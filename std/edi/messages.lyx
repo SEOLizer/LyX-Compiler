@@ -1,0 +1,604 @@
+// std/edi/messages.lyx — EDIFACT Infrastructure Messages (WP-EDI-01)
+//
+// CONTRL: mandatory syntax acknowledgement (positive and negative)
+// APERAK: application error / acknowledgement
+// GENRAL: general-purpose free-text message
+//
+// Public API:
+//   EdiContrlOk(icRef, senderId, receiverId, out, outMax)  → int64
+//   EdiContrlErr(icRef, segPos, errCode, out, outMax)      → int64
+//   EdiContrlRead(buf, bufLen, result)                     → int64 (EDI_OK/err)
+//   EdiAperakWrite(refMsgId, errCode, errText, out, outMax)→ int64
+//   EdiAperakRead(buf, bufLen, result)                     → int64
+//   EdiGenralWrite(subject, body, refMsgId, out, outMax)   → int64
+//   EdiGenralRead(buf, bufLen, result)                     → int64
+//
+// CONTRL result struct (EDI_CONTRL_SIZE):
+//   EDI_CONTRL_STATUS  : int64 — 7=accepted, 4=rejected (functional group), 5=rejected (message)
+//   EDI_CONTRL_ERRCODE : int64 — UN/EDIFACT error code (0 = none)
+//   EDI_CONTRL_SEGPOS  : int64 — offending segment position (0 = interchange level)
+//   EDI_CONTRL_ICREF   : int64 — ptr to ICR string
+//   EDI_CONTRL_ICREFLEN: int64
+//
+// APERAK result struct (EDI_APERAK_SIZE):
+//   EDI_APERAK_ERRCODE : int64
+//   EDI_APERAK_REFMSG  : int64 — ptr to reference message ID
+//   EDI_APERAK_REFLEN  : int64
+//   EDI_APERAK_TEXT    : int64 — ptr to error text
+//   EDI_APERAK_TEXTLEN : int64
+//
+// GENRAL result struct (EDI_GENRAL_SIZE):
+//   EDI_GENRAL_SUBJECT : int64 — ptr to BGM/C002 text
+//   EDI_GENRAL_SUBJLEN : int64
+//   EDI_GENRAL_BODY    : int64 — ptr to concatenated FTX body (alloc'd, caller must free)
+//   EDI_GENRAL_BODYLEN : int64
+//   EDI_GENRAL_REFMSG  : int64 — ptr to reference message ID
+//   EDI_GENRAL_REFLEN  : int64
+
+unit std.edi.messages;
+
+import std.edi.core;
+import std.alloc;
+
+// ── CONTRL result offsets ─────────────────────────────────────────────────────
+pub con EDI_CONTRL_STATUS:   int64 := 0;
+pub con EDI_CONTRL_ERRCODE:  int64 := 8;
+pub con EDI_CONTRL_SEGPOS:   int64 := 16;
+pub con EDI_CONTRL_ICREF:    int64 := 24;
+pub con EDI_CONTRL_ICREFLEN: int64 := 32;
+pub con EDI_CONTRL_SIZE:     int64 := 40;
+
+// CONTRL UCI status values
+pub con EDI_CONTRL_ACCEPTED:  int64 := 7;
+pub con EDI_CONTRL_REJECTED4: int64 := 4;   // functional group level
+pub con EDI_CONTRL_REJECTED5: int64 := 5;   // message level
+
+// Common CONTRL error codes (UN/EDIFACT S005)
+pub con EDI_ERR_SYNTAX_VER:     int64 := 2;    // Syntax version / level not supported
+pub con EDI_ERR_TEST_FLAG:      int64 := 7;    // Test indicator mismatch
+pub con EDI_ERR_INVALID_VALUE:  int64 := 14;   // Invalid value
+pub con EDI_ERR_MISSING_SEG:    int64 := 25;   // Missing mandatory segment
+
+// ── APERAK result offsets ─────────────────────────────────────────────────────
+pub con EDI_APERAK_ERRCODE:  int64 := 0;
+pub con EDI_APERAK_REFMSG:   int64 := 8;
+pub con EDI_APERAK_REFLEN:   int64 := 16;
+pub con EDI_APERAK_TEXT:     int64 := 24;
+pub con EDI_APERAK_TEXTLEN:  int64 := 32;
+pub con EDI_APERAK_SIZE:     int64 := 40;
+
+// ── GENRAL result offsets ─────────────────────────────────────────────────────
+pub con EDI_GENRAL_SUBJECT:  int64 := 0;
+pub con EDI_GENRAL_SUBJLEN:  int64 := 8;
+pub con EDI_GENRAL_BODY:     int64 := 16;
+pub con EDI_GENRAL_BODYLEN:  int64 := 24;
+pub con EDI_GENRAL_REFMSG:   int64 := 32;
+pub con EDI_GENRAL_REFLEN:   int64 := 40;
+pub con EDI_GENRAL_SIZE:     int64 := 48;
+
+// FTX segment text limit per EDIFACT standard
+pub con EDI_FTX_MAX:         int64 := 512;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn msgStrLen(ptr: int64): int64 {
+    var n: int64 := 0;
+    while (peek8(ptr + n) != 0) { n := n + 1; }
+    return n;
+}
+
+fn msgPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn msgPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i := i + 1;
+    }
+    return pos + n;
+}
+
+fn msgPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val < 0)  { return 0 - 1; }
+    if (val == 0) { return msgPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var buf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(buf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx := idx + 1;
+    }
+    var r: int64 := msgPutStr(out, pos, outMax, buf, digits);
+    free(buf, 24);
+    return r;
+}
+
+// Segment-level write helpers: write one full EDIFACT segment with tag + data.
+// Returns new pos after segment terminator.
+
+fn msgSeg3(out: int64, pos: int64, outMax: int64, t0: int64, t1: int64, t2: int64): int64 {
+    // Write "XYZ" tag
+    pos := msgPutChar(out, pos, outMax, t0);
+    pos := msgPutChar(out, pos, outMax, t1);
+    pos := msgPutChar(out, pos, outMax, t2);
+    return pos;
+}
+
+// Write segment "TAG+field1+field2'" — up to 4 string fields, 0 = omit
+fn msgWriteSeg(out: int64, pos: int64, outMax: int64, tag: int64, f1: int64, f1l: int64): int64 {
+    pos := msgPutStr(out, pos, outMax, tag, 3);
+    if (f1 != 0) {
+        pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := msgPutStr(out, pos, outMax, f1, f1l);
+    }
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// Check if segment at seg.ptr matches 3-char tag
+fn msgTagIs(seg: int64, t0: int64, t1: int64, t2: int64): int64 {
+    var p: int64 := peek64(seg + EDI_SEG_PTR);
+    if (p == 0) { return 0; }
+    if (peek8(p)   != t0) { return 0; }
+    if (peek8(p+1) != t1) { return 0; }
+    if (peek8(p+2) != t2) { return 0; }
+    return 1;
+}
+
+// Get element ptr/len from pre-split elements array
+fn msgElemPtr(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+}
+fn msgElemLen(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+}
+
+// Parse first numeric field from elements array (index idx)
+fn msgReadInt(elems: int64, idx: int64, nElems: int64): int64 {
+    if (idx >= nElems) { return 0; }
+    var p: int64 := msgElemPtr(elems, idx);
+    var l: int64 := msgElemLen(elems, idx);
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < l) {
+        var c: int64 := peek8(p + i);
+        if (c >= 48 && c <= 57) { v := v * 10 + (c - 48); }
+        i := i + 1;
+    }
+    return v;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — CONTRL
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write a positive CONTRL interchange (UCI status=7, no error).
+// icRef:      interchange control reference being acknowledged
+// senderId:   ID of the CONTRL sender (= original receiver)
+// receiverId: ID of the CONTRL receiver (= original sender)
+// Returns bytes written, -1 on overflow.
+pub fn EdiContrlOk(icRef: int64, senderId: int64, receiverId: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var icrLen: int64 := msgStrLen(icRef);
+    var sndLen: int64 := msgStrLen(senderId);
+    var rcvLen: int64 := msgStrLen(receiverId);
+
+    // UNB+UNOA:1+SENDER+RECEIVER+000000:0000+CONTRL001'
+    // For CONTRL we use a fixed interchange wrapper
+    pos := msgPutStr(out, pos, outMax, "UNB"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, "UNOA"c as int64, 4);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := msgPutChar(out, pos, outMax, 49);   // '1'
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, senderId, sndLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, receiverId, rcvLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, "000000"c as int64, 6);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := msgPutStr(out, pos, outMax, "0000"c as int64, 4);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, icRef, icrLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // UNH+1+CONTRL:1:901:UN'
+    pos := msgPutStr(out, pos, outMax, "UNH"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 49);   // msg ref "1"
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, "CONTRL"c as int64, 6);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := msgPutChar(out, pos, outMax, 49);   // '1'
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := msgPutStr(out, pos, outMax, "901"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := msgPutStr(out, pos, outMax, "UN"c as int64, 2);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // UCI+ICR+SENDER+RECEIVER+7'   (7 = accepted)
+    pos := msgPutStr(out, pos, outMax, "UCI"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, icRef, icrLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, receiverId, rcvLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, senderId, sndLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 55);   // '7' = accepted
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // UNT+3+1'
+    pos := msgPutStr(out, pos, outMax, "UNT"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 51);   // '3' segments
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 49);   // ref "1"
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // UNZ+1+ICR'
+    pos := msgPutStr(out, pos, outMax, "UNZ"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 49);   // '1' message
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, icRef, icrLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Write a negative CONTRL interchange (UCI status=4, with error code + segment position).
+pub fn EdiContrlErr(icRef: int64, segPos: int64, errCode: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var icrLen: int64 := msgStrLen(icRef);
+
+    // Minimal UNB (no sender/receiver in error case — caller adds if needed)
+    pos := msgPutStr(out, pos, outMax, "UNB"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, "UNOA:1"c as int64, 6);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);   // empty sender
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);   // empty receiver
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, "000000:0000"c as int64, 11);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, icRef, icrLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // UNH+1+CONTRL:1:901:UN'
+    pos := msgPutStr(out, pos, outMax, "UNH"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 49);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, "CONTRL:1:901:UN"c as int64, 15);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // UCI+ICR+++4+ERRCODE+SEGPOS'
+    pos := msgPutStr(out, pos, outMax, "UCI"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, icRef, icrLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);   // sender (empty)
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);   // receiver (empty)
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 52);   // '4' = rejected
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutInt(out, pos, outMax, errCode);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutInt(out, pos, outMax, segPos);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // UNT+3+1'
+    pos := msgPutStr(out, pos, outMax, "UNT"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 51);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 49);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // UNZ+1+ICR'
+    pos := msgPutStr(out, pos, outMax, "UNZ"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 49);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, icRef, icrLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse a CONTRL interchange. buf: raw bytes, result: EDI_CONTRL_SIZE struct.
+// Scans for UCI segment, extracts status (field 4), error code (field 5),
+// segment position (field 6), and ICR (field 1).
+// Returns EDI_OK, EDI_ERR_SYNTAX if UCI not found.
+pub fn EdiContrlRead(buf: int64, bufLen: int64, result: int64): int64 {
+    var i: int64 := 0;
+    while (i < EDI_CONTRL_SIZE) { poke8(result + i, 0); i := i + 1; }
+
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) {
+        startPos := 9;
+    }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(12 * EDI_ELEM_SIZE);
+    var found: int64 := 0;
+
+    while (found == 0) {
+        var ok: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (ok == 0) { found := 2; }   // end without UCI
+        else {
+            if (msgTagIs(seg, 85, 67, 73) == 1) {   // "UCI"
+                var n: int64 := EdiElementSplit(seg, elems, 12);
+                // elem[0] = ICR
+                if (n > 0) {
+                    poke64(result + EDI_CONTRL_ICREF,    msgElemPtr(elems, 0));
+                    poke64(result + EDI_CONTRL_ICREFLEN, msgElemLen(elems, 0));
+                }
+                // elem[3] = status (field 4: UCI+ICR+SND+RCV+STATUS)
+                if (n > 3) { poke64(result + EDI_CONTRL_STATUS, msgReadInt(elems, 3, n)); }
+                // elem[4] = error code
+                if (n > 4) { poke64(result + EDI_CONTRL_ERRCODE, msgReadInt(elems, 4, n)); }
+                // elem[5] = segment position
+                if (n > 5) { poke64(result + EDI_CONTRL_SEGPOS, msgReadInt(elems, 5, n)); }
+                found := 1;
+            }
+        }
+    }
+
+    free(elems, 12 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+
+    if (found == 2) { return EDI_ERR_SYNTAX; }
+    return EDI_OK;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — APERAK
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write APERAK message (BGM+APERAK + RFF+errCode + FTX+errText).
+// refMsgId: reference to original message (RFF+ACE), errCode: numeric app error,
+// errText:  free-form error description.
+pub fn EdiAperakWrite(refMsgId: int64, errCode: int64, errText: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var refLen: int64 := msgStrLen(refMsgId);
+    var txtLen: int64 := msgStrLen(errText);
+    if (txtLen > EDI_FTX_MAX) { txtLen := EDI_FTX_MAX; }
+
+    // BGM+313++9'  (313 = APERAK document type)
+    pos := msgPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, "313"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 57);   // function: 9 = original
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // RFF+ACE:REFMSGID'  (reference to the message in error)
+    pos := msgPutStr(out, pos, outMax, "RFF"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, "ACE"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := msgPutStr(out, pos, outMax, refMsgId, refLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // ERC+ERRCODE'  (application error code)
+    pos := msgPutStr(out, pos, outMax, "ERC"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutInt(out, pos, outMax, errCode);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // FTX+AAO++ERRTEXT'  (free-text error description, max EDI_FTX_MAX chars)
+    pos := msgPutStr(out, pos, outMax, "FTX"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, "AAO"c as int64, 3);   // subject: error text
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, errText, txtLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse APERAK message. Scans for BGM, RFF+ACE, ERC, FTX and fills result.
+// result: EDI_APERAK_SIZE — pointers into buf (zero-copy for ref and text).
+pub fn EdiAperakRead(buf: int64, bufLen: int64, result: int64): int64 {
+    var i: int64 := 0;
+    while (i < EDI_APERAK_SIZE) { poke8(result + i, 0); i := i + 1; }
+
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var ok: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (ok == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+            // RFF segment with qualifier ACE → reference message ID
+            if (msgTagIs(seg, 82, 70, 70) == 1) {   // "RFF"
+                if (n > 0) {
+                    var e0p: int64 := msgElemPtr(elems, 0);
+                    var e0l: int64 := msgElemLen(elems, 0);
+                    // check first component = "ACE"
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    EdiComponentSplit(e0p, e0l, comps, 4);
+                    var c0p: int64 := peek64(comps + EDI_ELEM_PTR);
+                    var c0l: int64 := peek64(comps + EDI_ELEM_LEN);
+                    if (c0l == 3) {
+                        if (peek8(c0p) == 65 && peek8(c0p+1) == 67 && peek8(c0p+2) == 69) {
+                            // "ACE" — next component is reference ID
+                            var nc: int64 := 0;
+                            nc := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_SIZE) / EDI_ELEM_SIZE;
+                            poke64(result + EDI_APERAK_REFMSG, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(result + EDI_APERAK_REFLEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+            // ERC segment → error code
+            if (msgTagIs(seg, 69, 82, 67) == 1) {   // "ERC"
+                if (n > 0) { poke64(result + EDI_APERAK_ERRCODE, msgReadInt(elems, 0, n)); }
+            }
+            // FTX segment → error text
+            if (msgTagIs(seg, 70, 84, 88) == 1) {   // "FTX"
+                if (n > 2) {
+                    poke64(result + EDI_APERAK_TEXT,    msgElemPtr(elems, 2));
+                    poke64(result + EDI_APERAK_TEXTLEN, msgElemLen(elems, 2));
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return EDI_OK;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — GENRAL
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write GENRAL message. Subject goes in BGM, body is split into ≤512-char FTX segments.
+// refMsgId: optional reference (0 = none).
+pub fn EdiGenralWrite(subject: int64, body: int64, refMsgId: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var subjLen: int64 := msgStrLen(subject);
+    var bodyLen: int64 := msgStrLen(body);
+    var refLen:  int64 := 0;
+    if (refMsgId != 0) { refLen := msgStrLen(refMsgId); }
+    if (subjLen > EDI_FTX_MAX) { subjLen := EDI_FTX_MAX; }
+
+    // BGM+ZZZ++9+subject'  (ZZZ = mutually defined = free text)
+    pos := msgPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, "ZZZ"c as int64, 3);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutChar(out, pos, outMax, 57);   // function: 9 = original
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := msgPutStr(out, pos, outMax, subject, subjLen);
+    pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // Optional reference
+    if (refMsgId != 0 && refLen > 0) {
+        pos := msgPutStr(out, pos, outMax, "RFF"c as int64, 3);
+        pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := msgPutStr(out, pos, outMax, "ON"c as int64, 2);
+        pos := msgPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := msgPutStr(out, pos, outMax, refMsgId, refLen);
+        pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    // FTX segments: split body into ≤EDI_FTX_MAX chunks
+    var bodyOff: int64 := 0;
+    while (bodyOff < bodyLen) {
+        var chunkLen: int64 := bodyLen - bodyOff;
+        if (chunkLen > EDI_FTX_MAX) { chunkLen := EDI_FTX_MAX; }
+        pos := msgPutStr(out, pos, outMax, "FTX"c as int64, 3);
+        pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := msgPutStr(out, pos, outMax, "GEN"c as int64, 3);   // general information
+        pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := msgPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := msgPutStr(out, pos, outMax, body + bodyOff, chunkLen);
+        pos := msgPutChar(out, pos, outMax, EDI_DEF_SEG);
+        bodyOff := bodyOff + chunkLen;
+    }
+
+    return pos;
+}
+
+// Parse GENRAL message. result.BODY is alloc'd — caller must free(result.BODY, result.BODYLEN).
+pub fn EdiGenralRead(buf: int64, bufLen: int64, result: int64): int64 {
+    var i: int64 := 0;
+    while (i < EDI_GENRAL_SIZE) { poke8(result + i, 0); i := i + 1; }
+
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+
+    // Pre-allocate body buffer (generous: 32 FTX × 512 = 16384 bytes)
+    var bodyBuf: int64 := alloc(16384);
+    var bodyOff: int64 := 0;
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var ok: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (ok == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+            // BGM → subject (field 4 = free document name)
+            if (msgTagIs(seg, 66, 71, 77) == 1) {   // "BGM"
+                if (n > 3) {
+                    poke64(result + EDI_GENRAL_SUBJECT, msgElemPtr(elems, 3));
+                    poke64(result + EDI_GENRAL_SUBJLEN, msgElemLen(elems, 3));
+                }
+            }
+            // RFF → reference message ID (second component)
+            if (msgTagIs(seg, 82, 70, 70) == 1) {   // "RFF"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    EdiComponentSplit(msgElemPtr(elems, 0), msgElemLen(elems, 0), comps, 4);
+                    poke64(result + EDI_GENRAL_REFMSG, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                    poke64(result + EDI_GENRAL_REFLEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+            // FTX → append body text (field 3)
+            if (msgTagIs(seg, 70, 84, 88) == 1) {   // "FTX"
+                if (n > 2) {
+                    var txtp: int64 := msgElemPtr(elems, 2);
+                    var txtl: int64 := msgElemLen(elems, 2);
+                    var j: int64 := 0;
+                    while (j < txtl && bodyOff < 16384) {
+                        poke8(bodyBuf + bodyOff, peek8(txtp + j));
+                        bodyOff := bodyOff + 1;
+                        j := j + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    poke64(result + EDI_GENRAL_BODY,    bodyBuf);
+    poke64(result + EDI_GENRAL_BODYLEN, bodyOff);
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return EDI_OK;
+}
