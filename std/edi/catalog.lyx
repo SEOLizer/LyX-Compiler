@@ -1,0 +1,575 @@
+// std/edi/catalog.lyx — Master data: PRICAT + PARTIN (WP-EDI-02)
+//
+// PRICAT: price/sales catalogue — products with GTIN, prices, validity periods
+// PARTIN: party information — GLN-based address and contact data
+//
+// GS1 validations:
+//   GTIN-8 / GTIN-12 / GTIN-13 / GTIN-14: Mod-10 Luhn check digit
+//   GLN-13: Mod-10 check digit
+//
+// Public API:
+//   EdiGtinCheck(ptr, len)                                    → int64 (1=valid)
+//   EdiGlnCheck(ptr, len)                                     → int64 (1=valid)
+//   EdiPricatWrite(items, count, out, outMax)                  → int64 (bytes)
+//   EdiPricatRead(buf, bufLen, items, maxItems)                → int64 (item count)
+//   EdiPartinWrite(party, out, outMax)                         → int64 (bytes)
+//   EdiPartinRead(buf, bufLen, party)                          → int64 (EDI_OK/err)
+//
+// EdiPricatItem struct (EDI_PRICAT_ITEM_SIZE bytes):
+//   GTIN ptr(8) + GTINLen(8) + Desc ptr(8) + DescLen(8)
+//   + GrossPrice(8) + NetPrice(8) + Currency ptr(8) + CurrencyLen(8)
+//   + Unit ptr(8) + UnitLen(8) + ValidFrom ptr(8) + ValidTo ptr(8)
+//   = 96 bytes
+//
+// EdiParty struct (EDI_PARTY_SIZE bytes):
+//   GLN ptr(8)+len(8) + Name ptr(8)+len(8) + Street ptr(8)+len(8)
+//   + City ptr(8)+len(8) + PostCode ptr(8)+len(8) + Country ptr(8)+len(8)
+//   + Role ptr(8)+len(8)  = 112 bytes
+
+unit std.edi.catalog;
+
+import std.edi.core;
+import std.alloc;
+
+// ── EdiPricatItem offsets ─────────────────────────────────────────────────────
+pub con EDI_PRICAT_GTIN:       int64 := 0;
+pub con EDI_PRICAT_GTINLEN:    int64 := 8;
+pub con EDI_PRICAT_DESC:       int64 := 16;
+pub con EDI_PRICAT_DESCLEN:    int64 := 24;
+// Prices stored as fixed-point: int64 × 100  (e.g. 1999 = 19.99)
+pub con EDI_PRICAT_GROSSPRICE: int64 := 32;
+pub con EDI_PRICAT_NETPRICE:   int64 := 40;
+pub con EDI_PRICAT_CURRENCY:   int64 := 48;
+pub con EDI_PRICAT_CURRENCYLEN:int64 := 56;
+pub con EDI_PRICAT_UNIT:       int64 := 64;
+pub con EDI_PRICAT_UNITLEN:    int64 := 72;
+pub con EDI_PRICAT_VALIDFROM:  int64 := 80;
+pub con EDI_PRICAT_VALIDTO:    int64 := 88;
+pub con EDI_PRICAT_ITEM_SIZE:  int64 := 96;
+
+// ── EdiParty offsets ──────────────────────────────────────────────────────────
+pub con EDI_PARTY_GLN:         int64 := 0;
+pub con EDI_PARTY_GLNLEN:      int64 := 8;
+pub con EDI_PARTY_NAME:        int64 := 16;
+pub con EDI_PARTY_NAMELEN:     int64 := 24;
+pub con EDI_PARTY_STREET:      int64 := 32;
+pub con EDI_PARTY_STREETL:     int64 := 40;
+pub con EDI_PARTY_CITY:        int64 := 48;
+pub con EDI_PARTY_CITYL:       int64 := 56;
+pub con EDI_PARTY_POSTCODE:    int64 := 64;
+pub con EDI_PARTY_POSTCODEL:   int64 := 72;
+pub con EDI_PARTY_COUNTRY:     int64 := 80;
+pub con EDI_PARTY_COUNTRYL:    int64 := 88;
+pub con EDI_PARTY_ROLE:        int64 := 96;
+pub con EDI_PARTY_ROLEL:       int64 := 104;
+pub con EDI_PARTY_SIZE:        int64 := 112;
+
+// PROACT struct — same as PRICAT item for activity data; reuse EDI_PRICAT_ITEM_SIZE
+pub con EDI_PROACT_GTIN:       int64 := 0;
+pub con EDI_PROACT_GTINLEN:    int64 := 8;
+pub con EDI_PROACT_QTY:        int64 := 16;   // quantity × 1000 (3 decimal places)
+pub con EDI_PROACT_DATE:       int64 := 24;   // ptr to date string
+pub con EDI_PROACT_TYPE:       int64 := 32;   // 1=sale, 2=return, 3=transfer
+pub con EDI_PROACT_SIZE:       int64 := 40;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn catStrLen(ptr: int64): int64 {
+    var n: int64 := 0;
+    while (peek8(ptr + n) != 0) { n := n + 1; }
+    return n;
+}
+
+fn catPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn catPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i := i + 1;
+    }
+    return pos + n;
+}
+
+fn catPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val < 0)  { return 0 - 1; }
+    if (val == 0) { return catPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var buf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(buf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx := idx + 1;
+    }
+    var r: int64 := catPutStr(out, pos, outMax, buf, digits);
+    free(buf, 24);
+    return r;
+}
+
+// Write fixed-point price as "NNN.NN" (val/100.val%100)
+fn catPutPrice(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    var whole: int64 := val / 100;
+    var frac:  int64 := val - whole * 100;
+    pos := catPutInt(out, pos, outMax, whole);
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DEC);
+    // Two decimal digits with leading zero
+    if (frac < 10) { pos := catPutChar(out, pos, outMax, 48); }
+    pos := catPutInt(out, pos, outMax, frac);
+    return pos;
+}
+
+// GS1 Mod-10 check digit: multiply alternating weights 1/3 on digits right-to-left
+// Returns 1 if valid, 0 if invalid, -1 if wrong length
+fn gs1Mod10(ptr: int64, len: int64): int64 {
+    if (len < 8)  { return 0 - 1; }
+    if (len > 14) { return 0 - 1; }
+    var sum: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c < 48 || c > 57) { return 0; }
+        var d: int64 := c - 48;
+        // position from right: rightmost is position 1 (check digit, weight 1)
+        // even positions from right get weight 3, odd positions get weight 1
+        var pos: int64 := len - i;   // 1-based from right
+        if (pos - (pos / 2) * 2 == 0) {
+            // even position from right (2,4,6...) → weight 3
+            sum := sum + d * 3;
+        } else {
+            sum := sum + d;
+        }
+        i := i + 1;
+    }
+    var r: int64 := sum - (sum / 10) * 10;   // sum mod 10
+    if (r == 0) { return 1; }
+    return 0;
+}
+
+fn catTagIs(seg: int64, t0: int64, t1: int64, t2: int64): int64 {
+    var p: int64 := peek64(seg + EDI_SEG_PTR);
+    if (p == 0) { return 0; }
+    if (peek8(p) != t0) { return 0; }
+    if (peek8(p+1) != t1) { return 0; }
+    if (peek8(p+2) != t2) { return 0; }
+    return 1;
+}
+
+fn catElemPtr(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+}
+fn catElemLen(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+}
+
+// Parse price string "NNN.NN" or "NNN,NN" → int64 (×100)
+fn catParsePrice(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var frac: int64 := 0;
+    var inFrac: int64 := 0;
+    var fracDig: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c == 46 || c == 44) {   // '.' or ','
+            inFrac := 1;
+        } else {
+            if (c >= 48 && c <= 57) {
+                if (inFrac == 0) {
+                    v := v * 10 + (c - 48);
+                } else {
+                    if (fracDig < 2) {
+                        frac := frac * 10 + (c - 48);
+                        fracDig := fracDig + 1;
+                    }
+                }
+            }
+        }
+        i := i + 1;
+    }
+    if (fracDig == 1) { frac := frac * 10; }
+    return v * 100 + frac;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — GS1 validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Validate GTIN check digit (lengths 8, 12, 13, 14). Returns 1=valid, 0=invalid.
+pub fn EdiGtinCheck(ptr: int64, len: int64): int64 {
+    if (len != 8 && len != 12 && len != 13 && len != 14) { return 0; }
+    return gs1Mod10(ptr, len);
+}
+
+// Validate GLN check digit (length must be 13). Returns 1=valid, 0=invalid.
+pub fn EdiGlnCheck(ptr: int64, len: int64): int64 {
+    if (len != 13) { return 0; }
+    return gs1Mod10(ptr, len);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — PRICAT
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write PRICAT message. items: array of EDI_PRICAT_ITEM_SIZE structs.
+// Returns bytes written, -1 on overflow. Does NOT validate GTINs (caller's responsibility).
+pub fn EdiPricatWrite(items: int64, count: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+
+    // BGM+9+PRICAT+9'  (document type 9 = price list, function 9 = original)
+    pos := catPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := catPutStr(out, pos, outMax, "9"c as int64, 1);
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := catPutStr(out, pos, outMax, "PRICAT"c as int64, 6);
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := catPutChar(out, pos, outMax, 57);   // function '9'
+    pos := catPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    var i: int64 := 0;
+    while (i < count) {
+        var item: int64 := items + i * EDI_PRICAT_ITEM_SIZE;
+        var gtinPtr: int64 := peek64(item + EDI_PRICAT_GTIN);
+        var gtinLen: int64 := peek64(item + EDI_PRICAT_GTINLEN);
+        var descPtr: int64 := peek64(item + EDI_PRICAT_DESC);
+        var descLen: int64 := peek64(item + EDI_PRICAT_DESCLEN);
+        var grossP:  int64 := peek64(item + EDI_PRICAT_GROSSPRICE);
+        var netP:    int64 := peek64(item + EDI_PRICAT_NETPRICE);
+        var currPtr: int64 := peek64(item + EDI_PRICAT_CURRENCY);
+        var currLen: int64 := peek64(item + EDI_PRICAT_CURRENCYLEN);
+        var unitPtr: int64 := peek64(item + EDI_PRICAT_UNIT);
+        var unitLen: int64 := peek64(item + EDI_PRICAT_UNITLEN);
+        var vfPtr:   int64 := peek64(item + EDI_PRICAT_VALIDFROM);
+        var vtPtr:   int64 := peek64(item + EDI_PRICAT_VALIDTO);
+
+        // LIN+LINENO++GTIN:SRV'  (SRV = GS1 article number qualifier)
+        pos := catPutStr(out, pos, outMax, "LIN"c as int64, 3);
+        pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := catPutInt(out, pos, outMax, i + 1);
+        pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := catPutStr(out, pos, outMax, gtinPtr, gtinLen);
+        pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := catPutStr(out, pos, outMax, "SRV"c as int64, 3);
+        pos := catPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // IMD+F++:::DESCRIPTION'  (free form description, qualifier F)
+        if (descPtr != 0 && descLen > 0) {
+            pos := catPutStr(out, pos, outMax, "IMD"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := catPutChar(out, pos, outMax, 70);   // 'F' = free form
+            pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := catPutStr(out, pos, outMax, ":::"c as int64, 3);
+            pos := catPutStr(out, pos, outMax, descPtr, descLen);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        // PRI+AAB:GROSSPRICE:CP'  (AAB=gross, CP=confirmed)
+        if (grossP > 0) {
+            pos := catPutStr(out, pos, outMax, "PRI"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := catPutStr(out, pos, outMax, "AAB"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := catPutPrice(out, pos, outMax, grossP);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := catPutStr(out, pos, outMax, "CP"c as int64, 2);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        // PRI+AAA:NETPRICE:CP'  (AAA=net)
+        if (netP > 0) {
+            pos := catPutStr(out, pos, outMax, "PRI"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := catPutStr(out, pos, outMax, "AAA"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := catPutPrice(out, pos, outMax, netP);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := catPutStr(out, pos, outMax, "CP"c as int64, 2);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        // QTY+1:1:UNIT'  (unit of measure)
+        if (unitPtr != 0 && unitLen > 0) {
+            pos := catPutStr(out, pos, outMax, "QTY"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := catPutChar(out, pos, outMax, 49);   // qualifier '1' = discrete quantity
+            pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := catPutChar(out, pos, outMax, 49);   // quantity '1'
+            pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := catPutStr(out, pos, outMax, unitPtr, unitLen);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        // DTM+194:VALIDFROM:102'  (194=valid from, 102=YYYYMMDD)
+        if (vfPtr != 0) {
+            pos := catPutStr(out, pos, outMax, "DTM"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := catPutStr(out, pos, outMax, "194"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := catPutStr(out, pos, outMax, vfPtr, 8);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := catPutStr(out, pos, outMax, "102"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        // DTM+206:VALIDTO:102'   (206=valid to)
+        if (vtPtr != 0) {
+            pos := catPutStr(out, pos, outMax, "DTM"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := catPutStr(out, pos, outMax, "206"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := catPutStr(out, pos, outMax, vtPtr, 8);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := catPutStr(out, pos, outMax, "102"c as int64, 3);
+            pos := catPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        i := i + 1;
+    }
+
+    // CNT+2:COUNT'  (message total)
+    pos := catPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := catPutChar(out, pos, outMax, 50);   // '2' = number of line items
+    pos := catPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := catPutInt(out, pos, outMax, count);
+    pos := catPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse PRICAT. Fills items[] array (EDI_PRICAT_ITEM_SIZE each).
+// Returns number of items parsed, or negative error code.
+// Pointers in items point into buf (zero-copy). Caller validates GTINs.
+pub fn EdiPricatRead(buf: int64, bufLen: int64, items: int64, maxItems: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count: int64 := 0;
+    var curItem: int64 := 0;   // pointer to current item slot
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+            // LIN → start new item
+            if (catTagIs(seg, 76, 73, 78) == 1) {   // "LIN"
+                if (count < maxItems) {
+                    curItem := items + count * EDI_PRICAT_ITEM_SIZE;
+                    // Zero the new item slot
+                    var zi: int64 := 0;
+                    while (zi < EDI_PRICAT_ITEM_SIZE) { poke8(curItem + zi, 0); zi := zi + 1; }
+                    // elem[2] = GTIN:SRV composite
+                    if (n > 2) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(catElemPtr(elems, 2), catElemLen(elems, 2), comps, 4);
+                        poke64(curItem + EDI_PRICAT_GTIN,    peek64(comps + EDI_ELEM_PTR));
+                        poke64(curItem + EDI_PRICAT_GTINLEN, peek64(comps + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                    count := count + 1;
+                }
+            }
+            // IMD → description (elem[4] = free-form text after :::)
+            if (catTagIs(seg, 73, 77, 68) == 1 && curItem != 0) {   // "IMD"
+                if (n > 2) {
+                    // elem[2] = ":::DESCRIPTION" — split by ':' and take last component
+                    var comps: int64 := alloc(8 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(catElemPtr(elems, 2), catElemLen(elems, 2), comps, 8);
+                    if (nc > 3) {
+                        poke64(curItem + EDI_PRICAT_DESC,    peek64(comps + 3 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(curItem + EDI_PRICAT_DESCLEN, peek64(comps + 3 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    free(comps, 8 * EDI_ELEM_SIZE);
+                }
+            }
+            // PRI → price (elem[0] = qualifier:price:basis composite)
+            if (catTagIs(seg, 80, 82, 73) == 1 && curItem != 0) {   // "PRI"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(catElemPtr(elems, 0), catElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qual: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var qualLen: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var pricePtr: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var priceLen: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var priceVal: int64 := catParsePrice(pricePtr, priceLen);
+                        // AAB = gross, AAA = net
+                        if (qualLen >= 3) {
+                            if (peek8(qual) == 65 && peek8(qual+1) == 65 && peek8(qual+2) == 66) {
+                                poke64(curItem + EDI_PRICAT_GROSSPRICE, priceVal);
+                            }
+                            if (peek8(qual) == 65 && peek8(qual+1) == 65 && peek8(qual+2) == 65) {
+                                poke64(curItem + EDI_PRICAT_NETPRICE, priceVal);
+                            }
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — PARTIN
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write PARTIN message for a single party.
+pub fn EdiPartinWrite(party: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var glnPtr:  int64 := peek64(party + EDI_PARTY_GLN);
+    var glnLen:  int64 := peek64(party + EDI_PARTY_GLNLEN);
+    var namePtr: int64 := peek64(party + EDI_PARTY_NAME);
+    var nameLen: int64 := peek64(party + EDI_PARTY_NAMELEN);
+    var strPtr:  int64 := peek64(party + EDI_PARTY_STREET);
+    var strLen:  int64 := peek64(party + EDI_PARTY_STREETL);
+    var cityPtr: int64 := peek64(party + EDI_PARTY_CITY);
+    var cityLen: int64 := peek64(party + EDI_PARTY_CITYL);
+    var pcPtr:   int64 := peek64(party + EDI_PARTY_POSTCODE);
+    var pcLen:   int64 := peek64(party + EDI_PARTY_POSTCODEL);
+    var ctryPtr: int64 := peek64(party + EDI_PARTY_COUNTRY);
+    var ctryLen: int64 := peek64(party + EDI_PARTY_COUNTRYL);
+    var rolePtr: int64 := peek64(party + EDI_PARTY_ROLE);
+    var roleLen: int64 := peek64(party + EDI_PARTY_ROLEL);
+
+    // BGM+349++9'   (349 = party information, 9 = original)
+    pos := catPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := catPutStr(out, pos, outMax, "349"c as int64, 3);
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := catPutChar(out, pos, outMax, 57);
+    pos := catPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // NAD+ROLE+GLN::9+NAME+STREET+CITY+POSTCODE+COUNTRY'
+    pos := catPutStr(out, pos, outMax, "NAD"c as int64, 3);
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (rolePtr != 0 && roleLen > 0) {
+        pos := catPutStr(out, pos, outMax, rolePtr, roleLen);
+    } else {
+        pos := catPutStr(out, pos, outMax, "BY"c as int64, 2);   // default: buyer
+    }
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    // GLN composite: GLN::9  (9=EAN/GS1 identifier)
+    if (glnPtr != 0 && glnLen > 0) {
+        pos := catPutStr(out, pos, outMax, glnPtr, glnLen);
+        pos := catPutStr(out, pos, outMax, "::9"c as int64, 3);
+    }
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (namePtr != 0 && nameLen > 0) { pos := catPutStr(out, pos, outMax, namePtr, nameLen); }
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (strPtr != 0 && strLen > 0) { pos := catPutStr(out, pos, outMax, strPtr, strLen); }
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (cityPtr != 0 && cityLen > 0) { pos := catPutStr(out, pos, outMax, cityPtr, cityLen); }
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (pcPtr != 0 && pcLen > 0) { pos := catPutStr(out, pos, outMax, pcPtr, pcLen); }
+    pos := catPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (ctryPtr != 0 && ctryLen > 0) { pos := catPutStr(out, pos, outMax, ctryPtr, ctryLen); }
+    pos := catPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse PARTIN. Fills party struct (EDI_PARTY_SIZE). Pointers into buf (zero-copy).
+// Returns EDI_OK or EDI_ERR_SYNTAX if NAD not found.
+pub fn EdiPartinRead(buf: int64, bufLen: int64, party: int64): int64 {
+    var i: int64 := 0;
+    while (i < EDI_PARTY_SIZE) { poke8(party + i, 0); i := i + 1; }
+
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(12 * EDI_ELEM_SIZE);
+    var found: int64 := 0;
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            if (catTagIs(seg, 78, 65, 68) == 1) {   // "NAD"
+                var n: int64 := EdiElementSplit(seg, elems, 12);
+                // elem[0] = role
+                if (n > 0) {
+                    poke64(party + EDI_PARTY_ROLE, catElemPtr(elems, 0));
+                    poke64(party + EDI_PARTY_ROLEL, catElemLen(elems, 0));
+                }
+                // elem[1] = GLN composite (GLN::9)
+                if (n > 1) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    EdiComponentSplit(catElemPtr(elems, 1), catElemLen(elems, 1), comps, 4);
+                    poke64(party + EDI_PARTY_GLN,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                    poke64(party + EDI_PARTY_GLNLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+                // elem[2] = name
+                if (n > 2) {
+                    poke64(party + EDI_PARTY_NAME,    catElemPtr(elems, 2));
+                    poke64(party + EDI_PARTY_NAMELEN, catElemLen(elems, 2));
+                }
+                // elem[3] = street
+                if (n > 3) {
+                    poke64(party + EDI_PARTY_STREET,  catElemPtr(elems, 3));
+                    poke64(party + EDI_PARTY_STREETL, catElemLen(elems, 3));
+                }
+                // elem[4] = city
+                if (n > 4) {
+                    poke64(party + EDI_PARTY_CITY,  catElemPtr(elems, 4));
+                    poke64(party + EDI_PARTY_CITYL, catElemLen(elems, 4));
+                }
+                // elem[5] = post code
+                if (n > 5) {
+                    poke64(party + EDI_PARTY_POSTCODE,  catElemPtr(elems, 5));
+                    poke64(party + EDI_PARTY_POSTCODEL, catElemLen(elems, 5));
+                }
+                // elem[6] = country
+                if (n > 6) {
+                    poke64(party + EDI_PARTY_COUNTRY,  catElemPtr(elems, 6));
+                    poke64(party + EDI_PARTY_COUNTRYL, catElemLen(elems, 6));
+                }
+                found := 1;
+                done := 1;
+            }
+        }
+    }
+
+    free(elems, 12 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    if (found == 0) { return EDI_ERR_SYNTAX; }
+    return EDI_OK;
+}
