@@ -1,0 +1,625 @@
+// std/edi/transport.lyx — Transport & Freight: IFTMIN + IFTMBC + IFTMCS +
+//   IFTMAN + IFCSUM + IFTSTA + IFTDGN + IFTFCC (WP-EDI-10)
+//
+// IFTMIN: multimodal order with N transport legs (TDT segments).
+// IFTDGN: dangerous goods; UN number must be exactly 4 digits.
+// IFTFCC: freight cost; must carry RFF+BN (booking ref) → EdiIftfccCheck.
+// IFTSTA: track & trace; unknown status codes → EdiIftstaStatusCheck = 1 (warn).
+// IFCSUM: consolidation list; references IFTMIN bookings via RFF+BN.
+
+unit std.edi.transport;
+
+import std.edi.core;
+import std.alloc;
+
+// ── BGM qualifiers ────────────────────────────────────────────────────────────
+pub con EDI_TRN_BGM_IFTMIN: int64 := 310;
+pub con EDI_TRN_BGM_IFTMBC: int64 := 311;
+pub con EDI_TRN_BGM_IFTMCS: int64 := 312;
+pub con EDI_TRN_BGM_IFTMAN: int64 := 313;
+pub con EDI_TRN_BGM_IFCSUM: int64 := 319;
+pub con EDI_TRN_BGM_IFTSTA: int64 := 214;
+pub con EDI_TRN_BGM_IFTDGN: int64 := 350;
+pub con EDI_TRN_BGM_IFTFCC: int64 := 315;
+
+// ── IFTSTA status codes ───────────────────────────────────────────────────────
+pub con EDI_IFTSTA_PICKEDUP:  int64 := 1;
+pub con EDI_IFTSTA_INTRANSIT: int64 := 2;
+pub con EDI_IFTSTA_DELAYED:   int64 := 3;
+pub con EDI_IFTSTA_DELIVERED: int64 := 4;
+
+// ── EDI_TRN_HDR offsets (112 bytes) ──────────────────────────────────────────
+pub con EDI_TRN_HDR_BGMQUAL:    int64 := 0;
+pub con EDI_TRN_HDR_REF:        int64 := 8;
+pub con EDI_TRN_HDR_REFLEN:     int64 := 16;
+pub con EDI_TRN_HDR_DATE:       int64 := 24;   // ptr to 8-char YYYYMMDD
+pub con EDI_TRN_HDR_DATELEN:    int64 := 32;
+pub con EDI_TRN_HDR_DEPARTURE:  int64 := 40;   // LOC+87 (origin)
+pub con EDI_TRN_HDR_DEPLEN:     int64 := 48;
+pub con EDI_TRN_HDR_ARRIVAL:    int64 := 56;   // LOC+88 (destination)
+pub con EDI_TRN_HDR_ARRLEN:     int64 := 64;
+pub con EDI_TRN_HDR_CARRIER:    int64 := 72;   // NAD+CA
+pub con EDI_TRN_HDR_CARRLEN:    int64 := 80;
+pub con EDI_TRN_HDR_BOOKINGREF: int64 := 88;   // RFF+BN
+pub con EDI_TRN_HDR_BOOKINGLEN: int64 := 96;
+pub con EDI_TRN_HDR_STATUSCODE: int64 := 104;  // IFTSTA STS
+pub con EDI_TRN_HDR_SIZE:       int64 := 112;
+
+// ── EDI_TRN_LEG offsets (40 bytes) ───────────────────────────────────────────
+pub con EDI_TRN_LEG_DEPARTURE: int64 := 0;
+pub con EDI_TRN_LEG_DEPLEN:    int64 := 8;
+pub con EDI_TRN_LEG_ARRIVAL:   int64 := 16;
+pub con EDI_TRN_LEG_ARRLEN:    int64 := 24;
+pub con EDI_TRN_LEG_MODE:      int64 := 32;  // 1=sea 2=rail 3=road 4=air
+pub con EDI_TRN_LEG_SIZE:      int64 := 40;
+
+// ── EDI_DGD offsets (64 bytes) ────────────────────────────────────────────────
+pub con EDI_DGD_UNNUMBER:     int64 := 0;   // 4-char UN number, e.g. "1203"
+pub con EDI_DGD_UNLEN:        int64 := 8;
+pub con EDI_DGD_IMDGCLASS:    int64 := 16;
+pub con EDI_DGD_IMDGLEN:      int64 := 24;
+pub con EDI_DGD_PACKINGGROUP: int64 := 32;  // 1=I 2=II 3=III
+pub con EDI_DGD_EMSCODE:      int64 := 40;
+pub con EDI_DGD_EMSLEN:       int64 := 48;
+pub con EDI_DGD_QTY:          int64 := 56;
+pub con EDI_DGD_SIZE:         int64 := 64;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn trnPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0 || pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn trnPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i := i + 1;
+    }
+    return pos + n;
+}
+
+fn trnPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val == 0) { return trnPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var tbuf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(tbuf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx := idx + 1;
+    }
+    var r: int64 := trnPutStr(out, pos, outMax, tbuf, digits);
+    free(tbuf, 24);
+    return r;
+}
+
+fn trnPutRevenue(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    var euros: int64 := val / 100;
+    var cents: int64 := val - euros * 100;
+    pos := trnPutInt(out, pos, outMax, euros);
+    pos := trnPutChar(out, pos, outMax, 46);
+    if (cents < 10) { pos := trnPutChar(out, pos, outMax, 48); }
+    pos := trnPutInt(out, pos, outMax, cents);
+    return pos;
+}
+
+fn trnParseInt(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c >= 48 && c <= 57) { v := v * 10 + (c - 48); }
+        i := i + 1;
+    }
+    return v;
+}
+
+fn trnParseRevenue(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var afterDot: int64 := 0;
+    var decimals: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c == 46 || c == 44) { afterDot := 1; }
+        else {
+            if (c >= 48 && c <= 57) {
+                v := v * 10 + (c - 48);
+                if (afterDot == 1) { decimals := decimals + 1; }
+            }
+        }
+        i := i + 1;
+    }
+    if (afterDot == 0) { v := v * 100; }
+    if (decimals == 1) { v := v * 10; }
+    return v;
+}
+
+fn trnTagIs(seg: int64, t0: int64, t1: int64, t2: int64): int64 {
+    var p: int64 := peek64(seg + EDI_SEG_PTR);
+    if (p == 0) { return 0; }
+    if (peek8(p) != t0) { return 0; }
+    if (peek8(p+1) != t1) { return 0; }
+    if (peek8(p+2) != t2) { return 0; }
+    return 1;
+}
+
+fn trnEP(elems: int64, idx: int64): int64 { return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_PTR); }
+fn trnEL(elems: int64, idx: int64): int64 { return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_LEN); }
+
+fn trnWriteCnt(out: int64, pos: int64, outMax: int64, n: int64): int64 {
+    pos := trnPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := trnPutChar(out, pos, outMax, 50);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := trnPutInt(out, pos, outMax, n);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+fn trnWriteRff(out: int64, pos: int64, outMax: int64, qual2: int64, refPtr: int64, refLen: int64): int64 {
+    if (refPtr == 0 || refLen == 0) { return pos; }
+    pos := trnPutStr(out, pos, outMax, "RFF"c as int64, 3);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := trnPutStr(out, pos, outMax, qual2, 2);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := trnPutStr(out, pos, outMax, refPtr, refLen);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// Write LOC+qualifier+location::9'
+fn trnWriteLoc(out: int64, pos: int64, outMax: int64, qual: int64, locPtr: int64, locLen: int64): int64 {
+    if (locPtr == 0 || locLen == 0) { return pos; }
+    pos := trnPutStr(out, pos, outMax, "LOC"c as int64, 3);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := trnPutInt(out, pos, outMax, qual);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := trnPutStr(out, pos, outMax, locPtr, locLen);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := trnPutChar(out, pos, outMax, 57);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// Write BGM + DTM + LOC+87 + LOC+88 + NAD+CA; return pos
+fn trnWriteHead(hdr: int64, out: int64, outMax: int64): int64 {
+    var bgmQual: int64 := peek64(hdr + EDI_TRN_HDR_BGMQUAL);
+    var refPtr:  int64 := peek64(hdr + EDI_TRN_HDR_REF);
+    var refLen:  int64 := peek64(hdr + EDI_TRN_HDR_REFLEN);
+    var datePtr: int64 := peek64(hdr + EDI_TRN_HDR_DATE);
+    var depPtr:  int64 := peek64(hdr + EDI_TRN_HDR_DEPARTURE);
+    var depLen:  int64 := peek64(hdr + EDI_TRN_HDR_DEPLEN);
+    var arrPtr:  int64 := peek64(hdr + EDI_TRN_HDR_ARRIVAL);
+    var arrLen:  int64 := peek64(hdr + EDI_TRN_HDR_ARRLEN);
+    var carPtr:  int64 := peek64(hdr + EDI_TRN_HDR_CARRIER);
+    var carLen:  int64 := peek64(hdr + EDI_TRN_HDR_CARRLEN);
+    var pos:     int64 := 0;
+
+    pos := trnPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := trnPutInt(out, pos, outMax, bgmQual);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (refPtr != 0 && refLen > 0) { pos := trnPutStr(out, pos, outMax, refPtr, refLen); }
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := trnPutChar(out, pos, outMax, 57);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    if (datePtr != 0) {
+        pos := trnPutStr(out, pos, outMax, "DTM"c as int64, 3);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := trnPutStr(out, pos, outMax, "137"c as int64, 3);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := trnPutStr(out, pos, outMax, datePtr, 8);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := trnPutStr(out, pos, outMax, "102"c as int64, 3);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    pos := trnWriteLoc(out, pos, outMax, 87, depPtr, depLen);
+    pos := trnWriteLoc(out, pos, outMax, 88, arrPtr, arrLen);
+
+    if (carPtr != 0 && carLen > 0) {
+        pos := trnPutStr(out, pos, outMax, "NAD"c as int64, 3);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := trnPutStr(out, pos, outMax, "CA"c as int64, 2);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := trnPutStr(out, pos, outMax, carPtr, carLen);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := trnPutChar(out, pos, outMax, 57);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    return pos;
+}
+
+// Common reader: fills BGM, DTM, LOC+87/88, NAD+CA, RFF+BN, STS, MOA+9
+fn trnReadMsg(buf: int64, bufLen: int64, hdr: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg:   int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var done:  int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            if (trnTagIs(seg, 66, 71, 77) == 1) {   // BGM
+                if (n > 0) { poke64(hdr + EDI_TRN_HDR_BGMQUAL, trnParseInt(trnEP(elems,0), trnEL(elems,0))); }
+                if (n > 1) { poke64(hdr + EDI_TRN_HDR_REF, trnEP(elems,1)); poke64(hdr + EDI_TRN_HDR_REFLEN, trnEL(elems,1)); }
+            }
+
+            if (trnTagIs(seg, 68, 84, 77) == 1) {   // DTM
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(trnEP(elems,0), trnEL(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql == 3 && peek8(qp) == 49 && peek8(qp+1) == 51 && peek8(qp+2) == 55) {
+                            poke64(hdr + EDI_TRN_HDR_DATE,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_TRN_HDR_DATELEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            if (trnTagIs(seg, 76, 79, 67) == 1) {   // LOC
+                if (n > 1) {
+                    var qual: int64 := trnParseInt(trnEP(elems,0), trnEL(elems,0));
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    EdiComponentSplit(trnEP(elems,1), trnEL(elems,1), comps, 4);
+                    var lp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                    var ll: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                    if (qual == 87) { poke64(hdr + EDI_TRN_HDR_DEPARTURE, lp); poke64(hdr + EDI_TRN_HDR_DEPLEN, ll); }
+                    if (qual == 88) { poke64(hdr + EDI_TRN_HDR_ARRIVAL,   lp); poke64(hdr + EDI_TRN_HDR_ARRLEN, ll); }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            if (trnTagIs(seg, 78, 65, 68) == 1) {   // NAD
+                if (n > 1) {
+                    var qp: int64 := trnEP(elems, 0);
+                    var ql: int64 := trnEL(elems, 0);
+                    // "CA" = 67,65
+                    if (ql >= 2 && peek8(qp) == 67 && peek8(qp+1) == 65) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(trnEP(elems,1), trnEL(elems,1), comps, 4);
+                        poke64(hdr + EDI_TRN_HDR_CARRIER, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_TRN_HDR_CARRLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                }
+            }
+
+            if (trnTagIs(seg, 82, 70, 70) == 1) {   // RFF
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(trnEP(elems,0), trnEL(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "BN" = 66,78
+                        if (ql == 2 && peek8(qp) == 66 && peek8(qp+1) == 78) {
+                            poke64(hdr + EDI_TRN_HDR_BOOKINGREF, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_TRN_HDR_BOOKINGLEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            if (trnTagIs(seg, 83, 84, 83) == 1) {   // STS
+                if (n > 0) { poke64(hdr + EDI_TRN_HDR_STATUSCODE, trnParseInt(trnEP(elems,0), trnEL(elems,0))); }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — Validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// UN number must be exactly 4 digits. Returns 1=valid, 0=invalid.
+pub fn EdiUnNumberCheck(ptr: int64, len: int64): int64 {
+    if (len != 4) { return 0; }
+    var i: int64 := 0;
+    while (i < 4) {
+        var c: int64 := peek8(ptr + i);
+        if (c < 48 || c > 57) { return 0; }
+        i := i + 1;
+    }
+    return 1;
+}
+
+// Known IFTSTA codes: 1/2/3/4. Unknown → 1 (warn). Known → 0 (ok).
+pub fn EdiIftstaStatusCheck(code: int64): int64 {
+    if (code == EDI_IFTSTA_PICKEDUP)  { return 0; }
+    if (code == EDI_IFTSTA_INTRANSIT) { return 0; }
+    if (code == EDI_IFTSTA_DELAYED)   { return 0; }
+    if (code == EDI_IFTSTA_DELIVERED) { return 0; }
+    return 1;
+}
+
+// IFTFCC without booking ref (RFF+BN) → 2 (error).
+pub fn EdiIftfccCheck(hdr: int64): int64 {
+    if (peek64(hdr + EDI_TRN_HDR_BOOKINGLEN) == 0) { return 2; }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IFTMIN — multimodal transport order with N legs (TDT segments)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn EdiIftminWrite(hdr: int64, legs: int64, legCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_TRN_HDR_BGMQUAL, EDI_TRN_BGM_IFTMIN);
+    var pos: int64 := trnWriteHead(hdr, out, outMax);
+
+    var i: int64 := 0;
+    while (i < legCount) {
+        var leg:    int64 := legs + i * EDI_TRN_LEG_SIZE;
+        var depPtr: int64 := peek64(leg + EDI_TRN_LEG_DEPARTURE);
+        var depLen: int64 := peek64(leg + EDI_TRN_LEG_DEPLEN);
+        var arrPtr: int64 := peek64(leg + EDI_TRN_LEG_ARRIVAL);
+        var arrLen: int64 := peek64(leg + EDI_TRN_LEG_ARRLEN);
+        var mode:   int64 := peek64(leg + EDI_TRN_LEG_MODE);
+
+        // TDT+n++mode'
+        pos := trnPutStr(out, pos, outMax, "TDT"c as int64, 3);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := trnPutInt(out, pos, outMax, i + 1);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := trnPutInt(out, pos, outMax, mode);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        pos := trnWriteLoc(out, pos, outMax, 9, depPtr, depLen);
+        pos := trnWriteLoc(out, pos, outMax, 11, arrPtr, arrLen);
+
+        i := i + 1;
+    }
+
+    pos := trnWriteCnt(out, pos, outMax, legCount);
+    return pos;
+}
+
+pub fn EdiIftminRead(buf: int64, bufLen: int64, hdr: int64, legs: int64, maxLegs: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg:    int64 := alloc(EDI_SEG_SIZE);
+    var elems:  int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count:  int64 := 0;
+    var curLeg: int64 := 0;
+    var done:   int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            if (trnTagIs(seg, 66, 71, 77) == 1) {
+                if (n > 0) { poke64(hdr + EDI_TRN_HDR_BGMQUAL, trnParseInt(trnEP(elems,0), trnEL(elems,0))); }
+                if (n > 1) { poke64(hdr + EDI_TRN_HDR_REF, trnEP(elems,1)); poke64(hdr + EDI_TRN_HDR_REFLEN, trnEL(elems,1)); }
+            }
+
+            if (trnTagIs(seg, 78, 65, 68) == 1) {
+                if (n > 1) {
+                    var qp: int64 := trnEP(elems, 0);
+                    var ql: int64 := trnEL(elems, 0);
+                    if (ql >= 2 && peek8(qp) == 67 && peek8(qp+1) == 65) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(trnEP(elems,1), trnEL(elems,1), comps, 4);
+                        poke64(hdr + EDI_TRN_HDR_CARRIER, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_TRN_HDR_CARRLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                }
+            }
+
+            // LOC: qual 87/88 → header; qual 9/11 → current leg
+            if (trnTagIs(seg, 76, 79, 67) == 1) {
+                if (n > 1) {
+                    var qual: int64 := trnParseInt(trnEP(elems,0), trnEL(elems,0));
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    EdiComponentSplit(trnEP(elems,1), trnEL(elems,1), comps, 4);
+                    var lp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                    var ll: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                    if (qual == 87) { poke64(hdr + EDI_TRN_HDR_DEPARTURE, lp); poke64(hdr + EDI_TRN_HDR_DEPLEN, ll); }
+                    if (qual == 88) { poke64(hdr + EDI_TRN_HDR_ARRIVAL,   lp); poke64(hdr + EDI_TRN_HDR_ARRLEN, ll); }
+                    if (qual == 9  && curLeg != 0) { poke64(curLeg + EDI_TRN_LEG_DEPARTURE, lp); poke64(curLeg + EDI_TRN_LEG_DEPLEN, ll); }
+                    if (qual == 11 && curLeg != 0) { poke64(curLeg + EDI_TRN_LEG_ARRIVAL,   lp); poke64(curLeg + EDI_TRN_LEG_ARRLEN, ll); }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // TDT → new leg
+            if (trnTagIs(seg, 84, 68, 84) == 1) {
+                if (count < maxLegs) {
+                    curLeg := legs + count * EDI_TRN_LEG_SIZE;
+                    var zi: int64 := 0;
+                    while (zi < EDI_TRN_LEG_SIZE) { poke8(curLeg + zi, 0); zi := zi + 1; }
+                    if (n > 2) { poke64(curLeg + EDI_TRN_LEG_MODE, trnParseInt(trnEP(elems,2), trnEL(elems,2))); }
+                    count := count + 1;
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Simple messages — shared write head + specific fields
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn EdiIftmbcWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_TRN_HDR_BGMQUAL, EDI_TRN_BGM_IFTMBC);
+    var pos: int64 := trnWriteHead(hdr, out, outMax);
+    pos := trnWriteRff(out, pos, outMax, "BN"c as int64, peek64(hdr+EDI_TRN_HDR_BOOKINGREF), peek64(hdr+EDI_TRN_HDR_BOOKINGLEN));
+    pos := trnWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiIftmbcRead(buf: int64, bufLen: int64, hdr: int64): int64 { return trnReadMsg(buf, bufLen, hdr); }
+
+pub fn EdiIftmcsWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_TRN_HDR_BGMQUAL, EDI_TRN_BGM_IFTMCS);
+    var pos: int64 := trnWriteHead(hdr, out, outMax);
+    pos := trnWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiIftmcsRead(buf: int64, bufLen: int64, hdr: int64): int64 { return trnReadMsg(buf, bufLen, hdr); }
+
+pub fn EdiIftmanWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_TRN_HDR_BGMQUAL, EDI_TRN_BGM_IFTMAN);
+    var pos: int64 := trnWriteHead(hdr, out, outMax);
+    pos := trnWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiIftmanRead(buf: int64, bufLen: int64, hdr: int64): int64 { return trnReadMsg(buf, bufLen, hdr); }
+
+pub fn EdiIfcsumWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_TRN_HDR_BGMQUAL, EDI_TRN_BGM_IFCSUM);
+    var pos: int64 := trnWriteHead(hdr, out, outMax);
+    pos := trnWriteRff(out, pos, outMax, "BN"c as int64, peek64(hdr+EDI_TRN_HDR_BOOKINGREF), peek64(hdr+EDI_TRN_HDR_BOOKINGLEN));
+    pos := trnWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiIfcsumRead(buf: int64, bufLen: int64, hdr: int64): int64 { return trnReadMsg(buf, bufLen, hdr); }
+
+pub fn EdiIftstaWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_TRN_HDR_BGMQUAL, EDI_TRN_BGM_IFTSTA);
+    var pos: int64 := trnWriteHead(hdr, out, outMax);
+    // STS+statusCode'
+    pos := trnPutStr(out, pos, outMax, "STS"c as int64, 3);
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := trnPutInt(out, pos, outMax, peek64(hdr + EDI_TRN_HDR_STATUSCODE));
+    pos := trnPutChar(out, pos, outMax, EDI_DEF_SEG);
+    pos := trnWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiIftstaRead(buf: int64, bufLen: int64, hdr: int64): int64 { return trnReadMsg(buf, bufLen, hdr); }
+
+pub fn EdiIftfccWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_TRN_HDR_BGMQUAL, EDI_TRN_BGM_IFTFCC);
+    var pos: int64 := trnWriteHead(hdr, out, outMax);
+    pos := trnWriteRff(out, pos, outMax, "BN"c as int64, peek64(hdr+EDI_TRN_HDR_BOOKINGREF), peek64(hdr+EDI_TRN_HDR_BOOKINGLEN));
+    pos := trnWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiIftfccRead(buf: int64, bufLen: int64, hdr: int64): int64 { return trnReadMsg(buf, bufLen, hdr); }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IFTDGN — dangerous goods notification
+//   Wire: BGM+350+ref+9' / DTM / DGS+ADR+unNum+imdgClass+packingGroup+emsCode' / CNT
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn EdiIftdgnWrite(hdr: int64, goods: int64, goodCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_TRN_HDR_BGMQUAL, EDI_TRN_BGM_IFTDGN);
+    var pos: int64 := trnWriteHead(hdr, out, outMax);
+
+    var i: int64 := 0;
+    while (i < goodCount) {
+        var dg:      int64 := goods + i * EDI_DGD_SIZE;
+        var unPtr:   int64 := peek64(dg + EDI_DGD_UNNUMBER);
+        var unLen:   int64 := peek64(dg + EDI_DGD_UNLEN);
+        var imdgPtr: int64 := peek64(dg + EDI_DGD_IMDGCLASS);
+        var imdgLen: int64 := peek64(dg + EDI_DGD_IMDGLEN);
+        var pg:      int64 := peek64(dg + EDI_DGD_PACKINGGROUP);
+        var emsPtr:  int64 := peek64(dg + EDI_DGD_EMSCODE);
+        var emsLen:  int64 := peek64(dg + EDI_DGD_EMSLEN);
+
+        pos := trnPutStr(out, pos, outMax, "DGS"c as int64, 3);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := trnPutStr(out, pos, outMax, "ADR"c as int64, 3);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (unPtr != 0 && unLen > 0) { pos := trnPutStr(out, pos, outMax, unPtr, unLen); }
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (imdgPtr != 0 && imdgLen > 0) { pos := trnPutStr(out, pos, outMax, imdgPtr, imdgLen); }
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := trnPutInt(out, pos, outMax, pg);
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (emsPtr != 0 && emsLen > 0) { pos := trnPutStr(out, pos, outMax, emsPtr, emsLen); }
+        pos := trnPutChar(out, pos, outMax, EDI_DEF_SEG);
+        i := i + 1;
+    }
+
+    pos := trnWriteCnt(out, pos, outMax, goodCount);
+    return pos;
+}
+
+pub fn EdiIftdgnRead(buf: int64, bufLen: int64, hdr: int64, goods: int64, maxGoods: int64): int64 {
+    trnReadMsg(buf, bufLen, hdr);
+
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg:   int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count: int64 := 0;
+    var done:  int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+            // DGS = 68,71,83
+            if (trnTagIs(seg, 68, 71, 83) == 1 && count < maxGoods) {
+                var dg: int64 := goods + count * EDI_DGD_SIZE;
+                var zi: int64 := 0;
+                while (zi < EDI_DGD_SIZE) { poke8(dg + zi, 0); zi := zi + 1; }
+                if (n > 1) { poke64(dg + EDI_DGD_UNNUMBER, trnEP(elems,1)); poke64(dg + EDI_DGD_UNLEN, trnEL(elems,1)); }
+                if (n > 2) { poke64(dg + EDI_DGD_IMDGCLASS, trnEP(elems,2)); poke64(dg + EDI_DGD_IMDGLEN, trnEL(elems,2)); }
+                if (n > 3) { poke64(dg + EDI_DGD_PACKINGGROUP, trnParseInt(trnEP(elems,3), trnEL(elems,3))); }
+                if (n > 4) { poke64(dg + EDI_DGD_EMSCODE, trnEP(elems,4)); poke64(dg + EDI_DGD_EMSLEN, trnEL(elems,4)); }
+                count := count + 1;
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}

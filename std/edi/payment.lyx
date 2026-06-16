@@ -1,0 +1,1041 @@
+// std/edi/payment.lyx — Payment & Banking: REMADV + PAYMUL + PAYORD + PAYEXT +
+//   DEBADV + CREEXT + CREMUL + DEBMUL + BANSTA + DIRDEB + FINCAN + DOCAPP + DOCINF
+//   (WP-EDI-09)
+//
+// IBAN validation (MOD 97), BIC format check (8/11 chars).
+// REMADV: must carry RFF+IV (invoice ref); missing → EdiRemadvCheck returns 1 (warn).
+// DIRDEB: mandatory mandate ref (RFF+MR); missing → EdiDirdebCheck returns 2 (err).
+// FINCAN: mandatory transaction ref (RFF+TN); missing → EdiFincanCheck returns 2 (err).
+// PAYMUL: Σ item amounts must equal header total; deviation >1 → EdiPaymulValidate returns 2.
+// DOCAPP/DOCINF: documentary credit with DOC-segment list.
+
+unit std.edi.payment;
+
+import std.edi.core;
+import std.alloc;
+
+// ── BGM qualifier constants ───────────────────────────────────────────────────
+pub con EDI_PAY_BGM_REMADV: int64 := 481;
+pub con EDI_PAY_BGM_PAYMUL: int64 := 452;
+pub con EDI_PAY_BGM_PAYORD: int64 := 450;
+pub con EDI_PAY_BGM_PAYEXT: int64 := 455;
+pub con EDI_PAY_BGM_DEBADV: int64 := 479;
+pub con EDI_PAY_BGM_CREEXT: int64 := 462;
+pub con EDI_PAY_BGM_CREMUL: int64 := 454;
+pub con EDI_PAY_BGM_DEBMUL: int64 := 453;
+pub con EDI_PAY_BGM_BANSTA: int64 := 391;
+pub con EDI_PAY_BGM_DIRDEB: int64 := 431;
+pub con EDI_PAY_BGM_FINCAN: int64 := 456;
+pub con EDI_PAY_BGM_DOCAPP: int64 := 760;
+pub con EDI_PAY_BGM_DOCINF: int64 := 763;
+
+// ── EDI_PAY_HDR offsets (160 bytes) ──────────────────────────────────────────
+pub con EDI_PAY_HDR_BGMQUAL:    int64 := 0;
+pub con EDI_PAY_HDR_REF:        int64 := 8;    // payment/order reference
+pub con EDI_PAY_HDR_REFLEN:     int64 := 16;
+pub con EDI_PAY_HDR_DATE:       int64 := 24;   // ptr to 8-char YYYYMMDD
+pub con EDI_PAY_HDR_DATELEN:    int64 := 32;
+pub con EDI_PAY_HDR_AMOUNT:     int64 := 40;   // ×100 fixed-point
+pub con EDI_PAY_HDR_CURRENCY:   int64 := 48;
+pub con EDI_PAY_HDR_CURLEN:     int64 := 56;
+pub con EDI_PAY_HDR_CREDIBAN:   int64 := 64;   // creditor IBAN
+pub con EDI_PAY_HDR_CREDILEN:   int64 := 72;
+pub con EDI_PAY_HDR_DEBTIBAN:   int64 := 80;   // debtor IBAN
+pub con EDI_PAY_HDR_DEBTILEN:   int64 := 88;
+pub con EDI_PAY_HDR_BIC:        int64 := 96;   // creditor bank BIC
+pub con EDI_PAY_HDR_BICLEN:     int64 := 104;
+pub con EDI_PAY_HDR_MANDATEREF: int64 := 112;  // DIRDEB RFF+MR
+pub con EDI_PAY_HDR_MANDATELEN: int64 := 120;
+pub con EDI_PAY_HDR_INVOICEREF: int64 := 128;  // REMADV RFF+IV
+pub con EDI_PAY_HDR_INVOICELEN: int64 := 136;
+pub con EDI_PAY_HDR_TXNREF:     int64 := 144;  // FINCAN RFF+TN
+pub con EDI_PAY_HDR_TXNREFLEN:  int64 := 152;
+pub con EDI_PAY_HDR_SIZE:       int64 := 160;
+
+// ── EDI_PAYMUL_ITEM offsets (56 bytes) ───────────────────────────────────────
+pub con EDI_PAYMUL_ITEM_AMOUNT:   int64 := 0;
+pub con EDI_PAYMUL_ITEM_REF:      int64 := 8;
+pub con EDI_PAYMUL_ITEM_REFLEN:   int64 := 16;
+pub con EDI_PAYMUL_ITEM_DEBTIBAN: int64 := 24;
+pub con EDI_PAYMUL_ITEM_DEBTILEN: int64 := 32;
+pub con EDI_PAYMUL_ITEM_CREDIBAN: int64 := 40;
+pub con EDI_PAYMUL_ITEM_CREDILEN: int64 := 48;
+pub con EDI_PAYMUL_ITEM_SIZE:     int64 := 56;
+
+// ── EDI_DOCAPP_HDR offsets (88 bytes) ────────────────────────────────────────
+pub con EDI_DOCAPP_HDR_CREDITNUM:    int64 := 0;
+pub con EDI_DOCAPP_HDR_CREDITNUMLEN: int64 := 8;
+pub con EDI_DOCAPP_HDR_BENEFICIARY:  int64 := 16;
+pub con EDI_DOCAPP_HDR_BENEFLEN:     int64 := 24;
+pub con EDI_DOCAPP_HDR_BANKBIC:      int64 := 32;
+pub con EDI_DOCAPP_HDR_BANKBICLEN:   int64 := 40;
+pub con EDI_DOCAPP_HDR_AMOUNT:       int64 := 48;   // ×100
+pub con EDI_DOCAPP_HDR_CURRENCY:     int64 := 56;
+pub con EDI_DOCAPP_HDR_CURLEN:       int64 := 64;
+pub con EDI_DOCAPP_HDR_VALIDUNTIL:   int64 := 72;   // ptr to 8-char date
+pub con EDI_DOCAPP_HDR_VALIDUNTILLEN:int64 := 80;
+pub con EDI_DOCAPP_HDR_SIZE:         int64 := 88;
+
+// ── EDI_DOCAPP_DOC offsets (24 bytes) ────────────────────────────────────────
+pub con EDI_DOCAPP_DOC_CODE:    int64 := 0;
+pub con EDI_DOCAPP_DOC_CODELEN: int64 := 8;
+pub con EDI_DOCAPP_DOC_COPIES:  int64 := 16;
+pub con EDI_DOCAPP_DOC_SIZE:    int64 := 24;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn payPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn payPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i := i + 1;
+    }
+    return pos + n;
+}
+
+fn payPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val == 0) { return payPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var tbuf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(tbuf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx := idx + 1;
+    }
+    var r: int64 := payPutStr(out, pos, outMax, tbuf, digits);
+    free(tbuf, 24);
+    return r;
+}
+
+fn payPutRevenue(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    var euros: int64 := val / 100;
+    var cents: int64 := val - euros * 100;
+    pos := payPutInt(out, pos, outMax, euros);
+    pos := payPutChar(out, pos, outMax, 46);
+    if (cents < 10) { pos := payPutChar(out, pos, outMax, 48); }
+    pos := payPutInt(out, pos, outMax, cents);
+    return pos;
+}
+
+fn payParseInt(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c >= 48 && c <= 57) { v := v * 10 + (c - 48); }
+        i := i + 1;
+    }
+    return v;
+}
+
+fn payParseRevenue(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var afterDot: int64 := 0;
+    var decimals: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c == 46 || c == 44) { afterDot := 1; }
+        else {
+            if (c >= 48 && c <= 57) {
+                v := v * 10 + (c - 48);
+                if (afterDot == 1) { decimals := decimals + 1; }
+            }
+        }
+        i := i + 1;
+    }
+    if (afterDot == 0) { v := v * 100; }
+    if (decimals == 1) { v := v * 10; }
+    return v;
+}
+
+fn payTagIs(seg: int64, t0: int64, t1: int64, t2: int64): int64 {
+    var p: int64 := peek64(seg + EDI_SEG_PTR);
+    if (p == 0) { return 0; }
+    if (peek8(p) != t0) { return 0; }
+    if (peek8(p+1) != t1) { return 0; }
+    if (peek8(p+2) != t2) { return 0; }
+    return 1;
+}
+
+fn payElemPtr(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+}
+fn payElemLen(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+}
+
+fn payWriteMoa(out: int64, pos: int64, outMax: int64, qualifier: int64, amount: int64): int64 {
+    pos := payPutStr(out, pos, outMax, "MOA"c as int64, 3);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := payPutInt(out, pos, outMax, qualifier);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := payPutRevenue(out, pos, outMax, amount);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+fn payWriteRff(out: int64, pos: int64, outMax: int64, qual2: int64, refPtr: int64, refLen: int64): int64 {
+    if (refPtr == 0 || refLen == 0) { return pos; }
+    pos := payPutStr(out, pos, outMax, "RFF"c as int64, 3);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := payPutStr(out, pos, outMax, qual2, 2);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := payPutStr(out, pos, outMax, refPtr, refLen);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+fn payWriteCnt(out: int64, pos: int64, outMax: int64, n: int64): int64 {
+    pos := payPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := payPutChar(out, pos, outMax, 50);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := payPutInt(out, pos, outMax, n);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// Write BGM+DTM+FII(CR)+FII(DB)+CUX+MOA; returns pos after MOA
+fn payWriteHead(hdr: int64, out: int64, outMax: int64): int64 {
+    var bgmQual: int64 := peek64(hdr + EDI_PAY_HDR_BGMQUAL);
+    var refPtr:  int64 := peek64(hdr + EDI_PAY_HDR_REF);
+    var refLen:  int64 := peek64(hdr + EDI_PAY_HDR_REFLEN);
+    var datePtr: int64 := peek64(hdr + EDI_PAY_HDR_DATE);
+    var crPtr:   int64 := peek64(hdr + EDI_PAY_HDR_CREDIBAN);
+    var crLen:   int64 := peek64(hdr + EDI_PAY_HDR_CREDILEN);
+    var dbPtr:   int64 := peek64(hdr + EDI_PAY_HDR_DEBTIBAN);
+    var dbLen:   int64 := peek64(hdr + EDI_PAY_HDR_DEBTILEN);
+    var bicPtr:  int64 := peek64(hdr + EDI_PAY_HDR_BIC);
+    var bicLen:  int64 := peek64(hdr + EDI_PAY_HDR_BICLEN);
+    var curPtr:  int64 := peek64(hdr + EDI_PAY_HDR_CURRENCY);
+    var curLen:  int64 := peek64(hdr + EDI_PAY_HDR_CURLEN);
+    var amount:  int64 := peek64(hdr + EDI_PAY_HDR_AMOUNT);
+    var pos:     int64 := 0;
+
+    pos := payPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := payPutInt(out, pos, outMax, bgmQual);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (refPtr != 0 && refLen > 0) { pos := payPutStr(out, pos, outMax, refPtr, refLen); }
+    pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := payPutChar(out, pos, outMax, 57);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    if (datePtr != 0) {
+        pos := payPutStr(out, pos, outMax, "DTM"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutStr(out, pos, outMax, "137"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutStr(out, pos, outMax, datePtr, 8);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutStr(out, pos, outMax, "102"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    // FII+CR+iban:bic:25'
+    if (crPtr != 0 && crLen > 0) {
+        pos := payPutStr(out, pos, outMax, "FII"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutStr(out, pos, outMax, "CR"c as int64, 2);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutStr(out, pos, outMax, crPtr, crLen);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        if (bicPtr != 0 && bicLen > 0) { pos := payPutStr(out, pos, outMax, bicPtr, bicLen); }
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutStr(out, pos, outMax, "25"c as int64, 2);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    // FII+DB+iban::25'
+    if (dbPtr != 0 && dbLen > 0) {
+        pos := payPutStr(out, pos, outMax, "FII"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutStr(out, pos, outMax, "DB"c as int64, 2);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutStr(out, pos, outMax, dbPtr, dbLen);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutStr(out, pos, outMax, "25"c as int64, 2);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    if (curPtr != 0 && curLen > 0) {
+        pos := payPutStr(out, pos, outMax, "CUX"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutChar(out, pos, outMax, 50);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutStr(out, pos, outMax, curPtr, curLen);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutChar(out, pos, outMax, 52);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    pos := payWriteMoa(out, pos, outMax, 9, amount);
+    return pos;
+}
+
+// Parse all standard payment fields into EDI_PAY_HDR
+fn payReadMsg(buf: int64, bufLen: int64, hdr: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg:   int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var done:  int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            // BGM → bgmQual, ref
+            if (payTagIs(seg, 66, 71, 77) == 1) {
+                if (n > 0) { poke64(hdr + EDI_PAY_HDR_BGMQUAL, payParseInt(payElemPtr(elems,0), payElemLen(elems,0))); }
+                if (n > 1) {
+                    poke64(hdr + EDI_PAY_HDR_REF,    payElemPtr(elems,1));
+                    poke64(hdr + EDI_PAY_HDR_REFLEN, payElemLen(elems,1));
+                }
+            }
+
+            // DTM+137 → date
+            if (payTagIs(seg, 68, 84, 77) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,0), payElemLen(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql == 3 && peek8(qp) == 49 && peek8(qp+1) == 51 && peek8(qp+2) == 55) {
+                            poke64(hdr + EDI_PAY_HDR_DATE,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_PAY_HDR_DATELEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // FII → IBAN and BIC
+            if (payTagIs(seg, 70, 73, 73) == 1) {
+                if (n > 1) {
+                    var qp: int64 := payElemPtr(elems, 0);
+                    var ql: int64 := payElemLen(elems, 0);
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,1), payElemLen(elems,1), comps, 4);
+                    // CR (67,82) → creditor
+                    if (ql >= 2 && peek8(qp) == 67 && peek8(qp+1) == 82) {
+                        if (nc > 0) {
+                            poke64(hdr + EDI_PAY_HDR_CREDIBAN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_PAY_HDR_CREDILEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                        if (nc > 1) {
+                            var bl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            if (bl > 0) {
+                                poke64(hdr + EDI_PAY_HDR_BIC,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                                poke64(hdr + EDI_PAY_HDR_BICLEN, bl);
+                            }
+                        }
+                    }
+                    // DB (68,66) → debtor
+                    if (ql >= 2 && peek8(qp) == 68 && peek8(qp+1) == 66) {
+                        if (nc > 0) {
+                            poke64(hdr + EDI_PAY_HDR_DEBTIBAN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_PAY_HDR_DEBTILEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // CUX → currency
+            if (payTagIs(seg, 67, 85, 88) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,0), payElemLen(elems,0), comps, 4);
+                    if (nc > 1) {
+                        poke64(hdr + EDI_PAY_HDR_CURRENCY, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_PAY_HDR_CURLEN,   peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // MOA+9 → total amount
+            if (payTagIs(seg, 77, 79, 65) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,0), payElemLen(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql == 1 && peek8(qp) == 57) {
+                            poke64(hdr + EDI_PAY_HDR_AMOUNT, payParseRevenue(vp, vl));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // RFF → invoice/mandate/txn ref
+            if (payTagIs(seg, 82, 70, 70) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,0), payElemLen(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "IV" = 73,86
+                        if (ql == 2 && peek8(qp) == 73 && peek8(qp+1) == 86) {
+                            poke64(hdr + EDI_PAY_HDR_INVOICEREF,  vp);
+                            poke64(hdr + EDI_PAY_HDR_INVOICELEN, vl);
+                        }
+                        // "MR" = 77,82
+                        if (ql == 2 && peek8(qp) == 77 && peek8(qp+1) == 82) {
+                            poke64(hdr + EDI_PAY_HDR_MANDATEREF, vp);
+                            poke64(hdr + EDI_PAY_HDR_MANDATELEN, vl);
+                        }
+                        // "TN" = 84,78
+                        if (ql == 2 && peek8(qp) == 84 && peek8(qp+1) == 78) {
+                            poke64(hdr + EDI_PAY_HDR_TXNREF,    vp);
+                            poke64(hdr + EDI_PAY_HDR_TXNREFLEN, vl);
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — Validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// IBAN checksum (MOD 97): move first 4 chars to end, replace letters with
+// two-digit numbers (A=10..Z=35), compute mod 97 of the result → must be 1.
+pub fn EdiIbanCheck(ptr: int64, len: int64): int64 {
+    if (len < 4) { return 0; }
+    var mod: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var idx: int64 := i + 4;
+        if (idx >= len) { idx := idx - len; }
+        var c: int64 := peek8(ptr + idx);
+        if (c >= 48 && c <= 57) {
+            mod := (mod * 10 + c - 48) % 97;
+        } else {
+            var val: int64 := c - 65 + 10;
+            mod := (mod * 10 + val / 10) % 97;
+            mod := (mod * 10 + val - (val / 10) * 10) % 97;
+        }
+        i := i + 1;
+    }
+    if (mod == 1) { return 1; }
+    return 0;
+}
+
+// BIC format: 8 or 11 chars; first 4 = bank code (A-Z); chars 5-6 = country (A-Z).
+pub fn EdiBicCheck(ptr: int64, len: int64): int64 {
+    if (len != 8 && len != 11) { return 0; }
+    var i: int64 := 0;
+    while (i < 4) {
+        var c: int64 := peek8(ptr + i);
+        if (c < 65 || c > 90) { return 0; }
+        i := i + 1;
+    }
+    if (peek8(ptr+4) < 65 || peek8(ptr+4) > 90) { return 0; }
+    if (peek8(ptr+5) < 65 || peek8(ptr+5) > 90) { return 0; }
+    return 1;
+}
+
+// REMADV without invoice ref → 1 (warn). With ref → 0 (ok).
+pub fn EdiRemadvCheck(hdr: int64): int64 {
+    if (peek64(hdr + EDI_PAY_HDR_INVOICELEN) == 0) { return 1; }
+    return 0;
+}
+
+// DIRDEB without mandate ref → 2 (err).
+pub fn EdiDirdebCheck(hdr: int64): int64 {
+    if (peek64(hdr + EDI_PAY_HDR_MANDATELEN) == 0) { return 2; }
+    return 0;
+}
+
+// FINCAN without TN transaction ref → 2 (err).
+pub fn EdiFincanCheck(hdr: int64): int64 {
+    if (peek64(hdr + EDI_PAY_HDR_TXNREFLEN) == 0) { return 2; }
+    return 0;
+}
+
+// PAYMUL sum validation: Σ item amounts vs header total. Deviation >1 → 2.
+pub fn EdiPaymulValidate(hdr: int64, items: int64, itemCount: int64): int64 {
+    var total: int64 := peek64(hdr + EDI_PAY_HDR_AMOUNT);
+    var sum:   int64 := 0;
+    var i:     int64 := 0;
+    while (i < itemCount) {
+        var item: int64 := items + i * EDI_PAYMUL_ITEM_SIZE;
+        sum := sum + peek64(item + EDI_PAYMUL_ITEM_AMOUNT);
+        i := i + 1;
+    }
+    var diff: int64 := sum - total;
+    if (diff < 0) { diff := 0 - diff; }
+    if (diff > 1) { return 2; }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Simple payment messages — shared write pattern, specific RFF
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn EdiRemadvWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_PAY_HDR_BGMQUAL, EDI_PAY_BGM_REMADV);
+    var pos: int64 := payWriteHead(hdr, out, outMax);
+    pos := payWriteRff(out, pos, outMax, "IV"c as int64, peek64(hdr+EDI_PAY_HDR_INVOICEREF), peek64(hdr+EDI_PAY_HDR_INVOICELEN));
+    pos := payWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiRemadvRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    return payReadMsg(buf, bufLen, hdr);
+}
+
+pub fn EdiPayordWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_PAY_HDR_BGMQUAL, EDI_PAY_BGM_PAYORD);
+    var pos: int64 := payWriteHead(hdr, out, outMax);
+    pos := payWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiPayordRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    return payReadMsg(buf, bufLen, hdr);
+}
+
+pub fn EdiPayextWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_PAY_HDR_BGMQUAL, EDI_PAY_BGM_PAYEXT);
+    var pos: int64 := payWriteHead(hdr, out, outMax);
+    pos := payWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiPayextRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    return payReadMsg(buf, bufLen, hdr);
+}
+
+pub fn EdiDebadvWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_PAY_HDR_BGMQUAL, EDI_PAY_BGM_DEBADV);
+    var pos: int64 := payWriteHead(hdr, out, outMax);
+    pos := payWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiDebadvRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    return payReadMsg(buf, bufLen, hdr);
+}
+
+pub fn EdiCreextWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_PAY_HDR_BGMQUAL, EDI_PAY_BGM_CREEXT);
+    var pos: int64 := payWriteHead(hdr, out, outMax);
+    pos := payWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiCreextRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    return payReadMsg(buf, bufLen, hdr);
+}
+
+pub fn EdiBanstaWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_PAY_HDR_BGMQUAL, EDI_PAY_BGM_BANSTA);
+    var pos: int64 := payWriteHead(hdr, out, outMax);
+    pos := payWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiBanstaRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    return payReadMsg(buf, bufLen, hdr);
+}
+
+pub fn EdiDirdebWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_PAY_HDR_BGMQUAL, EDI_PAY_BGM_DIRDEB);
+    var pos: int64 := payWriteHead(hdr, out, outMax);
+    pos := payWriteRff(out, pos, outMax, "MR"c as int64, peek64(hdr+EDI_PAY_HDR_MANDATEREF), peek64(hdr+EDI_PAY_HDR_MANDATELEN));
+    pos := payWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiDirdebRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    return payReadMsg(buf, bufLen, hdr);
+}
+
+pub fn EdiFincanWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_PAY_HDR_BGMQUAL, EDI_PAY_BGM_FINCAN);
+    var pos: int64 := payWriteHead(hdr, out, outMax);
+    pos := payWriteRff(out, pos, outMax, "TN"c as int64, peek64(hdr+EDI_PAY_HDR_TXNREF), peek64(hdr+EDI_PAY_HDR_TXNREFLEN));
+    pos := payWriteCnt(out, pos, outMax, 1);
+    return pos;
+}
+pub fn EdiFincanRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    return payReadMsg(buf, bufLen, hdr);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAYMUL / CREMUL / DEBMUL — multi-payment messages
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn EdiPaymulWrite(hdr: int64, items: int64, itemCount: int64, out: int64, outMax: int64): int64 {
+    if (peek64(hdr + EDI_PAY_HDR_BGMQUAL) == 0) { poke64(hdr + EDI_PAY_HDR_BGMQUAL, EDI_PAY_BGM_PAYMUL); }
+    var pos: int64 := payWriteHead(hdr, out, outMax);
+
+    var i: int64 := 0;
+    while (i < itemCount) {
+        var item:    int64 := items + i * EDI_PAYMUL_ITEM_SIZE;
+        var iamt:    int64 := peek64(item + EDI_PAYMUL_ITEM_AMOUNT);
+        var iref:    int64 := peek64(item + EDI_PAYMUL_ITEM_REF);
+        var irefLen: int64 := peek64(item + EDI_PAYMUL_ITEM_REFLEN);
+        var idb:     int64 := peek64(item + EDI_PAYMUL_ITEM_DEBTIBAN);
+        var idbLen:  int64 := peek64(item + EDI_PAYMUL_ITEM_DEBTILEN);
+        var icr:     int64 := peek64(item + EDI_PAYMUL_ITEM_CREDIBAN);
+        var icrLen:  int64 := peek64(item + EDI_PAYMUL_ITEM_CREDILEN);
+
+        pos := payPutStr(out, pos, outMax, "LIN"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutInt(out, pos, outMax, i + 1);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        pos := payWriteRff(out, pos, outMax, "CN"c as int64, iref, irefLen);
+
+        if (idb != 0 && idbLen > 0) {
+            pos := payPutStr(out, pos, outMax, "FII"c as int64, 3);
+            pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := payPutStr(out, pos, outMax, "DB"c as int64, 2);
+            pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := payPutStr(out, pos, outMax, idb, idbLen);
+            pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := payPutStr(out, pos, outMax, "25"c as int64, 2);
+            pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        if (icr != 0 && icrLen > 0) {
+            pos := payPutStr(out, pos, outMax, "FII"c as int64, 3);
+            pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := payPutStr(out, pos, outMax, "OR"c as int64, 2);
+            pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := payPutStr(out, pos, outMax, icr, icrLen);
+            pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := payPutStr(out, pos, outMax, "25"c as int64, 2);
+            pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        pos := payWriteMoa(out, pos, outMax, 203, iamt);
+        i := i + 1;
+    }
+
+    pos := payWriteCnt(out, pos, outMax, itemCount);
+    return pos;
+}
+
+pub fn EdiPaymulRead(buf: int64, bufLen: int64, hdr: int64, items: int64, maxItems: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg:     int64 := alloc(EDI_SEG_SIZE);
+    var elems:   int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count:   int64 := 0;
+    var curItem: int64 := 0;
+    var done:    int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            if (payTagIs(seg, 66, 71, 77) == 1) {
+                if (n > 0) { poke64(hdr + EDI_PAY_HDR_BGMQUAL, payParseInt(payElemPtr(elems,0), payElemLen(elems,0))); }
+                if (n > 1) {
+                    poke64(hdr + EDI_PAY_HDR_REF,    payElemPtr(elems,1));
+                    poke64(hdr + EDI_PAY_HDR_REFLEN, payElemLen(elems,1));
+                }
+            }
+
+            if (payTagIs(seg, 67, 85, 88) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,0), payElemLen(elems,0), comps, 4);
+                    if (nc > 1) {
+                        poke64(hdr + EDI_PAY_HDR_CURRENCY, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_PAY_HDR_CURLEN,   peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // LIN → new item
+            if (payTagIs(seg, 76, 73, 78) == 1) {
+                if (count < maxItems) {
+                    curItem := items + count * EDI_PAYMUL_ITEM_SIZE;
+                    var zi: int64 := 0;
+                    while (zi < EDI_PAYMUL_ITEM_SIZE) { poke8(curItem + zi, 0); zi := zi + 1; }
+                    count := count + 1;
+                }
+            }
+
+            // MOA+9 (header) or MOA+203 (item)
+            if (payTagIs(seg, 77, 79, 65) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,0), payElemLen(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var amt: int64 := payParseRevenue(vp, vl);
+                        if (ql == 1 && peek8(qp) == 57) {
+                            poke64(hdr + EDI_PAY_HDR_AMOUNT, amt);
+                        }
+                        // "203" = 50,48,51
+                        if (curItem != 0 && ql == 3 && peek8(qp) == 50 && peek8(qp+1) == 48 && peek8(qp+2) == 51) {
+                            poke64(curItem + EDI_PAYMUL_ITEM_AMOUNT, amt);
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // RFF+CN → item ref
+            if (payTagIs(seg, 82, 70, 70) == 1 && curItem != 0) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,0), payElemLen(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "CN" = 67,78
+                        if (ql == 2 && peek8(qp) == 67 && peek8(qp+1) == 78) {
+                            poke64(curItem + EDI_PAYMUL_ITEM_REF,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(curItem + EDI_PAYMUL_ITEM_REFLEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // FII in item context (DB/OR)
+            if (payTagIs(seg, 70, 73, 73) == 1 && curItem != 0) {
+                if (n > 1) {
+                    var qp: int64 := payElemPtr(elems, 0);
+                    var ql: int64 := payElemLen(elems, 0);
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,1), payElemLen(elems,1), comps, 4);
+                    if (nc > 0) {
+                        // DB (68,66) → debtor
+                        if (ql >= 2 && peek8(qp) == 68 && peek8(qp+1) == 66) {
+                            poke64(curItem + EDI_PAYMUL_ITEM_DEBTIBAN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(curItem + EDI_PAYMUL_ITEM_DEBTILEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                        // OR (79,82) → creditor
+                        if (ql >= 2 && peek8(qp) == 79 && peek8(qp+1) == 82) {
+                            poke64(curItem + EDI_PAYMUL_ITEM_CREDIBAN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(curItem + EDI_PAYMUL_ITEM_CREDILEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}
+
+pub fn EdiCremulWrite(hdr: int64, items: int64, itemCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_PAY_HDR_BGMQUAL, EDI_PAY_BGM_CREMUL);
+    return EdiPaymulWrite(hdr, items, itemCount, out, outMax);
+}
+pub fn EdiCremulRead(buf: int64, bufLen: int64, hdr: int64, items: int64, maxItems: int64): int64 {
+    return EdiPaymulRead(buf, bufLen, hdr, items, maxItems);
+}
+
+pub fn EdiDebmulWrite(hdr: int64, items: int64, itemCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_PAY_HDR_BGMQUAL, EDI_PAY_BGM_DEBMUL);
+    return EdiPaymulWrite(hdr, items, itemCount, out, outMax);
+}
+pub fn EdiDebmulRead(buf: int64, bufLen: int64, hdr: int64, items: int64, maxItems: int64): int64 {
+    return EdiPaymulRead(buf, bufLen, hdr, items, maxItems);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DOCAPP / DOCINF — documentary credit
+//   Wire: BGM+qual+creditNum+9' / DTM+36:validUntil:102' / NAD+BF+beneficiary::9' /
+//         FII+IS+bankBic::25' / CUX+2:currency:4' / MOA+9:amount' /
+//         DOC+code:copies' (per doc) / CNT+2:docCount'
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn docWriteMsg(bgmQual: int64, hdr: int64, docs: int64, docCount: int64, out: int64): int64 {
+    var outMax:  int64 := 8192;
+    var numPtr:  int64 := peek64(hdr + EDI_DOCAPP_HDR_CREDITNUM);
+    var numLen:  int64 := peek64(hdr + EDI_DOCAPP_HDR_CREDITNUMLEN);
+    var benPtr:  int64 := peek64(hdr + EDI_DOCAPP_HDR_BENEFICIARY);
+    var benLen:  int64 := peek64(hdr + EDI_DOCAPP_HDR_BENEFLEN);
+    var bicPtr:  int64 := peek64(hdr + EDI_DOCAPP_HDR_BANKBIC);
+    var bicLen:  int64 := peek64(hdr + EDI_DOCAPP_HDR_BANKBICLEN);
+    var amount:  int64 := peek64(hdr + EDI_DOCAPP_HDR_AMOUNT);
+    var curPtr:  int64 := peek64(hdr + EDI_DOCAPP_HDR_CURRENCY);
+    var curLen:  int64 := peek64(hdr + EDI_DOCAPP_HDR_CURLEN);
+    var valPtr:  int64 := peek64(hdr + EDI_DOCAPP_HDR_VALIDUNTIL);
+    var pos:     int64 := 0;
+
+    pos := payPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := payPutInt(out, pos, outMax, bgmQual);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (numPtr != 0 && numLen > 0) { pos := payPutStr(out, pos, outMax, numPtr, numLen); }
+    pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := payPutChar(out, pos, outMax, 57);
+    pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    if (valPtr != 0) {
+        pos := payPutStr(out, pos, outMax, "DTM"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutStr(out, pos, outMax, "36"c as int64, 2);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutStr(out, pos, outMax, valPtr, 8);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutStr(out, pos, outMax, "102"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    if (benPtr != 0 && benLen > 0) {
+        pos := payPutStr(out, pos, outMax, "NAD"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutStr(out, pos, outMax, "BF"c as int64, 2);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutStr(out, pos, outMax, benPtr, benLen);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutChar(out, pos, outMax, 57);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    if (bicPtr != 0 && bicLen > 0) {
+        pos := payPutStr(out, pos, outMax, "FII"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutStr(out, pos, outMax, "IS"c as int64, 2);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutStr(out, pos, outMax, bicPtr, bicLen);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutStr(out, pos, outMax, "25"c as int64, 2);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    if (curPtr != 0 && curLen > 0) {
+        pos := payPutStr(out, pos, outMax, "CUX"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := payPutChar(out, pos, outMax, 50);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutStr(out, pos, outMax, curPtr, curLen);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutChar(out, pos, outMax, 52);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    pos := payWriteMoa(out, pos, outMax, 9, amount);
+
+    var di: int64 := 0;
+    while (di < docCount) {
+        var doc:     int64 := docs + di * EDI_DOCAPP_DOC_SIZE;
+        var codePtr: int64 := peek64(doc + EDI_DOCAPP_DOC_CODE);
+        var codeLen: int64 := peek64(doc + EDI_DOCAPP_DOC_CODELEN);
+        var copies:  int64 := peek64(doc + EDI_DOCAPP_DOC_COPIES);
+        pos := payPutStr(out, pos, outMax, "DOC"c as int64, 3);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (codePtr != 0 && codeLen > 0) { pos := payPutStr(out, pos, outMax, codePtr, codeLen); }
+        pos := payPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := payPutInt(out, pos, outMax, copies);
+        pos := payPutChar(out, pos, outMax, EDI_DEF_SEG);
+        di := di + 1;
+    }
+
+    pos := payWriteCnt(out, pos, outMax, docCount);
+    return pos;
+}
+
+pub fn EdiDocappWrite(hdr: int64, docs: int64, docCount: int64, out: int64, outMax: int64): int64 {
+    return docWriteMsg(EDI_PAY_BGM_DOCAPP, hdr, docs, docCount, out);
+}
+
+fn docReadMsg(buf: int64, bufLen: int64, hdr: int64, docs: int64, maxDocs: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg:   int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count: int64 := 0;
+    var done:  int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            if (payTagIs(seg, 66, 71, 77) == 1) {
+                if (n > 1) {
+                    poke64(hdr + EDI_DOCAPP_HDR_CREDITNUM,    payElemPtr(elems,1));
+                    poke64(hdr + EDI_DOCAPP_HDR_CREDITNUMLEN, payElemLen(elems,1));
+                }
+            }
+
+            // DTM+36 → validUntil
+            if (payTagIs(seg, 68, 84, 77) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,0), payElemLen(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "36" = 51,54
+                        if (ql == 2 && peek8(qp) == 51 && peek8(qp+1) == 54) {
+                            poke64(hdr + EDI_DOCAPP_HDR_VALIDUNTIL,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_DOCAPP_HDR_VALIDUNTILLEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // NAD+BF → beneficiary
+            if (payTagIs(seg, 78, 65, 68) == 1) {
+                if (n > 1) {
+                    var qp: int64 := payElemPtr(elems, 0);
+                    var ql: int64 := payElemLen(elems, 0);
+                    // "BF" = 66,70
+                    if (ql >= 2 && peek8(qp) == 66 && peek8(qp+1) == 70) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(payElemPtr(elems,1), payElemLen(elems,1), comps, 4);
+                        poke64(hdr + EDI_DOCAPP_HDR_BENEFICIARY, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_DOCAPP_HDR_BENEFLEN,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                }
+            }
+
+            // FII+IS → bank BIC
+            if (payTagIs(seg, 70, 73, 73) == 1) {
+                if (n > 1) {
+                    var qp: int64 := payElemPtr(elems, 0);
+                    var ql: int64 := payElemLen(elems, 0);
+                    // "IS" = 73,83
+                    if (ql >= 2 && peek8(qp) == 73 && peek8(qp+1) == 83) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(payElemPtr(elems,1), payElemLen(elems,1), comps, 4);
+                        poke64(hdr + EDI_DOCAPP_HDR_BANKBIC,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_DOCAPP_HDR_BANKBICLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                }
+            }
+
+            // CUX → currency
+            if (payTagIs(seg, 67, 85, 88) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,0), payElemLen(elems,0), comps, 4);
+                    if (nc > 1) {
+                        poke64(hdr + EDI_DOCAPP_HDR_CURRENCY, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_DOCAPP_HDR_CURLEN,   peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // MOA+9 → amount
+            if (payTagIs(seg, 77, 79, 65) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,0), payElemLen(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql == 1 && peek8(qp) == 57) {
+                            poke64(hdr + EDI_DOCAPP_HDR_AMOUNT, payParseRevenue(peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR), peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN)));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // DOC+code:copies'
+            if (payTagIs(seg, 68, 79, 67) == 1) {
+                if (count < maxDocs && n > 0) {
+                    var doc: int64 := docs + count * EDI_DOCAPP_DOC_SIZE;
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(payElemPtr(elems,0), payElemLen(elems,0), comps, 4);
+                    if (nc > 0) {
+                        poke64(doc + EDI_DOCAPP_DOC_CODE,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(doc + EDI_DOCAPP_DOC_CODELEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    if (nc > 1) {
+                        poke64(doc + EDI_DOCAPP_DOC_COPIES, payParseInt(peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR), peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN)));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                    count := count + 1;
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}
+
+pub fn EdiDocappRead(buf: int64, bufLen: int64, hdr: int64, docs: int64, maxDocs: int64): int64 {
+    return docReadMsg(buf, bufLen, hdr, docs, maxDocs);
+}
+
+pub fn EdiDocinfrWrite(hdr: int64, docs: int64, docCount: int64, out: int64, outMax: int64): int64 {
+    return docWriteMsg(EDI_PAY_BGM_DOCINF, hdr, docs, docCount, out);
+}
+
+pub fn EdiDocinfrRead(buf: int64, bufLen: int64, hdr: int64, docs: int64, maxDocs: int64): int64 {
+    return docReadMsg(buf, bufLen, hdr, docs, maxDocs);
+}

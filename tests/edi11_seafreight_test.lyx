@@ -1,0 +1,484 @@
+// tests/edi11_seafreight_test.lyx — WP-EDI-11 Sea Freight tests
+unit tests.edi11_seafreight_test;
+
+import std.edi.seafreight;
+import std.edi.core;
+import std.alloc;
+import src.std.io;
+
+fn strEq(a: int64, aLen: int64, b: int64, bLen: int64): int64 {
+    if (aLen != bLen) { return 0; }
+    var i: int64 := 0;
+    while (i < aLen) {
+        if (peek8(a + i) != peek8(b + i)) { return 0; }
+        i := i + 1;
+    }
+    return 1;
+}
+
+fn pass(n: int64) { Print("PASS "); PrintLn(n); }
+fn fail(n: int64) { Print("FAIL "); PrintLn(n); }
+fn check(n: int64, ok: int64) { if (ok == 1) { pass(n); } else { fail(n); } }
+
+// Zero-fill a buffer
+fn zero(ptr: int64, sz: int64) {
+    var i: int64 := 0;
+    while (i < sz) { poke8(ptr + i, 0); i := i + 1; }
+}
+
+// Fill SF header with standard voyage data
+fn fillHdr(hdr: int64) {
+    zero(hdr, EDI_SF_HDR_SIZE);
+    poke64(hdr + EDI_SF_HDR_REF,      "VOYAGE001"c as int64);
+    poke64(hdr + EDI_SF_HDR_REFLEN,   9);
+    poke64(hdr + EDI_SF_HDR_DATE,     "20260615"c as int64);
+    poke64(hdr + EDI_SF_HDR_VESSEL,   "COSCO"c as int64);
+    poke64(hdr + EDI_SF_HDR_VESSELLN, 5);
+    poke64(hdr + EDI_SF_HDR_VOYAGE,   "VG2026A"c as int64);
+    poke64(hdr + EDI_SF_HDR_VOYAGELN, 7);
+    poke64(hdr + EDI_SF_HDR_PORT,     "DEHAM"c as int64);
+    poke64(hdr + EDI_SF_HDR_PORTLEN,  5);
+}
+
+// Fill container at ptr with ID (always 11 chars), size, bay, row, tier, weight × 100
+fn fillContPos(c: int64, idStr: int64, sz: int64, bay: int64, row: int64, tier: int64): int64 {
+    zero(c, EDI_SF_CONT_SIZE_OFF);
+    poke64(c + EDI_SF_CONT_ID,      idStr);
+    poke64(c + EDI_SF_CONT_IDLEN,   11);
+    poke64(c + EDI_SF_CONT_SIZE,    sz);
+    poke64(c + EDI_SF_CONT_TYPE,    "GP"c as int64);
+    poke64(c + EDI_SF_CONT_TYPELEN, 2);
+    poke64(c + EDI_SF_CONT_BAY,     bay);
+    poke64(c + EDI_SF_CONT_ROW,     row);
+    poke64(c + EDI_SF_CONT_TIER,    tier);
+    return 1;
+}
+
+// Set weight and moveType on an already-filled container
+fn fillContWtMv(c: int64, wt: int64, mv: int64): int64 {
+    poke64(c + EDI_SF_CONT_WEIGHT,   wt);
+    poke64(c + EDI_SF_CONT_MOVETYPE, mv);
+    return 1;
+}
+
+fn main() {
+    // ── Tests 1-7: EdiContainerCheck — ISO 6346 ──────────────────────────────
+    // Valid containers (sum%11 computed independently):
+    //   AAAU0000007 : sum=326, 326%11=7 → cd=7  ✓
+    //   TEXU1234569 : sum=5597, 5597%11=9 → cd=9 ✓
+    //   MSCU2345672 : check=2 ✓
+    //   HLXU9876547 : check=7 ✓
+    //   BICU0000011 : check=1 ✓
+
+    check(1, EdiContainerCheck("AAAU0000007"c as int64, 11));
+    check(2, EdiContainerCheck("TEXU1234569"c as int64, 11));
+    check(3, EdiContainerCheck("AAAU0000001"c as int64, 11) == 0);  // wrong cd (should be 7)
+    check(4, EdiContainerCheck("AAAU000000"c as int64, 10) == 0);   // wrong length
+    check(5, EdiContainerCheck("1AAU0000007"c as int64, 11) == 0);  // first char digit
+    check(6, EdiContainerCheck("00000000000"c as int64, 11) == 0);  // no letters in prefix
+    check(7, EdiContainerCheck("MSCU2345672"c as int64, 11));
+
+    // ── Tests 8-14: BAPLIE write/read round-trip — 2 containers ─────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(2 * EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont + 0 * EDI_SF_CONT_SIZE_OFF, "AAAU0000007"c as int64, 20, 3, 1, 82);
+        fillContWtMv(cont + 0 * EDI_SF_CONT_SIZE_OFF, 2200000, EDI_SF_MOVE_LOAD);
+        fillContPos(cont + 1 * EDI_SF_CONT_SIZE_OFF, "TEXU1234569"c as int64, 40, 5, 2, 84);
+        fillContWtMv(cont + 1 * EDI_SF_CONT_SIZE_OFF, 2750000, EDI_SF_MOVE_DISCHARGE);
+
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiBaplieWrite(hdr, cont, 2, out, 8192);
+        check(8, written > 0);
+
+        // BGM tag present
+        {
+            var found: int64 := 0;
+            var j: int64 := 0;
+            while (j + 2 < written) {
+                if (peek8(out+j)==66 && peek8(out+j+1)==71 && peek8(out+j+2)==77) { found := 1; }
+                j := j + 1;
+            }
+            check(9, found);
+        }
+
+        // EQD tag present
+        {
+            var found: int64 := 0;
+            var j: int64 := 0;
+            while (j + 2 < written) {
+                if (peek8(out+j)==69 && peek8(out+j+1)==81 && peek8(out+j+2)==68) { found := 1; }
+                j := j + 1;
+            }
+            check(10, found);
+        }
+
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(4 * EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, 4 * EDI_SF_CONT_SIZE_OFF);
+
+        var contCount: int64 := EdiBaplieRead(out, written, hdr2, cont2, 4);
+        check(11, contCount == 2);
+        check(12, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == EDI_SF_BGM_BAPLIE);
+        check(13, peek64(cont2 + 0 * EDI_SF_CONT_SIZE_OFF + EDI_SF_CONT_IDLEN) == 11);
+
+        var id0Ptr: int64 := peek64(cont2 + 0 * EDI_SF_CONT_SIZE_OFF + EDI_SF_CONT_ID);
+        var id0Len: int64 := peek64(cont2 + 0 * EDI_SF_CONT_SIZE_OFF + EDI_SF_CONT_IDLEN);
+        check(14, strEq(id0Ptr, id0Len, "AAAU0000007"c as int64, 11));
+
+        free(cont2, 4 * EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, 2 * EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 15-17: voyage + vessel + port round-trip ────────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "AAAU0000007"c as int64, 20, 1, 1, 82);
+        fillContWtMv(cont, 2000000, EDI_SF_MOVE_LOAD);
+
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiBaplieWrite(hdr, cont, 1, out, 8192);
+
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(2 * EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, 2 * EDI_SF_CONT_SIZE_OFF);
+        EdiBaplieRead(out, written, hdr2, cont2, 2);
+
+        var voyPtr: int64 := peek64(hdr2 + EDI_SF_HDR_VOYAGE);
+        var voyLen: int64 := peek64(hdr2 + EDI_SF_HDR_VOYAGELN);
+        var vesPtr: int64 := peek64(hdr2 + EDI_SF_HDR_VESSEL);
+        var vesLen: int64 := peek64(hdr2 + EDI_SF_HDR_VESSELLN);
+        var porPtr: int64 := peek64(hdr2 + EDI_SF_HDR_PORT);
+        var porLen: int64 := peek64(hdr2 + EDI_SF_HDR_PORTLEN);
+
+        check(15, strEq(voyPtr, voyLen, "VG2026A"c as int64, 7));
+        check(16, strEq(vesPtr, vesLen, "COSCO"c as int64, 5));
+        check(17, strEq(porPtr, porLen, "DEHAM"c as int64, 5));
+
+        free(cont2, 2 * EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 18-20: stowage position round-trip ──────────────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "TEXU1234569"c as int64, 40, 7, 3, 86);
+        fillContWtMv(cont, 3000000, EDI_SF_MOVE_SHIFT);
+
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiBaplieWrite(hdr, cont, 1, out, 8192);
+
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(2 * EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, 2 * EDI_SF_CONT_SIZE_OFF);
+        EdiBaplieRead(out, written, hdr2, cont2, 2);
+
+        check(18, peek64(cont2 + EDI_SF_CONT_BAY) == 7);
+        check(19, peek64(cont2 + EDI_SF_CONT_ROW) == 3);
+        check(20, peek64(cont2 + EDI_SF_CONT_TIER) == 86);
+
+        free(cont2, 2 * EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 21-22: MOVINS bgmQual == 28 ────────────────────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "AAAU0000007"c as int64, 20, 1, 1, 82);
+        fillContWtMv(cont, 2000000, EDI_SF_MOVE_LOAD);
+        var out: int64 := alloc(8192);
+        EdiMovinsWrite(hdr, cont, 1, out, 8192);
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, EDI_SF_CONT_SIZE_OFF);
+        EdiMovinsRead(out, 8192, hdr2, cont2, 1);
+        check(21, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == EDI_SF_BGM_MOVINS);
+        check(22, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == 28);
+        free(cont2, EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 23-24: COPARN bgmQual == 38 ────────────────────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "TEXU1234569"c as int64, 40, 1, 1, 82);
+        fillContWtMv(cont, 2000000, EDI_SF_MOVE_DISCHARGE);
+        var out: int64 := alloc(8192);
+        EdiCoparnWrite(hdr, cont, 1, out, 8192);
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, EDI_SF_CONT_SIZE_OFF);
+        EdiCoparnRead(out, 8192, hdr2, cont2, 1);
+        check(23, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == EDI_SF_BGM_COPARN);
+        check(24, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == 38);
+        free(cont2, EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 25-26: CODECO bgmQual == 29 ────────────────────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "AAAU0000007"c as int64, 20, 1, 1, 82);
+        fillContWtMv(cont, 2000000, EDI_SF_MOVE_LOAD);
+        var out: int64 := alloc(8192);
+        EdiCodecoWrite(hdr, cont, 1, out, 8192);
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, EDI_SF_CONT_SIZE_OFF);
+        EdiCodecoRead(out, 8192, hdr2, cont2, 1);
+        check(25, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == EDI_SF_BGM_CODECO);
+        check(26, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == 29);
+        free(cont2, EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 27-28: COARRI bgmQual == 30 ────────────────────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "AAAU0000007"c as int64, 20, 2, 2, 82);
+        fillContWtMv(cont, 2000000, EDI_SF_MOVE_DISCHARGE);
+        var out: int64 := alloc(8192);
+        EdiCoarriWrite(hdr, cont, 1, out, 8192);
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, EDI_SF_CONT_SIZE_OFF);
+        EdiCoarriRead(out, 8192, hdr2, cont2, 1);
+        check(27, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == EDI_SF_BGM_COARRI);
+        check(28, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == 30);
+        free(cont2, EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 29-30: COPINO bgmQual == 39 ────────────────────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "TEXU1234569"c as int64, 40, 1, 1, 82);
+        fillContWtMv(cont, 2000000, EDI_SF_MOVE_LOAD);
+        var out: int64 := alloc(8192);
+        EdiCopinoWrite(hdr, cont, 1, out, 8192);
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, EDI_SF_CONT_SIZE_OFF);
+        EdiCopinoRead(out, 8192, hdr2, cont2, 1);
+        check(29, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == EDI_SF_BGM_COPINO);
+        check(30, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == 39);
+        free(cont2, EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 31-32: COPRAR bgmQual == 42 ────────────────────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "AAAU0000007"c as int64, 20, 1, 1, 82);
+        fillContWtMv(cont, 2000000, EDI_SF_MOVE_LOAD);
+        var out: int64 := alloc(8192);
+        EdiCoprarWrite(hdr, cont, 1, out, 8192);
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, EDI_SF_CONT_SIZE_OFF);
+        EdiCoprarRead(out, 8192, hdr2, cont2, 1);
+        check(31, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == EDI_SF_BGM_COPRAR);
+        check(32, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == 42);
+        free(cont2, EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 33-35: VERMAS write/read + VGM weight ───────────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "MSCU2345672"c as int64, 40, 3, 2, 84);
+        fillContWtMv(cont, 2850000, EDI_SF_MOVE_LOAD);
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiVermasWrite(hdr, cont, 1, out, 8192);
+        check(33, written > 0);
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, EDI_SF_CONT_SIZE_OFF);
+        EdiVermasRead(out, written, hdr2, cont2, 1);
+        check(34, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == EDI_SF_BGM_VERMAS);
+        check(35, peek64(cont2 + EDI_SF_CONT_WEIGHT) == 2850000);
+        free(cont2, EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 36-38: HANMOV bgmQual == 85, size, moveType ────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "AAAU0000007"c as int64, 20, 5, 1, 84);
+        fillContWtMv(cont, 2100000, EDI_SF_MOVE_SHIFT);
+        var out: int64 := alloc(8192);
+        EdiHanmovWrite(hdr, cont, 1, out, 8192);
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, EDI_SF_CONT_SIZE_OFF);
+        EdiHanmovRead(out, 8192, hdr2, cont2, 1);
+        check(36, peek64(hdr2 + EDI_SF_HDR_BGMQUAL) == EDI_SF_BGM_HANMOV);
+        check(37, peek64(cont2 + EDI_SF_CONT_SIZE) == 20);
+        check(38, peek64(cont2 + EDI_SF_CONT_MOVETYPE) == EDI_SF_MOVE_SHIFT);
+        free(cont2, EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 39-40: 2-container BAPLIE second container ID round-trip ────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(2 * EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont + 0 * EDI_SF_CONT_SIZE_OFF, "AAAU0000007"c as int64, 20, 1, 1, 82);
+        fillContWtMv(cont + 0 * EDI_SF_CONT_SIZE_OFF, 2000000, EDI_SF_MOVE_LOAD);
+        fillContPos(cont + 1 * EDI_SF_CONT_SIZE_OFF, "MSCU2345672"c as int64, 40, 3, 2, 84);
+        fillContWtMv(cont + 1 * EDI_SF_CONT_SIZE_OFF, 2750000, EDI_SF_MOVE_DISCHARGE);
+        var out: int64 := alloc(8192);
+        EdiBaplieWrite(hdr, cont, 2, out, 8192);
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(4 * EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, 4 * EDI_SF_CONT_SIZE_OFF);
+        var n: int64 := EdiBaplieRead(out, 8192, hdr2, cont2, 4);
+        check(39, n == 2);
+        var id1Ptr: int64 := peek64(cont2 + 1 * EDI_SF_CONT_SIZE_OFF + EDI_SF_CONT_ID);
+        var id1Len: int64 := peek64(cont2 + 1 * EDI_SF_CONT_SIZE_OFF + EDI_SF_CONT_IDLEN);
+        check(40, strEq(id1Ptr, id1Len, "MSCU2345672"c as int64, 11));
+        free(cont2, 4 * EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, 2 * EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Test 41: EdiContainerCheck on BAPLIE round-trip ID ───────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "TEXU1234569"c as int64, 40, 1, 1, 82);
+        fillContWtMv(cont, 2000000, EDI_SF_MOVE_LOAD);
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiBaplieWrite(hdr, cont, 1, out, 8192);
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, EDI_SF_CONT_SIZE_OFF);
+        EdiBaplieRead(out, written, hdr2, cont2, 1);
+        var idPtr: int64 := peek64(cont2 + EDI_SF_CONT_ID);
+        var idLen: int64 := peek64(cont2 + EDI_SF_CONT_IDLEN);
+        check(41, EdiContainerCheck(idPtr, idLen));
+        free(cont2, EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Tests 42-43: additional valid container IDs ───────────────────────────
+    check(42, EdiContainerCheck("HLXU9876547"c as int64, 11));
+    check(43, EdiContainerCheck("BICU0000011"c as int64, 11));
+
+    // ── Test 44: MEA tag in VERMAS output ────────────────────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "AAAU0000007"c as int64, 20, 1, 1, 82);
+        fillContWtMv(cont, 2200000, EDI_SF_MOVE_LOAD);
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiVermasWrite(hdr, cont, 1, out, 8192);
+        var found: int64 := 0;
+        var j: int64 := 0;
+        while (j + 2 < written) {
+            if (peek8(out+j)==77 && peek8(out+j+1)==69 && peek8(out+j+2)==65) { found := 1; }
+            j := j + 1;
+        }
+        check(44, found);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+
+    // ── Test 45: MOVINS cont size == 40 round-trip ───────────────────────────
+    {
+        var hdr:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        fillHdr(hdr);
+        fillContPos(cont, "TEXU1234569"c as int64, 40, 4, 3, 86);
+        fillContWtMv(cont, 2700000, EDI_SF_MOVE_LOAD);
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiMovinsWrite(hdr, cont, 1, out, 8192);
+        var hdr2:  int64 := alloc(EDI_SF_HDR_SIZE);
+        var cont2: int64 := alloc(EDI_SF_CONT_SIZE_OFF);
+        zero(hdr2, EDI_SF_HDR_SIZE);
+        zero(cont2, EDI_SF_CONT_SIZE_OFF);
+        EdiMovinsRead(out, written, hdr2, cont2, 1);
+        check(45, peek64(cont2 + EDI_SF_CONT_SIZE) == 40);
+        free(cont2, EDI_SF_CONT_SIZE_OFF);
+        free(hdr2, EDI_SF_HDR_SIZE);
+        free(out, 8192);
+        free(cont, EDI_SF_CONT_SIZE_OFF);
+        free(hdr, EDI_SF_HDR_SIZE);
+    }
+}
