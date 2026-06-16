@@ -48,6 +48,7 @@ import src.lyu_reader;
 import src.crypto.lic_types;
 import src.crypto.lic_parse;
 import src.crypto.lic_derive;
+import src.crypto.lic_secret;
 import src.lic_build_flags;
 import src.std.alloc;
 import src.tooling.migrate_caps;
@@ -675,6 +676,21 @@ pub type CompilerConfig = class {
     // Validate required options
     if self.earlyExit {
       return false;
+    }
+    // Reject output paths with ".." components to prevent path traversal
+    if self.outputFile != 0 {
+      var opLen: int64 := StrLen(self.outputFile as pchar);
+      var opi: int64 := 0;
+      while opi < opLen - 1 {
+        if (peek8(self.outputFile + opi) == 46) && (peek8(self.outputFile + opi + 1) == 46) {
+          if opi == 0 || peek8(self.outputFile + opi - 1) == 47 {
+            EPrintStr("lyxc: ungültiger Ausgabepfad: '..' ist nicht erlaubt\n"c);
+            self.exitCode := 1;
+            return false;
+          }
+        }
+        opi := opi + 1;
+      }
     }
     if self.inputFile == 0 && self.unitInfoFile <= 1 && self.checkBinary == 0 && !self.selfTest && !self.migrateCaps {
       self.printHelp();
@@ -1966,6 +1982,10 @@ pub type CompilerConfig = class {
       //
       // For static binaries or --no-libc-init, use the original 12-byte stub.
       if self.armExternCount > 0 && !self.noLibcInit {
+        if irCodeLen > 131016 {
+          EPrintStr("lyxc: ARM64 code section too large for dynamic stub (>131016 bytes)\n"c);
+          return;
+        }
         self.codeStubOff := 56;
         var totalLen2: int64 := 56 + irCodeLen;
         var dynBuf: int64 := alloc(131072);
@@ -2468,7 +2488,8 @@ pub type CompilerConfig = class {
     var libcSo6IsNew: bool := false;
 
     // ---- .dynstr: \0 + distinct lib names + symbol names ----
-    var dynstr: int64 := alloc(65536);
+    con DYNSTR_MAX: int64 := 65536;
+    var dynstr: int64 := alloc(DYNSTR_MAX);
     var dsLen: int64 := 0;
     poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
     var uniqLibOff: int64 := alloc((nExt + 1) * 8);
@@ -2496,7 +2517,10 @@ pub type CompilerConfig = class {
       }
       if found < 0 {
         var off: int64 := dsLen;
-        var j: int64 := 0;
+        if dsLen + libLen + 1 > DYNSTR_MAX {
+          EPrintStr("lyxc: .dynstr overflow: too many external symbols\n"c);
+          return;
+        }
         memcpy(dynstr + dsLen, strBuf + libOff, libLen); dsLen := dsLen + libLen;
         poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
         poke64(uniqLibOff + uniqCount * 8, libOff);
@@ -2511,7 +2535,10 @@ pub type CompilerConfig = class {
       var nmOff: int64 := peek64(eb2);
       var nmLen: int64 := peek64(eb2 + CG_EXTERN_OFF_NAMELEN);
       var soff: int64 := dsLen;
-      var j2: int64 := 0;
+      if dsLen + nmLen + 1 > DYNSTR_MAX {
+        EPrintStr("lyxc: .dynstr overflow: too many external symbols\n"c);
+        return;
+      }
       memcpy(dynstr + dsLen, strBuf + nmOff, nmLen); dsLen := dsLen + nmLen;
       poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
       poke64(symStr + ei * 8, soff);
@@ -2536,6 +2563,10 @@ pub type CompilerConfig = class {
         lu := lu + 1;
       }
       if !libcFound {
+        if dsLen + libcSo6Len + 1 > DYNSTR_MAX {
+          EPrintStr("lyxc: .dynstr overflow: libc.so.6 entry\n"c);
+          return;
+        }
         libcSo6IsNew := true;
         libcSo6DynstrOff := dsLen;
         memcpy(dynstr + dsLen, libcSo6Str as int64, libcSo6Len);
@@ -2544,6 +2575,10 @@ pub type CompilerConfig = class {
       }
       var lsmStr: pchar := "__libc_start_main"c;
       var lsmLen: int64 := 17;
+      if dsLen + lsmLen + 1 > DYNSTR_MAX {
+        EPrintStr("lyxc: .dynstr overflow: __libc_start_main entry\n"c);
+        return;
+      }
       libcStartMainSymOff := dsLen;
       memcpy(dynstr + dsLen, lsmStr as int64, lsmLen);
       dsLen := dsLen + lsmLen;
@@ -4062,8 +4097,9 @@ pub fn lic_loadAndVerify(cfg: CompilerConfig, argc: int64, argv: pchar): bool {
   // cfg.licenseKey will be set to this buffer on success so codegen can embed it
   var keyBuf: int64 := alloc(32);
   if keyBuf != 0 {
-    var kb: int64 := 0;
-    memcpy(keyBuf, info.key as int64, info.keyLen && kb < 29);
+    var copyLen: int64 := info.keyLen;
+    if copyLen > 29 { copyLen := 29; }
+    memcpy(keyBuf, info.key as int64, copyLen);
   }
 
   // WP-15.1: Constant-time compare — immer alle 29 Positionen, kein early-exit.
@@ -4079,6 +4115,7 @@ pub fn lic_loadAndVerify(cfg: CompilerConfig, argc: int64, argv: pchar): bool {
     diff := diff | (got ^ exp);
     ci := ci + 1;
   }
+  lic_zeroSecret(expected);
   free(expected, 32);
   lic_infoFree(info);
 
