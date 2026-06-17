@@ -1,0 +1,197 @@
+// LX-30 Test: LBF-Nativ Writer — Struktur, CRC, Entry Point, Determinismus
+
+import src.std.alloc;
+import src.std.io;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import src.tools.lbf.genesis;
+import src.tools.lbf.writer;
+
+fn cmpBuf(a: int64, b: int64, n: int64): int64 {
+    var i: int64 := 0;
+    while i < n {
+        if peek8(a + i) != peek8(b + i) { return 0 - 1; }
+        i := i + 1;
+    }
+    return 0;
+}
+
+fn main(): int64 {
+
+    // ── Tests 1–6: writeLBF — Basis-LBF mit 64 NOP-Bytes ────────────────────
+
+    // Code-Puffer: 64 × 0x90 (NOP)
+    var code: int64 := alloc(64);
+    var fi: int64 := 0;
+    while fi < 64 { poke8(code + fi, 0x90); fi := fi + 1; }
+
+    var pathA: pchar := "/tmp/lx30_a.lbf"c;
+    var pathB: pchar := "/tmp/lx30_b.lbf"c;
+
+    // Test 1: writeLBF gibt true zurück
+    var lbf: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf.writeLBF(pathA, 0 as pchar, code, 64) {
+        EPrintStrLn("FAIL: writeLBF returned false"); return 1;
+    }
+
+    // Test 2: Datei kann geöffnet werden
+    var fd: int64 := open(pathA, 0, 0);
+    if fd < 0 { EPrintStrLn("FAIL: cannot open output file"); return 1; }
+
+    // Test 3: Dateigröße ist Vielfaches von LBF_BLOCK_SIZE
+    var fsize: int64 := lseek(fd, 0, 2);
+    if (fsize % LBF_BLOCK_SIZE) != 0 {
+        EPrintStrLn("FAIL: file size not multiple of LBF_BLOCK_SIZE"); close(fd); return 1;
+    }
+
+    // Test 4: totalBlocks = 2 (1 Genesis + 1 Text)
+    // section_block_count(64) = 1 → totBlk = 2 → fileSize = 8192
+    if fsize != (2 * LBF_BLOCK_SIZE) {
+        EPrintStrLn("FAIL: expected 2 blocks for 64-byte code"); close(fd); return 1;
+    }
+
+    // Datei lesen
+    lseek(fd, 0, 0);
+    var rbuf: int64 := alloc(fsize);
+    read(fd, rbuf, fsize);
+    close(fd);
+
+    // Test 5–8: Magic-Bytes 'L' 'Y' 'X' '!'
+    if peek8(rbuf + LBF_H_MAGIC)     != LBF_MAGIC_0 { EPrintStrLn("FAIL: magic[0]"); return 1; }
+    if peek8(rbuf + LBF_H_MAGIC + 1) != LBF_MAGIC_1 { EPrintStrLn("FAIL: magic[1]"); return 1; }
+    if peek8(rbuf + LBF_H_MAGIC + 2) != LBF_MAGIC_2 { EPrintStrLn("FAIL: magic[2]"); return 1; }
+    if peek8(rbuf + LBF_H_MAGIC + 3) != LBF_MAGIC_3 { EPrintStrLn("FAIL: magic[3]"); return 1; }
+
+    // Test 9: Block-Header-CRC valide
+    if lbf_header_validate(rbuf) != 0 {
+        EPrintStrLn("FAIL: genesis block header CRC invalid"); return 1;
+    }
+
+    // Test 10: entry_point = 0x400000
+    var ep: int64 := peek64(rbuf + LBF_HEADER_SIZE + GEN_P_ENTRY_POINT);
+    if ep != 0x400000 {
+        EPrintStrLn("FAIL: entry_point != 0x400000"); return 1;
+    }
+
+    // Test 11: GEN_P_FILE_CRC32C != 0 (wurde von lbf_finalize_file_crc befüllt)
+    var fcrc: int64 := peek32(rbuf + LBF_HEADER_SIZE + GEN_P_FILE_CRC32C) & 0xFFFFFFFF;
+    if fcrc == 0 {
+        EPrintStrLn("FAIL: GEN_P_FILE_CRC32C still 0"); return 1;
+    }
+
+    // Test 12: total_blocks im Header = 2
+    var totblk: int64 := peek32(rbuf + LBF_H_TOTAL_BLK) & 0xFFFFFFFF;
+    if totblk != 2 {
+        EPrintStrLn("FAIL: total_blocks in header != 2"); return 1;
+    }
+
+    // Test 13: UUID im Genesis-Payload hat Version 4 (Byte 6 obere 4 Bits = 0x40)
+    var uuidOff: int64 := LBF_HEADER_SIZE + GEN_P_COMPILER_UUID;
+    if (peek8(rbuf + uuidOff + 6) & 0xF0) != 0x40 {
+        EPrintStrLn("FAIL: UUID version bits != 0x40"); return 1;
+    }
+
+    // Test 14: UUID Variant RFC 4122 (Byte 8 obere 2 Bits = 0x80)
+    if (peek8(rbuf + uuidOff + 8) & 0xC0) != 0x80 {
+        EPrintStrLn("FAIL: UUID variant bits != 0x80"); return 1;
+    }
+
+    // ── Tests 15–17: Text-Block (Block 1) valide ─────────────────────────────
+
+    var blk1: int64 := rbuf + LBF_BLOCK_SIZE;
+
+    // Test 15: Block-1 Magic korrekt
+    if peek8(blk1 + LBF_H_MAGIC) != LBF_MAGIC_0 {
+        EPrintStrLn("FAIL: block1 magic[0]"); return 1;
+    }
+
+    // Test 16: Block-1 Header-CRC valide
+    if lbf_header_validate(blk1) != 0 {
+        EPrintStrLn("FAIL: text block header CRC invalid"); return 1;
+    }
+
+    // Test 17: Block-1 enthält den NOP-Code an Payload-Position 0
+    var blk1pay: int64 := blk1 + LBF_HEADER_SIZE;
+    if peek8(blk1pay + 0) != 0x90 {
+        EPrintStrLn("FAIL: text block payload[0] != NOP"); return 1;
+    }
+    if peek8(blk1pay + 63) != 0x90 {
+        EPrintStrLn("FAIL: text block payload[63] != NOP"); return 1;
+    }
+
+    // ── Tests 18–20: Determinismus — zweiter Aufruf liefert byte-identische Datei
+
+    var lbf2: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf2.writeLBF(pathB, 0 as pchar, code, 64) {
+        EPrintStrLn("FAIL: second writeLBF returned false"); return 1;
+    }
+
+    var fd2: int64 := open(pathB, 0, 0);
+    if fd2 < 0 { EPrintStrLn("FAIL: cannot open pathB"); return 1; }
+    var rbuf2: int64 := alloc(fsize);
+    read(fd2, rbuf2, fsize);
+    close(fd2);
+
+    // Test 18: zweite Datei hat gleiche Größe
+    var fd2sz: int64 := open(pathB, 0, 0);
+    var fsize2: int64 := 0;
+    if fd2sz >= 0 {
+        fsize2 := lseek(fd2sz, 0, 2);
+        close(fd2sz);
+    }
+    if fsize2 != fsize {
+        EPrintStrLn("FAIL: second file has different size"); return 1;
+    }
+
+    // Test 19: File-CRC32C ist identisch (Determinismus-Kerntest)
+    var fcrc2: int64 := peek32(rbuf2 + LBF_HEADER_SIZE + GEN_P_FILE_CRC32C) & 0xFFFFFFFF;
+    if fcrc != fcrc2 {
+        EPrintStrLn("FAIL: file CRC not deterministic across two calls"); return 1;
+    }
+
+    // Test 20: Bytes identisch (vollständiger Determinismus-Test)
+    if cmpBuf(rbuf, rbuf2, fsize) != 0 {
+        EPrintStrLn("FAIL: output not byte-identical on second writeLBF call"); return 1;
+    }
+
+    free(code, 64);
+    free(rbuf, fsize);
+    free(rbuf2, fsize);
+
+    // ── Tests 21–23: writeLBF mit codeLen=0 → 1 Genesis-Block ───────────────
+
+    var pathC: pchar := "/tmp/lx30_c.lbf"c;
+    var lbf3: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf3.writeLBF(pathC, 0 as pchar, 0, 0) {
+        EPrintStrLn("FAIL: writeLBF(codeLen=0) returned false"); return 1;
+    }
+
+    var fd3: int64 := open(pathC, 0, 0);
+    if fd3 < 0 { EPrintStrLn("FAIL: cannot open codeLen=0 output"); return 1; }
+    var fsize3: int64 := lseek(fd3, 0, 2);
+    var rbuf3: int64 := alloc(LBF_BLOCK_SIZE);
+    lseek(fd3, 0, 0);
+    read(fd3, rbuf3, LBF_BLOCK_SIZE);
+    close(fd3);
+
+    // Test 21: codeLen=0 → genau 1 Block (4096 Bytes)
+    if fsize3 != LBF_BLOCK_SIZE {
+        EPrintStrLn("FAIL: codeLen=0 should produce exactly 1 block"); return 1;
+    }
+
+    // Test 22: Header-CRC valide
+    if lbf_header_validate(rbuf3) != 0 {
+        EPrintStrLn("FAIL: codeLen=0 genesis block CRC invalid"); return 1;
+    }
+
+    // Test 23: entry_point = 0x400000 auch bei leerem Code
+    var ep3: int64 := peek64(rbuf3 + LBF_HEADER_SIZE + GEN_P_ENTRY_POINT);
+    if ep3 != 0x400000 {
+        EPrintStrLn("FAIL: codeLen=0 entry_point != 0x400000"); return 1;
+    }
+
+    free(rbuf3, LBF_BLOCK_SIZE);
+
+    PrintStrLn("lx30: LBF-Nativ backend OK");
+    return 0;
+}
