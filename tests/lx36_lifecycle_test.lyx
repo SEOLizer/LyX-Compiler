@@ -1,0 +1,319 @@
+// LX-36 Test: Lifecycle Descriptor — Event-Deskriptoren, TLV 0x08 Extended Format,
+//             Writer-Integration, Dump-Ausgabe (30 Tests)
+
+import src.std.alloc;
+import src.std.io;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.lifecycle;
+import src.tools.lbf.tlv;
+import src.tools.lbf.writer;
+import src.tools.lbf.dumper;
+import src.tools.lbf.block_header;
+import src.tools.lbf.security;
+
+fn main(): int64 {
+
+    // ── Tests 1–6: lc_ev_set / lc_ev_type / lc_ev_param / lc_ev_va ─────────────
+
+    var evbuf: int64 := lc_ev_alloc(4);
+
+    // Test 1: lc_ev_set + lc_ev_type (STDIN)
+    lc_ev_set(evbuf, 0, LBF_EV_STDIN, 0, 0);
+    if lc_ev_type(evbuf, 0) != LBF_EV_STDIN {
+        EPrintStrLn("FAIL: ev_type[0] should be LBF_EV_STDIN"); return 1;
+    }
+
+    // Test 2: lc_ev_param für STDIN = 0
+    if lc_ev_param(evbuf, 0) != 0 {
+        EPrintStrLn("FAIL: ev_param[0] should be 0 for STDIN"); return 1;
+    }
+
+    // Test 3: lc_ev_set + lc_ev_type (TIMER)
+    lc_ev_set(evbuf, 1, LBF_EV_TIMER, 60, 0);
+    if lc_ev_type(evbuf, 1) != LBF_EV_TIMER {
+        EPrintStrLn("FAIL: ev_type[1] should be LBF_EV_TIMER"); return 1;
+    }
+
+    // Test 4: lc_ev_param für TIMER = 60 (hz)
+    if lc_ev_param(evbuf, 1) != 60 {
+        EPrintStrLn("FAIL: ev_param[1] should be 60 for TIMER 60Hz"); return 1;
+    }
+
+    // Test 5: lc_ev_set + lc_ev_type (SIGNAL) mit sig=15
+    lc_ev_set(evbuf, 2, LBF_EV_SIGNAL, 15, 0x400000);
+    if lc_ev_type(evbuf, 2) != LBF_EV_SIGNAL {
+        EPrintStrLn("FAIL: ev_type[2] should be LBF_EV_SIGNAL"); return 1;
+    }
+
+    // Test 6: lc_ev_va roundtrip
+    if lc_ev_va(evbuf, 2) != 0x400000 {
+        EPrintStrLn("FAIL: ev_va[2] should be 0x400000"); return 1;
+    }
+
+    // ── Tests 7–10: Mehrere Deskriptoren, Index-Isolation ───────────────────────
+
+    // Test 7: Deskriptor 3 unabhängig von 2
+    lc_ev_set(evbuf, 3, LBF_EV_NET_ACCEPT, 8080, 0x401000);
+    if lc_ev_type(evbuf, 3) != LBF_EV_NET_ACCEPT {
+        EPrintStrLn("FAIL: ev_type[3] should be LBF_EV_NET_ACCEPT"); return 1;
+    }
+
+    // Test 8: Param von idx 3 (Port 8080)
+    if lc_ev_param(evbuf, 3) != 8080 {
+        EPrintStrLn("FAIL: ev_param[3] should be 8080"); return 1;
+    }
+
+    // Test 9: idx 0 unverändert nach Schreiben in idx 3
+    if lc_ev_type(evbuf, 0) != LBF_EV_STDIN {
+        EPrintStrLn("FAIL: ev_type[0] changed after writing idx 3"); return 1;
+    }
+
+    // Test 10: LBF_LC_EV_SIZE == 11 Bytes
+    if LBF_LC_EV_SIZE != 11 {
+        EPrintStrLn("FAIL: LBF_LC_EV_SIZE should be 11"); return 1;
+    }
+
+    lc_ev_free(evbuf, 4);
+
+    // ── Tests 11–15: tlv_add_lifecycle_full ONE_SHOT (lc=0, ev_count=0) ─────────
+
+    var tbuf: int64 := alloc(LBF_TLV_MAX_SIZE);
+    var pused: int64 := alloc(8);
+    poke64(pused, 0);
+    var out_vp: int64 := alloc(8);
+    var out_lp: int64 := alloc(8);
+
+    // Test 11: tlv_add_lifecycle_full ONE_SHOT returns 0
+    if tlv_add_lifecycle_full(tbuf, pused, LBF_LC_ONE_SHOT, 0, 0) != 0 {
+        EPrintStrLn("FAIL: tlv_add_lifecycle_full ONE_SHOT should return 0"); return 1;
+    }
+
+    // Test 12: tlv_find finds TLV 0x08
+    if tlv_find(tbuf, peek64(pused), LBF_TLV_LIFECYCLE, out_vp, out_lp) != 0 {
+        EPrintStrLn("FAIL: tlv_find should find LIFECYCLE TLV"); return 1;
+    }
+
+    // Test 13: TLV 0x08 value length = 2 bytes (kind + count)
+    if peek64(out_lp) != 2 {
+        EPrintStrLn("FAIL: ONE_SHOT lifecycle TLV value length should be 2"); return 1;
+    }
+
+    // Test 14: tlv_lc_kind = ONE_SHOT (0)
+    if tlv_lc_kind(peek64(out_vp)) != LBF_LC_ONE_SHOT {
+        EPrintStrLn("FAIL: tlv_lc_kind should be LBF_LC_ONE_SHOT"); return 1;
+    }
+
+    // Test 15: tlv_lc_count = 0
+    if tlv_lc_count(peek64(out_vp)) != 0 {
+        EPrintStrLn("FAIL: tlv_lc_count should be 0 for ONE_SHOT"); return 1;
+    }
+
+    free(tbuf, LBF_TLV_MAX_SIZE);
+    poke64(pused, 0);
+    tbuf := alloc(LBF_TLV_MAX_SIZE);
+
+    // ── Tests 16–22: tlv_add_lifecycle_full EVENT_LOOP mit 2 Ereignissen ────────
+
+    var ev2: int64 := lc_ev_alloc(2);
+    lc_ev_set(ev2, 0, LBF_EV_STDIN,  0,  0x400080);
+    lc_ev_set(ev2, 1, LBF_EV_TIMER,  60, 0x400100);
+
+    // Test 16: tlv_add_lifecycle_full EVENT_LOOP returns 0
+    if tlv_add_lifecycle_full(tbuf, pused, LBF_LC_EVENT_LOOP, ev2, 2) != 0 {
+        EPrintStrLn("FAIL: tlv_add_lifecycle_full EVENT_LOOP should return 0"); return 1;
+    }
+
+    // Test 17: tlv_find finds TLV 0x08
+    if tlv_find(tbuf, peek64(pused), LBF_TLV_LIFECYCLE, out_vp, out_lp) != 0 {
+        EPrintStrLn("FAIL: tlv_find should find LIFECYCLE TLV"); return 1;
+    }
+
+    // Test 18: TLV value length = 2 + 2*11 = 24 bytes
+    if peek64(out_lp) != 24 {
+        EPrintStrLn("FAIL: EVENT_LOOP lifecycle TLV value length should be 24"); return 1;
+    }
+
+    // Test 19: kind = EVENT_LOOP (1)
+    if tlv_lc_kind(peek64(out_vp)) != LBF_LC_EVENT_LOOP {
+        EPrintStrLn("FAIL: tlv_lc_kind should be LBF_LC_EVENT_LOOP"); return 1;
+    }
+
+    // Test 20: count = 2
+    if tlv_lc_count(peek64(out_vp)) != 2 {
+        EPrintStrLn("FAIL: tlv_lc_count should be 2"); return 1;
+    }
+
+    // Test 21: event[0] = STDIN, param=0, va=0x400080
+    var lc_ptr: int64 := peek64(out_vp);
+    if tlv_lc_ev_type(lc_ptr, 0) != LBF_EV_STDIN {
+        EPrintStrLn("FAIL: event[0] type should be LBF_EV_STDIN"); return 1;
+    }
+    if tlv_lc_ev_param(lc_ptr, 0) != 0 {
+        EPrintStrLn("FAIL: event[0] param should be 0"); return 1;
+    }
+    if tlv_lc_ev_va(lc_ptr, 0) != 0x400080 {
+        EPrintStrLn("FAIL: event[0] va should be 0x400080"); return 1;
+    }
+
+    // Test 22: event[1] = TIMER, param=60, va=0x400100
+    if tlv_lc_ev_type(lc_ptr, 1) != LBF_EV_TIMER {
+        EPrintStrLn("FAIL: event[1] type should be LBF_EV_TIMER"); return 1;
+    }
+    if tlv_lc_ev_param(lc_ptr, 1) != 60 {
+        EPrintStrLn("FAIL: event[1] param should be 60 (hz)"); return 1;
+    }
+    if tlv_lc_ev_va(lc_ptr, 1) != 0x400100 {
+        EPrintStrLn("FAIL: event[1] va should be 0x400100"); return 1;
+    }
+
+    lc_ev_free(ev2, 2);
+    free(tbuf, LBF_TLV_MAX_SIZE);
+    free(pused, 8);
+    free(out_vp, 8);
+    free(out_lp, 8);
+
+    // ── Tests 23–26: LBFNativeWriter.setLifecycle → LBF-Roundtrip ───────────────
+
+    // 2-Event EVENT_LOOP: STDIN + TIMER 30Hz
+    var ev3: int64 := lc_ev_alloc(2);
+    lc_ev_set(ev3, 0, LBF_EV_STDIN,  0,  0);
+    lc_ev_set(ev3, 1, LBF_EV_TIMER,  30, 0);
+
+    var code: int64 := alloc(64);
+    var fi: int64 := 0;
+    while fi < 64 { poke8(code + fi, 0x90); fi := fi + 1; }
+
+    var lbf: LBFNativeWriter := new LBFNativeWriter();
+    lbf.setLifecycle(LBF_LC_EVENT_LOOP, ev3, 2);
+    if !lbf.writeLBF("/tmp/lx36_event_loop.lbf"c, 0 as pchar, code, 64) {
+        EPrintStrLn("FAIL: writeLBF EVENT_LOOP failed"); return 1;
+    }
+    free(code, 64);
+    lc_ev_free(ev3, 2);
+
+    var fd: int64 := open("/tmp/lx36_event_loop.lbf"c, 0, 0);
+    if fd < 0 { EPrintStrLn("FAIL: cannot open event_loop LBF"); return 1; }
+    var fsize: int64 := lseek(fd, 0, 2);
+    lseek(fd, 0, 0);
+    var fbuf: int64 := alloc(fsize);
+    read(fd, fbuf, fsize);
+    close(fd);
+
+    // Test 23: verify passes
+    if lbf_dump_verify(fbuf, fsize) != 0 {
+        EPrintStrLn("FAIL: EVENT_LOOP LBF should verify OK"); return 1;
+    }
+
+    // Locate TLV 0x08 in genesis payload
+    var pay2: int64 := fbuf + LBF_HEADER_SIZE;
+    var used2: int64 := peek16(pay2 + GEN_P_TLV_USED) & 0xFFFF;
+    var tpool2: int64 := pay2 + GEN_P_TLV_POOL;
+    var vp2: int64 := alloc(8);
+    var vl2: int64 := alloc(8);
+    if tlv_find(tpool2, used2, LBF_TLV_LIFECYCLE, vp2, vl2) != 0 {
+        EPrintStrLn("FAIL: EVENT_LOOP LBF has no LIFECYCLE TLV"); return 1;
+    }
+
+    // Test 24: kind = EVENT_LOOP in written LBF
+    if tlv_lc_kind(peek64(vp2)) != LBF_LC_EVENT_LOOP {
+        EPrintStrLn("FAIL: LBF lifecycle kind should be EVENT_LOOP"); return 1;
+    }
+
+    // Test 25: count = 2 in written LBF
+    if tlv_lc_count(peek64(vp2)) != 2 {
+        EPrintStrLn("FAIL: LBF lifecycle count should be 2"); return 1;
+    }
+
+    // Test 26: event[1] param = 30 (TIMER 30Hz)
+    if tlv_lc_ev_param(peek64(vp2), 1) != 30 {
+        EPrintStrLn("FAIL: LBF event[1] param should be 30"); return 1;
+    }
+
+    free(vp2, 8);
+    free(vl2, 8);
+
+    // ── Tests 27–28: Dump-Ausgabe — kein Absturz, korrekte Ausgabe ───────────────
+
+    PrintStrLn("--- lifecycle dump ---");
+    lbf_dump_print_tlvs(fbuf);
+    PrintStrLn("--- lifecycle dump OK ---");
+
+    // Test 27: tlv_count = 3 (capabilities + lifecycle + section_map)
+    if lbf_dump_tlv_count(fbuf) != 3 {
+        EPrintStrLn("FAIL: EVENT_LOOP LBF should have 3 TLVs"); return 1;
+    }
+
+    // Test 28: dump_all no crash
+    lbf_dump_print_all(fbuf, fsize, "/tmp/lx36_event_loop.lbf"c);
+    PrintStrLn("--- full dump OK ---");
+
+    free(fbuf, fsize);
+
+    // ── Tests 29–30: DAEMON und REACTIVE über Writer ─────────────────────────────
+
+    var code2: int64 := alloc(64);
+    fi := 0;
+    while fi < 64 { poke8(code2 + fi, 0x90); fi := fi + 1; }
+
+    // Test 29: DAEMON lifecycle → TLV 0x08 kind=2
+    var lbf2: LBFNativeWriter := new LBFNativeWriter();
+    lbf2.setLifecycle(LBF_LC_DAEMON, 0, 0);
+    if !lbf2.writeLBF("/tmp/lx36_daemon.lbf"c, 0 as pchar, code2, 64) {
+        EPrintStrLn("FAIL: writeLBF DAEMON failed"); return 1;
+    }
+
+    var fd3: int64 := open("/tmp/lx36_daemon.lbf"c, 0, 0);
+    if fd3 < 0 { EPrintStrLn("FAIL: cannot open daemon LBF"); return 1; }
+    var fsz3: int64 := lseek(fd3, 0, 2);
+    lseek(fd3, 0, 0);
+    var fbuf3: int64 := alloc(fsz3);
+    read(fd3, fbuf3, fsz3);
+    close(fd3);
+
+    var vp3: int64 := alloc(8);
+    var vl3: int64 := alloc(8);
+    var pay3: int64 := fbuf3 + LBF_HEADER_SIZE;
+    var used3: int64 := peek16(pay3 + GEN_P_TLV_USED) & 0xFFFF;
+    var tpool3: int64 := pay3 + GEN_P_TLV_POOL;
+    tlv_find(tpool3, used3, LBF_TLV_LIFECYCLE, vp3, vl3);
+    if tlv_lc_kind(peek64(vp3)) != LBF_LC_DAEMON {
+        EPrintStrLn("FAIL: DAEMON LBF lifecycle kind should be 2"); return 1;
+    }
+
+    free(vp3, 8);
+    free(vl3, 8);
+    free(fbuf3, fsz3);
+
+    // Test 30: REACTIVE lifecycle → TLV 0x08 kind=3
+    var lbf3: LBFNativeWriter := new LBFNativeWriter();
+    lbf3.setLifecycle(LBF_LC_REACTIVE, 0, 0);
+    if !lbf3.writeLBF("/tmp/lx36_reactive.lbf"c, 0 as pchar, code2, 64) {
+        EPrintStrLn("FAIL: writeLBF REACTIVE failed"); return 1;
+    }
+    free(code2, 64);
+
+    var fd4: int64 := open("/tmp/lx36_reactive.lbf"c, 0, 0);
+    if fd4 < 0 { EPrintStrLn("FAIL: cannot open reactive LBF"); return 1; }
+    var fsz4: int64 := lseek(fd4, 0, 2);
+    lseek(fd4, 0, 0);
+    var fbuf4: int64 := alloc(fsz4);
+    read(fd4, fbuf4, fsz4);
+    close(fd4);
+
+    var vp4: int64 := alloc(8);
+    var vl4: int64 := alloc(8);
+    var pay4: int64 := fbuf4 + LBF_HEADER_SIZE;
+    var used4: int64 := peek16(pay4 + GEN_P_TLV_USED) & 0xFFFF;
+    var tpool4: int64 := pay4 + GEN_P_TLV_POOL;
+    tlv_find(tpool4, used4, LBF_TLV_LIFECYCLE, vp4, vl4);
+    if tlv_lc_kind(peek64(vp4)) != LBF_LC_REACTIVE {
+        EPrintStrLn("FAIL: REACTIVE LBF lifecycle kind should be 3"); return 1;
+    }
+
+    free(vp4, 8);
+    free(vl4, 8);
+    free(fbuf4, fsz4);
+
+    PrintStrLn("lx36: lifecycle descriptor OK");
+    return 0;
+}

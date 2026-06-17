@@ -232,8 +232,9 @@ pub con ANNO_REDUNDANT:      int64 := 8;   // @redundant
 pub con ANNO_CAPABILITIES:   int64 := 16;  // WP-L1: @capabilities([...])
 pub con ANNO_USES_CAP:       int64 := 32;  // WP-L1: @uses_caller_cap([...])
 pub con ANNO_CAP_EXTERN:     int64 := 64;  // WP-L1: @cap(path) on extern fn
+pub con ANNO_LIFECYCLE:      int64 := 128; // LX-36: @lifecycle(kind)
 pub con CAP_FLAG_FASTPATH:   int64 := 1;   // WP-L1: NK_CAPABILITY_DECL.iVal bit0 = @fastpath
-// Bits 7..63 reserved for future annotations.
+// Bits 8..63 reserved for future annotations.
 
 // ============================================================================
 // Parser Class
@@ -281,6 +282,9 @@ pub type Parser = class {
   _pendingUsesCapAttr:  int64;  // NK_USES_CALLER_CAP node to chain before next fn decl, or -1
   _pendingCapExternOff: int64;  // @cap path source offset for next extern fn (0=none)
   _pendingCapExternLen: int64;  // @cap path source length
+
+  // LX-36: pending @lifecycle annotation
+  _pendingLifecycleKind: int64; // -1=not set, 0=one_shot, 1=event_loop, 2=daemon, 3=reactive
 
   // Recursion depth guard — prevents stack-overflow DoS via deeply nested expressions
   parseDepth: int64;
@@ -497,6 +501,7 @@ pub type Parser = class {
     if self._tokTextEq(tokIdx, "capabilities"c)    != 0 { return ANNO_CAPABILITIES; }  // WP-L1
     if self._tokTextEq(tokIdx, "uses_caller_cap"c) != 0 { return ANNO_USES_CAP; }      // WP-L1
     if self._tokTextEq(tokIdx, "cap"c)             != 0 { return ANNO_CAP_EXTERN; }    // WP-L1
+    if self._tokTextEq(tokIdx, "lifecycle"c)       != 0 { return ANNO_LIFECYCLE; }    // LX-36
     return 0;
   }
 
@@ -575,6 +580,9 @@ pub type Parser = class {
     // Use 0-1 workaround: bootstrap miscompiles negative literal -1 as 0 (known bug)
     self._pendingCapAttr     := 0 - 1;
     self._pendingUsesCapAttr := 0 - 1;
+
+    // LX-36: pending lifecycle annotation (-1 = not set, 0 = one_shot default)
+    self._pendingLifecycleKind := 0 - 1;
 
     self._tokenize();
   }
@@ -3071,6 +3079,26 @@ pub type Parser = class {
     return n;
   }
 
+  // LX-36: Parse @lifecycle(kind) argument — caller consumed '('; cur = kind ident.
+  // Sets _pendingLifecycleKind and consumes through ')'.
+  fn _parseLifecycleKindArg(): void {
+    if self.Check(TK_IDENT) != 0 {
+      if self._tokTextEq(self.cur, "one_shot"c)   != 0 { self._pendingLifecycleKind := 0; }
+      if self._tokTextEq(self.cur, "event_loop"c) != 0 { self._pendingLifecycleKind := 1; }
+      if self._tokTextEq(self.cur, "daemon"c)     != 0 { self._pendingLifecycleKind := 2; }
+      if self._tokTextEq(self.cur, "reactive"c)   != 0 { self._pendingLifecycleKind := 3; }
+      self.Advance();
+    }
+    // Drain any remaining args until matching ')'
+    var depth: int64 := 1;
+    while depth > 0 && self.Peek() != TK_EOF {
+      if self.Check(TK_LPAREN) != 0  { depth := depth + 1; }
+      if self.Check(TK_RPAREN) != 0  { depth := depth - 1; }
+      if depth > 0 { self.Advance(); }
+    }
+    if self.Check(TK_RPAREN) != 0 { self.Advance(); }
+  }
+
   // ==================================================================
   // Top-level parse -- returns head of declaration list (via NNext)
   // ==================================================================
@@ -3198,6 +3226,9 @@ pub type Parser = class {
             self._pendingCapExternOff := capPacked & 0xFFFFFFFF;
             self._pendingCapExternLen := capPacked >> 32;
             self.Expect(TK_RPAREN);
+          } else if (flag == ANNO_LIFECYCLE) {      // LX-36: @lifecycle(kind)
+            self.Advance();  // consume (
+            self._parseLifecycleKindArg();
           } else {
             self.Advance();  // consume (
             var depth: int64 := 1;
@@ -3249,6 +3280,9 @@ pub type Parser = class {
             self._pendingCapExternOff := packed3 & 0xFFFFFFFF;
             self._pendingCapExternLen := packed3 >> 32;
             self.Expect(TK_RPAREN);
+          } else if (flag2 == ANNO_LIFECYCLE) {      // LX-36: @lifecycle(kind)
+            self.Advance();  // consume (
+            self._parseLifecycleKindArg();
           } else {
             self.Advance();
             var depth: int64 := 1;
