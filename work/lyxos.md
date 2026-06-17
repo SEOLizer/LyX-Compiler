@@ -2,7 +2,7 @@
 
 **lyxc-Ziel:** `--target=lyxos`  
 **ABI-Referenz:** `work/lyxos/syscalls.md` (ABI v1.0, 137 Syscalls)  
-**Stand:** v0.9.10B  
+**Stand:** v0.9.10C  
 **Stand:** v0.9.9A  
 **Branch-Namensschema:** `feat/lyxos-lx<nn>-<kürzel>`
 
@@ -1041,7 +1041,7 @@ Analogon zu `readelf` für ELF.
   File CRC32C: 0x3F8A21B7  ✓
 
 [Compiler Provenance]
-  Compiler:    lyxc 0.9.10B
+  Compiler:    lyxc 0.9.10C
   Compiler:    lyxc 0.9.9A
   Compiled At: 2026-06-10 12:14:03 UTC
   UUID:        a3f72b18-4c91-4d2e-8e7b-1234567890ab
