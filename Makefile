@@ -110,6 +110,11 @@ test: lyxc
 	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
 	@/tmp/lyxc_lx36_test
 	@rm -f /tmp/lyxc_lx36_test
+
+	@echo "--- net_frame: kernel-safe frame units (45 tests) ---"
+	./lyxc tests/net_frame_test.lyx -o /tmp/lyxc_net_frame_test
+	@/tmp/lyxc_net_frame_test
+	@rm -f /tmp/lyxc_net_frame_test
 	@echo "OK"
 
 test-lyxos: lyxc

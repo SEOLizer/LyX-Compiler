@@ -1,0 +1,255 @@
+// std/net/dhcp/frame.lyx — Pure DHCP frame builder and parser (RFC 2131)
+//
+// Kernel-safe: no imports, no syscalls, no dynamic allocation.
+// All functions operate on caller-provided buffers.
+//
+// This unit contains the pure frame-manipulation subset of std.net.dhcp.
+// For POSIX DHCP lease acquisition (UDP socket), use std.net.dhcp instead.
+//
+// Public API:
+//   DhcpBuildDiscover(buf, mac, xid)              → int64 (DHCP_MIN_LEN)
+//   DhcpBuildRequest(buf, mac, xid, offIP, srvIP) → int64 (DHCP_MIN_LEN)
+//   DhcpParseReply(buf, len, result)
+//
+// Result struct (DHCP_RESULT_SIZE = 72 bytes):
+//   DHCP_RESULT_IP     +0   leased IP (packed, big-endian)
+//   DHCP_RESULT_MASK   +8   subnet mask
+//   DHCP_RESULT_GW    +16   default gateway
+//   DHCP_RESULT_DNS   +24   primary DNS server
+//   DHCP_RESULT_LEASE +32   lease time in seconds
+//   DHCP_RESULT_SERVER+40   DHCP server IP (option 54)
+//   DHCP_RESULT_XID   +48   transaction ID
+//   DHCP_RESULT_TYPE  +56   DHCP message type (2=OFFER, 5=ACK, 6=NAK)
+//   DHCP_RESULT_OK    +64   1 if OFFER or ACK received
+
+unit std.net.dhcp.frame;
+
+// ── Ports ─────────────────────────────────────────────────────────────────────
+pub con DHCP_PORT_SERVER:   int64 := 67;
+pub con DHCP_PORT_CLIENT:   int64 := 68;
+
+// ── Operation codes ───────────────────────────────────────────────────────────
+pub con DHCP_OP_REQUEST:    int64 := 1;
+pub con DHCP_OP_REPLY:      int64 := 2;
+
+// ── Hardware types ────────────────────────────────────────────────────────────
+pub con DHCP_HTYPE_ETHER:   int64 := 1;
+
+// ── DHCP message types (option 53) ───────────────────────────────────────────
+pub con DHCP_MSG_DISCOVER:  int64 := 1;
+pub con DHCP_MSG_OFFER:     int64 := 2;
+pub con DHCP_MSG_REQUEST:   int64 := 3;
+pub con DHCP_MSG_DECLINE:   int64 := 4;
+pub con DHCP_MSG_ACK:       int64 := 5;
+pub con DHCP_MSG_NAK:       int64 := 6;
+pub con DHCP_MSG_RELEASE:   int64 := 7;
+pub con DHCP_MSG_INFORM:    int64 := 8;
+
+// ── DHCP option codes ─────────────────────────────────────────────────────────
+pub con DHCP_OPT_SUBNET:    int64 := 1;
+pub con DHCP_OPT_ROUTER:    int64 := 3;
+pub con DHCP_OPT_DNS:       int64 := 6;
+pub con DHCP_OPT_HOSTNAME:  int64 := 12;
+pub con DHCP_OPT_DOMAIN:    int64 := 15;
+pub con DHCP_OPT_REQIP:     int64 := 50;
+pub con DHCP_OPT_LEASE:     int64 := 51;
+pub con DHCP_OPT_MSGTYPE:   int64 := 53;
+pub con DHCP_OPT_SERVERID:  int64 := 54;
+pub con DHCP_OPT_PARAMREQ:  int64 := 55;
+pub con DHCP_OPT_PAD:       int64 := 0;
+pub con DHCP_OPT_END:       int64 := 255;
+
+// ── Packet field offsets (RFC 2131 §2) ───────────────────────────────────────
+pub con DHCP_OFFS_OP:       int64 := 0;
+pub con DHCP_OFFS_HTYPE:    int64 := 1;
+pub con DHCP_OFFS_HLEN:     int64 := 2;
+pub con DHCP_OFFS_HOPS:     int64 := 3;
+pub con DHCP_OFFS_XID:      int64 := 4;
+pub con DHCP_OFFS_SECS:     int64 := 8;
+pub con DHCP_OFFS_FLAGS:    int64 := 10;
+pub con DHCP_OFFS_CIADDR:   int64 := 12;
+pub con DHCP_OFFS_YIADDR:   int64 := 16;
+pub con DHCP_OFFS_SIADDR:   int64 := 20;
+pub con DHCP_OFFS_GIADDR:   int64 := 24;
+pub con DHCP_OFFS_CHADDR:   int64 := 28;
+pub con DHCP_OFFS_SNAME:    int64 := 44;
+pub con DHCP_OFFS_FILE:     int64 := 108;
+pub con DHCP_OFFS_COOKIE:   int64 := 236;
+pub con DHCP_OFFS_OPTIONS:  int64 := 240;
+pub con DHCP_MIN_LEN:       int64 := 300;
+
+// ── Magic cookie bytes (0x63825363) ──────────────────────────────────────────
+pub con DHCP_MAGIC_B0:      int64 := 99;   // 0x63
+pub con DHCP_MAGIC_B1:      int64 := 130;  // 0x82
+pub con DHCP_MAGIC_B2:      int64 := 83;   // 0x53
+pub con DHCP_MAGIC_B3:      int64 := 99;   // 0x63
+
+pub con DHCP_FLAG_BROADCAST: int64 := 128; // bit 15 of flags = broadcast
+
+// ── Result struct offsets ─────────────────────────────────────────────────────
+pub con DHCP_RESULT_IP:     int64 := 0;
+pub con DHCP_RESULT_MASK:   int64 := 8;
+pub con DHCP_RESULT_GW:     int64 := 16;
+pub con DHCP_RESULT_DNS:    int64 := 24;
+pub con DHCP_RESULT_LEASE:  int64 := 32;
+pub con DHCP_RESULT_SERVER: int64 := 40;
+pub con DHCP_RESULT_XID:    int64 := 48;
+pub con DHCP_RESULT_TYPE:   int64 := 56;
+pub con DHCP_RESULT_OK:     int64 := 64;
+pub con DHCP_RESULT_SIZE:   int64 := 72;
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+fn dhcpfZero(buf: int64, size: int64) {
+    var i: int64 := 0;
+    while i < size { poke8(buf + i, 0); i := i + 1; }
+}
+
+fn dhcpfCopy(dst: int64, src: int64, n: int64) {
+    var i: int64 := 0;
+    while i < n { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+fn dhcpfWrite32(buf: int64, offset: int64, val: int64) {
+    poke8(buf + offset,     (val >> 24) & 255);
+    poke8(buf + offset + 1, (val >> 16) & 255);
+    poke8(buf + offset + 2, (val >> 8)  & 255);
+    poke8(buf + offset + 3, val & 255);
+}
+
+fn dhcpfRead32(buf: int64, offset: int64): int64 {
+    var b0: int64 := peek8(buf + offset)     & 255;
+    var b1: int64 := peek8(buf + offset + 1) & 255;
+    var b2: int64 := peek8(buf + offset + 2) & 255;
+    var b3: int64 := peek8(buf + offset + 3) & 255;
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+fn dhcpfWriteCookie(buf: int64) {
+    poke8(buf + DHCP_OFFS_COOKIE,     DHCP_MAGIC_B0);
+    poke8(buf + DHCP_OFFS_COOKIE + 1, DHCP_MAGIC_B1);
+    poke8(buf + DHCP_OFFS_COOKIE + 2, DHCP_MAGIC_B2);
+    poke8(buf + DHCP_OFFS_COOKIE + 3, DHCP_MAGIC_B3);
+}
+
+fn dhcpfCheckCookie(buf: int64): int64 {
+    if (peek8(buf + DHCP_OFFS_COOKIE)     & 255) != DHCP_MAGIC_B0 { return 0; }
+    if (peek8(buf + DHCP_OFFS_COOKIE + 1) & 255) != DHCP_MAGIC_B1 { return 0; }
+    if (peek8(buf + DHCP_OFFS_COOKIE + 2) & 255) != DHCP_MAGIC_B2 { return 0; }
+    if (peek8(buf + DHCP_OFFS_COOKIE + 3) & 255) != DHCP_MAGIC_B3 { return 0; }
+    return 1;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// DhcpBuildDiscover: writes a DHCPDISCOVER packet into buf.
+// buf must be >= DHCP_MIN_LEN (300) bytes.
+// mac: pointer to 6-byte Ethernet MAC address.
+// xid: 32-bit transaction ID (only low 32 bits used).
+// Returns DHCP_MIN_LEN.
+pub fn DhcpBuildDiscover(buf: int64, mac: int64, xid: int64): int64 {
+    dhcpfZero(buf, DHCP_MIN_LEN);
+    poke8(buf + DHCP_OFFS_OP,    DHCP_OP_REQUEST);
+    poke8(buf + DHCP_OFFS_HTYPE, DHCP_HTYPE_ETHER);
+    poke8(buf + DHCP_OFFS_HLEN,  6);
+    poke8(buf + DHCP_OFFS_HOPS,  0);
+    dhcpfWrite32(buf, DHCP_OFFS_XID, xid & 0xFFFFFFFF);
+    poke8(buf + DHCP_OFFS_FLAGS, DHCP_FLAG_BROADCAST);
+    dhcpfCopy(buf + DHCP_OFFS_CHADDR, mac, 6);
+    dhcpfWriteCookie(buf);
+    var o: int64 := DHCP_OFFS_OPTIONS;
+    poke8(buf + o, DHCP_OPT_MSGTYPE);  o := o + 1;
+    poke8(buf + o, 1);                  o := o + 1;
+    poke8(buf + o, DHCP_MSG_DISCOVER);  o := o + 1;
+    poke8(buf + o, DHCP_OPT_PARAMREQ); o := o + 1;
+    poke8(buf + o, 4);                  o := o + 1;
+    poke8(buf + o, DHCP_OPT_SUBNET);   o := o + 1;
+    poke8(buf + o, DHCP_OPT_ROUTER);   o := o + 1;
+    poke8(buf + o, DHCP_OPT_DNS);      o := o + 1;
+    poke8(buf + o, DHCP_OPT_DOMAIN);   o := o + 1;
+    poke8(buf + o, DHCP_OPT_END);
+    return DHCP_MIN_LEN;
+}
+
+// DhcpBuildRequest: writes a DHCPREQUEST packet into buf.
+// offeredIP: IP from OFFER (packed, big-endian).
+// serverIP:  DHCP server identifier from OFFER option 54.
+// Returns DHCP_MIN_LEN.
+pub fn DhcpBuildRequest(buf: int64, mac: int64, xid: int64, offeredIP: int64, serverIP: int64): int64 {
+    dhcpfZero(buf, DHCP_MIN_LEN);
+    poke8(buf + DHCP_OFFS_OP,    DHCP_OP_REQUEST);
+    poke8(buf + DHCP_OFFS_HTYPE, DHCP_HTYPE_ETHER);
+    poke8(buf + DHCP_OFFS_HLEN,  6);
+    poke8(buf + DHCP_OFFS_HOPS,  0);
+    dhcpfWrite32(buf, DHCP_OFFS_XID, xid & 0xFFFFFFFF);
+    poke8(buf + DHCP_OFFS_FLAGS, DHCP_FLAG_BROADCAST);
+    dhcpfCopy(buf + DHCP_OFFS_CHADDR, mac, 6);
+    dhcpfWriteCookie(buf);
+    var o: int64 := DHCP_OFFS_OPTIONS;
+    poke8(buf + o, DHCP_OPT_MSGTYPE);   o := o + 1;
+    poke8(buf + o, 1);                   o := o + 1;
+    poke8(buf + o, DHCP_MSG_REQUEST);    o := o + 1;
+    poke8(buf + o, DHCP_OPT_REQIP);     o := o + 1;
+    poke8(buf + o, 4);                   o := o + 1;
+    dhcpfWrite32(buf, o, offeredIP);     o := o + 4;
+    poke8(buf + o, DHCP_OPT_SERVERID);  o := o + 1;
+    poke8(buf + o, 4);                   o := o + 1;
+    dhcpfWrite32(buf, o, serverIP);      o := o + 4;
+    poke8(buf + o, DHCP_OPT_PARAMREQ);  o := o + 1;
+    poke8(buf + o, 4);                   o := o + 1;
+    poke8(buf + o, DHCP_OPT_SUBNET);    o := o + 1;
+    poke8(buf + o, DHCP_OPT_ROUTER);    o := o + 1;
+    poke8(buf + o, DHCP_OPT_DNS);       o := o + 1;
+    poke8(buf + o, DHCP_OPT_DOMAIN);    o := o + 1;
+    poke8(buf + o, DHCP_OPT_END);
+    return DHCP_MIN_LEN;
+}
+
+// DhcpParseReply: parses a DHCP OFFER or ACK reply from buf into result.
+// result must point to DHCP_RESULT_SIZE zeroed bytes (caller must zero it).
+// Sets DHCP_RESULT_OK=1 on OFFER or ACK; 0 on NAK, invalid packet, or parse error.
+pub fn DhcpParseReply(buf: int64, len: int64, result: int64) {
+    poke64(result + DHCP_RESULT_OK,   0);
+    poke64(result + DHCP_RESULT_TYPE, 0);
+    if len < DHCP_OFFS_OPTIONS { return; }
+    if (peek8(buf + DHCP_OFFS_OP) & 255) != DHCP_OP_REPLY { return; }
+    if dhcpfCheckCookie(buf) == 0 { return; }
+    poke64(result + DHCP_RESULT_IP, dhcpfRead32(buf, DHCP_OFFS_YIADDR));
+    var pos:     int64 := DHCP_OFFS_OPTIONS;
+    var msgType: int64 := 0;
+    var done:    int64 := 0;
+    while (pos < len && done == 0) {
+        var t: int64 := peek8(buf + pos) & 255;
+        if t == DHCP_OPT_PAD { pos := pos + 1; }
+        if t == DHCP_OPT_END { done := 1; }
+        if (t != DHCP_OPT_PAD && t != DHCP_OPT_END) {
+            if (pos + 1 >= len) { done := 1; }
+            if (pos + 1 < len) {
+                var l:    int64 := peek8(buf + pos + 1) & 255;
+                var doff: int64 := pos + 2;
+                if (t == DHCP_OPT_MSGTYPE && l == 1 && doff < len) {
+                    msgType := peek8(buf + doff) & 255;
+                }
+                if (t == DHCP_OPT_SERVERID && l == 4 && doff + 3 < len) {
+                    poke64(result + DHCP_RESULT_SERVER, dhcpfRead32(buf, doff));
+                }
+                if (t == DHCP_OPT_LEASE && l == 4 && doff + 3 < len) {
+                    poke64(result + DHCP_RESULT_LEASE, dhcpfRead32(buf, doff));
+                }
+                if (t == DHCP_OPT_SUBNET && l == 4 && doff + 3 < len) {
+                    poke64(result + DHCP_RESULT_MASK, dhcpfRead32(buf, doff));
+                }
+                if (t == DHCP_OPT_ROUTER && l == 4 && doff + 3 < len) {
+                    poke64(result + DHCP_RESULT_GW, dhcpfRead32(buf, doff));
+                }
+                if (t == DHCP_OPT_DNS && l >= 4 && doff + 3 < len) {
+                    poke64(result + DHCP_RESULT_DNS, dhcpfRead32(buf, doff));
+                }
+                pos := pos + 2 + l;
+            }
+        }
+    }
+    poke64(result + DHCP_RESULT_TYPE, msgType);
+    if msgType == DHCP_MSG_ACK   { poke64(result + DHCP_RESULT_OK, 1); }
+    if msgType == DHCP_MSG_OFFER { poke64(result + DHCP_RESULT_OK, 1); }
+}
