@@ -1,0 +1,205 @@
+// LX-31 Test: lbf_loader — Validierung, ELF-Builder, CRC-Schutz (25 Tests)
+
+import src.std.alloc;
+import src.std.io;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import src.tools.lbf.genesis;
+import src.tools.lbf.security;
+import src.tools.lbf.elf_builder;
+import src.tools.lbf.writer;
+
+fn main(): int64 {
+
+    // ── Setup: Gültige LBF-Datei erzeugen ────────────────────────────────────
+
+    // Code-Puffer: 64 NOP-Bytes (0x90)
+    var code: int64 := alloc(64);
+    var fi: int64 := 0;
+    while fi < 64 { poke8(code + fi, 0x90); fi := fi + 1; }
+
+    var lbfPath: pchar := "/tmp/lx31_valid.lbf"c;
+    var lbf: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf.writeLBF(lbfPath, 0 as pchar, code, 64) {
+        EPrintStrLn("FAIL: setup writeLBF returned false"); return 1;
+    }
+
+    // LBF vollständig einlesen
+    var sfd: int64 := open(lbfPath, 0, 0);
+    if sfd < 0 { EPrintStrLn("FAIL: cannot open valid LBF"); return 1; }
+    var fsize: int64 := lseek(sfd, 0, 2);
+    lseek(sfd, 0, 0);
+    var fbuf: int64 := alloc(fsize);
+    read(sfd, fbuf, fsize);
+    close(sfd);
+
+    // ── Tests 1–4: Genesis-Block-Validierung — gültige Datei ─────────────────
+
+    // Test 1: Dateigröße ist Vielfaches von LBF_BLOCK_SIZE
+    if (fsize % LBF_BLOCK_SIZE) != 0 {
+        EPrintStrLn("FAIL: file size not multiple of block size"); return 1;
+    }
+
+    // Test 2: lbf_header_validate(Block 0) = 0
+    if lbf_header_validate(fbuf) != 0 {
+        EPrintStrLn("FAIL: genesis block validate failed on valid file"); return 1;
+    }
+
+    // Test 3: lbf_verify_file_crc = 0
+    if lbf_verify_file_crc(fbuf, fsize) != 0 {
+        EPrintStrLn("FAIL: lbf_verify_file_crc failed on valid file"); return 1;
+    }
+
+    // Test 4: UUID-Blacklist → 1 (keine Datei → sicher)
+    var uuidPtr: int64 := fbuf + LBF_HEADER_SIZE + GEN_P_COMPILER_UUID;
+    if lbf_check_compiler_blacklist(uuidPtr) != 1 {
+        EPrintStrLn("FAIL: blacklist check should return 1 (safe)"); return 1;
+    }
+
+    // ── Tests 5–7: Magic-Korrumpierung ────────────────────────────────────────
+
+    // Test 5: Magic[0] korrumpieren → validate = -1
+    var savedMagic: int64 := peek8(fbuf + LBF_H_MAGIC) & 0xFF;
+    poke8(fbuf + LBF_H_MAGIC, 0x00);
+    if lbf_header_validate(fbuf) != (0 - 1) {
+        EPrintStrLn("FAIL: corrupted magic[0] should return -1"); return 1;
+    }
+    poke8(fbuf + LBF_H_MAGIC, savedMagic);  // wiederherstellen
+
+    // Test 6: Magic[3] korrumpieren ('!' → 0x00) → validate = -1
+    var savedMagic3: int64 := peek8(fbuf + LBF_H_MAGIC + 3) & 0xFF;
+    poke8(fbuf + LBF_H_MAGIC + 3, 0x00);
+    if lbf_header_validate(fbuf) != (0 - 1) {
+        EPrintStrLn("FAIL: corrupted magic[3] should return -1"); return 1;
+    }
+    poke8(fbuf + LBF_H_MAGIC + 3, savedMagic3);
+
+    // Test 7: Magic wiederhergestellt → validate = 0
+    if lbf_header_validate(fbuf) != 0 {
+        EPrintStrLn("FAIL: magic not properly restored"); return 1;
+    }
+
+    // ── Tests 8–10: Payload-Byte-Korrumpierung → Block-CRC-Fehler ────────────
+
+    // Test 8: Genesis-Payload korrumpieren (Byte 100) → validate = -2
+    var payOff: int64 := LBF_HEADER_SIZE + 100;
+    var savedByte: int64 := peek8(fbuf + payOff) & 0xFF;
+    poke8(fbuf + payOff, (savedByte ^ 0xFF) & 0xFF);
+    if lbf_header_validate(fbuf) != (0 - 2) {
+        EPrintStrLn("FAIL: corrupted payload should return -2 (CRC mismatch)"); return 1;
+    }
+    poke8(fbuf + payOff, savedByte);  // wiederherstellen
+
+    // Test 9: validate = 0 nach Wiederherstellung
+    if lbf_header_validate(fbuf) != 0 {
+        EPrintStrLn("FAIL: validate not 0 after payload restore"); return 1;
+    }
+
+    // Test 10: Gleiches Byte in Block 1 korrumpieren → Block-1-CRC-Fehler
+    var blk1Pay: int64 := LBF_BLOCK_SIZE + LBF_HEADER_SIZE + 50;
+    var savedBlk1: int64 := peek8(fbuf + blk1Pay) & 0xFF;
+    poke8(fbuf + blk1Pay, (savedBlk1 ^ 0xFF) & 0xFF);
+    if lbf_header_validate(fbuf + LBF_BLOCK_SIZE) != (0 - 2) {
+        EPrintStrLn("FAIL: block1 corrupted should return -2"); return 1;
+    }
+    poke8(fbuf + blk1Pay, savedBlk1);
+
+    // ── Tests 11–13: File-CRC-Schutz ─────────────────────────────────────────
+
+    // Test 11: Gespeicherter file-CRC korrumpieren → verify = -1
+    var crcOff: int64 := LBF_HEADER_SIZE + GEN_P_FILE_CRC32C;
+    var savedCrc0: int64 := peek8(fbuf + crcOff) & 0xFF;
+    poke8(fbuf + crcOff, (savedCrc0 ^ 0xFF) & 0xFF);
+    if lbf_verify_file_crc(fbuf, fsize) != (0 - 1) {
+        EPrintStrLn("FAIL: tampered file CRC should fail verify"); return 1;
+    }
+    poke8(fbuf + crcOff, savedCrc0);
+
+    // Test 12: verify nach Wiederherstellung = 0
+    if lbf_verify_file_crc(fbuf, fsize) != 0 {
+        EPrintStrLn("FAIL: verify not 0 after CRC restore"); return 1;
+    }
+
+    // Test 13: Text-Block-Content korrumpieren → file CRC schlägt fehl
+    // Poke8 direkt in Block-1-Payload (Block-Header-CRC gesondert → ignorieren)
+    poke8(fbuf + blk1Pay, (savedBlk1 ^ 0x01) & 0xFF);
+    if lbf_verify_file_crc(fbuf, fsize) != (0 - 1) {
+        EPrintStrLn("FAIL: corrupted text block should fail file CRC"); return 1;
+    }
+    poke8(fbuf + blk1Pay, savedBlk1);  // wiederherstellen
+
+    free(fbuf, fsize);
+
+    // ── Tests 14–18: ELF-Builder — Struktur ──────────────────────────────────
+
+    var elfSz: int64 := 0x1000 + 64;
+    var elfBuf: int64 := alloc(elfSz);
+    var ret: int64 := lbf_build_exec_elf(code, 64, elfBuf);
+
+    // Test 14: lbf_build_exec_elf gibt korrekte Größe zurück
+    if ret != elfSz {
+        EPrintStrLn("FAIL: lbf_build_exec_elf returned wrong size"); return 1;
+    }
+
+    // Test 15: ELF-Magic \x7fELF
+    if peek8(elfBuf + 0) != 127 { EPrintStrLn("FAIL: ELF magic[0]"); return 1; }
+    if peek8(elfBuf + 1) != 69  { EPrintStrLn("FAIL: ELF magic[1] E"); return 1; }
+    if peek8(elfBuf + 2) != 76  { EPrintStrLn("FAIL: ELF magic[2] L"); return 1; }
+    if peek8(elfBuf + 3) != 70  { EPrintStrLn("FAIL: ELF magic[3] F"); return 1; }
+
+    // Test 16: ELFCLASS64, ELFDATA2LSB
+    if peek8(elfBuf + 4) != 2 { EPrintStrLn("FAIL: ELF class != 64"); return 1; }
+    if peek8(elfBuf + 5) != 1 { EPrintStrLn("FAIL: ELF data != LSB"); return 1; }
+
+    // Test 17: e_entry = 0x400000 (LE64, bytes 24–31)
+    if peek8(elfBuf + 26) != 0x40 {
+        EPrintStrLn("FAIL: e_entry byte 2 != 0x40"); return 1;
+    }
+    if peek8(elfBuf + 24) != 0 {
+        EPrintStrLn("FAIL: e_entry byte 0 != 0x00"); return 1;
+    }
+
+    // Test 18: e_phnum = 1 (byte 56–57)
+    if peek8(elfBuf + 56) != 1 {
+        EPrintStrLn("FAIL: e_phnum != 1"); return 1;
+    }
+
+    // ── Tests 19–23: PT_LOAD-Inhalt ───────────────────────────────────────────
+
+    var ph: int64 := elfBuf + 64;  // PT_LOAD at offset 64
+
+    // Test 19: p_type = PT_LOAD (1)
+    if peek8(ph + 0) != 1 { EPrintStrLn("FAIL: p_type != PT_LOAD"); return 1; }
+
+    // Test 20: p_flags = 5 (R|X)
+    if peek8(ph + 4) != 5 { EPrintStrLn("FAIL: p_flags != 5 (R|X)"); return 1; }
+
+    // Test 21: p_offset = 0x1000 (byte 9 = 0x10, others 0)
+    if peek8(ph + 9) != 0x10 { EPrintStrLn("FAIL: p_offset != 0x1000"); return 1; }
+
+    // Test 22: p_vaddr = 0x400000 (byte 18 = 0x40)
+    if peek8(ph + 18) != 0x40 { EPrintStrLn("FAIL: p_vaddr != 0x400000"); return 1; }
+
+    // Test 23: p_filesz = codeLen (64) in LE64
+    if (peek8(ph + 32) & 0xFF) != 64 {
+        EPrintStrLn("FAIL: p_filesz != 64"); return 1;
+    }
+
+    // ── Tests 24–25: Code im ELF korrekt platziert ───────────────────────────
+
+    // Test 24: Code-Byte 0 an ELF-Offset 0x1000 = NOP (0x90)
+    if peek8(elfBuf + 0x1000 + 0) != 0x90 {
+        EPrintStrLn("FAIL: ELF code[0] != NOP"); return 1;
+    }
+
+    // Test 25: Code-Byte 63 an ELF-Offset 0x1000+63 = NOP (0x90)
+    if peek8(elfBuf + 0x1000 + 63) != 0x90 {
+        EPrintStrLn("FAIL: ELF code[63] != NOP"); return 1;
+    }
+
+    free(elfBuf, elfSz);
+    free(code, 64);
+
+    PrintStrLn("lx31: lbf_loader OK");
+    return 0;
+}

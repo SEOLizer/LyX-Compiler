@@ -85,6 +85,18 @@ test: lyxc
 	./lyxc tests/lx28_sections_test.lyx -o /tmp/lyxc_lx28_test
 	@/tmp/lyxc_lx28_test
 	@rm -f /tmp/lyxc_lx28_test
+	@echo "--- LX-29: Supply Chain Security ---"
+	./lyxc tests/lx29_security_test.lyx -o /tmp/lyxc_lx29_test
+	@/tmp/lyxc_lx29_test
+	@rm -f /tmp/lyxc_lx29_test
+	@echo "--- LX-30: LBF-Nativ Backend ---"
+	./lyxc tests/lx30_lbf_backend_test.lyx -o /tmp/lyxc_lx30_test
+	@/tmp/lyxc_lx30_test
+	@rm -f /tmp/lyxc_lx30_test
+	@echo "--- LX-31: lbf_loader ---"
+	./lyxc tests/lx31_lbf_loader_test.lyx -o /tmp/lyxc_lx31_test
+	@/tmp/lyxc_lx31_test
+	@rm -f /tmp/lyxc_lx31_test
 	@echo "OK"
 
 test-lyxos: lyxc
