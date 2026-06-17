@@ -1,0 +1,208 @@
+// std/net/arp.lyx — ARP Client (RFC 826)
+//
+// Public API:
+//   ArpBuildRequest(buf, srcMac, srcIP, dstIP)             → int64 (42)
+//   ArpBuildReply(buf, srcMac, srcIP, dstMac, dstIP)       → int64 (42)
+//   ArpParse(buf, len, result)                             — fills result
+//   ArpResolve(ip, result)                                  → int64 (0=ok)
+//
+// ARP frame wire layout (42 bytes total, all multi-byte fields big-endian):
+//
+//   Ethernet header (bytes 0-13):
+//     0-5   dst MAC
+//     6-11  src MAC
+//     12-13 EtherType = 0x0806
+//   ARP payload (bytes 14-41):
+//     14-15 hardware type = 0x0001 (Ethernet)
+//     16-17 protocol type = 0x0800 (IPv4)
+//     18    hardware addr length = 6
+//     19    protocol addr length = 4
+//     20-21 operation (1=REQUEST, 2=REPLY)
+//     22-27 sender hardware addr (MAC)
+//     28-31 sender protocol addr (IP)
+//     32-37 target hardware addr (MAC)
+//     38-41 target protocol addr (IP)
+//
+// ArpResolve uses SIOCGARP ioctl (reads kernel ARP cache, no raw socket
+// needed, no network traffic generated). Requires the IP to already be
+// in the cache (e.g. after a ping or connect).
+
+unit std.net.arp;
+
+import std.net.socket;
+import std.alloc;
+
+// ── Frame field offsets ───────────────────────────────────────────────────────
+pub con ARP_ETH_DST:       int64 := 0;   // 6 bytes: ethernet destination MAC
+pub con ARP_ETH_SRC:       int64 := 6;   // 6 bytes: ethernet source MAC
+pub con ARP_ETH_TYPE:      int64 := 12;  // 2 bytes: EtherType (0x0806)
+pub con ARP_HRD:           int64 := 14;  // 2 bytes: hardware type
+pub con ARP_PRO:           int64 := 16;  // 2 bytes: protocol type
+pub con ARP_HLEN:          int64 := 18;  // 1 byte:  hardware addr length
+pub con ARP_PLEN:          int64 := 19;  // 1 byte:  protocol addr length
+pub con ARP_OP:            int64 := 20;  // 2 bytes: operation code
+pub con ARP_SHA:           int64 := 22;  // 6 bytes: sender hardware addr
+pub con ARP_SIP:           int64 := 28;  // 4 bytes: sender IP
+pub con ARP_THA:           int64 := 32;  // 6 bytes: target hardware addr
+pub con ARP_TIP:           int64 := 38;  // 4 bytes: target IP
+pub con ARP_FRAME_SIZE:    int64 := 42;
+
+// ── Operation codes ───────────────────────────────────────────────────────────
+pub con ARP_OP_REQUEST:    int64 := 1;
+pub con ARP_OP_REPLY:      int64 := 2;
+pub con ARP_OP_RREQUEST:   int64 := 3;   // Reverse ARP request
+pub con ARP_OP_RREPLY:     int64 := 4;   // Reverse ARP reply
+
+// ── Wire constants ────────────────────────────────────────────────────────────
+pub con ARP_HTYPE_ETHER:   int64 := 1;    // hardware type = Ethernet
+pub con ARP_PROTO_IPV4:    int64 := 2048; // protocol type = IPv4 (0x0800)
+pub con ARP_ETYPE_B0:      int64 := 8;    // EtherType high byte (0x08)
+pub con ARP_ETYPE_B1:      int64 := 6;    // EtherType low byte  (0x06)
+
+// ── Result struct offsets (48 bytes) ─────────────────────────────────────────
+pub con ARP_RESULT_SENDER_IP:  int64 := 0;   // sender IP  (packed like IPPack)
+pub con ARP_RESULT_SENDER_MAC: int64 := 8;   // sender MAC (bytes at +8..+13)
+pub con ARP_RESULT_TARGET_IP:  int64 := 16;  // target IP
+pub con ARP_RESULT_TARGET_MAC: int64 := 24;  // target MAC (bytes at +24..+29)
+pub con ARP_RESULT_OP:         int64 := 32;  // operation code (1 or 2)
+pub con ARP_RESULT_OK:         int64 := 40;  // 1 = valid result
+pub con ARP_RESULT_SIZE:       int64 := 48;
+
+// SIOCGARP = 0x8954 (Linux x86_64) — read kernel ARP cache entry
+con ARP_SIOCGARP: int64 := 35156;
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+fn arpZero(buf: int64, size: int64) {
+    var i: int64 := 0;
+    while (i < size) { poke8(buf + i, 0); i := i + 1; }
+}
+
+fn arpCopyMac(dst: int64, src: int64) {
+    var i: int64 := 0;
+    while (i < 6) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+fn arpWrite16BE(buf: int64, off: int64, val: int64) {
+    poke8(buf + off,     (val >> 8) & 255);
+    poke8(buf + off + 1, val & 255);
+}
+
+fn arpRead16BE(buf: int64, off: int64): int64 {
+    return (peek8(buf + off) << 8) | peek8(buf + off + 1);
+}
+
+fn arpWrite32BE(buf: int64, off: int64, val: int64) {
+    poke8(buf + off,     (val >> 24) & 255);
+    poke8(buf + off + 1, (val >> 16) & 255);
+    poke8(buf + off + 2, (val >> 8)  & 255);
+    poke8(buf + off + 3, val & 255);
+}
+
+fn arpRead32BE(buf: int64, off: int64): int64 {
+    var b0: int64 := peek8(buf + off);
+    var b1: int64 := peek8(buf + off + 1);
+    var b2: int64 := peek8(buf + off + 2);
+    var b3: int64 := peek8(buf + off + 3);
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// Build ARP REQUEST frame into buf (must be >= ARP_FRAME_SIZE bytes).
+// Ethernet destination = broadcast (ff:ff:ff:ff:ff:ff).
+// ARP target MAC = 00:00:00:00:00:00 (unknown).
+// srcMac: pointer to 6-byte sender MAC.
+// srcIP, dstIP: packed like IPPack (e.g. IPPack(192,168,1,1)).
+// Returns ARP_FRAME_SIZE (42).
+pub fn ArpBuildRequest(buf: int64, srcMac: int64, srcIP: int64, dstIP: int64): int64 {
+    arpZero(buf, ARP_FRAME_SIZE);
+    // Ethernet: dst = ff:ff:ff:ff:ff:ff (broadcast)
+    poke8(buf,     255); poke8(buf + 1, 255); poke8(buf + 2, 255);
+    poke8(buf + 3, 255); poke8(buf + 4, 255); poke8(buf + 5, 255);
+    arpCopyMac(buf + ARP_ETH_SRC, srcMac);
+    poke8(buf + ARP_ETH_TYPE,     ARP_ETYPE_B0);
+    poke8(buf + ARP_ETH_TYPE + 1, ARP_ETYPE_B1);
+    arpWrite16BE(buf, ARP_HRD, ARP_HTYPE_ETHER);
+    arpWrite16BE(buf, ARP_PRO, ARP_PROTO_IPV4);
+    poke8(buf + ARP_HLEN, 6);
+    poke8(buf + ARP_PLEN, 4);
+    arpWrite16BE(buf, ARP_OP, ARP_OP_REQUEST);
+    arpCopyMac(buf + ARP_SHA, srcMac);
+    arpWrite32BE(buf, ARP_SIP, srcIP);
+    // ARP_THA already zeroed
+    arpWrite32BE(buf, ARP_TIP, dstIP);
+    return ARP_FRAME_SIZE;
+}
+
+// Build ARP REPLY frame into buf.
+// srcMac/srcIP: replying host. dstMac/dstIP: original requester.
+// Returns ARP_FRAME_SIZE (42).
+pub fn ArpBuildReply(buf: int64, srcMac: int64, srcIP: int64, dstMac: int64, dstIP: int64): int64 {
+    arpZero(buf, ARP_FRAME_SIZE);
+    arpCopyMac(buf + ARP_ETH_DST, dstMac);
+    arpCopyMac(buf + ARP_ETH_SRC, srcMac);
+    poke8(buf + ARP_ETH_TYPE,     ARP_ETYPE_B0);
+    poke8(buf + ARP_ETH_TYPE + 1, ARP_ETYPE_B1);
+    arpWrite16BE(buf, ARP_HRD, ARP_HTYPE_ETHER);
+    arpWrite16BE(buf, ARP_PRO, ARP_PROTO_IPV4);
+    poke8(buf + ARP_HLEN, 6);
+    poke8(buf + ARP_PLEN, 4);
+    arpWrite16BE(buf, ARP_OP, ARP_OP_REPLY);
+    arpCopyMac(buf + ARP_SHA, srcMac);
+    arpWrite32BE(buf, ARP_SIP, srcIP);
+    arpCopyMac(buf + ARP_THA, dstMac);
+    arpWrite32BE(buf, ARP_TIP, dstIP);
+    return ARP_FRAME_SIZE;
+}
+
+// Parse ARP frame from buf (a raw Ethernet frame, ARP_FRAME_SIZE bytes).
+// result: pointer to ARP_RESULT_SIZE zeroed bytes.
+// Sets ARP_RESULT_OK=1 if frame has EtherType 0x0806, hlen=6, plen=4.
+pub fn ArpParse(buf: int64, len: int64, result: int64) {
+    poke64(result + ARP_RESULT_OK, 0);
+    if (len < ARP_FRAME_SIZE) { return; }
+    if (peek8(buf + ARP_ETH_TYPE)     != ARP_ETYPE_B0) { return; }
+    if (peek8(buf + ARP_ETH_TYPE + 1) != ARP_ETYPE_B1) { return; }
+    if (peek8(buf + ARP_HLEN) != 6) { return; }
+    if (peek8(buf + ARP_PLEN) != 4) { return; }
+    poke64(result + ARP_RESULT_SENDER_IP,  arpRead32BE(buf, ARP_SIP));
+    poke64(result + ARP_RESULT_TARGET_IP,  arpRead32BE(buf, ARP_TIP));
+    arpCopyMac(result + ARP_RESULT_SENDER_MAC, buf + ARP_SHA);
+    arpCopyMac(result + ARP_RESULT_TARGET_MAC, buf + ARP_THA);
+    poke64(result + ARP_RESULT_OP, arpRead16BE(buf, ARP_OP));
+    poke64(result + ARP_RESULT_OK, 1);
+}
+
+// Look up the MAC address for ip in the kernel ARP cache (SIOCGARP ioctl).
+// No raw socket or root required; reads the kernel's cache only.
+// On success: result.OK=1, SENDER_MAC and TARGET_MAC = resolved MAC.
+// Returns 0 on success, -1 if IP not in cache or on error.
+pub fn ArpResolve(ip: int64, result: int64): int64 {
+    poke64(result + ARP_RESULT_OK, 0);
+    var sock: UDPSocket := UDPSocketNew();
+    if (sock.fd < 0) { return 0 - 1; }
+    // arpreq: arp_pa(16) + arp_ha(16) + arp_flags(4) + arp_netmask(16) + arp_dev(16) = 68
+    var req: int64 := alloc(68);
+    arpZero(req, 68);
+    // arp_pa.sa_family = AF_INET = 2
+    poke8(req,     2);
+    poke8(req + 1, 0);
+    // arp_pa.sin_addr = IP in network byte order (big-endian)
+    poke8(req + 4, (ip >> 24) & 255);
+    poke8(req + 5, (ip >> 16) & 255);
+    poke8(req + 6, (ip >> 8)  & 255);
+    poke8(req + 7, ip & 255);
+    var ret: int64 := sys_ioctl(sock.fd, ARP_SIOCGARP, req);
+    UDPSocketClose(sock);
+    if (ret < 0) { free(req, 68); return 0 - 1; }
+    // arp_ha (offset 16): sa_family(2 bytes) + MAC(6 bytes) + padding
+    var macPtr: int64 := req + 18;
+    arpCopyMac(result + ARP_RESULT_SENDER_MAC, macPtr);
+    arpCopyMac(result + ARP_RESULT_TARGET_MAC, macPtr);
+    poke64(result + ARP_RESULT_TARGET_IP, ip);
+    poke64(result + ARP_RESULT_OP,  ARP_OP_REPLY);
+    poke64(result + ARP_RESULT_OK,  1);
+    free(req, 68);
+    return 0;
+}
