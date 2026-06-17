@@ -97,6 +97,9 @@ test: lyxc
 	./lyxc tests/lx31_lbf_loader_test.lyx -o /tmp/lyxc_lx31_test
 	@/tmp/lyxc_lx31_test
 	@rm -f /tmp/lyxc_lx31_test
+	./lyxc tests/lx32_lbf_import_test.lyx -o /tmp/lyxc_lx32_test
+	@/tmp/lyxc_lx32_test
+	@rm -f /tmp/lyxc_lx32_test
 	@echo "OK"
 
 test-lyxos: lyxc

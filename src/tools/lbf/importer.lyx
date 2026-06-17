@@ -1,0 +1,87 @@
+// src/tools/lbf/importer.lyx — LX-32 LBF-Nativ → IOFS-Import (Library)
+//
+// Public API:
+//   lbf_import(path, store) → genesis_lpid (int64) oder -1
+//
+// Import: import src.tools.lbf.importer;
+
+import src.std.alloc;
+import src.std.io;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import src.tools.lbf.genesis;
+import src.tools.lbf.security;
+import src.tools.lbf.iofs_page;
+import src.tools.lbf.iofs_store;
+
+// ── lbf_import ────────────────────────────────────────────────────────────────
+//
+// Importiert eine LBF-Datei in den IOFS-Store.
+//
+// path:  Pfad zur LBF-Datei
+// store: Zeiger auf IOFS-Store (aus iofs_store_alloc)
+//
+// Rückgabe: LPID der Genesis-Page (Block 0), oder -1 bei Fehler.
+
+pub fn lbf_import(path: pchar, store: int64): int64 {
+
+    // ── 1. Datei öffnen und lesen ─────────────────────────────────────────────
+    var fd: int64 := open(path, 0, 0);
+    if fd < 0 { return 0 - 1; }
+
+    var fsize: int64 := lseek(fd, 0, 2);
+    if (fsize % LBF_BLOCK_SIZE) != 0 { close(fd); return 0 - 1; }
+    if fsize < LBF_BLOCK_SIZE        { close(fd); return 0 - 1; }
+    lseek(fd, 0, 0);
+
+    var fbuf: int64 := alloc(fsize);
+    var got: int64 := read(fd, fbuf, fsize);
+    close(fd);
+    if got != fsize { free(fbuf, fsize); return 0 - 1; }
+
+    // ── 2. Genesis-Block validieren ───────────────────────────────────────────
+    if lbf_header_validate(fbuf) != 0 { free(fbuf, fsize); return 0 - 1; }
+
+    // ── 3. File-CRC32C prüfen ─────────────────────────────────────────────────
+    if lbf_verify_file_crc(fbuf, fsize) != 0 { free(fbuf, fsize); return 0 - 1; }
+
+    // ── 4. UUID-Blacklist prüfen ──────────────────────────────────────────────
+    var uuidPtr: int64 := fbuf + LBF_HEADER_SIZE + GEN_P_COMPILER_UUID;
+    if lbf_check_compiler_blacklist(uuidPtr) == 0 { free(fbuf, fsize); return 0 - 1; }
+
+    // ── 5. Block-Anzahl aus Genesis lesen ─────────────────────────────────────
+    var totalBlocks: int64 := fsize / LBF_BLOCK_SIZE;
+
+    // ── 6. LPIDs für alle Blöcke generieren (zufällig, 8 Bytes) ─────────────
+    var lpid_arr: int64 := alloc(totalBlocks * 8);
+    var rnd_buf: int64 := alloc(totalBlocks * 8);
+    sys_getrandom(rnd_buf, totalBlocks * 8, 0);
+    var li: int64 := 0;
+    while li < totalBlocks {
+        poke64(lpid_arr + li * 8, peek64(rnd_buf + li * 8));
+        li := li + 1;
+    }
+    free(rnd_buf, totalBlocks * 8);
+
+    // ── 7. IOFS-Pages bauen und in Store eintragen ────────────────────────────
+    var bi: int64 := 0;
+    while bi < totalBlocks {
+        var lpid:      int64 := peek64(lpid_arr + bi * 8);
+        var next_lpid: int64 := 0;
+        if bi + 1 < totalBlocks { next_lpid := peek64(lpid_arr + (bi + 1) * 8); }
+
+        var lbf_block: int64 := fbuf + bi * LBF_BLOCK_SIZE;
+        var pg: int64 := iofs_page_build(lpid, next_lpid, lbf_block, 0);
+
+        var ec: int64 := 0;
+        if next_lpid != 0 { ec := 1; }
+
+        iofs_store_add(store, lpid, pg, ec);
+        bi := bi + 1;
+    }
+
+    var genesis_lpid: int64 := peek64(lpid_arr);
+    free(lpid_arr, totalBlocks * 8);
+    free(fbuf, fsize);
+    return genesis_lpid;
+}
