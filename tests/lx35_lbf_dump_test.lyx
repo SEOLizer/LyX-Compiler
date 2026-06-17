@@ -1,0 +1,215 @@
+// LX-35 Test: lbf_dump — Validierung, Feld-Lesefunktionen, Dump-Ausgabe (30 Tests)
+
+import src.std.alloc;
+import src.std.io;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import src.tools.lbf.security;
+import src.tools.lbf.writer;
+import src.tools.lbf.dumper;
+
+fn main(): int64 {
+
+    // ── Setup: valide 2-Block LBF erzeugen ───────────────────────────────────
+
+    var code: int64 := alloc(64);
+    var fi: int64 := 0;
+    while fi < 64 { poke8(code + fi, 0x90); fi := fi + 1; }
+
+    var lbf: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf.writeLBF("/tmp/lx35_valid.lbf"c, 0 as pchar, code, 64) {
+        EPrintStrLn("FAIL: setup writeLBF failed"); return 1;
+    }
+    free(code, 64);
+
+    // Datei einlesen
+    var fd: int64 := open("/tmp/lx35_valid.lbf"c, 0, 0);
+    if fd < 0 { EPrintStrLn("FAIL: cannot open valid LBF"); return 1; }
+    var fsize: int64 := lseek(fd, 0, 2);
+    lseek(fd, 0, 0);
+    var fbuf: int64 := alloc(fsize);
+    read(fd, fbuf, fsize);
+    close(fd);
+
+    // ── Tests 1–2: Grundvalidierung gültige Datei ────────────────────────────
+
+    if lbf_dump_verify(fbuf, fsize) != 0 {
+        EPrintStrLn("FAIL: lbf_dump_verify on valid file should return 0"); return 1;
+    }
+    if lbf_dump_total_blocks(fbuf, fsize) != 2 {
+        EPrintStrLn("FAIL: total_blocks should be 2"); return 1;
+    }
+
+    // ── Tests 3–5: Magic-Korrumpierung → -2 ──────────────────────────────────
+
+    var saved_m0: int64 := peek8(fbuf + LBF_H_MAGIC) & 0xFF;
+    poke8(fbuf + LBF_H_MAGIC, 0x00);
+    if lbf_dump_verify(fbuf, fsize) != (0 - 2) {
+        EPrintStrLn("FAIL: corrupted magic should give -2"); return 1;
+    }
+    poke8(fbuf + LBF_H_MAGIC, saved_m0);
+
+    // Wiederhergestellt → 0
+    if lbf_dump_verify(fbuf, fsize) != 0 {
+        EPrintStrLn("FAIL: magic restored, should be 0"); return 1;
+    }
+
+    // Letztes Magic-Byte korrumpieren
+    var saved_m3: int64 := peek8(fbuf + LBF_H_MAGIC + 3) & 0xFF;
+    poke8(fbuf + LBF_H_MAGIC + 3, 0xFF);
+    if lbf_dump_verify(fbuf, fsize) != (0 - 2) {
+        EPrintStrLn("FAIL: corrupted magic[3] should give -2"); return 1;
+    }
+    poke8(fbuf + LBF_H_MAGIC + 3, saved_m3);
+
+    // ── Tests 6–8: Block-CRC-Korrumpierung → -3 ──────────────────────────────
+
+    // Payload-Byte in Block 0 korrumpieren
+    var payOff0: int64 := LBF_HEADER_SIZE + 10;
+    var saved_p0: int64 := peek8(fbuf + payOff0) & 0xFF;
+    poke8(fbuf + payOff0, (saved_p0 ^ 0xFF) & 0xFF);
+    if lbf_dump_verify(fbuf, fsize) != (0 - 3) {
+        EPrintStrLn("FAIL: corrupted block 0 payload should give -3"); return 1;
+    }
+    if lbf_dump_block_crc_ok(fbuf, 0) {
+        EPrintStrLn("FAIL: corrupted block 0 should not have valid CRC"); return 1;
+    }
+    if !lbf_dump_block_crc_ok(fbuf, 1) {
+        EPrintStrLn("FAIL: block 1 should still be valid"); return 1;
+    }
+    poke8(fbuf + payOff0, saved_p0);
+
+    // Test 8: Wiederhergestellt → 0
+    if lbf_dump_verify(fbuf, fsize) != 0 {
+        EPrintStrLn("FAIL: after block 0 restore, should be 0"); return 1;
+    }
+
+    // ── Tests 9–11: Block 1 korrumpieren, Block 0 bleibt valide ─────────────
+
+    var payOff1: int64 := LBF_BLOCK_SIZE + LBF_HEADER_SIZE + 50;
+    var saved_p1: int64 := peek8(fbuf + payOff1) & 0xFF;
+    poke8(fbuf + payOff1, (saved_p1 ^ 0xFF) & 0xFF);
+
+    if lbf_dump_verify(fbuf, fsize) != (0 - 3) {
+        EPrintStrLn("FAIL: corrupted block 1 should give -3"); return 1;
+    }
+    if !lbf_dump_block_crc_ok(fbuf, 0) {
+        EPrintStrLn("FAIL: block 0 should be valid when block 1 is corrupt"); return 1;
+    }
+    if lbf_dump_block_crc_ok(fbuf, 1) {
+        EPrintStrLn("FAIL: block 1 should fail CRC after corruption"); return 1;
+    }
+    poke8(fbuf + payOff1, saved_p1);
+
+    // ── Tests 12–13: File-CRC-Korrumpierung → -4 ─────────────────────────────
+    // Strategie: Block-1-Payload modifizieren + Block-1-CRC reparieren →
+    // alle Block-CRCs valide, aber File-CRC passt nicht mehr.
+
+    var b1_pay_off: int64 := LBF_BLOCK_SIZE + LBF_HEADER_SIZE + 20;
+    var saved_b1: int64 := peek8(fbuf + b1_pay_off) & 0xFF;
+    poke8(fbuf + b1_pay_off, (saved_b1 ^ 0x01) & 0xFF);
+    lbf_header_set_crc(fbuf + LBF_BLOCK_SIZE, fbuf + LBF_BLOCK_SIZE + LBF_HEADER_SIZE);
+
+    if lbf_dump_verify(fbuf, fsize) != (0 - 4) {
+        EPrintStrLn("FAIL: block1-modified-with-fixed-CRC should give -4"); return 1;
+    }
+
+    // Wiederherstellen: Byte zurücksetzen + Block-1-CRC neu berechnen
+    poke8(fbuf + b1_pay_off, saved_b1);
+    lbf_header_set_crc(fbuf + LBF_BLOCK_SIZE, fbuf + LBF_BLOCK_SIZE + LBF_HEADER_SIZE);
+
+    if lbf_dump_verify(fbuf, fsize) != 0 {
+        EPrintStrLn("FAIL: after block1 restore, should be 0"); return 1;
+    }
+
+    // ── Tests 14–17: Feld-Lesefunktionen ─────────────────────────────────────
+
+    if lbf_dump_arch(fbuf) != LBF_ARCH_X86_64 {
+        EPrintStrLn("FAIL: arch should be LBF_ARCH_X86_64 (1)"); return 1;
+    }
+    if lbf_dump_entry_point(fbuf) != 0x400000 {
+        EPrintStrLn("FAIL: entry_point should be 0x400000"); return 1;
+    }
+    if lbf_dump_file_size_bytes(fbuf) != 2 * LBF_BLOCK_SIZE {
+        EPrintStrLn("FAIL: file_size_bytes should be 8192"); return 1;
+    }
+    if lbf_dump_total_blocks(fbuf, fsize) != 2 {
+        EPrintStrLn("FAIL: total_blocks should be 2"); return 1;
+    }
+
+    // ── Test 18: TLV-Anzahl ───────────────────────────────────────────────────
+    // Writer schreibt: capabilities(0x05) + lifecycle(0x08) + section_map(0x09) = 3
+
+    if lbf_dump_tlv_count(fbuf) != 3 {
+        EPrintStrLn("FAIL: tlv_count should be 3 (caps+lifecycle+section_map)"); return 1;
+    }
+
+    // ── Tests 19–20: lbf_dump_verify auf ungültige Größe ─────────────────────
+
+    if lbf_dump_verify(fbuf, 100) != (0 - 1) {
+        EPrintStrLn("FAIL: size 100 should give -1"); return 1;
+    }
+    if lbf_dump_verify(fbuf, LBF_BLOCK_SIZE - 1) != (0 - 1) {
+        EPrintStrLn("FAIL: size not multiple should give -1"); return 1;
+    }
+
+    // ── Tests 21–25: Dump-Ausgabe-Funktionen (kein Absturz, nur Ausgabe) ─────
+
+    PrintStrLn("--- dump output begins ---");
+
+    lbf_dump_print_genesis(fbuf, fsize);
+    PrintStrLn("--- genesis OK ---");
+
+    lbf_dump_print_provenance(fbuf);
+    PrintStrLn("--- provenance OK ---");
+
+    lbf_dump_print_tlvs(fbuf);
+    PrintStrLn("--- tlvs OK ---");
+
+    lbf_dump_print_blocks(fbuf, fsize);
+    PrintStrLn("--- blocks OK ---");
+
+    lbf_dump_print_all(fbuf, fsize, "/tmp/lx35_valid.lbf"c);
+    PrintStrLn("--- full dump OK ---");
+
+    // ── Tests 26–28: 1-Block LBF (nur Genesis, codeLen=0) ───────────────────
+
+    var lbf2: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf2.writeLBF("/tmp/lx35_genesis_only.lbf"c, 0 as pchar, 0, 0) {
+        EPrintStrLn("FAIL: writeLBF genesis-only failed"); return 1;
+    }
+
+    var fd2: int64 := open("/tmp/lx35_genesis_only.lbf"c, 0, 0);
+    if fd2 < 0 { EPrintStrLn("FAIL: cannot open genesis-only LBF"); return 1; }
+    var fsize2: int64 := lseek(fd2, 0, 2);
+    lseek(fd2, 0, 0);
+    var fbuf2: int64 := alloc(fsize2);
+    read(fd2, fbuf2, fsize2);
+    close(fd2);
+
+    if lbf_dump_verify(fbuf2, fsize2) != 0 {
+        EPrintStrLn("FAIL: genesis-only LBF should verify OK"); return 1;
+    }
+    if lbf_dump_total_blocks(fbuf2, fsize2) != 1 {
+        EPrintStrLn("FAIL: genesis-only should have 1 block"); return 1;
+    }
+    if lbf_dump_block_crc_ok(fbuf2, 0) != true {
+        EPrintStrLn("FAIL: genesis-only block 0 CRC should be OK"); return 1;
+    }
+    free(fbuf2, fsize2);
+
+    // ── Tests 29–30: block_crc_ok gibt korrekte Ergebnisse zurück ────────────
+
+    // Beide Blöcke der validen Datei haben valide CRCs
+    if !lbf_dump_block_crc_ok(fbuf, 0) {
+        EPrintStrLn("FAIL: block 0 should have valid CRC"); return 1;
+    }
+    if !lbf_dump_block_crc_ok(fbuf, 1) {
+        EPrintStrLn("FAIL: block 1 should have valid CRC"); return 1;
+    }
+
+    free(fbuf, fsize);
+
+    PrintStrLn("lx35: lbf_dump OK");
+    return 0;
+}
