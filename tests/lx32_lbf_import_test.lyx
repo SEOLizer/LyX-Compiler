@@ -1,0 +1,296 @@
+// LX-32 Test: lbf_import — LBF-Nativ → IOFS-Store (30 Tests)
+
+import src.std.alloc;
+import src.std.io;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import src.tools.lbf.genesis;
+import src.tools.lbf.security;
+import src.tools.lbf.iofs_page;
+import src.tools.lbf.iofs_store;
+import src.tools.lbf.writer;
+import src.tools.lbf.importer;
+
+fn main(): int64 {
+
+    // ── Setup: 2-Block LBF erzeugen (Genesis + 1 Text-Block) ─────────────────
+
+    var code: int64 := alloc(64);
+    var ci: int64 := 0;
+    while ci < 64 { poke8(code + ci, 0x90); ci := ci + 1; }
+
+    var lbfPath: pchar := "/tmp/lx32_test.lbf"c;
+    var lbf: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf.writeLBF(lbfPath, 0 as pchar, code, 64) {
+        EPrintStrLn("FAIL: setup writeLBF failed"); return 1;
+    }
+    free(code, 64);
+
+    // ── Test 1: lbf_import gibt valide LPID zurück (≠ -1, ≠ 0) ─────────────
+
+    var store: int64 := iofs_store_alloc(256);
+    var genesis_lpid: int64 := lbf_import(lbfPath, store);
+    if genesis_lpid == (0 - 1) {
+        EPrintStrLn("FAIL: lbf_import returned -1"); return 1;
+    }
+    if genesis_lpid == 0 {
+        EPrintStrLn("FAIL: lbf_import returned 0 (invalid LPID)"); return 1;
+    }
+
+    // ── Test 2: Store hat genau totalBlocks Einträge ──────────────────────────
+    // 64B Code = 1 Text-Block → totalBlocks = 2 (Genesis + 1 Text)
+
+    var count: int64 := iofs_store_count(store);
+    if count != 2 {
+        EPrintStrLn("FAIL: expected 2 pages in store"); return 1;
+    }
+
+    // ── Test 3: Genesis-LPID (Block 0) ist in Store auffindbar ───────────────
+
+    var genesis_page: int64 := iofs_store_lookup(store, genesis_lpid);
+    if genesis_page == 0 {
+        EPrintStrLn("FAIL: genesis LPID not found in store"); return 1;
+    }
+
+    // ── Test 4: Genesis-Page hat korrekten Typ (0x04 = IOFS_PAGE_TYPE_LBF) ───
+
+    if iofs_page_get_type(genesis_page) != IOFS_PAGE_TYPE_LBF {
+        EPrintStrLn("FAIL: genesis page type != 0x04"); return 1;
+    }
+
+    // ── Test 5: Genesis-Page LPID stimmt mit Store-Key überein ───────────────
+
+    if iofs_page_get_lpid(genesis_page) != genesis_lpid {
+        EPrintStrLn("FAIL: genesis page LPID mismatch"); return 1;
+    }
+
+    // ── Test 6: Genesis-Page hat Payload mit LYX!-Magic ──────────────────────
+
+    if !iofs_page_has_lbf_magic(genesis_page) {
+        EPrintStrLn("FAIL: genesis page payload missing LYX! magic"); return 1;
+    }
+
+    // ── Test 7: Genesis-Page hat genau 1 Kante (0xB001) ─────────────────────
+
+    if iofs_page_get_edge_count(genesis_page) != 1 {
+        EPrintStrLn("FAIL: genesis page edge_count != 1"); return 1;
+    }
+
+    // ── Test 8: Kanten-Typ der Genesis-Page ist 0xB001 ───────────────────────
+
+    if iofs_page_get_edge_type(genesis_page, 0) != IOFS_EDGE_BLK_CHAIN {
+        EPrintStrLn("FAIL: genesis page edge type != 0xB001"); return 1;
+    }
+
+    // ── Test 9: 0xB001-Kante zeigt auf Text-Block-LPID, der im Store ist ─────
+
+    var next_lpid: int64 := iofs_page_get_edge_lpid(genesis_page, 0);
+    if next_lpid == 0 {
+        EPrintStrLn("FAIL: genesis page next_lpid is 0"); return 1;
+    }
+    var text_page: int64 := iofs_store_lookup(store, next_lpid);
+    if text_page == 0 {
+        EPrintStrLn("FAIL: text LPID not found in store via 0xB001 chain"); return 1;
+    }
+
+    // ── Test 10: Text-Page hat korrekten Typ (0x04) ───────────────────────────
+
+    if iofs_page_get_type(text_page) != IOFS_PAGE_TYPE_LBF {
+        EPrintStrLn("FAIL: text page type != 0x04"); return 1;
+    }
+
+    // ── Test 11: Text-Page hat 0 Kanten (letzter Block) ──────────────────────
+
+    if iofs_page_get_edge_count(text_page) != 0 {
+        EPrintStrLn("FAIL: text page edge_count != 0 (should be last)"); return 1;
+    }
+
+    // ── Test 12: Text-Page LPID stimmt mit Store-Key überein ─────────────────
+
+    if iofs_page_get_lpid(text_page) != next_lpid {
+        EPrintStrLn("FAIL: text page LPID mismatch"); return 1;
+    }
+
+    // ── Test 13: Genesis-Page CRC32C ist valide ───────────────────────────────
+
+    if iofs_page_validate_crc(genesis_page, 1) != 0 {
+        EPrintStrLn("FAIL: genesis page CRC32C invalid"); return 1;
+    }
+
+    // ── Test 14: Text-Page CRC32C ist valide ─────────────────────────────────
+
+    if iofs_page_validate_crc(text_page, 0) != 0 {
+        EPrintStrLn("FAIL: text page CRC32C invalid"); return 1;
+    }
+
+    // ── Test 15: iofs_store_edge_count für Genesis-LPID = 1 ──────────────────
+
+    if iofs_store_edge_count(store, genesis_lpid) != 1 {
+        EPrintStrLn("FAIL: store edge_count for genesis != 1"); return 1;
+    }
+
+    // ── Test 16: iofs_store_edge_count für Text-LPID = 0 ─────────────────────
+
+    if iofs_store_edge_count(store, next_lpid) != 0 {
+        EPrintStrLn("FAIL: store edge_count for text != 0"); return 1;
+    }
+
+    // ── Test 17: iofs_store_lpid_at(0) = genesis_lpid ────────────────────────
+
+    if iofs_store_lpid_at(store, 0) != genesis_lpid {
+        EPrintStrLn("FAIL: lpid_at(0) != genesis_lpid"); return 1;
+    }
+
+    // ── Test 18: iofs_store_lpid_at(1) = next_lpid ───────────────────────────
+
+    if iofs_store_lpid_at(store, 1) != next_lpid {
+        EPrintStrLn("FAIL: lpid_at(1) != next_lpid"); return 1;
+    }
+
+    // ── Test 19: iofs_store_lpid_at(2) = -1 (out of range) ───────────────────
+
+    if iofs_store_lpid_at(store, 2) != (0 - 1) {
+        EPrintStrLn("FAIL: lpid_at(2) should be -1"); return 1;
+    }
+
+    // ── Test 20: iofs_store_lookup für unbekannte LPID = 0 ───────────────────
+
+    if iofs_store_lookup(store, 0x1234567890ABCDEF) != 0 {
+        EPrintStrLn("FAIL: lookup of unknown LPID should return 0"); return 1;
+    }
+
+    // ── Test 21: CRC korrumpieren → validate schlägt fehl ────────────────────
+
+    var saved_byte: int64 := peek8(genesis_page + IOFS_H_CRC32C) & 0xFF;
+    poke8(genesis_page + IOFS_H_CRC32C, (saved_byte ^ 0xFF) & 0xFF);
+    if iofs_page_validate_crc(genesis_page, 1) != (0 - 1) {
+        EPrintStrLn("FAIL: tampered CRC should fail validate"); return 1;
+    }
+    poke8(genesis_page + IOFS_H_CRC32C, saved_byte);
+
+    // ── Test 22: CRC nach Wiederherstellung wieder valide ─────────────────────
+
+    if iofs_page_validate_crc(genesis_page, 1) != 0 {
+        EPrintStrLn("FAIL: CRC not valid after restore"); return 1;
+    }
+
+    // ── Test 23: Payload-Korrumpierung → CRC-Fehler ───────────────────────────
+
+    var pay_off: int64 := IOFS_PAGE_HDR_SIZE + 10;
+    var saved_pay: int64 := peek8(genesis_page + pay_off) & 0xFF;
+    poke8(genesis_page + pay_off, (saved_pay ^ 0xFF) & 0xFF);
+    if iofs_page_validate_crc(genesis_page, 1) != (0 - 1) {
+        EPrintStrLn("FAIL: tampered payload should fail CRC"); return 1;
+    }
+    poke8(genesis_page + pay_off, saved_pay);
+
+    iofs_store_free(store);
+
+    // ── Test 24: Zweiter Import derselben Datei → neues Store, neue LPIDs ─────
+
+    var store2: int64 := iofs_store_alloc(256);
+    var lpid2: int64 := lbf_import(lbfPath, store2);
+    if lpid2 == (0 - 1) {
+        EPrintStrLn("FAIL: second import failed"); return 1;
+    }
+
+    // Test 24: zweiter Import gibt anderen LPID zurück (zufällig)
+    // (Sehr unwahrscheinlich, dass beide gleich sind — aber kein harter Fehler)
+    var count2: int64 := iofs_store_count(store2);
+    if count2 != 2 {
+        EPrintStrLn("FAIL: second import page count != 2"); return 1;
+    }
+    iofs_store_free(store2);
+
+    // ── Test 25: lbf_import mit nicht-existenter Datei → -1 ─────────────────
+
+    var store3: int64 := iofs_store_alloc(256);
+    var bad_lpid: int64 := lbf_import("/tmp/does_not_exist_lx32.lbf"c, store3);
+    if bad_lpid != (0 - 1) {
+        EPrintStrLn("FAIL: nonexistent file should return -1"); return 1;
+    }
+    if iofs_store_count(store3) != 0 {
+        EPrintStrLn("FAIL: store should be empty after failed import"); return 1;
+    }
+    iofs_store_free(store3);
+
+    // ── Test 26: 4-Block LBF (3 Text-Blöcke) → Ketten-Korrektheit ───────────
+
+    var bigCode: int64 := alloc(LBF_PAYLOAD_SIZE * 3);
+    var bci: int64 := 0;
+    while bci < LBF_PAYLOAD_SIZE * 3 { poke8(bigCode + bci, 0x90); bci := bci + 1; }
+
+    var bigPath: pchar := "/tmp/lx32_big.lbf"c;
+    var lbf2: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf2.writeLBF(bigPath, 0 as pchar, bigCode, LBF_PAYLOAD_SIZE * 3) {
+        EPrintStrLn("FAIL: big writeLBF failed"); return 1;
+    }
+    free(bigCode, LBF_PAYLOAD_SIZE * 3);
+
+    var store4: int64 := iofs_store_alloc(256);
+    var big_lpid: int64 := lbf_import(bigPath, store4);
+    if big_lpid == (0 - 1) {
+        EPrintStrLn("FAIL: big import failed"); return 1;
+    }
+
+    // Test 26: 4 Blöcke im Store
+    if iofs_store_count(store4) != 4 {
+        EPrintStrLn("FAIL: big import expected 4 pages"); return 1;
+    }
+
+    // ── Test 27: Vollständige Kette traversierbar (0→1→2→3, Block 3 kein Edge)
+
+    var cur_lpid: int64 := big_lpid;
+    var chain_len: int64 := 0;
+    var traverse: int64 := 1;
+    while traverse == 1 {
+        var cur_pg: int64 := iofs_store_lookup(store4, cur_lpid);
+        if cur_pg == 0 { traverse := 0; }
+        else {
+            chain_len := chain_len + 1;
+            var ec: int64 := iofs_page_get_edge_count(cur_pg);
+            if ec == 0 { traverse := 0; }
+            else { cur_lpid := iofs_page_get_edge_lpid(cur_pg, 0); }
+        }
+    }
+    if chain_len != 4 {
+        EPrintStrLn("FAIL: chain traversal expected 4 hops"); return 1;
+    }
+
+    // ── Test 28: Alle 4 Pages haben CRC-valide Header ─────────────────────────
+
+    var vi: int64 := 0;
+    while vi < 4 {
+        var vl: int64 := iofs_store_lpid_at(store4, vi);
+        var vp: int64 := iofs_store_lookup(store4, vl);
+        var vec: int64 := iofs_store_edge_count(store4, vl);
+        if iofs_page_validate_crc(vp, vec) != 0 {
+            EPrintStrLn("FAIL: big import page CRC invalid"); return 1;
+        }
+        vi := vi + 1;
+    }
+
+    // ── Test 29: Nur letzter Block hat 0 Kanten ───────────────────────────────
+
+    var last_ec: int64 := iofs_store_edge_count(store4, iofs_store_lpid_at(store4, 3));
+    if last_ec != 0 {
+        EPrintStrLn("FAIL: last block should have 0 edges"); return 1;
+    }
+
+    // ── Test 30: Alle Blöcke außer letztem haben genau 1 Kante ───────────────
+
+    var ki: int64 := 0;
+    while ki < 3 {
+        var kl: int64 := iofs_store_lpid_at(store4, ki);
+        var ke: int64 := iofs_store_edge_count(store4, kl);
+        if ke != 1 {
+            EPrintStrLn("FAIL: non-last block should have 1 edge"); return 1;
+        }
+        ki := ki + 1;
+    }
+
+    iofs_store_free(store4);
+
+    PrintStrLn("lx32: lbf_import OK");
+    return 0;
+}
