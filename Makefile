@@ -100,6 +100,9 @@ test: lyxc
 	./lyxc tests/lx32_lbf_import_test.lyx -o /tmp/lyxc_lx32_test
 	@/tmp/lyxc_lx32_test
 	@rm -f /tmp/lyxc_lx32_test
+	./lyxc tests/lx33_dep_resolver_test.lyx -o /tmp/lyxc_lx33_test
+	@/tmp/lyxc_lx33_test
+	@rm -f /tmp/lyxc_lx33_test
 	@echo "OK"
 
 test-lyxos: lyxc

@@ -1,0 +1,187 @@
+// src/tools/lbf/dep_resolver.lyx — LX-33 Dependency Resolver
+//
+// Löst TLV 0x02 (SHA-256-Abhängigkeitshashes) zu LPIDs auf und webt
+// 0xD001-Dependency-Kanten in den IOFS-Programm-Graphen ein.
+//
+// Public API:
+//   dep_index_alloc()                               → idx
+//   dep_index_free(idx)
+//   dep_index_register(idx, sha256, lpid)           → 0=ok  -1=full
+//   dep_index_lookup(idx, sha256)                   → lpid  0=missing
+//   dep_index_count(idx)                            → int64
+//   dep_resolve_all(store, idx, prog_lpid)          → unresolved count
+//
+// Import: import src.tools.lbf.dep_resolver;
+
+import src.std.alloc;
+import src.std.io;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.tlv;
+import src.tools.lbf.iofs_page;
+import src.tools.lbf.iofs_store;
+
+// ── Konstanten ────────────────────────────────────────────────────────────────
+
+pub con IOFS_EDGE_DEP      : int64 := 0xD001;
+pub con DEP_SHA256_SIZE    : int64 := 32;
+pub con DEP_INDEX_CAP      : int64 := 256;   // power of 2; load ≤ 50% for 100 entries
+pub con DEP_INDEX_ENTRY_SZ : int64 := 40;    // sha256[32] + lpid[8]
+pub con DEP_INDEX_HDR_SZ   : int64 := 24;    // count[8] + capacity[8] + entries_ptr[8]
+
+// ── Private Helpers ───────────────────────────────────────────────────────────
+
+fn sha256_copy(dst: int64, src: int64) {
+    var i: int64 := 0;
+    while i < DEP_SHA256_SIZE { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+fn sha256_eq(a: int64, b: int64): bool {
+    var i: int64 := 0;
+    while i < DEP_SHA256_SIZE {
+        if peek8(a + i) != peek8(b + i) { return false; }
+        i := i + 1;
+    }
+    return true;
+}
+
+// ── dep_index_alloc ───────────────────────────────────────────────────────────
+
+pub fn dep_index_alloc(): int64 {
+    var idx: int64 := alloc(DEP_INDEX_HDR_SZ);
+    poke64(idx + 0, 0);
+    poke64(idx + 8, DEP_INDEX_CAP);
+    var entries: int64 := alloc(DEP_INDEX_CAP * DEP_INDEX_ENTRY_SZ);
+    poke64(idx + 16, entries);
+    return idx;
+}
+
+// ── dep_index_free ────────────────────────────────────────────────────────────
+
+pub fn dep_index_free(idx: int64) {
+    var entries: int64 := peek64(idx + 16);
+    free(entries, DEP_INDEX_CAP * DEP_INDEX_ENTRY_SZ);
+    free(idx, DEP_INDEX_HDR_SZ);
+}
+
+// ── dep_index_count ───────────────────────────────────────────────────────────
+
+pub fn dep_index_count(idx: int64): int64 {
+    return peek64(idx + 0);
+}
+
+// ── dep_index_register ────────────────────────────────────────────────────────
+//
+// Registriert sha256 → lpid. Überschreibt vorhandenen Eintrag.
+// Rückgabe: 0=ok, -1=Tabelle voll.
+
+pub fn dep_index_register(idx: int64, sha256: int64, lpid: int64): int64 {
+    var count: int64 := peek64(idx + 0);
+    var cap: int64 := peek64(idx + 8);
+    var entries: int64 := peek64(idx + 16);
+    var slot: int64 := peek64(sha256) & (cap - 1);
+    var i: int64 := 0;
+    while i < cap {
+        var entry: int64 := entries + slot * DEP_INDEX_ENTRY_SZ;
+        var existing: int64 := peek64(entry + DEP_SHA256_SIZE);
+        if existing == 0 {
+            sha256_copy(entry, sha256);
+            poke64(entry + DEP_SHA256_SIZE, lpid);
+            poke64(idx + 0, count + 1);
+            return 0;
+        }
+        if sha256_eq(entry, sha256) {
+            poke64(entry + DEP_SHA256_SIZE, lpid);
+            return 0;
+        }
+        slot := (slot + 1) & (cap - 1);
+        i := i + 1;
+    }
+    return 0 - 1;
+}
+
+// ── dep_index_lookup ──────────────────────────────────────────────────────────
+//
+// Sucht LPID für sha256. Rückgabe: lpid oder 0 wenn nicht gefunden.
+
+pub fn dep_index_lookup(idx: int64, sha256: int64): int64 {
+    var cap: int64 := peek64(idx + 8);
+    var entries: int64 := peek64(idx + 16);
+    var slot: int64 := peek64(sha256) & (cap - 1);
+    var i: int64 := 0;
+    while i < cap {
+        var entry: int64 := entries + slot * DEP_INDEX_ENTRY_SZ;
+        var lpid: int64 := peek64(entry + DEP_SHA256_SIZE);
+        if lpid == 0 { return 0; }
+        if sha256_eq(entry, sha256) { return lpid; }
+        slot := (slot + 1) & (cap - 1);
+        i := i + 1;
+    }
+    return 0;
+}
+
+// ── dep_resolve_all ───────────────────────────────────────────────────────────
+//
+// Löst alle TLV 0x02 Abhängigkeiten von prog_lpid auf.
+// Für jede gefundene Abhängigkeit wird eine 0xD001-Kante in die Genesis-Page
+// eingewebt. Nicht gefundene Abhängigkeiten werden auf stderr gemeldet.
+//
+// Rückgabe: Anzahl nicht aufgelöster Abhängigkeiten (0 = alles aufgelöst).
+//           -1 wenn prog_lpid nicht im Store gefunden.
+
+pub fn dep_resolve_all(store: int64, idx: int64, prog_lpid: int64): int64 {
+    var pg: int64 := iofs_store_lookup(store, prog_lpid);
+    if pg == 0 { return 0 - 1; }
+
+    // Genesis-Payload: IOFS_PAGE_HDR_SIZE + LBF_HEADER_SIZE in die Page
+    var payload: int64 := pg + IOFS_PAGE_HDR_SIZE + LBF_HEADER_SIZE;
+    var tlv_used: int64 := peek16(payload + GEN_P_TLV_USED) & 0xFFFF;
+    var tlv_pool: int64 := payload + GEN_P_TLV_POOL;
+
+    // TLV 0x02 suchen
+    var out_val: int64 := alloc(8);
+    var out_len: int64 := alloc(8);
+    var rc: int64 := tlv_find(tlv_pool, tlv_used, LBF_TLV_DEP_HASH_GRAPH, out_val, out_len);
+
+    if rc != 0 {
+        free(out_val, 8);
+        free(out_len, 8);
+        return 0;  // kein TLV 0x02 → keine Abhängigkeiten
+    }
+
+    var val_ptr: int64 := peek64(out_val);
+    var val_len: int64 := peek64(out_len);
+    free(out_val, 8);
+    free(out_len, 8);
+
+    var n_deps: int64 := val_len / DEP_SHA256_SIZE;
+
+    // Hashes vor Page-Modifikation kopieren (Page-Ptr wird nach add_edge ungültig)
+    var hashes: int64 := alloc(n_deps * DEP_SHA256_SIZE);
+    var ci: int64 := 0;
+    while ci < n_deps * DEP_SHA256_SIZE {
+        poke8(hashes + ci, peek8(val_ptr + ci));
+        ci := ci + 1;
+    }
+
+    var unresolved: int64 := 0;
+    var di: int64 := 0;
+    while di < n_deps {
+        var sha256: int64 := hashes + di * DEP_SHA256_SIZE;
+        var dep_lpid: int64 := dep_index_lookup(idx, sha256);
+        if dep_lpid != 0 {
+            // 0xD001-Kante in Genesis-Page einweben
+            var old_pg: int64 := iofs_store_lookup(store, prog_lpid);
+            var old_ec: int64 := iofs_store_edge_count(store, prog_lpid);
+            var new_pg: int64 := iofs_page_add_edge(old_pg, old_ec, dep_lpid, IOFS_EDGE_DEP);
+            iofs_page_free(old_pg, old_ec);
+            iofs_store_update_page(store, prog_lpid, new_pg, old_ec + 1);
+        } else {
+            EPrintStrLn("dep_resolver: unresolved dependency");
+            unresolved := unresolved + 1;
+        }
+        di := di + 1;
+    }
+
+    free(hashes, n_deps * DEP_SHA256_SIZE);
+    return unresolved;
+}
