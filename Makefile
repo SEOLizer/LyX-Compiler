@@ -103,6 +103,9 @@ test: lyxc
 	./lyxc tests/lx33_dep_resolver_test.lyx -o /tmp/lyxc_lx33_test
 	@/tmp/lyxc_lx33_test
 	@rm -f /tmp/lyxc_lx33_test
+	./lyxc tests/lx35_lbf_dump_test.lyx -o /tmp/lyxc_lx35_test
+	@/tmp/lyxc_lx35_test
+	@rm -f /tmp/lyxc_lx35_test
 	@echo "OK"
 
 test-lyxos: lyxc
