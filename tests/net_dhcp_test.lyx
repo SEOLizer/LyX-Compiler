@@ -1,0 +1,282 @@
+// tests/net_dhcp_test.lyx — DHCP Client Unit Tests (45 tests)
+unit tests.net_dhcp_test;
+
+import std.net.dhcp;
+import std.net.socket;
+import std.alloc;
+import src.std.io;
+
+fn pass(n: int64) { Print("PASS "); PrintLn(n); }
+fn fail(n: int64) { Print("FAIL "); PrintLn(n); }
+fn check(n: int64, ok: int64) { if (ok == 1) { pass(n); } else { fail(n); } }
+
+// Build a synthetic DHCP server reply (OFFER or ACK) into buf (300 bytes zeroed).
+// msgType: 2=OFFER, 5=ACK, 6=NAK
+// yiaddr: offered IP (packed like IPPack)
+// serverIP: DHCP server IP
+fn buildReply(buf: int64, msgType: int64, yiaddr: int64, serverIP: int64) {
+    var i: int64 := 0;
+    while (i < 300) { poke8(buf + i, 0); i := i + 1; }
+    poke8(buf + DHCP_OFFS_OP,    DHCP_OP_REPLY);
+    poke8(buf + DHCP_OFFS_HTYPE, DHCP_HTYPE_ETHER);
+    poke8(buf + DHCP_OFFS_HLEN,  6);
+    // xid = 0x12345678
+    poke8(buf + DHCP_OFFS_XID,     18);  // 0x12
+    poke8(buf + DHCP_OFFS_XID + 1, 52);  // 0x34
+    poke8(buf + DHCP_OFFS_XID + 2, 86);  // 0x56
+    poke8(buf + DHCP_OFFS_XID + 3, 120); // 0x78
+    // yiaddr
+    poke8(buf + DHCP_OFFS_YIADDR,     (yiaddr >> 24) & 255);
+    poke8(buf + DHCP_OFFS_YIADDR + 1, (yiaddr >> 16) & 255);
+    poke8(buf + DHCP_OFFS_YIADDR + 2, (yiaddr >> 8)  & 255);
+    poke8(buf + DHCP_OFFS_YIADDR + 3, yiaddr & 255);
+    // magic cookie
+    poke8(buf + DHCP_OFFS_COOKIE,     DHCP_MAGIC_B0);
+    poke8(buf + DHCP_OFFS_COOKIE + 1, DHCP_MAGIC_B1);
+    poke8(buf + DHCP_OFFS_COOKIE + 2, DHCP_MAGIC_B2);
+    poke8(buf + DHCP_OFFS_COOKIE + 3, DHCP_MAGIC_B3);
+    // options
+    var o: int64 := DHCP_OFFS_OPTIONS;
+    // option 53: message type
+    poke8(buf + o, 53); o := o + 1;
+    poke8(buf + o, 1);  o := o + 1;
+    poke8(buf + o, msgType); o := o + 1;
+    // option 54: server identifier
+    poke8(buf + o, 54); o := o + 1;
+    poke8(buf + o, 4);  o := o + 1;
+    poke8(buf + o, (serverIP >> 24) & 255); o := o + 1;
+    poke8(buf + o, (serverIP >> 16) & 255); o := o + 1;
+    poke8(buf + o, (serverIP >> 8)  & 255); o := o + 1;
+    poke8(buf + o, serverIP & 255);          o := o + 1;
+    // option 51: lease time = 43200 (0x0000A8C0)
+    poke8(buf + o, 51); o := o + 1;
+    poke8(buf + o, 4);  o := o + 1;
+    poke8(buf + o, 0);   o := o + 1;
+    poke8(buf + o, 0);   o := o + 1;
+    poke8(buf + o, 168); o := o + 1;  // 0xA8
+    poke8(buf + o, 192); o := o + 1;  // 0xC0
+    // option 1: subnet mask = 255.255.255.0
+    poke8(buf + o, 1);   o := o + 1;
+    poke8(buf + o, 4);   o := o + 1;
+    poke8(buf + o, 255); o := o + 1;
+    poke8(buf + o, 255); o := o + 1;
+    poke8(buf + o, 255); o := o + 1;
+    poke8(buf + o, 0);   o := o + 1;
+    // option 3: router = 192.168.1.1
+    poke8(buf + o, 3);   o := o + 1;
+    poke8(buf + o, 4);   o := o + 1;
+    poke8(buf + o, 192); o := o + 1;
+    poke8(buf + o, 168); o := o + 1;
+    poke8(buf + o, 1);   o := o + 1;
+    poke8(buf + o, 1);   o := o + 1;
+    // option 6: DNS = 8.8.8.8
+    poke8(buf + o, 6);   o := o + 1;
+    poke8(buf + o, 4);   o := o + 1;
+    poke8(buf + o, 8);   o := o + 1;
+    poke8(buf + o, 8);   o := o + 1;
+    poke8(buf + o, 8);   o := o + 1;
+    poke8(buf + o, 8);   o := o + 1;
+    // end
+    poke8(buf + o, 255);
+}
+
+fn main() {
+    var pkt:    int64 := alloc(DHCP_MIN_LEN);
+    var result: int64 := alloc(DHCP_RESULT_SIZE);
+    var mac:    int64 := alloc(6);
+
+    // Set up a test MAC: AA:BB:CC:DD:EE:FF
+    poke8(mac,     170); // 0xAA
+    poke8(mac + 1, 187); // 0xBB
+    poke8(mac + 2, 204); // 0xCC
+    poke8(mac + 3, 221); // 0xDD
+    poke8(mac + 4, 238); // 0xEE
+    poke8(mac + 5, 255); // 0xFF
+
+    // ── Tests 1-8: Constants ──────────────────────────────────────────────────
+    check(1,  DHCP_PORT_SERVER  == 67);
+    check(2,  DHCP_PORT_CLIENT  == 68);
+    check(3,  DHCP_MIN_LEN      == 300);
+    check(4,  DHCP_RESULT_SIZE  == 72);
+    check(5,  DHCP_OFFS_YIADDR  == 16);
+    check(6,  DHCP_OFFS_OPTIONS == 240);
+    check(7,  DHCP_MSG_DISCOVER == 1);
+    check(8,  DHCP_MSG_ACK      == 5);
+
+    // ── Tests 9-24: DhcpBuildDiscover ────────────────────────────────────────
+    var n: int64 := DhcpBuildDiscover(pkt, mac, 305419896); // xid = 0x12345678
+
+    // Test 9: op = 1 (BOOTREQUEST)
+    check(9, peek8(pkt + DHCP_OFFS_OP) == 1);
+
+    // Test 10: htype = 1 (Ethernet)
+    check(10, peek8(pkt + DHCP_OFFS_HTYPE) == 1);
+
+    // Test 11: hlen = 6
+    check(11, peek8(pkt + DHCP_OFFS_HLEN) == 6);
+
+    // Test 12: hops = 0
+    check(12, peek8(pkt + DHCP_OFFS_HOPS) == 0);
+
+    // Test 13: XID byte 0 = 0x12 (18)
+    check(13, peek8(pkt + DHCP_OFFS_XID) == 18);
+
+    // Test 14: XID byte 1 = 0x34 (52)
+    check(14, peek8(pkt + DHCP_OFFS_XID + 1) == 52);
+
+    // Test 15: XID byte 3 = 0x78 (120)
+    check(15, peek8(pkt + DHCP_OFFS_XID + 3) == 120);
+
+    // Test 16: flags byte 10 = 0x80 (broadcast bit set)
+    check(16, peek8(pkt + DHCP_OFFS_FLAGS) == DHCP_FLAG_BROADCAST);
+
+    // Test 17: chaddr[0] = MAC[0] = 0xAA (170)
+    check(17, peek8(pkt + DHCP_OFFS_CHADDR) == 170);
+
+    // Test 18: chaddr[5] = MAC[5] = 0xFF (255)
+    check(18, peek8(pkt + DHCP_OFFS_CHADDR + 5) == 255);
+
+    // Test 19: magic cookie byte 0 = 99 (0x63)
+    check(19, peek8(pkt + DHCP_OFFS_COOKIE) == DHCP_MAGIC_B0);
+
+    // Test 20: magic cookie byte 1 = 130 (0x82)
+    check(20, peek8(pkt + DHCP_OFFS_COOKIE + 1) == DHCP_MAGIC_B1);
+
+    // Test 21: magic cookie byte 2 = 83 (0x53)
+    check(21, peek8(pkt + DHCP_OFFS_COOKIE + 2) == DHCP_MAGIC_B2);
+
+    // Test 22: magic cookie byte 3 = 99 (0x63)
+    check(22, peek8(pkt + DHCP_OFFS_COOKIE + 3) == DHCP_MAGIC_B3);
+
+    // Test 23: option 53 type code at DHCP_OFFS_OPTIONS = 53
+    check(23, peek8(pkt + DHCP_OFFS_OPTIONS) == 53);
+
+    // Test 24: option 53 value = 1 (DISCOVER)
+    check(24, peek8(pkt + DHCP_OFFS_OPTIONS + 2) == DHCP_MSG_DISCOVER);
+
+    // ── Tests 25-32: DhcpBuildRequest ────────────────────────────────────────
+    // offeredIP = 192.168.1.100 = IPPack(192,168,1,100)
+    // serverIP  = 192.168.1.1  = IPPack(192,168,1,1)
+    var offIP: int64 := IPPack(192, 168, 1, 100);
+    var srvIP: int64 := IPPack(192, 168, 1, 1);
+    DhcpBuildRequest(pkt, mac, 305419896, offIP, srvIP);
+
+    // Test 25: op = 1
+    check(25, peek8(pkt + DHCP_OFFS_OP) == 1);
+
+    // Test 26: XID byte 0 = 0x12 (preserved)
+    check(26, peek8(pkt + DHCP_OFFS_XID) == 18);
+
+    // Test 27: broadcast flag
+    check(27, peek8(pkt + DHCP_OFFS_FLAGS) == DHCP_FLAG_BROADCAST);
+
+    // Test 28: option 53 value = 3 (REQUEST)
+    check(28, peek8(pkt + DHCP_OFFS_OPTIONS + 2) == DHCP_MSG_REQUEST);
+
+    // Test 29: option 50 type code = 50 (Requested IP)
+    check(29, peek8(pkt + DHCP_OFFS_OPTIONS + 3) == DHCP_OPT_REQIP);
+
+    // Test 30: option 50 first data byte = 192
+    // offeredIP = 192.168.1.100: big-endian byte 0 = 192
+    check(30, peek8(pkt + DHCP_OFFS_OPTIONS + 5) == 192);
+
+    // Test 31: option 54 type code = 54 (Server Identifier)
+    check(31, peek8(pkt + DHCP_OFFS_OPTIONS + 9) == DHCP_OPT_SERVERID);
+
+    // Test 32: option 54 first data byte = 192 (server = 192.168.1.1)
+    check(32, peek8(pkt + DHCP_OFFS_OPTIONS + 11) == 192);
+
+    // ── Tests 33-45: DhcpParseReply ──────────────────────────────────────────
+    var replyBuf: int64 := alloc(300);
+
+    // Test 33: invalid magic cookie → result.OK = 0
+    {
+        var i: int64 := 0;
+        while (i < 300) { poke8(replyBuf + i, 0); i := i + 1; }
+        poke8(replyBuf + DHCP_OFFS_OP, DHCP_OP_REPLY);
+        poke8(replyBuf + DHCP_OFFS_COOKIE, 0);  // break cookie
+        var i2: int64 := 0;
+        while (i2 < DHCP_RESULT_SIZE) { poke8(result + i2, 0); i2 := i2 + 1; }
+        DhcpParseReply(replyBuf, 270, result);
+        check(33, peek64(result + DHCP_RESULT_OK) == 0);
+    }
+
+    // Test 34: op = 1 (not a reply) → result.OK = 0
+    {
+        var i: int64 := 0;
+        while (i < 300) { poke8(replyBuf + i, 0); i := i + 1; }
+        poke8(replyBuf + DHCP_OFFS_OP, DHCP_OP_REQUEST);
+        poke8(replyBuf + DHCP_OFFS_COOKIE,     DHCP_MAGIC_B0);
+        poke8(replyBuf + DHCP_OFFS_COOKIE + 1, DHCP_MAGIC_B1);
+        poke8(replyBuf + DHCP_OFFS_COOKIE + 2, DHCP_MAGIC_B2);
+        poke8(replyBuf + DHCP_OFFS_COOKIE + 3, DHCP_MAGIC_B3);
+        var i2: int64 := 0;
+        while (i2 < DHCP_RESULT_SIZE) { poke8(result + i2, 0); i2 := i2 + 1; }
+        DhcpParseReply(replyBuf, 270, result);
+        check(34, peek64(result + DHCP_RESULT_OK) == 0);
+    }
+
+    // Tests 35-42: synthetic OFFER (msgType=2, yiaddr=192.168.1.100, srv=192.168.1.1)
+    {
+        var yiaddr: int64 := IPPack(192, 168, 1, 100);
+        var srvaddr: int64 := IPPack(192, 168, 1, 1);
+        buildReply(replyBuf, DHCP_MSG_OFFER, yiaddr, srvaddr);
+        var i: int64 := 0;
+        while (i < DHCP_RESULT_SIZE) { poke8(result + i, 0); i := i + 1; }
+        DhcpParseReply(replyBuf, 274, result);
+
+        // Test 35: OFFER → result.OK = 1
+        check(35, peek64(result + DHCP_RESULT_OK) == 1);
+
+        // Test 36: OFFER → result.TYPE = 2
+        check(36, peek64(result + DHCP_RESULT_TYPE) == DHCP_MSG_OFFER);
+
+        // Test 37: OFFER → result.IP = 192.168.1.100
+        check(37, peek64(result + DHCP_RESULT_IP) == IPPack(192, 168, 1, 100));
+
+        // Test 38: OFFER → result.SERVER = 192.168.1.1
+        check(38, peek64(result + DHCP_RESULT_SERVER) == IPPack(192, 168, 1, 1));
+
+        // Test 39: OFFER → result.LEASE = 43200 (0xA8C0)
+        check(39, peek64(result + DHCP_RESULT_LEASE) == 43200);
+
+        // Test 40: OFFER → result.MASK = 255.255.255.0
+        check(40, peek64(result + DHCP_RESULT_MASK) == IPPack(255, 255, 255, 0));
+
+        // Test 41: OFFER → result.GW = 192.168.1.1
+        check(41, peek64(result + DHCP_RESULT_GW) == IPPack(192, 168, 1, 1));
+
+        // Test 42: OFFER → result.DNS = 8.8.8.8
+        check(42, peek64(result + DHCP_RESULT_DNS) == IPPack(8, 8, 8, 8));
+    }
+
+    // Test 43: ACK → result.OK = 1, result.TYPE = 5
+    {
+        var yiaddr: int64 := IPPack(10, 0, 0, 50);
+        var srvaddr: int64 := IPPack(10, 0, 0, 1);
+        buildReply(replyBuf, DHCP_MSG_ACK, yiaddr, srvaddr);
+        var i: int64 := 0;
+        while (i < DHCP_RESULT_SIZE) { poke8(result + i, 0); i := i + 1; }
+        DhcpParseReply(replyBuf, 274, result);
+        check(43, peek64(result + DHCP_RESULT_OK) == 1);
+    }
+
+    // Test 44: NAK → result.OK = 0
+    {
+        var yiaddr: int64 := 0;
+        var srvaddr: int64 := IPPack(192, 168, 1, 1);
+        buildReply(replyBuf, DHCP_MSG_NAK, yiaddr, srvaddr);
+        var i: int64 := 0;
+        while (i < DHCP_RESULT_SIZE) { poke8(result + i, 0); i := i + 1; }
+        DhcpParseReply(replyBuf, 274, result);
+        check(44, peek64(result + DHCP_RESULT_OK) == 0);
+    }
+
+    // Test 45: short packet (< DHCP_OFFS_OPTIONS) → result.OK = 0
+    {
+        var i: int64 := 0;
+        while (i < DHCP_RESULT_SIZE) { poke8(result + i, 0); i := i + 1; }
+        DhcpParseReply(replyBuf, 100, result);
+        check(45, peek64(result + DHCP_RESULT_OK) == 0);
+    }
+}
