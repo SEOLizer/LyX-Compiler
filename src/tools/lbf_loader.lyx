@@ -1,0 +1,153 @@
+// src/tools/lbf_loader.lyx — LX-31 POSIX-Loader für LBF-Nativ (LYX!)
+//
+// Usage: lbf_loader <file.lbf>
+//
+// Ladesequenz:
+//   1. LBF öffnen, Größe prüfen (Vielfaches von 4096)
+//   2. Genesis-Block 0 validieren (Magic + Block-CRC32C)
+//   3. Gesamt-File-CRC32C prüfen
+//   4. Compiler-UUID gegen /etc/lyx/compiler_blacklist.bin prüfen
+//   5. Text-Block-Payloads extrahieren (Block 1..text_blocks)
+//   6. Minimales ELF64 bauen (code → VA 0x400000)
+//   7. ELF nach /tmp/.lbf_exec schreiben + chmod 0755
+//   8. sys_execve("/tmp/.lbf_exec") — ersetzt diesen Prozess
+
+import src.std.alloc;
+import src.std.io;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import src.tools.lbf.genesis;
+import src.tools.lbf.security;
+import src.tools.lbf.elf_builder;
+
+// ── ldr_die ───────────────────────────────────────────────────────────────────
+
+fn ldr_die(msg: pchar) {
+    EPrintStrLn(msg);
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
+fn main(): int64 {
+    var argc: int64 := GetArgC();
+    if argc < 2 {
+        EPrintStrLn("usage: lbf_loader <file.lbf>");
+        return 1;
+    }
+    var lbfPath: pchar := GetArg(1) as pchar;
+
+    // ── 1. Datei öffnen ───────────────────────────────────────────────────────
+    var fd: int64 := open(lbfPath, 0, 0);
+    if fd < 0 {
+        EPrintStrLn("lbf_loader: cannot open file");
+        return 1;
+    }
+
+    var fsize: int64 := lseek(fd, 0, 2);
+    if (fsize % LBF_BLOCK_SIZE) != 0 {
+        EPrintStrLn("lbf_loader: file size not multiple of 4096");
+        close(fd);
+        return 1;
+    }
+    if fsize < LBF_BLOCK_SIZE {
+        EPrintStrLn("lbf_loader: file too small");
+        close(fd);
+        return 1;
+    }
+    lseek(fd, 0, 0);
+
+    // ── 2. Gesamte Datei einlesen ─────────────────────────────────────────────
+    var fbuf: int64 := alloc(fsize);
+    var got: int64 := read(fd, fbuf, fsize);
+    close(fd);
+    if got != fsize {
+        EPrintStrLn("lbf_loader: read error");
+        free(fbuf, fsize);
+        return 1;
+    }
+
+    // ── 3. Genesis-Block validieren (Magic + Block-CRC32C) ───────────────────
+    if lbf_header_validate(fbuf) != 0 {
+        EPrintStrLn("lbf_loader: genesis block invalid (magic or CRC32C)");
+        free(fbuf, fsize);
+        return 1;
+    }
+
+    // ── 4. File-CRC32C prüfen ────────────────────────────────────────────────
+    if lbf_verify_file_crc(fbuf, fsize) != 0 {
+        EPrintStrLn("lbf_loader: file CRC32C mismatch — tampered binary refused");
+        free(fbuf, fsize);
+        return 1;
+    }
+
+    // ── 5. UUID-Blacklist prüfen ──────────────────────────────────────────────
+    var uuidPtr: int64 := fbuf + LBF_HEADER_SIZE + GEN_P_COMPILER_UUID;
+    if lbf_check_compiler_blacklist(uuidPtr) == 0 {
+        EPrintStrLn("lbf_loader: compiler UUID blacklisted — execution refused");
+        free(fbuf, fsize);
+        return 1;
+    }
+
+    // ── 6. Text-Blöcke extrahieren ────────────────────────────────────────────
+    var pay: int64 := fbuf + LBF_HEADER_SIZE;
+    var textBlk: int64 := peek16(pay + GEN_P_TEXT_BLOCKS);
+    if textBlk == 0 {
+        EPrintStrLn("lbf_loader: no text blocks (nothing to execute)");
+        free(fbuf, fsize);
+        return 1;
+    }
+
+    var codeLen: int64 := textBlk * LBF_PAYLOAD_SIZE;
+    var codeBuf: int64 := alloc(codeLen);
+
+    var bi: int64 := 0;
+    while bi < textBlk {
+        var src: int64 := fbuf + ((1 + bi) * LBF_BLOCK_SIZE) + LBF_HEADER_SIZE;
+        var dst: int64 := codeBuf + (bi * LBF_PAYLOAD_SIZE);
+        var pi: int64 := 0;
+        while pi < LBF_PAYLOAD_SIZE { poke8(dst + pi, peek8(src + pi)); pi := pi + 1; }
+        bi := bi + 1;
+    }
+
+    free(fbuf, fsize);
+
+    // ── 7. Minimales ELF64 bauen ──────────────────────────────────────────────
+    var elfSz: int64 := 0x1000 + codeLen;
+    var elfBuf: int64 := alloc(elfSz);
+    lbf_build_exec_elf(codeBuf, codeLen, elfBuf);
+    free(codeBuf, codeLen);
+
+    // ── 8. ELF nach /tmp/.lbf_exec schreiben ─────────────────────────────────
+    var tmpPath: pchar := "/tmp/.lbf_exec"c;
+    var wfd: int64 := open(tmpPath, 577, 493);
+    if wfd < 0 {
+        EPrintStrLn("lbf_loader: cannot write exec ELF");
+        free(elfBuf, elfSz);
+        return 1;
+    }
+    var written: int64 := sys_write(wfd, elfBuf, elfSz);
+    close(wfd);
+    free(elfBuf, elfSz);
+
+    if written != elfSz {
+        EPrintStrLn("lbf_loader: ELF write incomplete");
+        return 1;
+    }
+
+    chmod(tmpPath, 493);
+
+    // ── 9. sys_execve ─────────────────────────────────────────────────────────
+    // argv = ["/tmp/.lbf_exec", null]
+    // envp = [null]
+    var argv: int64 := alloc(16);
+    poke64(argv + 0, tmpPath as int64);
+    poke64(argv + 8, 0);
+    var envp: int64 := alloc(8);
+    poke64(envp, 0);
+
+    sys_execve(tmpPath, argv, envp);
+
+    // execve gibt nur zurück wenn es fehlschlägt
+    EPrintStrLn("lbf_loader: execve failed");
+    return 1;
+}
