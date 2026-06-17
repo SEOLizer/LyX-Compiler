@@ -54,7 +54,8 @@ Lyx combines native control with modern safety features:
 | ELF64 Backend (ARM64)  | Stable            |
 | PE32+ Backend (x86-64) | Beta              |
 | Android APK Builder    | Stable            |
-| LyxOS Backend          | In Development    |
+| LyxOS Backend (IR/Simulation, Phase 0–7) | Stable         |
+| LyxOS Backend (LBF-Nativ Production, Phase 8) | In Development |
 | Stack Canaries (WP-18) | Stable            |
 | LCBS / seccomp / Landlock | Stable         |
 | Precompiled Units (.lyu) | Stable          |
@@ -461,11 +462,68 @@ make e2e       # integration tests
 
 ---
 
+## LyxOS Backend
+
+LyxOS is a purpose-built OS target for Lyx programs. It defines its own binary format (**LBF — Lyx Binary Format**) and a 137-syscall ABI, providing deterministic execution, built-in capability enforcement, and an integrated AI inference layer at the kernel level.
+
+Two binary formats are used:
+
+| Format | Magic | Purpose |
+|--------|-------|---------|
+| **LBF-IR** | `LBF\0` | IR opcode bytecode — runs on POSIX Linux via `lbf_run` interpreter (for testing) |
+| **LBF-Nativ** | `LYX!` | Native x86-64/ARM64 machine code, 4 KB page-aligned — production format for the LyxOS kernel |
+
+### Implementation Status
+
+**Phase 0–7 — IR / Simulation layer (25 Work Packages): complete**
+
+| Area | Work Packages | Status |
+|------|---------------|--------|
+| LBF-IR serialiser + interpreter (`lbf_run`) | LX-00, LX-24 | ✅ Done |
+| Target registration, entry point, I/O, memory | LX-01 – LX-05 | ✅ Done |
+| VFS, I/O devices, poll | LX-06, LX-07 | ✅ Done |
+| Network syscalls (0x0600–0x0609) | LX-08 | ✅ Done |
+| Processes, threads, IPC, synchronisation | LX-09, LX-10 | ✅ Done |
+| Time syscalls | LX-11 | ✅ Done |
+| Capabilities, pledge, unveil | LX-12 | ✅ Done |
+| Task scheduler, `@parallel` | LX-13 | ✅ Done |
+| AI inference layer (model, context, embedding, vector index, knowledge graph) | LX-14 – LX-16 | ✅ Done |
+| Lyra agent interface | LX-17 | ✅ Done |
+| IOFS: Island & Ocean filesystem | LX-18 | ✅ Done |
+| Runtime library, stdlib adaptation, error return convention | LX-19 – LX-21 | ✅ Done |
+| Debug & telemetry, integration tests | LX-22, LX-23 | ✅ Done |
+
+**Phase 8 — LBF-Nativ production format (12 Work Packages): in progress**
+
+| Work Package | Description | Status |
+|--------------|-------------|--------|
+| LX-25 | Block Header I/O | ✅ Done |
+| LX-26 | Genesis-Content Serializer | ✅ Done |
+| LX-27 | TLV Framework | ✅ Done |
+| LX-28 | Section Block Emitter | ✅ Done |
+| LX-29 | Supply Chain Security | Offen |
+| LX-30 | lyxc backend `--target=lyxos` → `LYX!` | Offen |
+| LX-31 | `lbf_loader` POSIX loader | Offen |
+| LX-32 | `lbf_import` IOFS import | Offen |
+| LX-33 | Dependency resolver | Offen |
+| LX-34 | Zero-Load Executor (Kernel) | Offen |
+| LX-35 | `lbf-dump` inspection tool | Offen |
+| LX-36 | Lifecycle descriptor | Offen |
+
+Compile and run a LyxOS program today (via the IR interpreter):
+
+```bash
+lyxc --target=lyxos --emit=lbf prog.lyx -o prog.lbf
+lbf_run prog.lbf
+```
+
+---
+
 ## Roadmap
 
 ### In Progress
 
-- LyxOS bare-metal backend
+- LyxOS Phase 8 — LBF-Nativ production format (LX-29 – LX-36)
 - Language Server Protocol (LSP)
 - Incremental compilation
 
