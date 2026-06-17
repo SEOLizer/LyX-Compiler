@@ -106,6 +106,10 @@ test: lyxc
 	./lyxc tests/lx35_lbf_dump_test.lyx -o /tmp/lyxc_lx35_test
 	@/tmp/lyxc_lx35_test
 	@rm -f /tmp/lyxc_lx35_test
+	@echo "--- LX-36: Lifecycle Descriptor ---"
+	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
+	@/tmp/lyxc_lx36_test
+	@rm -f /tmp/lyxc_lx36_test
 	@echo "OK"
 
 test-lyxos: lyxc

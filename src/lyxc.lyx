@@ -470,6 +470,9 @@ pub type CompilerConfig = class {
   // LX-00: --emit=lbf: serialize IR to .lbf bytecode (only with --target=lyxos)
   emitLBF: bool;
 
+  // LX-36: lifecycle kind from @lifecycle annotation (0=ONE_SHOT default)
+  lifecycleKind: int64;
+
   // WP-T14: Migration Tool + Compat-Modus
   migrateCaps: bool;
   capCompat:   bool;
@@ -1365,6 +1368,10 @@ pub type CompilerConfig = class {
       self.exitCode := 1;
       return self.exitCode;
     }
+
+    // LX-36: capture lifecycle kind from @lifecycle annotation (-1 = not set → ONE_SHOT)
+    self.lifecycleKind := parser._pendingLifecycleKind;
+    if self.lifecycleKind < 0 { self.lifecycleKind := 0; }
 
     // Dump AST if requested and return early
     if self.dumpParser || self.astDump {
@@ -2316,9 +2323,16 @@ pub type CompilerConfig = class {
     var emitter: EmitLyxOS := new EmitLyxOS();
     emitter.init(irMod);
 
-    // _start is emitted first at offset 0 with a placeholder CALL rel32=0.
-    // Layout: XOR rbp,rbp(3) + CALL(5) + ... — callNextIP = 8.
-    emitter.emitStartStub();
+    // LX-36: choose _start variant by lifecycle kind.
+    // ONE_SHOT/DAEMON (0,2): standard 46-byte stub; CALL rel32 at +28, callNextIP=32.
+    // EVENT_LOOP (1): 68-byte stub; CALL rel32 at +49, callNextIP=54.
+    // REACTIVE (3): no _start needed (kernel jumps to handler directly).
+    if self.lifecycleKind == 1 {
+        emitter.emitStartStubEventLoop();
+    }
+    if self.lifecycleKind != 1 {
+        emitter.emitStartStub();
+    }
 
     // Emit all IR functions. mainOff = absolute buffer offset of main().
     var mainOff: int64 := emitter.emitFunctions();
@@ -2327,10 +2341,15 @@ pub type CompilerConfig = class {
     emitter.emitStrPool();
 
     // Patch CALL rel32 in _start now that mainOff is known.
-    // rel32 at buf+28, callNextIP = 32  (LX-03 _start = 46 bytes)
-    emitter.patchCallRel32(28, mainOff - 32);
+    if self.lifecycleKind == 1 {
+        emitter.patchCallRel32(50, mainOff - 54);  // EVENT_LOOP: rel32 at +50, callNextIP=54
+    }
+    if self.lifecycleKind != 1 {
+        emitter.patchCallRel32(28, mainOff - 32);  // ONE_SHOT/DAEMON/REACTIVE: rel32 at +28
+    }
 
     var lbf: LBFNativeWriter := new LBFNativeWriter();
+    lbf.setLifecycle(self.lifecycleKind, 0, 0);  // LX-36: no events at compile time (handler VAs unknown)
     if !lbf.writeLBF(outPath, self.inputFile as pchar, emitter.getCodeBuf(), emitter.getCodeLen()) {
       EPrintStrLn("error: lyxos: failed to write LBF");
       self.exitCode := 1;
