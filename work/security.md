@@ -337,19 +337,23 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/lyxc.lyx` Z. 207–314 |
+| **Dateien** | `src/lyxc.lyx` Z. 208, 315 |
 | **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ offen |
+| **Status** | ✅ erledigt (fix/sec-wp32-toctou-metasafe → develop) |
 | **Quelle** | Security-Audit 2026-06-18 (H-5) |
 
 **Problem:** `ms_appendMetaSafe` öffnet die Output-Binary mit `O_RDONLY`, liest sie, schließt den FD, berechnet Hashes, öffnet sie dann neu mit `O_WRONLY|O_CREAT|O_TRUNC` und überschreibt sie. In diesem Zeitfenster kann ein anderer Prozess die Datei durch eine präparierte Version ersetzen (Symlink-Attack, Race Condition). Der Compiler würde dann die manipulierte Binary mit einem gültigen Sicherheits-Header stempeln.
 
-**Fix:** Datei mit `O_RDWR` in einem einzigen `open()`-Aufruf öffnen, in-place modifizieren. Alternativ: Schreiben in Temp-File + atomares `rename()`.
+**Fix (implementiert):**
+- `open(path, 0, 0)` (O_RDONLY) → `open(path, 2, 0)` (O_RDWR)
+- `close(fd)` nach dem Lesen entfernt — fd bleibt offen
+- Zweites `open(path, 577, 493)` (O_WRONLY|O_CREAT|O_TRUNC) ersetzt durch `lseek(fd, 0, 0)` + `write(fd, ...)` auf demselben fd
+- Einzelnes `close(fd)` am Ende — kein TOCTOU-Fenster mehr möglich
 
 **Teilschritte:**
-- [ ] **32.1** `O_RDONLY` + schließen + `O_WRONLY` → durch `O_RDWR` in einem `open()` ersetzen
-- [ ] **32.2** In-place-Schreiblogik anpassen (kein erneutes `open`)
-- [ ] **32.3** Test: Race-Condition-Szenario prüfen
+- [x] **32.1** `O_RDONLY` → `O_RDWR` in einem `open()`
+- [x] **32.2** In-place-Schreiblogik: `lseek + write` statt zweitem `open`
+- [x] **32.3** Test `tests/sec_wp32_toctou_test.sh` — 20 Tests PASS
 
 ---
 

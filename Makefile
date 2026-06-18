@@ -136,6 +136,10 @@ test: lyxc
 	@bash tests/sec_wp31_filesize_test.sh
 	@echo "OK"
 
+	@echo "--- sec_wp32: TOCTOU ms_appendMetaSafe (20 tests) ---"
+	@bash tests/sec_wp32_toctou_test.sh
+	@echo "OK"
+
 test-lyxos: lyxc
 	@echo "=== LyxOS Integrations-Kompilierungstest ==="
 	@for f in \
