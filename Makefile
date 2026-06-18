@@ -115,6 +115,9 @@ test: lyxc
 	./lyxc tests/net_frame_test.lyx -o /tmp/lyxc_net_frame_test
 	@/tmp/lyxc_net_frame_test
 	@rm -f /tmp/lyxc_net_frame_test
+
+	@echo "--- sec_wp28: kernel-mode-guard allowlist (20 tests) ---"
+	@bash tests/sec_wp28_kernel_guard_test.sh
 	@echo "OK"
 
 test-lyxos: lyxc
