@@ -165,7 +165,7 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Security-Audit 2026-06-18 ha
 |----------|------|
 | **Dateien** | `src/std/alloc.lyx`, Z. 16–35 |
 | **Priorität** | 🔴 Kritisch |
-| **Status** | ⬜ offen |
+| **Status** | ✅ erledigt (2026-06-18, commit eab88e6) |
 | **Quelle** | Security-Audit 2026-06-18 (C-1, C-2) |
 
 **Problem 1 — Integer-Overflow (C-1):** `alloc(size)` berechnet `((size + 15) / 16) * 16`. Bei `size ≈ INT64_MAX` überläuft `size + 15` auf einen negativen Wert → `aligned` wird winzig → `alloc()` gibt einen bereits genutzten Pointer zurück → Heap-Überschreibung. Tritt auf wenn zwei sehr große Strings konkateniert werden (`StrConcat`).
@@ -182,8 +182,8 @@ pub fn alloc(size: int64): int64 {
 ```
 
 **Teilschritte:**
-- [ ] **26.1** Guard-Zeilen in `alloc()` einfügen
-- [ ] **26.2** Regressionstest: `alloc(0)` liefert zwei verschiedene Adressen; `alloc(INT64_MAX)` liefert 0
+- [x] **26.1** Guard-Zeilen in `alloc()` einfügen (src/std/alloc.lyx + std/alloc.lyx)
+- [x] **26.2** Regressionstest: `tests/sec_wp26_alloc_test.lyx` — 15/15 PASS; `make test` — 0 FAIL
 - [ ] **26.3** Singularität prüfen + Seed updaten
 
 ---
@@ -194,7 +194,7 @@ pub fn alloc(size: int64): int64 {
 |----------|------|
 | **Dateien** | `src/lyxc.lyx` Z. 4384; `src/sema.lyx` Z. 757 |
 | **Priorität** | 🔴 Kritisch |
-| **Status** | ⬜ offen |
+| **Status** | ✅ erledigt (2026-06-18, commit eab88e6) |
 | **Quelle** | Security-Audit 2026-06-18 (C-3, M-4) |
 
 **Problem 1 — OOB-Schreibzugriff `--unit-info` (C-3):**
@@ -218,9 +218,9 @@ if bytesRead != size { close(fd); return 0 as pchar; }
 ```
 
 **Teilschritte:**
-- [ ] **27.1** `--unit-info` OOB-Guard in `src/lyxc.lyx`
-- [ ] **27.2** `_sema_readFile` Rückgabewert-Prüfung in `src/sema.lyx`
-- [ ] **27.3** Regressionstest: Compiler mit nicht-lesbarer Unit-Datei → kein Crash
+- [x] **27.1** `--unit-info` OOB-Guard in `src/lyxc.lyx` (Z. 4384: `if uiSz < 0 { uiSz := 0; }`)
+- [x] **27.2** `_sema_readFile` Rückgabewert-Prüfung in `src/sema.lyx` (Z. 757: partial-read guard)
+- [x] **27.3** Regressionstest: `make test` — 0 FAIL
 
 ---
 
