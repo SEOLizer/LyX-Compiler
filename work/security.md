@@ -312,27 +312,24 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/std/io.lyx` Z. 477–498; `src/sema.lyx` Z. 754–758 |
+| **Dateien** | `src/codegen_x86.lyx` (builtin), `src/std/io.lyx`, `src/sema.lyx` |
 | **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ offen |
+| **Status** | ✅ erledigt (feat/hl7 → develop) |
 | **Quelle** | Security-Audit 2026-06-18 (H-4) |
 
 **Problem:** `FileReadAll` und `_sema_readFile` lesen Dateien ohne Größenlimit. Eine 4-GB-Eingabedatei (oder ein 4-GB-`.lyu`-File) erschöpft den Systemspeicher → OOM-Kill. Da `alloc()` unbegrenzt wächst, kann ein Angreifer mit einer präparierten Datei alle anderen Prozesse auf dem System killen.
 
-**Fix:**
-```
-// src/std/io.lyx und src/sema.lyx
-var size: int64 := lseek(fd, 0, 2);
-if size > 256 * 1024 * 1024 {   // max 256 MB
-    close(fd);
-    return 0 as pchar;
-}
-```
+**Fix (implementiert):**
+- `src/codegen_x86.lyx`: Limit direkt als x86-Maschinenbytes im `FileReadAll`-Builtin eingebaut (`cmp rax, 268435456` + `jle`/`jg` short jumps); zusätzlich size ≤ 0 Prüfung
+- `src/std/io.lyx`: Limit in der Quelle als Fallback (für nicht-builtin-Nutzung)
+- `src/sema.lyx` `_sema_readFile`: Limit für importierte `.lyx`/`.lyu`-Dateien beim Kompilieren
+- Fehlermeldung auf stderr bei Überschreitung; `256-MB-Limit` im Text für Grep-Tests
 
 **Teilschritte:**
-- [ ] **31.1** Limit in `FileReadAll` (`src/std/io.lyx`)
-- [ ] **31.2** Limit in `_sema_readFile` (`src/sema.lyx`)
-- [ ] **31.3** Fehlermeldung bei überschrittenem Limit ausgeben (nicht lautlos 0 zurückgeben)
+- [x] **31.1** Limit im `FileReadAll`-Builtin (`src/codegen_x86.lyx`) als x86-Bytes
+- [x] **31.2** Limit in `_sema_readFile` (`src/sema.lyx`)
+- [x] **31.3** Fehlermeldung bei überschrittenem Limit (enthält `256-MB-Limit`)
+- [x] **31.4** Test `tests/sec_wp31_filesize_test.sh` — 20 Tests PASS
 
 ---
 

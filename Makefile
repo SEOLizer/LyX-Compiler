@@ -132,6 +132,10 @@ test: lyxc
 	@rm -f /tmp/lyxc_sec_wp30_test
 	@echo "OK"
 
+	@echo "--- sec_wp31: Dateigrößen-Limit FileReadAll (20 tests) ---"
+	@bash tests/sec_wp31_filesize_test.sh
+	@echo "OK"
+
 test-lyxos: lyxc
 	@echo "=== LyxOS Integrations-Kompilierungstest ==="
 	@for f in \
