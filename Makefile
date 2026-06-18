@@ -144,6 +144,10 @@ test: lyxc
 	@bash tests/sec_wp33_string_bounds_test.sh
 	@echo "OK"
 
+	@echo "--- sec_wp34: Codegen-Buffer-Größenlimit (20 tests) ---"
+	@bash tests/sec_wp34_codegen_buffer_test.sh
+	@echo "OK"
+
 test-lyxos: lyxc
 	@echo "=== LyxOS Integrations-Kompilierungstest ==="
 	@for f in \
