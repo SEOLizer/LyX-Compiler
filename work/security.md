@@ -290,24 +290,21 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 |----------|------|
 | **Dateien** | `std/net/http.lyx`, Z. 204–207 |
 | **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ offen |
+| **Status** | ✅ erledigt (feat/hl7 → develop) |
 | **Quelle** | Security-Audit 2026-06-18 (H-3) |
 
 **Problem:** `Host` und `Path` werden bereits auf CRLF geprüft (Z. 147–149), aber `req.headers` (benutzerdefinierte Header) wird ohne jede Validierung direkt in den Request-Buffer geschrieben. Ein Angreifer mit Kontrolle über `req.headers` kann beliebige HTTP-Header injizieren — inkl. `\r\nTransfer-Encoding: chunked\r\n`, Body-Injection und Request-Smuggling.
 
-**Fix:**
-```
-if (req.headers != 0) {
-    if http_hasCrLf(req.headers, StrLen(req.headers)) != 0 { return 0; }
-    var hlen: int64 := StrLen(req.headers);
-    p := http_writeMem(p, req.headers, hlen);
-}
-```
+**Fix (implementiert):**
+- `std/net/http.lyx`: Neue Funktion `http_hasInjectionCrLf` — erkennt nacktes CR/LF und doppeltes CRLF (`\r\n\r\n`), erlaubt einzelne CRLF-Zeilentrenner (wie von `HTTPSetHeader` generiert)
+- `HTTPRequestBuild`: Prüft `req.headers` mit `http_hasInjectionCrLf`; bei Fehler `munmap` + `return 0`
+- `HTTPSetHeader`: Prüft `name` und `value` mit `http_hasCrLf`; bei CRLF `return 0` (Validierung an der Quelle)
+- `std/net/dns.lyx`: `@cap(system.time)` auf `extern fn time` ergänzt (fehlende FFI-Annotation)
 
 **Teilschritte:**
-- [ ] **30.1** CRLF-Check für `req.headers` in `std/net/http.lyx`
-- [ ] **30.2** Fehlercode bei CRLF-Injektion dokumentieren
-- [ ] **30.3** Test: Header mit `\r\n` → Fehler; normaler Header → OK
+- [x] **30.1** CRLF-Check für `req.headers` in `std/net/http.lyx`
+- [x] **30.2** CRLF-Validierung in `HTTPSetHeader` (Name + Value)
+- [x] **30.3** Test `tests/sec_wp30_crlf_test.lyx` — 20 Tests PASS
 
 ---
 

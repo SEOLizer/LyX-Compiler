@@ -126,6 +126,12 @@ test: lyxc
 	@rm -f /tmp/lyxc_sec_wp29_test
 	@echo "OK"
 
+	@echo "--- sec_wp30: HTTP Custom-Header CRLF-Injection (20 tests) ---"
+	./lyxc tests/sec_wp30_crlf_test.lyx -o /tmp/lyxc_sec_wp30_test
+	@/tmp/lyxc_sec_wp30_test
+	@rm -f /tmp/lyxc_sec_wp30_test
+	@echo "OK"
+
 test-lyxos: lyxc
 	@echo "=== LyxOS Integrations-Kompilierungstest ==="
 	@for f in \
