@@ -1,0 +1,670 @@
+// src/crypto/lic_ed25519.lyx — Ed25519-Signaturverifikation (WP-29)
+//
+// Twisted Edwards-Kurve: -x² + y² = 1 + d·x²·y² über GF(2²⁵⁵-19)
+// RFC 8032 §5.1.7 + SUPERCOP-Referenzimplementierung
+//
+// Feldelement: 10 × int64 Limbs (26/25-Bit alternierend)
+// Punkt:       (X:Y:Z:T) extended coordinates, 4 × 80 Bytes = 320 Bytes
+
+import src.crypto.lic_sha512;
+import src.std.alloc;
+
+// ─── GF(2²⁵⁵-19) Feldarithmetik ─────────────────────────────────────────────
+
+fn _ef_new(): int64 { return alloc(80); }
+fn _ef_del(f: int64) { free(f, 80); }
+
+fn _ef_zero(h: int64) {
+  var i: int64 := 0;
+  while i < 10 { poke64(h+i*8, 0); i := i+1; }
+}
+
+fn _ef_one(h: int64) { _ef_zero(h); poke64(h, 1); }
+
+fn _ef_copy(dst: int64, src: int64) {
+  var i: int64 := 0;
+  while i < 80 { poke8(dst+i, peek8(src+i)); i := i+1; }
+}
+
+fn _ef_carry(h: int64) {
+  var c: int64 := 0; var v: int64 := 0;
+  var pass: int64 := 0;
+  while pass < 2 {
+    v:=peek64(h+0);  c:=v>>26; poke64(h+0, v&0x3FFFFFF); poke64(h+8,  peek64(h+8) +c);
+    v:=peek64(h+8);  c:=v>>25; poke64(h+8, v&0x1FFFFFF); poke64(h+16, peek64(h+16)+c);
+    v:=peek64(h+16); c:=v>>26; poke64(h+16,v&0x3FFFFFF); poke64(h+24, peek64(h+24)+c);
+    v:=peek64(h+24); c:=v>>25; poke64(h+24,v&0x1FFFFFF); poke64(h+32, peek64(h+32)+c);
+    v:=peek64(h+32); c:=v>>26; poke64(h+32,v&0x3FFFFFF); poke64(h+40, peek64(h+40)+c);
+    v:=peek64(h+40); c:=v>>25; poke64(h+40,v&0x1FFFFFF); poke64(h+48, peek64(h+48)+c);
+    v:=peek64(h+48); c:=v>>26; poke64(h+48,v&0x3FFFFFF); poke64(h+56, peek64(h+56)+c);
+    v:=peek64(h+56); c:=v>>25; poke64(h+56,v&0x1FFFFFF); poke64(h+64, peek64(h+64)+c);
+    v:=peek64(h+64); c:=v>>26; poke64(h+64,v&0x3FFFFFF); poke64(h+72, peek64(h+72)+c);
+    v:=peek64(h+72); c:=v>>25; poke64(h+72,v&0x1FFFFFF); poke64(h+0,  peek64(h+0) +c*19);
+    pass := pass+1;
+  }
+}
+
+fn _ef_add(h: int64, f: int64, g: int64) {
+  var i: int64 := 0;
+  while i < 10 { poke64(h+i*8, peek64(f+i*8)+peek64(g+i*8)); i := i+1; }
+}
+
+fn _ef_sub(h: int64, f: int64, g: int64) {
+  poke64(h+0,  134217690+peek64(f+0) -peek64(g+0));
+  poke64(h+8,   67108862+peek64(f+8) -peek64(g+8));
+  poke64(h+16, 134217726+peek64(f+16)-peek64(g+16));
+  poke64(h+24,  67108862+peek64(f+24)-peek64(g+24));
+  poke64(h+32, 134217726+peek64(f+32)-peek64(g+32));
+  poke64(h+40,  67108862+peek64(f+40)-peek64(g+40));
+  poke64(h+48, 134217726+peek64(f+48)-peek64(g+48));
+  poke64(h+56,  67108862+peek64(f+56)-peek64(g+56));
+  poke64(h+64, 134217726+peek64(f+64)-peek64(g+64));
+  poke64(h+72,  67108862+peek64(f+72)-peek64(g+72));
+}
+
+fn _ef_mul(h: int64, f: int64, g: int64) {
+  var f0:int64:=peek64(f+0); var f1:int64:=peek64(f+8); var f2:int64:=peek64(f+16);
+  var f3:int64:=peek64(f+24); var f4:int64:=peek64(f+32); var f5:int64:=peek64(f+40);
+  var f6:int64:=peek64(f+48); var f7:int64:=peek64(f+56); var f8:int64:=peek64(f+64);
+  var f9:int64:=peek64(f+72);
+  var g0:int64:=peek64(g+0); var g1:int64:=peek64(g+8); var g2:int64:=peek64(g+16);
+  var g3:int64:=peek64(g+24); var g4:int64:=peek64(g+32); var g5:int64:=peek64(g+40);
+  var g6:int64:=peek64(g+48); var g7:int64:=peek64(g+56); var g8:int64:=peek64(g+64);
+  var g9:int64:=peek64(g+72);
+  poke64(h+0,  f0*g0+(f1*g9+f9*g1)*38+(f2*g8+f8*g2)*19+(f3*g7+f7*g3)*38+(f4*g6+f6*g4)*19+f5*g5*38);
+  poke64(h+8,  f0*g1+f1*g0+(f2*g9+f9*g2+f3*g8+f8*g3+f4*g7+f7*g4+f5*g6+f6*g5)*19);
+  poke64(h+16, f0*g2+f2*g0+f1*g1*2+(f3*g9+f9*g3)*38+(f4*g8+f8*g4)*19+(f5*g7+f7*g5)*38+f6*g6*19);
+  poke64(h+24, f0*g3+f3*g0+f1*g2+f2*g1+(f4*g9+f9*g4+f5*g8+f8*g5+f6*g7+f7*g6)*19);
+  poke64(h+32, f0*g4+f4*g0+(f1*g3+f3*g1)*2+f2*g2+(f5*g9+f9*g5)*38+(f6*g8+f8*g6)*19+f7*g7*38);
+  poke64(h+40, f0*g5+f5*g0+f1*g4+f4*g1+f2*g3+f3*g2+(f6*g9+f9*g6+f7*g8+f8*g7)*19);
+  poke64(h+48, f0*g6+f6*g0+(f1*g5+f5*g1)*2+f2*g4+f4*g2+f3*g3*2+(f7*g9+f9*g7)*38+f8*g8*19);
+  poke64(h+56, f0*g7+f7*g0+f1*g6+f6*g1+f2*g5+f5*g2+f3*g4+f4*g3+(f8*g9+f9*g8)*19);
+  poke64(h+64, f0*g8+f8*g0+(f1*g7+f7*g1)*2+f2*g6+f6*g2+(f3*g5+f5*g3)*2+f4*g4+f9*g9*38);
+  poke64(h+72, f0*g9+f9*g0+f1*g8+f8*g1+f2*g7+f7*g2+f3*g6+f6*g3+f4*g5+f5*g4);
+  _ef_carry(h);
+}
+
+fn _ef_sq(h: int64, f: int64) { _ef_mul(h, f, f); }
+
+fn _ef_reduce(h: int64) {
+  _ef_carry(h);
+  var h0:int64:=peek64(h+0)+19; var c:int64:=h0>>26; h0:=h0&0x3FFFFFF;
+  var h1:int64:=peek64(h+8)+c;  c:=h1>>25; h1:=h1&0x1FFFFFF;
+  var h2:int64:=peek64(h+16)+c; c:=h2>>26; h2:=h2&0x3FFFFFF;
+  var h3:int64:=peek64(h+24)+c; c:=h3>>25; h3:=h3&0x1FFFFFF;
+  var h4:int64:=peek64(h+32)+c; c:=h4>>26; h4:=h4&0x3FFFFFF;
+  var h5:int64:=peek64(h+40)+c; c:=h5>>25; h5:=h5&0x1FFFFFF;
+  var h6:int64:=peek64(h+48)+c; c:=h6>>26; h6:=h6&0x3FFFFFF;
+  var h7:int64:=peek64(h+56)+c; c:=h7>>25; h7:=h7&0x1FFFFFF;
+  var h8:int64:=peek64(h+64)+c; c:=h8>>26; h8:=h8&0x3FFFFFF;
+  var h9:int64:=peek64(h+72)+c; c:=h9>>25; h9:=h9&0x1FFFFFF;
+  if c != 0 {
+    poke64(h+0,h0); poke64(h+8,h1); poke64(h+16,h2); poke64(h+24,h3);
+    poke64(h+32,h4); poke64(h+40,h5); poke64(h+48,h6); poke64(h+56,h7);
+    poke64(h+64,h8); poke64(h+72,h9);
+  }
+}
+
+// little-endian 32-Byte → Feldelement (Bit 255 wird beibehalten)
+fn _ef_from_bytes(h: int64, b: int64) {
+  var ps: int64 := alloc(80); var ws: int64 := alloc(80);
+  poke64(ps+0,0); poke64(ps+8,26); poke64(ps+16,51); poke64(ps+24,77); poke64(ps+32,102);
+  poke64(ps+40,128); poke64(ps+48,153); poke64(ps+56,179); poke64(ps+64,204); poke64(ps+72,230);
+  poke64(ws+0,26); poke64(ws+8,25); poke64(ws+16,26); poke64(ws+24,25); poke64(ws+32,26);
+  poke64(ws+40,25); poke64(ws+48,26); poke64(ws+56,25); poke64(ws+64,26); poke64(ws+72,25);
+  var i: int64 := 0;
+  while i < 10 {
+    var p: int64 := peek64(ps+i*8); var w: int64 := peek64(ws+i*8);
+    var bidx: int64 := p >> 3; var boff: int64 := p & 7;
+    var raw: int64 := peek8(b+bidx)|(peek8(b+bidx+1)<<8)|(peek8(b+bidx+2)<<16)|(peek8(b+bidx+3)<<24);
+    poke64(h+i*8, (raw >> boff) & ((1<<w)-1));
+    i := i+1;
+  }
+  free(ps,80); free(ws,80);
+}
+
+// Feldelement → 32 Bytes little-endian
+fn _ef_to_bytes(b: int64, h: int64) {
+  _ef_reduce(h);
+  var i: int64 := 0;
+  while i < 32 { poke8(b+i, 0); i := i+1; }
+  var ps: int64 := alloc(80); var ws: int64 := alloc(80);
+  poke64(ps+0,0); poke64(ps+8,26); poke64(ps+16,51); poke64(ps+24,77); poke64(ps+32,102);
+  poke64(ps+40,128); poke64(ps+48,153); poke64(ps+56,179); poke64(ps+64,204); poke64(ps+72,230);
+  poke64(ws+0,26); poke64(ws+8,25); poke64(ws+16,26); poke64(ws+24,25); poke64(ws+32,26);
+  poke64(ws+40,25); poke64(ws+48,26); poke64(ws+56,25); poke64(ws+64,26); poke64(ws+72,25);
+  i := 0;
+  while i < 10 {
+    var p: int64 := peek64(ps+i*8); var w: int64 := peek64(ws+i*8);
+    var val: int64 := peek64(h+i*8);
+    var j: int64 := 0;
+    while j < w {
+      var bp: int64 := p+j;
+      poke8(b+(bp>>3), peek8(b+(bp>>3))|(((val>>j)&1)<<(bp&7)));
+      j := j+1;
+    }
+    i := i+1;
+  }
+  free(ps,80); free(ws,80);
+}
+
+// Inversion: out = z^(p-2) mod p (Fermat) — Additionskette für p-2
+fn _ef_invert(out: int64, z: int64) {
+  var t0:int64:=_ef_new(); var t1:int64:=_ef_new();
+  var z9:int64:=_ef_new(); var z11:int64:=_ef_new(); var z31:int64:=_ef_new();
+  var z10:int64:=_ef_new(); var z20:int64:=_ef_new(); var z40:int64:=_ef_new();
+  var z50:int64:=_ef_new(); var z100:int64:=_ef_new();
+  var z200:int64:=_ef_new(); var z250:int64:=_ef_new();
+  _ef_sq(t0,z); _ef_sq(t1,t0); _ef_sq(t1,t1);
+  _ef_mul(z9,t1,z); _ef_mul(z11,z9,t0); _ef_sq(t0,z11); _ef_mul(z31,t0,z9);
+  _ef_sq(t0,z31); var i:int64:=1; while i<5 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z10,t0,z31);
+  _ef_sq(t0,z10); i:=1; while i<10 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z20,t0,z10);
+  _ef_sq(t0,z20); i:=1; while i<20 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z40,t0,z20);
+  _ef_sq(t0,z40); i:=1; while i<10 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z50,t0,z10);
+  _ef_sq(t0,z50); i:=1; while i<50 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z100,t0,z50);
+  _ef_sq(t0,z100); i:=1; while i<100 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z200,t0,z100);
+  _ef_sq(t0,z200); i:=1; while i<50 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z250,t0,z50);
+  _ef_sq(t0,z250); i:=1; while i<5 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(out,t0,z11);
+  _ef_del(t0); _ef_del(t1); _ef_del(z9); _ef_del(z11); _ef_del(z31);
+  _ef_del(z10); _ef_del(z20); _ef_del(z40); _ef_del(z50);
+  _ef_del(z100); _ef_del(z200); _ef_del(z250);
+}
+
+// z^(2^252-3) = z^((p-5)/8) — Additionskette identisch zu _ef_invert bis z250,
+// dann nur 2 Squarings + *z statt 5 Squarings + *z11
+fn _ef_pow_p58(out: int64, z: int64) {
+  var t0:int64:=_ef_new(); var t1:int64:=_ef_new();
+  var z9:int64:=_ef_new(); var z11:int64:=_ef_new(); var z31:int64:=_ef_new();
+  var z10:int64:=_ef_new(); var z20:int64:=_ef_new(); var z40:int64:=_ef_new();
+  var z50:int64:=_ef_new(); var z100:int64:=_ef_new();
+  var z200:int64:=_ef_new(); var z250:int64:=_ef_new();
+  _ef_sq(t0,z); _ef_sq(t1,t0); _ef_sq(t1,t1);
+  _ef_mul(z9,t1,z); _ef_mul(z11,z9,t0); _ef_sq(t0,z11); _ef_mul(z31,t0,z9);
+  _ef_sq(t0,z31); var i:int64:=1; while i<5 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z10,t0,z31);
+  _ef_sq(t0,z10); i:=1; while i<10 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z20,t0,z10);
+  _ef_sq(t0,z20); i:=1; while i<20 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z40,t0,z20);
+  _ef_sq(t0,z40); i:=1; while i<10 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z50,t0,z10);
+  _ef_sq(t0,z50); i:=1; while i<50 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z100,t0,z50);
+  _ef_sq(t0,z100); i:=1; while i<100 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z200,t0,z100);
+  _ef_sq(t0,z200); i:=1; while i<50 { _ef_sq(t0,t0); i:=i+1; }
+  _ef_mul(z250,t0,z50);
+  // z250 = z^(2^250-1); 2 Squarings + *z → z^(2^252-3)
+  _ef_sq(t0,z250); _ef_sq(t0,t0);
+  _ef_mul(out,t0,z);
+  _ef_del(t0); _ef_del(t1); _ef_del(z9); _ef_del(z11); _ef_del(z31);
+  _ef_del(z10); _ef_del(z20); _ef_del(z40); _ef_del(z50);
+  _ef_del(z100); _ef_del(z200); _ef_del(z250);
+}
+
+// Kurvenkonstante d — kanonische positive Limbs (vorberechnet, kein carry nötig)
+// Lyx >> ist logischer Shift; negative Limbs würden _ef_carry korrumpieren.
+fn _ef_load_d(d: int64) {
+  poke64(d+0,  56195235); poke64(d+8,  13857412); poke64(d+16, 51736253);
+  poke64(d+24, 6949390);  poke64(d+32, 114729);   poke64(d+40, 24766616);
+  poke64(d+48, 60832955); poke64(d+56, 30306712); poke64(d+64, 48412415);
+  poke64(d+72, 21499315);
+}
+
+// 2*d (für unified addition)
+fn _ef_load_2d(d2: int64) {
+  poke64(d2+0,  45281625); poke64(d2+8,  27714825); poke64(d2+16, 36363642);
+  poke64(d2+24, 13898781); poke64(d2+32, 229458);   poke64(d2+40, 15978800);
+  poke64(d2+48, 54557047); poke64(d2+56, 27058993); poke64(d2+64, 29715967);
+  poke64(d2+72, 9444199);
+}
+
+// sqrt(-1) mod p = 2^((p-1)/4) mod p — kanonische positive Limbs
+fn _ef_load_sqrtm1(s: int64) {
+  poke64(s+0,  34513072); poke64(s+8,  25610706); poke64(s+16, 9377949);
+  poke64(s+24, 3500415);  poke64(s+32, 12389472); poke64(s+40, 33281959);
+  poke64(s+48, 41962654); poke64(s+56, 31548777); poke64(s+64, 326685);
+  poke64(s+72, 11406482);
+}
+
+// Konstantzeit-Gleichheitstest zweier Feldelemente (muss vor _ep_decompress stehen)
+fn _ef_equals(a: int64, b: int64): bool {
+  var ta: int64 := _ef_new(); var tb: int64 := _ef_new();
+  _ef_copy(ta, a); _ef_copy(tb, b);
+  _ef_reduce(ta); _ef_reduce(tb);
+  var diff: int64 := 0; var i: int64 := 0;
+  while i < 10 { diff := diff | (peek64(ta+i*8) ^ peek64(tb+i*8)); i := i+1; }
+  _ef_del(ta); _ef_del(tb);
+  return diff == 0;
+}
+
+// ─── Erweiterte Koordinaten-Punkt (X:Y:Z:T) = 4 × 80 Bytes = 320 Bytes ────────
+
+fn _ep_new(): int64 { return alloc(320); }
+fn _ep_del(P: int64) { free(P, 320); }
+fn _ep_X(P: int64): int64 { return P; }
+fn _ep_Y(P: int64): int64 { return P + 80; }
+fn _ep_Z(P: int64): int64 { return P + 160; }
+fn _ep_T(P: int64): int64 { return P + 240; }
+
+// Identität: (0:1:1:0)
+fn _ep_identity(P: int64) {
+  _ef_zero(_ep_X(P)); _ef_one(_ep_Y(P)); _ef_one(_ep_Z(P)); _ef_zero(_ep_T(P));
+}
+
+// Punkt-Addition R = P + Q (Unified Addition, Hisil et al.)
+fn _ep_add(R: int64, P: int64, Q: int64) {
+  var A:int64:=_ef_new(); var B:int64:=_ef_new(); var C:int64:=_ef_new();
+  var D:int64:=_ef_new(); var E:int64:=_ef_new(); var F:int64:=_ef_new();
+  var G:int64:=_ef_new(); var H:int64:=_ef_new();
+  var t0:int64:=_ef_new(); var t1:int64:=_ef_new(); var d2:int64:=_ef_new();
+
+  _ef_sub(t0, _ep_Y(P), _ep_X(P));
+  _ef_sub(t1, _ep_Y(Q), _ep_X(Q));
+  _ef_mul(A, t0, t1);
+
+  _ef_add(t0, _ep_Y(P), _ep_X(P));
+  _ef_add(t1, _ep_Y(Q), _ep_X(Q));
+  _ef_mul(B, t0, t1);
+
+  _ef_load_2d(d2);
+  _ef_mul(t0, _ep_T(P), d2);
+  _ef_mul(C, t0, _ep_T(Q));
+
+  _ef_mul(t0, _ep_Z(P), _ep_Z(Q));
+  _ef_add(D, t0, t0);
+
+  _ef_sub(E, B, A);
+  _ef_sub(F, D, C);
+  _ef_add(G, D, C);
+  _ef_add(H, B, A);
+
+  _ef_mul(_ep_X(R), E, F);
+  _ef_mul(_ep_Y(R), G, H);
+  _ef_mul(_ep_Z(R), F, G);
+  _ef_mul(_ep_T(R), E, H);
+
+  _ef_del(A); _ef_del(B); _ef_del(C); _ef_del(D);
+  _ef_del(E); _ef_del(F); _ef_del(G); _ef_del(H);
+  _ef_del(t0); _ef_del(t1); _ef_del(d2);
+}
+
+// Punkt-Verdopplung R = 2*P — verwendet die unified addition mit P=P
+fn _ep_double(R: int64, P: int64) {
+  _ep_add(R, P, P);
+}
+
+// Konstantzeit-Swap zweier Punkte
+fn _ep_cswap(P: int64, Q: int64, sw: int64) {
+  var mask: int64 := 0 - sw;
+  var i: int64 := 0;
+  while i < 320 {
+    var x: int64 := (peek8(P+i) ^ peek8(Q+i)) & (mask & 255);
+    poke8(P+i, peek8(P+i) ^ x);
+    poke8(Q+i, peek8(Q+i) ^ x);
+    i := i+1;
+  }
+}
+
+// Punkt-Kopie (muss vor _ep_scalarmult stehen)
+fn _ep_copy4(dst: int64, src: int64) {
+  var i: int64 := 0;
+  while i < 320 { poke8(dst+i, peek8(src+i)); i := i+1; }
+}
+
+// Skalarmultiplikation R = k*P (k: 32-Byte little-endian Skalar)
+fn _ep_scalarmult(R: int64, P: int64, k: int64) {
+  var Q: int64 := _ep_new();
+  _ep_copy4(Q, P);
+  _ep_identity(R);
+
+  var bit: int64 := 254;
+  while bit >= 0 {
+    _ep_double(R, R);
+    var byteIdx: int64 := bit / 8;
+    var bitIdx:  int64 := bit - byteIdx * 8;
+    var b: int64 := (peek8(k + byteIdx) >> bitIdx) & 1;
+    if b != 0 {
+      _ep_add(R, R, Q);
+    }
+    bit := bit - 1;
+  }
+
+  _ep_del(Q);
+}
+
+// Decompression: 32-Byte compressed point → (X:Y:Z:T)
+// RFC 8032 §5.1.3: x = u*v^3*(u*v^7)^((p-5)/8), u=y²-1, v=d*y²+1
+fn _ep_decompress(P: int64, bytes32: int64): bool {
+  var ybuf: int64 := alloc(32);
+  if ybuf == 0 { return false; }
+  var i: int64 := 0;
+  while i < 32 { poke8(ybuf+i, peek8(bytes32+i)); i := i+1; }
+  var xsign: int64 := (peek8(ybuf+31) >> 7) & 1;
+  poke8(ybuf+31, peek8(ybuf+31) & 0x7F);
+
+  var Y:int64:=_ef_new(); var u:int64:=_ef_new(); var v:int64:=_ef_new();
+  var d:int64:=_ef_new(); var X:int64:=_ef_new(); var tmp:int64:=_ef_new();
+  var v3:int64:=_ef_new(); var v7:int64:=_ef_new(); var check:int64:=_ef_new();
+  var sqrtm1:int64:=_ef_new(); var zero:int64:=_ef_new();
+
+  _ef_from_bytes(Y, ybuf);
+  free(ybuf, 32);
+
+  // u = y^2 - 1,  v = d*y^2 + 1
+  _ef_sq(u, Y);
+  _ef_load_d(d);
+  _ef_mul(v, d, u);
+  var one: int64 := _ef_new();
+  _ef_one(one);
+  _ef_sub(u, u, one);
+  _ef_carry(u);
+  _ef_add(v, v, one);
+  _ef_del(one);
+
+  // x = u * v^3 * (u * v^7)^((p-5)/8)
+  _ef_sq(v3, v);
+  _ef_mul(v3, v3, v);
+  _ef_sq(v7, v3);
+  _ef_mul(v7, v7, v);
+  _ef_mul(tmp, u, v7);
+  _ef_pow_p58(X, tmp);
+  _ef_mul(X, X, u);
+  _ef_mul(X, X, v3);
+
+  // Prüfe: v*x^2 == u  oder  v*x^2 == -u
+  _ef_sq(tmp, X);
+  _ef_mul(check, v, tmp);
+
+  var vx2_eq_u: bool := _ef_equals(check, u);
+
+  _ef_zero(zero);
+  _ef_sub(tmp, zero, u);   // tmp = -u (mit Feld-Bias)
+  _ef_carry(tmp);
+  var vx2_eq_nu: bool := _ef_equals(check, tmp);
+
+  if not vx2_eq_u && not vx2_eq_nu {
+    _ef_del(Y); _ef_del(u); _ef_del(v); _ef_del(d); _ef_del(X);
+    _ef_del(tmp); _ef_del(v3); _ef_del(v7); _ef_del(check);
+    _ef_del(sqrtm1); _ef_del(zero);
+    return false;
+  }
+
+  if not vx2_eq_u {
+    _ef_load_sqrtm1(sqrtm1);
+    _ef_mul(X, X, sqrtm1);
+  }
+
+  // Vorzeichen korrigieren
+  _ef_reduce(X);
+  var x0: int64 := peek64(X) & 1;
+  if x0 != xsign {
+    _ef_sub(X, zero, X);   // X = 0 - X = -X (zero ist bereits 0)
+    _ef_carry(X);
+  }
+
+  _ef_copy(_ep_X(P), X);
+  _ef_copy(_ep_Y(P), Y);
+  _ef_one(_ep_Z(P));
+  _ef_mul(_ep_T(P), X, Y);
+
+  _ef_del(Y); _ef_del(u); _ef_del(v); _ef_del(d); _ef_del(X);
+  _ef_del(tmp); _ef_del(v3); _ef_del(v7); _ef_del(check);
+  _ef_del(sqrtm1); _ef_del(zero);
+  return true;
+}
+
+// Punkte-Gleichheit: P == Q (projektiv: X1*Z2 == X2*Z1 und Y1*Z2 == Y2*Z1)
+fn _ep_equal(P: int64, Q: int64): bool {
+  var lx:int64:=_ef_new(); var rx:int64:=_ef_new();
+  var ly:int64:=_ef_new(); var ry:int64:=_ef_new();
+  _ef_mul(lx, _ep_X(P), _ep_Z(Q));
+  _ef_mul(rx, _ep_X(Q), _ep_Z(P));
+  _ef_mul(ly, _ep_Y(P), _ep_Z(Q));
+  _ef_mul(ry, _ep_Y(Q), _ep_Z(P));
+  var ex: bool := _ef_equals(lx, rx);
+  var ey: bool := _ef_equals(ly, ry);
+  _ef_del(lx); _ef_del(rx); _ef_del(ly); _ef_del(ry);
+  return ex && ey;
+}
+
+// Basispunkt B (Extended Coordinates, TweetNaCl-Limbs)
+fn _ep_load_base(B: int64) {
+  poke64(_ep_X(B)+0,  52811034); poke64(_ep_X(B)+8,  25909283);
+  poke64(_ep_X(B)+16, 16144682); poke64(_ep_X(B)+24, 17082669);
+  poke64(_ep_X(B)+32, 27570973); poke64(_ep_X(B)+40, 30858332);
+  poke64(_ep_X(B)+48, 40966398); poke64(_ep_X(B)+56, 8378388);
+  poke64(_ep_X(B)+64, 20764389); poke64(_ep_X(B)+72, 8758491);
+
+  poke64(_ep_Y(B)+0,  40265304); poke64(_ep_Y(B)+8,  26843545);
+  poke64(_ep_Y(B)+16, 13421772); poke64(_ep_Y(B)+24, 20132659);
+  poke64(_ep_Y(B)+32, 26843545); poke64(_ep_Y(B)+40, 6710886);
+  poke64(_ep_Y(B)+48, 53687091); poke64(_ep_Y(B)+56, 13421772);
+  poke64(_ep_Y(B)+64, 40265318); poke64(_ep_Y(B)+72, 26843545);
+
+  _ef_one(_ep_Z(B));
+  _ef_mul(_ep_T(B), _ep_X(B), _ep_Y(B));
+}
+
+// ─── Skalare Reduktion mod L (64-Byte SHA-512 → 32-Byte Skalar) ──────────────
+// Lyx >> ist logischer Shift; für vorzeichenbehaftete Carries brauchen wir SAR.
+fn _sar21(v: int64): int64 {
+  var sign: int64 := (0 - ((v >> 63) & 1)) << 43;
+  return (v >> 21) | sign;
+}
+
+fn _sc_load3(s: int64): int64 {
+  return peek8(s) | (peek8(s+1) << 8) | (peek8(s+2) << 16);
+}
+
+fn _sc_load4(s: int64): int64 {
+  return peek8(s) | (peek8(s+1) << 8) | (peek8(s+2) << 16) | (peek8(s+3) << 24);
+}
+
+fn _sc_reduce64(hash64: int64, out32: int64) {
+  var s0:int64 := 2097151 & _sc_load3(hash64);
+  var s1:int64 := 2097151 & (_sc_load4(hash64+2) >> 5);
+  var s2:int64 := 2097151 & (_sc_load3(hash64+5) >> 2);
+  var s3:int64 := 2097151 & (_sc_load4(hash64+7) >> 7);
+  var s4:int64 := 2097151 & (_sc_load4(hash64+10) >> 4);
+  var s5:int64 := 2097151 & (_sc_load3(hash64+13) >> 1);
+  var s6:int64 := 2097151 & (_sc_load4(hash64+15) >> 6);
+  var s7:int64 := 2097151 & (_sc_load3(hash64+18) >> 3);
+  var s8:int64 := 2097151 & _sc_load3(hash64+21);
+  var s9:int64 := 2097151 & (_sc_load4(hash64+23) >> 5);
+  var s10:int64 := 2097151 & (_sc_load3(hash64+26) >> 2);
+  var s11:int64 := 2097151 & (_sc_load4(hash64+28) >> 7);
+  var s12:int64 := 2097151 & (_sc_load4(hash64+31) >> 4);
+  var s13:int64 := 2097151 & (_sc_load3(hash64+34) >> 1);
+  var s14:int64 := 2097151 & (_sc_load4(hash64+36) >> 6);
+  var s15:int64 := 2097151 & (_sc_load3(hash64+39) >> 3);
+  var s16:int64 := 2097151 & _sc_load3(hash64+42);
+  var s17:int64 := 2097151 & (_sc_load4(hash64+44) >> 5);
+  var s18:int64 := 2097151 & (_sc_load3(hash64+47) >> 2);
+  var s19:int64 := 2097151 & (_sc_load4(hash64+49) >> 7);
+  var s20:int64 := 2097151 & (_sc_load4(hash64+52) >> 4);
+  var s21:int64 := 2097151 & (_sc_load3(hash64+55) >> 1);
+  var s22:int64 := 2097151 & (_sc_load4(hash64+57) >> 6);
+  var s23:int64 := _sc_load4(hash64+60) >> 3;
+
+  s11 := s11 + s23 * 666643;  s12 := s12 + s23 * 470296;
+  s13 := s13 + s23 * 654183;  s14 := s14 - s23 * 997805;
+  s15 := s15 + s23 * 136657;  s16 := s16 - s23 * 683901; s23 := 0;
+  s10 := s10 + s22 * 666643;  s11 := s11 + s22 * 470296;
+  s12 := s12 + s22 * 654183;  s13 := s13 - s22 * 997805;
+  s14 := s14 + s22 * 136657;  s15 := s15 - s22 * 683901; s22 := 0;
+  s9  := s9  + s21 * 666643;  s10 := s10 + s21 * 470296;
+  s11 := s11 + s21 * 654183;  s12 := s12 - s21 * 997805;
+  s13 := s13 + s21 * 136657;  s14 := s14 - s21 * 683901; s21 := 0;
+  s8  := s8  + s20 * 666643;  s9  := s9  + s20 * 470296;
+  s10 := s10 + s20 * 654183;  s11 := s11 - s20 * 997805;
+  s12 := s12 + s20 * 136657;  s13 := s13 - s20 * 683901; s20 := 0;
+  s7  := s7  + s19 * 666643;  s8  := s8  + s19 * 470296;
+  s9  := s9  + s19 * 654183;  s10 := s10 - s19 * 997805;
+  s11 := s11 + s19 * 136657;  s12 := s12 - s19 * 683901; s19 := 0;
+  s6  := s6  + s18 * 666643;  s7  := s7  + s18 * 470296;
+  s8  := s8  + s18 * 654183;  s9  := s9  - s18 * 997805;
+  s10 := s10 + s18 * 136657;  s11 := s11 - s18 * 683901; s18 := 0;
+
+  // Deklaration aller carry-Variablen (carry6..carry16 werden vor carry0..carry5 erstmals genutzt)
+  var carry0:int64 := 0; var carry1:int64 := 0; var carry2:int64 := 0;
+  var carry3:int64 := 0; var carry4:int64 := 0; var carry5:int64 := 0;
+  var carry6:int64 := 0; var carry7:int64 := 0; var carry8:int64 := 0;
+  var carry9:int64 := 0; var carry10:int64 := 0; var carry11:int64 := 0;
+  var carry12:int64 := 0; var carry13:int64 := 0; var carry14:int64 := 0;
+  var carry15:int64 := 0; var carry16:int64 := 0;
+
+  carry6 := _sar21(s6 + (1<<20)); s7  := s7  + carry6; s6  := s6  - carry6*(1<<21);
+  carry8 := _sar21(s8 + (1<<20)); s9  := s9  + carry8; s8  := s8  - carry8*(1<<21);
+  carry10:= _sar21(s10+(1<<20));  s11 := s11 + carry10;s10 := s10 - carry10*(1<<21);
+  carry12:= _sar21(s12+(1<<20));  s13 := s13 + carry12;s12 := s12 - carry12*(1<<21);
+  carry14:= _sar21(s14+(1<<20));  s15 := s15 + carry14;s14 := s14 - carry14*(1<<21);
+  carry16:= _sar21(s16+(1<<20));  s17 := s17 + carry16;s16 := s16 - carry16*(1<<21);
+  carry7 := _sar21(s7 + (1<<20)); s8  := s8  + carry7; s7  := s7  - carry7*(1<<21);
+  carry9 := _sar21(s9 + (1<<20)); s10 := s10 + carry9; s9  := s9  - carry9*(1<<21);
+  carry11:= _sar21(s11+(1<<20));  s12 := s12 + carry11;s11 := s11 - carry11*(1<<21);
+  carry13:= _sar21(s13+(1<<20));  s14 := s14 + carry13;s13 := s13 - carry13*(1<<21);
+  carry15:= _sar21(s15+(1<<20));  s16 := s16 + carry15;s15 := s15 - carry15*(1<<21);
+
+  s5  := s5  + s17 * 666643;  s6  := s6  + s17 * 470296;
+  s7  := s7  + s17 * 654183;  s8  := s8  - s17 * 997805;
+  s9  := s9  + s17 * 136657;  s10 := s10 - s17 * 683901; s17 := 0;
+  s4  := s4  + s16 * 666643;  s5  := s5  + s16 * 470296;
+  s6  := s6  + s16 * 654183;  s7  := s7  - s16 * 997805;
+  s8  := s8  + s16 * 136657;  s9  := s9  - s16 * 683901; s16 := 0;
+  s3  := s3  + s15 * 666643;  s4  := s4  + s15 * 470296;
+  s5  := s5  + s15 * 654183;  s6  := s6  - s15 * 997805;
+  s7  := s7  + s15 * 136657;  s8  := s8  - s15 * 683901; s15 := 0;
+  s2  := s2  + s14 * 666643;  s3  := s3  + s14 * 470296;
+  s4  := s4  + s14 * 654183;  s5  := s5  - s14 * 997805;
+  s6  := s6  + s14 * 136657;  s7  := s7  - s14 * 683901; s14 := 0;
+  s1  := s1  + s13 * 666643;  s2  := s2  + s13 * 470296;
+  s3  := s3  + s13 * 654183;  s4  := s4  - s13 * 997805;
+  s5  := s5  + s13 * 136657;  s6  := s6  - s13 * 683901; s13 := 0;
+  s0  := s0  + s12 * 666643;  s1  := s1  + s12 * 470296;
+  s2  := s2  + s12 * 654183;  s3  := s3  - s12 * 997805;
+  s4  := s4  + s12 * 136657;  s5  := s5  - s12 * 683901; s12 := 0;
+
+  carry0 := _sar21(s0+(1<<20)); s1  := s1 +carry0; s0  := s0 -carry0*(1<<21);
+  carry2 := _sar21(s2+(1<<20)); s3  := s3 +carry2; s2  := s2 -carry2*(1<<21);
+  carry4 := _sar21(s4+(1<<20)); s5  := s5 +carry4; s4  := s4 -carry4*(1<<21);
+  carry6 := _sar21(s6+(1<<20)); s7  := s7 +carry6; s6  := s6 -carry6*(1<<21);
+  carry8 := _sar21(s8+(1<<20)); s9  := s9 +carry8; s8  := s8 -carry8*(1<<21);
+  carry10:= _sar21(s10+(1<<20));s11 := s11+carry10;s10 := s10-carry10*(1<<21);
+  carry1 := _sar21(s1+(1<<20)); s2  := s2 +carry1; s1  := s1 -carry1*(1<<21);
+  carry3 := _sar21(s3+(1<<20)); s4  := s4 +carry3; s3  := s3 -carry3*(1<<21);
+  carry5 := _sar21(s5+(1<<20)); s6  := s6 +carry5; s5  := s5 -carry5*(1<<21);
+  carry7 := _sar21(s7+(1<<20)); s8  := s8 +carry7; s7  := s7 -carry7*(1<<21);
+  carry9 := _sar21(s9+(1<<20)); s10 := s10+carry9; s9  := s9 -carry9*(1<<21);
+  var carry11b:int64 := _sar21(s11+(1<<20)); s12 := carry11b; s11 := s11-carry11b*(1<<21);
+
+  s0 := s0 + s12*666643; s1 := s1 + s12*470296;
+  s2 := s2 + s12*654183; s3 := s3 - s12*997805;
+  s4 := s4 + s12*136657; s5 := s5 - s12*683901; s12 := 0;
+
+  carry0 := _sar21(s0); s1 := s1+carry0; s0 := s0-(carry0<<21);
+  carry1 := _sar21(s1); s2 := s2+carry1; s1 := s1-(carry1<<21);
+  carry2 := _sar21(s2); s3 := s3+carry2; s2 := s2-(carry2<<21);
+  carry3 := _sar21(s3); s4 := s4+carry3; s3 := s3-(carry3<<21);
+  carry4 := _sar21(s4); s5 := s5+carry4; s4 := s4-(carry4<<21);
+  carry5 := _sar21(s5); s6 := s6+carry5; s5 := s5-(carry5<<21);
+  carry6 := _sar21(s6); s7 := s7+carry6; s6 := s6-(carry6<<21);
+  carry7 := _sar21(s7); s8 := s8+carry7; s7 := s7-(carry7<<21);
+  carry8 := _sar21(s8); s9 := s9+carry8; s8 := s8-(carry8<<21);
+  carry9 := _sar21(s9); s10 := s10+carry9; s9 := s9-(carry9<<21);
+  var carry10b:int64 := _sar21(s10); s11 := s11+carry10b; s10 := s10-(carry10b<<21);
+  var carry11c:int64 := _sar21(s11); s12 := carry11c; s11 := s11-(carry11c<<21);
+
+  // 21-Bit Limbs → 32 Bytes little-endian
+  poke8(out32+0,  s0 & 255);
+  poke8(out32+1,  (s0 >> 8) & 255);
+  poke8(out32+2,  ((s0 >> 16) | (s1 << 5)) & 255);
+  poke8(out32+3,  (s1 >> 3) & 255);
+  poke8(out32+4,  (s1 >> 11) & 255);
+  poke8(out32+5,  ((s1 >> 19) | (s2 << 2)) & 255);
+  poke8(out32+6,  (s2 >> 6) & 255);
+  poke8(out32+7,  ((s2 >> 14) | (s3 << 7)) & 255);
+  poke8(out32+8,  (s3 >> 1) & 255);
+  poke8(out32+9,  (s3 >> 9) & 255);
+  poke8(out32+10, ((s3 >> 17) | (s4 << 4)) & 255);
+  poke8(out32+11, (s4 >> 4) & 255);
+  poke8(out32+12, (s4 >> 12) & 255);
+  poke8(out32+13, ((s4 >> 20) | (s5 << 1)) & 255);
+  poke8(out32+14, (s5 >> 7) & 255);
+  poke8(out32+15, ((s5 >> 15) | (s6 << 6)) & 255);
+  poke8(out32+16, (s6 >> 2) & 255);
+  poke8(out32+17, (s6 >> 10) & 255);
+  poke8(out32+18, ((s6 >> 18) | (s7 << 3)) & 255);
+  poke8(out32+19, (s7 >> 5) & 255);
+  poke8(out32+20, (s7 >> 13) & 255);
+  poke8(out32+21, s8 & 255);
+  poke8(out32+22, (s8 >> 8) & 255);
+  poke8(out32+23, ((s8 >> 16) | (s9 << 5)) & 255);
+  poke8(out32+24, (s9 >> 3) & 255);
+  poke8(out32+25, (s9 >> 11) & 255);
+  poke8(out32+26, ((s9 >> 19) | (s10 << 2)) & 255);
+  poke8(out32+27, (s10 >> 6) & 255);
+  poke8(out32+28, ((s10 >> 14) | (s11 << 7)) & 255);
+  poke8(out32+29, (s11 >> 1) & 255);
+  poke8(out32+30, (s11 >> 9) & 255);
+  poke8(out32+31, (s11 >> 17) & 255);
+}
+
+// ─── Ed25519 Verifikation (RFC 8032 §5.1.7) ──────────────────────────────────
+
+pub fn lic_ed25519_verify(msg: int64, msgLen: int64, sig64: int64, pk32: int64): bool {
+  // S < L: sig[63] & 0xe0 muss 0 sein
+  if (peek8(sig64+63) & 0xe0) != 0 { return false; }
+
+  var R: int64 := _ep_new();
+  var A: int64 := _ep_new();
+  if not _ep_decompress(R, sig64)  { _ep_del(R); _ep_del(A); return false; }
+  if not _ep_decompress(A, pk32)   { _ep_del(R); _ep_del(A); return false; }
+
+  // SHA-512(R_bytes || pk32 || msg)
+  var hashIn: int64 := alloc(64 + msgLen);
+  if hashIn == 0 { _ep_del(R); _ep_del(A); return false; }
+  var i: int64 := 0;
+  while i < 32 { poke8(hashIn+i, peek8(sig64+i)); i := i+1; }   // R-bytes aus sig
+  i := 0;
+  while i < 32 { poke8(hashIn+32+i, peek8(pk32+i)); i := i+1; }  // pk32
+  i := 0;
+  while i < msgLen { poke8(hashIn+64+i, peek8(msg+i)); i := i+1; }
+
+  var hash64: int64 := alloc(64);
+  if hash64 == 0 { free(hashIn, 64+msgLen); _ep_del(R); _ep_del(A); return false; }
+  lic_sha512(hashIn, 64 + msgLen, hash64);
+  free(hashIn, 64 + msgLen);
+
+  // Hash mod L
+  var h32: int64 := alloc(32);
+  if h32 == 0 { free(hash64, 64); _ep_del(R); _ep_del(A); return false; }
+  i := 0;
+  while i < 32 { poke8(h32+i, 0); i := i+1; }
+  _sc_reduce64(hash64, h32);
+  free(hash64, 64);
+
+  // S*B und R + h*A
+  var B:  int64 := _ep_new();
+  var SB: int64 := _ep_new();
+  var hA: int64 := _ep_new();
+  var RhA:int64 := _ep_new();
+
+  _ep_load_base(B);
+  _ep_scalarmult(SB, B, sig64 + 32);   // S = sig64[32..63]
+  _ep_scalarmult(hA, A, h32);
+  _ep_add(RhA, R, hA);
+
+  var ok: bool := _ep_equal(SB, RhA);
+  free(h32, 32);
+  _ep_del(R); _ep_del(A); _ep_del(B); _ep_del(SB); _ep_del(hA); _ep_del(RhA);
+  return ok;
+}

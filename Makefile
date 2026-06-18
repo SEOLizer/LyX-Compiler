@@ -120,6 +120,12 @@ test: lyxc
 	@bash tests/sec_wp28_kernel_guard_test.sh
 	@echo "OK"
 
+	@echo "--- sec_wp29: Ed25519-Lizenzverifikation (20 tests) ---"
+	./lyxc tests/sec_wp29_ed25519_test.lyx -o /tmp/lyxc_sec_wp29_test
+	@/tmp/lyxc_sec_wp29_test
+	@rm -f /tmp/lyxc_sec_wp29_test
+	@echo "OK"
+
 test-lyxos: lyxc
 	@echo "=== LyxOS Integrations-Kompilierungstest ==="
 	@for f in \

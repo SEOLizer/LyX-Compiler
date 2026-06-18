@@ -50,6 +50,7 @@ import src.crypto.lic_types;
 import src.crypto.lic_parse;
 import src.crypto.lic_derive;
 import src.crypto.lic_secret;
+import src.crypto.lic_base64;
 import src.lic_build_flags;
 import src.std.alloc;
 import src.tooling.migrate_caps;
@@ -4117,46 +4118,71 @@ pub fn lic_loadAndVerify(cfg: CompilerConfig, argc: int64, argv: pchar): bool {
     return false;
   }
 
-  // Derive expected key from name + email
-  var expected: int64 := alloc(32);
-  if expected == 0 { lic_infoFree(info); return false; }
-  lic_deriveKey(info.name as int64, info.nameLen, info.email as int64, info.emailLen, expected as pchar);
+  // WP-29: Dual-Mode Verifikation
+  // Ed25519 (WP-29): keyLen >= 64  → base64-dekodieren → Ed25519-Verify
+  // HMAC-SHA256 (Legacy): keyLen <= 35 → HMAC ableiten → Zeitkonstanter Vergleich
+  var ok: bool := false;
+  var keyBuf: int64 := 0;
+  var keyBufLen: int64 := 0;
 
-  // WP-LIC-10: copy the provided key into a persistent buffer before freeing info
-  // cfg.licenseKey will be set to this buffer on success so codegen can embed it
-  var keyBuf: int64 := alloc(32);
-  if keyBuf != 0 {
-    var copyLen: int64 := info.keyLen;
-    if copyLen > 29 { copyLen := 29; }
-    memcpy(keyBuf, info.key as int64, copyLen);
+  if info.keyLen >= 64 {
+    // WP-29: Ed25519-Pfad
+    var sig64: int64 := alloc(64);
+    if sig64 != 0 {
+      var sigLen: int64 := lic_base64Decode(info.key as int64, info.keyLen, sig64);
+      if sigLen == 64 {
+        ok := lic_verifyKey(info.name as int64, info.nameLen, info.email as int64, info.emailLen, sig64);
+      }
+      if ok {
+        // WP-LIC-10: Schlüssel-String für Watermark bewahren
+        keyBuf := alloc(96);
+        if keyBuf != 0 {
+          keyBufLen := info.keyLen;
+          if keyBufLen > 90 { keyBufLen := 90; }
+          memcpy(keyBuf, info.key as int64, keyBufLen);
+        }
+      }
+      free(sig64, 64);
+    }
+  } else {
+    // Legacy HMAC-SHA256-Pfad
+    var expected: int64 := alloc(32);
+    if expected != 0 {
+      lic_deriveKey(info.name as int64, info.nameLen, info.email as int64, info.emailLen, expected as pchar);
+      // WP-LIC-10: Schlüssel-String für Watermark bewahren
+      keyBuf := alloc(32);
+      if keyBuf != 0 {
+        keyBufLen := info.keyLen;
+        if keyBufLen > 29 { keyBufLen := 29; }
+        memcpy(keyBuf, info.key as int64, keyBufLen);
+      }
+      // WP-15.1: Zeitkonstanter Vergleich (29 Positionen, kein early-exit)
+      var diff: int64 := 0;
+      var ci: int64 := 0;
+      while ci < 29 {
+        var got: int64 := 0;
+        var exp: int64 := peek8(expected + ci);
+        if ci < info.keyLen { got := peek8(info.key as int64 + ci); }
+        diff := diff | (got ^ exp);
+        ci := ci + 1;
+      }
+      lic_zeroSecret(expected);
+      free(expected, 32);
+      ok := diff == 0;
+      if not ok && keyBuf != 0 { free(keyBuf, 32); keyBuf := 0; keyBufLen := 0; }
+    }
   }
 
-  // WP-15.1: Constant-time compare — immer alle 29 Positionen, kein early-exit.
-  // XOR + OR-Akkumulation: diff != 0 ↔ mindestens eine Byte-Differenz.
-  // Timing hängt nur von der festen Schlüssellänge (29) ab.
-  // (Für direkte Digest-Vergleiche: lic_hmacEqual aus lic_hmac.lyx verwenden.)
-  var diff: int64 := 0;
-  var ci: int64 := 0;
-  while ci < 29 {
-    var got: int64 := 0;
-    var exp: int64 := peek8(expected + ci);
-    if ci < info.keyLen { got := peek8(info.key as int64 + ci); }
-    diff := diff | (got ^ exp);
-    ci := ci + 1;
-  }
-  lic_zeroSecret(expected);
-  free(expected, 32);
   lic_infoFree(info);
 
-  if diff != 0 {
+  if not ok {
     EPrintStr("lyxc: ungueltiger Lizenzschluessel.\n"c);
-    if keyBuf != 0 { free(keyBuf, 32); }
     return false;
   }
 
   // Store verified key for WP-LIC-10 watermark embedding
   cfg.licenseKey    := keyBuf;
-  cfg.licenseKeyLen := 29;
+  cfg.licenseKeyLen := keyBufLen;
   return true;
 }
 
