@@ -230,7 +230,7 @@ if bytesRead != size { close(fd); return 0 as pchar; }
 |----------|------|
 | **Dateien** | `src/sema.lyx`, `_sema_isKernelForbidden()` |
 | **Priorität** | 🟠 Hoch |
-| **Status** | ⬜ offen |
+| **Status** | ✅ erledigt (2026-06-18, branch fix/sec-wp28-kernel-guard-allowlist) |
 | **Quelle** | Security-Audit 2026-06-18 (H-1) |
 
 **Problem:** Die aktuelle Forbidden-List für `--target=lyxos-kernel` blockt explizit benannte Module, lässt aber `std.net.epoll` und alle weiteren POSIX-abhängigen `std.net.*`-Module durch. `std.net.epoll` ruft direkt `sys_epoll_create1`/`sys_epoll_ctl`/`sys_epoll_wait` auf — ohne `std.net.socket` zu importieren, greift kein transitives Blocking.
@@ -252,9 +252,9 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 ```
 
 **Teilschritte:**
-- [ ] **28.1** `_sema_isKernelForbidden()` auf Allowlist-Ansatz für `std.net.*` umstellen
-- [ ] **28.2** `std.fs.*`, `std.thread.*`, `std.os.*`, `std.io.*` bleiben als Prefix-Blockliste
-- [ ] **28.3** Tests: `std.net.epoll` mit `--target=lyxos-kernel` → Fehler; `std.net.eth` → OK
+- [x] **28.1** `_sema_isKernelForbidden()` auf Allowlist-Ansatz für `std.net.*` umgestellt
+- [x] **28.2** `std.fs.*`, `std.thread.*`, `std.os.*`, `std.io.*` als Prefix-Blockliste beibehalten
+- [x] **28.3** Tests: `tests/sec_wp28_kernel_guard_test.sh` — 20/20 PASS; `make test` — 0 FAIL
 
 ---
 
