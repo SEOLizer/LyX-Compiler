@@ -361,26 +361,27 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/std/string.lyx` Z. 218, 232–242, 290–302; `src/sema.lyx` Z. 893 |
+| **Dateien** | `src/codegen_x86.lyx` (strlen x86), `src/std/string.lyx`, `src/sema.lyx`, `src/codegen_x86.lyx` (loop) |
 | **Priorität** | 🟡 Mittel |
-| **Status** | ⬜ offen |
+| **Status** | ✅ erledigt (fix/sec-wp33-string-bounds → develop) |
 | **Quelle** | Security-Audit 2026-06-18 (M-1, M-2, M-3, L-2) |
 
-**Probleme:**
+**Probleme und Fixes:**
 
-1. **`StrLen(0)` → SIGSEGV** — Kein Null-Pointer-Guard. Fix: `if ptr == 0 { return 0; }`.
+1. **`StrLen(0)` → SIGSEGV**: `_lyx_strlen`-Builtin (x86) hatte keinen Null-Guard. Fix: `test rdi, rdi; jz` an den Beginn der Helper-Funktion; Helper von 15 auf 24 Bytes; alle nachfolgenden Helper-Offsets +9.
 
-2. **`StrCopy` Off-by-One** (Z. 232) — `while i <= srcLen` liest 1 Byte über das Source-Array-Ende. Fix: `while i < srcLen` + explizites `poke8(dest + srcLen, 0)`.
+2. **`StrCopy` Off-by-One** (Z. 232): `while i <= srcLen` → `while i < srcLen` + explizites `poke8(dest + srcLen, 0)` in der Source (Builtin in `codegen_x86.lyx` läuft via strlen und ist unabhängig korrekt).
 
-3. **`StrSubstr` ohne Bounds-Prüfung** (Z. 290) — `start + len > srcLen` → OOB-Read. Fix: `if start < 0 || len < 0 || start + len > srcLen { return 0 as pchar; }`.
+3. **`StrSubstr` ohne Bounds-Prüfung** (Z. 290): `if src == 0 || start < 0 || len < 0 || start + len > srcLen { return 0; }` eingefügt.
 
-4. **`_sema_processImport` modLen==1 OOB** (sema.lyx Z. 893) — `while wptd < modLen - 1` liest bei `modLen == 1` ein Byte jenseits des Modulnamens. Fix: `while wptd + 1 < modLen`.
+4. **`_sema_processImport`/`cg_processImport` Loop-Bedingung**: `while wptd < modLen - 1` → `while wptd + 1 < modLen` in `src/sema.lyx` und `src/codegen_x86.lyx`.
 
 **Teilschritte:**
-- [ ] **33.1** `StrLen`: Null-Pointer-Guard
-- [ ] **33.2** `StrCopy`: Off-by-One korrigieren
-- [ ] **33.3** `StrSubstr`: Bounds-Check
-- [ ] **33.4** `_sema_processImport`: Loop-Bedingung korrigieren (identischer Bug auch in `codegen_x86.lyx`)
+- [x] **33.1** `_lyx_strlen`-Builtin: Null-Pointer-Guard als x86-Bytes (codegen_x86.lyx)
+- [x] **33.2** `StrCopy`: Off-by-One in src/std/string.lyx korrigiert
+- [x] **33.3** `StrSubstr`: Bounds-Check (src/std/string.lyx)
+- [x] **33.4** `_sema_processImport` + `cg_processImport`: Loop-Bedingung korrigiert
+- [x] **33.5** Test `tests/sec_wp33_string_bounds_test.sh` — 20 Tests PASS
 
 ---
 
