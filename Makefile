@@ -148,6 +148,10 @@ test: lyxc
 	@bash tests/sec_wp34_codegen_buffer_test.sh
 	@echo "OK"
 
+	@echo "--- sec_wp35: LYU-Parser symCount-Limit (20 tests) ---"
+	@bash tests/sec_wp35_lyu_symcount_test.sh
+	@echo "OK"
+
 test-lyxos: lyxc
 	@echo "=== LyxOS Integrations-Kompilierungstest ==="
 	@for f in \

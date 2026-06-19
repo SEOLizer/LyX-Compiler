@@ -416,24 +416,25 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/sema.lyx` Z. 798 |
+| **Dateien** | `src/sema.lyx` |
 | **Priorität** | 🟡 Mittel |
-| **Status** | ⬜ offen |
+| **Status** | ✅ erledigt (fix/sec-wp35-lyu-symcount-limit → develop) |
 | **Quelle** | Security-Audit 2026-06-18 (M-6) |
 
-**Problem:** `symCount` wird aus einer `.lyu`-Datei gelesen ohne obere Schranke. Eine crafted `.lyu`-Datei mit `symCount = 0x7FFFFFFF` und gültigem Format treibt das Symboltabellen-Wachstum ins Extreme (jeder `_pushSym`-Aufruf verdoppelt bei Bedarf den Puffer).
+**Problem:** `symCount` wird aus einer `.lyu`-Datei gelesen ohne obere Schranke. Eine crafted `.lyu`-Datei mit `symCount = 0x7FFFFFFF` treibt das Symboltabellen-Wachstum ins Extreme.
+
+**Wurzelursache (neu entdeckt):** `_sema_processImport` nutzte `StrLen(lyuSrc)` für die `.lyu`-Größe — da `.lyu` Binärformat ist und `\x00` ab Byte 3 (Magic-Padding) enthält, lieferte `StrLen` immer 3 → `_sema_parseLyuSyms` exitete sofort wegen `size < 10`. Das `symCount`-Limit konnte nicht greifen.
 
 **Fix:**
-```
-if symCount > 65536 {
-    EPrintStr("sema error: .lyu symCount unreasonably large: "c);
-    return;
-}
-```
+
+1. **`lastReadSize: int64`** in der Sema-Klasse: wird in `_sema_readFile` auf die echte Dateigröße (via `lseek`) gesetzt, bevor der Buffer zurückgegeben wird.
+2. **`_sema_processImport`**: nutzt jetzt `self.lastReadSize` statt `StrLen(lyuSrc)` → binärsicheres Parsen.
+3. **`_sema_parseLyuSyms`**: `if symCount > 65536 { EPrintStrLn(...); return; }` → verhindert OOM.
 
 **Teilschritte:**
-- [ ] **35.1** Limit-Check nach dem Lesen von `symCount`
-- [ ] **35.2** Test: crafted `.lyu` mit `symCount = 100000` → Fehler
+- [x] **35.1** `lastReadSize`-Feld + binärsichere Größenübergabe an `_sema_parseLyuSyms`
+- [x] **35.2** `symCount > 65536`-Check + Fehlermeldung in `_sema_parseLyuSyms`
+- [x] **35.3** Test `tests/sec_wp35_lyu_symcount_test.sh` — 20 Tests PASS
 
 ---
 
