@@ -468,17 +468,18 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 |----------|------|
 | **Dateien** | `std/crypto/rand.lyx` |
 | **Priorität** | 🔵 Niedrig |
-| **Status** | ⬜ offen |
+| **Status** | ✅ erledigt |
 | **Quelle** | Security-Audit 2026-06-18 (I-3) |
+| **Ende** | 2026-06-19 |
 
 **Problem:** `RandInt64()` gibt `0` zurück wenn `getrandom` fehlschlägt. Der Kommentar verschleiert den Fehler. Aufrufer, die den Rückgabewert nicht auf Null prüfen, könnten vorhersagbare Werte verwenden (z. B. als Session-Token, Nonce, CSRF-Token).
 
-**Fix:** Expliziten Fehlerindikator zurückgeben (z. B. separater Out-Parameter) oder bei `getrandom`-Fehler abbrechen (`exit(1)`), da vorhersagbare Zufallszahlen schlimmer sind als ein Programm-Abbruch.
+**Fix:** Bei `getrandom`-Fehler bricht `RandInt64()` jetzt mit `exit(1)` ab. Vorhersagbare Zufallszahlen (0) wären gefährlicher als ein Programmabbruch. Alle stdlib-Aufrufer verwenden `RandBytesExact` direkt (mit Fehlercode-Handling) — keine externen Aufrufer von `RandInt64()` betroffen.
 
 **Teilschritte:**
-- [ ] **37.1** Fehlerfall dokumentieren (Kommentar präzisieren)
-- [ ] **37.2** Fehlerbehandlungsstrategie entscheiden: Abbruch oder Fehlercode
-- [ ] **37.3** Alle Aufrufer von `RandInt64()` auf Fehlerfall-Handling prüfen
+- [x] **37.1** Fehlerfall dokumentieren (Kommentar präzisiert, WP-37-Hinweis ergänzt)
+- [x] **37.2** Fehlerbehandlungsstrategie: Abbruch via `exit(1)` gewählt
+- [x] **37.3** Aufrufer geprüft — keine externen Aufrufer von `RandInt64()`/`RandU32()` in stdlib
 
 ---
 
@@ -525,4 +526,4 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 | **34** | **Codegen-Buffer-Größenlimit** | **⬜** | – | 🟡 |
 | **35** | **LYU-Parser symCount-Limit** | **⬜** | – | 🟡 |
 | **36** | **SecureZero() Compiler-Barriere** | **✅** | 2026-06-19 | 🔵 |
-| **37** | **RandInt64() Fehlerbehandlung** | **⬜** | – | 🔵 |
+| **37** | **RandInt64() Fehlerbehandlung** | **✅** | 2026-06-19 | 🔵 |
