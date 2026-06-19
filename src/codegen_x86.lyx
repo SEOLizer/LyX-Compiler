@@ -3428,6 +3428,21 @@ pub type Codegen = class {
       paramIdx := paramIdx + 1;
       param := self.cg_nnext(param);
     }
+    // L-4: stack params at [rbp+16], [rbp+24], ... (method explicit params 5+ on stack)
+    var mspOff: int64 := 16;
+    while (param != -1) {
+      var mspName: pchar := self.cg_nsval(param);
+      var mspNlen: int64 := self.cg_nslen(param);
+      var mspLocal: int64 := self.cg_addLocal(mspName, mspNlen);
+      var mspType: int64 := self.cg_nc0(param);
+      if (mspType >= 0 && self.cg_nkind(mspType) == 60) {
+        self.cg_setLocalType(self.localCount - 1, self.cg_nsval(mspType), self.cg_nslen(mspType));
+      }
+      self.cg_loadRax(mspOff);
+      self.cg_storeRax(mspLocal);
+      mspOff := mspOff + 8;
+      param := self.cg_nnext(param);
+    }
     // Generate body
     var body: int64 := self.cg_nc2(ni);
     self.cg_genBlock(body);
@@ -4557,10 +4572,10 @@ pub type Codegen = class {
       }
     }
 
-    // For method calls: push self (object) as first arg.
-    // Static calls (TypeName.Method() where TypeName is a class, not a variable) skip self-push.
+    // L-4: resolve smObj and static-call BEFORE ordering push
+    var smObj: int64 := -1;
     if (isMethod == 1) {
-      var smObj: int64 := self.cg_nc0(ni);
+      smObj := self.cg_nc0(ni);
       if (self.cg_nkind(smObj) == CGN_IDENT) {
         var smName: pchar := self.cg_nsval(smObj);
         var smLen:  int64 := self.cg_nslen(smObj);
@@ -4569,38 +4584,89 @@ pub type Codegen = class {
           isStaticCall := 1;
         }
       }
-      if (isStaticCall == 0) {
+    }
+
+    // L-4: total arg slots including implicit self
+    var nExpl: int64 := argc;
+    var nTotal: int64 := argc;
+    if (isMethod == 1 && isStaticCall == 0) { nTotal := argc + 1; }
+
+    if (nTotal <= 6) {
+      // Simple path: all fit in registers — push self first (method), then args, then defaults
+      if (isMethod == 1 && isStaticCall == 0) {
         self.cg_genExpr(smObj);
         self.cg_pushRax();
         argc := argc + 1;
       }
-    }
-
-    // Evaluate each arg and push
-    cur := argNode;
-    while (cur != -1) {
-      self.cg_genExpr(cur);
-      self.cg_pushRax();
-      cur := self.cg_nnext(cur);
-    }
-
-    // WP-MEM-05: emit default expressions for remaining params
-    if (cgDefFuncNi >= 0) {
-      var cgPn: int64 := self.cg_nc0(cgDefFuncNi);
-      var cgSkip: int64 := 0;
-      while (cgSkip < argc && cgPn >= 0) {
-        cgPn := self.cg_nnext(cgPn);
-        cgSkip := cgSkip + 1;
+      cur := argNode;
+      while (cur != -1) {
+        self.cg_genExpr(cur);
+        self.cg_pushRax();
+        cur := self.cg_nnext(cur);
       }
-      while (cgPn >= 0) {
-        var cgDef: int64 := self.cg_nc1(cgPn);
-        if (cgDef >= 0) {
-          self.cg_genExpr(cgDef);
-          self.cg_pushRax();
-          argc := argc + 1;
+      // WP-MEM-05: emit default expressions for remaining params
+      if (cgDefFuncNi >= 0) {
+        var cgPn: int64 := self.cg_nc0(cgDefFuncNi);
+        var cgSkip: int64 := 0;
+        while (cgSkip < argc && cgPn >= 0) {
+          cgPn := self.cg_nnext(cgPn);
+          cgSkip := cgSkip + 1;
         }
-        cgPn := self.cg_nnext(cgPn);
+        while (cgPn >= 0) {
+          var cgDef: int64 := self.cg_nc1(cgPn);
+          if (cgDef >= 0) {
+            self.cg_genExpr(cgDef);
+            self.cg_pushRax();
+            argc := argc + 1;
+          }
+          cgPn := self.cg_nnext(cgPn);
+        }
       }
+    } else {
+      // L-4: 7+ param path — push stack args first (reverse), then register args
+      var argBuf: int64 := alloc(nExpl * 8);
+      var acnt: int64 := 0;
+      var acur: int64 := argNode;
+      while (acur != -1) {
+        poke64(argBuf + acnt * 8, acur);
+        acnt := acnt + 1;
+        acur := self.cg_nnext(acur);
+      }
+      if (isMethod == 1 && isStaticCall == 0) {
+        argc := argc + 1;
+        // Push stack explicit args in reverse: arg[nExpl-1] deepest, arg[5] shallowest
+        var si: int64 := nExpl - 1;
+        while (si >= 5) {
+          self.cg_genExpr(peek64(argBuf + si * 8));
+          self.cg_pushRax();
+          si := si - 1;
+        }
+        // Push self into rdi slot
+        self.cg_genExpr(smObj);
+        self.cg_pushRax();
+        // Push register explicit args: arg[0..4]
+        var ri: int64 := 0;
+        while (ri < 5 && ri < nExpl) {
+          self.cg_genExpr(peek64(argBuf + ri * 8));
+          self.cg_pushRax();
+          ri := ri + 1;
+        }
+      } else {
+        // Non-method: push stack args in reverse (arg[argc-1]..arg[6]), then reg args (arg[0..5])
+        var si2: int64 := argc - 1;
+        while (si2 >= 6) {
+          self.cg_genExpr(peek64(argBuf + si2 * 8));
+          self.cg_pushRax();
+          si2 := si2 - 1;
+        }
+        var ri2: int64 := 0;
+        while (ri2 < 6) {
+          self.cg_genExpr(peek64(argBuf + ri2 * 8));
+          self.cg_pushRax();
+          ri2 := ri2 + 1;
+        }
+      }
+      free(argBuf, nExpl * 8);
     }
 
     // Pop args into registers
@@ -8529,6 +8595,21 @@ pub type Codegen = class {
       else if (paramIdx == 4) { self.cg_spillR8(off); }
       else if (paramIdx == 5) { self.cg_spillR9(off); }
       paramIdx := paramIdx + 1;
+      param := self.cg_nnext(param);
+    }
+    // L-4: stack params at [rbp+16], [rbp+24], ... (args 7+ passed on caller stack)
+    var spOff: int64 := 16;
+    while (param != -1) {
+      var spName: pchar := self.cg_nsval(param);
+      var spNlen: int64 := self.cg_nslen(param);
+      var spLocal: int64 := self.cg_addLocal(spName, spNlen);
+      var spType: int64 := self.cg_nc0(param);
+      if (spType >= 0 && self.cg_nkind(spType) == 60) {
+        self.cg_setLocalType(self.localCount - 1, self.cg_nsval(spType), self.cg_nslen(spType));
+      }
+      self.cg_loadRax(spOff);
+      self.cg_storeRax(spLocal);
+      spOff := spOff + 8;
       param := self.cg_nnext(param);
     }
 
