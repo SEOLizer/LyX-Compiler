@@ -28,7 +28,7 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Security-Audit 2026-06-18 ha
 | **33** | String-Library Bounds-Hardening (`StrCopy`, `StrSubstr`, `StrLen`) | 🟡 Mittel |
 | **34** | Codegen-Buffer-Größenlimit | 🟡 Mittel |
 | **35** | LYU-Parser `symCount`-Limit | 🟡 Mittel |
-| **36** | `SecureZero()` Compiler-Barriere | 🔵 Niedrig |
+| **36** | `SecureZero()` Compiler-Barriere | ✅ Erledigt |
 | **37** | `RandInt64()` Fehlerbehandlung bei `getrandom`-Fehler | 🔵 Niedrig |
 
 ---
@@ -442,18 +442,23 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `std/crypto/ct.lyx` Z. 80–84 |
+| **Dateien** | `lyx-compiler/usr/include/lyx/units/std/crypto/ct.lyx` Z. 79–85 |
 | **Priorität** | 🔵 Niedrig |
-| **Status** | ⬜ offen |
+| **Status** | ✅ erledigt (fix/sec-wp36-securezero-barrier → develop) |
 | **Quelle** | Security-Audit 2026-06-18 (I-1) |
 
-**Problem:** `SecureZero()` nutzt eine `poke8`-Schleife ohne Compiler-Barriere. Ein aggressiver Optimizer könnte Dead-Store-Elimination anwenden und die Schleife komplett entfernen. `lic_zeroSecret()` nutzt korrekt `explicit_bzero()` (nicht wegoptimierbar), aber `SecureZero()` in `std/crypto/ct.lyx` tut das nicht.
+**Problem:** `SecureZero()` nutzte eine `poke8`-Schleife ohne Compiler-Barriere. Ein aggressiver Optimizer könnte Dead-Store-Elimination anwenden und die Schleife komplett entfernen. `lic_zeroSecret()` nutzt korrekt `explicit_bzero()` (nicht wegoptimierbar), aber `SecureZero()` in `std/crypto/ct.lyx` tat das nicht.
 
-**Fix:** `SecureZero()` auf `explicit_bzero` (Syscall-basiert oder Memory-Barrier) umstellen, oder eine `volatile`-äquivalente Schreibsequenz verwenden, die der Lyx-Codegen nicht eliminiert.
+**Analyse (36.1):** Der Lyx-Codegen macht **kein** Dead-Store-Elimination auf `poke8` (nicht-optimierender Einpass-Compiler). Die `poke8`-Schleife wäre zur Laufzeit sicher. Dennoch: `explicit_bzero` als Defense-in-Depth für zukünftige Optimizer-Pässe und zur Konsistenz mit `lic_zeroSecret()`.
+
+**Fix (implementiert):**
+- `extern fn explicit_bzero(ptr: pchar, n: int64) link "libc.so.6"` zu `ct.lyx` hinzugefügt
+- `SecureZero()` ersetzt `poke8`-Schleife durch `explicit_bzero(ptr as pchar, len)` mit `len <= 0`-Guard
 
 **Teilschritte:**
-- [ ] **36.1** Prüfen ob Lyx-Codegen Dead-Store-Elimination für `poke8` macht
-- [ ] **36.2** Falls ja: `explicit_bzero`-Binding nutzen
+- [x] **36.1** Lyx-Codegen macht kein DSE auf `poke8` (bestätigt — non-optimizing compiler)
+- [x] **36.2** `explicit_bzero`-Binding + Umstieg in `SecureZero()` (Defense-in-Depth)
+- [x] **36.3** Test `tests/sec_wp36_securezero_test.sh` — 20 Tests PASS
 
 ---
 
@@ -519,5 +524,5 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 | **33** | **String-Library Bounds-Hardening** | **⬜** | – | 🟡 |
 | **34** | **Codegen-Buffer-Größenlimit** | **⬜** | – | 🟡 |
 | **35** | **LYU-Parser symCount-Limit** | **⬜** | – | 🟡 |
-| **36** | **SecureZero() Compiler-Barriere** | **⬜** | – | 🔵 |
+| **36** | **SecureZero() Compiler-Barriere** | **✅** | 2026-06-19 | 🔵 |
 | **37** | **RandInt64() Fehlerbehandlung** | **⬜** | – | 🔵 |
