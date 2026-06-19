@@ -389,26 +389,26 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 
 | Attribut | Wert |
 |----------|------|
-| **Dateien** | `src/codegen_x86.lyx` Z. 627–632 |
+| **Dateien** | `src/codegen_x86.lyx` |
 | **Priorität** | 🟡 Mittel |
-| **Status** | ⬜ offen |
+| **Status** | ✅ erledigt (fix/sec-wp34-codegen-buffer-limit → develop) |
 | **Quelle** | Security-Audit 2026-06-18 (M-5) |
 
 **Problem:** Der Code-Output-Buffer beginnt mit 65 536 Bytes und verdoppelt sich unbegrenzt. Eine crafted große Eingabedatei (z. B. eine Million inline-Assemblerwerte) kann den Buffer auf mehrere GB wachsen lassen → OOM.
 
 **Fix:**
-```
-con MAX_CODE_SIZE: int64 := 512 * 1024 * 1024;  // 512 MB
-...
-if nc > MAX_CODE_SIZE {
-    EPrintStrLn("error: code output exceeds 512 MB limit"c);
-    return;
-}
-```
+
+1. **`codeOverflow`/`dataOverflow`-Flags** in der `Codegen`-Klasse (beide in `Init()` auf 0 gesetzt).
+2. **`cg_grow()`/`cg_growData()`**: Vor Verdopplung wird `nc > 536870912` (512 MB) geprüft; bei Überschreitung wird das Flag gesetzt und ein Fehler per `EPrintStrLn` ausgegeben.
+3. **`cg_e8()`/`cg_edata()`**: Prüft das jeweilige Overflow-Flag vor jedem Byte; bei gesetztem Flag wird `return` ausgeführt (kein OOB-Write).
+4. **`WriteELF()`**: Prüft beide Flags am Anfang; bei gesetztem Flag wird die Ausgabe mit Fehlermeldung abgebrochen.
 
 **Teilschritte:**
-- [ ] **34.1** `MAX_CODE_SIZE`-Konstante definieren und Wachstums-Check einbauen
-- [ ] **34.2** Fehlermeldung + sauberer Abbruch
+- [x] **34.1** `codeOverflow`/`dataOverflow`-Flags in Codegen-Klasse + `Init()` initialisiert
+- [x] **34.2** `cg_grow()`/`cg_growData()`: 512-MB-Check + Fehlermeldung
+- [x] **34.3** `cg_e8()`/`cg_edata()`: Overflow-Guard (kein Byte nach Overflow)
+- [x] **34.4** `WriteELF()`: Guard verhindert korrupte ELF-Ausgabe
+- [x] **34.5** Test `tests/sec_wp34_codegen_buffer_test.sh` — 20 Tests PASS
 
 ---
 
