@@ -152,6 +152,10 @@ test: lyxc
 	@bash tests/sec_wp35_lyu_symcount_test.sh
 	@echo "OK"
 
+	@echo "--- sec_wp36: SecureZero Compiler-Barriere (20 tests) ---"
+	@bash tests/sec_wp36_securezero_test.sh
+	@echo "OK"
+
 test-lyxos: lyxc
 	@echo "=== LyxOS Integrations-Kompilierungstest ==="
 	@for f in \
