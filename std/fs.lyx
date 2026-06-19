@@ -377,118 +377,79 @@ con PATH_BUF_SIZE: int64 := 4096;
 //   PathContainedIn(root, path) verwenden — prüft Präfix nach Normalisierung.
 //   Für vollständigen Schutz zusätzlich realpath() aufrufen (löst Symlinks auf).
 pub fn PathNormalize(dest: pchar, src: pchar): pchar {
-  // Da Lyx keine dynamischen Arrays hat, implementieren wir eine 
-  // vereinfachte Version ohne vollständigen Stack
-  var result: pchar := "                                                                                ";
+  // SEC-BUG-05 fix: segment-stack algorithm — correct for all .. cases,
+  // heap buffers (no fixed 80-byte literal overflow).
   var src_len: int64 := StrLen(src);
-  
-  // Prüfe ob absolut oder relativ
   var is_absolute: bool := false;
-  if (src_len > 0 && StrCharAt(src, 0) == 47) {  // '/'
-    is_absolute := true;
-  }
-  
-  // Einfacherer Algorithmus: ein Durchgang
+  if (src_len > 0 && StrCharAt(src, 0) == 47) { is_absolute := true; }  // '/'
+
+  // Segment stack: store (start, len) pairs into src positions.
+  // Max 512 segments (4096 bytes / 8 bytes per entry).
+  var seg_starts: int64 := alloc(4096);
+  var seg_lens:   int64 := alloc(4096);
+  var seg_count:  int64 := 0;
+
   var i: int64 := 0;
-  var j: int64 := 0;
-  var last_slash: int64 := 0;
-  var comp_start: int64 := 0;
-  
-  if (is_absolute) {
-    StrSetChar(result, 0, 47);  // '/'
-    j := 1;
-    last_slash := 0;
-  }
-  
-  while (i < src_len) {
-    var c: int64 := StrCharAt(src, i);
-    
-    if (c == 47) {  // '/'
-      // Segment beenden
+  if (is_absolute) { i := 1; }
+  var comp_start: int64 := i;
+
+  // Process src char by char; flush segment at each '/' and at end.
+  while (i <= src_len) {
+    var c: int64 := 0;
+    if (i < src_len) { c := StrCharAt(src, i); }
+    if (c == 47 || i == src_len) {  // '/' or end
       var seg_len: int64 := i - comp_start;
-      
-      if (seg_len == 1 && StrCharAt(src, comp_start) == 46) {  // "."
-        // Überspringen
-        comp_start := i + 1;
-        last_slash := j;
-      }
-      else if (seg_len == 2 && StrCharAt(src, comp_start) == 46 && StrCharAt(src, comp_start + 1) == 46) {  // ".."
-        // Zurückgehen: entferne letztes Segment
-        if (last_slash < j) {
-          j := last_slash;
-          if (j > 0 && is_absolute) {
-            // Finde vorigen Slash
-            var k: int64 := j - 1;
-            while (k > 0) {
-              if (StrCharAt(result, k) == 47) { last_slash := k; break; }
-              k := k - 1;
-            }
-            if (k == 0) { last_slash := 0; }
-          }
+      if (seg_len == 0) {
+        // empty (multiple // or trailing slash) — skip
+      } else if (seg_len == 1 && StrCharAt(src, comp_start) == 46) {
+        // "." — skip
+      } else if (seg_len == 2 && StrCharAt(src, comp_start) == 46
+                               && StrCharAt(src, comp_start + 1) == 46) {
+        // ".." — pop last segment (ignore if already at root)
+        if (seg_count > 0) { seg_count := seg_count - 1; }
+      } else {
+        // normal segment — push
+        if (seg_count < 512) {
+          poke64(seg_starts + seg_count * 8, comp_start);
+          poke64(seg_lens   + seg_count * 8, seg_len);
+          seg_count := seg_count + 1;
         }
-        comp_start := i + 1;
-        last_slash := j;
       }
-      else if (seg_len > 0) {
-        // Normales Segment: kopieren
-        var k: int64 := 0;
-        while (k < seg_len) {
-          StrSetChar(result, j + k, StrCharAt(src, comp_start + k));
-          k := k + 1;
-        }
-        j := j + seg_len;
-        last_slash := j;
-        StrSetChar(result, j, 47);  // '/'
-        j := j + 1;
-        comp_start := i + 1;
-      }
-      else {
-        // Mehrere / : überspringen
-        comp_start := i + 1;
-      }
+      comp_start := i + 1;
     }
     i := i + 1;
   }
-  
-  // Letztes Segment prüfen
-  var seg_len: int64 := i - comp_start;
-  if (seg_len == 1 && StrCharAt(src, comp_start) == 46) {
-    // "." am Ende - entfernen
-  }
-  else if (seg_len == 2 && StrCharAt(src, comp_start) == 46 && StrCharAt(src, comp_start + 1) == 46) {
-    // ".." am Ende - entferne letztes Segment
-    if (last_slash < j) {
-      j := last_slash;
-    }
-  }
-  else if (seg_len > 0) {
-    // Normales Segment kopieren
+
+  // Reconstruct dest from valid segments.
+  var j: int64 := 0;
+  if (is_absolute) { StrSetChar(dest, 0, 47); j := 1; }  // leading '/'
+
+  var si: int64 := 0;
+  while (si < seg_count) {
+    var s: int64 := peek64(seg_starts + si * 8);
+    var l: int64 := peek64(seg_lens   + si * 8);
     var k: int64 := 0;
-    while (k < seg_len) {
-      StrSetChar(result, j + k, StrCharAt(src, comp_start + k));
+    while (k < l && j < PATH_BUF_SIZE - 1) {
+      StrSetChar(dest, j, StrCharAt(src, s + k));
+      j := j + 1;
       k := k + 1;
     }
-    j := j + seg_len;
+    // '/' between segments (not after last)
+    if (si < seg_count - 1 && j < PATH_BUF_SIZE - 1) {
+      StrSetChar(dest, j, 47);
+      j := j + 1;
+    }
+    si := si + 1;
   }
-  
-  // Entferne trailing slash (außer bei "/")
-  if (j > 1 && StrCharAt(result, j - 1) == 47) {
-    j := j - 1;
-  }
-  
-  // Null-terminator
-  StrSetChar(result, j, 0);
-  
-  // Kopiere nach dest (bis zur Puffergröße)
-  var copy_len: int64 := j;
-  if (copy_len >= PATH_BUF_SIZE) { copy_len := PATH_BUF_SIZE - 1; }
-  var k: int64 := 0;
-  while (k < copy_len) {
-    StrSetChar(dest, k, StrCharAt(result, k));
-    k := k + 1;
-  }
-  StrSetChar(dest, copy_len, 0);
-  
+
+  // Edge case: empty result (e.g. "/" or relative ".")
+  if (j == 0 && is_absolute) { StrSetChar(dest, 0, 47); j := 1; }
+  if (j == 0) { StrSetChar(dest, 0, 46); j := 1; }  // relative empty → "."
+
+  StrSetChar(dest, j, 0);
+
+  free(seg_starts, 4096);
+  free(seg_lens,   4096);
   return dest;
 }
 
