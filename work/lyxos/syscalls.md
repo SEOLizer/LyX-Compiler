@@ -276,6 +276,9 @@ con ERR_CAPVIOL     : int64 := 29  // Capability-Verletzung
 con ERR_AIBUSY      : int64 := 30  // KI-Inferenz-Engine ausgelastet
 con ERR_BADMODEL    : int64 := 31  // Ungültiges oder nicht unterstütztes KI-Modell
 con ERR_CTXFULL     : int64 := 32  // KI-Kontextfenster voll
+con ERR_NO_DISPLAY  : int64 := 33  // Kein Anzeigegerät vorhanden
+con ERR_BAD_FORMAT  : int64 := 34  // Pixel-Format nicht unterstützt
+con ERR_GPU_FAULT   : int64 := 35  // GPU-Fehler / Command-Buffer ungültig
 ```
 
 ---
@@ -533,6 +536,7 @@ con CLOCK_THREAD : int64 := 3   // CPU-Zeit des aktuellen Threads
 "device"  – sys_ioctl, sys_port_in/out
 "ai"      – KI-Syscalls (0x0800-0x08FF)
 "lyra"    – Lyra-Syscalls (0x0900-0x09FF)
+"display" – Grafik-Syscalls (0x0D00-0x0DFF)
 "admin"   – privilegierte Syscalls (sys_mount, sys_setuid, ...)
 ```
 
@@ -569,6 +573,19 @@ Wenn es nicht geladen ist, geben alle 0x0800-Syscalls `ERR_NOTSUP` zurück.
 | 0x0810 | `sys_graph_edge_add` | `src_node: int64`, `rel_type: int64`, `dst_node: int64`, `meta: ptr`, `meta_len: int64` | Edge-ID | Erzeugt eine gerichtete Kante zwischen zwei Graph-Knoten mit einem semantischen Relationstyp (`GRAPH_REL_*`). Optionale Metadaten (z.B. Gewicht, Zeitstempel) als Byte-Array. Kanten werden in einem Kernel-seitigen B+-Baum indexiert. |
 | 0x0811 | `sys_graph_edge_remove` | `edge_id: int64` | — | Entfernt eine Graph-Kante anhand ihrer ID. Die zugehörigen Knoten bleiben erhalten. Wenn beide Endknoten `GRAPH_PERSIST=0` haben und keine weiteren Kanten besitzen, werden sie GC'd. |
 | 0x0812 | `sys_graph_query` | `node_id: int64`, `rel_type: int64`, `depth: int64`, `results: GraphQueryResult*`, `max: int64` | gefundene Einträge | Traversiert den Wissensgraphen von `node_id` ausgehend entlang `rel_type`-Kanten bis Tiefe `depth` (1 = direkte Nachbarn). `rel_type = GRAPH_REL_ANY (-1)` liefert alle Kantentypen. Ergebnisse absteigend nach Kanten-Gewicht sortiert. |
+| 0x0813 | `sys_ai_ctx_save` | `ctx_fd: fd`, `dir_fd: fd`, `path: pchar` | — | Persistiert den KV-Cache eines Inferenz-Kontexts als IOFS-Page-Cluster. Ermöglicht Lyra, unterbrochene Konversationen sitzungsübergreifend fortzusetzen. Nur Cache-Zustand wird gespeichert, nicht die Modell-Weights. |
+| 0x0814 | `sys_ai_ctx_restore` | `model_fd: fd`, `dir_fd: fd`, `path: pchar` | Context-fd | Lädt einen zuvor gespeicherten KV-Cache und erzeugt einen neuen Context-fd. Das Modell muss identisch zum Modell beim Speichern sein; andernfalls `ERR_BADMODEL`. |
+| 0x0815 | `sys_ai_cancel` | `job_fd: fd` | — | Bricht eine laufende asynchrone Inferenz ab (Job-fd aus `sys_ai_infer`). Schreibt `NOTIFY_AI_CANCELED` auf den ursprünglichen Notify-fd. Keine Auswirkung wenn Job bereits abgeschlossen. |
+| 0x0816 | `sys_ai_model_pin` | `model_fd: fd` | — | Verhindert das Auslagern eines Modells aus der Kernel-KI-Arena (kein Swap). Kritisch für das Lyra-Basismodell das nie kalt werden darf. Erfordert `CAP_ADMIN` oder `"lyra"`-Pledge. |
+| 0x0817 | `sys_ai_model_unpin` | `model_fd: fd` | — | Gibt ein zuvor gepinntes Modell wieder für das Swap-System frei. |
+| 0x0818 | `sys_ai_batch_infer` | `ctx_fd: fd`, `prompts_fd: fd`, `count: int64`, `results_fd: fd`, `opts: AiInferOpts*` | Batch-Job-fd | Reicht `count` Prompts in einem GPU-Batch ein. Prompts werden aus `prompts_fd` als Array von `(ptr, len)`-Paaren gelesen. Ergebnisse landen sequentiell in `results_fd`. GPU-Batching erhöht den Durchsatz bei parallelen Anfragen drastisch. |
+| 0x0819 | `sys_ai_adapter_load` | `model_fd: fd`, `dir_fd: fd`, `path: pchar`, `flags: int64` | Adapter-fd | Lädt einen LoRA-Adapter aus `path` und aktiviert ihn auf `model_fd`. Mehrere Adapter können gestapelt werden. `ADAPTER_MERGE=1` bäckt die Gewichte direkt ein (irreversibel, spart Laufzeit). |
+| 0x081A | `sys_ai_adapter_unload` | `adapter_fd: fd` | — | Entfernt einen LoRA-Adapter vom zugehörigen Modell und gibt die Adapter-Gewichte frei. |
+| 0x081B | `sys_ai_classify` | `model_fd: fd`, `text: ptr`, `text_len: int64`, `labels: pchar*`, `label_count: int64`, `scores_out: f32*` | Index des gewählten Labels | Schnelle Klassifikation ohne Textgenerierung. Gibt den Index des wahrscheinlichsten Labels zurück; `scores_out` enthält alle Wahrscheinlichkeitswerte. Hauptsächlich für die Semantische Firewall (Intent-Klassifikation PUBLIC/INTERNAL/CONFIDENTIAL/SECRET). |
+| 0x081C | `sys_ai_speech_to_text` | `model_fd: fd`, `audio_fd: fd`, `sample_rate: int64`, `result_fd: fd`, `opts: AiInferOpts*` | STT-Job-fd | Transkribiert Audio-Samples aus `audio_fd` (PCM-S16LE) zu UTF-8-Text in `result_fd`. Basis für Lyras Spracheingabe. Asynchron; Abschluss via `NOTIFY_AI_DONE`. |
+| 0x081D | `sys_ai_text_to_speech` | `model_fd: fd`, `text: ptr`, `text_len: int64`, `audio_fd: fd`, `sample_rate_out: int64*` | TTS-Job-fd | Synthetisiert Sprache aus `text` als PCM-S16LE-Samples in `audio_fd`. `*sample_rate_out` enthält die Ausgangs-Abtastrate. Basis für Lyras Sprachausgabe. |
+| 0x081E | `sys_graph_node_info` | `node_id: int64`, `info_out: GraphNodeInfo*` | — | Liest Metadaten eines einzelnen Wissensgraph-Knotens (Typ, Payload-Größe, Kanten-Anzahl, Embedding-Dimension, Zeitstempel). Ergänzt `sys_graph_query` um direkten Einzelknoten-Zugriff. |
+| 0x081F | `sys_graph_node_delete` | `node_id: int64`, `flags: int64` | — | Löscht einen Knoten explizit. `NODE_DELETE_CASCADE=1`: entfernt auch alle ausgehenden Kanten. Ohne Flag: `ERR_BUSY` wenn noch eingehende Kanten vorhanden. Löst anschließend einen GC-Zyklus aus. |
 
 **AI-Inferenz-Flags:**
 
@@ -596,6 +613,18 @@ con GRAPH_REL_SEMANTIC    : int64 := 6    // Semantische Ähnlichkeit (KNN-basie
 con GRAPH_REL_DEPENDS_ON  : int64 := 7    // Abhängigkeit (Code-Modul, Datei)
 ```
 
+**LoRA-Adapter-Flags:**
+
+```lyx
+con ADAPTER_MERGE : int64 := 1   // Gewichte einbacken (irreversibel, eliminiert Laufzeit-Overhead)
+```
+
+**Graph-Node-Delete-Flags:**
+
+```lyx
+con NODE_DELETE_CASCADE : int64 := 1   // Alle ausgehenden Kanten mitlöschen
+```
+
 ---
 
 ### Kategorie 0x0900 – Lyra Agent Interface
@@ -618,6 +647,46 @@ Normale Anwendungen nutzen sie nicht direkt — sie kommunizieren mit Lyra
 | 0x0909 | `sys_context_push` | `frame: ptr`, `frame_len: int64` | — | Schiebt einen Kontext-Frame auf den Kernel-Kontext-Stack von Lyra (Context Graph, WP17). Wird genutzt um "was gerade passiert" zu kommunizieren. |
 | 0x090A | `sys_context_pop` | — | — | Entfernt den obersten Kontext-Frame. |
 | 0x090B | `sys_timeline_query` | `from_ns: int64`, `to_ns: int64`, `filter_vec: f32*`, `dim: int64`, `results: TimelineResult*`, `max: int64` | gefundene Einträge | Sucht im Kern-Wissensgraphen nach Ereignissen innerhalb des Zeitfensters `[from_ns, to_ns]` (CLOCK_REAL). Optionaler `filter_vec` (Embedding-Dimension `dim > 0`) schränkt auf semantisch ähnliche Ereignisse ein. Ermöglicht Queries wie "Zeige alles vom Montag als ich an Projekt Alpha gearbeitet habe". `from_ns = 0` → unbegrenzt zurück. |
+| 0x090C | `sys_lyra_announce` | `text: pchar`, `text_len: int64`, `icon_fd: fd`, `duration_ns: int64`, `flags: int64` | Announce-ID | Zeigt eine Lyra-Statusmeldung an (Toast/Banner). `duration_ns = 0` = bleibt bis zum expliziten Dismiss. `icon_fd = -1` = kein Icon. `ANNOUNCE_URGENT=1` zeigt die Meldung auch über Vollbild-Apps. Lyra kündigt damit an was sie gerade tut ("Ich fülle das Formular aus..."). |
+| 0x090D | `sys_lyra_confirm` | `action_desc: pchar`, `desc_len: int64`, `opts: LyraConfirmOpts*`, `timeout_ns: int64` | User-Antwort-Code | **Consent-Gate:** Fragt den User via Kernel-Dialog um Erlaubnis bevor Lyra eine destruktive Aktion ausführt. `action_desc` beschreibt was Lyra tun will ("Bestellung für 42€ abschicken?"). Rückgabe: `CONFIRM_YES=1`, `CONFIRM_NO=2`, `CONFIRM_TIMEOUT=3`. Kernel-seitig erzwungen — Lyra kann das Gate nicht umgehen. Blockiert den Lyra-Thread bis zur Antwort. |
+| 0x090E | `sys_lyra_highlight` | `win_fd: fd`, `node_id: int64`, `color: int64`, `duration_ns: int64` | — | Hebt ein UI-Element optisch hervor (Lyra-Stil: Rahmen + Puls-Animation). Zeigt dem User was Lyra gerade anschaut oder bearbeiten will. `node_id = -1` hebt das gesamte Fenster hervor. Läuft intern über das Overlay-System. |
+| 0x090F | `sys_lyra_cursor` | `shape: int64`, `win_fd: fd` | — | Setzt den Mauszeiger auf einen KI-spezifischen Cursor-Stil. `CURSOR_AI_ACTIVE=10` = animierter KI-Cursor. `CURSOR_DEFAULT=0` = zurück zum normalen Cursor. Signalisiert dem User visuell dass Lyra gerade die Steuerung hat. |
+
+**Lyra-Confirm-Optionen:**
+
+```lyx
+type LyraConfirmOpts = flat struct {
+    yes_label:  [64]uint8;    // Text für "Ja"-Button (Default: "Zulassen")
+    no_label:   [64]uint8;    // Text für "Nein"-Button (Default: "Ablehnen")
+    detail:     [512]uint8;   // Optionaler Detailtext (leer = keiner)
+    risk_level: int64;        // 0=niedrig, 1=mittel, 2=hoch → steuert Dialog-Stil
+};
+```
+
+**Confirm-Antwort-Codes:**
+
+```lyx
+con CONFIRM_YES     : int64 := 1   // User hat zugestimmt
+con CONFIRM_NO      : int64 := 2   // User hat abgelehnt
+con CONFIRM_TIMEOUT : int64 := 3   // Timeout abgelaufen (Lyra behandelt wie NO)
+```
+
+**Announce-Flags:**
+
+```lyx
+con ANNOUNCE_URGENT   : int64 := 1   // Über Vollbild-Apps hinaus sichtbar
+con ANNOUNCE_PROGRESS : int64 := 2   // Zeigt Fortschrittsbalken
+con ANNOUNCE_SILENT   : int64 := 4   // Kein Ton / keine Vibration
+```
+
+**Lyra-Cursor-Stile:**
+
+```lyx
+con CURSOR_DEFAULT   : int64 := 0    // Standard-Benutzer-Cursor
+con CURSOR_AI_ACTIVE : int64 := 10   // Animierter KI-Cursor (Lyra steuert)
+con CURSOR_AI_THINK  : int64 := 11   // KI-Denk-Cursor (Lyra überlegt)
+con CURSOR_AI_DONE   : int64 := 12   // KI-Fertig-Cursor (kurz nach Aktion)
+```
 
 ---
 
@@ -715,6 +784,195 @@ con IOFS_TOMBSTONE      : int64 := 0x10   // CoW-Forwarding: neue LBA in Payload
 
 // Page-Embedding-Dimension (384-dim = 1536 Bytes, passt in Meta-Page)
 con IOFS_EMBED_DIM : int64 := 384
+```
+
+---
+
+### Kategorie 0x0D00 — Display, Fenster & Eingabe
+
+**Design-Entscheidung:** Lyx OS kennt keinen Display-Server und kein Protokoll-Socket
+(kein X11, kein Wayland-Protokoll). Der Kernel verwaltet Display-Hardware,
+Surface-Puffer (GPU-zugänglich), VSync-Signale und Eingabe-Streams direkt als
+Kernel-Objekte hinter fds. **Lyra** übernimmt als privilegierter Compositor-Prozess
+(benötigt `"display"`-Pledge) alle Layout- und Z-Order-Entscheidungen.
+
+Anwendungen sprechen direkt mit dem Kernel — kein Protokoll-Overhead, kein
+IPC-Roundtrip. Eine Anwendung erstellt ein Fenster, bekommt einen Surface-fd,
+zeichnet (CPU oder GPU) und ruft `sys_surface_present` auf. Der Rest ist Lyra.
+
+**Sub-Gruppen:**
+
+| Bereich | Inhalt |
+|---------|--------|
+| 0x0D00–0x0D02 | Display-Verwaltung |
+| 0x0D03–0x0D07 | Surface-Verwaltung (Pixel-Puffer) |
+| 0x0D08–0x0D0E | Fenster-Verwaltung (Compositor-Interface) |
+| 0x0D0F–0x0D10 | Eingabe |
+| 0x0D11–0x0D12 | GPU-Beschleunigung |
+
+| Nr | Name | Argumente | rdx-Rückgabe | Beschreibung |
+|----|------|-----------|--------------|--------------|
+| 0x0D00 | `sys_display_open` | `display_id: int64`, `flags: int64` | Display-fd | Öffnet ein Display-Gerät. `display_id = 0` = primäres Display. Erfordert `"display"`-Pledge. Das zurückgegebene fd ist der Ankerpunkt für Surfaces und VSync. |
+| 0x0D01 | `sys_display_info` | `display_fd: fd`, `info_out: DisplayInfo*` | — | Schreibt Auflösung, Refresh-Rate, DPI, Pixel-Format und Flags (HDR, Touch, primär) in `info_out`. |
+| 0x0D02 | `sys_display_list` | `ids_out: int64*`, `max: int64` | Anzahl Displays | Füllt `ids_out` mit allen verfügbaren Display-IDs. Ermöglicht Multi-Monitor-Erkennung. |
+| 0x0D03 | `sys_surface_create` | `display_fd: fd`, `width: int64`, `height: int64`, `format: int64`, `flags: int64` | Surface-fd | Alloziert einen GPU-zugänglichen Pixel-Puffer in der angegebenen Auflösung und im angegebenen Format (`PIX_*`). `SURF_DOUBLE_BUFFER=4` legt automatisch Front + Back Buffer an. |
+| 0x0D04 | `sys_surface_map` | `surface_fd: fd` | Pixel-Puffer-Adresse | Mappt den Back-Buffer einer Surface als beschreibbare Speicherseiten in den Adressraum. Ermöglicht CPU-Drawing. Nach `sys_surface_present` ist die Adresse weiterhin gültig (Double-Buffering tauscht intern). |
+| 0x0D05 | `sys_surface_unmap` | `surface_fd: fd` | — | Hebt das CPU-Mapping auf. Die Surface selbst bleibt erhalten; nur der Userspace-Zeiger wird ungültig. |
+| 0x0D06 | `sys_surface_present` | `surface_fd: fd`, `win_fd: fd`, `damage: DamageRect*`, `damage_count: int64` | Frame-ID | Übergibt die Surface an den Compositor (Lyra) zur Darstellung im Fenster `win_fd`. `damage` gibt die veränderten Rechtecke an (0/NULL = gesamte Surface). Compositor wartet auf den nächsten VSync. `NOTIFY_VSYNC` wird geschrieben wenn der Frame auf dem Display erscheint. |
+| 0x0D07 | `sys_vsync_wait` | `display_fd: fd`, `timeout_ns: int64` | Frame-ID | Blockiert bis zum nächsten vertikalen Sync-Puls des Displays. Gibt eine monoton steigende Frame-ID zurück. Nützlich für zeitpräzise Animation ohne Polling. `ERR_TIMEOUT` bei Ablauf der Frist. |
+| 0x0D08 | `sys_window_create` | `display_fd: fd`, `title: pchar`, `opts: WindowOpts*` | Win-fd | Fordert beim Compositor ein Fenster an. Lyra entscheidet über tatsächliche Position und Größe (respektiert `opts` als Hint wenn `WIN_LYRA_MANAGED` nicht gesetzt). Schreibt `NOTIFY_WIN_CLOSE`, `NOTIFY_WIN_RESIZE` und `NOTIFY_WIN_FOCUS_*` auf `opts.notify_fd`. |
+| 0x0D09 | `sys_window_resize` | `win_fd: fd`, `width: int64`, `height: int64` | — | Bittet den Compositor, das Fenster auf die neue Größe zu ändern. Bei `WIN_LYRA_MANAGED`: Lyra kann den Wunsch ignorieren. Bei manuell verwalteten Fenstern: sofortige Wirkung. |
+| 0x0D0A | `sys_window_move` | `win_fd: fd`, `x: int64`, `y: int64` | — | Setzt die Fensterposition (in Display-Pixeln, Ursprung = oben links). Wie `sys_window_resize` ist dies ein Hint wenn `WIN_LYRA_MANAGED` gesetzt. |
+| 0x0D0B | `sys_window_show` | `win_fd: fd`, `mode: int64` | — | Ändert den Sichtbarkeitszustand des Fensters. `mode`: `WIN_SHOW=0`, `WIN_HIDE=1`, `WIN_MINIMIZE=2`, `WIN_MAXIMIZE=3`, `WIN_FULLSCREEN=4`, `WIN_RESTORE=5`. |
+| 0x0D0C | `sys_window_destroy` | `win_fd: fd` | — | Entfernt das Fenster aus dem Compositor. Der zugehörige Surface-fd wird implizit freigegeben. Schreibt `NOTIFY_WIN_CLOSE` auf den Notify-fd bevor der fd ungültig wird. |
+| 0x0D0D | `sys_window_title` | `win_fd: fd`, `title: pchar` | — | Ändert den Fenstertitel. Lyra wertet den Titel semantisch aus (z.B. für Task-Switching-Ansagen). |
+| 0x0D0E | `sys_window_surface` | `win_fd: fd` | Surface-fd | Gibt den Surface-fd zurück der diesem Fenster zugeordnet ist. Wird automatisch angelegt wenn das Fenster erzeugt wurde; kann auch manuell via `sys_surface_create` + manueller Übergabe gesetzt werden. |
+| 0x0D0F | `sys_input_open` | `device_type: int64`, `flags: int64` | Input-fd | Öffnet einen Eingabekanal für den angegebenen Gerätetyp (`INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_TOUCH`, `INPUT_STYLUS`, `INPUT_GAMEPAD`). Events werden im Kernel gepuffert. `POLL_IN` auf dem fd wenn Events verfügbar. |
+| 0x0D10 | `sys_input_read` | `input_fd: fd`, `events: InputEvent*`, `max: int64` | gelesene Events | Liest bis zu `max` Eingabeereignisse in das `events`-Array. `0` = kein Event vorhanden (non-blocking). Jedes Event enthält Typ, Zeitstempel, Koordinaten, Modifier-Bits und Druck (für Stylus/Touch). |
+| 0x0D11 | `sys_gpu_submit` | `surface_fd: fd`, `cmds: ptr`, `cmd_len: int64` | Fence-ID | Reicht einen GPU-Command-Buffer zur Ausführung auf der Surface ein. Format und Inhalt von `cmds` sind GPU-spezifisch (Treiber-ABI). Rückgabe: Fence-ID für `sys_gpu_fence_wait`. |
+| 0x0D12 | `sys_gpu_fence_wait` | `fence_id: int64`, `timeout_ns: int64` | — | Blockiert bis der GPU den Command-Buffer mit der angegebenen Fence-ID abgearbeitet hat. `ERR_TIMEOUT` bei Fristablauf. `ERR_GPU_FAULT` wenn der GPU einen Fehler gemeldet hat. |
+
+**Display-Flags:**
+
+```lyx
+con DISP_HDR     : int64 := 1   // Display unterstützt High Dynamic Range
+con DISP_TOUCH   : int64 := 2   // Touch-Display (integriert)
+con DISP_PRIMARY : int64 := 4   // Primäres Display
+con DISP_EXTERNAL: int64 := 8   // Extern angeschlossen (HDMI, DP, USB-C)
+```
+
+**Pixel-Formate:**
+
+```lyx
+con PIX_ARGB8888 : int64 := 1   // 32-bit: Alpha/R/G/B je 8 Bit (Standard)
+con PIX_XRGB8888 : int64 := 2   // 32-bit: Padding/R/G/B (kein Alpha)
+con PIX_RGB565   : int64 := 3   // 16-bit: 5/6/5 Bit (Embedded-Displays)
+con PIX_A8       : int64 := 4   // 8-bit Alpha only (Masken-Surfaces)
+```
+
+**Surface-Flags:**
+
+```lyx
+con SURF_GPU_READABLE  : int64 := 1   // GPU kann Pixel lesen (für Compositing)
+con SURF_GPU_WRITABLE  : int64 := 2   // GPU kann Pixel schreiben (für GPU-Rendering)
+con SURF_DOUBLE_BUFFER : int64 := 4   // Front + Back Buffer; Present tauscht sie
+```
+
+**Fenster-Sichtbarkeitsmodi:**
+
+```lyx
+con WIN_SHOW       : int64 := 0   // Normal anzeigen
+con WIN_HIDE       : int64 := 1   // Verstecken (kein Taskbar-Eintrag)
+con WIN_MINIMIZE   : int64 := 2   // Minimieren (im Taskbar)
+con WIN_MAXIMIZE   : int64 := 3   // Maximieren (gesamte Display-Fläche)
+con WIN_FULLSCREEN : int64 := 4   // Exklusiv-Vollbild (kein Compositor-Overlay)
+con WIN_RESTORE    : int64 := 5   // Zur vorherigen Größe zurückkehren
+```
+
+**Fenster-Optionen (WindowOpts.flags):**
+
+```lyx
+con WIN_RESIZABLE    : int64 := 1   // Benutzer kann Größe ziehen
+con WIN_BORDERLESS   : int64 := 2   // Kein Fensterrahmen (eigene Dekoration)
+con WIN_TRANSPARENT  : int64 := 4   // Compositor compositet Alpha-Kanal durch
+con WIN_ALWAYS_TOP   : int64 := 8   // Immer über anderen Fenstern
+con WIN_LYRA_MANAGED : int64 := 16  // Lyra entscheidet Position/Größe (Standard AI-OS)
+con WIN_NO_SHADOW    : int64 := 32  // Kein Schatten durch Compositor
+```
+
+**Eingabegeräte:**
+
+```lyx
+con INPUT_KEYBOARD : int64 := 1
+con INPUT_MOUSE    : int64 := 2
+con INPUT_TOUCH    : int64 := 3
+con INPUT_STYLUS   : int64 := 4
+con INPUT_GAMEPAD  : int64 := 5
+```
+
+**Eingabe-Event-Typen:**
+
+```lyx
+con EV_KEY_PRESS    : int64 := 1   // Taste gedrückt
+con EV_KEY_RELEASE  : int64 := 2   // Taste losgelassen
+con EV_MOUSE_MOVE   : int64 := 3   // Maus bewegt
+con EV_MOUSE_BUTTON : int64 := 4   // Maustaste gedrückt/losgelassen
+con EV_MOUSE_SCROLL : int64 := 5   // Mausrad
+con EV_TOUCH_DOWN   : int64 := 6   // Berührung beginnt
+con EV_TOUCH_MOVE   : int64 := 7   // Berührung bewegt sich
+con EV_TOUCH_UP     : int64 := 8   // Berührung endet
+```
+
+---
+
+### Kategorie 0x0D13–0x0D1D — Lyra als GUI-Akteur
+
+Wenn Lyra auf der Oberfläche handelt (anstelle des Users), gelten drei
+Anforderungen die über normale Grafik-Syscalls hinausgehen:
+
+1. **Sehen:** Lyra muss den Bildschirminhalt lesen (Snapshot für Vision-AI).
+2. **Verstehen:** Lyra muss UI-Elemente semantisch kennen — nicht nur Pixel,
+   sondern "Das ist ein Submit-Button" (Accessibility-Baum).
+3. **Handeln:** Lyra muss synthetische Events einschleusen und eigene
+   Overlay-Schichten rendern.
+
+**Agency-Kontext:** Der Kernel unterscheidet explizit zwischen User-Eingabe und
+KI-Eingabe. Jeder synthetische Input via `sys_input_inject` wird mit dem
+Lyra-Prozess-fd markiert. Anwendungen können via `InputEvent.modifiers`-Bit
+`EV_SOURCE_AI=0x8000` erkennen ob Lyra oder der Mensch steuert. Alle Lyra-UI-Aktionen
+schreiben automatisch einen `sys_trace_event`-Eintrag (vollständiger Audit-Trail).
+
+**Consent-Gate:** Für destructive Aktionen (Löschen, Senden, Kaufen) muss Lyra
+`sys_lyra_confirm` aufrufen. Der User muss explizit bestätigen bevor der Kernel
+die Aktion freigibt. Diese Bestätigung ist kernel-seitig erzwungen — Lyra kann sie
+nicht selbst fälschen.
+
+| Nr | Name | Argumente | rdx-Rückgabe | Beschreibung |
+|----|------|-----------|--------------|--------------|
+| 0x0D13 | `sys_window_list` | `out: int64*`, `max: int64` | Anzahl Fenster | Füllt `out` mit den win_fds aller sichtbaren Fenster (nach Z-Order, vorderstes zuerst). Erfordert `"display"`-Pledge. Lyras Einstiegspunkt um die aktuelle UI-Landschaft zu verstehen. |
+| 0x0D14 | `sys_window_info` | `win_fd: fd`, `info_out: WindowInfo*` | — | Liest Metadaten eines Fensters: Titel, Bounds (x/y/width/height), Owner-PID, Fokus-Status und Accessibility-Typ. Ermöglicht Lyra das gezielte Ansteuern eines bestimmten App-Fensters. |
+| 0x0D15 | `sys_window_focus` | `win_fd: fd` | — | Gibt dem Fenster den Eingabefokus. Erfordert `"display"`-Pledge. Notwendige Vorbedingung vor `sys_input_inject` wenn das Zielfenster nicht bereits fokussiert ist. Schreibt `NOTIFY_WIN_FOCUS_IN` / `NOTIFY_WIN_FOCUS_OUT` auf betroffene Fenster. |
+| 0x0D16 | `sys_input_inject` | `win_fd: fd`, `events: InputEvent*`, `count: int64` | — | Schleust synthetische Eingabeereignisse in das Fenster ein. Erfordert `"display"`-Pledge. Der Kernel setzt automatisch `EV_SOURCE_AI=0x8000` im `modifiers`-Feld — die empfangende App kann Lyra-Input von User-Input unterscheiden. Jeder Aufruf schreibt einen Audit-`trace_event`. |
+| 0x0D17 | `sys_display_snapshot` | `display_fd: fd`, `surface_fd: fd`, `flags: int64` | — | Rendert den komponierten Bildschirminhalt des Displays in `surface_fd`. Lyra nutzt dies als Eingabe für Vision-AI (`sys_ai_infer` mit multimodalen Modellen). `SNAP_CURSOR=1` schließt den Mauszeiger ein. `SNAP_NOCURSOR=2` blendet ihn aus. |
+| 0x0D18 | `sys_window_snapshot` | `win_fd: fd`, `surface_fd: fd`, `flags: int64` | — | Wie `sys_display_snapshot`, aber nur für ein einzelnes Fenster. Auch wenn das Fenster teilweise verdeckt ist wird der vollständige Fensterinhalt geliefert (Off-Screen-Rendering). |
+| 0x0D19 | `sys_overlay_create` | `win_fd: fd`, `x: int64`, `y: int64`, `width: int64`, `height: int64`, `flags: int64` | Overlay-fd | Erzeugt ein transparentes Overlay über einem Fenster. Lyra zeichnet in die Overlay-Surface (eigener Surface-fd via `sys_window_surface`). Der Compositor rendert das Overlay immer über dem Zielfenster. `OVL_CLICK_THROUGH=1`: Mausklicks gehen durch das Overlay ans Zielfenster. `OVL_HIGHLIGHT=2`: vordefinierter Highlight-Effekt (kein eigenes Drawing nötig). |
+| 0x0D1A | `sys_overlay_destroy` | `overlay_fd: fd` | — | Entfernt ein Overlay. |
+| 0x0D1B | `sys_acc_tree` | `win_fd: fd`, `buf: ptr`, `buf_size: int64` | geschriebene Bytes | Liest den Accessibility-Baum eines Fensters als Array von `AccNode`-Strukturen. Lyra-native Apps (lyxc-Runtime) exportieren diesen automatisch. Der Baum beschreibt alle sichtbaren UI-Elemente semantisch: "Button: Senden", "TextInput: leer", "Label: Preis 42€". Lyra muss damit nicht pixelweise analysieren. |
+| 0x0D1C | `sys_acc_action` | `win_fd: fd`, `node_id: int64`, `action: int64`, `data: ptr`, `data_len: int64` | — | Führt eine Aktion auf einem UI-Element aus. `ACC_CLICK=1`: Klick auf Button/Link. `ACC_FOCUS=2`: Element fokussieren. `ACC_SET_VALUE=3`: Text in Eingabefeld setzen (`data` = UTF-8-String). `ACC_SCROLL=4`: Scroll-Position setzen. Jede Aktion schreibt einen Audit-`trace_event` mit node_id und Aktion. `ERR_PERM` wenn die App `"ai"`-Pledge nicht hat. |
+| 0x0D1D | `sys_acc_subscribe` | `win_fd: fd`, `notify_fd: fd` | — | Abonniert `NOTIFY_ACC_CHANGED`-Events auf `notify_fd` wenn sich der Accessibility-Baum des Fensters ändert (neue Elemente, Zustandsänderungen, Text-Updates). Lyra nutzt dies um reaktiv auf UI-Änderungen zu reagieren (z.B. "Warte bis das Ladebalken-Element verschwindet"). |
+
+**Agency-Flags für InputEvent.modifiers:**
+
+```lyx
+con EV_SOURCE_USER : int64 := 0x0000   // Physischer User-Input (Standard)
+con EV_SOURCE_AI   : int64 := 0x8000   // Lyra-injizierter synthetischer Input
+```
+
+**Overlay-Flags:**
+
+```lyx
+con OVL_CLICK_THROUGH : int64 := 1   // Mausevents gehen ans Zielfenster durch
+con OVL_HIGHLIGHT     : int64 := 2   // Vordefinierter Highlight-Effekt (Lyra-Stil)
+con OVL_ALWAYS_TOP    : int64 := 4   // Über allen anderen Overlays
+```
+
+**Accessibility-Aktionen:**
+
+```lyx
+con ACC_CLICK     : int64 := 1   // Klick auf Element (Button, Link, Checkbox)
+con ACC_FOCUS     : int64 := 2   // Eingabefokus setzen
+con ACC_SET_VALUE : int64 := 3   // Wert setzen (TextInput, Slider, Dropdown)
+con ACC_SCROLL    : int64 := 4   // Scroll-Position setzen (data = int64 Pixel-Offset)
+con ACC_EXPAND    : int64 := 5   // Ausklappen (Accordion, Dropdown, TreeNode)
+con ACC_COLLAPSE  : int64 := 6   // Einklappen
+```
+
+**Snapshot-Flags:**
+
+```lyx
+con SNAP_CURSOR   : int64 := 1   // Mauszeiger in Snapshot einschließen
+con SNAP_NOCURSOR : int64 := 2   // Mauszeiger ausblenden
+con SNAP_HDR      : int64 := 4   // HDR-Ausgabe wenn verfügbar
 ```
 
 ---
@@ -882,6 +1140,118 @@ type GraphQueryResult = flat struct {
     meta:      [128]uint8;
 };
 
+type GraphNodeInfo = flat struct {
+    node_id:    int64;    // Knoten-ID
+    type_flags: int64;    // GRAPH_NODE_* Typ-Bits
+    payload_sz: int64;    // Größe der gespeicherten Nutzdaten in Bytes
+    edge_count: int64;    // Anzahl ausgehender Kanten
+    embed_dim:  int64;    // Embedding-Dimension (0 = kein Embedding vorhanden)
+    ts_create:  int64;    // Erstellungszeitpunkt (CLOCK_REAL ns)
+    ts_modify:  int64;    // Letzter Änderungszeitpunkt
+    ref_count:  int64;    // Anzahl eingehender Kanten (GC-Referenzzähler)
+};
+
+type DisplayInfo = flat struct {
+    display_id:   int64;
+    width_px:     int64;
+    height_px:    int64;
+    refresh_mhz:  int64;    // Refresh-Rate in Millihertz (60000 = 60 Hz)
+    dpi_x:        int64;
+    dpi_y:        int64;
+    pixel_format: int64;    // PIX_* Standardformat des Displays
+    flags:        int64;    // DISP_HDR | DISP_TOUCH | DISP_PRIMARY | DISP_EXTERNAL
+};
+
+type WindowOpts = flat struct {
+    x:          int64;    // Initiale X-Position (Hint für Compositor)
+    y:          int64;    // Initiale Y-Position
+    width:      int64;    // Initiale Breite in Pixeln
+    height:     int64;    // Initiale Höhe in Pixeln
+    min_width:  int64;    // Minimale Breite (0 = kein Limit)
+    min_height: int64;    // Minimale Höhe
+    max_width:  int64;    // Maximale Breite (0 = kein Limit)
+    max_height: int64;    // Maximale Höhe
+    flags:      int64;    // WIN_RESIZABLE | WIN_BORDERLESS | WIN_LYRA_MANAGED usw.
+    notify_fd:  int64;    // fd für NOTIFY_WIN_CLOSE / NOTIFY_WIN_RESIZE / NOTIFY_WIN_FOCUS_*
+};
+
+type InputEvent = flat struct {
+    type:      int64;    // EV_* Ereignistyp
+    ts_ns:     int64;    // Zeitstempel (CLOCK_MONO ns)
+    key:       int64;    // Taste / Button-Index (bei EV_KEY_*, EV_MOUSE_BUTTON)
+    modifiers: int64;    // Modifier-Bits: SHIFT=1, CTRL=2, ALT=4, META=8
+    x:         int64;    // Absolut-X in Pixeln (Maus/Touch; relativ für EV_MOUSE_MOVE)
+    y:         int64;    // Absolut-Y in Pixeln
+    dx:        int64;    // Delta-X (relativ, für Maus-Move und Scroll)
+    dy:        int64;    // Delta-Y
+    pressure:  f32;      // Druckwert 0.0–1.0 (Stylus/Touch; 0 für Keyboard/Maus)
+    touch_id:  int64;    // Berührungs-ID für Multi-Touch (eindeutig pro Finger)
+};
+
+type DamageRect = flat struct {
+    x:      int64;    // Linke Kante des geänderten Rechtecks in Pixeln
+    y:      int64;    // Obere Kante
+    width:  int64;
+    height: int64;
+};
+
+type WindowInfo = flat struct {
+    win_fd:      int64;       // fd des Fensters
+    owner_pid:   int64;       // PID des besitzenden Prozesses
+    title:       [256]uint8;  // Aktueller Fenstertitel (UTF-8)
+    x:           int64;       // Position auf dem Display
+    y:           int64;
+    width:       int64;
+    height:      int64;
+    z_order:     int64;       // Z-Position (0 = vorderstes Fenster)
+    focused:     bool;        // Hat Eingabefokus?
+    visible:     bool;        // Sichtbar (nicht minimiert)?
+    acc_type:    int64;       // Accessibility-Typ des Hauptinhalts
+};
+
+type AccNode = flat struct {
+    node_id:   int64;         // Eindeutige ID innerhalb des Fensters
+    parent_id: int64;         // 0 = Root-Element
+    type:      int64;         // ACC_TYPE_BUTTON, ACC_TYPE_INPUT usw.
+    x:         int64;         // Absolute Bildschirmposition
+    y:         int64;
+    width:     int64;
+    height:    int64;
+    label:     [128]uint8;    // Sichtbarer Text / Aria-Label (UTF-8)
+    value:     [256]uint8;    // Aktueller Wert (z.B. Inhalt eines Textfelds)
+    enabled:   bool;
+    focused:   bool;
+    checked:   bool;          // Für Checkboxen / Radio-Buttons
+    expanded:  bool;          // Für Accordions / Dropdowns
+    child_count: int64;
+};
+
+// Accessibility-Node-Typen
+// (als Konstanten, kein Enum — lyxc kennt keine Enums)
+```
+
+**Accessibility-Node-Typen:**
+
+```lyx
+con ACC_TYPE_BUTTON    : int64 := 1
+con ACC_TYPE_INPUT     : int64 := 2   // Einzeiliges Textfeld
+con ACC_TYPE_TEXTAREA  : int64 := 3   // Mehrzeiliges Textfeld
+con ACC_TYPE_LABEL     : int64 := 4
+con ACC_TYPE_LINK      : int64 := 5
+con ACC_TYPE_IMAGE     : int64 := 6
+con ACC_TYPE_CHECKBOX  : int64 := 7
+con ACC_TYPE_RADIO     : int64 := 8
+con ACC_TYPE_DROPDOWN  : int64 := 9
+con ACC_TYPE_SLIDER    : int64 := 10
+con ACC_TYPE_LIST      : int64 := 11
+con ACC_TYPE_LISTITEM  : int64 := 12
+con ACC_TYPE_MENU      : int64 := 13
+con ACC_TYPE_MENUITEM  : int64 := 14
+con ACC_TYPE_CONTAINER : int64 := 15  // Allgemeiner Container / Panel
+con ACC_TYPE_PROGRESS  : int64 := 16  // Fortschrittsbalken
+con ACC_TYPE_CANVAS    : int64 := 17  // Frei gezeichnete Fläche (kein Baum darunter)
+```
+
 type TimelineResult = flat struct {
     node_id:   int64;    // Knoten-ID im Wissensgraphen
     ts_ns:     int64;    // Zeitstempel des Ereignisses (CLOCK_REAL)
@@ -920,6 +1290,15 @@ con NOTIFY_IRQ          : int64 := 7   // Hardware-IRQ
 con NOTIFY_WATCHPOINT   : int64 := 8   // Hardware-Watchpoint ausgelöst
 con NOTIFY_EMBED_DONE   : int64 := 9   // Async-Embedding (O_SEMANTIC) abgeschlossen
 con NOTIFY_GRAPH_UPDATED: int64 := 10  // Wissensgraph-Kante hinzugefügt/entfernt
+con NOTIFY_WIN_CLOSE    : int64 := 11  // Benutzer hat Fenster geschlossen
+con NOTIFY_WIN_RESIZE   : int64 := 12  // Fenster wurde in der Größe verändert (neue Maße in data)
+con NOTIFY_WIN_FOCUS_IN : int64 := 13  // Fenster hat Eingabefokus erhalten
+con NOTIFY_WIN_FOCUS_OUT: int64 := 14  // Fenster hat Eingabefokus verloren
+con NOTIFY_VSYNC        : int64 := 15  // Vertikaler Sync-Puls (Frame-ID in data)
+con NOTIFY_INPUT_READY  : int64 := 16  // Eingabeereignisse auf einem input_fd verfügbar
+con NOTIFY_AI_CANCELED  : int64 := 17  // KI-Inferenz-Job via sys_ai_cancel abgebrochen
+con NOTIFY_ACC_CHANGED  : int64 := 18  // Accessibility-Baum eines Fensters hat sich geändert
+con NOTIFY_LYRA_CONFIRM : int64 := 19  // User hat auf sys_lyra_confirm geantwortet (data = CONFIRM_*)
 ```
 
 ### Spawn-Flags
@@ -1025,12 +1404,13 @@ if (err != ERR_OK) {
 | 0x0500–0x0504 | Zeit | 5 |
 | 0x0600–0x0609 | Netzwerk | 10 |
 | 0x0700–0x0708 | Sicherheit & Capabilities | 9 |
-| 0x0800–0x0812 | KI & Semantik + Wissensgraph | 19 |
-| 0x0900–0x090B | Lyra Agent Interface | 12 |
+| 0x0800–0x081F | KI & Semantik + Wissensgraph | 32 |
+| 0x0900–0x090F | Lyra Agent Interface + native UI | 16 |
 | 0x0A00–0x0A05 | Debug & Telemetrie | 6 |
 | 0x0B00–0x0B09 | Task & Automatische Parallelität | 10 |
 | 0x0C00–0x0C04 | IOFS: Island & Ocean File System | 5 |
-| **Gesamt** | | **137** |
+| 0x0D00–0x0D1D | Display, Fenster, Eingabe & Lyra-GUI-Agentur | 30 |
+| **Gesamt** | | **182** |
 
 Reservierte Bereiche für spätere Erweiterungen:
 - `0x000E–0x00FF`: Prozess & Threads
@@ -1041,8 +1421,148 @@ Reservierte Bereiche für spätere Erweiterungen:
 - `0x0A06–0x0AFF`: Debug-Erweiterungen
 - `0x0B0A–0x0BFF`: Task-Erweiterungen
 - `0x0C05–0x0CFF`: IOFS-Erweiterungen
-- `0x0D00–0xFFFF`: Zukünftige Kategorien
+- `0x0D13–0x0DFF`: Display-Erweiterungen (Color-Management, HDR, Virtual-Display)
+- `0x0E00–0xFFFF`: Zukünftige Kategorien
 
 ---
 
-*Dokument-Version: 1.2 | Erstellt: 2026-06-09 | Aktualisiert: 2026-06-09 | lyxc-Ziel: `--target=lyxos`*
+---
+
+## 10. Implementierter Ring-3 ABI (aktueller Stand)
+
+Der vorangehende Abschnitt beschreibt den **zukünftigen** ABI-Entwurf mit hex-gruppierten Nummern. Dieser Abschnitt dokumentiert den **tatsächlich implementierten** Ring-3 Syscall-Stand in `kernel/ring3.lyx` (flaches Nummernschema 0–201).
+
+### 10.1 Mechanismus
+
+Ring-3-Prozesse rufen Syscalls via `SYSCALL`-Instruction auf. Der Handler `ring3_r3_deferred` in `bootloader/boot.asm` speichert den Kontext im `r3_sc_block` (physisch-feste 4 KB-Seite, auch von Ring-3 schreibbar):
+
+```
+r3_sc_block Layout (Byte-Offsets):
+  +0:  nr      — Syscall-Nummer (rax beim Eintritt)
+  +8:  a0      — Argument 0 (rdi)
+  +16: a1      — Argument 1 (rsi)
+  +24: a2      — Argument 2 (rdx)
+  +32: a3      — Argument 3 (r10)
+  +40: result  — Rückgabewert (Kernel → Ring-3, nach IRETQ in rdx)
+  +48: rsp3    — Ring-3 RSP
+  +56: rcx3    — Ring-3 RIP (= rcx nach SYSCALL)
+  +64: r11     — Ring-3 RFLAGS
+  +72: rbp3    — Ring-3 RBP
+```
+
+### 10.2 Rückgabe-Konvention
+
+- Ring-3 liest das Ergebnis aus `+40 (result)` nach IRETQ in `rdx`.
+- Fehler: result = `-1`; Erfolg: result = Wert ≥ 0.
+- Keine dedizierten ERR\_\*-Konstanten im aktuellen Kernel — nur -1 / ≥0.
+
+### 10.3 FD-Offset-Konvention
+
+| Ring-3-FD | Bedeutung |
+|-----------|-----------|
+| 0 | Tastatur (stdin, blocking PS/2-Read) |
+| 1 | stdout (vmm\_op41 → COM1 + Framebuffer) |
+| 2 | stderr (reserviert) |
+| ≥ 3 | VFS-FD = Ring-3-FD − 3 |
+
+### 10.4 Syscall-Tabelle (implementiert)
+
+| Nr | Name | Argumente (a0, a1, a2, a3) | Rückgabe | Beschreibung |
+|----|------|-----------------------------|----------|--------------|
+| 0 | `sys_read` | `fd, buf_uva, count` | bytes oder -1 | Lesen von fd. fd=0: blockierender PS/2-Tastatur-Read (1 Byte). fd≥3: VFS-Read. Bei Verzeichnis-FD: DirEntry-Array à 56 Byte. `buf_uva` wird via VmmPhysFromUserVirt übersetzt; large reads über Kernel-Zwischenpuffer. |
+| 1 | `lyx_putchar` | `fd, char_byte, 1` | 1 | Byte auf COM1 + GOP-Framebuffer (vmm\_op41). Bei aktivem Child-Capture: Byte zusätzlich in SHM-Ringpuffer (+16). |
+| 2 | `sys_open` | `path_uva, flags, mode` | r3fd+3 oder -1 | Datei im VFS öffnen. `path_uva` → physisch via VmmPhysFromUserVirt. Rückgabe = VFS-fd+3. |
+| 3 | `sys_close` | `r3fd` | 0 | VFS-FD schließen (`VfsClose(r3fd − 3)`). |
+| 9 | `sys_mmap` | `hint, size, prot, flags` | user\_virt | Virtuelle Seiten allozieren und in Prozess-PML4 mappen. Bump-Allokator ab USER\_HEAP\_BASE (0x10000000). |
+| 24 | `sys_yield` | — | — | Asynchrones Yield: gibt Kontrolle vom Kind-Prozess an den Compositor zurück. Wird in child\_run\_init / child\_run\_once direkt abgefangen — **nicht** durch handle\_r3\_syscall. |
+| 79 | `sys_getcwd` | `buf_phys, size` | len+1 | Aktuelles Arbeitsverzeichnis in buf schreiben (VfsGetCwd). |
+| 80 | `sys_chdir` | `path_uva` | 0 oder -1 | Arbeitsverzeichnis wechseln (VfsChdir). |
+| 81 | `sys_locale_info` | `buf_uva` | Ergebnis | Locale-Zusammenfassung in Puffer schreiben (LocaleSummary). |
+| 82 | `sys_diskinfo` | — | 0 | Festplatten-Info auf COM1 + Framebuffer ausgeben (VfsDiskPrintInfoR3). |
+| 83 | `sys_mkpart` | `disk_id, lba_start, sector_count` | 0 oder -1 | MBR-Partitionseintrag anlegen (VfsMkPart). |
+| 84 | `sys_mkfat32` | `disk_id, lba_start, sector_count` | 0 oder -1 | Partition als FAT32 formatieren (VfsMkFat32). |
+| 85 | `sys_mount` | `vol_id, disk_id, lba_start` | 0 oder -1 | Festplatte als Volume mounten (VfsMountDisk). |
+| 86 | `sys_vol` | `vol_id` | 0 oder -1 | Aktives VFS-Volume wechseln; CWD → "/" (VfsSwitchVolume). |
+| 87 | `sys_gpt` | `disk_id, vol_id_start` | Anzahl Partitionen oder -1 | GPT scannen, FAT32-Partitionen automatisch mounten + Infos ausgeben. |
+| 88 | `sys_partinfo` | `disk_id` | 0 | Partitionstabelle mit freien Lücken ausgeben (VfsDiskMap). |
+| 89 | `sys_mkfat32_part` | `disk_id, part_no` | 0 oder -1 | Partition `part_no` als FAT32 formatieren (VfsMkFat32ByPart). |
+| 90 | `sys_mount_part` | `vol_id, disk_id, part_no` | 0 oder -1 | Partition `part_no` als `vol_id` mounten (VfsMountByPart). |
+| 91 | `sys_spawn_child` | `path_uva, argc, argv_phys` | Exit-Code oder -1 | ELF-Binary als Kind-Prozess laden und **synchron** ausführen. AMD64-ABI-Stack (argc/argv) wird auf Kind-Stack aufgebaut. Blockiert bis zum Abschluss. |
+| 92 | `sys_setenv` | `key_phys, val_phys` | 0 | Umgebungsvariable setzen (VfsEnvSet). |
+| 93 | `sys_getenv` | `key_phys, buf_phys, size` | Länge oder -1 | Umgebungsvariable lesen (VfsEnvGet). |
+| 94 | `sys_envlist` | — | 0 | Alle Umgebungsvariablen auf COM1 + Framebuffer ausgeben (VfsEnvList). |
+| 95 | `sys_write` | `r3fd, buf_uva, count` | bytes oder -1 | In VFS-FD schreiben (VfsWrite). `buf_uva` → physisch via VmmPhysFromUserVirt. |
+| 96 | `sys_rename` | `old_path_uva, new_path_uva` | 0 oder -1 | Datei/Verzeichnis umbenennen (VfsRename). |
+| 97 | `sys_unlink` | `path_uva` | 0 oder -1 | Datei löschen (VfsUnlink). |
+| 98 | `sys_block_open` | `disk_id, flags` | bfd+3 oder -1 | Rohes Block-Device öffnen (VfsBlockOpen). Rückgabe = Block-FD+3. |
+| 99 | `sys_block_read` | `bfd, lba, count, buf_uva` | Ergebnis oder -1 | Sektoren von Block-Device in Benutzerpuffer lesen (VfsBlockRead). |
+| 100 | `sys_block_write` | `bfd, lba, count, buf_uva` | Ergebnis oder -1 | Sektoren aus Benutzerpuffer auf Block-Device schreiben (VfsBlockWrite). |
+| 101 | `sys_block_info` | `bfd, out_uva` | Ergebnis oder -1 | Block-Device-Info lesen: `{sector\_count(8), disk\_id(8), 512(8)}` (VfsBlockInfo). |
+| 102 | `sys_gpt_create` | `disk_id, nsectors, nparts, parts_uva` | 0 oder -1 | GPT-Partitionstabelle anlegen. `parts_uva` → Array von `{lba_start, lba_end}`-Paaren (VfsGptCreate). |
+| 110 | `sys_win_create` | `x, y, w, h` | win\_id oder -1 | Fenster anlegen, SHM-Framebuffer allozieren (w×h×4 Byte physisch kontiguös). |
+| 111 | `sys_win_destroy` | `win_id` | 0 oder -1 | Fenster-Slot freigeben (WIN\_OFF\_STATE → 0). |
+| 112 | `sys_win_raise` | `win_id` | 0 oder -1 | Fenster in den Vordergrund bringen (Z := max\_Z + 1). |
+| 113 | `sys_win_move` | `win_id, x, y` | 0 oder -1 | Fensterposition in der Fenster-Tabelle aktualisieren. |
+| 114 | `sys_win_resize` | `win_id, new_w, new_h` | 0 oder -1 | Fenster-Metadaten aktualisieren (kein FB-Realloc). |
+| 115 | `sys_win_get_fb` | `win_id` | user\_virt oder -1 | Fenster-Framebuffer (SHM) in Prozess-PML4 mappen; liefert user-virtuelle Adresse. |
+| 116 | `sys_vsync_wait` | — | 0 | Busy-wait bis PIT-Frame-Counter sich erhöht (~10 ms bei 100 Hz, vmm\_op48). |
+| 117 | `sys_time_ns` | — | Nanosekunden | Monotone Zeit in ns: PIT-Frame-Counter × 10.000.000. |
+| 118 | `sys_shm_create` | `size` | shm\_id (0–63) oder -1 | Physisch kontiguöse SHM-Seiten allozieren; liefert shm\_id. |
+| 119 | `sys_shm_map` | `shm_id` | user\_virt oder -1 | SHM in Prozess-Adressraum mappen; Ref-Count erhöhen. |
+| 120 | `sys_shm_unmap` | `shm_id` | 0 | Ref-Count verringern; Slot freigeben wenn Ref-Count = 0. |
+| 121 | `sys_event_send` | `pid, type, a, b` | 0 | Event (32 Byte: type/a/b/c) in Ring-Puffer von `pid` schreiben. Max. 8 PIDs × 16 Slots. |
+| 122 | `sys_event_recv` | `out_buf_uva` | 0 oder -1 | Ältestes Event für aktuelle PID lesen: `{type(8), a(8), b(8), c(8)}`. |
+| 124 | `sys_set_console` | `pid, shm_id` | 0 | PutCh-Ausgabe von `pid` in SHM-Ringpuffer umleiten. `shm_id = -1` → trennen. |
+| 125 | `sys_fb_map_user` | `fb_base, fb_width, fb_height, fb_stride` | fb\_phys | GOP-Framebuffer-Seiten user-zugänglich in Prozess-PML4 mappen (identity-map). |
+| 126 | `sys_get_mouse_x` | — | X | PS/2-Maus X-Position (absolut, nach Bounds geclippt, vmm\_op50). |
+| 127 | `sys_get_mouse_y` | — | Y | PS/2-Maus Y-Position (vmm\_op51). |
+| 128 | `sys_get_mouse_btn` | — | Buttons | PS/2-Maus Tastenstand (vmm\_op52). |
+| 129 | `sys_set_mouse_bounds` | `max_x, max_y` | 0 | Maus-Koordinatengrenze setzen (vmm\_op54/55). |
+| 130 | `sys_win_get_table_phys` | — | phys | Physische Basisadresse der Fenster-Tabelle (Compositor-Direktzugriff). |
+| 131 | `sys_kbd_poll` | — | char oder 0 | Non-blocking PS/2-Tastaturlesen (vmm\_op28). 0 = keine Taste verfügbar. |
+| 132 | `sys_event_recv_pid` | `pid_idx, out_buf_uva` | 0 oder -1 | Event für bestimmten PID-Slot lesen (für Compositor-seitige Abfrage fremder PIDs). |
+| 133 | `sys_envlistbuf` | `buf_uva, size` | bytes | Alle Env-Vars als `KEY=VAL\n` in Benutzerpuffer kopieren (VfsEnvListBuf). |
+| 134 | `sys_rtc_read` | — | `(Stunden<<8)\|Minuten` | RTC-Zeit lesen, binär, 24h (vmm\_op61). |
+| 135 | `sys_fstat` | `r3fd, stat_uva` | 0 oder -1 | Datei-Stat auf offenem FD (VfsFstat): `+0=Größe(8), +8=Typ(8; 0=Datei/1=Dir), +16=Cluster(8)`. |
+| 136 | `sys_getpid` | — | PID | Aktuelle Scheduler-PID zurückgeben (vmm\_op49). |
+| 137 | `sys_set_child_out` | `shm_id` | 0 | SHM für Child-stdout-Capture registrieren. Capture ist aktiv während SysSpawnChild; -1 deaktiviert. |
+| 138 | `sys_rtc_datetime` | — | `(fat32\_date<<16)\|fat32\_time` | RTC als FAT32-Format lesen (vmm\_op62). date: Bits[15:9]=Jahr−1980, [8:5]=Monat, [4:0]=Tag. time: Bits[15:11]=Stunden, [10:5]=Minuten, [4:0]=Sekunden/2. |
+| 139 | `sys_mkdir` | `path_uva` | 0 oder -1 | Verzeichnis anlegen (VfsMkdirPath). |
+| 140 | `sys_utime_fd` | `r3fd, mtime` | 0 | Mtime auf offenem FD setzen (VfsUtimeFd). `mtime` im FAT32-Format wie sys\_rtc\_datetime. |
+| 200 | `sys_spawn_async` | `path_uva` | slot (0..1) oder -1 | ELF als **asynchrones** Kind laden und bis zum ersten sys\_yield (nr=24) ausführen. Liefert Slot-Index. Max. 2 gleichzeitige async-Kinder. |
+| 201 | `sys_run_child` | `slot` | 0 (yield) oder Exit-Code | Asynchrones Kind bis zum nächsten sys\_yield oder Beendigung fortsetzen. Rückgabe 0 = Kind hat geyldet; >0 = Exit-Code. |
+
+### 10.5 SHM-Ringpuffer-Format
+
+Für `sys_set_console` und `sys_set_child_out` gilt folgendes Layout der SHM-Seite:
+
+```
++0:  write_pos (int64) — nächste Schreibposition mod 4080
++8:  (reserviert, 8 Byte)
++16: data[4080]        — Byte-Ringpuffer (rohe Zeichen-Ausgabe)
+```
+
+### 10.6 Async-Child-Slots
+
+| Slot | Physische Ladeadresse | PHYS-Konstante |
+|------|----------------------|----------------|
+| 0 | 0x1D00000 (29 MB) | ACHILD0\_PHYS |
+| 1 | 0x1E00000 (30 MB) | ACHILD1\_PHYS |
+
+Jeder Slot hat einen 64-Byte-Kontextblock (achild\_ctx): `{rsp(8), rcx(8), r11(8), rbp(8), cr3(8), heap_virt(8), status(8)}`. status: 0=frei, 1=aktiv, -1=beendet.
+
+### 10.7 Abweichungen vom Future-ABI
+
+| Aspekt | Future-ABI (Abschnitte 2–9) | Implementierter ABI (aktuell) |
+|--------|----------------------------|-------------------------------|
+| Fehlercodes | `rax = ERR_*` (32 Konstanten) | Nur -1 / ≥0, keine dedizierten Codes |
+| Zwei-Register-Rückgabe | `rax = Fehler`, `rdx = Wert` | Einzel-Register: `result` in rdx; rax immer 0 |
+| Syscall-Nummernschema | 0x0000–0x0DFF (hex-Gruppen) | Flach: 0–201 |
+| dir\_fd / AT\_CWD | Immer erstes Argument | Pfad-Syscalls ohne dir\_fd — CWD implizit |
+| FD-Offset | VFS-FD 0 = stdin direkt | Ring-3-FD = VFS-FD + 3 (fd 0–2 reserviert) |
+| CLOEXEC-Default | CLOEXEC per Default | Keine FD-Vererbungs-Kontrolle implementiert |
+| sys\_mmap | Nr. 0x0100 | Nr. 9 |
+
+---
+
+*Dokument-Version: 1.5 | Erstellt: 2026-06-09 | Aktualisiert: 2026-06-17 | lyxc-Ziel: `--target=lyxos`*
