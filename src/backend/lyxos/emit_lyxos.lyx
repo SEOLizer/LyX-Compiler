@@ -180,28 +180,28 @@ pub type EmitLyxOS = class {
     }
 
     // --- _start entry point (LX-03) ---
+    // Stack-Canary-Seed via RTC: Kernel hat KEINEN getrandom-Syscall (§10.4); 0x000C=12
+    // wäre unbelegt → uninitialisierter Canary. Stattdessen RTC-Zeit (138/134) + rsp mischen.
     // Layout (from buffer offset 0):
     //   +0   XOR rbp, rbp           (3 bytes)
-    //   +3   MOV rax, 0x000C        (10 bytes)  sys_getrandom
-    //   +13  LEA rdi, [rsp-8]       (5 bytes)   buf = rsp-8
-    //   +18  MOV esi, 8             (5 bytes)   len = 8
-    //   +23  XOR edx, edx           (2 bytes)   flags = 0
-    //   +25  SYSCALL                (2 bytes)   → canary at [rsp-8]
-    //   +27  CALL rel32             (5 bytes)   ← rel32 at +28, callNextIP = 32
-    //   +32  MOV edi, eax           (2 bytes)   exit code
-    //   +34  MOV rax, 60            (10 bytes)  sys_exit (Linux-kompat, .ring3_exit)
-    //   +44  SYSCALL                (2 bytes)
+    //   +3   MOV rax, 138           (10 bytes)  sys_rtc_datetime → rdx=(date<<16)|time
+    //   +13  SYSCALL                (2 bytes)
+    //   +15  MOV r8, rdx            (3 bytes)
+    //   +18  SHL r8, 32             (4 bytes)
+    //   +22  MOV rax, 134           (10 bytes)  sys_rtc_read → rdx=(h<<8)|m
+    //   +32  SYSCALL                (2 bytes)
+    //   +34  OR  r8, rdx            (3 bytes)
+    //   +37  XOR r8, rsp            (3 bytes)   ASLR-Entropie einmischen
+    //   +40  MOV [rsp-8], r8        (5 bytes)   → canary at [rsp-8]
+    //   +45  CALL rel32             (5 bytes)   ← rel32 at +46, callNextIP = 50
+    //   +50  MOV edi, eax           (2 bytes)   exit code
+    //   +52  MOV rax, 60            (10 bytes)  sys_exit (Linux-kompat, .ring3_exit)
+    //   +62  SYSCALL                (2 bytes)
     pub fn emitStartStub(): void {
         // XOR rbp, rbp
         self.emit8(0x48); self.emit8(0x31); self.emit8(0xED);
-        // sys_getrandom(buf=[rsp-8], len=8, flags=0)  — LyxOS syscall 0x000C
-        self.emitMovRaxImm(0x000C);                             // MOV rax, 12
-        self.emit8(0x48); self.emit8(0x8D); self.emit8(0x7C);  // LEA rdi,
-        self.emit8(0x24); self.emit8(0xF8);                    //   [rsp-8]
-        self.emit8(0xBE); self.emit32(8);                       // MOV esi, 8
-        self.emit8(0x31); self.emit8(0xD2);                     // XOR edx, edx
-        self.emitSyscall();                                     // SYSCALL
-        // CALL main (placeholder, patched at +28)
+        self.emitCanarySeed();                                 // RTC-Seed → [rsp-8]
+        // CALL main (placeholder, patched at +46)
         self.emit8(0xE8); self.emit32(0);
         // sys_exit(rax) — Kernel .ring3_exit erwartet rax=60, rdi=Exit-Code
         self.emit8(0x89); self.emit8(0xC7);                     // MOV edi, eax
@@ -209,31 +209,39 @@ pub type EmitLyxOS = class {
         self.emitSyscall();                                     // SYSCALL
     }
 
-    // LX-36: _start for EVENT_LOOP lifecycle (68 bytes).
-    // Prepends sys_event_loop_init (0x0020) call before CALL main.
-    // CALL rel32 is at byte offset 49; callNextIP = 54.
-    // Caller must use: patchCallRel32(50, mainOff - 54)
+    // Stack-Canary-Seed (42 Bytes) — RTC-Zeit + rsp gemischt nach [rsp-8].
+    // Kein getrandom-Syscall in §10.4; RTC (138/134) ist die einzige Kernel-Entropiequelle.
+    fn emitCanarySeed(): void {
+        self.emitMovRaxImm(138);                               // MOV rax, 138 (sys_rtc_datetime)
+        self.emitSyscall();                                    // → rdx = (date<<16)|time
+        self.emit8(0x49); self.emit8(0x89); self.emit8(0xD0);  // MOV r8, rdx
+        self.emit8(0x49); self.emit8(0xC1); self.emit8(0xE0); self.emit8(0x20); // SHL r8, 32
+        self.emitMovRaxImm(134);                               // MOV rax, 134 (sys_rtc_read)
+        self.emitSyscall();                                    // → rdx = (h<<8)|m
+        self.emit8(0x49); self.emit8(0x09); self.emit8(0xD0);  // OR r8, rdx
+        self.emit8(0x49); self.emit8(0x31); self.emit8(0xE0);  // XOR r8, rsp
+        self.emit8(0x4C); self.emit8(0x89); self.emit8(0x44); self.emit8(0x24); self.emit8(0xF8); // MOV [rsp-8], r8
+    }
+
+    // LX-36: _start for EVENT_LOOP lifecycle (86 bytes).
+    // RTC-Canary-Seed (wie ONE_SHOT), dann sys_event_loop_init (0x0020) vor CALL main.
+    // CALL rel32 is at byte offset 68; callNextIP = 72.
+    // Caller must use: patchCallRel32(68, mainOff - 72)
     pub fn emitStartStubEventLoop(): void {
         // XOR rbp, rbp
         self.emit8(0x48); self.emit8(0x31); self.emit8(0xED);
-        // sys_getrandom canary (same as ONE_SHOT)
-        self.emitMovRaxImm(0x000C);
-        self.emit8(0x48); self.emit8(0x8D); self.emit8(0x7C);
-        self.emit8(0x24); self.emit8(0xF8);
-        self.emit8(0xBE); self.emit32(8);
-        self.emit8(0x31); self.emit8(0xD2);
-        self.emitSyscall();
+        self.emitCanarySeed();                               // +3:  RTC-Seed → [rsp-8], endet +45
         // sys_event_loop_init (0x0020): kernel registers lifecycle sources
         // MOV rdi, imm64 (0 = kernel reads TLV 0x08 from loaded binary)
-        self.emit8(0x48); self.emit8(0xBF); self.emit64(0);  // +27: MOV rdi, 0
-        self.emitMovRaxImm(0x0020);                           // +37: MOV rax, 0x0020
-        self.emitSyscall();                                   // +47: SYSCALL
-        // CALL main placeholder: rel32 at byte 50, callNextIP = 54
-        self.emit8(0xE8); self.emit32(0);                     // +49: CALL rel32
+        self.emit8(0x48); self.emit8(0xBF); self.emit64(0);  // +45: MOV rdi, 0
+        self.emitMovRaxImm(0x0020);                           // +55: MOV rax, 0x0020
+        self.emitSyscall();                                   // +65: SYSCALL
+        // CALL main placeholder: rel32 at byte 68, callNextIP = 72
+        self.emit8(0xE8); self.emit32(0);                     // +67: CALL rel32
         // sys_exit(rax) — Kernel .ring3_exit erwartet rax=60, rdi=Exit-Code
-        self.emit8(0x89); self.emit8(0xC7);                   // +54: MOV edi, eax
-        self.emitMovRaxImm(60);                               // +56: MOV rax, 60 (sys_exit)
-        self.emitSyscall();                                   // +66: SYSCALL
+        self.emit8(0x89); self.emit8(0xC7);                   // +72: MOV edi, eax
+        self.emitMovRaxImm(60);                               // +74: MOV rax, 60 (sys_exit)
+        self.emitSyscall();                                   // +84: SYSCALL
     }
 
     // --- Slot load/store helpers ---
@@ -469,10 +477,15 @@ pub type EmitLyxOS = class {
         else if id == 56 { self.emitVfsSyscall(0x0608, 5, dest); }    // sys_getsockopt
         else if id == 57 { self.emitVfsSyscall(0x0609, 2, dest); }    // sys_shutdown
         // LX-09: Prozess & Threads (0x0000–0x000D) — IDs 58–71
-        else if id == 58 { self.emitVfsSyscall(0x0000, 0, dest); }    // sys_version
+        // sys_version: Kernel hat KEINEN Versions-Syscall (§10.4). 0x0000 würde nr=0=sys_read
+        // treffen (Kollision). Backe stattdessen die Compiler-bekannte LyxOS-ABI-Version ein.
+        else if id == 58 {
+            self.emitMovRaxImm(0x0000000100000000);   // (major<<32)|minor = v1.0 (kein Syscall)
+            self.emitMovSlotFromRax(dest);
+        }
         else if id == 59 { self.emitVfsSyscall(60, 1, dest); }    // sys_exit (Linux-kompat, .ring3_exit)
-        else if id == 60 { self.emitVfsSyscall(231, 1, dest); }   // sys_exit_group (Linux-kompat)
-        else if id == 61 { self.emitVfsSyscall(0x0003, 5, dest); }    // sys_spawn
+        else if id == 60 { self.emitVfsSyscall(60, 1, dest); }    // sys_exit_group → §10.4 sys_exit=60 (Kernel kennt kein 231)
+        else if id == 61 { self.emitVfsSyscall(91, 3, dest); }    // sys_spawn → §10.4 sys_spawn_child=91 (path, argc, argv); 0x0003=sys_close-Kollision vermieden
         else if id == 62 { self.emitVfsSyscall(0x0004, 4, dest); }    // sys_thread_spawn
         else if id == 63 { self.emitVfsSyscall(0x0005, 1, dest); }    // sys_thread_exit
         else if id == 64 { self.emitVfsSyscall(0x0006, 3, dest); }    // sys_wait
