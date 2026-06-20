@@ -10,6 +10,15 @@
 @copyright("2024-2025 Andreas Röne")
 unit std.log;
 
+import std.alloc;
+import std.os;
+
+// FEAT-11: Global log state
+var _log_level:       int64 := 1;   // default INFO
+var _log_fd:          int64 := 1;   // stdout (fd 1); -1 = closed
+var _log_color:       int64 := 0;   // 0=off, 1=ANSI colors
+var _log_timestamp:   int64 := 0;   // 0=off, 1=print timestamp prefix
+
 con LOG_LEVEL_DEBUG: int64 := 0;
 con LOG_LEVEL_INFO: int64 := 1;
 con LOG_LEVEL_WARN: int64 := 2;
@@ -34,10 +43,11 @@ pub fn log_level_to_string(level: int64): pchar {
 // ============================================================================
 
 pub fn set_log_level(level: int64): void {
+  _log_level := level;
 }
 
 pub fn get_log_level(): int64 {
-  return 1;
+  return _log_level;
 }
 
 // ============================================================================
@@ -130,6 +140,182 @@ pub fn unregister_log_callback(): void {
 
 pub fn has_log_callback(): bool {
   return false;
+}
+
+// ============================================================================
+// FEAT-11: Datei-Output, Timestamps, ANSI-Farben, log_Xf Format-Wrapper
+// ============================================================================
+
+// Schaltet auf Datei-Logging um. path="" → zurück auf stdout.
+pub fn log_set_file(path: pchar): bool {
+  if (StrLen(path) == 0) {
+    if (_log_fd != 1) { close(_log_fd); }
+    _log_fd := 1;
+    return true;
+  }
+  var fd: int64 := open(path, 1089, 420);  // O_WRONLY|O_CREAT|O_APPEND, 0644
+  if (fd < 0) { return false; }
+  if (_log_fd != 1) { close(_log_fd); }
+  _log_fd := fd;
+  return true;
+}
+
+pub fn log_set_color(enabled: bool): void {
+  if (enabled) { _log_color := 1; } else { _log_color := 0; }
+}
+
+pub fn log_set_timestamp(enabled: bool): void {
+  if (enabled) { _log_timestamp := 1; } else { _log_timestamp := 0; }
+}
+
+// ANSI-Farbcodes per Level
+fn _log_color_code(level: int64): pchar {
+  if (level == 0) { return "\033[36m"; }   // DEBUG  → Cyan
+  if (level == 1) { return "\033[32m"; }   // INFO   → Grün
+  if (level == 2) { return "\033[33m"; }   // WARN   → Gelb
+  if (level == 3) { return "\033[31m"; }   // ERROR  → Rot
+  return "\033[35m";                        // FATAL  → Magenta
+}
+
+// Schreibt null-terminated String auf _log_fd
+fn _log_write(s: pchar): void {
+  var len: int64 := StrLen(s);
+  write(_log_fd, s as int64, len);
+}
+
+// Zentraler Ausgabe-Kern: Level-Filter, optionaler Timestamp, Farbe, Präfix
+pub fn log_emit(level: int64, msg: pchar): void {
+  if (level < _log_level) { return; }
+
+  if (_log_timestamp != 0) {
+    var sec: int64 := time(0);
+    var tsBuf: int64 := alloc(22);
+    Int64ToStrBuf(sec, tsBuf);
+    _log_write("[");
+    _log_write(tsBuf as pchar);
+    _log_write("] ");
+    free(tsBuf, 22);
+  }
+
+  if (_log_color != 0) {
+    _log_write(_log_color_code(level));
+  }
+
+  _log_write("[");
+  _log_write(log_level_to_string(level));
+  _log_write("] ");
+  _log_write(msg);
+  _log_write("\n");
+
+  if (_log_color != 0) {
+    _log_write("\033[0m");  // Reset
+  }
+}
+
+// Hilfsfunktion: int64 → String direkt in einen Stack-Buffer schreiben
+fn Int64ToStrBuf(n: int64, buf: int64): void {
+  if (n == 0) { poke8(buf, 48); poke8(buf + 1, 0); return; }
+  var val: int64 := n;
+  var neg: int64 := 0;
+  if (n < 0) { neg := 1; val := 0 - n; }
+  var tmp: int64 := alloc(22);
+  var pos: int64 := 0;
+  while (val > 0) { poke8(tmp + pos, 48 + (val % 10)); val := val / 10; pos := pos + 1; }
+  if (neg != 0) { poke8(tmp + pos, 45); pos := pos + 1; }
+  var i: int64 := 0;
+  while (i < pos) { poke8(buf + i, peek8(tmp + (pos - 1 - i))); i := i + 1; }
+  poke8(buf + pos, 0);
+  free(tmp, 22);
+}
+
+// Format-Wrapper: Hängt einen Integer an die Nachricht
+// Hilfsfunktion: kopiert mlen Bytes aus msg nach dest (kein Builtin-StrCopy nötig)
+fn _log_strcpy(dest: int64, msg: pchar, mlen: int64): void {
+  var i: int64 := 0;
+  while (i < mlen) { poke8(dest + i, StrCharAt(msg, i)); i := i + 1; }
+}
+
+pub fn log_debugf(msg: pchar, n: int64): void {
+  if (_log_level > 0) { return; }
+  var mlen: int64 := StrLen(msg);
+  var buf: int64 := alloc(22);
+  Int64ToStrBuf(n, buf);
+  var combined: int64 := alloc(mlen + 24);
+  _log_strcpy(combined, msg, mlen);
+  var i: int64 := 0;
+  while (peek8(buf + i) != 0) { poke8(combined + mlen + i, peek8(buf + i)); i := i + 1; }
+  poke8(combined + mlen + i, 0);
+  log_emit(0, combined as pchar);
+}
+
+pub fn log_infof(msg: pchar, n: int64): void {
+  if (_log_level > 1) { return; }
+  var mlen: int64 := StrLen(msg);
+  var buf: int64 := alloc(22);
+  Int64ToStrBuf(n, buf);
+  var combined: int64 := alloc(mlen + 24);
+  _log_strcpy(combined, msg, mlen);
+  var i: int64 := 0;
+  while (peek8(buf + i) != 0) { poke8(combined + mlen + i, peek8(buf + i)); i := i + 1; }
+  poke8(combined + mlen + i, 0);
+  log_emit(1, combined as pchar);
+}
+
+pub fn log_warnf(msg: pchar, n: int64): void {
+  if (_log_level > 2) { return; }
+  var mlen: int64 := StrLen(msg);
+  var buf: int64 := alloc(22);
+  Int64ToStrBuf(n, buf);
+  var combined: int64 := alloc(mlen + 24);
+  _log_strcpy(combined, msg, mlen);
+  var i: int64 := 0;
+  while (peek8(buf + i) != 0) { poke8(combined + mlen + i, peek8(buf + i)); i := i + 1; }
+  poke8(combined + mlen + i, 0);
+  log_emit(2, combined as pchar);
+}
+
+pub fn log_errorf(msg: pchar, n: int64): void {
+  var mlen: int64 := StrLen(msg);
+  var buf: int64 := alloc(22);
+  Int64ToStrBuf(n, buf);
+  var combined: int64 := alloc(mlen + 24);
+  _log_strcpy(combined, msg, mlen);
+  var i: int64 := 0;
+  while (peek8(buf + i) != 0) { poke8(combined + mlen + i, peek8(buf + i)); i := i + 1; }
+  poke8(combined + mlen + i, 0);
+  log_emit(3, combined as pchar);
+}
+
+// Schreibt eine JSON-strukturierte Zeile in den konfigurierten Log-Sink:
+//   {"level":"info","event":"<event>","<key>":"<value>"}
+// Escaping: nur den Grundfall (keine verschachtelten Anführungszeichen in Strings).
+pub fn log_info_kv(event: pchar, key: pchar, value: pchar): void {
+  var elen: int64 := StrLen(event);
+  var klen: int64 := StrLen(key);
+  var vlen: int64 := StrLen(value);
+  // Puffer: {"level":"info","event":"<e>","<k>":"<v>"}\n + NUL
+  var bsize: int64 := 30 + elen + klen + vlen + 10;
+  var b: int64 := alloc(bsize);
+  var pos: int64 := 0;
+  // {"level":"info","event":"
+  var prefix: pchar := "{\"level\":\"info\",\"event\":\"";
+  var i: int64 := 0;
+  while (peek8(prefix as int64 + i) != 0) { poke8(b + pos, peek8(prefix as int64 + i)); pos := pos + 1; i := i + 1; }
+  i := 0; while (i < elen)  { poke8(b + pos, peek8(event as int64 + i)); pos := pos + 1; i := i + 1; }
+  poke8(b + pos, 34); pos := pos + 1; // "
+  poke8(b + pos, 44); pos := pos + 1; // ,
+  poke8(b + pos, 34); pos := pos + 1; // "
+  i := 0; while (i < klen)  { poke8(b + pos, peek8(key   as int64 + i)); pos := pos + 1; i := i + 1; }
+  poke8(b + pos, 34); pos := pos + 1; // "
+  poke8(b + pos, 58); pos := pos + 1; // :
+  poke8(b + pos, 34); pos := pos + 1; // "
+  i := 0; while (i < vlen)  { poke8(b + pos, peek8(value as int64 + i)); pos := pos + 1; i := i + 1; }
+  poke8(b + pos, 34); pos := pos + 1; // "
+  poke8(b + pos, 125); pos := pos + 1; // }
+  poke8(b + pos, 0);
+  _log_write(b as pchar);
+  _log_write("\n");
+  free(b, bsize);
 }
 
 // End of std/log.lyx
