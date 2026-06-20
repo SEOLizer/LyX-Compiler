@@ -6,6 +6,7 @@
 unit std.regex;
 
 import std.string;
+import std.alloc;
 
 pub fn isAlpha(c: int64): int64 {
   if ((c >= 65) && (c <= 90)) { return 1; }
@@ -337,13 +338,8 @@ pub type RegexProgramInfo = struct {
   captureSlots: int64;
 }
 
-pub type RegexFrame = struct {
-  pc: int64;
-  pos: int64;
-  caps: array[32]int64;
-}
-
-var regexLastCaps: array[32]int64;
+// regexLastCaps: pointer to alloc'd int64[32] buffer, lazy-initialized on first use
+var regexLastCaps: int64 := 0;
 var regexLastCapCount: int64 := 0;
 
 fn regexReadU8(prog: pchar, idx: int64): int64 {
@@ -403,7 +399,7 @@ fn regexClassMatches(prog: pchar, classIndex: int64, c: int64, flags: int64,
   var rangeCount: int64 := regexReadU32(prog, idx + 1);
   var i: int64 := 0;
   var pos: int64 := idx + 5;
-  var match: int64 := 0;
+  var matched2: int64 := 0;
   var ch: int64 := c;
   if ((flags & REGEX_FLAG_IGNORE_CASE) != 0) {
     ch := regexFoldChar(ch);
@@ -415,12 +411,12 @@ fn regexClassMatches(prog: pchar, classIndex: int64, c: int64, flags: int64,
       startc := regexFoldChar(startc);
       endc := regexFoldChar(endc);
     }
-    if ((ch >= startc) && (ch <= endc)) { match := 1; }
+    if ((ch >= startc) && (ch <= endc)) { matched2 := 1; }
     pos := pos + 8;
     i := i + 1;
   }
-  if (negated != 0) { if (match == 0) { return 1; } else { return 0; } }
-  return match;
+  if (negated != 0) { if (matched2 == 0) { return 1; } else { return 0; } }
+  return matched2;
 }
 
 fn regexRunAt(prog: pchar, progLen: int64, info: RegexProgramInfo, text: pchar,
@@ -428,29 +424,30 @@ fn regexRunAt(prog: pchar, progLen: int64, info: RegexProgramInfo, text: pchar,
   if (info.instrStart < 0) { return -1; }
   if (info.captureSlots > REGEX_MAX_CAPTURE_SLOTS) { return -1; }
   var tlen: int64 := StrLen(text);
-  var stackPc: array[256]int64;
-  var stackPos: array[256]int64;
-  var stackCaps: array[8192]int64;
+  // Use alloc'd buffers instead of array[N]int64 (not supported at parse level)
+  var stackPc:   int64 := alloc(256 * 8) as int64;
+  var stackPos:  int64 := alloc(256 * 8) as int64;
+  var stackCaps: int64 := alloc(8192 * 8) as int64;
   var sp: int64 := 0;
   var i: int64 := 0;
   var spBase: int64 := 0;
   while (i < REGEX_MAX_CAPTURE_SLOTS) {
-    stackCaps[i] := -1;
+    poke64(stackCaps + i * 8, 0 - 1);
     i := i + 1;
   }
-  stackPc[0] := 0;
-  stackPos[0] := startPos;
+  poke64(stackPc + 0, 0);
+  poke64(stackPos + 0, startPos);
   sp := 1;
   while (sp > 0) {
     sp := sp - 1;
     spBase := sp * 32;
-    var pc: int64 := stackPc[sp];
-    var pos: int64 := stackPos[sp];
-    var caps: array[32]int64;
+    var pc: int64 := peek64(stackPc + sp * 8);
+    var pos: int64 := peek64(stackPos + sp * 8);
+    var caps: int64 := alloc(32 * 8) as int64;
     i := 0;
     while (i < info.captureSlots) {
       var capIdx: int64 := spBase + i;
-      caps[i] := stackCaps[capIdx];
+      poke64(caps + i * 8, peek64(stackCaps + capIdx * 8));
       i := i + 1;
     }
     while (true) {
@@ -481,13 +478,13 @@ fn regexRunAt(prog: pchar, progLen: int64, info: RegexProgramInfo, text: pchar,
         var t2: int64 := regexReadU32(prog, info.instrStart + pc + 4);
         pc := t1;
         if (sp < REGEX_STACK_MAX) {
-          stackPc[sp] := t2;
-          stackPos[sp] := pos;
+          poke64(stackPc  + sp * 8, t2);
+          poke64(stackPos + sp * 8, pos);
           spBase := sp * 32;
           i := 0;
           while (i < info.captureSlots) {
             var pushIdx: int64 := spBase + i;
-            stackCaps[pushIdx] := caps[i];
+            poke64(stackCaps + pushIdx * 8, peek64(caps + i * 8));
             i := i + 1;
           }
           sp := sp + 1;
@@ -496,9 +493,10 @@ fn regexRunAt(prog: pchar, progLen: int64, info: RegexProgramInfo, text: pchar,
         var t3: int64 := regexReadU32(prog, info.instrStart + pc);
         pc := t3;
       } else if (op == 6) {
+        if (regexLastCaps == 0) { regexLastCaps := alloc(32 * 8) as int64; }
         i := 0;
         while (i < info.captureSlots) {
-          regexLastCaps[i] := caps[i];
+          poke64(regexLastCaps + i * 8, peek64(caps + i * 8));
           i := i + 1;
         }
         regexLastCapCount := info.captureSlots / 2;
@@ -506,7 +504,9 @@ fn regexRunAt(prog: pchar, progLen: int64, info: RegexProgramInfo, text: pchar,
       } else if (op == 7) {
         var slot: int64 := regexReadU32(prog, info.instrStart + pc);
         pc := pc + 4;
-        if (slot >= 0 && slot < info.captureSlots) { caps[slot] := pos; }
+        if (slot >= 0 && slot < info.captureSlots) {
+          poke64(caps + slot * 8, pos);
+        }
       } else if (op == 8) {
         if (pos != 0) {
           if ((flags & REGEX_FLAG_MULTILINE) == 0) { break; }
@@ -648,14 +648,16 @@ pub fn RegexCaptureStart(group: int64): int64 {
   var slot: int64 := group * 2;
   if ((group < 0) || (group >= regexLastCapCount)) { return -1; }
   if ((slot < 0) || (slot >= REGEX_MAX_CAPTURE_SLOTS)) { return -1; }
-  return regexLastCaps[slot];
+  if (regexLastCaps == 0) { return -1; }
+  return peek64(regexLastCaps + slot * 8);
 }
 
 pub fn RegexCaptureEnd(group: int64): int64 {
   var slot: int64 := (group * 2) + 1;
   if ((group < 0) || (group >= regexLastCapCount)) { return -1; }
   if ((slot < 0) || (slot >= REGEX_MAX_CAPTURE_SLOTS)) { return -1; }
-  return regexLastCaps[slot];
+  if (regexLastCaps == 0) { return -1; }
+  return peek64(regexLastCaps + slot * 8);
 }
 
 pub fn RegexCaptureText(dest: pchar, text: pchar, group: int64): pchar {
@@ -700,4 +702,157 @@ pub fn CaptureEnd(group: int64): int64 {
 
 pub fn CaptureText(dest: pchar, text: pchar, group: int64): pchar {
   return RegexCaptureText(dest, text, group);
+}
+
+// Canonical aliases used by regression tests and external code
+pub fn RegexMatch(pattern: pchar, text: pchar): bool {
+  return Match(pattern, text);
+}
+
+pub fn RegexSearch(pattern: pchar, text: pchar): int64 {
+  return Search(pattern, text);
+}
+
+pub fn RegexReplace(pattern: pchar, text: pchar, replacement: pchar): int64 {
+  return Replace(pattern, text, replacement);
+}
+
+// ============================================================================
+// WP-C7: Alternation |, RegexSearchSpan, RegexFindAll
+// ============================================================================
+
+// Returns position of the first top-level '|' at or after pIdx.
+// Top-level means: not inside () or []. Returns -1 if none found.
+fn findAltPos(pattern: pchar, pIdx: int64): int64 {
+  var plen: int64 := StrLen(pattern);
+  var depth: int64 := 0;
+  var i: int64 := pIdx;
+  while (i < plen) {
+    var c: int64 := StrSafeCharAt(pattern, i);
+    if (c == 92 && i + 1 < plen) {
+      i := i + 2;
+    } else if (c == 40) {
+      depth := depth + 1;
+      i := i + 1;
+    } else if (c == 41 && depth > 0) {
+      depth := depth - 1;
+      i := i + 1;
+    } else if (c == 91) {
+      i := i + 1;
+      while (i < plen && StrSafeCharAt(pattern, i) != 93) {
+        if (StrSafeCharAt(pattern, i) == 92 && i + 1 < plen) { i := i + 2; }
+        else { i := i + 1; }
+      }
+      if (i < plen) { i := i + 1; }
+    } else if (c == 124 && depth == 0) {
+      return i;
+    } else {
+      i := i + 1;
+    }
+  }
+  return -1;
+}
+
+// Extract pattern[pFrom..pEnd) into a newly alloc'd string.
+fn subPattern(pattern: pchar, pFrom: int64, pEnd: int64): pchar {
+  var len: int64 := pEnd - pFrom;
+  var buf: pchar := alloc(len + 1);
+  var i: int64 := 0;
+  while (i < len) {
+    StrSetChar(buf, i, StrSafeCharAt(pattern, pFrom + i));
+    i := i + 1;
+  }
+  StrSetChar(buf, len, 0);
+  return buf;
+}
+
+// matchHere with alternation: tries left branch, then right branch if left fails.
+fn matchHereAlt(pattern: pchar, pIdx: int64, text: pchar, tIdx: int64): int64 {
+  var altPos: int64 := findAltPos(pattern, pIdx);
+  if (altPos < 0) {
+    return matchHere(pattern, pIdx, text, tIdx);
+  }
+  var leftPat: pchar := subPattern(pattern, pIdx, altPos);
+  var leftRes: int64 := matchHere(leftPat, 0, text, tIdx);
+  if (leftRes >= 0) { return leftRes; }
+  return matchHereAlt(pattern, altPos + 1, text, tIdx);
+}
+
+// regexSearchFrom with alternation: returns leftmost match start across all branches.
+fn regexSearchFromAlt(pattern: pchar, text: pchar, startIdx: int64): int64 {
+  var altPos: int64 := findAltPos(pattern, 0);
+  if (altPos < 0) {
+    return regexSearchFrom(pattern, text, startIdx);
+  }
+  var plen: int64 := StrLen(pattern);
+  var leftPat: pchar := subPattern(pattern, 0, altPos);
+  var rightPat: pchar := subPattern(pattern, altPos + 1, plen);
+  var leftRes: int64 := regexSearchFrom(leftPat, text, startIdx);
+  var rightRes: int64 := regexSearchFromAlt(rightPat, text, startIdx);
+  if (leftRes < 0) { return rightRes; }
+  if (rightRes < 0) { return leftRes; }
+  if (leftRes <= rightRes) { return leftRes; }
+  return rightRes;
+}
+
+// Find the end position of a match starting at startPos (handles alternation).
+fn regexMatchEndAlt(pattern: pchar, text: pchar, startPos: int64): int64 {
+  var altPos: int64 := findAltPos(pattern, 0);
+  if (altPos < 0) {
+    var pStart: int64 := 0;
+    if (StrSafeCharAt(pattern, 0) == 94) { pStart := 1; }
+    return matchHere(pattern, pStart, text, startPos);
+  }
+  var plen: int64 := StrLen(pattern);
+  var leftPat: pchar := subPattern(pattern, 0, altPos);
+  var leftEnd: int64 := regexMatchEndAlt(leftPat, text, startPos);
+  if (leftEnd >= 0) { return leftEnd; }
+  var rightPat: pchar := subPattern(pattern, altPos + 1, plen);
+  return regexMatchEndAlt(rightPat, text, startPos);
+}
+
+// RegexSearchSpan: find pattern in text and write match start/end to output addresses.
+// startOut and endOut are int64 addresses (e.g. alloc(8)) written via poke64.
+// Returns true if a match was found.
+pub fn RegexSearchSpan(pattern: pchar, text: pchar, startOut: int64, endOut: int64): bool {
+  var start: int64 := regexSearchFromAlt(pattern, text, 0);
+  if (start < 0) { return false; }
+  var end: int64 := regexMatchEndAlt(pattern, text, start);
+  if (end < start) { end := start; }
+  poke64(startOut, start);
+  poke64(endOut, end);
+  return true;
+}
+
+// RegexFindAll: find all non-overlapping matches of pattern in text.
+// out: int64 address of a buffer that receives pchar pointers (8 bytes each).
+//      Caller reads match i as: peek64(out + i*8) cast to pchar.
+// maxMatches: maximum number of matches to store.
+// Returns the number of matches found.
+pub fn RegexFindAll(pattern: pchar, text: pchar, out: int64, maxMatches: int64): int64 {
+  var tlen: int64 := StrLen(text);
+  var count: int64 := 0;
+  var startIdx: int64 := 0;
+  while (count < maxMatches && startIdx <= tlen) {
+    var matchStart: int64 := regexSearchFromAlt(pattern, text, startIdx);
+    if (matchStart < 0) { break; }
+    var matchEnd: int64 := regexMatchEndAlt(pattern, text, matchStart);
+    if (matchEnd < matchStart) { matchEnd := matchStart; }
+    var matchLen: int64 := matchEnd - matchStart;
+    var buf: pchar := alloc(matchLen + 1);
+    var mi: int64 := 0;
+    while (mi < matchLen) {
+      StrSetChar(buf, mi, StrSafeCharAt(text, matchStart + mi));
+      mi := mi + 1;
+    }
+    StrSetChar(buf, matchLen, 0);
+    poke64(out + count * 8, buf as int64);
+    count := count + 1;
+    if (matchEnd > matchStart) {
+      startIdx := matchEnd;
+    } else {
+      startIdx := matchStart + 1;
+    }
+  }
+  return count;
 }

@@ -7,6 +7,10 @@
 @copyright("2026 Andreas Röne")
 unit std.pdf.reader;
 
+import std.alloc;
+import std.pdf.builder;
+import std.pdf.objects;
+
 // ============================================================================
 // Reader struct field offsets (mmap'd block, PDF_RDR_BLOCK_SIZE bytes)
 // ============================================================================
@@ -316,17 +320,17 @@ fn _rdReadFileInto(path: pchar, rdr: int64): int64 {
   var fd: int64 := open(path, 0, 0);
   if (fd < 0) { return 0; }
   var cap: int64 := 524288;  // 512 KB initial
-  var buf: int64 := mmap(0, cap, 3, 34, -1, 0);
+  var buf: int64 := alloc(cap);
   if (buf == 0) { close(fd); return 0; }
   var total: int64 := 0;
   while (1 == 1) {
     if (cap - total < 4096) {
       var newCap: int64 := cap * 2;
-      var newBuf: int64 := mmap(0, newCap, 3, 34, -1, 0);
+      var newBuf: int64 := alloc(newCap);
       if (newBuf == 0) { break; }
       var ci: int64 := 0;
       while (ci < total) { poke8(newBuf + ci, peek8(buf + ci)); ci := ci + 1; }
-      munmap(buf, cap);
+      free(buf, cap);
       buf := newBuf;
       cap := newCap;
     }
@@ -335,7 +339,7 @@ fn _rdReadFileInto(path: pchar, rdr: int64): int64 {
     total := total + n;
   }
   close(fd);
-  if (total == 0) { munmap(buf, cap); return 0; }
+  if (total == 0) { free(buf, cap); return 0; }
   poke64(rdr + PDF_RDR_DATA,    buf);
   poke64(rdr + PDF_RDR_DATASIZE, total);
   poke64(rdr + PDF_RDR_DATACAP,  cap);
@@ -404,7 +408,7 @@ fn _rdParsePdf(rdr: int64): int64 {
   poke64(rdr + PDF_RDR_INFOID, infoId);
 
   // 4. Allocate xrefs array
-  var xrefs: int64 := mmap(0, xrefCount * 8, 3, 34, -1, 0);
+  var xrefs: int64 := alloc(xrefCount * 8);
   if (xrefs == 0) { return 0; }
   var zi: int64 := 0;
   while (zi < xrefCount * 8) { poke8(xrefs + zi, 0); zi := zi + 1; }
@@ -470,23 +474,23 @@ fn _rdParsePdf(rdr: int64): int64 {
 // ============================================================================
 
 pub fn PdfOpen(path: pchar): int64 {
-  var rdr: int64 := mmap(0, PDF_RDR_BLOCK_SIZE, 3, 34, -1, 0);
+  var rdr: int64 := alloc(PDF_RDR_BLOCK_SIZE);
   if (rdr == 0) { return 0; }
   var zi: int64 := 0;
   while (zi < PDF_RDR_BLOCK_SIZE) { poke8(rdr + zi, 0); zi := zi + 1; }
 
   if (_rdReadFileInto(path, rdr) == 0) {
-    munmap(rdr, PDF_RDR_BLOCK_SIZE);
+    free(rdr, PDF_RDR_BLOCK_SIZE);
     return 0;
   }
   if (_rdParsePdf(rdr) == 0) {
     var d: int64 := peek64(rdr + PDF_RDR_DATA);
     var c: int64 := peek64(rdr + PDF_RDR_DATACAP);
-    if (d != 0 && c > 0) { munmap(d, c); }
+    if (d != 0 && c > 0) { free(d, c); }
     var x: int64 := peek64(rdr + PDF_RDR_XREFS);
     var n: int64 := peek64(rdr + PDF_RDR_XREFCOUNT);
-    if (x != 0 && n > 0) { munmap(x, n * 8); }
-    munmap(rdr, PDF_RDR_BLOCK_SIZE);
+    if (x != 0 && n > 0) { free(x, n * 8); }
+    free(rdr, PDF_RDR_BLOCK_SIZE);
     return 0;
   }
   return rdr;
@@ -498,9 +502,9 @@ pub fn PdfClose(rdr: int64): void {
   var c: int64 := peek64(rdr + PDF_RDR_DATACAP);
   var x: int64 := peek64(rdr + PDF_RDR_XREFS);
   var n: int64 := peek64(rdr + PDF_RDR_XREFCOUNT);
-  if (d != 0 && c > 0) { munmap(d, c); }
-  if (x != 0 && n > 0) { munmap(x, n * 8); }
-  munmap(rdr, PDF_RDR_BLOCK_SIZE);
+  if (d != 0 && c > 0) { free(d, c); }
+  if (x != 0 && n > 0) { free(x, n * 8); }
+  free(rdr, PDF_RDR_BLOCK_SIZE);
 }
 
 pub fn PdfRdrPageCount(rdr: int64): int64 {
@@ -549,4 +553,604 @@ pub fn PdfRdrGetCreator(rdr: int64, buf: int64, maxLen: int64): void {
 pub fn PdfRdrGetProducer(rdr: int64, buf: int64, maxLen: int64): void {
   if (rdr == 0) { poke8(buf, 0); return; }
   _rdrCopyMeta(rdr, PDF_RDR_META_PRODUCER, buf, maxLen);
+}
+
+// ============================================================================
+// WP-PDF-19: PDF page import / merge
+// All helpers access reader internals directly (same unit).
+// ============================================================================
+
+// Parse a real number at data[pos] and return value ×100 as int64.
+// Handles integers and simple decimals (up to 2 decimal places).
+fn _rdParseReal100(rdr: int64, pos: int64, outPtr: int64): int64 {
+  var data: int64 := peek64(rdr + PDF_RDR_DATA);
+  var size: int64 := peek64(rdr + PDF_RDR_DATASIZE);
+  var neg:  int64 := 0;
+  if (pos < size && peek8(data + pos) == 45) { neg := 1; pos := pos + 1; }
+  var int100: int64 := 0;
+  while (pos < size && peek8(data + pos) >= 48 && peek8(data + pos) <= 57) {
+    int100 := int100 * 10 + (peek8(data + pos) - 48);
+    pos := pos + 1;
+  }
+  int100 := int100 * 100;
+  if (pos < size && peek8(data + pos) == 46) {
+    pos := pos + 1;
+    var frac: int64 := 0;  var fd: int64 := 0;
+    while (pos < size && peek8(data + pos) >= 48 && peek8(data + pos) <= 57 && fd < 2) {
+      frac := frac * 10 + (peek8(data + pos) - 48);
+      fd := fd + 1;  pos := pos + 1;
+    }
+    if (fd == 1) { frac := frac * 10; }
+    int100 := int100 + frac;
+    while (pos < size && peek8(data + pos) >= 48 && peek8(data + pos) <= 57) { pos := pos + 1; }
+  }
+  if (neg != 0) { int100 := 0 - int100; }
+  poke64(outPtr, int100);
+  return pos;
+}
+
+// Find the nth page object ID by walking the /Kids array of the /Pages node.
+// Works for flat page trees (all kids are Page leaves). Returns -1 on failure.
+fn _rdFindPage(rdr: int64, pagesId: int64, pageIdx: int64): int64 {
+  var pos: int64 := _rdObjStart(rdr, pagesId);
+  if (pos < 0) { return -1; }
+  var data: int64 := peek64(rdr + PDF_RDR_DATA);
+  var size: int64 := peek64(rdr + PDF_RDR_DATASIZE);
+  if (pos + 1 >= size || peek8(data + pos) != 60 || peek8(data + pos + 1) != 60) { return -1; }
+  var kp: int64 := _rdScanDictForKey(rdr, pos + 2, "Kids");
+  if (kp < 0) { return -1; }
+  kp := _rdSkipWs(rdr, kp);
+  if (kp >= size || peek8(data + kp) != 91) { return -1; }
+  kp := kp + 1;
+  var idx: int64 := 0;
+  while (idx <= pageIdx) {
+    kp := _rdSkipWs(rdr, kp);
+    if (kp >= size || peek8(data + kp) == 93) { return -1; }
+    poke64(rdr + PDF_RDR_TMP, 0);
+    kp := _rdParseUInt(rdr, kp, rdr + PDF_RDR_TMP);
+    var kidId: int64 := peek64(rdr + PDF_RDR_TMP);
+    kp := _rdSkipWs(rdr, kp);
+    while (kp < size && peek8(data + kp) >= 48 && peek8(data + kp) <= 57) { kp := kp + 1; }
+    kp := _rdSkipWs(rdr, kp);
+    if (kp < size && peek8(data + kp) == 82) { kp := kp + 1; }
+    if (idx == pageIdx) { return kidId; }
+    idx := idx + 1;
+  }
+  return -1;
+}
+
+// Parse /MediaBox from page object. Returns width ×100.
+fn _rdPageW100(rdr: int64, pageId: int64): int64 {
+  var pos: int64 := _rdObjStart(rdr, pageId);
+  if (pos < 0) { return 59528; }
+  var data: int64 := peek64(rdr + PDF_RDR_DATA);
+  var size: int64 := peek64(rdr + PDF_RDR_DATASIZE);
+  if (pos + 1 >= size || peek8(data + pos) != 60 || peek8(data + pos + 1) != 60) { return 59528; }
+  var mp: int64 := _rdScanDictForKey(rdr, pos + 2, "MediaBox");
+  if (mp < 0) { return 59528; }
+  mp := _rdSkipWs(rdr, mp);
+  if (mp >= size || peek8(data + mp) != 91) { return 59528; }
+  mp := mp + 1;
+  var llx: int64 := 0;  var urx: int64 := 0;
+  mp := _rdSkipWs(rdr, mp);
+  mp := _rdParseReal100(rdr, mp, rdr + PDF_RDR_TMP);  llx := peek64(rdr + PDF_RDR_TMP);
+  mp := _rdSkipWs(rdr, mp);
+  mp := _rdParseReal100(rdr, mp, rdr + PDF_RDR_TMP);  // lly — skip
+  mp := _rdSkipWs(rdr, mp);
+  mp := _rdParseReal100(rdr, mp, rdr + PDF_RDR_TMP);  urx := peek64(rdr + PDF_RDR_TMP);
+  return urx - llx;
+}
+
+// Parse /MediaBox from page object. Returns height ×100.
+fn _rdPageH100(rdr: int64, pageId: int64): int64 {
+  var pos: int64 := _rdObjStart(rdr, pageId);
+  if (pos < 0) { return 84189; }
+  var data: int64 := peek64(rdr + PDF_RDR_DATA);
+  var size: int64 := peek64(rdr + PDF_RDR_DATASIZE);
+  if (pos + 1 >= size || peek8(data + pos) != 60 || peek8(data + pos + 1) != 60) { return 84189; }
+  var hp: int64 := _rdScanDictForKey(rdr, pos + 2, "MediaBox");
+  if (hp < 0) { return 84189; }
+  hp := _rdSkipWs(rdr, hp);
+  if (hp >= size || peek8(data + hp) != 91) { return 84189; }
+  hp := hp + 1;
+  var lly: int64 := 0;  var ury: int64 := 0;
+  hp := _rdSkipWs(rdr, hp);
+  hp := _rdParseReal100(rdr, hp, rdr + PDF_RDR_TMP);  // llx — skip
+  hp := _rdSkipWs(rdr, hp);
+  hp := _rdParseReal100(rdr, hp, rdr + PDF_RDR_TMP);  lly := peek64(rdr + PDF_RDR_TMP);
+  hp := _rdSkipWs(rdr, hp);
+  hp := _rdParseReal100(rdr, hp, rdr + PDF_RDR_TMP);  // urx — skip
+  hp := _rdSkipWs(rdr, hp);
+  hp := _rdParseReal100(rdr, hp, rdr + PDF_RDR_TMP);  ury := peek64(rdr + PDF_RDR_TMP);
+  return ury - lly;
+}
+
+// Resolve a dict value that may be an inline dict << >> or an indirect ref N G R.
+// Returns position of the opening << on success, or -1.
+fn _rdResolveDict(rdr: int64, pos: int64): int64 {
+  var data: int64 := peek64(rdr + PDF_RDR_DATA);
+  var size: int64 := peek64(rdr + PDF_RDR_DATASIZE);
+  pos := _rdSkipWs(rdr, pos);
+  if (pos + 1 < size && peek8(data + pos) == 60 && peek8(data + pos + 1) == 60) { return pos; }
+  // Try to parse as ref: N G R
+  if (pos >= size || peek8(data + pos) < 48 || peek8(data + pos) > 57) { return -1; }
+  poke64(rdr + PDF_RDR_TMP, 0);
+  pos := _rdParseUInt(rdr, pos, rdr + PDF_RDR_TMP);
+  var refId: int64 := peek64(rdr + PDF_RDR_TMP);
+  pos := _rdSkipWs(rdr, pos);
+  while (pos < size && peek8(data + pos) >= 48 && peek8(data + pos) <= 57) { pos := pos + 1; }
+  pos := _rdSkipWs(rdr, pos);
+  if (pos < size && peek8(data + pos) == 82) {
+    var rp: int64 := _rdObjStart(rdr, refId);
+    return rp;
+  }
+  return -1;
+}
+
+// Register Lyx-format fonts (/Fk entries) from src page into dst.
+// Both src and dst are assumed to be Lyx-generated PDFs (font slot = key number).
+fn _rdImportFonts(dst: int64, rdr: int64, pageId: int64, dstPage: int64): void {
+  var data: int64 := peek64(rdr + PDF_RDR_DATA);
+  var size: int64 := peek64(rdr + PDF_RDR_DATASIZE);
+  var pp: int64 := _rdObjStart(rdr, pageId);
+  if (pp < 0) { return; }
+  if (pp + 1 >= size || peek8(data + pp) != 60 || peek8(data + pp + 1) != 60) { return; }
+  // Find /Resources
+  var rp: int64 := _rdScanDictForKey(rdr, pp + 2, "Resources");
+  if (rp < 0) { return; }
+  rp := _rdResolveDict(rdr, rp);
+  if (rp < 0) { return; }
+  if (peek8(data + rp) != 60 || peek8(data + rp + 1) != 60) { return; }
+  // Find /Font in Resources
+  var fp: int64 := _rdScanDictForKey(rdr, rp + 2, "Font");
+  if (fp < 0) { return; }
+  fp := _rdResolveDict(rdr, fp);
+  if (fp < 0) { return; }
+  if (peek8(data + fp) != 60 || peek8(data + fp + 1) != 60) { return; }
+  // Walk font dict: each entry is /Fk N G R
+  var p: int64 := fp + 2;
+  while (p < size) {
+    p := _rdSkipWs(rdr, p);
+    if (p >= size) { break; }
+    var c: int64 := peek8(data + p);
+    if (c == 62 && p + 1 < size && peek8(data + p + 1) == 62) { break; }
+    if (c != 47) { break; }
+    p := p + 1;
+    // Expect 'F' followed by digits for the slot number
+    if (p >= size || peek8(data + p) != 70) {
+      p := _rdSkipName(rdr, p);
+      p := _rdSkipWs(rdr, p);
+      p := _rdSkipValue(rdr, p);
+      continue;
+    }
+    p := p + 1;
+    if (p >= size || peek8(data + p) < 48 || peek8(data + p) > 57) {
+      p := _rdSkipName(rdr, p);
+      p := _rdSkipWs(rdr, p);
+      p := _rdSkipValue(rdr, p);
+      continue;
+    }
+    var slot: int64 := 0;
+    while (p < size && peek8(data + p) >= 48 && peek8(data + p) <= 57) {
+      slot := slot * 10 + (peek8(data + p) - 48);
+      p := p + 1;
+    }
+    p := _rdSkipWs(rdr, p);
+    p := _rdSkipValue(rdr, p);  // skip ref value
+    if (slot >= 0 && slot < 14) {
+      var fontBase: int64 := dst + PDF_DOC_FONTIDS;
+      var foid: int64 := peek64(fontBase + slot * 8);
+      if (foid == 0) {
+        var nid: int64 := peek64(dst + PDF_DOC_NEXTID);
+        poke64(dst + PDF_DOC_NEXTID, nid + 1);
+        poke64(fontBase + slot * 8, nid);
+      }
+      var mask: int64 := peek64(dst + PDF_DOC_PAGEFONTMASK + dstPage * 8);
+      poke64(dst + PDF_DOC_PAGEFONTMASK + dstPage * 8, mask | (1 << slot));
+    }
+  }
+}
+
+// Allocate a new page in dst with given int64 dimensions (×100).
+// Returns page index or -1 on failure.
+fn _importAddPage(dst: int64, w100: int64, h100: int64): int64 {
+  var count: int64 := peek64(dst + PDF_DOC_PAGECOUNT);
+  if (count >= peek64(dst + PDF_DOC_PAGECAP)) { return -1; }
+  var nid:   int64 := peek64(dst + PDF_DOC_NEXTID);
+  poke64(dst + PDF_DOC_NEXTID, nid + 2);
+  poke64(peek64(dst + PDF_DOC_PAGEIDS)     + count * 8, nid);
+  poke64(peek64(dst + PDF_DOC_CONTENTIDS)  + count * 8, nid + 1);
+  poke64(peek64(dst + PDF_DOC_WIDTHS100)   + count * 8, w100);
+  poke64(peek64(dst + PDF_DOC_HEIGHTS100)  + count * 8, h100);
+  poke64(peek64(dst + PDF_DOC_CONTENTBUFS) + count * 8, 0);
+  poke64(peek64(dst + PDF_DOC_CONTENTLENS) + count * 8, 0);
+  poke64(peek64(dst + PDF_DOC_CONTENTCAPS) + count * 8, 0);
+  poke64(dst + PDF_DOC_PAGECOUNT, count + 1);
+  return count;
+}
+
+// Copy the content stream bytes from src page into dst's content buffer.
+// If the stream is FlateDecode-compressed, stores bytes as-is and sets PAGEPRECOMP.
+fn _rdCopyContent(dst: int64, rdr: int64, pageId: int64, dstPage: int64): void {
+  var data: int64 := peek64(rdr + PDF_RDR_DATA);
+  var size: int64 := peek64(rdr + PDF_RDR_DATASIZE);
+  var pp: int64 := _rdObjStart(rdr, pageId);
+  if (pp < 0) { return; }
+  if (pp + 1 >= size || peek8(data + pp) != 60 || peek8(data + pp + 1) != 60) { return; }
+  var contId: int64 := _rdDictGetRef(rdr, pp + 2, "Contents");
+  if (contId <= 0) { return; }
+  var cp: int64 := _rdObjStart(rdr, contId);
+  if (cp < 0) { return; }
+  if (cp + 1 >= size || peek8(data + cp) != 60 || peek8(data + cp + 1) != 60) { return; }
+  var clen: int64 := _rdDictGetInt(rdr, cp + 2, "Length");
+  if (clen <= 0) { return; }
+  // Check /Filter /FlateDecode
+  var filt: int64 := _rdScanDictForKey(rdr, cp + 2, "Filter");
+  var isFlate: int64 := 0;
+  if (filt >= 0) {
+    filt := _rdSkipWs(rdr, filt);
+    if (_rdMatchStr(data, filt, "/FlateDecode") != 0) { isFlate := 1; }
+  }
+  // Find "stream" keyword
+  var sp: int64 := _rdFindStr(rdr, cp, "stream");
+  if (sp < 0) { return; }
+  sp := sp + 6;
+  if (sp < size && peek8(data + sp) == 13) { sp := sp + 1; }
+  if (sp < size && peek8(data + sp) == 10) { sp := sp + 1; }
+  if (sp + clen > size) { return; }
+  // Allocate and copy
+  var cbuf: int64 := alloc(clen);
+  if (cbuf == 0) { return; }
+  var bi: int64 := 0;
+  while (bi < clen) { poke8(cbuf + bi, peek8(data + sp + bi)); bi := bi + 1; }
+  poke64(peek64(dst + PDF_DOC_CONTENTBUFS) + dstPage * 8, cbuf);
+  poke64(peek64(dst + PDF_DOC_CONTENTLENS) + dstPage * 8, clen);
+  poke64(peek64(dst + PDF_DOC_CONTENTCAPS) + dstPage * 8, clen);
+  if (isFlate != 0) {
+    poke64(peek64(dst + PDF_DOC_PAGEPRECOMP) + dstPage * 8, 1);
+  }
+}
+
+// ============================================================================
+// Public API — WP-PDF-19
+// ============================================================================
+
+// Import page srcPageIdx from src (reader handle) into dst (builder doc handle).
+// Returns the new page index in dst, or -1 on failure.
+// Notes:
+//  - Only Standard-14 fonts are re-registered (Lyx-generated PDFs only).
+//  - Images are not re-imported.
+//  - Only flat /Pages trees are supported (direct leaf pages, no nested nodes).
+pub fn PdfImportPage(dst: int64, src: int64, srcPageIdx: int64): int64 {
+  if (dst == 0 || src == 0) { return -1; }
+  if (srcPageIdx < 0 || srcPageIdx >= peek64(src + PDF_RDR_PAGECOUNT)) { return -1; }
+  var data:    int64 := peek64(src + PDF_RDR_DATA);
+  var size:    int64 := peek64(src + PDF_RDR_DATASIZE);
+  var rootId:  int64 := peek64(src + PDF_RDR_ROOTID);
+  var rp:      int64 := _rdObjStart(src, rootId);
+  if (rp < 0) { return -1; }
+  if (rp + 1 >= size || peek8(data + rp) != 60 || peek8(data + rp + 1) != 60) { return -1; }
+  var pagesId: int64 := _rdDictGetRef(src, rp + 2, "Pages");
+  if (pagesId <= 0) { return -1; }
+  var pageId:  int64 := _rdFindPage(src, pagesId, srcPageIdx);
+  if (pageId <= 0) { return -1; }
+  var w100:    int64 := _rdPageW100(src, pageId);
+  var h100:    int64 := _rdPageH100(src, pageId);
+  var dstPage: int64 := _importAddPage(dst, w100, h100);
+  if (dstPage < 0) { return -1; }
+  _rdCopyContent(dst, src, pageId, dstPage);
+  _rdImportFonts(dst, src, pageId, dstPage);
+  return dstPage;
+}
+
+// Import all pages from src into dst (appended in order).
+pub fn PdfMergeAll(dst: int64, src: int64): void {
+  if (dst == 0 || src == 0) { return; }
+  var n:   int64 := peek64(src + PDF_RDR_PAGECOUNT);
+  var idx: int64 := 0;
+  while (idx < n) {
+    PdfImportPage(dst, src, idx);
+    idx := idx + 1;
+  }
+}
+
+// ============================================================================
+// WP-PDF-21: Text extraction from PDF content streams
+// ============================================================================
+
+// Return a pointer into the reader's mmap'd file data pointing at the first
+// byte of the content stream for objId. Stores stream length at PDF_RDR_TMP.
+// Returns 0 if the object is not found, has no stream, or is FlateDecode-
+// compressed (no decompressor available).
+fn _rdObjStreamRaw(rdr: int64, objId: int64): int64 {
+  var data: int64 := peek64(rdr + PDF_RDR_DATA);
+  var size: int64 := peek64(rdr + PDF_RDR_DATASIZE);
+  var pos:  int64 := _rdObjStart(rdr, objId);
+  if (pos < 0 || pos + 1 >= size) { poke64(rdr + PDF_RDR_TMP, 0); return 0; }
+  if (peek8(data + pos) != 60 || peek8(data + pos + 1) != 60) { poke64(rdr + PDF_RDR_TMP, 0); return 0; }
+  var slen: int64 := _rdDictGetInt(rdr, pos + 2, "Length");
+  if (slen <= 0) { poke64(rdr + PDF_RDR_TMP, 0); return 0; }
+  // Reject compressed streams (FlateDecode)
+  var fp: int64 := _rdScanDictForKey(rdr, pos + 2, "Filter");
+  if (fp >= 0) {
+    fp := _rdSkipWs(rdr, fp);
+    if (_rdMatchStr(data, fp, "/FlateDecode") != 0) {
+      poke64(rdr + PDF_RDR_TMP, 0); return 0;
+    }
+  }
+  var sp: int64 := _rdFindStr(rdr, pos, "stream");
+  if (sp < 0) { poke64(rdr + PDF_RDR_TMP, 0); return 0; }
+  sp := sp + 6;
+  if (sp < size && peek8(data + sp) == 13) { sp := sp + 1; }
+  if (sp < size && peek8(data + sp) == 10) { sp := sp + 1; }
+  if (sp + slen > size) { poke64(rdr + PDF_RDR_TMP, 0); return 0; }
+  poke64(rdr + PDF_RDR_TMP, slen);
+  return data + sp;
+}
+
+// Parse a PDF content stream and write extracted text into buf (NUL-terminated).
+// Handles: BT/ET, Td/TD (line-break detection), Tj, TJ, literal and hex strings.
+// Line breaks are emitted as \n when a downward Td/TD move is detected.
+fn _exProcessStream(stream: int64, slen: int64, buf: int64, maxLen: int64): void {
+  var sp:      int64 := 0;
+  var bpos:    int64 := 0;
+  var inBT:    int64 := 0;
+  var hadText: int64 := 0;
+  var prevN:   int64 := 0;   // second-to-last parsed number (×100)
+  var lastN:   int64 := 0;   // most recent parsed number (×100)
+  var nc:      int64 := 0;   // numbers accumulated since last non-number token
+
+  while (sp < slen && bpos + 1 < maxLen) {
+    var c: int64 := peek8(stream + sp);
+
+    // Whitespace
+    if (c == 32 || c == 9 || c == 10 || c == 13) { sp := sp + 1; continue; }
+
+    // Comment: % to end of line
+    if (c == 37) {
+      while (sp < slen && peek8(stream + sp) != 10 && peek8(stream + sp) != 13) { sp := sp + 1; }
+      continue;
+    }
+
+    // Name (/Foo) — skip entirely, reset number accumulator
+    if (c == 47) {
+      sp := sp + 1;
+      while (sp < slen) {
+        var nc2: int64 := peek8(stream + sp);
+        if (nc2 <= 32 || nc2 == 47 || nc2 == 40 || nc2 == 41 || nc2 == 60 || nc2 == 62 || nc2 == 91 || nc2 == 93) { break; }
+        sp := sp + 1;
+      }
+      nc := 0;
+      continue;
+    }
+
+    // Number (integer or float, possibly negative)
+    if (c == 45 || c == 46 || (c >= 48 && c <= 57)) {
+      var neg: int64 := 0;
+      if (c == 45) { neg := 1; sp := sp + 1; }
+      var iv: int64 := 0;
+      while (sp < slen && peek8(stream + sp) >= 48 && peek8(stream + sp) <= 57) {
+        iv := iv * 10 + (peek8(stream + sp) - 48); sp := sp + 1;
+      }
+      iv := iv * 100;
+      if (sp < slen && peek8(stream + sp) == 46) {
+        sp := sp + 1;
+        var frac: int64 := 0;  var fd: int64 := 0;
+        while (sp < slen && peek8(stream + sp) >= 48 && peek8(stream + sp) <= 57 && fd < 2) {
+          frac := frac * 10 + (peek8(stream + sp) - 48); fd := fd + 1; sp := sp + 1;
+        }
+        while (sp < slen && peek8(stream + sp) >= 48 && peek8(stream + sp) <= 57) { sp := sp + 1; }
+        if (fd == 1) { frac := frac * 10; }
+        iv := iv + frac;
+      }
+      if (neg != 0) { iv := 0 - iv; }
+      prevN := lastN;  lastN := iv;  nc := nc + 1;
+      continue;
+    }
+
+    // Literal string (...)
+    if (c == 40) {
+      sp := sp + 1;
+      var depth: int64 := 1;
+      while (sp < slen && depth > 0) {
+        var sc: int64 := peek8(stream + sp);
+        if (sc == 92 && sp + 1 < slen) {
+          sp := sp + 1;
+          var ec: int64 := peek8(stream + sp); sp := sp + 1;
+          if (ec == 10 || ec == 13) {
+            if (ec == 13 && sp < slen && peek8(stream + sp) == 10) { sp := sp + 1; }
+          } else if (ec >= 48 && ec <= 55) {
+            var oct: int64 := ec - 48;
+            if (sp < slen && peek8(stream+sp) >= 48 && peek8(stream+sp) <= 55) { oct := oct*8+(peek8(stream+sp)-48); sp:=sp+1; }
+            if (sp < slen && peek8(stream+sp) >= 48 && peek8(stream+sp) <= 55) { oct := oct*8+(peek8(stream+sp)-48); sp:=sp+1; }
+            if (inBT != 0 && oct >= 32 && oct <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, oct); bpos:=bpos+1; }
+          } else {
+            var out: int64 := ec;
+            if (ec == 110 || ec == 114) { out := 32; }
+            if (ec == 116) { out := 9; }
+            if (inBT != 0 && out >= 32 && out <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, out); bpos:=bpos+1; }
+          }
+        } else if (sc == 40) { depth := depth + 1; sp := sp + 1; }
+        else if (sc == 41) { depth := depth - 1; sp := sp + 1; }
+        else {
+          if (inBT != 0 && sc >= 32 && sc <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, sc); bpos:=bpos+1; }
+          sp := sp + 1;
+        }
+      }
+      if (inBT != 0) { hadText := 1; }
+      nc := 0;
+      continue;
+    }
+
+    // Hex string <AB CD>  (not << which is a dict)
+    if (c == 60 && sp + 1 < slen && peek8(stream + sp + 1) != 60) {
+      sp := sp + 1;
+      while (sp < slen && peek8(stream + sp) != 62) {
+        var h1: int64 := peek8(stream + sp); sp := sp + 1;
+        if (h1 == 32 || h1 == 9 || h1 == 10 || h1 == 13) { continue; }
+        // second hex digit (optional if at >)
+        var h2: int64 := 48;  // default '0'
+        if (sp < slen && peek8(stream + sp) != 62) {
+          var hc: int64 := peek8(stream + sp);
+          if (hc != 32 && hc != 9 && hc != 10 && hc != 13) { h2 := hc; sp := sp + 1; }
+        }
+        var d1: int64 := 0;  var d2: int64 := 0;
+        if (h1 >= 48 && h1 <= 57) { d1 := h1 - 48; }
+        else if (h1 >= 65 && h1 <= 70) { d1 := h1 - 55; }
+        else if (h1 >= 97 && h1 <= 102) { d1 := h1 - 87; }
+        if (h2 >= 48 && h2 <= 57) { d2 := h2 - 48; }
+        else if (h2 >= 65 && h2 <= 70) { d2 := h2 - 55; }
+        else if (h2 >= 97 && h2 <= 102) { d2 := h2 - 87; }
+        var hb: int64 := d1 * 16 + d2;
+        if (inBT != 0 && hb >= 32 && hb <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, hb); bpos:=bpos+1; }
+      }
+      if (sp < slen) { sp := sp + 1; }
+      if (inBT != 0) { hadText := 1; }
+      nc := 0;
+      continue;
+    }
+
+    // Dict << >> — skip
+    if (c == 60 && sp + 1 < slen && peek8(stream + sp + 1) == 60) {
+      sp := sp + 2;
+      var dd: int64 := 1;
+      while (sp + 1 < slen && dd > 0) {
+        if (peek8(stream+sp) == 60 && peek8(stream+sp+1) == 60) { dd:=dd+1; sp:=sp+2; }
+        else if (peek8(stream+sp) == 62 && peek8(stream+sp+1) == 62) { dd:=dd-1; sp:=sp+2; }
+        else { sp := sp + 1; }
+      }
+      nc := 0;
+      continue;
+    }
+
+    // Array [...] — TJ arguments: process strings inline, skip kerning numbers
+    if (c == 91) {
+      sp := sp + 1;
+      while (sp < slen && peek8(stream + sp) != 93) {
+        var ac: int64 := peek8(stream + sp);
+        if (ac == 32 || ac == 9 || ac == 10 || ac == 13) { sp:=sp+1; continue; }
+        if (ac == 40) {
+          sp := sp + 1;
+          var adepth: int64 := 1;
+          while (sp < slen && adepth > 0) {
+            var asc: int64 := peek8(stream + sp);
+            if (asc == 92 && sp + 1 < slen) {
+              sp := sp + 1;
+              var aec: int64 := peek8(stream + sp); sp := sp + 1;
+              if (aec >= 48 && aec <= 55) {
+                var aoct: int64 := aec - 48;
+                if (sp < slen && peek8(stream+sp) >= 48 && peek8(stream+sp) <= 55) { aoct:=aoct*8+(peek8(stream+sp)-48); sp:=sp+1; }
+                if (sp < slen && peek8(stream+sp) >= 48 && peek8(stream+sp) <= 55) { aoct:=aoct*8+(peek8(stream+sp)-48); sp:=sp+1; }
+                if (inBT != 0 && aoct >= 32 && aoct <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, aoct); bpos:=bpos+1; }
+              } else if (aec != 10 && aec != 13 && aec >= 32 && aec <= 126) {
+                if (inBT != 0 && bpos + 1 < maxLen) { poke8(buf+bpos, aec); bpos:=bpos+1; }
+              }
+            } else if (asc == 40) { adepth:=adepth+1; sp:=sp+1; }
+            else if (asc == 41) { adepth:=adepth-1; sp:=sp+1; }
+            else {
+              if (inBT != 0 && asc >= 32 && asc <= 126 && bpos + 1 < maxLen) { poke8(buf+bpos, asc); bpos:=bpos+1; }
+              sp := sp + 1;
+            }
+          }
+          if (inBT != 0) { hadText := 1; }
+          continue;
+        }
+        // Kerning number — skip
+        if (ac == 45 || ac == 46 || (ac >= 48 && ac <= 57)) {
+          if (ac == 45) { sp := sp + 1; }
+          while (sp < slen && peek8(stream+sp) >= 48 && peek8(stream+sp) <= 57) { sp:=sp+1; }
+          if (sp < slen && peek8(stream+sp) == 46) { sp:=sp+1; while (sp<slen && peek8(stream+sp)>=48 && peek8(stream+sp)<=57) { sp:=sp+1; } }
+          continue;
+        }
+        sp := sp + 1;
+      }
+      if (sp < slen) { sp := sp + 1; }
+      nc := 0;
+      continue;
+    }
+
+    // Operator: sequence of letters (and *)
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 39) {
+      var opStart: int64 := sp;
+      sp := sp + 1;
+      if (c != 39) {  // ' is single-char operator
+        while (sp < slen) {
+          var oc: int64 := peek8(stream + sp);
+          if (!((oc >= 65 && oc <= 90) || (oc >= 97 && oc <= 122) || oc == 42)) { break; }
+          sp := sp + 1;
+        }
+      }
+      var opLen: int64 := sp - opStart;
+      var c0: int64 := c;
+      var c1: int64 := 0;
+      if (opLen >= 2) { c1 := peek8(stream + opStart + 1); }
+
+      if (c0 == 66 && c1 == 84 && opLen == 2) {  // BT
+        inBT := 1; nc := 0; prevN := 0; lastN := 0;
+      } else if (c0 == 69 && c1 == 84 && opLen == 2) {  // ET
+        inBT := 0; nc := 0;
+      } else if (c0 == 84 && (c1 == 100 || c1 == 68) && opLen == 2) {  // Td / TD
+        // prevN=tx(×100), lastN=ty(×100); negative ty = move down = new line
+        if (nc >= 2 && lastN < -100 && hadText != 0 && bpos + 1 < maxLen) {
+          poke8(buf + bpos, 10); bpos := bpos + 1;
+        }
+        nc := 0;
+      } else if (c0 == 39 && opLen == 1) {  // ' — move to next line and show string
+        if (hadText != 0 && bpos + 1 < maxLen) { poke8(buf + bpos, 10); bpos := bpos + 1; }
+        nc := 0;
+      } else {
+        nc := 0;
+      }
+      continue;
+    }
+
+    sp := sp + 1;
+  }
+
+  if (bpos < maxLen) { poke8(buf + bpos, 0); }
+}
+
+// ============================================================================
+// PdfRdrExtractText — public API (WP-PDF-21)
+//
+// Extract text from page srcPageIdx of reader rdr into buf (max maxLen bytes,
+// NUL-terminated). Lines separated by \n where Td/TD moves text downward.
+//
+// Limitations:
+//  - Only works if the content stream is UNCOMPRESSED (PdfSetCompression 0).
+//    FlateDecode streams return an empty string (no decompressor available).
+//  - Only Standard printable ASCII (0x20–0x7E) is extracted.
+//  - Only Lyx-generated content is fully supported (BT/ET, Td, Tj, TJ).
+// ============================================================================
+
+pub fn PdfRdrExtractText(rdr: int64, pageIdx: int64, buf: int64, maxLen: int64): void {
+  if (rdr == 0 || buf == 0 || maxLen <= 0) { return; }
+  poke8(buf, 0);
+  if (pageIdx < 0 || pageIdx >= peek64(rdr + PDF_RDR_PAGECOUNT)) { return; }
+
+  var data:    int64 := peek64(rdr + PDF_RDR_DATA);
+  var size:    int64 := peek64(rdr + PDF_RDR_DATASIZE);
+  var rootId:  int64 := peek64(rdr + PDF_RDR_ROOTID);
+  var rp:      int64 := _rdObjStart(rdr, rootId);
+  if (rp < 0) { return; }
+  if (rp + 1 >= size || peek8(data + rp) != 60 || peek8(data + rp + 1) != 60) { return; }
+  var pagesId: int64 := _rdDictGetRef(rdr, rp + 2, "Pages");
+  if (pagesId <= 0) { return; }
+  var pageId:  int64 := _rdFindPage(rdr, pagesId, pageIdx);
+  if (pageId <= 0) { return; }
+
+  // Get /Contents ref
+  var pp: int64 := _rdObjStart(rdr, pageId);
+  if (pp < 0) { return; }
+  if (pp + 1 >= size || peek8(data + pp) != 60 || peek8(data + pp + 1) != 60) { return; }
+  var contId: int64 := _rdDictGetRef(rdr, pp + 2, "Contents");
+  if (contId <= 0) { return; }
+
+  // Get raw stream pointer
+  var stream: int64 := _rdObjStreamRaw(rdr, contId);
+  if (stream == 0) { return; }
+  var slen: int64 := peek64(rdr + PDF_RDR_TMP);
+  if (slen <= 0) { return; }
+
+  _exProcessStream(stream, slen, buf, maxLen);
 }

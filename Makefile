@@ -23,7 +23,7 @@ BIN_DST   := $(PKG_DIR)/usr/local/bin
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test test-lyxos snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen
+.PHONY: build bootstrap singularity test test-lyxos snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen sync-units-src
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -196,10 +196,28 @@ snapshot-update: lyxc
 
 # ── Paketierung ───────────────────────────────────────────────────────────────
 
-package: precompile-units install-bin
+package: sync-units-src precompile-units install-bin
 	dpkg-deb --build $(PKG_DIR) $(DEB_NAME)
 	@echo ""
 	@echo "Paket fertig: $(DEB_NAME)"
+
+# Gepackte .lyx-Quelltexte aus der kanonischen Source synchronisieren.
+# Der Import-Resolver (sema.lyx) bevorzugt .lyx vor .lyu — die gepackten
+# .lyx sind also funktional autoritativ und MÜSSEN der Source entsprechen,
+# sonst kompiliert ein installiertes lyxc gegen veraltete stdlib.
+sync-units-src:
+	@echo "Synchronisiere std/ + data/ .lyx → Paketbaum..."
+	@for f in $(UNITS_SRC); do \
+		dst=$(UNITS_DST)/$${f#std/}; \
+		mkdir -p $$(dirname $$dst); \
+		cp $$f $$dst; \
+	done
+	@for f in $(DATA_SRC); do \
+		dst=$(DATA_DST)/$${f#data/}; \
+		mkdir -p $$(dirname $$dst); \
+		cp $$f $$dst; \
+	done
+	@echo "$(words $(UNITS_SRC) $(DATA_SRC)) .lyx-Quelltexte synchronisiert."
 
 precompile-units: lyxc
 	@echo "Pass 1: Kompiliere Units..."
