@@ -12,9 +12,9 @@ Felder am Ende des Metadatenblocks ergänzt, die maschinell auswertbar sind.
 
 | # | Feldname           | Typ        | Beispiel                    | Zweck |
 |---|--------------------|------------|-----------------------------|-------|
-| 4 | `compilerBuild`    | u16-String | `lyxc 0.9.11A x86_64-linux` | Welcher Compiler-Build hat diese LYU erzeugt |
+| 4 | `compilerBuild`    | u16-String | `lyxc 0.9.12A x86_64-linux` | Welcher Compiler-Build hat diese LYU erzeugt |
 | 5 | `unitVersion`      | u16-String | `1.0.0`                     | Versionsnummer der Unit selbst (für Paketmanager / API-Stabilität) |
-| 6 | `minCompilerVer`   | u16-String | `0.9.11A`                    | Mindest-Compiler-Version, die diese Unit lesen/nutzen kann |
+| 6 | `minCompilerVer`   | u16-String | `0.9.12A`                    | Mindest-Compiler-Version, die diese Unit lesen/nutzen kann |
 | 4 | `compilerBuild`    | u16-String | `lyxc 0.9.9A x86_64-linux` | Welcher Compiler-Build hat diese LYU erzeugt |
 | 5 | `unitVersion`      | u16-String | `1.0.0`                     | Versionsnummer der Unit selbst (für Paketmanager / API-Stabilität) |
 | 6 | `minCompilerVer`   | u16-String | `0.9.9A`                    | Mindest-Compiler-Version, die diese Unit lesen/nutzen kann |
@@ -103,8 +103,8 @@ Offset  Größe  Feld
 
 - Konstante für den Build-String definieren (analog zu `--version`-Ausgabe):
   ```lyx
-  con LYXC_BUILD_STR: pchar := "lyxc 0.9.11A x86_64-linux"c;
-  con LYXC_MIN_VER:   pchar := "0.9.11A"c;
+  con LYXC_BUILD_STR: pchar := "lyxc 0.9.12A x86_64-linux"c;
+  con LYXC_MIN_VER:   pchar := "0.9.12A"c;
   con LYXC_BUILD_STR: pchar := "lyxc 0.9.9A x86_64-linux"c;
   con LYXC_MIN_VER:   pchar := "0.9.9A"c;
   ```
