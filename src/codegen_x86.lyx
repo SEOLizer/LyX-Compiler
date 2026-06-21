@@ -214,13 +214,14 @@ con CG_PATCH_OFF_KIND:    int64 := 24;
 con CGN_TYPE_DECL:  int64 := 10;
 con CGN_FIELD_DECL: int64 := 7;
 
-con CG_CLASS_SZ:           int64 := 56;
+con CG_CLASS_SZ:           int64 := 64;
 con CG_CLASS_OFF_NAMELEN:  int64 := 8;
 con CG_CLASS_OFF_FIELDSPTR: int64 := 16;
 con CG_CLASS_OFF_FIELDCNT: int64 := 24;
 con CG_CLASS_OFF_VMTOFF:   int64 := 32;
 con CG_CLASS_OFF_VMTSLOTS: int64 := 40;
 con CG_CLASS_OFF_VMTLIST:  int64 := 48;
+con CG_CLASS_OFF_PARENTIDX: int64 := 56;  // WP-BC-L2: parent class layout index (-1 if none)
 
 con CG_VMT_METH_PATCH_SZ:       int64 := 16;
 con CG_VMT_METH_OFF_CODESTART:  int64 := 8;
@@ -1582,6 +1583,34 @@ pub type Codegen = class {
       poke64(self.data + slotDataOff, codeBase + methCodeStart);
       mp := mp + 1;
     }
+    // WP-BC-L2: propagate inherited (non-overridden) vtable slots base→derived.
+    // Own/overridden slots were filled above (non-zero code vaddr); slots still 0
+    // are inherited and copied from the parent vtable. Declaration order guarantees
+    // each parent is fully resolved before its children (incl. multi-level chains).
+    var ciP: int64 := 0;
+    while (ciP < self.classCount) {
+      var cbpP: int64 := self.classLayouts + ciP * CG_CLASS_SZ;
+      var parIdxP: int64 := peek64(cbpP + CG_CLASS_OFF_PARENTIDX);
+      var myOffP: int64 := peek64(cbpP + CG_CLASS_OFF_VMTOFF);
+      if (parIdxP >= 0 && myOffP >= 0) {
+        var pbpP: int64 := self.classLayouts + parIdxP * CG_CLASS_SZ;
+        var pOffP: int64 := peek64(pbpP + CG_CLASS_OFF_VMTOFF);
+        var mySlotsP: int64 := peek64(cbpP + CG_CLASS_OFF_VMTSLOTS);
+        var pSlotsP: int64 := peek64(pbpP + CG_CLASS_OFF_VMTSLOTS);
+        if (pOffP >= 0) {
+          var limP: int64 := pSlotsP;
+          if (mySlotsP < limP) { limP := mySlotsP; }
+          var sP: int64 := 0;
+          while (sP < limP) {
+            if (peek64(self.data + myOffP + sP * 8) == 0) {
+              poke64(self.data + myOffP + sP * 8, peek64(self.data + pOffP + sP * 8));
+            }
+            sP := sP + 1;
+          }
+        }
+      }
+      ciP := ciP + 1;
+    }
   }
 
   // ------------------------------------------------------------------
@@ -2651,16 +2680,34 @@ pub type Codegen = class {
   fn cg_buildClassLayout(ni: int64) {
     var className: pchar := self.cg_nsval(ni);
     var classLen:  int64 := self.cg_nslen(ni);
-    // Count fields (child0 chain)
+    // WP-BC-INH: resolve parent class layout (field flattening + VMT inheritance).
+    // Requires the parent class layout to be built already (declaration order).
+    var parentNi: int64 := self.cg_nc2(ni);
+    var pIdx: int64 := 0 - 1;
+    var parentFieldCnt: int64 := 0;
+    var parentFldsPtr: int64 := 0;
+    if (parentNi >= 0) {
+      pIdx := self.cg_findClass(self.cg_nsval(parentNi), self.cg_nslen(parentNi));
+      if (pIdx >= 0) {
+        parentFieldCnt := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_FIELDCNT);
+        parentFldsPtr  := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_FIELDSPTR);
+      }
+    }
+    // Count own fields (child0 chain)
     var fieldNode: int64 := self.cg_nc0(ni);
-    var cnt: int64 := 0;
+    var ownCnt: int64 := 0;
     var tmp: int64 := fieldNode;
-    while (tmp != -1) { cnt := cnt + 1; tmp := self.cg_nnext(tmp); }
-    // Allocate field array
+    while (tmp != -1) { ownCnt := ownCnt + 1; tmp := self.cg_nnext(tmp); }
+    // Total fields = inherited base fields + own fields
+    var cnt: int64 := parentFieldCnt + ownCnt;
+    // Allocate field array (base fields flattened first, then own)
     var flds: int64 := alloc((cnt + 1) * CG_CFIELD_SZ);
-    // WP-10a: fields start at offset 8 (offset 0 reserved for VMT pointer)
-    var offset: int64 := 8;
-    var i: int64 := 0;
+    // Copy inherited base-class field entries verbatim — their offsets (8,16,…)
+    // stay valid because every class reserves offset 0 for the VMT pointer.
+    if (parentFieldCnt > 0) { memcpy(flds, parentFldsPtr, parentFieldCnt * CG_CFIELD_SZ); }
+    // WP-10a: offset 0 = VMT ptr; own fields continue after the base fields.
+    var offset: int64 := 8 + parentFieldCnt * 8;
+    var i: int64 := parentFieldCnt;
     tmp := fieldNode;
     while (tmp != -1) {
       var fb: int64 := flds + i * CG_CFIELD_SZ;
@@ -2694,18 +2741,12 @@ pub type Codegen = class {
       i := i + 1;
       tmp := self.cg_nnext(tmp);
     }
-    // WP-BC-19: resolve parent class VMT slots for inheritance
-    var parentNi: int64 := self.cg_nc2(ni);
+    // WP-BC-19: parent VMT slots for inheritance (parentNi/pIdx resolved above)
     var parentSlotCount: int64 := 0;
     var parentMethodList: int64 := 0;
-    if (parentNi >= 0) {
-      var pName: pchar := self.cg_nsval(parentNi);
-      var pLen:  int64 := self.cg_nslen(parentNi);
-      var pIdx:  int64 := self.cg_findClass(pName, pLen);
-      if (pIdx >= 0) {
-        parentSlotCount  := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTSLOTS);
-        parentMethodList := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTLIST);
-      }
+    if (pIdx >= 0) {
+      parentSlotCount  := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTSLOTS);
+      parentMethodList := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTLIST);
     }
     // Count own virtual methods that are new (not overriding a parent slot)
     var ownMethodCount: int64 := 0;
@@ -2786,6 +2827,7 @@ pub type Codegen = class {
     poke64(base + CG_CLASS_OFF_VMTOFF,   vmtDataOff);
     poke64(base + CG_CLASS_OFF_VMTSLOTS, totalSlots);
     poke64(base + CG_CLASS_OFF_VMTLIST,  methodList);
+    poke64(base + CG_CLASS_OFF_PARENTIDX, pIdx);  // WP-BC-L2: for inherited-slot propagation
     self.classCount := self.classCount + 1;
     // Track temporary field array for later cleanup (BUG-02)
     // The flds pointer is stored in classLayouts and used by cg_findField/cg_getFieldOffset
@@ -2815,16 +2857,30 @@ pub type Codegen = class {
   fn cg_buildStructLayout(ni: int64) {
     var sName: pchar := self.cg_nsval(ni);
     var sLen:  int64 := self.cg_nslen(ni);
+    // WP-BC-INH: a method-less class may still `extends` a base — flatten base fields.
+    var parentNi: int64 := self.cg_nc2(ni);
+    var parentFieldCnt: int64 := 0;
+    var parentFldsPtr: int64 := 0;
+    if (parentNi >= 0) {
+      var pIdx: int64 := self.cg_findClass(self.cg_nsval(parentNi), self.cg_nslen(parentNi));
+      if (pIdx >= 0) {
+        parentFieldCnt := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_FIELDCNT);
+        parentFldsPtr  := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_FIELDSPTR);
+      }
+    }
     var fieldNode: int64 := self.cg_nc0(ni);
-    var cnt: int64 := 0;
+    var ownCnt: int64 := 0;
     var tmp: int64 := fieldNode;
-    while (tmp != -1) { cnt := cnt + 1; tmp := self.cg_nnext(tmp); }
+    while (tmp != -1) { ownCnt := ownCnt + 1; tmp := self.cg_nnext(tmp); }
+    var cnt: int64 := parentFieldCnt + ownCnt;
     var flds: int64 := alloc((cnt + 1) * CG_CFIELD_SZ);
+    // Inherited base fields first (offsets preserved); own fields continue after.
+    if (parentFieldCnt > 0) { memcpy(flds, parentFldsPtr, parentFieldCnt * CG_CFIELD_SZ); }
     // WP-4.1-A: check for @packed flag (bit 0 of struct iVal) and at(offset) fields
     var isPacked: int64 := self.cg_nival(ni) & 1;
-    // Structs: fields start at offset 0 (no VMT slot)
-    var offset: int64 := 0;
-    var i: int64 := 0;
+    // Structs: fields start at offset 0 (no VMT slot); derived continue after base.
+    var offset: int64 := parentFieldCnt * 8;
+    var i: int64 := parentFieldCnt;
     tmp := fieldNode;
     while (tmp != -1) {
       var fb: int64 := flds + i * CG_CFIELD_SZ;
@@ -2889,6 +2945,7 @@ pub type Codegen = class {
     poke64(base + CG_CLASS_OFF_VMTOFF,   -1);
     poke64(base + CG_CLASS_OFF_VMTSLOTS, 0);
     poke64(base + CG_CLASS_OFF_VMTLIST, 0);
+    poke64(base + CG_CLASS_OFF_PARENTIDX, -1);  // structs/flattened classes carry no vtable
     self.classCount := self.classCount + 1;
     // Track temporary field array for later cleanup (BUG-02)
     self.cg_trackTempBuf(flds, (cnt + 1) * CG_CFIELD_SZ);
@@ -4700,6 +4757,33 @@ pub type Codegen = class {
       var classIdx: int64 := self.cg_objClassIdx(objNode);
       if (classIdx >= 0) {
         var clsBase: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
+        // WP-BC-L2: virtual dispatch. If the method occupies a VMT slot in the
+        // object's static class, call through the runtime vtable instead of a
+        // static mangled name — this is what makes override/late-binding work.
+        // Slot indices are consistent base↔derived (parent slots copied first),
+        // so the static class's slot index correctly indexes the dynamic vtable.
+        var vmtListCS: int64   := peek64(clsBase + CG_CLASS_OFF_VMTLIST);
+        var vmtSlotsCS: int64  := peek64(clsBase + CG_CLASS_OFF_VMTSLOTS);
+        var vSlot: int64 := 0 - 1;
+        var vs: int64 := 0;
+        while (vs < vmtSlotsCS) {
+          var vName: pchar := peek64(vmtListCS + vs * 16) as pchar;
+          var vLen:  int64 := peek64(vmtListCS + vs * CG_VMTMETH_SZ + CG_VMTMETH_OFF_NAMELEN);
+          if (self.cg_seq(vName, vLen, fname, fnlen) != 0) { vSlot := vs; break; }
+          vs := vs + 1;
+        }
+        if (vSlot >= 0 && isStaticCall == 0) {
+          // self is in rdi (arg0). mov rax,[rdi]; mov rax,[rax+slot*8]; call rax
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x07);
+          var vdisp: int64 := vSlot * 8;
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x80);
+          self.cg_e8(vdisp & 0xFF);
+          self.cg_e8((vdisp >> 8) & 0xFF);
+          self.cg_e8((vdisp >> 16) & 0xFF);
+          self.cg_e8((vdisp >> 24) & 0xFF);
+          self.cg_e8(0xFF); self.cg_e8(0xD0);
+          return;
+        }
         var clsName: pchar := peek64(clsBase) as pchar;
         var clsLen:  int64 := peek64(clsBase + CG_CLASS_OFF_NAMELEN);
         var mangLen: int64 := clsLen + 1 + fnlen;
@@ -9773,7 +9857,17 @@ pub type Codegen = class {
       } else if (k == CGN_TYPE_DECL) {
         // NK_TYPE_DECL: class if it has methods (nc1 != -1), struct otherwise
         var hasMethods: int64 := self.cg_nc1(cur);
-        if (hasMethods == -1) {
+        // WP-BC-L2: a method-less class that `extends` a class WITH a vtable must
+        // also be class-layout, so it inherits the vtable pointer + slots.
+        var forceClass: int64 := 0;
+        var tdParent: int64 := self.cg_nc2(cur);
+        if (tdParent >= 0) {
+          var tdPi: int64 := self.cg_findClass(self.cg_nsval(tdParent), self.cg_nslen(tdParent));
+          if (tdPi >= 0) {
+            if (peek64(self.classLayouts + tdPi * CG_CLASS_SZ + CG_CLASS_OFF_VMTSLOTS) > 0) { forceClass := 1; }
+          }
+        }
+        if (hasMethods == -1 && forceClass == 0) {
           // No methods → treat as struct (fields start at offset 0, no VMT)
           self.cg_buildStructLayout(cur);
         } else {
