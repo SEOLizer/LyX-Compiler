@@ -1,5 +1,20 @@
 # Changelog - Lyx Compiler
 
+## Version 0.9.12A (Juni 2026)
+
+OOP-Vererbung und Parser-Verbesserungen (WP-BC, lyxc-Fix-Backlog L1–L6).
+
+### OOP / Vererbung
+
+- **L1 — Feld-Layout-Vererbung**: Felder einer Basisklasse werden in das Layout der abgeleiteten Klasse flach vorangestellt; geerbte Felder erhalten korrekte Offsets (`cg_buildClassLayout`/`cg_buildStructLayout`).
+- **L2 — virtuelle Dispatch über Basis-Pointer**: `extends`-Parent korrekt erfasst (Parser `_sc2`-Setter-Bug); `override`/`abstract` implizieren `virtual`; virtuelle Methoden werden dynamisch über die vtable aufgerufen (`cg_genCall`); abgeleitete Klassen erben die vtable, `override` ersetzt den Slot, geerbte nicht-überschriebene Slots werden base→derived propagiert.
+
+### Parser
+
+- **L4 — `[N]T` Prefix-Array-Felder**: `kids: [4]Node;` wird geparst (führendes Integer-Literal nach `[` disambiguiert gegen Tuple-Typen); erzeugt denselben Array-Knoten wie die Suffix-Form `T[N]`.
+- **L5 — `form` als Soft-Keyword**: `form` ist überall als normaler Bezeichner nutzbar; das Top-Level-`form`-Konstrukt wird kontextuell per Text erkannt.
+- **L6 — lesbare Diagnostik**: Parse-Fehler nennen Token-Namen und das tatsächliche Lexem statt roher Token-IDs (z. B. „expected IDENT, got form 'form'").
+
 ## Version 1.0.0A (Juni 2026)
 
 Erste Alpha-Version. Alle P0-Blocker behoben, alle Compiler-Bugs BUG-1..8 geschlossen.
