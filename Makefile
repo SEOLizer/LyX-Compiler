@@ -134,6 +134,10 @@ test: lyxc
 	@bash tests/sec_dns_oob_test.sh
 	@echo "OK"
 
+	@echo "--- sec_tls: TLS Hostname-Verifikation (5 tests) ---"
+	@bash tests/sec_tls_hostname_test.sh
+	@echo "OK"
+
 	@echo "--- sec_wp28: kernel-mode-guard allowlist (20 tests) ---"
 	@bash tests/sec_wp28_kernel_guard_test.sh
 	@echo "OK"
