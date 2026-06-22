@@ -390,6 +390,11 @@ pub type Sema = class {
   // BUG-3: current source file path for error messages (null = root module)
   curFile: pchar;
 
+  // FFI-SANDBOX: 1 = aktuell analysierte Unit ist vertrauenswürdig (std.*/src.*),
+  // 0 = User-Code. Unbekannte FFI (FFI_CLASS_UNKNOWN) ist nur in User-Code
+  // fail-closed (erfordert @capabilities) — std-Bindings (571 Externs) bleiben erlaubt.
+  ffiTrusted: int64;
+
   // WP-KI-02: pointer to ErrorCollector (0 = text mode, ≠0 = --error-json mode)
   errColl: int64;
 
@@ -1081,9 +1086,24 @@ pub type Sema = class {
       }
     }
 
+    // FFI-SANDBOX: std.*/src.*-Units sind vertrauenswürdig (Binding-Layer = TCB);
+    // ihre Externs dürfen FFI_CLASS_UNKNOWN sein. User-Code (und Drittmodule)
+    // bleiben fail-closed. modName-Namespace ist robust (User kann nicht als std.*
+    // importieren — Resolver schlägt std.* nur im stdPath nach).
+    var savedTrust: int64 := self.ffiTrusted;
+    var isStd: int64 := 0;
+    if modLen >= 4 {
+      if (StrCharAt(modName,0)&255)==115 && (StrCharAt(modName,1)&255)==116 &&
+         (StrCharAt(modName,2)&255)==100 && (StrCharAt(modName,3)&255)==46 { isStd := 1; }  // "std."
+      if (StrCharAt(modName,0)&255)==115 && (StrCharAt(modName,1)&255)==114 &&
+         (StrCharAt(modName,2)&255)==99  && (StrCharAt(modName,3)&255)==46 { isStd := 1; }  // "src."
+    }
+    self.ffiTrusted := isStd;
+
     // BUG-3: type-check function bodies in imported module
     self.Pass2(head);
 
+    self.ffiTrusted := savedTrust;
     self.src       := savedSrc;
     self.pNodes    := savedNodes;
     self.pToks     := savedToks;
@@ -2214,6 +2234,16 @@ pub type Sema = class {
       // OS-class extern fn must declare @capabilities([...]) — otherwise LCBS is bypassable
       if capAttrNi < 0 || self.sn_kind(capAttrNi) != SNK_CAPABILITY_ATTR {
         self._errorNode("extern fn mit OS-Zugriff erfordert @capabilities([...])-Annotation"c, ni);
+      }
+    } else if cls == FFI_CLASS_UNKNOWN {
+      // FFI-SANDBOX (Fail-Closed): unbekanntes/nicht-klassifiziertes FFI-Symbol. In
+      // vertrauenswürdigen std.*/src.*-Units erlaubt (Binding-Layer = TCB); in User-Code
+      // muss es per @capabilities([...]) explizit deklariert werden — sonst war es ein
+      // Sandbox-Bypass (beliebiges Symbol als „SAFE" durchgewunken).
+      if self.ffiTrusted == 0 {
+        if capAttrNi < 0 || self.sn_kind(capAttrNi) != SNK_CAPABILITY_ATTR {
+          self._errorNode("extern fn: unbekanntes FFI-Symbol erfordert @capabilities([...]) (FFI-Sandbox Fail-Closed)"c, ni);
+        }
       }
     } else if ffi_isStrncpyFamily(name, nameLen) {
       self._warnNode(ffi_strncpyWarnMsg(), ni);
@@ -3720,6 +3750,7 @@ pub type Sema = class {
     self.curClassNi  := -1;
     self.classCapNode := -1;
     self.curFile     := 0 as pchar;
+    self.ffiTrusted  := 0;   // Root/User-Modul ist NICHT vertrauenswürdig (fail-closed)
 
     // WP-10e: import dedup table
     self.importedCap   := 16;

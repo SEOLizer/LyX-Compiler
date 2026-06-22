@@ -126,6 +126,10 @@ test: lyxc
 	@bash tests/sec_wp27_read_test.sh
 	@echo "OK"
 
+	@echo "--- sec_ffi: FFI-Sandbox Fail-Closed (4 tests) ---"
+	@bash tests/sec_ffi_failclosed_test.sh
+	@echo "OK"
+
 	@echo "--- sec_wp28: kernel-mode-guard allowlist (20 tests) ---"
 	@bash tests/sec_wp28_kernel_guard_test.sh
 	@echo "OK"
