@@ -116,6 +116,12 @@ test: lyxc
 	@/tmp/lyxc_net_frame_test
 	@rm -f /tmp/lyxc_net_frame_test
 
+	@echo "--- sec_wp26: alloc()/calloc() Integer-Overflow + Zero-Alloc (18 tests) ---"
+	./lyxc tests/sec_wp26_alloc_test.lyx -o /tmp/lyxc_sec_wp26_test
+	@/tmp/lyxc_sec_wp26_test
+	@rm -f /tmp/lyxc_sec_wp26_test
+	@echo "OK"
+
 	@echo "--- sec_wp28: kernel-mode-guard allowlist (20 tests) ---"
 	@bash tests/sec_wp28_kernel_guard_test.sh
 	@echo "OK"
