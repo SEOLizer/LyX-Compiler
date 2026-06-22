@@ -29,10 +29,33 @@
 
 import src.std.alloc;
 con WIN_PREAMBLE_SZ:   int64 := 508;
-// WP-4.3: WIN_HELPERS_SZ must equal CG_H_USER (currently 1266) so that
+// WP-A2: WIN_HELPERS_SZ MUST equal CG_H_USER from codegen_x86.lyx so that
 // user-code rel32 call offsets to helpers are identical in Linux and Windows.
-con WIN_HELPERS_SZ:    int64 := 1266;  // = CG_H_USER from codegen_x86.lyx
-con WIN_USER_OFF:      int64 := 1774;  // WIN_PREAMBLE_SZ + WIN_HELPERS_SZ
+// The trampoline zone is now emitted with explicit padding to each WIN_H_*
+// offset (see wxb_padTo below), so individual helper SIZE drift can no longer
+// shift later trampolines — only these offset constants must track CG_H_*.
+con WIN_HELPERS_SZ:    int64 := 1372;  // = CG_H_USER from codegen_x86.lyx
+con WIN_USER_OFF:      int64 := 1880;  // WIN_PREAMBLE_SZ + WIN_HELPERS_SZ
+
+// Trampoline target offsets within the helper zone — MUST mirror CG_H_* in
+// codegen_x86.lyx exactly (user-code call sites use those Linux offsets).
+con WIN_H_START:      int64 := 0;
+con WIN_H_STRLEN:     int64 := 79;
+con WIN_H_PRINTSTR:   int64 := 103;
+con WIN_H_PRINTINT:   int64 := 129;
+con WIN_H_STRSUB:     int64 := 233;
+con WIN_H_STRCHARAT:  int64 := 304;
+con WIN_H_EPRINTSTR:  int64 := 310;
+con WIN_H_EPRINTINT:  int64 := 336;
+con WIN_H_F64STR:     int64 := 440;
+con WIN_H_STRSPLIT:   int64 := 775;
+con WIN_H_MAP_NEW:    int64 := 990;
+con WIN_H_MAP_SET:    int64 := 1037;
+con WIN_H_MAP_GET:    int64 := 1130;
+con WIN_H_MAP_HAS:    int64 := 1202;
+con WIN_H_STACK_FAIL: int64 := 1275;
+con WIN_H_CANARY_INIT: int64 := 1345;
+con WIN_H_USER:       int64 := 1372;
 
 // Preamble sub-function offsets within code buffer
 con WIN_PS_OFF:   int64 := 0;     // win_print_str_impl
@@ -66,6 +89,12 @@ con WIN_ENTRY_OFF:    int64 := 508;   // = WIN_PREAMBLE_SZ, _start offset in .te
 con WIN_FILE_ALIGN:   int64 := 0x200;
 con WIN_SEC_ALIGN:    int64 := 0x1000;
 
+// WP-A2.2: source (ELF) link base used by codegen for absolute pointers — mirror
+// CG_ELF_BASE / CG_CODE_OFF in codegen_x86.lyx. Base relocs carry image RVAs
+// relative to CG_ELF_BASE; the PE consumer rebases each value + emits .reloc.
+con WIN_SRC_ELF_BASE: int64 := 4194304;  // 0x400000 = CG_ELF_BASE
+con WIN_SRC_CODE_OFF: int64 := 176;      // CG_CODE_OFF
+
 // .rdata layout relative offsets (rdataRVA computed dynamically)
 con WIN_RDATA_IDT_OFF:    int64 := 0;    // Import Directory Table (2 * 20 = 40 bytes)
 con WIN_RDATA_INT_OFF:    int64 := 40;   // Import Name Table (5+1 * 8 = 48 bytes)
@@ -98,6 +127,17 @@ pub type WinX86Backend = class {
   out:    int64;
   outLen: int64;
   outCap: int64;
+
+  // WP-A2.2: base relocations from codegen (image RVAs of absolute pointers).
+  baseRelocBuf:    int64;
+  baseRelocCount:  int64;
+  peRVAs:          int64;   // sorted .text RVAs of the relocated pointers
+  relocContent:    int64;   // built IMAGE_BASE_RELOCATION blocks
+  relocContentLen: int64;
+
+  // WP-A2.3: win64 heap allocator helper. Linux mmap syscalls (alloc/new/dynarray)
+  // are rewritten to call this VirtualAlloc-based helper appended at code end.
+  vallocCallOff:   int64;   // code offset of the helper's `call [VirtualAlloc]` (-1 = none)
 
   // ------------------------------------------------------------------
   // Code buffer primitives
@@ -695,6 +735,21 @@ pub type WinX86Backend = class {
     while (i < n) { self.wxb_ce8(0x90); i := i + 1; }
   }
 
+  // WP-A2: pad the code buffer with NOPs until the helper-zone offset (relative
+  // to zoneStart) reaches `target`. Guarantees each trampoline lands exactly on
+  // its WIN_H_* offset regardless of preceding helper sizes.
+  fn wxb_padTo(zoneStart: int64, target: int64) {
+    while ((self.codeLen - zoneStart) < target) { self.wxb_ce8(0x90); }
+  }
+
+  // WP-A2: emit a 5-byte `JMP rel32` to absolute code offset `targetOff`,
+  // computing rel32 from the current position (position-independent).
+  fn wxb_emitJmpTo(targetOff: int64) {
+    self.wxb_ce8(0xE9);
+    var endOff: int64 := self.codeLen + 4;  // codeLen now at rel32 start; +4 = after it
+    self.wxb_ce32(targetOff - endOff);
+  }
+
   // ------------------------------------------------------------------
   // Patch IAT rel32 fields after codeLen is known (so rdataRVA can be computed).
   // Called from wxb_buildCode after all code is assembled.
@@ -747,6 +802,12 @@ pub type WinX86Backend = class {
     // _start ExitProcess call at code[561], instruction end at 567
     var r4: int64 := epRVA - (textBase + WIN_CALL_EP + 6);
     self.wxb_patch32(WIN_CALL_EP + 2, r4);
+
+    // WP-A2.3: VirtualAlloc call inside the appended heap helper (dynamic offset).
+    if (self.vallocCallOff >= 0) {
+      var rva: int64 := vaRVA - (textBase + self.vallocCallOff + 6);
+      self.wxb_patch32(self.vallocCallOff + 2, rva);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -775,7 +836,10 @@ pub type WinX86Backend = class {
     if ((linuxRelMain & 0x80000000) != 0) {
       linuxRelMain := linuxRelMain | ((-1) & ~0xFFFFFFFF);
     }
-    var relMain: int64 := linuxRelMain + 14;
+    // WP-A2: with the trampoline zone now padded to CG_H_USER (1372) and user code
+    // copied from cgBuf[CG_H_USER], the win/Linux user-code positions differ by a
+    // constant that cancels in the rel32 — so relMain == linuxRelMain (no +14 fudge).
+    var relMain: int64 := linuxRelMain;
 
     // Emit preamble (WIN_PREAMBLE_SZ = 508 bytes)
     self.wxb_emitPrintStr();     // 68 bytes, offsets 0..67
@@ -783,24 +847,33 @@ pub type WinX86Backend = class {
     self.wxb_emitStrSub();       // 58 bytes, offsets 213..270
     self.wxb_emitArgvSetup();    // 237 bytes, offsets 271..507
 
-    // Emit trampoline zone (WIN_HELPERS_SZ = 1266 bytes = CG_H_USER)
-    // Each trampoline is at the SAME offset as its Linux counterpart (relative to zone start)
-    // so that user-code rel32 call values remain identical in both binaries.
-    self.wxb_emitStart(relMain); // 79 bytes (65+14 NOPs), zone offsets  0.. 78 (CG_H_START..CG_H_STRLEN-1)
-    self.wxb_emitStrlen();       // 15 bytes,                zone offsets 79.. 93 (CG_H_STRLEN..CG_H_PRINTSTR-1)
-    self.wxb_emitPrintStrJmp();  // 26 bytes,                zone offsets 94..119 (CG_H_PRINTSTR..CG_H_PRINTINT-1)
-    self.wxb_emitPrintIntJmp();  // 104 bytes,               zone offsets 120..223 (CG_H_PRINTINT..CG_H_STRSUB-1)
-    self.wxb_emitStrSubJmp();    // 71 bytes,                zone offsets 224..294 (CG_H_STRSUB..CG_H_STRCHARAT-1)
-    self.wxb_emitStrCharAt();    // 6 bytes,                 zone offsets 295..300 (CG_H_STRCHARAT..CG_H_EPRINTSTR-1)
-    self.wxb_emitEPrintStrJmp(); // 26 bytes,                zone offsets 301..326 (CG_H_EPRINTSTR..CG_H_EPRINTINT-1)
-    self.wxb_emitEPrintIntJmp(); // 104 bytes,               zone offsets 327..430 (CG_H_EPRINTINT..CG_H_F64STR-1)
-    self.wxb_emitStub(335);      // 335 NOP bytes,           zone offsets 431..765 (CG_H_F64STR..CG_H_STRSPLIT-1)
-    self.wxb_emitStub(215);      // 215 NOP bytes,           zone offsets 766..980 (CG_H_STRSPLIT..CG_H_MAP_NEW-1)
-    self.wxb_emitStub(47);       //  47 NOP bytes,           zone offsets 981..1027 (CG_H_MAP_NEW..CG_H_MAP_SET-1)
-    self.wxb_emitStub(93);       //  93 NOP bytes,           zone offsets 1028..1120 (CG_H_MAP_SET..CG_H_MAP_GET-1)
-    self.wxb_emitStub(72);       //  72 NOP bytes,           zone offsets 1121..1192 (CG_H_MAP_GET..CG_H_MAP_HAS-1)
-    self.wxb_emitStub(73);       //  73 NOP bytes,           zone offsets 1193..1265 (CG_H_MAP_HAS..CG_H_USER-1)
-    // Total trampoline zone: 79+15+26+104+71+6+26+104+335+215+47+93+72+73 = 1266 = CG_H_USER ✓
+    // WP-A2: Emit trampoline zone. Each trampoline is padded to its EXACT WIN_H_*
+    // offset (mirroring CG_H_* in codegen_x86.lyx) so user-code rel32 calls — which
+    // use the Linux CG_H_* offsets — land on the right trampoline. Previously the
+    // helpers were packed contiguously; because win64 strlen (15B) is shorter than
+    // the Linux slot (24B), every later trampoline was shifted, so PrintStr calls
+    // hit a NOP sled and fell through into PrintInt (string ptr printed as a number).
+    var zoneStart: int64 := self.codeLen;
+    self.wxb_padTo(zoneStart, WIN_H_START);     self.wxb_emitStart(relMain);
+    self.wxb_padTo(zoneStart, WIN_H_STRLEN);    self.wxb_emitStrlen();
+    self.wxb_padTo(zoneStart, WIN_H_PRINTSTR);  self.wxb_emitJmpTo(WIN_PS_OFF);
+    self.wxb_padTo(zoneStart, WIN_H_PRINTINT);  self.wxb_emitJmpTo(WIN_PI_OFF);
+    self.wxb_padTo(zoneStart, WIN_H_STRSUB);    self.wxb_emitJmpTo(WIN_SS_OFF);
+    self.wxb_padTo(zoneStart, WIN_H_STRCHARAT); self.wxb_emitStrCharAt();
+    self.wxb_padTo(zoneStart, WIN_H_EPRINTSTR); self.wxb_emitJmpTo(WIN_PS_OFF);
+    self.wxb_padTo(zoneStart, WIN_H_EPRINTINT); self.wxb_emitJmpTo(WIN_PI_OFF);
+    // Unimplemented helpers: a bare RET at each offset so any call returns cleanly
+    // (canary init/fail become no-ops → effectively disabled, not a crash).
+    self.wxb_padTo(zoneStart, WIN_H_F64STR);      self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_STRSPLIT);    self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_MAP_NEW);     self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_MAP_SET);     self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_MAP_GET);     self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_MAP_HAS);     self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_STACK_FAIL);  self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_CANARY_INIT); self.wxb_ce8(0xC3);
+    // Pad remainder so user code starts exactly at WIN_H_USER (= CG_H_USER).
+    self.wxb_padTo(zoneStart, WIN_H_USER);
 
     // Copy user code verbatim (all rel32 values remain correct because:
     //   user code is shifted by WIN_USER_OFF=1774 in Windows vs CG_H_USER=1266 in Linux,
@@ -821,8 +894,136 @@ pub type WinX86Backend = class {
       j := j + 1;
     }
 
+    // WP-A2.2: rebase absolute VMT pointers in the appended user/data zone and
+    // collect their .text RVAs for the .reloc section.
+    self.wxb_applyBaseRelocs(cgLen);
+
+    // WP-A2.3: replace inline Linux mmap syscalls (alloc/new/dynarray) with calls
+    // to a VirtualAlloc-based helper appended here at code end.
+    var userEnd: int64 := self.codeLen;
+    var vallocOff: int64 := self.codeLen;
+    self.wxb_emitVAlloc();
+    self.wxb_replaceMmap(vallocOff, userEnd);
+
     // Patch IAT indirect call rel32 fields now that codeLen is final
     self.wxb_patchIAT();
+  }
+
+  // WP-A2.3: VirtualAlloc-based heap helper. Entry: rsi = size (Linux mmap arg2).
+  // Returns rax = base. 41 bytes; the `call [VirtualAlloc]` rel32 is patched in
+  // wxb_patchIAT via vallocCallOff.
+  fn wxb_emitVAlloc() {
+    var start: int64 := self.codeLen;
+    self.wxb_ce8(0x55);                                          // push rbp
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xE5); // mov rbp, rsp
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xE4); self.wxb_ce8(0xF0); // and rsp, -16
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x20); // sub rsp, 0x20
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF2); // mov rdx, rsi  (dwSize)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x31); self.wxb_ce8(0xC9); // xor rcx, rcx  (lpAddress=NULL)
+    self.wxb_ce8(0x41); self.wxb_ce8(0xB8); self.wxb_ce8(0x00); self.wxb_ce8(0x30); self.wxb_ce8(0x00); self.wxb_ce8(0x00); // mov r8d, 0x3000
+    self.wxb_ce8(0x41); self.wxb_ce8(0xB9); self.wxb_ce8(0x04); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); // mov r9d, 0x04
+    self.vallocCallOff := self.codeLen;                          // offset of FF 15
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);    // call [VirtualAlloc_IAT] (patched)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xEC); // mov rsp, rbp
+    self.wxb_ce8(0x5D);                                          // pop rbp
+    self.wxb_ce8(0xC3);                                          // ret
+    var _unused: int64 := start;
+  }
+
+  // WP-A2.3: scan [from, to) for the 12-byte inline mmap pattern
+  // (48 B8 09 00*7  0F 05 = movabs rax,9; syscall) and rewrite each to
+  // `call vallocOff` (E8 rel32) + NOP padding. Size is already in rsi.
+  fn wxb_replaceMmap(vallocOff: int64, endOff: int64) {
+    var i: int64 := WIN_USER_OFF;
+    while (i + 12 <= endOff) {
+      if (peek8(self.code + i) == 0x48 && peek8(self.code + i + 1) == 0xB8 &&
+          peek8(self.code + i + 2) == 0x09 && peek8(self.code + i + 3) == 0x00 &&
+          peek8(self.code + i + 4) == 0x00 && peek8(self.code + i + 5) == 0x00 &&
+          peek8(self.code + i + 6) == 0x00 && peek8(self.code + i + 7) == 0x00 &&
+          peek8(self.code + i + 8) == 0x00 && peek8(self.code + i + 9) == 0x00 &&
+          peek8(self.code + i + 10) == 0x0F && peek8(self.code + i + 11) == 0x05) {
+        var rel: int64 := vallocOff - (i + 5);
+        poke8(self.code + i, 0xE8);
+        poke8(self.code + i + 1, rel & 0xFF);
+        poke8(self.code + i + 2, (rel >> 8) & 0xFF);
+        poke8(self.code + i + 3, (rel >> 16) & 0xFF);
+        poke8(self.code + i + 4, (rel >> 24) & 0xFF);
+        var p: int64 := 5;
+        while (p < 12) { poke8(self.code + i + p, 0x90); p := p + 1; }
+        i := i + 12;
+      } else {
+        i := i + 1;
+      }
+    }
+  }
+
+  // WP-A2.2: For each base reloc (ELF image RVA of an 8-byte absolute pointer),
+  // map it to the win code-buffer position, add the constant ELF→win delta to the
+  // stored value (so it is correct at the preferred ImageBase), and record the
+  // .text RVA (sorted) so wxb_buildRelocBlocks can emit IMAGE_REL_BASED_DIR64.
+  fn wxb_applyBaseRelocs(cgLen: int64) {
+    self.relocContentLen := 0;
+    if (self.baseRelocCount <= 0) { return; }
+    // delta = (win vaddr of a user/data byte) − (its ELF vaddr); constant across
+    // the verbatim-copied user code + data zone.
+    var delta: int64 := (WIN_IMAGE_BASE + WIN_TEXT_RVA + WIN_USER_OFF - WIN_H_USER)
+                        - (WIN_SRC_ELF_BASE + WIN_SRC_CODE_OFF);
+    var i: int64 := 0;
+    while (i < self.baseRelocCount) {
+      var rva: int64 := peek64(self.baseRelocBuf + i * 8);
+      var o:   int64 := rva - WIN_SRC_CODE_OFF;             // offset into cg code+data image
+      var winOff: int64 := WIN_USER_OFF + o - WIN_H_USER;  // offset into win .text buffer
+      var v: int64 := peek64(self.code + winOff);
+      poke64(self.code + winOff, v + delta);
+      poke64(self.peRVAs + i * 8, WIN_TEXT_RVA + winOff);   // .text RVA of the pointer
+      i := i + 1;
+    }
+    // Insertion-sort the RVAs ascending (page grouping needs sorted input).
+    var a: int64 := 1;
+    while (a < self.baseRelocCount) {
+      var key: int64 := peek64(self.peRVAs + a * 8);
+      var b: int64 := a - 1;
+      while (b >= 0 && peek64(self.peRVAs + b * 8) > key) {
+        poke64(self.peRVAs + (b + 1) * 8, peek64(self.peRVAs + b * 8));
+        b := b - 1;
+      }
+      poke64(self.peRVAs + (b + 1) * 8, key);
+      a := a + 1;
+    }
+    self.wxb_buildRelocBlocks();
+  }
+
+  // WP-A2.2: build IMAGE_BASE_RELOCATION blocks (grouped per 4 KB page) from the
+  // sorted peRVAs into self.relocContent. Each entry = (10<<12)|(offset&0xFFF),
+  // type 10 = IMAGE_REL_BASED_DIR64. Bounded to one FILE_ALIGN (512 B) page of
+  // content — ample for typical vtable counts.
+  fn wxb_buildRelocBlocks() {
+    var pos: int64 := 0;          // write cursor in relocContent
+    var i: int64 := 0;
+    while (i < self.baseRelocCount) {
+      var page: int64 := peek64(self.peRVAs + i * 8) & ~(0xFFF);
+      // count entries on this page
+      var k: int64 := i;
+      while (k < self.baseRelocCount && (peek64(self.peRVAs + k * 8) & ~(0xFFF)) == page) {
+        k := k + 1;
+      }
+      var nEnt: int64 := k - i;
+      var blockSize: int64 := 8 + nEnt * 2;
+      if ((blockSize & 2) != 0) { blockSize := blockSize + 2; }  // 4-byte align
+      // block header
+      poke32(self.relocContent + pos, page);          pos := pos + 4;
+      poke32(self.relocContent + pos, blockSize);     pos := pos + 4;
+      var e: int64 := i;
+      while (e < k) {
+        var off: int64 := peek64(self.peRVAs + e * 8) - page;
+        poke16(self.relocContent + pos, (10 << 12) | (off & 0xFFF));
+        pos := pos + 2;
+        e := e + 1;
+      }
+      if ((nEnt & 1) != 0) { poke16(self.relocContent + pos, 0); pos := pos + 2; }  // pad entry
+      i := k;
+    }
+    self.relocContentLen := pos;
   }
 
   // ------------------------------------------------------------------
@@ -968,6 +1169,9 @@ pub type WinX86Backend = class {
     var relocFileOff: int64 := rdataFileOff + WIN_FILE_ALIGN;
     var imageSize: int64 := relocRVA + WIN_SEC_ALIGN;
     var entryRVA: int64 := WIN_TEXT_RVA + WIN_ENTRY_OFF;
+    // WP-A2.2: .reloc virtual size = real block content if any, else the empty block.
+    var relocVSize: int64 := 8;
+    if (self.relocContentLen > 0) { relocVSize := self.relocContentLen; }
 
     // ---- DOS Header (64 bytes) + DOS Stub (64 bytes) ----
     self.wxb_writeDosHeader(128);  // PE signature at file offset 128
@@ -1019,7 +1223,7 @@ pub type WinX86Backend = class {
     self.wxb_oe32(0); self.wxb_oe32(0);  // [2] Resource
     self.wxb_oe32(0); self.wxb_oe32(0);  // [3] Exception
     self.wxb_oe32(0); self.wxb_oe32(0);  // [4] Security
-    self.wxb_oe32(relocRVA); self.wxb_oe32(8);  // [5] BaseReloc (empty block → ASLR-safe)
+    self.wxb_oe32(relocRVA); self.wxb_oe32(relocVSize);  // [5] BaseReloc
     self.wxb_oe32(0); self.wxb_oe32(0);  // [6] Debug
     self.wxb_oe32(0); self.wxb_oe32(0);  // [7] Architecture
     self.wxb_oe32(0); self.wxb_oe32(0);  // [8] GlobalPtr
@@ -1057,7 +1261,7 @@ pub type WinX86Backend = class {
 
     // ---- Section Header .reloc (40 bytes) — 3×40=120; total headers=512, no pad needed ----
     self.wxb_oName8(".reloc"c, 6);
-    self.wxb_oe32(8);               // VirtualSize = 8 (one empty IMAGE_BASE_RELOCATION block)
+    self.wxb_oe32(relocVSize);      // VirtualSize (real blocks if any, else empty block)
     self.wxb_oe32(relocRVA);        // VirtualAddress
     self.wxb_oe32(WIN_FILE_ALIGN);  // SizeOfRawData = 512
     self.wxb_oe32(relocFileOff);    // PointerToRawData
@@ -1081,10 +1285,21 @@ pub type WinX86Backend = class {
     // ---- .rdata section ----
     self.wxb_writeRdata(rdataRVA);
 
-    // ---- .reloc section (8 bytes + pad): empty IMAGE_BASE_RELOCATION block ----
-    self.wxb_oe32(0);                        // VirtualAddress = 0 (page 0)
-    self.wxb_oe32(8);                        // SizeOfBlock = 8 (header only, no entries)
-    self.wxb_oZeros(WIN_FILE_ALIGN - 8);     // pad to FILE_ALIGNMENT
+    // ---- .reloc section ----
+    if (self.relocContentLen > 0) {
+      // WP-A2.2: emit the real IMAGE_BASE_RELOCATION blocks, then pad to FILE_ALIGN.
+      var r: int64 := 0;
+      while (r < self.relocContentLen) {
+        self.wxb_oe8(peek8(self.relocContent + r));
+        r := r + 1;
+      }
+      self.wxb_oZeros(WIN_FILE_ALIGN - self.relocContentLen);
+    } else {
+      // No absolute pointers: one empty block (page 0, header only) → ASLR-safe.
+      self.wxb_oe32(0);
+      self.wxb_oe32(8);
+      self.wxb_oZeros(WIN_FILE_ALIGN - 8);
+    }
 
     // ---- Write to file (O_WRONLY|O_CREAT|O_TRUNC=577, mode 0755=493) ----
     var fd: int64 := open(path, 577, 493);
@@ -1118,6 +1333,22 @@ pub type WinX86Backend = class {
     self.outCap  := 65536;
     self.out     := alloc(self.outCap);
     self.outLen  := 0;
+    self.baseRelocBuf    := 0;
+    self.baseRelocCount  := 0;
+    self.peRVAs          := 0;
+    self.relocContent    := 0;
+    self.relocContentLen := 0;
+    self.vallocCallOff   := 0 - 1;
+  }
+
+  // WP-A2.2: hand over the codegen base-reloc table BEFORE Build().
+  pub fn SetBaseRelocs(buf: int64, count: int64) {
+    self.baseRelocBuf   := buf;
+    self.baseRelocCount := count;
+    if (count > 0) {
+      self.peRVAs       := alloc(count * 8);
+      self.relocContent := alloc(WIN_FILE_ALIGN);
+    }
   }
 
 };
