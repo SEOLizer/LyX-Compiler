@@ -122,6 +122,10 @@ test: lyxc
 	@rm -f /tmp/lyxc_sec_wp26_test
 	@echo "OK"
 
+	@echo "--- sec_wp27: read()-Fehlerbehandlung OOB (7 tests) ---"
+	@bash tests/sec_wp27_read_test.sh
+	@echo "OK"
+
 	@echo "--- sec_wp28: kernel-mode-guard allowlist (20 tests) ---"
 	@bash tests/sec_wp28_kernel_guard_test.sh
 	@echo "OK"
