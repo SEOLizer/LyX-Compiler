@@ -89,6 +89,12 @@ con WIN_ENTRY_OFF:    int64 := 508;   // = WIN_PREAMBLE_SZ, _start offset in .te
 con WIN_FILE_ALIGN:   int64 := 0x200;
 con WIN_SEC_ALIGN:    int64 := 0x1000;
 
+// WP-A2.2: source (ELF) link base used by codegen for absolute pointers — mirror
+// CG_ELF_BASE / CG_CODE_OFF in codegen_x86.lyx. Base relocs carry image RVAs
+// relative to CG_ELF_BASE; the PE consumer rebases each value + emits .reloc.
+con WIN_SRC_ELF_BASE: int64 := 4194304;  // 0x400000 = CG_ELF_BASE
+con WIN_SRC_CODE_OFF: int64 := 176;      // CG_CODE_OFF
+
 // .rdata layout relative offsets (rdataRVA computed dynamically)
 con WIN_RDATA_IDT_OFF:    int64 := 0;    // Import Directory Table (2 * 20 = 40 bytes)
 con WIN_RDATA_INT_OFF:    int64 := 40;   // Import Name Table (5+1 * 8 = 48 bytes)
@@ -121,6 +127,13 @@ pub type WinX86Backend = class {
   out:    int64;
   outLen: int64;
   outCap: int64;
+
+  // WP-A2.2: base relocations from codegen (image RVAs of absolute pointers).
+  baseRelocBuf:    int64;
+  baseRelocCount:  int64;
+  peRVAs:          int64;   // sorted .text RVAs of the relocated pointers
+  relocContent:    int64;   // built IMAGE_BASE_RELOCATION blocks
+  relocContentLen: int64;
 
   // ------------------------------------------------------------------
   // Code buffer primitives
@@ -871,8 +884,81 @@ pub type WinX86Backend = class {
       j := j + 1;
     }
 
+    // WP-A2.2: rebase absolute VMT pointers in the appended user/data zone and
+    // collect their .text RVAs for the .reloc section.
+    self.wxb_applyBaseRelocs(cgLen);
+
     // Patch IAT indirect call rel32 fields now that codeLen is final
     self.wxb_patchIAT();
+  }
+
+  // WP-A2.2: For each base reloc (ELF image RVA of an 8-byte absolute pointer),
+  // map it to the win code-buffer position, add the constant ELF→win delta to the
+  // stored value (so it is correct at the preferred ImageBase), and record the
+  // .text RVA (sorted) so wxb_buildRelocBlocks can emit IMAGE_REL_BASED_DIR64.
+  fn wxb_applyBaseRelocs(cgLen: int64) {
+    self.relocContentLen := 0;
+    if (self.baseRelocCount <= 0) { return; }
+    // delta = (win vaddr of a user/data byte) − (its ELF vaddr); constant across
+    // the verbatim-copied user code + data zone.
+    var delta: int64 := (WIN_IMAGE_BASE + WIN_TEXT_RVA + WIN_USER_OFF - WIN_H_USER)
+                        - (WIN_SRC_ELF_BASE + WIN_SRC_CODE_OFF);
+    var i: int64 := 0;
+    while (i < self.baseRelocCount) {
+      var rva: int64 := peek64(self.baseRelocBuf + i * 8);
+      var o:   int64 := rva - WIN_SRC_CODE_OFF;             // offset into cg code+data image
+      var winOff: int64 := WIN_USER_OFF + o - WIN_H_USER;  // offset into win .text buffer
+      var v: int64 := peek64(self.code + winOff);
+      poke64(self.code + winOff, v + delta);
+      poke64(self.peRVAs + i * 8, WIN_TEXT_RVA + winOff);   // .text RVA of the pointer
+      i := i + 1;
+    }
+    // Insertion-sort the RVAs ascending (page grouping needs sorted input).
+    var a: int64 := 1;
+    while (a < self.baseRelocCount) {
+      var key: int64 := peek64(self.peRVAs + a * 8);
+      var b: int64 := a - 1;
+      while (b >= 0 && peek64(self.peRVAs + b * 8) > key) {
+        poke64(self.peRVAs + (b + 1) * 8, peek64(self.peRVAs + b * 8));
+        b := b - 1;
+      }
+      poke64(self.peRVAs + (b + 1) * 8, key);
+      a := a + 1;
+    }
+    self.wxb_buildRelocBlocks();
+  }
+
+  // WP-A2.2: build IMAGE_BASE_RELOCATION blocks (grouped per 4 KB page) from the
+  // sorted peRVAs into self.relocContent. Each entry = (10<<12)|(offset&0xFFF),
+  // type 10 = IMAGE_REL_BASED_DIR64. Bounded to one FILE_ALIGN (512 B) page of
+  // content — ample for typical vtable counts.
+  fn wxb_buildRelocBlocks() {
+    var pos: int64 := 0;          // write cursor in relocContent
+    var i: int64 := 0;
+    while (i < self.baseRelocCount) {
+      var page: int64 := peek64(self.peRVAs + i * 8) & ~(0xFFF);
+      // count entries on this page
+      var k: int64 := i;
+      while (k < self.baseRelocCount && (peek64(self.peRVAs + k * 8) & ~(0xFFF)) == page) {
+        k := k + 1;
+      }
+      var nEnt: int64 := k - i;
+      var blockSize: int64 := 8 + nEnt * 2;
+      if ((blockSize & 2) != 0) { blockSize := blockSize + 2; }  // 4-byte align
+      // block header
+      poke32(self.relocContent + pos, page);          pos := pos + 4;
+      poke32(self.relocContent + pos, blockSize);     pos := pos + 4;
+      var e: int64 := i;
+      while (e < k) {
+        var off: int64 := peek64(self.peRVAs + e * 8) - page;
+        poke16(self.relocContent + pos, (10 << 12) | (off & 0xFFF));
+        pos := pos + 2;
+        e := e + 1;
+      }
+      if ((nEnt & 1) != 0) { poke16(self.relocContent + pos, 0); pos := pos + 2; }  // pad entry
+      i := k;
+    }
+    self.relocContentLen := pos;
   }
 
   // ------------------------------------------------------------------
@@ -1018,6 +1104,9 @@ pub type WinX86Backend = class {
     var relocFileOff: int64 := rdataFileOff + WIN_FILE_ALIGN;
     var imageSize: int64 := relocRVA + WIN_SEC_ALIGN;
     var entryRVA: int64 := WIN_TEXT_RVA + WIN_ENTRY_OFF;
+    // WP-A2.2: .reloc virtual size = real block content if any, else the empty block.
+    var relocVSize: int64 := 8;
+    if (self.relocContentLen > 0) { relocVSize := self.relocContentLen; }
 
     // ---- DOS Header (64 bytes) + DOS Stub (64 bytes) ----
     self.wxb_writeDosHeader(128);  // PE signature at file offset 128
@@ -1069,7 +1158,7 @@ pub type WinX86Backend = class {
     self.wxb_oe32(0); self.wxb_oe32(0);  // [2] Resource
     self.wxb_oe32(0); self.wxb_oe32(0);  // [3] Exception
     self.wxb_oe32(0); self.wxb_oe32(0);  // [4] Security
-    self.wxb_oe32(relocRVA); self.wxb_oe32(8);  // [5] BaseReloc (empty block → ASLR-safe)
+    self.wxb_oe32(relocRVA); self.wxb_oe32(relocVSize);  // [5] BaseReloc
     self.wxb_oe32(0); self.wxb_oe32(0);  // [6] Debug
     self.wxb_oe32(0); self.wxb_oe32(0);  // [7] Architecture
     self.wxb_oe32(0); self.wxb_oe32(0);  // [8] GlobalPtr
@@ -1107,7 +1196,7 @@ pub type WinX86Backend = class {
 
     // ---- Section Header .reloc (40 bytes) — 3×40=120; total headers=512, no pad needed ----
     self.wxb_oName8(".reloc"c, 6);
-    self.wxb_oe32(8);               // VirtualSize = 8 (one empty IMAGE_BASE_RELOCATION block)
+    self.wxb_oe32(relocVSize);      // VirtualSize (real blocks if any, else empty block)
     self.wxb_oe32(relocRVA);        // VirtualAddress
     self.wxb_oe32(WIN_FILE_ALIGN);  // SizeOfRawData = 512
     self.wxb_oe32(relocFileOff);    // PointerToRawData
@@ -1131,10 +1220,21 @@ pub type WinX86Backend = class {
     // ---- .rdata section ----
     self.wxb_writeRdata(rdataRVA);
 
-    // ---- .reloc section (8 bytes + pad): empty IMAGE_BASE_RELOCATION block ----
-    self.wxb_oe32(0);                        // VirtualAddress = 0 (page 0)
-    self.wxb_oe32(8);                        // SizeOfBlock = 8 (header only, no entries)
-    self.wxb_oZeros(WIN_FILE_ALIGN - 8);     // pad to FILE_ALIGNMENT
+    // ---- .reloc section ----
+    if (self.relocContentLen > 0) {
+      // WP-A2.2: emit the real IMAGE_BASE_RELOCATION blocks, then pad to FILE_ALIGN.
+      var r: int64 := 0;
+      while (r < self.relocContentLen) {
+        self.wxb_oe8(peek8(self.relocContent + r));
+        r := r + 1;
+      }
+      self.wxb_oZeros(WIN_FILE_ALIGN - self.relocContentLen);
+    } else {
+      // No absolute pointers: one empty block (page 0, header only) → ASLR-safe.
+      self.wxb_oe32(0);
+      self.wxb_oe32(8);
+      self.wxb_oZeros(WIN_FILE_ALIGN - 8);
+    }
 
     // ---- Write to file (O_WRONLY|O_CREAT|O_TRUNC=577, mode 0755=493) ----
     var fd: int64 := open(path, 577, 493);
@@ -1168,6 +1268,21 @@ pub type WinX86Backend = class {
     self.outCap  := 65536;
     self.out     := alloc(self.outCap);
     self.outLen  := 0;
+    self.baseRelocBuf    := 0;
+    self.baseRelocCount  := 0;
+    self.peRVAs          := 0;
+    self.relocContent    := 0;
+    self.relocContentLen := 0;
+  }
+
+  // WP-A2.2: hand over the codegen base-reloc table BEFORE Build().
+  pub fn SetBaseRelocs(buf: int64, count: int64) {
+    self.baseRelocBuf   := buf;
+    self.baseRelocCount := count;
+    if (count > 0) {
+      self.peRVAs       := alloc(count * 8);
+      self.relocContent := alloc(WIN_FILE_ALIGN);
+    }
   }
 
 };
