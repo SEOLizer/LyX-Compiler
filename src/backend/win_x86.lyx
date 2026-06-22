@@ -135,6 +135,10 @@ pub type WinX86Backend = class {
   relocContent:    int64;   // built IMAGE_BASE_RELOCATION blocks
   relocContentLen: int64;
 
+  // WP-A2.3: win64 heap allocator helper. Linux mmap syscalls (alloc/new/dynarray)
+  // are rewritten to call this VirtualAlloc-based helper appended at code end.
+  vallocCallOff:   int64;   // code offset of the helper's `call [VirtualAlloc]` (-1 = none)
+
   // ------------------------------------------------------------------
   // Code buffer primitives
   // ------------------------------------------------------------------
@@ -798,6 +802,12 @@ pub type WinX86Backend = class {
     // _start ExitProcess call at code[561], instruction end at 567
     var r4: int64 := epRVA - (textBase + WIN_CALL_EP + 6);
     self.wxb_patch32(WIN_CALL_EP + 2, r4);
+
+    // WP-A2.3: VirtualAlloc call inside the appended heap helper (dynamic offset).
+    if (self.vallocCallOff >= 0) {
+      var rva: int64 := vaRVA - (textBase + self.vallocCallOff + 6);
+      self.wxb_patch32(self.vallocCallOff + 2, rva);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -888,8 +898,63 @@ pub type WinX86Backend = class {
     // collect their .text RVAs for the .reloc section.
     self.wxb_applyBaseRelocs(cgLen);
 
+    // WP-A2.3: replace inline Linux mmap syscalls (alloc/new/dynarray) with calls
+    // to a VirtualAlloc-based helper appended here at code end.
+    var userEnd: int64 := self.codeLen;
+    var vallocOff: int64 := self.codeLen;
+    self.wxb_emitVAlloc();
+    self.wxb_replaceMmap(vallocOff, userEnd);
+
     // Patch IAT indirect call rel32 fields now that codeLen is final
     self.wxb_patchIAT();
+  }
+
+  // WP-A2.3: VirtualAlloc-based heap helper. Entry: rsi = size (Linux mmap arg2).
+  // Returns rax = base. 41 bytes; the `call [VirtualAlloc]` rel32 is patched in
+  // wxb_patchIAT via vallocCallOff.
+  fn wxb_emitVAlloc() {
+    var start: int64 := self.codeLen;
+    self.wxb_ce8(0x55);                                          // push rbp
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xE5); // mov rbp, rsp
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xE4); self.wxb_ce8(0xF0); // and rsp, -16
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x20); // sub rsp, 0x20
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF2); // mov rdx, rsi  (dwSize)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x31); self.wxb_ce8(0xC9); // xor rcx, rcx  (lpAddress=NULL)
+    self.wxb_ce8(0x41); self.wxb_ce8(0xB8); self.wxb_ce8(0x00); self.wxb_ce8(0x30); self.wxb_ce8(0x00); self.wxb_ce8(0x00); // mov r8d, 0x3000
+    self.wxb_ce8(0x41); self.wxb_ce8(0xB9); self.wxb_ce8(0x04); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); // mov r9d, 0x04
+    self.vallocCallOff := self.codeLen;                          // offset of FF 15
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);    // call [VirtualAlloc_IAT] (patched)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xEC); // mov rsp, rbp
+    self.wxb_ce8(0x5D);                                          // pop rbp
+    self.wxb_ce8(0xC3);                                          // ret
+    var _unused: int64 := start;
+  }
+
+  // WP-A2.3: scan [from, to) for the 12-byte inline mmap pattern
+  // (48 B8 09 00*7  0F 05 = movabs rax,9; syscall) and rewrite each to
+  // `call vallocOff` (E8 rel32) + NOP padding. Size is already in rsi.
+  fn wxb_replaceMmap(vallocOff: int64, endOff: int64) {
+    var i: int64 := WIN_USER_OFF;
+    while (i + 12 <= endOff) {
+      if (peek8(self.code + i) == 0x48 && peek8(self.code + i + 1) == 0xB8 &&
+          peek8(self.code + i + 2) == 0x09 && peek8(self.code + i + 3) == 0x00 &&
+          peek8(self.code + i + 4) == 0x00 && peek8(self.code + i + 5) == 0x00 &&
+          peek8(self.code + i + 6) == 0x00 && peek8(self.code + i + 7) == 0x00 &&
+          peek8(self.code + i + 8) == 0x00 && peek8(self.code + i + 9) == 0x00 &&
+          peek8(self.code + i + 10) == 0x0F && peek8(self.code + i + 11) == 0x05) {
+        var rel: int64 := vallocOff - (i + 5);
+        poke8(self.code + i, 0xE8);
+        poke8(self.code + i + 1, rel & 0xFF);
+        poke8(self.code + i + 2, (rel >> 8) & 0xFF);
+        poke8(self.code + i + 3, (rel >> 16) & 0xFF);
+        poke8(self.code + i + 4, (rel >> 24) & 0xFF);
+        var p: int64 := 5;
+        while (p < 12) { poke8(self.code + i + p, 0x90); p := p + 1; }
+        i := i + 12;
+      } else {
+        i := i + 1;
+      }
+    }
   }
 
   // WP-A2.2: For each base reloc (ELF image RVA of an 8-byte absolute pointer),
@@ -1273,6 +1338,7 @@ pub type WinX86Backend = class {
     self.peRVAs          := 0;
     self.relocContent    := 0;
     self.relocContentLen := 0;
+    self.vallocCallOff   := 0 - 1;
   }
 
   // WP-A2.2: hand over the codegen base-reloc table BEFORE Build().
