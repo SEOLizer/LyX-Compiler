@@ -29,10 +29,33 @@
 
 import src.std.alloc;
 con WIN_PREAMBLE_SZ:   int64 := 508;
-// WP-4.3: WIN_HELPERS_SZ must equal CG_H_USER (currently 1266) so that
+// WP-A2: WIN_HELPERS_SZ MUST equal CG_H_USER from codegen_x86.lyx so that
 // user-code rel32 call offsets to helpers are identical in Linux and Windows.
-con WIN_HELPERS_SZ:    int64 := 1266;  // = CG_H_USER from codegen_x86.lyx
-con WIN_USER_OFF:      int64 := 1774;  // WIN_PREAMBLE_SZ + WIN_HELPERS_SZ
+// The trampoline zone is now emitted with explicit padding to each WIN_H_*
+// offset (see wxb_padTo below), so individual helper SIZE drift can no longer
+// shift later trampolines — only these offset constants must track CG_H_*.
+con WIN_HELPERS_SZ:    int64 := 1372;  // = CG_H_USER from codegen_x86.lyx
+con WIN_USER_OFF:      int64 := 1880;  // WIN_PREAMBLE_SZ + WIN_HELPERS_SZ
+
+// Trampoline target offsets within the helper zone — MUST mirror CG_H_* in
+// codegen_x86.lyx exactly (user-code call sites use those Linux offsets).
+con WIN_H_START:      int64 := 0;
+con WIN_H_STRLEN:     int64 := 79;
+con WIN_H_PRINTSTR:   int64 := 103;
+con WIN_H_PRINTINT:   int64 := 129;
+con WIN_H_STRSUB:     int64 := 233;
+con WIN_H_STRCHARAT:  int64 := 304;
+con WIN_H_EPRINTSTR:  int64 := 310;
+con WIN_H_EPRINTINT:  int64 := 336;
+con WIN_H_F64STR:     int64 := 440;
+con WIN_H_STRSPLIT:   int64 := 775;
+con WIN_H_MAP_NEW:    int64 := 990;
+con WIN_H_MAP_SET:    int64 := 1037;
+con WIN_H_MAP_GET:    int64 := 1130;
+con WIN_H_MAP_HAS:    int64 := 1202;
+con WIN_H_STACK_FAIL: int64 := 1275;
+con WIN_H_CANARY_INIT: int64 := 1345;
+con WIN_H_USER:       int64 := 1372;
 
 // Preamble sub-function offsets within code buffer
 con WIN_PS_OFF:   int64 := 0;     // win_print_str_impl
@@ -695,6 +718,21 @@ pub type WinX86Backend = class {
     while (i < n) { self.wxb_ce8(0x90); i := i + 1; }
   }
 
+  // WP-A2: pad the code buffer with NOPs until the helper-zone offset (relative
+  // to zoneStart) reaches `target`. Guarantees each trampoline lands exactly on
+  // its WIN_H_* offset regardless of preceding helper sizes.
+  fn wxb_padTo(zoneStart: int64, target: int64) {
+    while ((self.codeLen - zoneStart) < target) { self.wxb_ce8(0x90); }
+  }
+
+  // WP-A2: emit a 5-byte `JMP rel32` to absolute code offset `targetOff`,
+  // computing rel32 from the current position (position-independent).
+  fn wxb_emitJmpTo(targetOff: int64) {
+    self.wxb_ce8(0xE9);
+    var endOff: int64 := self.codeLen + 4;  // codeLen now at rel32 start; +4 = after it
+    self.wxb_ce32(targetOff - endOff);
+  }
+
   // ------------------------------------------------------------------
   // Patch IAT rel32 fields after codeLen is known (so rdataRVA can be computed).
   // Called from wxb_buildCode after all code is assembled.
@@ -775,7 +813,10 @@ pub type WinX86Backend = class {
     if ((linuxRelMain & 0x80000000) != 0) {
       linuxRelMain := linuxRelMain | ((-1) & ~0xFFFFFFFF);
     }
-    var relMain: int64 := linuxRelMain + 14;
+    // WP-A2: with the trampoline zone now padded to CG_H_USER (1372) and user code
+    // copied from cgBuf[CG_H_USER], the win/Linux user-code positions differ by a
+    // constant that cancels in the rel32 — so relMain == linuxRelMain (no +14 fudge).
+    var relMain: int64 := linuxRelMain;
 
     // Emit preamble (WIN_PREAMBLE_SZ = 508 bytes)
     self.wxb_emitPrintStr();     // 68 bytes, offsets 0..67
@@ -783,24 +824,33 @@ pub type WinX86Backend = class {
     self.wxb_emitStrSub();       // 58 bytes, offsets 213..270
     self.wxb_emitArgvSetup();    // 237 bytes, offsets 271..507
 
-    // Emit trampoline zone (WIN_HELPERS_SZ = 1266 bytes = CG_H_USER)
-    // Each trampoline is at the SAME offset as its Linux counterpart (relative to zone start)
-    // so that user-code rel32 call values remain identical in both binaries.
-    self.wxb_emitStart(relMain); // 79 bytes (65+14 NOPs), zone offsets  0.. 78 (CG_H_START..CG_H_STRLEN-1)
-    self.wxb_emitStrlen();       // 15 bytes,                zone offsets 79.. 93 (CG_H_STRLEN..CG_H_PRINTSTR-1)
-    self.wxb_emitPrintStrJmp();  // 26 bytes,                zone offsets 94..119 (CG_H_PRINTSTR..CG_H_PRINTINT-1)
-    self.wxb_emitPrintIntJmp();  // 104 bytes,               zone offsets 120..223 (CG_H_PRINTINT..CG_H_STRSUB-1)
-    self.wxb_emitStrSubJmp();    // 71 bytes,                zone offsets 224..294 (CG_H_STRSUB..CG_H_STRCHARAT-1)
-    self.wxb_emitStrCharAt();    // 6 bytes,                 zone offsets 295..300 (CG_H_STRCHARAT..CG_H_EPRINTSTR-1)
-    self.wxb_emitEPrintStrJmp(); // 26 bytes,                zone offsets 301..326 (CG_H_EPRINTSTR..CG_H_EPRINTINT-1)
-    self.wxb_emitEPrintIntJmp(); // 104 bytes,               zone offsets 327..430 (CG_H_EPRINTINT..CG_H_F64STR-1)
-    self.wxb_emitStub(335);      // 335 NOP bytes,           zone offsets 431..765 (CG_H_F64STR..CG_H_STRSPLIT-1)
-    self.wxb_emitStub(215);      // 215 NOP bytes,           zone offsets 766..980 (CG_H_STRSPLIT..CG_H_MAP_NEW-1)
-    self.wxb_emitStub(47);       //  47 NOP bytes,           zone offsets 981..1027 (CG_H_MAP_NEW..CG_H_MAP_SET-1)
-    self.wxb_emitStub(93);       //  93 NOP bytes,           zone offsets 1028..1120 (CG_H_MAP_SET..CG_H_MAP_GET-1)
-    self.wxb_emitStub(72);       //  72 NOP bytes,           zone offsets 1121..1192 (CG_H_MAP_GET..CG_H_MAP_HAS-1)
-    self.wxb_emitStub(73);       //  73 NOP bytes,           zone offsets 1193..1265 (CG_H_MAP_HAS..CG_H_USER-1)
-    // Total trampoline zone: 79+15+26+104+71+6+26+104+335+215+47+93+72+73 = 1266 = CG_H_USER ✓
+    // WP-A2: Emit trampoline zone. Each trampoline is padded to its EXACT WIN_H_*
+    // offset (mirroring CG_H_* in codegen_x86.lyx) so user-code rel32 calls — which
+    // use the Linux CG_H_* offsets — land on the right trampoline. Previously the
+    // helpers were packed contiguously; because win64 strlen (15B) is shorter than
+    // the Linux slot (24B), every later trampoline was shifted, so PrintStr calls
+    // hit a NOP sled and fell through into PrintInt (string ptr printed as a number).
+    var zoneStart: int64 := self.codeLen;
+    self.wxb_padTo(zoneStart, WIN_H_START);     self.wxb_emitStart(relMain);
+    self.wxb_padTo(zoneStart, WIN_H_STRLEN);    self.wxb_emitStrlen();
+    self.wxb_padTo(zoneStart, WIN_H_PRINTSTR);  self.wxb_emitJmpTo(WIN_PS_OFF);
+    self.wxb_padTo(zoneStart, WIN_H_PRINTINT);  self.wxb_emitJmpTo(WIN_PI_OFF);
+    self.wxb_padTo(zoneStart, WIN_H_STRSUB);    self.wxb_emitJmpTo(WIN_SS_OFF);
+    self.wxb_padTo(zoneStart, WIN_H_STRCHARAT); self.wxb_emitStrCharAt();
+    self.wxb_padTo(zoneStart, WIN_H_EPRINTSTR); self.wxb_emitJmpTo(WIN_PS_OFF);
+    self.wxb_padTo(zoneStart, WIN_H_EPRINTINT); self.wxb_emitJmpTo(WIN_PI_OFF);
+    // Unimplemented helpers: a bare RET at each offset so any call returns cleanly
+    // (canary init/fail become no-ops → effectively disabled, not a crash).
+    self.wxb_padTo(zoneStart, WIN_H_F64STR);      self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_STRSPLIT);    self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_MAP_NEW);     self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_MAP_SET);     self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_MAP_GET);     self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_MAP_HAS);     self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_STACK_FAIL);  self.wxb_ce8(0xC3);
+    self.wxb_padTo(zoneStart, WIN_H_CANARY_INIT); self.wxb_ce8(0xC3);
+    // Pad remainder so user code starts exactly at WIN_H_USER (= CG_H_USER).
+    self.wxb_padTo(zoneStart, WIN_H_USER);
 
     // Copy user code verbatim (all rel32 values remain correct because:
     //   user code is shifted by WIN_USER_OFF=1774 in Windows vs CG_H_USER=1266 in Linux,
