@@ -138,6 +138,10 @@ test: lyxc
 	@bash tests/sec_tls_hostname_test.sh
 	@echo "OK"
 
+	@echo "--- sec_stdpath: --std-path off-by-one (2 tests) ---"
+	@bash tests/sec_stdpath_test.sh
+	@echo "OK"
+
 	@echo "--- sec_wp28: kernel-mode-guard allowlist (20 tests) ---"
 	@bash tests/sec_wp28_kernel_guard_test.sh
 	@echo "OK"

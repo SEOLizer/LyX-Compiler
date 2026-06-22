@@ -48,5 +48,32 @@ if "$LYXC" "$TMP/t4.lyx" -o "$TMP/t4" >/dev/null 2>&1; then
   _fail 4 "link-Alias auf system kompilierte (SEC-BUG-01-Regression!)"
 else _pass 4; fi
 
+# 5 (S3): no-link PROCESS-Extern (fork) in User-Code OHNE @cap → abgelehnt
+cat > "$TMP/t5.lyx" << 'EOF'
+extern fn fork(): int64;
+fn main(): int64 { return 0; }
+EOF
+if "$LYXC" "$TMP/t5.lyx" -o "$TMP/t5" >/dev/null 2>&1; then
+  _fail 5 "User-fork() ohne @cap kompilierte (PROCESS-Klasse-Bypass)"
+else _pass 5; fi
+
+# 6 (S3): fork MIT @cap → erlaubt (Opt-in)
+cat > "$TMP/t6.lyx" << 'EOF'
+@cap(process.spawn)
+extern fn fork(): int64;
+fn main(): int64 { return 0; }
+EOF
+if "$LYXC" "$TMP/t6.lyx" -o "$TMP/t6" >/dev/null 2>&1; then _pass 6
+else _fail 6 "fork() mit @cap abgelehnt (Opt-in kaputt)"; fi
+
+# 7 (S3): unbekannte no-link-Extern in User-Code OHNE @cap → abgelehnt
+cat > "$TMP/t7.lyx" << 'EOF'
+extern fn weird_nolink_sym(x: int64): int64;
+fn main(): int64 { return 0; }
+EOF
+if "$LYXC" "$TMP/t7.lyx" -o "$TMP/t7" >/dev/null 2>&1; then
+  _fail 7 "unbekannte no-link-Extern ohne @cap kompilierte (Fail-Open no-link)"
+else _pass 7; fi
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
