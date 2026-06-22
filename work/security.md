@@ -19,7 +19,7 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Security-Audit 2026-06-18 ha
 | **6c** | PIE/ASLR für x86-64 ELF (zurückgestellt, Risiko hoch) | 🔵 Niedrig |
 | **6b-ARM64** | W^X für ARM64-ELF-Writer (`writeELF`, `writeELFExecDynamic`) | 🟡 Mittel |
 | **26** | `alloc()`/`calloc()` Integer-Overflow + Zero-Alloc-Aliasing | ✅ Erledigt |
-| **27** | `read()`-Fehlerbehandlung OOB (`--unit-info` + `_sema_readFile`) | 🔴 Kritisch |
+| **27** | `read()`-Fehlerbehandlung OOB (`--unit-info` + `_sema_readFile` + alle Datei-/ELF-Reader) | ✅ Erledigt |
 | **28** | Kernel-Mode-Guard Erweiterung (`std.net.epoll` + gesamtes `std.net.*`) | 🟠 Hoch |
 | **29** | Lizenz-Secret-Architektur (XOR-Obfuskation → asymmetrisch) | 🟠 Hoch |
 | **30** | HTTP Custom-Header CRLF-Injection | 🟠 Hoch |
@@ -196,8 +196,10 @@ pub fn alloc(size: int64): int64 {
 |----------|------|
 | **Dateien** | `src/lyxc.lyx` Z. 4384; `src/sema.lyx` Z. 757 |
 | **Priorität** | 🔴 Kritisch |
-| **Status** | ✅ erledigt (2026-06-18, commit eab88e6) |
+| **Status** | ✅ erledigt (2026-06-18; alle Reader gehärtet + CI-Test 2026-06-22) |
 | **Quelle** | Security-Audit 2026-06-18 (C-3, M-4) |
+
+> **2026-06-22 (Verifikation/Härtung):** named Fixes (C-3 `--unit-info` EINTR, M-4 `_sema_readFile`) im Code bestätigt. Verifikationspass fand dieselbe ungeprüfte-read()-Klasse an weiteren Stellen → gehärtet: `codegen_x86.lyx cg_readFile` (identischer M-4-Bug im Import-Pfad!), ELF-Parser-Reads in `lyxc.lyx` (Section-Header/shstrtab/Lizenz-Payload), `ms_appendMetaSafe`, Provenance-SHA, `lyxc_keygen`. Alle read()-Aufrufe prüfen jetzt den Rückgabewert. Regressionsschutz: `tests/sec_wp27_read_test.sh` (8 Quellcode-Checks) in `make test`.
 
 **Problem 1 — OOB-Schreibzugriff `--unit-info` (C-3):**
 ```
@@ -518,7 +520,7 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 | **24** | **seccomp-Filter-Vollständigkeit** | **✅** | 2026-06-14 | 🟠 |
 | **25** | **--capabilities=compat Warnung** | **✅** | 2026-06-14 | 🟡 |
 | **26** | **alloc()/calloc() Integer-Overflow + Zero-Alloc** | **✅** | – | 🔴 |
-| **27** | **read()-Fehlerbehandlung OOB** | **⬜** | – | 🔴 |
+| **27** | **read()-Fehlerbehandlung OOB** | **✅** | – | 🔴 |
 | **28** | **Kernel-Mode-Guard Erweiterung** | **⬜** | – | 🟠 |
 | **29** | **Lizenz-Secret-Architektur** | **⬜** | – | 🟠 |
 | **30** | **HTTP Custom-Header CRLF-Injection** | **⬜** | – | 🟠 |
