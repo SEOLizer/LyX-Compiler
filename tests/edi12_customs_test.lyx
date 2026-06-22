@@ -1,0 +1,448 @@
+// tests/edi12_customs_test.lyx — WP-EDI-12 Customs tests
+unit tests.edi12_customs_test;
+
+import std.edi.customs;
+import std.edi.core;
+import std.alloc;
+import src.std.io;
+
+fn strEq(a: int64, aLen: int64, b: int64, bLen: int64): int64 {
+    if (aLen != bLen) { return 0; }
+    var i: int64 := 0;
+    while (i < aLen) {
+        if (peek8(a + i) != peek8(b + i)) { return 0; }
+        i := i + 1;
+    }
+    return 1;
+}
+
+fn pass(n: int64) { Print("PASS "); PrintLn(n); }
+fn fail(n: int64) { Print("FAIL "); PrintLn(n); }
+fn check(n: int64, ok: int64) { if (ok == 1) { pass(n); } else { fail(n); } }
+
+fn zero(ptr: int64, sz: int64) {
+    var i: int64 := 0;
+    while (i < sz) { poke8(ptr + i, 0); i := i + 1; }
+}
+
+fn fillHdr(hdr: int64) {
+    zero(hdr, EDI_CUS_HDR_SIZE);
+    poke64(hdr + EDI_CUS_HDR_REF,        "DEC-2026-001"c as int64);
+    poke64(hdr + EDI_CUS_HDR_REFLEN,     12);
+    poke64(hdr + EDI_CUS_HDR_DATE,       "20260615"c as int64);
+    poke64(hdr + EDI_CUS_HDR_ORIGIN,     "DE"c as int64);
+    poke64(hdr + EDI_CUS_HDR_ORIGLEN,    2);
+    poke64(hdr + EDI_CUS_HDR_DEST,       "US"c as int64);
+    poke64(hdr + EDI_CUS_HDR_DESTLEN,    2);
+    poke64(hdr + EDI_CUS_HDR_DECLARANT,  "ACME-GmbH"c as int64);
+    poke64(hdr + EDI_CUS_HDR_DECLLEN,    9);
+    poke64(hdr + EDI_CUS_HDR_CURRENCY,   "EUR"c as int64);
+    poke64(hdr + EDI_CUS_HDR_CURLEN,     3);
+    poke64(hdr + EDI_CUS_HDR_CUSTVALUE,  125000);
+    poke64(hdr + EDI_CUS_HDR_DECLREF,    "DECL-20260615-A"c as int64);
+    poke64(hdr + EDI_CUS_HDR_DECLREFLEN, 15);
+}
+
+// ≤6 params: base + separate HS setter
+fn fillItemBase(it: int64, descStr: int64, descLen: int64, qty: int64, val: int64) {
+    zero(it, EDI_CUS_ITEM_SIZE);
+    poke64(it + EDI_CUS_ITEM_DESC,    descStr);
+    poke64(it + EDI_CUS_ITEM_DESCLEN, descLen);
+    poke64(it + EDI_CUS_ITEM_QTY,     qty);
+    poke64(it + EDI_CUS_ITEM_VALUE,   val);
+}
+
+fn fillItemHs(it: int64, hsStr: int64, hsLen: int64) {
+    poke64(it + EDI_CUS_ITEM_HSCODE,    hsStr);
+    poke64(it + EDI_CUS_ITEM_HSCODELEN, hsLen);
+}
+
+fn main() {
+    // ── Tests 1-7: CUSCAR write/read round-trip ───────────────────────────────
+    {
+        var hdr:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items: int64 := alloc(2 * EDI_CUS_ITEM_SIZE);
+        fillHdr(hdr);
+        fillItemBase(items + 0 * EDI_CUS_ITEM_SIZE, "Laptop"c as int64, 6, 50, 75000);
+        fillItemHs(items + 0 * EDI_CUS_ITEM_SIZE, "8471.30"c as int64, 7);
+        fillItemBase(items + 1 * EDI_CUS_ITEM_SIZE, "Mouse"c as int64, 5, 100, 5000);
+        fillItemHs(items + 1 * EDI_CUS_ITEM_SIZE, "8471.60"c as int64, 7);
+
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCuscarWrite(hdr, items, 2, out, 8192);
+        check(1, written > 0);
+
+        // BGM tag present
+        {
+            var found: int64 := 0;
+            var j: int64 := 0;
+            while (j + 2 < written) {
+                if (peek8(out+j)==66 && peek8(out+j+1)==71 && peek8(out+j+2)==77) { found := 1; }
+                j := j + 1;
+            }
+            check(2, found);
+        }
+
+        // LIN tag present
+        {
+            var found: int64 := 0;
+            var j: int64 := 0;
+            while (j + 2 < written) {
+                if (peek8(out+j)==76 && peek8(out+j+1)==73 && peek8(out+j+2)==78) { found := 1; }
+                j := j + 1;
+            }
+            check(3, found);
+        }
+
+        var hdr2:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items2: int64 := alloc(4 * EDI_CUS_ITEM_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        zero(items2, 4 * EDI_CUS_ITEM_SIZE);
+
+        var itemCount: int64 := EdiCuscarRead(out, written, hdr2, items2, 4);
+        check(4, peek64(hdr2 + EDI_CUS_HDR_BGMQUAL) == EDI_CUS_BGM_CUSCAR);
+        check(5, itemCount == 2);
+
+        var decPtr: int64 := peek64(hdr2 + EDI_CUS_HDR_DECLARANT);
+        var decLen: int64 := peek64(hdr2 + EDI_CUS_HDR_DECLLEN);
+        check(6, strEq(decPtr, decLen, "ACME-GmbH"c as int64, 9));
+        check(7, peek64(hdr2 + EDI_CUS_HDR_CUSTVALUE) == 125000);
+
+        free(items2, 4 * EDI_CUS_ITEM_SIZE);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(items, 2 * EDI_CUS_ITEM_SIZE);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // ── Tests 8-11: item desc, qty, value, HS code round-trip ────────────────
+    {
+        var hdr:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items: int64 := alloc(EDI_CUS_ITEM_SIZE);
+        fillHdr(hdr);
+        fillItemBase(items, "Laptop"c as int64, 6, 50, 75000);
+        fillItemHs(items, "8471.30"c as int64, 7);
+
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCuscarWrite(hdr, items, 1, out, 8192);
+
+        var hdr2:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items2: int64 := alloc(2 * EDI_CUS_ITEM_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        zero(items2, 2 * EDI_CUS_ITEM_SIZE);
+        EdiCuscarRead(out, written, hdr2, items2, 2);
+
+        var dPtr: int64 := peek64(items2 + EDI_CUS_ITEM_DESC);
+        var dLen: int64 := peek64(items2 + EDI_CUS_ITEM_DESCLEN);
+        check(8, strEq(dPtr, dLen, "Laptop"c as int64, 6));
+        check(9, peek64(items2 + EDI_CUS_ITEM_QTY) == 50);
+        check(10, peek64(items2 + EDI_CUS_ITEM_VALUE) == 75000);
+
+        var hsPtr: int64 := peek64(items2 + EDI_CUS_ITEM_HSCODE);
+        var hsLen: int64 := peek64(items2 + EDI_CUS_ITEM_HSCODELEN);
+        check(11, strEq(hsPtr, hsLen, "8471.30"c as int64, 7));
+
+        free(items2, 2 * EDI_CUS_ITEM_SIZE);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(items, EDI_CUS_ITEM_SIZE);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // ── Tests 12-15: origin/dest/declRef/currency round-trip ─────────────────
+    {
+        var hdr:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items: int64 := alloc(EDI_CUS_ITEM_SIZE);
+        fillHdr(hdr);
+        fillItemBase(items, "Widget"c as int64, 6, 10, 5000);
+        fillItemHs(items, "3926.90"c as int64, 7);
+
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCuscarWrite(hdr, items, 1, out, 8192);
+
+        var hdr2:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items2: int64 := alloc(2 * EDI_CUS_ITEM_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        zero(items2, 2 * EDI_CUS_ITEM_SIZE);
+        EdiCuscarRead(out, written, hdr2, items2, 2);
+
+        check(12, strEq(peek64(hdr2+EDI_CUS_HDR_ORIGIN), peek64(hdr2+EDI_CUS_HDR_ORIGLEN), "DE"c as int64, 2));
+        check(13, strEq(peek64(hdr2+EDI_CUS_HDR_DEST), peek64(hdr2+EDI_CUS_HDR_DESTLEN), "US"c as int64, 2));
+        check(14, strEq(peek64(hdr2+EDI_CUS_HDR_DECLREF), peek64(hdr2+EDI_CUS_HDR_DECLREFLEN), "DECL-20260615-A"c as int64, 15));
+        check(15, strEq(peek64(hdr2+EDI_CUS_HDR_CURRENCY), peek64(hdr2+EDI_CUS_HDR_CURLEN), "EUR"c as int64, 3));
+
+        free(items2, 2 * EDI_CUS_ITEM_SIZE);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(items, EDI_CUS_ITEM_SIZE);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // ── Tests 16-18: CUSDEC bgmQual == 960 ───────────────────────────────────
+    {
+        var hdr:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items: int64 := alloc(EDI_CUS_ITEM_SIZE);
+        fillHdr(hdr);
+        fillItemBase(items, "Cable"c as int64, 5, 200, 4000);
+        fillItemHs(items, "8544.42"c as int64, 7);
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCusdecWrite(hdr, items, 1, out, 8192);
+        check(16, written > 0);
+        var hdr2:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items2: int64 := alloc(2 * EDI_CUS_ITEM_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        zero(items2, 2 * EDI_CUS_ITEM_SIZE);
+        EdiCusdecRead(out, written, hdr2, items2, 2);
+        check(17, peek64(hdr2 + EDI_CUS_HDR_BGMQUAL) == EDI_CUS_BGM_CUSDEC);
+        check(18, peek64(hdr2 + EDI_CUS_HDR_BGMQUAL) == 960);
+        free(items2, 2 * EDI_CUS_ITEM_SIZE);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(items, EDI_CUS_ITEM_SIZE);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // ── Tests 19-21: CUSEXP bgmQual == 962 ───────────────────────────────────
+    {
+        var hdr:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items: int64 := alloc(EDI_CUS_ITEM_SIZE);
+        fillHdr(hdr);
+        fillItemBase(items, "Phone"c as int64, 5, 5, 60000);
+        fillItemHs(items, "8517.12"c as int64, 7);
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCusexpWrite(hdr, items, 1, out, 8192);
+        check(19, written > 0);
+        var hdr2:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items2: int64 := alloc(2 * EDI_CUS_ITEM_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        zero(items2, 2 * EDI_CUS_ITEM_SIZE);
+        EdiCusexpRead(out, written, hdr2, items2, 2);
+        check(20, peek64(hdr2 + EDI_CUS_HDR_BGMQUAL) == EDI_CUS_BGM_CUSEXP);
+        check(21, peek64(hdr2 + EDI_CUS_HDR_BGMQUAL) == 962);
+        free(items2, 2 * EDI_CUS_ITEM_SIZE);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(items, EDI_CUS_ITEM_SIZE);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // ── Tests 22-25: CUSRSP write/read + accepted ─────────────────────────────
+    {
+        var hdr: int64 := alloc(EDI_CUS_HDR_SIZE);
+        fillHdr(hdr);
+        poke64(hdr + EDI_CUS_HDR_RSPCODE, EDI_CUSRSP_ACCEPTED);
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCusrspWrite(hdr, out, 8192);
+        check(22, written > 0);
+
+        // STS tag present
+        {
+            var found: int64 := 0;
+            var j: int64 := 0;
+            while (j + 2 < written) {
+                if (peek8(out+j)==83 && peek8(out+j+1)==84 && peek8(out+j+2)==83) { found := 1; }
+                j := j + 1;
+            }
+            check(23, found);
+        }
+
+        var hdr2: int64 := alloc(EDI_CUS_HDR_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        EdiCusrspRead(out, written, hdr2);
+        check(24, peek64(hdr2 + EDI_CUS_HDR_BGMQUAL) == EDI_CUS_BGM_CUSRSP);
+        check(25, peek64(hdr2 + EDI_CUS_HDR_RSPCODE) == EDI_CUSRSP_ACCEPTED);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // Test 26: CUSRSP rejected
+    {
+        var hdr: int64 := alloc(EDI_CUS_HDR_SIZE);
+        fillHdr(hdr);
+        poke64(hdr + EDI_CUS_HDR_RSPCODE, EDI_CUSRSP_REJECTED);
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCusrspWrite(hdr, out, 8192);
+        var hdr2: int64 := alloc(EDI_CUS_HDR_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        EdiCusrspRead(out, written, hdr2);
+        check(26, peek64(hdr2 + EDI_CUS_HDR_RSPCODE) == EDI_CUSRSP_REJECTED);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // Test 27: CUSRSP released
+    {
+        var hdr: int64 := alloc(EDI_CUS_HDR_SIZE);
+        fillHdr(hdr);
+        poke64(hdr + EDI_CUS_HDR_RSPCODE, EDI_CUSRSP_RELEASED);
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCusrspWrite(hdr, out, 8192);
+        var hdr2: int64 := alloc(EDI_CUS_HDR_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        EdiCusrspRead(out, written, hdr2);
+        check(27, peek64(hdr2 + EDI_CUS_HDR_RSPCODE) == EDI_CUSRSP_RELEASED);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // ── Tests 28-30: CUSDEC 2-item round-trip ────────────────────────────────
+    {
+        var hdr:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items: int64 := alloc(2 * EDI_CUS_ITEM_SIZE);
+        fillHdr(hdr);
+        fillItemBase(items + 0 * EDI_CUS_ITEM_SIZE, "Sensor"c as int64, 6, 30, 45000);
+        fillItemHs(items + 0 * EDI_CUS_ITEM_SIZE, "9027.10"c as int64, 7);
+        fillItemBase(items + 1 * EDI_CUS_ITEM_SIZE, "Battery"c as int64, 7, 60, 12000);
+        fillItemHs(items + 1 * EDI_CUS_ITEM_SIZE, "8506.10"c as int64, 7);
+
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCusdecWrite(hdr, items, 2, out, 8192);
+
+        var hdr2:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items2: int64 := alloc(4 * EDI_CUS_ITEM_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        zero(items2, 4 * EDI_CUS_ITEM_SIZE);
+        var n: int64 := EdiCusdecRead(out, written, hdr2, items2, 4);
+        check(28, n == 2);
+
+        var d1Ptr: int64 := peek64(items2 + 1 * EDI_CUS_ITEM_SIZE + EDI_CUS_ITEM_DESC);
+        var d1Len: int64 := peek64(items2 + 1 * EDI_CUS_ITEM_SIZE + EDI_CUS_ITEM_DESCLEN);
+        check(29, strEq(d1Ptr, d1Len, "Battery"c as int64, 7));
+        check(30, peek64(items2 + 0 * EDI_CUS_ITEM_SIZE + EDI_CUS_ITEM_QTY) == 30);
+
+        free(items2, 4 * EDI_CUS_ITEM_SIZE);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(items, 2 * EDI_CUS_ITEM_SIZE);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // ── Tests 31-32: procedure code round-trip + GIS tag ─────────────────────
+    {
+        var hdr:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items: int64 := alloc(EDI_CUS_ITEM_SIZE);
+        fillHdr(hdr);
+        poke64(hdr + EDI_CUS_HDR_PROCCODE, 4200);
+        fillItemBase(items, "Part"c as int64, 4, 5, 3000);
+        fillItemHs(items, "7318.15"c as int64, 7);
+
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCusdecWrite(hdr, items, 1, out, 8192);
+
+        var hdr2:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items2: int64 := alloc(2 * EDI_CUS_ITEM_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        zero(items2, 2 * EDI_CUS_ITEM_SIZE);
+        EdiCusdecRead(out, written, hdr2, items2, 2);
+        check(31, peek64(hdr2 + EDI_CUS_HDR_PROCCODE) == 4200);
+
+        // GIS tag in output
+        {
+            var found: int64 := 0;
+            var j: int64 := 0;
+            while (j + 2 < written) {
+                if (peek8(out+j)==71 && peek8(out+j+1)==73 && peek8(out+j+2)==83) { found := 1; }
+                j := j + 1;
+            }
+            check(32, found);
+        }
+
+        free(items2, 2 * EDI_CUS_ITEM_SIZE);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(items, EDI_CUS_ITEM_SIZE);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // ── Tests 33-35: bgmQual constants correct ────────────────────────────────
+    {
+        var hdr:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items: int64 := alloc(EDI_CUS_ITEM_SIZE);
+        fillHdr(hdr);
+        fillItemBase(items, "X"c as int64, 1, 1, 100);
+        fillItemHs(items, "9999.99"c as int64, 7);
+        var out: int64 := alloc(8192);
+        var hdr2: int64 := alloc(EDI_CUS_HDR_SIZE);
+
+        EdiCuscarWrite(hdr, items, 1, out, 8192);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        EdiCuscarRead(out, 8192, hdr2, items, 1);
+        check(33, peek64(hdr2 + EDI_CUS_HDR_BGMQUAL) == 85);
+
+        EdiCusdecWrite(hdr, items, 1, out, 8192);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        EdiCusdecRead(out, 8192, hdr2, items, 1);
+        check(34, peek64(hdr2 + EDI_CUS_HDR_BGMQUAL) == 960);
+
+        EdiCusexpWrite(hdr, items, 1, out, 8192);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        EdiCusexpRead(out, 8192, hdr2, items, 1);
+        check(35, peek64(hdr2 + EDI_CUS_HDR_BGMQUAL) == 962);
+
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(items, EDI_CUS_ITEM_SIZE);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // ── Tests 36-37: CUSRSP bgmQual == 961 + queried ─────────────────────────
+    {
+        var hdr: int64 := alloc(EDI_CUS_HDR_SIZE);
+        fillHdr(hdr);
+        poke64(hdr + EDI_CUS_HDR_RSPCODE, EDI_CUSRSP_QUERIED);
+        var out: int64 := alloc(8192);
+        EdiCusrspWrite(hdr, out, 8192);
+        var hdr2: int64 := alloc(EDI_CUS_HDR_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        EdiCusrspRead(out, 8192, hdr2);
+        check(36, peek64(hdr2 + EDI_CUS_HDR_BGMQUAL) == 961);
+        check(37, peek64(hdr2 + EDI_CUS_HDR_RSPCODE) == EDI_CUSRSP_QUERIED);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // ── Test 38: carrier round-trip ───────────────────────────────────────────
+    {
+        var hdr:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items: int64 := alloc(EDI_CUS_ITEM_SIZE);
+        fillHdr(hdr);
+        poke64(hdr + EDI_CUS_HDR_CARRIER, "DHL-Freight"c as int64);
+        poke64(hdr + EDI_CUS_HDR_CARRLEN, 11);
+        fillItemBase(items, "Box"c as int64, 3, 1, 1000);
+        fillItemHs(items, "4819.10"c as int64, 7);
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCuscarWrite(hdr, items, 1, out, 8192);
+        var hdr2:   int64 := alloc(EDI_CUS_HDR_SIZE);
+        var items2: int64 := alloc(2 * EDI_CUS_ITEM_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        zero(items2, 2 * EDI_CUS_ITEM_SIZE);
+        EdiCuscarRead(out, written, hdr2, items2, 2);
+        check(38, strEq(peek64(hdr2+EDI_CUS_HDR_CARRIER), peek64(hdr2+EDI_CUS_HDR_CARRLEN), "DHL-Freight"c as int64, 11));
+        free(items2, 2 * EDI_CUS_ITEM_SIZE);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(items, EDI_CUS_ITEM_SIZE);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+
+    // ── Tests 39-40: declRef + custValue in CUSRSP ────────────────────────────
+    {
+        var hdr: int64 := alloc(EDI_CUS_HDR_SIZE);
+        fillHdr(hdr);
+        poke64(hdr + EDI_CUS_HDR_RSPCODE, EDI_CUSRSP_ACCEPTED);
+        var out: int64 := alloc(8192);
+        var written: int64 := EdiCusrspWrite(hdr, out, 8192);
+        var hdr2: int64 := alloc(EDI_CUS_HDR_SIZE);
+        zero(hdr2, EDI_CUS_HDR_SIZE);
+        EdiCusrspRead(out, written, hdr2);
+        check(39, strEq(peek64(hdr2+EDI_CUS_HDR_DECLREF), peek64(hdr2+EDI_CUS_HDR_DECLREFLEN), "DECL-20260615-A"c as int64, 15));
+        check(40, peek64(hdr2 + EDI_CUS_HDR_CUSTVALUE) == 125000);
+        free(hdr2, EDI_CUS_HDR_SIZE);
+        free(out, 8192);
+        free(hdr, EDI_CUS_HDR_SIZE);
+    }
+}

@@ -1,0 +1,214 @@
+// tests/grf08_image_test.lyx — GRF-08: Unified Image Facade Tests
+
+unit tests.grf08_image_test;
+
+import std.image.core;
+import std.image.image;
+import std.alloc;
+import std.io;
+
+// Build a minimal 1x1 24-bpp BMP: red pixel (R=0xFF G=0x00 B=0x00)
+fn make1x1RedBmp(buf: int64): int64 {
+    var p: int64 := buf;
+    // BMP file header
+    poke8(p,0x42); poke8(p+1,0x4D); p:=p+2;       // 'BM'
+    poke8(p,58); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4; // fileSize=58
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;  // reserved
+    poke8(p,54); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4; // pixelOffset=54
+    // BITMAPINFOHEADER (40 bytes)
+    poke8(p,40); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4; // headerSize=40
+    poke8(p,1); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;  // width=1
+    poke8(p,1); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;  // height=1 (bottom-up)
+    poke8(p,1); poke8(p+1,0); p:=p+2;  // planes=1
+    poke8(p,24); poke8(p+1,0); p:=p+2; // bpp=24
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;  // compression=0
+    poke8(p,4); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;  // imageSize=4 (with padding)
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;  // xPPM
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;  // yPPM
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;  // clrUsed
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;  // clrImportant
+    // Pixel data: BGR = 0x00,0x00,0xFF (blue=0,green=0,red=255) + 1 byte padding
+    poke8(p,0x00); poke8(p+1,0x00); poke8(p+2,0xFF); poke8(p+3,0x00); p:=p+4;
+    return p - buf;
+}
+
+// Build a minimal 2x2 PNG (RGBA, all green: R=0,G=255,B=0,A=255 → 0x00FF00FF)
+// Using PngEncode internally would be ideal, but we hand-craft one since we can
+// use our PngEncode function via the image unit.
+// Instead, re-use the BMP encoder approach: just test ImageDecodeFromMem with
+// a BMP buffer (already tested above) and a hand-crafted PNG.
+// For PNG we manually build a valid 1x1 green PNG with store-only DEFLATE.
+fn make1x1GreenPng(buf: int64): int64 {
+    var p: int64 := buf;
+    // PNG signature
+    poke8(p,0x89); poke8(p+1,0x50); poke8(p+2,0x4E); poke8(p+3,0x47);
+    poke8(p+4,0x0D); poke8(p+5,0x0A); poke8(p+6,0x1A); poke8(p+7,0x0A);
+    p := p + 8;
+
+    // IHDR chunk: 13 bytes data + 4 len + 4 type + 4 crc = 25 bytes
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,13); p:=p+4;  // len=13
+    poke8(p,0x49); poke8(p+1,0x48); poke8(p+2,0x44); poke8(p+3,0x52); p:=p+4; // 'IHDR'
+    // width=1, height=1 (BE)
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,1); p:=p+4;   // width=1
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,1); p:=p+4;   // height=1
+    poke8(p,8); p:=p+1;   // bitDepth=8
+    poke8(p,6); p:=p+1;   // colorType=6 (RGBA)
+    poke8(p,0); p:=p+1;   // compression=0
+    poke8(p,0); p:=p+1;   // filter=0
+    poke8(p,0); p:=p+1;   // interlace=0
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;   // CRC (ignored)
+
+    // IDAT chunk: contains zlib-wrapped DEFLATE data
+    // Raw filtered data: 1 row: [filter_byte=0][R=0][G=255][B=0][A=255] = 5 bytes
+    // zlib header: CMF=0x78, FLG=0x01
+    // DEFLATE stored block: BFINAL=1, BTYPE=00, LEN=5, NLEN=5^0xFFFF=0xFFFA
+    // then 5 bytes of data
+    // Adler-32 of [0,0,255,0,255]: A = 1+0+0+255+0+255=511; B = 1+1+1+256+256+511=1026... let me compute
+    // A_init=1, B_init=0
+    // byte 0x00: A=1, B=1
+    // byte 0x00: A=1, B=2
+    // byte 0xFF: A=256, B=258
+    // byte 0x00: A=256, B=514
+    // byte 0xFF: A=511, B=1025
+    // All < 65521, no mod needed.
+    // Adler-32 = (B<<16)|A = (1025<<16)|511 = 0x040101FF
+    // Stored BE: 0x04, 0x01, 0x01, 0xFF
+    // IDAT data = zlib_hdr(2) + deflate_stored_hdr(5) + raw(5) + adler32(4) = 16 bytes
+    var idatLen: int64 := 16;
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3, idatLen & 255); p:=p+4; // len=16
+    poke8(p,0x49); poke8(p+1,0x44); poke8(p+2,0x41); poke8(p+3,0x54); p:=p+4; // 'IDAT'
+    poke8(p,0x78); poke8(p+1,0x01); p:=p+2;   // zlib header
+    // DEFLATE stored block: BFINAL=1|BTYPE=00 → byte=0x01
+    poke8(p,0x01); p:=p+1;
+    // LEN=5 LE: 0x05, 0x00
+    poke8(p,5); poke8(p+1,0); p:=p+2;
+    // NLEN=~LEN LE: 0xFA, 0xFF
+    poke8(p,0xFA); poke8(p+1,0xFF); p:=p+2;
+    // raw data: filter=0, R=0, G=255, B=0, A=255
+    poke8(p,0x00); poke8(p+1,0x00); poke8(p+2,0xFF); poke8(p+3,0x00); poke8(p+4,0xFF); p:=p+5;
+    // Adler-32 BE: 0x04, 0x01, 0x01, 0xFF
+    poke8(p,0x04); poke8(p+1,0x01); poke8(p+2,0x01); poke8(p+3,0xFF); p:=p+4;
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;    // CRC (ignored)
+
+    // IEND chunk
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;   // len=0
+    poke8(p,0x49); poke8(p+1,0x45); poke8(p+2,0x4E); poke8(p+3,0x44); p:=p+4; // 'IEND'
+    poke8(p,0); poke8(p+1,0); poke8(p+2,0); poke8(p+3,0); p:=p+4;   // CRC (ignored)
+
+    return p - buf;
+}
+
+pub fn main(argc: int64, argv: pchar): int64 {
+    var ok: int64 := 1;
+
+    // -------------------------------------------------------------------------
+    // Test 1: ImageDecodeFromMem — BMP auto-detect → red pixel
+    // -------------------------------------------------------------------------
+    var bmpBuf: int64 := alloc(64);
+    var bmpLen: int64 := make1x1RedBmp(bmpBuf);
+    var img1: int64 := alloc(GRF_SIZE);
+    var ret1: int64 := ImageDecodeFromMem(bmpBuf, bmpLen, img1);
+    if (ret1 != 1) {
+        PrintLn("FAIL: ImageDecodeFromMem BMP returned 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: ImageDecodeFromMem BMP ret=1"c);
+        var px: int64 := ImagePixelAt(img1, 0, 0);
+        if (px != 0xFF0000FF) {
+            PrintLn("FAIL: BMP pixel != red"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: BMP pixel = red (0xFF0000FF)"c);
+        }
+        var w: int64 := ImageGetWidth(img1);
+        var h: int64 := ImageGetHeight(img1);
+        if (w != 1 || h != 1) {
+            PrintLn("FAIL: BMP dimensions wrong"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: BMP 1x1 dimensions"c);
+        }
+    }
+    ImageFree(img1);
+    free(bmpBuf, 64);
+
+    // -------------------------------------------------------------------------
+    // Test 2: ImageDecodeFromMem — PNG auto-detect → green pixel
+    // -------------------------------------------------------------------------
+    var pngBuf: int64 := alloc(128);
+    var pngLen: int64 := make1x1GreenPng(pngBuf);
+    var img2: int64 := alloc(GRF_SIZE);
+    var ret2: int64 := ImageDecodeFromMem(pngBuf, pngLen, img2);
+    if (ret2 != 1) {
+        PrintLn("FAIL: ImageDecodeFromMem PNG returned 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: ImageDecodeFromMem PNG ret=1"c);
+        var px2: int64 := ImagePixelAt(img2, 0, 0);
+        // Green: R=0, G=255, B=0, A=255 → 0x00FF00FF
+        if (px2 != 0x00FF00FF) {
+            PrintLn("FAIL: PNG pixel != green"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: PNG pixel = green (0x00FF00FF)"c);
+        }
+        var w2: int64 := ImageGetWidth(img2);
+        if (w2 != 1) {
+            PrintLn("FAIL: PNG width != 1"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: PNG 1x1 width"c);
+        }
+    }
+    ImageFree(img2);
+    free(pngBuf, 128);
+
+    // -------------------------------------------------------------------------
+    // Test 3: ImageDecodeFromMem — unknown format → 0
+    // -------------------------------------------------------------------------
+    var unkBuf: int64 := alloc(16);
+    poke8(unkBuf,0); poke8(unkBuf+1,0); poke8(unkBuf+2,0); poke8(unkBuf+3,0);
+    poke8(unkBuf+4,0); poke8(unkBuf+5,0); poke8(unkBuf+6,0); poke8(unkBuf+7,0);
+    poke8(unkBuf+8,0); poke8(unkBuf+9,0); poke8(unkBuf+10,0); poke8(unkBuf+11,0);
+    var img3: int64 := alloc(GRF_SIZE);
+    var ret3: int64 := ImageDecodeFromMem(unkBuf, 16, img3);
+    if (ret3 != 0) {
+        PrintLn("FAIL: ImageDecodeFromMem unknown format should return 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: ImageDecodeFromMem unknown → 0"c);
+    }
+    free(unkBuf, 16);
+    free(img3, GRF_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 4: ImageGetChannels / ImageGetHeight accessors
+    // -------------------------------------------------------------------------
+    var bmpBuf4: int64 := alloc(64);
+    var bmpLen4: int64 := make1x1RedBmp(bmpBuf4);
+    var img4: int64 := alloc(GRF_SIZE);
+    ImageDecodeFromMem(bmpBuf4, bmpLen4, img4);
+    var ch4: int64 := ImageGetChannels(img4);
+    var h4:  int64 := ImageGetHeight(img4);
+    if (ch4 != 4) {
+        PrintLn("FAIL: ImageGetChannels != 4"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: ImageGetChannels=4"c);
+    }
+    if (h4 != 1) {
+        PrintLn("FAIL: ImageGetHeight != 1"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: ImageGetHeight=1"c);
+    }
+    ImageFree(img4);
+    free(bmpBuf4, 64);
+
+    if (ok != 0) {
+        PrintLn("=== GRF-08: ALL PASS ==="c);
+    } else {
+        PrintLn("=== GRF-08: SOME FAIL ==="c);
+    }
+    return ok;
+}

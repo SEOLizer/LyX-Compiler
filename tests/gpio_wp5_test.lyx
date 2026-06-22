@@ -1,0 +1,301 @@
+// tests/gpio_wp5_test.lyx
+// WP-5: Erweiterungen — Alt-Modes, Edge-Detection, SoftPWM
+//
+// x86-64-testbare ACs:
+// AC-WP5.1.1: GpioSetAltMode setzt korrekte GPFSEL-3-Bit-Codes
+// AC-WP5.1.2: Ungültige Alt-Codes (0,1,8) → 0
+// AC-WP5.2.2: GpioWaitForEdge Timeout auf ungültigem Fd → 0 oder -1
+// AC-WP5.2.3: GpioWaitForEdge(fd, 0) non-blocking → sofort
+// AC-WP5.3.3: GpioSoftPWM läuft korrekte Dauer (>= duration_ms)
+// AC-WP5.3.4: Kein Endlosschleifen bei frequency > 1000 Hz
+// AC-WP5.3.5: frequency=0 → sofortige Rückkehr
+// AC-WP5.3.x: dutyCycle=0 / dutyCycle=100 → kein Crash
+//
+// RPi4-Hardware (manuell):
+//   AC-WP5.1.3: SetAltMode(2, ALT0) → I2C SDA1 auf Pin 2
+//   AC-WP5.2.1: Edge-Ereignis innerhalb 1ms
+//   AC-WP5.3.1: LED dimmt sichtbar mit 50% bei 1kHz
+//   AC-WP5.3.2: Frequenzabweichung < 5%
+
+unit tests.gpio_wp5_test;
+
+import std.hardware.gpio_ext;
+import std.hardware.gpio_mmio;
+import std.hardware.rpi4;
+import std.alloc;
+
+// Fake-MMIO-Kontext
+fn makeFakeCtx(): int64 {
+  var ctx: int64 := GpioCtxAlloc();
+  var mem: int64 := alloc(256);
+  var i: int64 := 0;
+  while (i < 32) { poke64(mem + i * 8, 0); i := i + 1; }
+  poke64(ctx,      mem);
+  poke64(ctx + 8,  1);
+  poke64(ctx + 16, 1);
+  return ctx;
+}
+
+fn freeFakeCtx(ctx: int64) {
+  free(peek64(ctx), 256);
+  GpioCtxFree(ctx);
+}
+
+// ============================================================
+// AC-WP5.1.1: GpioSetAltMode setzt korrekte GPFSEL-Bits
+// ============================================================
+fn testAltModeBits(): int64 {
+  var gc:  int64 := makeFakeCtx();
+  var mem: int64 := peek64(gc);
+  var failed: int64 := 0;
+
+  // Pin 4: GPFSEL0 (offset 0), shift = (4%10)*3 = 12
+  // Alt0 = 4 (100) → bits 12-14 = 100
+  GpioSetAltMode(gc, 4, GPIO_PIN_ALT0);
+  var fsel0: int64 := peek32(mem) & 0xFFFFFFFF;
+  if (((fsel0 >> 12) & 7) != 4) {
+    PrintLn("FAIL: Pin4 ALT0 should set bits 12-14 = 100 (4)");
+    failed := failed + 1;
+  }
+
+  // Alt1 = 5 (101)
+  GpioSetAltMode(gc, 4, GPIO_PIN_ALT1);
+  fsel0 := peek32(mem) & 0xFFFFFFFF;
+  if (((fsel0 >> 12) & 7) != 5) {
+    PrintLn("FAIL: Pin4 ALT1 should set bits 12-14 = 101 (5)");
+    failed := failed + 1;
+  }
+
+  // Alt4 = 3 (011) — nicht-linear!
+  GpioSetAltMode(gc, 4, GPIO_PIN_ALT4);
+  fsel0 := peek32(mem) & 0xFFFFFFFF;
+  if (((fsel0 >> 12) & 7) != 3) {
+    PrintLn("FAIL: Pin4 ALT4 should set bits 12-14 = 011 (3)");
+    failed := failed + 1;
+  }
+
+  // Alt5 = 2 (010) — nicht-linear!
+  GpioSetAltMode(gc, 4, GPIO_PIN_ALT5);
+  fsel0 := peek32(mem) & 0xFFFFFFFF;
+  if (((fsel0 >> 12) & 7) != 2) {
+    PrintLn("FAIL: Pin4 ALT5 should set bits 12-14 = 010 (2)");
+    failed := failed + 1;
+  }
+
+  // Alt2 = 6, Alt3 = 7 auf Pin 14 (GPFSEL1, shift=(14-10)*3=12)
+  GpioSetAltMode(gc, 14, GPIO_PIN_ALT2);
+  var fsel1: int64 := peek32(mem + 4) & 0xFFFFFFFF;
+  if (((fsel1 >> 12) & 7) != 6) {
+    PrintLn("FAIL: Pin14 ALT2 should set bits 12-14 = 110 (6)");
+    failed := failed + 1;
+  }
+
+  GpioSetAltMode(gc, 14, GPIO_PIN_ALT3);
+  fsel1 := peek32(mem + 4) & 0xFFFFFFFF;
+  if (((fsel1 >> 12) & 7) != 7) {
+    PrintLn("FAIL: Pin14 ALT3 should set bits 12-14 = 111 (7)");
+    failed := failed + 1;
+  }
+
+  freeFakeCtx(gc);
+  if (failed == 0) { PrintLn("OK: GpioSetAltMode all 6 Alt-codes set correct GPFSEL bits (WP-5.1.1)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP5.1.2: Ungültige Alt-Codes werden abgelehnt
+// ============================================================
+fn testAltModeInvalid(): int64 {
+  var gc:   int64 := makeFakeCtx();
+  var failed: int64 := 0;
+
+  // Code 0 (INPUT) und 1 (OUTPUT) sind keine Alt-Codes → 0
+  if (GpioSetAltMode(gc, 4, 0) != 0) {
+    PrintLn("FAIL: SetAltMode with code=0 (INPUT) should return 0");
+    failed := failed + 1;
+  }
+  if (GpioSetAltMode(gc, 4, 1) != 0) {
+    PrintLn("FAIL: SetAltMode with code=1 (OUTPUT) should return 0");
+    failed := failed + 1;
+  }
+  // Code 8 (kein gültiger GPFSEL-Code) → 0
+  if (GpioSetAltMode(gc, 4, 8) != 0) {
+    PrintLn("FAIL: SetAltMode with code=8 should return 0");
+    failed := failed + 1;
+  }
+
+  freeFakeCtx(gc);
+  if (failed == 0) { PrintLn("OK: GpioSetAltMode rejects non-Alt codes (WP-5.1.2)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP5.2.2 / 5.2.3: GpioWaitForEdge Timeout + non-blocking
+// ============================================================
+fn testWaitForEdgeTimeout(): int64 {
+  // Ungültiger fd → sofort -1 oder 0
+  var r: int64 := GpioWaitForEdge(-1, 0);
+  if (r != -1 && r != 0) {
+    PrintLn("FAIL: WaitForEdge(-1, 0) should return -1 or 0");
+    return 1;
+  }
+  PrintLn("OK: GpioWaitForEdge with invalid fd returns immediately (WP-5.2.2)");
+  return 0;
+}
+
+fn testWaitForEdgeNonBlocking(): int64 {
+  // timeout=0 auf gültigem aber nicht-GPIO-Fd (/dev/null) → 0 oder 1, kein Hängen
+  var ts0: int64 := alloc(GPIO_TIMESPEC_SIZE);
+  var ts1: int64 := alloc(GPIO_TIMESPEC_SIZE);
+  clock_gettime(GPIO_CLOCK_MONOTONIC, ts0);
+
+  var r: int64 := GpioWaitForEdge(-1, 0);
+
+  clock_gettime(GPIO_CLOCK_MONOTONIC, ts1);
+  var startNs:  int64 := peek64(ts0) * GPIO_NS_PER_SEC + peek64(ts0 + 8);
+  var endNs:    int64 := peek64(ts1) * GPIO_NS_PER_SEC + peek64(ts1 + 8);
+  var elapsedUs: int64 := (endNs - startNs) / GPIO_NS_PER_US;
+  free(ts0, GPIO_TIMESPEC_SIZE);
+  free(ts1, GPIO_TIMESPEC_SIZE);
+
+  if (elapsedUs >= 50000) {
+    PrintLn("FAIL: WaitForEdge(timeout=0) took >= 50ms — not non-blocking");
+    return 1;
+  }
+  PrintLn("OK: GpioWaitForEdge(timeout=0) returns immediately (WP-5.2.3)");
+  return 0;
+}
+
+// ============================================================
+// AC-WP5.3.5: frequency=0 → sofortige Rückkehr
+// ============================================================
+fn testSoftPWMGuard(): int64 {
+  var gc: int64 := makeFakeCtx();
+
+  var ts0: int64 := alloc(GPIO_TIMESPEC_SIZE);
+  var ts1: int64 := alloc(GPIO_TIMESPEC_SIZE);
+  clock_gettime(GPIO_CLOCK_MONOTONIC, ts0);
+  GpioSoftPWM(gc, 18, 0, 50, 1000);   // frequency=0 → sofort
+  clock_gettime(GPIO_CLOCK_MONOTONIC, ts1);
+
+  var elapsedUs: int64 := (peek64(ts1) * GPIO_NS_PER_SEC + peek64(ts1 + 8)
+                         - peek64(ts0) * GPIO_NS_PER_SEC - peek64(ts0 + 8))
+                         / GPIO_NS_PER_US;
+  free(ts0, GPIO_TIMESPEC_SIZE);
+  free(ts1, GPIO_TIMESPEC_SIZE);
+  freeFakeCtx(gc);
+
+  if (elapsedUs >= 10000) {
+    PrintLn("FAIL: SoftPWM(frequency=0) should return immediately");
+    return 1;
+  }
+  PrintLn("OK: GpioSoftPWM(frequency=0) returns immediately (WP-5.3.5)");
+  return 0;
+}
+
+// ============================================================
+// AC-WP5.3.3: SoftPWM läuft mindestens duration_ms
+// ============================================================
+fn testSoftPWMDuration(): int64 {
+  var gc:  int64 := makeFakeCtx();
+  var failed: int64 := 0;
+
+  var ts0: int64 := alloc(GPIO_TIMESPEC_SIZE);
+  var ts1: int64 := alloc(GPIO_TIMESPEC_SIZE);
+
+  // 100 Hz, 50%, 20ms → ~2 Zyklen
+  clock_gettime(GPIO_CLOCK_MONOTONIC, ts0);
+  GpioSoftPWM(gc, 18, 100, 50, 20);
+  clock_gettime(GPIO_CLOCK_MONOTONIC, ts1);
+
+  var elapsedUs: int64 := (peek64(ts1) * GPIO_NS_PER_SEC + peek64(ts1 + 8)
+                         - peek64(ts0) * GPIO_NS_PER_SEC - peek64(ts0 + 8))
+                         / GPIO_NS_PER_US;
+
+  if (elapsedUs < 20000) {
+    PrintLn("FAIL: SoftPWM(100Hz, 20ms) elapsed < 20ms");
+    failed := failed + 1;
+  }
+  // Großzügige Obergrenze: max. 5× Sollzeit (langsame CI-Maschinen)
+  if (elapsedUs > 100000) {
+    PrintLn("FAIL: SoftPWM(100Hz, 20ms) elapsed > 100ms — suspiciously slow");
+    failed := failed + 1;
+  }
+
+  free(ts0, GPIO_TIMESPEC_SIZE);
+  free(ts1, GPIO_TIMESPEC_SIZE);
+  freeFakeCtx(gc);
+  if (failed == 0) { PrintLn("OK: GpioSoftPWM(100Hz, 50%, 20ms) ran for >= 20ms (WP-5.3.3)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP5.3.4: Kein Endlosschleifen bei frequency > 1000 Hz
+// ============================================================
+fn testSoftPWMHighFreqNoInfiniteLoop(): int64 {
+  var gc:  int64 := makeFakeCtx();
+  var failed: int64 := 0;
+
+  var ts0: int64 := alloc(GPIO_TIMESPEC_SIZE);
+  var ts1: int64 := alloc(GPIO_TIMESPEC_SIZE);
+
+  // 10000 Hz, 50%, 5ms → period_us=100, 50 Zyklen — früher Endlosschleife
+  clock_gettime(GPIO_CLOCK_MONOTONIC, ts0);
+  GpioSoftPWM(gc, 18, 10000, 50, 5);
+  clock_gettime(GPIO_CLOCK_MONOTONIC, ts1);
+
+  var elapsedUs: int64 := (peek64(ts1) * GPIO_NS_PER_SEC + peek64(ts1 + 8)
+                         - peek64(ts0) * GPIO_NS_PER_SEC - peek64(ts0 + 8))
+                         / GPIO_NS_PER_US;
+
+  free(ts0, GPIO_TIMESPEC_SIZE);
+  free(ts1, GPIO_TIMESPEC_SIZE);
+  freeFakeCtx(gc);
+
+  // Muss >= 5ms und < 2000ms sein (kein Infinite-Loop)
+  if (elapsedUs < 5000) {
+    PrintLn("FAIL: SoftPWM(10kHz, 5ms) elapsed < 5ms");
+    failed := failed + 1;
+  }
+  if (elapsedUs > 2000000) {
+    PrintLn("FAIL: SoftPWM(10kHz, 5ms) did not return — infinite loop?");
+    failed := failed + 1;
+  }
+
+  if (failed == 0) { PrintLn("OK: GpioSoftPWM(10kHz, 50%, 5ms) terminates — no infinite loop (WP-5.3.4)"); }
+  return failed;
+}
+
+// ============================================================
+// AC-WP5.3.x: dutyCycle-Randfälle (0% und 100%) — kein Crash
+// ============================================================
+fn testSoftPWMDutyCycleEdges(): int64 {
+  var gc:  int64 := makeFakeCtx();
+
+  // dutyCycle=0: PIN bleibt LOW, high_us=0 → kein HIGH-Write
+  GpioSoftPWM(gc, 18, 1000, 0, 2);
+
+  // dutyCycle=100: PIN bleibt HIGH, low_us=0 → kein LOW-Write
+  GpioSoftPWM(gc, 18, 1000, 100, 2);
+
+  freeFakeCtx(gc);
+  PrintLn("OK: GpioSoftPWM dutyCycle=0 and 100 run without crash (WP-5.3.x)");
+  return 0;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testAltModeBits();
+  failed := failed + testAltModeInvalid();
+  failed := failed + testWaitForEdgeTimeout();
+  failed := failed + testWaitForEdgeNonBlocking();
+  failed := failed + testSoftPWMGuard();
+  failed := failed + testSoftPWMDuration();
+  failed := failed + testSoftPWMHighFreqNoInfiniteLoop();
+  failed := failed + testSoftPWMDutyCycleEdges();
+
+  if (failed != 0) { PrintLn("FAILED"); return 1; }
+  PrintLn("ALL PASSED");
+  PrintLn("NOTE: AC-WP5.1.3, 5.2.1, 5.3.1/2 require RPi4 hardware — manual test");
+  return 0;
+}

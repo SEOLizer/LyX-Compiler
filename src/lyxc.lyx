@@ -42,10 +42,15 @@ import src.backend.arm_cm_backend;
 import src.backend.xtensa;
 import src.lfd_codegen;
 import src.lyu_writer;
+import src.lbf_writer;
+import src.backend.lyxos.emit_lyxos;
+import src.tools.lbf.writer;
 import src.lyu_reader;
 import src.crypto.lic_types;
 import src.crypto.lic_parse;
 import src.crypto.lic_derive;
+import src.crypto.lic_secret;
+import src.crypto.lic_base64;
 import src.lic_build_flags;
 import src.std.alloc;
 import src.tooling.migrate_caps;
@@ -71,19 +76,20 @@ con LYU_META_OFF_CODELEN: int64 := 8;
 con RELOC_SZ:        int64 := 24;
 
 // Target architectures
-con TARGET_X86_64:       int64 := 1;
-con TARGET_ARM64:        int64 := 2;
-con TARGET_RISCV64:      int64 := 3;
-con TARGET_ARM_CM:       int64 := 4;
-con TARGET_MACOS_X86_64:   int64 := 5;
-con TARGET_WINDOWS_X86_64: int64 := 6;
-con TARGET_MACOS_ARM64:    int64 := 7;
-con TARGET_WINDOWS_ARM64:  int64 := 8;
-con TARGET_LINUX_RISCV64:  int64 := 9;
-con TARGET_ARM_CM4:        int64 := 10;
-con TARGET_XTENSA:         int64 := 11;
-con TARGET_ANDROID_ARM64:  int64 := 12;
-con TARGET_ANDROID_X86_64: int64 := 13;
+con LYX_TC_X86_64:       int64 := 1;
+con LYX_TC_ARM64:        int64 := 2;
+con LYX_TC_RISCV64:      int64 := 3;
+con LYX_TC_ARM_CM:       int64 := 4;
+con LYX_TC_MACOS_X86_64:   int64 := 5;
+con LYX_TC_WINDOWS_X86_64: int64 := 6;
+con LYX_TC_MACOS_ARM64:    int64 := 7;
+con LYX_TC_WINDOWS_ARM64:  int64 := 8;
+con LYX_TC_LINUX_RISCV64:  int64 := 9;
+con LYX_TC_ARM_CM4:        int64 := 10;
+con LYX_TC_XTENSA:         int64 := 11;
+con LYX_TC_ANDROID_ARM64:  int64 := 12;
+con LYX_TC_ANDROID_X86_64: int64 := 13;
+con LYX_TC_LYXOS:          int64 := 14;
 
 // Optimization levels
 con OPT_NONE: int64 := 0;
@@ -163,6 +169,7 @@ pub type CLIOptions = struct {
   defineMacros: int64;
   emitRelocs: bool;
   stripDebug: bool;
+  emitLBF: bool;
 };
 
 // ============================================================================
@@ -197,14 +204,13 @@ fn ms_crc32(data: int64, len: int64): int64 {
 // codeLen  = length of .text in bytes
 // dataLen  = length of .data in bytes (follows .text immediately)
 fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64) {
-  // Open and read the existing binary
-  var fd: int64 := open(path, 0, 0);  // O_RDONLY
+  // WP-32: single O_RDWR open — no close between read and write eliminates TOCTOU window
+  var fd: int64 := open(path, 2, 0);  // O_RDWR
   if (fd < 0) { PrintStr("meta-safe: cannot open binary\n"); return; }
   var fileSize: int64 := lseek(fd, 0, 2);
   lseek(fd, 0, 0);
   var buf: int64 := alloc(fileSize + 4096);
   read(fd, buf as pchar, fileSize);
-  close(fd);
 
   // Compute CRC32 per 4096-byte page of .text
   var pageSize: int64 := 4096;
@@ -304,11 +310,10 @@ fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64
   poke64(sh2 + ELF64_SHDR_OFF_ALIGN, 1);                        // sh_addralign
   poke64(sh2 + ELF64_SHDR_OFF_ENTSIZE, 0);                        // sh_entsize
 
-  // Write new ELF file (overwrite)
-  var wfd: int64 := open(path, 577, 493);  // O_WRONLY|O_CREAT|O_TRUNC, 0755
-  if (wfd < 0) { PrintStr("meta-safe: cannot write binary\n"); free(nbuf, newSize); return; }
-  write(wfd, nbuf as pchar, newSize);
-  close(wfd);
+  // WP-32: write in-place on the same fd (no second open — TOCTOU eliminated)
+  lseek(fd, 0, 0);
+  write(fd, nbuf as pchar, newSize);
+  close(fd);
 
   free(buf, fileSize + 4096);
   free(payload, payloadSize);
@@ -457,6 +462,19 @@ pub type CompilerConfig = class {
   // WP-3.2: --meta-safe: append .meta_safe section with CRC32 page hashes
   metaSafe: bool;
 
+  // WP-A5: --no-libc-init: skip __libc_start_main, call main directly
+  noLibcInit: bool;
+  arm64LibcStartMainUsed: bool;
+
+  // LX-00: --emit=lbf: serialize IR to .lbf bytecode (only with --target=lyxos)
+  emitLBF: bool;
+
+  // LX-36: lifecycle kind from @lifecycle annotation (0=ONE_SHOT default)
+  lifecycleKind: int64;
+
+  // WP-KM-01: --target=lyxos-kernel: reject POSIX-dependent imports
+  kernelMode: int64;
+
   // WP-T14: Migration Tool + Compat-Modus
   migrateCaps: bool;
   capCompat:   bool;
@@ -522,11 +540,14 @@ pub type CompilerConfig = class {
     self.provenance     := false;
     self.runtimeChecks  := false;
     self.debugSymbols   := false;
-    self.metaSafe       := false;
+    self.metaSafe              := false;
+    self.noLibcInit            := false;
+    self.arm64LibcStartMainUsed := false;
     self.migrateCaps    := false;
     self.capCompat      := false;
     self.selfTest       := false;
     self.compileUnit    := false;
+    self.kernelMode     := 0;
     self.unitInfoFile   := 0;
     self.unitInfoPath   := 0;
     self.outputType       := OUTPUT_TYPE_EXECUTABLE;
@@ -663,6 +684,21 @@ pub type CompilerConfig = class {
     if self.earlyExit {
       return false;
     }
+    // Reject output paths with ".." components to prevent path traversal
+    if self.outputFile != 0 {
+      var opLen: int64 := StrLen(self.outputFile as pchar);
+      var opi: int64 := 0;
+      while opi < opLen - 1 {
+        if (peek8(self.outputFile + opi) == 46) && (peek8(self.outputFile + opi + 1) == 46) {
+          if opi == 0 || peek8(self.outputFile + opi - 1) == 47 {
+            EPrintStr("lyxc: ungültiger Ausgabepfad: '..' ist nicht erlaubt\n"c);
+            self.exitCode := 1;
+            return false;
+          }
+        }
+        opi := opi + 1;
+      }
+    }
     if self.inputFile == 0 && self.unitInfoFile <= 1 && self.checkBinary == 0 && !self.selfTest && !self.migrateCaps {
       self.printHelp();
       self.exitCode := 1;
@@ -671,7 +707,7 @@ pub type CompilerConfig = class {
     
     // Set defaults
     if self.target == 0 {
-      self.target := TARGET_X86_64;
+      self.target := LYX_TC_X86_64;
     }
     if self.format == 0 {
       self.format := FORMAT_ELF;
@@ -688,53 +724,60 @@ pub type CompilerConfig = class {
     if StrStartsWith(arg, "--target=") {
       var val: int64 := arg + 9;  // skip "--target=" (9 chars)
       if StrCmp(val, "x86_64"c) == 0 {
-        self.target := TARGET_X86_64;
+        self.target := LYX_TC_X86_64;
       } else if StrCmp(val, "arm64"c) == 0 {
-        self.target := TARGET_ARM64;
+        self.target := LYX_TC_ARM64;
       } else if StrCmp(val, "linux-arm64"c) == 0 {
-        self.target := TARGET_ARM64;
+        self.target := LYX_TC_ARM64;
       } else if StrCmp(val, "riscv64"c) == 0 {
-        self.target := TARGET_RISCV64;
+        self.target := LYX_TC_RISCV64;
       } else if StrCmp(val, "arm_cm"c) == 0 {
-        self.target := TARGET_ARM_CM;
+        self.target := LYX_TC_ARM_CM;
       } else if StrCmp(val, "macos-x86_64"c) == 0 {
-        self.target := TARGET_MACOS_X86_64;
+        self.target := LYX_TC_MACOS_X86_64;
       } else if StrCmp(val, "windows-x86_64"c) == 0 {
-        self.target := TARGET_WINDOWS_X86_64;
+        self.target := LYX_TC_WINDOWS_X86_64;
       } else if StrCmp(val, "macos-arm64"c) == 0 {
-        self.target := TARGET_MACOS_ARM64;
+        self.target := LYX_TC_MACOS_ARM64;
         self.format := FORMAT_MACHO;
       } else if StrCmp(val, "windows-arm64"c) == 0 {
-        self.target := TARGET_WINDOWS_ARM64;
+        self.target := LYX_TC_WINDOWS_ARM64;
         self.format := FORMAT_PE;
       } else if StrCmp(val, "linux-riscv64"c) == 0 {
-        self.target := TARGET_LINUX_RISCV64;
+        self.target := LYX_TC_LINUX_RISCV64;
         self.format := FORMAT_ELF;
       } else if StrCmp(val, "arm-cm4"c) == 0 || StrCmp(val, "arm-cm33"c) == 0 {
-        self.target := TARGET_ARM_CM4;
+        self.target := LYX_TC_ARM_CM4;
         self.format := FORMAT_ELF;
       } else if StrCmp(val, "esp32"c) == 0 || StrCmp(val, "esp32s3"c) == 0 {
-        self.target := TARGET_XTENSA;
+        self.target := LYX_TC_XTENSA;
         self.format := FORMAT_ELF;
       } else if StrCmp(val, "android-arm64"c) == 0 || StrCmp(val, "android"c) == 0 {
         // Default Android architecture: ARM64 (Android 5.0+ requires 64-bit ARM)
-        self.target := TARGET_ANDROID_ARM64;
+        self.target := LYX_TC_ANDROID_ARM64;
         self.format := FORMAT_ELF;
       } else if StrCmp(val, "android-x86_64"c) == 0 {
-        self.target := TARGET_ANDROID_X86_64;
+        self.target := LYX_TC_ANDROID_X86_64;
         self.format := FORMAT_ELF;
       } else if StrCmp(val, "win64"c) == 0 {
-        self.target := TARGET_WINDOWS_X86_64;
+        self.target := LYX_TC_WINDOWS_X86_64;
         self.format := FORMAT_PE;
       } else if StrCmp(val, "linux"c) == 0 {
-        self.target := TARGET_X86_64;
+        self.target := LYX_TC_X86_64;
         self.format := FORMAT_ELF;
       } else if StrCmp(val, "macosx64"c) == 0 {
-        self.target := TARGET_MACOS_X86_64;
+        self.target := LYX_TC_MACOS_X86_64;
         self.format := FORMAT_MACHO;
       } else if StrCmp(val, "riscv"c) == 0 {
-        self.target := TARGET_RISCV64;
+        self.target := LYX_TC_RISCV64;
         self.format := FORMAT_ELF;
+      } else if StrCmp(val, "lyxos"c) == 0 {
+        self.target := LYX_TC_LYXOS;
+        self.format := FORMAT_ELF;
+      } else if StrCmp(val, "lyxos-kernel"c) == 0 {
+        self.target     := LYX_TC_LYXOS;
+        self.format     := FORMAT_ELF;
+        self.kernelMode := 1;
       }
       return;
     }
@@ -755,17 +798,17 @@ pub type CompilerConfig = class {
     if StrStartsWith(arg, "--arch=") {
       var val: int64 := arg + 7;
       if StrCmp(val, "x86_64"c) == 0 {
-        self.target := TARGET_X86_64;
-        self.arch := TARGET_X86_64;
+        self.target := LYX_TC_X86_64;
+        self.arch := LYX_TC_X86_64;
       } else if StrCmp(val, "arm64"c) == 0 {
-        self.target := TARGET_ARM64;
-        self.arch := TARGET_ARM64;
+        self.target := LYX_TC_ARM64;
+        self.arch := LYX_TC_ARM64;
       } else if StrCmp(val, "riscv"c) == 0 || StrCmp(val, "riscv64"c) == 0 {
-        self.target := TARGET_RISCV64;
-        self.arch := TARGET_RISCV64;
+        self.target := LYX_TC_RISCV64;
+        self.arch := LYX_TC_RISCV64;
       } else if StrCmp(val, "arm_cm"c) == 0 {
-        self.target := TARGET_ARM_CM;
-        self.arch := TARGET_ARM_CM;
+        self.target := LYX_TC_ARM_CM;
+        self.arch := LYX_TC_ARM_CM;
       }
       return;
     }
@@ -895,6 +938,10 @@ pub type CompilerConfig = class {
       self.emitASM := true;
       return;
     }
+    if StrCmp(arg, "--emit=lbf"c) == 0 {
+      self.emitLBF := true;
+      return;
+    }
     if StrCmp(arg, "--list"c) == 0 {
       self.dumpList := true;
       return;
@@ -1019,6 +1066,12 @@ pub type CompilerConfig = class {
       return;
     }
 
+    // WP-A5: --no-libc-init — call main directly, skip __libc_start_main (bare-metal/static)
+    if StrCmp(arg, "--no-libc-init"c) == 0 {
+      self.noLibcInit := true;
+      return;
+    }
+
     // WP-BC-49: --debug-symbols
     if StrCmp(arg, "--debug-symbols"c) == 0 {
       self.debugSymbols := true;
@@ -1032,6 +1085,10 @@ pub type CompilerConfig = class {
     }
     if StrCmp(arg, "--capabilities=compat"c) == 0 {
       self.capCompat := true;
+      // WP-25.1: prominente Compiler-Warnung
+      EPrintStrLn("WARNUNG: --capabilities=compat aktiv!"c);
+      EPrintStrLn("         seccomp, landlock und Userspace-Proxy werden vollstaendig deaktiviert."c);
+      EPrintStrLn("         Das generierte Binary laeuft OHNE Laufzeitschutz."c);
       return;
     }
 
@@ -1056,7 +1113,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("0.9.1A"c);
+      PrintStrLn("1.0.0A"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1078,7 +1135,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("0.9.1A"c);
+      PrintStrLn("1.0.0A"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1191,7 +1248,7 @@ pub type CompilerConfig = class {
   }
   
   fn printHelp(): void {
-    PrintStrLn("lyxc 0.9.1A (bootstrap)");
+    PrintStrLn("lyxc 1.0.0A (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -1209,6 +1266,7 @@ pub type CompilerConfig = class {
     PrintStrLn("  --android-api=N        Android API-Level (21..34+, Default 26)");
     PrintStrLn("  --target-energy=<1-5>  Energy-Ziel (1=Minimal, 5=Extreme)");
     PrintStrLn("  --emit-asm             IR als Pseudo-Assembler ausgeben");
+    PrintStrLn("  --emit=lbf             IR als .lbf-Bytecode ausgeben (nur --target=lyxos)");
     PrintStrLn("  --asm-listing          Assembly-Listing mit Source-Zeilen (DO-178C 6.1)");
     PrintStrLn("  --dump-relocs          Relocations und externe Symbole anzeigen");
     PrintStrLn("  --trace-imports        Import-Aufloesung debuggen");
@@ -1291,6 +1349,18 @@ pub type CompilerConfig = class {
       PrintStrLn("Stage 1: Lexing...");
     }
     var _t1: int64 := self._passStart("lexer"c);
+    // WP-31: explicit 256-MB-Limit check before FileReadAll (seed binary may lack built-in check)
+    var _szfd: int64 := open(inputFile, 0, 0);
+    if _szfd >= 0 {
+      var _fsz: int64 := lseek(_szfd, 0, 2);
+      close(_szfd);
+      if _fsz > 268435456 {
+        EPrintStr("error: Cannot read input file: 256-MB-Limit überschritten: "c);
+        EPrintStrLn(inputFile);
+        self.exitCode := 1;
+        return self.exitCode;
+      }
+    }
     var source: pchar := FileReadAll(inputFile);
     if source == 0 {
       EPrintStr("Error: Cannot read input file: "c);
@@ -1317,6 +1387,10 @@ pub type CompilerConfig = class {
       self.exitCode := 1;
       return self.exitCode;
     }
+
+    // LX-36: capture lifecycle kind from @lifecycle annotation (-1 = not set → ONE_SHOT)
+    self.lifecycleKind := parser._pendingLifecycleKind;
+    if self.lifecycleKind < 0 { self.lifecycleKind := 0; }
 
     // Dump AST if requested and return early
     if self.dumpParser || self.astDump {
@@ -1350,6 +1424,7 @@ pub type CompilerConfig = class {
     sema.typeReasoning  := self.typeReasoning; // WP-BC-46
     sema.constraintLog  := self.constraintLog; // WP-BC-46
     sema.daaEnabled     := self.daaWarn;       // WP-AS-15: DAA opt-in
+    sema.kernelMode     := self.kernelMode;   // WP-KM-01: --target=lyxos-kernel
     injectSystemConstants(sema, self);         // WP-CS-05
     var semaResult: int64 := sema.Check(astRoot);
     self._passEnd("sema"c, _t3);
@@ -1441,10 +1516,17 @@ pub type CompilerConfig = class {
       return self.exitCode;
     }
 
+    // LX-00: validate --emit=lbf before any fast-path early returns
+    if self.emitLBF && self.target != LYX_TC_LYXOS {
+      EPrintStrLn("error: --emit=lbf requires --target=lyxos");
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+
     // Stage 5-8 (x86_64 fast path): use direct AST→ELF Codegen (proven, no IR needed)
     // WP-BC-47: skip fast path when --provenance is set (needs IR)
     // WP-AND-02: skip fast path for shared-lib output (needs ET_DYN writer via writeBinary)
-    if self.target == TARGET_X86_64 && !self.provenance && self.outputType != OUTPUT_TYPE_SHARED_LIB {
+    if self.target == LYX_TC_X86_64 && !self.provenance && self.outputType != OUTPUT_TYPE_SHARED_LIB {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.out"c; }
       var _t5x: int64 := self._passStart("codegen-x86_64"c);
@@ -1484,7 +1566,7 @@ pub type CompilerConfig = class {
     }
 
     // Stage 5-8 (macos-x86_64 fast path): same code gen as Linux, Mach-O output
-    if self.target == TARGET_MACOS_X86_64 {
+    if self.target == LYX_TC_MACOS_X86_64 {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.out"c; }
       var _t5m: int64 := self._passStart("codegen-macos-x86_64"c);
@@ -1505,13 +1587,16 @@ pub type CompilerConfig = class {
       var mxb: MacosX86Backend := new MacosX86Backend();
       mxb.Init();
       mxb.Build(cg.code, cg.codeLen);
-      mxb.WriteMachO(outPath);
+      // WP-D1: patch VMT addresses (Linux→macOS base) and write data section
+      mxb.SetVMTInfo(cg.vmtPatches, cg.vmtPatchCount,
+                     cg.vmtMethodPatches, cg.vmtMethodPatchCount);
+      mxb.WriteMachO(outPath, cg.data, cg.dataLen);
       self._passEnd("codegen-macos-x86_64"c, _t5m);
       return self.exitCode;
     }
 
     // Stage 5-8 (windows-x86_64 fast path): same code gen as Linux, PE64 output
-    if self.target == TARGET_WINDOWS_X86_64 {
+    if self.target == LYX_TC_WINDOWS_X86_64 {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.exe"c; }
       var _t5w: int64 := self._passStart("codegen-win-x86_64"c);
@@ -1531,6 +1616,7 @@ pub type CompilerConfig = class {
       cg.Generate(astRoot);
       var wxb: WinX86Backend := new WinX86Backend();
       wxb.Init();
+      wxb.SetBaseRelocs(cg.cg_getBaseRelocBuf(), cg.cg_getBaseRelocCount());  // WP-A2.2
       wxb.Build(cg.code, cg.codeLen, cg.data, cg.dataLen);
       wxb.WritePE64(outPath);
       self._passEnd("codegen-win-x86_64"c, _t5w);
@@ -1575,33 +1661,53 @@ pub type CompilerConfig = class {
       PrintStrLn("Stage 7: Code Generation...");
     }
 
+    // LX-00: --emit=lbf — serialize IR to .lbf bytecode file (lyxos target only)
+    if self.emitLBF {
+      if self.target != LYX_TC_LYXOS {
+        EPrintStrLn("error: --emit=lbf requires --target=lyxos");
+        self.exitCode := 1;
+        return self.exitCode;
+      }
+      var outFile: pchar := self.outputFile;
+      if outFile == 0 { outFile := "a.lbf"c; }
+      var lbfw: LBFWriter := new LBFWriter();
+      if !lbfw.serialize(irMod as int64, outFile) {
+        EPrintStrLn("error: failed to write .lbf file");
+        self.exitCode := 1;
+        return self.exitCode;
+      }
+      return self.exitCode;
+    }
+
     var codeBuffer: int64 := 0;
 
-    if self.target == TARGET_X86_64 {
+    if self.target == LYX_TC_X86_64 {
       codeBuffer := self.emitX86_64(irMod as int64, lower);
-    } else if self.target == TARGET_ARM64 {
+    } else if self.target == LYX_TC_ARM64 {
       codeBuffer := self.emitARM64(irMod as int64);
-    } else if self.target == TARGET_ANDROID_ARM64 {
+    } else if self.target == LYX_TC_ANDROID_ARM64 {
       // WP-AND-01: Android target registered; routes to Linux ARM64 backend.
       // Bionic-specific ABI (TLS, stack alignment, .eh_frame) is WP-AND-03.
       codeBuffer := self.emitARM64(irMod as int64);
-    } else if self.target == TARGET_ANDROID_X86_64 {
+    } else if self.target == LYX_TC_ANDROID_X86_64 {
       // WP-AND-01: Android x86_64 routes to Linux x86_64 backend (emulator target).
       codeBuffer := self.emitX86_64(irMod as int64, lower);
-    } else if self.target == TARGET_MACOS_ARM64 {
+    } else if self.target == LYX_TC_MACOS_ARM64 {
       codeBuffer := self.emitMacOSARM64(irMod as int64);
-    } else if self.target == TARGET_WINDOWS_ARM64 {
+    } else if self.target == LYX_TC_WINDOWS_ARM64 {
       codeBuffer := self.emitWindowsARM64(irMod as int64);
-    } else if self.target == TARGET_LINUX_RISCV64 {
+    } else if self.target == LYX_TC_LINUX_RISCV64 {
       codeBuffer := self.emitLinuxRISCV64(irMod as int64);
-    } else if self.target == TARGET_ARM_CM4 {
+    } else if self.target == LYX_TC_ARM_CM4 {
       codeBuffer := self.emitARMCM4(irMod as int64);
-    } else if self.target == TARGET_XTENSA {
+    } else if self.target == LYX_TC_XTENSA {
       codeBuffer := self.emitXtensa(irMod as int64);
-    } else if self.target == TARGET_RISCV64 {
+    } else if self.target == LYX_TC_RISCV64 {
       codeBuffer := self.emitRISCV(irMod as int64);
-    } else if self.target == TARGET_ARM_CM {
+    } else if self.target == LYX_TC_ARM_CM {
       codeBuffer := self.emitARMCm(irMod as int64);
+    } else if self.target == LYX_TC_LYXOS {
+      codeBuffer := self.emitLyxOS(irMod as int64);
     }
 
     if codeBuffer == 0 {
@@ -1610,8 +1716,8 @@ pub type CompilerConfig = class {
       return self.exitCode;
     }
 
-    // Windows ARM64 / Linux RISC-V / ARM CM4 / Xtensa: file already written inside emit*
-    if self.target == TARGET_WINDOWS_ARM64 || self.target == TARGET_LINUX_RISCV64 || self.target == TARGET_ARM_CM4 || self.target == TARGET_XTENSA {
+    // Windows ARM64 / Linux RISC-V / ARM CM4 / Xtensa / LyxOS: file already written inside emit*
+    if self.target == LYX_TC_WINDOWS_ARM64 || self.target == LYX_TC_LINUX_RISCV64 || self.target == LYX_TC_ARM_CM4 || self.target == LYX_TC_XTENSA || self.target == LYX_TC_LYXOS {
       return self.exitCode;
     }
 
@@ -1885,28 +1991,95 @@ pub type CompilerConfig = class {
         return irCodeBuf;
       }
 
-      // Prepend 12-byte _start stub: BL main + exit syscall
-      // _start (offset 0): BL main  (main is at offset 12, imm26 delta = 3)
-      // _start (offset 4): MOVZ x8, #93 (SYS_EXIT)
-      // _start (offset 8): SVC #0
-      // main   (offset 12): IR-emitted function code
-      self.codeStubOff := 12;
-      var totalLen: int64 := 12 + irCodeLen;
+      // WP-A5: For dynamically-linked binaries (armExternCount > 0) and --no-libc-init not set,
+      // prepend a 56-byte _start that calls __libc_start_main before main.
+      // Layout:
+      //  0: ADR  x0, #56      — address of main (main is at offset 56)
+      //  4: LDR  x1, [sp]     — argc from stack
+      //  8: ADD  x2, sp, #8   — argv = sp+8
+      // 12: MOVZ x3, #0       — init=NULL
+      // 16: MOVZ x4, #0       — fini=NULL
+      // 20: MOVZ x5, #0       — rtld_fini=NULL
+      // 24: ADD  x6, sp, #0   — stack_end=sp
+      // 28: LDR  x8, [pc,#20] — load __libc_start_main from GOT slot at offset 48
+      // 32: BLR  x8            — call __libc_start_main
+      // 36: MOVZ x8, #93      — fallback: SYS_exit
+      // 40: SVC  #0            — fallback syscall
+      // 44: NOP                — align GOT to 8 bytes
+      // 48: .quad 0            — GOT slot for __libc_start_main (filled by loader)
+      // 56: IR-emitted code (main...)
+      //
+      // For static binaries or --no-libc-init, use the original 12-byte stub.
+      if self.armExternCount > 0 && !self.noLibcInit {
+        if irCodeLen > 131016 {
+          EPrintStr("lyxc: ARM64 code section too large for dynamic stub (>131016 bytes)\n"c);
+          return;
+        }
+        self.codeStubOff := 56;
+        var totalLen2: int64 := 56 + irCodeLen;
+        var dynBuf: int64 := alloc(131072);
+        // ADR x0, #56 = 0x100001C0
+        poke8(dynBuf +  0, 0xC0); poke8(dynBuf +  1, 0x01); poke8(dynBuf +  2, 0x00); poke8(dynBuf +  3, 0x10);
+        // LDR x1, [sp] = 0xF94003E1
+        poke8(dynBuf +  4, 0xE1); poke8(dynBuf +  5, 0x03); poke8(dynBuf +  6, 0x40); poke8(dynBuf +  7, 0xF9);
+        // ADD x2, sp, #8 = 0x910023E2
+        poke8(dynBuf +  8, 0xE2); poke8(dynBuf +  9, 0x23); poke8(dynBuf + 10, 0x00); poke8(dynBuf + 11, 0x91);
+        // MOVZ x3, #0 = 0xD2800003
+        poke8(dynBuf + 12, 0x03); poke8(dynBuf + 13, 0x00); poke8(dynBuf + 14, 0x80); poke8(dynBuf + 15, 0xD2);
+        // MOVZ x4, #0 = 0xD2800004
+        poke8(dynBuf + 16, 0x04); poke8(dynBuf + 17, 0x00); poke8(dynBuf + 18, 0x80); poke8(dynBuf + 19, 0xD2);
+        // MOVZ x5, #0 = 0xD2800005
+        poke8(dynBuf + 20, 0x05); poke8(dynBuf + 21, 0x00); poke8(dynBuf + 22, 0x80); poke8(dynBuf + 23, 0xD2);
+        // ADD x6, sp, #0 = 0x910003E6  (MOV x6, sp)
+        poke8(dynBuf + 24, 0xE6); poke8(dynBuf + 25, 0x03); poke8(dynBuf + 26, 0x00); poke8(dynBuf + 27, 0x91);
+        // LDR x8, [pc, #20] = 0x580000A8  (loads GOT at offset 48)
+        poke8(dynBuf + 28, 0xA8); poke8(dynBuf + 29, 0x00); poke8(dynBuf + 30, 0x00); poke8(dynBuf + 31, 0x58);
+        // BLR x8 = 0xD63F0100
+        poke8(dynBuf + 32, 0x00); poke8(dynBuf + 33, 0x01); poke8(dynBuf + 34, 0x3F); poke8(dynBuf + 35, 0xD6);
+        // MOVZ x8, #93 = 0xD2800BA8 (fallback exit)
+        poke8(dynBuf + 36, 0xA8); poke8(dynBuf + 37, 0x0B); poke8(dynBuf + 38, 0x80); poke8(dynBuf + 39, 0xD2);
+        // SVC #0 = 0xD4000001
+        poke8(dynBuf + 40, 0x01); poke8(dynBuf + 41, 0x00); poke8(dynBuf + 42, 0x00); poke8(dynBuf + 43, 0xD4);
+        // NOP = 0xD503201F (padding for 8-byte GOT alignment)
+        poke8(dynBuf + 44, 0x1F); poke8(dynBuf + 45, 0x20); poke8(dynBuf + 46, 0x03); poke8(dynBuf + 47, 0xD5);
+        // GOT slot for __libc_start_main (offset 48, 8 bytes zero — filled by loader)
+        poke64(dynBuf + 48, 0);
+        // Copy IR code after stub
+        memcpy(dynBuf + 56, irCodeBuf, irCodeLen);
+        self.arm64LibcStartMainUsed := true;
+        self.codeSize := totalLen2;
+        return dynBuf;
+      }
+
+      // Static/no-libc-init: 20-byte _start stub: load argc/argv then BL main + exit
+      // _start (offset  0): LDR x0, [sp]     — argc from Linux AArch64 ABI stack → x0
+      // _start (offset  4): ADD x1, sp, #8   — argv pointer → x1
+      // _start (offset  8): BL main           — main at offset 20, imm26 delta = 3
+      // _start (offset 12): MOVZ x8, #93     — SYS_EXIT fallback
+      // _start (offset 16): SVC #0
+      // main   (offset 20): IR-emitted function code
+      self.codeStubOff := 20;
+      var totalLen: int64 := 20 + irCodeLen;
       var newBuf: int64 := alloc(131072);
 
-      // BL main = 0x94000003
-      poke8(newBuf + 0, 3);     poke8(newBuf + 1, 0);
-      poke8(newBuf + 2, 0);     poke8(newBuf + 3, 0x94);
+      // LDR x0, [sp] = 0xF94003E0
+      poke8(newBuf + 0, 0xE0);  poke8(newBuf + 1, 0x03);
+      poke8(newBuf + 2, 0x40);  poke8(newBuf + 3, 0xF9);
+      // ADD x1, sp, #8 = 0x910023E1
+      poke8(newBuf + 4, 0xE1);  poke8(newBuf + 5, 0x23);
+      poke8(newBuf + 6, 0x00);  poke8(newBuf + 7, 0x91);
+      // BL main = 0x94000003 (delta = (20-8)/4 = 3)
+      poke8(newBuf + 8, 3);     poke8(newBuf + 9, 0);
+      poke8(newBuf + 10, 0);    poke8(newBuf + 11, 0x94);
       // MOVZ x8, #93 = 0xD2800BA8
-      poke8(newBuf + 4, 0xA8);  poke8(newBuf + 5, 0x0B);
-      poke8(newBuf + 6, 0x80);  poke8(newBuf + 7, 0xD2);
+      poke8(newBuf + 12, 0xA8); poke8(newBuf + 13, 0x0B);
+      poke8(newBuf + 14, 0x80); poke8(newBuf + 15, 0xD2);
       // SVC #0 = 0xD4000001
-      poke8(newBuf + 8, 0x01);  poke8(newBuf + 9, 0x00);
-      poke8(newBuf + 10, 0x00); poke8(newBuf + 11, 0xD4);
+      poke8(newBuf + 16, 0x01); poke8(newBuf + 17, 0x00);
+      poke8(newBuf + 18, 0x00); poke8(newBuf + 19, 0xD4);
 
       // Copy IR code after stub
-      var ci: int64 := 0;
-      memcpy(newBuf + 12, irCodeBuf, irCodeLen);
+      memcpy(newBuf + 20, irCodeBuf, irCodeLen);
 
       self.codeSize := totalLen;
       return newBuf;
@@ -2076,10 +2249,13 @@ pub type CompilerConfig = class {
     if funcCount > 0 {
       var emitter: EmitARM64 := new EmitARM64();
       emitter.init(irMod);
+      // WP-D2: Windows mode — replace Linux syscalls with Windows API helper calls
+      emitter.setWinMode(1);
       emitter.emit();
-      wab.Build(emitter.getCodeBuf(), emitter.getCodeLen());
+      wab.Build(emitter.getCodeBuf(), emitter.getCodeLen(),
+                emitter.getWinPatchBuf(), emitter.getWinPatchCount());
     } else {
-      wab.Build(0, 0);
+      wab.Build(0, 0, 0, 0);
     }
     wab.WritePE64(outPath);
     self.codeSize := wab.GetCodeSize();
@@ -2134,9 +2310,11 @@ pub type CompilerConfig = class {
       var emitter: EmitXtensa := new EmitXtensa();
       emitter.init(irMod);
       emitter.emit();
-      xb.Build(emitter.getCodeBuf(), emitter.getCodeLen());
+      // WP-D3: pass main function offset so e_entry is set correctly
+      // (helpers are prepended before user code in emit())
+      xb.Build(emitter.getCodeBuf(), emitter.getCodeLen(), emitter.getFuncAddr(0));
     } else {
-      xb.Build(0, 0);
+      xb.Build(0, 0, 0);
     }
     xb.WriteELF32(outPath);
     self.codeSize := xb.GetCodeSize();
@@ -2156,7 +2334,53 @@ pub type CompilerConfig = class {
     self.codeSize := emitter.emit();
     return emitter.getCodeBuf();
   }
-  
+
+  // LX-01/LX-02: Lyx OS x86-64 backend.
+  // Compiles IR → machine code, then writes ELF with .note.lyx-abi.
+  fn emitLyxOS(irMod: int64): int64 {
+    var outPath: pchar := self.outputFile;
+    if outPath == 0 as pchar { outPath := "a.out"c; }
+
+    var emitter: EmitLyxOS := new EmitLyxOS();
+    emitter.init(irMod);
+
+    // LX-36: choose _start variant by lifecycle kind.
+    // RTC-Canary-Seed (kein getrandom in §10.4) verschiebt die CALL-Offsets:
+    // ONE_SHOT/DAEMON (0,2): 64-byte stub; CALL rel32 at +46, callNextIP=50.
+    // EVENT_LOOP (1): 86-byte stub; CALL rel32 at +68, callNextIP=72.
+    // REACTIVE (3): no _start needed (kernel jumps to handler directly).
+    if self.lifecycleKind == 1 {
+        emitter.emitStartStubEventLoop();
+    }
+    if self.lifecycleKind != 1 {
+        emitter.emitStartStub();
+    }
+
+    // Emit all IR functions. mainOff = absolute buffer offset of main().
+    var mainOff: int64 := emitter.emitFunctions();
+
+    // Append IR string pool and patch all CONST_STR LEA rel32s (LX-04).
+    emitter.emitStrPool();
+
+    // Patch CALL rel32 in _start now that mainOff is known.
+    if self.lifecycleKind == 1 {
+        emitter.patchCallRel32(68, mainOff - 72);  // EVENT_LOOP: rel32 at +68, callNextIP=72
+    }
+    if self.lifecycleKind != 1 {
+        emitter.patchCallRel32(46, mainOff - 50);  // ONE_SHOT/DAEMON/REACTIVE: rel32 at +46, callNextIP=50
+    }
+
+    var lbf: LBFNativeWriter := new LBFNativeWriter();
+    lbf.setLifecycle(self.lifecycleKind, 0, 0);  // LX-36: no events at compile time (handler VAs unknown)
+    if !lbf.writeLBF(outPath, self.inputFile as pchar, emitter.getCodeBuf(), emitter.getCodeLen()) {
+      EPrintStrLn("error: lyxos: failed to write LBF");
+      self.exitCode := 1;
+      return 1;
+    }
+    self.codeSize := emitter.getCodeLen();
+    return 1;
+  }
+
   // ---------------------------------------------------------------------------
   // Binary Writing
   // ---------------------------------------------------------------------------
@@ -2301,9 +2525,13 @@ pub type CompilerConfig = class {
     var interpLen: int64 := StrLen(interpStr) + 1;
     var nExt: int64 := self.armExternCount;
     var strBuf: int64 := peek64(self.irModulePtr + IR_MOD_OFF_STRBUF);   // IR string table
+    var libcStartMainSymOff: int64 := 0;
+    var libcSo6DynstrOff: int64 := 0;
+    var libcSo6IsNew: bool := false;
 
     // ---- .dynstr: \0 + distinct lib names + symbol names ----
-    var dynstr: int64 := alloc(65536);
+    con DYNSTR_MAX: int64 := 65536;
+    var dynstr: int64 := alloc(DYNSTR_MAX);
     var dsLen: int64 := 0;
     poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
     var uniqLibOff: int64 := alloc((nExt + 1) * 8);
@@ -2331,7 +2559,10 @@ pub type CompilerConfig = class {
       }
       if found < 0 {
         var off: int64 := dsLen;
-        var j: int64 := 0;
+        if dsLen + libLen + 1 > DYNSTR_MAX {
+          EPrintStr("lyxc: .dynstr overflow: too many external symbols\n"c);
+          return;
+        }
         memcpy(dynstr + dsLen, strBuf + libOff, libLen); dsLen := dsLen + libLen;
         poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
         poke64(uniqLibOff + uniqCount * 8, libOff);
@@ -2346,25 +2577,73 @@ pub type CompilerConfig = class {
       var nmOff: int64 := peek64(eb2);
       var nmLen: int64 := peek64(eb2 + CG_EXTERN_OFF_NAMELEN);
       var soff: int64 := dsLen;
-      var j2: int64 := 0;
+      if dsLen + nmLen + 1 > DYNSTR_MAX {
+        EPrintStr("lyxc: .dynstr overflow: too many external symbols\n"c);
+        return;
+      }
       memcpy(dynstr + dsLen, strBuf + nmOff, nmLen); dsLen := dsLen + nmLen;
       poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
       poke64(symStr + ei * 8, soff);
       ei := ei + 1;
     }
+
+    // WP-A5: inject libc.so.6 DT_NEEDED and __libc_start_main symbol into .dynstr
+    if self.arm64LibcStartMainUsed {
+      var libcSo6Str: pchar := "libc.so.6"c;
+      var libcSo6Len: int64 := 9;
+      var libcFound: bool := false;
+      var lu: int64 := 0;
+      while lu < uniqCount {
+        var dynstrLibOff: int64 := peek64(uniqLibStr + lu * 8);
+        var km: int64 := 0;
+        var matchL: bool := true;
+        while km <= libcSo6Len {
+          if matchL { if peek8(dynstr + dynstrLibOff + km) != peek8(libcSo6Str as int64 + km) { matchL := false; } }
+          km := km + 1;
+        }
+        if matchL { libcFound := true; lu := uniqCount; }
+        lu := lu + 1;
+      }
+      if !libcFound {
+        if dsLen + libcSo6Len + 1 > DYNSTR_MAX {
+          EPrintStr("lyxc: .dynstr overflow: libc.so.6 entry\n"c);
+          return;
+        }
+        libcSo6IsNew := true;
+        libcSo6DynstrOff := dsLen;
+        memcpy(dynstr + dsLen, libcSo6Str as int64, libcSo6Len);
+        dsLen := dsLen + libcSo6Len;
+        poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+      }
+      var lsmStr: pchar := "__libc_start_main"c;
+      var lsmLen: int64 := 17;
+      if dsLen + lsmLen + 1 > DYNSTR_MAX {
+        EPrintStr("lyxc: .dynstr overflow: __libc_start_main entry\n"c);
+        return;
+      }
+      libcStartMainSymOff := dsLen;
+      memcpy(dynstr + dsLen, lsmStr as int64, lsmLen);
+      dsLen := dsLen + lsmLen;
+      poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+    }
+
     var dynstrSize: int64 := dsLen;
 
     // ---- section offsets (8-aligned) ----
     var dynstrOff: int64 := ((codeFileOff + size + 7) >> 3) << 3;
     var dynsymOff: int64 := ((dynstrOff + dynstrSize + 7) >> 3) << 3;
-    var dynsymSize: int64 := (nExt + 1) * 24;
+    var lsmExtra: int64 := 0;
+    if self.arm64LibcStartMainUsed { lsmExtra := 1; }
+    var libcNeededExtra: int64 := 0;
+    if libcSo6IsNew { libcNeededExtra := 1; }
+    var dynsymSize: int64 := (nExt + lsmExtra + 1) * 24;
     var hashOff: int64 := dynsymOff + dynsymSize;
-    var nchain: int64 := nExt + 1;
+    var nchain: int64 := nExt + lsmExtra + 1;
     var hashSize: int64 := (3 + nchain) * 4;
     var relaOff: int64 := ((hashOff + hashSize + 7) >> 3) << 3;
-    var relaSize: int64 := self.relocCount * 24;
+    var relaSize: int64 := (self.relocCount + lsmExtra) * 24;
     var dynOff: int64 := relaOff + relaSize;
-    var dynCount: int64 := uniqCount + 11;
+    var dynCount: int64 := uniqCount + libcNeededExtra + 11;
     var dynSize: int64 := dynCount * 16;
     var fileSize: int64 := dynOff + dynSize;
 
@@ -2421,6 +2700,14 @@ pub type CompilerConfig = class {
       poke16(sy + 6, 0);                       // SHN_UNDEF
       ei := ei + 1;
     }
+    // WP-A5: __libc_start_main at dynsym index nExt+1
+    if self.arm64LibcStartMainUsed {
+      var lsmSy: int64 := buf + dynsymOff + (nExt + 1) * 24;
+      poke32(lsmSy, libcStartMainSymOff);  // st_name
+      poke8(lsmSy + 4, 0x12);              // STB_GLOBAL|STT_FUNC
+      poke8(lsmSy + 5, 0);
+      poke16(lsmSy + 6, 0);                // SHN_UNDEF
+    }
 
     // .hash — minimal SysV (nbucket=1, empty)
     poke32(buf + hashOff, 1);
@@ -2436,6 +2723,16 @@ pub type CompilerConfig = class {
       poke64(ra + 16, peek64(src + ELF64_RELA_OFF_ADDEND));                        // r_addend
       ri := ri + 1;
     }
+    // WP-A5: RELA for __libc_start_main GOT slot (stub+48 = VA 0x401030)
+    if self.arm64LibcStartMainUsed {
+      var lsmRa: int64 := buf + relaOff + self.relocCount * 24;
+      var lsmSymIdx: int64 := nExt + 1;
+      var lsmRInfo: int64 := lsmSymIdx << 32;
+      lsmRInfo := lsmRInfo | 0x401;         // R_AARCH64_GLOB_DAT
+      poke64(lsmRa,      0x401030);          // r_offset: GOT slot at stub offset 48
+      poke64(lsmRa + 8,  lsmRInfo);          // r_info
+      poke64(lsmRa + 16, 0);                 // r_addend = 0
+    }
 
     // .dynamic
     var dp: int64 := buf + dynOff;
@@ -2443,6 +2740,10 @@ pub type CompilerConfig = class {
     while u2 < uniqCount {
       poke64(dp, 1); poke64(dp + ELF64_DYN_OFF_VAL, peek64(uniqLibStr + u2 * 8)); dp := dp + 16;  // DT_NEEDED
       u2 := u2 + 1;
+    }
+    // WP-A5: DT_NEEDED for libc.so.6 if not already in user externs
+    if libcSo6IsNew {
+      poke64(dp, 1); poke64(dp + ELF64_DYN_OFF_VAL, libcSo6DynstrOff); dp := dp + 16;  // DT_NEEDED libc.so.6
     }
     poke64(dp, 4);  poke64(dp + ELF64_DYN_OFF_VAL, baseVA + hashOff);   dp := dp + 16;   // DT_HASH
     poke64(dp, 5);  poke64(dp + ELF64_DYN_OFF_VAL, baseVA + dynstrOff); dp := dp + 16;   // DT_STRTAB
@@ -2513,17 +2814,23 @@ pub type CompilerConfig = class {
     poke8(elfBuf + off, 0); off := off + 1;
     poke8(elfBuf + off, 0); off := off + 1;
     
-    // e_type (offset 16): ET_EXEC = 2
-    poke16(elfBuf + 16, 2);
+    // WP-10: ARM64 Linux uses ET_DYN (PIE) with load VA 0x1000.
+    // ARM64 code is already PC-relative (ADRP/ADR/BL), so no IR changes needed.
+    // x86_64 keeps ET_EXEC at 0x401000.
+    var etype:  int64 := 2;        // ET_EXEC
+    var loadVA: int64 := 0x401000;
+    if self.target == LYX_TC_ARM64 { etype := 3; loadVA := 0x1000; }  // ET_DYN
+    // e_type (offset 16)
+    poke16(elfBuf + 16, etype);
     // e_machine (offset 18): x86-64=62, AArch64=183
     var emach: int64 := 62;
-    if self.target == TARGET_ARM64 { emach := 183; }
-    if self.target == TARGET_ANDROID_ARM64 { emach := 183; }
+    if self.target == LYX_TC_ARM64 { emach := 183; }
+    if self.target == LYX_TC_ANDROID_ARM64 { emach := 183; }
     poke16(elfBuf + 18, emach);
     // e_version (offset 20): EV_CURRENT = 1
     poke32(elfBuf + 20, 1);
-    // e_entry (offset 24): entry point = 0x401000
-    poke64(elfBuf + ELF64_EHDR_OFF_ENTRY, 0x401000);
+    // e_entry (offset 24)
+    poke64(elfBuf + ELF64_EHDR_OFF_ENTRY, loadVA);
     // e_phoff (offset 32): program header offset = 64
     poke64(elfBuf + ELF64_EHDR_OFF_PHOFF, 64);
     // e_shoff (offset 40): no section headers = 0
@@ -2551,10 +2858,9 @@ pub type CompilerConfig = class {
     poke32(elfBuf + ph, 7); ph := ph + 4;
     // p_offset: file offset = 0x1000
     poke64(elfBuf + ph, codeFileOffset); ph := ph + 8;
-    // p_vaddr: virtual address = 0x401000
-    poke64(elfBuf + ph, 0x401000); ph := ph + 8;
-    // p_paddr: physical address = 0x401000
-    poke64(elfBuf + ph, 0x401000); ph := ph + 8;
+    // p_vaddr / p_paddr: 0x1000 for ARM64 PIE, 0x401000 for x86-64
+    poke64(elfBuf + ph, loadVA); ph := ph + 8;
+    poke64(elfBuf + ph, loadVA); ph := ph + 8;
     // p_filesz: file size = code size
     poke64(elfBuf + ph, size); ph := ph + 8;
     // p_memsz: memory size = code size
@@ -2713,8 +3019,8 @@ pub type CompilerConfig = class {
 
     poke16(buf + 16, 3);                            // e_type = ET_DYN
     var emach: int64 := 62;                         // EM_X86_64
-    if self.target == TARGET_ARM64 { emach := 183; }
-    if self.target == TARGET_ANDROID_ARM64 { emach := 183; }
+    if self.target == LYX_TC_ARM64 { emach := 183; }
+    if self.target == LYX_TC_ANDROID_ARM64 { emach := 183; }
     poke16(buf + 18, emach);                        // e_machine
     poke32(buf + 20, 1);                            // e_version
     poke64(buf + ELF64_EHDR_OFF_ENTRY, 0);
@@ -3060,18 +3366,13 @@ pub type CompilerConfig = class {
   }
 
   fn writePE(path: pchar, code: int64, size: int64): bool {
-    var writer: int64 := PE64Writer.Create();
-    writer.SetEntry(0x401000);
-    writer.SetTextSection(code, size, 0x401000);
-    
-    var output: int64 := writer.Write();
-    var outputSize: int64 := writer.GetSize();
-    
-    var result: bool := FileWriteAll(path, output as pchar, outputSize);
-    
-    writer.Free();
-    
-    return result;
+    var writer: TPE64Writer := new TPE64Writer();
+    writer.Init();
+    writer.SetCode(code, size);
+    writer.SetEntryRVA(0x1000);
+    writer.WriteStatic(path as int64, StrLen(path));
+    writer.Destroy();
+    return 1 as bool;
   }
   
   fn writeMachO(path: pchar, code: int64, size: int64): bool {
@@ -3110,7 +3411,7 @@ pub type CompilerConfig = class {
 
     // --- Mach-O header (32 bytes) ---
     poke32(outBuf + off, 0xFEEDFACF); off := off + 4;  // magic MH_MAGIC_64
-    if self.target == TARGET_MACOS_ARM64 {
+    if self.target == LYX_TC_MACOS_ARM64 {
       poke32(outBuf + off, 0x0100000C); off := off + 4;  // CPU_TYPE_ARM64
       poke32(outBuf + off, 0); off := off + 4;           // CPU_SUBTYPE_ARM64_ALL
     } else {
@@ -3529,22 +3830,22 @@ pub type CompilerConfig = class {
   // ---------------------------------------------------------------------------
   
   pub fn GetTargetName(): pchar {
-    if self.target == TARGET_X86_64 {
+    if self.target == LYX_TC_X86_64 {
       return "x86_64"c;
     }
-    if self.target == TARGET_ARM64 {
+    if self.target == LYX_TC_ARM64 {
       return "arm64"c;
     }
-    if self.target == TARGET_RISCV64 {
+    if self.target == LYX_TC_RISCV64 {
       return "riscv64"c;
     }
-    if self.target == TARGET_ARM_CM {
+    if self.target == LYX_TC_ARM_CM {
       return "arm_cm"c;
     }
-    if self.target == TARGET_ANDROID_ARM64 {
+    if self.target == LYX_TC_ANDROID_ARM64 {
       return "android-arm64"c;
     }
-    if self.target == TARGET_ANDROID_X86_64 {
+    if self.target == LYX_TC_ANDROID_X86_64 {
       return "android-x86_64"c;
     }
     return "unknown"c;
@@ -3641,35 +3942,35 @@ pub type CompilerConfig = class {
 
 // WP-CS-05: map CompilerConfig.target → ARCH_* code (1=x86_64, 2=arm64, 3=riscv64, 4=arm_cm)
 fn cfg_archCode(cfg: CompilerConfig): int64 {
-  if cfg.target == TARGET_X86_64         { return 1; }
-  if cfg.target == TARGET_MACOS_X86_64   { return 1; }
-  if cfg.target == TARGET_WINDOWS_X86_64 { return 1; }
-  if cfg.target == TARGET_ANDROID_X86_64 { return 1; }
-  if cfg.target == TARGET_ARM64          { return 2; }
-  if cfg.target == TARGET_MACOS_ARM64    { return 2; }
-  if cfg.target == TARGET_WINDOWS_ARM64  { return 2; }
-  if cfg.target == TARGET_ANDROID_ARM64  { return 2; }
-  if cfg.target == TARGET_RISCV64        { return 3; }
-  if cfg.target == TARGET_LINUX_RISCV64  { return 3; }
-  if cfg.target == TARGET_ARM_CM         { return 4; }
-  if cfg.target == TARGET_ARM_CM4        { return 4; }
+  if cfg.target == LYX_TC_X86_64         { return 1; }
+  if cfg.target == LYX_TC_MACOS_X86_64   { return 1; }
+  if cfg.target == LYX_TC_WINDOWS_X86_64 { return 1; }
+  if cfg.target == LYX_TC_ANDROID_X86_64 { return 1; }
+  if cfg.target == LYX_TC_ARM64          { return 2; }
+  if cfg.target == LYX_TC_MACOS_ARM64    { return 2; }
+  if cfg.target == LYX_TC_WINDOWS_ARM64  { return 2; }
+  if cfg.target == LYX_TC_ANDROID_ARM64  { return 2; }
+  if cfg.target == LYX_TC_RISCV64        { return 3; }
+  if cfg.target == LYX_TC_LINUX_RISCV64  { return 3; }
+  if cfg.target == LYX_TC_ARM_CM         { return 4; }
+  if cfg.target == LYX_TC_ARM_CM4        { return 4; }
   return 1;
 }
 
 // WP-CS-05: map CompilerConfig.target → OS_* code (1=linux, 2=macos, 3=windows, 4=bare)
 fn cfg_osCode(cfg: CompilerConfig): int64 {
-  if cfg.target == TARGET_X86_64         { return 1; }
-  if cfg.target == TARGET_ARM64          { return 1; }
-  if cfg.target == TARGET_RISCV64        { return 1; }
-  if cfg.target == TARGET_LINUX_RISCV64  { return 1; }
-  if cfg.target == TARGET_ANDROID_ARM64  { return 1; }
-  if cfg.target == TARGET_ANDROID_X86_64 { return 1; }
-  if cfg.target == TARGET_MACOS_X86_64   { return 2; }
-  if cfg.target == TARGET_MACOS_ARM64    { return 2; }
-  if cfg.target == TARGET_WINDOWS_X86_64 { return 3; }
-  if cfg.target == TARGET_WINDOWS_ARM64  { return 3; }
-  if cfg.target == TARGET_ARM_CM         { return 4; }
-  if cfg.target == TARGET_ARM_CM4        { return 4; }
+  if cfg.target == LYX_TC_X86_64         { return 1; }
+  if cfg.target == LYX_TC_ARM64          { return 1; }
+  if cfg.target == LYX_TC_RISCV64        { return 1; }
+  if cfg.target == LYX_TC_LINUX_RISCV64  { return 1; }
+  if cfg.target == LYX_TC_ANDROID_ARM64  { return 1; }
+  if cfg.target == LYX_TC_ANDROID_X86_64 { return 1; }
+  if cfg.target == LYX_TC_MACOS_X86_64   { return 2; }
+  if cfg.target == LYX_TC_MACOS_ARM64    { return 2; }
+  if cfg.target == LYX_TC_WINDOWS_X86_64 { return 3; }
+  if cfg.target == LYX_TC_WINDOWS_ARM64  { return 3; }
+  if cfg.target == LYX_TC_ARM_CM         { return 4; }
+  if cfg.target == LYX_TC_ARM_CM4        { return 4; }
   return 1;
 }
 
@@ -3686,10 +3987,10 @@ fn injectCgSystemConstants(cg: Codegen, arch: int64, os: int64): void {
   cg.AddBuiltinCon("TARGET_ARCH"c, arch);
   cg.AddBuiltinCon("TARGET_OS"c,   os);
   var b: int64 := 0;
-  if arch == 1 { b := 1; } else { b := 0; }  cg.AddBuiltinCon("TARGET_X86_64"c,  b);
-  if arch == 2 { b := 1; } else { b := 0; }  cg.AddBuiltinCon("TARGET_ARM64"c,   b);
-  if arch == 3 { b := 1; } else { b := 0; }  cg.AddBuiltinCon("TARGET_RISCV64"c, b);
-  if arch == 4 { b := 1; } else { b := 0; }  cg.AddBuiltinCon("TARGET_ARM_CM"c,  b);
+  if arch == 1 { b := 1; } else { b := 0; }  cg.AddBuiltinCon("LYX_TC_X86_64"c,  b);
+  if arch == 2 { b := 1; } else { b := 0; }  cg.AddBuiltinCon("LYX_TC_ARM64"c,   b);
+  if arch == 3 { b := 1; } else { b := 0; }  cg.AddBuiltinCon("LYX_TC_RISCV64"c, b);
+  if arch == 4 { b := 1; } else { b := 0; }  cg.AddBuiltinCon("LYX_TC_ARM_CM"c,  b);
   if os == 1   { b := 1; } else { b := 0; }  cg.AddBuiltinCon("TARGET_LINUX"c,   b);
   if os == 2   { b := 1; } else { b := 0; }  cg.AddBuiltinCon("TARGET_MACOS"c,   b);
   if os == 3   { b := 1; } else { b := 0; }  cg.AddBuiltinCon("TARGET_WINDOWS"c, b);
@@ -3714,10 +4015,10 @@ fn injectSystemConstants(sema: Sema, cfg: CompilerConfig): void {
   sema.InjectConInt("TARGET_ARCH"c, arch);
   sema.InjectConInt("TARGET_OS"c,   os);
   // Bool shortcuts
-  sema.InjectConBool("TARGET_X86_64"c,  arch == 1);
-  sema.InjectConBool("TARGET_ARM64"c,   arch == 2);
-  sema.InjectConBool("TARGET_RISCV64"c, arch == 3);
-  sema.InjectConBool("TARGET_ARM_CM"c,  arch == 4);
+  sema.InjectConBool("LYX_TC_X86_64"c,  arch == 1);
+  sema.InjectConBool("LYX_TC_ARM64"c,   arch == 2);
+  sema.InjectConBool("LYX_TC_RISCV64"c, arch == 3);
+  sema.InjectConBool("LYX_TC_ARM_CM"c,  arch == 4);
   sema.InjectConBool("TARGET_LINUX"c,   os == 1);
   sema.InjectConBool("TARGET_MACOS"c,   os == 2);
   sema.InjectConBool("TARGET_WINDOWS"c, os == 3);
@@ -3829,44 +4130,71 @@ pub fn lic_loadAndVerify(cfg: CompilerConfig, argc: int64, argv: pchar): bool {
     return false;
   }
 
-  // Derive expected key from name + email
-  var expected: int64 := alloc(32);
-  if expected == 0 { lic_infoFree(info); return false; }
-  lic_deriveKey(info.name as int64, info.nameLen, info.email as int64, info.emailLen, expected as pchar);
+  // WP-29: Dual-Mode Verifikation
+  // Ed25519 (WP-29): keyLen >= 64  → base64-dekodieren → Ed25519-Verify
+  // HMAC-SHA256 (Legacy): keyLen <= 35 → HMAC ableiten → Zeitkonstanter Vergleich
+  var ok: bool := false;
+  var keyBuf: int64 := 0;
+  var keyBufLen: int64 := 0;
 
-  // WP-LIC-10: copy the provided key into a persistent buffer before freeing info
-  // cfg.licenseKey will be set to this buffer on success so codegen can embed it
-  var keyBuf: int64 := alloc(32);
-  if keyBuf != 0 {
-    var kb: int64 := 0;
-    memcpy(keyBuf, info.key as int64, info.keyLen && kb < 29);
+  if info.keyLen >= 64 {
+    // WP-29: Ed25519-Pfad
+    var sig64: int64 := alloc(64);
+    if sig64 != 0 {
+      var sigLen: int64 := lic_base64Decode(info.key as int64, info.keyLen, sig64);
+      if sigLen == 64 {
+        ok := lic_verifyKey(info.name as int64, info.nameLen, info.email as int64, info.emailLen, sig64);
+      }
+      if ok {
+        // WP-LIC-10: Schlüssel-String für Watermark bewahren
+        keyBuf := alloc(96);
+        if keyBuf != 0 {
+          keyBufLen := info.keyLen;
+          if keyBufLen > 90 { keyBufLen := 90; }
+          memcpy(keyBuf, info.key as int64, keyBufLen);
+        }
+      }
+      free(sig64, 64);
+    }
+  } else {
+    // Legacy HMAC-SHA256-Pfad
+    var expected: int64 := alloc(32);
+    if expected != 0 {
+      lic_deriveKey(info.name as int64, info.nameLen, info.email as int64, info.emailLen, expected as pchar);
+      // WP-LIC-10: Schlüssel-String für Watermark bewahren
+      keyBuf := alloc(32);
+      if keyBuf != 0 {
+        keyBufLen := info.keyLen;
+        if keyBufLen > 29 { keyBufLen := 29; }
+        memcpy(keyBuf, info.key as int64, keyBufLen);
+      }
+      // WP-15.1: Zeitkonstanter Vergleich (29 Positionen, kein early-exit)
+      var diff: int64 := 0;
+      var ci: int64 := 0;
+      while ci < 29 {
+        var got: int64 := 0;
+        var exp: int64 := peek8(expected + ci);
+        if ci < info.keyLen { got := peek8(info.key as int64 + ci); }
+        diff := diff | (got ^ exp);
+        ci := ci + 1;
+      }
+      lic_zeroSecret(expected);
+      free(expected, 32);
+      ok := diff == 0;
+      if not ok && keyBuf != 0 { free(keyBuf, 32); keyBuf := 0; keyBufLen := 0; }
+    }
   }
 
-  // WP-15.1: Constant-time compare — immer alle 29 Positionen, kein early-exit.
-  // XOR + OR-Akkumulation: diff != 0 ↔ mindestens eine Byte-Differenz.
-  // Timing hängt nur von der festen Schlüssellänge (29) ab.
-  // (Für direkte Digest-Vergleiche: lic_hmacEqual aus lic_hmac.lyx verwenden.)
-  var diff: int64 := 0;
-  var ci: int64 := 0;
-  while ci < 29 {
-    var got: int64 := 0;
-    var exp: int64 := peek8(expected + ci);
-    if ci < info.keyLen { got := peek8(info.key as int64 + ci); }
-    diff := diff | (got ^ exp);
-    ci := ci + 1;
-  }
-  free(expected, 32);
   lic_infoFree(info);
 
-  if diff != 0 {
+  if not ok {
     EPrintStr("lyxc: ungueltiger Lizenzschluessel.\n"c);
-    if keyBuf != 0 { free(keyBuf, 32); }
     return false;
   }
 
   // Store verified key for WP-LIC-10 watermark embedding
   cfg.licenseKey    := keyBuf;
-  cfg.licenseKeyLen := 29;
+  cfg.licenseKeyLen := keyBufLen;
   return true;
 }
 
@@ -4079,7 +4407,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 0.9.1A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.0.0A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
@@ -4092,6 +4420,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
     if uiFd >= 0 {
       uiBuf := alloc(131072);
       uiSz := read(uiFd, uiBuf as pchar, 131071);
+      if uiSz < 0 { uiSz := 0; }   // WP-27: EINTR-Guard — verhindert poke8(buf-1)
       poke8(uiBuf + uiSz, 0);
       close(uiFd);
       uiOk := true;

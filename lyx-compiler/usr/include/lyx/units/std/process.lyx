@@ -6,6 +6,9 @@
 @copyright("2024-2025 Andreas Röne")
 unit std.process;
 
+import std.pipe;
+import std.alloc;
+
 pub type Process = int64;
 pub type ExitCode = int64;
 
@@ -105,4 +108,75 @@ pub fn shell(cmd: pchar): ExitCode {
   var shifted: int64 := status >> 8;
   var code: int64 := shifted & 255;
   return code;
+}
+
+// ============================================================
+// WP-2: Subprocess mit Pipe-verbundenen stdin/stdout
+// ============================================================
+
+// SpawnWithPipes: forkt einen Kindprozess und verbindet seine
+// stdin und stdout mit je einer Pipe.
+//
+// prog:        Pfad zum ausführbaren Programm
+// stdinFdOut:  alloc(8)-Buffer — nach Aufruf enthält peek64() den fd,
+//              auf den der Elternprozess schreibt (→ Kind liest)
+// stdoutFdOut: alloc(8)-Buffer — nach Aufruf enthält peek64() den fd,
+//              von dem der Elternprozess liest (← Kind schreibt)
+//
+// Gibt die Kind-PID zurück (> 0), oder < 0 bei Fehler.
+pub fn SpawnWithPipes(prog: pchar, stdinFdOut: int64, stdoutFdOut: int64): int64 {
+  // Pipe für stdin: Eltern schreibt auf stdinWrite, Kind liest von stdinRead
+  var stdinRead:  int64 := alloc(8);
+  var stdinWrite: int64 := alloc(8);
+  if (PipeCreate(stdinRead, stdinWrite) < 0) {
+    free(stdinRead, 8); free(stdinWrite, 8);
+    return -1;
+  }
+
+  // Pipe für stdout: Kind schreibt auf stdoutWrite, Eltern liest von stdoutRead
+  var stdoutRead:  int64 := alloc(8);
+  var stdoutWrite: int64 := alloc(8);
+  if (PipeCreate(stdoutRead, stdoutWrite) < 0) {
+    close(peek64(stdinRead)); close(peek64(stdinWrite));
+    free(stdinRead, 8); free(stdinWrite, 8);
+    free(stdoutRead, 8); free(stdoutWrite, 8);
+    return -1;
+  }
+
+  var pid: int64 := fork();
+
+  if (pid < 0) {
+    // fork fehlgeschlagen — alle fds schließen
+    close(peek64(stdinRead));  close(peek64(stdinWrite));
+    close(peek64(stdoutRead)); close(peek64(stdoutWrite));
+    free(stdinRead, 8); free(stdinWrite, 8);
+    free(stdoutRead, 8); free(stdoutWrite, 8);
+    return -1;
+  }
+
+  if (pid == 0) {
+    // Kindprozess: stdin ← stdinRead, stdout → stdoutWrite
+    sys_dup2(peek64(stdinRead),  0);  // stdin  = 0
+    sys_dup2(peek64(stdoutWrite), 1); // stdout = 1
+    // Pipe-Enden des Kindes schließen (dup2 hat Kopien angelegt)
+    close(peek64(stdinRead));  close(peek64(stdinWrite));
+    close(peek64(stdoutRead)); close(peek64(stdoutWrite));
+    execve(prog, prog, 0);
+    // execve scheitert: Kind beendet sich
+    sys_exit_group(1);
+    return 0;
+  }
+
+  // Elternprozess: unbenutzte Pipe-Enden schließen
+  close(peek64(stdinRead));
+  close(peek64(stdoutWrite));
+
+  // Ergebnis-fds an Caller liefern
+  poke64(stdinFdOut,  peek64(stdinWrite));
+  poke64(stdoutFdOut, peek64(stdoutRead));
+
+  free(stdinRead, 8); free(stdinWrite, 8);
+  free(stdoutRead, 8); free(stdoutWrite, 8);
+
+  return pid;
 }

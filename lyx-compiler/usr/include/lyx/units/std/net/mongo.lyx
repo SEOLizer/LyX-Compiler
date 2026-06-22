@@ -22,6 +22,20 @@ unit std.net.mongo;
 
 import std.net.socket;
 import std.net.dns;
+import std.net.tls;
+
+// OpenSSL crypto for SCRAM-SHA-256 (WP-4.2)
+extern fn EVP_sha256(): int64 link "libcrypto.so.3";
+extern fn HMAC(evp: int64, key: int64, keylen: int64, data: int64, datalen: int64, md: int64, mdlen: int64): int64 link "libcrypto.so.3";
+extern fn PKCS5_PBKDF2_HMAC(pass: int64, passlen: int64, salt: int64, saltlen: int64, iter: int64, digest: int64, keylen: int64, out: int64): int64 link "libcrypto.so.3";
+extern fn SHA256(data: int64, n: int64, md: int64): int64 link "libcrypto.so.3";
+
+// OpenSSL base64 (WP-4.2)
+extern fn EVP_EncodeBlock(out: int64, in_: int64, inl: int64): int64 link "libcrypto.so.3";
+extern fn EVP_DecodeBlock(out: int64, in_: int64, inl: int64): int64 link "libcrypto.so.3";
+
+// /dev/urandom for SCRAM nonce (WP-4.2)
+extern fn mongo_urandom_open(path: int64, flags: int64, mode: int64): int64;
 
 // MongoDB port
 pub con MONGO_PORT: int64 := 27017;
@@ -40,6 +54,9 @@ pub type MongoConn = struct {
   connected: int64;    // 1 if connected
   host: int64;         // host string pointer
   port: int64;         // port number
+  tls_enabled: int64;  // 1 if TLS active (WP-4.1)
+  tls_ssl: int64;      // raw SSL* pointer
+  tls_ctx: int64;      // raw SSL_CTX* pointer
 };
 
 // WP1: Connect to MongoDB
@@ -66,12 +83,27 @@ pub fn MongoConnect(host: int64, port: int64): MongoConn {
   
   conn.fd := tcp.fd;
   conn.connected := 1;
-  
+  conn.tls_enabled := 0;
+  conn.tls_ssl := 0;
+  conn.tls_ctx := 0;
+
   return conn;
 }
 
 // WP1: Disconnect from MongoDB
-pub fn MongoDisconnect(conn: MongoConn): void {
+pub fn MongoDisconnect(conn: MongoConn) {
+  if (conn.tls_enabled != 0) {
+    if (conn.tls_ssl != 0) {
+      SSL_shutdown(conn.tls_ssl);
+      SSL_free(conn.tls_ssl);
+    }
+    if (conn.tls_ctx != 0) {
+      SSL_CTX_free(conn.tls_ctx);
+    }
+    conn.tls_ssl := 0;
+    conn.tls_ctx := 0;
+    conn.tls_enabled := 0;
+  }
   if (conn.fd >= 0) {
     sys_close(conn.fd);
   }
@@ -110,22 +142,97 @@ pub type MongoDoc = struct {
   len: int64;     // used length
 };
 
-// WP2: Create new document
+// WP2: Create new document — len starts at 4 to reserve BSON length header
 pub fn MongoDocNew(): MongoDoc {
   var doc: MongoDoc;
   doc.data := mmap(0, 4096, PROT_RW, MAP_ANON, FD_NONE, 0);
   doc.size := 4096;
-  doc.len := 0;
+  doc.len := 4;  // reserve 4 bytes for BSON document length (written by Finalize)
   return doc;
 }
 
-// WP2: Add string field to document
+// WP2 / WP-4.3: Add UTF-8 string field — BSON type 0x02
+// BSON element: type(1) + key(cstring) + strLen(int32 LE) + value(bytes) + null(1)
 pub fn MongoDocAddString(doc: MongoDoc, key: int64, value: int64): int64 {
-  if (doc.data == 0) {
-    return -1;
-  }
-  // Simplified: just return success for now
+  if (doc.data == 0) { return -1; }
+  var keyLen: int64 := 0;
+  while (peek8(key + keyLen) != 0) { keyLen := keyLen + 1; }
+  var valLen: int64 := 0;
+  while (peek8(value + valLen) != 0) { valLen := valLen + 1; }
+  var need: int64 := 1 + keyLen + 1 + 4 + valLen + 1;
+  if (doc.len + need >= doc.size) { return -1; }
+  var pos: int64 := doc.len;
+  poke8(doc.data + pos, 2); pos := pos + 1;  // BSON_STRING
+  var i: int64 := 0;
+  while (i < keyLen) { poke8(doc.data + pos, peek8(key + i)); pos := pos + 1; i := i + 1; }
+  poke8(doc.data + pos, 0); pos := pos + 1;
+  var slen: int64 := valLen + 1;
+  poke8(doc.data + pos, slen & 0xFF);         pos := pos + 1;
+  poke8(doc.data + pos, (slen >> 8) & 0xFF);  pos := pos + 1;
+  poke8(doc.data + pos, (slen >> 16) & 0xFF); pos := pos + 1;
+  poke8(doc.data + pos, (slen >> 24) & 0xFF); pos := pos + 1;
+  i := 0;
+  while (i < valLen) { poke8(doc.data + pos, peek8(value + i)); pos := pos + 1; i := i + 1; }
+  poke8(doc.data + pos, 0); pos := pos + 1;
+  doc.len := pos;
   return 0;
+}
+
+// WP-4.3: Add int32 field — BSON type 0x10
+pub fn MongoDocAddInt32(doc: MongoDoc, key: int64, value: int64): int64 {
+  if (doc.data == 0) { return -1; }
+  var keyLen: int64 := 0;
+  while (peek8(key + keyLen) != 0) { keyLen := keyLen + 1; }
+  var need: int64 := 1 + keyLen + 1 + 4;
+  if (doc.len + need >= doc.size) { return -1; }
+  var pos: int64 := doc.len;
+  poke8(doc.data + pos, 16); pos := pos + 1;  // BSON_INT32
+  var i: int64 := 0;
+  while (i < keyLen) { poke8(doc.data + pos, peek8(key + i)); pos := pos + 1; i := i + 1; }
+  poke8(doc.data + pos, 0); pos := pos + 1;
+  poke8(doc.data + pos, value & 0xFF);         pos := pos + 1;
+  poke8(doc.data + pos, (value >> 8) & 0xFF);  pos := pos + 1;
+  poke8(doc.data + pos, (value >> 16) & 0xFF); pos := pos + 1;
+  poke8(doc.data + pos, (value >> 24) & 0xFF); pos := pos + 1;
+  doc.len := pos;
+  return 0;
+}
+
+// WP-4.3: Add binary field — BSON type 0x05, subtype 0x00
+pub fn MongoDocAddBinary(doc: MongoDoc, key: int64, data: int64, datalen: int64): int64 {
+  if (doc.data == 0) { return -1; }
+  var keyLen: int64 := 0;
+  while (peek8(key + keyLen) != 0) { keyLen := keyLen + 1; }
+  var need: int64 := 1 + keyLen + 1 + 4 + 1 + datalen;
+  if (doc.len + need >= doc.size) { return -1; }
+  var pos: int64 := doc.len;
+  poke8(doc.data + pos, 5); pos := pos + 1;  // BSON_BINARY
+  var i: int64 := 0;
+  while (i < keyLen) { poke8(doc.data + pos, peek8(key + i)); pos := pos + 1; i := i + 1; }
+  poke8(doc.data + pos, 0); pos := pos + 1;
+  poke8(doc.data + pos, datalen & 0xFF);         pos := pos + 1;
+  poke8(doc.data + pos, (datalen >> 8) & 0xFF);  pos := pos + 1;
+  poke8(doc.data + pos, (datalen >> 16) & 0xFF); pos := pos + 1;
+  poke8(doc.data + pos, (datalen >> 24) & 0xFF); pos := pos + 1;
+  poke8(doc.data + pos, 0); pos := pos + 1;  // subtype = generic binary
+  i := 0;
+  while (i < datalen) { poke8(doc.data + pos, peek8(data + i)); pos := pos + 1; i := i + 1; }
+  doc.len := pos;
+  return 0;
+}
+
+// WP-4.3: Finalize document — writes BSON length header + trailing null
+// Returns total document length in bytes.
+pub fn MongoDocFinalize(doc: MongoDoc): int64 {
+  if (doc.data == 0) { return 0; }
+  poke8(doc.data + doc.len, 0);
+  var total: int64 := doc.len + 1;
+  doc.len := total;
+  poke8(doc.data + 0, total & 0xFF);
+  poke8(doc.data + 1, (total >> 8) & 0xFF);
+  poke8(doc.data + 2, (total >> 16) & 0xFF);
+  poke8(doc.data + 3, (total >> 24) & 0xFF);
+  return total;
 }
 
 // WP3: Wire protocol opcodes
@@ -138,18 +245,20 @@ pub con MONGO_OP_GET_MORE: int64 := 2005;
 pub con MONGO_OP_DELETE: int64 := 2006;
 pub con MONGO_OP_KILL_CURSORS: int64 := 2007;
 
-// WP4: Send request to MongoDB
+// WP4: Send request to MongoDB (TLS-aware, WP-4.1)
 pub fn MongoSend(conn: MongoConn, data: int64, len: int64): int64 {
-  if (conn.fd < 0 || conn.connected == 0) {
-    return -1;
+  if (conn.fd < 0 || conn.connected == 0) { return -1; }
+  if (conn.tls_enabled != 0) {
+    return SSL_write(conn.tls_ssl, data, len);
   }
   return sys_write(conn.fd, data, len);
 }
 
-// WP4: Read response from MongoDB
+// WP4: Read response from MongoDB (TLS-aware, WP-4.1)
 pub fn MongoRead(conn: MongoConn, data: int64, len: int64): int64 {
-  if (conn.fd < 0 || conn.connected == 0) {
-    return -1;
+  if (conn.fd < 0 || conn.connected == 0) { return -1; }
+  if (conn.tls_enabled != 0) {
+    return SSL_read(conn.tls_ssl, data, len);
   }
   return sys_read(conn.fd, data, len);
 }
@@ -194,6 +303,534 @@ pub fn MongoCollectionName(db: int64, coll: int64): int64 {
   return buf;
 }
 
-// WP6: Authentication constants (SCRAM-SHA-1)
-pub con MONGO_AUTH_PLAIN: int64 := 0;
-pub con MONGO_AUTH_SCRAM_SHA1: int64 := 1;
+// WP6: Authentication constants
+pub con MONGO_AUTH_PLAIN: int64 := 0;          // plaintext — only allowed over TLS (WP-4.4)
+pub con MONGO_AUTH_SCRAM_SHA1: int64 := 1;     // legacy, not recommended
+pub con MONGO_AUTH_SCRAM_SHA256: int64 := 2;   // recommended (WP-4.2)
+
+// WP-4.5: MongoPool — connection pooling not yet implemented (stub placeholder)
+// Use MongoPoolCreate/Destroy/Acquire/Release once implemented.
+
+// ============================================================================
+// WP-4.1: TLS Connect
+// ============================================================================
+
+pub fn MongoConnectTLS(host: int64, port: int64, hostname: int64): MongoConn {
+  var conn: MongoConn;
+  conn.fd := -1; conn.connected := 0; conn.host := host; conn.port := port;
+  conn.tls_enabled := 0; conn.tls_ssl := 0; conn.tls_ctx := 0;
+
+  var ip: int64 := GetHostByName(host);
+  if (ip == 0) { return conn; }
+
+  var tcp: TCPConn := TCPConnect(ip, port);
+  if (tcp.fd < 0) { return conn; }
+  TCPConnSetNodelay(tcp, true);
+
+  var ctx: TLSContext := TLSInit();
+  if (ctx.initialized == 0) { sys_close(tcp.fd); return conn; }
+
+  var tlsConn: TLSConn := TLSConnect(ctx, tcp.fd, hostname);
+  if (tlsConn.connected == 0) {
+    TLSFree(ctx);
+    sys_close(tcp.fd);
+    return conn;
+  }
+
+  conn.fd := tcp.fd;
+  conn.connected := 1;
+  conn.tls_enabled := 1;
+  conn.tls_ssl := tlsConn.ssl;
+  conn.tls_ctx := ctx.ctx;
+  return conn;
+}
+
+// ============================================================================
+// WP-4 Internal helpers
+// ============================================================================
+
+fn mongo_strlen(s: int64): int64 {
+  var n: int64 := 0;
+  while (peek8(s + n) != 0) { n := n + 1; }
+  return n;
+}
+
+fn mongo_randombytes(buf: int64, len: int64): bool {
+  var fd: int64 := open("/dev/urandom", 0, 0);
+  if (fd < 0) { return false; }
+  var n: int64 := sys_read(fd, buf, len);
+  sys_close(fd);
+  return n == len;
+}
+
+// Low-level BSON builder (positional, avoids struct-value issues)
+fn mbson_str(buf: int64, pos: int64, key: int64, val: int64): int64 {
+  var kl: int64 := mongo_strlen(key);
+  var vl: int64 := mongo_strlen(val);
+  poke8(buf + pos, 2); pos := pos + 1;
+  var i: int64 := 0;
+  while (i < kl) { poke8(buf + pos, peek8(key + i)); pos := pos + 1; i := i + 1; }
+  poke8(buf + pos, 0); pos := pos + 1;
+  var sl: int64 := vl + 1;
+  poke8(buf + pos, sl & 0xFF);         pos := pos + 1;
+  poke8(buf + pos, (sl >> 8) & 0xFF);  pos := pos + 1;
+  poke8(buf + pos, (sl >> 16) & 0xFF); pos := pos + 1;
+  poke8(buf + pos, (sl >> 24) & 0xFF); pos := pos + 1;
+  i := 0;
+  while (i < vl) { poke8(buf + pos, peek8(val + i)); pos := pos + 1; i := i + 1; }
+  poke8(buf + pos, 0); pos := pos + 1;
+  return pos;
+}
+
+fn mbson_i32(buf: int64, pos: int64, key: int64, val: int64): int64 {
+  var kl: int64 := mongo_strlen(key);
+  poke8(buf + pos, 16); pos := pos + 1;
+  var i: int64 := 0;
+  while (i < kl) { poke8(buf + pos, peek8(key + i)); pos := pos + 1; i := i + 1; }
+  poke8(buf + pos, 0); pos := pos + 1;
+  poke8(buf + pos, val & 0xFF);         pos := pos + 1;
+  poke8(buf + pos, (val >> 8) & 0xFF);  pos := pos + 1;
+  poke8(buf + pos, (val >> 16) & 0xFF); pos := pos + 1;
+  poke8(buf + pos, (val >> 24) & 0xFF); pos := pos + 1;
+  return pos;
+}
+
+fn mbson_bin(buf: int64, pos: int64, key: int64, data: int64, dlen: int64): int64 {
+  var kl: int64 := mongo_strlen(key);
+  poke8(buf + pos, 5); pos := pos + 1;
+  var i: int64 := 0;
+  while (i < kl) { poke8(buf + pos, peek8(key + i)); pos := pos + 1; i := i + 1; }
+  poke8(buf + pos, 0); pos := pos + 1;
+  poke8(buf + pos, dlen & 0xFF);         pos := pos + 1;
+  poke8(buf + pos, (dlen >> 8) & 0xFF);  pos := pos + 1;
+  poke8(buf + pos, (dlen >> 16) & 0xFF); pos := pos + 1;
+  poke8(buf + pos, (dlen >> 24) & 0xFF); pos := pos + 1;
+  poke8(buf + pos, 0); pos := pos + 1;
+  i := 0;
+  while (i < dlen) { poke8(buf + pos, peek8(data + i)); pos := pos + 1; i := i + 1; }
+  return pos;
+}
+
+fn mbson_finish(buf: int64, pos: int64): int64 {
+  poke8(buf + pos, 0); pos := pos + 1;
+  poke8(buf + 0, pos & 0xFF);
+  poke8(buf + 1, (pos >> 8) & 0xFF);
+  poke8(buf + 2, (pos >> 16) & 0xFF);
+  poke8(buf + 3, (pos >> 24) & 0xFF);
+  return pos;
+}
+
+// Build and send OP_MSG (opcode 2013) with a single body section
+fn mongo_send_opmsg(conn: MongoConn, bson: int64, bsonLen: int64): int64 {
+  var total: int64 := 16 + 4 + 1 + bsonLen;
+  var buf: int64 := alloc(total);
+  // header
+  poke8(buf + 0, total & 0xFF);         poke8(buf + 1, (total >> 8) & 0xFF);
+  poke8(buf + 2, (total >> 16) & 0xFF); poke8(buf + 3, (total >> 24) & 0xFF);
+  poke8(buf + 4, 1); poke8(buf + 5, 0); poke8(buf + 6, 0); poke8(buf + 7, 0); // requestID=1
+  poke8(buf + 8, 0); poke8(buf + 9, 0); poke8(buf + 10, 0); poke8(buf + 11, 0); // responseTo=0
+  poke8(buf + 12, 221); poke8(buf + 13, 7); poke8(buf + 14, 0); poke8(buf + 15, 0); // opCode=2013
+  poke8(buf + 16, 0); poke8(buf + 17, 0); poke8(buf + 18, 0); poke8(buf + 19, 0); // flagBits=0
+  poke8(buf + 20, 0); // sectionType=0 (body)
+  var i: int64 := 0;
+  while (i < bsonLen) { poke8(buf + 21 + i, peek8(bson + i)); i := i + 1; }
+  var ret: int64 := MongoSend(conn, buf, total);
+  free(buf, total);
+  return ret;
+}
+
+// Read OP_MSG response; returns pointer to alloc'd BSON body (caller must free + size)
+// outSize is set to the BSON body size. Returns 0 on error.
+fn mongo_recv_opmsg(conn: MongoConn, outSize: int64): int64 {
+  var hdr: int64 := alloc(16);
+  var n: int64 := MongoRead(conn, hdr, 16);
+  if (n < 16) { free(hdr, 16); return 0; }
+  var msgLen: int64 := peek8(hdr) | (peek8(hdr+1) << 8) | (peek8(hdr+2) << 16) | (peek8(hdr+3) << 24);
+  free(hdr, 16);
+  if (msgLen < 21) { return 0; }
+  var bodySize: int64 := msgLen - 21;  // minus header(16) + flags(4) + sectionType(1)
+  var rest: int64 := alloc(msgLen - 16);
+  n := MongoRead(conn, rest, msgLen - 16);
+  if (n < msgLen - 16) { free(rest, msgLen - 16); return 0; }
+  // rest[0..3] = flagBits, rest[4] = sectionType, rest[5..] = BSON
+  var bson: int64 := alloc(bodySize);
+  var i: int64 := 0;
+  while (i < bodySize) { poke8(bson + i, peek8(rest + 5 + i)); i := i + 1; }
+  free(rest, msgLen - 16);
+  poke64(outSize, bodySize);
+  return bson;
+}
+
+// Find a field in a BSON document by key; returns pointer to value bytes or 0
+fn mbson_find(doc: int64, docLen: int64, key: int64): int64 {
+  var keyLen: int64 := mongo_strlen(key);
+  var pos: int64 := 4;  // skip document length
+  while (pos < docLen - 1) {
+    var typ: int64 := peek8(doc + pos); pos := pos + 1;
+    if (typ == 0) { break; }
+    // compare key
+    var match: bool := true;
+    var ki: int64 := 0;
+    while (ki <= keyLen) {
+      if (peek8(doc + pos + ki) != peek8(key + ki)) { match := false; break; }
+      ki := ki + 1;
+    }
+    var fieldKeyLen: int64 := 0;
+    while (peek8(doc + pos + fieldKeyLen) != 0) { fieldKeyLen := fieldKeyLen + 1; }
+    pos := pos + fieldKeyLen + 1;
+    if (match) { return doc + pos; }
+    // skip value
+    if (typ == 2) {  // string
+      var sl: int64 := peek8(doc+pos) | (peek8(doc+pos+1) << 8) | (peek8(doc+pos+2) << 16) | (peek8(doc+pos+3) << 24);
+      pos := pos + 4 + sl;
+    } else if (typ == 16) { pos := pos + 4; }
+    else if (typ == 8)  { pos := pos + 1; }
+    else if (typ == 1 || typ == 18) { pos := pos + 8; }
+    else if (typ == 5) {
+      var bl: int64 := peek8(doc+pos) | (peek8(doc+pos+1)<<8) | (peek8(doc+pos+2)<<16) | (peek8(doc+pos+3)<<24);
+      pos := pos + 5 + bl;
+    } else { break; }
+  }
+  return 0;
+}
+
+fn mbson_get_int32(doc: int64, docLen: int64, key: int64): int64 {
+  var vp: int64 := mbson_find(doc, docLen, key);
+  if (vp == 0) { return 0; }
+  return peek8(vp) | (peek8(vp+1) << 8) | (peek8(vp+2) << 16) | (peek8(vp+3) << 24);
+}
+
+fn mbson_get_binary(doc: int64, docLen: int64, key: int64, outData: int64, outLen: int64): bool {
+  var vp: int64 := mbson_find(doc, docLen, key);
+  if (vp == 0) { return false; }
+  var bl: int64 := peek8(vp) | (peek8(vp+1)<<8) | (peek8(vp+2)<<16) | (peek8(vp+3)<<24);
+  poke64(outLen, bl);
+  var i: int64 := 0;
+  while (i < bl) { poke8(peek64(outData) + i, peek8(vp + 5 + i)); i := i + 1; }
+  return true;
+}
+
+// ============================================================================
+// WP-4.2: SCRAM-SHA-256 Authentication (RFC 5802 / RFC 7677)
+// ============================================================================
+
+fn scram_hmac(key: int64, keyLen: int64, msg: int64, msgLen: int64, out: int64) {
+  var mdLen: int64 := alloc(8); poke64(mdLen, 32);
+  HMAC(EVP_sha256(), key, keyLen, msg, msgLen, out, mdLen);
+  free(mdLen, 8);
+}
+
+fn scram_sha256(data: int64, dataLen: int64, out: int64) {
+  SHA256(data, dataLen, out);
+}
+
+fn scram_pbkdf2(pass: int64, passLen: int64, salt: int64, saltLen: int64, iters: int64, out: int64) {
+  PKCS5_PBKDF2_HMAC(pass, passLen, salt, saltLen, iters, EVP_sha256(), 32, out);
+}
+
+fn scram_xor32(a: int64, b: int64, out: int64) {
+  var i: int64 := 0;
+  while (i < 32) { poke8(out + i, peek8(a + i) ^ peek8(b + i)); i := i + 1; }
+}
+
+// Append null-terminated string to buffer at pos, return new pos
+fn scram_append(buf: int64, pos: int64, s: int64): int64 {
+  var i: int64 := 0;
+  while (peek8(s + i) != 0) { poke8(buf + pos, peek8(s + i)); pos := pos + 1; i := i + 1; }
+  return pos;
+}
+
+// Append raw bytes to buffer at pos, return new pos
+fn scram_appendb(buf: int64, pos: int64, s: int64, len: int64): int64 {
+  var i: int64 := 0;
+  while (i < len) { poke8(buf + pos, peek8(s + i)); pos := pos + 1; i := i + 1; }
+  return pos;
+}
+
+// Parse server-first message fields (destructive: writes nulls into srvcopy)
+// Extracts r=, s=, i= values. Returns iterations or 0 on error.
+fn scram_parse_server_first(sf: int64, sfLen: int64, rnonce: int64, saltB64: int64, iters: int64): int64 {
+  var i: int64 := 0;
+  while (i < sfLen) {
+    if (peek8(sf + i) == 114 && peek8(sf + i + 1) == 61) {  // "r="
+      var j: int64 := i + 2;
+      var rp: int64 := 0;
+      while (j < sfLen && peek8(sf + j) != 44) {
+        poke8(rnonce + rp, peek8(sf + j)); rp := rp + 1; j := j + 1;
+      }
+      poke8(rnonce + rp, 0);
+    }
+    if (peek8(sf + i) == 115 && peek8(sf + i + 1) == 61) {  // "s="
+      var j: int64 := i + 2;
+      var sp: int64 := 0;
+      while (j < sfLen && peek8(sf + j) != 44) {
+        poke8(saltB64 + sp, peek8(sf + j)); sp := sp + 1; j := j + 1;
+      }
+      poke8(saltB64 + sp, 0);
+    }
+    if (peek8(sf + i) == 105 && peek8(sf + i + 1) == 61) {  // "i="
+      var j: int64 := i + 2;
+      var its: int64 := 0;
+      while (j < sfLen && peek8(sf + j) != 44 && peek8(sf + j) != 0) {
+        its := its * 10 + (peek8(sf + j) - 48);
+        j := j + 1;
+      }
+      poke64(iters, its);
+    }
+    i := i + 1;
+  }
+  return peek64(iters);
+}
+
+// WP-4.2 / WP-4.4: Authenticate against MongoDB using SCRAM-SHA-256.
+// authMechanism: MONGO_AUTH_SCRAM_SHA256 (or MONGO_AUTH_PLAIN — requires TLS).
+// authdb: authentication database (e.g. "admin").
+// Returns 0 on success, -1 on failure.
+pub fn MongoAuth(conn: MongoConn, username: int64, password: int64, authdb: int64, authMechanism: int64): int64 {
+  if (!MongoIsConnected(conn)) { return -1; }
+
+  // WP-4.4: Block PLAIN auth without TLS
+  if (authMechanism == MONGO_AUTH_PLAIN && conn.tls_enabled == 0) {
+    return -1;
+  }
+
+  if (authMechanism != MONGO_AUTH_SCRAM_SHA256) { return -1; }
+
+  // --- Step 1: Build client-first-message ---
+  var rawNonce: int64 := alloc(18);
+  if (!mongo_randombytes(rawNonce, 18)) { free(rawNonce, 18); return -1; }
+
+  var nonceBuf: int64 := alloc(32);   // base64 of 18 bytes = 24 chars + NUL
+  EVP_EncodeBlock(nonceBuf, rawNonce, 18);
+  free(rawNonce, 18);
+  // EVP_EncodeBlock may add \n — strip it
+  var nlen: int64 := 0;
+  while (nlen < 31 && peek8(nonceBuf + nlen) != 0 && peek8(nonceBuf + nlen) != 10) { nlen := nlen + 1; }
+  poke8(nonceBuf + nlen, 0);
+
+  var cfBare: int64 := alloc(512);  // "n=<user>,r=<nonce>"
+  var cfPos: int64 := 0;
+  poke8(cfBare + cfPos, 110); poke8(cfBare + cfPos + 1, 61); cfPos := cfPos + 2;  // "n="
+  cfPos := scram_append(cfBare, cfPos, username);
+  poke8(cfBare + cfPos, 44); cfPos := cfPos + 1;  // ","
+  poke8(cfBare + cfPos, 114); poke8(cfBare + cfPos + 1, 61); cfPos := cfPos + 2;  // "r="
+  cfPos := scram_append(cfBare, cfPos, nonceBuf);
+  poke8(cfBare + cfPos, 0);
+
+  var cf: int64 := alloc(512);  // "n,," + cfBare
+  var cfp: int64 := 0;
+  poke8(cf + cfp, 110); poke8(cf + cfp + 1, 44); poke8(cf + cfp + 2, 44); cfp := cfp + 3;  // "n,,"
+  cfp := scram_appendb(cf, cfp, cfBare, cfPos);
+  poke8(cf + cfp, 0);
+
+  // --- Step 2: saslStart ---
+  var sbson: int64 := alloc(1024);
+  var sp: int64 := 4;
+  sp := mbson_i32(sbson, sp, "saslStart", 1);
+  sp := mbson_str(sbson, sp, "mechanism", "SCRAM-SHA-256");
+  sp := mbson_bin(sbson, sp, "payload", cf, cfp);
+  sp := mbson_str(sbson, sp, "$db", authdb);
+  sp := mbson_finish(sbson, sp);
+
+  var sr1: int64 := mongo_send_opmsg(conn, sbson, sp);
+  free(sbson, 1024);
+  if (sr1 < 0) { free(cf, 512); free(cfBare, 512); free(nonceBuf, 32); return -1; }
+
+  var rspSize: int64 := alloc(8);
+  var rsp1: int64 := mongo_recv_opmsg(conn, rspSize);
+  if (rsp1 == 0) { free(cf, 512); free(cfBare, 512); free(nonceBuf, 32); free(rspSize, 8); return -1; }
+  var rsp1Len: int64 := peek64(rspSize);
+
+  // Extract conversationId and payload from response
+  var convId: int64 := mbson_get_int32(rsp1, rsp1Len, "conversationId");
+  var payBuf: int64 := alloc(512);
+  var payPtr: int64 := alloc(8); poke64(payPtr, payBuf);
+  var payLenPtr: int64 := alloc(8);
+  var gotPay: bool := mbson_get_binary(rsp1, rsp1Len, "payload", payPtr, payLenPtr);
+  var payLen: int64 := peek64(payLenPtr);
+  free(rsp1, rsp1Len); free(rspSize, 8); free(payPtr, 8); free(payLenPtr, 8);
+  if (!gotPay) { free(payBuf, 512); free(cf, 512); free(cfBare, 512); free(nonceBuf, 32); return -1; }
+  poke8(payBuf + payLen, 0);
+
+  // --- Step 3: Parse server-first, compute client proof ---
+  var rnonce: int64 := alloc(128);
+  var saltB64: int64 := alloc(128);
+  var itersPtr: int64 := alloc(8); poke64(itersPtr, 0);
+  scram_parse_server_first(payBuf, payLen, rnonce, saltB64, itersPtr);
+  var iters: int64 := peek64(itersPtr);
+  free(itersPtr, 8);
+
+  if (iters == 0) {
+    free(rnonce, 128); free(saltB64, 128); free(payBuf, 512);
+    free(cf, 512); free(cfBare, 512); free(nonceBuf, 32);
+    return -1;
+  }
+
+  // Decode salt from base64
+  var saltRaw: int64 := alloc(64);
+  var saltB64Len: int64 := mongo_strlen(saltB64);
+  var saltLen: int64 := EVP_DecodeBlock(saltRaw, saltB64, saltB64Len);
+  if (saltLen < 0) { saltLen := 0; }
+
+  // SaltedPassword = PBKDF2-SHA256(password, salt, iterations, 32)
+  var saltedPw: int64 := alloc(32);
+  var passLen: int64 := mongo_strlen(password);
+  scram_pbkdf2(password, passLen, saltRaw, saltLen, iters, saltedPw);
+  free(saltRaw, 64);
+
+  // clientKey = HMAC(saltedPassword, "Client Key")
+  var clientKey: int64 := alloc(32);
+  var ckMsg: int64 := alloc(12);  // "Client Key\0"
+  poke8(ckMsg+0,67); poke8(ckMsg+1,108); poke8(ckMsg+2,105); poke8(ckMsg+3,101);
+  poke8(ckMsg+4,110); poke8(ckMsg+5,116); poke8(ckMsg+6,32); poke8(ckMsg+7,75);
+  poke8(ckMsg+8,101); poke8(ckMsg+9,121); poke8(ckMsg+10,0);
+  scram_hmac(saltedPw, 32, ckMsg, 10, clientKey);
+  free(ckMsg, 12);
+
+  // storedKey = SHA256(clientKey)
+  var storedKey: int64 := alloc(32);
+  scram_sha256(clientKey, 32, storedKey);
+
+  // Build auth-message = clientFirstBare + "," + serverFirst + "," + clientFinalWithoutProof
+  // clientFinalWithoutProof = "c=biws,r=" + serverNonce
+  var cfwp: int64 := alloc(256);  // client-final-without-proof
+  var cwp: int64 := 0;
+  poke8(cfwp+cwp,99); poke8(cfwp+cwp+1,61); poke8(cfwp+cwp+2,98); poke8(cfwp+cwp+3,105);
+  poke8(cfwp+cwp+4,119); poke8(cfwp+cwp+5,115); poke8(cfwp+cwp+6,44);
+  poke8(cfwp+cwp+7,114); poke8(cfwp+cwp+8,61); cwp := cwp + 9;  // "c=biws,r="
+  cwp := scram_append(cfwp, cwp, rnonce);
+  poke8(cfwp + cwp, 0);
+
+  var authMsg: int64 := alloc(1024);
+  var amp: int64 := 0;
+  amp := scram_appendb(authMsg, amp, cfBare, cfPos);
+  poke8(authMsg + amp, 44); amp := amp + 1;
+  amp := scram_appendb(authMsg, amp, payBuf, payLen);
+  poke8(authMsg + amp, 44); amp := amp + 1;
+  amp := scram_appendb(authMsg, amp, cfwp, cwp);
+  poke8(authMsg + amp, 0);
+
+  // clientSignature = HMAC(storedKey, authMessage)
+  var clientSig: int64 := alloc(32);
+  scram_hmac(storedKey, 32, authMsg, amp, clientSig);
+
+  // clientProof = clientKey XOR clientSignature
+  var clientProof: int64 := alloc(32);
+  scram_xor32(clientKey, clientSig, clientProof);
+
+  // Encode proof as base64
+  var proofB64: int64 := alloc(64);
+  EVP_EncodeBlock(proofB64, clientProof, 32);
+  var pbl: int64 := 0;
+  while (pbl < 63 && peek8(proofB64 + pbl) != 0 && peek8(proofB64 + pbl) != 10) { pbl := pbl + 1; }
+  poke8(proofB64 + pbl, 0);
+
+  // Server key and signature for later verification
+  var serverKey: int64 := alloc(32);
+  var skMsg: int64 := alloc(12);
+  poke8(skMsg+0,83); poke8(skMsg+1,101); poke8(skMsg+2,114); poke8(skMsg+3,118);
+  poke8(skMsg+4,101); poke8(skMsg+5,114); poke8(skMsg+6,32); poke8(skMsg+7,75);
+  poke8(skMsg+8,101); poke8(skMsg+9,121); poke8(skMsg+10,0);
+  scram_hmac(saltedPw, 32, skMsg, 10, serverKey);
+  free(skMsg, 12);
+  var expectedServerSig: int64 := alloc(32);
+  scram_hmac(serverKey, 32, authMsg, amp, expectedServerSig);
+  free(serverKey, 32); free(saltedPw, 32); free(storedKey, 32);
+  free(clientKey, 32); free(clientSig, 32); free(clientProof, 32);
+
+  // --- Step 4: Build client-final ---
+  var cfinal: int64 := alloc(512);
+  var cfp2: int64 := 0;
+  cfp2 := scram_appendb(cfinal, cfp2, cfwp, cwp);
+  poke8(cfinal + cfp2, 44); poke8(cfinal + cfp2 + 1, 112); poke8(cfinal + cfp2 + 2, 61);
+  cfp2 := cfp2 + 3;  // ",p="
+  cfp2 := scram_append(cfinal, cfp2, proofB64);
+  poke8(cfinal + cfp2, 0);
+  free(proofB64, 64); free(cfwp, 256);
+
+  // --- Step 5: saslContinue ---
+  var sbson2: int64 := alloc(1024);
+  var sp2: int64 := 4;
+  sp2 := mbson_i32(sbson2, sp2, "saslContinue", 1);
+  sp2 := mbson_i32(sbson2, sp2, "conversationId", convId);
+  sp2 := mbson_bin(sbson2, sp2, "payload", cfinal, cfp2);
+  sp2 := mbson_str(sbson2, sp2, "$db", authdb);
+  sp2 := mbson_finish(sbson2, sp2);
+  free(cfinal, 512);
+
+  mongo_send_opmsg(conn, sbson2, sp2);
+  free(sbson2, 1024);
+
+  var rspSize2: int64 := alloc(8);
+  var rsp2: int64 := mongo_recv_opmsg(conn, rspSize2);
+  if (rsp2 == 0) {
+    free(rspSize2, 8); free(expectedServerSig, 32);
+    free(rnonce, 128); free(saltB64, 128); free(payBuf, 512);
+    free(cf, 512); free(cfBare, 512); free(nonceBuf, 32); free(authMsg, 1024);
+    return -1;
+  }
+  var rsp2Len: int64 := peek64(rspSize2);
+
+  // Verify server signature
+  var srvPayBuf: int64 := alloc(128);
+  var srvPayPtr: int64 := alloc(8); poke64(srvPayPtr, srvPayBuf);
+  var srvPayLenPtr: int64 := alloc(8);
+  mbson_get_binary(rsp2, rsp2Len, "payload", srvPayPtr, srvPayLenPtr);
+  var srvPayLen: int64 := peek64(srvPayLenPtr);
+  free(srvPayPtr, 8); free(srvPayLenPtr, 8);
+
+  // Parse "v=<base64signature>" from server final
+  var vFound: bool := false;
+  var vi: int64 := 0;
+  while (vi + 1 < srvPayLen) {
+    if (peek8(srvPayBuf + vi) == 118 && peek8(srvPayBuf + vi + 1) == 61) {
+      var vb64: int64 := alloc(64);
+      var vlen: int64 := 0;
+      var vj: int64 := vi + 2;
+      while (vj < srvPayLen) {
+        poke8(vb64 + vlen, peek8(srvPayBuf + vj)); vlen := vlen + 1; vj := vj + 1;
+      }
+      var vRaw: int64 := alloc(32);
+      EVP_DecodeBlock(vRaw, vb64, vlen);
+      var srvSigMatch: bool := true;
+      var ki: int64 := 0;
+      while (ki < 32) {
+        if (peek8(vRaw + ki) != peek8(expectedServerSig + ki)) { srvSigMatch := false; break; }
+        ki := ki + 1;
+      }
+      free(vb64, 64); free(vRaw, 32);
+      vFound := srvSigMatch;
+      break;
+    }
+    vi := vi + 1;
+  }
+  free(srvPayBuf, 128); free(rsp2, rsp2Len); free(rspSize2, 8);
+
+  free(expectedServerSig, 32); free(rnonce, 128); free(saltB64, 128);
+  free(payBuf, 512); free(cf, 512); free(cfBare, 512);
+  free(nonceBuf, 32); free(authMsg, 1024);
+
+  if (!vFound) { return -1; }
+
+  // Check if saslContinue with empty payload is needed (done: false)
+  var done: int64 := mbson_get_int32(rsp2, rsp2Len, "done");
+  if (done == 0) {
+    var sbson3: int64 := alloc(256);
+    var sp3: int64 := 4;
+    sp3 := mbson_i32(sbson3, sp3, "saslContinue", 1);
+    sp3 := mbson_i32(sbson3, sp3, "conversationId", convId);
+    var emptyBuf: int64 := alloc(4);
+    sp3 := mbson_bin(sbson3, sp3, "payload", emptyBuf, 0);
+    free(emptyBuf, 4);
+    sp3 := mbson_str(sbson3, sp3, "$db", authdb);
+    sp3 := mbson_finish(sbson3, sp3);
+    mongo_send_opmsg(conn, sbson3, sp3);
+    free(sbson3, 256);
+    var rspSize3: int64 := alloc(8);
+    var rsp3: int64 := mongo_recv_opmsg(conn, rspSize3);
+    if (rsp3 != 0) { free(rsp3, peek64(rspSize3)); }
+    free(rspSize3, 8);
+  }
+
+  return 0;
+}

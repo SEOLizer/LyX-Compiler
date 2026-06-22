@@ -71,6 +71,10 @@ pub type EmitXtensa = class {
   funcAddrs:  int64;
   funcCount:  int64;
 
+  // WP-D3: offsets of helper subroutines in codeBuf (prepended before user code)
+  xt_printstrOff:  int64;
+  xt_printintOff:  int64;
+
   // --------------------------------------------------------------------------
   // Raw code emission
   // --------------------------------------------------------------------------
@@ -529,10 +533,118 @@ pub type EmitXtensa = class {
     }
   }
 
+  // --------------------------------------------------------------------------
+  // L8UI / S8I — byte load/store (RRI8, op0=2, op1=0/4)
+  // Placed here (after BRI12 etc.) so forward-ref issues are avoided.
+  // --------------------------------------------------------------------------
+
+  fn xt_L8UI(ar: int64, as_: int64, off: int64) {
+    var im: int64 := off & 0xFF;
+    self.xt_e3((ar << 4) | 2, ((im & 0xF) << 4) | as_, im >> 4);
+  }
+
+  fn xt_S8I(at: int64, as_: int64, off: int64) {
+    var im: int64 := off & 0xFF;
+    self.xt_e3((at << 4) | 2, ((im & 0xF) << 4) | as_, 0x40 | (im >> 4));
+  }
+
+  // --------------------------------------------------------------------------
+  // WP-D3: Helper subroutine emitters (all deps defined above)
+  // --------------------------------------------------------------------------
+
+  fn xt_emitPrintStrHelper() {
+    self.xt_ADDI(XT_SP, XT_SP, -8);
+    self.xt_S32I(XT_A0, XT_SP, 0);
+    self.xt_MOVI(XT_A3, 6);
+    self.xt_MOVI(XT_A4, 28);
+    self.xt_SSL(XT_A4);
+    self.xt_SLL(XT_A3, XT_A3);       // a3 = 0x60000000 (UART base)
+    self.xt_L8UI(XT_A4, XT_RV, 0);  // 18: loop: load byte
+    self.xt_BEQZ(XT_A4, 9);          // 21: if null → done (+9)
+    self.xt_S8I(XT_A4, XT_A3, 0);   // 24: write to UART
+    self.xt_ADDI(XT_RV, XT_RV, 1);  // 27: ptr++
+    self.xt_BNEZ(XT_SP, -15);        // 30: always back to offset 18 (-15)
+    self.xt_L32I(XT_A0, XT_SP, 0);  // 33: done: restore RA
+    self.xt_ADDI(XT_SP, XT_SP, 8);
+    self.xt_JX_A0();
+    // 14 × 3 = 42 bytes ✓
+  }
+
+  fn xt_emitPrintIntHelper() {
+    self.xt_ADDI(XT_SP, XT_SP, -24);
+    self.xt_S32I(XT_A0, XT_SP, 0);
+    self.xt_MOVI(XT_A3, 0);
+    self.xt_MOVI(XT_A5, 6);
+    self.xt_MOVI(XT_T0, 28);
+    self.xt_SSL(XT_T0);
+    self.xt_SLL(XT_A5, XT_A5);         // a5 = 0x60000000
+    self.xt_ADDI(XT_A4, XT_SP, 23);
+    self.xt_e3((7 << 4) | 6, 10, 0xA0); // MOVI a7, 10
+    self.xt_BGEZ(XT_RV, 6);             // 27: if a2>=0 → offset 36 (+6)
+    self.xt_NEG(XT_RV, XT_RV);
+    self.xt_MOVI(XT_A3, 1);
+    self.xt_MOVI(6, 0);                 // 36: .do_loop: quotient=0
+    self.xt_SUB(XT_T0, XT_RV, 7);      // 39: .div10_loop
+    self.xt_BLTZ(XT_T0, 9);             // 42: if a2<10 → 54 (+9)
+    self.xt_MOV(XT_RV, XT_T0);
+    self.xt_ADDI(6, 6, 1);
+    self.xt_BNEZ(XT_SP, -15);           // 51: → 39 (-15)
+    self.xt_ADDI(XT_RV, XT_RV, 0x30);  // 54: .div10_done
+    self.xt_S8I(XT_RV, XT_A4, 0);
+    self.xt_ADDI(XT_A4, XT_A4, -1);
+    self.xt_MOV(XT_RV, 6);
+    self.xt_BNEZ(XT_RV, -33);           // 66: → 36 (-33)
+    self.xt_BEQZ(XT_A3, 6);             // 69: if !neg → 78 (+6)
+    self.xt_MOVI(XT_T0, 0x2D);
+    self.xt_S8I(XT_T0, XT_A5, 0);
+    self.xt_ADDI(XT_A4, XT_A4, 1);     // 78: .skip_minus
+    self.xt_ADDI(6, XT_SP, 24);
+    self.xt_SUB(XT_T0, XT_A4, 6);      // 84: .print_loop
+    self.xt_BEQZ(XT_T0, 12);            // 87: if done → 102 (+12)
+    self.xt_L8UI(XT_T0, XT_A4, 0);
+    self.xt_S8I(XT_T0, XT_A5, 0);
+    self.xt_ADDI(XT_A4, XT_A4, 1);
+    self.xt_BNEZ(XT_SP, -18);           // 99: → 84 (-18)
+    self.xt_L32I(XT_A0, XT_SP, 0);     // 102: .print_done
+    self.xt_ADDI(XT_SP, XT_SP, 24);
+    self.xt_JX_A0();
+    // 37 × 3 = 111 bytes ✓
+  }
+
+  fn xt_emitHelpers() {
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+    self.xt_printstrOff := self.codeLen;
+    self.xt_emitPrintStrHelper();
+
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+    self.xt_printintOff := self.codeLen;
+    self.xt_emitPrintIntHelper();
+
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+  }
+
   fn emitBuiltinCall(id: int64, dest: int64) {
-    // Bare-metal: stub all built-ins, return 0
-    self.xt_MOVI(XT_T0, 0);
-    self.xt_storeSlot(dest);
+    if id == 1 {
+      // PrintStr: a2 = pchar from slot 0, call printstr helper
+      self.xt_loadSlot(0);                    // T0 (a8) = slot[0] = str ptr
+      self.xt_MOV(XT_RV, XT_T0);            // a2 = str ptr
+      var callPC: int64 := self.codeLen;
+      var aligned: int64 := (callPC + 4) & -4;
+      var off18: int64 := (self.xt_printstrOff - aligned) >> 2;
+      self.xt_CALL0(off18);                  // call printstr helper
+    } else if id == 2 {
+      // PrintInt: a2 = int32 from slot 0, call printint helper
+      self.xt_loadSlot(0);
+      self.xt_MOV(XT_RV, XT_T0);
+      var callPC2: int64 := self.codeLen;
+      var aligned2: int64 := (callPC2 + 4) & -4;
+      var off18_2: int64 := (self.xt_printintOff - aligned2) >> 2;
+      self.xt_CALL0(off18_2);               // call printint helper
+    } else {
+      // Other builtins: stub returning 0
+      self.xt_MOVI(XT_T0, 0);
+      self.xt_storeSlot(dest);
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -565,19 +677,23 @@ pub type EmitXtensa = class {
   // --------------------------------------------------------------------------
 
   pub fn init(irMod: int64) {
-    self.ir         := irMod;
-    self.codeBuf    := alloc(131072);
-    self.codeCap    := 131072;
-    self.codeLen    := 0;
-    self.stackSize  := 0;
-    self.labelAddrs := alloc(1024 * 8);
-    self.patchBuf   := alloc(1024 * 32);
-    self.patchCount := 0;
-    self.funcAddrs  := alloc(256 * 8);
-    self.funcCount  := 0;
+    self.ir              := irMod;
+    self.codeBuf         := alloc(131072);
+    self.codeCap         := 131072;
+    self.codeLen         := 0;
+    self.stackSize       := 0;
+    self.labelAddrs      := alloc(1024 * 8);
+    self.patchBuf        := alloc(1024 * 32);
+    self.patchCount      := 0;
+    self.funcAddrs       := alloc(256 * 8);
+    self.funcCount       := 0;
+    self.xt_printstrOff  := 0;
+    self.xt_printintOff  := 0;
   }
 
   pub fn emit(): int64 {
+    // WP-D3: prepend PrintStr + PrintInt helper subroutines before user code
+    self.xt_emitHelpers();
     var n: int64 := self.getFuncCount();
     var i: int64 := 0;
     while i < n { self.emitFunc(i); i := i + 1; }
@@ -586,6 +702,11 @@ pub type EmitXtensa = class {
 
   pub fn getCodeBuf(): int64 { return self.codeBuf; }
   pub fn getCodeLen(): int64 { return self.codeLen; }
+  // WP-D3: offset of user function i within codeBuf (after helpers were prepended)
+  pub fn getFuncAddr(i: int64): int64 {
+    if i < 256 { return peek64(self.funcAddrs + i * 8); }
+    return 0;
+  }
 
   // --------------------------------------------------------------------------
   // IR accessors (same layout as EmitARM64 / EmitRISCV64 / EmitARMCM)
@@ -625,6 +746,7 @@ pub type XtensaBackend = class {
   code:    int64;
   codeLen: int64;
   codeCap: int64;
+  mainOff: int64;   // WP-D3: offset of main function within code (e_entry = IRAM_BASE + mainOff)
 
   fn xb_e8(v: int64) {
     poke8(self.code + self.codeLen, v & 0xFF);
@@ -635,10 +757,13 @@ pub type XtensaBackend = class {
     self.codeCap := 65536;
     self.code    := alloc(self.codeCap);
     self.codeLen := 0;
+    self.mainOff := 0;
   }
 
-  pub fn Build(irBuf: int64, irLen: int64) {
-    // Function 0 starts at offset 0 — it IS the entry point (e_entry = XT_IRAM_BASE)
+  pub fn Build(irBuf: int64, irLen: int64, mainFuncOff: int64) {
+    // WP-D3: mainFuncOff is the offset of user function 0 (= main) within irBuf.
+    // Helpers are prepended before user code, so e_entry must point to main, not offset 0.
+    self.mainOff := mainFuncOff;
     var i: int64 := 0;
     while i < irLen {
       self.xb_e8(peek8(irBuf + i));
@@ -674,7 +799,7 @@ pub type XtensaBackend = class {
     poke16(elfBuf + 16, 2);            // e_type: ET_EXEC
     poke16(elfBuf + 18, 0x5E);         // e_machine: EM_XTENSA = 94
     poke32(elfBuf + 20, 1);            // e_version
-    poke32(elfBuf + 24, 0x40080000);   // e_entry: IRAM base = VA of function 0
+    poke32(elfBuf + 24, 0x40080000 + self.mainOff);  // e_entry = IRAM_BASE + main offset
     poke32(elfBuf + 28, 52);           // e_phoff: program headers follow ELF header
     poke32(elfBuf + 32, 0);            // e_shoff: no section headers
     poke32(elfBuf + 36, 0);            // e_flags

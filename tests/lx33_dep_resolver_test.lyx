@@ -1,0 +1,383 @@
+// LX-33 Test: dep_resolver — Dependency Index + 0xD001 Edge Injection (30 Tests)
+
+import src.std.alloc;
+import src.std.io;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import src.tools.lbf.genesis;
+import src.tools.lbf.security;
+import src.tools.lbf.iofs_page;
+import src.tools.lbf.iofs_store;
+import src.tools.lbf.writer;
+import src.tools.lbf.importer;
+import src.tools.lbf.dep_resolver;
+
+// ── Hilfsfunktion: LBF-Datei mit TLV 0x02 patchen ───────────────────────────
+//
+// Liest src_path, hängt TLV 0x02 mit n×32 Byte Hashes ans TLV-Pool an,
+// schreibt nach dst_path, ruft lbf_finalize_file_crc auf.
+// Rückgabe: 0=ok, -1=Fehler.
+
+fn patch_dep_tlv(src_path: pchar, dst_path: pchar, hashes: int64, n: int64): int64 {
+    var fd: int64 := open(src_path, 0, 0);
+    if fd < 0 { return 0 - 1; }
+    var fsz: int64 := lseek(fd, 0, 2);
+    lseek(fd, 0, 0);
+    var buf: int64 := alloc(fsz);
+    if read(fd, buf, fsz) != fsz { close(fd); free(buf, fsz); return 0 - 1; }
+    close(fd);
+
+    // TLV_USED lesen und TLV 0x02 anhängen
+    var gen_pay: int64 := buf + LBF_HEADER_SIZE;
+    var tlv_used_ptr: int64 := gen_pay + GEN_P_TLV_USED;
+    var cur_used: int64 := peek16(tlv_used_ptr) & 0xFFFF;
+    var tlv_pool: int64 := gen_pay + GEN_P_TLV_POOL;
+    var val_len: int64 := n * 32;
+    poke8(tlv_pool + cur_used, LBF_TLV_DEP_HASH_GRAPH);
+    poke16(tlv_pool + cur_used + 1, val_len);
+    var hi: int64 := 0;
+    while hi < val_len {
+        poke8(tlv_pool + cur_used + 3 + hi, peek8(hashes + hi));
+        hi := hi + 1;
+    }
+    poke16(tlv_used_ptr, cur_used + 3 + val_len);
+
+    // Block-0-CRC reparieren
+    lbf_header_set_crc(buf, buf + LBF_HEADER_SIZE);
+
+    // Datei schreiben
+    var wfd: int64 := open(dst_path, 577, 420);
+    if wfd < 0 { free(buf, fsz); return 0 - 1; }
+    var written: int64 := write(wfd, buf, fsz);
+    close(wfd);
+    free(buf, fsz);
+    if written != fsz { return 0 - 1; }
+
+    // File-CRC reparieren
+    return lbf_finalize_file_crc(dst_path as int64);
+}
+
+fn main(): int64 {
+
+    // ── Tests 1–2: dep_index_alloc + leere Suche ─────────────────────────────
+
+    var idx: int64 := dep_index_alloc();
+    if idx == 0 {
+        EPrintStrLn("FAIL: dep_index_alloc returned 0"); return 1;
+    }
+
+    var zero_hash: int64 := alloc(32);
+    sys_getrandom(zero_hash, 32, 0);
+    if dep_index_lookup(idx, zero_hash) != 0 {
+        EPrintStrLn("FAIL: lookup in empty index should return 0"); return 1;
+    }
+
+    // ── Test 3–4: register + lookup ──────────────────────────────────────────
+
+    var hash_A: int64 := alloc(32);
+    sys_getrandom(hash_A, 32, 0);
+
+    if dep_index_register(idx, hash_A, 1001) != 0 {
+        EPrintStrLn("FAIL: register hash_A failed"); return 1;
+    }
+    if dep_index_lookup(idx, hash_A) != 1001 {
+        EPrintStrLn("FAIL: lookup hash_A should return 1001"); return 1;
+    }
+
+    // Test 4: unbekannter Hash → 0
+    var hash_unk: int64 := alloc(32);
+    sys_getrandom(hash_unk, 32, 0);
+    if dep_index_lookup(idx, hash_unk) != 0 {
+        EPrintStrLn("FAIL: lookup unknown hash should return 0"); return 1;
+    }
+
+    // ── Test 5–6: zweites Entry + beide auffindbar ────────────────────────────
+
+    var hash_B: int64 := alloc(32);
+    sys_getrandom(hash_B, 32, 0);
+    dep_index_register(idx, hash_B, 2002);
+
+    if dep_index_lookup(idx, hash_A) != 1001 {
+        EPrintStrLn("FAIL: hash_A should still be 1001 after hash_B registered"); return 1;
+    }
+    if dep_index_lookup(idx, hash_B) != 2002 {
+        EPrintStrLn("FAIL: hash_B should be 2002"); return 1;
+    }
+
+    // ── Test 7: Überschreiben existierender Eintrag ───────────────────────────
+
+    dep_index_register(idx, hash_A, 9999);
+    if dep_index_lookup(idx, hash_A) != 9999 {
+        EPrintStrLn("FAIL: re-registered hash_A should return 9999"); return 1;
+    }
+    dep_index_register(idx, hash_A, 1001);  // zurücksetzen
+
+    // ── Tests 8–9: 100 Einträge registrieren + alle auffindbar ───────────────
+
+    var bulk: int64 := alloc(100 * 32);
+    sys_getrandom(bulk, 100 * 32, 0);
+    var ri: int64 := 0;
+    while ri < 100 {
+        dep_index_register(idx, bulk + ri * 32, ri + 100);
+        ri := ri + 1;
+    }
+
+    var all_ok: int64 := 1;
+    var li: int64 := 0;
+    while li < 100 {
+        if dep_index_lookup(idx, bulk + li * 32) != li + 100 { all_ok := 0; }
+        li := li + 1;
+    }
+    if all_ok != 1 {
+        EPrintStrLn("FAIL: not all 100 bulk entries found"); return 1;
+    }
+    if dep_index_count(idx) < 102 {  // hash_A + hash_B + 100 = 102
+        EPrintStrLn("FAIL: dep_index_count should be >= 102"); return 1;
+    }
+
+    // ── Setup: LBF-Dateien erzeugen ───────────────────────────────────────────
+
+    var code: int64 := alloc(64);
+    var cfi: int64 := 0;
+    while cfi < 64 { poke8(code + cfi, 0x90); cfi := cfi + 1; }
+
+    var lbf_a: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf_a.writeLBF("/tmp/lx33_A.lbf"c, 0 as pchar, code, 64) {
+        EPrintStrLn("FAIL: writeLBF A failed"); return 1;
+    }
+
+    var lbf_b: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf_b.writeLBF("/tmp/lx33_B.lbf"c, 0 as pchar, code, 64) {
+        EPrintStrLn("FAIL: writeLBF B failed"); return 1;
+    }
+    free(code, 64);
+
+    // ── Test 10–11: dep_resolve_all auf Programm ohne Abhängigkeiten ──────────
+
+    var store: int64 := iofs_store_alloc(256);
+    var lpid_A: int64 := lbf_import("/tmp/lx33_A.lbf"c, store);
+    if lpid_A == (0 - 1) {
+        EPrintStrLn("FAIL: import A failed"); return 1;
+    }
+
+    if dep_resolve_all(store, idx, lpid_A) != 0 {
+        EPrintStrLn("FAIL: dep_resolve_all on no-dep program should return 0"); return 1;
+    }
+    if iofs_store_edge_count(store, lpid_A) != 1 {
+        EPrintStrLn("FAIL: A edge count should remain 1 (only 0xB001)"); return 1;
+    }
+
+    // ── Test 12–19: B mit TLV 0x02 → hash_A ──────────────────────────────────
+    //   B: 1 dep (hash_A → lpid_A)
+
+    // hash_A für B's TLV 0x02 vorbereiten (wir benutzen das gleiche hash_A)
+    if patch_dep_tlv("/tmp/lx33_B.lbf"c, "/tmp/lx33_B_dep.lbf"c, hash_A, 1) != 0 {
+        EPrintStrLn("FAIL: patch_dep_tlv for B failed"); return 1;
+    }
+
+    // hash_A → lpid_A im Index registrieren
+    dep_index_register(idx, hash_A, lpid_A);
+
+    var lpid_B: int64 := lbf_import("/tmp/lx33_B_dep.lbf"c, store);
+    if lpid_B == (0 - 1) {
+        EPrintStrLn("FAIL: import B_dep failed"); return 1;
+    }
+
+    var unresolved_B: int64 := dep_resolve_all(store, idx, lpid_B);
+    if unresolved_B != 0 {
+        EPrintStrLn("FAIL: dep_resolve_all B with known dep should return 0"); return 1;
+    }
+
+    // Test 15: B hat jetzt 2 Kanten (0xB001 + 0xD001)
+    if iofs_store_edge_count(store, lpid_B) != 2 {
+        EPrintStrLn("FAIL: B edge count should be 2 after dep resolution"); return 1;
+    }
+
+    // Tests 16–17: Kanten-Typen prüfen
+    var pg_B: int64 := iofs_store_lookup(store, lpid_B);
+    if iofs_page_get_edge_count(pg_B) != 2 {
+        EPrintStrLn("FAIL: B page edge_count header != 2"); return 1;
+    }
+    if iofs_page_get_edge_type(pg_B, 0) != IOFS_EDGE_BLK_CHAIN {
+        EPrintStrLn("FAIL: B edge 0 type should be 0xB001"); return 1;
+    }
+    if iofs_page_get_edge_type(pg_B, 1) != IOFS_EDGE_DEP {
+        EPrintStrLn("FAIL: B edge 1 type should be 0xD001"); return 1;
+    }
+
+    // Test 18: 0xD001 zeigt auf lpid_A
+    if iofs_page_get_edge_lpid(pg_B, 1) != lpid_A {
+        EPrintStrLn("FAIL: B dep edge LPID should be lpid_A"); return 1;
+    }
+
+    // Test 19: B's CRC nach Edge-Injection valide
+    if iofs_page_validate_crc(pg_B, 2) != 0 {
+        EPrintStrLn("FAIL: B page CRC invalid after dep edge injection"); return 1;
+    }
+
+    // ── Tests 20–21: nicht aufgelöste Abhängigkeit ────────────────────────────
+
+    var code_c: int64 := alloc(64);
+    var ccfi: int64 := 0;
+    while ccfi < 64 { poke8(code_c + ccfi, 0x90); ccfi := ccfi + 1; }
+
+    var lbf_c: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf_c.writeLBF("/tmp/lx33_C.lbf"c, 0 as pchar, code_c, 64) {
+        EPrintStrLn("FAIL: writeLBF C failed"); return 1;
+    }
+    free(code_c, 64);
+
+    var hash_X: int64 := alloc(32);
+    sys_getrandom(hash_X, 32, 0);
+
+    if patch_dep_tlv("/tmp/lx33_C.lbf"c, "/tmp/lx33_C_dep.lbf"c, hash_X, 1) != 0 {
+        EPrintStrLn("FAIL: patch_dep_tlv for C failed"); return 1;
+    }
+
+    var lpid_C: int64 := lbf_import("/tmp/lx33_C_dep.lbf"c, store);
+    if lpid_C == (0 - 1) {
+        EPrintStrLn("FAIL: import C_dep failed"); return 1;
+    }
+    var initial_ec_C: int64 := iofs_store_edge_count(store, lpid_C);
+
+    var unresolved_C: int64 := dep_resolve_all(store, idx, lpid_C);
+    if unresolved_C != 1 {
+        EPrintStrLn("FAIL: dep_resolve_all C with unknown dep should return 1"); return 1;
+    }
+
+    // Test 21: C's edge count unverändert (kein D001 hinzugefügt)
+    if iofs_store_edge_count(store, lpid_C) != initial_ec_C {
+        EPrintStrLn("FAIL: C edge count should not change for unresolved dep"); return 1;
+    }
+
+    // ── Tests 22–25: Multi-Dep: D mit [hash_A, hash_B, hash_X] ──────────────
+
+    var code_d: int64 := alloc(64);
+    var dfi: int64 := 0;
+    while dfi < 64 { poke8(code_d + dfi, 0x90); dfi := dfi + 1; }
+    var lbf_d: LBFNativeWriter := new LBFNativeWriter();
+    if !lbf_d.writeLBF("/tmp/lx33_D.lbf"c, 0 as pchar, code_d, 64) {
+        EPrintStrLn("FAIL: writeLBF D failed"); return 1;
+    }
+    free(code_d, 64);
+
+    // hash_B → lpid_B in Index registrieren
+    dep_index_register(idx, hash_B, lpid_B);
+
+    // 3 Hashes: hash_A (aufgelöst), hash_B (aufgelöst), hash_X (nicht aufgelöst)
+    var d_hashes: int64 := alloc(96);
+    var dhi: int64 := 0;
+    while dhi < 32 { poke8(d_hashes + dhi,      peek8(hash_A + dhi)); dhi := dhi + 1; }
+    dhi := 0;
+    while dhi < 32 { poke8(d_hashes + 32 + dhi, peek8(hash_B + dhi)); dhi := dhi + 1; }
+    dhi := 0;
+    while dhi < 32 { poke8(d_hashes + 64 + dhi, peek8(hash_X + dhi)); dhi := dhi + 1; }
+
+    if patch_dep_tlv("/tmp/lx33_D.lbf"c, "/tmp/lx33_D_dep.lbf"c, d_hashes, 3) != 0 {
+        EPrintStrLn("FAIL: patch_dep_tlv for D failed"); return 1;
+    }
+    free(d_hashes, 96);
+
+    var lpid_D: int64 := lbf_import("/tmp/lx33_D_dep.lbf"c, store);
+    if lpid_D == (0 - 1) {
+        EPrintStrLn("FAIL: import D_dep failed"); return 1;
+    }
+
+    // Test 22: dep_resolve_all(D) = 1 (hash_X nicht registriert)
+    var unresolved_D: int64 := dep_resolve_all(store, idx, lpid_D);
+    if unresolved_D != 1 {
+        EPrintStrLn("FAIL: dep_resolve_all D should return 1 (1 unresolved)"); return 1;
+    }
+
+    // Test 23: D hat 3 Kanten (0xB001 + 0xD001_A + 0xD001_B)
+    if iofs_store_edge_count(store, lpid_D) != 3 {
+        EPrintStrLn("FAIL: D edge count should be 3"); return 1;
+    }
+
+    // Test 24: D's 0xD001 Kanten zeigen auf richtige LPIDs
+    var pg_D: int64 := iofs_store_lookup(store, lpid_D);
+    if iofs_page_get_edge_type(pg_D, 1) != IOFS_EDGE_DEP {
+        EPrintStrLn("FAIL: D edge 1 should be 0xD001"); return 1;
+    }
+    if iofs_page_get_edge_type(pg_D, 2) != IOFS_EDGE_DEP {
+        EPrintStrLn("FAIL: D edge 2 should be 0xD001"); return 1;
+    }
+
+    // Test 25: D's CRC valide nach zwei Edge-Injections
+    if iofs_page_validate_crc(pg_D, 3) != 0 {
+        EPrintStrLn("FAIL: D page CRC invalid after 2 dep edges"); return 1;
+    }
+
+    // ── Tests 26–28: iofs_page_add_edge direkt ────────────────────────────────
+
+    // Baue eine frische Test-Page mit 0 Edges
+    var dummy_block: int64 := alloc(4096);
+    poke8(dummy_block + 0, 0x4C);  // L
+    poke8(dummy_block + 1, 0x59);  // Y
+    poke8(dummy_block + 2, 0x58);  // X
+    poke8(dummy_block + 3, 0x21);  // !
+    var test_pg: int64 := iofs_page_build(0xDEADBEEF00000001, 0, dummy_block, 0);
+    free(dummy_block, 4096);
+
+    if iofs_page_get_edge_count(test_pg) != 0 {
+        EPrintStrLn("FAIL: fresh test page should have 0 edges"); return 1;
+    }
+
+    // Test 26: add_edge → neue Page mit 1 Edge
+    var test_pg2: int64 := iofs_page_add_edge(test_pg, 0, 0x1234567890ABCDEF, IOFS_EDGE_DEP);
+    iofs_page_free(test_pg, 0);
+    if iofs_page_get_edge_count(test_pg2) != 1 {
+        EPrintStrLn("FAIL: page after add_edge should have 1 edge"); return 1;
+    }
+
+    // Test 27: Edge-Typ korrekt
+    if iofs_page_get_edge_type(test_pg2, 0) != IOFS_EDGE_DEP {
+        EPrintStrLn("FAIL: added edge type should be 0xD001"); return 1;
+    }
+
+    // Test 28: CRC nach add_edge valide
+    if iofs_page_validate_crc(test_pg2, 1) != 0 {
+        EPrintStrLn("FAIL: page CRC invalid after add_edge"); return 1;
+    }
+    iofs_page_free(test_pg2, 1);
+
+    // ── Tests 29–30: iofs_store_update_page ───────────────────────────────────
+
+    // Test 29: update_page ändert page_ptr im Store
+    var lpid_X: int64 := 0x9876543200000001;
+    var fake_pg1: int64 := alloc(8);
+    var fake_pg2: int64 := alloc(8);
+    var store2: int64 := iofs_store_alloc(16);
+    iofs_store_add(store2, lpid_X, fake_pg1, 0);
+
+    if iofs_store_lookup(store2, lpid_X) != fake_pg1 {
+        EPrintStrLn("FAIL: initial lookup should return fake_pg1"); return 1;
+    }
+    iofs_store_update_page(store2, lpid_X, fake_pg2, 1);
+    if iofs_store_lookup(store2, lpid_X) != fake_pg2 {
+        EPrintStrLn("FAIL: after update, lookup should return fake_pg2"); return 1;
+    }
+
+    // Test 30: edge_count wurde auch aktualisiert
+    if iofs_store_edge_count(store2, lpid_X) != 1 {
+        EPrintStrLn("FAIL: edge_count should be 1 after update"); return 1;
+    }
+
+    free(fake_pg1, 8);
+    free(fake_pg2, 8);
+    iofs_store_free(store2);
+
+    // ── Cleanup ───────────────────────────────────────────────────────────────
+
+    dep_index_free(idx);
+    iofs_store_free(store);
+    free(zero_hash, 32);
+    free(hash_A, 32);
+    free(hash_B, 32);
+    free(hash_unk, 32);
+    free(hash_X, 32);
+    free(bulk, 100 * 32);
+
+    PrintStrLn("lx33: dep_resolver OK");
+    return 0;
+}

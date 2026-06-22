@@ -369,121 +369,146 @@ con PATH_BUF_SIZE: int64 := 4096;
 
 // Normalisiert einen Pfad: ./ und ../ und // auflösen
 // "/home/user/./foo/../bar//baz" -> "/home/user/bar/baz"
-// Nutzt Stack-basierten Algorithmus
+//
+// SICHERHEITSWARNUNG (SEC-BUG-05): PathNormalize ist rein LEXIKALISCH.
+// Es löst KEINE Symlinks auf und erzwingt KEIN Root-Jail.
+// Symlink-basierte Path-Traversal-Angriffe werden NICHT verhindert.
+// Für Sicherheitsgrenzen (z.B. User-Upload-Pfade einschränken):
+//   PathContainedIn(root, path) verwenden — prüft Präfix nach Normalisierung.
+//   Für vollständigen Schutz zusätzlich realpath() aufrufen (löst Symlinks auf).
 pub fn PathNormalize(dest: pchar, src: pchar): pchar {
-  // Da Lyx keine dynamischen Arrays hat, implementieren wir eine 
-  // vereinfachte Version ohne vollständigen Stack
-  var result: pchar := "                                                                                ";
+  // SEC-BUG-05 fix: segment-stack algorithm — correct for all .. cases,
+  // heap buffers (no fixed 80-byte literal overflow).
   var src_len: int64 := StrLen(src);
-  
-  // Prüfe ob absolut oder relativ
   var is_absolute: bool := false;
-  if (src_len > 0 && StrCharAt(src, 0) == 47) {  // '/'
-    is_absolute := true;
-  }
-  
-  // Einfacherer Algorithmus: ein Durchgang
+  if (src_len > 0 && StrCharAt(src, 0) == 47) { is_absolute := true; }  // '/'
+
+  // Segment stack: store (start, len) pairs into src positions.
+  // Max 512 segments (4096 bytes / 8 bytes per entry).
+  var seg_starts: int64 := alloc(4096);
+  var seg_lens:   int64 := alloc(4096);
+  var seg_count:  int64 := 0;
+
   var i: int64 := 0;
-  var j: int64 := 0;
-  var last_slash: int64 := 0;
-  var comp_start: int64 := 0;
-  
-  if (is_absolute) {
-    StrSetChar(result, 0, 47);  // '/'
-    j := 1;
-    last_slash := 0;
-  }
-  
-  while (i < src_len) {
-    var c: int64 := StrCharAt(src, i);
-    
-    if (c == 47) {  // '/'
-      // Segment beenden
+  if (is_absolute) { i := 1; }
+  var comp_start: int64 := i;
+
+  // Process src char by char; flush segment at each '/' and at end.
+  while (i <= src_len) {
+    var c: int64 := 0;
+    if (i < src_len) { c := StrCharAt(src, i); }
+    if (c == 47 || i == src_len) {  // '/' or end
       var seg_len: int64 := i - comp_start;
-      
-      if (seg_len == 1 && StrCharAt(src, comp_start) == 46) {  // "."
-        // Überspringen
-        comp_start := i + 1;
-        last_slash := j;
-      }
-      else if (seg_len == 2 && StrCharAt(src, comp_start) == 46 && StrCharAt(src, comp_start + 1) == 46) {  // ".."
-        // Zurückgehen: entferne letztes Segment
-        if (last_slash < j) {
-          j := last_slash;
-          if (j > 0 && is_absolute) {
-            // Finde vorigen Slash
-            var k: int64 := j - 1;
-            while (k > 0) {
-              if (StrCharAt(result, k) == 47) { last_slash := k; break; }
-              k := k - 1;
-            }
-            if (k == 0) { last_slash := 0; }
-          }
+      if (seg_len == 0) {
+        // empty (multiple // or trailing slash) — skip
+      } else if (seg_len == 1 && StrCharAt(src, comp_start) == 46) {
+        // "." — skip
+      } else if (seg_len == 2 && StrCharAt(src, comp_start) == 46
+                               && StrCharAt(src, comp_start + 1) == 46) {
+        // ".." — pop last segment (ignore if already at root)
+        if (seg_count > 0) { seg_count := seg_count - 1; }
+      } else {
+        // normal segment — push
+        if (seg_count < 512) {
+          poke64(seg_starts + seg_count * 8, comp_start);
+          poke64(seg_lens   + seg_count * 8, seg_len);
+          seg_count := seg_count + 1;
         }
-        comp_start := i + 1;
-        last_slash := j;
       }
-      else if (seg_len > 0) {
-        // Normales Segment: kopieren
-        var k: int64 := 0;
-        while (k < seg_len) {
-          StrSetChar(result, j + k, StrCharAt(src, comp_start + k));
-          k := k + 1;
-        }
-        j := j + seg_len;
-        last_slash := j;
-        StrSetChar(result, j, 47);  // '/'
-        j := j + 1;
-        comp_start := i + 1;
-      }
-      else {
-        // Mehrere / : überspringen
-        comp_start := i + 1;
-      }
+      comp_start := i + 1;
     }
     i := i + 1;
   }
-  
-  // Letztes Segment prüfen
-  var seg_len: int64 := i - comp_start;
-  if (seg_len == 1 && StrCharAt(src, comp_start) == 46) {
-    // "." am Ende - entfernen
-  }
-  else if (seg_len == 2 && StrCharAt(src, comp_start) == 46 && StrCharAt(src, comp_start + 1) == 46) {
-    // ".." am Ende - entferne letztes Segment
-    if (last_slash < j) {
-      j := last_slash;
-    }
-  }
-  else if (seg_len > 0) {
-    // Normales Segment kopieren
+
+  // Reconstruct dest from valid segments.
+  var j: int64 := 0;
+  if (is_absolute) { StrSetChar(dest, 0, 47); j := 1; }  // leading '/'
+
+  var si: int64 := 0;
+  while (si < seg_count) {
+    var s: int64 := peek64(seg_starts + si * 8);
+    var l: int64 := peek64(seg_lens   + si * 8);
     var k: int64 := 0;
-    while (k < seg_len) {
-      StrSetChar(result, j + k, StrCharAt(src, comp_start + k));
+    while (k < l && j < PATH_BUF_SIZE - 1) {
+      StrSetChar(dest, j, StrCharAt(src, s + k));
+      j := j + 1;
       k := k + 1;
     }
-    j := j + seg_len;
+    // '/' between segments (not after last)
+    if (si < seg_count - 1 && j < PATH_BUF_SIZE - 1) {
+      StrSetChar(dest, j, 47);
+      j := j + 1;
+    }
+    si := si + 1;
   }
-  
-  // Entferne trailing slash (außer bei "/")
-  if (j > 1 && StrCharAt(result, j - 1) == 47) {
-    j := j - 1;
-  }
-  
-  // Null-terminator
-  StrSetChar(result, j, 0);
-  
-  // Kopiere nach dest (bis zur Puffergröße)
-  var copy_len: int64 := j;
-  if (copy_len >= PATH_BUF_SIZE) { copy_len := PATH_BUF_SIZE - 1; }
-  var k: int64 := 0;
-  while (k < copy_len) {
-    StrSetChar(dest, k, StrCharAt(result, k));
-    k := k + 1;
-  }
-  StrSetChar(dest, copy_len, 0);
-  
+
+  // Edge case: empty result (e.g. "/" or relative ".")
+  if (j == 0 && is_absolute) { StrSetChar(dest, 0, 47); j := 1; }
+  if (j == 0) { StrSetChar(dest, 0, 46); j := 1; }  // relative empty → "."
+
+  StrSetChar(dest, j, 0);
+
+  free(seg_starts, 4096);
+  free(seg_lens,   4096);
   return dest;
+}
+
+// Prüft ob path lexikalisch innerhalb von root liegt (SEC-BUG-05).
+//
+// Normalisiert beide Pfade und prüft dass der normalisierte path-String
+// mit dem normalisierten root-String beginnt, gefolgt von '/' oder Ende.
+//
+// Beispiele:
+//   PathContainedIn("/srv/uploads", "/srv/uploads/img.png") → true
+//   PathContainedIn("/srv/uploads", "/srv/uploads")         → true  (root selbst)
+//   PathContainedIn("/srv/uploads", "/srv/uploads2/x")      → false (Präfix-Collision)
+//   PathContainedIn("/srv/uploads", "/srv/uploads/../etc")  → false (traversal)
+//   PathContainedIn("/srv/uploads", "/etc/passwd")          → false
+//
+// ACHTUNG: Rein lexikalisch — Symlinks werden NICHT aufgelöst.
+// Für vollständigen Schutz: realpath() auf path aufrufen und Ergebnis prüfen.
+pub fn PathContainedIn(root: pchar, path: pchar): bool {
+  var normRoot: pchar := alloc(PATH_BUF_SIZE);
+  var normPath: pchar := alloc(PATH_BUF_SIZE);
+
+  PathNormalize(normRoot, root);
+  PathNormalize(normPath, path);
+
+  var rootLen: int64 := StrLen(normRoot);
+  var pathLen: int64 := StrLen(normPath);
+
+  // path kürzer als root → kann nicht enthalten sein
+  if (pathLen < rootLen) {
+    free(normRoot as int64, PATH_BUF_SIZE);
+    free(normPath as int64, PATH_BUF_SIZE);
+    return false;
+  }
+
+  // Präfix-Check: normPath muss mit normRoot beginnen
+  var i: int64 := 0;
+  while (i < rootLen) {
+    if (StrCharAt(normPath, i) != StrCharAt(normRoot, i)) {
+      free(normRoot as int64, PATH_BUF_SIZE);
+      free(normPath as int64, PATH_BUF_SIZE);
+      return false;
+    }
+    i := i + 1;
+  }
+
+  // Nach dem Root-Präfix muss '/' oder Ende folgen
+  // (verhindert "/srv/uploads2" als false positive für root "/srv/uploads")
+  var ok: bool := false;
+  if (pathLen == rootLen) {
+    ok := true;
+  } else if (StrCharAt(normPath, rootLen) == 47) {  // '/'
+    ok := true;
+  } else if (rootLen > 0 && StrCharAt(normRoot, rootLen - 1) == 47) {
+    ok := true;  // root endet selbst auf '/' (z.B. "/")
+  }
+
+  free(normRoot as int64, PATH_BUF_SIZE);
+  free(normPath as int64, PATH_BUF_SIZE);
+  return ok;
 }
 
 // Gibt den Verzeichnis-Teil eines Pfades zurück
@@ -751,6 +776,38 @@ pub fn DirEntryType(dirlist: int64, name: pchar, nameLen: int64): int64 {
     found := found + 1;
   }
   return DT_UNKNOWN;
+}
+
+// Returns the name of the idx-th entry (0-based) as a pointer into the DirList
+// buffer. Returns null (0) if idx is out of range. The pointer stays valid
+// until DirFree is called.
+pub fn DirEntryName(dirlist: int64, idx: int64): pchar {
+  if (dirlist == 0) { return 0 as pchar; }
+  var count: int64 := peek64(dirlist);
+  if (idx < 0 || idx >= count) { return 0 as pchar; }
+  var pos: int64 := 16;
+  var i: int64 := 0;
+  while (i < idx) {
+    var eLen: int64 := peek64(dirlist + pos);
+    pos := pos + 8 + 1 + eLen + 1;  // nameLen + type + name + NUL
+    i := i + 1;
+  }
+  return (dirlist + pos + 8 + 1) as pchar;  // skip nameLen(8) + type(1)
+}
+
+// Returns the DT_* type of the idx-th entry (0-based), or DT_UNKNOWN if out of range.
+pub fn DirEntryTypeAt(dirlist: int64, idx: int64): int64 {
+  if (dirlist == 0) { return DT_UNKNOWN; }
+  var count: int64 := peek64(dirlist);
+  if (idx < 0 || idx >= count) { return DT_UNKNOWN; }
+  var pos: int64 := 16;
+  var i: int64 := 0;
+  while (i < idx) {
+    var eLen: int64 := peek64(dirlist + pos);
+    pos := pos + 8 + 1 + eLen + 1;
+    i := i + 1;
+  }
+  return peek8(dirlist + pos + 8);  // type byte follows nameLen(8)
 }
 
 // Releases the memory allocated by DirList.
@@ -1254,6 +1311,40 @@ pub fn MkTemp(pathBuf: int64): int64 {
   }
   var fd: int64 := open(pathBuf as pchar, O_WRONLY | O_CREAT | O_EXCL, 384);  // 0600
   return fd;
+}
+
+// Creates a unique temporary file under /tmp and returns its path.
+// The returned pchar is heap-allocated (32 bytes); caller must free(ptr, 32).
+// The file remains on disk until explicitly removed with FileRemove/unlink.
+pub fn TmpFile(): pchar {
+  var buf: int64 := alloc(32);
+  var ts:  int64 := time(0);
+  var pid: int64 := getpid();
+  // Template: /tmp/lyx_<pid8hex>_<ts8hex>
+  poke8(buf,  47); poke8(buf+1,116); poke8(buf+2,109); poke8(buf+3,112);
+  poke8(buf+4, 47); poke8(buf+5,108); poke8(buf+6,121); poke8(buf+7,120);
+  poke8(buf+8, 95);  // '_'
+  var hex: pchar := "0123456789abcdef";
+  var i: int64 := 0;
+  while (i < 8) {
+    poke8(buf + 9  + i, peek8(hex as int64 + ((pid >> (28 - i * 4)) & 0xF)));
+    poke8(buf + 17 + i, peek8(hex as int64 + ((ts  >> (28 - i * 4)) & 0xF)));
+    i := i + 1;
+  }
+  poke8(buf + 25, 0);
+  // Retry with a counter suffix if the file already exists
+  var attempt: int64 := 0;
+  var f: int64 := open(buf as pchar, O_WRONLY | O_CREAT | O_EXCL, 384);  // 0600
+  while (f < 0 && attempt < 256) {
+    attempt := attempt + 1;
+    poke8(buf + 25, 95);  // '_'
+    poke8(buf + 26, peek8(hex as int64 + ((attempt >> 4) & 0xF)));
+    poke8(buf + 27, peek8(hex as int64 + (attempt & 0xF)));
+    poke8(buf + 28, 0);
+    f := open(buf as pchar, O_WRONLY | O_CREAT | O_EXCL, 384);
+  }
+  if (f >= 0) { close(f); }
+  return buf as pchar;
 }
 
 // ============================================================================

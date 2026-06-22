@@ -1,0 +1,247 @@
+// src/tools/lbf/iofs_page.lyx — LX-32 IOFS-Page-Builder für LBF-Blöcke
+//
+// Baut IOFS-Seiten (big-endian Header + LBF-Block-Payload + 0xB001-Kanten).
+// Für den POSIX-IOFS-Simulator: kein echtes LyxOS-Kernel erforderlich.
+//
+// IOFS-Page-Layout:
+//   +0   [104] IofsPageHeader (big-endian Felder)
+//   +104 [4096] Payload (vollständiger LBF-Block incl. 64B Header)
+//   +4200 [edge_count × 10] Kanten: [lpid_be64][type_be16]
+//
+// Import: import src.tools.lbf.iofs_page;
+
+import src.std.alloc;
+import src.std.lyxos.lbf_layout;
+
+// ── Konstanten ────────────────────────────────────────────────────────────────
+
+pub con IOFS_PAGE_HDR_SIZE  : int64 := 104;
+pub con IOFS_EDGE_SIZE      : int64 := 10;       // lpid(8) + type(2)
+pub con IOFS_PAGE_TYPE_LBF  : int64 := 4;        // 0x04 = ausführbarer LBF-Block
+pub con IOFS_EDGE_BLK_CHAIN : int64 := 0xB001;   // Block-Ketten-Kante
+
+// IofsPageHeader-Offsets (alle Felder big-endian)
+pub con IOFS_H_PAGE_ID    : int64 := 0;    // uint64
+pub con IOFS_H_TYPE_FLAGS : int64 := 8;    // uint64
+pub con IOFS_H_PAYLOAD_SZ : int64 := 16;   // uint32
+pub con IOFS_H_EDGE_COUNT : int64 := 20;   // uint16
+pub con IOFS_H_RESERVED   : int64 := 22;   // uint16
+pub con IOFS_H_TS_CREATE  : int64 := 24;   // int64
+pub con IOFS_H_TS_MODIFY  : int64 := 32;   // int64
+pub con IOFS_H_TS_ACCESS  : int64 := 40;   // int64
+pub con IOFS_H_CRC32C     : int64 := 48;   // uint32
+pub con IOFS_H_PADDING    : int64 := 52;   // [52] Nullbytes
+
+// ── Big-Endian-Hilfsfunktionen ────────────────────────────────────────────────
+
+fn pokeBE64(dst: int64, val: int64) {
+    poke8(dst + 0, (val >> 56) & 0xFF);
+    poke8(dst + 1, (val >> 48) & 0xFF);
+    poke8(dst + 2, (val >> 40) & 0xFF);
+    poke8(dst + 3, (val >> 32) & 0xFF);
+    poke8(dst + 4, (val >> 24) & 0xFF);
+    poke8(dst + 5, (val >> 16) & 0xFF);
+    poke8(dst + 6, (val >>  8) & 0xFF);
+    poke8(dst + 7,  val        & 0xFF);
+}
+
+fn pokeBE32(dst: int64, val: int64) {
+    poke8(dst + 0, (val >> 24) & 0xFF);
+    poke8(dst + 1, (val >> 16) & 0xFF);
+    poke8(dst + 2, (val >>  8) & 0xFF);
+    poke8(dst + 3,  val        & 0xFF);
+}
+
+fn pokeBE16(dst: int64, val: int64) {
+    poke8(dst + 0, (val >> 8) & 0xFF);
+    poke8(dst + 1,  val       & 0xFF);
+}
+
+fn peekBE64(src: int64): int64 {
+    var v: int64 := (peek8(src + 0) & 0xFF);
+    v := (v << 8) | (peek8(src + 1) & 0xFF);
+    v := (v << 8) | (peek8(src + 2) & 0xFF);
+    v := (v << 8) | (peek8(src + 3) & 0xFF);
+    v := (v << 8) | (peek8(src + 4) & 0xFF);
+    v := (v << 8) | (peek8(src + 5) & 0xFF);
+    v := (v << 8) | (peek8(src + 6) & 0xFF);
+    v := (v << 8) | (peek8(src + 7) & 0xFF);
+    return v;
+}
+
+fn peekBE16(src: int64): int64 {
+    return ((peek8(src) & 0xFF) << 8) | (peek8(src + 1) & 0xFF);
+}
+
+// ── CRC32C (Castagnoli) ───────────────────────────────────────────────────────
+
+fn iofsCrc32c(data: int64, len: int64): int64 {
+    var crc: int64 := 0xFFFFFFFF;
+    var i: int64 := 0;
+    while i < len {
+        crc := crc ^ (peek8(data + i) & 0xFF);
+        var bit: int64 := 0;
+        while bit < 8 {
+            if (crc & 1) != 0 { crc := (crc >> 1) ^ 0x82F63B78; }
+            else               { crc := crc >> 1; }
+            bit := bit + 1;
+        }
+        i := i + 1;
+    }
+    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+// ── iofs_page_size ────────────────────────────────────────────────────────────
+//
+// Berechnet die Gesamtgröße einer IOFS-Page.
+// edge_count: Anzahl der Kanten (0 oder 1 für LX-32).
+
+pub fn iofs_page_size(edge_count: int64): int64 {
+    return IOFS_PAGE_HDR_SIZE + LBF_BLOCK_SIZE + (edge_count * IOFS_EDGE_SIZE);
+}
+
+// ── iofs_page_build ───────────────────────────────────────────────────────────
+//
+// Baut eine vollständige IOFS-Page für einen LBF-Block.
+//
+// lpid:       LPID dieser Page
+// next_lpid:  LPID der nächsten Page (0 = keine Kette, kein 0xB001-Edge)
+// lbf_block:  Zeiger auf den vollständigen 4096-Byte-LBF-Block
+// ts:         Zeitstempel (Epoch-Sekunden; 0 = kein Zeitstempel)
+//
+// Allokiert den Page-Puffer. Aufrufer muss mit iofs_page_free() freigeben.
+// Rückgabe: Zeiger auf Page-Puffer, oder 0 bei Fehler.
+
+pub fn iofs_page_build(lpid: int64, next_lpid: int64, lbf_block: int64, ts: int64): int64 {
+    var edge_count: int64 := 0;
+    if next_lpid != 0 { edge_count := 1; }
+
+    var pgsz: int64 := iofs_page_size(edge_count);
+    var pg: int64 := alloc(pgsz);
+
+    // ── Header (104 Bytes, big-endian) ────────────────────────────────────────
+    pokeBE64(pg + IOFS_H_PAGE_ID,    lpid);
+    pokeBE64(pg + IOFS_H_TYPE_FLAGS, IOFS_PAGE_TYPE_LBF);
+    pokeBE32(pg + IOFS_H_PAYLOAD_SZ, LBF_BLOCK_SIZE);
+    pokeBE16(pg + IOFS_H_EDGE_COUNT, edge_count);
+    // reserved = 0 (schon 0 durch alloc)
+    pokeBE64(pg + IOFS_H_TS_CREATE,  ts);
+    pokeBE64(pg + IOFS_H_TS_MODIFY,  ts);
+    pokeBE64(pg + IOFS_H_TS_ACCESS,  ts);
+    // crc32c = 0 (wird unten gesetzt)
+
+    // ── Payload: vollständiger LBF-Block ──────────────────────────────────────
+    var payload: int64 := pg + IOFS_PAGE_HDR_SIZE;
+    var pi: int64 := 0;
+    while pi < LBF_BLOCK_SIZE { poke8(payload + pi, peek8(lbf_block + pi)); pi := pi + 1; }
+
+    // ── Kanten ────────────────────────────────────────────────────────────────
+    if next_lpid != 0 {
+        var edge: int64 := pg + IOFS_PAGE_HDR_SIZE + LBF_BLOCK_SIZE;
+        pokeBE64(edge + 0, next_lpid);
+        pokeBE16(edge + 8, IOFS_EDGE_BLK_CHAIN);
+    }
+
+    // ── CRC32C über gesamte Page (Header mit crc=0) ───────────────────────────
+    var crc: int64 := iofsCrc32c(pg, pgsz);
+    pokeBE32(pg + IOFS_H_CRC32C, crc);
+
+    return pg;
+}
+
+// ── iofs_page_free ────────────────────────────────────────────────────────────
+
+pub fn iofs_page_free(pg: int64, edge_count: int64) {
+    free(pg, iofs_page_size(edge_count));
+}
+
+// ── iofs_page_add_edge ────────────────────────────────────────────────────────
+//
+// Baut eine neue Page mit einem zusätzlichen Edge am Ende.
+// Der Aufrufer muss die alte Page mit iofs_page_free(old_pg, old_ec) freigeben.
+//
+// Rückgabe: Zeiger auf neue Page, oder 0 bei Fehler.
+
+pub fn iofs_page_add_edge(old_pg: int64, old_ec: int64, new_lpid: int64, new_type: int64): int64 {
+    var new_ec: int64 := old_ec + 1;
+    var old_sz: int64 := iofs_page_size(old_ec);
+    var new_sz: int64 := iofs_page_size(new_ec);
+    var new_pg: int64 := alloc(new_sz);
+
+    // Kopiere alte Page (Header + Payload + alte Edges)
+    var i: int64 := 0;
+    while i < old_sz { poke8(new_pg + i, peek8(old_pg + i)); i := i + 1; }
+
+    // Edge-Anzahl im Header aktualisieren (BE16 bei IOFS_H_EDGE_COUNT = 20)
+    pokeBE16(new_pg + IOFS_H_EDGE_COUNT, new_ec);
+
+    // Neue Edge ans Ende schreiben
+    var edge: int64 := new_pg + IOFS_PAGE_HDR_SIZE + LBF_BLOCK_SIZE + (old_ec * IOFS_EDGE_SIZE);
+    pokeBE64(edge + 0, new_lpid);
+    pokeBE16(edge + 8, new_type);
+
+    // CRC32C neu berechnen (gespeicherten CRC nullen)
+    poke8(new_pg + IOFS_H_CRC32C,     0);
+    poke8(new_pg + IOFS_H_CRC32C + 1, 0);
+    poke8(new_pg + IOFS_H_CRC32C + 2, 0);
+    poke8(new_pg + IOFS_H_CRC32C + 3, 0);
+    var crc: int64 := iofsCrc32c(new_pg, new_sz);
+    pokeBE32(new_pg + IOFS_H_CRC32C, crc);
+
+    return new_pg;
+}
+
+// ── Abfragefunktionen ─────────────────────────────────────────────────────────
+
+pub fn iofs_page_get_lpid(pg: int64): int64 {
+    return peekBE64(pg + IOFS_H_PAGE_ID);
+}
+
+pub fn iofs_page_get_type(pg: int64): int64 {
+    return peekBE64(pg + IOFS_H_TYPE_FLAGS);
+}
+
+pub fn iofs_page_get_edge_count(pg: int64): int64 {
+    return peekBE16(pg + IOFS_H_EDGE_COUNT);
+}
+
+pub fn iofs_page_get_edge_lpid(pg: int64, idx: int64): int64 {
+    var edge: int64 := pg + IOFS_PAGE_HDR_SIZE + LBF_BLOCK_SIZE + (idx * IOFS_EDGE_SIZE);
+    return peekBE64(edge + 0);
+}
+
+pub fn iofs_page_get_edge_type(pg: int64, idx: int64): int64 {
+    var edge: int64 := pg + IOFS_PAGE_HDR_SIZE + LBF_BLOCK_SIZE + (idx * IOFS_EDGE_SIZE);
+    return peekBE16(edge + 8);
+}
+
+// iofs_page_has_lbf_magic — prüft ob Payload mit LYX! beginnt.
+pub fn iofs_page_has_lbf_magic(pg: int64): bool {
+    var p: int64 := pg + IOFS_PAGE_HDR_SIZE;
+    if peek8(p + 0) != LBF_MAGIC_0 { return false; }
+    if peek8(p + 1) != LBF_MAGIC_1 { return false; }
+    if peek8(p + 2) != LBF_MAGIC_2 { return false; }
+    if peek8(p + 3) != LBF_MAGIC_3 { return false; }
+    return true;
+}
+
+// iofs_page_validate_crc — recomputes CRC32C (with stored crc zeroed) and compares.
+// Returns 0=ok, -1=mismatch.
+pub fn iofs_page_validate_crc(pg: int64, edge_count: int64): int64 {
+    var pgsz: int64 := iofs_page_size(edge_count);
+
+    // Gespeicherten CRC sichern und nullen (BE32 at offset 48)
+    var stored: int64 := (peekBE64(pg + IOFS_H_CRC32C) >> 32) & 0xFFFFFFFF;
+    poke8(pg + IOFS_H_CRC32C,     0);
+    poke8(pg + IOFS_H_CRC32C + 1, 0);
+    poke8(pg + IOFS_H_CRC32C + 2, 0);
+    poke8(pg + IOFS_H_CRC32C + 3, 0);
+
+    var computed: int64 := iofsCrc32c(pg, pgsz);
+
+    // Gespeicherten CRC wiederherstellen
+    pokeBE32(pg + IOFS_H_CRC32C, stored);
+
+    if computed != stored { return 0 - 1; }
+    return 0;
+}

@@ -1,0 +1,211 @@
+// LX-00: LBF Writer — Lyx Binary Format Serializer
+// Converts an in-memory IRModule to a .lbf bytecode file.
+//
+// Format summary:
+//   Header     64 bytes  magic+version+offsets
+//   StringPool var       raw IR string buffer (verbatim copy)
+//   FuncTable  24*n      compact function entries
+//   InstrArray 20*n      packed instructions (one per IR instr)
+//   RelocTable 0 bytes   (empty in Phase 1)
+//
+// Instruction encoding (20 bytes, little-endian):
+//   +0  u16  opcode  (IRO_* value)
+//   +2  u16  dest    (destination slot; 0xFFFF = no dest)
+//   +4  u32  a       (src1; 0xFFFFFFFF = unused)
+//   +8  u32  b       (src2; 0xFFFFFFFF = unused)
+//   +12 i64  imm     (immInt: constant value, strOff, labelId, funcIdx, etc.)
+//
+// All fields are stored in immInt by irAddInstrDirect, so `imm` always
+// comes from IR_INSTR_OFF_IMMINT (+40) — no opcode-specific branching needed.
+
+import src.ir;
+
+pub type LBFWriter = class {
+    buf: int64;
+    cap: int64;
+    len: int64;
+
+    fn init(): void {
+        self.cap := 65536;
+        self.buf := alloc(self.cap);
+        self.len := 0;
+    }
+
+    fn grow(need: int64): void {
+        if (self.len + need) <= self.cap { return; }
+        var nc: int64 := self.cap * 2;
+        while nc < (self.len + need) { nc := nc * 2; }
+        var nb: int64 := alloc(nc);
+        memcpy(nb, self.buf, self.len);
+        self.buf := nb;
+        self.cap := nc;
+    }
+
+    fn w8(v: int64): void {
+        self.grow(1);
+        poke8(self.buf + self.len, v & 0xFF);
+        self.len := self.len + 1;
+    }
+
+    fn w16(v: int64): void {
+        self.grow(2);
+        poke8(self.buf + self.len + 0, v & 0xFF);
+        poke8(self.buf + self.len + 1, (v >> 8) & 0xFF);
+        self.len := self.len + 2;
+    }
+
+    fn w32(v: int64): void {
+        self.grow(4);
+        poke8(self.buf + self.len + 0, v & 0xFF);
+        poke8(self.buf + self.len + 1, (v >> 8) & 0xFF);
+        poke8(self.buf + self.len + 2, (v >> 16) & 0xFF);
+        poke8(self.buf + self.len + 3, (v >> 24) & 0xFF);
+        self.len := self.len + 4;
+    }
+
+    fn w64(v: int64): void {
+        self.grow(8);
+        poke8(self.buf + self.len + 0, v & 0xFF);
+        poke8(self.buf + self.len + 1, (v >> 8) & 0xFF);
+        poke8(self.buf + self.len + 2, (v >> 16) & 0xFF);
+        poke8(self.buf + self.len + 3, (v >> 24) & 0xFF);
+        poke8(self.buf + self.len + 4, (v >> 32) & 0xFF);
+        poke8(self.buf + self.len + 5, (v >> 40) & 0xFF);
+        poke8(self.buf + self.len + 6, (v >> 48) & 0xFF);
+        poke8(self.buf + self.len + 7, (v >> 56) & 0xFF);
+        self.len := self.len + 8;
+    }
+
+    // Patch a u32 at an already-written position (for header fixup).
+    fn patch32(off: int64, v: int64): void {
+        poke8(self.buf + off + 0, v & 0xFF);
+        poke8(self.buf + off + 1, (v >> 8) & 0xFF);
+        poke8(self.buf + off + 2, (v >> 16) & 0xFF);
+        poke8(self.buf + off + 3, (v >> 24) & 0xFF);
+    }
+
+    fn writeFile(path: pchar): bool {
+        var fd: int64 := open(path, 577, 420);  // O_WRONLY|O_CREAT|O_TRUNC, 0644
+        if fd == -1 { return false; }
+        write(fd, self.buf as pchar, self.len);
+        close(fd);
+        return true;
+    }
+
+    // Find the index of main() in the function table.
+    fn findMain(funcBuf: int64, funcLen: int64, strBuf: int64): int64 {
+        var fi: int64 := 0;
+        while fi < funcLen {
+            var fBase:     int64 := funcBuf + fi * IR_FUNC_SIZE;
+            var fnNameOff: int64 := peek64(fBase + 0);
+            var fnNameLen: int64 := peek64(fBase + IR_FUNC_OFF_NAMELEN);
+            if fnNameLen == 4 {
+                var p: int64 := strBuf + fnNameOff;
+                if peek8(p+0)==109 && peek8(p+1)==97 && peek8(p+2)==105 && peek8(p+3)==110 {
+                    return fi;
+                }
+            }
+            fi := fi + 1;
+        }
+        return 0;
+    }
+
+    pub fn serialize(irMod: int64, outPath: pchar): bool {
+        self.init();
+
+        var instrBuf: int64 := peek64(irMod + IR_MOD_OFF_INSTRBUF);
+        var instrLen: int64 := peek64(irMod + IR_MOD_OFF_INSTRLEN);
+        var strBuf:   int64 := peek64(irMod + IR_MOD_OFF_STRBUF);
+        var strLen:   int64 := peek64(irMod + IR_MOD_OFF_STRLEN);
+        var funcBuf:  int64 := peek64(irMod + IR_MOD_OFF_FUNCBUF);
+        var funcLen:  int64 := peek64(irMod + IR_MOD_OFF_FUNCLEN);
+
+        var entryIdx: int64 := self.findMain(funcBuf, funcLen, strBuf);
+
+        // --- Header: 64 bytes placeholder (patched at end) ---
+        var hdrStart: int64 := self.len;
+        var hi: int64 := 0;
+        while hi < 64 { self.w8(0); hi := hi + 1; }
+
+        // Magic + version
+        poke8(self.buf + hdrStart + 0, 76);   // 'L'
+        poke8(self.buf + hdrStart + 1, 66);   // 'B'
+        poke8(self.buf + hdrStart + 2, 70);   // 'F'
+        poke8(self.buf + hdrStart + 3, 0);
+        poke8(self.buf + hdrStart + 4, 1);    // version = 1
+        poke8(self.buf + hdrStart + 5, 0);
+        // flags = 0 (bytes 6-7 already zero)
+
+        // --- String pool ---
+        var strPoolOff: int64 := self.len;
+        var si: int64 := 0;
+        while si < strLen {
+            self.w8(peek8(strBuf + si));
+            si := si + 1;
+        }
+
+        // --- FuncTable (24 bytes per entry) ---
+        var funcTableOff: int64 := self.len;
+        var fi: int64 := 0;
+        while fi < funcLen {
+            var fBase:       int64 := funcBuf + fi * IR_FUNC_SIZE;
+            var fnNameOff:   int64 := peek64(fBase + 0);
+            var fnNameLen:   int64 := peek64(fBase + IR_FUNC_OFF_NAMELEN);
+            var fnInstrsOff: int64 := peek64(fBase + IR_FUNC_OFF_INSTRSOFF);
+            var fnInstrCnt:  int64 := peek64(fBase + IR_FUNC_OFF_INSTRCOUNT);
+            var fnLocals:    int64 := peek64(fBase + IR_FUNC_OFF_LOCALCOUNT);
+            var fnParams:    int64 := peek64(fBase + IR_FUNC_OFF_PARAMCOUNT);
+            // INSTRSOFF ist ein Instruktions-INDEX (ir_lower._addFunc speichert
+            // funcInstrStart = INSTRLEN-Zähler), kein Byte-Offset — nicht teilen!
+            var firstInstr:  int64 := fnInstrsOff;
+
+            // nameOff(4) nameLen(2) localCount(2) paramCount(2) pad(2) firstInstr(4) instrCount(4) pad(4)
+            self.w32(fnNameOff);
+            self.w16(fnNameLen);
+            self.w16(fnLocals);
+            self.w16(fnParams);
+            self.w16(0);
+            self.w32(firstInstr);
+            self.w32(fnInstrCnt);
+            self.w32(0);
+
+            fi := fi + 1;
+        }
+
+        // --- Instruction array (20 bytes per entry) ---
+        var instrOff: int64 := self.len;
+        var ii: int64 := 0;
+        while ii < instrLen {
+            var iBase: int64 := instrBuf + ii * IR_INSTR_SIZE;
+            var op:   int64 := peek64(iBase + 0);
+            var dest: int64 := peek64(iBase + IR_INSTR_OFF_DEST);
+            var src1: int64 := peek64(iBase + IR_INSTR_OFF_SRC1);
+            var src2: int64 := peek64(iBase + IR_INSTR_OFF_SRC2);
+            var imm:  int64 := peek64(iBase + IR_INSTR_OFF_IMMINT);
+
+            self.w16(op);
+            self.w16(dest);
+            self.w32(src1);
+            self.w32(src2);
+            self.w64(imm);
+
+            ii := ii + 1;
+        }
+
+        // --- Reloc table (empty Phase 1) ---
+        var relocOff: int64 := self.len;
+
+        // --- Patch header fields ---
+        self.patch32(hdrStart + 8,  entryIdx);
+        self.patch32(hdrStart + 12, strPoolOff);
+        self.patch32(hdrStart + 16, strLen);
+        self.patch32(hdrStart + 20, funcTableOff);
+        self.patch32(hdrStart + 24, funcLen);
+        self.patch32(hdrStart + 28, instrOff);
+        self.patch32(hdrStart + 32, instrLen);
+        self.patch32(hdrStart + 36, relocOff);
+        // relocCount already 0
+
+        return self.writeFile(outPath);
+    }
+};

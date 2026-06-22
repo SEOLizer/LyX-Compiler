@@ -6,6 +6,7 @@ unit std.net.http;
 import std.net.socket;
 import std.net.dns;
 import std.net.types;
+import std.net.tls;
 
 // HTTP constants
 pub con HTTP_PORT: int64 := 80;
@@ -19,6 +20,11 @@ pub con HTTP_GET: int64 := 1;
 pub con HTTP_POST: int64 := 2;
 pub con HTTP_PUT: int64 := 3;
 pub con HTTP_DELETE: int64 := 4;
+pub con HTTP_PATCH: int64 := 5;
+pub con HTTP_HEAD: int64 := 6;
+
+// Max redirects to follow automatically
+pub con HTTP_MAX_REDIRECTS: int64 := 10;
 
 // HTTP status codes
 pub con HTTP_OK: int64 := 200;
@@ -38,6 +44,8 @@ pub type HTTPResponse = struct {
   contentLength: int64;
   bodyPtr: int64;       // Pointer to response body
   bodySize: int64;
+  headersRaw: int64;    // WP-C6: raw response headers (mmap'd, null-terminated)
+  headersSize: int64;   // WP-C6: raw headers byte count
 };
 
 // HTTP Request structure
@@ -72,6 +80,30 @@ fn http_hasCrLf(ptr: int64, maxLen: int64): int64 {
     if (c == 13) { return 1; }
     if (c == 10) { return 1; }
     i := i + 1;
+  }
+  return 0;
+}
+
+// WP-30: Gibt 1 zurück wenn ptr eine doppelte CRLF-Sequenz (\r\n\r\n) oder
+// ein nacktes CR/LF (nicht Teil von \r\n) enthält — beides ermöglicht
+// Header-Injection und Request-Smuggling in Header-Blöcken.
+fn http_hasInjectionCrLf(ptr: int64, maxLen: int64): int64 {
+  var i: int64 := 0;
+  while (i < maxLen) {
+    var c: int64 := peek8(ptr + i);
+    if (c == 0) { return 0; }
+    if (c == 13) {
+      // Nacktes \r ohne folgendes \n → Fehler
+      if peek8(ptr + i + 1) != 10 { return 1; }
+      // \r\n gefunden — ist es ein doppeltes? (\r\n\r\n)
+      if peek8(ptr + i + 2) == 13 && peek8(ptr + i + 3) == 10 { return 1; }
+      i := i + 2;
+    } else if (c == 10) {
+      // Nacktes \n ohne vorangehendes \r → Fehler
+      return 1;
+    } else {
+      i := i + 1;
+    }
   }
   return 0;
 }
@@ -142,9 +174,11 @@ pub fn HTTPRequestBuild(req: HTTPRequest): int64 {
 
   // WP-9.3: Allokationsgröße dynamisch berechnen
   // 16 Byte Metadaten + Method + Path + HTTP-Version + Host-Header +
-  // Connection-Header + Content-Length + CRLF + Body
+  // Connection-Header + Content-Length + CRLF + Body + custom headers
+  var customHdrsLen: int64 := 0;
+  if (req.headers != 0) { customHdrsLen := http_strLen(req.headers); }
   var allocSize: int64 := 16 + 8 + pathLen + 12 + 7 + hostLen + 2 +
-                          21 + 32 + 2 + req.bodySize + 16;
+                          21 + 32 + 2 + req.bodySize + 16 + customHdrsLen;
   var buf: int64 := mmap(0, allocSize, PROT_RW, MAP_ANON, FD_NONE, 0);
   if (buf == 0) { return 0; }
 
@@ -164,6 +198,12 @@ pub fn HTTPRequestBuild(req: HTTPRequest): int64 {
     poke8(p, 68); poke8(p+1, 69); poke8(p+2, 76); poke8(p+3, 69); poke8(p+4, 84);
     poke8(p+5, 69); poke8(p+6, 32);
     p := p + 7;
+  } else if (req.method == HTTP_PATCH) {
+    poke8(p,80);poke8(p+1,65);poke8(p+2,84);poke8(p+3,67);poke8(p+4,72);poke8(p+5,32);
+    p := p + 6;
+  } else if (req.method == HTTP_HEAD) {
+    poke8(p,72);poke8(p+1,69);poke8(p+2,65);poke8(p+3,68);poke8(p+4,32);
+    p := p + 5;
   }
 
   // Path + " HTTP/1.1\r\n"
@@ -185,8 +225,15 @@ pub fn HTTPRequestBuild(req: HTTPRequest): int64 {
   poke8(p+15,115);poke8(p+16,101);poke8(p+17,13);poke8(p+18,10);
   p := p + 19;
 
-  // Content-Length for POST/PUT with body
-  if ((req.method == HTTP_POST || req.method == HTTP_PUT) && req.bodySize > 0) {
+  // WP-30: Custom headers — CRLF-Injektion verhindern
+  if (req.headers != 0) {
+    var hlen: int64 := http_strLen(req.headers);
+    if (http_hasInjectionCrLf(req.headers, hlen) != 0) { munmap(buf, allocSize); return 0; }
+    p := http_writeMem(p, req.headers, hlen);
+  }
+
+  // Content-Length for POST/PUT/PATCH with body
+  if ((req.method == HTTP_POST || req.method == HTTP_PUT || req.method == HTTP_PATCH) && req.bodySize > 0) {
     poke8(p,67);poke8(p+1,111);poke8(p+2,110);poke8(p+3,116);poke8(p+4,101);
     poke8(p+5,110);poke8(p+6,116);poke8(p+7,45);poke8(p+8,76);poke8(p+9,101);
     poke8(p+10,110);poke8(p+11,103);poke8(p+12,116);poke8(p+13,104);poke8(p+14,58);poke8(p+15,32);
@@ -199,7 +246,7 @@ pub fn HTTPRequestBuild(req: HTTPRequest): int64 {
   poke8(p,13);poke8(p+1,10); p := p + 2;
 
   // Body
-  if ((req.method == HTTP_POST || req.method == HTTP_PUT) && req.bodySize > 0 && req.body != 0) {
+  if ((req.method == HTTP_POST || req.method == HTTP_PUT || req.method == HTTP_PATCH) && req.bodySize > 0 && req.body != 0) {
     p := http_writeMem(p, req.body, req.bodySize);
   }
 
@@ -224,6 +271,8 @@ pub fn HTTPSend(request: HTTPRequest): HTTPResponse {
   response.contentLength := 0;
   response.bodyPtr := 0;
   response.bodySize := 0;
+  response.headersRaw := 0;
+  response.headersSize := 0;
 
   // Resolve hostname
   var ip: int64 := GetHostByName(request.host);
@@ -311,31 +360,55 @@ pub fn HTTPSend(request: HTTPRequest): HTTPResponse {
     i := i + 1;
   }
 
-  // WP-9.4: Wenn Content-Length > bereits empfangene Body-Bytes, weiter lesen
-  if (bodyStart > 0 && response.contentLength > 0) {
+  // WP-C6: Speichere rohe Response-Header (ohne body)
+  if (bodyStart > 0) {
+    var hdrLen: int64 := bodyStart - 2;  // ohne abschließendes \r\n\r\n→\r\n
+    response.headersRaw := mmap(0, hdrLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (response.headersRaw != 0) {
+      var hj: int64 := 0;
+      while (hj < hdrLen) { poke8(response.headersRaw + hj, peek8(buf + hj)); hj := hj + 1; }
+      poke8(response.headersRaw + hdrLen, 0);
+      response.headersSize := hdrLen;
+    }
+  }
+
+  // WP-C6: Detect Transfer-Encoding: chunked
+  var isChunked: int64 := 0;
+  if (response.headersRaw != 0) {
+    var hptr: int64 := response.headersRaw;
+    var hcheck: int64 := 0;
+    while (hcheck < response.headersSize - 26) {
+      // "Transfer-Encoding: chunked"  (T=84,r=114,a=97,n=110,s=115,f=102,e=101,r=114)
+      if (peek8(hptr+hcheck)==84 && peek8(hptr+hcheck+1)==114 && peek8(hptr+hcheck+2)==97 &&
+          peek8(hptr+hcheck+3)==110 && peek8(hptr+hcheck+4)==115 &&
+          peek8(hptr+hcheck+18)==99 && peek8(hptr+hcheck+19)==104 &&   // "ch"
+          peek8(hptr+hcheck+20)==117 && peek8(hptr+hcheck+21)==110 &&  // "un"
+          peek8(hptr+hcheck+22)==107 && peek8(hptr+hcheck+23)==101 &&  // "ke"
+          peek8(hptr+hcheck+24)==100) {                                  // "d"
+        isChunked := 1; hcheck := response.headersSize;
+      }
+      hcheck := hcheck + 1;
+    }
+  }
+
+  // WP-9.4: Lese fehlenden Body (Content-Length oder chunked)
+  if (isChunked == 0 && bodyStart > 0 && response.contentLength > 0) {
     var alreadyHave: int64 := totalRead - bodyStart;
     var need: int64 := response.contentLength - alreadyHave;
-
     if (need > 0) {
-      // Expandiere buf auf Header + vollständiger Body
       var newSize: int64 := bodyStart + response.contentLength + 1;
       var newBuf: int64 := mmap(0, newSize, PROT_RW, MAP_ANON, FD_NONE, 0);
       if (newBuf != 0) {
-        // Kopiere bereits Gelesenes
         var j: int64 := 0;
         while (j < totalRead) { poke8(newBuf + j, peek8(buf + j)); j := j + 1; }
         munmap(buf, bufSize);
-        buf := newBuf;
-        bufSize := newSize;
-
-        // WP-9.5: Lese fehlende Body-Bytes in Schleife mit Timeout
+        buf := newBuf; bufSize := newSize;
         var pos: int64 := totalRead;
         var remaining: int64 := need;
         while (remaining > 0) {
-          var chunk: int64 := http_readTimeout(sock, buf + pos, remaining, HTTP_RECV_TIMEOUT_MS);
-          if (chunk <= 0) { break; }
-          pos := pos + chunk;
-          remaining := remaining - chunk;
+          var ck: int64 := http_readTimeout(sock, buf + pos, remaining, HTTP_RECV_TIMEOUT_MS);
+          if (ck <= 0) { break; }
+          pos := pos + ck; remaining := remaining - ck;
         }
         totalRead := pos;
       }
@@ -344,7 +417,48 @@ pub fn HTTPSend(request: HTTPRequest): HTTPResponse {
 
   sys_close(sock);
 
-  // Body extrahieren
+  // WP-C6: Chunked Transfer Encoding — unchunk body in place
+  if (isChunked != 0 && bodyStart > 0) {
+    var chunkBody: int64 := mmap(0, totalRead + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (chunkBody != 0) {
+      var cpos: int64 := bodyStart;
+      var wpos: int64 := 0;
+      var doneChunk: int64 := 0;
+      while (doneChunk == 0 && cpos < totalRead) {
+        // Read hex size
+        var chunkSz: int64 := 0;
+        while (cpos < totalRead) {
+          var hc: int64 := peek8(buf + cpos);
+          if (hc == 13 || hc == 10) { break; }
+          if (hc >= 48 && hc <= 57)  { chunkSz := chunkSz * 16 + (hc - 48); }
+          else if (hc >= 65 && hc <= 70) { chunkSz := chunkSz * 16 + (hc - 55); }
+          else if (hc >= 97 && hc <= 102) { chunkSz := chunkSz * 16 + (hc - 87); }
+          cpos := cpos + 1;
+        }
+        // Skip \r\n after size
+        if (cpos < totalRead && peek8(buf + cpos) == 13) { cpos := cpos + 1; }
+        if (cpos < totalRead && peek8(buf + cpos) == 10) { cpos := cpos + 1; }
+        if (chunkSz == 0) { doneChunk := 1; }
+        else {
+          var cj: int64 := 0;
+          while (cj < chunkSz && cpos < totalRead) {
+            poke8(chunkBody + wpos, peek8(buf + cpos));
+            wpos := wpos + 1; cpos := cpos + 1; cj := cj + 1;
+          }
+          // Skip trailing \r\n
+          if (cpos < totalRead && peek8(buf + cpos) == 13) { cpos := cpos + 1; }
+          if (cpos < totalRead && peek8(buf + cpos) == 10) { cpos := cpos + 1; }
+        }
+      }
+      poke8(chunkBody + wpos, 0);
+      response.bodyPtr := chunkBody;
+      response.bodySize := wpos;
+    }
+    munmap(buf, bufSize);
+    return response;
+  }
+
+  // Non-chunked: extract body normally
   if (bodyStart > 0) {
     var bodyLen: int64 := totalRead - bodyStart;
     if (response.contentLength > 0 && response.contentLength < bodyLen) {
@@ -368,10 +482,14 @@ pub fn HTTPSend(request: HTTPRequest): HTTPResponse {
   return response;
 }
 
-// Free HTTP response body
+// Free HTTP response body and headers
 pub fn HTTPResponseFree(response: HTTPResponse) {
   if (response.bodyPtr != 0) {
     munmap(response.bodyPtr, response.bodySize + 1);
+  }
+  // WP-C6: free headersRaw
+  if (response.headersRaw != 0) {
+    munmap(response.headersRaw, response.headersSize + 1);
   }
 }
 
@@ -396,6 +514,505 @@ pub fn HTTPPost(host: int64, path: int64, body: int64, bodySize: int64): HTTPRes
   req.path := path;
   req.port := HTTP_PORT;
   req.headers := 0;
+  req.body := body;
+  req.bodySize := bodySize;
+  return HTTPSend(req);
+}
+
+// ============================================================================
+// WP-C6: Neue REST-Methoden
+// ============================================================================
+
+pub fn HTTPPut(host: int64, path: int64, body: int64, bodySize: int64): HTTPResponse {
+  var req: HTTPRequest;
+  req.method := HTTP_PUT;
+  req.host := host;
+  req.path := path;
+  req.port := HTTP_PORT;
+  req.headers := 0;
+  req.body := body;
+  req.bodySize := bodySize;
+  return HTTPSend(req);
+}
+
+pub fn HTTPDelete(host: int64, path: int64): HTTPResponse {
+  var req: HTTPRequest;
+  req.method := HTTP_DELETE;
+  req.host := host;
+  req.path := path;
+  req.port := HTTP_PORT;
+  req.headers := 0;
+  req.body := 0;
+  req.bodySize := 0;
+  return HTTPSend(req);
+}
+
+pub fn HTTPPatch(host: int64, path: int64, body: int64, bodySize: int64): HTTPResponse {
+  var req: HTTPRequest;
+  req.method := HTTP_PATCH;
+  req.host := host;
+  req.path := path;
+  req.port := HTTP_PORT;
+  req.headers := 0;
+  req.body := body;
+  req.bodySize := bodySize;
+  return HTTPSend(req);
+}
+
+pub fn HTTPHead(host: int64, path: int64): HTTPResponse {
+  var req: HTTPRequest;
+  req.method := HTTP_HEAD;
+  req.host := host;
+  req.path := path;
+  req.port := HTTP_PORT;
+  req.headers := 0;
+  req.body := 0;
+  req.bodySize := 0;
+  return HTTPSend(req);
+}
+
+// ============================================================================
+// WP-C6: Custom Header Builder
+// hdrs = 0 → neue mmap-Region; hdrs != 0 → anhängen und altes mmap freigeben.
+// Gibt neue Pufferadresse zurück. Caller muss HTTPHeadersFree() aufrufen.
+// ============================================================================
+
+pub fn HTTPSetHeader(hdrs: int64, name: int64, value: int64): int64 {
+  var nlen: int64 := http_strLen(name);
+  var vlen: int64 := http_strLen(value);
+  // WP-30: Name und Value dürfen kein CR/LF enthalten (Injection-Schutz)
+  if (http_hasCrLf(name, nlen) != 0) { return 0; }
+  if (http_hasCrLf(value, vlen) != 0) { return 0; }
+  // "Name: Value\r\n\0"
+  var addLen: int64 := nlen + 2 + vlen + 2;
+
+  var oldLen: int64 := 0;
+  if (hdrs != 0) { oldLen := http_strLen(hdrs); }
+
+  var newSize: int64 := oldLen + addLen + 1;
+  var newBuf: int64 := mmap(0, newSize, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (newBuf == 0) { return hdrs; }
+
+  var p: int64 := newBuf;
+  if (hdrs != 0) {
+    p := http_writeMem(p, hdrs, oldLen);
+    munmap(hdrs, oldLen + 1);
+  }
+  p := http_writeMem(p, name, nlen);
+  poke8(p, 58); poke8(p+1, 32); p := p + 2;
+  p := http_writeMem(p, value, vlen);
+  poke8(p, 13); poke8(p+1, 10); p := p + 2;
+  poke8(p, 0);
+  return newBuf;
+}
+
+pub fn HTTPHeadersFree(hdrs: int64) {
+  if (hdrs != 0) {
+    var len: int64 := http_strLen(hdrs);
+    munmap(hdrs, len + 1);
+  }
+}
+
+// WP-C6: Bearer-Token-Auth: fügt "Authorization: Bearer <token>\r\n" hinzu
+pub fn HTTPSetBearerToken(hdrs: int64, token: int64): int64 {
+  var tlen: int64 := http_strLen(token);
+  // "Authorization: Bearer " = 22 chars
+  var valBuf: int64 := mmap(0, tlen + 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (valBuf == 0) { return hdrs; }
+  var p: int64 := valBuf;
+  poke8(p,66);poke8(p+1,101);poke8(p+2,97);poke8(p+3,114);poke8(p+4,101);poke8(p+5,114);poke8(p+6,32);
+  p := p + 7;
+  p := http_writeMem(p, token, tlen);
+  poke8(p, 0);
+  var key: pchar := "Authorization"c;
+  var result: int64 := HTTPSetHeader(hdrs, key as int64, valBuf);
+  munmap(valBuf, tlen + 8);
+  return result;
+}
+
+// WP-C6: Basic-Auth: fügt "Authorization: Basic <base64(user:pass)>\r\n" hinzu
+fn http_b64char(v: int64): int64 {
+  if (v < 26) { return 65 + v; }
+  if (v < 52) { return 97 + v - 26; }
+  if (v < 62) { return 48 + v - 52; }
+  if (v == 62) { return 43; }
+  return 47;
+}
+
+pub fn HTTPSetBasicAuth(hdrs: int64, user: int64, pass: int64): int64 {
+  var ulen:    int64 := http_strLen(user);
+  var plen:    int64 := http_strLen(pass);
+  var credLen: int64 := ulen + 1 + plen;
+  var cred:    int64 := mmap(0, credLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var b64Len:  int64 := 0;
+  var b64Buf:  int64 := 0;
+  var bi:      int64 := 0;
+  var bo:      int64 := 0;
+  var b0:      int64 := 0;
+  var b1:      int64 := 0;
+  var b2:      int64 := 0;
+  var v:       int64 := 0;
+  var pad:     int64 := 0;
+  var val2Len: int64 := 0;
+  var val2:    int64 := 0;
+  var vp:      int64 := 0;
+  var result2: int64 := 0;
+  var key2:    pchar := "Authorization"c;
+  var cp:      int64 := 0;
+
+  if (cred == 0) { return hdrs; }
+  cp := cred;
+  cp := http_writeMem(cp, user, ulen);
+  poke8(cp, 58); cp := cp + 1;
+  cp := http_writeMem(cp, pass, plen);
+  poke8(cp, 0);
+
+  b64Len := ((credLen + 2) / 3) * 4;
+  b64Buf := mmap(0, b64Len + 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (b64Buf == 0) { munmap(cred, credLen + 1); return hdrs; }
+
+  while (bi < credLen) {
+    b0 := peek8(cred + bi) & 0xFF; bi := bi + 1;
+    b1 := 0; b2 := 0;
+    if (bi < credLen) { b1 := peek8(cred + bi) & 0xFF; bi := bi + 1; }
+    if (bi < credLen) { b2 := peek8(cred + bi) & 0xFF; bi := bi + 1; }
+    v := (b0 << 16) | (b1 << 8) | b2;
+    poke8(b64Buf + bo, http_b64char((v >> 18) & 63)); bo := bo + 1;
+    poke8(b64Buf + bo, http_b64char((v >> 12) & 63)); bo := bo + 1;
+    poke8(b64Buf + bo, http_b64char((v >>  6) & 63)); bo := bo + 1;
+    poke8(b64Buf + bo, http_b64char(v & 63));         bo := bo + 1;
+  }
+  pad := credLen - ((credLen / 3) * 3);
+  if (pad == 1) { poke8(b64Buf + bo - 1, 61); poke8(b64Buf + bo - 2, 61); }
+  if (pad == 2) { poke8(b64Buf + bo - 1, 61); }
+  poke8(b64Buf + bo, 0);
+
+  val2Len := 6 + b64Len;
+  val2 := mmap(0, val2Len + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (val2 != 0) {
+    poke8(val2,66);poke8(val2+1,97);poke8(val2+2,115);poke8(val2+3,105);poke8(val2+4,99);poke8(val2+5,32);
+    vp := val2 + 6;
+    vp := http_writeMem(vp, b64Buf, b64Len);
+    poke8(vp, 0);
+    result2 := HTTPSetHeader(hdrs, key2 as int64, val2);
+    munmap(val2, val2Len + 1);
+  } else {
+    result2 := hdrs;
+  }
+  munmap(cred, credLen + 1);
+  munmap(b64Buf, b64Len + 8);
+  return result2;
+}
+
+// ============================================================================
+// WP-C6: HTTPGetHeader — sucht Response-Header nach Name, gibt Wert zurück
+// Gibt 0 zurück wenn nicht gefunden. Rückgabe zeigt in headersRaw-Buffer.
+// ============================================================================
+pub fn HTTPGetHeader(resp: HTTPResponse, name: int64): int64 {
+  var nlen:   int64 := 0;
+  var hptr:   int64 := 0;
+  var hsize:  int64 := 0;
+  var hi:     int64 := 0;
+  var mfound: int64 := 0;
+  var mi:     int64 := 0;
+  var hc2:    int64 := 0;
+  var nc:     int64 := 0;
+  var next:   int64 := 0;
+  var vi:     int64 := 0;
+  if (resp.headersRaw == 0) { return 0; }
+  nlen := http_strLen(name);
+  hptr := resp.headersRaw;
+  hsize := resp.headersSize;
+  while (hi < hsize - nlen - 1) {
+    mfound := 1;
+    mi := 0;
+    while (mi < nlen) {
+      hc2 := peek8(hptr + hi + mi);
+      nc := peek8(name + mi);
+      if (hc2 >= 65 && hc2 <= 90) { hc2 := hc2 + 32; }
+      if (nc  >= 65 && nc  <= 90) { nc  := nc  + 32; }
+      if (hc2 != nc) { mfound := 0; mi := nlen; }
+      mi := mi + 1;
+    }
+    if (mfound != 0 && hi + nlen < hsize) {
+      next := peek8(hptr + hi + nlen);
+      if (next == 58) {
+        vi := hi + nlen + 1;
+        if (vi < hsize && peek8(hptr + vi) == 32) { vi := vi + 1; }
+        return hptr + vi;
+      }
+    }
+    hi := hi + 1;
+  }
+  return 0;
+}
+
+// ============================================================================
+// WP-C6: HTTPSendWithRedirects — automatisches 3xx-Redirect-Folgen (max 10)
+// Unterstützt HTTP→HTTP und HTTP→HTTPS-Redirects.
+// ============================================================================
+
+// Parst "http[s]://host[:port]/path" oder "/path" aus einem Location-Header.
+// Gibt 1 zurück wenn HTTPS, 0 wenn HTTP. Schreibt host\0 nach hostBuf, path\0 nach pathBuf.
+fn http_parseLocation(loc: int64, hostBuf: int64, pathBuf: int64, portOut: int64): int64 {
+  var isHttps: int64 := 0;
+  var p: int64 := loc;
+
+  // Absolut? "http://" oder "https://"
+  if (peek8(p)==104 && peek8(p+1)==116 && peek8(p+2)==116 && peek8(p+3)==112) {
+    p := p + 4;
+    if (peek8(p)==115) { isHttps := 1; p := p + 1; }
+    // skip "://"
+    if (peek8(p)==58) { p := p + 1; }
+    if (peek8(p)==47) { p := p + 1; }
+    if (peek8(p)==47) { p := p + 1; }
+    // Read host until '/' or ':' or end
+    var hi: int64 := 0;
+    var port: int64 := 0;
+    while (peek8(p + hi) != 0 && peek8(p + hi) != 47 && peek8(p + hi) != 58) {
+      poke8(hostBuf + hi, peek8(p + hi));
+      hi := hi + 1;
+    }
+    poke8(hostBuf + hi, 0);
+    // Port?
+    if (peek8(p + hi) == 58) {
+      hi := hi + 1;
+      while (peek8(p + hi) >= 48 && peek8(p + hi) <= 57) {
+        port := port * 10 + (peek8(p + hi) - 48);
+        hi := hi + 1;
+      }
+    }
+    if (port == 0) {
+      if (isHttps != 0) { port := 443; } else { port := 80; }
+    }
+    poke64(portOut, port);
+    p := p + hi;
+    // Path starts at '/' or default "/"
+    if (peek8(p) == 0) {
+      poke8(pathBuf, 47); poke8(pathBuf + 1, 0);  // "/"
+    } else {
+      var pi: int64 := 0;
+      while (peek8(p + pi) != 0) { poke8(pathBuf + pi, peek8(p + pi)); pi := pi + 1; }
+      poke8(pathBuf + pi, 0);
+    }
+  } else if (peek8(p) == 47) {
+    // Relative path — caller must keep host
+    poke64(portOut, 0);  // 0 = keep current host
+    var pi2: int64 := 0;
+    while (peek8(p + pi2) != 0) { poke8(pathBuf + pi2, peek8(p + pi2)); pi2 := pi2 + 1; }
+    poke8(pathBuf + pi2, 0);
+    poke8(hostBuf, 0);  // signal "keep host"
+  } else {
+    poke8(hostBuf, 0);
+    poke8(pathBuf, 47); poke8(pathBuf + 1, 0);
+    poke64(portOut, 0);
+  }
+  return isHttps;
+}
+
+// HTTPSendWithRedirects: sendet Request und folgt 3xx-Redirects automatisch.
+// Für HTTPS-Redirects wird TLS verwendet.
+pub fn HTTPSendWithRedirects(request: HTTPRequest): HTTPResponse {
+  var cur: HTTPRequest;
+  cur.method := request.method;
+  cur.host := request.host;
+  cur.path := request.path;
+  cur.port := request.port;
+  cur.headers := request.headers;
+  cur.body := request.body;
+  cur.bodySize := request.bodySize;
+
+  var hostBuf: int64 := mmap(0, 512, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var pathBuf: int64 := mmap(0, 2048, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var portBuf: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+
+  var hops: int64 := 0;
+  var resp: HTTPResponse;
+  resp.statusCode := 0; resp.statusText := 0; resp.headerCount := 0;
+  resp.contentLength := 0; resp.bodyPtr := 0; resp.bodySize := 0;
+  resp.headersRaw := 0; resp.headersSize := 0;
+
+  while (hops < HTTP_MAX_REDIRECTS) {
+    resp := HTTPSend(cur);
+    hops := hops + 1;
+
+    var sc: int64 := resp.statusCode;
+    // Follow 301, 302, 303, 307, 308
+    var isRedirect: int64 := 0;
+    if (sc == 301 || sc == 302 || sc == 303 || sc == 307 || sc == 308) {
+      isRedirect := 1;
+    }
+    if (isRedirect == 0) { hops := HTTP_MAX_REDIRECTS; }  // break
+    else {
+      // Get Location header
+      var loc: int64 := 0;
+      var locName: pchar := "Location"c;
+      loc := HTTPGetHeader(resp, locName as int64);
+      if (loc == 0) { hops := HTTP_MAX_REDIRECTS; }
+      else {
+        // Copy location value before freeing response (it points into headersRaw)
+        var locLen: int64 := http_strLen(loc);
+        var locCopy: int64 := mmap(0, locLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+        var lci: int64 := 0;
+        while (lci < locLen && peek8(loc + lci) != 13 && peek8(loc + lci) != 10 && peek8(loc + lci) != 0) {
+          poke8(locCopy + lci, peek8(loc + lci)); lci := lci + 1;
+        }
+        poke8(locCopy + lci, 0);
+
+        HTTPResponseFree(resp);
+        resp.statusCode := 0; resp.headersRaw := 0; resp.headersSize := 0;
+        resp.bodyPtr := 0; resp.bodySize := 0;
+
+        var isHttps: int64 := http_parseLocation(locCopy, hostBuf, pathBuf, portBuf);
+        munmap(locCopy, locLen + 1);
+
+        // Update cur with new host/path/port
+        var newPort: int64 := peek64(portBuf);
+        if (peek8(hostBuf) != 0) { cur.host := hostBuf; }
+        cur.path := pathBuf;
+        if (newPort != 0) { cur.port := newPort; }
+
+        // 303: downgrade to GET
+        if (sc == 303) {
+          cur.method := HTTP_GET;
+          cur.body := 0;
+          cur.bodySize := 0;
+        }
+
+        // HTTPS redirect: use TLS directly
+        if (isHttps != 0) {
+          var tctx: TLSContext := TLSInit();
+          if (tctx.initialized != 0) {
+            var tip: int64 := GetHostByName(cur.host);
+            if (tip != 0) {
+              var ttcp: TCPConn := TCPConnect(tip, cur.port);
+              if (ttcp.fd >= 0) {
+                var tconn: TLSConn := TLSConnect(tctx, ttcp.fd, cur.host);
+                if (tconn.connected != 0) {
+                  // Build and send request via TLS
+                  var treqBuf: int64 := HTTPRequestBuild(cur);
+                  if (treqBuf != 0) {
+                    var tallocSz: int64 := peek64(treqBuf);
+                    var treqSz: int64 := peek64(treqBuf + 8);
+                    TLSWrite(tconn, treqBuf + 16, treqSz);
+                    munmap(treqBuf, tallocSz);
+                    // Read TLS response
+                    var tbufSz: int64 := 16384;
+                    var tbuf: int64 := mmap(0, tbufSz, PROT_RW, MAP_ANON, FD_NONE, 0);
+                    var tn: int64 := TLSRead(tconn, tbuf, tbufSz - 1);
+                    if (tn > 0) {
+                      // Parse status
+                      var ti2: int64 := 0;
+                      while (ti2 < tn - 13) {
+                        if (peek8(tbuf+ti2)==72 && peek8(tbuf+ti2+1)==84 &&
+                            peek8(tbuf+ti2+2)==84 && peek8(tbuf+ti2+3)==80 &&
+                            peek8(tbuf+ti2+4)==47) {
+                          ti2 := ti2 + 9;
+                          resp.statusCode := (peek8(tbuf+ti2)-48)*100 + (peek8(tbuf+ti2+1)-48)*10 + (peek8(tbuf+ti2+2)-48);
+                          break;
+                        }
+                        ti2 := ti2 + 1;
+                      }
+                      // Find body
+                      var tbodyStart: int64 := 0;
+                      ti2 := 0;
+                      while (ti2 < tn - 4) {
+                        if (peek8(tbuf+ti2)==13 && peek8(tbuf+ti2+1)==10 &&
+                            peek8(tbuf+ti2+2)==13 && peek8(tbuf+ti2+3)==10) {
+                          tbodyStart := ti2 + 4; break;
+                        }
+                        ti2 := ti2 + 1;
+                      }
+                      // Store headers
+                      if (tbodyStart > 0) {
+                        var thdrLen: int64 := tbodyStart - 2;
+                        resp.headersRaw := mmap(0, thdrLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+                        if (resp.headersRaw != 0) {
+                          var thj: int64 := 0;
+                          while (thj < thdrLen) { poke8(resp.headersRaw + thj, peek8(tbuf + thj)); thj := thj + 1; }
+                          poke8(resp.headersRaw + thdrLen, 0);
+                          resp.headersSize := thdrLen;
+                        }
+                        var tbodyLen: int64 := tn - tbodyStart;
+                        if (tbodyLen > 0) {
+                          resp.bodyPtr := mmap(0, tbodyLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+                          if (resp.bodyPtr != 0) {
+                            var tbj: int64 := 0;
+                            while (tbj < tbodyLen) { poke8(resp.bodyPtr + tbj, peek8(tbuf + tbodyStart + tbj)); tbj := tbj + 1; }
+                            poke8(resp.bodyPtr + tbodyLen, 0);
+                            resp.bodySize := tbodyLen;
+                          }
+                        }
+                      }
+                    }
+                    munmap(tbuf, tbufSz);
+                  }
+                  TLSClose(tconn);
+                }
+                sys_close(ttcp.fd);
+              }
+            }
+            TLSFree(tctx);
+          }
+          hops := HTTP_MAX_REDIRECTS;  // done, HTTPS response collected
+        }
+      }
+    }
+  }
+
+  munmap(hostBuf, 512);
+  munmap(pathBuf, 2048);
+  munmap(portBuf, 8);
+  return resp;
+}
+
+// HTTPGetWithRedirects: GET + automatisches Redirect-Folgen
+pub fn HTTPGetWithRedirects(host: int64, path: int64): HTTPResponse {
+  var req: HTTPRequest;
+  req.method := HTTP_GET;
+  req.host := host;
+  req.path := path;
+  req.port := HTTP_PORT;
+  req.headers := 0;
+  req.body := 0;
+  req.bodySize := 0;
+  return HTTPSendWithRedirects(req);
+}
+
+// HTTPDeleteH: DELETE mit Custom-Headers
+pub fn HTTPDeleteH(host: int64, path: int64, headers: int64): HTTPResponse {
+  var req: HTTPRequest;
+  req.method := HTTP_DELETE;
+  req.host := host;
+  req.path := path;
+  req.port := HTTP_PORT;
+  req.headers := headers;
+  req.body := 0;
+  req.bodySize := 0;
+  return HTTPSend(req);
+}
+
+// HTTPGetH: GET mit Custom-Headers
+pub fn HTTPGetH(host: int64, path: int64, headers: int64): HTTPResponse {
+  var req: HTTPRequest;
+  req.method := HTTP_GET;
+  req.host := host;
+  req.path := path;
+  req.port := HTTP_PORT;
+  req.headers := headers;
+  req.body := 0;
+  req.bodySize := 0;
+  return HTTPSend(req);
+}
+
+// HTTPPostH: POST mit Custom-Headers
+pub fn HTTPPostH(host: int64, path: int64, body: int64, bodySize: int64, headers: int64): HTTPResponse {
+  var req: HTTPRequest;
+  req.method := HTTP_POST;
+  req.host := host;
+  req.path := path;
+  req.port := HTTP_PORT;
+  req.headers := headers;
   req.body := body;
   req.bodySize := bodySize;
   return HTTPSend(req);

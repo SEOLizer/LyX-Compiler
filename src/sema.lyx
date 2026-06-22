@@ -7,6 +7,8 @@
 
 import src.parser;
 import src.std.alloc;
+import src.std.io;
+import src.error_collector;  // WP-KI-02
 import src.security.capabilities;
 import src.security.capability_resolver;
 import src.security.cap_graph;
@@ -80,6 +82,7 @@ pub con TY_RANGE:      int64 := 26;  // range type: 1..100
 pub con TY_PCHAR_NULLABLE: int64 := 27;  // pchar? — optional pointer, null-safe
 pub con TY_RING_BUFFER:    int64 := 28;  // WP-BC-17: RingBuffer<T> lock-free ring buffer
 pub con TY_PARALLEL_ARRAY: int64 := 29;  // WP-BC-18: parallel Array<T> SIMD vector
+pub con TY_TUPLE:          int64 := 30;  // WP-04: [T, T] tuple return type
 
 // Local copies of parser constants to avoid import-resolution issues
 // inside Sema class methods (compiler limitation: imported constants from
@@ -158,6 +161,7 @@ con SNK_AT_DIRECTIVE:    int64 := 104; // @io_check/@overflow_check: iv=kind(0/1
 con SNK_AT_ENERGY:       int64 := 105; // WP-EN-02: @energy(N) — iv=level(1-5)
 con SNK_DEFER:           int64 := 106; // WP-AS-07: defer Stmt; c0=deferred statement
 con SNK_FOR_RANGE:       int64 := 107; // WP-1.1-A: for i in range([start,] stop) { }
+con SNK_TYPE_TUPLE:      int64 := 109; // WP-04: [T, T] tuple return type node
 
 // WP-L2/L3: LCBS Capability-AST-Knoten (Kopien von NK_* aus parser.lyx)
 con SNK_CAPABILITY_ATTR:   int64 := 110; // @capabilities([...]) — c0=first CAPABILITY_DECL; iVal=1 → dynamic
@@ -322,6 +326,12 @@ pub type Sema = class {
   includePath: int64;  // extra include dir (pchar), 0 = not set
   stdPath:     int64;  // stdlib root override (pchar), 0 = not set
 
+  // WP-35: actual byte count of the last file read by _sema_readFile (binary-safe, no StrLen)
+  lastReadSize: int64;
+
+  // WP-KM-01: --target=lyxos-kernel: 1 = reject POSIX-dependent imports
+  kernelMode: int64;
+
   // WP-BC-46: verbose type-inference diagnostics
   typeReasoning: bool;  // --type-reasoning: log each resolved type
   constraintLog: bool;  // --constraint-log: log each type constraint
@@ -348,6 +358,9 @@ pub type Sema = class {
   // WP-EN-03: @energy top-level directive state
   energyLevel: int64;  // 0=not set, 1-5=active
 
+  // LX-36: @lifecycle annotation state
+  lifecycleKind: int64;  // LBF_LC_ONE_SHOT=0 (default), EVENT_LOOP=1, DAEMON=2, REACTIVE=3
+
   // WP-L3: Capability-Vererbung
   currModuleCaps:  CapSet;  // C(P) des aktuellen Moduls (aus @capabilities auf main/module)
   importCapCache:  int64;   // ptr: (nameHash:8, capSetPtr:8) Paare
@@ -373,6 +386,12 @@ pub type Sema = class {
   // Pending-Annotations vor der nächsten Funktionsdeklaration
   pendingCapNode:  int64;   // letztes NK_CAPABILITY_ATTR vor NK_FUNC_DECL
   pendingUccNode:  int64;   // letztes NK_USES_CALLER_CAP vor NK_FUNC_DECL
+
+  // BUG-3: current source file path for error messages (null = root module)
+  curFile: pchar;
+
+  // WP-KI-02: pointer to ErrorCollector (0 = text mode, ≠0 = --error-json mode)
+  errColl: int64;
 
   // ------------------------------------------------------------------
   // Node access helpers
@@ -504,11 +523,21 @@ pub type Sema = class {
   // ------------------------------------------------------------------
 
   fn _error(msg: pchar, line: int64) {
-    PrintStr("sema error (line ");
-    PrintInt(line);
-    PrintStr("): ");
-    PrintStr(msg);
-    PrintStr("\n");
+    if self.errColl != 0 {
+      // WP-KI-02: route to ErrorCollector instead of text output
+      var ec: ErrorCollector := self.errColl as ErrorCollector;
+      ec.EcAdd(1, 0, self.curFile, line, msg);
+    } else {
+      if self.curFile != 0 as pchar {
+        PrintStr(self.curFile);
+        PrintStr(": ");
+      }
+      PrintStr("sema error (line ");
+      PrintInt(line);
+      PrintStr("): ");
+      PrintStr(msg);
+      PrintStr("\n");
+    }
     self.hadError   := 1;
     self.errorCount := self.errorCount + 1;
   }
@@ -522,6 +551,42 @@ pub type Sema = class {
     self._error(msg, line);
   }
 
+  fn _errorNodeName(msg: pchar, ni: int64, name: pchar, nameLen: int64) {
+    var tokIdx: int64 := self.sn_tokIdx(ni);
+    var line: int64 := 0;
+    if (tokIdx >= 0 && tokIdx < self.pTokCount) {
+      line := self.sn_tokLine(tokIdx);
+    }
+    if self.errColl != 0 {
+      // WP-KI-02: build combined message "msg 'name'" and route to collector
+      var mlen: int64 := StrLen(msg);
+      var tbuf: int64 := alloc(mlen + nameLen + 5);
+      memcpy(tbuf, msg as int64, mlen);
+      poke8(tbuf + mlen,     32);  // space
+      poke8(tbuf + mlen + 1, 39);  // '
+      memcpy(tbuf + mlen + 2, name as int64, nameLen);
+      poke8(tbuf + mlen + 2 + nameLen,     39);  // '
+      poke8(tbuf + mlen + 2 + nameLen + 1, 0);   // NUL
+      var ec: ErrorCollector := self.errColl as ErrorCollector;
+      ec.EcAdd(1, 0, self.curFile, line, tbuf as pchar);
+      free(tbuf, mlen + nameLen + 5);
+    } else {
+      if self.curFile != 0 as pchar {
+        PrintStr(self.curFile);
+        PrintStr(": ");
+      }
+      PrintStr("sema error (line ");
+      PrintInt(line);
+      PrintStr("): ");
+      PrintStr(msg);
+      PrintStr(" '");
+      sys_write(1, name as int64, nameLen);
+      PrintStr("'\n");
+    }
+    self.hadError   := 1;
+    self.errorCount := self.errorCount + 1;
+  }
+
   // WP-AS-15: emit a warning (does not increment errorCount)
   fn _warnNode(msg: pchar, ni: int64) {
     var tokIdx: int64 := self.sn_tokIdx(ni);
@@ -529,10 +594,15 @@ pub type Sema = class {
     if (tokIdx >= 0 && tokIdx < self.pTokCount) {
       line := self.sn_tokLine(tokIdx);
     }
-    PrintStr("warning(line "c);
-    PrintInt(line);
-    PrintStr("): "c);
-    PrintStrLn(msg);
+    if self.errColl != 0 {
+      var ec: ErrorCollector := self.errColl as ErrorCollector;
+      ec.EcAdd(1, 1, self.curFile, line, msg);
+    } else {
+      PrintStr("warning(line "c);
+      PrintInt(line);
+      PrintStr("): "c);
+      PrintStrLn(msg);
+    }
   }
 
   // WP-2.2-A: Print a non-NUL-terminated source substring (for error messages).
@@ -584,6 +654,8 @@ pub type Sema = class {
     if (k == SNK_TYPE_RINGBUF) { return TY_RING_BUFFER; }
     // WP-BC-18: parallel Array<T> type
     if (k == SNK_TYPE_PARALLEL) { return TY_PARALLEL_ARRAY; }
+    // WP-04: Tuple return type [T, T, ...]
+    if (k == SNK_TYPE_TUPLE) { return TY_TUPLE; }
     // WP-13: Function pointer type
     if (k == SNK_FN_PTR) { return TY_FN_PTR; }
     // WP-14: Type parameter (T, U, etc.)
@@ -599,13 +671,13 @@ pub type Sema = class {
     if (self._strNEq(nm, nl, "int32",   5)) { return TY_INT32;   }
     if (self._strNEq(nm, nl, "int16",   5)) { return TY_INT16;   }
     if (self._strNEq(nm, nl, "int8",    4)) { return TY_INT8;    }
-    if (self._strNEq(nm, nl, "u64",     4)) { return TY_UINT64;  }
-    if (self._strNEq(nm, nl, "u32",     4)) { return TY_UINT32;  }
-    if (self._strNEq(nm, nl, "u16",     4)) { return TY_UINT16;  }
-    if (self._strNEq(nm, nl, "u8",      3)) { return TY_UINT8;   }
+    if (self._strNEq(nm, nl, "u64",     3)) { return TY_UINT64;  }
+    if (self._strNEq(nm, nl, "u32",     3)) { return TY_UINT32;  }
+    if (self._strNEq(nm, nl, "u16",     3)) { return TY_UINT16;  }
+    if (self._strNEq(nm, nl, "u8",      2)) { return TY_UINT8;   }
     if (self._strNEq(nm, nl, "pchar",   5)) { return TY_PCHAR;   }
-    if (self._strNEq(nm, nl, "f64",     4)) { return TY_FLOAT64; }
-    if (self._strNEq(nm, nl, "f32",     4)) { return TY_FLOAT32; }
+    if (self._strNEq(nm, nl, "f64",     3)) { return TY_FLOAT64; }
+    if (self._strNEq(nm, nl, "f32",     3)) { return TY_FLOAT32; }
     if (self._strNEq(nm, nl, "char",    4)) { return TY_CHAR;    }
     // Look up user-defined type (struct / enum / type alias)
     var si: int64 := self.Lookup(nm, nl);
@@ -613,8 +685,7 @@ pub type Sema = class {
       var sk: int64 := self.SymKind(si);
       if (sk == SYM_STRUCT || sk == SYM_ENUM || sk == SYM_TYPE) { return TY_USER; }
     }
-    // Unknown name: treat as imported class type (for bootstrap, assume valid)
-    return TY_USER;
+    return TY_UNKNOWN;
   }
 
   // ------------------------------------------------------------------
@@ -685,11 +756,18 @@ pub type Sema = class {
     }
     var size: int64 := lseek(fd, 0, 2);
     if (size <= 0) { close(fd); return 0 as pchar; }
+    // WP-31: Dateigrößen-Limit 256 MB — verhindert OOM durch präparierte .lyu/.lyx-Eingaben
+    if (size > 268435456) {
+      PrintStr("error: _sema_readFile: Unit überschreitet 256-MB-Limit\n"c);
+      close(fd); return 0 as pchar;
+    }
     lseek(fd, 0, 0);
     var buf: int64 := alloc(size + 1);
-    read(fd, buf as pchar, size);
+    var bytesRead: int64 := read(fd, buf as pchar, size);
+    if bytesRead != size { close(fd); return 0 as pchar; }  // WP-27: partieller Read → Fehler
     poke8(buf + size, 0);
     close(fd);
+    self.lastReadSize := size;  // WP-35: expose actual byte count for binary-safe callers
     return buf as pchar;
   }
 
@@ -701,36 +779,58 @@ pub type Sema = class {
     if ((StrCharAt(data, 1) & 255) != 89) { return; }
     if ((StrCharAt(data, 2) & 255) != 85) { return; }
     var pos: int64 := 4;  // skip magic (4 bytes)
+    if pos + 4 > size { return; }
     var version: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
     pos := pos + 2;  // version
     pos := pos + 1;  // arch
     pos := pos + 1;  // flags
     // unit name
+    if pos + 2 > size { return; }
     var ulen: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+    if pos + 2 + ulen > size { return; }
     pos := pos + 2 + ulen;
     // v2 metadata: description, author, copyright
     if (version >= 2) {
+      if pos + 2 > size { return; }
       var dl: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+      if pos + 2 + dl > size { return; }
       pos := pos + 2 + dl;
+      if pos + 2 > size { return; }
       var al: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+      if pos + 2 + al > size { return; }
       pos := pos + 2 + al;
+      if pos + 2 > size { return; }
       var cl: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+      if pos + 2 + cl > size { return; }
       pos := pos + 2 + cl;
     }
+    if pos + 4 > size { return; }
     var symCount: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8) | ((StrCharAt(data, pos+2) & 255) << 16) | ((StrCharAt(data, pos+3) & 255) << 24);
     pos := pos + 4;
+    // WP-35: reject crafted .lyu files with absurdly large symCount (prevents OOM)
+    if symCount > 65536 {
+      EPrintStrLn("sema error: .lyu symCount unreasonably large — möglicherweise manipulierte Datei"c);
+      return;
+    }
+    if pos + 16 > size { return; }
     pos := pos + 16;  // skip 4 × u32 offset placeholders
     // Inject each exported symbol into the current sema scope
     var si: int64 := 0;
     while (si < symCount && pos < size) {
+      if pos + 2 > size { return; }
       var nameLen: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+      if pos + 2 + nameLen > size { return; }
       pos := pos + 2;
       var namePtr: pchar := (data as int64 + pos) as pchar;
       pos := pos + nameLen;
+      if pos + 1 > size { return; }
       var lsk: int64 := StrCharAt(data, pos) & 255;
       pos := pos + 1;
+      if pos + 4 > size { return; }
       pos := pos + 4;  // skip typeHash (u32)
+      if pos + 2 > size { return; }
       var tiLen: int64 := (StrCharAt(data, pos) & 255) | ((StrCharAt(data, pos+1) & 255) << 8);
+      if pos + 2 + tiLen > size { return; }
       pos := pos + 2;
       var tiPtr: pchar := (data as int64 + pos) as pchar;
       pos := pos + tiLen;
@@ -757,19 +857,82 @@ pub type Sema = class {
     }
   }
 
+  // WP-KM-01: length-aware exact match (modName slice vs null-terminated literal).
+  fn _sema_kmEq(a: pchar, aLen: int64, b: pchar): int64 {
+    var bLen: int64 := StrLen(b);
+    if aLen != bLen { return 0; }
+    var i: int64 := 0;
+    while i < aLen {
+      if (StrCharAt(a, i) & 255) != (StrCharAt(b, i) & 255) { return 0; }
+      i := i + 1;
+    }
+    return 1;
+  }
+
+  // WP-KM-01: length-aware prefix match (modName slice starts with null-terminated literal).
+  fn _sema_kmPfx(a: pchar, aLen: int64, b: pchar): int64 {
+    var bLen: int64 := StrLen(b);
+    if aLen < bLen { return 0; }
+    var i: int64 := 0;
+    while i < bLen {
+      if (StrCharAt(a, i) & 255) != (StrCharAt(b, i) & 255) { return 0; }
+      i := i + 1;
+    }
+    return 1;
+  }
+
+  // WP-KM-01: returns 1 if modName[0..modLen] is a POSIX import forbidden in kernel mode.
+  fn _sema_isKernelForbidden(modName: pchar, modLen: int64): int64 {
+    // WP-28: std.net.* — Allowlist-Ansatz: alles blockiert, nur 5 reine Frame-Units erlaubt
+    if self._sema_kmEq(modName, modLen, "std.net"c) != 0 { return 1; }
+    if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
+      if self._sema_kmEq(modName, modLen, "std.net.eth"c)        != 0 { return 0; }
+      if self._sema_kmEq(modName, modLen, "std.net.ipv4"c)       != 0 { return 0; }
+      if self._sema_kmEq(modName, modLen, "std.net.udp"c)        != 0 { return 0; }
+      if self._sema_kmEq(modName, modLen, "std.net.arp.frame"c)  != 0 { return 0; }
+      if self._sema_kmEq(modName, modLen, "std.net.dhcp.frame"c) != 0 { return 0; }
+      return 1;
+    }
+    // std.fs.*, std.thread.*, std.os.*, std.io.* — alle verboten
+    if self._sema_kmEq(modName, modLen, "std.fs"c)        != 0 { return 1; }
+    if self._sema_kmPfx(modName, modLen, "std.fs."c)      != 0 { return 1; }
+    if self._sema_kmEq(modName, modLen, "std.thread"c)    != 0 { return 1; }
+    if self._sema_kmPfx(modName, modLen, "std.thread."c)  != 0 { return 1; }
+    if self._sema_kmEq(modName, modLen, "std.os"c)        != 0 { return 1; }
+    if self._sema_kmPfx(modName, modLen, "std.os."c)      != 0 { return 1; }
+    if self._sema_kmEq(modName, modLen, "std.io"c)        != 0 { return 1; }
+    if self._sema_kmPfx(modName, modLen, "std.io."c)      != 0 { return 1; }
+    return 0;
+  }
+
   fn _sema_processImport(modName: pchar, modLen: int64) {
     if (self._sema_hasImported(modName, modLen) != 0) { return; }
     self._sema_markImported(modName, modLen);
 
-    // WP-7: ".." als Modulkomponente verbieten ("..foo.bar" → "../foo/bar.lyx")
+    // WP-7a: ".." als Modulkomponente verbieten ("..foo.bar" → "../foo/bar.lyx")
+    // WP-33: `wptd + 1 < modLen` avoids underflow when modLen == 0
     var wptd: int64 := 0;
-    while wptd < modLen - 1 {
-      if (StrCharAt(modName, wptd) & 255) == 46 && (StrCharAt(modName, wptd + 1) & 255) == 46 {
+    while wptd + 1 < modLen {
+      if ((StrCharAt(modName, wptd) & 255) == 46 && (StrCharAt(modName, wptd + 1) & 255) == 46) {
         EPrintStr("sema error: import path traversal verboten: "c);
         EPrintStrLn(modName);
+        self.hadError   := 1;
+        self.errorCount := self.errorCount + 1;
         return;
       }
       wptd := wptd + 1;
+    }
+
+    // WP-KM-01: kernel mode — reject POSIX-dependent imports
+    if self.kernelMode != 0 {
+      if self._sema_isKernelForbidden(modName, modLen) != 0 {
+        EPrintStr("kernel error: POSIX import verboten in --target=lyxos-kernel: "c);
+        sys_write(2, modName as int64, modLen);
+        EPrintStr("\n"c);
+        self.hadError   := 1;
+        self.errorCount := self.errorCount + 1;
+        return;
+      }
     }
 
     // Convert "bootstrap.mathlib" → "bootstrap/mathlib.lyx"
@@ -792,7 +955,8 @@ pub type Sema = class {
       var lyuPath: pchar := pathBuf as pchar;
       var lyuSrc: pchar := self._sema_readFile(lyuPath);
       if (lyuSrc != 0 as pchar) {
-        var lyuSize: int64 := StrLen(lyuSrc);
+        // WP-35: use actual file size (not StrLen) — .lyu is binary and contains null bytes
+        var lyuSize: int64 := self.lastReadSize;
         self._sema_parseLyuSyms(lyuSrc, lyuSize);
       }
       return;
@@ -801,13 +965,27 @@ pub type Sema = class {
     var p: Parser := new Parser();
     p.Init(src, StrLen(src));
     var head: int64 := p.Parse();
-    if (p.hadError != 0) { dispose p; return; }
+    if (p.hadError != 0) {
+      PrintStr("sema error: parse error in imported module '"c);
+      sys_write(1, modName as int64, modLen);
+      PrintStr("'\n"c);
+      self.hadError   := 1;
+      self.errorCount := self.errorCount + 1;
+      dispose p;
+      return;
+    }
 
     // WP-L6: Caps ZUERST extrahieren (vor Pass1) für Pruning-Entscheidung
-    var savedSrc:   pchar := self.src;
-    var savedNodes: int64 := self.pNodes;
-    self.src    := p.src;
-    self.pNodes := p.nodes;
+    var savedSrc:      pchar := self.src;
+    var savedNodes:    int64 := self.pNodes;
+    var savedToks:     int64 := self.pToks;
+    var savedTokCount: int64 := self.pTokCount;
+    var savedCurFile:  pchar := self.curFile;
+    self.src       := p.src;
+    self.pNodes    := p.nodes;
+    self.pToks     := p.toks;
+    self.pTokCount := p.tokCount;
+    self.curFile   := path;
 
     // @capabilities extrahieren (für WP-L3 Cache und WP-L4 Graph)
     var importedCaps: CapSet := new CapSet();
@@ -849,8 +1027,11 @@ pub type Sema = class {
       memcpy(nameCopy, modName as int64, modLen);
       poke8(nameCopy + modLen, 0);
       self.capStripper.AddStripped(nameCopy as pchar, modLen);
-      self.src    := savedSrc;
-      self.pNodes := savedNodes;
+      self.src       := savedSrc;
+      self.pNodes    := savedNodes;
+      self.pToks     := savedToks;
+      self.pTokCount := savedTokCount;
+      self.curFile   := savedCurFile;
       dispose p;
       return;
     }
@@ -900,8 +1081,14 @@ pub type Sema = class {
       }
     }
 
-    self.src    := savedSrc;
-    self.pNodes := savedNodes;
+    // BUG-3: type-check function bodies in imported module
+    self.Pass2(head);
+
+    self.src       := savedSrc;
+    self.pNodes    := savedNodes;
+    self.pToks     := savedToks;
+    self.pTokCount := savedTokCount;
+    self.curFile   := savedCurFile;
 
     dispose p;
   }
@@ -920,6 +1107,47 @@ pub type Sema = class {
     var initNi: int64 := self.sn_c1(nodeIdx);
     if (initNi < 0) { return 0; }
     return self._evalConstExpr(initNi);
+  }
+
+  // BUG-5: compute compile-time size of a class or struct by name
+  fn _sizeofType(name: pchar, nlen: int64): int64 {
+    if self._strNEq(name, nlen, "int64"c, 5) { return 8; }
+    if self._strNEq(name, nlen, "bool"c,  4) { return 8; }
+    if self._strNEq(name, nlen, "f64"c,   3) { return 8; }
+    if self._strNEq(name, nlen, "pchar"c, 5) { return 8; }
+    var si: int64 := self.Lookup(name, nlen);
+    if si < 0 { return 8; }
+    var nodeIdx: int64 := self.SymNodeIdx(si);
+    if nodeIdx < 0 { return 8; }
+    var kk: int64 := self.sn_kind(nodeIdx);
+    if kk == SNK_TYPE_DECL {
+      var fieldCnt: int64 := 0;
+      var tmp: int64 := self.sn_c0(nodeIdx);
+      while tmp >= 0 {
+        if self.sn_kind(tmp) == 7 { fieldCnt := fieldCnt + 1; }
+        tmp := self.sn_next(tmp);
+      }
+      var vmtSlots: int64 := 0;
+      var mth: int64 := self.sn_c1(nodeIdx);
+      while mth >= 0 {
+        if self.sn_kind(mth) == SNK_FUNC_DECL {
+          if ((self.sn_iVal(mth) >> 1) & 1) != 0 { vmtSlots := vmtSlots + 1; }
+        }
+        mth := self.sn_next(mth);
+      }
+      if vmtSlots > 0 { return (fieldCnt + 1) * 8; }
+      return fieldCnt * 8;
+    }
+    if kk == SNK_STRUCT_DECL {
+      var fieldCnt: int64 := 0;
+      var tmp: int64 := self.sn_c0(nodeIdx);
+      while tmp >= 0 {
+        if self.sn_kind(tmp) == 7 { fieldCnt := fieldCnt + 1; }
+        tmp := self.sn_next(tmp);
+      }
+      return fieldCnt * 8;
+    }
+    return 8;
   }
 
   fn _evalConstExpr(ni: int64): int64 {
@@ -959,6 +1187,16 @@ pub type Sema = class {
       if (bop == 82) { if (lv <= rv) { return 1; } else { return 0; } }  // TK_LE  <=
       if (bop == 83) { if (lv > rv)  { return 1; } else { return 0; } }  // TK_GT  >
       if (bop == 84) { if (lv >= rv) { return 1; } else { return 0; } }  // TK_GE  >=
+      return 0;
+    }
+    if (k == SNK_CALL) {
+      // sizeof(TypeName) is a compile-time constant (BUG-5)
+      if self._strNEq(self.sn_sVal(ni), self.sn_sLen(ni), "sizeof"c, 6) {
+        var argNi: int64 := self.sn_c0(ni);
+        if argNi >= 0 {
+          return self._sizeofType(self.sn_sVal(argNi), self.sn_sLen(argNi));
+        }
+      }
       return 0;
     }
     self._errorNode("@if: non-constant expression in condition", ni);
@@ -1054,7 +1292,7 @@ pub type Sema = class {
       }
       var si: int64 := self.Lookup(nm, nl);
       if (si < 0) {
-        self._errorNode("undefined symbol", ni);
+        self._errorNodeName("undefined symbol", ni, nm, nl);
       }
 
     } else if (k == SNK_CALL) {
@@ -1070,7 +1308,7 @@ pub type Sema = class {
         var nl: int64 := self.sn_sLen(ni);
         var si: int64 := self.Lookup(nm, nl);
         if (si < 0) {
-          self._errorNode("undefined function", ni);
+          self._errorNodeName("undefined function", ni, nm, nl);
         } else {
           // WP-L7: Caller-Cap-Prüfung für @uses_caller_cap-annotierte Funktionen
           self._checkCallerCap(ni, nm, nl);
@@ -1118,7 +1356,7 @@ pub type Sema = class {
           while (classFld >= 0) {
             if (self._strNEq(fldName, fldLen, self.sn_sVal(classFld), self.sn_sLen(classFld)) != 0) {
               var vis: int64 := (self.sn_iVal(classFld) >> 4) & 3;
-              if (vis == 2) { self._errorNode("private field not accessible", ni); }
+              if (vis == 2) { self._errorNodeName("private field not accessible", ni, fldName, fldLen); }
               break;
             }
             classFld := self.sn_next(classFld);
@@ -1135,7 +1373,7 @@ pub type Sema = class {
         var newNi: int64 := self.SymNodeIdx(newSym);
         if (newNi >= 0) {
           var classAbstract: int64 := self.sn_iVal(newNi) & 1;
-          if (classAbstract != 0) { self._errorNode("cannot instantiate abstract class", ni); }
+          if (classAbstract != 0) { self._errorNodeName("cannot instantiate abstract class", ni, newName, newLen); }
         }
       }
       // Check constructor arguments (child0 = first arg)
@@ -1152,19 +1390,19 @@ pub type Sema = class {
       }
 
     } else if (k == SNK_CLOSURE) {
-      // WP-13: Closure expression — check captured vars and body
-      // c0 = function reference, c1 = captured vars list, c2 = body
-      var fnRef: int64 := self.sn_c0(ni);
-      if (fnRef >= 0) { self._checkExpr(fnRef); }
-      // Check captured variable references
-      var capVar: int64 := self.sn_c1(ni);
-      while (capVar >= 0) {
-        self._checkExpr(capVar);
-        capVar := self.sn_next(capVar);
+      // WP-02: anonymous function expression: fn(params): rettype { body }
+      // c0 = param list, c1 = return type, c2 = body block
+      self._pushScope();
+      var param: int64 := self.sn_c0(ni);
+      while (param >= 0) {
+        var typeNi: int64 := self.sn_c0(param);
+        var tid: int64 := self.ResolveType(typeNi);
+        self._pushSym(self.sn_sVal(param), self.sn_sLen(param), SYM_PARAM, tid, param);
+        param := self.sn_next(param);
       }
-      // Check closure body
       var body: int64 := self.sn_c2(ni);
       if (body >= 0) { self._checkStmt(body); }
+      self._popScope();
 
     } else if (k == SNK_FN_PTR) {
       // Function pointer literal — check function reference
@@ -1174,7 +1412,7 @@ pub type Sema = class {
         var nl: int64 := self.sn_sLen(fnRef);
         var si: int64 := self.Lookup(nm, nl);
         if (si < 0) {
-          self._errorNode("undefined function for fn ptr", ni);
+          self._errorNodeName("undefined function for fn ptr", ni, nm, nl);
         } else {
           self._checkFnPtrUcc(fnRef);  // WP-L7: Warnung bei UCC-annotierten Fn-Ptr
         }
@@ -1275,11 +1513,15 @@ pub type Sema = class {
       self._popScope();
 
     } else if (k == SNK_VAR_DECL) {
+      // BUG-8: reject 'self' as a variable name (reserved keyword in class methods)
+      if self._strNEq(self.sn_sVal(ni), self.sn_sLen(ni), "self"c, 4) {
+        self._errorNode("'self' is a reserved keyword and cannot be used as a variable name", ni);
+      }
       var typeNi: int64 := self.sn_c0(ni);
       var initNi: int64 := self.sn_c1(ni);
       var tid: int64 := self.ResolveType(typeNi);
       if (tid == TY_UNKNOWN) {
-        self._errorNode("unknown type in var decl", ni);
+        self._errorNodeName("unknown type in var decl", ni, self.sn_sVal(typeNi), self.sn_sLen(typeNi));
       }
       self._logReason("var-decl", ni, tid);
       if (initNi >= 0) {
@@ -1306,7 +1548,7 @@ pub type Sema = class {
         if (si >= 0 && self.SymKind(si) == SYM_PARAM) {
           var paramNi: int64 := self.SymNodeIdx(si);
           if (paramNi >= 0 && (self.sn_iVal(paramNi) & SEMA_PARAM_FLAG_CON) != 0) {
-            self._errorNode("assignment to con-parameter not allowed", ni);
+            self._errorNodeName("assignment to con-parameter not allowed", ni, self.sn_sVal(lval), self.sn_sLen(lval));
           }
         }
       }
@@ -1320,9 +1562,29 @@ pub type Sema = class {
       self._checkExpr(self.sn_c0(ni));
 
     } else if (k == SNK_IF) {
-      self._checkExpr(self.sn_c0(ni));   // condition
-      self._checkStmt(self.sn_c1(ni));   // then-block
-      self._checkStmt(self.sn_c2(ni));   // else-block (or -1)
+      var ifCondNi: int64 := self.sn_c0(ni);
+      // R2: dead-branch elimination — if condition is a compile-time constant
+      // (e.g. TARGET_WINDOWS, TARGET_LINUX), only check the live branch.
+      var ifFolded: int64 := 0;
+      if self.sn_kind(ifCondNi) == SNK_IDENT {
+        var ifNm: pchar := self.sn_sVal(ifCondNi);
+        var ifNl: int64 := self.sn_sLen(ifCondNi);
+        var ifSi: int64 := self.Lookup(ifNm, ifNl);
+        if ifSi >= 0 && self.SymKind(ifSi) == SYM_CON {
+          var ifCv: int64 := self._lookupConst(ifNm, ifNl);
+          if ifCv != 0 {
+            self._checkStmt(self.sn_c1(ni));
+          } else {
+            self._checkStmt(self.sn_c2(ni));
+          }
+          ifFolded := 1;
+        }
+      }
+      if ifFolded == 0 {
+        self._checkExpr(ifCondNi);
+        self._checkStmt(self.sn_c1(ni));
+        self._checkStmt(self.sn_c2(ni));
+      }
 
     } else if (k == SNK_WHILE) {
       self._checkExpr(self.sn_c0(ni));   // condition
@@ -1448,10 +1710,10 @@ pub type Sema = class {
           var variantSym: int64 := self.Lookup(variantName, variantLen);
           if (variantSym >= 0) {
             if (self.SymKind(variantSym) != SYM_CON) {
-              self._errorNode("enum pattern: not a valid enum variant"c, patNode);
+              self._errorNodeName("enum pattern: not a valid enum variant"c, patNode, variantName, variantLen);
             }
           } else {
-            self._errorNode("enum pattern: variant not found"c, patNode);
+            self._errorNodeName("enum pattern: variant not found"c, patNode, variantName, variantLen);
           }
         } else if (patKind == SNK_PATTERN_STRUCT) {
           var structTypeName: pchar := self.sn_sVal(patNode);
@@ -1460,10 +1722,10 @@ pub type Sema = class {
           if (structSym >= 0) {
             var structSymKind: int64 := self.SymKind(structSym);
             if (structSymKind != SYM_STRUCT && structSymKind != SYM_TYPE) {
-              self._errorNode("struct pattern: not a struct type"c, patNode);
+              self._errorNodeName("struct pattern: not a struct type"c, patNode, structTypeName, structTypeLen);
             }
           } else {
-            self._errorNode("struct pattern: type not found"c, patNode);
+            self._errorNodeName("struct pattern: type not found"c, patNode, structTypeName, structTypeLen);
           }
           var fieldPat: int64 := self.sn_c0(patNode);
           while (fieldPat >= 0) { self._checkStmt(fieldPat); fieldPat := self.sn_next(fieldPat); }
@@ -1535,7 +1797,7 @@ pub type Sema = class {
       self._checkExpr(self.sn_c0(ni));
       var checkType: int64 := self.ResolveType(self.sn_c1(ni));
       if (checkType == TY_UNKNOWN) {
-        self._errorNode("unknown type in is expression", ni);
+        self._errorNodeName("unknown type in is expression", ni, self.sn_sVal(self.sn_c1(ni)), self.sn_sLen(self.sn_c1(ni)));
       }
     // WP-17: Range expression (1..100)
     // WP-BC-13: format expression expr:width[:decimals]
@@ -1893,6 +2155,7 @@ pub type Sema = class {
 
   // WP-L5: Prüft extern fn-Deklarationen auf FFI-Sicherheitsklasse.
   // Wird in _checkFuncDecl aufgerufen wenn iVal & 1 == 1 und c3 != -1 (extern fn).
+  // SEC-BUG-01: Prüft zusätzlich das link-Zielsymbol gegen Blacklist (Aliasing-Schutz).
   fn _checkExternFn(ni: int64): void {
     var iVal:    int64 := self.sn_iVal(ni);
     var name:    pchar := self.sn_sVal(ni);
@@ -1920,6 +2183,23 @@ pub type Sema = class {
       }
     }
 
+    // SEC-BUG-01: link-Zielsymbol gegen Blacklist prüfen (c3 = linkLen<<32 | linkOff).
+    // Verhindert: extern fn safe_name(...) link "system"; — Lyx-Name wäre nicht geblockt.
+    var c3val: int64 := self.sn_c3(ni);
+    if c3val != -1 {
+      var linkOff: int64 := c3val & 0x00000000FFFFFFFF;
+      var linkLen: int64 := (c3val >> 32) & 0x00000000FFFFFFFF;
+      var linkName: pchar := self.src + linkOff;
+      if ffi_isLinkTargetBlacklisted(linkName, linkLen) {
+        self._errorNode(ffi_linkAliasMsg(), ni);
+        return;
+      }
+      if ffi_isLinkTargetFormatString(linkName, linkLen) && !hasFormatCap {
+        self._errorNode(ffi_linkFormatAliasMsg(), ni);
+        return;
+      }
+    }
+
     var cls: int64 := ffi_classify(name, nameLen, pcharCount, sizeCount, variadic, hasFormatCap);
 
     if cls == FFI_CLASS_FORBIDDEN {
@@ -1930,6 +2210,11 @@ pub type Sema = class {
       } else {
         self._errorNode(ffi_signatureMsg(), ni);
       }
+    } else if cls == FFI_CLASS_OS {
+      // OS-class extern fn must declare @capabilities([...]) — otherwise LCBS is bypassable
+      if capAttrNi < 0 || self.sn_kind(capAttrNi) != SNK_CAPABILITY_ATTR {
+        self._errorNode("extern fn mit OS-Zugriff erfordert @capabilities([...])-Annotation"c, ni);
+      }
     } else if ffi_isStrncpyFamily(name, nameLen) {
       self._warnNode(ffi_strncpyWarnMsg(), ni);
     }
@@ -1938,9 +2223,23 @@ pub type Sema = class {
   fn _checkFuncDecl(ni: int64) {
     self._pushScope();
 
-    // WP-L5: extern fn-Validierung (iVal & 1 = extern, c3 != -1 = hat link-String)
-    if (self.sn_iVal(ni) & 1) != 0 && self.sn_c3(ni) != -1 {
-      self._checkExternFn(ni);
+    // WP-L5: extern fn-Validierung (iVal & 1 = extern)
+    // SEC-BUG-02: auch extern fn OHNE link-String prüfen (c3 == -1).
+    // Stdlib-interne Builtins (fork, waitpid, getpid …) sind explizit ausgenommen.
+    if (self.sn_iVal(ni) & 1) != 0 {
+      if self.sn_c3(ni) != -1 {
+        // Hat link-String → volle FFI-Prüfung inkl. link-Target
+        self._checkExternFn(ni);
+      } else {
+        // Kein link-String → nur Blacklist-Check (SEC-BUG-02)
+        var bname:    pchar := self.sn_sVal(ni);
+        var bnameLen: int64 := self.sn_sLen(ni);
+        if !ffi_isStdlibBuiltin(bname, bnameLen) {
+          if ffi_isHardBlacklisted(bname, bnameLen) {
+            self._errorNode(ffi_noLinkBlacklistMsg(), ni);
+          }
+        }
+      }
     }
 
     // WP-13: Capture analysis - track current function for nested function detection
@@ -1965,7 +2264,7 @@ pub type Sema = class {
     if (retNi >= 0) {
       var retTid: int64 := self.ResolveType(retNi);
       if (retTid == TY_UNKNOWN) {
-        self._errorNode("unknown return type", ni);
+        self._errorNodeName("unknown return type", ni, self.sn_sVal(retNi), self.sn_sLen(retNi));
       }
       self._logReason("return-type"c, ni, retTid);
     }
@@ -2018,7 +2317,7 @@ pub type Sema = class {
         var eLen: int64 := peek64(self.daaBuf + i * DAA_SIZE + DAA_OFF_NAMELEN);
         if (self._strNEq(nm, nl, ePtr, eLen)) {
           if (self.daaEnabled >= 2) {
-            self._errorNode("variable used before initialization"c, ni);
+            self._errorNodeName("variable used before initialization"c, ni, nm, nl);
           } else {
             self._warnNode("variable possibly used before initialization"c, ni);
           }
@@ -2211,7 +2510,7 @@ pub type Sema = class {
     while (ta >= 0) {
       var tid: int64 := self.ResolveType(ta);
       if (tid == TY_UNKNOWN) {
-        self._errorNode("unknown type in generic arguments", ta);
+        self._errorNodeName("unknown type in generic arguments", ta, self.sn_sVal(ta), self.sn_sLen(ta));
       }
       argCount := argCount + 1;
       ta := self.sn_next(ta);
@@ -2567,6 +2866,84 @@ pub type Sema = class {
     self._warnNode("@uses_caller_cap bei indirektem Aufruf nicht überprüfbar"c, ni);
   }
 
+  // WP-A3: Returns byte size of a field's type node for at(offset) overlap checking.
+  // Uses direct string comparison with token-accurate lengths (without null terminator).
+  fn _semFieldTypeSize(typeNi: int64): int64 {
+    if (typeNi < 0) { return 8; }
+    var tn: pchar := self.sn_sVal(typeNi);
+    var tl: int64 := self.sn_sLen(typeNi);
+    // 1-byte: int8, u8, char
+    if (tl == 4 && self._strNEq(tn, tl, "int8"c, 4)) { return 1; }
+    if (tl == 2 && self._strNEq(tn, tl, "u8"c,   2)) { return 1; }
+    if (tl == 4 && self._strNEq(tn, tl, "char"c, 4)) { return 1; }
+    // 2-byte: int16, u16
+    if (tl == 5 && self._strNEq(tn, tl, "int16"c, 5)) { return 2; }
+    if (tl == 3 && self._strNEq(tn, tl, "u16"c,   3)) { return 2; }
+    // 4-byte: int32, u32, f32
+    if (tl == 5 && self._strNEq(tn, tl, "int32"c, 5)) { return 4; }
+    if (tl == 3 && self._strNEq(tn, tl, "u32"c,   3)) { return 4; }
+    if (tl == 3 && self._strNEq(tn, tl, "f32"c,   3)) { return 4; }
+    return 8;  // int64, u64, f64, pchar, bool, structs: 8 bytes
+  }
+
+  // WP-A3: ConstExpr, monotonicity, and O(n²) overlap check for at(offset) fields.
+  fn _checkAtOffsetFields(firstField: int64) {
+    var hasOff: int64 := 0;
+    var tmpf: int64 := firstField;
+    while (tmpf >= 0) {
+      if ((self.sn_iVal(tmpf) & 1) != 0) { hasOff := 1; break; }
+      tmpf := self.sn_next(tmpf);
+    }
+    if (hasOff == 0) { return; }
+    var prevOff: int64 := -1;
+    var offBuf:  int64 := alloc(64 * 8);
+    var szBuf:   int64 := alloc(64 * 8);
+    var nodBuf:  int64 := alloc(64 * 8);
+    var nOff:    int64 := 0;
+    var fld:     int64 := firstField;
+    while (fld >= 0 && nOff < 64) {
+      if ((self.sn_iVal(fld) & 1) != 0) {
+        var offNi: int64 := self.sn_c1(fld);
+        if (offNi >= 0) {
+          if (self.sn_kind(offNi) != 40) {
+            self._errorNode("at(offset): value must be a compile-time integer constant"c, fld);
+          }
+          var fOff: int64 := self.sn_iVal(offNi);
+          if (fOff < prevOff) {
+            self._errorNode("struct field at(offset) must not decrease relative to previous field"c, fld);
+          }
+          prevOff := fOff;
+          poke64(offBuf + nOff * 8, fOff);
+          poke64(szBuf  + nOff * 8, self._semFieldTypeSize(self.sn_c0(fld)));
+          poke64(nodBuf + nOff * 8, fld);
+          nOff := nOff + 1;
+        }
+      }
+      fld := self.sn_next(fld);
+    }
+    var ai:   int64 := 0;
+    var aOff: int64 := 0;
+    var aSz:  int64 := 0;
+    var bi:   int64 := 0;
+    var bOff: int64 := 0;
+    var bSz:  int64 := 0;
+    while (ai < nOff) {
+      aOff := peek64(offBuf + ai * 8);
+      aSz  := peek64(szBuf  + ai * 8);
+      bi   := ai + 1;
+      while (bi < nOff) {
+        bOff := peek64(offBuf + bi * 8);
+        bSz  := peek64(szBuf  + bi * 8);
+        if (aOff < bOff + bSz && bOff < aOff + aSz) {
+          var errNi: int64 := peek64(nodBuf + bi * 8);
+          self._errorNode("struct field at(offset) overlaps with previous field"c, errNi);
+        }
+        bi := bi + 1;
+      }
+      ai := ai + 1;
+    }
+  }
+
   fn _p2Decl(ni: int64) {
     var k: int64 := self.sn_kind(ni);
     // WP-L7: Pending-Annotationen bei nicht-annotierbaren Knoten zurücksetzen.
@@ -2588,15 +2965,8 @@ pub type Sema = class {
       // only their monomorphized instances (emitted by IR lowerer) are.
       return;
     } else if (k == SNK_STRUCT_DECL) {
-      // Check struct field types and validate explicit at(offset) offsets (WP-4.1-A)
+      // Check struct field types and @big_endian constraints (WP-4.1-A/B/A3)
       var field: int64 := self.sn_c0(ni);
-      var prevOffset: int64 := -1;
-      var hasPackedOffset: int64 := 0;
-      var tmpf: int64 := field;
-      while (tmpf >= 0) {
-        if ((self.sn_iVal(tmpf) & 1) != 0) { hasPackedOffset := 1; break; }
-        tmpf := self.sn_next(tmpf);
-      }
       while (field >= 0) {
         var typeNode: int64 := self.sn_c0(field);
         if (typeNode >= 0) { self.ResolveType(typeNode); }
@@ -2608,19 +2978,10 @@ pub type Sema = class {
             self._errorNode("@big_endian cannot be applied to f64 fields"c, field);
           }
         }
-        // WP-4.1-A: validate explicit offsets are monotonically non-decreasing
-        if (hasPackedOffset != 0 && (self.sn_iVal(field) & 1) != 0) {
-          var offsetNi: int64 := self.sn_c1(field);
-          if (offsetNi >= 0) {
-            var fieldOff: int64 := self.sn_iVal(offsetNi);
-            if (fieldOff < prevOffset) {
-              self._errorNode("struct field at(offset) must not decrease relative to previous field"c, field);
-            }
-            prevOffset := fieldOff;
-          }
-        }
         field := self.sn_next(field);
       }
+      // WP-A3: ConstExpr + monotonicity + overlap check
+      self._checkAtOffsetFields(self.sn_c0(ni));
     } else if (k == SNK_ENUM_DECL) {
       // Check enum variant payload types
       var variant: int64 := self.sn_c0(ni);
@@ -2655,7 +3016,7 @@ pub type Sema = class {
         var parentLen: int64 := self.sn_sLen(parentNi);
         var parentSym: int64 := self.Lookup(parentName, parentLen);
         if (parentSym < 0) {
-          self._errorNode("unknown parent class", ni);
+          self._errorNodeName("unknown parent class", ni, parentName, parentLen);
         }
         // Check that methods marked override exist in parent (name check only)
         var mth: int64 := self.sn_c1(ni);
@@ -2677,7 +3038,7 @@ pub type Sema = class {
         var ifaceLen:  int64 := self.sn_sLen(ifaceListNi);
         var ifaceSym:  int64 := self.Lookup(ifaceName, ifaceLen);
         if (ifaceSym < 0) {
-          self._errorNode("unknown interface", ni);
+          self._errorNodeName("unknown interface", ni, ifaceName, ifaceLen);
         } else {
           var ifaceNi: int64 := self.SymNodeIdx(ifaceSym);
           if (ifaceNi >= 0) {
@@ -2695,7 +3056,7 @@ pub type Sema = class {
                 }
                 cMth := self.sn_next(cMth);
               }
-              if (found == 0) { self._errorNode("class missing interface method", iMth); }
+              if (found == 0) { self._errorNodeName("class missing interface method", iMth, iMthName, iMthLen); }
               iMth := self.sn_next(iMth);
             }
           }
@@ -2731,6 +3092,11 @@ pub type Sema = class {
           }
           mthCap := self.sn_next(mthCap);
         }
+      }
+      // WP-A3: For struct-type declarations (type X = struct {}), validate at(offset) fields.
+      // Struct nodes have c1 < 0 (no methods) and c0 pointing to first field (NK_FIELD_DECL = 7).
+      if (self.sn_c1(ni) < 0 && self.sn_c0(ni) >= 0 && self.sn_kind(self.sn_c0(ni)) == 7) {
+        self._checkAtOffsetFields(self.sn_c0(ni));
       }
       // WP-BC-22 / WP-L8: restore class context
       self.classCapNode := prevClassCapNode;
@@ -2825,6 +3191,129 @@ pub type Sema = class {
   }
 
   fn _registerBuiltins() {
+    // LX-22: Debug & Telemetrie (0x0A00–0x0A05) — IDs 145–150
+    self._regBuiltin("sys_debug_print");
+    self._regBuiltin("sys_trace_event");
+    self._regBuiltin("sys_perf_counter");
+    self._regBuiltin("sys_stack_trace");
+    self._regBuiltin("sys_watchpoint_set");
+    self._regBuiltin("sys_watchpoint_clear");
+    // LX-WP17: Vega Window System (0x0D00–0x0D14) — IDs 151–171
+    self._regBuiltin("sys_win_create");
+    self._regBuiltin("sys_win_destroy");
+    self._regBuiltin("sys_win_raise");
+    self._regBuiltin("sys_win_move");
+    self._regBuiltin("sys_win_resize");
+    self._regBuiltin("sys_win_get_fb");
+    self._regBuiltin("sys_vsync_wait");
+    self._regBuiltin("sys_time_ns");
+    self._regBuiltin("sys_shm_create");
+    self._regBuiltin("sys_shm_map");
+    self._regBuiltin("sys_shm_unmap");
+    self._regBuiltin("sys_event_send");
+    self._regBuiltin("sys_event_recv");
+    self._regBuiltin("sys_set_console");
+    self._regBuiltin("sys_fb_map_user");
+    self._regBuiltin("sys_get_mouse_x");
+    self._regBuiltin("sys_get_mouse_y");
+    self._regBuiltin("sys_get_mouse_btn");
+    self._regBuiltin("sys_set_mouse_bounds");
+    self._regBuiltin("sys_win_get_table_phys");
+    self._regBuiltin("sys_kbd_poll");
+    // LX-18: IOFS (0x0C00–0x0C04) — IDs 140–144
+    self._regBuiltin("sys_iofs_mount");
+    self._regBuiltin("sys_iofs_compact");
+    self._regBuiltin("sys_iofs_page_info");
+    self._regBuiltin("sys_iofs_sandbox_enter");
+    self._regBuiltin("sys_iofs_sandbox_exit");
+    // LX-17: Lyra Agent Interface (0x0900–0x090B) — IDs 128–139
+    self._regBuiltin("sys_intent_submit");
+    self._regBuiltin("sys_intent_wait");
+    self._regBuiltin("sys_intent_cancel");
+    self._regBuiltin("sys_lyra_event");
+    self._regBuiltin("sys_dream_register");
+    self._regBuiltin("sys_dream_unregister");
+    self._regBuiltin("sys_memory_store");
+    self._regBuiltin("sys_memory_recall");
+    self._regBuiltin("sys_memory_search");
+    self._regBuiltin("sys_context_push");
+    self._regBuiltin("sys_context_pop");
+    self._regBuiltin("sys_timeline_query");
+    // LX-16: Semantisches Paging & Wissensgraph (0x080D–0x0812) — IDs 122–127
+    self._regBuiltin("sys_sem_annotate");
+    self._regBuiltin("sys_sem_query");
+    self._regBuiltin("sys_graph_node_create");
+    self._regBuiltin("sys_graph_edge_add");
+    self._regBuiltin("sys_graph_edge_remove");
+    self._regBuiltin("sys_graph_query");
+    // LX-15: KI-Embedding & Vektorindex (0x0807–0x080C) — IDs 116–121
+    self._regBuiltin("sys_ai_embed");
+    self._regBuiltin("sys_ai_token_count");
+    self._regBuiltin("sys_ai_search");
+    self._regBuiltin("sys_ai_index_create");
+    self._regBuiltin("sys_ai_index_insert");
+    self._regBuiltin("sys_ai_index_delete");
+    // LX-14: KI-Basis (0x0800–0x0806) — IDs 109–115
+    self._regBuiltin("sys_ai_model_load");
+    self._regBuiltin("sys_ai_model_unload");
+    self._regBuiltin("sys_ai_model_info");
+    self._regBuiltin("sys_ai_ctx_create");
+    self._regBuiltin("sys_ai_ctx_destroy");
+    self._regBuiltin("sys_ai_infer");
+    self._regBuiltin("sys_ai_infer_sync");
+    // LX-13: Task-Scheduler & Parallelität (0x0B00–0x0B09) — IDs 99–108
+    self._regBuiltin("sys_task_spawn");
+    self._regBuiltin("sys_task_await");
+    self._regBuiltin("sys_task_cancel");
+    self._regBuiltin("sys_task_group_create");
+    self._regBuiltin("sys_task_group_add");
+    self._regBuiltin("sys_task_group_await");
+    self._regBuiltin("sys_cpu_count");
+    self._regBuiltin("sys_cpu_topology");
+    self._regBuiltin("sys_affinity_hint");
+    self._regBuiltin("sys_numa_alloc");
+    // LX-12: Capabilities + Pledge + Unveil (0x0700–0x0708) — IDs 90–98
+    self._regBuiltin("sys_cap_create");
+    self._regBuiltin("sys_cap_restrict");
+    self._regBuiltin("sys_cap_rights");
+    self._regBuiltin("sys_pledge");
+    self._regBuiltin("sys_unveil");
+    self._regBuiltin("sys_uid_get");
+    self._regBuiltin("sys_gid_get");
+    self._regBuiltin("sys_setuid");
+    self._regBuiltin("sys_seccomp");
+    // LX-11: Zeit-Syscalls (0x0500–0x0504) — IDs 85–89
+    self._regBuiltin("sys_clock_get");
+    self._regBuiltin("sys_clock_set");
+    self._regBuiltin("sys_timer_create");
+    self._regBuiltin("sys_timer_set");
+    self._regBuiltin("sys_timer_wait");
+    // LX-10: IPC & Synchronisation (0x0400–0x040C) — an den Anfang wegen Bootstrap-Limit
+    self._regBuiltin("sys_mutex_lock");
+    self._regBuiltin("sys_mutex_unlock");
+    self._regBuiltin("sys_sem_create");
+    self._regBuiltin("sys_sem_wait");
+    self._regBuiltin("sys_sem_post");
+    self._regBuiltin("sys_sem_destroy");
+    self._regBuiltin("sys_channel_create");
+    self._regBuiltin("sys_channel_send");
+    self._regBuiltin("sys_channel_recv");
+    self._regBuiltin("sys_notify_create");
+    self._regBuiltin("sys_notify_send");
+    self._regBuiltin("sys_notify_recv");
+    self._regBuiltin("sys_futex");
+    // LX-09: LyxOS Prozess & Threads (0x0000–0x000D) — sys_getpid/gettid/getrandom bereits unten
+    self._regBuiltin("sys_version");
+    self._regBuiltin("sys_exit");
+    self._regBuiltin("sys_exit_group");
+    self._regBuiltin("sys_spawn");
+    self._regBuiltin("sys_thread_spawn");
+    self._regBuiltin("sys_thread_exit");
+    self._regBuiltin("sys_wait");
+    self._regBuiltin("sys_yield");
+    self._regBuiltin("sys_sleep_ns");
+    self._regBuiltin("sys_priority");
+    self._regBuiltin("sys_signal_mask");
     // Memory
     self._regBuiltin("mmap");
     self._regBuiltin("munmap");
@@ -2833,11 +3322,13 @@ pub type Sema = class {
     self._regBuiltin("poke32");
     self._regBuiltin("poke64");
     self._regBuiltin("pokef64");
+    self._regBuiltin("poke32f");
     self._regBuiltin("peek8");
     self._regBuiltin("peek16");
     self._regBuiltin("peek32");
     self._regBuiltin("peek64");
     self._regBuiltin("peekf64");
+    self._regBuiltin("peek32f");
     // I/O
     self._regBuiltin("Print");
     self._regBuiltin("PrintStr");
@@ -2845,11 +3336,13 @@ pub type Sema = class {
     self._regBuiltin("PrintChar");
     self._regBuiltin("PrintBool");
     self._regBuiltin("PrintFloat");
+    self._regBuiltin("Printf");     // WP-08
     // String
     self._regBuiltin("StrLength");
     self._regBuiltin("StrLen");
     self._regBuiltin("StrCharAt");
     self._regBuiltin("StrEquals");
+    self._regBuiltin("StrEq");
     self._regBuiltin("StrStartsWith");
     self._regBuiltin("StrEndsWith");
     self._regBuiltin("StrConcat");
@@ -2890,8 +3383,12 @@ pub type Sema = class {
     self._regBuiltin("lseek");
     self._regBuiltin("IOResult"); // WP-CS-09: read _lyx_io_result
 
+    // sizeof is a compile-time builtin (BUG-5)
+    self._regBuiltin("sizeof");
+
     // WP-BC-02: additional builtins
     self._regBuiltin("chmod");
+    self._regBuiltin("chown");
     self._regBuiltin("getpid");
     self._regBuiltin("unlink");
     self._regBuiltin("rename");
@@ -2908,15 +3405,8 @@ pub type Sema = class {
     self._regBuiltin("breakpoint");
     self._regBuiltin("Println");
     self._regBuiltin("StrFromInt");
-    self._regBuiltin("StrEquals");
-    self._regBuiltin("StrEndsWith");
-    self._regBuiltin("StrConcat");
-    self._regBuiltin("StrCopy");
-    self._regBuiltin("StrAppendStr");
     self._regBuiltin("Random");
     self._regBuiltin("RandomSeed");
-    self._regBuiltin("FloatToStr");
-    self._regBuiltin("PrintFloat");
     self._regBuiltin("GetArg");
     // WP-BC-39: Inspect(expr) — in-situ data visualizer
     self._regBuiltin("Inspect");
@@ -2928,8 +3418,9 @@ pub type Sema = class {
     self._regBuiltin("trace");
     self._regBuiltin("trace_int");
     self._regBuiltin("trace_str");
-    // WP-BC-44: clock_gettime for --trace-passes timing
+    // WP-BC-44: clock_gettime / nanosleep for --trace-passes timing
     self._regBuiltin("clock_gettime");
+    self._regBuiltin("nanosleep");
     // WP-BC-51: array builtins
     self._regBuiltin("len");
     self._regBuiltin("push");
@@ -3082,6 +3573,63 @@ pub type Sema = class {
     self._regBuiltin("sys_mq_timedsend");
     self._regBuiltin("sys_mq_timedreceive");
     self._regBuiltin("sys_mq_getsetattr");
+    // WP-12: SysV IPC — Shared Memory, Semaphore, Message Queues
+    self._regBuiltin("sys_shmget");
+    self._regBuiltin("sys_shmat");
+    self._regBuiltin("sys_shmctl");
+    self._regBuiltin("sys_shmdt");
+    self._regBuiltin("sys_semget");
+    self._regBuiltin("sys_semop");
+    self._regBuiltin("sys_semctl");
+    self._regBuiltin("sys_msgget");
+    self._regBuiltin("sys_msgsnd");
+    self._regBuiltin("sys_msgrcv");
+    self._regBuiltin("sys_msgctl");
+    // WP-13: io_uring -- Asynchrones I/O
+    self._regBuiltin("sys_io_uring_setup");
+    self._regBuiltin("sys_io_uring_enter");
+    self._regBuiltin("sys_io_uring_register");
+    // WP-14: xattr, statfs, fallocate
+    self._regBuiltin("sys_setxattr");
+    self._regBuiltin("sys_getxattr");
+    self._regBuiltin("sys_listxattr");
+    self._regBuiltin("sys_removexattr");
+    self._regBuiltin("sys_fsetxattr");
+    self._regBuiltin("sys_fgetxattr");
+    self._regBuiltin("sys_flistxattr");
+    self._regBuiltin("sys_fremovexattr");
+    self._regBuiltin("sys_fallocate");
+    self._regBuiltin("sys_statfs");
+    // WP-15: Linux Capabilities & prctl
+    self._regBuiltin("sys_capget");
+    self._regBuiltin("sys_capset");
+    self._regBuiltin("sys_prctl");
+    self._regBuiltin("sys_arch_prctl");
+    // WP-16: Namespaces, pidfd & Prozess-Isolation
+    self._regBuiltin("sys_pidfd_open");
+    self._regBuiltin("sys_pidfd_send_signal");
+    self._regBuiltin("sys_pidfd_getfd");
+    self._regBuiltin("sys_unshare");
+    self._regBuiltin("sys_setns");
+    // WP-17: futex2 -- neue Synchronisierungs-API (Kernel 5.16+/6.7+)
+    self._regBuiltin("sys_futex_waitv");
+    self._regBuiltin("sys_futex_wake");
+    self._regBuiltin("sys_futex_wait");
+    self._regBuiltin("sys_futex_requeue");
+    // WP-18: Debugging & Performance-Monitoring
+    self._regBuiltin("sys_ptrace");
+    self._regBuiltin("sys_perf_event_open");
+    // WP-19: BPF-Programme
+    self._regBuiltin("sys_bpf");
+    // WP-20: System-Administration
+    self._regBuiltin("sys_mount");
+    self._regBuiltin("sys_umount2");
+    self._regBuiltin("sys_chroot");
+    self._regBuiltin("sys_sethostname");
+    self._regBuiltin("sys_reboot");
+    self._regBuiltin("sys_sync");
+    // WP-BL-01: Kryptographische Zufallszahlen
+    self._regBuiltin("sys_getrandom");
     // WP-AND-upstream-fix: indirect-call builtins (0..4 args).
     self._regBuiltin("_indirect_call_0");
     self._regBuiltin("_indirect_call_1");
@@ -3104,6 +3652,34 @@ pub type Sema = class {
     self._regBuiltin("fFloor");
     self._regBuiltin("fCeil");
     self._regBuiltin("fRound");
+    // WP-GPIO-1: Memory / Instruction Barrier Intrinsics
+    self._regBuiltin("mem_barrier");   // ARM64: DMB SY  x86-64: MFENCE
+    self._regBuiltin("inst_barrier");  // ARM64: ISB     x86-64: LFENCE
+    // LX-06: LyxOS VFS syscalls (0x0200–0x0215) — fehlende Namen aus fs.lyx
+    self._regBuiltin("sys_open");
+    self._regBuiltin("sys_seek");
+    self._regBuiltin("sys_stat");
+    self._regBuiltin("sys_mkdir");
+    self._regBuiltin("sys_unlink");
+    self._regBuiltin("sys_rename");
+    self._regBuiltin("sys_readdir");
+    self._regBuiltin("sys_symlink");
+    self._regBuiltin("sys_readlink");
+    self._regBuiltin("sys_umount");
+    self._regBuiltin("sys_content_id");
+
+    // LX-07: LyxOS I/O-Geräte & Poll (0x0300–0x0305)
+    self._regBuiltin("sys_poll");
+    self._regBuiltin("sys_ioctl");
+    self._regBuiltin("sys_mmap_device");
+    self._regBuiltin("sys_irq_bind");
+    self._regBuiltin("sys_port_in");
+    self._regBuiltin("sys_port_out");
+
+    // LX-08: LyxOS Netzwerk (0x0600–0x0609) — sys_socket..sys_shutdown bereits ab LX-06
+    self._regBuiltin("sys_sendmsg");
+    self._regBuiltin("sys_recvmsg");
+
   }
 
   // ------------------------------------------------------------------
@@ -3143,6 +3719,7 @@ pub type Sema = class {
     self.errorCount := 0;
     self.curClassNi  := -1;
     self.classCapNode := -1;
+    self.curFile     := 0 as pchar;
 
     // WP-10e: import dedup table
     self.importedCap   := 16;
@@ -3162,6 +3739,7 @@ pub type Sema = class {
     // WP-BC-42: search paths (set by caller after Init)
     self.includePath := 0;
     self.stdPath     := 0;
+    self.lastReadSize := 0;  // WP-35: binary-safe file size
 
     // WP-BC-46: verbose flags (set by caller after Init)
     self.typeReasoning := false;

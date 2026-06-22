@@ -1,5 +1,81 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.0A (Juni 2026)
+
+Erste Alpha-Version (V1.0.0A) — vollständiger Sprachkern, self-hosting (Singularität),
+echte OOP-Vererbung und Backend-Parität inkl. vollständigem Windows-PE32+-Target.
+Enthält lyxc-Fix-Backlog L1–L6, WP-A2 (Windows), WP-28..37 (Security), V-1..3 und
+BUG-1..8.
+
+### OOP / Vererbung
+
+- **L1 — Feld-Layout-Vererbung**: Felder einer Basisklasse werden in das Layout der abgeleiteten Klasse flach vorangestellt; geerbte Felder erhalten korrekte Offsets (`cg_buildClassLayout`/`cg_buildStructLayout`).
+- **L2 — virtuelle Dispatch über Basis-Pointer**: `extends`-Parent korrekt erfasst (Parser `_sc2`-Setter-Bug); `override`/`abstract` implizieren `virtual`; virtuelle Methoden werden dynamisch über die vtable aufgerufen (`cg_genCall`); abgeleitete Klassen erben die vtable, `override` ersetzt den Slot, geerbte nicht-überschriebene Slots werden base→derived propagiert.
+
+### Parser
+
+- **L4 — `[N]T` Prefix-Array-Felder**: `kids: [4]Node;` wird geparst (führendes Integer-Literal nach `[` disambiguiert gegen Tuple-Typen); erzeugt denselben Array-Knoten wie die Suffix-Form `T[N]`.
+- **L5 — `form` als Soft-Keyword**: `form` ist überall als normaler Bezeichner nutzbar; das Top-Level-`form`-Konstrukt wird kontextuell per Text erkannt.
+- **L6 — lesbare Diagnostik**: Parse-Fehler nennen Token-Namen und das tatsächliche Lexem statt roher Token-IDs (z. B. „expected IDENT, got form 'form'").
+
+### Windows PE32+ — vollständiges OOP & Funktionen (WP-A2)
+
+- **A2.1**: Trampolin-Zone exakt auf die `CG_H_*`-Helper-Offsets ausgerichtet — `wine hello.exe` gibt korrekt aus (vorher Müll, weil PrintStr-Calls in den PrintInt-Helper durchfielen).
+- **A2.2**: Unified Base-Relocation — Codegen registriert absolute VMT-Pointer; PE-Backend emittiert echte `.reloc`-Blöcke (`IMAGE_REL_BASED_DIR64`) + rebased die Werte → ASLR-tauglich.
+- **A2.3**: `new`/alloc nutzt `VirtualAlloc` statt Linux-`mmap`-syscall.
+- **A2.4**: `_start`→`main`-Aufruf korrigiert (`relMain + 14`) — alle user-Funktions-/Methoden-Calls funktionieren.
+- Verifiziert unter wine: Funktionen, Rekursion, virtuelle Dispatch, Vererbung, Felder, Heap, Output.
+
+### Security (WP-28..37)
+
+- **WP-28**: Kernel-Mode-Guard Allowlist — `@kernel_mode` Attribut blockiert unsichere Imports
+- **WP-29**: Ed25519-Lizenzverifikation — asymmetrische Signaturprüfung ohne RSA-Overhead
+- **WP-30**: HTTP Custom-Header CRLF-Injection-Schutz — `\r\n` in Header-Werten wird abgelehnt
+- **WP-31**: `FileReadAll` 256-MB-Limit — schützt vor OOM-Angriffen via überdimensionale Dateien; explizite Größenprüfung auch in lyxc selbst (Seed-Binary-Invarianz)
+- **WP-32**: TOCTOU-Schutz `ms_appendMetaSafe` — atomares Append mit POSIX-Locks
+- **WP-33**: String-Library Bounds-Hardening — alle Slice/Sub-Operationen prüfen Grenzen
+- **WP-34**: Codegen-Buffer-Größenlimit — verhindert Stack-Overflow bei pathologischen Inputs
+- **WP-35**: LYU-Parser symCount-Limit — begrenzt Symboltabellengröße in Precompiled Units
+- **WP-36**: `SecureZero` Compiler-Barriere — `poke8`-basiertes Nullen verhindert Dead-Store-Elimination
+- **WP-37**: `RandInt64` Fehlerbehandlung — `getrandom`-Fehler werden propagiert, kein Silent-Fail
+
+### V1-Blocker (LyxOS Self-Hosting)
+
+- **V-1**: `--target=lyxos` Segfault bei großen Programmen — behoben
+- **V-2**: LyxOS Builtin-I/O falsche Syscall-Nummern — `sys_open=0x200`, `sys_read=0x202`, `sys_write=0x203` korrekt gesetzt
+- **V-3**: `lyxc` dynamisch gelinkt via `explicit_bzero` — ersetzt durch `poke8`-Loop (PR #789); `lyxc` ist jetzt vollständig statisch
+
+### P0-Blocker (V1.0.0A Milestone)
+
+- **WP-A2**: Windows PE32+ `.reloc`-Section + ASLR (PR #791) — `win_x86.lyx` und `win_arm64.lyx` emittieren jetzt eine gültige `.reloc`-Section mit leerem `IMAGE_BASE_RELOCATION`-Block; BaseReloc-DataDir korrekt verdrahtet; `DllCharacteristics=0x8160` (DYNAMIC_BASE|NX_COMPAT|HIGH_ENTROPY_VA)
+
+### Security Audit Fixes (PR #790)
+
+- **SEC-BUG-05**: `PathNormalize` — segment-stack-basierter Algorithmus ersetzt fehlerhaften one-pass `..`-Handler; 80-Byte Buffer-Overflow gefixt; sicherer gegen path-traversal-Angriffe
+
+### Compiler-Bugs (BUG-1..8)
+
+- BUG-1: Importierte Konstanten im Bootstrap — behoben
+- BUG-2: VMT-Kollision bei identischen Methodennamen — behoben
+- BUG-3: Klassen-Instanz-Parameter — behoben
+- BUG-4: 7-Argument-Overflow — behoben
+- BUG-5: `break` als NOP in verschachtelten Schleifen — behoben
+- BUG-6: r8/r9 werden nicht gespillt — behoben
+- BUG-7: `BUG-1`-Typenfeld-Offset — behoben (PR #769)
+- BUG-8: TypeName.field Offset immer 0 — behoben
+
+### Test Suite
+
+- `make test` grün: alle Tests PASS (LX-25..36, net_frame 45 Tests, WP-28..37 je 20 Tests)
+- sec_wp37 in Makefile eingetragen
+
+### P1-Status (86% ✅, Kriterium ≥80%)
+
+C1 TmpFile, C2 Trig-Funktionen, C4 StrFormat, C5 URL-Encode/Build/Resolve, C6 HTTP PUT/DELETE/PATCH/HEAD, C8 log_info_kv — alle implementiert.
+A4 (`@big_endian` ARM64 REV-Emission) bleibt offen.
+
+---
+
 ## Unreleased
 
 ### Parser

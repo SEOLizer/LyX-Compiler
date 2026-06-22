@@ -1,0 +1,457 @@
+// tests/edi00_core_test.lyx — EDI-00: Interchange engine unit tests (no network)
+//
+// Covers all WP-EDI-00 acceptance criteria:
+//   • UNA absent → default delimiters
+//   • UNA present with non-default delimiters → correct extraction
+//   • Escape '?' prevents delimiter recognition in EdiSegmentNext + EdiElementSplit
+//   • UNB/UNZ round-trip
+//   • UNH/UNT write format
+//   • EdiSeqNext monotonically increasing per partner
+//   • EdiDuplicateCheck: same ICR → 1, different → 0
+
+unit tests.edi00_core_test;
+
+import std.edi.core;
+import std.alloc;
+import std.io;
+
+fn memEq(a: int64, aLen: int64, b: int64, bLen: int64): int64 {
+    if (aLen != bLen) { return 0; }
+    var i: int64 := 0;
+    while (i < aLen) {
+        if (peek8(a+i) != peek8(b+i)) { return 0; }
+        i := i + 1;
+    }
+    return 1;
+}
+
+pub fn main(argc: int64, argv: pchar): int64 {
+    var ok: int64 := 1;
+
+    // -------------------------------------------------------------------------
+    // Test 1: EdiUnaRead — no UNA → default delimiters
+    // -------------------------------------------------------------------------
+    var una1: int64 := alloc(EDI_UNA_SIZE);
+    var buf1: pchar := "UNB+UNOA:1+SND+RCV+260615:1200+ICR001'"c;
+    var r1: int64 := EdiUnaRead(buf1 as int64, 39, una1);
+    if (r1 != EDI_ERR_NOUNA) {
+        PrintLn("FAIL: no-UNA should return EDI_ERR_NOUNA"c); ok := 0;
+    } else { PrintLn("PASS: no-UNA returns EDI_ERR_NOUNA"c); }
+    if (peek64(una1 + EDI_UNA_COMP) != EDI_DEF_COMP) {
+        PrintLn("FAIL: no-UNA comp not default"c); ok := 0;
+    } else { PrintLn("PASS: no-UNA comp = default ':'"c); }
+    if (peek64(una1 + EDI_UNA_DATA) != EDI_DEF_DATA) {
+        PrintLn("FAIL: no-UNA data not default"c); ok := 0;
+    } else { PrintLn("PASS: no-UNA data = default '+'"c); }
+    if (peek64(una1 + EDI_UNA_SEG) != EDI_DEF_SEG) {
+        PrintLn("FAIL: no-UNA seg not default"c); ok := 0;
+    } else { PrintLn("PASS: no-UNA seg  = default '\\''"c); }
+    free(una1, EDI_UNA_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 2: EdiUnaRead — UNA present with custom delimiters
+    // Custom: comp='|'(124) data='~'(126) dec='.'(46) rel='?'(63) seg='^'(94)
+    // -------------------------------------------------------------------------
+    var unaBuf: int64 := alloc(9);
+    poke8(unaBuf,   85); poke8(unaBuf+1, 78); poke8(unaBuf+2, 65);   // "UNA"
+    poke8(unaBuf+3, 124);  // '|' comp
+    poke8(unaBuf+4, 126);  // '~' data
+    poke8(unaBuf+5, 46);   // '.' dec
+    poke8(unaBuf+6, 63);   // '?' rel
+    poke8(unaBuf+7, 32);   // ' ' reserved
+    poke8(unaBuf+8, 94);   // '^' seg terminator
+    var una2: int64 := alloc(EDI_UNA_SIZE);
+    var r2: int64 := EdiUnaRead(unaBuf, 9, una2);
+    if (r2 != EDI_OK) { PrintLn("FAIL: UNA present should return EDI_OK"c); ok := 0; }
+    else               { PrintLn("PASS: UNA present returns EDI_OK"c); }
+    if (peek64(una2 + EDI_UNA_COMP) != 124) {
+        PrintLn("FAIL: UNA comp should be '|' (124)"c); ok := 0;
+    } else { PrintLn("PASS: UNA comp = '|'"c); }
+    if (peek64(una2 + EDI_UNA_DATA) != 126) {
+        PrintLn("FAIL: UNA data should be '~' (126)"c); ok := 0;
+    } else { PrintLn("PASS: UNA data = '~'"c); }
+    if (peek64(una2 + EDI_UNA_SEG) != 94) {
+        PrintLn("FAIL: UNA seg should be '^' (94)"c); ok := 0;
+    } else { PrintLn("PASS: UNA seg  = '^'"c); }
+
+    // -------------------------------------------------------------------------
+    // Test 3: EdiSegmentNext — two segments with default terminator
+    // Buffer: "BGM+380+INV001+9'DTM+137:20260615:102'"
+    // -------------------------------------------------------------------------
+    var raw3: pchar := "BGM+380+INV001+9'DTM+137:20260615:102'"c;
+    var una3: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(raw3 as int64, 5, una3);   // no UNA → defaults written
+    var sctx3: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx3, una3, 0);
+    var seg3: int64 := alloc(EDI_SEG_SIZE);
+
+    var found3a: int64 := EdiSegmentNext(raw3 as int64, 38, sctx3, seg3);
+    if (found3a != 1) {
+        PrintLn("FAIL: first EdiSegmentNext should return 1"c); ok := 0;
+    } else { PrintLn("PASS: first segment found"c); }
+    if (peek64(seg3 + EDI_SEG_LEN) != 16) {
+        PrintLn("FAIL: first segment len != 16"c); ok := 0;
+    } else { PrintLn("PASS: first segment len = 16"c); }
+    // First 3 bytes should be "BGM"
+    var sp3a: int64 := peek64(seg3 + EDI_SEG_PTR);
+    if (peek8(sp3a) != 66 || peek8(sp3a+1) != 71 || peek8(sp3a+2) != 77) {
+        PrintLn("FAIL: first segment tag != BGM"c); ok := 0;
+    } else { PrintLn("PASS: first segment tag = BGM"c); }
+
+    var found3b: int64 := EdiSegmentNext(raw3 as int64, 38, sctx3, seg3);
+    if (found3b != 1) {
+        PrintLn("FAIL: second EdiSegmentNext should return 1"c); ok := 0;
+    } else { PrintLn("PASS: second segment found"c); }
+    if (peek64(seg3 + EDI_SEG_LEN) != 20) {
+        PrintLn("FAIL: second segment len != 20"c); ok := 0;
+    } else { PrintLn("PASS: second segment len = 20"c); }
+
+    var found3c: int64 := EdiSegmentNext(raw3 as int64, 38, sctx3, seg3);
+    if (found3c != 0) {
+        PrintLn("FAIL: third EdiSegmentNext should return 0 (end)"c); ok := 0;
+    } else { PrintLn("PASS: third call returns 0 (end of buffer)"c); }
+
+    free(una3, EDI_UNA_SIZE);
+    free(sctx3, EDI_SEGCTX_SIZE);
+    free(seg3, EDI_SEG_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 4: EdiSegCtxInit — custom seg terminator from UNA
+    // Buffer (after 9-byte UNA): "BGM~380~INV~9^DTM~137^"
+    // with data='~'(126) seg='^'(94)
+    // -------------------------------------------------------------------------
+    var sctx4: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx4, una2, 0);   // una2 has custom delimiters from Test 2
+    // Build body with custom delimiters: "BGM~380~INV~9^DTM~137^"
+    var body4: int64 := alloc(22);
+    // B G M ~ 3 8 0 ~ I N V ~ 9  ^  D  T  M  ~  1  3  7  ^
+    poke8(body4, 66); poke8(body4+1, 71); poke8(body4+2, 77);
+    poke8(body4+3, 126);  // '~'
+    poke8(body4+4, 51); poke8(body4+5, 56); poke8(body4+6, 48);
+    poke8(body4+7, 126);  // '~'
+    poke8(body4+8, 73); poke8(body4+9, 78); poke8(body4+10, 86);
+    poke8(body4+11, 126); // '~'
+    poke8(body4+12, 57);
+    poke8(body4+13, 94);  // '^' segment terminator
+    poke8(body4+14, 68); poke8(body4+15, 84); poke8(body4+16, 77);
+    poke8(body4+17, 126); // '~'
+    poke8(body4+18, 49); poke8(body4+19, 51); poke8(body4+20, 55);
+    poke8(body4+21, 94);  // '^' segment terminator
+    var seg4: int64 := alloc(EDI_SEG_SIZE);
+    var f4a: int64 := EdiSegmentNext(body4, 22, sctx4, seg4);
+    if (f4a != 1) { PrintLn("FAIL: custom-delim first segment not found"c); ok := 0; }
+    else           { PrintLn("PASS: custom-delim first segment found"c); }
+    if (peek64(seg4 + EDI_SEG_LEN) != 13) {
+        PrintLn("FAIL: custom-delim first seg len != 13"c); ok := 0;
+    } else { PrintLn("PASS: custom-delim first seg len = 13"c); }
+    var f4b: int64 := EdiSegmentNext(body4, 22, sctx4, seg4);
+    if (f4b != 1) { PrintLn("FAIL: custom-delim second segment not found"c); ok := 0; }
+    else           { PrintLn("PASS: custom-delim second segment found"c); }
+    free(body4, 22);
+    free(sctx4, EDI_SEGCTX_SIZE);
+    free(seg4, EDI_SEG_SIZE);
+    free(una2, EDI_UNA_SIZE);
+    free(unaBuf, 9);
+
+    // -------------------------------------------------------------------------
+    // Test 5: Escape handling — '?+' in element is NOT a separator
+    // Buffer: "TST+A?+B+C'"
+    // EdiElementSplit must give 2 elements: "A?+B" (raw) and "C"
+    // EdiUnescape on "A?+B" must give "A+B" (3 bytes)
+    // -------------------------------------------------------------------------
+    var una5: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead("X"c as int64, 1, una5);   // forces defaults
+    var sctx5: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx5, una5, 0);
+    var raw5: pchar := "TST+A?+B+C'"c;
+    var seg5: int64 := alloc(EDI_SEG_SIZE);
+    EdiSegmentNext(raw5 as int64, 11, sctx5, seg5);   // extract "TST+A?+B+C"
+
+    var elems5: int64 := alloc(4 * EDI_ELEM_SIZE);
+    var nElems5: int64 := EdiElementSplit(seg5, elems5, 4);
+    if (nElems5 != 2) {
+        PrintLn("FAIL: escaped '+' split → should give 2 elements"c); ok := 0;
+    } else { PrintLn("PASS: escaped '+' gives 2 elements (not 3)"c); }
+    var e5_0_len: int64 := peek64(elems5 + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+    var e5_1_len: int64 := peek64(elems5 + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+    if (e5_0_len != 4) {
+        PrintLn("FAIL: first element raw len should be 4 (A?+B)"c); ok := 0;
+    } else { PrintLn("PASS: first element raw len = 4"c); }
+    if (e5_1_len != 1) {
+        PrintLn("FAIL: second element len should be 1 (C)"c); ok := 0;
+    } else { PrintLn("PASS: second element len = 1 (C)"c); }
+
+    // Unescape first element "A?+B" → "A+B"
+    var e5_0_ptr: int64 := peek64(elems5 + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+    var dst5: int64 := alloc(8);
+    var ulen: int64 := EdiUnescape(e5_0_ptr, e5_0_len, dst5, 8);
+    if (ulen != 3) {
+        PrintLn("FAIL: EdiUnescape of 'A?+B' should give 3 bytes"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnescape length = 3"c); }
+    if (peek8(dst5) != 65 || peek8(dst5+1) != 43 || peek8(dst5+2) != 66) {
+        PrintLn("FAIL: EdiUnescape result should be 'A+B'"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnescape result = 'A+B'"c); }
+
+    free(dst5, 8);
+    free(elems5, 4 * EDI_ELEM_SIZE);
+    free(seg5, EDI_SEG_SIZE);
+    free(sctx5, EDI_SEGCTX_SIZE);
+    free(una5, EDI_UNA_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 6: EdiElementSplit — split "BGM+380+INV001+9" into 3 elements
+    // -------------------------------------------------------------------------
+    var una6: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead("X"c as int64, 1, una6);
+    var sctx6: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx6, una6, 0);
+    var raw6: pchar := "BGM+380+INV001+9'"c;
+    var seg6: int64 := alloc(EDI_SEG_SIZE);
+    EdiSegmentNext(raw6 as int64, 17, sctx6, seg6);
+    var elems6: int64 := alloc(6 * EDI_ELEM_SIZE);
+    var n6: int64 := EdiElementSplit(seg6, elems6, 6);
+    if (n6 != 3) {
+        PrintLn("FAIL: BGM+380+INV001+9 should have 3 elements"c); ok := 0;
+    } else { PrintLn("PASS: BGM segment → 3 elements"c); }
+    if (peek64(elems6 + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN) != 3) {
+        PrintLn("FAIL: elem[0] len should be 3 (380)"c); ok := 0;
+    } else { PrintLn("PASS: elem[0] len = 3 (380)"c); }
+    if (peek64(elems6 + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN) != 6) {
+        PrintLn("FAIL: elem[1] len should be 6 (INV001)"c); ok := 0;
+    } else { PrintLn("PASS: elem[1] len = 6 (INV001)"c); }
+    // elem[0] first byte = '3' = 51
+    var e6p: int64 := peek64(elems6 + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+    if (peek8(e6p) != 51) {
+        PrintLn("FAIL: elem[0][0] should be '3'"c); ok := 0;
+    } else { PrintLn("PASS: elem[0] starts with '3'"c); }
+    free(elems6, 6 * EDI_ELEM_SIZE);
+    free(seg6, EDI_SEG_SIZE);
+    free(sctx6, EDI_SEGCTX_SIZE);
+    free(una6, EDI_UNA_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 7: EdiComponentSplit — "UNOA:1" → 2 components "UNOA" and "1"
+    // -------------------------------------------------------------------------
+    var compIn: pchar := "UNOA:1"c;
+    var comps7: int64 := alloc(4 * EDI_ELEM_SIZE);
+    var nc7: int64 := EdiComponentSplit(compIn as int64, 6, comps7, 4);
+    if (nc7 != 2) {
+        PrintLn("FAIL: 'UNOA:1' should split into 2 components"c); ok := 0;
+    } else { PrintLn("PASS: EdiComponentSplit gives 2 components"c); }
+    if (peek64(comps7 + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN) != 4) {
+        PrintLn("FAIL: comp[0] len should be 4 (UNOA)"c); ok := 0;
+    } else { PrintLn("PASS: comp[0] len = 4 (UNOA)"c); }
+    if (peek64(comps7 + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN) != 1) {
+        PrintLn("FAIL: comp[1] len should be 1 (1)"c); ok := 0;
+    } else { PrintLn("PASS: comp[1] len = 1"c); }
+    // comp[0] first byte = 'U' = 85
+    var c7p: int64 := peek64(comps7 + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+    if (peek8(c7p) != 85) {
+        PrintLn("FAIL: comp[0][0] should be 'U'"c); ok := 0;
+    } else { PrintLn("PASS: comp[0] starts with 'U'"c); }
+    free(comps7, 4 * EDI_ELEM_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 8: EdiUnescape — no escape chars → unchanged
+    // -------------------------------------------------------------------------
+    var plain: pchar := "HELLO"c;
+    var dst8: int64 := alloc(8);
+    var ulen8: int64 := EdiUnescape(plain as int64, 5, dst8, 8);
+    if (ulen8 != 5) {
+        PrintLn("FAIL: EdiUnescape of plain string should be 5"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnescape plain string len = 5"c); }
+    if (memEq(plain as int64, 5, dst8, 5) != 1) {
+        PrintLn("FAIL: EdiUnescape plain string bytes differ"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnescape plain string bytes equal"c); }
+    free(dst8, 8);
+
+    // -------------------------------------------------------------------------
+    // Test 9: EdiUnbWrite + EdiUnbRead round-trip
+    // -------------------------------------------------------------------------
+    var ctx9w: int64 := alloc(EDI_CTX_SIZE);
+    EdiCtxInit(ctx9w);
+    var snd9: pchar := "SENDR01"c;
+    var rcv9: pchar := "RECV001"c;
+    var icr9: pchar := "ICR001"c;
+    var dt9:  pchar := "20260615"c;
+    var tm9:  pchar := "1200"c;
+    poke64(ctx9w + EDI_CTX_SENDER,   snd9 as int64);
+    poke64(ctx9w + EDI_CTX_SNDLEN,   7);
+    poke64(ctx9w + EDI_CTX_RCVR,     rcv9 as int64);
+    poke64(ctx9w + EDI_CTX_RCVLEN,   7);
+    poke64(ctx9w + EDI_CTX_ICREF,    icr9 as int64);
+    poke64(ctx9w + EDI_CTX_ICREFLEN, 6);
+    poke64(ctx9w + EDI_CTX_DATE,     dt9 as int64);
+    poke64(ctx9w + EDI_CTX_TIME,     tm9 as int64);
+
+    var out9: int64 := alloc(256);
+    var written9: int64 := EdiUnbWrite(ctx9w, out9, 256);
+    if (written9 < 10) {
+        PrintLn("FAIL: EdiUnbWrite returned too few bytes"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnbWrite returned bytes > 10"c); }
+
+    // Read back (exclude trailing segment terminator)
+    var ctx9r: int64 := alloc(EDI_CTX_SIZE);
+    EdiCtxInit(ctx9r);
+    var rr9: int64 := EdiUnbRead(out9, written9 - 1, ctx9r);
+    if (rr9 != EDI_OK) {
+        PrintLn("FAIL: EdiUnbRead of round-trip should return EDI_OK"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnbRead returns EDI_OK"c); }
+
+    var sndLen9: int64 := peek64(ctx9r + EDI_CTX_SNDLEN);
+    if (sndLen9 != 7) {
+        PrintLn("FAIL: round-trip sender len should be 7"c); ok := 0;
+    } else { PrintLn("PASS: round-trip sender len = 7"c); }
+    var sndPtr9: int64 := peek64(ctx9r + EDI_CTX_SENDER);
+    if (memEq(sndPtr9, 7, snd9 as int64, 7) != 1) {
+        PrintLn("FAIL: round-trip sender bytes differ"c); ok := 0;
+    } else { PrintLn("PASS: round-trip sender = SENDR01"c); }
+
+    var rcvLen9: int64 := peek64(ctx9r + EDI_CTX_RCVLEN);
+    if (rcvLen9 != 7) {
+        PrintLn("FAIL: round-trip receiver len should be 7"c); ok := 0;
+    } else { PrintLn("PASS: round-trip receiver len = 7"c); }
+
+    var icrLen9: int64 := peek64(ctx9r + EDI_CTX_ICREFLEN);
+    if (icrLen9 != 6) {
+        PrintLn("FAIL: round-trip ICR len should be 6"c); ok := 0;
+    } else { PrintLn("PASS: round-trip ICR len = 6"c); }
+    var icrPtr9: int64 := peek64(ctx9r + EDI_CTX_ICREF);
+    if (memEq(icrPtr9, 6, icr9 as int64, 6) != 1) {
+        PrintLn("FAIL: round-trip ICR bytes differ"c); ok := 0;
+    } else { PrintLn("PASS: round-trip ICR = ICR001"c); }
+
+    var charset9: int64 := peek64(ctx9r + EDI_CTX_CHARSET);
+    if (charset9 != EDI_CHARSET_UNOA) {
+        PrintLn("FAIL: round-trip charset should be UNOA"c); ok := 0;
+    } else { PrintLn("PASS: round-trip charset = UNOA"c); }
+
+    free(out9, 256);
+    free(ctx9w, EDI_CTX_SIZE);
+    free(ctx9r, EDI_CTX_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 10: EdiUnzWrite — verify tag and content
+    // -------------------------------------------------------------------------
+    var ctx10: int64 := alloc(EDI_CTX_SIZE);
+    EdiCtxInit(ctx10);
+    var icr10: pchar := "ICRT10"c;
+    poke64(ctx10 + EDI_CTX_ICREF,    icr10 as int64);
+    poke64(ctx10 + EDI_CTX_ICREFLEN, 6);
+    var out10: int64 := alloc(64);
+    var w10: int64 := EdiUnzWrite(ctx10, 3, out10, 64);
+    // Expected: "UNZ+3+ICRT10'" → 13 bytes
+    if (w10 != 13) {
+        PrintLn("FAIL: EdiUnzWrite len != 13"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnzWrite len = 13"c); }
+    // First 3 bytes = "UNZ" (85, 78, 90)
+    if (peek8(out10) != 85 || peek8(out10+1) != 78 || peek8(out10+2) != 90) {
+        PrintLn("FAIL: EdiUnzWrite tag != UNZ"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnzWrite tag = UNZ"c); }
+    // 5th byte = '3' = 51 (message count 3)
+    if (peek8(out10+4) != 51) {
+        PrintLn("FAIL: EdiUnzWrite msgCount != '3'"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnzWrite msgCount = '3'"c); }
+    // Last byte = segment terminator = 39 ('\''')
+    if (peek8(out10 + w10 - 1) != 39) {
+        PrintLn("FAIL: EdiUnzWrite last byte != segment terminator"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnzWrite ends with segment terminator"c); }
+    free(out10, 64);
+    free(ctx10, EDI_CTX_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 11: EdiUnhWrite + EdiUntWrite
+    // EdiUnhWrite(ctx, "1", "INVOIC", out, max) → "UNH+1+INVOIC:D:01B:UN'"
+    // EdiUntWrite(ctx, 5, "1", out, max)        → "UNT+5+1'"
+    // -------------------------------------------------------------------------
+    var ctx11: int64 := alloc(EDI_CTX_SIZE);
+    EdiCtxInit(ctx11);
+    var out11h: int64 := alloc(64);
+    var ref11: pchar := "1"c;
+    var typ11: pchar := "INVOIC"c;
+    var w11h: int64 := EdiUnhWrite(ctx11, ref11 as int64, typ11 as int64, out11h, 64);
+    // "UNH+1+INVOIC:D:01B:UN'" = 22 bytes
+    if (w11h != 22) {
+        PrintLn("FAIL: EdiUnhWrite len != 22"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnhWrite len = 22"c); }
+    // Tag "UNH" = 85, 78, 72
+    if (peek8(out11h) != 85 || peek8(out11h+1) != 78 || peek8(out11h+2) != 72) {
+        PrintLn("FAIL: EdiUnhWrite tag != UNH"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnhWrite tag = UNH"c); }
+    // Last byte = segment terminator
+    if (peek8(out11h + w11h - 1) != 39) {
+        PrintLn("FAIL: EdiUnhWrite missing segment terminator"c); ok := 0;
+    } else { PrintLn("PASS: EdiUnhWrite ends with terminator"c); }
+
+    var out11t: int64 := alloc(32);
+    var w11t: int64 := EdiUntWrite(ctx11, 5, ref11 as int64, out11t, 32);
+    // "UNT+5+1'" = 8 bytes
+    if (w11t != 8) {
+        PrintLn("FAIL: EdiUntWrite len != 8"c); ok := 0;
+    } else { PrintLn("PASS: EdiUntWrite len = 8"c); }
+    // Tag "UNT" = 85, 78, 84
+    if (peek8(out11t) != 85 || peek8(out11t+1) != 78 || peek8(out11t+2) != 84) {
+        PrintLn("FAIL: EdiUntWrite tag != UNT"c); ok := 0;
+    } else { PrintLn("PASS: EdiUntWrite tag = UNT"c); }
+    free(out11h, 64);
+    free(out11t, 32);
+    free(ctx11, EDI_CTX_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 12: EdiSeqNext — monotonically increasing per partner
+    // -------------------------------------------------------------------------
+    var state12: int64 := alloc(EDI_STATE_SIZE);
+    EdiStateInit(state12);
+    var pA: pchar := "PARTNER_A"c;
+    var pB: pchar := "PARTNER_B"c;
+    var s12a1: int64 := EdiSeqNext(state12, pA as int64);
+    var s12a2: int64 := EdiSeqNext(state12, pA as int64);
+    var s12a3: int64 := EdiSeqNext(state12, pA as int64);
+    var s12b1: int64 := EdiSeqNext(state12, pB as int64);
+    var s12b2: int64 := EdiSeqNext(state12, pB as int64);
+    if (s12a1 != 1) { PrintLn("FAIL: PARTNER_A seq1 != 1"c); ok := 0; }
+    else             { PrintLn("PASS: PARTNER_A seq1 = 1"c); }
+    if (s12a2 != 2) { PrintLn("FAIL: PARTNER_A seq2 != 2"c); ok := 0; }
+    else             { PrintLn("PASS: PARTNER_A seq2 = 2"c); }
+    if (s12a3 != 3) { PrintLn("FAIL: PARTNER_A seq3 != 3"c); ok := 0; }
+    else             { PrintLn("PASS: PARTNER_A seq3 = 3"c); }
+    if (s12b1 != 1) { PrintLn("FAIL: PARTNER_B seq1 != 1 (should be independent)"c); ok := 0; }
+    else             { PrintLn("PASS: PARTNER_B seq1 = 1 (independent counter)"c); }
+    if (s12b2 != 2) { PrintLn("FAIL: PARTNER_B seq2 != 2"c); ok := 0; }
+    else             { PrintLn("PASS: PARTNER_B seq2 = 2"c); }
+    // PARTNER_A counter must still be at 3 (not affected by PARTNER_B)
+    var s12a4: int64 := EdiSeqNext(state12, pA as int64);
+    if (s12a4 != 4) { PrintLn("FAIL: PARTNER_A seq4 != 4 (B counter leaked)"c); ok := 0; }
+    else             { PrintLn("PASS: PARTNER_A seq4 = 4 (counters independent)"c); }
+    free(state12, EDI_STATE_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 13: EdiDuplicateCheck — same ICR = dup, different = new
+    // -------------------------------------------------------------------------
+    var state13: int64 := alloc(EDI_STATE_SIZE);
+    EdiStateInit(state13);
+    var pC: pchar := "PARTNER_C"c;
+    var icr13a: pchar := "ICR-2026-001"c;
+    var icr13b: pchar := "ICR-2026-002"c;
+    var d13_1: int64 := EdiDuplicateCheck(state13, pC as int64, icr13a as int64);
+    if (d13_1 != 0) {
+        PrintLn("FAIL: first ICR should not be duplicate"c); ok := 0;
+    } else { PrintLn("PASS: first ICR = new (0)"c); }
+    var d13_2: int64 := EdiDuplicateCheck(state13, pC as int64, icr13a as int64);
+    if (d13_2 != 1) {
+        PrintLn("FAIL: second same ICR should be duplicate (1)"c); ok := 0;
+    } else { PrintLn("PASS: second same ICR = duplicate (1)"c); }
+    var d13_3: int64 := EdiDuplicateCheck(state13, pC as int64, icr13b as int64);
+    if (d13_3 != 0) {
+        PrintLn("FAIL: different ICR should not be duplicate"c); ok := 0;
+    } else { PrintLn("PASS: different ICR = new (0)"c); }
+    var d13_4: int64 := EdiDuplicateCheck(state13, pC as int64, icr13b as int64);
+    if (d13_4 != 1) {
+        PrintLn("FAIL: repeated ICR-002 should be duplicate"c); ok := 0;
+    } else { PrintLn("PASS: repeated ICR-002 = duplicate (1)"c); }
+    free(state13, EDI_STATE_SIZE);
+
+    if (ok != 0) { PrintLn("=== EDI-00: ALL PASS ==="c); }
+    else          { PrintLn("=== EDI-00: SOME FAIL ==="c); }
+    return ok;
+}

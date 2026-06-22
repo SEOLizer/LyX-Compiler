@@ -1,0 +1,952 @@
+// LX-01: Lyx OS Backend — ELF-Grundgerüst + .note.lyx-abi
+// LX-02: Codegen-Skelett (IR-Dispatch, SYSCALL-Makro, Slot-Modell)
+//
+// ELF-Layout (x86-64 EXEC, statisch):
+//   0x0000  ELF header        64 B
+//   0x0040  PH[0] PT_LOAD RX  56 B  (covers whole file)
+//   0x0078  PH[1] PT_NOTE R   56 B  (.note.lyx-abi)
+//   0x00B0  padding            …
+//   0x1000  .text (_start)     N B   (IR-compiled code)
+//   0x1000+N .note.lyx-abi    24 B
+//
+// Syscall ABI (syscalls.md §2.2):
+//   in:  rax=nr, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5, r9=a6
+//   out: rax=errcode, rdx=value
+//   clobbered: rcx, r11
+//   callee-saved: rbx, rbp, r12–r15
+//
+// sys_exit_group = 0x0002 (lyxos)
+
+import src.ir;
+
+// ---------------------------------------------------------------------------
+// EmitLyxOS — x86-64 code generator for --target=lyxos
+// ---------------------------------------------------------------------------
+
+pub type EmitLyxOS = class {
+    irMod:         int64;   // pointer to IRModule
+    codeBuf:       int64;   // mmap'd output buffer
+    codeLen:       int64;   // bytes written so far
+    codeCap:       int64;
+    strPatchBuf:   int64;   // array of (leaOff: int64, strOff: int64) pairs for CONST_STR
+    strPatchCount: int64;
+    strPatchCap:   int64;   // Kapazität in Bytes (16 Byte/Eintrag); wächst dynamisch
+
+    pub fn init(ir: int64): void {
+        self.irMod         := ir;
+        self.codeCap       := 65536;
+        self.codeBuf       := alloc(self.codeCap);
+        self.codeLen       := 0;
+        self.strPatchCap   := 4096;
+        self.strPatchBuf   := alloc(self.strPatchCap);
+        self.strPatchCount := 0;
+    }
+
+    // strPatchBuf wächst dynamisch (16 Byte/Eintrag). Vorher fix 4096 = nur 256 Einträge →
+    // große Programme (z.B. lyxc.lyx, tausende String-Literale) überliefen den Buffer
+    // ungeprüft → Heap-Korruption → Garbage-leaOff in emitStrPool → Wild-poke8-SIGSEGV.
+    fn growStrPatch(): void {
+        var need: int64 := (self.strPatchCount + 1) * 16;
+        if need <= self.strPatchCap { return; }
+        var nc: int64 := self.strPatchCap * 2;
+        while nc < need { nc := nc * 2; }
+        var nb: int64 := alloc(nc);
+        memcpy(nb, self.strPatchBuf, self.strPatchCount * 16);
+        self.strPatchBuf := nb;
+        self.strPatchCap := nc;
+    }
+
+    fn grow(need: int64): void {
+        if (self.codeLen + need) <= self.codeCap { return; }
+        var nc: int64 := self.codeCap * 2;
+        while nc < (self.codeLen + need) { nc := nc * 2; }
+        var nb: int64 := alloc(nc);
+        memcpy(nb, self.codeBuf, self.codeLen);
+        self.codeBuf := nb;
+        self.codeCap := nc;
+    }
+
+    pub fn emit8(v: int64): void {
+        self.grow(1);
+        poke8(self.codeBuf + self.codeLen, v & 0xFF);
+        self.codeLen := self.codeLen + 1;
+    }
+
+    pub fn emit32(v: int64): void {
+        self.grow(4);
+        poke8(self.codeBuf + self.codeLen + 0,  v        & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 1, (v >>  8) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 2, (v >> 16) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 3, (v >> 24) & 0xFF);
+        self.codeLen := self.codeLen + 4;
+    }
+
+    pub fn emit64(v: int64): void {
+        self.grow(8);
+        poke8(self.codeBuf + self.codeLen + 0,  v        & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 1, (v >>  8) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 2, (v >> 16) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 3, (v >> 24) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 4, (v >> 32) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 5, (v >> 40) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 6, (v >> 48) & 0xFF);
+        poke8(self.codeBuf + self.codeLen + 7, (v >> 56) & 0xFF);
+        self.codeLen := self.codeLen + 8;
+    }
+
+    // Patch a u32 at an already-written offset.
+    fn patch32(off: int64, v: int64): void {
+        poke8(self.codeBuf + off + 0,  v        & 0xFF);
+        poke8(self.codeBuf + off + 1, (v >>  8) & 0xFF);
+        poke8(self.codeBuf + off + 2, (v >> 16) & 0xFF);
+        poke8(self.codeBuf + off + 3, (v >> 24) & 0xFF);
+    }
+
+    // Patch a u64 at an already-written offset.
+    fn patch64(off: int64, v: int64): void {
+        poke8(self.codeBuf + off + 0,  v        & 0xFF);
+        poke8(self.codeBuf + off + 1, (v >>  8) & 0xFF);
+        poke8(self.codeBuf + off + 2, (v >> 16) & 0xFF);
+        poke8(self.codeBuf + off + 3, (v >> 24) & 0xFF);
+        poke8(self.codeBuf + off + 4, (v >> 32) & 0xFF);
+        poke8(self.codeBuf + off + 5, (v >> 40) & 0xFF);
+        poke8(self.codeBuf + off + 6, (v >> 48) & 0xFF);
+        poke8(self.codeBuf + off + 7, (v >> 56) & 0xFF);
+    }
+
+    // --- Syscall helpers ---
+
+    // SYSCALL instruction: 0F 05
+    fn emitSyscall(): void {
+        self.emit8(0x0F);
+        self.emit8(0x05);
+    }
+
+    // MOV rax, imm64  (REX.W B8+rd)
+    fn emitMovRaxImm(v: int64): void {
+        self.emit8(0x48);   // REX.W
+        self.emit8(0xB8);   // MOV rax, imm64
+        self.emit64(v);
+    }
+
+    // MOV rdi, imm32  (sign-extended)  — xor edi,edi for 0
+    fn emitMovRdiImm32(v: int64): void {
+        if v == 0 {
+            // XOR edi, edi  (31 FF)  — also zeroes rdi via zero-extension
+            self.emit8(0x31);
+            self.emit8(0xFF);
+        } else {
+            // MOV edi, imm32  (BF imm32)
+            self.emit8(0xBF);
+            self.emit32(v);
+        }
+    }
+
+    // Emit: sys_exit(code) — Kernel .ring3_exit-Handler erwartet Linux-kompatible
+    // Nummer rax=60 (sys_exit), Exit-Code in rdi (SysV AMD64 arg0). Kernel speichert
+    // ring3_exit_code, stellt Kernel-CR3/Kontext wieder her, springt via Trampolin
+    // zurück nach vmm_op29. (Früher rax=2 = lyxc-Bug-Kompat; auf §10.4 wäre 2=sys_open.)
+    fn emitSysExitGroup(code: int64): void {
+        self.emitMovRaxImm(60);       // rax = 60 (sys_exit)
+        self.emitMovRdiImm32(code);   // rdi = exit code
+        self.emitSyscall();
+    }
+
+    // Patch a u32 at an already-written position.
+    pub fn patchCallRel32(off: int64, rel32: int64): void {
+        self.patch32(off, rel32);
+    }
+
+    // --- Slot model (rbp-based locals, 8 bytes each) ---
+    // slot 0 → [rbp - 8], slot 1 → [rbp - 16], etc.
+    fn slotOff(slot: int64): int64 {
+        return 0 - (slot + 1) * 8;
+    }
+
+    // --- Function prologue / epilogue ---
+
+    fn emitPrologue(localCount: int64): void {
+        // PUSH rbp
+        self.emit8(0x55);
+        // MOV rbp, rsp
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xE5);
+        // SUB rsp, localCount*8  (align to 16: round up to even)
+        var frameBytes: int64 := localCount * 8;
+        var aligned: int64 := ((frameBytes + 15) / 16) * 16;
+        if aligned > 0 {
+            if aligned <= 127 {
+                // SUB rsp, imm8  (48 83 EC imm8)
+                self.emit8(0x48); self.emit8(0x83); self.emit8(0xEC);
+                self.emit8(aligned);
+            } else {
+                // SUB rsp, imm32  (48 81 EC imm32)
+                self.emit8(0x48); self.emit8(0x81); self.emit8(0xEC);
+                self.emit32(aligned);
+            }
+        }
+    }
+
+    fn emitEpilogue(): void {
+        // MOV rsp, rbp
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xEC);
+        // POP rbp
+        self.emit8(0x5D);
+        // RET
+        self.emit8(0xC3);
+    }
+
+    // --- _start entry point (LX-03) ---
+    // Stack-Canary-Seed via RTC: Kernel hat KEINEN getrandom-Syscall (§10.4); 0x000C=12
+    // wäre unbelegt → uninitialisierter Canary. Stattdessen RTC-Zeit (138/134) + rsp mischen.
+    // Layout (from buffer offset 0):
+    //   +0   XOR rbp, rbp           (3 bytes)
+    //   +3   MOV rax, 138           (10 bytes)  sys_rtc_datetime → rdx=(date<<16)|time
+    //   +13  SYSCALL                (2 bytes)
+    //   +15  MOV r8, rdx            (3 bytes)
+    //   +18  SHL r8, 32             (4 bytes)
+    //   +22  MOV rax, 134           (10 bytes)  sys_rtc_read → rdx=(h<<8)|m
+    //   +32  SYSCALL                (2 bytes)
+    //   +34  OR  r8, rdx            (3 bytes)
+    //   +37  XOR r8, rsp            (3 bytes)   ASLR-Entropie einmischen
+    //   +40  MOV [rsp-8], r8        (5 bytes)   → canary at [rsp-8]
+    //   +45  CALL rel32             (5 bytes)   ← rel32 at +46, callNextIP = 50
+    //   +50  MOV edi, eax           (2 bytes)   exit code
+    //   +52  MOV rax, 60            (10 bytes)  sys_exit (Linux-kompat, .ring3_exit)
+    //   +62  SYSCALL                (2 bytes)
+    pub fn emitStartStub(): void {
+        // XOR rbp, rbp
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xED);
+        self.emitCanarySeed();                                 // RTC-Seed → [rsp-8]
+        // CALL main (placeholder, patched at +46)
+        self.emit8(0xE8); self.emit32(0);
+        // sys_exit(rax) — Kernel .ring3_exit erwartet rax=60, rdi=Exit-Code
+        self.emit8(0x89); self.emit8(0xC7);                     // MOV edi, eax
+        self.emitMovRaxImm(60);                                 // MOV rax, 60 (sys_exit)
+        self.emitSyscall();                                     // SYSCALL
+    }
+
+    // Stack-Canary-Seed (42 Bytes) — RTC-Zeit + rsp gemischt nach [rsp-8].
+    // Kein getrandom-Syscall in §10.4; RTC (138/134) ist die einzige Kernel-Entropiequelle.
+    fn emitCanarySeed(): void {
+        self.emitMovRaxImm(138);                               // MOV rax, 138 (sys_rtc_datetime)
+        self.emitSyscall();                                    // → rdx = (date<<16)|time
+        self.emit8(0x49); self.emit8(0x89); self.emit8(0xD0);  // MOV r8, rdx
+        self.emit8(0x49); self.emit8(0xC1); self.emit8(0xE0); self.emit8(0x20); // SHL r8, 32
+        self.emitMovRaxImm(134);                               // MOV rax, 134 (sys_rtc_read)
+        self.emitSyscall();                                    // → rdx = (h<<8)|m
+        self.emit8(0x49); self.emit8(0x09); self.emit8(0xD0);  // OR r8, rdx
+        self.emit8(0x49); self.emit8(0x31); self.emit8(0xE0);  // XOR r8, rsp
+        self.emit8(0x4C); self.emit8(0x89); self.emit8(0x44); self.emit8(0x24); self.emit8(0xF8); // MOV [rsp-8], r8
+    }
+
+    // LX-36: _start for EVENT_LOOP lifecycle (86 bytes).
+    // RTC-Canary-Seed (wie ONE_SHOT), dann sys_event_loop_init (0x0020) vor CALL main.
+    // CALL rel32 is at byte offset 68; callNextIP = 72.
+    // Caller must use: patchCallRel32(68, mainOff - 72)
+    pub fn emitStartStubEventLoop(): void {
+        // XOR rbp, rbp
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xED);
+        self.emitCanarySeed();                               // +3:  RTC-Seed → [rsp-8], endet +45
+        // sys_event_loop_init (0x0020): kernel registers lifecycle sources
+        // MOV rdi, imm64 (0 = kernel reads TLV 0x08 from loaded binary)
+        self.emit8(0x48); self.emit8(0xBF); self.emit64(0);  // +45: MOV rdi, 0
+        self.emitMovRaxImm(0x0020);                           // +55: MOV rax, 0x0020
+        self.emitSyscall();                                   // +65: SYSCALL
+        // CALL main placeholder: rel32 at byte 68, callNextIP = 72
+        self.emit8(0xE8); self.emit32(0);                     // +67: CALL rel32
+        // sys_exit(rax) — Kernel .ring3_exit erwartet rax=60, rdi=Exit-Code
+        self.emit8(0x89); self.emit8(0xC7);                   // +72: MOV edi, eax
+        self.emitMovRaxImm(60);                               // +74: MOV rax, 60 (sys_exit)
+        self.emitSyscall();                                   // +84: SYSCALL
+    }
+
+    // --- Slot load/store helpers ---
+
+    fn emitMovRaxFromSlot(slot: int64): void {
+        var off: int64 := self.slotOff(slot);
+        if slot < 16 {
+            // MOV rax, [rbp + disp8]  (48 8B 45 <d8>)
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x45);
+            self.emit8(off & 0xFF);
+        } else {
+            // MOV rax, [rbp + disp32]  (48 8B 85 <d32>)
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x85);
+            self.emit32(off);
+        }
+    }
+
+    fn emitMovSlotFromRax(slot: int64): void {
+        var off: int64 := self.slotOff(slot);
+        if slot < 16 {
+            // MOV [rbp + disp8], rax  (48 89 45 <d8>)
+            self.emit8(0x48); self.emit8(0x89); self.emit8(0x45);
+            self.emit8(off & 0xFF);
+        } else {
+            // MOV [rbp + disp32], rax  (48 89 85 <d32>)
+            self.emit8(0x48); self.emit8(0x89); self.emit8(0x85);
+            self.emit32(off);
+        }
+    }
+
+    // CALL rel32 stub — wired up with real relocation in LX-03+
+    fn emitCall(funcIdx: int64, retSlot: int64): void {
+        self.emit8(0xE8);
+        self.emit32(0);
+    }
+
+    // LEA rax, [rip + rel32] with forward patch; rel32 resolved in emitStrPool().
+    fn emitConstStr(strOff: int64, dest: int64): void {
+        self.growStrPatch();
+        var pBase:  int64 := self.strPatchBuf + self.strPatchCount * 16;
+        var curLen: int64 := self.codeLen;
+        poke64(pBase + 0, curLen);
+        poke64(pBase + 8, strOff);
+        self.strPatchCount := self.strPatchCount + 1;
+        self.emit8(0x48); self.emit8(0x8D); self.emit8(0x05);
+        self.emit32(0);
+        self.emitMovSlotFromRax(dest);
+    }
+
+    fn emitStrPool(): void {
+        var strBuf:     int64 := peek64(self.irMod + IR_MOD_OFF_STRBUF);
+        var strLen:     int64 := peek64(self.irMod + IR_MOD_OFF_STRLEN);
+        var poolStart:  int64 := self.codeLen;
+        var patchCount: int64 := self.strPatchCount;
+        var patchBuf:   int64 := self.strPatchBuf;
+        var pi: int64 := 0;
+        while pi < patchCount {
+            var patchBase: int64 := patchBuf + pi * 16;
+            var leaOff: int64 := peek64(patchBase + 0);
+            var strOff: int64 := peek64(patchBase + 8);
+            var rel32: int64 := (poolStart + strOff) - (leaOff + 7);
+            self.patch32(leaOff + 3, rel32);
+            pi := pi + 1;
+        }
+        var si: int64 := 0;
+        while si < strLen {
+            self.emit8(peek8(strBuf + si));
+            si := si + 1;
+        }
+    }
+
+    fn emitMovRdiFromSlot(slot: int64): void {
+        var off: int64 := self.slotOff(slot);
+        if slot < 16 {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x7D);
+            self.emit8(off & 0xFF);
+        } else {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0xBD);
+            self.emit32(off);
+        }
+    }
+
+    fn emitMovR10FromSlot(slot: int64): void {
+        var off: int64 := self.slotOff(slot);
+        if slot < 16 {
+            self.emit8(0x4C); self.emit8(0x8B); self.emit8(0x55);
+            self.emit8(off & 0xFF);
+        } else {
+            self.emit8(0x4C); self.emit8(0x8B); self.emit8(0x95);
+            self.emit32(off);
+        }
+    }
+
+    fn emitMovR8FromSlot(slot: int64): void {
+        var off: int64 := self.slotOff(slot);
+        if slot < 16 {
+            self.emit8(0x4C); self.emit8(0x8B); self.emit8(0x45);
+            self.emit8(off & 0xFF);
+        } else {
+            self.emit8(0x4C); self.emit8(0x8B); self.emit8(0x85);
+            self.emit32(off);
+        }
+    }
+
+    fn emitMovRsiFromSlot(slot: int64): void {
+        var off: int64 := self.slotOff(slot);
+        if slot < 16 {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x75);
+            self.emit8(off & 0xFF);
+        } else {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0xB5);
+            self.emit32(off);
+        }
+    }
+
+    fn emitMovRdxFromSlot(slot: int64): void {
+        var off: int64 := self.slotOff(slot);
+        if slot < 16 {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x55);
+            self.emit8(off & 0xFF);
+        } else {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x95);
+            self.emit32(off);
+        }
+    }
+
+    fn emitPrintStr(): void {
+        self.emitMovRsiFromSlot(0);
+        self.emitMovRdxFromSlot(1);
+        self.emit8(0xBF); self.emit32(1);
+        self.emitMovRaxImm(0x0203);
+        self.emitSyscall();
+    }
+
+    fn emitPrintInt(): void {
+        self.emitMovRaxFromSlot(0);
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xEC); self.emit8(0x20);
+        self.emit8(0x45); self.emit8(0x31); self.emit8(0xC0);
+        self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);
+        self.emit8(0x79); self.emit8(9);
+        self.emit8(0x41); self.emit8(0xB8); self.emit32(1);
+        self.emit8(0x48); self.emit8(0xF7); self.emit8(0xD8);
+        self.emit8(0x41); self.emit8(0xB9); self.emit32(10);
+        self.emit8(0x41); self.emit8(0xBB); self.emit32(23);
+        self.emit8(0x31); self.emit8(0xD2);
+        self.emit8(0x49); self.emit8(0xF7); self.emit8(0xF1);
+        self.emit8(0x83); self.emit8(0xC2); self.emit8(0x30);
+        self.emit8(0x42); self.emit8(0x88); self.emit8(0x14); self.emit8(0x1C);
+        self.emit8(0x41); self.emit8(0xFF); self.emit8(0xCB);
+        self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);
+        self.emit8(0x75); self.emit8(0xEC);
+        self.emit8(0x45); self.emit8(0x85); self.emit8(0xC0);
+        self.emit8(0x74); self.emit8(8);
+        self.emit8(0x42); self.emit8(0xC6); self.emit8(0x04); self.emit8(0x1C); self.emit8(0x2D);
+        self.emit8(0x41); self.emit8(0xFF); self.emit8(0xCB);
+        self.emit8(0x4A); self.emit8(0x8D); self.emit8(0x74); self.emit8(0x1C); self.emit8(0x01);
+        self.emit8(0xBA); self.emit32(23);
+        self.emit8(0x44); self.emit8(0x29); self.emit8(0xDA);
+        self.emit8(0xBF); self.emit32(1);
+        self.emitMovRaxImm(0x0203);
+        self.emitSyscall();
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC4); self.emit8(0x20);
+    }
+
+    // LX-06: generic N-arg LyxOS VFS syscall emitter
+    // Args expected in slots 0..argc-1; return value (rdx) stored to dest.
+    fn emitVfsSyscall(nr: int64, argc: int64, dest: int64): void {
+        self.emitMovRaxImm(nr);
+        if argc >= 1 { self.emitMovRdiFromSlot(0); }
+        if argc >= 2 { self.emitMovRsiFromSlot(1); }
+        if argc >= 3 { self.emitMovRdxFromSlot(2); }
+        if argc >= 4 { self.emitMovR10FromSlot(3); }
+        if argc >= 5 { self.emitMovR8FromSlot(4); }
+        if argc >= 6 {
+            // MOV r9, [rbp + slotOff(5)]  — r9=arg6 (REX.R reg=001)
+            var off6: int64 := self.slotOff(5);
+            if 5 < 16 {
+                self.emit8(0x4C); self.emit8(0x8B); self.emit8(0x4D);
+                self.emit8(off6 & 0xFF);
+            } else {
+                self.emit8(0x4C); self.emit8(0x8B); self.emit8(0x8D);
+                self.emit32(off6);
+            }
+        }
+        self.emitSyscall();
+        self.emit8(0x49); self.emit8(0x89); self.emit8(0xC7);  // MOV r15, rax (LX-21: save error code)
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);  // MOV rax, rdx (LyxOS: rdx=value)
+        self.emitMovSlotFromRax(dest);
+    }
+
+    fn emitBuiltinCall(id: int64, dest: int64): void {
+        if id == 1 {
+            self.emitPrintStr();
+        } else if id == 2 {
+            self.emitPrintInt();
+        // ABI: kanonische Nummern aus syscalls.md §10.4 "implementiert" (dezimal).
+        // Builtins ohne §10.4-Äquivalent behalten ihre Hex-Design-Nummer (Kernel kennt sie nicht).
+        } else if id == 20 { self.emitVfsSyscall(2, 4, dest); }  // sys_open §10.4=2
+        else if id == 21 { self.emitVfsSyscall(3, 1, dest); }    // sys_close §10.4=3
+        else if id == 22 { self.emitVfsSyscall(0, 3, dest); }    // sys_read §10.4=0
+        else if id == 23 { self.emitVfsSyscall(95, 3, dest); }    // sys_write §10.4=95
+        else if id == 24 { self.emitVfsSyscall(0x0204, 3, dest); }    // sys_seek
+        else if id == 25 { self.emitVfsSyscall(0x0205, 4, dest); }    // sys_stat
+        else if id == 26 { self.emitVfsSyscall(135, 2, dest); }    // sys_fstat §10.4=135
+        else if id == 27 { self.emitVfsSyscall(139, 3, dest); }    // sys_mkdir §10.4=139
+        else if id == 28 { self.emitVfsSyscall(97, 3, dest); }    // sys_unlink §10.4=97
+        else if id == 29 { self.emitVfsSyscall(96, 4, dest); }    // sys_rename §10.4=96
+        else if id == 30 { self.emitVfsSyscall(0x020A, 3, dest); }    // sys_readdir
+        else if id == 31 { self.emitVfsSyscall(0x020B, 2, dest); }    // sys_dup
+        else if id == 32 { self.emitVfsSyscall(0x020C, 3, dest); }    // sys_pipe
+        else if id == 33 { self.emitVfsSyscall(0x020D, 2, dest); }    // sys_truncate
+        else if id == 34 { self.emitVfsSyscall(0x020E, 1, dest); }    // sys_sync
+        else if id == 35 { self.emitVfsSyscall(85, 3, dest); }    // sys_mount §10.4=85 (vol_id,disk_id,lba_start)
+        else if id == 36 { self.emitVfsSyscall(0x0210, 3, dest); }    // sys_umount
+        else if id == 37 { self.emitVfsSyscall(79, 2, dest); }    // sys_getcwd §10.4=79
+        else if id == 38 { self.emitVfsSyscall(80, 1, dest); }    // sys_chdir §10.4=80 (path_uva)
+        else if id == 39 { self.emitVfsSyscall(0x0213, 3, dest); }    // sys_symlink
+        else if id == 40 { self.emitVfsSyscall(0x0214, 4, dest); }    // sys_readlink
+        else if id == 41 { self.emitVfsSyscall(0x0215, 4, dest); }    // sys_content_id
+        else if id == 42 { self.emitVfsSyscall(0x0300, 3, dest); }    // sys_poll
+        else if id == 43 { self.emitVfsSyscall(0x0301, 3, dest); }    // sys_ioctl
+        else if id == 44 { self.emitVfsSyscall(0x0302, 4, dest); }    // sys_mmap_device
+        else if id == 45 { self.emitVfsSyscall(0x0303, 2, dest); }    // sys_irq_bind
+        else if id == 46 { self.emitVfsSyscall(0x0304, 2, dest); }    // sys_port_in
+        else if id == 47 { self.emitVfsSyscall(0x0305, 3, dest); }    // sys_port_out
+        else if id == 48 { self.emitVfsSyscall(0x0600, 3, dest); }    // sys_socket
+        else if id == 49 { self.emitVfsSyscall(0x0601, 3, dest); }    // sys_bind
+        else if id == 50 { self.emitVfsSyscall(0x0602, 2, dest); }    // sys_listen
+        else if id == 51 { self.emitVfsSyscall(0x0603, 3, dest); }    // sys_accept
+        else if id == 52 { self.emitVfsSyscall(0x0604, 3, dest); }    // sys_connect
+        else if id == 53 { self.emitVfsSyscall(0x0605, 3, dest); }    // sys_sendmsg
+        else if id == 54 { self.emitVfsSyscall(0x0606, 3, dest); }    // sys_recvmsg
+        else if id == 55 { self.emitVfsSyscall(0x0607, 5, dest); }    // sys_setsockopt
+        else if id == 56 { self.emitVfsSyscall(0x0608, 5, dest); }    // sys_getsockopt
+        else if id == 57 { self.emitVfsSyscall(0x0609, 2, dest); }    // sys_shutdown
+        // LX-09: Prozess & Threads (0x0000–0x000D) — IDs 58–71
+        // sys_version: Kernel hat KEINEN Versions-Syscall (§10.4). 0x0000 würde nr=0=sys_read
+        // treffen (Kollision). Backe stattdessen die Compiler-bekannte LyxOS-ABI-Version ein.
+        else if id == 58 {
+            self.emitMovRaxImm(0x0000000100000000);   // (major<<32)|minor = v1.0 (kein Syscall)
+            self.emitMovSlotFromRax(dest);
+        }
+        else if id == 59 { self.emitVfsSyscall(60, 1, dest); }    // sys_exit (Linux-kompat, .ring3_exit)
+        else if id == 60 { self.emitVfsSyscall(60, 1, dest); }    // sys_exit_group → §10.4 sys_exit=60 (Kernel kennt kein 231)
+        else if id == 61 { self.emitVfsSyscall(91, 3, dest); }    // sys_spawn → §10.4 sys_spawn_child=91 (path, argc, argv); 0x0003=sys_close-Kollision vermieden
+        else if id == 62 { self.emitVfsSyscall(0x0004, 4, dest); }    // sys_thread_spawn
+        else if id == 63 { self.emitVfsSyscall(0x0005, 1, dest); }    // sys_thread_exit
+        else if id == 64 { self.emitVfsSyscall(0x0006, 3, dest); }    // sys_wait
+        else if id == 65 { self.emitVfsSyscall(136, 0, dest); }    // sys_getpid §10.4=136
+        else if id == 66 { self.emitVfsSyscall(0x0008, 0, dest); }    // sys_gettid
+        else if id == 67 { self.emitVfsSyscall(24, 0, dest); }    // sys_yield §10.4=24
+        else if id == 68 { self.emitVfsSyscall(0x000A, 1, dest); }    // sys_sleep_ns
+        else if id == 69 { self.emitVfsSyscall(0x000B, 2, dest); }    // sys_priority
+        else if id == 70 { self.emitVfsSyscall(0x000C, 3, dest); }    // sys_getrandom
+        else if id == 71 { self.emitVfsSyscall(0x000D, 2, dest); }    // sys_signal_mask
+        // LX-10: IPC & Synchronisation (0x0400–0x040C) — id 72+k → 0x0400+k
+        else if id >= 72 && id <= 84 {
+            var lx10nr: int64 := 0x0400 + (id - 72);
+            var lx10ac: int64 := 1;
+            if id == 79 { lx10ac := 3; }
+            else if id == 80 { lx10ac := 3; }
+            else if id == 82 { lx10ac := 2; }
+            else if id == 83 { lx10ac := 2; }
+            else if id == 84 { lx10ac := 3; }
+            self.emitVfsSyscall(lx10nr, lx10ac, dest);
+        }
+        // LX-11: Zeit-Syscalls (0x0500–0x0504) — id 85+k → 0x0500+k
+        else if id >= 85 && id <= 89 {
+            var lx11nr: int64 := 0x0500 + (id - 85);
+            var lx11ac: int64 := 2;
+            if id == 87 { lx11ac := 3; }    // sys_timer_create(clock_id, notify_fd, flags)
+            else if id == 88 { lx11ac := 3; } // sys_timer_set(fd, interval_ns, initial_ns)
+            self.emitVfsSyscall(lx11nr, lx11ac, dest);
+        }
+        // LX-12: Capabilities + Pledge + Unveil (0x0700–0x0708) — id 90+k → 0x0700+k
+        else if id >= 90 && id <= 98 {
+            var lx12nr: int64 := 0x0700 + (id - 90);
+            var lx12ac: int64 := 2;
+            if id == 92 { lx12ac := 1; }    // sys_cap_rights(cap_fd)
+            else if id == 95 { lx12ac := 0; } // sys_uid_get()
+            else if id == 96 { lx12ac := 0; } // sys_gid_get()
+            else if id == 97 { lx12ac := 1; } // sys_setuid(uid)
+            self.emitVfsSyscall(lx12nr, lx12ac, dest);
+        }
+        // LX-13: Task-Scheduler & Parallelität (0x0B00–0x0B09) — id 99+k → 0x0B00+k
+        else if id >= 99 && id <= 108 {
+            var lx13nr: int64 := 0x0B00 + (id - 99);
+            var lx13ac: int64 := 2;
+            if id == 99 { lx13ac := 4; }      // sys_task_spawn(fn,arg,arg_size,flags)
+            else if id == 100 { lx13ac := 4; } // sys_task_await(fd,result_out,result_size,timeout_ns)
+            else if id == 101 { lx13ac := 1; } // sys_task_cancel(task_fd)
+            else if id == 102 { lx13ac := 1; } // sys_task_group_create(flags)
+            else if id == 103 { lx13ac := 4; } // sys_task_group_add(group_fd,fn,arg,arg_size)
+            else if id == 105 { lx13ac := 0; } // sys_cpu_count()
+            else if id == 108 { lx13ac := 3; } // sys_numa_alloc(size,node_hint,prot)
+            self.emitVfsSyscall(lx13nr, lx13ac, dest);
+        }
+        // LX-14: KI-Basis (0x0800–0x0806) — id 109+k → 0x0800+k
+        else if id >= 109 && id <= 115 {
+            var lx14nr: int64 := 0x0800 + (id - 109);
+            var lx14ac: int64 := 2;
+            if id == 109 { lx14ac := 3; }      // sys_ai_model_load(dir_fd,path,flags)
+            else if id == 110 { lx14ac := 1; } // sys_ai_model_unload(model_fd)
+            else if id == 112 { lx14ac := 3; } // sys_ai_ctx_create(model_fd,ctx_size,flags)
+            else if id == 113 { lx14ac := 1; } // sys_ai_ctx_destroy(ctx_fd)
+            else if id == 114 { lx14ac := 4; } // sys_ai_infer(ctx_fd,prompt_fd,result_fd,opts)
+            else if id == 115 { lx14ac := 6; } // sys_ai_infer_sync(ctx_fd,prompt,prompt_len,result,result_max,opts)
+            self.emitVfsSyscall(lx14nr, lx14ac, dest);
+        }
+        // LX-15: KI-Embedding & Vektorindex (0x0807–0x080C) — id 116+k → 0x0807+k
+        else if id >= 116 && id <= 121 {
+            var lx15nr: int64 := 0x0807 + (id - 116);
+            var lx15ac: int64 := 2;
+            if id == 116 { lx15ac := 5; }      // sys_ai_embed(ctx_fd,text,text_len,vec_out,dim_inout)
+            else if id == 117 { lx15ac := 3; } // sys_ai_token_count(ctx_fd,text,text_len)
+            else if id == 118 { lx15ac := 6; } // sys_ai_search(idx_fd,query_vec,dim,k,results,max)
+            else if id == 120 { lx15ac := 6; } // sys_ai_index_insert(idx_fd,id,vec,dim,meta,meta_len)
+            self.emitVfsSyscall(lx15nr, lx15ac, dest);
+        }
+        // LX-16: Semantisches Paging & Wissensgraph (0x080D–0x0812) — id 122+k → 0x080D+k
+        else if id >= 122 && id <= 127 {
+            var lx16nr: int64 := 0x080D + (id - 122);
+            var lx16ac: int64 := 2;
+            if id == 122 { lx16ac := 3; }      // sys_sem_annotate(addr,size,embed_fd)
+            else if id == 123 { lx16ac := 5; } // sys_sem_query(query_vec,dim,k,results,max)
+            else if id == 125 { lx16ac := 5; } // sys_graph_edge_add(src,rel_type,dst,meta,meta_len)
+            else if id == 126 { lx16ac := 1; } // sys_graph_edge_remove(edge_id)
+            else if id == 127 { lx16ac := 5; } // sys_graph_query(node_id,rel_type,depth,results,max)
+            self.emitVfsSyscall(lx16nr, lx16ac, dest);
+        }
+        // LX-17: Lyra Agent Interface (0x0900–0x090B) — id 128+k → 0x0900+k
+        else if id >= 128 && id <= 139 {
+            var lx17nr: int64 := 0x0900 + (id - 128);
+            var lx17ac: int64 := 2;
+            if id == 128 { lx17ac := 3; }      // sys_intent_submit(text,len,priority)
+            else if id == 129 { lx17ac := 3; } // sys_intent_wait(intent_id,timeout_ns,result_fd)
+            else if id == 130 { lx17ac := 1; } // sys_intent_cancel(intent_id)
+            else if id == 131 { lx17ac := 3; } // sys_lyra_event(event_type,data,data_len)
+            else if id == 132 { lx17ac := 3; } // sys_dream_register(fn_fd,interval_ns,flags)
+            else if id == 133 { lx17ac := 1; } // sys_dream_unregister(dream_id)
+            else if id == 134 { lx17ac := 4; } // sys_memory_store(key,val,val_len,flags)
+            else if id == 135 { lx17ac := 3; } // sys_memory_recall(key,buf,buf_size)
+            else if id == 136 { lx17ac := 5; } // sys_memory_search(query_vec,dim,k,results,max)
+            else if id == 138 { lx17ac := 0; } // sys_context_pop()
+            else if id == 139 { lx17ac := 6; } // sys_timeline_query(from,to,filter_vec,dim,results,max)
+            self.emitVfsSyscall(lx17nr, lx17ac, dest);
+        }
+        // LX-18: IOFS (0x0C00–0x0C04) — id 140+k → 0x0C00+k
+        else if id >= 140 && id <= 144 {
+            var lx18nr: int64 := 0x0C00 + (id - 140);
+            var lx18ac: int64 := 2;
+            if id == 142 { lx18ac := 3; } // sys_iofs_page_info(mount_fd,page_id,out)
+            else if id == 143 { lx18ac := 1; } // sys_iofs_sandbox_enter(mount_fd)
+            else if id == 144 { lx18ac := 0; } // sys_iofs_sandbox_exit()
+            self.emitVfsSyscall(lx18nr, lx18ac, dest);
+        }
+        // LX-22: Debug & Telemetrie (0x0A00–0x0A05) — id 145+k → 0x0A00+k
+        else if id >= 145 && id <= 150 {
+            var lx22nr: int64 := 0x0A00 + (id - 145);
+            var lx22ac: int64 := 2;
+            if id == 147 { lx22ac := 1; }      // sys_perf_counter(counter_id)
+            else if id == 149 { lx22ac := 3; } // sys_watchpoint_set(addr,size,flags)
+            else if id == 150 { lx22ac := 1; } // sys_watchpoint_clear(addr)
+            self.emitVfsSyscall(lx22nr, lx22ac, dest);
+        }
+        // LX-WP17: Vega Window System — §10.4 dezimal 110–131 (Lücke bei 123: kein Kernel-Syscall).
+        // id 151→110 (sys_win_create) … 163→122 (sys_event_recv), dann id 164+→124+ (Lücke übersprungen).
+        else if id >= 151 && id <= 171 {
+            var lxW17nr: int64 := 110 + (id - 151);
+            if id >= 164 { lxW17nr := lxW17nr + 1; }  // 123 ist im Kernel unbelegt
+            var lxW17ac: int64 := 0;
+            if id == 151 { lxW17ac := 5; }       // sys_win_create(x,y,w,h,flags)
+            else if id == 152 { lxW17ac := 1; }   // sys_win_destroy(win_id)
+            else if id == 153 { lxW17ac := 1; }   // sys_win_raise(win_id)
+            else if id == 154 { lxW17ac := 3; }   // sys_win_move(win_id,x,y)
+            else if id == 155 { lxW17ac := 3; }   // sys_win_resize(win_id,new_w,new_h)
+            else if id == 156 { lxW17ac := 1; }   // sys_win_get_fb(win_id)
+            else if id == 157 { lxW17ac := 0; }   // sys_vsync_wait()
+            else if id == 158 { lxW17ac := 0; }   // sys_time_ns()
+            else if id == 159 { lxW17ac := 1; }   // sys_shm_create(size)
+            else if id == 160 { lxW17ac := 1; }   // sys_shm_map(shm_id)
+            else if id == 161 { lxW17ac := 1; }   // sys_shm_unmap(shm_id)
+            else if id == 162 { lxW17ac := 4; }   // sys_event_send(pid,type,a,b)
+            else if id == 163 { lxW17ac := 1; }   // sys_event_recv(out_buf_uva)
+            else if id == 164 { lxW17ac := 2; }   // sys_set_console(pid,shm_id)
+            else if id == 165 { lxW17ac := 4; }   // sys_fb_map_user(fb_phys,fb_w,fb_h,stride)
+            else if id == 166 { lxW17ac := 0; }   // sys_get_mouse_x()
+            else if id == 167 { lxW17ac := 0; }   // sys_get_mouse_y()
+            else if id == 168 { lxW17ac := 0; }   // sys_get_mouse_btn()
+            else if id == 169 { lxW17ac := 2; }   // sys_set_mouse_bounds(max_x,max_y)
+            else if id == 170 { lxW17ac := 0; }   // sys_win_get_table_phys()
+            else if id == 171 { lxW17ac := 0; }   // sys_kbd_poll()
+            self.emitVfsSyscall(lxW17nr, lxW17ac, dest);
+        }
+    }
+
+    // sys_mmap(hint=0, size, prot=PROT_RW=3, flags=MAP_PRIVATE|MAP_ANON=5) → rdx=addr
+    // §10.4=9 (Bump-Allokator ab USER_HEAP_BASE 0x10000000).
+    fn emitAlloc(sizeSlot: int64, dest: int64): void {
+        self.emitMovRaxImm(9);
+        self.emit8(0x31); self.emit8(0xFF);
+        self.emitMovRsiFromSlot(sizeSlot);
+        self.emit8(0xBA); self.emit32(3);
+        self.emit8(0x41); self.emit8(0xBA); self.emit32(5);
+        self.emitSyscall();
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);
+        self.emitMovSlotFromRax(dest);
+    }
+
+    // sys_munmap(addr, size=0) — KEIN §10.4-Äquivalent (Bump-Allokator kennt kein Free).
+    // Nummer 0x0101 bleibt als Design-Platzhalter; Kernel liefert -1 (No-Op-Semantik).
+    fn emitFree(ptrSlot: int64): void {
+        self.emitMovRaxImm(0x0101);
+        var off: int64 := self.slotOff(ptrSlot);
+        if ptrSlot < 16 {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x7D);
+            self.emit8(off & 0xFF);
+        } else {
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0xBD);
+            self.emit32(off);
+        }
+        self.emit8(0x31); self.emit8(0xF6);
+        self.emitSyscall();
+    }
+
+    // --- IR instruction dispatch ---
+
+    fn emitInstr(idx: int64): void {
+        var instrBuf: int64 := peek64(self.irMod + IR_MOD_OFF_INSTRBUF);
+        var iBase:    int64 := instrBuf + idx * IR_INSTR_SIZE;
+        var op:       int64 := peek64(iBase + 0);
+        var dest:     int64 := peek64(iBase + IR_INSTR_OFF_DEST);
+        var src1:     int64 := peek64(iBase + IR_INSTR_OFF_SRC1);
+        var imm:      int64 := peek64(iBase + IR_INSTR_OFF_IMMINT);
+        if op == 0 {                            // IRO_CONST_INT
+            self.emitMovRaxImm(imm);
+            self.emitMovSlotFromRax(dest);
+        } else if op == 1 {                     // IRO_CONST_STR
+            self.emitConstStr(imm, dest);
+        } else if op == 61 {                    // IRO_LOAD_LOCAL
+            self.emitMovRaxFromSlot(src1);
+            self.emitMovSlotFromRax(dest);
+        } else if op == 62 {                    // IRO_STORE_LOCAL
+            self.emitMovRaxFromSlot(src1);
+            self.emitMovSlotFromRax(dest);
+        } else if op == 80 {                    // IRO_CALL_BUILTIN
+            self.emitBuiltinCall(imm, dest);
+        } else if op == 164 {                   // IRO_LOAD_ERRVAL (LX-21: rax=r15-shadow)
+            self.emit8(0x49); self.emit8(0x8B); self.emit8(0xC7);  // MOV rax, r15
+            self.emitMovSlotFromRax(dest);
+        } else if op == 81 {                    // IRO_CALL
+            self.emitCall(src1, dest);
+        } else if op == 94 {                    // IRO_FUNC_EXIT
+            self.emitMovRaxFromSlot(src1);
+            self.emitEpilogue();
+        } else if op == 112 {                   // IRO_ALLOC
+            self.emitAlloc(src1, dest);
+        } else if op == 113 {                   // IRO_FREE
+            self.emitFree(src1);
+        }
+        // 90 (JMP), 93 (LABEL), all others: no code
+    }
+
+    // Emit all IR functions.
+    // Returns byte offset of `main` in the output buffer (for _start CALL).
+    fn emitFunctions(): int64 {
+        var funcBuf:  int64 := peek64(self.irMod + IR_MOD_OFF_FUNCBUF);
+        var funcLen:  int64 := peek64(self.irMod + IR_MOD_OFF_FUNCLEN);
+        var strBuf:   int64 := peek64(self.irMod + IR_MOD_OFF_STRBUF);
+        var mainOff:  int64 := self.codeLen;   // default: first func
+
+        var fi: int64 := 0;
+        while fi < funcLen {
+            var fBase:       int64 := funcBuf + fi * IR_FUNC_SIZE;
+            var fnNameOff:   int64 := peek64(fBase + 0);
+            var fnNameLen:   int64 := peek64(fBase + IR_FUNC_OFF_NAMELEN);
+            var fnInstrsOff: int64 := peek64(fBase + IR_FUNC_OFF_INSTRSOFF);
+            var fnInstrCnt:  int64 := peek64(fBase + IR_FUNC_OFF_INSTRCOUNT);
+            var fnLocals:    int64 := peek64(fBase + IR_FUNC_OFF_LOCALCOUNT);
+
+            // Record offset of main()
+            if fnNameLen == 4 {
+                var p: int64 := strBuf + fnNameOff;
+                if peek8(p+0)==109 && peek8(p+1)==97 && peek8(p+2)==105 && peek8(p+3)==110 {
+                    mainOff := self.codeLen;
+                }
+            }
+
+            // INSTRSOFF ist ein Instruktions-INDEX (ir_lower._addFunc speichert
+            // funcInstrStart = INSTRLEN-Zähler), kein Byte-Offset — nicht teilen!
+            var firstIdx: int64 := fnInstrsOff;
+            self.emitPrologue(fnLocals);
+            var ii: int64 := 0;
+            while ii < fnInstrCnt {
+                self.emitInstr(firstIdx + ii);
+                ii := ii + 1;
+            }
+            // Return value already in rax from last instruction (LOAD_LOCAL/FUNC_EXIT)
+            self.emitEpilogue();
+
+            fi := fi + 1;
+        }
+        return mainOff;
+    }
+
+    pub fn getCodeBuf(): int64 { return self.codeBuf; }
+    pub fn getCodeLen(): int64 { return self.codeLen; }
+};
+
+// ---------------------------------------------------------------------------
+// LyxOsELFWriter — writes the ELF binary with .note.lyx-abi
+// ---------------------------------------------------------------------------
+
+pub type LyxOsELFWriter = class {
+    buf: int64;
+    len: int64;
+    cap: int64;
+
+    // Prefixed elf_ to avoid VMT collision with EmitLyxOS.init/grow/patch32/patch64
+    fn elf_init(): void {
+        self.cap := 65536;
+        self.buf := alloc(self.cap);
+        self.len := 0;
+    }
+
+    fn elf_grow(need: int64): void {
+        if (self.len + need) <= self.cap { return; }
+        var nc: int64 := self.cap * 2;
+        while nc < (self.len + need) { nc := nc * 2; }
+        var nb: int64 := alloc(nc);
+        memcpy(nb, self.buf, self.len);
+        self.buf := nb;
+        self.cap := nc;
+    }
+
+    fn elf_w8(v: int64): void {
+        self.elf_grow(1);
+        poke8(self.buf + self.len, v & 0xFF);
+        self.len := self.len + 1;
+    }
+
+    fn elf_w16(v: int64): void {
+        self.elf_grow(2);
+        poke8(self.buf + self.len + 0, v & 0xFF);
+        poke8(self.buf + self.len + 1, (v >> 8) & 0xFF);
+        self.len := self.len + 2;
+    }
+
+    fn elf_w32(v: int64): void {
+        self.elf_grow(4);
+        poke8(self.buf + self.len + 0,  v        & 0xFF);
+        poke8(self.buf + self.len + 1, (v >>  8) & 0xFF);
+        poke8(self.buf + self.len + 2, (v >> 16) & 0xFF);
+        poke8(self.buf + self.len + 3, (v >> 24) & 0xFF);
+        self.len := self.len + 4;
+    }
+
+    fn elf_w64(v: int64): void {
+        self.elf_grow(8);
+        poke8(self.buf + self.len + 0,  v        & 0xFF);
+        poke8(self.buf + self.len + 1, (v >>  8) & 0xFF);
+        poke8(self.buf + self.len + 2, (v >> 16) & 0xFF);
+        poke8(self.buf + self.len + 3, (v >> 24) & 0xFF);
+        poke8(self.buf + self.len + 4, (v >> 32) & 0xFF);
+        poke8(self.buf + self.len + 5, (v >> 40) & 0xFF);
+        poke8(self.buf + self.len + 6, (v >> 48) & 0xFF);
+        poke8(self.buf + self.len + 7, (v >> 56) & 0xFF);
+        self.len := self.len + 8;
+    }
+
+    fn elf_patch32(off: int64, v: int64): void {
+        poke8(self.buf + off + 0,  v        & 0xFF);
+        poke8(self.buf + off + 1, (v >>  8) & 0xFF);
+        poke8(self.buf + off + 2, (v >> 16) & 0xFF);
+        poke8(self.buf + off + 3, (v >> 24) & 0xFF);
+    }
+
+    fn elf_patch64(off: int64, v: int64): void {
+        poke8(self.buf + off + 0,  v        & 0xFF);
+        poke8(self.buf + off + 1, (v >>  8) & 0xFF);
+        poke8(self.buf + off + 2, (v >> 16) & 0xFF);
+        poke8(self.buf + off + 3, (v >> 24) & 0xFF);
+        poke8(self.buf + off + 4, (v >> 32) & 0xFF);
+        poke8(self.buf + off + 5, (v >> 40) & 0xFF);
+        poke8(self.buf + off + 6, (v >> 48) & 0xFF);
+        poke8(self.buf + off + 7, (v >> 56) & 0xFF);
+    }
+
+    fn elf_padTo(target: int64): void {
+        while self.len < target { self.elf_w8(0); }
+    }
+
+    // Write the .note.lyx-abi section payload (24 bytes):
+    //   namesz=4, descsz=8, type=1, "LYX\0", major=1, minor=0
+    fn elf_writeNote(): void {
+        self.elf_w32(4);              // namesz: "LYX\0" = 4 bytes
+        self.elf_w32(8);              // descsz: major(4) + minor(4) = 8 bytes
+        self.elf_w32(1);              // type = 1 (NT_VERSION)
+        self.elf_w8(76);              // 'L'
+        self.elf_w8(89);              // 'Y'
+        self.elf_w8(88);              // 'X'
+        self.elf_w8(0);               // '\0'
+        self.elf_w32(1);              // major = 1
+        self.elf_w32(0);              // minor = 0
+    }
+
+    // Build and write the ELF file.
+    // codeBuf/codeLen: compiled machine code (_start + functions).
+    pub fn writeELF(path: pchar, codeBuf: int64, codeLen: int64): bool {
+        self.elf_init();
+        if self.buf == 0 { return false; }  // alloc failed
+
+        var pageSize:   int64 := 4096;           // 0x1000
+        var baseVaddr:  int64 := 0x400000;
+        var codeOff:    int64 := pageSize;        // .text at file offset 0x1000
+        var noteOff:    int64 := codeOff + codeLen;
+        var noteSize:   int64 := 24;
+        var fileSize:   int64 := noteOff + noteSize;
+
+        var entryVaddr: int64 := baseVaddr + codeOff;   // 0x401000 = _start
+        var noteVaddr:  int64 := baseVaddr + noteOff;
+
+        // --- ELF header (64 bytes) ---
+        // e_ident magic
+        self.elf_w8(127); self.elf_w8(69); self.elf_w8(76); self.elf_w8(70);  // \x7fELF
+        self.elf_w8(2);   // EI_CLASS = ELFCLASS64
+        self.elf_w8(1);   // EI_DATA  = ELFDATA2LSB (little-endian)
+        self.elf_w8(1);   // EI_VERSION = EV_CURRENT
+        self.elf_w8(0);   // EI_OSABI = ELFOSABI_NONE  (0 = System V / LyxOS)
+        self.elf_w64(0);  // EI_ABIVERSION + padding (8 bytes)
+        self.elf_w16(2);  // e_type = ET_EXEC
+        self.elf_w16(62); // e_machine = EM_X86_64
+        self.elf_w32(1);  // e_version = EV_CURRENT
+        self.elf_w64(entryVaddr);  // e_entry
+        self.elf_w64(64);          // e_phoff = 64 (right after ELF header)
+        self.elf_w64(0);           // e_shoff = 0 (no section headers)
+        self.elf_w32(0);           // e_flags
+        self.elf_w16(64);          // e_ehsize
+        self.elf_w16(56);          // e_phentsize
+        self.elf_w16(2);           // e_phnum = 2 (PT_LOAD, PT_NOTE)
+        self.elf_w16(64);          // e_shentsize
+        self.elf_w16(0);           // e_shnum
+        self.elf_w16(0);           // e_shstrndx
+
+        // --- Program headers (2 × 56 bytes) ---
+        // Bootstrap Bug 4: max 5 explicit args. elf_writePH had 7 → inline instead.
+        // PH[0]: PT_LOAD (R-X) — covers entire file
+        self.elf_grow(56);
+        self.elf_w32(1);           // p_type  = PT_LOAD
+        self.elf_w32(5);           // p_flags = R|X
+        self.elf_w64(0);           // p_offset
+        self.elf_w64(baseVaddr);   // p_vaddr
+        self.elf_w64(baseVaddr);   // p_paddr
+        self.elf_w64(fileSize);    // p_filesz
+        self.elf_w64(fileSize);    // p_memsz
+        self.elf_w64(pageSize);    // p_align
+
+        // PH[1]: PT_NOTE (R) — .note.lyx-abi only
+        self.elf_grow(56);
+        self.elf_w32(4);           // p_type  = PT_NOTE
+        self.elf_w32(4);           // p_flags = R
+        self.elf_w64(noteOff);     // p_offset
+        self.elf_w64(noteVaddr);   // p_vaddr
+        self.elf_w64(noteVaddr);   // p_paddr
+        self.elf_w64(noteSize);    // p_filesz
+        self.elf_w64(noteSize);    // p_memsz
+        self.elf_w64(4);           // p_align
+
+        // --- Padding to page boundary ---
+        self.elf_padTo(codeOff);
+
+        // --- .text: compiled code ---
+        var ci: int64 := 0;
+        while ci < codeLen {
+            self.elf_w8(peek8(codeBuf + ci));
+            ci := ci + 1;
+        }
+
+        // --- .note.lyx-abi ---
+        self.elf_writeNote();
+
+        // --- Write to file ---
+        var fd: int64 := open(path, 577, 493);   // O_WRONLY|O_CREAT|O_TRUNC, 0755
+        if fd == -1 { return false; }
+        write(fd, self.buf as pchar, self.len);
+        close(fd);
+        chmod(path, 493);
+        return true;
+    }
+
+    pub fn elf_getLen(): int64 { return self.len; }
+};

@@ -6,6 +6,7 @@
 @copyright("2024-2025 Andreas Röne")
 unit std.audio;
 
+import std.alloc;
 // Error codes
 pub con AUDIO_OK: int64 := 0;
 pub con AUDIO_ERROR: int64 := -1;
@@ -56,7 +57,7 @@ pub fn MP3Parse(path: pchar, info: AudioInfo): int64 {
   }
   
   // Allocate buffer
-  buf := mmap(0, 32768, 3, 34, -1, 0);
+  buf := alloc(32768);
   if (buf == 0) {
     close(fd);
     return AUDIO_ERROR;
@@ -68,7 +69,7 @@ pub fn MP3Parse(path: pchar, info: AudioInfo): int64 {
   close(fd);
   
   if (bytesRead < 10) {
-    munmap(buf, 32768);
+    free(buf, 32768);
     return AUDIO_ERROR;
   }
   
@@ -131,7 +132,7 @@ pub fn MP3Parse(path: pchar, info: AudioInfo): int64 {
   }
    
   if (!found) {
-    munmap(buf, 32768);
+    free(buf, 32768);
     close(fd);
     return AUDIO_ERROR;
   }
@@ -216,7 +217,7 @@ pub fn MP3Parse(path: pchar, info: AudioInfo): int64 {
     info.durationMs := (info.dataSize * 8) / br;
   }
   
-  munmap(buf, 32768);
+  free(buf, 32768);
   close(fd);
   return AUDIO_OK;
 }
@@ -246,7 +247,7 @@ pub fn WAVParse(path: pchar, info: AudioInfo): int64 {
   }
   
   // Allocate buffer
-  buf := mmap(0, fsize, 3, 34, -1, 0);
+  buf := alloc(fsize);
   if (buf == 0) {
     close(fd);
     return AUDIO_ERROR;
@@ -257,21 +258,21 @@ pub fn WAVParse(path: pchar, info: AudioInfo): int64 {
   close(fd);
   
   if (bytesRead < 44) {
-    munmap(buf, fsize);
+    free(buf, fsize);
     return AUDIO_ERROR;
   }
   
 // Check RIFF at offset 0 (82='R', 73='I', 70='F', 70='F')
   if (peek8(buf + 0) != 82 || peek8(buf + 1) != 73 ||
      peek8(buf + 2) != 70 || peek8(buf + 3) != 70) {
-    munmap(buf, fsize);
+    free(buf, fsize);
     return AUDIO_ERROR;
   }
   
   // Check WAVE at offset 8 (87='W', 65='A', 86='V', 69='E')
   if (peek8(buf + 8) != 87 || peek8(buf + 9) != 65 ||
      peek8(buf + 10) != 86 || peek8(buf + 11) != 69) {
-    munmap(buf, fsize);
+    free(buf, fsize);
     return AUDIO_ERROR;
   }
   
@@ -279,7 +280,7 @@ pub fn WAVParse(path: pchar, info: AudioInfo): int64 {
   var fmt: int16;
   fmt := (peek8(buf + 21) << 8) | peek8(buf + 20) as int16;
   if (fmt != 1) {
-    munmap(buf, fsize);
+    free(buf, fsize);
     return AUDIO_NOT_SUPPORTED;
   }
   
@@ -308,7 +309,7 @@ pub fn WAVParse(path: pchar, info: AudioInfo): int64 {
   }
   
   if (dpos == 0 || dsz == 0) {
-    munmap(buf, fsize);
+    free(buf, fsize);
     return AUDIO_ERROR;
   }
   
@@ -319,7 +320,7 @@ pub fn WAVParse(path: pchar, info: AudioInfo): int64 {
   bps := info.sampleRate * info.channels * (info.bitsPerSample / 8);
   if (bps > 0) { info.durationMs := (dsz * 1000) / bps; }
   
-  munmap(buf, fsize);
+  free(buf, fsize);
   return AUDIO_OK;
 }
 
@@ -356,7 +357,7 @@ pub fn WAVReadData(path: pchar, info: AudioInfo): int64 {
   }
   
   // Allocate buffer for audio data
-  buf := mmap(0, info.dataSize, 3, 34, -1, 0);
+  buf := alloc(info.dataSize);
   if (buf == 0) {
     close(fd);
     return 0;
@@ -370,7 +371,7 @@ pub fn WAVReadData(path: pchar, info: AudioInfo): int64 {
   close(fd);
   
   if (bytesRead < info.dataSize) {
-    munmap(buf, info.dataSize);
+    free(buf, info.dataSize);
     return 0;
   }
   
@@ -605,7 +606,7 @@ pub fn WAVSaveFile(path: pchar, buffer: int64, dataSize: int64, sampleRate: int6
   
   // Allocate temporary buffer for header (44 bytes)
   var headerBuf: int64;
-  headerBuf := mmap(0, 44, 3, 34, -1, 0);
+  headerBuf := alloc(44);
   
   if (headerBuf == 0) {
     close(fd);
@@ -617,7 +618,7 @@ pub fn WAVSaveFile(path: pchar, buffer: int64, dataSize: int64, sampleRate: int6
   headerSize := WAVWriteHeader(headerBuf, dataSize, sampleRate, channels, bitsPerSample);
   
   if (headerSize != 44) {
-    munmap(headerBuf, 44);
+    free(headerBuf, 44);
     close(fd);
     return AUDIO_ERROR;
   }
@@ -627,12 +628,12 @@ pub fn WAVSaveFile(path: pchar, buffer: int64, dataSize: int64, sampleRate: int6
   written := write(fd, headerBuf, 44);
   
   if (written != 44) {
-    munmap(headerBuf, 44);
+    free(headerBuf, 44);
     close(fd);
     return AUDIO_ERROR;
   }
   
-  munmap(headerBuf, 44);
+  free(headerBuf, 44);
   
   // Write PCM data - loop until all bytes written
   var total: int64;
@@ -658,6 +659,47 @@ pub fn WAVSaveFile(path: pchar, buffer: int64, dataSize: int64, sampleRate: int6
   }
   
   return AUDIO_OK;
+}
+
+// ============================================================
+// Tone Generator (PCM square wave - no fp required)
+// ============================================================
+
+// Generate a square-wave tone as a 16-bit PCM buffer.
+// Returns mmap'd heap pointer; caller frees with munmap(buf, size).
+pub fn AudioGenTone(freq: int64, durationMs: int64, sampleRate: int64, channels: int64, amplitude: int64, sizeOut: int64): int64 {
+  if (freq < 1) { freq := 1; }
+  var totalSamples: int64 := sampleRate * durationMs / 1000;
+  var totalBytes: int64 := totalSamples * channels * 2;
+  if (totalBytes < 1) {
+    if (sizeOut != 0) { poke64(sizeOut, 0); }
+    return 0;
+  }
+  var buf: int64 := mmap(0, totalBytes, 3, 34, -1, 0);
+  if (buf == 0) {
+    if (sizeOut != 0) { poke64(sizeOut, 0); }
+    return 0;
+  }
+  if (sizeOut != 0) { poke64(sizeOut, totalBytes); }
+  var period: int64 := sampleRate / freq;
+  if (period < 2) { period := 2; }
+  var halfPeriod: int64 := period / 2;
+  var i: int64 := 0;
+  while (i < totalSamples) {
+    var val: int64;
+    var phase: int64 := i % period;
+    if (phase < halfPeriod) { val := amplitude; }
+    else                    { val := 0 - amplitude; }
+    var ch: int64 := 0;
+    while (ch < channels) {
+      var off: int64 := (i * channels + ch) * 2;
+      poke8(buf + off,     val & 255);
+      poke8(buf + off + 1, (val >> 8) & 255);
+      ch := ch + 1;
+    }
+    i := i + 1;
+  }
+  return buf;
 }
 
 // ============================================================

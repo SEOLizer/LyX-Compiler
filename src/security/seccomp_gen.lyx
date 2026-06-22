@@ -11,7 +11,7 @@
 //   [N+1]  Default: SECCOMP_RET_KILL_PROCESS
 //
 // Implizit erlaubt (immer, auch ohne @capabilities):
-//   exit_group, exit, brk, mmap(anon), munmap, write, prctl, prlimit64
+//   exit_group, exit, brk, mmap(anon), munmap, write, prctl, prlimit64, getrandom
 
 import src.std.alloc;
 
@@ -37,6 +37,7 @@ con SC_OFF_ARG2: int64 := 32;  // args[2]
 
 // Linux x86-64 syscall numbers
 con SC_SYS_READ:          int64 := 0;
+con SC_SYS_PREAD64:       int64 := 17;
 con SC_SYS_OPEN:          int64 := 2;
 con SC_SYS_WRITE:         int64 := 1;
 con SC_SYS_CLOSE:         int64 := 3;
@@ -72,11 +73,14 @@ con SC_SYS_CLOCK_GETTIME: int64 := 228;
 con SC_SYS_EXIT_GROUP:    int64 := 231;
 con SC_SYS_TGKILL:        int64 := 234;
 con SC_SYS_OPENAT:        int64 := 257;
+con SC_SYS_NEWFSTATAT:    int64 := 262;
 con SC_SYS_UNLINKAT:      int64 := 263;
 con SC_SYS_ACCEPT4:       int64 := 288;
 con SC_SYS_PRLIMIT64:     int64 := 302;
-con SC_SYS_SCHED_SETATTR: int64 := 314;
-con SC_SYS_GETRANDOM:     int64 := 318;
+con SC_SYS_SETPRIORITY:      int64 := 141;
+con SC_SYS_SCHED_SETSCHEDULER: int64 := 144;
+con SC_SYS_SCHED_SETATTR:    int64 := 314;
+con SC_SYS_GETRANDOM:        int64 := 318;
 con SC_SYS_EXECVEAT:      int64 := 322;
 con SC_SYS_STATX:         int64 := 332;
 
@@ -229,6 +233,8 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
   n := sc_allow_nr(bpfBuf, n, SC_SYS_FUTEX);       // futex (threading primitives)
   n := sc_allow_nr(bpfBuf, n, SC_SYS_RT_SIGACTION);  // signal handlers
   n := sc_allow_nr(bpfBuf, n, SC_SYS_RT_SIGRETURN);  // signal return
+  // WP-24.1: getrandom immer erlauben — Stack-Canary-Init (__lyx_canary_init) braucht es
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_GETRANDOM);   // getrandom (canary init)
 
   // ---- Capability-spezifische Syscalls -----------------------------------
 
@@ -263,15 +269,19 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
 
   if hasRead {
     n := sc_allow_nr(bpfBuf, n, SC_SYS_READ);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_PREAD64);      // WP-24.3: positional read
     n := sc_allow_nr(bpfBuf, n, SC_SYS_CLOSE);
     n := sc_allow_nr(bpfBuf, n, SC_SYS_LSEEK);
     n := sc_allow_nr(bpfBuf, n, SC_SYS_FSTAT);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_NEWFSTATAT);   // WP-24.3: path-based stat
   }
   if hasWrite {
     n := sc_allow_nr(bpfBuf, n, SC_SYS_READ);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_PREAD64);      // WP-24.3: positional read
     n := sc_allow_nr(bpfBuf, n, SC_SYS_CLOSE);
     n := sc_allow_nr(bpfBuf, n, SC_SYS_LSEEK);
     n := sc_allow_nr(bpfBuf, n, SC_SYS_FSTAT);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_NEWFSTATAT);   // WP-24.3: path-based stat
   }
 
   if sc_has_cap(capBuf, capCount, SC_CAP_FS_DELETE) {
@@ -282,6 +292,7 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
   if sc_has_cap(capBuf, capCount, SC_CAP_FS_META) {
     n := sc_allow_nr(bpfBuf, n, SC_SYS_STATX);
     n := sc_allow_nr(bpfBuf, n, SC_SYS_GETDENTS64);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_NEWFSTATAT);   // WP-24.3: path-based stat
   }
 
   if sc_has_cap(capBuf, capCount, SC_CAP_FS_EXEC) {
@@ -329,10 +340,12 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
       sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_ALLOW); n := n + 1;
       sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;  // Reload NR
     } else if hasUnix {
-      // AF_UNIX socket
-      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 5, SC_SYS_SOCKET); n := n + 1;
+      // AF_UNIX socket: 5 instructions total (gate + load-arg + check + allow + reload)
+      // jf=3: if NR!=socket skip load-arg/check/allow, land on reload-NR (shared endpoint)
+      // jf=1: if domain!=AF_UNIX skip allow, land on reload-NR
+      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 3, SC_SYS_SOCKET); n := n + 1;
       sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG0); n := n + 1;
-      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 2, SC_AF_UNIX); n := n + 1;
+      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 1, SC_AF_UNIX); n := n + 1;
       sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_ALLOW); n := n + 1;  // AF_UNIX match → allow
       sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;  // Reload NR
     }
@@ -350,6 +363,8 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
       n := sc_allow_nr(bpfBuf, n, SC_SYS_LISTEN);
       n := sc_allow_nr(bpfBuf, n, SC_SYS_ACCEPT);
       n := sc_allow_nr(bpfBuf, n, SC_SYS_ACCEPT4);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_READ);      // read from accepted connections
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_RECVFROM);  // recvfrom for TCP servers
     }
     if hasUdpBind {
       n := sc_allow_nr(bpfBuf, n, SC_SYS_BIND);
@@ -386,6 +401,8 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
 
   if sc_has_cap(capBuf, capCount, SC_CAP_PROCESS_SCHED) {
     n := sc_allow_nr(bpfBuf, n, SC_SYS_SCHED_SETATTR);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_SCHED_SETSCHEDULER);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_SETPRIORITY);
   }
 
   var hasHw: bool := sc_has_cap(capBuf, capCount, SC_CAP_HARDWARE_GPIO) ||

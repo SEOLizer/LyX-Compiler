@@ -1,0 +1,212 @@
+// tests/grf06_webp_test.lyx — GRF-06: WebP Decoder Tests
+
+unit tests.grf06_webp_test;
+
+import std.image.core;
+import std.image.webp;
+import std.alloc;
+import std.io;
+
+// Build a minimal VP8L WebP: 4x3 image (just header, no real pixel data needed for meta).
+// VP8L bitstream: signature 0x2F, then 28-bit packed: (w-1) in bits 0..13, (h-1) in bits 14..27.
+// w=4 → w-1=3=0x003, h=3 → h-1=2=0x002
+// packed = 3 | (2 << 14) = 3 | 32768 = 32771 = 0x00008003
+// bytes (LE): 0x03, 0x80, 0x00, 0x00
+fn makeVp8lWebP(buf: int64): int64 {
+    var p: int64 := buf;
+    // RIFF header
+    poke8(p, 0x52); poke8(p+1, 0x49); poke8(p+2, 0x46); poke8(p+3, 0x46); // "RIFF"
+    // File size (placeholder)
+    poke8(p+4, 30); poke8(p+5, 0); poke8(p+6, 0); poke8(p+7, 0);
+    // "WEBP"
+    poke8(p+8, 0x57); poke8(p+9, 0x45); poke8(p+10, 0x42); poke8(p+11, 0x50);
+    p := p + 12;
+
+    // VP8L chunk: "VP8L" + chunk size (LE) + data
+    poke8(p, 0x56); poke8(p+1, 0x50); poke8(p+2, 0x38); poke8(p+3, 0x4C); // "VP8L"
+    // chunk size = 5 (signature + 4 bytes of bitstream header)
+    poke8(p+4, 5); poke8(p+5, 0); poke8(p+6, 0); poke8(p+7, 0);
+    p := p + 8;
+    // VP8L bitstream: signature byte + 4 bytes with w-1 and h-1 packed
+    poke8(p, 0x2F);           // VP8L signature
+    // packed = (w-1) | ((h-1) << 14); w=4, h=3 → 3 | (2<<14) = 3 | 32768 = 32771 = 0x00008003
+    poke8(p+1, 0x03); poke8(p+2, 0x80); poke8(p+3, 0x00); poke8(p+4, 0x00);
+    p := p + 5;
+
+    return p - buf;
+}
+
+// Build a minimal VP8 (lossy) WebP: 8x6 dimensions.
+// VP8 chunk: "VP8 " + chunk size + VP8 bitstream.
+// The VP8 bitstream has w-1 at bytes 6-7 (LE 16-bit, 14 bits used) and h-1 at bytes 8-9.
+// w=8 → w-1=7, h=6 → h-1=5; encode as 14-bit values in LE.
+fn makeVp8LossyWebP(buf: int64): int64 {
+    var p: int64 := buf;
+    poke8(p, 0x52); poke8(p+1, 0x49); poke8(p+2, 0x46); poke8(p+3, 0x46);
+    poke8(p+4, 30); poke8(p+5, 0); poke8(p+6, 0); poke8(p+7, 0);
+    poke8(p+8, 0x57); poke8(p+9, 0x45); poke8(p+10, 0x42); poke8(p+11, 0x50);
+    p := p + 12;
+
+    // VP8 chunk: "VP8 " (with space = 0x20)
+    poke8(p, 0x56); poke8(p+1, 0x50); poke8(p+2, 0x38); poke8(p+3, 0x20); // "VP8 "
+    // chunk size = 10 (minimum for meta detection)
+    poke8(p+4, 10); poke8(p+5, 0); poke8(p+6, 0); poke8(p+7, 0);
+    p := p + 8;
+    // VP8 bitstream: 10 bytes
+    // Bytes 0-5: frame tag + start code (we just fill with zeros)
+    poke8(p, 0); poke8(p+1, 0); poke8(p+2, 0); poke8(p+3, 0); poke8(p+4, 0); poke8(p+5, 0);
+    // Bytes 6-7: width-1 (14-bit LE) = 7
+    poke8(p+6, 7); poke8(p+7, 0);
+    // Bytes 8-9: height-1 (14-bit LE) = 5
+    poke8(p+8, 5); poke8(p+9, 0);
+    p := p + 10;
+
+    return p - buf;
+}
+
+pub fn main(argc: int64, argv: pchar): int64 {
+    var ok: int64 := 1;
+
+    // -------------------------------------------------------------------------
+    // Test 1: VP8L WebP — WebpMeta extracts 4x3 dimensions
+    // -------------------------------------------------------------------------
+    var buf1: int64 := alloc(64);
+    var len1: int64 := makeVp8lWebP(buf1);
+    var img1: int64 := alloc(GRF_SIZE);
+    var ret1: int64 := WebpMeta(buf1, len1, img1);
+    if (ret1 != 1) {
+        PrintLn("FAIL: WebpMeta VP8L returned 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: WebpMeta VP8L ret=1"c);
+        var w: int64 := peek64(img1 + GRF_OFF_WIDTH);
+        var h: int64 := peek64(img1 + GRF_OFF_HEIGHT);
+        if (w != 4) {
+            PrintLn("FAIL: VP8L width != 4"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: VP8L width=4"c);
+        }
+        if (h != 3) {
+            PrintLn("FAIL: VP8L height != 3"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: VP8L height=3"c);
+        }
+        var fmt: int64 := peek64(img1 + GRF_OFF_FORMAT);
+        if (fmt != GRF_FMT_WEBP) {
+            PrintLn("FAIL: VP8L format != GRF_FMT_WEBP"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: VP8L format=GRF_FMT_WEBP"c);
+        }
+        var ch: int64 := peek64(img1 + GRF_OFF_CHANNELS);
+        if (ch != 4) {
+            PrintLn("FAIL: VP8L channels != 4"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: VP8L channels=4"c);
+        }
+    }
+    free(buf1, 64);
+    free(img1, GRF_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 2: VP8 lossy WebP — WebpMeta extracts 8x6 dimensions
+    // -------------------------------------------------------------------------
+    var buf2: int64 := alloc(64);
+    var len2: int64 := makeVp8LossyWebP(buf2);
+    var img2: int64 := alloc(GRF_SIZE);
+    var ret2: int64 := WebpMeta(buf2, len2, img2);
+    if (ret2 != 1) {
+        PrintLn("FAIL: WebpMeta VP8 lossy returned 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: WebpMeta VP8 lossy ret=1"c);
+        var w2: int64 := peek64(img2 + GRF_OFF_WIDTH);
+        var h2: int64 := peek64(img2 + GRF_OFF_HEIGHT);
+        if (w2 != 8) {
+            PrintLn("FAIL: VP8 width != 8"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: VP8 lossy width=8"c);
+        }
+        if (h2 != 6) {
+            PrintLn("FAIL: VP8 height != 6"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: VP8 lossy height=6"c);
+        }
+        var ch2: int64 := peek64(img2 + GRF_OFF_CHANNELS);
+        if (ch2 != 3) {
+            PrintLn("FAIL: VP8 channels != 3"c);
+            ok := 0;
+        } else {
+            PrintLn("PASS: VP8 lossy channels=3"c);
+        }
+    }
+    free(buf2, 64);
+    free(img2, GRF_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 3: WebpDecode VP8L → returns 0 (full decode not implemented)
+    // -------------------------------------------------------------------------
+    var buf3: int64 := alloc(64);
+    var len3: int64 := makeVp8lWebP(buf3);
+    var img3: int64 := alloc(GRF_SIZE);
+    var ret3: int64 := WebpDecode(buf3, len3, img3);
+    if (ret3 != 0) {
+        PrintLn("FAIL: WebpDecode VP8L should return 0 (not implemented)"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: WebpDecode VP8L ret=0 (stub)"c);
+    }
+    free(buf3, 64);
+    free(img3, GRF_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 4: Bad RIFF signature → WebpMeta returns 0
+    // -------------------------------------------------------------------------
+    var bufBad: int64 := alloc(32);
+    poke8(bufBad, 0); poke8(bufBad+1, 0); poke8(bufBad+2, 0); poke8(bufBad+3, 0);
+    poke8(bufBad+8, 0); poke8(bufBad+9, 0); poke8(bufBad+10, 0); poke8(bufBad+11, 0);
+    var imgBad: int64 := alloc(GRF_SIZE);
+    var retBad: int64 := WebpMeta(bufBad, 32, imgBad);
+    if (retBad != 0) {
+        PrintLn("FAIL: WebpMeta bad sig should return 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: WebpMeta bad sig → 0"c);
+    }
+    free(bufBad, 32);
+    free(imgBad, GRF_SIZE);
+
+    // -------------------------------------------------------------------------
+    // Test 5: RIFF+WEBP but no recognized chunk → WebpMeta returns 0
+    // -------------------------------------------------------------------------
+    var buf5: int64 := alloc(32);
+    poke8(buf5, 0x52); poke8(buf5+1, 0x49); poke8(buf5+2, 0x46); poke8(buf5+3, 0x46);
+    poke8(buf5+4, 16); poke8(buf5+5, 0); poke8(buf5+6, 0); poke8(buf5+7, 0);
+    poke8(buf5+8, 0x57); poke8(buf5+9, 0x45); poke8(buf5+10, 0x42); poke8(buf5+11, 0x50);
+    // Chunk: "EXIF" (unknown) with size 4
+    poke8(buf5+12, 0x45); poke8(buf5+13, 0x58); poke8(buf5+14, 0x49); poke8(buf5+15, 0x46);
+    poke8(buf5+16, 4); poke8(buf5+17, 0); poke8(buf5+18, 0); poke8(buf5+19, 0);
+    poke8(buf5+20, 0); poke8(buf5+21, 0); poke8(buf5+22, 0); poke8(buf5+23, 0);
+    var img5: int64 := alloc(GRF_SIZE);
+    var ret5: int64 := WebpMeta(buf5, 24, img5);
+    if (ret5 != 0) {
+        PrintLn("FAIL: WebpMeta unknown chunk should return 0"c);
+        ok := 0;
+    } else {
+        PrintLn("PASS: WebpMeta unknown chunk → 0"c);
+    }
+    free(buf5, 32);
+    free(img5, GRF_SIZE);
+
+    if (ok != 0) {
+        PrintLn("=== GRF-06: ALL PASS ==="c);
+    } else {
+        PrintLn("=== GRF-06: SOME FAIL ==="c);
+    }
+    return ok;
+}

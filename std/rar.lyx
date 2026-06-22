@@ -1,0 +1,309 @@
+// std/rar.lyx — RAR5-Archiv Reader (nur stored, method=0)
+//
+// RAR ist ein proprietäres Format von RARLAB.
+// Das Erstellen von RAR-Archiven erfordert eine RARLAB-Lizenz.
+// Diese Unit liest ausschließlich RAR5-Archive (Signatur "Rar!\x1A\x07\x01\x00")
+// und unterstützt nur unkomprimierte Einträge (method=0 / stored).
+// Komprimierte Einträge werden übersprungen (kein offener Algorithmus).
+//
+// RAR5-Blockstruktur:
+//   [Signatur 8 Bytes] [Block]...
+//   Block = CRC32(4) + HeaderSize(vint) + <header-data> + <data-area>
+//   header-data enthält: Type(vint) + Flags(vint) + opt. ExtraSize(vint)
+//                        + opt. DataSize(vint) + typspezifische Felder
+//
+// Verweise: RAR5-Technote (RARLAB) — Block-Typen:
+//   1=ARC  2=FILE  3=SERVICE  4=ENCRYPT  5=ENDARC
+// FILE-Flags: 0x0001=Verzeichnis  0x0002=mtime  0x0004=CRC32
+// Compression info bits 7-9: method (0=store, 1-5=compress)
+
+unit std.rar;
+
+import std.alloc;
+import std.io;
+import std.string;
+import std.fs;
+
+// ============================================================================
+// Konstanten
+// ============================================================================
+
+pub con RAR_MAX_ENTRIES:      int64 := 4096;
+
+pub con RAR_ERR_OK:           int64 := 0;
+pub con RAR_ERR_NOTRAR:       int64 := 1;
+pub con RAR_ERR_IO:           int64 := 2;
+pub con RAR_ERR_CORRUPT:      int64 := 3;
+pub con RAR_ERR_COMPRESSED:   int64 := 4;
+
+// ============================================================================
+// Struct-Offsets (Kommentare als Dokumentation)
+// ============================================================================
+// RarReader (32 Bytes): rawData:0  rawLen:8  entries:16  entryCount:24
+// RarEntry  (32 Bytes): name:0  dataOff:8  dataLen:16  (pad):24
+
+// ============================================================================
+// RAR5 Signature
+// ============================================================================
+// Bytes 0-7: 52 61 72 21 1A 07 01 00  ("Rar!\x1A\x07\x01\x00")
+
+// ============================================================================
+// Interne Hilfsfunktionen
+// ============================================================================
+
+// RAR5 Variable-Length Integer lesen.
+// posPtr: Zeiger auf int64-Position (wird aktualisiert).
+fn rarVint(buf: int64, posPtr: int64): int64 {
+    var pos:    int64 := peek64(posPtr);
+    var result: int64 := 0;
+    var shift:  int64 := 0;
+    var more:   int64 := 1;
+    while (more == 1) {
+        var b: int64 := peek8(buf + pos);
+        result := result | ((b & 0x7F) << shift);
+        shift  := shift + 7;
+        pos    := pos + 1;
+        if ((b & 0x80) == 0) { more := 0; }
+    }
+    poke64(posPtr, pos);
+    return result;
+}
+
+// uint32 (little-endian) lesen; posPtr wird um 4 erhöht.
+fn rarU32(buf: int64, posPtr: int64): int64 {
+    var pos: int64 := peek64(posPtr);
+    var v: int64 := peek8(buf + pos)
+                  | (peek8(buf + pos + 1) << 8)
+                  | (peek8(buf + pos + 2) << 16)
+                  | (peek8(buf + pos + 3) << 24);
+    poke64(posPtr, pos + 4);
+    return v;
+}
+
+// n Bytes von src nach dst kopieren
+fn rarCopy(dst: int64, src: int64, n: int64): void {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+// ============================================================================
+// RAR5 Reader — Lesen
+// ============================================================================
+
+// Öffnet ein RAR5-Archiv aus einer Datei.
+// Gibt alloc'd Handle zurück oder 0 bei Fehler (nicht RAR5 oder I/O-Fehler).
+// Aufrufer muss RarClose() aufrufen.
+// Nur stored-Einträge (method=0) werden gespeichert; komprimierte übersprungen.
+pub fn RarOpen(path: int64): int64 {
+    var fsize: int64 := FileSize(path);
+    if (fsize < 8) { return 0; }
+
+    var raw: int64 := alloc(fsize + 1);
+    var n:   int64 := ReadFile(path, raw, fsize);
+    if (n < 8) { free(raw); return 0; }
+    poke8(raw + n, 0);
+
+    // RAR5-Signatur prüfen: 52 61 72 21 1A 07 01 00
+    if ((peek8(raw)     != 0x52) |
+        (peek8(raw + 1) != 0x61) |
+        (peek8(raw + 2) != 0x72) |
+        (peek8(raw + 3) != 0x21) |
+        (peek8(raw + 4) != 0x1A) |
+        (peek8(raw + 5) != 0x07) |
+        (peek8(raw + 6) != 0x01) |
+        (peek8(raw + 7) != 0x00)) {
+        free(raw); return 0;
+    }
+
+    var handle:  int64 := alloc(32);
+    var entries: int64 := alloc(RAR_MAX_ENTRIES * 32);
+    poke64(handle,      raw);
+    poke64(handle + 8,  n);
+    poke64(handle + 16, entries);
+    poke64(handle + 24, 0);
+
+    // Cursor (heap-allokiert, da kein Adress-Operator in Lyx)
+    var cur: int64 := alloc(8);
+    poke64(cur, 8);  // Position nach Signatur
+
+    var count: int64 := 0;
+    var done:  int64 := 0;
+
+    while (((peek64(cur) + 5) <= n) & (count < RAR_MAX_ENTRIES) & (done == 0)) {
+
+        // ── Gemeinsamer Block-Header ──────────────────────────────────────────
+        // CRC32 (4 Bytes) — übersprungen (Validierung optional)
+        rarU32(raw, cur);
+
+        // HeaderSize (vint): Anzahl Bytes ab Header-Type-Feld bis Ende (inkl. Extra-Area)
+        // WICHTIG: hdrDataStart muss NACH dem Lesen des vint gesetzt werden,
+        // da headerSize die Bytes ab der Type-Position zählt (exkl. headerSize-vint selbst).
+        var headerSize:   int64 := rarVint(raw, cur);
+        var hdrDataStart: int64 := peek64(cur);  // zeigt jetzt auf das Type-Vint-Feld
+        var hdrDataEnd:   int64 := hdrDataStart + headerSize;
+
+        // Guard: Header muss innerhalb der Datei liegen
+        if (hdrDataEnd > n) { done := 1; }
+        else {
+            // Header-Type (vint)
+            var hdrType:  int64 := rarVint(raw, cur);
+            // Header-Flags (vint)
+            var hdrFlags: int64 := rarVint(raw, cur);
+
+            // Optionale Extra-Area-Größe
+            var extraSize: int64 := 0;
+            if ((hdrFlags & 0x0001) != 0) { extraSize := rarVint(raw, cur); }
+
+            // Optionale Data-Area-Größe (gepackte/gespeicherte Dateidaten)
+            var dataSize: int64 := 0;
+            if ((hdrFlags & 0x0002) != 0) { dataSize := rarVint(raw, cur); }
+
+            // ── Block-Typ auswerten ───────────────────────────────────────────
+            if (hdrType == 5) {
+                // ENDARC — Ende des Archivs
+                done := 1;
+            } else {
+                if (hdrType == 2) {
+                    // ── FILE-Header ───────────────────────────────────────────
+                    var fileFlags:  int64 := rarVint(raw, cur);
+                    var unpackSize: int64 := rarVint(raw, cur);
+                    var attributes: int64 := rarVint(raw, cur);
+
+                    // mtime (uint32) falls FHD_UTIME (bit 1) gesetzt
+                    if ((fileFlags & 0x0002) != 0) { rarU32(raw, cur); }
+
+                    // CRC32 (uint32) falls FHD_CRC32 (bit 2) gesetzt
+                    if ((fileFlags & 0x0004) != 0) { rarU32(raw, cur); }
+
+                    // Compression info (vint): bits 7-9 = method
+                    var compInfo: int64 := rarVint(raw, cur);
+
+                    // Host OS (vint) — überspringen
+                    rarVint(raw, cur);
+
+                    // Dateiname
+                    var nameLen: int64 := rarVint(raw, cur);
+                    var namePos: int64 := peek64(cur);
+
+                    // Compression method: Bits 7-9 der compInfo
+                    var method: int64 := (compInfo >> 7) & 0x7;
+
+                    // Verzeichnisse (FHD_DIRECTORY, bit 0) überspringen
+                    var isDir: int64 := fileFlags & 0x0001;
+
+                    // Nur stored reguläre Dateien mit vernünftigem Namen speichern
+                    if ((isDir == 0) & (method == 0) & (nameLen > 0) & (nameLen < 512)) {
+                        var dataOff: int64 := hdrDataEnd;
+                        if ((dataOff + dataSize) <= n) {
+                            var name: int64 := alloc(nameLen + 1);
+                            var ni: int64 := 0;
+                            while (ni < nameLen) {
+                                poke8(name + ni, peek8(raw + namePos + ni));
+                                ni := ni + 1;
+                            }
+                            poke8(name + nameLen, 0);
+
+                            var entry: int64 := entries + count * 32;
+                            poke64(entry,      name);
+                            poke64(entry + 8,  dataOff);
+                            poke64(entry + 16, dataSize);
+                            poke64(entry + 24, 0);
+                            count := count + 1;
+                        }
+                    }
+                }
+
+                // Nächsten Block anspringen (Header-Ende + Data-Area)
+                poke64(cur, hdrDataEnd + dataSize);
+            }
+        }
+    }
+
+    free(cur);
+    poke64(handle + 24, count);
+    return handle;
+}
+
+// Schließt ein RAR-Handle und gibt alle Ressourcen frei.
+pub fn RarClose(handle: int64): void {
+    if (handle == 0) { return; }
+    var entries: int64 := peek64(handle + 16);
+    var count:   int64 := peek64(handle + 24);
+    var i: int64 := 0;
+    while (i < count) {
+        var name: int64 := peek64(entries + i * 32);
+        if (name != 0) { free(name); }
+        i := i + 1;
+    }
+    free(entries);
+    free(peek64(handle));
+    free(handle);
+}
+
+// Gibt die Anzahl der stored Einträge zurück.
+pub fn RarCount(handle: int64): int64 {
+    if (handle == 0) { return 0; }
+    return peek64(handle + 24);
+}
+
+// Gibt den Namen des i-ten Eintrags zurück (interner Puffer — nicht free'n).
+pub fn RarName(handle: int64, idx: int64): int64 {
+    if (handle == 0) { return 0; }
+    if ((idx < 0) | (idx >= peek64(handle + 24))) { return 0; }
+    return peek64(peek64(handle + 16) + idx * 32);
+}
+
+// Gibt die unkomprimierte Größe des i-ten Eintrags zurück.
+pub fn RarSize(handle: int64, idx: int64): int64 {
+    if (handle == 0) { return 0; }
+    if ((idx < 0) | (idx >= peek64(handle + 24))) { return 0; }
+    return peek64(peek64(handle + 16) + idx * 32 + 16);
+}
+
+// Liest den i-ten Eintrag in outBuf (mindestens RarSize Bytes Kapazität).
+// Gibt geschriebene Bytes zurück oder -1 bei Fehler.
+// Achtung: Nur für stored-Einträge sinnvoll — RAR_ERR_COMPRESSED kennzeichnet
+// komprimierte Einträge, die RarOpen bereits überspringt.
+pub fn RarRead(handle: int64, idx: int64, outBuf: int64, maxLen: int64): int64 {
+    if (handle == 0) { return 0 - 1; }
+    var count: int64 := peek64(handle + 24);
+    if ((idx < 0) | (idx >= count)) { return 0 - 1; }
+
+    var entry:   int64 := peek64(handle + 16) + idx * 32;
+    var dataOff: int64 := peek64(entry + 8);
+    var dataLen: int64 := peek64(entry + 16);
+    var rawData: int64 := peek64(handle);
+    var rawLen:  int64 := peek64(handle + 8);
+
+    if ((dataOff + dataLen) > rawLen) { return 0 - 1; }
+    if (dataLen > maxLen) { return 0 - 1; }
+
+    rarCopy(outBuf, rawData + dataOff, dataLen);
+    return dataLen;
+}
+
+// Sucht Eintrag nach exaktem Namen (UTF-8). Gibt Index zurück oder -1.
+pub fn RarFind(handle: int64, name: int64): int64 {
+    if (handle == 0) { return 0 - 1; }
+    var count:   int64 := peek64(handle + 24);
+    var entries: int64 := peek64(handle + 16);
+    var nlen:    int64 := StrLen(name);
+    var i: int64 := 0;
+    while (i < count) {
+        var ename: int64 := peek64(entries + i * 32);
+        if (ename != 0) {
+            var elen: int64 := StrLen(ename);
+            if (nlen == elen) {
+                var isMatch: int64 := 1;
+                var k: int64 := 0;
+                while (k < nlen) {
+                    if (peek8(ename + k) != peek8(name + k)) { isMatch := 0; }
+                    k := k + 1;
+                }
+                if (isMatch == 1) { return i; }
+            }
+        }
+        i := i + 1;
+    }
+    return 0 - 1;
+}

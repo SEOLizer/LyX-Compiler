@@ -1,0 +1,890 @@
+// std/blockchain.lyx — Blockchain Standard Library (WP-BL-02..WP-BL-05)
+//
+// Public API (WP-BL-02 Serializer):
+//   BLSerializeInt32(v, out)          — 4-byte big-endian into out
+//   BLSerializeInt64(v, out)          — 8-byte big-endian into out
+//   BLMerkleRoot(txPtrs, count, out)  — merkle root of count transactions
+//
+// Public API (WP-BL-03 Core Models):
+//   Structures: BLTransaction (232 bytes), BLBlock (128 + tx list)
+//   BLNewTransaction(pubKey, recvAddr, amount, fee, nonce, txOut)
+//   BLNewCoinbaseTx(recvAddr, amount, blockIndex, txOut)
+//   BLIsCoinbase(tx): int64
+//   BLTxHash(tx, out)
+//   BLNewBlock(index, prevHash, txPtrs, txCount, difficulty, blockOut)
+//   BLCalculateHash(block, out)
+//
+// Public API (WP-BL-04 Ledger):
+//   BLLedgerNew(): int64              — alloc'd ledger ptr
+//   BLLedgerFree(l)
+//   BLGetBalance(l, addr): int64
+//   BLGetNonce(l, addr): int64
+//   BLApplyTransaction(l, tx): int64  — new ledger ptr or 0 on error
+//   BLApplyBlock(l, block): int64     — new ledger ptr or 0 on error
+//
+// Public API (WP-BL-05 Consensus):
+//   BLBlockchainNew(difficulty, reward, maxTxPerBlock): int64
+//   BLBlockchainFree(bc)
+//   BLAddTransaction(bc, tx): int64   — 1=ok, 0=err
+//   BLMinePendingTransactions(bc, minerAddr): int64  — new block ptr or 0
+//   BLIsValidChain(bc): int64         — 1=ok, 0=invalid
+//   BLGetBalance(l, addr): int64      — via ledger
+//   BLChainLength(bc): int64
+//
+// Notes:
+//   PublicKey = 64 bytes (X||Y uncompressed secp256k1)
+//   Address   = 32 bytes (SHA-256 of PublicKey)
+//   Signature = 64 bytes (R||S compact)
+//   Amounts in base units. 1 Coin = BL_BASE_UNIT = 1_000_000.
+
+unit std.blockchain;
+
+import std.alloc;
+import std.crypto.sha256;
+import std.crypto.ecc;
+import std.crypto.rand;
+import std.time;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+pub con BL_BASE_UNIT:                 int64 := 1000000;
+pub con BL_PUBKEY_LEN:                int64 := 64;   // X||Y uncompressed
+pub con BL_PRIVKEY_LEN:               int64 := 32;
+pub con BL_ADDR_LEN:                  int64 := 32;   // SHA-256(pubkey)
+pub con BL_SIG_LEN:                   int64 := 64;   // R||S
+pub con BL_HASH_LEN:                  int64 := 32;
+pub con BL_DIFFICULTY_INTERVAL:       int64 := 10;
+pub con BL_BLOCK_TARGET_NS:           int64 := 10000000000;   // 10 s
+pub con BL_MIN_DIFFICULTY:            int64 := 1;
+pub con BL_MAX_DIFFICULTY_FACTOR:     int64 := 4;
+
+// ── BLTransaction layout (304 bytes) ─────────────────────────────────────────
+// offset   0: senderAddr   [32 bytes]
+// offset  32: senderPubKey [64 bytes]
+// offset  96: receiverAddr [32 bytes]
+// offset 128: amount       int64
+// offset 136: fee          int64
+// offset 144: nonce        int64
+// offset 152: timestamp    int64
+// offset 160: signature    [64 bytes]  — R||S
+// total: 224 bytes
+
+pub con BL_TX_SENDER_ADDR:   int64 := 0;
+pub con BL_TX_SENDER_PUB:    int64 := 32;
+pub con BL_TX_RECV_ADDR:     int64 := 96;
+pub con BL_TX_AMOUNT:        int64 := 128;
+pub con BL_TX_FEE:           int64 := 136;
+pub con BL_TX_NONCE:         int64 := 144;
+pub con BL_TX_TIMESTAMP:     int64 := 152;
+pub con BL_TX_SIG:           int64 := 160;
+pub con BL_TX_SIZE:          int64 := 224;
+
+// ── BLBlock layout ────────────────────────────────────────────────────────────
+// offset   0: index        int64
+// offset   8: timestamp    int64
+// offset  16: prevHash     [32 bytes]
+// offset  48: merkleRoot   [32 bytes]
+// offset  80: nonce        int64
+// offset  88: difficulty   int64
+// offset  96: hash         [32 bytes]
+// offset 128: txCount      int64
+// offset 136: txPtrs       int64  (ptr to alloc'd array of int64 tx pointers)
+// total header: 144 bytes
+
+pub con BL_BLK_INDEX:      int64 := 0;
+pub con BL_BLK_TIMESTAMP:  int64 := 8;
+pub con BL_BLK_PREV_HASH:  int64 := 16;
+pub con BL_BLK_MERKLE:     int64 := 48;
+pub con BL_BLK_NONCE:      int64 := 80;
+pub con BL_BLK_DIFFICULTY: int64 := 88;
+pub con BL_BLK_HASH:       int64 := 96;
+pub con BL_BLK_TX_COUNT:   int64 := 128;
+pub con BL_BLK_TX_PTRS:    int64 := 136;
+pub con BL_BLK_SIZE:       int64 := 144;
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn blMemCpy(dst: int64, src: int64, n: int64): void {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+fn blMemZero(dst: int64, n: int64): void {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + i, 0); i := i + 1; }
+}
+
+fn blMemEq(a: int64, b: int64, n: int64): int64 {
+    var i: int64 := 0;
+    while (i < n) {
+        if ((peek8(a + i) & 0xFF) != (peek8(b + i) & 0xFF)) { return 0; }
+        i := i + 1;
+    }
+    return 1;
+}
+
+fn blCurrentNs(): int64 {
+    return GetTimeNs(CLOCK_REALTIME);
+}
+
+// ── WP-BL-02: Serializer ─────────────────────────────────────────────────────
+
+// Write 4-byte big-endian int32 into out (4 bytes)
+pub fn BLSerializeInt32(v: int64, out: int64): void {
+    poke8(out + 0, (v >> 24) & 0xFF);
+    poke8(out + 1, (v >> 16) & 0xFF);
+    poke8(out + 2, (v >>  8) & 0xFF);
+    poke8(out + 3, (v >>  0) & 0xFF);
+}
+
+// Write 8-byte big-endian int64 into out (8 bytes)
+pub fn BLSerializeInt64(v: int64, out: int64): void {
+    poke8(out + 0, (v >> 56) & 0xFF);
+    poke8(out + 1, (v >> 48) & 0xFF);
+    poke8(out + 2, (v >> 40) & 0xFF);
+    poke8(out + 3, (v >> 32) & 0xFF);
+    poke8(out + 4, (v >> 24) & 0xFF);
+    poke8(out + 5, (v >> 16) & 0xFF);
+    poke8(out + 6, (v >>  8) & 0xFF);
+    poke8(out + 7, (v >>  0) & 0xFF);
+}
+
+// serializeTxPayload (without signature) into buf. Returns byte count written.
+// Layout: [4+32 senderAddr] [4+64 senderPub] [4+32 recvAddr] [8 amount] [8 fee] [8 nonce] [8 ts]
+// Total: 4+32 + 4+64 + 4+32 + 8+8+8+8 = 172 bytes
+fn blSerializeTxPayload(tx: int64, buf: int64): int64 {
+    var off: int64 := 0;
+    BLSerializeInt32(BL_ADDR_LEN, buf + off);   off := off + 4;
+    blMemCpy(buf + off, tx + BL_TX_SENDER_ADDR, BL_ADDR_LEN); off := off + BL_ADDR_LEN;
+    BLSerializeInt32(BL_PUBKEY_LEN, buf + off); off := off + 4;
+    blMemCpy(buf + off, tx + BL_TX_SENDER_PUB, BL_PUBKEY_LEN); off := off + BL_PUBKEY_LEN;
+    BLSerializeInt32(BL_ADDR_LEN, buf + off);   off := off + 4;
+    blMemCpy(buf + off, tx + BL_TX_RECV_ADDR, BL_ADDR_LEN); off := off + BL_ADDR_LEN;
+    BLSerializeInt64(peek64(tx + BL_TX_AMOUNT),    buf + off); off := off + 8;
+    BLSerializeInt64(peek64(tx + BL_TX_FEE),       buf + off); off := off + 8;
+    BLSerializeInt64(peek64(tx + BL_TX_NONCE),     buf + off); off := off + 8;
+    BLSerializeInt64(peek64(tx + BL_TX_TIMESTAMP), buf + off); off := off + 8;
+    return off;
+}
+
+// serializeTxFull (with signature). Returns byte count written.
+// Total: 172 + 4+64 = 240 bytes
+fn blSerializeTxFull(tx: int64, buf: int64): int64 {
+    var off: int64 := blSerializeTxPayload(tx, buf);
+    BLSerializeInt32(BL_SIG_LEN, buf + off); off := off + 4;
+    blMemCpy(buf + off, tx + BL_TX_SIG, BL_SIG_LEN); off := off + BL_SIG_LEN;
+    return off;
+}
+
+// serializeBlockHeader. Returns byte count written.
+// Layout: [8 index] [8 ts] [4+32 prevHash] [4+32 merkle] [8 nonce] [4 difficulty]
+// Total: 8+8 + 4+32 + 4+32 + 8+4 = 100 bytes
+fn blSerializeBlockHeader(block: int64, buf: int64): int64 {
+    var off: int64 := 0;
+    BLSerializeInt64(peek64(block + BL_BLK_INDEX),     buf + off); off := off + 8;
+    BLSerializeInt64(peek64(block + BL_BLK_TIMESTAMP), buf + off); off := off + 8;
+    BLSerializeInt32(BL_HASH_LEN, buf + off);                      off := off + 4;
+    blMemCpy(buf + off, block + BL_BLK_PREV_HASH, BL_HASH_LEN);   off := off + BL_HASH_LEN;
+    BLSerializeInt32(BL_HASH_LEN, buf + off);                      off := off + 4;
+    blMemCpy(buf + off, block + BL_BLK_MERKLE, BL_HASH_LEN);      off := off + BL_HASH_LEN;
+    BLSerializeInt64(peek64(block + BL_BLK_NONCE),      buf + off); off := off + 8;
+    BLSerializeInt32(peek64(block + BL_BLK_DIFFICULTY), buf + off); off := off + 4;
+    return off;
+}
+
+// Merkle root of count transactions (pointers in txPtrs array).
+// Writes 32-byte hash into out.
+pub fn BLMerkleRoot(txPtrs: int64, count: int64, out: int64): void {
+    if (count == 0) {
+        // sha256 of empty
+        var empty: int64 := alloc(1);
+        SHA256(empty, 0, out);
+        free(empty, 1);
+        return;
+    }
+
+    // Build leaf hashes: sha256(serializeTxFull(tx))
+    var leaves: int64 := alloc(count * BL_HASH_LEN);
+    var buf: int64    := alloc(256);
+    var i: int64 := 0;
+    while (i < count) {
+        var tx: int64 := peek64(txPtrs + i * 8);
+        var n: int64  := blSerializeTxFull(tx, buf);
+        SHA256(buf, n, leaves + i * BL_HASH_LEN);
+        i := i + 1;
+    }
+    free(buf, 256);
+
+    var leafCount: int64 := count;
+    var combined: int64  := alloc(BL_HASH_LEN * 2);
+
+    while (leafCount > 1) {
+        // Duplicate last leaf if odd count
+        if ((leafCount & 1) == 1) {
+            blMemCpy(leaves + leafCount * BL_HASH_LEN, leaves + (leafCount - 1) * BL_HASH_LEN, BL_HASH_LEN);
+            leafCount := leafCount + 1;
+        }
+        var nextCount: int64  := leafCount / 2;
+        var nextLeaves: int64 := alloc(nextCount * BL_HASH_LEN);
+        var j: int64 := 0;
+        while (j < nextCount) {
+            blMemCpy(combined,               leaves + (j * 2)     * BL_HASH_LEN, BL_HASH_LEN);
+            blMemCpy(combined + BL_HASH_LEN, leaves + (j * 2 + 1) * BL_HASH_LEN, BL_HASH_LEN);
+            SHA256(combined, BL_HASH_LEN * 2, nextLeaves + j * BL_HASH_LEN);
+            j := j + 1;
+        }
+        free(leaves, leafCount * BL_HASH_LEN);
+        leaves    := nextLeaves;
+        leafCount := nextCount;
+    }
+
+    blMemCpy(out, leaves, BL_HASH_LEN);
+    free(leaves, BL_HASH_LEN);
+    free(combined, BL_HASH_LEN * 2);
+}
+
+// ── WP-BL-03: Core Models ────────────────────────────────────────────────────
+
+// Allocate and fill a BLTransaction. pubKey=64B, recvAddr=32B.
+// Signature field is zeroed — must be set after signing.
+pub fn BLNewTransaction(pubKey: int64, recvAddr: int64, amount: int64, fee: int64, nonce: int64): int64 {
+    var tx: int64 := alloc(BL_TX_SIZE);
+    blMemZero(tx, BL_TX_SIZE);
+    // senderAddress = SHA256(pubKey)
+    SHA256(pubKey, BL_PUBKEY_LEN, tx + BL_TX_SENDER_ADDR);
+    blMemCpy(tx + BL_TX_SENDER_PUB,  pubKey,   BL_PUBKEY_LEN);
+    blMemCpy(tx + BL_TX_RECV_ADDR,   recvAddr, BL_ADDR_LEN);
+    poke64(tx + BL_TX_AMOUNT,    amount);
+    poke64(tx + BL_TX_FEE,       fee);
+    poke64(tx + BL_TX_NONCE,     nonce);
+    poke64(tx + BL_TX_TIMESTAMP, blCurrentNs());
+    return tx;
+}
+
+// Coinbase transaction: senderAddr = zeros(32), senderPub = zeros(64), nonce = blockIndex.
+pub fn BLNewCoinbaseTx(recvAddr: int64, amount: int64, blockIndex: int64): int64 {
+    var tx: int64 := alloc(BL_TX_SIZE);
+    blMemZero(tx, BL_TX_SIZE);
+    blMemCpy(tx + BL_TX_RECV_ADDR, recvAddr, BL_ADDR_LEN);
+    poke64(tx + BL_TX_AMOUNT,    amount);
+    poke64(tx + BL_TX_FEE,       0);
+    poke64(tx + BL_TX_NONCE,     blockIndex);
+    poke64(tx + BL_TX_TIMESTAMP, blCurrentNs());
+    return tx;
+}
+
+pub fn BLTxFree(tx: int64): void {
+    free(tx, BL_TX_SIZE);
+}
+
+// Returns 1 if this is a coinbase transaction (senderAddr all zeros).
+pub fn BLIsCoinbase(tx: int64): int64 {
+    var zeros: int64 := alloc(BL_ADDR_LEN);
+    blMemZero(zeros, BL_ADDR_LEN);
+    var eq: int64 := blMemEq(tx + BL_TX_SENDER_ADDR, zeros, BL_ADDR_LEN);
+    free(zeros, BL_ADDR_LEN);
+    return eq;
+}
+
+// txHash = SHA256(serializeTxFull(tx)). Writes 32 bytes into out.
+pub fn BLTxHash(tx: int64, out: int64): void {
+    var buf: int64 := alloc(256);
+    var n: int64   := blSerializeTxFull(tx, buf);
+    SHA256(buf, n, out);
+    free(buf, 256);
+}
+
+// Sign a transaction: sets tx.signature. privKey=32B, pubKey in tx.senderPub.
+// Returns 1 on success.
+pub fn BLSignTransaction(tx: int64, privKey: int64): int64 {
+    var payload: int64 := alloc(256);
+    var n: int64       := blSerializeTxPayload(tx, payload);
+    var h: int64       := alloc(BL_HASH_LEN);
+    SHA256(payload, n, h);
+    free(payload, 256);
+    var r: int64 := tx + BL_TX_SIG;
+    var s: int64 := tx + BL_TX_SIG + 32;
+    var ok: int64 := ECDSASign(h, privKey, r, s);
+    free(h, BL_HASH_LEN);
+    return ok;
+}
+
+// Verify a transaction signature. Returns 1 if valid.
+pub fn BLVerifyTransaction(tx: int64): int64 {
+    if (BLIsCoinbase(tx) == 1) { return 1; }
+    var payload: int64 := alloc(256);
+    var n: int64       := blSerializeTxPayload(tx, payload);
+    var h: int64       := alloc(BL_HASH_LEN);
+    SHA256(payload, n, h);
+    free(payload, 256);
+    var pubx: int64 := tx + BL_TX_SENDER_PUB;
+    var puby: int64 := tx + BL_TX_SENDER_PUB + 32;
+    var r: int64    := tx + BL_TX_SIG;
+    var s: int64    := tx + BL_TX_SIG + 32;
+    var ok: int64   := ECDSAVerify(h, pubx, puby, r, s);
+    free(h, BL_HASH_LEN);
+    return ok;
+}
+
+// Allocate a new block. txPtrs = int64 array of tx pointers (count items).
+// hash field is zeroed — call BLCalculateHash after PoW.
+pub fn BLNewBlock(index: int64, prevHash: int64, txPtrs: int64, txCount: int64, difficulty: int64): int64 {
+    var block: int64 := alloc(BL_BLK_SIZE);
+    blMemZero(block, BL_BLK_SIZE);
+    poke64(block + BL_BLK_INDEX,      index);
+    poke64(block + BL_BLK_TIMESTAMP,  blCurrentNs());
+    blMemCpy(block + BL_BLK_PREV_HASH, prevHash, BL_HASH_LEN);
+    // Compute merkle root
+    BLMerkleRoot(txPtrs, txCount, block + BL_BLK_MERKLE);
+    poke64(block + BL_BLK_NONCE,      0);
+    poke64(block + BL_BLK_DIFFICULTY, difficulty);
+    poke64(block + BL_BLK_TX_COUNT,   txCount);
+    // Copy tx pointer array
+    if (txCount > 0) {
+        var ptrArr: int64 := alloc(txCount * 8);
+        blMemCpy(ptrArr, txPtrs, txCount * 8);
+        poke64(block + BL_BLK_TX_PTRS, ptrArr);
+    }
+    return block;
+}
+
+// Free a block (does NOT free the transaction pointers in txPtrs).
+pub fn BLBlockFree(block: int64): void {
+    var txCount: int64 := peek64(block + BL_BLK_TX_COUNT);
+    if (txCount > 0) {
+        var ptrArr: int64 := peek64(block + BL_BLK_TX_PTRS);
+        if (ptrArr != 0) { free(ptrArr, txCount * 8); }
+    }
+    free(block, BL_BLK_SIZE);
+}
+
+// calculateHash = SHA256(serializeBlockHeader(block)). Writes 32 bytes into out.
+pub fn BLCalculateHash(block: int64, out: int64): void {
+    var buf: int64 := alloc(128);
+    var n: int64   := blSerializeBlockHeader(block, buf);
+    SHA256(buf, n, out);
+    free(buf, 128);
+}
+
+// meetsTarget: returns 1 if hash has `difficulty` leading zero bytes.
+pub fn BLMeetsTarget(hash: int64, difficulty: int64): int64 {
+    var i: int64 := 0;
+    while (i < difficulty) {
+        if ((peek8(hash + i) & 0xFF) != 0) { return 0; }
+        i := i + 1;
+    }
+    return 1;
+}
+
+// ── WP-BL-04: Ledger ─────────────────────────────────────────────────────────
+//
+// Ledger is a flat hash table of (address[32], balance int64, nonce int64) entries.
+// Layout per bucket: 32 bytes addr + 8 bytes balance + 8 bytes nonce + 8 bytes "used" flag = 56 bytes
+// Capacity: 1024 buckets (fixed). Open addressing, linear probing.
+// Total size: 8 (header: capacity) + 1024 * 56 bytes = 57352 bytes
+
+pub con BL_LEDGER_CAP:      int64 := 1024;
+pub con BL_LEDGER_BUCKET:   int64 := 56;   // addr(32) + balance(8) + nonce(8) + used(8)
+pub con BL_LEDGER_HDR:      int64 := 8;
+pub con BL_LEDGER_SIZE:     int64 := 57352; // 8 + 1024*56
+
+pub con BL_BUCKET_ADDR:     int64 := 0;
+pub con BL_BUCKET_BALANCE:  int64 := 32;
+pub con BL_BUCKET_NONCE:    int64 := 40;
+pub con BL_BUCKET_USED:     int64 := 48;
+
+fn blLedgerHash(addr: int64): int64 {
+    var h: int64 := 0;
+    var i: int64 := 0;
+    while (i < BL_ADDR_LEN) {
+        h := (h * 31 + (peek8(addr + i) & 0xFF)) & 0x7FFFFFFFFFFFFFFF;
+        i := i + 1;
+    }
+    return h & (BL_LEDGER_CAP - 1);
+}
+
+fn blLedgerFind(l: int64, addr: int64): int64 {
+    var start: int64 := blLedgerHash(addr);
+    var idx: int64   := start;
+    while (1 == 1) {
+        var bucket: int64 := l + BL_LEDGER_HDR + idx * BL_LEDGER_BUCKET;
+        if (peek64(bucket + BL_BUCKET_USED) == 0) { return 0 - 1; }
+        if (blMemEq(bucket + BL_BUCKET_ADDR, addr, BL_ADDR_LEN) == 1) { return idx; }
+        idx := (idx + 1) & (BL_LEDGER_CAP - 1);
+        if (idx == start) { return 0 - 1; }
+    }
+    return 0 - 1;
+}
+
+fn blLedgerFindOrInsert(l: int64, addr: int64): int64 {
+    var start: int64 := blLedgerHash(addr);
+    var idx: int64   := start;
+    while (1 == 1) {
+        var bucket: int64 := l + BL_LEDGER_HDR + idx * BL_LEDGER_BUCKET;
+        if (peek64(bucket + BL_BUCKET_USED) == 0) {
+            poke64(bucket + BL_BUCKET_USED,    1);
+            poke64(bucket + BL_BUCKET_BALANCE, 0);
+            poke64(bucket + BL_BUCKET_NONCE,   0);
+            blMemCpy(bucket + BL_BUCKET_ADDR, addr, BL_ADDR_LEN);
+            return idx;
+        }
+        if (blMemEq(bucket + BL_BUCKET_ADDR, addr, BL_ADDR_LEN) == 1) { return idx; }
+        idx := (idx + 1) & (BL_LEDGER_CAP - 1);
+        if (idx == start) { return 0 - 1; }
+    }
+    return 0 - 1;
+}
+
+// Clone a ledger (immutable update pattern).
+fn blLedgerClone(l: int64): int64 {
+    var c: int64 := alloc(BL_LEDGER_SIZE);
+    blMemCpy(c, l, BL_LEDGER_SIZE);
+    return c;
+}
+
+pub fn BLLedgerNew(): int64 {
+    var l: int64 := alloc(BL_LEDGER_SIZE);
+    blMemZero(l, BL_LEDGER_SIZE);
+    return l;
+}
+
+pub fn BLLedgerFree(l: int64): void {
+    free(l, BL_LEDGER_SIZE);
+}
+
+pub fn BLGetBalance(l: int64, addr: int64): int64 {
+    var idx: int64 := blLedgerFind(l, addr);
+    if (idx == (0 - 1)) { return 0; }
+    var bucket: int64 := l + BL_LEDGER_HDR + idx * BL_LEDGER_BUCKET;
+    return peek64(bucket + BL_BUCKET_BALANCE);
+}
+
+pub fn BLGetNonce(l: int64, addr: int64): int64 {
+    var idx: int64 := blLedgerFind(l, addr);
+    if (idx == (0 - 1)) { return 0; }
+    var bucket: int64 := l + BL_LEDGER_HDR + idx * BL_LEDGER_BUCKET;
+    return peek64(bucket + BL_BUCKET_NONCE);
+}
+
+fn blLedgerCredit(l: int64, addr: int64, amount: int64): int64 {
+    var c: int64   := blLedgerClone(l);
+    var idx: int64 := blLedgerFindOrInsert(c, addr);
+    if (idx == (0 - 1)) { BLLedgerFree(c); return 0; }
+    var bucket: int64 := c + BL_LEDGER_HDR + idx * BL_LEDGER_BUCKET;
+    poke64(bucket + BL_BUCKET_BALANCE, peek64(bucket + BL_BUCKET_BALANCE) + amount);
+    return c;
+}
+
+fn blLedgerDebit(l: int64, addr: int64, amount: int64): int64 {
+    var c: int64   := blLedgerClone(l);
+    var idx: int64 := blLedgerFindOrInsert(c, addr);
+    if (idx == (0 - 1)) { BLLedgerFree(c); return 0; }
+    var bucket: int64 := c + BL_LEDGER_HDR + idx * BL_LEDGER_BUCKET;
+    poke64(bucket + BL_BUCKET_BALANCE, peek64(bucket + BL_BUCKET_BALANCE) - amount);
+    return c;
+}
+
+fn blLedgerIncrNonce(l: int64, addr: int64): int64 {
+    var c: int64   := blLedgerClone(l);
+    var idx: int64 := blLedgerFindOrInsert(c, addr);
+    if (idx == (0 - 1)) { BLLedgerFree(c); return 0; }
+    var bucket: int64 := c + BL_LEDGER_HDR + idx * BL_LEDGER_BUCKET;
+    poke64(bucket + BL_BUCKET_NONCE, peek64(bucket + BL_BUCKET_NONCE) + 1);
+    return c;
+}
+
+// BLApplyTransaction: returns new ledger ptr on success, 0 on error.
+// Caller must free old ledger if they no longer need it.
+pub fn BLApplyTransaction(l: int64, tx: int64): int64 {
+    if (BLIsCoinbase(tx) == 1) {
+        return blLedgerCredit(l, tx + BL_TX_RECV_ADDR, peek64(tx + BL_TX_AMOUNT));
+    }
+
+    var senderAddr: int64 := tx + BL_TX_SENDER_ADDR;
+    var expected: int64   := BLGetNonce(l, senderAddr);
+    if (peek64(tx + BL_TX_NONCE) != expected) { return 0; }
+
+    var amount: int64 := peek64(tx + BL_TX_AMOUNT);
+    var fee: int64    := peek64(tx + BL_TX_FEE);
+    if ((amount < 0) | (fee < 0)) { return 0; }
+
+    var required: int64 := amount + fee;
+    if (BLGetBalance(l, senderAddr) < required) { return 0; }
+
+    var l2: int64 := blLedgerDebit(l, senderAddr, required);
+    if (l2 == 0) { return 0; }
+    var l3: int64 := blLedgerCredit(l2, tx + BL_TX_RECV_ADDR, amount);
+    BLLedgerFree(l2);
+    if (l3 == 0) { return 0; }
+    var l4: int64 := blLedgerIncrNonce(l3, senderAddr);
+    BLLedgerFree(l3);
+    return l4;
+}
+
+// BLApplyBlock: returns new ledger ptr on success, 0 on error (atomic).
+pub fn BLApplyBlock(l: int64, block: int64): int64 {
+    var txCount: int64 := peek64(block + BL_BLK_TX_COUNT);
+    var txPtrs: int64  := peek64(block + BL_BLK_TX_PTRS);
+    var cur: int64     := blLedgerClone(l);
+    var i: int64 := 0;
+    while (i < txCount) {
+        var tx: int64   := peek64(txPtrs + i * 8);
+        var next: int64 := BLApplyTransaction(cur, tx);
+        BLLedgerFree(cur);
+        if (next == 0) { return 0; }
+        cur := next;
+        i := i + 1;
+    }
+    return cur;
+}
+
+// ── WP-BL-05: Consensus (Blockchain) ─────────────────────────────────────────
+//
+// Blockchain struct layout:
+//   offset  0: ledger ptr        int64
+//   offset  8: difficulty        int64
+//   offset 16: miningReward      int64
+//   offset 24: maxTxPerBlock     int64
+//   offset 32: chainCount        int64  (number of blocks)
+//   offset 40: chainCap          int64  (capacity of chainBlocks array)
+//   offset 48: chainBlocks       int64  (ptr to array of block ptrs)
+//   offset 56: mempoolCount      int64
+//   offset 64: mempoolCap        int64
+//   offset 72: mempoolTxs        int64  (ptr to array of tx ptrs)
+//   total: 80 bytes
+
+pub con BL_BC_LEDGER:       int64 := 0;
+pub con BL_BC_DIFFICULTY:   int64 := 8;
+pub con BL_BC_REWARD:       int64 := 16;
+pub con BL_BC_MAX_TX:       int64 := 24;
+pub con BL_BC_CHAIN_COUNT:  int64 := 32;
+pub con BL_BC_CHAIN_CAP:    int64 := 40;
+pub con BL_BC_CHAIN_BLKS:   int64 := 48;
+pub con BL_BC_MEMPOOL_CNT:  int64 := 56;
+pub con BL_BC_MEMPOOL_CAP:  int64 := 64;
+pub con BL_BC_MEMPOOL_TXS:  int64 := 72;
+pub con BL_BC_SIZE:         int64 := 80;
+
+fn blBCGrowChain(bc: int64): void {
+    var cap: int64 := peek64(bc + BL_BC_CHAIN_CAP);
+    var newCap: int64 := cap * 2;
+    if (newCap < 16) { newCap := 16; }
+    var old: int64 := peek64(bc + BL_BC_CHAIN_BLKS);
+    var newArr: int64 := alloc(newCap * 8);
+    blMemZero(newArr, newCap * 8);
+    if (old != 0) { blMemCpy(newArr, old, cap * 8); free(old, cap * 8); }
+    poke64(bc + BL_BC_CHAIN_BLKS, newArr);
+    poke64(bc + BL_BC_CHAIN_CAP,  newCap);
+}
+
+fn blBCGrowMempool(bc: int64): void {
+    var cap: int64 := peek64(bc + BL_BC_MEMPOOL_CAP);
+    var newCap: int64 := cap * 2;
+    if (newCap < 16) { newCap := 16; }
+    var old: int64 := peek64(bc + BL_BC_MEMPOOL_TXS);
+    var newArr: int64 := alloc(newCap * 8);
+    blMemZero(newArr, newCap * 8);
+    if (old != 0) { blMemCpy(newArr, old, cap * 8); free(old, cap * 8); }
+    poke64(bc + BL_BC_MEMPOOL_TXS, newArr);
+    poke64(bc + BL_BC_MEMPOOL_CAP, newCap);
+}
+
+pub fn BLBlockchainNew(difficulty: int64, reward: int64, maxTxPerBlock: int64): int64 {
+    var bc: int64 := alloc(BL_BC_SIZE);
+    blMemZero(bc, BL_BC_SIZE);
+
+    var ledger: int64 := BLLedgerNew();
+    poke64(bc + BL_BC_LEDGER,     ledger);
+    poke64(bc + BL_BC_DIFFICULTY, difficulty);
+    poke64(bc + BL_BC_REWARD,     reward);
+    poke64(bc + BL_BC_MAX_TX,     maxTxPerBlock);
+
+    // Genesis block
+    var prevHash: int64 := alloc(BL_HASH_LEN);
+    blMemZero(prevHash, BL_HASH_LEN);
+    var genesis: int64 := BLNewBlock(0, prevHash, 0, 0, difficulty);
+    free(prevHash, BL_HASH_LEN);
+    poke64(genesis + BL_BLK_TIMESTAMP, 0);  // canonical genesis timestamp
+    BLCalculateHash(genesis, genesis + BL_BLK_HASH);
+
+    blBCGrowChain(bc);
+    var chainArr: int64 := peek64(bc + BL_BC_CHAIN_BLKS);
+    poke64(chainArr, genesis);
+    poke64(bc + BL_BC_CHAIN_COUNT, 1);
+
+    return bc;
+}
+
+pub fn BLBlockchainFree(bc: int64): void {
+    var ledger: int64 := peek64(bc + BL_BC_LEDGER);
+    if (ledger != 0) { BLLedgerFree(ledger); }
+
+    var chainCount: int64 := peek64(bc + BL_BC_CHAIN_COUNT);
+    var chainCap: int64   := peek64(bc + BL_BC_CHAIN_CAP);
+    var chainArr: int64   := peek64(bc + BL_BC_CHAIN_BLKS);
+    if (chainArr != 0) {
+        var i: int64 := 0;
+        while (i < chainCount) {
+            var blk: int64 := peek64(chainArr + i * 8);
+            if (blk != 0) { BLBlockFree(blk); }
+            i := i + 1;
+        }
+        free(chainArr, chainCap * 8);
+    }
+
+    var mpCount: int64 := peek64(bc + BL_BC_MEMPOOL_CNT);
+    var mpCap: int64   := peek64(bc + BL_BC_MEMPOOL_CAP);
+    var mpArr: int64   := peek64(bc + BL_BC_MEMPOOL_TXS);
+    if (mpArr != 0) {
+        var j: int64 := 0;
+        while (j < mpCount) {
+            var tx: int64 := peek64(mpArr + j * 8);
+            if (tx != 0) { BLTxFree(tx); }
+            j := j + 1;
+        }
+        free(mpArr, mpCap * 8);
+    }
+
+    free(bc, BL_BC_SIZE);
+}
+
+pub fn BLChainLength(bc: int64): int64 {
+    return peek64(bc + BL_BC_CHAIN_COUNT);
+}
+
+// Get last block in chain.
+fn blLastBlock(bc: int64): int64 {
+    var count: int64 := peek64(bc + BL_BC_CHAIN_COUNT);
+    var arr: int64   := peek64(bc + BL_BC_CHAIN_BLKS);
+    return peek64(arr + (count - 1) * 8);
+}
+
+// BLAddTransaction: validates and adds tx to mempool.
+// Returns 1 on success, 0 on failure. Takes ownership of tx on success.
+pub fn BLAddTransaction(bc: int64, tx: int64): int64 {
+    if (BLIsCoinbase(tx) == 1) { return 0; }
+
+    // 1. Public key matches address
+    var derivedAddr: int64 := alloc(BL_ADDR_LEN);
+    SHA256(tx + BL_TX_SENDER_PUB, BL_PUBKEY_LEN, derivedAddr);
+    var addrOk: int64 := blMemEq(derivedAddr, tx + BL_TX_SENDER_ADDR, BL_ADDR_LEN);
+    free(derivedAddr, BL_ADDR_LEN);
+    if (addrOk == 0) { return 0; }
+
+    // 2. Signature valid
+    if (BLVerifyTransaction(tx) == 0) { return 0; }
+
+    // 3. Nonce correct
+    var ledger: int64 := peek64(bc + BL_BC_LEDGER);
+    if (peek64(tx + BL_TX_NONCE) != BLGetNonce(ledger, tx + BL_TX_SENDER_ADDR)) { return 0; }
+
+    // 4. Amounts non-negative
+    if ((peek64(tx + BL_TX_AMOUNT) < 0) | (peek64(tx + BL_TX_FEE) < 0)) { return 0; }
+
+    // 5. Sufficient balance
+    var required: int64 := peek64(tx + BL_TX_AMOUNT) + peek64(tx + BL_TX_FEE);
+    if (BLGetBalance(ledger, tx + BL_TX_SENDER_ADDR) < required) { return 0; }
+
+    // 6. Deduplication by tx hash
+    var txH: int64    := alloc(BL_HASH_LEN);
+    BLTxHash(tx, txH);
+    var mpCount: int64 := peek64(bc + BL_BC_MEMPOOL_CNT);
+    var mpArr: int64   := peek64(bc + BL_BC_MEMPOOL_TXS);
+    var dupH: int64    := alloc(BL_HASH_LEN);
+    var dup: int64     := 0;
+    var i: int64       := 0;
+    while (i < mpCount) {
+        BLTxHash(peek64(mpArr + i * 8), dupH);
+        if (blMemEq(txH, dupH, BL_HASH_LEN) == 1) { dup := 1; break; }
+        i := i + 1;
+    }
+    free(txH, BL_HASH_LEN);
+    free(dupH, BL_HASH_LEN);
+    if (dup == 1) { return 0; }
+
+    // Add to mempool
+    if (mpCount >= peek64(bc + BL_BC_MEMPOOL_CAP)) { blBCGrowMempool(bc); }
+    mpArr := peek64(bc + BL_BC_MEMPOOL_TXS);
+    poke64(mpArr + mpCount * 8, tx);
+    poke64(bc + BL_BC_MEMPOOL_CNT, mpCount + 1);
+    return 1;
+}
+
+fn blAdjustDifficulty(bc: int64): int64 {
+    var count: int64      := peek64(bc + BL_BC_CHAIN_COUNT);
+    var difficulty: int64 := peek64(bc + BL_BC_DIFFICULTY);
+    if ((count & (BL_DIFFICULTY_INTERVAL - 1)) != 0) { return difficulty; }
+
+    var arr: int64       := peek64(bc + BL_BC_CHAIN_BLKS);
+    var startBlk: int64  := peek64(arr + (count - BL_DIFFICULTY_INTERVAL) * 8);
+    var endBlk: int64    := peek64(arr + (count - 1) * 8);
+    var timeTaken: int64 := peek64(endBlk + BL_BLK_TIMESTAMP) - peek64(startBlk + BL_BLK_TIMESTAMP);
+    var expected: int64  := BL_BLOCK_TARGET_NS * BL_DIFFICULTY_INTERVAL;
+
+    if (timeTaken == 0) { timeTaken := 1; }
+
+    var newDiff: int64 := (difficulty * expected) / timeTaken;
+    var maxUp: int64   := difficulty * BL_MAX_DIFFICULTY_FACTOR;
+    var maxDown: int64 := difficulty / BL_MAX_DIFFICULTY_FACTOR;
+    if (maxDown < BL_MIN_DIFFICULTY) { maxDown := BL_MIN_DIFFICULTY; }
+
+    if (newDiff > maxUp)   { newDiff := maxUp; }
+    if (newDiff < maxDown) { newDiff := maxDown; }
+    if (newDiff < BL_MIN_DIFFICULTY) { newDiff := BL_MIN_DIFFICULTY; }
+    return newDiff;
+}
+
+// BLMinePendingTransactions: mines a new block with mempool transactions.
+// minerAddr = 32-byte address. Returns new block ptr or 0 on error.
+// The new block is appended to bc.chain and bc.ledger is updated.
+pub fn BLMinePendingTransactions(bc: int64, minerAddr: int64): int64 {
+    var mpCount: int64    := peek64(bc + BL_BC_MEMPOOL_CNT);
+    var mpArr: int64      := peek64(bc + BL_BC_MEMPOOL_TXS);
+    var maxTx: int64      := peek64(bc + BL_BC_MAX_TX);
+    var reward: int64     := peek64(bc + BL_BC_REWARD);
+    var difficulty: int64 := peek64(bc + BL_BC_DIFFICULTY);
+    var last: int64       := blLastBlock(bc);
+    var newIndex: int64   := peek64(last + BL_BLK_INDEX) + 1;
+
+    // Select up to maxTx transactions (simple FIFO — no fee sort to keep ≤6 params)
+    var selected: int64 := mpCount;
+    if (selected > maxTx) { selected := maxTx; }
+
+    // Compute total fees
+    var totalFees: int64 := 0;
+    var i: int64 := 0;
+    while (i < selected) {
+        totalFees := totalFees + peek64(peek64(mpArr + i * 8) + BL_TX_FEE);
+        i := i + 1;
+    }
+
+    // Coinbase tx
+    var coinbase: int64 := BLNewCoinbaseTx(minerAddr, reward + totalFees, newIndex);
+
+    // Build tx pointer array: [coinbase] + selected mempool txs
+    var allCount: int64 := selected + 1;
+    var allTxs: int64   := alloc(allCount * 8);
+    poke64(allTxs, coinbase);
+    var j: int64 := 0;
+    while (j < selected) {
+        poke64(allTxs + (j + 1) * 8, peek64(mpArr + j * 8));
+        j := j + 1;
+    }
+
+    // Create block
+    var newBlock: int64 := BLNewBlock(newIndex, last + BL_BLK_HASH, allTxs, allCount, difficulty);
+    free(allTxs, allCount * 8);
+
+    // PoW loop
+    var hashBuf: int64 := alloc(BL_HASH_LEN);
+    while (1 == 1) {
+        BLCalculateHash(newBlock, hashBuf);
+        if (BLMeetsTarget(hashBuf, difficulty) == 1) { break; }
+        poke64(newBlock + BL_BLK_NONCE, peek64(newBlock + BL_BLK_NONCE) + 1);
+    }
+    blMemCpy(newBlock + BL_BLK_HASH, hashBuf, BL_HASH_LEN);
+    free(hashBuf, BL_HASH_LEN);
+
+    // Apply block to ledger
+    var oldLedger: int64 := peek64(bc + BL_BC_LEDGER);
+    var newLedger: int64 := BLApplyBlock(oldLedger, newBlock);
+    if (newLedger == 0) {
+        BLBlockFree(newBlock);
+        BLTxFree(coinbase);
+        return 0;
+    }
+    BLLedgerFree(oldLedger);
+    poke64(bc + BL_BC_LEDGER, newLedger);
+
+    // Append block to chain
+    var chainCount: int64 := peek64(bc + BL_BC_CHAIN_COUNT);
+    if (chainCount >= peek64(bc + BL_BC_CHAIN_CAP)) { blBCGrowChain(bc); }
+    var chainArr: int64 := peek64(bc + BL_BC_CHAIN_BLKS);
+    poke64(chainArr + chainCount * 8, newBlock);
+    poke64(bc + BL_BC_CHAIN_COUNT, chainCount + 1);
+
+    // Remove selected txs from mempool (shift remaining)
+    var remaining: int64 := mpCount - selected;
+    var k: int64 := 0;
+    while (k < remaining) {
+        poke64(mpArr + k * 8, peek64(mpArr + (selected + k) * 8));
+        k := k + 1;
+    }
+    poke64(bc + BL_BC_MEMPOOL_CNT, remaining);
+
+    // Update difficulty
+    poke64(bc + BL_BC_DIFFICULTY, blAdjustDifficulty(bc));
+
+    return newBlock;
+}
+
+// BLIsValidChain: validates entire chain. Returns 1 if valid, 0 if not.
+pub fn BLIsValidChain(bc: int64): int64 {
+    var count: int64   := peek64(bc + BL_BC_CHAIN_COUNT);
+    var arr: int64     := peek64(bc + BL_BC_CHAIN_BLKS);
+    if (count == 0) { return 0; }
+
+    var genesis: int64 := peek64(arr);
+    var genHash: int64 := alloc(BL_HASH_LEN);
+    BLCalculateHash(genesis, genHash);
+    var genOk: int64 := blMemEq(genHash, genesis + BL_BLK_HASH, BL_HASH_LEN);
+    free(genHash, BL_HASH_LEN);
+    if (genOk == 0) { return 0; }
+
+    var replayLedger: int64 := BLLedgerNew();
+    var hashBuf: int64      := alloc(BL_HASH_LEN);
+    var merkBuf: int64      := alloc(BL_HASH_LEN);
+    var valid: int64        := 1;
+
+    var i: int64 := 1;
+    while (i < count) {
+        var b: int64    := peek64(arr + i * 8);
+        var prev: int64 := peek64(arr + (i - 1) * 8);
+
+        // Hash integrity
+        BLCalculateHash(b, hashBuf);
+        if (blMemEq(hashBuf, b + BL_BLK_HASH, BL_HASH_LEN) == 0) { valid := 0; break; }
+
+        // Chain link
+        if (blMemEq(b + BL_BLK_PREV_HASH, prev + BL_BLK_HASH, BL_HASH_LEN) == 0) { valid := 0; break; }
+
+        // Merkle root
+        var txPtrs: int64  := peek64(b + BL_BLK_TX_PTRS);
+        var txCount: int64 := peek64(b + BL_BLK_TX_COUNT);
+        BLMerkleRoot(txPtrs, txCount, merkBuf);
+        if (blMemEq(merkBuf, b + BL_BLK_MERKLE, BL_HASH_LEN) == 0) { valid := 0; break; }
+
+        // PoW
+        if (BLMeetsTarget(b + BL_BLK_HASH, peek64(b + BL_BLK_DIFFICULTY)) == 0) { valid := 0; break; }
+
+        // Ledger state
+        var nextLedger: int64 := BLApplyBlock(replayLedger, b);
+        BLLedgerFree(replayLedger);
+        if (nextLedger == 0) { valid := 0; replayLedger := BLLedgerNew(); break; }
+        replayLedger := nextLedger;
+
+        i := i + 1;
+    }
+
+    BLLedgerFree(replayLedger);
+    free(hashBuf, BL_HASH_LEN);
+    free(merkBuf, BL_HASH_LEN);
+    return valid;
+}
+
+// Convenience: get balance from blockchain's current ledger.
+pub fn BLBlockchainGetBalance(bc: int64, addr: int64): int64 {
+    return BLGetBalance(peek64(bc + BL_BC_LEDGER), addr);
+}
+
+pub fn BLBlockchainGetNonce(bc: int64, addr: int64): int64 {
+    return BLGetNonce(peek64(bc + BL_BC_LEDGER), addr);
+}
+
+// Get a block by index (0 = genesis). Returns block ptr or 0.
+pub fn BLGetBlock(bc: int64, index: int64): int64 {
+    var count: int64 := peek64(bc + BL_BC_CHAIN_COUNT);
+    if ((index < 0) | (index >= count)) { return 0; }
+    var arr: int64 := peek64(bc + BL_BC_CHAIN_BLKS);
+    return peek64(arr + index * 8);
+}

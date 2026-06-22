@@ -23,6 +23,13 @@ import std.pdf.viewprefs;
 import std.pdf.namedest;
 import std.pdf.attach;
 import std.pdf.layer;
+import std.pdf.xobject;
+import std.pdf.shading;
+import std.pdf.spot;
+import std.pdf.forms;
+import std.pdf.ttfont;
+import std.pdf.xmp;
+import std.pdf.pdfa;
 
 // All public symbols are re-exported from the sub-units:
 //
@@ -80,7 +87,7 @@ import std.pdf.layer;
 //   PdfLinkSetGoto(doc, annotIdx, destPage)          — set dest on goto link
 //   PdfAddNote(doc, page, x, y, title, content)      → int64 (annotIdx)
 //
-// From std.pdf.reader (WP-PDF-09):
+// From std.pdf.reader (WP-PDF-09 + WP-PDF-19):
 //   PdfOpen(path)                                    → int64 (reader handle, 0=error)
 //   PdfClose(rdr)
 //   PdfRdrPageCount(rdr)                             → int64
@@ -90,6 +97,14 @@ import std.pdf.layer;
 //   PdfRdrGetKeywords(rdr, buf, maxLen)
 //   PdfRdrGetCreator(rdr, buf, maxLen)
 //   PdfRdrGetProducer(rdr, buf, maxLen)
+//   PdfRdrExtractText(rdr, pageIdx, buf, maxLen)      — extract text from page into NUL-terminated buf
+//     Lines separated by \n (from downward Td/TD moves). Only works on uncompressed streams.
+//   PdfImportPage(dst, src, srcPageIdx)              → int64 (new page handle in dst, -1=error)
+//   PdfMergeAll(dst, src)                            — append all pages of src into dst
+//     dst: builder doc handle (from PdfNew)
+//     src: reader handle (from PdfOpen)
+//     Copies content stream + Standard-14 font resources. Images not re-imported.
+//     Only works with Lyx-generated PDFs (flat /Pages tree, Standard-14 fonts).
 //
 // From std.pdf.outline (WP-PDF-10):
 //   PdfOutlineAdd(doc, parentIdx, title, destPage)   → int64 (outline index, -1=error)
@@ -124,3 +139,64 @@ import std.pdf.layer;
 //   PdfLayerBegin(doc, page, layerIdx)               — open a marked-content region (/OC BDC)
 //   PdfLayerEnd(doc, page)                           — close the region (EMC)
 //   PdfLayerSetVisible(doc, layerIdx, visible)        — 1=on (default), 0=off
+//
+// From std.pdf.shading (WP-PDF-22):
+//   PdfPackColor(r100, g100, b100)                   → int64 (packed colour)
+//   PdfPackCoords(x100, y100)                        → int64 (packed point/size)
+//   PdfLinearGradient(doc, page, p0, p1, c0, c1)    — axial gradient (Type 2)
+//   PdfRadialGradient(doc, page, center, radii, c0, c1) — radial gradient (Type 3)
+//     p0/p1    = PdfPackCoords(x100, y100)
+//     center   = PdfPackCoords(cx100, cy100)
+//     radii    = PdfPackCoords(r0_100, r1_100)  inner / outer radius
+//     c0/c1    = PdfPackColor(r100, g100, b100)  0–10000 per channel
+//
+// From std.pdf.spot (WP-PDF-25):
+//   PdfDefineSpotColor(doc, name, c100, m100, y100, k100) → int64 (spotId, -1=err)
+//     name: spot color name (e.g. "PANTONE 485 C")
+//     c/m/y/k: CMYK alternate ×100 (0–10000 per channel)
+//   PdfSetStrokeSpot(doc, page, spotId, tint)  — stroke color; tint 0.0–1.0
+//   PdfSetFillSpot(doc, page, spotId, tint)    — fill color;   tint 0.0–1.0
+//     Emits /Separation color space + tint transform into page /Resources.
+//     CMYK fallback visible on systems without spot-color support.
+//
+// From std.pdf.builder (WP-PDF-17 — Encryption):
+//   PdfSetUserPassword(doc, pwd)         — user password (required to open)
+//   PdfSetOwnerPassword(doc, pwd)        — owner password (full edit rights)
+//   PdfSetPermissions(doc, flags)        — OR: PDF_PERM_PRINT/MODIFY/COPY/ANNOT/FILL/EXTRACT/ASSEMBLE/PRINT_HQ
+//   PdfSetEncryption(doc, PDF_ENC_RC4_128)  — enable RC4-128 encryption
+//     Call before PdfSave. Only RC4-128 implemented; AES variants accepted but degrade to RC4-128.
+//     Inkompatibel mit PDF/A (WP-PDF-27).
+//
+// From std.pdf.forms (WP-PDF-18):
+//   PdfAddTextField(doc, page, pos, size, name, defaultValue) → int64  (fieldId)
+//   PdfAddCheckbox(doc, page, pos, size100, name, checked)    → int64
+//   PdfAddRadioButton(doc, page, pos, size100, groupName, value) → int64
+//   PdfAddComboBox(doc, page, pos, size, name)                → int64
+//   PdfComboAddItem(doc, fieldId, item)
+//   PdfFlattenForms(doc)   — render all fields as static content; removes /AcroForm
+//     pos  = PdfPackCoords(x100, y100)   bottom-left corner
+//     size = PdfPackCoords(w100, h100)   width × height
+//     size100 = side length ×100 for square fields (checkbox/radio)
+//     groupName: radio buttons with the same name form one group (auto-created)
+//
+// From std.pdf.ttfont (WP-PDF-24):
+//   PdfLoadFont(doc, path)                        → int64 (fontId, -1=error)
+//   PdfSetFontTT(doc, page, fontId, size)         — select TT font + emit Tf
+//   PdfTextAtUTF8(doc, page, x, y, text)          — place UTF-8 text (uses current TT font)
+//   PdfFinalizeFont(doc, fontId)                  — pre-build subset; call before PdfSave
+//     Embeds TrueType as Type0/CIDFontType2 (Identity-H, Unicode text selection).
+//     Without PdfFinalizeFont: full TTF embedded. With it: subset (used glyphs only).
+//
+// From std.pdf.xmp (WP-PDF-26):
+//   PdfGenerateXMP(doc)              — auto-generate XMP from /Info fields; call before PdfSave
+//   PdfSetXMP(doc, xmpXml, len)      — embed a raw XMP blob (int64 pointer, byte length)
+//     Embeds /Metadata stream (Type/Metadata, Subtype/XML) referenced from Catalog.
+//     exiftool reads: dc:title (Title), dc:creator (Author), dc:description (Subject),
+//     dc:subject (Keywords), xmp:CreatorTool, pdf:Producer.
+//     When PdfSetConformance was called first, PdfGenerateXMP also writes pdfaid namespace.
+//
+// From std.pdf.pdfa (WP-PDF-27):
+//   PdfSetConformance(doc, PDF_CONFORMANCE_A1B)   — enable PDF/A output mode
+//     PDF_CONFORMANCE_NONE / A1B / A2B / A3B
+//     Call before PdfGenerateXMP and PdfSave.
+//     Effects: OutputIntent + sRGB ICC profile in Catalog, pdfaid XMP fields, no encryption.

@@ -1,0 +1,459 @@
+// std/cloud/cf/waf.lyx — Cloudflare WAF, Firewall Rules, IP Access Rules, Rate Limiting
+// WP-CF-05
+
+unit std.cloud.cf.waf;
+
+import std.cloud.cf.transport;
+import std.cloud.cf.core;
+import std.alloc;
+import std.io;
+
+pub con CF_IP_RULE_WHITELIST:    int64 := "whitelist"c as int64;
+pub con CF_IP_RULE_BLOCK:        int64 := "block"c as int64;
+pub con CF_IP_RULE_CHALLENGE:    int64 := "challenge"c as int64;
+pub con CF_IP_RULE_JS_CHALLENGE: int64 := "js_challenge"c as int64;
+
+pub type CFFirewallRule = struct {
+    id:          int64;  // pchar
+    description: int64;  // pchar
+    expression:  int64;  // pchar — Wirefilter expression
+    action:      int64;  // pchar: "block","challenge","js_challenge","managed_challenge","allow","log"
+    enabled:     int64;
+    priority:    int64;
+    paused:      int64;
+};
+
+pub type CFIPAccessRule = struct {
+    id:       int64;  // pchar
+    mode:     int64;  // pchar
+    notes:    int64;  // pchar
+    target:   int64;  // pchar: "ip","ip_range","country","asn"
+    value:    int64;  // pchar
+    scope:    int64;  // pchar: "zone","account"
+    created:  int64;  // pchar
+};
+
+pub type CFRateLimit = struct {
+    id:          int64;  // pchar
+    description: int64;  // pchar
+    urlPattern:  int64;  // pchar
+    threshold:   int64;
+    period:      int64;
+    action:      int64;  // pchar: "simulate","ban","challenge"
+    timeout:     int64;  // ban duration seconds
+    enabled:     int64;
+};
+
+fn wafFreeIfSet(p: int64) {
+    if (p != 0) { free(p, StrLen(p as pchar)+1); }
+}
+
+pub fn CFFirewallRuleFree(r: CFFirewallRule) {
+    wafFreeIfSet(r.id); wafFreeIfSet(r.description);
+    wafFreeIfSet(r.expression); wafFreeIfSet(r.action);
+}
+
+pub fn CFIPAccessRuleFree(r: CFIPAccessRule) {
+    wafFreeIfSet(r.id); wafFreeIfSet(r.mode); wafFreeIfSet(r.notes);
+    wafFreeIfSet(r.target); wafFreeIfSet(r.value); wafFreeIfSet(r.scope);
+    wafFreeIfSet(r.created);
+}
+
+pub fn CFRateLimitFree(r: CFRateLimit) {
+    wafFreeIfSet(r.id); wafFreeIfSet(r.description);
+    wafFreeIfSet(r.urlPattern); wafFreeIfSet(r.action);
+}
+
+fn parseFirewallRule(json: int64, jl: int64): CFFirewallRule {
+    var r: CFFirewallRule;
+    r.id          := cfExtractValue(json, jl, "id"c);
+    r.description := cfExtractValue(json, jl, "description"c);
+    r.expression  := cfExtractValue(json, jl, "expression"c);
+    r.action      := cfExtractValue(json, jl, "action"c);
+    r.enabled     := cfExtractBool(json, jl, "enabled"c);
+    r.priority    := cfExtractInt(json, jl, "priority"c);
+    r.paused      := cfExtractBool(json, jl, "paused"c);
+    return r;
+}
+
+fn parseIPRule(json: int64, jl: int64): CFIPAccessRule {
+    var r: CFIPAccessRule;
+    r.id      := cfExtractValue(json, jl, "id"c);
+    r.mode    := cfExtractValue(json, jl, "mode"c);
+    r.notes   := cfExtractValue(json, jl, "notes"c);
+    r.created := cfExtractValue(json, jl, "created_on"c);
+    // configuration is nested
+    var cfg: int64 := cfExtractValue(json, jl, "configuration"c);
+    if (cfg != 0) {
+        var cl: int64 := StrLen(cfg as pchar);
+        r.target := cfExtractValue(cfg, cl, "target"c);
+        r.value  := cfExtractValue(cfg, cl, "value"c);
+        free(cfg, cl+1);
+    }
+    return r;
+}
+
+// Firewall Custom Rules (Ruleset API)
+
+fn fwRulesPath(zoneId: pchar): int64 {
+    var buf: int64 := alloc(512);
+    var off: int64 := cftAppend(buf, 0, "/zones/"c);
+    off := cftAppend(buf, off, zoneId);
+    off := cftAppend(buf, off, "/rulesets/phases/http_request_firewall_custom/entrypoint/rules"c);
+    poke8(buf+off, 0); return buf;
+}
+
+pub fn FirewallRuleCreate(c: CFClient, zoneId: pchar,
+                          description: pchar, expression: pchar, action: pchar,
+                          priority: int64, enabled: int64): CFFirewallRule {
+    var path: int64 := fwRulesPath(zoneId);
+    var jdesc: int64 := cfJsonEscape(description);
+    var jexpr: int64 := cfJsonEscape(expression);
+    var jact:  int64 := cfJsonEscape(action);
+    var body: int64 := alloc(1024);
+    var off: int64 := cftAppend(body, 0, "{\"description\":\""c);
+    off := cftAppend(body, off, jdesc as pchar);
+    off := cftAppend(body, off, "\",\"expression\":\""c);
+    off := cftAppend(body, off, jexpr as pchar);
+    off := cftAppend(body, off, "\",\"action\":\""c);
+    off := cftAppend(body, off, jact as pchar);
+    off := cftAppend(body, off, "\",\"enabled\":"c);
+    if (enabled==1){off:=cftAppend(body,off,"true"c);}else{off:=cftAppend(body,off,"false"c);}
+    if (priority > 0) {
+        off := cftAppend(body, off, ",\"priority\":"c);
+        off := cftAppendInt(body, off, priority);
+    }
+    off := cftAppend(body, off, "}"c); poke8(body+off, 0);
+    free(jdesc,StrLen(jdesc as pchar)+1);
+    free(jexpr,StrLen(jexpr as pchar)+1);
+    free(jact,StrLen(jact as pchar)+1);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 512); free(body, 1024);
+    var rule: CFFirewallRule;
+    rule.id:=0; rule.description:=0; rule.expression:=0; rule.action:=0;
+    rule.enabled:=0; rule.priority:=0; rule.paused:=0;
+    if (r.success == 1 && r.result != 0) { rule = parseFirewallRule(r.result, r.resultLen); }
+    CFResponseFree(r); return rule;
+}
+
+pub fn FirewallRuleDelete(c: CFClient, zoneId: pchar, ruleId: pchar): int64 {
+    var path: int64 := alloc(512);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_firewall_custom/entrypoint/rules/"c);
+    po := cftAppend(path, po, ruleId); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn FirewallRuleList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_firewall_custom/entrypoint"c);
+    poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+pub fn FirewallRuleEnable(c: CFClient, zoneId: pchar, ruleId: pchar): int64 {
+    var path: int64 := alloc(512);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_firewall_custom/entrypoint/rules/"c);
+    po := cftAppend(path, po, ruleId); poke8(path+po, 0);
+    var body: pchar := "{\"enabled\":true}"c;
+    var r: CFResponse := CFPatch(c, path as pchar, body as int64, StrLen(body));
+    free(path, 512);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn FirewallRuleDisable(c: CFClient, zoneId: pchar, ruleId: pchar): int64 {
+    var path: int64 := alloc(512);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_firewall_custom/entrypoint/rules/"c);
+    po := cftAppend(path, po, ruleId); poke8(path+po, 0);
+    var body: pchar := "{\"enabled\":false}"c;
+    var r: CFResponse := CFPatch(c, path as pchar, body as int64, StrLen(body));
+    free(path, 512);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+// Quick firewall helpers
+
+pub fn FirewallBlockIP(c: CFClient, zoneId: pchar, ip: pchar, note: pchar): CFFirewallRule {
+    var expr: int64 := alloc(256);
+    var eo: int64 := cftAppend(expr, 0, "(ip.src eq "c);
+    eo := cftAppend(expr, eo, ip);
+    eo := cftAppend(expr, eo, ")"c); poke8(expr+eo, 0);
+    var rule: CFFirewallRule := FirewallRuleCreate(c, zoneId, note, expr as pchar, "block"c, 100, 1);
+    free(expr, 256); return rule;
+}
+
+pub fn FirewallBlockCountry(c: CFClient, zoneId: pchar,
+                             countryCodes: int64, count: int64, note: pchar): CFFirewallRule {
+    var expr: int64 := alloc(count * 8 + 64);
+    var eo: int64 := cftAppend(expr, 0, "(ip.src.country in {"c);
+    var i: int64 := 0;
+    while (i < count) {
+        if (i > 0) { eo := cftAppend(expr, eo, " "c); }
+        var code: pchar := peek64(countryCodes + i * 8) as pchar;
+        eo := cftAppend(expr, eo, "\""c);
+        eo := cftAppend(expr, eo, code);
+        eo := cftAppend(expr, eo, "\""c);
+        i := i + 1;
+    }
+    eo := cftAppend(expr, eo, "})"c); poke8(expr+eo, 0);
+    var rule: CFFirewallRule := FirewallRuleCreate(c, zoneId, note, expr as pchar, "block"c, 100, 1);
+    free(expr, count*8+64); return rule;
+}
+
+pub fn FirewallAllowIP(c: CFClient, zoneId: pchar, ip: pchar, note: pchar): CFFirewallRule {
+    var expr: int64 := alloc(256);
+    var eo: int64 := cftAppend(expr, 0, "(ip.src eq "c);
+    eo := cftAppend(expr, eo, ip);
+    eo := cftAppend(expr, eo, ")"c); poke8(expr+eo, 0);
+    var rule: CFFirewallRule := FirewallRuleCreate(c, zoneId, note, expr as pchar, "allow"c, 50, 1);
+    free(expr, 256); return rule;
+}
+
+pub fn FirewallChallengePath(c: CFClient, zoneId: pchar, pathPrefix: pchar, note: pchar): CFFirewallRule {
+    var jp: int64 := cfJsonEscape(pathPrefix);
+    var expr: int64 := alloc(512);
+    var eo: int64 := cftAppend(expr, 0, "(http.request.uri.path contains \""c);
+    eo := cftAppend(expr, eo, jp as pchar);
+    eo := cftAppend(expr, eo, "\")"c); poke8(expr+eo, 0);
+    free(jp, StrLen(jp as pchar)+1);
+    var rule: CFFirewallRule := FirewallRuleCreate(c, zoneId, note, expr as pchar, "challenge"c, 100, 1);
+    free(expr, 512); return rule;
+}
+
+// IP Access Rules
+
+pub fn IPRuleCreate(c: CFClient, zoneId: pchar,
+                    mode: pchar, target: pchar, value: pchar, notes: pchar): CFIPAccessRule {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/firewall/access_rules/rules"c); poke8(path+po, 0);
+    var jmode:  int64 := cfJsonEscape(mode);
+    var jtarget:int64 := cfJsonEscape(target);
+    var jvalue: int64 := cfJsonEscape(value);
+    var jnotes: int64 := cfJsonEscape(notes);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"mode\":\""c);
+    off := cftAppend(body, off, jmode as pchar);
+    off := cftAppend(body, off, "\",\"configuration\":{\"target\":\""c);
+    off := cftAppend(body, off, jtarget as pchar);
+    off := cftAppend(body, off, "\",\"value\":\""c);
+    off := cftAppend(body, off, jvalue as pchar);
+    off := cftAppend(body, off, "\"},\"notes\":\""c);
+    off := cftAppend(body, off, jnotes as pchar);
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    free(jmode,StrLen(jmode as pchar)+1);
+    free(jtarget,StrLen(jtarget as pchar)+1);
+    free(jvalue,StrLen(jvalue as pchar)+1);
+    free(jnotes,StrLen(jnotes as pchar)+1);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 512);
+    var rule: CFIPAccessRule;
+    rule.id:=0; rule.mode:=0; rule.notes:=0;
+    rule.target:=0; rule.value:=0; rule.scope:=0; rule.created:=0;
+    if (r.success == 1 && r.result != 0) { rule = parseIPRule(r.result, r.resultLen); }
+    CFResponseFree(r); return rule;
+}
+
+pub fn IPRuleCreateAccount(c: CFClient, mode: pchar, target: pchar, value: pchar, notes: pchar): CFIPAccessRule {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, c.accountId as pchar);
+    po := cftAppend(path, po, "/firewall/access_rules/rules"c); poke8(path+po, 0);
+    var jmode:  int64 := cfJsonEscape(mode);
+    var jtarget:int64 := cfJsonEscape(target);
+    var jvalue: int64 := cfJsonEscape(value);
+    var jnotes: int64 := cfJsonEscape(notes);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"mode\":\""c);
+    off := cftAppend(body, off, jmode as pchar);
+    off := cftAppend(body, off, "\",\"configuration\":{\"target\":\""c);
+    off := cftAppend(body, off, jtarget as pchar);
+    off := cftAppend(body, off, "\",\"value\":\""c);
+    off := cftAppend(body, off, jvalue as pchar);
+    off := cftAppend(body, off, "\"},\"notes\":\""c);
+    off := cftAppend(body, off, jnotes as pchar);
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    free(jmode,StrLen(jmode as pchar)+1);
+    free(jtarget,StrLen(jtarget as pchar)+1);
+    free(jvalue,StrLen(jvalue as pchar)+1);
+    free(jnotes,StrLen(jnotes as pchar)+1);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 512);
+    var rule: CFIPAccessRule;
+    rule.id:=0; rule.mode:=0; rule.notes:=0;
+    rule.target:=0; rule.value:=0; rule.scope:=0; rule.created:=0;
+    if (r.success == 1 && r.result != 0) { rule = parseIPRule(r.result, r.resultLen); }
+    CFResponseFree(r); return rule;
+}
+
+pub fn IPRuleDelete(c: CFClient, zoneId: pchar, ruleId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/firewall/access_rules/rules/"c);
+    po := cftAppend(path, po, ruleId); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn IPRuleList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/firewall/access_rules/rules"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}
+
+pub fn IPRuleListAccount(c: CFClient): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, c.accountId as pchar);
+    po := cftAppend(path, po, "/firewall/access_rules/rules"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}
+
+// Rate Limiting
+
+pub fn RateLimitCreate(c: CFClient, zoneId: pchar,
+                       urlPattern: pchar, threshold: int64,
+                       period: int64, action: pchar, timeout: int64): CFRateLimit {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rate_limits"c); poke8(path+po, 0);
+    var jurl:    int64 := cfJsonEscape(urlPattern);
+    var jaction: int64 := cfJsonEscape(action);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"match\":{\"request\":{\"url_pattern\":\""c);
+    off := cftAppend(body, off, jurl as pchar);
+    off := cftAppend(body, off, "\",\"methods\":[\"_ALL_\"]}},\"threshold\":"c);
+    off := cftAppendInt(body, off, threshold);
+    off := cftAppend(body, off, ",\"period\":"c);
+    off := cftAppendInt(body, off, period);
+    off := cftAppend(body, off, ",\"action\":{\"mode\":\""c);
+    off := cftAppend(body, off, jaction as pchar);
+    off := cftAppend(body, off, "\",\"timeout\":"c);
+    off := cftAppendInt(body, off, timeout);
+    off := cftAppend(body, off, "},\"enabled\":true}"c); poke8(body+off, 0);
+    free(jurl,StrLen(jurl as pchar)+1);
+    free(jaction,StrLen(jaction as pchar)+1);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 512);
+    var rl: CFRateLimit;
+    rl.id:=0; rl.description:=0; rl.urlPattern:=0;
+    rl.threshold:=0; rl.period:=0; rl.action:=0; rl.timeout:=0; rl.enabled:=0;
+    if (r.success == 1 && r.result != 0) {
+        rl.id         := cfExtractValue(r.result, r.resultLen, "id"c);
+        rl.threshold  := cfExtractInt(r.result, r.resultLen, "threshold"c);
+        rl.period     := cfExtractInt(r.result, r.resultLen, "period"c);
+        rl.enabled    := cfExtractBool(r.result, r.resultLen, "enabled"c);
+    }
+    CFResponseFree(r); return rl;
+}
+
+pub fn RateLimitDelete(c: CFClient, zoneId: pchar, ruleId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rate_limits/"c);
+    po := cftAppend(path, po, ruleId); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn RateLimitList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rate_limits"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}
+
+// WAF Managed Rules
+
+pub fn WAFPackageList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/firewall/waf/packages"c); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+pub fn WAFPackageGet(c: CFClient, zoneId: pchar, packageId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/firewall/waf/packages/"c);
+    po := cftAppend(path, po, packageId); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+pub fn WAFRuleGroupList(c: CFClient, zoneId: pchar, packageId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/firewall/waf/packages/"c);
+    po := cftAppend(path, po, packageId);
+    po := cftAppend(path, po, "/groups"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 50);
+    free(path, 256); return result;
+}
+
+fn wafGroupSetMode(c: CFClient, zoneId: pchar, packageId: pchar, groupId: pchar, mode: pchar): int64 {
+    var path: int64 := alloc(512);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/firewall/waf/packages/"c);
+    po := cftAppend(path, po, packageId);
+    po := cftAppend(path, po, "/groups/"c);
+    po := cftAppend(path, po, groupId); poke8(path+po, 0);
+    var jm: int64 := cfJsonEscape(mode);
+    var body: int64 := alloc(64);
+    var off: int64 := cftAppend(body, 0, "{\"mode\":\""c);
+    off := cftAppend(body, off, jm as pchar);
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    free(jm, StrLen(jm as pchar)+1);
+    var r: CFResponse := CFPatch(c, path as pchar, body, off);
+    free(path, 512); free(body, 64);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn WAFRuleGroupEnable(c: CFClient, zoneId: pchar, packageId: pchar, groupId: pchar): int64 {
+    return wafGroupSetMode(c, zoneId, packageId, groupId, "on"c);
+}
+pub fn WAFRuleGroupDisable(c: CFClient, zoneId: pchar, packageId: pchar, groupId: pchar): int64 {
+    return wafGroupSetMode(c, zoneId, packageId, groupId, "off"c);
+}

@@ -15,19 +15,37 @@
 
 
 import src.std.alloc;
-pub con MACOS_SYS_EXIT:   int64 := 0x2000001;
-pub con MACOS_SYS_READ:   int64 := 0x2000003;
-pub con MACOS_SYS_WRITE:  int64 := 0x2000004;
-pub con MACOS_SYS_OPEN:   int64 := 0x2000005;
-pub con MACOS_SYS_CLOSE:  int64 := 0x2000006;
-pub con MACOS_SYS_GETPID: int64 := 0x2000014;
-pub con MACOS_SYS_UNLINK: int64 := 0x200000A;
-pub con MACOS_SYS_RENAME: int64 := 0x2000080;
-pub con MACOS_SYS_MKDIR:  int64 := 0x2000088;
-pub con MACOS_SYS_RMDIR:  int64 := 0x2000089;
-pub con MACOS_SYS_MUNMAP: int64 := 0x2000049;
-pub con MACOS_SYS_MMAP:   int64 := 0x20000C5;
-pub con MACOS_SYS_LSEEK:  int64 := 0x20000C7;
+pub con MACOS_SYS_EXIT:      int64 := 0x2000001;
+pub con MACOS_SYS_FORK:      int64 := 0x2000002;
+pub con MACOS_SYS_READ:      int64 := 0x2000003;
+pub con MACOS_SYS_WRITE:     int64 := 0x2000004;
+pub con MACOS_SYS_OPEN:      int64 := 0x2000005;
+pub con MACOS_SYS_CLOSE:     int64 := 0x2000006;
+pub con MACOS_SYS_GETPID:    int64 := 0x2000014;
+pub con MACOS_SYS_UNLINK:    int64 := 0x200000A;
+pub con MACOS_SYS_RENAME:    int64 := 0x2000080;
+pub con MACOS_SYS_MKDIR:     int64 := 0x2000088;
+pub con MACOS_SYS_RMDIR:     int64 := 0x2000089;
+pub con MACOS_SYS_MUNMAP:    int64 := 0x2000049;
+pub con MACOS_SYS_MMAP:      int64 := 0x20000C5;
+pub con MACOS_SYS_LSEEK:     int64 := 0x20000C7;
+pub con MACOS_SYS_FCNTL:     int64 := 0x200005C;
+// WP-D1: macOS BSD socket syscalls
+pub con MACOS_SYS_RECVMSG:   int64 := 0x200001B;
+pub con MACOS_SYS_SENDMSG:   int64 := 0x200001C;
+pub con MACOS_SYS_RECVFROM:  int64 := 0x200001D;
+pub con MACOS_SYS_ACCEPT:    int64 := 0x200001E;
+pub con MACOS_SYS_SOCKET:    int64 := 0x2000061;
+pub con MACOS_SYS_CONNECT:   int64 := 0x2000062;
+pub con MACOS_SYS_BIND:      int64 := 0x2000068;
+pub con MACOS_SYS_SETSOCKOPT: int64 := 0x2000069;
+pub con MACOS_SYS_LISTEN:    int64 := 0x200006A;
+pub con MACOS_SYS_GETSOCKOPT: int64 := 0x2000076;
+pub con MACOS_SYS_SENDTO:    int64 := 0x2000085;
+pub con MACOS_SYS_SHUTDOWN:  int64 := 0x2000086;
+pub con MACOS_SYS_SOCKETPAIR: int64 := 0x2000087;
+// macOS mmap flags: MAP_PRIVATE|MAP_ANON
+pub con MACOS_MAP_PRIVATE_ANON: int64 := 0x1002;
 
 // ============================================================================
 // Mach-O 64 Format Constants
@@ -48,8 +66,16 @@ con MACOS_S_ATTR_PURE_INSTR:   int64 := 0x80000000;
 con MACOS_TEXT_BASE:           int64 := 0x100000000;  // traditional macOS x86_64 base
 con MACOS_PAGE_SIZE:           int64 := 0x1000;       // 4 KB (x86_64)
 
-// Size of codegen_x86.lyx helper stubs — MUST match CG_H_USER in codegen_x86.lyx
-con MACOS_HELPERS_SZ: int64 := 287;
+// Size of first 6 helper stubs — MUST match Linux layout so CG_H_STRLEN/PRINTSTR/etc. are correct.
+// WP-D1: fixed from 287 to 301 so helpers are at identical offsets as Linux:
+//   _start: 0..78 (79 bytes), strlen: 79..93 (15), printstr: 94..119 (26),
+//   printint: 120..223 (104), strsub: 224..294 (71), strcharat: 295..300 (6)
+// Total: 301 = Linux offset 301 (start of eprint_str), where verbatim copy begins.
+con MACOS_HELPERS_SZ:     int64 := 301;
+// Linux ELF base and code offset (from codegen_x86.lyx) for VMT patching
+con MACOS_LINUX_BASE:     int64 := 4194480;   // CG_ELF_BASE + CG_CODE_OFF = 0x4000B0
+// macOS code VA base: MACOS_TEXT_BASE + page (4096)
+con MACOS_CODE_BASE:      int64 := 4294971392; // 0x100001000
 
 // ============================================================================
 // MacosX86Backend
@@ -66,6 +92,14 @@ pub type MacosX86Backend = class {
   out:    int64;
   outLen: int64;
   outCap: int64;
+
+  // WP-D1: VMT patch state (set via SetVMTInfo before WriteMachO)
+  vmtPatch:     int64;  // cg.vmtPatches
+  vmtCnt:       int64;  // cg.vmtPatchCount
+  vmtMeth:      int64;  // cg.vmtMethodPatches
+  vmtMethCnt:   int64;  // cg.vmtMethodPatchCount
+  cgDataPtr:    int64;  // cg.data
+  cgDataLen_:   int64;  // cg.dataLen
 
   // ------------------------------------------------------------------
   // Code buffer helpers
@@ -147,22 +181,26 @@ pub type MacosX86Backend = class {
   // All offsets and sizes must match CG_H_USER layout in codegen_x86.lyx.
   // ------------------------------------------------------------------
 
-  // _start / entry (65 bytes, offset 0..64)
-  // LC_MAIN calls entry(argc, argv): argc already in rdi, argv in rsi.
-  // NOP-pad replaces the Linux prlimit64 block and the pop/mov setup.
+  // _start / entry (79 bytes, offsets 0..78) — WP-D1: matches Linux _start size.
+  // This ensures strlen (79), printstr (94), printint (120), etc. are at correct offsets.
+  // Layout:
+  //  [0..47]:  48 NOPs
+  //  [48..52]: E8 rel32 — call main (argc in rdi, argv in rsi from LC_MAIN)
+  //  [53..55]: 48 89 C7 — mov rdi, rax (pass main's return value to exit)
+  //  [56..71]: 16 NOPs (padding to 72)
+  //  [72..76]: B8 01 00 00 02 — mov eax, 0x2000001 (MACOS_SYS_EXIT)
+  //  [77..78]: 0F 05 — syscall
+  //  Total: 48+5+3+16+5+2 = 79 bytes ✓
   fn mxb_emitStart(rel32: int64) {
     var i: int64 := 0;
-    while (i < 48) { self.mxb_ce8(0x90); i := i + 1; }  // 48 NOPs
-    // offset 48: call main  E8 rel32
-    self.mxb_ce8(0xE8); self.mxb_ce32(rel32);
-    // offset 53: mov rdi, rax  (48 89 C7)
-    self.mxb_ce8(0x48); self.mxb_ce8(0x89); self.mxb_ce8(0xC7);
-    // offset 56: mov rax, MACOS_SYS_EXIT  (48 C7 C0 01 00 00 02)
-    self.mxb_ce8(0x48); self.mxb_ce8(0xC7); self.mxb_ce8(0xC0);
-    self.mxb_ce8(0x01); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x02);
-    // offset 63: syscall  (0F 05)
-    self.mxb_ce8(0x0F); self.mxb_ce8(0x05);
-    // 48+1+4+3+7+2 = 65 bytes
+    while (i < 48) { self.mxb_ce8(0x90); i := i + 1; }         // [0..47] 48 NOPs
+    self.mxb_ce8(0xE8); self.mxb_ce32(rel32);                    // [48..52] call main
+    self.mxb_ce8(0x48); self.mxb_ce8(0x89); self.mxb_ce8(0xC7); // [53..55] mov rdi, rax
+    i := 0;
+    while (i < 16) { self.mxb_ce8(0x90); i := i + 1; }         // [56..71] 16 NOPs
+    self.mxb_ce8(0xB8);                                           // [72] mov eax, imm32
+    self.mxb_ce8(0x01); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x02); // [73..76] MACOS_SYS_EXIT
+    self.mxb_ce8(0x0F); self.mxb_ce8(0x05);                      // [77..78] syscall
   }
 
   // _lyx_strlen (15 bytes, offset 65..79) — no syscalls, identical to Linux
@@ -233,7 +271,7 @@ pub type MacosX86Backend = class {
     self.mxb_ce8(0x48); self.mxb_ce8(0xC7); self.mxb_ce8(0xC7); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov rdi, 0
     self.mxb_ce8(0x48); self.mxb_ce8(0x8D); self.mxb_ce8(0x54); self.mxb_ce8(0x24); self.mxb_ce8(0x10); // lea rsi, [rsp+16]
     self.mxb_ce8(0xBA); self.mxb_ce8(0x03); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov edx, 3
-    self.mxb_ce8(0x49); self.mxb_ce8(0xC7); self.mxb_ce8(0xC2); self.mxb_ce8(0x22); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov r10, 34
+    self.mxb_ce8(0x49); self.mxb_ce8(0xC7); self.mxb_ce8(0xC2); self.mxb_ce8(0x02); self.mxb_ce8(0x10); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov r10, 0x1002 (MAP_PRIVATE|MAP_ANON macOS)
     self.mxb_ce8(0x49); self.mxb_ce8(0xC7); self.mxb_ce8(0xC0); self.mxb_ce8(0xFF); self.mxb_ce8(0xFF); self.mxb_ce8(0xFF); self.mxb_ce8(0xFF); // mov r8, -1
     self.mxb_ce8(0x49); self.mxb_ce8(0xC7); self.mxb_ce8(0xC1); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x00); // mov r9, 0
     self.mxb_ce8(0xB8); self.mxb_ce8(0xC5); self.mxb_ce8(0x00); self.mxb_ce8(0x00); self.mxb_ce8(0x02); // mov eax, MACOS_SYS_MMAP
@@ -250,39 +288,213 @@ pub type MacosX86Backend = class {
     self.mxb_ce8(0xC3);                                                  // ret
   }
 
-  // _lyx_strcharat (6 bytes, offset 281..286) — no syscalls, identical to Linux
+  // _lyx_strcharat (6 bytes, offset 295..300) — no syscalls, identical to Linux
   fn mxb_emitStrCharAt() {
     self.mxb_ce8(0x48); self.mxb_ce8(0x0F); self.mxb_ce8(0xB6); self.mxb_ce8(0x04); self.mxb_ce8(0x37); // movzx rax, byte[rdi+rsi]
     self.mxb_ce8(0xC3);                                                  // ret
   }
 
   // ------------------------------------------------------------------
+  // WP-D1: Linux→macOS syscall number translation
+  // Returns 0 if the Linux syscall has no known macOS equivalent.
+  // ------------------------------------------------------------------
+  fn mxb_linuxToMacos(linuxNum: int64): int64 {
+    if linuxNum == 1   { return MACOS_SYS_WRITE;      }  // write
+    if linuxNum == 2   { return MACOS_SYS_CLOSE;      }  // close
+    if linuxNum == 3   { return MACOS_SYS_READ;       }  // read
+    if linuxNum == 5   { return MACOS_SYS_OPEN;       }  // open
+    if linuxNum == 9   { return MACOS_SYS_MMAP;       }  // mmap
+    if linuxNum == 11  { return MACOS_SYS_MUNMAP;     }  // munmap
+    if linuxNum == 41  { return MACOS_SYS_SOCKET;     }  // socket
+    if linuxNum == 42  { return MACOS_SYS_CONNECT;    }  // connect
+    if linuxNum == 43  { return MACOS_SYS_ACCEPT;     }  // accept
+    if linuxNum == 44  { return MACOS_SYS_SENDTO;     }  // sendto
+    if linuxNum == 45  { return MACOS_SYS_RECVFROM;   }  // recvfrom
+    if linuxNum == 46  { return MACOS_SYS_SENDMSG;    }  // sendmsg
+    if linuxNum == 47  { return MACOS_SYS_RECVMSG;    }  // recvmsg
+    if linuxNum == 48  { return MACOS_SYS_SHUTDOWN;   }  // shutdown
+    if linuxNum == 49  { return MACOS_SYS_BIND;       }  // bind
+    if linuxNum == 50  { return MACOS_SYS_LISTEN;     }  // listen
+    if linuxNum == 53  { return MACOS_SYS_SOCKETPAIR; }  // socketpair
+    if linuxNum == 54  { return MACOS_SYS_SETSOCKOPT; }  // setsockopt
+    if linuxNum == 55  { return MACOS_SYS_GETSOCKOPT; }  // getsockopt
+    if linuxNum == 57  { return MACOS_SYS_FORK;       }  // fork
+    if linuxNum == 60  { return MACOS_SYS_EXIT;       }  // exit
+    if linuxNum == 72  { return MACOS_SYS_FCNTL;      }  // fcntl
+    if linuxNum == 231 { return MACOS_SYS_EXIT;       }  // exit_group
+    return 0;
+  }
+
+  // WP-D1: Patch Linux syscall numbers in the code buffer (offsets startOff..codeLen).
+  // Handles both 10-byte form (48 B8 <imm64> 0F 05) from user code
+  // and 5-byte form (B8 <imm32> 0F 05) from verbatim-copied Linux helper stubs.
+  fn mxb_patchCode(startOff: int64) {
+    var i: int64 := startOff;
+    var linuxNum: int64 := 0;
+    var macosNum: int64 := 0;
+    while (i < self.codeLen - 7) {
+      // 10-byte REX.W form: 48 B8 <8-byte LE imm64> 0F 05
+      if peek8(self.code + i) == 0x48 && peek8(self.code + i + 1) == 0xB8 &&
+         peek8(self.code + i + 6) == 0 && peek8(self.code + i + 7) == 0 &&
+         peek8(self.code + i + 8) == 0 && peek8(self.code + i + 9) == 0 &&
+         peek8(self.code + i + 10) == 0x0F && peek8(self.code + i + 11) == 0x05 {
+        linuxNum := peek8(self.code + i + 2) | (peek8(self.code + i + 3) << 8) |
+                    (peek8(self.code + i + 4) << 16) | (peek8(self.code + i + 5) << 24);
+        macosNum := self.mxb_linuxToMacos(linuxNum);
+        if macosNum != 0 {
+          poke8(self.code + i + 2,  macosNum & 0xFF);
+          poke8(self.code + i + 3, (macosNum >> 8) & 0xFF);
+          poke8(self.code + i + 4, (macosNum >> 16) & 0xFF);
+          poke8(self.code + i + 5, (macosNum >> 24) & 0xFF);
+          i := i + 11; // skip past the patched instruction
+        }
+      // 5-byte form: B8 <4-byte LE imm32> 0F 05
+      } else if peek8(self.code + i) == 0xB8 &&
+                peek8(self.code + i + 5) == 0x0F && peek8(self.code + i + 6) == 0x05 {
+        linuxNum := peek8(self.code + i + 1) | (peek8(self.code + i + 2) << 8) |
+                    (peek8(self.code + i + 3) << 16) | (peek8(self.code + i + 4) << 24);
+        macosNum := self.mxb_linuxToMacos(linuxNum);
+        if macosNum != 0 {
+          poke8(self.code + i + 1,  macosNum & 0xFF);
+          poke8(self.code + i + 2, (macosNum >> 8) & 0xFF);
+          poke8(self.code + i + 3, (macosNum >> 16) & 0xFF);
+          poke8(self.code + i + 4, (macosNum >> 24) & 0xFF);
+          i := i + 6;
+        }
+      }
+      i := i + 1;
+    }
+  }
+
+  // WP-02: Patch Linux mmap flags (34 = MAP_PRIVATE|MAP_ANON) to macOS (0x1002).
+  // Three instruction forms that embed flag value 34 before a syscall:
+  //   5-byte:  B8 22 00 00 00  49 89 C2   (mov eax,34; mov r10,rax)
+  //  10-byte: 48 B8 22 00..00  49 89 C2   (mov rax,34; mov r10,rax)
+  //  10+push: 48 B8 22 00..00  50         (mov rax,34; push rax  — for 6-arg push form)
+  fn mxb_patchMmapFlags(startOff: int64) {
+    var i: int64 := startOff;
+    while (i < self.codeLen - 12) {
+      // 5-byte form: B8 22 00 00 00 49 89 C2
+      if peek8(self.code + i) == 0xB8 &&
+         peek8(self.code + i + 1) == 0x22 &&
+         peek8(self.code + i + 2) == 0 &&
+         peek8(self.code + i + 3) == 0 &&
+         peek8(self.code + i + 4) == 0 &&
+         peek8(self.code + i + 5) == 0x49 &&
+         peek8(self.code + i + 6) == 0x89 &&
+         peek8(self.code + i + 7) == 0xC2 {
+        poke8(self.code + i + 1, 0x02);
+        poke8(self.code + i + 2, 0x10);
+        poke8(self.code + i + 3, 0);
+        poke8(self.code + i + 4, 0);
+        i := i + 7;
+      // 10-byte REX form: 48 B8 22 00 00 00 00 00 00 00 49 89 C2
+      } else if peek8(self.code + i) == 0x48 &&
+                peek8(self.code + i + 1) == 0xB8 &&
+                peek8(self.code + i + 2) == 0x22 &&
+                peek8(self.code + i + 3) == 0 &&
+                peek8(self.code + i + 4) == 0 &&
+                peek8(self.code + i + 5) == 0 &&
+                peek8(self.code + i + 6) == 0 &&
+                peek8(self.code + i + 7) == 0 &&
+                peek8(self.code + i + 8) == 0 &&
+                peek8(self.code + i + 9) == 0 &&
+                peek8(self.code + i + 10) == 0x49 &&
+                peek8(self.code + i + 11) == 0x89 &&
+                peek8(self.code + i + 12) == 0xC2 {
+        poke8(self.code + i + 2, 0x02);
+        poke8(self.code + i + 3, 0x10);
+        i := i + 12;
+      // 10-byte REX form + push: 48 B8 22 00 00 00 00 00 00 00 50
+      } else if peek8(self.code + i) == 0x48 &&
+                peek8(self.code + i + 1) == 0xB8 &&
+                peek8(self.code + i + 2) == 0x22 &&
+                peek8(self.code + i + 3) == 0 &&
+                peek8(self.code + i + 4) == 0 &&
+                peek8(self.code + i + 5) == 0 &&
+                peek8(self.code + i + 6) == 0 &&
+                peek8(self.code + i + 7) == 0 &&
+                peek8(self.code + i + 8) == 0 &&
+                peek8(self.code + i + 9) == 0 &&
+                peek8(self.code + i + 10) == 0x50 {
+        poke8(self.code + i + 2, 0x02);
+        poke8(self.code + i + 3, 0x10);
+        i := i + 10;
+      }
+      i := i + 1;
+    }
+  }
+
+  // WP-D1: Patch VMT addresses from Linux ELF base to macOS Mach-O base.
+  // Uses fields set by SetVMTInfo: vmtPatch, vmtCnt, vmtMeth, vmtMethCnt, cgDataPtr.
+  fn mxb_patchVMTAddrs() {
+    var delta: int64 := MACOS_CODE_BASE - MACOS_LINUX_BASE;
+    if self.vmtCnt <= 0 { return; }
+    var j: int64 := 0;
+    while (j < self.vmtCnt) {
+      var rec: int64 := self.vmtPatch + j * 24;
+      var codeOff: int64 := peek64(rec);
+      if codeOff >= 0 && codeOff < self.codeLen - 7 {
+        var oldAddr: int64 := peek64(self.code + codeOff);
+        poke64(self.code + codeOff, oldAddr + delta);
+      }
+      j := j + 1;
+    }
+    if self.vmtMethCnt <= 0 { return; }
+    j := 0;
+    while (j < self.vmtMethCnt) {
+      var rec2: int64 := self.vmtMeth + j * 16;
+      var slotOff: int64 := peek64(rec2);
+      var oldMeth: int64 := peek64(self.cgDataPtr + slotOff);
+      poke64(self.cgDataPtr + slotOff, oldMeth + delta);
+      j := j + 1;
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Build the macOS code buffer from a Codegen-produced Linux buffer
+  // WP-D1: stubs now at correct Linux-matching offsets (MACOS_HELPERS_SZ=301)
   // ------------------------------------------------------------------
 
   fn mxb_buildCode(cgBuf: int64, cgLen: int64) {
-    // Extract call-main rel32 from Linux _start (patched at bytes 49..52)
-    var b0: int64 := peek8(cgBuf + 49);
-    var b1: int64 := peek8(cgBuf + 50);
-    var b2: int64 := peek8(cgBuf + 51);
-    var b3: int64 := peek8(cgBuf + 52);
+    // WP-D1 fix: Linux _start (79 bytes) has call-main E8 at byte 62, rel32 at 63..66.
+    // (Bytes 49..52 are the CG_ARGC data-patch, NOT the call-main rel32.)
+    // macOS _start puts E8 at byte 48 (next IP = 53); Linux next IP = 67.
+    // Adjust: rel32_macos = rel32_linux + (67 - 53) = rel32_linux + 14.
+    var b0: int64 := peek8(cgBuf + 63);
+    var b1: int64 := peek8(cgBuf + 64);
+    var b2: int64 := peek8(cgBuf + 65);
+    var b3: int64 := peek8(cgBuf + 66);
     var rel32: int64 := b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+    // Sign-extend 32 bits to int64
+    if rel32 > 0x7FFFFFFF { rel32 := rel32 - 0x100000000; }
+    rel32 := rel32 + 14;  // macOS E8@48 nextIP=53 vs Linux E8@62 nextIP=67
 
-    // Emit macOS-patched helper stubs at identical offsets
-    self.mxb_emitStart(rel32);      // 0..64   (65 bytes)
-    self.mxb_emitStrlen();          // 65..79  (15 bytes)
-    self.mxb_emitPrintStr();        // 80..105 (26 bytes)
-    self.mxb_emitPrintInt();        // 106..209 (104 bytes)
-    self.mxb_emitStrSub();          // 210..280 (71 bytes)
-    self.mxb_emitStrCharAt();       // 281..286 (6 bytes)
-    // Total: 65+15+26+104+71+6 = 287 = MACOS_HELPERS_SZ ✓
+    // Emit macOS stubs at same offsets as Linux (WP-D1):
+    // _start:    0..78   (79 bytes)  = CG_H_STRLEN base
+    // strlen:    79..93  (15 bytes)  = CG_H_STRLEN = 79 ✓
+    // printstr:  94..119 (26 bytes)  = CG_H_PRINTSTR = 94 ✓
+    // printint:  120..223(104 bytes) = CG_H_PRINTINT = 120 ✓
+    // strsub:    224..294(71 bytes)  = CG_H_STRSUB = 224 ✓
+    // strcharat: 295..300(6 bytes)   = CG_H_STRCHARAT = 295 ✓
+    // Total: 79+15+26+104+71+6 = 301 = MACOS_HELPERS_SZ ✓
+    self.mxb_emitStart(rel32);
+    self.mxb_emitStrlen();
+    self.mxb_emitPrintStr();
+    self.mxb_emitPrintInt();
+    self.mxb_emitStrSub();
+    self.mxb_emitStrCharAt();
 
-    // Copy user functions verbatim — all relative addresses remain valid
+    // Copy Linux helpers 301+ and user code verbatim, then patch Linux syscall numbers
     var i: int64 := MACOS_HELPERS_SZ;
     while (i < cgLen) {
       self.mxb_ce8(peek8(cgBuf + i));
       i := i + 1;
     }
+    // Scan and patch Linux syscall numbers in all verbatim-copied code
+    self.mxb_patchCode(MACOS_HELPERS_SZ);
+    // WP-02: patch Linux mmap flags (34) to macOS (0x1002) in all verbatim-copied code
+    self.mxb_patchMmapFlags(MACOS_HELPERS_SZ);
   }
 
   // ------------------------------------------------------------------
@@ -300,7 +512,7 @@ pub type MacosX86Backend = class {
   //
   // LC_MAIN entryoff = P  (byte offset within file to _start at code[0])
 
-  fn mxb_writeMachO(path: pchar) {
+  fn mxb_writeMachO(path: pchar, cgData: int64, cgDataLen: int64) {
     var codeSize: int64 := self.codeLen;
 
     // Load-command sizes
@@ -314,7 +526,7 @@ pub type MacosX86Backend = class {
     // Page-align to get code offset P
     var P: int64 := (H + MACOS_PAGE_SIZE - 1) & ~(MACOS_PAGE_SIZE - 1);  // 4096
 
-    var textVMSz: int64 := P + codeSize;
+    var textVMSz: int64 := P + codeSize + cgDataLen;  // WP-D1: include data section
 
     // ---- Mach-O header (32 bytes) ----
     self.mxb_oe32(MACOS_MH_MAGIC_64);
@@ -380,6 +592,13 @@ pub type MacosX86Backend = class {
       self.mxb_oe8(peek8(self.code + i));
       i := i + 1;
     }
+    // ---- Data section (strings, VMT tables) — immediately follows code ----
+    // WP-D1: RIP-relative string/VMT accesses assume data is at code_end + dataOff
+    i := 0;
+    while (i < cgDataLen) {
+      self.mxb_oe8(peek8(cgData + i));
+      i := i + 1;
+    }
 
     // ---- Write to file (O_WRONLY|O_CREAT|O_TRUNC=577, mode 0755=493) ----
     var fd: int64 := open(path, 577, 493);
@@ -400,8 +619,20 @@ pub type MacosX86Backend = class {
     self.mxb_buildCode(cgBuf, cgLen);
   }
 
-  pub fn WriteMachO(path: pchar) {
-    self.mxb_writeMachO(path);
+  // WP-D1: Set VMT patch state. Call after Build(), before WriteMachO().
+  pub fn SetVMTInfo(vPatch: int64, vCnt: int64, vMeth: int64, vMethCnt: int64) {
+    self.vmtPatch   := vPatch;
+    self.vmtCnt     := vCnt;
+    self.vmtMeth    := vMeth;
+    self.vmtMethCnt := vMethCnt;
+  }
+
+  // WP-D1: Write Mach-O with data section appended after code + VMT patching.
+  pub fn WriteMachO(path: pchar, cgData: int64, cgDataLen: int64) {
+    self.cgDataPtr  := cgData;
+    self.cgDataLen_ := cgDataLen;
+    self.mxb_patchVMTAddrs();
+    self.mxb_writeMachO(path, cgData, cgDataLen);
   }
 
   pub fn GetCodeSize(): int64 { return self.codeLen; }

@@ -120,26 +120,26 @@ pub fn Adler32Update(current: int64, data: pchar, len: int64): int64 {
 // CRC32 Checksum (for completeness)
 // ============================================================================
 
+// Standard CRC-32 (ISO 3309 / zlib / PNG / gzip): reflektiert, Polynom 0xEDB88320,
+// Init 0xFFFFFFFF, FinalXor 0xFFFFFFFF. (Früher: MSB-first-Variante mit 0x04C11DB7
+// OHNE 32-Bit-Maskierung → `<<1`-Overflow → 64-Bit-Garbage, nicht zlib-kompatibel.)
 pub fn CRC32(data: pchar, len: int64): int64 {
-    var crc: int64 := -1;
+    var crc: int64 := 0xFFFFFFFF;
     var i: int64 := 0;
-    
     while (i < len) {
-        var byte: int64 := StrCharAt(data, i);
-        crc := crc ^ (byte << 24);
+        crc := crc ^ (StrCharAt(data, i) & 0xFF);
         var j: int64 := 0;
         while (j < 8) {
-            if ((crc & -2147483648) != 0) {
-                crc := (crc << 1) ^ 0x104C11DB7;
+            if ((crc & 1) != 0) {
+                crc := (crc >> 1) ^ 0xEDB88320;
             } else {
-                crc := crc << 1;
+                crc := crc >> 1;
             }
             j := j + 1;
         }
         i := i + 1;
     }
-    
-    return ~crc;
+    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
 }
 
 // ============================================================================
@@ -148,6 +148,18 @@ pub fn CRC32(data: pchar, len: int64): int64 {
 
 // Fixed literal/length codes (0-255 = literals, 256 = end block, 257-285 = length)
 pub con LITLEN_EOF: int64 := 256;
+
+// Reverse the lowest `bits` bits of `code` (MSB↔LSB), for Huffman code emission.
+// DEFLATE packs bits LSB-first in bytes, but Huffman codes are defined MSB-first.
+fn bitRev(code: int64, bits: int64): int64 {
+    var result: int64 := 0;
+    var i: int64 := 0;
+    while (i < bits) {
+        result := result | (((code >> i) & 1) << (bits - 1 - i));
+        i := i + 1;
+    }
+    return result;
+}
 
 // Get fixed Huffman code for literal/length
 // Returns (code * 256) + bits
@@ -193,99 +205,97 @@ pub fn GetFixedDistCode(dist: int64): int64 {
 // DEFLATE Compress with LZ77 (Fixed Huffman)
 // ============================================================================
 
-// Encode a literal/length symbol with fixed Huffman
+// Encode a literal/length symbol with fixed Huffman (RFC 1951 §3.2.6).
+// Codes are bit-reversed before writing because DEFLATE packs LSB-first
+// but Huffman codes are defined MSB-first.
 fn EncodeLitLen(output: pchar, bit_pos: int64, symbol: int64): int64 {
     var code: int64 := 0;
     var bits: int64 := 0;
-    
     if (symbol <= 143) {
-        code := symbol + 48;
+        code := symbol + 48;        // codes 48..191 (8-bit)
         bits := 8;
     } else if (symbol <= 255) {
-        code := symbol - 256 + 400;
+        code := symbol - 144 + 400; // codes 400..511 (9-bit)
         bits := 9;
     } else if (symbol <= 279) {
-        code := (symbol - 280) * 2;
+        code := symbol - 256;        // codes 0..23 (7-bit)
         bits := 7;
     } else {
-        code := symbol - 280 + 144;
+        code := symbol - 280 + 192;  // codes 192..199 (8-bit)
         bits := 8;
     }
-    
-    return BitWriteBits(output, bit_pos, code, bits);
+    return BitWriteBits(output, bit_pos, bitRev(code, bits), bits);
 }
 
-// Encode a distance code
+// Encode a distance code (RFC 1951 §3.2.5, Table 2).
+// In fixed DEFLATE, all distance codes are exactly 5 bits (codes 0-29),
+// bit-reversed before LSB-first emission. Extra bits are written separately.
 fn EncodeDist(output: pchar, bit_pos: int64, dist: int64): int64 {
     var code: int64 := 0;
-    var bits: int64 := 0;
-    
-    if (dist == 1) { code := 0; bits := 1; }
-    else if (dist == 2) { code := 1; bits := 1; }
-    else if (dist == 3) { code := 2; bits := 2; }
-    else if (dist == 4) { code := 3; bits := 2; }
-    else if (dist <= 6) { code := dist + 2; bits := 3; }
-    else if (dist <= 8) { code := dist + 4; bits := 3; }
-    else if (dist <= 12) { code := dist + 6; bits := 4; }
-    else if (dist <= 16) { code := dist + 10; bits := 4; }
-    else if (dist <= 24) { code := dist + 14; bits := 5; }
-    else if (dist <= 32) { code := dist + 20; bits := 5; }
-    else if (dist <= 48) { code := dist + 28; bits := 6; }
-    else if (dist <= 64) { code := dist + 36; bits := 6; }
-    else if (dist <= 96) { code := dist + 52; bits := 7; }
-    else if (dist <= 128) { code := dist + 68; bits := 7; }
-    else if (dist <= 192) { code := dist + 100; bits := 8; }
-    else if (dist <= 256) { code := dist + 132; bits := 8; }
-    else if (dist <= 384) { code := dist + 164; bits := 9; }
-    else if (dist <= 512) { code := dist + 196; bits := 9; }
-    else if (dist <= 768) { code := dist + 260; bits := 10; }
-    else if (dist <= 1024) { code := dist + 324; bits := 10; }
-    else if (dist <= 1536) { code := dist + 388; bits := 11; }
-    else if (dist <= 2048) { code := dist + 452; bits := 11; }
-    else if (dist <= 3072) { code := dist + 516; bits := 12; }
-    else if (dist <= 4096) { code := dist + 580; bits := 12; }
-    else if (dist <= 6144) { code := dist + 644; bits := 13; }
-    else if (dist <= 8192) { code := dist + 708; bits := 13; }
-    else if (dist <= 12288) { code := dist + 772; bits := 14; }
-    else if (dist <= 16384) { code := dist + 836; bits := 14; }
-    else if (dist <= 24576) { code := dist + 900; bits := 15; }
-    else { code := dist - 32768 + 964; bits := 15; }
-    
-    return BitWriteBits(output, bit_pos, code, bits);
+    if (dist == 1) { code := 0; }
+    else if (dist == 2) { code := 1; }
+    else if (dist == 3) { code := 2; }
+    else if (dist == 4) { code := 3; }
+    else if (dist <= 6) { code := 4; }
+    else if (dist <= 8) { code := 5; }
+    else if (dist <= 12) { code := 6; }
+    else if (dist <= 16) { code := 7; }
+    else if (dist <= 24) { code := 8; }
+    else if (dist <= 32) { code := 9; }
+    else if (dist <= 48) { code := 10; }
+    else if (dist <= 64) { code := 11; }
+    else if (dist <= 96) { code := 12; }
+    else if (dist <= 128) { code := 13; }
+    else if (dist <= 192) { code := 14; }
+    else if (dist <= 256) { code := 15; }
+    else if (dist <= 384) { code := 16; }
+    else if (dist <= 512) { code := 17; }
+    else if (dist <= 768) { code := 18; }
+    else if (dist <= 1024) { code := 19; }
+    else if (dist <= 1536) { code := 20; }
+    else if (dist <= 2048) { code := 21; }
+    else if (dist <= 3072) { code := 22; }
+    else if (dist <= 4096) { code := 23; }
+    else if (dist <= 6144) { code := 24; }
+    else if (dist <= 8192) { code := 25; }
+    else if (dist <= 12288) { code := 26; }
+    else if (dist <= 16384) { code := 27; }
+    else if (dist <= 24576) { code := 28; }
+    else { code := 29; }
+    return BitWriteBits(output, bit_pos, bitRev(code, 5), 5);
 }
 
-// Get length code for LZ77 length
+// Get length code for LZ77 length (RFC 1951 §3.2.5, Table 1).
 fn GetLengthCode(len: int64): int64 {
-    if (len == 3) { return 257; }
-    if (len == 4) { return 258; }
-    if (len == 5) { return 259; }
-    if (len == 6) { return 260; }
-    if (len == 7) { return 261; }
-    if (len == 8) { return 262; }
-    if (len == 9) { return 263; }
+    if (len == 3)  { return 257; }
+    if (len == 4)  { return 258; }
+    if (len == 5)  { return 259; }
+    if (len == 6)  { return 260; }
+    if (len == 7)  { return 261; }
+    if (len == 8)  { return 262; }
+    if (len == 9)  { return 263; }
     if (len == 10) { return 264; }
-    // For longer lengths, use extra bits
-    if (len <= 11) { return 265; }
-    if (len <= 13) { return 266; }
-    if (len <= 15) { return 267; }
-    if (len <= 17) { return 268; }
-    if (len <= 19) { return 269; }
-    if (len <= 23) { return 270; }
-    if (len <= 27) { return 271; }
-    if (len <= 31) { return 272; }
-    if (len <= 35) { return 273; }
-    if (len <= 43) { return 274; }
-    if (len <= 51) { return 275; }
-    if (len <= 59) { return 276; }
-    if (len <= 67) { return 277; }
-    if (len <= 83) { return 278; }
-    if (len <= 99) { return 279; }
-    if (len <= 115) { return 280; }
-    if (len <= 131) { return 281; }
-    if (len <= 163) { return 282; }
-    if (len <= 195) { return 283; }
-    if (len <= 227) { return 284; }
-    return 285;  // 258
+    if (len <= 12) { return 265; }   // 11-12
+    if (len <= 14) { return 266; }   // 13-14
+    if (len <= 16) { return 267; }   // 15-16
+    if (len <= 18) { return 268; }   // 17-18
+    if (len <= 22) { return 269; }   // 19-22
+    if (len <= 26) { return 270; }   // 23-26
+    if (len <= 30) { return 271; }   // 27-30
+    if (len <= 34) { return 272; }   // 31-34
+    if (len <= 42) { return 273; }   // 35-42
+    if (len <= 50) { return 274; }   // 43-50
+    if (len <= 58) { return 275; }   // 51-58
+    if (len <= 66) { return 276; }   // 59-66
+    if (len <= 82) { return 277; }   // 67-82
+    if (len <= 98) { return 278; }   // 83-98
+    if (len <= 114) { return 279; }  // 99-114
+    if (len <= 130) { return 280; }  // 115-130
+    if (len <= 162) { return 281; }  // 131-162
+    if (len <= 194) { return 282; }  // 163-194
+    if (len <= 226) { return 283; }  // 195-226
+    if (len <= 257) { return 284; }  // 227-257
+    return 285;                       // 258
 }
 
 // Compress using LZ77 with fixed Huffman
@@ -306,9 +316,10 @@ pub fn DeflateCompressLZ77(input: pchar, input_len: int64, output: pchar): int64
         }
         
         // Write block header: BFINAL + BTYPE=01 (fixed Huffman)
+        // BTYPE=01: BTYPE[0]=1 (LSB, sent first), BTYPE[1]=0 (MSB, sent second)
         bit_pos := BitWriteBit(output, bit_pos, is_final);
-        bit_pos := BitWriteBit(output, bit_pos, 0);  // BTYPE bit 0
-        bit_pos := BitWriteBit(output, bit_pos, 1);  // BTYPE bit 1
+        bit_pos := BitWriteBit(output, bit_pos, 1);  // BTYPE[0]=1
+        bit_pos := BitWriteBit(output, bit_pos, 0);  // BTYPE[1]=0
         
         var block_end: int64 := pos + 32768;
         if (block_end > input_len) { block_end := input_len; }
@@ -351,42 +362,73 @@ pub fn DeflateCompressLZ77(input: pchar, input_len: int64, output: pchar): int64
                 var len_code: int64 := GetLengthCode(match_len);
                 bit_pos := EncodeLitLen(output, bit_pos, len_code);
                 
-                // Write extra length bits if needed
-                if (len_code >= 265) {
+                // Write extra length bits (RFC 1951 Table 1; extra bits NOT reversed)
+                if (len_code >= 265 && len_code <= 284) {
                     var extra_bits: int64 := 0;
-                    var extra_len: int64 := 0;
-                    if (len_code <= 269) { extra_bits := 0; extra_len := 11; }
-                    else if (len_code <= 277) { extra_bits := 1; extra_len := 19; }
-                    else if (len_code <= 285) { extra_bits := 2; extra_len := 35; }
-                    
-                    if (extra_bits > 0) {
-                        var ebits: int64 := match_len - extra_len;
-                        bit_pos := BitWriteBits(output, bit_pos, ebits, extra_bits);
-                    }
+                    var base_len: int64 := 0;
+                    if (len_code <= 268) { extra_bits := 1; }
+                    else if (len_code <= 272) { extra_bits := 2; }
+                    else if (len_code <= 276) { extra_bits := 3; }
+                    else if (len_code <= 280) { extra_bits := 4; }
+                    else { extra_bits := 5; }
+                    if (len_code == 265) { base_len := 11; }
+                    else if (len_code == 266) { base_len := 13; }
+                    else if (len_code == 267) { base_len := 15; }
+                    else if (len_code == 268) { base_len := 17; }
+                    else if (len_code == 269) { base_len := 19; }
+                    else if (len_code == 270) { base_len := 23; }
+                    else if (len_code == 271) { base_len := 27; }
+                    else if (len_code == 272) { base_len := 31; }
+                    else if (len_code == 273) { base_len := 35; }
+                    else if (len_code == 274) { base_len := 43; }
+                    else if (len_code == 275) { base_len := 51; }
+                    else if (len_code == 276) { base_len := 59; }
+                    else if (len_code == 277) { base_len := 67; }
+                    else if (len_code == 278) { base_len := 83; }
+                    else if (len_code == 279) { base_len := 99; }
+                    else if (len_code == 280) { base_len := 115; }
+                    else if (len_code == 281) { base_len := 131; }
+                    else if (len_code == 282) { base_len := 163; }
+                    else if (len_code == 283) { base_len := 195; }
+                    else { base_len := 227; }
+                    bit_pos := BitWriteBits(output, bit_pos, match_len - base_len, extra_bits);
                 }
                 
                 // Write distance
                 bit_pos := EncodeDist(output, bit_pos, match_dist);
                 
-                // Write extra distance bits
+                // Write extra distance bits (RFC 1951 Table 2; extra bits NOT reversed)
                 var dbits: int64 := 0;
-                var dextra: int64 := 0;
+                var dbase: int64 := match_dist;
                 if (match_dist <= 4) { dbits := 0; }
-                else if (match_dist <= 8) { dbits := 0; }
-                else if (match_dist <= 16) { dbits := 1; dextra := 4; }
-                else if (match_dist <= 32) { dbits := 1; dextra := 4; }
-                else if (match_dist <= 64) { dbits := 2; dextra := 8; }
-                else if (match_dist <= 128) { dbits := 2; dextra := 8; }
-                else if (match_dist <= 256) { dbits := 3; dextra := 16; }
-                else if (match_dist <= 512) { dbits := 3; dextra := 16; }
-                else if (match_dist <= 1024) { dbits := 4; dextra := 32; }
-                else if (match_dist <= 2048) { dbits := 4; dextra := 32; }
-                else if (match_dist <= 4096) { dbits := 5; dextra := 64; }
-                else { dbits := 5; dextra := 64; }
-                
+                else if (match_dist <= 6)   { dbits := 1; dbase := 5; }
+                else if (match_dist <= 8)   { dbits := 1; dbase := 7; }
+                else if (match_dist <= 12)  { dbits := 2; dbase := 9; }
+                else if (match_dist <= 16)  { dbits := 2; dbase := 13; }
+                else if (match_dist <= 24)  { dbits := 3; dbase := 17; }
+                else if (match_dist <= 32)  { dbits := 3; dbase := 25; }
+                else if (match_dist <= 48)  { dbits := 4; dbase := 33; }
+                else if (match_dist <= 64)  { dbits := 4; dbase := 49; }
+                else if (match_dist <= 96)  { dbits := 5; dbase := 65; }
+                else if (match_dist <= 128) { dbits := 5; dbase := 97; }
+                else if (match_dist <= 192) { dbits := 6; dbase := 129; }
+                else if (match_dist <= 256) { dbits := 6; dbase := 193; }
+                else if (match_dist <= 384) { dbits := 7; dbase := 257; }
+                else if (match_dist <= 512) { dbits := 7; dbase := 385; }
+                else if (match_dist <= 768) { dbits := 8; dbase := 513; }
+                else if (match_dist <= 1024) { dbits := 8; dbase := 769; }
+                else if (match_dist <= 1536) { dbits := 9; dbase := 1025; }
+                else if (match_dist <= 2048) { dbits := 9; dbase := 1537; }
+                else if (match_dist <= 3072) { dbits := 10; dbase := 2049; }
+                else if (match_dist <= 4096) { dbits := 10; dbase := 3073; }
+                else if (match_dist <= 6144) { dbits := 11; dbase := 4097; }
+                else if (match_dist <= 8192) { dbits := 11; dbase := 6145; }
+                else if (match_dist <= 12288) { dbits := 12; dbase := 8193; }
+                else if (match_dist <= 16384) { dbits := 12; dbase := 12289; }
+                else if (match_dist <= 24576) { dbits := 13; dbase := 16385; }
+                else { dbits := 13; dbase := 24577; }
                 if (dbits > 0) {
-                    var ebits: int64 := match_dist - dextra;
-                    bit_pos := BitWriteBits(output, bit_pos, ebits, dbits);
+                    bit_pos := BitWriteBits(output, bit_pos, match_dist - dbase, dbits);
                 }
                 
                 pos := pos + match_len;
@@ -415,67 +457,39 @@ pub fn DeflateCompressLZ77(input: pchar, input_len: int64, output: pchar): int64
 // DEFLATE Compress (stored blocks only - simplest form)
 // ============================================================================
 
-// Compress using DEFLATE stored blocks (with bit-level output)
+// Compress using DEFLATE stored blocks (RFC 1951 BTYPE=00).
+// Uses direct byte writes: 1 header byte + 4 LEN/NLEN bytes + raw data per block.
 pub fn DeflateCompress(input: pchar, input_len: int64, output: pchar): int64 {
     if (input_len <= 0) { return 0; }
-    
-    var pos: int64 := 0;
-    var bit_pos: int64 := 0;
-    
-    while (pos < input_len) {
-        var remaining: int64 := input_len - pos;
-        var block_size: int64 := 65535;
-        if (remaining < block_size) { block_size := remaining; }
-        
-        // Write block header: BFINAL (1 bit) + BTYPE (2 bits) = 00
-        var is_final: int64 := 1;
-        if (pos + block_size < input_len) { is_final := 0; }
-        
-        // Write BFINAL (bit 0) and BTYPE=00 (bits 1-2)
-        bit_pos := BitWriteBit(output, bit_pos, is_final);
-        bit_pos := BitWriteBit(output, bit_pos, 0);  // BTYPE bit 0
-        bit_pos := BitWriteBit(output, bit_pos, 0);  // BTYPE bit 1
-        
-        // Align to byte boundary
-        if ((bit_pos & 7) != 0) {
-            var bp7: int64 := bit_pos + 7;
-            var bp8: int64 := bp7 / 8;
-            bit_pos := bp8 * 8;
-        }
-        
-        // Write LEN (little-endian, 16 bits)
-        var len: int64 := block_size;
-        var byte_pos: int64 := bit_pos / 8;
-        StrSetChar(output, byte_pos, len & 255);
-        StrSetChar(output, byte_pos + 1, (len / 256) & 255);
-        
-        // Write NLEN (ones complement of LEN, little-endian, 16 bits)
-        var nlen: int64 := (~len) & 65535;
-        StrSetChar(output, byte_pos + 2, nlen & 255);
-        StrSetChar(output, byte_pos + 3, (nlen / 256) & 255);
-        
-        bit_pos := bit_pos + 32;
-        
-        // Write raw data (bytes)
+    var outPos: int64 := 0;
+    var inPos: int64 := 0;
+    while (inPos < input_len) {
+        var remaining: int64 := input_len - inPos;
+        var blockSize: int64 := 65535;
+        if (remaining < blockSize) { blockSize := remaining; }
+        var isFinal: int64 := 1;
+        if (inPos + blockSize < input_len) { isFinal := 0; }
+        // Header byte: BFINAL in bit0, BTYPE=00 in bits1-2, padding zeros in bits3-7
+        StrSetChar(output, outPos, isFinal);
+        outPos := outPos + 1;
+        // LEN (16-bit little-endian)
+        StrSetChar(output, outPos,     blockSize & 255);
+        StrSetChar(output, outPos + 1, (blockSize / 256) & 255);
+        // NLEN = ones complement of LEN (16-bit little-endian)
+        var nlen: int64 := (blockSize ^ 65535) & 65535;
+        StrSetChar(output, outPos + 2, nlen & 255);
+        StrSetChar(output, outPos + 3, (nlen / 256) & 255);
+        outPos := outPos + 4;
+        // Raw data
         var i: int64 := 0;
-        var data_start: int64 := bit_pos / 8;
-        while (i < block_size) {
-            StrSetChar(output, data_start + i, StrCharAt(input, pos + i));
+        while (i < blockSize) {
+            StrSetChar(output, outPos + i, StrCharAt(input, inPos + i));
             i := i + 1;
         }
-        bit_pos := bit_pos + block_size * 8;
-        
-        pos := pos + block_size;
+        outPos := outPos + blockSize;
+        inPos := inPos + blockSize;
     }
-    
-    // Round up to bytes
-    if ((bit_pos & 7) != 0) {
-        var bp7: int64 := bit_pos + 7;
-            var bp8: int64 := bp7 / 8;
-            bit_pos := bp8 * 8;
-    }
-    
-    return bit_pos / 8;
+    return outPos;
 }
 
 // ============================================================================
@@ -488,27 +502,27 @@ pub fn ZlibCompress(input: pchar, input_len: int64, output: pchar, level: int64)
     
     var pos: int64 := 0;
     
-    // CMF (Compression Method and flags)
-    // CM = 8 (DEFLATE), CINFO = 7 (window size = 32K)
+    // CMF: CM = 8 (DEFLATE), CINFO = 7 (32K-Fenster) → immer 0x78.
+    // (Früher korrumpierte `cmf | 1` das CM-Feld.)
     var cmf: int64 := 0x78;
-    if (level <= 1) { cmf := cmf | 1; }  // FAST
-    else if (level >= 8) { cmf := cmf | 2; }  // MAX
-    
     StrSetChar(output, pos, cmf);
     pos := pos + 1;
-    
-    // FLG (Flags)
-    // Compression level in bits 1-2
-    var flg: int64 := 0;
-    if (level <= 1) { flg := 1; }
-    else if (level >= 8) { flg := 2; }
-    else { flg := 6; }
-    // FDICT = 0 (no dictionary)
+
+    // FLG: FLEVEL (Bits 6-7, nur informativ), FDICT=0, FCHECK (Bits 0-4) so
+    // gewählt, dass (CMF*256 + FLG) ein Vielfaches von 31 ist (RFC 1950 §2.2).
+    var flevel: int64 := 2;
+    if (level <= 1) { flevel := 0; }
+    else if (level < 6) { flevel := 1; }
+    else if (level >= 7) { flevel := 3; }
+    var flg: int64 := flevel << 6;
+    var hsum: int64 := cmf * 256 + flg;
+    var rem: int64 := hsum - (hsum / 31) * 31;
+    if (rem != 0) { flg := flg + (31 - rem); }
     StrSetChar(output, pos, flg);
     pos := pos + 1;
     
-    // Compress data using LZ77
-    var compressed: int64 := DeflateCompressLZ77(input, input_len, output);
+    // Compress data using LZ77 — NACH dem 2-Byte-Header schreiben (sonst Clobber!)
+    var compressed: int64 := DeflateCompressLZ77(input, input_len, (output as int64 + pos) as pchar);
     pos := pos + compressed;
     
     // Adler-32 checksum
@@ -648,146 +662,330 @@ fn DecodeHuffmanSymbol(data: pchar, len: int64, bit_pos: int64): int64 {
     return bits8 - 256;
 }
 
-// Inflate DEFLATE (supports stored blocks and fixed Huffman)
-// bit_offset: number of bits to skip at start (0 for raw DEFLATE, 16 for zlib)
-pub fn InflateDEFLATE(input: pchar, input_len: int64, output: pchar): int64 {
-    var bit_pos: int64 := 0;  // Start at beginning for raw DEFLATE
-    var out_pos: int64 := 0;
-    var done: bool := false;
-    
-    while (!done) {
-        var bfinal: int64 := ReadBits(input, 0, input_len, bit_pos, 1);
-        var btype0: int64 := ReadBits(input, 0, input_len, bit_pos + 1, 1);
-        var btype1: int64 := ReadBits(input, 0, input_len, bit_pos + 2, 1);
-        
-        bit_pos := bit_pos + 3;
-        
-        if (bfinal < 0 || btype0 < 0 || btype1 < 0) { break; }
-        
-        var btype: int64 := btype0 + btype1 * 2;
-        
-        if (btype == 0) {
-            // Stored block
-            var pad: int64 := (8 - (bit_pos & 7)) & 7;
-            bit_pos := bit_pos + pad;
-            
-            var byte_pos: int64 := bit_pos / 8;
-            var len: int64 := StrCharAt(input, byte_pos);
-            len := len + StrCharAt(input, byte_pos + 1) * 256;
-            
-            var nlen: int64 := StrCharAt(input, byte_pos + 2);
-            nlen := nlen + StrCharAt(input, byte_pos + 3) * 256;
-            
-            if ((nlen & 65535) != ((~len) & 65535)) {
+// ---------------------------------------------------------------------------
+// RFC 1951 DEFLATE inflate — korrekte Implementierung (V-4).
+//
+// Ersetzt den alten Decoder, der (a) in ReadBit das Byte-Offset (bit_pos/8)
+// ignorierte (las nur Byte 0), (b) Huffman-Codes LSB- statt MSB-first dekodierte,
+// (c) Längen-/Distanz-Extrabits nicht las und (d) Dynamic-Huffman nicht konnte.
+// Folge: SIGSEGV (Runaway-Copy) auf jedem komprimierten Stream → PNG/ZIP kaputt.
+//
+// Canonical-Huffman-Decode nach puff.c-Schema. Unterstützt stored (btype=0),
+// fixed (btype=1) und dynamic (btype=2) Huffman.
+// ---------------------------------------------------------------------------
+pub type Inflater = class {
+    input:     int64;   // Eingabe-Bytes (pchar as int64)
+    input_len: int64;
+    output:    int64;   // Ausgabe-Buffer
+    bit_pos:   int64;   // absolute Bit-Position in input
+    out_pos:   int64;   // geschriebene Ausgabe-Bytes
+
+    lenBase:   int64;   // int64[29]  Längen-Basiswerte (Symbol 257..285)
+    lenExtra:  int64;   // int64[29]  Längen-Extrabits
+    distBase:  int64;   // int64[30]
+    distExtra: int64;   // int64[30]
+
+    litCnt:    int64;   // Huffman: count[16] für Literal/Längen-Baum
+    litSym:    int64;   // Huffman: symbol[288]
+    distCnt:   int64;   // count[16] für Distanz-Baum
+    distSym:   int64;   // symbol[32]
+    clCnt:     int64;   // count[16] für Code-Längen-Baum (dynamic)
+    clSym:     int64;   // symbol[19]
+    lensBuf:   int64;   // int64[320] Code-Längen-Scratch (288 lit + 32 dist)
+
+    pub fn init(inp: int64, ilen: int64, outp: int64): void {
+        self.input     := inp;
+        self.input_len := ilen;
+        self.output    := outp;
+        self.bit_pos   := 0;
+        self.out_pos   := 0;
+        self.lenBase   := alloc(29 * 8);
+        self.lenExtra  := alloc(29 * 8);
+        self.distBase  := alloc(30 * 8);
+        self.distExtra := alloc(30 * 8);
+        self.litCnt    := alloc(16 * 8);
+        self.litSym    := alloc(288 * 8);
+        self.distCnt   := alloc(16 * 8);
+        self.distSym   := alloc(32 * 8);
+        self.clCnt     := alloc(16 * 8);
+        self.clSym     := alloc(19 * 8);
+        self.lensBuf   := alloc(320 * 8);
+        self.fillTables();
+    }
+
+    // Ein Bit aus dem Strom (LSB-first innerhalb des Bytes).
+    fn readBit(): int64 {
+        var bp: int64 := self.bit_pos;
+        var bytePos: int64 := bp >> 3;
+        if (bytePos >= self.input_len) { return -1; }
+        var b: int64 := peek8(self.input + bytePos);
+        var bit: int64 := (b >> (bp & 7)) & 1;
+        self.bit_pos := bp + 1;
+        return bit;
+    }
+
+    // n Bits, LSB-first (für Header-Felder und Längen-/Distanz-Extrabits).
+    fn readBits(n: int64): int64 {
+        var v: int64 := 0;
+        var i: int64 := 0;
+        while (i < n) {
+            var bit: int64 := self.readBit();
+            if (bit < 0) { return -1; }
+            v := v + (bit << i);
+            i := i + 1;
+        }
+        return v;
+    }
+
+    // Canonical-Huffman aus Code-Längen lens[0..n-1] in cnt[16]/sym[n] bauen.
+    fn buildHuff(lens: int64, n: int64, cnt: int64, sym: int64): void {
+        var i: int64 := 0;
+        while (i <= 15) { poke64(cnt + i * 8, 0); i := i + 1; }
+        i := 0;
+        while (i < n) {
+            var l: int64 := peek64(lens + i * 8);
+            poke64(cnt + l * 8, peek64(cnt + l * 8) + 1);
+            i := i + 1;
+        }
+        // Offsets je Länge (Symbole der Länge 0 werden nicht platziert)
+        var offs: int64 := alloc(16 * 8);
+        poke64(offs + 1 * 8, 0);
+        var ln: int64 := 1;
+        while (ln < 15) {
+            poke64(offs + (ln + 1) * 8, peek64(offs + ln * 8) + peek64(cnt + ln * 8));
+            ln := ln + 1;
+        }
+        i := 0;
+        while (i < n) {
+            var l2: int64 := peek64(lens + i * 8);
+            if (l2 != 0) {
+                var o: int64 := peek64(offs + l2 * 8);
+                poke64(sym + o * 8, i);
+                poke64(offs + l2 * 8, o + 1);
+            }
+            i := i + 1;
+        }
+    }
+
+    // Ein Symbol aus dem Strom dekodieren (MSB-first Code-Akkumulation).
+    fn decode(cnt: int64, sym: int64): int64 {
+        var code:  int64 := 0;
+        var first: int64 := 0;
+        var index: int64 := 0;
+        var ln:    int64 := 1;
+        while (ln <= 15) {
+            var bit: int64 := self.readBit();
+            if (bit < 0) { return -1; }
+            code := code | bit;
+            var count: int64 := peek64(cnt + ln * 8);
+            if ((code - first) < count) {
+                return peek64(sym + (index + (code - first)) * 8);
+            }
+            index := index + count;
+            first := first + count;
+            first := first << 1;
+            code  := code << 1;
+            ln := ln + 1;
+        }
+        return -1;
+    }
+
+    // Längen-/Distanz-Basis- und Extrabit-Tabellen füllen (RFC 1951 §3.2.5).
+    fn fillTables(): void {
+        var lb: int64 := self.lenBase;
+        var le: int64 := self.lenExtra;
+        self.put2(lb, le, 0, 3, 0);    self.put2(lb, le, 1, 4, 0);
+        self.put2(lb, le, 2, 5, 0);    self.put2(lb, le, 3, 6, 0);
+        self.put2(lb, le, 4, 7, 0);    self.put2(lb, le, 5, 8, 0);
+        self.put2(lb, le, 6, 9, 0);    self.put2(lb, le, 7, 10, 0);
+        self.put2(lb, le, 8, 11, 1);   self.put2(lb, le, 9, 13, 1);
+        self.put2(lb, le, 10, 15, 1);  self.put2(lb, le, 11, 17, 1);
+        self.put2(lb, le, 12, 19, 2);  self.put2(lb, le, 13, 23, 2);
+        self.put2(lb, le, 14, 27, 2);  self.put2(lb, le, 15, 31, 2);
+        self.put2(lb, le, 16, 35, 3);  self.put2(lb, le, 17, 43, 3);
+        self.put2(lb, le, 18, 51, 3);  self.put2(lb, le, 19, 59, 3);
+        self.put2(lb, le, 20, 67, 4);  self.put2(lb, le, 21, 83, 4);
+        self.put2(lb, le, 22, 99, 4);  self.put2(lb, le, 23, 115, 4);
+        self.put2(lb, le, 24, 131, 5); self.put2(lb, le, 25, 163, 5);
+        self.put2(lb, le, 26, 195, 5); self.put2(lb, le, 27, 227, 5);
+        self.put2(lb, le, 28, 258, 0);
+        var db: int64 := self.distBase;
+        var de: int64 := self.distExtra;
+        self.put2(db, de, 0, 1, 0);     self.put2(db, de, 1, 2, 0);
+        self.put2(db, de, 2, 3, 0);     self.put2(db, de, 3, 4, 0);
+        self.put2(db, de, 4, 5, 1);     self.put2(db, de, 5, 7, 1);
+        self.put2(db, de, 6, 9, 2);     self.put2(db, de, 7, 13, 2);
+        self.put2(db, de, 8, 17, 3);    self.put2(db, de, 9, 25, 3);
+        self.put2(db, de, 10, 33, 4);   self.put2(db, de, 11, 49, 4);
+        self.put2(db, de, 12, 65, 5);   self.put2(db, de, 13, 97, 5);
+        self.put2(db, de, 14, 129, 6);  self.put2(db, de, 15, 193, 6);
+        self.put2(db, de, 16, 257, 7);  self.put2(db, de, 17, 385, 7);
+        self.put2(db, de, 18, 513, 8);  self.put2(db, de, 19, 769, 8);
+        self.put2(db, de, 20, 1025, 9); self.put2(db, de, 21, 1537, 9);
+        self.put2(db, de, 22, 2049, 10); self.put2(db, de, 23, 3073, 10);
+        self.put2(db, de, 24, 4097, 11); self.put2(db, de, 25, 6145, 11);
+        self.put2(db, de, 26, 8193, 12); self.put2(db, de, 27, 12289, 12);
+        self.put2(db, de, 28, 16385, 13); self.put2(db, de, 29, 24577, 13);
+    }
+
+    fn put2(base: int64, extra: int64, i: int64, b: int64, e: int64): void {
+        poke64(base + i * 8, b);
+        poke64(extra + i * 8, e);
+    }
+
+    // Fixed-Huffman-Bäume gemäß RFC 1951 §3.2.6 aufbauen.
+    fn fixedTrees(): void {
+        var lens: int64 := self.lensBuf;
+        var i: int64 := 0;
+        while (i < 144) { poke64(lens + i * 8, 8); i := i + 1; }
+        while (i < 256) { poke64(lens + i * 8, 9); i := i + 1; }
+        while (i < 280) { poke64(lens + i * 8, 7); i := i + 1; }
+        while (i < 288) { poke64(lens + i * 8, 8); i := i + 1; }
+        self.buildHuff(lens, 288, self.litCnt, self.litSym);
+        i := 0;
+        while (i < 30) { poke64(lens + i * 8, 5); i := i + 1; }
+        self.buildHuff(lens, 30, self.distCnt, self.distSym);
+    }
+
+    // Dynamic-Huffman-Bäume aus dem Block-Header lesen (RFC 1951 §3.2.7).
+    // Rückgabe: 0 = OK, -1 = Fehler.
+    fn dynamicTrees(): int64 {
+        var hlit:  int64 := self.readBits(5) + 257;
+        var hdist: int64 := self.readBits(5) + 1;
+        var hclen: int64 := self.readBits(4) + 4;
+        if (hlit < 257 || hdist < 1 || hclen < 4) { return -1; }
+        // Reihenfolge der Code-Längen-Code-Längen
+        var order: int64 := alloc(19 * 8);
+        self.fillOrder(order);
+        var cl: int64 := alloc(19 * 8);
+        var i: int64 := 0;
+        while (i < 19) { poke64(cl + i * 8, 0); i := i + 1; }
+        i := 0;
+        while (i < hclen) {
+            var v: int64 := self.readBits(3);
+            if (v < 0) { return -1; }
+            poke64(cl + peek64(order + i * 8) * 8, v);
+            i := i + 1;
+        }
+        self.buildHuff(cl, 19, self.clCnt, self.clSym);
+        // HLIT+HDIST Code-Längen mit dem CL-Baum dekodieren
+        var lens: int64 := self.lensBuf;
+        var total: int64 := hlit + hdist;
+        var n: int64 := 0;
+        while (n < total) {
+            var s: int64 := self.decode(self.clCnt, self.clSym);
+            if (s < 0) { return -1; }
+            if (s < 16) {
+                poke64(lens + n * 8, s);
+                n := n + 1;
+            } else if (s == 16) {
+                if (n == 0) { return -1; }
+                var prev: int64 := peek64(lens + (n - 1) * 8);
+                var r: int64 := self.readBits(2) + 3;
+                while (r > 0) { poke64(lens + n * 8, prev); n := n + 1; r := r - 1; }
+            } else if (s == 17) {
+                var r2: int64 := self.readBits(3) + 3;
+                while (r2 > 0) { poke64(lens + n * 8, 0); n := n + 1; r2 := r2 - 1; }
+            } else {
+                var r3: int64 := self.readBits(7) + 11;
+                while (r3 > 0) { poke64(lens + n * 8, 0); n := n + 1; r3 := r3 - 1; }
+            }
+        }
+        if (n != total) { return -1; }
+        // In Literal/Längen- und Distanz-Längen aufteilen
+        self.buildHuff(lens, hlit, self.litCnt, self.litSym);
+        // Distanz-Längen ans Array-Anfang verschieben
+        var d: int64 := 0;
+        while (d < hdist) {
+            poke64(lens + d * 8, peek64(lens + (hlit + d) * 8));
+            d := d + 1;
+        }
+        self.buildHuff(lens, hdist, self.distCnt, self.distSym);
+        return 0;
+    }
+
+    fn fillOrder(order: int64): void {
+        poke64(order + 0 * 8, 16);  poke64(order + 1 * 8, 17); poke64(order + 2 * 8, 18);
+        poke64(order + 3 * 8, 0);   poke64(order + 4 * 8, 8);  poke64(order + 5 * 8, 7);
+        poke64(order + 6 * 8, 9);   poke64(order + 7 * 8, 6);  poke64(order + 8 * 8, 10);
+        poke64(order + 9 * 8, 5);   poke64(order + 10 * 8, 11); poke64(order + 11 * 8, 4);
+        poke64(order + 12 * 8, 12); poke64(order + 13 * 8, 3);  poke64(order + 14 * 8, 13);
+        poke64(order + 15 * 8, 2);  poke64(order + 16 * 8, 14); poke64(order + 17 * 8, 1);
+        poke64(order + 18 * 8, 15);
+    }
+
+    // Einen komprimierten Block (fixed/dynamic) dekodieren. 0 = OK, -1 = Fehler.
+    fn inflateBlock(): int64 {
+        while (1 == 1) {
+            var s: int64 := self.decode(self.litCnt, self.litSym);
+            if (s < 0) { return -1; }
+            if (s < 256) {
+                poke8(self.output + self.out_pos, s & 0xFF);
+                self.out_pos := self.out_pos + 1;
+            } else if (s == 256) {
+                return 0;
+            } else {
+                var si: int64 := s - 257;
+                if (si < 0 || si >= 29) { return -1; }
+                var length: int64 := peek64(self.lenBase + si * 8) + self.readBits(peek64(self.lenExtra + si * 8));
+                var ds: int64 := self.decode(self.distCnt, self.distSym);
+                if (ds < 0 || ds >= 30) { return -1; }
+                var dist: int64 := peek64(self.distBase + ds * 8) + self.readBits(peek64(self.distExtra + ds * 8));
+                if (dist < 1 || dist > self.out_pos) { return -1; }
+                var k: int64 := 0;
+                while (k < length) {
+                    var b: int64 := peek8(self.output + (self.out_pos - dist));
+                    poke8(self.output + self.out_pos, b);
+                    self.out_pos := self.out_pos + 1;
+                    k := k + 1;
+                }
+            }
+        }
+        return 0;
+    }
+
+    pub fn run(): int64 {
+        var fin: int64 := 0;
+        while (fin == 0) {
+            var bfinal: int64 := self.readBits(1);
+            var btype:  int64 := self.readBits(2);
+            if (bfinal < 0 || btype < 0) { return -1; }
+            if (bfinal == 1) { fin := 1; }
+
+            if (btype == 0) {
+                // Stored: auf Byte-Grenze ausrichten
+                var bp: int64 := (self.bit_pos + 7) & (0 - 8);
+                var bytePos: int64 := bp >> 3;
+                if (bytePos + 4 > self.input_len) { return -1; }
+                var slen: int64 := peek8(self.input + bytePos) + peek8(self.input + bytePos + 1) * 256;
+                bytePos := bytePos + 4;
+                if (bytePos + slen > self.input_len) { return -1; }
+                var k: int64 := 0;
+                while (k < slen) {
+                    poke8(self.output + self.out_pos, peek8(self.input + bytePos + k));
+                    self.out_pos := self.out_pos + 1;
+                    k := k + 1;
+                }
+                self.bit_pos := (bytePos + slen) << 3;
+            } else if (btype == 1) {
+                self.fixedTrees();
+                if (self.inflateBlock() < 0) { return -1; }
+            } else if (btype == 2) {
+                if (self.dynamicTrees() < 0) { return -1; }
+                if (self.inflateBlock() < 0) { return -1; }
+            } else {
                 return -1;
             }
-            
-            bit_pos := bit_pos + 16;
-            
-            var i: int64 := 0;
-            while (i < len) {
-                var src: int64 := bit_pos / 8;
-                StrSetChar(output, out_pos, StrCharAt(input, src));
-                out_pos := out_pos + 1;
-                bit_pos := bit_pos + 8;
-                i := i + 1;
-            }
-        } else if (btype == 1) {
-            // Fixed Huffman - decode LZ77
-            while (true) {
-                // Read next bits to determine symbol
-                var symbol: int64 := -1;
-                var bits7: int64 := ReadBits(input, 0, input_len, bit_pos, 7);
-                
-                if (bits7 < 160) {
-                    if (bits7 < 96) {
-                        symbol := bits7 + 48;
-                    } else {
-                        symbol := bits7 - 96 + 144;
-                    }
-                    bit_pos := bit_pos + 7;
-                } else {
-                    var bits8: int64 := ReadBits(input, 0, input_len, bit_pos, 8);
-                    if (bits8 < 256) {
-                        symbol := bits8;
-                    } else {
-                        symbol := bits8 - 256 + 256;
-                    }
-                    bit_pos := bit_pos + 8;
-                }
-                
-                if (symbol < 0) { break; }
-                
-                if (symbol < 256) {
-                    StrSetChar(output, out_pos, symbol);
-                    out_pos := out_pos + 1;
-                } else if (symbol == 256) {
-                    done := true;
-                    break;
-                } else {
-                    // Length code (257-285)
-                    var length: int64 := DecodeLengthValue(symbol);
-                    
-                    // Read distance
-                    var dbits: int64 := ReadBits(input, 0, input_len, bit_pos, 5);
-                    bit_pos := bit_pos + 5;
-                    
-                    var dist: int64 := 0;
-                    // Map distance code to actual distance
-                    if (dbits == 0) { dist := 1; }
-                    else if (dbits == 1) { dist := 2; }
-                    else if (dbits == 2) { dist := 3; }
-                    else if (dbits == 3) { dist := 4; }
-                    else if (dbits == 4) { dist := 5; }
-                    else if (dbits == 5) { dist := 6; }
-                    else if (dbits == 6) { dist := 7; }
-                    else if (dbits == 7) { dist := 8; }
-                    else if (dbits == 8) { dist := 9; }
-                    else if (dbits == 9) { dist := 10; }
-                    else if (dbits == 10) { dist := 12; }
-                    else if (dbits == 11) { dist := 14; }
-                    else if (dbits == 12) { dist := 16; }
-                    else if (dbits == 13) { dist := 20; }
-                    else if (dbits == 14) { dist := 24; }
-                    else if (dbits == 15) { dist := 28; }
-                    else if (dbits == 16) { dist := 32; }
-                    else if (dbits == 17) { dist := 40; }
-                    else if (dbits == 18) { dist := 48; }
-                    else if (dbits == 19) { dist := 56; }
-                    else if (dbits == 20) { dist := 64; }
-                    else if (dbits == 21) { dist := 80; }
-                    else if (dbits == 22) { dist := 96; }
-                    else if (dbits == 23) { dist := 112; }
-                    else if (dbits == 24) { dist := 128; }
-                    else if (dbits == 25) { dist := 160; }
-                    else if (dbits == 26) { dist := 192; }
-                    else if (dbits == 27) { dist := 224; }
-                    else if (dbits == 28) { dist := 256; }
-                    else { dist := 512; }
-                    
-                    if (dist < 1 || dist > out_pos) {
-                        return -1;
-                    }
-                    
-                    // Copy from history
-                    var j: int64 := 0;
-                    while (j < length) {
-                        var src: int64 := out_pos - dist;
-                        var b: int64 := StrCharAt(output, src);
-                        StrSetChar(output, out_pos, b);
-                        out_pos := out_pos + 1;
-                        j := j + 1;
-                    }
-                }
-            }
-        } else {
-            return -1;
         }
-        
-        if (bfinal == 1) { done := true; }
+        return self.out_pos;
     }
-    
-    return out_pos;
+}
+
+// Inflate eines rohen DEFLATE-Streams (stored + fixed + dynamic Huffman, RFC 1951).
+pub fn InflateDEFLATE(input: pchar, input_len: int64, output: pchar): int64 {
+    var inf: Inflater := new Inflater();
+    inf.init(input as int64, input_len, output as int64);
+    return inf.run();
 }
 
 // Zlib Decompress
@@ -814,10 +1012,9 @@ pub fn ZlibDecompress(input: pchar, input_len: int64, output: pchar): int64 {
     fdict := fdict & 1;
     if (fdict != 0) { return -1; }
     
-    // Skip zlib header (2 bytes) and call InflateDEFLATE
-    // We need to create a view into the input starting at byte 2
-    // For simplicity, pass input_len - 2 and let inflate handle offset
-    return InflateDEFLATE(input, input_len, output);
+    // Skip zlib header (2 bytes); trailing 4-Byte-Adler ignoriert InflateDEFLATE
+    // automatisch (stoppt am bfinal-Block).
+    return InflateDEFLATE((input as int64 + 2) as pchar, input_len - 2, output);
 }
 
 // ZlibDecompressToBuffer

@@ -1,0 +1,547 @@
+// std/cloud/cloudwatch.lyx — AWS CloudWatch Metrics + Logs Client
+// WP-AWS-12
+// Metrics: Query protocol; Logs: JSON protocol
+
+unit std.cloud.cloudwatch;
+
+import std.cloud.aws.core;
+import std.cloud.aws.transport;
+import std.cloud.aws.xml;
+import std.alloc;
+import std.io;
+
+pub type CWClient = struct {
+    creds:  AWSCreds;
+    region: int64;
+    host:   int64;  // metrics endpoint
+};
+
+pub type CWLogsClient = struct {
+    creds:  AWSCreds;
+    region: int64;
+    host:   int64;  // logs endpoint
+};
+
+pub type CWMetricDatum = struct {
+    metricName: int64;  // pchar
+    value:      int64;  // int64 bits of f64
+    unit:       int64;  // pchar (e.g. "Count", "Bytes", "Milliseconds", "None")
+    timestamp:  int64;  // epoch seconds (0 = now)
+};
+
+fn cwAppend(buf: int64, off: int64, s: pchar): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while(i<n){poke8(buf+off+i,StrCharAt(s,i)&0xFF);i:=i+1;}
+    return off+n;
+}
+
+fn cwUrlEncode(s: pchar, buf: int64, off: int64): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while(i<n){
+        var c: int64 := StrCharAt(s,i) & 0xFF;
+        if ((c>=65&&c<=90)||(c>=97&&c<=122)||(c>=48&&c<=57)||c==45||c==95||c==46||c==126) {
+            poke8(buf+off,c); off:=off+1;
+        } else {
+            poke8(buf+off,37);
+            poke8(buf+off+1,if((c>>4)<10){48+(c>>4)}else{87+(c>>4)});
+            poke8(buf+off+2,if((c&0xF)<10){48+(c&0xF)}else{87+(c&0xF)});
+            off:=off+3;
+        }
+        i:=i+1;
+    }
+    return off;
+}
+
+fn cwJsonEscape(s: pchar, buf: int64, off: int64): int64 {
+    if (s == 0 as pchar) { return off; }
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while (i < n) {
+        var c: int64 := StrCharAt(s,i) & 0xFF;
+        if (c == 34) { poke8(buf+off,92); poke8(buf+off+1,34); off:=off+2; }
+        else if (c == 92) { poke8(buf+off,92); poke8(buf+off+1,92); off:=off+2; }
+        else if (c == 10) { poke8(buf+off,92); poke8(buf+off+1,110); off:=off+2; }
+        else { poke8(buf+off,c); off:=off+1; }
+        i:=i+1;
+    }
+    return off;
+}
+
+fn cwSend(client: CWClient, body: int64, bodyLen: int64): AWSResponse {
+    return AWSQueryRequest(client.creds, client.host as pchar,
+                           body, bodyLen,
+                           client.region as pchar, "monitoring"c);
+}
+
+fn cwLogsSend(client: CWLogsClient, target: pchar, body: int64, bodyLen: int64): AWSResponse {
+    return AWSJSONRequest(client.creds, client.host as pchar, target,
+                          body, bodyLen,
+                          client.region as pchar, "logs"c,
+                          "application/x-amz-json-1.1"c);
+}
+
+pub fn CWConnect(creds: AWSCreds, region: pchar): CWClient {
+    var c: CWClient;
+    c.creds  := creds;
+    c.region := region as int64;
+    c.host   := AWSEndpoint("monitoring"c, region) as int64;
+    return c;
+}
+
+pub fn CWClose(client: CWClient) {
+    AWSCredentialsFree(client.creds);
+    if (client.host != 0) { free(client.host, StrLen(client.host as pchar)+1); }
+}
+
+pub fn CWLogsConnect(creds: AWSCreds, region: pchar): CWLogsClient {
+    var c: CWLogsClient;
+    c.creds  := creds;
+    c.region := region as int64;
+    c.host   := AWSEndpoint("logs"c, region) as int64;
+    return c;
+}
+
+pub fn CWLogsClose(client: CWLogsClient) {
+    AWSCredentialsFree(client.creds);
+    if (client.host != 0) { free(client.host, StrLen(client.host as pchar)+1); }
+}
+
+// ── Metrics ───────────────────────────────────────────────────────────────────
+
+pub fn CWListMetrics(client: CWClient, ns: pchar, metricName: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := cwAppend(buf, off, "Action=ListMetrics&Version=2010-08-01"c);
+    if (ns != 0 as pchar && StrLen(ns) > 0) {
+        off := cwAppend(buf, off, "&Namespace="c);
+        off := cwUrlEncode(ns, buf, off);
+    }
+    if (metricName != 0 as pchar && StrLen(metricName) > 0) {
+        off := cwAppend(buf, off, "&MetricName="c);
+        off := cwUrlEncode(metricName, buf, off);
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwSend(client, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn CWGetMetricStatistics(client: CWClient,
+                              ns: pchar, metricName: pchar,
+                              startTime: pchar, endTime: pchar,
+                              period: int64, statistic: pchar,
+                              unit: pchar): int64 {
+    var buf: int64 := alloc(2048); var off: int64 := 0;
+    off := cwAppend(buf, off, "Action=GetMetricStatistics&Version=2010-08-01&Namespace="c);
+    off := cwUrlEncode(ns, buf, off);
+    off := cwAppend(buf, off, "&MetricName="c);
+    off := cwUrlEncode(metricName, buf, off);
+    off := cwAppend(buf, off, "&StartTime="c);
+    off := cwUrlEncode(startTime, buf, off);
+    off := cwAppend(buf, off, "&EndTime="c);
+    off := cwUrlEncode(endTime, buf, off);
+    off := cwAppend(buf, off, "&Period="c);
+    var tmp: int64 := alloc(24); Int64ToStr(period, tmp as pchar);
+    off := cwAppend(buf, off, tmp as pchar); free(tmp, 24);
+    off := cwAppend(buf, off, "&Statistics.member.1="c);
+    off := cwUrlEncode(statistic, buf, off);
+    if (unit != 0 as pchar && StrLen(unit) > 0) {
+        off := cwAppend(buf, off, "&Unit="c);
+        off := cwUrlEncode(unit, buf, off);
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwSend(client, buf, off);
+    free(buf, 2048);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn CWPutMetricData(client: CWClient, ns: pchar,
+                        data: int64, count: int64): int64 {
+    // data: array of CWMetricDatum structs (each 32 bytes: metricName, value, unit, timestamp)
+    var buf: int64 := alloc(8192); var off: int64 := 0;
+    off := cwAppend(buf, off, "Action=PutMetricData&Version=2010-08-01&Namespace="c);
+    off := cwUrlEncode(ns, buf, off);
+    var i: int64 := 0;
+    while (i < count) {
+        var datum: int64 := data + i*32;
+        var name: pchar := peek64(datum)   as pchar;
+        var val:  int64 := peek64(datum+8);
+        var unit: pchar := peek64(datum+16) as pchar;
+        var ts:   int64 := peek64(datum+24);
+        var idx: int64 := alloc(24); Int64ToStr(i+1, idx as pchar);
+        off := cwAppend(buf, off, "&MetricData.member."c);
+        off := cwAppend(buf, off, idx as pchar);
+        off := cwAppend(buf, off, ".MetricName="c);
+        off := cwUrlEncode(name, buf, off);
+        off := cwAppend(buf, off, "&MetricData.member."c);
+        off := cwAppend(buf, off, idx as pchar);
+        off := cwAppend(buf, off, ".Value="c);
+        // val is an integer representing the value (as int64)
+        var vtmp: int64 := alloc(32); Int64ToStr(val, vtmp as pchar);
+        off := cwAppend(buf, off, vtmp as pchar);
+        free(vtmp, 32);
+        if (unit != 0 as pchar && StrLen(unit) > 0) {
+            off := cwAppend(buf, off, "&MetricData.member."c);
+            off := cwAppend(buf, off, idx as pchar);
+            off := cwAppend(buf, off, ".Unit="c);
+            off := cwUrlEncode(unit, buf, off);
+        }
+        if (ts > 0) {
+            off := cwAppend(buf, off, "&MetricData.member."c);
+            off := cwAppend(buf, off, idx as pchar);
+            off := cwAppend(buf, off, ".Timestamp="c);
+            var tstmp: int64 := alloc(32); Int64ToStr(ts, tstmp as pchar);
+            off := cwAppend(buf, off, tstmp as pchar);
+            free(tstmp, 32);
+        }
+        free(idx, 24);
+        i:=i+1;
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwSend(client, buf, off);
+    free(buf, 8192);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn CWDescribeAlarms(client: CWClient, alarmName: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    off := cwAppend(buf, off, "Action=DescribeAlarms&Version=2010-08-01"c);
+    if (alarmName != 0 as pchar && StrLen(alarmName) > 0) {
+        off := cwAppend(buf, off, "&AlarmNames.member.1="c);
+        off := cwUrlEncode(alarmName, buf, off);
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwSend(client, buf, off);
+    free(buf, 256);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn CWPutMetricAlarm(client: CWClient,
+                         alarmName: pchar, ns: pchar, metricName: pchar,
+                         comparison: pchar, threshold: int64,
+                         period: int64, evalPeriods: int64, statistic: pchar,
+                         actionsEnabled: int64, alarmArn: pchar): int64 {
+    var buf: int64 := alloc(4096); var off: int64 := 0;
+    off := cwAppend(buf, off, "Action=PutMetricAlarm&Version=2010-08-01&AlarmName="c);
+    off := cwUrlEncode(alarmName, buf, off);
+    off := cwAppend(buf, off, "&Namespace="c);
+    off := cwUrlEncode(ns, buf, off);
+    off := cwAppend(buf, off, "&MetricName="c);
+    off := cwUrlEncode(metricName, buf, off);
+    off := cwAppend(buf, off, "&ComparisonOperator="c);
+    off := cwUrlEncode(comparison, buf, off);
+    off := cwAppend(buf, off, "&Threshold="c);
+    var tmp: int64 := alloc(24); Int64ToStr(threshold, tmp as pchar);
+    off := cwAppend(buf, off, tmp as pchar);
+    off := cwAppend(buf, off, "&Period="c);
+    Int64ToStr(period, tmp as pchar);
+    off := cwAppend(buf, off, tmp as pchar);
+    off := cwAppend(buf, off, "&EvaluationPeriods="c);
+    Int64ToStr(evalPeriods, tmp as pchar);
+    off := cwAppend(buf, off, tmp as pchar);
+    free(tmp, 24);
+    off := cwAppend(buf, off, "&Statistic="c);
+    off := cwUrlEncode(statistic, buf, off);
+    if (actionsEnabled != 0) {
+        off := cwAppend(buf, off, "&ActionsEnabled=true"c);
+    }
+    if (alarmArn != 0 as pchar && StrLen(alarmArn) > 0) {
+        off := cwAppend(buf, off, "&AlarmActions.member.1="c);
+        off := cwUrlEncode(alarmArn, buf, off);
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwSend(client, buf, off);
+    free(buf, 4096);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn CWDeleteAlarms(client: CWClient, alarmName: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    off := cwAppend(buf, off, "Action=DeleteAlarms&Version=2010-08-01&AlarmNames.member.1="c);
+    off := cwUrlEncode(alarmName, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwSend(client, buf, off);
+    free(buf, 256);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+// ── CloudWatch Logs ───────────────────────────────────────────────────────────
+
+pub fn CWLogsCreateLogGroup(client: CWLogsClient, groupName: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    off := cwAppend(buf, off, "{\"logGroupName\":\""c);
+    off := cwJsonEscape(groupName, buf, off);
+    off := cwAppend(buf, off, "\"}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwLogsSend(client, "Logs_20140328.CreateLogGroup"c, buf, off);
+    free(buf, 256);
+    var ok: int64 := 0;
+    if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn CWLogsDeleteLogGroup(client: CWLogsClient, groupName: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    off := cwAppend(buf, off, "{\"logGroupName\":\""c);
+    off := cwJsonEscape(groupName, buf, off);
+    off := cwAppend(buf, off, "\"}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwLogsSend(client, "Logs_20140328.DeleteLogGroup"c, buf, off);
+    free(buf, 256);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn CWLogsDescribeLogGroups(client: CWLogsClient, prefix: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    poke8(buf+off,123); off:=off+1;
+    if (prefix != 0 as pchar && StrLen(prefix) > 0) {
+        off := cwAppend(buf, off, "\"logGroupNamePrefix\":\""c);
+        off := cwJsonEscape(prefix, buf, off);
+        off := cwAppend(buf, off, "\""c);
+    }
+    poke8(buf+off,125); off:=off+1;
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwLogsSend(client, "Logs_20140328.DescribeLogGroups"c, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn CWLogsCreateLogStream(client: CWLogsClient, groupName: pchar, streamName: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := cwAppend(buf, off, "{\"logGroupName\":\""c);
+    off := cwJsonEscape(groupName, buf, off);
+    off := cwAppend(buf, off, "\",\"logStreamName\":\""c);
+    off := cwJsonEscape(streamName, buf, off);
+    off := cwAppend(buf, off, "\"}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwLogsSend(client, "Logs_20140328.CreateLogStream"c, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn CWLogsDescribeLogStreams(client: CWLogsClient, groupName: pchar, prefix: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := cwAppend(buf, off, "{\"logGroupName\":\""c);
+    off := cwJsonEscape(groupName, buf, off);
+    off := cwAppend(buf, off, "\""c);
+    if (prefix != 0 as pchar && StrLen(prefix) > 0) {
+        off := cwAppend(buf, off, ",\"logStreamNamePrefix\":\""c);
+        off := cwJsonEscape(prefix, buf, off);
+        off := cwAppend(buf, off, "\""c);
+    }
+    off := cwAppend(buf, off, "}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwLogsSend(client, "Logs_20140328.DescribeLogStreams"c, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn CWLogsPutLogEvents(client: CWLogsClient,
+                           groupName: pchar, streamName: pchar,
+                           messages: int64, timestamps: int64, count: int64,
+                           sequenceToken: pchar): int64 {
+    // messages: array of pchar; timestamps: array of int64 (epoch ms)
+    var buf: int64 := alloc(65536); var off: int64 := 0;
+    off := cwAppend(buf, off, "{\"logGroupName\":\""c);
+    off := cwJsonEscape(groupName, buf, off);
+    off := cwAppend(buf, off, "\",\"logStreamName\":\""c);
+    off := cwJsonEscape(streamName, buf, off);
+    off := cwAppend(buf, off, "\""c);
+    if (sequenceToken != 0 as pchar && StrLen(sequenceToken) > 0) {
+        off := cwAppend(buf, off, ",\"sequenceToken\":\""c);
+        off := cwJsonEscape(sequenceToken, buf, off);
+        off := cwAppend(buf, off, "\""c);
+    }
+    off := cwAppend(buf, off, ",\"logEvents\":["c);
+    var i: int64 := 0;
+    while (i < count) {
+        if (i > 0) { poke8(buf+off,44); off:=off+1; }
+        var msg: pchar := peek64(messages + i*8) as pchar;
+        var ts: int64  := peek64(timestamps + i*8);
+        off := cwAppend(buf, off, "{\"timestamp\":"c);
+        var tmp: int64 := alloc(24); Int64ToStr(ts, tmp as pchar);
+        off := cwAppend(buf, off, tmp as pchar); free(tmp, 24);
+        off := cwAppend(buf, off, ",\"message\":\""c);
+        off := cwJsonEscape(msg, buf, off);
+        off := cwAppend(buf, off, "\"}"c);
+        i:=i+1;
+    }
+    off := cwAppend(buf, off, "]}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwLogsSend(client, "Logs_20140328.PutLogEvents"c, buf, off);
+    free(buf, 65536);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn CWLogsGetLogEvents(client: CWLogsClient,
+                           groupName: pchar, streamName: pchar,
+                           startTime: int64, endTime: int64, limit: int64): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := cwAppend(buf, off, "{\"logGroupName\":\""c);
+    off := cwJsonEscape(groupName, buf, off);
+    off := cwAppend(buf, off, "\",\"logStreamName\":\""c);
+    off := cwJsonEscape(streamName, buf, off);
+    off := cwAppend(buf, off, "\""c);
+    if (startTime > 0) {
+        off := cwAppend(buf, off, ",\"startTime\":"c);
+        var tmp: int64 := alloc(24); Int64ToStr(startTime, tmp as pchar);
+        off := cwAppend(buf, off, tmp as pchar); free(tmp, 24);
+    }
+    if (endTime > 0) {
+        off := cwAppend(buf, off, ",\"endTime\":"c);
+        var tmp2: int64 := alloc(24); Int64ToStr(endTime, tmp2 as pchar);
+        off := cwAppend(buf, off, tmp2 as pchar); free(tmp2, 24);
+    }
+    if (limit > 0) {
+        off := cwAppend(buf, off, ",\"limit\":"c);
+        var tmp3: int64 := alloc(24); Int64ToStr(limit, tmp3 as pchar);
+        off := cwAppend(buf, off, tmp3 as pchar); free(tmp3, 24);
+    }
+    off := cwAppend(buf, off, ",\"startFromHead\":true}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwLogsSend(client, "Logs_20140328.GetLogEvents"c, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn CWLogsFilterLogEvents(client: CWLogsClient,
+                              groupName: pchar, pattern: pchar,
+                              startTime: int64, endTime: int64, limit: int64): int64 {
+    var buf: int64 := alloc(1024); var off: int64 := 0;
+    off := cwAppend(buf, off, "{\"logGroupName\":\""c);
+    off := cwJsonEscape(groupName, buf, off);
+    off := cwAppend(buf, off, "\""c);
+    if (pattern != 0 as pchar && StrLen(pattern) > 0) {
+        off := cwAppend(buf, off, ",\"filterPattern\":\""c);
+        off := cwJsonEscape(pattern, buf, off);
+        off := cwAppend(buf, off, "\""c);
+    }
+    if (startTime > 0) {
+        off := cwAppend(buf, off, ",\"startTime\":"c);
+        var tmp: int64 := alloc(24); Int64ToStr(startTime, tmp as pchar);
+        off := cwAppend(buf, off, tmp as pchar); free(tmp, 24);
+    }
+    if (endTime > 0) {
+        off := cwAppend(buf, off, ",\"endTime\":"c);
+        var tmp2: int64 := alloc(24); Int64ToStr(endTime, tmp2 as pchar);
+        off := cwAppend(buf, off, tmp2 as pchar); free(tmp2, 24);
+    }
+    if (limit > 0) {
+        off := cwAppend(buf, off, ",\"limit\":"c);
+        var tmp3: int64 := alloc(24); Int64ToStr(limit, tmp3 as pchar);
+        off := cwAppend(buf, off, tmp3 as pchar); free(tmp3, 24);
+    }
+    off := cwAppend(buf, off, "}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwLogsSend(client, "Logs_20140328.FilterLogEvents"c, buf, off);
+    free(buf, 1024);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn CWLogsStartQuery(client: CWLogsClient,
+                         groupName: pchar, query: pchar,
+                         startTime: int64, endTime: int64): int64 {
+    var buf: int64 := alloc(2048); var off: int64 := 0;
+    off := cwAppend(buf, off, "{\"logGroupName\":\""c);
+    off := cwJsonEscape(groupName, buf, off);
+    off := cwAppend(buf, off, "\",\"queryString\":\""c);
+    off := cwJsonEscape(query, buf, off);
+    off := cwAppend(buf, off, "\",\"startTime\":"c);
+    var tmp: int64 := alloc(24); Int64ToStr(startTime, tmp as pchar);
+    off := cwAppend(buf, off, tmp as pchar);
+    off := cwAppend(buf, off, ",\"endTime\":"c);
+    Int64ToStr(endTime, tmp as pchar);
+    off := cwAppend(buf, off, tmp as pchar);
+    free(tmp, 24);
+    off := cwAppend(buf, off, "}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwLogsSend(client, "Logs_20140328.StartQuery"c, buf, off);
+    free(buf, 2048);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn CWLogsGetQueryResults(client: CWLogsClient, queryId: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    off := cwAppend(buf, off, "{\"queryId\":\""c);
+    off := cwJsonEscape(queryId, buf, off);
+    off := cwAppend(buf, off, "\"}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwLogsSend(client, "Logs_20140328.GetQueryResults"c, buf, off);
+    free(buf, 256);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn CWLogsPutRetentionPolicy(client: CWLogsClient, groupName: pchar, retentionDays: int64): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    off := cwAppend(buf, off, "{\"logGroupName\":\""c);
+    off := cwJsonEscape(groupName, buf, off);
+    off := cwAppend(buf, off, "\",\"retentionInDays\":"c);
+    var tmp: int64 := alloc(24); Int64ToStr(retentionDays, tmp as pchar);
+    off := cwAppend(buf, off, tmp as pchar); free(tmp, 24);
+    off := cwAppend(buf, off, "}"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := cwLogsSend(client, "Logs_20140328.PutRetentionPolicy"c, buf, off);
+    free(buf, 256);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}

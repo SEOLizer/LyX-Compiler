@@ -1,0 +1,501 @@
+// src/tools/lbf/dumper.lyx — LX-35 LBF-Dump Library
+//
+// Liest und validiert LYX!-Dateien; gibt menschenlesbare Felder aus.
+//
+// Public API:
+//   lbf_dump_verify(fbuf, fsize)           → 0/-1/-2/-3/-4
+//   lbf_dump_block_crc_ok(fbuf, block_idx) → bool
+//   lbf_dump_arch(fbuf)                    → int64 (LBF_ARCH_*)
+//   lbf_dump_entry_point(fbuf)             → int64
+//   lbf_dump_file_size_bytes(fbuf)         → int64
+//   lbf_dump_total_blocks(fbuf, fsize)     → int64
+//   lbf_dump_tlv_count(fbuf)               → int64
+//   lbf_dump_print_genesis(fbuf, fsize)    — Sektion 1
+//   lbf_dump_print_provenance(fbuf)        — Sektion 2
+//   lbf_dump_print_tlvs(fbuf)              — Sektion 3
+//   lbf_dump_print_blocks(fbuf, fsize)     — Sektion 4
+//   lbf_dump_print_all(fbuf, fsize, fname) — vollständiger Dump
+//
+// Import: import src.tools.lbf.dumper;
+
+import src.std.alloc;
+import src.std.io;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import src.tools.lbf.security;
+import src.tools.lbf.tlv;
+
+// ── Private Ausgabe-Hilfsfunktionen ──────────────────────────────────────────
+
+fn dump_lc_hex(c: int64) {
+    if c < 10 { PrintChar(48 + c); }
+    else       { PrintChar(87 + c); }   // 'a' - 10 = 87
+}
+
+fn dump_hex8(val: int64) {
+    PrintStr("0x"c);
+    dump_lc_hex((val >> 4) & 0xF);
+    dump_lc_hex(val & 0xF);
+}
+
+fn dump_hex32(val: int64) {
+    PrintStr("0x"c);
+    var i: int64 := 7;
+    while i >= 0 {
+        dump_lc_hex((val >> (i * 4)) & 0xF);
+        i := i - 1;
+    }
+}
+
+fn dump_hex64(val: int64) {
+    PrintStr("0x"c);
+    var i: int64 := 15;
+    while i >= 0 {
+        dump_lc_hex((val >> (i * 4)) & 0xF);
+        i := i - 1;
+    }
+}
+
+// UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx  (lowercase)
+fn dump_uuid(uuid: int64) {
+    var i: int64 := 0;
+    while i < 4 {
+        dump_lc_hex((peek8(uuid + i) >> 4) & 0xF);
+        dump_lc_hex(peek8(uuid + i) & 0xF);
+        i := i + 1;
+    }
+    PrintStr("-"c);
+    i := 0;
+    while i < 2 {
+        dump_lc_hex((peek8(uuid + 4 + i) >> 4) & 0xF);
+        dump_lc_hex(peek8(uuid + 4 + i) & 0xF);
+        i := i + 1;
+    }
+    PrintStr("-"c);
+    i := 0;
+    while i < 2 {
+        dump_lc_hex((peek8(uuid + 6 + i) >> 4) & 0xF);
+        dump_lc_hex(peek8(uuid + 6 + i) & 0xF);
+        i := i + 1;
+    }
+    PrintStr("-"c);
+    i := 0;
+    while i < 2 {
+        dump_lc_hex((peek8(uuid + 8 + i) >> 4) & 0xF);
+        dump_lc_hex(peek8(uuid + 8 + i) & 0xF);
+        i := i + 1;
+    }
+    PrintStr("-"c);
+    i := 0;
+    while i < 6 {
+        dump_lc_hex((peek8(uuid + 10 + i) >> 4) & 0xF);
+        dump_lc_hex(peek8(uuid + 10 + i) & 0xF);
+        i := i + 1;
+    }
+}
+
+fn dump_nstr(ptr: int64, maxlen: int64) {
+    var i: int64 := 0;
+    while i < maxlen && (peek8(ptr + i) & 0xFF) != 0 {
+        PrintChar(peek8(ptr + i) & 0xFF);
+        i := i + 1;
+    }
+}
+
+fn dump_ok_fail(ok: bool) {
+    if ok  { PrintStr("(OK)"c); }
+    if !ok { PrintStr("(FAIL)"c); }
+}
+
+fn dump_arch_str(arch: int64): pchar {
+    if arch == LBF_ARCH_X86_64 { return "x86-64"c; }
+    if arch == LBF_ARCH_ARM64  { return "ARM64"c; }
+    if arch == LBF_ARCH_RISCV  { return "RISC-V"c; }
+    return "unknown"c;
+}
+
+fn dump_sect_type_str(t: int64): pchar {
+    if t == LBF_SECT_TYPE_TEXT   { return ".text"c; }
+    if t == LBF_SECT_TYPE_RODATA { return ".rodata"c; }
+    if t == LBF_SECT_TYPE_DATA   { return ".data"c; }
+    if t == LBF_SECT_TYPE_BSS    { return ".bss"c; }
+    return "?"c;
+}
+
+fn dump_sect_prot_str(p: int64): pchar {
+    if p == LBF_SECT_PROT_RX { return "R/X"c; }
+    if p == LBF_SECT_PROT_R  { return "R"c; }
+    if p == LBF_SECT_PROT_RW { return "R/W"c; }
+    return "?"c;
+}
+
+fn dump_lc_kind_str(k: int64): pchar {
+    if k == 0 { return "ONE_SHOT"c; }
+    if k == 1 { return "EVENT_LOOP"c; }
+    if k == 2 { return "DAEMON"c; }
+    if k == 3 { return "REACTIVE"c; }
+    return "unknown"c;
+}
+
+// ── lbf_dump_verify ───────────────────────────────────────────────────────────
+//
+// Vollständige Validierung eines LBF-Datei-Puffers.
+//
+// Rückgabe:
+//   0  = gültig
+//  -1  = ungültige Dateigröße
+//  -2  = ungültiges Magic
+//  -3  = Block-CRC-Fehler (mindestens ein Block)
+//  -4  = File-CRC32C-Fehler
+
+pub fn lbf_dump_verify(fbuf: int64, fsize: int64): int64 {
+    if fsize < LBF_BLOCK_SIZE         { return 0 - 1; }
+    if (fsize % LBF_BLOCK_SIZE) != 0  { return 0 - 1; }
+
+    if peek8(fbuf + LBF_H_MAGIC)     != LBF_MAGIC_0 { return 0 - 2; }
+    if peek8(fbuf + LBF_H_MAGIC + 1) != LBF_MAGIC_1 { return 0 - 2; }
+    if peek8(fbuf + LBF_H_MAGIC + 2) != LBF_MAGIC_2 { return 0 - 2; }
+    if peek8(fbuf + LBF_H_MAGIC + 3) != LBF_MAGIC_3 { return 0 - 2; }
+
+    var total: int64 := fsize / LBF_BLOCK_SIZE;
+    var bi: int64 := 0;
+    while bi < total {
+        if lbf_header_validate(fbuf + bi * LBF_BLOCK_SIZE) != 0 { return 0 - 3; }
+        bi := bi + 1;
+    }
+
+    if lbf_verify_file_crc(fbuf, fsize) != 0 { return 0 - 4; }
+    return 0;
+}
+
+// ── lbf_dump_block_crc_ok ─────────────────────────────────────────────────────
+
+pub fn lbf_dump_block_crc_ok(fbuf: int64, block_idx: int64): bool {
+    return lbf_header_validate(fbuf + block_idx * LBF_BLOCK_SIZE) == 0;
+}
+
+// ── Feld-Lesefunktionen ───────────────────────────────────────────────────────
+
+pub fn lbf_dump_arch(fbuf: int64): int64 {
+    return peek8(fbuf + LBF_HEADER_SIZE + GEN_P_TARGET_ARCH) & 0xFF;
+}
+
+pub fn lbf_dump_entry_point(fbuf: int64): int64 {
+    return peek64(fbuf + LBF_HEADER_SIZE + GEN_P_ENTRY_POINT);
+}
+
+pub fn lbf_dump_file_size_bytes(fbuf: int64): int64 {
+    return peek32(fbuf + LBF_HEADER_SIZE + GEN_P_FILE_SIZE) & 0xFFFFFFFF;
+}
+
+pub fn lbf_dump_total_blocks(fbuf: int64, fsize: int64): int64 {
+    return fsize / LBF_BLOCK_SIZE;
+}
+
+pub fn lbf_dump_tlv_count(fbuf: int64): int64 {
+    var pay: int64 := fbuf + LBF_HEADER_SIZE;
+    var used: int64 := peek16(pay + GEN_P_TLV_USED) & 0xFFFF;
+    var tpool: int64 := pay + GEN_P_TLV_POOL;
+    return tlv_count(tpool, used);
+}
+
+// ── lbf_dump_print_genesis ────────────────────────────────────────────────────
+
+pub fn lbf_dump_print_genesis(fbuf: int64, fsize: int64) {
+    var pay: int64 := fbuf + LBF_HEADER_SIZE;
+
+    PrintStrLn("[Block 0 - Genesis]"c);
+
+    // Magic
+    var magic_ok: bool := true;
+    if peek8(fbuf + LBF_H_MAGIC)     != LBF_MAGIC_0 { magic_ok := false; }
+    if peek8(fbuf + LBF_H_MAGIC + 1) != LBF_MAGIC_1 { magic_ok := false; }
+    if peek8(fbuf + LBF_H_MAGIC + 2) != LBF_MAGIC_2 { magic_ok := false; }
+    if peek8(fbuf + LBF_H_MAGIC + 3) != LBF_MAGIC_3 { magic_ok := false; }
+    PrintStr("  Magic:       LYX! (0x4C 0x59 0x58 0x21)  "c);
+    dump_ok_fail(magic_ok);
+    PrintLn();
+
+    // Target arch
+    var arch: int64 := peek8(pay + GEN_P_TARGET_ARCH) & 0xFF;
+    PrintStr("  Target:      "c);
+    PrintStrLn(dump_arch_str(arch));
+
+    // Entry point
+    var ep: int64 := peek64(pay + GEN_P_ENTRY_POINT);
+    PrintStr("  Entry Point: "c);
+    dump_hex64(ep);
+    PrintLn();
+
+    // File size
+    var fsz_stored: int64 := peek32(pay + GEN_P_FILE_SIZE) & 0xFFFFFFFF;
+    var blocks: int64 := fsize / LBF_BLOCK_SIZE;
+    PrintStr("  File Size:   "c);
+    PrintInt(fsz_stored);
+    PrintStr(" bytes ("c);
+    PrintInt(blocks);
+    PrintStrLn(" blocks)"c);
+
+    // File CRC
+    var file_crc_ok: bool := lbf_verify_file_crc(fbuf, fsize) == 0;
+    var stored_crc: int64 := peek32(pay + GEN_P_FILE_CRC32C) & 0xFFFFFFFF;
+    PrintStr("  File CRC32C: "c);
+    dump_hex32(stored_crc);
+    PrintStr("  "c);
+    dump_ok_fail(file_crc_ok);
+    PrintLn();
+    PrintLn();
+}
+
+// ── lbf_dump_print_provenance ─────────────────────────────────────────────────
+
+pub fn lbf_dump_print_provenance(fbuf: int64) {
+    var pay: int64 := fbuf + LBF_HEADER_SIZE;
+
+    PrintStrLn("[Compiler Provenance]"c);
+
+    // Compiler name
+    PrintStr("  Compiler:    "c);
+    dump_nstr(pay + GEN_P_COMPILER_NAME, 16);
+    PrintLn();
+
+    // Compiled at
+    var ts: int64 := peek64(pay + GEN_P_COMPILED_AT);
+    PrintStr("  Compiled At: "c);
+    if ts == 0 {
+        PrintStrLn("0 (not set)"c);
+    } else {
+        PrintInt(ts);
+        PrintStrLn(" (epoch s)"c);
+    }
+
+    // UUID
+    var uuid: int64 := pay + GEN_P_COMPILER_UUID;
+    PrintStr("  UUID:        "c);
+    dump_uuid(uuid);
+    PrintLn();
+
+    // UUID blacklist status
+    var bl_ok: bool := lbf_check_compiler_blacklist(uuid) != 0;
+    PrintStr("  UUID Status: "c);
+    if bl_ok  { PrintStrLn("(OK) not blacklisted"c); }
+    if !bl_ok { PrintStrLn("(FAIL) BLACKLISTED"c); }
+
+    PrintLn();
+}
+
+// ── lbf_dump_print_tlvs ───────────────────────────────────────────────────────
+
+pub fn lbf_dump_print_tlvs(fbuf: int64) {
+    var pay: int64 := fbuf + LBF_HEADER_SIZE;
+    var used: int64 := peek16(pay + GEN_P_TLV_USED) & 0xFFFF;
+    var tpool: int64 := pay + GEN_P_TLV_POOL;
+
+    PrintStrLn("[TLV Entries]"c);
+
+    if used == 0 {
+        PrintStrLn("  (none)"c);
+        PrintLn();
+        return;
+    }
+
+    var off: int64 := 0;
+    while off + 3 <= used {
+        var tag:  int64 := peek8(tpool + off) & 0xFF;
+        var vlen: int64 := peek16(tpool + off + 1) & 0xFFFF;
+        var vptr: int64 := tpool + off + 3;
+
+        PrintStr("  ["c);
+        dump_hex8(tag);
+        PrintStr("] "c);
+
+        var done: int64 := 0;
+
+        if tag == LBF_TLV_HUMAN_INTENT && done == 0 {
+            PrintStr("Intent: \""c);
+            write(1, vptr, vlen);
+            PrintStrLn("\""c);
+            done := 1;
+        }
+        if tag == LBF_TLV_DEP_HASH_GRAPH && done == 0 {
+            var n: int64 := vlen / 32;
+            PrintStr("Dep Hashes: "c);
+            PrintInt(n);
+            PrintStrLn(" SHA-256 entr(ies)"c);
+            done := 1;
+        }
+        if tag == LBF_TLV_SYM_INTERFACE && done == 0 {
+            PrintStrLn("Symbol Interface"c);
+            done := 1;
+        }
+        if tag == LBF_TLV_ISA_EXTENSIONS && done == 0 {
+            PrintStr("ISA Extensions: "c);
+            dump_hex64(peek64(vptr));
+            PrintLn();
+            done := 1;
+        }
+        if tag == LBF_TLV_CAPABILITIES && done == 0 {
+            var caps: int64 := peek64(vptr);
+            PrintStr("Capabilities: "c);
+            dump_hex64(caps);
+            if caps == 0 { PrintStr(" (none)"c); }
+            PrintLn();
+            done := 1;
+        }
+        if tag == LBF_TLV_SOURCE_MAP && done == 0 {
+            PrintStr("Source Map: "c);
+            write(1, vptr, vlen);
+            PrintLn();
+            done := 1;
+        }
+        if tag == LBF_TLV_BUILD_MANIFEST && done == 0 {
+            PrintStrLn("Build Manifest"c);
+            done := 1;
+        }
+        if tag == LBF_TLV_LIFECYCLE && done == 0 {
+            var kind: int64 := peek8(vptr) & 0xFF;
+            var cnt:  int64 := 0;
+            if vlen >= 2 { cnt := peek8(vptr + 1) & 0xFF; }
+            PrintStr("Lifecycle: "c);
+            PrintStr(dump_lc_kind_str(kind));
+            PrintStr(" (kind="c);
+            dump_hex8(kind);
+            PrintStr(", events="c);
+            PrintInt(cnt);
+            PrintStr(")"c);
+            PrintLn();
+            var ei: int64 := 0;
+            while ei < cnt {
+                var evbase: int64 := vptr + 2 + ei * 11;
+                var evtype: int64 := peek8(evbase) & 0xFF;
+                var evparam: int64 := peek16(evbase + 1) & 0xFFFF;
+                var evva: int64 := peek64(evbase + 3);
+                PrintStr("    ev["c);
+                PrintInt(ei);
+                PrintStr("]: type="c);
+                dump_hex8(evtype);
+                PrintStr(" param="c);
+                PrintInt(evparam);
+                PrintStr(" va="c);
+                dump_hex64(evva);
+                PrintLn();
+                ei := ei + 1;
+            }
+            done := 1;
+        }
+        if tag == LBF_TLV_SECTION_MAP && done == 0 {
+            var bstart: int64 := peek32(vptr)     & 0xFFFFFFFF;
+            var bcount: int64 := peek16(vptr + 4) & 0xFFFF;
+            var stype:  int64 := peek8(vptr + 6)  & 0xFF;
+            var sprot:  int64 := peek8(vptr + 7)  & 0xFF;
+            PrintStr("Section Map: "c);
+            PrintStr(dump_sect_type_str(stype));
+            PrintStr(" start="c);
+            PrintInt(bstart);
+            PrintStr(" count="c);
+            PrintInt(bcount);
+            PrintStr(" ("c);
+            PrintStr(dump_sect_prot_str(sprot));
+            PrintStrLn(")"c);
+            done := 1;
+        }
+        if done == 0 {
+            PrintStr("(unknown, "c);
+            PrintInt(vlen);
+            PrintStrLn(" bytes)"c);
+        }
+
+        off := off + 3 + vlen;
+    }
+    PrintLn();
+}
+
+// ── lbf_dump_print_blocks ─────────────────────────────────────────────────────
+
+pub fn lbf_dump_print_blocks(fbuf: int64, fsize: int64) {
+    var total: int64 := fsize / LBF_BLOCK_SIZE;
+    var pay: int64 := fbuf + LBF_HEADER_SIZE;
+
+    var text_blocks:   int64 := peek16(pay + GEN_P_TEXT_BLOCKS)   & 0xFFFF;
+    var rodata_blocks: int64 := peek16(pay + GEN_P_RODATA_BLOCKS) & 0xFFFF;
+    var data_blocks:   int64 := peek16(pay + GEN_P_DATA_BLOCKS)   & 0xFFFF;
+    var bss_blocks:    int64 := peek16(pay + GEN_P_BSS_BLOCKS)    & 0xFFFF;
+
+    PrintStrLn("[Block Inventory]"c);
+
+    var bi: int64 := 0;
+    while bi < total {
+        var block: int64 := fbuf + bi * LBF_BLOCK_SIZE;
+        var crc_ok: bool := lbf_header_validate(block) == 0;
+        var immutable: bool := (peek8(block + LBF_H_FLAGS) & LBF_FLAG_IMMUTABLE) != 0;
+
+        PrintStr("  Block "c);
+        PrintInt(bi);
+        PrintStr(": "c);
+
+        if bi == 0 {
+            PrintStr("Genesis        "c);
+        } else {
+            // Determine section type by position
+            var text_end:   int64 := 1 + text_blocks;
+            var rodata_end: int64 := text_end + rodata_blocks;
+            var data_end:   int64 := rodata_end + data_blocks;
+            var bss_end:    int64 := data_end + bss_blocks;
+
+            var tidx: int64 := 0;
+            if bi >= 1 && bi < text_end {
+                PrintStr(".text  ["c);
+                tidx := bi;
+                PrintInt(tidx);
+                PrintStr("/"c);
+                PrintInt(text_blocks);
+                PrintStr("]  "c);
+            }
+            if bi >= text_end && bi < rodata_end {
+                PrintStr(".rodata["c);
+                PrintInt(bi - text_end + 1);
+                PrintStr("/"c);
+                PrintInt(rodata_blocks);
+                PrintStr("]  "c);
+            }
+            if bi >= rodata_end && bi < data_end {
+                PrintStr(".data  ["c);
+                PrintInt(bi - rodata_end + 1);
+                PrintStr("/"c);
+                PrintInt(data_blocks);
+                PrintStr("]  "c);
+            }
+            if bi >= data_end && bi < bss_end {
+                PrintStr(".bss   ["c);
+                PrintInt(bi - data_end + 1);
+                PrintStr("/"c);
+                PrintInt(bss_blocks);
+                PrintStr("]  "c);
+            }
+            if bi >= bss_end {
+                PrintStr("(extra)        "c);
+            }
+        }
+
+        PrintStr("CRC "c);
+        dump_ok_fail(crc_ok);
+        if immutable { PrintStr("  Immutable"c); }
+        PrintLn();
+
+        bi := bi + 1;
+    }
+    PrintLn();
+}
+
+// ── lbf_dump_print_all ────────────────────────────────────────────────────────
+
+pub fn lbf_dump_print_all(fbuf: int64, fsize: int64, fname: pchar) {
+    PrintStr("=== LBF DUMP: "c);
+    PrintStr(fname);
+    PrintStrLn(" ==="c);
+    PrintLn();
+    lbf_dump_print_genesis(fbuf, fsize);
+    lbf_dump_print_provenance(fbuf);
+    lbf_dump_print_tlvs(fbuf);
+    lbf_dump_print_blocks(fbuf, fsize);
+}

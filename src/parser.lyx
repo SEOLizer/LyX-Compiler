@@ -106,6 +106,7 @@ pub con NK_DEFER:        int64 := 106; // WP-AS-07: defer Stmt; c0=deferred stat
 pub con NK_FOR_RANGE:    int64 := 107; // WP-1.1-A: for i in range([start,] stop) { }
                                         //   sOff/sLen=var, c0=start, c1=stop(excl), c2=body
 pub con NK_NAMED_ARG:    int64 := 108; // WP-MEM-05: named call argument; sVal/sLen=name, c0=value
+pub con NK_TYPE_TUPLE:   int64 := 109; // WP-04: [T, T, ...] tuple return type; c0=first type (linked via next)
 
 // WP-L1: LCBS Capability AST nodes
 // NK_CAPABILITY_ATTR: c0=first NK_CAPABILITY_DECL; iVal=0(list) or 1(dynamic)
@@ -231,8 +232,9 @@ pub con ANNO_REDUNDANT:      int64 := 8;   // @redundant
 pub con ANNO_CAPABILITIES:   int64 := 16;  // WP-L1: @capabilities([...])
 pub con ANNO_USES_CAP:       int64 := 32;  // WP-L1: @uses_caller_cap([...])
 pub con ANNO_CAP_EXTERN:     int64 := 64;  // WP-L1: @cap(path) on extern fn
+pub con ANNO_LIFECYCLE:      int64 := 128; // LX-36: @lifecycle(kind)
 pub con CAP_FLAG_FASTPATH:   int64 := 1;   // WP-L1: NK_CAPABILITY_DECL.iVal bit0 = @fastpath
-// Bits 7..63 reserved for future annotations.
+// Bits 8..63 reserved for future annotations.
 
 // ============================================================================
 // Parser Class
@@ -281,13 +283,22 @@ pub type Parser = class {
   _pendingCapExternOff: int64;  // @cap path source offset for next extern fn (0=none)
   _pendingCapExternLen: int64;  // @cap path source length
 
+  // LX-36: pending @lifecycle annotation
+  _pendingLifecycleKind: int64; // -1=not set, 0=one_shot, 1=event_loop, 2=daemon, 3=reactive
+
+  // Recursion depth guard — prevents stack-overflow DoS via deeply nested expressions
+  parseDepth: int64;
+
   // ------------------------------------------------------------------
   // Token array helpers
   // ------------------------------------------------------------------
 
   fn _toff(i: int64): int64 { return self.toks + i * PARSER_TOK_SIZE; }
 
-  fn TokKind(i: int64): int64  { return peek64(self._toff(i)); }
+  fn TokKind(i: int64): int64 {
+    if i >= self.tokCount { i := self.tokCount - 1; }  // clamp: returns EOF for Peek2/Peek3 past end
+    return peek64(self._toff(i));
+  }
   fn TokStart(i: int64): int64 { return peek64(self._toff(i) + TOK_OFF_START); }
   fn TokLen(i: int64): int64   { return peek64(self._toff(i) + TOK_OFF_LEN); }
   fn TokIVal(i: int64): int64  { return peek64(self._toff(i) + TOK_OFF_IVAL); }
@@ -433,13 +444,17 @@ pub type Parser = class {
     }
     if (self.hadError == 0) {
       self.hadError := 1;
+      // WP-BC-L6: human-readable diagnostics — token names + the offending lexeme
+      // instead of raw token IDs ("expected token 2, got 121").
       PrintStr("Parse error at line ");
       PrintInt(self.TokLine(self.cur));
-      PrintStr(": expected token ");
-      PrintInt(k);
+      PrintStr(": expected ");
+      PrintStr(LexerTokKindStr(k));
       PrintStr(", got ");
-      PrintInt(self.Peek());
-      PrintStr("\n");
+      PrintStr(LexerTokKindStr(self.Peek()));
+      PrintStr(" '");
+      self._printTokText(self.cur);
+      PrintStr("'\n");
     }
     // Always advance past the unexpected token — prevents infinite loops in
     // while-loops that call Expect but only exit on TK_RBRACE/TK_EOF.
@@ -455,6 +470,19 @@ pub type Parser = class {
     PrintStr(": ");
     PrintStr(msg);
     PrintStr("\n");
+  }
+
+  // WP-BC-L6: print a token's source lexeme (src bytes are not null-terminated).
+  fn _printTokText(i: int64) {
+    var off: int64 := self._tokOff(i);
+    var ln:  int64 := self.TokLen(i);
+    if (ln <= 0) { return; }
+    var buf: int64 := alloc(ln + 1);
+    var j: int64 := 0;
+    while (j < ln) { poke8(buf + j, peek8(self.src + off + j)); j := j + 1; }
+    poke8(buf + ln, 0);
+    PrintStr(buf as pchar);
+    free(buf, ln + 1);
   }
 
   // Token text: offset and length within src
@@ -490,6 +518,7 @@ pub type Parser = class {
     if self._tokTextEq(tokIdx, "capabilities"c)    != 0 { return ANNO_CAPABILITIES; }  // WP-L1
     if self._tokTextEq(tokIdx, "uses_caller_cap"c) != 0 { return ANNO_USES_CAP; }      // WP-L1
     if self._tokTextEq(tokIdx, "cap"c)             != 0 { return ANNO_CAP_EXTERN; }    // WP-L1
+    if self._tokTextEq(tokIdx, "lifecycle"c)       != 0 { return ANNO_LIFECYCLE; }    // LX-36
     return 0;
   }
 
@@ -569,6 +598,9 @@ pub type Parser = class {
     self._pendingCapAttr     := 0 - 1;
     self._pendingUsesCapAttr := 0 - 1;
 
+    // LX-36: pending lifecycle annotation (-1 = not set, 0 = one_shot default)
+    self._pendingLifecycleKind := 0 - 1;
+
     self._tokenize();
   }
 
@@ -629,6 +661,33 @@ pub type Parser = class {
 
   fn ParseType(): int64 {
     var ti: int64 := self.cur;
+    // WP-04: [T, T, ...] tuple type syntax
+    if (self.Check(TK_LBRACK) != 0) {
+      self.Advance();
+      // WP-BC-L4: [N]T fixed-size array (prefix form). A tuple element type never
+      // starts with an integer literal, so a leading number disambiguates cleanly.
+      // Produces the same NK_TYPE_ARRAY_FIXED node as the T[N] suffix form.
+      if (self.Check(TK_INT) != 0) {
+        var sizeExpr: int64 := self.ParseExpr();
+        self.Expect(TK_RBRACK);
+        var elemT: int64 := self.ParseType();
+        var an: int64 := self._alloc(NK_TYPE_ARRAY_FIXED, ti);
+        self._sc0(an, elemT);
+        self._sc1(an, sizeExpr);
+        return an;
+      }
+      var n: int64 := self._alloc(NK_TYPE_TUPLE, ti);
+      var first: int64 := self.ParseType();
+      var last: int64 := first;
+      self._sc0(n, first);
+      while (self.Match(TK_COMMA) != 0) {
+        var elem: int64 := self.ParseType();
+        self._sn(last, elem);
+        last := elem;
+      }
+      self.Expect(TK_RBRACK);
+      return n;
+    }
     // WP-11: Handle extended type keywords (i8, i16, i32, u8, f32, char, etc.)
     if (self.Check(TK_INT8) != 0 || self.Check(TK_INT16) != 0 ||
         self.Check(TK_INT32) != 0 || self.Check(TK_INT64) != 0 ||
@@ -641,7 +700,8 @@ pub type Parser = class {
       self.Advance();
       return self._parseArrayTypeSuffix(n, ti);
     }
-    // NOTE: TK_FN handling removed - it's handled at statement level for function declarations
+    // WP-02: function pointer type: fn(T1, T2): R
+    if (self.Check(TK_FN) != 0) { return self.ParseFnType(); }
     if (self.Check(TK_ARRAY) != 0) {
       self.Advance();
       var n: int64 := self._alloc(NK_TYPE_ARRAY, ti);
@@ -842,6 +902,12 @@ pub type Parser = class {
   // minBP: minimum binding power to consume; callers pass 0 for the full expression,
   //        or infixBP(op) for left-associativity, or infixBP(op)-1 for right-associativity.
   fn ParseExprPrec(minBP: int64): int64 {
+    self.parseDepth := self.parseDepth + 1;
+    if self.parseDepth > 500 {
+      self._err("expression too deeply nested (max 500 levels)"c);
+      self.parseDepth := self.parseDepth - 1;
+      return self._alloc(NK_INT_LIT, self.cur);
+    }
     var lhs: int64 := self.ParseUnary();
     while (1 == 1) {
       var op: int64 := self.TokKind(self.cur);
@@ -893,13 +959,14 @@ pub type Parser = class {
         self._siv(n, op); self._sc0(n, lhs); self._sc1(n, rhs); lhs := n;
       }
     }
+    self.parseDepth := self.parseDepth - 1;
     return lhs;
   }
 
   // Parse arg list where ? is replaced by pipeVal (the piped expression)
   fn _parsePipeArgList(pipeVal: int64): int64 {
     if (self.Check(TK_RPAREN) != 0) { return pipeVal; }
-    var head: int64;
+    var head: int64 := -1;
     if (self.Check(TK_QUEST) != 0) {
       self.Advance();
       head := pipeVal;
@@ -908,7 +975,7 @@ pub type Parser = class {
     }
     var tail: int64 := head;
     while (self.Match(TK_COMMA) != 0) {
-      var arg: int64;
+      var arg: int64 := -1;
       if (self.Check(TK_QUEST) != 0) {
         self.Advance();
         arg := pipeVal;
@@ -1132,8 +1199,9 @@ pub type Parser = class {
         // Not a call — treat type args as a comparison (unusual; fall through)
       }
       if (self.Check(100) != 0) {  // TK_LPAREN=100
-        // WP-1.2: function calls forbidden in const expressions
-        if (self.inConstExpr != 0) {
+        // WP-1.2: function calls forbidden in const expressions,
+        // except sizeof(Type) which is a compile-time constant.
+        if (self.inConstExpr != 0 && self._tokTextEq(ti, "sizeof"c) == 0) {
           self._err("function call not allowed in const expression"c);
         }
         self.Advance();
@@ -1206,6 +1274,18 @@ pub type Parser = class {
       }
       self.Expect(TK_RBRACK);
       self._sc0(n, head);
+      return n;
+    }
+
+    // WP-02: anonymous function / closure expression: fn(params): rettype { body }
+    if (k == TK_FN) {
+      self.Advance();  // consume 'fn'
+      var n: int64 := self._alloc(NK_CLOSURE, ti);
+      self.Expect(TK_LPAREN);
+      self._sc0(n, self._parseParamList());
+      self.Expect(TK_RPAREN);
+      if (self.Match(TK_COLON) != 0) { self._sc1(n, self.ParseType()); }
+      self._sc2(n, self.ParseBlock());
       return n;
     }
 
@@ -1812,6 +1892,10 @@ pub type Parser = class {
     self.Advance();
     var nameTok: int64 := self.cur;
     self.Expect(TK_IDENT);
+    // BUG-8: 'self' is a reserved keyword and cannot be used as a variable name
+    if (self._tokTextEq(nameTok, "self"c) != 0) {
+      self._err("'self' is a reserved keyword and cannot be used as a variable name"c);
+    }
     // WP-BC-05: detect tuple var decl: var a, b := fn()
     if (self.Check(TK_COMMA) != 0) {
       return self._parseTupleVarDecl(nameTok, ti);
@@ -2284,8 +2368,11 @@ pub type Parser = class {
         // c2 = parent class name (extends)
         if (self.Check(TK_EXTENDS) != 0) {
           self.Advance();
-          self._sc2(n, self._alloc(NK_TYPE_NAME, self.cur));
-          self._ssv(self._sc2(n), self._tokOff(self.cur), self._tokLen(self.cur));
+          // _sc2 ist nur Setter (kein 1-Arg-Getter); Node in Variable halten,
+          // sonst landet _ssv auf falschem Node und parentName bleibt leer.
+          var pn: int64 := self._alloc(NK_TYPE_NAME, self.cur);
+          self._sc2(n, pn);
+          self._ssv(pn, self._tokOff(self.cur), self._tokLen(self.cur));
           self.Advance();
         }
         // c3 = interface names (implements)
@@ -2329,6 +2416,9 @@ pub type Parser = class {
             if (self.Match(TK_VIRTUAL) != 0)  { cVirtual := 1; }
             if (self.Match(TK_OVERRIDE) != 0) { cOverride := 1; }
             if (self.Match(TK_ABSTRACT) != 0) { cAbstract := 1; }
+            // WP-BC-L2: override and abstract are inherently virtual — they must
+            // occupy a VMT slot so late-binding dispatch finds/fills them.
+            if (cOverride != 0 || cAbstract != 0) { cVirtual := 1; }
             // WP-L8: @capabilities / @uses_caller_cap on class methods.
             // Use LOCAL variables — NOT _pendingCapAttr/_pendingUsesCapAttr, which hold the
             // class-level cap and must not be overwritten before the TYPE_DECL is chained.
@@ -2422,12 +2512,32 @@ pub type Parser = class {
               if (mthHead == -1) { mthHead := m; mthTail := m; }
               else { self._sn(mthTail, m); mthTail := m; }
             } else {
+              // WP-4.1-B: optional @big_endian annotation before field name
+              var isBigEndian2: int64 := 0;
+              if (self.Check(TK_AT) != 0 && self._tokTextEq(self.cur + 1, "big_endian"c) != 0) {
+                self.Advance();
+                self.Advance();
+                isBigEndian2 := 1;
+              }
               var fTok: int64 := self.cur;
               self.Expect(TK_IDENT);
               var fn2: int64 := self._alloc(NK_FIELD_DECL, fTok);
               self._ssv(fn2, self._tokOff(fTok), self._tokLen(fTok));
+              if (isBigEndian2 != 0) { self._siv(fn2, self.NIVal(fn2) | FIELD_FLAG_BIG_ENDIAN); }
               self.Expect(TK_COLON);
               self._sc0(fn2, self.ParseType());
+              // WP-4.1-A: optional at(expr) explicit offset after the field type
+              if (self._isSoftKw(self.cur, "at"c) != 0 && self.TokKind(self.cur + 1) == TK_LPAREN) {
+                self.Advance();
+                self.Expect(TK_LPAREN);
+                var prevConst2: int64 := self.inConstExpr;
+                self.inConstExpr := 1;
+                var offsetExpr2: int64 := self.ParseExpr();
+                self.inConstExpr := prevConst2;
+                self.Expect(TK_RPAREN);
+                self._sc1(fn2, offsetExpr2);
+                self._siv(fn2, self.NIVal(fn2) | FIELD_FLAG_PACKED_OFFSET);
+              }
               self.Match(TK_SEMI);
               if (fldHead == -1) { fldHead := fn2; fldTail := fn2; }
               else { self._sn(fldTail, fn2); fldTail := fn2; }
@@ -3004,6 +3114,26 @@ pub type Parser = class {
     return n;
   }
 
+  // LX-36: Parse @lifecycle(kind) argument — caller consumed '('; cur = kind ident.
+  // Sets _pendingLifecycleKind and consumes through ')'.
+  fn _parseLifecycleKindArg(): void {
+    if self.Check(TK_IDENT) != 0 {
+      if self._tokTextEq(self.cur, "one_shot"c)   != 0 { self._pendingLifecycleKind := 0; }
+      if self._tokTextEq(self.cur, "event_loop"c) != 0 { self._pendingLifecycleKind := 1; }
+      if self._tokTextEq(self.cur, "daemon"c)     != 0 { self._pendingLifecycleKind := 2; }
+      if self._tokTextEq(self.cur, "reactive"c)   != 0 { self._pendingLifecycleKind := 3; }
+      self.Advance();
+    }
+    // Drain any remaining args until matching ')'
+    var depth: int64 := 1;
+    while depth > 0 && self.Peek() != TK_EOF {
+      if self.Check(TK_LPAREN) != 0  { depth := depth + 1; }
+      if self.Check(TK_RPAREN) != 0  { depth := depth - 1; }
+      if depth > 0 { self.Advance(); }
+    }
+    if self.Check(TK_RPAREN) != 0 { self.Advance(); }
+  }
+
   // ==================================================================
   // Top-level parse -- returns head of declaration list (via NNext)
   // ==================================================================
@@ -3131,6 +3261,9 @@ pub type Parser = class {
             self._pendingCapExternOff := capPacked & 0xFFFFFFFF;
             self._pendingCapExternLen := capPacked >> 32;
             self.Expect(TK_RPAREN);
+          } else if (flag == ANNO_LIFECYCLE) {      // LX-36: @lifecycle(kind)
+            self.Advance();  // consume (
+            self._parseLifecycleKindArg();
           } else {
             self.Advance();  // consume (
             var depth: int64 := 1;
@@ -3182,6 +3315,9 @@ pub type Parser = class {
             self._pendingCapExternOff := packed3 & 0xFFFFFFFF;
             self._pendingCapExternLen := packed3 >> 32;
             self.Expect(TK_RPAREN);
+          } else if (flag2 == ANNO_LIFECYCLE) {      // LX-36: @lifecycle(kind)
+            self.Advance();  // consume (
+            self._parseLifecycleKindArg();
           } else {
             self.Advance();
             var depth: int64 := 1;
@@ -3221,7 +3357,9 @@ pub type Parser = class {
       else if (k == TK_EXTERN) { decl := self._parseExternDecl(); }
       else if (k == TK_DIM)    { decl := self._parseDimDecl(isPub); }
       else if (k == TK_UTYPE)  { decl := self._parseUtypeDecl(isPub); }
-      else if (k == TK_FORM)   { decl := self._parseLfdForm(); }
+      // WP-BC-L5: 'form' is a soft keyword (lexed as IDENT). Recognize the top-level
+      // form construct by text; everywhere else 'form' is a usable identifier.
+      else if (k == TK_IDENT && self._tokTextEq(self.cur, "form"c) != 0) { decl := self._parseLfdForm(); }
       // WP-BC-60: static global variable declaration
       else if (k == TK_STATIC) { decl := self.ParseStaticDecl(isPub); }
       // WP-BC-56: skip "unit Name;" module declaration

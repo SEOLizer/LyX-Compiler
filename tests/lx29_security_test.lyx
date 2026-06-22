@@ -1,0 +1,209 @@
+// LX-29 Test: Supply Chain Security — SHA-256, UUID v4, Blacklist, File-CRC (--target=x86_64)
+
+import src.std.alloc;
+import src.std.io;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import src.tools.lbf.genesis;
+import src.tools.lbf.security;
+
+// Füllt n Bytes ab dst mit val.
+fn fillBytes(dst: int64, n: int64, val: int64) {
+    var i: int64 := 0;
+    while i < n { poke8(dst + i, val & 0xFF); i := i + 1; }
+}
+
+// Gibt 0 zurück wenn a[0..n-1] == b[0..n-1], -1 sonst.
+fn cmpBytes(a: int64, b: int64, n: int64): int64 {
+    var i: int64 := 0;
+    while i < n {
+        if peek8(a + i) != peek8(b + i) { return 0 - 1; }
+        i := i + 1;
+    }
+    return 0;
+}
+
+fn main(): int64 {
+
+    // ── Tests 1–4: lbf_compute_source_hash — Determinismus ───────────────────
+
+    var src1: int64 := alloc(64);
+    var src2: int64 := alloc(64);
+    var h1:   int64 := alloc(32);
+    var h2:   int64 := alloc(32);
+    var h3:   int64 := alloc(32);
+
+    // Gleicher Inhalt → identisches SHA-256
+    var i: int64 := 0;
+    while i < 64 { poke8(src1 + i, i & 0xFF); poke8(src2 + i, i & 0xFF); i := i + 1; }
+    lbf_compute_source_hash(src1, 64, h1);
+    lbf_compute_source_hash(src2, 64, h2);
+    if cmpBytes(h1, h2, 32) != 0 {
+        EPrintStrLn("FAIL: identical inputs → different SHA-256"); return 1;
+    }
+
+    // Drei separate Aufrufe → immer gleich (deterministisch)
+    lbf_compute_source_hash(src1, 64, h3);
+    if cmpBytes(h1, h3, 32) != 0 {
+        EPrintStrLn("FAIL: SHA-256 not deterministic"); return 1;
+    }
+
+    // 1 Bit geändert → anderes SHA-256
+    poke8(src2 + 0, (peek8(src2 + 0)) ^ 1);
+    lbf_compute_source_hash(src2, 64, h2);
+    if cmpBytes(h1, h2, 32) == 0 {
+        EPrintStrLn("FAIL: 1-bit change → same SHA-256"); return 1;
+    }
+
+    // Leerer Puffer: SHA-256("") = bekannter Wert (e3b0c44298fc...)
+    lbf_compute_source_hash(src1, 0, h2);
+    if peek8(h2 + 0) != 0xE3 {
+        EPrintStrLn("FAIL: SHA-256('') byte 0 != 0xE3"); return 1;
+    }
+    if peek8(h2 + 1) != 0xB0 {
+        EPrintStrLn("FAIL: SHA-256('') byte 1 != 0xB0"); return 1;
+    }
+
+    free(src1, 64); free(src2, 64); free(h1, 32); free(h2, 32); free(h3, 32);
+
+    // ── Tests 5–9: lbf_generate_compiler_uuid — UUID v4-Format ──────────────
+
+    var uuid1: int64 := alloc(16);
+    var uuid2: int64 := alloc(16);
+    var uuid3: int64 := alloc(16);
+
+    lbf_generate_compiler_uuid(uuid1);
+    lbf_generate_compiler_uuid(uuid2);
+    lbf_generate_compiler_uuid(uuid3);
+
+    // Byte 6: obere 4 Bits = 0x4 (Version 4)
+    if (peek8(uuid1 + 6) & 0xF0) != 0x40 {
+        EPrintStrLn("FAIL: UUID byte 6 version != 4"); return 1;
+    }
+
+    // Byte 8: obere 2 Bits = 0b10 (Variant RFC 4122)
+    if (peek8(uuid1 + 8) & 0xC0) != 0x80 {
+        EPrintStrLn("FAIL: UUID byte 8 variant != 0b10"); return 1;
+    }
+
+    // uuid2 + uuid3 ebenfalls korrekt formatiert
+    if (peek8(uuid2 + 6) & 0xF0) != 0x40 {
+        EPrintStrLn("FAIL: UUID2 byte 6 version != 4"); return 1;
+    }
+    if (peek8(uuid2 + 8) & 0xC0) != 0x80 {
+        EPrintStrLn("FAIL: UUID2 byte 8 variant != 0b10"); return 1;
+    }
+
+    // Drei UUIDs sollen alle verschieden sein (extrem hohe Wahrscheinlichkeit)
+    if cmpBytes(uuid1, uuid2, 16) == 0 {
+        EPrintStrLn("FAIL: uuid1 == uuid2"); return 1;
+    }
+    if cmpBytes(uuid1, uuid3, 16) == 0 {
+        EPrintStrLn("FAIL: uuid1 == uuid3"); return 1;
+    }
+    if cmpBytes(uuid2, uuid3, 16) == 0 {
+        EPrintStrLn("FAIL: uuid2 == uuid3"); return 1;
+    }
+
+    free(uuid1, 16); free(uuid2, 16); free(uuid3, 16);
+
+    // ── Tests 10–12: lbf_check_compiler_blacklist — keine Datei → sicher ────
+
+    // /etc/lyx/compiler_blacklist.bin existiert wahrscheinlich nicht → 1
+    var testuuid: int64 := alloc(16);
+    fillBytes(testuuid, 16, 0xAB);
+    var blres: int64 := lbf_check_compiler_blacklist(testuuid);
+    if blres != 1 {
+        EPrintStrLn("FAIL: blacklist(no file) should return 1 (safe)"); return 1;
+    }
+
+    // Zweiter Aufruf mit anderem UUID → auch 1
+    fillBytes(testuuid, 16, 0x00);
+    blres := lbf_check_compiler_blacklist(testuuid);
+    if blres != 1 {
+        EPrintStrLn("FAIL: blacklist(no file, zero uuid) should return 1"); return 1;
+    }
+
+    // UUID aus Nullen ist nie in nichtexistenter Blacklist → 1
+    fillBytes(testuuid, 16, 0xFF);
+    blres := lbf_check_compiler_blacklist(testuuid);
+    if blres != 1 {
+        EPrintStrLn("FAIL: blacklist(no file, ff uuid) should return 1"); return 1;
+    }
+    free(testuuid, 16);
+
+    // ── Tests 13–17: lbf_finalize_file_crc — Ein-Block-LBF-Datei ────────────
+
+    // Minimal-LBF: 1 Block (nur Genesis, kein Code).
+    // block_index=0, total_blocks=1.
+    var blkbuf: int64 := alloc(LBF_BLOCK_SIZE);
+    fillBytes(blkbuf, LBF_BLOCK_SIZE, 0);
+
+    lbf_header_init(blkbuf, 0, 1, 1000000, 1);
+
+    // Genesis-Payload minimal befüllen (content_type=1, arch=1)
+    var pay: int64 := blkbuf + LBF_HEADER_SIZE;
+    poke8(pay + GEN_P_CONTENT_TYPE, 1);
+    poke8(pay + GEN_P_TARGET_ARCH,  1);
+    // GEN_P_FILE_CRC32C = 0 (bereits Null)
+
+    // Per-Block-CRC setzen
+    lbf_header_set_crc(blkbuf, pay);
+
+    // In temporäre Datei schreiben
+    var tmppath: pchar := "/tmp/lx29_test.lbf"c;
+    var wfd: int64 := open(tmppath, 65, 420);   // O_WRONLY|O_CREAT = 65 (1|64), mode 0644=420
+    if wfd < 0 { EPrintStrLn("FAIL: cannot create /tmp/lx29_test.lbf"); return 1; }
+    write(wfd, blkbuf, LBF_BLOCK_SIZE);
+    close(wfd);
+
+    // lbf_finalize_file_crc aufrufen
+    var ret: int64 := lbf_finalize_file_crc(tmppath);
+    if ret != 0 {
+        EPrintStrLn("FAIL: lbf_finalize_file_crc returned != 0"); return 1;
+    }
+
+    // Datei zurücklesen und prüfen
+    var rfd: int64 := open(tmppath, 0, 0);   // O_RDONLY = 0
+    if rfd < 0 { EPrintStrLn("FAIL: cannot reopen /tmp/lx29_test.lbf"); return 1; }
+    var rbuf: int64 := alloc(LBF_BLOCK_SIZE);
+    read(rfd, rbuf, LBF_BLOCK_SIZE);
+    close(rfd);
+
+    // Magic muss noch korrekt sein
+    if peek8(rbuf + LBF_H_MAGIC)     != LBF_MAGIC_0 { EPrintStrLn("FAIL: magic[0]"); return 1; }
+    if peek8(rbuf + LBF_H_MAGIC + 1) != LBF_MAGIC_1 { EPrintStrLn("FAIL: magic[1]"); return 1; }
+
+    // GEN_P_FILE_CRC32C darf nicht mehr Null sein (wurde befüllt)
+    var rpay: int64 := rbuf + LBF_HEADER_SIZE;
+    var fcrc: int64 := peek32(rpay + GEN_P_FILE_CRC32C) & 0xFFFFFFFF;
+    if fcrc == 0 {
+        EPrintStrLn("FAIL: GEN_P_FILE_CRC32C still 0 after finalize"); return 1;
+    }
+
+    // Block-Header-CRC muss valide sein (lbf_header_validate → 0)
+    if lbf_header_validate(rbuf) != 0 {
+        EPrintStrLn("FAIL: block header CRC invalid after finalize"); return 1;
+    }
+
+    // Zweiter Aufruf von lbf_finalize_file_crc auf dieselbe Datei → idempotent
+    ret := lbf_finalize_file_crc(tmppath);
+    if ret != 0 {
+        EPrintStrLn("FAIL: second lbf_finalize_file_crc returned != 0"); return 1;
+    }
+    var rfd2: int64 := open(tmppath, 0, 0);
+    var rbuf2: int64 := alloc(LBF_BLOCK_SIZE);
+    read(rfd2, rbuf2, LBF_BLOCK_SIZE);
+    close(rfd2);
+    // Datei byte-identisch nach zweitem Durchlauf (idempotent)
+    if cmpBytes(rbuf, rbuf2, LBF_BLOCK_SIZE) != 0 {
+        EPrintStrLn("FAIL: lbf_finalize_file_crc not idempotent"); return 1;
+    }
+
+    free(blkbuf, LBF_BLOCK_SIZE);
+    free(rbuf,   LBF_BLOCK_SIZE);
+    free(rbuf2,  LBF_BLOCK_SIZE);
+
+    PrintStrLn("lx29: supply chain security OK");
+    return 0;
+}

@@ -1,0 +1,479 @@
+// std/hl7/core.lyx — HL7 v2 MLLP Foundation + MSH/ACK Engine (WP-HL7-00)
+//
+// Public API:
+//   Hl7StateInit(state)
+//   MllpFrameWrite(buf, bufMax, msg, msgLen)          → int64 (bytes written / -1)
+//   MllpFrameRead(buf, bufLen, out, outMax)           → int64 (body bytes / -1)
+//   Hl7MshParse(msg, len, msh)                        → int64 (HL7_OK / error)
+//   Hl7AckWrite(msh, code, text, out, outMax)         → int64 (bytes written)
+//   Hl7DupCheck(state, partnerKey, ctrlId)            → int64 (1=dup 0=new)
+//   Hl7VersionCheck(msh)                              → int64 (HL7_OK / err)
+//   Hl7IsTestMsg(msh)                                 → int64 (1=test 0=prod)
+
+unit std.hl7.core;
+
+import std.alloc;
+
+// ── Error / status codes ─────────────────────────────────────────────────────
+pub con HL7_OK:           int64 := 0;
+pub con HL7_ERR_TRUNC:    int64 := 1;
+pub con HL7_ERR_SYNTAX:   int64 := 2;
+pub con HL7_ERR_DUP:      int64 := 3;
+pub con HL7_ERR_OVERFLOW: int64 := 4;
+pub con HL7_ERR_VERSION:  int64 := 5;
+
+// ── MLLP framing bytes ───────────────────────────────────────────────────────
+pub con HL7_MLLP_VT: int64 := 11;   // 0x0B
+pub con HL7_MLLP_FS: int64 := 28;   // 0x1C
+pub con HL7_MLLP_CR: int64 := 13;   // 0x0D
+
+// ── MSA code bytes (first char of 2-char code) ───────────────────────────────
+// Callers pass "AA"c, "AE"c, "AR"c as pchar literals
+pub con HL7_ACK_AA: int64 := 1;   // Application Accept
+pub con HL7_ACK_AE: int64 := 2;   // Application Error
+pub con HL7_ACK_AR: int64 := 3;   // Application Reject
+
+// ── Hl7Msh struct offsets (ptr+len per field, 16 bytes each) ─────────────────
+pub con HL7_MSH_SEND_APP:  int64 := 0;    // sending application
+pub con HL7_MSH_SEND_APP_LEN: int64 := 8;
+pub con HL7_MSH_SEND_FAC:  int64 := 16;   // sending facility
+pub con HL7_MSH_SEND_FAC_LEN: int64 := 24;
+pub con HL7_MSH_RECV_APP:  int64 := 32;   // receiving application
+pub con HL7_MSH_RECV_APP_LEN: int64 := 40;
+pub con HL7_MSH_RECV_FAC:  int64 := 48;   // receiving facility
+pub con HL7_MSH_RECV_FAC_LEN: int64 := 56;
+pub con HL7_MSH_DATETIME:  int64 := 64;
+pub con HL7_MSH_DATETIME_LEN: int64 := 72;
+pub con HL7_MSH_MSG_TYPE:  int64 := 80;   // e.g. "ADT"
+pub con HL7_MSH_MSG_TYPE_LEN: int64 := 88;
+pub con HL7_MSH_TRIGGER:   int64 := 96;   // e.g. "A01"
+pub con HL7_MSH_TRIGGER_LEN: int64 := 104;
+pub con HL7_MSH_CTRL_ID:   int64 := 112;
+pub con HL7_MSH_CTRL_ID_LEN: int64 := 120;
+pub con HL7_MSH_PROC_ID:   int64 := 128;  // P=prod T=test D=debug
+pub con HL7_MSH_PROC_ID_LEN: int64 := 136;
+pub con HL7_MSH_VERSION:   int64 := 144;
+pub con HL7_MSH_VERSION_LEN: int64 := 152;
+pub con HL7_MSH_CHARSET:   int64 := 160;
+pub con HL7_MSH_CHARSET_LEN: int64 := 168;
+pub con HL7_MSH_FIELD_SEP: int64 := 176;  // field separator byte (usually '|'=124)
+pub con HL7_MSH_COMP_SEP:  int64 := 184;  // component separator byte (usually '^'=94)
+pub con HL7_MSH_SIZE:       int64 := 192;
+
+// ── Dedup state layout ───────────────────────────────────────────────────────
+pub con HL7_DUP_RING:       int64 := 64;    // ring entries per partner
+pub con HL7_MAX_PARTNERS:   int64 := 16;
+// slot layout: key=8, ringPos=8, ring=64×8=512 → 528 bytes per slot
+pub con HL7_SLOT_KEY:    int64 := 0;
+pub con HL7_SLOT_RPOS:   int64 := 8;
+pub con HL7_SLOT_RING:   int64 := 16;
+pub con HL7_SLOT_SIZE:   int64 := 528;   // 16 + 64*8
+pub con HL7_STATE_SIZE:  int64 := 8448;  // 16 * 528
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+fn hlStrLen(s: int64): int64 {
+    var n: int64 := 0;
+    while (peek8(s + n) != 0) { n := n + 1; }
+    return n;
+}
+
+fn hlHash(s: int64, len: int64): int64 {
+    var h: int64 := 2166136261;
+    var i: int64 := 0;
+    while (i < len) {
+        h := (h * 16777619) + peek8(s + i);
+        i := i + 1;
+    }
+    return h;
+}
+
+// Write count bytes from src into dst, return count.
+fn hlCopy(dst: int64, src: int64, count: int64): int64 {
+    var i: int64 := 0;
+    while (i < count) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+    return count;
+}
+
+// Write ASCII decimal of n into buf; return bytes written.
+fn hlWriteInt(buf: int64, n: int64): int64 {
+    if (n == 0) { poke8(buf, 48); return 1; }
+    var tmp: int64 := alloc(24);
+    var pos: int64 := 0;
+    var v: int64 := n;
+    while (v > 0) {
+        poke8(tmp + pos, 48 + (v - (v / 10) * 10));
+        pos := pos + 1;
+        v := v / 10;
+    }
+    // reverse
+    var i: int64 := 0;
+    while (i < pos) {
+        poke8(buf + i, peek8(tmp + pos - 1 - i));
+        i := i + 1;
+    }
+    return pos;
+}
+
+// Write src (ptr, len) into dst, return len.
+fn hlWriteField(dst: int64, src: int64, srcLen: int64): int64 {
+    hlCopy(dst, src, srcLen);
+    return srcLen;
+}
+
+// Skip past 'sep' in buf[pos..bufLen]; return new pos (first char of next field).
+fn hlSkipToSep(buf: int64, bufLen: int64, pos: int64, sep: int64): int64 {
+    var p: int64 := pos;
+    while (p < bufLen && peek8(buf + p) != sep) { p := p + 1; }
+    return p;
+}
+
+// Find field n (1-based) in HL7 segment; sep is field separator byte.
+// Returns start of field content in *outPtr, length in *outLen.
+fn hlGetField(buf: int64, bufLen: int64, sep: int64, fieldNum: int64, outPtr: int64, outLen: int64) {
+    var pos:  int64 := 0;
+    var fnum: int64 := 0;
+    // Skip the segment tag (field 0)
+    while (pos < bufLen && peek8(buf + pos) != sep) { pos := pos + 1; }
+    // Now scan fields
+    while (pos < bufLen && fnum < fieldNum) {
+        pos := pos + 1;   // skip sep
+        fnum := fnum + 1;
+        if (fnum == fieldNum) {
+            var start: int64 := pos;
+            while (pos < bufLen && peek8(buf + pos) != sep && peek8(buf + pos) != 13 && peek8(buf + pos) != 10) {
+                pos := pos + 1;
+            }
+            poke64(outPtr, buf + start);
+            poke64(outLen, pos - start);
+            return;
+        }
+        while (pos < bufLen && peek8(buf + pos) != sep && peek8(buf + pos) != 13) {
+            pos := pos + 1;
+        }
+    }
+    poke64(outPtr, 0);
+    poke64(outLen, 0);
+}
+
+// Get component n (1-based) from a field value; compSep is component separator.
+fn hlGetComp(fldPtr: int64, fldLen: int64, compSep: int64, compNum: int64, outPtr: int64, outLen: int64) {
+    var pos:  int64 := 0;
+    var cnum: int64 := 1;
+    var start: int64 := 0;
+    while (cnum < compNum && pos < fldLen) {
+        if (peek8(fldPtr + pos) == compSep) { cnum := cnum + 1; start := pos + 1; }
+        pos := pos + 1;
+    }
+    var end: int64 := start;
+    while (end < fldLen && peek8(fldPtr + end) != compSep) { end := end + 1; }
+    poke64(outPtr, fldPtr + start);
+    poke64(outLen, end - start);
+}
+
+// Find partner slot in state; return slot ptr or -1 if full.
+fn hlPartnerSlot(state: int64, partnerKey: int64): int64 {
+    var i:    int64 := 0;
+    var free: int64 := 0 - 1;
+    while (i < HL7_MAX_PARTNERS) {
+        var slot: int64 := state + i * HL7_SLOT_SIZE;
+        var key:  int64 := peek64(slot + HL7_SLOT_KEY);
+        if (key == partnerKey) { return slot; }
+        if (key == 0 && free == 0 - 1) { free := slot; }
+        i := i + 1;
+    }
+    if (free != 0 - 1) {
+        poke64(free + HL7_SLOT_KEY, partnerKey);
+        return free;
+    }
+    return 0 - 1;
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// Zero dedup state (call before first use).
+pub fn Hl7StateInit(state: int64) {
+    var i: int64 := 0;
+    while (i < HL7_STATE_SIZE) { poke8(state + i, 0); i := i + 1; }
+}
+
+// Write MLLP frame: VT + msg + FS + CR into buf.
+// Returns total bytes written, or -1 if buf too small.
+pub fn MllpFrameWrite(buf: int64, bufMax: int64, msg: int64, msgLen: int64): int64 {
+    if (bufMax < msgLen + 3) { return 0 - 1; }
+    poke8(buf, HL7_MLLP_VT);
+    hlCopy(buf + 1, msg, msgLen);
+    poke8(buf + 1 + msgLen, HL7_MLLP_FS);
+    poke8(buf + 2 + msgLen, HL7_MLLP_CR);
+    return msgLen + 3;
+}
+
+// Extract HL7 message body from MLLP-framed buffer.
+// Scans for VT, then reads until FS+CR. Writes body into out.
+// Returns body length, or -1 if no valid frame found, -2 if out too small.
+pub fn MllpFrameRead(buf: int64, bufLen: int64, out: int64, outMax: int64): int64 {
+    var i: int64 := 0;
+    // find VT
+    while (i < bufLen && peek8(buf + i) != HL7_MLLP_VT) { i := i + 1; }
+    if (i >= bufLen) { return 0 - 1; }
+    i := i + 1;   // skip VT
+    var start: int64 := i;
+    // find FS+CR
+    var done:  int64 := 0;
+    var fsPos: int64 := 0 - 1;
+    while (i < bufLen && done == 0) {
+        if (peek8(buf + i) == HL7_MLLP_FS) {
+            if (i + 1 < bufLen && peek8(buf + i + 1) == HL7_MLLP_CR) {
+                fsPos := i;
+                done := 1;
+            }
+        }
+        if (done == 0) { i := i + 1; }
+    }
+    if (fsPos == 0 - 1) { return 0 - 1; }
+    var bodyLen: int64 := fsPos - start;
+    if (bodyLen > outMax) { return 0 - 2; }
+    hlCopy(out, buf + start, bodyLen);
+    return bodyLen;
+}
+
+// Parse MSH segment into msh struct.
+// msg must start at "MSH". Returns HL7_OK or HL7_ERR_SYNTAX.
+pub fn Hl7MshParse(msg: int64, len: int64, msh: int64): int64 {
+    if (len < 8) { return HL7_ERR_SYNTAX; }
+    // verify "MSH"
+    if (peek8(msg) != 77) { return HL7_ERR_SYNTAX; }   // 'M'
+    if (peek8(msg+1) != 83) { return HL7_ERR_SYNTAX; } // 'S'
+    if (peek8(msg+2) != 72) { return HL7_ERR_SYNTAX; } // 'H'
+    var fsep: int64 := peek8(msg + 3) as int64;   // MSH-1: field separator
+    var csep: int64 := peek8(msg + 4) as int64;   // MSH-2.1: component separator
+    poke64(msh + HL7_MSH_FIELD_SEP, fsep);
+    poke64(msh + HL7_MSH_COMP_SEP, csep);
+    // temp storage for field pointers
+    var fptr: int64 := alloc(16);
+    var flen: int64 := alloc(16);
+    // MSH-3: Sending Application (hlGetField fieldNum = MSH-N minus 1)
+    hlGetField(msg, len, fsep, 2, fptr, flen);
+    poke64(msh + HL7_MSH_SEND_APP, peek64(fptr));
+    poke64(msh + HL7_MSH_SEND_APP_LEN, peek64(flen));
+    // MSH-4: Sending Facility
+    hlGetField(msg, len, fsep, 3, fptr, flen);
+    poke64(msh + HL7_MSH_SEND_FAC, peek64(fptr));
+    poke64(msh + HL7_MSH_SEND_FAC_LEN, peek64(flen));
+    // MSH-5: Receiving Application
+    hlGetField(msg, len, fsep, 4, fptr, flen);
+    poke64(msh + HL7_MSH_RECV_APP, peek64(fptr));
+    poke64(msh + HL7_MSH_RECV_APP_LEN, peek64(flen));
+    // MSH-6: Receiving Facility
+    hlGetField(msg, len, fsep, 5, fptr, flen);
+    poke64(msh + HL7_MSH_RECV_FAC, peek64(fptr));
+    poke64(msh + HL7_MSH_RECV_FAC_LEN, peek64(flen));
+    // MSH-7: DateTime
+    hlGetField(msg, len, fsep, 6, fptr, flen);
+    poke64(msh + HL7_MSH_DATETIME, peek64(fptr));
+    poke64(msh + HL7_MSH_DATETIME_LEN, peek64(flen));
+    // MSH-9: Message Type (components: MsgType^TriggerEvent^Structure)
+    hlGetField(msg, len, fsep, 8, fptr, flen);
+    var f9ptr: int64 := peek64(fptr);
+    var f9len: int64 := peek64(flen);
+    var cptr: int64 := alloc(16);
+    var clen: int64 := alloc(16);
+    hlGetComp(f9ptr, f9len, csep, 1, cptr, clen);
+    poke64(msh + HL7_MSH_MSG_TYPE, peek64(cptr));
+    poke64(msh + HL7_MSH_MSG_TYPE_LEN, peek64(clen));
+    hlGetComp(f9ptr, f9len, csep, 2, cptr, clen);
+    poke64(msh + HL7_MSH_TRIGGER, peek64(cptr));
+    poke64(msh + HL7_MSH_TRIGGER_LEN, peek64(clen));
+    // MSH-10: Control ID
+    hlGetField(msg, len, fsep, 9, fptr, flen);
+    poke64(msh + HL7_MSH_CTRL_ID, peek64(fptr));
+    poke64(msh + HL7_MSH_CTRL_ID_LEN, peek64(flen));
+    // MSH-11: Processing ID
+    hlGetField(msg, len, fsep, 10, fptr, flen);
+    poke64(msh + HL7_MSH_PROC_ID, peek64(fptr));
+    poke64(msh + HL7_MSH_PROC_ID_LEN, peek64(flen));
+    // MSH-12: Version
+    hlGetField(msg, len, fsep, 11, fptr, flen);
+    poke64(msh + HL7_MSH_VERSION, peek64(fptr));
+    poke64(msh + HL7_MSH_VERSION_LEN, peek64(flen));
+    // MSH-18: Character Set
+    hlGetField(msg, len, fsep, 17, fptr, flen);
+    poke64(msh + HL7_MSH_CHARSET, peek64(fptr));
+    poke64(msh + HL7_MSH_CHARSET_LEN, peek64(flen));
+    return HL7_OK;
+}
+
+// Generate ACK/NACK response from incoming msh.
+// code: "AA"c=accept, "AE"c=error, "AR"c=reject (pchar, 2 bytes used).
+// text: freetext for MSA-3 (pchar, null-terminated).
+// Returns bytes written or -1 on overflow.
+pub fn Hl7AckWrite(msh: int64, code: int64, text: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var fsep: int64 := peek64(msh + HL7_MSH_FIELD_SEP);
+    var csep: int64 := peek64(msh + HL7_MSH_COMP_SEP);
+    if (fsep == 0) { fsep := 124; }   // default '|'
+    if (csep == 0) { csep := 94; }    // default '^'
+    // MSH segment header
+    poke8(out + pos, 77); pos := pos + 1;  // M
+    poke8(out + pos, 83); pos := pos + 1;  // S
+    poke8(out + pos, 72); pos := pos + 1;  // H
+    poke8(out + pos, fsep); pos := pos + 1;
+    poke8(out + pos, csep); pos := pos + 1;
+    poke8(out + pos, 126); pos := pos + 1; // ~
+    poke8(out + pos, 92);  pos := pos + 1; // backslash
+    poke8(out + pos, 38);  pos := pos + 1; // &
+    poke8(out + pos, fsep); pos := pos + 1;
+    // Swap: recv → send, send → recv
+    var rAppPtr: int64 := peek64(msh + HL7_MSH_RECV_APP);
+    var rAppLen: int64 := peek64(msh + HL7_MSH_RECV_APP_LEN);
+    var rFacPtr: int64 := peek64(msh + HL7_MSH_RECV_FAC);
+    var rFacLen: int64 := peek64(msh + HL7_MSH_RECV_FAC_LEN);
+    var sAppPtr: int64 := peek64(msh + HL7_MSH_SEND_APP);
+    var sAppLen: int64 := peek64(msh + HL7_MSH_SEND_APP_LEN);
+    var sFacPtr: int64 := peek64(msh + HL7_MSH_SEND_FAC);
+    var sFacLen: int64 := peek64(msh + HL7_MSH_SEND_FAC_LEN);
+    // MSH-3 (our app = orig recv app)
+    pos := pos + hlWriteField(out + pos, rAppPtr, rAppLen);
+    poke8(out + pos, fsep); pos := pos + 1;
+    // MSH-4 (our fac = orig recv fac)
+    pos := pos + hlWriteField(out + pos, rFacPtr, rFacLen);
+    poke8(out + pos, fsep); pos := pos + 1;
+    // MSH-5 (dest app = orig send app)
+    pos := pos + hlWriteField(out + pos, sAppPtr, sAppLen);
+    poke8(out + pos, fsep); pos := pos + 1;
+    // MSH-6 (dest fac = orig send fac)
+    pos := pos + hlWriteField(out + pos, sFacPtr, sFacLen);
+    poke8(out + pos, fsep); pos := pos + 1;
+    // MSH-7 datetime (empty for simplicity)
+    poke8(out + pos, fsep); pos := pos + 1;
+    // MSH-8 security (empty)
+    poke8(out + pos, fsep); pos := pos + 1;
+    // MSH-9 ACK^<trigger>
+    poke8(out + pos, 65); pos := pos + 1;  // A
+    poke8(out + pos, 67); pos := pos + 1;  // C
+    poke8(out + pos, 75); pos := pos + 1;  // K
+    poke8(out + pos, csep); pos := pos + 1;
+    var trigPtr: int64 := peek64(msh + HL7_MSH_TRIGGER);
+    var trigLen: int64 := peek64(msh + HL7_MSH_TRIGGER_LEN);
+    pos := pos + hlWriteField(out + pos, trigPtr, trigLen);
+    poke8(out + pos, fsep); pos := pos + 1;
+    // MSH-10 new control ID (use "ACK" as placeholder)
+    poke8(out + pos, 65); pos := pos + 1;  // A
+    poke8(out + pos, 67); pos := pos + 1;  // C
+    poke8(out + pos, 75); pos := pos + 1;  // K
+    poke8(out + pos, fsep); pos := pos + 1;
+    // MSH-11 processing id (copy from incoming)
+    var procPtr: int64 := peek64(msh + HL7_MSH_PROC_ID);
+    var procLen: int64 := peek64(msh + HL7_MSH_PROC_ID_LEN);
+    if (procLen > 0) {
+        pos := pos + hlWriteField(out + pos, procPtr, procLen);
+    } else {
+        poke8(out + pos, 80); pos := pos + 1;  // P
+    }
+    poke8(out + pos, fsep); pos := pos + 1;
+    // MSH-12 version (copy from incoming or default 2.5.1)
+    var verPtr: int64 := peek64(msh + HL7_MSH_VERSION);
+    var verLen: int64 := peek64(msh + HL7_MSH_VERSION_LEN);
+    if (verLen > 0) {
+        pos := pos + hlWriteField(out + pos, verPtr, verLen);
+    } else {
+        // "2.5.1"
+        poke8(out + pos, 50); pos := pos + 1;
+        poke8(out + pos, 46); pos := pos + 1;
+        poke8(out + pos, 53); pos := pos + 1;
+        poke8(out + pos, 46); pos := pos + 1;
+        poke8(out + pos, 49); pos := pos + 1;
+    }
+    poke8(out + pos, 13); pos := pos + 1;  // CR (segment terminator)
+    // MSA segment: MSA|<code>|<orig_ctrl_id>|<text>
+    poke8(out + pos, 77); pos := pos + 1;  // M
+    poke8(out + pos, 83); pos := pos + 1;  // S
+    poke8(out + pos, 65); pos := pos + 1;  // A
+    poke8(out + pos, fsep); pos := pos + 1;
+    // code (2 chars)
+    poke8(out + pos, peek8(code));     pos := pos + 1;
+    poke8(out + pos, peek8(code + 1)); pos := pos + 1;
+    poke8(out + pos, fsep); pos := pos + 1;
+    // original control ID
+    var ctrlPtr: int64 := peek64(msh + HL7_MSH_CTRL_ID);
+    var ctrlLen: int64 := peek64(msh + HL7_MSH_CTRL_ID_LEN);
+    pos := pos + hlWriteField(out + pos, ctrlPtr, ctrlLen);
+    poke8(out + pos, fsep); pos := pos + 1;
+    // text (null-terminated)
+    if (text != 0) {
+        var tlen: int64 := hlStrLen(text);
+        pos := pos + hlCopy(out + pos, text, tlen);
+    }
+    poke8(out + pos, 13); pos := pos + 1;  // CR
+    return pos;
+}
+
+// Dedup check: returns 1 if (partnerKey, ctrlId) was seen before, 0 if new.
+// Side effect: registers the pair as seen when returning 0.
+// state must be initialized with Hl7StateInit.
+pub fn Hl7DupCheck(state: int64, partnerKey: int64, ctrlId: int64): int64 {
+    var slot: int64 := hlPartnerSlot(state, partnerKey);
+    if (slot == 0 - 1) { return 0; }
+    var idLen:   int64 := hlStrLen(ctrlId);
+    var idHash:  int64 := hlHash(ctrlId, idLen);
+    var ringBase: int64 := slot + HL7_SLOT_RING;
+    var ringPos:  int64 := peek64(slot + HL7_SLOT_RPOS);
+    var i:     int64 := 0;
+    var found: int64 := 0;
+    while (i < HL7_DUP_RING && found == 0) {
+        if (peek64(ringBase + i * 8) == idHash) { found := 1; }
+        i := i + 1;
+    }
+    if (found == 1) { return 1; }
+    poke64(ringBase + ringPos * 8, idHash);
+    var nextPos: int64 := ringPos + 1;
+    if (nextPos >= HL7_DUP_RING) { nextPos := 0; }
+    poke64(slot + HL7_SLOT_RPOS, nextPos);
+    return 0;
+}
+
+// Returns HL7_OK if version in msh is a known supported version.
+// Supported: 2.3.1, 2.4, 2.5, 2.5.1, 2.6, 2.7
+pub fn Hl7VersionCheck(msh: int64): int64 {
+    var vptr: int64 := peek64(msh + HL7_MSH_VERSION);
+    var vlen: int64 := peek64(msh + HL7_MSH_VERSION_LEN);
+    if (vlen == 0) { return HL7_ERR_VERSION; }
+    // check first byte = '2'
+    if (peek8(vptr) != 50) { return HL7_ERR_VERSION; }
+    if (vlen < 3) { return HL7_ERR_VERSION; }
+    if (peek8(vptr + 1) != 46) { return HL7_ERR_VERSION; }  // '.'
+    var minor: int64 := peek8(vptr + 2) as int64;
+    // minor must be 3, 4, 5, 6, or 7
+    if (minor < 51 || minor > 55) {  // '3'..'7'
+        // also allow '5' (2.5 and 2.5.1) — already in range
+        return HL7_ERR_VERSION;
+    }
+    return HL7_OK;
+}
+
+// Returns 1 if MSH-11 (Processing ID) starts with 'T' (test message).
+// Test messages must NOT be written to production database.
+pub fn Hl7IsTestMsg(msh: int64): int64 {
+    var ptr: int64 := peek64(msh + HL7_MSH_PROC_ID);
+    var len: int64 := peek64(msh + HL7_MSH_PROC_ID_LEN);
+    if (len == 0) { return 0; }
+    if (peek8(ptr) == 84) { return 1; }  // 'T'
+    return 0;
+}
+
+// Returns 1 if MSH-18 (Character Set) indicates UTF-8.
+// HL7 v2 default (when MSH-18 absent) is ISO-8859-1, NOT UTF-8.
+pub fn Hl7IsUtf8(msh: int64): int64 {
+    var ptr: int64 := peek64(msh + HL7_MSH_CHARSET);
+    var len: int64 := peek64(msh + HL7_MSH_CHARSET_LEN);
+    if (len < 7) { return 0; }
+    // Check for "UNICODE" prefix
+    if (peek8(ptr)   != 85) { return 0; }  // U
+    if (peek8(ptr+1) != 78) { return 0; }  // N
+    if (peek8(ptr+2) != 73) { return 0; }  // I
+    if (peek8(ptr+3) != 67) { return 0; }  // C
+    if (peek8(ptr+4) != 79) { return 0; }  // O
+    if (peek8(ptr+5) != 68) { return 0; }  // D
+    if (peek8(ptr+6) != 69) { return 0; }  // E
+    return 1;
+}

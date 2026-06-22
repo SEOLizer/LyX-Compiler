@@ -1,0 +1,222 @@
+// tests/usb_wp5_test.lyx
+// WP-5: Bulk-Transfers
+//
+// Abnahmekriterien:
+// AC-1: BulkWrite(fd, 0x01, data, len, 1000) sendet an EP1 OUT
+// AC-2: BulkRead(fd, 0x81, buffer, len, 1000) empfängt von EP1 IN
+// AC-3: Bei Timeout negativer Rückgabewert (kein Hängen)
+// AC-4: Write-Read mit USB-Serial-Loopback (erfordert echte Hardware)
+//
+// Hardware-unabhängige Tests: IOCTL-Code, Struct-Layout, Fehlerbehandlung.
+
+unit tests.usb_wp5_test;
+
+import std.hardware.usb_bulk;
+import std.alloc;
+
+// ============================================================
+// IOCTL-Konstante verifizieren
+// USBDEVFS_BULK = _IOW('U', 2, usbdevfs_bulktransfer)
+// sizeof = 24 → (1<<30)|(24<<16)|(0x55<<8)|2 = 0x40185502
+// ============================================================
+fn testIoctlConstant(): int64 {
+  var expected: int64 := (1 << 30) | (24 << 16) | (0x55 << 8) | 2;
+  if (USBDEVFS_BULK != expected) {
+    PrintLn("FAIL: USBDEVFS_BULK value wrong");
+    return 1;
+  }
+  PrintLn("OK: USBDEVFS_BULK = 0x40185502");
+  return 0;
+}
+
+// ============================================================
+// Struct-Größe: 24 Bytes
+// ============================================================
+fn testStructSize(): int64 {
+  if (USB_BULK_STRUCT_SIZE != 24) {
+    PrintLn("FAIL: USB_BULK_STRUCT_SIZE != 24");
+    return 1;
+  }
+  PrintLn("OK: USB_BULK_STRUCT_SIZE = 24");
+  return 0;
+}
+
+// ============================================================
+// usbdevfs_bulktransfer Struct-Layout
+//   +0:  ep      (uint32)
+//   +4:  len     (uint32)
+//   +8:  timeout (uint32)
+//   +12: _pad    (uint32) = 0
+//   +16: data    (pointer, 8 Bytes)
+// ============================================================
+fn testStructLayout(): int64 {
+  var buf: int64 := alloc(USB_BULK_STRUCT_SIZE);
+  var failed: int64 := 0;
+  var fakeData: int64 := 0x0ABCDEF0;
+
+  UsbBuildBulkTransfer(buf, 0x81, fakeData, 512, 2000);
+
+  // +0: ep = 0x81
+  if ((peek32(buf) & 0xFFFFFFFF) != 0x81) {
+    PrintLn("FAIL: +0 ep != 0x81");
+    failed := failed + 1;
+  }
+  // +4: len = 512
+  if ((peek32(buf + 4) & 0xFFFFFFFF) != 512) {
+    PrintLn("FAIL: +4 len != 512");
+    failed := failed + 1;
+  }
+  // +8: timeout = 2000
+  if ((peek32(buf + 8) & 0xFFFFFFFF) != 2000) {
+    PrintLn("FAIL: +8 timeout != 2000");
+    failed := failed + 1;
+  }
+  // +12: _pad = 0
+  if ((peek32(buf + 12) & 0xFFFFFFFF) != 0) {
+    PrintLn("FAIL: +12 _pad != 0");
+    failed := failed + 1;
+  }
+  // +16: data pointer
+  if (peek64(buf + 16) != fakeData) {
+    PrintLn("FAIL: +16 data pointer mismatch");
+    failed := failed + 1;
+  }
+
+  free(buf, USB_BULK_STRUCT_SIZE);
+  if (failed == 0) { PrintLn("OK: bulkTransfer struct layout (24 bytes)"); }
+  return failed;
+}
+
+// ============================================================
+// OUT-Endpunkt: ep-Feld hat Bit 7 = 0
+// ============================================================
+fn testOutEndpointEpField(): int64 {
+  var buf: int64 := alloc(USB_BULK_STRUCT_SIZE);
+  var dummy: int64 := alloc(64);
+  UsbBuildBulkTransfer(buf, 0x02, dummy, 64, 1000);  // OUT EP 2
+  var ep: int64 := peek32(buf) & 0xFF;
+  free(buf, USB_BULK_STRUCT_SIZE);
+  free(dummy, 64);
+
+  if ((ep & 0x80) != 0) {
+    PrintLn("FAIL: OUT endpoint should have bit 7 = 0");
+    return 1;
+  }
+  if ((ep & 0x0F) != 2) {
+    PrintLn("FAIL: OUT endpoint number should be 2");
+    return 1;
+  }
+  PrintLn("OK: OUT endpoint (bit 7 = 0)");
+  return 0;
+}
+
+// ============================================================
+// IN-Endpunkt: ep-Feld hat Bit 7 = 1
+// ============================================================
+fn testInEndpointEpField(): int64 {
+  var buf: int64 := alloc(USB_BULK_STRUCT_SIZE);
+  var dummy: int64 := alloc(64);
+  UsbBuildBulkTransfer(buf, 0x82, dummy, 64, 1000);  // IN EP 2
+  var ep: int64 := peek32(buf) & 0xFF;
+  free(buf, USB_BULK_STRUCT_SIZE);
+  free(dummy, 64);
+
+  if ((ep & 0x80) == 0) {
+    PrintLn("FAIL: IN endpoint should have bit 7 = 1");
+    return 1;
+  }
+  if ((ep & 0x0F) != 2) {
+    PrintLn("FAIL: IN endpoint number should be 2");
+    return 1;
+  }
+  PrintLn("OK: IN endpoint (bit 7 = 1)");
+  return 0;
+}
+
+// ============================================================
+// AC-3: fd=-1 → alle Operationen geben negativen Wert zurück
+// (kein Hängen, sofortige Fehlerantwort)
+// ============================================================
+fn testInvalidFdNegative(): int64 {
+  var failed: int64 := 0;
+  var buf: int64 := alloc(64);
+
+  var r1: int64 := UsbBulkTransfer(-1, 0x01, buf, 64, 1000);
+  if (r1 >= 0) {
+    PrintLn("FAIL: BulkTransfer(fd=-1) should be negative");
+    failed := failed + 1;
+  }
+
+  var r2: int64 := UsbBulkWrite(-1, 0x01, buf, 64, 1000);
+  if (r2 >= 0) {
+    PrintLn("FAIL: BulkWrite(fd=-1) should be negative");
+    failed := failed + 1;
+  }
+
+  var r3: int64 := UsbBulkRead(-1, 0x81, buf, 64, 1000);
+  if (r3 >= 0) {
+    PrintLn("FAIL: BulkRead(fd=-1) should be negative");
+    failed := failed + 1;
+  }
+
+  free(buf, 64);
+  if (failed == 0) { PrintLn("OK: invalid fd → negative return (AC-3)"); }
+  return failed;
+}
+
+// ============================================================
+// UsbBulkWrite und UsbBulkRead sind symmetrische Wrapper
+// (selbe Struct-Felder, nur ep-Adresse unterscheidet sich)
+// ============================================================
+fn testWriteReadSymmetry(): int64 {
+  var wBuf: int64 := alloc(USB_BULK_STRUCT_SIZE);
+  var rBuf: int64 := alloc(USB_BULK_STRUCT_SIZE);
+  var data: int64 := alloc(8);
+
+  UsbBuildBulkTransfer(wBuf, 0x01, data, 8, 500);  // OUT
+  UsbBuildBulkTransfer(rBuf, 0x81, data, 8, 500);  // IN
+
+  var failed: int64 := 0;
+
+  // Write: ep bit 7 = 0
+  var wEp: int64 := peek32(wBuf) & 0xFF;
+  if ((wEp & 0x80) != 0) { PrintLn("FAIL: write ep bit 7 != 0"); failed := failed + 1; }
+
+  // Read: ep bit 7 = 1
+  var rEp: int64 := peek32(rBuf) & 0xFF;
+  if ((rEp & 0x80) == 0) { PrintLn("FAIL: read ep bit 7 != 1"); failed := failed + 1; }
+
+  // Beide haben gleiche len und timeout
+  var wLen: int64 := peek32(wBuf + 4) & 0xFFFFFFFF;
+  var rLen: int64 := peek32(rBuf + 4) & 0xFFFFFFFF;
+  if (wLen != 8 || rLen != 8) { PrintLn("FAIL: len mismatch"); failed := failed + 1; }
+
+  var wTo: int64 := peek32(wBuf + 8) & 0xFFFFFFFF;
+  var rTo: int64 := peek32(rBuf + 8) & 0xFFFFFFFF;
+  if (wTo != 500 || rTo != 500) { PrintLn("FAIL: timeout mismatch"); failed := failed + 1; }
+
+  free(wBuf, USB_BULK_STRUCT_SIZE);
+  free(rBuf, USB_BULK_STRUCT_SIZE);
+  free(data, 8);
+
+  if (failed == 0) { PrintLn("OK: BulkWrite/BulkRead symmetry"); }
+  return failed;
+}
+
+fn main(): int64 {
+  var failed: int64 := 0;
+  failed := failed + testIoctlConstant();
+  failed := failed + testStructSize();
+  failed := failed + testStructLayout();
+  failed := failed + testOutEndpointEpField();
+  failed := failed + testInEndpointEpField();
+  failed := failed + testInvalidFdNegative();
+  failed := failed + testWriteReadSymmetry();
+
+  if (failed != 0) {
+    PrintLn("FAILED");
+    return 1;
+  }
+  PrintLn("ALL PASSED");
+  return 0;
+}

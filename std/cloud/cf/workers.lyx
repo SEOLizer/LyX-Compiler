@@ -1,0 +1,426 @@
+// std/cloud/cf/workers.lyx — Cloudflare Workers scripts, routes, secrets, cron
+// WP-CF-07
+
+unit std.cloud.cf.workers;
+
+import std.cloud.cf.transport;
+import std.cloud.cf.core;
+import std.alloc;
+import std.io;
+
+pub type CFWorkerScript = struct {
+    name:     int64;  // pchar
+    etag:     int64;  // pchar
+    size:     int64;
+    modified: int64;  // pchar
+};
+
+pub type CFWorkerRoute = struct {
+    id:      int64;  // pchar
+    pattern: int64;  // pchar
+    script:  int64;  // pchar
+};
+
+fn wkFreeIfSet(p: int64) {
+    if (p != 0) { free(p, StrLen(p as pchar)+1); }
+}
+
+pub fn CFWorkerScriptFree(s: CFWorkerScript) {
+    wkFreeIfSet(s.name); wkFreeIfSet(s.etag); wkFreeIfSet(s.modified);
+}
+pub fn CFWorkerRouteFree(r: CFWorkerRoute) {
+    wkFreeIfSet(r.id); wkFreeIfSet(r.pattern); wkFreeIfSet(r.script);
+}
+
+fn workerPath(accountId: pchar, scriptName: pchar): int64 {
+    var buf: int64 := alloc(512);
+    var off: int64 := cftAppend(buf, 0, "/accounts/"c);
+    off := cftAppend(buf, off, accountId);
+    off := cftAppend(buf, off, "/workers/scripts/"c);
+    off := cftAppend(buf, off, scriptName);
+    poke8(buf+off, 0); return buf;
+}
+
+// Script management
+
+pub fn WorkerDeploy(c: CFClient, accountId: pchar,
+                    scriptName: pchar, script: int64, scriptLen: int64): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    var r: CFResponse := CFPutRaw(c, path as pchar, "application/javascript"c, script, scriptLen);
+    free(path, 512);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn WorkerDeployModule(c: CFClient, accountId: pchar,
+                           scriptName: pchar,
+                           moduleScript: int64, scriptLen: int64,
+                           metadata: pchar): int64 {
+    // multipart/form-data: metadata JSON + script as ES module
+    var path: int64 := workerPath(accountId, scriptName);
+    var boundary: pchar := "lyxcf-worker-boundary"c;
+    var metaStr: pchar := metadata;
+    if (metaStr == 0 as pchar) { metaStr := "{\"main_module\":\"worker.mjs\"}"c; }
+    var ml: int64 := StrLen(metaStr);
+    var body: int64 := alloc(scriptLen + ml + 512);
+    var off: int64 := cftAppend(body, 0, "--"c);
+    off := cftAppend(body, off, boundary);
+    off := cftAppend(body, off, "\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n"c);
+    off := cftAppend(body, off, metaStr);
+    off := cftAppend(body, off, "\r\n--"c);
+    off := cftAppend(body, off, boundary);
+    off := cftAppend(body, off, "\r\nContent-Disposition: form-data; name=\"worker.mjs\"; filename=\"worker.mjs\"\r\nContent-Type: application/javascript+module\r\n\r\n"c);
+    off := cftAppendN(body, off, moduleScript, scriptLen);
+    off := cftAppend(body, off, "\r\n--"c);
+    off := cftAppend(body, off, boundary);
+    off := cftAppend(body, off, "--\r\n"c); poke8(body+off, 0);
+    var ctBuf: int64 := alloc(128);
+    var cto: int64 := cftAppend(ctBuf, 0, "multipart/form-data; boundary="c);
+    cto := cftAppend(ctBuf, cto, boundary); poke8(ctBuf+cto, 0);
+    var r: CFResponse := CFPutRaw(c, path as pchar, ctBuf as pchar, body, off);
+    free(path, 512); free(body, scriptLen+ml+512); free(ctBuf, 128);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn WorkerDeployWithBindings(c: CFClient, accountId: pchar,
+                                  scriptName: pchar,
+                                  script: int64, scriptLen: int64,
+                                  bindingsJson: pchar, bindingsLen: int64): int64 {
+    var meta: int64 := alloc(bindingsLen + 128);
+    var mo: int64 := cftAppend(meta, 0, "{\"main_module\":\"worker.js\",\"bindings\":"c);
+    mo := cftAppendN(meta, mo, bindingsJson as int64, bindingsLen);
+    mo := cftAppend(meta, mo, "}"c); poke8(meta+mo, 0);
+    var result: int64 := WorkerDeployModule(c, accountId, scriptName, script, scriptLen, meta as pchar);
+    free(meta, bindingsLen+128);
+    return result;
+}
+
+pub fn WorkerDelete(c: CFClient, accountId: pchar, scriptName: pchar): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn WorkerGet(c: CFClient, accountId: pchar, scriptName: pchar): CFWorkerScript {
+    var path: int64 := workerPath(accountId, scriptName);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var s: CFWorkerScript; s.name:=0; s.etag:=0; s.size:=0; s.modified:=0;
+    if (r.success == 1 && r.result != 0) {
+        s.name     := cfExtractValue(r.result, r.resultLen, "id"c);
+        s.etag     := cfExtractValue(r.result, r.resultLen, "etag"c);
+        s.size     := cfExtractInt(r.result, r.resultLen, "size"c);
+        s.modified := cfExtractValue(r.result, r.resultLen, "modified_on"c);
+    }
+    CFResponseFree(r); return s;
+}
+
+pub fn WorkerList(c: CFClient, accountId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/workers/scripts"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}
+
+pub fn WorkerDownload(c: CFClient, accountId: pchar, scriptName: pchar): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    // GET with Accept: application/javascript
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var result: int64 := 0;
+    if (r.statusCode == 200 && r.result != 0) {
+        result = cftDupN(r.result, r.resultLen);
+    }
+    CFResponseFree(r); return result;
+}
+
+// Worker Routes (zone-level)
+
+pub fn WorkerRouteCreate(c: CFClient, zoneId: pchar,
+                          pattern: pchar, scriptName: pchar): CFWorkerRoute {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/workers/routes"c); poke8(path+po, 0);
+    var jp: int64 := cfJsonEscape(pattern);
+    var js: int64 := cfJsonEscape(scriptName);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"pattern\":\""c);
+    off := cftAppend(body, off, jp as pchar);
+    off := cftAppend(body, off, "\",\"script\":\""c);
+    off := cftAppend(body, off, js as pchar);
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    wkFreeIfSet(jp); wkFreeIfSet(js);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 512);
+    var route: CFWorkerRoute; route.id:=0; route.pattern:=0; route.script:=0;
+    if (r.success == 1 && r.result != 0) {
+        route.id      := cfExtractValue(r.result, r.resultLen, "id"c);
+        route.pattern := cfExtractValue(r.result, r.resultLen, "pattern"c);
+        route.script  := cfExtractValue(r.result, r.resultLen, "script"c);
+    }
+    CFResponseFree(r); return route;
+}
+
+pub fn WorkerRouteUpdate(c: CFClient, zoneId: pchar, routeId: pchar,
+                          pattern: pchar, scriptName: pchar): CFWorkerRoute {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/workers/routes/"c);
+    po := cftAppend(path, po, routeId); poke8(path+po, 0);
+    var jp: int64 := cfJsonEscape(pattern);
+    var js: int64 := cfJsonEscape(scriptName);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"pattern\":\""c);
+    off := cftAppend(body, off, jp as pchar);
+    off := cftAppend(body, off, "\",\"script\":\""c);
+    off := cftAppend(body, off, js as pchar);
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    wkFreeIfSet(jp); wkFreeIfSet(js);
+    var r: CFResponse := CFPut(c, path as pchar, body, off);
+    free(path, 256); free(body, 512);
+    var route: CFWorkerRoute; route.id:=0; route.pattern:=0; route.script:=0;
+    if (r.success == 1 && r.result != 0) {
+        route.id      := cfExtractValue(r.result, r.resultLen, "id"c);
+        route.pattern := cfExtractValue(r.result, r.resultLen, "pattern"c);
+        route.script  := cfExtractValue(r.result, r.resultLen, "script"c);
+    }
+    CFResponseFree(r); return route;
+}
+
+pub fn WorkerRouteDelete(c: CFClient, zoneId: pchar, routeId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/workers/routes/"c);
+    po := cftAppend(path, po, routeId); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn WorkerRouteList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/workers/routes"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}
+
+// Subdomain (workers.dev)
+
+pub fn WorkerSubdomainGet(c: CFClient, accountId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/workers/subdomain"c); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) {
+        result = cfExtractValue(r.result, r.resultLen, "name"c);
+    }
+    CFResponseFree(r); return result;
+}
+
+pub fn WorkerSubdomainCreate(c: CFClient, accountId: pchar, subdomain: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/workers/subdomain"c); poke8(path+po, 0);
+    var js: int64 := cfJsonEscape(subdomain);
+    var body: int64 := alloc(256);
+    var off: int64 := cftAppend(body, 0, "{\"subdomain\":\""c);
+    off := cftAppend(body, off, js as pchar);
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    wkFreeIfSet(js);
+    var r: CFResponse := CFPut(c, path as pchar, body, off);
+    free(path, 256); free(body, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+fn workerSubdomainToggle(c: CFClient, accountId: pchar, scriptName: pchar, enabled: int64): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    var p2: int64 := alloc(StrLen(path as pchar) + 32);
+    var po: int64 := cftAppend(p2, 0, path as pchar);
+    po := cftAppend(p2, po, "/subdomain"c); poke8(p2+po, 0);
+    free(path, 512);
+    var body: int64 := alloc(32);
+    var off: int64 := cftAppend(body, 0, "{\"enabled\":"c);
+    if (enabled==1){off:=cftAppend(body,off,"true"c);}else{off:=cftAppend(body,off,"false"c);}
+    off := cftAppend(body, off, "}"c); poke8(body+off, 0);
+    var r: CFResponse := CFPost(c, p2 as pchar, body, off);
+    free(p2, StrLen(path as pchar)+32); free(body, 32);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn WorkerEnableSubdomain(c: CFClient, accountId: pchar, scriptName: pchar): int64 {
+    return workerSubdomainToggle(c, accountId, scriptName, 1);
+}
+pub fn WorkerDisableSubdomain(c: CFClient, accountId: pchar, scriptName: pchar): int64 {
+    return workerSubdomainToggle(c, accountId, scriptName, 0);
+}
+
+// Secrets
+
+pub fn WorkerSecretSet(c: CFClient, accountId: pchar,
+                        scriptName: pchar, key: pchar, value: pchar): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    var p2: int64 := alloc(StrLen(path as pchar) + 32);
+    var po: int64 := cftAppend(p2, 0, path as pchar);
+    po := cftAppend(p2, po, "/secrets"c); poke8(p2+po, 0);
+    free(path, 512);
+    var jkey: int64 := cfJsonEscape(key);
+    var jval: int64 := cfJsonEscape(value);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\""c);
+    off := cftAppend(body, off, jkey as pchar);
+    off := cftAppend(body, off, "\",\"text\":\""c);
+    off := cftAppend(body, off, jval as pchar);
+    off := cftAppend(body, off, "\",\"type\":\"secret_text\"}"c); poke8(body+off, 0);
+    wkFreeIfSet(jkey); wkFreeIfSet(jval);
+    var r: CFResponse := CFPut(c, p2 as pchar, body, off);
+    free(p2, StrLen(p2 as pchar)+1); free(body, 512);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn WorkerSecretDelete(c: CFClient, accountId: pchar, scriptName: pchar, key: pchar): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    var pl: int64 := StrLen(path as pchar);
+    var p2: int64 := alloc(pl + 64);
+    var po: int64 := cftAppend(p2, 0, path as pchar);
+    po := cftAppend(p2, po, "/secrets/"c);
+    po := cftAppend(p2, po, key); poke8(p2+po, 0);
+    free(path, 512);
+    var r: CFResponse := CFDelete(c, p2 as pchar);
+    free(p2, pl+64);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn WorkerSecretList(c: CFClient, accountId: pchar, scriptName: pchar): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    var pl: int64 := StrLen(path as pchar);
+    var p2: int64 := alloc(pl + 32);
+    var po: int64 := cftAppend(p2, 0, path as pchar);
+    po := cftAppend(p2, po, "/secrets"c); poke8(p2+po, 0);
+    free(path, 512);
+    var r: CFResponse := CFGet(c, p2 as pchar);
+    free(p2, pl+32);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+// Cron Triggers
+
+pub fn WorkerCronCreate(c: CFClient, accountId: pchar,
+                         scriptName: pchar, cronExpr: pchar): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    var pl: int64 := StrLen(path as pchar);
+    var p2: int64 := alloc(pl + 32);
+    var po: int64 := cftAppend(p2, 0, path as pchar);
+    po := cftAppend(p2, po, "/schedules"c); poke8(p2+po, 0);
+    free(path, 512);
+    var jcron: int64 := cfJsonEscape(cronExpr);
+    var body: int64 := alloc(256);
+    var off: int64 := cftAppend(body, 0, "[{\"cron\":\""c);
+    off := cftAppend(body, off, jcron as pchar);
+    off := cftAppend(body, off, "\"}]"c); poke8(body+off, 0);
+    wkFreeIfSet(jcron);
+    var r: CFResponse := CFPut(c, p2 as pchar, body, off);
+    free(p2, pl+32); free(body, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn WorkerCronList(c: CFClient, accountId: pchar, scriptName: pchar): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    var pl: int64 := StrLen(path as pchar);
+    var p2: int64 := alloc(pl + 32);
+    var po: int64 := cftAppend(p2, 0, path as pchar);
+    po := cftAppend(p2, po, "/schedules"c); poke8(p2+po, 0);
+    free(path, 512);
+    var r: CFResponse := CFGet(c, p2 as pchar);
+    free(p2, pl+32);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+// Tail (log streaming)
+
+pub fn WorkerTailStart(c: CFClient, accountId: pchar, scriptName: pchar): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    var pl: int64 := StrLen(path as pchar);
+    var p2: int64 := alloc(pl + 32);
+    var po: int64 := cftAppend(p2, 0, path as pchar);
+    po := cftAppend(p2, po, "/tails"c); poke8(p2+po, 0);
+    free(path, 512);
+    var body: pchar := "{}"c;
+    var r: CFResponse := CFPost(c, p2 as pchar, body as int64, StrLen(body));
+    free(p2, pl+32);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) {
+        result = cfExtractValue(r.result, r.resultLen, "id"c);
+    }
+    CFResponseFree(r); return result;
+}
+
+pub fn WorkerTailDelete(c: CFClient, accountId: pchar, scriptName: pchar, tailId: pchar): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    var pl: int64 := StrLen(path as pchar);
+    var p2: int64 := alloc(pl + 64);
+    var po: int64 := cftAppend(p2, 0, path as pchar);
+    po := cftAppend(p2, po, "/tails/"c);
+    po := cftAppend(p2, po, tailId); poke8(p2+po, 0);
+    free(path, 512);
+    var r: CFResponse := CFDelete(c, p2 as pchar);
+    free(p2, pl+64);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+// Wasm module upload (multipart)
+
+pub fn WorkerDeployWasm(c: CFClient, accountId: pchar,
+                         scriptName: pchar,
+                         jsScript: int64, jsLen: int64,
+                         wasmModule: int64, wasmLen: int64): int64 {
+    var path: int64 := workerPath(accountId, scriptName);
+    var boundary: pchar := "lyxcf-wasm-boundary"c;
+    var body: int64 := alloc(jsLen + wasmLen + 1024);
+    var off: int64 := cftAppend(body, 0, "--"c);
+    off := cftAppend(body, off, boundary);
+    off := cftAppend(body, off, "\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n"c);
+    off := cftAppend(body, off, "{\"main_module\":\"main.js\",\"bindings\":[{\"type\":\"wasm_module\",\"name\":\"WASM\",\"part\":\"worker.wasm\"}]}"c);
+    off := cftAppend(body, off, "\r\n--"c);
+    off := cftAppend(body, off, boundary);
+    off := cftAppend(body, off, "\r\nContent-Disposition: form-data; name=\"main.js\"; filename=\"main.js\"\r\nContent-Type: application/javascript+module\r\n\r\n"c);
+    off := cftAppendN(body, off, jsScript, jsLen);
+    off := cftAppend(body, off, "\r\n--"c);
+    off := cftAppend(body, off, boundary);
+    off := cftAppend(body, off, "\r\nContent-Disposition: form-data; name=\"worker.wasm\"; filename=\"worker.wasm\"\r\nContent-Type: application/wasm\r\n\r\n"c);
+    off := cftAppendN(body, off, wasmModule, wasmLen);
+    off := cftAppend(body, off, "\r\n--"c);
+    off := cftAppend(body, off, boundary);
+    off := cftAppend(body, off, "--\r\n"c); poke8(body+off, 0);
+    var ctBuf: int64 := alloc(128);
+    var cto: int64 := cftAppend(ctBuf, 0, "multipart/form-data; boundary="c);
+    cto := cftAppend(ctBuf, cto, boundary); poke8(ctBuf+cto, 0);
+    var r: CFResponse := CFPutRaw(c, path as pchar, ctBuf as pchar, body, off);
+    free(path, 512); free(body, jsLen+wasmLen+1024); free(ctBuf, 128);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}

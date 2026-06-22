@@ -1,0 +1,258 @@
+// std/hardware/gpio_mmio.lyx
+// WP-2: Variante A — MMIO-Direktzugriff auf GPIO-Register (Raspberry Pi 4)
+//
+// Kein Kernel-Kontext-Switch nach der Initialisierung — ideal für
+// zeitkritische Anwendungen (Software-PWM, Bit-Bang-Protokolle).
+//
+// WP-2.0 Memory-Barrier-Regel (ARM64 Out-of-Order):
+//   Nach JEDEM Schreibzugriff auf ein GPIO-Register: mem_barrier()
+//   Nach sys_mmap vor erstem Register-Zugriff: mem_barrier()
+//   Lese-Zugriffe (GPLEV): keine Barriere nötig
+
+unit std.hardware.gpio_mmio;
+
+import std.hardware.rpi4;
+import std.hardware.gpio_syscalls;
+import std.hardware.gpio_barriers;
+import std.alloc;
+
+// ============================================================
+// GPIO-Kontext (heap-allokiert, 24 Bytes)
+//   +0:  gpio_mem     (int64) — Basisadresse des mmap-Mappings
+//   +8:  is_mapped    (int64) — 0 = nicht initialisiert, 1 = aktiv
+//   +16: has_new_pull (int64) — 1 = neue BCM2711-Pull-Register (Standard)
+// ============================================================
+
+pub con GPIO_CTX_SIZE: int64 := 24;
+
+pub con GPIO_PIN_INPUT:  int64 := 0;   // RPI4_MODE_INPUT
+pub con GPIO_PIN_OUTPUT: int64 := 1;   // RPI4_MODE_OUTPUT
+
+pub con GPIO_PIN_LOW:  int64 := 0;
+pub con GPIO_PIN_HIGH: int64 := 1;
+
+pub con GPIO_PULL_NONE: int64 := 0;
+pub con GPIO_PULL_DOWN: int64 := 1;
+pub con GPIO_PULL_UP:   int64 := 2;
+
+// ============================================================
+// GpioCtxAlloc / GpioCtxFree
+// ============================================================
+
+pub fn GpioCtxAlloc(): int64 {
+  var ctx: int64 := alloc(GPIO_CTX_SIZE);
+  if (ctx == 0) { return 0; }
+  poke64(ctx,      0);   // gpio_mem = nil
+  poke64(ctx + 8,  0);   // is_mapped = 0
+  poke64(ctx + 16, RPI4_HAS_NEW_PULL_REGS);  // Standard: neue Register
+  return ctx;
+}
+
+pub fn GpioCtxFree(ctx: int64) {
+  free(ctx, GPIO_CTX_SIZE);
+}
+
+// Accessoren
+pub fn GpioGetMem(ctx: int64): int64    { return peek64(ctx); }
+pub fn GpioIsMapped(ctx: int64): int64  { return peek64(ctx + 8); }
+pub fn GpioHasNewPull(ctx: int64): int64{ return peek64(ctx + 16); }
+
+// ============================================================
+// WP-2.2: GpioInit — öffnet /dev/gpiomem und legt MMIO-Mapping an
+//
+// Öffnet zuerst /dev/gpiomem (kein Root nötig), fällt auf
+// /dev/mem zurück (Root erforderlich).
+// Nach mmap: mem_barrier() — stellt Mapping-Etablierung sicher.
+//
+// Rückgabe: 1 = Erfolg, 0 = Fehler (AC-1: kein /dev/gpiomem → 0)
+// ============================================================
+pub fn GpioInit(ctx: int64): int64 {
+  var fd: int64 := GpioOpen("/dev/gpiomem"c, GPIO_O_RDWR | GPIO_O_SYNC);
+  if (fd < 0) {
+    // AC-4: Fallback auf /dev/mem (Root-Rechte erforderlich)
+    fd := GpioOpen("/dev/mem"c, GPIO_O_RDWR | GPIO_O_SYNC);
+    if (fd < 0) { return 0; }
+  }
+
+  // Mapping anlegen: offset=0 mappt auf GPIO_BASE in /dev/gpiomem
+  var gpioMem: int64 := GpioMmap(0, RPI4_GPIO_MAP_SIZE,
+                                   GPIO_PROT_RW, GPIO_MAP_SHARED,
+                                   fd, 0);
+  GpioClose(fd);  // fd nach mmap nicht mehr benötigt
+
+  if (gpioMem == RPI4_MAP_FAILED || gpioMem <= 0) { return 0; }
+
+  // WP-2.0 AC: Mapping vollständig etabliert → erst dann Register-Zugriff
+  GpioMemBarrier();
+
+  poke64(ctx,     gpioMem);
+  poke64(ctx + 8, 1);          // is_mapped = 1
+  return 1;
+}
+
+// ============================================================
+// WP-2.2: GpioClose — gibt das MMIO-Mapping frei
+//
+// mem_barrier() vor munmap: alle ausstehenden Schreibvorgänge abschließen.
+// is_mapped-Flag verhindert doppeltes Freigeben.
+// ============================================================
+pub fn GpioClose(ctx: int64) {
+  if (peek64(ctx + 8) == 0) { return; }    // nicht initialisiert → No-op
+  GpioMemBarrier();
+  var gpioMem: int64 := peek64(ctx);
+  GpioMunmap(gpioMem, RPI4_GPIO_MAP_SIZE);
+  poke64(ctx,     0);
+  poke64(ctx + 8, 0);
+}
+
+// ============================================================
+// WP-2.3: GpioSetPinMode — konfiguriert einen Pin als Ein- oder Ausgang
+//
+// GPFSEL-Register: 3 Bits pro Pin, 10 Pins pro 32-Bit-Register.
+// reg_index = pin / 10, bit_shift = (pin % 10) * 3
+//
+// mem_barrier() nach dem Schreibzugriff (WP-2.0 AC-1, AC-5).
+// Rückgabe: 1 = Erfolg, 0 = Fehler (ungültiger Pin oder nicht init.)
+//
+// AC-1: SetPinMode(18, Input)  → korrekte Bits im FSEL1 gelöscht
+// AC-2: SetPinMode(18, Output) → Bits 24-26 in FSEL1 auf 001 gesetzt
+// ============================================================
+pub fn GpioSetPinMode(ctx: int64, pin: int64, mode: int64): int64 {
+  if (pin > RPI4_MAX_PIN || peek64(ctx + 8) == 0) { return 0; }
+
+  var gpioMem: int64 := peek64(ctx);
+  var regIdx:  int64 := pin / 10;
+  var bitShift: int64 := (pin - regIdx * 10) * 3;
+  var fselOff: int64 := regIdx * 4;   // Byte-Offset im Mapping
+
+  var cur: int64 := peek32(gpioMem + fselOff) & 0xFFFFFFFF;
+  var mask: int64 := 7 << bitShift;   // 3 Bits auf Position bitShift
+  cur := cur & (~mask & 0xFFFFFFFF);  // Bits löschen
+
+  if (mode != GPIO_PIN_INPUT) {
+    // Output oder Alt-Funktion: mode-Bits setzen
+    cur := cur | ((mode & 7) << bitShift);
+  }
+
+  poke32(gpioMem + fselOff, cur);
+  GpioMemBarrier();   // WP-2.0
+  return 1;
+}
+
+// ============================================================
+// WP-2.4: GpioWritePin — setzt oder löscht einen Ausgangs-Pin
+//
+// GPSET/GPCLR: Write-1-to-set/clear — atomar, kein RMW-Problem.
+// mem_barrier() nach dem Schreibzugriff (WP-2.0 AC, WP-2.4 AC-6).
+//
+// AC-1: WritePin(18, High) → Bit 18 in GPSET0 gesetzt
+// AC-2: WritePin(18, Low)  → Bit 18 in GPCLR0 gesetzt
+// AC-4: WritePin(34, High) → Bit 2 in GPSET1 (34-32=2)
+// ============================================================
+pub fn GpioWritePin(ctx: int64, pin: int64, state: int64): int64 {
+  if (pin > RPI4_MAX_PIN || peek64(ctx + 8) == 0) { return 0; }
+
+  var gpioMem: int64 := peek64(ctx);
+
+  if (pin < 32) {
+    var bit: int64 := 1 << pin;
+    if (state == GPIO_PIN_HIGH) {
+      poke32(gpioMem + RPI4_GPSET0, bit);
+    } else {
+      poke32(gpioMem + RPI4_GPCLR0, bit);
+    }
+  } else {
+    var bit: int64 := 1 << (pin - 32);
+    if (state == GPIO_PIN_HIGH) {
+      poke32(gpioMem + RPI4_GPSET1, bit);
+    } else {
+      poke32(gpioMem + RPI4_GPCLR1, bit);
+    }
+  }
+
+  GpioMemBarrier();   // WP-2.0
+  return 1;
+}
+
+// ============================================================
+// WP-2.4: GpioReadPin — liest den aktuellen Pegel eines Pins
+//
+// GPLEV: Read-Only — kein mem_barrier() nötig (kein Schreib-Seiteneffekt).
+//
+// Rückgabe: GPIO_PIN_HIGH (1) oder GPIO_PIN_LOW (0),
+//           oder -1 bei ungültigem Pin / fehlendem Mapping.
+// AC-3: ReadPin gibt den physischen Pegel zurück.
+// ============================================================
+pub fn GpioReadPin(ctx: int64, pin: int64): int64 {
+  if (pin > RPI4_MAX_PIN || peek64(ctx + 8) == 0) { return -1; }
+
+  var gpioMem: int64 := peek64(ctx);
+
+  if (pin < 32) {
+    var lev: int64 := peek32(gpioMem + RPI4_GPLEV0) & 0xFFFFFFFF;
+    return (lev >> pin) & 1;
+  } else {
+    var lev: int64 := peek32(gpioMem + RPI4_GPLEV1) & 0xFFFFFFFF;
+    return (lev >> (pin - 32)) & 1;
+  }
+}
+
+// ============================================================
+// WP-2.5: GpioSetPullMode — konfiguriert Pull-Up/Down-Widerstand
+//
+// Unterstützt zwei Protokolle (Auswahl per ctx.has_new_pull):
+//   1. Neu (BCM2711 Rev >= 1.2): GPIO_PUP_PDN_CNTRL_REG0–3
+//      2 Bits pro Pin: 00=None  01=PullDown  10=PullUp
+//   2. Legacy (BCM2835/ältere RPi4): GPPUD + GPPUDCLK 3-Schritt-Protokoll
+//
+// mem_barrier() nach jedem Register-Schreibzugriff (WP-2.0 AC).
+//
+// AC-1: SetPullMode(23, PullUp)   → 10 in REG1 Bits 14-15 (Pin 23: (23%16)=7, *2=14)
+// AC-3: SetPullMode(23, PullDown) → 01 in REG1 Bits 14-15
+// AC-4: SetPullMode(23, None)     → 00 in REG1 Bits 14-15
+// ============================================================
+pub fn GpioSetPullMode(ctx: int64, pin: int64, mode: int64): int64 {
+  if (pin > RPI4_MAX_PIN || peek64(ctx + 8) == 0) { return 0; }
+
+  var gpioMem: int64  := peek64(ctx);
+  var newPull: int64  := peek64(ctx + 16);
+
+  if (newPull == 1) {
+    // Neues BCM2711-Register-Format
+    var regIdx:  int64 := pin / 16;
+    var bitShift: int64 := (pin - regIdx * 16) * 2;
+    var pudOff:  int64 := RPI4_PUP_PDN_REG0 + regIdx * 4;
+
+    var cur: int64 := peek32(gpioMem + pudOff) & 0xFFFFFFFF;
+    var mask: int64 := 3 << bitShift;
+    cur := cur & (~mask & 0xFFFFFFFF);
+    cur := cur | ((mode & 3) << bitShift);
+    poke32(gpioMem + pudOff, cur);
+    GpioMemBarrier();
+  } else {
+    // Legacy-Protokoll (BCM2835 / BCM2711 Rev < 1.2)
+    // Schritt 1: Pull-Modus in GPPUD schreiben
+    poke32(gpioMem + RPI4_GPPUD, mode & 3);
+    GpioMemBarrier();
+
+    // Schritt 2: Clock-Bit für Pin setzen (mindestens 150 Taktzyklen halten)
+    if (pin < 32) {
+      poke32(gpioMem + RPI4_GPPUDCLK0, 1 << pin);
+    } else {
+      poke32(gpioMem + RPI4_GPPUDCLK1, 1 << (pin - 32));
+    }
+    GpioMemBarrier();
+
+    // Schritt 3: GPPUD zurücksetzen, dann Clock-Bit löschen
+    poke32(gpioMem + RPI4_GPPUD, 0);
+    GpioMemBarrier();
+    if (pin < 32) {
+      poke32(gpioMem + RPI4_GPPUDCLK0, 0);
+    } else {
+      poke32(gpioMem + RPI4_GPPUDCLK1, 0);
+    }
+    GpioMemBarrier();
+  }
+
+  return 1;
+}

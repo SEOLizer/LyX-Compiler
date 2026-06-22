@@ -1,0 +1,1002 @@
+// std/edi/orders.lyx — Purchase orders: ORDERS + ORDRSP + ORDCHG (WP-EDI-04)
+//
+// ORDERS  (BGM 220): purchase order, NAD ×4 (BY/SU/DP/IV), MOA sum validation
+// ORDRSP  (BGM 231): order acknowledgement with per-line status (1/5/7)
+// ORDCHG  (BGM 230): order change request with incrementing change sequence number
+//
+// Acceptance notes:
+//   • ORDERS with missing order number → EdiOrdersWrite returns -1
+//   • All 4 NAD roles (BY/SU/DP/IV) extracted by EdiOrdersRead
+//   • EdiOrdersValidate: line-sum vs MOA+77 tolerance ≤ 1 cent
+//   • ORDRSP lines with status 7 (rejected) correctly stored
+//
+// Public API:
+//   EdiOrdersWrite(hdr, lines, lineCount, out, outMax)               → int64 (bytes/-1)
+//   EdiOrdersRead(buf, bufLen, hdr, lines, maxLines)                  → int64 (line count)
+//   EdiOrdersValidate(hdr, lines, lineCount)                          → int64 (0=ok, 1=mismatch)
+//   EdiOrdrspWrite(orderRef, confirmNum, lines, lineCount, out, outMax) → int64 (bytes)
+//   EdiOrdrspRead(buf, bufLen, hdr, lines, maxLines)                  → int64 (line count)
+//   EdiOrdchgWrite(orderRef, changeNo, lines, lineCount, out, outMax) → int64 (bytes)
+//   EdiOrdchgRead(buf, bufLen, hdr, lines, maxLines)                  → int64 (line count)
+
+unit std.edi.orders;
+
+import std.edi.core;
+import std.alloc;
+
+// ── EdiOrderLine offsets (EDI_ORDER_LINE_SIZE bytes) ─────────────────────────
+pub con EDI_ORDER_LINE_GTIN:       int64 := 0;
+pub con EDI_ORDER_LINE_GTINLEN:    int64 := 8;
+pub con EDI_ORDER_LINE_QTY:        int64 := 16;
+pub con EDI_ORDER_LINE_UNIT:       int64 := 24;
+pub con EDI_ORDER_LINE_UNITLEN:    int64 := 32;
+pub con EDI_ORDER_LINE_PRICE:      int64 := 40;   // unit price × 100
+pub con EDI_ORDER_LINE_TAXRATE:    int64 := 48;   // tax rate × 100 (e.g. 1900 = 19.00 %)
+pub con EDI_ORDER_LINE_DATE:       int64 := 56;   // delivery date ptr (8 chars) or 0
+pub con EDI_ORDER_LINE_STATUS:     int64 := 64;   // 0=normal, 1=accepted, 5=changed, 7=rejected
+pub con EDI_ORDER_LINE_LINENO:     int64 := 72;
+pub con EDI_ORDER_LINE_SIZE:       int64 := 80;
+
+// ── EdiOrderHdr offsets (EDI_ORDER_HDR_SIZE bytes) ───────────────────────────
+pub con EDI_ORDER_HDR_NUM:         int64 := 0;
+pub con EDI_ORDER_HDR_NUMLEN:      int64 := 8;
+pub con EDI_ORDER_HDR_DATE:        int64 := 16;
+pub con EDI_ORDER_HDR_DATELEN:     int64 := 24;
+pub con EDI_ORDER_HDR_BUYER_GLN:   int64 := 32;
+pub con EDI_ORDER_HDR_BUYER_GLNL:  int64 := 40;
+pub con EDI_ORDER_HDR_SUP_GLN:     int64 := 48;
+pub con EDI_ORDER_HDR_SUP_GLNL:    int64 := 56;
+pub con EDI_ORDER_HDR_DELIV_GLN:   int64 := 64;
+pub con EDI_ORDER_HDR_DELIV_GLNL:  int64 := 72;
+pub con EDI_ORDER_HDR_INV_GLN:     int64 := 80;
+pub con EDI_ORDER_HDR_INV_GLNL:    int64 := 88;
+pub con EDI_ORDER_HDR_TOTAL:       int64 := 96;   // MOA+77 total (× 100)
+pub con EDI_ORDER_HDR_CHANGENO:    int64 := 104;  // ORDCHG sequence number
+pub con EDI_ORDER_HDR_SIZE:        int64 := 112;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn ordStrLen(ptr: int64): int64 {
+    var n: int64 := 0;
+    while (peek8(ptr + n) != 0) { n := n + 1; }
+    return n;
+}
+
+fn ordPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn ordPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i := i + 1;
+    }
+    return pos + n;
+}
+
+fn ordPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val < 0)  { return 0 - 1; }
+    if (val == 0) { return ordPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var buf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(buf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx := idx + 1;
+    }
+    var r: int64 := ordPutStr(out, pos, outMax, buf, digits);
+    free(buf, 24);
+    return r;
+}
+
+fn ordPutPrice(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    var whole: int64 := val / 100;
+    var frac:  int64 := val - whole * 100;
+    pos := ordPutInt(out, pos, outMax, whole);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DEC);
+    if (frac < 10) { pos := ordPutChar(out, pos, outMax, 48); }
+    pos := ordPutInt(out, pos, outMax, frac);
+    return pos;
+}
+
+fn ordParseInt(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c >= 48 && c <= 57) { v := v * 10 + (c - 48); }
+        i := i + 1;
+    }
+    return v;
+}
+
+fn ordParsePrice(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var frac: int64 := 0;
+    var inFrac: int64 := 0;
+    var fracDig: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c == 46 || c == 44) {
+            inFrac := 1;
+        } else {
+            if (c >= 48 && c <= 57) {
+                if (inFrac == 0) {
+                    v := v * 10 + (c - 48);
+                } else {
+                    if (fracDig < 2) {
+                        frac := frac * 10 + (c - 48);
+                        fracDig := fracDig + 1;
+                    }
+                }
+            }
+        }
+        i := i + 1;
+    }
+    if (fracDig == 1) { frac := frac * 10; }
+    return v * 100 + frac;
+}
+
+fn ordTagIs(seg: int64, t0: int64, t1: int64, t2: int64): int64 {
+    var p: int64 := peek64(seg + EDI_SEG_PTR);
+    if (p == 0) { return 0; }
+    if (peek8(p) != t0) { return 0; }
+    if (peek8(p+1) != t1) { return 0; }
+    if (peek8(p+2) != t2) { return 0; }
+    return 1;
+}
+
+fn ordElemPtr(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+}
+fn ordElemLen(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+}
+
+// Parse NAD's GLN from elem[1] (GLN::9 composite), comp[0] = GLN
+fn nadGetGln(elems: int64, glnPtrOut: int64, glnLenOut: int64): int64 {
+    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+    EdiComponentSplit(ordElemPtr(elems, 1), ordElemLen(elems, 1), comps, 4);
+    poke64(glnPtrOut, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+    poke64(glnLenOut, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+    free(comps, 4 * EDI_ELEM_SIZE);
+    return 0;
+}
+
+// Write NAD segment: NAD+ROLE+GLN::9'
+fn writeNad(out: int64, pos: int64, outMax: int64, role: int64, glnPtr: int64, glnLen: int64): int64 {
+    pos := ordPutStr(out, pos, outMax, "NAD"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutStr(out, pos, outMax, role, 2);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (glnPtr != 0 && glnLen > 0) {
+        pos := ordPutStr(out, pos, outMax, glnPtr, glnLen);
+        pos := ordPutStr(out, pos, outMax, "::9"c as int64, 3);
+    }
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — ORDERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write ORDERS. hdr must have EDI_ORDER_HDR_NUM set (mandatory).
+// Computes and writes MOA+77 total from line amounts.
+// Returns bytes written, or -1 if order number is missing.
+pub fn EdiOrdersWrite(hdr: int64, lines: int64, lineCount: int64, out: int64, outMax: int64): int64 {
+    var orderNumPtr: int64 := peek64(hdr + EDI_ORDER_HDR_NUM);
+    var orderNumLen: int64 := peek64(hdr + EDI_ORDER_HDR_NUMLEN);
+    if (orderNumPtr == 0 || orderNumLen == 0) { return 0 - 1; }
+
+    var datePtr:   int64 := peek64(hdr + EDI_ORDER_HDR_DATE);
+    var buyerPtr:  int64 := peek64(hdr + EDI_ORDER_HDR_BUYER_GLN);
+    var buyerLen:  int64 := peek64(hdr + EDI_ORDER_HDR_BUYER_GLNL);
+    var supPtr:    int64 := peek64(hdr + EDI_ORDER_HDR_SUP_GLN);
+    var supLen:    int64 := peek64(hdr + EDI_ORDER_HDR_SUP_GLNL);
+    var delivPtr:  int64 := peek64(hdr + EDI_ORDER_HDR_DELIV_GLN);
+    var delivLen:  int64 := peek64(hdr + EDI_ORDER_HDR_DELIV_GLNL);
+    var invPtr:    int64 := peek64(hdr + EDI_ORDER_HDR_INV_GLN);
+    var invLen:    int64 := peek64(hdr + EDI_ORDER_HDR_INV_GLNL);
+
+    var pos: int64 := 0;
+
+    // BGM+220+orderNum+9'  (220 = purchase order)
+    pos := ordPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutStr(out, pos, outMax, "220"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutStr(out, pos, outMax, orderNumPtr, orderNumLen);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutChar(out, pos, outMax, 57);   // '9' = original
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // DTM+137:date:102'
+    if (datePtr != 0) {
+        pos := ordPutStr(out, pos, outMax, "DTM"c as int64, 3);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := ordPutStr(out, pos, outMax, "137"c as int64, 3);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := ordPutStr(out, pos, outMax, datePtr, 8);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := ordPutStr(out, pos, outMax, "102"c as int64, 3);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    // NAD segments (BY, SU, DP, IV)
+    if (buyerPtr != 0 && buyerLen > 0) {
+        pos := writeNad(out, pos, outMax, "BY"c as int64, buyerPtr, buyerLen);
+    }
+    if (supPtr != 0 && supLen > 0) {
+        pos := writeNad(out, pos, outMax, "SU"c as int64, supPtr, supLen);
+    }
+    if (delivPtr != 0 && delivLen > 0) {
+        pos := writeNad(out, pos, outMax, "DP"c as int64, delivPtr, delivLen);
+    }
+    if (invPtr != 0 && invLen > 0) {
+        pos := writeNad(out, pos, outMax, "IV"c as int64, invPtr, invLen);
+    }
+
+    // Line items
+    var total: int64 := 0;
+    var i: int64 := 0;
+    while (i < lineCount) {
+        var line: int64 := lines + i * EDI_ORDER_LINE_SIZE;
+        var gtinPtr:  int64 := peek64(line + EDI_ORDER_LINE_GTIN);
+        var gtinLen:  int64 := peek64(line + EDI_ORDER_LINE_GTINLEN);
+        var qty:      int64 := peek64(line + EDI_ORDER_LINE_QTY);
+        var unitPtr:  int64 := peek64(line + EDI_ORDER_LINE_UNIT);
+        var unitLen:  int64 := peek64(line + EDI_ORDER_LINE_UNITLEN);
+        var price:    int64 := peek64(line + EDI_ORDER_LINE_PRICE);
+        var taxRate:  int64 := peek64(line + EDI_ORDER_LINE_TAXRATE);
+        var lineDate: int64 := peek64(line + EDI_ORDER_LINE_DATE);
+
+        total := total + qty * price;
+
+        // LIN+lineNo++GTIN:SRV'
+        pos := ordPutStr(out, pos, outMax, "LIN"c as int64, 3);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := ordPutInt(out, pos, outMax, i + 1);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (gtinPtr != 0 && gtinLen > 0) {
+            pos := ordPutStr(out, pos, outMax, gtinPtr, gtinLen);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutStr(out, pos, outMax, "SRV"c as int64, 3);
+        }
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // QTY+21:qty:UNIT'
+        pos := ordPutStr(out, pos, outMax, "QTY"c as int64, 3);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := ordPutStr(out, pos, outMax, "21"c as int64, 2);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := ordPutInt(out, pos, outMax, qty);
+        if (unitPtr != 0 && unitLen > 0) {
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutStr(out, pos, outMax, unitPtr, unitLen);
+        }
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // PRI+AAA:price:CP'
+        if (price > 0) {
+            pos := ordPutStr(out, pos, outMax, "PRI"c as int64, 3);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := ordPutStr(out, pos, outMax, "AAA"c as int64, 3);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutPrice(out, pos, outMax, price);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutStr(out, pos, outMax, "CP"c as int64, 2);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        // TAX+7+VAT+++:::taxRate'
+        if (taxRate > 0) {
+            pos := ordPutStr(out, pos, outMax, "TAX"c as int64, 3);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := ordPutChar(out, pos, outMax, 55);   // '7' = tax
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := ordPutStr(out, pos, outMax, "VAT"c as int64, 3);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := ordPutStr(out, pos, outMax, ":::"c as int64, 3);
+            pos := ordPutPrice(out, pos, outMax, taxRate);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        // DTM+2:delivDate:102'
+        if (lineDate != 0) {
+            pos := ordPutStr(out, pos, outMax, "DTM"c as int64, 3);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := ordPutStr(out, pos, outMax, "2"c as int64, 1);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutStr(out, pos, outMax, lineDate, 8);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutStr(out, pos, outMax, "102"c as int64, 3);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        i := i + 1;
+    }
+
+    // UNS+S'  (summary section separator)
+    pos := ordPutStr(out, pos, outMax, "UNS"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutChar(out, pos, outMax, 83);   // 'S' = summary
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // MOA+77:total'  (77 = invoice amount = sum of line amounts)
+    pos := ordPutStr(out, pos, outMax, "MOA"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutStr(out, pos, outMax, "77"c as int64, 2);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := ordPutPrice(out, pos, outMax, total);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // CNT+2:lineCount'
+    pos := ordPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutChar(out, pos, outMax, 50);   // '2'
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := ordPutInt(out, pos, outMax, lineCount);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse ORDERS. Fills hdr and lines[]. Returns line count.
+pub fn EdiOrdersRead(buf: int64, bufLen: int64, hdr: int64, lines: int64, maxLines: int64): int64 {
+    var i: int64 := 0;
+    while (i < EDI_ORDER_HDR_SIZE) { poke8(hdr + i, 0); i := i + 1; }
+
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count: int64 := 0;
+    var curLine: int64 := 0;
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            // BGM → orderNum from elem[1]
+            if (ordTagIs(seg, 66, 71, 77) == 1) {   // "BGM"
+                if (n > 1) {
+                    poke64(hdr + EDI_ORDER_HDR_NUM,    ordElemPtr(elems, 1));
+                    poke64(hdr + EDI_ORDER_HDR_NUMLEN, ordElemLen(elems, 1));
+                }
+            }
+
+            // DTM+137 → document date
+            if (ordTagIs(seg, 68, 84, 77) == 1 && curLine == 0) {   // "DTM" (header)
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 0), ordElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql >= 3 && peek8(qp) == 49 && peek8(qp+1) == 51 && peek8(qp+2) == 55) {
+                            poke64(hdr + EDI_ORDER_HDR_DATE,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_ORDER_HDR_DATELEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // NAD → extract role and GLN
+            if (ordTagIs(seg, 78, 65, 68) == 1) {   // "NAD"
+                if (n > 1) {
+                    var rp: int64 := ordElemPtr(elems, 0);
+                    var rl: int64 := ordElemLen(elems, 0);
+                    var glnStorage: int64 := alloc(16);
+                    nadGetGln(elems, glnStorage, glnStorage + 8);
+                    var glnP: int64 := peek64(glnStorage);
+                    var glnL: int64 := peek64(glnStorage + 8);
+                    // Match role
+                    if (rl >= 2) {
+                        if (peek8(rp) == 66 && peek8(rp+1) == 89) {   // "BY"
+                            poke64(hdr + EDI_ORDER_HDR_BUYER_GLN,  glnP);
+                            poke64(hdr + EDI_ORDER_HDR_BUYER_GLNL, glnL);
+                        }
+                        if (peek8(rp) == 83 && peek8(rp+1) == 85) {   // "SU"
+                            poke64(hdr + EDI_ORDER_HDR_SUP_GLN,   glnP);
+                            poke64(hdr + EDI_ORDER_HDR_SUP_GLNL,  glnL);
+                        }
+                        if (peek8(rp) == 68 && peek8(rp+1) == 80) {   // "DP"
+                            poke64(hdr + EDI_ORDER_HDR_DELIV_GLN,  glnP);
+                            poke64(hdr + EDI_ORDER_HDR_DELIV_GLNL, glnL);
+                        }
+                        if (peek8(rp) == 73 && peek8(rp+1) == 86) {   // "IV"
+                            poke64(hdr + EDI_ORDER_HDR_INV_GLN,   glnP);
+                            poke64(hdr + EDI_ORDER_HDR_INV_GLNL,  glnL);
+                        }
+                    }
+                    free(glnStorage, 16);
+                }
+            }
+
+            // LIN → new line item
+            if (ordTagIs(seg, 76, 73, 78) == 1) {   // "LIN"
+                if (count < maxLines) {
+                    curLine := lines + count * EDI_ORDER_LINE_SIZE;
+                    var zi: int64 := 0;
+                    while (zi < EDI_ORDER_LINE_SIZE) { poke8(curLine + zi, 0); zi := zi + 1; }
+                    poke64(curLine + EDI_ORDER_LINE_LINENO, count + 1);
+                    if (n > 2) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(ordElemPtr(elems, 2), ordElemLen(elems, 2), comps, 4);
+                        poke64(curLine + EDI_ORDER_LINE_GTIN,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(curLine + EDI_ORDER_LINE_GTINLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                    count := count + 1;
+                }
+            }
+
+            // QTY+21:qty:UNIT'
+            if (ordTagIs(seg, 81, 84, 89) == 1 && curLine != 0) {   // "QTY"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 0), ordElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql >= 2 && peek8(qp) == 50 && peek8(qp+1) == 49) {   // "21"
+                            var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                            var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            poke64(curLine + EDI_ORDER_LINE_QTY, ordParseInt(vp, vl));
+                            if (nc > 2) {
+                                poke64(curLine + EDI_ORDER_LINE_UNIT,    peek64(comps + 2 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                                poke64(curLine + EDI_ORDER_LINE_UNITLEN, peek64(comps + 2 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                            }
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // PRI+AAA:price:CP'
+            if (ordTagIs(seg, 80, 82, 73) == 1 && curLine != 0) {   // "PRI"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 0), ordElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql >= 3 && peek8(qp) == 65 && peek8(qp+1) == 65 && peek8(qp+2) == 65) {
+                            var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                            var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            poke64(curLine + EDI_ORDER_LINE_PRICE, ordParsePrice(vp, vl));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // TAX+7+VAT+++:::taxRate'  → taxRate from elem[4] comp[3]
+            if (ordTagIs(seg, 84, 65, 88) == 1 && curLine != 0) {   // "TAX"
+                if (n > 4) {
+                    var comps: int64 := alloc(8 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 4), ordElemLen(elems, 4), comps, 8);
+                    if (nc > 3) {
+                        var vp: int64 := peek64(comps + 3 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var vl: int64 := peek64(comps + 3 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        poke64(curLine + EDI_ORDER_LINE_TAXRATE, ordParsePrice(vp, vl));
+                    }
+                    free(comps, 8 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // DTM on line level → delivery date (qualifier "2")
+            if (ordTagIs(seg, 68, 84, 77) == 1 && curLine != 0) {   // "DTM" (line)
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 0), ordElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql == 1 && peek8(qp) == 50) {   // "2"
+                            poke64(curLine + EDI_ORDER_LINE_DATE, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // UNS+S' → switch to summary section, reset curLine
+            if (ordTagIs(seg, 85, 78, 83) == 1) { curLine := 0; }   // "UNS"
+
+            // MOA+77:total' → invoice total
+            if (ordTagIs(seg, 77, 79, 65) == 1) {   // "MOA"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 0), ordElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // qualifier "77" = 55,55
+                        if (ql >= 2 && peek8(qp) == 55 && peek8(qp+1) == 55) {
+                            var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                            var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            poke64(hdr + EDI_ORDER_HDR_TOTAL, ordParsePrice(vp, vl));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}
+
+// Validate MOA sum. Returns 0 if valid (diff ≤ 1 cent), 1 if mismatch.
+pub fn EdiOrdersValidate(hdr: int64, lines: int64, lineCount: int64): int64 {
+    var total: int64 := peek64(hdr + EDI_ORDER_HDR_TOTAL);
+    if (total == 0) { return 0; }
+    var lineSum: int64 := 0;
+    var i: int64 := 0;
+    while (i < lineCount) {
+        var line: int64 := lines + i * EDI_ORDER_LINE_SIZE;
+        var qty:   int64 := peek64(line + EDI_ORDER_LINE_QTY);
+        var price: int64 := peek64(line + EDI_ORDER_LINE_PRICE);
+        lineSum := lineSum + qty * price;
+        i := i + 1;
+    }
+    var diff: int64 := lineSum - total;
+    if (diff < 0) { diff := 0 - diff; }
+    if (diff > 1) { return 1; }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — ORDRSP (order acknowledgement)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write ORDRSP. orderRef: null-terminated order number string.
+// confirmNum: null-terminated confirmation number string (or 0).
+// Lines use EDI_ORDER_LINE_STATUS field for line status.
+pub fn EdiOrdrspWrite(orderRef: int64, confirmNum: int64, lines: int64, lineCount: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+
+    // BGM+231+confirmNum+9'  (231 = order acknowledgement)
+    pos := ordPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutStr(out, pos, outMax, "231"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (confirmNum != 0) {
+        var cnLen: int64 := ordStrLen(confirmNum);
+        pos := ordPutStr(out, pos, outMax, confirmNum, cnLen);
+    }
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutChar(out, pos, outMax, 57);   // '9'
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // RFF+ON:orderRef'  (ON = order number)
+    if (orderRef != 0) {
+        var orLen: int64 := ordStrLen(orderRef);
+        pos := ordPutStr(out, pos, outMax, "RFF"c as int64, 3);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := ordPutStr(out, pos, outMax, "ON"c as int64, 2);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := ordPutStr(out, pos, outMax, orderRef, orLen);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    var i: int64 := 0;
+    while (i < lineCount) {
+        var line: int64 := lines + i * EDI_ORDER_LINE_SIZE;
+        var gtinPtr: int64 := peek64(line + EDI_ORDER_LINE_GTIN);
+        var gtinLen: int64 := peek64(line + EDI_ORDER_LINE_GTINLEN);
+        var qty:     int64 := peek64(line + EDI_ORDER_LINE_QTY);
+        var unitPtr: int64 := peek64(line + EDI_ORDER_LINE_UNIT);
+        var unitLen: int64 := peek64(line + EDI_ORDER_LINE_UNITLEN);
+        var price:   int64 := peek64(line + EDI_ORDER_LINE_PRICE);
+        var status:  int64 := peek64(line + EDI_ORDER_LINE_STATUS);
+
+        // LIN+n+status+GTIN:SRV'  (status in elem[1]: 1=accepted,5=changed,7=rejected)
+        pos := ordPutStr(out, pos, outMax, "LIN"c as int64, 3);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := ordPutInt(out, pos, outMax, i + 1);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (status != 0) {
+            pos := ordPutInt(out, pos, outMax, status);
+        }
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (gtinPtr != 0 && gtinLen > 0) {
+            pos := ordPutStr(out, pos, outMax, gtinPtr, gtinLen);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutStr(out, pos, outMax, "SRV"c as int64, 3);
+        }
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // QTY+21:qty:UNIT'
+        pos := ordPutStr(out, pos, outMax, "QTY"c as int64, 3);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := ordPutStr(out, pos, outMax, "21"c as int64, 2);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := ordPutInt(out, pos, outMax, qty);
+        if (unitPtr != 0 && unitLen > 0) {
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutStr(out, pos, outMax, unitPtr, unitLen);
+        }
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // PRI+AAA:price:CP'  (if price set, may differ from order for status=5)
+        if (price > 0) {
+            pos := ordPutStr(out, pos, outMax, "PRI"c as int64, 3);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := ordPutStr(out, pos, outMax, "AAA"c as int64, 3);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutPrice(out, pos, outMax, price);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutStr(out, pos, outMax, "CP"c as int64, 2);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        i := i + 1;
+    }
+
+    // CNT+2:lineCount'
+    pos := ordPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutChar(out, pos, outMax, 50);   // '2'
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := ordPutInt(out, pos, outMax, lineCount);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse ORDRSP. Returns line count. Line status stored in EDI_ORDER_LINE_STATUS.
+pub fn EdiOrdrspRead(buf: int64, bufLen: int64, hdr: int64, lines: int64, maxLines: int64): int64 {
+    var i: int64 := 0;
+    while (i < EDI_ORDER_HDR_SIZE) { poke8(hdr + i, 0); i := i + 1; }
+
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count: int64 := 0;
+    var curLine: int64 := 0;
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            // BGM → confirmNum from elem[1]
+            if (ordTagIs(seg, 66, 71, 77) == 1) {
+                if (n > 1) {
+                    poke64(hdr + EDI_ORDER_HDR_NUM,    ordElemPtr(elems, 1));
+                    poke64(hdr + EDI_ORDER_HDR_NUMLEN, ordElemLen(elems, 1));
+                }
+            }
+
+            // RFF+ON:orderRef' → back-reference to original ORDERS
+            if (ordTagIs(seg, 82, 70, 70) == 1) {   // "RFF"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 0), ordElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "ON" = 79,78
+                        if (ql >= 2 && peek8(qp) == 79 && peek8(qp+1) == 78) {
+                            poke64(hdr + EDI_ORDER_HDR_BUYER_GLN,  peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_ORDER_HDR_BUYER_GLNL, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // LIN → line with status in elem[1]
+            if (ordTagIs(seg, 76, 73, 78) == 1) {   // "LIN"
+                if (count < maxLines) {
+                    curLine := lines + count * EDI_ORDER_LINE_SIZE;
+                    var zi: int64 := 0;
+                    while (zi < EDI_ORDER_LINE_SIZE) { poke8(curLine + zi, 0); zi := zi + 1; }
+                    poke64(curLine + EDI_ORDER_LINE_LINENO, count + 1);
+                    // elem[1] = status
+                    if (n > 1) {
+                        var sp: int64 := ordElemPtr(elems, 1);
+                        var sl: int64 := ordElemLen(elems, 1);
+                        if (sl > 0) {
+                            poke64(curLine + EDI_ORDER_LINE_STATUS, ordParseInt(sp, sl));
+                        }
+                    }
+                    // elem[2] = GTIN:SRV
+                    if (n > 2) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(ordElemPtr(elems, 2), ordElemLen(elems, 2), comps, 4);
+                        poke64(curLine + EDI_ORDER_LINE_GTIN,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(curLine + EDI_ORDER_LINE_GTINLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                    count := count + 1;
+                }
+            }
+
+            // QTY+21:qty:UNIT'
+            if (ordTagIs(seg, 81, 84, 89) == 1 && curLine != 0) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 0), ordElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql >= 2 && peek8(qp) == 50 && peek8(qp+1) == 49) {
+                            var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                            var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            poke64(curLine + EDI_ORDER_LINE_QTY, ordParseInt(vp, vl));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // PRI+AAA:price:CP'
+            if (ordTagIs(seg, 80, 82, 73) == 1 && curLine != 0) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 0), ordElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql >= 3 && peek8(qp) == 65 && peek8(qp+1) == 65 && peek8(qp+2) == 65) {
+                            var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                            var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            poke64(curLine + EDI_ORDER_LINE_PRICE, ordParsePrice(vp, vl));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — ORDCHG (order change request)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write ORDCHG. orderRef: original order number string. changeNo: sequence number (must increment).
+pub fn EdiOrdchgWrite(orderRef: int64, changeNo: int64, lines: int64, lineCount: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+
+    // BGM+230++1+changeNo'  (230 = purchase order change, function 1 = change)
+    pos := ordPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutStr(out, pos, outMax, "230"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutChar(out, pos, outMax, 49);   // '1' = change function
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutInt(out, pos, outMax, changeNo);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // RFF+ON:orderRef'
+    if (orderRef != 0) {
+        var orLen: int64 := ordStrLen(orderRef);
+        pos := ordPutStr(out, pos, outMax, "RFF"c as int64, 3);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := ordPutStr(out, pos, outMax, "ON"c as int64, 2);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := ordPutStr(out, pos, outMax, orderRef, orLen);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    var i: int64 := 0;
+    while (i < lineCount) {
+        var line: int64 := lines + i * EDI_ORDER_LINE_SIZE;
+        var gtinPtr: int64 := peek64(line + EDI_ORDER_LINE_GTIN);
+        var gtinLen: int64 := peek64(line + EDI_ORDER_LINE_GTINLEN);
+        var qty:     int64 := peek64(line + EDI_ORDER_LINE_QTY);
+        var unitPtr: int64 := peek64(line + EDI_ORDER_LINE_UNIT);
+        var unitLen: int64 := peek64(line + EDI_ORDER_LINE_UNITLEN);
+        var price:   int64 := peek64(line + EDI_ORDER_LINE_PRICE);
+
+        // LIN+n++GTIN:SRV'
+        pos := ordPutStr(out, pos, outMax, "LIN"c as int64, 3);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := ordPutInt(out, pos, outMax, i + 1);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (gtinPtr != 0 && gtinLen > 0) {
+            pos := ordPutStr(out, pos, outMax, gtinPtr, gtinLen);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutStr(out, pos, outMax, "SRV"c as int64, 3);
+        }
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // QTY+21:qty:UNIT'
+        pos := ordPutStr(out, pos, outMax, "QTY"c as int64, 3);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := ordPutStr(out, pos, outMax, "21"c as int64, 2);
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := ordPutInt(out, pos, outMax, qty);
+        if (unitPtr != 0 && unitLen > 0) {
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutStr(out, pos, outMax, unitPtr, unitLen);
+        }
+        pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // PRI+AAA:price:CP'
+        if (price > 0) {
+            pos := ordPutStr(out, pos, outMax, "PRI"c as int64, 3);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := ordPutStr(out, pos, outMax, "AAA"c as int64, 3);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutPrice(out, pos, outMax, price);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := ordPutStr(out, pos, outMax, "CP"c as int64, 2);
+            pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        i := i + 1;
+    }
+
+    // CNT+2:lineCount'
+    pos := ordPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := ordPutChar(out, pos, outMax, 50);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := ordPutInt(out, pos, outMax, lineCount);
+    pos := ordPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse ORDCHG. Returns line count. hdr.ChangeNo set from BGM elem[3].
+pub fn EdiOrdchgRead(buf: int64, bufLen: int64, hdr: int64, lines: int64, maxLines: int64): int64 {
+    var i: int64 := 0;
+    while (i < EDI_ORDER_HDR_SIZE) { poke8(hdr + i, 0); i := i + 1; }
+
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count: int64 := 0;
+    var curLine: int64 := 0;
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            // BGM+230++1+changeNo' → changeNo from elem[3]
+            if (ordTagIs(seg, 66, 71, 77) == 1) {
+                if (n > 3) {
+                    var cp: int64 := ordElemPtr(elems, 3);
+                    var cl: int64 := ordElemLen(elems, 3);
+                    poke64(hdr + EDI_ORDER_HDR_CHANGENO, ordParseInt(cp, cl));
+                }
+            }
+
+            // RFF+ON:orderRef' → original order number (stored in HDR_NUM)
+            if (ordTagIs(seg, 82, 70, 70) == 1) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 0), ordElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql >= 2 && peek8(qp) == 79 && peek8(qp+1) == 78) {   // "ON"
+                            poke64(hdr + EDI_ORDER_HDR_NUM,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_ORDER_HDR_NUMLEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // LIN
+            if (ordTagIs(seg, 76, 73, 78) == 1) {
+                if (count < maxLines) {
+                    curLine := lines + count * EDI_ORDER_LINE_SIZE;
+                    var zi: int64 := 0;
+                    while (zi < EDI_ORDER_LINE_SIZE) { poke8(curLine + zi, 0); zi := zi + 1; }
+                    poke64(curLine + EDI_ORDER_LINE_LINENO, count + 1);
+                    if (n > 2) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(ordElemPtr(elems, 2), ordElemLen(elems, 2), comps, 4);
+                        poke64(curLine + EDI_ORDER_LINE_GTIN,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(curLine + EDI_ORDER_LINE_GTINLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                    count := count + 1;
+                }
+            }
+
+            // QTY
+            if (ordTagIs(seg, 81, 84, 89) == 1 && curLine != 0) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 0), ordElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql >= 2 && peek8(qp) == 50 && peek8(qp+1) == 49) {
+                            var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                            var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            poke64(curLine + EDI_ORDER_LINE_QTY, ordParseInt(vp, vl));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // PRI
+            if (ordTagIs(seg, 80, 82, 73) == 1 && curLine != 0) {
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(ordElemPtr(elems, 0), ordElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql >= 3 && peek8(qp) == 65 && peek8(qp+1) == 65 && peek8(qp+2) == 65) {
+                            var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                            var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            poke64(curLine + EDI_ORDER_LINE_PRICE, ordParsePrice(vp, vl));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}

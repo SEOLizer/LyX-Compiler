@@ -4,6 +4,7 @@
 // ==================================================================
 
 import src.ir;
+import src.parser;
 import src.std.alloc;
 
 // AST node field offsets (node size = 88 bytes)
@@ -867,10 +868,14 @@ pub type IRLower = class {
     return dest;
   }
   
+  fn _unused_placeholder_lx10(): void {
+    // Slot-Padding: IRLower braucht gerade Methodenanzahl für VMT-Alignment
+  }
+
   // ------------------------------------------------------------------
   // Function Call Lowering
   // ------------------------------------------------------------------
-  
+
   fn lowerCall(expr: int64): int64 {
     // WP-2.1: generic calls (iVal=2) go through the monomorphization path
     if (self.nodeIVal(expr) == 2) {
@@ -990,6 +995,45 @@ pub type IRLower = class {
         var instrIdx: int64 := self.irAddInstrDirect(IRO_INSPECT, -1, valSrc, -1, 0);
         self.irSetStrOff(instrIdx, nameOff);
       }
+      return dest;
+    }
+
+    // PrintLn("literal") / Print("literal"): same mechanism as PrintStr below,
+    // but PrintLn appends '\n'. Inline — adding helper methods shifts vtable.
+    if ((self.seq(fname, fnlen, "PrintLn", 7) || self.seq(fname, fnlen, "Print", 5)) &&
+        arg0 >= 0 && self.nodeKind(arg0) == NK_LIT_STR) {
+      var plAddNl: int64 := 0;
+      if self.seq(fname, fnlen, "PrintLn", 7) { plAddNl := 1; }
+      var plStart: int64 := (self.nodeSVal(arg0) as int64) + 1;
+      var plSrcLen: int64 := self.nodeSLen(arg0) - 2;
+      if (plSrcLen < 0) { plSrcLen := 0; }
+      var plBuf: int64 := alloc(plSrcLen + 9);
+      var plOut: int64 := 0;
+      var plI: int64 := 0;
+      while plI < plSrcLen {
+        var plC: int64 := peek8(plStart + plI);
+        if plC == 92 && plI + 1 < plSrcLen {
+          var plN: int64 := peek8(plStart + plI + 1);
+          if plN == 110      { plC := 10; plI := plI + 1; }
+          else if plN == 116 { plC := 9;  plI := plI + 1; }
+          else if plN == 114 { plC := 13; plI := plI + 1; }
+          else if plN == 92  { plC := 92; plI := plI + 1; }
+          else if plN == 34  { plC := 34; plI := plI + 1; }
+          else if plN == 48  { plC := 0;  plI := plI + 1; }
+        }
+        poke8(plBuf + plOut, plC);
+        plOut := plOut + 1;
+        plI := plI + 1;
+      }
+      if plAddNl != 0 { poke8(plBuf + plOut, 10); plOut := plOut + 1; }
+      var plStrOff: int64 := self.irAddString(plBuf as pchar, plOut);
+      var plA: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_STR, plA, -1, -1, plStrOff);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 0, plA, -1, 0);
+      var plL: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, plL, -1, -1, plOut);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 1, plL, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 1);
       return dest;
     }
 
@@ -1156,6 +1200,1098 @@ pub type IRLower = class {
     }
 
 
+    // WP-08: PrintFloat(f) → IRO_CALL_BUILTIN(id=9) for ARM64 backends
+    if (self.seq(fname, fnlen, "PrintFloat", 10)) {
+      if arg0 >= 0 {
+        var pfTemp: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pfTemp, -1, 0);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 9);
+      }
+      return dest;
+    }
+
+    // WP-D3: PrintInt(n) → IRO_CALL_BUILTIN(id=2) so Xtensa/ARM64 backends
+    // can dispatch to a real itoa implementation instead of the generic id=1 fallback.
+    if (self.seq(fname, fnlen, "PrintInt", 8)) {
+      if arg0 >= 0 {
+        var piTemp: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, piTemp, -1, 0);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 2);
+      }
+      return dest;
+    }
+
+    // WP-GPIO-1: mem_barrier() / inst_barrier() → IRO_CALL_BUILTIN(id=10/11)
+    // ARM64 backend: DMB SY (id=10) / ISB (id=11)
+    if (self.seq(fname, fnlen, "mem_barrier", 11)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 10);
+      return dest;
+    }
+    if (self.seq(fname, fnlen, "inst_barrier", 12)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 11);
+      return dest;
+    }
+
+    // WP-01: StrSub(s, start, len) → IRO_CALL_BUILTIN(id=6)
+    if (self.seq(fname, fnlen, "StrSub", 6)) {
+      if arg0 >= 0 {
+        var ss0: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ss0, -1, 0);
+        var ssN1: int64 := self.nodeNext(arg0);
+        if ssN1 >= 0 {
+          var ss1: int64 := self.lowerExpr(ssN1);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, 1, ss1, -1, 0);
+          var ssN2: int64 := self.nodeNext(ssN1);
+          if ssN2 >= 0 {
+            var ss2: int64 := self.lowerExpr(ssN2);
+            self.irAddInstrDirect(IRO_STORE_LOCAL, 2, ss2, -1, 0);
+          }
+        }
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 6);
+      }
+      return dest;
+    }
+
+    // WP-01: StrConcat(a, b) → IRO_CALL_BUILTIN(id=7)
+    if (self.seq(fname, fnlen, "StrConcat", 9)) {
+      if arg0 >= 0 {
+        var sc0: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sc0, -1, 0);
+        var scN1: int64 := self.nodeNext(arg0);
+        if scN1 >= 0 {
+          var sc1: int64 := self.lowerExpr(scN1);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sc1, -1, 0);
+        }
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 7);
+      }
+      return dest;
+    }
+
+    // WP-01: StrCopy(s) → IRO_CALL_BUILTIN(id=8)
+    if (self.seq(fname, fnlen, "StrCopy", 7)) {
+      if arg0 >= 0 {
+        var scy0: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, scy0, -1, 0);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 8);
+      }
+      return dest;
+    }
+
+    // WP-08: Printf(fmt, a1, a2, a3) → IRO_CALL_BUILTIN(id=10) for ARM64 backends
+    if (self.seq(fname, fnlen, "Printf", 6)) {
+      if arg0 >= 0 {
+        var pf0: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pf0, -1, 0);
+        var pfN1: int64 := self.nodeNext(arg0);
+        if pfN1 >= 0 {
+          var pf1: int64 := self.lowerExpr(pfN1);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, 1, pf1, -1, 0);
+          var pfN2: int64 := self.nodeNext(pfN1);
+          if pfN2 >= 0 {
+            var pf2: int64 := self.lowerExpr(pfN2);
+            self.irAddInstrDirect(IRO_STORE_LOCAL, 2, pf2, -1, 0);
+            var pfN3: int64 := self.nodeNext(pfN2);
+            if pfN3 >= 0 {
+              var pf3: int64 := self.lowerExpr(pfN3);
+              self.irAddInstrDirect(IRO_STORE_LOCAL, 3, pf3, -1, 0);
+            }
+          }
+        }
+      }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 10);
+      return dest;
+    }
+
+    // WP-D2: mmap(addr, size, ...) → IRO_ALLOC(size) for ARM64 backends.
+    // The ARM64 IR backend (emit_arm64.lyx) maps IRO_ALLOC to mmap on Linux
+    // and to VirtualAlloc on Windows, so this translation is correct for both.
+    if (self.seq(fname, fnlen, "mmap", 4)) {
+      if arg0 >= 0 {
+        var mmapSizeNode: int64 := self.nodeNext(arg0);  // second arg = size
+        if mmapSizeNode >= 0 {
+          var mmapSizeSlot: int64 := self.lowerExpr(mmapSizeNode);
+          self.irAddInstrDirect(IRO_ALLOC, dest, mmapSizeSlot, -1, 0);
+        }
+      }
+      return dest;
+    }
+
+    // WP-D2: munmap(ptr, size) → IRO_FREE(ptr) for ARM64 backends.
+    if (self.seq(fname, fnlen, "munmap", 6)) {
+      if arg0 >= 0 {
+        var munmapPtrSlot: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_FREE, -1, munmapPtrSlot, -1, 0);
+      }
+      return dest;
+    }
+
+    // LX-06: VFS syscalls (--target=lyxos, builtin IDs 20-41)
+    // Pattern: lower args into slots 0..N-1, emit IRO_CALL_BUILTIN(id).
+    // No helper method allowed (would shift IRLower VMT and break seed).
+    if (self.seq(fname, fnlen, "sys_open", 8)) {
+      var soA: int64 := arg0;
+      if soA >= 0 { var soT: int64 := self.lowerExpr(soA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, soT, -1, 0); soA := self.nodeNext(soA); }
+      if soA >= 0 { var soT: int64 := self.lowerExpr(soA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, soT, -1, 0); soA := self.nodeNext(soA); }
+      if soA >= 0 { var soT: int64 := self.lowerExpr(soA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, soT, -1, 0); soA := self.nodeNext(soA); }
+      if soA >= 0 { var soT: int64 := self.lowerExpr(soA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, soT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 20); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_close", 9)) {
+      if arg0 >= 0 { var scT: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, scT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 21); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_read", 8)) {
+      var srA: int64 := arg0;
+      if srA >= 0 { var srT: int64 := self.lowerExpr(srA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, srT, -1, 0); srA := self.nodeNext(srA); }
+      if srA >= 0 { var srT: int64 := self.lowerExpr(srA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, srT, -1, 0); srA := self.nodeNext(srA); }
+      if srA >= 0 { var srT: int64 := self.lowerExpr(srA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, srT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 22); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_write", 9)) {
+      var swA: int64 := arg0;
+      if swA >= 0 { var swT: int64 := self.lowerExpr(swA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, swT, -1, 0); swA := self.nodeNext(swA); }
+      if swA >= 0 { var swT: int64 := self.lowerExpr(swA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, swT, -1, 0); swA := self.nodeNext(swA); }
+      if swA >= 0 { var swT: int64 := self.lowerExpr(swA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, swT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 23); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_seek", 8)) {
+      var skA: int64 := arg0;
+      if skA >= 0 { var skT: int64 := self.lowerExpr(skA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, skT, -1, 0); skA := self.nodeNext(skA); }
+      if skA >= 0 { var skT: int64 := self.lowerExpr(skA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, skT, -1, 0); skA := self.nodeNext(skA); }
+      if skA >= 0 { var skT: int64 := self.lowerExpr(skA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, skT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 24); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_stat", 8)) {
+      var stA: int64 := arg0;
+      if stA >= 0 { var stT: int64 := self.lowerExpr(stA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, stT, -1, 0); stA := self.nodeNext(stA); }
+      if stA >= 0 { var stT: int64 := self.lowerExpr(stA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, stT, -1, 0); stA := self.nodeNext(stA); }
+      if stA >= 0 { var stT: int64 := self.lowerExpr(stA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, stT, -1, 0); stA := self.nodeNext(stA); }
+      if stA >= 0 { var stT: int64 := self.lowerExpr(stA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, stT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 25); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_fstat", 9)) {
+      var sfA: int64 := arg0;
+      if sfA >= 0 { var sfT: int64 := self.lowerExpr(sfA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sfT, -1, 0); sfA := self.nodeNext(sfA); }
+      if sfA >= 0 { var sfT: int64 := self.lowerExpr(sfA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sfT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 26); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_mkdir", 9)) {
+      var smA: int64 := arg0;
+      if smA >= 0 { var smT: int64 := self.lowerExpr(smA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, smT, -1, 0); smA := self.nodeNext(smA); }
+      if smA >= 0 { var smT: int64 := self.lowerExpr(smA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, smT, -1, 0); smA := self.nodeNext(smA); }
+      if smA >= 0 { var smT: int64 := self.lowerExpr(smA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, smT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 27); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_unlink", 10)) {
+      var suA: int64 := arg0;
+      if suA >= 0 { var suT: int64 := self.lowerExpr(suA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, suT, -1, 0); suA := self.nodeNext(suA); }
+      if suA >= 0 { var suT: int64 := self.lowerExpr(suA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, suT, -1, 0); suA := self.nodeNext(suA); }
+      if suA >= 0 { var suT: int64 := self.lowerExpr(suA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, suT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 28); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_rename", 10)) {
+      var sreA: int64 := arg0;
+      if sreA >= 0 { var sreT: int64 := self.lowerExpr(sreA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sreT, -1, 0); sreA := self.nodeNext(sreA); }
+      if sreA >= 0 { var sreT: int64 := self.lowerExpr(sreA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sreT, -1, 0); sreA := self.nodeNext(sreA); }
+      if sreA >= 0 { var sreT: int64 := self.lowerExpr(sreA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sreT, -1, 0); sreA := self.nodeNext(sreA); }
+      if sreA >= 0 { var sreT: int64 := self.lowerExpr(sreA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, sreT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 29); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_readdir", 11)) {
+      var srdA: int64 := arg0;
+      if srdA >= 0 { var srdT: int64 := self.lowerExpr(srdA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, srdT, -1, 0); srdA := self.nodeNext(srdA); }
+      if srdA >= 0 { var srdT: int64 := self.lowerExpr(srdA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, srdT, -1, 0); srdA := self.nodeNext(srdA); }
+      if srdA >= 0 { var srdT: int64 := self.lowerExpr(srdA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, srdT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 30); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_dup", 7)) {
+      var sdA: int64 := arg0;
+      if sdA >= 0 { var sdT: int64 := self.lowerExpr(sdA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sdT, -1, 0); sdA := self.nodeNext(sdA); }
+      if sdA >= 0 { var sdT: int64 := self.lowerExpr(sdA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sdT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 31); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_pipe", 8)) {
+      var spA: int64 := arg0;
+      if spA >= 0 { var spT: int64 := self.lowerExpr(spA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, spT, -1, 0); spA := self.nodeNext(spA); }
+      if spA >= 0 { var spT: int64 := self.lowerExpr(spA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, spT, -1, 0); spA := self.nodeNext(spA); }
+      if spA >= 0 { var spT: int64 := self.lowerExpr(spA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, spT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 32); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_truncate", 12)) {
+      var strA: int64 := arg0;
+      if strA >= 0 { var strT: int64 := self.lowerExpr(strA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, strT, -1, 0); strA := self.nodeNext(strA); }
+      if strA >= 0 { var strT: int64 := self.lowerExpr(strA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, strT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 33); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_sync", 8)) {
+      if arg0 >= 0 { var syT: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, syT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 34); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_mount", 9)) {
+      var smoA: int64 := arg0;
+      if smoA >= 0 { var smoT: int64 := self.lowerExpr(smoA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, smoT, -1, 0); smoA := self.nodeNext(smoA); }
+      if smoA >= 0 { var smoT: int64 := self.lowerExpr(smoA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, smoT, -1, 0); smoA := self.nodeNext(smoA); }
+      if smoA >= 0 { var smoT: int64 := self.lowerExpr(smoA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, smoT, -1, 0); smoA := self.nodeNext(smoA); }
+      if smoA >= 0 { var smoT: int64 := self.lowerExpr(smoA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, smoT, -1, 0); smoA := self.nodeNext(smoA); }
+      if smoA >= 0 { var smoT: int64 := self.lowerExpr(smoA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, smoT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 35); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_umount", 10)) {
+      var sumA: int64 := arg0;
+      if sumA >= 0 { var sumT: int64 := self.lowerExpr(sumA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sumT, -1, 0); sumA := self.nodeNext(sumA); }
+      if sumA >= 0 { var sumT: int64 := self.lowerExpr(sumA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sumT, -1, 0); sumA := self.nodeNext(sumA); }
+      if sumA >= 0 { var sumT: int64 := self.lowerExpr(sumA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sumT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 36); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_getcwd", 10)) {
+      var sgcA: int64 := arg0;
+      if sgcA >= 0 { var sgcT: int64 := self.lowerExpr(sgcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sgcT, -1, 0); sgcA := self.nodeNext(sgcA); }
+      if sgcA >= 0 { var sgcT: int64 := self.lowerExpr(sgcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sgcT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 37); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_chdir", 9)) {
+      var schA: int64 := arg0;
+      if schA >= 0 { var schT: int64 := self.lowerExpr(schA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, schT, -1, 0); schA := self.nodeNext(schA); }
+      if schA >= 0 { var schT: int64 := self.lowerExpr(schA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, schT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 38); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_symlink", 11)) {
+      var sslA: int64 := arg0;
+      if sslA >= 0 { var sslT: int64 := self.lowerExpr(sslA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sslT, -1, 0); sslA := self.nodeNext(sslA); }
+      if sslA >= 0 { var sslT: int64 := self.lowerExpr(sslA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sslT, -1, 0); sslA := self.nodeNext(sslA); }
+      if sslA >= 0 { var sslT: int64 := self.lowerExpr(sslA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sslT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 39); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_readlink", 12)) {
+      var srlA: int64 := arg0;
+      if srlA >= 0 { var srlT: int64 := self.lowerExpr(srlA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, srlT, -1, 0); srlA := self.nodeNext(srlA); }
+      if srlA >= 0 { var srlT: int64 := self.lowerExpr(srlA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, srlT, -1, 0); srlA := self.nodeNext(srlA); }
+      if srlA >= 0 { var srlT: int64 := self.lowerExpr(srlA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, srlT, -1, 0); srlA := self.nodeNext(srlA); }
+      if srlA >= 0 { var srlT: int64 := self.lowerExpr(srlA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, srlT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 40); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_content_id", 14)) {
+      var sciA: int64 := arg0;
+      if sciA >= 0 { var sciT: int64 := self.lowerExpr(sciA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sciT, -1, 0); sciA := self.nodeNext(sciA); }
+      if sciA >= 0 { var sciT: int64 := self.lowerExpr(sciA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sciT, -1, 0); sciA := self.nodeNext(sciA); }
+      if sciA >= 0 { var sciT: int64 := self.lowerExpr(sciA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sciT, -1, 0); sciA := self.nodeNext(sciA); }
+      if sciA >= 0 { var sciT: int64 := self.lowerExpr(sciA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, sciT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 41); return dest;
+    }
+
+    // LX-07: I/O-Geräte & Poll (0x0300–0x0305) — IDs 42–47
+    if (self.seq(fname, fnlen, "sys_poll", 8)) {
+      var spA: int64 := arg0;
+      if spA >= 0 { var spT: int64 := self.lowerExpr(spA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, spT, -1, 0); spA := self.nodeNext(spA); }
+      if spA >= 0 { var spT: int64 := self.lowerExpr(spA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, spT, -1, 0); spA := self.nodeNext(spA); }
+      if spA >= 0 { var spT: int64 := self.lowerExpr(spA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, spT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 42); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ioctl", 9)) {
+      var sioA: int64 := arg0;
+      if sioA >= 0 { var sioT: int64 := self.lowerExpr(sioA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sioT, -1, 0); sioA := self.nodeNext(sioA); }
+      if sioA >= 0 { var sioT: int64 := self.lowerExpr(sioA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sioT, -1, 0); sioA := self.nodeNext(sioA); }
+      if sioA >= 0 { var sioT: int64 := self.lowerExpr(sioA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sioT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 43); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_mmap_device", 15)) {
+      var smdA: int64 := arg0;
+      if smdA >= 0 { var smdT: int64 := self.lowerExpr(smdA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, smdT, -1, 0); smdA := self.nodeNext(smdA); }
+      if smdA >= 0 { var smdT: int64 := self.lowerExpr(smdA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, smdT, -1, 0); smdA := self.nodeNext(smdA); }
+      if smdA >= 0 { var smdT: int64 := self.lowerExpr(smdA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, smdT, -1, 0); smdA := self.nodeNext(smdA); }
+      if smdA >= 0 { var smdT: int64 := self.lowerExpr(smdA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, smdT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 44); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_irq_bind", 12)) {
+      var sibA: int64 := arg0;
+      if sibA >= 0 { var sibT: int64 := self.lowerExpr(sibA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sibT, -1, 0); sibA := self.nodeNext(sibA); }
+      if sibA >= 0 { var sibT: int64 := self.lowerExpr(sibA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sibT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 45); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_port_in", 11)) {
+      var spiA: int64 := arg0;
+      if spiA >= 0 { var spiT: int64 := self.lowerExpr(spiA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, spiT, -1, 0); spiA := self.nodeNext(spiA); }
+      if spiA >= 0 { var spiT: int64 := self.lowerExpr(spiA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, spiT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 46); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_port_out", 12)) {
+      var spoA: int64 := arg0;
+      if spoA >= 0 { var spoT: int64 := self.lowerExpr(spoA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, spoT, -1, 0); spoA := self.nodeNext(spoA); }
+      if spoA >= 0 { var spoT: int64 := self.lowerExpr(spoA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, spoT, -1, 0); spoA := self.nodeNext(spoA); }
+      if spoA >= 0 { var spoT: int64 := self.lowerExpr(spoA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, spoT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 47); return dest;
+    }
+
+    // LX-08: Netzwerk (0x0600–0x0609) — IDs 48–57
+    if (self.seq(fname, fnlen, "sys_socket", 10)) {
+      var ssoA: int64 := arg0;
+      if ssoA >= 0 { var ssoT: int64 := self.lowerExpr(ssoA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ssoT, -1, 0); ssoA := self.nodeNext(ssoA); }
+      if ssoA >= 0 { var ssoT: int64 := self.lowerExpr(ssoA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, ssoT, -1, 0); ssoA := self.nodeNext(ssoA); }
+      if ssoA >= 0 { var ssoT: int64 := self.lowerExpr(ssoA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, ssoT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 48); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_bind", 8)) {
+      var sbnA: int64 := arg0;
+      if sbnA >= 0 { var sbnT: int64 := self.lowerExpr(sbnA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sbnT, -1, 0); sbnA := self.nodeNext(sbnA); }
+      if sbnA >= 0 { var sbnT: int64 := self.lowerExpr(sbnA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sbnT, -1, 0); sbnA := self.nodeNext(sbnA); }
+      if sbnA >= 0 { var sbnT: int64 := self.lowerExpr(sbnA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sbnT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 49); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_listen", 10)) {
+      var sliA: int64 := arg0;
+      if sliA >= 0 { var sliT: int64 := self.lowerExpr(sliA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sliT, -1, 0); sliA := self.nodeNext(sliA); }
+      if sliA >= 0 { var sliT: int64 := self.lowerExpr(sliA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sliT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 50); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_accept", 10)) {
+      var sacA: int64 := arg0;
+      if sacA >= 0 { var sacT: int64 := self.lowerExpr(sacA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sacT, -1, 0); sacA := self.nodeNext(sacA); }
+      if sacA >= 0 { var sacT: int64 := self.lowerExpr(sacA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sacT, -1, 0); sacA := self.nodeNext(sacA); }
+      if sacA >= 0 { var sacT: int64 := self.lowerExpr(sacA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sacT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 51); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_connect", 11)) {
+      var scnA: int64 := arg0;
+      if scnA >= 0 { var scnT: int64 := self.lowerExpr(scnA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, scnT, -1, 0); scnA := self.nodeNext(scnA); }
+      if scnA >= 0 { var scnT: int64 := self.lowerExpr(scnA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, scnT, -1, 0); scnA := self.nodeNext(scnA); }
+      if scnA >= 0 { var scnT: int64 := self.lowerExpr(scnA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, scnT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 52); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_sendmsg", 11)) {
+      var ssmA: int64 := arg0;
+      if ssmA >= 0 { var ssmT: int64 := self.lowerExpr(ssmA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ssmT, -1, 0); ssmA := self.nodeNext(ssmA); }
+      if ssmA >= 0 { var ssmT: int64 := self.lowerExpr(ssmA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, ssmT, -1, 0); ssmA := self.nodeNext(ssmA); }
+      if ssmA >= 0 { var ssmT: int64 := self.lowerExpr(ssmA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, ssmT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 53); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_recvmsg", 11)) {
+      var srmA: int64 := arg0;
+      if srmA >= 0 { var srmT: int64 := self.lowerExpr(srmA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, srmT, -1, 0); srmA := self.nodeNext(srmA); }
+      if srmA >= 0 { var srmT: int64 := self.lowerExpr(srmA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, srmT, -1, 0); srmA := self.nodeNext(srmA); }
+      if srmA >= 0 { var srmT: int64 := self.lowerExpr(srmA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, srmT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 54); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_setsockopt", 14)) {
+      var sssA: int64 := arg0;
+      if sssA >= 0 { var sssT: int64 := self.lowerExpr(sssA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sssT, -1, 0); sssA := self.nodeNext(sssA); }
+      if sssA >= 0 { var sssT: int64 := self.lowerExpr(sssA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sssT, -1, 0); sssA := self.nodeNext(sssA); }
+      if sssA >= 0 { var sssT: int64 := self.lowerExpr(sssA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sssT, -1, 0); sssA := self.nodeNext(sssA); }
+      if sssA >= 0 { var sssT: int64 := self.lowerExpr(sssA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, sssT, -1, 0); sssA := self.nodeNext(sssA); }
+      if sssA >= 0 { var sssT: int64 := self.lowerExpr(sssA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, sssT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 55); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_getsockopt", 14)) {
+      var sgsA: int64 := arg0;
+      if sgsA >= 0 { var sgsT: int64 := self.lowerExpr(sgsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sgsT, -1, 0); sgsA := self.nodeNext(sgsA); }
+      if sgsA >= 0 { var sgsT: int64 := self.lowerExpr(sgsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sgsT, -1, 0); sgsA := self.nodeNext(sgsA); }
+      if sgsA >= 0 { var sgsT: int64 := self.lowerExpr(sgsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sgsT, -1, 0); sgsA := self.nodeNext(sgsA); }
+      if sgsA >= 0 { var sgsT: int64 := self.lowerExpr(sgsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, sgsT, -1, 0); sgsA := self.nodeNext(sgsA); }
+      if sgsA >= 0 { var sgsT: int64 := self.lowerExpr(sgsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, sgsT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 56); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_shutdown", 12)) {
+      var sshA: int64 := arg0;
+      if sshA >= 0 { var sshT: int64 := self.lowerExpr(sshA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sshT, -1, 0); sshA := self.nodeNext(sshA); }
+      if sshA >= 0 { var sshT: int64 := self.lowerExpr(sshA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sshT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 57); return dest;
+    }
+
+    // LX-09: Prozess & Threads (0x0000–0x000D) — IDs 58–71
+    if (self.seq(fname, fnlen, "sys_version", 11)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 58); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_exit", 8)) {
+      var sexA: int64 := arg0;
+      if sexA >= 0 { var sexT: int64 := self.lowerExpr(sexA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sexT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 59); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_exit_group", 14)) {
+      var segA: int64 := arg0;
+      if segA >= 0 { var segT: int64 := self.lowerExpr(segA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, segT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 60); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_spawn", 9)) {
+      var sspA: int64 := arg0;
+      if sspA >= 0 { var sspT: int64 := self.lowerExpr(sspA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sspT, -1, 0); sspA := self.nodeNext(sspA); }
+      if sspA >= 0 { var sspT: int64 := self.lowerExpr(sspA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sspT, -1, 0); sspA := self.nodeNext(sspA); }
+      if sspA >= 0 { var sspT: int64 := self.lowerExpr(sspA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sspT, -1, 0); sspA := self.nodeNext(sspA); }
+      if sspA >= 0 { var sspT: int64 := self.lowerExpr(sspA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, sspT, -1, 0); sspA := self.nodeNext(sspA); }
+      if sspA >= 0 { var sspT: int64 := self.lowerExpr(sspA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, sspT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 61); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_thread_spawn", 16)) {
+      var stsA: int64 := arg0;
+      if stsA >= 0 { var stsT: int64 := self.lowerExpr(stsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, stsT, -1, 0); stsA := self.nodeNext(stsA); }
+      if stsA >= 0 { var stsT: int64 := self.lowerExpr(stsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, stsT, -1, 0); stsA := self.nodeNext(stsA); }
+      if stsA >= 0 { var stsT: int64 := self.lowerExpr(stsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, stsT, -1, 0); stsA := self.nodeNext(stsA); }
+      if stsA >= 0 { var stsT: int64 := self.lowerExpr(stsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, stsT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 62); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_thread_exit", 15)) {
+      var steA: int64 := arg0;
+      if steA >= 0 { var steT: int64 := self.lowerExpr(steA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, steT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 63); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_wait", 8)) {
+      var swtA: int64 := arg0;
+      if swtA >= 0 { var swtT: int64 := self.lowerExpr(swtA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, swtT, -1, 0); swtA := self.nodeNext(swtA); }
+      if swtA >= 0 { var swtT: int64 := self.lowerExpr(swtA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, swtT, -1, 0); swtA := self.nodeNext(swtA); }
+      if swtA >= 0 { var swtT: int64 := self.lowerExpr(swtA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, swtT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 64); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_getpid", 10)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 65); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_gettid", 10)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 66); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_yield", 9)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 67); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_sleep_ns", 12)) {
+      var sslA: int64 := arg0;
+      if sslA >= 0 { var sslT: int64 := self.lowerExpr(sslA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sslT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 68); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_priority", 12)) {
+      var spriA: int64 := arg0;
+      if spriA >= 0 { var spriT: int64 := self.lowerExpr(spriA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, spriT, -1, 0); spriA := self.nodeNext(spriA); }
+      if spriA >= 0 { var spriT: int64 := self.lowerExpr(spriA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, spriT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 69); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_getrandom", 13)) {
+      var sgrA: int64 := arg0;
+      if sgrA >= 0 { var sgrT: int64 := self.lowerExpr(sgrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sgrT, -1, 0); sgrA := self.nodeNext(sgrA); }
+      if sgrA >= 0 { var sgrT: int64 := self.lowerExpr(sgrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sgrT, -1, 0); sgrA := self.nodeNext(sgrA); }
+      if sgrA >= 0 { var sgrT: int64 := self.lowerExpr(sgrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sgrT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 70); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_signal_mask", 15)) {
+      var ssmkA: int64 := arg0;
+      if ssmkA >= 0 { var ssmkT: int64 := self.lowerExpr(ssmkA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ssmkT, -1, 0); ssmkA := self.nodeNext(ssmkA); }
+      if ssmkA >= 0 { var ssmkT: int64 := self.lowerExpr(ssmkA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, ssmkT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 71); return dest;
+    }
+
+    // LX-10: IPC & Synchronisation (0x0400–0x040C) — IDs 72–84, vollständig inline
+    if (self.seq(fname, fnlen, "sys_mutex_lock", 14)) {
+      var smlA: int64 := arg0;
+      if smlA >= 0 { var smlT: int64 := self.lowerExpr(smlA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, smlT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 72); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_mutex_unlock", 16)) {
+      var smuA: int64 := arg0;
+      if smuA >= 0 { var smuT: int64 := self.lowerExpr(smuA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, smuT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 73); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_sem_create", 14)) {
+      var sscA: int64 := arg0;
+      if sscA >= 0 { var sscT: int64 := self.lowerExpr(sscA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sscT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 74); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_sem_wait", 12)) {
+      var sswA: int64 := arg0;
+      if sswA >= 0 { var sswT: int64 := self.lowerExpr(sswA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sswT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 75); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_sem_post", 12)) {
+      var sspA: int64 := arg0;
+      if sspA >= 0 { var sspT: int64 := self.lowerExpr(sspA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sspT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 76); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_sem_destroy", 15)) {
+      var ssdA: int64 := arg0;
+      if ssdA >= 0 { var ssdT: int64 := self.lowerExpr(ssdA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ssdT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 77); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_channel_create", 18)) {
+      var sccA: int64 := arg0;
+      if sccA >= 0 { var sccT: int64 := self.lowerExpr(sccA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sccT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 78); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_channel_send", 16)) {
+      var scsA: int64 := arg0;
+      if scsA >= 0 { var scsT: int64 := self.lowerExpr(scsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, scsT, -1, 0); scsA := self.nodeNext(scsA); }
+      if scsA >= 0 { var scsT: int64 := self.lowerExpr(scsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, scsT, -1, 0); scsA := self.nodeNext(scsA); }
+      if scsA >= 0 { var scsT: int64 := self.lowerExpr(scsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, scsT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 79); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_channel_recv", 16)) {
+      var scrA: int64 := arg0;
+      if scrA >= 0 { var scrT: int64 := self.lowerExpr(scrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, scrT, -1, 0); scrA := self.nodeNext(scrA); }
+      if scrA >= 0 { var scrT: int64 := self.lowerExpr(scrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, scrT, -1, 0); scrA := self.nodeNext(scrA); }
+      if scrA >= 0 { var scrT: int64 := self.lowerExpr(scrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, scrT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 80); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_notify_create", 17)) {
+      var sncA: int64 := arg0;
+      if sncA >= 0 { var sncT: int64 := self.lowerExpr(sncA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sncT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 81); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_notify_send", 15)) {
+      var snsA: int64 := arg0;
+      if snsA >= 0 { var snsT: int64 := self.lowerExpr(snsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, snsT, -1, 0); snsA := self.nodeNext(snsA); }
+      if snsA >= 0 { var snsT: int64 := self.lowerExpr(snsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, snsT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 82); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_notify_recv", 15)) {
+      var snrA: int64 := arg0;
+      if snrA >= 0 { var snrT: int64 := self.lowerExpr(snrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, snrT, -1, 0); snrA := self.nodeNext(snrA); }
+      if snrA >= 0 { var snrT: int64 := self.lowerExpr(snrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, snrT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 83); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_futex", 9)) {
+      var sfuA: int64 := arg0;
+      if sfuA >= 0 { var sfuT: int64 := self.lowerExpr(sfuA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sfuT, -1, 0); sfuA := self.nodeNext(sfuA); }
+      if sfuA >= 0 { var sfuT: int64 := self.lowerExpr(sfuA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sfuT, -1, 0); sfuA := self.nodeNext(sfuA); }
+      if sfuA >= 0 { var sfuT: int64 := self.lowerExpr(sfuA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sfuT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 84); return dest;
+    }
+    // LX-11: Zeit-Syscalls (0x0500–0x0504) — IDs 85–89
+    if (self.seq(fname, fnlen, "sys_clock_get", 13)) {
+      var scgA: int64 := arg0;
+      if scgA >= 0 { var scgT: int64 := self.lowerExpr(scgA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, scgT, -1, 0); scgA := self.nodeNext(scgA); }
+      if scgA >= 0 { var scgT: int64 := self.lowerExpr(scgA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, scgT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 85); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_clock_set", 13)) {
+      var scsA: int64 := arg0;
+      if scsA >= 0 { var scsT: int64 := self.lowerExpr(scsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, scsT, -1, 0); scsA := self.nodeNext(scsA); }
+      if scsA >= 0 { var scsT: int64 := self.lowerExpr(scsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, scsT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 86); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_timer_create", 16)) {
+      var stcA: int64 := arg0;
+      if stcA >= 0 { var stcT: int64 := self.lowerExpr(stcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, stcT, -1, 0); stcA := self.nodeNext(stcA); }
+      if stcA >= 0 { var stcT: int64 := self.lowerExpr(stcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, stcT, -1, 0); stcA := self.nodeNext(stcA); }
+      if stcA >= 0 { var stcT: int64 := self.lowerExpr(stcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, stcT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 87); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_timer_set", 13)) {
+      var stsA: int64 := arg0;
+      if stsA >= 0 { var stsT: int64 := self.lowerExpr(stsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, stsT, -1, 0); stsA := self.nodeNext(stsA); }
+      if stsA >= 0 { var stsT: int64 := self.lowerExpr(stsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, stsT, -1, 0); stsA := self.nodeNext(stsA); }
+      if stsA >= 0 { var stsT: int64 := self.lowerExpr(stsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, stsT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 88); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_timer_wait", 14)) {
+      var stwA: int64 := arg0;
+      if stwA >= 0 { var stwT: int64 := self.lowerExpr(stwA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, stwT, -1, 0); stwA := self.nodeNext(stwA); }
+      if stwA >= 0 { var stwT: int64 := self.lowerExpr(stwA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, stwT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 89); return dest;
+    }
+    // LX-12: Capabilities + Pledge + Unveil (0x0700–0x0708) — IDs 90–98
+    if (self.seq(fname, fnlen, "sys_cap_create", 14)) {
+      var sccA: int64 := arg0;
+      if sccA >= 0 { var sccT: int64 := self.lowerExpr(sccA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sccT, -1, 0); sccA := self.nodeNext(sccA); }
+      if sccA >= 0 { var sccT: int64 := self.lowerExpr(sccA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sccT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 90); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_cap_restrict", 16)) {
+      var scrA: int64 := arg0;
+      if scrA >= 0 { var scrT: int64 := self.lowerExpr(scrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, scrT, -1, 0); scrA := self.nodeNext(scrA); }
+      if scrA >= 0 { var scrT: int64 := self.lowerExpr(scrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, scrT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 91); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_cap_rights", 14)) {
+      var scrA: int64 := arg0;
+      if scrA >= 0 { var scrT: int64 := self.lowerExpr(scrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, scrT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 92); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_pledge", 10)) {
+      var splA: int64 := arg0;
+      if splA >= 0 { var splT: int64 := self.lowerExpr(splA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, splT, -1, 0); splA := self.nodeNext(splA); }
+      if splA >= 0 { var splT: int64 := self.lowerExpr(splA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, splT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 93); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_unveil", 10)) {
+      var suvA: int64 := arg0;
+      if suvA >= 0 { var suvT: int64 := self.lowerExpr(suvA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, suvT, -1, 0); suvA := self.nodeNext(suvA); }
+      if suvA >= 0 { var suvT: int64 := self.lowerExpr(suvA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, suvT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 94); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_uid_get", 11)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 95); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_gid_get", 11)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 96); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_setuid", 10)) {
+      var ssuA: int64 := arg0;
+      if ssuA >= 0 { var ssuT: int64 := self.lowerExpr(ssuA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ssuT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 97); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_seccomp", 11)) {
+      var sscA: int64 := arg0;
+      if sscA >= 0 { var sscT: int64 := self.lowerExpr(sscA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sscT, -1, 0); sscA := self.nodeNext(sscA); }
+      if sscA >= 0 { var sscT: int64 := self.lowerExpr(sscA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sscT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 98); return dest;
+    }
+
+    // LX-13: Task-Scheduler & Parallelität (0x0B00–0x0B09) — IDs 99–108
+    if (self.seq(fname, fnlen, "sys_task_spawn", 14)) {
+      var stsA: int64 := arg0;
+      if stsA >= 0 { var stsT: int64 := self.lowerExpr(stsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, stsT, -1, 0); stsA := self.nodeNext(stsA); }
+      if stsA >= 0 { var stsT: int64 := self.lowerExpr(stsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, stsT, -1, 0); stsA := self.nodeNext(stsA); }
+      if stsA >= 0 { var stsT: int64 := self.lowerExpr(stsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, stsT, -1, 0); stsA := self.nodeNext(stsA); }
+      if stsA >= 0 { var stsT: int64 := self.lowerExpr(stsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, stsT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 99); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_task_await", 14)) {
+      var staA: int64 := arg0;
+      if staA >= 0 { var staT: int64 := self.lowerExpr(staA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, staT, -1, 0); staA := self.nodeNext(staA); }
+      if staA >= 0 { var staT: int64 := self.lowerExpr(staA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, staT, -1, 0); staA := self.nodeNext(staA); }
+      if staA >= 0 { var staT: int64 := self.lowerExpr(staA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, staT, -1, 0); staA := self.nodeNext(staA); }
+      if staA >= 0 { var staT: int64 := self.lowerExpr(staA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, staT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 100); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_task_cancel", 15)) {
+      var stcA: int64 := arg0;
+      if stcA >= 0 { var stcT: int64 := self.lowerExpr(stcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, stcT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 101); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_task_group_create", 21)) {
+      var sgcA: int64 := arg0;
+      if sgcA >= 0 { var sgcT: int64 := self.lowerExpr(sgcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sgcT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 102); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_task_group_add", 18)) {
+      var sgaA: int64 := arg0;
+      if sgaA >= 0 { var sgaT: int64 := self.lowerExpr(sgaA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sgaT, -1, 0); sgaA := self.nodeNext(sgaA); }
+      if sgaA >= 0 { var sgaT: int64 := self.lowerExpr(sgaA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sgaT, -1, 0); sgaA := self.nodeNext(sgaA); }
+      if sgaA >= 0 { var sgaT: int64 := self.lowerExpr(sgaA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sgaT, -1, 0); sgaA := self.nodeNext(sgaA); }
+      if sgaA >= 0 { var sgaT: int64 := self.lowerExpr(sgaA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, sgaT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 103); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_task_group_await", 20)) {
+      var sgwA: int64 := arg0;
+      if sgwA >= 0 { var sgwT: int64 := self.lowerExpr(sgwA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sgwT, -1, 0); sgwA := self.nodeNext(sgwA); }
+      if sgwA >= 0 { var sgwT: int64 := self.lowerExpr(sgwA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sgwT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 104); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_cpu_count", 13)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 105); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_cpu_topology", 16)) {
+      var sctA: int64 := arg0;
+      if sctA >= 0 { var sctT: int64 := self.lowerExpr(sctA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sctT, -1, 0); sctA := self.nodeNext(sctA); }
+      if sctA >= 0 { var sctT: int64 := self.lowerExpr(sctA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sctT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 106); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_affinity_hint", 17)) {
+      var sahA: int64 := arg0;
+      if sahA >= 0 { var sahT: int64 := self.lowerExpr(sahA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sahT, -1, 0); sahA := self.nodeNext(sahA); }
+      if sahA >= 0 { var sahT: int64 := self.lowerExpr(sahA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sahT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 107); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_numa_alloc", 14)) {
+      var snaA: int64 := arg0;
+      if snaA >= 0 { var snaT: int64 := self.lowerExpr(snaA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, snaT, -1, 0); snaA := self.nodeNext(snaA); }
+      if snaA >= 0 { var snaT: int64 := self.lowerExpr(snaA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, snaT, -1, 0); snaA := self.nodeNext(snaA); }
+      if snaA >= 0 { var snaT: int64 := self.lowerExpr(snaA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, snaT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 108); return dest;
+    }
+    // LX-22: Debug & Telemetrie (0x0A00–0x0A05) — IDs 145–150
+    if (self.seq(fname, fnlen, "sys_debug_print", 15)) {
+      var dpA: int64 := arg0;
+      if dpA >= 0 { var dpT: int64 := self.lowerExpr(dpA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, dpT, -1, 0); dpA := self.nodeNext(dpA); }
+      if dpA >= 0 { var dpT: int64 := self.lowerExpr(dpA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, dpT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 145); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_trace_event", 15)) {
+      var teA: int64 := arg0;
+      if teA >= 0 { var teT: int64 := self.lowerExpr(teA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, teT, -1, 0); teA := self.nodeNext(teA); }
+      if teA >= 0 { var teT: int64 := self.lowerExpr(teA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, teT, -1, 0); teA := self.nodeNext(teA); }
+      if teA >= 0 { var teT: int64 := self.lowerExpr(teA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, teT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 146); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_perf_counter", 16)) {
+      var pcA: int64 := arg0;
+      if pcA >= 0 { var pcT: int64 := self.lowerExpr(pcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pcT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 147); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_stack_trace", 15)) {
+      var stA: int64 := arg0;
+      if stA >= 0 { var stT: int64 := self.lowerExpr(stA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, stT, -1, 0); stA := self.nodeNext(stA); }
+      if stA >= 0 { var stT: int64 := self.lowerExpr(stA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, stT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 148); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_watchpoint_set", 18)) {
+      var wsA: int64 := arg0;
+      if wsA >= 0 { var wsT: int64 := self.lowerExpr(wsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, wsT, -1, 0); wsA := self.nodeNext(wsA); }
+      if wsA >= 0 { var wsT: int64 := self.lowerExpr(wsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, wsT, -1, 0); wsA := self.nodeNext(wsA); }
+      if wsA >= 0 { var wsT: int64 := self.lowerExpr(wsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, wsT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 149); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_watchpoint_clear", 20)) {
+      var wcA: int64 := arg0;
+      if wcA >= 0 { var wcT: int64 := self.lowerExpr(wcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, wcT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 150); return dest;
+    }
+    // LX-18: IOFS (0x0C00–0x0C04) — IDs 140–144
+    if (self.seq(fname, fnlen, "sys_iofs_mount", 14)) {
+      var ifmA: int64 := arg0;
+      if ifmA >= 0 { var ifmT: int64 := self.lowerExpr(ifmA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ifmT, -1, 0); ifmA := self.nodeNext(ifmA); }
+      if ifmA >= 0 { var ifmT: int64 := self.lowerExpr(ifmA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, ifmT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 140); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_iofs_compact", 16)) {
+      var ifcA: int64 := arg0;
+      if ifcA >= 0 { var ifcT: int64 := self.lowerExpr(ifcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ifcT, -1, 0); ifcA := self.nodeNext(ifcA); }
+      if ifcA >= 0 { var ifcT: int64 := self.lowerExpr(ifcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, ifcT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 141); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_iofs_page_info", 18)) {
+      var ifpA: int64 := arg0;
+      if ifpA >= 0 { var ifpT: int64 := self.lowerExpr(ifpA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ifpT, -1, 0); ifpA := self.nodeNext(ifpA); }
+      if ifpA >= 0 { var ifpT: int64 := self.lowerExpr(ifpA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, ifpT, -1, 0); ifpA := self.nodeNext(ifpA); }
+      if ifpA >= 0 { var ifpT: int64 := self.lowerExpr(ifpA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, ifpT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 142); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_iofs_sandbox_enter", 22)) {
+      var ifeA: int64 := arg0;
+      if ifeA >= 0 { var ifeT: int64 := self.lowerExpr(ifeA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ifeT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 143); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_iofs_sandbox_exit", 21)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 144); return dest;
+    }
+    // LX-17: Lyra Agent Interface (0x0900–0x090B) — IDs 128–139
+    if (self.seq(fname, fnlen, "sys_intent_submit", 17)) {
+      var sisA: int64 := arg0;
+      if sisA >= 0 { var sisT: int64 := self.lowerExpr(sisA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sisT, -1, 0); sisA := self.nodeNext(sisA); }
+      if sisA >= 0 { var sisT: int64 := self.lowerExpr(sisA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sisT, -1, 0); sisA := self.nodeNext(sisA); }
+      if sisA >= 0 { var sisT: int64 := self.lowerExpr(sisA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sisT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 128); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_intent_wait", 15)) {
+      var siwA: int64 := arg0;
+      if siwA >= 0 { var siwT: int64 := self.lowerExpr(siwA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, siwT, -1, 0); siwA := self.nodeNext(siwA); }
+      if siwA >= 0 { var siwT: int64 := self.lowerExpr(siwA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, siwT, -1, 0); siwA := self.nodeNext(siwA); }
+      if siwA >= 0 { var siwT: int64 := self.lowerExpr(siwA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, siwT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 129); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_intent_cancel", 17)) {
+      var sicA: int64 := arg0;
+      if sicA >= 0 { var sicT: int64 := self.lowerExpr(sicA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sicT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 130); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_lyra_event", 14)) {
+      var sleA: int64 := arg0;
+      if sleA >= 0 { var sleT: int64 := self.lowerExpr(sleA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sleT, -1, 0); sleA := self.nodeNext(sleA); }
+      if sleA >= 0 { var sleT: int64 := self.lowerExpr(sleA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sleT, -1, 0); sleA := self.nodeNext(sleA); }
+      if sleA >= 0 { var sleT: int64 := self.lowerExpr(sleA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sleT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 131); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_dream_register", 18)) {
+      var sdrA: int64 := arg0;
+      if sdrA >= 0 { var sdrT: int64 := self.lowerExpr(sdrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sdrT, -1, 0); sdrA := self.nodeNext(sdrA); }
+      if sdrA >= 0 { var sdrT: int64 := self.lowerExpr(sdrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sdrT, -1, 0); sdrA := self.nodeNext(sdrA); }
+      if sdrA >= 0 { var sdrT: int64 := self.lowerExpr(sdrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sdrT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 132); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_dream_unregister", 20)) {
+      var sduA: int64 := arg0;
+      if sduA >= 0 { var sduT: int64 := self.lowerExpr(sduA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sduT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 133); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_memory_store", 16)) {
+      var smsA: int64 := arg0;
+      if smsA >= 0 { var smsT: int64 := self.lowerExpr(smsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, smsT, -1, 0); smsA := self.nodeNext(smsA); }
+      if smsA >= 0 { var smsT: int64 := self.lowerExpr(smsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, smsT, -1, 0); smsA := self.nodeNext(smsA); }
+      if smsA >= 0 { var smsT: int64 := self.lowerExpr(smsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, smsT, -1, 0); smsA := self.nodeNext(smsA); }
+      if smsA >= 0 { var smsT: int64 := self.lowerExpr(smsA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, smsT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 134); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_memory_recall", 17)) {
+      var smrA: int64 := arg0;
+      if smrA >= 0 { var smrT: int64 := self.lowerExpr(smrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, smrT, -1, 0); smrA := self.nodeNext(smrA); }
+      if smrA >= 0 { var smrT: int64 := self.lowerExpr(smrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, smrT, -1, 0); smrA := self.nodeNext(smrA); }
+      if smrA >= 0 { var smrT: int64 := self.lowerExpr(smrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, smrT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 135); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_memory_search", 17)) {
+      var smhA: int64 := arg0;
+      if smhA >= 0 { var smhT: int64 := self.lowerExpr(smhA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, smhT, -1, 0); smhA := self.nodeNext(smhA); }
+      if smhA >= 0 { var smhT: int64 := self.lowerExpr(smhA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, smhT, -1, 0); smhA := self.nodeNext(smhA); }
+      if smhA >= 0 { var smhT: int64 := self.lowerExpr(smhA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, smhT, -1, 0); smhA := self.nodeNext(smhA); }
+      if smhA >= 0 { var smhT: int64 := self.lowerExpr(smhA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, smhT, -1, 0); smhA := self.nodeNext(smhA); }
+      if smhA >= 0 { var smhT: int64 := self.lowerExpr(smhA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, smhT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 136); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_context_push", 16)) {
+      var scpA: int64 := arg0;
+      if scpA >= 0 { var scpT: int64 := self.lowerExpr(scpA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, scpT, -1, 0); scpA := self.nodeNext(scpA); }
+      if scpA >= 0 { var scpT: int64 := self.lowerExpr(scpA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, scpT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 137); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_context_pop", 15)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 138); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_timeline_query", 18)) {
+      var stqA: int64 := arg0;
+      if stqA >= 0 { var stqT: int64 := self.lowerExpr(stqA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, stqT, -1, 0); stqA := self.nodeNext(stqA); }
+      if stqA >= 0 { var stqT: int64 := self.lowerExpr(stqA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, stqT, -1, 0); stqA := self.nodeNext(stqA); }
+      if stqA >= 0 { var stqT: int64 := self.lowerExpr(stqA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, stqT, -1, 0); stqA := self.nodeNext(stqA); }
+      if stqA >= 0 { var stqT: int64 := self.lowerExpr(stqA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, stqT, -1, 0); stqA := self.nodeNext(stqA); }
+      if stqA >= 0 { var stqT: int64 := self.lowerExpr(stqA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, stqT, -1, 0); stqA := self.nodeNext(stqA); }
+      if stqA >= 0 { var stqT: int64 := self.lowerExpr(stqA); self.irAddInstrDirect(IRO_STORE_LOCAL, 5, stqT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 139); return dest;
+    }
+    // LX-16: Semantisches Paging & Wissensgraph (0x080D–0x0812) — IDs 122–127
+    if (self.seq(fname, fnlen, "sys_sem_annotate", 16)) {
+      var sanA: int64 := arg0;
+      if sanA >= 0 { var sanT: int64 := self.lowerExpr(sanA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sanT, -1, 0); sanA := self.nodeNext(sanA); }
+      if sanA >= 0 { var sanT: int64 := self.lowerExpr(sanA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sanT, -1, 0); sanA := self.nodeNext(sanA); }
+      if sanA >= 0 { var sanT: int64 := self.lowerExpr(sanA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sanT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 122); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_sem_query", 13)) {
+      var sqrA: int64 := arg0;
+      if sqrA >= 0 { var sqrT: int64 := self.lowerExpr(sqrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sqrT, -1, 0); sqrA := self.nodeNext(sqrA); }
+      if sqrA >= 0 { var sqrT: int64 := self.lowerExpr(sqrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sqrT, -1, 0); sqrA := self.nodeNext(sqrA); }
+      if sqrA >= 0 { var sqrT: int64 := self.lowerExpr(sqrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sqrT, -1, 0); sqrA := self.nodeNext(sqrA); }
+      if sqrA >= 0 { var sqrT: int64 := self.lowerExpr(sqrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, sqrT, -1, 0); sqrA := self.nodeNext(sqrA); }
+      if sqrA >= 0 { var sqrT: int64 := self.lowerExpr(sqrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, sqrT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 123); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_graph_node_create", 21)) {
+      var sgnA: int64 := arg0;
+      if sgnA >= 0 { var sgnT: int64 := self.lowerExpr(sgnA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sgnT, -1, 0); sgnA := self.nodeNext(sgnA); }
+      if sgnA >= 0 { var sgnT: int64 := self.lowerExpr(sgnA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sgnT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 124); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_graph_edge_add", 18)) {
+      var sgeA: int64 := arg0;
+      if sgeA >= 0 { var sgeT: int64 := self.lowerExpr(sgeA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sgeT, -1, 0); sgeA := self.nodeNext(sgeA); }
+      if sgeA >= 0 { var sgeT: int64 := self.lowerExpr(sgeA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sgeT, -1, 0); sgeA := self.nodeNext(sgeA); }
+      if sgeA >= 0 { var sgeT: int64 := self.lowerExpr(sgeA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sgeT, -1, 0); sgeA := self.nodeNext(sgeA); }
+      if sgeA >= 0 { var sgeT: int64 := self.lowerExpr(sgeA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, sgeT, -1, 0); sgeA := self.nodeNext(sgeA); }
+      if sgeA >= 0 { var sgeT: int64 := self.lowerExpr(sgeA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, sgeT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 125); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_graph_edge_remove", 21)) {
+      var sgrA: int64 := arg0;
+      if sgrA >= 0 { var sgrT: int64 := self.lowerExpr(sgrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sgrT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 126); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_graph_query", 15)) {
+      var sgqA: int64 := arg0;
+      if sgqA >= 0 { var sgqT: int64 := self.lowerExpr(sgqA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sgqT, -1, 0); sgqA := self.nodeNext(sgqA); }
+      if sgqA >= 0 { var sgqT: int64 := self.lowerExpr(sgqA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sgqT, -1, 0); sgqA := self.nodeNext(sgqA); }
+      if sgqA >= 0 { var sgqT: int64 := self.lowerExpr(sgqA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sgqT, -1, 0); sgqA := self.nodeNext(sgqA); }
+      if sgqA >= 0 { var sgqT: int64 := self.lowerExpr(sgqA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, sgqT, -1, 0); sgqA := self.nodeNext(sgqA); }
+      if sgqA >= 0 { var sgqT: int64 := self.lowerExpr(sgqA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, sgqT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 127); return dest;
+    }
+    // LX-15: KI-Embedding & Vektorindex (0x0807–0x080C) — IDs 116–121
+    if (self.seq(fname, fnlen, "sys_ai_embed", 12)) {
+      var aemA: int64 := arg0;
+      if aemA >= 0 { var aemT: int64 := self.lowerExpr(aemA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, aemT, -1, 0); aemA := self.nodeNext(aemA); }
+      if aemA >= 0 { var aemT: int64 := self.lowerExpr(aemA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, aemT, -1, 0); aemA := self.nodeNext(aemA); }
+      if aemA >= 0 { var aemT: int64 := self.lowerExpr(aemA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, aemT, -1, 0); aemA := self.nodeNext(aemA); }
+      if aemA >= 0 { var aemT: int64 := self.lowerExpr(aemA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, aemT, -1, 0); aemA := self.nodeNext(aemA); }
+      if aemA >= 0 { var aemT: int64 := self.lowerExpr(aemA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, aemT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 116); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ai_token_count", 18)) {
+      var atcA: int64 := arg0;
+      if atcA >= 0 { var atcT: int64 := self.lowerExpr(atcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, atcT, -1, 0); atcA := self.nodeNext(atcA); }
+      if atcA >= 0 { var atcT: int64 := self.lowerExpr(atcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, atcT, -1, 0); atcA := self.nodeNext(atcA); }
+      if atcA >= 0 { var atcT: int64 := self.lowerExpr(atcA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, atcT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 117); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ai_search", 13)) {
+      var asrA: int64 := arg0;
+      if asrA >= 0 { var asrT: int64 := self.lowerExpr(asrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, asrT, -1, 0); asrA := self.nodeNext(asrA); }
+      if asrA >= 0 { var asrT: int64 := self.lowerExpr(asrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, asrT, -1, 0); asrA := self.nodeNext(asrA); }
+      if asrA >= 0 { var asrT: int64 := self.lowerExpr(asrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, asrT, -1, 0); asrA := self.nodeNext(asrA); }
+      if asrA >= 0 { var asrT: int64 := self.lowerExpr(asrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, asrT, -1, 0); asrA := self.nodeNext(asrA); }
+      if asrA >= 0 { var asrT: int64 := self.lowerExpr(asrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, asrT, -1, 0); asrA := self.nodeNext(asrA); }
+      if asrA >= 0 { var asrT: int64 := self.lowerExpr(asrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 5, asrT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 118); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ai_index_create", 19)) {
+      var aicA: int64 := arg0;
+      if aicA >= 0 { var aicT: int64 := self.lowerExpr(aicA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, aicT, -1, 0); aicA := self.nodeNext(aicA); }
+      if aicA >= 0 { var aicT: int64 := self.lowerExpr(aicA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, aicT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 119); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ai_index_insert", 19)) {
+      var aiiA: int64 := arg0;
+      if aiiA >= 0 { var aiiT: int64 := self.lowerExpr(aiiA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, aiiT, -1, 0); aiiA := self.nodeNext(aiiA); }
+      if aiiA >= 0 { var aiiT: int64 := self.lowerExpr(aiiA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, aiiT, -1, 0); aiiA := self.nodeNext(aiiA); }
+      if aiiA >= 0 { var aiiT: int64 := self.lowerExpr(aiiA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, aiiT, -1, 0); aiiA := self.nodeNext(aiiA); }
+      if aiiA >= 0 { var aiiT: int64 := self.lowerExpr(aiiA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, aiiT, -1, 0); aiiA := self.nodeNext(aiiA); }
+      if aiiA >= 0 { var aiiT: int64 := self.lowerExpr(aiiA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, aiiT, -1, 0); aiiA := self.nodeNext(aiiA); }
+      if aiiA >= 0 { var aiiT: int64 := self.lowerExpr(aiiA); self.irAddInstrDirect(IRO_STORE_LOCAL, 5, aiiT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 120); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ai_index_delete", 19)) {
+      var aidA: int64 := arg0;
+      if aidA >= 0 { var aidT: int64 := self.lowerExpr(aidA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, aidT, -1, 0); aidA := self.nodeNext(aidA); }
+      if aidA >= 0 { var aidT: int64 := self.lowerExpr(aidA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, aidT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 121); return dest;
+    }
+    // LX-14: KI-Basis (0x0800–0x0806) — IDs 109–115
+    if (self.seq(fname, fnlen, "sys_ai_model_load", 17)) {
+      var amlA: int64 := arg0;
+      if amlA >= 0 { var amlT: int64 := self.lowerExpr(amlA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, amlT, -1, 0); amlA := self.nodeNext(amlA); }
+      if amlA >= 0 { var amlT: int64 := self.lowerExpr(amlA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, amlT, -1, 0); amlA := self.nodeNext(amlA); }
+      if amlA >= 0 { var amlT: int64 := self.lowerExpr(amlA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, amlT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 109); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ai_model_unload", 19)) {
+      var amuA: int64 := arg0;
+      if amuA >= 0 { var amuT: int64 := self.lowerExpr(amuA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, amuT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 110); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ai_model_info", 17)) {
+      var amiA: int64 := arg0;
+      if amiA >= 0 { var amiT: int64 := self.lowerExpr(amiA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, amiT, -1, 0); amiA := self.nodeNext(amiA); }
+      if amiA >= 0 { var amiT: int64 := self.lowerExpr(amiA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, amiT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 111); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ai_ctx_create", 17)) {
+      var accA: int64 := arg0;
+      if accA >= 0 { var accT: int64 := self.lowerExpr(accA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, accT, -1, 0); accA := self.nodeNext(accA); }
+      if accA >= 0 { var accT: int64 := self.lowerExpr(accA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, accT, -1, 0); accA := self.nodeNext(accA); }
+      if accA >= 0 { var accT: int64 := self.lowerExpr(accA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, accT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 112); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ai_ctx_destroy", 18)) {
+      var acdA: int64 := arg0;
+      if acdA >= 0 { var acdT: int64 := self.lowerExpr(acdA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, acdT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 113); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ai_infer", 12)) {
+      var ainA: int64 := arg0;
+      if ainA >= 0 { var ainT: int64 := self.lowerExpr(ainA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, ainT, -1, 0); ainA := self.nodeNext(ainA); }
+      if ainA >= 0 { var ainT: int64 := self.lowerExpr(ainA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, ainT, -1, 0); ainA := self.nodeNext(ainA); }
+      if ainA >= 0 { var ainT: int64 := self.lowerExpr(ainA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, ainT, -1, 0); ainA := self.nodeNext(ainA); }
+      if ainA >= 0 { var ainT: int64 := self.lowerExpr(ainA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, ainT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 114); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_ai_infer_sync", 17)) {
+      var aisA: int64 := arg0;
+      if aisA >= 0 { var aisT: int64 := self.lowerExpr(aisA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, aisT, -1, 0); aisA := self.nodeNext(aisA); }
+      if aisA >= 0 { var aisT: int64 := self.lowerExpr(aisA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, aisT, -1, 0); aisA := self.nodeNext(aisA); }
+      if aisA >= 0 { var aisT: int64 := self.lowerExpr(aisA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, aisT, -1, 0); aisA := self.nodeNext(aisA); }
+      if aisA >= 0 { var aisT: int64 := self.lowerExpr(aisA); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, aisT, -1, 0); aisA := self.nodeNext(aisA); }
+      if aisA >= 0 { var aisT: int64 := self.lowerExpr(aisA); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, aisT, -1, 0); aisA := self.nodeNext(aisA); }
+      if aisA >= 0 { var aisT: int64 := self.lowerExpr(aisA); self.irAddInstrDirect(IRO_STORE_LOCAL, 5, aisT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 115); return dest;
+    }
+
+    // LX-WP17: Vega Window System (0x0D00–0x0D14) — IDs 151–171
+    if (self.seq(fname, fnlen, "sys_win_create", 14)) {
+      var w1A: int64 := arg0;
+      if w1A >= 0 { var w1T: int64 := self.lowerExpr(w1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, w1T, -1, 0); w1A := self.nodeNext(w1A); }
+      if w1A >= 0 { var w1T: int64 := self.lowerExpr(w1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, w1T, -1, 0); w1A := self.nodeNext(w1A); }
+      if w1A >= 0 { var w1T: int64 := self.lowerExpr(w1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, w1T, -1, 0); w1A := self.nodeNext(w1A); }
+      if w1A >= 0 { var w1T: int64 := self.lowerExpr(w1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, w1T, -1, 0); w1A := self.nodeNext(w1A); }
+      if w1A >= 0 { var w1T: int64 := self.lowerExpr(w1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 4, w1T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 151); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_win_destroy", 15)) {
+      var w2A: int64 := arg0;
+      if w2A >= 0 { var w2T: int64 := self.lowerExpr(w2A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, w2T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 152); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_win_raise", 13)) {
+      var w3A: int64 := arg0;
+      if w3A >= 0 { var w3T: int64 := self.lowerExpr(w3A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, w3T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 153); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_win_move", 12)) {
+      var w4A: int64 := arg0;
+      if w4A >= 0 { var w4T: int64 := self.lowerExpr(w4A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, w4T, -1, 0); w4A := self.nodeNext(w4A); }
+      if w4A >= 0 { var w4T: int64 := self.lowerExpr(w4A); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, w4T, -1, 0); w4A := self.nodeNext(w4A); }
+      if w4A >= 0 { var w4T: int64 := self.lowerExpr(w4A); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, w4T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 154); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_win_resize", 14)) {
+      var w5A: int64 := arg0;
+      if w5A >= 0 { var w5T: int64 := self.lowerExpr(w5A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, w5T, -1, 0); w5A := self.nodeNext(w5A); }
+      if w5A >= 0 { var w5T: int64 := self.lowerExpr(w5A); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, w5T, -1, 0); w5A := self.nodeNext(w5A); }
+      if w5A >= 0 { var w5T: int64 := self.lowerExpr(w5A); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, w5T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 155); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_win_get_fb", 14)) {
+      var w6A: int64 := arg0;
+      if w6A >= 0 { var w6T: int64 := self.lowerExpr(w6A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, w6T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 156); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_vsync_wait", 14)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 157); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_time_ns", 11)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 158); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_shm_create", 14)) {
+      var s1A: int64 := arg0;
+      if s1A >= 0 { var s1T: int64 := self.lowerExpr(s1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, s1T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 159); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_shm_map", 11)) {
+      var s2A: int64 := arg0;
+      if s2A >= 0 { var s2T: int64 := self.lowerExpr(s2A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, s2T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 160); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_shm_unmap", 13)) {
+      var s3A: int64 := arg0;
+      if s3A >= 0 { var s3T: int64 := self.lowerExpr(s3A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, s3T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 161); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_event_send", 14)) {
+      var e1A: int64 := arg0;
+      if e1A >= 0 { var e1T: int64 := self.lowerExpr(e1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, e1T, -1, 0); e1A := self.nodeNext(e1A); }
+      if e1A >= 0 { var e1T: int64 := self.lowerExpr(e1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, e1T, -1, 0); e1A := self.nodeNext(e1A); }
+      if e1A >= 0 { var e1T: int64 := self.lowerExpr(e1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, e1T, -1, 0); e1A := self.nodeNext(e1A); }
+      if e1A >= 0 { var e1T: int64 := self.lowerExpr(e1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, e1T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 162); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_event_recv", 14)) {
+      var e2A: int64 := arg0;
+      if e2A >= 0 { var e2T: int64 := self.lowerExpr(e2A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, e2T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 163); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_set_console", 15)) {
+      var coA: int64 := arg0;
+      if coA >= 0 { var coT: int64 := self.lowerExpr(coA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, coT, -1, 0); coA := self.nodeNext(coA); }
+      if coA >= 0 { var coT: int64 := self.lowerExpr(coA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, coT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 164); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_fb_map_user", 15)) {
+      var f1A: int64 := arg0;
+      if f1A >= 0 { var f1T: int64 := self.lowerExpr(f1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, f1T, -1, 0); f1A := self.nodeNext(f1A); }
+      if f1A >= 0 { var f1T: int64 := self.lowerExpr(f1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, f1T, -1, 0); f1A := self.nodeNext(f1A); }
+      if f1A >= 0 { var f1T: int64 := self.lowerExpr(f1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, f1T, -1, 0); f1A := self.nodeNext(f1A); }
+      if f1A >= 0 { var f1T: int64 := self.lowerExpr(f1A); self.irAddInstrDirect(IRO_STORE_LOCAL, 3, f1T, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 165); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_get_mouse_x", 15)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 166); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_get_mouse_y", 15)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 167); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_get_mouse_btn", 17)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 168); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_set_mouse_bounds", 20)) {
+      var msA: int64 := arg0;
+      if msA >= 0 { var msT: int64 := self.lowerExpr(msA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, msT, -1, 0); msA := self.nodeNext(msA); }
+      if msA >= 0 { var msT: int64 := self.lowerExpr(msA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, msT, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 169); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_win_get_table_phys", 22)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 170); return dest;
+    }
+    if (self.seq(fname, fnlen, "sys_kbd_poll", 12)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 171); return dest;
+    }
+
     // General call: lower first argument and emit IRO_CALL_BUILTIN
     if (arg0 >= 0) {
       var argTemp: int64 := self.lowerExpr(arg0);
@@ -1164,7 +2300,7 @@ pub type IRLower = class {
 
     return dest;
   }
-  
+
   // ------------------------------------------------------------------
   // Index/Array Access Lowering
   // ------------------------------------------------------------------
@@ -1181,13 +2317,64 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   // Field Access Lowering
   // ------------------------------------------------------------------
-  
+
+  fn fieldTypeSize(typeNode: int64): int64 {
+    if typeNode < 0 { return 8; }
+    var tv: pchar := self.nodeSVal(typeNode);
+    var tl: int64 := self.nodeSLen(typeNode);
+    if self.seq(tv, tl, "int8",  4) { return 1; }
+    if self.seq(tv, tl, "u8",    2) { return 1; }
+    if self.seq(tv, tl, "char",  4) { return 1; }
+    if self.seq(tv, tl, "int16", 5) { return 2; }
+    if self.seq(tv, tl, "u16",   3) { return 2; }
+    if self.seq(tv, tl, "int32", 5) { return 4; }
+    if self.seq(tv, tl, "u32",   3) { return 4; }
+    if self.seq(tv, tl, "f32",   3) { return 4; }
+    return 8;
+  }
+
   fn lowerField(expr: int64): int64 {
-    var base: int64 := self.lowerExpr(self.nodeC0(expr));
-    // Field name is in string value
     var dest: int64 := self.allocTemp();
-    
-    // Emit field load: dest = base.field
+    var baseNode: int64 := self.nodeC0(expr);
+
+    // TypeName.field — resolve to compile-time byte offset constant
+    if self.nodeKind(baseNode) == NK_IDENT {
+      var bSVal: pchar := self.nodeSVal(baseNode);
+      var bSLen: int64 := self.nodeSLen(baseNode);
+      var fSVal: pchar := self.nodeSVal(expr);
+      var fSLen: int64 := self.nodeSLen(expr);
+
+      var ti: int64 := 0;
+      while ti < self.nodeCount {
+        if self.nodeKind(ti) == NK_TYPE_DECL {
+          if self.seq(self.nodeSVal(ti), self.nodeSLen(ti), bSVal, bSLen) {
+            var offset: int64 := 0;
+            var fd: int64 := self.nodeC0(ti);
+            while fd >= 0 {
+              // Explicit at(offset) override (iVal bit0 = FIELD_FLAG_PACKED_OFFSET)
+              if (self.nodeIVal(fd) & 1) != 0 {
+                var offNode: int64 := self.nodeC1(fd);
+                if offNode >= 0 {
+                  if self.nodeKind(offNode) == NK_LIT_INT {
+                    offset := self.nodeIVal(offNode);
+                  }
+                }
+              }
+              if self.seq(self.nodeSVal(fd), self.nodeSLen(fd), fSVal, fSLen) {
+                self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, offset);
+                return dest;
+              }
+              offset := offset + self.fieldTypeSize(self.nodeC0(fd));
+              fd := self.nodeNext(fd);
+            }
+          }
+        }
+        ti := ti + 1;
+      }
+    }
+
+    // Instance field access or unresolved type — lower base, dest stays 0
+    var base: int64 := self.lowerExpr(baseNode);
     return dest;
   }
   
@@ -1507,9 +2694,64 @@ pub type IRLower = class {
   // var a, b := fn()  — lower init expr (call), results in rax+rdx
 
   fn lowerTupleVarDecl(stmt: int64) {
+    // var firstName, secondName := initExpr
+    // firstName = sval/slen on the node; secondName = c0 (NK_IDENT).
+    // LX-21: on lyxos, SYSCALL sets rax=error, rdx=value.
+    //   IRO_CALL_BUILTIN stores rdx (value) → valSlot.
+    //   IRO_LOAD_ERRVAL  reads rax shadow (r15) → errSlot.
+
+    var valSlot: int64 := self.allocTemp();
+
+    // Determine second name — is it discard ("_")?
+    var secondNode: int64 := self.nodeC0(stmt);
+    var errSlot: int64 := -1;
+    if secondNode >= 0 {
+      var sLen2: int64 := self.nodeSLen(secondNode);
+      var sAddr2: int64 := self.nodeSVal(secondNode) as int64;
+      var isDiscard: bool := sLen2 == 1 && peek8(sAddr2) == 95;
+      if !isDiscard {
+        errSlot := self.allocTemp();
+      }
+    }
+
+    // Lower init expression → temp slot (val)
     var initExpr: int64 := self.nodeC1(stmt);
-    if (initExpr >= 0) {
-      self.lowerExpr(initExpr);
+    if initExpr >= 0 {
+      var initTemp: int64 := self.lowerExpr(initExpr);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, valSlot, initTemp, -1, 0);
+      if errSlot >= 0 {
+        self.irAddInstrDirect(IRO_LOAD_ERRVAL, errSlot, 0, -1, 0);
+      }
+    }
+
+    // Register firstName → valSlot
+    if self.localNameCnt >= self.localNameCap {
+      var tvNewCap: int64 := self.localNameCap * 2;
+      var tvNb: int64 := alloc(tvNewCap * 24);
+      memcpy(tvNb, self.localNameBuf, self.localNameCnt * 24);
+      self.localNameBuf := tvNb;
+      self.localNameCap := tvNewCap;
+    }
+    var tvRec1: int64 := self.localNameBuf + self.localNameCnt * 24;
+    poke64(tvRec1 + 0, peek64(self.nodeOff(stmt) + NODE_OFF_SVAL));
+    poke64(tvRec1 + 8, self.nodeSLen(stmt));
+    poke64(tvRec1 + LOCAL_REC_OFF_SLOT, valSlot);
+    self.localNameCnt := self.localNameCnt + 1;
+
+    // Register secondName → errSlot (only if not discard)
+    if errSlot >= 0 {
+      if self.localNameCnt >= self.localNameCap {
+        var tvNewCap2: int64 := self.localNameCap * 2;
+        var tvNb2: int64 := alloc(tvNewCap2 * 24);
+        memcpy(tvNb2, self.localNameBuf, self.localNameCnt * 24);
+        self.localNameBuf := tvNb2;
+        self.localNameCap := tvNewCap2;
+      }
+      var tvRec2: int64 := self.localNameBuf + self.localNameCnt * 24;
+      poke64(tvRec2 + 0, peek64(self.nodeOff(secondNode) + NODE_OFF_SVAL));
+      poke64(tvRec2 + 8, self.nodeSLen(secondNode));
+      poke64(tvRec2 + LOCAL_REC_OFF_SLOT, errSlot);
+      self.localNameCnt := self.localNameCnt + 1;
     }
   }
 

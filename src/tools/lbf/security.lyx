@@ -1,0 +1,263 @@
+// src/tools/lbf/security.lyx — LX-29 Supply Chain Security für LBF-Nativ (LYX!)
+//
+// Public API:
+//   lbf_compute_source_hash(data, len, out_sha256)   — SHA-256 über Quellpuffer
+//   lbf_finalize_file_crc(filepath)                  — CRC32C aller Payloads → Genesis
+//   lbf_generate_compiler_uuid(out_uuid)              — UUID v4 via sys_getrandom
+//   lbf_check_compiler_blacklist(uuid)               → bool (true = sicher)
+//
+// Import: import src.tools.lbf.security;
+
+import src.std.alloc;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import std.crypto.sha256;
+
+// ── Private: CRC32C (Castagnoli, Polynomial 0x82F63B78 reflected) ────────────
+
+fn secCrc32c(data: int64, len: int64): int64 {
+    var crc: int64 := 0xFFFFFFFF;
+    var i: int64 := 0;
+    while i < len {
+        crc := crc ^ (peek8(data + i) & 0xFF);
+        var bit: int64 := 0;
+        while bit < 8 {
+            if (crc & 1) != 0 {
+                crc := (crc >> 1) ^ 0x82F63B78;
+            } else {
+                crc := crc >> 1;
+            }
+            bit := bit + 1;
+        }
+        i := i + 1;
+    }
+    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+// ── Private: memcpy ───────────────────────────────────────────────────────────
+
+fn secMemcpy(dst: int64, src: int64, n: int64) {
+    var i: int64 := 0;
+    while i < n { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+// ── Private: memcmp ───────────────────────────────────────────────────────────
+
+fn secMemcmp(a: int64, b: int64, n: int64): int64 {
+    var i: int64 := 0;
+    while i < n {
+        var da: int64 := peek8(a + i) & 0xFF;
+        var db: int64 := peek8(b + i) & 0xFF;
+        if da != db { return da - db; }
+        i := i + 1;
+    }
+    return 0;
+}
+
+// ── lbf_compute_source_hash ───────────────────────────────────────────────────
+//
+// Berechnet SHA-256 über den Quellpuffer data[0..len-1] und schreibt das
+// 32-Byte-Ergebnis nach out_sha256.
+// Wird vom lyxc-Backend genutzt um GEN_P_SOURCE_SHA256 im Genesis-Block zu füllen.
+
+pub fn lbf_compute_source_hash(data: int64, len: int64, out_sha256: int64) {
+    SHA256(data, len, out_sha256);
+}
+
+// ── lbf_finalize_file_crc ────────────────────────────────────────────────────
+//
+// Liest die LBF-Datei bei filepath (LYX!-Format), berechnet CRC32C über alle
+// Block-Payloads (mit GEN_P_FILE_CRC32C=0 im Genesis-Payload) und schreibt
+// das Ergebnis in das Genesis-Feld GEN_P_FILE_CRC32C. Danach wird der
+// per-Block-CRC32C des Genesis-Blocks neu berechnet.
+//
+// Rückgabe: 0 = Erfolg, -1 = Fehler (Datei nicht lesbar, kein LYX!-Magic, etc.)
+
+pub fn lbf_finalize_file_crc(filepath: int64): int64 {
+    // Datei öffnen (O_RDWR = 2)
+    var fd: int64 := open(filepath, 2, 0);
+    if fd < 0 { return 0 - 1; }
+
+    // Dateigröße ermitteln (lseek SEEK_END = 2)
+    var fsize: int64 := lseek(fd, 0, 2);
+    if fsize < LBF_BLOCK_SIZE {
+        close(fd);
+        return 0 - 1;
+    }
+    // Zurück zum Anfang (SEEK_SET = 0)
+    lseek(fd, 0, 0);
+
+    // Gesamtdatei in Puffer lesen
+    var fbuf: int64 := alloc(fsize);
+    var got: int64 := read(fd, fbuf, fsize);
+    if got != fsize {
+        free(fbuf, fsize);
+        close(fd);
+        return 0 - 1;
+    }
+
+    // Magic prüfen
+    if peek8(fbuf + LBF_H_MAGIC)     != LBF_MAGIC_0 { free(fbuf, fsize); close(fd); return 0 - 1; }
+    if peek8(fbuf + LBF_H_MAGIC + 1) != LBF_MAGIC_1 { free(fbuf, fsize); close(fd); return 0 - 1; }
+    if peek8(fbuf + LBF_H_MAGIC + 2) != LBF_MAGIC_2 { free(fbuf, fsize); close(fd); return 0 - 1; }
+    if peek8(fbuf + LBF_H_MAGIC + 3) != LBF_MAGIC_3 { free(fbuf, fsize); close(fd); return 0 - 1; }
+
+    // GEN_P_FILE_CRC32C auf 0 setzen (für deterministische Berechnung)
+    var fileCrcOff: int64 := LBF_HEADER_SIZE + GEN_P_FILE_CRC32C;
+    poke8(fbuf + fileCrcOff,     0);
+    poke8(fbuf + fileCrcOff + 1, 0);
+    poke8(fbuf + fileCrcOff + 2, 0);
+    poke8(fbuf + fileCrcOff + 3, 0);
+
+    // CRC32C aller Block-Payloads berechnen (kein Header, nur Payloads)
+    var totalBlocks: int64 := fsize / LBF_BLOCK_SIZE;
+    var crc: int64 := 0xFFFFFFFF;
+    var bi: int64 := 0;
+    while bi < totalBlocks {
+        var payloadPtr: int64 := fbuf + (bi * LBF_BLOCK_SIZE) + LBF_HEADER_SIZE;
+        // CRC32C schrittweise über jeden Payload aktualisieren
+        var pi: int64 := 0;
+        while pi < LBF_PAYLOAD_SIZE {
+            crc := crc ^ (peek8(payloadPtr + pi) & 0xFF);
+            var bit: int64 := 0;
+            while bit < 8 {
+                if (crc & 1) != 0 {
+                    crc := (crc >> 1) ^ 0x82F63B78;
+                } else {
+                    crc := crc >> 1;
+                }
+                bit := bit + 1;
+            }
+            pi := pi + 1;
+        }
+        bi := bi + 1;
+    }
+    crc := (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+
+    // File-CRC32C in Genesis-Payload schreiben (little-endian)
+    poke8(fbuf + fileCrcOff,     crc & 0xFF);
+    poke8(fbuf + fileCrcOff + 1, (crc >> 8)  & 0xFF);
+    poke8(fbuf + fileCrcOff + 2, (crc >> 16) & 0xFF);
+    poke8(fbuf + fileCrcOff + 3, (crc >> 24) & 0xFF);
+
+    // Per-Block-CRC32C des Genesis-Blocks neu berechnen
+    var genPayload: int64 := fbuf + LBF_HEADER_SIZE;
+    var blockCrc: int64 := secCrc32c(genPayload, LBF_PAYLOAD_SIZE);
+    poke8(fbuf + LBF_H_CRC32C,     blockCrc & 0xFF);
+    poke8(fbuf + LBF_H_CRC32C + 1, (blockCrc >> 8)  & 0xFF);
+    poke8(fbuf + LBF_H_CRC32C + 2, (blockCrc >> 16) & 0xFF);
+    poke8(fbuf + LBF_H_CRC32C + 3, (blockCrc >> 24) & 0xFF);
+
+    // Datei von Anfang an zurückschreiben
+    lseek(fd, 0, 0);
+    var written: int64 := write(fd, fbuf, fsize);
+    free(fbuf, fsize);
+    close(fd);
+
+    if written != fsize { return 0 - 1; }
+    return 0;
+}
+
+// ── lbf_generate_compiler_uuid ───────────────────────────────────────────────
+//
+// Füllt out_uuid (16 Bytes) mit einer UUID v4:
+//   - 16 kryptographisch zufällige Bytes via sys_getrandom
+//   - Byte 6: obere 4 Bits = 0x4 (Version 4)
+//   - Byte 8: obere 2 Bits = 0b10 (Variant RFC 4122)
+
+pub fn lbf_generate_compiler_uuid(out_uuid: int64) {
+    sys_getrandom(out_uuid, 16, 0);
+    poke8(out_uuid + 6, (peek8(out_uuid + 6) & 0x0F) | 0x40);
+    poke8(out_uuid + 8, (peek8(out_uuid + 8) & 0x3F) | 0x80);
+}
+
+// ── lbf_check_compiler_blacklist ─────────────────────────────────────────────
+//
+// Prüft ob die UUID (16 Bytes bei uuid) in /etc/lyx/compiler_blacklist.bin steht.
+// Das Blacklist-Format: eine Sequenz von 16-Byte-Einträgen ohne Trennzeichen.
+//
+// Rückgabe: 1 = UUID ist NICHT in der Blacklist (sicher)
+//            0 = UUID ist in der Blacklist (gesperrt)
+//
+// Wenn die Blacklist-Datei nicht existiert oder nicht lesbar ist: 1 (sicher).
+
+// ── lbf_verify_file_crc ──────────────────────────────────────────────────────
+//
+// Prüft GEN_P_FILE_CRC32C in-memory: berechnet CRC32C aller Block-Payloads mit
+// GEN_P_FILE_CRC32C temporär auf 0, vergleicht mit dem gespeicherten Wert.
+// Modifiziert fbuf temporär (4 Bytes), stellt sie danach wieder her.
+//
+// Rückgabe: 0 = korrekt, -1 = CRC-Fehler
+
+pub fn lbf_verify_file_crc(fbuf: int64, fsize: int64): int64 {
+    var fileCrcOff: int64 := LBF_HEADER_SIZE + GEN_P_FILE_CRC32C;
+    var stored: int64 := peek32(fbuf + fileCrcOff) & 0xFFFFFFFF;
+
+    // GEN_P_FILE_CRC32C temporär auf 0 setzen
+    poke8(fbuf + fileCrcOff,     0);
+    poke8(fbuf + fileCrcOff + 1, 0);
+    poke8(fbuf + fileCrcOff + 2, 0);
+    poke8(fbuf + fileCrcOff + 3, 0);
+
+    // CRC32C aller Block-Payloads berechnen
+    var totalBlocks: int64 := fsize / LBF_BLOCK_SIZE;
+    var crc: int64 := 0xFFFFFFFF;
+    var bi: int64 := 0;
+    while bi < totalBlocks {
+        var payloadPtr: int64 := fbuf + (bi * LBF_BLOCK_SIZE) + LBF_HEADER_SIZE;
+        var pi: int64 := 0;
+        while pi < LBF_PAYLOAD_SIZE {
+            crc := crc ^ (peek8(payloadPtr + pi) & 0xFF);
+            var bit: int64 := 0;
+            while bit < 8 {
+                if (crc & 1) != 0 { crc := (crc >> 1) ^ 0x82F63B78; }
+                else { crc := crc >> 1; }
+                bit := bit + 1;
+            }
+            pi := pi + 1;
+        }
+        bi := bi + 1;
+    }
+    crc := (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+
+    // GEN_P_FILE_CRC32C wiederherstellen
+    poke8(fbuf + fileCrcOff,     stored & 0xFF);
+    poke8(fbuf + fileCrcOff + 1, (stored >> 8)  & 0xFF);
+    poke8(fbuf + fileCrcOff + 2, (stored >> 16) & 0xFF);
+    poke8(fbuf + fileCrcOff + 3, (stored >> 24) & 0xFF);
+
+    if crc != stored { return 0 - 1; }
+    return 0;
+}
+
+// ── lbf_check_compiler_blacklist ─────────────────────────────────────────────
+//
+pub fn lbf_check_compiler_blacklist(uuid: int64): int64 {
+    var blpath: pchar := "/etc/lyx/compiler_blacklist.bin"c;
+    var fd: int64 := open(blpath, 0, 0);   // O_RDONLY = 0
+    if fd < 0 { return 1; }
+
+    // Dateigröße via lseek(SEEK_END)
+    var fsize: int64 := lseek(fd, 0, 2);
+    if fsize <= 0 { close(fd); return 1; }
+    lseek(fd, 0, 0);
+
+    // Nur Vielfache von 16 Bytes sind gültige Einträge
+    var count: int64 := fsize / 16;
+    if count == 0 { close(fd); return 1; }
+
+    var entry: int64 := alloc(16);
+    var i: int64 := 0;
+    var found: int64 := 0;
+    while (i < count) && (found == 0) {
+        var r: int64 := read(fd, entry, 16);
+        if r == 16 {
+            if secMemcmp(entry, uuid, 16) == 0 { found := 1; }
+        }
+        i := i + 1;
+    }
+    free(entry, 16);
+    close(fd);
+    if found != 0 { return 0; }
+    return 1;
+}

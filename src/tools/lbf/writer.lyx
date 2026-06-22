@@ -1,0 +1,154 @@
+// src/tools/lbf/writer.lyx — LX-30 LBF-Nativ Writer
+//
+// LBFNativeWriter erzeugt eine vollständige LBF-Nativ-Datei (LYX!-Format)
+// aus einem Code-Puffer und einem optionalen Quelldateipfad.
+// Deterministisch: UUID aus Source-SHA-256 abgeleitet (kein sys_getrandom).
+//
+// Public API:
+//   LBFNativeWriter.writeLBF(path, srcPath, codeBuf, codeLen): bool
+//
+// Import: import src.tools.lbf.writer;
+
+import src.std.alloc;
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import src.tools.lbf.genesis;
+import src.tools.lbf.tlv;
+import src.tools.lbf.lifecycle;
+import src.tools.lbf.sections;
+import src.tools.lbf.security;
+
+pub type LBFNativeWriter = class {
+    _pad:     int64;
+    _lcKind:  int64;  // lifecycle kind (LBF_LC_*, default 0 = ONE_SHOT)
+    _evBuf:   int64;  // event descriptor buffer (from lc_ev_alloc), 0 = none
+    _evCount: int64;  // number of event descriptors
+
+    // Konfiguriert Lifecycle-Kind und Ereignis-Deskriptoren für writeLBF.
+    // ev_buf darf 0 sein wenn ev_count == 0.
+    pub fn setLifecycle(kind: int64, ev_buf: int64, ev_count: int64): void {
+        self._lcKind  := kind;
+        self._evBuf   := ev_buf;
+        self._evCount := ev_count;
+    }
+
+    // writeLBF — Schreibt eine vollständige LBF-Nativ-Datei.
+    //
+    // path:    Zielpfad als pchar
+    // srcPath: Quelldateipfad für SHA-256-Berechnung (0 = kein Quellhash)
+    // codeBuf: Puffer mit x86-64-Maschinencode (.text-Segment)
+    // codeLen: Länge des Codes in Bytes (0 erlaubt → nur Genesis-Block)
+    //
+    // Rückgabe: true = Erfolg, false = Fehler
+
+    pub fn writeLBF(path: pchar, srcPath: pchar, codeBuf: int64, codeLen: int64): bool {
+
+        // ── 1. Source-SHA-256 berechnen ───────────────────────────────────────
+        var sha: int64 := alloc(32);
+
+        if (srcPath as int64) != 0 {
+            var sfd: int64 := open(srcPath, 0, 0);
+            if sfd >= 0 {
+                var ssz: int64 := lseek(sfd, 0, 2);
+                lseek(sfd, 0, 0);
+                if ssz > 0 {
+                    var sbuf: int64 := alloc(ssz);
+                    if read(sfd, sbuf, ssz) == ssz {
+                        lbf_compute_source_hash(sbuf, ssz, sha);
+                    }
+                    free(sbuf, ssz);
+                }
+                close(sfd);
+            }
+        }
+
+        // ── 2. UUID deterministisch aus den ersten 16 SHA-256-Bytes ──────────
+        var uuid: int64 := alloc(16);
+        var ui: int64 := 0;
+        while ui < 16 { poke8(uuid + ui, peek8(sha + ui)); ui := ui + 1; }
+        poke8(uuid + 6, (peek8(uuid + 6) & 0x0F) | 0x40);  // version 4
+        poke8(uuid + 8, (peek8(uuid + 8) & 0x3F) | 0x80);  // variant RFC 4122
+
+        // ── 3. Block-Geometrie ────────────────────────────────────────────────
+        var textBlk: int64 := section_block_count(codeLen);
+        var totBlk:  int64 := 1 + textBlk;
+        var fileSz:  int64 := totBlk * LBF_BLOCK_SIZE;
+
+        // ── 4. TLV-Pool aufbauen ──────────────────────────────────────────────
+        var tbuf:  int64 := alloc(LBF_TLV_MAX_SIZE);
+        var tused: int64 := alloc(8);
+        poke64(tused, 0);
+        tlv_add_capabilities(tbuf, tused, 0);
+        tlv_add_lifecycle_full(tbuf, tused, self._lcKind, self._evBuf, self._evCount);
+        tlv_add_section(tbuf, tused, 1, textBlk, LBF_SECT_TYPE_TEXT, LBF_SECT_PROT_RX);
+
+        // ── 5. Genesis-Daten-Puffer befüllen ─────────────────────────────────
+        var gd: int64 := genesis_data_alloc();
+        poke64(gd + GEN_D_ENTRY_POINT, 0x400000);
+        poke64(gd + GEN_D_TEXT_BLOCKS, textBlk);
+        poke64(gd + GEN_D_FILE_SIZE,   fileSz);
+        poke64(gd + GEN_D_TLV_USED,    peek64(tused));
+
+        var ci: int64 := 0;
+        while ci < 16 { poke8(gd + GEN_D_COMPILER_UUID + ci, peek8(uuid + ci)); ci := ci + 1; }
+        var si: int64 := 0;
+        while si < 32 { poke8(gd + GEN_D_SOURCE_SHA256 + si, peek8(sha + si)); si := si + 1; }
+
+        // ── 6. Genesis-Block bauen ────────────────────────────────────────────
+        var gen: int64 := alloc(LBF_BLOCK_SIZE);
+        lbf_header_init(gen, 0, totBlk, 0, 1);
+        var pay: int64 := gen + LBF_HEADER_SIZE;
+        genesis_serialize(gd, pay);
+
+        // TLV-Pool-Inhalt in Payload kopieren
+        var ti: int64 := 0;
+        var tlen: int64 := peek64(tused);
+        while ti < tlen { poke8(pay + GEN_P_TLV_POOL + ti, peek8(tbuf + ti)); ti := ti + 1; }
+
+        lbf_header_set_crc(gen, pay);
+
+        // ── 7. Datei öffnen (O_WRONLY|O_CREAT|O_TRUNC = 577, mode 0755 = 493)
+        var fd: int64 := open(path, 577, 493);
+        if fd < 0 {
+            free(gen, LBF_BLOCK_SIZE);
+            genesis_data_free(gd);
+            free(tbuf, LBF_TLV_MAX_SIZE);
+            free(tused, 8);
+            free(uuid, 16);
+            free(sha, 32);
+            return false;
+        }
+
+        // ── 8. Genesis-Block schreiben ────────────────────────────────────────
+        var wr: int64 := sys_write(fd, gen, LBF_BLOCK_SIZE);
+        if wr != LBF_BLOCK_SIZE {
+            close(fd);
+            free(gen, LBF_BLOCK_SIZE);
+            genesis_data_free(gd);
+            free(tbuf, LBF_TLV_MAX_SIZE);
+            free(tused, 8);
+            free(uuid, 16);
+            free(sha, 32);
+            return false;
+        }
+
+        // ── 9. Text-Sektion schreiben ─────────────────────────────────────────
+        var sr: int64 := section_emit(fd, codeBuf, codeLen, LBF_SECT_TYPE_TEXT, 1, totBlk);
+        close(fd);
+
+        // ── 10. Cleanup ───────────────────────────────────────────────────────
+        free(gen, LBF_BLOCK_SIZE);
+        genesis_data_free(gd);
+        free(tbuf, LBF_TLV_MAX_SIZE);
+        free(tused, 8);
+        free(uuid, 16);
+        free(sha, 32);
+
+        if sr != 0 { return false; }
+
+        // ── 11. File-CRC32C finalisieren ──────────────────────────────────────
+        if lbf_finalize_file_crc(path) != 0 { return false; }
+
+        return true;
+    }
+};

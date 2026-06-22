@@ -13,7 +13,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 0.9.0C
+VERSION   := 0.9.10D
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -23,7 +23,7 @@ BIN_DST   := $(PKG_DIR)/usr/local/bin
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen
+.PHONY: build bootstrap singularity test test-lyxos snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen sync-units-src
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -69,7 +69,124 @@ test: lyxc
 	./lyxc examples/basics/hello.lyx -o /tmp/lyxc_hello_test
 	@/tmp/lyxc_hello_test
 	@rm -f /tmp/lyxc_hello_test
+	@echo "--- LX-25: Block Header ---"
+	./lyxc tests/lx25_block_header_test.lyx -o /tmp/lyxc_lx25_test
+	@/tmp/lyxc_lx25_test
+	@rm -f /tmp/lyxc_lx25_test
+	@echo "--- LX-26: Genesis Serializer ---"
+	./lyxc tests/lx26_genesis_test.lyx -o /tmp/lyxc_lx26_test
+	@/tmp/lyxc_lx26_test
+	@rm -f /tmp/lyxc_lx26_test
+	@echo "--- LX-27: TLV-Framework ---"
+	./lyxc tests/lx27_tlv_test.lyx -o /tmp/lyxc_lx27_test
+	@/tmp/lyxc_lx27_test
+	@rm -f /tmp/lyxc_lx27_test
+	@echo "--- LX-28: Section Block Emitter ---"
+	./lyxc tests/lx28_sections_test.lyx -o /tmp/lyxc_lx28_test
+	@/tmp/lyxc_lx28_test
+	@rm -f /tmp/lyxc_lx28_test
+	@echo "--- LX-29: Supply Chain Security ---"
+	./lyxc tests/lx29_security_test.lyx -o /tmp/lyxc_lx29_test
+	@/tmp/lyxc_lx29_test
+	@rm -f /tmp/lyxc_lx29_test
+	@echo "--- LX-30: LBF-Nativ Backend ---"
+	./lyxc tests/lx30_lbf_backend_test.lyx -o /tmp/lyxc_lx30_test
+	@/tmp/lyxc_lx30_test
+	@rm -f /tmp/lyxc_lx30_test
+	@echo "--- LX-31: lbf_loader ---"
+	./lyxc tests/lx31_lbf_loader_test.lyx -o /tmp/lyxc_lx31_test
+	@/tmp/lyxc_lx31_test
+	@rm -f /tmp/lyxc_lx31_test
+	./lyxc tests/lx32_lbf_import_test.lyx -o /tmp/lyxc_lx32_test
+	@/tmp/lyxc_lx32_test
+	@rm -f /tmp/lyxc_lx32_test
+	./lyxc tests/lx33_dep_resolver_test.lyx -o /tmp/lyxc_lx33_test
+	@/tmp/lyxc_lx33_test
+	@rm -f /tmp/lyxc_lx33_test
+	./lyxc tests/lx35_lbf_dump_test.lyx -o /tmp/lyxc_lx35_test
+	@/tmp/lyxc_lx35_test
+	@rm -f /tmp/lyxc_lx35_test
+	@echo "--- LX-36: Lifecycle Descriptor ---"
+	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
+	@/tmp/lyxc_lx36_test
+	@rm -f /tmp/lyxc_lx36_test
+
+	@echo "--- net_frame: kernel-safe frame units (45 tests) ---"
+	./lyxc tests/net_frame_test.lyx -o /tmp/lyxc_net_frame_test
+	@/tmp/lyxc_net_frame_test
+	@rm -f /tmp/lyxc_net_frame_test
+
+	@echo "--- sec_wp28: kernel-mode-guard allowlist (20 tests) ---"
+	@bash tests/sec_wp28_kernel_guard_test.sh
 	@echo "OK"
+
+	@echo "--- sec_wp29: Ed25519-Lizenzverifikation (20 tests) ---"
+	./lyxc tests/sec_wp29_ed25519_test.lyx -o /tmp/lyxc_sec_wp29_test
+	@/tmp/lyxc_sec_wp29_test
+	@rm -f /tmp/lyxc_sec_wp29_test
+	@echo "OK"
+
+	@echo "--- sec_wp30: HTTP Custom-Header CRLF-Injection (20 tests) ---"
+	./lyxc tests/sec_wp30_crlf_test.lyx -o /tmp/lyxc_sec_wp30_test
+	@/tmp/lyxc_sec_wp30_test
+	@rm -f /tmp/lyxc_sec_wp30_test
+	@echo "OK"
+
+	@echo "--- sec_wp31: Dateigrößen-Limit FileReadAll (20 tests) ---"
+	@bash tests/sec_wp31_filesize_test.sh
+	@echo "OK"
+
+	@echo "--- sec_wp32: TOCTOU ms_appendMetaSafe (20 tests) ---"
+	@bash tests/sec_wp32_toctou_test.sh
+	@echo "OK"
+
+	@echo "--- sec_wp33: String-Library Bounds-Hardening (20 tests) ---"
+	@bash tests/sec_wp33_string_bounds_test.sh
+	@echo "OK"
+
+	@echo "--- sec_wp34: Codegen-Buffer-Größenlimit (20 tests) ---"
+	@bash tests/sec_wp34_codegen_buffer_test.sh
+	@echo "OK"
+
+	@echo "--- sec_wp35: LYU-Parser symCount-Limit (20 tests) ---"
+	@bash tests/sec_wp35_lyu_symcount_test.sh
+	@echo "OK"
+
+	@echo "--- sec_wp36: SecureZero Compiler-Barriere (20 tests) ---"
+	@bash tests/sec_wp36_securezero_test.sh
+	@echo "OK"
+
+	@echo "--- sec_wp37: RandInt64 Fehlerbehandlung (20 tests) ---"
+	@bash tests/sec_wp37_randint64_test.sh
+	@echo "OK"
+
+test-lyxos: lyxc
+	@echo "=== LyxOS Integrations-Kompilierungstest ==="
+	@for f in \
+		tests/lyxos/lx00_lbf_magic.lyx \
+		tests/lyxos/lx03_entry.lyx \
+		tests/lyxos/lx04_io.lyx \
+		tests/lyxos/lx05_alloc.lyx \
+		tests/lyxos/lx06_fs.lyx \
+		tests/lyxos/lx08_net.lyx \
+		tests/lyxos/lx09_spawn.lyx \
+		tests/lyxos/lx10_mutex.lyx \
+		tests/lyxos/lx11_timer.lyx \
+		tests/lyxos/lx12_pledge.lyx \
+		tests/lyxos/lx13_parallel.lyx \
+		tests/lyxos/lx14_ai_infer.lyx \
+		tests/lyxos/lx21_two_ret.lyx \
+		tests/lyxos/lx25_block_header.lyx \
+		tests/lyxos/lx26_genesis.lyx \
+		tests/lyxos/lx27_tlv.lyx \
+		tests/lyxos/lx28_sections.lyx; do \
+		printf "  %-40s" "$$f"; \
+		./lyxc $$f --target=lyxos --emit=lbf -o /tmp/lyxos_test.lbf \
+			&& echo "OK" \
+			|| (echo "FAIL" && exit 1); \
+	done
+	@rm -f /tmp/lyxos_test.lbf
+	@echo "=== Alle LyxOS-Tests kompiliert ==="
 
 snapshot: lyxc
 	@bash tests/run_snapshot_tests.sh
@@ -79,10 +196,28 @@ snapshot-update: lyxc
 
 # ── Paketierung ───────────────────────────────────────────────────────────────
 
-package: precompile-units install-bin
+package: sync-units-src precompile-units install-bin
 	dpkg-deb --build $(PKG_DIR) $(DEB_NAME)
 	@echo ""
 	@echo "Paket fertig: $(DEB_NAME)"
+
+# Gepackte .lyx-Quelltexte aus der kanonischen Source synchronisieren.
+# Der Import-Resolver (sema.lyx) bevorzugt .lyx vor .lyu — die gepackten
+# .lyx sind also funktional autoritativ und MÜSSEN der Source entsprechen,
+# sonst kompiliert ein installiertes lyxc gegen veraltete stdlib.
+sync-units-src:
+	@echo "Synchronisiere std/ + data/ .lyx → Paketbaum..."
+	@for f in $(UNITS_SRC); do \
+		dst=$(UNITS_DST)/$${f#std/}; \
+		mkdir -p $$(dirname $$dst); \
+		cp $$f $$dst; \
+	done
+	@for f in $(DATA_SRC); do \
+		dst=$(DATA_DST)/$${f#data/}; \
+		mkdir -p $$(dirname $$dst); \
+		cp $$f $$dst; \
+	done
+	@echo "$(words $(UNITS_SRC) $(DATA_SRC)) .lyx-Quelltexte synchronisiert."
 
 precompile-units: lyxc
 	@echo "Pass 1: Kompiliere Units..."

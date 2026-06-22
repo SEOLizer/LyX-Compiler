@@ -1,0 +1,224 @@
+// std/security_ext -- WP-15: Linux Capabilities & prctl
+// Wrapper um sys_capget (125), sys_capset (126), sys_prctl (157),
+// sys_arch_prctl (158).
+//
+// prctl steuert prozessbezogene Kernel-Parameter (Name, Dumpability,
+// No-New-Privs usw.). capget/capset lesen und setzen POSIX-Capabilities.
+
+import std.alloc;
+
+// ============================================================
+// prctl -- Konstanten
+// ============================================================
+
+// Prozess-Optionen fuer sys_prctl
+pub con PR_SET_PDEATHSIG:    int64 := 1;   // Signal bei Elterntod setzen
+pub con PR_GET_PDEATHSIG:    int64 := 2;
+pub con PR_SET_DUMPABLE:     int64 := 4;   // Core-Dump erlauben (1) oder sperren (0)
+pub con PR_GET_DUMPABLE:     int64 := 3;
+pub con PR_SET_NAME:         int64 := 15;  // Prozessname setzen (max. 15 Zeichen + NUL)
+pub con PR_GET_NAME:         int64 := 16;  // Prozessname lesen (16-Byte-Puffer)
+pub con PR_SET_NO_NEW_PRIVS: int64 := 38;  // Keine neuen Rechte via setuid/caps (einweg!)
+pub con PR_GET_NO_NEW_PRIVS: int64 := 39;
+pub con PR_SET_SECCOMP:      int64 := 22;  // seccomp-Filter setzen
+pub con PR_GET_SECCOMP:      int64 := 21;
+pub con PR_CAP_AMBIENT:      int64 := 47;  // Ambient Capabilities
+
+// PR_CAP_AMBIENT Sub-Kommandos
+pub con PR_CAP_AMBIENT_IS_SET:   int64 := 1;
+pub con PR_CAP_AMBIENT_RAISE:    int64 := 2;
+pub con PR_CAP_AMBIENT_LOWER:    int64 := 3;
+pub con PR_CAP_AMBIENT_CLEAR_ALL: int64 := 4;
+
+// arch_prctl Codes (x86-64)
+pub con ARCH_SET_GS: int64 := 4097;  // 0x1001
+pub con ARCH_SET_FS: int64 := 4098;  // 0x1002
+pub con ARCH_GET_FS: int64 := 4099;  // 0x1003
+pub con ARCH_GET_GS: int64 := 4100;  // 0x1004
+
+// ============================================================
+// prctl -- Prozessname
+// ============================================================
+
+// ProcessSetName: setzt den Prozessnamen (sichtbar in /proc/self/comm, ps).
+// name: NUL-terminierter String, maximal 15 Zeichen werden uebernommen.
+pub fn ProcessSetName(name: pchar): int64 {
+  return sys_prctl(PR_SET_NAME, name as int64, 0, 0, 0);
+}
+
+// ProcessGetName: liest den aktuellen Prozessnamen.
+// outBuf: Puffer von mindestens 16 Bytes.
+pub fn ProcessGetName(outBuf: int64): int64 {
+  return sys_prctl(PR_GET_NAME, outBuf, 0, 0, 0);
+}
+
+// ============================================================
+// prctl -- Sicherheitsoptionen
+// ============================================================
+
+// ProcessSetDumpable: erlaubt (1) oder sperrt (0) Core-Dumps fuer diesen Prozess.
+pub fn ProcessSetDumpable(val: int64): int64 {
+  return sys_prctl(PR_SET_DUMPABLE, val, 0, 0, 0);
+}
+
+// ProcessGetDumpable: liefert 1 wenn Core-Dumps erlaubt, sonst 0.
+pub fn ProcessGetDumpable(): int64 {
+  return sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+}
+
+// ProcessSetNoNewPrivs: setzt das no_new_privs-Flag (EINWEG, nicht rueckgaengig!).
+// Nach dem Setzen koennen keine neuen Rechte via execve(setuid), Capabilities
+// oder seccomp-Mechanismen erworben werden. Wichtig fuer Sandboxing.
+pub fn ProcessSetNoNewPrivs(): int64 {
+  return sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+}
+
+// ProcessGetNoNewPrivs: liefert 1 wenn no_new_privs gesetzt ist.
+pub fn ProcessGetNoNewPrivs(): int64 {
+  return sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+}
+
+// ============================================================
+// arch_prctl -- x86-64 Architektur-Optionen
+// ============================================================
+
+// ArchGetFs: liest die aktuelle FS-Basis (TLS-Zeiger des aktuellen Threads).
+pub fn ArchGetFs(): int64 {
+  var val: int64 := alloc(8);
+  if (val == 0) { return -1; }
+  var r: int64 := sys_arch_prctl(ARCH_GET_FS, val);
+  var fs: int64 := 0;
+  if (r == 0) { fs := peek64(val); }
+  free(val, 8);
+  if (r < 0) { return r; }
+  return fs;
+}
+
+// ArchGetGs: liest die aktuelle GS-Basis.
+pub fn ArchGetGs(): int64 {
+  var val: int64 := alloc(8);
+  if (val == 0) { return -1; }
+  var r: int64 := sys_arch_prctl(ARCH_GET_GS, val);
+  var gs: int64 := 0;
+  if (r == 0) { gs := peek64(val); }
+  free(val, 8);
+  if (r < 0) { return r; }
+  return gs;
+}
+
+// ============================================================
+// Capabilities -- Strukturen und Konstanten
+// ============================================================
+
+// Linux Capability Version 3 (2-Block-Layout, unterstuetzt cap 0..63)
+pub con LINUX_CAP_VERSION_3: int64 := 0x20080522;
+
+// Puffergroesse: cap_header (8 Bytes) + 2x cap_data (je 12 Bytes) = 32 Bytes
+//   +0:  header.version (uint32) -- muss LINUX_CAP_VERSION_3 sein
+//   +4:  header.pid     (int32)  -- 0 = aktueller Prozess
+//   +8:  data[0].effective   (uint32) -- effektive Capabilities 0..31
+//   +12: data[0].permitted   (uint32) -- erlaubte Capabilities 0..31
+//   +16: data[0].inheritable (uint32) -- vererbbare Capabilities 0..31
+//   +20: data[1].effective   (uint32) -- effektive Capabilities 32..63
+//   +24: data[1].permitted   (uint32) -- erlaubte Capabilities 32..63
+//   +28: data[1].inheritable (uint32) -- vererbbare Capabilities 32..63
+pub con CAP_BUF_SIZE:      int64 := 32;
+pub con CAP_EFF_0:         int64 := 8;   // data[0].effective
+pub con CAP_PRM_0:         int64 := 12;  // data[0].permitted
+pub con CAP_INH_0:         int64 := 16;  // data[0].inheritable
+pub con CAP_EFF_1:         int64 := 20;  // data[1].effective
+pub con CAP_PRM_1:         int64 := 24;  // data[1].permitted
+pub con CAP_INH_1:         int64 := 28;  // data[1].inheritable
+
+// Haeufig verwendete Capability-Nummern
+pub con CAP_CHOWN:         int64 := 0;
+pub con CAP_DAC_OVERRIDE:  int64 := 1;
+pub con CAP_DAC_READ_SEARCH: int64 := 2;
+pub con CAP_FOWNER:        int64 := 3;
+pub con CAP_KILL:          int64 := 5;
+pub con CAP_NET_BIND_SERVICE: int64 := 10;
+pub con CAP_NET_RAW:       int64 := 13;
+pub con CAP_SYS_ADMIN:     int64 := 21;
+pub con CAP_SYS_PTRACE:    int64 := 19;
+pub con CAP_SYS_RAWIO:     int64 := 17;
+pub con CAP_SETUID:        int64 := 7;
+pub con CAP_SETGID:        int64 := 6;
+pub con CAP_SETPCAP:       int64 := 8;
+
+// ============================================================
+// Capabilities -- Funktionen
+// ============================================================
+
+// capBufInit: initialisiert den Header in einem CAP_BUF_SIZE-Puffer.
+fn capBufInit(buf: int64) {
+  poke32(buf,     0x20080522);  // LINUX_CAP_VERSION_3
+  poke32(buf + 4, 0);           // pid = 0 (aktueller Prozess)
+}
+
+// CapGet: liest die Capabilities des aktuellen Prozesses.
+// buf: Puffer der Groesse CAP_BUF_SIZE (alloc(CAP_BUF_SIZE)).
+// Nach dem Aufruf: buf+8 = data[0], buf+20 = data[1].
+pub fn CapGet(buf: int64): int64 {
+  capBufInit(buf);
+  return sys_capget(buf, buf + 8);
+}
+
+// CapSet: setzt die Capabilities des aktuellen Prozesses.
+// buf: Puffer der Groesse CAP_BUF_SIZE, vorher mit CapGet befuellt.
+pub fn CapSet(buf: int64): int64 {
+  capBufInit(buf);
+  return sys_capset(buf, buf + 8);
+}
+
+// CapDrop: entfernt eine einzelne Capability aus effective und permitted.
+// capNum: Capability-Nummer (0..63, z.B. CAP_NET_RAW = 13)
+// Gibt 0 bei Erfolg oder negativen Fehlercode zurueck.
+pub fn CapDrop(capNum: int64): int64 {
+  var buf: int64 := alloc(CAP_BUF_SIZE);
+  if (buf == 0) { return -12; }
+  var r: int64 := CapGet(buf);
+  if (r < 0) { free(buf, CAP_BUF_SIZE); return r; }
+
+  // Bit-Maske berechnen: bit = capNum mod 32 -> mask = 1 << bit
+  var bit:  int64 := capNum;
+  var off0: int64 := CAP_EFF_0;   // Offsets fuer data[0] oder data[1]
+  var off1: int64 := CAP_PRM_0;
+  if (capNum >= 32) {
+    bit  := capNum - 32;
+    off0 := CAP_EFF_1;
+    off1 := CAP_PRM_1;
+  }
+  var mask: int64 := 1;
+  var i: int64 := 0;
+  while (i < bit) { mask := mask * 2; i := i + 1; }
+  var notmask: int64 := mask ^ 0xFFFFFFFF;
+
+  // Bit aus effective und permitted loeschen
+  poke32(buf + off0, (peek32(buf + off0) & notmask) as int32);
+  poke32(buf + off1, (peek32(buf + off1) & notmask) as int32);
+
+  r := CapSet(buf);
+  free(buf, CAP_BUF_SIZE);
+  return r;
+}
+
+// CapIsSet: prueft ob eine Capability in effective gesetzt ist.
+// Gibt 1 wenn gesetzt, 0 wenn nicht, negativ bei Fehler.
+pub fn CapIsSet(capNum: int64): int64 {
+  var buf: int64 := alloc(CAP_BUF_SIZE);
+  if (buf == 0) { return -12; }
+  var r: int64 := CapGet(buf);
+  if (r < 0) { free(buf, CAP_BUF_SIZE); return r; }
+
+  var bit:  int64 := capNum;
+  var off:  int64 := CAP_EFF_0;
+  if (capNum >= 32) { bit := capNum - 32; off := CAP_EFF_1; }
+  var mask: int64 := 1;
+  var i: int64 := 0;
+  while (i < bit) { mask := mask * 2; i := i + 1; }
+
+  var v: int64 := peek32(buf + off) & mask;
+  free(buf, CAP_BUF_SIZE);
+  if (v != 0) { return 1; }
+  return 0;
+}

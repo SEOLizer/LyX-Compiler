@@ -1,0 +1,1103 @@
+// std/crypto/pqc/mldsa.lyx
+// WP-PQC-07: ML-DSA (CRYSTALS-Dilithium, NIST FIPS 204)
+//
+// Digitale Signaturen – ersetzt RSA-Sign / ECDSA.
+// Sicherheit basiert auf Module Short Integer Solution (MSIS) + MLWE.
+//
+// Drei Sicherheitsstufen:
+//   ML-DSA-44 (level=44): k=4, l=4, η=2, AES-128-äquivalent
+//   ML-DSA-65 (level=65): k=6, l=5, η=4, AES-192-äquivalent
+//   ML-DSA-87 (level=87): k=8, l=7, η=2, AES-256-äquivalent
+//
+// q = 8380417  (23-Bit-Primzahl)
+// d = 13       (Power2Round-Parameter)
+//
+// SK-Layout: ρ(32) || K(32) || tr(32) || s₁(l*eta_bytes) || s₂(k*eta_bytes) || t₀(k*416)
+// PK-Layout: ρ(32) || t₁(k*320)
+// Sig-Layout: c̃(32) || z(l*z_bytes) || h(ω+k)
+//
+// Abhängigkeiten:
+//   WP-PQC-01: std/crypto/keccak.lyx  (SHAKE-128, SHAKE-256)
+//   WP-PQC-05: std/crypto/ntt.lyx     (DilithiumNTT, DilithiumINTT, ...)
+
+unit std.crypto.pqc.mldsa;
+
+import std.crypto.keccak;
+import std.crypto.ntt;
+import std.alloc;
+
+pub con DILITH_Q:  int64 := 8380417;
+pub con DILITH_D:  int64 := 13;
+
+// ─── Schlüssel- und Signaturgrößen ───────────────────────────────────────────
+pub con MLDSA44_PK:  int64 := 1312;
+pub con MLDSA44_SK:  int64 := 2528;
+pub con MLDSA44_SIG: int64 := 2420;
+pub con MLDSA65_PK:  int64 := 1952;
+pub con MLDSA65_SK:  int64 := 4000;
+pub con MLDSA65_SIG: int64 := 3293;
+pub con MLDSA87_PK:  int64 := 2592;
+pub con MLDSA87_SK:  int64 := 4864;
+pub con MLDSA87_SIG: int64 := 4595;
+
+// ─── Parameter aus Level ──────────────────────────────────────────────────────
+
+fn mldsa_k(level: int64): int64 {
+  if (level == 44) { return 4; }
+  if (level == 65) { return 6; }
+  return 8;
+}
+fn mldsa_l(level: int64): int64 {
+  if (level == 44) { return 4; }
+  if (level == 65) { return 5; }
+  return 7;
+}
+fn mldsa_eta(level: int64): int64 {
+  if (level == 65) { return 4; }
+  return 2;
+}
+fn mldsa_tau(level: int64): int64 {
+  if (level == 44) { return 39; }
+  if (level == 65) { return 49; }
+  return 60;
+}
+fn mldsa_gamma1(level: int64): int64 {
+  if (level == 44) { return 131072; }   // 2^17
+  return 524288;                         // 2^19
+}
+fn mldsa_gamma2(level: int64): int64 {
+  if (level == 44) { return 95232; }    // (q-1)/88
+  return 261888;                         // (q-1)/32
+}
+fn mldsa_beta(level: int64): int64 {
+  if (level == 44) { return 78; }       // tau*eta = 39*2
+  if (level == 65) { return 196; }      // 49*4
+  return 120;                            // 60*2
+}
+fn mldsa_omega(level: int64): int64 {
+  if (level == 44) { return 80; }
+  if (level == 65) { return 55; }
+  return 75;
+}
+fn mldsa_eta_bits(level: int64): int64 {
+  if (level == 65) { return 4; }
+  return 3;
+}
+fn mldsa_z_bits(level: int64): int64 {
+  if (level == 44) { return 18; }
+  return 20;
+}
+// m = (q-1) / (2*gamma2) = Anzahl HighBits-Klassen
+fn mldsa_m(level: int64): int64 {
+  if (level == 44) { return 44; }
+  return 16;
+}
+fn mldsa_w1_bits(level: int64): int64 {
+  if (level == 44) { return 6; }
+  return 4;
+}
+fn mldsa_pk_size(level: int64): int64 {
+  if (level == 44) { return 1312; }
+  if (level == 65) { return 1952; }
+  return 2592;
+}
+fn mldsa_sk_size(level: int64): int64 {
+  if (level == 44) { return 2528; }
+  if (level == 65) { return 4000; }
+  return 4864;
+}
+fn mldsa_sig_size(level: int64): int64 {
+  if (level == 44) { return 2420; }
+  if (level == 65) { return 3293; }
+  return 4595;
+}
+
+// ─── Allgemeine Bit-Pack / Bit-Unpack (LSB-first) ────────────────────────────
+
+fn dil_encode(poly: int64, bits: int64, dst: int64) {
+  var total: int64 := 32 * bits;
+  var i: int64 := 0;
+  while (i < total) { poke8(dst + i, 0); i := i + 1; }
+  i := 0;
+  while (i < 256) {
+    var val: int64 := peek64(poly + i * 8);
+    var j: int64 := 0;
+    while (j < bits) {
+      var bp: int64 := i * bits + j;
+      poke8(dst + (bp >> 3),
+            peek8(dst + (bp >> 3)) | (((val >> j) & 1) << (bp & 7)));
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+}
+
+fn dil_decode(data: int64, bits: int64, poly: int64) {
+  var i: int64 := 0;
+  while (i < 256) {
+    var val: int64 := 0;
+    var j: int64 := 0;
+    while (j < bits) {
+      var bp: int64 := i * bits + j;
+      val := val | (((peek8(data + (bp >> 3)) >> (bp & 7)) & 1) << j);
+      j := j + 1;
+    }
+    poke64(poly + i * 8, val);
+    i := i + 1;
+  }
+}
+
+// ─── η-Koeffizient-Packing ───────────────────────────────────────────────────
+// Koeffizienten ∈ [-η, η] stored in [0,q) as c=val if ≥ 0, c=val+q if < 0
+// Encoded as: eta - val_signed ∈ [0, 2η]
+
+fn pack_eta(c: int64, eta: int64): int64 {
+  if (c <= eta) { return eta - c; }          // positive (c ≤ eta ≤ q/2)
+  return eta + 8380417 - c;                   // negative (c > q/2)
+}
+
+fn unpack_eta(enc: int64, eta: int64): int64 {
+  var c: int64 := eta - enc;  // signed
+  if (c < 0) { return c + 8380417; }
+  return c;
+}
+
+fn encode_eta_poly(poly: int64, eta: int64, bits: int64, dst: int64) {
+  var tmp: int64 := alloc(2048);
+  var i: int64 := 0;
+  while (i < 256) {
+    poke64(tmp + i * 8, pack_eta(peek64(poly + i * 8), eta));
+    i := i + 1;
+  }
+  dil_encode(tmp, bits, dst);
+  free(tmp, 2048);
+}
+
+fn decode_eta_poly(data: int64, eta: int64, bits: int64, poly: int64) {
+  dil_decode(data, bits, poly);
+  var i: int64 := 0;
+  while (i < 256) {
+    poke64(poly + i * 8, unpack_eta(peek64(poly + i * 8), eta));
+    i := i + 1;
+  }
+}
+
+// ─── t₁-Encoding (10 Bits/Koeffizient, Werte ∈ [0, 1023]) ───────────────────
+
+fn encode_t1_poly(poly: int64, dst: int64) { dil_encode(poly, 10, dst); }
+fn decode_t1_poly(data: int64, poly: int64) { dil_decode(data, 10, poly); }
+
+// ─── t₀-Encoding (13 Bits/Koeffizient, stored als 4096 - t₀_signed) ─────────
+// t₀ ∈ (-2^12, 2^12] in [0,q): enc = 4096 - t₀_signed
+
+fn encode_t0_poly(poly: int64, dst: int64) {
+  var tmp: int64 := alloc(2048);
+  var i: int64 := 0;
+  while (i < 256) {
+    var c: int64 := peek64(poly + i * 8);
+    var t0: int64 := c;
+    if (c > 4096) { t0 := c - 8380417; }  // convert to signed
+    poke64(tmp + i * 8, 4096 - t0);
+    i := i + 1;
+  }
+  dil_encode(tmp, 13, dst);
+  free(tmp, 2048);
+}
+
+fn decode_t0_poly(data: int64, poly: int64) {
+  dil_decode(data, 13, poly);
+  var i: int64 := 0;
+  while (i < 256) {
+    var enc: int64 := peek64(poly + i * 8);
+    var t0: int64 := 4096 - enc;  // signed, ∈ (-4096, 4096]
+    if (t0 < 0) { t0 := t0 + 8380417; }
+    poke64(poly + i * 8, t0);
+    i := i + 1;
+  }
+}
+
+// ─── z-Encoding (18 oder 20 Bits, stored als γ₁ - z_signed) ─────────────────
+// z ∈ (-γ₁, γ₁) in [0,q): enc = γ₁ - z_signed ∈ [1, 2γ₁-1]
+
+fn pack_z_coeff(c: int64, gamma1: int64): int64 {
+  if (c <= gamma1) { return gamma1 - c; }   // positive z
+  return gamma1 + 8380417 - c;               // negative z (c > q/2 area)
+}
+
+fn unpack_z_coeff(enc: int64, gamma1: int64): int64 {
+  var c: int64 := gamma1 - enc;             // signed
+  if (c < 0) { return c + 8380417; }
+  return c;
+}
+
+fn encode_z_vec(v: int64, l: int64, bits: int64, gamma1: int64, dst: int64) {
+  var tmp: int64 := alloc(2048);
+  var pb: int64 := 32 * bits;
+  var i: int64 := 0;
+  while (i < l) {
+    var j: int64 := 0;
+    while (j < 256) {
+      poke64(tmp + j * 8, pack_z_coeff(peek64(v + i * 2048 + j * 8), gamma1));
+      j := j + 1;
+    }
+    dil_encode(tmp, bits, dst + i * pb);
+    i := i + 1;
+  }
+  free(tmp, 2048);
+}
+
+fn decode_z_vec(data: int64, l: int64, bits: int64, gamma1: int64, v: int64) {
+  var pb: int64 := 32 * bits;
+  var i: int64 := 0;
+  while (i < l) {
+    dil_decode(data + i * pb, bits, v + i * 2048);
+    var j: int64 := 0;
+    while (j < 256) {
+      poke64(v + i * 2048 + j * 8, unpack_z_coeff(peek64(v + i * 2048 + j * 8), gamma1));
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+}
+
+// ─── Hint-Encoding (ω + k Bytes) ─────────────────────────────────────────────
+
+fn encode_hint(h: int64, k: int64, omega: int64, dst: int64) {
+  var i: int64 := 0;
+  while (i < omega + k) { poke8(dst + i, 0); i := i + 1; }
+  var idx: int64 := 0;
+  i := 0;
+  while (i < k) {
+    var j: int64 := 0;
+    while (j < 256) {
+      if (peek64(h + i * 2048 + j * 8) != 0) {
+        poke8(dst + idx, j & 0xFF);
+        idx := idx + 1;
+      }
+      j := j + 1;
+    }
+    poke8(dst + omega + i, idx & 0xFF);
+    i := i + 1;
+  }
+}
+
+// Gibt 0 zurück wenn valid, 1 wenn malformed
+fn decode_hint(data: int64, k: int64, omega: int64, h: int64): int64 {
+  var i: int64 := 0;
+  while (i < k) {
+    var j: int64 := 0;
+    while (j < 256) { poke64(h + i * 2048 + j * 8, 0); j := j + 1; }
+    i := i + 1;
+  }
+  var idx: int64 := 0;
+  i := 0;
+  while (i < k) {
+    var end_idx: int64 := peek8(data + omega + i) & 0xFF;
+    if (end_idx < idx) { return 1; }
+    if (end_idx > omega) { return 1; }
+    var prev: int64 := 0 - 1;  // Sentinel -1: jedes pos ∈ [0,255] ist größer
+    while (idx < end_idx) {
+      var pos: int64 := peek8(data + idx) & 0xFF;
+      if (pos <= prev) { return 1; }  // nicht streng aufsteigend (pos muss > prev sein)
+      prev := pos;
+      poke64(h + i * 2048 + pos * 8, 1);
+      idx := idx + 1;
+    }
+    i := i + 1;
+  }
+  // Restliche Bytes müssen 0 sein
+  while (idx < omega) {
+    if (peek8(data + idx) != 0) { return 1; }
+    idx := idx + 1;
+  }
+  return 0;
+}
+
+// ─── Arithmetik-Helfer ────────────────────────────────────────────────────────
+
+// HighBits_q(r, α): r₁ = (r - r₀) / α mit Spezialfall r₁=m → r₁=0
+fn highbits(r: int64, alpha: int64): int64 {
+  var r0: int64 := r - (r / alpha) * alpha;          // r mod alpha
+  if (r0 > alpha / 2) { r0 := r0 - alpha; }          // zentrieren
+  if ((r - r0) == 8380416) { return 0; }             // Spezialfall: Top-Klasse
+  return (r - r0) / alpha;
+}
+
+// LowBits_q(r, α): zentrierter Rest (signed, wird in [0,q) zurückgegeben)
+fn lowbits(r: int64, alpha: int64): int64 {
+  var r0: int64 := r - (r / alpha) * alpha;
+  if (r0 > alpha / 2) { r0 := r0 - alpha; }
+  if ((r - r0) == 8380416) { return r0 - 1; }       // Spezialfall
+  return r0;
+}
+
+// MakeHint(z, r, α): 1 wenn HighBits(r) ≠ HighBits(r+z), sonst 0
+// z, r ∈ [0, q) — Repräsentation negativer Werte via q
+fn make_hint_coeff(z: int64, r: int64, alpha: int64): int64 {
+  var rz: int64 := r + z;
+  if (rz >= 8380417) { rz := rz - 8380417; }
+  if (highbits(r, alpha) != highbits(rz, alpha)) { return 1; }
+  return 0;
+}
+
+// UseHint(h, r, α): korrigierter HighBits-Wert
+fn use_hint(h: int64, r: int64, alpha: int64, m: int64): int64 {
+  var r1: int64 := highbits(r, alpha);
+  var r0: int64 := lowbits(r, alpha);
+  if (h == 0) { return r1; }
+  if (r0 > 0) {
+    // (r1 + 1) mod m
+    var res: int64 := r1 + 1;
+    if (res >= m) { res := 0; }
+    return res;
+  }
+  var res: int64 := r1 - 1;
+  if (res < 0) { res := res + m; }
+  return res;
+}
+
+// Power2Round(r, d=13) → schreibt r₀ und r₁ direkt in Polynome
+fn power2round_poly(poly: int64, r0p: int64, r1p: int64) {
+  var i: int64 := 0;
+  while (i < 256) {
+    var r: int64 := peek64(poly + i * 8);
+    var r0: int64 := r & 8191;                        // r mod 8192
+    if (r0 > 4096) { r0 := r0 - 8192; }             // zentrieren
+    var r1: int64 := (r - r0) / 8192;
+    if (r0 < 0) { poke64(r0p + i * 8, r0 + 8380417); }
+    else { poke64(r0p + i * 8, r0); }
+    poke64(r1p + i * 8, r1);
+    i := i + 1;
+  }
+}
+
+// Poly negieren: c → q - c (mod q), 0 bleibt 0
+fn poly_neg(poly: int64) {
+  var i: int64 := 0;
+  while (i < 256) {
+    var c: int64 := peek64(poly + i * 8);
+    if (c != 0) { poke64(poly + i * 8, 8380417 - c); }
+    i := i + 1;
+  }
+}
+
+// ─── Poly-Vektor-Helfer ───────────────────────────────────────────────────────
+
+fn dil_polyvec_ntt(v: int64, n: int64) {
+  var i: int64 := 0;
+  while (i < n) { DilithiumNTT(v + i * 2048); i := i + 1; }
+}
+
+fn dil_polyvec_intt(v: int64, n: int64) {
+  var i: int64 := 0;
+  while (i < n) { DilithiumINTT(v + i * 2048); i := i + 1; }
+}
+
+fn dil_polyvec_add(a: int64, b: int64, c: int64, n: int64) {
+  var i: int64 := 0;
+  while (i < n) {
+    DilithiumPolyAdd(a + i * 2048, b + i * 2048, c + i * 2048);
+    i := i + 1;
+  }
+}
+
+fn dil_polyvec_sub(a: int64, b: int64, c: int64, n: int64) {
+  var i: int64 := 0;
+  while (i < n) {
+    DilithiumPolySub(a + i * 2048, b + i * 2048, c + i * 2048);
+    i := i + 1;
+  }
+}
+
+fn dil_polyvec_copy(src: int64, dst: int64, n: int64) {
+  var i: int64 := 0;
+  while (i < n * 2048) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+// Mul-Acc: für jede Poly j: out[i] += a[i] * b[i]  (NTT-Bereich)
+fn dil_polymul_acc(a: int64, b: int64, dst: int64) {
+  var prod: int64 := alloc(2048);
+  DilithiumPolyMul(a, b, prod);
+  DilithiumPolyAdd(dst, prod, dst);
+  free(prod, 2048);
+}
+
+// ─── ∞-Norm und Hint-Gewicht ──────────────────────────────────────────────────
+
+// Gibt max |c| zurück; Koeffizienten in [0,q) repräsentieren ±-Werte
+fn inf_norm_vec(v: int64, n: int64): int64 {
+  var qhalf: int64 := 4190208;  // floor((q-1)/2)
+  var maxnorm: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    var j: int64 := 0;
+    while (j < 256) {
+      var c: int64 := peek64(v + i * 2048 + j * 8);
+      var norm: int64 := c;
+      if (c > qhalf) { norm := 8380417 - c; }
+      if (norm > maxnorm) { maxnorm := norm; }
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  return maxnorm;
+}
+
+fn hint_weight(h: int64, k: int64): int64 {
+  var weight: int64 := 0;
+  var i: int64 := 0;
+  while (i < k) {
+    var j: int64 := 0;
+    while (j < 256) {
+      if (peek64(h + i * 2048 + j * 8) != 0) { weight := weight + 1; }
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  return weight;
+}
+
+// LowBits-∞-Norm-Check: gibt 1 zurück wenn |any lowbits| >= bound
+fn check_lowbits_bound(w: int64, k: int64, alpha: int64, bound: int64): int64 {
+  var i: int64 := 0;
+  while (i < k) {
+    var j: int64 := 0;
+    while (j < 256) {
+      var lb: int64 := lowbits(peek64(w + i * 2048 + j * 8), alpha);
+      var alb: int64 := lb;
+      if (lb < 0) { alb := 0 - lb; }
+      if (alb >= bound) { return 1; }
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  return 0;
+}
+
+// ─── Sampling ────────────────────────────────────────────────────────────────
+
+// Dilithium SampleNTT: SHAKE-128(ρ || col || row, 816 Bytes) → 23-Bit Rejection
+fn mldsa_sample_ntt(rho: int64, row: int64, col: int64, poly: int64) {
+  var seed: int64 := alloc(34);
+  var buf:  int64 := alloc(816);   // 272 * 3 für sehr geringe Ablehnrate
+  var n: int64 := 0;
+  while (n < 32) { poke8(seed + n, peek8(rho + n)); n := n + 1; }
+  poke8(seed + 32, col & 0xFF);    // FIPS 204: j (Spalte) zuerst
+  poke8(seed + 33, row & 0xFF);    // dann i (Zeile)
+  SHAKE128(seed, 34, buf, 816);
+  var count: int64 := 0;
+  var pos: int64 := 0;
+  while (count < 256) {
+    var b0: int64 := peek8(buf + pos);
+    var b1: int64 := peek8(buf + pos + 1);
+    var b2: int64 := peek8(buf + pos + 2);
+    pos := pos + 3;
+    var t: int64 := b0 | (b1 << 8) | ((b2 & 0x7F) << 16);
+    if (t < 8380417) { poke64(poly + count * 8, t); count := count + 1; }
+  }
+  free(seed, 34); free(buf, 816);
+}
+
+// A * v_hat oder A^T * v_hat (k×l Matrix, NTT-Bereich)
+// transpose=0: w[i] = Σⱼ A[i,j]*v[j]  (k Ausgabe-Polys, l Eingabe-Polys)
+// transpose=1: w[i] = Σⱼ A[j,i]*v[j]  (l Ausgabe-Polys, k Eingabe-Polys)
+fn dil_matvec(rho: int64, v_hat: int64, w_hat: int64, k: int64, l: int64, transpose: int64) {
+  var a_poly: int64 := alloc(2048);
+  var out_n: int64 := k;
+  var in_n:  int64 := l;
+  if (transpose != 0) { out_n := l; in_n := k; }
+  var i: int64 := 0;
+  while (i < out_n) {
+    KyberPolyZero(w_hat + i * 2048);  // zero first (layout-kompatibel)
+    var j: int64 := 0;
+    while (j < in_n) {
+      var row: int64 := i;
+      var col: int64 := j;
+      if (transpose != 0) { row := j; col := i; }
+      mldsa_sample_ntt(rho, row, col, a_poly);
+      dil_polymul_acc(a_poly, v_hat + j * 2048, w_hat + i * 2048);
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  free(a_poly, 2048);
+}
+
+// SampleEta: SHAKE-256(ρ' || 2-Byte-Nonce, 512 Bytes) → η-gebundene Koeff.
+fn mldsa_sample_eta(rho_prime: int64, nonce: int64, eta: int64, poly: int64) {
+  var seed: int64 := alloc(66);  // 64 Bytes ρ' + 2 Bytes Nonce
+  var buf:  int64 := alloc(512);
+  var i: int64 := 0;
+  while (i < 64) { poke8(seed + i, peek8(rho_prime + i)); i := i + 1; }
+  poke8(seed + 64, nonce & 0xFF);
+  poke8(seed + 65, (nonce >> 8) & 0xFF);
+  SHAKE256(seed, 66, buf, 512);
+  var count: int64 := 0;
+  var pos: int64 := 0;
+  var bound: int64 := 2 * eta + 1;
+  while (count < 256) {
+    var b: int64 := peek8(buf + pos); pos := pos + 1;
+    var z0: int64 := b & 0xF;
+    var z1: int64 := b >> 4;
+    if (z0 < bound) {
+      var c: int64 := eta - z0;
+      if (c < 0) { c := c + 8380417; }
+      poke64(poly + count * 8, c); count := count + 1;
+    }
+    if (z1 < bound) {
+      if (count < 256) {
+        var c: int64 := eta - z1;
+        if (c < 0) { c := c + 8380417; }
+        poke64(poly + count * 8, c); count := count + 1;
+      }
+    }
+  }
+  free(seed, 66); free(buf, 512);
+}
+
+// ExpandMask: SHAKE-256(ρ'' || 2-Byte-Nonce, z_bytes) → y[i] ∈ [-(γ₁-1), γ₁-1]
+fn mldsa_expand_mask(rho_pp: int64, kappa: int64, gamma1: int64, l: int64, y: int64) {
+  var bits: int64 := 18;
+  if (gamma1 == 524288) { bits := 20; }
+  var xof_size: int64 := 32 * bits;   // 576 oder 640 Bytes
+  var buf:  int64 := alloc(640);       // max xof_size
+  var seed: int64 := alloc(66);        // 64 + 2
+  var n: int64 := 0;
+  while (n < 64) { poke8(seed + n, peek8(rho_pp + n)); n := n + 1; }
+  var i: int64 := 0;
+  while (i < l) {
+    var nonce: int64 := kappa + i;
+    poke8(seed + 64, nonce & 0xFF);
+    poke8(seed + 65, (nonce >> 8) & 0xFF);
+    SHAKE256(seed, 66, buf, xof_size);
+    var j: int64 := 0;
+    while (j < 256) {
+      var bp: int64 := j * bits;
+      var val: int64 := 0;
+      var b: int64 := 0;
+      while (b < bits) {
+        var bitpos: int64 := bp + b;
+        val := val | (((peek8(buf + (bitpos >> 3)) >> (bitpos & 7)) & 1) << b);
+        b := b + 1;
+      }
+      // coeff = gamma1 - 1 - val ∈ [-(gamma1-1), gamma1-1]
+      var coeff: int64 := gamma1 - 1 - val;
+      if (coeff < 0) { coeff := coeff + 8380417; }
+      poke64(y + i * 2048 + j * 8, coeff);
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  free(buf, 640); free(seed, 66);
+}
+
+// SampleInBall: τ Koeffizienten ±1 via Fisher-Yates shuffle
+fn mldsa_sample_in_ball(ctilde: int64, tau: int64, poly: int64) {
+  var buf: int64 := alloc(256);    // 8 Sign-Bytes + bis zu 248 Sampling-Bytes
+  SHAKE256(ctilde, 32, buf, 256);
+  var i: int64 := 0;
+  while (i < 256) { poke64(poly + i * 8, 0); i := i + 1; }
+  // Sign-Bits aus ersten 8 Bytes extrahieren
+  var sign_idx: int64 := 0;
+  var pos: int64 := 8;             // Sampling-Bytes starten nach 8 Sign-Bytes
+  i := 256 - tau;
+  while (i < 256) {
+    // Rejection-Sample j ∈ [0, i]
+    var j: int64 := peek8(buf + pos); pos := pos + 1;
+    while (j > i) {
+      j := peek8(buf + pos); pos := pos + 1;
+    }
+    poke64(poly + i * 8, peek64(poly + j * 8));
+    // Sign-Bit extrahieren
+    var sign_byte: int64 := peek8(buf + (sign_idx >> 3));
+    var sign_bit:  int64 := (sign_byte >> (sign_idx & 7)) & 1;
+    sign_idx := sign_idx + 1;
+    var val: int64 := 1;
+    if (sign_bit != 0) { val := 8380416; }  // -1 mod q
+    poke64(poly + j * 8, val);
+    i := i + 1;
+  }
+  free(buf, 256);
+}
+
+// ─── w₁-Encoding für Commitment-Hash ─────────────────────────────────────────
+
+fn encode_w1_vec(w1: int64, k: int64, bits: int64, dst: int64) {
+  var pb: int64 := 32 * bits;
+  var i: int64 := 0;
+  while (i < k) {
+    dil_encode(w1 + i * 2048, bits, dst + i * pb);
+    i := i + 1;
+  }
+}
+
+// ─── ML-DSA.KeyGen (FIPS 204 Algorithmus 6) ──────────────────────────────────
+// seed: 32 Bytes ξ
+// pk:   Empfänger für Public Key
+// sk:   Empfänger für Secret Key
+pub fn MLDSAKeyGen(seed: int64, level: int64, pk: int64, sk: int64): int64 {
+  var k: int64 := mldsa_k(level);
+  var l: int64 := mldsa_l(level);
+  var eta: int64 := mldsa_eta(level);
+  var eta_bits: int64 := mldsa_eta_bits(level);
+  var eta_pb: int64 := 32 * eta_bits;  // Bytes pro η-Polynom
+
+  // (ρ, ρ', K) = SHAKE-256(seed, 128 Bytes)
+  var exp: int64 := alloc(128);
+  SHAKE256(seed, 32, exp, 128);
+  var rho:       int64 := exp;          // [0..31]
+  var rho_prime: int64 := exp + 32;    // [32..95] (64 Bytes)
+  var K:         int64 := exp + 96;    // [96..127]
+
+  // s₁[i] = SampleEta(ρ', i), s₂[i] = SampleEta(ρ', l+i)
+  var s1: int64 := alloc(l * 2048);
+  var s2: int64 := alloc(k * 2048);
+  var i: int64 := 0;
+  while (i < l) {
+    mldsa_sample_eta(rho_prime, i, eta, s1 + i * 2048);
+    i := i + 1;
+  }
+  i := 0;
+  while (i < k) {
+    mldsa_sample_eta(rho_prime, l + i, eta, s2 + i * 2048);
+    i := i + 1;
+  }
+
+  // t = INTT(A * NTT(s₁)) + s₂
+  var s1_hat: int64 := alloc(l * 2048);
+  dil_polyvec_copy(s1, s1_hat, l);
+  dil_polyvec_ntt(s1_hat, l);
+
+  var t: int64 := alloc(k * 2048);
+  dil_matvec(rho, s1_hat, t, k, l, 0);   // t = A * s1_hat (NTT domain)
+  dil_polyvec_intt(t, k);                  // polynomial domain
+  dil_polyvec_add(t, s2, t, k);           // t += s2
+
+  // (t₁, t₀) = Power2Round(t, 13) per Koeffizient
+  var t1: int64 := alloc(k * 2048);
+  var t0: int64 := alloc(k * 2048);
+  i := 0;
+  while (i < k) {
+    power2round_poly(t + i * 2048, t0 + i * 2048, t1 + i * 2048);
+    i := i + 1;
+  }
+
+  // pk = ρ || ByteEncode_10(t₁)
+  i := 0;
+  while (i < 32) { poke8(pk + i, peek8(rho + i)); i := i + 1; }
+  i := 0;
+  while (i < k) {
+    encode_t1_poly(t1 + i * 2048, pk + 32 + i * 320);
+    i := i + 1;
+  }
+
+  // tr = SHAKE-256(pk, 32)
+  var tr: int64 := alloc(32);
+  SHAKE256(pk, mldsa_pk_size(level), tr, 32);
+
+  // sk = ρ || K || tr || s₁ || s₂ || t₀
+  var off: int64 := 0;
+  i := 0;
+  while (i < 32) { poke8(sk + off + i, peek8(rho + i)); i := i + 1; }
+  off := off + 32;
+  i := 0;
+  while (i < 32) { poke8(sk + off + i, peek8(K + i)); i := i + 1; }
+  off := off + 32;
+  i := 0;
+  while (i < 32) { poke8(sk + off + i, peek8(tr + i)); i := i + 1; }
+  off := off + 32;
+  i := 0;
+  while (i < l) {
+    encode_eta_poly(s1 + i * 2048, eta, eta_bits, sk + off + i * eta_pb);
+    i := i + 1;
+  }
+  off := off + l * eta_pb;
+  i := 0;
+  while (i < k) {
+    encode_eta_poly(s2 + i * 2048, eta, eta_bits, sk + off + i * eta_pb);
+    i := i + 1;
+  }
+  off := off + k * eta_pb;
+  i := 0;
+  while (i < k) {
+    encode_t0_poly(t0 + i * 2048, sk + off + i * 416);
+    i := i + 1;
+  }
+
+  free(exp, 128); free(s1, l*2048); free(s2, k*2048); free(s1_hat, l*2048);
+  free(t, k*2048); free(t1, k*2048); free(t0, k*2048); free(tr, 32);
+  return 0;
+}
+
+// ─── ML-DSA.Sign (FIPS 204 Algorithmus 7) ─────────────────────────────────────
+// Deterministische Variante (rnd = 0^256)
+// Gibt tatsächliche Signaturlänge zurück, oder 0 bei Fehler
+pub fn MLDSASign(sk: int64, level: int64, msg: int64, msgLen: int64, sig: int64): int64 {
+  var k: int64 := mldsa_k(level);
+  var l: int64 := mldsa_l(level);
+  var eta: int64 := mldsa_eta(level);
+  var tau: int64 := mldsa_tau(level);
+  var gamma1: int64 := mldsa_gamma1(level);
+  var gamma2: int64 := mldsa_gamma2(level);
+  var beta: int64 := mldsa_beta(level);
+  var omega: int64 := mldsa_omega(level);
+  var alpha: int64 := 2 * gamma2;
+  var eta_bits: int64 := mldsa_eta_bits(level);
+  var eta_pb: int64 := 32 * eta_bits;
+  var z_bits: int64 := mldsa_z_bits(level);
+  var w1_bits_val: int64 := mldsa_w1_bits(level);
+
+  // SK-Komponenten extrahieren
+  var sk_rho: int64 := sk;
+  var sk_K:   int64 := sk + 32;
+  var sk_tr:  int64 := sk + 64;
+  var sk_s1:  int64 := sk + 96;
+  var sk_s2:  int64 := sk + 96 + l * eta_pb;
+  var sk_t0:  int64 := sk + 96 + l * eta_pb + k * eta_pb;
+
+  // s₁, s₂, t₀ dekodieren
+  var s1: int64 := alloc(l * 2048);
+  var s2: int64 := alloc(k * 2048);
+  var t0: int64 := alloc(k * 2048);
+  var i: int64 := 0;
+  while (i < l) {
+    decode_eta_poly(sk_s1 + i * eta_pb, eta, eta_bits, s1 + i * 2048);
+    i := i + 1;
+  }
+  i := 0;
+  while (i < k) {
+    decode_eta_poly(sk_s2 + i * eta_pb, eta, eta_bits, s2 + i * 2048);
+    i := i + 1;
+  }
+  i := 0;
+  while (i < k) {
+    decode_t0_poly(sk_t0 + i * 416, t0 + i * 2048);
+    i := i + 1;
+  }
+
+  // NTT(s₁), NTT(s₂), NTT(t₀) vorberechnen
+  var s1h: int64 := alloc(l * 2048);
+  var s2h: int64 := alloc(k * 2048);
+  var t0h: int64 := alloc(k * 2048);
+  dil_polyvec_copy(s1, s1h, l); dil_polyvec_ntt(s1h, l);
+  dil_polyvec_copy(s2, s2h, k); dil_polyvec_ntt(s2h, k);
+  dil_polyvec_copy(t0, t0h, k); dil_polyvec_ntt(t0h, k);
+  free(s1, l*2048); free(s2, k*2048); free(t0, k*2048);
+
+  // μ = SHAKE-256(tr || M, 64)
+  var tr_msg: int64 := alloc(32 + msgLen);
+  i := 0;
+  while (i < 32) { poke8(tr_msg + i, peek8(sk_tr + i)); i := i + 1; }
+  i := 0;
+  while (i < msgLen) { poke8(tr_msg + 32 + i, peek8(msg + i)); i := i + 1; }
+  var mu: int64 := alloc(64);
+  SHAKE256(tr_msg, 32 + msgLen, mu, 64);
+  free(tr_msg, 32 + msgLen);
+
+  // ρ'' = SHAKE-256(K || 0^32 || μ, 64)  (deterministische Signatur: rnd=0)
+  var k_rnd_mu: int64 := alloc(128);
+  i := 0;
+  while (i < 32) { poke8(k_rnd_mu + i, peek8(sk_K + i)); i := i + 1; }
+  i := 0;
+  while (i < 32) { poke8(k_rnd_mu + 32 + i, 0); i := i + 1; }
+  i := 0;
+  while (i < 64) { poke8(k_rnd_mu + 64 + i, peek8(mu + i)); i := i + 1; }
+  var rho_pp: int64 := alloc(64);
+  SHAKE256(k_rnd_mu, 128, rho_pp, 64);
+  free(k_rnd_mu, 128);
+
+  // Arbeits-Puffer für Rejection-Loop
+  var y:      int64 := alloc(l * 2048);
+  var w:      int64 := alloc(k * 2048);
+  var w1:     int64 := alloc(k * 2048);
+  var c_poly: int64 := alloc(2048);
+  var c_hat:  int64 := alloc(2048);
+  var cs1:    int64 := alloc(l * 2048);
+  var cs2:    int64 := alloc(k * 2048);
+  var ct0:    int64 := alloc(k * 2048);
+  var z:      int64 := alloc(l * 2048);
+  var neg_ct0: int64 := alloc(k * 2048);
+  var arg2:   int64 := alloc(k * 2048);
+  var h_poly: int64 := alloc(k * 2048);
+  var ctilde: int64 := alloc(32);
+  var w1_enc: int64 := alloc(k * 192);
+
+  var kappa: int64 := 0;
+  var done:  int64 := 0;
+
+  while (done == 0) {
+    // y samplen und NTT berechnen
+    mldsa_expand_mask(rho_pp, kappa, gamma1, l, y);
+    dil_polyvec_ntt(y, l);                           // y jetzt NTT-Domain
+
+    // w = INTT(A * NTT(y))
+    dil_matvec(sk_rho, y, w, k, l, 0);
+    dil_polyvec_intt(w, k);
+
+    // y zurückkonvertieren (INTT(NTT(y)) = y)
+    dil_polyvec_intt(y, l);                          // y wieder Polynomial-Domain
+
+    // w₁ = HighBits(w, 2γ₂) pro Koeffizient
+    i := 0;
+    while (i < k) {
+      var j: int64 := 0;
+      while (j < 256) {
+        poke64(w1 + i*2048 + j*8, highbits(peek64(w + i*2048 + j*8), alpha));
+        j := j + 1;
+      }
+      i := i + 1;
+    }
+
+    // c̃ = SHAKE-256(μ || encode(w₁), 32)
+    var w1_enc_size: int64 := k * 32 * w1_bits_val;
+    encode_w1_vec(w1, k, w1_bits_val, w1_enc);
+    var mu_w1: int64 := alloc(64 + w1_enc_size);
+    i := 0;
+    while (i < 64) { poke8(mu_w1 + i, peek8(mu + i)); i := i + 1; }
+    i := 0;
+    while (i < w1_enc_size) { poke8(mu_w1 + 64 + i, peek8(w1_enc + i)); i := i + 1; }
+    SHAKE256(mu_w1, 64 + w1_enc_size, ctilde, 32);
+    free(mu_w1, 64 + w1_enc_size);
+
+    // c = SampleInBall(c̃, τ)
+    mldsa_sample_in_ball(ctilde, tau, c_poly);
+
+    // ĉ = NTT(c)
+    i := 0;
+    while (i < 2048) { poke8(c_hat + i, peek8(c_poly + i)); i := i + 1; }
+    DilithiumNTT(c_hat);
+
+    // cs₁ = INTT(ĉ ⊙ ŝ₁), cs₂ = INTT(ĉ ⊙ ŝ₂), ct₀ = INTT(ĉ ⊙ t̂₀)
+    i := 0;
+    while (i < l) {
+      DilithiumPolyMul(c_hat, s1h + i*2048, cs1 + i*2048);
+      DilithiumINTT(cs1 + i*2048);
+      i := i + 1;
+    }
+    i := 0;
+    while (i < k) {
+      DilithiumPolyMul(c_hat, s2h + i*2048, cs2 + i*2048);
+      DilithiumINTT(cs2 + i*2048);
+      i := i + 1;
+    }
+    i := 0;
+    while (i < k) {
+      DilithiumPolyMul(c_hat, t0h + i*2048, ct0 + i*2048);
+      DilithiumINTT(ct0 + i*2048);
+      i := i + 1;
+    }
+
+    // z = y + cs₁
+    dil_polyvec_add(y, cs1, z, l);
+
+    // Check ‖z‖∞ < γ₁ - β
+    if (inf_norm_vec(z, l) >= gamma1 - beta) {
+      kappa := kappa + l;
+    } else {
+      // w - cs₂ für LowBits-Check und Hint
+      var w_cs2: int64 := alloc(k * 2048);
+      dil_polyvec_sub(w, cs2, w_cs2, k);
+
+      // Check ‖r₀‖∞ < γ₂ - β
+      if (check_lowbits_bound(w_cs2, k, alpha, gamma2 - beta) != 0) {
+        free(w_cs2, k*2048);
+        kappa := kappa + l;
+      } else {
+        // -ct₀ und Argument für MakeHint
+        dil_polyvec_copy(ct0, neg_ct0, k);
+        i := 0;
+        while (i < k) { poly_neg(neg_ct0 + i*2048); i := i + 1; }
+
+        // arg2 = w - cs₂ + ct₀
+        dil_polyvec_add(w_cs2, ct0, arg2, k);
+        free(w_cs2, k*2048);
+
+        // h = MakeHint(-ct₀, arg2, 2γ₂)
+        i := 0;
+        while (i < k) {
+          var j: int64 := 0;
+          while (j < 256) {
+            var z_v: int64 := peek64(neg_ct0 + i*2048 + j*8);
+            var r_v: int64 := peek64(arg2 + i*2048 + j*8);
+            poke64(h_poly + i*2048 + j*8, make_hint_coeff(z_v, r_v, alpha));
+            j := j + 1;
+          }
+          i := i + 1;
+        }
+
+        // Check ‖h‖₁ ≤ ω
+        if (hint_weight(h_poly, k) > omega) {
+          kappa := kappa + l;
+        } else {
+          done := 1;
+          kappa := kappa + l;
+        }
+      }
+    }
+  }
+
+  // Signatur kodieren: c̃ || z || h
+  i := 0;
+  while (i < 32) { poke8(sig + i, peek8(ctilde + i)); i := i + 1; }
+  encode_z_vec(z, l, z_bits, gamma1, sig + 32);
+  var z_enc_size: int64 := l * 32 * z_bits;
+  encode_hint(h_poly, k, omega, sig + 32 + z_enc_size);
+
+  free(s1h, l*2048); free(s2h, k*2048); free(t0h, k*2048);
+  free(mu, 64); free(rho_pp, 64);
+  free(y, l*2048); free(w, k*2048); free(w1, k*2048);
+  free(c_poly, 2048); free(c_hat, 2048);
+  free(cs1, l*2048); free(cs2, k*2048); free(ct0, k*2048);
+  free(z, l*2048); free(neg_ct0, k*2048); free(arg2, k*2048);
+  free(h_poly, k*2048); free(ctilde, 32); free(w1_enc, k*192);
+
+  return mldsa_sig_size(level);
+}
+
+// ─── ML-DSA.Verify (FIPS 204 Algorithmus 3) ──────────────────────────────────
+// Gibt 1 zurück wenn Signatur gültig, 0 wenn ungültig
+pub fn MLDSAVerify(pk: int64, level: int64, msg: int64, msgLen: int64, sig: int64, sigLen: int64): int64 {
+  var k: int64 := mldsa_k(level);
+  var l: int64 := mldsa_l(level);
+  var tau: int64 := mldsa_tau(level);
+  var gamma1: int64 := mldsa_gamma1(level);
+  var gamma2: int64 := mldsa_gamma2(level);
+  var beta: int64 := mldsa_beta(level);
+  var omega: int64 := mldsa_omega(level);
+  var alpha: int64 := 2 * gamma2;
+  var m_val: int64 := mldsa_m(level);
+  var z_bits: int64 := mldsa_z_bits(level);
+  var w1_bits_val: int64 := mldsa_w1_bits(level);
+
+  if (sigLen != mldsa_sig_size(level)) { return 0; }
+
+  // Signatur-Komponenten extrahieren
+  var ctilde: int64 := sig;                         // 32 Bytes
+  var sig_z:  int64 := sig + 32;                    // l * z_bytes
+  var z_enc_size: int64 := l * 32 * z_bits;
+  var sig_h:  int64 := sig + 32 + z_enc_size;      // omega+k Bytes
+
+  // PK dekodieren: ρ || t₁
+  var pk_rho: int64 := pk;
+  var pk_t1:  int64 := pk + 32;
+
+  // z und h dekodieren
+  var z: int64 := alloc(l * 2048);
+  decode_z_vec(sig_z, l, z_bits, gamma1, z);
+  var h: int64 := alloc(k * 2048);
+  if (decode_hint(sig_h, k, omega, h) != 0) {
+    free(z, l*2048); free(h, k*2048); return 0;
+  }
+
+  // ‖z‖∞ < γ₁ - β
+  if (inf_norm_vec(z, l) >= gamma1 - beta) {
+    free(z, l*2048); free(h, k*2048); return 0;
+  }
+
+  // tr = SHAKE-256(pk, 32),  μ = SHAKE-256(tr || M, 64)
+  var tr: int64 := alloc(32);
+  SHAKE256(pk, mldsa_pk_size(level), tr, 32);
+  var tr_msg: int64 := alloc(32 + msgLen);
+  var i: int64 := 0;
+  while (i < 32) { poke8(tr_msg + i, peek8(tr + i)); i := i + 1; }
+  i := 0;
+  while (i < msgLen) { poke8(tr_msg + 32 + i, peek8(msg + i)); i := i + 1; }
+  var mu: int64 := alloc(64);
+  SHAKE256(tr_msg, 32 + msgLen, mu, 64);
+  free(tr, 32); free(tr_msg, 32 + msgLen);
+
+  // c = SampleInBall(c̃, τ)
+  var c_poly: int64 := alloc(2048);
+  mldsa_sample_in_ball(ctilde, tau, c_poly);
+  var c_hat: int64 := alloc(2048);
+  i := 0;
+  while (i < 2048) { poke8(c_hat + i, peek8(c_poly + i)); i := i + 1; }
+  DilithiumNTT(c_hat);
+  free(c_poly, 2048);
+
+  // z_hat = NTT(z)
+  var z_hat: int64 := alloc(l * 2048);
+  dil_polyvec_copy(z, z_hat, l);
+  dil_polyvec_ntt(z_hat, l);
+  free(z, l*2048);
+
+  // t₁ dekodieren und t₁ * 2^d berechnen
+  var t1: int64 := alloc(k * 2048);
+  i := 0;
+  while (i < k) {
+    decode_t1_poly(pk_t1 + i * 320, t1 + i * 2048);
+    // t₁ * 2^d (Shift aller Koeffizienten um d=13 Bits)
+    var j: int64 := 0;
+    while (j < 256) {
+      var c: int64 := peek64(t1 + i*2048 + j*8);
+      var cs: int64 := (c << 13) - ((c << 13) / 8380417) * 8380417;
+      poke64(t1 + i*2048 + j*8, cs);
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  // NTT(t₁_shifted)
+  var t1h: int64 := alloc(k * 2048);
+  dil_polyvec_copy(t1, t1h, k);
+  dil_polyvec_ntt(t1h, k);
+  free(t1, k*2048);
+
+  // w' = INTT(A * z_hat - c_hat * t1_hat)  (je k Polynome)
+  var ww: int64 := alloc(k * 2048);
+  dil_matvec(pk_rho, z_hat, ww, k, l, 0);   // A * z_hat (NTT domain)
+  free(z_hat, l*2048);
+
+  // Subtrahiere c_hat * t1h von ww
+  var ct1: int64 := alloc(2048);
+  i := 0;
+  while (i < k) {
+    DilithiumPolyMul(c_hat, t1h + i*2048, ct1);
+    DilithiumPolySub(ww + i*2048, ct1, ww + i*2048);
+    i := i + 1;
+  }
+  free(c_hat, 2048); free(t1h, k*2048); free(ct1, 2048);
+
+  dil_polyvec_intt(ww, k);
+
+  // w₁' = UseHint(h, w', 2γ₂)
+  var w1p: int64 := alloc(k * 2048);
+  i := 0;
+  while (i < k) {
+    var j: int64 := 0;
+    while (j < 256) {
+      var h_ij: int64 := peek64(h + i*2048 + j*8);
+      var w_ij: int64 := peek64(ww + i*2048 + j*8);
+      poke64(w1p + i*2048 + j*8, use_hint(h_ij, w_ij, alpha, m_val));
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  free(h, k*2048); free(ww, k*2048);
+
+  // c̃' = SHAKE-256(μ || encode(w₁'))
+  var w1_enc_size: int64 := k * 32 * w1_bits_val;
+  var w1_enc: int64 := alloc(w1_enc_size);
+  encode_w1_vec(w1p, k, w1_bits_val, w1_enc);
+  free(w1p, k*2048);
+
+  var mu_w1: int64 := alloc(64 + w1_enc_size);
+  i := 0;
+  while (i < 64) { poke8(mu_w1 + i, peek8(mu + i)); i := i + 1; }
+  i := 0;
+  while (i < w1_enc_size) { poke8(mu_w1 + 64 + i, peek8(w1_enc + i)); i := i + 1; }
+  free(w1_enc, w1_enc_size);
+  var ctilde_check: int64 := alloc(32);
+  SHAKE256(mu_w1, 64 + w1_enc_size, ctilde_check, 32);
+  free(mu_w1, 64 + w1_enc_size);
+  free(mu, 64);
+
+  // Vergleich c̃ == c̃'
+  var ok: int64 := 1;
+  i := 0;
+  while (i < 32) {
+    if (peek8(ctilde + i) != peek8(ctilde_check + i)) { ok := 0; }
+    i := i + 1;
+  }
+  free(ctilde_check, 32);
+  return ok;
+}

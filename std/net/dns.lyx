@@ -53,6 +53,7 @@ con DNS_CACHE_SLOTS: int64 := 16;
 con DNS_CACHE_ENTRY_SIZE: int64 := 224;
 con DNS_CACHE_DEFAULT_TTL: int64 := 300;
 
+@cap(system.time)
 extern fn time(tloc: int64): int64 link "libc.so.6";
 
 // ============================================================================
@@ -135,7 +136,7 @@ fn dns_encode_name(buf: int64, offset: int64, name: int64, nameLen: int64): int6
 
 fn dns_build_query(buf: int64, name: int64, nameLen: int64, queryType: int64): int64 {
   var offset: int64 := 0;
-  var id: uint16 := dns_random_id();
+  var id: int64 := dns_random_id();
   
   // DNS Header (12 bytes)
   poke8(buf + 0, (id >> 8) & 0xFF);
@@ -301,7 +302,13 @@ fn dns_parse_response_ex(buf: int64, bufLen: int64, resultPtr: int64, queryType:
     
     rdlength := (peek8(buf + offset) << 8) | peek8(buf + offset + 1);
     offset := offset + 2;
-    
+
+    // SEC-BUG-03: rdata-Bounds-Check — rdlength kommt aus dem Netzwerk (untrusted).
+    // Ohne diesen Check liest jeder Record-Handler OOB wenn rdlength über bufLen zeigt.
+    if (offset + rdlength > bufLen) {
+      return false;
+    }
+
     // Check if this is the record type we're looking for
     if (rclass != DNS_CLASS_IN) {
       offset := offset + rdlength;
@@ -1036,6 +1043,30 @@ pub fn ResolveHost(hostname: int64): IPAddr {
   return addr;
 }
 
+// Resolve hostname to IPv6 address (AAAA record).
+// Writes the address as two int64 halves to outHi / outLo (each a poke64 pointer).
+// Returns true on success.  Tries Google DNS first, Cloudflare as fallback.
+pub fn GetHostByNameV6(hostname: int64, outHi: int64, outLo: int64): bool {
+  var len: int64 := hostnameLen(hostname);
+  if (outHi != 0) { poke64(outHi, 0); }
+  if (outLo != 0) { poke64(outLo, 0); }
+  if (len == 0) { return false; }
+  var result: int64 := mmap(0, 128, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (result == 0) { return false; }
+  var ok: bool := DNSResolveAAAAGoogle(hostname, len, result);
+  if (!ok) { ok := DNSResolveAAAACoudflare(hostname, len, result); }
+  if (ok) {
+    var hi: int64 := DNSResultGetIPv6Hi(result);
+    var lo: int64 := DNSResultGetIPv6Lo(result);
+    munmap(result, 128);
+    if (outHi != 0) { poke64(outHi, hi); }
+    if (outLo != 0) { poke64(outLo, lo); }
+    return true;
+  }
+  munmap(result, 128);
+  return false;
+}
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -1067,7 +1098,7 @@ pub fn DNSPrintIPV6(data: int64) {
     first := false;
     
     // Print in hex
-    var hex: string := "";
+    var hex: int64 := 0;
     if ((word >> 12) > 0) {
       // Simplified hex output
     }
@@ -1081,6 +1112,23 @@ pub fn DNSPrintIPV6(data: int64) {
 pub fn DNSResultGetIPv4(resultPtr: int64): int64 {
   return (peek8(resultPtr + 40) << 24) | (peek8(resultPtr + 41) << 16) |
          (peek8(resultPtr + 42) << 8) | peek8(resultPtr + 43);
+}
+
+// Helper: Get upper 64 bits of IPv6 from result (for AAAA records)
+// The 16 bytes at resultPtr+40 are in network byte order (big-endian).
+pub fn DNSResultGetIPv6Hi(resultPtr: int64): int64 {
+  return (peek8(resultPtr + 40) << 56) | (peek8(resultPtr + 41) << 48) |
+         (peek8(resultPtr + 42) << 40) | (peek8(resultPtr + 43) << 32) |
+         (peek8(resultPtr + 44) << 24) | (peek8(resultPtr + 45) << 16) |
+         (peek8(resultPtr + 46) << 8)  |  peek8(resultPtr + 47);
+}
+
+// Helper: Get lower 64 bits of IPv6 from result (for AAAA records)
+pub fn DNSResultGetIPv6Lo(resultPtr: int64): int64 {
+  return (peek8(resultPtr + 48) << 56) | (peek8(resultPtr + 49) << 48) |
+         (peek8(resultPtr + 50) << 40) | (peek8(resultPtr + 51) << 32) |
+         (peek8(resultPtr + 52) << 24) | (peek8(resultPtr + 53) << 16) |
+         (peek8(resultPtr + 54) << 8)  |  peek8(resultPtr + 55);
 }
 
 // Helper: Get TTL from result
@@ -1568,4 +1616,30 @@ pub fn DNSResolveDoH(hostname: int64, hostnameLen: int64, resultPtr: int64): boo
 
 pub fn DNSResolveDoHEx(hostname: int64, hostnameLen: int64, queryType: int64, resultPtr: int64): bool {
   return dns_doh_resolve(hostname, hostnameLen, queryType, resultPtr);
+}
+
+// ============================================================================
+// WP-D4: TCPConnectHostIPv6 — AAAA-Lookup + TCP-Connect in einem Aufruf
+// ============================================================================
+
+// TCPConnectHostIPv6: Löst den Hostnamen via AAAA-Record auf und verbindet.
+// hostname: Null-terminierter pchar (als int64 übergeben).
+// port: Portnummer in Host-Byte-Order.
+// Gibt eine TCPConn zurück; conn.fd < 0 bei Fehler (DNS-Fehler oder connect-Fehler).
+pub fn TCPConnectHostIPv6(hostname: int64, port: int64): TCPConn {
+  var conn: TCPConn;
+  conn.fd := -1;
+  var hiPtr: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (hiPtr <= 0) { return conn; }
+  var loPtr: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (loPtr <= 0) { munmap(hiPtr, 8); return conn; }
+  var ok: bool := GetHostByNameV6(hostname, hiPtr, loPtr);
+  if (!ok) {
+    munmap(hiPtr, 8); munmap(loPtr, 8); return conn;
+  }
+  var hi: int64 := peek64(hiPtr);
+  var lo: int64 := peek64(loPtr);
+  munmap(hiPtr, 8); munmap(loPtr, 8);
+  conn := TCPConnectIPv6(hi, lo, port);
+  return conn;
 }

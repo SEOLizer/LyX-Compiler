@@ -116,6 +116,15 @@ pub type EmitARM64 = class {
   externCount: int64;
   externCap:   int64;
 
+  // WP-D2: Windows target mode — replaces Linux syscalls with BL placeholders
+  // that WinARM64Backend resolves to Windows API helper stubs after emit().
+  // winPatchBuf holds 16-byte records: {codeOffset:i64, helperId:i64}.
+  // Helper IDs: 1=PrintStr, 2=PrintInt, 3=Exit, 4=Alloc, 5=Free.
+  winMode:       int64;
+  winPatchBuf:   int64;
+  winPatchCount: int64;
+  winPatchCap:   int64;
+
 
   // -------------------------------------------------------------------------
   // Init
@@ -150,6 +159,12 @@ pub type EmitARM64 = class {
     self.externCap   := 64;
     self.externBuf   := alloc(self.externCap * 32);
     self.externCount := 0;
+
+    // WP-D2: Windows mode — off by default
+    self.winMode       := 0;
+    self.winPatchCap   := 64;
+    self.winPatchBuf   := alloc(self.winPatchCap * 16);
+    self.winPatchCount := 0;
   }
 
   fn getGlobalRelocBuf(): int64   { return self.globalRelocBuf; }
@@ -158,6 +173,28 @@ pub type EmitARM64 = class {
   fn getExternCount(): int64      { return self.externCount; }
 
   fn getFuncPrologueLen(): int64 { return self.funcPrologueLen; }
+
+  // WP-D2: Windows mode helpers
+  pub fn setWinMode(m: int64) { self.winMode := m; }
+  pub fn getWinPatchBuf(): int64 { return self.winPatchBuf; }
+  pub fn getWinPatchCount(): int64 { return self.winPatchCount; }
+
+  fn addWinPatch(codeOff: int64, helperId: int64) {
+    if self.winPatchCount >= self.winPatchCap {
+      var nc: int64 := self.winPatchCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      var i: int64 := 0;
+      while i < self.winPatchCount * 16 {
+        poke8(nb + i, peek8(self.winPatchBuf + i));
+        i := i + 1;
+      }
+      self.winPatchBuf := nb;
+      self.winPatchCap := nc;
+    }
+    poke64(self.winPatchBuf + self.winPatchCount * 16,     codeOff);
+    poke64(self.winPatchBuf + self.winPatchCount * 16 + 8, helperId);
+    self.winPatchCount := self.winPatchCount + 1;
+  }
 
   // WP-AND-02 Phase C: opt into PIC code emission. Caller flips this BEFORE
   // calling emit(); takes effect for emitLoadGlobal / emitStoreGlobal.
@@ -420,6 +457,9 @@ pub type EmitARM64 = class {
     if op == IRO_SIMD_SUB { self.emitNeon(0x4EE08400, src1, src2, dest); }
     if op == IRO_SIMD_MUL { self.emitNeon(0x6E609C00, src1, src2, dest); }
     if op == IRO_SIMD_DIV { self.emitNeon(0x6E60FC00, src1, src2, dest); }
+
+    // --- Debug ---
+    if op == IRO_INSPECT { self.emitInspect(src1, idx); }
   }
 
   // -------------------------------------------------------------------------
@@ -792,7 +832,60 @@ pub type EmitARM64 = class {
   }
 
   fn emitBuiltinCall(id: int64, dest: int64) {
-    // Builtin id dispatch — emit inline syscall or helper sequence
+    // WP-D2: Windows mode — emit BL placeholder to helper stubs instead of syscalls
+    if self.winMode != 0 {
+      if id == 1 {
+        // PrintStr: x0=str, x1=len → wab_printstr helper
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+        self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(1));
+        self.addWinPatch(self.codeLen, 1);
+        self.emit32(0x94000000);  // BL placeholder
+      } else if id == 2 {
+        // PrintInt: x0=int64 → wab_printint helper
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+        self.addWinPatch(self.codeLen, 2);
+        self.emit32(0x94000000);
+      } else if id == 3 {
+        // Exit: x0=exitcode → wab_exit helper (calls ExitProcess)
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+        self.addWinPatch(self.codeLen, 3);
+        self.emit32(0x94000000);
+      } else if id == 6 {
+        // WP-01: StrSub(s, start, len) → wab_strsub helper
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+        self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(1));
+        self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(2));
+        self.addWinPatch(self.codeLen, 6);
+        self.emit32(0x94000000);
+      } else if id == 7 {
+        // WP-01: StrConcat(a, b) → wab_strconcat helper
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+        self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(1));
+        self.addWinPatch(self.codeLen, 7);
+        self.emit32(0x94000000);
+      } else if id == 8 {
+        // WP-01: StrCopy(s) → wab_strcopy helper
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+        self.addWinPatch(self.codeLen, 8);
+        self.emit32(0x94000000);
+      } else if id == 9 {
+        // WP-08: PrintFloat(f64) → wab_printf helper (int decomp via wab_printint/wab_printstr)
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+        self.addWinPatch(self.codeLen, 9);
+        self.emit32(0x94000000);
+      } else if id == 10 {
+        // WP-08: Printf(fmt, a1, a2, a3) → wab_printf_full helper
+        self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+        self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(1));
+        self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(2));
+        self.emitLdur(ARM64_X3, ARM64_X29, self.slotOff(3));
+        self.addWinPatch(self.codeLen, 10);
+        self.emit32(0x94000000);
+      }
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+      return;
+    }
+    // Linux path — emit inline syscalls
     if id == 1 {
       // PrintStr: write(1, x0, x1)  — args already in x0,x1 by convention
       self.emitMovImmReg(ARM64_X0, 1);   // fd=stdout
@@ -811,6 +904,17 @@ pub type EmitARM64 = class {
       self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
       self.emitMovImmReg(ARM64_X8, SYS_EXIT);
       self.emit32(0xD4000001);
+    } else if id == 10 {
+      // WP-GPIO-1: mem_barrier() → DMB SY
+      // Encoding: D5 03 3F BF (little-endian uint32 = 0xBF3F03D5)
+      self.emit32(0xBF3F03D5);
+    } else if id == 11 {
+      // WP-GPIO-1: inst_barrier() → ISB SY
+      // Encoding: D5 03 3F DF (little-endian uint32 = 0xDF3F03D5)
+      self.emit32(0xDF3F03D5);
+    } else if id == 9 {
+      // WP-08: PrintFloat — Linux ARM64 fallback (load float bits, no-op print)
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
     }
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
@@ -913,7 +1017,15 @@ pub type EmitARM64 = class {
   // -------------------------------------------------------------------------
 
   fn emitAlloc(sizeSlot: int64, dest: int64) {
-    // mmap(0, size, PROT_RW=3, MAP_PRIVATE|MAP_ANON=34, -1, 0)
+    // WP-D2: Windows mode — call wab_alloc helper (VirtualAlloc)
+    if self.winMode != 0 {
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(sizeSlot));
+      self.addWinPatch(self.codeLen, 4);
+      self.emit32(0x94000000);  // BL placeholder → wab_alloc
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+      return;
+    }
+    // Linux: mmap(0, size, PROT_RW=3, MAP_PRIVATE|MAP_ANON=34, -1, 0)
     self.emitMovImmReg(ARM64_X0, 0);   // addr=0
     self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(sizeSlot));
     self.emitMovImmReg(ARM64_X2, 3);   // PROT_READ|PROT_WRITE
@@ -926,6 +1038,14 @@ pub type EmitARM64 = class {
   }
 
   fn emitFree(ptrSlot: int64) {
+    // WP-D2: Windows mode — call wab_free helper (VirtualFree)
+    if self.winMode != 0 {
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
+      self.addWinPatch(self.codeLen, 5);
+      self.emit32(0x94000000);  // BL placeholder → wab_free
+      return;
+    }
+    // Linux: munmap
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
     self.emitMovImmReg(ARM64_X1, 0);
     self.emitMovImmReg(ARM64_X8, SYS_MUNMAP);
@@ -1121,4 +1241,155 @@ pub type EmitARM64 = class {
   fn getInstrSrc1(absIdx: int64): int64  { return self.getInstrField(absIdx, 16); }
   fn getInstrSrc2(absIdx: int64): int64  { return self.getInstrField(absIdx, 24); }
   fn getInstrImmInt(absIdx: int64): int64 { return self.getInstrField(absIdx, 40); }
+
+  // -------------------------------------------------------------------------
+  // WP-13: Inspect(expr) — emit debug output "[Inspect:name] value\n" to stderr
+  // Linux: inline SYS_WRITE(2) syscalls + itoa loop
+  // Windows: ADR+B inline strings + BL wab_inspect_str(11)/wab_inspect_int(12)
+  // -------------------------------------------------------------------------
+
+  fn emitInspectSysWrite(len: int64) {
+    self.emitMovImmReg(ARM64_X2, len);
+    self.emitMovImmReg(ARM64_X0, 2);
+    self.emitMovImmReg(ARM64_X8, SYS_WRITE);
+    self.emit32(0xD4000001);
+  }
+
+  fn emitInspect(valSlot: int64, instrIdx: int64) {
+    var nameOff: int64 := self.getInstrField(instrIdx, 56);
+    var strBuf:  int64 := peek64(self.ir + 32);
+    var namePtr: int64 := strBuf + nameOff;
+    var nameLen: int64 := StrLen(namePtr as pchar);
+
+    if self.winMode != 0 {
+      // ---- Windows ARM64 ----
+      // Build "[Inspect:name] " prefix (9 + nameLen + 2 = 11+nameLen bytes)
+      var prefixLen: int64 := 11 + nameLen;
+      var pb: int64 := alloc(prefixLen + 1);
+      poke8(pb + 0, 91);   // '['
+      poke8(pb + 1, 73);   // 'I'
+      poke8(pb + 2, 110);  // 'n'
+      poke8(pb + 3, 115);  // 's'
+      poke8(pb + 4, 112);  // 'p'
+      poke8(pb + 5, 101);  // 'e'
+      poke8(pb + 6, 99);   // 'c'
+      poke8(pb + 7, 116);  // 't'
+      poke8(pb + 8, 58);   // ':'
+      var pi: int64 := 0;
+      while pi < nameLen { poke8(pb + 9 + pi, peek8(namePtr + pi)); pi := pi + 1; }
+      poke8(pb + 9 + nameLen,     93);  // ']'
+      poke8(pb + 9 + nameLen + 1, 32);  // ' '
+      // Emit: ADR x0, #8; B over prefix; prefix bytes+NUL+pad; MOVZ x1,#prefixLen; BL id=11
+      var ptot: int64 := prefixLen + 1;
+      var ppad: int64 := (4 - (ptot & 3)) & 3;
+      var ppadded: int64 := ptot + ppad;
+      self.emit32(0x10000040);  // ADR x0, #8
+      self.emit32(0x14000000 | ((4 + ppadded) >> 2));
+      var pj: int64 := 0;
+      while pj < prefixLen { self.emit8(peek8(pb + pj)); pj := pj + 1; }
+      self.emit8(0);
+      var pk: int64 := 0;
+      while pk < ppad { self.emit8(0); pk := pk + 1; }
+      self.emitMovImmReg(ARM64_X1, prefixLen);
+      self.addWinPatch(self.codeLen, 11);
+      self.emit32(0x94000000);
+      // Emit: load value → x0; BL id=12 (wab_inspect_int, prints decimal)
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(valSlot));
+      self.addWinPatch(self.codeLen, 12);
+      self.emit32(0x94000000);
+      // Emit: "\n" → BL id=11 (wab_inspect_str)
+      self.emit32(0x10000040);  // ADR x0, #8
+      self.emit32(0x14000002);  // B +2 (over 8 bytes: '\n'+NUL+2 pads)
+      self.emit8(10); self.emit8(0); self.emit8(0); self.emit8(0);
+      self.emitMovImmReg(ARM64_X1, 1);
+      self.addWinPatch(self.codeLen, 11);
+      self.emit32(0x94000000);
+      return;
+    }
+
+    // ---- Linux ARM64: inline SYS_WRITE(fd=2) calls ----
+
+    // Write "[Inspect:" (9 bytes) to stderr
+    // ADR x1, #8 (string starts 8 bytes after this instruction)
+    self.emit32(0x10000041);   // ADR x1, #8
+    // B +4 (over 12 bytes: 9 chars + NUL + 2 pads = 12, padded=12, (4+12)/4=4)
+    self.emit32(0x14000004);
+    self.emit8(91);  self.emit8(73);  self.emit8(110);  // [In
+    self.emit8(115); self.emit8(112); self.emit8(101);  // spe
+    self.emit8(99);  self.emit8(116); self.emit8(58);   // ct:
+    self.emit8(0);   self.emit8(0);   self.emit8(0);    // NUL + 2 pads (align 4)
+    self.emitInspectSysWrite(9);
+
+    // Write variable name to stderr
+    var ntot:    int64 := nameLen + 1;
+    var npad:    int64 := (4 - (ntot & 3)) & 3;
+    var npadded: int64 := ntot + npad;
+    self.emit32(0x10000041);  // ADR x1, #8
+    self.emit32(0x14000000 | ((4 + npadded) >> 2));
+    var ni: int64 := 0;
+    while ni < nameLen { self.emit8(peek8(namePtr + ni)); ni := ni + 1; }
+    self.emit8(0);
+    var np: int64 := 0;
+    while np < npad { self.emit8(0); np := np + 1; }
+    self.emitInspectSysWrite(nameLen);
+
+    // Write "] " (2 bytes) to stderr
+    // 2+1=3 bytes → pad=1 → padded=4 → B +2
+    self.emit32(0x10000041);  // ADR x1, #8
+    self.emit32(0x14000002);  // B +2 (over 8 bytes: '] '+NUL+pad)
+    self.emit8(93); self.emit8(32); self.emit8(0); self.emit8(0);  // ] ' ' NUL pad
+    self.emitInspectSysWrite(2);
+
+    // Load value from slot → x0
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(valSlot));
+
+    // Inline itoa + write(stderr, digits+'\n', len)
+    // Uses 32-byte stack buffer: sp[0..30]=digits(backwards), sp[31]='\n'
+    // x9=write_ptr, x10=value, x11=neg_flag, x12=10, x13=quotient, x14=digit
+    //
+    // Branch layout (instruction indices within this block):
+    //   instr  6: CBZ x10, →24 (ZERO_CASE)
+    //   instr  8: B.GE →11 (POS_LOOP)
+    //   instr 11: [POS_LOOP]
+    //   instr 18: CBNZ x10, →11 (-7)
+    //   instr 19: CBZ x11, →23 (+4, EMIT_OUT_SKIP)
+    //   instr 23: B →27 (+4, EMIT_OUT)
+    //   instr 24: [ZERO_CASE]
+    //   instr 27: [EMIT_OUT]
+    self.emit32(0xD10083FF);  // instr 0: SUB sp,sp,#32
+    self.emit32(0x91007BE9);  // instr 1: ADD x9,sp,#30  (x9 → buf[30])
+    self.emit32(0x5280014A);  // instr 2: MOVZ w10,#10  ('\n')
+    self.emit32(0x39007FEA);  // instr 3: STRB w10,[sp,#31]  (buf[31]='\n')
+    self.emit32(0xAA0003EA);  // instr 4: MOV x10,x0  (save value)
+    self.emit32(0xD280000B);  // instr 5: MOVZ x11,#0  (neg_flag=0)
+    self.emit32(0xB400024A);  // instr 6: CBZ x10,+18 (→ instr 24 ZERO_CASE)
+    self.emit32(0xF100015F);  // instr 7: CMP x10,#0  (SUBS xzr,x10,#0)
+    self.emit32(0x5400006A);  // instr 8: B.GE +3 (→ instr 11 POS_LOOP)
+    self.emit32(0xCB0A03EA);  // instr 9: NEG x10,x10
+    self.emit32(0xD280002B);  // instr10: MOVZ x11,#1  (neg_flag=1)
+    self.emit32(0xD280014C);  // instr11: MOVZ x12,#10  [POS_LOOP]
+    self.emit32(0x9ACC094D);  // instr12: UDIV x13,x10,x12
+    self.emit32(0x9B0CA9AE);  // instr13: MSUB x14,x13,x12,x10  (rem=value-q*10)
+    self.emit32(0x1100C1CE);  // instr14: ADD w14,w14,#48  ('0'+rem)
+    self.emit32(0x3900012E);  // instr15: STRB w14,[x9]
+    self.emit32(0xD1000529);  // instr16: SUB x9,x9,#1
+    self.emit32(0xAA0D03EA);  // instr17: MOV x10,x13  (value=quotient)
+    self.emit32(0xB5FFFF2A);  // instr18: CBNZ x10,-7 (→ instr 11 POS_LOOP)
+    self.emit32(0xB400008B);  // instr19: CBZ x11,+4 (→ instr 23)
+    self.emit32(0x528005AE);  // instr20: MOVZ w14,#45  ('-')
+    self.emit32(0x3900012E);  // instr21: STRB w14,[x9]
+    self.emit32(0xD1000529);  // instr22: SUB x9,x9,#1
+    self.emit32(0x14000004);  // instr23: B +4 (→ instr 27 EMIT_OUT)
+    self.emit32(0x5280060E);  // instr24: MOVZ w14,#48  ('0')  [ZERO_CASE]
+    self.emit32(0x3900012E);  // instr25: STRB w14,[x9]
+    self.emit32(0xD1000529);  // instr26: SUB x9,x9,#1
+    self.emit32(0x91000529);  // instr27: ADD x9,x9,#1  [EMIT_OUT] (first char)
+    self.emit32(0x910083EA);  // instr28: ADD x10,sp,#32  (past '\n')
+    self.emit32(0xCB090142);  // instr29: SUB x2,x10,x9  (length incl. '\n')
+    self.emit32(0xAA0903E1);  // instr30: MOV x1,x9  (start ptr)
+    self.emit32(0xD2800040);  // instr31: MOVZ x0,#2  (fd=stderr)
+    self.emit32(0xD2800808);  // instr32: MOVZ x8,#64  (SYS_WRITE)
+    self.emit32(0xD4000001);  // instr33: SVC #0
+    self.emit32(0x910083FF);  // instr34: ADD sp,sp,#32  (restore stack)
+  }
 };
