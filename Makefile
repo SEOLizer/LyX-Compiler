@@ -130,6 +130,10 @@ test: lyxc
 	@bash tests/sec_ffi_failclosed_test.sh
 	@echo "OK"
 
+	@echo "--- sec_dns: DNS rdata OOB-Härtung (5 tests) ---"
+	@bash tests/sec_dns_oob_test.sh
+	@echo "OK"
+
 	@echo "--- sec_wp28: kernel-mode-guard allowlist (20 tests) ---"
 	@bash tests/sec_wp28_kernel_guard_test.sh
 	@echo "OK"
