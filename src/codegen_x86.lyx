@@ -448,6 +448,13 @@ pub type Codegen = class {
   vmtMethodPatchCount:  int64;
   vmtMethodPatchCap:    int64;
 
+  // WP-A2.2: base relocations — image RVAs (relative to CG_ELF_BASE) of 8-byte
+  // absolute pointers (VMT slots + VMT-address movabs) that consumers must adjust
+  // by (load_base − CG_ELF_BASE). Used by the PE .reloc emitter and the LyxOS loader.
+  baseRelocBuf:    int64;
+  baseRelocCount:  int64;
+  baseRelocCap:    int64;
+
   // f64-returning user-defined functions: {namePtr:8, nameLen:8} = 16 bytes per entry
   f64FuncList:  int64;
   f64FuncCount: int64;
@@ -1569,6 +1576,8 @@ pub type Codegen = class {
         var cb: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
         var vmtDataOff: int64 := peek64(cb + CG_CLASS_OFF_VMTOFF);
         poke64(self.code + codeOff2, vmtBase + vmtDataOff);
+        // WP-A2.2: the movabs imm64 just written is an absolute pointer → base reloc.
+        self.cg_addBaseReloc(CG_CODE_OFF + codeOff2);
       }
       j := j + 1;
     }
@@ -1581,6 +1590,8 @@ pub type Codegen = class {
       var slotDataOff:  int64 := peek64(mpBase);
       var methCodeStart: int64 := peek64(mpBase + CG_VMT_METH_OFF_CODESTART);
       poke64(self.data + slotDataOff, codeBase + methCodeStart);
+      // WP-A2.2: VMT slot holds an absolute code pointer (data RVA = code + codeLen + off).
+      self.cg_addBaseReloc(CG_CODE_OFF + self.codeLen + slotDataOff);
       mp := mp + 1;
     }
     // WP-BC-L2: propagate inherited (non-overridden) vtable slots base→derived.
@@ -1604,6 +1615,8 @@ pub type Codegen = class {
           while (sP < limP) {
             if (peek64(self.data + myOffP + sP * 8) == 0) {
               poke64(self.data + myOffP + sP * 8, peek64(self.data + pOffP + sP * 8));
+              // WP-A2.2: inherited slot now holds an absolute code pointer → base reloc.
+              self.cg_addBaseReloc(CG_CODE_OFF + self.codeLen + myOffP + sP * 8);
             }
             sP := sP + 1;
           }
@@ -3083,6 +3096,24 @@ pub type Codegen = class {
     poke64(base + CG_PATCH_OFF_NAMEPTR, methodCodeStart);
     self.vmtMethodPatchCount := self.vmtMethodPatchCount + 1;
   }
+
+  // WP-A2.2: register an 8-byte absolute pointer at image RVA `rva` (relative to
+  // CG_ELF_BASE). Consumers relocate it by (load_base − CG_ELF_BASE): the PE backend
+  // emits an IMAGE_REL_BASED_DIR64 entry + rebases the value; the LyxOS loader adds
+  // its (load_base − 0x400000) delta. The default ELF exe loads at CG_ELF_BASE so no
+  // adjustment is needed there.
+  fn cg_addBaseReloc(rva: int64) {
+    if (self.baseRelocCount >= self.baseRelocCap) {
+      var nc: int64 := self.baseRelocCap * 2;
+      var nb: int64 := alloc(nc * 8);
+      memcpy(nb, self.baseRelocBuf, self.baseRelocCount * 8);
+      self.baseRelocBuf := nb; self.baseRelocCap := nc;
+    }
+    poke64(self.baseRelocBuf + self.baseRelocCount * 8, rva);
+    self.baseRelocCount := self.baseRelocCount + 1;
+  }
+  fn cg_getBaseRelocBuf(): int64 { return self.baseRelocBuf; }
+  fn cg_getBaseRelocCount(): int64 { return self.baseRelocCount; }
 
   // Helper: get class index for object node (IDENT, FIELD chain, or INDEX for struct arrays)
   fn cg_objClassIdx(objNode: int64): int64 {
@@ -10082,6 +10113,11 @@ pub type Codegen = class {
     self.vmtMethodPatchCap   := 64;
     self.vmtMethodPatches    := alloc(self.vmtMethodPatchCap * CG_VMT_METH_PATCH_SZ);
     self.vmtMethodPatchCount := 0;
+
+    // WP-A2.2: base relocation table
+    self.baseRelocCap   := 64;
+    self.baseRelocBuf   := alloc(self.baseRelocCap * 8);
+    self.baseRelocCount := 0;
 
     // f64-returning function table (pre-populated with known builtins)
     self.f64FuncCap   := 64;
