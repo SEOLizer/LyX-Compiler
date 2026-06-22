@@ -290,34 +290,35 @@ if [ $EC -eq 0 ]; then _pass 15; else _fail 15 "SecureZero betrifft falschen Buf
 
 # ── D: Implementierungscheck ──────────────────────────────────────────────────
 
-# Test 16: ct.lyx enthält explicit_bzero-Extern
+# D: libc-freies SecureZero (PR #800: explicit_bzero entfernt; poke8-Compiler-
+# Barriere statt libc). Tests prüfen jetzt das libc-FREIE Design.
+
+# Test 16: ct.lyx hat KEINEN explicit_bzero-Extern (libc-frei)
 if grep -q "extern fn explicit_bzero" "$CT_LYX" 2>/dev/null; then
+  _fail 16 "explicit_bzero-Extern noch in $CT_LYX — soll libc-frei sein"
+else
   _pass 16
-else
-  _fail 16 "explicit_bzero-Extern nicht in $CT_LYX"
 fi
 
-# Test 17: ct.lyx verlinkt gegen libc.so.6
+# Test 17: ct.lyx verlinkt NICHT gegen libc.so.6
 if grep -q 'link "libc.so.6"' "$CT_LYX" 2>/dev/null; then
+  _fail 17 "link libc.so.6 noch in $CT_LYX — soll libc-frei sein"
+else
   _pass 17
-else
-  _fail 17 "link libc.so.6 nicht in $CT_LYX"
 fi
 
-# Test 18: SecureZero ruft explicit_bzero auf (nicht poke8-Schleife)
-if grep -A5 "pub fn SecureZero" "$CT_LYX" 2>/dev/null | grep -q "explicit_bzero"; then
+# Test 18: SecureZero nutzt KEIN explicit_bzero
+if grep -A6 "pub fn SecureZero" "$CT_LYX" 2>/dev/null | grep -q "explicit_bzero"; then
+  _fail 18 "SecureZero nutzt noch explicit_bzero in $CT_LYX"
+else
   _pass 18
-else
-  _fail 18 "SecureZero nutzt kein explicit_bzero in $CT_LYX"
 fi
 
-# Test 19: Keine poke8-Schleife mehr in SecureZero
-# Die poke8-Schleife wäre: "poke8(ptr + i" direkt in SecureZero-Body
-# Prüfe den SecureZero-Block (zwischen pub fn SecureZero und nächstem pub fn)
-if awk '/pub fn SecureZero/,/^pub fn [A-Z]/' "$CT_LYX" 2>/dev/null | grep -q "poke8(ptr"; then
-  _fail 19 "poke8-Schleife noch in SecureZero vorhanden — DSE-Risiko nicht behoben"
-else
+# Test 19: SecureZero nutzt die poke8-Compiler-Barriere (WP-36, DSE-fest)
+if grep -A6 "pub fn SecureZero" "$CT_LYX" 2>/dev/null | grep -q "poke8(ptr"; then
   _pass 19
+else
+  _fail 19 "SecureZero hat keine poke8-Barriere in $CT_LYX"
 fi
 
 # ── E: Integration ────────────────────────────────────────────────────────────
