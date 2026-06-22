@@ -1,8 +1,11 @@
 # Changelog - Lyx Compiler
 
-## Version 0.9.12A (Juni 2026)
+## Version 1.0.0A (Juni 2026)
 
-OOP-Vererbung und Parser-Verbesserungen (WP-BC, lyxc-Fix-Backlog L1–L6).
+Erste Alpha-Version (V1.0.0A) — vollständiger Sprachkern, self-hosting (Singularität),
+echte OOP-Vererbung und Backend-Parität inkl. vollständigem Windows-PE32+-Target.
+Enthält lyxc-Fix-Backlog L1–L6, WP-A2 (Windows), WP-28..37 (Security), V-1..3 und
+BUG-1..8.
 
 ### OOP / Vererbung
 
@@ -15,9 +18,13 @@ OOP-Vererbung und Parser-Verbesserungen (WP-BC, lyxc-Fix-Backlog L1–L6).
 - **L5 — `form` als Soft-Keyword**: `form` ist überall als normaler Bezeichner nutzbar; das Top-Level-`form`-Konstrukt wird kontextuell per Text erkannt.
 - **L6 — lesbare Diagnostik**: Parse-Fehler nennen Token-Namen und das tatsächliche Lexem statt roher Token-IDs (z. B. „expected IDENT, got form 'form'").
 
-## Version 1.0.0A (Juni 2026)
+### Windows PE32+ — vollständiges OOP & Funktionen (WP-A2)
 
-Erste Alpha-Version. Alle P0-Blocker behoben, alle Compiler-Bugs BUG-1..8 geschlossen.
+- **A2.1**: Trampolin-Zone exakt auf die `CG_H_*`-Helper-Offsets ausgerichtet — `wine hello.exe` gibt korrekt aus (vorher Müll, weil PrintStr-Calls in den PrintInt-Helper durchfielen).
+- **A2.2**: Unified Base-Relocation — Codegen registriert absolute VMT-Pointer; PE-Backend emittiert echte `.reloc`-Blöcke (`IMAGE_REL_BASED_DIR64`) + rebased die Werte → ASLR-tauglich.
+- **A2.3**: `new`/alloc nutzt `VirtualAlloc` statt Linux-`mmap`-syscall.
+- **A2.4**: `_start`→`main`-Aufruf korrigiert (`relMain + 14`) — alle user-Funktions-/Methoden-Calls funktionieren.
+- Verifiziert unter wine: Funktionen, Rekursion, virtuelle Dispatch, Vererbung, Felder, Heap, Output.
 
 ### Security (WP-28..37)
 
