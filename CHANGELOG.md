@@ -1,5 +1,26 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.1C (Juni 2026)
+
+Patch-Release auf Basis von V1.0.1B. LyxOS-Nativ-Backend kernel-tauglich (Multi-Section)
+und pchar-Fix; Repo-Hygiene.
+
+### LyxOS-Nativ (emit_lyxos / writer / loader)
+- **LYXOS-WP-5 — Multi-Section-Metadaten** nach Kernel-Kontrakt (LX-34): natives `LYX!`
+  trägt bis zu 3 SECTION_MAP-TLVs (TEXT/RODATA/DATA + prot) + Genesis text/rodata/data_blocks.
+  Image bleibt contiguous-4032 @ VA 0x400000 (RIP-Offsets unverändert, uniform RW, per-Sektion-
+  prot kernelseitig deferred). entry_point = volle VA; kein Lifecycle-Handler-Table.
+  Loader lädt das ganze Image über die Dateigröße (robust gegen Block-Range-Überlappung).
+- **pchar-Variable an PrintStr behoben**: `var x: pchar := "..."; PrintStr(x)` lieferte einen
+  falschen rodata-Pointer (null-flood). ir_lower hat jetzt einen PrintStr(non-literal)-Pfad
+  (slot0=ptr, slot1=-1 Sentinel); emitPrintStr berechnet strlen zur Laufzeit bei len<0.
+
+### Repo-Hygiene
+- Fehlende LBF-Quelldateien (`src/tools/lbf/genesis.lyx`, `tlv.lyx`) + referenzierte Tests
+  ins Repo aufgenommen — frischer Checkout baut sonst nicht (`undefined function 'tlv_append'`).
+
+Singularität S3==S4 erhalten; `make test` grün.
+
 ## Version 1.0.1B (Juni 2026)
 
 Patch-Release auf Basis von V1.0.1A. Schwerpunkt: nativer LyxOS-Backend (emit_lyxos)
