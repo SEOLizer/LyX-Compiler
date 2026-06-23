@@ -193,14 +193,22 @@ zu Offset 0 springen. Für vollwertigen Kernel: getrennte prot-Segmente + entry_
 
 ---
 
-## 10. Producer (Referenz)
+## 10. Producer (Referenz) — LX-30 ✅ ERLEDIGT
 
-`LBFNativeWriter.writeLBF(path, srcPath, codeBuf, codeLen)`:
-- `text_blocks = ceil(codeLen / 4032)`, `entry_point = 0x400000` (ELF-VA).
-- Genesis-Block + Text-Blocks, jeder Block-CRC gesetzt, dann File-CRC finalisiert.
-- TLV: CAPABILITIES, LIFECYCLE, SECTION_MAP(start=1, count=text_blocks, TEXT, RX).
+**`lyxc --target=lyxos prog.lyx`** erzeugt direkt natives `LYX!` (NICHT `--emit=lbf`,
+das ist der IR-Pfad). Flow: `emitLyxOS` (lyxc.lyx) → `EmitLyxOS`-Backend (nativer
+x86_64-Maschinencode mit lyxos-Syscall-ABI, _start-Stub nach Lifecycle, StrPool ans Code
+angehängt) → `LBFNativeWriter.writeLBF(out, src, codeBuf, codeLen)`.
 
-(Aktuell nur TEXT; rodata/data/bss + Multi-Section-Producer = Erweiterung.)
+`writeLBF`: `text_blocks = ceil(codeLen/4032)`, `entry_point = 0x400000`, Genesis + Text-
+Blocks, Block-CRCs + File-CRC, TLV CAPABILITIES + LIFECYCLE + SECTION_MAP(1, text_blocks, TEXT, RX).
+
+**Verifiziert (V1.0.1A):** lyxc kompiliert sich selbst zu nativem lyxos-LYX! —
+2.072.576 B = 506 Blocks, `lbf_header_validate=0`, File-CRC32C OK. Regressions-Test:
+`tests/lbf_native_emit_test.sh`.
+
+Aktuell: gesamter Code/StrPool in EINER TEXT-Section. rodata/data/bss als getrennte
+Sektionen (eigene prot, mehrere SECTION_MAP-Einträge) = Erweiterung.
 
 ---
 
@@ -225,13 +233,16 @@ Kernel-Entscheidungen — bitte Kernel-Team festlegen:
 Sobald geklärt: WP-5 = Pools block-alignen, 3× SECTION_MAP + Genesis-Counts, RIP-Patches gegen
 finales Layout, `lbf_run` parallel auf Multi-Section-Mapping upgraden.
 
-## 11. Offene Punkte / Kernel-Erweiterung (LX-34)
+## 11. Offene Punkte / Kernel-Erweiterung
 
-- Zero-Load-Executor: Blocks direkt aus dem Speicher/IOFS ausführen (kein Kopieren).
+- **LX-34 Zero-Load-Executor:** Blocks direkt aus Speicher/IOFS ausführen (kein Kopieren).
+- **Ausführung auf POSIX:** native LYX! mit lyxos-Syscall-ABI läuft NUR auf dem lyxos-Kernel,
+  nicht via POSIX-`lbf_run` (dieser ist für plain-Funktions-Blobs). Kernel muss die
+  lyxos-Syscall-Tabelle + _start-Konvention bereitstellen.
+- **Multi-Section:** Producer trennt aktuell nicht rodata/data/bss — alles in TEXT.
 - IOFS-Kanten (`edge_offset`, `cont_lpid`) für Multi-Block-Graph-Layout.
-- Producer-Pfad `--target=lyxos` → echter `LYX!`-Maschinencode (statt nur `--emit=lbf` IR).
 - ARM64-Code in `LYX!` (target_arch=2) + arm64-Loader.
-- entry_point-Konvention vereinheitlichen (ELF-VA vs in-process-Offset).
+- entry_point-Konvention vereinheitlichen (ELF-VA 0x400000 vs in-process-Offset 0).
 
 ## Verwandt
 [[LYX-Native-Loader]] · [[lyu-format-v3]] · src/std/lyxos/lbf_layout.lyx (Konstanten)
