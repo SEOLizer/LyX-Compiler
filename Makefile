@@ -110,6 +110,9 @@ test: lyxc
 	./lyxc tests/lbf_run_test.lyx -o /tmp/lyxc_lbfrun_test
 	@/tmp/lyxc_lbfrun_test
 	@rm -f /tmp/lyxc_lbfrun_test
+	@echo "--- LYXOS-WP-1: Arithmetik/Vergleiche (6 tests) ---"
+	@bash tests/lyxos_wp1_arith_test.sh
+	@echo "OK"
 	@echo "--- LX-36: Lifecycle Descriptor ---"
 	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
 	@/tmp/lyxc_lx36_test
