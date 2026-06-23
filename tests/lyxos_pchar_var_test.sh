@@ -27,5 +27,14 @@ echo "$D" | grep -qiE "test +rdx,rdx" && _p "len-Sentinel-Gate (test rdx)" || _f
 # (4) lyxos-write-Syscall 0x203
 echo "$D" | grep -qiE "0x203" && _p "write-Syscall 0x203" || _f wr "kein 0x203"
 
+# (5) End-to-End: pchar-Var zeigt auf rodata-Literal (nicht Symbol-Tabelle).
+#     x[0] muss 'H' (72) sein — via lbf_run nativ ausgeführt (Pointer korrekt = byte 0).
+printf 'fn main(): int64 { var x: pchar := "HELLO"; return x[0]; }' > "$TMP/e.lyx"
+LYX_STD_PATH="$ROOT/std" "$LYXC" --target=lyxos "$TMP/e.lyx" -o "$TMP/e.lyxnative" >/dev/null 2>&1
+printf 'import src.tools.lbf.loader;\nfn main(): int64 { lbf_run("%s/e.lyxnative"c); return 111; }' "$TMP" > "$TMP/er.lyx"
+LYX_STD_PATH="$ROOT/std" "$LYXC" "$TMP/er.lyx" -o "$TMP/er" >/dev/null 2>&1
+timeout 5 "$TMP/er" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 72 ] && _p "pchar-Var → rodata (x[0]='H'=72)" || _f ptr "x[0]=$rc erwartet 72 (zeigt evtl. falsche Tabelle)"
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
