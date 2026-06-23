@@ -4,7 +4,7 @@
 Binärformats `LYX!`, damit der Kernel (Loader / Zero-Load-Executor, LX-34) Dateien
 laden, validieren, mappen und ausführen kann.
 
-**Stand:** V1.0.1A. Autoritative Quelle der Konstanten: `src/std/lyxos/lbf_layout.lyx`.
+**Stand:** V1.0.1B. Autoritative Quelle der Konstanten: `src/std/lyxos/lbf_layout.lyx`.
 Referenz-Implementierungen: `src/tools/lbf/{block_header,genesis,tlv,sections,security,loader}.lyx`.
 
 ---
@@ -203,7 +203,7 @@ angehängt) → `LBFNativeWriter.writeLBF(out, src, codeBuf, codeLen)`.
 `writeLBF`: `text_blocks = ceil(codeLen/4032)`, `entry_point = 0x400000`, Genesis + Text-
 Blocks, Block-CRCs + File-CRC, TLV CAPABILITIES + LIFECYCLE + SECTION_MAP(1, text_blocks, TEXT, RX).
 
-**Verifiziert (V1.0.1A):** lyxc kompiliert sich selbst zu nativem lyxos-LYX! —
+**Verifiziert (V1.0.1B):** lyxc kompiliert sich selbst zu nativem lyxos-LYX! —
 2.072.576 B = 506 Blocks, `lbf_header_validate=0`, File-CRC32C OK. Regressions-Test:
 `tests/lbf_native_emit_test.sh`.
 
