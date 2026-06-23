@@ -206,6 +206,11 @@ pub type IRLower = class {
   // ARM64-OOP: parallel zu localNameBuf — type-name-Node pro Local (oder -1).
   // Erlaubt Instanz-Feldzugriff `p.x`: p's Typ → Feld-Offset.
   localTypeBuf: int64;
+  // ARM64-OOP statische Methoden: in einer Methode = 1 (self belegt Slot 0, explizite
+  // Params verschieben sich um +1), sonst 0. curMethodClassType = NK_TYPE_NAME-Node der
+  // umgebenden Klasse (für `self.field`-Auflösung) oder -1.
+  methodParamBase:    int64;
+  curMethodClassType: int64;
 
   // WP-AND-upstream-fix v4/v5: module-scope mapping for top-level NK_VAR_DECLs.
   // Records are 32 bytes: {srcNameOff:i64, nameLen:i64, globalIdx:i64, initValue:i64}.
@@ -285,6 +290,8 @@ pub type IRLower = class {
     self.localNameBuf := alloc(32 * 24);
     self.localTypeBuf := alloc(32 * 8);
     self.localNameCnt := 0;
+    self.methodParamBase    := 0;
+    self.curMethodClassType := 0 - 1;
     self.globalNameCap := 32;
     self.globalNameBuf := alloc(32 * 32);
     self.globalNameCnt := 0;
@@ -642,6 +649,14 @@ pub type IRLower = class {
         var idName: pchar := self.nodeSVal(expr);
         var idLen:  int64 := self.nodeSLen(expr);
         var idPtrL: int64 := (idName) as int64;
+        // ARM64-OOP: `self` in einer Methode → impliziter Param-Slot 0 (Objekt-Pointer).
+        if self.methodParamBase != 0 && idLen == 4 {
+          if peek8(idPtrL) == 115 && peek8(idPtrL + 1) == 101 &&
+             peek8(idPtrL + 2) == 108 && peek8(idPtrL + 3) == 102 {   // "self"
+            self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, 0, -1, 0);
+            return dest;
+          }
+        }
         // WP-AND-upstream-fix v4: locals declared via NK_VAR_DECL come first.
         var lnI: int64 := self.localNameCnt - 1;   // shadowing: latest wins
         while lnI >= 0 {
@@ -683,7 +698,8 @@ pub type IRLower = class {
                 pj := pj + 1;
               }
               if pmatch != 0 {
-                self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, pidx, -1, 0);
+                // ARM64-OOP: in Methoden ist self Slot 0 → explizite Params +methodParamBase.
+                self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, pidx + self.methodParamBase, -1, 0);
                 return dest;
               }
             }
@@ -885,6 +901,37 @@ pub type IRLower = class {
     // WP-2.1: generic calls (iVal=2) go through the monomorphization path
     if (self.nodeIVal(expr) == 2) {
       return self.lowerGenericCall(expr);
+    }
+    // ARM64-OOP: Methoden-Call (iVal=1): c0=Objekt, sVal=Methode, c1=Args.
+    // Statische Dispatch: Klasse von c0 auflösen → mangled "Class_method" → IRO_CALL
+    // mit self=Objekt als arg0, dann explizite Args (im argBase-Block, vgl. nested-call).
+    if (self.nodeIVal(expr) == 1) {
+      var mcDest:     int64 := self.allocTemp();
+      var mcBaseNode: int64 := self.nodeC0(expr);
+      var mcDecl:     int64 := self._baseClassDecl(mcBaseNode);
+      if mcDecl >= 0 {
+        var mcMang: int64 := self._methodMangle(self.nodeSVal(mcDecl), self.nodeSLen(mcDecl),
+                                                self.nodeSVal(expr), self.nodeSLen(expr));
+        var mcLen:  int64 := self.nodeSLen(mcDecl) + 1 + self.nodeSLen(expr);
+        var mcIdx:  int64 := self._findFuncByName(mcMang as pchar, mcLen);
+        if mcIdx >= 0 {
+          var mcArgBase: int64 := self.tempCount;
+          var mcRsv: int64 := 0;
+          while mcRsv < 8 { self.allocTemp(); mcRsv := mcRsv + 1; }
+          var mcSelf: int64 := self.lowerExpr(mcBaseNode);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, mcArgBase, mcSelf, -1, 0);
+          var mcCnt: int64 := 1;
+          var mcArg: int64 := self.nodeC1(expr);
+          while mcArg >= 0 {
+            var mcAT: int64 := self.lowerExpr(mcArg);
+            self.irAddInstrDirect(IRO_STORE_LOCAL, mcArgBase + mcCnt, mcAT, -1, 0);
+            mcCnt := mcCnt + 1;
+            mcArg := self.nodeNext(mcArg);
+          }
+          self.irAddInstrDirect(IRO_CALL, mcDest, mcIdx, mcArgBase, mcCnt);
+        }
+      }
+      return mcDest;
     }
     // NK_CALL: sVal = function name, C0 = first argument (linked via nodeNext)
     var dest: int64 := self.allocTemp();
@@ -2419,15 +2466,63 @@ pub type IRLower = class {
     return 0 - 1;
   }
 
+  // ARM64-OOP: NK_TYPE_DECL der Klasse eines base-IDENT (-1 falls unauflösbar).
+  fn _baseClassDecl(baseNode: int64): int64 {
+    if self.nodeKind(baseNode) != NK_IDENT { return 0 - 1; }
+    var tn: int64 := 0 - 1;
+    // `self` in einer Methode → umgebende Klasse (curMethodClassType = NK_TYPE_DECL).
+    if self.methodParamBase != 0 && self.nodeSLen(baseNode) == 4 {
+      var sp: int64 := (self.nodeSVal(baseNode)) as int64;
+      if peek8(sp) == 115 && peek8(sp+1) == 101 && peek8(sp+2) == 108 && peek8(sp+3) == 102 {
+        tn := self.curMethodClassType;
+      }
+    }
+    if tn < 0 { tn := self._localTypeNode(self.nodeSVal(baseNode), self.nodeSLen(baseNode)); }
+    if tn < 0 { return 0 - 1; }
+    if self.nodeKind(tn) == NK_TYPE_DECL { return tn; }
+    if self.nodeKind(tn) == NK_TYPE_NAME { return self._findTypeDecl(self.nodeSVal(tn), self.nodeSLen(tn)); }
+    return 0 - 1;
+  }
+
   // ARM64-OOP: Feld-Offset für Instanz-Zugriff baseNode.fieldName (-1 falls unauflösbar).
   fn _instanceFieldOffset(baseNode: int64, fp: pchar, fl: int64): int64 {
-    if self.nodeKind(baseNode) != NK_IDENT { return 0 - 1; }
-    var tn: int64 := self._localTypeNode(self.nodeSVal(baseNode), self.nodeSLen(baseNode));
-    if tn < 0 { return 0 - 1; }
-    if self.nodeKind(tn) != NK_TYPE_NAME { return 0 - 1; }
-    var decl: int64 := self._findTypeDecl(self.nodeSVal(tn), self.nodeSLen(tn));
+    var decl: int64 := self._baseClassDecl(baseNode);
     if decl < 0 { return 0 - 1; }
     return self._fieldOffsetIn(decl, fp, fl);
+  }
+
+  // ARM64-OOP: funcBuffer-Index für einen (mangled) Funktionsnamen (-1 falls keiner).
+  fn _findFuncByName(np: pchar, nl: int64): int64 {
+    var fb: int64 := peek64(self.ir + IR_MOD_OFF_FUNCBUF);
+    var sb: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
+    var fc: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);
+    var npI: int64 := (np) as int64;
+    var i: int64 := 0;
+    while i < fc {
+      var off: int64 := peek64(fb + i * IR_FUNC_SIZE);
+      var ln:  int64 := peek64(fb + i * IR_FUNC_SIZE + IR_FUNC_OFF_NAMELEN);
+      if ln == nl {
+        var m: int64 := 1;
+        var j: int64 := 0;
+        while j < nl { if m != 0 { if peek8(sb + off + j) != peek8(npI + j) { m := 0; } } j := j + 1; }
+        if m != 0 { return i; }
+      }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  // ARM64-OOP: mangled Methoden-Name "Class_method" (null-term. Buffer-Pointer).
+  // Länge = clsL + 1 + mL. Identisch an allen 3 Sites (Pre-Pass, Emission, Dispatch).
+  fn _methodMangle(clsP: pchar, clsL: int64, mP: pchar, mL: int64): int64 {
+    var buf: int64 := alloc(clsL + 1 + mL + 1);
+    var i: int64 := 0;
+    while i < clsL { poke8(buf + i, peek8((clsP as int64) + i)); i := i + 1; }
+    poke8(buf + clsL, 95);  // '_'
+    var j: int64 := 0;
+    while j < mL { poke8(buf + clsL + 1 + j, peek8((mP as int64) + j)); j := j + 1; }
+    poke8(buf + clsL + 1 + mL, 0);
+    return buf;
   }
 
   fn lowerField(expr: int64): int64 {
@@ -3356,6 +3451,8 @@ pub type IRLower = class {
     // so they line up with the AAPCS64 spill the prologue performs and with
     // NK_IDENT's pidx-based loads. retValTemp moves AFTER params so it
     // doesn't share a slot with the first spilled parameter.
+    // ARM64-OOP: bei Methoden belegt das implizite self Slot 0 (= erstes Arg x0).
+    if self.methodParamBase != 0 { self.allocParam(); }
     var param: int64 := self.nodeC0(funcNode);
     while (param >= 0) {
       self.allocParam();
@@ -3472,6 +3569,19 @@ pub type IRLower = class {
           var pfNameOff: int64 := self.irAddString(pfNamePtr, pfNameLen);
           self.irAddFunc(pfNameOff, pfNameLen, 0, 0);
         }
+      } else if pfKind == NK_TYPE_DECL {
+        // ARM64-OOP: Methoden (c1-Chain) unter mangled Namen "Class_method" registrieren.
+        var pmM: int64 := self.nodeC1(pfCur);
+        while pmM >= 0 {
+          if self.nodeKind(pmM) == NK_FUNC_DECL {
+            var pmMang: int64 := self._methodMangle(self.nodeSVal(pfCur), self.nodeSLen(pfCur),
+                                                    self.nodeSVal(pmM), self.nodeSLen(pmM));
+            var pmLen:  int64 := self.nodeSLen(pfCur) + 1 + self.nodeSLen(pmM);
+            var pmOff:  int64 := self.irAddString(pmMang as pchar, pmLen);
+            self.irAddFunc(pmOff, pmLen, 0, 0);
+          }
+          pmM := self.nodeNext(pmM);
+        }
       } else if pfKind == NK_GENERIC_DECL {
         // WP-2.1: register generic declarations in genFuncBuf, NOT funcBuffer.
         // They are not emitted directly — only their specializations are.
@@ -3501,6 +3611,29 @@ pub type IRLower = class {
         if self.nodeC2(cur) == -1 && self.nodeC3(cur) != -1 { bodyIsExtern := 1; }
         if bodyIsExtern == 0 {
           self.lowerFunc(cur);
+        }
+      } else if (kind == NK_TYPE_DECL) {
+        // ARM64-OOP: Methoden (c1-Chain) als Funktionen mit mangled Namen + impliziten
+        // self-Param (Slot 0) lowern. methodParamBase=1 verschiebt explizite Params,
+        // curMethodClassType erlaubt `self.field`-Auflösung.
+        var mtM: int64 := self.nodeC1(cur);
+        while mtM >= 0 {
+          if self.nodeKind(mtM) == NK_FUNC_DECL {
+            if self.nodeC2(mtM) >= 0 {   // nur mit Body
+              var mtMang: int64 := self._methodMangle(self.nodeSVal(cur), self.nodeSLen(cur),
+                                                      self.nodeSVal(mtM), self.nodeSLen(mtM));
+              self.overrideFuncName    := mtMang as pchar;
+              self.overrideFuncNameLen := self.nodeSLen(cur) + 1 + self.nodeSLen(mtM);
+              self.methodParamBase     := 1;
+              self.curMethodClassType  := cur;
+              self.lowerFunc(mtM);
+              self.overrideFuncName    := 0 as pchar;
+              self.overrideFuncNameLen := 0;
+              self.methodParamBase     := 0;
+              self.curMethodClassType  := 0 - 1;
+            }
+          }
+          mtM := self.nodeNext(mtM);
         }
       } else if (kind == NK_GENERIC_DECL) {
         // WP-2.1: generic declarations are emitted only as specializations (see below)
