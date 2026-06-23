@@ -23,6 +23,10 @@ pub type LBFNativeWriter = class {
     _lcKind:  int64;  // lifecycle kind (LBF_LC_*, default 0 = ONE_SHOT)
     _evBuf:   int64;  // event descriptor buffer (from lc_ev_alloc), 0 = none
     _evCount: int64;  // number of event descriptors
+    // LYXOS-WP-5: Sektions-Byte-Größen (.text/.rodata/.data). 0/unbenutzt → ganzes Image = .text.
+    _textLen:   int64;
+    _rodataLen: int64;
+    _dataLen:   int64;
 
     // Konfiguriert Lifecycle-Kind und Ereignis-Deskriptoren für writeLBF.
     // ev_buf darf 0 sein wenn ev_count == 0.
@@ -30,6 +34,21 @@ pub type LBFNativeWriter = class {
         self._lcKind  := kind;
         self._evBuf   := ev_buf;
         self._evCount := ev_count;
+    }
+
+    // LYXOS-WP-5: Byte-Größen der Sektionen für Multi-Section-SECTION_MAP + Genesis-Counts.
+    pub fn setSections(textLen: int64, rodataLen: int64, dataLen: int64): void {
+        self._textLen   := textLen;
+        self._rodataLen := rodataLen;
+        self._dataLen   := dataLen;
+    }
+
+    // Block-Spanne (Block-granular) für Byte-Bereich [start, start+len) im 4032-gepackten Image.
+    // Bei contiguous-4032 (nicht page-aligned) können benachbarte Sektionen sich einen
+    // Grenzblock teilen — daher rein deskriptiv (per-Sektion-prot ist kernelseitig deferred).
+    fn _spanBlocks(start: int64, len: int64): int64 {
+        if len <= 0 { return 0; }
+        return (1 + (start + len - 1) / LBF_PAYLOAD_SIZE) - (start / LBF_PAYLOAD_SIZE);
     }
 
     // writeLBF — Schreibt eine vollständige LBF-Nativ-Datei.
@@ -80,12 +99,30 @@ pub type LBFNativeWriter = class {
         poke64(tused, 0);
         tlv_add_capabilities(tbuf, tused, 0);
         tlv_add_lifecycle_full(tbuf, tused, self._lcKind, self._evBuf, self._evCount);
-        tlv_add_section(tbuf, tused, 1, textBlk, LBF_SECT_TYPE_TEXT, LBF_SECT_PROT_RX);
+
+        // ── LYXOS-WP-5: Multi-Section-Metadaten (contiguous-4032, uniform RW kernelseitig) ──
+        var tLen: int64 := self._textLen;
+        var rLen: int64 := self._rodataLen;
+        var dLen: int64 := self._dataLen;
+        if tLen <= 0 { if rLen <= 0 { if dLen <= 0 { tLen := codeLen; } } }
+        var roStart: int64 := tLen;
+        var daStart: int64 := tLen + rLen;
+        var textCnt: int64 := self._spanBlocks(0, tLen);
+        var roCnt:   int64 := self._spanBlocks(roStart, rLen);
+        var daCnt:   int64 := self._spanBlocks(daStart, dLen);
+        var roStartBlk: int64 := 1 + roStart / LBF_PAYLOAD_SIZE;
+        var daStartBlk: int64 := 1 + daStart / LBF_PAYLOAD_SIZE;
+
+        tlv_add_section(tbuf, tused, 1, textCnt, LBF_SECT_TYPE_TEXT, LBF_SECT_PROT_RX);
+        if roCnt > 0 { tlv_add_section(tbuf, tused, roStartBlk, roCnt, LBF_SECT_TYPE_RODATA, LBF_SECT_PROT_R); }
+        if daCnt > 0 { tlv_add_section(tbuf, tused, daStartBlk, daCnt, LBF_SECT_TYPE_DATA, LBF_SECT_PROT_RW); }
 
         // ── 5. Genesis-Daten-Puffer befüllen ─────────────────────────────────
         var gd: int64 := genesis_data_alloc();
         poke64(gd + GEN_D_ENTRY_POINT, 0x400000);
-        poke64(gd + GEN_D_TEXT_BLOCKS, textBlk);
+        poke64(gd + GEN_D_TEXT_BLOCKS,   textCnt);
+        poke64(gd + GEN_D_RODATA_BLOCKS, roCnt);
+        poke64(gd + GEN_D_DATA_BLOCKS,   daCnt);
         poke64(gd + GEN_D_FILE_SIZE,   fileSz);
         poke64(gd + GEN_D_TLV_USED,    peek64(tused));
 
