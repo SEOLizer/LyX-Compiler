@@ -1,5 +1,23 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.1D (Juni 2026)
+
+Patch-Release auf Basis von V1.0.1C. Zwei LyxOS-Codegen-Bugs an der Wurzel behoben.
+
+### LyxOS-Nativ (emit_lyxos / ir_lower)
+- **pchar-Variable an PrintStr — echte Wurzel**: `lowerExpr` für `NK_LIT_STR` nutzte
+  `nodeIVal` (Parser-Offset) statt des IR-strBuf-Offsets → der Pointer zeigte in die
+  Symbol-/Namen-Tabelle ("main"/"gv") statt auf das rodata-Literal. Jetzt via `irAddString`
+  interniert (null-terminiert, Escapes verarbeitet). Betrifft alle String-Literale auf
+  IR-Backends.
+- **user-Funktions-Calls implementiert**: `emit_lyxos.emitCall` war ein Stub (`CALL rel32=0`,
+  keine Args/Result) → alle user-fn-Calls kaputt (`g := f(...)` → 0). Jetzt: Args via
+  System-V-Register (rdi,rsi,rdx,rcx,r8,r9), CALL-rel32-Patch auf Funktions-Offset,
+  Result rax→dest, Callee-Param-Spill Register→Slots.
+
+Verifiziert nativ via lbf_run (call→global=42, 5-arg=15, nested=16, pchar x[0]='H').
+Singularität S3==S4 erhalten; `make test` grün.
+
 ## Version 1.0.1C (Juni 2026)
 
 Patch-Release auf Basis von V1.0.1B. LyxOS-Nativ-Backend kernel-tauglich (Multi-Section)
