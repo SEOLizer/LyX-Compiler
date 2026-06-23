@@ -1,5 +1,31 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.1A (Juni 2026)
+
+Patch-Release auf Basis von V1.0.0A. Schwerpunkt: Sicherheits-Härtung, Korrektheit
+und Erweiterung der Backend-/Nativ-Unterstützung.
+
+### Security (Audit-Verifikationspass)
+- FFI-Sandbox **fail-closed**: unbekannte Externs erfordern `@cap(...)`; PROCESS-Klasse
+  + no-link-Pfad gehärtet (`FFI_CLASS_UNKNOWN`, TCB-Modell std.*/src.*).
+- `calloc()` Integer-Overflow-Guard; alle `read()`-Pfade (inkl. `cg_readFile`) OOB-gehärtet.
+- DNS-rdata-Doku-Hazard (64- vs 128-Byte-Puffer) behoben; TLS-Hostname-Verifikation
+  per CI verankert. RandInt64 silent-0 → `exit(1)`.
+- Jeder Fix mit CI-Regressionstest (sec_*-Suite).
+
+### Korrektheit
+- `--std-path=` Off-by-one (lieferte `=PATH`) behoben.
+- Makefile-Paketversion synchronisiert.
+
+### Backend / Nativ
+- **ARM64-Backend wiederbelebt**: con-Namens-Kollision (Target-Routing), `_start`→main,
+  lokales/nested Assignment, PrintInt, Arrays, Globals, plain structs + statische Methoden
+  (qemu-verifiziert). x86 unverändert.
+- **Nativer LYX!-Loader/Runtime** (`lbf_run`): LYX!-Datei laden + in-process ausführen
+  (mmap RWX + Sprung). `_indirect_call_0/_1` im x86-Codegen.
+
+Singularität S3==S4 erhalten; `make test` grün.
+
 ## Version 1.0.0A (Juni 2026)
 
 Erste Alpha-Version (V1.0.0A) — vollständiger Sprachkern, self-hosting (Singularität),
