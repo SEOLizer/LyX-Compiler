@@ -1,5 +1,25 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.1E (Juni 2026)
+
+Patch-Release auf Basis von V1.0.1D. Drei Optimizer-Bugs im lyxos-Backend behoben.
+
+### IR-Optimizer (ir_optimize)
+- **getInstrCount-Division**: `instrLen / IR_INSTR_SIZE` (93/80=1) ließ DCE nur eine Instruktion
+  sehen → LOAD_LOCAL für Param `a` wurde genoppt → Param `a` immer 0. Behoben via `fnEnd - fnStart`.
+- **Cross-Function-Register-Kollision**: Alle Optimizer-Passes scannten den gesamten Instruktions-
+  puffer über Funktionsgrenzen hinweg. IR-Register-Nummern starten pro Funktion neu bei 0 →
+  `isConstInt(reg)` / `getConstValue()` fanden Konstanten aus einer *anderen* Funktion und falteten
+  lebendige Arithmetik falsch (z. B. `f(1,2,3,4,5)` → 7 statt 15). Fix: `fnStart`/`fnEnd`-Felder
+  gesetzt pro Funktion in `optimize()`; alle Scan-Loops auf `[fnStart, fnEnd)` eingeschränkt.
+- **DCE eliminiert Rückgabe-Register**: `LOAD_LOCAL(dest=0, src1=retValTemp)` — die letzte
+  Instruktion die rax vor dem Epilog lädt — wurde von DCE geNOPpt wenn kein anderer Befehl
+  Register 0 als Quelle hatte. Das NOP wurde zu `CONST_INT(imm=0)` → rax=0.
+  Fix: DCE-Guard `dest > 0` (Register 0 = lyxos-Rückgabe-Register, nie tot).
+
+Wurzel-Symptom: `add5(10,20,30,40,50)` via globaler Variable lieferte 140 statt 150.
+Zwei Regressionstests in `tests/lyxos_call_args_test.sh` ergänzt (8/8 grün).
+
 ## Version 1.0.1D (Juni 2026)
 
 Patch-Release auf Basis von V1.0.1C. Zwei LyxOS-Codegen-Bugs an der Wurzel behoben.
