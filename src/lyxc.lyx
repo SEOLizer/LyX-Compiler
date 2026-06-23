@@ -1957,6 +1957,8 @@ pub type CompilerConfig = class {
   }
 
   fn emitARM64(irMod: int64): int64 {
+    // ARM64-FIX: irMod für writeELF*/Globals verfügbar machen (war nie gesetzt → 0).
+    self.irModulePtr := irMod;
     // If the IR module has functions, use the IR-based emitter.
     var funcCount: int64 := peek64(irMod + IR_MOD_OFF_FUNCLEN);
     if funcCount > 0 {
@@ -2798,8 +2800,18 @@ pub type CompilerConfig = class {
     // - Headers at offset 64 (must be covered by LOAD)
 
     var codeFileOffset: int64 := 4096;  // 0x1000
-    var elfSize: int64 := codeFileOffset + size;
-    
+    // ARM64-FIX: globals-.data nach Code (file-offset==vaddr im static PT_LOAD).
+    // gIdx-Slots in den literal-pools (emitLoadGlobal/StoreGlobal) werden unten auf die
+    // absolute VA gebacken. Nur arm64 (x86-IR-Globals: separater Pfad).
+    var gblIsArm: bool := (self.target == LYX_TC_ARM64) || (self.target == LYX_TC_ANDROID_ARM64);
+    var gblCount: int64 := 0;
+    if gblIsArm && self.irModulePtr != 0 {
+      gblCount := peek64(self.irModulePtr + IR_MOD_OFF_GLOBALLEN);
+    }
+    var gblFileOff: int64 := ((codeFileOffset + size + 7) / 8) * 8;
+    var gblSize:    int64 := gblCount * 8;
+    var elfSize: int64 := gblFileOff + gblSize;
+
     var fd: int64 := open(path, 577, 493);
     if fd == -1 { return false; }
     close(fd);
@@ -2837,12 +2849,12 @@ pub type CompilerConfig = class {
     poke8(elfBuf + off, 0); off := off + 1;
     poke8(elfBuf + off, 0); off := off + 1;
     
-    // WP-10: ARM64 Linux uses ET_DYN (PIE) with load VA 0x1000.
-    // ARM64 code is already PC-relative (ADRP/ADR/BL), so no IR changes needed.
-    // x86_64 keeps ET_EXEC at 0x401000.
+    // ARM64-FIX: ET_EXEC mit fester Basis 0x401000 (wie x86), NICHT ET_DYN/PIE.
+    // Grund: globals werden über literal-pool-Slots mit ABSOLUTER VA adressiert (kein
+    // Reloc, da static/kein Loader). Bei ET_DYN lädt der Kernel an variabler Basis →
+    // absolute VA falsch → SIGSEGV. Code ist PC-relativ (BL/ADR), läuft auch bei ET_EXEC.
     var etype:  int64 := 2;        // ET_EXEC
     var loadVA: int64 := 0x401000;
-    if self.target == LYX_TC_ARM64 { etype := 3; loadVA := 0x1000; }  // ET_DYN
     // e_type (offset 16)
     poke16(elfBuf + 16, etype);
     // e_machine (offset 18): x86-64=62, AArch64=183
@@ -2884,13 +2896,35 @@ pub type CompilerConfig = class {
     // p_vaddr / p_paddr: 0x1000 for ARM64 PIE, 0x401000 for x86-64
     poke64(elfBuf + ph, loadVA); ph := ph + 8;
     poke64(elfBuf + ph, loadVA); ph := ph + 8;
-    // p_filesz: file size = code size
-    poke64(elfBuf + ph, size); ph := ph + 8;
-    // p_memsz: memory size = code size
-    poke64(elfBuf + ph, size); ph := ph + 8;
+    // p_filesz/p_memsz: deckt Code + globals-.data ab
+    var loadSpan: int64 := elfSize - codeFileOffset;
+    poke64(elfBuf + ph, loadSpan); ph := ph + 8;
+    poke64(elfBuf + ph, loadSpan); ph := ph + 8;
     // p_align: alignment = 0x1000
     poke64(elfBuf + ph, 4096);
-    
+
+    // ARM64-FIX: globals-.data init + literal-pool-Slots auf absolute VA backen.
+    if gblIsArm && gblCount > 0 {
+      var gblVABase: int64 := loadVA + (gblFileOff - codeFileOffset);  // file-off→vaddr
+      // Init-Werte aus dem IR-globalBuffer
+      var gbuf: int64 := peek64(self.irModulePtr + IR_MOD_OFF_GLOBALBUF);
+      var dgi: int64 := 0;
+      while dgi < gblCount {
+        poke64(elfBuf + gblFileOff + dgi * 8, peek64(gbuf + dgi * 8));
+        dgi := dgi + 1;
+      }
+      // Slots backen: slot liegt im finalen code bei (codeStubOff + slotCodeOff)
+      var gri: int64 := 0;
+      while gri < self.globalRelocCount {
+        var grec: int64 := self.globalRelocBuf + gri * GRELOCBUF_SZ;
+        var slotCodeOff: int64 := peek64(grec + 0);
+        var gIdx:        int64 := peek64(grec + GRELOCBUF_OFF_GIDX);
+        var slotFileOff: int64 := codeFileOffset + self.codeStubOff + slotCodeOff;
+        poke64(elfBuf + slotFileOff, gblVABase + gIdx * 8);
+        gri := gri + 1;
+      }
+    }
+
     var result: int64 := FileWriteAll(path, elfBuf as pchar, elfSize) as int64;
     free(elfBuf, elfSize);
     chmod(path, 493);

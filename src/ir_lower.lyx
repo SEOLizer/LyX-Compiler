@@ -76,6 +76,7 @@ pub con NK_ASSERT:      int64 := 36;  // WP-BC-07
 
 // Literals (40-45)
 pub con NK_LIT_INT:     int64 := 40;
+pub con NK_TYPE_ARRAY_FIXED: int64 := 101;  // [N]T fixed-size array type (c0=elemType, c1=sizeExpr)
 pub con NK_LIT_FLOAT:   int64 := 41;
 pub con NK_LIT_STR:     int64 := 42;
 pub con NK_LIT_CHAR:    int64 := 43;
@@ -2318,8 +2319,9 @@ pub type IRLower = class {
     var base: int64 := self.lowerExpr(self.nodeC0(expr));
     var idx: int64 := self.lowerExpr(self.nodeC1(expr));
     var dest: int64 := self.allocTemp();
-    
-    // Emit load from base[idx]
+    // ARM64-FIX: war Stub. base = Array-Pointer (aus IRO_ALLOC), idx = Index.
+    // emitLoadIdx: LDR dest, [base, idx, LSL #3] (8-Byte-Elemente).
+    self.irAddInstrDirect(IRO_LOAD_IDX, dest, base, idx, 0);
     return dest;
   }
   
@@ -2536,6 +2538,22 @@ pub type IRLower = class {
       if vdInit >= 0 {
         var vdTemp: int64 := self.lowerExpr(vdInit);
         self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdTemp, -1, 0);
+      } else {
+        // ARM64-FIX: `var a: [N]T` ohne Init → Heap-Storage allozieren, vdSlot = Pointer
+        // (wie x86 codegen). 8 Byte/Element (emitLoadIdx/StoreIdx nutzen LSL#3).
+        var vdType: int64 := self.nodeC0(stmt);
+        if vdType >= 0 && self.nodeKind(vdType) == NK_TYPE_ARRAY_FIXED {
+          var vdSzNode: int64 := self.nodeC1(vdType);
+          var vdN: int64 := 0;
+          if vdSzNode >= 0 && self.nodeKind(vdSzNode) == NK_LIT_INT {
+            vdN := self.nodeIVal(vdSzNode);
+          }
+          if vdN > 0 {
+            var vdSzTemp: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_CONST_INT, vdSzTemp, -1, -1, vdN * 8);
+            self.irAddInstrDirect(IRO_ALLOC, vdSlot, vdSzTemp, -1, 0);
+          }
+        }
       }
       // Register name -> slot. Grow the buffer geometrically if full.
       if self.localNameCnt >= self.localNameCap {
@@ -3041,6 +3059,35 @@ pub type IRLower = class {
           }
           if slot >= 0 {
             self.irAddInstrDirect(IRO_STORE_LOCAL, slot, valTemp, -1, 0);
+          } else {
+            // ARM64-FIX: kein local/param → global suchen (globalNameBuf) und
+            // IRO_STORE_GLOBAL(gIdx, value) emittieren. Sonst war `g := x` für
+            // module-scope Globals ein no-op (Write persistierte nicht).
+            var asgGI: int64 := 0;
+            var asgFound: int64 := 0 - 1;
+            while asgGI < self.globalNameCnt {
+              if asgFound < 0 {
+                var asgRec:  int64 := self.globalNameBuf + asgGI * 32;
+                var asgLen:  int64 := peek64(asgRec + GLOBAL_REC_OFF_NAMELEN);
+                if asgLen == idLen {
+                  var asgOff:  int64 := peek64(asgRec + 0);
+                  var asgPtr:  int64 := peek64(self.ir + IR_MOD_OFF_STRBUF) + asgOff;
+                  var asgM:    int64 := 1;
+                  var asgJ:    int64 := 0;
+                  while asgJ < idLen {
+                    if asgM != 0 {
+                      if peek8(asgPtr + asgJ) != peek8(idPtrL + asgJ) { asgM := 0; }
+                    }
+                    asgJ := asgJ + 1;
+                  }
+                  if asgM != 0 { asgFound := peek64(asgRec + GLOBAL_REC_OFF_IDX); }
+                }
+              }
+              asgGI := asgGI + 1;
+            }
+            if asgFound >= 0 {
+              self.irAddInstrDirect(IRO_STORE_GLOBAL, asgFound, valTemp, -1, 0);
+            }
           }
         }
       }
@@ -3048,9 +3095,12 @@ pub type IRLower = class {
       else if (self.nodeKind(target) == NK_FIELD) {
         // Emit: store to field — TODO (#2 Instanz-Feldzugriff)
       }
-      // Target is INDEX
+      // Target is INDEX — store to array element. ARM64-FIX: war Stub.
+      // IRO_STORE_IDX: src1=value, src2=base, dest=idx (emitStoreIdx: STR value,[base,idx,LSL#3]).
       else if (self.nodeKind(target) == NK_INDEX) {
-        // Emit: store to array element — TODO
+        var aiBase: int64 := self.lowerExpr(self.nodeC0(target));
+        var aiIdx:  int64 := self.lowerExpr(self.nodeC1(target));
+        self.irAddInstrDirect(IRO_STORE_IDX, aiIdx, valTemp, aiBase, 0);
       }
     }
   }
