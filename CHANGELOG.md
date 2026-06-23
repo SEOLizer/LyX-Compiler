@@ -1,5 +1,29 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.1B (Juni 2026)
+
+Patch-Release auf Basis von V1.0.1A. Schwerpunkt: nativer LyxOS-Backend (emit_lyxos)
+von einem ~10-Op-Skelett zu echtem Codegen ausgebaut (LYXOS-WP-0..4).
+
+### LyxOS-Nativ-Backend (emit_lyxos)
+- **WP-1 Arithmetik/Vergleiche**: ADD/SUB/MUL/DIV/MOD, AND/OR/XOR/BITAND/BITOR/BITXOR,
+  SHL/SHR, CMP_EQ/NEQ/LT/LE/GT/GE, NEG (x86-64, rax/rcx, CMP+SETcc+MOVZX).
+- **WP-2 Control-Flow**: JMP/BR_TRUE/BR_FALSE/LABEL mit dynamischer Label-Tabelle +
+  rel32-Patching. Fix: Label-Id steht in IMMINT, nicht LABELOFF.
+- **WP-3 Globals**: LOAD/STORE_GLOBAL + LOAD_GLOBAL_ADDR über RIP-relativen Daten-Pool
+  (Init-Werte aus IR globalBuffer).
+- **WP-4 Fields/Index**: LOAD/STORE_FIELD (+HEAP), LOAD/STORE_IDX für structs/arrays.
+- Verifikation: lyxos sys_exit==Linux 60 → compute-only LYX! via lbf_run nativ ausgeführt;
+  Heap-Pfade Disasm-verifiziert. Tests in `make test` (lyxos_wp1..4).
+- LX-30: nativer `--target=lyxos` LYX!-Emit dokumentiert/getestet; lyxc self-compiliert
+  zu validem nativem lyxos-LYX!.
+
+### Offen
+- LYXOS-WP-5 (Multi-Section W^X, entry_point-Konvention, Lifecycle-Events) — wartet auf
+  Kernel-Loader-Kontrakt-Abstimmung (Spec §11b).
+
+Singularität S3==S4 erhalten; `make test` grün.
+
 ## Version 1.0.1A (Juni 2026)
 
 Patch-Release auf Basis von V1.0.0A. Schwerpunkt: Sicherheits-Härtung, Korrektheit

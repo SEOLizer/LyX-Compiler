@@ -1,6 +1,6 @@
 # LyxOS-Compiler-Arbeitspakete (emit_lyxos / natives LYX!)
 
-Stand: V1.0.1A. Ziel: lyxos-Programme nativ (LYX!) korrekt + kernel-tauglich kompilieren.
+Stand: V1.0.1B. Ziel: lyxos-Programme nativ (LYX!) korrekt + kernel-tauglich kompilieren.
 Backend: `src/backend/lyxos/emit_lyxos.lyx` (x86-64 + lyxos-Syscall-ABI), Wrapper
 `lyxc.lyx:emitLyxOS` → `src/tools/lbf/writer.lyx`. Format-Spec: `work/lbf-native-spec.md`.
 
