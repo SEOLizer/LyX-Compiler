@@ -23,35 +23,45 @@ Structs, Arrays erzeugen **lückenhaften Code** (verworfene Instruktionen).
 Die ir_lower-Schicht produziert die IR korrekt (für arm64 bereits gehärtet) — es fehlt rein
 die **Emission** in emit_lyxos. WP-Reihenfolge daher revidiert (Kern-Ops vor Multi-Section).
 
-## LYXOS-WP-1 — Arithmetik + Vergleiche
-**Prio P0.** emitInstr: IRO_ADD(10), SUB, MUL, DIV, MOD, bitwise (AND/OR/XOR/SHL/SHR),
-Vergleiche (EQ/NEQ/LT/LE/GT/GE → 0/1). x86-64-Encoding, Operanden aus Slots → rax/rcx → Slot.
-**Abnahme:** `return a+b` (a=5,b=7) → Text-Disasm enthält `add`; analog für sub/mul; ein
-Vergleich (`a < b`) emittiert cmp+setcc. Disasm-Test grün.
+## LYXOS-WP-1 — Arithmetik + Vergleiche ✅ ERLEDIGT
+emitInstr: ADD/SUB/MUL/DIV/MOD, AND/OR/XOR/BITAND/BITOR/BITXOR, SHL/SHR, CMP_EQ/NEQ/LT/LE/GT/GE,
+NEG. rax=src1, rcx=src2 → op → dest; Vergleiche via CMP+SETcc+MOVZX. tests/lyxos_wp1_arith_test.sh.
+**Verifiziert nativ ausgeführt** (siehe WP-2): add=12, mul=42, sub=15.
 
-## LYXOS-WP-2 — Control-Flow
-**Prio P0.** IRO_JMP(90), BR_TRUE(91), BR_FALSE(92), LABEL(93). Label-Adressen + rel32-Patching
-(wie emit_arm64/codegen_x86). **Abnahme:** `if`/`while`-Programm → Disasm enthält jmp/jz/jnz +
-Label-Ziele korrekt gepatcht; Struktur einer Zählschleife erkennbar.
+## LYXOS-WP-2 — Control-Flow ✅ ERLEDIGT
+emitInstr: JMP(90)/BR_TRUE(91)/BR_FALSE(92)/LABEL(93). Dynamische labelAddrs + jmpPatch,
+rel32 in applyJmpPatches() gepatcht. Bug behoben: Label-Id in IMMINT (nicht LABELOFF).
+**Echte Ausführung** via lbf_run (lyxos sys_exit==Linux 60): if=1/7, while=10, nested=12.
+tests/lyxos_wp2_controlflow_test.sh.
 
-## LYXOS-WP-3 — Globals + .data-Section
-**Prio P1.** IRO_LOAD_GLOBAL(64)/STORE_GLOBAL(65); writer: getrennte `.data`-Section +
-Genesis `data_blocks` + SECTION_MAP-Eintrag (prot RW). **Abnahme:** Programm mit `var g`
-(read+write) → Genesis data_blocks>0, SECTION_MAP enthält DATA(RW); Global-Zugriff im Disasm.
+## LYXOS-WP-3 — Globals ✅ ERLEDIGT
+emitGlobalsPool() hängt Globals-Pool (Init-Werte aus IR globalBuffer) ans Code, RIP-relativ.
+LOAD_GLOBAL(64)/STORE_GLOBAL(65)/LOAD_GLOBAL_ADDR(66). **Echte Ausführung**: init=7, store=5,
+rmw=14, accum=6, two=12. tests/lyxos_wp3_globals_test.sh.
+Hinweis: Globals im (RWX) Code-Pool; getrennte .data-Section = WP-5.
 
-## LYXOS-WP-4 — Fields + Index (structs/arrays)
-**Prio P1.** IRO_LOAD_FIELD/STORE_FIELD, IRO_LOAD_IDX/STORE_IDX, NEW/ALLOC-Layout.
-**Abnahme:** struct-Feld + Array-Index → Disasm enthält die Lade/Speicher-Sequenzen.
+## LYXOS-WP-4 — Fields + Index ✅ ERLEDIGT
+LOAD_FIELD(108)/STORE_FIELD(109)(+HEAP 110/111), LOAD_IDX(86)/STORE_IDX(87). Encodings
+MOV rax,[rax+off] / MOV [rcx+off],rax / MOV rax,[rax+rcx*8] / MOV [rdx+rcx*8],rax.
+Disasm-verifiziert (Offsets 0x0/0x8 + SIB). tests/lyxos_wp4_fields_test.sh.
+Hinweis: volle Heap/Array-Ausführung braucht lyxos-Kernel-alloc (lyxos-mmap-ABI ≠ POSIX).
 
-## LYXOS-WP-5 — Multi-Section W^X + entry_point + Lifecycle-Events
-**Prio P1 (kernel-facing).** .text(RX)/.rodata(R)/.data(RW)/.bss(RW) getrennt mit korrektem
-prot; rodata (Strings) raus aus TEXT; entry_point-Konvention mit Kernel abstimmen;
-LIFECYCLE-TLV mit Event→Handler-VA für REACTIVE/EVENT_LOOP. **Abnahme:** Programm mit
-RW-Global + RO-String → getrennte Sektionen + prot in SECTION_MAP; entry_point dokumentiert.
+## LYXOS-WP-5 — Multi-Section W^X + entry_point + Lifecycle-Events ⏸ KERNEL-ABSTIMMUNG
+**Prio P1 (kernel-facing).** Erfordert Kernel-Loader-Kontrakt-Entscheidungen, die das aktive
+Kernel-Team gerade trifft — NICHT blind raten:
+- **W^X-Trennung** .text(RX)/.rodata(R)/.data(RW)/.bss: Pools block-alignen + 3 SECTION_MAP +
+  Genesis-Counts. RIP-relative Patches müssen gegen das FINALE (gepaddete) Layout rechnen.
+  Bricht den POSIX-`lbf_run`-Pfad (lädt nur text_blocks contiguous) → lbf_run muss parallel
+  alle Sektionen contiguous-mit-prot mappen. **Offene Kernel-Frage:** Sektionen contiguous
+  in VA (gemeinsamer Adressraum, prot pro Block-Bereich) ODER getrennte mmaps?
+- **entry_point-Konvention:** aktuell hart 0x400000; mit Kernel-Lade-Basis abstimmen.
+- **Lifecycle-Events:** LIFECYCLE-TLV Event-ID→Handler-VA — braucht Kernel-Event-Modell.
+
+→ Vor Implementierung mit Kernel-Team Mapping-Strategie + entry_point + Event-Modell klären.
 
 ---
 
-## Reihenfolge & Hinweis
-WP-1 → WP-2 → WP-3 → WP-4 → WP-5. ir_lower liefert bereits korrekte IR; die Arbeit ist die
-x86-64-Emission in emit_lyxos (analog emit_arm64-Handler, aber x86 + lyxos-ABI). Commit nach
-jedem WP. Obsidian: [[Compiler-Workpackages-LYXOS]], [[LBF-Native-Format-Spec]].
+## Status & Hinweis
+WP-0..WP-4 ✅ erledigt + verifiziert (Branch feat/lyxos-compiler-wp). WP-5 ⏸ wartet auf
+Kernel-Koordination. ir_lower liefert korrekte IR; Arbeit war x86-Emission in emit_lyxos.
+Commit pro WP. Obsidian: [[Compiler-Workpackages-LYXOS]], [[LBF-Native-Format-Spec]].
