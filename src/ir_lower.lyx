@@ -203,6 +203,9 @@ pub type IRLower = class {
   localNameBuf: int64;
   localNameCnt: int64;
   localNameCap: int64;
+  // ARM64-OOP: parallel zu localNameBuf — type-name-Node pro Local (oder -1).
+  // Erlaubt Instanz-Feldzugriff `p.x`: p's Typ → Feld-Offset.
+  localTypeBuf: int64;
 
   // WP-AND-upstream-fix v4/v5: module-scope mapping for top-level NK_VAR_DECLs.
   // Records are 32 bytes: {srcNameOff:i64, nameLen:i64, globalIdx:i64, initValue:i64}.
@@ -280,6 +283,7 @@ pub type IRLower = class {
     self.tempCount := 0;
     self.localNameCap := 32;
     self.localNameBuf := alloc(32 * 24);
+    self.localTypeBuf := alloc(32 * 8);
     self.localNameCnt := 0;
     self.globalNameCap := 32;
     self.globalNameBuf := alloc(32 * 32);
@@ -2344,6 +2348,88 @@ pub type IRLower = class {
     return 8;
   }
 
+  // ARM64-OOP: NK_TYPE_DECL für einen Typ-Namen finden (-1 wenn keiner).
+  fn _findTypeDecl(np: pchar, nl: int64): int64 {
+    var ti: int64 := 0;
+    while ti < self.nodeCount {
+      if self.nodeKind(ti) == NK_TYPE_DECL {
+        if self.seq(self.nodeSVal(ti), self.nodeSLen(ti), np, nl) { return ti; }
+      }
+      ti := ti + 1;
+    }
+    return 0 - 1;
+  }
+
+  // ARM64-OOP: Byte-Offset eines Feldes in NK_TYPE_DECL (-1 wenn nicht gefunden).
+  fn _fieldOffsetIn(typeDecl: int64, fp: pchar, fl: int64): int64 {
+    var off: int64 := 0;
+    var fd: int64 := self.nodeC0(typeDecl);
+    while fd >= 0 {
+      if self.seq(self.nodeSVal(fd), self.nodeSLen(fd), fp, fl) { return off; }
+      off := off + self.fieldTypeSize(self.nodeC0(fd));
+      fd := self.nodeNext(fd);
+    }
+    return 0 - 1;
+  }
+
+  // ARM64-OOP: Gesamtgröße (Summe Feld-Größen) eines NK_TYPE_DECL.
+  fn _typeSizeOf(typeDecl: int64): int64 {
+    var sz: int64 := 0;
+    var fd: int64 := self.nodeC0(typeDecl);
+    while fd >= 0 {
+      sz := sz + self.fieldTypeSize(self.nodeC0(fd));
+      fd := self.nodeNext(fd);
+    }
+    return sz;
+  }
+
+  // ARM64-OOP: type-name-Node eines Locals per Name (-1 wenn nicht local/kein Typ).
+  fn _localTypeNode(idp: pchar, idl: int64): int64 {
+    var idPtrL: int64 := (idp) as int64;
+    var li: int64 := self.localNameCnt - 1;
+    while li >= 0 {
+      var rec: int64 := self.localNameBuf + li * 24;
+      var ln:  int64 := peek64(rec + LOCAL_REC_OFF_NAMELEN);
+      if ln == idl {
+        var noff: int64 := peek64(rec + 0);
+        var nptr: int64 := (self.src as int64) + noff;
+        var m: int64 := 1;
+        var j: int64 := 0;
+        while j < idl { if m != 0 { if peek8(nptr + j) != peek8(idPtrL + j) { m := 0; } } j := j + 1; }
+        if m != 0 { return peek64(self.localTypeBuf + li * 8); }
+      }
+      li := li - 1;
+    }
+    // ARM64-OOP: nicht local → Params durchsuchen (NK_PARAM.c0 = Typ-Node).
+    if self.curFunc >= 0 {
+      var pn: int64 := self.nodeC0(self.curFunc);
+      while pn >= 0 {
+        if self.nodeKind(pn) == NK_PARAM {
+          if self.nodeSLen(pn) == idl {
+            var pptr: int64 := (self.nodeSVal(pn)) as int64;
+            var pm: int64 := 1;
+            var pj: int64 := 0;
+            while pj < idl { if pm != 0 { if peek8(pptr + pj) != peek8(idPtrL + pj) { pm := 0; } } pj := pj + 1; }
+            if pm != 0 { return self.nodeC0(pn); }
+          }
+        }
+        pn := self.nodeNext(pn);
+      }
+    }
+    return 0 - 1;
+  }
+
+  // ARM64-OOP: Feld-Offset für Instanz-Zugriff baseNode.fieldName (-1 falls unauflösbar).
+  fn _instanceFieldOffset(baseNode: int64, fp: pchar, fl: int64): int64 {
+    if self.nodeKind(baseNode) != NK_IDENT { return 0 - 1; }
+    var tn: int64 := self._localTypeNode(self.nodeSVal(baseNode), self.nodeSLen(baseNode));
+    if tn < 0 { return 0 - 1; }
+    if self.nodeKind(tn) != NK_TYPE_NAME { return 0 - 1; }
+    var decl: int64 := self._findTypeDecl(self.nodeSVal(tn), self.nodeSLen(tn));
+    if decl < 0 { return 0 - 1; }
+    return self._fieldOffsetIn(decl, fp, fl);
+  }
+
   fn lowerField(expr: int64): int64 {
     var dest: int64 := self.allocTemp();
     var baseNode: int64 := self.nodeC0(expr);
@@ -2384,8 +2470,12 @@ pub type IRLower = class {
       }
     }
 
-    // Instance field access or unresolved type — lower base, dest stays 0
+    // ARM64-OOP: Instanz-Feldzugriff p.x — base = Objekt-Pointer, Offset aus p's Typ.
     var base: int64 := self.lowerExpr(baseNode);
+    var ifOff: int64 := self._instanceFieldOffset(baseNode, self.nodeSVal(expr), self.nodeSLen(expr));
+    if ifOff >= 0 {
+      self.irAddInstrDirect(IRO_LOAD_FIELD, dest, base, ifOff, 0);
+    }
     return dest;
   }
   
@@ -2407,10 +2497,19 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerNew(expr: int64): int64 {
-    // Type to allocate is in C0
+    // ARM64-OOP: `new T()` → IRO_ALLOC(typeSize) → dest = Objekt-Pointer.
+    // Typname = sVal des NK_NEW-Nodes (c0 = Konstruktor-Args, hier ignoriert).
+    // Layout: Felder ab Offset 0 (kein VMT für plain structs/methodenlose Klassen).
     var dest: int64 := self.allocTemp();
-    
-    // Emit allocation
+    var decl: int64 := self._findTypeDecl(self.nodeSVal(expr), self.nodeSLen(expr));
+    var sz: int64 := 8;
+    if decl >= 0 {
+      var tsz: int64 := self._typeSizeOf(decl);
+      if tsz > 0 { sz := tsz; }
+    }
+    var szTemp: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, szTemp, -1, -1, sz);
+    self.irAddInstrDirect(IRO_ALLOC, dest, szTemp, -1, 0);
     return dest;
   }
   
@@ -2562,12 +2661,18 @@ pub type IRLower = class {
         var vdI: int64 := 0;
         memcpy(vdNb, self.localNameBuf, self.localNameCnt * 24);
         self.localNameBuf := vdNb;
+        // ARM64-OOP: localTypeBuf parallel mit-growen.
+        var vdTb: int64 := alloc(vdNewCap * 8);
+        memcpy(vdTb, self.localTypeBuf, self.localNameCnt * 8);
+        self.localTypeBuf := vdTb;
         self.localNameCap := vdNewCap;
       }
       var vdRec: int64 := self.localNameBuf + self.localNameCnt * 24;
       poke64(vdRec +  0, peek64(self.nodeOff(stmt) + NODE_OFF_SVAL));  // src nameOff
       poke64(vdRec +  8, self.nodeSLen(stmt));
       poke64(vdRec + LOCAL_REC_OFF_SLOT, vdSlot);
+      // ARM64-OOP: Typ-Node des Locals merken (nodeC0 = Typ; -1 wenn keiner).
+      poke64(self.localTypeBuf + self.localNameCnt * 8, self.nodeC0(stmt));
       self.localNameCnt := self.localNameCnt + 1;
     }
     // Try/Catch/Finally handled in lowering blocks
@@ -3091,9 +3196,13 @@ pub type IRLower = class {
           }
         }
       }
-      // Target is FIELD
+      // Target is FIELD — ARM64-OOP: p.x := v → IRO_STORE_FIELD(value, base, fieldOff).
       else if (self.nodeKind(target) == NK_FIELD) {
-        // Emit: store to field — TODO (#2 Instanz-Feldzugriff)
+        var afBase: int64 := self.lowerExpr(self.nodeC0(target));
+        var afOff:  int64 := self._instanceFieldOffset(self.nodeC0(target), self.nodeSVal(target), self.nodeSLen(target));
+        if afOff >= 0 {
+          self.irAddInstrDirect(IRO_STORE_FIELD, afOff, valTemp, afBase, 0);
+        }
       }
       // Target is INDEX — store to array element. ARM64-FIX: war Stub.
       // IRO_STORE_IDX: src1=value, src2=base, dest=idx (emitStoreIdx: STR value,[base,idx,LSL#3]).
