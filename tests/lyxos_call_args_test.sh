@@ -27,6 +27,10 @@ run "CALL_5arg"     'fn f(a: int64, b: int64, c: int64, d: int64, e: int64): int
 run "CALL_5arg_global" 'fn f(a: int64, b: int64, c: int64, d: int64, e: int64): int64 { return e; } var g: int64 := 0; fn main(): int64 { g := f(10, 20, 30, 40, 55); return g; }' 55
 run "CALL_6arg"     'fn f(a: int64, b: int64, c: int64, d: int64, e: int64, x: int64): int64 { return a + x; } fn main(): int64 { return f(1, 2, 3, 4, 5, 6); }' 7
 run "CALL_nested"   'fn sq(n: int64): int64 { return n * n; } fn main(): int64 { return sq(sq(2)); }' 16
+# Regression: DCE incorrectly eliminated LOAD_LOCAL(dest=0) when no instr uses slot 0 as src
+run "CALL_return_last_param" 'fn f(a: int64, b: int64, c: int64, d: int64, e: int64): int64 { return e; } var g: int64 := 0; fn main(): int64 { g := f(10, 20, 30, 40, 55); return g; }' 55
+# Regression: getInstrCount() divided instrLen by IR_INSTR_SIZE; cross-fn reg collision
+run "CALL_add5_150" 'fn add5(a: int64, b: int64, c: int64, d: int64, e: int64): int64 { return a + b + c + d + e; } var gw: int64 := 0; fn main(): int64 { gw := add5(10, 20, 30, 40, 50); return gw; }' 150
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
