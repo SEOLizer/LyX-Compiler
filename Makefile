@@ -110,6 +110,9 @@ test: lyxc
 	./lyxc tests/lbf_run_test.lyx -o /tmp/lyxc_lbfrun_test
 	@/tmp/lyxc_lbfrun_test
 	@rm -f /tmp/lyxc_lbfrun_test
+	@echo "--- LX-30: nativer lyxos-LYX!-Emit ---"
+	@bash tests/lbf_native_emit_test.sh
+	@echo "OK"
 	@echo "--- LX-36: Lifecycle Descriptor ---"
 	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
 	@/tmp/lyxc_lx36_test
