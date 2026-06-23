@@ -37,6 +37,11 @@ pub type EmitLyxOS = class {
     jmpPatchBuf:   int64;
     jmpPatchCount: int64;
     jmpPatchCap:   int64;   // Bytes (16 je Eintrag)
+    // LYXOS-WP-3: Globals-Daten-Area (ans Code angehängt) + RIP-relative Patches.
+    globalsBase:   int64;   // Code-Offset des Globals-Pools (nach emitGlobalsPool)
+    globalPatchBuf: int64;
+    globalPatchCount: int64;
+    globalPatchCap: int64;  // Bytes (16 je Eintrag: dispOff, gIdx)
 
     pub fn init(ir: int64): void {
         self.irMod         := ir;
@@ -54,6 +59,11 @@ pub type EmitLyxOS = class {
         self.jmpPatchCap   := 4096;
         self.jmpPatchBuf   := alloc(self.jmpPatchCap);
         self.jmpPatchCount := 0;
+        // LYXOS-WP-3: Globals-Patches.
+        self.globalsBase      := 0 - 1;
+        self.globalPatchCap   := 4096;
+        self.globalPatchBuf   := alloc(self.globalPatchCap);
+        self.globalPatchCount := 0;
     }
 
     // strPatchBuf wächst dynamisch (16 Byte/Eintrag). Vorher fix 4096 = nur 256 Einträge →
@@ -423,6 +433,72 @@ pub type EmitLyxOS = class {
                 self.patch32(relOff, target - (relOff + 4));
             }
             i := i + 1;
+        }
+    }
+
+    // ── LYXOS-WP-3: Globals (RIP-relativer Zugriff auf angehängten Daten-Pool) ──
+    fn recordGlobalPatch(dispOff: int64, gIdx: int64): void {
+        var need: int64 := (self.globalPatchCount + 1) * 16;
+        if need > self.globalPatchCap {
+            var nc: int64 := self.globalPatchCap * 2;
+            var nb: int64 := alloc(nc);
+            memcpy(nb, self.globalPatchBuf, self.globalPatchCount * 16);
+            self.globalPatchBuf := nb;
+            self.globalPatchCap := nc;
+        }
+        var rec: int64 := self.globalPatchBuf + self.globalPatchCount * 16;
+        poke64(rec + 0, dispOff);
+        poke64(rec + 8, gIdx);
+        self.globalPatchCount := self.globalPatchCount + 1;
+    }
+
+    // dest = global[gIdx]   (MOV rax, [rip+disp]; → slot)
+    fn emitLoadGlobal(dest: int64, gIdx: int64): void {
+        self.emit8(0x48); self.emit8(0x8B); self.emit8(0x05);   // MOV rax, [rip+disp32]
+        var dispOff: int64 := self.codeLen;
+        self.emit32(0);
+        self.recordGlobalPatch(dispOff, gIdx);
+        self.emitMovSlotFromRax(dest);
+    }
+
+    // global[gIdx] = src1   (rax=src1; MOV [rip+disp], rax)
+    fn emitStoreGlobal(gIdx: int64, src1: int64): void {
+        self.emitMovRaxFromSlot(src1);
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0x05);   // MOV [rip+disp32], rax
+        var dispOff: int64 := self.codeLen;
+        self.emit32(0);
+        self.recordGlobalPatch(dispOff, gIdx);
+    }
+
+    // dest = &global[gIdx]  (LEA rax, [rip+disp]; → slot)
+    fn emitLoadGlobalAddr(dest: int64, gIdx: int64): void {
+        self.emit8(0x48); self.emit8(0x8D); self.emit8(0x05);   // LEA rax, [rip+disp32]
+        var dispOff: int64 := self.codeLen;
+        self.emit32(0);
+        self.recordGlobalPatch(dispOff, gIdx);
+        self.emitMovSlotFromRax(dest);
+    }
+
+    // Hängt den Globals-Daten-Pool ans Code an (8 B je Global, Init-Werte aus dem
+    // IR-Modul globalBuffer) und patcht alle RIP-relativen Disp32. IR_MOD_OFF_GLOBALBUF=104,
+    // IR_MOD_OFF_GLOBALLEN=120.
+    fn emitGlobalsPool(): void {
+        var gCount: int64 := peek64(self.irMod + 120);
+        var gBuf:   int64 := peek64(self.irMod + 104);
+        self.globalsBase := self.codeLen;
+        var i: int64 := 0;
+        while i < gCount {
+            self.emit64(peek64(gBuf + i * 8));   // Init-Wert (oder 0)
+            i := i + 1;
+        }
+        // RIP-relative Disp32 patchen: disp = (globalsBase + gIdx*8) - (dispOff + 4)
+        var p: int64 := 0;
+        while p < self.globalPatchCount {
+            var rec:     int64 := self.globalPatchBuf + p * 16;
+            var dispOff: int64 := peek64(rec + 0);
+            var gIdx:    int64 := peek64(rec + 8);
+            self.patch32(dispOff, (self.globalsBase + gIdx * 8) - (dispOff + 4));
+            p := p + 1;
         }
     }
 
@@ -878,6 +954,12 @@ pub type EmitLyxOS = class {
             self.emitBrCond(src1, imm, 0);
         } else if op == 93 {                    // IRO_LABEL
             self.emitLabelDef(imm);
+        } else if op == 64 {                    // IRO_LOAD_GLOBAL — LYXOS-WP-3 (dest=slot, src1=gIdx)
+            self.emitLoadGlobal(dest, src1);
+        } else if op == 65 {                    // IRO_STORE_GLOBAL (dest=gIdx, src1=value)
+            self.emitStoreGlobal(dest, src1);
+        } else if op == 66 {                    // IRO_LOAD_GLOBAL_ADDR (dest=slot, src1=gIdx)
+            self.emitLoadGlobalAddr(dest, src1);
         }
         // unbehandelte Ops: kein Code
     }
