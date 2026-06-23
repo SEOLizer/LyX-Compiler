@@ -597,42 +597,37 @@ pub type EmitARM64 = class {
   }
 
   fn emitLoadGlobal(addr: int64, dest: int64) {
-    if self.isSharedLib != 0 {
-      // WP-AND-upstream-fix v5: in shared-lib mode IRO_LOAD_GLOBAL now
-      // carries a globalIdx, not an absolute VA. Emit the literal-pool
-      // sequence with a placeholder slot value and record the slot's
-      // code-buffer offset + globalIdx into globalRelocBuf — writeELFSharedLib
-      // patches the slot to (dataOff + globalIdx*8) at link time and adds
-      // the matching R_AARCH64_RELATIVE entry.
-      var slotOff: int64 := self.codeLen + 8;
-      self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]
-      self.emit32(0x14000003);         // B +12
-      self.emit64(0);                   // placeholder slot
-      self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
-      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
-
-      if (self.globalRelocCount >= self.globalRelocCap) {
-        var newCap: int64 := self.globalRelocCap * 2;
-        var nb: int64 := alloc(newCap * 16);
-        var i: int64 := 0;
-        while i < self.globalRelocCount * 16 {
-          poke8(nb + i, peek8(self.globalRelocBuf + i));
-          i := i + 1;
-        }
-        self.globalRelocBuf := nb;
-        self.globalRelocCap := newCap;
-      }
-      var rec: int64 := self.globalRelocBuf + self.globalRelocCount * 16;
-      poke64(rec + 0, slotOff);
-      poke64(rec + 8, addr);   // addr field carries globalIdx in this path
-      self.globalRelocCount := self.globalRelocCount + 1;
-      return;
-    }
-    // addr is an absolute VA; load via MOVZ/MOVK sequence then LDR
-    self.emitMovImmReg(ARM64_X9, addr);
-    // LDR x0, [x9]
+    // IRO_LOAD_GLOBAL trägt einen globalIdx (NICHT eine VA). Beide Modi (shared-lib UND
+    // static) emittieren eine literal-pool-Sequenz mit Platzhalter-Slot und merken sich
+    // (slotOff, globalIdx) in globalRelocBuf. writeELFSharedLib bäckt + R_AARCH64_RELATIVE;
+    // writeELF (static) bäckt die absolute VA direkt (file-offset==vaddr, fixer Lade-Offset).
+    // ARM64-FIX: vorher MOVte der static-Pfad globalIdx als VA → LDR [0] → SIGSEGV.
+    var slotOff: int64 := self.codeLen + 8;
+    self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]
+    self.emit32(0x14000003);         // B +12
+    self.emit64(0);                   // placeholder slot (gebacken in writeELF*)
     self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+    self._recordGlobalReloc(slotOff, addr);
+  }
+
+  // Merkt (slotCodeOff, globalIdx) für späteres Backen durch writeELF*/writeELFSharedLib.
+  fn _recordGlobalReloc(slotOff: int64, gIdx: int64) {
+    if (self.globalRelocCount >= self.globalRelocCap) {
+      var newCap: int64 := self.globalRelocCap * 2;
+      var nb: int64 := alloc(newCap * 16);
+      var i: int64 := 0;
+      while i < self.globalRelocCount * 16 {
+        poke8(nb + i, peek8(self.globalRelocBuf + i));
+        i := i + 1;
+      }
+      self.globalRelocBuf := nb;
+      self.globalRelocCap := newCap;
+    }
+    var rec: int64 := self.globalRelocBuf + self.globalRelocCount * 16;
+    poke64(rec + 0, slotOff);
+    poke64(rec + 8, gIdx);
+    self.globalRelocCount := self.globalRelocCount + 1;
   }
 
   fn emitStoreGlobal(src: int64, addr: int64) {
@@ -640,10 +635,15 @@ pub type EmitARM64 = class {
       self._emitStoreGlobalPIC(src, addr);
       return;
     }
-    self.emitMovImmReg(ARM64_X9, addr);
-    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
-    // STR x0, [x9]
-    self.emit32(0xF9000120);  // STR x0, [x9]
+    // ARM64-FIX (static): literal-pool-Slot (gIdx-Platzhalter) → writeELF bäckt VA.
+    // Vorher MOVte addr(=gIdx) als VA → STR [0] → SIGSEGV.
+    var slotOff: int64 := self.codeLen + 8;
+    self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]  (Adresse aus Slot)
+    self.emit32(0x14000003);         // B +12  (über .quad)
+    self.emit64(0);                   // placeholder slot (gebacken in writeELF)
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));  // x0 = value
+    self.emit32(0xF9000120);          // STR x0, [x9]
+    self._recordGlobalReloc(slotOff, addr);
   }
 
   // WP-AND-02 Phase C: PIC-friendly global load using an inline literal pool.
