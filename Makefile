@@ -131,6 +131,9 @@ test: lyxc
 	@echo "--- LYXOS pchar-Variable an PrintStr (4 tests) ---"
 	@bash tests/lyxos_pchar_var_test.sh
 	@echo "OK"
+	@echo "--- LYXOS user-Funktions-Calls (6 tests) ---"
+	@bash tests/lyxos_call_args_test.sh
+	@echo "OK"
 	@echo "--- LX-36: Lifecycle Descriptor ---"
 	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
 	@/tmp/lyxc_lx36_test

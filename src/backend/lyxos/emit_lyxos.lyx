@@ -43,6 +43,12 @@ pub type EmitLyxOS = class {
     globalPatchBuf: int64;
     globalPatchCount: int64;
     globalPatchCap: int64;  // Bytes (16 je Eintrag: dispOff, gIdx)
+    // LYXOS-call-fix: user-Funktions-Calls. funcAddrs[funcId]=Code-Offset; callPatch=(relOff,funcId).
+    funcAddrs:     int64;
+    funcCap:       int64;   // Anzahl Funktions-Slots (8 Byte je)
+    callPatchBuf:  int64;
+    callPatchCount: int64;
+    callPatchCap:  int64;   // Bytes (16 je Eintrag)
 
     pub fn init(ir: int64): void {
         self.irMod         := ir;
@@ -65,6 +71,12 @@ pub type EmitLyxOS = class {
         self.globalPatchCap   := 4096;
         self.globalPatchBuf   := alloc(self.globalPatchCap);
         self.globalPatchCount := 0;
+        // LYXOS-call-fix: funcAddrs in emitFunctions alloziert (funcLen bekannt); Call-Patches hier.
+        self.funcAddrs        := 0;
+        self.funcCap          := 0;
+        self.callPatchCap     := 4096;
+        self.callPatchBuf     := alloc(self.callPatchCap);
+        self.callPatchCount   := 0;
     }
 
     // strPatchBuf wächst dynamisch (16 Byte/Eintrag). Vorher fix 4096 = nur 256 Einträge →
@@ -535,9 +547,75 @@ pub type EmitLyxOS = class {
     }
 
     // CALL rel32 stub — wired up with real relocation in LX-03+
-    fn emitCall(funcIdx: int64, retSlot: int64): void {
-        self.emit8(0xE8);
+    // ── LYXOS-call-fix: user-Funktions-Calls (System-V: rdi,rsi,rdx,rcx,r8,r9) ──
+    // Arg-Register-Index → REX-Prefix / ModRM-reg-Bits (mod=10 disp32, rm=101=rbp).
+    fn _argRegRex(ri: int64): int64 {
+        if ri < 4 { return 0x48; }
+        return 0x4C;   // r8/r9 brauchen REX.R
+    }
+    fn _argRegModrm(ri: int64): int64 {
+        var rb: int64 := 1;
+        if ri == 0 { rb := 7; }       // rdi
+        if ri == 1 { rb := 6; }       // rsi
+        if ri == 2 { rb := 2; }       // rdx
+        if ri == 3 { rb := 1; }       // rcx
+        if ri == 4 { rb := 0; }       // r8
+        if ri == 5 { rb := 1; }       // r9
+        return 0x85 | (rb << 3);      // mod=10, rm=101 (rbp+disp32)
+    }
+    // <argReg[ri]> := [rbp + slotOff(slot)]
+    fn emitMovRegFromSlot(ri: int64, slot: int64): void {
+        self.emit8(self._argRegRex(ri)); self.emit8(0x8B); self.emit8(self._argRegModrm(ri));
+        self.emit32(self.slotOff(slot));
+    }
+    // [rbp + slotOff(slot)] := <argReg[ri]>
+    fn emitMovSlotFromReg(ri: int64, slot: int64): void {
+        self.emit8(self._argRegRex(ri)); self.emit8(0x89); self.emit8(self._argRegModrm(ri));
+        self.emit32(self.slotOff(slot));
+    }
+
+    fn recordCallPatch(relOff: int64, funcId: int64): void {
+        var need: int64 := (self.callPatchCount + 1) * 16;
+        if need > self.callPatchCap {
+            var nc: int64 := self.callPatchCap * 2;
+            var nb: int64 := alloc(nc);
+            memcpy(nb, self.callPatchBuf, self.callPatchCount * 16);
+            self.callPatchBuf := nb;
+            self.callPatchCap := nc;
+        }
+        var rec: int64 := self.callPatchBuf + self.callPatchCount * 16;
+        poke64(rec + 0, relOff);
+        poke64(rec + 8, funcId);
+        self.callPatchCount := self.callPatchCount + 1;
+    }
+
+    fn applyCallPatches(): void {
+        var i: int64 := 0;
+        while i < self.callPatchCount {
+            var rec:    int64 := self.callPatchBuf + i * 16;
+            var relOff: int64 := peek64(rec + 0);
+            var funcId: int64 := peek64(rec + 8);
+            var target: int64 := 0 - 1;
+            if funcId >= 0 { if funcId < self.funcCap { target := peek64(self.funcAddrs + funcId * 8); } }
+            if target >= 0 {
+                self.patch32(relOff, target - (relOff + 4));
+            }
+            i := i + 1;
+        }
+    }
+
+    // dest = funcId(args at argBase..argBase+argCount-1)
+    fn emitCall(funcId: int64, argBase: int64, argCount: int64, dest: int64): void {
+        var ai: int64 := 0;
+        while ai < argCount {
+            if ai < 6 { self.emitMovRegFromSlot(ai, argBase + ai); }
+            ai := ai + 1;
+        }
+        self.emit8(0xE8);                       // CALL rel32
+        var relOff: int64 := self.codeLen;
         self.emit32(0);
+        self.recordCallPatch(relOff, funcId);
+        self.emitMovSlotFromRax(dest);          // Resultat rax → dest
     }
 
     // LEA rax, [rip + rel32] with forward patch; rel32 resolved in emitStrPool().
@@ -980,8 +1058,8 @@ pub type EmitLyxOS = class {
         } else if op == 164 {                   // IRO_LOAD_ERRVAL (LX-21: rax=r15-shadow)
             self.emit8(0x49); self.emit8(0x8B); self.emit8(0xC7);  // MOV rax, r15
             self.emitMovSlotFromRax(dest);
-        } else if op == 81 {                    // IRO_CALL
-            self.emitCall(src1, dest);
+        } else if op == 81 {                    // IRO_CALL (src1=funcId, src2=argBase, imm=argCount)
+            self.emitCall(src1, src2, imm, dest);
         } else if op == 94 {                    // IRO_FUNC_EXIT
             self.emitMovRaxFromSlot(src1);
             self.emitEpilogue();
@@ -1023,6 +1101,12 @@ pub type EmitLyxOS = class {
         var strBuf:   int64 := peek64(self.irMod + IR_MOD_OFF_STRBUF);
         var mainOff:  int64 := self.codeLen;   // default: first func
 
+        // LYXOS-call-fix: funcAddrs[funcId] = Code-Offset des Funktions-Starts.
+        self.funcCap   := funcLen;
+        self.funcAddrs := alloc(funcLen * 8);
+        var fz: int64 := 0;
+        while fz < funcLen { poke64(self.funcAddrs + fz * 8, 0 - 1); fz := fz + 1; }
+
         var fi: int64 := 0;
         while fi < funcLen {
             var fBase:       int64 := funcBuf + fi * IR_FUNC_SIZE;
@@ -1031,6 +1115,10 @@ pub type EmitLyxOS = class {
             var fnInstrsOff: int64 := peek64(fBase + IR_FUNC_OFF_INSTRSOFF);
             var fnInstrCnt:  int64 := peek64(fBase + IR_FUNC_OFF_INSTRCOUNT);
             var fnLocals:    int64 := peek64(fBase + IR_FUNC_OFF_LOCALCOUNT);
+            var fnParams:    int64 := peek64(fBase + IR_FUNC_OFF_PARAMCOUNT);
+
+            // LYXOS-call-fix: Start-Offset dieser Funktion merken (für CALL-rel32-Patch).
+            poke64(self.funcAddrs + fi * 8, self.codeLen);
 
             // Record offset of main()
             if fnNameLen == 4 {
@@ -1044,6 +1132,13 @@ pub type EmitLyxOS = class {
             // funcInstrStart = INSTRLEN-Zähler), kein Byte-Offset — nicht teilen!
             var firstIdx: int64 := fnInstrsOff;
             self.emitPrologue(fnLocals);
+            // LYXOS-call-fix: eingehende Arg-Register (System-V) in Param-Slots 0..N-1 spillen,
+            // damit LOAD_LOCAL der Parameter den Wert liest.
+            var psp: int64 := 0;
+            while psp < fnParams {
+                if psp < 6 { self.emitMovSlotFromReg(psp, psp); }
+                psp := psp + 1;
+            }
             var ii: int64 := 0;
             while ii < fnInstrCnt {
                 self.emitInstr(firstIdx + ii);
@@ -1056,6 +1151,8 @@ pub type EmitLyxOS = class {
         }
         // LYXOS-WP-2: alle JMP/BR rel32 auf Label-Offsets patchen.
         self.applyJmpPatches();
+        // LYXOS-call-fix: alle CALL rel32 auf Funktions-Offsets patchen.
+        self.applyCallPatches();
         return mainOff;
     }
 
