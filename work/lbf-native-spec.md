@@ -212,26 +212,27 @@ Sektionen (eigene prot, mehrere SECTION_MAP-Einträge) = Erweiterung.
 
 ---
 
-## 11b. Kernel-Abstimmung nötig (LYXOS-WP-5, blockiert)
+## 11b. Multi-Section (LYXOS-WP-5) ✅ — Kernel-Kontrakt umgesetzt
 
-Der native lyxos-Emit kann jetzt Arithmetik, Control-Flow, Globals, Fields/Index
-(LYXOS-WP-1..4). Für W^X-taugliche Multi-Section-Ausgabe braucht der Compiler drei
-Kernel-Entscheidungen — bitte Kernel-Team festlegen:
+Kernel-Team-Antworten (LX-34) implementiert:
 
-1. **Section-Mapping-Strategie:** Werden `.text`/`.rodata`/`.data` **contiguous im selben
-   VA-Bereich** geladen (ein Adressraum, prot pro Block-Bereich gesetzt — dann bleiben die
-   RIP-relativen Compiler-Offsets gültig), ODER als **getrennte mmaps** (dann braucht der
-   Compiler eine Relokationstabelle für sektionsübergreifende Referenzen)? Aktuell: alles in
-   EINER RX-Section, RIP-relativ — funktioniert nur ohne W^X.
-2. **entry_point-Konvention:** Aktuell hart `0x400000` (Genesis +0x04). Soll das die feste
-   Kernel-Lade-VA sein, oder ein **datei-/sektions-relativer Offset** (z. B. Offset 0 = Start
-   .text)? Der Loader-Kontrakt (§9.8) muss das fixieren.
-3. **Lifecycle-Event-Modell:** Für EVENT_LOOP/REACTIVE — Format der Event-ID→Handler-Tabelle
-   im LIFECYCLE-TLV (§8). Welche Adress-Form für Handler (VA / .text-Offset)? Wie ruft der
-   Kernel Handler auf (Signatur, Argumente)?
+1. **Section-Mapping = contiguous-in-VA @ `0x400000`, keine Reloc.** Loader streift pro Block
+   den 64-B-Header, konkateniert die 4032-B-Payloads zu EINEM Image; eine Mapping. Compiler
+   legt EINEN 4032-gepackten Byte-Stream an (text→rodata→data) — RIP-relative Offsets gegen
+   dieses Layout (4032, NICHT 4096). `SECTION_MAP` (TEXT/RODATA/DATA + prot) ist Block-granular
+   und **rein deskriptiv**: per-Sektion-Schutz ist kernelseitig **deferred** (uniform RW), weil
+   4032-Payloads nicht page-aligned sind → Grenzblöcke können zwei Sektionen tragen.
+   *Echtes RX/RO später:* Sektionen auf 4096 padden (kostet Contiguity).
+2. **entry_point = volle VA** (`0x400000` = Image-Start = `_start`). `phys = PHYS_BASE +
+   (entry_point − 0x400000)`. Nicht sektions-relativ.
+3. **Kein Lifecycle-Handler-Table.** Single entry → `_start` → `main()`. Windowed/Daemon nutzen
+   eigene Syscall-Event-Loop (`SysEventRecvPid`+`SysYield`). LIFECYCLE-TLV bleibt informativ;
+   **keine** Event-ID→Handler-Tabelle emittiert.
 
-Sobald geklärt: WP-5 = Pools block-alignen, 3× SECTION_MAP + Genesis-Counts, RIP-Patches gegen
-finales Layout, `lbf_run` parallel auf Multi-Section-Mapping upgraden.
+Loader (`lbf_run`/Kernel): lädt das ganze Image über die Dateigröße (`fsize/4096 − 1`
+Datenblöcke), unabhängig von den (ggf. überlappenden) Sektions-Counts.
+Implementiert in `emit_lyxos` (getTextLen/Rodata/Data) + `writer` (setSections/3×SECTION_MAP/
+Genesis-Counts) + `loader` (Dateigröße). Test: `tests/lyxos_wp5_sections_test.sh`.
 
 ## 11. Offene Punkte / Kernel-Erweiterung
 
