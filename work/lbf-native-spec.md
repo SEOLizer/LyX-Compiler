@@ -212,6 +212,27 @@ Sektionen (eigene prot, mehrere SECTION_MAP-Einträge) = Erweiterung.
 
 ---
 
+## 11b. Kernel-Abstimmung nötig (LYXOS-WP-5, blockiert)
+
+Der native lyxos-Emit kann jetzt Arithmetik, Control-Flow, Globals, Fields/Index
+(LYXOS-WP-1..4). Für W^X-taugliche Multi-Section-Ausgabe braucht der Compiler drei
+Kernel-Entscheidungen — bitte Kernel-Team festlegen:
+
+1. **Section-Mapping-Strategie:** Werden `.text`/`.rodata`/`.data` **contiguous im selben
+   VA-Bereich** geladen (ein Adressraum, prot pro Block-Bereich gesetzt — dann bleiben die
+   RIP-relativen Compiler-Offsets gültig), ODER als **getrennte mmaps** (dann braucht der
+   Compiler eine Relokationstabelle für sektionsübergreifende Referenzen)? Aktuell: alles in
+   EINER RX-Section, RIP-relativ — funktioniert nur ohne W^X.
+2. **entry_point-Konvention:** Aktuell hart `0x400000` (Genesis +0x04). Soll das die feste
+   Kernel-Lade-VA sein, oder ein **datei-/sektions-relativer Offset** (z. B. Offset 0 = Start
+   .text)? Der Loader-Kontrakt (§9.8) muss das fixieren.
+3. **Lifecycle-Event-Modell:** Für EVENT_LOOP/REACTIVE — Format der Event-ID→Handler-Tabelle
+   im LIFECYCLE-TLV (§8). Welche Adress-Form für Handler (VA / .text-Offset)? Wie ruft der
+   Kernel Handler auf (Signatur, Argumente)?
+
+Sobald geklärt: WP-5 = Pools block-alignen, 3× SECTION_MAP + Genesis-Counts, RIP-Patches gegen
+finales Layout, `lbf_run` parallel auf Multi-Section-Mapping upgraden.
+
 ## 11. Offene Punkte / Kernel-Erweiterung
 
 - **LX-34 Zero-Load-Executor:** Blocks direkt aus Speicher/IOFS ausführen (kein Kopieren).

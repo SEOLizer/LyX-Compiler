@@ -113,6 +113,18 @@ test: lyxc
 	@echo "--- LX-30: nativer lyxos-LYX!-Emit ---"
 	@bash tests/lbf_native_emit_test.sh
 	@echo "OK"
+	@echo "--- LYXOS-WP-1: Arithmetik/Vergleiche (6 tests) ---"
+	@bash tests/lyxos_wp1_arith_test.sh
+	@echo "OK"
+	@echo "--- LYXOS-WP-2: Control-Flow nativ ausgeführt (6 tests) ---"
+	@bash tests/lyxos_wp2_controlflow_test.sh
+	@echo "OK"
+	@echo "--- LYXOS-WP-3: Globals nativ ausgeführt (5 tests) ---"
+	@bash tests/lyxos_wp3_globals_test.sh
+	@echo "OK"
+	@echo "--- LYXOS-WP-4: Fields/Index Emission (4 tests) ---"
+	@bash tests/lyxos_wp4_fields_test.sh
+	@echo "OK"
 	@echo "--- LX-36: Lifecycle Descriptor ---"
 	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
 	@/tmp/lyxc_lx36_test
