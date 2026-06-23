@@ -1,0 +1,58 @@
+// src/tools/lbf/loader.lyx — Nativer LYX!-Loader/Runtime
+//
+// Lädt eine LYX!-Native-Datei (LBF-Block-Format), validiert Genesis-Header + File-CRC,
+// reassembliert den Maschinencode aus den Text-Blocks in RWX-Speicher und führt ihn
+// nativ in-process aus (Entry = Code-Offset 0, ohne ELF-Zwischenschritt).
+//
+// Konvention: der Code-Blob ist als Funktion aufrufbar (endet mit RET) und liefert
+// seinen Rückgabewert in x0/rax. Rückgabe: Code-Resultat, oder negativer Fehlercode.
+
+import src.std.lyxos.lbf_layout;
+import src.tools.lbf.block_header;
+import src.tools.lbf.security;
+import src.tools.lbf.genesis;
+
+// Linux mmap-Konstanten (stabil; lokal, um Import-Abhängigkeiten klein zu halten).
+con LDR_PROT_RWX: int64 := 7;    // PROT_READ | PROT_WRITE | PROT_EXEC
+con LDR_MAP_ANON: int64 := 34;   // MAP_PRIVATE | MAP_ANONYMOUS
+
+pub fn lbf_run(path: pchar): int64 {
+    var fd: int64 := open(path, 0, 0);
+    if fd < 0 { return 0 - 1; }
+    var fsize: int64 := lseek(fd, 0, 2);
+    lseek(fd, 0, 0);
+    if fsize < LBF_BLOCK_SIZE {
+        close(fd);
+        return 0 - 1;
+    }
+    var fbuf: int64 := alloc(fsize);
+    var got: int64 := read(fd, fbuf, fsize);
+    close(fd);
+    if got != fsize { free(fbuf, fsize); return 0 - 2; }
+
+    // Genesis-Header + File-CRC validieren.
+    if lbf_header_validate(fbuf) != 0 { free(fbuf, fsize); return 0 - 3; }
+    if lbf_verify_file_crc(fbuf, fsize) != 0 { free(fbuf, fsize); return 0 - 4; }
+
+    // Text-Block-Anzahl aus dem Genesis-Payload.
+    var payload0: int64 := fbuf + LBF_HEADER_SIZE;
+    var textBlk: int64 := genesis_get_total_block_count(payload0);
+    if textBlk <= 0 { free(fbuf, fsize); return 0 - 5; }
+
+    // RWX-Speicher für den reassemblierten Code.
+    var codeLen: int64 := textBlk * LBF_PAYLOAD_SIZE;
+    var code: int64 := mmap(0, codeLen, LDR_PROT_RWX, LDR_MAP_ANON, 0 - 1, 0);
+    if code <= 0 { free(fbuf, fsize); return 0 - 6; }
+
+    // Text-Blocks (1..textBlk) zusammenfügen: je 4032-Byte-Payload ab +64.
+    var bi: int64 := 1;
+    while bi <= textBlk {
+        var src: int64 := fbuf + bi * LBF_BLOCK_SIZE + LBF_HEADER_SIZE;
+        memcpy(code + (bi - 1) * LBF_PAYLOAD_SIZE, src, LBF_PAYLOAD_SIZE);
+        bi := bi + 1;
+    }
+    free(fbuf, fsize);
+
+    // Nativer Sprung: Code als Funktion bei Offset 0 aufrufen.
+    return _indirect_call_0(code);
+}
