@@ -46,22 +46,26 @@ MOV rax,[rax+off] / MOV [rcx+off],rax / MOV rax,[rax+rcx*8] / MOV [rdx+rcx*8],ra
 Disasm-verifiziert (Offsets 0x0/0x8 + SIB). tests/lyxos_wp4_fields_test.sh.
 Hinweis: volle Heap/Array-Ausführung braucht lyxos-Kernel-alloc (lyxos-mmap-ABI ≠ POSIX).
 
-## LYXOS-WP-5 — Multi-Section W^X + entry_point + Lifecycle-Events ⏸ KERNEL-ABSTIMMUNG
-**Prio P1 (kernel-facing).** Erfordert Kernel-Loader-Kontrakt-Entscheidungen, die das aktive
-Kernel-Team gerade trifft — NICHT blind raten:
-- **W^X-Trennung** .text(RX)/.rodata(R)/.data(RW)/.bss: Pools block-alignen + 3 SECTION_MAP +
-  Genesis-Counts. RIP-relative Patches müssen gegen das FINALE (gepaddete) Layout rechnen.
-  Bricht den POSIX-`lbf_run`-Pfad (lädt nur text_blocks contiguous) → lbf_run muss parallel
-  alle Sektionen contiguous-mit-prot mappen. **Offene Kernel-Frage:** Sektionen contiguous
-  in VA (gemeinsamer Adressraum, prot pro Block-Bereich) ODER getrennte mmaps?
-- **entry_point-Konvention:** aktuell hart 0x400000; mit Kernel-Lade-Basis abstimmen.
-- **Lifecycle-Events:** LIFECYCLE-TLV Event-ID→Handler-VA — braucht Kernel-Event-Modell.
+## LYXOS-WP-5 — Multi-Section-Metadaten + entry_point ✅ ERLEDIGT (nach Kernel-Kontrakt)
+Kernel-Antworten (Spec §11b) umgesetzt:
+- **Q1 contiguous-in-VA @0x400000, keine Reloc:** Image bleibt EIN 4032-gepackter Byte-Stream;
+  RIP-Offsets unverändert gültig. SECTION_MAP rein deskriptiv (per-Sektion-prot deferred,
+  uniform RW), da Payloads 4032 (nicht page-aligned) → Grenzblöcke geteilt.
+- **Q2 entry_point = volle VA 0x400000** (unverändert).
+- **Q3 kein Lifecycle-Handler-Table** (nicht emittiert; kooperatives Syscall-Loop-Modell).
 
-→ Vor Implementierung mit Kernel-Team Mapping-Strategie + entry_point + Event-Modell klären.
+emit_lyxos: getTextLen/getRodataLen/getDataLen (rodataBase/globalsBase/codeLen).
+writer: setSections + _spanBlocks → bis zu 3 SECTION_MAP (TEXT/RODATA/DATA + prot) +
+Genesis text/rodata/data_blocks. loader: lädt ganzes Image via Dateigröße (robust gegen
+Block-Range-Überlappung). tests/lyxos_wp5_sections_test.sh (5): Counts>0, entry=0x400000,
+Ausführung korrekt.
+
+**Noch offen (separat, nur wenn echtes W^X gewünscht):** Sektionen auf 4096 page-alignen
+(padden) → erzwingbares RX/RO statt uniform RW. Kostet Contiguity; aktuell bewusst nicht.
 
 ---
 
 ## Status & Hinweis
-WP-0..WP-4 ✅ erledigt + verifiziert (Branch feat/lyxos-compiler-wp). WP-5 ⏸ wartet auf
-Kernel-Koordination. ir_lower liefert korrekte IR; Arbeit war x86-Emission in emit_lyxos.
-Commit pro WP. Obsidian: [[Compiler-Workpackages-LYXOS]], [[LBF-Native-Format-Spec]].
+WP-0..WP-5 ✅ erledigt + verifiziert. Self-compile zu nativem lyxos-LYX! valide.
+ir_lower liefert korrekte IR; Arbeit war x86-Emission in emit_lyxos + Writer-Metadaten.
+Obsidian: [[Compiler-Workpackages-LYXOS]], [[LBF-Native-Format-Spec]].
