@@ -142,6 +142,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- LYXOS @capabilities → CAPS-TLV-Mapping (6 tests) ---"
 	@bash tests/lyxos_caps_tlv_test.sh
+	@echo "--- LYXOS importierte-Klassen-Methoden-Dispatch (1 test) ---"
+	@bash tests/lyxos_imported_class_dispatch_test.sh
+	@echo "OK"
 	@echo "OK"
 	@echo "--- LX-36: Lifecycle Descriptor ---"
 	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
