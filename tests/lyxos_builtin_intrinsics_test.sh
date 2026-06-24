@@ -80,6 +80,8 @@ compile_ok "stat_compiles"     'fn main(): int64 { var s: int64 := 0; return sta
 compile_ok "lstat_compiles"    'fn main(): int64 { var s: int64 := 0; return lstat("f", s); }'
 compile_ok "symlink_compiles"  'fn main(): int64 { return symlink("a", "b"); }'
 compile_ok "nanosleep_compiles" 'fn main(): int64 { var ts: int64 := 0; return nanosleep(ts, 0); }'
+compile_ok "pipe_compiles"     'fn main(): int64 { var a: int64 := 0; var b: int64 := 0; return pipe(a, b, 0); }'
+compile_ok "truncate_compiles" 'fn main(): int64 { return truncate(3, 100); }'
 compile_ok "rmdir_compiles"    'fn main(): int64 { return rmdir("d"); }'
 compile_ok "eprintint_compiles" 'fn main(): int64 { EPrintInt(42); return 0; }'
 compile_ok "argvget_compiles"  'fn main(): int64 { var av: int64 := 0; var p: pchar := ArgvGet(av, 0); return 0; }'
