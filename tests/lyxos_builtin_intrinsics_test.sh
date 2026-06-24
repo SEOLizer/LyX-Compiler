@@ -55,6 +55,10 @@ run "bitnot"  'fn main(): int64 { var x: int64 := 240; var y: int64 := ~x; retur
 run "not_zero" 'fn main(): int64 { var x: int64 := 0; return !x; }' 1
 run "not_nonzero" 'fn main(): int64 { var x: int64 := 5; return !x; }' 0
 
+# --- WP-CTOR: Konstruktor-Args (new C(args) → ClassName_Create(self,args)). Runtime=Kernel (new→mmap). ---
+compile_ok "ctor_args" 'type C = class { a: int64; fn Create(p: int64) { self.a := p; } fn A(): int64 { return self.a; } };
+fn main(): int64 { var c: C := new C(11); return c.A(); }' 
+
 # --- peek16 Word-Read (Laufzeit, rodata) ---
 run "peek16_low"  'fn main(): int64 { return peek16("AB") & 0xFF; }' 65
 run "peek16_high" 'fn main(): int64 { return (peek16("AB") >> 8) & 0xFF; }' 66
