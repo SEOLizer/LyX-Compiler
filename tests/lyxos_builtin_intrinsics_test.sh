@@ -94,6 +94,10 @@ compile_ok "wait4_compiles"    'fn main(): int64 { var s: int64 := 0; return sys
 compile_ok "oop_inherited_field" 'type A = class { val: int64; virtual fn S(): int64 { return 0; } };
 type D = class extends A { override fn S(): int64 { return self.val + 1; } fn C(v: int64) { self.val := v; } };
 fn main(): int64 { var d: D := new D(); d.C(41); return d.val; }'
+# WP-VMT: virtuelle Dispatch über Basis-Pointer (a:A hält D → D.S override). Runtime=Kernel (=42).
+compile_ok "oop_virtual_dispatch" 'type A = class { val: int64; virtual fn S(): int64 { return 0; } };
+type D = class extends A { override fn S(): int64 { return self.val + 1; } fn C(v: int64) { self.val := v; } };
+fn main(): int64 { var d: D := new D(); d.C(41); var a: A := d; return a.S(); }'
 
 # (EPrintFloat ist sema-bekannt aber nicht für lyxos gelowert → muss laut scheitern)
 compile_fail "hardened_catchall" 'fn main(): int64 { EPrintFloat(1.0); return 0; }' "unbekannter Builtin"
