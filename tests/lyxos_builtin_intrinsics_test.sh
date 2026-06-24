@@ -79,9 +79,9 @@ compile_ok "lseek_compiles"    'fn main(): int64 { return lseek(3, 0, 2); }'
 compile_ok "stat_compiles"     'fn main(): int64 { var s: int64 := 0; return stat("f", s); }'
 compile_ok "lstat_compiles"    'fn main(): int64 { var s: int64 := 0; return lstat("f", s); }'
 compile_ok "symlink_compiles"  'fn main(): int64 { return symlink("a", "b"); }'
-compile_ok "pipe_compiles"     'fn main(): int64 { var a: int64 := 0; var b: int64 := 0; return pipe(a, b, 0); }'
-compile_ok "truncate_compiles" 'fn main(): int64 { return truncate(3, 100); }'
 compile_ok "nanosleep_compiles" 'fn main(): int64 { var ts: int64 := 0; return nanosleep(ts, 0); }'
+# pipe/truncate sind keine sema-Builtins (lyxc nutzt sie nicht) → sema lehnt vor lowerCall ab;
+# die lowerCall/emit-Einträge (id 231/232) liegen bereit falls sie je registriert werden.
 
 # (EPrintFloat ist sema-bekannt aber nicht für lyxos gelowert → muss laut scheitern)
 compile_fail "hardened_catchall" 'fn main(): int64 { EPrintFloat(1.0); return 0; }' "unbekannter Builtin"
