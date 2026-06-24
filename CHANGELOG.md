@@ -1,5 +1,22 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.2C (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2B. Verifizierter Kombi-Build (peek/poke + strength-reduction) und CI-Härtung.
+
+### CI / Test-Infrastruktur
+- **`make test` ruft die neuen LyxOS-Regressionssuites auf**: `tests/lyxos_builtin_intrinsics_test.sh`
+  (peek/poke/StrCharAt, 10 Tests) und `tests/lyxos_strength_reduction_test.sh` (`*2^k`/`÷2^k`, 12 Tests)
+  liefen bisher nicht im `test`-Target. Genau diese Lücke ließ eine gemeldete „peek/poke-Regression"
+  in einer stale Zwischen-Binary (ohne den V1.0.2A-ir_lower-Fix) unbemerkt — die develop-Quelle war
+  immer korrekt. Beide Suites jetzt im `test`-Target: ein Build kann keinen der beiden LyxOS-Codegen-Fixes
+  mehr verlieren, ohne dass `make test` rot wird.
+
+### Verifikation (develop-HEAD, frischer Build)
+- peek8("Z")=90, peek8(var s)=90 (Disasm `movzx`, kein PrintStr-Fehldispatch).
+- x*4=20, (y*w+x)*4=48 (strength-reduction korrekt).
+- Beide Regressionssuites grün (10/10, 12/12); Singularität S3==S4 erhalten.
+
 ## Version 1.0.2B (Juni 2026)
 
 Patch-Release auf Basis von V1.0.2A. LyxOS-IR-Optimizer-Korrektheit: Strength-Reduction-Shift-Bug behoben (lbfwin Bug #4).
