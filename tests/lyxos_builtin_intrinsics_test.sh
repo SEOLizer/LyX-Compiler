@@ -62,6 +62,17 @@ compile_ok "poke16_compiles"     'var a: int64[4]; fn main(): int64 { poke16(a, 
 compile_ok "memcpy_compiles"     'var a: int64[4]; fn main(): int64 { memcpy(a, "XYZ", 3); return 0; }'
 compile_ok "StrSetChar_compiles" 'var a: int64[4]; fn main(): int64 { StrSetChar(a as pchar, 0, 88); return 0; }'
 
+# --- Gruppe A: POSIX-File-Builtins → flache §10.4-Syscalls (compile-only;
+#     LyxOS-Syscall-Nrn ≠ Linux → kein lbf_run-Runtime auf Linux; Disasm-verifiziert) ---
+compile_ok "open_compiles"   'fn main(): int64 { var fd: int64 := open("f", 0, 0); return 0; }'
+compile_ok "read_compiles"   'fn main(): int64 { var fd: int64 := 3; read(fd, "b", 1); return 0; }'
+compile_ok "write_compiles"  'fn main(): int64 { var fd: int64 := 1; write(fd, "b", 1); return 0; }'
+compile_ok "close_compiles"  'fn main(): int64 { close(3); return 0; }'
+compile_ok "unlink_compiles" 'fn main(): int64 { unlink("f"); return 0; }'
+compile_ok "rename_compiles" 'fn main(): int64 { rename("a", "b"); return 0; }'
+compile_ok "mkdir_compiles"  'fn main(): int64 { mkdir("d", 0); return 0; }'
+compile_ok "exit_compiles"   'fn main(): int64 { exit(0); return 0; }'
+
 # --- Gehärteter Catch-all: sema-bekannter aber nicht gelowerter Builtin → harter Fehler ---
 # (chmod hat keinen LyxOS-Syscall + ist nicht in lowerCall → muss laut scheitern)
 compile_fail "hardened_catchall" 'fn main(): int64 { return chmod("x", 0); }' "unbekannter Builtin"
