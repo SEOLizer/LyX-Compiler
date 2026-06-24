@@ -1,5 +1,25 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.2D (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2C. Schwerpunkt: lyxc self-hosting auf LyxOS — Builtin-Lowering + CAPS-TLV.
+
+### LyxOS-Nativ (ir_lower / emit_lyxos / writer)
+- **Gruppe C — Memory-Intrinsics** (ids 200–210): `peek16`/`poke16`/`memcpy` gelowert (argBase-Konvention,
+  `movzx`/`mov`/`rep movsb`).
+- **Gruppe A — POSIX-File-Builtins** (ids 220–227): `open`/`close`/`read`/`write`/`rename`/`unlink`/`mkdir`/`exit`
+  → flache §10.4-Syscalls (kein dir_fd — implementierter Kernel ist flach). Neuer `emitVfsSyscallAB` mit
+  argBase statt fester Slots (vermeidet Caller-Local-Aliasing).
+- **sizeof(Type)** compile-time fold in lowerCall (via `_findTypeDecl`+`_typeSizeOf`) — entblockt std.string.
+- **@capabilities → LBF CAPS-TLV-Mapping**: `writer.lyx` schrieb CAPS-TLV hart als 0 → @capabilities
+  wirkungslos, Kernel-Pledge-Gate erlaubte nur STDIO. Jetzt scannt lyxc `NK_CAPABILITY_DECL`, mappt
+  Pfad→`LBF_CAP_*`-Bit (fs.read=1/fs.write=2/network=4/process=8/ki.graph=32/ki.embed=16/audio=128),
+  OR-Union → `writer.setCapabilities`. CAPS-TLV trägt nun die echten FS-Caps.
+
+Verifiziert: CAPS-TLV [fs.read,fs.write]=3; Syscall-Nrn + Intrinsics disasm-/lbf_run-verifiziert.
+Neue Tests: `lyxos_builtin_intrinsics` (22), `lyxos_strength_reduction` (12), `lyxos_caps_tlv` (6) — alle
+in `make test`. Singularität S3==S4 erhalten.
+
 ## Version 1.0.2C (Juni 2026)
 
 Patch-Release auf Basis von V1.0.2B. Verifizierter Kombi-Build (peek/poke + strength-reduction) und CI-Härtung.
