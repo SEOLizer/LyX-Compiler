@@ -1,5 +1,25 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.2H (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2G. LyxOS-Backend: Array-Store-DCE-Bug, sema-Builtins, importierte OOP-Methoden.
+
+### LyxOS-Nativ (ir_optimize / ir_lower / sema)
+- **STORE_IDX DCE-Bug (#859)**: `IRO_STORE_IDX` fehlte in `ir_optimize.hasSideEffect` → DCE eliminierte
+  ALLE Array-Element-Stores (`a[i] := v`) auf dem lyxos-IR-Pfad (dest=idx-temp galt als tot → NOP).
+  Fix: STORE_IDX in hasSideEffect. wp4_fields jetzt 4/4.
+- **pipe/truncate sema-Registrierung (#859)**: `_regBuiltin("pipe"/"truncate")` — die lowerCall/emit-
+  Einträge (id 231/232) lagen bereit, waren aber unerreichbar.
+- **Methoden-Dispatch importierter Klassen (#861)**: eine Methode einer importierten Klasse (z.B.
+  TForm.Run aus vui) kehrte sofort zurück statt zu laufen — (a) `_findTypeDecl` scannte nur das aktuelle
+  Modul → unauflösbar am Call-Site → kein Dispatch; (b) der transitive Import-Pre-Pass registrierte
+  Methoden importierter Klassen nicht. Fix: `_baseTypeNode` liefert den Klassennamen auch ohne lokales
+  decl (statische Mangle `Class_method`, cross-module); Pre-Pass registriert importierte Methoden mangled.
+
+Verifiziert: wp4 4/4, intrinsics 37/37, call_args 8/8, neuer importierte-Klassen-Dispatch-Test;
+importierte Methode loopt korrekt (lbf_run exit 124, vorher 2). Singularität S3==S4; voll-lyxc→LBF
+baut (3.74 MB). ELF-Pfad unberührt (nutzt ir_optimize/ir_lower nicht). OOP-Runtime am echten Kernel.
+
 ## Version 1.0.2G (Juni 2026)
 
 Patch-Release auf Basis von V1.0.2F. LyxOS-OOP: geerbte Feld-Offsets + virtuelle Methoden-Dispatch.
