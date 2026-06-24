@@ -50,14 +50,21 @@ run "peek32_rodata_low" 'fn main(): int64 { return peek32("ABCD") & 0xFF; }' 65
 run "StrCharAt_0"       'fn main(): int64 { return StrCharAt("Z", 0); }' 90
 run "StrCharAt_idx2"    'fn main(): int64 { return StrCharAt("ABCDEF", 2); }' 67
 
-# --- Stores: compile-only (Byte-Encoding disasm-verifiziert: 88 08 / 48 89 08) ---
+# --- peek16 Word-Read (Laufzeit, rodata) ---
+run "peek16_low"  'fn main(): int64 { return peek16("AB") & 0xFF; }' 65
+run "peek16_high" 'fn main(): int64 { return (peek16("AB") >> 8) & 0xFF; }' 66
+
+# --- Stores + memcpy: compile-only (Byte-Encoding disasm-verifiziert) ---
 compile_ok "poke8_compiles"      'var a: int64[4]; fn main(): int64 { poke8(a, 77); return 0; }'
 compile_ok "poke32_compiles"     'var a: int64[4]; fn main(): int64 { poke32(a, 1000); return 0; }'
 compile_ok "poke64_compiles"     'var a: int64[4]; fn main(): int64 { poke64(a, 999); return 0; }'
+compile_ok "poke16_compiles"     'var a: int64[4]; fn main(): int64 { poke16(a, 4660); return 0; }'
+compile_ok "memcpy_compiles"     'var a: int64[4]; fn main(): int64 { memcpy(a, "XYZ", 3); return 0; }'
 compile_ok "StrSetChar_compiles" 'var a: int64[4]; fn main(): int64 { StrSetChar(a as pchar, 0, 88); return 0; }'
 
 # --- Gehärteter Catch-all: sema-bekannter aber nicht gelowerter Builtin → harter Fehler ---
-compile_fail "hardened_catchall" 'fn main(): int64 { return peek16("AB"); }' "unbekannter Builtin"
+# (chmod hat keinen LyxOS-Syscall + ist nicht in lowerCall → muss laut scheitern)
+compile_fail "hardened_catchall" 'fn main(): int64 { return chmod("x", 0); }' "unbekannter Builtin"
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
