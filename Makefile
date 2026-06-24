@@ -131,8 +131,14 @@ test: lyxc
 	@echo "--- LYXOS pchar-Variable an PrintStr (4 tests) ---"
 	@bash tests/lyxos_pchar_var_test.sh
 	@echo "OK"
-	@echo "--- LYXOS user-Funktions-Calls (6 tests) ---"
+	@echo "--- LYXOS user-Funktions-Calls (8 tests) ---"
 	@bash tests/lyxos_call_args_test.sh
+	@echo "OK"
+	@echo "--- LYXOS Memory-Intrinsics peek/poke/StrCharAt (10 tests) ---"
+	@bash tests/lyxos_builtin_intrinsics_test.sh
+	@echo "OK"
+	@echo "--- LYXOS strength-reduction *2^k / div2^k (12 tests) ---"
+	@bash tests/lyxos_strength_reduction_test.sh
 	@echo "OK"
 	@echo "--- LX-36: Lifecycle Descriptor ---"
 	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
