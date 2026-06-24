@@ -1,5 +1,24 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.2A (Juni 2026)
+
+Minor-Release auf Basis von V1.0.1E. LyxOS-Codegen-Korrektheit: Memory-Intrinsics-Misdispatch behoben.
+
+### LyxOS-Nativ (ir_lower / emit_lyxos)
+- **peek/poke/StrCharAt/StrSetChar Misdispatch behoben (Wurzel des fb-Garblings)**: `ir_lower.lowerCall`
+  hatte einen stillen Catch-all der jeden nicht explizit gelowerten Builtin auf `IRO_CALL_BUILTIN imm=1`
+  (= **PrintStr**) abbildete. `peek8/32/64`, `poke8/32/64`, `StrCharAt`, `StrSetChar` fehlten in der
+  lowerCall-Tabelle (anders als im ELF-Pfad) → wurden `write(1,ptr,strlen)`-Syscalls statt Byte-Load/Store.
+  Symptom: lbfwin `DrawString` (liest Glyphen via peek8) + `FillWinFb` (schreibt via poke64) scribbelten
+  über den Framebuffer. Fix: acht Intrinsics mit echten CALL_BUILTIN-ids (200–207) gelowert; `emit_lyxos`
+  emittiert `movzx`/`mov`. Args in hohen argBase-Block gespillt (nicht Slots 0..2, die Caller-Locals aliasen).
+- **lowerCall-Catch-all gehärtet**: kein stiller `id=1=PrintStr`-Default mehr → harter Compile-Fehler
+  `"unbekannter Builtin/Funktion: <name>"`. Der stille Default versteckte den Bug; ~150 ELF-Builtins fehlen
+  noch in lowerCall und werden jetzt laut statt still gemeldet.
+
+Verifiziert nativ via lbf_run (peek8=90, peek64&0xFF=65, StrCharAt=90/67); Store-Encoding disasm-verifiziert.
+Neuer Test `tests/lyxos_builtin_intrinsics_test.sh` (10/10). Singularität S3==S4 erhalten; `make test` grün.
+
 ## Version 1.0.1E (Juni 2026)
 
 Patch-Release auf Basis von V1.0.1D. Drei Optimizer-Bugs im lyxos-Backend behoben.
