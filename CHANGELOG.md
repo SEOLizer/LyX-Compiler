@@ -1,5 +1,23 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.2B (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2A. LyxOS-IR-Optimizer-Korrektheit: Strength-Reduction-Shift-Bug behoben (lbfwin Bug #4).
+
+### IR-Optimizer (ir_optimize)
+- **strength-reduction `*2^k` / `/2^k` Shift-Count korrigiert**: `strengthReduction()` setzte beim
+  Umbau `MUL`→`SHL` / `DIV`→`SHR` den Shift-Count (`power`) als **rohen Integer** in `src2`
+  (`setInstrSrc2(i, power)`). IR-Backends (`emit_lyxos`) lesen `src2` als Temp-/Slot-Referenz →
+  `shl rax, cl` lud `cl` aus Slot `#power` (fremde Variable) statt dem Shift-Betrag. Symptom:
+  `x*2/4/8/16` → Garbage (oft 0), `x/4/8` → Garbage; non-pow2 (×3,×5,÷3) + expliziter `x<<2` ok.
+  lbfwin-Crash: `DrawChar buf+(y*w+x)*4` (BGRA) → wilder Shift → `#PF`. Fix: den Wert des bereits
+  von `src2` referenzierten `CONST_INT`-Temps auf `power` ändern (Helper `setConstDefValue`); die
+  `src2`-Referenz bleibt — exakt die Form die ein expliziter `x << 2` erzeugt.
+  ELF-Prod-Codegen (`codegen_x86`, AST-direkt) nutzt das IR nicht → nur IR-Backends betroffen.
+
+Verifiziert nativ via lbf_run (x*4=20, x/4=5, (y*w+x)*4=48, a*4+b*2=22).
+Neuer Test `tests/lyxos_strength_reduction_test.sh` (12/12). Singularität S3==S4 erhalten.
+
 ## Version 1.0.2A (Juni 2026)
 
 Minor-Release auf Basis von V1.0.1E. LyxOS-Codegen-Korrektheit: Memory-Intrinsics-Misdispatch behoben.
