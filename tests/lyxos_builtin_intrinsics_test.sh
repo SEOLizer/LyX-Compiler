@@ -50,6 +50,11 @@ run "peek32_rodata_low" 'fn main(): int64 { return peek32("ABCD") & 0xFF; }' 65
 run "StrCharAt_0"       'fn main(): int64 { return StrCharAt("Z", 0); }' 90
 run "StrCharAt_idx2"    'fn main(): int64 { return StrCharAt("ABCDEF", 2); }' 67
 
+# --- WP-STUB: bisher still verworfene Ops (NOT/BITNOT pure-compute, runtime-verifiziert) ---
+run "bitnot"  'fn main(): int64 { var x: int64 := 240; var y: int64 := ~x; return y & 0xFF; }' 15
+run "not_zero" 'fn main(): int64 { var x: int64 := 0; return !x; }' 1
+run "not_nonzero" 'fn main(): int64 { var x: int64 := 5; return !x; }' 0
+
 # --- peek16 Word-Read (Laufzeit, rodata) ---
 run "peek16_low"  'fn main(): int64 { return peek16("AB") & 0xFF; }' 65
 run "peek16_high" 'fn main(): int64 { return (peek16("AB") >> 8) & 0xFF; }' 66
