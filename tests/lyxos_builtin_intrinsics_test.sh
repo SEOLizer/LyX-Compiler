@@ -74,8 +74,8 @@ compile_ok "mkdir_compiles"  'fn main(): int64 { mkdir("d", 0); return 0; }'
 compile_ok "exit_compiles"   'fn main(): int64 { exit(0); return 0; }'
 
 # --- Gehärteter Catch-all: sema-bekannter aber nicht gelowerter Builtin → harter Fehler ---
-# (chmod hat keinen LyxOS-Syscall + ist nicht in lowerCall → muss laut scheitern)
-compile_fail "hardened_catchall" 'fn main(): int64 { return chmod("x", 0); }' "unbekannter Builtin"
+# (lstat hat keinen §10.4-Syscall + ist nicht in lowerCall → muss laut scheitern)
+compile_fail "hardened_catchall" 'fn main(): int64 { var b: int64 := 0; return lstat("x", b); }' "unbekannter Builtin"
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
