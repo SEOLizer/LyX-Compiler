@@ -140,6 +140,9 @@ test: lyxc
 	@echo "--- LYXOS strength-reduction *2^k / div2^k (12 tests) ---"
 	@bash tests/lyxos_strength_reduction_test.sh
 	@echo "OK"
+	@echo "--- LYXOS @capabilities → CAPS-TLV-Mapping (6 tests) ---"
+	@bash tests/lyxos_caps_tlv_test.sh
+	@echo "OK"
 	@echo "--- LX-36: Lifecycle Descriptor ---"
 	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
 	@/tmp/lyxc_lx36_test
