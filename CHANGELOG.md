@@ -1,5 +1,23 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.2G (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2F. LyxOS-OOP: geerbte Feld-Offsets + virtuelle Methoden-Dispatch.
+
+### LyxOS-Nativ (ir_lower)
+- **OOP Bug #1 — geerbte Feld-Offsets (#856)**: `_fieldOffsetIn`/`_typeSizeOf` ignorierten geerbte
+  Basis-Klassen-Felder (extends, c2). `D extends A{val}`: `new D()` alloc(0) + Offset -1 → Garbage
+  (d.val=0, self.val=1016). Fix: Basis-Felder flach voranstellen (rekursiv), wie ELF. Am Kernel
+  bestätigt: d.val=41, d.S()=42.
+- **OOP Bug #2 — virtuelle Methoden-Dispatch (#857)**: ir_lower machte nur statische Dispatch
+  (deklarierter Typ) → `a.S()` (a:A hält D) rief A.S() statt D.S(). Fix: switch-dispatch über eine
+  type-id @ Objekt-Offset 0 (Klassen mit virtueller Methode; Felder ab +8), closed-world-
+  Vergleichskette über Subklassen-Overrides. Kein Daten-VMT/Adress-Patching — nur vorhandene IR-Ops.
+
+Verifiziert: ELF-Referenz a.S()=42; Disasm new D() alloc 16; Tests intrinsics 35/35, call_args 8/8,
+wp3 5/5. Singularität S3==S4; voll-lyxc→LBF baut weiter (3.65 MB). OOP-Runtime auf echtem LyxOS-
+Kernel zu verifizieren (new→mmap nr9 ≠ Linux). ELF-Pfad unberührt (nutzt ir_lower nicht).
+
 ## Version 1.0.2F (Juni 2026)
 
 Patch-Release auf Basis von V1.0.2E. **Meilenstein: lyxc compiliert vollständig zu einem LyxOS-LBF.**
