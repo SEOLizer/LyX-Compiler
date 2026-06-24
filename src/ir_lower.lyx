@@ -936,25 +936,59 @@ pub type IRLower = class {
       var mcBaseNode: int64 := self.nodeC0(expr);
       var mcDecl:     int64 := self._baseClassDecl(mcBaseNode);
       if mcDecl >= 0 {
-        var mcMang: int64 := self._methodMangle(self.nodeSVal(mcDecl), self.nodeSLen(mcDecl),
-                                                self.nodeSVal(expr), self.nodeSLen(expr));
-        var mcLen:  int64 := self.nodeSLen(mcDecl) + 1 + self.nodeSLen(expr);
-        var mcIdx:  int64 := self._findFuncByName(mcMang as pchar, mcLen);
-        if mcIdx >= 0 {
-          var mcArgBase: int64 := self.tempCount;
-          var mcRsv: int64 := 0;
-          while mcRsv < 8 { self.allocTemp(); mcRsv := mcRsv + 1; }
-          var mcSelf: int64 := self.lowerExpr(mcBaseNode);
-          self.irAddInstrDirect(IRO_STORE_LOCAL, mcArgBase, mcSelf, -1, 0);
-          var mcCnt: int64 := 1;
-          var mcArg: int64 := self.nodeC1(expr);
-          while mcArg >= 0 {
-            var mcAT: int64 := self.lowerExpr(mcArg);
-            self.irAddInstrDirect(IRO_STORE_LOCAL, mcArgBase + mcCnt, mcAT, -1, 0);
-            mcCnt := mcCnt + 1;
-            mcArg := self.nodeNext(mcArg);
+        var mNameP: pchar := self.nodeSVal(expr);
+        var mNameL: int64 := self.nodeSLen(expr);
+        // Arg-Block: self @ argBase, dann explizite Args.
+        var mcArgBase: int64 := self.tempCount;
+        var mcRsv: int64 := 0;
+        while mcRsv < 8 { self.allocTemp(); mcRsv := mcRsv + 1; }
+        var mcSelf: int64 := self.lowerExpr(mcBaseNode);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, mcArgBase, mcSelf, -1, 0);
+        var mcCnt: int64 := 1;
+        var mcArg: int64 := self.nodeC1(expr);
+        while mcArg >= 0 {
+          var mcAT: int64 := self.lowerExpr(mcArg);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, mcArgBase + mcCnt, mcAT, -1, 0);
+          mcCnt := mcCnt + 1;
+          mcArg := self.nodeNext(mcArg);
+        }
+        if self._methodVirtual(mcDecl, mNameP, mNameL) == 0 {
+          // STATISCHE Dispatch (nicht-virtuell): nächste Definition ab mcDecl.
+          var mcIdx: int64 := self._resolveMethodIdx(mcDecl, mNameP, mNameL);
+          if mcIdx >= 0 { self.irAddInstrDirect(IRO_CALL, mcDest, mcIdx, mcArgBase, mcCnt); }
+        } else {
+          // WP-VMT-lyxos: VIRTUELLE Switch-Dispatch über type-id @ obj[0].
+          // Whole-Program/closed-world: alle Subklassen von mcDecl mit eigenem Override
+          // → Vergleichskette; Fallback = mcDecl's eigene Auflösung.
+          var tidTemp: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_LOAD_FIELD, tidTemp, mcSelf, 0, 0);   // tid = obj[0]
+          var vEnd: int64 := self.genLabel();
+          var ci: int64 := 0;
+          while ci < self.nodeCount {
+            if self.nodeKind(ci) == NK_TYPE_DECL {
+              if self._extendsClass(ci, mcDecl) != 0 {
+                if self._classOwnHasMethod(ci, mNameP, mNameL) != 0 {
+                  var subIdx: int64 := self._resolveMethodIdx(ci, mNameP, mNameL);
+                  if subIdx >= 0 {
+                    var cTid: int64 := self.allocTemp();
+                    self.irAddInstrDirect(IRO_CONST_INT, cTid, -1, -1, ci);
+                    var cmpT: int64 := self.allocTemp();
+                    self.irAddInstrDirect(IRO_CMP_EQ, cmpT, tidTemp, cTid, 0);
+                    var vNext: int64 := self.genLabel();
+                    self.irEmitBrFalse(cmpT, vNext);
+                    self.irAddInstrDirect(IRO_CALL, mcDest, subIdx, mcArgBase, mcCnt);
+                    self.irEmitJmp(vEnd);
+                    self.irEmitLabel(vNext);
+                  }
+                }
+              }
+            }
+            ci := ci + 1;
           }
-          self.irAddInstrDirect(IRO_CALL, mcDest, mcIdx, mcArgBase, mcCnt);
+          // Fallback: mcDecl's eigene Auflösung (Basis/deklarierter Typ).
+          var baseIdx: int64 := self._resolveMethodIdx(mcDecl, mNameP, mNameL);
+          if baseIdx >= 0 { self.irAddInstrDirect(IRO_CALL, mcDest, baseIdx, mcArgBase, mcCnt); }
+          self.irEmitLabel(vEnd);
         }
       }
       return mcDest;
@@ -2773,11 +2807,30 @@ pub type IRLower = class {
     return 0 - 1;
   }
 
+  // WP-VMT-lyxos: hat die Klasse (oder ein Vorfahre) eine virtuelle Methode? Dann reserviert
+  // das Objekt Offset 0 für die type-id (Felder ab +8). Methode-iVal Bits 1-3 = virtual/override/abstract.
+  fn _hasVmt(typeDecl: int64): int64 {
+    var tc: int64 := typeDecl;
+    while tc >= 0 {
+      var m: int64 := self.nodeC1(tc);
+      while m >= 0 {
+        if self.nodeKind(m) == NK_FUNC_DECL { if (self.nodeIVal(m) & 14) != 0 { return 1; } }
+        m := self.nodeNext(m);
+      }
+      var pn: int64 := self.nodeC2(tc);
+      if pn >= 0 { tc := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn)); } else { tc := 0 - 1; }
+    }
+    return 0;
+  }
+
   // ARM64-OOP: Feld-Offset für Instanz-Zugriff baseNode.fieldName (-1 falls unauflösbar).
+  // WP-VMT-lyxos: +8 wenn die Klasse eine VMT hat (type-id @ Offset 0).
   fn _instanceFieldOffset(baseNode: int64, fp: pchar, fl: int64): int64 {
     var decl: int64 := self._baseClassDecl(baseNode);
     if decl < 0 { return 0 - 1; }
-    return self._fieldOffsetIn(decl, fp, fl);
+    var off: int64 := self._fieldOffsetIn(decl, fp, fl);
+    if off >= 0 { if self._hasVmt(decl) != 0 { off := off + 8; } }
+    return off;
   }
 
   // ARM64-OOP: funcBuffer-Index für einen (mangled) Funktionsnamen (-1 falls keiner).
@@ -2812,6 +2865,66 @@ pub type IRLower = class {
     while j < mL { poke8(buf + clsL + 1 + j, peek8((mP as int64) + j)); j := j + 1; }
     poke8(buf + clsL + 1 + mL, 0);
     return buf;
+  }
+
+  // WP-VMT-lyxos: hat typeDecl SELBST (eigene c1-Chain) eine Methode namens (mNameP,mNameL)?
+  fn _classOwnHasMethod(typeDecl: int64, mNameP: pchar, mNameL: int64): int64 {
+    var m: int64 := self.nodeC1(typeDecl);
+    while m >= 0 {
+      if self.nodeKind(m) == NK_FUNC_DECL {
+        if self.seq(self.nodeSVal(m), self.nodeSLen(m), mNameP, mNameL) { return 1; }
+      }
+      m := self.nodeNext(m);
+    }
+    return 0;
+  }
+
+  // WP-VMT-lyxos: ist Methode (mNameP,mNameL) in typeDecl-oder-Vorfahr virtuell (iVal Bits 1-3)?
+  fn _methodVirtual(typeDecl: int64, mNameP: pchar, mNameL: int64): int64 {
+    var tc: int64 := typeDecl;
+    while tc >= 0 {
+      var m: int64 := self.nodeC1(tc);
+      while m >= 0 {
+        if self.nodeKind(m) == NK_FUNC_DECL {
+          if self.seq(self.nodeSVal(m), self.nodeSLen(m), mNameP, mNameL) {
+            if (self.nodeIVal(m) & 14) != 0 { return 1; }
+            return 0;   // gefunden, nicht virtuell
+          }
+        }
+        m := self.nodeNext(m);
+      }
+      var pn: int64 := self.nodeC2(tc);
+      if pn >= 0 { tc := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn)); } else { tc := 0 - 1; }
+    }
+    return 0;
+  }
+
+  // WP-VMT-lyxos: funcBuffer-Index der Methode (mNameP,mNameL), aufgelöst ab typeDecl nach oben
+  // (nächste eigene Definition; override gewinnt). -1 falls keine.
+  fn _resolveMethodIdx(typeDecl: int64, mNameP: pchar, mNameL: int64): int64 {
+    var tc: int64 := typeDecl;
+    while tc >= 0 {
+      if self._classOwnHasMethod(tc, mNameP, mNameL) != 0 {
+        var mang: int64 := self._methodMangle(self.nodeSVal(tc), self.nodeSLen(tc), mNameP, mNameL);
+        var mlen: int64 := self.nodeSLen(tc) + 1 + mNameL;
+        return self._findFuncByName(mang as pchar, mlen);
+      }
+      var pn: int64 := self.nodeC2(tc);
+      if pn >= 0 { tc := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn)); } else { tc := 0 - 1; }
+    }
+    return 0 - 1;
+  }
+
+  // WP-VMT-lyxos: erweitert Klasse `c` transitiv `ancestor` (echte Subklasse)?
+  fn _extendsClass(c: int64, ancestor: int64): int64 {
+    var pn: int64 := self.nodeC2(c);
+    while pn >= 0 {
+      var p: int64 := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn));
+      if p < 0 { return 0; }
+      if p == ancestor { return 1; }
+      pn := self.nodeC2(p);
+    }
+    return 0;
   }
 
   fn lowerField(expr: int64): int64 {
@@ -2883,17 +2996,28 @@ pub type IRLower = class {
   fn lowerNew(expr: int64): int64 {
     // ARM64-OOP: `new T()` → IRO_ALLOC(typeSize) → dest = Objekt-Pointer.
     // Typname = sVal des NK_NEW-Nodes (c0 = Konstruktor-Args, hier ignoriert).
-    // Layout: Felder ab Offset 0 (kein VMT für plain structs/methodenlose Klassen).
+    // Layout: plain structs/methodenlose Klassen Felder ab Offset 0.
+    // WP-VMT-lyxos: Klassen MIT virtueller Methode reservieren Offset 0 für die type-id
+    // (= NK_TYPE_DECL-Node-Index), Felder ab +8. new schreibt die type-id nach obj[0].
     var dest: int64 := self.allocTemp();
     var decl: int64 := self._findTypeDecl(self.nodeSVal(expr), self.nodeSLen(expr));
     var sz: int64 := 8;
+    var hasVmt: int64 := 0;
     if decl >= 0 {
       var tsz: int64 := self._typeSizeOf(decl);
       if tsz > 0 { sz := tsz; }
+      hasVmt := self._hasVmt(decl);
+      if hasVmt != 0 { sz := sz + 8; }   // type-id-Slot @ Offset 0
     }
     var szTemp: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_CONST_INT, szTemp, -1, -1, sz);
     self.irAddInstrDirect(IRO_ALLOC, dest, szTemp, -1, 0);
+    if hasVmt != 0 {
+      // type-id (= decl-Node-Index) nach obj[0] schreiben — Laufzeit-Typ für virtuelle Dispatch.
+      var tidTemp: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, tidTemp, -1, -1, decl);
+      self.irAddInstrDirect(IRO_STORE_FIELD, 0, tidTemp, dest, 0);   // STORE_FIELD(off=0, value=tid, base=obj)
+    }
     return dest;
   }
   
