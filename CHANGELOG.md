@@ -1,5 +1,19 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.2E (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2D. lyxc→LyxOS: Kat-B/C-Builtins (kein Kernel-Bedarf).
+
+### LyxOS-Nativ (ir_lower / emit_lyxos)
+- **getdents64(fd,buf,n)** → read-on-dirfd (`sys_read`=0; §10.4 liefert DirEntry-Array bei Verzeichnis-FD).
+- **clock_gettime(clk_id, ts)** → id 211: `sys_time_ns`(117) + timespec-Split (tv_sec=ns/1e9, tv_nsec=ns%1e9
+  via cqo/idiv); clk_id ignoriert.
+- **chmod/chown** → no-op return 0 (LyxOS ist capability-basiert, keine POSIX-Permission-Bits).
+
+Verifiziert: alle vier compilieren auf `--target=lyxos` (kein Catch-all). Runtime der Syscall-Adapter nicht
+via lbf_run testbar (LyxOS-Nrn ≠ Linux) → Disasm. Tests: intrinsics 22/22, caps_tlv 6/6. Singularität S3==S4
+erhalten. Nächstes Gate für lyxc-self-hosting: StrLen (transitive Import-Resolution).
+
 ## Version 1.0.2D (Juni 2026)
 
 Patch-Release auf Basis von V1.0.2C. Schwerpunkt: lyxc self-hosting auf LyxOS — Builtin-Lowering + CAPS-TLV.
