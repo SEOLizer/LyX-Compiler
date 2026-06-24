@@ -1,5 +1,25 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.2I (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2H. LyxOS-Backend: unbehandelte IR-Opcodes, Konstruktor-Args.
+
+### LyxOS-Nativ (emit_lyxos / ir_lower)
+- **Unbehandelte IR-Opcodes emittiert + Catch-all gehärtet (#863)**: emit_lyxos verwarf reachable
+  Opcodes STILL (kein Code) → stilles Falschverhalten. Jetzt emittiert: NOT(50)/BITNOT(58),
+  ASSERT_NOT_NULL/NOT_ZERO/TRUE(158-160)+BOUNDS(157)→`emitPanicExit`, PANIC(121), CALL_INDIRECT(85)→
+  `emitCallIndirect`, CALL_EXTERN(84)→dest=0 (kein lyxos-Linkage), POOL_ALLOC/FREE(115/116)→no-op.
+  STUB-00: Catch-all → INT3 (lauter Runtime-Trap) statt stillem Drop. Sicherheit: ASSERT_*-Checks
+  wirken jetzt. (Offen, nun INT3-Trap: FSQRT(155), SIMD(122-131), INSPECT(153), PROFILE(161-163).)
+- **Konstruktor-Args (#864)**: `lowerNew` allozierte Objekt + type-id, rief den Konstruktor GAR NICHT
+  → `new C(11)` ließ Felder 0 (Args ignoriert). Fix: lowerNew ruft nach alloc+type-id
+  `ClassName_Create(self, args...)` falls definiert (Konvention wie ELF #683; cross-module via
+  `_findFuncByName` → auch importierte Ctors). Behebt die TForm.Create-Kaskade (frm.Root()=null → #PF).
+
+Verifiziert: lbf_run `~240&0xFF`=15/`!0`=1/`!5`=0/ctor_0arg=5; Konstruktor-Disasm zeigt Arg + `call
+Class_Create` (ELF-Referenz=11); intrinsics 41/41, call_args 8/8, wp4 4/4, imported-dispatch 1/1;
+Singularität S3==S4; voll-lyxc→LBF baut (3.75 MB). ELF-Pfad unberührt. OOP-Runtime am echten Kernel.
+
 ## Version 1.0.2H (Juni 2026)
 
 Patch-Release auf Basis von V1.0.2G. LyxOS-Backend: Array-Store-DCE-Bug, sema-Builtins, importierte OOP-Methoden.
