@@ -89,6 +89,12 @@ compile_ok "wait4_compiles"    'fn main(): int64 { var s: int64 := 0; return sys
 # pipe/truncate sind keine sema-Builtins (lyxc nutzt sie nicht) → sema lehnt vor lowerCall ab;
 # die lowerCall/emit-Einträge (id 231/232) liegen bereit falls sie je registriert werden.
 
+# --- OOP-Vererbung: geerbtes Feld (compile-only; new→mmap nr9 nicht via lbf_run/Linux testbar,
+#     Runtime-Verifikation auf echtem LyxOS-Kernel). Fix: _fieldOffsetIn/_typeSizeOf basis-rekursiv. ---
+compile_ok "oop_inherited_field" 'type A = class { val: int64; virtual fn S(): int64 { return 0; } };
+type D = class extends A { override fn S(): int64 { return self.val + 1; } fn C(v: int64) { self.val := v; } };
+fn main(): int64 { var d: D := new D(); d.C(41); return d.val; }'
+
 # (EPrintFloat ist sema-bekannt aber nicht für lyxos gelowert → muss laut scheitern)
 compile_fail "hardened_catchall" 'fn main(): int64 { EPrintFloat(1.0); return 0; }' "unbekannter Builtin"
 
