@@ -1,5 +1,29 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.2F (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2E. **Meilenstein: lyxc compiliert vollständig zu einem LyxOS-LBF.**
+`lyxc --target=lyxos src/lyxc.lyx` erzeugt ein vollständiges natives LBF (~3.6 MB, Magic LYX!) ohne
+unaufgelöste Builtins.
+
+### LyxOS-Nativ (ir_lower / emit_lyxos)
+- **Transitiver Import-Funktions-Pre-Pass**: globaler Pre-Pass in `lowerModule` registriert alle
+  (transitiv) importierten Top-Level-Funktionen im funcBuffer vor dem Body-Lowering. Behebt
+  „unbekannter Builtin: StrLen" (lyxc importiert std.string nur transitiv). Iterative Work-Queue
+  mit Pfad-Dedup, keine neue IRLower-Methode (Seed-vtable-Schutz). funcId bleibt namensbasiert
+  konsistent.
+- **0x0200-VFS-Block** (kernel-adoptiert, Commit 6e02a6f): `lseek`(0x0204), `stat`/`lstat`(0x0205
+  ±NOFOLLOW), `symlink`(0x0213), `rmdir`(0x0208+UNLINK_DIR), `nanosleep`(0x000A sleep_ns,
+  timespec→ns). dir_fd(AT_CWD=-1)/flags via CONST_INT-Injektion in den argBase-Block.
+- **Intrinsics/Diagnostik**: `EPrintInt`→stderr (`emitPrintIntFd`), `ArgvGet` (lea+deref),
+  `getdents64`→read-on-dirfd, `clock_gettime`→sys_time_ns+timespec-Split, `chmod`/`chown`→no-op.
+- **Gruppe D** `sys_fork`/`sys_execve`/`sys_wait4` → return -1 (LyxOS hat kein fork/exec/wait-
+  Prozessmodell, nur sys_spawn_child; einzige Nutzer self_test/lbf_loader laufen nicht auf LyxOS).
+
+Verifiziert: voll-lyxc→LBF baut blockerfrei (lbfdump 1.1: arch=x86-64); funcId-Konsistenz
+lyxos_call_args 8/8; intrinsics 33/33, strength 12/12, caps_tlv 6/6, wp3 5/5. Singularität S3==S4.
+Offen (Runtime, kein Compile-Blocker): on-device-Test durch Kernel-Team (LyxOS-Syscall-Nrn ≠ Linux).
+
 ## Version 1.0.2E (Juni 2026)
 
 Patch-Release auf Basis von V1.0.2D. lyxc→LyxOS: Kat-B/C-Builtins (kein Kernel-Bedarf).
