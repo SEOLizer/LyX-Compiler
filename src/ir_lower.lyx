@@ -264,6 +264,7 @@ pub type IRLower = class {
   genFuncBuf:   int64;
   genFuncCount: int64;
   genFuncCap:   int64;
+  _importsDone: int64;  // StrLen-fix: globaler transitiver Import-Func-Pre-Pass nur 1× (top-level)
   // Queue of pending specializations to emit after the main lowering loop
   // Records: {mangledPtr:8, mangledLen:8, genFuncNodeIdx:8, emitted:8} = 32 bytes each
   pendingGenBuf:   int64;
@@ -315,6 +316,7 @@ pub type IRLower = class {
     self.genFuncCap   := 16;
     self.genFuncBuf   := alloc(16 * 24);
     self.genFuncCount := 0;
+    self._importsDone := 0;
     self.pendingGenCap   := 16;
     self.pendingGenBuf   := alloc(16 * 32);
     self.pendingGenCount := 0;
@@ -3786,6 +3788,104 @@ pub type IRLower = class {
         self.genFuncCount := self.genFuncCount + 1;
       }
       pfCur := self.nodeNext(pfCur);
+    }
+
+    // StrLen-fix: globaler TRANSITIVER Import-Funktions-Pre-Pass (nur top-level lowerModule).
+    // Registriert ALLE (transitiv) importierten Top-Level-Funktionen im funcBuffer BEVOR
+    // irgendein Body gelowert wird. Sonst scheitert ein Modul-Body, der eine Funktion aus
+    // einem in Quelltext-Reihenfolge noch nicht verarbeiteten Import nutzt (z.B.
+    // error_collector → StrLen aus std.string; lyxc importiert std.string nur transitiv).
+    // Iterativ (Work-Queue, KEINE neue IRLower-Methode — Seed-vtable-Schutz, vgl. v3-Kommentar)
+    // mit Pfad-Dedup gegen Mehrfach-Parse bei Diamond-Imports.
+    if self._importsDone == 0 {
+      self._importsDone := 1;
+      var WLCAP: int64 := 4096;
+      var wlSrc:   int64 := alloc(WLCAP * 8);
+      var wlNodes: int64 := alloc(WLCAP * 8);
+      var wlCnt:   int64 := alloc(WLCAP * 8);
+      var wlHead:  int64 := alloc(WLCAP * 8);
+      var wlW: int64 := 0; var wlR: int64 := 0;
+      // Visited-Pfade (Dedup): Bytes + (off,len)-Paare.
+      var visBuf:  int64 := alloc(256 * 1024);
+      var visPair: int64 := alloc(WLCAP * 16);
+      var visN: int64 := 0; var visUsed: int64 := 0;
+      // Seed = aktuelles (top) Modul.
+      poke64(wlSrc, self.src as int64); poke64(wlNodes, self.nodes);
+      poke64(wlCnt, self.nodeCount);    poke64(wlHead, decls);
+      wlW := 1;
+      while wlR < wlW {
+        var mSrc:   int64 := peek64(wlSrc + wlR * 8);
+        var mNodes: int64 := peek64(wlNodes + wlR * 8);
+        var mCnt:   int64 := peek64(wlCnt + wlR * 8);
+        var mHead:  int64 := peek64(wlHead + wlR * 8);
+        wlR := wlR + 1;
+        var svSrc: pchar := self.src; var svNodes: int64 := self.nodes; var svCnt: int64 := self.nodeCount;
+        self.src := mSrc as pchar; self.nodes := mNodes; self.nodeCount := mCnt;
+        var dc: int64 := mHead;
+        while dc >= 0 {
+          if self.nodeKind(dc) == NK_IMPORT {
+            var nmP: pchar := self.nodeSVal(dc); var nmL: int64 := self.nodeSLen(dc);
+            // Pfad "a.b.c" -> "a/b/c.lyx"
+            var pb: int64 := alloc(nmL + 8); var pi: int64 := 0;
+            while pi < nmL {
+              var ch: int64 := peek8((nmP as int64) + pi);
+              if ch == 46 { ch := 47; }
+              poke8(pb + pi, ch); pi := pi + 1;
+            }
+            var dotLyx: pchar := ".lyx";
+            memcpy(pb + nmL, dotLyx as int64, 5);
+            // Dedup gegen visited (Modul-Name nmL Bytes).
+            var seen: int64 := 0; var vi: int64 := 0;
+            while vi < visN {
+              if peek64(visPair + vi * 16 + 8) == nmL {
+                var vo: int64 := peek64(visPair + vi * 16); var bm: int64 := 1; var bi: int64 := 0;
+                while bi < nmL { if peek8(visBuf + vo + bi) != peek8(pb + bi) { bm := 0; bi := nmL; } bi := bi + 1; }
+                if bm != 0 { seen := 1; vi := visN; }
+              }
+              vi := vi + 1;
+            }
+            if seen == 0 {
+              // visited eintragen
+              var ci: int64 := 0;
+              while ci < nmL { poke8(visBuf + visUsed + ci, peek8(pb + ci)); ci := ci + 1; }
+              poke64(visPair + visN * 16, visUsed); poke64(visPair + visN * 16 + 8, nmL);
+              visN := visN + 1; visUsed := visUsed + nmL;
+              var isrc: pchar := FileReadAll(pb as pchar);
+              if (isrc as int64) != 0 {
+                var ip: Parser := new Parser();
+                ip.Init(isrc, StrLen(isrc));
+                var ih: int64 := ip.Parse();
+                if ip.hadError == 0 {
+                  // Top-Level-Funktionen dieses Imports registrieren (src=ip.src).
+                  var rsv: pchar := self.src; var rnd: int64 := self.nodes; var rcn: int64 := self.nodeCount;
+                  self.src := ip.src; self.nodes := ip.nodes; self.nodeCount := ip.nodeCount;
+                  var fd2: int64 := ih;
+                  while fd2 >= 0 {
+                    if self.nodeKind(fd2) == NK_FUNC_DECL {
+                      var ext2: int64 := 0;
+                      if self.nodeC2(fd2) == -1 && self.nodeC3(fd2) != -1 { ext2 := 1; }
+                      if ext2 == 0 {
+                        var noff: int64 := self.irAddString(self.nodeSVal(fd2), self.nodeSLen(fd2));
+                        self.irAddFunc(noff, self.nodeSLen(fd2), 0, 0);
+                      }
+                    }
+                    fd2 := self.nodeNext(fd2);
+                  }
+                  self.src := rsv; self.nodes := rnd; self.nodeCount := rcn;
+                  // Transitiv enqueuen.
+                  if wlW < WLCAP {
+                    poke64(wlSrc + wlW * 8, ip.src as int64); poke64(wlNodes + wlW * 8, ip.nodes);
+                    poke64(wlCnt + wlW * 8, ip.nodeCount);    poke64(wlHead + wlW * 8, ih);
+                    wlW := wlW + 1;
+                  }
+                }
+              }
+            }
+          }
+          dc := self.nodeNext(dc);
+        }
+        self.src := svSrc; self.nodes := svNodes; self.nodeCount := svCnt;
+      }
     }
 
     var cur: int64 := decls;
