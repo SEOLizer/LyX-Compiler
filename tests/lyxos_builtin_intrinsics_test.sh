@@ -80,6 +80,12 @@ compile_ok "stat_compiles"     'fn main(): int64 { var s: int64 := 0; return sta
 compile_ok "lstat_compiles"    'fn main(): int64 { var s: int64 := 0; return lstat("f", s); }'
 compile_ok "symlink_compiles"  'fn main(): int64 { return symlink("a", "b"); }'
 compile_ok "nanosleep_compiles" 'fn main(): int64 { var ts: int64 := 0; return nanosleep(ts, 0); }'
+compile_ok "rmdir_compiles"    'fn main(): int64 { return rmdir("d"); }'
+compile_ok "eprintint_compiles" 'fn main(): int64 { EPrintInt(42); return 0; }'
+compile_ok "argvget_compiles"  'fn main(): int64 { var av: int64 := 0; var p: pchar := ArgvGet(av, 0); return 0; }'
+compile_ok "fork_compiles"     'fn main(): int64 { return sys_fork(); }'
+compile_ok "execve_compiles"   'fn main(): int64 { return sys_execve("x", 0, 0); }'
+compile_ok "wait4_compiles"    'fn main(): int64 { var s: int64 := 0; return sys_wait4(1, s, 0); }'
 # pipe/truncate sind keine sema-Builtins (lyxc nutzt sie nicht) → sema lehnt vor lowerCall ab;
 # die lowerCall/emit-Einträge (id 231/232) liegen bereit falls sie je registriert werden.
 
