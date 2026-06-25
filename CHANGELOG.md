@@ -1,5 +1,284 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.2I (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2H. LyxOS-Backend: unbehandelte IR-Opcodes, Konstruktor-Args.
+
+### LyxOS-Nativ (emit_lyxos / ir_lower)
+- **Unbehandelte IR-Opcodes emittiert + Catch-all gehärtet (#863)**: emit_lyxos verwarf reachable
+  Opcodes STILL (kein Code) → stilles Falschverhalten. Jetzt emittiert: NOT(50)/BITNOT(58),
+  ASSERT_NOT_NULL/NOT_ZERO/TRUE(158-160)+BOUNDS(157)→`emitPanicExit`, PANIC(121), CALL_INDIRECT(85)→
+  `emitCallIndirect`, CALL_EXTERN(84)→dest=0 (kein lyxos-Linkage), POOL_ALLOC/FREE(115/116)→no-op.
+  STUB-00: Catch-all → INT3 (lauter Runtime-Trap) statt stillem Drop. Sicherheit: ASSERT_*-Checks
+  wirken jetzt. (Offen, nun INT3-Trap: FSQRT(155), SIMD(122-131), INSPECT(153), PROFILE(161-163).)
+- **Konstruktor-Args (#864)**: `lowerNew` allozierte Objekt + type-id, rief den Konstruktor GAR NICHT
+  → `new C(11)` ließ Felder 0 (Args ignoriert). Fix: lowerNew ruft nach alloc+type-id
+  `ClassName_Create(self, args...)` falls definiert (Konvention wie ELF #683; cross-module via
+  `_findFuncByName` → auch importierte Ctors). Behebt die TForm.Create-Kaskade (frm.Root()=null → #PF).
+
+Verifiziert: lbf_run `~240&0xFF`=15/`!0`=1/`!5`=0/ctor_0arg=5; Konstruktor-Disasm zeigt Arg + `call
+Class_Create` (ELF-Referenz=11); intrinsics 41/41, call_args 8/8, wp4 4/4, imported-dispatch 1/1;
+Singularität S3==S4; voll-lyxc→LBF baut (3.75 MB). ELF-Pfad unberührt. OOP-Runtime am echten Kernel.
+
+## Version 1.0.2H (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2G. LyxOS-Backend: Array-Store-DCE-Bug, sema-Builtins, importierte OOP-Methoden.
+
+### LyxOS-Nativ (ir_optimize / ir_lower / sema)
+- **STORE_IDX DCE-Bug (#859)**: `IRO_STORE_IDX` fehlte in `ir_optimize.hasSideEffect` → DCE eliminierte
+  ALLE Array-Element-Stores (`a[i] := v`) auf dem lyxos-IR-Pfad (dest=idx-temp galt als tot → NOP).
+  Fix: STORE_IDX in hasSideEffect. wp4_fields jetzt 4/4.
+- **pipe/truncate sema-Registrierung (#859)**: `_regBuiltin("pipe"/"truncate")` — die lowerCall/emit-
+  Einträge (id 231/232) lagen bereit, waren aber unerreichbar.
+- **Methoden-Dispatch importierter Klassen (#861)**: eine Methode einer importierten Klasse (z.B.
+  TForm.Run aus vui) kehrte sofort zurück statt zu laufen — (a) `_findTypeDecl` scannte nur das aktuelle
+  Modul → unauflösbar am Call-Site → kein Dispatch; (b) der transitive Import-Pre-Pass registrierte
+  Methoden importierter Klassen nicht. Fix: `_baseTypeNode` liefert den Klassennamen auch ohne lokales
+  decl (statische Mangle `Class_method`, cross-module); Pre-Pass registriert importierte Methoden mangled.
+
+Verifiziert: wp4 4/4, intrinsics 37/37, call_args 8/8, neuer importierte-Klassen-Dispatch-Test;
+importierte Methode loopt korrekt (lbf_run exit 124, vorher 2). Singularität S3==S4; voll-lyxc→LBF
+baut (3.74 MB). ELF-Pfad unberührt (nutzt ir_optimize/ir_lower nicht). OOP-Runtime am echten Kernel.
+
+## Version 1.0.2G (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2F. LyxOS-OOP: geerbte Feld-Offsets + virtuelle Methoden-Dispatch.
+
+### LyxOS-Nativ (ir_lower)
+- **OOP Bug #1 — geerbte Feld-Offsets (#856)**: `_fieldOffsetIn`/`_typeSizeOf` ignorierten geerbte
+  Basis-Klassen-Felder (extends, c2). `D extends A{val}`: `new D()` alloc(0) + Offset -1 → Garbage
+  (d.val=0, self.val=1016). Fix: Basis-Felder flach voranstellen (rekursiv), wie ELF. Am Kernel
+  bestätigt: d.val=41, d.S()=42.
+- **OOP Bug #2 — virtuelle Methoden-Dispatch (#857)**: ir_lower machte nur statische Dispatch
+  (deklarierter Typ) → `a.S()` (a:A hält D) rief A.S() statt D.S(). Fix: switch-dispatch über eine
+  type-id @ Objekt-Offset 0 (Klassen mit virtueller Methode; Felder ab +8), closed-world-
+  Vergleichskette über Subklassen-Overrides. Kein Daten-VMT/Adress-Patching — nur vorhandene IR-Ops.
+
+Verifiziert: ELF-Referenz a.S()=42; Disasm new D() alloc 16; Tests intrinsics 35/35, call_args 8/8,
+wp3 5/5. Singularität S3==S4; voll-lyxc→LBF baut weiter (3.65 MB). OOP-Runtime auf echtem LyxOS-
+Kernel zu verifizieren (new→mmap nr9 ≠ Linux). ELF-Pfad unberührt (nutzt ir_lower nicht).
+
+## Version 1.0.2F (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2E. **Meilenstein: lyxc compiliert vollständig zu einem LyxOS-LBF.**
+`lyxc --target=lyxos src/lyxc.lyx` erzeugt ein vollständiges natives LBF (~3.6 MB, Magic LYX!) ohne
+unaufgelöste Builtins.
+
+### LyxOS-Nativ (ir_lower / emit_lyxos)
+- **Transitiver Import-Funktions-Pre-Pass**: globaler Pre-Pass in `lowerModule` registriert alle
+  (transitiv) importierten Top-Level-Funktionen im funcBuffer vor dem Body-Lowering. Behebt
+  „unbekannter Builtin: StrLen" (lyxc importiert std.string nur transitiv). Iterative Work-Queue
+  mit Pfad-Dedup, keine neue IRLower-Methode (Seed-vtable-Schutz). funcId bleibt namensbasiert
+  konsistent.
+- **0x0200-VFS-Block** (kernel-adoptiert, Commit 6e02a6f): `lseek`(0x0204), `stat`/`lstat`(0x0205
+  ±NOFOLLOW), `symlink`(0x0213), `rmdir`(0x0208+UNLINK_DIR), `nanosleep`(0x000A sleep_ns,
+  timespec→ns). dir_fd(AT_CWD=-1)/flags via CONST_INT-Injektion in den argBase-Block.
+- **Intrinsics/Diagnostik**: `EPrintInt`→stderr (`emitPrintIntFd`), `ArgvGet` (lea+deref),
+  `getdents64`→read-on-dirfd, `clock_gettime`→sys_time_ns+timespec-Split, `chmod`/`chown`→no-op.
+- **Gruppe D** `sys_fork`/`sys_execve`/`sys_wait4` → return -1 (LyxOS hat kein fork/exec/wait-
+  Prozessmodell, nur sys_spawn_child; einzige Nutzer self_test/lbf_loader laufen nicht auf LyxOS).
+
+Verifiziert: voll-lyxc→LBF baut blockerfrei (lbfdump 1.1: arch=x86-64); funcId-Konsistenz
+lyxos_call_args 8/8; intrinsics 33/33, strength 12/12, caps_tlv 6/6, wp3 5/5. Singularität S3==S4.
+Offen (Runtime, kein Compile-Blocker): on-device-Test durch Kernel-Team (LyxOS-Syscall-Nrn ≠ Linux).
+
+## Version 1.0.2E (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2D. lyxc→LyxOS: Kat-B/C-Builtins (kein Kernel-Bedarf).
+
+### LyxOS-Nativ (ir_lower / emit_lyxos)
+- **getdents64(fd,buf,n)** → read-on-dirfd (`sys_read`=0; §10.4 liefert DirEntry-Array bei Verzeichnis-FD).
+- **clock_gettime(clk_id, ts)** → id 211: `sys_time_ns`(117) + timespec-Split (tv_sec=ns/1e9, tv_nsec=ns%1e9
+  via cqo/idiv); clk_id ignoriert.
+- **chmod/chown** → no-op return 0 (LyxOS ist capability-basiert, keine POSIX-Permission-Bits).
+
+Verifiziert: alle vier compilieren auf `--target=lyxos` (kein Catch-all). Runtime der Syscall-Adapter nicht
+via lbf_run testbar (LyxOS-Nrn ≠ Linux) → Disasm. Tests: intrinsics 22/22, caps_tlv 6/6. Singularität S3==S4
+erhalten. Nächstes Gate für lyxc-self-hosting: StrLen (transitive Import-Resolution).
+
+## Version 1.0.2D (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2C. Schwerpunkt: lyxc self-hosting auf LyxOS — Builtin-Lowering + CAPS-TLV.
+
+### LyxOS-Nativ (ir_lower / emit_lyxos / writer)
+- **Gruppe C — Memory-Intrinsics** (ids 200–210): `peek16`/`poke16`/`memcpy` gelowert (argBase-Konvention,
+  `movzx`/`mov`/`rep movsb`).
+- **Gruppe A — POSIX-File-Builtins** (ids 220–227): `open`/`close`/`read`/`write`/`rename`/`unlink`/`mkdir`/`exit`
+  → flache §10.4-Syscalls (kein dir_fd — implementierter Kernel ist flach). Neuer `emitVfsSyscallAB` mit
+  argBase statt fester Slots (vermeidet Caller-Local-Aliasing).
+- **sizeof(Type)** compile-time fold in lowerCall (via `_findTypeDecl`+`_typeSizeOf`) — entblockt std.string.
+- **@capabilities → LBF CAPS-TLV-Mapping**: `writer.lyx` schrieb CAPS-TLV hart als 0 → @capabilities
+  wirkungslos, Kernel-Pledge-Gate erlaubte nur STDIO. Jetzt scannt lyxc `NK_CAPABILITY_DECL`, mappt
+  Pfad→`LBF_CAP_*`-Bit (fs.read=1/fs.write=2/network=4/process=8/ki.graph=32/ki.embed=16/audio=128),
+  OR-Union → `writer.setCapabilities`. CAPS-TLV trägt nun die echten FS-Caps.
+
+Verifiziert: CAPS-TLV [fs.read,fs.write]=3; Syscall-Nrn + Intrinsics disasm-/lbf_run-verifiziert.
+Neue Tests: `lyxos_builtin_intrinsics` (22), `lyxos_strength_reduction` (12), `lyxos_caps_tlv` (6) — alle
+in `make test`. Singularität S3==S4 erhalten.
+
+## Version 1.0.2C (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2B. Verifizierter Kombi-Build (peek/poke + strength-reduction) und CI-Härtung.
+
+### CI / Test-Infrastruktur
+- **`make test` ruft die neuen LyxOS-Regressionssuites auf**: `tests/lyxos_builtin_intrinsics_test.sh`
+  (peek/poke/StrCharAt, 10 Tests) und `tests/lyxos_strength_reduction_test.sh` (`*2^k`/`÷2^k`, 12 Tests)
+  liefen bisher nicht im `test`-Target. Genau diese Lücke ließ eine gemeldete „peek/poke-Regression"
+  in einer stale Zwischen-Binary (ohne den V1.0.2A-ir_lower-Fix) unbemerkt — die develop-Quelle war
+  immer korrekt. Beide Suites jetzt im `test`-Target: ein Build kann keinen der beiden LyxOS-Codegen-Fixes
+  mehr verlieren, ohne dass `make test` rot wird.
+
+### Verifikation (develop-HEAD, frischer Build)
+- peek8("Z")=90, peek8(var s)=90 (Disasm `movzx`, kein PrintStr-Fehldispatch).
+- x*4=20, (y*w+x)*4=48 (strength-reduction korrekt).
+- Beide Regressionssuites grün (10/10, 12/12); Singularität S3==S4 erhalten.
+
+## Version 1.0.2B (Juni 2026)
+
+Patch-Release auf Basis von V1.0.2A. LyxOS-IR-Optimizer-Korrektheit: Strength-Reduction-Shift-Bug behoben (lbfwin Bug #4).
+
+### IR-Optimizer (ir_optimize)
+- **strength-reduction `*2^k` / `/2^k` Shift-Count korrigiert**: `strengthReduction()` setzte beim
+  Umbau `MUL`→`SHL` / `DIV`→`SHR` den Shift-Count (`power`) als **rohen Integer** in `src2`
+  (`setInstrSrc2(i, power)`). IR-Backends (`emit_lyxos`) lesen `src2` als Temp-/Slot-Referenz →
+  `shl rax, cl` lud `cl` aus Slot `#power` (fremde Variable) statt dem Shift-Betrag. Symptom:
+  `x*2/4/8/16` → Garbage (oft 0), `x/4/8` → Garbage; non-pow2 (×3,×5,÷3) + expliziter `x<<2` ok.
+  lbfwin-Crash: `DrawChar buf+(y*w+x)*4` (BGRA) → wilder Shift → `#PF`. Fix: den Wert des bereits
+  von `src2` referenzierten `CONST_INT`-Temps auf `power` ändern (Helper `setConstDefValue`); die
+  `src2`-Referenz bleibt — exakt die Form die ein expliziter `x << 2` erzeugt.
+  ELF-Prod-Codegen (`codegen_x86`, AST-direkt) nutzt das IR nicht → nur IR-Backends betroffen.
+
+Verifiziert nativ via lbf_run (x*4=20, x/4=5, (y*w+x)*4=48, a*4+b*2=22).
+Neuer Test `tests/lyxos_strength_reduction_test.sh` (12/12). Singularität S3==S4 erhalten.
+
+## Version 1.0.2A (Juni 2026)
+
+Minor-Release auf Basis von V1.0.1E. LyxOS-Codegen-Korrektheit: Memory-Intrinsics-Misdispatch behoben.
+
+### LyxOS-Nativ (ir_lower / emit_lyxos)
+- **peek/poke/StrCharAt/StrSetChar Misdispatch behoben (Wurzel des fb-Garblings)**: `ir_lower.lowerCall`
+  hatte einen stillen Catch-all der jeden nicht explizit gelowerten Builtin auf `IRO_CALL_BUILTIN imm=1`
+  (= **PrintStr**) abbildete. `peek8/32/64`, `poke8/32/64`, `StrCharAt`, `StrSetChar` fehlten in der
+  lowerCall-Tabelle (anders als im ELF-Pfad) → wurden `write(1,ptr,strlen)`-Syscalls statt Byte-Load/Store.
+  Symptom: lbfwin `DrawString` (liest Glyphen via peek8) + `FillWinFb` (schreibt via poke64) scribbelten
+  über den Framebuffer. Fix: acht Intrinsics mit echten CALL_BUILTIN-ids (200–207) gelowert; `emit_lyxos`
+  emittiert `movzx`/`mov`. Args in hohen argBase-Block gespillt (nicht Slots 0..2, die Caller-Locals aliasen).
+- **lowerCall-Catch-all gehärtet**: kein stiller `id=1=PrintStr`-Default mehr → harter Compile-Fehler
+  `"unbekannter Builtin/Funktion: <name>"`. Der stille Default versteckte den Bug; ~150 ELF-Builtins fehlen
+  noch in lowerCall und werden jetzt laut statt still gemeldet.
+
+Verifiziert nativ via lbf_run (peek8=90, peek64&0xFF=65, StrCharAt=90/67); Store-Encoding disasm-verifiziert.
+Neuer Test `tests/lyxos_builtin_intrinsics_test.sh` (10/10). Singularität S3==S4 erhalten; `make test` grün.
+
+## Version 1.0.1E (Juni 2026)
+
+Patch-Release auf Basis von V1.0.1D. Drei Optimizer-Bugs im lyxos-Backend behoben.
+
+### IR-Optimizer (ir_optimize)
+- **getInstrCount-Division**: `instrLen / IR_INSTR_SIZE` (93/80=1) ließ DCE nur eine Instruktion
+  sehen → LOAD_LOCAL für Param `a` wurde genoppt → Param `a` immer 0. Behoben via `fnEnd - fnStart`.
+- **Cross-Function-Register-Kollision**: Alle Optimizer-Passes scannten den gesamten Instruktions-
+  puffer über Funktionsgrenzen hinweg. IR-Register-Nummern starten pro Funktion neu bei 0 →
+  `isConstInt(reg)` / `getConstValue()` fanden Konstanten aus einer *anderen* Funktion und falteten
+  lebendige Arithmetik falsch (z. B. `f(1,2,3,4,5)` → 7 statt 15). Fix: `fnStart`/`fnEnd`-Felder
+  gesetzt pro Funktion in `optimize()`; alle Scan-Loops auf `[fnStart, fnEnd)` eingeschränkt.
+- **DCE eliminiert Rückgabe-Register**: `LOAD_LOCAL(dest=0, src1=retValTemp)` — die letzte
+  Instruktion die rax vor dem Epilog lädt — wurde von DCE geNOPpt wenn kein anderer Befehl
+  Register 0 als Quelle hatte. Das NOP wurde zu `CONST_INT(imm=0)` → rax=0.
+  Fix: DCE-Guard `dest > 0` (Register 0 = lyxos-Rückgabe-Register, nie tot).
+
+Wurzel-Symptom: `add5(10,20,30,40,50)` via globaler Variable lieferte 140 statt 150.
+Zwei Regressionstests in `tests/lyxos_call_args_test.sh` ergänzt (8/8 grün).
+
+## Version 1.0.1D (Juni 2026)
+
+Patch-Release auf Basis von V1.0.1C. Zwei LyxOS-Codegen-Bugs an der Wurzel behoben.
+
+### LyxOS-Nativ (emit_lyxos / ir_lower)
+- **pchar-Variable an PrintStr — echte Wurzel**: `lowerExpr` für `NK_LIT_STR` nutzte
+  `nodeIVal` (Parser-Offset) statt des IR-strBuf-Offsets → der Pointer zeigte in die
+  Symbol-/Namen-Tabelle ("main"/"gv") statt auf das rodata-Literal. Jetzt via `irAddString`
+  interniert (null-terminiert, Escapes verarbeitet). Betrifft alle String-Literale auf
+  IR-Backends.
+- **user-Funktions-Calls implementiert**: `emit_lyxos.emitCall` war ein Stub (`CALL rel32=0`,
+  keine Args/Result) → alle user-fn-Calls kaputt (`g := f(...)` → 0). Jetzt: Args via
+  System-V-Register (rdi,rsi,rdx,rcx,r8,r9), CALL-rel32-Patch auf Funktions-Offset,
+  Result rax→dest, Callee-Param-Spill Register→Slots.
+
+Verifiziert nativ via lbf_run (call→global=42, 5-arg=15, nested=16, pchar x[0]='H').
+Singularität S3==S4 erhalten; `make test` grün.
+
+## Version 1.0.1C (Juni 2026)
+
+Patch-Release auf Basis von V1.0.1B. LyxOS-Nativ-Backend kernel-tauglich (Multi-Section)
+und pchar-Fix; Repo-Hygiene.
+
+### LyxOS-Nativ (emit_lyxos / writer / loader)
+- **LYXOS-WP-5 — Multi-Section-Metadaten** nach Kernel-Kontrakt (LX-34): natives `LYX!`
+  trägt bis zu 3 SECTION_MAP-TLVs (TEXT/RODATA/DATA + prot) + Genesis text/rodata/data_blocks.
+  Image bleibt contiguous-4032 @ VA 0x400000 (RIP-Offsets unverändert, uniform RW, per-Sektion-
+  prot kernelseitig deferred). entry_point = volle VA; kein Lifecycle-Handler-Table.
+  Loader lädt das ganze Image über die Dateigröße (robust gegen Block-Range-Überlappung).
+- **pchar-Variable an PrintStr behoben**: `var x: pchar := "..."; PrintStr(x)` lieferte einen
+  falschen rodata-Pointer (null-flood). ir_lower hat jetzt einen PrintStr(non-literal)-Pfad
+  (slot0=ptr, slot1=-1 Sentinel); emitPrintStr berechnet strlen zur Laufzeit bei len<0.
+
+### Repo-Hygiene
+- Fehlende LBF-Quelldateien (`src/tools/lbf/genesis.lyx`, `tlv.lyx`) + referenzierte Tests
+  ins Repo aufgenommen — frischer Checkout baut sonst nicht (`undefined function 'tlv_append'`).
+
+Singularität S3==S4 erhalten; `make test` grün.
+
+## Version 1.0.1B (Juni 2026)
+
+Patch-Release auf Basis von V1.0.1A. Schwerpunkt: nativer LyxOS-Backend (emit_lyxos)
+von einem ~10-Op-Skelett zu echtem Codegen ausgebaut (LYXOS-WP-0..4).
+
+### LyxOS-Nativ-Backend (emit_lyxos)
+- **WP-1 Arithmetik/Vergleiche**: ADD/SUB/MUL/DIV/MOD, AND/OR/XOR/BITAND/BITOR/BITXOR,
+  SHL/SHR, CMP_EQ/NEQ/LT/LE/GT/GE, NEG (x86-64, rax/rcx, CMP+SETcc+MOVZX).
+- **WP-2 Control-Flow**: JMP/BR_TRUE/BR_FALSE/LABEL mit dynamischer Label-Tabelle +
+  rel32-Patching. Fix: Label-Id steht in IMMINT, nicht LABELOFF.
+- **WP-3 Globals**: LOAD/STORE_GLOBAL + LOAD_GLOBAL_ADDR über RIP-relativen Daten-Pool
+  (Init-Werte aus IR globalBuffer).
+- **WP-4 Fields/Index**: LOAD/STORE_FIELD (+HEAP), LOAD/STORE_IDX für structs/arrays.
+- Verifikation: lyxos sys_exit==Linux 60 → compute-only LYX! via lbf_run nativ ausgeführt;
+  Heap-Pfade Disasm-verifiziert. Tests in `make test` (lyxos_wp1..4).
+- LX-30: nativer `--target=lyxos` LYX!-Emit dokumentiert/getestet; lyxc self-compiliert
+  zu validem nativem lyxos-LYX!.
+
+### Offen
+- LYXOS-WP-5 (Multi-Section W^X, entry_point-Konvention, Lifecycle-Events) — wartet auf
+  Kernel-Loader-Kontrakt-Abstimmung (Spec §11b).
+
+Singularität S3==S4 erhalten; `make test` grün.
+
+## Version 1.0.1A (Juni 2026)
+
+Patch-Release auf Basis von V1.0.0A. Schwerpunkt: Sicherheits-Härtung, Korrektheit
+und Erweiterung der Backend-/Nativ-Unterstützung.
+
+### Security (Audit-Verifikationspass)
+- FFI-Sandbox **fail-closed**: unbekannte Externs erfordern `@cap(...)`; PROCESS-Klasse
+  + no-link-Pfad gehärtet (`FFI_CLASS_UNKNOWN`, TCB-Modell std.*/src.*).
+- `calloc()` Integer-Overflow-Guard; alle `read()`-Pfade (inkl. `cg_readFile`) OOB-gehärtet.
+- DNS-rdata-Doku-Hazard (64- vs 128-Byte-Puffer) behoben; TLS-Hostname-Verifikation
+  per CI verankert. RandInt64 silent-0 → `exit(1)`.
+- Jeder Fix mit CI-Regressionstest (sec_*-Suite).
+
+### Korrektheit
+- `--std-path=` Off-by-one (lieferte `=PATH`) behoben.
+- Makefile-Paketversion synchronisiert.
+
+### Backend / Nativ
+- **ARM64-Backend wiederbelebt**: con-Namens-Kollision (Target-Routing), `_start`→main,
+  lokales/nested Assignment, PrintInt, Arrays, Globals, plain structs + statische Methoden
+  (qemu-verifiziert). x86 unverändert.
+- **Nativer LYX!-Loader/Runtime** (`lbf_run`): LYX!-Datei laden + in-process ausführen
+  (mmap RWX + Sprung). `_indirect_call_0/_1` im x86-Codegen.
+
+Singularität S3==S4 erhalten; `make test` grün.
+
 ## Version 1.0.0A (Juni 2026)
 
 Erste Alpha-Version (V1.0.0A) — vollständiger Sprachkern, self-hosting (Singularität),

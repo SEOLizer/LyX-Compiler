@@ -13,7 +13,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 0.9.10D
+VERSION   := 1.0.1D
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -106,6 +106,46 @@ test: lyxc
 	./lyxc tests/lx35_lbf_dump_test.lyx -o /tmp/lyxc_lx35_test
 	@/tmp/lyxc_lx35_test
 	@rm -f /tmp/lyxc_lx35_test
+	@echo "--- LBF nativer Loader/Runtime (End-to-End) ---"
+	./lyxc tests/lbf_run_test.lyx -o /tmp/lyxc_lbfrun_test
+	@/tmp/lyxc_lbfrun_test
+	@rm -f /tmp/lyxc_lbfrun_test
+	@echo "--- LX-30: nativer lyxos-LYX!-Emit ---"
+	@bash tests/lbf_native_emit_test.sh
+	@echo "OK"
+	@echo "--- LYXOS-WP-1: Arithmetik/Vergleiche (6 tests) ---"
+	@bash tests/lyxos_wp1_arith_test.sh
+	@echo "OK"
+	@echo "--- LYXOS-WP-2: Control-Flow nativ ausgeführt (6 tests) ---"
+	@bash tests/lyxos_wp2_controlflow_test.sh
+	@echo "OK"
+	@echo "--- LYXOS-WP-3: Globals nativ ausgeführt (5 tests) ---"
+	@bash tests/lyxos_wp3_globals_test.sh
+	@echo "OK"
+	@echo "--- LYXOS-WP-4: Fields/Index Emission (4 tests) ---"
+	@bash tests/lyxos_wp4_fields_test.sh
+	@echo "OK"
+	@echo "--- LYXOS-WP-5: Multi-Section-Metadaten (5 tests) ---"
+	@bash tests/lyxos_wp5_sections_test.sh
+	@echo "OK"
+	@echo "--- LYXOS pchar-Variable an PrintStr (4 tests) ---"
+	@bash tests/lyxos_pchar_var_test.sh
+	@echo "OK"
+	@echo "--- LYXOS user-Funktions-Calls (8 tests) ---"
+	@bash tests/lyxos_call_args_test.sh
+	@echo "OK"
+	@echo "--- LYXOS Memory-Intrinsics peek/poke/StrCharAt (10 tests) ---"
+	@bash tests/lyxos_builtin_intrinsics_test.sh
+	@echo "OK"
+	@echo "--- LYXOS strength-reduction *2^k / div2^k (12 tests) ---"
+	@bash tests/lyxos_strength_reduction_test.sh
+	@echo "OK"
+	@echo "--- LYXOS @capabilities → CAPS-TLV-Mapping (6 tests) ---"
+	@bash tests/lyxos_caps_tlv_test.sh
+	@echo "--- LYXOS importierte-Klassen-Methoden-Dispatch (1 test) ---"
+	@bash tests/lyxos_imported_class_dispatch_test.sh
+	@echo "OK"
+	@echo "OK"
 	@echo "--- LX-36: Lifecycle Descriptor ---"
 	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
 	@/tmp/lyxc_lx36_test
@@ -115,6 +155,32 @@ test: lyxc
 	./lyxc tests/net_frame_test.lyx -o /tmp/lyxc_net_frame_test
 	@/tmp/lyxc_net_frame_test
 	@rm -f /tmp/lyxc_net_frame_test
+
+	@echo "--- sec_wp26: alloc()/calloc() Integer-Overflow + Zero-Alloc (18 tests) ---"
+	./lyxc tests/sec_wp26_alloc_test.lyx -o /tmp/lyxc_sec_wp26_test
+	@/tmp/lyxc_sec_wp26_test
+	@rm -f /tmp/lyxc_sec_wp26_test
+	@echo "OK"
+
+	@echo "--- sec_wp27: read()-Fehlerbehandlung OOB (7 tests) ---"
+	@bash tests/sec_wp27_read_test.sh
+	@echo "OK"
+
+	@echo "--- sec_ffi: FFI-Sandbox Fail-Closed (4 tests) ---"
+	@bash tests/sec_ffi_failclosed_test.sh
+	@echo "OK"
+
+	@echo "--- sec_dns: DNS rdata OOB-Härtung (5 tests) ---"
+	@bash tests/sec_dns_oob_test.sh
+	@echo "OK"
+
+	@echo "--- sec_tls: TLS Hostname-Verifikation (5 tests) ---"
+	@bash tests/sec_tls_hostname_test.sh
+	@echo "OK"
+
+	@echo "--- sec_stdpath: --std-path off-by-one (2 tests) ---"
+	@bash tests/sec_stdpath_test.sh
+	@echo "OK"
 
 	@echo "--- sec_wp28: kernel-mode-guard allowlist (20 tests) ---"
 	@bash tests/sec_wp28_kernel_guard_test.sh

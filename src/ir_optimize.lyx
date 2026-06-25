@@ -26,6 +26,8 @@ pub type IROptimize = class {
   useCount: int64;
   domCount: int64;
   optLevel:  int64;  // WP-AS-06: 0=none, 1=min, 2=default, 3=aggressive (mirrors CompilerConfig.optLevel)
+  fnStart: int64;    // instruction index where current function starts (inclusive)
+  fnEnd: int64;      // instruction index where current function ends (exclusive)
 
   fn init(irMod: IRModule) {
     self.ir := irMod;
@@ -35,6 +37,8 @@ pub type IROptimize = class {
     self.useCount := 0;
     self.domCount := 0;
     self.optLevel  := 2;  // WP-AS-06: default = O2
+    self.fnStart := 0;
+    self.fnEnd := 0;
   }
 
   // ------------------------------------------------------------------
@@ -50,30 +54,42 @@ pub type IROptimize = class {
     var maxPass: int64 := 10;
     if (self.optLevel >= 3) { maxPass := 20; }  // -O3: allow more convergence rounds
 
-    var pass: int64 := 0;
-    while (pass < maxPass) {
-      self.passCount := pass;
-      self.changed := 0;
+    // Iterate per function to avoid cross-function register aliasing.
+    var funcBuf: int64 := self.ir.funcBuffer;
+    var funcLen: int64 := self.ir.funcLen;
+    var fi: int64 := 0;
+    while (fi < funcLen) {
+      var fBase: int64 := funcBuf + fi * IR_FUNC_SIZE;
+      self.fnStart := peek64(fBase + IR_FUNC_OFF_INSTRSOFF);
+      self.fnEnd   := self.fnStart + peek64(fBase + IR_FUNC_OFF_INSTRCOUNT);
 
-      if (self.optLevel >= 2) {
-        // O2+: full propagation and simplification
-        self.constantFolding();
-        self.copyPropagation();
-        self.strengthReduction();
+      var pass: int64 := 0;
+      while (pass < maxPass) {
+        self.passCount := pass;
+        self.changed := 0;
+
+        if (self.optLevel >= 2) {
+          // O2+: full propagation and simplification
+          self.constantFolding();
+          self.copyPropagation();
+          self.strengthReduction();
+        }
+
+        // O1+: remove dead code (always)
+        self.deadCodeElimination();
+        self.eliminateUnreachableBlocks();
+
+        if (self.optLevel >= 2) {
+          self.commonSubexprElimination();
+        }
+
+        // Check for convergence
+        if (self.changed == 0) { break; }
+
+        pass := pass + 1;
       }
 
-      // O1+: remove dead code (always)
-      self.deadCodeElimination();
-      self.eliminateUnreachableBlocks();
-
-      if (self.optLevel >= 2) {
-        self.commonSubexprElimination();
-      }
-
-      // Check for convergence
-      if (self.changed == 0) { break; }
-
-      pass := pass + 1;
+      fi := fi + 1;
     }
 
     return self.passCount;
@@ -85,11 +101,9 @@ pub type IROptimize = class {
   // Fold constant expressions: irConstInt(3) irAdd irConstInt(4) → irConstInt(7)
   
   fn constantFolding(): int64 {
-    // Get instruction count from IR module
-    var instrCount: int64 := self.getInstrCount();
-    var i: int64 := 0;
-    
-    while (i < instrCount) {
+    var i: int64 := self.fnStart;
+
+    while (i < self.fnEnd) {
       var op: int64 := self.getInstrOp(i);
       var dest: int64 := self.getInstrDest(i);
       var src1: int64 := self.getInstrSrc1(i);
@@ -223,9 +237,8 @@ pub type IROptimize = class {
   // Get constant value from a source operand
   fn isConstInt(src: int64): bool {
     if (src < 0) { return false; }
-    var instrCount: int64 := self.getInstrCount();
-    var i: int64 := 0;
-    while (i < instrCount) {
+    var i: int64 := self.fnStart;
+    while (i < self.fnEnd) {
       if (self.getInstrDest(i) == src) {
         if (self.getInstrOp(i) == IRO_CONST_INT) { return true; }
       }
@@ -236,10 +249,8 @@ pub type IROptimize = class {
 
   fn getConstValue(src: int64): int64 {
     if (src < 0) { return -1; }
-    // Look up src in instruction - find instruction that defines src
-    var instrCount: int64 := self.getInstrCount();
-    var i: int64 := 0;
-    while (i < instrCount) {
+    var i: int64 := self.fnStart;
+    while (i < self.fnEnd) {
       if (self.getInstrDest(i) == src) {
         var op: int64 := self.getInstrOp(i);
         if (op == IRO_CONST_INT) {
@@ -250,13 +261,31 @@ pub type IROptimize = class {
     }
     return -1;
   }
-  
+
+  // fix/lyxos-strength-reduction-shift: Wert des CONST_INT-Temps, das `src` definiert,
+  // auf `val` ändern. Genutzt von strengthReduction: MUL/DIV-by-pow2 → SHL/SHR, wobei
+  // der Shift-Count (=power) NICHT als roher Integer in src2 gehört (Backends lesen src2
+  // als Temp-/Slot-Referenz → cl aus falschem Slot), sondern als Wert im bereits von src2
+  // referenzierten CONST_INT-Temp (so wie ein expliziter `x << 2` aussieht).
+  fn setConstDefValue(src: int64, val: int64): void {
+    if (src < 0) { return; }
+    var i: int64 := self.fnStart;
+    while (i < self.fnEnd) {
+      if (self.getInstrDest(i) == src) {
+        if (self.getInstrOp(i) == IRO_CONST_INT) {
+          self.setInstrImmInt(i, val);
+          return;
+        }
+      }
+      i := i + 1;
+    }
+  }
+
   // Get constant float value
   fn getConstFloatValue(src: int64): int64 {
     if (src < 0) { return 0; }
-    var instrCount: int64 := self.getInstrCount();
-    var i: int64 := 0;
-    while (i < instrCount) {
+    var i: int64 := self.fnStart;
+    while (i < self.fnEnd) {
       if (self.getInstrDest(i) == src) {
         var op: int64 := self.getInstrOp(i);
         if (op == IRO_CONST_FLOAT) {
@@ -274,15 +303,14 @@ pub type IROptimize = class {
   // t1 = a; t2 = t1 + b → t2 = a + b
   
   fn copyPropagation(): int64 {
-    var instrCount: int64 := self.getInstrCount();
-    var i: int64 := 0;
-    
-    while (i < instrCount) {
+    var i: int64 := self.fnStart;
+
+    while (i < self.fnEnd) {
       var op: int64 := self.getInstrOp(i);
       var dest: int64 := self.getInstrDest(i);
       var src1: int64 := self.getInstrSrc1(i);
       var src2: int64 := self.getInstrSrc2(i);
-      
+
       // Replace src1 if it's a copy from another instruction
       if (src1 >= 0) {
         var src1Orig: int64 := self.traceCopy(src1);
@@ -291,7 +319,7 @@ pub type IROptimize = class {
           self.changed := self.changed + 1;
         }
       }
-      
+
       // Replace src2 if it's a copy
       if (src2 >= 0) {
         var src2Orig: int64 := self.traceCopy(src2);
@@ -300,27 +328,26 @@ pub type IROptimize = class {
           self.changed := self.changed + 1;
         }
       }
-      
+
       i := i + 1;
     }
-    
+
     return self.changed;
   }
-  
+
   // Trace copy chain to find original value
   fn traceCopy(temp: int64): int64 {
-    var instrCount: int64 := self.getInstrCount();
-    var i: int64 := 0;
+    var i: int64 := self.fnStart;
     var current: int64 := temp;
 
-    while (i < instrCount) {
+    while (i < self.fnEnd) {
       if (self.getInstrDest(i) == current) {
         var op: int64 := self.getInstrOp(i);
         var src1: int64 := self.getInstrSrc1(i);
         // IRO_MOVE is a direct copy: dest = src1
         if (op == IRO_MOVE) {
           current := src1;
-          i := 0;  // restart from beginning with new current
+          i := self.fnStart;  // restart from beginning with new current
           continue;
         }
       }
@@ -338,17 +365,17 @@ pub type IROptimize = class {
   
   fn deadCodeElimination(): int64 {
     var instrCount: int64 := self.getInstrCount();
-    
-    // First pass: find all used destinations
+
+    // First pass: find all used destinations (within this function only)
     var usedDests: int64 := alloc(instrCount * 8);
     var usedCount: int64 := 0;
-    
-    var i: int64 := 0;
-    while (i < instrCount) {
+
+    var i: int64 := self.fnStart;
+    while (i < self.fnEnd) {
       var src1: int64 := self.getInstrSrc1(i);
       var src2: int64 := self.getInstrSrc2(i);
       var src3: int64 := self.getInstrSrc3(i);
-      
+
       if (src1 >= 0) {
         poke64(usedDests + (usedCount * 8), src1);
         usedCount := usedCount + 1;
@@ -361,17 +388,17 @@ pub type IROptimize = class {
         poke64(usedDests + (usedCount * 8), src3);
         usedCount := usedCount + 1;
       }
-      
+
       i := i + 1;
     }
-    
+
     // Second pass: remove dead instructions
     var liveStart: int64 := -1;
-    i := 0;
-    while (i < instrCount) {
+    i := self.fnStart;
+    while (i < self.fnEnd) {
       var op: int64 := self.getInstrOp(i);
       var dest: int64 := self.getInstrDest(i);
-      
+
       // Check if destination is used
       var isUsed: int64 := 0;
       var j: int64 := 0;
@@ -382,15 +409,17 @@ pub type IROptimize = class {
         }
         j := j + 1;
       }
-      
+
       // Control flow instructions terminate basic blocks
-      if (op == IRO_JMP || op == IRO_BR_TRUE || op == IRO_BR_FALSE || 
+      if (op == IRO_JMP || op == IRO_BR_TRUE || op == IRO_BR_FALSE ||
           op == IRO_FUNC_EXIT || op == IRO_RETURN_STRUCT) {
         liveStart := i + 1;
       }
-      
-      // If dest is not used and instruction is not a side-effect, remove it
-      if (isUsed == 0 && dest >= 0) {
+
+      // If dest is not used and instruction is not a side-effect, remove it.
+      // dest==0 is the lyxos return register (loaded by the final LOAD_LOCAL before epilogue)
+      // and must never be eliminated even if it appears unused within the function.
+      if (isUsed == 0 && dest > 0) {
         // Check for side effects (memory, function call, etc.)
         var hasSideEffect: int64 := self.hasSideEffect(op);
         if (hasSideEffect == 0) {
@@ -399,19 +428,20 @@ pub type IROptimize = class {
           self.changed := self.changed + 1;
         }
       }
-      
+
       i := i + 1;
     }
-    
+
     return self.changed;
   }
   
   // Check if instruction has side effects
   fn hasSideEffect(op: int64): int64 {
     // Memory operations have side effects
-    if (op == IRO_STORE_LOCAL || op == IRO_STORE_GLOBAL || 
+    if (op == IRO_STORE_LOCAL || op == IRO_STORE_GLOBAL ||
         op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP ||
         op == IRO_STORE_ELEM || op == IRO_STORE_ELEM_DYN ||
+        op == IRO_STORE_IDX ||
         op == IRO_SIMD_STORE_ELEM) {
       return 1;
     }
@@ -445,30 +475,29 @@ pub type IROptimize = class {
   // Gleiche Berechnung in selber Expression → gemeinsames Temp-Register
   
   fn commonSubexprElimination(): int64 {
-    var instrCount: int64 := self.getInstrCount();
-    var i: int64 := 0;
-    
-    while (i < instrCount) {
+    var i: int64 := self.fnStart;
+
+    while (i < self.fnEnd) {
       var op: int64 := self.getInstrOp(i);
       var dest: int64 := self.getInstrDest(i);
       var src1: int64 := self.getInstrSrc1(i);
       var src2: int64 := self.getInstrSrc2(i);
-      
+
       // Only check binary operations
       if (op == IRO_ADD || op == IRO_SUB || op == IRO_MUL || op == IRO_DIV ||
           op == IRO_CMP_EQ || op == IRO_CMP_NEQ || op == IRO_CMP_LT ||
           op == IRO_AND || op == IRO_OR || op == IRO_XOR) {
-        
+
         // Look for same operation with same operands within the same basic block.
         // Stop at any instruction with side effects to avoid incorrect substitution
         // across intervening stores (no alias analysis available).
         var j: int64 := i + 1;
-        while (j < instrCount) {
+        while (j < self.fnEnd) {
           var jop: int64 := self.getInstrOp(j);
           if (self.hasSideEffect(jop) != 0 ||
               jop == IRO_JMP || jop == IRO_BR_TRUE || jop == IRO_BR_FALSE ||
               jop == IRO_FUNC_EXIT || jop == IRO_LABEL) {
-            j := instrCount;  // break — don't look across side effects or block boundaries
+            j := self.fnEnd;  // break — don't look across side effects or block boundaries
           } else {
             if (jop == op &&
                 self.getInstrSrc1(j) == src1 &&
@@ -481,19 +510,18 @@ pub type IROptimize = class {
           }
         }
       }
-      
+
       i := i + 1;
     }
-    
+
     return self.changed;
   }
   
   // Replace all uses of oldTemp with newTemp
   fn replaceUses(oldTemp: int64, newTemp: int64): int64 {
-    var instrCount: int64 := self.getInstrCount();
-    var i: int64 := 0;
-    
-    while (i < instrCount) {
+    var i: int64 := self.fnStart;
+
+    while (i < self.fnEnd) {
       if (self.getInstrSrc1(i) == oldTemp) {
         self.setInstrSrc1(i, newTemp);
       }
@@ -505,7 +533,7 @@ pub type IROptimize = class {
       }
       i := i + 1;
     }
-    
+
     return 0;
   }
   
@@ -515,10 +543,9 @@ pub type IROptimize = class {
   // x * 2 → x << 1, x * 0 → 0, x + 0 → x, etc.
   
   fn strengthReduction(): int64 {
-    var instrCount: int64 := self.getInstrCount();
-    var i: int64 := 0;
-    
-    while (i < instrCount) {
+    var i: int64 := self.fnStart;
+
+    while (i < self.fnEnd) {
       var op: int64 := self.getInstrOp(i);
       var dest: int64 := self.getInstrDest(i);
       var src1: int64 := self.getInstrSrc1(i);
@@ -532,7 +559,7 @@ pub type IROptimize = class {
           var power: int64 := self.isPowerOfTwo(c2);
           if (power >= 0) {
             self.setInstrOp(i, IRO_SHL);
-            self.setInstrSrc2(i, power);
+            self.setConstDefValue(src2, power);
             self.changed := self.changed + 1;
           }
           // Multiplication by 0 → 0
@@ -577,7 +604,7 @@ pub type IROptimize = class {
           var power: int64 := self.isPowerOfTwo(c2);
           if (power >= 0) {
             self.setInstrOp(i, IRO_SHR);
-            self.setInstrSrc2(i, power);
+            self.setConstDefValue(src2, power);
             self.changed := self.changed + 1;
           }
         }
@@ -633,7 +660,7 @@ pub type IROptimize = class {
   // ------------------------------------------------------------------
 
   fn getInstrCount(): int64 {
-    return self.ir.instrLen / IR_INSTR_SIZE;
+    return self.fnEnd - self.fnStart;
   }
 
   fn getInstrOp(idx: int64): int64 {
@@ -703,20 +730,19 @@ pub type IROptimize = class {
   
   // Remove redundant loads (load after store to same location)
   fn removeRedundantLoads(): int64 {
-    var instrCount: int64 := self.getInstrCount();
-    var i: int64 := 0;
-    
-    while (i < instrCount) {
+    var i: int64 := self.fnStart;
+
+    while (i < self.fnEnd) {
       var op: int64 := self.getInstrOp(i);
-      
+
       // Look for store followed by load from same location
       if (op == IRO_STORE_LOCAL || op == IRO_STORE_GLOBAL) {
         var storeDest: int64 := self.getInstrDest(i);
         var storeSrc: int64 := self.getInstrSrc1(i);
-        
+
         // Look for load from same location in next instructions
         var j: int64 := i + 1;
-        while (j < instrCount) {
+        while (j < self.fnEnd) {
           var loadOp: int64 := self.getInstrOp(j);
           if (loadOp == IRO_LOAD_LOCAL || loadOp == IRO_LOAD_GLOBAL) {
             var loadDest: int64 := self.getInstrDest(j);
@@ -729,24 +755,23 @@ pub type IROptimize = class {
           // Stop if we hit another store to same location
           if ((loadOp == IRO_STORE_LOCAL || loadOp == IRO_STORE_GLOBAL) &&
               self.getInstrDest(j) == storeDest) {
-            j := instrCount;  // break
+            j := self.fnEnd;  // break
           }
           j := j + 1;
         }
       }
-      
+
       i := i + 1;
     }
-    
+
     return self.changed;
   }
-  
+
   // Merge consecutive stores
   fn mergeStores(): int64 {
-    var instrCount: int64 := self.getInstrCount();
-    var i: int64 := 0;
-    
-    while (i < instrCount - 1) {
+    var i: int64 := self.fnStart;
+
+    while (i < self.fnEnd - 1) {
       var op: int64 := self.getInstrOp(i);
       
       if (op == IRO_STORE_LOCAL || op == IRO_STORE_GLOBAL) {
@@ -770,10 +795,9 @@ pub type IROptimize = class {
   // exit and precede the next label (they can never be executed).
 
   fn eliminateUnreachableBlocks(): int64 {
-    var instrCount: int64 := self.getInstrCount();
     var inUnreachable: int64 := 0;
-    var i: int64 := 0;
-    while (i < instrCount) {
+    var i: int64 := self.fnStart;
+    while (i < self.fnEnd) {
       var op: int64 := self.getInstrOp(i);
 
       // A label restores reachability

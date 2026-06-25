@@ -76,6 +76,7 @@ pub con NK_ASSERT:      int64 := 36;  // WP-BC-07
 
 // Literals (40-45)
 pub con NK_LIT_INT:     int64 := 40;
+pub con NK_TYPE_ARRAY_FIXED: int64 := 101;  // [N]T fixed-size array type (c0=elemType, c1=sizeExpr)
 pub con NK_LIT_FLOAT:   int64 := 41;
 pub con NK_LIT_STR:     int64 := 42;
 pub con NK_LIT_CHAR:    int64 := 43;
@@ -202,6 +203,14 @@ pub type IRLower = class {
   localNameBuf: int64;
   localNameCnt: int64;
   localNameCap: int64;
+  // ARM64-OOP: parallel zu localNameBuf — type-name-Node pro Local (oder -1).
+  // Erlaubt Instanz-Feldzugriff `p.x`: p's Typ → Feld-Offset.
+  localTypeBuf: int64;
+  // ARM64-OOP statische Methoden: in einer Methode = 1 (self belegt Slot 0, explizite
+  // Params verschieben sich um +1), sonst 0. curMethodClassType = NK_TYPE_NAME-Node der
+  // umgebenden Klasse (für `self.field`-Auflösung) oder -1.
+  methodParamBase:    int64;
+  curMethodClassType: int64;
 
   // WP-AND-upstream-fix v4/v5: module-scope mapping for top-level NK_VAR_DECLs.
   // Records are 32 bytes: {srcNameOff:i64, nameLen:i64, globalIdx:i64, initValue:i64}.
@@ -255,6 +264,18 @@ pub type IRLower = class {
   genFuncBuf:   int64;
   genFuncCount: int64;
   genFuncCap:   int64;
+  _importsDone: int64;  // StrLen-fix: globaler transitiver Import-Func-Pre-Pass nur 1× (top-level)
+  // WP-XMOD-OOP: globales Type-Registry (cross-module). Jeder NK_TYPE_DECL aller Module bekommt
+  // eine stabile globale type-id (= Registry-Index). Gefüllt im Import-Pre-Pass. Ermöglicht
+  // korrektes new (Größe/type-id) + virtuelle Dispatch für IMPORTIERTE Klassen.
+  _tregSrc:   int64;    // [] src-Pointer des Moduls je Eintrag
+  _tregNodes: int64;    // [] nodes-Pointer
+  _tregCnt:   int64;    // [] nodeCount
+  _tregIdx:   int64;    // [] lokaler Node-Index des NK_TYPE_DECL im Modul
+  _tregNameP: int64;    // [] absoluter Pointer auf Klassennamen
+  _tregNameL: int64;    // [] Namenslänge
+  _tregN:     int64;    // Anzahl Einträge
+  _tregCap:   int64;    // Kapazität
   // Queue of pending specializations to emit after the main lowering loop
   // Records: {mangledPtr:8, mangledLen:8, genFuncNodeIdx:8, emitted:8} = 32 bytes each
   pendingGenBuf:   int64;
@@ -279,7 +300,10 @@ pub type IRLower = class {
     self.tempCount := 0;
     self.localNameCap := 32;
     self.localNameBuf := alloc(32 * 24);
+    self.localTypeBuf := alloc(32 * 8);
     self.localNameCnt := 0;
+    self.methodParamBase    := 0;
+    self.curMethodClassType := 0 - 1;
     self.globalNameCap := 32;
     self.globalNameBuf := alloc(32 * 32);
     self.globalNameCnt := 0;
@@ -303,6 +327,15 @@ pub type IRLower = class {
     self.genFuncCap   := 16;
     self.genFuncBuf   := alloc(16 * 24);
     self.genFuncCount := 0;
+    self._importsDone := 0;
+    self._tregCap := 1024;
+    self._tregN := 0;
+    self._tregSrc   := alloc(self._tregCap * 8);
+    self._tregNodes := alloc(self._tregCap * 8);
+    self._tregCnt   := alloc(self._tregCap * 8);
+    self._tregIdx   := alloc(self._tregCap * 8);
+    self._tregNameP := alloc(self._tregCap * 8);
+    self._tregNameL := alloc(self._tregCap * 8);
     self.pendingGenCap   := 16;
     self.pendingGenBuf   := alloc(16 * 32);
     self.pendingGenCount := 0;
@@ -594,8 +627,32 @@ pub type IRLower = class {
     // Literal: string constant
     if (k == NK_LIT_STR) {
       var dest: int64 := self.allocTemp();
-      var strOff: int64 := self.nodeIVal(expr);
-      // Emit: dest = const str strOff (IRO_CONST_STR = 1)
+      // LYXOS-pchar-fix2: IR-Backends brauchen den Offset im IR-strBuf, NICHT nodeIVal
+      // (= Parser-/Quell-Offset). Sonst zeigt CONST_STR in die Symbol-/Namen-Tabelle
+      // (z. B. "main"). String aus nodeSVal extrahieren, Escapes verarbeiten, in den
+      // IR-strBuf internieren (irAddString null-terminiert → strlen-tauglich).
+      var lsStart:  int64 := (self.nodeSVal(expr) as int64) + 1;  // opening quote überspringen
+      var lsSrcLen: int64 := self.nodeSLen(expr) - 2;             // beide quotes weg
+      if (lsSrcLen < 0) { lsSrcLen := 0; }
+      var lsBuf: int64 := alloc(lsSrcLen + 8);
+      var lsOut: int64 := 0;
+      var lsI:   int64 := 0;
+      while lsI < lsSrcLen {
+        var lsC: int64 := peek8(lsStart + lsI);
+        if lsC == 92 && lsI + 1 < lsSrcLen {       // backslash-Escape
+          var lsN: int64 := peek8(lsStart + lsI + 1);
+          if lsN == 110      { lsC := 10; lsI := lsI + 1; }   // \n
+          else if lsN == 116 { lsC := 9;  lsI := lsI + 1; }   // \t
+          else if lsN == 114 { lsC := 13; lsI := lsI + 1; }   // \r
+          else if lsN == 92  { lsC := 92; lsI := lsI + 1; }   // \\
+          else if lsN == 34  { lsC := 34; lsI := lsI + 1; }   // \"
+          else if lsN == 48  { lsC := 0;  lsI := lsI + 1; }   // \0
+        }
+        poke8(lsBuf + lsOut, lsC);
+        lsOut := lsOut + 1;
+        lsI := lsI + 1;
+      }
+      var strOff: int64 := self.irAddString(lsBuf as pchar, lsOut);
       self.irAddInstrDirect(IRO_CONST_STR, dest, -1, -1, strOff);
       return dest;
     }
@@ -637,6 +694,14 @@ pub type IRLower = class {
         var idName: pchar := self.nodeSVal(expr);
         var idLen:  int64 := self.nodeSLen(expr);
         var idPtrL: int64 := (idName) as int64;
+        // ARM64-OOP: `self` in einer Methode → impliziter Param-Slot 0 (Objekt-Pointer).
+        if self.methodParamBase != 0 && idLen == 4 {
+          if peek8(idPtrL) == 115 && peek8(idPtrL + 1) == 101 &&
+             peek8(idPtrL + 2) == 108 && peek8(idPtrL + 3) == 102 {   // "self"
+            self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, 0, -1, 0);
+            return dest;
+          }
+        }
         // WP-AND-upstream-fix v4: locals declared via NK_VAR_DECL come first.
         var lnI: int64 := self.localNameCnt - 1;   // shadowing: latest wins
         while lnI >= 0 {
@@ -678,7 +743,8 @@ pub type IRLower = class {
                 pj := pj + 1;
               }
               if pmatch != 0 {
-                self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, pidx, -1, 0);
+                // ARM64-OOP: in Methoden ist self Slot 0 → explizite Params +methodParamBase.
+                self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, pidx + self.methodParamBase, -1, 0);
                 return dest;
               }
             }
@@ -881,6 +947,92 @@ pub type IRLower = class {
     if (self.nodeIVal(expr) == 2) {
       return self.lowerGenericCall(expr);
     }
+    // ARM64-OOP: Methoden-Call (iVal=1): c0=Objekt, sVal=Methode, c1=Args.
+    // Statische Dispatch: Klasse von c0 auflösen → mangled "Class_method" → IRO_CALL
+    // mit self=Objekt als arg0, dann explizite Args (im argBase-Block, vgl. nested-call).
+    if (self.nodeIVal(expr) == 1) {
+      var mcDest:     int64 := self.allocTemp();
+      var mcBaseNode: int64 := self.nodeC0(expr);
+      // WP-XMOD-OOP: Klassenname + lokales decl holen. localDecl>=0 = same-module (Fast-Path,
+      // kein Registry); localDecl<0 = importiert. Registry (globale type-id) nur für VIRTUELLE
+      // Dispatch nötig (type-id-Konsistenz cross-module) — non-virtuell läuft per Mangle-by-name.
+      var mcTn:      int64 := self._baseTypeNode(mcBaseNode);
+      var mcCName:   pchar := 0 as pchar;
+      var mcCNameL:  int64 := 0;
+      var mcLocal:   int64 := 0 - 1;
+      if mcTn >= 0 {
+        mcCName := self.nodeSVal(mcTn); mcCNameL := self.nodeSLen(mcTn);
+        if self.nodeKind(mcTn) == NK_TYPE_DECL { mcLocal := mcTn; }
+        else { mcLocal := self._findTypeDecl(mcCName, mcCNameL); }
+      }
+      if mcCNameL > 0 {
+        var mNameP: pchar := self.nodeSVal(expr);
+        var mNameL: int64 := self.nodeSLen(expr);
+        // Virtuell? Fast lokal, sonst via Registry (importiert).
+        var mcVirt: int64 := 0;
+        if mcLocal >= 0 { mcVirt := self._methodVirtual(mcLocal, mNameP, mNameL); }
+        else { mcVirt := self._tregMethodVirtualG(self._tregFind(mcCName, mcCNameL), mNameP, mNameL); }
+        // Arg-Block: self @ argBase, dann explizite Args.
+        var mcArgBase: int64 := self.tempCount;
+        var mcRsv: int64 := 0;
+        while mcRsv < 8 { self.allocTemp(); mcRsv := mcRsv + 1; }
+        var mcSelf: int64 := self.lowerExpr(mcBaseNode);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, mcArgBase, mcSelf, -1, 0);
+        var mcCnt: int64 := 1;
+        var mcArg: int64 := self.nodeC1(expr);
+        while mcArg >= 0 {
+          var mcAT: int64 := self.lowerExpr(mcArg);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, mcArgBase + mcCnt, mcAT, -1, 0);
+          mcCnt := mcCnt + 1;
+          mcArg := self.nodeNext(mcArg);
+        }
+        if mcVirt == 0 {
+          // STATISCHE Dispatch: nächste Definition ab decl (Mangle by-name, cross-module via funcBuffer).
+          var mcIdx: int64 := 0 - 1;
+          if mcLocal >= 0 { mcIdx := self._resolveMethodIdx(mcLocal, mNameP, mNameL); }
+          else {
+            var sbg: int64 := self._tregFind(mcCName, mcCNameL);
+            if sbg >= 0 { mcIdx := self._tregResolveMethodIdxG(sbg, mNameP, mNameL); }
+            else {
+              var sMang: int64 := self._methodMangle(mcCName, mcCNameL, mNameP, mNameL);
+              mcIdx := self._findFuncByName(sMang as pchar, mcCNameL + 1 + mNameL);
+            }
+          }
+          if mcIdx >= 0 { self.irAddInstrDirect(IRO_CALL, mcDest, mcIdx, mcArgBase, mcCnt); }
+        } else {
+          var baseG: int64 := self._tregFind(mcCName, mcCNameL);
+          // WP-XMOD-OOP: VIRTUELLE Switch-Dispatch über type-id @ obj[0] in GLOBALER Registry-Space
+          // (cross-module Subklassen). tid==g → g's Override; Fallback = baseG's Auflösung.
+          var tidTemp: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_LOAD_FIELD, tidTemp, mcSelf, 0, 0);   // tid = obj[0]
+          var vEnd: int64 := self.genLabel();
+          var gi: int64 := 0;
+          while gi < self._tregN {
+            if self._extendsClassG(gi, baseG) != 0 {
+              if self._tregOwnHasMethodG(gi, mNameP, mNameL) != 0 {
+                var subIdx: int64 := self._tregResolveMethodIdxG(gi, mNameP, mNameL);
+                if subIdx >= 0 {
+                  var cTid: int64 := self.allocTemp();
+                  self.irAddInstrDirect(IRO_CONST_INT, cTid, -1, -1, gi);
+                  var cmpT: int64 := self.allocTemp();
+                  self.irAddInstrDirect(IRO_CMP_EQ, cmpT, tidTemp, cTid, 0);
+                  var vNext: int64 := self.genLabel();
+                  self.irEmitBrFalse(cmpT, vNext);
+                  self.irAddInstrDirect(IRO_CALL, mcDest, subIdx, mcArgBase, mcCnt);
+                  self.irEmitJmp(vEnd);
+                  self.irEmitLabel(vNext);
+                }
+              }
+            }
+            gi := gi + 1;
+          }
+          var baseIdx: int64 := self._tregResolveMethodIdxG(baseG, mNameP, mNameL);
+          if baseIdx >= 0 { self.irAddInstrDirect(IRO_CALL, mcDest, baseIdx, mcArgBase, mcCnt); }
+          self.irEmitLabel(vEnd);
+        }
+      }
+      return mcDest;
+    }
     // NK_CALL: sVal = function name, C0 = first argument (linked via nodeNext)
     var dest: int64 := self.allocTemp();
     var fname: pchar := self.nodeSVal(expr);
@@ -1075,6 +1227,21 @@ pub type IRLower = class {
       return dest;
     }
 
+    // LYXOS-pchar-fix: PrintStr(<non-literal>) — z. B. pchar-Variable. Der String-Pointer
+    // wird zur Laufzeit geladen (slot 0); die Länge ist zur Compile-Zeit unbekannt → Sentinel
+    // -1 in slot 1, das Backend (emit_lyxos.emitPrintStr) berechnet dann strlen zur Laufzeit.
+    // Muss VOR dem User-Funktions-Lookup stehen, sonst fällt PrintStr(var) in den Legacy-
+    // CALL_BUILTIN-Fallback OHNE slot-0-Setup (→ falscher rodata-Pointer / null-flood).
+    if (self.seq(fname, fnlen, "PrintStr", 8) && arg0 >= 0) {
+      var psvPtr: int64 := self.lowerExpr(arg0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 0, psvPtr, -1, 0);
+      var psvLen: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, psvLen, -1, -1, 0 - 1);  // -1 = Sentinel „strlen zur Laufzeit"
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 1, psvLen, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 1);
+      return dest;
+    }
+
 
     // WP-AND-upstream-fix v2: user-function call. Inline name lookup against
     // the IR funcBuffer (no helper method — adding one shifted the IRLower
@@ -1109,11 +1276,19 @@ pub type IRLower = class {
       fbI := fbI + 1;
     }
     if fbUserIdx >= 0 {
+      // ARM64-FIX (nested-call-clobber): Argumente NICHT in Caller-Slots 0..N-1
+      // legen (die aliasen die eigenen Params/Locals des Callers!). Stattdessen einen
+      // reservierten hohen Slot-Block (argBase..argBase+7) nutzen, der über allen
+      // Live-Werten liegt. Sonst klobbert z.B. fib(n-1) den Slot0 (=Param n), und
+      // fib(n-2) liest n-1 → falsch. emitCall lädt aus argBase (IRO_CALL.src2).
+      var fbArgBase: int64 := self.tempCount;
+      var fbRsv: int64 := 0;
+      while fbRsv < 8 { self.allocTemp(); fbRsv := fbRsv + 1; }
       var fbArgCnt: int64 := 0;
       var fbArg: int64 := arg0;
       while fbArg >= 0 {
         var fbATemp: int64 := self.lowerExpr(fbArg);
-        self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgCnt, fbATemp, -1, 0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgBase + fbArgCnt, fbATemp, -1, 0);
         fbArgCnt := fbArgCnt + 1;
         fbArg := self.nodeNext(fbArg);
       }
@@ -1146,13 +1321,14 @@ pub type IRLower = class {
           var fbDExpr: int64 := self.nodeC1(fbDP);
           if fbDExpr >= 0 {
             var fbDTemp: int64 := self.lowerExpr(fbDExpr);
-            self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgCnt, fbDTemp, -1, 0);
+            self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgBase + fbArgCnt, fbDTemp, -1, 0);
             fbArgCnt := fbArgCnt + 1;
           }
           fbDP := self.nodeNext(fbDP);
         }
       }
-      self.irAddInstrDirect(IRO_CALL, dest, fbUserIdx, -1, fbArgCnt);
+      // src2 = argBase (Slot-Basis des Arg-Blocks) für emitCall
+      self.irAddInstrDirect(IRO_CALL, dest, fbUserIdx, fbArgBase, fbArgCnt);
       return dest;
     }
 
@@ -2292,11 +2468,243 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 171); return dest;
     }
 
-    // General call: lower first argument and emit IRO_CALL_BUILTIN
-    if (arg0 >= 0) {
-      var argTemp: int64 := self.lowerExpr(arg0);
-      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, argTemp, -1, 1);
+    // fix/lyxos-builtin-misdispatch: Memory-Intrinsics + Str-Char. Vorher fielen diese
+    // in den stillen id=1=PrintStr-Catch-all unten → write()-Syscall statt Byte-Load
+    // (fb-Garbling in lbfwin). Jetzt echte CALL_BUILTIN-ids (200-207); emit_lyxos
+    // emittiert movzx/mov. Args in einen HOHEN argBase-Block spillen (NICHT Slots 0..2 —
+    // die aliasen Caller-Locals, vgl. User-Call-Pfad oben). src1 der CALL_BUILTIN = argBase.
+    if (self.seq(fname, fnlen, "peek8", 5)) {
+      var pk8B: int64 := self.tempCount; var pk8R: int64 := 0; while pk8R < 4 { self.allocTemp(); pk8R := pk8R + 1; }
+      if arg0 >= 0 { var t: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, pk8B, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, pk8B, -1, 200); return dest;
     }
+    if (self.seq(fname, fnlen, "peek32", 6)) {
+      var pk32B: int64 := self.tempCount; var pk32R: int64 := 0; while pk32R < 4 { self.allocTemp(); pk32R := pk32R + 1; }
+      if arg0 >= 0 { var t: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, pk32B, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, pk32B, -1, 201); return dest;
+    }
+    if (self.seq(fname, fnlen, "peek64", 6)) {
+      var pk64B: int64 := self.tempCount; var pk64R: int64 := 0; while pk64R < 4 { self.allocTemp(); pk64R := pk64R + 1; }
+      if arg0 >= 0 { var t: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, pk64B, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, pk64B, -1, 202); return dest;
+    }
+    if (self.seq(fname, fnlen, "poke8", 5)) {
+      var po8B: int64 := self.tempCount; var po8R: int64 := 0; while po8R < 4 { self.allocTemp(); po8R := po8R + 1; }
+      var po8A: int64 := arg0;
+      if po8A >= 0 { var t: int64 := self.lowerExpr(po8A); self.irAddInstrDirect(IRO_STORE_LOCAL, po8B, t, -1, 0); po8A := self.nodeNext(po8A); }
+      if po8A >= 0 { var t: int64 := self.lowerExpr(po8A); self.irAddInstrDirect(IRO_STORE_LOCAL, po8B + 1, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, po8B, -1, 203); return dest;
+    }
+    if (self.seq(fname, fnlen, "poke32", 6)) {
+      var po32B: int64 := self.tempCount; var po32R: int64 := 0; while po32R < 4 { self.allocTemp(); po32R := po32R + 1; }
+      var po32A: int64 := arg0;
+      if po32A >= 0 { var t: int64 := self.lowerExpr(po32A); self.irAddInstrDirect(IRO_STORE_LOCAL, po32B, t, -1, 0); po32A := self.nodeNext(po32A); }
+      if po32A >= 0 { var t: int64 := self.lowerExpr(po32A); self.irAddInstrDirect(IRO_STORE_LOCAL, po32B + 1, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, po32B, -1, 204); return dest;
+    }
+    if (self.seq(fname, fnlen, "poke64", 6)) {
+      var po64B: int64 := self.tempCount; var po64R: int64 := 0; while po64R < 4 { self.allocTemp(); po64R := po64R + 1; }
+      var po64A: int64 := arg0;
+      if po64A >= 0 { var t: int64 := self.lowerExpr(po64A); self.irAddInstrDirect(IRO_STORE_LOCAL, po64B, t, -1, 0); po64A := self.nodeNext(po64A); }
+      if po64A >= 0 { var t: int64 := self.lowerExpr(po64A); self.irAddInstrDirect(IRO_STORE_LOCAL, po64B + 1, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, po64B, -1, 205); return dest;
+    }
+    if (self.seq(fname, fnlen, "StrCharAt", 9)) {
+      var scB: int64 := self.tempCount; var scR: int64 := 0; while scR < 4 { self.allocTemp(); scR := scR + 1; }
+      var scA: int64 := arg0;
+      if scA >= 0 { var t: int64 := self.lowerExpr(scA); self.irAddInstrDirect(IRO_STORE_LOCAL, scB, t, -1, 0); scA := self.nodeNext(scA); }
+      if scA >= 0 { var t: int64 := self.lowerExpr(scA); self.irAddInstrDirect(IRO_STORE_LOCAL, scB + 1, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, scB, -1, 206); return dest;
+    }
+    if (self.seq(fname, fnlen, "StrSetChar", 10)) {
+      var ssB: int64 := self.tempCount; var ssR: int64 := 0; while ssR < 4 { self.allocTemp(); ssR := ssR + 1; }
+      var ssA: int64 := arg0;
+      if ssA >= 0 { var t: int64 := self.lowerExpr(ssA); self.irAddInstrDirect(IRO_STORE_LOCAL, ssB, t, -1, 0); ssA := self.nodeNext(ssA); }
+      if ssA >= 0 { var t: int64 := self.lowerExpr(ssA); self.irAddInstrDirect(IRO_STORE_LOCAL, ssB + 1, t, -1, 0); ssA := self.nodeNext(ssA); }
+      if ssA >= 0 { var t: int64 := self.lowerExpr(ssA); self.irAddInstrDirect(IRO_STORE_LOCAL, ssB + 2, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, ssB, -1, 207); return dest;
+    }
+    // lyxc→LyxOS Gruppe C: pure-compute Intrinsics (peek16/poke16/memcpy), argBase-Konvention.
+    if (self.seq(fname, fnlen, "peek16", 6)) {
+      var p16B: int64 := self.tempCount; var p16R: int64 := 0; while p16R < 4 { self.allocTemp(); p16R := p16R + 1; }
+      if arg0 >= 0 { var t: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, p16B, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, p16B, -1, 208); return dest;
+    }
+    if (self.seq(fname, fnlen, "poke16", 6)) {
+      var po16B: int64 := self.tempCount; var po16R: int64 := 0; while po16R < 4 { self.allocTemp(); po16R := po16R + 1; }
+      var po16A: int64 := arg0;
+      if po16A >= 0 { var t: int64 := self.lowerExpr(po16A); self.irAddInstrDirect(IRO_STORE_LOCAL, po16B, t, -1, 0); po16A := self.nodeNext(po16A); }
+      if po16A >= 0 { var t: int64 := self.lowerExpr(po16A); self.irAddInstrDirect(IRO_STORE_LOCAL, po16B + 1, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, po16B, -1, 209); return dest;
+    }
+    if (self.seq(fname, fnlen, "memcpy", 6) || self.seq(fname, fnlen, "MemCopy", 7)) {
+      var mcB: int64 := self.tempCount; var mcR: int64 := 0; while mcR < 4 { self.allocTemp(); mcR := mcR + 1; }
+      var mcA: int64 := arg0;
+      if mcA >= 0 { var t: int64 := self.lowerExpr(mcA); self.irAddInstrDirect(IRO_STORE_LOCAL, mcB, t, -1, 0); mcA := self.nodeNext(mcA); }
+      if mcA >= 0 { var t: int64 := self.lowerExpr(mcA); self.irAddInstrDirect(IRO_STORE_LOCAL, mcB + 1, t, -1, 0); mcA := self.nodeNext(mcA); }
+      if mcA >= 0 { var t: int64 := self.lowerExpr(mcA); self.irAddInstrDirect(IRO_STORE_LOCAL, mcB + 2, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, mcB, -1, 210); return dest;
+    }
+    // lyxc→LyxOS Gruppe A: POSIX-File-Builtins → flache §10.4-Syscalls (KEIN dir_fd;
+    // implementierter Kernel ist flach). Args in hohen argBase-Block, src1=argBase.
+    // 1-arg: close(221)/unlink(225)/exit(227); mkdir(226) nur path (mode verworfen).
+    if (self.seq(fname, fnlen, "close", 5) || self.seq(fname, fnlen, "unlink", 6) ||
+        self.seq(fname, fnlen, "exit", 4)  || self.seq(fname, fnlen, "mkdir", 5)) {
+      var a1B: int64 := self.tempCount; var a1R: int64 := 0; while a1R < 2 { self.allocTemp(); a1R := a1R + 1; }
+      if arg0 >= 0 { var t: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, a1B, t, -1, 0); }
+      var a1id: int64 := 221;
+      if self.seq(fname, fnlen, "unlink", 6) { a1id := 225; }
+      if self.seq(fname, fnlen, "exit", 4)   { a1id := 227; }
+      if self.seq(fname, fnlen, "mkdir", 5)  { a1id := 226; }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, a1B, -1, a1id); return dest;
+    }
+    // 2-arg: rename(224)
+    if (self.seq(fname, fnlen, "rename", 6)) {
+      var a2B: int64 := self.tempCount; var a2R: int64 := 0; while a2R < 4 { self.allocTemp(); a2R := a2R + 1; }
+      var a2A: int64 := arg0;
+      if a2A >= 0 { var t: int64 := self.lowerExpr(a2A); self.irAddInstrDirect(IRO_STORE_LOCAL, a2B, t, -1, 0); a2A := self.nodeNext(a2A); }
+      if a2A >= 0 { var t: int64 := self.lowerExpr(a2A); self.irAddInstrDirect(IRO_STORE_LOCAL, a2B + 1, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, a2B, -1, 224); return dest;
+    }
+    // 3-arg: open(220)/read(222)/write(223)
+    if (self.seq(fname, fnlen, "open", 4) || self.seq(fname, fnlen, "read", 4) ||
+        self.seq(fname, fnlen, "write", 5)) {
+      var a3B: int64 := self.tempCount; var a3R: int64 := 0; while a3R < 4 { self.allocTemp(); a3R := a3R + 1; }
+      var a3A: int64 := arg0;
+      if a3A >= 0 { var t: int64 := self.lowerExpr(a3A); self.irAddInstrDirect(IRO_STORE_LOCAL, a3B, t, -1, 0); a3A := self.nodeNext(a3A); }
+      if a3A >= 0 { var t: int64 := self.lowerExpr(a3A); self.irAddInstrDirect(IRO_STORE_LOCAL, a3B + 1, t, -1, 0); a3A := self.nodeNext(a3A); }
+      if a3A >= 0 { var t: int64 := self.lowerExpr(a3A); self.irAddInstrDirect(IRO_STORE_LOCAL, a3B + 2, t, -1, 0); }
+      var a3id: int64 := 220;
+      if self.seq(fname, fnlen, "read", 4)  { a3id := 222; }
+      if self.seq(fname, fnlen, "write", 5) { a3id := 223; }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, a3B, -1, a3id); return dest;
+    }
+    // lyxc→LyxOS Kat-B: getdents64(fd,buf,n) → read-on-dirfd (sys_read=0, liefert DirEntry-Array).
+    if (self.seq(fname, fnlen, "getdents64", 10)) {
+      var gdB: int64 := self.tempCount; var gdR: int64 := 0; while gdR < 4 { self.allocTemp(); gdR := gdR + 1; }
+      var gdA: int64 := arg0;
+      if gdA >= 0 { var t: int64 := self.lowerExpr(gdA); self.irAddInstrDirect(IRO_STORE_LOCAL, gdB, t, -1, 0); gdA := self.nodeNext(gdA); }
+      if gdA >= 0 { var t: int64 := self.lowerExpr(gdA); self.irAddInstrDirect(IRO_STORE_LOCAL, gdB + 1, t, -1, 0); gdA := self.nodeNext(gdA); }
+      if gdA >= 0 { var t: int64 := self.lowerExpr(gdA); self.irAddInstrDirect(IRO_STORE_LOCAL, gdB + 2, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, gdB, -1, 222); return dest;
+    }
+    // lyxc→LyxOS Kat-B: clock_gettime(clk_id, ts) → sys_time_ns + timespec-Split (id 211).
+    if (self.seq(fname, fnlen, "clock_gettime", 13)) {
+      var cgB: int64 := self.tempCount; var cgR: int64 := 0; while cgR < 4 { self.allocTemp(); cgR := cgR + 1; }
+      var cgA: int64 := arg0;
+      if cgA >= 0 { var t: int64 := self.lowerExpr(cgA); self.irAddInstrDirect(IRO_STORE_LOCAL, cgB, t, -1, 0); cgA := self.nodeNext(cgA); }
+      if cgA >= 0 { var t: int64 := self.lowerExpr(cgA); self.irAddInstrDirect(IRO_STORE_LOCAL, cgB + 1, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, cgB, -1, 211); return dest;
+    }
+    // lyxc→LyxOS Kat-C: chmod/chown → no-op return 0 (LyxOS capability-basiert, keine POSIX-perms).
+    if (self.seq(fname, fnlen, "chmod", 5) || self.seq(fname, fnlen, "chown", 5)) {
+      self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, 0); return dest;
+    }
+    // lyxc→LyxOS 0x0200-Block (kernel-adoptiert). lseek/pipe(3-arg), truncate(2-arg) direkt.
+    if (self.seq(fname, fnlen, "lseek", 5) || self.seq(fname, fnlen, "pipe", 4) ||
+        self.seq(fname, fnlen, "truncate", 8)) {
+      var fxB: int64 := self.tempCount; var fxR: int64 := 0; while fxR < 4 { self.allocTemp(); fxR := fxR + 1; }
+      var fxA: int64 := arg0; var fxN: int64 := 0;
+      while fxA >= 0 && fxN < 3 {
+        var t: int64 := self.lowerExpr(fxA);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, fxB + fxN, t, -1, 0);
+        fxA := self.nodeNext(fxA); fxN := fxN + 1;
+      }
+      var fxId: int64 := 228;                                   // lseek
+      if self.seq(fname, fnlen, "pipe", 4)     { fxId := 231; }
+      if self.seq(fname, fnlen, "truncate", 8) { fxId := 232; }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, fxB, -1, fxId); return dest;
+    }
+    // stat(path,out) / lstat(path,out) → sys_stat(AT_CWD=-1, path, out, flags) — id 229.
+    if (self.seq(fname, fnlen, "stat", 4) || self.seq(fname, fnlen, "lstat", 5)) {
+      var stB: int64 := self.tempCount; var stR: int64 := 0; while stR < 4 { self.allocTemp(); stR := stR + 1; }
+      var stCwd: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, stCwd, -1, -1, -1);  // AT_CWD = -1
+      self.irAddInstrDirect(IRO_STORE_LOCAL, stB, stCwd, -1, 0);
+      var stA: int64 := arg0;
+      if stA >= 0 { var t: int64 := self.lowerExpr(stA); self.irAddInstrDirect(IRO_STORE_LOCAL, stB + 1, t, -1, 0); stA := self.nodeNext(stA); }
+      if stA >= 0 { var t: int64 := self.lowerExpr(stA); self.irAddInstrDirect(IRO_STORE_LOCAL, stB + 2, t, -1, 0); }
+      var stFlags: int64 := self.allocTemp();
+      var stFv: int64 := 0;
+      if self.seq(fname, fnlen, "lstat", 5) { stFv := 1; }      // STAT_NOFOLLOW
+      self.irAddInstrDirect(IRO_CONST_INT, stFlags, -1, -1, stFv);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, stB + 3, stFlags, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, stB, -1, 229); return dest;
+    }
+    // symlink(target, link) → sys_symlink(target, AT_CWD=-1, link) — id 230.
+    if (self.seq(fname, fnlen, "symlink", 7)) {
+      var syB: int64 := self.tempCount; var syR: int64 := 0; while syR < 4 { self.allocTemp(); syR := syR + 1; }
+      var syA: int64 := arg0;
+      if syA >= 0 { var t: int64 := self.lowerExpr(syA); self.irAddInstrDirect(IRO_STORE_LOCAL, syB, t, -1, 0); syA := self.nodeNext(syA); }
+      var syCwd: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, syCwd, -1, -1, -1);  // AT_CWD = -1
+      self.irAddInstrDirect(IRO_STORE_LOCAL, syB + 1, syCwd, -1, 0);
+      if syA >= 0 { var t: int64 := self.lowerExpr(syA); self.irAddInstrDirect(IRO_STORE_LOCAL, syB + 2, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, syB, -1, 230); return dest;
+    }
+    // nanosleep(ts, rem) → sys_sleep_ns (timespec→ns). rem ignoriert — id 233.
+    if (self.seq(fname, fnlen, "nanosleep", 9)) {
+      var nsB: int64 := self.tempCount; var nsR: int64 := 0; while nsR < 4 { self.allocTemp(); nsR := nsR + 1; }
+      if arg0 >= 0 { var t: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, nsB, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, nsB, -1, 233); return dest;
+    }
+    // lyxc→LyxOS: EPrintInt → stderr (Arg in Slot 0 wie PrintInt id 2, id 234).
+    if (self.seq(fname, fnlen, "EPrintInt", 9)) {
+      if arg0 >= 0 {
+        var epTemp: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, epTemp, -1, 0);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 234);
+      }
+      return dest;
+    }
+    // lyxc→LyxOS: ArgvGet(argv, i) → lea [argv+i*8]; deref (id 235, argBase 2-arg).
+    if (self.seq(fname, fnlen, "ArgvGet", 7)) {
+      var agB: int64 := self.tempCount; var agR: int64 := 0; while agR < 4 { self.allocTemp(); agR := agR + 1; }
+      var agA: int64 := arg0;
+      if agA >= 0 { var t: int64 := self.lowerExpr(agA); self.irAddInstrDirect(IRO_STORE_LOCAL, agB, t, -1, 0); agA := self.nodeNext(agA); }
+      if agA >= 0 { var t: int64 := self.lowerExpr(agA); self.irAddInstrDirect(IRO_STORE_LOCAL, agB + 1, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, agB, -1, 235); return dest;
+    }
+    // lyxc→LyxOS Gruppe D: fork/execve/wait4 → return -1 ("nicht unterstützt"). LyxOS hat
+    // KEIN fork/exec/wait-Prozessmodell (nur sys_spawn_child=91, synchron). Einzige Nutzer:
+    // self_test.lyx (Test-Harness, läuft nicht auf LyxOS) + lbf_loader (Linux-Tool). Lowering
+    // als -1 macht lyxc-LBF baubar; diese Pfade werden auf LyxOS nicht ausgeführt.
+    if (self.seq(fname, fnlen, "sys_fork", 8) || self.seq(fname, fnlen, "sys_execve", 10) ||
+        self.seq(fname, fnlen, "sys_wait4", 9)) {
+      self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, -1); return dest;
+    }
+    // rmdir(path) → sys_unlink(AT_CWD=-1, path, UNLINK_DIR=1) @ 0x0208 — id 236.
+    if (self.seq(fname, fnlen, "rmdir", 5)) {
+      var rdB: int64 := self.tempCount; var rdR: int64 := 0; while rdR < 4 { self.allocTemp(); rdR := rdR + 1; }
+      var rdCwd: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, rdCwd, -1, -1, -1);   // AT_CWD = -1
+      self.irAddInstrDirect(IRO_STORE_LOCAL, rdB, rdCwd, -1, 0);
+      if arg0 >= 0 { var t: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, rdB + 1, t, -1, 0); }
+      var rdFlag: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, rdFlag, -1, -1, 1);   // UNLINK_DIR = 1
+      self.irAddInstrDirect(IRO_STORE_LOCAL, rdB + 2, rdFlag, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, rdB, -1, 236); return dest;
+    }
+
+    // lyxc→LyxOS: sizeof(Type) → compile-time Konstante (Summe Feld-Größen),
+    // wie lowerNew. Primitive/unbekannt → 8. Emittiert IRO_CONST_INT statt Call.
+    if (self.seq(fname, fnlen, "sizeof", 6)) {
+      var szf: int64 := 8;
+      if arg0 >= 0 {
+        var szDecl: int64 := self._findTypeDecl(self.nodeSVal(arg0), self.nodeSLen(arg0));
+        if szDecl >= 0 { var ts: int64 := self._typeSizeOf(szDecl); if ts > 0 { szf := ts; } }
+      }
+      self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, szf); return dest;
+    }
+
+    // fix/lyxos-builtin-misdispatch: KEIN stiller id=1=PrintStr-Default mehr.
+    // Unbekannter Name (kein User-Fn, kein FFI-Extern, kein bekannter Builtin) =
+    // harter Compile-Fehler statt Garbage. Der stille Default versteckte den fb-Bug.
+    Print("lyxc: --target=lyxos: unbekannter Builtin/Funktion: "c);
+    var ucI: int64 := 0;
+    while (ucI < fnlen) { PrintChar(StrCharAt(fname, ucI)); ucI := ucI + 1; }
+    PrintLn(""c);
+    exit(1);
 
     return dest;
   }
@@ -2309,8 +2717,9 @@ pub type IRLower = class {
     var base: int64 := self.lowerExpr(self.nodeC0(expr));
     var idx: int64 := self.lowerExpr(self.nodeC1(expr));
     var dest: int64 := self.allocTemp();
-    
-    // Emit load from base[idx]
+    // ARM64-FIX: war Stub. base = Array-Pointer (aus IRO_ALLOC), idx = Index.
+    // emitLoadIdx: LDR dest, [base, idx, LSL #3] (8-Byte-Elemente).
+    self.irAddInstrDirect(IRO_LOAD_IDX, dest, base, idx, 0);
     return dest;
   }
   
@@ -2331,6 +2740,365 @@ pub type IRLower = class {
     if self.seq(tv, tl, "u32",   3) { return 4; }
     if self.seq(tv, tl, "f32",   3) { return 4; }
     return 8;
+  }
+
+  // ARM64-OOP: NK_TYPE_DECL für einen Typ-Namen finden (-1 wenn keiner).
+  fn _findTypeDecl(np: pchar, nl: int64): int64 {
+    var ti: int64 := 0;
+    while ti < self.nodeCount {
+      if self.nodeKind(ti) == NK_TYPE_DECL {
+        if self.seq(self.nodeSVal(ti), self.nodeSLen(ti), np, nl) { return ti; }
+      }
+      ti := ti + 1;
+    }
+    return 0 - 1;
+  }
+
+  // ARM64-OOP: Byte-Offset eines Feldes in NK_TYPE_DECL (-1 wenn nicht gefunden).
+  // WP-INH-lyxos: geerbte Basis-Felder zuerst (flach vorangestellt, wie ELF cg_buildClassLayout).
+  // Basis via extends (c2=NK_TYPE_NAME) inline aufgelöst (keine neue IRLower-Methode — Seed-vtable).
+  fn _fieldOffsetIn(typeDecl: int64, fp: pchar, fl: int64): int64 {
+    var off: int64 := 0;
+    var pn: int64 := self.nodeC2(typeDecl);
+    if pn >= 0 {
+      var base: int64 := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn));
+      if base >= 0 {
+        var bo: int64 := self._fieldOffsetIn(base, fp, fl);   // im Basis-Layout suchen
+        if bo >= 0 { return bo; }                             // gefunden → gleicher Offset
+        off := self._typeSizeOf(base);                        // eigene Felder beginnen nach Basis
+      }
+    }
+    var fd: int64 := self.nodeC0(typeDecl);
+    while fd >= 0 {
+      if self.seq(self.nodeSVal(fd), self.nodeSLen(fd), fp, fl) { return off; }
+      off := off + self.fieldTypeSize(self.nodeC0(fd));
+      fd := self.nodeNext(fd);
+    }
+    return 0 - 1;
+  }
+
+  // ARM64-OOP: Gesamtgröße (Summe Feld-Größen inkl. geerbter Basis-Felder) eines NK_TYPE_DECL.
+  fn _typeSizeOf(typeDecl: int64): int64 {
+    var sz: int64 := 0;
+    var pn: int64 := self.nodeC2(typeDecl);
+    if pn >= 0 {
+      var base: int64 := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn));
+      if base >= 0 { sz := sz + self._typeSizeOf(base); }    // WP-INH-lyxos: Basis-Felder mitzählen
+    }
+    var fd: int64 := self.nodeC0(typeDecl);
+    while fd >= 0 {
+      sz := sz + self.fieldTypeSize(self.nodeC0(fd));
+      fd := self.nodeNext(fd);
+    }
+    return sz;
+  }
+
+  // ARM64-OOP: type-name-Node eines Locals per Name (-1 wenn nicht local/kein Typ).
+  fn _localTypeNode(idp: pchar, idl: int64): int64 {
+    var idPtrL: int64 := (idp) as int64;
+    var li: int64 := self.localNameCnt - 1;
+    while li >= 0 {
+      var rec: int64 := self.localNameBuf + li * 24;
+      var ln:  int64 := peek64(rec + LOCAL_REC_OFF_NAMELEN);
+      if ln == idl {
+        var noff: int64 := peek64(rec + 0);
+        var nptr: int64 := (self.src as int64) + noff;
+        var m: int64 := 1;
+        var j: int64 := 0;
+        while j < idl { if m != 0 { if peek8(nptr + j) != peek8(idPtrL + j) { m := 0; } } j := j + 1; }
+        if m != 0 { return peek64(self.localTypeBuf + li * 8); }
+      }
+      li := li - 1;
+    }
+    // ARM64-OOP: nicht local → Params durchsuchen (NK_PARAM.c0 = Typ-Node).
+    if self.curFunc >= 0 {
+      var pn: int64 := self.nodeC0(self.curFunc);
+      while pn >= 0 {
+        if self.nodeKind(pn) == NK_PARAM {
+          if self.nodeSLen(pn) == idl {
+            var pptr: int64 := (self.nodeSVal(pn)) as int64;
+            var pm: int64 := 1;
+            var pj: int64 := 0;
+            while pj < idl { if pm != 0 { if peek8(pptr + pj) != peek8(idPtrL + pj) { pm := 0; } } pj := pj + 1; }
+            if pm != 0 { return self.nodeC0(pn); }
+          }
+        }
+        pn := self.nodeNext(pn);
+      }
+    }
+    return 0 - 1;
+  }
+
+  // ARM64-OOP: NK_TYPE_DECL der Klasse eines base-IDENT (-1 falls unauflösbar).
+  fn _baseClassDecl(baseNode: int64): int64 {
+    if self.nodeKind(baseNode) != NK_IDENT { return 0 - 1; }
+    var tn: int64 := 0 - 1;
+    // `self` in einer Methode → umgebende Klasse (curMethodClassType = NK_TYPE_DECL).
+    if self.methodParamBase != 0 && self.nodeSLen(baseNode) == 4 {
+      var sp: int64 := (self.nodeSVal(baseNode)) as int64;
+      if peek8(sp) == 115 && peek8(sp+1) == 101 && peek8(sp+2) == 108 && peek8(sp+3) == 102 {
+        tn := self.curMethodClassType;
+      }
+    }
+    if tn < 0 { tn := self._localTypeNode(self.nodeSVal(baseNode), self.nodeSLen(baseNode)); }
+    if tn < 0 { return 0 - 1; }
+    if self.nodeKind(tn) == NK_TYPE_DECL { return tn; }
+    if self.nodeKind(tn) == NK_TYPE_NAME { return self._findTypeDecl(self.nodeSVal(tn), self.nodeSLen(tn)); }
+    return 0 - 1;
+  }
+
+  // WP-VMT-lyxos: Typ-Node (NK_TYPE_DECL ODER NK_TYPE_NAME) der Klasse von baseNode.
+  // Liefert auch bei IMPORTIERTEN Klassen den Namen (sVal) — _baseClassDecl gibt dann -1,
+  // weil _findTypeDecl nur das aktuelle Modul scannt; Methoden-Dispatch braucht aber nur
+  // den Namen für statische Mangle "Class_method" (funcBuffer ist cross-module via _findFuncByName).
+  fn _baseTypeNode(baseNode: int64): int64 {
+    if self.nodeKind(baseNode) != NK_IDENT { return 0 - 1; }
+    if self.methodParamBase != 0 && self.nodeSLen(baseNode) == 4 {
+      var sp: int64 := (self.nodeSVal(baseNode)) as int64;
+      if peek8(sp) == 115 && peek8(sp+1) == 101 && peek8(sp+2) == 108 && peek8(sp+3) == 102 {
+        return self.curMethodClassType;
+      }
+    }
+    return self._localTypeNode(self.nodeSVal(baseNode), self.nodeSLen(baseNode));
+  }
+
+  // WP-VMT-lyxos: hat die Klasse (oder ein Vorfahre) eine virtuelle Methode? Dann reserviert
+  // das Objekt Offset 0 für die type-id (Felder ab +8). Methode-iVal Bits 1-3 = virtual/override/abstract.
+  fn _hasVmt(typeDecl: int64): int64 {
+    var tc: int64 := typeDecl;
+    while tc >= 0 {
+      var m: int64 := self.nodeC1(tc);
+      while m >= 0 {
+        if self.nodeKind(m) == NK_FUNC_DECL { if (self.nodeIVal(m) & 14) != 0 { return 1; } }
+        m := self.nodeNext(m);
+      }
+      var pn: int64 := self.nodeC2(tc);
+      if pn >= 0 { tc := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn)); } else { tc := 0 - 1; }
+    }
+    return 0;
+  }
+
+  // ARM64-OOP: Feld-Offset für Instanz-Zugriff baseNode.fieldName (-1 falls unauflösbar).
+  // WP-VMT-lyxos: +8 wenn die Klasse eine VMT hat (type-id @ Offset 0).
+  fn _instanceFieldOffset(baseNode: int64, fp: pchar, fl: int64): int64 {
+    // Fast-Path same-module/self: lokales decl direkt (kein Registry-Scan/ctx-Swap) — der
+    // häufigste Fall (self.field). _baseClassDecl löst self→curMethodClassType O(1).
+    var decl: int64 := self._baseClassDecl(baseNode);
+    if decl >= 0 {
+      var off: int64 := self._fieldOffsetIn(decl, fp, fl);
+      if off >= 0 { if self._hasVmt(decl) != 0 { off := off + 8; } }
+      return off;
+    }
+    // WP-XMOD-OOP: IMPORTIERTE Klasse (decl<0) → globales Registry (Offset im Definitionsmodul).
+    var tn: int64 := self._baseTypeNode(baseNode);
+    if tn < 0 { return 0 - 1; }
+    var g: int64 := self._tregFind(self.nodeSVal(tn), self.nodeSLen(tn));
+    if g < 0 { return 0 - 1; }
+    var offg: int64 := self._tregFieldOffG(g, fp, fl);
+    if offg >= 0 { if self._tregHasVmtG(g) != 0 { offg := offg + 8; } }
+    return offg;
+  }
+
+  // ARM64-OOP: funcBuffer-Index für einen (mangled) Funktionsnamen (-1 falls keiner).
+  fn _findFuncByName(np: pchar, nl: int64): int64 {
+    var fb: int64 := peek64(self.ir + IR_MOD_OFF_FUNCBUF);
+    var sb: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
+    var fc: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);
+    var npI: int64 := (np) as int64;
+    var i: int64 := 0;
+    while i < fc {
+      var off: int64 := peek64(fb + i * IR_FUNC_SIZE);
+      var ln:  int64 := peek64(fb + i * IR_FUNC_SIZE + IR_FUNC_OFF_NAMELEN);
+      if ln == nl {
+        var m: int64 := 1;
+        var j: int64 := 0;
+        while j < nl { if m != 0 { if peek8(sb + off + j) != peek8(npI + j) { m := 0; } } j := j + 1; }
+        if m != 0 { return i; }
+      }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  // ARM64-OOP: mangled Methoden-Name "Class_method" (null-term. Buffer-Pointer).
+  // Länge = clsL + 1 + mL. Identisch an allen 3 Sites (Pre-Pass, Emission, Dispatch).
+  fn _methodMangle(clsP: pchar, clsL: int64, mP: pchar, mL: int64): int64 {
+    var buf: int64 := alloc(clsL + 1 + mL + 1);
+    var i: int64 := 0;
+    while i < clsL { poke8(buf + i, peek8((clsP as int64) + i)); i := i + 1; }
+    poke8(buf + clsL, 95);  // '_'
+    var j: int64 := 0;
+    while j < mL { poke8(buf + clsL + 1 + j, peek8((mP as int64) + j)); j := j + 1; }
+    poke8(buf + clsL + 1 + mL, 0);
+    return buf;
+  }
+
+  // WP-VMT-lyxos: hat typeDecl SELBST (eigene c1-Chain) eine Methode namens (mNameP,mNameL)?
+  fn _classOwnHasMethod(typeDecl: int64, mNameP: pchar, mNameL: int64): int64 {
+    var m: int64 := self.nodeC1(typeDecl);
+    while m >= 0 {
+      if self.nodeKind(m) == NK_FUNC_DECL {
+        if self.seq(self.nodeSVal(m), self.nodeSLen(m), mNameP, mNameL) { return 1; }
+      }
+      m := self.nodeNext(m);
+    }
+    return 0;
+  }
+
+  // WP-VMT-lyxos: ist Methode (mNameP,mNameL) in typeDecl-oder-Vorfahr virtuell (iVal Bits 1-3)?
+  fn _methodVirtual(typeDecl: int64, mNameP: pchar, mNameL: int64): int64 {
+    var tc: int64 := typeDecl;
+    while tc >= 0 {
+      var m: int64 := self.nodeC1(tc);
+      while m >= 0 {
+        if self.nodeKind(m) == NK_FUNC_DECL {
+          if self.seq(self.nodeSVal(m), self.nodeSLen(m), mNameP, mNameL) {
+            if (self.nodeIVal(m) & 14) != 0 { return 1; }
+            return 0;   // gefunden, nicht virtuell
+          }
+        }
+        m := self.nodeNext(m);
+      }
+      var pn: int64 := self.nodeC2(tc);
+      if pn >= 0 { tc := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn)); } else { tc := 0 - 1; }
+    }
+    return 0;
+  }
+
+  // WP-VMT-lyxos: funcBuffer-Index der Methode (mNameP,mNameL), aufgelöst ab typeDecl nach oben
+  // (nächste eigene Definition; override gewinnt). -1 falls keine.
+  fn _resolveMethodIdx(typeDecl: int64, mNameP: pchar, mNameL: int64): int64 {
+    var tc: int64 := typeDecl;
+    while tc >= 0 {
+      if self._classOwnHasMethod(tc, mNameP, mNameL) != 0 {
+        var mang: int64 := self._methodMangle(self.nodeSVal(tc), self.nodeSLen(tc), mNameP, mNameL);
+        var mlen: int64 := self.nodeSLen(tc) + 1 + mNameL;
+        return self._findFuncByName(mang as pchar, mlen);
+      }
+      var pn: int64 := self.nodeC2(tc);
+      if pn >= 0 { tc := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn)); } else { tc := 0 - 1; }
+    }
+    return 0 - 1;
+  }
+
+  // WP-VMT-lyxos: erweitert Klasse `c` transitiv `ancestor` (echte Subklasse)?
+  fn _extendsClass(c: int64, ancestor: int64): int64 {
+    var pn: int64 := self.nodeC2(c);
+    while pn >= 0 {
+      var p: int64 := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn));
+      if p < 0 { return 0; }
+      if p == ancestor { return 1; }
+      pn := self.nodeC2(p);
+    }
+    return 0;
+  }
+
+  // ==================================================================
+  // WP-XMOD-OOP: globales Type-Registry (cross-module type-ids)
+  // ==================================================================
+
+  // Registriert den NK_TYPE_DECL `idx` des AKTUELLEN Modul-Kontexts (self.src/nodes/nodeCount
+  // müssen gesetzt sein). Dedup nach Name (eine Klasse ist in genau einem Modul definiert).
+  fn _tregRegister(idx: int64): void {
+    var np: pchar := self.nodeSVal(idx);
+    var nl: int64 := self.nodeSLen(idx);
+    if self._tregFind(np, nl) >= 0 { return; }
+    if self._tregN >= self._tregCap { return; }
+    var g: int64 := self._tregN;
+    poke64(self._tregSrc   + g * 8, self.src as int64);
+    poke64(self._tregNodes + g * 8, self.nodes);
+    poke64(self._tregCnt   + g * 8, self.nodeCount);
+    poke64(self._tregIdx   + g * 8, idx);
+    poke64(self._tregNameP + g * 8, np as int64);
+    poke64(self._tregNameL + g * 8, nl);
+    self._tregN := g + 1;
+  }
+
+  // Globale type-id eines Klassennamens (-1 falls keine). Namensvergleich via gespeicherte
+  // absolute Pointer (kein Kontext-Swap nötig).
+  fn _tregFind(np: pchar, nl: int64): int64 {
+    var npI: int64 := (np) as int64;
+    var i: int64 := 0;
+    while i < self._tregN {
+      if peek64(self._tregNameL + i * 8) == nl {
+        var p: int64 := peek64(self._tregNameP + i * 8);
+        var m: int64 := 1; var j: int64 := 0;
+        while j < nl { if m != 0 { if peek8(p + j) != peek8(npI + j) { m := 0; } } j := j + 1; }
+        if m != 0 { return i; }
+      }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  // Kontext-Swap-Wrapper: führen einen vorhandenen Helfer im Modul-Kontext von type-id g aus.
+  fn _tregSizeG(g: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._typeSizeOf(peek64(self._tregIdx + g * 8));
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  fn _tregHasVmtG(g: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._hasVmt(peek64(self._tregIdx + g * 8));
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  fn _tregFieldOffG(g: int64, fp: pchar, fl: int64): int64 {
+    if g < 0 { return 0 - 1; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._fieldOffsetIn(peek64(self._tregIdx + g * 8), fp, fl);
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  fn _tregMethodVirtualG(g: int64, mp: pchar, ml: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._methodVirtual(peek64(self._tregIdx + g * 8), mp, ml);
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  fn _tregOwnHasMethodG(g: int64, mp: pchar, ml: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._classOwnHasMethod(peek64(self._tregIdx + g * 8), mp, ml);
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  // funcBuffer-Index der Methode (mp,ml) ab type-id g nach oben aufgelöst. _findFuncByName ist
+  // cross-module (funcBuffer global); der Mangle nutzt den Klassennamen aus g's Kontext.
+  fn _tregResolveMethodIdxG(g: int64, mp: pchar, ml: int64): int64 {
+    if g < 0 { return 0 - 1; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._resolveMethodIdx(peek64(self._tregIdx + g * 8), mp, ml);
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  // Erweitert type-id g transitiv ancestorG? (Eltern-Kette in Registry-Space.)
+  fn _extendsClassG(g: int64, ancestorG: int64): int64 {
+    var cur: int64 := g;
+    while cur >= 0 {
+      var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+      self.src := peek64(self._tregSrc + cur * 8) as pchar; self.nodes := peek64(self._tregNodes + cur * 8); self.nodeCount := peek64(self._tregCnt + cur * 8);
+      var pn: int64 := self.nodeC2(peek64(self._tregIdx + cur * 8));
+      var pName: pchar := 0 as pchar; var pLen: int64 := 0;
+      if pn >= 0 { pName := self.nodeSVal(pn); pLen := self.nodeSLen(pn); }
+      self.src := sS; self.nodes := sN; self.nodeCount := sC;
+      if pLen == 0 { return 0; }
+      var pg: int64 := self._tregFind(pName, pLen);
+      if pg < 0 { return 0; }
+      if pg == ancestorG { return 1; }
+      cur := pg;
+    }
+    return 0;
   }
 
   fn lowerField(expr: int64): int64 {
@@ -2373,8 +3141,12 @@ pub type IRLower = class {
       }
     }
 
-    // Instance field access or unresolved type — lower base, dest stays 0
+    // ARM64-OOP: Instanz-Feldzugriff p.x — base = Objekt-Pointer, Offset aus p's Typ.
     var base: int64 := self.lowerExpr(baseNode);
+    var ifOff: int64 := self._instanceFieldOffset(baseNode, self.nodeSVal(expr), self.nodeSLen(expr));
+    if ifOff >= 0 {
+      self.irAddInstrDirect(IRO_LOAD_FIELD, dest, base, ifOff, 0);
+    }
     return dest;
   }
   
@@ -2396,10 +3168,55 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerNew(expr: int64): int64 {
-    // Type to allocate is in C0
+    // ARM64-OOP: `new T()` → IRO_ALLOC(typeSize) → dest = Objekt-Pointer.
+    // Typname = sVal des NK_NEW-Nodes (c0 = Konstruktor-Args, hier ignoriert).
+    // Layout: plain structs/methodenlose Klassen Felder ab Offset 0.
+    // WP-VMT-lyxos: Klassen MIT virtueller Methode reservieren Offset 0 für die type-id
+    // (= NK_TYPE_DECL-Node-Index), Felder ab +8. new schreibt die type-id nach obj[0].
     var dest: int64 := self.allocTemp();
-    
-    // Emit allocation
+    // WP-XMOD-OOP: Typ über globales Registry auflösen (auch IMPORTIERTE Klassen) → korrekte
+    // Größe/VMT/type-id. type-id = globaler Registry-Index g (modul-unabhängig, konsistent mit
+    // virtueller Dispatch). Vorher: _findTypeDecl(cwd) → importierte Klasse = Default-Größe 8.
+    var g: int64 := self._tregFind(self.nodeSVal(expr), self.nodeSLen(expr));
+    var sz: int64 := 8;
+    var hasVmt: int64 := 0;
+    if g >= 0 {
+      var tsz: int64 := self._tregSizeG(g);
+      if tsz > 0 { sz := tsz; }
+      hasVmt := self._tregHasVmtG(g);
+      if hasVmt != 0 { sz := sz + 8; }   // type-id-Slot @ Offset 0
+    }
+    var szTemp: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, szTemp, -1, -1, sz);
+    self.irAddInstrDirect(IRO_ALLOC, dest, szTemp, -1, 0);
+    if hasVmt != 0 {
+      // type-id (= globaler Registry-Index g) nach obj[0] schreiben — Laufzeit-Typ für virtuelle Dispatch.
+      var tidTemp: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, tidTemp, -1, -1, g);
+      self.irAddInstrDirect(IRO_STORE_FIELD, 0, tidTemp, dest, 0);   // STORE_FIELD(off=0, value=tid, base=obj)
+    }
+    // WP-CTOR-lyxos: Konstruktor `ClassName_Create(self, args...)` aufrufen falls definiert
+    // (Konvention wie ELF codegen_x86 #683). Vorher wurden Konstruktor-Args ignoriert →
+    // new C(11) ließ Felder 0. Args = NK_NEW.c0-Chain; self = neues Objekt @ argBase[0].
+    var ccName: pchar := "Create"c;
+    var ctorMang: int64 := self._methodMangle(self.nodeSVal(expr), self.nodeSLen(expr), ccName, 6);
+    var ctorLen:  int64 := self.nodeSLen(expr) + 1 + 6;
+    var ctorIdx:  int64 := self._findFuncByName(ctorMang as pchar, ctorLen);
+    if ctorIdx >= 0 {
+      var cArgBase: int64 := self.tempCount;
+      var cRsv: int64 := 0; while cRsv < 8 { self.allocTemp(); cRsv := cRsv + 1; }
+      self.irAddInstrDirect(IRO_STORE_LOCAL, cArgBase, dest, -1, 0);   // self = neues Objekt
+      var cCnt: int64 := 1;
+      var cArg: int64 := self.nodeC0(expr);
+      while cArg >= 0 {
+        var cT: int64 := self.lowerExpr(cArg);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, cArgBase + cCnt, cT, -1, 0);
+        cCnt := cCnt + 1;
+        cArg := self.nodeNext(cArg);
+      }
+      var ctorRes: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CALL, ctorRes, ctorIdx, cArgBase, cCnt);
+    }
     return dest;
   }
   
@@ -2527,6 +3344,22 @@ pub type IRLower = class {
       if vdInit >= 0 {
         var vdTemp: int64 := self.lowerExpr(vdInit);
         self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdTemp, -1, 0);
+      } else {
+        // ARM64-FIX: `var a: [N]T` ohne Init → Heap-Storage allozieren, vdSlot = Pointer
+        // (wie x86 codegen). 8 Byte/Element (emitLoadIdx/StoreIdx nutzen LSL#3).
+        var vdType: int64 := self.nodeC0(stmt);
+        if vdType >= 0 && self.nodeKind(vdType) == NK_TYPE_ARRAY_FIXED {
+          var vdSzNode: int64 := self.nodeC1(vdType);
+          var vdN: int64 := 0;
+          if vdSzNode >= 0 && self.nodeKind(vdSzNode) == NK_LIT_INT {
+            vdN := self.nodeIVal(vdSzNode);
+          }
+          if vdN > 0 {
+            var vdSzTemp: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_CONST_INT, vdSzTemp, -1, -1, vdN * 8);
+            self.irAddInstrDirect(IRO_ALLOC, vdSlot, vdSzTemp, -1, 0);
+          }
+        }
       }
       // Register name -> slot. Grow the buffer geometrically if full.
       if self.localNameCnt >= self.localNameCap {
@@ -2535,12 +3368,18 @@ pub type IRLower = class {
         var vdI: int64 := 0;
         memcpy(vdNb, self.localNameBuf, self.localNameCnt * 24);
         self.localNameBuf := vdNb;
+        // ARM64-OOP: localTypeBuf parallel mit-growen.
+        var vdTb: int64 := alloc(vdNewCap * 8);
+        memcpy(vdTb, self.localTypeBuf, self.localNameCnt * 8);
+        self.localTypeBuf := vdTb;
         self.localNameCap := vdNewCap;
       }
       var vdRec: int64 := self.localNameBuf + self.localNameCnt * 24;
       poke64(vdRec +  0, peek64(self.nodeOff(stmt) + NODE_OFF_SVAL));  // src nameOff
       poke64(vdRec +  8, self.nodeSLen(stmt));
       poke64(vdRec + LOCAL_REC_OFF_SLOT, vdSlot);
+      // ARM64-OOP: Typ-Node des Locals merken (nodeC0 = Typ; -1 wenn keiner).
+      poke64(self.localTypeBuf + self.localNameCnt * 8, self.nodeC0(stmt));
       self.localNameCnt := self.localNameCnt + 1;
     }
     // Try/Catch/Finally handled in lowering blocks
@@ -2971,20 +3810,113 @@ pub type IRLower = class {
     var target: int64 := self.nodeC0(stmt);
     var val: int64 := self.nodeC1(stmt);
     
-    if (target >= 0 && val >= 0) { 
+    if (target >= 0 && val >= 0) {
       var valTemp: int64 := self.lowerExpr(val);
-      
-      // Target is IDENT
+
+      // Target is IDENT — store to local variable or parameter slot.
+      // ARM64-FIX: war Stub (kein Store emittiert) → Assignments waren no-ops,
+      // while-Schleifen liefen endlos. Slot-Resolution spiegelt den Read-Pfad
+      // (NK_IDENT in lowerExpr): erst localNameBuf (latest-first/shadowing), dann Params.
       if (self.nodeKind(target) == NK_IDENT) {
-        // Emit: store to local variable
+        if self.curFunc >= 0 {
+          var idName: pchar := self.nodeSVal(target);
+          var idLen:  int64 := self.nodeSLen(target);
+          var idPtrL: int64 := (idName) as int64;
+          var slot:   int64 := 0 - 1;
+          var lnI:    int64 := self.localNameCnt - 1;
+          while lnI >= 0 {
+            if slot < 0 {
+              var lnRec:    int64 := self.localNameBuf + lnI * 24;
+              var lnLen:    int64 := peek64(lnRec + LOCAL_REC_OFF_NAMELEN);
+              if lnLen == idLen {
+                var lnNameOff: int64 := peek64(lnRec + 0);
+                var lnPtr:     int64 := (self.src as int64) + lnNameOff;
+                var lnMatch:   int64 := 1;
+                var lnJ:       int64 := 0;
+                while lnJ < idLen {
+                  if lnMatch != 0 {
+                    if peek8(lnPtr + lnJ) != peek8(idPtrL + lnJ) { lnMatch := 0; }
+                  }
+                  lnJ := lnJ + 1;
+                }
+                if lnMatch != 0 { slot := peek64(lnRec + LOCAL_REC_OFF_SLOT); }
+              }
+            }
+            lnI := lnI - 1;
+          }
+          if slot < 0 {
+            var pnode: int64 := self.nodeC0(self.curFunc);
+            var pidx:  int64 := 0;
+            while pnode >= 0 {
+              if self.nodeKind(pnode) == NK_PARAM {
+                if slot < 0 {
+                  var pnLen: int64 := self.nodeSLen(pnode);
+                  if pnLen == idLen {
+                    var pnPtr:  int64 := (self.nodeSVal(pnode)) as int64;
+                    var pmatch: int64 := 1;
+                    var pj:     int64 := 0;
+                    while pj < idLen {
+                      if pmatch != 0 {
+                        if peek8(pnPtr + pj) != peek8(idPtrL + pj) { pmatch := 0; }
+                      }
+                      pj := pj + 1;
+                    }
+                    if pmatch != 0 { slot := pidx; }
+                  }
+                }
+                pidx := pidx + 1;
+              }
+              pnode := self.nodeNext(pnode);
+            }
+          }
+          if slot >= 0 {
+            self.irAddInstrDirect(IRO_STORE_LOCAL, slot, valTemp, -1, 0);
+          } else {
+            // ARM64-FIX: kein local/param → global suchen (globalNameBuf) und
+            // IRO_STORE_GLOBAL(gIdx, value) emittieren. Sonst war `g := x` für
+            // module-scope Globals ein no-op (Write persistierte nicht).
+            var asgGI: int64 := 0;
+            var asgFound: int64 := 0 - 1;
+            while asgGI < self.globalNameCnt {
+              if asgFound < 0 {
+                var asgRec:  int64 := self.globalNameBuf + asgGI * 32;
+                var asgLen:  int64 := peek64(asgRec + GLOBAL_REC_OFF_NAMELEN);
+                if asgLen == idLen {
+                  var asgOff:  int64 := peek64(asgRec + 0);
+                  var asgPtr:  int64 := peek64(self.ir + IR_MOD_OFF_STRBUF) + asgOff;
+                  var asgM:    int64 := 1;
+                  var asgJ:    int64 := 0;
+                  while asgJ < idLen {
+                    if asgM != 0 {
+                      if peek8(asgPtr + asgJ) != peek8(idPtrL + asgJ) { asgM := 0; }
+                    }
+                    asgJ := asgJ + 1;
+                  }
+                  if asgM != 0 { asgFound := peek64(asgRec + GLOBAL_REC_OFF_IDX); }
+                }
+              }
+              asgGI := asgGI + 1;
+            }
+            if asgFound >= 0 {
+              self.irAddInstrDirect(IRO_STORE_GLOBAL, asgFound, valTemp, -1, 0);
+            }
+          }
+        }
       }
-      // Target is FIELD
+      // Target is FIELD — ARM64-OOP: p.x := v → IRO_STORE_FIELD(value, base, fieldOff).
       else if (self.nodeKind(target) == NK_FIELD) {
-        // Emit: store to field
+        var afBase: int64 := self.lowerExpr(self.nodeC0(target));
+        var afOff:  int64 := self._instanceFieldOffset(self.nodeC0(target), self.nodeSVal(target), self.nodeSLen(target));
+        if afOff >= 0 {
+          self.irAddInstrDirect(IRO_STORE_FIELD, afOff, valTemp, afBase, 0);
+        }
       }
-      // Target is INDEX
+      // Target is INDEX — store to array element. ARM64-FIX: war Stub.
+      // IRO_STORE_IDX: src1=value, src2=base, dest=idx (emitStoreIdx: STR value,[base,idx,LSL#3]).
       else if (self.nodeKind(target) == NK_INDEX) {
-        // Emit: store to array element
+        var aiBase: int64 := self.lowerExpr(self.nodeC0(target));
+        var aiIdx:  int64 := self.lowerExpr(self.nodeC1(target));
+        self.irAddInstrDirect(IRO_STORE_IDX, aiIdx, valTemp, aiBase, 0);
       }
     }
   }
@@ -3131,6 +4063,8 @@ pub type IRLower = class {
     // so they line up with the AAPCS64 spill the prologue performs and with
     // NK_IDENT's pidx-based loads. retValTemp moves AFTER params so it
     // doesn't share a slot with the first spilled parameter.
+    // ARM64-OOP: bei Methoden belegt das implizite self Slot 0 (= erstes Arg x0).
+    if self.methodParamBase != 0 { self.allocParam(); }
     var param: int64 := self.nodeC0(funcNode);
     while (param >= 0) {
       self.allocParam();
@@ -3247,6 +4181,19 @@ pub type IRLower = class {
           var pfNameOff: int64 := self.irAddString(pfNamePtr, pfNameLen);
           self.irAddFunc(pfNameOff, pfNameLen, 0, 0);
         }
+      } else if pfKind == NK_TYPE_DECL {
+        // ARM64-OOP: Methoden (c1-Chain) unter mangled Namen "Class_method" registrieren.
+        var pmM: int64 := self.nodeC1(pfCur);
+        while pmM >= 0 {
+          if self.nodeKind(pmM) == NK_FUNC_DECL {
+            var pmMang: int64 := self._methodMangle(self.nodeSVal(pfCur), self.nodeSLen(pfCur),
+                                                    self.nodeSVal(pmM), self.nodeSLen(pmM));
+            var pmLen:  int64 := self.nodeSLen(pfCur) + 1 + self.nodeSLen(pmM);
+            var pmOff:  int64 := self.irAddString(pmMang as pchar, pmLen);
+            self.irAddFunc(pmOff, pmLen, 0, 0);
+          }
+          pmM := self.nodeNext(pmM);
+        }
       } else if pfKind == NK_GENERIC_DECL {
         // WP-2.1: register generic declarations in genFuncBuf, NOT funcBuffer.
         // They are not emitted directly — only their specializations are.
@@ -3267,6 +4214,123 @@ pub type IRLower = class {
       pfCur := self.nodeNext(pfCur);
     }
 
+    // StrLen-fix: globaler TRANSITIVER Import-Funktions-Pre-Pass (nur top-level lowerModule).
+    // Registriert ALLE (transitiv) importierten Top-Level-Funktionen im funcBuffer BEVOR
+    // irgendein Body gelowert wird. Sonst scheitert ein Modul-Body, der eine Funktion aus
+    // einem in Quelltext-Reihenfolge noch nicht verarbeiteten Import nutzt (z.B.
+    // error_collector → StrLen aus std.string; lyxc importiert std.string nur transitiv).
+    // Iterativ (Work-Queue, KEINE neue IRLower-Methode — Seed-vtable-Schutz, vgl. v3-Kommentar)
+    // mit Pfad-Dedup gegen Mehrfach-Parse bei Diamond-Imports.
+    if self._importsDone == 0 {
+      self._importsDone := 1;
+      var WLCAP: int64 := 4096;
+      var wlSrc:   int64 := alloc(WLCAP * 8);
+      var wlNodes: int64 := alloc(WLCAP * 8);
+      var wlCnt:   int64 := alloc(WLCAP * 8);
+      var wlHead:  int64 := alloc(WLCAP * 8);
+      var wlW: int64 := 0; var wlR: int64 := 0;
+      // Visited-Pfade (Dedup): Bytes + (off,len)-Paare.
+      var visBuf:  int64 := alloc(256 * 1024);
+      var visPair: int64 := alloc(WLCAP * 16);
+      var visN: int64 := 0; var visUsed: int64 := 0;
+      // Seed = aktuelles (top) Modul.
+      poke64(wlSrc, self.src as int64); poke64(wlNodes, self.nodes);
+      poke64(wlCnt, self.nodeCount);    poke64(wlHead, decls);
+      wlW := 1;
+      while wlR < wlW {
+        var mSrc:   int64 := peek64(wlSrc + wlR * 8);
+        var mNodes: int64 := peek64(wlNodes + wlR * 8);
+        var mCnt:   int64 := peek64(wlCnt + wlR * 8);
+        var mHead:  int64 := peek64(wlHead + wlR * 8);
+        wlR := wlR + 1;
+        var svSrc: pchar := self.src; var svNodes: int64 := self.nodes; var svCnt: int64 := self.nodeCount;
+        self.src := mSrc as pchar; self.nodes := mNodes; self.nodeCount := mCnt;
+        var dc: int64 := mHead;
+        while dc >= 0 {
+          // WP-XMOD-OOP: jeden NK_TYPE_DECL dieses Moduls global registrieren (stabile type-id).
+          if self.nodeKind(dc) == NK_TYPE_DECL { self._tregRegister(dc); }
+          if self.nodeKind(dc) == NK_IMPORT {
+            var nmP: pchar := self.nodeSVal(dc); var nmL: int64 := self.nodeSLen(dc);
+            // Pfad "a.b.c" -> "a/b/c.lyx"
+            var pb: int64 := alloc(nmL + 8); var pi: int64 := 0;
+            while pi < nmL {
+              var ch: int64 := peek8((nmP as int64) + pi);
+              if ch == 46 { ch := 47; }
+              poke8(pb + pi, ch); pi := pi + 1;
+            }
+            var dotLyx: pchar := ".lyx";
+            memcpy(pb + nmL, dotLyx as int64, 5);
+            // Dedup gegen visited (Modul-Name nmL Bytes).
+            var seen: int64 := 0; var vi: int64 := 0;
+            while vi < visN {
+              if peek64(visPair + vi * 16 + 8) == nmL {
+                var vo: int64 := peek64(visPair + vi * 16); var bm: int64 := 1; var bi: int64 := 0;
+                while bi < nmL { if peek8(visBuf + vo + bi) != peek8(pb + bi) { bm := 0; bi := nmL; } bi := bi + 1; }
+                if bm != 0 { seen := 1; vi := visN; }
+              }
+              vi := vi + 1;
+            }
+            if seen == 0 {
+              // visited eintragen
+              var ci: int64 := 0;
+              while ci < nmL { poke8(visBuf + visUsed + ci, peek8(pb + ci)); ci := ci + 1; }
+              poke64(visPair + visN * 16, visUsed); poke64(visPair + visN * 16 + 8, nmL);
+              visN := visN + 1; visUsed := visUsed + nmL;
+              var isrc: pchar := FileReadAll(pb as pchar);
+              if (isrc as int64) != 0 {
+                var ip: Parser := new Parser();
+                ip.Init(isrc, StrLen(isrc));
+                var ih: int64 := ip.Parse();
+                if ip.hadError == 0 {
+                  // Top-Level-Funktionen dieses Imports registrieren (src=ip.src).
+                  var rsv: pchar := self.src; var rnd: int64 := self.nodes; var rcn: int64 := self.nodeCount;
+                  self.src := ip.src; self.nodes := ip.nodes; self.nodeCount := ip.nodeCount;
+                  var fd2: int64 := ih;
+                  while fd2 >= 0 {
+                    if self.nodeKind(fd2) == NK_FUNC_DECL {
+                      var ext2: int64 := 0;
+                      if self.nodeC2(fd2) == -1 && self.nodeC3(fd2) != -1 { ext2 := 1; }
+                      if ext2 == 0 {
+                        var noff: int64 := self.irAddString(self.nodeSVal(fd2), self.nodeSLen(fd2));
+                        self.irAddFunc(noff, self.nodeSLen(fd2), 0, 0);
+                      }
+                    } else if self.nodeKind(fd2) == NK_TYPE_DECL {
+                      // WP-VMT-lyxos: Methoden importierter Klassen mangled registrieren
+                      // ("Class_method") — sonst scheitert ein Methoden-Call im importierenden
+                      // Modul, das VOR dem Import gelowert wird (Ordering, vgl. StrLen-Pre-Pass).
+                      var mm: int64 := self.nodeC1(fd2);
+                      while mm >= 0 {
+                        if self.nodeKind(mm) == NK_FUNC_DECL {
+                          if self.nodeC2(mm) >= 0 {   // nur mit Body
+                            var mMang: int64 := self._methodMangle(self.nodeSVal(fd2), self.nodeSLen(fd2),
+                                                                   self.nodeSVal(mm), self.nodeSLen(mm));
+                            var mLen:  int64 := self.nodeSLen(fd2) + 1 + self.nodeSLen(mm);
+                            var mOff:  int64 := self.irAddString(mMang as pchar, mLen);
+                            self.irAddFunc(mOff, mLen, 0, 0);
+                          }
+                        }
+                        mm := self.nodeNext(mm);
+                      }
+                    }
+                    fd2 := self.nodeNext(fd2);
+                  }
+                  self.src := rsv; self.nodes := rnd; self.nodeCount := rcn;
+                  // Transitiv enqueuen.
+                  if wlW < WLCAP {
+                    poke64(wlSrc + wlW * 8, ip.src as int64); poke64(wlNodes + wlW * 8, ip.nodes);
+                    poke64(wlCnt + wlW * 8, ip.nodeCount);    poke64(wlHead + wlW * 8, ih);
+                    wlW := wlW + 1;
+                  }
+                }
+              }
+            }
+          }
+          dc := self.nodeNext(dc);
+        }
+        self.src := svSrc; self.nodes := svNodes; self.nodeCount := svCnt;
+      }
+    }
+
     var cur: int64 := decls;
     while (cur >= 0) {
       var kind: int64 := self.nodeKind(cur);
@@ -3276,6 +4340,29 @@ pub type IRLower = class {
         if self.nodeC2(cur) == -1 && self.nodeC3(cur) != -1 { bodyIsExtern := 1; }
         if bodyIsExtern == 0 {
           self.lowerFunc(cur);
+        }
+      } else if (kind == NK_TYPE_DECL) {
+        // ARM64-OOP: Methoden (c1-Chain) als Funktionen mit mangled Namen + impliziten
+        // self-Param (Slot 0) lowern. methodParamBase=1 verschiebt explizite Params,
+        // curMethodClassType erlaubt `self.field`-Auflösung.
+        var mtM: int64 := self.nodeC1(cur);
+        while mtM >= 0 {
+          if self.nodeKind(mtM) == NK_FUNC_DECL {
+            if self.nodeC2(mtM) >= 0 {   // nur mit Body
+              var mtMang: int64 := self._methodMangle(self.nodeSVal(cur), self.nodeSLen(cur),
+                                                      self.nodeSVal(mtM), self.nodeSLen(mtM));
+              self.overrideFuncName    := mtMang as pchar;
+              self.overrideFuncNameLen := self.nodeSLen(cur) + 1 + self.nodeSLen(mtM);
+              self.methodParamBase     := 1;
+              self.curMethodClassType  := cur;
+              self.lowerFunc(mtM);
+              self.overrideFuncName    := 0 as pchar;
+              self.overrideFuncNameLen := 0;
+              self.methodParamBase     := 0;
+              self.curMethodClassType  := 0 - 1;
+            }
+          }
+          mtM := self.nodeNext(mtM);
         }
       } else if (kind == NK_GENERIC_DECL) {
         // WP-2.1: generic declarations are emitted only as specializations (see below)
