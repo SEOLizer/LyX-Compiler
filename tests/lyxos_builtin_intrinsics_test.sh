@@ -80,6 +80,14 @@ run "f64_sqrt"  'fn main(): int64 { var f: f64 := 16.0; return sqrt(f) as int64;
 run "f64_itof_ftoi" 'fn main(): int64 { var i: int64 := 7; var f: f64 := i as f64; return f as int64; }' 7
 run "f64_cmp"   'fn main(): int64 { var a: f64 := 3.0; var b: f64 := 2.0; if a > b { return 1; } return 0; }' 1
 
+# --- WP-ADDR: @local (Adresse-von) runtime ---
+run "addr_read"  'fn main(): int64 { var x: int64 := 42; var p: int64 := @x; return peek64(p); }' 42
+run "addr_write" 'fn main(): int64 { var x: int64 := 5; var p: int64 := @x; poke64(p, 99); return x; }' 99
+# --- WP-F64-CMP: ucomisd (korrekt auch für NEGATIVE f64; vorher Integer-CMP der Bits) ---
+run "f64_cmp_neg"     'fn main(): int64 { var a: f64 := 0.0 - 5.0; var b: f64 := 0.0 - 2.0; if a < b { return 1; } return 0; }' 1
+run "f64_cmp_neg_pos" 'fn main(): int64 { var a: f64 := 0.0 - 1.0; var b: f64 := 1.0; if a < b { return 7; } return 0; }' 7
+run "f64_cmp_eq"      'fn main(): int64 { var a: f64 := 2.5; var b: f64 := 2.5; if a == b { return 3; } return 0; }' 3
+
 # --- peek16 Word-Read (Laufzeit, rodata) ---
 run "peek16_low"  'fn main(): int64 { return peek16("AB") & 0xFF; }' 65
 run "peek16_high" 'fn main(): int64 { return (peek16("AB") >> 8) & 0xFF; }' 66
