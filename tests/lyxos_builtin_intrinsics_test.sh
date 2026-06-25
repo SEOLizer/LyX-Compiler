@@ -66,6 +66,11 @@ fn main(): int64 { var a: A := new D(); return a.S(); }'
 compile_ok "field_heavy" 'type H = class { a:int64; b:int64; c:int64; d:int64; e:int64; f:int64; fn G(): int64 { return self.f; } };
 fn main(): int64 { var h: H := new H(); return h.G(); }' 
 
+# --- WP-OPCODE-REST: Div/Mod durch 0 → kontrollierter Panic (Exit 1) statt SIGFPE ---
+run "div_by_zero_panic"  'fn main(): int64 { var z: int64 := 0; var a: int64 := 10; return a / z; }' 1
+run "mod_by_zero_panic"  'fn main(): int64 { var z: int64 := 0; var a: int64 := 10; return a % z; }' 1
+run "div_ok_unaffected"  'fn main(): int64 { var a: int64 := 20; var b: int64 := 4; return a / b; }' 5
+
 # --- peek16 Word-Read (Laufzeit, rodata) ---
 run "peek16_low"  'fn main(): int64 { return peek16("AB") & 0xFF; }' 65
 run "peek16_high" 'fn main(): int64 { return (peek16("AB") >> 8) & 0xFF; }' 66
