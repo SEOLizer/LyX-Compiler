@@ -403,6 +403,72 @@ pub type EmitLyxOS = class {
         self.emitMovSlotFromRax(dest);
     }
 
+    // WP-SIMD: aligned f32-Buffer allozieren. IN: rcx=Element-Anzahl. OUT: rax=16-Byte-aligned ptr,
+    // Anzahl @ [rax-8]. mmap(0, n*4+24, PROT_RW=3, MAP_PRIVATE|ANON=0x22, -1, 0); align (ptr+23)&~15.
+    // (Mirror ELF codegen_x86 SIMD_NEW; flags 0x22 = auf Linux gültig → lbf_run-testbar.)
+    fn emitSimdAllocFromRcx(): void {
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xC8);   // mov rax, rcx
+        self.emit8(0x50);                                        // push rax (count)
+        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE0); self.emit8(0x02);  // shl rax, 2
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x18);  // add rax, 24
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xFF);   // xor rdi, rdi
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xC6);   // mov rsi, rax
+        self.emit8(0x48); self.emit8(0xC7); self.emit8(0xC2); self.emit8(0x03); self.emit8(0x00); self.emit8(0x00); self.emit8(0x00);  // mov rdx, 3
+        self.emit8(0x41); self.emit8(0xBA); self.emit8(0x22); self.emit8(0x00); self.emit8(0x00); self.emit8(0x00);  // mov r10d, 0x22
+        self.emit8(0x49); self.emit8(0xC7); self.emit8(0xC0); self.emit8(0xFF); self.emit8(0xFF); self.emit8(0xFF); self.emit8(0xFF);  // mov r8, -1
+        self.emit8(0x45); self.emit8(0x31); self.emit8(0xC9);   // xor r9d, r9d
+        self.emit8(0xB8); self.emit8(0x09); self.emit8(0x00); self.emit8(0x00); self.emit8(0x00);  // mov eax, 9 (mmap)
+        self.emit8(0x0F); self.emit8(0x05);                     // syscall
+        self.emit8(0x59);                                       // pop rcx (count)
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x17);  // add rax, 23
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xE0); self.emit8(0xF0);  // and rax, -16
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0x48); self.emit8(0xF8);  // mov [rax-8], rcx
+    }
+    fn emitSimdNew(dest: int64, cntSlot: int64): void {
+        self.emitMovRcxFromSlot(cntSlot);
+        self.emitSimdAllocFromRcx();
+        self.emitMovSlotFromRax(dest);
+    }
+    // WP-SIMD: vektorisierte f32-Binop. src1/src2=SIMD-ptr-Slots; alloc Ergebnis (gleiche Anzahl);
+    // SSE2-Loop (movaps/packed-op/movaps); dest=Ergebnis-ptr. packedOp: addps 0x58/subps 0x5C/mulps 0x59/divps 0x5E.
+    fn emitSimdBinOp(packedOp: int64, dest: int64, src1: int64, src2: int64): void {
+        self.emitMovRaxFromSlot(src1); self.emit8(0x48); self.emit8(0x89); self.emit8(0xC7);  // mov rdi, rax (lhs)
+        self.emitMovRaxFromSlot(src2); self.emit8(0x48); self.emit8(0x89); self.emit8(0xC6);  // mov rsi, rax (rhs)
+        self.emit8(0x48); self.emit8(0x8B); self.emit8(0x4F); self.emit8(0xF8);  // mov rcx, [rdi-8] (count)
+        self.emit8(0x51); self.emit8(0x57); self.emit8(0x56);                    // push rcx; push rdi; push rsi
+        self.emitSimdAllocFromRcx();                                             // rax = dst ptr
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xC2);                    // mov rdx, rax (dst)
+        self.emit8(0x5E); self.emit8(0x5F); self.emit8(0x59);                    // pop rsi; pop rdi; pop rcx
+        self.emit8(0x31); self.emit8(0xC0);                                      // xor eax, eax
+        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE1); self.emit8(0x02);  // shl rcx, 2 (byte count)
+        self.emit8(0x48); self.emit8(0x39); self.emit8(0xC8);                    // loop: cmp rax, rcx
+        self.emit8(0x7D); self.emit8(0x15);                                      // jge +21 (done)
+        self.emit8(0x0F); self.emit8(0x28); self.emit8(0x04); self.emit8(0x07);  // movaps xmm0, [rdi+rax]
+        self.emit8(0x0F); self.emit8(0x28); self.emit8(0x0C); self.emit8(0x06);  // movaps xmm1, [rsi+rax]
+        self.emit8(0x0F); self.emit8(packedOp); self.emit8(0xC1);               // packed op xmm0, xmm1
+        self.emit8(0x0F); self.emit8(0x29); self.emit8(0x04); self.emit8(0x02);  // movaps [rdx+rax], xmm0
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x10);  // add rax, 16
+        self.emit8(0xEB); self.emit8(0xE6);                                      // jmp loop
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);                    // done: mov rax, rdx
+        self.emitMovSlotFromRax(dest);
+    }
+    // WP-SIMD: f32-Element laden + nach f64. dest=f64-Slot, ptrSlot=SIMD-ptr, idxSlot=Index.
+    fn emitSimdLoadElem(dest: int64, ptrSlot: int64, idxSlot: int64): void {
+        self.emitMovRaxFromSlot(ptrSlot);
+        self.emitMovRcxFromSlot(idxSlot);
+        self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x10); self.emit8(0x04); self.emit8(0x88);  // movss xmm0, [rax+rcx*4]
+        self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x5A); self.emit8(0xC0);                    // cvtss2sd xmm0, xmm0
+        self.emitMovsdSlotFromXmm0(dest);
+    }
+    // WP-SIMD: f64-Wert nach f32 + Element speichern. idxSlot=Index, valSlot=f64-Wert, ptrSlot=SIMD-ptr.
+    fn emitSimdStoreElem(idxSlot: int64, valSlot: int64, ptrSlot: int64): void {
+        self.emitMovsdXmm0FromSlot(valSlot);
+        self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x5A); self.emit8(0xC0);  // cvtsd2ss xmm0, xmm0
+        self.emitMovRaxFromSlot(ptrSlot);
+        self.emitMovRcxFromSlot(idxSlot);
+        self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x11); self.emit8(0x04); self.emit8(0x88);  // movss [rax+rcx*4], xmm0
+    }
+
     // LYXOS-WP-1: MOV rcx, [rbp+disp] — zweiter Binop-Operand.
     fn emitMovRcxFromSlot(slot: int64): void {
         var off: int64 := self.slotOff(slot);
@@ -1400,9 +1466,23 @@ pub type EmitLyxOS = class {
             // IRO_INSPECT / PROFILE_ENTER/LEAVE/REPORT — Diagnostik: bewusster NOP auf LyxOS
             // (kein Profiling/Introspektion im Kernel-Build). Explizit, nicht stiller Default.
             self.emit8(0x90);                                       // nop
-        } else if op == 122 || op == 123 || op == 130 || op == 131 {
-            // IRO_SIMD_ADD/SUB/CMP_EQ/CMP_NE — kein Vektor(xmm)-Slot-Modell auf LyxOS.
-            // Kontrollierter Abbruch (statt stiller Garbage) bis Vektor-Pipeline existiert.
+        } else if op == 165 {                     // IRO_SIMD_NEW (dest, src1=count)
+            self.emitSimdNew(dest, src1);
+        } else if op == 122 {                     // IRO_SIMD_ADD → addps
+            self.emitSimdBinOp(0x58, dest, src1, src2);
+        } else if op == 123 {                     // IRO_SIMD_SUB → subps
+            self.emitSimdBinOp(0x5C, dest, src1, src2);
+        } else if op == 124 {                     // IRO_SIMD_MUL → mulps
+            self.emitSimdBinOp(0x59, dest, src1, src2);
+        } else if op == 125 {                     // IRO_SIMD_DIV → divps
+            self.emitSimdBinOp(0x5E, dest, src1, src2);
+        } else if op == 136 {                     // IRO_SIMD_LOAD_ELEM (dest, src1=ptr, src2=idx) f32→f64
+            self.emitSimdLoadElem(dest, src1, src2);
+        } else if op == 137 {                     // IRO_SIMD_STORE_ELEM (dest=idx, src1=val, src2=ptr) f64→f32
+            self.emitSimdStoreElem(dest, src1, src2);
+        } else if op == 126 || op == 127 || op == 128 || op == 129 || op == 130 || op == 131 || op == 132 || op == 133 || op == 134 || op == 135 {
+            // SIMD AND/OR/XOR/NEG/CMP — noch nicht implementiert (Arith ADD/SUB/MUL/DIV vorhanden).
+            // Kontrollierter Abbruch statt stiller Garbage.
             self.emitPanicExit();
         } else {
             // WP-STUB-00: unbehandelter IR-Opcode → INT3 (lauter Runtime-Trap) statt stilles

@@ -848,8 +848,11 @@ pub type IRLower = class {
     }
     // WP-BC-18: parallel Array<T>(size) — lower size, return alloc temp
     if (k == NK_SIMD_NEW) {
+      // WP-SIMD: parallel Array<f32>(n) → IRO_SIMD_NEW(dest, countTemp). emit_lyxos: aligned mmap,
+      // count @ ptr-8, 16-Byte-Alignment (wie ELF cg SIMD_NEW). c1 = Größen-Ausdruck.
       var dest: int64 := self.allocTemp();
-      self.lowerExpr(self.nodeC1(expr));
+      var cnt: int64 := self.lowerExpr(self.nodeC1(expr));
+      self.irAddInstrDirect(IRO_SIMD_NEW, dest, cnt, -1, 0);
       return dest;
     }
     // WP-BC-15: regex literal — lower as string constant
@@ -981,6 +984,18 @@ pub type IRLower = class {
     }
     if k == NK_UNOP { return self._isF64Expr(self.nodeC0(expr)); }
     if k == NK_CALL { return self.seq(self.nodeSVal(expr), self.nodeSLen(expr), "sqrt", 4); }
+    // WP-SIMD: Element einer parallel-Array<f32> wird als f64 geladen (cvtss2sd) → f64-Ausdruck.
+    if k == NK_INDEX { return self._isSimdExpr(self.nodeC0(expr)); }
+    return 0;
+  }
+
+  // WP-SIMD: ist expr eine parallel-Array<f32>-Variable (NK_TYPE_PARALLEL=93)? → SSE2-Vektor-Pfad.
+  fn _isSimdExpr(expr: int64): int64 {
+    if expr < 0 { return 0; }
+    if self.nodeKind(expr) != NK_IDENT { return 0; }
+    var tn: int64 := self._localTypeNode(self.nodeSVal(expr), self.nodeSLen(expr));
+    if tn < 0 { return 0; }
+    if self.nodeKind(tn) == 93 { return 1; }   // NK_TYPE_PARALLEL
     return 0;
   }
 
@@ -1020,6 +1035,13 @@ pub type IRLower = class {
           else if iro == IRO_SUB { iro := IRO_FSUB; }
           else if iro == IRO_MUL { iro := IRO_FMUL; }
           else { iro := IRO_FDIV; }
+        }
+      }
+      // WP-SIMD: beide Operanden parallel-Array<f32> → vektorisierte SSE2-Op. ADD(10)/SUB(11)/
+      // MUL(12)/DIV(13) → IRO_SIMD_ADD(122)/SUB(123)/MUL(124)/DIV(125) = +112.
+      if iro == IRO_ADD || iro == IRO_SUB || iro == IRO_MUL || iro == IRO_DIV {
+        if self._isSimdExpr(self.nodeC0(expr)) != 0 && self._isSimdExpr(self.nodeC1(expr)) != 0 {
+          iro := iro + 112;
         }
       }
       // WP-F64-CMP: f64-Vergleich → IRO_FCMP_* (ucomisd) statt Integer-CMP der Bits (nur für
@@ -2894,9 +2916,15 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerIndex(expr: int64): int64 {
+    var simd: int64 := self._isSimdExpr(self.nodeC0(expr));
     var base: int64 := self.lowerExpr(self.nodeC0(expr));
     var idx: int64 := self.lowerExpr(self.nodeC1(expr));
     var dest: int64 := self.allocTemp();
+    // WP-SIMD: parallel-Array<f32>[i] → f32-Element laden + nach f64 konvertieren (LOAD_ELEM).
+    if simd != 0 {
+      self.irAddInstrDirect(IRO_SIMD_LOAD_ELEM, dest, base, idx, 0);
+      return dest;
+    }
     // ARM64-FIX: war Stub. base = Array-Pointer (aus IRO_ALLOC), idx = Index.
     // emitLoadIdx: LDR dest, [base, idx, LSL #3] (8-Byte-Elemente).
     self.irAddInstrDirect(IRO_LOAD_IDX, dest, base, idx, 0);
@@ -4109,9 +4137,15 @@ pub type IRLower = class {
       // Target is INDEX — store to array element. ARM64-FIX: war Stub.
       // IRO_STORE_IDX: src1=value, src2=base, dest=idx (emitStoreIdx: STR value,[base,idx,LSL#3]).
       else if (self.nodeKind(target) == NK_INDEX) {
+        var aiSimd: int64 := self._isSimdExpr(self.nodeC0(target));
         var aiBase: int64 := self.lowerExpr(self.nodeC0(target));
         var aiIdx:  int64 := self.lowerExpr(self.nodeC1(target));
-        self.irAddInstrDirect(IRO_STORE_IDX, aiIdx, valTemp, aiBase, 0);
+        // WP-SIMD: parallel-Array<f32>[i] := v → f64-Wert nach f32 konvertieren + speichern.
+        if aiSimd != 0 {
+          self.irAddInstrDirect(IRO_SIMD_STORE_ELEM, aiIdx, valTemp, aiBase, 0);
+        } else {
+          self.irAddInstrDirect(IRO_STORE_IDX, aiIdx, valTemp, aiBase, 0);
+        }
       }
     }
   }

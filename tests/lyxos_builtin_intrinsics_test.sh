@@ -88,6 +88,11 @@ run "f64_cmp_neg"     'fn main(): int64 { var a: f64 := 0.0 - 5.0; var b: f64 :=
 run "f64_cmp_neg_pos" 'fn main(): int64 { var a: f64 := 0.0 - 1.0; var b: f64 := 1.0; if a < b { return 7; } return 0; }' 7
 run "f64_cmp_eq"      'fn main(): int64 { var a: f64 := 2.5; var b: f64 := 2.5; if a == b { return 3; } return 0; }' 3
 
+# --- WP-SIMD: parallel Array<f32> (aligned mmap + f32-Element + vektorisierte SSE2-Binops) ---
+run "simd_store_load" 'fn main(): int64 { let v: parallel Array<f32>(4) = parallel Array<f32>(4); v[0] := 7.0; return v[0] as int64; }' 7
+run "simd_add" 'fn main(): int64 { let a: parallel Array<f32>(4) = parallel Array<f32>(4); let b: parallel Array<f32>(4) = parallel Array<f32>(4); a[0] := 2.0; b[0] := 3.0; let c: parallel Array<f32> = a + b; return c[0] as int64; }' 5
+run "simd_mul" 'fn main(): int64 { let a: parallel Array<f32>(4) = parallel Array<f32>(4); let b: parallel Array<f32>(4) = parallel Array<f32>(4); a[2] := 6.0; b[2] := 7.0; let c: parallel Array<f32> = a * b; return c[2] as int64; }' 42
+
 # --- peek16 Word-Read (Laufzeit, rodata) ---
 run "peek16_low"  'fn main(): int64 { return peek16("AB") & 0xFF; }' 65
 run "peek16_high" 'fn main(): int64 { return (peek16("AB") >> 8) & 0xFF; }' 66
