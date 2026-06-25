@@ -92,6 +92,7 @@ run "f64_cmp_eq"      'fn main(): int64 { var a: f64 := 2.5; var b: f64 := 2.5; 
 run "simd_store_load" 'fn main(): int64 { let v: parallel Array<f32>(4) = parallel Array<f32>(4); v[0] := 7.0; return v[0] as int64; }' 7
 run "simd_add" 'fn main(): int64 { let a: parallel Array<f32>(4) = parallel Array<f32>(4); let b: parallel Array<f32>(4) = parallel Array<f32>(4); a[0] := 2.0; b[0] := 3.0; let c: parallel Array<f32> = a + b; return c[0] as int64; }' 5
 run "simd_mul" 'fn main(): int64 { let a: parallel Array<f32>(4) = parallel Array<f32>(4); let b: parallel Array<f32>(4) = parallel Array<f32>(4); a[2] := 6.0; b[2] := 7.0; let c: parallel Array<f32> = a * b; return c[2] as int64; }' 42
+run "simd_neg" 'fn main(): int64 { let a: parallel Array<f32>(4) = parallel Array<f32>(4); a[1] := 5.0; let b: parallel Array<f32> = -a; return (0 - (b[1] as int64)); }' 5
 
 # --- peek16 Word-Read (Laufzeit, rodata) ---
 run "peek16_low"  'fn main(): int64 { return peek16("AB") & 0xFF; }' 65
