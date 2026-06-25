@@ -18,8 +18,8 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Security-Audit 2026-06-18 ha
 | **25** | `--capabilities=compat` Laufzeit-Warnung | ✅ Erledigt |
 | **6c** | PIE/ASLR für x86-64 ELF (zurückgestellt, Risiko hoch) | 🔵 Niedrig |
 | **6b-ARM64** | W^X für ARM64-ELF-Writer (`writeELF`, `writeELFExecDynamic`) | 🟡 Mittel |
-| **26** | `alloc()`/`calloc()` Integer-Overflow + Zero-Alloc-Aliasing | ✅ Erledigt |
-| **27** | `read()`-Fehlerbehandlung OOB (`--unit-info` + `_sema_readFile` + alle Datei-/ELF-Reader) | ✅ Erledigt |
+| **26** | `alloc()` Integer-Overflow + Zero-Alloc-Aliasing | 🔴 Kritisch |
+| **27** | `read()`-Fehlerbehandlung OOB (`--unit-info` + `_sema_readFile`) | 🔴 Kritisch |
 | **28** | Kernel-Mode-Guard Erweiterung (`std.net.epoll` + gesamtes `std.net.*`) | 🟠 Hoch |
 | **29** | Lizenz-Secret-Architektur (XOR-Obfuskation → asymmetrisch) | 🟠 Hoch |
 | **30** | HTTP Custom-Header CRLF-Injection | 🟠 Hoch |
@@ -165,10 +165,8 @@ Von ursprünglich 25 WPs sind **20 abgeschlossen**. Security-Audit 2026-06-18 ha
 |----------|------|
 | **Dateien** | `src/std/alloc.lyx`, Z. 16–35 |
 | **Priorität** | 🔴 Kritisch |
-| **Status** | ✅ erledigt (2026-06-18; calloc()-Overflow-Guard + CI-Test 2026-06-22) |
+| **Status** | ✅ erledigt (2026-06-18, commit eab88e6) |
 | **Quelle** | Security-Audit 2026-06-18 (C-1, C-2) |
-
-> **2026-06-22 (Verifikation/Härtung):** `alloc()`-Guards empirisch bestätigt (sec_wp26-Test grün). Zusätzlich `calloc()` mit Integer-Overflow-Guard versehen (`count*elem_size` → 0 statt Under-Alloc) und `tests/sec_wp26_alloc_test.lyx` in `make test` aufgenommen (war nicht in CI → Regressionsrisiko wie WP-37). Test gibt jetzt Fail-Count als Exit-Code zurück.
 
 **Problem 1 — Integer-Overflow (C-1):** `alloc(size)` berechnet `((size + 15) / 16) * 16`. Bei `size ≈ INT64_MAX` überläuft `size + 15` auf einen negativen Wert → `aligned` wird winzig → `alloc()` gibt einen bereits genutzten Pointer zurück → Heap-Überschreibung. Tritt auf wenn zwei sehr große Strings konkateniert werden (`StrConcat`).
 
@@ -196,10 +194,8 @@ pub fn alloc(size: int64): int64 {
 |----------|------|
 | **Dateien** | `src/lyxc.lyx` Z. 4384; `src/sema.lyx` Z. 757 |
 | **Priorität** | 🔴 Kritisch |
-| **Status** | ✅ erledigt (2026-06-18; alle Reader gehärtet + CI-Test 2026-06-22) |
+| **Status** | ✅ erledigt (2026-06-18, commit eab88e6) |
 | **Quelle** | Security-Audit 2026-06-18 (C-3, M-4) |
-
-> **2026-06-22 (Verifikation/Härtung):** named Fixes (C-3 `--unit-info` EINTR, M-4 `_sema_readFile`) im Code bestätigt. Verifikationspass fand dieselbe ungeprüfte-read()-Klasse an weiteren Stellen → gehärtet: `codegen_x86.lyx cg_readFile` (identischer M-4-Bug im Import-Pfad!), ELF-Parser-Reads in `lyxc.lyx` (Section-Header/shstrtab/Lizenz-Payload), `ms_appendMetaSafe`, Provenance-SHA, `lyxc_keygen`. Alle read()-Aufrufe prüfen jetzt den Rückgabewert. Regressionsschutz: `tests/sec_wp27_read_test.sh` (8 Quellcode-Checks) in `make test`.
 
 **Problem 1 — OOB-Schreibzugriff `--unit-info` (C-3):**
 ```
@@ -519,8 +515,8 @@ if self._sema_kmPfx(modName, modLen, "std.net."c) != 0 {
 | 23 | Audit W^X-Reporting korrigieren | ✅ | 2026-06-13 | 🔴 |
 | **24** | **seccomp-Filter-Vollständigkeit** | **✅** | 2026-06-14 | 🟠 |
 | **25** | **--capabilities=compat Warnung** | **✅** | 2026-06-14 | 🟡 |
-| **26** | **alloc()/calloc() Integer-Overflow + Zero-Alloc** | **✅** | – | 🔴 |
-| **27** | **read()-Fehlerbehandlung OOB** | **✅** | – | 🔴 |
+| **26** | **alloc() Integer-Overflow + Zero-Alloc** | **⬜** | – | 🔴 |
+| **27** | **read()-Fehlerbehandlung OOB** | **⬜** | – | 🔴 |
 | **28** | **Kernel-Mode-Guard Erweiterung** | **⬜** | – | 🟠 |
 | **29** | **Lizenz-Secret-Architektur** | **⬜** | – | 🟠 |
 | **30** | **HTTP Custom-Header CRLF-Injection** | **⬜** | – | 🟠 |
