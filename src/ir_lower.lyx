@@ -265,6 +265,17 @@ pub type IRLower = class {
   genFuncCount: int64;
   genFuncCap:   int64;
   _importsDone: int64;  // StrLen-fix: globaler transitiver Import-Func-Pre-Pass nur 1× (top-level)
+  // WP-XMOD-OOP: globales Type-Registry (cross-module). Jeder NK_TYPE_DECL aller Module bekommt
+  // eine stabile globale type-id (= Registry-Index). Gefüllt im Import-Pre-Pass. Ermöglicht
+  // korrektes new (Größe/type-id) + virtuelle Dispatch für IMPORTIERTE Klassen.
+  _tregSrc:   int64;    // [] src-Pointer des Moduls je Eintrag
+  _tregNodes: int64;    // [] nodes-Pointer
+  _tregCnt:   int64;    // [] nodeCount
+  _tregIdx:   int64;    // [] lokaler Node-Index des NK_TYPE_DECL im Modul
+  _tregNameP: int64;    // [] absoluter Pointer auf Klassennamen
+  _tregNameL: int64;    // [] Namenslänge
+  _tregN:     int64;    // Anzahl Einträge
+  _tregCap:   int64;    // Kapazität
   // Queue of pending specializations to emit after the main lowering loop
   // Records: {mangledPtr:8, mangledLen:8, genFuncNodeIdx:8, emitted:8} = 32 bytes each
   pendingGenBuf:   int64;
@@ -317,6 +328,14 @@ pub type IRLower = class {
     self.genFuncBuf   := alloc(16 * 24);
     self.genFuncCount := 0;
     self._importsDone := 0;
+    self._tregCap := 1024;
+    self._tregN := 0;
+    self._tregSrc   := alloc(self._tregCap * 8);
+    self._tregNodes := alloc(self._tregCap * 8);
+    self._tregCnt   := alloc(self._tregCap * 8);
+    self._tregIdx   := alloc(self._tregCap * 8);
+    self._tregNameP := alloc(self._tregCap * 8);
+    self._tregNameL := alloc(self._tregCap * 8);
     self.pendingGenCap   := 16;
     self.pendingGenBuf   := alloc(16 * 32);
     self.pendingGenCount := 0;
@@ -934,20 +953,25 @@ pub type IRLower = class {
     if (self.nodeIVal(expr) == 1) {
       var mcDest:     int64 := self.allocTemp();
       var mcBaseNode: int64 := self.nodeC0(expr);
-      // WP-VMT-lyxos: Typ-Node holen (auch importierte). mcDecl<0 = importiert (nur Name bekannt).
-      var mcTn:     int64 := self._baseTypeNode(mcBaseNode);
-      var mcDecl:   int64 := 0 - 1;
-      var mcCName:  pchar := 0 as pchar;
-      var mcCNameL: int64 := 0;
+      // WP-XMOD-OOP: Klassenname + lokales decl holen. localDecl>=0 = same-module (Fast-Path,
+      // kein Registry); localDecl<0 = importiert. Registry (globale type-id) nur für VIRTUELLE
+      // Dispatch nötig (type-id-Konsistenz cross-module) — non-virtuell läuft per Mangle-by-name.
+      var mcTn:      int64 := self._baseTypeNode(mcBaseNode);
+      var mcCName:   pchar := 0 as pchar;
+      var mcCNameL:  int64 := 0;
+      var mcLocal:   int64 := 0 - 1;
       if mcTn >= 0 {
-        mcCName  := self.nodeSVal(mcTn);
-        mcCNameL := self.nodeSLen(mcTn);
-        if self.nodeKind(mcTn) == NK_TYPE_DECL { mcDecl := mcTn; }
-        else { mcDecl := self._findTypeDecl(mcCName, mcCNameL); }
+        mcCName := self.nodeSVal(mcTn); mcCNameL := self.nodeSLen(mcTn);
+        if self.nodeKind(mcTn) == NK_TYPE_DECL { mcLocal := mcTn; }
+        else { mcLocal := self._findTypeDecl(mcCName, mcCNameL); }
       }
       if mcCNameL > 0 {
         var mNameP: pchar := self.nodeSVal(expr);
         var mNameL: int64 := self.nodeSLen(expr);
+        // Virtuell? Fast lokal, sonst via Registry (importiert).
+        var mcVirt: int64 := 0;
+        if mcLocal >= 0 { mcVirt := self._methodVirtual(mcLocal, mNameP, mNameL); }
+        else { mcVirt := self._tregMethodVirtualG(self._tregFind(mcCName, mcCNameL), mNameP, mNameL); }
         // Arg-Block: self @ argBase, dann explizite Args.
         var mcArgBase: int64 := self.tempCount;
         var mcRsv: int64 := 0;
@@ -962,47 +986,47 @@ pub type IRLower = class {
           mcCnt := mcCnt + 1;
           mcArg := self.nodeNext(mcArg);
         }
-        if mcDecl < 0 {
-          // IMPORTIERTE Klasse: kein lokales decl → statische Mangle "Class_method" by name.
-          // (funcBuffer ist cross-module; virtuelle Dispatch importierter Klassen noch nicht.)
-          var impMang: int64 := self._methodMangle(mcCName, mcCNameL, mNameP, mNameL);
-          var impIdx:  int64 := self._findFuncByName(impMang as pchar, mcCNameL + 1 + mNameL);
-          if impIdx >= 0 { self.irAddInstrDirect(IRO_CALL, mcDest, impIdx, mcArgBase, mcCnt); }
-        } else if self._methodVirtual(mcDecl, mNameP, mNameL) == 0 {
-          // STATISCHE Dispatch (nicht-virtuell): nächste Definition ab mcDecl.
-          var mcIdx: int64 := self._resolveMethodIdx(mcDecl, mNameP, mNameL);
+        if mcVirt == 0 {
+          // STATISCHE Dispatch: nächste Definition ab decl (Mangle by-name, cross-module via funcBuffer).
+          var mcIdx: int64 := 0 - 1;
+          if mcLocal >= 0 { mcIdx := self._resolveMethodIdx(mcLocal, mNameP, mNameL); }
+          else {
+            var sbg: int64 := self._tregFind(mcCName, mcCNameL);
+            if sbg >= 0 { mcIdx := self._tregResolveMethodIdxG(sbg, mNameP, mNameL); }
+            else {
+              var sMang: int64 := self._methodMangle(mcCName, mcCNameL, mNameP, mNameL);
+              mcIdx := self._findFuncByName(sMang as pchar, mcCNameL + 1 + mNameL);
+            }
+          }
           if mcIdx >= 0 { self.irAddInstrDirect(IRO_CALL, mcDest, mcIdx, mcArgBase, mcCnt); }
         } else {
-          // WP-VMT-lyxos: VIRTUELLE Switch-Dispatch über type-id @ obj[0].
-          // Whole-Program/closed-world: alle Subklassen von mcDecl mit eigenem Override
-          // → Vergleichskette; Fallback = mcDecl's eigene Auflösung.
+          var baseG: int64 := self._tregFind(mcCName, mcCNameL);
+          // WP-XMOD-OOP: VIRTUELLE Switch-Dispatch über type-id @ obj[0] in GLOBALER Registry-Space
+          // (cross-module Subklassen). tid==g → g's Override; Fallback = baseG's Auflösung.
           var tidTemp: int64 := self.allocTemp();
           self.irAddInstrDirect(IRO_LOAD_FIELD, tidTemp, mcSelf, 0, 0);   // tid = obj[0]
           var vEnd: int64 := self.genLabel();
-          var ci: int64 := 0;
-          while ci < self.nodeCount {
-            if self.nodeKind(ci) == NK_TYPE_DECL {
-              if self._extendsClass(ci, mcDecl) != 0 {
-                if self._classOwnHasMethod(ci, mNameP, mNameL) != 0 {
-                  var subIdx: int64 := self._resolveMethodIdx(ci, mNameP, mNameL);
-                  if subIdx >= 0 {
-                    var cTid: int64 := self.allocTemp();
-                    self.irAddInstrDirect(IRO_CONST_INT, cTid, -1, -1, ci);
-                    var cmpT: int64 := self.allocTemp();
-                    self.irAddInstrDirect(IRO_CMP_EQ, cmpT, tidTemp, cTid, 0);
-                    var vNext: int64 := self.genLabel();
-                    self.irEmitBrFalse(cmpT, vNext);
-                    self.irAddInstrDirect(IRO_CALL, mcDest, subIdx, mcArgBase, mcCnt);
-                    self.irEmitJmp(vEnd);
-                    self.irEmitLabel(vNext);
-                  }
+          var gi: int64 := 0;
+          while gi < self._tregN {
+            if self._extendsClassG(gi, baseG) != 0 {
+              if self._tregOwnHasMethodG(gi, mNameP, mNameL) != 0 {
+                var subIdx: int64 := self._tregResolveMethodIdxG(gi, mNameP, mNameL);
+                if subIdx >= 0 {
+                  var cTid: int64 := self.allocTemp();
+                  self.irAddInstrDirect(IRO_CONST_INT, cTid, -1, -1, gi);
+                  var cmpT: int64 := self.allocTemp();
+                  self.irAddInstrDirect(IRO_CMP_EQ, cmpT, tidTemp, cTid, 0);
+                  var vNext: int64 := self.genLabel();
+                  self.irEmitBrFalse(cmpT, vNext);
+                  self.irAddInstrDirect(IRO_CALL, mcDest, subIdx, mcArgBase, mcCnt);
+                  self.irEmitJmp(vEnd);
+                  self.irEmitLabel(vNext);
                 }
               }
             }
-            ci := ci + 1;
+            gi := gi + 1;
           }
-          // Fallback: mcDecl's eigene Auflösung (Basis/deklarierter Typ).
-          var baseIdx: int64 := self._resolveMethodIdx(mcDecl, mNameP, mNameL);
+          var baseIdx: int64 := self._tregResolveMethodIdxG(baseG, mNameP, mNameL);
           if baseIdx >= 0 { self.irAddInstrDirect(IRO_CALL, mcDest, baseIdx, mcArgBase, mcCnt); }
           self.irEmitLabel(vEnd);
         }
@@ -2857,11 +2881,22 @@ pub type IRLower = class {
   // ARM64-OOP: Feld-Offset für Instanz-Zugriff baseNode.fieldName (-1 falls unauflösbar).
   // WP-VMT-lyxos: +8 wenn die Klasse eine VMT hat (type-id @ Offset 0).
   fn _instanceFieldOffset(baseNode: int64, fp: pchar, fl: int64): int64 {
+    // Fast-Path same-module/self: lokales decl direkt (kein Registry-Scan/ctx-Swap) — der
+    // häufigste Fall (self.field). _baseClassDecl löst self→curMethodClassType O(1).
     var decl: int64 := self._baseClassDecl(baseNode);
-    if decl < 0 { return 0 - 1; }
-    var off: int64 := self._fieldOffsetIn(decl, fp, fl);
-    if off >= 0 { if self._hasVmt(decl) != 0 { off := off + 8; } }
-    return off;
+    if decl >= 0 {
+      var off: int64 := self._fieldOffsetIn(decl, fp, fl);
+      if off >= 0 { if self._hasVmt(decl) != 0 { off := off + 8; } }
+      return off;
+    }
+    // WP-XMOD-OOP: IMPORTIERTE Klasse (decl<0) → globales Registry (Offset im Definitionsmodul).
+    var tn: int64 := self._baseTypeNode(baseNode);
+    if tn < 0 { return 0 - 1; }
+    var g: int64 := self._tregFind(self.nodeSVal(tn), self.nodeSLen(tn));
+    if g < 0 { return 0 - 1; }
+    var offg: int64 := self._tregFieldOffG(g, fp, fl);
+    if offg >= 0 { if self._tregHasVmtG(g) != 0 { offg := offg + 8; } }
+    return offg;
   }
 
   // ARM64-OOP: funcBuffer-Index für einen (mangled) Funktionsnamen (-1 falls keiner).
@@ -2958,6 +2993,114 @@ pub type IRLower = class {
     return 0;
   }
 
+  // ==================================================================
+  // WP-XMOD-OOP: globales Type-Registry (cross-module type-ids)
+  // ==================================================================
+
+  // Registriert den NK_TYPE_DECL `idx` des AKTUELLEN Modul-Kontexts (self.src/nodes/nodeCount
+  // müssen gesetzt sein). Dedup nach Name (eine Klasse ist in genau einem Modul definiert).
+  fn _tregRegister(idx: int64): void {
+    var np: pchar := self.nodeSVal(idx);
+    var nl: int64 := self.nodeSLen(idx);
+    if self._tregFind(np, nl) >= 0 { return; }
+    if self._tregN >= self._tregCap { return; }
+    var g: int64 := self._tregN;
+    poke64(self._tregSrc   + g * 8, self.src as int64);
+    poke64(self._tregNodes + g * 8, self.nodes);
+    poke64(self._tregCnt   + g * 8, self.nodeCount);
+    poke64(self._tregIdx   + g * 8, idx);
+    poke64(self._tregNameP + g * 8, np as int64);
+    poke64(self._tregNameL + g * 8, nl);
+    self._tregN := g + 1;
+  }
+
+  // Globale type-id eines Klassennamens (-1 falls keine). Namensvergleich via gespeicherte
+  // absolute Pointer (kein Kontext-Swap nötig).
+  fn _tregFind(np: pchar, nl: int64): int64 {
+    var npI: int64 := (np) as int64;
+    var i: int64 := 0;
+    while i < self._tregN {
+      if peek64(self._tregNameL + i * 8) == nl {
+        var p: int64 := peek64(self._tregNameP + i * 8);
+        var m: int64 := 1; var j: int64 := 0;
+        while j < nl { if m != 0 { if peek8(p + j) != peek8(npI + j) { m := 0; } } j := j + 1; }
+        if m != 0 { return i; }
+      }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  // Kontext-Swap-Wrapper: führen einen vorhandenen Helfer im Modul-Kontext von type-id g aus.
+  fn _tregSizeG(g: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._typeSizeOf(peek64(self._tregIdx + g * 8));
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  fn _tregHasVmtG(g: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._hasVmt(peek64(self._tregIdx + g * 8));
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  fn _tregFieldOffG(g: int64, fp: pchar, fl: int64): int64 {
+    if g < 0 { return 0 - 1; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._fieldOffsetIn(peek64(self._tregIdx + g * 8), fp, fl);
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  fn _tregMethodVirtualG(g: int64, mp: pchar, ml: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._methodVirtual(peek64(self._tregIdx + g * 8), mp, ml);
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  fn _tregOwnHasMethodG(g: int64, mp: pchar, ml: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._classOwnHasMethod(peek64(self._tregIdx + g * 8), mp, ml);
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  // funcBuffer-Index der Methode (mp,ml) ab type-id g nach oben aufgelöst. _findFuncByName ist
+  // cross-module (funcBuffer global); der Mangle nutzt den Klassennamen aus g's Kontext.
+  fn _tregResolveMethodIdxG(g: int64, mp: pchar, ml: int64): int64 {
+    if g < 0 { return 0 - 1; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._resolveMethodIdx(peek64(self._tregIdx + g * 8), mp, ml);
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+  // Erweitert type-id g transitiv ancestorG? (Eltern-Kette in Registry-Space.)
+  fn _extendsClassG(g: int64, ancestorG: int64): int64 {
+    var cur: int64 := g;
+    while cur >= 0 {
+      var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+      self.src := peek64(self._tregSrc + cur * 8) as pchar; self.nodes := peek64(self._tregNodes + cur * 8); self.nodeCount := peek64(self._tregCnt + cur * 8);
+      var pn: int64 := self.nodeC2(peek64(self._tregIdx + cur * 8));
+      var pName: pchar := 0 as pchar; var pLen: int64 := 0;
+      if pn >= 0 { pName := self.nodeSVal(pn); pLen := self.nodeSLen(pn); }
+      self.src := sS; self.nodes := sN; self.nodeCount := sC;
+      if pLen == 0 { return 0; }
+      var pg: int64 := self._tregFind(pName, pLen);
+      if pg < 0 { return 0; }
+      if pg == ancestorG { return 1; }
+      cur := pg;
+    }
+    return 0;
+  }
+
   fn lowerField(expr: int64): int64 {
     var dest: int64 := self.allocTemp();
     var baseNode: int64 := self.nodeC0(expr);
@@ -3031,22 +3174,25 @@ pub type IRLower = class {
     // WP-VMT-lyxos: Klassen MIT virtueller Methode reservieren Offset 0 für die type-id
     // (= NK_TYPE_DECL-Node-Index), Felder ab +8. new schreibt die type-id nach obj[0].
     var dest: int64 := self.allocTemp();
-    var decl: int64 := self._findTypeDecl(self.nodeSVal(expr), self.nodeSLen(expr));
+    // WP-XMOD-OOP: Typ über globales Registry auflösen (auch IMPORTIERTE Klassen) → korrekte
+    // Größe/VMT/type-id. type-id = globaler Registry-Index g (modul-unabhängig, konsistent mit
+    // virtueller Dispatch). Vorher: _findTypeDecl(cwd) → importierte Klasse = Default-Größe 8.
+    var g: int64 := self._tregFind(self.nodeSVal(expr), self.nodeSLen(expr));
     var sz: int64 := 8;
     var hasVmt: int64 := 0;
-    if decl >= 0 {
-      var tsz: int64 := self._typeSizeOf(decl);
+    if g >= 0 {
+      var tsz: int64 := self._tregSizeG(g);
       if tsz > 0 { sz := tsz; }
-      hasVmt := self._hasVmt(decl);
+      hasVmt := self._tregHasVmtG(g);
       if hasVmt != 0 { sz := sz + 8; }   // type-id-Slot @ Offset 0
     }
     var szTemp: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_CONST_INT, szTemp, -1, -1, sz);
     self.irAddInstrDirect(IRO_ALLOC, dest, szTemp, -1, 0);
     if hasVmt != 0 {
-      // type-id (= decl-Node-Index) nach obj[0] schreiben — Laufzeit-Typ für virtuelle Dispatch.
+      // type-id (= globaler Registry-Index g) nach obj[0] schreiben — Laufzeit-Typ für virtuelle Dispatch.
       var tidTemp: int64 := self.allocTemp();
-      self.irAddInstrDirect(IRO_CONST_INT, tidTemp, -1, -1, decl);
+      self.irAddInstrDirect(IRO_CONST_INT, tidTemp, -1, -1, g);
       self.irAddInstrDirect(IRO_STORE_FIELD, 0, tidTemp, dest, 0);   // STORE_FIELD(off=0, value=tid, base=obj)
     }
     // WP-CTOR-lyxos: Konstruktor `ClassName_Create(self, args...)` aufrufen falls definiert
@@ -4101,6 +4247,8 @@ pub type IRLower = class {
         self.src := mSrc as pchar; self.nodes := mNodes; self.nodeCount := mCnt;
         var dc: int64 := mHead;
         while dc >= 0 {
+          // WP-XMOD-OOP: jeden NK_TYPE_DECL dieses Moduls global registrieren (stabile type-id).
+          if self.nodeKind(dc) == NK_TYPE_DECL { self._tregRegister(dc); }
           if self.nodeKind(dc) == NK_IMPORT {
             var nmP: pchar := self.nodeSVal(dc); var nmL: int64 := self.nodeSLen(dc);
             // Pfad "a.b.c" -> "a/b/c.lyx"
