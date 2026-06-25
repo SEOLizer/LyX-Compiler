@@ -1,5 +1,21 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.3B (Juni 2026)
+
+LyxOS-Sprach-Features: Adresse-von, korrekter f64-Vergleich, SIMD. Basis V1.0.3A.
+
+### LyxOS (#872, #873)
+- **@local Adresse-von (#872)**: `@x` (TK_AT) liefert auf lyxos jetzt die Slot-Adresse
+  (lowerUnOp op==111 → IRO_LOAD_LOCAL_ADDR, lea); ELF konnte es bereits.
+- **ucomisd-f64-Vergleich (#872)**: f64-Vergleich nutzt jetzt `ucomisd` (IRO_FCMP_*) statt
+  Integer-CMP der IEEE-Bits → korrekt auch für negative f64 (vorher Ordering kaputt).
+- **SIMD parallel Array<f32> (#873)**: aligned-mmap-Allokation (count @ ptr-8), f32-Element-
+  Zugriff (movss + f32↔f64-Konvertierung), vektorisierte SSE2-Binops (addps/subps/mulps/divps).
+  Runtime-verifiziert (lbf_run). SIMD AND/OR/XOR/NEG/CMP weiter offen (kontrollierter Abbruch).
+
+Verifiziert: intrinsics 61/61, call_args 8/8; Singularität S3==S4; voll-lyxc→LBF baut (3.82 MB).
+ELF-Pfad unberührt. Offen: WSP-Systemprimitiven, Kernel-Runtime-Bestätigung (uidemo/lyxc-LBF).
+
 ## Version 1.0.3A (Juni 2026)
 
 Minor-Release: LyxOS-Codegen-Kern abgeschlossen — vollständige OOP, alle reachable IR-Opcodes,
