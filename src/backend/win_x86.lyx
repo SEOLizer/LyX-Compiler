@@ -138,6 +138,8 @@ pub type WinX86Backend = class {
   // WP-A2.3: win64 heap allocator helper. Linux mmap syscalls (alloc/new/dynarray)
   // are rewritten to call this VirtualAlloc-based helper appended at code end.
   vallocCallOff:   int64;   // code offset of the helper's `call [VirtualAlloc]` (-1 = none)
+  argcStoreOff:    int64;   // WP-WINARGV: disp32-Offset von `mov [rip+d],rax` (argc→CG_ARGC), Patch
+  argvStoreOff:    int64;   // WP-WINARGV: disp32-Offset von `mov [rip+d],rdx` (argv→CG_ARGV), Patch
 
   // ------------------------------------------------------------------
   // Code buffer primitives
@@ -622,9 +624,17 @@ pub type WinX86Backend = class {
     self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC7);
     // mov rsi, rdx  (argv → second SysV arg) [12..14]
     self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xD6);
-    // 33 NOPs  [15..47]
+    // WP-WINARGV: argc/argv in CG_ARGC/CG_ARGV-Globals speichern (sonst liest GetArgC/GetArgV 0).
+    // disp32 layout-abhängig (Daten ans Code-Ende angehängt) → in wxb_buildCode gepatcht.
+    // mov [rip+disp32], rax  (argc → CG_ARGC)  7 bytes [15..21]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0x05);
+    self.argcStoreOff := self.codeLen; self.wxb_ce32(0);
+    // mov [rip+disp32], rdx  (argv → CG_ARGV)  7 bytes [22..28]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0x15);
+    self.argvStoreOff := self.codeLen; self.wxb_ce32(0);
+    // 19 NOPs [29..47] (33 - 14 = 19; _start bleibt 79 Bytes)
     var i: int64 := 0;
-    while (i < 33) { self.wxb_ce8(0x90); i := i + 1; }
+    while (i < 19) { self.wxb_ce8(0x90); i := i + 1; }
     // call main  E8 rel32  [48..52]
     self.wxb_ce8(0xE8); self.wxb_ce32(relMain);
     // mov ecx, eax  (exit code = main() return value)  2 bytes [53..54]
@@ -893,10 +903,17 @@ pub type WinX86Backend = class {
     // Append data buffer so that RIP-relative LEA disp32 values are correct.
     // cg_patchAll computed disp32 = codeLen - codeOff - 4 + dataOff, which
     // assumes data follows code at exactly offset WIN_PREAMBLE_SZ + cgLen.
+    var dataTextOff: int64 := self.codeLen;   // WP-WINARGV: .text-Offset des Daten-/Globals-Blocks
     var j: int64 := 0;
     while (j < cgDataLen) {
       self.wxb_ce8(peek8(cgData + j));
       j := j + 1;
+    }
+    // WP-WINARGV: rip-relative disp der argc/argv-Stores im _start patchen (CG_ARGC=32, CG_ARGV=40).
+    // disp = Ziel-Offset − (disp32-Feld-Offset + 4); rein code-buffer-lokal (rip-rel positionsunabh.).
+    if self.argcStoreOff >= 0 {
+      self.wxb_patch32(self.argcStoreOff, (dataTextOff + 32) - (self.argcStoreOff + 4));
+      self.wxb_patch32(self.argvStoreOff, (dataTextOff + 40) - (self.argvStoreOff + 4));
     }
 
     // WP-A2.2: rebase absolute VMT pointers in the appended user/data zone and
@@ -1250,7 +1267,10 @@ pub type WinX86Backend = class {
     self.wxb_oe32(0);               // PointerToLinenumbers
     self.wxb_oe16(0);               // NumberOfRelocations
     self.wxb_oe16(0);               // NumberOfLinenumbers
-    self.wxb_oe32(0x60000020);      // Characteristics: CODE|MEM_EXECUTE|MEM_READ
+    // WP-WINARGV: CODE|EXECUTE|READ|WRITE. Daten/Globals werden ans .text-Ende angehängt
+    // (single-section-Design); ohne WRITE faulten ALLE globalen Schreibzugriffe (g:=x, argc/argv).
+    // W^X-Tradeoff für das win64-Beta-Backend; saubere Lösung = separate .data-Section (größerer Umbau).
+    self.wxb_oe32(0xE0000020);      // Characteristics: CODE|MEM_EXECUTE|MEM_READ|MEM_WRITE
 
     // ---- Section Header .rdata (40 bytes) ----
     self.wxb_oName8(".rdata"c, 6);
@@ -1344,6 +1364,8 @@ pub type WinX86Backend = class {
     self.relocContent    := 0;
     self.relocContentLen := 0;
     self.vallocCallOff   := 0 - 1;
+    self.argcStoreOff    := 0 - 1;
+    self.argvStoreOff    := 0 - 1;
   }
 
   // WP-A2.2: hand over the codegen base-reloc table BEFORE Build().
