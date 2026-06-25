@@ -1,5 +1,20 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.3C (Juni 2026)
+
+LyxOS-SIMD vervollständigt. Basis V1.0.3B.
+
+### LyxOS — SIMD-Reste (#875)
+- **AND/OR/XOR** auf parallel Array<f32> → `andps`/`orps`/`xorps` (vektorisierte SSE2-Loop).
+- **NEG** (`-vec`) → packed Vorzeichenbit-Flip (`pcmpeqd`+`pslld 31`+`xorps`).
+- **CMP_EQ/NE/LT/LE/GT/GE** → `cmpps` mit Prädikat-Imm (Masken-Vektor pro Lane).
+- Damit ist SIMD vollständig: Allokation, f32-Element-Zugriff, Arithmetik (ADD/SUB/MUL/DIV, #873)
+  und nun Bitwise/Negation/Vergleich.
+
+Verifiziert: NEG runtime (-5→5), AND/OR/XOR/CMP Disasm; intrinsics 62/62, call_args 8/8;
+Singularität S3==S4; voll-lyxc→LBF baut (3.83 MB). ELF-Pfad unberührt. Offen: WSP-System-
+primitiven, Kernel-Runtime-Bestätigung (uidemo/lyxc-LBF).
+
 ## Version 1.0.3B (Juni 2026)
 
 LyxOS-Sprach-Features: Adresse-von, korrekter f64-Vergleich, SIMD. Basis V1.0.3A.
