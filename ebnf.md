@@ -694,8 +694,10 @@ AdditiveExpr        = MultiplicativeExpr
 MultiplicativeExpr  = UnaryExpr
                       { ( "*" | "/" | "%" ) UnaryExpr } ;
 
-UnaryExpr           = ( "+" | "-" | "!" | "~" ) UnaryExpr
+UnaryExpr           = ( "+" | "-" | "!" | "~" | "@" ) UnaryExpr
                     | CastExpr ;
+(* "@" Ident  = Adresse-von (address-of) eines Locals/Params → Slot-Adresse.
+   Codegen: ELF lea rax,[rbp+off]; LyxOS IRO_LOAD_LOCAL_ADDR (PR #872). *)
 
 CastExpr            = PostfixExpr [ "as" Type ] ;
 
