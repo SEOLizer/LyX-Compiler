@@ -1,5 +1,22 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.3D (Juni 2026)
+
+LyxOS-Kernel-Systemprimitive (WSP). Basis V1.0.3C.
+
+### LyxOS — WSP-Systemprimitive
+- **cpu-ctrl / Fences / Atomics (#877)**: Builtins für Kernel-Treiber — cpu_pause/hlt/cli/sti/rdmsr/wrmsr,
+  fence_sfence/lfence/mfence, atomic_load/store(xchg)/cas(lock cmpxchg)/fetch_add(lock xadd).
+- **@volatile (#879)**: volatile-Loads von DCE ausgenommen (MMIO/Hardware-Register-Reads bleiben
+  erhalten; callmode-Sentinel-Markierung).
+- **@align(n) (#880)**: array/heap-backed Locals N-Byte-aligned alloziert (über-alloc + round-up;
+  DMA/MMIO/SIMD/Page-Buffer). Neues Var-Attribut, ebnf.md ergänzt.
+
+Verifiziert: Atomics runtime (store_load/fetch_add/cas), @volatile (Load überlebt DCE), @align
+(Disasm over-alloc+round); intrinsics 70/70, call_args 8/8, wp4 4/4; Singularität S3==S4
+(3c0068e2); voll-lyxc→LBF baut (3.85 MB). ELF-Pfad unberührt. Offen (WSP): asm{}-Block,
+extern/FFI echte Linkage (Reloc-Consumer).
+
 ## Version 1.0.3C (Juni 2026)
 
 LyxOS-SIMD vervollständigt. Basis V1.0.3B.
