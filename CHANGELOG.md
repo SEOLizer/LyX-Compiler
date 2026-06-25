@@ -1,5 +1,19 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.3E (Juni 2026)
+
+Windows-Backend-Korrektheit. Basis V1.0.3D.
+
+### Windows PE32+ (win64)
+- **Beschreibbare Globals + argc/argv (#882)**: win64 hatte keine beschreibbaren globalen
+  Variablen — Daten/Globals liegen im single-section-Design am `.text`-Ende, aber `.text` war
+  nur CODE|EXECUTE|READ → jeder globale Schreibzugriff (`g := x`) page-faultete. Zusätzlich
+  speicherte `_start` argc/argv nicht in die Globals (GetArgC/GetArgV lasen 0). Fix: `.text` →
+  +MEM_WRITE; `_start` schreibt argc/argv nach CG_ARGC/CG_ARGV (rip-relativer Store, disp gepatcht).
+  Wine-verifiziert: globale Writes, GetArgC/GetArgV/ArgvGet korrekt.
+
+Verifiziert: wine (global-write, GetArgC 1/4/2, ArgvGet); ELF-Pfad unberührt; Singularität S3==S4.
+
 ## Version 1.0.3D (Juni 2026)
 
 LyxOS-Kernel-Systemprimitive (WSP). Basis V1.0.3C.
