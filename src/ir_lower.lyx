@@ -276,6 +276,11 @@ pub type IRLower = class {
   _tregNameL: int64;    // [] Namenslänge
   _tregN:     int64;    // Anzahl Einträge
   _tregCap:   int64;    // Kapazität
+  // WP-VOLATILE: Slot-Nummern volatiler Locals der AKTUELLEN Funktion (rare → kleine Liste,
+  // Reset O(1) pro Funktion). Volatile LOAD_LOCAL werden mit callmode-Sentinel markiert,
+  // damit DCE sie nicht entfernt (MMIO/Hardware-Register-Reads müssen erhalten bleiben).
+  _volSlotList: int64;  // [] Slot-Nummern
+  _volSlotN:    int64;  // Anzahl
   // Queue of pending specializations to emit after the main lowering loop
   // Records: {mangledPtr:8, mangledLen:8, genFuncNodeIdx:8, emitted:8} = 32 bytes each
   pendingGenBuf:   int64;
@@ -336,6 +341,8 @@ pub type IRLower = class {
     self._tregIdx   := alloc(self._tregCap * 8);
     self._tregNameP := alloc(self._tregCap * 8);
     self._tregNameL := alloc(self._tregCap * 8);
+    self._volSlotList := alloc(256 * 8);
+    self._volSlotN := 0;
     self.pendingGenCap   := 16;
     self.pendingGenBuf   := alloc(16 * 32);
     self.pendingGenCount := 0;
@@ -721,7 +728,8 @@ pub type IRLower = class {
               lnJ := lnJ + 1;
             }
             if lnMatch != 0 {
-              self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, lnSlot, -1, 0);
+              var llIdx: int64 := self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, lnSlot, -1, 0);
+              if self._isVolSlot(lnSlot) != 0 { self._markVolatileInstr(llIdx); }   // WP-VOLATILE
               return dest;
             }
           }
@@ -987,6 +995,21 @@ pub type IRLower = class {
     // WP-SIMD: Element einer parallel-Array<f32> wird als f64 geladen (cvtss2sd) → f64-Ausdruck.
     if k == NK_INDEX { return self._isSimdExpr(self.nodeC0(expr)); }
     return 0;
+  }
+
+  // WP-VOLATILE: ist Slot in der volatile-Liste der aktuellen Funktion?
+  fn _isVolSlot(slot: int64): int64 {
+    var i: int64 := 0;
+    while i < self._volSlotN {
+      if peek64(self._volSlotList + i * 8) == slot { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+  // WP-VOLATILE: Instr idx als volatile markieren (callmode-Sentinel) → DCE behält sie.
+  fn _markVolatileInstr(idx: int64): void {
+    var ib: int64 := peek64(self.ir + IR_MOD_OFF_INSTRBUF);
+    poke64(ib + idx * 80 + IR_INSTR_OFF_CALLMODE, 1448232516);   // 0x564F4C44 "VOLD"
   }
 
   // WP-SIMD: ist expr eine parallel-Array<f32>-Variable (NK_TYPE_PARALLEL=93)? → SSE2-Vektor-Pfad.
@@ -3598,6 +3621,11 @@ pub type IRLower = class {
     // find it. Inline (no helper method) for vtable stability.
     else if (k == NK_VAR_DECL) {
       var vdSlot: int64 := self.allocTemp();
+      // WP-VOLATILE: @volatile-Local (Parser-Flag VAR_FLAG_VOLATILE=1) → Slot vormerken,
+      // damit dessen LOAD_LOCAL nicht von DCE eliminiert wird (MMIO/Hardware-Register).
+      if (self.nodeIVal(stmt) & 1) != 0 {
+        if self._volSlotN < 256 { poke64(self._volSlotList + self._volSlotN * 8, vdSlot); self._volSlotN := self._volSlotN + 1; }
+      }
       var vdInit: int64 := self.nodeC1(stmt);
       if vdInit >= 0 {
         var vdTemp: int64 := self.lowerExpr(vdInit);
@@ -4321,6 +4349,7 @@ pub type IRLower = class {
     self.paramCount := 0;
     self.tempCount := 0;
     self.localNameCnt := 0;
+    self._volSlotN := 0;   // WP-VOLATILE: volatile-Slot-Liste pro Funktion zurücksetzen
     self.curFunc := funcNode;
 
     // WP-AND-upstream-fix v8: allocate params FIRST (slots 0..paramCount-1)
