@@ -616,11 +616,12 @@ pub type IRLower = class {
       return dest;
     }
     
-    // Literal: float constant
+    // Literal: float constant — WP-F64: Quelltext ("2.0") → IEEE-754-Bits parsen → CONST_INT.
+    // (Node speichert TEXT via _ssv, nicht Bits; vorher emittierte der Zweig NICHTS → Garbage.)
     if (k == NK_LIT_FLOAT) {
       var dest: int64 := self.allocTemp();
-      var bits: int64 := self.nodeIVal(expr);
-      // Emit: dest = const float bits
+      var bits: int64 := self._parseFloatBits(self.nodeSVal(expr), self.nodeSLen(expr));
+      self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, bits);
       return dest;
     }
     
@@ -873,6 +874,116 @@ pub type IRLower = class {
   // Binary Operation Lowering
   // ------------------------------------------------------------------
   
+  // WP-F64: Float-Literal-Text ("2.0", "1e-3") → IEEE-754-Bits (int64). Repliziert ELF
+  // codegen_x86.cg_parseFloat (p[0..len) statt src/off). Lyx kennt keinen strtod-Builtin.
+  fn _parseFloatBits(p: pchar, len: int64): int64 {
+    var i: int64 := 0;
+    var neg: int64 := 0;
+    if i < len && StrCharAt(p, i) == 45 { neg := 1; i := i + 1; }
+    var num: int64 := 0;
+    var den: int64 := 1;
+    var intExtra: int64 := 0;
+    while i < len && StrCharAt(p, i) >= 48 && StrCharAt(p, i) <= 57 {
+      if num < 900000000000000 { num := num * 10 + StrCharAt(p, i) - 48; }
+      else { intExtra := intExtra + 1; }
+      i := i + 1;
+    }
+    if i < len && StrCharAt(p, i) == 46 {
+      i := i + 1;
+      if intExtra == 0 {
+        while i < len && StrCharAt(p, i) >= 48 && StrCharAt(p, i) <= 57 && den < 100000000 {
+          num := num * 10 + StrCharAt(p, i) - 48; den := den * 10; i := i + 1;
+        }
+      }
+      while i < len && StrCharAt(p, i) >= 48 && StrCharAt(p, i) <= 57 { i := i + 1; }
+    }
+    var expNeg: int64 := 0;
+    var expVal: int64 := 0;
+    if i < len && (StrCharAt(p, i) == 101 || StrCharAt(p, i) == 69) {
+      i := i + 1;
+      if i < len && StrCharAt(p, i) == 45 { expNeg := 1; i := i + 1; }
+      else if i < len && StrCharAt(p, i) == 43 { i := i + 1; }
+      while i < len && StrCharAt(p, i) >= 48 && StrCharAt(p, i) <= 57 {
+        expVal := expVal * 10 + StrCharAt(p, i) - 48; i := i + 1;
+      }
+    }
+    if num == 0 { return 0; }
+    if intExtra > 0 {
+      if expNeg == 0 { expVal := expVal + intExtra; }
+      else { if expVal > intExtra { expVal := expVal - intExtra; } else { expNeg := 0; expVal := intExtra - expVal; } }
+    }
+    var ej: int64 := 0;
+    if expNeg == 0 { while ej < expVal && num < 100000000000000 { num := num * 10; ej := ej + 1; } }
+    else { while ej < expVal && den < 100000000000000 { den := den * 10; ej := ej + 1; } }
+    var n: int64 := num;
+    var d: int64 := den;
+    var binExp: int64 := 0;
+    if expNeg == 0 {
+      while ej < expVal { while n > 922337203685477580 { n := n / 2; binExp := binExp + 1; } n := n * 10; ej := ej + 1; }
+    } else {
+      while ej < expVal { while d > 922337203685477580 { d := d / 2; n := n / 2; } d := d * 10; if n == 0 { return 0; } ej := ej + 1; }
+    }
+    while n < d && n > 0 {
+      if n > 4611686018427387903 { d := d / 2; if d == 0 { d := 1; } } else { n := n * 2; }
+      binExp := binExp - 1;
+      if binExp < (0 - 1074) { return 0; }
+    }
+    while d < 4611686018427387903 && n >= d * 2 {
+      d := d * 2; binExp := binExp + 1;
+      if binExp > 1023 {
+        var pInf: int64 := 2047; pInf := pInf << 52;
+        if neg != 0 { var smI: int64 := 1; var sI: int64 := 0; while sI < 63 { smI := smI * 2; sI := sI + 1; } return pInf | smI; }
+        return pInf;
+      }
+    }
+    n := n - d;
+    var mant: int64 := 0;
+    var bit: int64 := 51;
+    while bit >= 0 {
+      if n > 4000000000000000 { n := n / 2; d := d / 2; if d == 0 { d := 1; } }
+      n := n * 2;
+      if n >= d { mant := mant | (1 << bit); n := n - d; }
+      bit := bit - 1;
+    }
+    var biasedE: int64 := binExp + 1023;
+    if biasedE <= 0 { return 0; }
+    if biasedE >= 2047 {
+      var pInf2: int64 := 2047; pInf2 := pInf2 << 52;
+      if neg != 0 { var smJ: int64 := 1; var sJ: int64 := 0; while sJ < 63 { smJ := smJ * 2; sJ := sJ + 1; } return pInf2 | smJ; }
+      return pInf2;
+    }
+    var bits: int64 := (biasedE << 52) | mant;
+    if neg != 0 { var sm: int64 := 1; var sk: int64 := 0; while sk < 63 { sm := sm * 2; sk := sk + 1; } bits := bits | sm; }
+    return bits;
+  }
+
+  // WP-F64: liefert Ausdruck einen f64-Wert? (lit_float, f64-typisierter Ident, f64-Binop,
+  // cast→f64, sqrt-Call, unäres -f). Vergleiche/Logik liefern int (0/1). Vorlage: ELF cg_isF64Expr.
+  fn _isF64Expr(expr: int64): int64 {
+    if expr < 0 { return 0; }
+    var k: int64 := self.nodeKind(expr);
+    if k == NK_LIT_FLOAT { return 1; }
+    if k == NK_IDENT {
+      var tn: int64 := self._localTypeNode(self.nodeSVal(expr), self.nodeSLen(expr));
+      if tn >= 0 { return self.seq(self.nodeSVal(tn), self.nodeSLen(tn), "f64", 3); }
+      return 0;
+    }
+    if k == NK_CAST {
+      var tt: int64 := self.nodeC1(expr);
+      if tt >= 0 { return self.seq(self.nodeSVal(tt), self.nodeSLen(tt), "f64", 3); }
+      return 0;
+    }
+    if k == NK_BINOP {
+      var bop: int64 := self.nodeIVal(expr);
+      if bop >= 79 { return 0; }   // Vergleiche(79-84)/AND(85)/OR(86) → int
+      if self._isF64Expr(self.nodeC0(expr)) != 0 { return 1; }
+      return self._isF64Expr(self.nodeC1(expr));
+    }
+    if k == NK_UNOP { return self._isF64Expr(self.nodeC0(expr)); }
+    if k == NK_CALL { return self.seq(self.nodeSVal(expr), self.nodeSLen(expr), "sqrt", 4); }
+    return 0;
+  }
+
   fn lowerBinOp(expr: int64): int64 {
     var op: int64 := self.nodeIVal(expr);
     var t1: int64 := self.lowerExpr(self.nodeC0(expr));
@@ -902,7 +1013,16 @@ pub type IRLower = class {
     else if op == 85  { iro := IRO_AND; }   // TK_AND (&&; treat as bitwise for now)
     else if op == 86  { iro := IRO_OR;  }   // TK_OR (||)
     if iro >= 0 {
-      // WP-OPCODE-REST: Div/Mod durch 0 → kontrollierter ASSERT_NOT_ZERO (Panic) statt SIGFPE.
+      // WP-F64: f64-Operanden → Float-Ops (sonst Integer-Bit-Arithmetik der IEEE-Muster = Garbage).
+      if iro == IRO_ADD || iro == IRO_SUB || iro == IRO_MUL || iro == IRO_DIV {
+        if self._isF64Expr(expr) != 0 {
+          if iro == IRO_ADD { iro := IRO_FADD; }
+          else if iro == IRO_SUB { iro := IRO_FSUB; }
+          else if iro == IRO_MUL { iro := IRO_FMUL; }
+          else { iro := IRO_FDIV; }
+        }
+      }
+      // WP-OPCODE-REST: Integer-Div/Mod durch 0 → kontrollierter ASSERT_NOT_ZERO (Panic) statt SIGFPE.
       if iro == IRO_DIV || iro == IRO_MOD {
         self.irAddInstrDirect(IRO_ASSERT_NOT_ZERO, -1, t2, -1, 0);
       }
@@ -3208,12 +3328,27 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerCast(expr: int64): int64 {
+    // WP-F64: war STUB (dest uninitialisiert → Garbage bei `x as T`). Jetzt: f64↔int echt
+    // konvertieren (FTOI/ITOF), gleiche Repräsentationsklasse = pass-through (int↔int, ptr-casts).
     var src: int64 := self.lowerExpr(self.nodeC0(expr));
-    // Target type is in C1
-    var dest: int64 := self.allocTemp();
-    
-    // Emit cast based on source/target type
-    return dest;
+    var tt: int64 := self.nodeC1(expr);
+    var tgtF64: int64 := 0;
+    if tt >= 0 { tgtF64 := self.seq(self.nodeSVal(tt), self.nodeSLen(tt), "f64", 3); }
+    var srcF64: int64 := self._isF64Expr(self.nodeC0(expr));
+    if tgtF64 != 0 {
+      if srcF64 == 0 {
+        var d1: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_ITOF, d1, src, -1, 0);   // int → f64
+        return d1;
+      }
+      return src;   // f64 → f64
+    }
+    if srcF64 != 0 {
+      var d2: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_FTOI, d2, src, -1, 0);     // f64 → int (Trunkierung)
+      return d2;
+    }
+    return src;   // int → int / ptr-cast: gleiche Repräsentation, pass-through
   }
   
   // ------------------------------------------------------------------

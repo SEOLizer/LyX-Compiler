@@ -71,6 +71,15 @@ run "div_by_zero_panic"  'fn main(): int64 { var z: int64 := 0; var a: int64 := 
 run "mod_by_zero_panic"  'fn main(): int64 { var z: int64 := 0; var a: int64 := 10; return a % z; }' 1
 run "div_ok_unaffected"  'fn main(): int64 { var a: int64 := 20; var b: int64 := 4; return a / b; }' 5
 
+# --- WP-F64: f64-Pipeline (Literale/Arith/Casts/sqrt) runtime-verifiziert (pure compute) ---
+run "f64_add"   'fn main(): int64 { var a: f64 := 2.0; var b: f64 := 3.0; return (a + b) as int64; }' 5
+run "f64_mul"   'fn main(): int64 { var a: f64 := 3.0; var b: f64 := 4.0; return (a * b) as int64; }' 12
+run "f64_div"   'fn main(): int64 { var a: f64 := 10.0; var b: f64 := 4.0; return (a / b) as int64; }' 2
+run "f64_sub"   'fn main(): int64 { var a: f64 := 9.5; var b: f64 := 2.5; return (a - b) as int64; }' 7
+run "f64_sqrt"  'fn main(): int64 { var f: f64 := 16.0; return sqrt(f) as int64; }' 4
+run "f64_itof_ftoi" 'fn main(): int64 { var i: int64 := 7; var f: f64 := i as f64; return f as int64; }' 7
+run "f64_cmp"   'fn main(): int64 { var a: f64 := 3.0; var b: f64 := 2.0; if a > b { return 1; } return 0; }' 1
+
 # --- peek16 Word-Read (Laufzeit, rodata) ---
 run "peek16_low"  'fn main(): int64 { return peek16("AB") & 0xFF; }' 65
 run "peek16_high" 'fn main(): int64 { return (peek16("AB") >> 8) & 0xFF; }' 66
