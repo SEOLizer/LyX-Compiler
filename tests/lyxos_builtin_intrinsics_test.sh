@@ -103,6 +103,8 @@ run "wsp_pause_fences"  'fn main(): int64 { cpu_pause(); fence_sfence(); fence_l
 compile_ok "wsp_cpuctrl" 'fn main(): int64 { cpu_cli(); cpu_sti(); cpu_hlt(); var v: int64 := cpu_rdmsr(0); cpu_wrmsr(0, 1); return 0; }' 
 # --- WP-VOLATILE: @volatile-Local — Read wird nicht von DCE eliminiert (MMIO). Runtime-neutral. ---
 compile_ok "volatile_decl" '@volatile var g: int64 := 0; fn main(): int64 { @volatile var x: int64 := 5; x; return x; }' 
+# --- WP-ALIGN: @align(n) array/heap-backed Local → n-aligned Allokation (over-alloc+round) ---
+compile_ok "align_array" 'fn main(): int64 { @align(4096) var buf: int64[8]; buf[0] := 7; return buf[0]; }' 
 
 # --- peek16 Word-Read (Laufzeit, rodata) ---
 run "peek16_low"  'fn main(): int64 { return peek16("AB") & 0xFF; }' 65
