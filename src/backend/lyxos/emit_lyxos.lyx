@@ -31,24 +31,6 @@ pub type EmitLyxOS = class {
     strPatchBuf:   int64;   // array of (leaOff: int64, strOff: int64) pairs for CONST_STR
     strPatchCount: int64;
     strPatchCap:   int64;   // Kapazität in Bytes (16 Byte/Eintrag); wächst dynamisch
-    // LYXOS-WP-2: Control-Flow. labelAddrs[id]=Code-Offset (dynamisch); jmpPatch=(relOff,labelId).
-    labelAddrs:    int64;
-    labelCap:      int64;   // Anzahl Label-Slots (8 Byte je)
-    jmpPatchBuf:   int64;
-    jmpPatchCount: int64;
-    jmpPatchCap:   int64;   // Bytes (16 je Eintrag)
-    // LYXOS-WP-3: Globals-Daten-Area (ans Code angehängt) + RIP-relative Patches.
-    globalsBase:   int64;   // Code-Offset des Globals-Pools (nach emitGlobalsPool)
-    rodataBase:    int64;   // Code-Offset des StrPools = Ende .text (LYXOS-WP-5 Sektions-Grenze)
-    globalPatchBuf: int64;
-    globalPatchCount: int64;
-    globalPatchCap: int64;  // Bytes (16 je Eintrag: dispOff, gIdx)
-    // LYXOS-call-fix: user-Funktions-Calls. funcAddrs[funcId]=Code-Offset; callPatch=(relOff,funcId).
-    funcAddrs:     int64;
-    funcCap:       int64;   // Anzahl Funktions-Slots (8 Byte je)
-    callPatchBuf:  int64;
-    callPatchCount: int64;
-    callPatchCap:  int64;   // Bytes (16 je Eintrag)
 
     pub fn init(ir: int64): void {
         self.irMod         := ir;
@@ -58,25 +40,6 @@ pub type EmitLyxOS = class {
         self.strPatchCap   := 4096;
         self.strPatchBuf   := alloc(self.strPatchCap);
         self.strPatchCount := 0;
-        // LYXOS-WP-2: Label/Jmp-Infra.
-        self.labelCap      := 1024;
-        self.labelAddrs    := alloc(self.labelCap * 8);
-        var li0: int64 := 0;
-        while li0 < self.labelCap { poke64(self.labelAddrs + li0 * 8, 0 - 1); li0 := li0 + 1; }
-        self.jmpPatchCap   := 4096;
-        self.jmpPatchBuf   := alloc(self.jmpPatchCap);
-        self.jmpPatchCount := 0;
-        // LYXOS-WP-3: Globals-Patches.
-        self.globalsBase      := 0 - 1;
-        self.globalPatchCap   := 4096;
-        self.globalPatchBuf   := alloc(self.globalPatchCap);
-        self.globalPatchCount := 0;
-        // LYXOS-call-fix: funcAddrs in emitFunctions alloziert (funcLen bekannt); Call-Patches hier.
-        self.funcAddrs        := 0;
-        self.funcCap          := 0;
-        self.callPatchCap     := 4096;
-        self.callPatchBuf     := alloc(self.callPatchCap);
-        self.callPatchCount   := 0;
     }
 
     // strPatchBuf wächst dynamisch (16 Byte/Eintrag). Vorher fix 4096 = nur 256 Einträge →
@@ -325,317 +288,10 @@ pub type EmitLyxOS = class {
         }
     }
 
-    // LYXOS-WP-1: MOV rcx, [rbp+disp] — zweiter Binop-Operand.
-    fn emitMovRcxFromSlot(slot: int64): void {
-        var off: int64 := self.slotOff(slot);
-        if slot < 16 {
-            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x4D); self.emit8(off & 0xFF);
-        } else {
-            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x8D); self.emit32(off);
-        }
-    }
-
-    // LYXOS-WP-1: dest = src1 OP src2 — rax=src1, rcx=src2, op, → dest.
-    fn emitBinOp(op: int64, dest: int64, src1: int64, src2: int64): void {
-        self.emitMovRaxFromSlot(src1);
-        self.emitMovRcxFromSlot(src2);
-        if op == 10 {                                                      // ADD
-            self.emit8(0x48); self.emit8(0x01); self.emit8(0xC8);
-        } else if op == 11 {                                              // SUB
-            self.emit8(0x48); self.emit8(0x29); self.emit8(0xC8);
-        } else if op == 12 {                                              // MUL (IMUL rax,rcx)
-            self.emit8(0x48); self.emit8(0x0F); self.emit8(0xAF); self.emit8(0xC1);
-        } else if op == 13 {                                              // DIV (CQO; IDIV rcx → rax)
-            self.emit8(0x48); self.emit8(0x99);
-            self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF9);
-        } else if op == 14 {                                              // MOD (… → rdx → rax)
-            self.emit8(0x48); self.emit8(0x99);
-            self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF9);
-            self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);         // MOV rax, rdx
-        } else if op == 51 || op == 55 {                                  // AND / BITAND
-            self.emit8(0x48); self.emit8(0x21); self.emit8(0xC8);
-        } else if op == 52 || op == 56 {                                  // OR / BITOR
-            self.emit8(0x48); self.emit8(0x09); self.emit8(0xC8);
-        } else if op == 54 || op == 57 {                                  // XOR / BITXOR
-            self.emit8(0x48); self.emit8(0x31); self.emit8(0xC8);
-        } else if op == 59 {                                              // SHL rax, cl
-            self.emit8(0x48); self.emit8(0xD3); self.emit8(0xE0);
-        } else if op == 60 {                                              // SHR rax, cl
-            self.emit8(0x48); self.emit8(0xD3); self.emit8(0xE8);
-        } else {                                                          // Vergleiche 30..35
-            self.emit8(0x48); self.emit8(0x39); self.emit8(0xC8);         // CMP rax, rcx
-            var cc: int64 := 0x94;                                        // default sete
-            if op == 31 { cc := 0x95; }                                   // NEQ setne
-            if op == 32 { cc := 0x9C; }                                   // LT  setl
-            if op == 33 { cc := 0x9E; }                                   // LE  setle
-            if op == 34 { cc := 0x9F; }                                   // GT  setg
-            if op == 35 { cc := 0x9D; }                                   // GE  setge
-            self.emit8(0x0F); self.emit8(cc); self.emit8(0xC0);           // SETcc al
-            self.emit8(0x48); self.emit8(0x0F); self.emit8(0xB6); self.emit8(0xC0); // MOVZX rax, al
-        }
-        self.emitMovSlotFromRax(dest);
-    }
-
-    // LYXOS-WP-1: dest = -src1 (NEG).
-    fn emitNeg(dest: int64, src1: int64): void {
-        self.emitMovRaxFromSlot(src1);
-        self.emit8(0x48); self.emit8(0xF7); self.emit8(0xD8);             // NEG rax
-        self.emitMovSlotFromRax(dest);
-    }
-
-    // ── LYXOS-WP-2: Control-Flow ────────────────────────────────────────────────
-    fn ensureLabelCap(id: int64): void {
-        if id < self.labelCap { return; }
-        var nc: int64 := self.labelCap * 2;
-        while nc <= id { nc := nc * 2; }
-        var nb: int64 := alloc(nc * 8);
-        var i: int64 := 0;
-        while i < self.labelCap { poke64(nb + i * 8, peek64(self.labelAddrs + i * 8)); i := i + 1; }
-        while i < nc { poke64(nb + i * 8, 0 - 1); i := i + 1; }
-        self.labelAddrs := nb;
-        self.labelCap := nc;
-    }
-
-    fn emitLabelDef(id: int64): void {
-        self.ensureLabelCap(id);
-        poke64(self.labelAddrs + id * 8, self.codeLen);
-    }
-
-    fn recordJmpPatch(relOff: int64, labelId: int64): void {
-        var need: int64 := (self.jmpPatchCount + 1) * 16;
-        if need > self.jmpPatchCap {
-            var nc: int64 := self.jmpPatchCap * 2;
-            var nb: int64 := alloc(nc);
-            memcpy(nb, self.jmpPatchBuf, self.jmpPatchCount * 16);
-            self.jmpPatchBuf := nb;
-            self.jmpPatchCap := nc;
-        }
-        var rec: int64 := self.jmpPatchBuf + self.jmpPatchCount * 16;
-        poke64(rec + 0, relOff);
-        poke64(rec + 8, labelId);
-        self.jmpPatchCount := self.jmpPatchCount + 1;
-    }
-
-    fn emitJmpToLabel(labelId: int64): void {
-        self.emit8(0xE9);                 // JMP rel32
-        var relOff: int64 := self.codeLen;
-        self.emit32(0);
-        self.recordJmpPatch(relOff, labelId);
-    }
-
-    // jumpIfTrue!=0 → JNZ (BR_TRUE), sonst JZ (BR_FALSE).
-    fn emitBrCond(condSlot: int64, labelId: int64, jumpIfTrue: int64): void {
-        self.emitMovRaxFromSlot(condSlot);
-        self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);   // TEST rax, rax
-        self.emit8(0x0F);
-        if jumpIfTrue != 0 { self.emit8(0x85); } else { self.emit8(0x84); }  // JNZ / JZ rel32
-        var relOff: int64 := self.codeLen;
-        self.emit32(0);
-        self.recordJmpPatch(relOff, labelId);
-    }
-
-    fn applyJmpPatches(): void {
-        var i: int64 := 0;
-        while i < self.jmpPatchCount {
-            var rec:     int64 := self.jmpPatchBuf + i * 16;
-            var relOff:  int64 := peek64(rec + 0);
-            var labelId: int64 := peek64(rec + 8);
-            var target:  int64 := 0 - 1;
-            if labelId < self.labelCap { target := peek64(self.labelAddrs + labelId * 8); }
-            if target >= 0 {
-                self.patch32(relOff, target - (relOff + 4));
-            }
-            i := i + 1;
-        }
-    }
-
-    // ── LYXOS-WP-3: Globals (RIP-relativer Zugriff auf angehängten Daten-Pool) ──
-    fn recordGlobalPatch(dispOff: int64, gIdx: int64): void {
-        var need: int64 := (self.globalPatchCount + 1) * 16;
-        if need > self.globalPatchCap {
-            var nc: int64 := self.globalPatchCap * 2;
-            var nb: int64 := alloc(nc);
-            memcpy(nb, self.globalPatchBuf, self.globalPatchCount * 16);
-            self.globalPatchBuf := nb;
-            self.globalPatchCap := nc;
-        }
-        var rec: int64 := self.globalPatchBuf + self.globalPatchCount * 16;
-        poke64(rec + 0, dispOff);
-        poke64(rec + 8, gIdx);
-        self.globalPatchCount := self.globalPatchCount + 1;
-    }
-
-    // ── LYXOS-WP-4: Fields + Index (structs/arrays) ────────────────────────────
-    // dest = *(base + fieldOff)
-    fn emitLoadField(dest: int64, base: int64, fieldOff: int64): void {
-        self.emitMovRaxFromSlot(base);
-        self.emit8(0x48); self.emit8(0x8B); self.emit8(0x80); self.emit32(fieldOff);  // MOV rax,[rax+off]
-        self.emitMovSlotFromRax(dest);
-    }
-
-    // *(base + fieldOff) = value
-    fn emitStoreField(fieldOff: int64, value: int64, base: int64): void {
-        self.emitMovRaxFromSlot(value);
-        self.emitMovRcxFromSlot(base);
-        self.emit8(0x48); self.emit8(0x89); self.emit8(0x81); self.emit32(fieldOff);  // MOV [rcx+off],rax
-    }
-
-    // dest = base[idx]   (8-Byte-Elemente)
-    fn emitLoadIdx(dest: int64, base: int64, idx: int64): void {
-        self.emitMovRaxFromSlot(base);
-        self.emitMovRcxFromSlot(idx);
-        self.emit8(0x48); self.emit8(0x8B); self.emit8(0x04); self.emit8(0xC8);        // MOV rax,[rax+rcx*8]
-        self.emitMovSlotFromRax(dest);
-    }
-
-    // base[idx] = value   (8-Byte-Elemente)
-    fn emitStoreIdx(idx: int64, value: int64, base: int64): void {
-        self.emitMovRaxFromSlot(value);
-        self.emitMovRcxFromSlot(idx);
-        self.emitMovRdxFromSlot(base);
-        self.emit8(0x48); self.emit8(0x89); self.emit8(0x04); self.emit8(0xCA);        // MOV [rdx+rcx*8],rax
-    }
-
-    // WP-STUB: kontrollierter Abbruch (sys_exit 60, code 1) — exakt 12 Bytes (jnz/jb-Offset!).
-    fn emitPanicExit(): void {
-        self.emit8(0xBF); self.emit32(1);    // mov edi, 1   (Exit-Code)
-        self.emit8(0xB8); self.emit32(60);   // mov eax, 60  (sys_exit)
-        self.emit8(0x0F); self.emit8(0x05);  // syscall
-    }
-
-    // WP-STUB: indirekter Call (Funktions-Pointer). fnPtrSlot=Slot mit Adresse, argCount Args
-    // in Slots 0..argCount-1 (System-V), Result rax→dest. (CALL_INDIRECT aus _indirect_call_N.)
-    fn emitCallIndirect(fnPtrSlot: int64, argCount: int64, dest: int64): void {
-        if argCount >= 1 { self.emitMovRdiFromSlot(0); }
-        if argCount >= 2 { self.emitMovRsiFromSlot(1); }
-        if argCount >= 3 { self.emitMovRdxFromSlot(2); }
-        if argCount >= 4 { self.emitMovRcxFromSlot(3); }
-        if argCount >= 5 { self.emitMovR8FromSlot(4); }
-        self.emitMovRaxFromSlot(fnPtrSlot);  // rax = Funktions-Pointer
-        self.emit8(0xFF); self.emit8(0xD0);  // call rax
-        self.emitMovSlotFromRax(dest);
-    }
-
-    // dest = global[gIdx]   (MOV rax, [rip+disp]; → slot)
-    fn emitLoadGlobal(dest: int64, gIdx: int64): void {
-        self.emit8(0x48); self.emit8(0x8B); self.emit8(0x05);   // MOV rax, [rip+disp32]
-        var dispOff: int64 := self.codeLen;
-        self.emit32(0);
-        self.recordGlobalPatch(dispOff, gIdx);
-        self.emitMovSlotFromRax(dest);
-    }
-
-    // global[gIdx] = src1   (rax=src1; MOV [rip+disp], rax)
-    fn emitStoreGlobal(gIdx: int64, src1: int64): void {
-        self.emitMovRaxFromSlot(src1);
-        self.emit8(0x48); self.emit8(0x89); self.emit8(0x05);   // MOV [rip+disp32], rax
-        var dispOff: int64 := self.codeLen;
-        self.emit32(0);
-        self.recordGlobalPatch(dispOff, gIdx);
-    }
-
-    // dest = &global[gIdx]  (LEA rax, [rip+disp]; → slot)
-    fn emitLoadGlobalAddr(dest: int64, gIdx: int64): void {
-        self.emit8(0x48); self.emit8(0x8D); self.emit8(0x05);   // LEA rax, [rip+disp32]
-        var dispOff: int64 := self.codeLen;
-        self.emit32(0);
-        self.recordGlobalPatch(dispOff, gIdx);
-        self.emitMovSlotFromRax(dest);
-    }
-
-    // Hängt den Globals-Daten-Pool ans Code an (8 B je Global, Init-Werte aus dem
-    // IR-Modul globalBuffer) und patcht alle RIP-relativen Disp32. IR_MOD_OFF_GLOBALBUF=104,
-    // IR_MOD_OFF_GLOBALLEN=120.
-    fn emitGlobalsPool(): void {
-        var gCount: int64 := peek64(self.irMod + 120);
-        var gBuf:   int64 := peek64(self.irMod + 104);
-        self.globalsBase := self.codeLen;
-        var i: int64 := 0;
-        while i < gCount {
-            self.emit64(peek64(gBuf + i * 8));   // Init-Wert (oder 0)
-            i := i + 1;
-        }
-        // RIP-relative Disp32 patchen: disp = (globalsBase + gIdx*8) - (dispOff + 4)
-        var p: int64 := 0;
-        while p < self.globalPatchCount {
-            var rec:     int64 := self.globalPatchBuf + p * 16;
-            var dispOff: int64 := peek64(rec + 0);
-            var gIdx:    int64 := peek64(rec + 8);
-            self.patch32(dispOff, (self.globalsBase + gIdx * 8) - (dispOff + 4));
-            p := p + 1;
-        }
-    }
-
     // CALL rel32 stub — wired up with real relocation in LX-03+
-    // ── LYXOS-call-fix: user-Funktions-Calls (System-V: rdi,rsi,rdx,rcx,r8,r9) ──
-    // Arg-Register-Index → REX-Prefix / ModRM-reg-Bits (mod=10 disp32, rm=101=rbp).
-    fn _argRegRex(ri: int64): int64 {
-        if ri < 4 { return 0x48; }
-        return 0x4C;   // r8/r9 brauchen REX.R
-    }
-    fn _argRegModrm(ri: int64): int64 {
-        var rb: int64 := 1;
-        if ri == 0 { rb := 7; }       // rdi
-        if ri == 1 { rb := 6; }       // rsi
-        if ri == 2 { rb := 2; }       // rdx
-        if ri == 3 { rb := 1; }       // rcx
-        if ri == 4 { rb := 0; }       // r8
-        if ri == 5 { rb := 1; }       // r9
-        return 0x85 | (rb << 3);      // mod=10, rm=101 (rbp+disp32)
-    }
-    // <argReg[ri]> := [rbp + slotOff(slot)]
-    fn emitMovRegFromSlot(ri: int64, slot: int64): void {
-        self.emit8(self._argRegRex(ri)); self.emit8(0x8B); self.emit8(self._argRegModrm(ri));
-        self.emit32(self.slotOff(slot));
-    }
-    // [rbp + slotOff(slot)] := <argReg[ri]>
-    fn emitMovSlotFromReg(ri: int64, slot: int64): void {
-        self.emit8(self._argRegRex(ri)); self.emit8(0x89); self.emit8(self._argRegModrm(ri));
-        self.emit32(self.slotOff(slot));
-    }
-
-    fn recordCallPatch(relOff: int64, funcId: int64): void {
-        var need: int64 := (self.callPatchCount + 1) * 16;
-        if need > self.callPatchCap {
-            var nc: int64 := self.callPatchCap * 2;
-            var nb: int64 := alloc(nc);
-            memcpy(nb, self.callPatchBuf, self.callPatchCount * 16);
-            self.callPatchBuf := nb;
-            self.callPatchCap := nc;
-        }
-        var rec: int64 := self.callPatchBuf + self.callPatchCount * 16;
-        poke64(rec + 0, relOff);
-        poke64(rec + 8, funcId);
-        self.callPatchCount := self.callPatchCount + 1;
-    }
-
-    fn applyCallPatches(): void {
-        var i: int64 := 0;
-        while i < self.callPatchCount {
-            var rec:    int64 := self.callPatchBuf + i * 16;
-            var relOff: int64 := peek64(rec + 0);
-            var funcId: int64 := peek64(rec + 8);
-            var target: int64 := 0 - 1;
-            if funcId >= 0 { if funcId < self.funcCap { target := peek64(self.funcAddrs + funcId * 8); } }
-            if target >= 0 {
-                self.patch32(relOff, target - (relOff + 4));
-            }
-            i := i + 1;
-        }
-    }
-
-    // dest = funcId(args at argBase..argBase+argCount-1)
-    fn emitCall(funcId: int64, argBase: int64, argCount: int64, dest: int64): void {
-        var ai: int64 := 0;
-        while ai < argCount {
-            if ai < 6 { self.emitMovRegFromSlot(ai, argBase + ai); }
-            ai := ai + 1;
-        }
-        self.emit8(0xE8);                       // CALL rel32
-        var relOff: int64 := self.codeLen;
+    fn emitCall(funcIdx: int64, retSlot: int64): void {
+        self.emit8(0xE8);
         self.emit32(0);
-        self.recordCallPatch(relOff, funcId);
-        self.emitMovSlotFromRax(dest);          // Resultat rax → dest
     }
 
     // LEA rax, [rip + rel32] with forward patch; rel32 resolved in emitStrPool().
@@ -652,7 +308,6 @@ pub type EmitLyxOS = class {
     }
 
     fn emitStrPool(): void {
-        self.rodataBase := self.codeLen;   // LYXOS-WP-5: Ende .text / Start .rodata
         var strBuf:     int64 := peek64(self.irMod + IR_MOD_OFF_STRBUF);
         var strLen:     int64 := peek64(self.irMod + IR_MOD_OFF_STRLEN);
         var poolStart:  int64 := self.codeLen;
@@ -730,25 +385,14 @@ pub type EmitLyxOS = class {
     }
 
     fn emitPrintStr(): void {
-        self.emitMovRsiFromSlot(0);                              // rsi = ptr (slot 0)
-        self.emitMovRdxFromSlot(1);                              // rdx = len (slot 1, evtl. -1)
-        // LYXOS-pchar-fix: len<0 (Sentinel) → strlen(rsi) zur Laufzeit (null-terminierte pchar-Var).
-        // len>=0 (Literal-Pfad mit expliziter Länge) → unverändert verwenden.
-        self.emit8(0x48); self.emit8(0x85); self.emit8(0xD2);   // TEST rdx, rdx
-        self.emit8(0x79); self.emit8(0x0E);                     // JNS havelen (+14)
-        self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);   // XOR rdx, rdx
-        self.emit8(0x80); self.emit8(0x3C); self.emit8(0x16); self.emit8(0x00);  // loop: CMP byte[rsi+rdx],0
-        self.emit8(0x74); self.emit8(0x05);                     // JE havelen (+5)
-        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC2);   // INC rdx
-        self.emit8(0xEB); self.emit8(0xF5);                     // JMP loop (-11)
-        // havelen:
-        self.emit8(0xBF); self.emit32(1);                       // mov edi, 1 (stdout)
+        self.emitMovRsiFromSlot(0);
+        self.emitMovRdxFromSlot(1);
+        self.emit8(0xBF); self.emit32(1);
         self.emitMovRaxImm(0x0203);
         self.emitSyscall();
     }
 
-    fn emitPrintInt(): void { self.emitPrintIntFd(1); }     // PrintInt → stdout (fd 1)
-    fn emitPrintIntFd(fd: int64): void {
+    fn emitPrintInt(): void {
         self.emitMovRaxFromSlot(0);
         self.emit8(0x48); self.emit8(0x83); self.emit8(0xEC); self.emit8(0x20);
         self.emit8(0x45); self.emit8(0x31); self.emit8(0xC0);
@@ -772,7 +416,7 @@ pub type EmitLyxOS = class {
         self.emit8(0x4A); self.emit8(0x8D); self.emit8(0x74); self.emit8(0x1C); self.emit8(0x01);
         self.emit8(0xBA); self.emit32(23);
         self.emit8(0x44); self.emit8(0x29); self.emit8(0xDA);
-        self.emit8(0xBF); self.emit32(fd);                  // mov edi, fd (1=stdout, 2=stderr)
+        self.emit8(0xBF); self.emit32(1);
         self.emitMovRaxImm(0x0203);
         self.emitSyscall();
         self.emit8(0x48); self.emit8(0x83); self.emit8(0xC4); self.emit8(0x20);
@@ -804,33 +448,7 @@ pub type EmitLyxOS = class {
         self.emitMovSlotFromRax(dest);
     }
 
-    // lyxc→LyxOS Gruppe A: wie emitVfsSyscall, aber Args aus HOHEM argBase-Block
-    // (Slots argBase..argBase+argc-1) statt fester Slots 0..N — vermeidet das
-    // Caller-Local-Aliasing der festen Slots (vgl. #839 argBase-Konvention).
-    fn emitVfsSyscallAB(nr: int64, argc: int64, argBase: int64, dest: int64): void {
-        self.emitMovRaxImm(nr);
-        if argc >= 1 { self.emitMovRdiFromSlot(argBase); }
-        if argc >= 2 { self.emitMovRsiFromSlot(argBase + 1); }
-        if argc >= 3 { self.emitMovRdxFromSlot(argBase + 2); }
-        if argc >= 4 { self.emitMovR10FromSlot(argBase + 3); }
-        if argc >= 5 { self.emitMovR8FromSlot(argBase + 4); }
-        if argc >= 6 {
-            var off6: int64 := self.slotOff(argBase + 5);
-            if (argBase + 5) < 16 {
-                self.emit8(0x4C); self.emit8(0x8B); self.emit8(0x4D);
-                self.emit8(off6 & 0xFF);
-            } else {
-                self.emit8(0x4C); self.emit8(0x8B); self.emit8(0x8D);
-                self.emit32(off6);
-            }
-        }
-        self.emitSyscall();
-        self.emit8(0x49); self.emit8(0x89); self.emit8(0xC7);  // MOV r15, rax (Fehlercode)
-        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);  // MOV rax, rdx (LyxOS: rdx=value)
-        self.emitMovSlotFromRax(dest);
-    }
-
-    fn emitBuiltinCall(id: int64, argBase: int64, dest: int64): void {
+    fn emitBuiltinCall(id: int64, dest: int64): void {
         if id == 1 {
             self.emitPrintStr();
         } else if id == 2 {
@@ -1034,125 +652,6 @@ pub type EmitLyxOS = class {
             else if id == 171 { lxW17ac := 0; }   // sys_kbd_poll()
             self.emitVfsSyscall(lxW17nr, lxW17ac, dest);
         }
-        // fix/lyxos-builtin-misdispatch: Memory-Intrinsics + Str-Char als echte
-        // load/store-Emission (ids 200-207). Vorher fielen peek/poke/StrCharAt/StrSetChar
-        // in ir_lower.lowerCall auf den stillen id=1=PrintStr-Catch-all → write()-Syscall
-        // statt Byte-Load (fb-Garbling). Spiegelt codegen_x86 (ELF). Arg(s) in Slot 0/1/2.
-        else if id == 200 {                          // peek8: movzx rax, byte [rax]
-            self.emitMovRaxFromSlot(argBase);
-            self.emit8(0x48); self.emit8(0x0F); self.emit8(0xB6); self.emit8(0x00);
-            self.emitMovSlotFromRax(dest);
-        }
-        else if id == 201 {                          // peek32: mov eax, [rax] (zero-extend)
-            self.emitMovRaxFromSlot(argBase);
-            self.emit8(0x8B); self.emit8(0x00);
-            self.emitMovSlotFromRax(dest);
-        }
-        else if id == 202 {                          // peek64: mov rax, [rax]
-            self.emitMovRaxFromSlot(argBase);
-            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x00);
-            self.emitMovSlotFromRax(dest);
-        }
-        else if id == 203 {                          // poke8(addr,val): mov [rax], cl
-            self.emitMovRaxFromSlot(argBase); self.emitMovRcxFromSlot(argBase + 1);
-            self.emit8(0x88); self.emit8(0x08);
-            self.emitMovSlotFromRax(dest);
-        }
-        else if id == 204 {                          // poke32(addr,val): mov [rax], ecx
-            self.emitMovRaxFromSlot(argBase); self.emitMovRcxFromSlot(argBase + 1);
-            self.emit8(0x89); self.emit8(0x08);
-            self.emitMovSlotFromRax(dest);
-        }
-        else if id == 205 {                          // poke64(addr,val): mov [rax], rcx
-            self.emitMovRaxFromSlot(argBase); self.emitMovRcxFromSlot(argBase + 1);
-            self.emit8(0x48); self.emit8(0x89); self.emit8(0x08);
-            self.emitMovSlotFromRax(dest);
-        }
-        else if id == 206 {                          // StrCharAt(s,i): movzx rax, byte [rax+rcx]
-            self.emitMovRaxFromSlot(argBase); self.emitMovRcxFromSlot(argBase + 1);
-            self.emit8(0x48); self.emit8(0x0F); self.emit8(0xB6); self.emit8(0x04); self.emit8(0x08);
-            self.emitMovSlotFromRax(dest);
-        }
-        else if id == 207 {                          // StrSetChar(s,i,ch): mov [rax+rcx], dl
-            self.emitMovRaxFromSlot(argBase); self.emitMovRcxFromSlot(argBase + 1); self.emitMovRdxFromSlot(argBase + 2);
-            self.emit8(0x88); self.emit8(0x14); self.emit8(0x08);
-            self.emitMovSlotFromRax(dest);
-        }
-        // lyxc→LyxOS Gruppe C (pure-compute Intrinsics, argBase-Konvention wie 200-207)
-        else if id == 208 {                          // peek16(addr): movzx rax, word [rax]
-            self.emitMovRaxFromSlot(argBase);
-            self.emit8(0x48); self.emit8(0x0F); self.emit8(0xB7); self.emit8(0x00);
-            self.emitMovSlotFromRax(dest);
-        }
-        else if id == 209 {                          // poke16(addr,val): mov word [rax], cx
-            self.emitMovRaxFromSlot(argBase); self.emitMovRcxFromSlot(argBase + 1);
-            self.emit8(0x66); self.emit8(0x89); self.emit8(0x08);
-            self.emitMovSlotFromRax(dest);
-        }
-        else if id == 210 {                          // memcpy(dst,src,len): rep movsb; ret dst
-            self.emitMovRdiFromSlot(argBase); self.emitMovRsiFromSlot(argBase + 1); self.emitMovRcxFromSlot(argBase + 2);
-            self.emit8(0xFC);                        // cld
-            self.emit8(0xF3); self.emit8(0xA4);      // rep movsb
-            self.emitMovRaxFromSlot(argBase);        // rax = dst (C-Rückgabe)
-            self.emitMovSlotFromRax(dest);
-        }
-        // lyxc→LyxOS Kat-B: clock_gettime(clk_id, ts) → sys_time_ns(117) + ns in timespec
-        // splitten (tv_sec@+0 = ns/1e9, tv_nsec@+8 = ns%1e9). clk_id (argBase) ignoriert.
-        else if id == 211 {
-            self.emitMovRaxImm(117);                 // sys_time_ns
-            self.emitSyscall();
-            self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);            // mov rax, rdx (ns)
-            self.emitMovRdiFromSlot(argBase + 1);                            // rdi = ts ptr
-            self.emit8(0xB9); self.emit32(1000000000);                       // mov ecx, 1e9
-            self.emit8(0x48); self.emit8(0x99);                             // cqo
-            self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF9);           // idiv rcx → rax=sec rdx=nsec
-            self.emit8(0x48); self.emit8(0x89); self.emit8(0x07);          // mov [rdi], rax (tv_sec)
-            self.emit8(0x48); self.emit8(0x89); self.emit8(0x57); self.emit8(0x08); // mov [rdi+8], rdx
-            self.emit8(0x31); self.emit8(0xC0);                            // xor eax, eax (return 0)
-            self.emitMovSlotFromRax(dest);
-        }
-        // lyxc→LyxOS Gruppe A: POSIX-File-Builtins → flache §10.4-Syscalls (KEIN dir_fd —
-        // der implementierte Kernel nutzt flache Signaturen; dir_fd ist nur der zukünftige
-        // ABI-Entwurf). argBase-Konvention via emitVfsSyscallAB.
-        else if id == 220 { self.emitVfsSyscallAB(2,  3, argBase, dest); }   // open(path,flags,mode)
-        else if id == 221 { self.emitVfsSyscallAB(3,  1, argBase, dest); }   // close(fd)
-        else if id == 222 { self.emitVfsSyscallAB(0,  3, argBase, dest); }   // read(fd,buf,n)
-        else if id == 223 { self.emitVfsSyscallAB(95, 3, argBase, dest); }   // write(fd,buf,n)
-        else if id == 224 { self.emitVfsSyscallAB(96, 2, argBase, dest); }   // rename(old,new)
-        else if id == 225 { self.emitVfsSyscallAB(97, 1, argBase, dest); }   // unlink(path)
-        else if id == 226 { self.emitVfsSyscallAB(139,1, argBase, dest); }   // mkdir(path) — mode verworfen
-        else if id == 227 { self.emitVfsSyscallAB(60, 1, argBase, dest); }   // exit(code)
-        // lyxc→LyxOS: 0x0200-Block (kernel-adoptiert via deferred VFS-Pfad, Commit 6e02a6f).
-        // dir_fd/flags-Adapter werden in lowerCall in den argBase-Block injiziert.
-        else if id == 228 { self.emitVfsSyscallAB(0x0204, 3, argBase, dest); }  // lseek(fd,off,whence)
-        else if id == 229 { self.emitVfsSyscallAB(0x0205, 4, argBase, dest); }  // stat/lstat(AT_CWD,path,out,flags)
-        else if id == 230 { self.emitVfsSyscallAB(0x0213, 3, argBase, dest); }  // symlink(target,AT_CWD,link)
-        else if id == 231 { self.emitVfsSyscallAB(0x020C, 3, argBase, dest); }  // pipe(rfd_out,wfd_out,flags)
-        else if id == 232 { self.emitVfsSyscallAB(0x020D, 2, argBase, dest); }  // truncate(fd,size)
-        // nanosleep(ts, rem): timespec→ns (sec*1e9 + nsec) dann sys_sleep_ns(0x000A). rem ignoriert.
-        else if id == 233 {
-            self.emitMovRdiFromSlot(argBase);                              // rdi = ts ptr
-            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x07);          // mov rax, [rdi] (tv_sec)
-            self.emit8(0xB9); self.emit32(1000000000);                     // mov ecx, 1e9
-            self.emit8(0x48); self.emit8(0x0F); self.emit8(0xAF); self.emit8(0xC1);  // imul rax, rcx
-            self.emit8(0x48); self.emit8(0x03); self.emit8(0x47); self.emit8(0x08);  // add rax, [rdi+8] (tv_nsec)
-            self.emit8(0x48); self.emit8(0x89); self.emit8(0xC7);          // mov rdi, rax (ns)
-            self.emitMovRaxImm(10);                                        // sys_sleep_ns = 0x000A
-            self.emitSyscall();
-            self.emit8(0x31); self.emit8(0xC0);                            // xor eax, eax (return 0)
-            self.emitMovSlotFromRax(dest);
-        }
-        // lyxc→LyxOS: EPrintInt → stderr (fd 2; Arg in Slot 0 wie PrintInt id 2).
-        else if id == 234 { self.emitPrintIntFd(2); }
-        // ArgvGet(argv,i): lea rax,[argv+i*8]; mov rax,[rax]. argBase-Konvention.
-        else if id == 235 {
-            self.emitMovRaxFromSlot(argBase); self.emitMovRcxFromSlot(argBase + 1);
-            self.emit8(0x48); self.emit8(0x8D); self.emit8(0x04); self.emit8(0xC8);  // lea rax, [rax+rcx*8]
-            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x00);                    // mov rax, [rax]
-            self.emitMovSlotFromRax(dest);
-        }
-        // rmdir → sys_unlink(AT_CWD, path, UNLINK_DIR=1) @ 0x0208 (deferred VFS-Block).
-        else if id == 236 { self.emitVfsSyscallAB(0x0208, 3, argBase, dest); }
     }
 
     // sys_mmap(hint=0, size, prot=PROT_RW=3, flags=MAP_PRIVATE|MAP_ANON=5) → rdx=addr
@@ -1192,22 +691,7 @@ pub type EmitLyxOS = class {
         var op:       int64 := peek64(iBase + 0);
         var dest:     int64 := peek64(iBase + IR_INSTR_OFF_DEST);
         var src1:     int64 := peek64(iBase + IR_INSTR_OFF_SRC1);
-        var src2:     int64 := peek64(iBase + IR_INSTR_OFF_SRC2);
         var imm:      int64 := peek64(iBase + IR_INSTR_OFF_IMMINT);
-        // LYXOS-WP-1: Arithmetik/Bitwise/Shift/Vergleiche (2-Operand) + NEG (unary).
-        var isBin: int64 := 0;
-        if op == 10 || op == 11 || op == 12 || op == 13 || op == 14 { isBin := 1; }
-        if op == 51 || op == 52 || op == 54 || op == 55 || op == 56 || op == 57 { isBin := 1; }
-        if op == 59 || op == 60 { isBin := 1; }
-        if op == 30 || op == 31 || op == 32 || op == 33 || op == 34 || op == 35 { isBin := 1; }
-        if isBin != 0 {
-            self.emitBinOp(op, dest, src1, src2);
-            return;
-        }
-        if op == 15 {                           // IRO_NEG
-            self.emitNeg(dest, src1);
-            return;
-        }
         if op == 0 {                            // IRO_CONST_INT
             self.emitMovRaxImm(imm);
             self.emitMovSlotFromRax(dest);
@@ -1219,13 +703,13 @@ pub type EmitLyxOS = class {
         } else if op == 62 {                    // IRO_STORE_LOCAL
             self.emitMovRaxFromSlot(src1);
             self.emitMovSlotFromRax(dest);
-        } else if op == 80 {                    // IRO_CALL_BUILTIN (src1=argBase für ids 200-207)
-            self.emitBuiltinCall(imm, src1, dest);
+        } else if op == 80 {                    // IRO_CALL_BUILTIN
+            self.emitBuiltinCall(imm, dest);
         } else if op == 164 {                   // IRO_LOAD_ERRVAL (LX-21: rax=r15-shadow)
             self.emit8(0x49); self.emit8(0x8B); self.emit8(0xC7);  // MOV rax, r15
             self.emitMovSlotFromRax(dest);
-        } else if op == 81 {                    // IRO_CALL (src1=funcId, src2=argBase, imm=argCount)
-            self.emitCall(src1, src2, imm, dest);
+        } else if op == 81 {                    // IRO_CALL
+            self.emitCall(src1, dest);
         } else if op == 94 {                    // IRO_FUNC_EXIT
             self.emitMovRaxFromSlot(src1);
             self.emitEpilogue();
@@ -1233,64 +717,8 @@ pub type EmitLyxOS = class {
             self.emitAlloc(src1, dest);
         } else if op == 113 {                   // IRO_FREE
             self.emitFree(src1);
-        } else if op == 90 {                    // IRO_JMP — LYXOS-WP-2
-            self.emitJmpToLabel(imm);           // Label-Id steht in IMMINT (irAddInstrDirect)
-        } else if op == 91 {                    // IRO_BR_TRUE
-            self.emitBrCond(src1, imm, 1);
-        } else if op == 92 {                    // IRO_BR_FALSE
-            self.emitBrCond(src1, imm, 0);
-        } else if op == 93 {                    // IRO_LABEL
-            self.emitLabelDef(imm);
-        } else if op == 64 {                    // IRO_LOAD_GLOBAL — LYXOS-WP-3 (dest=slot, src1=gIdx)
-            self.emitLoadGlobal(dest, src1);
-        } else if op == 65 {                    // IRO_STORE_GLOBAL (dest=gIdx, src1=value)
-            self.emitStoreGlobal(dest, src1);
-        } else if op == 66 {                    // IRO_LOAD_GLOBAL_ADDR (dest=slot, src1=gIdx)
-            self.emitLoadGlobalAddr(dest, src1);
-        } else if op == 108 || op == 110 {      // IRO_LOAD_FIELD(_HEAP) — LYXOS-WP-4 (dest,src1=base,src2=off)
-            self.emitLoadField(dest, src1, src2);
-        } else if op == 109 || op == 111 {      // IRO_STORE_FIELD(_HEAP) (dest=off,src1=value,src2=base)
-            self.emitStoreField(dest, src1, src2);
-        } else if op == 86 {                    // IRO_LOAD_IDX (dest,src1=base,src2=idx)
-            self.emitLoadIdx(dest, src1, src2);
-        } else if op == 87 {                    // IRO_STORE_IDX (dest=idx,src1=value,src2=base)
-            self.emitStoreIdx(dest, src1, src2);
-        // WP-STUB: bisher still verworfene reachable Ops jetzt korrekt emittiert.
-        } else if op == 50 {                    // IRO_NOT (logisch): dest = (src1==0)?1:0
-            self.emitMovRaxFromSlot(src1);
-            self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);   // test rax, rax
-            self.emit8(0x0F); self.emit8(0x94); self.emit8(0xC0);   // sete al
-            self.emit8(0x0F); self.emit8(0xB6); self.emit8(0xC0);   // movzx eax, al
-            self.emitMovSlotFromRax(dest);
-        } else if op == 58 {                    // IRO_BITNOT: dest = ~src1
-            self.emitMovRaxFromSlot(src1);
-            self.emit8(0x48); self.emit8(0xF7); self.emit8(0xD0);   // not rax
-            self.emitMovSlotFromRax(dest);
-        } else if op == 121 {                   // IRO_PANIC → exit(1)
-            self.emitPanicExit();
-        } else if op == 158 || op == 159 || op == 160 {  // ASSERT_NOT_NULL/NOT_ZERO/TRUE: src1==0 → panic
-            self.emitMovRaxFromSlot(src1);
-            self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);   // test rax, rax
-            self.emit8(0x75); self.emit8(12);                       // jnz +12 (über Panic-Exit)
-            self.emitPanicExit();
-        } else if op == 157 {                   // ASSERT_BOUNDS: src1=idx, src2=len; idx>=len(uns) → panic
-            self.emitMovRaxFromSlot(src1);
-            self.emitMovRcxFromSlot(src2);
-            self.emit8(0x48); self.emit8(0x39); self.emit8(0xC8);   // cmp rax, rcx
-            self.emit8(0x72); self.emit8(12);                       // jb +12 (idx<len ok)
-            self.emitPanicExit();
-        } else if op == 85 {                    // IRO_CALL_INDIRECT (src1=fnPtr-slot, imm=argCount)
-            self.emitCallIndirect(src1, imm, dest);
-        } else if op == 84 {                    // IRO_CALL_EXTERN: auf lyxos kein Linkage → dest=0
-            self.emit8(0x31); self.emit8(0xC0);                     // xor eax, eax
-            self.emitMovSlotFromRax(dest);
-        } else if op == 115 || op == 116 {      // IRO_POOL_ALLOC/FREE: Platzhalter (keine Operanden) → no-op
-            self.emit8(0x90);                                       // nop (bewusst kein Pool-Allokator)
-        } else {
-            // WP-STUB-00: unbehandelter IR-Opcode → INT3 (lauter Runtime-Trap) statt stilles
-            // Falschverhalten. Deckt künftige Lücken sofort auf statt sie zu verschlucken.
-            self.emit8(0xCC);                                       // int3
         }
+        // 90 (JMP), 93 (LABEL), all others: no code
     }
 
     // Emit all IR functions.
@@ -1301,12 +729,6 @@ pub type EmitLyxOS = class {
         var strBuf:   int64 := peek64(self.irMod + IR_MOD_OFF_STRBUF);
         var mainOff:  int64 := self.codeLen;   // default: first func
 
-        // LYXOS-call-fix: funcAddrs[funcId] = Code-Offset des Funktions-Starts.
-        self.funcCap   := funcLen;
-        self.funcAddrs := alloc(funcLen * 8);
-        var fz: int64 := 0;
-        while fz < funcLen { poke64(self.funcAddrs + fz * 8, 0 - 1); fz := fz + 1; }
-
         var fi: int64 := 0;
         while fi < funcLen {
             var fBase:       int64 := funcBuf + fi * IR_FUNC_SIZE;
@@ -1315,10 +737,6 @@ pub type EmitLyxOS = class {
             var fnInstrsOff: int64 := peek64(fBase + IR_FUNC_OFF_INSTRSOFF);
             var fnInstrCnt:  int64 := peek64(fBase + IR_FUNC_OFF_INSTRCOUNT);
             var fnLocals:    int64 := peek64(fBase + IR_FUNC_OFF_LOCALCOUNT);
-            var fnParams:    int64 := peek64(fBase + IR_FUNC_OFF_PARAMCOUNT);
-
-            // LYXOS-call-fix: Start-Offset dieser Funktion merken (für CALL-rel32-Patch).
-            poke64(self.funcAddrs + fi * 8, self.codeLen);
 
             // Record offset of main()
             if fnNameLen == 4 {
@@ -1332,13 +750,6 @@ pub type EmitLyxOS = class {
             // funcInstrStart = INSTRLEN-Zähler), kein Byte-Offset — nicht teilen!
             var firstIdx: int64 := fnInstrsOff;
             self.emitPrologue(fnLocals);
-            // LYXOS-call-fix: eingehende Arg-Register (System-V) in Param-Slots 0..N-1 spillen,
-            // damit LOAD_LOCAL der Parameter den Wert liest.
-            var psp: int64 := 0;
-            while psp < fnParams {
-                if psp < 6 { self.emitMovSlotFromReg(psp, psp); }
-                psp := psp + 1;
-            }
             var ii: int64 := 0;
             while ii < fnInstrCnt {
                 self.emitInstr(firstIdx + ii);
@@ -1349,20 +760,11 @@ pub type EmitLyxOS = class {
 
             fi := fi + 1;
         }
-        // LYXOS-WP-2: alle JMP/BR rel32 auf Label-Offsets patchen.
-        self.applyJmpPatches();
-        // LYXOS-call-fix: alle CALL rel32 auf Funktions-Offsets patchen.
-        self.applyCallPatches();
         return mainOff;
     }
 
     pub fn getCodeBuf(): int64 { return self.codeBuf; }
     pub fn getCodeLen(): int64 { return self.codeLen; }
-
-    // LYXOS-WP-5: Sektions-Byte-Größen (.text/.rodata/.data) für SECTION_MAP + Genesis-Counts.
-    pub fn getTextLen(): int64   { return self.rodataBase; }
-    pub fn getRodataLen(): int64 { return self.globalsBase - self.rodataBase; }
-    pub fn getDataLen(): int64   { return self.codeLen - self.globalsBase; }
 };
 
 // ---------------------------------------------------------------------------

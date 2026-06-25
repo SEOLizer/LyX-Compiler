@@ -390,11 +390,6 @@ pub type Sema = class {
   // BUG-3: current source file path for error messages (null = root module)
   curFile: pchar;
 
-  // FFI-SANDBOX: 1 = aktuell analysierte Unit ist vertrauenswürdig (std.*/src.*),
-  // 0 = User-Code. Unbekannte FFI (FFI_CLASS_UNKNOWN) ist nur in User-Code
-  // fail-closed (erfordert @capabilities) — std-Bindings (571 Externs) bleiben erlaubt.
-  ffiTrusted: int64;
-
   // WP-KI-02: pointer to ErrorCollector (0 = text mode, ≠0 = --error-json mode)
   errColl: int64;
 
@@ -1086,24 +1081,9 @@ pub type Sema = class {
       }
     }
 
-    // FFI-SANDBOX: std.*/src.*-Units sind vertrauenswürdig (Binding-Layer = TCB);
-    // ihre Externs dürfen FFI_CLASS_UNKNOWN sein. User-Code (und Drittmodule)
-    // bleiben fail-closed. modName-Namespace ist robust (User kann nicht als std.*
-    // importieren — Resolver schlägt std.* nur im stdPath nach).
-    var savedTrust: int64 := self.ffiTrusted;
-    var isStd: int64 := 0;
-    if modLen >= 4 {
-      if (StrCharAt(modName,0)&255)==115 && (StrCharAt(modName,1)&255)==116 &&
-         (StrCharAt(modName,2)&255)==100 && (StrCharAt(modName,3)&255)==46 { isStd := 1; }  // "std."
-      if (StrCharAt(modName,0)&255)==115 && (StrCharAt(modName,1)&255)==114 &&
-         (StrCharAt(modName,2)&255)==99  && (StrCharAt(modName,3)&255)==46 { isStd := 1; }  // "src."
-    }
-    self.ffiTrusted := isStd;
-
     // BUG-3: type-check function bodies in imported module
     self.Pass2(head);
 
-    self.ffiTrusted := savedTrust;
     self.src       := savedSrc;
     self.pNodes    := savedNodes;
     self.pToks     := savedToks;
@@ -2235,22 +2215,6 @@ pub type Sema = class {
       if capAttrNi < 0 || self.sn_kind(capAttrNi) != SNK_CAPABILITY_ATTR {
         self._errorNode("extern fn mit OS-Zugriff erfordert @capabilities([...])-Annotation"c, ni);
       }
-    } else if cls == FFI_CLASS_PROCESS {
-      // S3 (V1.1): Prozess-Steuerung (fork/kill/clone/setuid…) erfordert @capabilities
-      // wie OS — vorher fiel PROCESS durch und war ohne Cap erlaubt (Sandbox-Lücke).
-      if capAttrNi < 0 || self.sn_kind(capAttrNi) != SNK_CAPABILITY_ATTR {
-        self._errorNode("extern fn mit Prozess-Steuerung erfordert @capabilities([...])-Annotation"c, ni);
-      }
-    } else if cls == FFI_CLASS_UNKNOWN {
-      // FFI-SANDBOX (Fail-Closed): unbekanntes/nicht-klassifiziertes FFI-Symbol. In
-      // vertrauenswürdigen std.*/src.*-Units erlaubt (Binding-Layer = TCB); in User-Code
-      // muss es per @capabilities([...]) explizit deklariert werden — sonst war es ein
-      // Sandbox-Bypass (beliebiges Symbol als „SAFE" durchgewunken).
-      if self.ffiTrusted == 0 {
-        if capAttrNi < 0 || self.sn_kind(capAttrNi) != SNK_CAPABILITY_ATTR {
-          self._errorNode("extern fn: unbekanntes FFI-Symbol erfordert @capabilities([...]) (FFI-Sandbox Fail-Closed)"c, ni);
-        }
-      }
     } else if ffi_isStrncpyFamily(name, nameLen) {
       self._warnNode(ffi_strncpyWarnMsg(), ni);
     }
@@ -2267,23 +2231,13 @@ pub type Sema = class {
         // Hat link-String → volle FFI-Prüfung inkl. link-Target
         self._checkExternFn(ni);
       } else {
-        // Kein link-String.
+        // Kein link-String → nur Blacklist-Check (SEC-BUG-02)
         var bname:    pchar := self.sn_sVal(ni);
         var bnameLen: int64 := self.sn_sLen(ni);
-        if self.ffiTrusted != 0 {
-          // Vertrauenswürdige Unit (std.*/src.*): stdlib-interne Builtins (fork, mmap,
-          // getpid …) exempt; sonst nur Blacklist (Binding-Layer = TCB).
-          if !ffi_isStdlibBuiltin(bname, bnameLen) {
-            if ffi_isHardBlacklisted(bname, bnameLen) {
-              self._errorNode(ffi_noLinkBlacklistMsg(), ni);
-            }
+        if !ffi_isStdlibBuiltin(bname, bnameLen) {
+          if ffi_isHardBlacklisted(bname, bnameLen) {
+            self._errorNode(ffi_noLinkBlacklistMsg(), ni);
           }
-        } else {
-          // S3 (V1.1): User-Code → volle Klassifizierung auch ohne link-String. Die
-          // stdlib-Builtin-Exemption gilt NICHT in User-Code: ein User-`extern fn fork()`
-          // ist echte Prozess-Steuerung (PROCESS → @cap), `extern fn evil()` UNKNOWN →
-          // fail-closed. Schließt die Fail-Open-Lücke im no-link-Pfad.
-          self._checkExternFn(ni);
         }
       }
     }
@@ -3440,8 +3394,6 @@ pub type Sema = class {
     self._regBuiltin("rename");
     self._regBuiltin("mkdir");
     self._regBuiltin("rmdir");
-    self._regBuiltin("pipe");      // lyxos 0x020C (lowerCall/emit-Eintrag id 231 vorhanden)
-    self._regBuiltin("truncate");  // lyxos 0x020D (lowerCall/emit-Eintrag id 232 vorhanden)
     self._regBuiltin("ioctl");
     self._regBuiltin("getdents64");
     self._regBuiltin("stat");
@@ -3768,7 +3720,6 @@ pub type Sema = class {
     self.curClassNi  := -1;
     self.classCapNode := -1;
     self.curFile     := 0 as pchar;
-    self.ffiTrusted  := 0;   // Root/User-Modul ist NICHT vertrauenswürdig (fail-closed)
 
     // WP-10e: import dedup table
     self.importedCap   := 16;

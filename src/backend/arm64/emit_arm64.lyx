@@ -430,7 +430,7 @@ pub type EmitARM64 = class {
     if op == IRO_STORE_IDX   { self.emitStoreIdx(src1, src2, dest); }
 
     // --- Calls ---
-    if op == IRO_CALL         { self.emitCall(src1, src2, imm, dest); }
+    if op == IRO_CALL         { self.emitCall(src1, imm, dest); }
     if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, dest); }
     if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, imm, dest); }
     if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest); }
@@ -597,37 +597,42 @@ pub type EmitARM64 = class {
   }
 
   fn emitLoadGlobal(addr: int64, dest: int64) {
-    // IRO_LOAD_GLOBAL trägt einen globalIdx (NICHT eine VA). Beide Modi (shared-lib UND
-    // static) emittieren eine literal-pool-Sequenz mit Platzhalter-Slot und merken sich
-    // (slotOff, globalIdx) in globalRelocBuf. writeELFSharedLib bäckt + R_AARCH64_RELATIVE;
-    // writeELF (static) bäckt die absolute VA direkt (file-offset==vaddr, fixer Lade-Offset).
-    // ARM64-FIX: vorher MOVte der static-Pfad globalIdx als VA → LDR [0] → SIGSEGV.
-    var slotOff: int64 := self.codeLen + 8;
-    self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]
-    self.emit32(0x14000003);         // B +12
-    self.emit64(0);                   // placeholder slot (gebacken in writeELF*)
+    if self.isSharedLib != 0 {
+      // WP-AND-upstream-fix v5: in shared-lib mode IRO_LOAD_GLOBAL now
+      // carries a globalIdx, not an absolute VA. Emit the literal-pool
+      // sequence with a placeholder slot value and record the slot's
+      // code-buffer offset + globalIdx into globalRelocBuf — writeELFSharedLib
+      // patches the slot to (dataOff + globalIdx*8) at link time and adds
+      // the matching R_AARCH64_RELATIVE entry.
+      var slotOff: int64 := self.codeLen + 8;
+      self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]
+      self.emit32(0x14000003);         // B +12
+      self.emit64(0);                   // placeholder slot
+      self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+
+      if (self.globalRelocCount >= self.globalRelocCap) {
+        var newCap: int64 := self.globalRelocCap * 2;
+        var nb: int64 := alloc(newCap * 16);
+        var i: int64 := 0;
+        while i < self.globalRelocCount * 16 {
+          poke8(nb + i, peek8(self.globalRelocBuf + i));
+          i := i + 1;
+        }
+        self.globalRelocBuf := nb;
+        self.globalRelocCap := newCap;
+      }
+      var rec: int64 := self.globalRelocBuf + self.globalRelocCount * 16;
+      poke64(rec + 0, slotOff);
+      poke64(rec + 8, addr);   // addr field carries globalIdx in this path
+      self.globalRelocCount := self.globalRelocCount + 1;
+      return;
+    }
+    // addr is an absolute VA; load via MOVZ/MOVK sequence then LDR
+    self.emitMovImmReg(ARM64_X9, addr);
+    // LDR x0, [x9]
     self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
-    self._recordGlobalReloc(slotOff, addr);
-  }
-
-  // Merkt (slotCodeOff, globalIdx) für späteres Backen durch writeELF*/writeELFSharedLib.
-  fn _recordGlobalReloc(slotOff: int64, gIdx: int64) {
-    if (self.globalRelocCount >= self.globalRelocCap) {
-      var newCap: int64 := self.globalRelocCap * 2;
-      var nb: int64 := alloc(newCap * 16);
-      var i: int64 := 0;
-      while i < self.globalRelocCount * 16 {
-        poke8(nb + i, peek8(self.globalRelocBuf + i));
-        i := i + 1;
-      }
-      self.globalRelocBuf := nb;
-      self.globalRelocCap := newCap;
-    }
-    var rec: int64 := self.globalRelocBuf + self.globalRelocCount * 16;
-    poke64(rec + 0, slotOff);
-    poke64(rec + 8, gIdx);
-    self.globalRelocCount := self.globalRelocCount + 1;
   }
 
   fn emitStoreGlobal(src: int64, addr: int64) {
@@ -635,15 +640,10 @@ pub type EmitARM64 = class {
       self._emitStoreGlobalPIC(src, addr);
       return;
     }
-    // ARM64-FIX (static): literal-pool-Slot (gIdx-Platzhalter) → writeELF bäckt VA.
-    // Vorher MOVte addr(=gIdx) als VA → STR [0] → SIGSEGV.
-    var slotOff: int64 := self.codeLen + 8;
-    self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]  (Adresse aus Slot)
-    self.emit32(0x14000003);         // B +12  (über .quad)
-    self.emit64(0);                   // placeholder slot (gebacken in writeELF)
-    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));  // x0 = value
-    self.emit32(0xF9000120);          // STR x0, [x9]
-    self._recordGlobalReloc(slotOff, addr);
+    self.emitMovImmReg(ARM64_X9, addr);
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
+    // STR x0, [x9]
+    self.emit32(0xF9000120);  // STR x0, [x9]
   }
 
   // WP-AND-02 Phase C: PIC-friendly global load using an inline literal pool.
@@ -716,12 +716,11 @@ pub type EmitARM64 = class {
   // Function calls
   // -------------------------------------------------------------------------
 
-  fn emitCall(funcId: int64, argBase: int64, argCount: int64, dest: int64) {
-    // ARM64-FIX: Args liegen im reservierten Block argBase..argBase+N-1 (NICHT 0..N-1,
-    // die die Caller-Params aliasen würden). Lade argBase+ai → x[ai].
+  fn emitCall(funcId: int64, argCount: int64, dest: int64) {
+    // Set up args from slots (caller passes args in slots 0..argCount-1)
     var ai: int64 := 0;
     while ai < argCount && ai < 8 {
-      self.emitLdur(ai, ARM64_X29, self.slotOff(argBase + ai));
+      self.emitLdur(ai, ARM64_X29, self.slotOff(ai));
       ai := ai + 1;
     }
     // BL funcId  — record patch
@@ -896,49 +895,10 @@ pub type EmitARM64 = class {
       self.emitMovImmReg(ARM64_X8, SYS_WRITE);
       self.emit32(0xD4000001);  // SVC #0
     } else if id == 2 {
-      // PrintInt(n): int64 → Dezimal-ASCII nach stdout, OHNE Newline (PrintIntLn macht \n).
-      // ARM64-FIX: vorher write(x0=intwert, müll, müll) → EBADF, leer. Jetzt inline itoa+write
-      // (gespiegelt von der inspect-Routine; fd=1=stdout statt 2, Länge ohne '\n' = sp+31).
-      // Wert kommt in slot0 (PrintInt-Lowering: STORE_LOCAL 0). 32-Byte-Stack-Buffer:
-      // x9=write_ptr, x10=value, x11=neg, x12=10, x13=quot, x14=digit.
-      // Identische Instr-Anzahl/-Layout wie inspect-itoa (Branch-Offsets bleiben gültig);
-      // NUR instr28 (Ende sp+31 statt +32 → '\n' ausgeschlossen) + instr31 (fd=1) geändert.
-      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));  // x0 = value
-      self.emit32(0xD10083FF);  // instr0: SUB sp,sp,#32
-      self.emit32(0x91007BE9);  // instr1: ADD x9,sp,#30
-      self.emit32(0x5280014A);  // instr2: MOVZ w10,#10  ('\n' in Buffer, NICHT ausgegeben)
-      self.emit32(0x39007FEA);  // instr3: STRB w10,[sp,#31]
-      self.emit32(0xAA0003EA);  // instr4: MOV x10,x0
-      self.emit32(0xD280000B);  // instr5: MOVZ x11,#0
-      self.emit32(0xB400024A);  // instr6: CBZ x10,+18 (→ instr24 ZERO_CASE)
-      self.emit32(0xF100015F);  // instr7: CMP x10,#0
-      self.emit32(0x5400006A);  // instr8: B.GE +3 (→ instr11 POS_LOOP)
-      self.emit32(0xCB0A03EA);  // instr9: NEG x10,x10
-      self.emit32(0xD280002B);  // instr10: MOVZ x11,#1
-      self.emit32(0xD280014C);  // instr11: [POS_LOOP] MOVZ x12,#10
-      self.emit32(0x9ACC094D);  // instr12: UDIV x13,x10,x12
-      self.emit32(0x9B0CA9AE);  // instr13: MSUB x14,x13,x12,x10
-      self.emit32(0x1100C1CE);  // instr14: ADD w14,w14,#48
-      self.emit32(0x3900012E);  // instr15: STRB w14,[x9]
-      self.emit32(0xD1000529);  // instr16: SUB x9,x9,#1
-      self.emit32(0xAA0D03EA);  // instr17: MOV x10,x13
-      self.emit32(0xB5FFFF2A);  // instr18: CBNZ x10,-7 (→ instr11)
-      self.emit32(0xB400008B);  // instr19: CBZ x11,+4 (→ instr23)
-      self.emit32(0x528005AE);  // instr20: MOVZ w14,#45 ('-')
-      self.emit32(0x3900012E);  // instr21: STRB w14,[x9]
-      self.emit32(0xD1000529);  // instr22: SUB x9,x9,#1
-      self.emit32(0x14000004);  // instr23: B +4 (→ instr27 EMIT_OUT)
-      self.emit32(0x5280060E);  // instr24: [ZERO_CASE] MOVZ w14,#48 ('0')
-      self.emit32(0x3900012E);  // instr25: STRB w14,[x9]
-      self.emit32(0xD1000529);  // instr26: SUB x9,x9,#1
-      self.emit32(0x91000529);  // instr27: [EMIT_OUT] ADD x9,x9,#1
-      self.emit32(0x91007FEA);  // instr28: ADD x10,sp,#31  (Ende OHNE '\n')
-      self.emit32(0xCB090142);  // instr29: SUB x2,x10,x9  (len)
-      self.emit32(0xAA0903E1);  // instr30: MOV x1,x9
-      self.emit32(0xD2800020);  // instr31: MOVZ x0,#1  (fd=stdout)
-      self.emit32(0xD2800808);  // instr32: MOVZ x8,#64 (SYS_WRITE)
-      self.emit32(0xD4000001);  // instr33: SVC #0
-      self.emit32(0x910083FF);  // instr34: ADD sp,sp,#32
+      // PrintInt: same but with string conversion via builtin thunk
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+      self.emitMovImmReg(ARM64_X8, SYS_WRITE);
+      self.emit32(0xD4000001);
     } else if id == 3 {
       // Exit
       self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
