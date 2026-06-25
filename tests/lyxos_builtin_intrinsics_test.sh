@@ -59,6 +59,13 @@ run "not_nonzero" 'fn main(): int64 { var x: int64 := 5; return !x; }' 0
 compile_ok "ctor_args" 'type C = class { a: int64; fn Create(p: int64) { self.a := p; } fn A(): int64 { return self.a; } };
 fn main(): int64 { var c: C := new C(11); return c.A(); }' 
 
+# --- WP-XMOD-OOP: virtuelle Dispatch + Vererbung (Registry type-id); Runtime=Kernel (new→mmap) ---
+compile_ok "virtual_override" 'type A = class { val: int64; virtual fn S(): int64 { return 0; } };
+type D = class extends A { override fn S(): int64 { return 42; } };
+fn main(): int64 { var a: A := new D(); return a.S(); }'
+compile_ok "field_heavy" 'type H = class { a:int64; b:int64; c:int64; d:int64; e:int64; f:int64; fn G(): int64 { return self.f; } };
+fn main(): int64 { var h: H := new H(); return h.G(); }' 
+
 # --- peek16 Word-Read (Laufzeit, rodata) ---
 run "peek16_low"  'fn main(): int64 { return peek16("AB") & 0xFF; }' 65
 run "peek16_high" 'fn main(): int64 { return (peek16("AB") >> 8) & 0xFF; }' 66
