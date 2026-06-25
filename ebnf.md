@@ -199,7 +199,10 @@ IntegrityMode       = "mode" ":"
 IntegrityInterval   = "interval" ":" IntLiteral ;
 
 VarAttr             = "@redundant"
-                    | "@volatile" ;
+                    | "@volatile"
+                    | "@align" "(" IntLiteral ")" ;
+(* "@align(N) var ..." — Allokations-Alignment (N Bytes) für array/heap-backed Locals.
+   LyxOS: über-alloziert + rundet Pointer auf N auf (emitAlloc). Skalare Stack-Locals: n/a. *)
 
 EndianAttr          = "@big_endian"
                     | "@little_endian" ;
