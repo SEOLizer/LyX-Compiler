@@ -1,5 +1,33 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.3A (Juni 2026)
+
+Minor-Release: LyxOS-Codegen-Kern abgeschlossen — vollständige OOP, alle reachable IR-Opcodes,
+f64-Pipeline. Basis V1.0.2I.
+
+### LyxOS — cross-module OOP (#866)
+- Globales Type-Registry: jeder `NK_TYPE_DECL` aller Module bekommt eine stabile globale type-id
+  (modul-unabhängig). Behebt importierte Klassen: `new` mit korrekter Größe/VMT/type-id,
+  Feld-Zugriff, virtuelle Dispatch über Modulgrenzen. Damit ist die OOP-Kette komplett
+  (geerbte Felder #856, virtuelle Dispatch #857, importierte Methoden #861, Konstruktor-Args #864,
+  cross-module #866).
+
+### LyxOS — Opcode-Reste (#867)
+- Div/Mod durch 0 → kontrollierter Panic (Exit 1) statt SIGFPE (ASSERT_NOT_ZERO).
+- FSQRT (sqrtsd), Diagnostik-Ops (INSPECT/PROFILE) → expliziter NOP, SIMD → expliziter Abbruch,
+  LOAD_LOCAL_ADDR-Infra (&local; Parser-Support ausstehend). Kein reachable Opcode mehr im
+  INT3-Catch-all.
+
+### LyxOS — f64-Pipeline (#868)
+- f64-Literale (Quelltext → IEEE-754 via `_parseFloatBits`), Arithmetik (FADD/FSUB/FMUL/FDIV →
+  addsd/subsd/mulsd/divsd), Casts f64↔int (ITOF/FTOI → cvtsi2sd/cvttsd2si), sqrt end-to-end.
+  Runtime-verifiziert (lbf_run): add/mul/div/sub/sqrt/casts/Vergleich. f64-Bits liegen als int64
+  im Slot, xmm-Ops laden via movsd.
+
+Verifiziert: intrinsics 53/53, call_args 8/8, wp4 4/4; Singularität S3==S4; voll-lyxc→LBF baut
+(3.81 MB). ELF-Pfad unberührt. Offene Folge-Items: Parser unary-`&`, ucomisd-f64-Vergleich
+(negative Ordering), xmm-Vektor-SIMD; Kernel-Runtime-Bestätigung (uidemo/VUI, lyxc-als-LBF).
+
 ## Version 1.0.2I (Juni 2026)
 
 Patch-Release auf Basis von V1.0.2H. LyxOS-Backend: unbehandelte IR-Opcodes, Konstruktor-Args.
