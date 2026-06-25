@@ -101,6 +101,8 @@ run "atomic_cas_ok"     'fn main(): int64 { var x: int64 := 10; var p: int64 := 
 run "atomic_cas_fail"   'fn main(): int64 { var x: int64 := 10; var p: int64 := @x; atomic_cas(p, 7, 99); return x; }' 10
 run "wsp_pause_fences"  'fn main(): int64 { cpu_pause(); fence_sfence(); fence_lfence(); fence_mfence(); return 5; }' 5
 compile_ok "wsp_cpuctrl" 'fn main(): int64 { cpu_cli(); cpu_sti(); cpu_hlt(); var v: int64 := cpu_rdmsr(0); cpu_wrmsr(0, 1); return 0; }' 
+# --- WP-VOLATILE: @volatile-Local — Read wird nicht von DCE eliminiert (MMIO). Runtime-neutral. ---
+compile_ok "volatile_decl" '@volatile var g: int64 := 0; fn main(): int64 { @volatile var x: int64 := 5; x; return x; }' 
 
 # --- peek16 Word-Read (Laufzeit, rodata) ---
 run "peek16_low"  'fn main(): int64 { return peek16("AB") & 0xFF; }' 65
