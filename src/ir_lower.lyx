@@ -902,17 +902,70 @@ pub type IRLower = class {
     else if op == 85  { iro := IRO_AND; }   // TK_AND (&&; treat as bitwise for now)
     else if op == 86  { iro := IRO_OR;  }   // TK_OR (||)
     if iro >= 0 {
+      // WP-OPCODE-REST: Div/Mod durch 0 → kontrollierter ASSERT_NOT_ZERO (Panic) statt SIGFPE.
+      if iro == IRO_DIV || iro == IRO_MOD {
+        self.irAddInstrDirect(IRO_ASSERT_NOT_ZERO, -1, t2, -1, 0);
+      }
       self.irAddInstrDirect(iro, dest, t1, t2, 0);
     }
     return dest;
   }
-  
+
+  // WP-OPCODE-REST: lokalen Slot eines Namens auflösen (Locals shadowing-latest, dann Params).
+  // -1 wenn kein lokaler/Param. Für &local (Adresse statt Wert).
+  fn _resolveLocalSlotForAddr(idName: pchar, idLen: int64): int64 {
+    var idPtrL: int64 := (idName) as int64;
+    var lnI: int64 := self.localNameCnt - 1;
+    while lnI >= 0 {
+      var lnRec: int64 := self.localNameBuf + lnI * 24;
+      var lnLen: int64 := peek64(lnRec + LOCAL_REC_OFF_NAMELEN);
+      if lnLen == idLen {
+        var lnPtr: int64 := (self.src as int64) + peek64(lnRec + 0);
+        var m: int64 := 1; var j: int64 := 0;
+        while j < idLen { if m != 0 { if peek8(lnPtr + j) != peek8(idPtrL + j) { m := 0; } } j := j + 1; }
+        if m != 0 { return peek64(lnRec + LOCAL_REC_OFF_SLOT); }
+      }
+      lnI := lnI - 1;
+    }
+    if self.curFunc >= 0 {
+      var pnode: int64 := self.nodeC0(self.curFunc);
+      var pidx: int64 := 0;
+      while pnode >= 0 {
+        if self.nodeKind(pnode) == NK_PARAM {
+          var pnLen: int64 := self.nodeSLen(pnode);
+          if pnLen == idLen {
+            var pnPtr: int64 := (self.nodeSVal(pnode)) as int64;
+            var m: int64 := 1; var j: int64 := 0;
+            while j < idLen { if m != 0 { if peek8(pnPtr + j) != peek8(idPtrL + j) { m := 0; } } j := j + 1; }
+            if m != 0 { return pidx + self.methodParamBase; }
+          }
+          pidx := pidx + 1;
+        }
+        pnode := self.nodeNext(pnode);
+      }
+    }
+    return 0 - 1;
+  }
+
   // ------------------------------------------------------------------
   // Unary Operation Lowering
   // ------------------------------------------------------------------
-  
+
   fn lowerUnOp(expr: int64): int64 {
     var op: int64 := self.nodeIVal(expr);
+    // WP-OPCODE-REST: &local (TK_BITAND, op==90, unär) → ADRESSE des Slots via IRO_LOAD_LOCAL_ADDR
+    // statt Wert (alter Kompromiss). Nur für lokale/Param-Identifier; sonst Fallback = Wert.
+    if op == 90 {
+      var aOperand: int64 := self.nodeC0(expr);
+      if self.nodeKind(aOperand) == NK_IDENT {
+        var aSlot: int64 := self._resolveLocalSlotForAddr(self.nodeSVal(aOperand), self.nodeSLen(aOperand));
+        if aSlot >= 0 {
+          var aDest: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_LOAD_LOCAL_ADDR, aDest, aSlot, -1, 0);
+          return aDest;
+        }
+      }
+    }
     var t1: int64 := self.lowerExpr(self.nodeC0(expr));
     var dest: int64 := self.allocTemp();
     // WP-AND-upstream-fix v6: emit actual ops. Map the parser's TK_*
