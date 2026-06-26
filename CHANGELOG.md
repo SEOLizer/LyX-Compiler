@@ -1,5 +1,32 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.4A (Juni 2026)
+
+Funktionszeiger + Method-Pointer (Vega-VCL-Event-System) sprachseitig komplett, ELF + LyxOS.
+Basis V1.0.3E.
+
+### Funktionszeiger-Felder A1 (#885)
+- **fn-Typ-Alias als Klassenfeld**: `type TNE = fn(TControl): int64; type TB = class { on_click: TNE; }`.
+  `b.on_click := h` (fn-Name → Adresse), Null-Check, `b.on_click(arg)` (indirekter Call). Zwei
+  Wurzeln gefixt: fn-Name-als-Wert lieferte 0 (cg_isDeclaredFunc + lea-Adresse / IRO_FUNC_ADDR);
+  `obj.field(args)` wurde als Methode gemangled (Feld-Load + plain indirekter Call).
+
+### Method-Pointer B2 (#886)
+- **`method`-Typ = fat pointer {code, data}** mit self-Bindung. `button.on_click := form.Handle`
+  bindet `form` als self; `button.on_click(arg)` ruft `form.Handle` mit self=form. Design:
+  heap-fat-ptr (Feld = 8B-Pointer → heap{code,data}; kein Klassen-Layout-Umbau). Parser-Befund:
+  Typ-Alias-Target wurde verworfen → jetzt gespeichert (TYPE_DECL c0 + iv-Bit1) + method-Alias-Registry.
+
+### fn-ptr/method-ptr Polish (#887)
+- **lokaler plain-fn-ptr-Call** `var f := fn; f(args)` crashte (ELF WP-02-Closure-Fehlinterpretation;
+  LyxOS „unbekannte Funktion") → thin-call / _findLocalSlot+CALL_INDIRECT.
+- **benannte Params** in fn/method-Typ (`fn(s: T)`, `method(s: T)`) parsen jetzt.
+- **cross-module method-Felder** (importierte Klasse) auf LyxOS (_treg-Context-Swap).
+
+### sema (#884)
+- **Arity-Check**: Argument-Anzahl bei Funktionsaufrufen wird geprüft (vorher KEINE Prüfung →
+  `add(5)` für `fn add(a,b)` kompilierte → Garbage/Crash). Konservativ (same-module, nicht extern/variadic).
+
 ## Version 1.0.3E (Juni 2026)
 
 Windows-Backend-Korrektheit. Basis V1.0.3D.
