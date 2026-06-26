@@ -94,6 +94,7 @@ pub con NK_NEW:         int64 := 52;
 pub con NK_CAST:        int64 := 53;
 pub con NK_CLOSURE:     int64 := 54;
 pub con NK_FN_PTR:      int64 := 55;
+pub con NK_METHOD_PTR:  int64 := 129;  // B2: method(...): R fat-pointer-Typ
 
 // Types (60-62)
 pub con NK_TYPE_NAME:   int64 := 60;
@@ -1194,6 +1195,25 @@ pub type IRLower = class {
       var fpName: pchar := self.nodeSVal(expr);
       var fpNameL: int64 := self.nodeSLen(expr);
       var fpOff: int64 := self._instanceFieldOffset(mcBaseNode, fpName, fpNameL);
+      if fpOff >= 0 && self._fieldIsMethodType(mcBaseNode, fpName, fpNameL) != 0 {
+        // B2 fat-call: p=[base+off]; code=[p+0]; self=data=[p+8]→slot0; Args→slot1..; CALL_INDIRECT.
+        var mfBase: int64 := self.lowerExpr(mcBaseNode);
+        var mfP: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_LOAD_FIELD, mfP, mfBase, fpOff, 0);
+        var mfCode: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_LOAD_FIELD, mfCode, mfP, 0, 0);
+        var mfData: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_LOAD_FIELD, mfData, mfP, 8, 0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, mfData, -1, 0);   // self → slot 0
+        var mfArg: int64 := self.nodeC1(expr); var mfI: int64 := 1;
+        while mfArg >= 0 {
+          var mfAT: int64 := self.lowerExpr(mfArg);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, mfI, mfAT, -1, 0);
+          mfI := mfI + 1; mfArg := self.nodeNext(mfArg);
+        }
+        self.irAddInstrDirect(IRO_CALL_INDIRECT, mcDest, mfCode, -1, mfI);
+        return mcDest;
+      }
       if fpOff >= 0 {
         var fpBase: int64 := self.lowerExpr(mcBaseNode);
         var fpFn: int64 := self.allocTemp();
@@ -3188,6 +3208,68 @@ pub type IRLower = class {
     return offg;
   }
 
+  // B2: ist `name` ein method-Typ-Alias (`type X = method(...)`, iv-Bit1 + c0=NK_METHOD_PTR)?
+  fn _isMethodAlias(np: pchar, nl: int64): int64 {
+    var t: int64 := self._findTypeDecl(np, nl);
+    if t < 0 { return 0; }
+    if (self.nodeIVal(t) & 2) == 0 { return 0; }
+    var body: int64 := self.nodeC0(t);
+    if body < 0 { return 0; }
+    if self.nodeKind(body) == NK_METHOD_PTR { return 1; }
+    return 0;
+  }
+  // B2: Typ-Node eines Feldes (fp,fl) in typeDecl (inkl. geerbter Basis-Felder). -1 wenn keins.
+  fn _fieldTypeNodeIn(typeDecl: int64, fp: pchar, fl: int64): int64 {
+    var pn: int64 := self.nodeC2(typeDecl);
+    if pn >= 0 {
+      var base: int64 := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn));
+      if base >= 0 {
+        var r: int64 := self._fieldTypeNodeIn(base, fp, fl);
+        if r >= 0 { return r; }
+      }
+    }
+    var fd: int64 := self.nodeC0(typeDecl);
+    while fd >= 0 {
+      if self.seq(self.nodeSVal(fd), self.nodeSLen(fd), fp, fl) { return self.nodeC0(fd); }
+      fd := self.nodeNext(fd);
+    }
+    return 0 - 1;
+  }
+  // B2: ist Feld (baseNode).fp method-typed (same-module via _baseClassDecl)?
+  fn _fieldIsMethodType(baseNode: int64, fp: pchar, fl: int64): int64 {
+    var decl: int64 := self._baseClassDecl(baseNode);
+    if decl < 0 { return 0; }
+    var ftn: int64 := self._fieldTypeNodeIn(decl, fp, fl);
+    if ftn < 0 { return 0; }
+    return self._isMethodAlias(self.nodeSVal(ftn), self.nodeSLen(ftn));
+  }
+
+  // B2: method-Referenz `obj.Method` → heap-fat-pointer {code, data} (16B); liefert Temp mit p.
+  fn _lowerMethodRef(rhs: int64): int64 {
+    var rObj:  int64 := self.nodeC0(rhs);
+    var mName: pchar := self.nodeSVal(rhs);
+    var mLen:  int64 := self.nodeSLen(rhs);
+    var szT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, szT, -1, -1, 16);
+    var p: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, p, szT, -1, 0);
+    var tn: int64 := self._baseTypeNode(rObj);
+    if tn >= 0 {
+      var cnP: pchar := self.nodeSVal(tn);
+      var cnL: int64 := self.nodeSLen(tn);
+      var mang: int64 := self._methodMangle(cnP, cnL, mName, mLen);
+      var fid:  int64 := self._findFuncByName(mang as pchar, cnL + 1 + mLen);
+      if fid >= 0 {
+        var codeT: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_FUNC_ADDR, codeT, fid, -1, 0);
+        self.irAddInstrDirect(IRO_STORE_FIELD, 0, codeT, p, 0);   // [p+0]=code
+      }
+    }
+    var dataT: int64 := self.lowerExpr(rObj);
+    self.irAddInstrDirect(IRO_STORE_FIELD, 8, dataT, p, 0);       // [p+8]=data (self)
+    return p;
+  }
+
   // ARM64-OOP: funcBuffer-Index für einen (mangled) Funktionsnamen (-1 falls keiner).
   fn _findFuncByName(np: pchar, nl: int64): int64 {
     var fb: int64 := peek64(self.ir + IR_MOD_OFF_FUNCBUF);
@@ -4218,7 +4300,12 @@ pub type IRLower = class {
       else if (self.nodeKind(target) == NK_FIELD) {
         var afBase: int64 := self.lowerExpr(self.nodeC0(target));
         var afOff:  int64 := self._instanceFieldOffset(self.nodeC0(target), self.nodeSVal(target), self.nodeSLen(target));
-        if afOff >= 0 {
+        // B2: method-typed Feld + RHS = method-Referenz (obj2.Method) → fat pointer {code,data}.
+        if (afOff >= 0 && self.nodeKind(val) == NK_FIELD
+            && self._fieldIsMethodType(self.nodeC0(target), self.nodeSVal(target), self.nodeSLen(target)) != 0) {
+          var afFat: int64 := self._lowerMethodRef(val);
+          self.irAddInstrDirect(IRO_STORE_FIELD, afOff, afFat, afBase, 0);
+        } else if (afOff >= 0) {
           self.irAddInstrDirect(IRO_STORE_FIELD, afOff, valTemp, afBase, 0);
         }
       }
