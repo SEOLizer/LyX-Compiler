@@ -213,6 +213,7 @@ con CG_PATCH_OFF_KIND:    int64 := 24;
 
 con CGN_TYPE_DECL:  int64 := 10;
 con CGN_METHOD_PTR: int64 := 129;  // B2: method(...): R fat-pointer-Typ-Node
+con CGN_FN_PTR_NODE: int64 := 55;  // fn(...): R thin-fn-pointer-Typ-Node
 con CGN_FIELD_DECL: int64 := 7;
 
 con CG_CLASS_SZ:           int64 := 64;
@@ -464,6 +465,10 @@ pub type Codegen = class {
   methodAliasList:  int64;
   methodAliasCount: int64;
   methodAliasCap:   int64;
+  // fn-Typ-Alias-Namen (thin-fn-pointer; lokaler plain-fn-ptr-Call)
+  fnAliasList:  int64;
+  fnAliasCount: int64;
+  fnAliasCap:   int64;
 
   // WP-BC-24: deferred generic monomorphization list
   // Entry: {mangledNamePtr:8, mangledNameLen:8, genericFuncNode:8} = 24 bytes
@@ -2314,10 +2319,34 @@ pub type Codegen = class {
         var body: int64 := self.cg_nc0(cur);
         if (body >= 0 && self.cg_nkind(body) == CGN_METHOD_PTR) {
           self.cg_registerMethodAlias(self.cg_nsval(cur), self.cg_nslen(cur));
+        } else if (body >= 0 && self.cg_nkind(body) == CGN_FN_PTR_NODE) {
+          self.cg_registerFnAlias(self.cg_nsval(cur), self.cg_nslen(cur));
         }
       }
       cur := self.cg_nnext(cur);
     }
+  }
+  fn cg_registerFnAlias(name: pchar, nameLen: int64) {
+    if (self.fnAliasCount >= self.fnAliasCap) {
+      var nc: int64 := self.fnAliasCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.fnAliasList, self.fnAliasCount * 16);
+      self.fnAliasList := nb;
+      self.fnAliasCap  := nc;
+    }
+    var base: int64 := self.fnAliasList + self.fnAliasCount * 16;
+    poke64(base,     name as int64);
+    poke64(base + 8, nameLen);
+    self.fnAliasCount := self.fnAliasCount + 1;
+  }
+  fn cg_isFnPtrAlias(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.fnAliasCount) {
+      var base: int64 := self.fnAliasList + i * 16;
+      if (self.cg_seq(peek64(base) as pchar, peek64(base + 8), name, nameLen) != 0) { return 1; }
+      i := i + 1;
+    }
+    return 0;
   }
 
   // A1: ist `name` eine deklarierte Top-Level-Funktion? (Fn-Name als Wert → Adresse statt 0)
@@ -4671,6 +4700,31 @@ pub type Codegen = class {
     if (isMethod == 0) {
       var clOff: int64 := self.cg_findLocal(fname, fnlen);
       if (clOff != 0) {
+        // #1: lokaler plain fn-ptr (fn-Typ-Alias)? → thin-call: Adresse laden, Args in normalen
+        // Registern (arg0→rdi), KEIN env-Shift. Vorher: Closure-Pfad las {fnPtr,env} → Garbage/Crash.
+        var clIdx: int64 := self.cg_findLocalIdx(fname, fnlen);
+        var isThinFn: int64 := 0;
+        if (clIdx >= 0) {
+          var ltb: int64 := self.localTypes + clIdx * CG_LOCTYPE_SZ;
+          var ltp: pchar := peek64(ltb) as pchar;
+          var ltl: int64 := peek64(ltb + CG_LOCTYPE_OFF_LEN);
+          if (ltp != 0 as pchar && ltl > 0 && self.cg_isFnPtrAlias(ltp, ltl) != 0) { isThinFn := 1; }
+        }
+        if (isThinFn != 0) {
+          var tfCur: int64 := argNode;
+          var tfArgc: int64 := 0;
+          while (tfCur >= 0) { self.cg_genExpr(tfCur); self.cg_pushRax(); tfArgc := tfArgc + 1; tfCur := self.cg_nnext(tfCur); }
+          self.cg_loadRax(clOff);                                 // rax = fn-Adresse (plain)
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);   // mov rbx, rax
+          if (tfArgc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9
+          if (tfArgc >= 5) { self.cg_e8(0x41); self.cg_e8(0x58); }  // pop r8
+          if (tfArgc >= 4) { self.cg_popRcx(); }
+          if (tfArgc >= 3) { self.cg_popRdx(); }
+          if (tfArgc >= 2) { self.cg_popRsi(); }
+          if (tfArgc >= 1) { self.cg_popRdi(); }
+          self.cg_e8(0xFF); self.cg_e8(0xD3);                     // call rbx
+          return;
+        }
         // Evaluate explicit args and push them
         var clCur: int64 := argNode;
         var clArgc: int64 := 0;
@@ -10342,6 +10396,9 @@ pub type Codegen = class {
     self.methodAliasCap   := 64;
     self.methodAliasList  := alloc(self.methodAliasCap * 16);
     self.methodAliasCount := 0;
+    self.fnAliasCap   := 64;
+    self.fnAliasList  := alloc(self.fnAliasCap * 16);
+    self.fnAliasCount := 0;
     self.cg_registerF64Func("fAdd"c,  4);
     self.cg_registerF64Func("fSub"c,  4);
     self.cg_registerF64Func("fMul"c,  4);
