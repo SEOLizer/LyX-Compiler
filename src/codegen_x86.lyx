@@ -11331,6 +11331,88 @@ pub type Codegen = class {
     self.cg_runAudit();            // WP-T13: Security Audit auf stderr
   }
 
+  // LyxOS-Reloc Step 1: statischer ET_EXEC wie WriteELF, ABER phdr-Tabelle am Datei-Ende
+  // (e_phoff→Ende, e_phnum=3) + 3. phdr PT_LYXRELOC + Reloc-Table. Code bleibt @CG_CODE_OFF
+  // (176) → Producer-RVAs + win64-Vertrag unberührt. WriteELF ist contiguous → rva == file-
+  // /vaddr-Offset, keine Übersetzung. Reloc-Table-Format: [count:u64][rva:u64 …] (rva relativ
+  // zu CG_ELF_BASE). Kernel: *(load_base + rva) += (load_va − CG_ELF_BASE). Linux ignoriert
+  // PT_LYXRELOC (PT_LOOS-Bereich) → läuft unverändert (delta=0 bei Basis CG_ELF_BASE).
+  fn cg_writeELFReloc(path: pchar) {
+    var totalCode: int64 := self.codeLen;
+    var totalData: int64 := self.dataLen;
+    var relCount:  int64 := self.baseRelocCount;
+    var relBuf:    int64 := self.baseRelocBuf;
+
+    var rwOff:    int64 := CG_CODE_OFF + totalCode;          // data-Start (== vaddr-Offset)
+    var relocOff: int64 := rwOff + totalData;               // Reloc-Table nach Data
+    var relocSize: int64 := 8 + relCount * 8;               // [count][rva…]
+    var phdrOff:  int64 := ((relocOff + relocSize + 7) / 8) * 8;  // 8-aligned phdr-Tabelle
+    var fileSize: int64 := phdrOff + 3 * 56;
+
+    var buf: int64 := alloc(fileSize);
+    var z: int64 := 0;
+    while (z < fileSize) { poke8(buf + z, 0); z := z + 1; }
+
+    // ELF-Header
+    poke8(buf, 0x7F); poke8(buf + 1, 69); poke8(buf + 2, 76); poke8(buf + 3, 70);
+    poke8(buf + 4, 2); poke8(buf + 5, 1); poke8(buf + 6, 1); poke8(buf + 7, 0);
+    poke16(buf + 16, 2);     // ET_EXEC
+    poke16(buf + 18, 62);    // EM_X86_64
+    poke32(buf + 20, 1);     // e_version
+    poke64(buf + 24, CG_ELF_BASE + CG_CODE_OFF);  // e_entry (0x4000b0)
+    poke64(buf + 32, phdrOff);                     // e_phoff → Datei-Ende
+    poke64(buf + ELF64_EHDR_OFF_SHOFF, 0);
+    poke32(buf + 48, 0);
+    poke16(buf + 52, 64);    // e_ehsize
+    poke16(buf + 54, 56);    // e_phentsize
+    poke16(buf + 56, 3);     // e_phnum = 3 (LOAD-RX, LOAD-RW, PT_LYXRELOC)
+    poke16(buf + 58, 0); poke16(buf + 60, 0); poke16(buf + 62, 0);
+
+    // Code @ CG_CODE_OFF, Data direkt danach (contiguous)
+    memcpy(buf + CG_CODE_OFF, self.code, totalCode);
+    memcpy(buf + rwOff, self.data, totalData);
+
+    // Reloc-Table @ relocOff
+    poke64(buf + relocOff, relCount);
+    var ri: int64 := 0;
+    while (ri < relCount) {
+      poke64(buf + relocOff + 8 + ri * 8, peek64(relBuf + ri * 8));
+      ri := ri + 1;
+    }
+
+    // phdr-Tabelle @ phdrOff
+    var rxSize: int64 := CG_CODE_OFF + totalCode;
+    var ph: int64 := buf + phdrOff;
+    // PT_LOAD #1 RX: ELF-Header + Code
+    poke32(ph, 1); poke32(ph + 4, 5);
+    poke64(ph + ELF64_PHDR_OFF_OFFSET, 0);
+    poke64(ph + 16, CG_ELF_BASE); poke64(ph + 24, CG_ELF_BASE);
+    poke64(ph + ELF64_PHDR_OFF_FILESZ, rxSize);
+    poke64(ph + ELF64_PHDR_OFF_MEMSZ,  rxSize);
+    poke64(ph + ELF64_PHDR_OFF_ALIGN,  4096);
+    // PT_LOAD #2 RW: Data + Reloc-Table (Kernel lädt Reloc-Table mit)
+    var ph2: int64 := buf + phdrOff + 56;
+    var rwSpan: int64 := totalData + relocSize;
+    poke32(ph2, 1); poke32(ph2 + 4, 6);
+    poke64(ph2 + ELF64_PHDR_OFF_OFFSET, rwOff);
+    poke64(ph2 + 16, CG_ELF_BASE + rwOff); poke64(ph2 + 24, CG_ELF_BASE + rwOff);
+    poke64(ph2 + ELF64_PHDR_OFF_FILESZ, rwSpan);
+    poke64(ph2 + ELF64_PHDR_OFF_MEMSZ,  rwSpan);
+    poke64(ph2 + ELF64_PHDR_OFF_ALIGN,  4096);
+    // PT_LYXRELOC: Reloc-Table-Deskriptor (p_type 0x6FFFAA00)
+    var ph3: int64 := buf + phdrOff + 112;
+    poke32(ph3, 0x6FFFAA00); poke32(ph3 + 4, 4);   // p_flags = PF_R
+    poke64(ph3 + ELF64_PHDR_OFF_OFFSET, relocOff);
+    poke64(ph3 + 16, CG_ELF_BASE + relocOff); poke64(ph3 + 24, CG_ELF_BASE + relocOff);
+    poke64(ph3 + ELF64_PHDR_OFF_FILESZ, relocSize);
+    poke64(ph3 + ELF64_PHDR_OFF_MEMSZ,  relocSize);
+    poke64(ph3 + ELF64_PHDR_OFF_ALIGN,  8);
+
+    var fd: int64 := open(path, 577, 493);
+    if (fd >= 0) { write(fd, buf as pchar, fileSize); close(fd); }
+    else { PrintStr("codegen: failed to open output file: "); PrintStr(path); PrintStr("\n"); }
+  }
+
   fn WriteELF(path: pchar) {
     // WP-34: refuse to write a binary produced by an overflowed buffer
     if (self.codeOverflow != 0 || self.dataOverflow != 0) {
@@ -11343,6 +11425,13 @@ pub type Codegen = class {
     // self-host singularity, since lyxc itself uses no FFI.
     if (self.externCount > 0) {
       self.cg_writeELFDynamic(path);
+      return;
+    }
+    // LyxOS-Reloc Step 1: Release-Build mit Base-Relocs (Klassen/VMT) → ELF mit PT_LYXRELOC,
+    // damit der LyxOS-Loader bei abweichender Ladebasis fixupen kann (statt vmm-Aliasing).
+    // Debug/Watermark behalten den exakten Alt-Pfad (unberührt). Linux ignoriert PT_LYXRELOC.
+    if (self.debugMode == 0 && self.licenseKey == 0 && self.baseRelocCount > 0) {
+      self.cg_writeELFReloc(path);
       return;
     }
     var totalCode: int64 := self.codeLen;
