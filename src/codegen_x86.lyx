@@ -2644,6 +2644,73 @@ pub type Codegen = class {
     return -1;
   }
 
+  // B2: ist das Feld vom Typ eines method-Alias (→ fat pointer)? Liest Feld-Typ-Name + Registry.
+  fn cg_fieldIsMethodType(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
+    if (classIdx < 0) { return 0; }
+    var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var p: pchar   := peek64(fb) as pchar;
+      var n: int64   := peek64(fb + CG_CFIELD_OFF_FIELDLEN);
+      if (n == fieldLen && self.cg_seq(p, n, fieldName, fieldLen)) {
+        var tp: pchar := peek64(fb + CG_CFIELD_OFF_TYPENAMEPTR) as pchar;
+        var tn: int64 := peek64(fb + CG_CFIELD_OFF_TYPENAMELEN);
+        if (tp == 0 as pchar || tn == 0) { return 0; }
+        return self.cg_isMethodType(tp, tn);
+      }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // B2: method-Referenz `obj.Method` (ungerufen) → heap-fat-pointer {code, data} (16B); rax = ptr.
+  // code = Adresse von Klasse_Method (mangled), data = obj-Instanz-Pointer.
+  fn cg_genMethodRef(rhs: int64) {
+    var rObj:  int64 := self.cg_nc0(rhs);
+    var mName: pchar := self.cg_nsval(rhs);
+    var mLen:  int64 := self.cg_nslen(rhs);
+    var rcls:  int64 := self.cg_objClassIdx(rObj);
+    // 16B-Speicher via anon-mmap(4096) (wie new) → rax = p
+    self.cg_movRaxImm(0);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7); // mov rdi,rax
+    self.cg_movRaxImm(4096); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6); // mov rsi,rax
+    self.cg_movRaxImm(3);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2); // mov rdx,rax
+    self.cg_movRaxImm(34);   self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2); // mov r10,rax
+    self.cg_movRaxImm(-1);   self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0); // xor r8,r8
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);                          // dec r8 → -1
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);                          // xor r9,r9
+    self.cg_movRaxImm(9);    self.cg_e8(0x0F); self.cg_e8(0x05);                    // syscall mmap
+    self.cg_pushRax();                                                              // [rsp] = p
+    // code-Adresse: lea rax,[rip+ Klasse_Method ]
+    if (rcls >= 0) {
+      var clsBase: int64 := self.classLayouts + rcls * CG_CLASS_SZ;
+      var clsName: pchar := peek64(clsBase) as pchar;
+      var clsLen:  int64 := peek64(clsBase + CG_CLASS_OFF_NAMELEN);
+      var mangLen: int64 := clsLen + 1 + mLen;
+      var mangBuf: int64 := alloc(mangLen + 1);
+      var mi: int64 := 0;
+      while (mi < clsLen) { poke8(mangBuf + mi, StrCharAt(clsName, mi)); mi := mi + 1; }
+      StrSetChar(mangBuf as pchar, clsLen, 95);
+      var mj: int64 := 0;
+      while (mj < mLen) { poke8(mangBuf + clsLen + 1 + mj, StrCharAt(mName, mj)); mj := mj + 1; }
+      poke8(mangBuf + mangLen, 0);
+      self.cg_emitFuncAddr(mangBuf as pchar, mangLen);   // rax = code
+      self.cg_trackTempBuf(mangBuf, mangLen + 1);
+    } else {
+      self.cg_zeroRax();
+    }
+    // [p] = code
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x1C); self.cg_e8(0x24);  // mov rbx,[rsp] (p)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x03);                    // mov [rbx], rax
+    // data = obj-Instanz → [p+8]
+    self.cg_genExpr(rObj);                                                    // rax = data
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x1C); self.cg_e8(0x24);  // mov rbx,[rsp] (p)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x43); self.cg_e8(0x08);  // mov [rbx+8], rax
+    self.cg_popRax();                                                         // rax = p (fat ptr)
+  }
+
   // WP-4.1-B: return fb+40 flags for a named field: bit0=bigEndian, bits8..15=typeWidth.
   // Returns 0 if field not found or not big_endian.
   fn cg_getFieldBigEndian(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
@@ -7443,13 +7510,19 @@ pub type Codegen = class {
         }
       } else if (self.cg_nkind(lhs) == CGN_FIELD) {
         // obj.field := rhs
-        self.cg_genExpr(rhs);
-        self.cg_pushRax();
         var obj: int64 := self.cg_nc0(lhs);
         var fieldName: pchar := self.cg_nsval(lhs);
         var fieldLen:  int64 := self.cg_nslen(lhs);
-        self.cg_genExpr(obj);
         var classIdx: int64 := self.cg_objClassIdx(obj);
+        // B2: method-typed Feld + RHS = method-Referenz (obj2.Method) → fat pointer {code,data}.
+        if (classIdx >= 0 && self.cg_nkind(rhs) == CGN_FIELD
+            && self.cg_fieldIsMethodType(classIdx, fieldName, fieldLen) != 0) {
+          self.cg_genMethodRef(rhs);
+        } else {
+          self.cg_genExpr(rhs);
+        }
+        self.cg_pushRax();
+        self.cg_genExpr(obj);
         var foff: int64 := -1;
         if (classIdx >= 0) { foff := self.cg_getFieldOffset(classIdx, fieldName, fieldLen); }
         self.cg_popRsi();
