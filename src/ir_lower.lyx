@@ -3000,6 +3000,22 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, szf); return dest;
     }
 
+    // #1: lokaler plain fn-ptr `f(args)` (f = NK_VAR_DECL-Local, keine Funktion) → indirekter Call.
+    // fn-Adresse zuerst laden (vor Arg-Stores in slots 0..N-1, die f's Slot überschreiben könnten).
+    var lfSlot: int64 := self._findLocalSlot(fname, fnlen);
+    if lfSlot >= 0 {
+      var lfFn: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_LOCAL, lfFn, lfSlot, -1, 0);
+      var lfArg: int64 := arg0; var lfI: int64 := 0;
+      while lfArg >= 0 {
+        var lfAT: int64 := self.lowerExpr(lfArg);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, lfI, lfAT, -1, 0);
+        lfI := lfI + 1; lfArg := self.nodeNext(lfArg);
+      }
+      self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, lfFn, -1, lfI);
+      return dest;
+    }
+
     // fix/lyxos-builtin-misdispatch: KEIN stiller id=1=PrintStr-Default mehr.
     // Unbekannter Name (kein User-Fn, kein FFI-Extern, kein bekannter Builtin) =
     // harter Compile-Fehler statt Garbage. Der stille Default versteckte den fb-Bug.
@@ -3235,13 +3251,33 @@ pub type IRLower = class {
     }
     return 0 - 1;
   }
-  // B2: ist Feld (baseNode).fp method-typed (same-module via _baseClassDecl)?
+  // B2: ist Feld (baseNode).fp method-typed? same-module via _baseClassDecl; importiert via _treg
+  // (Context-Swap auf Definitionsmodul — Feld-Typ-Node UND method-Alias liegen dort, wie _tregFieldOffG).
   fn _fieldIsMethodType(baseNode: int64, fp: pchar, fl: int64): int64 {
     var decl: int64 := self._baseClassDecl(baseNode);
-    if decl < 0 { return 0; }
-    var ftn: int64 := self._fieldTypeNodeIn(decl, fp, fl);
-    if ftn < 0 { return 0; }
-    return self._isMethodAlias(self.nodeSVal(ftn), self.nodeSLen(ftn));
+    if decl >= 0 {
+      var ftn: int64 := self._fieldTypeNodeIn(decl, fp, fl);
+      if ftn < 0 { return 0; }
+      return self._isMethodAlias(self.nodeSVal(ftn), self.nodeSLen(ftn));
+    }
+    var tn: int64 := self._baseTypeNode(baseNode);
+    if tn < 0 { return 0; }
+    var g: int64 := self._tregFind(self.nodeSVal(tn), self.nodeSLen(tn));
+    if g < 0 { return 0; }
+    return self._tregFieldIsMethodG(g, fp, fl);
+  }
+  // B2 cross-module: Feld method-typed im Definitionsmodul g (Context-Swap, wie _tregFieldOffG).
+  fn _tregFieldIsMethodG(g: int64, fp: pchar, fl: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar;
+    self.nodes := peek64(self._tregNodes + g * 8);
+    self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := 0;
+    var ftn: int64 := self._fieldTypeNodeIn(peek64(self._tregIdx + g * 8), fp, fl);
+    if ftn >= 0 { r := self._isMethodAlias(self.nodeSVal(ftn), self.nodeSLen(ftn)); }
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
   }
 
   // B2: method-Referenz `obj.Method` → heap-fat-pointer {code, data} (16B); liefert Temp mit p.
@@ -3268,6 +3304,25 @@ pub type IRLower = class {
     var dataT: int64 := self.lowerExpr(rObj);
     self.irAddInstrDirect(IRO_STORE_FIELD, 8, dataT, p, 0);       // [p+8]=data (self)
     return p;
+  }
+
+  // #1: Slot eines lokalen (NK_VAR_DECL) Namens (-1 wenn keiner). Für lokalen fn-ptr-Call.
+  fn _findLocalSlot(np: pchar, nl: int64): int64 {
+    if self.curFunc < 0 { return 0 - 1; }
+    var npI: int64 := (np) as int64;
+    var lnI: int64 := self.localNameCnt - 1;
+    while lnI >= 0 {
+      var lnRec: int64 := self.localNameBuf + lnI * 24;
+      var lnLen: int64 := peek64(lnRec + LOCAL_REC_OFF_NAMELEN);
+      if lnLen == nl {
+        var lnPtr: int64 := (self.src as int64) + peek64(lnRec + 0);
+        var m: int64 := 1; var j: int64 := 0;
+        while j < nl { if m != 0 { if peek8(lnPtr + j) != peek8(npI + j) { m := 0; } } j := j + 1; }
+        if m != 0 { return peek64(lnRec + LOCAL_REC_OFF_SLOT); }
+      }
+      lnI := lnI - 1;
+    }
+    return 0 - 1;
   }
 
   // ARM64-OOP: funcBuffer-Index für einen (mangled) Funktionsnamen (-1 falls keiner).
