@@ -212,6 +212,7 @@ con CG_PATCH_OFF_NAMELEN: int64 := 16;
 con CG_PATCH_OFF_KIND:    int64 := 24;
 
 con CGN_TYPE_DECL:  int64 := 10;
+con CGN_METHOD_PTR: int64 := 129;  // B2: method(...): R fat-pointer-Typ-Node
 con CGN_FIELD_DECL: int64 := 7;
 
 con CG_CLASS_SZ:           int64 := 64;
@@ -459,6 +460,10 @@ pub type Codegen = class {
   f64FuncList:  int64;
   f64FuncCount: int64;
   f64FuncCap:   int64;
+  // B2: method-Typ-Alias-Namen (Registry für fat-pointer-Detektion)
+  methodAliasList:  int64;
+  methodAliasCount: int64;
+  methodAliasCap:   int64;
 
   // WP-BC-24: deferred generic monomorphization list
   // Entry: {mangledNamePtr:8, mangledNameLen:8, genericFuncNode:8} = 24 bytes
@@ -2276,6 +2281,43 @@ pub type Codegen = class {
       i := i + 1;
     }
     return 0;
+  }
+
+  // B2: method-Typ-Alias-Registry. Name = Alias der `type X = method(...)` ist → fat pointer.
+  fn cg_registerMethodAlias(name: pchar, nameLen: int64) {
+    if (self.methodAliasCount >= self.methodAliasCap) {
+      var nc: int64 := self.methodAliasCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.methodAliasList, self.methodAliasCount * 16);
+      self.methodAliasList := nb;
+      self.methodAliasCap  := nc;
+    }
+    var base: int64 := self.methodAliasList + self.methodAliasCount * 16;
+    poke64(base,     name as int64);
+    poke64(base + 8, nameLen);
+    self.methodAliasCount := self.methodAliasCount + 1;
+  }
+  fn cg_isMethodType(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.methodAliasCount) {
+      var base: int64 := self.methodAliasList + i * 16;
+      if (self.cg_seq(peek64(base) as pchar, peek64(base + 8), name, nameLen) != 0) { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+  // Pre-pass: alle `type X = method(...)`-Aliase registrieren (iv-Bit1 + c0=NK_METHOD_PTR).
+  fn cg_collectMethodAliases(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      if (self.cg_nkind(cur) == CGN_TYPE_DECL && (self.cg_nival(cur) & 2) != 0) {
+        var body: int64 := self.cg_nc0(cur);
+        if (body >= 0 && self.cg_nkind(body) == CGN_METHOD_PTR) {
+          self.cg_registerMethodAlias(self.cg_nsval(cur), self.cg_nslen(cur));
+        }
+      }
+      cur := self.cg_nnext(cur);
+    }
   }
 
   // A1: ist `name` eine deklarierte Top-Level-Funktion? (Fn-Name als Wert → Adresse statt 0)
@@ -9933,6 +9975,7 @@ pub type Codegen = class {
     self.topLevelHead := head;   // A1: früh setzen (für cg_isDeclaredFunc beim Fn-Name-als-Wert)
     // Pre-pass: collect all user-defined functions returning f64 for cg_isF64Expr.
     self.cg_collectF64Funcs(head);
+    self.cg_collectMethodAliases(head);   // B2: method-Typ-Aliase registrieren
 
     var cur: int64 := head;
     while (cur != -1) {
@@ -9960,6 +10003,11 @@ pub type Codegen = class {
         var modLen:  int64 := self.cg_nslen(cur);
         self.cg_processImport(modName, modLen);
       } else if (k == CGN_TYPE_DECL) {
+        // B2: Typ-Alias (iv-Bit1) — kein Klassen/Struct-Layout. c0 = Alias-Target (kein Feld).
+        // method-Aliase sind bereits via cg_collectMethodAliases registriert.
+        if ((self.cg_nival(cur) & 2) != 0) {
+          // nichts zu bauen — Alias ist reine Typ-Umbenennung
+        } else {
         // NK_TYPE_DECL: class if it has methods (nc1 != -1), struct otherwise
         var hasMethods: int64 := self.cg_nc1(cur);
         // WP-BC-L2: a method-less class that `extends` a class WITH a vtable must
@@ -9990,6 +10038,7 @@ pub type Codegen = class {
             }
             method := nextM;
           }
+        }
         }
       } else if (k == CGN_STRUCT_DECL) {
         // Standalone struct declaration: register field layout (fields at offset 0)
@@ -10197,6 +10246,9 @@ pub type Codegen = class {
     self.f64FuncCap   := 64;
     self.f64FuncList  := alloc(self.f64FuncCap * 16);
     self.f64FuncCount := 0;
+    self.methodAliasCap   := 64;
+    self.methodAliasList  := alloc(self.methodAliasCap * 16);
+    self.methodAliasCount := 0;
     self.cg_registerF64Func("fAdd"c,  4);
     self.cg_registerF64Func("fSub"c,  4);
     self.cg_registerF64Func("fMul"c,  4);
