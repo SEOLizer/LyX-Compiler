@@ -2278,6 +2278,25 @@ pub type Codegen = class {
     return 0;
   }
 
+  // A1: ist `name` eine deklarierte Top-Level-Funktion? (Fn-Name als Wert → Adresse statt 0)
+  fn cg_isDeclaredFunc(name: pchar, nlen: int64): int64 {
+    var cur: int64 := self.topLevelHead;
+    while (cur != -1) {
+      if (self.cg_nkind(cur) == CGN_FUNC_DECL) {
+        if (self.cg_seq(self.cg_nsval(cur), self.cg_nslen(cur), name, nlen) != 0) { return 1; }
+      }
+      cur := self.cg_nnext(cur);
+    }
+    return 0;
+  }
+  // A1: Fn-Adresse laden — lea rax, [rip+disp32]; disp via CG_PATCH_CALL (= target-(pos+4), wie call).
+  fn cg_emitFuncAddr(name: pchar, nlen: int64) {
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);
+    var pos: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pos, name as int64, nlen, CG_PATCH_CALL);
+  }
+
   // Pre-pass: scan all CGN_FUNC_DECL nodes and register those returning f64.
   fn cg_collectF64Funcs(head: int64) {
     var cur: int64 := head;
@@ -3698,6 +3717,7 @@ pub type Codegen = class {
           var goffC: int64 := self.cg_findGlobal(name, nlen);
           if (goffC >= 0) { self.cg_loadRaxGlobal(goffC); }
           else if (self.cg_hasConVal(name, nlen) != 0) { self.cg_emitConLoad(name, nlen); }
+          else if (self.cg_isDeclaredFunc(name, nlen) != 0) { self.cg_emitFuncAddr(name, nlen); }
           else { self.cg_zeroRax(); }
         }
       } else {
@@ -3722,6 +3742,8 @@ pub type Codegen = class {
               self.cg_loadRaxGlobal(goff1);
             } else if (self.cg_hasConVal(name, nlen) != 0) {
               self.cg_emitConLoad(name, nlen);
+            } else if (self.cg_isDeclaredFunc(name, nlen) != 0) {
+              self.cg_emitFuncAddr(name, nlen);
             } else {
               self.cg_zeroRax();
             }
@@ -3732,6 +3754,8 @@ pub type Codegen = class {
             self.cg_loadRaxGlobal(goff2);
           } else if (self.cg_hasConVal(name, nlen) != 0) {
             self.cg_emitConLoad(name, nlen);
+          } else if (self.cg_isDeclaredFunc(name, nlen) != 0) {
+            self.cg_emitFuncAddr(name, nlen);
           } else {
             self.cg_zeroRax();
           }
@@ -4576,6 +4600,35 @@ pub type Codegen = class {
           return;
         } else if (self.cg_seq(fname, fnlen, popStr, 3)) {
           self.cg_genArrayPop(arrObj);
+          return;
+        }
+      }
+    }
+    // A1: Fn-Pointer-FELD-Call — obj.field(args), wobei `field` ein Klassen-FELD (kein Methode) ist.
+    // Plain indirekter Call: Feld laden (= Fn-Adresse), Args in normalen Registern, KEIN self-Inject.
+    if (isMethod == 1) {
+      var fpObj: int64 := self.cg_nc0(ni);
+      var fpClassIdx: int64 := self.cg_objClassIdx(fpObj);
+      if (fpClassIdx >= 0) {
+        var fpOff: int64 := self.cg_findField(fpClassIdx, fname, fnlen);
+        if (fpOff >= 0) {
+          // explizite Args auswerten + pushen (argNode = cg_nc1 für isMethod==1)
+          var fpCur: int64 := argNode;
+          var fpArgc: int64 := 0;
+          while (fpCur >= 0) { self.cg_genExpr(fpCur); self.cg_pushRax(); fpArgc := fpArgc + 1; fpCur := self.cg_nnext(fpCur); }
+          // Objekt → rax; Fn-Adresse aus Feld → rbx
+          self.cg_genExpr(fpObj);
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x98);   // mov rbx, [rax+disp32]
+          self.cg_e8(fpOff & 0xFF); self.cg_e8((fpOff >> 8) & 0xFF);
+          self.cg_e8((fpOff >> 16) & 0xFF); self.cg_e8((fpOff >> 24) & 0xFF);
+          // Args zurück in rdi,rsi,rdx,rcx,r8,r9 (normal, arg0→rdi; KEIN env-Shift)
+          if (fpArgc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9
+          if (fpArgc >= 5) { self.cg_e8(0x41); self.cg_e8(0x58); }  // pop r8
+          if (fpArgc >= 4) { self.cg_popRcx(); }
+          if (fpArgc >= 3) { self.cg_popRdx(); }
+          if (fpArgc >= 2) { self.cg_popRsi(); }
+          if (fpArgc >= 1) { self.cg_popRdi(); }
+          self.cg_e8(0xFF); self.cg_e8(0xD3);   // call rbx
           return;
         }
       }
@@ -9877,6 +9930,7 @@ pub type Codegen = class {
   // ------------------------------------------------------------------
 
   fn cg_genFile(head: int64) {
+    self.topLevelHead := head;   // A1: früh setzen (für cg_isDeclaredFunc beim Fn-Name-als-Wert)
     // Pre-pass: collect all user-defined functions returning f64 for cg_isF64Expr.
     self.cg_collectF64Funcs(head);
 
