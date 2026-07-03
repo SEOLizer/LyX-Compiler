@@ -132,6 +132,7 @@ TopDecl             = ImportDecl
                     | VarDecl
                     | FnDecl
                     | ExternFnDecl
+                    | ExternDataDecl
                     | TypeDecl
                     | EnumDecl
                     | DimDecl
@@ -266,6 +267,13 @@ ExternFnDecl        = [ "@cap" "(" CapabilityPath ")" ]
                       "link"
                       StringLiteral
                       ";" ;
+
+(* WSP-07: externes Daten-Symbol. Der Linkage-String steht DIREKT nach `extern`
+   (Unterscheidung von ExternFnDecl, wo `fn` folgt). Der Bezeichner liefert an
+   jeder Nutzung die ADRESSE des Symbols; sie wird zur Link-Zeit von `ld` aufgelöst
+   (z.B. Linker-Skript-Symbole __kernel_start/__kernel_end). Erfordert Ausgabe als
+   relocatable Objekt (`--emit=obj`); ohne Objektmodus ist es ein Compile-Fehler. *)
+ExternDataDecl      = "extern" StringLiteral Ident ":" Type ";" ;
 
 TypeParamClause     = "[" TypeParamList "]" ;
 

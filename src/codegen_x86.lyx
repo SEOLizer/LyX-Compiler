@@ -89,6 +89,7 @@ con CGN_NAMED_ARG:   int64 := 108; // WP-MEM-05: named call arg; nc0=value
 con CGN_MATCH_CASE:  int64 := 65;  // WP-15: case pattern => expr
 con CGN_RANGE:        int64 := 73;  // WP-17: range expression: 1..100
 con CGN_WHERE:        int64 := 74;  // WP-17: where clause: type X where constraint
+con CGN_EXTERN_DATA:  int64 := 75;  // WSP-07: extern "asm" name: Type;
 con CGN_IS_EXPR:      int64 := 72;  // WP-16: x is Type
 
 // WP-15: Pattern matching node kinds
@@ -189,6 +190,7 @@ con CG_PATCH_CALL:     int64 := 0;
 con CG_PATCH_STR:      int64 := 1;
 con CG_PATCH_VMT_ADDR: int64 := 2;  // absolute 8-byte VMT address in code buffer
 con CG_PATCH_EXTERN:   int64 := 3;  // FFI call: disp32 of `call *got(%rip)`, namePtr field = extern index
+con CG_PATCH_EXTERN_DATA: int64 := 4;  // WSP-07: disp32 von `lea rax,[rip+0]` auf externes Daten-Symbol; wird zu R_X86_64_PC32 in cg_writeELFObj
 
 // FFI imports (extern fn ... link "lib.so")
 con CG_EXTERN_SZ:          int64 := 32;
@@ -388,6 +390,11 @@ pub type Codegen = class {
   externSyms:      int64;
   externCount:     int64;
   externCap:       int64;
+  // WSP-07: externe Daten-Symbole (extern "asm"). Entry = {namePtr:i64, nameLen:i64} (16 B).
+  externData:      int64;
+  externDataCount: int64;
+  externDataCap:   int64;
+  objMode:         int64;   // WSP-07: 1 = ET_REL-Objekt (--emit=obj); extern "asm" nur hier erlaubt
 
   // Parser output (set by Init)
   pSrc:   pchar;
@@ -1543,6 +1550,43 @@ pub type Codegen = class {
     return idx;
   }
 
+  // WSP-07: externes Daten-Symbol (extern "asm") suchen / registrieren.
+  fn cg_findExternDataIdx(namePtr: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.externDataCount) {
+      var b: int64 := self.externData + i * 16;
+      if (self.cg_seq(peek64(b) as pchar, peek64(b + 8), namePtr, nlen)) { return i; }
+      i := i + 1;
+    }
+    return -1;
+  }
+
+  fn cg_addExternData(namePtr: pchar, nlen: int64): int64 {
+    var ex: int64 := self.cg_findExternDataIdx(namePtr, nlen);
+    if (ex >= 0) { return ex; }
+    if (self.externDataCount >= self.externDataCap) {
+      var nc: int64 := self.externDataCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.externData, self.externDataCount * 16);
+      self.externData := nb; self.externDataCap := nc;
+    }
+    var base: int64 := self.externData + self.externDataCount * 16;
+    poke64(base,     namePtr as int64);
+    poke64(base + 8, nlen);
+    var idx: int64 := self.externDataCount;
+    self.externDataCount := self.externDataCount + 1;
+    return idx;
+  }
+
+  // WSP-07: lea rax, [rip+disp32] auf ein externes Daten-Symbol. disp32 bleibt 0 und
+  // wird NICHT in cg_patchAll aufgelöst — cg_writeELFObj erzeugt daraus R_X86_64_PC32.
+  fn cg_emitExternDataAddr(name: pchar, nlen: int64) {
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);   // lea rax, [rip+disp32]
+    var pos: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pos, name as int64, nlen, CG_PATCH_EXTERN_DATA);
+  }
+
   fn cg_patchAll() {
     var i: int64 := 0;
     while (i < self.patchCount) {
@@ -1565,6 +1609,16 @@ pub type Codegen = class {
       } else if (kind == CG_PATCH_EXTERN) {
         // FFI call disp32 — resolved in cg_writeELFDynamic once the GOT
         // virtual address is known. Nothing to do here.
+      } else if (kind == CG_PATCH_EXTERN_DATA) {
+        // WSP-07: externes Daten-Symbol — nur im ET_REL-Objektmodus auflösbar (via ld).
+        // In einem normalen Executable gibt es keinen Linker → fail-closed.
+        if (self.objMode == 0) {
+          EPrintStr("error: extern \"asm\" '"c);
+          sys_write(2, namePtr, nlen);
+          EPrintStr("' benoetigt --emit=obj (Linker-aufgeloestes Symbol)\n"c);
+          exit(1);
+        }
+        // disp32 bleibt 0 → wird in cg_writeELFObj zu R_X86_64_PC32.
       } else {
         // CG_PATCH_STR: namePtr encodes data offset
         var dataOff: int64 := namePtr;
@@ -3866,6 +3920,7 @@ pub type Codegen = class {
           var goffC: int64 := self.cg_findGlobal(name, nlen);
           if (goffC >= 0) { self.cg_loadRaxGlobal(goffC); }
           else if (self.cg_hasConVal(name, nlen) != 0) { self.cg_emitConLoad(name, nlen); }
+          else if (self.cg_findExternDataIdx(name, nlen) >= 0) { self.cg_emitExternDataAddr(name, nlen); }
           else if (self.cg_isDeclaredFunc(name, nlen) != 0) { self.cg_emitFuncAddr(name, nlen); }
           else { self.cg_zeroRax(); }
         }
@@ -3891,6 +3946,8 @@ pub type Codegen = class {
               self.cg_loadRaxGlobal(goff1);
             } else if (self.cg_hasConVal(name, nlen) != 0) {
               self.cg_emitConLoad(name, nlen);
+            } else if (self.cg_findExternDataIdx(name, nlen) >= 0) {
+              self.cg_emitExternDataAddr(name, nlen);
             } else if (self.cg_isDeclaredFunc(name, nlen) != 0) {
               self.cg_emitFuncAddr(name, nlen);
             } else {
@@ -3903,6 +3960,8 @@ pub type Codegen = class {
             self.cg_loadRaxGlobal(goff2);
           } else if (self.cg_hasConVal(name, nlen) != 0) {
             self.cg_emitConLoad(name, nlen);
+          } else if (self.cg_findExternDataIdx(name, nlen) >= 0) {
+            self.cg_emitExternDataAddr(name, nlen);
           } else if (self.cg_isDeclaredFunc(name, nlen) != 0) {
             self.cg_emitFuncAddr(name, nlen);
           } else {
@@ -10201,6 +10260,9 @@ pub type Codegen = class {
         } else {
           self.cg_genFuncDecl(cur);
         }
+      } else if (k == CGN_EXTERN_DATA) {
+        // WSP-07: externes Daten-Symbol registrieren (Name → UNDEF-Symbol in cg_writeELFObj).
+        self.cg_addExternData(self.cg_nsval(cur), self.cg_nslen(cur));
       } else if (k == CGN_IMPORT) {
         // Process the imported module (WP-09: import resolution)
         var modName: pchar := self.cg_nsval(cur);
@@ -10381,6 +10443,11 @@ pub type Codegen = class {
     self.externCap   := 64;
     self.externSyms  := alloc(self.externCap * CG_EXTERN_SZ);
     self.externCount := 0;
+
+    // WSP-07: externe Daten-Symbol-Tabelle
+    self.externDataCap   := 32;
+    self.externData      := alloc(self.externDataCap * 16);
+    self.externDataCount := 0;
 
     self.nextLblId := 0;
 
@@ -11407,6 +11474,183 @@ pub type Codegen = class {
     poke64(ph3 + ELF64_PHDR_OFF_FILESZ, relocSize);
     poke64(ph3 + ELF64_PHDR_OFF_MEMSZ,  relocSize);
     poke64(ph3 + ELF64_PHDR_OFF_ALIGN,  8);
+
+    var fd: int64 := open(path, 577, 493);
+    if (fd >= 0) { write(fd, buf as pchar, fileSize); close(fd); }
+    else { PrintStr("codegen: failed to open output file: "); PrintStr(path); PrintStr("\n"); }
+  }
+
+  // WSP-07: nlen Bytes von ptr nach buf+off kopieren + Null-Terminator. Gibt off+nlen+1.
+  fn cg_objPutName(buf: int64, off: int64, ptr: int64, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < nlen) { poke8(buf + off + i, peek8(ptr + i)); i := i + 1; }
+    poke8(buf + off + nlen, 0);
+    return off + nlen + 1;
+  }
+
+  // WSP-07: relocatable ELF-Objekt (ET_REL) für `extern "asm"`. Eine Section .ltext =
+  // code||data (interne Refs sind RIP-relativ → reloc-invariant bei einem Block). baseRelocs
+  // (VMT/Klassen-Zeiger) → R_X86_64_64 gegen .ltext-Section-Symbol; extern-"asm"-Nutzungen →
+  // R_X86_64_PC32 gegen UNDEF-Symbol. Auflösung via `ld -T script.ld obj.o stub.o`.
+  fn cg_writeELFObj(path: pchar) {
+    var codeSz: int64 := self.codeLen;
+    var dataSz: int64 := self.dataLen;
+    var ltextSize: int64 := codeSz + dataSz;
+
+    // EXTERN_DATA-Patches zählen (jede Nutzung = eine Reloc).
+    var edPatch: int64 := 0;
+    var pc: int64 := 0;
+    while (pc < self.patchCount) {
+      if (peek64(self.patches + pc * CG_PATCH_SZ + CG_PATCH_OFF_KIND) == CG_PATCH_EXTERN_DATA) {
+        edPatch := edPatch + 1;
+      }
+      pc := pc + 1;
+    }
+
+    var symCount:  int64 := 3 + self.externDataCount;   // null, .ltext-Section, _start, externs
+    var relaCount: int64 := self.baseRelocCount + edPatch;
+
+    // .strtab-Größe: null + "_start\0" + je extern-Name+null
+    var strtabSize: int64 := 1 + 7;
+    var es: int64 := 0;
+    while (es < self.externDataCount) {
+      strtabSize := strtabSize + peek64(self.externData + es * 16 + 8) + 1;
+      es := es + 1;
+    }
+    var shstrtabSize: int64 := 45;   // "\0.ltext\0.symtab\0.strtab\0.rela.text\0.shstrtab\0"
+
+    // Datei-Layout
+    var ltextOff:   int64 := 64;
+    var symtabOff:  int64 := ((ltextOff + ltextSize + 7) / 8) * 8;
+    var symtabSize: int64 := symCount * 24;
+    var strtabOff:  int64 := symtabOff + symtabSize;
+    var relaOff:    int64 := ((strtabOff + strtabSize + 7) / 8) * 8;
+    var relaSize:   int64 := relaCount * 24;
+    var shstrOff:   int64 := relaOff + relaSize;
+    var shTableOff: int64 := ((shstrOff + shstrtabSize + 7) / 8) * 8;
+    var fileSize:   int64 := shTableOff + 6 * 64;
+
+    var buf: int64 := alloc(fileSize);
+    var z: int64 := 0;
+    while (z < fileSize) { poke8(buf + z, 0); z := z + 1; }
+
+    // ELF64-Header (ET_REL)
+    poke8(buf, 0x7F); poke8(buf + 1, 69); poke8(buf + 2, 76); poke8(buf + 3, 70);
+    poke8(buf + 4, 2); poke8(buf + 5, 1); poke8(buf + 6, 1); poke8(buf + 7, 0);
+    poke16(buf + 16, 1);     // ET_REL
+    poke16(buf + 18, 62);    // EM_X86_64
+    poke32(buf + 20, 1);     // e_version
+    poke64(buf + 24, 0);     // e_entry
+    poke64(buf + 32, 0);     // e_phoff
+    poke64(buf + ELF64_EHDR_OFF_SHOFF, shTableOff);
+    poke32(buf + 48, 0);
+    poke16(buf + 52, 64);    // e_ehsize
+    poke16(buf + 54, 56);    // e_phentsize
+    poke16(buf + 56, 0);     // e_phnum
+    poke16(buf + 58, 64);    // e_shentsize
+    poke16(buf + 60, 6);     // e_shnum
+    poke16(buf + 62, 5);     // e_shstrndx → .shstrtab
+
+    // .ltext = code || data
+    memcpy(buf + ltextOff, self.code, codeSz);
+    memcpy(buf + ltextOff + codeSz, self.data, dataSz);
+
+    // .strtab (Namen + Offsets sammeln)
+    poke8(buf + strtabOff, 0);
+    var startNameOff: int64 := 1;
+    var wo: int64 := self.cg_objPutName(buf, strtabOff + 1, "_start"c as int64, 6);
+    var edNameOff: int64 := alloc((self.externDataCount + 1) * 8);
+    var em: int64 := 0;
+    while (em < self.externDataCount) {
+      poke64(edNameOff + em * 8, wo - strtabOff);
+      wo := self.cg_objPutName(buf, wo, peek64(self.externData + em * 16),
+                               peek64(self.externData + em * 16 + 8));
+      em := em + 1;
+    }
+
+    // .symtab
+    // sym 0 = null (schon 0). sym 1 = .ltext-Section-Symbol (LOCAL, STT_SECTION)
+    var s1: int64 := buf + symtabOff + 24;
+    poke16(s1 + 6, 1);                 // st_shndx = .ltext
+    poke8(s1 + 4, 3);                  // st_info = STB_LOCAL<<4 | STT_SECTION
+    // sym 2 = _start (GLOBAL, STT_FUNC) @ .ltext:0
+    var s2: int64 := buf + symtabOff + 48;
+    poke32(s2, startNameOff);
+    poke8(s2 + 4, (1 << 4) | 2);       // STB_GLOBAL<<4 | STT_FUNC
+    poke16(s2 + 6, 1);                 // .ltext
+    // sym 3.. = extern-data UNDEF (GLOBAL, STT_NOTYPE)
+    var ek: int64 := 0;
+    while (ek < self.externDataCount) {
+      var sk: int64 := buf + symtabOff + (3 + ek) * 24;
+      poke32(sk, peek64(edNameOff + ek * 8));
+      poke8(sk + 4, (1 << 4) | 0);     // STB_GLOBAL<<4 | STT_NOTYPE
+      poke16(sk + 6, 0);               // SHN_UNDEF
+      ek := ek + 1;
+    }
+
+    // .rela.text
+    var ro: int64 := relaOff;
+    var bi: int64 := 0;
+    while (bi < self.baseRelocCount) {
+      var rva: int64 := peek64(self.baseRelocBuf + bi * 8);
+      var loc: int64 := rva - CG_CODE_OFF;                          // Offset in .ltext
+      var storedVal: int64 := peek64(buf + ltextOff + loc);
+      poke64(ro + buf, loc);                                        // r_offset
+      poke64(buf + ro + 8, (1 << 32) | 1);                          // r_info: sym=1(.ltext), R_X86_64_64
+      poke64(buf + ro + 16, storedVal - CG_ELF_BASE - CG_CODE_OFF); // r_addend = Ziel-Offset in .ltext
+      ro := ro + 24;
+      bi := bi + 1;
+    }
+    var pj: int64 := 0;
+    while (pj < self.patchCount) {
+      var pb: int64 := self.patches + pj * CG_PATCH_SZ;
+      if (peek64(pb + CG_PATCH_OFF_KIND) == CG_PATCH_EXTERN_DATA) {
+        var coff: int64 := peek64(pb);
+        var edi: int64 := self.cg_findExternDataIdx(peek64(pb + CG_PATCH_OFF_NAMEPTR) as pchar,
+                                                    peek64(pb + CG_PATCH_OFF_NAMELEN));
+        var symIdx: int64 := 3 + edi;
+        poke64(buf + ro, coff);                                     // r_offset (code@0 in .ltext)
+        poke64(buf + ro + 8, (symIdx << 32) | 2);                   // R_X86_64_PC32 gegen UNDEF-Sym
+        poke64(buf + ro + 16, 0 - 4);                               // r_addend = -4
+        ro := ro + 24;
+      }
+      pj := pj + 1;
+    }
+
+    // .shstrtab
+    poke8(buf + shstrOff, 0);
+    self.cg_objPutName(buf, shstrOff + 1,  ".ltext"c as int64, 6);
+    self.cg_objPutName(buf, shstrOff + 8,  ".symtab"c as int64, 7);
+    self.cg_objPutName(buf, shstrOff + 16, ".strtab"c as int64, 7);
+    self.cg_objPutName(buf, shstrOff + 24, ".rela.text"c as int64, 10);
+    self.cg_objPutName(buf, shstrOff + 35, ".shstrtab"c as int64, 9);
+
+    // Section-Header-Tabelle (6 × 64)
+    // sh 0 = NULL (schon 0)
+    var sh1: int64 := buf + shTableOff + 64;    // .ltext
+    poke32(sh1, 1); poke32(sh1 + 4, 1);                // SHT_PROGBITS
+    poke64(sh1 + 8, 7);                                // ALLOC|WRITE|EXECINSTR
+    poke64(sh1 + 24, ltextOff); poke64(sh1 + 32, ltextSize);
+    poke64(sh1 + 48, 16);
+    var sh2: int64 := buf + shTableOff + 128;   // .symtab
+    poke32(sh2, 8); poke32(sh2 + 4, 2);                // SHT_SYMTAB
+    poke64(sh2 + 24, symtabOff); poke64(sh2 + 32, symtabSize);
+    poke32(sh2 + 40, 3); poke32(sh2 + 44, 2);          // link=.strtab, info=first-global(2)
+    poke64(sh2 + 48, 8); poke64(sh2 + 56, 24);
+    var sh3: int64 := buf + shTableOff + 192;   // .strtab
+    poke32(sh3, 16); poke32(sh3 + 4, 3);               // SHT_STRTAB
+    poke64(sh3 + 24, strtabOff); poke64(sh3 + 32, strtabSize);
+    poke64(sh3 + 48, 1);
+    var sh4: int64 := buf + shTableOff + 256;   // .rela.text
+    poke32(sh4, 24); poke32(sh4 + 4, 4);               // SHT_RELA
+    poke64(sh4 + 8, 0x40);                             // SHF_INFO_LINK
+    poke64(sh4 + 24, relaOff); poke64(sh4 + 32, relaSize);
+    poke32(sh4 + 40, 2); poke32(sh4 + 44, 1);          // link=.symtab, info=.ltext
+    poke64(sh4 + 48, 8); poke64(sh4 + 56, 24);
+    var sh5: int64 := buf + shTableOff + 320;   // .shstrtab
+    poke32(sh5, 35); poke32(sh5 + 4, 3);               // SHT_STRTAB
+    poke64(sh5 + 24, shstrOff); poke64(sh5 + 32, shstrtabSize);
+    poke64(sh5 + 48, 1);
 
     var fd: int64 := open(path, 577, 493);
     if (fd >= 0) { write(fd, buf as pchar, fileSize); close(fd); }

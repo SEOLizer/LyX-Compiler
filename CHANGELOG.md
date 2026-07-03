@@ -1,5 +1,32 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.6A (Juli 2026)
+
+WSP-07: `extern "asm"` externe Daten-Symbole + relocatable Objekt-Ausgabe (ET_REL).
+Basis V1.0.5A.
+
+### extern "asm" (WSP-07)
+- **Syntax**: `extern "asm" name: Type;` — deklariert ein externes Daten-Symbol
+  (neuer AST-Knoten `NK_EXTERN_DATA`). Der Bezeichner liefert an jeder Nutzung die
+  ADRESSE des Symbols. Sema registriert es als adress-typisierte Variable ohne
+  Initializer; IDENT-Auflösung + Typecheck laufen normal.
+- **Auflösung zur Link-Zeit** durch `ld` (z.B. Linker-Skript-Symbole
+  `__kernel_start`/`__kernel_end`), nicht durch einen Runtime-Loader.
+- **Neuer Ausgabemodus `--emit=obj` (bzw. `-c`)**: relocatable ELF-Objekt (ET_REL)
+  statt Executable (x86_64). Eine Section `.ltext` = code||data (interne Refs sind
+  RIP-relativ → reloc-invariant). Erzeugt `.symtab`/`.strtab`/`.rela.text`:
+  - `R_X86_64_64` gegen das `.ltext`-Section-Symbol für interne absolute Referenzen
+    (Klassen-VMTs/Methoden-Zeiger, aus dem bestehenden baseReloc-Set).
+  - `R_X86_64_PC32` gegen ein `UNDEF`-Symbol je `extern "asm"`-Nutzung.
+  - Globales `_start`-Symbol als Entry (`ld -T script.ld obj.o stub.o`).
+- **Fail-closed**: `extern "asm"` ohne `--emit=obj` ist ein Compile-Fehler (kein
+  Linker → nicht auflösbar), kein stilles Falschergebnis.
+- **Grammatik**: `ExternDataDecl` in `ebnf.md` ergänzt.
+- Verifiziert: e2e mit `ld` gegen Assembly-Stub (Symbol-Byte 42 → Exit 42);
+  Klassen-Programm mit virtueller Dispatch (R_X86_64_64) + extern (R_X86_64_PC32)
+  → Exit 49; `readelf` bestätigt ET_REL/UNDEF-Symbol/Relocs; Selbst-Host-Fixpunkt
+  gen2==gen3; `make test` 20 PASS/0 FAIL.
+
 ## Version 1.0.5A (Juli 2026)
 
 Inline-Assembly `asm { }` (WSP-05) auf alle funktionalen Backends erweitert — jetzt
