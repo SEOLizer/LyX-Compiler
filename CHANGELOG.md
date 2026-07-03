@@ -1,5 +1,32 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.5A (Juli 2026)
+
+Inline-Assembly `asm { }` (WSP-05) auf alle funktionalen Backends erweitert — jetzt
+architektur-spezifisch statt nur x86 + LyxOS. Basis V1.0.4A.
+
+### asm{} Multi-Backend (arch-spezifisch)
+- **Modell**: Jede Ziel-Architektur akzeptiert nur ihre eigenen Mnemonics; ein Mnemonic
+  einer fremden Arch ist ein harter Compile-Fehler (wie C-Inline-Assembly). `ir_lower`
+  wählt die Mnemonic→Id-Tabelle über das neue `target`-Feld (VMT-sicher: Feld, keine
+  neue IRLower-Methode).
+- **Neue Backend-Handler** (`IRO_ASM`, op==167):
+  - `emit_arm64.lyx` (arm64/macos-arm64/win-arm64/android-arm64): nop, wfi, wfe, sev,
+    sevl, yield, isb, dsb, dmb, svc, brk, hlt, ret, eret.
+  - `riscv_linux.lyx` (linux-riscv64): nop, wfi, fence, fence.i, ecall, ebreak, mret, sret.
+  - `arm_cm_backend.lyx` (arm-cm4/arm-cm33, Thumb-2): nop, wfi, wfe, sev, yield, isb, dsb,
+    dmb, svc, bkpt, cpsid i, cpsie i (32-bit-Thumb: höheres Halbwort zuerst).
+  - `xtensa.lyx` (esp32/esp32s3): nop (weitere Mnemonics fail-closed, da Byte-Konvention
+    nicht gegen einen Assembler verifizierbar).
+- **Bestehend unverändert**: x86-64/macos-x86/win-x86 (AST-Pfad `codegen_x86`), LyxOS
+  (`emit_lyxos`).
+- **Grammatik**: `AsmStmt` + Abschnitt „12.2 Inline-Assembly Rule" in `ebnf.md` ergänzt
+  (Soft-Keyword, arch-spezifische Mnemonic-Sets, Fail-closed-Semantik).
+- **Vertagt** (pre-existing, ganzer Backend fehlt/hohl, nicht asm-spezifisch): android-x86_64
+  (`emitX86_64`-Stub), riscv64-non-linux + arm_cm-non-cm4 (leere `emit()`).
+- Verifiziert: Byte-Encodings je Arch, Cross-Arch-Fail-closed, x86/LyxOS-Regression grün,
+  Selbst-Host-Fixpunkt gen2==gen3, `make test` 20 PASS/0 FAIL.
+
 ## Version 1.0.4A (Juni 2026)
 
 Funktionszeiger + Method-Pointer (Vega-VCL-Event-System) sprachseitig komplett, ELF + LyxOS.
