@@ -487,6 +487,7 @@ Statement           = Block
                     | BreakStmt
                     | ContinueStmt
                     | DeferStmt
+                    | AsmStmt
                     | ExprStmt ;
 
 TupleUnpackStmt     = "var"
@@ -587,7 +588,32 @@ ContinueStmt        = "continue" ";" ;
 
 DeferStmt           = "defer" Statement ;
 
+AsmStmt             = "asm" "{" { StringLiteral } "}" ;
+
 ExprStmt            = Expr ";" ;
+```
+
+## 12.2 Inline-Assembly Rule (WSP-05)
+
+```text
+"asm" is a soft keyword: it is recognized as AsmStmt only when an identifier
+token with text "asm" appears in statement position and is immediately followed
+by "{". Otherwise "asm" remains a normal identifier.
+
+Each StringLiteral in the block is one instruction mnemonic. The accepted
+mnemonic set is ARCHITECTURE-SPECIFIC (chosen by the compilation --target):
+
+    x86-64 / lyxos : cli sti hlt nop pause cpuid iretq wbinvd invd sfence
+                     lfence mfence rdtsc ud2 int3 leave ret
+                     "lgdt [rdi]" "lidt [rdi]" "invlpg [rdi]"
+    arm64          : nop wfi wfe sev sevl yield isb dsb dmb svc brk hlt ret eret
+    arm-cm4 (Thumb): nop wfi wfe sev yield isb dsb dmb svc bkpt "cpsid i" "cpsie i"
+    riscv (linux)  : nop wfi fence fence.i ecall ebreak mret sret
+    xtensa (esp32) : nop
+
+A mnemonic not in the target's set is a hard compile error (no silent NOP).
+Mnemonics from a different architecture are therefore rejected. The block is
+never removed by optimization (each instruction has a side effect).
 ```
 
 ## 12.1 If/Else Binding Rule
