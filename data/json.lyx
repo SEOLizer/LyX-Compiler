@@ -342,6 +342,86 @@ fn _jSetCell(df: DataFrame, row: int64, keyPtr: int64, keyLen: int64, v: JVal, s
 }
 
 // Parse one `{...}` object as a DataFrame row (already appended as `row`).
+// Parse a JSON array value at p.pos ('[') into a List column df[<key>, row].
+// The element type is inferred from the array's scalar contents (any string ->
+// List<Utf8>, else any float -> List<Float64>, else List<Int64>). Nested array/
+// object elements are skipped. The column is created on first occurrence.
+fn _jParseArrayToList(p: JParser, df: DataFrame, row: int64, keyPtr: int64, keyLen: int64) {
+  p.pos := p.pos + 1;  // consume '['
+  var iv: Buffer := BufferNew(64);      // int values (ints; floats truncated)
+  var fv: Buffer := BufferNew(64);      // f64 bits (ints promoted)
+  var soff: Buffer := BufferNew(64);    // per-element offset into sbytes
+  var slen: Buffer := BufferNew(64);    // per-element string length
+  var sbytes: Buffer := BufferNew(64);  // concatenated string bytes
+  var sb: Buffer := BufferNew(32);      // scratch for element strings
+  var v: JVal;
+  var n: int64 := 0;
+  var hasFloat: int64 := 0;
+  var hasStr: int64 := 0;
+  var done: int64 := 0;
+  while (done == 0) {
+    _jSkipWs(p);
+    if (p.pos >= p.len) { done := 1; }
+    else {
+      var c: int64 := peek8(p.raw + p.pos) & 255;
+      if (c == 93) { p.pos := p.pos + 1; done := 1; }              // ']'
+      else if (c == 44) { p.pos := p.pos + 1; }                   // ','
+      else if (c == 91 || c == 123) { _jSkipContainer(p); }       // nested element: skip
+      else {
+        _jParseValue(p, sb, v);
+        if (v.kind == 3) {                                        // string
+          hasStr := 1;
+          BufferPushInt64(soff, sbytes.len);
+          BufferPushInt64(slen, sb.len);
+          if (sb.len > 0) { BufferPushBytes(sbytes, sb.data, sb.len); }
+          BufferPushInt64(iv, 0); BufferPushFloat64(fv, 0.0);
+        } else if (v.kind == 2) {                                 // float
+          hasFloat := 1;
+          BufferPushFloat64(fv, v.fval); BufferPushInt64(iv, v.fval as int64);
+          BufferPushInt64(soff, 0); BufferPushInt64(slen, 0);
+        } else if (v.kind == 1) {                                 // int
+          BufferPushInt64(iv, v.ival); BufferPushFloat64(fv, v.ival as f64);
+          BufferPushInt64(soff, 0); BufferPushInt64(slen, 0);
+        } else {                                                  // null/unsupported
+          BufferPushInt64(iv, 0); BufferPushFloat64(fv, 0.0);
+          BufferPushInt64(soff, 0); BufferPushInt64(slen, 0);
+        }
+        n := n + 1;
+      }
+    }
+  }
+  // Element type: prefer the existing column's, else infer.
+  var col: int64 := DataFrameColByName(df, keyPtr, keyLen);
+  if (col < 0) {
+    var elemT: int64 := DT_INT64;
+    if (hasStr != 0) { elemT := DT_UTF8; }
+    else if (hasFloat != 0) { elemT := DT_FLOAT64; }
+    var nm: int64 := mmap(0, keyLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (keyLen > 0) { memcpy(nm, keyPtr, keyLen); }
+    col := DataFrameAddColumn(df, nm, keyLen, dtList(dtBox(dtNew(elemT))), 1);
+  }
+  var celem: DataType := dtUnbox(df.columns[col].field.dtype.child);
+  var cet: int64 := celem.id;
+  if (cet == DT_UTF8) {
+    var ptrs: int64 := mmap(0, (n + 1) * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var lens: int64 := mmap(0, (n + 1) * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var i: int64 := 0;
+    while (i < n) {
+      poke64(ptrs + i * 8, sbytes.data + BufferGetInt64(soff, i));
+      poke64(lens + i * 8, BufferGetInt64(slen, i));
+      i := i + 1;
+    }
+    DataFrameSetListUtf8(df, col, row, ptrs, lens, n);
+    munmap(ptrs, (n + 1) * 8); munmap(lens, (n + 1) * 8);
+  } else if (cet == DT_FLOAT64) {
+    DataFrameSetListFloat64(df, col, row, fv.data, n);
+  } else {
+    DataFrameSetListInt64(df, col, row, iv.data, n);
+  }
+  BufferFree(iv); BufferFree(fv); BufferFree(soff);
+  BufferFree(slen); BufferFree(sbytes); BufferFree(sb);
+}
+
 fn _jParseObjectRow(p: JParser, df: DataFrame, row: int64, keyBuf: Buffer, strBuf: Buffer) {
   p.pos := p.pos + 1;  // consume '{'
   var v: JVal;
@@ -358,8 +438,13 @@ fn _jParseObjectRow(p: JParser, df: DataFrame, row: int64, keyBuf: Buffer, strBu
         _jParseString(p, keyBuf);
         _jSkipWs(p);
         if (p.pos < p.len && (peek8(p.raw + p.pos) & 255) == 58) { p.pos := p.pos + 1; }  // ':'
-        _jParseValue(p, strBuf, v);
-        _jSetCell(df, row, keyBuf.data, keyBuf.len, v, strBuf);
+        _jSkipWs(p);
+        if (p.pos < p.len && (peek8(p.raw + p.pos) & 255) == 91) {  // '[' -> List column
+          _jParseArrayToList(p, df, row, keyBuf.data, keyBuf.len);
+        } else {
+          _jParseValue(p, strBuf, v);
+          _jSetCell(df, row, keyBuf.data, keyBuf.len, v, strBuf);
+        }
       } else { p.pos := p.pos + 1; }
     }
   }
