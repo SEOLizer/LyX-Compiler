@@ -1,0 +1,259 @@
+// Lyx Data Library - L3 Operations (Batch 1)
+// Row/column operations over the typed columnar DataFrame (data.frame).
+//
+// These are the high-frequency table operations — aggregation, filtering,
+// projection, slicing — reimplemented on the typed, null-aware L2 API instead
+// of data.core's raw int64 layout. Later batches add sort, group-by, join and
+// reshape.
+//
+// Design notes:
+//   - Operations that produce a new table clone the source schema (same column
+//     names, types, nullability) and copy rows through the typed accessors, so
+//     NULLs, f64 bits and Utf8 payloads all survive correctly.
+//   - Cell copying dispatches on the column's DataType, keeping the operations
+//     themselves type-agnostic.
+
+@description("L3 operations for the Lyx data framework (aggregate, filter, select, slice)")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit data.ops;
+
+import data.kernel;
+import data.frame;
+
+// Comparison operators for filtering.
+pub con OP_EQ: int64 := 1;
+pub con OP_NE: int64 := 2;
+pub con OP_LT: int64 := 3;
+pub con OP_LE: int64 := 4;
+pub con OP_GT: int64 := 5;
+pub con OP_GE: int64 := 6;
+
+// ============================================================================
+// Schema / row copying
+// ============================================================================
+
+// Create an empty DataFrame with the same columns (name, type, nullability) as
+// `src`. The result has zero rows.
+pub fn DataFrameCloneSchema(src: DataFrame): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  var i: int64 := 0;
+  while (i < src.colCount) {
+    DataFrameAddColumn(dst,
+      src.columns[i].field.name,
+      src.columns[i].field.nameLen,
+      src.columns[i].field.dtype,
+      src.columns[i].field.nullable);
+    i := i + 1;
+  }
+  return dst;
+}
+
+// Copy a single cell (respecting type and NULL) from src[srcCol,srcRow] to
+// dst[dstCol,dstRow]. dst must already have that row.
+fn _copyCell(dst: DataFrame, dstCol: int64, dstRow: int64,
+             src: DataFrame, srcCol: int64, srcRow: int64) {
+  if (DataFrameIsValid(src, srcCol, srcRow) == 0) {
+    DataFrameSetNull(dst, dstCol, dstRow);
+    return;
+  }
+  var t: int64 := DataFrameColType(src, srcCol);
+  if (t == DT_FLOAT64) {
+    DataFrameSetFloat64(dst, dstCol, dstRow, DataFrameGetFloat64(src, srcCol, srcRow));
+  } else if (t == DT_UTF8) {
+    var ptr: int64 := DataFrameGetUtf8Ptr(src, srcCol, srcRow);
+    var len: int64 := DataFrameGetUtf8Len(src, srcCol, srcRow);
+    DataFrameSetUtf8(dst, dstCol, dstRow, ptr, len);
+  } else {
+    // int64, bool, timestamp — all plain 8-byte slots
+    DataFrameSetInt64(dst, dstCol, dstRow, DataFrameGetInt64(src, srcCol, srcRow));
+  }
+}
+
+// Append src's row `srcRow` to `dst` (which must share src's schema), copying
+// every column with the correct type. Returns the new row index, or -1.
+pub fn DataFrameAppendRowFrom(dst: DataFrame, src: DataFrame, srcRow: int64): int64 {
+  var row: int64 := DataFrameAppendRow(dst);
+  if (row < 0) { return -1; }
+  var c: int64 := 0;
+  while (c < src.colCount) {
+    _copyCell(dst, c, row, src, c, srcRow);
+    c := c + 1;
+  }
+  return row;
+}
+
+// ============================================================================
+// Aggregation (NULL-aware)
+// ============================================================================
+
+// Sum of a column's valid int64 cells.
+pub fn DataFrameSumInt64(df: DataFrame, col: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnSumInt64(df.columns[col]);
+}
+
+// Sum of a column's valid f64 cells.
+pub fn DataFrameSumFloat64(df: DataFrame, col: int64): f64 {
+  if (col < 0 || col >= df.colCount) { return 0.0; }
+  return ColumnSumFloat64(df.columns[col]);
+}
+
+// Count of non-NULL cells in a column.
+pub fn DataFrameCountValid(df: DataFrame, col: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnCountValid(df.columns[col]);
+}
+
+// Mean of a column as f64 (works for int64 or f64 columns). Returns 0.0 for an
+// all-NULL / empty column. NULLs are excluded from both sum and count.
+pub fn DataFrameMeanF64(df: DataFrame, col: int64): f64 {
+  if (col < 0 || col >= df.colCount) { return 0.0; }
+  var n: int64 := ColumnCountValid(df.columns[col]);
+  if (n == 0) { return 0.0; }
+  var t: int64 := DataFrameColType(df, col);
+  // NOTE: a division with two inline `as f64` casts as both operands miscompiles
+  // (codegen register bug in this compiler). Bind each operand to an f64 var.
+  var nf: f64 := n as f64;
+  if (t == DT_FLOAT64) {
+    var sumF: f64 := ColumnSumFloat64(df.columns[col]);
+    return sumF / nf;
+  }
+  var sumI: f64 := ColumnSumInt64(df.columns[col]) as f64;
+  return sumI / nf;
+}
+
+// Minimum of a column's valid int64 cells. `found` (int64*) is set to 1 if any
+// valid cell existed, 0 otherwise; the return value is 0 when none.
+pub fn DataFrameMinInt64(df: DataFrame, col: int64, found: int64): int64 {
+  poke64(found, 0);
+  if (col < 0 || col >= df.colCount) { return 0; }
+  var c: Column := df.columns[col];
+  var best: int64 := 0;
+  var have: int64 := 0;
+  var i: int64 := 0;
+  while (i < c.length) {
+    if (ColumnIsValid(c, i) != 0) {
+      var v: int64 := ColumnGetInt64(c, i);
+      if (have == 0 || v < best) { best := v; have := 1; }
+    }
+    i := i + 1;
+  }
+  poke64(found, have);
+  return best;
+}
+
+// Maximum of a column's valid int64 cells (see DataFrameMinInt64 for `found`).
+pub fn DataFrameMaxInt64(df: DataFrame, col: int64, found: int64): int64 {
+  poke64(found, 0);
+  if (col < 0 || col >= df.colCount) { return 0; }
+  var c: Column := df.columns[col];
+  var best: int64 := 0;
+  var have: int64 := 0;
+  var i: int64 := 0;
+  while (i < c.length) {
+    if (ColumnIsValid(c, i) != 0) {
+      var v: int64 := ColumnGetInt64(c, i);
+      if (have == 0 || v > best) { best := v; have := 1; }
+    }
+    i := i + 1;
+  }
+  poke64(found, have);
+  return best;
+}
+
+// ============================================================================
+// Filtering
+// ============================================================================
+
+fn _cmpInt64(a: int64, op: int64, b: int64): int64 {
+  if (op == OP_EQ) { if (a == b) { return 1; } return 0; }
+  if (op == OP_NE) { if (a != b) { return 1; } return 0; }
+  if (op == OP_LT) { if (a < b)  { return 1; } return 0; }
+  if (op == OP_LE) { if (a <= b) { return 1; } return 0; }
+  if (op == OP_GT) { if (a > b)  { return 1; } return 0; }
+  if (op == OP_GE) { if (a >= b) { return 1; } return 0; }
+  return 0;
+}
+
+// Return a new DataFrame containing the rows where the int64 column `col`
+// satisfies `col <op> value`. NULL cells never match. The full schema is kept.
+pub fn DataFrameFilterInt64(src: DataFrame, col: int64, op: int64, value: int64): DataFrame {
+  var dst: DataFrame := DataFrameCloneSchema(src);
+  if (col < 0 || col >= src.colCount) { return dst; }
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    if (DataFrameIsValid(src, col, r) != 0) {
+      if (_cmpInt64(DataFrameGetInt64(src, col, r), op, value) != 0) {
+        DataFrameAppendRowFrom(dst, src, r);
+      }
+    }
+    r := r + 1;
+  }
+  return dst;
+}
+
+// ============================================================================
+// Projection / slicing
+// ============================================================================
+
+// Return a new DataFrame with only the columns listed in `colIdx` (an int64
+// array of `n` column indices), in the given order, with all rows.
+pub fn DataFrameSelect(src: DataFrame, colIdx: int64, n: int64): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  // Build the projected schema.
+  var i: int64 := 0;
+  while (i < n) {
+    var ci: int64 := peek64(colIdx + i * 8);
+    if (ci >= 0 && ci < src.colCount) {
+      DataFrameAddColumn(dst,
+        src.columns[ci].field.name,
+        src.columns[ci].field.nameLen,
+        src.columns[ci].field.dtype,
+        src.columns[ci].field.nullable);
+    }
+    i := i + 1;
+  }
+  // Copy rows, projecting the selected columns.
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    var row: int64 := DataFrameAppendRow(dst);
+    var k: int64 := 0;
+    while (k < n) {
+      var ci: int64 := peek64(colIdx + k * 8);
+      if (ci >= 0 && ci < src.colCount) {
+        _copyCell(dst, k, row, src, ci, r);
+      }
+      k := k + 1;
+    }
+    r := r + 1;
+  }
+  return dst;
+}
+
+// Rows [start, end) of `src` as a new DataFrame (clamped to valid range).
+pub fn DataFrameSlice(src: DataFrame, start: int64, end: int64): DataFrame {
+  var dst: DataFrame := DataFrameCloneSchema(src);
+  var s: int64 := start;
+  var e: int64 := end;
+  if (s < 0) { s := 0; }
+  if (e > src.rowCount) { e := src.rowCount; }
+  var r: int64 := s;
+  while (r < e) {
+    DataFrameAppendRowFrom(dst, src, r);
+    r := r + 1;
+  }
+  return dst;
+}
+
+// First `n` rows.
+pub fn DataFrameHead(src: DataFrame, n: int64): DataFrame {
+  return DataFrameSlice(src, 0, n);
+}
+
+// Last `n` rows.
+pub fn DataFrameTail(src: DataFrame, n: int64): DataFrame {
+  var start: int64 := src.rowCount - n;
+  if (start < 0) { start := 0; }
+  return DataFrameSlice(src, start, src.rowCount);
+}
