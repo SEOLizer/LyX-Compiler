@@ -515,3 +515,123 @@ pub fn DataFrameJoinLeft(left: DataFrame, leftKey: int64,
   }
   return dst;
 }
+
+// ============================================================================
+// Reshape (melt / pivot)
+// ============================================================================
+
+// Copy `n` bytes into a fresh, stable heap allocation and return the pointer.
+// Used to give pivot output columns names that outlive the source frame.
+fn _dupBytes(src: int64, n: int64): int64 {
+  var sz: int64 := n;
+  if (sz < 1) { sz := 1; }
+  var p: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (p < 0) { return 0; }
+  if (n > 0) { memcpy(p, src, n); }
+  return p;
+}
+
+// Melt (wide -> long): keep the `nId` identifier columns (idIdx) and unpivot the
+// `nVal` int64 value columns (valIdx) into two columns, "variable" (Utf8, the
+// source column name) and "value" (int64). One output row per (source row,
+// value column). NULL value cells stay NULL. Value columns must be int64.
+pub fn DataFrameMeltInt64(src: DataFrame, idIdx: int64, nId: int64,
+                          valIdx: int64, nVal: int64): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  // Identifier columns, preserved.
+  var i: int64 := 0;
+  while (i < nId) {
+    var ci: int64 := peek64(idIdx + i * 8);
+    if (ci >= 0 && ci < src.colCount) {
+      DataFrameAddColumn(dst,
+        src.columns[ci].field.name, src.columns[ci].field.nameLen,
+        src.columns[ci].field.dtype, 1);
+    }
+    i := i + 1;
+  }
+  var varCol: int64 := DataFrameAddColumn(dst, "variable", 8, dtNew(DT_UTF8), 1);
+  var valCol: int64 := DataFrameAddColumn(dst, "value", 5, dtNew(DT_INT64), 1);
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    var v: int64 := 0;
+    while (v < nVal) {
+      var vc: int64 := peek64(valIdx + v * 8);
+      if (vc >= 0 && vc < src.colCount) {
+        var row: int64 := DataFrameAppendRow(dst);
+        var k: int64 := 0;
+        while (k < nId) {
+          var ci2: int64 := peek64(idIdx + k * 8);
+          if (ci2 >= 0 && ci2 < src.colCount) {
+            _copyCell(dst, k, row, src, ci2, r);
+          }
+          k := k + 1;
+        }
+        DataFrameSetUtf8(dst, varCol, row,
+          src.columns[vc].field.name, src.columns[vc].field.nameLen);
+        if (DataFrameIsValid(src, vc, r) != 0) {
+          DataFrameSetInt64(dst, valCol, row, DataFrameGetInt64(src, vc, r));
+        }
+      }
+      v := v + 1;
+    }
+    r := r + 1;
+  }
+  return dst;
+}
+
+// Pivot (long -> wide): one output row per distinct int64 `indexCol` value; the
+// distinct Utf8 `pivotCol` strings become int64 columns filled from `valueCol`.
+// Cells with no matching source row stay NULL. Later duplicates for the same
+// (index, pivot) cell overwrite earlier ones.
+pub fn DataFramePivotUtf8(src: DataFrame, indexCol: int64, pivotCol: int64, valueCol: int64): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  if (indexCol < 0 || indexCol >= src.colCount) { return dst; }
+  if (pivotCol < 0 || pivotCol >= src.colCount) { return dst; }
+  if (valueCol < 0 || valueCol >= src.colCount) { return dst; }
+  // Index column (col 0), same name/type as the source index.
+  var idxc: int64 := DataFrameAddColumn(dst,
+    src.columns[indexCol].field.name, src.columns[indexCol].field.nameLen,
+    src.columns[indexCol].field.dtype, 1);
+  // Pass 1: create one int64 column per distinct pivot string (names duplicated
+  // into stable storage so they outlive `src`).
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    if (DataFrameIsValid(src, pivotCol, r) != 0) {
+      var pptr: int64 := DataFrameGetUtf8Ptr(src, pivotCol, r);
+      var plen: int64 := DataFrameGetUtf8Len(src, pivotCol, r);
+      if (DataFrameColByName(dst, pptr, plen) < 0) {
+        DataFrameAddColumn(dst, _dupBytes(pptr, plen), plen, dtNew(DT_INT64), 1);
+      }
+    }
+    r := r + 1;
+  }
+  // Pass 2: one row per distinct index value.
+  var r2: int64 := 0;
+  while (r2 < src.rowCount) {
+    if (DataFrameIsValid(src, indexCol, r2) != 0) {
+      var iv: int64 := DataFrameGetInt64(src, indexCol, r2);
+      if (_findKeyRow(dst, idxc, iv) < 0) {
+        var er: int64 := DataFrameAppendRow(dst);
+        DataFrameSetInt64(dst, idxc, er, iv);
+      }
+    }
+    r2 := r2 + 1;
+  }
+  // Pass 3: scatter values into [index row, pivot column].
+  var r3: int64 := 0;
+  while (r3 < src.rowCount) {
+    if (DataFrameIsValid(src, indexCol, r3) != 0 && DataFrameIsValid(src, pivotCol, r3) != 0) {
+      if (DataFrameIsValid(src, valueCol, r3) != 0) {
+        var iv2: int64 := DataFrameGetInt64(src, indexCol, r3);
+        var er2: int64 := _findKeyRow(dst, idxc, iv2);
+        var pc: int64 := DataFrameColByName(dst,
+          DataFrameGetUtf8Ptr(src, pivotCol, r3), DataFrameGetUtf8Len(src, pivotCol, r3));
+        if (er2 >= 0 && pc >= 0) {
+          DataFrameSetInt64(dst, pc, er2, DataFrameGetInt64(src, valueCol, r3));
+        }
+      }
+    }
+    r3 := r3 + 1;
+  }
+  return dst;
+}
