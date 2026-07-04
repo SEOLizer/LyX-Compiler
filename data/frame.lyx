@@ -1,0 +1,286 @@
+// Lyx Data Library - L2 Structure
+// Typed, null-aware columnar tables built on the L1 kernel primitives.
+//
+// This layer turns the raw Buffer/Bitmap/DataType primitives into the objects
+// higher layers (operations, IO) actually work with:
+//   - Field:     a named, typed, nullable column descriptor
+//   - Column:    values (Buffer) + validity (Bitmap) + Field, kept in lockstep
+//   - DataFrame: a growable Array<Column> plus row bookkeeping
+//
+// Design notes:
+//   - Lyx structs have REFERENCE semantics (a struct variable is a heap object;
+//     a nested struct field holds a pointer to another object). So a Column's
+//     `values`/`validity` are assigned whole (`c.values := BufferNew(...)`),
+//     never filled field-by-field into an unallocated slot.
+//   - Columns live inline in an Array<Column> (16-byte [cap|len] header, then
+//     sizeof(Column)-byte elements). Each element stores pointers to its Field/
+//     Buffer/Bitmap, so growing the array (mmap+memcpy) never disturbs them.
+//   - There is exactly ONE length per column (Column.length, mirrored by the
+//     Buffer/Bitmap element counts). No duplicated bookkeeping — the source of
+//     the data.core Series double-truth bug is gone.
+//   - Rectangular by construction: DataFrameAppendRow extends every column with
+//     a NULL cell, and DataFrameAddColumn back-fills existing rows with NULLs.
+//   - This first cut covers int64 + NULL columns. Float64/Utf8/nested List land
+//     in the next increment; the DataType tag is already carried per column.
+
+@description("L2 typed columnar structures for the Lyx data framework (Field, Column, DataFrame)")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit data.frame;
+
+import data.kernel;
+
+// ============================================================================
+// Field — named, typed, nullable column descriptor
+// ============================================================================
+
+pub type Field = struct {
+  name: int64;        // pchar (column name)
+  nameLen: int64;     // byte length of name
+  dtype: DataType;    // reference to the column's type descriptor
+  nullable: int64;    // 1 = may contain NULLs, 0 = not
+};
+
+pub fn FieldNew(name: int64, nameLen: int64, dtype: DataType, nullable: int64): Field {
+  var f: Field;
+  f.name := name;
+  f.nameLen := nameLen;
+  f.dtype := dtype;
+  f.nullable := nullable;
+  return f;
+}
+
+// ============================================================================
+// Column — values + validity + descriptor, always the same length
+// ============================================================================
+
+pub type Column = struct {
+  field: Field;        // name + type + nullability
+  values: Buffer;      // fixed-width int64 slots (float bits / handles later)
+  validity: Bitmap;    // per-element NULL mask (1 = valid)
+  length: int64;       // logical element count (single source of truth)
+};
+
+// Initialise a Column *in place* through a reference (e.g. an Array<Column>
+// slot whose pointers are still zero). Uses whole-struct assignment for the
+// nested Buffer/Bitmap/Field, per Lyx reference semantics.
+fn _columnInit(c: Column, name: int64, nameLen: int64, dtype: DataType, nullable: int64, cap: int64) {
+  c.field := FieldNew(name, nameLen, dtype, nullable);
+  c.values := BufferNew(cap * 8);   // 8 bytes per int64 slot
+  c.validity := BitmapNew(cap);
+  c.length := 0;
+}
+
+// Construct a standalone Column.
+pub fn ColumnNew(name: int64, nameLen: int64, dtype: DataType, nullable: int64, cap: int64): Column {
+  var c: Column;
+  _columnInit(c, name, nameLen, dtype, nullable, cap);
+  return c;
+}
+
+// Append an int64 value (marked valid). Returns 1 on success, 0 on OOM.
+pub fn ColumnAppendInt64(c: Column, value: int64): int64 {
+  if (BufferPushInt64(c.values, value) == 0) { return 0; }
+  if (BitmapAppend(c.validity, 1) == 0) { return 0; }
+  c.length := c.length + 1;
+  return 1;
+}
+
+// Append a NULL cell (slot still occupies space so indices stay aligned).
+pub fn ColumnAppendNull(c: Column): int64 {
+  if (BufferPushInt64(c.values, 0) == 0) { return 0; }
+  if (BitmapAppend(c.validity, 0) == 0) { return 0; }
+  c.length := c.length + 1;
+  return 1;
+}
+
+// Read the int64 at `idx`. Returns 0 if out of range; use ColumnIsValid to
+// distinguish a real 0 from NULL.
+pub fn ColumnGetInt64(c: Column, idx: int64): int64 {
+  return BufferGetInt64(c.values, idx);
+}
+
+// 1 if the cell at `idx` holds a real value, 0 if NULL / out of range.
+pub fn ColumnIsValid(c: Column, idx: int64): int64 {
+  return BitmapGet(c.validity, idx);
+}
+
+// Overwrite `idx` with an int64 value and mark it valid. Returns 1 on success,
+// 0 if out of range.
+pub fn ColumnSetInt64(c: Column, idx: int64, value: int64): int64 {
+  if (BufferSetInt64(c.values, idx, value) == 0) { return 0; }
+  BitmapSet(c.validity, idx, 1);
+  return 1;
+}
+
+// Mark `idx` as NULL (value left in place but reported invalid).
+pub fn ColumnSetNull(c: Column, idx: int64) {
+  BitmapSet(c.validity, idx, 0);
+}
+
+// Count of non-NULL cells.
+pub fn ColumnCountValid(c: Column): int64 {
+  return BitmapCountValid(c.validity);
+}
+
+// Sum of the valid int64 cells (NULLs skipped).
+pub fn ColumnSumInt64(c: Column): int64 {
+  var sum: int64 := 0;
+  var i: int64 := 0;
+  while (i < c.length) {
+    if (BitmapGet(c.validity, i) != 0) {
+      sum := sum + BufferGetInt64(c.values, i);
+    }
+    i := i + 1;
+  }
+  return sum;
+}
+
+pub fn ColumnFree(c: Column) {
+  BufferFree(c.values);
+  BitmapFree(c.validity);
+}
+
+// ============================================================================
+// DataFrame — a growable set of equal-length columns
+// ============================================================================
+
+pub type DataFrame = struct {
+  columns: Array<Column>;  // inline Column elements (16-byte header + N*size)
+  colCount: int64;         // number of columns in use
+  colCap: int64;           // element capacity of the columns array
+  rowCount: int64;         // rows (every column has exactly this many cells)
+};
+
+// Allocate an Array<Column> region: 16-byte [cap|len] header + cap elements.
+// Returns 0 on OOM.
+fn _allocColumnArray(cap: int64): int64 {
+  var mem: int64 := mmap(0, cap * sizeof(Column) + 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (mem < 0) { return 0; }
+  poke64(mem + 0, cap);   // header: capacity
+  poke64(mem + 8, 0);     // header: length
+  return mem;
+}
+
+pub fn DataFrameNew(): DataFrame {
+  var df: DataFrame;
+  df.colCap := 8;
+  df.columns := _allocColumnArray(df.colCap);
+  df.colCount := 0;
+  df.rowCount := 0;
+  return df;
+}
+
+// Double the column array, preserving the header and the inline elements.
+fn _dfGrowCols(df: DataFrame) {
+  var newCap: int64 := df.colCap * 2;
+  var nb: int64 := _allocColumnArray(newCap);
+  if (nb == 0) { return; }
+  poke64(nb + 8, df.colCount);  // carry the length
+  memcpy(nb + 16, df.columns + 16, df.colCount * sizeof(Column));
+  munmap(df.columns, df.colCap * sizeof(Column) + 16);
+  df.columns := nb;
+  df.colCap := newCap;
+}
+
+// Add a column. Existing rows are back-filled with NULLs so the table stays
+// rectangular. Returns the new column index, or -1 on failure.
+pub fn DataFrameAddColumn(df: DataFrame, name: int64, nameLen: int64, dtype: DataType, nullable: int64): int64 {
+  if (df.colCount >= df.colCap) {
+    _dfGrowCols(df);
+    if (df.colCount >= df.colCap) { return -1; }  // grow failed (OOM)
+  }
+  _columnInit(df.columns[df.colCount], name, nameLen, dtype, nullable, 16);
+  // Back-fill existing rows so the new column has one cell per current row.
+  var r: int64 := 0;
+  while (r < df.rowCount) {
+    ColumnAppendNull(df.columns[df.colCount]);
+    r := r + 1;
+  }
+  df.colCount := df.colCount + 1;
+  poke64(df.columns + 8, df.colCount);  // keep Array header length in sync
+  return df.colCount - 1;
+}
+
+// Append a row: extend every column with a NULL cell. Returns the new row
+// index, or -1 if any column failed to grow.
+pub fn DataFrameAppendRow(df: DataFrame): int64 {
+  var i: int64 := 0;
+  while (i < df.colCount) {
+    if (ColumnAppendNull(df.columns[i]) == 0) { return -1; }
+    i := i + 1;
+  }
+  df.rowCount := df.rowCount + 1;
+  return df.rowCount - 1;
+}
+
+// --- Typed cell access by column index -------------------------------------
+
+pub fn DataFrameSetInt64(df: DataFrame, col: int64, row: int64, value: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnSetInt64(df.columns[col], row, value);
+}
+
+pub fn DataFrameGetInt64(df: DataFrame, col: int64, row: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnGetInt64(df.columns[col], row);
+}
+
+pub fn DataFrameIsValid(df: DataFrame, col: int64, row: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnIsValid(df.columns[col], row);
+}
+
+pub fn DataFrameSetNull(df: DataFrame, col: int64, row: int64) {
+  if (col < 0 || col >= df.colCount) { return; }
+  ColumnSetNull(df.columns[col], row);
+}
+
+// --- Column lookup by name -------------------------------------------------
+
+// Byte-compare two names (pchar + length). Returns 1 if equal.
+fn _nameEq(a: int64, aLen: int64, b: int64, bLen: int64): int64 {
+  if (aLen != bLen) { return 0; }
+  var i: int64 := 0;
+  while (i < aLen) {
+    if ((peek8(a + i) & 255) != (peek8(b + i) & 255)) { return 0; }
+    i := i + 1;
+  }
+  return 1;
+}
+
+// Index of the column named `name`, or -1 if absent.
+pub fn DataFrameColByName(df: DataFrame, name: int64, nameLen: int64): int64 {
+  var i: int64 := 0;
+  while (i < df.colCount) {
+    if (_nameEq(df.columns[i].field.name, df.columns[i].field.nameLen, name, nameLen) != 0) {
+      return i;
+    }
+    i := i + 1;
+  }
+  return -1;
+}
+
+// --- Introspection ---------------------------------------------------------
+
+pub fn DataFrameColCount(df: DataFrame): int64 { return df.colCount; }
+pub fn DataFrameRowCount(df: DataFrame): int64 { return df.rowCount; }
+
+// DataType id of a column (DT_* from data.kernel), or DT_NULL if out of range.
+pub fn DataFrameColType(df: DataFrame, col: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return DT_NULL; }
+  return df.columns[col].field.dtype.id;
+}
+
+pub fn DataFrameFree(df: DataFrame) {
+  var i: int64 := 0;
+  while (i < df.colCount) {
+    ColumnFree(df.columns[i]);
+    i := i + 1;
+  }
+  munmap(df.columns, df.colCap * sizeof(Column) + 16);
+  df.columns := 0;
+  df.colCount := 0;
+  df.colCap := 0;
+  df.rowCount := 0;
+}
