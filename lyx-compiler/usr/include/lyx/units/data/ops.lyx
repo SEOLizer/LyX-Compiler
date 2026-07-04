@@ -257,3 +257,163 @@ pub fn DataFrameTail(src: DataFrame, n: int64): DataFrame {
   if (start < 0) { start := 0; }
   return DataFrameSlice(src, start, src.rowCount);
 }
+
+// ============================================================================
+// Sorting
+// ============================================================================
+
+// Ordering predicate for two rows by an int64 column. Returns 1 if row `a`
+// should come strictly before row `b`. NULLs sort last (regardless of `asc`).
+fn _rowLessInt64(src: DataFrame, col: int64, asc: int64, a: int64, b: int64): int64 {
+  var va: int64 := DataFrameIsValid(src, col, a);
+  var vb: int64 := DataFrameIsValid(src, col, b);
+  if (va == 0 && vb == 0) { return 0; }  // both NULL: keep order (stable)
+  if (va == 0) { return 0; }             // a NULL -> after b
+  if (vb == 0) { return 1; }             // b NULL -> a before
+  var x: int64 := DataFrameGetInt64(src, col, a);
+  var y: int64 := DataFrameGetInt64(src, col, b);
+  if (asc != 0) {
+    if (x < y) { return 1; }
+    return 0;
+  }
+  if (x > y) { return 1; }
+  return 0;
+}
+
+// Stable bottom-up merge sort of the row-index array `idx` (n entries) by an
+// int64 column. `tmp` is scratch of the same size. O(n log n), no recursion.
+fn _mergeSortRows(src: DataFrame, col: int64, asc: int64, idx: int64, tmp: int64, n: int64) {
+  var width: int64 := 1;
+  while (width < n) {
+    var i: int64 := 0;
+    while (i < n) {
+      var left: int64 := i;
+      var mid: int64 := i + width;
+      if (mid > n) { mid := n; }
+      var right: int64 := i + width * 2;
+      if (right > n) { right := n; }
+      var a: int64 := left;
+      var b: int64 := mid;
+      var k: int64 := left;
+      while (a < mid && b < right) {
+        // Take from the left run unless the right element is strictly less
+        // (preserves stability).
+        if (_rowLessInt64(src, col, asc, peek64(idx + b * 8), peek64(idx + a * 8)) != 0) {
+          poke64(tmp + k * 8, peek64(idx + b * 8));
+          b := b + 1;
+        } else {
+          poke64(tmp + k * 8, peek64(idx + a * 8));
+          a := a + 1;
+        }
+        k := k + 1;
+      }
+      while (a < mid) { poke64(tmp + k * 8, peek64(idx + a * 8)); a := a + 1; k := k + 1; }
+      while (b < right) { poke64(tmp + k * 8, peek64(idx + b * 8)); b := b + 1; k := k + 1; }
+      i := i + width * 2;
+    }
+    memcpy(idx, tmp, n * 8);
+    width := width * 2;
+  }
+}
+
+// Return a new DataFrame with the rows sorted by int64 column `col`
+// (ascending != 0 for ascending, else descending). NULLs are placed last.
+// Stable. Full schema preserved.
+pub fn DataFrameSortByInt64(src: DataFrame, col: int64, ascending: int64): DataFrame {
+  var dst: DataFrame := DataFrameCloneSchema(src);
+  var n: int64 := src.rowCount;
+  if (n <= 0) { return dst; }
+  // Build the identity index [0, n).
+  var idx: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (idx < 0) { return dst; }
+  var i: int64 := 0;
+  while (i < n) { poke64(idx + i * 8, i); i := i + 1; }
+  // Sort unless the column is invalid (then keep original order).
+  if (col >= 0 && col < src.colCount) {
+    var tmp: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (tmp >= 0) {
+      _mergeSortRows(src, col, ascending, idx, tmp, n);
+      munmap(tmp, n * 8);
+    }
+  }
+  // Materialise rows in sorted order.
+  var j: int64 := 0;
+  while (j < n) {
+    DataFrameAppendRowFrom(dst, src, peek64(idx + j * 8));
+    j := j + 1;
+  }
+  munmap(idx, n * 8);
+  return dst;
+}
+
+// ============================================================================
+// Group-by (int64 key)
+// ============================================================================
+
+// Index of the row in `df` whose int64 column `keyCol` equals `key`, or -1.
+fn _findKeyRow(df: DataFrame, keyCol: int64, key: int64): int64 {
+  var r: int64 := 0;
+  while (r < df.rowCount) {
+    if (DataFrameIsValid(df, keyCol, r) != 0) {
+      if (DataFrameGetInt64(df, keyCol, r) == key) { return r; }
+    }
+    r := r + 1;
+  }
+  return -1;
+}
+
+// Group `src` by the int64 column `keyCol` and sum the int64 column `valCol`
+// per group. Result has two columns: the key (named after keyCol) and "sum".
+// Rows with a NULL key are skipped; NULL values contribute nothing.
+pub fn DataFrameGroupBySumInt64(src: DataFrame, keyCol: int64, valCol: int64): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  if (keyCol < 0 || keyCol >= src.colCount) { return dst; }
+  var kc: int64 := DataFrameAddColumn(dst,
+    src.columns[keyCol].field.name, src.columns[keyCol].field.nameLen,
+    src.columns[keyCol].field.dtype, 0);
+  var sc: int64 := DataFrameAddColumn(dst, "sum", 3, dtNew(DT_INT64), 1);
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    if (DataFrameIsValid(src, keyCol, r) != 0) {
+      var key: int64 := DataFrameGetInt64(src, keyCol, r);
+      var g: int64 := _findKeyRow(dst, kc, key);
+      if (g < 0) {
+        g := DataFrameAppendRow(dst);
+        DataFrameSetInt64(dst, kc, g, key);
+        DataFrameSetInt64(dst, sc, g, 0);
+      }
+      if (DataFrameIsValid(src, valCol, r) != 0) {
+        DataFrameSetInt64(dst, sc, g,
+          DataFrameGetInt64(dst, sc, g) + DataFrameGetInt64(src, valCol, r));
+      }
+    }
+    r := r + 1;
+  }
+  return dst;
+}
+
+// Group `src` by the int64 column `keyCol` and count rows per group. Result has
+// two columns: the key (named after keyCol) and "count". NULL keys are skipped.
+pub fn DataFrameGroupByCount(src: DataFrame, keyCol: int64): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  if (keyCol < 0 || keyCol >= src.colCount) { return dst; }
+  var kc: int64 := DataFrameAddColumn(dst,
+    src.columns[keyCol].field.name, src.columns[keyCol].field.nameLen,
+    src.columns[keyCol].field.dtype, 0);
+  var cc: int64 := DataFrameAddColumn(dst, "count", 5, dtNew(DT_INT64), 1);
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    if (DataFrameIsValid(src, keyCol, r) != 0) {
+      var key: int64 := DataFrameGetInt64(src, keyCol, r);
+      var g: int64 := _findKeyRow(dst, kc, key);
+      if (g < 0) {
+        g := DataFrameAppendRow(dst);
+        DataFrameSetInt64(dst, kc, g, key);
+        DataFrameSetInt64(dst, cc, g, 0);
+      }
+      DataFrameSetInt64(dst, cc, g, DataFrameGetInt64(dst, cc, g) + 1);
+    }
+    r := r + 1;
+  }
+  return dst;
+}
