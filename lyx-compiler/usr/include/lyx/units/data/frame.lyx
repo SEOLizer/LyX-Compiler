@@ -421,15 +421,33 @@ pub fn ColumnGetListElemUtf8Ptr(c: Column, idx: int64, j: int64): int64 {
 // `fieldCount` int64 values stored in `aux` at the slot's byte offset. Build the
 // column with dtype dtStruct(StructFieldsInt64(names, nameLens, F), F).
 
-// Build a struct field descriptor array from parallel name/nameLen arrays.
-// Returns a pointer to a fieldCount-entry array of 16-byte [namePtr, nameLen].
+// Struct field descriptor: a fieldCount-entry array of 24-byte records
+//   [namePtr : int64][nameLen : int64][typeId : int64]
+// typeId is a DT_* tag (DT_INT64 / DT_FLOAT64; both occupy one 8-byte cell slot).
+
+// Build a descriptor from parallel name/nameLen arrays; all fields typed int64.
 pub fn StructFieldsInt64(names: int64, nameLens: int64, fieldCount: int64): int64 {
-  var arr: int64 := mmap(0, fieldCount * 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var arr: int64 := mmap(0, fieldCount * 24, PROT_RW, MAP_ANON, FD_NONE, 0);
   if (arr < 0) { return 0; }
   var i: int64 := 0;
   while (i < fieldCount) {
-    poke64(arr + i * 16,     peek64(names + i * 8));
-    poke64(arr + i * 16 + 8, peek64(nameLens + i * 8));
+    poke64(arr + i * 24,      peek64(names + i * 8));
+    poke64(arr + i * 24 + 8,  peek64(nameLens + i * 8));
+    poke64(arr + i * 24 + 16, DT_INT64);
+    i := i + 1;
+  }
+  return arr;
+}
+
+// Build a descriptor from parallel name/nameLen/typeId arrays (mixed field types).
+pub fn StructFields(names: int64, nameLens: int64, typeIds: int64, fieldCount: int64): int64 {
+  var arr: int64 := mmap(0, fieldCount * 24, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (arr < 0) { return 0; }
+  var i: int64 := 0;
+  while (i < fieldCount) {
+    poke64(arr + i * 24,      peek64(names + i * 8));
+    poke64(arr + i * 24 + 8,  peek64(nameLens + i * 8));
+    poke64(arr + i * 24 + 16, peek64(typeIds + i * 8));
     i := i + 1;
   }
   return arr;
@@ -440,7 +458,7 @@ pub fn ColumnStructFieldIndex(c: Column, name: int64, nameLen: int64): int64 {
   var dt: DataType := c.field.dtype;
   var i: int64 := 0;
   while (i < dt.fieldCount) {
-    if (_nameEq(peek64(dt.fields + i * 16), peek64(dt.fields + i * 16 + 8), name, nameLen) != 0) {
+    if (_nameEq(peek64(dt.fields + i * 24), peek64(dt.fields + i * 24 + 8), name, nameLen) != 0) {
       return i;
     }
     i := i + 1;
@@ -448,8 +466,15 @@ pub fn ColumnStructFieldIndex(c: Column, name: int64, nameLen: int64): int64 {
   return -1;
 }
 
-// Set the struct cell at `idx` from `vals` (an array of fieldCount int64s).
-// Marks the cell valid. Returns 1, or 0 on OOM / out of range.
+// DT_* type of struct field `fieldIdx` in column `c` (DT_NULL if out of range).
+pub fn ColumnStructFieldType(c: Column, fieldIdx: int64): int64 {
+  var dt: DataType := c.field.dtype;
+  if (fieldIdx < 0 || fieldIdx >= dt.fieldCount) { return DT_NULL; }
+  return peek64(dt.fields + fieldIdx * 24 + 16);
+}
+
+// Set the struct cell at `idx` from `vals` (an array of fieldCount 8-byte slots;
+// f64 fields hold the raw f64 bits). Marks the cell valid. Returns 1, or 0.
 pub fn ColumnSetStructInt64(c: Column, idx: int64, vals: int64): int64 {
   if (idx < 0 || idx >= c.length) { return 0; }
   var F: int64 := c.field.dtype.fieldCount;
@@ -464,13 +489,22 @@ pub fn ColumnSetStructInt64(c: Column, idx: int64, vals: int64): int64 {
   return 1;
 }
 
-// Read struct field `fieldIdx` of the record at `idx` (0 if NULL / out of range).
+// Read int64 struct field `fieldIdx` of the record at `idx` (0 if NULL / oob).
 pub fn ColumnGetStructFieldInt64(c: Column, idx: int64, fieldIdx: int64): int64 {
   if (BitmapGet(c.validity, idx) == 0) { return 0; }
   var F: int64 := c.field.dtype.fieldCount;
   if (fieldIdx < 0 || fieldIdx >= F) { return 0; }
   var off: int64 := BufferGetInt64(c.values, idx);
   return peek64(BufferByteAddr(c.aux, off) + fieldIdx * 8);
+}
+
+// Read f64 struct field `fieldIdx` of the record at `idx` (0.0 if NULL / oob).
+pub fn ColumnGetStructFieldFloat64(c: Column, idx: int64, fieldIdx: int64): f64 {
+  if (BitmapGet(c.validity, idx) == 0) { return 0.0; }
+  var F: int64 := c.field.dtype.fieldCount;
+  if (fieldIdx < 0 || fieldIdx >= F) { return 0.0; }
+  var off: int64 := BufferGetInt64(c.values, idx);
+  return peekf64(BufferByteAddr(c.aux, off) + fieldIdx * 8);
 }
 
 pub fn ColumnFree(c: Column) {
@@ -648,6 +682,16 @@ pub fn DataFrameSetStructInt64(df: DataFrame, col: int64, row: int64, vals: int6
 pub fn DataFrameGetStructFieldInt64(df: DataFrame, col: int64, row: int64, fieldIdx: int64): int64 {
   if (col < 0 || col >= df.colCount) { return 0; }
   return ColumnGetStructFieldInt64(df.columns[col], row, fieldIdx);
+}
+
+pub fn DataFrameGetStructFieldFloat64(df: DataFrame, col: int64, row: int64, fieldIdx: int64): f64 {
+  if (col < 0 || col >= df.colCount) { return 0.0; }
+  return ColumnGetStructFieldFloat64(df.columns[col], row, fieldIdx);
+}
+
+pub fn DataFrameStructFieldType(df: DataFrame, col: int64, fieldIdx: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return DT_NULL; }
+  return ColumnStructFieldType(df.columns[col], fieldIdx);
 }
 
 pub fn DataFrameStructFieldIndex(df: DataFrame, col: int64, name: int64, nameLen: int64): int64 {
