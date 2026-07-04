@@ -1,0 +1,146 @@
+// Lyx Data Library - L4 IO: CSV
+// Writing typed DataFrames (data.frame) to RFC-4180 CSV.
+//
+// This first cut covers serialisation (DataFrame -> CSV text / file). Reading
+// with type inference lands in the next batch.
+//
+// Formatting per column DataType:
+//   - Int64/Bool/Timestamp: decimal integer
+//   - Float64:              decimal with 6 fractional digits (truncated)
+//   - Utf8:                 raw text, RFC-4180 quoted when needed
+//   - NULL cells:           an empty field
+//
+// Values are accumulated in an L1 Buffer, so the whole document is built with
+// bounds-safe growth before a single write() syscall.
+
+@description("CSV serialisation for the Lyx data framework (DataFrame -> CSV)")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit data.csv;
+
+import data.kernel;
+import data.frame;
+
+// ---- primitive formatting --------------------------------------------------
+
+// Append the decimal representation of an int64 to `b`.
+fn _pushInt64(b: Buffer, v: int64) {
+  if (v == 0) { BufferPushByte(b, 48); return; }
+  var neg: int64 := 0;
+  var n: int64 := v;
+  if (n < 0) { neg := 1; n := 0 - n; }
+  var tmp: int64 := mmap(0, 24, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var cnt: int64 := 0;
+  while (n > 0) {
+    poke8(tmp + cnt, 48 + (n - (n / 10) * 10));
+    n := n / 10;
+    cnt := cnt + 1;
+  }
+  if (neg != 0) { BufferPushByte(b, 45); }  // '-'
+  var i: int64 := cnt - 1;
+  while (i >= 0) { BufferPushByte(b, peek8(tmp + i)); i := i - 1; }
+  munmap(tmp, 24);
+}
+
+// Append an f64 as decimal with 6 fractional digits (truncated).
+fn _pushFloat64(b: Buffer, v: f64) {
+  var x: f64 := v;
+  if (x < 0.0) { BufferPushByte(b, 45); x := 0.0 - x; }
+  var ipart: int64 := x as int64;
+  _pushInt64(b, ipart);
+  BufferPushByte(b, 46);  // '.'
+  var frac: f64 := x - (ipart as f64);
+  var d: int64 := 0;
+  while (d < 6) {
+    frac := frac * 10.0;
+    var digit: int64 := frac as int64;
+    BufferPushByte(b, 48 + digit);
+    frac := frac - (digit as f64);
+    d := d + 1;
+  }
+}
+
+// Does a string need RFC-4180 quoting (contains comma, quote, CR or LF)?
+fn _needsQuote(ptr: int64, len: int64): int64 {
+  var i: int64 := 0;
+  while (i < len) {
+    var c: int64 := peek8(ptr + i) & 255;
+    if (c == 44 || c == 34 || c == 10 || c == 13) { return 1; }  // , " \n \r
+    i := i + 1;
+  }
+  return 0;
+}
+
+// Append a Utf8 field, quoting and escaping per RFC-4180 when necessary.
+fn _pushCsvField(b: Buffer, ptr: int64, len: int64) {
+  if (_needsQuote(ptr, len) == 0) {
+    if (len > 0) { BufferPushBytes(b, ptr, len); }
+    return;
+  }
+  BufferPushByte(b, 34);  // opening quote
+  var i: int64 := 0;
+  while (i < len) {
+    var c: int64 := peek8(ptr + i) & 255;
+    if (c == 34) { BufferPushByte(b, 34); }  // escape " as ""
+    BufferPushByte(b, c);
+    i := i + 1;
+  }
+  BufferPushByte(b, 34);  // closing quote
+}
+
+// ---- serialisation ---------------------------------------------------------
+
+// Append a single cell (df[col,row]) as a CSV field. NULL -> empty field.
+fn _pushCell(b: Buffer, df: DataFrame, col: int64, row: int64) {
+  if (DataFrameIsValid(df, col, row) == 0) { return; }  // empty field
+  var t: int64 := DataFrameColType(df, col);
+  if (t == DT_FLOAT64) {
+    _pushFloat64(b, DataFrameGetFloat64(df, col, row));
+  } else if (t == DT_UTF8) {
+    _pushCsvField(b, DataFrameGetUtf8Ptr(df, col, row), DataFrameGetUtf8Len(df, col, row));
+  } else {
+    _pushInt64(b, DataFrameGetInt64(df, col, row));
+  }
+}
+
+// Serialise `df` into a freshly allocated L1 Buffer containing the full CSV
+// document (header row + data rows, '\n'-terminated lines). The caller owns the
+// Buffer and should BufferFree it.
+pub fn DataFrameToCsvBuffer(df: DataFrame): Buffer {
+  var b: Buffer := BufferNew(256);
+  // Header.
+  var c: int64 := 0;
+  while (c < df.colCount) {
+    if (c > 0) { BufferPushByte(b, 44); }  // ','
+    _pushCsvField(b, df.columns[c].field.name, df.columns[c].field.nameLen);
+    c := c + 1;
+  }
+  BufferPushByte(b, 10);  // '\n'
+  // Rows.
+  var r: int64 := 0;
+  while (r < df.rowCount) {
+    var k: int64 := 0;
+    while (k < df.colCount) {
+      if (k > 0) { BufferPushByte(b, 44); }
+      _pushCell(b, df, k, r);
+      k := k + 1;
+    }
+    BufferPushByte(b, 10);
+    r := r + 1;
+  }
+  return b;
+}
+
+// Write `df` to `path` as CSV. Returns the number of bytes written, or -1 on
+// error (open/write failure).
+pub fn DataFrameWriteCsv(df: DataFrame, path: int64): int64 {
+  var b: Buffer := DataFrameToCsvBuffer(df);
+  // O_WRONLY | O_CREAT | O_TRUNC = 577, mode 0644 = 420
+  var fd: int64 := open(path, 577, 420);
+  if (fd < 0) { BufferFree(b); return -1; }
+  var written: int64 := 0;
+  if (b.len > 0) { written := write(fd, b.data, b.len); }
+  close(fd);
+  BufferFree(b);
+  return written;
+}
