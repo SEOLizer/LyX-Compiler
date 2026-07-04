@@ -341,6 +341,136 @@ pub fn DataFrameSortByInt64(src: DataFrame, col: int64, ascending: int64): DataF
   return dst;
 }
 
+// ---- generic / multi-column sort (any column type) -------------------------
+
+// Lexicographic byte compare of two strings. Returns -1/0/1.
+fn _cmpUtf8(pa: int64, la: int64, pb: int64, lb: int64): int64 {
+  var n: int64 := la;
+  if (lb < n) { n := lb; }
+  var i: int64 := 0;
+  while (i < n) {
+    var ca: int64 := peek8(pa + i) & 255;
+    var cb: int64 := peek8(pb + i) & 255;
+    if (ca < cb) { return 0 - 1; }
+    if (ca > cb) { return 1; }
+    i := i + 1;
+  }
+  if (la < lb) { return 0 - 1; }
+  if (la > lb) { return 1; }
+  return 0;
+}
+
+// Compare rows `a` and `b` by an ordered list of (column, ascending) keys.
+// Each key is compared by its column's DataType; NULLs always sort last. Returns
+// -1 if a < b, 1 if a > b, 0 if equal on all keys.
+fn _cmpRowsSpec(src: DataFrame, cols: int64, ascs: int64, ns: int64, a: int64, b: int64): int64 {
+  var s: int64 := 0;
+  while (s < ns) {
+    var col: int64 := peek64(cols + s * 8);
+    var asc: int64 := peek64(ascs + s * 8);
+    var va: int64 := DataFrameIsValid(src, col, a);
+    var vb: int64 := DataFrameIsValid(src, col, b);
+    if (va == 0 && vb == 0) {
+      // equal on this key -> fall through to the next key
+    } else if (va == 0) {
+      return 1;         // a is NULL -> after b (NULLs last)
+    } else if (vb == 0) {
+      return 0 - 1;
+    } else {
+      var cmp: int64 := 0;
+      var t: int64 := DataFrameColType(src, col);
+      if (t == DT_FLOAT64) {
+        var x: f64 := DataFrameGetFloat64(src, col, a);
+        var y: f64 := DataFrameGetFloat64(src, col, b);
+        if (x < y) { cmp := 0 - 1; } else if (x > y) { cmp := 1; }
+      } else if (t == DT_UTF8) {
+        cmp := _cmpUtf8(DataFrameGetUtf8Ptr(src, col, a), DataFrameGetUtf8Len(src, col, a),
+                        DataFrameGetUtf8Ptr(src, col, b), DataFrameGetUtf8Len(src, col, b));
+      } else {
+        var xi: int64 := DataFrameGetInt64(src, col, a);
+        var yi: int64 := DataFrameGetInt64(src, col, b);
+        if (xi < yi) { cmp := 0 - 1; } else if (xi > yi) { cmp := 1; }
+      }
+      if (asc == 0) { cmp := 0 - cmp; }
+      if (cmp != 0) { return cmp; }
+    }
+    s := s + 1;
+  }
+  return 0;
+}
+
+// Stable bottom-up merge sort of the row-index array by a multi-key spec.
+fn _mergeSortRowsSpec(src: DataFrame, cols: int64, ascs: int64, ns: int64, idx: int64, tmp: int64, n: int64) {
+  var width: int64 := 1;
+  while (width < n) {
+    var i: int64 := 0;
+    while (i < n) {
+      var left: int64 := i;
+      var mid: int64 := i + width;
+      if (mid > n) { mid := n; }
+      var right: int64 := i + width * 2;
+      if (right > n) { right := n; }
+      var a: int64 := left;
+      var b: int64 := mid;
+      var k: int64 := left;
+      while (a < mid && b < right) {
+        // take from the left run unless the right element is strictly less (stable)
+        if (_cmpRowsSpec(src, cols, ascs, ns, peek64(idx + b * 8), peek64(idx + a * 8)) < 0) {
+          poke64(tmp + k * 8, peek64(idx + b * 8)); b := b + 1;
+        } else {
+          poke64(tmp + k * 8, peek64(idx + a * 8)); a := a + 1;
+        }
+        k := k + 1;
+      }
+      while (a < mid) { poke64(tmp + k * 8, peek64(idx + a * 8)); a := a + 1; k := k + 1; }
+      while (b < right) { poke64(tmp + k * 8, peek64(idx + b * 8)); b := b + 1; k := k + 1; }
+      i := i + width * 2;
+    }
+    memcpy(idx, tmp, n * 8);
+    width := width * 2;
+  }
+}
+
+// Sort by a list of (column, ascending) keys, in priority order. `cols` and
+// `ascs` are int64 arrays of `ns` entries. Stable; NULLs sort last per key.
+// Works for int64, Float64 and Utf8 key columns. Full schema preserved.
+pub fn DataFrameSortByMulti(src: DataFrame, cols: int64, ascs: int64, ns: int64): DataFrame {
+  var dst: DataFrame := DataFrameCloneSchema(src);
+  var n: int64 := src.rowCount;
+  if (n <= 0) { return dst; }
+  var idx: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (idx < 0) { return dst; }
+  var i: int64 := 0;
+  while (i < n) { poke64(idx + i * 8, i); i := i + 1; }
+  if (ns > 0) {
+    var tmp: int64 := mmap(0, n * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (tmp >= 0) {
+      _mergeSortRowsSpec(src, cols, ascs, ns, idx, tmp, n);
+      munmap(tmp, n * 8);
+    }
+  }
+  var j: int64 := 0;
+  while (j < n) {
+    DataFrameAppendRowFrom(dst, src, peek64(idx + j * 8));
+    j := j + 1;
+  }
+  munmap(idx, n * 8);
+  return dst;
+}
+
+// Sort by a single column of any type (int64 / Float64 / Utf8). ascending != 0
+// for ascending. NULLs sort last. Stable.
+pub fn DataFrameSortBy(src: DataFrame, col: int64, ascending: int64): DataFrame {
+  var cols: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var ascs: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  poke64(cols, col);
+  poke64(ascs, ascending);
+  var r: DataFrame := DataFrameSortByMulti(src, cols, ascs, 1);
+  munmap(cols, 8);
+  munmap(ascs, 8);
+  return r;
+}
+
 // ============================================================================
 // Group-by (int64 key)
 // ============================================================================
