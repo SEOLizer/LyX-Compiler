@@ -56,8 +56,9 @@ pub fn FieldNew(name: int64, nameLen: int64, dtype: DataType, nullable: int64): 
 
 pub type Column = struct {
   field: Field;        // name + type + nullability
-  values: Buffer;      // fixed-width int64 slots (float bits / handles later)
+  values: Buffer;      // fixed-width 8-byte slots: int64 / f64 bits / Utf8 offset
   validity: Bitmap;    // per-element NULL mask (1 = valid)
+  aux: Buffer;         // variable-length payload (Utf8 bytes); empty otherwise
   length: int64;       // logical element count (single source of truth)
 };
 
@@ -66,8 +67,9 @@ pub type Column = struct {
 // nested Buffer/Bitmap/Field, per Lyx reference semantics.
 fn _columnInit(c: Column, name: int64, nameLen: int64, dtype: DataType, nullable: int64, cap: int64) {
   c.field := FieldNew(name, nameLen, dtype, nullable);
-  c.values := BufferNew(cap * 8);   // 8 bytes per int64 slot
+  c.values := BufferNew(cap * 8);   // 8 bytes per fixed-width slot
   c.validity := BitmapNew(cap);
+  c.aux := BufferNew(16);           // grows only when the column holds Utf8
   c.length := 0;
 }
 
@@ -136,9 +138,111 @@ pub fn ColumnSumInt64(c: Column): int64 {
   return sum;
 }
 
+// ---- Float64 cells ---------------------------------------------------------
+
+// Append an f64 value (marked valid). Returns 1 on success, 0 on OOM.
+pub fn ColumnAppendFloat64(c: Column, value: f64): int64 {
+  if (BufferPushFloat64(c.values, value) == 0) { return 0; }
+  if (BitmapAppend(c.validity, 1) == 0) { return 0; }
+  c.length := c.length + 1;
+  return 1;
+}
+
+// Read the f64 at `idx` (0.0 if out of range; check ColumnIsValid for NULL).
+pub fn ColumnGetFloat64(c: Column, idx: int64): f64 {
+  return BufferGetFloat64(c.values, idx);
+}
+
+// Overwrite `idx` with an f64 and mark it valid. Returns 1 on success.
+pub fn ColumnSetFloat64(c: Column, idx: int64, value: f64): int64 {
+  if (BufferSetFloat64(c.values, idx, value) == 0) { return 0; }
+  BitmapSet(c.validity, idx, 1);
+  return 1;
+}
+
+// Sum of the valid f64 cells (NULLs skipped).
+pub fn ColumnSumFloat64(c: Column): f64 {
+  var sum: f64 := 0.0;
+  var i: int64 := 0;
+  while (i < c.length) {
+    if (BitmapGet(c.validity, i) != 0) {
+      sum := sum + BufferGetFloat64(c.values, i);
+    }
+    i := i + 1;
+  }
+  return sum;
+}
+
+// ---- Utf8 (variable-length string) cells -----------------------------------
+//
+// The fixed slot in `values` holds a byte offset into `aux`, where the string
+// is stored length-prefixed: [len:int64][bytes...]. NULL is tracked by the
+// validity bitmap, so an offset of 0 is never confused with a NULL cell.
+
+// Append a string (copied into the column). Returns 1 on success, 0 on OOM.
+pub fn ColumnAppendUtf8(c: Column, strPtr: int64, strLen: int64): int64 {
+  var off: int64 := c.aux.len;
+  if (BufferPushInt64(c.aux, strLen) == 0) { return 0; }
+  if (strLen > 0) {
+    if (BufferPushBytes(c.aux, strPtr, strLen) < 0) { return 0; }
+  }
+  if (BufferPushInt64(c.values, off) == 0) { return 0; }
+  if (BitmapAppend(c.validity, 1) == 0) { return 0; }
+  c.length := c.length + 1;
+  return 1;
+}
+
+// Byte length of the string at `idx` (0 if NULL / out of range).
+pub fn ColumnGetUtf8Len(c: Column, idx: int64): int64 {
+  if (BitmapGet(c.validity, idx) == 0) { return 0; }
+  var off: int64 := BufferGetInt64(c.values, idx);
+  return peek64(BufferByteAddr(c.aux, off));
+}
+
+// Pointer to the string bytes at `idx` (NOT NUL-terminated). Returns 0 if NULL.
+// NOTE: a view into `aux` — only valid until the next Utf8 append/set, which
+// may grow and move that buffer. Copy the bytes (or use ColumnGetUtf8Into) if
+// you need to keep them.
+pub fn ColumnGetUtf8Ptr(c: Column, idx: int64): int64 {
+  if (BitmapGet(c.validity, idx) == 0) { return 0; }
+  var off: int64 := BufferGetInt64(c.values, idx);
+  return BufferByteAddr(c.aux, off) + 8;   // skip the length prefix
+}
+
+// Copy the string at `idx` into `dest` (NUL-terminated, truncated to destCap-1
+// bytes) and return the full stored length. dest gets an empty string for NULL.
+pub fn ColumnGetUtf8Into(c: Column, idx: int64, dest: int64, destCap: int64): int64 {
+  if (destCap <= 0) { return 0; }
+  if (BitmapGet(c.validity, idx) == 0) { poke8(dest, 0); return 0; }
+  var off: int64 := BufferGetInt64(c.values, idx);
+  var base: int64 := BufferByteAddr(c.aux, off);
+  var len: int64 := peek64(base);
+  var n: int64 := len;
+  if (n > destCap - 1) { n := destCap - 1; }
+  if (n < 0) { n := 0; }
+  memcpy(dest, base + 8, n);
+  poke8(dest + n, 0);
+  return len;
+}
+
+// Overwrite the cell at `idx` with a new string (appended to aux; the old blob
+// is left orphaned in aux — acceptable slack for the first cut). Marks valid.
+pub fn ColumnSetUtf8(c: Column, idx: int64, strPtr: int64, strLen: int64): int64 {
+  if (idx < 0 || idx >= c.length) { return 0; }
+  var off: int64 := c.aux.len;
+  if (BufferPushInt64(c.aux, strLen) == 0) { return 0; }
+  if (strLen > 0) {
+    if (BufferPushBytes(c.aux, strPtr, strLen) < 0) { return 0; }
+  }
+  BufferSetInt64(c.values, idx, off);
+  BitmapSet(c.validity, idx, 1);
+  return 1;
+}
+
 pub fn ColumnFree(c: Column) {
   BufferFree(c.values);
   BitmapFree(c.validity);
+  BufferFree(c.aux);
 }
 
 // ============================================================================
@@ -234,6 +338,31 @@ pub fn DataFrameIsValid(df: DataFrame, col: int64, row: int64): int64 {
 pub fn DataFrameSetNull(df: DataFrame, col: int64, row: int64) {
   if (col < 0 || col >= df.colCount) { return; }
   ColumnSetNull(df.columns[col], row);
+}
+
+pub fn DataFrameSetFloat64(df: DataFrame, col: int64, row: int64, value: f64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnSetFloat64(df.columns[col], row, value);
+}
+
+pub fn DataFrameGetFloat64(df: DataFrame, col: int64, row: int64): f64 {
+  if (col < 0 || col >= df.colCount) { return 0.0; }
+  return ColumnGetFloat64(df.columns[col], row);
+}
+
+pub fn DataFrameSetUtf8(df: DataFrame, col: int64, row: int64, strPtr: int64, strLen: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnSetUtf8(df.columns[col], row, strPtr, strLen);
+}
+
+pub fn DataFrameGetUtf8Ptr(df: DataFrame, col: int64, row: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnGetUtf8Ptr(df.columns[col], row);
+}
+
+pub fn DataFrameGetUtf8Len(df: DataFrame, col: int64, row: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnGetUtf8Len(df.columns[col], row);
 }
 
 // --- Column lookup by name -------------------------------------------------
