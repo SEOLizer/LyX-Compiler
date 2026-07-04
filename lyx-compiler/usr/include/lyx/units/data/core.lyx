@@ -67,6 +67,7 @@ pub type Series = struct {
 pub fn SeriesNewInt64(name: int64, capacity: int64): Series {
   var s: Series;
   s.data := mmap(0, capacity * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (s.data < 0) { s.data := 0; }  // mmap MAP_FAILED → safe null; downstream data==0 guards catch it
   s.labels := 0;
   s.length := 0;
   s.colType := COL_INT64;
@@ -78,6 +79,7 @@ pub fn SeriesNewInt64(name: int64, capacity: int64): Series {
 pub fn SeriesNewString(name: int64, capacity: int64): Series {
   var s: Series;
   s.data := mmap(0, capacity * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (s.data < 0) { s.data := 0; }  // mmap MAP_FAILED → safe null; downstream data==0 guards catch it
   s.labels := 0;
   s.length := 0;
   s.colType := COL_STRING;
@@ -89,6 +91,7 @@ pub fn SeriesNewString(name: int64, capacity: int64): Series {
 pub fn SeriesNewFloat64(name: int64, capacity: int64): Series {
   var s: Series;
   s.data := mmap(0, capacity * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (s.data < 0) { s.data := 0; }  // mmap MAP_FAILED → safe null; downstream data==0 guards catch it
   s.labels := 0;
   s.length := 0;
   s.colType := COL_FLOAT;
@@ -142,6 +145,11 @@ pub fn SeriesSetLabel(s: Series, idx: int64, label: int64) {
 }
 
 // Append value to series
+// LIMITATION: a standalone Series carries no capacity field, so this cannot
+// bounds-check or grow — the caller MUST size the Series (SeriesNew*'s capacity
+// argument) to hold every appended element. Appending past capacity is a
+// caller error. Growable buffers arrive with the P1 Buffer rewrite; inside a
+// DataFrame use DataFrameAppendRow, which grows safely.
 pub fn SeriesAppendInt(s: Series, value: int64) {
   poke64(s.data + s.length * 8, value);
   s.length := s.length + 1;
@@ -179,6 +187,7 @@ pub type DataFrame = struct {
 pub fn DataFrameNew(): DataFrame {
   var df: DataFrame;
   df.columns := mmap(0, 16 * 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (df.columns < 0) { df.columns := 0; }  // mmap MAP_FAILED → safe null
   df.colCount := 0;
   df.rowCount := 0;
   df.colCapacity := 16;
@@ -241,12 +250,49 @@ fn DFGetSeriesByIdx(df: DataFrame, colIdx: int64): Series {
   return s;
 }
 
+// Grow the column-descriptor buffer (columns) to double capacity.
+// Each column slot is 16 bytes: [name-ptr | Series-struct-ptr].
+fn _dfGrowCols(df: DataFrame) {
+  var oldCap: int64 := df.colCapacity;
+  var newCap: int64 := oldCap * 2;
+  var nb: int64 := mmap(0, newCap * 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (nb < 0) { return; }  // OOM: keep old buffer, caller aborts the add
+  memcpy(nb, df.columns, df.colCount * 16);
+  munmap(df.columns, oldCap * 16);
+  df.columns := nb;
+  df.colCapacity := newCap;
+}
+
+// Grow every column's data buffer to double the row capacity.
+// Called when the DataFrame is full and another row is appended, so that
+// DataFrameAppendRow never writes past the end of a column's mmap region.
+fn _dfGrowRows(df: DataFrame) {
+  var oldCap: int64 := df.rowCapacity;
+  var newCap: int64 := oldCap * 2;
+  var i: int64 := 0;
+  while (i < df.colCount) {
+    var sp: int64 := peek64(df.columns + i * 16 + 8);
+    if (sp != 0) {
+      var oldData: int64 := peek64(sp + 0);
+      var len: int64 := peek64(sp + 16);
+      var newData: int64 := mmap(0, newCap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+      if (newData < 0) { return; }  // OOM: leave rowCapacity unchanged, caller aborts
+      memcpy(newData, oldData, len * 8);
+      munmap(oldData, oldCap * 8);
+      poke64(sp + 0, newData);
+    }
+    i := i + 1;
+  }
+  df.rowCapacity := newCap;
+}
+
 // Add column to DataFrame
 pub fn DataFrameAddColumn(df: DataFrame, name: int64, colType: int64) {
   var s: Series;
 
   if (df.colCount >= df.colCapacity) {
-    return;
+    _dfGrowCols(df);
+    if (df.colCount >= df.colCapacity) { return; }  // grow failed (OOM): drop, don't overflow
   }
 
   if (colType == COL_STRING) {
@@ -259,6 +305,7 @@ pub fn DataFrameAddColumn(df: DataFrame, name: int64, colType: int64) {
 
   // Allocate heap Series struct (5 fields × 8 bytes = 40 bytes)
   var sp: int64 := mmap(0, 40, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (sp < 0) { return; }  // mmap MAP_FAILED → skip add rather than poke a bad pointer
   poke64(sp + 0,  s.data);
   poke64(sp + 8,  s.labels);
   poke64(sp + 16, s.length);
@@ -273,6 +320,13 @@ pub fn DataFrameAddColumn(df: DataFrame, name: int64, colType: int64) {
 
 // Add row to DataFrame — updates all column lengths in-place on the heap
 pub fn DataFrameAppendRow(df: DataFrame) {
+  // Guard against writing past the columns' mmap regions. Every column is
+  // sized to df.rowCapacity, so grow all of them before exceeding it.
+  if (df.rowCount >= df.rowCapacity) {
+    _dfGrowRows(df);
+    if (df.rowCount >= df.rowCapacity) { return; }  // grow failed (OOM): drop row, don't corrupt heap
+  }
+
   var i: int64 := 0;
 
   while (i < df.colCount) {
@@ -1391,10 +1445,14 @@ pub fn SeriesFilterLtF64(s: Series, threshold: f64): Series {
 
 // Add float column to DataFrame
 pub fn DataFrameAddColumnFloat64(df: DataFrame, name: int64) {
-  if (df.colCount >= df.colCapacity) { return; }
+  if (df.colCount >= df.colCapacity) {
+    _dfGrowCols(df);
+    if (df.colCount >= df.colCapacity) { return; }  // grow failed (OOM): drop, don't overflow
+  }
   var s: Series := SeriesNewFloat64(name, df.rowCapacity);
   s.length := df.rowCount;
   var sp: int64 := mmap(0, 40, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (sp < 0) { return; }  // mmap MAP_FAILED → skip add rather than poke a bad pointer
   poke64(sp + 0,  s.data);
   poke64(sp + 8,  s.labels);
   poke64(sp + 16, s.length);
