@@ -1,0 +1,157 @@
+// Lyx Data Library - L4 IO: JSON
+// Writing typed DataFrames (data.frame) to JSON — including the nested List and
+// Struct column types, which map directly onto JSON arrays and objects.
+//
+// Output is a JSON array of row objects, one object per line:
+//   [
+//   {"id":1,"tags":[10,20],"pt":{"x":1,"y":2}},
+//   {"id":2,"tags":null,"pt":null}
+//   ]
+//
+// Value formatting per column DataType:
+//   Int64/Bool/Timestamp -> number,  Float64 -> number (6 fractional digits),
+//   Utf8 -> escaped string,  List<Int64> -> array,  Struct -> object,
+//   NULL cell -> null.
+//
+// Reading (parse) follows in a later batch.
+
+@description("JSON serialisation for the Lyx data framework (DataFrame -> JSON)")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit data.json;
+
+import data.kernel;
+import data.frame;
+
+// ---- primitive formatting --------------------------------------------------
+
+fn _pushInt64(b: Buffer, v: int64) {
+  if (v == 0) { BufferPushByte(b, 48); return; }
+  var neg: int64 := 0;
+  var n: int64 := v;
+  if (n < 0) { neg := 1; n := 0 - n; }
+  var tmp: int64 := mmap(0, 24, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var cnt: int64 := 0;
+  while (n > 0) {
+    poke8(tmp + cnt, 48 + (n - (n / 10) * 10));
+    n := n / 10;
+    cnt := cnt + 1;
+  }
+  if (neg != 0) { BufferPushByte(b, 45); }
+  var i: int64 := cnt - 1;
+  while (i >= 0) { BufferPushByte(b, peek8(tmp + i)); i := i - 1; }
+  munmap(tmp, 24);
+}
+
+fn _pushFloat64(b: Buffer, v: f64) {
+  var x: f64 := v;
+  if (x < 0.0) { BufferPushByte(b, 45); x := 0.0 - x; }
+  var ipart: int64 := x as int64;
+  _pushInt64(b, ipart);
+  BufferPushByte(b, 46);  // '.'
+  var frac: f64 := x - (ipart as f64);
+  var d: int64 := 0;
+  while (d < 6) {
+    frac := frac * 10.0;
+    var digit: int64 := frac as int64;
+    BufferPushByte(b, 48 + digit);
+    frac := frac - (digit as f64);
+    d := d + 1;
+  }
+}
+
+// Append `ptr[0..len)` as a JSON string literal, escaping per the JSON spec.
+fn _pushJsonString(b: Buffer, ptr: int64, len: int64) {
+  BufferPushByte(b, 34);  // opening quote
+  var i: int64 := 0;
+  while (i < len) {
+    var c: int64 := peek8(ptr + i) & 255;
+    if (c == 34) { BufferPushByte(b, 92); BufferPushByte(b, 34); }        // \"
+    else if (c == 92) { BufferPushByte(b, 92); BufferPushByte(b, 92); }   // \\
+    else if (c == 10) { BufferPushByte(b, 92); BufferPushByte(b, 110); }  // \n
+    else if (c == 13) { BufferPushByte(b, 92); BufferPushByte(b, 114); }  // \r
+    else if (c == 9)  { BufferPushByte(b, 92); BufferPushByte(b, 116); }  // \t
+    else { BufferPushByte(b, c); }
+    i := i + 1;
+  }
+  BufferPushByte(b, 34);  // closing quote
+}
+
+// ---- value / row / document ------------------------------------------------
+
+// Append the cell df[col,row] as a JSON value (recursing into List/Struct).
+fn _pushValue(b: Buffer, df: DataFrame, col: int64, row: int64) {
+  if (DataFrameIsValid(df, col, row) == 0) {
+    // null
+    BufferPushByte(b, 110); BufferPushByte(b, 117);
+    BufferPushByte(b, 108); BufferPushByte(b, 108);
+    return;
+  }
+  var t: int64 := DataFrameColType(df, col);
+  if (t == DT_FLOAT64) {
+    _pushFloat64(b, DataFrameGetFloat64(df, col, row));
+  } else if (t == DT_UTF8) {
+    _pushJsonString(b, DataFrameGetUtf8Ptr(df, col, row), DataFrameGetUtf8Len(df, col, row));
+  } else if (t == DT_LIST) {
+    BufferPushByte(b, 91);  // '['
+    var n: int64 := DataFrameGetListLen(df, col, row);
+    var j: int64 := 0;
+    while (j < n) {
+      if (j > 0) { BufferPushByte(b, 44); }
+      _pushInt64(b, DataFrameGetListElemInt64(df, col, row, j));
+      j := j + 1;
+    }
+    BufferPushByte(b, 93);  // ']'
+  } else if (t == DT_STRUCT) {
+    BufferPushByte(b, 123);  // '{'
+    var dt: DataType := df.columns[col].field.dtype;
+    var f: int64 := 0;
+    while (f < dt.fieldCount) {
+      if (f > 0) { BufferPushByte(b, 44); }
+      _pushJsonString(b, peek64(dt.fields + f * 16), peek64(dt.fields + f * 16 + 8));
+      BufferPushByte(b, 58);  // ':'
+      _pushInt64(b, DataFrameGetStructFieldInt64(df, col, row, f));
+      f := f + 1;
+    }
+    BufferPushByte(b, 125);  // '}'
+  } else {
+    _pushInt64(b, DataFrameGetInt64(df, col, row));
+  }
+}
+
+// Serialise `df` into a freshly allocated Buffer as a JSON array of row objects
+// (one object per line). Caller owns the Buffer and should BufferFree it.
+pub fn DataFrameToJsonBuffer(df: DataFrame): Buffer {
+  var b: Buffer := BufferNew(256);
+  BufferPushByte(b, 91); BufferPushByte(b, 10);  // "[\n"
+  var r: int64 := 0;
+  while (r < df.rowCount) {
+    BufferPushByte(b, 123);  // '{'
+    var c: int64 := 0;
+    while (c < df.colCount) {
+      if (c > 0) { BufferPushByte(b, 44); }
+      _pushJsonString(b, df.columns[c].field.name, df.columns[c].field.nameLen);
+      BufferPushByte(b, 58);  // ':'
+      _pushValue(b, df, c, r);
+      c := c + 1;
+    }
+    BufferPushByte(b, 125);  // '}'
+    if (r + 1 < df.rowCount) { BufferPushByte(b, 44); }  // ',' between objects
+    BufferPushByte(b, 10);   // '\n'
+    r := r + 1;
+  }
+  BufferPushByte(b, 93); BufferPushByte(b, 10);  // "]\n"
+  return b;
+}
+
+// Write `df` to `path` as JSON. Returns bytes written, or -1 on error.
+pub fn DataFrameWriteJson(df: DataFrame, path: int64): int64 {
+  var b: Buffer := DataFrameToJsonBuffer(df);
+  var fd: int64 := open(path, 577, 420);  // O_WRONLY|O_CREAT|O_TRUNC, 0644
+  if (fd < 0) { BufferFree(b); return -1; }
+  var written: int64 := 0;
+  if (b.len > 0) { written := write(fd, b.data, b.len); }
+  close(fd);
+  BufferFree(b);
+  return written;
+}
