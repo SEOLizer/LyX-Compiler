@@ -294,6 +294,126 @@ pub fn ColumnSetListInt64(c: Column, idx: int64, elems: int64, n: int64): int64 
   return 1;
 }
 
+// ---- List<Float64> ---------------------------------------------------------
+// Same [count][elem...] aux layout as List<Int64>; elements are f64 bits. The
+// shared ColumnGetListLen works (identical count prefix). Build the column with
+// dtype dtList(dtBox(dtNew(DT_FLOAT64))).
+
+// Append a list of `n` f64 values read from the f64 array at `elems`.
+pub fn ColumnAppendListFloat64(c: Column, elems: int64, n: int64): int64 {
+  var off: int64 := c.aux.len;
+  if (BufferPushInt64(c.aux, n) == 0) { return 0; }
+  var i: int64 := 0;
+  while (i < n) {
+    if (BufferPushFloat64(c.aux, peekf64(elems + i * 8)) == 0) { return 0; }
+    i := i + 1;
+  }
+  if (BufferPushInt64(c.values, off) == 0) { return 0; }
+  if (BitmapAppend(c.validity, 1) == 0) { return 0; }
+  c.length := c.length + 1;
+  return 1;
+}
+
+// Element `j` (f64) of the list at `idx` (0.0 if NULL / out of range).
+pub fn ColumnGetListElemFloat64(c: Column, idx: int64, j: int64): f64 {
+  if (BitmapGet(c.validity, idx) == 0) { return 0.0; }
+  var off: int64 := BufferGetInt64(c.values, idx);
+  var base: int64 := BufferByteAddr(c.aux, off);
+  var cnt: int64 := peek64(base);
+  if (j < 0 || j >= cnt) { return 0.0; }
+  return peekf64(base + 8 + j * 8);
+}
+
+pub fn ColumnSetListFloat64(c: Column, idx: int64, elems: int64, n: int64): int64 {
+  if (idx < 0 || idx >= c.length) { return 0; }
+  var off: int64 := c.aux.len;
+  if (BufferPushInt64(c.aux, n) == 0) { return 0; }
+  var i: int64 := 0;
+  while (i < n) {
+    if (BufferPushFloat64(c.aux, peekf64(elems + i * 8)) == 0) { return 0; }
+    i := i + 1;
+  }
+  BufferSetInt64(c.values, idx, off);
+  BitmapSet(c.validity, idx, 1);
+  return 1;
+}
+
+// ---- List<Utf8> ------------------------------------------------------------
+// aux layout: [count:int64] then per element [len:int64][bytes...]. Element
+// access walks from the front (O(j)). Build the column with dtype
+// dtList(dtBox(dtNew(DT_UTF8))).
+
+// Append a list of `n` strings. `ptrs` is an array of pchar pointers and `lens`
+// the matching int64 byte-lengths.
+pub fn ColumnAppendListUtf8(c: Column, ptrs: int64, lens: int64, n: int64): int64 {
+  var off: int64 := c.aux.len;
+  if (BufferPushInt64(c.aux, n) == 0) { return 0; }
+  var i: int64 := 0;
+  while (i < n) {
+    var el: int64 := peek64(lens + i * 8);
+    if (BufferPushInt64(c.aux, el) == 0) { return 0; }
+    if (el > 0) {
+      if (BufferPushBytes(c.aux, peek64(ptrs + i * 8), el) < 0) { return 0; }
+    }
+    i := i + 1;
+  }
+  if (BufferPushInt64(c.values, off) == 0) { return 0; }
+  if (BitmapAppend(c.validity, 1) == 0) { return 0; }
+  c.length := c.length + 1;
+  return 1;
+}
+
+// Overwrite the Utf8-list cell at `idx` (old blob orphaned in aux). Marks valid.
+pub fn ColumnSetListUtf8(c: Column, idx: int64, ptrs: int64, lens: int64, n: int64): int64 {
+  if (idx < 0 || idx >= c.length) { return 0; }
+  var off: int64 := c.aux.len;
+  if (BufferPushInt64(c.aux, n) == 0) { return 0; }
+  var i: int64 := 0;
+  while (i < n) {
+    var el: int64 := peek64(lens + i * 8);
+    if (BufferPushInt64(c.aux, el) == 0) { return 0; }
+    if (el > 0) {
+      if (BufferPushBytes(c.aux, peek64(ptrs + i * 8), el) < 0) { return 0; }
+    }
+    i := i + 1;
+  }
+  BufferSetInt64(c.values, idx, off);
+  BitmapSet(c.validity, idx, 1);
+  return 1;
+}
+
+// Walk to element `j` of the Utf8 list at [idx], returning the byte address of
+// its [len] prefix (0 if NULL / out of range). Internal helper.
+fn _listUtf8ElemBase(c: Column, idx: int64, j: int64): int64 {
+  if (BitmapGet(c.validity, idx) == 0) { return 0; }
+  var off: int64 := BufferGetInt64(c.values, idx);
+  var base: int64 := BufferByteAddr(c.aux, off);
+  var cnt: int64 := peek64(base);
+  if (j < 0 || j >= cnt) { return 0; }
+  var pos: int64 := base + 8;
+  var e: int64 := 0;
+  while (e < j) {
+    pos := pos + 8 + peek64(pos);  // skip [len][bytes]
+    e := e + 1;
+  }
+  return pos;
+}
+
+// Byte length of element `j` of the Utf8 list at [idx] (0 if NULL / out of range).
+pub fn ColumnGetListElemUtf8Len(c: Column, idx: int64, j: int64): int64 {
+  var p: int64 := _listUtf8ElemBase(c, idx, j);
+  if (p == 0) { return 0; }
+  return peek64(p);
+}
+
+// Pointer to the bytes of element `j` of the Utf8 list at [idx] (0 if NULL /
+// out of range). Valid until the next aux mutation.
+pub fn ColumnGetListElemUtf8Ptr(c: Column, idx: int64, j: int64): int64 {
+  var p: int64 := _listUtf8ElemBase(c, idx, j);
+  if (p == 0) { return 0; }
+  return p + 8;  // skip the length prefix
+}
+
 // ---- Struct (nested record) cells ------------------------------------------
 //
 // A struct column holds records with a fixed set of named int64 fields. The
@@ -492,6 +612,32 @@ pub fn DataFrameGetListLen(df: DataFrame, col: int64, row: int64): int64 {
 pub fn DataFrameGetListElemInt64(df: DataFrame, col: int64, row: int64, j: int64): int64 {
   if (col < 0 || col >= df.colCount) { return 0; }
   return ColumnGetListElemInt64(df.columns[col], row, j);
+}
+
+pub fn DataFrameSetListFloat64(df: DataFrame, col: int64, row: int64, elems: int64, n: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnSetListFloat64(df.columns[col], row, elems, n);
+}
+
+pub fn DataFrameGetListElemFloat64(df: DataFrame, col: int64, row: int64, j: int64): f64 {
+  if (col < 0 || col >= df.colCount) { return 0.0; }
+  return ColumnGetListElemFloat64(df.columns[col], row, j);
+}
+
+pub fn DataFrameSetListUtf8(df: DataFrame, col: int64, row: int64, ptrs: int64, lens: int64, n: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  // reuse the append path on an existing (NULL) cell by rewriting its slot
+  return ColumnSetListUtf8(df.columns[col], row, ptrs, lens, n);
+}
+
+pub fn DataFrameGetListElemUtf8Len(df: DataFrame, col: int64, row: int64, j: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnGetListElemUtf8Len(df.columns[col], row, j);
+}
+
+pub fn DataFrameGetListElemUtf8Ptr(df: DataFrame, col: int64, row: int64, j: int64): int64 {
+  if (col < 0 || col >= df.colCount) { return 0; }
+  return ColumnGetListElemUtf8Ptr(df.columns[col], row, j);
 }
 
 pub fn DataFrameSetStructInt64(df: DataFrame, col: int64, row: int64, vals: int64): int64 {
