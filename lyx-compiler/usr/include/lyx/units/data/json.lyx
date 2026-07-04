@@ -422,6 +422,104 @@ fn _jParseArrayToList(p: JParser, df: DataFrame, row: int64, keyPtr: int64, keyL
   BufferFree(slen); BufferFree(sbytes); BufferFree(sb);
 }
 
+// Parse a JSON object value at p.pos ('{') into a Struct column df[<key>, row].
+// Struct fields come from the object's numeric members (Int64 / Float64); string
+// and nested members are skipped (Utf8 struct fields are a follow-up). The struct
+// schema is fixed from the first occurrence; later rows are matched by field name.
+fn _jParseObjectToStruct(p: JParser, df: DataFrame, row: int64, keyPtr: int64, keyLen: int64) {
+  p.pos := p.pos + 1;  // consume '{'
+  var nbytes: Buffer := BufferNew(64);   // concatenated field-name bytes
+  var noff: Buffer := BufferNew(32);     // per-field name offset into nbytes
+  var nlen: Buffer := BufferNew(32);     // per-field name length
+  var ftype: Buffer := BufferNew(32);    // per-field DT_* type
+  var fval: Buffer := BufferNew(32);     // per-field 8-byte value (int64 / f64 bits)
+  var kb: Buffer := BufferNew(32);       // scratch for field-name
+  var vb: Buffer := BufferNew(32);       // scratch for value strings
+  var bitScratch: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var v: JVal;
+  var nf: int64 := 0;
+  var done: int64 := 0;
+  while (done == 0) {
+    _jSkipWs(p);
+    if (p.pos >= p.len) { done := 1; }
+    else {
+      var c: int64 := peek8(p.raw + p.pos) & 255;
+      if (c == 125) { p.pos := p.pos + 1; done := 1; }        // '}'
+      else if (c == 44) { p.pos := p.pos + 1; }               // ','
+      else if (c == 34) {
+        kb.len := 0;
+        _jParseString(p, kb);
+        _jSkipWs(p);
+        if (p.pos < p.len && (peek8(p.raw + p.pos) & 255) == 58) { p.pos := p.pos + 1; }  // ':'
+        _jSkipWs(p);
+        var vc: int64 := 0;
+        if (p.pos < p.len) { vc := peek8(p.raw + p.pos) & 255; }
+        if (vc == 91 || vc == 123) {
+          _jSkipContainer(p);  // nested member: skip
+        } else {
+          _jParseValue(p, vb, v);
+          if (v.kind == 1 || v.kind == 2) {  // numeric field
+            BufferPushInt64(noff, nbytes.len);
+            BufferPushInt64(nlen, kb.len);
+            if (kb.len > 0) { BufferPushBytes(nbytes, kb.data, kb.len); }
+            if (v.kind == 2) {
+              pokef64(bitScratch, v.fval);
+              BufferPushInt64(fval, peek64(bitScratch));  // raw f64 bits
+              BufferPushInt64(ftype, DT_FLOAT64);
+            } else {
+              BufferPushInt64(fval, v.ival);
+              BufferPushInt64(ftype, DT_INT64);
+            }
+            nf := nf + 1;
+          }
+          // string/null fields skipped
+        }
+      } else { p.pos := p.pos + 1; }
+    }
+  }
+  // Create the struct column on first occurrence.
+  var col: int64 := DataFrameColByName(df, keyPtr, keyLen);
+  if (col < 0 && nf > 0) {
+    var names: int64 := mmap(0, nf * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var lens: int64 := mmap(0, nf * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var types: int64 := mmap(0, nf * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var i: int64 := 0;
+    while (i < nf) {
+      // duplicate each field name into stable storage
+      var fl: int64 := BufferGetInt64(nlen, i);
+      var nm: int64 := mmap(0, fl + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+      if (fl > 0) { memcpy(nm, nbytes.data + BufferGetInt64(noff, i), fl); }
+      poke64(names + i * 8, nm);
+      poke64(lens + i * 8, fl);
+      poke64(types + i * 8, BufferGetInt64(ftype, i));
+      i := i + 1;
+    }
+    var kn: int64 := mmap(0, keyLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (keyLen > 0) { memcpy(kn, keyPtr, keyLen); }
+    col := DataFrameAddColumn(df, kn, keyLen, dtStruct(StructFields(names, lens, types, nf), nf), 1);
+    munmap(names, nf * 8); munmap(lens, nf * 8); munmap(types, nf * 8);
+  }
+  // Fill the struct cell, placing each parsed field into its schema slot by name.
+  if (col >= 0) {
+    var F: int64 := df.columns[col].field.dtype.fieldCount;
+    var vals: int64 := mmap(0, (F + 1) * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var z: int64 := 0;
+    while (z < F) { poke64(vals + z * 8, 0); z := z + 1; }
+    var j: int64 := 0;
+    while (j < nf) {
+      var fi: int64 := DataFrameStructFieldIndex(df, col,
+        nbytes.data + BufferGetInt64(noff, j), BufferGetInt64(nlen, j));
+      if (fi >= 0) { poke64(vals + fi * 8, BufferGetInt64(fval, j)); }
+      j := j + 1;
+    }
+    DataFrameSetStructInt64(df, col, row, vals);
+    munmap(vals, (F + 1) * 8);
+  }
+  munmap(bitScratch, 8);
+  BufferFree(nbytes); BufferFree(noff); BufferFree(nlen);
+  BufferFree(ftype); BufferFree(fval); BufferFree(kb); BufferFree(vb);
+}
+
 fn _jParseObjectRow(p: JParser, df: DataFrame, row: int64, keyBuf: Buffer, strBuf: Buffer) {
   p.pos := p.pos + 1;  // consume '{'
   var v: JVal;
@@ -439,8 +537,12 @@ fn _jParseObjectRow(p: JParser, df: DataFrame, row: int64, keyBuf: Buffer, strBu
         _jSkipWs(p);
         if (p.pos < p.len && (peek8(p.raw + p.pos) & 255) == 58) { p.pos := p.pos + 1; }  // ':'
         _jSkipWs(p);
-        if (p.pos < p.len && (peek8(p.raw + p.pos) & 255) == 91) {  // '[' -> List column
+        var vc: int64 := 0;
+        if (p.pos < p.len) { vc := peek8(p.raw + p.pos) & 255; }
+        if (vc == 91) {                                        // '[' -> List column
           _jParseArrayToList(p, df, row, keyBuf.data, keyBuf.len);
+        } else if (vc == 123) {                                // '{' -> Struct column
+          _jParseObjectToStruct(p, df, row, keyBuf.data, keyBuf.len);
         } else {
           _jParseValue(p, strBuf, v);
           _jSetCell(df, row, keyBuf.data, keyBuf.len, v, strBuf);
