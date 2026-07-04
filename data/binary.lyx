@@ -1,0 +1,182 @@
+// Lyx Data Library - L4 IO: native binary format
+// Fast save/load of a typed DataFrame by dumping the columns' raw buffers
+// (values / validity / aux) plus a small schema header. No per-cell parsing on
+// load — buffers are copied back verbatim — so nested List/Struct columns
+// round-trip too.
+//
+// Layout (all integers little-endian int64, as written by poke64):
+//   magic "LYXDF001" (8 bytes)
+//   colCount:i64, rowCount:i64
+//   per column:
+//     nameLen:i64, name bytes
+//     dtypeId:i64, childId:i64 (LIST element type, else 0), fieldCount:i64
+//       per struct field: fnameLen:i64, fname bytes, ftypeId:i64
+//     length:i64
+//     valuesLen:i64, values bytes
+//     validCount:i64, validity bytes (ceil(length/8))
+//     auxLen:i64, aux bytes
+
+@description("Native binary serialisation for the Lyx data framework")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit data.binary;
+
+import data.kernel;
+import data.frame;
+
+// ---- writing ---------------------------------------------------------------
+
+// Serialise `df` into a freshly allocated Buffer. Caller frees it.
+pub fn DataFrameToBinaryBuffer(df: DataFrame): Buffer {
+  var b: Buffer := BufferNew(256);
+  BufferPushBytes(b, "LYXDF001", 8);
+  BufferPushInt64(b, df.colCount);
+  BufferPushInt64(b, df.rowCount);
+  var c: int64 := 0;
+  while (c < df.colCount) {
+    var col: Column := df.columns[c];
+    var dt: DataType := col.field.dtype;
+    // name
+    BufferPushInt64(b, col.field.nameLen);
+    if (col.field.nameLen > 0) { BufferPushBytes(b, col.field.name, col.field.nameLen); }
+    // dtype
+    BufferPushInt64(b, dt.id);
+    if (dt.id == DT_LIST) {
+      var elem: DataType := dtUnbox(dt.child);
+      BufferPushInt64(b, elem.id);
+    } else {
+      BufferPushInt64(b, 0);
+    }
+    if (dt.id == DT_STRUCT) {
+      BufferPushInt64(b, dt.fieldCount);
+      var f: int64 := 0;
+      while (f < dt.fieldCount) {
+        var fnl: int64 := peek64(dt.fields + f * 24 + 8);
+        BufferPushInt64(b, fnl);
+        if (fnl > 0) { BufferPushBytes(b, peek64(dt.fields + f * 24), fnl); }
+        BufferPushInt64(b, peek64(dt.fields + f * 24 + 16));  // field type
+        f := f + 1;
+      }
+    } else {
+      BufferPushInt64(b, 0);
+    }
+    // length + raw buffers
+    BufferPushInt64(b, col.length);
+    BufferPushInt64(b, col.values.len);
+    if (col.values.len > 0) { BufferPushBytes(b, col.values.data, col.values.len); }
+    BufferPushInt64(b, col.length);
+    var vbytes: int64 := (col.length + 7) / 8;
+    if (vbytes > 0) { BufferPushBytes(b, col.validity.bits, vbytes); }
+    BufferPushInt64(b, col.aux.len);
+    if (col.aux.len > 0) { BufferPushBytes(b, col.aux.data, col.aux.len); }
+    c := c + 1;
+  }
+  return b;
+}
+
+// Write `df` to `path` in the native binary format. Returns bytes written or -1.
+pub fn DataFrameWriteBinary(df: DataFrame, path: int64): int64 {
+  var b: Buffer := DataFrameToBinaryBuffer(df);
+  var fd: int64 := open(path, 577, 420);
+  if (fd < 0) { BufferFree(b); return -1; }
+  var written: int64 := 0;
+  if (b.len > 0) { written := write(fd, b.data, b.len); }
+  close(fd);
+  BufferFree(b);
+  return written;
+}
+
+// ---- reading ---------------------------------------------------------------
+
+fn _readFileBin(path: int64): Buffer {
+  var b: Buffer := BufferNew(65536);
+  var fd: int64 := open(path, 0, 0);
+  if (fd < 0) { BufferFree(b); b.data := 0; b.len := 0; b.cap := 0; return b; }
+  var done: int64 := 0;
+  while (done == 0) {
+    if (BufferReserve(b, 65536) == 0) { done := 1; }
+    else {
+      var nr: int64 := read(fd, b.data + b.len, 65536);
+      if (nr <= 0) { done := 1; }
+      else { b.len := b.len + nr; }
+    }
+  }
+  close(fd);
+  return b;
+}
+
+// Copy `n` bytes from `src` into a fresh stable allocation (for names that must
+// outlive the file buffer). Returns the pointer.
+fn _dup(src: int64, n: int64): int64 {
+  var sz: int64 := n;
+  if (sz < 1) { sz := 1; }
+  var p: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (p < 0) { return 0; }
+  if (n > 0) { memcpy(p, src, n); }
+  return p;
+}
+
+// Read a native binary file into a DataFrame. On failure or a bad magic,
+// returns an empty DataFrame.
+pub fn DataFrameReadBinary(path: int64): DataFrame {
+  var df: DataFrame := DataFrameNew();
+  var file: Buffer := _readFileBin(path);
+  if (file.data == 0 || file.len < 24) { BufferFree(file); return df; }
+  var raw: int64 := file.data;
+  var pos: int64 := 0;
+  // magic check ("LYXDF001")
+  if ((peek8(raw) & 255) != 76 || (peek8(raw + 1) & 255) != 89) {  // 'L','Y'
+    BufferFree(file); return df;
+  }
+  pos := pos + 8;
+  var colCount: int64 := peek64(raw + pos); pos := pos + 8;
+  var rowCount: int64 := peek64(raw + pos); pos := pos + 8;
+
+  var c: int64 := 0;
+  while (c < colCount) {
+    var nameLen: int64 := peek64(raw + pos); pos := pos + 8;
+    var namePtr: int64 := _dup(raw + pos, nameLen); pos := pos + nameLen;
+    var dtId: int64 := peek64(raw + pos); pos := pos + 8;
+    var childId: int64 := peek64(raw + pos); pos := pos + 8;
+    var fieldCount: int64 := peek64(raw + pos); pos := pos + 8;
+
+    var dtype: DataType;
+    if (dtId == DT_LIST) {
+      dtype := dtList(dtBox(dtNew(childId)));
+    } else if (dtId == DT_STRUCT) {
+      var names: int64 := mmap(0, (fieldCount + 1) * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+      var lens: int64 := mmap(0, (fieldCount + 1) * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+      var types: int64 := mmap(0, (fieldCount + 1) * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+      var f: int64 := 0;
+      while (f < fieldCount) {
+        var fnl: int64 := peek64(raw + pos); pos := pos + 8;
+        poke64(names + f * 8, _dup(raw + pos, fnl)); pos := pos + fnl;
+        poke64(lens + f * 8, fnl);
+        poke64(types + f * 8, peek64(raw + pos)); pos := pos + 8;
+        f := f + 1;
+      }
+      dtype := dtStruct(StructFields(names, lens, types, fieldCount), fieldCount);
+      munmap(names, (fieldCount + 1) * 8);
+      munmap(lens, (fieldCount + 1) * 8);
+      munmap(types, (fieldCount + 1) * 8);
+    } else {
+      dtype := dtNew(dtId);
+    }
+
+    var length: int64 := peek64(raw + pos); pos := pos + 8;
+    var valuesLen: int64 := peek64(raw + pos); pos := pos + 8;
+    var valuesData: int64 := raw + pos; pos := pos + valuesLen;
+    var validCount: int64 := peek64(raw + pos); pos := pos + 8;
+    var vbytes: int64 := (validCount + 7) / 8;
+    var validBits: int64 := raw + pos; pos := pos + vbytes;
+    var auxLen: int64 := peek64(raw + pos); pos := pos + 8;
+    var auxData: int64 := raw + pos; pos := pos + auxLen;
+
+    DataFrameAppendColumnRaw(df, namePtr, nameLen, dtype,
+      valuesData, valuesLen, validBits, validCount, auxData, auxLen, length);
+    c := c + 1;
+  }
+  df.rowCount := rowCount;
+  BufferFree(file);
+  return df;
+}
