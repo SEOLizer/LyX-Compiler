@@ -964,3 +964,183 @@ pub fn DataFramePivotUtf8(src: DataFrame, indexCol: int64, pivotCol: int64, valu
   }
   return dst;
 }
+
+// ============================================================================
+// Hash-based group-by / join (int64 key) — O(n) instead of the O(n*n) scan
+// ============================================================================
+
+// Smallest power of two >= n (minimum 16).
+fn _pow2Ge(n: int64): int64 {
+  var p: int64 := 16;
+  while (p < n) { p := p * 2; }
+  return p;
+}
+
+// Mix an int64 key into a hash. Callers mask with (cap-1) for the slot index.
+fn _hashInt64(k: int64): int64 {
+  var h: int64 := k * 2654435761;
+  h := h ^ (h >> 32);
+  return h;
+}
+
+// Group `src` by the int64 column `keyCol` and sum `valCol`, using an
+// open-addressing hash index from key to the destination group row. Same result
+// as DataFrameGroupBySumInt64 but O(n). Result: key column + "sum".
+pub fn DataFrameGroupBySumInt64Hash(src: DataFrame, keyCol: int64, valCol: int64): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  if (keyCol < 0 || keyCol >= src.colCount) { return dst; }
+  var kc: int64 := DataFrameAddColumn(dst,
+    src.columns[keyCol].field.name, src.columns[keyCol].field.nameLen,
+    src.columns[keyCol].field.dtype, 0);
+  var sc: int64 := DataFrameAddColumn(dst, "sum", 3, dtNew(DT_INT64), 1);
+  var cap: int64 := _pow2Ge(src.rowCount * 2 + 16);
+  var mask: int64 := cap - 1;
+  // slots: cap * 16 bytes = [key, groupRow+1]; groupRow+1 == 0 means empty.
+  var slots: int64 := mmap(0, cap * 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (slots < 0) { return dst; }
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    if (DataFrameIsValid(src, keyCol, r) != 0) {
+      var key: int64 := DataFrameGetInt64(src, keyCol, r);
+      var h: int64 := _hashInt64(key) & mask;
+      var groupRow: int64 := -1;
+      var probing: int64 := 1;
+      while (probing != 0) {
+        var pay: int64 := peek64(slots + h * 16 + 8);
+        if (pay == 0) {                       // empty -> new group
+          groupRow := DataFrameAppendRow(dst);
+          DataFrameSetInt64(dst, kc, groupRow, key);
+          DataFrameSetInt64(dst, sc, groupRow, 0);
+          poke64(slots + h * 16, key);
+          poke64(slots + h * 16 + 8, groupRow + 1);
+          probing := 0;
+        } else if (peek64(slots + h * 16) == key) {  // found
+          groupRow := pay - 1;
+          probing := 0;
+        } else {
+          h := (h + 1) & mask;                // linear probe
+        }
+      }
+      if (DataFrameIsValid(src, valCol, r) != 0) {
+        DataFrameSetInt64(dst, sc, groupRow,
+          DataFrameGetInt64(dst, sc, groupRow) + DataFrameGetInt64(src, valCol, r));
+      }
+    }
+    r := r + 1;
+  }
+  munmap(slots, cap * 16);
+  return dst;
+}
+
+// Group-by count with a hash index. Result: key column + "count".
+pub fn DataFrameGroupByCountInt64Hash(src: DataFrame, keyCol: int64): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  if (keyCol < 0 || keyCol >= src.colCount) { return dst; }
+  var kc: int64 := DataFrameAddColumn(dst,
+    src.columns[keyCol].field.name, src.columns[keyCol].field.nameLen,
+    src.columns[keyCol].field.dtype, 0);
+  var cc: int64 := DataFrameAddColumn(dst, "count", 5, dtNew(DT_INT64), 1);
+  var cap: int64 := _pow2Ge(src.rowCount * 2 + 16);
+  var mask: int64 := cap - 1;
+  var slots: int64 := mmap(0, cap * 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (slots < 0) { return dst; }
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    if (DataFrameIsValid(src, keyCol, r) != 0) {
+      var key: int64 := DataFrameGetInt64(src, keyCol, r);
+      var h: int64 := _hashInt64(key) & mask;
+      var groupRow: int64 := -1;
+      var probing: int64 := 1;
+      while (probing != 0) {
+        var pay: int64 := peek64(slots + h * 16 + 8);
+        if (pay == 0) {
+          groupRow := DataFrameAppendRow(dst);
+          DataFrameSetInt64(dst, kc, groupRow, key);
+          DataFrameSetInt64(dst, cc, groupRow, 0);
+          poke64(slots + h * 16, key);
+          poke64(slots + h * 16 + 8, groupRow + 1);
+          probing := 0;
+        } else if (peek64(slots + h * 16) == key) {
+          groupRow := pay - 1;
+          probing := 0;
+        } else {
+          h := (h + 1) & mask;
+        }
+      }
+      DataFrameSetInt64(dst, cc, groupRow, DataFrameGetInt64(dst, cc, groupRow) + 1);
+    }
+    r := r + 1;
+  }
+  munmap(slots, cap * 16);
+  return dst;
+}
+
+// Inner join on int64 keys using a hash index built on `right` (chained for
+// multiple rows per key). O(L + R) instead of O(L * R). Same result as
+// DataFrameJoinInner.
+pub fn DataFrameJoinInnerInt64Hash(left: DataFrame, leftKey: int64,
+                                   right: DataFrame, rightKey: int64): DataFrame {
+  var dst: DataFrame := _joinSchema(left, right);
+  if (leftKey < 0 || leftKey >= left.colCount) { return dst; }
+  if (rightKey < 0 || rightKey >= right.colCount) { return dst; }
+  var cap: int64 := _pow2Ge(right.rowCount * 2 + 16);
+  var mask: int64 := cap - 1;
+  // slots: [key, firstChain+1]; firstChain+1 == 0 means empty.
+  var slots: int64 := mmap(0, cap * 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (slots < 0) { return dst; }
+  // chainNext[rr] = next right row+1 in the same bucket (0 = end).
+  var chainNext: int64 := mmap(0, (right.rowCount + 1) * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (chainNext < 0) { munmap(slots, cap * 16); return dst; }
+  // Build phase: insert each right row.
+  var rr: int64 := 0;
+  while (rr < right.rowCount) {
+    if (DataFrameIsValid(right, rightKey, rr) != 0) {
+      var key: int64 := DataFrameGetInt64(right, rightKey, rr);
+      var h: int64 := _hashInt64(key) & mask;
+      var probing: int64 := 1;
+      while (probing != 0) {
+        var pay: int64 := peek64(slots + h * 16 + 8);
+        if (pay == 0) {                        // empty -> new bucket
+          poke64(slots + h * 16, key);
+          poke64(slots + h * 16 + 8, rr + 1);
+          poke64(chainNext + rr * 8, 0);
+          probing := 0;
+        } else if (peek64(slots + h * 16) == key) {  // prepend to chain
+          poke64(chainNext + rr * 8, pay);
+          poke64(slots + h * 16 + 8, rr + 1);
+          probing := 0;
+        } else {
+          h := (h + 1) & mask;
+        }
+      }
+    }
+    rr := rr + 1;
+  }
+  // Probe phase: each left row against the index.
+  var lr: int64 := 0;
+  while (lr < left.rowCount) {
+    if (DataFrameIsValid(left, leftKey, lr) != 0) {
+      var key: int64 := DataFrameGetInt64(left, leftKey, lr);
+      var h: int64 := _hashInt64(key) & mask;
+      var searching: int64 := 1;
+      while (searching != 0) {
+        var pay: int64 := peek64(slots + h * 16 + 8);
+        if (pay == 0) { searching := 0; }             // key absent
+        else if (peek64(slots + h * 16) == key) {     // walk the chain
+          var c: int64 := pay;
+          while (c != 0) {
+            _emitJoinedRow(dst, left, lr, right, c - 1, 1);
+            c := peek64(chainNext + (c - 1) * 8);
+          }
+          searching := 0;
+        } else {
+          h := (h + 1) & mask;
+        }
+      }
+    }
+    lr := lr + 1;
+  }
+  munmap(slots, cap * 16);
+  munmap(chainNext, (right.rowCount + 1) * 8);
+  return dst;
+}
