@@ -512,6 +512,153 @@ pub fn DataFrameJoinLeft(left: DataFrame, leftKey: int64,
 }
 
 // ============================================================================
+// Utf8-key group-by / join
+// ============================================================================
+
+// Compare the Utf8 cell df[col,row] against the bytes ptr[0..len). Returns 1
+// if equal (same length and bytes).
+fn _utf8CellEq(df: DataFrame, col: int64, row: int64, ptr: int64, len: int64): int64 {
+  if (DataFrameGetUtf8Len(df, col, row) != len) { return 0; }
+  var p: int64 := DataFrameGetUtf8Ptr(df, col, row);
+  var i: int64 := 0;
+  while (i < len) {
+    if ((peek8(p + i) & 255) != (peek8(ptr + i) & 255)) { return 0; }
+    i := i + 1;
+  }
+  return 1;
+}
+
+// Row in `df` whose Utf8 column `keyCol` equals ptr[0..len), or -1.
+fn _findKeyRowUtf8(df: DataFrame, keyCol: int64, ptr: int64, len: int64): int64 {
+  var r: int64 := 0;
+  while (r < df.rowCount) {
+    if (DataFrameIsValid(df, keyCol, r) != 0) {
+      if (_utf8CellEq(df, keyCol, r, ptr, len) != 0) { return r; }
+    }
+    r := r + 1;
+  }
+  return -1;
+}
+
+// Group `src` by the Utf8 column `keyCol` and sum the int64 column `valCol` per
+// group. Result: the key column (Utf8, named after keyCol) + "sum". NULL keys
+// skipped, NULL values contribute nothing.
+pub fn DataFrameGroupBySumUtf8(src: DataFrame, keyCol: int64, valCol: int64): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  if (keyCol < 0 || keyCol >= src.colCount) { return dst; }
+  var kc: int64 := DataFrameAddColumn(dst,
+    src.columns[keyCol].field.name, src.columns[keyCol].field.nameLen,
+    src.columns[keyCol].field.dtype, 0);
+  var sc: int64 := DataFrameAddColumn(dst, "sum", 3, dtNew(DT_INT64), 1);
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    if (DataFrameIsValid(src, keyCol, r) != 0) {
+      var kp: int64 := DataFrameGetUtf8Ptr(src, keyCol, r);
+      var kl: int64 := DataFrameGetUtf8Len(src, keyCol, r);
+      var g: int64 := _findKeyRowUtf8(dst, kc, kp, kl);
+      if (g < 0) {
+        g := DataFrameAppendRow(dst);
+        DataFrameSetUtf8(dst, kc, g, kp, kl);
+        DataFrameSetInt64(dst, sc, g, 0);
+      }
+      if (DataFrameIsValid(src, valCol, r) != 0) {
+        DataFrameSetInt64(dst, sc, g,
+          DataFrameGetInt64(dst, sc, g) + DataFrameGetInt64(src, valCol, r));
+      }
+    }
+    r := r + 1;
+  }
+  return dst;
+}
+
+// Group `src` by the Utf8 column `keyCol` and count rows per group. Result: the
+// key column (Utf8) + "count". NULL keys skipped.
+pub fn DataFrameGroupByCountUtf8(src: DataFrame, keyCol: int64): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  if (keyCol < 0 || keyCol >= src.colCount) { return dst; }
+  var kc: int64 := DataFrameAddColumn(dst,
+    src.columns[keyCol].field.name, src.columns[keyCol].field.nameLen,
+    src.columns[keyCol].field.dtype, 0);
+  var cc: int64 := DataFrameAddColumn(dst, "count", 5, dtNew(DT_INT64), 1);
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    if (DataFrameIsValid(src, keyCol, r) != 0) {
+      var kp: int64 := DataFrameGetUtf8Ptr(src, keyCol, r);
+      var kl: int64 := DataFrameGetUtf8Len(src, keyCol, r);
+      var g: int64 := _findKeyRowUtf8(dst, kc, kp, kl);
+      if (g < 0) {
+        g := DataFrameAppendRow(dst);
+        DataFrameSetUtf8(dst, kc, g, kp, kl);
+        DataFrameSetInt64(dst, cc, g, 0);
+      }
+      DataFrameSetInt64(dst, cc, g, DataFrameGetInt64(dst, cc, g) + 1);
+    }
+    r := r + 1;
+  }
+  return dst;
+}
+
+// Inner join on Utf8 keys: one output row per (left, right) pair whose Utf8 key
+// columns are equal and non-NULL. Output = left columns ++ right columns.
+pub fn DataFrameJoinInnerUtf8(left: DataFrame, leftKey: int64,
+                              right: DataFrame, rightKey: int64): DataFrame {
+  var dst: DataFrame := _joinSchema(left, right);
+  if (leftKey < 0 || leftKey >= left.colCount) { return dst; }
+  if (rightKey < 0 || rightKey >= right.colCount) { return dst; }
+  var lr: int64 := 0;
+  while (lr < left.rowCount) {
+    if (DataFrameIsValid(left, leftKey, lr) != 0) {
+      var lp: int64 := DataFrameGetUtf8Ptr(left, leftKey, lr);
+      var ll: int64 := DataFrameGetUtf8Len(left, leftKey, lr);
+      var rr: int64 := 0;
+      while (rr < right.rowCount) {
+        if (DataFrameIsValid(right, rightKey, rr) != 0) {
+          if (_utf8CellEq(right, rightKey, rr, lp, ll) != 0) {
+            _emitJoinedRow(dst, left, lr, right, rr, 1);
+          }
+        }
+        rr := rr + 1;
+      }
+    }
+    lr := lr + 1;
+  }
+  return dst;
+}
+
+// Left join on Utf8 keys: every left row appears at least once; a left row with
+// no match gets NULLs for the right columns.
+pub fn DataFrameJoinLeftUtf8(left: DataFrame, leftKey: int64,
+                             right: DataFrame, rightKey: int64): DataFrame {
+  var dst: DataFrame := _joinSchema(left, right);
+  if (leftKey < 0 || leftKey >= left.colCount) { return dst; }
+  var rightOk: int64 := 1;
+  if (rightKey < 0 || rightKey >= right.colCount) { rightOk := 0; }
+  var lr: int64 := 0;
+  while (lr < left.rowCount) {
+    var matched: int64 := 0;
+    if (DataFrameIsValid(left, leftKey, lr) != 0 && rightOk != 0) {
+      var lp: int64 := DataFrameGetUtf8Ptr(left, leftKey, lr);
+      var ll: int64 := DataFrameGetUtf8Len(left, leftKey, lr);
+      var rr: int64 := 0;
+      while (rr < right.rowCount) {
+        if (DataFrameIsValid(right, rightKey, rr) != 0) {
+          if (_utf8CellEq(right, rightKey, rr, lp, ll) != 0) {
+            _emitJoinedRow(dst, left, lr, right, rr, 1);
+            matched := 1;
+          }
+        }
+        rr := rr + 1;
+      }
+    }
+    if (matched == 0) {
+      _emitJoinedRow(dst, left, lr, right, 0, 0);
+    }
+    lr := lr + 1;
+  }
+  return dst;
+}
+
+// ============================================================================
 // Reshape (melt / pivot)
 // ============================================================================
 
