@@ -1274,3 +1274,180 @@ pub fn DataFrameJoinInnerInt64Hash(left: DataFrame, leftKey: int64,
   munmap(chainNext, (right.rowCount + 1) * 8);
   return dst;
 }
+
+// ============================================================================
+// Hash-based group-by / join (Utf8 key) — O(n)
+// ============================================================================
+//
+// String keys can't be stored inline in a hash slot, so the slot holds only a
+// row reference and collisions are resolved by comparing the incoming key bytes
+// against the referenced row's key cell (in dst for group-by, in the right
+// frame for join). All keys in one bucket-chain are equal by construction.
+
+// FNV-1a hash of a byte range. Callers mask with (cap-1) for the slot index.
+fn _hashBytes(ptr: int64, len: int64): int64 {
+  var h: int64 := 1125899906842597;
+  var i: int64 := 0;
+  while (i < len) {
+    h := (h ^ (peek8(ptr + i) & 255)) * 1099511628211;
+    i := i + 1;
+  }
+  return h;
+}
+
+// Group `src` by the Utf8 column `keyCol`, summing int64 `valCol`, via a hash
+// index (slot -> dst group row+1). Result: key column (Utf8) + "sum". O(n).
+pub fn DataFrameGroupBySumUtf8Hash(src: DataFrame, keyCol: int64, valCol: int64): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  if (keyCol < 0 || keyCol >= src.colCount) { return dst; }
+  var kc: int64 := DataFrameAddColumn(dst,
+    src.columns[keyCol].field.name, src.columns[keyCol].field.nameLen,
+    src.columns[keyCol].field.dtype, 0);
+  var sc: int64 := DataFrameAddColumn(dst, "sum", 3, dtNew(DT_INT64), 1);
+  var cap: int64 := _pow2Ge(src.rowCount * 2 + 16);
+  var mask: int64 := cap - 1;
+  var slots: int64 := mmap(0, cap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);  // group row+1; 0=empty
+  if (slots < 0) { return dst; }
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    if (DataFrameIsValid(src, keyCol, r) != 0) {
+      var kp: int64 := DataFrameGetUtf8Ptr(src, keyCol, r);
+      var kl: int64 := DataFrameGetUtf8Len(src, keyCol, r);
+      var h: int64 := _hashBytes(kp, kl) & mask;
+      var groupRow: int64 := -1;
+      var probing: int64 := 1;
+      while (probing != 0) {
+        var pay: int64 := peek64(slots + h * 8);
+        if (pay == 0) {
+          groupRow := DataFrameAppendRow(dst);
+          DataFrameSetUtf8(dst, kc, groupRow, kp, kl);
+          DataFrameSetInt64(dst, sc, groupRow, 0);
+          poke64(slots + h * 8, groupRow + 1);
+          probing := 0;
+        } else if (_utf8CellEq(dst, kc, pay - 1, kp, kl) != 0) {
+          groupRow := pay - 1;
+          probing := 0;
+        } else {
+          h := (h + 1) & mask;
+        }
+      }
+      if (DataFrameIsValid(src, valCol, r) != 0) {
+        DataFrameSetInt64(dst, sc, groupRow,
+          DataFrameGetInt64(dst, sc, groupRow) + DataFrameGetInt64(src, valCol, r));
+      }
+    }
+    r := r + 1;
+  }
+  munmap(slots, cap * 8);
+  return dst;
+}
+
+// Group-by count on a Utf8 key with a hash index. Result: key column + "count".
+pub fn DataFrameGroupByCountUtf8Hash(src: DataFrame, keyCol: int64): DataFrame {
+  var dst: DataFrame := DataFrameNew();
+  if (keyCol < 0 || keyCol >= src.colCount) { return dst; }
+  var kc: int64 := DataFrameAddColumn(dst,
+    src.columns[keyCol].field.name, src.columns[keyCol].field.nameLen,
+    src.columns[keyCol].field.dtype, 0);
+  var cc: int64 := DataFrameAddColumn(dst, "count", 5, dtNew(DT_INT64), 1);
+  var cap: int64 := _pow2Ge(src.rowCount * 2 + 16);
+  var mask: int64 := cap - 1;
+  var slots: int64 := mmap(0, cap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (slots < 0) { return dst; }
+  var r: int64 := 0;
+  while (r < src.rowCount) {
+    if (DataFrameIsValid(src, keyCol, r) != 0) {
+      var kp: int64 := DataFrameGetUtf8Ptr(src, keyCol, r);
+      var kl: int64 := DataFrameGetUtf8Len(src, keyCol, r);
+      var h: int64 := _hashBytes(kp, kl) & mask;
+      var groupRow: int64 := -1;
+      var probing: int64 := 1;
+      while (probing != 0) {
+        var pay: int64 := peek64(slots + h * 8);
+        if (pay == 0) {
+          groupRow := DataFrameAppendRow(dst);
+          DataFrameSetUtf8(dst, kc, groupRow, kp, kl);
+          DataFrameSetInt64(dst, cc, groupRow, 0);
+          poke64(slots + h * 8, groupRow + 1);
+          probing := 0;
+        } else if (_utf8CellEq(dst, kc, pay - 1, kp, kl) != 0) {
+          groupRow := pay - 1;
+          probing := 0;
+        } else {
+          h := (h + 1) & mask;
+        }
+      }
+      DataFrameSetInt64(dst, cc, groupRow, DataFrameGetInt64(dst, cc, groupRow) + 1);
+    }
+    r := r + 1;
+  }
+  munmap(slots, cap * 8);
+  return dst;
+}
+
+// Inner join on Utf8 keys with a chained hash index on `right`. O(L + R).
+pub fn DataFrameJoinInnerUtf8Hash(left: DataFrame, leftKey: int64,
+                                  right: DataFrame, rightKey: int64): DataFrame {
+  var dst: DataFrame := _joinSchema(left, right);
+  if (leftKey < 0 || leftKey >= left.colCount) { return dst; }
+  if (rightKey < 0 || rightKey >= right.colCount) { return dst; }
+  var cap: int64 := _pow2Ge(right.rowCount * 2 + 16);
+  var mask: int64 := cap - 1;
+  var slots: int64 := mmap(0, cap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);  // first right row+1
+  if (slots < 0) { return dst; }
+  var chainNext: int64 := mmap(0, (right.rowCount + 1) * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (chainNext < 0) { munmap(slots, cap * 8); return dst; }
+  // build
+  var rr: int64 := 0;
+  while (rr < right.rowCount) {
+    if (DataFrameIsValid(right, rightKey, rr) != 0) {
+      var kp: int64 := DataFrameGetUtf8Ptr(right, rightKey, rr);
+      var kl: int64 := DataFrameGetUtf8Len(right, rightKey, rr);
+      var h: int64 := _hashBytes(kp, kl) & mask;
+      var probing: int64 := 1;
+      while (probing != 0) {
+        var pay: int64 := peek64(slots + h * 8);
+        if (pay == 0) {
+          poke64(slots + h * 8, rr + 1);
+          poke64(chainNext + rr * 8, 0);
+          probing := 0;
+        } else if (_utf8CellEq(right, rightKey, pay - 1, kp, kl) != 0) {
+          poke64(chainNext + rr * 8, pay);
+          poke64(slots + h * 8, rr + 1);
+          probing := 0;
+        } else {
+          h := (h + 1) & mask;
+        }
+      }
+    }
+    rr := rr + 1;
+  }
+  // probe
+  var lr: int64 := 0;
+  while (lr < left.rowCount) {
+    if (DataFrameIsValid(left, leftKey, lr) != 0) {
+      var kp: int64 := DataFrameGetUtf8Ptr(left, leftKey, lr);
+      var kl: int64 := DataFrameGetUtf8Len(left, leftKey, lr);
+      var h: int64 := _hashBytes(kp, kl) & mask;
+      var searching: int64 := 1;
+      while (searching != 0) {
+        var pay: int64 := peek64(slots + h * 8);
+        if (pay == 0) { searching := 0; }
+        else if (_utf8CellEq(right, rightKey, pay - 1, kp, kl) != 0) {
+          var c: int64 := pay;
+          while (c != 0) {
+            _emitJoinedRow(dst, left, lr, right, c - 1, 1);
+            c := peek64(chainNext + (c - 1) * 8);
+          }
+          searching := 0;
+        } else {
+          h := (h + 1) & mask;
+        }
+      }
+    }
+    lr := lr + 1;
+  }
+  munmap(slots, cap * 8);
+  munmap(chainNext, (right.rowCount + 1) * 8);
+  return dst;
+}
