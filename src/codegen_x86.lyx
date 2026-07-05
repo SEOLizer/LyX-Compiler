@@ -2483,6 +2483,29 @@ pub type Codegen = class {
           }
         }
       }
+      // Stage 2c (methods): record class methods' return types under their
+      // mangled "ClassName_Method" name, so `obj.M() + x` can resolve M's class.
+      if (self.cg_nkind(cur) == CGN_TYPE_DECL && (self.cg_nival(cur) & 2) == 0) {
+        var cln: pchar := self.cg_nsval(cur);
+        var clnLen: int64 := self.cg_nslen(cur);
+        var method: int64 := self.cg_nc1(cur);
+        while (method != -1) {
+          var mRetNi: int64 := self.cg_nc1(method);
+          if (mRetNi >= 0) {
+            var mrn: pchar := self.cg_nsval(mRetNi);
+            var mrl: int64 := self.cg_nslen(mRetNi);
+            if (mrl > 0) {
+              var lc: int64 := alloc(8);
+              var mb: int64 := self.cg_mangleInto(cln, clnLen, self.cg_nsval(method), self.cg_nslen(method), lc);
+              var mbLen: int64 := peek64(lc);
+              free(lc, 8);
+              self.cg_registerFuncRet(mb as pchar, mbLen, mrn, mrl);
+              self.cg_trackTempBuf(mb, mbLen + 1);
+            }
+          }
+          method := self.cg_nnext(method);
+        }
+      }
       cur := self.cg_nnext(cur);
     }
   }
@@ -2570,22 +2593,32 @@ pub type Codegen = class {
       }
       return 0 - 1;
     }
-    // Stage 2c: a free-function call whose declared return type is a class, e.g.
-    // `StringFromPchar(..) + ..`. (Method calls — return type depends on the
-    // receiver's class — are not resolved here yet.)
-    if (k == CGN_CALL && self.cg_nival(ni) == 0) {
-      return self.cg_funcRetClassIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+    if (k == CGN_CALL) {
+      // Free function whose return type is a class, e.g. `StringFromPchar(..) + ..`.
+      if (self.cg_nival(ni) == 0) {
+        return self.cg_funcRetClassIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      }
+      // Method call `obj.M()`: resolve the receiver's class, then look up the
+      // mangled "ReceiverClass_M" in the return-type registry.
+      if (self.cg_nival(ni) == 1) {
+        var recvCi: int64 := self.cg_exprClassName(self.cg_nc0(ni));
+        if (recvCi < 0) { return 0 - 1; }
+        var lc: int64 := alloc(8);
+        var mb: int64 := self.cg_buildMethodMangled(recvCi, self.cg_nsval(ni), self.cg_nslen(ni), lc);
+        var mbLen: int64 := peek64(lc);
+        free(lc, 8);
+        var res: int64 := self.cg_funcRetClassIdx(mb as pchar, mbLen);
+        self.cg_trackTempBuf(mb, mbLen + 1);
+        return res;
+      }
     }
     return 0 - 1;
   }
 
-  // Build the mangled method name "ClassName_Method" into a fresh tracked buffer;
-  // returns the buffer (NUL-terminated) and writes its length to `lenCell`.
-  fn cg_buildMethodMangled(ci: int64, mname: pchar, lenCell: int64): int64 {
-    var cbase: int64 := self.classLayouts + ci * CG_CLASS_SZ;
-    var cln: pchar := peek64(cbase) as pchar;
-    var clnLen: int64 := peek64(cbase + CG_CLASS_OFF_NAMELEN);
-    var mlen: int64 := StrLen(mname);
+  // Build "ClassName_Method" from raw name+length pairs (neither need be NUL-
+  // terminated) into a fresh tracked buffer; returns the buffer (NUL-terminated)
+  // and writes its length to `lenCell`.
+  fn cg_mangleInto(cln: pchar, clnLen: int64, mname: pchar, mlen: int64, lenCell: int64): int64 {
     var mangLen: int64 := clnLen + 1 + mlen;
     var mangBuf: int64 := alloc(mangLen + 1);
     var ci2: int64 := 0;
@@ -2596,6 +2629,14 @@ pub type Codegen = class {
     poke8(mangBuf + mangLen, 0);
     poke64(lenCell, mangLen);
     return mangBuf;
+  }
+
+  // Build the mangled method name "ClassName_Method" for class-layout index `ci`.
+  fn cg_buildMethodMangled(ci: int64, mname: pchar, mlen: int64, lenCell: int64): int64 {
+    var cbase: int64 := self.classLayouts + ci * CG_CLASS_SZ;
+    var cln: pchar := peek64(cbase) as pchar;
+    var clnLen: int64 := peek64(cbase + CG_CLASS_OFF_NAMELEN);
+    return self.cg_mangleInto(cln, clnLen, mname, mlen, lenCell);
   }
 
   // Emit a direct 1-arg method call `recv.Method(arg)`: receiver→rdi (self),
@@ -2630,7 +2671,7 @@ pub type Codegen = class {
     var ci: int64 := self.cg_exprClassName(lhsNi);
     if (ci < 0) { return 0; }
     var lenCell: int64 := alloc(8);
-    var mangBuf: int64 := self.cg_buildMethodMangled(ci, mname, lenCell);
+    var mangBuf: int64 := self.cg_buildMethodMangled(ci, mname, StrLen(mname), lenCell);
     var mangLen: int64 := peek64(lenCell);
     free(lenCell, 8);
     if (self.cg_findLabel(mangBuf as pchar, mangLen) >= 0) {
@@ -2641,7 +2682,7 @@ pub type Codegen = class {
     // != fallback: a class that defines Eq but not Ne still gets `!=` as !(Eq).
     if (op == CGT_NEQ) {
       var lc2: int64 := alloc(8);
-      var eqBuf: int64 := self.cg_buildMethodMangled(ci, "Eq", lc2);
+      var eqBuf: int64 := self.cg_buildMethodMangled(ci, "Eq", 2, lc2);
       var eqLen: int64 := peek64(lc2);
       free(lc2, 8);
       if (self.cg_findLabel(eqBuf as pchar, eqLen) >= 0) {
@@ -2661,7 +2702,7 @@ pub type Codegen = class {
     var ci: int64 := self.cg_exprClassName(baseNi);
     if (ci < 0) { return 0; }
     var lenCell: int64 := alloc(8);
-    var mangBuf: int64 := self.cg_buildMethodMangled(ci, "Get", lenCell);
+    var mangBuf: int64 := self.cg_buildMethodMangled(ci, "Get", 3, lenCell);
     var mangLen: int64 := peek64(lenCell);
     free(lenCell, 8);
     if (self.cg_findLabel(mangBuf as pchar, mangLen) < 0) {
