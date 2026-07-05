@@ -1,0 +1,174 @@
+// std.strtype — owned, length-carrying String value type
+//
+// Motivation: Lyx's `pchar` is a raw NUL-terminated C string. Its length is not
+// carried (every length query scans for NUL), embedded NUL bytes are impossible,
+// and there is no clear ownership. `String` fixes that: it stores an explicit
+// byte length + capacity alongside an owned, growable buffer.
+//
+// Design:
+//   - libc-free: memory comes from mmap/munmap only (like the data framework).
+//   - Explicit length — no NUL scan, embedded NUL bytes are fine.
+//   - Structs are pass-by-reference in Lyx, so growth (StringReserve) reassigns
+//     `data`/`cap` in place and the caller sees the larger buffer.
+//   - Interop: StringFromPchar imports a C string, StringToPchar exports a fresh
+//     NUL-terminated copy the caller owns.
+
+@description("Owned, length-carrying String value type (libc-free)")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit std.strtype;
+
+pub type String = struct {
+  data: int64;   // mmap'd byte region (raw bytes, NOT NUL-terminated)
+  len: int64;    // number of bytes in use
+  cap: int64;    // allocated capacity in bytes
+};
+
+// Length of a raw NUL-terminated pchar (byte scan).
+fn _pcharLen(p: int64): int64 {
+  if (p == 0) { return 0; }
+  var n: int64 := 0;
+  while ((peek8(p + n) & 255) != 0) { n += 1; }
+  return n;
+}
+
+// Create an empty String with an initial capacity (rounded to >= 1).
+// data == 0 signals allocation failure.
+pub fn StringNew(cap: int64): String {
+  var s: String;
+  var c: int64 := cap;
+  if (c < 1) { c := 1; }
+  s.data := mmap(0, c, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (s.data < 0) { s.data := 0; s.len := 0; s.cap := 0; return s; }
+  s.len := 0;
+  s.cap := c;
+  return s;
+}
+
+// Ensure at least `need` more bytes fit; doubles capacity as needed
+// (mmap + memcpy + munmap). Returns 1 on success, 0 on OOM (unchanged).
+pub fn StringReserve(s: String, need: int64): int64 {
+  if (s.data == 0) { return 0; }
+  if (s.len + need <= s.cap) { return 1; }
+  var newCap: int64 := s.cap;
+  if (newCap < 1) { newCap := 1; }
+  while (newCap < s.len + need) { newCap *= 2; }
+  var nb: int64 := mmap(0, newCap, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (nb < 0) { return 0; }
+  memcpy(nb, s.data, s.len);
+  munmap(s.data, s.cap);
+  s.data := nb;
+  s.cap := newCap;
+  return 1;
+}
+
+// Copy `n` raw bytes from `ptr` into a new owned String (embedded NUL allowed).
+pub fn StringFromBytes(ptr: int64, n: int64): String {
+  var s: String := StringNew(n + 1);
+  if (s.data == 0) { return s; }
+  if (n > 0) { memcpy(s.data, ptr, n); s.len := n; }
+  return s;
+}
+
+// Copy a NUL-terminated pchar into a new owned String.
+pub fn StringFromPchar(p: int64): String {
+  return StringFromBytes(p, _pcharLen(p));
+}
+
+pub fn StringLen(s: String): int64 { return s.len; }
+
+// Byte at `i` (0 if out of range).
+pub fn StringCharAt(s: String, i: int64): int64 {
+  if (i < 0 || i >= s.len) { return 0; }
+  return peek8(s.data + i) & 255;
+}
+
+// Raw data pointer (valid for `len` bytes; NOT NUL-terminated).
+pub fn StringData(s: String): int64 { return s.data; }
+
+// Append a single byte. Returns 1 on success, 0 on OOM.
+pub fn StringAppendChar(s: String, c: int64): int64 {
+  if (StringReserve(s, 1) == 0) { return 0; }
+  poke8(s.data + s.len, c & 255);
+  s.len += 1;
+  return 1;
+}
+
+// Append `n` raw bytes from `ptr`. Returns 1 on success, 0 on OOM.
+pub fn StringAppendBytes(s: String, ptr: int64, n: int64): int64 {
+  if (n <= 0) { return 1; }
+  if (StringReserve(s, n) == 0) { return 0; }
+  memcpy(s.data + s.len, ptr, n);
+  s.len += n;
+  return 1;
+}
+
+// Append a NUL-terminated pchar. Returns 1 on success, 0 on OOM.
+pub fn StringAppendPchar(s: String, p: int64): int64 {
+  return StringAppendBytes(s, p, _pcharLen(p));
+}
+
+// Append another String's bytes. Returns 1 on success, 0 on OOM.
+pub fn StringAppend(s: String, other: String): int64 {
+  return StringAppendBytes(s, other.data, other.len);
+}
+
+// New String = a ++ b.
+pub fn StringConcat(a: String, b: String): String {
+  var r: String := StringNew(a.len + b.len + 1);
+  if (r.data == 0) { return r; }
+  StringAppendBytes(r, a.data, a.len);
+  StringAppendBytes(r, b.data, b.len);
+  return r;
+}
+
+// New String = the `count` bytes of `s` starting at `start` (clamped to range).
+pub fn StringSubstring(s: String, start: int64, count: int64): String {
+  var st: int64 := start;
+  if (st < 0) { st := 0; }
+  var n: int64 := count;
+  if (st + n > s.len) { n := s.len - st; }
+  if (n < 0) { n := 0; }
+  return StringFromBytes(s.data + st, n);
+}
+
+// Byte-wise equality of two Strings.
+pub fn StringEquals(a: String, b: String): int64 {
+  if (a.len != b.len) { return 0; }
+  var i: int64 := 0;
+  while (i < a.len) {
+    if ((peek8(a.data + i) & 255) != (peek8(b.data + i) & 255)) { return 0; }
+    i += 1;
+  }
+  return 1;
+}
+
+// Equality against a NUL-terminated pchar.
+pub fn StringEqualsPchar(s: String, p: int64): int64 {
+  var pl: int64 := _pcharLen(p);
+  if (s.len != pl) { return 0; }
+  var i: int64 := 0;
+  while (i < s.len) {
+    if ((peek8(s.data + i) & 255) != (peek8(p + i) & 255)) { return 0; }
+    i += 1;
+  }
+  return 1;
+}
+
+// Export a fresh NUL-terminated copy (len+1 bytes) the caller owns (munmap with
+// len+1). Returns the pointer, or 0 on OOM.
+pub fn StringToPchar(s: String): int64 {
+  var p: int64 := mmap(0, s.len + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (p < 0) { return 0; }
+  if (s.len > 0) { memcpy(p, s.data, s.len); }
+  poke8(p + s.len, 0);  // NUL terminator
+  return p;
+}
+
+// Release the String's memory and reset it to empty.
+pub fn StringFree(s: String) {
+  if (s.data != 0) { munmap(s.data, s.cap); }
+  s.data := 0;
+  s.len := 0;
+  s.cap := 0;
+}
