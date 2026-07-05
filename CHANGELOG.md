@@ -1,5 +1,27 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.8B (Juli 2026)
+
+Operator-Overloading für User-Klassen (Stufe 2a). Basis V1.0.8A.
+
+- **`a + b` → `a.Add(b)`** wenn der linke Operand ein Identifier mit class-Typ
+  ist, dessen Klasse die Operator-Methode definiert. Generisch — jede Klasse
+  mit passender Methode (String, Vec, BigInt …), kein String-Hardcode.
+- Operator → Methode: `+` Add, `-` Sub, `*` Mul, `/` Div, `%` Mod, `==` Eq.
+- Umsetzung im Codegen (x86): `cg_tryClassBinop` erkennt den class-Ident-Links-
+  Operanden über `localTypes`, baut den mangled Namen `ClassName_Method`, prüft
+  das Label und emittiert einen direkten Method-Call (Receiver→rdi/self,
+  Arg→rsi, Ergebnis rax). Neuer Zweig im CGN_BINOP-Handler neben
+  `pchar+pchar→StrConcat` und `parallel-Array→SIMD`. Trigger bewusst eng (nur
+  Ident-Links-Operand) → int/f64/pchar-Binops unverändert.
+- **Vertagt** (spätere Stufen): verkettete Ausdrücke `(a+b)+c` (Return-Typ-
+  Inferenz), `!=`/`[]`/Vergleichs-Overloads, `Text`-Operatoren.
+
+Verifiziert: `Vec{x,y}` mit Add — (1,2)+(10,20)=(11,22); `std.strtype.String`
+"Hello, "+"World!" konkateniert (Länge 13, korrekte Bytes) + `c == c` → Eq;
+int/f64/pchar-Binops unverändert; Selbst-Host-Fixpunkt gen2==gen3;
+`make test` 20 PASS/0 FAIL.
+
 ## Version 1.0.8A (Juli 2026)
 
 Vollständiger String- und Unicode-Stack. Basis V1.0.7D.
