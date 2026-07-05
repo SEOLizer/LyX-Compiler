@@ -819,6 +819,40 @@ LValue follows the same rule via the { LValueSuffix } repetition.
 
 ---
 
+## 15.3 Operator Overloading
+
+```text
+Operator overloading adds NO syntax — the productions AdditiveExpr,
+MultiplicativeExpr, EqualityExpr, RelationalExpr and the index PostfixSuffix
+are used unchanged. It is a semantic (overload-resolution) rule, which by the
+disclaimer in Section 19 is otherwise outside this EBNF; documented here for
+discoverability.
+
+When the left operand of an operator has a static type that is a `class`
+defining the corresponding method, the operator desugars to a method call on
+that operand:
+
+    +  -> .Add(rhs)      -  -> .Sub(rhs)      *  -> .Mul(rhs)
+    /  -> .Div(rhs)      %  -> .Mod(rhs)
+    == -> .Eq(rhs)       != -> .Ne(rhs)   (falls back to !(.Eq(rhs)))
+    <  -> .Lt(rhs)       <= -> .Le(rhs)   >  -> .Gt(rhs)   >= -> .Ge(rhs)
+    a[i] -> a.Get(i)
+
+Resolution rules:
+  - The left operand must resolve to a class type: an identifier of class type,
+    another arithmetic operator overload (its result class is the left
+    operand's class), or a call to a free function with a class return type.
+  - The class must define the operator's method (a defined ClassName_Method
+    label); otherwise the operator keeps its normal built-in meaning. So
+    int/f64/pchar operators and normal array/pchar indexing are unaffected.
+  - `!=` additionally falls back to negating `.Eq` when no `.Ne` is defined.
+
+Method calls as the left operand (return type receiver-dependent) are not
+resolved to overloads.
+```
+
+---
+
 # 16. Built-in and Special Expressions
 
 ```ebnf
