@@ -1,0 +1,176 @@
+// std.grapheme — grapheme cluster segmentation (UAX #29 extended clusters)
+//
+// A grapheme cluster is a user-perceived character: a base plus its combining
+// marks, a Hangul syllable spelled with jamo, a flag built from two regional
+// indicators, or an emoji ZWJ sequence. Byte- and codepoint-length both differ
+// from what a user counts as "one character"; the grapheme count is that notion.
+//
+// Kept in its own unit (not std.unicode) so a program that only needs grapheme
+// segmentation pulls in just the grapheme-break table (std.unicode_gbdata), not
+// the much larger normalisation tables. Importing this AND std.unicode together
+// compiles a lot of generated data at once.
+//
+// Grapheme break classes (std.unicode_gbdata): 0 Other, 1 CR, 2 LF, 3 Control,
+// 4 Extend, 5 ZWJ, 6 Regional_Indicator, 7 Prepend, 8 SpacingMark, 9 L, 10 V,
+// 11 T, 12 LV, 13 LVT; Extended_Pictographic is a separate flag.
+
+@description("Grapheme cluster segmentation (UAX #29) over Text")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit std.grapheme;
+
+import std.text;
+import std.unicode_gbdata;
+
+// Decode the codepoint at byte offset `off` in `t`; writes its UTF-8 length to
+// `lenOut`.
+fn _decodeAt(t: Text, off: int64, lenOut: int64): int64 {
+  var d: int64 := TextData(t);
+  var b: int64 := peek8(d + off) & 255;
+  if (b < 128) { poke64(lenOut, 1); return b; }
+  if (b < 224) {
+    poke64(lenOut, 2);
+    return ((b & 31) << 6) | (peek8(d + off + 1) & 63);
+  }
+  if (b < 240) {
+    poke64(lenOut, 3);
+    return ((b & 15) << 12) | ((peek8(d + off + 1) & 63) << 6) | (peek8(d + off + 2) & 63);
+  }
+  poke64(lenOut, 4);
+  return ((b & 7) << 18) | ((peek8(d + off + 1) & 63) << 12) | ((peek8(d + off + 2) & 63) << 6) | (peek8(d + off + 3) & 63);
+}
+
+// Grapheme break class of `cp` (0 = Other) — range binary search.
+fn _gbClass(cp: int64): int64 {
+  _gbEnsure();
+  var lo: int64 := 0;
+  var hi: int64 := _gn - 1;
+  var ans: int64 := 0 - 1;
+  while (lo <= hi) {
+    var mid: int64 := (lo + hi) / 2;
+    if (peek64(_gs + mid * 8) <= cp) { ans := mid; lo := mid + 1; }
+    else { hi := mid - 1; }
+  }
+  if (ans >= 0 && cp <= peek64(_ge + ans * 8)) { return peek64(_gc + ans * 8); }
+  return 0;
+}
+
+// Is `cp` Extended_Pictographic (emoji base)? — range binary search.
+fn _isExtPict(cp: int64): int64 {
+  _gbEnsure();
+  var lo: int64 := 0;
+  var hi: int64 := _en - 1;
+  var ans: int64 := 0 - 1;
+  while (lo <= hi) {
+    var mid: int64 := (lo + hi) / 2;
+    if (peek64(_es + mid * 8) <= cp) { ans := mid; lo := mid + 1; }
+    else { hi := mid - 1; }
+  }
+  if (ans >= 0 && cp <= peek64(_ee + ans * 8)) { return 1; }
+  return 0;
+}
+
+// Should a grapheme boundary fall between a left char of class `lc` and a right
+// char of class `rc`? `zwj` = the left char is a GB11 ZWJ (ends ExtPict Extend*);
+// `riRun` = count of consecutive Regional_Indicators ending at the left char;
+// `rExt` = the right char is Extended_Pictographic. Implements UAX #29 GB3–GB999.
+fn _gbBreak(lc: int64, rc: int64, zwj: int64, riRun: int64, rExt: int64): int64 {
+  if (lc == 1 && rc == 2) { return 0; }                                   // GB3  CR × LF
+  if (lc == 1 || lc == 2 || lc == 3) { return 1; }                        // GB4  (CR|LF|Control) ÷
+  if (rc == 1 || rc == 2 || rc == 3) { return 1; }                        // GB5  ÷ (CR|LF|Control)
+  if (lc == 9 && (rc == 9 || rc == 10 || rc == 12 || rc == 13)) { return 0; }  // GB6
+  if ((lc == 12 || lc == 10) && (rc == 10 || rc == 11)) { return 0; }     // GB7
+  if ((lc == 13 || lc == 11) && rc == 11) { return 0; }                   // GB8
+  if (rc == 4 || rc == 5) { return 0; }                                   // GB9  × (Extend|ZWJ)
+  if (rc == 8) { return 0; }                                              // GB9a × SpacingMark
+  if (lc == 7) { return 0; }                                              // GB9b Prepend ×
+  if (zwj != 0 && rExt != 0) { return 0; }                                // GB11 ...ZWJ × ExtPict
+  if (lc == 6 && rc == 6 && (riRun & 1) == 1) { return 0; }               // GB12/13 RI × RI (pair)
+  return 1;                                                               // GB999 otherwise ÷
+}
+
+// Fill `offsOut` with the byte offset of each grapheme cluster start; returns
+// the grapheme count. `offsOut` must hold at least (codepoint count + 1) slots.
+fn _graphemeOffsets(t: Text, offsOut: int64): int64 {
+  var byteLen: int64 := TextByteLength(t);
+  if (byteLen == 0) { return 0; }
+  var lc: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  poke64(offsOut + 0, 0);
+  var count: int64 := 1;
+  var prevCp: int64 := _decodeAt(t, 0, lc);
+  var i: int64 := peek64(lc);
+  var prevCls: int64 := _gbClass(prevCp);
+  var pictRun: int64 := _isExtPict(prevCp);
+  var zwjGB11: int64 := 0;
+  var riRun: int64 := 0;
+  if (prevCls == 6) { riRun := 1; }
+  while (i < byteLen) {
+    var cp: int64 := _decodeAt(t, i, lc);
+    var clen: int64 := peek64(lc);
+    var cls: int64 := _gbClass(cp);
+    var rExt: int64 := _isExtPict(cp);
+    if (_gbBreak(prevCls, cls, zwjGB11, riRun, rExt) != 0) {
+      poke64(offsOut + count * 8, i);
+      count += 1;
+    }
+    // advance the GB11 / RI / ExtPict-run state to include this codepoint
+    var oldPict: int64 := pictRun;
+    if (rExt != 0) { pictRun := 1; }
+    else if (cls == 4) { pictRun := oldPict; }   // Extend continues an ExtPict run
+    else { pictRun := 0; }
+    if (cls == 5 && oldPict != 0) { zwjGB11 := 1; } else { zwjGB11 := 0; }
+    if (cls == 6) { riRun += 1; } else { riRun := 0; }
+    prevCls := cls;
+    i += clen;
+  }
+  munmap(lc, 8);
+  return count;
+}
+
+// Number of grapheme clusters (user-perceived characters) in `t`.
+pub fn TextGraphemeCount(t: Text): int64 {
+  _gbEnsure();   // initialise the tables up-front (not deep inside the walk)
+  var byteLen: int64 := TextByteLength(t);
+  var cap: int64 := (byteLen + 2) * 8;
+  var offs: int64 := mmap(0, cap, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (offs < 0) { return 0; }
+  var n: int64 := _graphemeOffsets(t, offs);
+  munmap(offs, cap);
+  return n;
+}
+
+// Byte offset where the `idx`-th grapheme cluster starts (-1 if out of range).
+pub fn TextGraphemeByteOffset(t: Text, idx: int64): int64 {
+  if (idx < 0) { return 0 - 1; }
+  _gbEnsure();
+  var byteLen: int64 := TextByteLength(t);
+  var cap: int64 := (byteLen + 2) * 8;
+  var offs: int64 := mmap(0, cap, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (offs < 0) { return 0 - 1; }
+  var n: int64 := _graphemeOffsets(t, offs);
+  var r: int64 := 0 - 1;
+  if (idx < n) { r := peek64(offs + idx * 8); }
+  munmap(offs, cap);
+  return r;
+}
+
+// The `idx`-th grapheme cluster as a new Text (empty if out of range).
+pub fn TextGraphemeAt(t: Text, idx: int64): Text {
+  if (idx < 0) { return TextFromUtf8(0, 0); }
+  _gbEnsure();
+  var byteLen: int64 := TextByteLength(t);
+  var cap: int64 := (byteLen + 2) * 8;
+  var offs: int64 := mmap(0, cap, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (offs < 0) { return TextFromUtf8(0, 0); }
+  var n: int64 := _graphemeOffsets(t, offs);
+  var r: Text := TextFromUtf8(0, 0);
+  if (idx < n) {
+    var start: int64 := peek64(offs + idx * 8);
+    var end: int64 := byteLen;
+    if (idx + 1 < n) { end := peek64(offs + (idx + 1) * 8); }
+    r := TextFromUtf8(TextData(t) + start, end - start);
+  }
+  munmap(offs, cap);
+  return r;
+}
+

@@ -168,6 +168,28 @@ fn _ucdCompose(a: int64, b: int64): int64 {
   return 0 - 1;
 }
 
+// Full compatibility decomposition of `cp` (for NFKC/NFKD) written to `out`;
+// returns the length (0 if none). This is the recursive expansion applying both
+// canonical and compatibility mappings.
+fn _ucdCompatDecomp(cp: int64, out: int64): int64 {
+  _ucdEnsure();
+  var lo: int64 := 0;
+  var hi: int64 := _kn - 1;
+  while (lo <= hi) {
+    var mid: int64 := (lo + hi) / 2;
+    var mk: int64 := peek64(_kk + mid * 8);
+    if (mk == cp) {
+      var off: int64 := peek64(_ko + mid * 8);
+      var ln: int64 := peek64(_kl + mid * 8);
+      var j: int64 := 0;
+      while (j < ln) { poke64(out + j * 8, peek64(_kd + (off + j) * 8)); j += 1; }
+      return ln;
+    }
+    if (mk < cp) { lo := mid + 1; } else { hi := mid - 1; }
+  }
+  return 0;
+}
+
 // Decode all codepoints of `t` into the int64 array `out`; returns the count.
 fn _decodeToArray(t: Text, out: int64): int64 {
   var byteLen: int64 := TextByteLength(t);
@@ -238,18 +260,19 @@ fn _hangulComposeLVT(lv: int64, t: int64): int64 {
   return lv + (t - 4519);
 }
 
-// Decompose `t` to NFD: full canonical decomposition (generated table) + Hangul
-// (algorithmic), followed by canonical ordering of combining marks.
-pub fn TextToNFD(t: Text): Text {
+// Decompose `t` into a new Text: canonical (useCompat == 0) or compatibility
+// (useCompat != 0) decomposition + algorithmic Hangul, then canonical ordering.
+// Shared by NFD (canonical) and NFKD (compatibility).
+fn _nfDecompose(t: Text, useCompat: int64): Text {
   var byteLen: int64 := TextByteLength(t);
   var srcCap: int64 := byteLen + 4;
   var src: int64 := mmap(0, srcCap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
   if (src < 0) { return TextFromUtf8(TextData(t), byteLen); }
   var srcN: int64 := _decodeToArray(t, src);
-  var dstCap: int64 := byteLen * 4 + 8;
+  var dstCap: int64 := byteLen * 18 + 8;   // compat decomposition can expand a lot
   var dst: int64 := mmap(0, dstCap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
   var hCell: int64 := mmap(0, 24, PROT_RW, MAP_ANON, FD_NONE, 0);
-  var tmp: int64 := mmap(0, 128, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var tmp: int64 := mmap(0, 256, PROT_RW, MAP_ANON, FD_NONE, 0);
   var dn: int64 := 0;
   var i: int64 := 0;
   while (i < srcN) {
@@ -260,7 +283,9 @@ pub fn TextToNFD(t: Text): Text {
       poke64(dst + dn * 8, peek64(hCell + 8)); dn += 1;
       if (hn == 3) { poke64(dst + dn * 8, peek64(hCell + 16)); dn += 1; }
     } else {
-      var dl: int64 := _ucdDecomp(cp, tmp);
+      var dl: int64 := 0;
+      if (useCompat != 0) { dl := _ucdCompatDecomp(cp, tmp); }
+      else { dl := _ucdDecomp(cp, tmp); }
       if (dl > 0) {
         var j: int64 := 0;
         while (j < dl) { poke64(dst + dn * 8, peek64(tmp + j * 8)); dn += 1; j += 1; }
@@ -278,18 +303,17 @@ pub fn TextToNFD(t: Text): Text {
   while (k < dn) { w += CodepointToUtf8(peek64(dst + k * 8), buf + w); k += 1; }
   var r: Text := TextFromUtf8(buf, w);
   munmap(src, srcCap * 8); munmap(dst, dstCap * 8); munmap(hCell, 24);
-  munmap(tmp, 128); munmap(buf, bufSz);
+  munmap(tmp, 256); munmap(buf, bufSz);
   return r;
 }
 
-// Compose `t` to NFC: full canonical decomposition (NFD) followed by the
-// canonical composition algorithm (Hangul + table, with blocking).
-pub fn TextToNFC(t: Text): Text {
-  var nfd: Text := TextToNFD(t);
+// Canonical composition of an already-decomposed Text (Hangul + table, with
+// blocking). The caller owns `nfd`. Shared by NFC and NFKC.
+fn _nfCompose(nfd: Text): Text {
   var byteLen: int64 := TextByteLength(nfd);
   var cap: int64 := byteLen + 4;
   var arr: int64 := mmap(0, cap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
-  if (arr < 0) { return nfd; }
+  if (arr < 0) { return TextFromUtf8(TextData(nfd), byteLen); }
   var n: int64 := _decodeToArray(nfd, arr);
   var out: int64 := mmap(0, cap * 8, PROT_RW, MAP_ANON, FD_NONE, 0);
   var outN: int64 := 0;
@@ -318,7 +342,6 @@ pub fn TextToNFC(t: Text): Text {
     }
     i += 1;
   }
-  TextFree(nfd);
   var bufSz: int64 := outN * 4 + 8;
   var buf: int64 := mmap(0, bufSz, PROT_RW, MAP_ANON, FD_NONE, 0);
   var w: int64 := 0;
@@ -329,7 +352,29 @@ pub fn TextToNFC(t: Text): Text {
   return r;
 }
 
-// Normalisation-insensitive equality (Latin-1 subset): compares NFC forms.
+// NFD — canonical decomposition (+ canonical ordering).
+pub fn TextToNFD(t: Text): Text { return _nfDecompose(t, 0); }
+
+// NFC — canonical decomposition then canonical composition.
+pub fn TextToNFC(t: Text): Text {
+  var d: Text := _nfDecompose(t, 0);
+  var r: Text := _nfCompose(d);
+  TextFree(d);
+  return r;
+}
+
+// NFKD — compatibility decomposition (+ canonical ordering).
+pub fn TextToNFKD(t: Text): Text { return _nfDecompose(t, 1); }
+
+// NFKC — compatibility decomposition then canonical composition.
+pub fn TextToNFKC(t: Text): Text {
+  var d: Text := _nfDecompose(t, 1);
+  var r: Text := _nfCompose(d);
+  TextFree(d);
+  return r;
+}
+
+// Normalisation-insensitive equality: compares NFC forms.
 pub fn TextEqualsNormalized(a: Text, b: Text): int64 {
   var na: Text := TextToNFC(a);
   var nb: Text := TextToNFC(b);
