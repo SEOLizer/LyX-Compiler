@@ -2481,9 +2481,9 @@ pub type Codegen = class {
     return 0;
   }
 
-  // Operator overloading (Stage 2a): the method name a binary operator maps to,
-  // or 0 if the operator has no overload. + Add, - Sub, * Mul, / Div, % Mod,
-  // == Eq. (!= / [] / comparisons: later stages.)
+  // Operator overloading: the method name a binary operator maps to, or 0 if the
+  // operator has no overload. + Add, - Sub, * Mul, / Div, % Mod, == Eq, != Ne,
+  // < Lt, <= Le, > Gt, >= Ge. (Index [] → Get is handled on CGN_INDEX.)
   fn cg_opMethodName(op: int64): pchar {
     if (op == CGT_PLUS)    { return "Add"; }
     if (op == CGT_MINUS)   { return "Sub"; }
@@ -2491,55 +2491,112 @@ pub type Codegen = class {
     if (op == CGT_SLASH)   { return "Div"; }
     if (op == CGT_PERCENT) { return "Mod"; }
     if (op == CGT_EQ2)     { return "Eq"; }
+    if (op == CGT_NEQ)     { return "Ne"; }
+    if (op == CGT_LT)      { return "Lt"; }
+    if (op == CGT_LE)      { return "Le"; }
+    if (op == CGT_GT)      { return "Gt"; }
+    if (op == CGT_GE)      { return "Ge"; }
     return 0 as pchar;
   }
 
-  // Operator overloading (Stage 2a): if the binop `ni` has a class-typed left
-  // operand (an identifier whose declared type is a class) and that class
-  // defines the operator's method, emit `lhs.Method(rhs)` as a direct method
-  // call (self→rdi, arg→rsi, result in rax) and return 1. Otherwise emit nothing
-  // and return 0, so the normal integer/f64/pchar path handles the binop.
-  //
-  // Deliberately narrow (identifier left operand only) — chained expressions
-  // like `(a+b)+c` need call-result type inference and come in a later stage.
-  fn cg_tryClassBinop(ni: int64): int64 {
-    var op: int64 := self.cg_nival(ni);
-    var mname: pchar := self.cg_opMethodName(op);
-    if (mname == 0 as pchar) { return 0; }
-    var lhsNi: int64 := self.cg_nc0(ni);
-    if (self.cg_nkind(lhsNi) != CGN_IDENT) { return 0; }
-    var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(lhsNi), self.cg_nslen(lhsNi));
-    if (idx < 0) { return 0; }
-    var tb: int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
-    var cln: pchar := peek64(tb) as pchar;
-    var clnLen: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
-    if (cln == 0 as pchar || clnLen <= 0) { return 0; }
-    if (self.cg_findClass(cln, clnLen) < 0) { return 0; }   // not a class → normal binop
-    // build the mangled method name "ClassName_Method"
+  // Operator overloading: the class-layout index of an expression's static type,
+  // or -1 if it isn't a class-typed expression. Handles identifiers (declared
+  // type from localTypes) and — so chained expressions like `(a+b)+c` work — an
+  // arithmetic operator overload, whose result class is its left operand's class
+  // (the Vec+Vec→Vec convention). Comparison overloads yield bool, not a class.
+  fn cg_exprClassName(ni: int64): int64 {
+    if (ni < 0) { return 0 - 1; }
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_IDENT) {
+      var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (idx < 0) { return 0 - 1; }
+      var tb: int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
+      var cln: pchar := peek64(tb) as pchar;
+      var clnLen: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+      if (cln == 0 as pchar || clnLen <= 0) { return 0 - 1; }
+      return self.cg_findClass(cln, clnLen);
+    }
+    if (k == CGN_BINOP) {
+      var bop: int64 := self.cg_nival(ni);
+      if (bop == CGT_PLUS || bop == CGT_MINUS || bop == CGT_STAR ||
+          bop == CGT_SLASH || bop == CGT_PERCENT) {
+        return self.cg_exprClassName(self.cg_nc0(ni));
+      }
+      return 0 - 1;
+    }
+    return 0 - 1;
+  }
+
+  // Build the mangled method name "ClassName_Method" into a fresh tracked buffer;
+  // returns the buffer (NUL-terminated) and writes its length to `lenCell`.
+  fn cg_buildMethodMangled(ci: int64, mname: pchar, lenCell: int64): int64 {
+    var cbase: int64 := self.classLayouts + ci * CG_CLASS_SZ;
+    var cln: pchar := peek64(cbase) as pchar;
+    var clnLen: int64 := peek64(cbase + CG_CLASS_OFF_NAMELEN);
     var mlen: int64 := StrLen(mname);
     var mangLen: int64 := clnLen + 1 + mlen;
     var mangBuf: int64 := alloc(mangLen + 1);
-    var ci: int64 := 0;
-    while (ci < clnLen) { poke8(mangBuf + ci, StrCharAt(cln, ci)); ci := ci + 1; }
+    var ci2: int64 := 0;
+    while (ci2 < clnLen) { poke8(mangBuf + ci2, StrCharAt(cln, ci2)); ci2 := ci2 + 1; }
     poke8(mangBuf + clnLen, 95);   // '_'
     var cj: int64 := 0;
     while (cj < mlen) { poke8(mangBuf + clnLen + 1 + cj, StrCharAt(mname, cj)); cj := cj + 1; }
     poke8(mangBuf + mangLen, 0);
-    if (self.cg_findLabel(mangBuf as pchar, mangLen) < 0) {
-      self.cg_trackTempBuf(mangBuf, mangLen + 1);   // method not defined → normal binop
-      return 0;
-    }
-    // emit lhs.Method(rhs): receiver→rdi (self), arg→rsi, direct call
-    var rhsNi: int64 := self.cg_nc1(ni);
-    self.cg_genExpr(lhsNi);
+    poke64(lenCell, mangLen);
+    return mangBuf;
+  }
+
+  // Emit a direct 1-arg method call `recv.Method(arg)`: receiver→rdi (self),
+  // arg→rsi, call the (already-built, defined) mangled name. Result in rax.
+  fn cg_emitClassCall(recvNi: int64, argNi: int64, mangBuf: int64, mangLen: int64) {
+    self.cg_genExpr(recvNi);
     self.cg_pushRax();
-    self.cg_genExpr(rhsNi);
+    self.cg_genExpr(argNi);
     self.cg_pushRax();
     self.cg_popRsi();   // arg  → rsi
     self.cg_popRdi();   // self → rdi
     var pp: int64 := self.cg_emitCall();
     self.cg_addPatch(pp, mangBuf, mangLen, CG_PATCH_CALL);
     self.cg_trackTempBuf(mangBuf, mangLen + 1);
+  }
+
+  // Operator overloading: if the binop `ni` has a class-typed left operand and
+  // that class defines the operator's method, emit `lhs.Method(rhs)` and return
+  // 1. Otherwise emit nothing and return 0 (normal integer/f64/pchar path).
+  fn cg_tryClassBinop(ni: int64): int64 {
+    var op: int64 := self.cg_nival(ni);
+    var mname: pchar := self.cg_opMethodName(op);
+    if (mname == 0 as pchar) { return 0; }
+    var lhsNi: int64 := self.cg_nc0(ni);
+    var ci: int64 := self.cg_exprClassName(lhsNi);
+    if (ci < 0) { return 0; }
+    var lenCell: int64 := alloc(8);
+    var mangBuf: int64 := self.cg_buildMethodMangled(ci, mname, lenCell);
+    var mangLen: int64 := peek64(lenCell);
+    free(lenCell, 8);
+    if (self.cg_findLabel(mangBuf as pchar, mangLen) < 0) {
+      self.cg_trackTempBuf(mangBuf, mangLen + 1);   // method not defined → normal binop
+      return 0;
+    }
+    self.cg_emitClassCall(lhsNi, self.cg_nc1(ni), mangBuf, mangLen);
+    return 1;
+  }
+
+  // Operator overloading: if `ni` is `base[idx]` with a class-typed base that
+  // defines Get, emit `base.Get(idx)` and return 1; otherwise return 0.
+  fn cg_tryClassIndex(ni: int64): int64 {
+    var baseNi: int64 := self.cg_nc0(ni);
+    var ci: int64 := self.cg_exprClassName(baseNi);
+    if (ci < 0) { return 0; }
+    var lenCell: int64 := alloc(8);
+    var mangBuf: int64 := self.cg_buildMethodMangled(ci, "Get", lenCell);
+    var mangLen: int64 := peek64(lenCell);
+    free(lenCell, 8);
+    if (self.cg_findLabel(mangBuf as pchar, mangLen) < 0) {
+      self.cg_trackTempBuf(mangBuf, mangLen + 1);
+      return 0;
+    }
+    self.cg_emitClassCall(baseNi, self.cg_nc1(ni), mangBuf, mangLen);
     return 1;
   }
 
@@ -4283,6 +4340,9 @@ pub type Codegen = class {
     } else if (k == CGN_FIELD) {
       self.cg_genFieldLoad(ni);
 
+    } else if (k == CGN_INDEX && self.cg_tryClassIndex(ni) != 0) {
+      // operator overloading: base[idx] → base.Get(idx) for a class-typed base
+      // (emitted by cg_tryClassIndex; result in rax).
     } else if (k == CGN_INDEX) {
       // arr[i]: nc0=arr, nc1=index
       // Eval index first, push; then eval arr; pop index into rbx
