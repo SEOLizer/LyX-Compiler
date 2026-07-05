@@ -1,0 +1,185 @@
+// std.text — UTF-8 Text type (validated, codepoint-aware)
+//
+// Per the string-encoding decision (UTF-8 canonical): `Text` is the UTF-8 layer
+// on top of raw bytes. It validates UTF-8 at construction and offers codepoint-
+// level operations (count, decode) — as opposed to `String`/pchar which are
+// byte-level. This needs NO Unicode tables: UTF-8 decode/validate is pure byte
+// patterns. Normalisation (NFC/NFD) and grapheme segmentation, which DO need
+// tables, are a separate opt-in unit — not here.
+//
+// libc-free (mmap/munmap), owned bytes, byte length explicit.
+
+@description("UTF-8 Text type: validated, codepoint-aware (libc-free)")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit std.text;
+
+pub type Text = struct {
+  data: int64;     // owned UTF-8 bytes
+  byteLen: int64;  // length in bytes
+  valid: int64;    // 1 if the bytes are valid UTF-8, else 0
+};
+
+fn _pcharLen(p: int64): int64 {
+  if (p == 0) { return 0; }
+  var n: int64 := 0;
+  while ((peek8(p + n) & 255) != 0) { n += 1; }
+  return n;
+}
+
+// Validate a byte range as UTF-8: correct leading/continuation byte patterns,
+// no overlong encodings, no surrogates, codepoints <= U+10FFFF. Returns 1/0.
+fn _utf8Validate(ptr: int64, n: int64): int64 {
+  var i: int64 := 0;
+  while (i < n) {
+    var b: int64 := peek8(ptr + i) & 255;
+    var extra: int64 := 0;
+    var cp: int64 := 0;
+    var minCp: int64 := 0;
+    if (b < 128) {                       // 0xxxxxxx ASCII
+      extra := 0; cp := b; minCp := 0;
+    } else if (b >= 194 && b <= 223) {   // 110xxxxx (0xC2..0xDF)
+      extra := 1; cp := b & 31; minCp := 128;
+    } else if (b >= 224 && b <= 239) {   // 1110xxxx (0xE0..0xEF)
+      extra := 2; cp := b & 15; minCp := 2048;
+    } else if (b >= 240 && b <= 244) {   // 11110xxx (0xF0..0xF4)
+      extra := 3; cp := b & 7; minCp := 65536;
+    } else {
+      return 0;                          // invalid leading byte (incl. overlong 0xC0/0xC1, 0xF5+)
+    }
+    if (i + extra >= n) { return 0; }     // truncated sequence
+    var j: int64 := 1;
+    while (j <= extra) {
+      var c: int64 := peek8(ptr + i + j) & 255;
+      if ((c & 192) != 128) { return 0; } // not a 10xxxxxx continuation byte
+      cp := (cp << 6) | (c & 63);
+      j += 1;
+    }
+    if (extra > 0) {
+      if (cp < minCp) { return 0; }                    // overlong
+      if (cp > 1114111) { return 0; }                  // > U+10FFFF
+      if (cp >= 55296 && cp <= 57343) { return 0; }    // surrogate U+D800..U+DFFF
+    }
+    i += extra + 1;
+  }
+  return 1;
+}
+
+// Build a Text from `n` raw bytes at `ptr` (copied). Validates UTF-8; the
+// `valid` flag reflects the result (the bytes are stored either way).
+pub fn TextFromUtf8(ptr: int64, n: int64): Text {
+  var t: Text;
+  var sz: int64 := n;
+  if (sz < 1) { sz := 1; }
+  t.data := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (t.data < 0) { t.data := 0; t.byteLen := 0; t.valid := 0; return t; }
+  if (n > 0) { memcpy(t.data, ptr, n); }
+  t.byteLen := n;
+  t.valid := _utf8Validate(t.data, n);
+  return t;
+}
+
+// Build a Text from a NUL-terminated pchar (UTF-8).
+pub fn TextFromPchar(p: int64): Text {
+  return TextFromUtf8(p, _pcharLen(p));
+}
+
+pub fn TextByteLength(t: Text): int64 { return t.byteLen; }
+pub fn TextIsValid(t: Text): int64 { return t.valid; }
+pub fn TextData(t: Text): int64 { return t.data; }
+
+// Raw byte at index `i` (0 if out of range).
+pub fn TextByteAt(t: Text, i: int64): int64 {
+  if (i < 0 || i >= t.byteLen) { return 0; }
+  return peek8(t.data + i) & 255;
+}
+
+// Number of Unicode codepoints (not bytes): count of non-continuation bytes.
+pub fn TextCodepointCount(t: Text): int64 {
+  var cnt: int64 := 0;
+  var i: int64 := 0;
+  while (i < t.byteLen) {
+    if (((peek8(t.data + i) & 255) & 192) != 128) { cnt += 1; }  // leading byte
+    i += 1;
+  }
+  return cnt;
+}
+
+// Byte offset of the `idx`-th codepoint (-1 if out of range).
+pub fn TextByteOffsetOfCodepoint(t: Text, idx: int64): int64 {
+  if (idx < 0) { return 0 - 1; }
+  var seen: int64 := 0;
+  var i: int64 := 0;
+  while (i < t.byteLen) {
+    if (((peek8(t.data + i) & 255) & 192) != 128) {
+      if (seen == idx) { return i; }
+      seen += 1;
+    }
+    i += 1;
+  }
+  return 0 - 1;
+}
+
+// Decode the `idx`-th codepoint (-1 if out of range).
+pub fn TextCodepointAt(t: Text, idx: int64): int64 {
+  var off: int64 := TextByteOffsetOfCodepoint(t, idx);
+  if (off < 0) { return 0 - 1; }
+  var b: int64 := peek8(t.data + off) & 255;
+  if (b < 128) { return b; }
+  var extra: int64 := 0;
+  var cp: int64 := 0;
+  if (b < 224) { extra := 1; cp := b & 31; }
+  else if (b < 240) { extra := 2; cp := b & 15; }
+  else { extra := 3; cp := b & 7; }
+  var j: int64 := 1;
+  while (j <= extra) {
+    cp := (cp << 6) | (peek8(t.data + off + j) & 63);
+    j += 1;
+  }
+  return cp;
+}
+
+// UTF-8 byte length of a single codepoint (1..4; 0 if invalid).
+pub fn CodepointUtf8Len(cp: int64): int64 {
+  if (cp < 0) { return 0; }
+  if (cp < 128) { return 1; }
+  if (cp < 2048) { return 2; }
+  if (cp < 65536) {
+    if (cp >= 55296 && cp <= 57343) { return 0; }  // surrogate
+    return 3;
+  }
+  if (cp <= 1114111) { return 4; }
+  return 0;
+}
+
+// Encode codepoint `cp` as UTF-8 into `dest`; returns bytes written (0 if invalid).
+pub fn CodepointToUtf8(cp: int64, dest: int64): int64 {
+  var n: int64 := CodepointUtf8Len(cp);
+  if (n == 1) {
+    poke8(dest, cp & 127);
+  } else if (n == 2) {
+    poke8(dest,     192 | ((cp >> 6) & 31));
+    poke8(dest + 1, 128 | (cp & 63));
+  } else if (n == 3) {
+    poke8(dest,     224 | ((cp >> 12) & 15));
+    poke8(dest + 1, 128 | ((cp >> 6) & 63));
+    poke8(dest + 2, 128 | (cp & 63));
+  } else if (n == 4) {
+    poke8(dest,     240 | ((cp >> 18) & 7));
+    poke8(dest + 1, 128 | ((cp >> 12) & 63));
+    poke8(dest + 2, 128 | ((cp >> 6) & 63));
+    poke8(dest + 3, 128 | (cp & 63));
+  }
+  return n;
+}
+
+pub fn TextFree(t: Text) {
+  if (t.data != 0) {
+    var sz: int64 := t.byteLen;
+    if (sz < 1) { sz := 1; }
+    munmap(t.data, sz);
+  }
+  t.data := 0;
+  t.byteLen := 0;
+  t.valid := 0;
+}
