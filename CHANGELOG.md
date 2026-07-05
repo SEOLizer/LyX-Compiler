@@ -1,5 +1,32 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.8C (Juli 2026)
+
+Operator-Overloading komplettiert (Stufen 2b, 2c, 3) + `!=`-Fallback. Basis V1.0.8B.
+
+### Compiler
+- **Verkettete Ausdrücke** (2b): `a + b + c`, `(a+b)*d` — `cg_exprClassName` löst
+  die statische Klasse auch eines Arithmetik-Overloads auf (Result = Links-Klasse).
+- **Voller Operator-Satz** (2b): `!=` Ne, `<` Lt, `<=` Le, `>` Gt, `>=` Ge; Index
+  `a[i]` → `a.Get(i)` (neuer Zweig vor dem normalen CGN_INDEX-Pfad).
+- **Call-Ergebnis-Operanden** (2c): `f() + g()` wenn eine freie Funktion einen
+  class-Rückgabetyp hat (neue `fnRetList`-Registry: funcName → Rückgabetyp-Name,
+  Klasse zur Lookup-Zeit via `cg_findClass`).
+- **`!=`-Fallback**: eine Klasse mit nur `Eq` bekommt `!=` gratis (`a.Eq(b)` +
+  logisches NOT, wenn kein `Ne` definiert).
+- Trigger bleibt eng (nur class-Operanden) → int/f64/pchar-Binops, Vergleiche und
+  normale Array/pchar-Indizierung unverändert.
+
+### Standardbibliothek / Doku
+- **`std.strtype.String`**: Operator-Methoden `Eq`/`Ne`/`Compare`/`Lt`/`Le`/`Gt`/
+  `Ge`/`Get` ergänzt → String-Operatoren arbeiten **inhaltsbasiert** (vorher fiel
+  `==` mangels `Eq` auf einen Pointer-Vergleich zurück).
+- **`examples/basics/operator_overloading.lyx`**: Showcase (Vec-Klasse + String).
+- **`ebnf.md` §15.3**: Semantik-Notiz zum Operator-Overloading (kein Grammatik-
+  Zusatz — Overload-Resolution ist per §19 ohnehin außerhalb der EBNF).
+
+Verifiziert je Stufe: Selbst-Host-Fixpunkt gen2==gen3; `make test` 20 PASS/0 FAIL.
+
 ## Version 1.0.8B (Juli 2026)
 
 Operator-Overloading für User-Klassen (Stufe 2a). Basis V1.0.8A.
