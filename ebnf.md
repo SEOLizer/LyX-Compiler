@@ -483,6 +483,7 @@ Statement           = Block
                     | NestedFnDecl
                     | AssignStmt
                     | IncDecStmt
+                    | CompoundAssignStmt
                     | IfStmt
                     | WhileStmt
                     | ForStmt
@@ -510,6 +511,9 @@ TupleUnpackStmt     = "var"
 AssignStmt          = LValue ":=" Expr ";" ;
 
 IncDecStmt          = LValue ( "++" | "--" ) ";" ;
+
+(* Compound assignment: `x += y` desugars to `x := x + y` (likewise -= *= /= %=). *)
+CompoundAssignStmt  = LValue ( "+=" | "-=" | "*=" | "/=" | "%=" ) Expr ";" ;
 
 IfStmt              = "if"
                       "(" Expr ")"
