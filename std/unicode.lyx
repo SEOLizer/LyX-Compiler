@@ -115,8 +115,9 @@ pub fn TextToUpper(t: Text): Text { return _caseMap(t, 1); }
 // the full Unicode decomposition database. Each Latin-1 letter has exactly ONE
 // combining mark, so no canonical reordering (by combining class) is needed.
 //
+// Covered: Hangul (algorithmic, all 11,172 syllables) + Latin-1 precomposed.
 // NOT covered (need generated Unicode tables — follow-up): decompositions beyond
-// Latin-1 (Latin Extended, Greek, Cyrillic, Hangul), multi-mark canonical
+// Latin-1 (Latin Extended, Greek, Cyrillic, CJK-compat), multi-mark canonical
 // ordering, compatibility forms (NFKC/NFKD).
 
 // Canonical decomposition of a Latin-1 precomposed letter. Returns the base
@@ -217,8 +218,42 @@ fn _isSubsetMark(cp: int64): int64 {
   return 0;
 }
 
-// Decompose `t` to NFD (Latin-1 subset): each precomposed Latin-1 letter becomes
-// base + combining mark; everything else is unchanged.
+// ---- Hangul syllable composition/decomposition (algorithmic; Unicode §3.12) --
+// Covers all 11,172 modern Hangul syllables (U+AC00..U+D7A3) with no table.
+// L 0x1100.., V 0x1161.., T 0x11A7..; LCount 19, VCount 21, TCount 28.
+
+// Decompose Hangul syllable `cp` into 2 (LV) or 3 (LVT) jamo, written to the
+// int64 array `out`. Returns the count (0 if `cp` is not a Hangul syllable).
+fn _hangulDecompose(cp: int64, out: int64): int64 {
+  if (cp < 44032 || cp > 55203) { return 0; }
+  var si: int64 := cp - 44032;
+  var l: int64 := 4352 + si / 588;
+  var vt: int64 := si - (si / 588) * 588;
+  var v: int64 := 4449 + vt / 28;
+  var tmod: int64 := vt - (vt / 28) * 28;
+  poke64(out + 0, l);
+  poke64(out + 8, v);
+  if (tmod > 0) { poke64(out + 16, 4519 + tmod); return 3; }
+  return 2;
+}
+
+// Compose leading consonant `l` + vowel `v` into an LV syllable, or -1.
+fn _hangulComposeLV(l: int64, v: int64): int64 {
+  if (l < 4352 || l >= 4371) { return 0 - 1; }
+  if (v < 4449 || v >= 4470) { return 0 - 1; }
+  return 44032 + ((l - 4352) * 21 + (v - 4449)) * 28;
+}
+
+// Compose an LV syllable + trailing consonant `t` into an LVT syllable, or -1.
+fn _hangulComposeLVT(lv: int64, t: int64): int64 {
+  if (lv < 44032 || lv > 55203) { return 0 - 1; }
+  if (((lv - 44032) - (((lv - 44032) / 28) * 28)) != 0) { return 0 - 1; }  // must be an LV (T-index 0)
+  if (t <= 4519 || t >= 4547) { return 0 - 1; }
+  return lv + (t - 4519);
+}
+
+// Decompose `t` to NFD: Hangul syllables (algorithmic) + the Latin-1 precomposed
+// letters (curated). Other codepoints pass through unchanged.
 pub fn TextToNFD(t: Text): Text {
   var byteLen: int64 := TextByteLength(t);
   var sz: int64 := byteLen * 4 + 8;
@@ -226,58 +261,90 @@ pub fn TextToNFD(t: Text): Text {
   if (buf < 0) { return TextFromUtf8(TextData(t), byteLen); }
   var lenCell: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
   var markCell: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var hCell: int64 := mmap(0, 24, PROT_RW, MAP_ANON, FD_NONE, 0);
   var w: int64 := 0;
   var i: int64 := 0;
   while (i < byteLen) {
     var cp: int64 := _decodeAt(t, i, lenCell);
     var clen: int64 := peek64(lenCell);
-    var base: int64 := _decomp1(cp, markCell);
-    var mark: int64 := peek64(markCell);
-    if (mark >= 0) {
-      w += CodepointToUtf8(base, buf + w);
-      w += CodepointToUtf8(mark, buf + w);
+    var hn: int64 := _hangulDecompose(cp, hCell);
+    if (hn > 0) {
+      w += CodepointToUtf8(peek64(hCell + 0), buf + w);
+      w += CodepointToUtf8(peek64(hCell + 8), buf + w);
+      if (hn == 3) { w += CodepointToUtf8(peek64(hCell + 16), buf + w); }
     } else {
-      w += CodepointToUtf8(cp, buf + w);
+      var base: int64 := _decomp1(cp, markCell);
+      var mark: int64 := peek64(markCell);
+      if (mark >= 0) {
+        w += CodepointToUtf8(base, buf + w);
+        w += CodepointToUtf8(mark, buf + w);
+      } else {
+        w += CodepointToUtf8(cp, buf + w);
+      }
     }
     i += clen;
   }
   var r: Text := TextFromUtf8(buf, w);
-  munmap(buf, sz); munmap(lenCell, 8); munmap(markCell, 8);
+  munmap(buf, sz); munmap(lenCell, 8); munmap(markCell, 8); munmap(hCell, 24);
   return r;
 }
 
-// Compose `t` to NFC (Latin-1 subset): a base letter followed by a composable
-// combining mark becomes the precomposed letter; everything else is unchanged.
+// Compose `t` to NFC: Hangul jamo (L+V, LV+T — algorithmic) and Latin-1 base +
+// combining mark become the precomposed forms; everything else is unchanged.
 pub fn TextToNFC(t: Text): Text {
   var byteLen: int64 := TextByteLength(t);
   var sz: int64 := byteLen + 8;
   var buf: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
   if (buf < 0) { return TextFromUtf8(TextData(t), byteLen); }
-  var lenCell: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var lc: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
   var w: int64 := 0;
   var i: int64 := 0;
   while (i < byteLen) {
-    var cp: int64 := _decodeAt(t, i, lenCell);
-    var clen: int64 := peek64(lenCell);
-    var composed: int64 := 0 - 1;
+    var cp: int64 := _decodeAt(t, i, lc);
+    var clen: int64 := peek64(lc);
+    var handled: int64 := 0;
+    // decode the following codepoint (if any)
+    var hasNext: int64 := 0;
+    var nextCp: int64 := 0;
+    var nextLen: int64 := 0;
     if (i + clen < byteLen) {
-      var nextCp: int64 := _decodeAt(t, i + clen, lenCell);
-      var nextLen: int64 := peek64(lenCell);
-      if (_isSubsetMark(nextCp) != 0) {
-        composed := _compose(cp, nextCp);
-        if (composed >= 0) {
-          w += CodepointToUtf8(composed, buf + w);
-          i += clen + nextLen;
+      nextCp := _decodeAt(t, i + clen, lc);
+      nextLen := peek64(lc);
+      hasNext := 1;
+    }
+    // Hangul: L + V (+ optional T)
+    if (hasNext != 0 && cp >= 4352 && cp < 4371) {
+      var lv: int64 := _hangulComposeLV(cp, nextCp);
+      if (lv >= 0) {
+        var consumed: int64 := clen + nextLen;
+        var out2: int64 := lv;
+        if (i + consumed < byteLen) {
+          var tCp: int64 := _decodeAt(t, i + consumed, lc);
+          var tLen: int64 := peek64(lc);
+          var lvt: int64 := _hangulComposeLVT(lv, tCp);
+          if (lvt >= 0) { out2 := lvt; consumed += tLen; }
         }
+        w += CodepointToUtf8(out2, buf + w);
+        i += consumed;
+        handled := 1;
       }
     }
-    if (composed < 0) {
+    // Latin-1: base + combining mark
+    if (handled == 0 && hasNext != 0 && _isSubsetMark(nextCp) != 0) {
+      var composed: int64 := _compose(cp, nextCp);
+      if (composed >= 0) {
+        w += CodepointToUtf8(composed, buf + w);
+        i += clen + nextLen;
+        handled := 1;
+      }
+    }
+    if (handled == 0) {
       w += CodepointToUtf8(cp, buf + w);
       i += clen;
     }
   }
   var r: Text := TextFromUtf8(buf, w);
-  munmap(buf, sz); munmap(lenCell, 8);
+  munmap(buf, sz); munmap(lc, 8);
   return r;
 }
 
