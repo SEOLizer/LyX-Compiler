@@ -1,5 +1,95 @@
 # Changelog - Lyx Compiler
 
+## Version 1.0.8A (Juli 2026)
+
+Vollständiger String- und Unicode-Stack. Basis V1.0.7D.
+
+### String- und Text-Typen
+- **`std.strtype.String`** — eigener, längentragender String-Wert als Klasse
+  (mmap-basiert, libc-frei, embedded-NUL-sicher; Append/Substring/Equals/Add),
+  Empfänger für das geplante Operator-Overloading (`a + b` → `a.Add(b)`).
+- **`std.text.Text`** — UTF-8-Typ: validiert bei Konstruktion, codepoint-aware
+  (`TextCodepointCount`/`At`, En-/Decode), Concat, Codepoint-Substring, Find/
+  Contains, Trim, Replace, Split, ASCII-Case. Byte-Länge ≠ Codepoint-Zahl.
+
+### Unicode (opt-in Units)
+- **`std.unicode`** — Case-Folding (ASCII + Latin-1), Unicode-Whitespace-
+  Klassifikation, Text-Level Upper/Lower, und **volle Normalisierung
+  NFD/NFC/NFKD/NFKC**: kanonische + Kompatibilitäts-Dekomposition, Canonical-
+  Ordering nach Combining-Class, Composition-mit-Blocking, Hangul algorithmisch
+  (§3.12). `TextEqualsNormalized` (normalisierungs-insensitiver Vergleich).
+- **`std.grapheme`** — UAX #29 erweiterte Grapheme-Cluster (`TextGraphemeCount`/
+  `ByteOffset`/`At`): Regeln GB3–GB999 (Hangul, Extend/ZWJ, SpacingMark,
+  Prepend, Emoji-ZWJ GB11, Regional-Indicator-Paare GB12/13).
+- **`std.unicode_data` / `std.unicode_gbdata`** — aus UnicodeData.txt,
+  GraphemeBreakProperty.txt und emoji-data.txt generierte Tabellen (2081
+  kanonische + 5914 Kompatibilitäts-Dekompositionen, 968 Combining-Classes,
+  961 Composition-Pairs, 1429 Grapheme-Break-Ranges, 451 Extended_Pictographic),
+  sortiert + Binärsuche, Lazy-Init. Auf zwei Units gesplittet wegen lyxc-
+  Größen-Grenze beim Kompilieren.
+
+### Framework-Integration
+- **`data.strbridge`** — String↔Text-Konversion, DataFrame-Utf8-Zelle ↔ Text,
+  `DataFrameColumnAllValidUtf8` (UTF-8-Qualitätsprüfung) und
+  `DataFrameNormalizeColumnNFC` → normalisierungs-insensitive Group-by/Join auf
+  String-Spalten.
+
+Verifiziert e2e (Latin/Greek/Cyrillic/CJK-compat/Hangul, Emoji-ZWJ/Flags,
+Ligatur/Superscript/Fullwidth); Selbst-Host-Fixpunkt gen2==gen3.
+
+## Version 1.0.7D (Juli 2026)
+
+Rollout der Compound-Assignment-Operatoren in Standardbibliothek und Beispielen.
+Basis V1.0.7C.
+
+- **`std/`** — 3603 `x := x + y`-Muster auf `x += y` (bzw. `-= *= /= %=`)
+  umgestellt (238 Units), rein mechanisch (Desugaring-äquivalent), Idempotenz-
+  und Kompilier-verifiziert.
+- **`examples/basics/`** — neues Showcase `compound_assign.lyx`; control_flow/
+  variables/arrays modernisiert (inkl. `const`→`con`-Fix in variables.lyx).
+
+## Version 1.0.7C (Juli 2026)
+
+Rollout der Compound-Assignment-Operatoren in Compiler-Quelle und Daten-
+Framework. Basis V1.0.7B.
+
+- **Compiler-Quelle** (`src/`) auf `+=`/`-=` umgestellt und **Bootstrap-Seed
+  neu verankert** (Seed kennt die neue Syntax).
+- **`data/`-Framework**-Units auf die Compound-Operatoren umgestellt.
+
+## Version 1.0.7B (Juli 2026)
+
+Sprach-Feature: Compound-Assignment-Operatoren. Basis V1.0.7A.
+
+- **`+= -= *= /= %=`** als Parser-Desugaring (`a += b` → `a := a + b`),
+  backend-agnostisch. Neue Tokens im Lexer (`TK_PLUSEQ`…`TK_PERCENTEQ`),
+  Desugaring nach dem `++`/`--`-Block im Parser, `CompoundAssignStmt` in
+  `ebnf.md`. Fixpunkt gen2==gen3, 20 PASS.
+
+## Version 1.0.7A (Juli 2026)
+
+Standard-Daten-Framework: ein einheitliches, geschachteltes, spalten-
+orientiertes Datenmodell (Arrow-inspiriert, Lyx-Eigenformat). Basis V1.0.6A.
+
+### Schichten
+- **L1 Kernel** (`data.kernel`) — DataType-Tags, wachsender Buffer, Null-Bitmap.
+- **L2 Struktur** (`data.frame`) — Field/Column/DataFrame, typisierte Spalten
+  Int64/Float64/Utf8, geschachtelte List- und Struct-Spalten (offset-basiert,
+  grow-fest).
+- **L3 Operationen** (`data.ops`) — Aggregate/Filter/Select/Slice, generischer
+  und mehrspaltiger Sort (Merge-Sort), Group-by, Inner/Left/Right/Full-Join,
+  Melt/Pivot, sowie **hash-basierte** Group-by/Join (int64 + Utf8, O(n),
+  Open-Addressing/FNV-1a).
+
+### IO / Formate
+- **CSV** Reader (Typinferenz) + Writer; **JSON** Reader (flach + geschachtelt:
+  Arrays→List-, Objekte→Struct-Spalten, mixed-type) + Writer; **natives
+  Binärformat** (schnelles Save/Load, nested-aware); `DataFramePrint`
+  (ausgerichtete ASCII-Tabelle).
+- Robustheit (P0): Buffer-Grow + OOB/OOM-Guards.
+- Codegen-Fix: `x as f64` wird als f64-Ausdruck behandelt (Integer-Division-Bug
+  bei Doppel-Cast).
+
 ## Version 1.0.6A (Juli 2026)
 
 WSP-07: `extern "asm"` externe Daten-Symbole + relocatable Objekt-Ausgabe (ET_REL).
