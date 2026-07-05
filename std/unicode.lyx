@@ -1,0 +1,106 @@
+// std.unicode — opt-in Unicode-aware operations on Text (codepoints)
+//
+// Per the string-encoding decision, Unicode correctness lives in a SEPARATE
+// opt-in unit — not baked into the base String/Text. This first slice is
+// rule-based and needs NO Unicode data tables:
+//   - case folding for ASCII + Latin-1 Supplement (covers most European text)
+//   - Unicode whitespace / ASCII digit-letter classification
+//   - Text-level TextToUpper / TextToLower (decode -> fold -> re-encode)
+//
+// NOT here yet (need generated tables from the Unicode database — follow-up):
+//   - full case folding beyond Latin-1 (Latin Extended, Greek, Cyrillic, ...)
+//   - normalisation NFC / NFD (canonical decomposition + reordering)
+//   - grapheme-cluster segmentation
+// Known Latin-1 gaps (special-cased, currently left unchanged): ß (U+00DF),
+// ÿ (U+00FF) -> Ÿ (U+0178).
+
+@description("Opt-in Unicode-aware operations (case folding, classification) on Text")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit std.unicode;
+
+import std.text;
+
+// ---- codepoint case folding (ASCII + Latin-1 Supplement) -------------------
+
+pub fn UnicodeToLower(cp: int64): int64 {
+  if (cp >= 65 && cp <= 90) { return cp + 32; }                    // A-Z -> a-z
+  if (cp >= 192 && cp <= 222 && cp != 215) { return cp + 32; }     // À-Þ -> à-þ (except × U+00D7)
+  return cp;
+}
+
+pub fn UnicodeToUpper(cp: int64): int64 {
+  if (cp >= 97 && cp <= 122) { return cp - 32; }                   // a-z -> A-Z
+  if (cp >= 224 && cp <= 254 && cp != 247) { return cp - 32; }     // à-þ -> À-Þ (except ÷ U+00F7; ÿ U+00FF not covered)
+  return cp;
+}
+
+// ---- classification --------------------------------------------------------
+
+// Unicode White_Space property.
+pub fn UnicodeIsWhitespace(cp: int64): int64 {
+  if (cp >= 9 && cp <= 13) { return 1; }                           // TAB LF VT FF CR
+  if (cp == 32 || cp == 133 || cp == 160 || cp == 5760) { return 1; }  // SP NEL NBSP OGHAM
+  if (cp >= 8192 && cp <= 8202) { return 1; }                      // EN QUAD .. HAIR SPACE
+  if (cp == 8232 || cp == 8233 || cp == 8239 || cp == 8287 || cp == 12288) { return 1; }  // LS PS NNBSP MMSP IDEO
+  return 0;
+}
+
+pub fn UnicodeIsAsciiDigit(cp: int64): int64 {
+  if (cp >= 48 && cp <= 57) { return 1; }
+  return 0;
+}
+
+pub fn UnicodeIsAsciiLetter(cp: int64): int64 {
+  if (cp >= 65 && cp <= 90) { return 1; }
+  if (cp >= 97 && cp <= 122) { return 1; }
+  return 0;
+}
+
+// ---- Text-level case transforms (Unicode-aware, decode -> fold -> encode) ---
+
+// Decode the codepoint at byte offset `off` in `t`; returns the codepoint and
+// writes its UTF-8 byte length to *lenOut.
+fn _decodeAt(t: Text, off: int64, lenOut: int64): int64 {
+  var d: int64 := TextData(t);
+  var b: int64 := peek8(d + off) & 255;
+  if (b < 128) { poke64(lenOut, 1); return b; }
+  if (b < 224) {
+    poke64(lenOut, 2);
+    return ((b & 31) << 6) | (peek8(d + off + 1) & 63);
+  }
+  if (b < 240) {
+    poke64(lenOut, 3);
+    return ((b & 15) << 12) | ((peek8(d + off + 1) & 63) << 6) | (peek8(d + off + 2) & 63);
+  }
+  poke64(lenOut, 4);
+  return ((b & 7) << 18) | ((peek8(d + off + 1) & 63) << 12) | ((peek8(d + off + 2) & 63) << 6) | (peek8(d + off + 3) & 63);
+}
+
+// Apply a per-codepoint transform (0 = ToLower, 1 = ToUpper) across `t`,
+// returning a new Text. Requires valid UTF-8 input.
+fn _caseMap(t: Text, toUpper: int64): Text {
+  var byteLen: int64 := TextByteLength(t);
+  var sz: int64 := byteLen * 4 + 4;
+  var buf: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf < 0) { return TextFromUtf8(TextData(t), byteLen); }
+  var lenCell: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var w: int64 := 0;
+  var i: int64 := 0;
+  while (i < byteLen) {
+    var cp: int64 := _decodeAt(t, i, lenCell);
+    var clen: int64 := peek64(lenCell);
+    var folded: int64 := cp;
+    if (toUpper != 0) { folded := UnicodeToUpper(cp); }
+    else { folded := UnicodeToLower(cp); }
+    w += CodepointToUtf8(folded, buf + w);
+    i += clen;
+  }
+  var r: Text := TextFromUtf8(buf, w);
+  munmap(buf, sz);
+  munmap(lenCell, 8);
+  return r;
+}
+
+pub fn TextToLower(t: Text): Text { return _caseMap(t, 0); }
+pub fn TextToUpper(t: Text): Text { return _caseMap(t, 1); }
