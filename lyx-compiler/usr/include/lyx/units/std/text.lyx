@@ -271,6 +271,135 @@ pub fn TextAsciiLower(t: Text): Text {
   return r;
 }
 
+// ---- search / trim / replace / split ---------------------------------------
+
+// Do `needle`'s bytes appear in `t` starting at byte offset `i`?
+fn _bytesEqAt(t: Text, i: int64, needle: Text): int64 {
+  if (i + needle.byteLen > t.byteLen) { return 0; }
+  var j: int64 := 0;
+  while (j < needle.byteLen) {
+    if ((peek8(t.data + i + j) & 255) != (peek8(needle.data + j) & 255)) { return 0; }
+    j += 1;
+  }
+  return 1;
+}
+
+// Byte offset of the first occurrence of `needle`, or -1. Safe on UTF-8: the
+// encoding is self-synchronising, so a byte match is always a real match.
+pub fn TextFind(t: Text, needle: Text): int64 {
+  if (needle.byteLen == 0) { return 0; }
+  if (needle.byteLen > t.byteLen) { return 0 - 1; }
+  var i: int64 := 0;
+  while (i + needle.byteLen <= t.byteLen) {
+    if (_bytesEqAt(t, i, needle) != 0) { return i; }
+    i += 1;
+  }
+  return 0 - 1;
+}
+
+// Codepoint index of the first occurrence of `needle`, or -1.
+pub fn TextFindCp(t: Text, needle: Text): int64 {
+  var off: int64 := TextFind(t, needle);
+  if (off < 0) { return 0 - 1; }
+  var cp: int64 := 0;
+  var i: int64 := 0;
+  while (i < off) {
+    if (((peek8(t.data + i) & 255) & 192) != 128) { cp += 1; }
+    i += 1;
+  }
+  return cp;
+}
+
+pub fn TextContains(t: Text, needle: Text): int64 {
+  if (TextFind(t, needle) >= 0) { return 1; }
+  return 0;
+}
+
+fn _isAsciiWs(b: int64): int64 {
+  if (b == 32 || b == 9 || b == 10 || b == 13) { return 1; }
+  return 0;
+}
+
+// Trim leading/trailing ASCII whitespace (space, tab, LF, CR). ASCII bytes are
+// < 0x80 so this never touches a multibyte sequence. Unicode whitespace trimming
+// is for the opt-in unicode unit.
+pub fn TextTrim(t: Text): Text {
+  var start: int64 := 0;
+  while (start < t.byteLen && _isAsciiWs(peek8(t.data + start) & 255) != 0) { start += 1; }
+  var end: int64 := t.byteLen;
+  while (end > start && _isAsciiWs(peek8(t.data + end - 1) & 255) != 0) { end -= 1; }
+  return TextFromUtf8(t.data + start, end - start);
+}
+
+// Replace every (non-overlapping) occurrence of `old` with `repl`; new Text.
+// (`new` is a reserved keyword, so the replacement is named `repl`.)
+pub fn TextReplace(t: Text, old: Text, repl: Text): Text {
+  if (old.byteLen == 0 || old.byteLen > t.byteLen) { return TextFromUtf8(t.data, t.byteLen); }
+  // Pass 1: count occurrences to size the result exactly.
+  var count: int64 := 0;
+  var i: int64 := 0;
+  while (i + old.byteLen <= t.byteLen) {
+    if (_bytesEqAt(t, i, old) != 0) { count += 1; i += old.byteLen; }
+    else { i += 1; }
+  }
+  var resultLen: int64 := t.byteLen + count * (repl.byteLen - old.byteLen);
+  var sz: int64 := resultLen;
+  if (sz < 1) { sz := 1; }
+  var buf: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf < 0) { return TextFromUtf8(t.data, t.byteLen); }
+  // Pass 2: build.
+  var w: int64 := 0;
+  var r: int64 := 0;
+  while (r < t.byteLen) {
+    if (r + old.byteLen <= t.byteLen && _bytesEqAt(t, r, old) != 0) {
+      if (repl.byteLen > 0) { memcpy(buf + w, repl.data, repl.byteLen); }
+      w += repl.byteLen;
+      r += old.byteLen;
+    } else {
+      poke8(buf + w, peek8(t.data + r) & 255);
+      w += 1;
+      r += 1;
+    }
+  }
+  var res: Text := TextFromUtf8(buf, resultLen);
+  munmap(buf, sz);
+  return res;
+}
+
+// Split `t` on `sep`, writing up to `maxParts` Text structs into the array at
+// `out` (each sizeof(Text) bytes). Returns the total number of parts (which may
+// exceed maxParts — only the first maxParts are written).
+pub fn TextSplit(t: Text, sep: Text, out: int64, maxParts: int64): int64 {
+  if (sep.byteLen == 0) { return 0; }
+  var stride: int64 := sizeof(Text);
+  var count: int64 := 0;
+  var start: int64 := 0;
+  var i: int64 := 0;
+  while (i + sep.byteLen <= t.byteLen) {
+    if (_bytesEqAt(t, i, sep) != 0) {
+      if (count < maxParts) {
+        var part: Text := TextFromUtf8(t.data + start, i - start);
+        poke64(out + count * stride + 0,  part.data);
+        poke64(out + count * stride + 8,  part.byteLen);
+        poke64(out + count * stride + 16, part.valid);
+      }
+      count += 1;
+      i += sep.byteLen;
+      start := i;
+    } else {
+      i += 1;
+    }
+  }
+  if (count < maxParts) {
+    var last: Text := TextFromUtf8(t.data + start, t.byteLen - start);
+    poke64(out + count * stride + 0,  last.data);
+    poke64(out + count * stride + 8,  last.byteLen);
+    poke64(out + count * stride + 16, last.valid);
+  }
+  count += 1;
+  return count;
+}
+
 pub fn TextFree(t: Text) {
   if (t.data != 0) {
     var sz: int64 := t.byteLen;
