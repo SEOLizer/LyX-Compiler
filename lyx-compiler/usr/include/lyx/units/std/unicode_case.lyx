@@ -1,0 +1,92 @@
+// std.unicode_case — full Unicode simple case mapping (upper/lower)
+//
+// std.unicode's UnicodeToUpper/Lower are rule-based and cover only ASCII +
+// Latin-1. This unit provides the FULL simple case mapping (Latin Extended,
+// Greek, Cyrillic, …) from the generated std.unicode_casedata table.
+//
+// Kept separate from std.unicode: that unit already pulls in the large
+// normalisation tables (std.unicode_data), and compiling both big generated
+// units at once exceeds the compiler's per-compilation size limit. A program
+// that only needs case mapping imports this unit and pays for the case table
+// alone.
+//
+// "Simple" = 1:1 codepoint mappings (UnicodeData.txt fields 12/13). Full
+// case FOLDING and the few one-to-many special cases (ß → SS, İ, final sigma)
+// are not covered here.
+
+@description("Full Unicode simple case mapping (upper/lower) over Text")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit std.unicode_case;
+
+import std.text;
+import std.unicode_casedata;
+
+fn _decodeAt(t: Text, off: int64, lenOut: int64): int64 {
+  var d: int64 := TextData(t);
+  var b: int64 := peek8(d + off) & 255;
+  if (b < 128) { poke64(lenOut, 1); return b; }
+  if (b < 224) {
+    poke64(lenOut, 2);
+    return ((b & 31) << 6) | (peek8(d + off + 1) & 63);
+  }
+  if (b < 240) {
+    poke64(lenOut, 3);
+    return ((b & 15) << 12) | ((peek8(d + off + 1) & 63) << 6) | (peek8(d + off + 2) & 63);
+  }
+  poke64(lenOut, 4);
+  return ((b & 7) << 18) | ((peek8(d + off + 1) & 63) << 12) | ((peek8(d + off + 2) & 63) << 6) | (peek8(d + off + 3) & 63);
+}
+
+// Binary search `keys[0..n)` for `cp`; return the matching `vals` entry or `cp`.
+fn _caseLookup(cp: int64, keys: int64, vals: int64, n: int64): int64 {
+  var lo: int64 := 0;
+  var hi: int64 := n - 1;
+  while (lo <= hi) {
+    var mid: int64 := (lo + hi) / 2;
+    var mk: int64 := peek64(keys + mid * 8);
+    if (mk == cp) { return peek64(vals + mid * 8); }
+    if (mk < cp) { lo := mid + 1; } else { hi := mid - 1; }
+  }
+  return cp;
+}
+
+// Full simple uppercase / lowercase of a single codepoint (unchanged if none).
+pub fn UnicodeToUpperFull(cp: int64): int64 {
+  _caseEnsure();
+  return _caseLookup(cp, _uk, _uv, _un);
+}
+
+pub fn UnicodeToLowerFull(cp: int64): int64 {
+  _caseEnsure();
+  return _caseLookup(cp, _lk, _lv, _ln);
+}
+
+// Apply the full case mapping across a Text (toUpper != 0 → upper, else lower),
+// returning a new Text.
+fn _caseMapFull(t: Text, toUpper: int64): Text {
+  _caseEnsure();   // init the table up-front (not deep inside the loop)
+  var byteLen: int64 := TextByteLength(t);
+  var sz: int64 := byteLen * 4 + 4;
+  var buf: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf < 0) { return TextFromUtf8(TextData(t), byteLen); }
+  var lc: int64 := mmap(0, 8, PROT_RW, MAP_ANON, FD_NONE, 0);
+  var w: int64 := 0;
+  var i: int64 := 0;
+  while (i < byteLen) {
+    var cp: int64 := _decodeAt(t, i, lc);
+    var clen: int64 := peek64(lc);
+    var mapped: int64 := cp;
+    if (toUpper != 0) { mapped := _caseLookup(cp, _uk, _uv, _un); }
+    else { mapped := _caseLookup(cp, _lk, _lv, _ln); }
+    w += CodepointToUtf8(mapped, buf + w);
+    i += clen;
+  }
+  var r: Text := TextFromUtf8(buf, w);
+  munmap(buf, sz);
+  munmap(lc, 8);
+  return r;
+}
+
+pub fn TextToUpperFull(t: Text): Text { return _caseMapFull(t, 1); }
+pub fn TextToLowerFull(t: Text): Text { return _caseMapFull(t, 0); }
