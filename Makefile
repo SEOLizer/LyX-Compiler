@@ -143,6 +143,9 @@ test: lyxc
 	@echo "--- Statischer Methodenaufruf TypeName.Method() (7 tests) ---"
 	@bash tests/static_method_call_test.sh
 	@echo "OK"
+	@echo "--- FFI-Trust-Grenze von --compile-unit (5 tests) ---"
+	@bash tests/ffi_unit_trust_test.sh
+	@echo "OK"
 	@echo "--- Geometrie-/Result-Units (Struct-Literal-Umbau, 31 Prüfungen) ---"
 	./lyxc --std-path=std tests/geom_units_test.lyx -o /tmp/lyxc_geom_test
 	@/tmp/lyxc_geom_test > /dev/null

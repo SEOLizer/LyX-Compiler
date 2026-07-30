@@ -2,6 +2,27 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — FFI-Trust für `--compile-unit` (#960)
+- **`--compile-unit` auf einer stdlib-Unit gilt jetzt als vertrauenswürdig**,
+  genau wie dieselbe Unit beim Import. Vorher war sie als **Root**-Modul
+  untrusted und ihre Externs fielen in den Fail-Closed-Zweig der FFI-Sandbox.
+- Das war **kein Test-Artefakt**: `make package` ruft über `precompile-units`
+  denselben Pfad auf. 15 Units ließen sich dadurch nicht mehr zu `.lyu`
+  vorkompilieren — die gepackten Kopien stammten noch von vor der FFI-Härtung
+  und waren nicht regenerierbar.
+- Das Vertrauen kommt vom **Pfad**, den der Aufrufer angibt (`std/`, `src/`,
+  `data/`), nicht aus einer Selbstauskunft der Datei: eine Datei außerhalb des
+  Baums bleibt fail-closed, auch wenn sie sich selbst `unit std.x;` nennt.
+  Blacklist und Klassifizierung gelten unverändert weiter.
+- Compile-Sweep: **77 OK / 15 failed → 91 OK / 1 failed**.
+- Neuer Test `tests/ffi_unit_trust_test.sh` (5 PASS), in `make test`: hält beide
+  Seiten der Grenze fest — stdlib-Unit compiliert, Datei außerhalb des Baums und
+  normales Programm bleiben fail-closed, Blacklist greift auch im std-Baum,
+  stdlib-interne Builtins ohne link-String bleiben erlaubt.
+- **Offen**: `std/process.lyx` bleibt die einzige nicht übersetzbare Unit. Sie
+  deklariert `execve`/`execvp`, beide auf der harten FFI-Blacklist. Das ist die
+  Sandbox-Policy, keine Panne — braucht eine Entscheidung, kein Aufweichen.
+
 ### Standardbibliothek — nicht kompilierbare Units repariert (#960)
 - **16 Units waren nicht übersetzbar** und blockierten damit jedes Programm, das
   sie importiert (der Resolver bevorzugt `.lyx` vor `.lyu`). `test_compile_units.sh`
