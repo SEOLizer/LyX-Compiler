@@ -64,6 +64,25 @@
   Geometrie-/Result-Units gegen erwartete Zahlen — „kompiliert durch" genügt bei
   einem mechanischen Umbau nicht.
 
+### Compiler (Codegen) — Stack-Argumente nach dem Aufruf abräumen (#965)
+- **Ein Aufruf mit 7+ Argumenten innerhalb der Argumentliste eines anderen
+  Aufrufs zerstörte den äußeren Aufruf.** Ab dem 7. Slot gehen Argumente nach
+  SysV-Konvention über den Stack, und der Aufrufer muss sie nach dem `call`
+  selbst entfernen — das fehlte. Isoliert fiel es nicht auf (der Frame wird beim
+  Funktionsende ohnehin über `rbp` zurückgesetzt); verschachtelt lagen dort aber
+  schon die ausgewerteten Argumente des äußeren Aufrufs.
+- Zwei Ausprägungen: SIGSEGV oder — gefährlicher — ein stillschweigend
+  verlorener Parameter. `show("n7", seven(7,7,7,7,7,7,7))` verlor den Namen bzw.
+  stürzte ab.
+- Bei Methoden zählt das implizite `self` mit, dort lag die Grenze schon bei
+  **6** expliziten Argumenten.
+- Fix: `cg_popStackArgs(nTotal)` nach jedem Aufruf, der gespillt hat (imm8 bzw.
+  imm32). Betrifft den Methoden-/Static-Pfad und den Pfad für freie Funktionen.
+- Neuer Test `tests/nested_call_stackargs_test.lyx` (11 Prüfungen), in
+  `make test`: verschachtelte Aufrufe mit 6/7/9 Argumenten, zwei verschachtelte
+  nebeneinander, Methoden mit 6/7 Argumenten plus statischer Aufruf, isolierte
+  Aufrufe als Gegenprobe, und der Erhalt des äußeren `pchar`-Parameters.
+
 ### Compiler (Codegen) — statischer Methodenaufruf (#958)
 - **`TypeName.Method(args)` übergab die Argumente um ein Register verschoben.**
   Der Callee `TypeName_Method` hat immer ein implizites `self` als ersten
