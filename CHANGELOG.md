@@ -1,5 +1,47 @@
 # Changelog - Lyx Compiler
 
+## Unveröffentlicht (develop)
+
+Reine Standardbibliothek — kein Compiler-Change.
+
+### Standardbibliothek
+- **`std.text.Text` ist jetzt eine Klasse** (vorher struct). Damit trägt die
+  UTF-8-Schicht eine Methoden-API und nimmt am Operator-Overloading teil:
+  `a + b` (Add), `a == b`/`a != b` (Eq/Ne), `a < b` … `a >= b` (Compare), `a[i]` (Get).
+- **`a[i]` liefert den Codepoint**, nicht das Byte — `Text` ist die
+  codepoint-aware Schicht; für Rohbytes bleibt `ByteAt`. `Compare` ist
+  lexikografisch über die UTF-8-Bytes, was bei UTF-8 der Codepoint-Ordnung
+  entspricht (keine Locale-Collation, nicht normalisierungs-insensitiv).
+- **Neu**: `SplitCount` + `PartAt` (Split ohne Caller-Buffer), `TextCompare` als
+  freie Funktion.
+- **Kompatibel**: alle bisherigen freien Funktionen bleiben als Wrapper über den
+  Methoden — `std.unicode`, `std.unicode_case` und `std.grapheme` sind
+  unverändert (sie nutzten nur `TextData`/`TextByteLength`).
+- **Latenter Bug mitgefixt**: `Free()`/`TextFree()` leert jetzt wirklich das
+  Objekt des Aufrufers. Als struct mutierte es eine By-Value-Kopie, ließ die
+  Felder des Aufrufers also dangling.
+- `sizeof(Text)` ist die Handle-Größe → der Stride der rohen `TextSplit`-Ausgabe
+  ist die explizite Konstante `TEXT_PART_STRIDE` (24 = `[data][byteLen][valid]`).
+
+### Doku / Beispiele
+- **`examples/basics/text_operators.lyx`**: Showcase für `Text` (Methoden,
+  Operatoren, Codepoint- vs. Byte-Indizierung).
+- **`DATATYPES.md` §5.1**: `String` (Bytes-Ebene) vs. `Text` (UTF-8-Ebene),
+  Operator-Tabelle, Normalisierungs-Fallstrick, Lebensdauer.
+- **`README.md`**: String-Modultabelle um `std.strtype`, `std.text`,
+  `std.unicode`, `std.unicode_case`, `std.grapheme` ergänzt.
+
+### Bekannte Grenze
+- Ein Methodenaufruf auf einem Methoden-*Ergebnis* (`t.Trim().ByteLength()`) ist
+  noch keine Dispatch-Stelle (vgl. `ebnf.md` §15.3, letzter Absatz) —
+  Zwischenergebnis an eine Variable binden.
+- `TextFromUtf16`/`TextToUtf16` (Boundary-Konverter laut Encoding-Entscheidung)
+  fehlen noch.
+
+Verifiziert: `make test` 20 PASS / 0 FAIL; Smoke-Test über Methoden, Operatoren
+und Free-Function-Wrapper; `std.unicode`/`std.unicode_case`/`std.grapheme` laufen
+gegen das Klassen-`Text`.
+
 ## Version 1.0.8C (Juli 2026)
 
 Operator-Overloading komplettiert (Stufen 2b, 2c, 3) + `!=`-Fallback. Basis V1.0.8B.

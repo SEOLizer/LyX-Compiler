@@ -246,7 +246,12 @@ The standard library is written entirely in Lyx. All modules are available as so
 
 | Module | Description |
 |--------|-------------|
+| `std.strtype` | `String` — owned byte string (class, operators) |
+| `std.text` | `Text` — validated UTF-8, codepoint-aware (class, operators) |
 | `std.string` | String utilities |
+| `std.unicode` | Opt-in: normalisation (NFC/NFD), case folding, classification |
+| `std.unicode_case` | Opt-in: full Unicode simple case mapping |
+| `std.grapheme` | Opt-in: grapheme cluster segmentation (UAX #29) |
 | `std.regex` | Regular expressions |
 | `std.url` | URL parsing and encoding |
 
