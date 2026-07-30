@@ -2,7 +2,27 @@
 
 ## Unveröffentlicht (develop)
 
-Reine Standardbibliothek — kein Compiler-Change.
+### Compiler (LyxOS-Backend)
+- **Float-Memory-Intrinsics für `--target=lyxos`**: `peekf64`, `pokef64`,
+  `peek32f`, `poke32f` werden jetzt gelowert (ir_lower ids 253–256, Emission in
+  emit_lyxos). Sie waren in sema registriert und im ELF-Codegen inline
+  emittiert, im lyxos-Pfad aber nicht behandelt — die letzte Lücke aus dem
+  peek/poke-Misdispatch-Report. Der gehärtete Catch-all machte daraus einen
+  harten Compile-Fehler statt einer stillen Fehl-Emission, `--target=lyxos`
+  konnte also überhaupt keinen f64/f32-Speicherzugriff übersetzen.
+- `peekf64`/`pokef64` sind reine 8-Byte-Moves (f64 liegt als IEEE-Bits im
+  int64-Slot, wie in codegen_x86); nur die f32-Varianten brauchen SSE, weil sie
+  zwischen f32-Speicher und f64-Registerdarstellung konvertieren
+  (cvtss2sd / cvtsd2ss).
+- Regressionstests in `tests/lyxos_builtin_intrinsics_test.sh` (jetzt 75 PASS):
+  Reads auf rodata sind runtime-verifiziert — "AAAA" als f32 = 12.078431,
+  "AAAAAAAA" als f64 = 2261634.5098 prüft zugleich die f32→f64-Weitung, nicht
+  nur dass geladen wird. Stores compile-only wie die bestehenden poke-Tests.
+- Die Bug-Reports `BUG_lyxos_peek_poke_misdispatch.md` und
+  `BUG_lyxos_v102B_peek_poke_REGRESSION.md` sind damit vollständig abgearbeitet
+  und entfernt (Historie steht in git).
+
+### Standardbibliothek
 
 ### Standardbibliothek
 - **`std.text.Text` ist jetzt eine Klasse** (vorher struct). Damit trägt die

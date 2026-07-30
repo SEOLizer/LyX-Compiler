@@ -157,6 +157,20 @@ compile_ok "oop_virtual_dispatch" 'type A = class { val: int64; virtual fn S(): 
 type D = class extends A { override fn S(): int64 { return self.val + 1; } fn C(v: int64) { self.val := v; } };
 fn main(): int64 { var d: D := new D(); d.C(41); var a: A := d; return a.S(); }'
 
+# --- Float-Memory-Intrinsics (ids 253-256) ---
+# Gleiche Lücke wie 200-207: in sema registriert, in codegen_x86 (ELF) inline emittiert,
+# im lyxos-Pfad aber nicht gelowert → liefen in den (inzwischen fail-loud) Catch-all.
+# Reads sind auf rodata runtime-prüfbar: die ASCII-Bytes ergeben definierte Floats
+# ("AAAA" als f32 = 12.078431, "AAAAAAAA" als f64 = 2261634.5098) — das prüft zugleich
+# die f32→f64-Weitung von peek32f, nicht nur dass überhaupt geladen wird.
+run "peek32f_rodata" 'fn main(): int64 { var v: f64 := peek32f("AAAA"); if (v > 12.0 && v < 12.1) { return 55; } return 1; }' 55
+run "peekf64_rodata" 'fn main(): int64 { var v: f64 := peekf64("AAAAAAAA"); if (v > 2261634.0 && v < 2261635.0) { return 56; } return 1; }' 56
+run "peek32f_other"  'fn main(): int64 { var v: f64 := peek32f("@@@@"); if (v > 3.0 && v < 3.01) { return 57; } return 1; }' 57
+
+# Stores brauchen beschreibbares Memory (wie poke64 oben) → compile-only.
+compile_ok "pokef64_compiles" 'fn main(): int64 { var b: int64 := mmap(0, 4096, 3, 34, 0-1, 0); pokef64(b, 2.5); return 0; }'
+compile_ok "poke32f_compiles" 'fn main(): int64 { var b: int64 := mmap(0, 4096, 3, 34, 0-1, 0); poke32f(b, 1.5); return 0; }'
+
 # (EPrintFloat ist sema-bekannt aber nicht für lyxos gelowert → muss laut scheitern)
 compile_fail "hardened_catchall" 'fn main(): int64 { EPrintFloat(1.0); return 0; }' "unbekannter Builtin"
 
