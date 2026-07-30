@@ -1,6 +1,24 @@
 # Changelog - Lyx Compiler
 
-## Unveröffentlicht (develop)
+## Version 1.0.9A (Juli 2026)
+
+Aufruf-Protokoll im Codegen korrigiert, kompletter Unicode-/Text-Stack, alle
+stdlib-Units wieder übersetzbar. Basis V1.0.8C.
+
+Schwerpunkte:
+- **Codegen/ABI**: drei Fehler im Aufruf-Protokoll — verschobener self-Slot bei
+  statischen Methodenaufrufen, nie abgeräumte Stack-Argumente ab 7 Slots, und
+  ein Aufruf-Ergebnis war kein gültiger Methoden-Empfänger (#958, #965, #959).
+- **Text/Unicode**: `Text` als Klasse mit Operatoren, volles Simple-Case-Mapping,
+  normalisierungs-/case-insensitiver Vergleich, Unicode-Trim, UTF-16-Konverter.
+  Damit ist die Encoding-Entscheidung (UTF-8 kanonisch) vollständig umgesetzt.
+- **Standardbibliothek**: 17 Units waren gar nicht übersetzbar; Compile-Sweep
+  von 64 OK / 28 failed auf **92 OK / 0 failed** (#960).
+- **LyxOS**: Float-Memory-Intrinsics gelowert; `DIV → SHR` entfernt, weil für
+  vorzeichenbehaftete Division falsch.
+
+Alle Compiler-Änderungen mit Selbst-Host-Fixpunkt gen2==gen3 verifiziert;
+`make test` 20 PASS / 0 FAIL.
 
 ### `std.process` auf Compiler-Builtins umgestellt (#960)
 - **Compile-Sweep jetzt 92 OK / 0 failed** — die letzte nicht übersetzbare Unit.
