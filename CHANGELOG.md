@@ -2,6 +2,27 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler (sema)
+- **`TypeName.Method()` wird abgelehnt, wenn die Methode `self` benutzt** — dann
+  fehlt der Empfänger und die Methode arbeitete an einer beliebigen Adresse
+  (BUG-6 aus `work/compiler-bugs.md`). Methoden **ohne** self-Zugriff bleiben
+  erlaubt: das Static-Factory-Muster (`StringBuilder.Create(256)`) ist in
+  `src/std/` verbreitet, ein pauschales Verbot würde alle Aufrufstellen brechen.
+- Rekursive `self`-Erkennung über den ganzen Methodenrumpf; verschachtelte
+  `fn`-Deklarationen werden nicht betreten (eigener self-Kontext). Importierte
+  Typen tragen keine sichtbare Deklaration und bleiben ungeprüft — lieber
+  ungeprüft als falsch-positiv.
+- `TypeName.field` (Byte-Offset) bleibt unverändert gültig und ist mitgetestet.
+- Neuer Test `tests/static_method_call_test.sh` (7 PASS), in `make test` verdrahtet.
+- **Audit `work/compiler-bugs.md` (lyxc 0.9.9B, BUG-1..8)**: 7 der 8 gegen 1.0.8C
+  als behoben verifiziert — Feld-Offsets, der `e8 cc`-Platzhalter-CALL (bricht
+  heute in `cg_patchAll` hart ab), verschluckte sema-Fehler aus Imports (melden
+  jetzt den Modulnamen), `MemCopy`, `sizeof(Type)` in beiden Kontexten, `StrEq`,
+  `var self`-Shadowing. Report entfernt.
+- **Dabei neu gefunden**: statische Methodenaufrufe crashen zur Laufzeit auch
+  ohne self-Zugriff — vorbestehend, betrifft `src/std/string.lyx`,
+  `json.lyx`, `time.lyx`. Eigener Report `work/static-method-call-codegen.md`.
+
 ### Compiler (IR-Optimizer)
 - **Strength-Reduction `DIV → SHR` entfernt** — für vorzeichenbehaftete Division
   ist die Umformung schlicht falsch: Rechtsschieben rundet ab, Division

@@ -137,8 +137,11 @@ test: lyxc
 	@echo "--- LYXOS Memory-Intrinsics peek/poke/StrCharAt (10 tests) ---"
 	@bash tests/lyxos_builtin_intrinsics_test.sh
 	@echo "OK"
-	@echo "--- LYXOS strength-reduction *2^k / div2^k (12 tests) ---"
+	@echo "--- LYXOS strength-reduction *2^k / div2^k (20 tests) ---"
 	@bash tests/lyxos_strength_reduction_test.sh
+	@echo "OK"
+	@echo "--- Statischer Methodenaufruf TypeName.Method() (7 tests) ---"
+	@bash tests/static_method_call_test.sh
 	@echo "OK"
 	@echo "--- LYXOS @capabilities → CAPS-TLV-Mapping (6 tests) ---"
 	@bash tests/lyxos_caps_tlv_test.sh
