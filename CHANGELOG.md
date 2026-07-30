@@ -64,6 +64,25 @@
   Geometrie-/Result-Units gegen erwartete Zahlen — „kompiliert durch" genügt bei
   einem mechanischen Umbau nicht.
 
+### Compiler (Codegen) — Methodenaufruf auf einem Aufruf-Ergebnis (#959)
+- **`t.Trim().ByteLength()` scheiterte** mit `undefined function 'ByteLength'`:
+  `cg_objClassIdx` lieferte für einen Aufruf als Empfänger -1, der Aufruf wurde
+  ungemangelt emittiert und fand beim Patchen kein Ziel.
+- Die Klassenauflösung existierte bereits (`cg_exprClassName` + fnRet-Registry,
+  in der freie Funktionen **und** Methoden stehen) — sie wurde an dieser Stelle
+  nur nicht benutzt. Da sie sich für den Empfänger rekursiv aufruft, lösen jetzt
+  auch **Ketten** (`padded.Trim().AsciiUpper().ByteLength()`) und freie
+  Funktionen mit class-Rückgabe als Empfänger (`TextFromPchar("abc").ByteLength()`)
+  korrekt auf.
+- **Operatoren auf einem Methoden-Ergebnis** funktionieren damit ebenfalls
+  (`a.M() == b`, `a.M()[i]`). `ebnf.md` §15.3 sagte das Gegenteil und ist
+  angepasst; die Zwischenvariable in `examples/basics/text_operators.lyx`
+  entfällt.
+- Neuer Test `tests/method_result_dispatch_test.lyx` (13 Prüfungen), in
+  `make test`: Methoden- und Operator-Aufrufe auf Ergebnissen, dreistufige
+  Ketten, freie Funktion als Empfänger, `String` wie `Text`, und die
+  Zwischenvariable als Gegenprobe.
+
 ### Compiler (Codegen) — Stack-Argumente nach dem Aufruf abräumen (#965)
 - **Ein Aufruf mit 7+ Argumenten innerhalb der Argumentliste eines anderen
   Aufrufs zerstörte den äußeren Aufruf.** Ab dem 7. Slot gehen Argumente nach
@@ -209,9 +228,6 @@
   `std.unicode`, `std.unicode_case`, `std.grapheme` ergänzt.
 
 ### Bekannte Grenze
-- Ein Methodenaufruf auf einem Methoden-*Ergebnis* (`t.Trim().ByteLength()`) ist
-  noch keine Dispatch-Stelle (vgl. `ebnf.md` §15.3, letzter Absatz) —
-  Zwischenergebnis an eine Variable binden.
 - Volles Case-Folding mit 1:n-Expansion (ß→ss, ﬁ→fi) ist nicht abgedeckt; die
   simple 1:1-Faltung kann das nicht ausdrücken.
 
