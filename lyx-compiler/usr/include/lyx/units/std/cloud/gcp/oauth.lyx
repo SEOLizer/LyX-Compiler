@@ -1,0 +1,352 @@
+// std/cloud/gcp/oauth.lyx — OAuth 2.0 Token Manager (WP-GCP-03)
+//
+// Public API:
+//   GCPTokenFromServiceAccount(sa, scope) -> GCPToken
+//   GCPTokenFromRefresh(clientId, clientSecret, refreshToken) -> GCPToken
+//   GCPTokenFromMetadata() -> GCPToken
+//   GCPTokenIsExpired(token) -> int64 (1=expired, 0=ok)
+//   GCPTokenFree(token)
+
+unit std.cloud.gcp.oauth;
+
+import std.cloud.gcp.jwt;
+import std.alloc;
+import std.net.tls;
+import std.net.socket;
+import std.net.dns;
+import std.net.types;
+import std.net.http;
+import std.time;
+
+// ── GCPToken ──────────────────────────────────────────────────────────────────
+
+pub type GCPToken = struct {
+    accessToken: int64;   // pchar (alloc'd)
+    tokenLen:    int64;
+    expiresAt:   int64;   // unix timestamp
+    tokenType:   int64;   // pchar "Bearer"
+};
+
+pub fn GCPTokenFree(t: GCPToken): void {
+    if (t.accessToken != 0) { free(t.accessToken, t.tokenLen + 1); }
+    if (t.tokenType   != 0) {
+        var tl: int64 := 0;
+        while (peek8(t.tokenType + tl) != 0) { tl := tl + 1; }
+        free(t.tokenType, tl + 1);
+    }
+}
+
+pub fn GCPTokenIsExpired(t: GCPToken): int64 {
+    var now: int64 := Now();
+    if (t.expiresAt - now < 60) { return 1; }
+    return 0;
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn oauthStrLen(s: int64): int64 {
+    if (s == 0) { return 0; }
+    var i: int64 := 0;
+    while (peek8(s + i) != 0) { i := i + 1; }
+    return i;
+}
+
+fn oauthStrDupN(src: int64, n: int64): int64 {
+    var buf: int64 := alloc(n + 1);
+    var i: int64 := 0;
+    while (i < n) { poke8(buf + i, peek8(src + i)); i := i + 1; }
+    poke8(buf + n, 0);
+    return buf;
+}
+
+fn oauthStrDup(src: int64): int64 {
+    if (src == 0) { return 0; }
+    return oauthStrDupN(src, oauthStrLen(src));
+}
+
+// Extract JSON string field value (alloc'd, caller frees)
+fn oauthJSONExtract(json: int64, jsonLen: int64, key: int64): int64 {
+    var kl: int64 := oauthStrLen(key);
+    var i: int64 := 0;
+    while (i < jsonLen - kl - 3) {
+        if ((peek8(json + i) & 0xFF) == 34) {
+            var match: int64 := 1;
+            var j: int64 := 0;
+            while (j < kl) {
+                if ((peek8(json + i + 1 + j) & 0xFF) != (peek8(key + j) & 0xFF)) {
+                    match := 0; break;
+                }
+                j += 1;
+            }
+            if ((match == 1) & ((peek8(json + i + 1 + kl) & 0xFF) == 34)) {
+                var k: int64 := i + kl + 2;
+                while ((k < jsonLen) & (peek8(json + k) == 32)) { k := k + 1; }
+                if ((k < jsonLen) & ((peek8(json + k) & 0xFF) == 58)) {
+                    k += 1;
+                    while ((k < jsonLen) & (peek8(json + k) == 32)) { k := k + 1; }
+                    if ((k < jsonLen) & ((peek8(json + k) & 0xFF) == 34)) {
+                        k += 1;
+                        var vs: int64 := k;
+                        while ((k < jsonLen) & ((peek8(json + k) & 0xFF) != 34)) { k := k + 1; }
+                        return oauthStrDupN(json + vs, k - vs);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+// Extract JSON integer field value
+fn oauthJSONExtractInt(json: int64, jsonLen: int64, key: int64): int64 {
+    var kl: int64 := oauthStrLen(key);
+    var i: int64 := 0;
+    while (i < jsonLen - kl - 3) {
+        if ((peek8(json + i) & 0xFF) == 34) {
+            var match: int64 := 1;
+            var j: int64 := 0;
+            while (j < kl) {
+                if ((peek8(json + i + 1 + j) & 0xFF) != (peek8(key + j) & 0xFF)) {
+                    match := 0; break;
+                }
+                j += 1;
+            }
+            if ((match == 1) & ((peek8(json + i + 1 + kl) & 0xFF) == 34)) {
+                var k: int64 := i + kl + 2;
+                while ((k < jsonLen) & (peek8(json + k) == 32)) { k := k + 1; }
+                if ((k < jsonLen) & ((peek8(json + k) & 0xFF) == 58)) {
+                    k += 1;
+                    while ((k < jsonLen) & (peek8(json + k) == 32)) { k := k + 1; }
+                    var c: int64 := peek8(json + k) & 0xFF;
+                    if ((c >= 48) & (c <= 57)) {
+                        var val: int64 := 0;
+                        while ((k < jsonLen) & ((peek8(json + k) & 0xFF) >= 48) & ((peek8(json + k) & 0xFF) <= 57)) {
+                            val := val * 10 + ((peek8(json + k) & 0xFF) - 48);
+                            k += 1;
+                        }
+                        return val;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+// HTTPS POST to oauth2.googleapis.com/token
+fn oauthPost(body: int64, bodyLen: int64): int64 {
+    var host: int64   := "oauth2.googleapis.com" as int64;
+    var path: int64   := "/token" as int64;
+    var ip: int64     := GetHostByName(host);
+    if (ip == 0) { return 0; }
+    var tcpConn: TCPConn := TCPConnect(ip, 443);
+    if (tcpConn.fd < 0) { return 0; }
+    var tlsCtx: TLSContext := TLSInit();
+    var tlsConn: TLSConn  := TLSConnect(tlsCtx, tcpConn.fd, host);
+    if (tlsConn.connected == 0) {
+        TLSFree(tlsCtx); sys_close(tcpConn.fd); return 0;
+    }
+
+    // Build HTTP headers: Content-Type for URL-encoded form
+    var ctHeader: int64 := "Content-Type: application/x-www-form-urlencoded\r\n" as int64;
+    var ctLen: int64    := oauthStrLen(ctHeader);
+
+    var req: HTTPRequest;
+    req.method   := HTTP_POST;
+    req.host     := host;
+    req.path     := path;
+    req.port     := 443;
+    req.headers  := ctHeader;
+    req.body     := body;
+    req.bodySize := bodyLen;
+
+    var reqBuf: int64   := HTTPRequestBuild(req);
+    if (reqBuf == 0) {
+        TLSClose(tlsConn); TLSFree(tlsCtx); sys_close(tcpConn.fd); return 0;
+    }
+    var reqSz: int64 := peek64(reqBuf + 8);
+    TLSWrite(tlsConn, reqBuf + 16, reqSz);
+    var allocSz: int64 := peek64(reqBuf);
+    free(reqBuf, allocSz);
+
+    // Read response
+    var cap: int64   := 8192;
+    var buf: int64   := alloc(cap);
+    var total: int64 := 0;
+    var done: int64  := 0;
+    while (done == 0) {
+        var n: int64 := TLSRead(tlsConn, buf + total, cap - total - 1);
+        if (n <= 0) { done := 1; }
+        else {
+            total += n;
+            if (total >= cap - 1) { done := 1; }
+        }
+    }
+    TLSClose(tlsConn);
+    TLSFree(tlsCtx);
+    sys_close(tcpConn.fd);
+    poke8(buf + total, 0);
+
+    // Find body: skip past \r\n\r\n
+    var bodyStart: int64 := 0;
+    var ii: int64 := 0;
+    while (ii < total - 3) {
+        if ((peek8(buf + ii) == 13) & (peek8(buf + ii + 1) == 10) &
+            (peek8(buf + ii + 2) == 13) & (peek8(buf + ii + 3) == 10)) {
+            bodyStart := ii + 4;
+            break;
+        }
+        ii += 1;
+    }
+    if (bodyStart == 0) { free(buf, cap); return 0; }
+
+    var jsonLen: int64 := total - bodyStart;
+    var result: int64  := oauthStrDupN(buf + bodyStart, jsonLen);
+    free(buf, cap);
+    return result;
+}
+
+// Parse token response JSON: {"access_token":"ya29...","expires_in":3599,...}
+fn oauthParseTokenResponse(json: int64): GCPToken {
+    var t: GCPToken;
+    t.accessToken := 0; t.tokenLen := 0; t.expiresAt := 0; t.tokenType := 0;
+    if (json == 0) { return t; }
+    var jl: int64 := oauthStrLen(json);
+    t.accessToken := oauthJSONExtract(json, jl, "access_token" as int64);
+    if (t.accessToken != 0) { t.tokenLen := oauthStrLen(t.accessToken); }
+    var expiresIn: int64 := oauthJSONExtractInt(json, jl, "expires_in" as int64);
+    t.expiresAt := Now() + expiresIn;
+    t.tokenType := oauthStrDup("Bearer" as int64);
+    return t;
+}
+
+// ── Public Token Acquisition Functions ───────────────────────────────────────
+
+// Service Account JWT flow:
+// 1. GCPBuildJWT → signed JWT
+// 2. POST grant_type=urn:...jwt-bearer&assertion=<jwt>
+pub fn GCPTokenFromServiceAccount(sa: GCPServiceAccount, scope: int64): GCPToken {
+    var t: GCPToken;
+    t.accessToken := 0; t.tokenLen := 0; t.expiresAt := 0; t.tokenType := 0;
+    var now: int64 := Now();
+    var jwt: int64 := GCPBuildJWT(sa, scope, now);
+    if (jwt == 0) { return t; }
+    var jwtLen: int64 := oauthStrLen(jwt);
+
+    // Body: grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=<jwt>
+    var grantType: int64 := "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=" as int64;
+    var gtLen: int64     := oauthStrLen(grantType);
+    var bodyLen: int64   := gtLen + jwtLen;
+    var body: int64      := alloc(bodyLen + 1);
+    var i: int64 := 0;
+    while (i < gtLen)  { poke8(body + i, peek8(grantType + i)); i := i + 1; }
+    var j: int64 := 0;
+    while (j < jwtLen) { poke8(body + i, peek8(jwt + j)); i := i + 1; j := j + 1; }
+    poke8(body + bodyLen, 0);
+
+    var respJSON: int64 := oauthPost(body, bodyLen);
+    free(body, bodyLen + 1);
+    GCPJWTFree(jwt);
+
+    t := oauthParseTokenResponse(respJSON);
+    if (respJSON != 0) { free(respJSON, oauthStrLen(respJSON) + 1); }
+    return t;
+}
+
+// OAuth 2.0 Refresh Token flow (ADC / gcloud auth application-default login)
+pub fn GCPTokenFromRefresh(clientId: int64, clientSecret: int64, refreshToken: int64): GCPToken {
+    var t: GCPToken;
+    t.accessToken := 0; t.tokenLen := 0; t.expiresAt := 0; t.tokenType := 0;
+
+    var cidLen: int64 := oauthStrLen(clientId);
+    var csLen:  int64 := oauthStrLen(clientSecret);
+    var rtLen:  int64 := oauthStrLen(refreshToken);
+    var prefix: int64 := "grant_type=refresh_token&client_id=" as int64;
+    var mid1:   int64 := "&client_secret=" as int64;
+    var mid2:   int64 := "&refresh_token=" as int64;
+    var pfxLen: int64 := oauthStrLen(prefix);
+    var m1Len:  int64 := oauthStrLen(mid1);
+    var m2Len:  int64 := oauthStrLen(mid2);
+    var bodyLen: int64 := pfxLen + cidLen + m1Len + csLen + m2Len + rtLen;
+    var body: int64 := alloc(bodyLen + 1);
+    var i: int64 := 0;
+    var k: int64 := 0;
+    while (k < pfxLen)  { poke8(body + i, peek8(prefix + k)); i := i + 1; k := k + 1; }
+    k := 0;
+    while (k < cidLen)  { poke8(body + i, peek8(clientId + k)); i := i + 1; k := k + 1; }
+    k := 0;
+    while (k < m1Len)   { poke8(body + i, peek8(mid1 + k)); i := i + 1; k := k + 1; }
+    k := 0;
+    while (k < csLen)   { poke8(body + i, peek8(clientSecret + k)); i := i + 1; k := k + 1; }
+    k := 0;
+    while (k < m2Len)   { poke8(body + i, peek8(mid2 + k)); i := i + 1; k := k + 1; }
+    k := 0;
+    while (k < rtLen)   { poke8(body + i, peek8(refreshToken + k)); i := i + 1; k := k + 1; }
+    poke8(body + bodyLen, 0);
+
+    var respJSON: int64 := oauthPost(body, bodyLen);
+    free(body, bodyLen + 1);
+    t := oauthParseTokenResponse(respJSON);
+    if (respJSON != 0) { free(respJSON, oauthStrLen(respJSON) + 1); }
+    return t;
+}
+
+// GCE Metadata Server token (HTTP, no TLS)
+pub fn GCPTokenFromMetadata(): GCPToken {
+    var t: GCPToken;
+    t.accessToken := 0; t.tokenLen := 0; t.expiresAt := 0; t.tokenType := 0;
+
+    var host: int64 := "metadata.google.internal" as int64;
+    var path: int64 := "/computeMetadata/v1/instance/service-accounts/default/token" as int64;
+    var ip: int64   := GetHostByName(host);
+    if (ip == 0) { return t; }
+    var tcpConn: TCPConn := TCPConnect(ip, 80);
+    if (tcpConn.fd < 0) { return t; }
+
+    var metaHeader: int64 := "Metadata-Flavor: Google\r\n" as int64;
+    var req: HTTPRequest;
+    req.method   := HTTP_GET;
+    req.host     := host;
+    req.path     := path;
+    req.port     := 80;
+    req.headers  := metaHeader;
+    req.body     := 0;
+    req.bodySize := 0;
+
+    var reqBuf: int64 := HTTPRequestBuild(req);
+    if (reqBuf == 0) { sys_close(tcpConn.fd); return t; }
+    var reqSz: int64 := peek64(reqBuf + 8);
+    sys_write(tcpConn.fd, reqBuf + 16, reqSz);
+    var allocSz: int64 := peek64(reqBuf);
+    free(reqBuf, allocSz);
+
+    var cap: int64  := 4096;
+    var buf: int64  := alloc(cap);
+    var total: int64 := 0;
+    var done: int64  := 0;
+    while (done == 0) {
+        var n: int64 := sys_read(tcpConn.fd, buf + total, cap - total - 1);
+        if (n <= 0) { done := 1; }
+        else { total := total + n; if (total >= cap - 1) { done := 1; } }
+    }
+    sys_close(tcpConn.fd);
+    poke8(buf + total, 0);
+
+    var bodyStart: int64 := 0;
+    var ii: int64 := 0;
+    while (ii < total - 3) {
+        if ((peek8(buf + ii) == 13) & (peek8(buf + ii + 1) == 10) &
+            (peek8(buf + ii + 2) == 13) & (peek8(buf + ii + 3) == 10)) {
+            bodyStart := ii + 4; break;
+        }
+        ii += 1;
+    }
+    var jl: int64 := total - bodyStart;
+    var json: int64 := oauthStrDupN(buf + bodyStart, jl);
+    free(buf, cap);
+    t := oauthParseTokenResponse(json);
+    if (json != 0) { free(json, oauthStrLen(json) + 1); }
+    return t;
+}

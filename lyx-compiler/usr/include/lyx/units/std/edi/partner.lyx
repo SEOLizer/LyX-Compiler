@@ -1,0 +1,376 @@
+// std/edi/partner.lyx — AS2 / SFTP transport + Partner Profiles (WP-EDI-13)
+//
+// Partner profiles define how messages are exchanged with a trading partner:
+//   - which transport protocol (AS2 or SFTP)
+//   - sender/receiver IDs (AS2) or host/path (SFTP)
+//   - agreed message types (EDI_PART_MSG_*)
+//
+// This unit is a *metadata registry*, not a network driver. It allocates and
+// manages a flat array of EdiPartner records that callers persist how they
+// see fit (e.g. write to a config file using the writer helpers below).
+//
+// Wire format (pipe-delimited text, one partner per line):
+//   protocol|partnerID|ourID|host|port|path|msgTypes|options
+//   e.g. AS2|ACME-GmbH|MINE-Corp|as2.acme.com|4080|/as2|ORDERS,INVOIC|0
+//        SFTP|ACME-FTP|MINE-Corp|sftp.acme.com|22|/edi/in|REMADV,ORDERS|1
+
+unit std.edi.partner;
+
+import std.alloc;
+
+// ── Transport protocols ───────────────────────────────────────────────────────
+pub con EDI_PART_PROTO_AS2:  int64 := 1;
+pub con EDI_PART_PROTO_SFTP: int64 := 2;
+
+// ── Message type flags (bit field stored in msgTypes) ─────────────────────────
+pub con EDI_PART_MSG_ORDERS:  int64 := 1;
+pub con EDI_PART_MSG_INVOIC:  int64 := 2;
+pub con EDI_PART_MSG_DESADV:  int64 := 4;
+pub con EDI_PART_MSG_REMADV:  int64 := 8;
+pub con EDI_PART_MSG_ORDERS_RSP: int64 := 16;
+pub con EDI_PART_MSG_TRANSPORT:  int64 := 32;
+pub con EDI_PART_MSG_CUSTOMS:    int64 := 64;
+pub con EDI_PART_MSG_SEAFREIGHT: int64 := 128;
+
+// ── AS2 options ───────────────────────────────────────────────────────────────
+pub con EDI_PART_OPT_SIGN:     int64 := 1;   // sign outbound messages
+pub con EDI_PART_OPT_ENCRYPT:  int64 := 2;   // encrypt outbound messages
+pub con EDI_PART_OPT_MDN_SYNC: int64 := 4;   // request synchronous MDN
+pub con EDI_PART_OPT_COMPRESS: int64 := 8;   // compress payload
+
+// ── EdiPartner record offsets (256 bytes) ─────────────────────────────────────
+pub con EDI_PART_PROTOCOL:   int64 := 0;    // 1=AS2 2=SFTP
+pub con EDI_PART_PARTNERID:  int64 := 8;    // partner AS2-ID or SFTP user
+pub con EDI_PART_PARTNERLEN: int64 := 16;
+pub con EDI_PART_OURID:      int64 := 24;   // our AS2-ID or SFTP user
+pub con EDI_PART_OURIDLEN:   int64 := 32;
+pub con EDI_PART_HOST:       int64 := 40;   // hostname
+pub con EDI_PART_HOSTLEN:    int64 := 48;
+pub con EDI_PART_PORT:       int64 := 56;   // port number
+pub con EDI_PART_PATH:       int64 := 64;   // URL path or SFTP directory
+pub con EDI_PART_PATHLEN:    int64 := 72;
+pub con EDI_PART_MSGTYPES:   int64 := 80;   // bit mask of EDI_PART_MSG_*
+pub con EDI_PART_OPTIONS:    int64 := 88;   // bit mask of EDI_PART_OPT_*
+pub con EDI_PART_SIZE:       int64 := 96;   // 12 × 8 bytes
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn ptPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0 || pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn ptPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i += 1;
+    }
+    return pos + n;
+}
+
+fn ptPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val == 0) { return ptPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var tbuf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(tbuf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx += 1;
+    }
+    var r: int64 := ptPutStr(out, pos, outMax, tbuf, digits);
+    free(tbuf, 24);
+    return r;
+}
+
+fn ptParseInt(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c >= 48 && c <= 57) { v := v * 10 + (c - 48); }
+        i += 1;
+    }
+    return v;
+}
+
+// Write a message-type bit mask as comma-separated names
+fn ptWriteMsgTypes(out: int64, pos: int64, outMax: int64, mask: int64): int64 {
+    var first: int64 := 1;
+    if ((mask - (mask / EDI_PART_MSG_ORDERS) * EDI_PART_MSG_ORDERS) != (mask - (mask / 2) * 2)) { first := 0; }
+    // Simpler: test each bit manually
+    first := 1;
+    if (mask == 0) {
+        pos := ptPutChar(out, pos, outMax, 48);  // "0"
+        return pos;
+    }
+    if ((mask / EDI_PART_MSG_ORDERS)  - ((mask / EDI_PART_MSG_ORDERS) / 2) * 2  > 0) {
+        if (first == 0) { pos := ptPutChar(out, pos, outMax, 44); }
+        pos := ptPutStr(out, pos, outMax, "ORDERS"c as int64, 6);
+        first := 0;
+    }
+    if ((mask / EDI_PART_MSG_INVOIC)  - ((mask / EDI_PART_MSG_INVOIC) / 2) * 2  > 0) {
+        if (first == 0) { pos := ptPutChar(out, pos, outMax, 44); }
+        pos := ptPutStr(out, pos, outMax, "INVOIC"c as int64, 6);
+        first := 0;
+    }
+    if ((mask / EDI_PART_MSG_DESADV)  - ((mask / EDI_PART_MSG_DESADV) / 2) * 2  > 0) {
+        if (first == 0) { pos := ptPutChar(out, pos, outMax, 44); }
+        pos := ptPutStr(out, pos, outMax, "DESADV"c as int64, 6);
+        first := 0;
+    }
+    if ((mask / EDI_PART_MSG_REMADV)  - ((mask / EDI_PART_MSG_REMADV) / 2) * 2  > 0) {
+        if (first == 0) { pos := ptPutChar(out, pos, outMax, 44); }
+        pos := ptPutStr(out, pos, outMax, "REMADV"c as int64, 6);
+        first := 0;
+    }
+    if ((mask / EDI_PART_MSG_TRANSPORT) - ((mask / EDI_PART_MSG_TRANSPORT) / 2) * 2 > 0) {
+        if (first == 0) { pos := ptPutChar(out, pos, outMax, 44); }
+        pos := ptPutStr(out, pos, outMax, "TRANSPORT"c as int64, 9);
+        first := 0;
+    }
+    if ((mask / EDI_PART_MSG_CUSTOMS) - ((mask / EDI_PART_MSG_CUSTOMS) / 2) * 2 > 0) {
+        if (first == 0) { pos := ptPutChar(out, pos, outMax, 44); }
+        pos := ptPutStr(out, pos, outMax, "CUSTOMS"c as int64, 7);
+        first := 0;
+    }
+    if ((mask / EDI_PART_MSG_SEAFREIGHT) - ((mask / EDI_PART_MSG_SEAFREIGHT) / 2) * 2 > 0) {
+        if (first == 0) { pos := ptPutChar(out, pos, outMax, 44); }
+        pos := ptPutStr(out, pos, outMax, "SEAFREIGHT"c as int64, 10);
+        first := 0;
+    }
+    return pos;
+}
+
+// Parse msgTypes field: comma-separated names → bit mask
+fn ptParseMsgTypes(ptr: int64, len: int64): int64 {
+    var mask: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        // Scan token until ',' or end
+        var tStart: int64 := i;
+        var done: int64 := 0;
+        while (done == 0) {
+            if (i >= len) { done := 1; }
+            else {
+                if (peek8(ptr + i) == 44) { done := 1; }  // ','
+                else { i := i + 1; }
+            }
+        }
+        var tLen: int64 := i - tStart;
+        // Match known names
+        if (tLen == 6 && peek8(ptr+tStart)==79 && peek8(ptr+tStart+1)==82) { mask := mask + EDI_PART_MSG_ORDERS; }   // ORDERS
+        if (tLen == 6 && peek8(ptr+tStart)==73 && peek8(ptr+tStart+1)==78) { mask := mask + EDI_PART_MSG_INVOIC; }   // INVOIC
+        if (tLen == 6 && peek8(ptr+tStart)==68 && peek8(ptr+tStart+1)==69) { mask := mask + EDI_PART_MSG_DESADV; }   // DESADV
+        if (tLen == 6 && peek8(ptr+tStart)==82 && peek8(ptr+tStart+1)==69) { mask := mask + EDI_PART_MSG_REMADV; }   // REMADV
+        if (tLen == 9 && peek8(ptr+tStart)==84 && peek8(ptr+tStart+1)==82) { mask := mask + EDI_PART_MSG_TRANSPORT; } // TRANSPORT
+        if (tLen == 7 && peek8(ptr+tStart)==67 && peek8(ptr+tStart+1)==85) { mask := mask + EDI_PART_MSG_CUSTOMS; }  // CUSTOMS
+        if (tLen == 10 && peek8(ptr+tStart)==83 && peek8(ptr+tStart+1)==69) { mask := mask + EDI_PART_MSG_SEAFREIGHT; } // SEAFREIGHT
+        if (i < len) { i := i + 1; }  // skip ','
+    }
+    return mask;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Validation helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Returns 1 if partnerID is non-empty and protocol is known.
+pub fn EdiPartnerValidate(part: int64): int64 {
+    var proto: int64 := peek64(part + EDI_PART_PROTOCOL);
+    if (proto != EDI_PART_PROTO_AS2 && proto != EDI_PART_PROTO_SFTP) { return 0; }
+    if (peek64(part + EDI_PART_PARTNERLEN) == 0) { return 0; }
+    if (peek64(part + EDI_PART_OURIDLEN) == 0) { return 0; }
+    if (peek64(part + EDI_PART_HOSTLEN) == 0) { return 0; }
+    return 1;
+}
+
+// Returns 1 if partner supports the given message type flag.
+pub fn EdiPartnerSupports(part: int64, msgFlag: int64): int64 {
+    var mask: int64 := peek64(part + EDI_PART_MSGTYPES);
+    if ((mask / msgFlag) - ((mask / msgFlag) / 2) * 2 > 0) { return 1; }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Serialisation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write one partner as a pipe-delimited line. Returns bytes written.
+pub fn EdiPartnerWrite(part: int64, out: int64, outMax: int64): int64 {
+    var proto:      int64 := peek64(part + EDI_PART_PROTOCOL);
+    var partPtr:    int64 := peek64(part + EDI_PART_PARTNERID);
+    var partLen:    int64 := peek64(part + EDI_PART_PARTNERLEN);
+    var ourPtr:     int64 := peek64(part + EDI_PART_OURID);
+    var ourLen:     int64 := peek64(part + EDI_PART_OURIDLEN);
+    var hostPtr:    int64 := peek64(part + EDI_PART_HOST);
+    var hostLen:    int64 := peek64(part + EDI_PART_HOSTLEN);
+    var port:       int64 := peek64(part + EDI_PART_PORT);
+    var pathPtr:    int64 := peek64(part + EDI_PART_PATH);
+    var pathLen:    int64 := peek64(part + EDI_PART_PATHLEN);
+    var msgTypes:   int64 := peek64(part + EDI_PART_MSGTYPES);
+    var options:    int64 := peek64(part + EDI_PART_OPTIONS);
+    var pos:        int64 := 0;
+
+    // protocol name
+    if (proto == EDI_PART_PROTO_AS2)  { pos := ptPutStr(out, pos, outMax, "AS2"c as int64, 3); }
+    if (proto == EDI_PART_PROTO_SFTP) { pos := ptPutStr(out, pos, outMax, "SFTP"c as int64, 4); }
+    pos := ptPutChar(out, pos, outMax, 124);  // '|'
+    if (partPtr != 0 && partLen > 0) { pos := ptPutStr(out, pos, outMax, partPtr, partLen); }
+    pos := ptPutChar(out, pos, outMax, 124);
+    if (ourPtr != 0 && ourLen > 0)   { pos := ptPutStr(out, pos, outMax, ourPtr, ourLen); }
+    pos := ptPutChar(out, pos, outMax, 124);
+    if (hostPtr != 0 && hostLen > 0) { pos := ptPutStr(out, pos, outMax, hostPtr, hostLen); }
+    pos := ptPutChar(out, pos, outMax, 124);
+    pos := ptPutInt(out, pos, outMax, port);
+    pos := ptPutChar(out, pos, outMax, 124);
+    if (pathPtr != 0 && pathLen > 0) { pos := ptPutStr(out, pos, outMax, pathPtr, pathLen); }
+    pos := ptPutChar(out, pos, outMax, 124);
+    pos := ptWriteMsgTypes(out, pos, outMax, msgTypes);
+    pos := ptPutChar(out, pos, outMax, 124);
+    pos := ptPutInt(out, pos, outMax, options);
+    pos := ptPutChar(out, pos, outMax, 10);  // newline
+    return pos;
+}
+
+// Parse one pipe-delimited line into a partner record. Returns 1=ok, 0=err.
+pub fn EdiPartnerRead(line: int64, lineLen: int64, part: int64): int64 {
+    // Split on '|' (124) into up to 8 fields
+    var fields: int64 := alloc(8 * 16);   // 8 × (ptr:int64 + len:int64)
+    var fi: int64 := 0;
+    var start: int64 := 0;
+    var i: int64 := 0;
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var isSep: int64 := 0;
+        var isEnd: int64 := 0;
+        if (i >= lineLen) { isEnd := 1; }
+        else {
+            var c: int64 := peek8(line + i);
+            if (c == 124 || c == 10 || c == 13) { isSep := 1; }
+        }
+        if (isSep == 1 || isEnd == 1) {
+            if (fi < 8) {
+                poke64(fields + fi * 16 + 0, line + start);
+                poke64(fields + fi * 16 + 8, i - start);
+                fi += 1;
+            }
+            start := i + 1;
+            if (isEnd == 1) { done := 1; }
+        }
+        i += 1;
+    }
+
+    if (fi < 8) {
+        free(fields, 8 * 16);
+        return 0;
+    }
+
+    var zero: int64 := 0;
+    var k: int64 := 0;
+    while (k < EDI_PART_SIZE) { poke8(part + k, 0); k := k + 1; }
+
+    // Field 0: protocol
+    var protoPtr: int64 := peek64(fields + 0 * 16 + 0);
+    var protoLen: int64 := peek64(fields + 0 * 16 + 8);
+    if (protoLen == 3 && peek8(protoPtr)==65 && peek8(protoPtr+1)==83 && peek8(protoPtr+2)==50) {
+        poke64(part + EDI_PART_PROTOCOL, EDI_PART_PROTO_AS2);
+    }
+    if (protoLen == 4 && peek8(protoPtr)==83 && peek8(protoPtr+1)==70 && peek8(protoPtr+2)==84 && peek8(protoPtr+3)==80) {
+        poke64(part + EDI_PART_PROTOCOL, EDI_PART_PROTO_SFTP);
+    }
+
+    poke64(part + EDI_PART_PARTNERID,  peek64(fields + 1 * 16 + 0));
+    poke64(part + EDI_PART_PARTNERLEN, peek64(fields + 1 * 16 + 8));
+    poke64(part + EDI_PART_OURID,      peek64(fields + 2 * 16 + 0));
+    poke64(part + EDI_PART_OURIDLEN,   peek64(fields + 2 * 16 + 8));
+    poke64(part + EDI_PART_HOST,       peek64(fields + 3 * 16 + 0));
+    poke64(part + EDI_PART_HOSTLEN,    peek64(fields + 3 * 16 + 8));
+    poke64(part + EDI_PART_PORT,       ptParseInt(peek64(fields + 4 * 16 + 0), peek64(fields + 4 * 16 + 8)));
+    poke64(part + EDI_PART_PATH,       peek64(fields + 5 * 16 + 0));
+    poke64(part + EDI_PART_PATHLEN,    peek64(fields + 5 * 16 + 8));
+    poke64(part + EDI_PART_MSGTYPES,   ptParseMsgTypes(peek64(fields + 6 * 16 + 0), peek64(fields + 6 * 16 + 8)));
+    poke64(part + EDI_PART_OPTIONS,    ptParseInt(peek64(fields + 7 * 16 + 0), peek64(fields + 7 * 16 + 8)));
+
+    free(fields, 8 * 16);
+    return 1;
+}
+
+// Write N partners to a buffer; return total bytes written.
+pub fn EdiPartnerListWrite(parts: int64, count: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var i: int64 := 0;
+    while (i < count) {
+        var n: int64 := EdiPartnerWrite(parts + i * EDI_PART_SIZE, out + pos, outMax - pos);
+        if (n > 0) { pos := pos + n; }
+        i += 1;
+    }
+    return pos;
+}
+
+// Read N partners from a newline-delimited buffer; return partners parsed.
+pub fn EdiPartnerListRead(buf: int64, bufLen: int64, parts: int64, maxParts: int64): int64 {
+    var count: int64 := 0;
+    var lineStart: int64 := 0;
+    var i: int64 := 0;
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var atEnd: int64 := 0;
+        var atNl:  int64 := 0;
+        if (i >= bufLen) { atEnd := 1; }
+        else {
+            var c: int64 := peek8(buf + i);
+            if (c == 10 || c == 13) { atNl := 1; }
+        }
+
+        if (atNl == 1 || atEnd == 1) {
+            var lineLen: int64 := i - lineStart;
+            if (lineLen > 0 && count < maxParts) {
+                var r: int64 := EdiPartnerRead(buf + lineStart, lineLen, parts + count * EDI_PART_SIZE);
+                if (r == 1) { count := count + 1; }
+            }
+            lineStart := i + 1;
+            if (atEnd == 1) { done := 1; }
+        }
+        i += 1;
+    }
+    return count;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lookup helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Find partner by partnerID string; returns pointer to record or 0.
+pub fn EdiPartnerFind(parts: int64, count: int64, idPtr: int64, idLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < count) {
+        var rec:  int64 := parts + i * EDI_PART_SIZE;
+        var rPtr: int64 := peek64(rec + EDI_PART_PARTNERID);
+        var rLen: int64 := peek64(rec + EDI_PART_PARTNERLEN);
+        if (rLen == idLen) {
+            var found: int64 := 1;
+            var j: int64 := 0;
+            while (j < idLen) {
+                if (peek8(rPtr + j) != peek8(idPtr + j)) { found := 0; }
+                j += 1;
+            }
+            if (found == 1) { return rec; }
+        }
+        i += 1;
+    }
+    return 0;
+}

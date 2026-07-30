@@ -1,0 +1,609 @@
+// std/zip.lyx — ZIP-Archiv Lesen und Schreiben
+//
+// Unterstützt ZIP-Spezifikation (PKWARE APPNOTE):
+//   Lesen : method 0 (stored) + method 8 (deflated)
+//   Schreiben: method 0 (stored, < 64 Byte) + method 8 (deflated, sonst)
+//
+// Maximale Einträge pro Archiv: 4096
+// Keine ZIP64-Unterstützung (Einzeldateien max. ~2 GB)
+
+unit std.zip;
+
+import std.alloc;
+import std.io;
+import std.string;
+import std.fs;
+import std.zlib;
+
+// ============================================================================
+// Struct-Offsets (Kommentare als Dokumentation)
+// ============================================================================
+// ZipReader (32 Bytes):  rawData:0  rawLen:8  entries:16  entryCount:24
+// ZipEntry  (48 Bytes):  name:0  compSize:8  uncompSize:16  crc:24  method:32  dataOff:40
+// ZipWriter (16 Bytes):  entries:0  entryCount:8
+// PendingEntry (32 Bytes): name:0  dataPtr:8  dataLen:16  (pad):24
+
+pub con ZIP_MAX_ENTRIES:  int64 := 4096;
+pub con ZIP_METHOD_STORE: int64 := 0;
+pub con ZIP_METHOD_DEFLATE: int64 := 8;
+pub con ZIP_ERR_OK:       int64 := 0;
+pub con ZIP_ERR_NOTZIP:   int64 := 1;
+pub con ZIP_ERR_IO:       int64 := 2;
+pub con ZIP_ERR_CORRUPT:  int64 := 3;
+pub con ZIP_ERR_FULL:     int64 := 4;
+pub con ZIP_STORE_THRESHOLD: int64 := 64;
+
+// ============================================================================
+// Interne Hilfsfunktionen
+// ============================================================================
+
+// CRC-32 gemäß ZIP-Standard (Polynom 0xEDB88320, little-endian bit order)
+fn zipCrc32(data: int64, len: int64): int64 {
+    var crc: int64 := 0xFFFFFFFF;
+    var i: int64 := 0;
+    while (i < len) {
+        var b: int64 := peek8(data + i);
+        crc := crc ^ b;
+        var j: int64 := 0;
+        while (j < 8) {
+            if ((crc & 1) != 0) {
+                crc := (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc := crc >> 1;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+// Liest 16-Bit-Wert (little-endian) aus buf[off]
+fn zipGet16(buf: int64, off: int64): int64 {
+    return peek8(buf + off) | (peek8(buf + off + 1) << 8);
+}
+
+// Liest 32-Bit-Wert (little-endian) aus buf[off]
+fn zipGet32(buf: int64, off: int64): int64 {
+    return peek8(buf + off)
+         | (peek8(buf + off + 1) << 8)
+         | (peek8(buf + off + 2) << 16)
+         | (peek8(buf + off + 3) << 24);
+}
+
+// Schreibt 16-Bit-Wert (little-endian) nach buf[off]
+fn zipPut16(buf: int64, off: int64, val: int64): void {
+    poke8(buf + off,     val & 0xFF);
+    poke8(buf + off + 1, (val >> 8) & 0xFF);
+}
+
+// Schreibt 32-Bit-Wert (little-endian) nach buf[off]
+fn zipPut32(buf: int64, off: int64, val: int64): void {
+    poke8(buf + off,     val & 0xFF);
+    poke8(buf + off + 1, (val >> 8) & 0xFF);
+    poke8(buf + off + 2, (val >> 16) & 0xFF);
+    poke8(buf + off + 3, (val >> 24) & 0xFF);
+}
+
+// Kopiert n Bytes von src nach dst
+fn zipCopy(dst: int64, src: int64, n: int64): void {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+// Dupliziert einen String (null-terminiert)
+fn zipStrdup(s: int64): int64 {
+    if (s == 0) { return 0; }
+    var len: int64 := StrLen(s);
+    var buf: int64 := alloc(len + 1);
+    zipCopy(buf, s, len);
+    poke8(buf + len, 0);
+    return buf;
+}
+
+// Sucht End of Central Directory Record (Signatur 0x06054B50) von hinten.
+// Gibt Offset zurück oder -1.
+fn zipFindEOCD(data: int64, len: int64): int64 {
+    var i: int64 := len - 22;
+    while (i >= 0) {
+        if ((peek8(data + i)     == 0x50) &
+            (peek8(data + i + 1) == 0x4B) &
+            (peek8(data + i + 2) == 0x05) &
+            (peek8(data + i + 3) == 0x06)) {
+            return i;
+        }
+        i -= 1;
+    }
+    return 0 - 1;
+}
+
+// ============================================================================
+// ZIP Reader — Lesen
+// ============================================================================
+
+// Öffnet ein ZIP-Archiv aus einer Datei.
+// Gibt einen alloc'd Handle zurück oder 0 bei Fehler.
+// Aufrufer muss ZipClose() aufrufen.
+pub fn ZipOpen(path: int64): int64 {
+    var fsize: int64 := FileSize(path);
+    if (fsize < 22) { return 0; }
+
+    var raw: int64 := alloc(fsize + 1);
+    var n: int64 := ReadFile(path, raw, fsize);
+    if (n < 22) { free(raw); return 0; }
+    poke8(raw + n, 0);
+
+    // Signatur prüfen: muss mit PK beginnen
+    if ((peek8(raw) != 0x50) | (peek8(raw + 1) != 0x4B)) {
+        free(raw); return 0;
+    }
+
+    // End of Central Directory suchen
+    var eocd: int64 := zipFindEOCD(raw, n);
+    if (eocd < 0) { free(raw); return 0; }
+
+    var totalEntries: int64 := zipGet16(raw, eocd + 10);
+    var cdOffset: int64     := zipGet32(raw, eocd + 16);
+
+    if (totalEntries > ZIP_MAX_ENTRIES) { free(raw); return 0; }
+    if (cdOffset >= n) { free(raw); return 0; }
+
+    // Handle anlegen
+    var handle: int64 := alloc(32);
+    poke64(handle,      raw);
+    poke64(handle + 8,  n);
+    var entries: int64 := alloc(ZIP_MAX_ENTRIES * 48);
+    poke64(handle + 16, entries);
+    poke64(handle + 24, 0);
+
+    // Central Directory durchlaufen
+    var cdPos: int64 := cdOffset;
+    var count: int64 := 0;
+    while ((count < totalEntries) & (cdPos + 46 <= n)) {
+        // Central Directory Signatur: PK\x01\x02
+        if ((peek8(raw + cdPos)     != 0x50) |
+            (peek8(raw + cdPos + 1) != 0x4B) |
+            (peek8(raw + cdPos + 2) != 0x01) |
+            (peek8(raw + cdPos + 3) != 0x02)) {
+            break;
+        }
+
+        var method:     int64 := zipGet16(raw, cdPos + 10);
+        var crc:        int64 := zipGet32(raw, cdPos + 16);
+        var compSize:   int64 := zipGet32(raw, cdPos + 20);
+        var uncompSize: int64 := zipGet32(raw, cdPos + 24);
+        var nameLen:    int64 := zipGet16(raw, cdPos + 28);
+        var extraLen:   int64 := zipGet16(raw, cdPos + 30);
+        var commentLen: int64 := zipGet16(raw, cdPos + 32);
+        var localOff:   int64 := zipGet32(raw, cdPos + 42);
+
+        // Name als String kopieren
+        var name: int64 := alloc(nameLen + 1);
+        zipCopy(name, raw + cdPos + 46, nameLen);
+        poke8(name + nameLen, 0);
+
+        // Daten-Offset aus Local File Header ermitteln
+        var dataOff: int64 := 0;
+        if (localOff + 30 <= n) {
+            var lfNameLen:  int64 := zipGet16(raw, localOff + 26);
+            var lfExtraLen: int64 := zipGet16(raw, localOff + 28);
+            dataOff := localOff + 30 + lfNameLen + lfExtraLen;
+        }
+
+        var entry: int64 := entries + count * 48;
+        poke64(entry,      name);
+        poke64(entry + 8,  compSize);
+        poke64(entry + 16, uncompSize);
+        poke64(entry + 24, crc);
+        poke64(entry + 32, method);
+        poke64(entry + 40, dataOff);
+
+        cdPos := cdPos + 46 + nameLen + extraLen + commentLen;
+        count += 1;
+    }
+
+    poke64(handle + 24, count);
+    return handle;
+}
+
+// Schließt ein ZIP-Handle und gibt alle Ressourcen frei.
+pub fn ZipClose(handle: int64): void {
+    if (handle == 0) { return; }
+    var entries: int64 := peek64(handle + 16);
+    var count: int64   := peek64(handle + 24);
+    var i: int64 := 0;
+    while (i < count) {
+        var name: int64 := peek64(entries + i * 48);
+        if (name != 0) { free(name); }
+        i += 1;
+    }
+    free(entries);
+    free(peek64(handle));  // rawData
+    free(handle);
+}
+
+// Gibt die Anzahl der Einträge zurück.
+pub fn ZipCount(handle: int64): int64 {
+    if (handle == 0) { return 0; }
+    return peek64(handle + 24);
+}
+
+// Gibt den Namen des i-ten Eintrags zurück (zeigt auf internen Puffer — nicht free'n).
+pub fn ZipName(handle: int64, idx: int64): int64 {
+    if (handle == 0) { return 0; }
+    if ((idx < 0) | (idx >= peek64(handle + 24))) { return 0; }
+    return peek64(peek64(handle + 16) + idx * 48);
+}
+
+// Gibt die unkomprimierte Größe des i-ten Eintrags zurück.
+pub fn ZipUncompSize(handle: int64, idx: int64): int64 {
+    if (handle == 0) { return 0; }
+    if ((idx < 0) | (idx >= peek64(handle + 24))) { return 0; }
+    return peek64(peek64(handle + 16) + idx * 48 + 16);
+}
+
+// Liest den i-ten Eintrag in outBuf (mindestens ZipUncompSize Bytes).
+// Gibt geschriebene Bytes zurück oder -1 bei Fehler.
+pub fn ZipRead(handle: int64, idx: int64, outBuf: int64, maxLen: int64): int64 {
+    if (handle == 0) { return 0 - 1; }
+    var count: int64 := peek64(handle + 24);
+    if ((idx < 0) | (idx >= count)) { return 0 - 1; }
+
+    var entries:    int64 := peek64(handle + 16);
+    var entry:      int64 := entries + idx * 48;
+    var compSize:   int64 := peek64(entry + 8);
+    var uncompSize: int64 := peek64(entry + 16);
+    var method:     int64 := peek64(entry + 32);
+    var dataOff:    int64 := peek64(entry + 40);
+    var rawData:    int64 := peek64(handle);
+    var rawLen:     int64 := peek64(handle + 8);
+
+    if (dataOff + compSize > rawLen) { return 0 - 1; }
+    if (uncompSize > maxLen) { return 0 - 1; }
+
+    if (method == ZIP_METHOD_STORE) {
+        zipCopy(outBuf, rawData + dataOff, uncompSize);
+        return uncompSize;
+    }
+
+    if (method == ZIP_METHOD_DEFLATE) {
+        var written: int64 := InflateDEFLATE(
+            (rawData + dataOff) as pchar,
+            compSize,
+            outBuf as pchar
+        );
+        return written;
+    }
+
+    return 0 - 1;  // Unbekannte Methode
+}
+
+// Sucht Eintrag nach Namen. Gibt Index zurück oder -1.
+pub fn ZipFind(handle: int64, name: int64): int64 {
+    if (handle == 0) { return 0 - 1; }
+    var count: int64   := peek64(handle + 24);
+    var entries: int64 := peek64(handle + 16);
+    var i: int64 := 0;
+    while (i < count) {
+        var ename: int64 := peek64(entries + i * 48);
+        if (ename != 0) {
+            var isMatch: int64 := 1;
+            var nlen: int64 := StrLen(name);
+            var elen: int64 := StrLen(ename);
+            if (nlen != elen) {
+                isMatch := 0;
+            } else {
+                var k: int64 := 0;
+                while (k < nlen) {
+                    if (peek8(ename + k) != peek8(name + k)) { isMatch := 0; }
+                    k += 1;
+                }
+            }
+            if (isMatch == 1) { return i; }
+        }
+        i += 1;
+    }
+    return 0 - 1;
+}
+
+// ============================================================================
+// ZIP Writer — Schreiben
+// ============================================================================
+
+// Erstellt einen neuen ZIP-Writer-Handle.
+pub fn ZipWriterNew(): int64 {
+    var writer: int64 := alloc(16);
+    poke64(writer,     alloc(ZIP_MAX_ENTRIES * 32));
+    poke64(writer + 8, 0);
+    return writer;
+}
+
+// Fügt einen Eintrag hinzu (kopiert name und data).
+// Gibt ZIP_ERR_OK oder ZIP_ERR_FULL zurück.
+pub fn ZipWriterAdd(writer: int64, name: int64, data: int64, dataLen: int64): int64 {
+    if (writer == 0) { return ZIP_ERR_IO; }
+    var count: int64 := peek64(writer + 8);
+    if (count >= ZIP_MAX_ENTRIES) { return ZIP_ERR_FULL; }
+
+    var entries: int64 := peek64(writer);
+    var entry:   int64 := entries + count * 32;
+
+    // Name und Daten kopieren
+    var nameCopy: int64 := zipStrdup(name);
+    var dataCopy: int64 := alloc(dataLen + 1);
+    zipCopy(dataCopy, data, dataLen);
+    poke8(dataCopy + dataLen, 0);
+
+    poke64(entry,      nameCopy);
+    poke64(entry + 8,  dataCopy);
+    poke64(entry + 16, dataLen);
+    poke64(entry + 24, 0);
+
+    poke64(writer + 8, count + 1);
+    return ZIP_ERR_OK;
+}
+
+// Schreibt das ZIP-Archiv unkomprimiert (STORE) in eine Datei.
+// Alle Einträge werden mit Compression Method 0 gespeichert.
+// Nützlich wenn der DEFLATE-Pfad nicht benötigt wird.
+pub fn ZipWriterSaveStore(writer: int64, path: int64): int64 {
+    if (writer == 0) { return ZIP_ERR_IO; }
+    var count: int64   := peek64(writer + 8);
+    var entries: int64 := peek64(writer);
+
+    var totalData: int64 := 0;
+    var i: int64 := 0;
+    while (i < count) {
+        var entry: int64 := entries + i * 32;
+        totalData := totalData + peek64(entry + 16);
+        i += 1;
+    }
+    var bufSize: int64 := totalData + count * 512 + 65536;
+    var buf: int64 := alloc(bufSize);
+    var pos: int64 := 0;
+
+    var offsets: int64 := alloc(count * 8);
+
+    i := 0;
+    while (i < count) {
+        var entry:    int64 := entries + i * 32;
+        var ename:    int64 := peek64(entry);
+        var edata:    int64 := peek64(entry + 8);
+        var edataLen: int64 := peek64(entry + 16);
+        var enameLen: int64 := StrLen(ename);
+        var crc:      int64 := zipCrc32(edata, edataLen);
+
+        poke64(offsets + i * 8, pos);
+
+        poke8(buf + pos,     0x50); poke8(buf + pos + 1, 0x4B);
+        poke8(buf + pos + 2, 0x03); poke8(buf + pos + 3, 0x04);
+        zipPut16(buf, pos + 4,  20);
+        zipPut16(buf, pos + 6,  0);
+        zipPut16(buf, pos + 8,  0);        // STORE
+        zipPut16(buf, pos + 10, 0);
+        zipPut16(buf, pos + 12, 0x4A21);
+        zipPut32(buf, pos + 14, crc);
+        zipPut32(buf, pos + 18, edataLen);  // compSize == uncompSize
+        zipPut32(buf, pos + 22, edataLen);
+        zipPut16(buf, pos + 26, enameLen);
+        zipPut16(buf, pos + 28, 0);
+        zipCopy(buf + pos + 30, ename, enameLen);
+        pos := pos + 30 + enameLen;
+        zipCopy(buf + pos, edata, edataLen);
+        pos += edataLen;
+        i += 1;
+    }
+
+    var cdStart: int64 := pos;
+    i := 0;
+    while (i < count) {
+        var entry:    int64 := entries + i * 32;
+        var ename:    int64 := peek64(entry);
+        var edata:    int64 := peek64(entry + 8);
+        var edataLen: int64 := peek64(entry + 16);
+        var enameLen: int64 := StrLen(ename);
+        var localOff: int64 := peek64(offsets + i * 8);
+        var crc:      int64 := zipGet32(buf, localOff + 14);
+
+        poke8(buf + pos,     0x50); poke8(buf + pos + 1, 0x4B);
+        poke8(buf + pos + 2, 0x01); poke8(buf + pos + 3, 0x02);
+        zipPut16(buf, pos + 4,  20);
+        zipPut16(buf, pos + 6,  20);
+        zipPut16(buf, pos + 8,  0);
+        zipPut16(buf, pos + 10, 0);    // STORE
+        zipPut16(buf, pos + 12, 0);
+        zipPut16(buf, pos + 14, 0x4A21);
+        zipPut32(buf, pos + 16, crc);
+        zipPut32(buf, pos + 20, edataLen);
+        zipPut32(buf, pos + 24, edataLen);
+        zipPut16(buf, pos + 28, enameLen);
+        zipPut16(buf, pos + 30, 0);
+        zipPut16(buf, pos + 32, 0);
+        zipPut16(buf, pos + 34, 0);
+        zipPut16(buf, pos + 36, 0);
+        zipPut32(buf, pos + 38, 0);
+        zipPut32(buf, pos + 42, localOff);
+        zipCopy(buf + pos + 46, ename, enameLen);
+        pos := pos + 46 + enameLen;
+        i += 1;
+    }
+
+    var cdSize: int64 := pos - cdStart;
+    poke8(buf + pos,     0x50); poke8(buf + pos + 1, 0x4B);
+    poke8(buf + pos + 2, 0x05); poke8(buf + pos + 3, 0x06);
+    zipPut16(buf, pos + 4,  0);
+    zipPut16(buf, pos + 6,  0);
+    zipPut16(buf, pos + 8,  count);
+    zipPut16(buf, pos + 10, count);
+    zipPut32(buf, pos + 12, cdSize);
+    zipPut32(buf, pos + 16, cdStart);
+    zipPut16(buf, pos + 20, 0);
+    pos += 22;
+
+    var rc: int64 := WriteFile(path, buf, pos);
+    free(buf, bufSize);
+    free(offsets, count * 8);
+    if (rc <= 0) { return ZIP_ERR_IO; }
+    return ZIP_ERR_OK;
+}
+
+// Schreibt das ZIP-Archiv in eine Datei.
+// Gibt ZIP_ERR_OK oder Fehlercode zurück.
+pub fn ZipWriterSave(writer: int64, path: int64): int64 {
+    if (writer == 0) { return ZIP_ERR_IO; }
+    var count: int64   := peek64(writer + 8);
+    var entries: int64 := peek64(writer);
+
+    // Ausgabepuffer schätzen: Daten + Header + Central Directory
+    var totalData: int64 := 0;
+    var i: int64 := 0;
+    while (i < count) {
+        var entry: int64 := entries + i * 32;
+        totalData := totalData + peek64(entry + 16);
+        i += 1;
+    }
+    // Puffer: Rohdaten * 2 (Kompressionsoverhead) + je 512 Bytes für Header
+    var bufSize: int64 := totalData * 2 + count * 512 + 65536;
+    var buf: int64 := alloc(bufSize);
+    var pos: int64 := 0;
+
+    // Offsets der Local File Headers merken (für Central Directory)
+    var offsets: int64 := alloc(count * 8);
+
+    // Komprimierungs-Puffer
+    var compBuf: int64 := alloc(totalData * 2 + 65536);
+
+    // ── Local File Headers + Daten ──────────────────────────────────────────
+    i := 0;
+    while (i < count) {
+        var entry:     int64 := entries + i * 32;
+        var ename:     int64 := peek64(entry);
+        var edata:     int64 := peek64(entry + 8);
+        var edataLen:  int64 := peek64(entry + 16);
+        var enameLen:  int64 := StrLen(ename);
+
+        poke64(offsets + i * 8, pos);
+
+        var crc:      int64 := zipCrc32(edata, edataLen);
+        var method:   int64 := ZIP_METHOD_DEFLATE;
+        var compData: int64 := compBuf;
+        var compLen:  int64 := 0;
+
+        // Kleine Dateien und Nulllänge: stored
+        if (edataLen <= ZIP_STORE_THRESHOLD) {
+            method  := ZIP_METHOD_STORE;
+            compData := edata;
+            compLen  := edataLen;
+        } else {
+            compLen := DeflateCompressLZ77(edata as pchar, edataLen, compBuf as pchar);
+            // Falls komprimiert größer: stored verwenden
+            if (compLen >= edataLen) {
+                method   := ZIP_METHOD_STORE;
+                compData := edata;
+                compLen  := edataLen;
+            }
+        }
+
+        // Local File Header (30 Bytes + Name)
+        poke8(buf + pos,     0x50); poke8(buf + pos + 1, 0x4B);   // PK
+        poke8(buf + pos + 2, 0x03); poke8(buf + pos + 3, 0x04);   // \x03\x04
+        zipPut16(buf, pos + 4,  20);          // Version needed: 2.0
+        zipPut16(buf, pos + 6,  0);           // General purpose flags
+        zipPut16(buf, pos + 8,  method);      // Compression method
+        zipPut16(buf, pos + 10, 0);           // Last mod time (DOS format)
+        zipPut16(buf, pos + 12, 0x4A21);      // Last mod date (2026-01-01)
+        zipPut32(buf, pos + 14, crc);         // CRC-32
+        zipPut32(buf, pos + 18, compLen);     // Compressed size
+        zipPut32(buf, pos + 22, edataLen);    // Uncompressed size
+        zipPut16(buf, pos + 26, enameLen);    // File name length
+        zipPut16(buf, pos + 28, 0);           // Extra field length
+        zipCopy(buf + pos + 30, ename, enameLen);
+
+        pos := pos + 30 + enameLen;
+
+        // Dateidaten
+        zipCopy(buf + pos, compData, compLen);
+        pos += compLen;
+
+        i += 1;
+    }
+
+    // ── Central Directory ────────────────────────────────────────────────────
+    var cdStart: int64 := pos;
+
+    i := 0;
+    while (i < count) {
+        var entry:    int64 := entries + i * 32;
+        var ename:    int64 := peek64(entry);
+        var edata:    int64 := peek64(entry + 8);
+        var edataLen: int64 := peek64(entry + 16);
+        var enameLen: int64 := StrLen(ename);
+        var localOff: int64 := peek64(offsets + i * 8);
+
+        // Methode und Größen aus dem Local File Header lesen (bereits geschrieben)
+        var lfhBase:  int64 := localOff;
+        var method:   int64 := zipGet16(buf, lfhBase + 8);
+        var crc:      int64 := zipGet32(buf, lfhBase + 14);
+        var compLen:  int64 := zipGet32(buf, lfhBase + 18);
+
+        poke8(buf + pos,     0x50); poke8(buf + pos + 1, 0x4B);  // PK
+        poke8(buf + pos + 2, 0x01); poke8(buf + pos + 3, 0x02);  // \x01\x02
+        zipPut16(buf, pos + 4,  20);         // Version made by: 2.0
+        zipPut16(buf, pos + 6,  20);         // Version needed: 2.0
+        zipPut16(buf, pos + 8,  0);          // Flags
+        zipPut16(buf, pos + 10, method);     // Method
+        zipPut16(buf, pos + 12, 0);          // Mod time
+        zipPut16(buf, pos + 14, 0x4A21);     // Mod date
+        zipPut32(buf, pos + 16, crc);        // CRC-32
+        zipPut32(buf, pos + 20, compLen);    // Compressed size
+        zipPut32(buf, pos + 24, edataLen);   // Uncompressed size
+        zipPut16(buf, pos + 28, enameLen);   // Name length
+        zipPut16(buf, pos + 30, 0);          // Extra length
+        zipPut16(buf, pos + 32, 0);          // Comment length
+        zipPut16(buf, pos + 34, 0);          // Disk start
+        zipPut16(buf, pos + 36, 0);          // Internal attributes
+        zipPut32(buf, pos + 38, 0);          // External attributes
+        zipPut32(buf, pos + 42, localOff);   // Local header offset
+        zipCopy(buf + pos + 46, ename, enameLen);
+
+        pos := pos + 46 + enameLen;
+        i += 1;
+    }
+
+    var cdSize: int64 := pos - cdStart;
+
+    // ── End of Central Directory ─────────────────────────────────────────────
+    poke8(buf + pos,     0x50); poke8(buf + pos + 1, 0x4B);  // PK
+    poke8(buf + pos + 2, 0x05); poke8(buf + pos + 3, 0x06);  // \x05\x06
+    zipPut16(buf, pos + 4,  0);       // Disk number
+    zipPut16(buf, pos + 6,  0);       // Start disk
+    zipPut16(buf, pos + 8,  count);   // Entries on disk
+    zipPut16(buf, pos + 10, count);   // Total entries
+    zipPut32(buf, pos + 12, cdSize);  // Central directory size
+    zipPut32(buf, pos + 16, cdStart); // Central directory offset
+    zipPut16(buf, pos + 20, 0);       // Comment length
+    pos += 22;
+
+    // Schreiben
+    var rc: int64 := WriteFile(path, buf, pos);
+
+    free(buf); free(offsets); free(compBuf);
+    if (rc <= 0) { return ZIP_ERR_IO; }
+    return ZIP_ERR_OK;
+}
+
+// Gibt den Writer und alle enthaltenen Einträge frei.
+pub fn ZipWriterFree(writer: int64): void {
+    if (writer == 0) { return; }
+    var entries: int64 := peek64(writer);
+    var count:   int64 := peek64(writer + 8);
+    var i: int64 := 0;
+    while (i < count) {
+        var entry: int64 := entries + i * 32;
+        if (peek64(entry) != 0)     { free(peek64(entry)); }
+        if (peek64(entry + 8) != 0) { free(peek64(entry + 8)); }
+        i += 1;
+    }
+    free(entries);
+    free(writer);
+}

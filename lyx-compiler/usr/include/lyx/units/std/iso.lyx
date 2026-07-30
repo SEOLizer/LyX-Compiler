@@ -1,0 +1,656 @@
+// std/iso.lyx — ISO 9660 Lesen und Schreiben (Level 1, keine Komprimierung)
+//
+// Unterstützt:
+//   Reader: ISO 9660 Volumes, BFS-Verzeichnisbaum, max. 256 Verzeichnisse.
+//           Liest Dateien und Unterverzeichnisse, baut vollständige Pfade.
+//   Writer: Flat-Root-Verzeichnis (keine Unterverzeichnisse), ISO 9660 Level 1
+//           (Großbuchstaben, 8.3-Dateinamen + ";1"-Version).
+//
+// Sektorgröße: 2048 Bytes
+// System Area: Sektoren 0–15 (leer)
+// PVD (Primary Volume Descriptor): Sektor 16
+// VDST (Volume Descriptor Set Terminator): Sektor 17
+// Path Table (L + M): Sektoren 18–19
+// Root Dir: Sektor 20
+// Dateidaten: ab Sektor 21
+//
+// Both-Byte-Order (BOF) Integers: 4 Bytes LE + 4 Bytes BE (uint32)
+//                                 2 Bytes LE + 2 Bytes BE (uint16)
+
+unit std.iso;
+
+import std.alloc;
+import std.io;
+import std.string;
+import std.fs;
+
+// ============================================================================
+// Konstanten
+// ============================================================================
+
+pub con ISO_SECTOR:          int64 := 2048;
+pub con ISO_MAX_ENTRIES:     int64 := 4096;
+pub con ISO_MAX_DIRS:        int64 := 256;
+pub con ISO_MAX_PATH:        int64 := 512;
+
+pub con ISO_ERR_OK:          int64 := 0;
+pub con ISO_ERR_NOTISO:      int64 := 1;
+pub con ISO_ERR_IO:          int64 := 2;
+pub con ISO_ERR_CORRUPT:     int64 := 3;
+pub con ISO_ERR_FULL:        int64 := 4;
+pub con ISO_ERR_NAMETOOLONG: int64 := 5;
+
+// ============================================================================
+// Struct-Offsets (Kommentare als Dokumentation)
+// ============================================================================
+// IsoReader (40 Bytes):  rawData:0  rawLen:8  entries:16  entryCount:24  (pad):32
+// IsoEntry  (40 Bytes):  name:0  dataOff:8  dataLen:16  (pad):24  (pad):32
+// IsoWriter (32 Bytes):  entries:0  entryCount:8  (pad):16  (pad):24
+// IsoWEntry (24 Bytes):  name:0  data:8  dataLen:16
+// ScanCtx   (48 Bytes):  raw:0  entries:8  count:16  queue:24  qTail:32  n:40
+
+// ============================================================================
+// Interne Hilfsfunktionen
+// ============================================================================
+
+fn isoReadU32LE(buf: int64, off: int64): int64 {
+    return peek8(buf + off)
+         | (peek8(buf + off + 1) << 8)
+         | (peek8(buf + off + 2) << 16)
+         | (peek8(buf + off + 3) << 24);
+}
+
+fn isoReadU16LE(buf: int64, off: int64): int64 {
+    return peek8(buf + off) | (peek8(buf + off + 1) << 8);
+}
+
+fn isoPutU32LE(buf: int64, off: int64, val: int64): void {
+    poke8(buf + off,     val & 0xFF);
+    poke8(buf + off + 1, (val >> 8)  & 0xFF);
+    poke8(buf + off + 2, (val >> 16) & 0xFF);
+    poke8(buf + off + 3, (val >> 24) & 0xFF);
+}
+
+fn isoPutU32BE(buf: int64, off: int64, val: int64): void {
+    poke8(buf + off,     (val >> 24) & 0xFF);
+    poke8(buf + off + 1, (val >> 16) & 0xFF);
+    poke8(buf + off + 2, (val >> 8)  & 0xFF);
+    poke8(buf + off + 3, val & 0xFF);
+}
+
+fn isoPutU16LE(buf: int64, off: int64, val: int64): void {
+    poke8(buf + off,     val & 0xFF);
+    poke8(buf + off + 1, (val >> 8) & 0xFF);
+}
+
+fn isoPutU16BE(buf: int64, off: int64, val: int64): void {
+    poke8(buf + off,     (val >> 8) & 0xFF);
+    poke8(buf + off + 1, val & 0xFF);
+}
+
+fn isoPutU32BOF(buf: int64, off: int64, val: int64): void {
+    isoPutU32LE(buf, off,     val);
+    isoPutU32BE(buf, off + 4, val);
+}
+
+fn isoPutU16BOF(buf: int64, off: int64, val: int64): void {
+    isoPutU16LE(buf, off,     val);
+    isoPutU16BE(buf, off + 2, val);
+}
+
+fn isoCopy(dst: int64, src: int64, n: int64): void {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+fn isoFill(dst: int64, n: int64, val: int64): void {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + i, val); i := i + 1; }
+}
+
+fn isoStrPad(dst: int64, off: int64, fieldLen: int64, src: int64): void {
+    var i: int64 := 0;
+    while (i < fieldLen) {
+        var c: int64 := peek8(src + i);
+        if (c == 0) {
+            while (i < fieldLen) { poke8(dst + off + i, 0x20); i := i + 1; }
+        } else {
+            poke8(dst + off + i, c);
+            i += 1;
+        }
+    }
+}
+
+fn isoStrdup(src: int64, slen: int64): int64 {
+    var buf: int64 := alloc(slen + 1);
+    var i: int64 := 0;
+    while (i < slen) { poke8(buf + i, peek8(src + i)); i := i + 1; }
+    poke8(buf + slen, 0);
+    return buf;
+}
+
+fn isoStripVersion(name: int64, nlen: int64): int64 {
+    var i: int64 := nlen - 1;
+    var found: int64 := nlen;
+    var searching: int64 := 1;
+    while ((i >= 0) & (searching == 1)) {
+        if (peek8(name + i) == 0x3B) { found := i; searching := 0; }
+        i -= 1;
+    }
+    return found;
+}
+
+fn isoToUpper(c: int64): int64 {
+    if ((c >= 0x61) & (c <= 0x7A)) { return c - 0x20; }
+    return c;
+}
+
+fn isoIsValidChar(c: int64): int64 {
+    if ((c >= 0x41) & (c <= 0x5A)) { return 1; }
+    if ((c >= 0x30) & (c <= 0x39)) { return 1; }
+    if (c == 0x5F) { return 1; }
+    if (c == 0x2E) { return 1; }
+    return 0;
+}
+
+fn isoNormalizeName(dst: int64, src: int64, nameLen: int64): void {
+    var i: int64 := 0;
+    while (i < nameLen) {
+        var c: int64 := isoToUpper(peek8(src + i));
+        if (isoIsValidChar(c) == 0) { c := 0x5F; }
+        poke8(dst + i, c);
+        i += 1;
+    }
+    poke8(dst + nameLen, 0);
+}
+
+fn isoJoinPath(prefix: int64, plen: int64, suffix: int64, slen: int64): int64 {
+    var total: int64 := plen + 1 + slen;
+    if (total >= ISO_MAX_PATH) { total := ISO_MAX_PATH - 1; }
+    var buf: int64 := alloc(total + 1);
+    var i: int64 := 0;
+    while (i < plen) { poke8(buf + i, peek8(prefix + i)); i := i + 1; }
+    poke8(buf + plen, 0x2F);
+    var j: int64 := 0;
+    while (j < slen) {
+        if ((plen + 1 + j) < ISO_MAX_PATH) {
+            poke8(buf + plen + 1 + j, peek8(suffix + j));
+        }
+        j += 1;
+    }
+    poke8(buf + total, 0);
+    return buf;
+}
+
+// ============================================================================
+// BFS-Hilfsfunktion: Verarbeitet einen Verzeichnissektor.
+// ctx (ScanCtx, 48 Bytes): [0]=raw [8]=entries [16]=count [24]=queue [32]=qTail [40]=n
+// Schreibt count und qTail zurück in ctx.
+// ============================================================================
+fn isoScanDir(ctx: int64, dirLBA: int64, dirLen: int64, dirPath: int64): void {
+    var raw:      int64 := peek64(ctx);
+    var entries:  int64 := peek64(ctx + 8);
+    var count:    int64 := peek64(ctx + 16);
+    var queue:    int64 := peek64(ctx + 24);
+    var qTail:    int64 := peek64(ctx + 32);
+    var n:        int64 := peek64(ctx + 40);
+    var dirStart: int64 := dirLBA * ISO_SECTOR;
+    var plen:     int64 := StrLen(dirPath);
+    var pos:      int64 := 0;
+
+    while (pos < dirLen) {
+        var recBase:   int64 := raw + dirStart + pos;
+        var recLen:    int64 := peek8(recBase);
+
+        if (recLen == 0) {
+            var sectorOff: int64 := pos % ISO_SECTOR;
+            pos := pos + (ISO_SECTOR - sectorOff);
+        } else {
+            var nameLen:   int64 := peek8(recBase + 32);
+            var nameSrc:   int64 := recBase + 33;
+            var isSpecial: int64 := 0;
+            if (nameLen == 1) {
+                var fb: int64 := peek8(nameSrc);
+                if ((fb == 0) | (fb == 1)) { isSpecial := 1; }
+            }
+
+            if (isSpecial == 0) {
+                var fileFlags: int64 := peek8(recBase + 25);
+                var isDir:     int64 := fileFlags & 0x02;
+                var effLen:    int64 := isoStripVersion(nameSrc, nameLen);
+
+                if (isDir != 0) {
+                    if (qTail < ISO_MAX_DIRS) {
+                        var fileLBA: int64 := isoReadU32LE(recBase, 2);
+                        var fileLen: int64 := isoReadU32LE(recBase, 10);
+                        var subPath: int64 := isoJoinPath(dirPath, plen, nameSrc, effLen);
+                        var qe:      int64 := qTail * 24;
+                        poke64(queue + qe,      fileLBA);
+                        poke64(queue + qe + 8,  fileLen);
+                        poke64(queue + qe + 16, subPath);
+                        qTail += 1;
+                    }
+                } else {
+                    if (count < ISO_MAX_ENTRIES) {
+                        var fileLBA2:  int64 := isoReadU32LE(recBase, 2);
+                        var fileSize2: int64 := isoReadU32LE(recBase, 10);
+                        var fullPath:  int64 := 0;
+                        if (plen == 0) {
+                            fullPath := isoStrdup(nameSrc, effLen);
+                        } else {
+                            fullPath := isoJoinPath(dirPath, plen, nameSrc, effLen);
+                        }
+                        var entry:   int64 := entries + count * 40;
+                        poke64(entry,      fullPath);
+                        poke64(entry + 8,  fileLBA2 * ISO_SECTOR);
+                        poke64(entry + 16, fileSize2);
+                        poke64(entry + 24, 0);
+                        poke64(entry + 32, 0);
+                        count += 1;
+                    }
+                }
+            }
+            pos += recLen;
+        }
+    }
+
+    poke64(ctx + 16, count);
+    poke64(ctx + 32, qTail);
+}
+
+// ============================================================================
+// ISO 9660 Reader
+// ============================================================================
+
+pub fn IsoOpen(path: int64): int64 {
+    var fsize: int64 := FileSize(path);
+    if (fsize < (17 * ISO_SECTOR)) { return 0; }
+    var raw: int64 := alloc(fsize + 1);
+    var n:   int64 := ReadFile(path, raw, fsize);
+    if (n < (17 * ISO_SECTOR)) { free(raw); return 0; }
+    poke8(raw + n, 0);
+
+    var pvd: int64 := raw + 16 * ISO_SECTOR;
+    if (peek8(pvd) != 1) { free(raw); return 0; }
+    if ((peek8(pvd + 1) != 0x43) |
+        (peek8(pvd + 2) != 0x44) |
+        (peek8(pvd + 3) != 0x30) |
+        (peek8(pvd + 4) != 0x30) |
+        (peek8(pvd + 5) != 0x31)) {
+        free(raw); return 0;
+    }
+
+    var handle:  int64 := alloc(40);
+    var entries: int64 := alloc(ISO_MAX_ENTRIES * 40);
+    poke64(handle,      raw);
+    poke64(handle + 8,  n);
+    poke64(handle + 16, entries);
+    poke64(handle + 24, 0);
+
+    var rootRec:    int64 := pvd + 156;
+    var rootLBA:    int64 := isoReadU32LE(rootRec, 2);
+    var rootDirLen: int64 := isoReadU32LE(rootRec, 10);
+
+    var queue:    int64 := alloc(ISO_MAX_DIRS * 24);
+    var rootPath: int64 := alloc(1);
+    poke8(rootPath, 0);
+
+    poke64(queue,      rootLBA);
+    poke64(queue + 8,  rootDirLen);
+    poke64(queue + 16, rootPath);
+
+    // ScanCtx: [0]=raw [8]=entries [16]=count [24]=queue [32]=qTail [40]=n
+    var ctx: int64 := alloc(48);
+    poke64(ctx,      raw);
+    poke64(ctx + 8,  entries);
+    poke64(ctx + 16, 0);
+    poke64(ctx + 24, queue);
+    poke64(ctx + 32, 1);
+    poke64(ctx + 40, n);
+
+    var bfsi:    int64 := 0;
+    var bfsDone: int64 := 0;
+    var dirLBA2:   int64 := 0;
+    var dirLen2:   int64 := 0;
+    var dirPath2:  int64 := 0;
+    var dirStart2: int64 := 0;
+    var qTailCur:  int64 := 0;
+
+    while (bfsDone == 0) {
+        qTailCur := peek64(ctx + 32);
+        if ((bfsi < qTailCur) & (bfsi < ISO_MAX_DIRS)) {
+            dirLBA2   := peek64(queue + bfsi * 24);
+            dirLen2   := peek64(queue + bfsi * 24 + 8);
+            dirPath2  := peek64(queue + bfsi * 24 + 16);
+            dirStart2 := dirLBA2 * ISO_SECTOR;
+            if ((dirStart2 + dirLen2) <= n) {
+                isoScanDir(ctx, dirLBA2, dirLen2, dirPath2);
+            }
+            free(dirPath2);
+            bfsi += 1;
+        } else {
+            bfsDone := 1;
+        }
+    }
+
+    var bfsi2:    int64 := bfsi;
+    var qTailEnd: int64 := peek64(ctx + 32);
+    while (bfsi2 < qTailEnd) {
+        free(peek64(queue + bfsi2 * 24 + 16));
+        bfsi2 += 1;
+    }
+
+    var finalCount: int64 := peek64(ctx + 16);
+    free(ctx);
+    free(queue);
+
+    poke64(handle + 24, finalCount);
+    return handle;
+}
+
+pub fn IsoClose(handle: int64): void {
+    if (handle == 0) { return; }
+    var entries: int64 := peek64(handle + 16);
+    var count:   int64 := peek64(handle + 24);
+    var i: int64 := 0;
+    while (i < count) {
+        var name: int64 := peek64(entries + i * 40);
+        if (name != 0) { free(name); }
+        i += 1;
+    }
+    free(entries);
+    free(peek64(handle));
+    free(handle);
+}
+
+pub fn IsoCount(handle: int64): int64 {
+    if (handle == 0) { return 0; }
+    return peek64(handle + 24);
+}
+
+pub fn IsoName(handle: int64, idx: int64): int64 {
+    if (handle == 0) { return 0; }
+    if ((idx < 0) | (idx >= peek64(handle + 24))) { return 0; }
+    return peek64(peek64(handle + 16) + idx * 40);
+}
+
+pub fn IsoSize(handle: int64, idx: int64): int64 {
+    if (handle == 0) { return 0; }
+    if ((idx < 0) | (idx >= peek64(handle + 24))) { return 0; }
+    return peek64(peek64(handle + 16) + idx * 40 + 16);
+}
+
+pub fn IsoRead(handle: int64, idx: int64, outBuf: int64, maxLen: int64): int64 {
+    if (handle == 0) { return 0 - 1; }
+    var count: int64 := peek64(handle + 24);
+    if ((idx < 0) | (idx >= count)) { return 0 - 1; }
+
+    var entry:   int64 := peek64(handle + 16) + idx * 40;
+    var dataOff: int64 := peek64(entry + 8);
+    var dataLen: int64 := peek64(entry + 16);
+    var rawData: int64 := peek64(handle);
+    var rawLen:  int64 := peek64(handle + 8);
+
+    if ((dataOff + dataLen) > rawLen) { return 0 - 1; }
+    if (dataLen > maxLen) { return 0 - 1; }
+
+    isoCopy(outBuf, rawData + dataOff, dataLen);
+    return dataLen;
+}
+
+pub fn IsoFind(handle: int64, name: int64): int64 {
+    if (handle == 0) { return 0 - 1; }
+    var count:   int64 := peek64(handle + 24);
+    var entries: int64 := peek64(handle + 16);
+    var nlen:    int64 := StrLen(name);
+    var i: int64 := 0;
+    while (i < count) {
+        var ename: int64 := peek64(entries + i * 40);
+        if (ename != 0) {
+            var elen: int64 := StrLen(ename);
+            if (nlen == elen) {
+                var isMatch: int64 := 1;
+                var k: int64 := 0;
+                while (k < nlen) {
+                    if (peek8(ename + k) != peek8(name + k)) { isMatch := 0; }
+                    k += 1;
+                }
+                if (isMatch == 1) { return i; }
+            }
+        }
+        i += 1;
+    }
+    return 0 - 1;
+}
+
+// ============================================================================
+// ISO 9660 Writer
+// ============================================================================
+
+pub fn IsoWriterNew(): int64 {
+    var w: int64 := alloc(32);
+    poke64(w,      alloc(ISO_MAX_ENTRIES * 24));
+    poke64(w + 8,  0);
+    poke64(w + 16, 0);
+    poke64(w + 24, 0);
+    return w;
+}
+
+pub fn IsoWriterAdd(w: int64, name: int64, data: int64, dataLen: int64): int64 {
+    if (w == 0) { return ISO_ERR_IO; }
+    var count: int64 := peek64(w + 8);
+    if (count >= ISO_MAX_ENTRIES) { return ISO_ERR_FULL; }
+
+    var slen: int64 := StrLen(name);
+    if ((slen == 0) | (slen > 36)) { return ISO_ERR_NAMETOOLONG; }
+
+    var nameBuf: int64 := alloc(slen + 1);
+    isoNormalizeName(nameBuf, name, slen);
+
+    var entries: int64 := peek64(w);
+    var entry:   int64 := entries + count * 24;
+    poke64(entry,      nameBuf);
+    poke64(entry + 8,  data);
+    poke64(entry + 16, dataLen);
+    poke64(w + 8, count + 1);
+    return ISO_ERR_OK;
+}
+
+// nameByte: 0x00 für ".", 0x01 für ".." — nameLen ist immer 1
+fn isoWriteRootEntry(rootSector: int64, recOff: int64, lba: int64, dlen: int64, flags: int64, nameByte: int64): void {
+    poke8(rootSector + recOff,      34);
+    poke8(rootSector + recOff + 1,  0);
+    isoPutU32BOF(rootSector, recOff + 2, lba);
+    isoPutU32BOF(rootSector, recOff + 10, dlen);
+    poke8(rootSector + recOff + 25, flags);
+    poke8(rootSector + recOff + 26, 0);
+    poke8(rootSector + recOff + 27, 0);
+    isoPutU16BOF(rootSector, recOff + 28, 1);
+    poke8(rootSector + recOff + 32, 1);
+    poke8(rootSector + recOff + 33, nameByte);
+}
+
+pub fn IsoWriterSave(w: int64, path: int64): int64 {
+    if (w == 0) { return ISO_ERR_IO; }
+    var count:   int64 := peek64(w + 8);
+    var entries: int64 := peek64(w);
+
+    var firstDataSector: int64 := 21;
+    var totalSectors:    int64 := firstDataSector;
+    var i: int64 := 0;
+    while (i < count) {
+        var dl: int64 := peek64(entries + i * 24 + 16);
+        var sc: int64 := (dl + ISO_SECTOR - 1);
+        sc := sc / ISO_SECTOR;
+        if (sc == 0) { sc := 1; }
+        totalSectors += sc;
+        i += 1;
+    }
+
+    var imageSize: int64 := totalSectors * ISO_SECTOR;
+    var image:     int64 := alloc(imageSize);
+    isoFill(image, imageSize, 0);
+
+    var lbaArr: int64 := alloc(count * 8);
+    var curLBA: int64 := firstDataSector;
+    i := 0;
+    while (i < count) {
+        var data:    int64 := peek64(entries + i * 24 + 8);
+        var dataLen: int64 := peek64(entries + i * 24 + 16);
+        poke64(lbaArr + i * 8, curLBA);
+        if (dataLen > 0) {
+            isoCopy(image + curLBA * ISO_SECTOR, data, dataLen);
+        }
+        var sc: int64 := (dataLen + ISO_SECTOR - 1);
+        sc := sc / ISO_SECTOR;
+        if (sc == 0) { sc := 1; }
+        curLBA += sc;
+        i += 1;
+    }
+
+    // Root-Verzeichnis in Sektor 20
+    var rootSector: int64 := image + 20 * ISO_SECTOR;
+    var rootDirLen: int64 := 0;
+
+    isoWriteRootEntry(rootSector, 0,  20, ISO_SECTOR, 0x02, 0x00);
+    rootDirLen += 34;
+    isoWriteRootEntry(rootSector, rootDirLen, 20, ISO_SECTOR, 0x02, 0x01);
+    rootDirLen += 34;
+
+    i := 0;
+    while (i < count) {
+        var nameBuf: int64 := peek64(entries + i * 24);
+        var dataLen: int64 := peek64(entries + i * 24 + 16);
+        var fileLBA: int64 := peek64(lbaArr + i * 8);
+        var nlen:    int64 := StrLen(nameBuf);
+        var fullLen: int64 := nlen + 2;
+        var recLen:  int64 := 33 + fullLen;
+        if ((recLen % 2) != 0) { recLen := recLen + 1; }
+        var recOff: int64 := rootDirLen;
+
+        if ((recOff + recLen) <= ISO_SECTOR) {
+            poke8(rootSector + recOff,      recLen);
+            poke8(rootSector + recOff + 1,  0);
+            isoPutU32BOF(rootSector, recOff + 2,  fileLBA);
+            isoPutU32BOF(rootSector, recOff + 10, dataLen);
+            poke8(rootSector + recOff + 25, 0x00);
+            poke8(rootSector + recOff + 26, 0);
+            poke8(rootSector + recOff + 27, 0);
+            isoPutU16BOF(rootSector, recOff + 28, 1);
+            poke8(rootSector + recOff + 32, fullLen);
+            var j: int64 := 0;
+            while (j < nlen) {
+                poke8(rootSector + recOff + 33 + j, peek8(nameBuf + j));
+                j += 1;
+            }
+            poke8(rootSector + recOff + 33 + nlen,     0x3B);
+            poke8(rootSector + recOff + 33 + nlen + 1, 0x31);
+            rootDirLen += recLen;
+        }
+        i += 1;
+    }
+
+    // PVD in Sektor 16
+    var pvd: int64 := image + 16 * ISO_SECTOR;
+    poke8(pvd,     1);
+    poke8(pvd + 1, 0x43);
+    poke8(pvd + 2, 0x44);
+    poke8(pvd + 3, 0x30);
+    poke8(pvd + 4, 0x30);
+    poke8(pvd + 5, 0x31);
+    poke8(pvd + 6, 1);
+
+    isoFill(pvd + 8,  32, 0x20);
+    isoFill(pvd + 40, 32, 0x20);
+
+    var volId: int64 := alloc(8);
+    poke8(volId,     0x4C); poke8(volId + 1, 0x59); poke8(volId + 2, 0x58);
+    poke8(volId + 3, 0x49); poke8(volId + 4, 0x53); poke8(volId + 5, 0x4F);
+    poke8(volId + 6, 0);
+    isoStrPad(pvd, 40, 32, volId);
+    free(volId);
+
+    isoPutU32BOF(pvd, 80, totalSectors);
+    isoPutU16BOF(pvd, 120, 1);
+    isoPutU16BOF(pvd, 124, 1);
+    isoPutU16BOF(pvd, 128, ISO_SECTOR);
+    isoPutU32BOF(pvd, 132, 10);
+    isoPutU32LE(pvd, 140, 18);
+    isoPutU32BE(pvd, 148, 19);
+
+    var rootRec: int64 := pvd + 156;
+    poke8(rootRec,      34);
+    poke8(rootRec + 1,  0);
+    isoPutU32BOF(rootRec, 2, 20);
+    isoPutU32BOF(rootRec, 10, ISO_SECTOR);
+    poke8(rootRec + 25, 0x02);
+    poke8(rootRec + 26, 0);
+    poke8(rootRec + 27, 0);
+    isoPutU16BOF(rootRec, 28, 1);
+    poke8(rootRec + 32, 1);
+    poke8(rootRec + 33, 0x00);
+
+    isoFill(pvd + 190, 128, 0x20);
+    isoFill(pvd + 318, 128, 0x20);
+    isoFill(pvd + 446, 128, 0x20);
+    isoFill(pvd + 574, 128, 0x20);
+    isoFill(pvd + 702, 37,  0x20);
+    isoFill(pvd + 739, 36,  0x20);
+    isoFill(pvd + 775, 37,  0x20);
+
+    isoFill(pvd + 812, 16, 0x30); poke8(pvd + 828, 0);
+    isoFill(pvd + 829, 16, 0x30); poke8(pvd + 845, 0);
+    isoFill(pvd + 846, 16, 0x30); poke8(pvd + 862, 0);
+    isoFill(pvd + 863, 16, 0x30); poke8(pvd + 879, 0);
+
+    poke8(pvd + 880, 1);
+
+    // VDST in Sektor 17
+    var vdst: int64 := image + 17 * ISO_SECTOR;
+    poke8(vdst,     0xFF);
+    poke8(vdst + 1, 0x43);
+    poke8(vdst + 2, 0x44);
+    poke8(vdst + 3, 0x30);
+    poke8(vdst + 4, 0x30);
+    poke8(vdst + 5, 0x31);
+    poke8(vdst + 6, 1);
+
+    // L-Path Table in Sektor 18
+    var lpt: int64 := image + 18 * ISO_SECTOR;
+    poke8(lpt,     1);
+    poke8(lpt + 1, 0);
+    isoPutU32LE(lpt, 2, 20);
+    isoPutU16LE(lpt, 6, 1);
+    poke8(lpt + 8, 0x00);
+    poke8(lpt + 9, 0x00);
+
+    // M-Path Table in Sektor 19
+    var mpt: int64 := image + 19 * ISO_SECTOR;
+    poke8(mpt,     1);
+    poke8(mpt + 1, 0);
+    isoPutU32BE(mpt, 2, 20);
+    isoPutU16BE(mpt, 6, 1);
+    poke8(mpt + 8, 0x00);
+    poke8(mpt + 9, 0x00);
+
+    var written: int64 := WriteFile(path, image, imageSize);
+    free(image);
+    free(lbaArr);
+
+    if (written != imageSize) { return ISO_ERR_IO; }
+    return ISO_ERR_OK;
+}
+
+pub fn IsoWriterFree(w: int64): void {
+    if (w == 0) { return; }
+    var entries: int64 := peek64(w);
+    var count:   int64 := peek64(w + 8);
+    var i: int64 := 0;
+    while (i < count) {
+        var name: int64 := peek64(entries + i * 24);
+        if (name != 0) { free(name); }
+        i += 1;
+    }
+    free(entries);
+    free(w);
+}

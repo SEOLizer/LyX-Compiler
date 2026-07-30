@@ -1,0 +1,706 @@
+// std/edi/seafreight.lyx — Sea Freight: BAPLIE + MOVINS + COPARN + CODECO +
+//   COARRI + COPINO + COPRAR + VERMAS + HANMOV (WP-EDI-11)
+//
+// Container identification follows ISO 6346:
+//   EdiContainerCheck(ptr, len) → 1=valid, 0=invalid
+//   Format: 4-char owner + 6-digit serial + 1 check digit = 11 chars
+//   Letters mapped A=10..Z=35 (skipping 11,22,33); digits 0-9 as-is.
+//   Sum of (value × 2^pos) for positions 0-9, then sum % 11 % 10 must equal
+//   the check digit (11 → 0 per ISO 6346).
+
+unit std.edi.seafreight;
+
+import std.edi.core;
+import std.alloc;
+
+// ── BGM qualifiers ────────────────────────────────────────────────────────────
+pub con EDI_SF_BGM_BAPLIE: int64 := 23;
+pub con EDI_SF_BGM_MOVINS: int64 := 28;
+pub con EDI_SF_BGM_COPARN: int64 := 38;
+pub con EDI_SF_BGM_CODECO: int64 := 29;
+pub con EDI_SF_BGM_COARRI: int64 := 30;
+pub con EDI_SF_BGM_COPINO: int64 := 39;
+pub con EDI_SF_BGM_COPRAR: int64 := 42;
+pub con EDI_SF_BGM_VERMAS: int64 := 35;
+pub con EDI_SF_BGM_HANMOV: int64 := 85;
+
+// ── Container move types ──────────────────────────────────────────────────────
+pub con EDI_SF_MOVE_LOAD:      int64 := 1;
+pub con EDI_SF_MOVE_DISCHARGE: int64 := 2;
+pub con EDI_SF_MOVE_SHIFT:     int64 := 3;
+
+// ── EDI_SF_HDR offsets (96 bytes) ────────────────────────────────────────────
+pub con EDI_SF_HDR_BGMQUAL:   int64 := 0;
+pub con EDI_SF_HDR_REF:       int64 := 8;
+pub con EDI_SF_HDR_REFLEN:    int64 := 16;
+pub con EDI_SF_HDR_DATE:      int64 := 24;
+pub con EDI_SF_HDR_DATELEN:   int64 := 32;
+pub con EDI_SF_HDR_VESSEL:    int64 := 40;   // TDT vessel name
+pub con EDI_SF_HDR_VESSELLN:  int64 := 48;
+pub con EDI_SF_HDR_VOYAGE:    int64 := 56;   // RFF+VN voyage
+pub con EDI_SF_HDR_VOYAGELN:  int64 := 64;
+pub con EDI_SF_HDR_PORT:      int64 := 72;   // LOC+9 port
+pub con EDI_SF_HDR_PORTLEN:   int64 := 80;
+pub con EDI_SF_HDR_MOVECOUNT: int64 := 88;   // total CNT
+pub con EDI_SF_HDR_SIZE:      int64 := 96;
+
+// ── EDI_SF_CONT offsets (80 bytes) ───────────────────────────────────────────
+pub con EDI_SF_CONT_ID:       int64 := 0;    // container ID (11 chars ISO 6346)
+pub con EDI_SF_CONT_IDLEN:    int64 := 8;
+pub con EDI_SF_CONT_SIZE:     int64 := 16;   // e.g. 20, 40 (feet)
+pub con EDI_SF_CONT_TYPE:     int64 := 24;   // e.g. GP (general purpose)
+pub con EDI_SF_CONT_TYPELEN:  int64 := 32;
+pub con EDI_SF_CONT_BAY:      int64 := 40;   // stowage position bay
+pub con EDI_SF_CONT_ROW:      int64 := 48;   // stowage row
+pub con EDI_SF_CONT_TIER:     int64 := 56;   // stowage tier
+pub con EDI_SF_CONT_WEIGHT:   int64 := 64;   // VGM in kg × 100
+pub con EDI_SF_CONT_MOVETYPE: int64 := 72;   // 1=load 2=discharge 3=shift
+pub con EDI_SF_CONT_SIZE_OFF: int64 := 80;   // total struct size
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ISO 6346 check digit validation
+// Letters A-Z → 10-35 skipping multiples of 11 (11,22,33).
+// Positional weights: 2^0..2^9 for chars 0..9.
+// check_digit = (sum % 11) % 10; 11 maps to 0.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn sfLetterVal(c: int64): int64 {
+    if (c < 65 || c > 90) { return 0 - 1; }
+    var v: int64 := c - 55;  // A=10, B=11... but we skip 11,22,33
+    if (v >= 11) { v := v + 1; }
+    if (v >= 22) { v := v + 1; }
+    if (v >= 33) { v := v + 1; }
+    return v;
+}
+
+pub fn EdiContainerCheck(ptr: int64, len: int64): int64 {
+    if (len != 11) { return 0; }
+    // First 4 must be letters (owner code, last must be U/J/Z)
+    var i: int64 := 0;
+    while (i < 4) {
+        var c: int64 := peek8(ptr + i);
+        if (c < 65 || c > 90) { return 0; }
+        i += 1;
+    }
+    // Chars 4-9 must be digits (serial number)
+    i := 4;
+    while (i < 10) {
+        var c: int64 := peek8(ptr + i);
+        if (c < 48 || c > 57) { return 0; }
+        i += 1;
+    }
+    // Char 10 must be digit (check digit)
+    var checkChar: int64 := peek8(ptr + 10);
+    if (checkChar < 48 || checkChar > 57) { return 0; }
+    var expected: int64 := checkChar - 48;
+
+    // Compute weighted sum: pos 0-3 are letters, pos 4-9 are digits
+    var sum: int64 := 0;
+    var weight: int64 := 1;
+    i := 0;
+    while (i < 10) {
+        var c: int64 := peek8(ptr + i);
+        var val: int64 := 0;
+        if (c >= 65 && c <= 90) {
+            val := sfLetterVal(c);
+        } else {
+            val := c - 48;
+        }
+        sum := sum + val * weight;
+        weight := weight * 2;
+        i += 1;
+    }
+    var computed: int64 := (sum - (sum / 11) * 11) - ((sum - (sum / 11) * 11) / 10) * 10;
+    if (computed == expected) { return 1; }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn sfPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0 || pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn sfPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i += 1;
+    }
+    return pos + n;
+}
+
+fn sfPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val == 0) { return sfPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var tbuf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(tbuf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx += 1;
+    }
+    var r: int64 := sfPutStr(out, pos, outMax, tbuf, digits);
+    free(tbuf, 24);
+    return r;
+}
+
+fn sfPutRevenue(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    var euros: int64 := val / 100;
+    var cents: int64 := val - euros * 100;
+    pos := sfPutInt(out, pos, outMax, euros);
+    pos := sfPutChar(out, pos, outMax, 46);
+    if (cents < 10) { pos := sfPutChar(out, pos, outMax, 48); }
+    pos := sfPutInt(out, pos, outMax, cents);
+    return pos;
+}
+
+fn sfParseInt(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c >= 48 && c <= 57) { v := v * 10 + (c - 48); }
+        i += 1;
+    }
+    return v;
+}
+
+fn sfTagIs(seg: int64, t0: int64, t1: int64, t2: int64): int64 {
+    var p: int64 := peek64(seg + EDI_SEG_PTR);
+    if (p == 0) { return 0; }
+    if (peek8(p) != t0) { return 0; }
+    if (peek8(p+1) != t1) { return 0; }
+    if (peek8(p+2) != t2) { return 0; }
+    return 1;
+}
+
+fn sfEP(elems: int64, idx: int64): int64 { return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_PTR); }
+fn sfEL(elems: int64, idx: int64): int64 { return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_LEN); }
+
+fn sfWriteCnt(out: int64, pos: int64, outMax: int64, n: int64): int64 {
+    pos := sfPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := sfPutChar(out, pos, outMax, 50);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := sfPutInt(out, pos, outMax, n);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+fn sfWriteRff(out: int64, pos: int64, outMax: int64, qual2: int64, refPtr: int64, refLen: int64): int64 {
+    if (refPtr == 0 || refLen == 0) { return pos; }
+    pos := sfPutStr(out, pos, outMax, "RFF"c as int64, 3);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := sfPutStr(out, pos, outMax, qual2, 2);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := sfPutStr(out, pos, outMax, refPtr, refLen);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// BGM + DTM + TDT (vessel) + RFF+VN (voyage) + LOC+9 (port); return pos
+fn sfWriteHead(hdr: int64, out: int64, outMax: int64): int64 {
+    var bgmQual:  int64 := peek64(hdr + EDI_SF_HDR_BGMQUAL);
+    var refPtr:   int64 := peek64(hdr + EDI_SF_HDR_REF);
+    var refLen:   int64 := peek64(hdr + EDI_SF_HDR_REFLEN);
+    var datePtr:  int64 := peek64(hdr + EDI_SF_HDR_DATE);
+    var vesPtr:   int64 := peek64(hdr + EDI_SF_HDR_VESSEL);
+    var vesLen:   int64 := peek64(hdr + EDI_SF_HDR_VESSELLN);
+    var voyPtr:   int64 := peek64(hdr + EDI_SF_HDR_VOYAGE);
+    var voyLen:   int64 := peek64(hdr + EDI_SF_HDR_VOYAGELN);
+    var portPtr:  int64 := peek64(hdr + EDI_SF_HDR_PORT);
+    var portLen:  int64 := peek64(hdr + EDI_SF_HDR_PORTLEN);
+    var pos:      int64 := 0;
+
+    pos := sfPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := sfPutInt(out, pos, outMax, bgmQual);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (refPtr != 0 && refLen > 0) { pos := sfPutStr(out, pos, outMax, refPtr, refLen); }
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := sfPutChar(out, pos, outMax, 57);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    if (datePtr != 0) {
+        pos := sfPutStr(out, pos, outMax, "DTM"c as int64, 3);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := sfPutStr(out, pos, outMax, "137"c as int64, 3);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := sfPutStr(out, pos, outMax, datePtr, 8);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := sfPutStr(out, pos, outMax, "102"c as int64, 3);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    // TDT+20++vessel' (mode 20 = maritime)
+    if (vesPtr != 0 && vesLen > 0) {
+        pos := sfPutStr(out, pos, outMax, "TDT"c as int64, 3);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := sfPutStr(out, pos, outMax, "20"c as int64, 2);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := sfPutStr(out, pos, outMax, vesPtr, vesLen);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    // RFF+VN:voyage'
+    pos := sfWriteRff(out, pos, outMax, "VN"c as int64, voyPtr, voyLen);
+
+    // LOC+9+port::9'
+    if (portPtr != 0 && portLen > 0) {
+        pos := sfPutStr(out, pos, outMax, "LOC"c as int64, 3);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := sfPutChar(out, pos, outMax, 57);  // '9'
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := sfPutStr(out, pos, outMax, portPtr, portLen);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := sfPutChar(out, pos, outMax, 57);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    return pos;
+}
+
+// Write one container EQD+CN+id+sizeType' + LOC+147+bayRowTier' + MEA+VGM+WT:KGM+weight'
+fn sfWriteCont(out: int64, pos: int64, outMax: int64, cont: int64): int64 {
+    var idPtr:  int64 := peek64(cont + EDI_SF_CONT_ID);
+    var idLen:  int64 := peek64(cont + EDI_SF_CONT_IDLEN);
+    var csz:    int64 := peek64(cont + EDI_SF_CONT_SIZE);
+    var ctPtr:  int64 := peek64(cont + EDI_SF_CONT_TYPE);
+    var ctLen:  int64 := peek64(cont + EDI_SF_CONT_TYPELEN);
+    var bay:    int64 := peek64(cont + EDI_SF_CONT_BAY);
+    var row:    int64 := peek64(cont + EDI_SF_CONT_ROW);
+    var tier:   int64 := peek64(cont + EDI_SF_CONT_TIER);
+    var weight: int64 := peek64(cont + EDI_SF_CONT_WEIGHT);
+    var mtype:  int64 := peek64(cont + EDI_SF_CONT_MOVETYPE);
+
+    // EQD+CN+id+size:type'
+    pos := sfPutStr(out, pos, outMax, "EQD"c as int64, 3);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := sfPutStr(out, pos, outMax, "CN"c as int64, 2);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (idPtr != 0 && idLen > 0) { pos := sfPutStr(out, pos, outMax, idPtr, idLen); }
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := sfPutInt(out, pos, outMax, csz);
+    if (ctPtr != 0 && ctLen > 0) {
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := sfPutStr(out, pos, outMax, ctPtr, ctLen);
+    }
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // LOC+147+bay:row:tier'
+    pos := sfPutStr(out, pos, outMax, "LOC"c as int64, 3);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := sfPutStr(out, pos, outMax, "147"c as int64, 3);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := sfPutInt(out, pos, outMax, bay);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := sfPutInt(out, pos, outMax, row);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := sfPutInt(out, pos, outMax, tier);
+    pos := sfPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // MEA+VGM+WT:KGM:weight'
+    if (weight > 0) {
+        pos := sfPutStr(out, pos, outMax, "MEA"c as int64, 3);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := sfPutStr(out, pos, outMax, "VGM"c as int64, 3);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := sfPutStr(out, pos, outMax, "WT"c as int64, 2);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := sfPutStr(out, pos, outMax, "KGM"c as int64, 3);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := sfPutRevenue(out, pos, outMax, weight);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    // TSR+movetype' (move instruction)
+    if (mtype > 0) {
+        pos := sfPutStr(out, pos, outMax, "TSR"c as int64, 3);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := sfPutInt(out, pos, outMax, mtype);
+        pos := sfPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    return pos;
+}
+
+// Common reader: fills BGM, DTM, TDT(vessel), RFF+VN, LOC+9(port), CNT
+fn sfReadHead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg:   int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var done:  int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            if (sfTagIs(seg, 66, 71, 77) == 1) {   // BGM
+                if (n > 0) { poke64(hdr + EDI_SF_HDR_BGMQUAL, sfParseInt(sfEP(elems,0), sfEL(elems,0))); }
+                if (n > 1) { poke64(hdr + EDI_SF_HDR_REF, sfEP(elems,1)); poke64(hdr + EDI_SF_HDR_REFLEN, sfEL(elems,1)); }
+            }
+
+            if (sfTagIs(seg, 68, 84, 77) == 1) {   // DTM
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(sfEP(elems,0), sfEL(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (ql == 3 && peek8(qp)==49 && peek8(qp+1)==51 && peek8(qp+2)==55) {
+                            poke64(hdr + EDI_SF_HDR_DATE,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_SF_HDR_DATELEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // TDT: elem[0]=seq, elem[2]=vessel name (mode=20 maritime)
+            if (sfTagIs(seg, 84, 68, 84) == 1) {
+                if (n > 2) {
+                    poke64(hdr + EDI_SF_HDR_VESSEL,   sfEP(elems, 2));
+                    poke64(hdr + EDI_SF_HDR_VESSELLN, sfEL(elems, 2));
+                }
+            }
+
+            if (sfTagIs(seg, 82, 70, 70) == 1) {   // RFF
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(sfEP(elems,0), sfEL(elems,0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "VN" = 86,78
+                        if (ql == 2 && peek8(qp) == 86 && peek8(qp+1) == 78) {
+                            poke64(hdr + EDI_SF_HDR_VOYAGE,   peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_SF_HDR_VOYAGELN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            if (sfTagIs(seg, 76, 79, 67) == 1) {   // LOC
+                if (n > 1) {
+                    var qual: int64 := sfParseInt(sfEP(elems,0), sfEL(elems,0));
+                    if (qual == 9) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(sfEP(elems,1), sfEL(elems,1), comps, 4);
+                        poke64(hdr + EDI_SF_HDR_PORT,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_SF_HDR_PORTLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                }
+            }
+
+            if (sfTagIs(seg, 67, 78, 84) == 1) {   // CNT
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    EdiComponentSplit(sfEP(elems,0), sfEL(elems,0), comps, 4);
+                    poke64(hdr + EDI_SF_HDR_MOVECOUNT, sfParseInt(
+                        peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR),
+                        peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN)));
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return 1;
+}
+
+// Read containers: scan for EQD+CN; each EQD starts a new container record.
+// LOC+147 → bay:row:tier; MEA → weight; TSR → moveType.
+fn sfReadConts(buf: int64, bufLen: int64, conts: int64, maxConts: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx:    int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg:     int64 := alloc(EDI_SEG_SIZE);
+    var elems:   int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count:   int64 := 0;
+    var curCont: int64 := 0;
+    var done:    int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            // EQD = 69,81,68
+            if (sfTagIs(seg, 69, 81, 68) == 1 && count < maxConts) {
+                curCont := conts + count * EDI_SF_CONT_SIZE_OFF;
+                var zi: int64 := 0;
+                while (zi < EDI_SF_CONT_SIZE_OFF) { poke8(curCont + zi, 0); zi := zi + 1; }
+                if (n > 1) {
+                    poke64(curCont + EDI_SF_CONT_ID,    sfEP(elems, 1));
+                    poke64(curCont + EDI_SF_CONT_IDLEN, sfEL(elems, 1));
+                }
+                if (n > 2) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(sfEP(elems,2), sfEL(elems,2), comps, 4);
+                    if (nc > 0) {
+                        poke64(curCont + EDI_SF_CONT_SIZE, sfParseInt(
+                            peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR),
+                            peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN)));
+                    }
+                    if (nc > 1) {
+                        poke64(curCont + EDI_SF_CONT_TYPE,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(curCont + EDI_SF_CONT_TYPELEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+                count += 1;
+            }
+
+            // LOC+147 → stowage
+            if (sfTagIs(seg, 76, 79, 67) == 1 && curCont != 0) {
+                if (n > 1) {
+                    var qual: int64 := sfParseInt(sfEP(elems,0), sfEL(elems,0));
+                    if (qual == 147) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        var nc: int64 := EdiComponentSplit(sfEP(elems,1), sfEL(elems,1), comps, 4);
+                        if (nc > 0) { poke64(curCont + EDI_SF_CONT_BAY, sfParseInt(
+                            peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR),
+                            peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN))); }
+                        if (nc > 1) { poke64(curCont + EDI_SF_CONT_ROW, sfParseInt(
+                            peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR),
+                            peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN))); }
+                        if (nc > 2) { poke64(curCont + EDI_SF_CONT_TIER, sfParseInt(
+                            peek64(comps + 2 * EDI_ELEM_SIZE + EDI_ELEM_PTR),
+                            peek64(comps + 2 * EDI_ELEM_SIZE + EDI_ELEM_LEN))); }
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                }
+            }
+
+            // MEA = 77,69,65 → VGM weight
+            if (sfTagIs(seg, 77, 69, 65) == 1 && curCont != 0) {
+                if (n > 1) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(sfEP(elems,1), sfEL(elems,1), comps, 4);
+                    if (nc > 2) {
+                        var wp: int64 := peek64(comps + 2 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var wl: int64 := peek64(comps + 2 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var wv: int64 := 0;
+                        var wi: int64 := 0;
+                        var afterDot: int64 := 0;
+                        var decs: int64 := 0;
+                        while (wi < wl) {
+                            var wc: int64 := peek8(wp + wi);
+                            if (wc == 46 || wc == 44) { afterDot := 1; }
+                            else {
+                                if (wc >= 48 && wc <= 57) {
+                                    wv := wv * 10 + (wc - 48);
+                                    if (afterDot == 1) { decs := decs + 1; }
+                                }
+                            }
+                            wi += 1;
+                        }
+                        if (afterDot == 0) { wv := wv * 100; }
+                        if (decs == 1) { wv := wv * 10; }
+                        poke64(curCont + EDI_SF_CONT_WEIGHT, wv);
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // TSR = 84,83,82 → move type
+            if (sfTagIs(seg, 84, 83, 82) == 1 && curCont != 0) {
+                if (n > 0) { poke64(curCont + EDI_SF_CONT_MOVETYPE, sfParseInt(sfEP(elems,0), sfEL(elems,0))); }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — all 9 sea freight message types
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn EdiBaplieWrite(hdr: int64, conts: int64, contCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_SF_HDR_BGMQUAL, EDI_SF_BGM_BAPLIE);
+    var pos: int64 := sfWriteHead(hdr, out, outMax);
+    var i: int64 := 0;
+    while (i < contCount) {
+        pos := sfWriteCont(out, pos, outMax, conts + i * EDI_SF_CONT_SIZE_OFF);
+        i += 1;
+    }
+    pos := sfWriteCnt(out, pos, outMax, contCount);
+    return pos;
+}
+
+pub fn EdiBaplieRead(buf: int64, bufLen: int64, hdr: int64, conts: int64, maxConts: int64): int64 {
+    sfReadHead(buf, bufLen, hdr);
+    return sfReadConts(buf, bufLen, conts, maxConts);
+}
+
+pub fn EdiMovinsWrite(hdr: int64, conts: int64, contCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_SF_HDR_BGMQUAL, EDI_SF_BGM_MOVINS);
+    var pos: int64 := sfWriteHead(hdr, out, outMax);
+    var i: int64 := 0;
+    while (i < contCount) {
+        pos := sfWriteCont(out, pos, outMax, conts + i * EDI_SF_CONT_SIZE_OFF);
+        i += 1;
+    }
+    pos := sfWriteCnt(out, pos, outMax, contCount);
+    return pos;
+}
+
+pub fn EdiMovinsRead(buf: int64, bufLen: int64, hdr: int64, conts: int64, maxConts: int64): int64 {
+    sfReadHead(buf, bufLen, hdr);
+    return sfReadConts(buf, bufLen, conts, maxConts);
+}
+
+pub fn EdiCoparnWrite(hdr: int64, conts: int64, contCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_SF_HDR_BGMQUAL, EDI_SF_BGM_COPARN);
+    var pos: int64 := sfWriteHead(hdr, out, outMax);
+    var i: int64 := 0;
+    while (i < contCount) {
+        pos := sfWriteCont(out, pos, outMax, conts + i * EDI_SF_CONT_SIZE_OFF);
+        i += 1;
+    }
+    pos := sfWriteCnt(out, pos, outMax, contCount);
+    return pos;
+}
+
+pub fn EdiCoparnRead(buf: int64, bufLen: int64, hdr: int64, conts: int64, maxConts: int64): int64 {
+    sfReadHead(buf, bufLen, hdr);
+    return sfReadConts(buf, bufLen, conts, maxConts);
+}
+
+pub fn EdiCodecoWrite(hdr: int64, conts: int64, contCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_SF_HDR_BGMQUAL, EDI_SF_BGM_CODECO);
+    var pos: int64 := sfWriteHead(hdr, out, outMax);
+    var i: int64 := 0;
+    while (i < contCount) {
+        pos := sfWriteCont(out, pos, outMax, conts + i * EDI_SF_CONT_SIZE_OFF);
+        i += 1;
+    }
+    pos := sfWriteCnt(out, pos, outMax, contCount);
+    return pos;
+}
+
+pub fn EdiCodecoRead(buf: int64, bufLen: int64, hdr: int64, conts: int64, maxConts: int64): int64 {
+    sfReadHead(buf, bufLen, hdr);
+    return sfReadConts(buf, bufLen, conts, maxConts);
+}
+
+pub fn EdiCoarriWrite(hdr: int64, conts: int64, contCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_SF_HDR_BGMQUAL, EDI_SF_BGM_COARRI);
+    var pos: int64 := sfWriteHead(hdr, out, outMax);
+    var i: int64 := 0;
+    while (i < contCount) {
+        pos := sfWriteCont(out, pos, outMax, conts + i * EDI_SF_CONT_SIZE_OFF);
+        i += 1;
+    }
+    pos := sfWriteCnt(out, pos, outMax, contCount);
+    return pos;
+}
+
+pub fn EdiCoarriRead(buf: int64, bufLen: int64, hdr: int64, conts: int64, maxConts: int64): int64 {
+    sfReadHead(buf, bufLen, hdr);
+    return sfReadConts(buf, bufLen, conts, maxConts);
+}
+
+pub fn EdiCopinoWrite(hdr: int64, conts: int64, contCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_SF_HDR_BGMQUAL, EDI_SF_BGM_COPINO);
+    var pos: int64 := sfWriteHead(hdr, out, outMax);
+    var i: int64 := 0;
+    while (i < contCount) {
+        pos := sfWriteCont(out, pos, outMax, conts + i * EDI_SF_CONT_SIZE_OFF);
+        i += 1;
+    }
+    pos := sfWriteCnt(out, pos, outMax, contCount);
+    return pos;
+}
+
+pub fn EdiCopinoRead(buf: int64, bufLen: int64, hdr: int64, conts: int64, maxConts: int64): int64 {
+    sfReadHead(buf, bufLen, hdr);
+    return sfReadConts(buf, bufLen, conts, maxConts);
+}
+
+pub fn EdiCoprarWrite(hdr: int64, conts: int64, contCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_SF_HDR_BGMQUAL, EDI_SF_BGM_COPRAR);
+    var pos: int64 := sfWriteHead(hdr, out, outMax);
+    var i: int64 := 0;
+    while (i < contCount) {
+        pos := sfWriteCont(out, pos, outMax, conts + i * EDI_SF_CONT_SIZE_OFF);
+        i += 1;
+    }
+    pos := sfWriteCnt(out, pos, outMax, contCount);
+    return pos;
+}
+
+pub fn EdiCoprarRead(buf: int64, bufLen: int64, hdr: int64, conts: int64, maxConts: int64): int64 {
+    sfReadHead(buf, bufLen, hdr);
+    return sfReadConts(buf, bufLen, conts, maxConts);
+}
+
+pub fn EdiVermasWrite(hdr: int64, conts: int64, contCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_SF_HDR_BGMQUAL, EDI_SF_BGM_VERMAS);
+    var pos: int64 := sfWriteHead(hdr, out, outMax);
+    var i: int64 := 0;
+    while (i < contCount) {
+        pos := sfWriteCont(out, pos, outMax, conts + i * EDI_SF_CONT_SIZE_OFF);
+        i += 1;
+    }
+    pos := sfWriteCnt(out, pos, outMax, contCount);
+    return pos;
+}
+
+pub fn EdiVermasRead(buf: int64, bufLen: int64, hdr: int64, conts: int64, maxConts: int64): int64 {
+    sfReadHead(buf, bufLen, hdr);
+    return sfReadConts(buf, bufLen, conts, maxConts);
+}
+
+pub fn EdiHanmovWrite(hdr: int64, conts: int64, contCount: int64, out: int64, outMax: int64): int64 {
+    poke64(hdr + EDI_SF_HDR_BGMQUAL, EDI_SF_BGM_HANMOV);
+    var pos: int64 := sfWriteHead(hdr, out, outMax);
+    var i: int64 := 0;
+    while (i < contCount) {
+        pos := sfWriteCont(out, pos, outMax, conts + i * EDI_SF_CONT_SIZE_OFF);
+        i += 1;
+    }
+    pos := sfWriteCnt(out, pos, outMax, contCount);
+    return pos;
+}
+
+pub fn EdiHanmovRead(buf: int64, bufLen: int64, hdr: int64, conts: int64, maxConts: int64): int64 {
+    sfReadHead(buf, bufLen, hdr);
+    return sfReadConts(buf, bufLen, conts, maxConts);
+}

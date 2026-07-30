@@ -1,0 +1,382 @@
+// Lyx Bluetooth Library — std/hardware/bluetooth_l2cap.lyx
+//
+// WP-4: BLE L2CAP + ATT-Protokoll
+//
+// L2CAP (Logical Link Control and Adaptation Protocol) ist die Transportschicht
+// für BLE. Darüber läuft das ATT-Protokoll (Attribute Protocol), das die
+// Grundlage für GATT (Generic Attribute Profile) bildet.
+//
+// Paketformat ATT:
+//   [opcode: 1 Byte] [payload: 0..MTU-1 Bytes]
+//   Standard-MTU = 23 Bytes → max. 22 Bytes Nutzdaten
+//
+// Ablauf BLE-Client:
+//   fd := L2CapConnect(bdaddr, BT_PSM_ATT, BDADDR_LE_PUBLIC)
+//   L2CapSetMtu(fd, 23)           // optional: MTU auf 23 setzen
+//   newMtu := AttExchangeMtu(fd, 517)
+//   data := AttReadChar(fd, handle, buf, bufLen)
+//   AttWriteChar(fd, handle, data, dataLen)
+//   // Notifications empfangen in Schleife
+//   L2CapClose(fd)
+
+unit std.hardware.bluetooth_l2cap;
+
+import std.hardware.bluetooth_types;
+import std.alloc;
+
+// ============================================================================
+// ATT-Protokoll-Opcodes (Attribute Protocol, BT Core Spec 5.x Vol 3 Part F)
+// ============================================================================
+
+pub con ATT_OP_ERROR_RSP:        int64 := 1;    // 0x01
+pub con ATT_OP_MTU_REQ:          int64 := 2;    // 0x02
+pub con ATT_OP_MTU_RSP:          int64 := 3;    // 0x03
+pub con ATT_OP_FIND_INFO_REQ:    int64 := 4;    // 0x04
+pub con ATT_OP_FIND_INFO_RSP:    int64 := 5;    // 0x05
+pub con ATT_OP_READ_BY_TYPE_REQ: int64 := 8;    // 0x08
+pub con ATT_OP_READ_BY_TYPE_RSP: int64 := 9;    // 0x09
+pub con ATT_OP_READ_REQ:         int64 := 10;   // 0x0A
+pub con ATT_OP_READ_RSP:         int64 := 11;   // 0x0B
+pub con ATT_OP_READ_BLOB_REQ:    int64 := 12;   // 0x0C
+pub con ATT_OP_READ_BLOB_RSP:    int64 := 13;   // 0x0D
+pub con ATT_OP_READ_BY_GROUP_TYPE_REQ: int64 := 16;  // 0x10
+pub con ATT_OP_READ_BY_GROUP_TYPE_RSP: int64 := 17;  // 0x11
+pub con ATT_OP_WRITE_REQ:        int64 := 18;   // 0x12
+pub con ATT_OP_WRITE_RSP:        int64 := 19;   // 0x13
+pub con ATT_OP_HANDLE_VALUE_NTF: int64 := 27;   // 0x1B — Notification (kein ACK)
+pub con ATT_OP_HANDLE_VALUE_IND: int64 := 29;   // 0x1D — Indication (ACK nötig)
+pub con ATT_OP_HANDLE_VALUE_CFM: int64 := 30;   // 0x1E — Confirmation für IND
+pub con ATT_OP_WRITE_CMD:        int64 := 82;   // 0x52 — Write without response
+
+// ATT-Fehlercodes (im Error-Response-Paket)
+pub con ATT_ERR_INVALID_HANDLE:     int64 := 1;
+pub con ATT_ERR_READ_NOT_PERMITTED:  int64 := 2;
+pub con ATT_ERR_WRITE_NOT_PERMITTED: int64 := 3;
+pub con ATT_ERR_ATTR_NOT_FOUND:     int64 := 10;
+pub con ATT_ERR_INSUFFICIENT_AUTH:  int64 := 5;
+pub con ATT_ERR_INSUFFICIENT_ENC:   int64 := 15;
+
+// MTU-Konstanten
+pub con ATT_DEFAULT_MTU:  int64 := 23;   // Standard BLE ATT MTU
+pub con ATT_MAX_PAYLOAD:  int64 := 22;   // ATT_DEFAULT_MTU - 1 (Opcode-Byte)
+pub con ATT_MAX_MTU:      int64 := 517;  // Maximum negotiierbare MTU
+
+// ============================================================================
+// WP-4.1: L2CapConnect — BLE L2CAP-Verbindung aufbauen
+//
+// bdaddr:   Remote-Bluetooth-Adresse (aus BTStrToAddr)
+// psm:      Protocol Service Multiplexer (BT_PSM_ATT = 31 für GATT)
+// addrType: BDADDR_LE_PUBLIC (1) oder BDADDR_LE_RANDOM (2)
+// Rückgabe: Socket-FD (≥ 0) oder -1 bei Fehler
+// ============================================================================
+pub fn L2CapConnect(bdaddr: int64, psm: int64, addrType: int64): int64 {
+  // SOCK_SEQPACKET = 5 für L2CAP (paketsicher, in-order)
+  var fd: int64 := sys_socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
+  if (fd < 0) { return -1; }
+
+  var buf: int64 := alloc(BT_SOCKADDR_L2_SIZE);
+  if (buf == 0) { sys_close(fd); return -1; }
+
+  BTSockAddrL2Create(buf, psm, bdaddr, addrType);
+
+  var ret: int64 := sys_connect(fd, buf, BT_SOCKADDR_L2_SIZE);
+  free(buf, BT_SOCKADDR_L2_SIZE);
+
+  if (ret < 0) { sys_close(fd); return -1; }
+  return fd;
+}
+
+// ============================================================================
+// L2CapListen — L2CAP-Server starten (für eigene BLE-Services)
+//
+// psm:     lokaler PSM (> 0x1000 für dynamisch zugeordnete PSMs)
+// backlog: max. Länge der Warteschlange
+// Rückgabe: Listening-FD oder -1
+// ============================================================================
+pub fn L2CapListen(psm: int64, backlog: int64): int64 {
+  var fd: int64 := sys_socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
+  if (fd < 0) { return -1; }
+
+  var buf: int64 := alloc(BT_SOCKADDR_L2_SIZE);
+  if (buf == 0) { sys_close(fd); return -1; }
+
+  BTSockAddrL2Create(buf, psm, 0, BDADDR_BREDR);
+
+  var ret: int64 := sys_bind(fd, buf, BT_SOCKADDR_L2_SIZE);
+  free(buf, BT_SOCKADDR_L2_SIZE);
+  if (ret < 0) { sys_close(fd); return -1; }
+
+  ret := sys_listen(fd, backlog);
+  if (ret < 0) { sys_close(fd); return -1; }
+  return fd;
+}
+
+// ============================================================================
+// L2CapSetMtu — Input-MTU setzen (vor connect)
+//
+// Setzt L2CAP_IMTU via setsockopt. Standard ATT-MTU = 23 Bytes.
+// Muss vor sys_connect gesetzt werden um zu wirken.
+// ============================================================================
+pub fn L2CapSetMtu(fd: int64, imtu: int64): int64 {
+  var optBuf: int64 := alloc(2);
+  if (optBuf == 0) { return -1; }
+  poke16(optBuf, imtu);
+  var ret: int64 := sys_setsockopt(fd, SOL_L2CAP, L2CAP_IMTU, optBuf, 2);
+  free(optBuf, 2);
+  return ret;
+}
+
+// ============================================================================
+// L2CapClose — Socket schließen
+// ============================================================================
+pub fn L2CapClose(fd: int64): int64 {
+  return sys_close(fd);
+}
+
+// ============================================================================
+// L2CapPoll — auf Daten / Ereignisse warten
+//
+// Rückgabe: 1 = Daten verfügbar, 0 = Timeout, -1 = Fehler / Abbruch
+// ============================================================================
+pub fn L2CapPoll(fd: int64, timeoutMs: int64): int64 {
+  var pfd: int64 := alloc(8);
+  if (pfd == 0) { return -1; }
+  BTPollFdSet(pfd, fd, POLLIN);
+  var ret: int64 := sys_poll(pfd, 1, timeoutMs);
+  var revents: int64 := BTPollFdRevents(pfd);
+  free(pfd, 8);
+  if (ret < 0) { return -1; }
+  if (ret == 0) { return 0; }
+  if ((revents & POLLHUP) != 0 || (revents & POLLERR) != 0) { return -1; }
+  if ((revents & POLLIN) != 0) { return 1; }
+  return 0;
+}
+
+// ============================================================================
+// WP-4.2: AttSend — ATT-Paket senden
+//
+// opcode:     ATT-Opcode (ATT_OP_*)
+// payload:    Zeiger auf Nutzdaten (darf 0 sein wenn payloadLen = 0)
+// payloadLen: Länge der Nutzdaten (max. ATT_MAX_PAYLOAD = 22)
+// Rückgabe:   gesendete Gesamtbytes oder -1 bei Fehler
+// ============================================================================
+pub fn AttSend(fd: int64, opcode: int64, payload: int64, payloadLen: int64): int64 {
+  if (payloadLen > ATT_MAX_PAYLOAD) { payloadLen := ATT_MAX_PAYLOAD; }
+  var pktLen: int64 := 1 + payloadLen;
+  var pkt: int64 := alloc(pktLen);
+  if (pkt == 0) { return -1; }
+
+  poke8(pkt, opcode);
+  var i: int64 := 0;
+  while (i < payloadLen) {
+    poke8(pkt + 1 + i, peek8(payload + i));
+    i += 1;
+  }
+
+  var ret: int64 := sys_sendto(fd, pkt, pktLen, 0, 0, 0);
+  free(pkt, pktLen);
+  return ret;
+}
+
+// ============================================================================
+// WP-4.3: AttRecv — ATT-Paket empfangen
+//
+// opcodeOut: Zeiger auf int64, der den Opcode aufnimmt (0 = ignorieren)
+// dataBuf:   Zeiger auf Empfangspuffer für Nutzdaten
+// bufLen:    max. zu kopierende Nutzdaten-Bytes
+// Rückgabe:  Anzahl kopierter Nutzdaten-Bytes, 0 bei leerem Paket, -1 bei Fehler
+// ============================================================================
+pub fn AttRecv(fd: int64, opcodeOut: int64, dataBuf: int64, bufLen: int64): int64 {
+  var recvBuf: int64 := alloc(ATT_DEFAULT_MTU);
+  if (recvBuf == 0) { return -1; }
+
+  var n: int64 := sys_recvfrom(fd, recvBuf, ATT_DEFAULT_MTU, 0, 0, 0);
+  if (n <= 0) { free(recvBuf, ATT_DEFAULT_MTU); return -1; }
+
+  if (opcodeOut != 0) { poke64(opcodeOut, peek8(recvBuf)); }
+
+  var payloadLen: int64 := n - 1;
+  if (payloadLen > bufLen) { payloadLen := bufLen; }
+  var i: int64 := 0;
+  while (i < payloadLen) {
+    poke8(dataBuf + i, peek8(recvBuf + 1 + i));
+    i += 1;
+  }
+
+  free(recvBuf, ATT_DEFAULT_MTU);
+  return payloadLen;
+}
+
+// ============================================================================
+// AttExchangeMtu — MTU-Austausch (ATT_OP_MTU_REQ + ATT_OP_MTU_RSP)
+//
+// clientMtu:  gewünschte Client-MTU (z.B. ATT_MAX_MTU = 517)
+// Rückgabe:   ausgehandelte Server-MTU oder ATT_DEFAULT_MTU bei Fehler
+// ============================================================================
+pub fn AttExchangeMtu(fd: int64, clientMtu: int64): int64 {
+  // MTU-Request: payload = 2-Byte-LE-MTU
+  var payload: int64 := alloc(2);
+  if (payload == 0) { return ATT_DEFAULT_MTU; }
+  poke8(payload,     clientMtu & 0xFF);
+  poke8(payload + 1, (clientMtu >> 8) & 0xFF);
+  var ret: int64 := AttSend(fd, ATT_OP_MTU_REQ, payload, 2);
+  free(payload, 2);
+  if (ret < 0) { return ATT_DEFAULT_MTU; }
+
+  // MTU-Response lesen
+  var rspBuf: int64 := alloc(4);
+  if (rspBuf == 0) { return ATT_DEFAULT_MTU; }
+  var opcode: int64 := 0;
+  var rspLen: int64 := AttRecv(fd, rspBuf, rspBuf + 8, 2);
+  // opcodeOut auf rspBuf zeigen würde crashen — besser inline:
+  var recvBuf2: int64 := alloc(ATT_DEFAULT_MTU);
+  free(rspBuf, 4);
+  if (recvBuf2 == 0) { return ATT_DEFAULT_MTU; }
+  var n: int64 := sys_recvfrom(fd, recvBuf2, ATT_DEFAULT_MTU, 0, 0, 0);
+  if (n < 3) { free(recvBuf2, ATT_DEFAULT_MTU); return ATT_DEFAULT_MTU; }
+  var rcvOpcode: int64 := peek8(recvBuf2);
+  var serverMtu: int64 := ATT_DEFAULT_MTU;
+  if (rcvOpcode == ATT_OP_MTU_RSP) {
+    serverMtu := peek8(recvBuf2 + 1) | (peek8(recvBuf2 + 2) << 8);
+    if (serverMtu < ATT_DEFAULT_MTU) { serverMtu := ATT_DEFAULT_MTU; }
+  }
+  free(recvBuf2, ATT_DEFAULT_MTU);
+  return serverMtu;
+}
+
+// ============================================================================
+// WP-4.4: AttReadChar — vollständiger Read-Request/Response-Zyklus
+//
+// handle:  Charakteristik-Handle (uint16, little-endian in Paket)
+// dataBuf: Zeiger auf Empfangspuffer
+// bufLen:  max. Puffergröße
+// Rückgabe: Anzahl empfangener Datenbytes oder -1 bei Fehler / ATT-Error
+// ============================================================================
+pub fn AttReadChar(fd: int64, handle: int64, dataBuf: int64, bufLen: int64): int64 {
+  // Read-Request: 2-Byte-Handle little-endian
+  var req: int64 := alloc(2);
+  if (req == 0) { return -1; }
+  poke8(req,     handle & 0xFF);
+  poke8(req + 1, (handle >> 8) & 0xFF);
+  var ret: int64 := AttSend(fd, ATT_OP_READ_REQ, req, 2);
+  free(req, 2);
+  if (ret < 0) { return -1; }
+
+  // Read-Response lesen
+  var recvBuf: int64 := alloc(ATT_DEFAULT_MTU);
+  if (recvBuf == 0) { return -1; }
+  var n: int64 := sys_recvfrom(fd, recvBuf, ATT_DEFAULT_MTU, 0, 0, 0);
+  if (n <= 0) { free(recvBuf, ATT_DEFAULT_MTU); return -1; }
+
+  var opcode: int64 := peek8(recvBuf);
+  var result: int64 := -1;
+  if (opcode == ATT_OP_READ_RSP) {
+    var payLen: int64 := n - 1;
+    if (payLen > bufLen) { payLen := bufLen; }
+    var i: int64 := 0;
+    while (i < payLen) { poke8(dataBuf + i, peek8(recvBuf + 1 + i)); i := i + 1; }
+    result := payLen;
+  }
+  // ATT_OP_ERROR_RSP → result bleibt -1
+
+  free(recvBuf, ATT_DEFAULT_MTU);
+  return result;
+}
+
+// ============================================================================
+// AttWriteChar — Write-Request (mit Antwort)
+//
+// handle:  Charakteristik-Handle
+// data:    zu schreibende Daten
+// dataLen: Länge (max. ATT_MAX_PAYLOAD - 2 = 20 Bytes)
+// Rückgabe: 0 = OK (Write-Response empfangen), -1 = Fehler
+// ============================================================================
+pub fn AttWriteChar(fd: int64, handle: int64, data: int64, dataLen: int64): int64 {
+  var maxData: int64 := ATT_MAX_PAYLOAD - 2;  // 2 Bytes für Handle
+  if (dataLen > maxData) { dataLen := maxData; }
+
+  var plen: int64 := 2 + dataLen;
+  var payload: int64 := alloc(plen);
+  if (payload == 0) { return -1; }
+  poke8(payload,     handle & 0xFF);
+  poke8(payload + 1, (handle >> 8) & 0xFF);
+  var i: int64 := 0;
+  while (i < dataLen) { poke8(payload + 2 + i, peek8(data + i)); i := i + 1; }
+
+  var ret: int64 := AttSend(fd, ATT_OP_WRITE_REQ, payload, plen);
+  free(payload, plen);
+  if (ret < 0) { return -1; }
+
+  // Write-Response lesen (1 Byte Opcode, kein Payload)
+  var rsp: int64 := alloc(4);
+  if (rsp == 0) { return -1; }
+  var n: int64 := sys_recvfrom(fd, rsp, 4, 0, 0, 0);
+  var ok: int64 := -1;
+  if (n > 0 && peek8(rsp) == ATT_OP_WRITE_RSP) { ok := 0; }
+  free(rsp, 4);
+  return ok;
+}
+
+// ============================================================================
+// AttWriteCmd — Write Command (ohne Antwort, schneller)
+//
+// handle:  Charakteristik-Handle
+// data:    zu schreibende Daten
+// dataLen: Länge (max. 20 Bytes)
+// Rückgabe: gesendete Bytes oder -1
+// ============================================================================
+pub fn AttWriteCmd(fd: int64, handle: int64, data: int64, dataLen: int64): int64 {
+  var maxData: int64 := ATT_MAX_PAYLOAD - 2;
+  if (dataLen > maxData) { dataLen := maxData; }
+
+  var plen: int64 := 2 + dataLen;
+  var payload: int64 := alloc(plen);
+  if (payload == 0) { return -1; }
+  poke8(payload,     handle & 0xFF);
+  poke8(payload + 1, (handle >> 8) & 0xFF);
+  var i: int64 := 0;
+  while (i < dataLen) { poke8(payload + 2 + i, peek8(data + i)); i := i + 1; }
+
+  var ret: int64 := AttSend(fd, ATT_OP_WRITE_CMD, payload, plen);
+  free(payload, plen);
+  return ret;
+}
+
+// ============================================================================
+// AttRecvNotification — ATT_HANDLE_VALUE_NTF empfangen
+//
+// handleOut: Zeiger auf int64 für den Handle (0 = ignorieren)
+// dataBuf:   Zeiger auf Nutzdaten-Puffer
+// bufLen:    max. Puffergröße
+// Rückgabe:  Nutzdaten-Bytes oder -1 (Fehler / kein Notification-Paket)
+// ============================================================================
+pub fn AttRecvNotification(fd: int64, handleOut: int64, dataBuf: int64, bufLen: int64): int64 {
+  var recvBuf: int64 := alloc(ATT_DEFAULT_MTU);
+  if (recvBuf == 0) { return -1; }
+  var n: int64 := sys_recvfrom(fd, recvBuf, ATT_DEFAULT_MTU, 0, 0, 0);
+  if (n < 3) { free(recvBuf, ATT_DEFAULT_MTU); return -1; }
+
+  var opcode: int64 := peek8(recvBuf);
+  if (opcode != ATT_OP_HANDLE_VALUE_NTF && opcode != ATT_OP_HANDLE_VALUE_IND) {
+    free(recvBuf, ATT_DEFAULT_MTU);
+    return -1;
+  }
+
+  // Handle aus Bytes 1–2 (little-endian)
+  var handle: int64 := peek8(recvBuf + 1) | (peek8(recvBuf + 2) << 8);
+  if (handleOut != 0) { poke64(handleOut, handle); }
+
+  // Nutzlast ab Byte 3
+  var payLen: int64 := n - 3;
+  if (payLen > bufLen) { payLen := bufLen; }
+  var i: int64 := 0;
+  while (i < payLen) { poke8(dataBuf + i, peek8(recvBuf + 3 + i)); i := i + 1; }
+
+  // ATT_OP_HANDLE_VALUE_IND erfordert Confirmation
+  if (opcode == ATT_OP_HANDLE_VALUE_IND) {
+    AttSend(fd, ATT_OP_HANDLE_VALUE_CFM, 0, 0);
+  }
+
+  free(recvBuf, ATT_DEFAULT_MTU);
+  return payLen;
+}

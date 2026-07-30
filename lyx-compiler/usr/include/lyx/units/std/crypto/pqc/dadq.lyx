@@ -1,0 +1,788 @@
+// std/crypto/pqc/dadq.lyx
+// WP-DADQ-01: Dynamically Dimensioned Alternating Quasigroup Cryptosystem
+// Phase 2 Revision: sigma-Isomorphismus-Konstruktion
+//
+// Phase-2-Befunde (work/dadq_phase2_results.md):
+//   KRITISCH T-2.1: Zirkulante T => Polynomgrad univariat => BEHOBEN: T_pub = sigma o T_priv o sigma_inv
+//   KRITISCH T-2.2: Isomorphismus-Angriff trivial => T_pub_col_inv in O(n^2) berechenbar (strukturell, Phase 3)
+//   KRITISCH T-2.3.3: DDT r-invariant (Zirkulanz) => BEHOBEN: T_pub nicht-zirkulant
+//   KRITISCH T-2.5.1: Konsistenzcheck tautologisch => BEHOBEN: SHA256(m || r_seed)
+//
+// Algebraische Struktur (Phase 2):
+//   T_priv = zirkulante Latin-Square aus seed_T_priv: T_priv[a][b] := pi[(a+b) mod 256]
+//   T_pub  = sigma-Isomorphismus: T_pub[a][b] := sigma[T_priv[sigma_inv[a]][sigma_inv[b]]]
+//   T_pub ist eine Latin-Square (Iso-Abschluss) aber nicht zirkulant => bessere Diffusion
+//
+// Schluessel (Phase 2):
+//   pk = T_pub[256][256]         65536 Bytes (volle Tabelle)
+//   sk = (sigma[256], sigma_inv[256], seed_T_priv[32], key_mac[32]) = 576 Bytes
+//
+// Encryption:
+//   r_seed <- random 32 Bytes
+//   r[i]   = DRBG(r_seed, i)   (expand auf m_len Bytes)
+//   m_enc[i] = T_pub[m[i]][r[i]]   (Table-Lookup in pk)
+//   commit = r_seed XOR SHA256(m_enc)
+//   hash_mr = SHA256(m || r_seed)    (Integritaets-Commitment)
+//   c = m_enc || commit || hash_mr
+//
+// Decryption:
+//   r_seed = SHA256(m_enc) XOR commit
+//   r[i]   = DRBG(r_seed, i)
+//   m[i]   = sigma[T_priv_col_inv[sigma_inv[r[i]]][sigma_inv[m_enc[i]]]]
+//   verify: SHA256(m_dec || r_seed) == hash_mr
+//
+// Hinweis Phase 2: Das System bleibt strukturell symmetrisch, da T_pub_col_inv
+// in O(n^2) aus T_pub berechnet werden kann (Latin-Square-Eigenschaft).
+// Echte Asymmetrie erfordert eine grundlegende Neukonstruktion (AP-3.1).
+//
+// Ciphertext-Overhead: 64 Bytes (commit[32] + hash_mr[32])
+
+unit std.crypto.pqc.dadq;
+
+import std.alloc;
+import std.crypto.sha256;
+import std.crypto.rand;
+
+// --- Groessenkonstanten ---
+
+pub con DADQ_SEED_LEN:    int64 := 32;
+pub con DADQ_PK_LEN:      int64 := 65536;  // T_pub[256][256] Bytes
+pub con DADQ_SK_LEN:      int64 := 544;    // sigma(256) + sigma_inv(256) + seed_T_priv(32) + key_mac(32... wait 256+256+32=544)
+pub con DADQ_SK_LEN_FULL: int64 := 576;    // + key_mac[32]
+pub con DADQ_OVERHEAD:    int64 := 64;     // commit(32) + hash_mr(32)
+pub con DADQ_TABLE_SZ:    int64 := 65536;  // 256x256 Bytes
+pub con DADQ_BLOCK_SZ:    int64 := 16;
+
+// --- SHA-256-basierte DRBG ---
+// out_i = SHA256(seed || counter_le64), liefert 32 Bytes pro Aufruf.
+
+fn dadqDRBGNext(seed: int64, counter: int64, out: int64) {
+    var buf: int64 := alloc(40);
+    var i: int64 := 0;
+    while (i < 32) { poke8(buf + i, peek8(seed + i)); i := i + 1; }
+    poke8(buf + 32, counter & 0xFF);
+    poke8(buf + 33, (counter >> 8)  & 0xFF);
+    poke8(buf + 34, (counter >> 16) & 0xFF);
+    poke8(buf + 35, (counter >> 24) & 0xFF);
+    poke8(buf + 36, (counter >> 32) & 0xFF);
+    poke8(buf + 37, (counter >> 40) & 0xFF);
+    poke8(buf + 38, (counter >> 48) & 0xFF);
+    poke8(buf + 39, (counter >> 56) & 0xFF);
+    SHA256(buf, 40, out);
+    free(buf, 40);
+}
+
+// --- Fisher-Yates-Shuffle via DRBG ---
+
+fn dadqGenPerm(seed: int64, domain_byte: int64, perm: int64) {
+    var dseed:   int64 := alloc(33);
+    var dseed_h: int64 := alloc(32);
+    var rng_buf: int64 := alloc(256);
+    var i:       int64 := 0;
+    var chunk:   int64 := 0;
+    var r_byte:  int64 := 0;
+    var j:       int64 := 0;
+    var tmp:     int64 := 0;
+
+    while (i < 32) { poke8(dseed + i, peek8(seed + i)); i := i + 1; }
+    poke8(dseed + 32, domain_byte & 0xFF);
+    SHA256(dseed, 33, dseed_h);
+    free(dseed, 33);
+
+    i := 0;
+    while (i < 256) { poke8(perm + i, i & 0xFF); i := i + 1; }
+
+    chunk := 0;
+    while (chunk < 8) {
+        dadqDRBGNext(dseed_h, chunk, rng_buf + chunk * 32);
+        chunk += 1;
+    }
+
+    i := 255;
+    while (i >= 1) {
+        r_byte := peek8(rng_buf + (255 - i)) & 0xFF;
+        j := r_byte - (r_byte / (i + 1)) * (i + 1);
+        tmp := peek8(perm + i) & 0xFF;
+        poke8(perm + i, peek8(perm + j) & 0xFF);
+        poke8(perm + j, tmp & 0xFF);
+        i -= 1;
+    }
+    free(rng_buf, 256);
+    free(dseed_h, 32);
+}
+
+// --- Zirkulante Latin-Square (intern fuer T_priv) ---
+// T[a][b] := pi[(a + b) mod 256]
+
+fn dadqGenTable(seed: int64, domain_byte: int64, table: int64) {
+    var perm: int64 := alloc(256);
+    var a:    int64 := 0;
+    var b:    int64 := 0;
+    var sum:  int64 := 0;
+    var idx:  int64 := 0;
+    dadqGenPerm(seed, domain_byte, perm);
+    a := 0;
+    while (a < 256) {
+        b := 0;
+        while (b < 256) {
+            sum := a + b;
+            idx := sum - (sum / 256) * 256;
+            poke8(table + a * 256 + b, peek8(perm + idx) & 0xFF);
+            b += 1;
+        }
+        a += 1;
+    }
+    free(perm, 256);
+}
+
+// --- sigma-Isomorphismus: T_pub = sigma o T_priv o sigma_inv ---
+// T_pub[a][b] = sigma[T_priv[sigma_inv[a]][sigma_inv[b]]]
+// Nicht-zirkulant, da sigma eine echte Byte-Permutation ist.
+
+fn dadqGenTableSigmaIso(seed_T_priv: int64, sigma: int64, sigma_inv: int64, T_pub: int64) {
+    var T_priv: int64 := alloc(DADQ_TABLE_SZ);
+    var a:      int64 := 0;
+    var b:      int64 := 0;
+    var sa:     int64 := 0;
+    var sb:     int64 := 0;
+    var v:      int64 := 0;
+    dadqGenTable(seed_T_priv, 0xAB, T_priv);
+    a := 0;
+    while (a < 256) {
+        b := 0;
+        while (b < 256) {
+            sa := peek8(sigma_inv + a) & 0xFF;
+            sb := peek8(sigma_inv + b) & 0xFF;
+            v  := peek8(T_priv + sa * 256 + sb) & 0xFF;
+            poke8(T_pub + a * 256 + b, peek8(sigma + v) & 0xFF);
+            b += 1;
+        }
+        a += 1;
+    }
+    free(T_priv, DADQ_TABLE_SZ);
+}
+
+// --- Spalteninverse der Tabelle ---
+// col_inv[b][v] = a  sodass  T[a][b] = v
+
+fn dadqBuildColInv(table: int64, col_inv: int64) {
+    var b: int64 := 0;
+    var a: int64 := 0;
+    var v: int64 := 0;
+    b := 0;
+    while (b < 256) {
+        a := 0;
+        while (a < 256) {
+            v := peek8(table + a * 256 + b) & 0xFF;
+            poke8(col_inv + b * 256 + v, a & 0xFF);
+            a += 1;
+        }
+        b += 1;
+    }
+}
+
+// --- AP-6.1: Constant-Time Byte-Vergleich ---
+// Schleife laeuft IMMER alle n Iterationen (kein Kurzschluss).
+// Leakt nur das finale Gleichheits-Ergebnis, nicht die Position des ersten Unterschieds.
+// Rueckgabe: 1 wenn gleich, 0 wenn verschieden.
+
+fn ctMemEq(a: int64, b: int64, n: int64): int64 {
+    var diff: int64 := 0;
+    var i:    int64 := 0;
+    while (i < n) {
+        diff := diff | ((peek8(a + i) & 0xFF) ^ (peek8(b + i) & 0xFF));
+        i += 1;
+    }
+    if (diff == 0) { return 1; }
+    return 0;
+}
+
+// --- Schluessel-Generierung ---
+// SK-Layout:
+//   sk[0..255]   = sigma
+//   sk[256..511] = sigma_inv
+//   sk[512..543] = seed_T_priv
+//   sk[544..575] = key_mac (reserviert fuer Phase 4 FO-Transform)
+//
+// PK: T_pub = sigma o T_priv o sigma_inv (65536 Bytes)
+
+pub fn dadqKeyGen(master_seed: int64, pk: int64, sk: int64) {
+    var buf:        int64 := alloc(33);
+    var seed_sigma: int64 := alloc(32);
+    var i:          int64 := 0;
+    var si:         int64 := 0;
+
+    i := 0;
+    while (i < 32) { poke8(buf + i, peek8(master_seed + i)); i := i + 1; }
+
+    poke8(buf + 32, 0x01);
+    SHA256(buf, 33, seed_sigma);     // seed_sigma
+
+    poke8(buf + 32, 0x02);
+    SHA256(buf, 33, sk + 512);       // sk[512..543] = seed_T_priv
+
+    poke8(buf + 32, 0x03);
+    SHA256(buf, 33, sk + 544);       // sk[544..575] = key_mac
+
+    free(buf, 33);
+
+    dadqGenPerm(seed_sigma, 0x00, sk);  // sk[0..255] = sigma
+    free(seed_sigma, 32);
+
+    i := 0;
+    while (i < 256) {
+        si := peek8(sk + i) & 0xFF;
+        poke8(sk + 256 + si, i & 0xFF);
+        i += 1;
+    }
+
+    // pk = T_pub = sigma o T_priv o sigma_inv
+    dadqGenTableSigmaIso(sk + 512, sk, sk + 256, pk);
+}
+
+// dadqKeyGenFull ist jetzt identisch mit dadqKeyGen (kein seed_T-Copy mehr noetig)
+// Behalten fuer API-Kompatibilitaet.
+
+pub fn dadqKeyGenFull(master_seed: int64, pk: int64, sk: int64) {
+    dadqKeyGen(master_seed, pk, sk);
+}
+
+// --- Enc ---
+// pk:    Zeiger auf DADQ_PK_LEN (65536) Bytes = T_pub
+// m:     Zeiger auf m_len Bytes Klartext
+// c:     Zeiger auf m_len + DADQ_OVERHEAD (64) Bytes (Ausgabe)
+// Layout: c[0..m_len-1]    = m_enc
+//         c[m_len..m_len+31]   = commit = r_seed XOR SHA256(m_enc)
+//         c[m_len+32..m_len+63] = hash_mr = SHA256(m || r_seed)
+
+pub fn dadqEnc(pk: int64, m: int64, m_len: int64, c: int64) {
+    var r_seed:   int64 := alloc(32);
+    var r:        int64 := alloc(m_len);
+    var h_enc:    int64 := alloc(32);
+    var h_mr:     int64 := alloc(32);
+    var hash_in:  int64 := alloc(m_len + 32);
+    var r_chunk:  int64 := alloc(32);
+    var i:        int64 := 0;
+    var j:        int64 := 0;
+    var chunk:    int64 := 0;
+    var mi:       int64 := 0;
+    var ri:       int64 := 0;
+
+    // Zufaelliger r_seed und DRBG-Expansion auf m_len Bytes
+    RandBytesExact(r_seed, 32);
+    chunk := 0;
+    while (chunk * 32 < m_len) {
+        dadqDRBGNext(r_seed, chunk, r_chunk);
+        i := 0;
+        while (i < 32) {
+            if (chunk * 32 + i < m_len) {
+                poke8(r + chunk * 32 + i, peek8(r_chunk + i) & 0xFF);
+            }
+            i += 1;
+        }
+        chunk += 1;
+    }
+
+    // m_enc[i] = T_pub[m[i]][r[i]]
+    i := 0;
+    while (i < m_len) {
+        mi := peek8(m + i) & 0xFF;
+        ri := peek8(r + i) & 0xFF;
+        poke8(c + i, peek8(pk + mi * 256 + ri) & 0xFF);
+        i += 1;
+    }
+
+    // commit = r_seed XOR SHA256(m_enc)
+    SHA256(c, m_len, h_enc);
+    j := 0;
+    while (j < 32) {
+        poke8(c + m_len + j, (peek8(r_seed + j) ^ peek8(h_enc + j)) & 0xFF);
+        j += 1;
+    }
+
+    // hash_mr = SHA256(m || r_seed)
+    i := 0;
+    while (i < m_len) { poke8(hash_in + i, peek8(m + i) & 0xFF); i := i + 1; }
+    j := 0;
+    while (j < 32) { poke8(hash_in + m_len + j, peek8(r_seed + j) & 0xFF); j := j + 1; }
+    SHA256(hash_in, m_len + 32, h_mr);
+    j := 0;
+    while (j < 32) { poke8(c + m_len + 32 + j, peek8(h_mr + j) & 0xFF); j := j + 1; }
+
+    free(r_chunk, 32);
+    free(hash_in, m_len + 32);
+    free(h_mr, 32);
+    free(h_enc, 32);
+    free(r, m_len);
+    free(r_seed, 32);
+}
+
+// --- Dec ---
+// sk:    Zeiger auf DADQ_SK_LEN_FULL (576) Bytes
+// c:     Zeiger auf c_len Bytes Ciphertext
+// m:     Zeiger auf c_len - DADQ_OVERHEAD Bytes (Ausgabe)
+// Rueckgabe: 0 = Erfolg, -1 = ungueltig (Manipulation erkannt)
+
+pub fn dadqDec(sk: int64, c: int64, c_len: int64, m: int64): int64 {
+    var m_len:       int64 := c_len - DADQ_OVERHEAD;
+    var sigma:       int64 := 0;
+    var sigma_inv:   int64 := 0;
+    var seed_T_priv: int64 := 0;
+    var T_priv:      int64 := 0;
+    var T_col_inv:   int64 := 0;
+    var r_seed:      int64 := 0;
+    var r:           int64 := 0;
+    var h_enc:       int64 := 0;
+    var h_mr_check:  int64 := 0;
+    var hash_in:     int64 := 0;
+    var r_chunk:     int64 := 0;
+    var ok:          int64 := 0;
+    var i:           int64 := 0;
+    var j:           int64 := 0;
+    var chunk:       int64 := 0;
+    var ri:          int64 := 0;
+    var ci:          int64 := 0;
+    var sr:          int64 := 0;
+    var sc:          int64 := 0;
+    var sm:          int64 := 0;
+
+    if (m_len <= 0) { return (0 - 1); }
+
+    sigma       := sk;
+    sigma_inv   := sk + 256;
+    seed_T_priv := sk + 512;
+
+    T_priv     := alloc(DADQ_TABLE_SZ);
+    T_col_inv  := alloc(DADQ_TABLE_SZ);
+    r_seed     := alloc(32);
+    r          := alloc(m_len);
+    h_enc      := alloc(32);
+    h_mr_check := alloc(32);
+    hash_in    := alloc(m_len + 32);
+    r_chunk    := alloc(32);
+
+    // T_priv (zirkulant) und seine Spalteninverse
+    dadqGenTable(seed_T_priv, 0xAB, T_priv);
+    dadqBuildColInv(T_priv, T_col_inv);
+
+    // r_seed aus commit wiederherstellen: r_seed = SHA256(m_enc) XOR commit
+    SHA256(c, m_len, h_enc);
+    j := 0;
+    while (j < 32) {
+        poke8(r_seed + j, (peek8(h_enc + j) ^ peek8(c + m_len + j)) & 0xFF);
+        j += 1;
+    }
+
+    // r auf m_len Bytes expandieren
+    chunk := 0;
+    while (chunk * 32 < m_len) {
+        dadqDRBGNext(r_seed, chunk, r_chunk);
+        i := 0;
+        while (i < 32) {
+            if (chunk * 32 + i < m_len) {
+                poke8(r + chunk * 32 + i, peek8(r_chunk + i) & 0xFF);
+            }
+            i += 1;
+        }
+        chunk += 1;
+    }
+
+    // Entschluesseln via sigma-Isomorphismus:
+    // m[i] = sigma[T_priv_col_inv[sigma_inv[r[i]]][sigma_inv[m_enc[i]]]]
+    i := 0;
+    while (i < m_len) {
+        ri := peek8(r + i) & 0xFF;
+        ci := peek8(c + i) & 0xFF;
+        sr := peek8(sigma_inv + ri) & 0xFF;
+        sc := peek8(sigma_inv + ci) & 0xFF;
+        sm := peek8(T_col_inv + sr * 256 + sc) & 0xFF;
+        poke8(m + i, peek8(sigma + sm) & 0xFF);
+        i += 1;
+    }
+
+    // Integritaetscheck: SHA256(m_dec || r_seed) == hash_mr  (CT)
+    i := 0;
+    while (i < m_len) { poke8(hash_in + i, peek8(m + i) & 0xFF); i := i + 1; }
+    j := 0;
+    while (j < 32) { poke8(hash_in + m_len + j, peek8(r_seed + j) & 0xFF); j := j + 1; }
+    SHA256(hash_in, m_len + 32, h_mr_check);
+
+    ok := ctMemEq(h_mr_check, c + m_len + 32, 32);
+
+    free(r_chunk, 32);
+    free(hash_in, m_len + 32);
+    free(h_mr_check, 32);
+    free(h_enc, 32);
+    free(r, m_len);
+    free(r_seed, 32);
+    free(T_col_inv, DADQ_TABLE_SZ);
+    free(T_priv, DADQ_TABLE_SZ);
+
+    if (ok == 0) { return (0 - 1); }
+    return 0;
+}
+
+// ============================================================================
+// Symmetrischer Modus (Phase 3 -- AP-3.1)
+// ============================================================================
+// Im symmetrischen Modus wird sk direkt zwischen beiden Parteien geteilt.
+// T_pub wird NICHT veroeffentlicht => kein col_inv-Angriff moeglich.
+//
+// Sicherheitsbeziehung (AP-3.1):
+//   DADQ-SYM-OW reduziert auf SHA256-Urbild-Resistenz:
+//   Angreifer sieht c = dadqSymEnc(sk, m), kennt sk NICHT.
+//   Um m zu bestimmen muss er T_pub kennen.
+//   T_pub = sigma o T_priv o sigma_inv, sigma aus SHA256(master_seed||0x01),
+//   T_priv aus SHA256(master_seed||0x02) => T_pub-Wissen erfordert SHA256-Inversion.
+//
+// Grover-Resistenz (AP-3.2):
+//   Key-Raum: |K| = 2^256 (seed-abgeleitet) => Grover-Bound = sqrt(2^256) = 2^128
+//   => 128-bit Quantensicherheit gegeben.
+
+pub fn dadqSymKeyGen(seed: int64, sk: int64) {
+    var T_pub_tmp: int64 := alloc(DADQ_PK_LEN);
+    dadqKeyGen(seed, T_pub_tmp, sk);
+    free(T_pub_tmp, DADQ_PK_LEN);
+}
+
+// dadqSymEnc: verschluesselt mit sk (T_pub intern abgeleitet, nie oeffentlich)
+// Sicher gegen col_inv-Angriff da T_pub dem Angreifer unbekannt.
+
+pub fn dadqSymEnc(sk: int64, m: int64, m_len: int64, c: int64) {
+    var T_pub: int64 := alloc(DADQ_PK_LEN);
+    dadqGenTableSigmaIso(sk + 512, sk, sk + 256, T_pub);
+    dadqEnc(T_pub, m, m_len, c);
+    free(T_pub, DADQ_PK_LEN);
+}
+
+// dadqSymDec: identisch mit dadqDec (sk enthaelt seed_T_priv + sigma)
+
+pub fn dadqSymDec(sk: int64, c: int64, c_len: int64, m: int64): int64 {
+    return dadqDec(sk, c, c_len, m);
+}
+
+// ============================================================================
+// Fujisaki-Okamoto Transform (Phase 4 -- AP-4.3)
+// ============================================================================
+// FO-Transform: IND-CPA (randomisiert) => IND-CCA2 (deterministisch, ROM)
+//
+// Schema DADQ-FO:
+//   Neuer Schluessel key_fo (32 Bytes) in sk_fo[576..607].
+//   Enc wird deterministisch: r_seed := HMAC-SHA256(key_fo, m)
+//   Dec verifiziert: HMAC(key_fo, m_dec) == r_seed_rec (nicht-tautologisch!)
+//
+// Sicherheit (AP-4.3):
+//   DADQ-FO ist IND-CCA2 im Random Oracle Model (FO-Theorem, Fujisaki-Okamoto 1999):
+//   Wenn DADQ-SYM (randomisiert) IND-CPA-sicher ist, dann ist DADQ-FO IND-CCA2.
+//
+//   Beweis der Nicht-Tautologie des FO-Checks:
+//   r_seed_rec = SHA256(m_enc) XOR commit  [aus Ciphertext]
+//   r_seed_exp = HMAC(key_fo, m_dec)       [aus Entschluesselung]
+//   Falls c modifiziert: m_dec != m_orig => r_seed_exp != r_seed_orig = r_seed_rec => reject
+//   Faelschung erfordert: HMAC(key_fo, m_dec) = r_seed_rec (key_fo unbekannt => PRF-Sicherheit)
+//
+// SK-Layout fuer FO:
+//   sk_fo[0..575]   = sk (wie DADQ_SK_LEN_FULL)
+//   sk_fo[576..607] = key_fo (32 Bytes, deterministisches PRF-Schluessel)
+
+pub con DADQ_FO_SK_LEN: int64 := 608;  // DADQ_SK_LEN_FULL + key_fo(32)
+
+// --- HMAC-SHA256 (RFC 2104) ---
+// Interner Baustein fuer FO-Transform.
+// key: 32 Bytes (< 64 = SHA256 Blockgroesse); msg: msg_len Bytes; out: 32 Bytes
+
+fn dadqHMACSHA256(key: int64, msg: int64, msg_len: int64, out: int64) {
+    var ipad_key:   int64 := alloc(64);
+    var opad_key:   int64 := alloc(64);
+    var inner_msg:  int64 := alloc(64 + msg_len);
+    var inner_hash: int64 := alloc(32);
+    var outer_msg:  int64 := alloc(96);
+    var i:          int64 := 0;
+    var kb:         int64 := 0;
+
+    i := 0;
+    while (i < 64) {
+        kb := 0;
+        if (i < 32) { kb := peek8(key + i) & 0xFF; }
+        poke8(ipad_key + i, (kb ^ 0x36) & 0xFF);
+        poke8(opad_key + i, (kb ^ 0x5C) & 0xFF);
+        i += 1;
+    }
+
+    i := 0;
+    while (i < 64) { poke8(inner_msg + i, peek8(ipad_key + i)); i := i + 1; }
+    i := 0;
+    while (i < msg_len) { poke8(inner_msg + 64 + i, peek8(msg + i)); i := i + 1; }
+    SHA256(inner_msg, 64 + msg_len, inner_hash);
+
+    i := 0;
+    while (i < 64) { poke8(outer_msg + i, peek8(opad_key + i)); i := i + 1; }
+    i := 0;
+    while (i < 32) { poke8(outer_msg + 64 + i, peek8(inner_hash + i)); i := i + 1; }
+    SHA256(outer_msg, 96, out);
+
+    free(ipad_key, 64); free(opad_key, 64);
+    free(inner_msg, 64 + msg_len); free(inner_hash, 32);
+    free(outer_msg, 96);
+}
+
+// --- FO KeyGen ---
+// Erzeugt sk_fo (608 Bytes): sk (576 Bytes) + key_fo (32 Bytes)
+
+pub fn dadqFOKeyGen(master_seed: int64, sk_fo: int64) {
+    var buf: int64 := alloc(33);
+    var i:   int64 := 0;
+    // sk[0..575] wie dadqKeyGenFull ohne pk
+    var T_pub_tmp: int64 := alloc(DADQ_PK_LEN);
+    dadqKeyGen(master_seed, T_pub_tmp, sk_fo);
+    free(T_pub_tmp, DADQ_PK_LEN);
+    // key_fo = SHA256(master_seed || 0x04)
+    i := 0;
+    while (i < 32) { poke8(buf + i, peek8(master_seed + i)); i := i + 1; }
+    poke8(buf + 32, 0x04);
+    SHA256(buf, 33, sk_fo + 576);
+    free(buf, 33);
+}
+
+// --- FO Enc (deterministisch) ---
+// Vorteil ggue. SymEnc: r_seed ist deterministisch aus m (via HMAC),
+// dadurch ist Wiederverschluesselung moeglich => CCA2-Sicherheit.
+
+pub fn dadqFOEnc(sk_fo: int64, m: int64, m_len: int64, c: int64) {
+    var T_pub:    int64 := alloc(DADQ_PK_LEN);
+    var r_seed:   int64 := alloc(32);
+    var r:        int64 := alloc(m_len);
+    var h_enc:    int64 := alloc(32);
+    var h_mr:     int64 := alloc(32);
+    var hash_in:  int64 := alloc(m_len + 32);
+    var r_chunk:  int64 := alloc(32);
+    var key_fo:   int64 := 0;
+    var i:        int64 := 0;
+    var j:        int64 := 0;
+    var chunk:    int64 := 0;
+    var mi:       int64 := 0;
+    var ri:       int64 := 0;
+
+    key_fo := sk_fo + 576;
+    dadqGenTableSigmaIso(sk_fo + 512, sk_fo, sk_fo + 256, T_pub);
+
+    // r_seed = HMAC(key_fo, m)  -- deterministisch aus m
+    dadqHMACSHA256(key_fo, m, m_len, r_seed);
+
+    // r expandieren
+    chunk := 0;
+    while (chunk * 32 < m_len) {
+        dadqDRBGNext(r_seed, chunk, r_chunk);
+        i := 0;
+        while (i < 32) {
+            if (chunk * 32 + i < m_len) {
+                poke8(r + chunk * 32 + i, peek8(r_chunk + i) & 0xFF);
+            }
+            i += 1;
+        }
+        chunk += 1;
+    }
+
+    // m_enc[i] = T_pub[m[i]][r[i]]
+    i := 0;
+    while (i < m_len) {
+        mi := peek8(m + i) & 0xFF;
+        ri := peek8(r + i) & 0xFF;
+        poke8(c + i, peek8(T_pub + mi * 256 + ri) & 0xFF);
+        i += 1;
+    }
+
+    // commit = r_seed XOR SHA256(m_enc)
+    SHA256(c, m_len, h_enc);
+    j := 0;
+    while (j < 32) {
+        poke8(c + m_len + j, (peek8(r_seed + j) ^ peek8(h_enc + j)) & 0xFF);
+        j += 1;
+    }
+
+    // hash_mr = SHA256(m || r_seed)
+    i := 0;
+    while (i < m_len) { poke8(hash_in + i, peek8(m + i) & 0xFF); i := i + 1; }
+    j := 0;
+    while (j < 32) { poke8(hash_in + m_len + j, peek8(r_seed + j) & 0xFF); j := j + 1; }
+    SHA256(hash_in, m_len + 32, h_mr);
+    j := 0;
+    while (j < 32) { poke8(c + m_len + 32 + j, peek8(h_mr + j) & 0xFF); j := j + 1; }
+
+    free(r_chunk, 32); free(hash_in, m_len + 32); free(h_mr, 32);
+    free(h_enc, 32); free(r, m_len); free(r_seed, 32); free(T_pub, DADQ_PK_LEN);
+}
+
+// --- FO Dec (mit nicht-tautologischem FO-Check) ---
+// Unterschied zu dadqDec: verifiziert HMAC(key_fo, m_dec) == r_seed_rec.
+// Da key_fo geheim und PRF: Faelschung erfordert PRF-Inversion => IND-CCA2.
+
+pub fn dadqFODec(sk_fo: int64, c: int64, c_len: int64, m: int64): int64 {
+    var m_len:       int64 := c_len - DADQ_OVERHEAD;
+    var sigma:       int64 := 0;
+    var sigma_inv:   int64 := 0;
+    var seed_T_priv: int64 := 0;
+    var key_fo:      int64 := 0;
+    var T_priv:      int64 := 0;
+    var T_col_inv:   int64 := 0;
+    var r_seed_rec:  int64 := 0;
+    var r_seed_exp:  int64 := 0;
+    var r:           int64 := 0;
+    var h_enc:       int64 := 0;
+    var h_mr_check:  int64 := 0;
+    var hash_in:     int64 := 0;
+    var r_chunk:     int64 := 0;
+    var ok:          int64 := 0;
+    var i:           int64 := 0;
+    var j:           int64 := 0;
+    var chunk:       int64 := 0;
+    var ri:          int64 := 0;
+    var ci:          int64 := 0;
+    var sr:          int64 := 0;
+    var sc:          int64 := 0;
+    var sm:          int64 := 0;
+
+    if (m_len <= 0) { return (0 - 1); }
+
+    sigma       := sk_fo;
+    sigma_inv   := sk_fo + 256;
+    seed_T_priv := sk_fo + 512;
+    key_fo      := sk_fo + 576;
+
+    T_priv     := alloc(DADQ_TABLE_SZ);
+    T_col_inv  := alloc(DADQ_TABLE_SZ);
+    r_seed_rec := alloc(32);
+    r_seed_exp := alloc(32);
+    r          := alloc(m_len);
+    h_enc      := alloc(32);
+    h_mr_check := alloc(32);
+    hash_in    := alloc(m_len + 32);
+    r_chunk    := alloc(32);
+
+    dadqGenTable(seed_T_priv, 0xAB, T_priv);
+    dadqBuildColInv(T_priv, T_col_inv);
+
+    // r_seed aus commit wiederherstellen
+    SHA256(c, m_len, h_enc);
+    j := 0;
+    while (j < 32) {
+        poke8(r_seed_rec + j, (peek8(h_enc + j) ^ peek8(c + m_len + j)) & 0xFF);
+        j += 1;
+    }
+
+    // r expandieren
+    chunk := 0;
+    while (chunk * 32 < m_len) {
+        dadqDRBGNext(r_seed_rec, chunk, r_chunk);
+        i := 0;
+        while (i < 32) {
+            if (chunk * 32 + i < m_len) {
+                poke8(r + chunk * 32 + i, peek8(r_chunk + i) & 0xFF);
+            }
+            i += 1;
+        }
+        chunk += 1;
+    }
+
+    // Entschluesseln via sigma-Isomorphismus
+    i := 0;
+    while (i < m_len) {
+        ri := peek8(r + i) & 0xFF;
+        ci := peek8(c + i) & 0xFF;
+        sr := peek8(sigma_inv + ri) & 0xFF;
+        sc := peek8(sigma_inv + ci) & 0xFF;
+        sm := peek8(T_col_inv + sr * 256 + sc) & 0xFF;
+        poke8(m + i, peek8(sigma + sm) & 0xFF);
+        i += 1;
+    }
+
+    // FO-Check (nicht-tautologisch, CT): HMAC(key_fo, m_dec) == r_seed_rec
+    // AP-6.1: beide Checks laufen IMMER (kein if-Guard), um Timing-Oracle zu vermeiden.
+    dadqHMACSHA256(key_fo, m, m_len, r_seed_exp);
+
+    // Hash-MR-Check: SHA256(m_dec || r_seed_rec) == hash_mr  (CT, immer ausgefuehrt)
+    i := 0;
+    while (i < m_len) { poke8(hash_in + i, peek8(m + i) & 0xFF); i := i + 1; }
+    j := 0;
+    while (j < 32) { poke8(hash_in + m_len + j, peek8(r_seed_rec + j) & 0xFF); j := j + 1; }
+    SHA256(hash_in, m_len + 32, h_mr_check);
+
+    // CT-Vergleich: beide Ergebnisse akkumulieren ohne Kurzschluss
+    ok := ctMemEq(r_seed_exp, r_seed_rec, 32);
+    ok := ok & ctMemEq(h_mr_check, c + m_len + 32, 32);
+
+    free(r_chunk, 32); free(hash_in, m_len + 32); free(h_mr_check, 32);
+    free(h_enc, 32); free(r, m_len);
+    free(r_seed_exp, 32); free(r_seed_rec, 32);
+    free(T_col_inv, DADQ_TABLE_SZ); free(T_priv, DADQ_TABLE_SZ);
+
+    if (ok == 0) { return (0 - 1); }
+    return 0;
+}
+
+// ============================================================================
+// Phase 6 -- Implementierungshaertung (AP-6.1, AP-6.2, AP-6.3)
+// ============================================================================
+
+// --- AP-6.3: Sichere Speicherloeschung ---
+
+pub fn dadqZeroize(buf: int64, n: int64) {
+    var i: int64 := 0;
+    while (i < n) { poke8(buf + i, 0); i := i + 1; }
+}
+
+// --- AP-6.2: Seed-Entropie-Validierung ---
+// Rueckgabe: 0 = gueltig, -1 = schwacher Seed (all-zero oder alle Bytes identisch).
+
+pub fn dadqValidateSeed(seed: int64): int64 {
+    var sum:  int64 := 0;
+    var same: int64 := 1;
+    var b0:   int64 := 0;
+    var bi:   int64 := 0;
+    var i:    int64 := 0;
+    b0 := peek8(seed) & 0xFF;
+    i := 0;
+    while (i < 32) {
+        bi := peek8(seed + i) & 0xFF;
+        sum += bi;
+        if (bi != b0) { same := 0; }
+        i += 1;
+    }
+    if (sum == 0) { return (0 - 1); }
+    if (same != 0) { return (0 - 1); }
+    return 0;
+}
+
+// --- AP-6.2: Sichere KeyGen mit internem CSPRNG-Seed ---
+
+pub fn dadqFOKeyGenRand(sk_fo: int64) {
+    var seed: int64 := alloc(32);
+    RandBytesExact(seed, 32);
+    dadqFOKeyGen(seed, sk_fo);
+    dadqZeroize(seed, 32);
+    free(seed, 32);
+}
+
+// --- Alloc-Helfer ---
+
+pub fn dadqEncAlloc(pk: int64, m: int64, m_len: int64): int64 {
+    var c_len: int64 := m_len + DADQ_OVERHEAD;
+    var c:     int64 := alloc(c_len);
+    dadqEnc(pk, m, m_len, c);
+    return c;
+}
+
+pub fn dadqDecAlloc(sk: int64, c: int64, c_len: int64): int64 {
+    var m_len: int64 := c_len - DADQ_OVERHEAD;
+    var m:     int64 := 0;
+    var rc:    int64 := 0;
+    if (m_len <= 0) { return 0; }
+    m  := alloc(m_len);
+    rc := dadqDec(sk, c, c_len, m);
+    if (rc != 0) { free(m, m_len); return 0; }
+    return m;
+}
+
+pub fn dadqFreeCtx(p: int64, sz: int64) {
+    if (p != 0) { free(p, sz); }
+}

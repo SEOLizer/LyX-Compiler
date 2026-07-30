@@ -1,0 +1,314 @@
+// std/image/tiff.lyx — GRF-05: TIFF Decoder (None + PackBits compression)
+// Supports LE/BE byte order, RGB and Grayscale, 8/16-bit.
+
+@description("TIFF decoder: uncompressed and PackBits, LE/BE byte order")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.image.tiff;
+
+import std.image.core;
+import std.alloc;
+import std.fs;
+
+// TIFF Tag IDs
+con TIFF_TAG_WIDTH:     int64 := 256;
+con TIFF_TAG_HEIGHT:    int64 := 257;
+con TIFF_TAG_BPS:       int64 := 258;  // BitsPerSample
+con TIFF_TAG_COMPRESS:  int64 := 259;
+con TIFF_TAG_PHOTOM:    int64 := 262;  // PhotometricInterpretation
+con TIFF_TAG_STRIPS:    int64 := 273;  // StripOffsets
+con TIFF_TAG_RPS:       int64 := 278;  // RowsPerStrip
+con TIFF_TAG_COUNTS:    int64 := 279;  // StripByteCounts
+con TIFF_TAG_SAMPLESPIX: int64 := 277; // SamplesPerPixel
+
+// TIFF Types
+con TIFF_T_BYTE:  int64 := 1;
+con TIFF_T_SHORT: int64 := 3;
+con TIFF_T_LONG:  int64 := 4;
+
+// Compression
+con TIFF_COMP_NONE:     int64 := 1;
+con TIFF_COMP_PACKBITS: int64 := 32773;
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn tiffGet16(buf: int64, off: int64, bigEndian: int64): int64 {
+    var lo: int64 := peek8(buf + off);
+    var hi: int64 := peek8(buf + off + 1);
+    if (bigEndian != 0) { return (lo << 8) | hi; }
+    return lo | (hi << 8);
+}
+
+fn tiffGet32(buf: int64, off: int64, bigEndian: int64): int64 {
+    var b0: int64 := peek8(buf + off);
+    var b1: int64 := peek8(buf + off + 1);
+    var b2: int64 := peek8(buf + off + 2);
+    var b3: int64 := peek8(buf + off + 3);
+    if (bigEndian != 0) {
+        return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    }
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+// Get tag value (handles SHORT and LONG, value-or-offset field).
+// Returns the value directly if count*typeSize ≤ 4, else reads from offset.
+fn tiffTagValue(buf: int64, bufLen: int64, tagOff: int64, bigEndian: int64): int64 {
+    var ttype:  int64 := tiffGet16(buf, tagOff + 2, bigEndian);
+    var count:  int64 := tiffGet32(buf, tagOff + 4, bigEndian);
+    var valOff: int64 := tagOff + 8;  // position of value/offset field
+
+    var typeSize: int64 := 1;
+    if (ttype == TIFF_T_SHORT) { typeSize := 2; }
+    if (ttype == TIFF_T_LONG)  { typeSize := 4; }
+
+    if (count * typeSize <= 4) {
+        // Value is stored directly in the value field
+        if (ttype == TIFF_T_SHORT) { return tiffGet16(buf, valOff, bigEndian); }
+        if (ttype == TIFF_T_LONG)  { return tiffGet32(buf, valOff, bigEndian); }
+        return peek8(buf + valOff);
+    }
+    // Value is at offset
+    var offset: int64 := tiffGet32(buf, valOff, bigEndian);
+    if (ttype == TIFF_T_SHORT) { return tiffGet16(buf, offset, bigEndian); }
+    if (ttype == TIFF_T_LONG)  { return tiffGet32(buf, offset, bigEndian); }
+    return peek8(buf + offset);
+}
+
+// Get tag array offset (for multi-value tags like StripOffsets).
+fn tiffTagOffset(buf: int64, tagOff: int64, bigEndian: int64, count: int64): int64 {
+    var ttype:    int64 := tiffGet16(buf, tagOff + 2, bigEndian);
+    var cnt:      int64 := tiffGet32(buf, tagOff + 4, bigEndian);
+    var valOff:   int64 := tagOff + 8;
+    var typeSize: int64 := 1;
+    if (ttype == TIFF_T_SHORT) { typeSize := 2; }
+    if (ttype == TIFF_T_LONG)  { typeSize := 4; }
+    if (cnt * typeSize <= 4) { return valOff; }  // value is inline
+    return tiffGet32(buf, valOff, bigEndian);     // value is at this offset in buf
+}
+
+// Read strip value at index i from array at base offset.
+fn tiffStripVal(buf: int64, base: int64, idx: int64, ttype: int64, bigEndian: int64): int64 {
+    if (ttype == TIFF_T_SHORT) { return tiffGet16(buf, base + idx * 2, bigEndian); }
+    if (ttype == TIFF_T_LONG)  { return tiffGet32(buf, base + idx * 4, bigEndian); }
+    return peek8(buf + base + idx);
+}
+
+// Decompress PackBits encoded data into out.
+// Returns bytes written.
+fn tiffPackBits(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64 {
+    var si: int64 := 0;
+    var di: int64 := 0;
+    while (si < srcLen && di < dstMax) {
+        var n: int64 := peek8(src + si);
+        si += 1;
+        // n is signed: if bit 7 is set, it's negative (2's complement)
+        if (n > 127) { n := n - 256; }  // convert to signed int64
+        if (n >= 0) {
+            // Literal run: copy n+1 bytes
+            var ri: int64 := 0;
+            while (ri <= n && si < srcLen && di < dstMax) {
+                poke8(dst + di, peek8(src + si));
+                di += 1;
+                si += 1;
+                ri += 1;
+            }
+        } else if (n > 0 - 128) {
+            // Repeat run: repeat next byte (1-n) times
+            var repeatByte: int64 := peek8(src + si);
+            si += 1;
+            var ri: int64 := 0;
+            var repeatCount: int64 := 1 - n;
+            while (ri < repeatCount && di < dstMax) {
+                poke8(dst + di, repeatByte);
+                di += 1;
+                ri += 1;
+            }
+        }
+        // n == -128: NOP
+    }
+    return di;
+}
+
+// ============================================================================
+// TiffDecode — decode TIFF from memory buffer
+// ============================================================================
+
+pub fn TiffDecode(buf: int64, len: int64, img: int64): int64 {
+    if (len < 8) { return 0; }
+
+    // Byte order check
+    var b0: int64 := peek8(buf);
+    var b1: int64 := peek8(buf + 1);
+    var bigEndian: int64 := 0;
+    if (b0 == 0x49 && b1 == 0x49) { bigEndian := 0; }  // 'II' = LE
+    else if (b0 == 0x4D && b1 == 0x4D) { bigEndian := 1; }  // 'MM' = BE
+    else { return 0; }
+
+    // Magic check: 42
+    var magic: int64 := tiffGet16(buf, 2, bigEndian);
+    if (magic != 42) { return 0; }
+
+    // First IFD offset
+    var ifdOff: int64 := tiffGet32(buf, 4, bigEndian);
+    if (ifdOff + 2 >= len) { return 0; }
+
+    // Read IFD
+    var nTags: int64 := tiffGet16(buf, ifdOff, bigEndian);
+
+    // Extract key fields
+    var w:        int64 := 0;
+    var h:        int64 := 0;
+    var bps:      int64 := 1;
+    var comp:     int64 := TIFF_COMP_NONE;
+    var photom:   int64 := 1;  // default: BlackIsZero
+    var rps:      int64 := 0;  // RowsPerStrip (0 = not set)
+    var nsamples: int64 := 1;
+
+    // Tag offsets for array types
+    var stripOffsTag: int64 := 0;
+    var stripCntTag:  int64 := 0;
+    var stripOffsType: int64 := TIFF_T_LONG;
+    var stripCntType:  int64 := TIFF_T_LONG;
+    var nStrips:      int64 := 0;
+
+    var ti: int64 := 0;
+    while (ti < nTags) {
+        var tagOff: int64 := ifdOff + 2 + ti * 12;
+        var tagId:  int64 := tiffGet16(buf, tagOff, bigEndian);
+        var ttype:  int64 := tiffGet16(buf, tagOff + 2, bigEndian);
+        var count:  int64 := tiffGet32(buf, tagOff + 4, bigEndian);
+
+        if (tagId == TIFF_TAG_WIDTH)      { w        := tiffTagValue(buf, len, tagOff, bigEndian); }
+        if (tagId == TIFF_TAG_HEIGHT)     { h        := tiffTagValue(buf, len, tagOff, bigEndian); }
+        if (tagId == TIFF_TAG_BPS)        { bps      := tiffTagValue(buf, len, tagOff, bigEndian); }
+        if (tagId == TIFF_TAG_COMPRESS)   { comp     := tiffTagValue(buf, len, tagOff, bigEndian); }
+        if (tagId == TIFF_TAG_PHOTOM)     { photom   := tiffTagValue(buf, len, tagOff, bigEndian); }
+        if (tagId == TIFF_TAG_RPS)        { rps      := tiffTagValue(buf, len, tagOff, bigEndian); }
+        if (tagId == TIFF_TAG_SAMPLESPIX) { nsamples := tiffTagValue(buf, len, tagOff, bigEndian); }
+        if (tagId == TIFF_TAG_STRIPS) {
+            stripOffsTag  := tagOff;
+            stripOffsType := ttype;
+            nStrips       := count;
+        }
+        if (tagId == TIFF_TAG_COUNTS) {
+            stripCntTag  := tagOff;
+            stripCntType := ttype;
+        }
+        ti += 1;
+    }
+
+    if (w == 0 || h == 0) { return 0; }
+    if (stripOffsTag == 0) { return 0; }
+    if (comp != TIFF_COMP_NONE && comp != TIFF_COMP_PACKBITS) { return 0; }
+    if (photom != 1 && photom != 2) { return 0; }  // only Gray and RGB
+
+    // Bytes per sample
+    var bytesPerSample: int64 := bps / 8;
+    if (bytesPerSample <= 0) { bytesPerSample := 1; }
+
+    // Channels: 1 for Gray, 3 for RGB
+    var channels: int64 := nsamples;
+
+    var rowBytes: int64 := w * channels * bytesPerSample;
+    if (rps == 0) { rps := h; }
+    var stripRows: int64 := rps;
+
+    // Allocate output
+    var pixLen: int64 := w * h * 4;
+    var pixels: int64 := alloc(pixLen);
+    if (pixels == 0) { return 0; }
+
+    // Decode each strip
+    var stripBase: int64 := tiffTagOffset(buf, stripOffsTag, bigEndian, nStrips);
+    var cntBase:   int64 := 0;
+    if (stripCntTag != 0) {
+        cntBase := tiffTagOffset(buf, stripCntTag, bigEndian, nStrips);
+    }
+
+    var curRow: int64 := 0;
+    var si: int64 := 0;
+    while (si < nStrips && curRow < h) {
+        var stripOff: int64 := tiffStripVal(buf, stripBase, si, stripOffsType, bigEndian);
+        var stripCnt: int64 := rowBytes * stripRows;
+        if (cntBase != 0) {
+            stripCnt := tiffStripVal(buf, cntBase, si, stripCntType, bigEndian);
+        }
+
+        // Decompress strip data
+        var stripRows2: int64 := h - curRow;
+        if (stripRows2 > stripRows) { stripRows2 := stripRows; }
+        var rawSz: int64 := rowBytes * stripRows2;
+
+        var rawData: int64 := alloc(rawSz + 16);
+        if (rawData == 0) { free(pixels, pixLen); return 0; }
+
+        if (comp == TIFF_COMP_NONE) {
+            // Copy directly
+            var ci: int64 := 0;
+            while (ci < rawSz && stripOff + ci < len) {
+                poke8(rawData + ci, peek8(buf + stripOff + ci));
+                ci += 1;
+            }
+        } else {
+            // PackBits decompress
+            tiffPackBits(buf + stripOff, stripCnt, rawData, rawSz + 16);
+        }
+
+        // Convert raw row data to RGBA8
+        var ry: int64 := 0;
+        while (ry < stripRows2) {
+            var rowBase: int64 := rawData + ry * rowBytes;
+            var dstBase: int64 := pixels + (curRow + ry) * w * 4;
+            var rx: int64 := 0;
+            while (rx < w) {
+                var r: int64 := 255;
+                var g: int64 := 255;
+                var b: int64 := 255;
+                var a: int64 := 255;
+                if (photom == 1 || channels == 1) {
+                    // Grayscale: PhotometricInterpretation=1 (BlackIsZero)
+                    var gray: int64 := peek8(rowBase + rx * bytesPerSample);
+                    r := gray; g := gray; b := gray;
+                } else {
+                    // RGB
+                    r := peek8(rowBase + rx * 3 * bytesPerSample);
+                    g := peek8(rowBase + rx * 3 * bytesPerSample + bytesPerSample);
+                    b := peek8(rowBase + rx * 3 * bytesPerSample + bytesPerSample * 2);
+                }
+                poke8(dstBase + rx * 4,     r);
+                poke8(dstBase + rx * 4 + 1, g);
+                poke8(dstBase + rx * 4 + 2, b);
+                poke8(dstBase + rx * 4 + 3, a);
+                rx += 1;
+            }
+            ry += 1;
+        }
+
+        free(rawData, rawSz + 16);
+        curRow += stripRows2;
+        si += 1;
+    }
+
+    poke64(img + GRF_OFF_WIDTH,    w);
+    poke64(img + GRF_OFF_HEIGHT,   h);
+    poke64(img + GRF_OFF_CHANNELS, 4);
+    poke64(img + GRF_OFF_DEPTH,    8);
+    poke64(img + GRF_OFF_FORMAT,   GRF_FMT_TIFF);
+    poke64(img + GRF_OFF_PIXELS,   pixels);
+    poke64(img + GRF_OFF_PIXLEN,   pixLen);
+    return 1;
+}
+
+pub fn TiffDecodeFile(path: int64, plen: int64, img: int64): int64 {
+    var fsize: int64 := FileSize(path);
+    if (fsize <= 0) { return 0; }
+    var buf: int64 := alloc(fsize);
+    if (buf == 0) { return 0; }
+    var n: int64 := ReadFile(path, buf, fsize);
+    var ret: int64 := 0;
+    if (n == fsize) { ret := TiffDecode(buf, fsize, img); }
+    free(buf, fsize);
+    return ret;
+}

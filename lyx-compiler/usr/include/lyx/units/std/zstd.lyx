@@ -1,0 +1,1335 @@
+// std/zstd.lyx — Zstd-Dekompressor (RFC 8878) + Store-Modus-Kompressor
+unit std.zstd;
+
+import std.alloc;
+import std.io;
+import std.string;
+
+pub con ZSTD_OK:       int64 := 0;
+pub con ZSTD_ERR:      int64 := 0 - 1;
+pub con ZSTD_OVERFLOW: int64 := 0 - 2;
+
+// ========================================================================
+// Forward Byte Reader  ZsBR (24 B): [0]=ptr [8]=pos [16]=len
+// ========================================================================
+
+fn zsbrNew(ptr: int64, len: int64): int64 {
+    var br: int64 := alloc(24);
+    poke64(br, ptr); poke64(br + 8, 0); poke64(br + 16, len);
+    return br;
+}
+
+fn zsbrLeft(br: int64): int64 { return peek64(br + 16) - peek64(br + 8); }
+fn zsbrPos(br: int64): int64  { return peek64(br + 8); }
+
+fn zsbrReadU8(br: int64): int64 {
+    var pos: int64 := peek64(br + 8);
+    var val: int64 := peek8(peek64(br) + pos);
+    poke64(br + 8, pos + 1);
+    return val;
+}
+
+fn zsbrReadLE16(br: int64): int64 {
+    var lo: int64 := zsbrReadU8(br);
+    return lo | (zsbrReadU8(br) << 8);
+}
+
+fn zsbrReadLE24(br: int64): int64 {
+    var b0: int64 := zsbrReadU8(br);
+    var b1: int64 := zsbrReadU8(br);
+    return b0 | (b1 << 8) | (zsbrReadU8(br) << 16);
+}
+
+fn zsbrReadLE32(br: int64): int64 {
+    var lo: int64 := zsbrReadLE16(br);
+    return lo | (zsbrReadLE16(br) << 16);
+}
+
+fn zsbrReadLE64(br: int64): int64 {
+    var lo: int64 := zsbrReadLE32(br);
+    return lo | (zsbrReadLE32(br) << 32);
+}
+
+fn zsbrSkip(br: int64, n: int64): void { poke64(br + 8, peek64(br + 8) + n); }
+fn zsbrSeekTo(br: int64, pos: int64): void { poke64(br + 8, pos); }
+
+// ========================================================================
+// Forward Bit Reader  ZsBit (24 B): [0]=ptr [8]=bytePos [16]=bitInByte
+// Bits within a byte are consumed LSB-first (low bit = bit 0)
+// ========================================================================
+
+fn zsBitNew(ptr: int64, bytePos: int64): int64 {
+    var zb: int64 := alloc(24);
+    poke64(zb, ptr); poke64(zb + 8, bytePos); poke64(zb + 16, 0);
+    return zb;
+}
+
+fn zsBitReadOne(zb: int64): int64 {
+    var bpos: int64 := peek64(zb + 8);
+    var bit:  int64 := peek64(zb + 16);
+    var val:  int64 := (peek8(peek64(zb) + bpos) >> bit) & 1;
+    bit += 1;
+    if (bit == 8) { bit := 0; bpos := bpos + 1; }
+    poke64(zb + 8, bpos); poke64(zb + 16, bit);
+    return val;
+}
+
+fn zsBitReadBits(zb: int64, n: int64): int64 {
+    var val: int64 := 0;
+    var i:   int64 := 0;
+    while (i < n) { val := val | (zsBitReadOne(zb) << i); i := i + 1; }
+    return val;
+}
+
+fn zsBitSkipToByte(zb: int64): void {
+    var bit: int64 := peek64(zb + 16);
+    if (bit != 0) { poke64(zb + 8, peek64(zb + 8) + 1); poke64(zb + 16, 0); }
+}
+
+fn zsBitBytePos(zb: int64): int64 { return peek64(zb + 8); }
+
+// ========================================================================
+// Reverse Bit Reader  ZsRevBR (32 B): [0]=ptr [8]=bytePos [16]=curByte [24]=bitInByte
+// Reads from the END of a buffer going backwards, MSB-first within each byte.
+// Last byte has a sentinel 1-bit at its highest set bit.
+// ========================================================================
+
+fn zsRevNew(ptr: int64, len: int64): int64 {
+    var rbr: int64 := alloc(32);
+    var k: int64 := 0;
+    while (k < 32) { poke8(rbr + k, 0); k := k + 1; }
+    poke64(rbr, ptr);
+    if (len == 0) { poke64(rbr + 24, 0 - 1); return rbr; }
+    var lastByte: int64 := peek8(ptr + len - 1);
+    if (lastByte == 0) { poke64(rbr + 24, 0 - 1); return rbr; }
+    // Find highest set bit (= sentinel)
+    var hb: int64 := 7;
+    while (((lastByte >> hb) & 1) == 0) { hb := hb - 1; }
+    poke64(rbr + 8,  len - 1);   // bytePos = last byte index
+    poke64(rbr + 16, lastByte);  // curByte
+    poke64(rbr + 24, hb - 1);   // bitInByte = bit below sentinel (-1 if hb=0)
+    return rbr;
+}
+
+fn zsRevReadBit(rbr: int64): int64 {
+    var bitPos: int64 := peek64(rbr + 24);
+    if (bitPos < 0) {
+        var bpos: int64 := peek64(rbr + 8) - 1;
+        if (bpos < 0) { return 0; }
+        poke64(rbr + 8,  bpos);
+        poke64(rbr + 16, peek8(peek64(rbr) + bpos));
+        poke64(rbr + 24, 7);
+        bitPos := 7;
+    }
+    var val: int64 := (peek64(rbr + 16) >> bitPos) & 1;
+    poke64(rbr + 24, bitPos - 1);
+    return val;
+}
+
+fn zsRevReadBits(rbr: int64, n: int64): int64 {
+    if (n == 0) { return 0; }
+    var val: int64 := 0;
+    var i:   int64 := n - 1;
+    while (i >= 0) { val := val | (zsRevReadBit(rbr) << i); i := i - 1; }
+    return val;
+}
+
+// ========================================================================
+// Helpers
+// ========================================================================
+
+fn zsHighbit(x: int64): int64 {
+    var h: int64 := 0;
+    var v: int64 := x;
+    while (v > 1) { v := v >> 1; h := h + 1; }
+    return h;
+}
+
+fn zsAbs(x: int64): int64 {
+    if (x < 0) { return 0 - x; }
+    return x;
+}
+
+// ========================================================================
+// FSE Table  ZsFSE (16+tableSize*8 B): [0]=AL [8]=entriesBase
+// Entry packed as int64: bits[7:0]=sym  bits[15:8]=nbBits  bits[31:16]=newState
+// ========================================================================
+
+fn zsFSEAlloc(AL: int64): int64 {
+    var sz: int64 := 16 + ((1 << AL) * 8);
+    var tab: int64 := alloc(sz);
+    var k: int64 := 0;
+    while (k < sz) { poke8(tab + k, 0); k := k + 1; }
+    poke64(tab,     AL);
+    poke64(tab + 8, tab + 16);
+    return tab;
+}
+
+fn zsFSEFree(tab: int64): void { if (tab != 0) { free(tab); } }
+
+fn zsFSESym(tab: int64, state: int64): int64 {
+    return peek64(peek64(tab + 8) + state * 8) & 0xFF;
+}
+
+fn zsFSENbBits(tab: int64, state: int64): int64 {
+    return (peek64(peek64(tab + 8) + state * 8) >> 8) & 0xFF;
+}
+
+fn zsFSENewState(tab: int64, state: int64): int64 {
+    return (peek64(peek64(tab + 8) + state * 8) >> 16) & 0xFFFF;
+}
+
+fn zsFSESetEntry(tab: int64, pos: int64, sym: int64, nbBits: int64, newState: int64): void {
+    var entry: int64 := (sym & 0xFF) | ((nbBits & 0xFF) << 8) | ((newState & 0xFFFF) << 16);
+    poke64(peek64(tab + 8) + pos * 8, entry);
+}
+
+// Build FSE decoding table from probability array.
+// probs[i] = probability (-1 means "less probable" = 1 slot)
+fn zsFSEBuild(probs: int64, numProbs: int64, AL: int64): int64 {
+    var tab:       int64 := zsFSEAlloc(AL);
+    var tableSize: int64 := 1 << AL;
+    var tableMask: int64 := tableSize - 1;
+    var step:      int64 := (tableSize >> 1) + (tableSize >> 3) + 3;
+    var highThr:   int64 := tableSize - 1;
+
+    // Temp symbol array
+    var symArr: int64 := alloc(tableSize * 8);
+    var k: int64 := 0;
+    while (k < tableSize) { poke64(symArr + k * 8, 0 - 1); k := k + 1; }
+
+    // Place -1 prob symbols at top
+    var s: int64 := 0;
+    while (s < numProbs) {
+        if (peek64(probs + s * 8) == (0 - 1)) {
+            poke64(symArr + highThr * 8, s);
+            highThr -= 1;
+        }
+        s += 1;
+    }
+
+    // Spread normal symbols
+    var pos: int64 := 0;
+    s := 0;
+    while (s < numProbs) {
+        var p: int64 := peek64(probs + s * 8);
+        if (p > 0) {
+            var j: int64 := 0;
+            while (j < p) {
+                poke64(symArr + pos * 8, s);
+                pos := (pos + step) & tableMask;
+                while (pos > highThr) { pos := (pos + step) & tableMask; }
+                j += 1;
+            }
+        }
+        s += 1;
+    }
+
+    // symbolNext array (starts at prob[s] for each symbol)
+    var symNext: int64 := alloc(numProbs * 8);
+    s := 0;
+    while (s < numProbs) {
+        var p: int64 := peek64(probs + s * 8);
+        if (p > 0) { poke64(symNext + s * 8, p); }
+        else { if (p == (0 - 1)) { poke64(symNext + s * 8, 1); } }
+        s += 1;
+    }
+
+    // Fill nbBits + newState
+    var i: int64 := 0;
+    while (i < tableSize) {
+        var sym: int64 := peek64(symArr + i * 8);
+        if ((sym >= 0) & (sym < numProbs)) {
+            var ns: int64 := peek64(symNext + sym * 8);
+            poke64(symNext + sym * 8, ns + 1);
+            var nbBits:   int64 := AL - zsHighbit(ns);
+            var newState: int64 := (ns << nbBits) - tableSize;
+            zsFSESetEntry(tab, i, sym, nbBits, newState);
+        }
+        i += 1;
+    }
+
+    free(symArr); free(symNext);
+    return tab;
+}
+
+// Read FSE probability table from forward bit reader.
+// probs: pre-allocated int64 array [0..maxSym], filled on return.
+// Returns AL (accuracy log) on success, or -1 on error.
+fn zsReadFSEProbs(zb: int64, maxSym: int64, probs: int64): int64 {
+    var AL: int64 := zsBitReadBits(zb, 4) + 5;
+    var tableSize: int64 := 1 << AL;
+    var remaining: int64 := tableSize + 1;
+    var threshold: int64 := tableSize;
+    var nbBits:    int64 := AL + 1;
+
+    var s: int64 := 0;
+    while (s <= maxSym) { poke64(probs + s * 8, 0); s := s + 1; }
+
+    var charnum: int64 := 0;
+    var prev0:   int64 := 0;
+
+    while ((remaining > 1) & (charnum <= maxSym)) {
+        if (prev0 != 0) {
+            // Zero-run: read pairs of bits
+            var n0: int64 := charnum;
+            var done: int64 := 0;
+            while (done == 0) {
+                var rr: int64 := zsBitReadBits(zb, 2);
+                if (rr == 3) { n0 := n0 + 3; }
+                else { n0 := n0 + rr; done := 1; }
+            }
+            while (charnum < n0) {
+                if (charnum <= maxSym) { poke64(probs + charnum * 8, 0); }
+                charnum += 1;
+            }
+            prev0 := 0;
+        }
+
+        if ((remaining > 1) & (charnum <= maxSym)) {
+            var maxval: int64 := (2 * threshold) - 1 - remaining;
+            var lowPart: int64 := zsBitReadBits(zb, nbBits - 1);
+            var cnt: int64 := 0;
+            if (lowPart < maxval) {
+                cnt := lowPart;
+            } else {
+                var extraBit: int64 := zsBitReadBits(zb, 1);
+                var fullVal:  int64 := lowPart | (extraBit << (nbBits - 1));
+                if (fullVal >= threshold) { cnt := fullVal - maxval; }
+                else { cnt := fullVal; }
+            }
+            cnt -= 1;
+            if (cnt == (0 - 1)) { remaining := remaining - 1; }
+            else { if (cnt > 0) { remaining := remaining - cnt; } }
+            if (charnum <= maxSym) { poke64(probs + charnum * 8, cnt); }
+            charnum += 1;
+            while (remaining < threshold) { threshold := threshold >> 1; nbBits := nbBits - 1; }
+            if (cnt == 0) { prev0 := 1; }
+            else { prev0 := 0; }
+        }
+    }
+    return AL;
+}
+
+// ========================================================================
+// Predefined probability arrays and FSE tables for LL / ML / OFF
+// Default tableLog: LL=6 (sum=64), ML=6 (sum=64), OFF=5 (sum=32)
+// ========================================================================
+
+fn zsLLProb(sym: int64): int64 {
+    if (sym == 0)  { return 4; }
+    if (sym == 1)  { return 3; }
+    if ((sym >= 2)  & (sym <= 8))  { return 2; }
+    if ((sym >= 9)  & (sym <= 15)) { return 1; }
+    if ((sym >= 16) & (sym <= 24)) { return 2; }
+    if (sym == 25) { return 3; }
+    if (sym == 26) { return 2; }
+    if ((sym >= 27) & (sym <= 31)) { return 1; }
+    if ((sym >= 32) & (sym <= 35)) { return 0 - 1; }
+    return 0;
+}
+
+fn zsMLProb(sym: int64): int64 {
+    if (sym == 1) { return 4; }
+    if (sym == 2) { return 3; }
+    if ((sym >= 3) & (sym <= 8)) { return 2; }
+    if ((sym >= 46) & (sym <= 52)) { return 0 - 1; }
+    if ((sym >= 0) & (sym <= 52)) { return 1; }
+    return 0;
+}
+
+fn zsOFFProb(sym: int64): int64 {
+    if ((sym >= 5) & (sym <= 7)) { return 2; }
+    if ((sym >= 24) & (sym <= 28)) { return 0 - 1; }
+    if ((sym >= 0) & (sym <= 28)) { return 1; }
+    return 0;
+}
+
+fn zsLLPredefined(): int64 {
+    var probs: int64 := alloc(36 * 8);
+    var s: int64 := 0;
+    while (s < 36) { poke64(probs + s * 8, zsLLProb(s)); s := s + 1; }
+    var tab: int64 := zsFSEBuild(probs, 36, 6);
+    free(probs);
+    return tab;
+}
+
+fn zsMLPredefined(): int64 {
+    var probs: int64 := alloc(53 * 8);
+    var s: int64 := 0;
+    while (s < 53) { poke64(probs + s * 8, zsMLProb(s)); s := s + 1; }
+    var tab: int64 := zsFSEBuild(probs, 53, 6);
+    free(probs);
+    return tab;
+}
+
+fn zsOFFPredefined(): int64 {
+    var probs: int64 := alloc(29 * 8);
+    var s: int64 := 0;
+    while (s < 29) { poke64(probs + s * 8, zsOFFProb(s)); s := s + 1; }
+    var tab: int64 := zsFSEBuild(probs, 29, 5);
+    free(probs);
+    return tab;
+}
+
+// ========================================================================
+// Literal Length / Match Length code tables
+// ========================================================================
+
+fn zsLLBase(code: int64): int64 {
+    if (code < 16) { return code; }
+    if (code == 16) { return 16; }
+    if (code == 17) { return 18; }
+    if (code == 18) { return 20; }
+    if (code == 19) { return 22; }
+    if (code == 20) { return 24; }
+    if (code == 21) { return 28; }
+    if (code == 22) { return 32; }
+    if (code == 23) { return 40; }
+    if (code == 24) { return 48; }
+    if (code == 25) { return 64; }
+    if (code == 26) { return 128; }
+    if (code == 27) { return 256; }
+    if (code == 28) { return 512; }
+    if (code == 29) { return 1024; }
+    if (code == 30) { return 2048; }
+    if (code == 31) { return 4096; }
+    if (code == 32) { return 8192; }
+    if (code == 33) { return 16384; }
+    if (code == 34) { return 32768; }
+    return 65536;
+}
+
+fn zsLLExtra(code: int64): int64 {
+    if (code < 16) { return 0; }
+    if (code == 16) { return 1; }
+    if (code == 17) { return 1; }
+    if (code == 18) { return 1; }
+    if (code == 19) { return 1; }
+    if (code == 20) { return 2; }
+    if (code == 21) { return 2; }
+    if (code == 22) { return 3; }
+    if (code == 23) { return 3; }
+    if (code == 24) { return 4; }
+    if (code == 25) { return 4; }
+    if (code == 26) { return 5; }
+    if (code == 27) { return 5; }
+    if (code == 28) { return 6; }
+    if (code == 29) { return 7; }
+    if (code == 30) { return 8; }
+    if (code == 31) { return 9; }
+    if (code == 32) { return 10; }
+    if (code == 33) { return 11; }
+    if (code == 34) { return 12; }
+    return 13;
+}
+
+fn zsMLBase(code: int64): int64 {
+    if (code < 32) { return code + 3; }
+    if (code == 32) { return 35; }
+    if (code == 33) { return 37; }
+    if (code == 34) { return 39; }
+    if (code == 35) { return 41; }
+    if (code == 36) { return 43; }
+    if (code == 37) { return 47; }
+    if (code == 38) { return 51; }
+    if (code == 39) { return 59; }
+    if (code == 40) { return 67; }
+    if (code == 41) { return 83; }
+    if (code == 42) { return 99; }
+    if (code == 43) { return 131; }
+    if (code == 44) { return 163; }
+    if (code == 45) { return 227; }
+    if (code == 46) { return 355; }
+    if (code == 47) { return 611; }
+    if (code == 48) { return 1123; }
+    if (code == 49) { return 2147; }
+    if (code == 50) { return 4195; }
+    if (code == 51) { return 8291; }
+    return 16483;
+}
+
+fn zsMLExtra(code: int64): int64 {
+    if (code < 32) { return 0; }
+    if ((code >= 32) & (code <= 35)) { return 1; }
+    if ((code >= 36) & (code <= 37)) { return 2; }
+    if ((code >= 38) & (code <= 39)) { return 3; }
+    if ((code >= 40) & (code <= 41)) { return 4; }
+    if ((code >= 42) & (code <= 43)) { return 5; }
+    if (code == 44) { return 6; }
+    if (code == 45) { return 7; }
+    if (code == 46) { return 8; }
+    if (code == 47) { return 9; }
+    if (code == 48) { return 10; }
+    if (code == 49) { return 11; }
+    if (code == 50) { return 12; }
+    if (code == 51) { return 13; }
+    return 14;
+}
+
+// ========================================================================
+// Huffman Tree  ZsHuff (408 B): same layout as BrHTree
+// [0]=maxLen  [8..135]=firstCode[16]  [136..263]=firstIdx[16]
+// [264..391]=countArr[16]  [392]=symsPtr  [400]=trivialSym
+// ========================================================================
+
+fn zsHuffNew(): int64 {
+    var t: int64 := alloc(408);
+    var k: int64 := 0;
+    while (k < 408) { poke8(t + k, 0); k := k + 1; }
+    poke64(t + 400, 0 - 1);  // trivialSym = -1 (no trivial)
+    return t;
+}
+
+fn zsHuffFree(t: int64): void { if (t != 0) { free(peek64(t + 392)); free(t); } }
+
+// Build canonical Huffman from code-length array.
+// lens[sym] = code length in bits (0 = absent)
+fn zsHuffBuildLens(t: int64, lens: int64, numSyms: int64): void {
+    var maxLen: int64 := 0;
+    var s: int64 := 0;
+    while (s < numSyms) { var l: int64 := peek64(lens + s * 8); if (l > maxLen) { maxLen := l; } s := s + 1; }
+    poke64(t, maxLen);
+    if (maxLen == 0) { return; }
+
+    // Count symbols per length
+    var k: int64 := 0;
+    while (k <= maxLen) { poke64(t + 264 + k * 8, 0); k := k + 1; }
+    s := 0;
+    while (s < numSyms) { var l: int64 := peek64(lens + s * 8); if (l > 0) { poke64(t + 264 + l * 8, peek64(t + 264 + l * 8) + 1); } s := s + 1; }
+
+    // Compute firstCode per length (canonical Huffman)
+    var code: int64 := 0;
+    poke64(t + 8, 0);   // firstCode[0] = 0 (unused)
+    poke64(t + 8 + 8, 0);  // firstCode[1] = 0
+    k := 1;
+    while (k < maxLen) {
+        code := (code + peek64(t + 264 + k * 8)) << 1;
+        poke64(t + 8 + (k + 1) * 8, code);
+        k += 1;
+    }
+
+    // Count total symbols and allocate symsPtr
+    var total: int64 := 0;
+    s := 0;
+    while (s < numSyms) { if (peek64(lens + s * 8) > 0) { total := total + 1; } s := s + 1; }
+
+    if (total == 1) {
+        // Trivial: only one symbol — find it
+        s := 0;
+        while (s < numSyms) { if (peek64(lens + s * 8) > 0) { poke64(t + 400, s); return; } s := s + 1; }
+    }
+
+    var syms: int64 := alloc(total * 8);
+    poke64(t + 392, syms);
+
+    // Build firstIdx and symbols sorted by length
+    var idx: int64 := 0;
+    k := 1;
+    while (k <= maxLen) {
+        poke64(t + 136 + k * 8, idx);
+        s := 0;
+        while (s < numSyms) {
+            if (peek64(lens + s * 8) == k) {
+                poke64(syms + idx * 8, s);
+                idx += 1;
+            }
+            s += 1;
+        }
+        k += 1;
+    }
+}
+
+// Decode one Huffman symbol from a backward bitstream (ZsRevBR).
+fn zsHuffDecSym(t: int64, rbr: int64): int64 {
+    var trivial: int64 := peek64(t + 400);
+    if (trivial >= 0) { return trivial; }
+    var maxLen: int64 := peek64(t);
+    var code: int64 := 0;
+    var l: int64 := 1;
+    while (l <= maxLen) {
+        code := (code << 1) | zsRevReadBit(rbr);
+        var fc: int64 := peek64(t + 8 + l * 8);
+        var cnt: int64 := peek64(t + 264 + l * 8);
+        if ((code >= fc) & (code < fc + cnt)) {
+            var fi: int64 := peek64(t + 136 + l * 8);
+            return peek64(peek64(t + 392) + (fi + code - fc) * 8);
+        }
+        l += 1;
+    }
+    return 0;
+}
+
+// Read Huffman weights from ZsBit forward reader.
+// weights[i] = code length for symbol i (0 = absent)
+// Returns number of symbols or 0 on error.
+// Format: header byte -> if >= 128: direct (header-127 symbols, 4 bits each, packed 2/byte)
+//                        if < 128: FSE-compressed weights (header = compressed size)
+fn zsReadHuffWeights(br: int64, ptr: int64, weights: int64): int64 {
+    var hdr: int64 := zsbrReadU8(br);
+
+    if (hdr >= 128) {
+        // Direct encoding: hdr - 127 symbols
+        var numSyms: int64 := hdr - 127;
+        var byteCount: int64 := (numSyms + 1) / 2;
+        var s: int64 := 0;
+        var b: int64 := 0;
+        while (b < byteCount) {
+            var bv: int64 := zsbrReadU8(br);
+            if (s < numSyms) { poke64(weights + s * 8, bv & 0xF); s := s + 1; }
+            if (s < numSyms) { poke64(weights + s * 8, (bv >> 4) & 0xF); s := s + 1; }
+            b += 1;
+        }
+        return numSyms;
+    }
+
+    // FSE-compressed weights
+    var compSize: int64 := hdr;
+    if (compSize == 0) { return 0; }
+
+    var wBase: int64 := zsbrPos(br);  // start of FSE data
+    var zb: int64 := zsBitNew(ptr + wBase, 0);
+
+    // Read FSE prob table for weights (max symbol = 255, weights are 0..11)
+    var wprobs: int64 := alloc(256 * 8);
+    var AL: int64 := zsReadFSEProbs(zb, 255, wprobs);
+    var tableHdrSize: int64 := zsBitBytePos(zb);
+    free(zb);
+
+    if (AL < 0) { free(wprobs); return 0; }
+
+    var wtab: int64 := zsFSEBuild(wprobs, 256, AL);
+    free(wprobs);
+
+    // The remaining bytes in compSize are the backward FSE bitstream
+    var bsStart: int64 := wBase + tableHdrSize;
+    var bsLen:   int64 := compSize - tableHdrSize;
+    var rbr:     int64 := zsRevNew(ptr + bsStart, bsLen);
+
+    // Decode weights (FSE state machine)
+    var state: int64 := zsRevReadBits(rbr, AL);
+    var numSyms: int64 := 0;
+    var done: int64 := 0;
+    while (done == 0) {
+        var w: int64 := zsFSESym(wtab, state);
+        if (numSyms < 256) { poke64(weights + numSyms * 8, w); }
+        numSyms += 1;
+        var nb: int64 := zsFSENbBits(wtab, state);
+        var ns: int64 := zsFSENewState(wtab, state);
+        // Check if bitstream exhausted
+        var bl: int64 := peek64(rbr + 24);
+        var bp: int64 := peek64(rbr + 8);
+        if ((bl < 0) & (bp < 0)) { done := 1; }
+        else { state := ns + zsRevReadBits(rbr, nb); }
+        if (numSyms >= 256) { done := 1; }
+    }
+
+    free(rbr);
+    zsFSEFree(wtab);
+    zsbrSkip(br, compSize);
+    return numSyms;
+}
+
+// Build Huffman tree from zstd weight array.
+// weight[s] = 0 → absent; weight[s] > 0 → code length = weight[s]
+// The last symbol's weight is derived to complete the tree.
+fn zsHuffFromWeights(weights: int64, numSyms: int64): int64 {
+    var t: int64 := zsHuffNew();
+    if (numSyms == 0) { return t; }
+
+    // Compute max weight
+    var maxW: int64 := 0;
+    var s: int64 := 0;
+    while (s < numSyms) { var w: int64 := peek64(weights + s * 8); if (w > maxW) { maxW := w; } s := s + 1; }
+    if (maxW == 0) { return t; }
+
+    // Implicit last weight: find the missing bits to complete the tree.
+    // sum of 2^(maxWeight - weight[s]) for s with weight > 0 must = 2^maxWeight
+    var sumPow: int64 := 0;
+    s := 0;
+    while (s < numSyms) {
+        var w: int64 := peek64(weights + s * 8);
+        if (w > 0) {
+            var diff: int64 := maxW - w;
+            sumPow := sumPow + (1 << diff);
+        }
+        s += 1;
+    }
+    // The "remaining" after accounting for all symbols should be a power of 2
+    var remaining: int64 := (1 << maxW) - sumPow;
+    var implicitW: int64 := 0;
+    if (remaining > 0) { implicitW := maxW - zsHighbit(remaining); }
+
+    // Build code-length array: len[s] = weight[s] (non-zero), adjusted by maxWeight
+    // In zstd: code_length[s] = maxBits + 1 - weight[s]  (but weight=0 means absent)
+    // Actually: weight IS the code length for non-zero entries
+    var lens: int64 := alloc((numSyms + 1) * 8);
+    s := 0;
+    while (s < numSyms) {
+        poke64(lens + s * 8, peek64(weights + s * 8));
+        s += 1;
+    }
+    // Last symbol gets implicitW
+    if (implicitW > 0) {
+        poke64(lens + numSyms * 8, implicitW);
+        numSyms += 1;
+    }
+
+    zsHuffBuildLens(t, lens, numSyms);
+    free(lens);
+    return t;
+}
+
+// ========================================================================
+// Context  ZsCtx (168 B)
+// [0]=src [8]=srcPos [16]=srcLen [24]=dst [32]=dstPos [40]=dstMax
+// [48]=error [56]=off1 [64]=off2 [72]=off3
+// [80]=litTree [88]=llTable [96]=mlTable [104]=offTable
+// [112]=llMode [120]=mlMode [128]=offMode
+// [136]=llRLE [144]=mlRLE [152]=offRLE
+// [160]=contentSize (0=unknown)
+// ========================================================================
+
+fn zsCtxNew(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64 {
+    var ctx: int64 := alloc(168);
+    var k: int64 := 0;
+    while (k < 168) { poke8(ctx + k, 0); k := k + 1; }
+    poke64(ctx,       src);
+    poke64(ctx + 16,  srcLen);
+    poke64(ctx + 24,  dst);
+    poke64(ctx + 40,  dstMax);
+    poke64(ctx + 56,  1);  // off1
+    poke64(ctx + 64,  4);  // off2
+    poke64(ctx + 72,  8);  // off3
+    poke64(ctx + 112, 0 - 1);  // llMode = -1 (none yet)
+    poke64(ctx + 120, 0 - 1);  // mlMode = -1
+    poke64(ctx + 128, 0 - 1);  // offMode = -1
+    return ctx;
+}
+
+fn zsCtxFree(ctx: int64): void {
+    if (ctx == 0) { return; }
+    var lt: int64 := peek64(ctx + 80);
+    if (lt != 0) { zsHuffFree(lt); }
+    zsFSEFree(peek64(ctx + 88));
+    zsFSEFree(peek64(ctx + 96));
+    zsFSEFree(peek64(ctx + 104));
+    free(ctx);
+}
+
+fn zsOutput(ctx: int64, b: int64): void {
+    var pos: int64 := peek64(ctx + 32);
+    var mx:  int64 := peek64(ctx + 40);
+    if (pos >= mx) { poke64(ctx + 48, 1); return; }
+    poke8(peek64(ctx + 24) + pos, b & 0xFF);
+    poke64(ctx + 32, pos + 1);
+}
+
+fn zsCopyBack(ctx: int64, offset: int64, matchLen: int64): void {
+    var dst:    int64 := peek64(ctx + 24);
+    var dstPos: int64 := peek64(ctx + 32);
+    var dstMax: int64 := peek64(ctx + 40);
+    var i: int64 := 0;
+    while (i < matchLen) {
+        if (dstPos >= dstMax) { poke64(ctx + 48, 1); return; }
+        var backPos: int64 := dstPos - offset;
+        if (backPos < 0) { poke64(ctx + 48, 1); return; }
+        poke8(dst + dstPos, peek8(dst + backPos));
+        dstPos += 1;
+        i += 1;
+    }
+    poke64(ctx + 32, dstPos);
+}
+
+// Resolve offset_value (raw from bitstream) with repeat-offset logic.
+// Returns actual offset. Updates ctx's off1/off2/off3.
+fn zsResolveOffset(ctx: int64, offVal: int64, llLen: int64): int64 {
+    var off1: int64 := peek64(ctx + 56);
+    var off2: int64 := peek64(ctx + 64);
+    var off3: int64 := peek64(ctx + 72);
+    var actual: int64 := 0;
+
+    if (offVal > 3) {
+        actual := offVal - 3;
+        poke64(ctx + 72, off2); poke64(ctx + 64, off1); poke64(ctx + 56, actual);
+    } else {
+        if (offVal == 1) {
+            actual := off1;
+        } else {
+            if (offVal == 2) {
+                actual := off2;
+                poke64(ctx + 64, off1); poke64(ctx + 56, actual);
+            } else {
+                // offVal == 3
+                if (llLen == 0) {
+                    actual := off3;
+                    poke64(ctx + 72, off2); poke64(ctx + 64, off1); poke64(ctx + 56, actual);
+                } else {
+                    actual := off1 - 1;
+                }
+            }
+        }
+    }
+    return actual;
+}
+
+// ========================================================================
+// Literals Section Decoding
+// ========================================================================
+
+// Returns litBuf (heap pointer, caller must free) and litLen via outLen pointer.
+// litBuf is 0 on error.
+fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
+    var hdr0: int64 := zsbrReadU8(br);
+    var ltype: int64 := hdr0 & 3;           // bits[1:0]
+    var szFmt: int64 := (hdr0 >> 2) & 3;   // bits[3:2]
+
+    if (ltype == 0) {
+        // Raw_Literals_Block: literals are uncompressed
+        var rlen: int64 := 0;
+        if (szFmt == 0) { rlen := (hdr0 >> 3) & 0x1F; }
+        else { if (szFmt == 1) { rlen := ((hdr0 >> 4) & 0x0F) | (zsbrReadU8(br) << 4); }
+        else { rlen := ((hdr0 >> 4) & 0x0F) | (zsbrReadU8(br) << 4) | (zsbrReadU8(br) << 12); } }
+        poke64(outLen, rlen);
+        var litBuf: int64 := alloc(rlen + 1);
+        var k: int64 := 0;
+        while (k < rlen) { poke8(litBuf + k, zsbrReadU8(br)); k := k + 1; }
+        return litBuf;
+    }
+
+    if (ltype == 1) {
+        // RLE_Literals_Block: single byte repeated
+        var rlen: int64 := 0;
+        if (szFmt == 0) { rlen := (hdr0 >> 3) & 0x1F; }
+        else { if (szFmt == 1) { rlen := ((hdr0 >> 4) & 0x0F) | (zsbrReadU8(br) << 4); }
+        else { rlen := ((hdr0 >> 4) & 0x0F) | (zsbrReadU8(br) << 4) | (zsbrReadU8(br) << 12); } }
+        var rleByte: int64 := zsbrReadU8(br);
+        poke64(outLen, rlen);
+        var litBuf: int64 := alloc(rlen + 1);
+        var k: int64 := 0;
+        while (k < rlen) { poke8(litBuf + k, rleByte); k := k + 1; }
+        return litBuf;
+    }
+
+    // Compressed (2) or Treeless (3) Huffman literals
+    // Parse header: regeneratedSize and compressedSize
+    var regenSize: int64 := 0;
+    var compSize:  int64 := 0;
+
+    if (szFmt == 0) {
+        var hdr1: int64 := zsbrReadU8(br);
+        var hdr2: int64 := zsbrReadU8(br);
+        regenSize := ((hdr0 >> 4) & 0x0F) | ((hdr1 & 0x3F) << 4);
+        compSize  := ((hdr1 >> 6) & 0x03) | (hdr2 << 2);
+    } else {
+        if (szFmt == 1) {
+            var hdr1: int64 := zsbrReadU8(br);
+            var hdr2: int64 := zsbrReadU8(br);
+            regenSize := ((hdr0 >> 4) & 0x0F) | ((hdr1 & 0x3F) << 4);
+            compSize  := ((hdr1 >> 6) & 0x03) | (hdr2 << 2);
+        } else {
+            var hdr1: int64 := zsbrReadU8(br);
+            var hdr2: int64 := zsbrReadU8(br);
+            var hdr3: int64 := zsbrReadU8(br);
+            var hdr4: int64 := zsbrReadU8(br);
+            regenSize := ((hdr0 >> 4) & 0x0F) | (hdr1 << 4) | ((hdr2 & 0x03) << 12);
+            compSize  := ((hdr2 >> 2) & 0x3F) | (hdr3 << 6) | ((hdr4 & 0x03) << 14);
+        }
+    }
+
+    if (regenSize == 0) { poke64(outLen, 0); return alloc(1); }
+
+    var litDataStart: int64 := zsbrPos(br);
+    var litPtr: int64 := blockPtr + litDataStart;
+
+    // Read Huffman tree (if type=2) or reuse (type=3)
+    // We build a local tree here; for Treeless we'd need the ctx, but to keep ≤6 params
+    // we always build a new tree (type 3 = Treeless means reuse, which we handle by error)
+    var htree: int64 := 0;
+    if (ltype == 2) {
+        var wbr: int64 := zsbrNew(litPtr, compSize);
+        var weights: int64 := alloc(256 * 8);
+        var nw: int64 := zsReadHuffWeights(wbr, litPtr, weights);
+        var hdrConsumed: int64 := zsbrPos(wbr);
+        free(wbr);
+        htree := zsHuffFromWeights(weights, nw);
+        free(weights);
+        litDataStart += hdrConsumed;
+        litPtr := blockPtr + litDataStart;
+        compSize -= hdrConsumed;
+    } else {
+        // Treeless: would need previous tree; return error (not supported in this block)
+        poke64(outLen, 0);
+        zsbrSkip(br, compSize);
+        return 0;
+    }
+
+    // Decompress Huffman literals
+    // Use a backward bitstream. Zstd uses 4 interleaved streams for regenSize >= 1024.
+    // We only handle the single-stream case (regenSize < 1024).
+    var litBuf: int64 := alloc(regenSize + 1);
+    poke64(outLen, regenSize);
+
+    if (regenSize < 1024) {
+        // Single stream
+        var rbr: int64 := zsRevNew(litPtr, compSize);
+        var k: int64 := 0;
+        while (k < regenSize) {
+            var sym: int64 := zsHuffDecSym(htree, rbr);
+            poke8(litBuf + k, sym & 0xFF);
+            k += 1;
+        }
+        free(rbr);
+    } else {
+        // 4-stream interleaved Huffman (jump table = 6 bytes)
+        // jump table: stream 1 size (LE16), stream 2 size (LE16), stream 3 size (LE16)
+        if (compSize < 6) {
+            zsHuffFree(htree); free(litBuf);
+            poke64(outLen, 0); zsbrSkip(br, compSize); return 0;
+        }
+        var s1len: int64 := (peek8(litPtr) & 0xFF) | ((peek8(litPtr + 1) & 0xFF) << 8);
+        var s2len: int64 := (peek8(litPtr + 2) & 0xFF) | ((peek8(litPtr + 3) & 0xFF) << 8);
+        var s3len: int64 := (peek8(litPtr + 4) & 0xFF) | ((peek8(litPtr + 5) & 0xFF) << 8);
+        var s4len: int64 := compSize - 6 - s1len - s2len - s3len;
+
+        var p1: int64 := litPtr + 6;
+        var p2: int64 := p1 + s1len;
+        var p3: int64 := p2 + s2len;
+        var p4: int64 := p3 + s3len;
+
+        var perStream: int64 := regenSize / 4;
+        var remainder: int64 := regenSize - perStream * 4;
+
+        var rbr1: int64 := zsRevNew(p1, s1len);
+        var rbr2: int64 := zsRevNew(p2, s2len);
+        var rbr3: int64 := zsRevNew(p3, s3len);
+        var rbr4: int64 := zsRevNew(p4, s4len);
+
+        var outPos: int64 := 0;
+        var k: int64 := 0;
+
+        while (k < perStream) {
+            poke8(litBuf + outPos,              zsHuffDecSym(htree, rbr1) & 0xFF);
+            poke8(litBuf + outPos + perStream,  zsHuffDecSym(htree, rbr2) & 0xFF);
+            poke8(litBuf + outPos + perStream * 2, zsHuffDecSym(htree, rbr3) & 0xFF);
+            poke8(litBuf + outPos + perStream * 3, zsHuffDecSym(htree, rbr4) & 0xFF);
+            outPos += 1;
+            k += 1;
+        }
+        // Remainder from stream 4
+        var remBase: int64 := perStream * 4;
+        k := 0;
+        while (k < remainder) {
+            poke8(litBuf + remBase + k, zsHuffDecSym(htree, rbr4) & 0xFF);
+            k += 1;
+        }
+
+        free(rbr1); free(rbr2); free(rbr3); free(rbr4);
+    }
+
+    zsHuffFree(htree);
+    zsbrSkip(br, compSize);
+    return litBuf;
+}
+
+// ========================================================================
+// Sequence Decoding
+// ========================================================================
+
+// Read or reuse FSE table for one sequence component.
+// mode: 0=predefined, 1=RLE, 2=FSE_Compressed, 3=Repeat
+// which: 0=LL, 1=ML, 2=OFF
+// Returns new table pointer (or existing for repeat).
+fn zsGetSeqTable(ctx: int64, zb: int64, mode: int64, which: int64): int64 {
+    var modeField: int64 := 112 + which * 8;
+    var tabField:  int64 := 88  + which * 8;
+    var rleField:  int64 := 136 + which * 8;
+
+    if (mode == 0) {
+        // Predefined
+        zsFSEFree(peek64(ctx + tabField));
+        var tab: int64 := 0;
+        if (which == 0) { tab := zsLLPredefined(); }
+        else { if (which == 1) { tab := zsMLPredefined(); }
+        else { tab := zsOFFPredefined(); } }
+        poke64(ctx + tabField, tab);
+        poke64(ctx + modeField, 0);
+        return tab;
+    }
+
+    if (mode == 1) {
+        // RLE: single symbol
+        var rleSym: int64 := zsBitReadBits(zb, 8);
+        poke64(ctx + rleField,  rleSym);
+        poke64(ctx + modeField, 1);
+        return 0;  // no table; caller checks mode
+    }
+
+    if (mode == 2) {
+        // FSE compressed
+        var maxSym: int64 := 35;
+        if (which == 1) { maxSym := 52; }
+        if (which == 2) { maxSym := 28; }
+        var probs: int64 := alloc((maxSym + 1) * 8);
+        var AL: int64 := zsReadFSEProbs(zb, maxSym, probs);
+        var tab: int64 := zsFSEBuild(probs, maxSym + 1, AL);
+        free(probs);
+        zsFSEFree(peek64(ctx + tabField));
+        poke64(ctx + tabField, tab);
+        poke64(ctx + modeField, 2);
+        return tab;
+    }
+
+    // mode == 3: Repeat — reuse existing table
+    return peek64(ctx + tabField);
+}
+
+// Decode all sequences and apply to output.
+// Reads from rbr (reverse bitstream over sequence data).
+fn zsDecodeSeqs(ctx: int64, rbr: int64, litBuf: int64, litLen: int64, numSeq: int64): void {
+    if (numSeq == 0) {
+        // No sequences — copy all literals
+        var k: int64 := 0;
+        while (k < litLen) { zsOutput(ctx, peek8(litBuf + k)); k := k + 1; }
+        return;
+    }
+
+    var llMode: int64 := peek64(ctx + 112);
+    var mlMode: int64 := peek64(ctx + 120);
+    var offMode: int64 := peek64(ctx + 128);
+    var llTab:   int64 := peek64(ctx + 88);
+    var mlTab:   int64 := peek64(ctx + 96);
+    var offTab:  int64 := peek64(ctx + 104);
+    var llAL:    int64 := 0;
+    var mlAL:    int64 := 0;
+    var offAL:   int64 := 0;
+    if (llTab  != 0) { llAL  := peek64(llTab); }
+    if (mlTab  != 0) { mlAL  := peek64(mlTab); }
+    if (offTab != 0) { offAL := peek64(offTab); }
+
+    // Initialize states from reverse bitstream
+    var llState:  int64 := 0;
+    var mlState:  int64 := 0;
+    var offState: int64 := 0;
+    if (llMode  != 1) { llState  := zsRevReadBits(rbr, llAL); }
+    if (offMode != 1) { offState := zsRevReadBits(rbr, offAL); }
+    if (mlMode  != 1) { mlState  := zsRevReadBits(rbr, mlAL); }
+
+    var litPos: int64 := 0;
+    var seqIdx: int64 := 0;
+
+    while (seqIdx < numSeq) {
+        var isLast: int64 := 0;
+        if (seqIdx == numSeq - 1) { isLast := 1; }
+
+        // Peek symbols
+        var llCode: int64 := peek64(ctx + 136);  // RLE sym default
+        var mlCode: int64 := peek64(ctx + 144);
+        var offCode: int64 := peek64(ctx + 152);
+        if (llMode  != 1) { llCode  := zsFSESym(llTab,  llState); }
+        if (mlMode  != 1) { mlCode  := zsFSESym(mlTab,  mlState); }
+        if (offMode != 1) { offCode := zsFSESym(offTab, offState); }
+
+        // Update states (read bits) — skip for last sequence
+        if (isLast == 0) {
+            if (llMode  != 1) { llState  := zsFSENewState(llTab,  llState)  + zsRevReadBits(rbr, zsFSENbBits(llTab,  llState)); }
+            if (offMode != 1) { offState := zsFSENewState(offTab, offState) + zsRevReadBits(rbr, zsFSENbBits(offTab, offState)); }
+            if (mlMode  != 1) { mlState  := zsFSENewState(mlTab,  mlState)  + zsRevReadBits(rbr, zsFSENbBits(mlTab,  mlState)); }
+        }
+
+        // Decode extra bits
+        var offExtra: int64 := zsRevReadBits(rbr, offCode);
+        var offVal:   int64 := (1 << offCode) + offExtra;
+        var mlExtra:  int64 := zsMLExtra(mlCode);
+        var mlLen:    int64 := zsMLBase(mlCode) + zsRevReadBits(rbr, mlExtra);
+        var llExtra:  int64 := zsLLExtra(llCode);
+        var llLen:    int64 := zsLLBase(llCode) + zsRevReadBits(rbr, llExtra);
+
+        // Resolve offset
+        var actual: int64 := zsResolveOffset(ctx, offVal, llLen);
+
+        // Copy literal run
+        var k: int64 := 0;
+        while ((k < llLen) & (litPos < litLen)) {
+            zsOutput(ctx, peek8(litBuf + litPos));
+            litPos += 1;
+            k += 1;
+        }
+
+        // Copy match
+        zsCopyBack(ctx, actual, mlLen);
+
+        seqIdx += 1;
+    }
+
+    // Copy remaining literals
+    while (litPos < litLen) {
+        zsOutput(ctx, peek8(litBuf + litPos));
+        litPos += 1;
+    }
+}
+
+// ========================================================================
+// Compressed Block Decompression
+// ========================================================================
+
+fn zsDecompressCompressed(ctx: int64, blkPtr: int64, blkLen: int64): void {
+    var br: int64 := zsbrNew(blkPtr, blkLen);
+
+    // --- Literals section ---
+    var litLenOut: int64 := alloc(8);
+    poke64(litLenOut, 0);
+    var litBuf: int64 := zsReadLiterals(br, blkPtr, litLenOut);
+    var litLen: int64 := peek64(litLenOut);
+    free(litLenOut);
+
+    if (litBuf == 0) { poke64(ctx + 48, 1); free(br); return; }
+
+    // --- Sequences section ---
+    if (zsbrLeft(br) == 0) {
+        // No sequences — just output literals
+        var k: int64 := 0;
+        while (k < litLen) { zsOutput(ctx, peek8(litBuf + k)); k := k + 1; }
+        free(litBuf); free(br);
+        return;
+    }
+
+    // Read number of sequences
+    var nsRaw: int64 := zsbrReadU8(br);
+    var numSeq: int64 := 0;
+    if (nsRaw == 0) { numSeq := 0; }
+    else {
+        if (nsRaw < 128) { numSeq := nsRaw; }
+        else {
+            if (nsRaw < 255) {
+                numSeq := ((nsRaw - 128) << 8) + zsbrReadU8(br);
+            } else {
+                numSeq := zsbrReadU8(br) + (zsbrReadU8(br) << 8) + 0x7F00;
+            }
+        }
+    }
+
+    if (numSeq == 0) {
+        // Output all literals
+        var k: int64 := 0;
+        while (k < litLen) { zsOutput(ctx, peek8(litBuf + k)); k := k + 1; }
+        free(litBuf); free(br);
+        return;
+    }
+
+    // Read compression mode byte
+    var modeByte: int64 := zsbrReadU8(br);
+    var llMode:   int64 := (modeByte >> 6) & 3;
+    var offMode:  int64 := (modeByte >> 4) & 3;
+    var mlMode:   int64 := (modeByte >> 2) & 3;
+
+    // Read FSE tables into ctx
+    var zb: int64 := zsBitNew(blkPtr, zsbrPos(br));
+    zsGetSeqTable(ctx, zb, llMode,  0);
+    zsGetSeqTable(ctx, zb, mlMode,  1);
+    zsGetSeqTable(ctx, zb, offMode, 2);
+    var tabBytesUsed: int64 := zsBitBytePos(zb);
+    free(zb);
+
+    zsbrSeekTo(br, tabBytesUsed);
+
+    // The rest of the block is the reverse bitstream for sequences
+    var seqBitStart: int64 := zsbrPos(br);
+    var seqBitLen:   int64 := blkLen - seqBitStart;
+    var rbr: int64 := zsRevNew(blkPtr + seqBitStart, seqBitLen);
+
+    zsDecodeSeqs(ctx, rbr, litBuf, litLen, numSeq);
+
+    free(rbr);
+    free(litBuf);
+    free(br);
+}
+
+fn zsDecompressBlock(ctx: int64, blkPtr: int64, blkLen: int64, blkType: int64): void {
+    if (blkType == 0) {
+        // Raw block
+        var k: int64 := 0;
+        while (k < blkLen) { zsOutput(ctx, peek8(blkPtr + k)); k := k + 1; }
+    } else {
+        if (blkType == 1) {
+            // RLE block: repeated byte, blkLen times (single byte in blkPtr)
+            var rleByte: int64 := peek8(blkPtr);
+            var k: int64 := 0;
+            // blkLen is NOT the block payload size for RLE; it's the RLE count
+            // The actual byte payload is 1 byte; blkLen from header is the count
+            while (k < blkLen) { zsOutput(ctx, rleByte); k := k + 1; }
+        } else {
+            // Compressed block
+            zsDecompressCompressed(ctx, blkPtr, blkLen);
+        }
+    }
+}
+
+// ========================================================================
+// Frame Decompression
+// ========================================================================
+
+pub fn ZstdDecompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64 {
+    if (((src == 0) | (dst == 0)) | (srcLen < 4)) { return ZSTD_ERR; }
+
+    var ctx: int64 := zsCtxNew(src, srcLen, dst, dstMax);
+    var br:  int64 := zsbrNew(src, srcLen);
+
+    // Check magic: 0xFD2FB528 little-endian = bytes 28 B5 2F FD
+    var m0: int64 := zsbrReadU8(br);
+    var m1: int64 := zsbrReadU8(br);
+    var m2: int64 := zsbrReadU8(br);
+    var m3: int64 := zsbrReadU8(br);
+    var badMagic: int64 := 0;
+    if (m0 != 0x28) { badMagic := 1; }
+    if (m1 != 0xB5) { badMagic := 1; }
+    if (m2 != 0x2F) { badMagic := 1; }
+    if (m3 != 0xFD) { badMagic := 1; }
+
+    // Skip skippable frames (magic 0x184D2A5?) — check upper nibble of LE32
+    // For simplicity skip if first 4 bytes don't match either frame magic
+    if (badMagic != 0) {
+        free(br); zsCtxFree(ctx);
+        return ZSTD_ERR;
+    }
+
+    // Frame Header
+    var fhd: int64 := zsbrReadU8(br);
+    var fcsFld:  int64 := (fhd >> 6) & 3;
+    var ssf:     int64 := (fhd >> 5) & 1;
+    var ccf:     int64 := (fhd >> 2) & 1;  // bit2 per zstd source
+    var didFlag: int64 := fhd & 3;          // bits[1:0] per zstd source
+
+    if (ssf == 0) {
+        // Window_Descriptor: 1 byte (we just skip it)
+        zsbrReadU8(br);
+    }
+
+    // Dictionary_ID field
+    if (didFlag == 1) { zsbrReadU8(br); }
+    else { if (didFlag == 2) { zsbrReadLE16(br); }
+    else { if (didFlag == 3) { zsbrReadLE32(br); } } }
+
+    // Content_Size field
+    var contentSize: int64 := 0;
+    if ((ssf == 1) & (fcsFld == 0)) {
+        contentSize := zsbrReadU8(br);
+    } else {
+        if (fcsFld == 1) { contentSize := zsbrReadLE16(br) + 256; }
+        else { if (fcsFld == 2) { contentSize := zsbrReadLE32(br); }
+        else { if (fcsFld == 3) { contentSize := zsbrReadLE64(br); } } }
+    }
+    poke64(ctx + 160, contentSize);
+
+    // Check output buffer size
+    if ((contentSize > 0) & (contentSize > dstMax)) {
+        free(br); zsCtxFree(ctx);
+        return ZSTD_OVERFLOW;
+    }
+
+    // Block loop
+    var done: int64 := 0;
+    while (done == 0) {
+        if (zsbrLeft(br) < 3) { done := 1; }
+        else {
+            var hdrLE: int64 := zsbrReadLE24(br);
+            var lastBlock: int64 := hdrLE & 1;
+            var blockType: int64 := (hdrLE >> 1) & 3;
+            var blockSize: int64 := hdrLE >> 3;
+
+            if (blockType == 3) {
+                poke64(ctx + 48, 1);  // reserved = error
+                done := 1;
+            } else {
+                var blkPtr: int64 := src + zsbrPos(br);
+
+                if (blockType == 1) {
+                    // RLE: 1 byte in stream, blockSize = repetition count
+                    zsDecompressBlock(ctx, blkPtr, blockSize, 1);
+                    zsbrSkip(br, 1);
+                } else {
+                    zsDecompressBlock(ctx, blkPtr, blockSize, blockType);
+                    if (blockType == 0) { zsbrSkip(br, blockSize); }
+                    else { zsbrSkip(br, blockSize); }
+                }
+            }
+
+            if (lastBlock == 1) { done := 1; }
+            if (peek64(ctx + 48) != 0) { done := 1; }
+        }
+    }
+
+    var result: int64 := ZSTD_ERR;
+    if (peek64(ctx + 48) == 0) {
+        result := peek64(ctx + 32);
+    }
+
+    free(br);
+    zsCtxFree(ctx);
+    return result;
+}
+
+// ========================================================================
+// Store-Modus Compressor
+// Format: magic(4) + FHD(1) + ContentSize(8) + blocks + last empty block
+// Each raw block: blockHdr(3) + rawData
+// Max block payload: 131072 bytes (128 KB)
+// Block header (24-bit LE): bit0=LastBlock, bits[2:1]=BlockType(0=Raw), bits[23:3]=BlockSize
+// ========================================================================
+
+pub fn ZstdCompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64 {
+    if (((src == 0) | (dst == 0))) { return ZSTD_ERR; }
+
+    var blockMax: int64 := 131072;
+    var numBlocks: int64 := 1;
+    if (srcLen > 0) { numBlocks := (srcLen + blockMax - 1) / blockMax; }
+    // Overhead: 13 bytes frame header + 3 bytes per block
+    var needed: int64 := 13 + numBlocks * 3 + srcLen;
+    if (dstMax < needed) { return ZSTD_OVERFLOW; }
+
+    var pos: int64 := 0;
+
+    // Magic: 28 B5 2F FD
+    poke8(dst + pos, 0x28); pos := pos + 1;
+    poke8(dst + pos, 0xB5); pos := pos + 1;
+    poke8(dst + pos, 0x2F); pos := pos + 1;
+    poke8(dst + pos, 0xFD); pos := pos + 1;
+
+    // FHD: FCS=11 (8-byte size), SSF=1, CCF=0, DID=00
+    // = bits[7:6]=11, bit5=1, bit4=0, bit3=0, bits[2:1]=00, bit0=0
+    // = 1110_0000 = 0xE0
+    poke8(dst + pos, 0xE0); pos := pos + 1;
+
+    // Content size (8 bytes LE)
+    var cs: int64 := srcLen;
+    var k: int64 := 0;
+    while (k < 8) { poke8(dst + pos, cs & 0xFF); cs := cs >> 8; pos := pos + 1; k := k + 1; }
+
+    // Raw blocks
+    var srcOff: int64 := 0;
+    while (srcOff < srcLen) {
+        var remain: int64 := srcLen - srcOff;
+        var blkSize: int64 := remain;
+        if (blkSize > blockMax) { blkSize := blockMax; }
+        var isLast: int64 := 0;
+        if (srcOff + blkSize >= srcLen) { isLast := 1; }
+        // Block header: blockSize << 3 | BlockType=0 << 1 | isLast
+        var hdr: int64 := (blkSize << 3) | isLast;
+        poke8(dst + pos, hdr & 0xFF);         pos := pos + 1;
+        poke8(dst + pos, (hdr >> 8) & 0xFF);  pos := pos + 1;
+        poke8(dst + pos, (hdr >> 16) & 0xFF); pos := pos + 1;
+        var j: int64 := 0;
+        while (j < blkSize) { poke8(dst + pos, peek8(src + srcOff + j)); pos := pos + 1; j := j + 1; }
+        srcOff += blkSize;
+    }
+
+    // If srcLen == 0: write a single empty last block
+    if (srcLen == 0) {
+        // LastBlock=1, BlockType=0, BlockSize=0 → hdr = (0 << 3) | (0 << 1) | 1 = 1
+        poke8(dst + pos, 1); pos := pos + 1;
+        poke8(dst + pos, 0); pos := pos + 1;
+        poke8(dst + pos, 0); pos := pos + 1;
+    }
+
+    return pos;
+}

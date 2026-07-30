@@ -1,0 +1,142 @@
+// std/hardware/usb_control.lyx
+// WP-4: Control-Transfers + Interface-Claim/Release
+// Plattform: Linux ARM64 / x86_64 — usbdevfs ioctl-Schnittstelle
+//
+// Hinweis: Alle Funktionen haben ≤ 6 Parameter (Lyx x86-64 ABI-Grenze:
+// arg 7+ werden auf dem Stack übergeben, was der Bootstrap-Compiler
+// aktuell nicht korrekt unterstützt).
+
+unit std.hardware.usb_control;
+
+import std.hardware.usb_types;
+import std.alloc;
+
+// ============================================================
+// IOCTL-Codes (64-Bit Linux — aus <linux/usbdevice_fs.h>)
+// Formel: _IOC(dir, 'U', nr, size) = (dir<<30)|(size<<16)|(0x55<<8)|nr
+// ============================================================
+
+// _IOWR('U', 0, usbdevfs_ctrltransfer) — sizeof=24 auf 64-Bit
+pub con USBDEVFS_CONTROL: int64 := 0xC0185500;
+
+// _IOW('U', 15, unsigned int) — sizeof(uint)=4
+pub con USBDEVFS_CLAIMINTERFACE: int64 := 0x4004550F;
+
+// _IOW('U', 16, unsigned int)
+pub con USBDEVFS_RELEASEINTERFACE: int64 := 0x40045510;
+
+// ============================================================
+// Standard USB Request-Typen (USB 2.0 Spec §9.4)
+// ============================================================
+
+pub con USB_DIR_OUT: int64 := 0x00;
+pub con USB_DIR_IN:  int64 := 0x80;
+
+pub con USB_RECIP_DEVICE:    int64 := 0x00;
+pub con USB_RECIP_INTERFACE: int64 := 0x01;
+pub con USB_RECIP_ENDPOINT:  int64 := 0x02;
+
+pub con USB_REQ_GET_STATUS:        int64 := 0;
+pub con USB_REQ_GET_DESCRIPTOR:    int64 := 6;
+pub con USB_REQ_SET_DESCRIPTOR:    int64 := 7;
+pub con USB_REQ_GET_CONFIGURATION: int64 := 8;
+pub con USB_REQ_SET_CONFIGURATION: int64 := 9;
+pub con USB_REQ_GET_INTERFACE:     int64 := 10;
+pub con USB_REQ_SET_INTERFACE:     int64 := 11;
+
+pub con USB_TIMEOUT_DEFAULT: int64 := 5000;
+pub con USB_TIMEOUT_SHORT:   int64 := 1000;
+
+// ============================================================
+// UsbDevFsCtrlTransfer — Layout (24 Bytes auf 64-Bit Linux)
+//
+//   +0:  bRequestType (uint8)
+//   +1:  bRequest     (uint8)
+//   +2:  wValue       (uint16 LE)
+//   +4:  wIndex       (uint16 LE)
+//   +6:  wLength      (uint16 LE)
+//   +8:  timeout      (uint32 LE) in Millisekunden
+//   +12: _pad         (uint32)  → 0
+//   +16: data         (void *)  → 8 Bytes auf 64-Bit
+// ============================================================
+
+pub con USB_CTRL_STRUCT_SIZE: int64 := 24;
+
+// ============================================================
+// UsbCtrlSetRequest — befüllt den Request-Header (Bytes 0..7)
+// (5 Parameter ≤ 6-Arg-Limit)
+// ============================================================
+pub fn UsbCtrlSetRequest(buf: int64, reqType: int64, req: int64,
+                          wValue: int64, wIndex: int64) {
+  poke8 (buf,     reqType & 0xFF);
+  poke8 (buf + 1, req     & 0xFF);
+  poke16(buf + 2, wValue  & 0xFFFF);
+  poke16(buf + 4, wIndex  & 0xFFFF);
+}
+
+// ============================================================
+// UsbCtrlSetTransfer — befüllt Länge, Timeout und Datenzeiger (Bytes 6..23)
+// (4 Parameter ≤ 6-Arg-Limit)
+// ============================================================
+pub fn UsbCtrlSetTransfer(buf: int64, data: int64, length: int64, timeout: int64) {
+  poke16(buf + 6,  length  & 0xFFFF);
+  poke32(buf + 8,  timeout & 0xFFFFFFFF);
+  poke32(buf + 12, 0);       // _pad
+  poke64(buf + 16, data);
+}
+
+// ============================================================
+// UsbControlTransferRaw — sendet einen bereits befüllten ctrlBuf via ioctl
+// (2 Parameter)
+// ============================================================
+pub fn UsbControlTransferRaw(dev_fd: int64, ctrlBuf: int64): int64 {
+  return sys_ioctl(dev_fd, USBDEVFS_CONTROL, ctrlBuf);
+}
+
+// ============================================================
+// UsbGetDeviceDescriptor — liest Device Descriptor via Control-Transfer
+// descBuf muss ≥ USB_SIZEOF_DEVICE_DESC (18) Bytes groß sein.
+// Rückgabe: 18 bei Erfolg, negativer Wert bei Fehler (AC-4).
+// (2 Parameter)
+// ============================================================
+pub fn UsbGetDeviceDescriptor(dev_fd: int64, descBuf: int64): int64 {
+  var buf: int64 := alloc(USB_CTRL_STRUCT_SIZE);
+  var wValue: int64 := (USB_DT_DEVICE << 8) | 0;
+  UsbCtrlSetRequest(buf, USB_DIR_IN | USB_RECIP_DEVICE,
+                    USB_REQ_GET_DESCRIPTOR, wValue, 0);
+  UsbCtrlSetTransfer(buf, descBuf, USB_SIZEOF_DEVICE_DESC, USB_TIMEOUT_DEFAULT);
+  var ret: int64 := UsbControlTransferRaw(dev_fd, buf);
+  free(buf, USB_CTRL_STRUCT_SIZE);
+  return ret;
+}
+
+// ============================================================
+// UsbClaimInterface — beansprucht Interface für exklusiven Zugriff
+//
+// WICHTIG: USBDEVFS_CLAIMINTERFACE erwartet `unsigned int *`,
+//          nicht den Wert direkt — sonst schlägt das ioctl mit -EINVAL fehl.
+// Rückgabe: 0 = Erfolg, < 0 = Fehler (z.B. -EBUSY, -ENODEV).
+// (2 Parameter)
+// ============================================================
+pub fn UsbClaimInterface(dev_fd: int64, interface_num: int64): int64 {
+  var numBuf: int64 := alloc(8);
+  poke32(numBuf,     interface_num & 0xFFFFFFFF);
+  poke32(numBuf + 4, 0);
+  var ret: int64 := sys_ioctl(dev_fd, USBDEVFS_CLAIMINTERFACE, numBuf);
+  free(numBuf, 8);
+  return ret;
+}
+
+// ============================================================
+// UsbReleaseInterface — gibt ein beanspruchtes Interface frei
+// Rückgabe: 0 = Erfolg, < 0 = Fehler.
+// (2 Parameter)
+// ============================================================
+pub fn UsbReleaseInterface(dev_fd: int64, interface_num: int64): int64 {
+  var numBuf: int64 := alloc(8);
+  poke32(numBuf,     interface_num & 0xFFFFFFFF);
+  poke32(numBuf + 4, 0);
+  var ret: int64 := sys_ioctl(dev_fd, USBDEVFS_RELEASEINTERFACE, numBuf);
+  free(numBuf, 8);
+  return ret;
+}

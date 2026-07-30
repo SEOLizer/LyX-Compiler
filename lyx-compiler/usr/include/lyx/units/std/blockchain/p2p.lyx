@@ -1,0 +1,566 @@
+// std/blockchain/p2p.lyx — Blockchain P2P Networking (WP-BL-06)
+//
+// TCP-based P2P layer for blockchain node communication.
+// Binary message protocol: [1 byte type] [4 bytes length BE] [N bytes payload]
+//
+// Public API:
+//   BLP2PNodeNew(bc, port): int64      — alloc node
+//   BLP2PNodeFree(node)
+//   BLP2PNodeStart(node): int64        — bind+listen, returns 1 on success
+//   BLP2PNodeStop(node)
+//   BLP2PConnectPeer(node, ip, port): int64   — connect to peer, 1=ok
+//   BLP2PBroadcastTx(node, tx)
+//   BLP2PBroadcastBlock(node, block)
+//   BLP2PHandleIncoming(node, fd): int64      — process one message, 1=ok
+//   BLP2PPoll(node): int64             — non-blocking poll of all connections
+//
+// Deserializer (required for P2P):
+//   BLDeserializeInt32(buf, off): int64
+//   BLDeserializeInt64(buf, off): int64
+//   BLDeserializeTx(buf, off, txOut): int64   — returns new offset
+//   BLDeserializeBlock(buf, off, bcCtx): int64 — returns new offset, block ptr in bcCtx
+
+unit std.blockchain.p2p;
+
+import std.alloc;
+import std.blockchain;
+import std.crypto.sha256;
+
+// ── Message type constants ────────────────────────────────────────────────────
+
+pub con BLP2P_MSG_QUERY_LATEST:    int64 := 1;
+pub con BLP2P_MSG_RESP_LATEST:     int64 := 2;
+pub con BLP2P_MSG_QUERY_CHAIN:     int64 := 3;
+pub con BLP2P_MSG_RESP_CHAIN:      int64 := 4;
+pub con BLP2P_MSG_BROADCAST_TX:    int64 := 5;
+pub con BLP2P_MSG_BROADCAST_BLOCK: int64 := 6;
+
+pub con BLP2P_MAX_PEERS:   int64 := 32;
+pub con BLP2P_MSG_HDR_LEN: int64 := 5;   // 1 type + 4 length
+
+// ── Node layout ───────────────────────────────────────────────────────────────
+// offset  0: bc ptr         int64
+// offset  8: listenPort     int64
+// offset 16: serverFd       int64   (-1 = not started)
+// offset 24: peerCount      int64
+// offset 32: peerFds        int64   (ptr: BLP2P_MAX_PEERS × int64 fds, -1 = empty)
+// total: 40 bytes
+
+pub con BLP2P_NODE_BC:         int64 := 0;
+pub con BLP2P_NODE_PORT:       int64 := 8;
+pub con BLP2P_NODE_SERVER_FD:  int64 := 16;
+pub con BLP2P_NODE_PEER_COUNT: int64 := 24;
+pub con BLP2P_NODE_PEER_FDS:   int64 := 32;
+pub con BLP2P_NODE_SIZE:       int64 := 40;
+
+// Linux syscall numbers (x86-64)
+con SYS_SOCKET:    int64 := 41;
+con SYS_BIND:      int64 := 49;
+con SYS_LISTEN:    int64 := 50;
+con SYS_ACCEPT:    int64 := 43;
+con SYS_CONNECT:   int64 := 42;
+con SYS_CLOSE:     int64 := 3;
+con SYS_WRITE:     int64 := 1;
+con SYS_READ:      int64 := 0;
+con SYS_SETSOCKOPT:int64 := 54;
+
+con AF_INET:         int64 := 2;
+con SOCK_STREAM:     int64 := 1;
+con SOL_SOCKET:      int64 := 1;
+con SO_REUSEADDR:    int64 := 2;
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn p2pMemCpy(dst: int64, src: int64, n: int64): void {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+fn p2pMemZero(dst: int64, n: int64): void {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + i, 0); i := i + 1; }
+}
+
+// Build sockaddr_in: family(2B) + port_BE(2B) + ip_BE(4B) + pad(8B) = 16 bytes
+fn p2pBuildSockaddr(buf: int64, ip: int64, port: int64): void {
+    p2pMemZero(buf, 16);
+    poke8(buf + 0, AF_INET & 0xFF);
+    poke8(buf + 1, 0);
+    poke8(buf + 2, (port >> 8) & 0xFF);
+    poke8(buf + 3, port & 0xFF);
+    // ip as 4 bytes big-endian
+    poke8(buf + 4, (ip >> 24) & 0xFF);
+    poke8(buf + 5, (ip >> 16) & 0xFF);
+    poke8(buf + 6, (ip >>  8) & 0xFF);
+    poke8(buf + 7,  ip        & 0xFF);
+}
+
+fn p2pSocket(): int64 {
+    return sys_socket(AF_INET, SOCK_STREAM, 0);
+}
+
+fn p2pClose(fd: int64): void {
+    sys_close(fd);
+}
+
+fn p2pWriteAll(fd: int64, buf: int64, n: int64): int64 {
+    var sent: int64 := 0;
+    while (sent < n) {
+        var r: int64 := sys_write(fd, buf + sent, n - sent);
+        if (r <= 0) { return 0; }
+        sent += r;
+    }
+    return 1;
+}
+
+fn p2pReadAll(fd: int64, buf: int64, n: int64): int64 {
+    var got: int64 := 0;
+    while (got < n) {
+        var r: int64 := sys_read(fd, buf + got, n - got);
+        if (r <= 0) { return 0; }
+        got += r;
+    }
+    return 1;
+}
+
+// Send a message: [1B type] [4B len BE] [payload]
+fn p2pSendMsg(fd: int64, msgType: int64, payload: int64, payloadLen: int64): int64 {
+    var hdr: int64 := alloc(BLP2P_MSG_HDR_LEN);
+    poke8(hdr, msgType & 0xFF);
+    poke8(hdr + 1, (payloadLen >> 24) & 0xFF);
+    poke8(hdr + 2, (payloadLen >> 16) & 0xFF);
+    poke8(hdr + 3, (payloadLen >>  8) & 0xFF);
+    poke8(hdr + 4,  payloadLen        & 0xFF);
+    var ok: int64 := p2pWriteAll(fd, hdr, BLP2P_MSG_HDR_LEN);
+    free(hdr, BLP2P_MSG_HDR_LEN);
+    if (ok == 0) { return 0; }
+    if (payloadLen > 0) { ok := p2pWriteAll(fd, payload, payloadLen); }
+    return ok;
+}
+
+// Broadcast to all connected peers
+fn p2pBroadcastMsg(node: int64, msgType: int64, payload: int64, payloadLen: int64): void {
+    var count: int64 := peek64(node + BLP2P_NODE_PEER_COUNT);
+    var fds: int64   := peek64(node + BLP2P_NODE_PEER_FDS);
+    var i: int64 := 0;
+    while (i < BLP2P_MAX_PEERS) {
+        var fd: int64 := peek64(fds + i * 8);
+        if (fd != (0 - 1)) {
+            p2pSendMsg(fd, msgType, payload, payloadLen);
+        }
+        i += 1;
+    }
+}
+
+// ── Deserializer ──────────────────────────────────────────────────────────────
+
+pub fn BLDeserializeInt32(buf: int64, off: int64): int64 {
+    return (((peek8(buf + off)     & 0xFF) << 24) |
+            ((peek8(buf + off + 1) & 0xFF) << 16) |
+            ((peek8(buf + off + 2) & 0xFF) <<  8) |
+             (peek8(buf + off + 3) & 0xFF));
+}
+
+pub fn BLDeserializeInt64(buf: int64, off: int64): int64 {
+    var hi: int64 := ((peek8(buf + off)     & 0xFF) << 56) |
+                     ((peek8(buf + off + 1) & 0xFF) << 48) |
+                     ((peek8(buf + off + 2) & 0xFF) << 40) |
+                     ((peek8(buf + off + 3) & 0xFF) << 32);
+    var lo: int64 := ((peek8(buf + off + 4) & 0xFF) << 24) |
+                     ((peek8(buf + off + 5) & 0xFF) << 16) |
+                     ((peek8(buf + off + 6) & 0xFF) <<  8) |
+                      (peek8(buf + off + 7) & 0xFF);
+    return hi | lo;
+}
+
+// Deserialize a BLTransaction from buf at offset off.
+// Returns (new_offset encoded in upper 32 bits | tx_ptr in lower 32? No — returns new offset,
+// writes tx ptr into outPtr[0]).
+// outPtr: int64 ptr where the alloc'd tx pointer is stored.
+pub fn BLDeserializeTx(buf: int64, off: int64, outPtr: int64): int64 {
+    var tx: int64 := alloc(BL_TX_SIZE);
+    p2pMemZero(tx, BL_TX_SIZE);
+
+    // senderAddr: [4B len][32B]
+    var addrLen: int64 := BLDeserializeInt32(buf, off); off := off + 4;
+    if (addrLen > BL_ADDR_LEN) { addrLen := BL_ADDR_LEN; }
+    p2pMemCpy(tx + BL_TX_SENDER_ADDR, buf + off, addrLen); off := off + BL_ADDR_LEN;
+
+    // senderPub: [4B len][64B]
+    var pubLen: int64 := BLDeserializeInt32(buf, off); off := off + 4;
+    if (pubLen > BL_PUBKEY_LEN) { pubLen := BL_PUBKEY_LEN; }
+    p2pMemCpy(tx + BL_TX_SENDER_PUB, buf + off, pubLen); off := off + BL_PUBKEY_LEN;
+
+    // recvAddr: [4B len][32B]
+    var rAddrLen: int64 := BLDeserializeInt32(buf, off); off := off + 4;
+    if (rAddrLen > BL_ADDR_LEN) { rAddrLen := BL_ADDR_LEN; }
+    p2pMemCpy(tx + BL_TX_RECV_ADDR, buf + off, rAddrLen); off := off + BL_ADDR_LEN;
+
+    poke64(tx + BL_TX_AMOUNT,    BLDeserializeInt64(buf, off)); off := off + 8;
+    poke64(tx + BL_TX_FEE,       BLDeserializeInt64(buf, off)); off := off + 8;
+    poke64(tx + BL_TX_NONCE,     BLDeserializeInt64(buf, off)); off := off + 8;
+    poke64(tx + BL_TX_TIMESTAMP, BLDeserializeInt64(buf, off)); off := off + 8;
+
+    // signature: [4B len][64B]
+    var sigLen: int64 := BLDeserializeInt32(buf, off); off := off + 4;
+    if (sigLen > BL_SIG_LEN) { sigLen := BL_SIG_LEN; }
+    p2pMemCpy(tx + BL_TX_SIG, buf + off, sigLen); off := off + BL_SIG_LEN;
+
+    poke64(outPtr, tx);
+    return off;
+}
+
+// Serialize a block for transmission. alloc's buf, writes size into outLen.
+fn p2pSerializeBlock(block: int64, outLen: int64): int64 {
+    var txCount: int64 := peek64(block + BL_BLK_TX_COUNT);
+    // Header: 100 bytes (from blSerializeBlockHeader)
+    // txCount: 4 bytes
+    // Each TX: 240 bytes (serializeTxFull)
+    var totalSize: int64 := 104 + txCount * 240;
+    var buf: int64       := alloc(totalSize);
+    p2pMemZero(buf, totalSize);
+
+    // Header (100 bytes)
+    // We re-implement serialization inline to avoid importing internal fn
+    var off: int64 := 0;
+    BLSerializeInt64(peek64(block + BL_BLK_INDEX),     buf + off); off := off + 8;
+    BLSerializeInt64(peek64(block + BL_BLK_TIMESTAMP), buf + off); off := off + 8;
+    BLSerializeInt32(BL_HASH_LEN, buf + off);                      off := off + 4;
+    p2pMemCpy(buf + off, block + BL_BLK_PREV_HASH, BL_HASH_LEN);  off := off + BL_HASH_LEN;
+    BLSerializeInt32(BL_HASH_LEN, buf + off);                      off := off + 4;
+    p2pMemCpy(buf + off, block + BL_BLK_MERKLE, BL_HASH_LEN);     off := off + BL_HASH_LEN;
+    BLSerializeInt64(peek64(block + BL_BLK_NONCE),      buf + off); off := off + 8;
+    BLSerializeInt32(peek64(block + BL_BLK_DIFFICULTY), buf + off); off := off + 4;
+    // hash field (32 bytes) — extra, not in header but needed for validation
+    p2pMemCpy(buf + off, block + BL_BLK_HASH, BL_HASH_LEN);       off := off + BL_HASH_LEN;
+
+    // txCount (4 bytes)
+    BLSerializeInt32(txCount, buf + off); off := off + 4;
+
+    // transactions
+    var txPtrs: int64 := peek64(block + BL_BLK_TX_PTRS);
+    var txBuf: int64  := alloc(256);
+    var i: int64 := 0;
+    while (i < txCount) {
+        var tx: int64 := peek64(txPtrs + i * 8);
+        // senderAddr
+        BLSerializeInt32(BL_ADDR_LEN, buf + off);                    off := off + 4;
+        p2pMemCpy(buf + off, tx + BL_TX_SENDER_ADDR, BL_ADDR_LEN);  off := off + BL_ADDR_LEN;
+        // senderPub
+        BLSerializeInt32(BL_PUBKEY_LEN, buf + off);                  off := off + 4;
+        p2pMemCpy(buf + off, tx + BL_TX_SENDER_PUB, BL_PUBKEY_LEN); off := off + BL_PUBKEY_LEN;
+        // recvAddr
+        BLSerializeInt32(BL_ADDR_LEN, buf + off);                    off := off + 4;
+        p2pMemCpy(buf + off, tx + BL_TX_RECV_ADDR, BL_ADDR_LEN);    off := off + BL_ADDR_LEN;
+        BLSerializeInt64(peek64(tx + BL_TX_AMOUNT),    buf + off);   off := off + 8;
+        BLSerializeInt64(peek64(tx + BL_TX_FEE),       buf + off);   off := off + 8;
+        BLSerializeInt64(peek64(tx + BL_TX_NONCE),     buf + off);   off := off + 8;
+        BLSerializeInt64(peek64(tx + BL_TX_TIMESTAMP), buf + off);   off := off + 8;
+        // sig
+        BLSerializeInt32(BL_SIG_LEN, buf + off);                     off := off + 4;
+        p2pMemCpy(buf + off, tx + BL_TX_SIG, BL_SIG_LEN);           off := off + BL_SIG_LEN;
+        i += 1;
+    }
+    free(txBuf, 256);
+
+    poke64(outLen, off);
+    return buf;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+pub fn BLP2PNodeNew(bc: int64, port: int64): int64 {
+    var node: int64 := alloc(BLP2P_NODE_SIZE);
+    p2pMemZero(node, BLP2P_NODE_SIZE);
+    poke64(node + BLP2P_NODE_BC,         bc);
+    poke64(node + BLP2P_NODE_PORT,       port);
+    poke64(node + BLP2P_NODE_SERVER_FD,  0 - 1);
+    poke64(node + BLP2P_NODE_PEER_COUNT, 0);
+
+    // Initialize peer fd array: all -1
+    var fds: int64 := alloc(BLP2P_MAX_PEERS * 8);
+    var i: int64 := 0;
+    while (i < BLP2P_MAX_PEERS) {
+        poke64(fds + i * 8, 0 - 1);
+        i += 1;
+    }
+    poke64(node + BLP2P_NODE_PEER_FDS, fds);
+    return node;
+}
+
+pub fn BLP2PNodeFree(node: int64): void {
+    // Close all peer connections
+    var fds: int64  := peek64(node + BLP2P_NODE_PEER_FDS);
+    var i: int64    := 0;
+    while (i < BLP2P_MAX_PEERS) {
+        var fd: int64 := peek64(fds + i * 8);
+        if (fd != (0 - 1)) { p2pClose(fd); }
+        i += 1;
+    }
+    free(fds, BLP2P_MAX_PEERS * 8);
+
+    var serverFd: int64 := peek64(node + BLP2P_NODE_SERVER_FD);
+    if (serverFd != (0 - 1)) { p2pClose(serverFd); }
+
+    free(node, BLP2P_NODE_SIZE);
+}
+
+pub fn BLP2PNodeStop(node: int64): void {
+    var serverFd: int64 := peek64(node + BLP2P_NODE_SERVER_FD);
+    if (serverFd != (0 - 1)) {
+        p2pClose(serverFd);
+        poke64(node + BLP2P_NODE_SERVER_FD, 0 - 1);
+    }
+}
+
+// BLP2PNodeStart: bind and listen. Returns 1 on success.
+pub fn BLP2PNodeStart(node: int64): int64 {
+    var fd: int64 := p2pSocket();
+    if (fd < 0) { return 0; }
+
+    // SO_REUSEADDR
+    var optval: int64 := alloc(4);
+    poke32(optval, 1);
+    sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, optval, 4);
+    free(optval, 4);
+
+    var addr: int64 := alloc(16);
+    p2pBuildSockaddr(addr, 0, peek64(node + BLP2P_NODE_PORT));
+    var bindOk: int64 := sys_bind(fd, addr, 16);
+    free(addr, 16);
+    if (bindOk < 0) { p2pClose(fd); return 0; }
+
+    if (sys_listen(fd, 128) < 0) { p2pClose(fd); return 0; }
+
+    poke64(node + BLP2P_NODE_SERVER_FD, fd);
+    return 1;
+}
+
+// BLP2PConnectPeer: connect to a peer by IPv4 address (int64) and port.
+// Returns 1 on success.
+pub fn BLP2PConnectPeer(node: int64, ip: int64, port: int64): int64 {
+    var fds: int64  := peek64(node + BLP2P_NODE_PEER_FDS);
+    // Find empty slot
+    var slot: int64 := 0 - 1;
+    var i: int64    := 0;
+    while (i < BLP2P_MAX_PEERS) {
+        if (peek64(fds + i * 8) == (0 - 1)) { slot := i; break; }
+        i += 1;
+    }
+    if (slot == (0 - 1)) { return 0; }  // no slots
+
+    var fd: int64 := p2pSocket();
+    if (fd < 0) { return 0; }
+
+    var addr: int64 := alloc(16);
+    p2pBuildSockaddr(addr, ip, port);
+    var connOk: int64 := sys_connect(fd, addr, 16);
+    free(addr, 16);
+    if (connOk < 0) { p2pClose(fd); return 0; }
+
+    poke64(fds + slot * 8, fd);
+    poke64(node + BLP2P_NODE_PEER_COUNT, peek64(node + BLP2P_NODE_PEER_COUNT) + 1);
+
+    // Send QUERY_LATEST to bootstrap
+    p2pSendMsg(fd, BLP2P_MSG_QUERY_LATEST, 0, 0);
+    return 1;
+}
+
+// BLP2PBroadcastTx: serialize and broadcast transaction to all peers.
+pub fn BLP2PBroadcastTx(node: int64, tx: int64): void {
+    var buf: int64 := alloc(256);
+    p2pMemZero(buf, 256);
+    var off: int64 := 0;
+    // Inline serializeTxFull
+    BLSerializeInt32(BL_ADDR_LEN, buf + off);                    off := off + 4;
+    p2pMemCpy(buf + off, tx + BL_TX_SENDER_ADDR, BL_ADDR_LEN);  off := off + BL_ADDR_LEN;
+    BLSerializeInt32(BL_PUBKEY_LEN, buf + off);                  off := off + 4;
+    p2pMemCpy(buf + off, tx + BL_TX_SENDER_PUB, BL_PUBKEY_LEN); off := off + BL_PUBKEY_LEN;
+    BLSerializeInt32(BL_ADDR_LEN, buf + off);                    off := off + 4;
+    p2pMemCpy(buf + off, tx + BL_TX_RECV_ADDR, BL_ADDR_LEN);    off := off + BL_ADDR_LEN;
+    BLSerializeInt64(peek64(tx + BL_TX_AMOUNT),    buf + off);   off := off + 8;
+    BLSerializeInt64(peek64(tx + BL_TX_FEE),       buf + off);   off := off + 8;
+    BLSerializeInt64(peek64(tx + BL_TX_NONCE),     buf + off);   off := off + 8;
+    BLSerializeInt64(peek64(tx + BL_TX_TIMESTAMP), buf + off);   off := off + 8;
+    BLSerializeInt32(BL_SIG_LEN, buf + off);                     off := off + 4;
+    p2pMemCpy(buf + off, tx + BL_TX_SIG, BL_SIG_LEN);           off := off + BL_SIG_LEN;
+    p2pBroadcastMsg(node, BLP2P_MSG_BROADCAST_TX, buf, off);
+    free(buf, 256);
+}
+
+// BLP2PBroadcastBlock: serialize and broadcast block to all peers.
+pub fn BLP2PBroadcastBlock(node: int64, block: int64): void {
+    var lenPtr: int64 := alloc(8);
+    var buf: int64    := p2pSerializeBlock(block, lenPtr);
+    var msgLen: int64 := peek64(lenPtr);
+    free(lenPtr, 8);
+    p2pBroadcastMsg(node, BLP2P_MSG_BROADCAST_BLOCK, buf, msgLen);
+    free(buf, msgLen);
+}
+
+// Handle incoming data from a peer fd. Returns 1 if message processed, 0 on disconnect.
+pub fn BLP2PHandleIncoming(node: int64, fd: int64): int64 {
+    var hdr: int64 := alloc(BLP2P_MSG_HDR_LEN);
+    if (p2pReadAll(fd, hdr, BLP2P_MSG_HDR_LEN) == 0) { free(hdr, BLP2P_MSG_HDR_LEN); return 0; }
+
+    var msgType: int64 := peek8(hdr) & 0xFF;
+    var payLen: int64  := BLDeserializeInt32(hdr, 1);
+    free(hdr, BLP2P_MSG_HDR_LEN);
+
+    var payload: int64 := 0;
+    if (payLen > 0) {
+        payload := alloc(payLen);
+        if (p2pReadAll(fd, payload, payLen) == 0) {
+            free(payload, payLen);
+            return 0;
+        }
+    }
+
+    var bc: int64 := peek64(node + BLP2P_NODE_BC);
+
+    if (msgType == BLP2P_MSG_QUERY_LATEST) {
+        // Respond with latest block header
+        var last: int64   := BLGetBlock(bc, BLChainLength(bc) - 1);
+        var lenPtr: int64 := alloc(8);
+        var blkBuf: int64 := p2pSerializeBlock(last, lenPtr);
+        var blkLen: int64 := peek64(lenPtr);
+        free(lenPtr, 8);
+        p2pSendMsg(fd, BLP2P_MSG_RESP_LATEST, blkBuf, blkLen);
+        free(blkBuf, blkLen);
+
+    } else if (msgType == BLP2P_MSG_BROADCAST_TX) {
+        // Deserialize and add to mempool
+        var txPtr: int64 := alloc(8);
+        BLDeserializeTx(payload, 0, txPtr);
+        var tx: int64 := peek64(txPtr);
+        free(txPtr, 8);
+        if (tx != 0) {
+            if (BLAddTransaction(bc, tx) == 0) { BLTxFree(tx); }
+            // If accepted, rebroadcast to other peers (excluding sender)
+        }
+
+    } else if (msgType == BLP2P_MSG_BROADCAST_BLOCK) {
+        // Deserialize block
+        var off: int64     := 0;
+        var index: int64   := BLDeserializeInt64(payload, off);    off := off + 8;
+        var ts: int64      := BLDeserializeInt64(payload, off);    off := off + 8;
+        var phLen: int64   := BLDeserializeInt32(payload, off);    off := off + 4;
+        var prevHash: int64 := alloc(BL_HASH_LEN);
+        p2pMemCpy(prevHash, payload + off, BL_HASH_LEN);           off := off + BL_HASH_LEN;
+        var mrLen: int64   := BLDeserializeInt32(payload, off);    off := off + 4;
+        var merkle: int64  := alloc(BL_HASH_LEN);
+        p2pMemCpy(merkle, payload + off, BL_HASH_LEN);             off := off + BL_HASH_LEN;
+        var nonce: int64   := BLDeserializeInt64(payload, off);    off := off + 8;
+        var diff: int64    := BLDeserializeInt32(payload, off);    off := off + 4;
+        var recvHash: int64 := alloc(BL_HASH_LEN);
+        p2pMemCpy(recvHash, payload + off, BL_HASH_LEN);           off := off + BL_HASH_LEN;
+        var txCount: int64 := BLDeserializeInt32(payload, off);    off := off + 4;
+
+        // Deserialize transactions
+        var txPtrs: int64 := alloc(txCount * 8);
+        var outPtr: int64 := alloc(8);
+        var t: int64 := 0;
+        while (t < txCount) {
+            off := BLDeserializeTx(payload, off, outPtr);
+            poke64(txPtrs + t * 8, peek64(outPtr));
+            t += 1;
+        }
+        free(outPtr, 8);
+
+        // Build block
+        var newBlock: int64 := BLNewBlock(index, prevHash, txPtrs, txCount, diff);
+        poke64(newBlock + BL_BLK_TIMESTAMP, ts);
+        p2pMemCpy(newBlock + BL_BLK_HASH, recvHash, BL_HASH_LEN);
+
+        free(prevHash, BL_HASH_LEN);
+        free(merkle, BL_HASH_LEN);
+        free(recvHash, BL_HASH_LEN);
+        free(txPtrs, txCount * 8);
+
+        // Validate: must be direct successor
+        var chainLen: int64 := BLChainLength(bc);
+        var last: int64     := BLGetBlock(bc, chainLen - 1);
+        var lastIdx: int64  := peek64(last + BL_BLK_INDEX);
+
+        if (index == lastIdx + 1) {
+            // Check hash and PoW
+            var checkHash: int64 := alloc(BL_HASH_LEN);
+            BLCalculateHash(newBlock, checkHash);
+            var hashOk: int64 := 1;
+            var i2: int64 := 0;
+            while (i2 < BL_HASH_LEN) {
+                if ((peek8(checkHash + i2) & 0xFF) != (peek8(newBlock + BL_BLK_HASH + i2) & 0xFF)) {
+                    hashOk := 0; break;
+                }
+                i2 += 1;
+            }
+            free(checkHash, BL_HASH_LEN);
+
+            if ((hashOk == 1) & (BLMeetsTarget(newBlock + BL_BLK_HASH, diff) == 1)) {
+                var oldLedger: int64 := peek64(bc + BL_BC_LEDGER);
+                var newLedger: int64 := BLApplyBlock(oldLedger, newBlock);
+                if (newLedger != 0) {
+                    BLLedgerFree(oldLedger);
+                    poke64(bc + BL_BC_LEDGER, newLedger);
+                    // Append block
+                    var cnt: int64 := peek64(bc + BL_BC_CHAIN_COUNT);
+                    var arr: int64 := peek64(bc + BL_BC_CHAIN_BLKS);
+                    poke64(arr + cnt * 8, newBlock);
+                    poke64(bc + BL_BC_CHAIN_COUNT, cnt + 1);
+                    // Rebroadcast
+                    BLP2PBroadcastBlock(node, newBlock);
+                } else {
+                    BLBlockFree(newBlock);
+                }
+            } else {
+                BLBlockFree(newBlock);
+            }
+        } else if (index > lastIdx + 1) {
+            // Our chain is behind — request full chain
+            var queryBuf: int64 := alloc(8);
+            BLSerializeInt64(lastIdx, queryBuf);
+            p2pSendMsg(fd, BLP2P_MSG_QUERY_CHAIN, queryBuf, 8);
+            free(queryBuf, 8);
+            BLBlockFree(newBlock);
+        } else {
+            BLBlockFree(newBlock);
+        }
+    }
+
+    if (payload != 0) { free(payload, payLen); }
+    return 1;
+}
+
+// BLP2PPoll: accept one new peer connection if available (non-blocking via accept).
+// Returns 1 if new connection accepted, 0 otherwise.
+pub fn BLP2PPoll(node: int64): int64 {
+    var serverFd: int64 := peek64(node + BLP2P_NODE_SERVER_FD);
+    if (serverFd == (0 - 1)) { return 0; }
+
+    // accept4 with SOCK_NONBLOCK = 526336 (0x80800)... use blocking accept for simplicity
+    var clientFd: int64 := sys_accept(serverFd, 0, 0);
+    if (clientFd < 0) { return 0; }
+
+    var fds: int64  := peek64(node + BLP2P_NODE_PEER_FDS);
+    var slot: int64 := 0 - 1;
+    var i: int64    := 0;
+    while (i < BLP2P_MAX_PEERS) {
+        if (peek64(fds + i * 8) == (0 - 1)) { slot := i; break; }
+        i += 1;
+    }
+    if (slot == (0 - 1)) { p2pClose(clientFd); return 0; }
+
+    poke64(fds + slot * 8, clientFd);
+    poke64(node + BLP2P_NODE_PEER_COUNT, peek64(node + BLP2P_NODE_PEER_COUNT) + 1);
+
+    // Send latest block to new peer
+    var last: int64   := BLGetBlock(peek64(node + BLP2P_NODE_BC), BLChainLength(peek64(node + BLP2P_NODE_BC)) - 1);
+    var lenPtr: int64 := alloc(8);
+    var blkBuf: int64 := p2pSerializeBlock(last, lenPtr);
+    var blkLen: int64 := peek64(lenPtr);
+    free(lenPtr, 8);
+    p2pSendMsg(clientFd, BLP2P_MSG_RESP_LATEST, blkBuf, blkLen);
+    free(blkBuf, blkLen);
+
+    return 1;
+}

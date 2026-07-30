@@ -1,0 +1,349 @@
+// std/cloud/sqs.lyx — AWS SQS Client
+// WP-AWS-11 (messaging part 1)
+// Query protocol (POST form-urlencoded → XML responses)
+
+unit std.cloud.sqs;
+
+import std.cloud.aws.core;
+import std.cloud.aws.transport;
+import std.cloud.aws.xml;
+import std.alloc;
+import std.io;
+
+pub type SQSClient = struct {
+    creds:       AWSCreds;
+    region:      int64;  // pchar
+    host:        int64;  // pchar alloc'd
+    accountId:   int64;  // pchar (optional, for URL building)
+};
+
+pub type SQSMessage = struct {
+    messageId:     int64;  // pchar
+    receiptHandle: int64;  // pchar
+    body:          int64;  // pchar
+    md5:           int64;  // pchar
+    attributes:    int64;  // pchar (raw XML/JSON)
+};
+
+pub fn SQSMessageFree(m: SQSMessage) {
+    if (m.messageId     != 0) { free(m.messageId,     StrLen(m.messageId     as pchar)+1); }
+    if (m.receiptHandle != 0) { free(m.receiptHandle, StrLen(m.receiptHandle as pchar)+1); }
+    if (m.body          != 0) { free(m.body,          StrLen(m.body          as pchar)+1); }
+    if (m.md5           != 0) { free(m.md5,           StrLen(m.md5           as pchar)+1); }
+    if (m.attributes    != 0) { free(m.attributes,    StrLen(m.attributes    as pchar)+1); }
+}
+
+fn sqsAppend(buf: int64, off: int64, s: pchar): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while(i<n){poke8(buf+off+i,StrCharAt(s,i)&0xFF);i:=i+1;}
+    return off+n;
+}
+
+fn sqsUrlEncode(s: pchar, buf: int64, off: int64): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while(i<n){
+        var c: int64 := StrCharAt(s,i) & 0xFF;
+        if ((c>=65&&c<=90)||(c>=97&&c<=122)||(c>=48&&c<=57)||c==45||c==95||c==46||c==126) {
+            poke8(buf+off,c); off:=off+1;
+        } else {
+            poke8(buf+off,37);
+            poke8(buf+off+1,if((c>>4)<10){48+(c>>4)}else{87+(c>>4)});
+            poke8(buf+off+2,if((c&0xF)<10){48+(c&0xF)}else{87+(c&0xF)});
+            off:=off+3;
+        }
+        i:=i+1;
+    }
+    return off;
+}
+
+fn sqsSend(client: SQSClient, queuePath: pchar, body: int64, bodyLen: int64): AWSResponse {
+    // SQS uses path-based queue URLs: host + "/" + accountId + "/" + queueName
+    return AWSQueryRequest(client.creds, client.host as pchar,
+                           body, bodyLen,
+                           client.region as pchar, "sqs"c);
+}
+
+pub fn SQSConnect(creds: AWSCreds, region: pchar): SQSClient {
+    var c: SQSClient;
+    c.creds     := creds;
+    c.region    := region as int64;
+    c.host      := AWSEndpoint("sqs"c, region) as int64;
+    c.accountId := 0;
+    return c;
+}
+
+pub fn SQSClose(client: SQSClient) {
+    AWSCredentialsFree(client.creds);
+    if (client.host != 0) { free(client.host, StrLen(client.host as pchar)+1); }
+}
+
+// ── Queue operations ──────────────────────────────────────────────────────────
+
+pub fn SQSListQueues(client: SQSClient, prefix: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=ListQueues&Version=2012-11-05"c);
+    if (prefix != 0 as pchar && StrLen(prefix) > 0) {
+        off := sqsAppend(buf, off, "&QueueNamePrefix="c);
+        off := sqsUrlEncode(prefix, buf, off);
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 256);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SQSCreateQueue(client: SQSClient, name: pchar,
+                      visibilityTimeout: int64, retentionSec: int64): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=CreateQueue&Version=2012-11-05&QueueName="c);
+    off := sqsUrlEncode(name, buf, off);
+    if (visibilityTimeout > 0) {
+        off := sqsAppend(buf, off, "&Attribute.1.Name=VisibilityTimeout&Attribute.1.Value="c);
+        var tmp: int64 := alloc(24); Int64ToStr(visibilityTimeout, tmp as pchar);
+        off := sqsAppend(buf, off, tmp as pchar); free(tmp, 24);
+    }
+    if (retentionSec > 0) {
+        off := sqsAppend(buf, off, "&Attribute.2.Name=MessageRetentionPeriod&Attribute.2.Value="c);
+        var tmp2: int64 := alloc(24); Int64ToStr(retentionSec, tmp2 as pchar);
+        off := sqsAppend(buf, off, tmp2 as pchar); free(tmp2, 24);
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "QueueUrl"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SQSCreateFIFOQueue(client: SQSClient, name: pchar): int64 {
+    // FIFO queue names must end in .fifo
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=CreateQueue&Version=2012-11-05&QueueName="c);
+    off := sqsUrlEncode(name, buf, off);
+    off := sqsAppend(buf, off, "&Attribute.1.Name=FifoQueue&Attribute.1.Value=true"c);
+    off := sqsAppend(buf, off, "&Attribute.2.Name=ContentBasedDeduplication&Attribute.2.Value=true"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "QueueUrl"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SQSGetQueueUrl(client: SQSClient, name: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=GetQueueUrl&Version=2012-11-05&QueueName="c);
+    off := sqsUrlEncode(name, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 256);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "QueueUrl"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SQSDeleteQueue(client: SQSClient, queueUrl: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=DeleteQueue&Version=2012-11-05&QueueUrl="c);
+    off := sqsUrlEncode(queueUrl, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn SQSGetQueueAttributes(client: SQSClient, queueUrl: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=GetQueueAttributes&Version=2012-11-05&QueueUrl="c);
+    off := sqsUrlEncode(queueUrl, buf, off);
+    off := sqsAppend(buf, off, "&AttributeName.1=All"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+// ── Message operations ────────────────────────────────────────────────────────
+
+pub fn SQSSendMessage(client: SQSClient, queueUrl: pchar,
+                      body: pchar, delaySeconds: int64): int64 {
+    var buf: int64 := alloc(4096); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=SendMessage&Version=2012-11-05&QueueUrl="c);
+    off := sqsUrlEncode(queueUrl, buf, off);
+    off := sqsAppend(buf, off, "&MessageBody="c);
+    off := sqsUrlEncode(body, buf, off);
+    if (delaySeconds > 0) {
+        off := sqsAppend(buf, off, "&DelaySeconds="c);
+        var tmp: int64 := alloc(24); Int64ToStr(delaySeconds, tmp as pchar);
+        off := sqsAppend(buf, off, tmp as pchar); free(tmp, 24);
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 4096);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "MessageId"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SQSSendMessageFIFO(client: SQSClient, queueUrl: pchar,
+                           body: pchar, groupId: pchar, dedupeId: pchar): int64 {
+    var buf: int64 := alloc(4096); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=SendMessage&Version=2012-11-05&QueueUrl="c);
+    off := sqsUrlEncode(queueUrl, buf, off);
+    off := sqsAppend(buf, off, "&MessageBody="c);
+    off := sqsUrlEncode(body, buf, off);
+    off := sqsAppend(buf, off, "&MessageGroupId="c);
+    off := sqsUrlEncode(groupId, buf, off);
+    if (dedupeId != 0 as pchar && StrLen(dedupeId) > 0) {
+        off := sqsAppend(buf, off, "&MessageDeduplicationId="c);
+        off := sqsUrlEncode(dedupeId, buf, off);
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 4096);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "MessageId"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SQSReceiveMessages(client: SQSClient, queueUrl: pchar,
+                           maxMessages: int64, waitSeconds: int64): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=ReceiveMessage&Version=2012-11-05&QueueUrl="c);
+    off := sqsUrlEncode(queueUrl, buf, off);
+    if (maxMessages > 0 && maxMessages <= 10) {
+        off := sqsAppend(buf, off, "&MaxNumberOfMessages="c);
+        var tmp: int64 := alloc(24); Int64ToStr(maxMessages, tmp as pchar);
+        off := sqsAppend(buf, off, tmp as pchar); free(tmp, 24);
+    }
+    if (waitSeconds > 0) {
+        off := sqsAppend(buf, off, "&WaitTimeSeconds="c);
+        var tmp2: int64 := alloc(24); Int64ToStr(waitSeconds, tmp2 as pchar);
+        off := sqsAppend(buf, off, tmp2 as pchar); free(tmp2, 24);
+    }
+    off := sqsAppend(buf, off, "&AttributeName.1=All&MessageAttributeName.1=All"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SQSDeleteMessage(client: SQSClient, queueUrl: pchar, receiptHandle: pchar): int64 {
+    var buf: int64 := alloc(4096); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=DeleteMessage&Version=2012-11-05&QueueUrl="c);
+    off := sqsUrlEncode(queueUrl, buf, off);
+    off := sqsAppend(buf, off, "&ReceiptHandle="c);
+    off := sqsUrlEncode(receiptHandle, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 4096);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn SQSDeleteMessageBatch(client: SQSClient, queueUrl: pchar,
+                              handles: int64, count: int64): int64 {
+    // handles: array of pchar receiptHandles
+    var buf: int64 := alloc(65536); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=DeleteMessageBatch&Version=2012-11-05&QueueUrl="c);
+    off := sqsUrlEncode(queueUrl, buf, off);
+    var i: int64 := 0;
+    while (i < count) {
+        var rh: pchar := peek64(handles + i*8) as pchar;
+        off := sqsAppend(buf, off, "&DeleteMessageBatchRequestEntry."c);
+        var tmp: int64 := alloc(24); Int64ToStr(i+1, tmp as pchar);
+        off := sqsAppend(buf, off, tmp as pchar); free(tmp, 24);
+        off := sqsAppend(buf, off, ".Id="c);
+        var idbuf: int64 := alloc(24); Int64ToStr(i+1, idbuf as pchar);
+        off := sqsAppend(buf, off, idbuf as pchar); free(idbuf, 24);
+        off := sqsAppend(buf, off, "&DeleteMessageBatchRequestEntry."c);
+        var tmp2: int64 := alloc(24); Int64ToStr(i+1, tmp2 as pchar);
+        off := sqsAppend(buf, off, tmp2 as pchar); free(tmp2, 24);
+        off := sqsAppend(buf, off, ".ReceiptHandle="c);
+        off := sqsUrlEncode(rh, buf, off);
+        i:=i+1;
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 65536);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn SQSChangeMessageVisibility(client: SQSClient, queueUrl: pchar,
+                                   receiptHandle: pchar, visibilityTimeout: int64): int64 {
+    var buf: int64 := alloc(4096); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=ChangeMessageVisibility&Version=2012-11-05&QueueUrl="c);
+    off := sqsUrlEncode(queueUrl, buf, off);
+    off := sqsAppend(buf, off, "&ReceiptHandle="c);
+    off := sqsUrlEncode(receiptHandle, buf, off);
+    off := sqsAppend(buf, off, "&VisibilityTimeout="c);
+    var tmp: int64 := alloc(24); Int64ToStr(visibilityTimeout, tmp as pchar);
+    off := sqsAppend(buf, off, tmp as pchar); free(tmp, 24);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 4096);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn SQSPurgeQueue(client: SQSClient, queueUrl: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := sqsAppend(buf, off, "Action=PurgeQueue&Version=2012-11-05&QueueUrl="c);
+    off := sqsUrlEncode(queueUrl, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := sqsSend(client, 0 as pchar, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+// Parse first message from ReceiveMessage XML response
+pub fn SQSParseFirstMessage(xml: int64, xmlLen: int64): SQSMessage {
+    var msg: SQSMessage;
+    var item: int64 := XMLFind(xml, xmlLen, "Message"c);
+    if (item == 0) { return msg; }
+    var il: int64 := StrLen(item as pchar);
+    msg.messageId     := XMLFind(item, il, "MessageId"c);
+    msg.receiptHandle := XMLFind(item, il, "ReceiptHandle"c);
+    msg.body          := XMLFind(item, il, "Body"c);
+    msg.md5           := XMLFind(item, il, "MD5OfBody"c);
+    free(item, il+1);
+    return msg;
+}

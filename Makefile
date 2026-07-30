@@ -143,6 +143,11 @@ test: lyxc
 	@echo "--- Statischer Methodenaufruf TypeName.Method() (7 tests) ---"
 	@bash tests/static_method_call_test.sh
 	@echo "OK"
+	@echo "--- Geometrie-/Result-Units (Struct-Literal-Umbau, 31 Prüfungen) ---"
+	./lyxc --std-path=std tests/geom_units_test.lyx -o /tmp/lyxc_geom_test
+	@/tmp/lyxc_geom_test > /dev/null
+	@rm -f /tmp/lyxc_geom_test
+	@echo "OK"
 	@echo "--- LYXOS @capabilities → CAPS-TLV-Mapping (6 tests) ---"
 	@bash tests/lyxos_caps_tlv_test.sh
 	@echo "--- LYXOS importierte-Klassen-Methoden-Dispatch (1 test) ---"

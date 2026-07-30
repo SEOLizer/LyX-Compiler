@@ -2,6 +2,26 @@
 
 ## Unveröffentlicht (develop)
 
+### Standardbibliothek — nicht kompilierbare Units repariert (#960)
+- **16 Units waren nicht übersetzbar** und blockierten damit jedes Programm, das
+  sie importiert (der Resolver bevorzugt `.lyx` vor `.lyu`). `test_compile_units.sh`
+  geht von **64 OK / 28 failed** auf **77 OK / 15 failed**; die verbleibenden 15
+  sind ausschließlich FFI-Sandbox-fail-closed und damit gewolltes Verhalten.
+- **Struct-Literale `Type{f: e, …}` (96 Stellen in 7 Units)** — eine Syntax, die
+  Lyx nie hatte, weder im Parser noch in der EBNF. Umgeschrieben auf Deklaration
+  + Feldzuweisung; verschachtelte Literale (`Rect{min: Vec2{…}}`) wandern von
+  innen nach außen in Hilfsvariablen.
+- **`array[N]T` → `[N]T`** (13 Stellen in 6 Units): `ArrayType` ist laut EBNF
+  `array "[" Type "]"`, eine Zahl ist dort kein gültiger Typ.
+- **Reservierte Keywords als Bezeichner**: `match` (buffer), `widget`/`layout`
+  (lfd_factory, qt5_app), `repeat` (svg/anim), `i8` (ml_full).
+- **`const` → `con`** (crt_raw), fehlende `import std.alloc` (xml, uuid),
+  Phantomtyp `fd` → `int64` (systeminfo).
+- Neuer Test `tests/geom_units_test.lyx` (31 Prüfungen), in `make test`
+  verdrahtet: prüft Konstruktoren **und** abgeleitete Werte der umgeschriebenen
+  Geometrie-/Result-Units gegen erwartete Zahlen — „kompiliert durch" genügt bei
+  einem mechanischen Umbau nicht.
+
 ### Compiler (sema)
 - **`TypeName.Method()` wird abgelehnt, wenn die Methode `self` benutzt** — dann
   fehlt der Empfänger und die Methode arbeitete an einer beliebigen Adresse

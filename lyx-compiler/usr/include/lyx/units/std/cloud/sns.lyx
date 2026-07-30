@@ -1,0 +1,310 @@
+// std/cloud/sns.lyx — AWS SNS Client
+// WP-AWS-11 (messaging part 2)
+// Query protocol (POST form-urlencoded → XML responses)
+
+unit std.cloud.sns;
+
+import std.cloud.aws.core;
+import std.cloud.aws.transport;
+import std.cloud.aws.xml;
+import std.alloc;
+import std.io;
+
+pub type SNSClient = struct {
+    creds:  AWSCreds;
+    region: int64;
+    host:   int64;
+};
+
+fn snsAppend(buf: int64, off: int64, s: pchar): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while(i<n){poke8(buf+off+i,StrCharAt(s,i)&0xFF);i:=i+1;}
+    return off+n;
+}
+
+fn snsUrlEncode(s: pchar, buf: int64, off: int64): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while(i<n){
+        var c: int64 := StrCharAt(s,i) & 0xFF;
+        if ((c>=65&&c<=90)||(c>=97&&c<=122)||(c>=48&&c<=57)||c==45||c==95||c==46||c==126) {
+            poke8(buf+off,c); off:=off+1;
+        } else {
+            poke8(buf+off,37);
+            poke8(buf+off+1,if((c>>4)<10){48+(c>>4)}else{87+(c>>4)});
+            poke8(buf+off+2,if((c&0xF)<10){48+(c&0xF)}else{87+(c&0xF)});
+            off:=off+3;
+        }
+        i:=i+1;
+    }
+    return off;
+}
+
+fn snsSend(client: SNSClient, body: int64, bodyLen: int64): AWSResponse {
+    return AWSQueryRequest(client.creds, client.host as pchar,
+                           body, bodyLen,
+                           client.region as pchar, "sns"c);
+}
+
+pub fn SNSConnect(creds: AWSCreds, region: pchar): SNSClient {
+    var c: SNSClient;
+    c.creds  := creds;
+    c.region := region as int64;
+    c.host   := AWSEndpoint("sns"c, region) as int64;
+    return c;
+}
+
+pub fn SNSClose(client: SNSClient) {
+    AWSCredentialsFree(client.creds);
+    if (client.host != 0) { free(client.host, StrLen(client.host as pchar)+1); }
+}
+
+// ── Topics ────────────────────────────────────────────────────────────────────
+
+pub fn SNSListTopics(client: SNSClient): int64 {
+    var body: pchar := "Action=ListTopics&Version=2010-03-31"c;
+    var resp: AWSResponse := snsSend(client, body as int64, StrLen(body));
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SNSCreateTopic(client: SNSClient, name: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=CreateTopic&Version=2010-03-31&Name="c);
+    off := snsUrlEncode(name, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 256);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "TopicArn"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SNSCreateFIFOTopic(client: SNSClient, name: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=CreateTopic&Version=2010-03-31&Name="c);
+    off := snsUrlEncode(name, buf, off);
+    off := snsAppend(buf, off, "&Attributes.entry.1.key=FifoTopic&Attributes.entry.1.value=true"c);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "TopicArn"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SNSDeleteTopic(client: SNSClient, topicArn: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=DeleteTopic&Version=2010-03-31&TopicArn="c);
+    off := snsUrlEncode(topicArn, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn SNSGetTopicAttributes(client: SNSClient, topicArn: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=GetTopicAttributes&Version=2010-03-31&TopicArn="c);
+    off := snsUrlEncode(topicArn, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+// ── Publishing ────────────────────────────────────────────────────────────────
+
+pub fn SNSPublish(client: SNSClient, topicArn: pchar, subject: pchar, message: pchar): int64 {
+    var buf: int64 := alloc(8192); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=Publish&Version=2010-03-31&TopicArn="c);
+    off := snsUrlEncode(topicArn, buf, off);
+    if (subject != 0 as pchar && StrLen(subject) > 0) {
+        off := snsAppend(buf, off, "&Subject="c);
+        off := snsUrlEncode(subject, buf, off);
+    }
+    off := snsAppend(buf, off, "&Message="c);
+    off := snsUrlEncode(message, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 8192);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "MessageId"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SNSPublishToPhone(client: SNSClient, phoneNumber: pchar, message: pchar): int64 {
+    var buf: int64 := alloc(4096); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=Publish&Version=2010-03-31&PhoneNumber="c);
+    off := snsUrlEncode(phoneNumber, buf, off);
+    off := snsAppend(buf, off, "&Message="c);
+    off := snsUrlEncode(message, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 4096);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "MessageId"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SNSPublishBatch(client: SNSClient, topicArn: pchar,
+                        messages: int64, count: int64): int64 {
+    // messages: array of pchar message bodies
+    var buf: int64 := alloc(65536); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=PublishBatch&Version=2010-03-31&TopicArn="c);
+    off := snsUrlEncode(topicArn, buf, off);
+    var i: int64 := 0;
+    while (i < count) {
+        var msg: pchar := peek64(messages + i*8) as pchar;
+        var tmp: int64 := alloc(24); Int64ToStr(i+1, tmp as pchar);
+        off := snsAppend(buf, off, "&PublishBatchRequestEntries.member."c);
+        off := snsAppend(buf, off, tmp as pchar);
+        off := snsAppend(buf, off, ".Id="c);
+        off := snsAppend(buf, off, tmp as pchar);
+        off := snsAppend(buf, off, "&PublishBatchRequestEntries.member."c);
+        off := snsAppend(buf, off, tmp as pchar);
+        off := snsAppend(buf, off, ".Message="c);
+        free(tmp, 24);
+        off := snsUrlEncode(msg, buf, off);
+        i:=i+1;
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 65536);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+// ── Subscriptions ─────────────────────────────────────────────────────────────
+
+pub fn SNSSubscribe(client: SNSClient, topicArn: pchar,
+                    protocol: pchar, endpoint: pchar): int64 {
+    var buf: int64 := alloc(2048); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=Subscribe&Version=2010-03-31&TopicArn="c);
+    off := snsUrlEncode(topicArn, buf, off);
+    off := snsAppend(buf, off, "&Protocol="c);
+    off := snsUrlEncode(protocol, buf, off);
+    off := snsAppend(buf, off, "&Endpoint="c);
+    off := snsUrlEncode(endpoint, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 2048);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "SubscriptionArn"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SNSUnsubscribe(client: SNSClient, subscriptionArn: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=Unsubscribe&Version=2010-03-31&SubscriptionArn="c);
+    off := snsUrlEncode(subscriptionArn, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn SNSListSubscriptionsByTopic(client: SNSClient, topicArn: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=ListSubscriptionsByTopic&Version=2010-03-31&TopicArn="c);
+    off := snsUrlEncode(topicArn, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SNSConfirmSubscription(client: SNSClient, topicArn: pchar, token: pchar): int64 {
+    var buf: int64 := alloc(1024); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=ConfirmSubscription&Version=2010-03-31&TopicArn="c);
+    off := snsUrlEncode(topicArn, buf, off);
+    off := snsAppend(buf, off, "&Token="c);
+    off := snsUrlEncode(token, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 1024);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "SubscriptionArn"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+// ── Platform Applications (push notifications) ────────────────────────────────
+
+pub fn SNSCreatePlatformApplication(client: SNSClient, name: pchar,
+                                     platform: pchar, credential: pchar): int64 {
+    // platform: "APNS" | "GCM" | "APNS_SANDBOX" etc.
+    var buf: int64 := alloc(2048); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=CreatePlatformApplication&Version=2010-03-31&Name="c);
+    off := snsUrlEncode(name, buf, off);
+    off := snsAppend(buf, off, "&Platform="c);
+    off := snsUrlEncode(platform, buf, off);
+    off := snsAppend(buf, off, "&Attributes.entry.1.key=PlatformCredential&Attributes.entry.1.value="c);
+    off := snsUrlEncode(credential, buf, off);
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 2048);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "PlatformApplicationArn"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn SNSCreatePlatformEndpoint(client: SNSClient, platformAppArn: pchar,
+                                  deviceToken: pchar, userData: pchar): int64 {
+    var buf: int64 := alloc(2048); var off: int64 := 0;
+    off := snsAppend(buf, off, "Action=CreatePlatformEndpoint&Version=2010-03-31&PlatformApplicationArn="c);
+    off := snsUrlEncode(platformAppArn, buf, off);
+    off := snsAppend(buf, off, "&Token="c);
+    off := snsUrlEncode(deviceToken, buf, off);
+    if (userData != 0 as pchar && StrLen(userData) > 0) {
+        off := snsAppend(buf, off, "&CustomUserData="c);
+        off := snsUrlEncode(userData, buf, off);
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := snsSend(client, buf, off);
+    free(buf, 2048);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "EndpointArn"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}

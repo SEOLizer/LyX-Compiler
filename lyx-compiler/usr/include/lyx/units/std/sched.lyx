@@ -1,0 +1,152 @@
+// std/sched — WP-8: Scheduling & CPU-Affinität
+// Wrapper um sys_sched_yield, sys_sched_setaffinity, sys_sched_getaffinity,
+// sys_getpriority, sys_setpriority, sys_getcpu
+
+import std.alloc;
+
+// ============================================================
+// Konstanten
+// ============================================================
+
+// cpu_set_t: 128 Bytes = 1024-Bit-Maske (CPU 0..1023)
+pub con CPU_SET_SIZE: int64 := 128;
+
+// getpriority/setpriority: which-Werte
+pub con PRIO_PROCESS: int64 := 0;  // Prozess-ID
+pub con PRIO_PGRP:    int64 := 1;  // Prozessgruppen-ID
+pub con PRIO_USER:    int64 := 2;  // Benutzer-ID
+
+// ============================================================
+// CPU-Scheduling
+// ============================================================
+
+// SchedYield: gibt die CPU freiwillig ab (Kooperatives Multitasking).
+pub fn SchedYield(): int64 {
+  return sys_sched_yield();
+}
+
+// ============================================================
+// CPU-Affinität
+// ============================================================
+
+// SchedSetAffinity: setzt die CPU-Affinität von pid.
+// cpuMask: alloc(CPU_SET_SIZE) — Bitmap welche CPUs erlaubt sind.
+// pid=0 → aktueller Prozess.
+// Gibt 0 bei Erfolg, < 0 bei Fehler.
+pub fn SchedSetAffinity(pid: int64, cpuMask: int64): int64 {
+  var r: int64 := sys_sched_setaffinity(pid, CPU_SET_SIZE, cpuMask);
+  if (r < 0) { return r; }
+  return 0;
+}
+
+// SchedGetAffinity: liest die CPU-Affinität von pid.
+// outMask: alloc(CPU_SET_SIZE) — wird mit der aktuellen Maske gefüllt.
+// Gibt 0 bei Erfolg, < 0 bei Fehler.
+// Hinweis: Kernel 6.x gibt die Anzahl kopierter Bytes zurück (z.B. 8) —
+// wir normalisieren auf 0 = Erfolg.
+pub fn SchedGetAffinity(pid: int64, outMask: int64): int64 {
+  var r: int64 := sys_sched_getaffinity(pid, CPU_SET_SIZE, outMask);
+  if (r < 0) { return r; }
+  return 0;
+}
+
+// ============================================================
+// cpu_set_t Helfer
+// ============================================================
+
+// CpuSetZero: setzt alle Bits auf 0 (keine CPU erlaubt).
+pub fn CpuSetZero(buf: int64) {
+  var i: int64 := 0;
+  while (i < CPU_SET_SIZE) {
+    poke8(buf + i, 0);
+    i += 1;
+  }
+}
+
+// CpuSetAdd: erlaubt CPU cpu in der Maske.
+pub fn CpuSetAdd(buf: int64, cpu: int64) {
+  var byteIdx: int64 := cpu / 8;
+  var bit: int64 := 1 << (cpu % 8);
+  var cur: int64 := peek8(buf + byteIdx) as int64;
+  if (cur < 0) { cur := cur + 256; }  // int8-Vorzeichenerweiterung korrigieren
+  poke8(buf + byteIdx, cur | bit);
+}
+
+// CpuSetRemove: verbietet CPU cpu in der Maske.
+pub fn CpuSetRemove(buf: int64, cpu: int64) {
+  var byteIdx: int64 := cpu / 8;
+  var bit: int64 := 1 << (cpu % 8);
+  var cur: int64 := peek8(buf + byteIdx) as int64;
+  if (cur < 0) { cur := cur + 256; }
+  poke8(buf + byteIdx, cur & (255 - bit));
+}
+
+// CpuSetHas: gibt true zurück wenn CPU cpu in der Maske ist.
+pub fn CpuSetHas(buf: int64, cpu: int64): bool {
+  var byteIdx: int64 := cpu / 8;
+  var bit: int64 := 1 << (cpu % 8);
+  var cur: int64 := peek8(buf + byteIdx) as int64;
+  if (cur < 0) { cur := cur + 256; }
+  return (cur & bit) != 0;
+}
+
+// CpuSetCount: zählt die Anzahl gesetzter CPUs in der Maske.
+pub fn CpuSetCount(buf: int64): int64 {
+  var count: int64 := 0;
+  var i: int64 := 0;
+  while (i < CPU_SET_SIZE) {
+    var b: int64 := peek8(buf + i) as int64;
+    if (b < 0) { b := b + 256; }
+    // Popcount des Bytes
+    var j: int64 := 0;
+    while (j < 8) {
+      if ((b & (1 << j)) != 0) { count := count + 1; }
+      j += 1;
+    }
+    i += 1;
+  }
+  return count;
+}
+
+// ============================================================
+// Nice-Wert (Prozess-Priorität)
+// ============================================================
+
+// GetPriority: liefert den Nice-Wert des Prozesses pid (-20..19).
+// pid=0 → aktueller Prozess.
+// Kernel gibt 20-nice zurück; wir rechnen zurück auf den echten Nice-Wert.
+pub fn GetPriority(pid: int64): int64 {
+  var raw: int64 := sys_getpriority(PRIO_PROCESS, pid);
+  if (raw < 0) { return raw; }  // Fehler weitergeben
+  return 20 - raw;
+}
+
+// SetPriority: setzt den Nice-Wert des Prozesses pid (-20..19).
+// Nicht-Root kann den Nice-Wert nur erhöhen (Priorität senken).
+pub fn SetPriority(pid: int64, nice: int64): int64 {
+  return sys_setpriority(PRIO_PROCESS, pid, nice);
+}
+
+// ============================================================
+// Aktuelle CPU
+// ============================================================
+
+// GetCPU: gibt die CPU-Nummer zurück, auf der der Prozess aktuell läuft.
+// cpuOut: alloc(8)-Buffer — nach dem Aufruf peek64() für CPU-Nummer.
+// nodeOut: alloc(8)-Buffer — NUMA-Knoten (0 auf nicht-NUMA-Systemen).
+pub fn GetCPU(cpuOut: int64, nodeOut: int64): int64 {
+  return sys_getcpu(cpuOut, nodeOut, 0);
+}
+
+// GetCurrentCPU: gibt die CPU-Nummer direkt zurück (< 0 bei Fehler).
+pub fn GetCurrentCPU(): int64 {
+  var buf: int64 := alloc(8);
+  if (buf == 0) { return -1; }
+  poke64(buf, 0);
+  var r: int64 := sys_getcpu(buf, 0, 0);
+  var cpu: int64 := 0;
+  if (r == 0) { cpu := peek64(buf) & 4294967295; }
+  free(buf, 8);
+  if (r < 0) { return r; }
+  return cpu;
+}

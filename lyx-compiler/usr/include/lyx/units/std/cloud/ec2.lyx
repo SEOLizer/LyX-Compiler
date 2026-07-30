@@ -1,0 +1,658 @@
+// std/cloud/ec2.lyx — AWS EC2 Client
+// WP-AWS-07
+// Query protocol (POST form-urlencoded → XML responses)
+
+unit std.cloud.ec2;
+
+import std.cloud.aws.core;
+import std.cloud.aws.transport;
+import std.cloud.aws.xml;
+import std.alloc;
+import std.io;
+
+pub type EC2Client = struct {
+    creds:   AWSCreds;
+    region:  int64;  // pchar
+    host:    int64;  // pchar (alloc'd)
+};
+
+pub type EC2Instance = struct {
+    instanceId:   int64;  // pchar (alloc'd)
+    state:        int64;  // pchar (alloc'd)
+    instanceType: int64;  // pchar (alloc'd)
+    publicIP:     int64;  // pchar (alloc'd)
+    privateIP:    int64;  // pchar (alloc'd)
+    imageId:      int64;  // pchar (alloc'd)
+    keyName:      int64;  // pchar (alloc'd)
+    launchTime:   int64;  // pchar (alloc'd)
+};
+
+pub type EC2Volume = struct {
+    volumeId:         int64;  // pchar
+    size:             int64;
+    state:            int64;  // pchar
+    availabilityZone: int64;  // pchar
+    volumeType:       int64;  // pchar
+};
+
+pub type EC2SecurityGroup = struct {
+    groupId:   int64;  // pchar
+    groupName: int64;  // pchar
+    vpcId:     int64;  // pchar
+};
+
+pub fn EC2InstanceFree(i: EC2Instance) {
+    if (i.instanceId   != 0) { free(i.instanceId,   StrLen(i.instanceId   as pchar)+1); }
+    if (i.state        != 0) { free(i.state,        StrLen(i.state        as pchar)+1); }
+    if (i.instanceType != 0) { free(i.instanceType, StrLen(i.instanceType as pchar)+1); }
+    if (i.publicIP     != 0) { free(i.publicIP,     StrLen(i.publicIP     as pchar)+1); }
+    if (i.privateIP    != 0) { free(i.privateIP,    StrLen(i.privateIP    as pchar)+1); }
+    if (i.imageId      != 0) { free(i.imageId,      StrLen(i.imageId      as pchar)+1); }
+    if (i.keyName      != 0) { free(i.keyName,      StrLen(i.keyName      as pchar)+1); }
+    if (i.launchTime   != 0) { free(i.launchTime,   StrLen(i.launchTime   as pchar)+1); }
+}
+
+fn ec2StrDup(s: pchar): int64 {
+    if (s == 0 as pchar) { return 0; }
+    var n: int64 := StrLen(s)+1;
+    var b: int64 := alloc(n);
+    var i: int64 := 0;
+    while(i<n){poke8(b+i,StrCharAt(s,i)&0xFF);i:=i+1;}
+    return b;
+}
+
+pub fn EC2Connect(creds: AWSCreds, region: pchar): EC2Client {
+    var c: EC2Client;
+    c.creds  := creds;
+    c.region := region as int64;
+    c.host   := AWSEndpoint("ec2"c, region) as int64;
+    return c;
+}
+
+pub fn EC2Close(client: EC2Client) {
+    AWSCredentialsFree(client.creds);
+    if (client.host != 0) { free(client.host, StrLen(client.host as pchar)+1); }
+}
+
+fn ec2Query(client: EC2Client, params: int64, count: int64): AWSResponse {
+    var body: int64 := AWSQueryBuild("DescribeInstances"c, "2016-11-15"c, params, 0);
+    // body is replaced by caller's action; we just need the transport call
+    // caller passes full body directly
+    // Actually, rebuild properly per call — this helper is action-agnostic for body
+    var resp: AWSResponse := AWSQueryRequest(client.creds, client.host as pchar,
+                                             body, StrLen(body as pchar),
+                                             client.region as pchar, "ec2"c);
+    free(body, StrLen(body as pchar)+1);
+    return resp;
+}
+
+fn ec2Send(client: EC2Client, body: int64, bodyLen: int64): AWSResponse {
+    return AWSQueryRequest(client.creds, client.host as pchar,
+                           body, bodyLen,
+                           client.region as pchar, "ec2"c);
+}
+
+// ── Instances ─────────────────────────────────────────────────────────────────
+
+fn parseEC2Instance(xml: int64, xmlLen: int64): EC2Instance {
+    var inst: EC2Instance;
+    var idBuf:   int64 := XMLFind(xml, xmlLen, "instanceId"c);
+    var stBuf:   int64 := XMLFindIn(xml, xmlLen, "instanceState"c, "name"c);
+    var typBuf:  int64 := XMLFind(xml, xmlLen, "instanceType"c);
+    var pubBuf:  int64 := XMLFind(xml, xmlLen, "ipAddress"c);
+    var privBuf: int64 := XMLFind(xml, xmlLen, "privateIpAddress"c);
+    var imgBuf:  int64 := XMLFind(xml, xmlLen, "imageId"c);
+    var keyBuf:  int64 := XMLFind(xml, xmlLen, "keyName"c);
+    var ltBuf:   int64 := XMLFind(xml, xmlLen, "launchTime"c);
+    inst.instanceId   := idBuf;
+    inst.state        := stBuf;
+    inst.instanceType := typBuf;
+    inst.publicIP     := pubBuf;
+    inst.privateIP    := privBuf;
+    inst.imageId      := imgBuf;
+    inst.keyName      := keyBuf;
+    inst.launchTime   := ltBuf;
+    return inst;
+}
+
+pub fn EC2DescribeInstances(client: EC2Client): int64 {
+    var body: int64 := AWSQueryBuild("DescribeInstances"c, "2016-11-15"c, 0, 0);
+    var bodyLen: int64 := StrLen(body as pchar);
+    var resp: AWSResponse := ec2Send(client, body, bodyLen);
+    free(body, bodyLen+1);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2RunInstances(client: EC2Client, imageId: pchar, instanceType: pchar,
+                       minCount: int64, maxCount: int64, keyName: pchar,
+                       subnetId: pchar, sgId: pchar): int64 {
+    var buf: int64 := alloc(2048); var off: int64 := 0;
+    fn ap(s: pchar) {
+        var n: int64 := StrLen(s); var i: int64 := 0;
+        while(i<n){poke8(buf+off+i,StrCharAt(s,i)&0xFF);i:=i+1;}
+        off:=off+n;
+    }
+    fn apc(s: pchar, c: int64) {
+        ap(s); poke8(buf+off,c&0xFF); off:=off+1;
+    }
+    fn apN(n: int64) {
+        var tmp: int64 := alloc(24);
+        Int64ToStr(n, tmp as pchar);
+        ap(tmp as pchar);
+        free(tmp, 24);
+    }
+    ap("Action=RunInstances&Version=2016-11-15"c);
+    ap("&ImageId="c); ap(imageId);
+    ap("&InstanceType="c); ap(instanceType);
+    ap("&MinCount="c); apN(minCount);
+    ap("&MaxCount="c); apN(maxCount);
+    if (keyName != 0 as pchar && StrLen(keyName) > 0) {
+        ap("&KeyName="c); ap(keyName);
+    }
+    if (subnetId != 0 as pchar && StrLen(subnetId) > 0) {
+        ap("&SubnetId="c); ap(subnetId);
+    }
+    if (sgId != 0 as pchar && StrLen(sgId) > 0) {
+        ap("&SecurityGroupId.1="c); ap(sgId);
+    }
+    poke8(buf+off, 0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 2048);
+    var result: int64 := 0;
+    if (resp.statusCode == 200) {
+        var body: int64 := resp.body;
+        result := XMLFind(body, resp.bodyLen, "instanceId"c);
+        resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2TerminateInstances(client: EC2Client, instanceId: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=TerminateInstances&Version=2016-11-15&InstanceId.1="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n := StrLen(instanceId);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(instanceId,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn EC2StopInstances(client: EC2Client, instanceId: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=StopInstances&Version=2016-11-15&InstanceId.1="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n := StrLen(instanceId);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(instanceId,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn EC2StartInstances(client: EC2Client, instanceId: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=StartInstances&Version=2016-11-15&InstanceId.1="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n := StrLen(instanceId);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(instanceId,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn EC2DescribeInstanceStatus(client: EC2Client, instanceId: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=DescribeInstanceStatus&Version=2016-11-15&InstanceId.1="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n := StrLen(instanceId);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(instanceId,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "instanceStatus"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2DescribeInstanceById(client: EC2Client, instanceId: pchar): EC2Instance {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=DescribeInstances&Version=2016-11-15&InstanceId.1="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n := StrLen(instanceId);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(instanceId,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var inst: EC2Instance;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        var item: int64 := XMLFind(resp.body, resp.bodyLen, "item"c);
+        if (item != 0) {
+            inst := parseEC2Instance(item, StrLen(item as pchar));
+            free(item, StrLen(item as pchar)+1);
+        }
+    }
+    AWSResponseFree(resp);
+    return inst;
+}
+
+// ── AMIs ──────────────────────────────────────────────────────────────────────
+
+pub fn EC2DescribeImages(client: EC2Client, owner: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=DescribeImages&Version=2016-11-15"c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    if (owner != 0 as pchar && StrLen(owner) > 0) {
+        var p: pchar := "&Owner.1="c; n:=StrLen(p);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(p,i)&0xFF);i:=i+1;} off:=off+n;
+        n:=StrLen(owner);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(owner,i)&0xFF);i:=i+1;} off:=off+n;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2CreateImage(client: EC2Client, instanceId: pchar, name: pchar,
+                      noReboot: int64): int64 {
+    var buf: int64 := alloc(1024); var off: int64 := 0;
+    var s: pchar := "Action=CreateImage&Version=2016-11-15&InstanceId="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(instanceId);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(instanceId,i)&0xFF);i:=i+1;} off:=off+n;
+    var nm: pchar := "&Name="c; n:=StrLen(nm);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(nm,i)&0xFF);i:=i+1;} off:=off+n;
+    n:=StrLen(name);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(name,i)&0xFF);i:=i+1;} off:=off+n;
+    if (noReboot == 1) {
+        var nr: pchar := "&NoReboot=true"c; n:=StrLen(nr);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(nr,i)&0xFF);i:=i+1;} off:=off+n;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 1024);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "imageId"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+// ── Key Pairs ─────────────────────────────────────────────────────────────────
+
+pub fn EC2DescribeKeyPairs(client: EC2Client): int64 {
+    var body: pchar := "Action=DescribeKeyPairs&Version=2016-11-15"c;
+    var resp: AWSResponse := ec2Send(client, body as int64, StrLen(body));
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2ImportKeyPair(client: EC2Client, keyName: pchar, publicKeyBase64: pchar): int64 {
+    var buf: int64 := alloc(2048); var off: int64 := 0;
+    var s: pchar := "Action=ImportKeyPair&Version=2016-11-15&KeyName="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(keyName);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(keyName,i)&0xFF);i:=i+1;} off:=off+n;
+    var pk: pchar := "&PublicKeyMaterial="c; n:=StrLen(pk);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(pk,i)&0xFF);i:=i+1;} off:=off+n;
+    n:=StrLen(publicKeyBase64);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(publicKeyBase64,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 2048);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn EC2DeleteKeyPair(client: EC2Client, keyName: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=DeleteKeyPair&Version=2016-11-15&KeyName="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(keyName);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(keyName,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+// ── Security Groups ───────────────────────────────────────────────────────────
+
+pub fn EC2DescribeSecurityGroups(client: EC2Client): int64 {
+    var body: pchar := "Action=DescribeSecurityGroups&Version=2016-11-15"c;
+    var resp: AWSResponse := ec2Send(client, body as int64, StrLen(body));
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2CreateSecurityGroup(client: EC2Client, name: pchar, desc: pchar, vpcId: pchar): int64 {
+    var buf: int64 := alloc(1024); var off: int64 := 0;
+    var s: pchar := "Action=CreateSecurityGroup&Version=2016-11-15&GroupName="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(name);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(name,i)&0xFF);i:=i+1;} off:=off+n;
+    var d: pchar := "&Description="c; n:=StrLen(d);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(d,i)&0xFF);i:=i+1;} off:=off+n;
+    n:=StrLen(desc);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(desc,i)&0xFF);i:=i+1;} off:=off+n;
+    if (vpcId != 0 as pchar && StrLen(vpcId) > 0) {
+        var vp: pchar := "&VpcId="c; n:=StrLen(vp);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(vp,i)&0xFF);i:=i+1;} off:=off+n;
+        n:=StrLen(vpcId);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(vpcId,i)&0xFF);i:=i+1;} off:=off+n;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 1024);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "groupId"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2AuthorizeSGIngress(client: EC2Client, sgId: pchar,
+                              proto: pchar, fromPort: int64, toPort: int64, cidr: pchar): int64 {
+    var buf: int64 := alloc(1024); var off: int64 := 0;
+    var s: pchar := "Action=AuthorizeSecurityGroupIngress&Version=2016-11-15&GroupId="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(sgId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(sgId,i)&0xFF);i:=i+1;} off:=off+n;
+    var p1: pchar := "&IpPermissions.1.IpProtocol="c; n:=StrLen(p1);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(p1,i)&0xFF);i:=i+1;} off:=off+n;
+    n:=StrLen(proto); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(proto,i)&0xFF);i:=i+1;} off:=off+n;
+    var p2: pchar := "&IpPermissions.1.FromPort="c; n:=StrLen(p2);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(p2,i)&0xFF);i:=i+1;} off:=off+n;
+    var tmp: int64 := alloc(24); Int64ToStr(fromPort, tmp as pchar);
+    n:=StrLen(tmp as pchar); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(tmp as pchar,i)&0xFF);i:=i+1;} off:=off+n;
+    var p3: pchar := "&IpPermissions.1.ToPort="c; n:=StrLen(p3);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(p3,i)&0xFF);i:=i+1;} off:=off+n;
+    Int64ToStr(toPort, tmp as pchar);
+    n:=StrLen(tmp as pchar); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(tmp as pchar,i)&0xFF);i:=i+1;} off:=off+n;
+    free(tmp, 24);
+    var p4: pchar := "&IpPermissions.1.IpRanges.1.CidrIp="c; n:=StrLen(p4);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(p4,i)&0xFF);i:=i+1;} off:=off+n;
+    n:=StrLen(cidr); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(cidr,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 1024);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn EC2DeleteSecurityGroup(client: EC2Client, sgId: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=DeleteSecurityGroup&Version=2016-11-15&GroupId="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(sgId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(sgId,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+// ── VPC ───────────────────────────────────────────────────────────────────────
+
+pub fn EC2DescribeVpcs(client: EC2Client): int64 {
+    var body: pchar := "Action=DescribeVpcs&Version=2016-11-15"c;
+    var resp: AWSResponse := ec2Send(client, body as int64, StrLen(body));
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2CreateVpc(client: EC2Client, cidr: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=CreateVpc&Version=2016-11-15&CidrBlock="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(cidr); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(cidr,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFindIn(resp.body, resp.bodyLen, "vpc"c, "vpcId"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2DescribeSubnets(client: EC2Client, vpcId: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=DescribeSubnets&Version=2016-11-15"c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    if (vpcId != 0 as pchar && StrLen(vpcId) > 0) {
+        var filt: pchar := "&Filter.1.Name=vpc-id&Filter.1.Value.1="c; n:=StrLen(filt);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(filt,i)&0xFF);i:=i+1;} off:=off+n;
+        n:=StrLen(vpcId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(vpcId,i)&0xFF);i:=i+1;} off:=off+n;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+// ── Elastic IPs ───────────────────────────────────────────────────────────────
+
+pub fn EC2AllocateAddress(client: EC2Client): int64 {
+    var body: pchar := "Action=AllocateAddress&Version=2016-11-15&Domain=vpc"c;
+    var resp: AWSResponse := ec2Send(client, body as int64, StrLen(body));
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "allocationId"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2AssociateAddress(client: EC2Client, instanceId: pchar, allocationId: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=AssociateAddress&Version=2016-11-15&InstanceId="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(instanceId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(instanceId,i)&0xFF);i:=i+1;} off:=off+n;
+    var al: pchar := "&AllocationId="c; n:=StrLen(al);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(al,i)&0xFF);i:=i+1;} off:=off+n;
+    n:=StrLen(allocationId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(allocationId,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn EC2ReleaseAddress(client: EC2Client, allocationId: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=ReleaseAddress&Version=2016-11-15&AllocationId="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(allocationId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(allocationId,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+// ── EBS Volumes ───────────────────────────────────────────────────────────────
+
+pub fn EC2DescribeVolumes(client: EC2Client): int64 {
+    var body: pchar := "Action=DescribeVolumes&Version=2016-11-15"c;
+    var resp: AWSResponse := ec2Send(client, body as int64, StrLen(body));
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2CreateVolume(client: EC2Client, az: pchar, sizeGb: int64, volType: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=CreateVolume&Version=2016-11-15&AvailabilityZone="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(az); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(az,i)&0xFF);i:=i+1;} off:=off+n;
+    var sz: pchar := "&Size="c; n:=StrLen(sz);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(sz,i)&0xFF);i:=i+1;} off:=off+n;
+    var tmp: int64 := alloc(24); Int64ToStr(sizeGb, tmp as pchar);
+    n:=StrLen(tmp as pchar); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(tmp as pchar,i)&0xFF);i:=i+1;} off:=off+n;
+    free(tmp, 24);
+    var vt: pchar := "&VolumeType="c; n:=StrLen(vt);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(vt,i)&0xFF);i:=i+1;} off:=off+n;
+    n:=StrLen(volType); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(volType,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "volumeId"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2AttachVolume(client: EC2Client, volumeId: pchar, instanceId: pchar, device: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=AttachVolume&Version=2016-11-15&VolumeId="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(volumeId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(volumeId,i)&0xFF);i:=i+1;} off:=off+n;
+    var iid: pchar := "&InstanceId="c; n:=StrLen(iid);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(iid,i)&0xFF);i:=i+1;} off:=off+n;
+    n:=StrLen(instanceId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(instanceId,i)&0xFF);i:=i+1;} off:=off+n;
+    var dv: pchar := "&Device="c; n:=StrLen(dv);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(dv,i)&0xFF);i:=i+1;} off:=off+n;
+    n:=StrLen(device); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(device,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn EC2DetachVolume(client: EC2Client, volumeId: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=DetachVolume&Version=2016-11-15&VolumeId="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(volumeId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(volumeId,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn EC2DeleteVolume(client: EC2Client, volumeId: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=DeleteVolume&Version=2016-11-15&VolumeId="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(volumeId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(volumeId,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+// ── Snapshots ─────────────────────────────────────────────────────────────────
+
+pub fn EC2CreateSnapshot(client: EC2Client, volumeId: pchar, desc: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=CreateSnapshot&Version=2016-11-15&VolumeId="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(volumeId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(volumeId,i)&0xFF);i:=i+1;} off:=off+n;
+    if (desc != 0 as pchar && StrLen(desc) > 0) {
+        var d: pchar := "&Description="c; n:=StrLen(d);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(d,i)&0xFF);i:=i+1;} off:=off+n;
+        n:=StrLen(desc); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(desc,i)&0xFF);i:=i+1;} off:=off+n;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := ec2Send(client, buf, off);
+    free(buf, 512);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := XMLFind(resp.body, resp.bodyLen, "snapshotId"c);
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn EC2DescribeAvailabilityZones(client: EC2Client): int64 {
+    var body: pchar := "Action=DescribeAvailabilityZones&Version=2016-11-15"c;
+    var resp: AWSResponse := ec2Send(client, body as int64, StrLen(body));
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}

@@ -1,0 +1,246 @@
+// std/graphdb/edge.lyx
+// WP-GRP-03: GraphEdge mit TLV-Properties
+
+@description("GraphDB edge: source, target, type, TLV properties")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.graphdb.edge;
+
+import std.alloc;
+import std.graphdb.core;
+
+pub con GEDGE_OFF_ID:        int64 := 0;
+pub con GEDGE_OFF_SOURCE:    int64 := 8;
+pub con GEDGE_OFF_TARGET:    int64 := 16;
+pub con GEDGE_OFF_ETYPEBUF:  int64 := 24;
+pub con GEDGE_OFF_ETYPELEN:  int64 := 32;
+pub con GEDGE_OFF_CREATEDAT: int64 := 40;
+pub con GEDGE_OFF_PROPSBUF:  int64 := 48;
+pub con GEDGE_OFF_PROPSLEN:  int64 := 56;
+pub con GEDGE_OFF_PROPSCAP:  int64 := 64;
+pub con GEDGE_SIZE:          int64 := 72;
+
+con EDGE_PROPS_INIT_CAP: int64 := 256;
+
+con EPROP_INT64: int64 := 0;
+con EPROP_PCHAR: int64 := 1;
+con EPROP_F64:   int64 := 2;
+con EPROP_BOOL:  int64 := 3;
+
+// ============================================================
+// Init / Free
+// ============================================================
+
+pub fn GraphEdgeInit(e: int64) {
+    poke64(e + GEDGE_OFF_ID,        GRAPH_ID_INVALID);
+    poke64(e + GEDGE_OFF_SOURCE,    0);
+    poke64(e + GEDGE_OFF_TARGET,    0);
+    poke64(e + GEDGE_OFF_ETYPEBUF,  0);
+    poke64(e + GEDGE_OFF_ETYPELEN,  0);
+    poke64(e + GEDGE_OFF_CREATEDAT, 0);
+    var pb: int64 := alloc(EDGE_PROPS_INIT_CAP);
+    poke64(e + GEDGE_OFF_PROPSBUF,  pb);
+    poke64(e + GEDGE_OFF_PROPSLEN,  0);
+    poke64(e + GEDGE_OFF_PROPSCAP,  EDGE_PROPS_INIT_CAP);
+}
+
+pub fn GraphEdgeFree(e: int64) {
+    var et: int64 := peek64(e + GEDGE_OFF_ETYPEBUF);
+    var el: int64 := peek64(e + GEDGE_OFF_ETYPELEN);
+    if (et != 0) { free(et, el + 1); }
+    var pb: int64 := peek64(e + GEDGE_OFF_PROPSBUF);
+    var pc: int64 := peek64(e + GEDGE_OFF_PROPSCAP);
+    if (pb != 0) { free(pb, pc); }
+}
+
+// ============================================================
+// EdgeType
+// ============================================================
+
+pub fn GraphEdgeSetType(e: int64, etype: pchar, elen: int64) {
+    var old: int64 := peek64(e + GEDGE_OFF_ETYPEBUF);
+    var ol: int64  := peek64(e + GEDGE_OFF_ETYPELEN);
+    if (old != 0) { free(old, ol + 1); }
+    var nb: int64 := alloc(elen + 1);
+    var i: int64  := 0;
+    while (i < elen) {
+        poke8(nb + i, StrCharAt(etype, i));
+        i += 1;
+    }
+    poke8(nb + elen, 0);
+    poke64(e + GEDGE_OFF_ETYPEBUF, nb);
+    poke64(e + GEDGE_OFF_ETYPELEN, elen);
+}
+
+pub fn GraphEdgeTypeEq(e: int64, etype: pchar, elen: int64): int64 {
+    var el: int64 := peek64(e + GEDGE_OFF_ETYPELEN);
+    if (el != elen) { return 0; }
+    var eb: int64 := peek64(e + GEDGE_OFF_ETYPEBUF);
+    if (eb == 0) { return 0; }
+    var i: int64  := 0;
+    var ca: int64 := 0;
+    var cb: int64 := 0;
+    while (i < elen) {
+        ca := peek8(eb + i);
+        cb := StrCharAt(etype, i);
+        if (ca != cb) { return 0; }
+        i += 1;
+    }
+    return 1;
+}
+
+// ============================================================
+// TLV-Properties (intern)
+// ============================================================
+
+fn _edgeGrowProps(e: int64, need: int64) {
+    var cap: int64 := peek64(e + GEDGE_OFF_PROPSCAP);
+    var len: int64 := peek64(e + GEDGE_OFF_PROPSLEN);
+    if (len + need <= cap) { return; }
+    var nc: int64 := cap * 2;
+    if (nc < len + need) { nc := len + need + 256; }
+    var nb: int64 := alloc(nc);
+    var ob: int64 := peek64(e + GEDGE_OFF_PROPSBUF);
+    memcpy(nb, ob, len);
+    free(ob, cap);
+    poke64(e + GEDGE_OFF_PROPSBUF, nb);
+    poke64(e + GEDGE_OFF_PROPSCAP, nc);
+}
+
+fn _edgePropWrite(e: int64, typ: int64, key: pchar, klen: int64, valBuf: int64, vsize: int64) {
+    _edgeGrowProps(e, 2 + klen + vsize);
+    var buf: int64 := peek64(e + GEDGE_OFF_PROPSBUF);
+    var pos: int64 := peek64(e + GEDGE_OFF_PROPSLEN);
+    var i: int64   := 0;
+    poke8(buf + pos, typ);
+    poke8(buf + pos + 1, klen);
+    pos += 2;
+    while (i < klen) {
+        poke8(buf + pos + i, StrCharAt(key, i));
+        i += 1;
+    }
+    pos += klen;
+    memcpy(buf + pos, valBuf, vsize);
+    poke64(e + GEDGE_OFF_PROPSLEN, pos + vsize);
+}
+
+fn _edgeReadLen4(p: int64): int64 {
+    return peek8(p) + peek8(p + 1) * 256 + peek8(p + 2) * 65536 + peek8(p + 3) * 16777216;
+}
+
+fn _edgeKeyEq(buf: int64, kstart: int64, key: pchar, klen: int64): int64 {
+    var j: int64  := 0;
+    var ca: int64 := 0;
+    var cb: int64 := 0;
+    while (j < klen) {
+        ca := peek8(buf + kstart + j);
+        cb := StrCharAt(key, j);
+        if (ca != cb) { return 0; }
+        j += 1;
+    }
+    return 1;
+}
+
+fn _edgePropFind(e: int64, typ: int64, key: pchar, klen: int64): int64 {
+    var buf: int64    := peek64(e + GEDGE_OFF_PROPSBUF);
+    var total: int64  := peek64(e + GEDGE_OFF_PROPSLEN);
+    var pos: int64    := 0;
+    var ptyp: int64   := 0;
+    var pklen: int64  := 0;
+    var kstart: int64 := 0;
+    var vstart: int64 := 0;
+    var found: int64  := 0;
+    var slen: int64   := 0;
+    while (pos < total) {
+        ptyp   := peek8(buf + pos);
+        pklen  := peek8(buf + pos + 1);
+        kstart := pos + 2;
+        vstart := kstart + pklen;
+        found  := 0;
+        if (ptyp == typ) {
+            if (pklen == klen) { found := _edgeKeyEq(buf, kstart, key, klen); }
+        }
+        if (found != 0) { return buf + vstart; }
+        if (ptyp == EPROP_INT64)      { pos := vstart + 8; }
+        else if (ptyp == EPROP_F64)   { pos := vstart + 8; }
+        else if (ptyp == EPROP_BOOL)  { pos := vstart + 1; }
+        else if (ptyp == EPROP_PCHAR) {
+            slen := _edgeReadLen4(buf + vstart);
+            pos  := vstart + 4 + slen;
+        } else { pos := total; }
+    }
+    return 0;
+}
+
+// ============================================================
+// Properties: Set
+// ============================================================
+
+pub fn GraphEdgeSetInt(e: int64, key: pchar, klen: int64, val: int64) {
+    var tmp: int64 := alloc(8);
+    poke64(tmp, val);
+    _edgePropWrite(e, EPROP_INT64, key, klen, tmp, 8);
+    free(tmp, 8);
+}
+
+pub fn GraphEdgeSetF64(e: int64, key: pchar, klen: int64, bits: int64) {
+    var tmp: int64 := alloc(8);
+    poke64(tmp, bits);
+    _edgePropWrite(e, EPROP_F64, key, klen, tmp, 8);
+    free(tmp, 8);
+}
+
+pub fn GraphEdgeSetBool(e: int64, key: pchar, klen: int64, val: int64) {
+    var tmp: int64 := alloc(1);
+    poke8(tmp, val & 1);
+    _edgePropWrite(e, EPROP_BOOL, key, klen, tmp, 1);
+    free(tmp, 1);
+}
+
+pub fn GraphEdgeSetStr(e: int64, key: pchar, klen: int64, val: pchar, vlen: int64) {
+    var tmp: int64 := alloc(4 + vlen);
+    var i: int64   := 0;
+    poke8(tmp,     vlen & 255);
+    poke8(tmp + 1, (vlen >> 8) & 255);
+    poke8(tmp + 2, (vlen >> 16) & 255);
+    poke8(tmp + 3, (vlen >> 24) & 255);
+    while (i < vlen) {
+        poke8(tmp + 4 + i, StrCharAt(val, i));
+        i += 1;
+    }
+    _edgePropWrite(e, EPROP_PCHAR, key, klen, tmp, 4 + vlen);
+    free(tmp, 4 + vlen);
+}
+
+// ============================================================
+// Properties: Get
+// ============================================================
+
+pub fn GraphEdgeGetInt(e: int64, key: pchar, klen: int64): int64 {
+    var p: int64 := _edgePropFind(e, EPROP_INT64, key, klen);
+    if (p == 0) { return 0; }
+    return peek64(p);
+}
+
+pub fn GraphEdgeGetF64(e: int64, key: pchar, klen: int64): int64 {
+    var p: int64 := _edgePropFind(e, EPROP_F64, key, klen);
+    if (p == 0) { return 0; }
+    return peek64(p);
+}
+
+pub fn GraphEdgeGetBool(e: int64, key: pchar, klen: int64): int64 {
+    var p: int64 := _edgePropFind(e, EPROP_BOOL, key, klen);
+    if (p == 0) { return 0; }
+    return peek8(p);
+}
+
+pub fn GraphEdgeGetStr(e: int64, key: pchar, klen: int64, outLen: int64): pchar {
+    var p: int64 := _edgePropFind(e, EPROP_PCHAR, key, klen);
+    if (p == 0) {
+        if (outLen != 0) { poke64(outLen, 0); }
+        return 0 as pchar;
+    }
+    var slen: int64 := _edgeReadLen4(p);
+    if (outLen != 0) { poke64(outLen, slen); }
+    return (p + 4) as pchar;
+}

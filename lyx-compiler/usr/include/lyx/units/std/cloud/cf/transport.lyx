@@ -1,0 +1,520 @@
+// std/cloud/cf/transport.lyx — Cloudflare REST/JSON HTTP transport
+// WP-CF-01
+
+unit std.cloud.cf.transport;
+
+import std.cloud.cf.credentials;
+import std.net.http;
+import std.net.socket;
+import std.net.dns;
+import std.net.tls;
+import std.net.types;
+import std.alloc;
+import std.io;
+import std.time;
+
+pub con CF_API_HOST: int64 := "api.cloudflare.com"c as int64;
+pub con CF_API_BASE: int64 := "/client/v4"c as int64;
+
+// ── CFClient ──────────────────────────────────────────────────────────────────
+
+pub type CFClient = struct {
+    authType:  int64;   // CF_AUTH_TOKEN | CF_AUTH_KEY
+    token:     int64;   // pchar — Bearer token
+    apiKey:    int64;   // pchar — Legacy key
+    email:     int64;   // pchar — Legacy email
+    accountId: int64;   // pchar — default account
+    zoneId:    int64;   // pchar — default zone
+    timeout:   int64;   // ms (unused currently)
+    maxRetries: int64;
+};
+
+// ── CFResponse ────────────────────────────────────────────────────────────────
+
+pub type CFResponse = struct {
+    success:    int64;   // 1 = success, 0 = error
+    statusCode: int64;
+    result:     int64;   // pchar — JSON value (alloc'd)
+    resultLen:  int64;
+    errors:     int64;   // pchar — JSON array (alloc'd)
+    messages:   int64;   // pchar — JSON array (alloc'd)
+    page:       int64;
+    perPage:    int64;
+    totalPages: int64;
+    totalCount: int64;
+};
+
+fn cfEmptyResp(): CFResponse {
+    var r: CFResponse;
+    r.success := 0; r.statusCode := 0;
+    r.result := 0; r.resultLen := 0;
+    r.errors := 0; r.messages := 0;
+    r.page := 1; r.perPage := 20; r.totalPages := 1; r.totalCount := 0;
+    return r;
+}
+
+pub fn CFResponseFree(r: CFResponse) {
+    if (r.result   != 0) { free(r.result,   StrLen(r.result   as pchar) + 1); }
+    if (r.errors   != 0) { free(r.errors,   StrLen(r.errors   as pchar) + 1); }
+    if (r.messages != 0) { free(r.messages, StrLen(r.messages as pchar) + 1); }
+}
+
+// ── String helpers ────────────────────────────────────────────────────────────
+
+fn cftDup(s: pchar): int64 {
+    if (s == 0 as pchar) { return 0; }
+    var n: int64 := StrLen(s);
+    var buf: int64 := alloc(n + 1); var i: int64 := 0;
+    while (i < n) { poke8(buf + i, StrCharAt(s, i) & 0xFF); i := i + 1; }
+    poke8(buf + n, 0); return buf;
+}
+
+fn cftDupN(s: int64, n: int64): int64 {
+    if (n <= 0) { var b: int64 := alloc(1); poke8(b, 0); return b; }
+    var buf: int64 := alloc(n + 1); var i: int64 := 0;
+    while (i < n) { poke8(buf + i, peek8(s + i)); i := i + 1; }
+    poke8(buf + n, 0); return buf;
+}
+
+pub fn cftAppend(buf: int64, off: int64, s: pchar): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while (i < n) { poke8(buf + off + i, StrCharAt(s, i) & 0xFF); i := i + 1; }
+    return off + n;
+}
+
+pub fn cftAppendN(buf: int64, off: int64, s: int64, n: int64): int64 {
+    var i: int64 := 0;
+    while (i < n) { poke8(buf + off + i, peek8(s + i)); i := i + 1; }
+    return off + n;
+}
+
+pub fn cftAppendInt(buf: int64, off: int64, n: int64): int64 {
+    var tmp: int64 := alloc(24);
+    Int64ToStr(n, tmp as pchar);
+    var r: int64 := cftAppend(buf, off, tmp as pchar);
+    free(tmp, 24); return r;
+}
+
+// ── JSON extraction ───────────────────────────────────────────────────────────
+
+// Extracts the value of "key" from JSON. Handles strings, objects, arrays,
+// numbers, booleans. Returns alloc'd copy or 0.
+pub fn cfExtractValue(json: int64, jsonLen: int64, key: pchar): int64 {
+    if (json == 0 || jsonLen <= 0) { return 0; }
+    var kl: int64 := StrLen(key);
+    var i: int64 := 0;
+    while (i < jsonLen - kl - 2) {
+        if ((peek8(json + i) & 0xFF) == 34) { // '"'
+            var match: int64 := 1; var j: int64 := 0;
+            if (i + 1 + kl < jsonLen) {
+                while (j < kl) {
+                    if ((peek8(json + i + 1 + j) & 0xFF) != (StrCharAt(key, j) & 0xFF)) {
+                        match := 0; break;
+                    }
+                    j += 1;
+                }
+                if (match == 1 && i + 1 + kl < jsonLen &&
+                    (peek8(json + i + 1 + kl) & 0xFF) == 34) { // closing '"'
+                    var k: int64 := i + kl + 2;
+                    // skip whitespace
+                    while (k < jsonLen && (peek8(json + k) & 0xFF) == 32) { k := k + 1; }
+                    if (k < jsonLen && (peek8(json + k) & 0xFF) == 58) { // ':'
+                        k += 1;
+                        while (k < jsonLen && (peek8(json + k) & 0xFF) == 32) { k := k + 1; }
+                        var vs: int64 := k;
+                        var ch: int64 := peek8(json + k) & 0xFF;
+                        if (ch == 123 || ch == 91) { // '{' or '['
+                            var close: int64 := 125;
+                            if (ch == 91) { close := 93; }
+                            var depth: int64 := 1;
+                            k += 1;
+                            while (k < jsonLen && depth > 0) {
+                                var c2: int64 := peek8(json + k) & 0xFF;
+                                if (c2 == 34) { // skip string
+                                    k += 1;
+                                    while (k < jsonLen && (peek8(json+k)&0xFF) != 34) {
+                                        if ((peek8(json+k)&0xFF)==92) { k := k+1; }
+                                        k += 1;
+                                    }
+                                } else {
+                                    if (c2 == ch)    { depth := depth + 1; }
+                                    if (c2 == close) { depth := depth - 1; }
+                                }
+                                k += 1;
+                            }
+                        } else if (ch == 34) { // string
+                            k += 1;
+                            while (k < jsonLen && (peek8(json+k)&0xFF) != 34) {
+                                if ((peek8(json+k)&0xFF)==92) { k := k+1; }
+                                k += 1;
+                            }
+                            k += 1;
+                        } else { // number/bool/null
+                            while (k < jsonLen) {
+                                var c3: int64 := peek8(json+k) & 0xFF;
+                                if (c3==44||c3==125||c3==93||c3==10||c3==13||c3==32) { break; }
+                                k += 1;
+                            }
+                        }
+                        return cftDupN(json + vs, k - vs);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+pub fn cfExtractBool(json: int64, jsonLen: int64, key: pchar): int64 {
+    var val: int64 := cfExtractValue(json, jsonLen, key);
+    if (val == 0) { return 0; }
+    var r: int64 := 0;
+    if ((peek8(val) & 0xFF) == 116) { r := 1; } // 't' for true
+    free(val, StrLen(val as pchar) + 1);
+    return r;
+}
+
+pub fn cfExtractInt(json: int64, jsonLen: int64, key: pchar): int64 {
+    var val: int64 := cfExtractValue(json, jsonLen, key);
+    if (val == 0) { return 0; }
+    var r: int64 := StrToInt64(val as pchar);
+    free(val, StrLen(val as pchar) + 1);
+    return r;
+}
+
+// Extract a field from a JSON object/array by string path element.
+// Returns alloc'd value or 0. (For nested access, call multiple times.)
+
+// ── Response parser ───────────────────────────────────────────────────────────
+
+fn cfParseResponse(body: int64, bodyLen: int64, statusCode: int64): CFResponse {
+    var r: CFResponse := cfEmptyResp();
+    r.statusCode := statusCode;
+    if (body == 0 || bodyLen <= 0) { return r; }
+
+    r.success  := cfExtractBool(body, bodyLen, "success"c);
+    r.result   := cfExtractValue(body, bodyLen, "result"c);
+    r.errors   := cfExtractValue(body, bodyLen, "errors"c);
+    r.messages := cfExtractValue(body, bodyLen, "messages"c);
+    if (r.result != 0) { r.resultLen := StrLen(r.result as pchar); }
+
+    var ri: int64 := cfExtractValue(body, bodyLen, "result_info"c);
+    if (ri != 0) {
+        var ril: int64 := StrLen(ri as pchar);
+        r.page       := cfExtractInt(ri, ril, "page"c);
+        r.perPage    := cfExtractInt(ri, ril, "per_page"c);
+        r.totalPages := cfExtractInt(ri, ril, "total_pages"c);
+        r.totalCount := cfExtractInt(ri, ril, "total_count"c);
+        if (r.page == 0)       { r.page := 1; }
+        if (r.perPage == 0)    { r.perPage := 20; }
+        if (r.totalPages == 0) { r.totalPages := 1; }
+        free(ri, ril + 1);
+    }
+    return r;
+}
+
+// ── Low-level TLS send ────────────────────────────────────────────────────────
+
+fn cfDoSend(req: HTTPRequest): HTTPResponse {
+    var emptyResp: HTTPResponse;
+    emptyResp.statusCode := 0; emptyResp.bodyPtr := 0; emptyResp.bodySize := 0;
+    emptyResp.headers := 0; emptyResp.headerCount := 0;
+
+    var ip: int64 := DNSResolve("api.cloudflare.com"c);
+    if (ip == 0) { return emptyResp; }
+    var conn: TCPConn := TCPConnect(ip, 443);
+    if (conn.fd < 0) { return emptyResp; }
+    var tlsCtx: TLSContext := TLSInit();
+    var tlsConn: TLSConn := TLSConnect(tlsCtx, conn.fd, "api.cloudflare.com"c);
+    if (tlsConn.connected == 0) { TLSFree(tlsCtx); return emptyResp; }
+
+    var reqBuf: int64  := HTTPRequestBuild(req);
+    var allocSz: int64 := peek64(reqBuf);
+    var reqSz: int64   := peek64(reqBuf + 8);
+    TLSWrite(tlsConn, reqBuf + 16, reqSz);
+    free(reqBuf, allocSz);
+
+    var resp: HTTPResponse := HTTPSend(tlsConn, conn);
+    TLSClose(tlsConn);
+    TLSFree(tlsCtx);
+    return resp;
+}
+
+// ── Core send with auth headers ───────────────────────────────────────────────
+
+fn cfSend(c: CFClient, method: pchar, path: pchar, body: int64, bodyLen: int64): CFResponse {
+    var pathBuf: int64 := alloc(2048);
+    var po: int64 := cftAppend(pathBuf, 0, "/client/v4"c);
+    po := cftAppend(pathBuf, po, path);
+    poke8(pathBuf + po, 0);
+
+    // Auth header value buffer
+    var authBuf: int64 := alloc(1024);
+    var ao: int64 := 0;
+    if (c.authType == CF_AUTH_TOKEN) {
+        ao := cftAppend(authBuf, ao, "Bearer "c);
+        if (c.token != 0) { ao := cftAppend(authBuf, ao, c.token as pchar); }
+    } else {
+        // Legacy: apiKey goes in X-Auth-Key header below, authBuf holds key value
+        if (c.apiKey != 0) { ao := cftAppend(authBuf, ao, c.apiKey as pchar); }
+    }
+    poke8(authBuf + ao, 0);
+
+    var headers: int64 := alloc(10 * 16);
+    var nh: int64 := 0;
+
+    if (c.authType == CF_AUTH_TOKEN) {
+        poke64(headers + nh*16,     "Authorization"c as int64);
+        poke64(headers + nh*16 + 8, authBuf);
+        nh += 1;
+    } else {
+        poke64(headers + nh*16,     "X-Auth-Key"c as int64);
+        poke64(headers + nh*16 + 8, authBuf);
+        nh += 1;
+        if (c.email != 0) {
+            poke64(headers + nh*16,     "X-Auth-Email"c as int64);
+            poke64(headers + nh*16 + 8, c.email);
+            nh += 1;
+        }
+    }
+
+    if (bodyLen > 0) {
+        poke64(headers + nh*16,     "Content-Type"c as int64);
+        poke64(headers + nh*16 + 8, "application/json"c as int64);
+        nh += 1;
+    }
+
+    poke64(headers + nh*16,     "Accept"c as int64);
+    poke64(headers + nh*16 + 8, "application/json"c as int64);
+    nh += 1;
+
+    poke64(headers + nh*16,     "User-Agent"c as int64);
+    poke64(headers + nh*16 + 8, "lyxcf/1.0"c as int64);
+    nh += 1;
+
+    var httpReq: HTTPRequest;
+    httpReq.method      := method;
+    httpReq.host        := "api.cloudflare.com"c;
+    httpReq.path        := pathBuf as pchar;
+    httpReq.headers     := headers;
+    httpReq.headerCount := nh;
+    httpReq.body        := body;
+    httpReq.bodyLen     := bodyLen;
+
+    var httpResp: HTTPResponse := cfDoSend(httpReq);
+    free(pathBuf, 2048);
+    free(authBuf, 1024);
+    free(headers, 10 * 16);
+
+    var r: CFResponse := cfParseResponse(httpResp.bodyPtr, httpResp.bodySize, httpResp.statusCode);
+    if (httpResp.bodyPtr != 0) { sys_munmap(httpResp.bodyPtr, httpResp.bodySize + 1); }
+    HTTPHeadersFree(httpResp);
+    return r;
+}
+
+// Send with exponential backoff retry on 429/5xx
+fn cfSendRetry(c: CFClient, method: pchar, path: pchar, body: int64, bodyLen: int64): CFResponse {
+    var attempt: int64 := 0;
+    var delay:   int64 := 100;
+    var r: CFResponse := cfEmptyResp();
+
+    while (attempt <= c.maxRetries) {
+        r = cfSend(c, method, path, body, bodyLen);
+        if (r.statusCode > 0 &&
+            r.statusCode != 429 &&
+            r.statusCode != 500 && r.statusCode != 502 &&
+            r.statusCode != 503 && r.statusCode != 504) {
+            return r;
+        }
+        if (attempt < c.maxRetries) {
+            CFResponseFree(r);
+            r = cfEmptyResp();
+            Sleep(delay);
+            delay := delay * 2;
+        }
+        attempt += 1;
+    }
+    return r;
+}
+
+// ── Public HTTP methods ───────────────────────────────────────────────────────
+
+pub fn CFClientNew(creds: CFCredentials): CFClient {
+    var c: CFClient;
+    c.authType  := creds.authType;
+    c.token     := creds.token;
+    c.apiKey    := creds.apiKey;
+    c.email     := creds.email;
+    c.accountId := creds.accountId;
+    c.zoneId    := creds.zoneId;
+    c.timeout   := 30000;
+    c.maxRetries := 3;
+    return c;
+}
+
+pub fn CFClientFree(c: CFClient) {
+    // CFClient borrows the credential strings from CFCredentials.
+    // Free only if caller has transferred ownership.
+}
+
+pub fn CFGet(c: CFClient, path: pchar): CFResponse {
+    return cfSendRetry(c, "GET"c, path, 0, 0);
+}
+
+pub fn CFPost(c: CFClient, path: pchar, body: int64, bodyLen: int64): CFResponse {
+    return cfSendRetry(c, "POST"c, path, body, bodyLen);
+}
+
+pub fn CFPut(c: CFClient, path: pchar, body: int64, bodyLen: int64): CFResponse {
+    return cfSendRetry(c, "PUT"c, path, body, bodyLen);
+}
+
+pub fn CFPatch(c: CFClient, path: pchar, body: int64, bodyLen: int64): CFResponse {
+    return cfSendRetry(c, "PATCH"c, path, body, bodyLen);
+}
+
+pub fn CFDelete(c: CFClient, path: pchar): CFResponse {
+    return cfSendRetry(c, "DELETE"c, path, 0, 0);
+}
+
+// PUT with non-JSON content type (e.g. application/javascript for Workers)
+pub fn CFPutRaw(c: CFClient, path: pchar, contentType: pchar, body: int64, bodyLen: int64): CFResponse {
+    var pathBuf: int64 := alloc(2048);
+    var po: int64 := cftAppend(pathBuf, 0, "/client/v4"c);
+    po := cftAppend(pathBuf, po, path);
+    poke8(pathBuf + po, 0);
+
+    var authBuf: int64 := alloc(1024);
+    var ao: int64 := 0;
+    if (c.authType == CF_AUTH_TOKEN) {
+        ao := cftAppend(authBuf, ao, "Bearer "c);
+        if (c.token != 0) { ao := cftAppend(authBuf, ao, c.token as pchar); }
+    } else {
+        if (c.apiKey != 0) { ao := cftAppend(authBuf, ao, c.apiKey as pchar); }
+    }
+    poke8(authBuf + ao, 0);
+
+    var headers: int64 := alloc(8 * 16);
+    var nh: int64 := 0;
+
+    if (c.authType == CF_AUTH_TOKEN) {
+        poke64(headers + nh*16,     "Authorization"c as int64);
+        poke64(headers + nh*16 + 8, authBuf);
+        nh += 1;
+    } else {
+        poke64(headers + nh*16,     "X-Auth-Key"c as int64);
+        poke64(headers + nh*16 + 8, authBuf);
+        nh += 1;
+    }
+
+    poke64(headers + nh*16,     "Content-Type"c as int64);
+    poke64(headers + nh*16 + 8, contentType as int64);
+    nh += 1;
+    poke64(headers + nh*16,     "User-Agent"c as int64);
+    poke64(headers + nh*16 + 8, "lyxcf/1.0"c as int64);
+    nh += 1;
+
+    var httpReq: HTTPRequest;
+    httpReq.method      := "PUT"c;
+    httpReq.host        := "api.cloudflare.com"c;
+    httpReq.path        := pathBuf as pchar;
+    httpReq.headers     := headers;
+    httpReq.headerCount := nh;
+    httpReq.body        := body;
+    httpReq.bodyLen     := bodyLen;
+
+    var httpResp: HTTPResponse := cfDoSend(httpReq);
+    free(pathBuf, 2048);
+    free(authBuf, 1024);
+    free(headers, 8 * 16);
+
+    var r: CFResponse := cfParseResponse(httpResp.bodyPtr, httpResp.bodySize, httpResp.statusCode);
+    if (httpResp.bodyPtr != 0) { sys_munmap(httpResp.bodyPtr, httpResp.bodySize + 1); }
+    HTTPHeadersFree(httpResp);
+    return r;
+}
+
+// ── Pagination helper ─────────────────────────────────────────────────────────
+
+pub fn CFGetAll(c: CFClient, path: pchar, perPage: int64): int64 {
+    var pp: int64 := perPage;
+    if (pp <= 0 || pp > 100) { pp := 100; }
+
+    var outBuf:  int64 := alloc(4194304); // 4 MB output buffer
+    var outOff:  int64 := 0;
+    outOff := cftAppend(outBuf, outOff, "["c);
+    var first: int64 := 1;
+
+    var page:       int64 := 1;
+    var totalPages: int64 := 1;
+    // check if path already has '?'
+    var hasQ: int64 := 0; var pi2: int64 := 0; var pathLen: int64 := StrLen(path);
+    while (pi2 < pathLen) {
+        if ((StrCharAt(path, pi2) & 0xFF) == 63) { hasQ := 1; break; }
+        pi2 += 1;
+    }
+
+    while (page <= totalPages) {
+        var pbuf: int64 := alloc(2048);
+        var po: int64 := cftAppend(pbuf, 0, path);
+        if (hasQ == 1) {
+            po := cftAppend(pbuf, po, "&page="c);
+        } else {
+            po := cftAppend(pbuf, po, "?page="c);
+        }
+        po := cftAppendInt(pbuf, po, page);
+        po := cftAppend(pbuf, po, "&per_page="c);
+        po := cftAppendInt(pbuf, po, pp);
+        poke8(pbuf + po, 0);
+
+        var r: CFResponse := cfSendRetry(c, "GET"c, pbuf as pchar, 0, 0);
+        free(pbuf, 2048);
+
+        if (r.success == 0 || r.result == 0) {
+            CFResponseFree(r);
+            break;
+        }
+
+        totalPages := r.totalPages;
+        if (totalPages <= 0) { totalPages := 1; }
+
+        var rl: int64 := r.resultLen;
+        if (rl > 2 && (peek8(r.result) & 0xFF) == 91) { // '[' array
+            if (first == 0) { outOff := cftAppend(outBuf, outOff, ","c); }
+            outOff := cftAppendN(outBuf, outOff, r.result + 1, rl - 2);
+            first := 0;
+        } else if (rl > 0) {
+            if (first == 0) { outOff := cftAppend(outBuf, outOff, ","c); }
+            outOff := cftAppendN(outBuf, outOff, r.result, rl);
+            first := 0;
+        }
+
+        CFResponseFree(r);
+        page += 1;
+    }
+
+    outOff := cftAppend(outBuf, outOff, "]"c);
+    poke8(outBuf + outOff, 0);
+    return outBuf;
+}
+
+// ── Token validation ──────────────────────────────────────────────────────────
+
+pub fn CFValidateToken(c: CFClient): int64 {
+    var r: CFResponse := CFGet(c, "/user/tokens/verify"c);
+    var ok: int64 := r.success;
+    CFResponseFree(r);
+    return ok;
+}
+
+// ── Error helpers ─────────────────────────────────────────────────────────────
+
+pub fn CFErrorString(code: int64): pchar {
+    if (code == 7000) { return "No route for that URI"c; }
+    if (code == 7003) { return "Zone not found"c; }
+    if (code == 9103) { return "Invalid token"c; }
+    if (code == 10000) { return "Authentication error"c; }
+    if (code == 81053) { return "DNS record already exists"c; }
+    return "Unknown error"c;
+}

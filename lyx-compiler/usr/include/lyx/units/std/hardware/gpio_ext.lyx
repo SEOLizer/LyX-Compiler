@@ -1,0 +1,121 @@
+// std/hardware/gpio_ext.lyx
+// WP-5: Erweiterungen — Alternativfunktionen, Edge-Detection, SoftPWM
+//
+// WP-5.1: GPIO_PIN_ALT0–ALT5-Konstanten + GpioSetAltMode
+// WP-5.2: GpioWaitForEdge (sys_poll auf ioctl Line-Fd)
+// WP-5.3: GpioSoftPWM (Bit-Bang, µs-Zähler gegen >1kHz-Bug)
+
+unit std.hardware.gpio_ext;
+
+import std.hardware.gpio_mmio;
+import std.hardware.gpio_syscalls;
+import std.hardware.gpio_util;
+import std.alloc;
+
+// ============================================================
+// WP-5.1: Alternativfunktions-Konstanten (BCM2711 GPFSEL 3-Bit-Codes)
+//
+// Die Codes sind NICHT linear:
+//   Input  = 000 (0)   Output = 001 (1)
+//   Alt0   = 100 (4)   Alt1   = 101 (5)
+//   Alt2   = 110 (6)   Alt3   = 111 (7)
+//   Alt4   = 011 (3)   Alt5   = 010 (2)
+// ============================================================
+
+pub con GPIO_PIN_ALT0: int64 := 4;
+pub con GPIO_PIN_ALT1: int64 := 5;
+pub con GPIO_PIN_ALT2: int64 := 6;
+pub con GPIO_PIN_ALT3: int64 := 7;
+pub con GPIO_PIN_ALT4: int64 := 3;
+pub con GPIO_PIN_ALT5: int64 := 2;
+
+// GpioSetAltMode — setzt einen Pin auf eine der sechs Alt-Funktionen.
+// mode: GPIO_PIN_ALT0 .. GPIO_PIN_ALT5
+// Delegiert an GpioSetPinMode (GPFSEL RMW + mem_barrier).
+// Rückgabe: 1 = Erfolg, 0 = Fehler (ungültiger Pin / nicht gemappt)
+pub fn GpioSetAltMode(ctx: int64, pin: int64, mode: int64): int64 {
+  if (mode < 2 || mode > 7) { return 0; }   // nur Alt-Codes erlaubt
+  return GpioSetPinMode(ctx, pin, mode);
+}
+
+// ============================================================
+// WP-5.2: GpioWaitForEdge — blockiert bis zum nächsten GPIO-Ereignis
+//
+// Voraussetzung: line_fd wurde mit GpioRequestLines() + Edge-Flag
+//   (GPIO_V2_LINE_FLAG_EDGE_RISING / _FALLING / _BOTH) geöffnet.
+//
+// Nutzt sys_poll auf dem Line-Fd. pollfd-Layout (8 Bytes):
+//   +0: int32 fd, +4: int16 events, +6: int16 revents
+//
+// timeout_ms:  0 = sofort prüfen (non-blocking)
+//             -1 = unbegrenzt warten
+//          > 0 = maximal timeout_ms Millisekunden warten
+//
+// Rückgabe: 1 = Ereignis eingetroffen
+//           0 = Timeout abgelaufen oder kein Ereignis
+//          -1 = Fehler (ungültiger Fd, sys_poll-Fehler)
+//
+// AC-WP5.2.1: Edge-Ereignis innerhalb 1ms (Hardware-Test RPi4)
+// AC-WP5.2.2: Timeout läuft korrekt ab
+// ============================================================
+pub fn GpioWaitForEdge(line_fd: int64, timeout_ms: int64): int64 {
+  var pfd: int64 := alloc(8);
+  if (pfd == 0) { return -1; }
+  GpioPollFdSet(pfd, line_fd, GPIO_POLLIN);
+  var r: int64 := GpioPoll(pfd, 1, timeout_ms);
+  free(pfd, 8);
+  if (r < 0)  { return -1; }
+  if (r == 0) { return 0; }
+  return 1;
+}
+
+// ============================================================
+// WP-5.3: GpioSoftPWM — Software-PWM via Bit-Bang + Busy-Wait
+//
+// Blockiert die CPU vollständig für duration_ms Millisekunden.
+// Für mehrere Kanäle oder Frequenzen > 10 kHz: DMA oder Hardware-PWM.
+//
+// Bug-Fix vs. v1: Zähler in µs statt ms.
+//   Bei frequency > 1000 Hz wäre period_us / 1000 = 0 (Ganzzahldivision)
+//   → elapsed_ms niemals inkrementiert → Endlosschleife.
+//   Fix: elapsed_us zählt in µs, Vergleich gegen duration_ms * 1000.
+//
+// Randfälle:
+//   frequency <= 0         → sofortige Rückkehr (Guard)
+//   dutyCycle = 0          → Pin bleibt LOW für die gesamte Dauer
+//   dutyCycle >= 100       → Pin bleibt HIGH für die gesamte Dauer
+//   frequency > 1_000_000  → period_us auf 1 µs geklemmt (kein Überlauf)
+//
+// AC-WP5.3.1: LED dimmt sichtbar (Hardware-Test RPi4)
+// AC-WP5.3.2: Frequenzabweichung < 5 % (Hardware-Test)
+// AC-WP5.3.3: Rückkehr nach duration_ms Millisekunden
+// AC-WP5.3.4: Kein Endlosschleifen-Verhalten bei frequency > 1000 Hz
+// AC-WP5.3.5: frequency = 0 → sofortige Rückkehr
+// ============================================================
+pub fn GpioSoftPWM(ctx: int64, pin: int64, frequency: int64,
+                    dutyCycle: int64, duration_ms: int64) {
+  if (frequency <= 0) { return; }
+
+  var period_us: int64 := 1000000 / frequency;
+  if (period_us <= 0) { period_us := 1; }   // Frequenzen > 1 MHz: klemmen
+
+  var high_us: int64 := (period_us * dutyCycle) / 100;
+  if (high_us < 0)          { high_us := 0; }
+  if (high_us > period_us)  { high_us := period_us; }
+  var low_us: int64 := period_us - high_us;
+
+  var elapsed_us: int64 := 0;
+  var target_us:  int64 := duration_ms * 1000;
+
+  while (elapsed_us < target_us) {
+    if (high_us > 0) {
+      GpioWritePin(ctx, pin, GPIO_PIN_HIGH);
+      GpioDelayMicroseconds(high_us);
+    }
+    if (low_us > 0) {
+      GpioWritePin(ctx, pin, GPIO_PIN_LOW);
+      GpioDelayMicroseconds(low_us);
+    }
+    elapsed_us += period_us;
+  }
+}

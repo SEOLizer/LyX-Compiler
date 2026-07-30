@@ -1,0 +1,160 @@
+// std/hardware/usb_endpoint_types.lyx
+// WP-7A: Typsichere USB-Endpunkt-Wrapper (Approximation ohne Generics)
+//
+// Status: TEILWEISE IMPLEMENTIERT — vollständige WP-7A-Garantien erfordern
+//   zwei Lyx-Features, die aktuell fehlen:
+//
+//   1. Nominale Typsicherheit (distinct struct types):
+//      Lyx verwendet strukturelles Typing. Structs mit gleichen Feldtypen
+//      sind austauschbar — der Compiler erzwingt keine Namensunterschiede.
+//      → AC-1/AC-2 (Compiler-Fehler bei falscher Richtung) nicht erreichbar.
+//
+//   2. Generics mit Compile-Time-Parametern:
+//      `BulkOutEndpoint<$01>` erfordert parameterisierte Typen.
+//      → AC-3 (Compile-Time-Warnung bei falscher EP-Adresse) nicht erreichbar.
+//      → AC-4 (Zero-Cost-Abstraktion) ohne Inlining/Spezialisierung nicht erreichbar.
+//
+//   Was diese Implementierung bietet:
+//   ✓ API-Level-Separation: UsbBulkOutEndpoint hat NUR Write-Operationen,
+//     UsbBulkInEndpoint NUR Read-Operationen (keine Write-Funktion existiert).
+//     Ein Aufrufer kann keine "Read"-Operation auf einem Out-Endpoint aufrufen —
+//     nicht weil der Compiler es verhindert, sondern weil die Funktion nicht existiert.
+//   ✓ Runtime-Richtungsvalidierung in Factory-Funktionen (Bit-7-Check).
+//   ✓ Sentinelwert (dev_fd=-1) bei falschem Endpoint → alle Ops geben -1 zurück.
+//   ✓ Dokumentationstypen: Code, der UsbBulkOutEndpoint verwendet, kommuniziert
+//     die Richtungs-Absicht klar.
+
+unit std.hardware.usb_endpoint_types;
+
+import std.hardware.usb_bulk;
+import std.hardware.usb_interrupt;
+
+// ============================================================
+// Endpoint-Typen
+// Alle haben dev_fd=-1 als Sentinel für "ungültige Richtung".
+// ============================================================
+
+// Bulk OUT — Host → Device (endpoint bit 7 = 0)
+pub type UsbBulkOutEndpoint = struct {
+  dev_fd:   int64;
+  endpoint: int64;
+  timeout:  int64;
+};
+
+// Bulk IN — Device → Host (endpoint bit 7 = 1)
+pub type UsbBulkInEndpoint = struct {
+  dev_fd:   int64;
+  endpoint: int64;
+  timeout:  int64;
+};
+
+// Interrupt IN — Device → Host, asynchron via URB (endpoint bit 7 = 1)
+pub type UsbInterruptInEndpoint = struct {
+  dev_fd:    int64;
+  endpoint:  int64;
+  buf_size:  int64;
+  timeout:   int64;
+};
+
+// ============================================================
+// Factory-Funktionen mit Runtime-Richtungsvalidierung
+// Bit 7 der EP-Adresse: 0 = OUT, 1 = IN
+// Bei falscher Richtung: dev_fd = -1 (Sentinel → alle Ops geben -1 zurück)
+// ============================================================
+
+// UsbMakeBulkOut: ep muss Bit 7 = 0 haben (z.B. 0x01, 0x02)
+pub fn UsbMakeBulkOut(dev_fd: int64, ep: int64, timeout: int64): UsbBulkOutEndpoint {
+  var r: UsbBulkOutEndpoint;
+  if ((ep & 0x80) != 0) {
+    // IN-Adresse für OUT-Typ → Sentinel
+    r.dev_fd := -1; r.endpoint := ep; r.timeout := 0;
+    return r;
+  }
+  r.dev_fd := dev_fd; r.endpoint := ep; r.timeout := timeout;
+  return r;
+}
+
+// UsbMakeBulkIn: ep muss Bit 7 = 1 haben (z.B. 0x81, 0x82)
+pub fn UsbMakeBulkIn(dev_fd: int64, ep: int64, timeout: int64): UsbBulkInEndpoint {
+  var r: UsbBulkInEndpoint;
+  if ((ep & 0x80) == 0) {
+    // OUT-Adresse für IN-Typ → Sentinel
+    r.dev_fd := -1; r.endpoint := ep; r.timeout := 0;
+    return r;
+  }
+  r.dev_fd := dev_fd; r.endpoint := ep; r.timeout := timeout;
+  return r;
+}
+
+// UsbMakeInterruptIn: ep muss Bit 7 = 1 haben (z.B. 0x81)
+pub fn UsbMakeInterruptIn(dev_fd: int64, ep: int64, bufSize: int64, timeout: int64): UsbInterruptInEndpoint {
+  var r: UsbInterruptInEndpoint;
+  if ((ep & 0x80) == 0) {
+    r.dev_fd := -1; r.endpoint := ep; r.buf_size := 0; r.timeout := 0;
+    return r;
+  }
+  r.dev_fd := dev_fd; r.endpoint := ep; r.buf_size := bufSize; r.timeout := timeout;
+  return r;
+}
+
+// Prüft ob ein BulkOut-Endpoint gültig ist (keine Sentinelwerte)
+pub fn UsbBulkOutValid(ep: UsbBulkOutEndpoint): int64 {
+  if (ep.dev_fd < 0) { return 0; }
+  return 1;
+}
+
+// Prüft ob ein BulkIn-Endpoint gültig ist
+pub fn UsbBulkInValid(ep: UsbBulkInEndpoint): int64 {
+  if (ep.dev_fd < 0) { return 0; }
+  return 1;
+}
+
+// Prüft ob ein InterruptIn-Endpoint gültig ist
+pub fn UsbInterruptInValid(ep: UsbInterruptInEndpoint): int64 {
+  if (ep.dev_fd < 0) { return 0; }
+  return 1;
+}
+
+// ============================================================
+// Operationen — API-Level-Separation:
+//   UsbBulkOutEndpoint hat NUR Write (kein Read in diesem Modul).
+//   UsbBulkInEndpoint hat NUR Read (kein Write in diesem Modul).
+//   UsbInterruptInEndpoint hat NUR Submit/Wait/Discard.
+//
+//   Ein Aufrufer, der "UsbBulkOutRead" aufrufen möchte, findet die
+//   Funktion nicht — das ist die erreichbare Typsicherheit ohne Generics.
+// ============================================================
+
+// UsbBulkOutWrite — sendet Daten an den OUT-Endpunkt
+// Gibt -1 zurück wenn der Endpoint ungültig ist (falsche Richtung).
+pub fn UsbBulkOutWrite(ep: UsbBulkOutEndpoint, data: int64, length: int64): int64 {
+  if (ep.dev_fd < 0) { return -1; }
+  return UsbBulkWrite(ep.dev_fd, ep.endpoint, data, length, ep.timeout);
+}
+
+// UsbBulkInRead — empfängt Daten vom IN-Endpunkt
+// Gibt -1 zurück wenn der Endpoint ungültig ist.
+pub fn UsbBulkInRead(ep: UsbBulkInEndpoint, buffer: int64, length: int64): int64 {
+  if (ep.dev_fd < 0) { return -1; }
+  return UsbBulkRead(ep.dev_fd, ep.endpoint, buffer, length, ep.timeout);
+}
+
+// UsbInterruptInSubmit — reicht einen URB für den IN-Endpunkt ein
+// Rückgabe: URB-Zeiger (muss nach WaitForUrb freigegeben werden) oder 0.
+pub fn UsbInterruptInSubmit(ep: UsbInterruptInEndpoint, buffer: int64, context: int64): int64 {
+  if (ep.dev_fd < 0) { return 0; }
+  return UsbSubmitInterruptRead(ep.dev_fd, ep.endpoint, buffer, ep.buf_size, context);
+}
+
+// UsbInterruptInWait — wartet auf URB-Abschluss
+// Rückgabe: URB-Zeiger oder 0 bei Timeout.
+pub fn UsbInterruptInWait(ep: UsbInterruptInEndpoint, timeout_ms: int64): int64 {
+  if (ep.dev_fd < 0) { return 0; }
+  return UsbWaitForUrb(ep.dev_fd, timeout_ms);
+}
+
+// UsbInterruptInDiscard — bricht laufenden URB ab
+pub fn UsbInterruptInDiscard(ep: UsbInterruptInEndpoint, urbPtr: int64): int64 {
+  if (ep.dev_fd < 0) { return 0; }
+  return UsbDiscardUrb(ep.dev_fd, urbPtr);
+}

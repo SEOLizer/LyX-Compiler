@@ -1,0 +1,635 @@
+// std/edi/shipping.lyx — Despatch & receipt: DESADV + RECADV (WP-EDI-06)
+//
+// DESADV (BGM 351): despatch advice with 3-level package hierarchy
+//   (palette → carton → item) via CPS/PAC/GIN/LIN segments.
+//   SSCC-18 validation and duplicate detection.
+// RECADV (BGM 632): receiving advice with ordered/delivered/accepted quantities
+//   and optional deviation reason (FTX+AAI).
+//
+// EdiPackage (EDI_PACKAGE_SIZE bytes): SSCC, type, parent index, GTIN, qty
+// EdiRecadvLine (EDI_RECADV_LINE_SIZE bytes): GTIN, ordered, delivered, accepted, reason
+//
+// Public API:
+//   EdiSsccCheck(ptr, len)                                    → 1=valid, 0=invalid
+//   EdiSsccGenerate(base17, out)                              → void (writes 18 chars + NUL)
+//   EdiDesadvWrite(refNum, date, packages, packCount, out, outMax) → bytes
+//   EdiDesadvRead(buf, bufLen, packages, maxPacks)            → packCount / -1=dup SSCC
+//   EdiRecadvWrite(orderRef, date, lines, lineCount, out, outMax)  → bytes
+//   EdiRecadvRead(buf, bufLen, lines, maxLines)               → lineCount
+
+unit std.edi.shipping;
+
+import std.edi.core;
+import std.alloc;
+
+// ── Package type constants ────────────────────────────────────────────────────
+pub con EDI_PKG_PALLET: int64 := 1;
+pub con EDI_PKG_CARTON: int64 := 2;
+pub con EDI_PKG_ITEM:   int64 := 3;
+
+// ── EdiPackage field offsets ──────────────────────────────────────────────────
+pub con EDI_PACKAGE_SSCC:    int64 := 0;    // ptr to 18-char SSCC string
+pub con EDI_PACKAGE_SSCCLEN: int64 := 8;
+pub con EDI_PACKAGE_TYPE:    int64 := 16;   // 1=pallet 2=carton 3=item
+pub con EDI_PACKAGE_PARENT:  int64 := 24;   // parent index (0-based), -1 if none
+pub con EDI_PACKAGE_GTIN:    int64 := 32;   // ptr (items only)
+pub con EDI_PACKAGE_GTINLEN: int64 := 40;
+pub con EDI_PACKAGE_QTY:     int64 := 48;
+pub con EDI_PACKAGE_SIZE:    int64 := 56;
+
+// ── EdiRecadvLine field offsets ───────────────────────────────────────────────
+pub con EDI_RECADV_LINE_GTIN:      int64 := 0;
+pub con EDI_RECADV_LINE_GTINLEN:   int64 := 8;
+pub con EDI_RECADV_LINE_ORDERED:   int64 := 16;
+pub con EDI_RECADV_LINE_DELIVERED: int64 := 24;
+pub con EDI_RECADV_LINE_ACCEPTED:  int64 := 32;
+pub con EDI_RECADV_LINE_REASON:    int64 := 40;   // ptr to FTX free text
+pub con EDI_RECADV_LINE_REASONLEN: int64 := 48;
+pub con EDI_RECADV_LINE_SIZE:      int64 := 56;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn shpStrLen(ptr: int64): int64 {
+    var n: int64 := 0;
+    while (peek8(ptr + n) != 0) { n := n + 1; }
+    return n;
+}
+
+fn shpPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn shpPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i += 1;
+    }
+    return pos + n;
+}
+
+fn shpPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val < 0)  { return 0 - 1; }
+    if (val == 0) { return shpPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var buf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(buf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx += 1;
+    }
+    var r: int64 := shpPutStr(out, pos, outMax, buf, digits);
+    free(buf, 24);
+    return r;
+}
+
+fn shpParseInt(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c >= 48 && c <= 57) { v := v * 10 + (c - 48); }
+        i += 1;
+    }
+    return v;
+}
+
+fn shpTagIs(seg: int64, t0: int64, t1: int64, t2: int64): int64 {
+    var p: int64 := peek64(seg + EDI_SEG_PTR);
+    if (p == 0) { return 0; }
+    if (peek8(p) != t0) { return 0; }
+    if (peek8(p+1) != t1) { return 0; }
+    if (peek8(p+2) != t2) { return 0; }
+    return 1;
+}
+
+fn shpElemPtr(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+}
+fn shpElemLen(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+}
+
+fn shpStrEq(a: int64, aLen: int64, b: int64, bLen: int64): int64 {
+    if (aLen != bLen) { return 0; }
+    if (aLen == 0) { return 0; }
+    var i: int64 := 0;
+    while (i < aLen) {
+        if (peek8(a+i) != peek8(b+i)) { return 0; }
+        i += 1;
+    }
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — SSCC-18
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GS1 Mod-10 for SSCC-18: digit at index i (0-based from left) in N-digit code
+// gets weight 3 if (N-i) is even, weight 1 if odd.
+// For N=18: even indices get weight 3, odd indices get weight 1.
+
+// Validate an 18-digit SSCC string. Returns 1 if check digit is correct, 0 otherwise.
+pub fn EdiSsccCheck(ptr: int64, len: int64): int64 {
+    if (len != 18) { return 0; }
+    var sum: int64 := 0;
+    var i: int64 := 0;
+    while (i < 18) {
+        var c: int64 := peek8(ptr + i);
+        if (c < 48) { return 0; }
+        if (c > 57) { return 0; }
+        var d: int64 := c - 48;
+        var w: int64 := 1;
+        if (i - (i / 2) * 2 == 0) { w := 3; }  // even index → weight 3
+        sum := sum + d * w;
+        i += 1;
+    }
+    if (sum % 10 != 0) { return 0; }
+    return 1;
+}
+
+// Generate SSCC-18 from a 17-char base string (extension digit + company prefix
+// + serial reference). Writes 18 ASCII digits + NUL to out (needs ≥19 bytes).
+pub fn EdiSsccGenerate(base17: int64, out: int64): void {
+    var sum: int64 := 0;
+    var i: int64 := 0;
+    while (i < 17) {
+        var c: int64 := peek8(base17 + i);
+        var d: int64 := 0;
+        if (c >= 48 && c <= 57) { d := c - 48; }
+        poke8(out + i, d + 48);
+        var w: int64 := 1;
+        if (i - (i / 2) * 2 == 0) { w := 3; }
+        sum := sum + d * w;
+        i += 1;
+    }
+    var r: int64 := sum % 10;
+    var checkDigit: int64 := (10 - r) % 10;
+    poke8(out + 17, checkDigit + 48);
+    poke8(out + 18, 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — DESADV
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write DESADV. Packages must be ordered: pallets first, then cartons, then items.
+// Each package: SSCC + type + parent (0-based index, -1 for none) + GTIN/qty (items).
+pub fn EdiDesadvWrite(refNum: int64, date: int64, packages: int64, packCount: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var refLen: int64 := 0;
+    if (refNum != 0) { refLen := shpStrLen(refNum); }
+
+    // BGM+351+refNum+9'
+    pos := shpPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := shpPutStr(out, pos, outMax, "351"c as int64, 3);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (refLen > 0) { pos := shpPutStr(out, pos, outMax, refNum, refLen); }
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := shpPutChar(out, pos, outMax, 57);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // DTM+137:date:102'
+    if (date != 0) {
+        pos := shpPutStr(out, pos, outMax, "DTM"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := shpPutStr(out, pos, outMax, "137"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := shpPutStr(out, pos, outMax, date, 8);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := shpPutStr(out, pos, outMax, "102"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    var itemNo: int64 := 0;
+    var pi: int64 := 0;
+    while (pi < packCount) {
+        var pkg: int64 := packages + pi * EDI_PACKAGE_SIZE;
+        var ssccPtr: int64 := peek64(pkg + EDI_PACKAGE_SSCC);
+        var ssccLen: int64 := peek64(pkg + EDI_PACKAGE_SSCCLEN);
+        var pkgType: int64 := peek64(pkg + EDI_PACKAGE_TYPE);
+        var parent:  int64 := peek64(pkg + EDI_PACKAGE_PARENT);
+        var gtinPtr: int64 := peek64(pkg + EDI_PACKAGE_GTIN);
+        var gtinLen: int64 := peek64(pkg + EDI_PACKAGE_GTINLEN);
+        var qty:     int64 := peek64(pkg + EDI_PACKAGE_QTY);
+
+        // CPS+seqNo[+parentSeqNo]'
+        pos := shpPutStr(out, pos, outMax, "CPS"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := shpPutInt(out, pos, outMax, pi + 1);
+        if (parent != (0 - 1)) {
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := shpPutInt(out, pos, outMax, parent + 1);
+        }
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        if (pkgType == EDI_PKG_PALLET || pkgType == EDI_PKG_CARTON) {
+            // PAC+1++typeCode'
+            pos := shpPutStr(out, pos, outMax, "PAC"c as int64, 3);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := shpPutChar(out, pos, outMax, 49);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            if (pkgType == EDI_PKG_PALLET) {
+                pos := shpPutStr(out, pos, outMax, "201"c as int64, 3);
+            } else {
+                pos := shpPutStr(out, pos, outMax, "CT"c as int64, 2);
+            }
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+            // PCI+33E'  (marking with shipping label)
+            pos := shpPutStr(out, pos, outMax, "PCI"c as int64, 3);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := shpPutStr(out, pos, outMax, "33E"c as int64, 3);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+            // GIN+BJ+sscc'
+            if (ssccPtr != 0 && ssccLen > 0) {
+                pos := shpPutStr(out, pos, outMax, "GIN"c as int64, 3);
+                pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+                pos := shpPutStr(out, pos, outMax, "BJ"c as int64, 2);
+                pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+                pos := shpPutStr(out, pos, outMax, ssccPtr, ssccLen);
+                pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+            }
+        } else {
+            // Item: LIN+n++GTIN:SRV' + QTY+12:qty'
+            itemNo += 1;
+            pos := shpPutStr(out, pos, outMax, "LIN"c as int64, 3);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := shpPutInt(out, pos, outMax, itemNo);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            if (gtinPtr != 0 && gtinLen > 0) {
+                pos := shpPutStr(out, pos, outMax, gtinPtr, gtinLen);
+                pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+                pos := shpPutStr(out, pos, outMax, "SRV"c as int64, 3);
+            }
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+            // QTY+12:qty'
+            pos := shpPutStr(out, pos, outMax, "QTY"c as int64, 3);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := shpPutStr(out, pos, outMax, "12"c as int64, 2);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := shpPutInt(out, pos, outMax, qty);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        pi += 1;
+    }
+
+    // CNT+2:packCount'
+    pos := shpPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := shpPutChar(out, pos, outMax, 50);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := shpPutInt(out, pos, outMax, packCount);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse DESADV. Returns package count, or -1 if a duplicate SSCC is detected.
+// parent field: 0-based index of parent package, or peek64()==(0-1) if none.
+pub fn EdiDesadvRead(buf: int64, bufLen: int64, packages: int64, maxPacks: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count: int64 := 0;
+    var curPkg: int64 := 0;
+    var done: int64 := 0;
+    var dupFound: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            // CPS → new package slot
+            if (shpTagIs(seg, 67, 80, 83) == 1) {   // "CPS"
+                if (count < maxPacks) {
+                    curPkg := packages + count * EDI_PACKAGE_SIZE;
+                    var zi: int64 := 0;
+                    while (zi < EDI_PACKAGE_SIZE) { poke8(curPkg + zi, 0); zi := zi + 1; }
+                    poke64(curPkg + EDI_PACKAGE_PARENT, 0 - 1);
+                    if (n > 1) {
+                        var pSeqNo: int64 := shpParseInt(shpElemPtr(elems, 1), shpElemLen(elems, 1));
+                        if (pSeqNo > 0) {
+                            poke64(curPkg + EDI_PACKAGE_PARENT, pSeqNo - 1);
+                        }
+                    }
+                    count += 1;
+                } else {
+                    curPkg := 0;
+                }
+            }
+
+            // PAC → determine package type from elem[2]
+            if (shpTagIs(seg, 80, 65, 67) == 1 && curPkg != 0) {   // "PAC"
+                if (n > 2) {
+                    var tp: int64 := shpElemPtr(elems, 2);
+                    var tl: int64 := shpElemLen(elems, 2);
+                    // "201" = 50,48,49 → pallet
+                    if (tl == 3 && peek8(tp) == 50 && peek8(tp+1) == 48 && peek8(tp+2) == 49) {
+                        poke64(curPkg + EDI_PACKAGE_TYPE, EDI_PKG_PALLET);
+                    }
+                    // "CT" = 67,84 → carton
+                    if (tl == 2 && peek8(tp) == 67 && peek8(tp+1) == 84) {
+                        poke64(curPkg + EDI_PACKAGE_TYPE, EDI_PKG_CARTON);
+                    }
+                }
+            }
+
+            // GIN+BJ+sscc' → store SSCC, check for duplicates
+            if (shpTagIs(seg, 71, 73, 78) == 1 && curPkg != 0) {   // "GIN"
+                if (n > 1) {
+                    var qp: int64 := shpElemPtr(elems, 0);
+                    var ql: int64 := shpElemLen(elems, 0);
+                    // qualifier "BJ" = 66,74
+                    if (ql >= 2 && peek8(qp) == 66 && peek8(qp+1) == 74) {
+                        var sp: int64 := shpElemPtr(elems, 1);
+                        var sl: int64 := shpElemLen(elems, 1);
+                        // duplicate check against all previous packages
+                        var di: int64 := 0;
+                        while (di < count - 1) {
+                            var dpkg: int64 := packages + di * EDI_PACKAGE_SIZE;
+                            var dp: int64 := peek64(dpkg + EDI_PACKAGE_SSCC);
+                            var dl: int64 := peek64(dpkg + EDI_PACKAGE_SSCCLEN);
+                            if (shpStrEq(sp, sl, dp, dl) == 1) {
+                                dupFound := 1;
+                                done := 1;
+                            }
+                            di += 1;
+                        }
+                        if (dupFound == 0) {
+                            poke64(curPkg + EDI_PACKAGE_SSCC,    sp);
+                            poke64(curPkg + EDI_PACKAGE_SSCCLEN, sl);
+                        }
+                    }
+                }
+            }
+
+            // LIN → item-level: set type, store GTIN
+            if (shpTagIs(seg, 76, 73, 78) == 1 && curPkg != 0) {   // "LIN"
+                poke64(curPkg + EDI_PACKAGE_TYPE, EDI_PKG_ITEM);
+                if (n > 2) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    EdiComponentSplit(shpElemPtr(elems, 2), shpElemLen(elems, 2), comps, 4);
+                    poke64(curPkg + EDI_PACKAGE_GTIN,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                    poke64(curPkg + EDI_PACKAGE_GTINLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // QTY+12:qty' → despatch quantity for item
+            if (shpTagIs(seg, 81, 84, 89) == 1 && curPkg != 0) {   // "QTY"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(shpElemPtr(elems, 0), shpElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "12" = 49,50 → despatch qty
+                        if (ql == 2 && peek8(qp) == 49 && peek8(qp+1) == 50) {
+                            var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                            var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            poke64(curPkg + EDI_PACKAGE_QTY, shpParseInt(vp, vl));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    if (dupFound == 1) { return 0 - 1; }
+    return count;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — RECADV
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write RECADV. orderRef is used as BGM reference and RFF+ON cross-reference.
+pub fn EdiRecadvWrite(orderRef: int64, date: int64, lines: int64, lineCount: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var refLen: int64 := 0;
+    if (orderRef != 0) { refLen := shpStrLen(orderRef); }
+
+    // BGM+632+orderRef+9'
+    pos := shpPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := shpPutStr(out, pos, outMax, "632"c as int64, 3);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (refLen > 0) { pos := shpPutStr(out, pos, outMax, orderRef, refLen); }
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := shpPutChar(out, pos, outMax, 57);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // DTM+137:date:102'
+    if (date != 0) {
+        pos := shpPutStr(out, pos, outMax, "DTM"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := shpPutStr(out, pos, outMax, "137"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := shpPutStr(out, pos, outMax, date, 8);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := shpPutStr(out, pos, outMax, "102"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    // RFF+ON:orderRef'  (cross-reference to purchase order)
+    if (refLen > 0) {
+        pos := shpPutStr(out, pos, outMax, "RFF"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := shpPutStr(out, pos, outMax, "ON"c as int64, 2);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := shpPutStr(out, pos, outMax, orderRef, refLen);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    var li: int64 := 0;
+    while (li < lineCount) {
+        var line: int64 := lines + li * EDI_RECADV_LINE_SIZE;
+        var gtinPtr:    int64 := peek64(line + EDI_RECADV_LINE_GTIN);
+        var gtinLen:    int64 := peek64(line + EDI_RECADV_LINE_GTINLEN);
+        var ordered:    int64 := peek64(line + EDI_RECADV_LINE_ORDERED);
+        var delivered:  int64 := peek64(line + EDI_RECADV_LINE_DELIVERED);
+        var accepted:   int64 := peek64(line + EDI_RECADV_LINE_ACCEPTED);
+        var reasonPtr:  int64 := peek64(line + EDI_RECADV_LINE_REASON);
+        var reasonLen:  int64 := peek64(line + EDI_RECADV_LINE_REASONLEN);
+
+        // LIN+n++GTIN:SRV'
+        pos := shpPutStr(out, pos, outMax, "LIN"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := shpPutInt(out, pos, outMax, li + 1);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (gtinPtr != 0 && gtinLen > 0) {
+            pos := shpPutStr(out, pos, outMax, gtinPtr, gtinLen);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := shpPutStr(out, pos, outMax, "SRV"c as int64, 3);
+        }
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // QTY+21:ordered'
+        pos := shpPutStr(out, pos, outMax, "QTY"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := shpPutStr(out, pos, outMax, "21"c as int64, 2);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := shpPutInt(out, pos, outMax, ordered);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // QTY+12:delivered'
+        pos := shpPutStr(out, pos, outMax, "QTY"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := shpPutStr(out, pos, outMax, "12"c as int64, 2);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := shpPutInt(out, pos, outMax, delivered);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // QTY+192:accepted'
+        pos := shpPutStr(out, pos, outMax, "QTY"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := shpPutStr(out, pos, outMax, "192"c as int64, 3);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := shpPutInt(out, pos, outMax, accepted);
+        pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // FTX+AAI+++reason'  (optional deviation reason)
+        if (reasonPtr != 0 && reasonLen > 0) {
+            pos := shpPutStr(out, pos, outMax, "FTX"c as int64, 3);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := shpPutStr(out, pos, outMax, "AAI"c as int64, 3);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+            pos := shpPutStr(out, pos, outMax, reasonPtr, reasonLen);
+            pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+        }
+
+        li += 1;
+    }
+
+    // CNT+2:lineCount'
+    pos := shpPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := shpPutChar(out, pos, outMax, 50);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := shpPutInt(out, pos, outMax, lineCount);
+    pos := shpPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse RECADV. Returns line count.
+pub fn EdiRecadvRead(buf: int64, bufLen: int64, lines: int64, maxLines: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count: int64 := 0;
+    var curLine: int64 := 0;
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            // LIN → new line
+            if (shpTagIs(seg, 76, 73, 78) == 1) {   // "LIN"
+                if (count < maxLines) {
+                    curLine := lines + count * EDI_RECADV_LINE_SIZE;
+                    var zi: int64 := 0;
+                    while (zi < EDI_RECADV_LINE_SIZE) { poke8(curLine + zi, 0); zi := zi + 1; }
+                    if (n > 2) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(shpElemPtr(elems, 2), shpElemLen(elems, 2), comps, 4);
+                        poke64(curLine + EDI_RECADV_LINE_GTIN,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(curLine + EDI_RECADV_LINE_GTINLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                    count += 1;
+                }
+            }
+
+            // QTY → ordered/delivered/accepted
+            if (shpTagIs(seg, 81, 84, 89) == 1 && curLine != 0) {   // "QTY"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(shpElemPtr(elems, 0), shpElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var qty: int64 := shpParseInt(vp, vl);
+                        // "21" = 50,49 → ordered
+                        if (ql == 2 && peek8(qp) == 50 && peek8(qp+1) == 49) {
+                            poke64(curLine + EDI_RECADV_LINE_ORDERED, qty);
+                        }
+                        // "12" = 49,50 → delivered
+                        if (ql == 2 && peek8(qp) == 49 && peek8(qp+1) == 50) {
+                            poke64(curLine + EDI_RECADV_LINE_DELIVERED, qty);
+                        }
+                        // "192" = 49,57,50 → accepted
+                        if (ql == 3 && peek8(qp) == 49 && peek8(qp+1) == 57 && peek8(qp+2) == 50) {
+                            poke64(curLine + EDI_RECADV_LINE_ACCEPTED, qty);
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // FTX+AAI+++reason' → deviation reason
+            if (shpTagIs(seg, 70, 84, 88) == 1 && curLine != 0) {   // "FTX"
+                if (n > 3) {
+                    var qp: int64 := shpElemPtr(elems, 0);
+                    var ql: int64 := shpElemLen(elems, 0);
+                    // qualifier "AAI" = 65,65,73
+                    if (ql >= 3 && peek8(qp) == 65 && peek8(qp+1) == 65 && peek8(qp+2) == 73) {
+                        poke64(curLine + EDI_RECADV_LINE_REASON,    shpElemPtr(elems, 3));
+                        poke64(curLine + EDI_RECADV_LINE_REASONLEN, shpElemLen(elems, 3));
+                    }
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}

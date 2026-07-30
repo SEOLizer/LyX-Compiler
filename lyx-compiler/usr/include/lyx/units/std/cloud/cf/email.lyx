@@ -1,0 +1,283 @@
+// std/cloud/cf/email.lyx — Cloudflare Email Routing
+// WP-CF-14
+
+unit std.cloud.cf.email;
+
+import std.cloud.cf.transport;
+import std.cloud.cf.core;
+import std.alloc;
+import std.io;
+
+pub type CFEmailSettings = struct {
+    enabled:  int64;  // 0 or 1
+    name:     int64;  // pchar — zone name
+    created:  int64;  // pchar
+    modified: int64;  // pchar
+    tag:      int64;  // pchar
+};
+
+pub type CFEmailRule = struct {
+    id:       int64;  // pchar
+    name:     int64;  // pchar
+    enabled:  int64;
+    priority: int64;
+    matchers: int64;  // pchar — JSON array
+    actions:  int64;  // pchar — JSON array
+};
+
+fn emFreeIfSet(p: int64) {
+    if (p != 0) { free(p, StrLen(p as pchar)+1); }
+}
+
+pub fn CFEmailSettingsFree(s: CFEmailSettings) {
+    emFreeIfSet(s.name); emFreeIfSet(s.created); emFreeIfSet(s.modified); emFreeIfSet(s.tag);
+}
+
+pub fn CFEmailRuleFree(r: CFEmailRule) {
+    emFreeIfSet(r.id); emFreeIfSet(r.name); emFreeIfSet(r.matchers); emFreeIfSet(r.actions);
+}
+
+fn emailPath(zoneId: pchar, rest: pchar): int64 {
+    var buf: int64 := alloc(256);
+    var off: int64 := cftAppend(buf, 0, "/zones/"c);
+    off := cftAppend(buf, off, zoneId);
+    off := cftAppend(buf, off, "/email/routing"c);
+    if (rest != 0 as pchar) { off := cftAppend(buf, off, rest); }
+    poke8(buf+off, 0); return buf;
+}
+
+fn emailRulePath(zoneId: pchar, ruleId: pchar): int64 {
+    var buf: int64 := alloc(256);
+    var off: int64 := cftAppend(buf, 0, "/zones/"c);
+    off := cftAppend(buf, off, zoneId);
+    off := cftAppend(buf, off, "/email/routing/rules"c);
+    if (ruleId != 0 as pchar) {
+        off := cftAppend(buf, off, "/"c);
+        off := cftAppend(buf, off, ruleId);
+    }
+    poke8(buf+off, 0); return buf;
+}
+
+// Email Routing Settings
+
+pub fn EmailRoutingGet(c: CFClient, zoneId: pchar): CFEmailSettings {
+    var path: int64 := emailPath(zoneId, 0 as pchar);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var s: CFEmailSettings;
+    s.enabled:=0; s.name:=0; s.created:=0; s.modified:=0; s.tag:=0;
+    if (r.success == 1 && r.result != 0) {
+        s.enabled  := cfExtractBool(r.result, r.resultLen, "enabled"c);
+        s.name     := cfExtractValue(r.result, r.resultLen, "name"c);
+        s.created  := cfExtractValue(r.result, r.resultLen, "created"c);
+        s.modified := cfExtractValue(r.result, r.resultLen, "modified"c);
+        s.tag      := cfExtractValue(r.result, r.resultLen, "tag"c);
+    }
+    CFResponseFree(r); return s;
+}
+
+pub fn EmailRoutingEnable(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := emailPath(zoneId, "/enable"c);
+    var r: CFResponse := CFPost(c, path as pchar, 0, 0);
+    free(path, 256);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn EmailRoutingDisable(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := emailPath(zoneId, "/disable"c);
+    var r: CFResponse := CFPost(c, path as pchar, 0, 0);
+    free(path, 256);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+// DNS verification
+
+pub fn EmailRoutingDNSGet(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := emailPath(zoneId, "/dns"c);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+pub fn EmailRoutingDNSVerify(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := emailPath(zoneId, "/dns"c);
+    var r: CFResponse := CFPost(c, path as pchar, 0, 0);
+    free(path, 256);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+// Email Rules
+
+fn parseEmailRule(json: int64, jl: int64): CFEmailRule {
+    var rule: CFEmailRule;
+    rule.id       := cfExtractValue(json, jl, "id"c);
+    rule.name     := cfExtractValue(json, jl, "name"c);
+    rule.enabled  := cfExtractBool(json, jl, "enabled"c);
+    rule.priority := cfExtractInt(json, jl, "priority"c);
+    rule.matchers := cfExtractValue(json, jl, "matchers"c);
+    rule.actions  := cfExtractValue(json, jl, "actions"c);
+    return rule;
+}
+
+pub fn EmailRuleCreate(c: CFClient, zoneId: pchar, name: pchar, priority: int64,
+                       matcherType: pchar, matcherField: pchar, matcherValue: pchar,
+                       actionType: pchar, actionValue: pchar): CFEmailRule {
+    var path: int64 := emailRulePath(zoneId, 0 as pchar);
+    var jname: int64 := cfJsonEscape(name);
+    var jmval: int64 := cfJsonEscape(matcherValue);
+    var javal: int64 := cfJsonEscape(actionValue);
+    var body: int64 := alloc(1024);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\""c);
+    off := cftAppend(body, off, jname as pchar);
+    off := cftAppend(body, off, "\",\"priority\":"c);
+    var pbuf: int64 := alloc(24);
+    var pstr: int64 := int64ToStr(priority, pbuf);
+    off := cftAppend(body, off, pbuf as pchar);
+    free(pbuf, 24);
+    off := cftAppend(body, off, ",\"enabled\":true,\"matchers\":[{\"type\":\""c);
+    off := cftAppend(body, off, matcherType);
+    if (matcherField != 0 as pchar) {
+        off := cftAppend(body, off, "\",\"field\":\""c);
+        off := cftAppend(body, off, matcherField);
+    }
+    off := cftAppend(body, off, "\",\"value\":\""c);
+    off := cftAppend(body, off, jmval as pchar);
+    off := cftAppend(body, off, "\"}],\"actions\":[{\"type\":\""c);
+    off := cftAppend(body, off, actionType);
+    if (actionValue != 0 as pchar) {
+        off := cftAppend(body, off, "\",\"value\":[\""c);
+        off := cftAppend(body, off, javal as pchar);
+        off := cftAppend(body, off, "\"]"c);
+    }
+    off := cftAppend(body, off, "}]}"c); poke8(body+off, 0);
+    emFreeIfSet(jname); emFreeIfSet(jmval); emFreeIfSet(javal);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 1024);
+    var rule: CFEmailRule;
+    rule.id:=0; rule.name:=0; rule.enabled:=0; rule.priority:=0; rule.matchers:=0; rule.actions:=0;
+    if (r.success == 1 && r.result != 0) { rule = parseEmailRule(r.result, r.resultLen); }
+    CFResponseFree(r); return rule;
+}
+
+pub fn EmailRuleCreateWorker(c: CFClient, zoneId: pchar, name: pchar,
+                              priority: int64, matcherType: pchar,
+                              matcherField: pchar, matcherValue: pchar,
+                              workerTag: pchar): CFEmailRule {
+    return EmailRuleCreate(c, zoneId, name, priority,
+        matcherType, matcherField, matcherValue,
+        "worker"c, workerTag);
+}
+
+pub fn EmailRuleDelete(c: CFClient, zoneId: pchar, ruleId: pchar): int64 {
+    var path: int64 := emailRulePath(zoneId, ruleId);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn EmailRuleList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := emailRulePath(zoneId, 0 as pchar);
+    var result: int64 := CFGetAll(c, path as pchar, 50);
+    free(path, 256); return result;
+}
+
+pub fn EmailRuleUpdate(c: CFClient, zoneId: pchar, ruleId: pchar,
+                       enabled: int64, priority: int64): CFEmailRule {
+    var path: int64 := emailRulePath(zoneId, ruleId);
+    var body: int64 := alloc(128);
+    var off: int64 := cftAppend(body, 0, "{\"enabled\":"c);
+    if (enabled == 1) { off := cftAppend(body, off, "true"c); }
+    else { off := cftAppend(body, off, "false"c); }
+    off := cftAppend(body, off, ",\"priority\":"c);
+    var pbuf: int64 := alloc(24);
+    var pstr: int64 := int64ToStr(priority, pbuf);
+    off := cftAppend(body, off, pbuf as pchar);
+    free(pbuf, 24);
+    off := cftAppend(body, off, "}"c); poke8(body+off, 0);
+    var r: CFResponse := CFPut(c, path as pchar, body, off);
+    free(path, 256); free(body, 128);
+    var rule: CFEmailRule;
+    rule.id:=0; rule.name:=0; rule.enabled:=0; rule.priority:=0; rule.matchers:=0; rule.actions:=0;
+    if (r.success == 1 && r.result != 0) { rule = parseEmailRule(r.result, r.resultLen); }
+    CFResponseFree(r); return rule;
+}
+
+// Catch-all rule
+
+pub fn EmailCatchAllGet(c: CFClient, zoneId: pchar): CFEmailRule {
+    var path: int64 := emailPath(zoneId, "/rules/catch_all"c);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var rule: CFEmailRule;
+    rule.id:=0; rule.name:=0; rule.enabled:=0; rule.priority:=0; rule.matchers:=0; rule.actions:=0;
+    if (r.success == 1 && r.result != 0) { rule = parseEmailRule(r.result, r.resultLen); }
+    CFResponseFree(r); return rule;
+}
+
+pub fn EmailCatchAllSet(c: CFClient, zoneId: pchar,
+                        actionType: pchar, actionValue: pchar,
+                        enabled: int64): int64 {
+    var path: int64 := emailPath(zoneId, "/rules/catch_all"c);
+    var javal: int64 := 0;
+    if (actionValue != 0 as pchar) { javal = cfJsonEscape(actionValue); }
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\"catch_all\",\"enabled\":"c);
+    if (enabled == 1) { off := cftAppend(body, off, "true"c); }
+    else { off := cftAppend(body, off, "false"c); }
+    off := cftAppend(body, off, ",\"matchers\":[{\"type\":\"all\"}],\"actions\":[{\"type\":\""c);
+    off := cftAppend(body, off, actionType);
+    if (javal != 0) {
+        off := cftAppend(body, off, "\",\"value\":[\""c);
+        off := cftAppend(body, off, javal as pchar);
+        off := cftAppend(body, off, "\"]"c);
+        emFreeIfSet(javal);
+    }
+    off := cftAppend(body, off, "}]}"c); poke8(body+off, 0);
+    var r: CFResponse := CFPut(c, path as pchar, body, off);
+    free(path, 256); free(body, 512);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+// Destination addresses
+
+fn destPath(accountId: pchar, destAddr: pchar): int64 {
+    var buf: int64 := alloc(256);
+    var off: int64 := cftAppend(buf, 0, "/accounts/"c);
+    off := cftAppend(buf, off, accountId);
+    off := cftAppend(buf, off, "/email/routing/addresses"c);
+    if (destAddr != 0 as pchar) {
+        off := cftAppend(buf, off, "/"c);
+        off := cftAppend(buf, off, destAddr);
+    }
+    poke8(buf+off, 0); return buf;
+}
+
+pub fn EmailDestinationCreate(c: CFClient, accountId: pchar, email: pchar): int64 {
+    var path: int64 := destPath(accountId, 0 as pchar);
+    var jmail: int64 := cfJsonEscape(email);
+    var body: int64 := alloc(256);
+    var off: int64 := cftAppend(body, 0, "{\"email\":\""c);
+    off := cftAppend(body, off, jmail as pchar);
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    emFreeIfSet(jmail);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cfExtractValue(r.result, r.resultLen, "tag"c); }
+    CFResponseFree(r); return result;
+}
+
+pub fn EmailDestinationDelete(c: CFClient, accountId: pchar, destTag: pchar): int64 {
+    var path: int64 := destPath(accountId, destTag);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn EmailDestinationList(c: CFClient, accountId: pchar): int64 {
+    var path: int64 := destPath(accountId, 0 as pchar);
+    var result: int64 := CFGetAll(c, path as pchar, 50);
+    free(path, 256); return result;
+}

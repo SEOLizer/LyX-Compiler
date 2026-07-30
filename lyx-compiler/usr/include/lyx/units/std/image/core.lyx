@@ -1,0 +1,176 @@
+// std/image/core.lyx — GRF-00: Core Image API
+// GrfImage struct layout, pixel ops, format detection, file I/O helper
+
+@description("Image decoder core: GrfImage struct, pixel ops, format detection")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.image.core;
+
+import std.alloc;
+import std.fs;
+
+// ============================================================================
+// GrfImage Struct Offsets (all fields are int64, total 56 bytes)
+// ============================================================================
+
+pub con GRF_OFF_WIDTH:    int64 := 0;
+pub con GRF_OFF_HEIGHT:   int64 := 8;
+pub con GRF_OFF_CHANNELS: int64 := 16;
+pub con GRF_OFF_DEPTH:    int64 := 24;
+pub con GRF_OFF_FORMAT:   int64 := 32;
+pub con GRF_OFF_PIXELS:   int64 := 40;
+pub con GRF_OFF_PIXLEN:   int64 := 48;
+pub con GRF_SIZE:         int64 := 56;
+
+// ============================================================================
+// Format Constants
+// ============================================================================
+
+pub con GRF_FMT_UNKNOWN: int64 := 0;
+pub con GRF_FMT_BMP:     int64 := 1;
+pub con GRF_FMT_PNG:     int64 := 2;
+pub con GRF_FMT_JPEG:    int64 := 3;
+pub con GRF_FMT_GIF:     int64 := 4;
+pub con GRF_FMT_TIFF:    int64 := 5;
+pub con GRF_FMT_WEBP:    int64 := 6;
+pub con GRF_FMT_AVIF:    int64 := 7;
+
+// ============================================================================
+// Allocation
+// ============================================================================
+
+// Allocates GrfImage struct + RGBA8 pixel buffer (w*h*4 bytes).
+// Canonical format: 4 channels, 8 bits/channel, RGBA row-major top-down.
+// Returns img pointer (int64), or 0 on invalid dimensions.
+pub fn GrfImageAlloc(w: int64, h: int64): int64 {
+    if (w <= 0 || h <= 0) { return 0; }
+    var img: int64 := alloc(GRF_SIZE);
+    if (img == 0) { return 0; }
+    var pixLen: int64 := w * h * 4;
+    var pixels: int64 := alloc(pixLen);
+    if (pixels == 0) { free(img, GRF_SIZE); return 0; }
+    poke64(img + GRF_OFF_WIDTH,    w);
+    poke64(img + GRF_OFF_HEIGHT,   h);
+    poke64(img + GRF_OFF_CHANNELS, 4);
+    poke64(img + GRF_OFF_DEPTH,    8);
+    poke64(img + GRF_OFF_FORMAT,   GRF_FMT_UNKNOWN);
+    poke64(img + GRF_OFF_PIXELS,   pixels);
+    poke64(img + GRF_OFF_PIXLEN,   pixLen);
+    return img;
+}
+
+// Frees pixel buffer and struct allocated by GrfImageAlloc.
+pub fn GrfImageFree(img: int64): void {
+    if (img == 0) { return; }
+    var pixels: int64 := peek64(img + GRF_OFF_PIXELS);
+    var pixLen: int64 := peek64(img + GRF_OFF_PIXLEN);
+    if (pixels != 0 && pixLen > 0) { free(pixels, pixLen); }
+    free(img, GRF_SIZE);
+}
+
+// ============================================================================
+// Pixel Access
+// ============================================================================
+
+// Returns pixel at (x,y) as 0xRRGGBBAA packed int64.
+pub fn GrfImageGetPixel(img: int64, x: int64, y: int64): int64 {
+    var w:      int64 := peek64(img + GRF_OFF_WIDTH);
+    var pixels: int64 := peek64(img + GRF_OFF_PIXELS);
+    var off:    int64 := (y * w + x) * 4;
+    var r: int64 := peek8(pixels + off);
+    var g: int64 := peek8(pixels + off + 1);
+    var b: int64 := peek8(pixels + off + 2);
+    var a: int64 := peek8(pixels + off + 3);
+    return (r << 24) | (g << 16) | (b << 8) | a;
+}
+
+// Writes rgba (0xRRGGBBAA) to pixel at (x,y).
+pub fn GrfImageSetPixel(img: int64, x: int64, y: int64, rgba: int64): void {
+    var w:      int64 := peek64(img + GRF_OFF_WIDTH);
+    var pixels: int64 := peek64(img + GRF_OFF_PIXELS);
+    var off:    int64 := (y * w + x) * 4;
+    poke8(pixels + off,     (rgba >> 24) & 255);
+    poke8(pixels + off + 1, (rgba >> 16) & 255);
+    poke8(pixels + off + 2, (rgba >> 8)  & 255);
+    poke8(pixels + off + 3, rgba & 255);
+}
+
+// Fills all pixels with rgba (0xRRGGBBAA).
+pub fn GrfImageClear(img: int64, rgba: int64): void {
+    var pixels: int64 := peek64(img + GRF_OFF_PIXELS);
+    var pixLen: int64 := peek64(img + GRF_OFF_PIXLEN);
+    var r: int64 := (rgba >> 24) & 255;
+    var g: int64 := (rgba >> 16) & 255;
+    var b: int64 := (rgba >> 8)  & 255;
+    var a: int64 := rgba & 255;
+    var i: int64 := 0;
+    while (i < pixLen) {
+        poke8(pixels + i,     r);
+        poke8(pixels + i + 1, g);
+        poke8(pixels + i + 2, b);
+        poke8(pixels + i + 3, a);
+        i += 4;
+    }
+}
+
+// ============================================================================
+// File I/O
+// ============================================================================
+
+// Reads file at path into pre-allocated outBuf (maxLen bytes).
+// plen is reserved for future use (ignored). Returns bytes read or -1.
+pub fn GrfFileRead(path: int64, plen: int64, outBuf: int64, maxLen: int64): int64 {
+    return ReadFile(path, outBuf, maxLen);
+}
+
+// ============================================================================
+// Format Detection
+// ============================================================================
+
+// Returns GRF_FMT_* constant based on magic bytes, or GRF_FMT_UNKNOWN.
+pub fn GrfDetectFormat(buf: int64, len: int64): int64 {
+    if (len < 4) { return GRF_FMT_UNKNOWN; }
+    var b0: int64 := peek8(buf);
+    var b1: int64 := peek8(buf + 1);
+    var b2: int64 := peek8(buf + 2);
+    var b3: int64 := peek8(buf + 3);
+    // BMP: 'B' 'M' (0x42 0x4D)
+    if (b0 == 0x42 && b1 == 0x4D) { return GRF_FMT_BMP; }
+    // PNG: 89 50 4E 47
+    if (b0 == 0x89 && b1 == 0x50 && b2 == 0x4E && b3 == 0x47) { return GRF_FMT_PNG; }
+    // JPEG: FF D8 FF
+    if (b0 == 0xFF && b1 == 0xD8 && b2 == 0xFF) { return GRF_FMT_JPEG; }
+    // GIF: 'G' 'I' 'F' '8'
+    if (b0 == 0x47 && b1 == 0x49 && b2 == 0x46 && b3 == 0x38) { return GRF_FMT_GIF; }
+    // TIFF LE: 'I' 'I' 0x2A 0x00
+    if (b0 == 0x49 && b1 == 0x49 && b2 == 0x2A && b3 == 0x00) { return GRF_FMT_TIFF; }
+    // TIFF BE: 'M' 'M' 0x00 0x2A
+    if (b0 == 0x4D && b1 == 0x4D && b2 == 0x00 && b3 == 0x2A) { return GRF_FMT_TIFF; }
+    // WebP: 'R' 'I' 'F' 'F' .... 'W' 'E' 'B' 'P' at offset 8
+    if (len >= 12 && b0 == 0x52 && b1 == 0x49 && b2 == 0x46 && b3 == 0x46) {
+        var w8:  int64 := peek8(buf + 8);
+        var w9:  int64 := peek8(buf + 9);
+        var w10: int64 := peek8(buf + 10);
+        var w11: int64 := peek8(buf + 11);
+        if (w8 == 0x57 && w9 == 0x45 && w10 == 0x42 && w11 == 0x50) { return GRF_FMT_WEBP; }
+    }
+    // AVIF: 'f' 't' 'y' 'p' at offset 4, brand 'avif'/'avis' at offset 8
+    if (len >= 12) {
+        var f4: int64 := peek8(buf + 4);
+        var f5: int64 := peek8(buf + 5);
+        var f6: int64 := peek8(buf + 6);
+        var f7: int64 := peek8(buf + 7);
+        if (f4 == 0x66 && f5 == 0x74 && f6 == 0x79 && f7 == 0x70) {
+            var a8:  int64 := peek8(buf + 8);
+            var a9:  int64 := peek8(buf + 9);
+            var a10: int64 := peek8(buf + 10);
+            var a11: int64 := peek8(buf + 11);
+            // 'avif' or 'avis'
+            if (a8 == 0x61 && a9 == 0x76 && a10 == 0x69) {
+                if (a11 == 0x66) { return GRF_FMT_AVIF; }
+                if (a11 == 0x73) { return GRF_FMT_AVIF; }
+            }
+        }
+    }
+    return GRF_FMT_UNKNOWN;
+}

@@ -1,0 +1,196 @@
+// std/hardware/usb_endpoint_bind.lyx
+// WP-7B: Endpoint-Binding-Registry — Makro-Fallback ohne Lyx-Makros
+//
+// Ziel: Endpoint-Adressen werden einmalig unter einem numerischen Schlüssel
+// registriert (analog zu DefineOutEndpoint/DefineInEndpoint), danach nur
+// noch per Schlüssel referenziert — keine Adresse beim Aufruf nötig.
+//
+// Pascal-Makro-Äquivalent:
+//   macro DefineOutEndpoint(EpOut, $01) →
+//     con EP_OUT: int64 := 1;
+//     UsbDefOutEndpoint(reg, EP_OUT, dev_fd, 0x01, 1000);
+//     // Aufruf: UsbEpWrite(reg, EP_OUT, data, len)
+//
+//   macro DefineInEndpoint(EpIn, $81) →
+//     con EP_IN: int64 := 2;
+//     UsbDefInEndpoint(reg, EP_IN, dev_fd, 0x81, 1000);
+//     // Aufruf: UsbEpRead(reg, EP_IN, buf, len)
+//
+// Richtungssicherheit (runtime, zweistufig):
+//   1. Registrierung: Bit-7-Check — falsche Richtung → return -1
+//   2. Nutzung: UsbEpWrite verwirft IN-Slots (is_out≠1 → -1),
+//              UsbEpRead verwirft OUT-Slots (is_out≠0 → -1)
+
+unit std.hardware.usb_endpoint_bind;
+
+import std.hardware.usb_bulk;
+import std.alloc;
+
+// ============================================================
+// Registry-Layout (flacher Heap-Puffer)
+//
+//   [0..7]:   count (Anzahl registrierter Slots)
+//   [8..347]: bis zu 8 Slots à 40 Bytes
+//
+// Slot-Layout (40 Bytes):
+//   +0:  key      (int64) — eindeutiger Schlüssel (vom Aufrufer gewählt)
+//   +8:  dev_fd   (int64)
+//   +16: ep_addr  (int64)
+//   +24: timeout  (int64) in Millisekunden
+//   +32: is_out   (int64) — 1 = OUT (Host→Device), 0 = IN (Device→Host)
+// ============================================================
+
+pub con USB_EP_REG_MAX_SLOTS: int64 := 8;
+pub con USB_EP_REG_SLOT_SIZE: int64 := 40;
+pub con USB_EP_REG_SIZE:      int64 := 328;   // 8 + 8 × 40
+
+// Slot-interne Offsets
+con USB_EP_SLOT_KEY:     int64 := 0;
+con USB_EP_SLOT_FD:      int64 := 8;
+con USB_EP_SLOT_ADDR:    int64 := 16;
+con USB_EP_SLOT_TIMEOUT: int64 := 24;
+con USB_EP_SLOT_IS_OUT:  int64 := 32;
+
+// ============================================================
+// UsbEpRegistryAlloc — legt eine neue Registry an und nullt sie
+// ============================================================
+pub fn UsbEpRegistryAlloc(): int64 {
+  var reg: int64 := alloc(USB_EP_REG_SIZE);
+  if (reg == 0) { return 0; }
+  var i: int64 := 0;
+  while (i < USB_EP_REG_SIZE) {
+    poke8(reg + i, 0);
+    i += 1;
+  }
+  return reg;
+}
+
+// UsbEpRegistryFree — gibt die Registry frei
+pub fn UsbEpRegistryFree(reg: int64) {
+  free(reg, USB_EP_REG_SIZE);
+}
+
+// UsbEpRegistryCount — Anzahl der registrierten Slots
+pub fn UsbEpRegistryCount(reg: int64): int64 {
+  return peek64(reg);
+}
+
+// ============================================================
+// Interner Helfer: Slot anhand des Schlüssels suchen
+// Rückgabe: Basisadresse des Slots oder -1
+// ============================================================
+fn usbEpFindSlot(reg: int64, key: int64): int64 {
+  var count: int64 := peek64(reg);
+  var i: int64 := 0;
+  while (i < count) {
+    var base: int64 := reg + 8 + i * USB_EP_REG_SLOT_SIZE;
+    if (peek64(base + USB_EP_SLOT_KEY) == key) { return base; }
+    i += 1;
+  }
+  return -1;
+}
+
+// ============================================================
+// Interner Helfer: neuen Slot hinzufügen (6 Parameter = Limit)
+// Rückgabe: Basisadresse des neuen Slots, oder -1 wenn voll / falsche Richtung
+// ============================================================
+fn usbEpAddSlot(reg: int64, key: int64, fd: int64, ep: int64, timeout: int64, is_out: int64): int64 {
+  var count: int64 := peek64(reg);
+  if (count >= USB_EP_REG_MAX_SLOTS) { return -1; }
+  var base: int64 := reg + 8 + count * USB_EP_REG_SLOT_SIZE;
+  poke64(base + USB_EP_SLOT_KEY,     key);
+  poke64(base + USB_EP_SLOT_FD,      fd);
+  poke64(base + USB_EP_SLOT_ADDR,    ep);
+  poke64(base + USB_EP_SLOT_TIMEOUT, timeout);
+  poke64(base + USB_EP_SLOT_IS_OUT,  is_out);
+  poke64(reg, count + 1);
+  return base;
+}
+
+// ============================================================
+// UsbDefOutEndpoint — registriert einen OUT-Endpoint unter key
+// ep muss Bit 7 = 0 haben (0x01..0x0F).
+// Rückgabe: 0 = Erfolg, -1 = Fehler (falsche Richtung oder Registry voll).
+// (5 Parameter ≤ 6-Arg-Limit)
+// ============================================================
+pub fn UsbDefOutEndpoint(reg: int64, key: int64, fd: int64, ep: int64, timeout: int64): int64 {
+  if ((ep & 0x80) != 0) { return -1; }    // IN-Adresse für OUT-Slot
+  if (usbEpAddSlot(reg, key, fd, ep, timeout, 1) < 0) { return -1; }
+  return 0;
+}
+
+// ============================================================
+// UsbDefInEndpoint — registriert einen IN-Endpoint unter key
+// ep muss Bit 7 = 1 haben (0x81..0x8F).
+// (5 Parameter ≤ 6-Arg-Limit)
+// ============================================================
+pub fn UsbDefInEndpoint(reg: int64, key: int64, fd: int64, ep: int64, timeout: int64): int64 {
+  if ((ep & 0x80) == 0) { return -1; }    // OUT-Adresse für IN-Slot
+  if (usbEpAddSlot(reg, key, fd, ep, timeout, 0) < 0) { return -1; }
+  return 0;
+}
+
+// ============================================================
+// UsbEpWrite — sendet Daten über den mit key registrierten OUT-Endpoint
+// Gibt -1 zurück wenn:
+//   - key nicht gefunden
+//   - Slot ist IN (is_out=0) — Richtungsfehler
+//   - Bulk-Transfer schlägt fehl
+// (4 Parameter ≤ 6-Arg-Limit)
+// ============================================================
+pub fn UsbEpWrite(reg: int64, key: int64, data: int64, len: int64): int64 {
+  var slot: int64 := usbEpFindSlot(reg, key);
+  if (slot < 0) { return -1; }
+  if (peek64(slot + USB_EP_SLOT_IS_OUT) != 1) { return -1; }   // ist IN, nicht OUT
+  return UsbBulkWrite(
+    peek64(slot + USB_EP_SLOT_FD),
+    peek64(slot + USB_EP_SLOT_ADDR),
+    data, len,
+    peek64(slot + USB_EP_SLOT_TIMEOUT)
+  );
+}
+
+// ============================================================
+// UsbEpRead — empfängt Daten vom mit key registrierten IN-Endpoint
+// Gibt -1 zurück wenn key nicht gefunden oder Slot ist OUT.
+// (4 Parameter ≤ 6-Arg-Limit)
+// ============================================================
+pub fn UsbEpRead(reg: int64, key: int64, buf: int64, len: int64): int64 {
+  var slot: int64 := usbEpFindSlot(reg, key);
+  if (slot < 0) { return -1; }
+  if (peek64(slot + USB_EP_SLOT_IS_OUT) != 0) { return -1; }   // ist OUT, nicht IN
+  return UsbBulkRead(
+    peek64(slot + USB_EP_SLOT_FD),
+    peek64(slot + USB_EP_SLOT_ADDR),
+    buf, len,
+    peek64(slot + USB_EP_SLOT_TIMEOUT)
+  );
+}
+
+// ============================================================
+// UsbEpTimeout — liest den Timeout eines registrierten Endpoints
+// Rückgabe: Timeout in ms oder -1 wenn nicht gefunden
+// ============================================================
+pub fn UsbEpTimeout(reg: int64, key: int64): int64 {
+  var slot: int64 := usbEpFindSlot(reg, key);
+  if (slot < 0) { return -1; }
+  return peek64(slot + USB_EP_SLOT_TIMEOUT);
+}
+
+// ============================================================
+// UsbEpAddr — liest die EP-Adresse eines registrierten Endpoints
+// ============================================================
+pub fn UsbEpAddr(reg: int64, key: int64): int64 {
+  var slot: int64 := usbEpFindSlot(reg, key);
+  if (slot < 0) { return -1; }
+  return peek64(slot + USB_EP_SLOT_ADDR);
+}
+
+// ============================================================
+// UsbEpIsOut — gibt 1 wenn der Slot ein OUT-Endpoint ist, 0 für IN, -1 nicht gefunden
+// ============================================================
+pub fn UsbEpIsOut(reg: int64, key: int64): int64 {
+  var slot: int64 := usbEpFindSlot(reg, key);
+  if (slot < 0) { return -1; }
+  return peek64(slot + USB_EP_SLOT_IS_OUT);
+}

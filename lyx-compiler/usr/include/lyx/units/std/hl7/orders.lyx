@@ -1,0 +1,444 @@
+// std/hl7/orders.lyx — HL7 v2 Order Management (WP-HL7-02)
+//
+// Public API:
+//   Hl7OrcParse(seg, segLen, order)          — ORC segment → struct
+//   Hl7ObrParse(seg, segLen, order)          — OBR segment → struct
+//   Hl7OrmParse(msg, len, order)             — ORM^O01 → struct
+//   Hl7OmlParse(msg, len, order)             — OML^O21 → struct
+//   Hl7OrmWrite(order, out, outMax)          → int64 (bytes written)
+//   Hl7OmlWrite(order, out, outMax)          → int64
+//   Hl7OrrWrite(order, status, out, outMax)  → int64 (ORR^O02 / ORL^O22)
+//   Hl7RasParse(msg, len, admin)             — RAS^O17 → Hl7RxAdmin struct
+
+unit std.hl7.orders;
+
+import std.hl7.core;
+import std.alloc;
+
+// ── Hl7Order struct offsets ──────────────────────────────────────────────────
+pub con HL7_ORD_CTRL:         int64 := 0;    // ORC-1 order control (NW/CA/DC/SC/RP)
+pub con HL7_ORD_CTRL_LEN:     int64 := 8;
+pub con HL7_ORD_PLACER:       int64 := 16;   // ORC-2 placer order number
+pub con HL7_ORD_PLACER_LEN:   int64 := 24;
+pub con HL7_ORD_FILLER:       int64 := 32;   // ORC-3 filler order number
+pub con HL7_ORD_FILLER_LEN:   int64 := 40;
+pub con HL7_ORD_STATUS:       int64 := 48;   // ORC-5 order status
+pub con HL7_ORD_STATUS_LEN:   int64 := 56;
+pub con HL7_ORD_SERVICE:      int64 := 64;   // OBR-4 universal service ID
+pub con HL7_ORD_SERVICE_LEN:  int64 := 72;
+pub con HL7_ORD_PRIORITY:     int64 := 80;   // OBR-5 priority (R/S/A/T/C)
+pub con HL7_ORD_PRIORITY_LEN: int64 := 88;
+pub con HL7_ORD_REQ_DT:       int64 := 96;   // OBR-6 requested datetime
+pub con HL7_ORD_REQ_DT_LEN:   int64 := 104;
+pub con HL7_ORD_OBS_DT:       int64 := 112;  // OBR-7 observation datetime
+pub con HL7_ORD_OBS_DT_LEN:   int64 := 120;
+pub con HL7_ORD_PROVIDER:     int64 := 128;  // ORC-12 ordering provider
+pub con HL7_ORD_PROVIDER_LEN: int64 := 136;
+pub con HL7_ORD_PAT_ID:       int64 := 144;  // PID-3.1 patient ID
+pub con HL7_ORD_PAT_ID_LEN:   int64 := 152;
+pub con HL7_ORD_VISIT:        int64 := 160;  // PV1-19 visit number
+pub con HL7_ORD_VISIT_LEN:    int64 := 168;
+pub con HL7_ORD_MSGTYPE:      int64 := 176;  // 1=ORM, 2=OML
+pub con HL7_ORD_ISSTAT:       int64 := 184;  // 1=STAT (OBR-5='S')
+pub con HL7_ORD_SIZE:         int64 := 192;
+
+// ── Hl7RxAdmin struct offsets ────────────────────────────────────────────────
+pub con HL7_RXA_DRUG:         int64 := 0;    // RXA-5 administered code (drug)
+pub con HL7_RXA_DRUG_LEN:     int64 := 8;
+pub con HL7_RXA_DOSE:         int64 := 16;   // RXA-6 administered amount
+pub con HL7_RXA_DOSE_LEN:     int64 := 24;
+pub con HL7_RXA_UNIT:         int64 := 32;   // RXA-7 administered units
+pub con HL7_RXA_UNIT_LEN:     int64 := 40;
+pub con HL7_RXA_ROUTE:        int64 := 48;   // RXA-12 administered route
+pub con HL7_RXA_ROUTE_LEN:    int64 := 56;
+pub con HL7_RXA_START:        int64 := 64;   // RXA-3 start datetime
+pub con HL7_RXA_START_LEN:    int64 := 72;
+pub con HL7_RXA_STOP:         int64 := 80;   // RXA-4 end datetime
+pub con HL7_RXA_STOP_LEN:     int64 := 88;
+pub con HL7_RXA_ADMIN_BY:     int64 := 96;   // RXA-10 administering provider
+pub con HL7_RXA_ADMIN_BY_LEN: int64 := 104;
+pub con HL7_RXA_SIZE:         int64 := 112;
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+fn ordStrLen(s: int64): int64 {
+    var n: int64 := 0;
+    while (peek8(s + n) != 0) { n := n + 1; }
+    return n;
+}
+
+fn ordCopy(dst: int64, src: int64, count: int64) {
+    var i: int64 := 0;
+    while (i < count) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+// Get Nth pipe-separated field (1-based) from HL7 segment.
+fn ordFieldGet(seg: int64, segLen: int64, sep: int64, fieldNum: int64, outPtr: int64, outLen: int64) {
+    var pos:  int64 := 0;
+    var fnum: int64 := 0;
+    while (pos < segLen && peek8(seg + pos) != sep) { pos := pos + 1; }
+    while (pos < segLen && fnum < fieldNum) {
+        pos += 1;
+        fnum += 1;
+        if (fnum == fieldNum) {
+            var start: int64 := pos;
+            while (pos < segLen && peek8(seg+pos) != sep && peek8(seg+pos) != 13 && peek8(seg+pos) != 10) {
+                pos += 1;
+            }
+            poke64(outPtr, seg + start);
+            poke64(outLen, pos - start);
+            return;
+        }
+        while (pos < segLen && peek8(seg + pos) != sep && peek8(seg + pos) != 13) {
+            pos += 1;
+        }
+    }
+    poke64(outPtr, 0);
+    poke64(outLen, 0);
+}
+
+// Get Nth component (1-based) from field value.
+fn ordCompGet(fldPtr: int64, fldLen: int64, csep: int64, compNum: int64, outPtr: int64, outLen: int64) {
+    var pos:   int64 := 0;
+    var cnum:  int64 := 1;
+    var start: int64 := 0;
+    while (cnum < compNum && pos < fldLen) {
+        if (peek8(fldPtr + pos) == csep) { cnum := cnum + 1; start := pos + 1; }
+        pos += 1;
+    }
+    var end: int64 := start;
+    while (end < fldLen && peek8(fldPtr + end) != csep) { end := end + 1; }
+    poke64(outPtr, fldPtr + start);
+    poke64(outLen, end - start);
+}
+
+// Find 3-char segment by scanning for CR + name + '|'.
+fn ordFindSeg(msg: int64, len: int64, n1: int64, n2: int64, n3: int64, fsep: int64): int64 {
+    if (len >= 4 && peek8(msg)==n1 && peek8(msg+1)==n2 && peek8(msg+2)==n3 && peek8(msg+3)==fsep) {
+        return msg;
+    }
+    var i: int64 := 0;
+    while (i < len - 4) {
+        if (peek8(msg + i) == 13) {
+            if (peek8(msg+i+1)==n1 && peek8(msg+i+2)==n2 && peek8(msg+i+3)==n3 && peek8(msg+i+4)==fsep) {
+                return msg + i + 1;
+            }
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+// Return byte length of segment starting at segStart.
+fn ordSegLen(msgStart: int64, msgLen: int64, segStart: int64): int64 {
+    var offset: int64 := segStart - msgStart;
+    var pos:    int64 := offset;
+    while (pos < msgLen && peek8(msgStart + pos) != 13 && peek8(msgStart + pos) != 10) {
+        pos += 1;
+    }
+    return pos - offset;
+}
+
+fn ordWriteField(out: int64, pos: int64, ptr: int64, len: int64): int64 {
+    ordCopy(out + pos, ptr, len);
+    return pos + len;
+}
+
+// Write MSH header. msgtype must be null-terminated (e.g. "ORM^O01").
+fn ordWriteMsh(msgtype: int64, out: int64, outMax: int64): int64 {
+    var pos: int64 := 0;
+    var fsep: int64 := 124;
+    var csep: int64 := 94;
+    poke8(out+pos, 77); pos := pos + 1;    // M
+    poke8(out+pos, 83); pos := pos + 1;    // S
+    poke8(out+pos, 72); pos := pos + 1;    // H
+    poke8(out+pos, fsep); pos := pos + 1;
+    poke8(out+pos, csep); pos := pos + 1;
+    poke8(out+pos, 126); pos := pos + 1;   // ~
+    poke8(out+pos, 92);  pos := pos + 1;   // backslash
+    poke8(out+pos, 38);  pos := pos + 1;   // &
+    poke8(out+pos, fsep); pos := pos + 1;
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-3 empty
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-4 empty
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-5 empty
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-6 empty
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-7 empty
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-8 empty
+    var mtLen: int64 := ordStrLen(msgtype);
+    pos := ordWriteField(out, pos, msgtype, mtLen);
+    poke8(out+pos, fsep); pos := pos + 1;
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-10 empty
+    poke8(out+pos, 80); pos := pos + 1;    // MSH-11: P
+    poke8(out+pos, fsep); pos := pos + 1;
+    poke8(out+pos, 50); pos := pos + 1;    // 2
+    poke8(out+pos, 46); pos := pos + 1;    // .
+    poke8(out+pos, 53); pos := pos + 1;    // 5
+    poke8(out+pos, 46); pos := pos + 1;    // .
+    poke8(out+pos, 49); pos := pos + 1;    // 1
+    poke8(out+pos, 13); pos := pos + 1;    // CR
+    return pos;
+}
+
+// Write ORC + OBR segments from order struct.
+fn ordWriteOrcObr(order: int64, out: int64, startPos: int64): int64 {
+    var pos:  int64 := startPos;
+    var fsep: int64 := 124;
+    // ORC
+    poke8(out+pos, 79); pos := pos + 1;    // O
+    poke8(out+pos, 82); pos := pos + 1;    // R
+    poke8(out+pos, 67); pos := pos + 1;    // C
+    poke8(out+pos, fsep); pos := pos + 1;
+    var ctPtr: int64 := peek64(order + HL7_ORD_CTRL);
+    var ctLen: int64 := peek64(order + HL7_ORD_CTRL_LEN);
+    if (ctLen > 0) { pos := ordWriteField(out, pos, ctPtr, ctLen); }
+    poke8(out+pos, fsep); pos := pos + 1;
+    var plPtr: int64 := peek64(order + HL7_ORD_PLACER);
+    var plLen: int64 := peek64(order + HL7_ORD_PLACER_LEN);
+    if (plLen > 0) { pos := ordWriteField(out, pos, plPtr, plLen); }
+    poke8(out+pos, fsep); pos := pos + 1;
+    var flPtr: int64 := peek64(order + HL7_ORD_FILLER);
+    var flLen: int64 := peek64(order + HL7_ORD_FILLER_LEN);
+    if (flLen > 0) { pos := ordWriteField(out, pos, flPtr, flLen); }
+    poke8(out+pos, 13); pos := pos + 1;    // CR
+    // OBR
+    poke8(out+pos, 79); pos := pos + 1;    // O
+    poke8(out+pos, 66); pos := pos + 1;    // B
+    poke8(out+pos, 82); pos := pos + 1;    // R
+    poke8(out+pos, fsep); pos := pos + 1;
+    poke8(out+pos, 49); pos := pos + 1;    // OBR-1 = "1"
+    poke8(out+pos, fsep); pos := pos + 1;
+    if (plLen > 0) { pos := ordWriteField(out, pos, plPtr, plLen); }
+    poke8(out+pos, fsep); pos := pos + 1;
+    poke8(out+pos, fsep); pos := pos + 1;  // OBR-3 empty
+    var svPtr: int64 := peek64(order + HL7_ORD_SERVICE);
+    var svLen: int64 := peek64(order + HL7_ORD_SERVICE_LEN);
+    if (svLen > 0) { pos := ordWriteField(out, pos, svPtr, svLen); }
+    poke8(out+pos, fsep); pos := pos + 1;
+    var prPtr: int64 := peek64(order + HL7_ORD_PRIORITY);
+    var prLen: int64 := peek64(order + HL7_ORD_PRIORITY_LEN);
+    if (prLen > 0) { pos := ordWriteField(out, pos, prPtr, prLen); }
+    poke8(out+pos, 13); pos := pos + 1;    // CR
+    return pos;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+// Parse ORC segment → order struct (CTRL, PLACER, FILLER, STATUS, PROVIDER).
+pub fn Hl7OrcParse(seg: int64, segLen: int64, order: int64) {
+    var fsep: int64 := 124;
+    var fptr: int64 := alloc(16);
+    var flen: int64 := alloc(16);
+    ordFieldGet(seg, segLen, fsep, 1, fptr, flen);
+    poke64(order + HL7_ORD_CTRL, peek64(fptr));
+    poke64(order + HL7_ORD_CTRL_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 2, fptr, flen);
+    poke64(order + HL7_ORD_PLACER, peek64(fptr));
+    poke64(order + HL7_ORD_PLACER_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 3, fptr, flen);
+    poke64(order + HL7_ORD_FILLER, peek64(fptr));
+    poke64(order + HL7_ORD_FILLER_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 5, fptr, flen);
+    poke64(order + HL7_ORD_STATUS, peek64(fptr));
+    poke64(order + HL7_ORD_STATUS_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 12, fptr, flen);
+    poke64(order + HL7_ORD_PROVIDER, peek64(fptr));
+    poke64(order + HL7_ORD_PROVIDER_LEN, peek64(flen));
+}
+
+// Parse OBR segment → order struct (SERVICE, PRIORITY, REQ_DT, OBS_DT, ISSTAT).
+pub fn Hl7ObrParse(seg: int64, segLen: int64, order: int64) {
+    var fsep: int64 := 124;
+    var fptr: int64 := alloc(16);
+    var flen: int64 := alloc(16);
+    ordFieldGet(seg, segLen, fsep, 4, fptr, flen);
+    poke64(order + HL7_ORD_SERVICE, peek64(fptr));
+    poke64(order + HL7_ORD_SERVICE_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 5, fptr, flen);
+    var prp: int64 := peek64(fptr);
+    var prl: int64 := peek64(flen);
+    poke64(order + HL7_ORD_PRIORITY, prp);
+    poke64(order + HL7_ORD_PRIORITY_LEN, prl);
+    if (prl >= 1) {
+        if (peek8(prp) == 83) { poke64(order + HL7_ORD_ISSTAT, 1); }
+    }
+    ordFieldGet(seg, segLen, fsep, 6, fptr, flen);
+    poke64(order + HL7_ORD_REQ_DT, peek64(fptr));
+    poke64(order + HL7_ORD_REQ_DT_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 7, fptr, flen);
+    poke64(order + HL7_ORD_OBS_DT, peek64(fptr));
+    poke64(order + HL7_ORD_OBS_DT_LEN, peek64(flen));
+}
+
+// Parse RXA segment → admin struct.
+pub fn Hl7RxaParse(seg: int64, segLen: int64, admin: int64) {
+    var fsep: int64 := 124;
+    var fptr: int64 := alloc(16);
+    var flen: int64 := alloc(16);
+    ordFieldGet(seg, segLen, fsep, 3, fptr, flen);
+    poke64(admin + HL7_RXA_START, peek64(fptr));
+    poke64(admin + HL7_RXA_START_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 4, fptr, flen);
+    poke64(admin + HL7_RXA_STOP, peek64(fptr));
+    poke64(admin + HL7_RXA_STOP_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 5, fptr, flen);
+    poke64(admin + HL7_RXA_DRUG, peek64(fptr));
+    poke64(admin + HL7_RXA_DRUG_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 6, fptr, flen);
+    poke64(admin + HL7_RXA_DOSE, peek64(fptr));
+    poke64(admin + HL7_RXA_DOSE_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 7, fptr, flen);
+    poke64(admin + HL7_RXA_UNIT, peek64(fptr));
+    poke64(admin + HL7_RXA_UNIT_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 10, fptr, flen);
+    poke64(admin + HL7_RXA_ADMIN_BY, peek64(fptr));
+    poke64(admin + HL7_RXA_ADMIN_BY_LEN, peek64(flen));
+    ordFieldGet(seg, segLen, fsep, 12, fptr, flen);
+    poke64(admin + HL7_RXA_ROUTE, peek64(fptr));
+    poke64(admin + HL7_RXA_ROUTE_LEN, peek64(flen));
+}
+
+// Parse full ORM^O01 message → order struct.
+pub fn Hl7OrmParse(msg: int64, len: int64, order: int64) {
+    poke64(order + HL7_ORD_MSGTYPE, 1);
+    poke64(order + HL7_ORD_ISSTAT, 0);
+    var orcSeg: int64 := ordFindSeg(msg, len, 79, 82, 67, 124);  // O,R,C,|
+    if (orcSeg != 0) {
+        var orcLen: int64 := ordSegLen(msg, len, orcSeg);
+        Hl7OrcParse(orcSeg, orcLen, order);
+    }
+    var obrSeg: int64 := ordFindSeg(msg, len, 79, 66, 82, 124);  // O,B,R,|
+    if (obrSeg != 0) {
+        var obrLen: int64 := ordSegLen(msg, len, obrSeg);
+        Hl7ObrParse(obrSeg, obrLen, order);
+    }
+    var pidSeg: int64 := ordFindSeg(msg, len, 80, 73, 68, 124);  // P,I,D,|
+    if (pidSeg != 0) {
+        var pidLen: int64 := ordSegLen(msg, len, pidSeg);
+        var fptr: int64 := alloc(16);
+        var flen: int64 := alloc(16);
+        var cptr: int64 := alloc(16);
+        var clen: int64 := alloc(16);
+        ordFieldGet(pidSeg, pidLen, 124, 3, fptr, flen);
+        var f3p: int64 := peek64(fptr);
+        var f3l: int64 := peek64(flen);
+        ordCompGet(f3p, f3l, 94, 1, cptr, clen);
+        poke64(order + HL7_ORD_PAT_ID, peek64(cptr));
+        poke64(order + HL7_ORD_PAT_ID_LEN, peek64(clen));
+    }
+    var pv1Seg: int64 := ordFindSeg(msg, len, 80, 86, 49, 124);  // P,V,1,|
+    if (pv1Seg != 0) {
+        var pv1Len: int64 := ordSegLen(msg, len, pv1Seg);
+        var vptr: int64 := alloc(16);
+        var vlen: int64 := alloc(16);
+        ordFieldGet(pv1Seg, pv1Len, 124, 19, vptr, vlen);
+        poke64(order + HL7_ORD_VISIT, peek64(vptr));
+        poke64(order + HL7_ORD_VISIT_LEN, peek64(vlen));
+    }
+}
+
+// Parse full OML^O21 message → order struct. Same layout as ORM; type=2.
+pub fn Hl7OmlParse(msg: int64, len: int64, order: int64) {
+    Hl7OrmParse(msg, len, order);
+    poke64(order + HL7_ORD_MSGTYPE, 2);
+}
+
+// Parse full RAS^O17 message → admin struct.
+pub fn Hl7RasParse(msg: int64, len: int64, admin: int64) {
+    var rxaSeg: int64 := ordFindSeg(msg, len, 82, 88, 65, 124);  // R,X,A,|
+    if (rxaSeg != 0) {
+        var rxaLen: int64 := ordSegLen(msg, len, rxaSeg);
+        Hl7RxaParse(rxaSeg, rxaLen, admin);
+    }
+}
+
+// Write ORM^O01 to out. Returns bytes written.
+pub fn Hl7OrmWrite(order: int64, out: int64, outMax: int64): int64 {
+    var mt: int64 := "ORM^O01"c as int64;
+    var pos: int64 := ordWriteMsh(mt, out, outMax);
+    return ordWriteOrcObr(order, out, pos);
+}
+
+// Write OML^O21 to out. Returns bytes written.
+pub fn Hl7OmlWrite(order: int64, out: int64, outMax: int64): int64 {
+    var mt: int64 := "OML^O21"c as int64;
+    var pos: int64 := ordWriteMsh(mt, out, outMax);
+    return ordWriteOrcObr(order, out, pos);
+}
+
+// Write ORR^O02 (ORM reply) or ORL^O22 (OML reply).
+// status is null-terminated: "OK"=accepted, "ER"=error.
+pub fn Hl7OrrWrite(order: int64, status: int64, out: int64, outMax: int64): int64 {
+    var pos:  int64 := 0;
+    var fsep: int64 := 124;
+    var csep: int64 := 94;
+    // MSH
+    poke8(out+pos, 77); pos := pos + 1;    // M
+    poke8(out+pos, 83); pos := pos + 1;    // S
+    poke8(out+pos, 72); pos := pos + 1;    // H
+    poke8(out+pos, fsep); pos := pos + 1;
+    poke8(out+pos, csep); pos := pos + 1;
+    poke8(out+pos, 126); pos := pos + 1;   // ~
+    poke8(out+pos, 92);  pos := pos + 1;   // backslash
+    poke8(out+pos, 38);  pos := pos + 1;   // &
+    poke8(out+pos, fsep); pos := pos + 1;
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-3
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-4
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-5
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-6
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-7
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-8
+    // MSH-9: ORR^O02 or ORL^O22 depending on msgtype
+    var mt: int64 := peek64(order + HL7_ORD_MSGTYPE);
+    if (mt == 2) {
+        poke8(out+pos, 79); pos := pos + 1;   // O
+        poke8(out+pos, 82); pos := pos + 1;   // R
+        poke8(out+pos, 76); pos := pos + 1;   // L
+        poke8(out+pos, csep); pos := pos + 1;
+        poke8(out+pos, 79); pos := pos + 1;   // O
+        poke8(out+pos, 50); pos := pos + 1;   // 2
+        poke8(out+pos, 50); pos := pos + 1;   // 2
+    } else {
+        poke8(out+pos, 79); pos := pos + 1;   // O
+        poke8(out+pos, 82); pos := pos + 1;   // R
+        poke8(out+pos, 82); pos := pos + 1;   // R
+        poke8(out+pos, csep); pos := pos + 1;
+        poke8(out+pos, 79); pos := pos + 1;   // O
+        poke8(out+pos, 48); pos := pos + 1;   // 0
+        poke8(out+pos, 50); pos := pos + 1;   // 2
+    }
+    poke8(out+pos, fsep); pos := pos + 1;
+    poke8(out+pos, fsep); pos := pos + 1;  // MSH-10
+    poke8(out+pos, 80); pos := pos + 1;    // MSH-11: P
+    poke8(out+pos, fsep); pos := pos + 1;
+    poke8(out+pos, 50); pos := pos + 1;    // 2
+    poke8(out+pos, 46); pos := pos + 1;    // .
+    poke8(out+pos, 53); pos := pos + 1;    // 5
+    poke8(out+pos, 46); pos := pos + 1;    // .
+    poke8(out+pos, 49); pos := pos + 1;    // 1
+    poke8(out+pos, 13); pos := pos + 1;    // CR
+    // MSA
+    poke8(out+pos, 77); pos := pos + 1;    // M
+    poke8(out+pos, 83); pos := pos + 1;    // S
+    poke8(out+pos, 65); pos := pos + 1;    // A
+    poke8(out+pos, fsep); pos := pos + 1;
+    var stLen: int64 := ordStrLen(status);
+    pos := ordWriteField(out, pos, status, stLen);
+    poke8(out+pos, fsep); pos := pos + 1;
+    poke8(out+pos, 13); pos := pos + 1;    // CR
+    // ORC with echoed placer/filler and status
+    poke8(out+pos, 79); pos := pos + 1;    // O
+    poke8(out+pos, 82); pos := pos + 1;    // R
+    poke8(out+pos, 67); pos := pos + 1;    // C
+    poke8(out+pos, fsep); pos := pos + 1;
+    pos := ordWriteField(out, pos, status, stLen);
+    poke8(out+pos, fsep); pos := pos + 1;
+    var plPtr: int64 := peek64(order + HL7_ORD_PLACER);
+    var plLen: int64 := peek64(order + HL7_ORD_PLACER_LEN);
+    if (plLen > 0) { pos := ordWriteField(out, pos, plPtr, plLen); }
+    poke8(out+pos, fsep); pos := pos + 1;
+    var flPtr: int64 := peek64(order + HL7_ORD_FILLER);
+    var flLen: int64 := peek64(order + HL7_ORD_FILLER_LEN);
+    if (flLen > 0) { pos := ordWriteField(out, pos, flPtr, flLen); }
+    poke8(out+pos, 13); pos := pos + 1;    // CR
+    return pos;
+}

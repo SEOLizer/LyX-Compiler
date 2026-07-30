@@ -1,0 +1,390 @@
+// std/cloud/cf/tunnel.lyx — Cloudflare Tunnel
+// WP-CF-12
+
+unit std.cloud.cf.tunnel;
+
+import std.cloud.cf.transport;
+import std.cloud.cf.core;
+import std.alloc;
+import std.io;
+
+pub type CFTunnel = struct {
+    id:          int64;  // pchar — UUID
+    name:        int64;  // pchar
+    status:      int64;  // pchar
+    accountTag:  int64;  // pchar
+    created:     int64;  // pchar
+    remoteConfig: int64; // 0 or 1
+    credFile:    int64;  // pchar — path to credentials file
+};
+
+pub type CFTunnelIngress = struct {
+    hostname:   int64;  // pchar
+    service:    int64;  // pchar
+    path:       int64;  // pchar — optional
+};
+
+fn tnFreeIfSet(p: int64) {
+    if (p != 0) { free(p, StrLen(p as pchar)+1); }
+}
+
+pub fn CFTunnelFree(t: CFTunnel) {
+    tnFreeIfSet(t.id); tnFreeIfSet(t.name); tnFreeIfSet(t.status);
+    tnFreeIfSet(t.accountTag); tnFreeIfSet(t.created); tnFreeIfSet(t.credFile);
+}
+
+fn parseTunnel(json: int64, jl: int64): CFTunnel {
+    var t: CFTunnel;
+    t.id          := cfExtractValue(json, jl, "id"c);
+    t.name        := cfExtractValue(json, jl, "name"c);
+    t.status      := cfExtractValue(json, jl, "status"c);
+    t.accountTag  := cfExtractValue(json, jl, "account_tag"c);
+    t.created     := cfExtractValue(json, jl, "created_at"c);
+    t.remoteConfig := cfExtractBool(json, jl, "remote_config"c);
+    t.credFile    := 0;
+    return t;
+}
+
+fn tunnelPath(accountId: pchar, rest: pchar): int64 {
+    var buf: int64 := alloc(512);
+    var off: int64 := cftAppend(buf, 0, "/accounts/"c);
+    off := cftAppend(buf, off, accountId);
+    off := cftAppend(buf, off, "/cfd_tunnel"c);
+    if (rest != 0 as pchar) { off := cftAppend(buf, off, rest); }
+    poke8(buf+off, 0); return buf;
+}
+
+fn tunnelIdPath(accountId: pchar, tunnelId: pchar, rest: pchar): int64 {
+    var buf: int64 := alloc(512);
+    var off: int64 := cftAppend(buf, 0, "/accounts/"c);
+    off := cftAppend(buf, off, accountId);
+    off := cftAppend(buf, off, "/cfd_tunnel/"c);
+    off := cftAppend(buf, off, tunnelId);
+    if (rest != 0 as pchar) { off := cftAppend(buf, off, rest); }
+    poke8(buf+off, 0); return buf;
+}
+
+// Tunnel CRUD
+
+pub fn TunnelCreate(c: CFClient, accountId: pchar, name: pchar,
+                    tunnelSecret: pchar): CFTunnel {
+    var path: int64 := tunnelPath(accountId, 0 as pchar);
+    var jname: int64 := cfJsonEscape(name);
+    var jsec: int64 := cfJsonEscape(tunnelSecret);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\""c);
+    off := cftAppend(body, off, jname as pchar);
+    off := cftAppend(body, off, "\",\"tunnel_secret\":\""c);
+    off := cftAppend(body, off, jsec as pchar);
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    tnFreeIfSet(jname); tnFreeIfSet(jsec);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 512); free(body, 512);
+    var t: CFTunnel;
+    t.id:=0; t.name:=0; t.status:=0; t.accountTag:=0; t.created:=0; t.remoteConfig:=0; t.credFile:=0;
+    if (r.success == 1 && r.result != 0) { t = parseTunnel(r.result, r.resultLen); }
+    CFResponseFree(r); return t;
+}
+
+pub fn TunnelDelete(c: CFClient, accountId: pchar, tunnelId: pchar): int64 {
+    var path: int64 := tunnelIdPath(accountId, tunnelId, 0 as pchar);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn TunnelGet(c: CFClient, accountId: pchar, tunnelId: pchar): CFTunnel {
+    var path: int64 := tunnelIdPath(accountId, tunnelId, 0 as pchar);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var t: CFTunnel;
+    t.id:=0; t.name:=0; t.status:=0; t.accountTag:=0; t.created:=0; t.remoteConfig:=0; t.credFile:=0;
+    if (r.success == 1 && r.result != 0) { t = parseTunnel(r.result, r.resultLen); }
+    CFResponseFree(r); return t;
+}
+
+pub fn TunnelGetByName(c: CFClient, accountId: pchar, name: pchar): CFTunnel {
+    var path: int64 := alloc(512);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/cfd_tunnel?name="c);
+    po := cftAppend(path, po, name); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var t: CFTunnel;
+    t.id:=0; t.name:=0; t.status:=0; t.accountTag:=0; t.created:=0; t.remoteConfig:=0; t.credFile:=0;
+    if (r.success == 1 && r.result != 0) {
+        var rl: int64 := r.resultLen;
+        if (rl > 2 && (peek8(r.result) & 0xFF) == 91) {
+            var j: int64 := 1;
+            while (j < rl && (peek8(r.result+j)&0xFF) != 123) { j:=j+1; }
+            if (j < rl) {
+                var depth: int64 := 0; var k: int64 := j;
+                while (k < rl) {
+                    var ch: int64 := peek8(r.result+k)&0xFF;
+                    if(ch==123){depth:=depth+1;}if(ch==125){depth:=depth-1;if(depth==0){k:=k+1;break;}}
+                    k:=k+1;
+                }
+                var obj: int64 := cftDupN(r.result+j, k-j);
+                t = parseTunnel(obj, k-j);
+                free(obj, k-j+1);
+            }
+        }
+    }
+    CFResponseFree(r); return t;
+}
+
+pub fn TunnelList(c: CFClient, accountId: pchar): int64 {
+    var path: int64 := tunnelPath(accountId, 0 as pchar);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 512); return result;
+}
+
+pub fn TunnelCleanup(c: CFClient, accountId: pchar, tunnelId: pchar): int64 {
+    var path: int64 := tunnelIdPath(accountId, tunnelId, "/connections"c);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+// Token
+
+pub fn TunnelToken(c: CFClient, accountId: pchar, tunnelId: pchar): int64 {
+    var path: int64 := tunnelIdPath(accountId, tunnelId, "/token"c);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var token: int64 := 0;
+    if (r.success == 1 && r.result != 0) { token = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return token;
+}
+
+pub fn TunnelTokenSave(c: CFClient, accountId: pchar, tunnelId: pchar,
+                       filePath: pchar): int64 {
+    var token: int64 := TunnelToken(c, accountId, tunnelId);
+    if (token == 0) { return 0; }
+    var tl: int64 := StrLen(token as pchar);
+    // Write token to file via sys_open/sys_write
+    var fd: int64 := sys_open(filePath, 65, 420); // O_CREAT|O_WRONLY, mode 0644
+    if (fd < 0) { free(token, tl+1); return 0; }
+    sys_write(fd, token, tl);
+    sys_close(fd);
+    free(token, tl+1);
+    return 1;
+}
+
+// Configuration (ingress rules)
+
+pub fn TunnelConfigGet(c: CFClient, accountId: pchar, tunnelId: pchar): int64 {
+    var path: int64 := tunnelIdPath(accountId, tunnelId, "/configurations"c);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var result: int64 := 0;
+    if (r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+pub fn TunnelConfigSet(c: CFClient, accountId: pchar, tunnelId: pchar,
+                       configJson: int64, configLen: int64): int64 {
+    var path: int64 := tunnelIdPath(accountId, tunnelId, "/configurations"c);
+    var r: CFResponse := CFPut(c, path as pchar, configJson, configLen);
+    free(path, 512);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+// Build ingress config JSON from ingress array
+
+pub fn TunnelIngressAdd(c: CFClient, accountId: pchar, tunnelId: pchar,
+                        hostname: pchar, service: pchar, path: pchar): int64 {
+    // Get existing config, append ingress rule, PUT back
+    var existing: int64 := TunnelConfigGet(c, accountId, tunnelId);
+    var jhost: int64 := cfJsonEscape(hostname);
+    var jsvc: int64 := cfJsonEscape(service);
+    var body: int64 := alloc(4096);
+    var off: int64 := cftAppend(body, 0, "{\"config\":{\"ingress\":["c);
+    // New rule first
+    off := cftAppend(body, off, "{\"hostname\":\""c);
+    off := cftAppend(body, off, jhost as pchar);
+    off := cftAppend(body, off, "\",\"service\":\""c);
+    off := cftAppend(body, off, jsvc as pchar);
+    off := cftAppend(body, off, "\""c);
+    if (path != 0 as pchar) {
+        var jpath: int64 := cfJsonEscape(path);
+        off := cftAppend(body, off, ",\"path\":\""c);
+        off := cftAppend(body, off, jpath as pchar);
+        off := cftAppend(body, off, "\""c);
+        tnFreeIfSet(jpath);
+    }
+    off := cftAppend(body, off, "}"c);
+    // Add catch-all
+    off := cftAppend(body, off, ",{\"service\":\"http_status:404\"}"c);
+    off := cftAppend(body, off, "]}}"c); poke8(body+off, 0);
+    tnFreeIfSet(jhost); tnFreeIfSet(jsvc);
+    if (existing != 0) { free(existing, StrLen(existing as pchar)+1); }
+    var tnPath: int64 := tunnelIdPath(accountId, tunnelId, "/configurations"c);
+    var r: CFResponse := CFPut(c, tnPath as pchar, body, off);
+    free(tnPath, 512); free(body, 4096);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn TunnelIngressList(c: CFClient, accountId: pchar, tunnelId: pchar): int64 {
+    var cfg: int64 := TunnelConfigGet(c, accountId, tunnelId);
+    if (cfg == 0) { return 0; }
+    var cl: int64 := StrLen(cfg as pchar);
+    var ingress: int64 := cfExtractValue(cfg, cl, "ingress"c);
+    free(cfg, cl+1);
+    return ingress;
+}
+
+// DNS routing for tunnel
+
+pub fn TunnelDNSRoute(c: CFClient, zoneId: pchar, tunnelId: pchar,
+                      hostname: pchar, proxied: int64): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/dns_records"c); poke8(path+po, 0);
+    var jhost: int64 := cfJsonEscape(hostname);
+    var target: int64 := alloc(256);
+    var to: int64 := cftAppend(target, 0, tunnelId);
+    to := cftAppend(target, to, ".cfargotunnel.com"c); poke8(target+to, 0);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"type\":\"CNAME\",\"name\":\""c);
+    off := cftAppend(body, off, jhost as pchar);
+    off := cftAppend(body, off, "\",\"content\":\""c);
+    off := cftAppend(body, off, target as pchar);
+    off := cftAppend(body, off, "\",\"ttl\":1,\"proxied\":"c);
+    if (proxied == 1) { off := cftAppend(body, off, "true"c); }
+    else { off := cftAppend(body, off, "false"c); }
+    off := cftAppend(body, off, "}"c); poke8(body+off, 0);
+    tnFreeIfSet(jhost); free(target, 256);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 512);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn TunnelDNSUnroute(c: CFClient, zoneId: pchar, hostname: pchar): int64 {
+    // Find CNAME record for hostname and delete it
+    var path: int64 := alloc(512);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/dns_records?type=CNAME&name="c);
+    po := cftAppend(path, po, hostname); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := 0;
+    if (r.success == 1 && r.result != 0) {
+        var rl: int64 := r.resultLen;
+        if (rl > 2 && (peek8(r.result)&0xFF)==91) {
+            var j: int64 := 1;
+            while (j < rl && (peek8(r.result+j)&0xFF)!=123) { j:=j+1; }
+            if (j < rl) {
+                var depth: int64 := 0; var k: int64 := j;
+                while (k < rl) {
+                    var ch: int64 := peek8(r.result+k)&0xFF;
+                    if(ch==123){depth:=depth+1;}if(ch==125){depth:=depth-1;if(depth==0){k:=k+1;break;}}
+                    k:=k+1;
+                }
+                var obj: int64 := cftDupN(r.result+j, k-j);
+                var ol: int64 := k-j;
+                var recId: int64 := cfExtractValue(obj, ol, "id"c);
+                free(obj, ol+1);
+                if (recId != 0) {
+                    var rl2: int64 := StrLen(recId as pchar);
+                    var delPath: int64 := alloc(256);
+                    var dpo: int64 := cftAppend(delPath, 0, "/zones/"c);
+                    dpo := cftAppend(delPath, dpo, zoneId);
+                    dpo := cftAppend(delPath, dpo, "/dns_records/"c);
+                    dpo := cftAppend(delPath, dpo, recId as pchar); poke8(delPath+dpo, 0);
+                    var r2: CFResponse := CFDelete(c, delPath as pchar);
+                    free(delPath, 256); free(recId, rl2+1);
+                    ok = r2.success; CFResponseFree(r2);
+                }
+            }
+        }
+    }
+    CFResponseFree(r); return ok;
+}
+
+// Connections
+
+pub fn TunnelConnectionList(c: CFClient, accountId: pchar, tunnelId: pchar): int64 {
+    var path: int64 := tunnelIdPath(accountId, tunnelId, "/connections"c);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 512);
+    var result: int64 := 0;
+    if (r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+// Virtual Networks
+
+pub fn TunnelVNetCreate(c: CFClient, accountId: pchar, name: pchar,
+                        comment: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/teamnet/virtual_networks"c); poke8(path+po, 0);
+    var jname: int64 := cfJsonEscape(name);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"name\":\""c);
+    off := cftAppend(body, off, jname as pchar);
+    if (comment != 0 as pchar) {
+        var jcmt: int64 := cfJsonEscape(comment);
+        off := cftAppend(body, off, "\",\"comment\":\""c);
+        off := cftAppend(body, off, jcmt as pchar);
+        tnFreeIfSet(jcmt);
+    }
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    tnFreeIfSet(jname);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 512);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cfExtractValue(r.result, r.resultLen, "id"c); }
+    CFResponseFree(r); return result;
+}
+
+pub fn TunnelVNetList(c: CFClient, accountId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/teamnet/virtual_networks"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}
+
+// IP Routes (Tunnel routing)
+
+pub fn TunnelRouteCreate(c: CFClient, accountId: pchar, tunnelId: pchar,
+                         network: pchar, comment: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/teamnet/routes"c); poke8(path+po, 0);
+    var jnet: int64 := cfJsonEscape(network);
+    var jtun: int64 := cfJsonEscape(tunnelId);
+    var body: int64 := alloc(512);
+    var off: int64 := cftAppend(body, 0, "{\"network\":\""c);
+    off := cftAppend(body, off, jnet as pchar);
+    off := cftAppend(body, off, "\",\"tunnel_id\":\""c);
+    off := cftAppend(body, off, jtun as pchar);
+    if (comment != 0 as pchar) {
+        var jcmt: int64 := cfJsonEscape(comment);
+        off := cftAppend(body, off, "\",\"comment\":\""c);
+        off := cftAppend(body, off, jcmt as pchar);
+        tnFreeIfSet(jcmt);
+    }
+    off := cftAppend(body, off, "\"}"c); poke8(body+off, 0);
+    tnFreeIfSet(jnet); tnFreeIfSet(jtun);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 512);
+    var ok: int64 := r.success; CFResponseFree(r); return ok;
+}
+
+pub fn TunnelRouteList(c: CFClient, accountId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/accounts/"c);
+    po := cftAppend(path, po, accountId);
+    po := cftAppend(path, po, "/teamnet/routes"c); poke8(path+po, 0);
+    var result: int64 := CFGetAll(c, path as pchar, 100);
+    free(path, 256); return result;
+}

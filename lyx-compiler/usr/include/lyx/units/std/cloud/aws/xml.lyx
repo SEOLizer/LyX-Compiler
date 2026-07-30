@@ -1,0 +1,313 @@
+// std/cloud/aws/xml.lyx — AWS XML response parser
+// WP-AWS-05 (XML portion)
+// Simple but correct parser for AWS XML responses (EC2, S3, SQS, SNS, STS, etc.)
+
+unit std.cloud.aws.xml;
+
+import std.alloc;
+import std.io;
+
+fn strDupN(src: int64, n: int64): int64 {
+    if (n <= 0) { return 0; }
+    var buf: int64 := alloc(n + 1);
+    var i: int64 := 0;
+    while(i<n){poke8(buf+i,peek8(src+i)&0xFF);i:=i+1;}
+    poke8(buf+n,0);
+    return buf;
+}
+
+fn matchTag(xml: int64, off: int64, xmlLen: int64, tag: pchar): int64 {
+    // Check if xml[off..] starts with tag (case-sensitive, no attributes yet)
+    var tl: int64 := StrLen(tag);
+    if (off + tl > xmlLen) { return 0; }
+    var i: int64 := 0;
+    while(i<tl){if(peek8(xml+off+i)!=(StrCharAt(tag,i)&0xFF)){return 0;}i:=i+1;}
+    // next char must be '>' or ' ' or '/' (end of tag name)
+    if (off+tl < xmlLen) {
+        var nc: int64 := peek8(xml+off+tl) & 0xFF;
+        if (nc != 62 && nc != 32 && nc != 47 && nc != 9 && nc != 10 && nc != 13) { return 0; }
+    }
+    return 1;
+}
+
+// Find first occurrence of <tag>…</tag> in xml, return alloc'd content or 0
+pub fn XMLFind(xml: int64, xmlLen: int64, tag: pchar): int64 {
+    var tl: int64 := StrLen(tag);
+    var i: int64 := 0;
+    while (i < xmlLen) {
+        if ((peek8(xml+i) & 0xFF) == 60) { // '<'
+            if (i+1 < xmlLen && (peek8(xml+i+1) & 0xFF) == 33) { // '!' comment/CDATA
+                // skip to '>'
+                while (i < xmlLen && (peek8(xml+i) & 0xFF) != 62) { i:=i+1; }
+                i:=i+1; continue;
+            }
+            if (i+1 < xmlLen && (peek8(xml+i+1) & 0xFF) == 63) { // '?' processing instr
+                while (i < xmlLen && (peek8(xml+i) & 0xFF) != 62) { i:=i+1; }
+                i:=i+1; continue;
+            }
+            if (i+1 < xmlLen && (peek8(xml+i+1) & 0xFF) == 47) { // '</' closing tag
+                i:=i+1; continue;
+            }
+            // opening tag: check if it matches
+            if (matchTag(xml, i+1, xmlLen, tag) == 1) {
+                // skip to '>'
+                var tagStart: int64 := i;
+                while (i < xmlLen && (peek8(xml+i) & 0xFF) != 62) { i:=i+1; }
+                if (i >= xmlLen) { return 0; }
+                // self-closing?
+                if ((peek8(xml+i-1) & 0xFF) == 47) { i:=i+1; continue; } // <tag/>
+                i:=i+1; // skip '>'
+                var contentStart: int64 := i;
+                // find matching </tag>
+                var depth: int64 := 1;
+                while (i < xmlLen && depth > 0) {
+                    if ((peek8(xml+i) & 0xFF) == 60) {
+                        if (i+1 < xmlLen && (peek8(xml+i+1) & 0xFF) == 47) {
+                            // closing tag </
+                            if (matchTag(xml, i+2, xmlLen, tag) == 1) {
+                                depth -= 1;
+                                if (depth == 0) { break; }
+                            }
+                            while (i < xmlLen && (peek8(xml+i) & 0xFF) != 62) { i:=i+1; }
+                        } else if (matchTag(xml, i+1, xmlLen, tag) == 1) {
+                            // another opening of same tag → nested
+                            depth += 1;
+                            while (i < xmlLen && (peek8(xml+i) & 0xFF) != 62) { i:=i+1; }
+                        } else {
+                            while (i < xmlLen && (peek8(xml+i) & 0xFF) != 62) { i:=i+1; }
+                        }
+                    }
+                    i:=i+1;
+                }
+                if (depth == 0) {
+                    return strDupN(xml+contentStart, i - contentStart - 1);
+                }
+                return 0;
+            }
+        }
+        i:=i+1;
+    }
+    return 0;
+}
+
+// XMLFindStr — convenience: xml is pchar
+pub fn XMLFindStr(xml: pchar, tag: pchar): int64 {
+    if (xml == 0 as pchar) { return 0; }
+    return XMLFind(xml as int64, StrLen(xml), tag);
+}
+
+// XMLFindIn — find <inner> inside the first <outer> found
+pub fn XMLFindIn(xml: int64, xmlLen: int64, outer: pchar, inner: pchar): int64 {
+    var outerContent: int64 := XMLFind(xml, xmlLen, outer);
+    if (outerContent == 0) { return 0; }
+    var result: int64 := XMLFind(outerContent, StrLen(outerContent as pchar), inner);
+    free(outerContent, StrLen(outerContent as pchar)+1);
+    return result;
+}
+
+// XMLFindAll — find all occurrences of <tag> in xml
+// Returns array of alloc'd pchar values; *outCount set to count. Caller frees each + array.
+pub fn XMLFindAll(xml: int64, xmlLen: int64, tag: pchar, outCount: int64): int64 {
+    // Count occurrences first
+    var count: int64 := 0;
+    var i: int64 := 0;
+    var tl: int64 := StrLen(tag);
+    while (i < xmlLen) {
+        if ((peek8(xml+i) & 0xFF) == 60) {
+            if (i+1 < xmlLen && (peek8(xml+i+1) & 0xFF) != 47 &&
+                (peek8(xml+i+1) & 0xFF) != 33 &&
+                (peek8(xml+i+1) & 0xFF) != 63) {
+                if (matchTag(xml, i+1, xmlLen, tag) == 1) { count:=count+1; }
+            }
+        }
+        i:=i+1;
+    }
+    poke64(outCount, count);
+    if (count == 0) { return 0; }
+
+    var arr: int64 := alloc(count * 8);
+    var idx: int64 := 0;
+    i := 0;
+    while (i < xmlLen && idx < count) {
+        if ((peek8(xml+i) & 0xFF) == 60) {
+            if (i+1 < xmlLen && (peek8(xml+i+1) & 0xFF) != 47 &&
+                (peek8(xml+i+1) & 0xFF) != 33 &&
+                (peek8(xml+i+1) & 0xFF) != 63) {
+                if (matchTag(xml, i+1, xmlLen, tag) == 1) {
+                    // extract content
+                    while (i < xmlLen && (peek8(xml+i) & 0xFF) != 62) { i:=i+1; }
+                    if ((peek8(xml+i-1) & 0xFF) == 47) { // self-closing
+                        poke64(arr + idx*8, 0); idx:=idx+1; i:=i+1; continue;
+                    }
+                    i:=i+1;
+                    var contentStart: int64 := i;
+                    var depth: int64 := 1;
+                    while (i < xmlLen && depth > 0) {
+                        if ((peek8(xml+i) & 0xFF) == 60) {
+                            if (i+1 < xmlLen && (peek8(xml+i+1) & 0xFF) == 47) {
+                                if (matchTag(xml, i+2, xmlLen, tag) == 1) {
+                                    depth:=depth-1;
+                                    if (depth == 0) { break; }
+                                }
+                                while (i < xmlLen && (peek8(xml+i) & 0xFF) != 62) { i:=i+1; }
+                            } else if (matchTag(xml, i+1, xmlLen, tag) == 1) {
+                                depth:=depth+1;
+                                while (i < xmlLen && (peek8(xml+i) & 0xFF) != 62) { i:=i+1; }
+                            } else {
+                                while (i < xmlLen && (peek8(xml+i) & 0xFF) != 62) { i:=i+1; }
+                            }
+                        }
+                        i:=i+1;
+                    }
+                    if (depth == 0) {
+                        poke64(arr+idx*8, strDupN(xml+contentStart, i-contentStart-1));
+                    } else {
+                        poke64(arr+idx*8, 0);
+                    }
+                    idx:=idx+1;
+                    continue;
+                }
+            }
+        }
+        i:=i+1;
+    }
+    return arr;
+}
+
+pub fn XMLFreeResults(results: int64, count: int64) {
+    var i: int64 := 0;
+    while (i < count) {
+        var p: int64 := peek64(results + i*8);
+        if (p != 0) { free(p, StrLen(p as pchar)+1); }
+        i:=i+1;
+    }
+    free(results, count*8);
+}
+
+// XMLAttr — extract attribute value from a tag string like <tag attr="val" ...>
+// tagStr should be the content starting at '<' up to and including '>'
+pub fn XMLAttr(tagStr: int64, tagLen: int64, attr: pchar): int64 {
+    var al: int64 := StrLen(attr);
+    var i: int64 := 0;
+    while (i < tagLen) {
+        // look for attr="
+        if (matchTag(tagStr, i, tagLen, attr) == 1) {
+            i:=i+al;
+            while (i < tagLen && (peek8(tagStr+i) == 32 || peek8(tagStr+i) == 9)) { i:=i+1; }
+            if (i < tagLen && (peek8(tagStr+i) & 0xFF) == 61) { // '='
+                i:=i+1;
+                while (i < tagLen && (peek8(tagStr+i) == 32 || peek8(tagStr+i) == 9)) { i:=i+1; }
+                if (i < tagLen) {
+                    var quote: int64 := peek8(tagStr+i) & 0xFF;
+                    if (quote == 34 || quote == 39) { // '"' or "'"
+                        i:=i+1;
+                        var start: int64 := i;
+                        while (i < tagLen && (peek8(tagStr+i) & 0xFF) != quote) { i:=i+1; }
+                        return strDupN(tagStr+start, i-start);
+                    }
+                }
+            }
+        }
+        i:=i+1;
+    }
+    return 0;
+}
+
+// Query-protocol helpers (WP-AWS-05) ─────────────────────────────────────────
+
+fn urlEncodeChar(c: int64, buf: int64, off: int64): int64 {
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+        c == 45 || c == 95 || c == 46 || c == 126) {
+        poke8(buf+off, c); return off+1;
+    }
+    poke8(buf+off, 37); // '%'
+    var hi: int64 := (c>>4)&0xF;
+    var lo: int64 := c & 0xF;
+    poke8(buf+off+1, if(hi<10){48+hi}else{87+hi});
+    poke8(buf+off+2, if(lo<10){48+lo}else{87+lo});
+    return off+3;
+}
+
+fn appendQ(buf: int64, off: int64, s: pchar): int64 {
+    var n: int64 := StrLen(s); var i: int64 := 0;
+    while(i<n){poke8(buf+off+i,StrCharAt(s,i)&0xFF);i:=i+1;}
+    return off+n;
+}
+
+pub fn AWSQueryBuild(action: pchar, version: pchar, params: int64, count: int64): int64 {
+    // params is array of pchar pairs: [key0, val0, key1, val1, ...]
+    var buf: int64 := alloc(8192);
+    var off: int64 := 0;
+    var act: pchar := "Action="c;
+    off := appendQ(buf, off, act);
+    off := appendQ(buf, off, action);
+    poke8(buf+off,38); off:=off+1;
+    var ver: pchar := "Version="c;
+    off := appendQ(buf, off, ver);
+    off := appendQ(buf, off, version);
+    var i: int64 := 0;
+    while (i < count) {
+        poke8(buf+off, 38); off:=off+1; // '&'
+        var key: pchar := peek64(params + i*16) as pchar;
+        var val: pchar := peek64(params + i*16 + 8) as pchar;
+        off := appendQ(buf, off, key);
+        poke8(buf+off, 61); off:=off+1; // '='
+        // URL-encode value
+        var vl: int64 := StrLen(val); var j: int64 := 0;
+        while(j<vl){off := urlEncodeChar(StrCharAt(val,j)&0xFF, buf, off);j:=j+1;}
+        i:=i+1;
+    }
+    poke8(buf+off, 0);
+    var result: int64 := alloc(off+1);
+    i:=0; while(i<off){poke8(result+i,peek8(buf+i));i:=i+1;}
+    poke8(result+off,0);
+    free(buf, 8192);
+    return result;
+}
+
+pub fn AWSpaginationToken(body: int64, bodyLen: int64): int64 {
+    // Try common pagination token field names (JSON and XML)
+    var candidates: int64 := alloc(8 * 8);
+    poke64(candidates+0,  "NextToken"c           as int64);
+    poke64(candidates+8,  "NextMarker"c          as int64);
+    poke64(candidates+16, "NextContinuationToken"c as int64);
+    poke64(candidates+24, "Marker"c              as int64);
+    poke64(candidates+32, "nextToken"c           as int64);
+    poke64(candidates+40, "ContinuationToken"c  as int64);
+    poke64(candidates+48, 0);
+    poke64(candidates+56, 0);
+    var i: int64 := 0;
+    while (i < 6) {
+        var name: pchar := peek64(candidates+i*8) as pchar;
+        // Try XML
+        var v: int64 := XMLFind(body, bodyLen, name);
+        if (v != 0) { free(candidates, 8*8); return v; }
+        // Try JSON (simple scan for "name":"value")
+        var j: int64 := 0;
+        while (j < bodyLen - StrLen(name) - 4) {
+            if ((peek8(body+j) & 0xFF) == 34) { // '"'
+                var nl: int64 := StrLen(name);
+                var match: int64 := 1; var k: int64 := 0;
+                while(k<nl){if(peek8(body+j+1+k)!=(StrCharAt(name,k)&0xFF)){match:=0;break;}k:=k+1;}
+                if (match == 1 && (peek8(body+j+1+nl)&0xFF)==34 && (peek8(body+j+2+nl)&0xFF)==58) {
+                    var vs: int64 := j+3+nl;
+                    while(vs<bodyLen && peek8(body+vs)==32){vs:=vs+1;}
+                    if ((peek8(body+vs)&0xFF)==34) {
+                        vs:=vs+1;
+                        var vstart: int64 := vs;
+                        while(vs<bodyLen && (peek8(body+vs)&0xFF)!=34){vs:=vs+1;}
+                        var result: int64 := alloc(vs-vstart+1);
+                        k:=0; while(k<vs-vstart){poke8(result+k,peek8(body+vstart+k));k:=k+1;}
+                        poke8(result+vs-vstart,0);
+                        free(candidates, 8*8);
+                        return result;
+                    }
+                }
+            }
+            j:=j+1;
+        }
+        i:=i+1;
+    }
+    free(candidates, 8*8);
+    return 0;
+}

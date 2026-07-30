@@ -1,0 +1,213 @@
+// std/hardware/usb_urb_pool.lyx
+// WP-8.3: URB-Pool für überlappende Interrupt-Transfers
+//
+// Nach jedem WaitForUrb muss ein neuer URB eingereicht werden.
+// Ein Pool mit 4 URBs ermöglicht überlappende I/O: während ein URB
+// verarbeitet wird, wartet der nächste bereits im Kernel.
+//
+// Lyx-Anpassung: statt Callback-Pointer gibt UsbUrbPoolPoll den
+// Entry-Index zurück. Der Aufrufer liest Daten und ruft
+// UsbUrbPoolResubmit auf — kein Funktionszeiger nötig.
+//
+// Wichtig: Bei Geräte-Disconnect (UsbUrbPoolGetStatus = -ENODEV)
+// NICHT erneut einreichen (Kernel ignoriert es).
+
+unit std.hardware.usb_urb_pool;
+
+import std.hardware.usb_interrupt;
+import std.hardware.usb_syscalls;
+import std.alloc;
+
+// ============================================================
+// Pool-Konstanten
+// ============================================================
+pub con USB_URB_POOL_COUNT:      int64 := 4;
+pub con USB_URB_POOL_BUF_SIZE:   int64 := 64;    // Bytes pro URB-Puffer
+
+// Pool-Header (32 Bytes):
+//   +0:  dev_fd
+//   +8:  endpoint
+//   +16: buf_size (tatsächlich genutzter Puffer, ≤ USB_URB_POOL_BUF_SIZE)
+//   +24: submitted_count
+//
+// Pool-Entry pro Slot (136 Bytes):
+//   +0:   URB (56 Bytes)
+//   +56:  Datenpuffer (64 Bytes)
+//   +120: in_use (int64)
+//   +128: actual_len (int64)
+
+pub con USB_URB_POOL_HDR_SIZE:   int64 := 32;
+pub con USB_URB_POOL_ENTRY_SIZE: int64 := 136;   // 56 + 64 + 8 + 8
+pub con USB_URB_POOL_TOTAL_SIZE: int64 := 576;   // 32 + 4×136
+
+// Entry-interne Offsets
+con POOL_ENT_BUF:       int64 := 56;
+con POOL_ENT_IN_USE:    int64 := 120;
+con POOL_ENT_ACTLEN:    int64 := 128;
+
+// Header-Offsets
+con POOL_HDR_FD:        int64 := 0;
+con POOL_HDR_EP:        int64 := 8;
+con POOL_HDR_BUFSZ:     int64 := 16;
+con POOL_HDR_SUBMITTED: int64 := 24;
+
+// POLLIN event-Flag
+con POOL_POLLIN: int64 := 1;
+
+// ============================================================
+// Hilfsfunktion: Basisadresse eines Pool-Eintrags
+// ============================================================
+fn usbPoolEntryBase(urbp: int64, idx: int64): int64 {
+  return urbp + USB_URB_POOL_HDR_SIZE + idx * USB_URB_POOL_ENTRY_SIZE;
+}
+
+// ============================================================
+// UsbUrbPoolAlloc — legt einen neuen Pool an und nullt ihn
+// bufSize: tatsächliche Puffergröße (≤ USB_URB_POOL_BUF_SIZE)
+// ============================================================
+pub fn UsbUrbPoolAlloc(dev_fd: int64, endpoint: int64, bufSize: int64): int64 {
+  var urbp: int64 := alloc(USB_URB_POOL_TOTAL_SIZE);
+  if (urbp == 0) { return 0; }
+  // Pool komplett nullen (576 / 8 = 72 Chunks)
+  var i: int64 := 0;
+  while (i < 72) { poke64(urbp + i * 8, 0); i := i + 1; }
+  if (bufSize > USB_URB_POOL_BUF_SIZE) { bufSize := USB_URB_POOL_BUF_SIZE; }
+  if (bufSize <= 0) { bufSize := USB_URB_POOL_BUF_SIZE; }
+  poke64(urbp + POOL_HDR_FD,    dev_fd);
+  poke64(urbp + POOL_HDR_EP,    endpoint);
+  poke64(urbp + POOL_HDR_BUFSZ, bufSize);
+  return urbp;
+}
+
+pub fn UsbUrbPoolFree(urbp: int64) {
+  free(urbp, USB_URB_POOL_TOTAL_SIZE);
+}
+
+// ============================================================
+// UsbUrbPoolInit — initialisiert und reicht alle 4 URBs ein
+// Rückgabe: Anzahl erfolgreich eingereichter URBs (≤ 4).
+// Bei fd=-1: 0 (alle schlagen fehl, kein Crash).
+// (AC-1: InitUrbPool reicht alle 4 URBs erfolgreich ein)
+// ============================================================
+pub fn UsbUrbPoolInit(urbp: int64): int64 {
+  var fd:      int64 := peek64(urbp + POOL_HDR_FD);
+  var ep:      int64 := peek64(urbp + POOL_HDR_EP);
+  var bufSz:   int64 := peek64(urbp + POOL_HDR_BUFSZ);
+  var submitted: int64 := 0;
+  var i: int64 := 0;
+
+  while (i < USB_URB_POOL_COUNT) {
+    var base:   int64 := usbPoolEntryBase(urbp, i);
+    var urbPtr: int64 := base;
+    var bufPtr: int64 := base + POOL_ENT_BUF;
+
+    // URB nullen (7 × poke64)
+    var j: int64 := 0;
+    while (j < 7) { poke64(urbPtr + j * 8, 0); j := j + 1; }
+
+    // URB befüllen
+    poke8 (urbPtr + URB_OFF_TYPE,          USBDEVFS_URB_TYPE_INTERRUPT & 0xFF);
+    poke8 (urbPtr + URB_OFF_ENDPOINT,      ep & 0xFF);
+    poke64(urbPtr + URB_OFF_BUFFER,        bufPtr);
+    poke32(urbPtr + URB_OFF_BUFFER_LENGTH, bufSz & 0xFFFFFFFF);
+    poke64(urbPtr + URB_OFF_USERCONTEXT,   i);    // Kontext = Entry-Index
+
+    poke64(base + POOL_ENT_IN_USE,  1);
+    poke64(base + POOL_ENT_ACTLEN,  0);
+
+    var ret: int64 := sys_ioctl(fd, USBDEVFS_SUBMITURB, urbPtr);
+    if (ret >= 0) {
+      submitted += 1;
+    } else {
+      poke64(base + POOL_ENT_IN_USE, 0);  // Submit fehlgeschlagen
+    }
+    i += 1;
+  }
+
+  poke64(urbp + POOL_HDR_SUBMITTED, submitted);
+  return submitted;
+}
+
+// ============================================================
+// UsbUrbPoolPoll — wartet auf nächsten fertigen URB
+//
+// Rückgabe: Entry-Index (0..3) des fertigen URBs,
+//           oder -1 bei Timeout / Fehler.
+//
+// Nach dem Aufruf:
+//   - UsbUrbPoolGetBuffer(urbp, idx)    → Datenzeiger
+//   - UsbUrbPoolGetActualLen(urbp, idx) → empfangene Bytes
+//   - UsbUrbPoolGetStatus(urbp, idx)    → URB-Status (0=OK, -ENODEV bei Disconnect)
+//   - UsbUrbPoolResubmit(urbp, idx)     → wenn Status==0: erneut einreichen
+// (AC-2: PollUrbPool ruft Callback bei jeder eingehenden Meldung auf)
+// ============================================================
+pub fn UsbUrbPoolPoll(urbp: int64, timeout_ms: int64): int64 {
+  var fd: int64 := peek64(urbp + POOL_HDR_FD);
+
+  // poll() auf den Geräte-fd
+  var pfd: int64 := alloc(8);
+  poke32(pfd,     fd & 0xFFFFFFFF);
+  poke16(pfd + 4, POOL_POLLIN);
+  poke16(pfd + 6, 0);
+  var pollRet: int64 := sys_poll(pfd, 1, timeout_ms);
+  free(pfd, 8);
+  if (pollRet <= 0) { return -1; }
+
+  // REAPURBNDELAY: Kernel schreibt URB-Zeiger in *urbPtrBuf
+  var urbPtrBuf: int64 := alloc(8);
+  poke64(urbPtrBuf, 0);
+  var ret: int64 := sys_ioctl(fd, USBDEVFS_REAPURBNDELAY, urbPtrBuf);
+  var urbPtr: int64 := peek64(urbPtrBuf);
+  free(urbPtrBuf, 8);
+  if (ret < 0 || urbPtr == 0) { return -1; }
+
+  // Entry-Index aus usercontext lesen
+  var idx: int64 := peek64(urbPtr + URB_OFF_USERCONTEXT);
+  if (idx < 0 || idx >= USB_URB_POOL_COUNT) { return -1; }
+
+  // Metadaten speichern
+  var base: int64 := usbPoolEntryBase(urbp, idx);
+  var actualLen: int64 := peek32(urbPtr + URB_OFF_ACTUAL_LENGTH) & 0xFFFFFFFF;
+  poke64(base + POOL_ENT_ACTLEN, actualLen);
+  poke64(base + POOL_ENT_IN_USE, 0);    // bereit zur Verarbeitung
+
+  return idx;
+}
+
+// ============================================================
+// UsbUrbPoolResubmit — reicht einen verarbeiteten URB neu ein
+// Nicht aufrufen wenn Status == -ENODEV (AC-3).
+// Rückgabe: 0 = Erfolg, negativ = Fehler.
+// ============================================================
+pub fn UsbUrbPoolResubmit(urbp: int64, idx: int64): int64 {
+  if (idx < 0 || idx >= USB_URB_POOL_COUNT) { return -1; }
+  var fd:   int64 := peek64(urbp + POOL_HDR_FD);
+  var base: int64 := usbPoolEntryBase(urbp, idx);
+  poke64(base + POOL_ENT_ACTLEN, 0);
+  poke64(base + POOL_ENT_IN_USE, 1);
+  return sys_ioctl(fd, USBDEVFS_SUBMITURB, base);   // URB ist at base+0
+}
+
+// ============================================================
+// Accessoren
+// ============================================================
+
+// Zeiger auf den Datenpuffer von Entry idx
+pub fn UsbUrbPoolGetBuffer(urbp: int64, idx: int64): int64 {
+  return usbPoolEntryBase(urbp, idx) + POOL_ENT_BUF;
+}
+
+// Tatsächlich empfangene Bytes (nach UsbUrbPoolPoll)
+pub fn UsbUrbPoolGetActualLen(urbp: int64, idx: int64): int64 {
+  return peek64(usbPoolEntryBase(urbp, idx) + POOL_ENT_ACTLEN);
+}
+
+// URB-Status (aus URB.status-Feld, sign-extended) — 0=OK, -ENODEV bei Disconnect
+pub fn UsbUrbPoolGetStatus(urbp: int64, idx: int64): int64 {
+  return peek32(usbPoolEntryBase(urbp, idx) + URB_OFF_STATUS);
+}
+
+// in_use-Flag: 1 = im Kernel eingereicht, 0 = bereit zur Verarbeitung
+pub fn UsbUrbPoolGetInUse(urbp: int64, idx: int64): int64 {
+  return peek64(usbPoolEntryBase(urbp, idx) + POOL_ENT_IN_USE);
+}

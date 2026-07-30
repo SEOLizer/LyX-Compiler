@@ -1,0 +1,458 @@
+// std/image/gif.lyx — GRF-04: GIF Decoder (LZW, transparency, interlace)
+// Supports GIF87a and GIF89a, first frame decode, frame count, transparency.
+
+@description("GIF decoder: LZW, transparency, interlace, animation frame count")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.image.gif;
+
+import std.image.core;
+import std.alloc;
+import std.fs;
+
+// ============================================================================
+// LZW decoder
+// Reads GIF LZW sub-block stream and writes decoded indices to out.
+// initCodeSize: initial LZW minimum code size (1 byte from file).
+// sub: pointer to sub-block data (first length byte).
+// outBuf: output pixel indices, outMax: max output bytes.
+// Returns bytes decoded.
+// ============================================================================
+
+fn gifLZW(initCodeSize: int64, sub: int64, subTotal: int64, outBuf: int64, outMax: int64): int64 {
+    var clearCode: int64 := 1 << initCodeSize;
+    var eoiCode:   int64 := clearCode + 1;
+    var codeSize:  int64 := initCodeSize + 1;
+
+    // Dictionary: 4096 entries, each entry is [prefix:2 + suffix:1 + len:1] per entry
+    // We use a flat int64 array for simplicity: prefix(8) + suffix(8) + length(8) = 24 bytes/entry
+    var dict:    int64 := alloc(4096 * 24);
+    if (dict == 0) { return 0; }
+
+    var dictSize: int64 := clearCode + 2;
+
+    // Initialize base entries (indices 0..clearCode-1 are single-char codes)
+    var initI: int64 := 0;
+    while (initI < clearCode) {
+        poke64(dict + initI * 24,      0 - 1);  // no prefix
+        poke64(dict + initI * 24 + 8,  initI);  // suffix = index itself
+        poke64(dict + initI * 24 + 16, 1);      // length = 1
+        initI += 1;
+    }
+
+    // Bitstream reader state
+    var bitBuf:  int64 := 0;
+    var bitCnt:  int64 := 0;
+    var subPos:  int64 := 0;      // position in subblock stream
+    var blockRem: int64 := 0;     // remaining bytes in current sub-block
+    var blockOff: int64 := sub;   // pointer to current sub-block
+
+    // Initialize block: first byte is length
+    blockRem := peek8(blockOff);
+    blockOff += 1;
+
+    var outPos: int64 := 0;
+    var prevCode: int64 := 0 - 1;
+    var stack: int64 := alloc(4096);
+    if (stack == 0) { free(dict, 4096 * 24); return 0; }
+
+    var running: int64 := 1;
+    while (running != 0) {
+        // Fill bit buffer
+        while (bitCnt < codeSize && blockRem > 0) {
+            var b: int64 := peek8(blockOff);
+            blockOff += 1;
+            blockRem -= 1;
+            bitBuf := bitBuf | (b << bitCnt);
+            bitCnt += 8;
+            if (blockRem == 0) {
+                // Move to next sub-block
+                if (blockOff - sub > subTotal) {
+                    running := 0;
+                    blockRem := 0 - 1;  // signal end
+                }
+                if (running != 0) {
+                    blockRem := peek8(blockOff);
+                    if (blockRem == 0) {
+                        running := 0;  // block terminator
+                    } else {
+                        blockOff += 1;
+                    }
+                }
+            }
+        }
+
+        if (bitCnt < codeSize) {
+            running := 0;
+        }
+        if (running == 0) {
+            // empty body — will exit
+        } else {
+            var code: int64 := bitBuf & ((1 << codeSize) - 1);
+            bitBuf := bitBuf >> codeSize;
+            bitCnt -= codeSize;
+
+            if (code == clearCode) {
+                // Reset
+                codeSize := initCodeSize + 1;
+                dictSize := clearCode + 2;
+                prevCode := 0 - 1;
+            } else if (code == eoiCode) {
+                running := 0;
+            } else {
+                // Decode code to pixel sequence
+                var actualCode: int64 := code;
+                var stackTop: int64 := 0;
+
+                if (code >= dictSize) {
+                    // Special case: code == dictSize (KwKwK pattern)
+                    if (prevCode >= 0) {
+                        var pc: int64 := prevCode;
+                        var firstSuffix: int64 := peek64(dict + pc * 24 + 8);
+                        while (peek64(dict + pc * 24) >= 0) {
+                            pc := peek64(dict + pc * 24);
+                        }
+                        firstSuffix := peek64(dict + pc * 24 + 8);
+                        poke8(stack + stackTop, firstSuffix);
+                        stackTop += 1;
+                        actualCode := prevCode;
+                    }
+                }
+
+                // Walk the dictionary chain to decode
+                var dc: int64 := actualCode;
+                while (dc >= 0 && dc < clearCode + 2 && dc >= clearCode + 2) {
+                    dc := 0 - 1;  // unreachable — exit
+                }
+                // Unwind the chain
+                dc := actualCode;
+                var limit: int64 := 4096;
+                while (dc >= 0 && limit > 0) {
+                    poke8(stack + stackTop, peek64(dict + dc * 24 + 8));
+                    stackTop += 1;
+                    var pfx: int64 := peek64(dict + dc * 24);
+                    if (pfx < 0) {
+                        dc := 0 - 1;
+                    } else {
+                        dc := pfx;
+                    }
+                    limit -= 1;
+                }
+
+                // Output in reverse order
+                var si: int64 := stackTop - 1;
+                while (si >= 0) {
+                    if (outPos < outMax) {
+                        poke8(outBuf + outPos, peek8(stack + si));
+                        outPos += 1;
+                    }
+                    si -= 1;
+                }
+
+                // Add new dictionary entry
+                if (prevCode >= 0 && dictSize < 4096) {
+                    var firstOut: int64 := peek8(stack + stackTop - 1);
+                    poke64(dict + dictSize * 24,      prevCode);
+                    poke64(dict + dictSize * 24 + 8,  firstOut);
+                    poke64(dict + dictSize * 24 + 16, peek64(dict + prevCode * 24 + 16) + 1);
+                    dictSize += 1;
+                    // Grow code size if needed
+                    if (dictSize == (1 << codeSize) && codeSize < 12) {
+                        codeSize += 1;
+                    }
+                }
+                prevCode := code;
+            }
+        }
+    }
+
+    free(stack, 4096);
+    free(dict, 4096 * 24);
+    return outPos;
+}
+
+// ============================================================================
+// Internal: decode one GIF frame into img
+// buf: full GIF file, len: file length, frameIdx: 0-based frame index.
+// Sets img fields. Returns 1 on success, 0 on error.
+// ============================================================================
+
+fn gifDecodeFrame(buf: int64, len: int64, frameIdx: int64, img: int64): int64 {
+    if (len < 13) { return 0; }
+    // Header: "GIF87a" or "GIF89a"
+    if (peek8(buf)     != 0x47) { return 0; }  // 'G'
+    if (peek8(buf + 1) != 0x49) { return 0; }  // 'I'
+    if (peek8(buf + 2) != 0x46) { return 0; }  // 'F'
+    if (peek8(buf + 3) != 0x38) { return 0; }  // '8'
+
+    var scrW: int64 := peek8(buf + 6) | (peek8(buf + 7) << 8);
+    var scrH: int64 := peek8(buf + 8) | (peek8(buf + 9) << 8);
+    var packed: int64 := peek8(buf + 10);
+    var hasGCT: int64 := (packed >> 7) & 1;
+    var gctSize: int64 := 3 * (1 << ((packed & 7) + 1));
+
+    var pos: int64 := 13;
+    // Global Color Table
+    var gct: int64 := 0;
+    if (hasGCT != 0) {
+        gct := buf + pos;
+        pos += gctSize;
+    }
+
+    var curFrame: int64 := 0;
+    var transIndex: int64 := 0 - 1;  // -1 = no transparency
+    var running: int64 := 1;
+
+    while (running != 0 && pos < len) {
+        var blockType: int64 := peek8(buf + pos);
+        pos += 1;
+
+        if (blockType == 0x3B) {
+            // Trailer
+            running := 0;
+        } else if (blockType == 0x21) {
+            // Extension
+            var extType: int64 := peek8(buf + pos);
+            pos += 1;
+            if (extType == 0xF9) {
+                // Graphic Control Extension
+                var subLen: int64 := peek8(buf + pos);
+                pos += 1;
+                if (subLen >= 4) {
+                    var gceFlags: int64 := peek8(buf + pos);
+                    var hasTransp: int64 := gceFlags & 1;
+                    if (hasTransp != 0) {
+                        transIndex := peek8(buf + pos + 3);
+                    } else {
+                        transIndex := 0 - 1;
+                    }
+                }
+                pos += subLen;
+                // Skip block terminator
+                var bt: int64 := peek8(buf + pos);
+                while (bt != 0 && pos < len) {
+                    pos := pos + bt + 1;
+                    bt := peek8(buf + pos);
+                }
+                pos += 1;
+            } else {
+                // Skip other extensions
+                var bt: int64 := peek8(buf + pos);
+                while (bt != 0 && pos < len) {
+                    pos := pos + bt + 1;
+                    bt := peek8(buf + pos);
+                }
+                pos += 1;
+            }
+        } else if (blockType == 0x2C) {
+            // Image Descriptor
+            var imgX: int64 := peek8(buf + pos) | (peek8(buf + pos + 1) << 8);
+            var imgY: int64 := peek8(buf + pos + 2) | (peek8(buf + pos + 3) << 8);
+            var imgW: int64 := peek8(buf + pos + 4) | (peek8(buf + pos + 5) << 8);
+            var imgH: int64 := peek8(buf + pos + 6) | (peek8(buf + pos + 7) << 8);
+            var idPacked: int64 := peek8(buf + pos + 8);
+            pos += 9;
+
+            var hasLCT:  int64 := (idPacked >> 7) & 1;
+            var interlaced: int64 := (idPacked >> 6) & 1;
+            var lctSize: int64 := 3 * (1 << ((idPacked & 7) + 1));
+
+            var lct: int64 := 0;
+            if (hasLCT != 0) {
+                lct := buf + pos;
+                pos += lctSize;
+            }
+
+            var colorTable: int64 := gct;
+            if (lct != 0) { colorTable := lct; }
+
+            var initCodeSize: int64 := peek8(buf + pos);
+            pos += 1;
+
+            // Calculate sub-block total size
+            var subStart: int64 := pos;
+            var subScan: int64 := pos;
+            while (subScan < len) {
+                var blen: int64 := peek8(buf + subScan);
+                subScan += 1;
+                if (blen == 0) { subScan := len + 1; }  // done
+                if (subScan <= len) { subScan := subScan + blen; }
+            }
+            var subTotal: int64 := subScan - subStart;
+
+            if (curFrame == frameIdx) {
+                // Decode this frame
+                var pixCount: int64 := imgW * imgH;
+                var indices: int64 := alloc(pixCount + 16);
+                if (indices == 0) { return 0; }
+
+                var nDecoded: int64 := gifLZW(initCodeSize, buf + subStart, subTotal, indices, pixCount);
+                if (nDecoded <= 0) { free(indices, pixCount + 16); return 0; }
+
+                // Handle interlacing
+                var deinterlaced: int64 := indices;
+                var needFreeDeint: int64 := 0;
+                if (interlaced != 0) {
+                    deinterlaced := alloc(pixCount + 16);
+                    if (deinterlaced == 0) { free(indices, pixCount + 16); return 0; }
+                    needFreeDeint := 1;
+                    // 4 interlace passes: rows 0,8,16,...  then 4,12,...  then 2,6,...  then 1,3,5,...
+                    var passes: int64 := alloc(4 * 2 * 8);  // 4 passes: [start, step] each
+                    poke64(passes,      0); poke64(passes + 8, 8);
+                    poke64(passes + 16, 4); poke64(passes + 24, 8);
+                    poke64(passes + 32, 2); poke64(passes + 40, 4);
+                    poke64(passes + 48, 1); poke64(passes + 56, 2);
+                    var srcIdx: int64 := 0;
+                    var passI: int64 := 0;
+                    while (passI < 4) {
+                        var startRow: int64 := peek64(passes + passI * 16);
+                        var stepRow:  int64 := peek64(passes + passI * 16 + 8);
+                        var dstRow: int64 := startRow;
+                        while (dstRow < imgH) {
+                            var xi: int64 := 0;
+                            while (xi < imgW) {
+                                poke8(deinterlaced + dstRow * imgW + xi, peek8(indices + srcIdx));
+                                srcIdx += 1;
+                                xi += 1;
+                            }
+                            dstRow += stepRow;
+                        }
+                        passI += 1;
+                    }
+                    free(passes, 4 * 2 * 8);
+                }
+
+                // Allocate RGBA8 output (full screen size)
+                var pixLen: int64 := imgW * imgH * 4;
+                var pixels: int64 := alloc(pixLen);
+                if (pixels == 0) {
+                    free(indices, pixCount + 16);
+                    if (needFreeDeint != 0) { free(deinterlaced, pixCount + 16); }
+                    return 0;
+                }
+
+                // Map palette indices to RGBA8
+                var pi: int64 := 0;
+                while (pi < imgH) {
+                    var pj: int64 := 0;
+                    while (pj < imgW) {
+                        var idx: int64 := peek8(deinterlaced + pi * imgW + pj);
+                        var r: int64 := 0;
+                        var g: int64 := 0;
+                        var b: int64 := 0;
+                        var a: int64 := 255;
+                        if (colorTable != 0) {
+                            r := peek8(colorTable + idx * 3);
+                            g := peek8(colorTable + idx * 3 + 1);
+                            b := peek8(colorTable + idx * 3 + 2);
+                        }
+                        if (idx == transIndex) { a := 0; }
+                        var dp: int64 := pixels + (pi * imgW + pj) * 4;
+                        poke8(dp,     r);
+                        poke8(dp + 1, g);
+                        poke8(dp + 2, b);
+                        poke8(dp + 3, a);
+                        pj += 1;
+                    }
+                    pi += 1;
+                }
+
+                free(indices, pixCount + 16);
+                if (needFreeDeint != 0) { free(deinterlaced, pixCount + 16); }
+
+                poke64(img + GRF_OFF_WIDTH,    imgW);
+                poke64(img + GRF_OFF_HEIGHT,   imgH);
+                poke64(img + GRF_OFF_CHANNELS, 4);
+                poke64(img + GRF_OFF_DEPTH,    8);
+                poke64(img + GRF_OFF_FORMAT,   GRF_FMT_GIF);
+                poke64(img + GRF_OFF_PIXELS,   pixels);
+                poke64(img + GRF_OFF_PIXLEN,   pixLen);
+                return 1;
+            }
+
+            // Skip image data for other frames
+            var bt2: int64 := peek8(buf + pos);
+            while (bt2 != 0 && pos < len) {
+                pos := pos + bt2 + 1;
+                bt2 := peek8(buf + pos);
+            }
+            pos += 1;
+            curFrame += 1;
+        } else {
+            // Unknown block — skip
+            running := 0;
+        }
+    }
+    return 0;
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+pub fn GifDecode(buf: int64, len: int64, img: int64): int64 {
+    return gifDecodeFrame(buf, len, 0, img);
+}
+
+pub fn GifDecodeFile(path: int64, plen: int64, img: int64): int64 {
+    var fsize: int64 := FileSize(path);
+    if (fsize <= 0) { return 0; }
+    var buf: int64 := alloc(fsize);
+    if (buf == 0) { return 0; }
+    var n: int64 := ReadFile(path, buf, fsize);
+    var ret: int64 := 0;
+    if (n == fsize) { ret := GifDecode(buf, fsize, img); }
+    free(buf, fsize);
+    return ret;
+}
+
+pub fn GifDecodeFrame(buf: int64, len: int64, frameIdx: int64, img: int64): int64 {
+    return gifDecodeFrame(buf, len, frameIdx, img);
+}
+
+// Count image frames in GIF file. Returns frame count, or 0 on error.
+pub fn GifGetFrameCount(buf: int64, len: int64): int64 {
+    if (len < 13) { return 0; }
+    if (peek8(buf) != 0x47 || peek8(buf+1) != 0x49 || peek8(buf+2) != 0x46 || peek8(buf+3) != 0x38) {
+        return 0;
+    }
+    var packed: int64 := peek8(buf + 10);
+    var hasGCT: int64 := (packed >> 7) & 1;
+    var gctSize: int64 := 3 * (1 << ((packed & 7) + 1));
+    var pos: int64 := 13;
+    if (hasGCT != 0) { pos := pos + gctSize; }
+
+    var count: int64 := 0;
+    var running: int64 := 1;
+    while (running != 0 && pos < len) {
+        var blockType: int64 := peek8(buf + pos);
+        pos += 1;
+        if (blockType == 0x3B) {
+            running := 0;
+        } else if (blockType == 0x21) {
+            pos += 1;  // ext type
+            var bt: int64 := peek8(buf + pos);
+            while (bt != 0 && pos < len) {
+                pos := pos + bt + 1;
+                bt := peek8(buf + pos);
+            }
+            pos += 1;
+        } else if (blockType == 0x2C) {
+            var idPacked: int64 := peek8(buf + pos + 8);
+            pos += 9;
+            if ((idPacked >> 7) & 1) { pos := pos + 3 * (1 << ((idPacked & 7) + 1)); }
+            pos += 1;  // skip initial code size
+            // Skip sub-blocks
+            var bt: int64 := peek8(buf + pos);
+            while (bt != 0 && pos < len) {
+                pos := pos + bt + 1;
+                bt := peek8(buf + pos);
+            }
+            pos += 1;
+            count += 1;
+        } else {
+            running := 0;
+        }
+    }
+    return count;
+}

@@ -1,0 +1,286 @@
+// std/graphdb/file.lyx
+// WP-GRP-06: Datei-Persistenz für GraphMemStore
+
+@description("GraphDB file persistence: binary save/load of GraphMemStore")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.graphdb.file;
+
+import std.alloc;
+import std.fs;
+import std.graphdb.core;
+import std.graphdb.node;
+import std.graphdb.edge;
+import std.graphdb.mem;
+
+// Dateiformat:
+// [MAGIC: 8B "LYXGDB\x01\x00"][nodeCount:8][edgeCount:8][flags:8]
+// pro Node: [id:8][labelsLen:8][labelsCount:8][propsLen:8][vecDims:8] + Daten
+// pro Edge: [id:8][source:8][target:8][edgeTypeLen:8][createdAt:8][propsLen:8] + Daten
+
+con GFILE_HEADER_SIZE: int64 := 32;
+con GFILE_NODE_HDR:    int64 := 40;
+con GFILE_EDGE_HDR:    int64 := 48;
+
+// ============================================================
+// Serialisierungs-Hilfsfunktionen
+// ============================================================
+
+fn _gfile_nodeSerSize(n: int64): int64 {
+    return GFILE_NODE_HDR
+         + peek64(n + GNODE_OFF_LABELSLEN)
+         + peek64(n + GNODE_OFF_PROPSLEN)
+         + peek64(n + GNODE_OFF_VECDIMS) * 8;
+}
+
+fn _gfile_edgeSerSize(e: int64): int64 {
+    return GFILE_EDGE_HDR
+         + peek64(e + GEDGE_OFF_ETYPELEN)
+         + peek64(e + GEDGE_OFF_PROPSLEN);
+}
+
+fn _gfile_writeMagic(buf: int64) {
+    poke8(buf + 0, 76);  // L
+    poke8(buf + 1, 89);  // Y
+    poke8(buf + 2, 88);  // X
+    poke8(buf + 3, 71);  // G
+    poke8(buf + 4, 68);  // D
+    poke8(buf + 5, 66);  // B
+    poke8(buf + 6, 1);
+    poke8(buf + 7, 0);
+}
+
+fn _gfile_checkMagic(buf: int64): int64 {
+    if (peek8(buf + 0) != 76) { return 0; }
+    if (peek8(buf + 1) != 89) { return 0; }
+    if (peek8(buf + 2) != 88) { return 0; }
+    if (peek8(buf + 3) != 71) { return 0; }
+    if (peek8(buf + 4) != 68) { return 0; }
+    if (peek8(buf + 5) != 66) { return 0; }
+    if (peek8(buf + 6) != 1)  { return 0; }
+    if (peek8(buf + 7) != 0)  { return 0; }
+    return 1;
+}
+
+// Schreibt Node in buf ab *posPtr, aktualisiert *posPtr
+fn _gfile_writeNode(buf: int64, posPtr: int64, n: int64) {
+    var pos: int64 := peek64(posPtr);
+    var ll:  int64 := peek64(n + GNODE_OFF_LABELSLEN);
+    var lc:  int64 := peek64(n + GNODE_OFF_LABELSCOUNT);
+    var pl:  int64 := peek64(n + GNODE_OFF_PROPSLEN);
+    var vd:  int64 := peek64(n + GNODE_OFF_VECDIMS);
+    poke64(buf + pos,      peek64(n + GNODE_OFF_ID));
+    poke64(buf + pos + 8,  ll);
+    poke64(buf + pos + 16, lc);
+    poke64(buf + pos + 24, pl);
+    poke64(buf + pos + 32, vd);
+    pos += GFILE_NODE_HDR;
+    if (ll > 0) {
+        memcpy(buf + pos, peek64(n + GNODE_OFF_LABELSBUF), ll);
+        pos += ll;
+    }
+    if (pl > 0) {
+        memcpy(buf + pos, peek64(n + GNODE_OFF_PROPSBUF), pl);
+        pos += pl;
+    }
+    if (vd > 0) {
+        memcpy(buf + pos, peek64(n + GNODE_OFF_VECBUF), vd * 8);
+        pos := pos + vd * 8;
+    }
+    poke64(posPtr, pos);
+}
+
+// Schreibt Edge in buf ab *posPtr, aktualisiert *posPtr
+fn _gfile_writeEdge(buf: int64, posPtr: int64, e: int64) {
+    var pos: int64 := peek64(posPtr);
+    var el:  int64 := peek64(e + GEDGE_OFF_ETYPELEN);
+    var pl:  int64 := peek64(e + GEDGE_OFF_PROPSLEN);
+    poke64(buf + pos,      peek64(e + GEDGE_OFF_ID));
+    poke64(buf + pos + 8,  peek64(e + GEDGE_OFF_SOURCE));
+    poke64(buf + pos + 16, peek64(e + GEDGE_OFF_TARGET));
+    poke64(buf + pos + 24, el);
+    poke64(buf + pos + 32, peek64(e + GEDGE_OFF_CREATEDAT));
+    poke64(buf + pos + 40, pl);
+    pos += GFILE_EDGE_HDR;
+    if (el > 0) {
+        memcpy(buf + pos, peek64(e + GEDGE_OFF_ETYPEBUF), el);
+        pos += el;
+    }
+    if (pl > 0) {
+        memcpy(buf + pos, peek64(e + GEDGE_OFF_PROPSBUF), pl);
+        pos += pl;
+    }
+    poke64(posPtr, pos);
+}
+
+// ============================================================
+// Deserialisierungs-Hilfsfunktionen
+// ============================================================
+
+// Liest Node aus buf ab *posPtr, gibt Node-Pointer zurück, aktualisiert *posPtr
+fn _gfile_readNode(buf: int64, posPtr: int64): int64 {
+    var pos: int64  := peek64(posPtr);
+    var id:  int64  := peek64(buf + pos);       pos := pos + 8;
+    var ll:  int64  := peek64(buf + pos);       pos := pos + 8;
+    var lc:  int64  := peek64(buf + pos);       pos := pos + 8;
+    var pl:  int64  := peek64(buf + pos);       pos := pos + 8;
+    var vd:  int64  := peek64(buf + pos);       pos := pos + 8;
+    var n:   int64  := alloc(GNODE_SIZE);
+    poke64(n + GNODE_OFF_ID, id);
+    var lcap: int64 := ll;
+    if (lcap < 64) { lcap := 64; }
+    var lb: int64   := alloc(lcap);
+    if (ll > 0) { memcpy(lb, buf + pos, ll); pos := pos + ll; }
+    poke64(n + GNODE_OFF_LABELSBUF,   lb);
+    poke64(n + GNODE_OFF_LABELSLEN,   ll);
+    poke64(n + GNODE_OFF_LABELSCAP,   lcap);
+    poke64(n + GNODE_OFF_LABELSCOUNT, lc);
+    var pcap: int64 := pl;
+    if (pcap < 256) { pcap := 256; }
+    var pb: int64   := alloc(pcap);
+    if (pl > 0) { memcpy(pb, buf + pos, pl); pos := pos + pl; }
+    poke64(n + GNODE_OFF_PROPSBUF,    pb);
+    poke64(n + GNODE_OFF_PROPSLEN,    pl);
+    poke64(n + GNODE_OFF_PROPSCAP,    pcap);
+    poke64(n + GNODE_OFF_VECBUF,      0);
+    poke64(n + GNODE_OFF_VECDIMS,     0);
+    if (vd > 0) {
+        var vb: int64 := alloc(vd * 8);
+        memcpy(vb, buf + pos, vd * 8);
+        pos := pos + vd * 8;
+        poke64(n + GNODE_OFF_VECBUF,  vb);
+        poke64(n + GNODE_OFF_VECDIMS, vd);
+    }
+    poke64(posPtr, pos);
+    return n;
+}
+
+// Liest Edge aus buf ab *posPtr, gibt Edge-Pointer zurück, aktualisiert *posPtr
+fn _gfile_readEdge(buf: int64, posPtr: int64): int64 {
+    var pos: int64  := peek64(posPtr);
+    var id:  int64  := peek64(buf + pos);       pos := pos + 8;
+    var src: int64  := peek64(buf + pos);       pos := pos + 8;
+    var tgt: int64  := peek64(buf + pos);       pos := pos + 8;
+    var el:  int64  := peek64(buf + pos);       pos := pos + 8;
+    var cat: int64  := peek64(buf + pos);       pos := pos + 8;
+    var pl:  int64  := peek64(buf + pos);       pos := pos + 8;
+    var e:   int64  := alloc(GEDGE_SIZE);
+    poke64(e + GEDGE_OFF_ID,        id);
+    poke64(e + GEDGE_OFF_SOURCE,    src);
+    poke64(e + GEDGE_OFF_TARGET,    tgt);
+    poke64(e + GEDGE_OFF_CREATEDAT, cat);
+    var etbuf: int64 := 0;
+    if (el > 0) {
+        etbuf := alloc(el + 1);
+        memcpy(etbuf, buf + pos, el);
+        poke8(etbuf + el, 0);
+        pos += el;
+    }
+    poke64(e + GEDGE_OFF_ETYPEBUF,  etbuf);
+    poke64(e + GEDGE_OFF_ETYPELEN,  el);
+    var pcap: int64 := pl;
+    if (pcap < 256) { pcap := 256; }
+    var pb: int64   := alloc(pcap);
+    if (pl > 0) { memcpy(pb, buf + pos, pl); pos := pos + pl; }
+    poke64(e + GEDGE_OFF_PROPSBUF,  pb);
+    poke64(e + GEDGE_OFF_PROPSLEN,  pl);
+    poke64(e + GEDGE_OFF_PROPSCAP,  pcap);
+    poke64(posPtr, pos);
+    return e;
+}
+
+// ============================================================
+// Public API
+// ============================================================
+
+pub fn GraphFileSave(store: int64, path: pchar, plen: int64, compress: int64): int64 {
+    var ncnt: int64  := peek64(store + GMEM_OFF_NODECOUNT);
+    var nptrs: int64 := peek64(store + GMEM_OFF_NODEPTRS);
+    var ecnt: int64  := peek64(store + GMEM_OFF_EDGECOUNT);
+    var eptrs: int64 := peek64(store + GMEM_OFF_EDGEPTRS);
+    var total: int64 := GFILE_HEADER_SIZE;
+    var i: int64     := 0;
+    var n: int64     := 0;
+    var e: int64     := 0;
+    var posPtr: int64 := 0;
+    var buf: int64   := 0;
+    var ret: int64   := 0;
+    i := 0;
+    while (i < ncnt) {
+        n := peek64(nptrs + i * 8);
+        total := total + _gfile_nodeSerSize(n);
+        i += 1;
+    }
+    i := 0;
+    while (i < ecnt) {
+        e := peek64(eptrs + i * 8);
+        total := total + _gfile_edgeSerSize(e);
+        i += 1;
+    }
+    buf := alloc(total);
+    _gfile_writeMagic(buf);
+    poke64(buf + 8,  ncnt);
+    poke64(buf + 16, ecnt);
+    poke64(buf + 24, 0);    // flags = 0 (uncompressed)
+    posPtr := alloc(8);
+    poke64(posPtr, GFILE_HEADER_SIZE);
+    i := 0;
+    while (i < ncnt) {
+        n := peek64(nptrs + i * 8);
+        _gfile_writeNode(buf, posPtr, n);
+        i += 1;
+    }
+    i := 0;
+    while (i < ecnt) {
+        e := peek64(eptrs + i * 8);
+        _gfile_writeEdge(buf, posPtr, e);
+        i += 1;
+    }
+    ret := WriteFile(path, buf as pchar, total);
+    free(posPtr, 8);
+    free(buf, total);
+    if (ret == total) { return 1; }
+    return 0;
+}
+
+pub fn GraphFileLoad(store: int64, path: pchar, plen: int64): int64 {
+    var fsz: int64   := FileSize(path);
+    var buf: int64   := 0;
+    var rd: int64    := 0;
+    var ncnt: int64  := 0;
+    var ecnt: int64  := 0;
+    var posPtr: int64 := 0;
+    var i: int64     := 0;
+    var n: int64     := 0;
+    var e: int64     := 0;
+    if (fsz < GFILE_HEADER_SIZE) { return 0; }
+    buf := alloc(fsz);
+    rd  := ReadFile(path, buf as pchar, fsz);
+    if (rd != fsz) {
+        free(buf, fsz);
+        return 0;
+    }
+    if (_gfile_checkMagic(buf) == 0) {
+        free(buf, fsz);
+        return 0;
+    }
+    ncnt := peek64(buf + 8);
+    ecnt := peek64(buf + 16);
+    posPtr := alloc(8);
+    poke64(posPtr, GFILE_HEADER_SIZE);
+    i := 0;
+    while (i < ncnt) {
+        n := _gfile_readNode(buf, posPtr);
+        GraphMemStoreAddNode(store, n);
+        i += 1;
+    }
+    i := 0;
+    while (i < ecnt) {
+        e := _gfile_readEdge(buf, posPtr);
+        GraphMemStoreAddEdge(store, e);
+        i += 1;
+    }
+    free(posPtr, 8);
+    free(buf, fsz);
+    return 1;
+}

@@ -1,0 +1,255 @@
+// std/cloud/do/registry.lyx — DigitalOcean Container Registry (DOCR)
+// WP-DO-10
+
+unit std.cloud.do.registry;
+
+import std.cloud.do.transport;
+import std.cloud.do.credentials;
+import std.alloc;
+import std.io;
+
+pub type DORegistry = struct {
+    name:       int64;  // pchar (alloc'd)
+    serverURL:  int64;  // pchar "registry.digitalocean.com/<name>" (alloc'd)
+    region:     int64;  // pchar (alloc'd)
+    storageUsed: int64; // bytes
+};
+
+pub fn DORegistryFree(r: DORegistry) {
+    if (r.name      != 0) { free(r.name,      StrLen(r.name      as pchar) + 1); }
+    if (r.serverURL != 0) { free(r.serverURL, StrLen(r.serverURL as pchar) + 1); }
+    if (r.region    != 0) { free(r.region,    StrLen(r.region    as pchar) + 1); }
+}
+
+pub type DORepository = struct {
+    name:       int64;  // pchar (alloc'd)
+    registry:   int64;  // pchar (alloc'd)
+    tagCount:   int64;
+    latestTag:  int64;  // pchar (alloc'd)
+};
+
+pub fn DORepositoryFree(r: DORepository) {
+    if (r.name      != 0) { free(r.name,      StrLen(r.name      as pchar) + 1); }
+    if (r.registry  != 0) { free(r.registry,  StrLen(r.registry  as pchar) + 1); }
+    if (r.latestTag != 0) { free(r.latestTag, StrLen(r.latestTag as pchar) + 1); }
+}
+
+pub type DOTag = struct {
+    tag:          int64;  // pchar (alloc'd)
+    manifestDigest: int64; // pchar (alloc'd)
+    compressedSize: int64;
+    updatedAt:    int64;  // pchar (alloc'd)
+};
+
+pub fn DOTagFree(t: DOTag) {
+    if (t.tag            != 0) { free(t.tag,            StrLen(t.tag            as pchar) + 1); }
+    if (t.manifestDigest != 0) { free(t.manifestDigest, StrLen(t.manifestDigest as pchar) + 1); }
+    if (t.updatedAt      != 0) { free(t.updatedAt,      StrLen(t.updatedAt      as pchar) + 1); }
+}
+
+fn doClientRegistry(creds: DOCredentials): DOClient {
+    var c: DOClient; c.token := creds.token; c.tokenLen := creds.tokenLen; return c;
+}
+
+fn parseRegistry(json: int64): DORegistry {
+    var r: DORegistry;
+    r.name        := doJsonStr(json, "name"c);
+    r.serverURL   := doJsonStr(json, "server_url"c);
+    r.region      := doJsonStr(json, "region"c);
+    r.storageUsed := doJsonInt(json, "storage_usage_bytes"c);
+    return r;
+}
+
+fn parseRepository(json: int64): DORepository {
+    var r: DORepository;
+    r.name      := doJsonStr(json, "name"c);
+    r.registry  := doJsonStr(json, "registry_name"c);
+    r.tagCount  := doJsonInt(json, "tag_count"c);
+    r.latestTag := doJsonStr(json, "latest_tag"c);
+    return r;
+}
+
+fn parseTag(json: int64): DOTag {
+    var t: DOTag;
+    t.tag            := doJsonStr(json, "tag"c);
+    t.manifestDigest := doJsonStr(json, "manifest_digest"c);
+    t.compressedSize := doJsonInt(json, "compressed_size_bytes"c);
+    t.updatedAt      := doJsonStr(json, "updated_at"c);
+    return t;
+}
+
+pub fn RegistryCreate(creds: DOCredentials, name: pchar, region: pchar,
+                      subscriptionTier: pchar): DORegistry {
+    var r: DORegistry;
+    r.name := 0; r.serverURL := 0; r.region := 0; r.storageUsed := 0;
+    var buf: int64 := alloc(512);
+    var h: pchar := "{\"name\":\""c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(buf+i,StrCharAt(h,i)&0xFF);i:=i+1;}
+    var nl: int64 := StrLen(name);
+    i:=0; while(i<nl){poke8(buf+lh+i,StrCharAt(name,i)&0xFF);i:=i+1;}
+    var s2: pchar := "\",\"subscription_tier_slug\":\""c; var l2: int64 := StrLen(s2);
+    i:=0; while(i<l2){poke8(buf+lh+nl+i,StrCharAt(s2,i)&0xFF);i:=i+1;}
+    var tl: int64 := StrLen(subscriptionTier);
+    var off: int64 := lh+nl+l2;
+    i:=0; while(i<tl){poke8(buf+off+i,StrCharAt(subscriptionTier,i)&0xFF);i:=i+1;} off:=off+tl;
+    if (region != 0 as pchar) {
+        var sr: pchar := "\",\"region\":\""c; var lsr: int64 := StrLen(sr);
+        i:=0; while(i<lsr){poke8(buf+off+i,StrCharAt(sr,i)&0xFF);i:=i+1;} off:=off+lsr;
+        var rl: int64 := StrLen(region);
+        i:=0; while(i<rl){poke8(buf+off+i,StrCharAt(region,i)&0xFF);i:=i+1;} off:=off+rl;
+    }
+    var tail: pchar := "\"}"c; var tlen: int64 := StrLen(tail);
+    i:=0; while(i<tlen){poke8(buf+off+i,StrCharAt(tail,i)&0xFF);i:=i+1;} off:=off+tlen;
+    poke8(buf+off,0);
+    var cl: DOClient := doClientRegistry(creds);
+    var resp: HTTPResponse := DOPost(cl, "/v2/registry"c, buf, off);
+    free(buf, 512);
+    if ((resp.statusCode == 200 || resp.statusCode == 201) && resp.bodyPtr != 0) {
+        r := parseRegistry(resp.bodyPtr);
+    }
+    HTTPResponseFree(resp);
+    return r;
+}
+
+pub fn RegistryDelete(creds: DOCredentials): int64 {
+    var cl: DOClient := doClientRegistry(creds);
+    var resp: HTTPResponse := DODelete(cl, "/v2/registry"c);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    return ok;
+}
+
+pub fn RegistryGet(creds: DOCredentials): DORegistry {
+    var r: DORegistry;
+    r.name := 0; r.serverURL := 0; r.region := 0; r.storageUsed := 0;
+    var cl: DOClient := doClientRegistry(creds);
+    var resp: HTTPResponse := DOGet(cl, "/v2/registry"c);
+    if (resp.statusCode == 200 && resp.bodyPtr != 0) { r := parseRegistry(resp.bodyPtr); }
+    HTTPResponseFree(resp);
+    return r;
+}
+
+pub fn RegistrySubscriptionGet(creds: DOCredentials): int64 {
+    var cl: DOClient := doClientRegistry(creds);
+    var resp: HTTPResponse := DOGet(cl, "/v2/registry/subscription"c);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.bodyPtr != 0) { result := resp.bodyPtr; resp.bodyPtr := 0; }
+    HTTPResponseFree(resp);
+    return result;
+}
+
+pub fn RegistryRepositoryList(creds: DOCredentials, registryName: pchar): int64 {
+    var cl: DOClient := doClientRegistry(creds);
+    var pathBuf: int64 := alloc(256);
+    doMakePath(pathBuf, "/v2/registry/"c, registryName);
+    var existLen: int64 := StrLen(pathBuf as pchar);
+    var sfx: pchar := "/repositories"c; var sl: int64 := StrLen(sfx);
+    var i: int64 := 0;
+    while(i<sl){poke8(pathBuf+existLen+i,StrCharAt(sfx,i)&0xFF);i:=i+1;}
+    poke8(pathBuf+existLen+sl,0);
+    var result: int64 := DOGetAll(cl, pathBuf as pchar, "repositories"c);
+    free(pathBuf, 256);
+    return result;
+}
+
+pub fn RegistryRepositoryDelete(creds: DOCredentials, registryName: pchar, repoName: pchar): int64 {
+    var cl: DOClient := doClientRegistry(creds);
+    var pathBuf: int64 := alloc(512);
+    doMakePath3(pathBuf, "/v2/registry/"c, registryName, "/repositories/"c);
+    var existLen: int64 := StrLen(pathBuf as pchar);
+    var rl: int64 := StrLen(repoName);
+    var i: int64 := 0;
+    while(i<rl){poke8(pathBuf+existLen+i,StrCharAt(repoName,i)&0xFF);i:=i+1;}
+    poke8(pathBuf+existLen+rl,0);
+    var resp: HTTPResponse := DODelete(cl, pathBuf as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(pathBuf, 512);
+    return ok;
+}
+
+pub fn RegistryTagList(creds: DOCredentials, registryName: pchar, repoName: pchar): int64 {
+    var cl: DOClient := doClientRegistry(creds);
+    var pathBuf: int64 := alloc(512);
+    doMakePath3(pathBuf, "/v2/registry/"c, registryName, "/repositories/"c);
+    var existLen: int64 := StrLen(pathBuf as pchar);
+    var rl: int64 := StrLen(repoName);
+    var i: int64 := 0;
+    while(i<rl){poke8(pathBuf+existLen+i,StrCharAt(repoName,i)&0xFF);i:=i+1;}
+    var sfx: pchar := "/tags"c; var sl: int64 := StrLen(sfx);
+    i:=0; while(i<sl){poke8(pathBuf+existLen+rl+i,StrCharAt(sfx,i)&0xFF);i:=i+1;}
+    poke8(pathBuf+existLen+rl+sl,0);
+    var result: int64 := DOGetAll(cl, pathBuf as pchar, "tags"c);
+    free(pathBuf, 512);
+    return result;
+}
+
+pub fn RegistryTagDelete(creds: DOCredentials, registryName: pchar,
+                         repoName: pchar, tag: pchar): int64 {
+    var cl: DOClient := doClientRegistry(creds);
+    var pathBuf: int64 := alloc(512);
+    doMakePath3(pathBuf, "/v2/registry/"c, registryName, "/repositories/"c);
+    var existLen: int64 := StrLen(pathBuf as pchar);
+    var rl: int64 := StrLen(repoName);
+    var i: int64 := 0;
+    while(i<rl){poke8(pathBuf+existLen+i,StrCharAt(repoName,i)&0xFF);i:=i+1;}
+    var sfx: pchar := "/tags/"c; var sl: int64 := StrLen(sfx);
+    i:=0; while(i<sl){poke8(pathBuf+existLen+rl+i,StrCharAt(sfx,i)&0xFF);i:=i+1;}
+    var tl: int64 := StrLen(tag);
+    i:=0; while(i<tl){poke8(pathBuf+existLen+rl+sl+i,StrCharAt(tag,i)&0xFF);i:=i+1;}
+    poke8(pathBuf+existLen+rl+sl+tl,0);
+    var resp: HTTPResponse := DODelete(cl, pathBuf as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(pathBuf, 512);
+    return ok;
+}
+
+pub fn RegistryGarbageCollect(creds: DOCredentials, registryName: pchar): int64 {
+    var cl: DOClient := doClientRegistry(creds);
+    var pathBuf: int64 := alloc(256);
+    doMakePath(pathBuf, "/v2/registry/"c, registryName);
+    var existLen: int64 := StrLen(pathBuf as pchar);
+    var sfx: pchar := "/garbage-collection"c; var sl: int64 := StrLen(sfx);
+    var i: int64 := 0;
+    while(i<sl){poke8(pathBuf+existLen+i,StrCharAt(sfx,i)&0xFF);i:=i+1;}
+    poke8(pathBuf+existLen+sl,0);
+    var resp: HTTPResponse := DOPost(cl, pathBuf as pchar, 0, 0);
+    var ok: int64 := 0;
+    if (resp.statusCode == 201) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(pathBuf, 256);
+    return ok;
+}
+
+pub fn RegistryDockerLogin(creds: DOCredentials): int64 {
+    // Returns Docker credentials JSON: {"auths":{"registry.digitalocean.com":{"auth":"<base64>"}}}
+    var cl: DOClient := doClientRegistry(creds);
+    var resp: HTTPResponse := DOGet(cl, "/v2/registry/docker-credentials"c);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.bodyPtr != 0) { result := resp.bodyPtr; resp.bodyPtr := 0; }
+    HTTPResponseFree(resp);
+    return result;
+}
+
+pub fn RegistryValidateName(creds: DOCredentials, name: pchar): int64 {
+    var cl: DOClient := doClientRegistry(creds);
+    var buf: int64 := alloc(128);
+    var h: pchar := "{\"name\":\""c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(buf+i,StrCharAt(h,i)&0xFF);i:=i+1;}
+    var nl: int64 := StrLen(name);
+    i:=0; while(i<nl){poke8(buf+lh+i,StrCharAt(name,i)&0xFF);i:=i+1;}
+    poke8(buf+lh+nl,34); poke8(buf+lh+nl+1,125); poke8(buf+lh+nl+2,0); // '"}'
+    var bodyLen: int64 := lh + nl + 2;
+    var resp: HTTPResponse := DOPost(cl, "/v2/registry/validate-name"c, buf, bodyLen);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(buf, 128);
+    return ok;
+}

@@ -1,0 +1,351 @@
+// std/crypto/pqc/pqc.lyx
+// WP-PQC-10: Einheitliche High-Level PQC API
+//
+// Fassade über ML-KEM (FIPS 203), ML-DSA (FIPS 204), SLH-DSA (FIPS 205)
+// und Hybrid-KEM (X25519 + ML-KEM-768).
+//
+// Key-Pair-Handle (PQC_KP_SIZE = 40 Bytes):
+//   +0:  algorithm  +8: pkPtr  +16: pkLen  +24: skPtr  +32: skLen
+//
+// KEM-Algorithmen:  MLKEM_512/768/1024, HYBRID_768
+// DSA-Algorithmen:  MLDSA_44/65/87, SLHDSA_128S/256S
+//
+// Seed-Größen für PQCKeyGenFromSeed:
+//   ML-KEM:        64 Bytes  (d[32] || z[32])
+//   ML-DSA:        32 Bytes  (ξ)
+//   SLH-DSA-128S:  48 Bytes  (skseed[16] || skprf[16] || pkseed[16])
+//   SLH-DSA-256S:  96 Bytes  (skseed[32] || skprf[32] || pkseed[32])
+//   Hybrid-768:    64 Bytes  (seed_x25519[32] || seed_mlkem[32])
+
+unit std.crypto.pqc.pqc;
+
+import std.crypto.rand;
+import std.crypto.pqc.mlkem;
+import std.crypto.pqc.mldsa;
+import std.crypto.pqc.slhdsa;
+import std.crypto.pqc.hybrid;
+import std.alloc;
+
+// ─── Algorithmus-Konstanten ──────────────────────────────────────────────────
+pub con PQC_ALG_MLKEM_512:    int64 := 1;
+pub con PQC_ALG_MLKEM_768:    int64 := 2;
+pub con PQC_ALG_MLKEM_1024:   int64 := 3;
+pub con PQC_ALG_MLDSA_44:     int64 := 4;
+pub con PQC_ALG_MLDSA_65:     int64 := 5;
+pub con PQC_ALG_MLDSA_87:     int64 := 6;
+pub con PQC_ALG_SLHDSA_128S:  int64 := 7;
+pub con PQC_ALG_SLHDSA_256S:  int64 := 8;
+pub con PQC_ALG_HYBRID_768:   int64 := 9;
+pub con PQC_ALG_SLHDSA_MINI:  int64 := 10;  // Mini-Params (n=16,h=4,d=2) — nur für Tests
+
+pub con PQC_SS_LEN:   int64 := 32;  // Shared-Secret-Länge aller KEM-Algorithmen
+pub con PQC_KP_SIZE:  int64 := 40;  // Bytes pro Key-Pair-Handle
+
+// ─── Schlüssel- und Ausgabegrößen ────────────────────────────────────────────
+
+pub fn PQCPublicKeyLen(alg: int64): int64 {
+  if (alg == PQC_ALG_MLKEM_512)    { return MLKEM512_PK; }
+  if (alg == PQC_ALG_MLKEM_768)    { return MLKEM768_PK; }
+  if (alg == PQC_ALG_MLKEM_1024)   { return MLKEM1024_PK; }
+  if (alg == PQC_ALG_MLDSA_44)     { return MLDSA44_PK; }
+  if (alg == PQC_ALG_MLDSA_65)     { return MLDSA65_PK; }
+  if (alg == PQC_ALG_MLDSA_87)     { return MLDSA87_PK; }
+  if (alg == PQC_ALG_SLHDSA_128S)  { return SLH_128S_PK; }
+  if (alg == PQC_ALG_SLHDSA_256S)  { return SLH_256S_PK; }
+  if (alg == PQC_ALG_SLHDSA_MINI)  { return SLH_128S_PK; }  // n=16 → PK=32
+  if (alg == PQC_ALG_HYBRID_768)   { return HYBRID_PK; }
+  return 0;
+}
+
+pub fn PQCSecretKeyLen(alg: int64): int64 {
+  if (alg == PQC_ALG_MLKEM_512)    { return MLKEM512_SK; }
+  if (alg == PQC_ALG_MLKEM_768)    { return MLKEM768_SK; }
+  if (alg == PQC_ALG_MLKEM_1024)   { return MLKEM1024_SK; }
+  if (alg == PQC_ALG_MLDSA_44)     { return MLDSA44_SK; }
+  if (alg == PQC_ALG_MLDSA_65)     { return MLDSA65_SK; }
+  if (alg == PQC_ALG_MLDSA_87)     { return MLDSA87_SK; }
+  if (alg == PQC_ALG_SLHDSA_128S)  { return SLH_128S_SK; }
+  if (alg == PQC_ALG_SLHDSA_256S)  { return SLH_256S_SK; }
+  if (alg == PQC_ALG_SLHDSA_MINI)  { return SLH_128S_SK; }  // n=16 → SK=64
+  if (alg == PQC_ALG_HYBRID_768)   { return HYBRID_SK; }
+  return 0;
+}
+
+pub fn PQCCTLen(alg: int64): int64 {
+  if (alg == PQC_ALG_MLKEM_512)    { return MLKEM512_CT; }
+  if (alg == PQC_ALG_MLKEM_768)    { return MLKEM768_CT; }
+  if (alg == PQC_ALG_MLKEM_1024)   { return MLKEM1024_CT; }
+  if (alg == PQC_ALG_HYBRID_768)   { return HYBRID_CT; }
+  return 0;
+}
+
+pub fn PQCSigLen(alg: int64): int64 {
+  if (alg == PQC_ALG_MLDSA_44)     { return MLDSA44_SIG; }
+  if (alg == PQC_ALG_MLDSA_65)     { return MLDSA65_SIG; }
+  if (alg == PQC_ALG_MLDSA_87)     { return MLDSA87_SIG; }
+  if (alg == PQC_ALG_SLHDSA_128S)  { return SLH_128S_SIG; }
+  if (alg == PQC_ALG_SLHDSA_256S)  { return SLH_256S_SIG; }
+  if (alg == PQC_ALG_SLHDSA_MINI)  { return SLH_MINI_SIG; }
+  return 0;
+}
+
+pub fn PQCSeedSize(alg: int64): int64 {
+  if (alg == PQC_ALG_MLKEM_512 || alg == PQC_ALG_MLKEM_768 || alg == PQC_ALG_MLKEM_1024) { return 64; }
+  if (alg == PQC_ALG_MLDSA_44 || alg == PQC_ALG_MLDSA_65 || alg == PQC_ALG_MLDSA_87)    { return 32; }
+  if (alg == PQC_ALG_SLHDSA_128S)  { return 48; }
+  if (alg == PQC_ALG_SLHDSA_256S)  { return 96; }
+  if (alg == PQC_ALG_SLHDSA_MINI)  { return 48; }  // n=16 → 3×16=48
+  if (alg == PQC_ALG_HYBRID_768)   { return 64; }
+  return 0;
+}
+
+// ─── Handle-Accessors ────────────────────────────────────────────────────────
+
+pub fn PQCGetAlgorithm(kp: int64): int64    { return peek64(kp+0);  }
+pub fn PQCGetPublicKey(kp: int64): int64    { return peek64(kp+8);  }
+pub fn PQCGetPublicKeyLen(kp: int64): int64 { return peek64(kp+16); }
+pub fn PQCGetSecretKey(kp: int64): int64    { return peek64(kp+24); }
+pub fn PQCGetSecretKeyLen(kp: int64): int64 { return peek64(kp+32); }
+
+// ─── Interne Helfer ──────────────────────────────────────────────────────────
+
+fn pqc_mlkem_k(alg: int64): int64 {
+  if (alg == PQC_ALG_MLKEM_512)  { return 2; }
+  if (alg == PQC_ALG_MLKEM_768)  { return 3; }
+  return 4;
+}
+
+fn pqc_mldsa_level(alg: int64): int64 {
+  if (alg == PQC_ALG_MLDSA_44) { return 44; }
+  if (alg == PQC_ALG_MLDSA_65) { return 65; }
+  return 87;
+}
+
+fn pqc_make_kp(alg: int64, pk: int64, pkLen: int64, sk: int64, skLen: int64): int64 {
+  var kp: int64 := alloc(PQC_KP_SIZE);
+  poke64(kp+0,  alg);
+  poke64(kp+8,  pk);
+  poke64(kp+16, pkLen);
+  poke64(kp+24, sk);
+  poke64(kp+32, skLen);
+  return kp;
+}
+
+fn pqc_memcpy(dst: int64, src: int64, n: int64) {
+  var i: int64 := 0;
+  while (i < n) { poke8(dst+i, peek8(src+i)); i := i+1; }
+}
+
+// ─── PQCKeyGenFromSeed ────────────────────────────────────────────────────────
+// Deterministisch; seed muss PQCSeedSize(alg) Bytes enthalten.
+// Gibt Handle zurück, oder 0 bei unbekanntem Algorithmus.
+
+pub fn PQCKeyGenFromSeed(alg: int64, seed: int64): int64 {
+  var pkLen: int64 := PQCPublicKeyLen(alg);
+  var skLen: int64 := PQCSecretKeyLen(alg);
+  if (pkLen == 0) { return 0; }
+  var pk: int64 := alloc(pkLen);
+  var sk: int64 := alloc(skLen);
+
+  if (alg == PQC_ALG_MLKEM_512 || alg == PQC_ALG_MLKEM_768 || alg == PQC_ALG_MLKEM_1024) {
+    MLKEMKeyGen(seed, pqc_mlkem_k(alg), pk, sk);
+  }
+  if (alg == PQC_ALG_MLDSA_44 || alg == PQC_ALG_MLDSA_65 || alg == PQC_ALG_MLDSA_87) {
+    MLDSAKeyGen(seed, pqc_mldsa_level(alg), pk, sk);
+  }
+  if (alg == PQC_ALG_SLHDSA_128S) {
+    var ps: int64 := alloc(SLH_PS);
+    SLHParams128s(ps);
+    SLHDSAKeyGen(ps, seed, seed+16, seed+32, sk, pk);
+    free(ps, SLH_PS);
+  }
+  if (alg == PQC_ALG_SLHDSA_256S) {
+    var ps: int64 := alloc(SLH_PS);
+    SLHParams256s(ps);
+    SLHDSAKeyGen(ps, seed, seed+32, seed+64, sk, pk);
+    free(ps, SLH_PS);
+  }
+  if (alg == PQC_ALG_SLHDSA_MINI) {
+    var ps: int64 := alloc(SLH_PS);
+    SLHParamsMini(ps);
+    SLHDSAKeyGen(ps, seed, seed+16, seed+32, sk, pk);
+    free(ps, SLH_PS);
+  }
+  if (alg == PQC_ALG_HYBRID_768) {
+    HybridKEMKeyGen(seed, pk, sk);
+  }
+
+  return pqc_make_kp(alg, pk, pkLen, sk, skLen);
+}
+
+// ─── PQCKeyGen ────────────────────────────────────────────────────────────────
+// Erzeugt ein neues Schlüsselpaar mit kryptographisch sicherer Zufälligkeit.
+
+pub fn PQCKeyGen(alg: int64): int64 {
+  var seedSize: int64 := PQCSeedSize(alg);
+  if (seedSize == 0) { return 0; }
+  var seed: int64 := alloc(seedSize);
+  RandBytesExact(seed, seedSize);
+  var kp: int64 := PQCKeyGenFromSeed(alg, seed);
+  free(seed, seedSize);
+  return kp;
+}
+
+// ─── PQCFreeKeyPair ───────────────────────────────────────────────────────────
+
+pub fn PQCFreeKeyPair(kp: int64) {
+  if (kp == 0) { return; }
+  var pk:    int64 := peek64(kp+8);
+  var pkLen: int64 := peek64(kp+16);
+  var sk:    int64 := peek64(kp+24);
+  var skLen: int64 := peek64(kp+32);
+  if (pk != 0) { free(pk, pkLen); }
+  if (sk != 0) { free(sk, skLen); }
+  free(kp, PQC_KP_SIZE);
+}
+
+// ─── PQCEncapsulate ───────────────────────────────────────────────────────────
+// KEM: erzeugt Ciphertext und Shared Secret mit system-eigener Zufälligkeit.
+// ctOut: caller-alloziert mit PQCCTLen(alg) Bytes
+// ssOut: caller-alloziert mit PQC_SS_LEN Bytes
+// Gibt 0 bei Erfolg, -1 wenn alg kein KEM-Algorithmus ist.
+
+pub fn PQCEncapsulate(kp: int64, ctOut: int64, ssOut: int64): int64 {
+  var alg: int64 := peek64(kp+0);
+  var pk:  int64 := peek64(kp+8);
+
+  if (alg == PQC_ALG_MLKEM_512 || alg == PQC_ALG_MLKEM_768 || alg == PQC_ALG_MLKEM_1024) {
+    var rand: int64 := alloc(32);
+    RandBytesExact(rand, 32);
+    MLKEMEncapsulate(pk, pqc_mlkem_k(alg), rand, ctOut, ssOut);
+    free(rand, 32);
+    return 0;
+  }
+  if (alg == PQC_ALG_HYBRID_768) {
+    var rand: int64 := alloc(64);
+    RandBytesExact(rand, 64);
+    HybridKEMEncapsulate(pk, rand, ctOut, ssOut);
+    free(rand, 64);
+    return 0;
+  }
+  return 0 - 1;
+}
+
+// ─── PQCDecapsulate ───────────────────────────────────────────────────────────
+// KEM: rekonstruiert Shared Secret aus Ciphertext.
+// ssOut: caller-alloziert mit PQC_SS_LEN Bytes
+// Gibt 0 bei Erfolg, -1 wenn alg kein KEM-Algorithmus ist.
+
+pub fn PQCDecapsulate(kp: int64, ct: int64, ssOut: int64): int64 {
+  var alg: int64 := peek64(kp+0);
+  var sk:  int64 := peek64(kp+24);
+
+  if (alg == PQC_ALG_MLKEM_512 || alg == PQC_ALG_MLKEM_768 || alg == PQC_ALG_MLKEM_1024) {
+    MLKEMDecapsulate(sk, pqc_mlkem_k(alg), ct, ssOut);
+    return 0;
+  }
+  if (alg == PQC_ALG_HYBRID_768) {
+    HybridKEMDecapsulate(sk, ct, ssOut);
+    return 0;
+  }
+  return 0 - 1;
+}
+
+// ─── PQCSign ──────────────────────────────────────────────────────────────────
+// DSA: signiert msg mit dem Secret Key aus dem Handle.
+// sigOut: caller-alloziert mit PQCSigLen(alg) Bytes
+// Gibt tatsächliche Signaturlänge zurück, oder 0 bei Fehler / falscher Algorithmus.
+
+pub fn PQCSign(kp: int64, msg: int64, msgLen: int64, sigOut: int64): int64 {
+  var alg: int64 := peek64(kp+0);
+  var sk:  int64 := peek64(kp+24);
+
+  if (alg == PQC_ALG_MLDSA_44 || alg == PQC_ALG_MLDSA_65 || alg == PQC_ALG_MLDSA_87) {
+    return MLDSASign(sk, pqc_mldsa_level(alg), msg, msgLen, sigOut);
+  }
+  if (alg == PQC_ALG_SLHDSA_128S) {
+    var ps: int64 := alloc(SLH_PS);
+    SLHParams128s(ps);
+    var sigLen: int64 := SLHDSASign(ps, sk, msg, msgLen, 0, sigOut);
+    free(ps, SLH_PS);
+    return sigLen;
+  }
+  if (alg == PQC_ALG_SLHDSA_256S) {
+    var ps: int64 := alloc(SLH_PS);
+    SLHParams256s(ps);
+    var sigLen: int64 := SLHDSASign(ps, sk, msg, msgLen, 0, sigOut);
+    free(ps, SLH_PS);
+    return sigLen;
+  }
+  if (alg == PQC_ALG_SLHDSA_MINI) {
+    var ps: int64 := alloc(SLH_PS);
+    SLHParamsMini(ps);
+    var sigLen: int64 := SLHDSASign(ps, sk, msg, msgLen, 0, sigOut);
+    free(ps, SLH_PS);
+    return sigLen;
+  }
+  return 0;
+}
+
+// ─── PQCVerify ────────────────────────────────────────────────────────────────
+// DSA: verifiziert eine Signatur gegen den Public Key aus dem Handle.
+// Gibt 1 bei gültiger Signatur, 0 sonst.
+
+pub fn PQCVerify(kp: int64, msg: int64, msgLen: int64, sig: int64, sigLen: int64): int64 {
+  var alg: int64 := peek64(kp+0);
+  var pk:  int64 := peek64(kp+8);
+
+  if (alg == PQC_ALG_MLDSA_44 || alg == PQC_ALG_MLDSA_65 || alg == PQC_ALG_MLDSA_87) {
+    return MLDSAVerify(pk, pqc_mldsa_level(alg), msg, msgLen, sig, sigLen);
+  }
+  if (alg == PQC_ALG_SLHDSA_128S) {
+    var ps: int64 := alloc(SLH_PS);
+    SLHParams128s(ps);
+    var r: int64 := SLHDSAVerify(ps, pk, msg, msgLen, sig);
+    free(ps, SLH_PS);
+    return r;
+  }
+  if (alg == PQC_ALG_SLHDSA_256S) {
+    var ps: int64 := alloc(SLH_PS);
+    SLHParams256s(ps);
+    var r: int64 := SLHDSAVerify(ps, pk, msg, msgLen, sig);
+    free(ps, SLH_PS);
+    return r;
+  }
+  if (alg == PQC_ALG_SLHDSA_MINI) {
+    var ps: int64 := alloc(SLH_PS);
+    SLHParamsMini(ps);
+    var r: int64 := SLHDSAVerify(ps, pk, msg, msgLen, sig);
+    free(ps, SLH_PS);
+    return r;
+  }
+  return 0;
+}
+
+// ─── Schlüssel-Import/Export ─────────────────────────────────────────────────
+
+// Kopiert Public Key in out (PQCGetPublicKeyLen(kp) Bytes). Gibt pkLen zurück.
+pub fn PQCExportPublicKey(kp: int64, out: int64): int64 {
+  var pk:    int64 := peek64(kp+8);
+  var pkLen: int64 := peek64(kp+16);
+  pqc_memcpy(out, pk, pkLen);
+  return pkLen;
+}
+
+// Kopiert Secret Key in out (PQCGetSecretKeyLen(kp) Bytes). Gibt skLen zurück.
+pub fn PQCExportSecretKey(kp: int64, out: int64): int64 {
+  var sk:    int64 := peek64(kp+24);
+  var skLen: int64 := peek64(kp+32);
+  pqc_memcpy(out, sk, skLen);
+  return skLen;
+}
+
+// Erstellt Handle mit nur dem Public Key (skPtr=0, skLen=0).
+// Für Encapsulate / Verify mit fremdem Public Key.
+pub fn PQCImportPublicKey(alg: int64, data: int64, len: int64): int64 {
+  var pkLen: int64 := PQCPublicKeyLen(alg);
+  if (pkLen == 0 || len != pkLen) { return 0; }
+  var pk: int64 := alloc(pkLen);
+  pqc_memcpy(pk, data, pkLen);
+  return pqc_make_kp(alg, pk, pkLen, 0, 0);
+}

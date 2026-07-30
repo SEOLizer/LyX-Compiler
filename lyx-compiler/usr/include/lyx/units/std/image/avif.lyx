@@ -1,0 +1,144 @@
+// std/image/avif.lyx — GRF-07: AVIF Decoder (Phase 1: Metadata only)
+// Parses ISOBMFF boxes to extract width/height/color info from ispe box.
+// Full AV1 pixel decode is a future milestone (Phase 2).
+
+@description("AVIF metadata parser: ISOBMFF box traversal, ispe width/height")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.image.avif;
+
+import std.image.core;
+import std.alloc;
+
+// ============================================================================
+// Internal: big-endian 32-bit read
+// ============================================================================
+
+fn avifGet32(buf: int64, off: int64): int64 {
+    var b0: int64 := peek8(buf + off);
+    var b1: int64 := peek8(buf + off + 1);
+    var b2: int64 := peek8(buf + off + 2);
+    var b3: int64 := peek8(buf + off + 3);
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+// Compare 4 bytes at buf+off with literal a,b,c,d. Returns 1 if equal.
+fn avifBoxIs(buf: int64, off: int64, a: int64, b: int64, c: int64, d: int64): int64 {
+    if (peek8(buf + off)     != a) { return 0; }
+    if (peek8(buf + off + 1) != b) { return 0; }
+    if (peek8(buf + off + 2) != c) { return 0; }
+    if (peek8(buf + off + 3) != d) { return 0; }
+    return 1;
+}
+
+// ============================================================================
+// AvifDetect — check if buf contains AVIF data
+// Returns 1 if AVIF, 0 otherwise.
+// ============================================================================
+
+pub fn AvifDetect(buf: int64, len: int64): int64 {
+    if (len < 12) { return 0; }
+    // Must have 'ftyp' at offset 4
+    if (avifBoxIs(buf, 4, 0x66, 0x74, 0x79, 0x70) == 0) { return 0; }
+    // major_brand at offset 8: 'avif' or 'avis'
+    if (peek8(buf + 8) != 0x61 || peek8(buf + 9) != 0x76 || peek8(buf + 10) != 0x69) { return 0; }
+    var brand4: int64 := peek8(buf + 11);
+    if (brand4 == 0x66 || brand4 == 0x73) { return 1; }
+    // Check compatible brands in ftyp box (starts at offset 16, 4 bytes each)
+    var ftypSize: int64 := avifGet32(buf, 0);
+    if (ftypSize < 16 || ftypSize > len) { return 0; }
+    var brandPos: int64 := 16;
+    while (brandPos + 4 <= ftypSize) {
+        var ba: int64 := peek8(buf + brandPos);
+        var bb: int64 := peek8(buf + brandPos + 1);
+        var bc: int64 := peek8(buf + brandPos + 2);
+        var bd: int64 := peek8(buf + brandPos + 3);
+        if (ba == 0x61 && bb == 0x76 && bc == 0x69 && (bd == 0x66 || bd == 0x73)) { return 1; }
+        brandPos += 4;
+    }
+    return 0;
+}
+
+// ============================================================================
+// Internal: recursively search for 'ispe' box inside a given container range.
+// Returns offset to ispe box data (after the 8-byte ispe header), or -1 if not found.
+// ============================================================================
+
+fn avifFindIspe(buf: int64, start: int64, end: int64): int64 {
+    var pos: int64 := start;
+    while (pos + 8 <= end) {
+        var bsize: int64 := avifGet32(buf, pos);
+        if (bsize < 8) { return 0 - 1; }
+        var btype0: int64 := peek8(buf + pos + 4);
+        var btype1: int64 := peek8(buf + pos + 5);
+        var btype2: int64 := peek8(buf + pos + 6);
+        var btype3: int64 := peek8(buf + pos + 7);
+        if (pos + bsize > end) { return 0 - 1; }
+
+        // 'ispe' = 0x69 0x73 0x70 0x65
+        if (btype0 == 0x69 && btype1 == 0x73 && btype2 == 0x70 && btype3 == 0x65) {
+            return pos + 8;  // offset to ispe data (after header)
+        }
+        // Container boxes: search inside
+        // 'meta', 'iprp', 'ipco', 'moov', 'trak', 'mdia', 'udta'
+        var isContainer: int64 := 0;
+        if (btype0 == 0x6D && btype1 == 0x65 && btype2 == 0x74 && btype3 == 0x61) { isContainer := 1; }
+        if (btype0 == 0x69 && btype1 == 0x70 && btype2 == 0x72 && btype3 == 0x70) { isContainer := 1; }
+        if (btype0 == 0x69 && btype1 == 0x70 && btype2 == 0x63 && btype3 == 0x6F) { isContainer := 1; }
+        if (btype0 == 0x6D && btype1 == 0x6F && btype2 == 0x6F && btype3 == 0x76) { isContainer := 1; }
+
+        if (isContainer != 0) {
+            var innerStart: int64 := pos + 8;
+            // 'meta' has a 4-byte version/flags field before children
+            if (btype0 == 0x6D && btype1 == 0x65 && btype2 == 0x74 && btype3 == 0x61) {
+                innerStart += 4;
+            }
+            var found: int64 := avifFindIspe(buf, innerStart, pos + bsize);
+            if (found >= 0) { return found; }
+        }
+        pos += bsize;
+    }
+    return 0 - 1;
+}
+
+// ============================================================================
+// AvifMeta — parse AVIF metadata (width, height, bit depth, color)
+// Returns 1 on success, 0 on error.
+// ============================================================================
+
+pub fn AvifMeta(buf: int64, len: int64, img: int64): int64 {
+    if (AvifDetect(buf, len) == 0) { return 0; }
+
+    // Search entire file for 'ispe' box
+    var ispeOff: int64 := avifFindIspe(buf, 0, len);
+    if (ispeOff < 0) { return 0; }
+
+    // ispe box data: [version:1][flags:3][width:4][height:4] (all big-endian)
+    if (ispeOff + 12 > len) { return 0; }
+    var w: int64 := avifGet32(buf, ispeOff + 4);
+    var h: int64 := avifGet32(buf, ispeOff + 8);
+
+    if (w == 0 || h == 0) { return 0; }
+
+    poke64(img + GRF_OFF_WIDTH,    w);
+    poke64(img + GRF_OFF_HEIGHT,   h);
+    poke64(img + GRF_OFF_CHANNELS, 4);  // assume RGBA
+    poke64(img + GRF_OFF_DEPTH,    8);
+    poke64(img + GRF_OFF_FORMAT,   GRF_FMT_AVIF);
+    poke64(img + GRF_OFF_PIXELS,   0);
+    poke64(img + GRF_OFF_PIXLEN,   0);
+    return 1;
+}
+
+// ============================================================================
+// AvifDecode — Phase 1 stub (AV1 decode is future work)
+// Sets metadata fields and returns 0 (no pixel data).
+// ============================================================================
+
+pub fn AvifDecode(buf: int64, len: int64, img: int64): int64 {
+    if (AvifMeta(buf, len, img) == 0) { return 0; }
+    // Phase 2 (AV1 pixel decode) not yet implemented
+    poke64(img + GRF_OFF_PIXELS, 0);
+    poke64(img + GRF_OFF_PIXLEN, 0);
+    return 0;
+}
