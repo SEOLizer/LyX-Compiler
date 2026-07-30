@@ -94,9 +94,33 @@ nicht im Basistyp — die Tabellen sind MB-groß.
 | `a[i]` | `Get` | `i`-tes **Byte** | `i`-ter **Codepoint** |
 
 `==` vergleicht Bytes, ist also **nicht** normalisierungs-insensitiv: „é" als ein
-Codepoint und als `e`+kombinierender Akut sind ungleich. Für den Vergleich
-optisch gleicher Texte vorher über `std.unicode` nach NFC normalisieren.
-`Compare` ist Codepoint-Ordnung, **keine** Locale-Collation.
+Codepoint und als `e`+kombinierender Akut sind ungleich. `Compare` ist
+Codepoint-Ordnung, **keine** Locale-Collation. Ebenso trimmt `Trim()` nur
+ASCII-Whitespace — NBSP, EN/EM-Space und das ideographische Leerzeichen bleiben
+stehen. Für beides gibt es opt-in-Funktionen:
+
+| Frage | Funktion | Unit |
+|-------|----------|------|
+| Gleich trotz unterschiedlicher Normalisierung? | `TextEqualsNormalized(a, b)` | `std.unicode` |
+| Sortierung trotz unterschiedlicher Normalisierung? | `TextCompareNormalized(a, b)` | `std.unicode` |
+| Präfix trotz unterschiedlicher Normalisierung? | `TextStartsWithNormalized(t, p)` | `std.unicode` |
+| Unicode-Whitespace trimmen | `TextTrimUnicode` / `TextTrimStartUnicode` / `TextTrimEndUnicode` | `std.unicode` |
+| Gleich ohne Rücksicht auf Groß/Klein? | `TextEqualsFold(a, b)` | `std.unicode_case` |
+| Sortierung ohne Rücksicht auf Groß/Klein? | `TextCompareFold(a, b)` | `std.unicode_case` |
+| Enthält, ohne Rücksicht auf Groß/Klein? | `TextContainsFold(t, needle)` | `std.unicode_case` |
+| Vergleichsschlüssel einmal berechnen | `TextFoldFull(t)` | `std.unicode_case` |
+
+Die beiden Achsen sind **getrennt**: `TextEqualsFold` ist nicht
+normalisierungs-insensitiv und `TextEqualsNormalized` nicht case-insensitiv. Wer
+beides braucht, normalisiert erst (`TextToNFC`) und faltet dann
+(`TextEqualsFold`). Grund für die Trennung ist keine Designvorliebe, sondern eine
+Compiler-Grenze: die Normalisierungs- und die Case-Tabelle zusammen in einer
+Kompilierungseinheit sprengen das Größenlimit von `lyxc`.
+
+`TextEqualsFold` faltet **simple** (1:1) — inklusive des griechischen
+Schluss-Sigma (ς→σ), das reines Kleinschreiben nicht erwischt. Volles Folding mit
+1:n-Expansion (ß→ss, ﬁ→fi) ist nicht abgedeckt, „STRASSE" und „Straße" bleiben
+also ungleich.
 
 ```lyx
 import std.text;

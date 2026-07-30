@@ -23,6 +23,18 @@ Reine Standardbibliothek — kein Compiler-Change.
 - `sizeof(Text)` ist die Handle-Größe → der Stride der rohen `TextSplit`-Ausgabe
   ist die explizite Konstante `TEXT_PART_STRIDE` (24 = `[data][byteLen][valid]`).
 
+- **`std.unicode`**: `TextCompareNormalized`, `TextStartsWithNormalized` und
+  `TextTrimUnicode` / `TextTrimStartUnicode` / `TextTrimEndUnicode` (Trimmen nach
+  der Unicode-White_Space-Eigenschaft — `Text.Trim()` lässt NBSP, EN/EM-Space und
+  U+3000 stehen). Ergänzt das schon vorhandene `TextEqualsNormalized`.
+- **`std.unicode_case`**: caseless Vergleich — `TextEqualsFold`,
+  `TextCompareFold`, `TextContainsFold`, plus `TextFoldFull` (Schlüssel einmal
+  berechnen) und `UnicodeFoldFull` auf Codepoint-Ebene. Simple Faltung inkl.
+  griechischem Schluss-Sigma (ς→σ), das reines Kleinschreiben nicht erwischt;
+  1:n-Expansion (ß→ss) bleibt außerhalb.
+- Die beiden Achsen sind bewusst getrennt (Fold ≠ normalisierungs-insensitiv):
+  beide Tabellen-Units zusammen sprengen das Kompilierungs-Größenlimit von `lyxc`.
+
 ### Doku / Beispiele
 - **`examples/basics/text_operators.lyx`**: Showcase für `Text` (Methoden,
   Operatoren, Codepoint- vs. Byte-Indizierung).
