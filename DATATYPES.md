@@ -67,6 +67,69 @@ Print(s);                // "Hi"
 StrFree(s);
 ```
 
+#### 5.1 Bibliotheks-String-Typen: `String` und `Text`
+
+Über den Builtins liegen zwei stdlib-Typen. Beide sind Klassen, libc-frei
+(mmap/munmap) und besitzen ihre Bytes; beide nehmen am Operator-Overloading teil
+(siehe `ebnf.md` §15.3).
+
+| Typ | Unit | Ebene | Bedeutung |
+|-----|------|-------|-----------|
+| `String` | `std.strtype` | **Bytes** | Rohe, uninterpretierte Bytes mit expliziter Länge + Kapazität. Embedded NUL erlaubt, kein NUL-Scan. `CharAt`/`Get` = **Byte**. |
+| `Text` | `std.text` | **UTF-8** | Bei Konstruktion als UTF-8 validiert, codepoint-orientiert. `CodepointAt`/`Get` = **Codepoint**, `ByteAt` = Rohbyte. |
+
+Das entspricht dem Encoding-Beschluss: UTF-8 ist das kanonische interne Encoding,
+und der Bytes/Text-Split trennt „rohe Bytes" von „garantiert gültigem UTF-8".
+Volle Unicode-Korrektheit (Normalisierung, Grapheme, volles Case-Mapping) liegt
+bewusst in opt-in-Units (`std.unicode`, `std.unicode_case`, `std.grapheme`),
+nicht im Basistyp — die Tabellen sind MB-groß.
+
+**Operatoren** (beide Typen definieren die Methoden, auf die der Compiler abbildet):
+
+| Operator | Methode | `String` | `Text` |
+|----------|---------|----------|--------|
+| `a + b` | `Add` | Byte-Konkatenation | UTF-8-Konkatenation |
+| `a == b` / `a != b` | `Eq` / `Ne` | inhaltsgleich (Bytes) | inhaltsgleich (Bytes) |
+| `a < b` `<=` `>` `>=` | `Lt`/`Le`/`Gt`/`Ge` über `Compare` | lexikografisch nach Bytes | lexikografisch nach UTF-8-Bytes = **Codepoint-Ordnung** |
+| `a[i]` | `Get` | `i`-tes **Byte** | `i`-ter **Codepoint** |
+
+`==` vergleicht Bytes, ist also **nicht** normalisierungs-insensitiv: „é" als ein
+Codepoint und als `e`+kombinierender Akut sind ungleich. Für den Vergleich
+optisch gleicher Texte vorher über `std.unicode` nach NFC normalisieren.
+`Compare` ist Codepoint-Ordnung, **keine** Locale-Collation.
+
+```lyx
+import std.text;
+
+var a: Text := TextFromPchar("héllo");
+var b: Text := TextFromPchar(" wörld");
+
+a.ByteLength();        // 6  — Bytes
+a.CodepointCount();    // 5  — Codepoints
+a[1];                  // 233 (U+00E9) — Codepoint, nicht das Lead-Byte
+a.ByteAt(1);           // 195 — Rohbyte
+
+var joined: Text := a + b;
+if (a == TextFromPchar("héllo")) { /* inhaltsgleich */ }
+
+a.Free();              // Referenzsemantik: leert wirklich das Objekt
+```
+
+`Text` trägt neben den Operatoren die volle Methoden-API: `IsValid`, `Data`,
+`ByteAt`, `CodepointCount`, `CodepointAt`, `ByteOffsetOfCodepoint`,
+`SubstringCp` (codepoint-korrekt, zerteilt nie eine Multibyte-Sequenz),
+`StartsWith`, `Find`/`FindCp`/`Contains`, `Trim`, `Replace`, `SplitCount`/`PartAt`,
+`AsciiUpper`/`AsciiLower`, `ToPchar`, `Free`. Jede dieser Methoden existiert
+zusätzlich als freie Funktion (`TextCodepointCount(t)` usw.).
+
+**Lebensdauer:** beide Typen sind Klassen, also Referenzen — `Free()` wirkt auf
+das Objekt des Aufrufers. Speicher wird manuell freigegeben (kein Refcount, kein
+GC); das ist bewusst so, solange Lyx kein globales RC/COW hat.
+
+**Grenze:** UTF-16 ist ausschließlich Boundary-Format (Windows-FFI,
+UTF-16-Dateien), nie internes Format. Konverter `TextFromUtf16`/`TextToUtf16`
+sind noch nicht implementiert.
+
 ### 6. Enum-Typen (v0.5.7)
 
 Enums definieren eine benannte Menge von Integer-Konstanten.

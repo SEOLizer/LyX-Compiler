@@ -8,17 +8,20 @@
 // tables, are a separate opt-in unit — not here.
 //
 // libc-free (mmap/munmap), owned bytes, byte length explicit.
+//
+// `Text` is a CLASS (it used to be a struct). That buys three things:
+//   - a method API (t.CodepointCount(), t.Trim(), …) next to the free functions,
+//   - operator overloading — `a + b`, `a == b`, `a < b`, `a[i]` (see below),
+//   - reference semantics, so a mutating method like Free() actually affects the
+//     caller's object instead of a by-value copy.
+// Every free function of the old struct API is kept as a thin wrapper, so
+// existing callers (std.unicode, std.unicode_case, std.grapheme, …) are
+// unaffected.
 
 @description("UTF-8 Text type: validated, codepoint-aware (libc-free)")
 @author("Andreas Röne")
 @copyright("2024-2026 Andreas Röne")
 unit std.text;
-
-pub type Text = struct {
-  data: int64;     // owned UTF-8 bytes
-  byteLen: int64;  // length in bytes
-  valid: int64;    // 1 if the bytes are valid UTF-8, else 0
-};
 
 fn _pcharLen(p: int64): int64 {
   if (p == 0) { return 0; }
@@ -65,79 +68,464 @@ fn _utf8Validate(ptr: int64, n: int64): int64 {
   return 1;
 }
 
+fn _isAsciiWs(b: int64): int64 {
+  if (b == 32 || b == 9 || b == 10 || b == 13) { return 1; }
+  return 0;
+}
+
+// Number of int64 slots one part occupies in the raw TextSplit output array:
+// [data:8][byteLen:8][valid:8]. Kept as an explicit constant because `Text` is a
+// class now, so sizeof(Text) is the handle size, not the field block size.
+pub con TEXT_PART_STRIDE: int64 := 24;
+
+pub type Text = class {
+  data: int64;     // owned UTF-8 bytes
+  byteLen: int64;  // length in bytes
+  valid: int64;    // 1 if the bytes are valid UTF-8, else 0
+
+  // --- constructors (call on a `new Text()`) ---------------------------------
+
+  // Copy `n` raw bytes from `ptr` and validate them as UTF-8; the `valid` flag
+  // reflects the result (the bytes are stored either way).
+  fn InitFromUtf8(ptr: int64, n: int64) {
+    var sz: int64 := n;
+    if (sz < 1) { sz := 1; }
+    self.data := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (self.data < 0) { self.data := 0; self.byteLen := 0; self.valid := 0; return; }
+    if (n > 0) { memcpy(self.data, ptr, n); }
+    self.byteLen := n;
+    self.valid := _utf8Validate(self.data, n);
+  }
+
+  fn InitFromPchar(p: int64) {
+    self.InitFromUtf8(p, _pcharLen(p));
+  }
+
+  // --- queries ---------------------------------------------------------------
+
+  fn ByteLength(): int64 { return self.byteLen; }
+  fn IsValid(): int64 { return self.valid; }
+  fn Data(): int64 { return self.data; }
+
+  // Raw byte at index `i` (0 if out of range).
+  fn ByteAt(i: int64): int64 {
+    if (i < 0 || i >= self.byteLen) { return 0; }
+    return peek8(self.data + i) & 255;
+  }
+
+  // Number of Unicode codepoints (not bytes): count of non-continuation bytes.
+  fn CodepointCount(): int64 {
+    var cnt: int64 := 0;
+    var i: int64 := 0;
+    while (i < self.byteLen) {
+      if (((peek8(self.data + i) & 255) & 192) != 128) { cnt += 1; }  // leading byte
+      i += 1;
+    }
+    return cnt;
+  }
+
+  // Byte offset of the `idx`-th codepoint (-1 if out of range).
+  fn ByteOffsetOfCodepoint(idx: int64): int64 {
+    if (idx < 0) { return 0 - 1; }
+    var seen: int64 := 0;
+    var i: int64 := 0;
+    while (i < self.byteLen) {
+      if (((peek8(self.data + i) & 255) & 192) != 128) {
+        if (seen == idx) { return i; }
+        seen += 1;
+      }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // Decode the `idx`-th codepoint (-1 if out of range).
+  fn CodepointAt(idx: int64): int64 {
+    var off: int64 := self.ByteOffsetOfCodepoint(idx);
+    if (off < 0) { return 0 - 1; }
+    var b: int64 := peek8(self.data + off) & 255;
+    if (b < 128) { return b; }
+    var extra: int64 := 0;
+    var cp: int64 := 0;
+    if (b < 224) { extra := 1; cp := b & 31; }
+    else if (b < 240) { extra := 2; cp := b & 15; }
+    else { extra := 3; cp := b & 7; }
+    var j: int64 := 1;
+    while (j <= extra) {
+      cp := (cp << 6) | (peek8(self.data + off + j) & 63);
+      j += 1;
+    }
+    return cp;
+  }
+
+  // --- deriving new Texts ----------------------------------------------------
+
+  // self ++ other, as a new Text. Two complete valid UTF-8 sequences
+  // concatenated are still valid, so no boundary re-check beyond the standard
+  // validation InitFromUtf8 does.
+  // (Operator-overloading target: a + b -> a.Add(b).)
+  fn Add(other: Text): Text {
+    var total: int64 := self.byteLen + other.byteLen;
+    var sz: int64 := total;
+    if (sz < 1) { sz := 1; }
+    var tmp: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
+    var r: Text := new Text();
+    if (tmp < 0) { r.InitFromUtf8(0, 0); return r; }
+    if (self.byteLen > 0) { memcpy(tmp, self.data, self.byteLen); }
+    if (other.byteLen > 0) { memcpy(tmp + self.byteLen, other.data, other.byteLen); }
+    r.InitFromUtf8(tmp, total);
+    munmap(tmp, sz);
+    return r;
+  }
+
+  fn Concat(other: Text): Text { return self.Add(other); }
+
+  // Substring by CODEPOINT index: `countCp` codepoints starting at codepoint
+  // `startCp` (clamped to the end). Returns a new Text. Unicode-correct — never
+  // splits a multibyte sequence.
+  fn SubstringCp(startCp: int64, countCp: int64): Text {
+    var r: Text := new Text();
+    var startByte: int64 := self.ByteOffsetOfCodepoint(startCp);
+    if (startByte < 0) { r.InitFromUtf8(0, 0); return r; }
+    var endByte: int64 := self.ByteOffsetOfCodepoint(startCp + countCp);
+    if (endByte < 0) { endByte := self.byteLen; }   // clamp past the end
+    r.InitFromUtf8(self.data + startByte, endByte - startByte);
+    return r;
+  }
+
+  // --- comparison ------------------------------------------------------------
+
+  // Byte-wise equality. NOTE: equal only for the same Unicode normalisation form
+  // (byte-equal). Normalisation-insensitive comparison needs the opt-in unicode
+  // unit.
+  fn Equals(other: Text): int64 {
+    if (self.byteLen != other.byteLen) { return 0; }
+    var i: int64 := 0;
+    while (i < self.byteLen) {
+      if ((peek8(self.data + i) & 255) != (peek8(other.data + i) & 255)) { return 0; }
+      i += 1;
+    }
+    return 1;
+  }
+
+  fn EqualsPchar(p: int64): int64 {
+    var pl: int64 := _pcharLen(p);
+    if (self.byteLen != pl) { return 0; }
+    var i: int64 := 0;
+    while (i < self.byteLen) {
+      if ((peek8(self.data + i) & 255) != (peek8(p + i) & 255)) { return 0; }
+      i += 1;
+    }
+    return 1;
+  }
+
+  // True if `self` starts with the byte sequence of `prefix`.
+  fn StartsWith(prefix: Text): int64 {
+    if (prefix.byteLen > self.byteLen) { return 0; }
+    var i: int64 := 0;
+    while (i < prefix.byteLen) {
+      if ((peek8(self.data + i) & 255) != (peek8(prefix.data + i) & 255)) { return 0; }
+      i += 1;
+    }
+    return 1;
+  }
+
+  // --- operator-overloading methods ------------------------------------------
+  // These carry the names the compiler's operator overloading looks for, so
+  // `a + b`, `a == b`, `a != b`, `a < b`, …, `a[i]` work on Text. (Add is
+  // defined above.) `Compare` is a lexicographic comparison of the UTF-8 bytes
+  // returning -1/0/1 — which for UTF-8 is the same order as comparing
+  // codepoints, so it is a real Unicode code-point ordering, not just a byte
+  // artefact. It is NOT a locale collation, and NOT normalisation-insensitive.
+
+  fn Eq(other: Text): int64 { return self.Equals(other); }                 // ==
+
+  fn Ne(other: Text): int64 {                                              // !=
+    if (self.Equals(other) != 0) { return 0; }
+    return 1;
+  }
+
+  fn Compare(other: Text): int64 {
+    var n: int64 := self.byteLen;
+    if (other.byteLen < n) { n := other.byteLen; }
+    var i: int64 := 0;
+    while (i < n) {
+      var a: int64 := peek8(self.data + i) & 255;
+      var b: int64 := peek8(other.data + i) & 255;
+      if (a < b) { return 0 - 1; }
+      if (a > b) { return 1; }
+      i += 1;
+    }
+    if (self.byteLen < other.byteLen) { return 0 - 1; }
+    if (self.byteLen > other.byteLen) { return 1; }
+    return 0;
+  }
+
+  fn Lt(other: Text): int64 { if (self.Compare(other) <  0) { return 1; } return 0; }  // <
+  fn Le(other: Text): int64 { if (self.Compare(other) <= 0) { return 1; } return 0; }  // <=
+  fn Gt(other: Text): int64 { if (self.Compare(other) >  0) { return 1; } return 0; }  // >
+  fn Ge(other: Text): int64 { if (self.Compare(other) >= 0) { return 1; } return 0; }  // >=
+
+  // a[i] -> the i-th CODEPOINT (not the i-th byte). Text is the codepoint-aware
+  // layer, so indexing it by byte would be a trap; use ByteAt for raw bytes.
+  fn Get(i: int64): int64 { return self.CodepointAt(i); }                   // a[i]
+
+  // --- interop ---------------------------------------------------------------
+
+  // Fresh NUL-terminated pchar copy (byteLen+1 bytes) the caller owns. 0 on OOM.
+  fn ToPchar(): int64 {
+    var p: int64 := mmap(0, self.byteLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (p < 0) { return 0; }
+    if (self.byteLen > 0) { memcpy(p, self.data, self.byteLen); }
+    poke8(p + self.byteLen, 0);
+    return p;
+  }
+
+  // --- ASCII case ------------------------------------------------------------
+
+  // ASCII-only upper/lower casing (A-Z <-> a-z); bytes >= 0x80 (all multibyte
+  // UTF-8 bytes) are left untouched, so the result stays valid UTF-8. Full
+  // Unicode case mapping needs the opt-in unicode / unicode_case units.
+  fn AsciiUpper(): Text {
+    var r: Text := new Text();
+    r.InitFromUtf8(self.data, self.byteLen);
+    var i: int64 := 0;
+    while (i < r.byteLen) {
+      var b: int64 := peek8(r.data + i) & 255;
+      if (b >= 97 && b <= 122) { poke8(r.data + i, b - 32); }
+      i += 1;
+    }
+    return r;
+  }
+
+  fn AsciiLower(): Text {
+    var r: Text := new Text();
+    r.InitFromUtf8(self.data, self.byteLen);
+    var i: int64 := 0;
+    while (i < r.byteLen) {
+      var b: int64 := peek8(r.data + i) & 255;
+      if (b >= 65 && b <= 90) { poke8(r.data + i, b + 32); }
+      i += 1;
+    }
+    return r;
+  }
+
+  // --- search / trim / replace / split ---------------------------------------
+
+  // Do `needle`'s bytes appear in self starting at byte offset `i`?
+  fn BytesEqAt(i: int64, needle: Text): int64 {
+    if (i + needle.byteLen > self.byteLen) { return 0; }
+    var j: int64 := 0;
+    while (j < needle.byteLen) {
+      if ((peek8(self.data + i + j) & 255) != (peek8(needle.data + j) & 255)) { return 0; }
+      j += 1;
+    }
+    return 1;
+  }
+
+  // Byte offset of the first occurrence of `needle`, or -1. Safe on UTF-8: the
+  // encoding is self-synchronising, so a byte match is always a real match.
+  fn Find(needle: Text): int64 {
+    if (needle.byteLen == 0) { return 0; }
+    if (needle.byteLen > self.byteLen) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i + needle.byteLen <= self.byteLen) {
+      if (self.BytesEqAt(i, needle) != 0) { return i; }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // Codepoint index of the first occurrence of `needle`, or -1.
+  fn FindCp(needle: Text): int64 {
+    var off: int64 := self.Find(needle);
+    if (off < 0) { return 0 - 1; }
+    var cp: int64 := 0;
+    var i: int64 := 0;
+    while (i < off) {
+      if (((peek8(self.data + i) & 255) & 192) != 128) { cp += 1; }
+      i += 1;
+    }
+    return cp;
+  }
+
+  fn Contains(needle: Text): int64 {
+    if (self.Find(needle) >= 0) { return 1; }
+    return 0;
+  }
+
+  // Trim leading/trailing ASCII whitespace (space, tab, LF, CR). ASCII bytes are
+  // < 0x80 so this never touches a multibyte sequence. Unicode whitespace
+  // trimming is for the opt-in unicode unit.
+  fn Trim(): Text {
+    var start: int64 := 0;
+    while (start < self.byteLen && _isAsciiWs(peek8(self.data + start) & 255) != 0) { start += 1; }
+    var end: int64 := self.byteLen;
+    while (end > start && _isAsciiWs(peek8(self.data + end - 1) & 255) != 0) { end -= 1; }
+    var r: Text := new Text();
+    r.InitFromUtf8(self.data + start, end - start);
+    return r;
+  }
+
+  // Replace every (non-overlapping) occurrence of `old` with `repl`; new Text.
+  // (`new` is a reserved keyword, so the replacement is named `repl`.)
+  fn Replace(old: Text, repl: Text): Text {
+    var res: Text := new Text();
+    if (old.byteLen == 0 || old.byteLen > self.byteLen) {
+      res.InitFromUtf8(self.data, self.byteLen);
+      return res;
+    }
+    // Pass 1: count occurrences to size the result exactly.
+    var count: int64 := 0;
+    var i: int64 := 0;
+    while (i + old.byteLen <= self.byteLen) {
+      if (self.BytesEqAt(i, old) != 0) { count += 1; i += old.byteLen; }
+      else { i += 1; }
+    }
+    var resultLen: int64 := self.byteLen + count * (repl.byteLen - old.byteLen);
+    var sz: int64 := resultLen;
+    if (sz < 1) { sz := 1; }
+    var buf: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (buf < 0) { res.InitFromUtf8(self.data, self.byteLen); return res; }
+    // Pass 2: build.
+    var w: int64 := 0;
+    var r: int64 := 0;
+    while (r < self.byteLen) {
+      if (r + old.byteLen <= self.byteLen && self.BytesEqAt(r, old) != 0) {
+        if (repl.byteLen > 0) { memcpy(buf + w, repl.data, repl.byteLen); }
+        w += repl.byteLen;
+        r += old.byteLen;
+      } else {
+        poke8(buf + w, peek8(self.data + r) & 255);
+        w += 1;
+        r += 1;
+      }
+    }
+    res.InitFromUtf8(buf, resultLen);
+    munmap(buf, sz);
+    return res;
+  }
+
+  // Number of parts `self` splits into on `sep` (always >= 1 for a non-empty
+  // separator). The OO counterpart to the raw Split below: SplitCount + PartAt
+  // need no caller-managed output buffer.
+  fn SplitCount(sep: Text): int64 {
+    if (sep.byteLen == 0) { return 0; }
+    var count: int64 := 0;
+    var i: int64 := 0;
+    while (i + sep.byteLen <= self.byteLen) {
+      if (self.BytesEqAt(i, sep) != 0) { count += 1; i += sep.byteLen; }
+      else { i += 1; }
+    }
+    return count + 1;
+  }
+
+  // The `idx`-th part of splitting `self` on `sep`, as a new Text (empty Text if
+  // `idx` is out of range).
+  fn PartAt(sep: Text, idx: int64): Text {
+    var r: Text := new Text();
+    if (sep.byteLen == 0 || idx < 0) { r.InitFromUtf8(0, 0); return r; }
+    var seen: int64 := 0;
+    var start: int64 := 0;
+    var i: int64 := 0;
+    while (i + sep.byteLen <= self.byteLen) {
+      if (self.BytesEqAt(i, sep) != 0) {
+        if (seen == idx) { r.InitFromUtf8(self.data + start, i - start); return r; }
+        seen += 1;
+        i += sep.byteLen;
+        start := i;
+      } else {
+        i += 1;
+      }
+    }
+    if (seen == idx) { r.InitFromUtf8(self.data + start, self.byteLen - start); return r; }
+    r.InitFromUtf8(0, 0);
+    return r;
+  }
+
+  // Split `self` on `sep`, writing up to `maxParts` raw field blocks into the
+  // array at `out` (TEXT_PART_STRIDE bytes each: [data][byteLen][valid]).
+  // Returns the total number of parts (which may exceed maxParts — only the
+  // first maxParts are written). Prefer SplitCount + PartAt; this raw form
+  // exists for callers that already manage their own buffer.
+  fn Split(sep: Text, out: int64, maxParts: int64): int64 {
+    if (sep.byteLen == 0) { return 0; }
+    var stride: int64 := TEXT_PART_STRIDE;
+    var count: int64 := 0;
+    var start: int64 := 0;
+    var i: int64 := 0;
+    while (i + sep.byteLen <= self.byteLen) {
+      if (self.BytesEqAt(i, sep) != 0) {
+        if (count < maxParts) {
+          var part: Text := new Text();
+          part.InitFromUtf8(self.data + start, i - start);
+          poke64(out + count * stride + 0,  part.data);
+          poke64(out + count * stride + 8,  part.byteLen);
+          poke64(out + count * stride + 16, part.valid);
+        }
+        count += 1;
+        i += sep.byteLen;
+        start := i;
+      } else {
+        i += 1;
+      }
+    }
+    if (count < maxParts) {
+      var last: Text := new Text();
+      last.InitFromUtf8(self.data + start, self.byteLen - start);
+      poke64(out + count * stride + 0,  last.data);
+      poke64(out + count * stride + 8,  last.byteLen);
+      poke64(out + count * stride + 16, last.valid);
+    }
+    count += 1;
+    return count;
+  }
+
+  // --- lifetime --------------------------------------------------------------
+
+  // Release the owned bytes. Now that Text is a class this really clears the
+  // caller's object — as a struct it only cleared a by-value copy.
+  fn Free() {
+    if (self.data != 0) {
+      var sz: int64 := self.byteLen;
+      if (sz < 1) { sz := 1; }
+      munmap(self.data, sz);
+    }
+    self.data := 0;
+    self.byteLen := 0;
+    self.valid := 0;
+  }
+};
+
+// ---- free-function API (unchanged surface, delegates to the methods) --------
+
 // Build a Text from `n` raw bytes at `ptr` (copied). Validates UTF-8; the
 // `valid` flag reflects the result (the bytes are stored either way).
 pub fn TextFromUtf8(ptr: int64, n: int64): Text {
-  var t: Text;
-  var sz: int64 := n;
-  if (sz < 1) { sz := 1; }
-  t.data := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
-  if (t.data < 0) { t.data := 0; t.byteLen := 0; t.valid := 0; return t; }
-  if (n > 0) { memcpy(t.data, ptr, n); }
-  t.byteLen := n;
-  t.valid := _utf8Validate(t.data, n);
+  var t: Text := new Text();
+  t.InitFromUtf8(ptr, n);
   return t;
 }
 
 // Build a Text from a NUL-terminated pchar (UTF-8).
 pub fn TextFromPchar(p: int64): Text {
-  return TextFromUtf8(p, _pcharLen(p));
+  var t: Text := new Text();
+  t.InitFromPchar(p);
+  return t;
 }
 
-pub fn TextByteLength(t: Text): int64 { return t.byteLen; }
-pub fn TextIsValid(t: Text): int64 { return t.valid; }
-pub fn TextData(t: Text): int64 { return t.data; }
+pub fn TextByteLength(t: Text): int64 { return t.ByteLength(); }
+pub fn TextIsValid(t: Text): int64 { return t.IsValid(); }
+pub fn TextData(t: Text): int64 { return t.Data(); }
 
-// Raw byte at index `i` (0 if out of range).
-pub fn TextByteAt(t: Text, i: int64): int64 {
-  if (i < 0 || i >= t.byteLen) { return 0; }
-  return peek8(t.data + i) & 255;
-}
+pub fn TextByteAt(t: Text, i: int64): int64 { return t.ByteAt(i); }
+pub fn TextCodepointCount(t: Text): int64 { return t.CodepointCount(); }
 
-// Number of Unicode codepoints (not bytes): count of non-continuation bytes.
-pub fn TextCodepointCount(t: Text): int64 {
-  var cnt: int64 := 0;
-  var i: int64 := 0;
-  while (i < t.byteLen) {
-    if (((peek8(t.data + i) & 255) & 192) != 128) { cnt += 1; }  // leading byte
-    i += 1;
-  }
-  return cnt;
-}
-
-// Byte offset of the `idx`-th codepoint (-1 if out of range).
 pub fn TextByteOffsetOfCodepoint(t: Text, idx: int64): int64 {
-  if (idx < 0) { return 0 - 1; }
-  var seen: int64 := 0;
-  var i: int64 := 0;
-  while (i < t.byteLen) {
-    if (((peek8(t.data + i) & 255) & 192) != 128) {
-      if (seen == idx) { return i; }
-      seen += 1;
-    }
-    i += 1;
-  }
-  return 0 - 1;
+  return t.ByteOffsetOfCodepoint(idx);
 }
 
-// Decode the `idx`-th codepoint (-1 if out of range).
-pub fn TextCodepointAt(t: Text, idx: int64): int64 {
-  var off: int64 := TextByteOffsetOfCodepoint(t, idx);
-  if (off < 0) { return 0 - 1; }
-  var b: int64 := peek8(t.data + off) & 255;
-  if (b < 128) { return b; }
-  var extra: int64 := 0;
-  var cp: int64 := 0;
-  if (b < 224) { extra := 1; cp := b & 31; }
-  else if (b < 240) { extra := 2; cp := b & 15; }
-  else { extra := 3; cp := b & 7; }
-  var j: int64 := 1;
-  while (j <= extra) {
-    cp := (cp << 6) | (peek8(t.data + off + j) & 63);
-    j += 1;
-  }
-  return cp;
-}
+pub fn TextCodepointAt(t: Text, idx: int64): int64 { return t.CodepointAt(idx); }
 
 // UTF-8 byte length of a single codepoint (1..4; 0 if invalid).
 pub fn CodepointUtf8Len(cp: int64): int64 {
@@ -173,240 +561,36 @@ pub fn CodepointToUtf8(cp: int64, dest: int64): int64 {
   return n;
 }
 
-// ---- operations ------------------------------------------------------------
+pub fn TextConcat(a: Text, b: Text): Text { return a.Add(b); }
 
-// Concatenate two Texts into a new Text. Two complete valid UTF-8 sequences
-// concatenated are still valid, so no boundary re-check is needed beyond the
-// standard validation TextFromUtf8 does.
-pub fn TextConcat(a: Text, b: Text): Text {
-  var total: int64 := a.byteLen + b.byteLen;
-  var sz: int64 := total;
-  if (sz < 1) { sz := 1; }
-  var tmp: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
-  if (tmp < 0) { return TextFromUtf8(0, 0); }
-  if (a.byteLen > 0) { memcpy(tmp, a.data, a.byteLen); }
-  if (b.byteLen > 0) { memcpy(tmp + a.byteLen, b.data, b.byteLen); }
-  var r: Text := TextFromUtf8(tmp, total);
-  munmap(tmp, sz);
-  return r;
-}
-
-// Substring by CODEPOINT index: `countCp` codepoints starting at codepoint
-// `startCp` (clamped to the end). Returns a new Text. Unicode-correct — never
-// splits a multibyte sequence.
 pub fn TextSubstringCp(t: Text, startCp: int64, countCp: int64): Text {
-  var startByte: int64 := TextByteOffsetOfCodepoint(t, startCp);
-  if (startByte < 0) { return TextFromUtf8(0, 0); }
-  var endByte: int64 := TextByteOffsetOfCodepoint(t, startCp + countCp);
-  if (endByte < 0) { endByte := t.byteLen; }   // clamp past the end
-  return TextFromUtf8(t.data + startByte, endByte - startByte);
+  return t.SubstringCp(startCp, countCp);
 }
 
-// Byte-wise equality. NOTE: equal only for the same Unicode normalisation form
-// (byte-equal). Normalisation-insensitive comparison needs the opt-in unicode
-// unit.
-pub fn TextEquals(a: Text, b: Text): int64 {
-  if (a.byteLen != b.byteLen) { return 0; }
-  var i: int64 := 0;
-  while (i < a.byteLen) {
-    if ((peek8(a.data + i) & 255) != (peek8(b.data + i) & 255)) { return 0; }
-    i += 1;
-  }
-  return 1;
-}
+pub fn TextEquals(a: Text, b: Text): int64 { return a.Equals(b); }
+pub fn TextEqualsPchar(t: Text, p: int64): int64 { return t.EqualsPchar(p); }
+pub fn TextStartsWith(t: Text, prefix: Text): int64 { return t.StartsWith(prefix); }
+pub fn TextCompare(a: Text, b: Text): int64 { return a.Compare(b); }
+pub fn TextToPchar(t: Text): int64 { return t.ToPchar(); }
+pub fn TextAsciiUpper(t: Text): Text { return t.AsciiUpper(); }
+pub fn TextAsciiLower(t: Text): Text { return t.AsciiLower(); }
 
-pub fn TextEqualsPchar(t: Text, p: int64): int64 {
-  var pl: int64 := _pcharLen(p);
-  if (t.byteLen != pl) { return 0; }
-  var i: int64 := 0;
-  while (i < t.byteLen) {
-    if ((peek8(t.data + i) & 255) != (peek8(p + i) & 255)) { return 0; }
-    i += 1;
-  }
-  return 1;
-}
+pub fn TextFind(t: Text, needle: Text): int64 { return t.Find(needle); }
+pub fn TextFindCp(t: Text, needle: Text): int64 { return t.FindCp(needle); }
+pub fn TextContains(t: Text, needle: Text): int64 { return t.Contains(needle); }
+pub fn TextTrim(t: Text): Text { return t.Trim(); }
 
-// True if `t` starts with the byte sequence of `prefix`.
-pub fn TextStartsWith(t: Text, prefix: Text): int64 {
-  if (prefix.byteLen > t.byteLen) { return 0; }
-  var i: int64 := 0;
-  while (i < prefix.byteLen) {
-    if ((peek8(t.data + i) & 255) != (peek8(prefix.data + i) & 255)) { return 0; }
-    i += 1;
-  }
-  return 1;
-}
-
-// Fresh NUL-terminated pchar copy (byteLen+1 bytes) the caller owns. 0 on OOM.
-pub fn TextToPchar(t: Text): int64 {
-  var p: int64 := mmap(0, t.byteLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
-  if (p < 0) { return 0; }
-  if (t.byteLen > 0) { memcpy(p, t.data, t.byteLen); }
-  poke8(p + t.byteLen, 0);
-  return p;
-}
-
-// ASCII-only upper/lower casing (A-Z <-> a-z); bytes >= 0x80 (all multibyte
-// UTF-8 bytes) are left untouched, so the result stays valid UTF-8. Full Unicode
-// case folding needs the opt-in unicode unit.
-pub fn TextAsciiUpper(t: Text): Text {
-  var r: Text := TextFromUtf8(t.data, t.byteLen);
-  var i: int64 := 0;
-  while (i < r.byteLen) {
-    var b: int64 := peek8(r.data + i) & 255;
-    if (b >= 97 && b <= 122) { poke8(r.data + i, b - 32); }
-    i += 1;
-  }
-  return r;
-}
-
-pub fn TextAsciiLower(t: Text): Text {
-  var r: Text := TextFromUtf8(t.data, t.byteLen);
-  var i: int64 := 0;
-  while (i < r.byteLen) {
-    var b: int64 := peek8(r.data + i) & 255;
-    if (b >= 65 && b <= 90) { poke8(r.data + i, b + 32); }
-    i += 1;
-  }
-  return r;
-}
-
-// ---- search / trim / replace / split ---------------------------------------
-
-// Do `needle`'s bytes appear in `t` starting at byte offset `i`?
-fn _bytesEqAt(t: Text, i: int64, needle: Text): int64 {
-  if (i + needle.byteLen > t.byteLen) { return 0; }
-  var j: int64 := 0;
-  while (j < needle.byteLen) {
-    if ((peek8(t.data + i + j) & 255) != (peek8(needle.data + j) & 255)) { return 0; }
-    j += 1;
-  }
-  return 1;
-}
-
-// Byte offset of the first occurrence of `needle`, or -1. Safe on UTF-8: the
-// encoding is self-synchronising, so a byte match is always a real match.
-pub fn TextFind(t: Text, needle: Text): int64 {
-  if (needle.byteLen == 0) { return 0; }
-  if (needle.byteLen > t.byteLen) { return 0 - 1; }
-  var i: int64 := 0;
-  while (i + needle.byteLen <= t.byteLen) {
-    if (_bytesEqAt(t, i, needle) != 0) { return i; }
-    i += 1;
-  }
-  return 0 - 1;
-}
-
-// Codepoint index of the first occurrence of `needle`, or -1.
-pub fn TextFindCp(t: Text, needle: Text): int64 {
-  var off: int64 := TextFind(t, needle);
-  if (off < 0) { return 0 - 1; }
-  var cp: int64 := 0;
-  var i: int64 := 0;
-  while (i < off) {
-    if (((peek8(t.data + i) & 255) & 192) != 128) { cp += 1; }
-    i += 1;
-  }
-  return cp;
-}
-
-pub fn TextContains(t: Text, needle: Text): int64 {
-  if (TextFind(t, needle) >= 0) { return 1; }
-  return 0;
-}
-
-fn _isAsciiWs(b: int64): int64 {
-  if (b == 32 || b == 9 || b == 10 || b == 13) { return 1; }
-  return 0;
-}
-
-// Trim leading/trailing ASCII whitespace (space, tab, LF, CR). ASCII bytes are
-// < 0x80 so this never touches a multibyte sequence. Unicode whitespace trimming
-// is for the opt-in unicode unit.
-pub fn TextTrim(t: Text): Text {
-  var start: int64 := 0;
-  while (start < t.byteLen && _isAsciiWs(peek8(t.data + start) & 255) != 0) { start += 1; }
-  var end: int64 := t.byteLen;
-  while (end > start && _isAsciiWs(peek8(t.data + end - 1) & 255) != 0) { end -= 1; }
-  return TextFromUtf8(t.data + start, end - start);
-}
-
-// Replace every (non-overlapping) occurrence of `old` with `repl`; new Text.
-// (`new` is a reserved keyword, so the replacement is named `repl`.)
 pub fn TextReplace(t: Text, old: Text, repl: Text): Text {
-  if (old.byteLen == 0 || old.byteLen > t.byteLen) { return TextFromUtf8(t.data, t.byteLen); }
-  // Pass 1: count occurrences to size the result exactly.
-  var count: int64 := 0;
-  var i: int64 := 0;
-  while (i + old.byteLen <= t.byteLen) {
-    if (_bytesEqAt(t, i, old) != 0) { count += 1; i += old.byteLen; }
-    else { i += 1; }
-  }
-  var resultLen: int64 := t.byteLen + count * (repl.byteLen - old.byteLen);
-  var sz: int64 := resultLen;
-  if (sz < 1) { sz := 1; }
-  var buf: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
-  if (buf < 0) { return TextFromUtf8(t.data, t.byteLen); }
-  // Pass 2: build.
-  var w: int64 := 0;
-  var r: int64 := 0;
-  while (r < t.byteLen) {
-    if (r + old.byteLen <= t.byteLen && _bytesEqAt(t, r, old) != 0) {
-      if (repl.byteLen > 0) { memcpy(buf + w, repl.data, repl.byteLen); }
-      w += repl.byteLen;
-      r += old.byteLen;
-    } else {
-      poke8(buf + w, peek8(t.data + r) & 255);
-      w += 1;
-      r += 1;
-    }
-  }
-  var res: Text := TextFromUtf8(buf, resultLen);
-  munmap(buf, sz);
-  return res;
+  return t.Replace(old, repl);
 }
 
-// Split `t` on `sep`, writing up to `maxParts` Text structs into the array at
-// `out` (each sizeof(Text) bytes). Returns the total number of parts (which may
-// exceed maxParts — only the first maxParts are written).
+// Split `t` on `sep`, writing up to `maxParts` raw field blocks into the array
+// at `out` (TEXT_PART_STRIDE bytes each). Returns the total number of parts.
 pub fn TextSplit(t: Text, sep: Text, out: int64, maxParts: int64): int64 {
-  if (sep.byteLen == 0) { return 0; }
-  var stride: int64 := sizeof(Text);
-  var count: int64 := 0;
-  var start: int64 := 0;
-  var i: int64 := 0;
-  while (i + sep.byteLen <= t.byteLen) {
-    if (_bytesEqAt(t, i, sep) != 0) {
-      if (count < maxParts) {
-        var part: Text := TextFromUtf8(t.data + start, i - start);
-        poke64(out + count * stride + 0,  part.data);
-        poke64(out + count * stride + 8,  part.byteLen);
-        poke64(out + count * stride + 16, part.valid);
-      }
-      count += 1;
-      i += sep.byteLen;
-      start := i;
-    } else {
-      i += 1;
-    }
-  }
-  if (count < maxParts) {
-    var last: Text := TextFromUtf8(t.data + start, t.byteLen - start);
-    poke64(out + count * stride + 0,  last.data);
-    poke64(out + count * stride + 8,  last.byteLen);
-    poke64(out + count * stride + 16, last.valid);
-  }
-  count += 1;
-  return count;
+  return t.Split(sep, out, maxParts);
 }
 
-pub fn TextFree(t: Text) {
-  if (t.data != 0) {
-    var sz: int64 := t.byteLen;
-    if (sz < 1) { sz := 1; }
-    munmap(t.data, sz);
-  }
-  t.data := 0;
-  t.byteLen := 0;
-  t.valid := 0;
-}
+pub fn TextSplitCount(t: Text, sep: Text): int64 { return t.SplitCount(sep); }
+pub fn TextPartAt(t: Text, sep: Text, idx: int64): Text { return t.PartAt(sep, idx); }
+
+pub fn TextFree(t: Text) { t.Free(); }
