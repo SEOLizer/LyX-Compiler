@@ -12,101 +12,135 @@ import std.alloc;
 pub type Process = int64;
 pub type ExitCode = int64;
 
-extern fn fork(): int64;
-extern fn execve(path: pchar, argv: pchar, envp: pchar): int64;
-extern fn execvp(path: pchar, argv: pchar): int64;
-extern fn waitpid(pid: int64, status: int64, options: int64): int64;
-extern fn kill(pid: int64, sig: int64): int64;
-extern fn getpid(): int64;
+// Prozess-Primitive kommen aus den Compiler-Builtins (sys_fork/sys_execve/
+// sys_wait4/sys_kill/sys_getpid), nicht aus rohem FFI. `execve`/`execvp` stehen
+// auf der harten FFI-Blacklist — beliebiges exec über ein dynamisch gelinktes
+// Symbol ist ein Sandbox-Escape —, weshalb diese Unit sich zuvor überhaupt nicht
+// übersetzen ließ. Über die Builtins geht derselbe Syscall durch den
+// kontrollierten Pfad des Compilers.
 
 pub con WNOHANG: int64 := 1;
 pub con SIGTERM: int64 := 15;
 pub con SIGKILL: int64 := 9;
 
+// argv für execve: NULL-terminiertes Array aus Zeigern. Die frühere Fassung
+// übergab den Programmpfad direkt als argv (`execve(prog, prog, 0)`) — das ist
+// kein Zeiger-Array, der Aufruf wäre auch mit erlaubtem FFI fehlgeschlagen.
+fn _argv1(prog: pchar): int64 {
+  var v: int64 := alloc(16);
+  poke64(v, prog as int64);
+  poke64(v + 8, 0);
+  return v;
+}
+
+// argv für `/bin/sh -c <cmd>`: {"/bin/sh", "-c", cmd, NULL}
+fn _argvShell(cmd: pchar): int64 {
+  var v: int64 := alloc(32);
+  poke64(v,      "/bin/sh" as int64);
+  poke64(v + 8,  "-c" as int64);
+  poke64(v + 16, cmd as int64);
+  poke64(v + 24, 0);
+  return v;
+}
+
+// wait4 schreibt den Status an eine Adresse. Die frühere Fassung übergab die
+// Zahl 0 als „Zeiger" und las den Status nie zurück — Exit-Codes waren damit
+// immer 0. Hier: 8-Byte-Puffer, Status auslesen, Exit-Code extrahieren.
+fn _waitStatus(pid: int64, options: int64, outCode: int64): int64 {
+  var st: int64 := alloc(8);
+  poke64(st, 0);
+  var r: int64 := sys_wait4(pid, st, options);
+  var raw: int64 := peek64(st);
+  free(st, 8);
+  poke64(outCode, (raw >> 8) & 255);
+  return r;
+}
+
 pub fn spawn(prog: pchar): Process {
-  var pid: int64 := fork();
+  var pid: int64 := sys_fork();
   if (pid < 0) {
-    return -1;
+    return 0 - 1;
   }
   if (pid == 0) {
-    execve(prog, prog, 0);
-    return -1;
+    sys_execve(prog as int64, _argv1(prog), 0);
+    exit(127);          // execve gescheitert: Kind muss enden
+    return 0 - 1;
   }
   return pid;
 }
 
 pub fn run(prog: pchar): ExitCode {
-  var pid: int64 := fork();
+  var pid: int64 := sys_fork();
   if (pid < 0) {
-    return -1;
+    return 0 - 1;
   }
   if (pid == 0) {
-    execve(prog, prog, 0);
-    return -1;
+    sys_execve(prog as int64, _argv1(prog), 0);
+    exit(127);
+    return 0 - 1;
   }
-  var status: int64 := 0;
-  waitpid(pid, status, 0);
-  var shifted: int64 := status >> 8;
-  var code: int64 := shifted & 255;
+  var codeBuf: int64 := alloc(8);
+  _waitStatus(pid, 0, codeBuf);
+  var code: int64 := peek64(codeBuf);
+  free(codeBuf, 8);
   return code;
 }
 
 pub fn wait_for(pid: int64): ExitCode {
-  var status: int64 := 0;
-  waitpid(pid, status, 0);
-  var shifted: int64 := status >> 8;
-  var code: int64 := shifted & 255;
+  var codeBuf: int64 := alloc(8);
+  _waitStatus(pid, 0, codeBuf);
+  var code: int64 := peek64(codeBuf);
+  free(codeBuf, 8);
   return code;
 }
 
 pub fn try_wait(pid: int64): ExitCode {
-  var status: int64 := 0;
-  var result: int64 := waitpid(pid, status, WNOHANG);
-  if (result == 0) {
-    return -2;
-  }
-  if (result < 0) {
-    return -1;
-  }
-  var shifted: int64 := status >> 8;
-  var code: int64 := shifted & 255;
+  var codeBuf: int64 := alloc(8);
+  var result: int64 := _waitStatus(pid, WNOHANG, codeBuf);
+  var code: int64 := peek64(codeBuf);
+  free(codeBuf, 8);
+  if (result == 0) { return 0 - 2; }     // läuft noch
+  if (result < 0)  { return 0 - 1; }
   return code;
 }
 
 pub fn proc_kill(pid: int64, sig: int64): int64 {
-  return kill(pid, sig);
+  return sys_kill(pid, sig);
 }
 
 pub fn terminate(pid: int64): int64 {
-  return kill(pid, SIGTERM);
+  return sys_kill(pid, SIGTERM);
 }
 
 pub fn terminate_force(pid: int64): int64 {
-  return kill(pid, SIGKILL);
+  return sys_kill(pid, SIGKILL);
 }
 
 pub fn is_running(pid: int64): bool {
-  var status: int64 := 0;
-  return waitpid(pid, status, WNOHANG) == 0;
+  var codeBuf: int64 := alloc(8);
+  var r: int64 := _waitStatus(pid, WNOHANG, codeBuf);
+  free(codeBuf, 8);
+  return r == 0;
 }
 
 pub fn self_pid(): int64 {
-  return getpid();
+  return sys_getpid();
 }
 
 pub fn shell(cmd: pchar): ExitCode {
-  var pid: int64 := fork();
+  var pid: int64 := sys_fork();
   if (pid < 0) {
-    return -1;
+    return 0 - 1;
   }
   if (pid == 0) {
-    execve("/bin/sh", "-c", cmd);
-    return -1;
+    sys_execve("/bin/sh" as int64, _argvShell(cmd), 0);
+    exit(127);
+    return 0 - 1;
   }
-  var status: int64 := 0;
-  waitpid(pid, status, 0);
-  var shifted: int64 := status >> 8;
-  var code: int64 := shifted & 255;
+  var codeBuf: int64 := alloc(8);
+  _waitStatus(pid, 0, codeBuf);
+  var code: int64 := peek64(codeBuf);
+  free(codeBuf, 8);
   return code;
 }
 
@@ -143,7 +177,7 @@ pub fn SpawnWithPipes(prog: pchar, stdinFdOut: int64, stdoutFdOut: int64): int64
     return -1;
   }
 
-  var pid: int64 := fork();
+  var pid: int64 := sys_fork();
 
   if (pid < 0) {
     // fork fehlgeschlagen — alle fds schließen
@@ -161,9 +195,9 @@ pub fn SpawnWithPipes(prog: pchar, stdinFdOut: int64, stdoutFdOut: int64): int64
     // Pipe-Enden des Kindes schließen (dup2 hat Kopien angelegt)
     close(peek64(stdinRead));  close(peek64(stdinWrite));
     close(peek64(stdoutRead)); close(peek64(stdoutWrite));
-    execve(prog, prog, 0);
+    sys_execve(prog as int64, _argv1(prog), 0);
     // execve scheitert: Kind beendet sich
-    sys_exit_group(1);
+    exit(1);
     return 0;
   }
 

@@ -2,6 +2,27 @@
 
 ## Unveröffentlicht (develop)
 
+### `std.process` auf Compiler-Builtins umgestellt (#960)
+- **Compile-Sweep jetzt 92 OK / 0 failed** — die letzte nicht übersetzbare Unit.
+- `std/process.lyx` deklarierte `execve`/`execvp` als rohes FFI. Beide stehen auf
+  der harten FFI-Blacklist (beliebiges exec über ein dynamisch gelinktes Symbol
+  ist ein Sandbox-Escape), die Unit ließ sich deshalb gar nicht übersetzen.
+  Umgestellt auf die bereits vorhandenen Builtins `sys_fork`, `sys_execve`,
+  `sys_wait4`, `sys_kill`, `sys_getpid` — derselbe Syscall, aber über den
+  kontrollierten Pfad des Compilers. **Die Blacklist bleibt unangetastet.**
+- **Zwei Laufzeitfehler mitgefixt**, die beim Compilieren nie auffielen:
+  - `execve(prog, prog, 0)` übergab den Pfad als `argv`; `argv` muss ein
+    NULL-terminiertes Zeiger-Array sein. Der Aufruf wäre auch mit erlaubtem FFI
+    gescheitert. Jetzt echte argv-Arrays (`_argv1`, `_argvShell`).
+  - `waitpid(pid, status, 0)` übergab die **Zahl** 0 als Status-Zeiger und las
+    den Status nie zurück → Exit-Codes waren immer 0. Jetzt 8-Byte-Puffer.
+  - `sys_exit_group` ist in sema registriert, hat aber keine Codegen-Umsetzung →
+    `exit()` verwendet.
+- Neuer Test `tests/process_unit_test.lyx` (8 Prüfungen), in `make test`: prüft
+  gegen echte Prozesse (`run /bin/true` = 0, `/bin/false` = 1, `shell "exit 7"`
+  = 7, fehlendes Programm = 127, spawn/wait_for). Nur so sind beide Fehler oben
+  sichtbar — am Compilieren nicht.
+
 ### Compiler — FFI-Trust für `--compile-unit` (#960)
 - **`--compile-unit` auf einer stdlib-Unit gilt jetzt als vertrauenswürdig**,
   genau wie dieselbe Unit beim Import. Vorher war sie als **Root**-Modul
