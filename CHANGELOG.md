@@ -64,6 +64,22 @@
   Geometrie-/Result-Units gegen erwartete Zahlen — „kompiliert durch" genügt bei
   einem mechanischen Umbau nicht.
 
+### Compiler (Codegen) — statischer Methodenaufruf (#958)
+- **`TypeName.Method(args)` übergab die Argumente um ein Register verschoben.**
+  Der Callee `TypeName_Method` hat immer ein implizites `self` als ersten
+  Parameter; der statische Aufruf ließ diesen Slot weg. Dadurch landete das erste
+  echte Argument in `self` und der erste Parameter bekam Müll — `SB.Create(41)`
+  lieferte 169 statt 42, in `src/std/string.lyx` reichte es für einen SIGSEGV.
+- Fix: der statische Aufruf reserviert den self-Slot und übergibt **0**. Dass die
+  Methode `self` nicht anfassen darf, prüft sema bereits (BUG-6-Check).
+  Betrifft beide Pfade — Registerargumente und den Stack-Spill ab 7 Slots.
+- Damit ist das Static-Factory-Muster (`StringBuilder.Create(256)`) erstmals
+  funktionsfähig; es war seit jeher fehlerhaft, nur bisher nicht isoliert.
+- Neuer Test `tests/static_method_codegen_test.lyx` (10 Prüfungen), in
+  `make test`: statische Aufrufe mit 0/1/2/5/7 Argumenten, dieselben Aufrufe über
+  eine Instanz, und `self`-Integrität nach einem statischen Aufruf. Gegen den
+  Vorgänger-Compiler schlagen genau die vier statischen Fälle fehl.
+
 ### Compiler (sema)
 - **`TypeName.Method()` wird abgelehnt, wenn die Methode `self` benutzt** — dann
   fehlt der Empfänger und die Methode arbeitete an einer beliebigen Adresse
