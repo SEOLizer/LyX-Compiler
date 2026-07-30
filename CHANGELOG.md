@@ -35,6 +35,16 @@ Reine Standardbibliothek — kein Compiler-Change.
 - Die beiden Achsen sind bewusst getrennt (Fold ≠ normalisierungs-insensitiv):
   beide Tabellen-Units zusammen sprengen das Kompilierungs-Größenlimit von `lyxc`.
 
+- **`std.text` UTF-16-Boundary-Konverter**: `TextFromUtf16` /
+  `TextFromUtf16Bom` / `TextUtf16Length` / `TextToUtf16` / `TextToUtf16Bom`,
+  Byte-Reihenfolge über `UTF16_BE` / `UTF16_LE`. Surrogate-Paare in beide
+  Richtungen; fehlerhafte Eingabe (unpaariges High-/Low-Surrogate,
+  abgeschnittenes Paar, ungerades Rest-Byte) wird zu U+FFFD statt zum Fehler,
+  das Ergebnis bleibt also gültiges UTF-8. BOM wird erkannt und entfernt bzw.
+  auf Wunsch geschrieben; ohne BOM gilt Big-Endian (RFC 2781). Tabellenfrei.
+  Damit ist der letzte offene Punkt der Encoding-Entscheidung erledigt — UTF-16
+  bleibt reines Grenzformat, intern ist alles UTF-8.
+
 ### Doku / Beispiele
 - **`examples/basics/text_operators.lyx`**: Showcase für `Text` (Methoden,
   Operatoren, Codepoint- vs. Byte-Indizierung).
@@ -47,8 +57,8 @@ Reine Standardbibliothek — kein Compiler-Change.
 - Ein Methodenaufruf auf einem Methoden-*Ergebnis* (`t.Trim().ByteLength()`) ist
   noch keine Dispatch-Stelle (vgl. `ebnf.md` §15.3, letzter Absatz) —
   Zwischenergebnis an eine Variable binden.
-- `TextFromUtf16`/`TextToUtf16` (Boundary-Konverter laut Encoding-Entscheidung)
-  fehlen noch.
+- Volles Case-Folding mit 1:n-Expansion (ß→ss, ﬁ→fi) ist nicht abgedeckt; die
+  simple 1:1-Faltung kann das nicht ausdrücken.
 
 Verifiziert: `make test` 20 PASS / 0 FAIL; Smoke-Test über Methoden, Operatoren
 und Free-Function-Wrapper; `std.unicode`/`std.unicode_case`/`std.grapheme` laufen

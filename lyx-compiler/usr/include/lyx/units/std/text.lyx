@@ -73,6 +73,46 @@ fn _isAsciiWs(b: int64): int64 {
   return 0;
 }
 
+// ---- UTF-16 boundary helpers ------------------------------------------------
+//
+// UTF-16 is a BOUNDARY format only (Windows FFI, UTF-16 files) — never Lyx's
+// internal representation. Everything inside stays UTF-8.
+
+// Byte order for the UTF-16 converters.
+pub con UTF16_BE: int64 := 0;
+pub con UTF16_LE: int64 := 1;
+
+// U+FFFD REPLACEMENT CHARACTER — what malformed UTF-16 (unpaired surrogate,
+// truncated sequence, odd trailing byte) decodes to. Substituting keeps the
+// resulting Text valid UTF-8 instead of propagating the damage.
+pub con UNICODE_REPLACEMENT: int64 := 65533;
+
+// Read the UTF-16 code unit at byte offset `off`.
+fn _u16At(ptr: int64, off: int64, endian: int64): int64 {
+  var b0: int64 := peek8(ptr + off) & 255;
+  var b1: int64 := peek8(ptr + off + 1) & 255;
+  if (endian == UTF16_LE) { return (b1 << 8) | b0; }
+  return (b0 << 8) | b1;
+}
+
+// Write the UTF-16 code unit `u` at byte offset `off`.
+fn _u16Put(dest: int64, off: int64, u: int64, endian: int64) {
+  var hi: int64 := (u >> 8) & 255;
+  var lo: int64 := u & 255;
+  if (endian == UTF16_LE) { poke8(dest + off, lo); poke8(dest + off + 1, hi); }
+  else { poke8(dest + off, hi); poke8(dest + off + 1, lo); }
+}
+
+fn _isHighSurrogate(u: int64): int64 {
+  if (u >= 55296 && u <= 56319) { return 1; }      // U+D800..U+DBFF
+  return 0;
+}
+
+fn _isLowSurrogate(u: int64): int64 {
+  if (u >= 56320 && u <= 57343) { return 1; }      // U+DC00..U+DFFF
+  return 0;
+}
+
 // Number of int64 slots one part occupies in the raw TextSplit output array:
 // [data:8][byteLen:8][valid:8]. Kept as an explicit constant because `Text` is a
 // class now, so sizeof(Text) is the handle size, not the field block size.
@@ -279,6 +319,65 @@ pub type Text = class {
     if (self.byteLen > 0) { memcpy(p, self.data, self.byteLen); }
     poke8(p + self.byteLen, 0);
     return p;
+  }
+
+  // --- UTF-16 boundary (encode) ----------------------------------------------
+
+  // Bytes a UTF-16 encoding of self would need, WITHOUT a BOM. Call this to
+  // size the destination buffer before Utf16Encode — the count is not
+  // derivable from ByteLength (UTF-8 and UTF-16 disagree per codepoint in both
+  // directions: ASCII is 1 vs 2 bytes, U+0800..U+FFFF is 3 vs 2).
+  fn Utf16Length(): int64 {
+    var n: int64 := 0;
+    var i: int64 := 0;
+    while (i < self.byteLen) {
+      var b: int64 := peek8(self.data + i) & 255;
+      var clen: int64 := 1;
+      var cp: int64 := b;
+      if (b >= 240) { clen := 4; cp := 65536; }        // >= U+10000 -> surrogate pair
+      else if (b >= 224) { clen := 3; cp := 2048; }
+      else if (b >= 192) { clen := 2; cp := 128; }
+      if (cp >= 65536) { n += 4; } else { n += 2; }
+      i += clen;
+    }
+    return n;
+  }
+
+  // Encode self as UTF-16 into `dest` (no BOM); returns the bytes written.
+  // `dest` must hold at least Utf16Length() bytes. Codepoints above U+FFFF
+  // become a surrogate pair, which is the one place UTF-16 is variable-width —
+  // and the reason indexing UTF-16 by code unit is a trap.
+  fn Utf16Encode(dest: int64, endian: int64): int64 {
+    var w: int64 := 0;
+    var i: int64 := 0;
+    while (i < self.byteLen) {
+      var b: int64 := peek8(self.data + i) & 255;
+      var clen: int64 := 1;
+      var cp: int64 := b;
+      if (b >= 240) {
+        clen := 4;
+        cp := ((b & 7) << 18) | ((peek8(self.data + i + 1) & 63) << 12)
+              | ((peek8(self.data + i + 2) & 63) << 6) | (peek8(self.data + i + 3) & 63);
+      } else if (b >= 224) {
+        clen := 3;
+        cp := ((b & 15) << 12) | ((peek8(self.data + i + 1) & 63) << 6)
+              | (peek8(self.data + i + 2) & 63);
+      } else if (b >= 192) {
+        clen := 2;
+        cp := ((b & 31) << 6) | (peek8(self.data + i + 1) & 63);
+      }
+      if (cp >= 65536) {
+        var v: int64 := cp - 65536;
+        _u16Put(dest, w, 55296 | ((v >> 10) & 1023), endian);        // high surrogate
+        _u16Put(dest, w + 2, 56320 | (v & 1023), endian);            // low surrogate
+        w += 4;
+      } else {
+        _u16Put(dest, w, cp, endian);
+        w += 2;
+      }
+      i += clen;
+    }
+    return w;
   }
 
   // --- ASCII case ------------------------------------------------------------
@@ -594,3 +693,86 @@ pub fn TextSplitCount(t: Text, sep: Text): int64 { return t.SplitCount(sep); }
 pub fn TextPartAt(t: Text, sep: Text, idx: int64): Text { return t.PartAt(sep, idx); }
 
 pub fn TextFree(t: Text) { t.Free(); }
+
+// ---- UTF-16 boundary converters --------------------------------------------
+//
+// Only for the boundary: reading UTF-16 files, talking to the Windows API.
+// Nothing inside Lyx stores UTF-16 — see the UTF-8-canonical encoding decision.
+
+// Decode `byteLen` bytes of UTF-16 at `ptr` into a Text (UTF-8).
+//
+// Malformed input does not fail — it yields U+FFFD, one per offending code
+// unit: an unpaired high surrogate (no low surrogate follows), a stray low
+// surrogate, a truncated pair at the end of the buffer, and a trailing odd
+// byte. That keeps the result valid UTF-8; check for U+FFFD if you need to
+// reject bad input rather than substitute.
+pub fn TextFromUtf16(ptr: int64, byteLen: int64, endian: int64): Text {
+  var units: int64 := byteLen / 2;
+  var sz: int64 := units * 4 + 4;                 // worst case 4 UTF-8 bytes per unit
+  var buf: int64 := mmap(0, sz, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf < 0) { return TextFromUtf8(0, 0); }
+  var w: int64 := 0;
+  var i: int64 := 0;
+  while (i < units) {
+    var u: int64 := _u16At(ptr, i * 2, endian);
+    var cp: int64 := u;
+    if (_isHighSurrogate(u) != 0) {
+      if (i + 1 < units) {
+        var lo: int64 := _u16At(ptr, (i + 1) * 2, endian);
+        if (_isLowSurrogate(lo) != 0) {
+          cp := 65536 + (((u - 55296) << 10) | (lo - 56320));
+          i += 1;                                  // consumed the pair
+        } else {
+          cp := UNICODE_REPLACEMENT;               // high surrogate, no low
+        }
+      } else {
+        cp := UNICODE_REPLACEMENT;                 // truncated pair
+      }
+    } else if (_isLowSurrogate(u) != 0) {
+      cp := UNICODE_REPLACEMENT;                   // stray low surrogate
+    }
+    w += CodepointToUtf8(cp, buf + w);
+    i += 1;
+  }
+  if (byteLen - units * 2 != 0) {                  // odd trailing byte
+    w += CodepointToUtf8(UNICODE_REPLACEMENT, buf + w);
+  }
+  var r: Text := TextFromUtf8(buf, w);
+  munmap(buf, sz);
+  return r;
+}
+
+// Like TextFromUtf16, but takes the byte order from a leading BOM and strips
+// it: U+FEFF -> big endian, U+FFFE -> little endian. With NO BOM the input is
+// read as BIG endian, per RFC 2781 for plain "UTF-16" — note that this is the
+// opposite of what most Windows-produced files without a BOM actually are, so
+// pass the endianness explicitly when you know it.
+pub fn TextFromUtf16Bom(ptr: int64, byteLen: int64): Text {
+  if (byteLen >= 2) {
+    var b0: int64 := peek8(ptr) & 255;
+    var b1: int64 := peek8(ptr + 1) & 255;
+    if (b0 == 254 && b1 == 255) {                  // FE FF -> BE BOM
+      return TextFromUtf16(ptr + 2, byteLen - 2, UTF16_BE);
+    }
+    if (b0 == 255 && b1 == 254) {                  // FF FE -> LE BOM
+      return TextFromUtf16(ptr + 2, byteLen - 2, UTF16_LE);
+    }
+  }
+  return TextFromUtf16(ptr, byteLen, UTF16_BE);
+}
+
+// Bytes a UTF-16 encoding of `t` needs, without a BOM (add 2 for one).
+pub fn TextUtf16Length(t: Text): int64 { return t.Utf16Length(); }
+
+// Encode `t` as UTF-16 into `dest` (no BOM); returns bytes written.
+pub fn TextToUtf16(t: Text, dest: int64, endian: int64): int64 {
+  return t.Utf16Encode(dest, endian);
+}
+
+// Encode `t` as UTF-16 into `dest`, prefixed with a U+FEFF BOM in the chosen
+// byte order; returns bytes written (BOM included). `dest` needs
+// TextUtf16Length(t) + 2 bytes.
+pub fn TextToUtf16Bom(t: Text, dest: int64, endian: int64): int64 {
+  _u16Put(dest, 0, 65279, endian);                 // U+FEFF
+  return 2 + t.Utf16Encode(dest + 2, endian);
+}
