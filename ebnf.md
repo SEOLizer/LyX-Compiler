@@ -847,8 +847,14 @@ Resolution rules:
     int/f64/pchar operators and normal array/pchar indexing are unaffected.
   - `!=` additionally falls back to negating `.Eq` when no `.Ne` is defined.
 
-Method calls as the left operand (return type receiver-dependent) are not
-resolved to overloads.
+A method call is also a valid left operand and a valid receiver: its class is
+resolved through the receiver's class plus the declared return type, so
+`a.M() + b`, `a.M() == b`, `a.M()[i]` and chains like `t.Trim().ByteLength()`
+work. Chains resolve recursively, so the receiver may itself be a method call
+or a free function returning a class.
+
+An operand whose class cannot be determined statically keeps the operator's
+built-in meaning; there is no runtime fallback.
 ```
 
 ---
