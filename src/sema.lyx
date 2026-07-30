@@ -1328,7 +1328,21 @@ pub type Sema = class {
       var isMethod: int64 := self.sn_iVal(ni);
       if (isMethod == 1) {
         // Method call: obj.method(args) — check object, then args
-        self._checkExpr(self.sn_c0(ni));
+        // BUG-6: Der Empfänger muss eine Instanz sein, kein Typname. `Pair.Method()`
+        // wurde bisher stillschweigend akzeptiert und mit undefiniertem self
+        // ausgeführt. Feldzugriff `Pair.second` (Byte-Offset) bleibt gültig — das ist
+        // ein dokumentiertes Pattern und ein anderer Knoten (SNK_FIELD), hier greift
+        // nur der Aufruf-Zweig.
+        var recv: int64 := self.sn_c0(ni);
+        if (recv >= 0 && self.sn_kind(recv) == SNK_IDENT) {
+          var rnm: pchar := self.sn_sVal(recv);
+          var rnl: int64 := self.sn_sLen(recv);
+          var rsi: int64 := self.Lookup(rnm, rnl);
+          if (rsi >= 0 && self.SymKind(rsi) == SYM_TYPE) {
+            self._checkStaticMethodCall(ni, rsi, rnm, rnl);
+          }
+        }
+        self._checkExpr(recv);
         var arg: int64 := self.sn_c1(ni);
         while (arg >= 0) { self._checkExpr(arg); arg := self.sn_next(arg); }
       } else {
@@ -2905,6 +2919,58 @@ pub type Sema = class {
       i += 1;
     }
     return -1;
+  }
+
+  // BUG-6: Rekursiv prüfen, ob ein Methodenrumpf `self` verwendet.
+  // Läuft über c0/c1/c2 und die next-Kette; verschachtelte SNK_FUNC_DECL werden
+  // nicht betreten (eigener self-Kontext).
+  fn _usesSelf(ni: int64, depth: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (depth > 64) { return 1; }   // zu tief → konservativ „benutzt self"
+    var n: int64 := ni;
+    while (n >= 0) {
+      var k: int64 := self.sn_kind(n);
+      if (k == SNK_IDENT) {
+        if (self._strNEq(self.sn_sVal(n), self.sn_sLen(n), "self"c, 4)) { return 1; }
+      }
+      if (k != SNK_FUNC_DECL || n == ni) {
+        if (self._usesSelf(self.sn_c0(n), depth + 1) != 0) { return 1; }
+        if (self._usesSelf(self.sn_c1(n), depth + 1) != 0) { return 1; }
+        if (self._usesSelf(self.sn_c2(n), depth + 1) != 0) { return 1; }
+      }
+      n := self.sn_next(n);
+    }
+    return 0;
+  }
+
+  // BUG-6: `TypeName.Method(args)` — Aufruf über den Typnamen statt über eine Instanz.
+  //
+  // Das ist NICHT pauschal ungültig: statische Factory-Methoden sind ein etabliertes
+  // Pattern (z.B. `StringBuilder.Create(256)` in src/std/string.lyx) — sie allozieren
+  // selbst und rühren `self` nie an. Verboten ist nur der Fall, in dem die Methode
+  // `self` tatsächlich benutzt: dann läuft sie mit undefiniertem Empfänger und
+  // schreibt/liest an einer beliebigen Adresse. Genau das beschrieb BUG-6.
+  //
+  // Importierte Typen tragen SymNodeIdx -2 (siehe Import-Pass), deren Rümpfe sind hier
+  // nicht sichtbar → übersprungen, lieber ungeprüft als falsch-positiv.
+  fn _checkStaticMethodCall(callNi: int64, typeSi: int64, tname: pchar, tlen: int64): void {
+    var declNi: int64 := self.SymNodeIdx(typeSi);
+    if (declNi < 0) { return; }
+    if (self.sn_kind(declNi) != SNK_TYPE_DECL) { return; }
+    var mname: pchar := self.sn_sVal(callNi);
+    var mlen: int64 := self.sn_sLen(callNi);
+    var mth: int64 := self.sn_c1(declNi);
+    while (mth >= 0) {
+      if (self.sn_kind(mth) == SNK_FUNC_DECL) {
+        if (self._strNEq(self.sn_sVal(mth), self.sn_sLen(mth), mname, mlen)) {
+          if (self._usesSelf(self.sn_c2(mth), 0) != 0) {
+            self._errorNodeName("Methode benutzt 'self' und braucht eine Instanz — Aufruf ueber den Typnamen", callNi, mname, mlen);
+          }
+          return;
+        }
+      }
+      mth := self.sn_next(mth);
+    }
   }
 
   // WP-L7: Prüft ob curFuncCapBuf alle von @uses_caller_cap geforderten Caps enthält.
