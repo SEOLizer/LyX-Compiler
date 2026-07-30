@@ -150,9 +150,50 @@ zusätzlich als freie Funktion (`TextCodepointCount(t)` usw.).
 das Objekt des Aufrufers. Speicher wird manuell freigegeben (kein Refcount, kein
 GC); das ist bewusst so, solange Lyx kein globales RC/COW hat.
 
-**Grenze:** UTF-16 ist ausschließlich Boundary-Format (Windows-FFI,
-UTF-16-Dateien), nie internes Format. Konverter `TextFromUtf16`/`TextToUtf16`
-sind noch nicht implementiert.
+#### 5.2 UTF-16 an der Grenze
+
+UTF-16 ist ausschließlich **Boundary-Format** (Windows-FFI, UTF-16-Dateien), nie
+internes Format — innerhalb von Lyx bleibt alles UTF-8. Die Konverter liegen in
+`std.text`, brauchen keine Tabellen und arbeiten auf reinen Bytemustern:
+
+| Funktion | Bedeutung |
+|----------|-----------|
+| `TextFromUtf16(ptr, byteLen, endian)` | UTF-16 → `Text`, Byte-Reihenfolge explizit |
+| `TextFromUtf16Bom(ptr, byteLen)` | Byte-Reihenfolge aus dem BOM, BOM wird entfernt |
+| `TextUtf16Length(t)` | Bytes, die die UTF-16-Kodierung braucht (ohne BOM) |
+| `TextToUtf16(t, dest, endian)` | `Text` → UTF-16, ohne BOM; liefert geschriebene Bytes |
+| `TextToUtf16Bom(t, dest, endian)` | dito mit vorangestelltem U+FEFF |
+
+Byte-Reihenfolge über die Konstanten `UTF16_BE` / `UTF16_LE`.
+
+**Puffergröße:** immer über `TextUtf16Length(t)` bestimmen (plus 2 für ein BOM) —
+sie lässt sich **nicht** aus `ByteLength()` ableiten. UTF-8 und UTF-16 sind pro
+Codepoint in beide Richtungen unterschiedlich groß: ASCII ist 1 vs. 2 Bytes,
+U+0800..U+FFFF dagegen 3 vs. 2.
+
+**Surrogate-Paare:** Codepoints über U+FFFF werden als Paar kodiert bzw. beim
+Dekodieren wieder zusammengesetzt. Genau das ist der Grund, warum UTF-16 kein
+Fixed-Width-Format ist und Indizierung nach Code-Unit eine Falle bleibt — `Text`
+indiziert deshalb nach Codepoint.
+
+**Fehlerhafte Eingabe bricht nicht ab**, sondern wird zu U+FFFD (`UNICODE_REPLACEMENT`),
+je ein Ersatzzeichen pro fehlerhafter Code-Unit: unpaariges High-Surrogate,
+verirrtes Low-Surrogate, abgeschnittenes Paar am Puffer-Ende, ungerades
+Rest-Byte. Das Ergebnis ist damit garantiert gültiges UTF-8. Wer schlechte
+Eingabe ablehnen statt ersetzen will, prüft das Resultat auf U+FFFD.
+
+**Ohne BOM liest `TextFromUtf16Bom` big-endian** — so schreibt es RFC 2781 für
+schlichtes „UTF-16" vor. Das ist das Gegenteil dessen, was BOM-lose Dateien aus
+der Windows-Welt üblicherweise sind: wenn die Byte-Reihenfolge bekannt ist, lieber
+`TextFromUtf16` mit explizitem `UTF16_LE` verwenden.
+
+```lyx
+var t: Text := TextFromUtf16Bom(fileBytes, fileLen);
+
+var need: int64 := TextUtf16Length(t) + 2;              // + BOM
+var out: int64 := mmap(0, need, PROT_RW, MAP_ANON, FD_NONE, 0);
+var written: int64 := TextToUtf16Bom(t, out, UTF16_LE);
+```
 
 ### 6. Enum-Typen (v0.5.7)
 
