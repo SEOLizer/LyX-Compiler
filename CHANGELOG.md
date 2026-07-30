@@ -2,6 +2,23 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler (IR-Optimizer)
+- **Strength-Reduction `DIV → SHR` entfernt** — für vorzeichenbehaftete Division
+  ist die Umformung schlicht falsch: Rechtsschieben rundet ab, Division
+  trunkiert Richtung Null. `-21 / 4` ist `-5`, `-21 >> 2` aber `-6`. Nur exakt
+  teilbare Werte kamen zufällig richtig heraus, weshalb es lange unauffällig
+  blieb. Die IR unterscheidet an dieser Stelle kein signed/unsigned, es gibt
+  also keine Bedingung, unter der die Umformung sicher wäre.
+- Derselbe Arm miscompilierte zusätzlich den 2^0-Fall: `x / 1` lieferte auf dem
+  IR-Pfad (lyxos, arm64, …) konstant **1** statt `x`.
+- `MUL → SHL` bleibt: im Zweierkomplement ist sie für beide Vorzeichen exakt.
+- Betrifft alle IR-basierten Backends; der ELF-Pfad war nie betroffen (AST →
+  codegen_x86 ohne diesen Pass). Regressionstests in
+  `tests/lyxos_strength_reduction_test.sh` (jetzt 20 PASS): negative Dividenden
+  mit Rest, `x / 1`, sowie geteilte Const-Temps (ein nicht reduziertes `%` darf
+  die auf log2 umgeschriebene Konstante einer benachbarten `*` nicht sehen).
+- Damit ist `BUG_lyxos_strength_reduction_shift.md` abgearbeitet und entfernt.
+
 ### Compiler (LyxOS-Backend)
 - **Float-Memory-Intrinsics für `--target=lyxos`**: `peekf64`, `pokef64`,
   `peek32f`, `poke32f` werden jetzt gelowert (ir_lower ids 253–256, Emission in
