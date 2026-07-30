@@ -143,6 +143,11 @@ test: lyxc
 	@echo "--- Statischer Methodenaufruf TypeName.Method() (7 tests) ---"
 	@bash tests/static_method_call_test.sh
 	@echo "OK"
+	@echo "--- Statischer Methodenaufruf: Codegen/Argumentlage (10 Prüfungen) ---"
+	./lyxc --std-path=std tests/static_method_codegen_test.lyx -o /tmp/lyxc_smc_test
+	@/tmp/lyxc_smc_test > /dev/null
+	@rm -f /tmp/lyxc_smc_test
+	@echo "OK"
 	@echo "--- std.process gegen echte Prozesse (8 Prüfungen) ---"
 	./lyxc --std-path=std tests/process_unit_test.lyx -o /tmp/lyxc_process_test
 	@/tmp/lyxc_process_test > /dev/null
