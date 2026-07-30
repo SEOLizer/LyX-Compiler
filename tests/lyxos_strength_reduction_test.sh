@@ -30,9 +30,25 @@ run "mul4"   'fn main(): int64 { var x: int64 := 5; return x * 4; }' 20
 run "mul8"   'fn main(): int64 { var x: int64 := 5; return x * 8; }' 40
 run "mul16"  'fn main(): int64 { var x: int64 := 3; return x * 16; }' 48
 run "mul1"   'fn main(): int64 { var x: int64 := 7; return x * 1; }' 7
-# Division durch Zweierpotenz (strength-reduced → SHR)
+# Division durch Zweierpotenz. NICHT mehr strength-reduced: Rechtsschieben rundet ab,
+# Division trunkiert Richtung Null — bei negativem Dividenden mit Rest divergiert das.
+# Exakt teilbare Werte kamen auch mit der alten SHR-Umformung richtig heraus, deshalb
+# die negativen Fälle mit Rest direkt darunter.
 run "div4"   'fn main(): int64 { var x: int64 := 20; return x / 4; }' 5
 run "div8"   'fn main(): int64 { var x: int64 := 80; return x / 8; }' 10
+# -21/4 muss -5 sein (Trunkierung), nicht -6 (Abrundung). +100 wegen Exit-Code.
+run "div_neg_rest"   'fn main(): int64 { var x: int64 := 0 - 21; return x / 4 + 100; }' 95
+run "div_neg_rest8"  'fn main(): int64 { var x: int64 := 0 - 30; return x / 8 + 100; }' 97
+run "div_neg_exact"  'fn main(): int64 { var x: int64 := 0 - 20; return x / 4 + 100; }' 95
+# 2^0: die alte DIV-Umformung lieferte hier konstant 1 statt x.
+run "div1"   'fn main(): int64 { var x: int64 := 7; return x / 1; }' 7
+run "div1_b" 'fn main(): int64 { var x: int64 := 42; return x / 1; }' 42
+# MUL bleibt reduziert und ist auch für negative Werte exakt (Zweierkomplement).
+run "mul_neg" 'fn main(): int64 { var x: int64 := 0 - 5; return x * 4 + 100; }' 80
+# Geteiltes Const-Temp: MOD wird nicht reduziert, darf also nicht die auf log2
+# umgeschriebene Konstante einer benachbarten MUL sehen.
+run "mul_mod_shared_const" 'fn main(): int64 { var x: int64 := 6; var y: int64 := 9; return x * 4 + y % 4; }' 25
+run "mul_div_shared_const" 'fn main(): int64 { var x: int64 := 6; var y: int64 := 40; return x * 4 + y / 4; }' 34
 # Nicht-Zweierpotenz bleibt echte MUL/DIV
 run "mul3"   'fn main(): int64 { var x: int64 := 5; return x * 3; }' 15
 # Expliziter Shift unverändert korrekt
