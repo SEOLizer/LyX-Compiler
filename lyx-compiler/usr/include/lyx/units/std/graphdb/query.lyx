@@ -1,0 +1,243 @@
+// std/graphdb/query.lyx
+// WP-GRP-07: High-Level Query-API (Store + Indizes kombiniert)
+
+@description("GraphDB high-level query API: temporal, type, pattern, and vector-semantic queries")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.graphdb.query;
+
+import std.alloc;
+import std.graphdb.core;
+import std.graphdb.node;
+import std.graphdb.edge;
+import std.graphdb.mem;
+import std.graphdb.index;
+
+// ============================================================
+// GraphQueryCtx Layout
+// ============================================================
+
+pub con GQCTX_OFF_STORE:   int64 := 0;
+pub con GQCTX_OFF_TIDX:    int64 := 8;
+pub con GQCTX_OFF_TYPEIDX: int64 := 16;
+pub con GQCTX_OFF_VIDX:    int64 := 24;
+pub con GQCTX_SIZE:        int64 := 32;
+
+// ============================================================
+// GraphQueryPatternCtx Layout (avoids 7-arg bug)
+// store srcId, etype-ptr, elen, tsFrom in a 32-byte struct
+// ============================================================
+
+pub con GQPAT_OFF_SRCID:   int64 := 0;
+pub con GQPAT_OFF_ETYPE:   int64 := 8;
+pub con GQPAT_OFF_ELEN:    int64 := 16;
+pub con GQPAT_OFF_TSFROM:  int64 := 24;
+pub con GQPAT_SIZE:        int64 := 32;
+
+// ============================================================
+// QueryCtx Init / Setters
+// ============================================================
+
+pub fn GraphQueryCtxInit(ctx: int64, store: int64) {
+    poke64(ctx + GQCTX_OFF_STORE,   store);
+    poke64(ctx + GQCTX_OFF_TIDX,    0);
+    poke64(ctx + GQCTX_OFF_TYPEIDX, 0);
+    poke64(ctx + GQCTX_OFF_VIDX,    0);
+}
+
+pub fn GraphQueryCtxSetTemporalIdx(ctx: int64, tidx: int64) {
+    poke64(ctx + GQCTX_OFF_TIDX, tidx);
+}
+
+pub fn GraphQueryCtxSetTypeIdx(ctx: int64, typeidx: int64) {
+    poke64(ctx + GQCTX_OFF_TYPEIDX, typeidx);
+}
+
+pub fn GraphQueryCtxSetVectorIdx(ctx: int64, vidx: int64) {
+    poke64(ctx + GQCTX_OFF_VIDX, vidx);
+}
+
+// ============================================================
+// QueryPatternCtx Init / Setters
+// ============================================================
+
+pub fn GraphQueryPatternInit(pat: int64, srcId: int64, etype: pchar, elen: int64) {
+    poke64(pat + GQPAT_OFF_SRCID,  srcId);
+    poke64(pat + GQPAT_OFF_ETYPE,  etype as int64);
+    poke64(pat + GQPAT_OFF_ELEN,   elen);
+    poke64(pat + GQPAT_OFF_TSFROM, 0);
+}
+
+pub fn GraphQueryPatternSetTs(pat: int64, tsFrom: int64) {
+    poke64(pat + GQPAT_OFF_TSFROM, tsFrom);
+}
+
+// ============================================================
+// Query: Edges in Zeitfenster
+// ============================================================
+
+pub fn GraphQueryEdgesInWindow(ctx: int64, tsFrom: int64, tsTo: int64, outBuf: int64, maxOut: int64): int64 {
+    var tidx: int64 := peek64(ctx + GQCTX_OFF_TIDX);
+    if (tidx == 0) { return 0; }
+    if (maxOut == 0) { return 0; }
+    return GraphTemporalIndexQuery(tidx, tsFrom, tsTo, outBuf, maxOut);
+}
+
+// ============================================================
+// Query: Edges nach Typ
+// ============================================================
+
+pub fn GraphQueryEdgesByType(ctx: int64, etype: pchar, elen: int64, outBuf: int64, maxOut: int64): int64 {
+    var typeidx: int64 := peek64(ctx + GQCTX_OFF_TYPEIDX);
+    if (typeidx == 0) { return 0; }
+    if (maxOut == 0) { return 0; }
+    return GraphTypeIndexQuery(typeidx, etype, elen, outBuf, maxOut);
+}
+
+// ============================================================
+// Query: Pattern srcId → etype → target (optionaler Zeitfilter)
+// pat = GQPAT_SIZE Struct (avoids 7-arg limit)
+// ============================================================
+
+pub fn GraphQueryPattern(ctx: int64, pat: int64, outBuf: int64, maxOut: int64): int64 {
+    var store: int64  := peek64(ctx  + GQCTX_OFF_STORE);
+    var srcId: int64  := peek64(pat  + GQPAT_OFF_SRCID);
+    var etype: pchar  := peek64(pat  + GQPAT_OFF_ETYPE) as pchar;
+    var elen: int64   := peek64(pat  + GQPAT_OFF_ELEN);
+    var tsFrom: int64 := peek64(pat  + GQPAT_OFF_TSFROM);
+    var ebuf: int64   := 0;
+    var ecnt: int64   := 0;
+    var found: int64  := 0;
+    var i: int64      := 0;
+    var eid: int64    := 0;
+    var ep: int64     := 0;
+    var cat: int64    := 0;
+    var tgt: int64    := 0;
+    var pass: int64   := 0;
+    if (maxOut == 0) { return 0; }
+    ebuf := alloc(4096 * 8);
+    ecnt := GraphMemStoreOutEdges(store, srcId, ebuf, 4096);
+    i := 0;
+    while (i < ecnt) {
+        eid := peek64(ebuf + i * 8);
+        ep  := GraphMemStoreGetEdge(store, eid);
+        if (ep != 0) {
+            if (GraphEdgeTypeEq(ep, etype, elen) == 1) {
+                pass := 0;
+                if (tsFrom == 0) { pass := 1; }
+                if (pass == 0) {
+                    cat := peek64(ep + GEDGE_OFF_CREATEDAT);
+                    if (cat >= tsFrom) { pass := 1; }
+                }
+                if (pass == 1) {
+                    if (found < maxOut) {
+                        tgt := peek64(ep + GEDGE_OFF_TARGET);
+                        poke64(outBuf + found * 8, tgt);
+                        found += 1;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    free(ebuf, 4096 * 8);
+    return found;
+}
+
+// ============================================================
+// BFS-Hilfsfunktion: prüft ob id in buf[0..cnt]
+// ============================================================
+
+fn _inBuf(buf: int64, cnt: int64, id: int64): int64 {
+    var i: int64 := 0;
+    while (i < cnt) {
+        if (peek64(buf + i * 8) == id) { return 1; }
+        i += 1;
+    }
+    return 0;
+}
+
+// ============================================================
+// Graph-RAG: semantisch nahe Nodes + BFS-Umfeld bis depth Hops
+// ============================================================
+
+pub fn GraphGetContextForAI(ctx: int64, queryVec: int64, topK: int64, depth: int64, outBuf: int64, maxOut: int64): int64 {
+    var vidx: int64      := peek64(ctx + GQCTX_OFF_VIDX);
+    var store: int64     := peek64(ctx + GQCTX_OFF_STORE);
+    var outCnt: int64    := 0;
+    var seedIds: int64   := 0;
+    var seedScr: int64   := 0;
+    var seedCnt: int64   := 0;
+    var curBuf: int64    := 0;
+    var nxtBuf: int64    := 0;
+    var curCnt: int64    := 0;
+    var nxtCnt: int64    := 0;
+    var nbBuf: int64     := 0;
+    var nbCnt: int64     := 0;
+    var hop: int64       := 0;
+    var i: int64         := 0;
+    var j: int64         := 0;
+    var nodeId: int64    := 0;
+    var nbId: int64      := 0;
+    var swp: int64       := 0;
+    if (vidx == 0) { return 0; }
+    if (maxOut == 0) { return 0; }
+    seedIds := alloc(topK * 8);
+    seedScr := alloc(topK * 8);
+    seedCnt := GraphVectorIndexSearch(vidx, queryVec, topK, seedIds, seedScr);
+    free(seedScr, topK * 8);
+    i := 0;
+    while (i < seedCnt) {
+        nodeId := peek64(seedIds + i * 8);
+        if (outCnt < maxOut) {
+            poke64(outBuf + outCnt * 8, nodeId);
+            outCnt += 1;
+        }
+        i += 1;
+    }
+    if (depth == 0) {
+        free(seedIds, topK * 8);
+        return outCnt;
+    }
+    curBuf := alloc(maxOut * 8);
+    nxtBuf := alloc(maxOut * 8);
+    nbBuf  := alloc(maxOut * 8);
+    memcpy(curBuf, seedIds, seedCnt * 8);
+    curCnt := seedCnt;
+    free(seedIds, topK * 8);
+    hop := 0;
+    while (hop < depth) {
+        nxtCnt := 0;
+        i := 0;
+        while (i < curCnt) {
+            nodeId := peek64(curBuf + i * 8);
+            nbCnt  := GraphMemStoreNeighbors(store, nodeId, nbBuf, maxOut);
+            j := 0;
+            while (j < nbCnt) {
+                nbId := peek64(nbBuf + j * 8);
+                if (_inBuf(outBuf, outCnt, nbId) == 0) {
+                    if (outCnt < maxOut) {
+                        poke64(outBuf + outCnt * 8, nbId);
+                        outCnt += 1;
+                    }
+                    if (nxtCnt < maxOut) {
+                        poke64(nxtBuf + nxtCnt * 8, nbId);
+                        nxtCnt += 1;
+                    }
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        swp    := curBuf;
+        curBuf := nxtBuf;
+        nxtBuf := swp;
+        curCnt := nxtCnt;
+        if (curCnt == 0) { hop := depth; }
+        hop += 1;
+    }
+    free(curBuf, maxOut * 8);
+    free(nxtBuf, maxOut * 8);
+    free(nbBuf,  maxOut * 8);
+    return outCnt;
+}

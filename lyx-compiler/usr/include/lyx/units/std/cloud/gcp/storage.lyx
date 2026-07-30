@@ -1,0 +1,307 @@
+// std/cloud/gcp/storage.lyx — Google Cloud Storage (WP-GCP-06)
+//
+// Public API:
+//   GCSConnect(credsPtr, project) -> GCSConn
+//   GCSDisconnect(c)
+//   GCSBucketCreate(c, bucket, location) -> int64 (status code)
+//   GCSBucketDelete(c, bucket) -> int64
+//   GCSBucketExists(c, bucket) -> int64 (1=yes,0=no)
+//   GCSUpload(c, bucket, object, data, dataLen) -> int64 (status code)
+//   GCSUploadJSON(c, bucket, object, json, jsonLen) -> int64
+//   GCSDownload(c, bucket, object) -> GCPResponse
+//   GCSDownloadRange(c, bucket, object, start, end) -> GCPResponse
+//   GCSDelete(c, bucket, object) -> int64
+//   GCSExists(c, bucket, object) -> int64
+//   GCSGetMeta(c, bucket, object) -> int64 (alloc'd JSON pchar, or 0)
+
+unit std.cloud.gcp.storage;
+
+import std.cloud.gcp.transport;
+import std.alloc;
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+pub type GCSConn = struct {
+    client:  GCPClient;
+    project: int64;   // pchar
+};
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn gcsStrLen(s: int64): int64 {
+    if (s == 0) { return 0; }
+    var i: int64 := 0; while (peek8(s + i) != 0) { i := i + 1; } return i;
+}
+
+fn gcsStrDupN(src: int64, n: int64): int64 {
+    var buf: int64 := alloc(n + 1);
+    var i: int64 := 0;
+    while (i < n) { poke8(buf + i, peek8(src + i)); i := i + 1; }
+    poke8(buf + n, 0); return buf;
+}
+
+fn gcsStrDup(src: int64): int64 {
+    if (src == 0) { return 0; }
+    return gcsStrDupN(src, gcsStrLen(src));
+}
+
+// URL-encode a path segment (object name may contain '/')
+fn gcsURLEncode(s: int64, out: int64): int64 {
+    var n: int64 := 0;
+    var i: int64 := 0;
+    var hex: int64 := "0123456789ABCDEF" as int64;
+    while (peek8(s + i) != 0) {
+        var c: int64 := peek8(s + i) & 0xFF;
+        var safe: int64 := 0;
+        if ((c >= 65) & (c <= 90))  { safe := 1; }
+        if ((c >= 97) & (c <= 122)) { safe := 1; }
+        if ((c >= 48) & (c <= 57))  { safe := 1; }
+        if ((c == 45) | (c == 95) | (c == 46) | (c == 126)) { safe := 1; }
+        if ((c == 47)) { safe := 1; }   // '/' allowed in GCS paths
+        if (safe == 1) {
+            poke8(out + n, c); n := n + 1;
+        } else {
+            poke8(out + n, 37); n := n + 1;  // '%'
+            poke8(out + n, peek8(hex + (c >> 4))); n := n + 1;
+            poke8(out + n, peek8(hex + (c & 15))); n := n + 1;
+        }
+        i += 1;
+    }
+    poke8(out + n, 0);
+    return n;
+}
+
+// Build GCS API path: /storage/v1/b/{bucket}/o/{object}
+fn gcsObjectPath(bucket: int64, object: int64): int64 {
+    var pfx: int64  := "/storage/v1/b/" as int64;
+    var mid: int64  := "/o/" as int64;
+    var bl: int64   := gcsStrLen(bucket);
+    var ol: int64   := gcsStrLen(object) * 3 + 4;  // worst-case encoded
+    var total: int64 := 14 + bl + 3 + ol + 1;
+    var buf: int64   := alloc(total);
+    var pos: int64   := 0;
+    var i: int64 := 0;
+    while (i < 14) { poke8(buf + pos, peek8(pfx + i)); pos := pos + 1; i := i + 1; }
+    i := 0;
+    while (i < bl) { poke8(buf + pos, peek8(bucket + i)); pos := pos + 1; i := i + 1; }
+    i := 0;
+    while (i < 3)  { poke8(buf + pos, peek8(mid + i)); pos := pos + 1; i := i + 1; }
+    var encBuf: int64 := alloc(ol + 4);
+    var encLen: int64 := gcsURLEncode(object, encBuf);
+    i := 0;
+    while (i < encLen) { poke8(buf + pos, peek8(encBuf + i)); pos := pos + 1; i := i + 1; }
+    free(encBuf, ol + 4);
+    poke8(buf + pos, 0);
+    return buf;
+}
+
+// Build GCS bucket path: /storage/v1/b/{bucket}
+fn gcsBucketPath(bucket: int64): int64 {
+    var pfx: int64 := "/storage/v1/b/" as int64;
+    var bl: int64  := gcsStrLen(bucket);
+    var buf: int64 := alloc(14 + bl + 1);
+    var i: int64 := 0;
+    while (i < 14) { poke8(buf + i, peek8(pfx + i)); i := i + 1; }
+    var j: int64 := 0;
+    while (j < bl) { poke8(buf + 14 + j, peek8(bucket + j)); j := j + 1; }
+    poke8(buf + 14 + bl, 0);
+    return buf;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+pub fn GCSConnect(credsPtr: int64, project: int64): GCSConn {
+    var c: GCSConn;
+    c.client  := GCPClientNew(credsPtr, project, "storage.googleapis.com" as int64);
+    c.project := gcsStrDup(project);
+    return c;
+}
+
+pub fn GCSDisconnect(c: GCSConn): void {
+    GCPClientFree(c.client);
+    if (c.project != 0) { free(c.project, gcsStrLen(c.project) + 1); }
+}
+
+// GCSBucketCreate — creates a new GCS bucket in the given location
+pub fn GCSBucketCreate(c: GCSConn, bucket: int64, location: int64): int64 {
+    // POST /storage/v1/b?project={project}
+    var projLen: int64 := gcsStrLen(c.project);
+    var path: int64 := alloc(32 + projLen + 1);
+    var pfx: int64  := "/storage/v1/b?project=" as int64;
+    var pfxLen: int64 := gcsStrLen(pfx);
+    var i: int64 := 0;
+    while (i < pfxLen) { poke8(path + i, peek8(pfx + i)); i := i + 1; }
+    i := 0;
+    while (i < projLen) { poke8(path + pfxLen + i, peek8(c.project + i)); i := i + 1; }
+    poke8(path + pfxLen + projLen, 0);
+
+    var bktLen: int64  := gcsStrLen(bucket);
+    var locLen: int64  := gcsStrLen(location);
+    var locStr: int64  := location;
+    if (locStr == 0) { locStr := "US" as int64; locLen := 2; }
+    var bodyBuf: int64 := alloc(64 + bktLen + locLen + 1);
+    var pfx2: int64    := "{\"name\":\"" as int64;
+    var pfxLen2: int64 := 9;
+    var mid: int64     := "\",\"location\":\"" as int64;
+    var midLen: int64  := 15;
+    var sfx: int64     := "\"}" as int64;
+    var sfxLen: int64  := 2;
+    var pos: int64 := 0;
+    i := 0; while (i < pfxLen2) { poke8(bodyBuf + pos, peek8(pfx2 + i)); pos := pos + 1; i := i + 1; }
+    i := 0; while (i < bktLen)  { poke8(bodyBuf + pos, peek8(bucket + i)); pos := pos + 1; i := i + 1; }
+    i := 0; while (i < midLen)  { poke8(bodyBuf + pos, peek8(mid + i)); pos := pos + 1; i := i + 1; }
+    i := 0; while (i < locLen)  { poke8(bodyBuf + pos, peek8(locStr + i)); pos := pos + 1; i := i + 1; }
+    i := 0; while (i < sfxLen)  { poke8(bodyBuf + pos, peek8(sfx + i)); pos := pos + 1; i := i + 1; }
+    poke8(bodyBuf + pos, 0);
+
+    var r: GCPResponse := GCPPost(c.client, path, bodyBuf, pos);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(bodyBuf, 64 + bktLen + locLen + 1);
+    free(path, 32 + projLen + 1);
+    return sc;
+}
+
+pub fn GCSBucketDelete(c: GCSConn, bucket: int64): int64 {
+    var path: int64 := gcsBucketPath(bucket);
+    var r: GCPResponse := GCPDelete(c.client, path);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(path, gcsStrLen(path) + 1);
+    return sc;
+}
+
+pub fn GCSBucketExists(c: GCSConn, bucket: int64): int64 {
+    var path: int64 := gcsBucketPath(bucket);
+    var r: GCPResponse := GCPGet(c.client, path);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(path, gcsStrLen(path) + 1);
+    if (sc == 200) { return 1; }
+    return 0;
+}
+
+// GCSUpload — upload raw bytes as an object
+pub fn GCSUpload(c: GCSConn, bucket: int64, object: int64, data: int64, dataLen: int64): int64 {
+    // POST /upload/storage/v1/b/{bucket}/o?uploadType=media&name={object}
+    var bl: int64  := gcsStrLen(bucket);
+    var ol: int64  := gcsStrLen(object) * 3 + 4;
+    var total: int64 := 64 + bl + ol + 1;
+    var path: int64  := alloc(total);
+    var pfx: int64   := "/upload/storage/v1/b/" as int64;
+    var pfxLen: int64 := gcsStrLen(pfx);
+    var sfx: int64   := "/o?uploadType=media&name=" as int64;
+    var sfxLen: int64 := gcsStrLen(sfx);
+    var pos: int64 := 0;
+    var i: int64 := 0;
+    while (i < pfxLen) { poke8(path + pos, peek8(pfx + i)); pos := pos + 1; i := i + 1; }
+    i := 0; while (i < bl) { poke8(path + pos, peek8(bucket + i)); pos := pos + 1; i := i + 1; }
+    i := 0; while (i < sfxLen) { poke8(path + pos, peek8(sfx + i)); pos := pos + 1; i := i + 1; }
+    var encBuf: int64 := alloc(ol + 4);
+    var encLen: int64 := gcsURLEncode(object, encBuf);
+    i := 0; while (i < encLen) { poke8(path + pos, peek8(encBuf + i)); pos := pos + 1; i := i + 1; }
+    free(encBuf, ol + 4);
+    poke8(path + pos, 0);
+
+    var r: GCPResponse := GCPPost(c.client, path, data, dataLen);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(path, total);
+    return sc;
+}
+
+pub fn GCSUploadJSON(c: GCSConn, bucket: int64, object: int64, json: int64, jsonLen: int64): int64 {
+    return GCSUpload(c, bucket, object, json, jsonLen);
+}
+
+// GCSDownload — download object body; caller calls GCPResponseFree
+pub fn GCSDownload(c: GCSConn, bucket: int64, object: int64): GCPResponse {
+    var basePath: int64 := gcsObjectPath(bucket, object);
+    var bpl: int64 := gcsStrLen(basePath);
+    var suffix: int64   := "?alt=media" as int64;
+    var sfxLen: int64   := gcsStrLen(suffix);
+    var path: int64     := alloc(bpl + sfxLen + 1);
+    var i: int64 := 0;
+    while (i < bpl)    { poke8(path + i, peek8(basePath + i)); i := i + 1; }
+    i := 0; while (i < sfxLen) { poke8(path + bpl + i, peek8(suffix + i)); i := i + 1; }
+    poke8(path + bpl + sfxLen, 0);
+    free(basePath, gcsStrLen(basePath) + 1);
+    var r: GCPResponse := GCPGet(c.client, path);
+    free(path, bpl + sfxLen + 1);
+    return r;
+}
+
+pub fn GCSDownloadRange(c: GCSConn, bucket: int64, object: int64, start: int64, end: int64): GCPResponse {
+    // TODO: set Range: bytes=start-end header — for now same as full download
+    return GCSDownload(c, bucket, object);
+}
+
+pub fn GCSDelete(c: GCSConn, bucket: int64, object: int64): int64 {
+    var path: int64 := gcsObjectPath(bucket, object);
+    var r: GCPResponse := GCPDelete(c.client, path);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(path, gcsStrLen(path) + 1);
+    return sc;
+}
+
+pub fn GCSExists(c: GCSConn, bucket: int64, object: int64): int64 {
+    var path: int64 := gcsObjectPath(bucket, object);
+    var r: GCPResponse := GCPGet(c.client, path);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(path, gcsStrLen(path) + 1);
+    if (sc == 200) { return 1; }
+    return 0;
+}
+
+pub fn GCSGetMeta(c: GCSConn, bucket: int64, object: int64): int64 {
+    var path: int64 := gcsObjectPath(bucket, object);
+    var r: GCPResponse := GCPGet(c.client, path);
+    var body: int64 := 0;
+    if (r.statusCode == 200) {
+        body := r.body; r.body := 0;  // transfer ownership
+    }
+    GCPResponseFree(r);
+    free(path, gcsStrLen(path) + 1);
+    return body;
+}
+
+// GCSList — returns raw JSON response body with list of objects
+pub fn GCSList(c: GCSConn, bucket: int64, prefix: int64, pageSize: int64): GCPResponse {
+    var bl: int64   := gcsStrLen(bucket);
+    var pl: int64   := gcsStrLen(prefix);
+    var total: int64 := 64 + bl + pl + 1;
+    var path: int64  := alloc(total);
+    var pfx: int64   := "/storage/v1/b/" as int64;
+    var pfxLen: int64 := 14;
+    var sfx: int64   := "/o?maxResults=" as int64;
+    var sfxLen: int64 := gcsStrLen(sfx);
+    var pos: int64 := 0;
+    var i: int64 := 0;
+    while (i < pfxLen) { poke8(path + pos, peek8(pfx + i)); pos := pos + 1; i := i + 1; }
+    i := 0; while (i < bl) { poke8(path + pos, peek8(bucket + i)); pos := pos + 1; i := i + 1; }
+    i := 0; while (i < sfxLen) { poke8(path + pos, peek8(sfx + i)); pos := pos + 1; i := i + 1; }
+    // Append pageSize as decimal
+    var numBuf: int64 := alloc(24);
+    var numLen: int64 := 0;
+    if (pageSize <= 0) { pageSize := 1000; }
+    var v: int64 := pageSize;
+    var tmpBuf: int64 := alloc(24);
+    var tl: int64 := 0;
+    while (v > 0) { poke8(tmpBuf + tl, 48 + (v - ((v / 10) * 10))); v := v / 10; tl := tl + 1; }
+    i := 0; while (i < tl) { poke8(numBuf + i, peek8(tmpBuf + tl - 1 - i)); i := i + 1; }
+    free(tmpBuf, 24); numLen := tl;
+    i := 0; while (i < numLen) { poke8(path + pos, peek8(numBuf + i)); pos := pos + 1; i := i + 1; }
+    free(numBuf, 24);
+    if (pl > 0) {
+        var pfxQ: int64 := "&prefix=" as int64;
+        var pql: int64  := gcsStrLen(pfxQ);
+        i := 0; while (i < pql) { poke8(path + pos, peek8(pfxQ + i)); pos := pos + 1; i := i + 1; }
+        i := 0; while (i < pl) { poke8(path + pos, peek8(prefix + i)); pos := pos + 1; i := i + 1; }
+    }
+    poke8(path + pos, 0);
+    var r: GCPResponse := GCPGet(c.client, path);
+    free(path, total);
+    return r;
+}

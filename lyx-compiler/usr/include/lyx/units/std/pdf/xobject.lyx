@@ -1,0 +1,130 @@
+// std/pdf/xobject.lyx
+// Form XObjects (WP-PDF-23): reusable graphic blocks placed on multiple pages
+
+@description("PDF Form XObjects: PdfBeginXObject, PdfEndXObject, PdfDrawXObject")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.pdf.xobject;
+
+import std.pdf.builder;
+import std.pdf.objects;
+
+// ============================================================================
+// PdfBeginXObject — start a new Form XObject context
+//
+// Returns a negative handle (e.g. -1 for first, -2 for second ...).
+// The handle can be passed as the `page` parameter to all drawing functions
+// (PdfSetFont, PdfTextAt, PdfRect, PdfMoveTo, etc.) to draw into the XObject.
+// w, h: BBox dimensions in PDF points (e.g. PDF_A4_W for a full A4 width)
+// ============================================================================
+
+pub fn PdfBeginXObject(doc: int64, w: f64, h: f64): int64 {
+  if (doc == 0) { return 0; }
+
+  var count: int64 := peek64(doc + PDF_DOC_XOBJCOUNT);
+  var cap:   int64 := peek64(doc + PDF_DOC_XOBJCAP);
+  var buf:   int64 := peek64(doc + PDF_DOC_XOBJBUF);
+
+  // Grow record buffer if needed
+  if (count >= cap) {
+    var newCap: int64 := cap * 2;
+    var newBuf: int64 := mmapAlloc(newCap * PDF_XOBJ_RECSIZE);
+    if (newBuf == 0) { return 0; }
+    zeroMem(newBuf, newCap * PDF_XOBJ_RECSIZE);
+    var ci: int64 := 0;
+    while (ci < count * PDF_XOBJ_RECSIZE) {
+      poke8(newBuf + ci, peek8(buf + ci));
+      ci += 1;
+    }
+    munmap(buf, cap * PDF_XOBJ_RECSIZE);
+    buf := newBuf;
+    cap := newCap;
+    poke64(doc + PDF_DOC_XOBJBUF, buf);
+    poke64(doc + PDF_DOC_XOBJCAP, cap);
+  }
+
+  // Assign a PDF object ID
+  var objId: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, objId + 1);
+
+  // Initialise record
+  var rec: int64 := buf + count * PDF_XOBJ_RECSIZE;
+  poke64(rec + PDF_XOBJ_OBJID,          objId);
+  poke64(rec + PDF_XOBJ_W100,           f64ToInt100(w));
+  poke64(rec + PDF_XOBJ_H100,           f64ToInt100(h));
+  poke64(rec + PDF_XOBJ_CONTENTBUF,     0);
+  poke64(rec + PDF_XOBJ_CONTENTLEN,     0);
+  poke64(rec + PDF_XOBJ_CONTENTCAP,     0);
+  poke64(rec + PDF_XOBJ_FONTMASK,       0);
+  poke64(rec + PDF_XOBJ_CURFONTIDX,     0);
+  poke64(rec + PDF_XOBJ_CURFONTSIZE100, 0);
+  poke64(rec + PDF_XOBJ_CURTEXTCOLOR,   0);
+
+  poke64(doc + PDF_DOC_XOBJCOUNT, count + 1);
+
+  // Handle: -(idx + 1)
+  return 0 - count - 1;
+}
+
+// ============================================================================
+// PdfEndXObject — finalise a Form XObject (no-op currently, reserved for
+// future use such as closing open path operators).
+// ============================================================================
+
+pub fn PdfEndXObject(doc: int64, xobj: int64): void {
+  // Currently nothing to do — content is already written via PdfContentAppend*.
+  // Reserved for future cleanup (e.g., unclosed BT/ET, open paths).
+}
+
+// ============================================================================
+// _pdfDrawXObjEmit — shared emit helper, max 6 args (Lyx 7-arg limit).
+// scale100: uniform scale factor ×100 (100 = native 1:1).
+// Emits: q  scale 0 0 scale tx ty cm  /FXi Do  Q
+// ============================================================================
+
+fn _pdfDrawXObjEmit(doc: int64, page: int64, idx: int64,
+                     tx100: int64, ty100: int64, scale100: int64): void {
+  var xMaskBuf: int64 := peek64(doc + PDF_DOC_PAGEXOBJMASKS);
+  var xMask:    int64 := peek64(xMaskBuf + page * 8);
+  poke64(xMaskBuf + page * 8, xMask | (1 << idx));
+
+  if (PdfContentEnsure(doc, page, 128) == 0) { return; }
+  var buf: int64 := pdfXBuf(doc, page);
+  var pos: int64 := pdfXPos(doc, page);
+  pos := pdfStr(buf, pos, "q\n");
+  pos := pdfReal100(buf, pos, scale100); poke8(buf + pos, 32); pos := pos + 1;
+  pos := pdfStr(buf, pos, "0 0 ");
+  pos := pdfReal100(buf, pos, scale100); poke8(buf + pos, 32); pos := pos + 1;
+  pos := pdfReal100(buf, pos, tx100); poke8(buf + pos, 32); pos := pos + 1;
+  pos := pdfReal100(buf, pos, ty100);
+  pos := pdfStr(buf, pos, " cm\n/FX");
+  pos := pdfInt(buf, pos, idx);
+  pos := pdfStr(buf, pos, " Do\nQ\n");
+  pdfXSetPos(doc, page, pos);
+}
+
+// ============================================================================
+// PdfDrawXObject — place a Form XObject at position (x,y) at native BBox size.
+// max 5 args (Lyx 7-arg calling-convention limit: max 6 total args safe).
+// ============================================================================
+
+pub fn PdfDrawXObject(doc: int64, page: int64, xobj: int64, x: f64, y: f64): void {
+  if (doc == 0 || page < 0 || xobj >= 0) { return; }
+  var idx: int64 := 0 - xobj - 1;
+  if (idx < 0 || idx >= peek64(doc + PDF_DOC_XOBJCOUNT)) { return; }
+  _pdfDrawXObjEmit(doc, page, idx, f64ToInt100(x), f64ToInt100(y), 100);
+}
+
+// ============================================================================
+// PdfDrawXObjectScaled — place with explicit scale (×100 integer, 100 = 100%).
+// e.g. scale100=200 doubles the size, scale100=50 halves it.
+// Uses uniform scaling (same factor for both axes).
+// ============================================================================
+
+pub fn PdfDrawXObjectScaled(doc: int64, page: int64, xobj: int64,
+                              x100: int64, y100: int64, scale100: int64): void {
+  if (doc == 0 || page < 0 || xobj >= 0) { return; }
+  var idx: int64 := 0 - xobj - 1;
+  if (idx < 0 || idx >= peek64(doc + PDF_DOC_XOBJCOUNT)) { return; }
+  _pdfDrawXObjEmit(doc, page, idx, x100, y100, scale100);
+}

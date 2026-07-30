@@ -1,0 +1,560 @@
+// std/cloud/aws/sigv4.lyx — AWS Signature Version 4
+// WP-AWS-01
+//
+// Implements full SigV4 signing for all AWS services and protocols.
+// Canonical request → StringToSign → derived signing key → HMAC-SHA256 signature.
+//
+// Public API:
+//   AWSSignCtx        — signing context struct
+//   SigV4Sign(ctx)    — compute Authorization header, write into ctx.authHeader
+//   SigV4SignQuery(ctx) → pchar  — presigned URL query string (alloc'd)
+//   SigV4DateNow(dateBuf, dateTimeBuf) — fill date buffers from system clock
+
+unit std.cloud.aws.sigv4;
+
+import std.crypto.sha256;
+import std.crypto.hmac;
+import std.alloc;
+import std.io;
+import std.time;
+
+// AWSSignCtx — fill all fields before calling SigV4Sign
+pub type AWSSignCtx = struct {
+    // Credentials
+    accessKey:     int64;  // pchar
+    secretKey:     int64;  // pchar
+    sessionToken:  int64;  // pchar or 0 for permanent credentials
+
+    // Request
+    method:        int64;  // pchar "GET" / "POST" / "PUT" / "DELETE" etc.
+    host:          int64;  // pchar "s3.eu-central-1.amazonaws.com"
+    path:          int64;  // pchar "/bucket/key" (URI-encoded, no query)
+    query:         int64;  // pchar "Action=DescribeInstances&..." (sorted, encoded) or 0
+    body:          int64;  // raw body bytes pointer or 0 for empty body
+    bodyLen:       int64;  // length of body
+
+    // Service/Region
+    service:       int64;  // pchar "s3" / "ec2" / "dynamodb" etc.
+    region:        int64;  // pchar "eu-central-1"
+
+    // Time (filled by SigV4DateNow or caller, format: YYYYMMDD + YYYYMMDDTHHmmssZ)
+    date:          int64;  // pchar 8-char: "20240115"
+    dateTime:      int64;  // pchar 16-char: "20240115T120000Z"
+
+    // Output: Authorization header value (caller provides 512-byte buffer)
+    authHeader:    int64;  // pchar output buffer (min 512 bytes)
+};
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn hexChar(n: int64): int64 {
+    if (n < 10) { return 48 + n; }
+    return 87 + n; // 'a' - 10
+}
+
+fn hexEncodeBytes(src: int64, srcLen: int64, dst: int64) {
+    var i: int64 := 0;
+    while (i < srcLen) {
+        var b: int64 := peek8(src + i) & 0xFF;
+        poke8(dst + i*2,   hexChar(b >> 4));
+        poke8(dst + i*2+1, hexChar(b & 0xF));
+        i += 1;
+    }
+    poke8(dst + srcLen*2, 0);
+}
+
+// SHA-256 hex of data, writes 65 bytes (64 hex + NUL) into out
+fn sha256HexOf(data: int64, dataLen: int64, out: int64) {
+    var digest: int64 := alloc(32);
+    SHA256(data, dataLen, digest);
+    hexEncodeBytes(digest, 32, out);
+    free(digest, 32);
+}
+
+// Append pchar s into buf at offset *off, return new offset
+fn appendStr(buf: int64, off: int64, s: pchar): int64 {
+    var i: int64 := 0;
+    var n: int64 := StrLen(s);
+    while (i < n) { poke8(buf+off+i, StrCharAt(s,i)&0xFF); i:=i+1; }
+    return off + n;
+}
+
+fn appendBytes(buf: int64, off: int64, src: int64, n: int64): int64 {
+    var i: int64 := 0;
+    while (i < n) { poke8(buf+off+i, peek8(src+i)&0xFF); i:=i+1; }
+    return off + n;
+}
+
+fn appendChar(buf: int64, off: int64, c: int64): int64 {
+    poke8(buf+off, c); return off+1;
+}
+
+// URI-encode pchar into dst; returns bytes written (no NUL)
+// Unreserved chars per RFC 3986 + SigV4 spec: A-Z a-z 0-9 - _ . ~
+fn uriEncode(src: pchar, dst: int64, encodeSlash: int64): int64 {
+    var i: int64 := 0; var j: int64 := 0;
+    var n: int64 := StrLen(src);
+    while (i < n) {
+        var c: int64 := StrCharAt(src, i) & 0xFF;
+        var safe: int64 := 0;
+        if (c >= 65 && c <= 90)  { safe := 1; }  // A-Z
+        if (c >= 97 && c <= 122) { safe := 1; }  // a-z
+        if (c >= 48 && c <= 57)  { safe := 1; }  // 0-9
+        if (c == 45 || c == 95 || c == 46 || c == 126) { safe := 1; } // - _ . ~
+        if (encodeSlash == 0 && c == 47) { safe := 1; } // '/' when not encoding slashes
+        if (safe == 1) {
+            poke8(dst+j, c); j := j + 1;
+        } else {
+            poke8(dst+j, 37); j := j+1; // '%'
+            poke8(dst+j, hexChar((c>>4)&0xF)); j := j+1;
+            poke8(dst+j, hexChar(c&0xF));      j := j+1;
+        }
+        i += 1;
+    }
+    return j;
+}
+
+fn toLower(c: int64): int64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
+// ── Canonical headers ─────────────────────────────────────────────────────────
+// We produce a fixed set of signed headers for all requests:
+//   host, x-amz-content-sha256 (S3), x-amz-date, x-amz-security-token (if set)
+// Service-specific additional headers are added by the transport layer.
+
+fn buildPayloadHash(body: int64, bodyLen: int64, out: int64) {
+    if (body == 0 || bodyLen == 0) {
+        // Empty body: SHA-256("") = known constant
+        var empty: pchar := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"c;
+        var i: int64 := 0; var n: int64 := StrLen(empty);
+        while(i<n){poke8(out+i,StrCharAt(empty,i)&0xFF);i:=i+1;}
+        poke8(out+n,0);
+    } else {
+        sha256HexOf(body, bodyLen, out);
+    }
+}
+
+// ── SigV4 derived signing key ─────────────────────────────────────────────────
+// kSigning = HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date), region), service), "aws4_request")
+
+fn deriveSigningKey(secretKey: pchar, date: pchar, region: pchar, service: pchar, out: int64) {
+    // k1 = HMAC("AWS4" + secretKey, date)
+    var prefix: pchar := "AWS4"c;
+    var pl: int64 := StrLen(prefix);
+    var sl: int64 := StrLen(secretKey);
+    var kInit: int64 := alloc(pl + sl);
+    var i: int64 := 0;
+    while(i<pl){poke8(kInit+i,StrCharAt(prefix,i)&0xFF);i:=i+1;}
+    i:=0; while(i<sl){poke8(kInit+pl+i,StrCharAt(secretKey,i)&0xFF);i:=i+1;}
+    var dl: int64 := StrLen(date);
+    var k1: int64 := alloc(32);
+    HMAC_SHA256(kInit, pl+sl, date as int64, dl, k1);
+    free(kInit, pl+sl);
+
+    // k2 = HMAC(k1, region)
+    var rl: int64 := StrLen(region);
+    var k2: int64 := alloc(32);
+    HMAC_SHA256(k1, 32, region as int64, rl, k2);
+    free(k1, 32);
+
+    // k3 = HMAC(k2, service)
+    var svl: int64 := StrLen(service);
+    var k3: int64 := alloc(32);
+    HMAC_SHA256(k2, 32, service as int64, svl, k3);
+    free(k2, 32);
+
+    // kSigning = HMAC(k3, "aws4_request")
+    var term: pchar := "aws4_request"c;
+    var tl: int64 := StrLen(term);
+    HMAC_SHA256(k3, 32, term as int64, tl, out);
+    free(k3, 32);
+}
+
+// ── Main signing function ─────────────────────────────────────────────────────
+
+pub fn SigV4Sign(ctx: int64) {
+    var c: AWSSignCtx := ctx as AWSSignCtx;
+
+    var method:   pchar := c.method   as pchar;
+    var host:     pchar := c.host     as pchar;
+    var path:     pchar := c.path     as pchar;
+    var query:    pchar := c.query    as pchar;
+    var service:  pchar := c.service  as pchar;
+    var region:   pchar := c.region   as pchar;
+    var date:     pchar := c.date     as pchar;
+    var dateTime: pchar := c.dateTime as pchar;
+    var accessKey: pchar := c.accessKey as pchar;
+    var secretKey: pchar := c.secretKey as pchar;
+
+    // 1. Payload hash
+    var payloadHash: int64 := alloc(65);
+    buildPayloadHash(c.body, c.bodyLen, payloadHash);
+
+    // 2. Canonical headers (fixed order: host, x-amz-content-sha256 for S3, x-amz-date, security-token)
+    // Format: header-name:value\n (lowercase names, trimmed values)
+    var canonHeaders: int64 := alloc(1024);
+    var chOff: int64 := 0;
+    // host:
+    var hh: pchar := "host:"c;
+    chOff := appendStr(canonHeaders, chOff, hh);
+    chOff := appendStr(canonHeaders, chOff, host);
+    chOff := appendChar(canonHeaders, chOff, 10); // '\n'
+    // x-amz-content-sha256: (always for s3, harmless for others)
+    var xcs: pchar := "x-amz-content-sha256:"c;
+    chOff := appendStr(canonHeaders, chOff, xcs);
+    chOff := appendBytes(canonHeaders, chOff, payloadHash, 64);
+    chOff := appendChar(canonHeaders, chOff, 10);
+    // x-amz-date:
+    var xd: pchar := "x-amz-date:"c;
+    chOff := appendStr(canonHeaders, chOff, xd);
+    chOff := appendStr(canonHeaders, chOff, dateTime);
+    chOff := appendChar(canonHeaders, chOff, 10);
+    // x-amz-security-token (if set):
+    var hasTok: int64 := 0;
+    if (c.sessionToken != 0) {
+        var xt: pchar := "x-amz-security-token:"c;
+        chOff := appendStr(canonHeaders, chOff, xt);
+        chOff := appendStr(canonHeaders, chOff, c.sessionToken as pchar);
+        chOff := appendChar(canonHeaders, chOff, 10);
+        hasTok := 1;
+    }
+    poke8(canonHeaders + chOff, 0);
+
+    // 3. Signed headers list
+    var signedHeaders: int64 := alloc(128);
+    var sh: pchar := "host;x-amz-content-sha256;x-amz-date"c;
+    var shLen: int64 := StrLen(sh);
+    var i: int64 := 0;
+    while(i<shLen){poke8(signedHeaders+i,StrCharAt(sh,i)&0xFF);i:=i+1;}
+    if (hasTok == 1) {
+        var xt2: pchar := ";x-amz-security-token"c;
+        var xt2l: int64 := StrLen(xt2);
+        i:=0; while(i<xt2l){poke8(signedHeaders+shLen+i,StrCharAt(xt2,i)&0xFF);i:=i+1;}
+        shLen += xt2l;
+    }
+    poke8(signedHeaders+shLen, 0);
+
+    // 4. Canonical request:
+    // Method\nURI\nQuery\nHeaders\nSignedHeaders\nPayloadHash
+    var cr: int64 := alloc(4096);
+    var crOff: int64 := 0;
+    crOff := appendStr(cr, crOff, method); crOff := appendChar(cr, crOff, 10);
+    // URI (path must already be URI-encoded per S3 conventions)
+    crOff := appendStr(cr, crOff, path);   crOff := appendChar(cr, crOff, 10);
+    // Query string (already sorted + encoded by caller, or empty)
+    if (c.query != 0 && StrLen(query) > 0) {
+        crOff := appendStr(cr, crOff, query);
+    }
+    crOff := appendChar(cr, crOff, 10);
+    // Canonical headers
+    crOff := appendBytes(cr, crOff, canonHeaders, chOff);
+    crOff := appendChar(cr, crOff, 10);
+    // Signed headers
+    crOff := appendBytes(cr, crOff, signedHeaders, shLen); crOff := appendChar(cr, crOff, 10);
+    // Payload hash
+    crOff := appendBytes(cr, crOff, payloadHash, 64);
+    poke8(cr + crOff, 0);
+
+    // 5. Canonical request hash
+    var crHash: int64 := alloc(65);
+    sha256HexOf(cr, crOff, crHash);
+    free(cr, 4096);
+
+    // 6. Credential scope: date/region/service/aws4_request
+    var scope: int64 := alloc(128);
+    var scopeOff: int64 := 0;
+    scopeOff := appendStr(scope, scopeOff, date);    scopeOff := appendChar(scope, scopeOff, 47);
+    scopeOff := appendStr(scope, scopeOff, region);  scopeOff := appendChar(scope, scopeOff, 47);
+    scopeOff := appendStr(scope, scopeOff, service); scopeOff := appendChar(scope, scopeOff, 47);
+    var aws4r: pchar := "aws4_request"c;
+    scopeOff := appendStr(scope, scopeOff, aws4r);
+    poke8(scope + scopeOff, 0);
+
+    // 7. String to sign:
+    // "AWS4-HMAC-SHA256\n" + dateTime + "\n" + scope + "\n" + crHash
+    var sts: int64 := alloc(512);
+    var stsOff: int64 := 0;
+    var alg: pchar := "AWS4-HMAC-SHA256"c;
+    stsOff := appendStr(sts, stsOff, alg);       stsOff := appendChar(sts, stsOff, 10);
+    stsOff := appendStr(sts, stsOff, dateTime);  stsOff := appendChar(sts, stsOff, 10);
+    stsOff := appendBytes(sts, stsOff, scope, scopeOff); stsOff := appendChar(sts, stsOff, 10);
+    stsOff := appendBytes(sts, stsOff, crHash, 64);
+    poke8(sts + stsOff, 0);
+
+    // 8. Derive signing key
+    var signingKey: int64 := alloc(32);
+    deriveSigningKey(secretKey, date, region, service, signingKey);
+
+    // 9. Compute signature
+    var sigRaw: int64 := alloc(32);
+    HMAC_SHA256(signingKey, 32, sts, stsOff, sigRaw);
+    free(signingKey, 32);
+    free(sts, 512);
+
+    var sigHex: int64 := alloc(65);
+    hexEncodeBytes(sigRaw, 32, sigHex);
+    free(sigRaw, 32);
+
+    // 10. Build Authorization header value:
+    // AWS4-HMAC-SHA256 Credential=<key>/<scope>, SignedHeaders=<sh>, Signature=<sig>
+    var out: int64 := c.authHeader;
+    var outOff: int64 := 0;
+    outOff := appendStr(out, outOff, alg);
+    var sp: pchar := " Credential="c;
+    outOff := appendStr(out, outOff, sp);
+    outOff := appendStr(out, outOff, accessKey); outOff := appendChar(out, outOff, 47);
+    outOff := appendBytes(out, outOff, scope, scopeOff);
+    var cm: pchar := ", SignedHeaders="c;
+    outOff := appendStr(out, outOff, cm);
+    outOff := appendBytes(out, outOff, signedHeaders, shLen);
+    var sg: pchar := ", Signature="c;
+    outOff := appendStr(out, outOff, sg);
+    outOff := appendBytes(out, outOff, sigHex, 64);
+    poke8(out + outOff, 0);
+
+    free(payloadHash, 65);
+    free(canonHeaders, 1024);
+    free(signedHeaders, 128);
+    free(crHash, 65);
+    free(scope, 128);
+    free(sigHex, 65);
+}
+
+// SigV4SignQuery — generate presigned URL query parameters
+// Returns alloc'd pchar like:
+//   X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=...&X-Amz-Date=...&
+//   X-Amz-Expires=<sec>&X-Amz-SignedHeaders=host&X-Amz-Signature=<hex>
+pub fn SigV4SignQuery(ctx: int64, expires: int64): int64 {
+    var c: AWSSignCtx := ctx as AWSSignCtx;
+    var accessKey: pchar := c.accessKey as pchar;
+    var secretKey: pchar := c.secretKey as pchar;
+    var date:      pchar := c.date      as pchar;
+    var dateTime:  pchar := c.dateTime  as pchar;
+    var region:    pchar := c.region    as pchar;
+    var service:   pchar := c.service   as pchar;
+    var method:    pchar := c.method    as pchar;
+    var host:      pchar := c.host      as pchar;
+    var path:      pchar := c.path      as pchar;
+
+    // Credential scope
+    var scope: int64 := alloc(128);
+    var sOff: int64 := 0;
+    sOff := appendStr(scope, sOff, date); poke8(scope+sOff,47); sOff:=sOff+1;
+    sOff := appendStr(scope, sOff, region); poke8(scope+sOff,47); sOff:=sOff+1;
+    sOff := appendStr(scope, sOff, service); poke8(scope+sOff,47); sOff:=sOff+1;
+    var aws4r: pchar := "aws4_request"c;
+    sOff := appendStr(scope, sOff, aws4r);
+    poke8(scope+sOff,0);
+
+    // URL-encode credential: accessKey/scope
+    var credBuf: int64 := alloc(512);
+    var credOff: int64 := 0;
+    credOff := appendStr(credBuf, credOff, accessKey);
+    poke8(credBuf+credOff, 47); credOff:=credOff+1;
+    credOff := appendBytes(credBuf, credOff, scope, sOff);
+    poke8(credBuf+credOff, 0);
+
+    // expires as string
+    var expBuf: int64 := alloc(24);
+    var expStr: pchar := Int64ToStr(expires, expBuf);
+    var expLen: int64 := StrLen(expStr);
+
+    // Build query string (must be sorted alphabetically for canonical request):
+    // X-Amz-Algorithm=AWS4-HMAC-SHA256
+    // X-Amz-Credential=<encoded>
+    // X-Amz-Date=<dateTime>
+    // X-Amz-Expires=<n>
+    // X-Amz-SignedHeaders=host
+    var qBuf: int64 := alloc(2048);
+    var qOff: int64 := 0;
+    var q1: pchar := "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential="c;
+    qOff := appendStr(qBuf, qOff, q1);
+    // URI-encode credential (slash and forward-slash must be %2F in query)
+    var encCred: int64 := alloc(1024);
+    var i: int64 := 0;
+    while(i<credOff) {
+        var ch: int64 := peek8(credBuf+i) & 0xFF;
+        if (ch == 47) { // '/' → %2F
+            poke8(encCred+qOff+0, 37); poke8(encCred+qOff+1, 50); poke8(encCred+qOff+2, 70);
+            // actually write into qBuf
+            poke8(qBuf+qOff, 37); poke8(qBuf+qOff+1, 50); poke8(qBuf+qOff+2, 70);
+            qOff:=qOff+3;
+        } else {
+            poke8(qBuf+qOff, ch); qOff:=qOff+1;
+        }
+        i:=i+1;
+    }
+    free(encCred, 1024);
+    var q2: pchar := "&X-Amz-Date="c;
+    qOff := appendStr(qBuf, qOff, q2);
+    qOff := appendStr(qBuf, qOff, dateTime);
+    var q3: pchar := "&X-Amz-Expires="c;
+    qOff := appendStr(qBuf, qOff, q3);
+    qOff := appendStr(qBuf, qOff, expStr);
+    var q4: pchar := "&X-Amz-SignedHeaders=host"c;
+    qOff := appendStr(qBuf, qOff, q4);
+    if (c.sessionToken != 0) {
+        var q5: pchar := "&X-Amz-Security-Token="c;
+        qOff := appendStr(qBuf, qOff, q5);
+        // URI-encode session token
+        var encTok: int64 := alloc(1024);
+        var tokLen: int64 := uriEncode(c.sessionToken as pchar, encTok, 1);
+        qOff := appendBytes(qBuf, qOff, encTok, tokLen);
+        free(encTok, 1024);
+    }
+    poke8(qBuf+qOff, 0);
+
+    // Canonical request for presigned URL
+    var cr: int64 := alloc(4096);
+    var crOff: int64 := 0;
+    crOff := appendStr(cr, crOff, method); crOff := appendChar(cr, crOff, 10);
+    crOff := appendStr(cr, crOff, path);   crOff := appendChar(cr, crOff, 10);
+    crOff := appendBytes(cr, crOff, qBuf, qOff); crOff := appendChar(cr, crOff, 10);
+    var hh: pchar := "host:"c;
+    crOff := appendStr(cr, crOff, hh);
+    crOff := appendStr(cr, crOff, host);
+    crOff := appendChar(cr, crOff, 10);
+    crOff := appendChar(cr, crOff, 10); // blank line after headers
+    var shdr: pchar := "host"c;
+    crOff := appendStr(cr, crOff, shdr); crOff := appendChar(cr, crOff, 10);
+    var unsg: pchar := "UNSIGNED-PAYLOAD"c;
+    crOff := appendStr(cr, crOff, unsg);
+    poke8(cr+crOff, 0);
+
+    var crHash: int64 := alloc(65);
+    sha256HexOf(cr, crOff, crHash);
+    free(cr, 4096);
+
+    // StringToSign
+    var sts: int64 := alloc(512);
+    var stsOff: int64 := 0;
+    var alg: pchar := "AWS4-HMAC-SHA256"c;
+    stsOff := appendStr(sts, stsOff, alg);       stsOff := appendChar(sts, stsOff, 10);
+    stsOff := appendStr(sts, stsOff, dateTime);  stsOff := appendChar(sts, stsOff, 10);
+    stsOff := appendBytes(sts, stsOff, scope, sOff); stsOff := appendChar(sts, stsOff, 10);
+    stsOff := appendBytes(sts, stsOff, crHash, 64);
+    poke8(sts+stsOff, 0);
+
+    var sigKey: int64 := alloc(32);
+    deriveSigningKey(secretKey, date, region, service, sigKey);
+    var sigRaw: int64 := alloc(32);
+    HMAC_SHA256(sigKey, 32, sts, stsOff, sigRaw);
+    free(sigKey, 32);
+    free(sts, 512);
+
+    var sigHex: int64 := alloc(65);
+    hexEncodeBytes(sigRaw, 32, sigHex);
+    free(sigRaw, 32);
+
+    // Append &X-Amz-Signature=<hex>
+    var q6: pchar := "&X-Amz-Signature="c;
+    qOff := appendStr(qBuf, qOff, q6);
+    qOff := appendBytes(qBuf, qOff, sigHex, 64);
+    poke8(qBuf+qOff, 0);
+
+    free(scope, 128);
+    free(credBuf, 512);
+    free(expBuf, 24);
+    free(crHash, 65);
+    free(sigHex, 65);
+
+    // Return a copy of the query string
+    var result: int64 := alloc(qOff + 1);
+    i:=0; while(i<qOff){poke8(result+i,peek8(qBuf+i));i:=i+1;}
+    poke8(result+qOff, 0);
+    free(qBuf, 2048);
+    return result;
+}
+
+// SigV4DateNow — fill 8-byte date + 16-byte dateTime from system clock
+// Uses sys_clock_gettime(CLOCK_REALTIME) → seconds since epoch → decompose
+// date format:     "YYYYMMDD"
+// dateTime format: "YYYYMMDDTHHmmssZ"
+pub fn SigV4DateNow(dateBuf: int64, dateTimeBuf: int64) {
+    // Get seconds since epoch via sys_clock_gettime
+    var ts: int64 := alloc(16); // struct timespec {tv_sec, tv_nsec}
+    sys_clock_gettime(0, ts);   // CLOCK_REALTIME = 0
+    var sec: int64 := peek64(ts);
+    free(ts, 16);
+
+    // Decompose epoch seconds to calendar (simplified Gregorian)
+    var s: int64 := sec;
+
+    // Days since epoch
+    var days: int64 := s / 86400;
+    var rem: int64  := s - days * 86400;
+    var hour: int64  := rem / 3600;
+    var mrem: int64  := rem - hour * 3600;
+    var minute: int64 := mrem / 60;
+    var second: int64 := mrem - minute * 60;
+
+    // Date from days since 1970-01-01
+    var year: int64  := 1970;
+    var month: int64 := 1;
+    var day: int64   := 1;
+    var d: int64     := days;
+
+    // Advance years
+    while (1 == 1) {
+        var isLeap: int64 := 0;
+        if (year & 3 == 0) {
+            if (year - (year/100)*100 != 0) { isLeap := 1; }
+            else if (year - (year/400)*400 == 0) { isLeap := 1; }
+        }
+        var diy: int64 := 365;
+        if (isLeap == 1) { diy := 366; }
+        if (d < diy) { break; }
+        d -= diy;
+        year += 1;
+    }
+    // Advance months
+    var isLeapY: int64 := 0;
+    if (year & 3 == 0) {
+        if (year - (year/100)*100 != 0) { isLeapY := 1; }
+        else if (year - (year/400)*400 == 0) { isLeapY := 1; }
+    }
+    var mdays: int64 := alloc(13 * 8); // month day counts
+    poke64(mdays+0,  0); poke64(mdays+8,  31); poke64(mdays+16, 28+isLeapY);
+    poke64(mdays+24, 31); poke64(mdays+32, 30); poke64(mdays+40, 31);
+    poke64(mdays+48, 30); poke64(mdays+56, 31); poke64(mdays+64, 31);
+    poke64(mdays+72, 30); poke64(mdays+80, 31); poke64(mdays+88, 30);
+    poke64(mdays+96, 31);
+    month := 1;
+    while (month <= 12) {
+        var md: int64 := peek64(mdays + month * 8);
+        if (d < md) { break; }
+        d -= md;
+        month += 1;
+    }
+    free(mdays, 13 * 8);
+    day := d + 1;
+
+    // Write YYYYMMDD
+    fn w2(buf: int64, off: int64, n: int64) {
+        poke8(buf+off,   48 + (n/10));
+        poke8(buf+off+1, 48 + (n-((n/10)*10)));
+    }
+    fn w4(buf: int64, off: int64, n: int64) {
+        poke8(buf+off,   48 + (n/1000));
+        poke8(buf+off+1, 48 + ((n/100)-(n/1000)*10));
+        poke8(buf+off+2, 48 + ((n/10)-(n/100)*10));
+        poke8(buf+off+3, 48 + (n-(n/10)*10));
+    }
+    w4(dateBuf, 0, year);
+    w2(dateBuf, 4, month);
+    w2(dateBuf, 6, day);
+    poke8(dateBuf+8, 0);
+
+    // Write YYYYMMDDTHHmmssZ
+    w4(dateTimeBuf, 0,  year);
+    w2(dateTimeBuf, 4,  month);
+    w2(dateTimeBuf, 6,  day);
+    poke8(dateTimeBuf+8,  84); // 'T'
+    w2(dateTimeBuf, 9,  hour);
+    w2(dateTimeBuf, 11, minute);
+    w2(dateTimeBuf, 13, second);
+    poke8(dateTimeBuf+15, 90); // 'Z'
+    poke8(dateTimeBuf+16, 0);
+}

@@ -1,0 +1,1004 @@
+// std/edi/invoice.lyx — Invoicing: INVOIC + INVCON + COMDIS + COACSU (WP-EDI-08)
+//
+// INVOIC (BGM 380/381/383/386): invoice, credit note, debit, prepayment request.
+//   Tax validation: Σ(qty×price) == MOA+77 (net), Σ(tax) == MOA+176, net+tax == MOA+9.
+//   Tax types: S=19% (Standard), AA=7% (Reduced), Z=0% (Zero-rate), E=Exempt.
+// INVCON (BGM 44):  invoicing contract / standing order
+// COMDIS (BGM 34):  commercial dispute with free-text reason
+// COACSU (BGM 36):  commercial account summary (net + gross balance)
+//
+// Public API:
+//   EdiInvoicWrite(hdr, lines, lineCount, out, outMax)   → bytes
+//   EdiInvoicRead(buf, bufLen, hdr, lines, maxLines)     → lineCount
+//   EdiInvoicValidate(hdr, lines, lineCount)             → 0=ok 1=net-err 3=gross-err
+//   EdiInvconWrite(hdr, out, outMax)                     → bytes
+//   EdiInvconRead(buf, bufLen, hdr)                      → 1=ok 0=err
+//   EdiComdisWrite(hdr, out, outMax)                     → bytes
+//   EdiComdisRead(buf, bufLen, hdr)                      → 1=ok 0=err
+//   EdiCoacsuWrite(hdr, out, outMax)                     → bytes
+//   EdiCoacsuRead(buf, bufLen, hdr)                      → 1=ok 0=err
+
+unit std.edi.invoice;
+
+import std.edi.core;
+import std.alloc;
+
+// ── Tax type codes ────────────────────────────────────────────────────────────
+pub con EDI_INVOIC_TAX_S:  int64 := 1;   // Standard 19%
+pub con EDI_INVOIC_TAX_AA: int64 := 2;   // Reduced  7%
+pub con EDI_INVOIC_TAX_Z:  int64 := 3;   // Zero-rate 0%
+pub con EDI_INVOIC_TAX_E:  int64 := 4;   // Exempt    0%
+
+// ── EdiInvoiceHeader offsets ──────────────────────────────────────────────────
+pub con EDI_INVOIC_HDR_NUM:       int64 := 0;    // ptr to invoice number
+pub con EDI_INVOIC_HDR_NUMLEN:    int64 := 8;
+pub con EDI_INVOIC_HDR_DATE:      int64 := 16;
+pub con EDI_INVOIC_HDR_DATELEN:   int64 := 24;
+pub con EDI_INVOIC_HDR_BGMQUAL:   int64 := 32;   // 380=invoice 381=credit 383=debit 386=prepay
+pub con EDI_INVOIC_HDR_SUPPLIER:  int64 := 40;
+pub con EDI_INVOIC_HDR_SUPLEN:    int64 := 48;
+pub con EDI_INVOIC_HDR_BUYER:     int64 := 56;
+pub con EDI_INVOIC_HDR_BUYLEN:    int64 := 64;
+pub con EDI_INVOIC_HDR_CURRENCY:  int64 := 72;
+pub con EDI_INVOIC_HDR_CURLEN:    int64 := 80;
+pub con EDI_INVOIC_HDR_NETTOTAL:  int64 := 88;   // ×100 fixed-point (MOA+77)
+pub con EDI_INVOIC_HDR_TAXTOTAL:  int64 := 96;   // ×100 (MOA+176)
+pub con EDI_INVOIC_HDR_GROSSTOTAL:int64 := 104;  // ×100 (MOA+9)
+pub con EDI_INVOIC_HDR_SIZE:      int64 := 112;
+
+// ── EdiInvoiceLine offsets ────────────────────────────────────────────────────
+pub con EDI_INVOIC_LINE_GTIN:    int64 := 0;
+pub con EDI_INVOIC_LINE_GTINLEN: int64 := 8;
+pub con EDI_INVOIC_LINE_QTY:     int64 := 16;
+pub con EDI_INVOIC_LINE_PRICE:   int64 := 24;    // unit price ×100
+pub con EDI_INVOIC_LINE_NETAMT:  int64 := 32;    // qty × price (×100)
+pub con EDI_INVOIC_LINE_TAXTYPE: int64 := 40;    // EDI_INVOIC_TAX_*
+pub con EDI_INVOIC_LINE_LINENO:  int64 := 48;
+pub con EDI_INVOIC_LINE_SIZE:    int64 := 56;
+
+// ── EdiInvconHeader offsets ───────────────────────────────────────────────────
+pub con EDI_INVCON_HDR_CONTRACTNUM: int64 := 0;
+pub con EDI_INVCON_HDR_NUMLEN:      int64 := 8;
+pub con EDI_INVCON_HDR_DATE:        int64 := 16;
+pub con EDI_INVCON_HDR_DATELEN:     int64 := 24;
+pub con EDI_INVCON_HDR_INVOICEREF:  int64 := 32;
+pub con EDI_INVCON_HDR_REFLEN:      int64 := 40;
+pub con EDI_INVCON_HDR_AMOUNT:      int64 := 48;   // ×100
+pub con EDI_INVCON_HDR_CURRENCY:    int64 := 56;
+pub con EDI_INVCON_HDR_CURLEN:      int64 := 64;
+pub con EDI_INVCON_HDR_SIZE:        int64 := 72;
+
+// ── EdiComdisHeader offsets ───────────────────────────────────────────────────
+pub con EDI_COMDIS_HDR_DISPUTEREF: int64 := 0;
+pub con EDI_COMDIS_HDR_REFLEN:     int64 := 8;
+pub con EDI_COMDIS_HDR_DATE:       int64 := 16;
+pub con EDI_COMDIS_HDR_DATELEN:    int64 := 24;
+pub con EDI_COMDIS_HDR_INVOICEREF: int64 := 32;
+pub con EDI_COMDIS_HDR_IREFLEN:    int64 := 40;
+pub con EDI_COMDIS_HDR_AMOUNT:     int64 := 48;   // ×100
+pub con EDI_COMDIS_HDR_REASON:     int64 := 56;
+pub con EDI_COMDIS_HDR_REASONLEN:  int64 := 64;
+pub con EDI_COMDIS_HDR_SIZE:       int64 := 72;
+
+// ── EdiCoacsuHeader offsets ───────────────────────────────────────────────────
+pub con EDI_COACSU_HDR_ACCOUNTREF:   int64 := 0;
+pub con EDI_COACSU_HDR_REFLEN:       int64 := 8;
+pub con EDI_COACSU_HDR_DATE:         int64 := 16;
+pub con EDI_COACSU_HDR_DATELEN:      int64 := 24;
+pub con EDI_COACSU_HDR_NETBALANCE:   int64 := 32;   // ×100
+pub con EDI_COACSU_HDR_GROSSBALANCE: int64 := 40;   // ×100
+pub con EDI_COACSU_HDR_CURRENCY:     int64 := 48;
+pub con EDI_COACSU_HDR_CURLEN:       int64 := 56;
+pub con EDI_COACSU_HDR_SIZE:         int64 := 64;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn invStrLen(ptr: int64): int64 {
+    var n: int64 := 0;
+    while (peek8(ptr + n) != 0) { n := n + 1; }
+    return n;
+}
+
+fn invPutChar(out: int64, pos: int64, outMax: int64, ch: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (pos >= outMax) { return 0 - 1; }
+    poke8(out + pos, ch);
+    return pos + 1;
+}
+
+fn invPutStr(out: int64, pos: int64, outMax: int64, src: int64, n: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        if (pos + i >= outMax) { return 0 - 1; }
+        poke8(out + pos + i, peek8(src + i));
+        i += 1;
+    }
+    return pos + n;
+}
+
+fn invPutInt(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    if (pos < 0) { return 0 - 1; }
+    if (val < 0)  { return 0 - 1; }
+    if (val == 0) { return invPutChar(out, pos, outMax, 48); }
+    var tmp: int64 := val;
+    var digits: int64 := 0;
+    while (tmp > 0) { tmp := tmp / 10; digits := digits + 1; }
+    var buf: int64 := alloc(24);
+    tmp := val;
+    var idx: int64 := 1;
+    while (idx <= digits) {
+        var d: int64 := tmp - (tmp / 10) * 10;
+        poke8(buf + digits - idx, 48 + d);
+        tmp := tmp / 10;
+        idx += 1;
+    }
+    var r: int64 := invPutStr(out, pos, outMax, buf, digits);
+    free(buf, 24);
+    return r;
+}
+
+fn invPutRevenue(out: int64, pos: int64, outMax: int64, val: int64): int64 {
+    var euros: int64 := val / 100;
+    var cents: int64 := val - euros * 100;
+    pos := invPutInt(out, pos, outMax, euros);
+    pos := invPutChar(out, pos, outMax, 46);
+    if (cents < 10) { pos := invPutChar(out, pos, outMax, 48); }
+    pos := invPutInt(out, pos, outMax, cents);
+    return pos;
+}
+
+fn invParseInt(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c >= 48 && c <= 57) { v := v * 10 + (c - 48); }
+        i += 1;
+    }
+    return v;
+}
+
+fn invParseRevenue(ptr: int64, len: int64): int64 {
+    var v: int64 := 0;
+    var afterDot: int64 := 0;
+    var decimals: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        var c: int64 := peek8(ptr + i);
+        if (c == 46 || c == 44) { afterDot := 1; }
+        else {
+            if (c >= 48 && c <= 57) {
+                v := v * 10 + (c - 48);
+                if (afterDot == 1) { decimals := decimals + 1; }
+            }
+        }
+        i += 1;
+    }
+    if (afterDot == 0) { v := v * 100; }
+    if (decimals == 1) { v := v * 10; }
+    return v;
+}
+
+fn invTagIs(seg: int64, t0: int64, t1: int64, t2: int64): int64 {
+    var p: int64 := peek64(seg + EDI_SEG_PTR);
+    if (p == 0) { return 0; }
+    if (peek8(p) != t0) { return 0; }
+    if (peek8(p+1) != t1) { return 0; }
+    if (peek8(p+2) != t2) { return 0; }
+    return 1;
+}
+
+fn invElemPtr(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+}
+fn invElemLen(elems: int64, idx: int64): int64 {
+    return peek64(elems + idx * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+}
+
+// Write MOA+qualifier:amount' (qualifier as integer)
+fn invWriteMoa(out: int64, pos: int64, outMax: int64, qualifier: int64, amount: int64): int64 {
+    pos := invPutStr(out, pos, outMax, "MOA"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutInt(out, pos, outMax, qualifier);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutRevenue(out, pos, outMax, amount);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// Write TAX+7+VAT+++:::type' segment where typeCode: 1=S 2=AA 3=Z 4=E
+fn invWriteTaxSeg(out: int64, pos: int64, outMax: int64, typeCode: int64): int64 {
+    pos := invPutStr(out, pos, outMax, "TAX"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, 55);   // '7'
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutStr(out, pos, outMax, "VAT"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    if (typeCode == EDI_INVOIC_TAX_S) { pos := invPutChar(out, pos, outMax, 83); }   // 'S'
+    if (typeCode == EDI_INVOIC_TAX_AA) {
+        pos := invPutChar(out, pos, outMax, 65);   // 'A'
+        pos := invPutChar(out, pos, outMax, 65);
+    }
+    if (typeCode == EDI_INVOIC_TAX_Z) { pos := invPutChar(out, pos, outMax, 90); }   // 'Z'
+    if (typeCode == EDI_INVOIC_TAX_E) { pos := invPutChar(out, pos, outMax, 69); }   // 'E'
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// Write NAD+role+glnValue::9' (rolePtr is "SU" or "BY" etc.)
+fn invWriteNad(out: int64, pos: int64, outMax: int64, rolePtr: int64, glnPtr: int64, glnLen: int64): int64 {
+    pos := invPutStr(out, pos, outMax, "NAD"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutStr(out, pos, outMax, rolePtr, 2);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (glnPtr != 0 && glnLen > 0) {
+        pos := invPutStr(out, pos, outMax, glnPtr, glnLen);
+    }
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutChar(out, pos, outMax, 57);   // '9'
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// Write DTM+137:date:102'
+fn invWriteDtm(out: int64, pos: int64, outMax: int64, date: int64): int64 {
+    pos := invPutStr(out, pos, outMax, "DTM"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutStr(out, pos, outMax, "137"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutStr(out, pos, outMax, date, 8);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutStr(out, pos, outMax, "102"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// Write RFF+qualifier:ref'
+fn invWriteRff(out: int64, pos: int64, outMax: int64, qualPtr: int64, refPtr: int64, refLen: int64): int64 {
+    pos := invPutStr(out, pos, outMax, "RFF"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutStr(out, pos, outMax, qualPtr, 2);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    if (refPtr != 0 && refLen > 0) {
+        pos := invPutStr(out, pos, outMax, refPtr, refLen);
+    }
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — INVOIC
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Write INVOIC. Totals are computed from lines; header totals are ignored for output.
+pub fn EdiInvoicWrite(hdr: int64, lines: int64, lineCount: int64, out: int64, outMax: int64): int64 {
+    var bgmQual: int64 := peek64(hdr + EDI_INVOIC_HDR_BGMQUAL);
+    var numPtr:  int64 := peek64(hdr + EDI_INVOIC_HDR_NUM);
+    var numLen:  int64 := peek64(hdr + EDI_INVOIC_HDR_NUMLEN);
+    var datePtr: int64 := peek64(hdr + EDI_INVOIC_HDR_DATE);
+    var supPtr:  int64 := peek64(hdr + EDI_INVOIC_HDR_SUPPLIER);
+    var supLen:  int64 := peek64(hdr + EDI_INVOIC_HDR_SUPLEN);
+    var buyPtr:  int64 := peek64(hdr + EDI_INVOIC_HDR_BUYER);
+    var buyLen:  int64 := peek64(hdr + EDI_INVOIC_HDR_BUYLEN);
+    var curPtr:  int64 := peek64(hdr + EDI_INVOIC_HDR_CURRENCY);
+    var curLen:  int64 := peek64(hdr + EDI_INVOIC_HDR_CURLEN);
+
+    if (bgmQual == 0) { bgmQual := 380; }
+
+    var pos: int64 := 0;
+
+    // BGM+qualifier+invoiceNum+9'
+    pos := invPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutInt(out, pos, outMax, bgmQual);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (numPtr != 0 && numLen > 0) { pos := invPutStr(out, pos, outMax, numPtr, numLen); }
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, 57);   // '9'
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    if (datePtr != 0) { pos := invWriteDtm(out, pos, outMax, datePtr); }
+    if (supPtr != 0 && supLen > 0) { pos := invWriteNad(out, pos, outMax, "SU"c as int64, supPtr, supLen); }
+    if (buyPtr != 0 && buyLen > 0) { pos := invWriteNad(out, pos, outMax, "BY"c as int64, buyPtr, buyLen); }
+
+    // CUX+2:currency:4'
+    if (curPtr != 0 && curLen > 0) {
+        pos := invPutStr(out, pos, outMax, "CUX"c as int64, 3);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := invPutChar(out, pos, outMax, 50);   // '2'
+        pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := invPutStr(out, pos, outMax, curPtr, curLen);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := invPutChar(out, pos, outMax, 52);   // '4'
+        pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    // Tax accumulator: [0]=base_S [8]=tax_S [16]=base_AA [24]=tax_AA [32]=base_Z [40]=tax_Z [48]=base_E [56]=tax_E
+    var taxAcc: int64 := alloc(64);
+    var zi: int64 := 0;
+    while (zi < 64) { poke8(taxAcc + zi, 0); zi := zi + 1; }
+    var netTotal: int64 := 0;
+
+    var li: int64 := 0;
+    while (li < lineCount) {
+        var line: int64 := lines + li * EDI_INVOIC_LINE_SIZE;
+        var gtinPtr: int64 := peek64(line + EDI_INVOIC_LINE_GTIN);
+        var gtinLen: int64 := peek64(line + EDI_INVOIC_LINE_GTINLEN);
+        var qty:     int64 := peek64(line + EDI_INVOIC_LINE_QTY);
+        var price:   int64 := peek64(line + EDI_INVOIC_LINE_PRICE);
+        var netAmt:  int64 := peek64(line + EDI_INVOIC_LINE_NETAMT);
+        var taxType: int64 := peek64(line + EDI_INVOIC_LINE_TAXTYPE);
+
+        // LIN+n++GTIN:SRV'
+        pos := invPutStr(out, pos, outMax, "LIN"c as int64, 3);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := invPutInt(out, pos, outMax, li + 1);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+        if (gtinPtr != 0 && gtinLen > 0) {
+            pos := invPutStr(out, pos, outMax, gtinPtr, gtinLen);
+            pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+            pos := invPutStr(out, pos, outMax, "SRV"c as int64, 3);
+        }
+        pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // QTY+47:qty'
+        pos := invPutStr(out, pos, outMax, "QTY"c as int64, 3);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := invPutStr(out, pos, outMax, "47"c as int64, 2);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := invPutInt(out, pos, outMax, qty);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // PRI+AAA:price:CP'
+        pos := invPutStr(out, pos, outMax, "PRI"c as int64, 3);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := invPutStr(out, pos, outMax, "AAA"c as int64, 3);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := invPutRevenue(out, pos, outMax, price);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := invPutStr(out, pos, outMax, "CP"c as int64, 2);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+        // MOA+203:netAmt'
+        pos := invWriteMoa(out, pos, outMax, 203, netAmt);
+
+        // TAX+7+VAT+++:::type'
+        pos := invWriteTaxSeg(out, pos, outMax, taxType);
+
+        // Accumulate tax
+        netTotal += netAmt;
+        if (taxType == EDI_INVOIC_TAX_S) {
+            poke64(taxAcc + 0, peek64(taxAcc + 0) + netAmt);
+            poke64(taxAcc + 8, peek64(taxAcc + 8) + netAmt * 19 / 100);
+        }
+        if (taxType == EDI_INVOIC_TAX_AA) {
+            poke64(taxAcc + 16, peek64(taxAcc + 16) + netAmt);
+            poke64(taxAcc + 24, peek64(taxAcc + 24) + netAmt * 7 / 100);
+        }
+        if (taxType == EDI_INVOIC_TAX_Z) { poke64(taxAcc + 32, peek64(taxAcc + 32) + netAmt); }
+        if (taxType == EDI_INVOIC_TAX_E) { poke64(taxAcc + 48, peek64(taxAcc + 48) + netAmt); }
+
+        li += 1;
+    }
+
+    // UNS+S'  (summary section separator)
+    pos := invPutStr(out, pos, outMax, "UNS"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, 83);   // 'S'
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    // Per-tax-type summary
+    var taxTotal: int64 := 0;
+    if (peek64(taxAcc + 0) > 0) {
+        pos := invWriteTaxSeg(out, pos, outMax, EDI_INVOIC_TAX_S);
+        pos := invWriteMoa(out, pos, outMax, 125, peek64(taxAcc + 0));
+        pos := invWriteMoa(out, pos, outMax, 124, peek64(taxAcc + 8));
+        taxTotal := taxTotal + peek64(taxAcc + 8);
+    }
+    if (peek64(taxAcc + 16) > 0) {
+        pos := invWriteTaxSeg(out, pos, outMax, EDI_INVOIC_TAX_AA);
+        pos := invWriteMoa(out, pos, outMax, 125, peek64(taxAcc + 16));
+        pos := invWriteMoa(out, pos, outMax, 124, peek64(taxAcc + 24));
+        taxTotal := taxTotal + peek64(taxAcc + 24);
+    }
+    if (peek64(taxAcc + 32) > 0) {
+        pos := invWriteTaxSeg(out, pos, outMax, EDI_INVOIC_TAX_Z);
+        pos := invWriteMoa(out, pos, outMax, 125, peek64(taxAcc + 32));
+        pos := invWriteMoa(out, pos, outMax, 124, 0);
+    }
+    if (peek64(taxAcc + 48) > 0) {
+        pos := invWriteTaxSeg(out, pos, outMax, EDI_INVOIC_TAX_E);
+        pos := invWriteMoa(out, pos, outMax, 125, peek64(taxAcc + 48));
+        pos := invWriteMoa(out, pos, outMax, 124, 0);
+    }
+    free(taxAcc, 64);
+
+    // MOA+77:netTotal' MOA+176:taxTotal' MOA+9:grossTotal'
+    pos := invWriteMoa(out, pos, outMax, 77, netTotal);
+    pos := invWriteMoa(out, pos, outMax, 176, taxTotal);
+    pos := invWriteMoa(out, pos, outMax, 9, netTotal + taxTotal);
+
+    // CNT+2:lineCount'
+    pos := invPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, 50);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutInt(out, pos, outMax, lineCount);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    return pos;
+}
+
+// Parse INVOIC. Returns line count.
+pub fn EdiInvoicRead(buf: int64, bufLen: int64, hdr: int64, lines: int64, maxLines: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var count: int64 := 0;
+    var curLine: int64 := 0;
+    var inSummary: int64 := 0;
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            // BGM → qualifier and invoice number
+            if (invTagIs(seg, 66, 71, 77) == 1) {   // "BGM"
+                if (n > 0) { poke64(hdr + EDI_INVOIC_HDR_BGMQUAL, invParseInt(invElemPtr(elems, 0), invElemLen(elems, 0))); }
+                if (n > 1) {
+                    poke64(hdr + EDI_INVOIC_HDR_NUM,    invElemPtr(elems, 1));
+                    poke64(hdr + EDI_INVOIC_HDR_NUMLEN, invElemLen(elems, 1));
+                }
+            }
+
+            // DTM → date (qualifier 137)
+            if (invTagIs(seg, 68, 84, 77) == 1 && inSummary == 0) {   // "DTM"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 0), invElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "137" = 49,51,55
+                        if (ql == 3 && peek8(qp) == 49 && peek8(qp+1) == 51 && peek8(qp+2) == 55) {
+                            poke64(hdr + EDI_INVOIC_HDR_DATE,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_INVOIC_HDR_DATELEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // NAD → supplier or buyer GLN
+            if (invTagIs(seg, 78, 65, 68) == 1) {   // "NAD"
+                if (n > 1) {
+                    var qp: int64 := invElemPtr(elems, 0);
+                    var ql: int64 := invElemLen(elems, 0);
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    EdiComponentSplit(invElemPtr(elems, 1), invElemLen(elems, 1), comps, 4);
+                    var gp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                    var gl: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                    // "SU" = 83,85
+                    if (ql >= 2 && peek8(qp) == 83 && peek8(qp+1) == 85) {
+                        poke64(hdr + EDI_INVOIC_HDR_SUPPLIER, gp);
+                        poke64(hdr + EDI_INVOIC_HDR_SUPLEN,   gl);
+                    }
+                    // "BY" = 66,89
+                    if (ql >= 2 && peek8(qp) == 66 && peek8(qp+1) == 89) {
+                        poke64(hdr + EDI_INVOIC_HDR_BUYER,  gp);
+                        poke64(hdr + EDI_INVOIC_HDR_BUYLEN, gl);
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // CUX → currency from comp[1]
+            if (invTagIs(seg, 67, 85, 88) == 1) {   // "CUX"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 0), invElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        poke64(hdr + EDI_INVOIC_HDR_CURRENCY, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_INVOIC_HDR_CURLEN,   peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // UNS+S → enter summary section
+            if (invTagIs(seg, 85, 78, 83) == 1) {   // "UNS"
+                inSummary := 1;
+                curLine := 0;
+            }
+
+            // LIN → new invoice line (only in line section)
+            if (invTagIs(seg, 76, 73, 78) == 1 && inSummary == 0) {   // "LIN"
+                if (count < maxLines) {
+                    curLine := lines + count * EDI_INVOIC_LINE_SIZE;
+                    var zi: int64 := 0;
+                    while (zi < EDI_INVOIC_LINE_SIZE) { poke8(curLine + zi, 0); zi := zi + 1; }
+                    poke64(curLine + EDI_INVOIC_LINE_LINENO, count + 1);
+                    if (n > 2) {
+                        var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                        EdiComponentSplit(invElemPtr(elems, 2), invElemLen(elems, 2), comps, 4);
+                        poke64(curLine + EDI_INVOIC_LINE_GTIN,    peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(curLine + EDI_INVOIC_LINE_GTINLEN, peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        free(comps, 4 * EDI_ELEM_SIZE);
+                    }
+                    count += 1;
+                }
+            }
+
+            // QTY+47:qty' → invoiced quantity for current line
+            if (invTagIs(seg, 81, 84, 89) == 1 && curLine != 0) {   // "QTY"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 0), invElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "47" = 52,55
+                        if (ql == 2 && peek8(qp) == 52 && peek8(qp+1) == 55) {
+                            var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                            var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            poke64(curLine + EDI_INVOIC_LINE_QTY, invParseInt(vp, vl));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // PRI+AAA:price:CP' → unit price
+            if (invTagIs(seg, 80, 82, 73) == 1 && curLine != 0) {   // "PRI"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 0), invElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        // "AAA" = 65,65,65
+                        if (ql >= 3 && peek8(qp) == 65 && peek8(qp+1) == 65 && peek8(qp+2) == 65) {
+                            var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                            var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                            poke64(curLine + EDI_INVOIC_LINE_PRICE, invParseRevenue(vp, vl));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // TAX → line tax type (before UNS+S)
+            if (invTagIs(seg, 84, 65, 88) == 1 && curLine != 0 && inSummary == 0) {   // "TAX"
+                if (n > 4) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 4), invElemLen(elems, 4), comps, 4);
+                    if (nc > 3) {
+                        var tp: int64 := peek64(comps + 3 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var tl: int64 := peek64(comps + 3 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        if (tl >= 1) {
+                            var tc: int64 := peek8(tp);
+                            if (tc == 83) { poke64(curLine + EDI_INVOIC_LINE_TAXTYPE, EDI_INVOIC_TAX_S); }
+                            if (tc == 65 && tl >= 2 && peek8(tp+1) == 65) { poke64(curLine + EDI_INVOIC_LINE_TAXTYPE, EDI_INVOIC_TAX_AA); }
+                            if (tc == 90) { poke64(curLine + EDI_INVOIC_LINE_TAXTYPE, EDI_INVOIC_TAX_Z); }
+                            if (tc == 69) { poke64(curLine + EDI_INVOIC_LINE_TAXTYPE, EDI_INVOIC_TAX_E); }
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+
+            // MOA → line net or summary totals
+            if (invTagIs(seg, 77, 79, 65) == 1) {   // "MOA"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 0), invElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var amt: int64 := invParseRevenue(vp, vl);
+                        // "203" = 50,48,51 → line net amount
+                        if (curLine != 0 && inSummary == 0 && ql == 3 && peek8(qp) == 50 && peek8(qp+1) == 48 && peek8(qp+2) == 51) {
+                            poke64(curLine + EDI_INVOIC_LINE_NETAMT, amt);
+                        }
+                        // "77" = 55,55 → net total
+                        if (inSummary == 1 && ql == 2 && peek8(qp) == 55 && peek8(qp+1) == 55) {
+                            poke64(hdr + EDI_INVOIC_HDR_NETTOTAL, amt);
+                        }
+                        // "176" = 49,55,54 → tax total
+                        if (inSummary == 1 && ql == 3 && peek8(qp) == 49 && peek8(qp+1) == 55 && peek8(qp+2) == 54) {
+                            poke64(hdr + EDI_INVOIC_HDR_TAXTOTAL, amt);
+                        }
+                        // "9" = 57 → gross total
+                        if (inSummary == 1 && ql == 1 && peek8(qp) == 57) {
+                            poke64(hdr + EDI_INVOIC_HDR_GROSSTOTAL, amt);
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return count;
+}
+
+// Validate INVOIC totals. Returns 0=ok, 1=net mismatch, 3=gross mismatch.
+// Tolerance: ≤1 cent (≤1 in ×100 representation) per check.
+pub fn EdiInvoicValidate(hdr: int64, lines: int64, lineCount: int64): int64 {
+    var netTotal:   int64 := peek64(hdr + EDI_INVOIC_HDR_NETTOTAL);
+    var taxTotal:   int64 := peek64(hdr + EDI_INVOIC_HDR_TAXTOTAL);
+    var grossTotal: int64 := peek64(hdr + EDI_INVOIC_HDR_GROSSTOTAL);
+
+    var lineSum: int64 := 0;
+    var li: int64 := 0;
+    while (li < lineCount) {
+        var line: int64 := lines + li * EDI_INVOIC_LINE_SIZE;
+        lineSum := lineSum + peek64(line + EDI_INVOIC_LINE_NETAMT);
+        li += 1;
+    }
+
+    var netDiff: int64 := lineSum - netTotal;
+    if (netDiff < 0) { netDiff := 0 - netDiff; }
+    if (netDiff > 1) { return 1; }
+
+    var expectedGross: int64 := netTotal + taxTotal;
+    var grossDiff: int64 := expectedGross - grossTotal;
+    if (grossDiff < 0) { grossDiff := 0 - grossDiff; }
+    if (grossDiff > 1) { return 3; }
+
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — INVCON
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn EdiInvconWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    var numPtr: int64 := peek64(hdr + EDI_INVCON_HDR_CONTRACTNUM);
+    var numLen: int64 := peek64(hdr + EDI_INVCON_HDR_NUMLEN);
+    var datePtr:int64 := peek64(hdr + EDI_INVCON_HDR_DATE);
+    var refPtr: int64 := peek64(hdr + EDI_INVCON_HDR_INVOICEREF);
+    var refLen: int64 := peek64(hdr + EDI_INVCON_HDR_REFLEN);
+    var amount: int64 := peek64(hdr + EDI_INVCON_HDR_AMOUNT);
+    var curPtr: int64 := peek64(hdr + EDI_INVCON_HDR_CURRENCY);
+    var curLen: int64 := peek64(hdr + EDI_INVCON_HDR_CURLEN);
+
+    var pos: int64 := 0;
+    pos := invPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutStr(out, pos, outMax, "44"c as int64, 2);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (numPtr != 0 && numLen > 0) { pos := invPutStr(out, pos, outMax, numPtr, numLen); }
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, 57);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    if (datePtr != 0) { pos := invWriteDtm(out, pos, outMax, datePtr); }
+
+    if (refPtr != 0 && refLen > 0) { pos := invWriteRff(out, pos, outMax, "IV"c as int64, refPtr, refLen); }
+
+    // MOA+9:amount:currency'
+    pos := invPutStr(out, pos, outMax, "MOA"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, 57);   // '9'
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutRevenue(out, pos, outMax, amount);
+    if (curPtr != 0 && curLen > 0) {
+        pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := invPutStr(out, pos, outMax, curPtr, curLen);
+    }
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    pos := invPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, 50);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutChar(out, pos, outMax, 49);   // '1'
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+pub fn EdiInvconRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            if (invTagIs(seg, 66, 71, 77) == 1) {   // "BGM"
+                if (n > 1) {
+                    poke64(hdr + EDI_INVCON_HDR_CONTRACTNUM, invElemPtr(elems, 1));
+                    poke64(hdr + EDI_INVCON_HDR_NUMLEN,      invElemLen(elems, 1));
+                }
+            }
+            if (invTagIs(seg, 68, 84, 77) == 1) {   // "DTM"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 0), invElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        poke64(hdr + EDI_INVCON_HDR_DATE,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_INVCON_HDR_DATELEN, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+            if (invTagIs(seg, 82, 70, 70) == 1) {   // "RFF"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 0), invElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        poke64(hdr + EDI_INVCON_HDR_INVOICEREF, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_INVCON_HDR_REFLEN,     peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+            if (invTagIs(seg, 77, 79, 65) == 1) {   // "MOA"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 0), invElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        poke64(hdr + EDI_INVCON_HDR_AMOUNT, invParseRevenue(peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR), peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN)));
+                        if (nc > 2) {
+                            poke64(hdr + EDI_INVCON_HDR_CURRENCY, peek64(comps + 2 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                            poke64(hdr + EDI_INVCON_HDR_CURLEN,   peek64(comps + 2 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — COMDIS
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn EdiComdisWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    var refPtr: int64 := peek64(hdr + EDI_COMDIS_HDR_DISPUTEREF);
+    var refLen: int64 := peek64(hdr + EDI_COMDIS_HDR_REFLEN);
+    var datePtr:int64 := peek64(hdr + EDI_COMDIS_HDR_DATE);
+    var irefPtr:int64 := peek64(hdr + EDI_COMDIS_HDR_INVOICEREF);
+    var irefLen:int64 := peek64(hdr + EDI_COMDIS_HDR_IREFLEN);
+    var amount: int64 := peek64(hdr + EDI_COMDIS_HDR_AMOUNT);
+    var rsPtr:  int64 := peek64(hdr + EDI_COMDIS_HDR_REASON);
+    var rsLen:  int64 := peek64(hdr + EDI_COMDIS_HDR_REASONLEN);
+
+    var pos: int64 := 0;
+    pos := invPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutStr(out, pos, outMax, "34"c as int64, 2);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (refPtr != 0 && refLen > 0) { pos := invPutStr(out, pos, outMax, refPtr, refLen); }
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, 57);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    if (datePtr != 0) { pos := invWriteDtm(out, pos, outMax, datePtr); }
+    if (irefPtr != 0 && irefLen > 0) { pos := invWriteRff(out, pos, outMax, "IV"c as int64, irefPtr, irefLen); }
+    pos := invWriteMoa(out, pos, outMax, 125, amount);
+
+    if (rsPtr != 0 && rsLen > 0) {
+        pos := invPutStr(out, pos, outMax, "FTX"c as int64, 3);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := invPutStr(out, pos, outMax, "AAI"c as int64, 3);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := invPutStr(out, pos, outMax, rsPtr, rsLen);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    pos := invPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, 50);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutChar(out, pos, outMax, 49);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+pub fn EdiComdisRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            if (invTagIs(seg, 66, 71, 77) == 1) {   // "BGM"
+                if (n > 1) {
+                    poke64(hdr + EDI_COMDIS_HDR_DISPUTEREF, invElemPtr(elems, 1));
+                    poke64(hdr + EDI_COMDIS_HDR_REFLEN,     invElemLen(elems, 1));
+                }
+            }
+            if (invTagIs(seg, 82, 70, 70) == 1) {   // "RFF"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 0), invElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        poke64(hdr + EDI_COMDIS_HDR_INVOICEREF, peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR));
+                        poke64(hdr + EDI_COMDIS_HDR_IREFLEN,    peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+            if (invTagIs(seg, 77, 79, 65) == 1) {   // "MOA"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 0), invElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        poke64(hdr + EDI_COMDIS_HDR_AMOUNT, invParseRevenue(peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR), peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN)));
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+            if (invTagIs(seg, 70, 84, 88) == 1) {   // "FTX"
+                if (n > 3) {
+                    poke64(hdr + EDI_COMDIS_HDR_REASON,    invElemPtr(elems, 3));
+                    poke64(hdr + EDI_COMDIS_HDR_REASONLEN, invElemLen(elems, 3));
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API — COACSU
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn EdiCoacsuWrite(hdr: int64, out: int64, outMax: int64): int64 {
+    var refPtr: int64 := peek64(hdr + EDI_COACSU_HDR_ACCOUNTREF);
+    var refLen: int64 := peek64(hdr + EDI_COACSU_HDR_REFLEN);
+    var datePtr:int64 := peek64(hdr + EDI_COACSU_HDR_DATE);
+    var netBal: int64 := peek64(hdr + EDI_COACSU_HDR_NETBALANCE);
+    var grsBal: int64 := peek64(hdr + EDI_COACSU_HDR_GROSSBALANCE);
+    var curPtr: int64 := peek64(hdr + EDI_COACSU_HDR_CURRENCY);
+    var curLen: int64 := peek64(hdr + EDI_COACSU_HDR_CURLEN);
+
+    var pos: int64 := 0;
+    pos := invPutStr(out, pos, outMax, "BGM"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutStr(out, pos, outMax, "36"c as int64, 2);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    if (refPtr != 0 && refLen > 0) { pos := invPutStr(out, pos, outMax, refPtr, refLen); }
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, 57);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+
+    if (datePtr != 0) { pos := invWriteDtm(out, pos, outMax, datePtr); }
+
+    // CUX+2:currency:4'
+    if (curPtr != 0 && curLen > 0) {
+        pos := invPutStr(out, pos, outMax, "CUX"c as int64, 3);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+        pos := invPutChar(out, pos, outMax, 50);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := invPutStr(out, pos, outMax, curPtr, curLen);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+        pos := invPutChar(out, pos, outMax, 52);
+        pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+    }
+
+    pos := invWriteMoa(out, pos, outMax, 77, netBal);
+    pos := invWriteMoa(out, pos, outMax, 9, grsBal);
+
+    pos := invPutStr(out, pos, outMax, "CNT"c as int64, 3);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_DATA);
+    pos := invPutChar(out, pos, outMax, 50);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_COMP);
+    pos := invPutChar(out, pos, outMax, 49);
+    pos := invPutChar(out, pos, outMax, EDI_DEF_SEG);
+    return pos;
+}
+
+pub fn EdiCoacsuRead(buf: int64, bufLen: int64, hdr: int64): int64 {
+    var una: int64 := alloc(EDI_UNA_SIZE);
+    EdiUnaRead(buf, bufLen, una);
+    var startPos: int64 := 0;
+    if (peek8(buf) == 85 && peek8(buf+1) == 78 && peek8(buf+2) == 65) { startPos := 9; }
+    var sctx: int64 := alloc(EDI_SEGCTX_SIZE);
+    EdiSegCtxInit(sctx, una, startPos);
+    var seg: int64 := alloc(EDI_SEG_SIZE);
+    var elems: int64 := alloc(8 * EDI_ELEM_SIZE);
+    var done: int64 := 0;
+
+    while (done == 0) {
+        var r: int64 := EdiSegmentNext(buf, bufLen, sctx, seg);
+        if (r == 0) { done := 1; }
+        else {
+            var n: int64 := EdiElementSplit(seg, elems, 8);
+
+            if (invTagIs(seg, 66, 71, 77) == 1) {   // "BGM"
+                if (n > 1) {
+                    poke64(hdr + EDI_COACSU_HDR_ACCOUNTREF, invElemPtr(elems, 1));
+                    poke64(hdr + EDI_COACSU_HDR_REFLEN,     invElemLen(elems, 1));
+                }
+            }
+            if (invTagIs(seg, 77, 79, 65) == 1) {   // "MOA"
+                if (n > 0) {
+                    var comps: int64 := alloc(4 * EDI_ELEM_SIZE);
+                    var nc: int64 := EdiComponentSplit(invElemPtr(elems, 0), invElemLen(elems, 0), comps, 4);
+                    if (nc > 1) {
+                        var qp: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var ql: int64 := peek64(comps + 0 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var vp: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_PTR);
+                        var vl: int64 := peek64(comps + 1 * EDI_ELEM_SIZE + EDI_ELEM_LEN);
+                        var amt: int64 := invParseRevenue(vp, vl);
+                        // "77" = 55,55 → net balance
+                        if (ql == 2 && peek8(qp) == 55 && peek8(qp+1) == 55) {
+                            poke64(hdr + EDI_COACSU_HDR_NETBALANCE, amt);
+                        }
+                        // "9" = 57 → gross balance
+                        if (ql == 1 && peek8(qp) == 57) {
+                            poke64(hdr + EDI_COACSU_HDR_GROSSBALANCE, amt);
+                        }
+                    }
+                    free(comps, 4 * EDI_ELEM_SIZE);
+                }
+            }
+        }
+    }
+
+    free(elems, 8 * EDI_ELEM_SIZE);
+    free(seg, EDI_SEG_SIZE);
+    free(sctx, EDI_SEGCTX_SIZE);
+    free(una, EDI_UNA_SIZE);
+    return 1;
+}

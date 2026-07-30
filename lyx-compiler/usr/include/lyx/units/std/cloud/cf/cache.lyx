@@ -1,0 +1,391 @@
+// std/cloud/cf/cache.lyx — Cloudflare Cache, Page Rules, Transform Rules
+// WP-CF-04
+
+unit std.cloud.cf.cache;
+
+import std.cloud.cf.transport;
+import std.cloud.cf.core;
+import std.alloc;
+import std.io;
+
+pub con CF_PR_ALWAYS_HTTPS:      int64 := "always_use_https"c as int64;
+pub con CF_PR_BROWSER_CACHE_TTL: int64 := "browser_cache_ttl"c as int64;
+pub con CF_PR_CACHE_LEVEL:       int64 := "cache_level"c as int64;
+pub con CF_PR_EDGE_CACHE_TTL:    int64 := "edge_cache_ttl"c as int64;
+pub con CF_PR_FORWARDING_URL:    int64 := "forwarding_url"c as int64;
+pub con CF_PR_SSL:               int64 := "ssl"c as int64;
+
+pub type CFCacheRule = struct {
+    id:          int64;  // pchar
+    description: int64;  // pchar
+    expression:  int64;  // pchar — Wirefilter expression
+    action:      int64;  // pchar: "set_cache_settings","bypass_cache","serve_stale"
+    enabled:     int64;
+    browserTTL:  int64;
+    edgeTTL:     int64;
+    cacheKey:    int64;  // pchar (JSON)
+    serveStale:  int64;
+};
+
+pub type CFPageRule = struct {
+    id:       int64;  // pchar
+    targets:  int64;  // pchar (JSON array)
+    actions:  int64;  // pchar (JSON array)
+    priority: int64;
+    status:   int64;  // pchar
+    created:  int64;  // pchar
+    modified: int64;  // pchar
+};
+
+pub type CFTransformRule = struct {
+    id:          int64;  // pchar
+    description: int64;  // pchar
+    expression:  int64;  // pchar
+    action:      int64;  // pchar
+    enabled:     int64;
+    pathValue:   int64;  // pchar
+    queryValue:  int64;  // pchar
+};
+
+fn cachePurgePath(zoneId: pchar): int64 {
+    var buf: int64 := alloc(256);
+    var off: int64 := cftAppend(buf, 0, "/zones/"c);
+    off := cftAppend(buf, off, zoneId);
+    off := cftAppend(buf, off, "/purge_cache"c); poke8(buf+off, 0);
+    return buf;
+}
+
+fn freeIfSet(p: int64) {
+    if (p != 0) { free(p, StrLen(p as pchar)+1); }
+}
+
+// Cache purge
+
+pub fn CachePurgeAll(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := cachePurgePath(zoneId);
+    var body: pchar := "{\"purge_everything\":true}"c;
+    var r: CFResponse := CFPost(c, path as pchar, body as int64, StrLen(body));
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn CachePurgeFiles(c: CFClient, zoneId: pchar, urls: int64, count: int64): int64 {
+    var path: int64 := cachePurgePath(zoneId);
+    var body: int64 := alloc(count * 512 + 64);
+    var off: int64 := cftAppend(body, 0, "{\"files\":["c);
+    var i: int64 := 0;
+    while (i < count) {
+        if (i > 0) { off := cftAppend(body, off, ","c); }
+        var url: pchar := peek64(urls + i * 8) as pchar;
+        var je: int64 := cfJsonEscape(url);
+        off := cftAppend(body, off, "\""c);
+        off := cftAppend(body, off, je as pchar);
+        off := cftAppend(body, off, "\""c);
+        free(je, StrLen(je as pchar)+1);
+        i += 1;
+    }
+    off := cftAppend(body, off, "]}"c); poke8(body+off, 0);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, count*512+64);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+fn cachePurgeArray(c: CFClient, zoneId: pchar, jsonKey: pchar, items: int64, count: int64): int64 {
+    var path: int64 := cachePurgePath(zoneId);
+    var body: int64 := alloc(count * 256 + 64);
+    var off: int64 := cftAppend(body, 0, "{\""c);
+    off := cftAppend(body, off, jsonKey);
+    off := cftAppend(body, off, "\":["c);
+    var i: int64 := 0;
+    while (i < count) {
+        if (i > 0) { off := cftAppend(body, off, ","c); }
+        var item: pchar := peek64(items + i * 8) as pchar;
+        var je: int64 := cfJsonEscape(item);
+        off := cftAppend(body, off, "\""c);
+        off := cftAppend(body, off, je as pchar);
+        off := cftAppend(body, off, "\""c);
+        free(je, StrLen(je as pchar)+1);
+        i += 1;
+    }
+    off := cftAppend(body, off, "]}"c); poke8(body+off, 0);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, count*256+64);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn CachePurgeTags(c: CFClient, zoneId: pchar, tags: int64, count: int64): int64 {
+    return cachePurgeArray(c, zoneId, "tags"c, tags, count);
+}
+pub fn CachePurgePrefixes(c: CFClient, zoneId: pchar, prefixes: int64, count: int64): int64 {
+    return cachePurgeArray(c, zoneId, "prefixes"c, prefixes, count);
+}
+pub fn CachePurgeHosts(c: CFClient, zoneId: pchar, hosts: int64, count: int64): int64 {
+    return cachePurgeArray(c, zoneId, "hosts"c, hosts, count);
+}
+
+// Cache Rules (Ruleset API)
+
+pub fn CFCacheRuleFree(rule: CFCacheRule) {
+    freeIfSet(rule.id); freeIfSet(rule.description);
+    freeIfSet(rule.expression); freeIfSet(rule.action);
+    freeIfSet(rule.cacheKey);
+}
+
+pub fn CacheRuleList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_cache_settings/entrypoint"c);
+    poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+pub fn CacheRuleCreate(c: CFClient, zoneId: pchar, description: pchar,
+                        expression: pchar, action: pchar,
+                        browserTTL: int64, edgeTTL: int64): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_cache_settings/entrypoint/rules"c);
+    poke8(path+po, 0);
+    var jdesc: int64 := cfJsonEscape(description);
+    var jexpr: int64 := cfJsonEscape(expression);
+    var jact:  int64 := cfJsonEscape(action);
+    var body: int64 := alloc(1024);
+    var off: int64 := cftAppend(body, 0, "{\"description\":\""c);
+    off := cftAppend(body, off, jdesc as pchar);
+    off := cftAppend(body, off, "\",\"expression\":\""c);
+    off := cftAppend(body, off, jexpr as pchar);
+    off := cftAppend(body, off, "\",\"action\":\""c);
+    off := cftAppend(body, off, jact as pchar);
+    off := cftAppend(body, off, "\",\"enabled\":true,\"action_parameters\":{\"cache\":true"c);
+    if (browserTTL > 0) {
+        off := cftAppend(body, off, ",\"browser_ttl\":{\"mode\":\"override_origin\",\"default\":"c);
+        off := cftAppendInt(body, off, browserTTL);
+        off := cftAppend(body, off, "}"c);
+    }
+    if (edgeTTL > 0) {
+        off := cftAppend(body, off, ",\"edge_ttl\":{\"mode\":\"override_origin\",\"default\":"c);
+        off := cftAppendInt(body, off, edgeTTL);
+        off := cftAppend(body, off, ",\"status_code_ttl\":[]}"c);
+    }
+    off := cftAppend(body, off, "}}"c); poke8(body+off, 0);
+    free(jdesc, StrLen(jdesc as pchar)+1);
+    free(jexpr, StrLen(jexpr as pchar)+1);
+    free(jact, StrLen(jact as pchar)+1);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 1024);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn CacheRuleDelete(c: CFClient, zoneId: pchar, ruleId: pchar): int64 {
+    var path: int64 := alloc(512);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_cache_settings/entrypoint/rules/"c);
+    po := cftAppend(path, po, ruleId); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+// Page Rules (Legacy API)
+
+pub fn CFPageRuleFree(pr: CFPageRule) {
+    freeIfSet(pr.id); freeIfSet(pr.targets); freeIfSet(pr.actions);
+    freeIfSet(pr.status); freeIfSet(pr.created); freeIfSet(pr.modified);
+}
+
+pub fn PageRuleCreate(c: CFClient, zoneId: pchar,
+                      urlPattern: pchar, actions: pchar, actionsLen: int64,
+                      priority: int64): CFPageRule {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/pagerules"c); poke8(path+po, 0);
+    var jp: int64 := cfJsonEscape(urlPattern);
+    var body: int64 := alloc(actionsLen + 512);
+    var off: int64 := cftAppend(body, 0, "{\"targets\":[{\"target\":\"url\",\"constraint\":{\"operator\":\"matches\",\"value\":\""c);
+    off := cftAppend(body, off, jp as pchar);
+    off := cftAppend(body, off, "\"}}],\"actions\":"c);
+    off := cftAppendN(body, off, actions as int64, actionsLen);
+    off := cftAppend(body, off, ",\"priority\":"c);
+    off := cftAppendInt(body, off, priority);
+    off := cftAppend(body, off, ",\"status\":\"active\"}"c); poke8(body+off, 0);
+    free(jp, StrLen(jp as pchar)+1);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, actionsLen+512);
+    var pr: CFPageRule;
+    pr.id:=0; pr.targets:=0; pr.actions:=0; pr.priority:=0;
+    pr.status:=0; pr.created:=0; pr.modified:=0;
+    if (r.success == 1 && r.result != 0) {
+        pr.id       := cfExtractValue(r.result, r.resultLen, "id"c);
+        pr.priority := cfExtractInt(r.result, r.resultLen, "priority"c);
+        pr.status   := cfExtractValue(r.result, r.resultLen, "status"c);
+    }
+    CFResponseFree(r); return pr;
+}
+
+pub fn PageRuleDelete(c: CFClient, zoneId: pchar, ruleId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/pagerules/"c);
+    po := cftAppend(path, po, ruleId); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 256);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn PageRuleList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/pagerules"c); poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+pub fn PageRuleRedirect(c: CFClient, zoneId: pchar,
+                        fromPattern: pchar, toURL: pchar, statusCode: int64): CFPageRule {
+    var jto: int64 := cfJsonEscape(toURL);
+    var actions: int64 := alloc(512);
+    var ao: int64 := cftAppend(actions, 0, "[{\"id\":\"forwarding_url\",\"value\":{\"url\":\""c);
+    ao := cftAppend(actions, ao, jto as pchar);
+    ao := cftAppend(actions, ao, "\",\"status_code\":"c);
+    ao := cftAppendInt(actions, ao, statusCode);
+    ao := cftAppend(actions, ao, "}}]"c); poke8(actions+ao, 0);
+    free(jto, StrLen(jto as pchar)+1);
+    var pr: CFPageRule := PageRuleCreate(c, zoneId, fromPattern, actions as pchar, ao, 1);
+    free(actions, 512); return pr;
+}
+
+pub fn PageRuleForceHTTPS(c: CFClient, zoneId: pchar, pattern: pchar): CFPageRule {
+    var actions: pchar := "[{\"id\":\"always_use_https\"}]"c;
+    return PageRuleCreate(c, zoneId, pattern, actions, StrLen(actions), 1);
+}
+
+pub fn PageRuleCacheEverything(c: CFClient, zoneId: pchar, pattern: pchar, ttl: int64): CFPageRule {
+    var actions: int64 := alloc(256);
+    var ao: int64 := cftAppend(actions, 0, "[{\"id\":\"cache_level\",\"value\":\"cache_everything\"},{\"id\":\"edge_cache_ttl\",\"value\":"c);
+    ao := cftAppendInt(actions, ao, ttl);
+    ao := cftAppend(actions, ao, "}]"c); poke8(actions+ao, 0);
+    var pr: CFPageRule := PageRuleCreate(c, zoneId, pattern, actions as pchar, ao, 1);
+    free(actions, 256); return pr;
+}
+
+// Transform Rules
+
+pub fn CFTransformRuleFree(tr: CFTransformRule) {
+    freeIfSet(tr.id); freeIfSet(tr.description);
+    freeIfSet(tr.expression); freeIfSet(tr.action);
+    freeIfSet(tr.pathValue); freeIfSet(tr.queryValue);
+}
+
+pub fn TransformRuleCreate(c: CFClient, zoneId: pchar,
+                            description: pchar, expression: pchar, newPath: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_transform/entrypoint/rules"c);
+    poke8(path+po, 0);
+    var jdesc: int64 := cfJsonEscape(description);
+    var jexpr: int64 := cfJsonEscape(expression);
+    var jpath: int64 := cfJsonEscape(newPath);
+    var body: int64 := alloc(1024);
+    var off: int64 := cftAppend(body, 0, "{\"description\":\""c);
+    off := cftAppend(body, off, jdesc as pchar);
+    off := cftAppend(body, off, "\",\"expression\":\""c);
+    off := cftAppend(body, off, jexpr as pchar);
+    off := cftAppend(body, off, "\",\"action\":\"rewrite\",\"enabled\":true,\"action_parameters\":{\"uri\":{\"path\":{\"type\":\"static\",\"value\":\""c);
+    off := cftAppend(body, off, jpath as pchar);
+    off := cftAppend(body, off, "\"}}}}"c); poke8(body+off, 0);
+    free(jdesc,StrLen(jdesc as pchar)+1);
+    free(jexpr,StrLen(jexpr as pchar)+1);
+    free(jpath,StrLen(jpath as pchar)+1);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 1024);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn TransformRuleDelete(c: CFClient, zoneId: pchar, ruleId: pchar): int64 {
+    var path: int64 := alloc(512);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_transform/entrypoint/rules/"c);
+    po := cftAppend(path, po, ruleId); poke8(path+po, 0);
+    var r: CFResponse := CFDelete(c, path as pchar);
+    free(path, 512);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn TransformRuleList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_transform/entrypoint"c);
+    poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}
+
+pub fn HeaderRuleCreate(c: CFClient, zoneId: pchar,
+                         description: pchar, expression: pchar,
+                         reqHeaders: pchar, respHeaders: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_late_transform/entrypoint/rules"c);
+    poke8(path+po, 0);
+    var jdesc: int64 := cfJsonEscape(description);
+    var jexpr: int64 := cfJsonEscape(expression);
+    var body: int64 := alloc(2048);
+    var off: int64 := cftAppend(body, 0, "{\"description\":\""c);
+    off := cftAppend(body, off, jdesc as pchar);
+    off := cftAppend(body, off, "\",\"expression\":\""c);
+    off := cftAppend(body, off, jexpr as pchar);
+    off := cftAppend(body, off, "\",\"action\":\"rewrite\",\"enabled\":true,\"action_parameters\":{\"headers\":"c);
+    if (reqHeaders != 0 as pchar && StrLen(reqHeaders) > 0) {
+        off := cftAppend(body, off, reqHeaders as pchar);
+    } else {
+        off := cftAppend(body, off, "{}"c);
+    }
+    off := cftAppend(body, off, "}}"c); poke8(body+off, 0);
+    free(jdesc, StrLen(jdesc as pchar)+1);
+    free(jexpr, StrLen(jexpr as pchar)+1);
+    var r: CFResponse := CFPost(c, path as pchar, body, off);
+    free(path, 256); free(body, 2048);
+    var ok: int64 := r.success;
+    CFResponseFree(r); return ok;
+}
+
+pub fn HeaderRuleList(c: CFClient, zoneId: pchar): int64 {
+    var path: int64 := alloc(256);
+    var po: int64 := cftAppend(path, 0, "/zones/"c);
+    po := cftAppend(path, po, zoneId);
+    po := cftAppend(path, po, "/rulesets/phases/http_request_late_transform/entrypoint"c);
+    poke8(path+po, 0);
+    var r: CFResponse := CFGet(c, path as pchar);
+    free(path, 256);
+    var result: int64 := 0;
+    if (r.success == 1 && r.result != 0) { result = cftDupN(r.result, r.resultLen); }
+    CFResponseFree(r); return result;
+}

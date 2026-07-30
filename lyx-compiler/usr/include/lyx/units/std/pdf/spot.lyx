@@ -1,0 +1,114 @@
+// std/pdf/spot.lyx
+// PDF Spot colors (Separation color spaces) — WP-PDF-25
+// Supports PANTONE and other named spot colors with CMYK alternate.
+
+@description("PDF spot colors: PdfDefineSpotColor, PdfSetStrokeSpot, PdfSetFillSpot")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.pdf.spot;
+
+import std.alloc;
+import std.pdf.builder;
+import std.pdf.objects;
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn _spotGrow(doc: int64): int64 {
+  var count: int64 := peek64(doc + PDF_DOC_SPOTCOUNT);
+  var cap:   int64 := peek64(doc + PDF_DOC_SPOTCAP);
+  var buf:   int64 := peek64(doc + PDF_DOC_SPOTBUF);
+  if (count < cap) { return buf + count * PDF_SPOT_RECSIZE; }
+  var newCap: int64 := cap * 2;
+  var newBuf: int64 := alloc(newCap * PDF_SPOT_RECSIZE);
+  if (newBuf == 0) { return 0; }
+  var bi: int64 := 0;
+  while (bi < count * PDF_SPOT_RECSIZE) { poke8(newBuf+bi, peek8(buf+bi)); bi:=bi+1; }
+  free(buf, cap * PDF_SPOT_RECSIZE);
+  poke64(doc + PDF_DOC_SPOTCAP, newCap);
+  poke64(doc + PDF_DOC_SPOTBUF, newBuf);
+  return newBuf + count * PDF_SPOT_RECSIZE;
+}
+
+fn _spotEmit(doc: int64, page: int64, spotId: int64, tint: f64, upper: int64): void {
+  // upper=1: stroke (CS/SC), upper=0: fill (cs/sc)
+  PdfContentEnsure(doc, page, 32);
+  var buf: int64 := pdfXBuf(doc, page);
+  var pos: int64 := pdfXPos(doc, page);
+  pos := pdfStr(buf, pos, "/SP");
+  pos := pdfInt(buf, pos, spotId);
+  if (upper != 0) { pos := pdfStr(buf, pos, " CS "); } else { pos := pdfStr(buf, pos, " cs "); }
+  pos := pdfReal(buf, pos, tint);
+  if (upper != 0) { pos := pdfStr(buf, pos, " SC\n"); } else { pos := pdfStr(buf, pos, " sc\n"); }
+  pdfXSetPos(doc, page, pos);
+  // Set bit spotId in per-page spot mask
+  var masks: int64 := peek64(doc + PDF_DOC_PAGESPOTMASKS);
+  var m:     int64 := peek64(masks + page * 8);
+  poke64(masks + page * 8, m | (1 << spotId));
+}
+
+// ============================================================================
+// PdfDefineSpotColor — register a named spot color with CMYK alternate
+//
+// name: spot color name (e.g. "PANTONE 485 C")
+// c, m, y, k: CMYK alternate values ×100 (0 = 0%, 10000 = 100%)
+// Returns the spot color index (spotId ≥ 0), or -1 on failure.
+// The spotId is stable: use it in PdfSetStrokeSpot / PdfSetFillSpot.
+// ============================================================================
+
+pub fn PdfDefineSpotColor(doc: int64, name: pchar, c100: int64, m100: int64, y100: int64, k100: int64): int64 {
+  if (doc == 0 || name == 0) { return -1; }
+  var rec: int64 := _spotGrow(doc);
+  if (rec == 0) { return -1; }
+
+  // Copy name string into mmap'd buffer
+  var nlen: int64 := StrLen(name) + 1;
+  var nbuf: int64 := alloc(nlen);
+  if (nbuf == 0) { return -1; }
+  var ni: int64 := 0;
+  while (ni < nlen) { poke8(nbuf + ni, StrCharAt(name, ni)); ni := ni + 1; }
+
+  // Allocate PDF object ID for the tint function
+  var fnId: int64 := peek64(doc + PDF_DOC_NEXTID);
+  poke64(doc + PDF_DOC_NEXTID, fnId + 1);
+
+  // Store record
+  poke64(rec + PDF_SPOT_NAMEBUF, nbuf);
+  poke64(rec + PDF_SPOT_NAMELEN, nlen);
+  poke64(rec + PDF_SPOT_C100,   c100);
+  poke64(rec + PDF_SPOT_M100,   m100);
+  poke64(rec + PDF_SPOT_Y100,   y100);
+  poke64(rec + PDF_SPOT_K100,   k100);
+  poke64(rec + PDF_SPOT_FNID,   fnId);
+
+  var spotId: int64 := peek64(doc + PDF_DOC_SPOTCOUNT);
+  poke64(doc + PDF_DOC_SPOTCOUNT, spotId + 1);
+  return spotId;
+}
+
+// ============================================================================
+// PdfSetStrokeSpot — select spot color as stroke color space and set tint
+//
+// spotId: value returned by PdfDefineSpotColor
+// tint:   ink coverage 0.0 (none) … 1.0 (full)
+// Emits: /SP{n} CS {tint} SC
+// ============================================================================
+
+pub fn PdfSetStrokeSpot(doc: int64, page: int64, spotId: int64, tint: f64): void {
+  if (doc == 0 || spotId < 0 || spotId >= peek64(doc + PDF_DOC_SPOTCOUNT)) { return; }
+  _spotEmit(doc, page, spotId, tint, 1);
+}
+
+// ============================================================================
+// PdfSetFillSpot — select spot color as fill color space and set tint
+//
+// spotId: value returned by PdfDefineSpotColor
+// tint:   ink coverage 0.0 (none) … 1.0 (full)
+// Emits: /SP{n} cs {tint} sc
+// ============================================================================
+
+pub fn PdfSetFillSpot(doc: int64, page: int64, spotId: int64, tint: f64): void {
+  if (doc == 0 || spotId < 0 || spotId >= peek64(doc + PDF_DOC_SPOTCOUNT)) { return; }
+  _spotEmit(doc, page, spotId, tint, 0);
+}

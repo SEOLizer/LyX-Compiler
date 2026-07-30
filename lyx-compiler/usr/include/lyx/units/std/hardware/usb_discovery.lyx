@@ -1,0 +1,178 @@
+// std/hardware/usb_discovery.lyx
+// WP-3: Geräteerkennung (Device Discovery) via /dev/bus/usb/
+// Plattform: Linux ARM64 / x86_64
+
+unit std.hardware.usb_discovery;
+
+import std.hardware.usb_syscalls;
+import std.hardware.usb_types;
+import std.hardware.usb_util;
+import std.hardware.usb_parse;
+import std.alloc;
+
+// ============================================================
+// Konstanten
+// ============================================================
+
+pub con USB_BUS_PATH_LEN: int64 := 256;   // Max. Pfadlänge für Bus/Device-Pfade
+
+// dirent d_type-Werte (andere als USB_DT_* Descriptor-Typen!)
+con USBD_DIRENT_DIR: int64 := 4;
+con USBD_DIRENT_REG: int64 := 8;
+
+// Ergebnis-Codes von UsbFindDevice / UsbFindDevicePath
+pub con USB_FIND_OK:       int64 := 0;   // Gerät gefunden
+pub con USB_FIND_NOTFOUND: int64 := -1;  // Gerät nicht gefunden
+pub con USB_FIND_NOPERM:   int64 := -2;  // Keine Berechtigung (kein einziges Gerät öffenbar)
+
+// ============================================================
+// Interner Helfer: Scannt ein Bus-Verzeichnis (z.B. /dev/bus/usb/001/)
+// nach einem USB-Gerät mit passender VID/PID.
+//
+// busPath:    null-terminierter Pfad des Bus-Verzeichnisses (int64)
+// busNum:     numerische Bus-Nummer (für device.bus_num)
+// vendor:     gesuchte Vendor-ID
+// product:    gesuchte Product-ID
+// devicePtr:  Zeiger auf allokierte UsbDevice-Struktur
+//
+// Rückgabe: geöffneter fd des gefundenen Geräts (≥ 0) oder -1.
+// Der Aufrufer ist für das Schließen des fd NICHT zuständig —
+// er verbleibt in device.handle.
+// ============================================================
+fn usbScanBusDir(busPath: int64, busNum: int64,
+                 vendor: int64, product: int64,
+                 devicePtr: int64): int64 {
+  var dirFd: int64 := usb_open(busPath as pchar, USB_O_RDONLY | USB_O_DIRECTORY);
+  if (dirFd < 0) { return -1; }
+
+  var entBuf:    int64 := alloc(2048);
+  var descBuf:   int64 := alloc(USB_SIZEOF_DEVICE_DESC);
+  var devPath:   int64 := alloc(USB_BUS_PATH_LEN);
+  var emptyStr:  pchar := ""c;
+  var foundFd:   int64 := -1;
+
+  while (foundFd < 0) {
+    var nRead: int64 := usb_getdents64(dirFd, entBuf, 2048);
+    if (nRead <= 0) { break; }
+
+    var pos: int64 := 0;
+    while (pos < nRead) {
+      var entry:  int64 := entBuf + pos;
+      var recLen: int64 := Dirent64RecLen(entry);
+      if (recLen <= 0) { break; }
+
+      var dtype:   int64 := Dirent64Type(entry);
+      var namePtr: int64 := Dirent64Name(entry);
+
+      // Nur reguläre Dateien mit numerischem Namen sind Gerätedateien
+      if (dtype == USBD_DIRENT_REG && UsbIsNumeric(namePtr) == 1) {
+        UsbBuildPath(busPath, namePtr, emptyStr as int64, devPath, USB_BUS_PATH_LEN);
+
+        // O_RDWR versuchen (für Control-Transfers notwendig), Fallback O_RDONLY
+        var devFd: int64 := usb_open(devPath as pchar, USB_O_RDWR);
+        if (devFd < 0) {
+          devFd := usb_open(devPath as pchar, USB_O_RDONLY);
+        }
+
+        if (devFd >= 0) {
+          var nDesc: int64 := usb_read(devFd, descBuf, USB_SIZEOF_DEVICE_DESC);
+          if (nDesc == USB_SIZEOF_DEVICE_DESC) {
+            var vid: int64 := UsbDevDesc_idVendor(descBuf);
+            var pid: int64 := UsbDevDesc_idProduct(descBuf);
+            if (vid == vendor && pid == product) {
+              // VID/PID stimmen überein — Gerät gefunden
+              poke64(devicePtr,      vid);                         // vendor_id   (+0)
+              poke64(devicePtr + 8,  pid);                         // product_id  (+8)
+              poke64(devicePtr + 32, busNum);                      // bus_num     (+32)
+              poke64(devicePtr + 40, UsbParseNum(namePtr));        // dev_num     (+40)
+              poke64(devicePtr + 48, devFd);                       // handle      (+48)
+              UsbParseConfiguration(devFd, devicePtr);
+              foundFd := devFd;
+              break;
+            }
+          }
+          // Kein Treffer oder Lesen fehlgeschlagen → fd schließen, weiter
+          if (foundFd < 0) {
+            usb_close(devFd);
+          }
+        }
+      }
+
+      pos += recLen;
+    }
+  }
+
+  usb_close(dirFd);
+  free(entBuf,  2048);
+  free(descBuf, USB_SIZEOF_DEVICE_DESC);
+  free(devPath, USB_BUS_PATH_LEN);
+  return foundFd;
+}
+
+// ============================================================
+// UsbFindDevicePath — Device Discovery mit konfigurierbarem Bus-Root
+//
+// busRoot:   Wurzelpfad der USB-Bus-Hierarchie (z.B. "/dev/bus/usb/"c as int64)
+// vendor:    gesuchte Vendor-ID  (16 Bit)
+// product:   gesuchte Product-ID (16 Bit)
+// devicePtr: Zeiger auf eine per UsbAllocDevice() allokierte UsbDevice-Struktur
+//
+// Rückgabe: USB_FIND_OK (0) wenn gefunden, USB_FIND_NOTFOUND (-1) sonst.
+//
+// Alle Geräte ohne Zugriff werden übersprungen — der Scan wird
+// für alle verbleibenden Busse fortgesetzt (kein vorzeitiger Abbruch).
+// ============================================================
+pub fn UsbFindDevicePath(busRoot: int64, vendor: int64, product: int64,
+                          devicePtr: int64): int64 {
+  var rootFd: int64 := usb_open(busRoot as pchar, USB_O_RDONLY | USB_O_DIRECTORY);
+  if (rootFd < 0) { return USB_FIND_NOTFOUND; }
+
+  var entBuf:   int64 := alloc(2048);
+  var busPath:  int64 := alloc(USB_BUS_PATH_LEN);
+  var slashStr: pchar := "/"c;
+  var found:    int64 := 0;
+
+  while (found == 0) {
+    var nRead: int64 := usb_getdents64(rootFd, entBuf, 2048);
+    if (nRead <= 0) { break; }
+
+    var pos: int64 := 0;
+    while (pos < nRead) {
+      var entry:  int64 := entBuf + pos;
+      var recLen: int64 := Dirent64RecLen(entry);
+      if (recLen <= 0) { break; }
+
+      var dtype:   int64 := Dirent64Type(entry);
+      var namePtr: int64 := Dirent64Name(entry);
+
+      // Bus-Verzeichnisse sind numerisch benannte Unterverzeichnisse
+      if (dtype == USBD_DIRENT_DIR && UsbIsNumeric(namePtr) == 1) {
+        var busNum: int64 := UsbParseNum(namePtr);
+        UsbBuildPath(busRoot, namePtr, slashStr as int64, busPath, USB_BUS_PATH_LEN);
+
+        var fd: int64 := usbScanBusDir(busPath, busNum, vendor, product, devicePtr);
+        if (fd >= 0) {
+          found := 1;
+          break;
+        }
+      }
+
+      pos += recLen;
+    }
+  }
+
+  usb_close(rootFd);
+  free(entBuf,  2048);
+  free(busPath, USB_BUS_PATH_LEN);
+
+  if (found == 1) { return USB_FIND_OK; }
+  return USB_FIND_NOTFOUND;
+}
+
+// ============================================================
+// UsbFindDevice — Standard-Einstiegspunkt für /dev/bus/usb/
+// ============================================================
+pub fn UsbFindDevice(vendor: int64, product: int64, devicePtr: int64): int64 {
+  var busRoot: pchar := "/dev/bus/usb/"c;
+  return UsbFindDevicePath(busRoot as int64, vendor, product, devicePtr);
+}

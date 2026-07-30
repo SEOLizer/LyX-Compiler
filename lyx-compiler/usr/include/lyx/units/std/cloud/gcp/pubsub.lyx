@@ -1,0 +1,281 @@
+// std/cloud/gcp/pubsub.lyx — Google Cloud Pub/Sub (WP-GCP-09)
+//
+// Public API:
+//   PubSubConnect(credsPtr, project) -> PubSubConn
+//   PubSubDisconnect(c)
+//   PubSubTopicCreate(c, topic) -> int64 (status)
+//   PubSubTopicDelete(c, topic) -> int64 (status)
+//   PubSubTopicExists(c, topic) -> int64
+//   PubSubSubscriptionCreate(c, sub, topic, ackDeadline) -> int64 (status)
+//   PubSubSubscriptionDelete(c, sub) -> int64 (status)
+//   PubSubPublish(c, topic, data, dataLen) -> GCPResponse
+//   PubSubPull(c, sub, maxMessages) -> GCPResponse
+//   PubSubAck(c, sub, ackIds, ackIdCount) -> int64 (status)
+
+unit std.cloud.gcp.pubsub;
+
+import std.cloud.gcp.transport;
+import std.cloud.gcp.jwt;
+import std.alloc;
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+pub type PubSubConn = struct {
+    client:  GCPClient;
+    project: int64;   // pchar
+};
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn psStrLen(s: int64): int64 {
+    if (s == 0) { return 0; }
+    var i: int64 := 0; while (peek8(s + i) != 0) { i := i + 1; } return i;
+}
+
+fn psStrDup(src: int64): int64 {
+    if (src == 0) { return 0; }
+    var n: int64 := psStrLen(src);
+    var buf: int64 := alloc(n + 1);
+    var i: int64 := 0;
+    while (i < n) { poke8(buf + i, peek8(src + i)); i := i + 1; }
+    poke8(buf + n, 0); return buf;
+}
+
+fn psAppend(dst: int64, pos: int64, src: int64, n: int64): int64 {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + pos + i, peek8(src + i)); i := i + 1; }
+    return pos + n;
+}
+
+fn psAppendStr(dst: int64, pos: int64, s: int64): int64 {
+    return psAppend(dst, pos, s, psStrLen(s));
+}
+
+fn psAppendInt(dst: int64, pos: int64, n: int64): int64 {
+    if (n == 0) { poke8(dst + pos, 48); return pos + 1; }
+    var tmp: int64 := alloc(24); var tl: int64 := 0; var v: int64 := n;
+    while (v > 0) { poke8(tmp + tl, 48 + (v - ((v / 10) * 10))); v := v / 10; tl := tl + 1; }
+    var i: int64 := 0; while (i < tl) { poke8(dst + pos + i, peek8(tmp + tl - 1 - i)); i := i + 1; }
+    free(tmp, 24); return pos + tl;
+}
+
+// Build topic resource name: projects/{project}/topics/{topic}
+fn psTopicName(project: int64, topic: int64): int64 {
+    var pfx: int64    := "projects/" as int64;
+    var mid: int64    := "/topics/" as int64;
+    var pl: int64     := psStrLen(project);
+    var tl: int64     := psStrLen(topic);
+    var buf: int64    := alloc(9 + pl + 8 + tl + 1);
+    var pos: int64 := 0;
+    pos := psAppend(buf, pos, pfx, 9);
+    pos := psAppend(buf, pos, project, pl);
+    pos := psAppend(buf, pos, mid, 8);
+    pos := psAppend(buf, pos, topic, tl);
+    poke8(buf + pos, 0); return buf;
+}
+
+// Build subscription resource name: projects/{project}/subscriptions/{sub}
+fn psSubName(project: int64, sub: int64): int64 {
+    var pfx: int64    := "projects/" as int64;
+    var mid: int64    := "/subscriptions/" as int64;
+    var pl: int64     := psStrLen(project);
+    var sl: int64     := psStrLen(sub);
+    var midLen: int64 := psStrLen(mid);
+    var buf: int64    := alloc(9 + pl + midLen + sl + 1);
+    var pos: int64 := 0;
+    pos := psAppend(buf, pos, pfx, 9);
+    pos := psAppend(buf, pos, project, pl);
+    pos := psAppend(buf, pos, mid, midLen);
+    pos := psAppend(buf, pos, sub, sl);
+    poke8(buf + pos, 0); return buf;
+}
+
+// Build API path: /v1/{resource}
+fn psPath(resource: int64): int64 {
+    var pfx: int64  := "/v1/" as int64;
+    var rl: int64   := psStrLen(resource);
+    var buf: int64  := alloc(4 + rl + 1);
+    var i: int64 := 0;
+    while (i < 4)  { poke8(buf + i, peek8(pfx + i)); i := i + 1; }
+    i := 0; while (i < rl) { poke8(buf + 4 + i, peek8(resource + i)); i := i + 1; }
+    poke8(buf + 4 + rl, 0); return buf;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+pub fn PubSubConnect(credsPtr: int64, project: int64): PubSubConn {
+    var c: PubSubConn;
+    c.client  := GCPClientNew(credsPtr, project, "pubsub.googleapis.com" as int64);
+    c.project := psStrDup(project);
+    return c;
+}
+
+pub fn PubSubDisconnect(c: PubSubConn): void {
+    GCPClientFree(c.client);
+    if (c.project != 0) { free(c.project, psStrLen(c.project) + 1); }
+}
+
+pub fn PubSubTopicCreate(c: PubSubConn, topic: int64): int64 {
+    var name: int64 := psTopicName(c.project, topic);
+    var path: int64 := psPath(name);
+    var r: GCPResponse := GCPPut(c.client, path, "{}" as int64, 2);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(path, psStrLen(path) + 1);
+    free(name, psStrLen(name) + 1);
+    return sc;
+}
+
+pub fn PubSubTopicDelete(c: PubSubConn, topic: int64): int64 {
+    var name: int64 := psTopicName(c.project, topic);
+    var path: int64 := psPath(name);
+    var r: GCPResponse := GCPDelete(c.client, path);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(path, psStrLen(path) + 1);
+    free(name, psStrLen(name) + 1);
+    return sc;
+}
+
+pub fn PubSubTopicExists(c: PubSubConn, topic: int64): int64 {
+    var name: int64 := psTopicName(c.project, topic);
+    var path: int64 := psPath(name);
+    var r: GCPResponse := GCPGet(c.client, path);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(path, psStrLen(path) + 1);
+    free(name, psStrLen(name) + 1);
+    if (sc == 200) { return 1; }
+    return 0;
+}
+
+pub fn PubSubSubscriptionCreate(c: PubSubConn, sub: int64, topic: int64, ackDeadline: int64): int64 {
+    var subName:   int64 := psSubName(c.project, sub);
+    var topicName: int64 := psTopicName(c.project, topic);
+    var path: int64 := psPath(subName);
+
+    var tnl: int64 := psStrLen(topicName);
+    var bodySz: int64 := 64 + tnl + 24;
+    var body: int64   := alloc(bodySz);
+    var pos: int64 := 0;
+    pos := psAppendStr(body, pos, "{\"topic\":\"" as int64);
+    pos := psAppend(body, pos, topicName, tnl);
+    pos := psAppendStr(body, pos, "\",\"ackDeadlineSeconds\":" as int64);
+    if (ackDeadline <= 0) { ackDeadline := 30; }
+    pos := psAppendInt(body, pos, ackDeadline);
+    poke8(body + pos, 125); pos := pos + 1; poke8(body + pos, 0);
+
+    var r: GCPResponse := GCPPut(c.client, path, body, pos);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(body, bodySz);
+    free(path, psStrLen(path) + 1);
+    free(subName, psStrLen(subName) + 1);
+    free(topicName, psStrLen(topicName) + 1);
+    return sc;
+}
+
+pub fn PubSubSubscriptionDelete(c: PubSubConn, sub: int64): int64 {
+    var name: int64 := psSubName(c.project, sub);
+    var path: int64 := psPath(name);
+    var r: GCPResponse := GCPDelete(c.client, path);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(path, psStrLen(path) + 1);
+    free(name, psStrLen(name) + 1);
+    return sc;
+}
+
+// PubSubPublish — publish a message to a topic
+// data: raw bytes, dataLen: byte count
+pub fn PubSubPublish(c: PubSubConn, topic: int64, data: int64, dataLen: int64): GCPResponse {
+    var name: int64 := psTopicName(c.project, topic);
+    var nl: int64   := psStrLen(name);
+    // Path: /v1/projects/{proj}/topics/{topic}:publish
+    var pathBuf: int64 := alloc(nl + 12);
+    var pos: int64 := psAppendStr(pathBuf, 0, "/v1/" as int64);
+    pos := psAppend(pathBuf, pos, name, nl);
+    pos := psAppendStr(pathBuf, pos, ":publish" as int64);
+    poke8(pathBuf + pos, 0);
+    free(name, nl + 1);
+
+    // Base64-encode data for JSON body
+    var b64Sz: int64   := (dataLen * 4 / 3) + 8;
+    var b64Buf: int64  := alloc(b64Sz);
+    base64urlEncodeBytes(data, dataLen, b64Buf);
+    var b64Len: int64  := psStrLen(b64Buf);
+
+    var bodySz: int64 := 32 + b64Len + 1;
+    var body: int64   := alloc(bodySz);
+    pos := 0;
+    pos := psAppendStr(body, pos, "{\"messages\":[{\"data\":\"" as int64);
+    pos := psAppend(body, pos, b64Buf, b64Len);
+    pos := psAppendStr(body, pos, "\"}]}" as int64);
+    poke8(body + pos, 0);
+    free(b64Buf, b64Sz);
+
+    var r: GCPResponse := GCPPost(c.client, pathBuf, body, pos);
+    free(body, bodySz);
+    free(pathBuf, nl + 12);
+    return r;
+}
+
+// PubSubPull — pull messages from subscription
+pub fn PubSubPull(c: PubSubConn, sub: int64, maxMessages: int64): GCPResponse {
+    var name: int64 := psSubName(c.project, sub);
+    var nl: int64   := psStrLen(name);
+    var pathBuf: int64 := alloc(nl + 10);
+    var pos: int64 := psAppendStr(pathBuf, 0, "/v1/" as int64);
+    pos := psAppend(pathBuf, pos, name, nl);
+    pos := psAppendStr(pathBuf, pos, ":pull" as int64);
+    poke8(pathBuf + pos, 0);
+    free(name, nl + 1);
+
+    if (maxMessages <= 0) { maxMessages := 10; }
+    var body: int64 := alloc(48);
+    pos := 0;
+    pos := psAppendStr(body, pos, "{\"maxMessages\":" as int64);
+    pos := psAppendInt(body, pos, maxMessages);
+    poke8(body + pos, 125); pos := pos + 1; poke8(body + pos, 0);
+
+    var r: GCPResponse := GCPPost(c.client, pathBuf, body, pos);
+    free(body, 48);
+    free(pathBuf, nl + 10);
+    return r;
+}
+
+// PubSubAck — acknowledge messages
+// ackIds: array of pchar pointers, ackIdCount: count
+pub fn PubSubAck(c: PubSubConn, sub: int64, ackIds: int64, ackIdCount: int64): int64 {
+    var name: int64 := psSubName(c.project, sub);
+    var nl: int64   := psStrLen(name);
+    var pathBuf: int64 := alloc(nl + 15);
+    var pos: int64 := psAppendStr(pathBuf, 0, "/v1/" as int64);
+    pos := psAppend(pathBuf, pos, name, nl);
+    pos := psAppendStr(pathBuf, pos, ":acknowledge" as int64);
+    poke8(pathBuf + pos, 0);
+    free(name, nl + 1);
+
+    var bodySz: int64 := 32 + ackIdCount * 128;
+    var body: int64   := alloc(bodySz);
+    pos := 0;
+    pos := psAppendStr(body, pos, "{\"ackIds\":[" as int64);
+    var i: int64 := 0;
+    while (i < ackIdCount) {
+        if (i > 0) { poke8(body + pos, 44); pos := pos + 1; }
+        poke8(body + pos, 34); pos := pos + 1;
+        var aid: int64 := peek64(ackIds + i * 8);
+        pos := psAppendStr(body, pos, aid);
+        poke8(body + pos, 34); pos := pos + 1;
+        i += 1;
+    }
+    pos := psAppendStr(body, pos, "]}" as int64);
+    poke8(body + pos, 0);
+
+    var r: GCPResponse := GCPPost(c.client, pathBuf, body, pos);
+    var sc: int64 := r.statusCode;
+    GCPResponseFree(r);
+    free(body, bodySz);
+    free(pathBuf, nl + 15);
+    return sc;
+}

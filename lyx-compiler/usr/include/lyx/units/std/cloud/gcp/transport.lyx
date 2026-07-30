@@ -1,0 +1,437 @@
+// std/cloud/gcp/transport.lyx — GCP REST/JSON HTTP Transport + Retry (WP-GCP-05)
+//
+// Public API:
+//   GCPClientNew(creds, project, baseURL) -> GCPClient
+//   GCPClientFree(c)
+//   GCPGet(c, path) -> GCPResponse
+//   GCPPost(c, path, body, bodyLen) -> GCPResponse
+//   GCPPut(c, path, body, bodyLen) -> GCPResponse
+//   GCPPatch(c, path, body, bodyLen) -> GCPResponse
+//   GCPDelete(c, path) -> GCPResponse
+//   GCPResponseFree(r)
+//   GCPParseError(body, bodyLen) -> GCPError
+
+unit std.cloud.gcp.transport;
+
+import std.cloud.gcp.credentials;
+import std.alloc;
+import std.net.tls;
+import std.net.socket;
+import std.net.dns;
+import std.net.types;
+import std.net.http;
+import std.time;
+import std.os;
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+pub type GCPClient = struct {
+    credsPtr:   int64;   // int64 → GCPCredentials* (alloc'd)
+    project:    int64;   // pchar
+    baseURL:    int64;   // pchar  e.g. "storage.googleapis.com"
+    timeout:    int64;   // ms (default 30000)
+    maxRetries: int64;   // default 3
+};
+
+pub type GCPResponse = struct {
+    statusCode:  int64;
+    body:        int64;   // pchar (alloc'd, null-terminated)
+    bodyLen:     int64;
+    contentType: int64;   // pchar (alloc'd or 0)
+};
+
+pub type GCPError = struct {
+    code:    int64;
+    message: int64;   // pchar (alloc'd)
+    status:  int64;   // pchar (alloc'd)
+    details: int64;   // pchar (alloc'd)
+};
+
+// ── Error codes ───────────────────────────────────────────────────────────────
+
+pub con GCP_ERR_OK:         int64 := 0;
+pub con GCP_ERR_AUTH:       int64 := 401;
+pub con GCP_ERR_FORBIDDEN:  int64 := 403;
+pub con GCP_ERR_NOT_FOUND:  int64 := 404;
+pub con GCP_ERR_CONFLICT:   int64 := 409;
+pub con GCP_ERR_RATE_LIMIT: int64 := 429;
+pub con GCP_ERR_SERVER:     int64 := 500;
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn trpStrLen(s: int64): int64 {
+    if (s == 0) { return 0; }
+    var i: int64 := 0;
+    while (peek8(s + i) != 0) { i := i + 1; }
+    return i;
+}
+
+fn trpStrDupN(src: int64, n: int64): int64 {
+    var buf: int64 := alloc(n + 1);
+    var i: int64 := 0;
+    while (i < n) { poke8(buf + i, peek8(src + i)); i := i + 1; }
+    poke8(buf + n, 0);
+    return buf;
+}
+
+fn trpStrDup(src: int64): int64 {
+    if (src == 0) { return 0; }
+    return trpStrDupN(src, trpStrLen(src));
+}
+
+fn trpAppendN(dst: int64, dstLen: int64, src: int64, n: int64): int64 {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + dstLen + i, peek8(src + i)); i := i + 1; }
+    return dstLen + n;
+}
+
+fn gcpEmptyResp(): GCPResponse {
+    var r: GCPResponse;
+    r.statusCode := 0; r.body := 0; r.bodyLen := 0; r.contentType := 0;
+    return r;
+}
+
+fn gcpEmptyError(): GCPError {
+    var e: GCPError;
+    e.code := 0; e.message := 0; e.status := 0; e.details := 0;
+    return e;
+}
+
+// Should we retry this status code?
+fn gcpShouldRetry(statusCode: int64): int64 {
+    if (statusCode == 429) { return 1; }
+    if (statusCode == 500) { return 1; }
+    if (statusCode == 502) { return 1; }
+    if (statusCode == 503) { return 1; }
+    if (statusCode == 504) { return 1; }
+    return 0;
+}
+
+// Delay in ms for retry attempt n (100ms * 2^n)
+fn gcpRetryDelay(attempt: int64): int64 {
+    var d: int64 := 100;
+    var i: int64 := 0;
+    while (i < attempt) { d := d * 2; i := i + 1; }
+    return d;
+}
+
+// Extract GCP JSON error field "error.message" etc.
+fn gcpJSONNested(json: int64, jl: int64, outer: int64, inner: int64): int64 {
+    var ol: int64 := trpStrLen(outer);
+    var i: int64 := 0;
+    while (i < jl - ol - 3) {
+        if ((peek8(json + i) & 0xFF) == 34) {
+            var match: int64 := 1;
+            var j: int64 := 0;
+            while (j < ol) {
+                if ((peek8(json + i + 1 + j) & 0xFF) != (peek8(outer + j) & 0xFF)) {
+                    match := 0; break;
+                }
+                j += 1;
+            }
+            if ((match == 1) & ((peek8(json + i + 1 + ol) & 0xFF) == 34)) {
+                var k: int64 := i + ol + 2;
+                while ((k < jl) & (peek8(json + k) == 32)) { k := k + 1; }
+                if ((k < jl) & ((peek8(json + k) & 0xFF) == 58)) {
+                    k += 1;
+                    while ((k < jl) & (peek8(json + k) == 32)) { k := k + 1; }
+                    if ((k < jl) & ((peek8(json + k) & 0xFF) == 123)) {
+                        // Found nested object, now search inner key within it
+                        var subStart: int64 := k;
+                        var depth: int64 := 1;
+                        k += 1;
+                        while ((k < jl) & (depth > 0)) {
+                            var c: int64 := peek8(json + k) & 0xFF;
+                            if (c == 123) { depth := depth + 1; }
+                            if (c == 125) { depth := depth - 1; }
+                            k += 1;
+                        }
+                        // Search for inner key in subStart..k range
+                        var il: int64 := trpStrLen(inner);
+                        var si: int64 := subStart;
+                        while (si < k - il - 3) {
+                            if ((peek8(json + si) & 0xFF) == 34) {
+                                var m2: int64 := 1;
+                                var jj: int64 := 0;
+                                while (jj < il) {
+                                    if ((peek8(json + si + 1 + jj) & 0xFF) != (peek8(inner + jj) & 0xFF)) {
+                                        m2 := 0; break;
+                                    }
+                                    jj += 1;
+                                }
+                                if ((m2 == 1) & ((peek8(json + si + 1 + il) & 0xFF) == 34)) {
+                                    var sk: int64 := si + il + 2;
+                                    while ((sk < k) & (peek8(json + sk) == 32)) { sk := sk + 1; }
+                                    if ((sk < k) & ((peek8(json + sk) & 0xFF) == 58)) {
+                                        sk += 1;
+                                        while ((sk < k) & (peek8(json + sk) == 32)) { sk := sk + 1; }
+                                        if ((sk < k) & ((peek8(json + sk) & 0xFF) == 34)) {
+                                            sk += 1;
+                                            var vs: int64 := sk;
+                                            while ((sk < k) & ((peek8(json + sk) & 0xFF) != 34)) { sk := sk + 1; }
+                                            return trpStrDupN(json + vs, sk - vs);
+                                        }
+                                    }
+                                }
+                            }
+                            si += 1;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+fn gcpJSONExtractInt(json: int64, jl: int64, key: int64): int64 {
+    var kl: int64 := trpStrLen(key);
+    var i: int64 := 0;
+    while (i < jl - kl - 3) {
+        if ((peek8(json + i) & 0xFF) == 34) {
+            var match: int64 := 1;
+            var j: int64 := 0;
+            while (j < kl) {
+                if ((peek8(json + i + 1 + j) & 0xFF) != (peek8(key + j) & 0xFF)) {
+                    match := 0; break;
+                }
+                j += 1;
+            }
+            if ((match == 1) & ((peek8(json + i + 1 + kl) & 0xFF) == 34)) {
+                var k: int64 := i + kl + 2;
+                while ((k < jl) & (peek8(json + k) == 32)) { k := k + 1; }
+                if ((k < jl) & ((peek8(json + k) & 0xFF) == 58)) {
+                    k += 1;
+                    while ((k < jl) & (peek8(json + k) == 32)) { k := k + 1; }
+                    var c: int64 := peek8(json + k) & 0xFF;
+                    if ((c >= 48) & (c <= 57)) {
+                        var val: int64 := 0;
+                        while ((k < jl) & ((peek8(json + k) & 0xFF) >= 48) & ((peek8(json + k) & 0xFF) <= 57)) {
+                            val := val * 10 + ((peek8(json + k) & 0xFF) - 48);
+                            k += 1;
+                        }
+                        return val;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+// ── Main HTTPS request function ───────────────────────────────────────────────
+
+// gcpDoRequest — perform HTTPS request to the baseURL host.
+// method: "GET", "POST", "PUT", "PATCH", "DELETE"
+// path: URL path (e.g. "/storage/v1/b/bucket/o/object")
+// body / bodyLen: request body (may be 0/0 for GET/DELETE)
+// token: Bearer token string
+// Returns GCPResponse with alloc'd body; caller calls GCPResponseFree.
+fn gcpDoRequest(host: int64, method: int64, path: int64, body: int64, bodyLen: int64, token: int64): GCPResponse {
+    var r: GCPResponse := gcpEmptyResp();
+    var ip: int64 := GetHostByName(host);
+    if (ip == 0) { return r; }
+    var tcpConn: TCPConn := TCPConnect(ip, 443);
+    if (tcpConn.fd < 0) { return r; }
+    var tlsCtx: TLSContext := TLSInit();
+    var tlsConn: TLSConn   := TLSConnect(tlsCtx, tcpConn.fd, host);
+    if (tlsConn.connected == 0) {
+        TLSFree(tlsCtx); sys_close(tcpConn.fd); return r;
+    }
+
+    // Build Authorization + Content-Type header string
+    var authPfx: int64   := "Authorization: Bearer " as int64;
+    var authPfxLen: int64 := 22;
+    var tokenLen: int64   := trpStrLen(token);
+    var ctHdr: int64;
+    var ctHdrLen: int64;
+    if (bodyLen > 0) {
+        ctHdr    := "Content-Type: application/json\r\nUser-Agent: lyxgcloud/1.0\r\n" as int64;
+        ctHdrLen := trpStrLen(ctHdr);
+    } else {
+        ctHdr    := "User-Agent: lyxgcloud/1.0\r\n" as int64;
+        ctHdrLen := trpStrLen(ctHdr);
+    }
+
+    var hdrBufSz: int64 := authPfxLen + tokenLen + 2 + ctHdrLen + 1;
+    var hdrBuf: int64   := alloc(hdrBufSz);
+    var pos: int64 := 0;
+    pos := trpAppendN(hdrBuf, pos, authPfx, authPfxLen);
+    pos := trpAppendN(hdrBuf, pos, token, tokenLen);
+    poke8(hdrBuf + pos, 13); pos := pos + 1;
+    poke8(hdrBuf + pos, 10); pos := pos + 1;
+    pos := trpAppendN(hdrBuf, pos, ctHdr, ctHdrLen);
+    poke8(hdrBuf + pos, 0);
+
+    var methodInt: int64 := HTTP_GET;
+    var m0: int64 := peek8(method) & 0xFF;
+    if (m0 == 80) {   // 'P'
+        var m1: int64 := peek8(method + 1) & 0xFF;
+        if (m1 == 79) { methodInt := HTTP_POST; }        // PO → POST
+        else if (m1 == 85) { methodInt := HTTP_PUT; }    // PU → PUT
+        else if (m1 == 65) { methodInt := HTTP_PATCH; }  // PA → PATCH
+    } else if (m0 == 68) { methodInt := HTTP_DELETE; }   // D → DELETE
+
+    var req: HTTPRequest;
+    req.method   := methodInt;
+    req.host     := host;
+    req.path     := path;
+    req.port     := 443;
+    req.headers  := hdrBuf;
+    req.body     := body;
+    req.bodySize := bodyLen;
+
+    var reqBuf: int64 := HTTPRequestBuild(req);
+    if (reqBuf == 0) {
+        free(hdrBuf, hdrBufSz);
+        TLSClose(tlsConn); TLSFree(tlsCtx); sys_close(tcpConn.fd); return r;
+    }
+    var reqSz: int64   := peek64(reqBuf + 8);
+    var allocSz: int64 := peek64(reqBuf);
+    TLSWrite(tlsConn, reqBuf + 16, reqSz);
+    free(reqBuf, allocSz);
+    free(hdrBuf, hdrBufSz);
+
+    // Read full response into a growing buffer
+    var cap: int64   := 65536;
+    var buf: int64   := alloc(cap);
+    var total: int64 := 0;
+    var done: int64  := 0;
+    while (done == 0) {
+        if (total >= cap - 1) {
+            // Grow: double capacity
+            var newCap: int64 := cap * 2;
+            var newBuf: int64 := alloc(newCap);
+            var ci: int64 := 0;
+            while (ci < total) { poke8(newBuf + ci, peek8(buf + ci)); ci := ci + 1; }
+            free(buf, cap);
+            buf := newBuf; cap := newCap;
+        }
+        var n: int64 := TLSRead(tlsConn, buf + total, cap - total - 1);
+        if (n <= 0) { done := 1; }
+        else { total := total + n; }
+    }
+    TLSClose(tlsConn);
+    TLSFree(tlsCtx);
+    sys_close(tcpConn.fd);
+    poke8(buf + total, 0);
+
+    // Parse status code from HTTP/1.1 NNN
+    var sc: int64 := 0;
+    var si: int64 := 0;
+    while (si < total - 12) {
+        if ((peek8(buf + si) == 72) & (peek8(buf + si + 1) == 84) &
+            (peek8(buf + si + 2) == 84) & (peek8(buf + si + 3) == 80) &
+            (peek8(buf + si + 4) == 47)) {
+            var j: int64 := si + 5;
+            while ((j < total) & ((peek8(buf + j) & 0xFF) != 32)) { j := j + 1; }
+            j += 1;
+            sc := 0;
+            while ((j < total) & ((peek8(buf + j) & 0xFF) >= 48) & ((peek8(buf + j) & 0xFF) <= 57)) {
+                sc := sc * 10 + ((peek8(buf + j) & 0xFF) - 48);
+                j += 1;
+            }
+            break;
+        }
+        si += 1;
+    }
+    r.statusCode := sc;
+
+    // Find body start (after \r\n\r\n)
+    var bodyStart: int64 := 0;
+    var ii: int64 := 0;
+    while (ii < total - 3) {
+        if ((peek8(buf + ii) == 13) & (peek8(buf + ii + 1) == 10) &
+            (peek8(buf + ii + 2) == 13) & (peek8(buf + ii + 3) == 10)) {
+            bodyStart := ii + 4; break;
+        }
+        ii += 1;
+    }
+    if (bodyStart > 0) {
+        var bodyLen2: int64 := total - bodyStart;
+        r.body    := trpStrDupN(buf + bodyStart, bodyLen2);
+        r.bodyLen := bodyLen2;
+    }
+    free(buf, cap);
+    return r;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+pub fn GCPClientNew(credsPtr: int64, project: int64, baseURL: int64): GCPClient {
+    var c: GCPClient;
+    c.credsPtr   := credsPtr;
+    c.project    := trpStrDup(project);
+    c.baseURL    := trpStrDup(baseURL);
+    c.timeout    := 30000;
+    c.maxRetries := 3;
+    return c;
+}
+
+pub fn GCPClientFree(c: GCPClient): void {
+    if (c.project != 0) { free(c.project, trpStrLen(c.project) + 1); }
+    if (c.baseURL != 0) { free(c.baseURL, trpStrLen(c.baseURL) + 1); }
+}
+
+pub fn GCPResponseFree(r: GCPResponse): void {
+    if (r.body        != 0) { free(r.body,        r.bodyLen + 1); }
+    if (r.contentType != 0) { free(r.contentType, trpStrLen(r.contentType) + 1); }
+}
+
+pub fn GCPErrorFree(e: GCPError): void {
+    if (e.message != 0) { free(e.message, trpStrLen(e.message) + 1); }
+    if (e.status  != 0) { free(e.status,  trpStrLen(e.status)  + 1); }
+    if (e.details != 0) { free(e.details, trpStrLen(e.details) + 1); }
+}
+
+pub fn GCPParseError(body: int64, bodyLen: int64): GCPError {
+    var e: GCPError := gcpEmptyError();
+    if (body == 0) { return e; }
+    e.code    := gcpJSONExtractInt(body, bodyLen, "code" as int64);
+    e.message := gcpJSONNested(body, bodyLen, "error" as int64, "message" as int64);
+    e.status  := gcpJSONNested(body, bodyLen, "error" as int64, "status" as int64);
+    return e;
+}
+
+fn gcpRequest(c: GCPClient, method: int64, path: int64, body: int64, bodyLen: int64): GCPResponse {
+    var token: int64 := GCPGetToken(c.credsPtr);
+    var attempt: int64 := 0;
+    var r: GCPResponse;
+    r.statusCode := 0; r.body := 0; r.bodyLen := 0; r.contentType := 0;
+    while (attempt <= c.maxRetries) {
+        r := gcpDoRequest(c.baseURL, method, path, body, bodyLen, token);
+        if (gcpShouldRetry(r.statusCode) == 0) {
+            return r;
+        }
+        if (attempt < c.maxRetries) {
+            GCPResponseFree(r);
+            r.statusCode := 0; r.body := 0; r.bodyLen := 0; r.contentType := 0;
+            var delay: int64 := gcpRetryDelay(attempt);
+            sleep(delay);
+        }
+        attempt += 1;
+    }
+    return r;
+}
+
+pub fn GCPGet(c: GCPClient, path: int64): GCPResponse {
+    return gcpRequest(c, "GET" as int64, path, 0, 0);
+}
+
+pub fn GCPPost(c: GCPClient, path: int64, body: int64, bodyLen: int64): GCPResponse {
+    return gcpRequest(c, "POST" as int64, path, body, bodyLen);
+}
+
+pub fn GCPPut(c: GCPClient, path: int64, body: int64, bodyLen: int64): GCPResponse {
+    return gcpRequest(c, "PUT" as int64, path, body, bodyLen);
+}
+
+pub fn GCPPatch(c: GCPClient, path: int64, body: int64, bodyLen: int64): GCPResponse {
+    return gcpRequest(c, "PATCH" as int64, path, body, bodyLen);
+}
+
+pub fn GCPDelete(c: GCPClient, path: int64): GCPResponse {
+    return gcpRequest(c, "DELETE" as int64, path, 0, 0);
+}

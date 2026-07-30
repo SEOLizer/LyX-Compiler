@@ -1,0 +1,421 @@
+// std/cloud/aws/core.lyx — AWS Core: Credential Chain + Endpoint Resolution
+// WP-AWS-02 + WP-AWS-04
+
+unit std.cloud.aws.core;
+
+import std.alloc;
+import std.io;
+import std.fs;
+
+// ── Credential source constants ───────────────────────────────────────────────
+pub con CREDS_STATIC:   int64 := 1;
+pub con CREDS_ENV:      int64 := 2;
+pub con CREDS_FILE:     int64 := 3;
+pub con CREDS_ECS:      int64 := 4;
+pub con CREDS_EC2_META: int64 := 5;
+
+// ── AWSCreds struct ───────────────────────────────────────────────────────────
+pub type AWSCreds = struct {
+    accessKey:    int64;  // pchar (alloc'd)
+    secretKey:    int64;  // pchar (alloc'd)
+    sessionToken: int64;  // pchar or 0
+    expiration:   int64;  // Unix timestamp, 0 = no expiry
+    source:       int64;  // CREDS_* constant
+    region:       int64;  // pchar or 0
+    profile:      int64;  // pchar or 0
+};
+
+// ── AWSServiceConfig struct ───────────────────────────────────────────────────
+pub type AWSServiceConfig = struct {
+    region:       int64;  // pchar
+    endpoint:     int64;  // pchar custom endpoint or 0
+    useDualStack: int64;
+    useFIPS:      int64;
+    maxRetries:   int64;
+    timeoutMs:    int64;
+};
+
+// ── Credential helpers ────────────────────────────────────────────────────────
+
+fn strDup(s: pchar): int64 {
+    if (s == 0 as pchar) { return 0; }
+    var n: int64 := StrLen(s);
+    var buf: int64 := alloc(n + 1);
+    var i: int64 := 0;
+    while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;}
+    poke8(buf+n,0);
+    return buf;
+}
+
+fn emptyCredsStruct(): AWSCreds {
+    var c: AWSCreds;
+    c.accessKey := 0; c.secretKey := 0; c.sessionToken := 0;
+    c.expiration := 0; c.source := 0; c.region := 0; c.profile := 0;
+    return c;
+}
+
+pub fn AWSCredentialsFree(creds: AWSCreds) {
+    if (creds.accessKey    != 0) { free(creds.accessKey,    StrLen(creds.accessKey    as pchar)+1); }
+    if (creds.secretKey    != 0) { free(creds.secretKey,    StrLen(creds.secretKey    as pchar)+1); }
+    if (creds.sessionToken != 0) { free(creds.sessionToken, StrLen(creds.sessionToken as pchar)+1); }
+    if (creds.region       != 0) { free(creds.region,       StrLen(creds.region       as pchar)+1); }
+    if (creds.profile      != 0) { free(creds.profile,      StrLen(creds.profile      as pchar)+1); }
+}
+
+pub fn AWSCredentialsStatic(accessKey: pchar, secretKey: pchar): AWSCreds {
+    var c: AWSCreds := emptyCredsStruct();
+    c.accessKey := strDup(accessKey);
+    c.secretKey := strDup(secretKey);
+    c.source    := CREDS_STATIC;
+    return c;
+}
+
+pub fn AWSCredentialsStaticWithToken(accessKey: pchar, secretKey: pchar, sessionToken: pchar): AWSCreds {
+    var c: AWSCreds := AWSCredentialsStatic(accessKey, secretKey);
+    c.sessionToken := strDup(sessionToken);
+    return c;
+}
+
+extern fn getenv(name: pchar): pchar;
+
+pub fn AWSCredentialsFromEnv(): AWSCreds {
+    var c: AWSCreds := emptyCredsStruct();
+    var ak: pchar := getenv("AWS_ACCESS_KEY_ID"c);
+    var sk: pchar := getenv("AWS_SECRET_ACCESS_KEY"c);
+    if (ak == 0 as pchar || sk == 0 as pchar) { return c; }
+    c.accessKey := strDup(ak);
+    c.secretKey := strDup(sk);
+    c.source    := CREDS_ENV;
+    var tok: pchar := getenv("AWS_SESSION_TOKEN"c);
+    if (tok != 0 as pchar) { c.sessionToken := strDup(tok); }
+    var reg: pchar := getenv("AWS_DEFAULT_REGION"c);
+    if (reg == 0 as pchar) { reg := getenv("AWS_REGION"c); }
+    if (reg != 0 as pchar) { c.region := strDup(reg); }
+    return c;
+}
+
+// ── INI parser ────────────────────────────────────────────────────────────────
+// Minimal INI: [section]\nkey=value\n, supports # and ; comments
+
+fn iniGetValue(content: int64, contentLen: int64, section: pchar, key: pchar): int64 {
+    // Returns alloc'd pchar value or 0
+    var i: int64 := 0;
+    var inSection: int64 := 0;
+    var sl: int64 := StrLen(section);
+    var kl: int64 := StrLen(key);
+
+    while (i < contentLen) {
+        // Skip whitespace/blank lines
+        while (i < contentLen && (peek8(content+i) == 32 || peek8(content+i) == 9)) { i:=i+1; }
+        if (i >= contentLen) { break; }
+        var ch: int64 := peek8(content+i) & 0xFF;
+
+        if (ch == 35 || ch == 59) { // '#' or ';' comment
+            while (i < contentLen && peek8(content+i) != 10) { i:=i+1; }
+            i:=i+1; continue;
+        }
+
+        if (ch == 91) { // '[' section header
+            i:=i+1;
+            var secStart: int64 := i;
+            while (i < contentLen && peek8(content+i) != 93 && peek8(content+i) != 10) { i:=i+1; }
+            var secLen: int64 := i - secStart;
+            if (secLen == sl) {
+                var match: int64 := 1; var j: int64 := 0;
+                while(j<sl){
+                    if(peek8(content+secStart+j) != (StrCharAt(section,j)&0xFF)){match:=0;break;}
+                    j:=j+1;
+                }
+                inSection := match;
+            } else {
+                inSection := 0;
+            }
+            while (i < contentLen && peek8(content+i) != 10) { i:=i+1; }
+            i:=i+1; continue;
+        }
+
+        if (inSection == 1 && ch != 10) {
+            // Try to match key=value
+            var lineStart: int64 := i;
+            // Skip to '='
+            while (i < contentLen && peek8(content+i) != 61 && peek8(content+i) != 10) { i:=i+1; }
+            if (peek8(content+i) == 61) {
+                var keyEnd: int64 := i;
+                // Trim trailing spaces from key
+                var ke: int64 := keyEnd - 1;
+                while (ke > lineStart && peek8(content+ke) == 32) { ke:=ke-1; }
+                var keyLen2: int64 := ke - lineStart + 1;
+                if (keyLen2 == kl) {
+                    var km: int64 := 1; var j2: int64 := 0;
+                    while(j2<kl){
+                        if(peek8(content+lineStart+j2) != (StrCharAt(key,j2)&0xFF)){km:=0;break;}
+                        j2:=j2+1;
+                    }
+                    if (km == 1) {
+                        i:=i+1; // skip '='
+                        while (i < contentLen && peek8(content+i) == 32) { i:=i+1; }
+                        var valStart: int64 := i;
+                        while (i < contentLen && peek8(content+i) != 10) { i:=i+1; }
+                        var valEnd: int64 := i;
+                        while (valEnd > valStart && peek8(content+valEnd-1) == 32) { valEnd:=valEnd-1; }
+                        var valLen: int64 := valEnd - valStart;
+                        var val: int64 := alloc(valLen + 1);
+                        var jj: int64 := 0;
+                        while(jj<valLen){poke8(val+jj,peek8(content+valStart+jj));jj:=jj+1;}
+                        poke8(val+valLen, 0);
+                        return val;
+                    }
+                }
+            }
+        }
+
+        while (i < contentLen && peek8(content+i) != 10) { i:=i+1; }
+        i:=i+1;
+    }
+    return 0;
+}
+
+fn homeDir(): pchar {
+    var h: pchar := getenv("HOME"c);
+    if (h != 0 as pchar) { return h; }
+    return "/root"c;
+}
+
+fn expandHome(path: pchar): int64 {
+    // expand ~ to $HOME
+    if (StrLen(path) > 0 && (StrCharAt(path, 0) & 0xFF) == 126) { // '~'
+        var home: pchar := homeDir();
+        var hl: int64 := StrLen(home);
+        var pl: int64 := StrLen(path);
+        var buf: int64 := alloc(hl + pl); // skip '~'
+        var i: int64 := 0;
+        while(i<hl){poke8(buf+i,StrCharAt(home,i)&0xFF);i:=i+1;}
+        i:=1; while(i<pl){poke8(buf+hl+i-1,StrCharAt(path,i)&0xFF);i:=i+1;}
+        poke8(buf+hl+pl-1, 0);
+        return buf;
+    }
+    return strDup(path);
+}
+
+fn readFileAlloc(path: int64): int64 {
+    // Returns alloc'd content or 0; caller must free
+    var sz: int64 := FileSize(path as pchar);
+    if (sz <= 0) { return 0; }
+    var buf: int64 := alloc(sz + 1);
+    ReadFile(path as pchar, buf as pchar, sz);
+    poke8(buf+sz, 0);
+    return buf;
+}
+
+pub fn AWSCredentialsFromFile(path: pchar, profile: pchar): AWSCreds {
+    var c: AWSCreds := emptyCredsStruct();
+    var resolvedPath: int64 := 0;
+    if (path == 0 as pchar) {
+        var home: pchar := homeDir();
+        var hl: int64 := StrLen(home);
+        var suffix: pchar := "/.aws/credentials"c;
+        var sl: int64 := StrLen(suffix);
+        resolvedPath := alloc(hl + sl + 1);
+        var i: int64 := 0;
+        while(i<hl){poke8(resolvedPath+i,StrCharAt(home,i)&0xFF);i:=i+1;}
+        i:=0; while(i<sl){poke8(resolvedPath+hl+i,StrCharAt(suffix,i)&0xFF);i:=i+1;}
+        poke8(resolvedPath+hl+sl, 0);
+    } else {
+        resolvedPath := expandHome(path);
+    }
+    var content: int64 := readFileAlloc(resolvedPath);
+    var rpLen: int64 := StrLen(resolvedPath as pchar);
+    free(resolvedPath, rpLen + 1);
+    if (content == 0) { return c; }
+    var contentLen: int64 := StrLen(content as pchar);
+
+    var prof: pchar := "default"c;
+    if (profile != 0 as pchar) { prof := profile; }
+
+    var ak: int64 := iniGetValue(content, contentLen, prof, "aws_access_key_id"c);
+    var sk: int64 := iniGetValue(content, contentLen, prof, "aws_secret_access_key"c);
+    free(content, contentLen + 1);
+
+    if (ak == 0 || sk == 0) {
+        if (ak != 0) { free(ak, StrLen(ak as pchar)+1); }
+        if (sk != 0) { free(sk, StrLen(sk as pchar)+1); }
+        return c;
+    }
+    c.accessKey := ak;
+    c.secretKey := sk;
+    c.source    := CREDS_FILE;
+    c.profile   := strDup(prof);
+    return c;
+}
+
+pub fn AWSConfigFromFile(path: pchar, profile: pchar): AWSCreds {
+    var c: AWSCreds := emptyCredsStruct();
+    var resolvedPath: int64 := 0;
+    if (path == 0 as pchar) {
+        var home: pchar := homeDir();
+        var hl: int64 := StrLen(home);
+        var suffix: pchar := "/.aws/config"c;
+        var sl: int64 := StrLen(suffix);
+        resolvedPath := alloc(hl + sl + 1);
+        var i: int64 := 0;
+        while(i<hl){poke8(resolvedPath+i,StrCharAt(home,i)&0xFF);i:=i+1;}
+        i:=0; while(i<sl){poke8(resolvedPath+hl+i,StrCharAt(suffix,i)&0xFF);i:=i+1;}
+        poke8(resolvedPath+hl+sl, 0);
+    } else {
+        resolvedPath := expandHome(path);
+    }
+    var content: int64 := readFileAlloc(resolvedPath);
+    var rpLen: int64 := StrLen(resolvedPath as pchar);
+    free(resolvedPath, rpLen + 1);
+    if (content == 0) { return c; }
+    var contentLen: int64 := StrLen(content as pchar);
+
+    // In config, profile sections are "profile <name>" except "default"
+    var sectionBuf: int64 := alloc(128);
+    var prof: pchar := "default"c;
+    if (profile != 0 as pchar && !StrEquals(profile, "default"c) as int64 == 0) {
+        var prefx: pchar := "profile "c;
+        var pfxl: int64 := StrLen(prefx);
+        var pl: int64 := StrLen(profile);
+        var i: int64 := 0;
+        while(i<pfxl){poke8(sectionBuf+i,StrCharAt(prefx,i)&0xFF);i:=i+1;}
+        i:=0; while(i<pl){poke8(sectionBuf+pfxl+i,StrCharAt(profile,i)&0xFF);i:=i+1;}
+        poke8(sectionBuf+pfxl+pl,0);
+        prof := sectionBuf as pchar;
+    }
+
+    var reg: int64 := iniGetValue(content, contentLen, prof, "region"c);
+    free(content, contentLen + 1);
+    free(sectionBuf, 128);
+
+    c.region := reg;
+    return c;
+}
+
+pub fn AWSCredentialsProfile(profile: pchar): AWSCreds {
+    return AWSCredentialsFromFile(0 as pchar, profile);
+}
+
+pub fn AWSCredentialsDefault(): AWSCreds {
+    // Chain: Env → File(default) → empty
+    var c: AWSCreds := AWSCredentialsFromEnv();
+    if (c.accessKey != 0) { return c; }
+    c = AWSCredentialsFromFile(0 as pchar, 0 as pchar);
+    if (c.accessKey != 0) {
+        // Merge region from config if missing
+        if (c.region == 0) {
+            var cfg: AWSCreds := AWSConfigFromFile(0 as pchar, 0 as pchar);
+            if (cfg.region != 0) { c.region := cfg.region; cfg.region := 0; }
+            AWSCredentialsFree(cfg);
+        }
+        return c;
+    }
+    return c;
+}
+
+pub fn AWSCredentialsIsExpired(creds: AWSCreds): int64 {
+    if (creds.expiration == 0) { return 0; }
+    var ts: int64 := alloc(16);
+    sys_clock_gettime(0, ts);
+    var now: int64 := peek64(ts);
+    free(ts, 16);
+    if (creds.expiration < now) { return 1; }
+    return 0;
+}
+
+pub fn AWSCredentialsRefresh(creds: AWSCreds): AWSCreds {
+    // Re-fetch from same source
+    if (creds.source == CREDS_ENV) { return AWSCredentialsFromEnv(); }
+    if (creds.source == CREDS_FILE) {
+        return AWSCredentialsFromFile(0 as pchar, creds.profile as pchar);
+    }
+    return creds;
+}
+
+// ── Endpoint Resolution (WP-AWS-04) ──────────────────────────────────────────
+
+// Services that use a single global endpoint
+fn isGlobalService(service: pchar): int64 {
+    if (StrEquals(service, "iam"c)        as int64 == 1) { return 1; }
+    if (StrEquals(service, "route53"c)    as int64 == 1) { return 1; }
+    if (StrEquals(service, "cloudfront"c) as int64 == 1) { return 1; }
+    if (StrEquals(service, "waf"c)        as int64 == 1) { return 1; }
+    return 0;
+}
+
+fn isChinaRegion(region: pchar): int64 {
+    if (StrStartsWith(region, "cn-"c) as int64 == 1) { return 1; }
+    return 0;
+}
+
+fn appendStr2(buf: int64, off: int64, s: pchar): int64 {
+    var i: int64 := 0; var n: int64 := StrLen(s);
+    while(i<n){poke8(buf+off+i,StrCharAt(s,i)&0xFF);i:=i+1;}
+    return off+n;
+}
+
+pub fn AWSEndpoint(service: pchar, region: pchar): int64 {
+    // Returns alloc'd pchar endpoint hostname
+    var buf: int64 := alloc(256);
+    var off: int64 := 0;
+
+    if (isGlobalService(service) == 1) {
+        off := appendStr2(buf, off, service);
+        var suffix: pchar := ".amazonaws.com"c;
+        off := appendStr2(buf, off, suffix);
+        poke8(buf+off, 0);
+        return buf;
+    }
+
+    // Standard: <service>.<region>.amazonaws.com[.cn]
+    off := appendStr2(buf, off, service);
+    poke8(buf+off, 46); off:=off+1;
+    off := appendStr2(buf, off, region);
+    if (isChinaRegion(region) == 1) {
+        var sfxCN: pchar := ".amazonaws.com.cn"c;
+        off := appendStr2(buf, off, sfxCN);
+    } else {
+        var sfx: pchar := ".amazonaws.com"c;
+        off := appendStr2(buf, off, sfx);
+    }
+    poke8(buf+off, 0);
+    return buf;
+}
+
+pub fn AWSS3Endpoint(bucket: pchar, region: pchar, pathStyle: int64): int64 {
+    var buf: int64 := alloc(512);
+    var off: int64 := 0;
+    if (pathStyle == 0 && bucket != 0 as pchar) {
+        // virtual-hosted: <bucket>.s3.<region>.amazonaws.com
+        off := appendStr2(buf, off, bucket); poke8(buf+off,46); off:=off+1;
+    }
+    var s3: pchar := "s3"c;
+    off := appendStr2(buf, off, s3); poke8(buf+off,46); off:=off+1;
+    off := appendStr2(buf, off, region);
+    if (isChinaRegion(region) == 1) {
+        var sfxCN: pchar := ".amazonaws.com.cn"c;
+        off := appendStr2(buf, off, sfxCN);
+    } else {
+        var sfx: pchar := ".amazonaws.com"c;
+        off := appendStr2(buf, off, sfx);
+    }
+    poke8(buf+off, 0);
+    return buf;
+}
+
+pub fn AWSServiceConfigDefault(region: pchar): AWSServiceConfig {
+    var cfg: AWSServiceConfig;
+    cfg.region       := region as int64;
+    cfg.endpoint     := 0;
+    cfg.useDualStack := 0;
+    cfg.useFIPS      := 0;
+    cfg.maxRetries   := 3;
+    cfg.timeoutMs    := 30000;
+    return cfg;
+}
+
+pub fn AWSServiceConfigLocalStack(): AWSServiceConfig {
+    var cfg: AWSServiceConfig := AWSServiceConfigDefault("us-east-1"c);
+    cfg.endpoint := "http://localhost:4566"c as int64;
+    return cfg;
+}

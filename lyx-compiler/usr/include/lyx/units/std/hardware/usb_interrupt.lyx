@@ -1,0 +1,222 @@
+// std/hardware/usb_interrupt.lyx
+// WP-6: Interrupt-Transfers (asynchron, URB-basiert)
+// Plattform: Linux ARM64 / x86_64 — usbdevfs ioctl-Schnittstelle
+//
+// Ablauf:
+//   1. UsbAllocUrb()                              — Heap-URB anlegen
+//   2. UsbInitInterruptRead(urb, ep, buf, len, ctx) — Felder befüllen
+//   3. UsbSubmitUrb(fd, urb)                      — URB einreichen
+//   4. UsbWaitForUrb(fd, timeout)                 — auf Abschluss warten
+//   5. UsbUrbActualLength / UsbUrbStatus lesen    — Ergebnis auswerten
+//   6. UsbSubmitUrb erneut                        — nächsten Zyklus starten
+//   7. UsbFreeUrb(urb)                            — am Ende freigeben
+//
+// Bugs aus dem Design-Doc-Review behoben:
+//   - URB heap-allokiert (kein Stack) — bleibt gültig bis REAP
+//   - WaitForUrb: p_urb = 0 vor REAPURBNDELAY (Kernel überschreibt es)
+//   - DiscardUrb: urbPtr direkt an ioctl (nicht &urbPtr — USBDEVFS_DISCARDURB ist _IO)
+//   - Kein Phantom-Feld `direction`; signr ist uint32 (4 Bytes), nicht Byte
+
+unit std.hardware.usb_interrupt;
+
+import std.hardware.usb_syscalls;
+import std.alloc;
+
+// ============================================================
+// IOCTL-Codes (64-Bit Linux — aus <linux/usbdevice_fs.h>)
+// ============================================================
+
+// _IOW('U', 10, struct usbdevfs_urb) — sizeof(usbdevfs_urb) = 56
+// = (1<<30)|(56<<16)|(0x55<<8)|10 = 0x4038550A
+pub con USBDEVFS_SUBMITURB: int64 := 0x4038550A;
+
+// _IO('U', 11) — kein Datentransfer, URB-Zeiger als arg direkt
+// = (0<<30)|(0<<16)|(0x55<<8)|11 = 0x0000550B
+pub con USBDEVFS_DISCARDURB: int64 := 0x0000550B;
+
+// _IOW('U', 12, void *) — blockierend, sizeof(void*)=8
+// = (1<<30)|(8<<16)|(0x55<<8)|12 = 0x4008550C
+pub con USBDEVFS_REAPURB: int64 := 0x4008550C;
+
+// _IOW('U', 13, void *) — nicht blockierend
+// = (1<<30)|(8<<16)|(0x55<<8)|13 = 0x4008550D
+pub con USBDEVFS_REAPURBNDELAY: int64 := 0x4008550D;
+
+// URB-Transfer-Typen (usbdevfs_urb.type)
+pub con USBDEVFS_URB_TYPE_ISO:       int64 := 0;
+pub con USBDEVFS_URB_TYPE_INTERRUPT: int64 := 1;
+pub con USBDEVFS_URB_TYPE_CONTROL:   int64 := 2;
+pub con USBDEVFS_URB_TYPE_BULK:      int64 := 3;
+
+// ============================================================
+// struct usbdevfs_urb — Layout (56 Bytes auf 64-Bit Linux)
+//
+// Offset  0: type             (uint8)   USBDEVFS_URB_TYPE_*
+// Offset  1: endpoint         (uint8)   Bit 7: 1=IN, 0=OUT
+// Offset  2: _pad0            (2 Bytes) — Padding für int-Alignment
+// Offset  4: status           (int32)   0 = OK, nach Abschluss vom Kernel gesetzt
+// Offset  8: flags            (uint32)
+// Offset 12: _pad1            (4 Bytes) — Padding für Pointer-Alignment
+// Offset 16: buffer           (void *)  8 Bytes
+// Offset 24: buffer_length    (int32)
+// Offset 28: actual_length    (int32)   vom Kernel befüllt
+// Offset 32: start_frame      (int32)
+// Offset 36: number_of_packets(int32)
+// Offset 40: error_count      (int32)
+// Offset 44: signr            (uint32)  Signalnummer (0 = kein Signal) — NICHT Byte!
+// Offset 48: usercontext      (void *)  8 Bytes, unverändert beim Reap zurückgegeben
+// Total: 56 Bytes
+// ============================================================
+pub con USB_URB_STRUCT_SIZE: int64 := 56;
+
+// Feld-Offsets für direkten Speicherzugriff
+pub con URB_OFF_TYPE:            int64 := 0;
+pub con URB_OFF_ENDPOINT:        int64 := 1;
+pub con URB_OFF_STATUS:          int64 := 4;
+pub con URB_OFF_FLAGS:           int64 := 8;
+pub con URB_OFF_BUFFER:          int64 := 16;
+pub con URB_OFF_BUFFER_LENGTH:   int64 := 24;
+pub con URB_OFF_ACTUAL_LENGTH:   int64 := 28;
+pub con URB_OFF_START_FRAME:     int64 := 32;
+pub con URB_OFF_NUM_PACKETS:     int64 := 36;
+pub con URB_OFF_ERROR_COUNT:     int64 := 40;
+pub con URB_OFF_SIGNR:           int64 := 44;
+pub con URB_OFF_USERCONTEXT:     int64 := 48;
+
+// poll-Event-Flag
+con URB_POLLIN: int64 := 1;
+
+// ============================================================
+// UsbAllocUrb — allokiert und nullt eine URB-Struktur (Heap)
+// Der Aufrufer ist für UsbFreeUrb() zuständig, nachdem WaitForUrb
+// den URB zurückgegeben hat.
+// ============================================================
+pub fn UsbAllocUrb(): int64 {
+  var ptr: int64 := alloc(USB_URB_STRUCT_SIZE);
+  if (ptr == 0) { return 0; }
+  // 56 Bytes = 7 × 8 → 7 poke64-Aufrufe
+  var i: int64 := 0;
+  while (i < 7) {
+    poke64(ptr + i * 8, 0);
+    i += 1;
+  }
+  return ptr;
+}
+
+// UsbFreeUrb — gibt einen heap-allokierten URB frei
+pub fn UsbFreeUrb(urbPtr: int64) {
+  free(urbPtr, USB_URB_STRUCT_SIZE);
+}
+
+// ============================================================
+// UsbInitInterruptRead — befüllt einen URB für Interrupt-IN-Lesen
+// urbPtr: aus UsbAllocUrb() (muss vor diesem Aufruf genullt sein)
+// (5 Parameter ≤ 6-Arg-Limit)
+// ============================================================
+pub fn UsbInitInterruptRead(urbPtr: int64, endpoint: int64,
+                             buffer: int64, length: int64, context: int64) {
+  poke8 (urbPtr + URB_OFF_TYPE,          USBDEVFS_URB_TYPE_INTERRUPT & 0xFF);
+  poke8 (urbPtr + URB_OFF_ENDPOINT,      endpoint & 0xFF);
+  poke32(urbPtr + URB_OFF_FLAGS,         0);
+  poke64(urbPtr + URB_OFF_BUFFER,        buffer);
+  poke32(urbPtr + URB_OFF_BUFFER_LENGTH, length & 0xFFFFFFFF);
+  poke64(urbPtr + URB_OFF_USERCONTEXT,   context);
+  // status, actual_length, signr etc. bleiben 0 (bereits genullt)
+}
+
+// ============================================================
+// UsbSubmitUrb — reicht einen URB beim Kernel ein (kehrt sofort zurück)
+// Rückgabe: 0 = Erfolg, negativer Fehlercode sonst.
+// ============================================================
+pub fn UsbSubmitUrb(dev_fd: int64, urbPtr: int64): int64 {
+  return sys_ioctl(dev_fd, USBDEVFS_SUBMITURB, urbPtr);
+}
+
+// ============================================================
+// UsbSubmitInterruptRead — Convenience: allokiert URB, init und submit
+// Rückgabe: URB-Zeiger (Heap, Aufrufer muss nach REAP freigeben)
+//           oder 0 bei Fehler.
+// (5 Parameter ≤ 6-Arg-Limit)
+// ============================================================
+pub fn UsbSubmitInterruptRead(dev_fd: int64, endpoint: int64,
+                               buffer: int64, length: int64, context: int64): int64 {
+  var urb: int64 := UsbAllocUrb();
+  if (urb == 0) { return 0; }
+  UsbInitInterruptRead(urb, endpoint, buffer, length, context);
+  var ret: int64 := UsbSubmitUrb(dev_fd, urb);
+  if (ret < 0) {
+    UsbFreeUrb(urb);
+    return 0;
+  }
+  return urb;
+}
+
+// ============================================================
+// UsbWaitForUrb — wartet auf URB-Abschluss via poll + REAPURBNDELAY
+//
+// Rückgabe: Zeiger auf den fertigen URB (Kernel-Adresse des URBs,
+//           identisch mit dem bei SubmitUrb übergebenen Zeiger)
+//           oder 0 bei Timeout oder Fehler.
+//
+// WICHTIG: urbPtrBuf muss 0 sein vor dem REAPURBNDELAY-ioctl —
+//          der Kernel überschreibt es mit dem URB-Zeiger.
+// ============================================================
+pub fn UsbWaitForUrb(dev_fd: int64, timeout_ms: int64): int64 {
+  // pollfd: { int32 fd, int16 events, int16 revents } = 8 Bytes
+  var pfd: int64 := alloc(8);
+  poke32(pfd,     dev_fd & 0xFFFFFFFF);
+  poke16(pfd + 4, URB_POLLIN);
+  poke16(pfd + 6, 0);
+
+  var pollRet: int64 := sys_poll(pfd, 1, timeout_ms);
+  free(pfd, 8);
+
+  if (pollRet <= 0) { return 0; }   // Timeout oder poll-Fehler
+
+  // REAPURBNDELAY: nicht-blockierendes Abholen des fertigen URBs
+  // urbPtrBuf = 0, Kernel schreibt URB-Zeiger hinein
+  var urbPtrBuf: int64 := alloc(8);
+  poke64(urbPtrBuf, 0);
+  var ret: int64 := sys_ioctl(dev_fd, USBDEVFS_REAPURBNDELAY, urbPtrBuf);
+  var result: int64 := peek64(urbPtrBuf);
+  free(urbPtrBuf, 8);
+
+  if (ret < 0) { return 0; }
+  return result;
+}
+
+// ============================================================
+// UsbDiscardUrb — bricht einen laufenden URB ab
+//
+// USBDEVFS_DISCARDURB ist _IO (kein Datentransfer) — urbPtr wird
+// direkt als ioctl-Argument übergeben, NICHT als Zeiger-auf-Zeiger.
+// Rückgabe: 1 = abgebrochen, 0 = Fehler (z.B. URB bereits abgeschlossen)
+// ============================================================
+pub fn UsbDiscardUrb(dev_fd: int64, urbPtr: int64): int64 {
+  if (sys_ioctl(dev_fd, USBDEVFS_DISCARDURB, urbPtr) >= 0) { return 1; }
+  return 0;
+}
+
+// ============================================================
+// URB-Feld-Accessoren (nach WaitForUrb auswerten)
+// ============================================================
+
+// Fehlercode nach Abschluss (0 = OK, negativ = Fehler)
+pub fn UsbUrbStatus(urbPtr: int64): int64 {
+  return peek32(urbPtr + URB_OFF_STATUS);
+}
+
+// Tatsächlich empfangene Bytes (vom Kernel gesetzt)
+pub fn UsbUrbActualLength(urbPtr: int64): int64 {
+  return peek32(urbPtr + URB_OFF_ACTUAL_LENGTH) & 0xFFFFFFFF;
+}
+
+// Usercontext — der beim Submit übergebene Kontext-Zeiger
+pub fn UsbUrbContext(urbPtr: int64): int64 {
+  return peek64(urbPtr + URB_OFF_USERCONTEXT);
+}
+
+// Endpunkt-Adresse des URBs
+pub fn UsbUrbEndpoint(urbPtr: int64): int64 {
+  return peek8(urbPtr + URB_OFF_ENDPOINT);
+}

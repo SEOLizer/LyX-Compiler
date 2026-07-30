@@ -1,0 +1,165 @@
+// std/ipc_sysv — WP-12: SysV IPC (Shared Memory, Semaphore, Message Queues)
+// Wrapper um sys_shmget/shmat/shmctl/shmdt, sys_semget/semop/semctl,
+// sys_msgget/msgsnd/msgrcv/msgctl
+//
+// SysV IPC-Objekte werden über Integer-Keys identifiziert (nicht über Pfade).
+// IPC_PRIVATE (0) erzeugt ein privates Objekt ohne externen Schlüssel.
+
+import std.alloc;
+
+// ============================================================
+// Allgemeine IPC-Konstanten
+// ============================================================
+
+pub con IPC_PRIVATE: int64 := 0;   // privater Key (nicht teilbar)
+pub con IPC_CREAT:   int64 := 512;  // 0x200 — anlegen falls nicht vorhanden
+pub con IPC_EXCL:    int64 := 1024; // 0x400 — Fehler wenn bereits vorhanden
+
+// IPC-Kontroll-Kommandos
+pub con IPC_RMID: int64 := 0;  // Objekt löschen
+pub con IPC_STAT: int64 := 2;  // Status lesen
+pub con IPC_SET:  int64 := 1;  // Parameter setzen
+
+// ============================================================
+// Shared Memory
+// ============================================================
+
+// Flags für ShmAttach
+pub con SHM_RDONLY: int64 := 4096; // 0x1000 — nur lesen
+
+// ShmCreate: erzeugt oder öffnet ein Shared-Memory-Segment.
+// key:   IPC_PRIVATE oder eigener Integer-Key
+// size:  Größe in Bytes
+// flags: IPC_CREAT | IPC_EXCL | Zugriffsrechte (z.B. 438 = 0o666)
+// Gibt shmId zurück (>= 0) oder negativen Fehlercode.
+pub fn ShmCreate(key: int64, size: int64, flags: int64): int64 {
+  return sys_shmget(key, size, flags);
+}
+
+// ShmAttach: mappt ein Shared-Memory-Segment in den Prozess-Adressraum.
+// shmId: Identifier aus ShmCreate
+// addr:  gewünschte Adresse (0 = Kernel wählt automatisch)
+// flags: 0 oder SHM_RDONLY
+// Gibt die tatsächliche Mapping-Adresse zurück oder -errno.
+pub fn ShmAttach(shmId: int64, addr: int64, flags: int64): int64 {
+  return sys_shmat(shmId, addr, flags);
+}
+
+// ShmDetach: entfernt das Segment aus dem Adressraum.
+// Kein Löschen — das Segment bleibt bis ShmDelete.
+pub fn ShmDetach(addr: int64): int64 {
+  return sys_shmdt(addr);
+}
+
+// ShmDelete: löscht das Segment (IPC_RMID).
+// Das Segment wird gelöscht sobald kein Prozess mehr gemappt ist.
+pub fn ShmDelete(shmId: int64): int64 {
+  return sys_shmctl(shmId, IPC_RMID, 0);
+}
+
+// ============================================================
+// Semaphore
+// ============================================================
+
+// sembuf-Struktur: 6 Bytes, ausgerichtet auf 8 Bytes
+//   +0: sem_num (uint16) — Semaphornummer in der Gruppe
+//   +2: sem_op  (int16)  — Operation: +1 = V (post), -1 = P (wait)
+//   +4: sem_flg (int16)  — SEM_UNDO / IPC_NOWAIT
+pub con SEMBUF_SIZE: int64 := 8;
+pub con SEM_UNDO:   int64 := 4096; // 0x1000 — Undo bei Prozessende
+pub con IPC_NOWAIT: int64 := 2048; // 0x800  — nicht blockieren
+
+// Semaphore-Kommandos für SemSetVal/SemGetVal
+pub con SEM_GETVAL: int64 := 12; // GETVAL — Wert einer einzelnen Semaphore
+pub con SEM_SETVAL: int64 := 16; // SETVAL — Wert setzen
+
+// SemCreate: erzeugt oder öffnet eine Semaphore-Gruppe.
+// key:   IPC_PRIVATE oder Integer-Key
+// nsems: Anzahl der Semaphoren in der Gruppe (>= 1)
+// flags: IPC_CREAT | IPC_EXCL | Zugriffsrechte
+pub fn SemCreate(key: int64, nsems: int64, flags: int64): int64 {
+  return sys_semget(key, nsems, flags);
+}
+
+// SemSetVal: setzt den Wert einer einzelnen Semaphore (SETVAL).
+pub fn SemSetVal(semId: int64, semNum: int64, val: int64): int64 {
+  return sys_semctl(semId, semNum, SEM_SETVAL, val);
+}
+
+// SemGetVal: liest den Wert einer einzelnen Semaphore (GETVAL).
+pub fn SemGetVal(semId: int64, semNum: int64): int64 {
+  return sys_semctl(semId, semNum, SEM_GETVAL, 0);
+}
+
+// SemWait: dekrementiert Semaphore semNum um 1 (blockierend — P-Operation).
+pub fn SemWait(semId: int64, semNum: int64): int64 {
+  var buf: int64 := alloc(SEMBUF_SIZE);
+  if (buf == 0) { return -12; }   // -ENOMEM
+  poke16(buf,     semNum as int16);
+  poke16(buf + 2, -1 as int16);   // sem_op = -1
+  poke16(buf + 4, 0);
+  var r: int64 := sys_semop(semId, buf, 1);
+  free(buf, SEMBUF_SIZE);
+  return r;
+}
+
+// SemPost: inkrementiert Semaphore semNum um 1 (V-Operation).
+pub fn SemPost(semId: int64, semNum: int64): int64 {
+  var buf: int64 := alloc(SEMBUF_SIZE);
+  if (buf == 0) { return -12; }   // -ENOMEM
+  poke16(buf,     semNum as int16);
+  poke16(buf + 2, 1 as int16);    // sem_op = +1
+  poke16(buf + 4, 0);
+  var r: int64 := sys_semop(semId, buf, 1);
+  free(buf, SEMBUF_SIZE);
+  return r;
+}
+
+// SemDelete: löscht die Semaphore-Gruppe (IPC_RMID).
+pub fn SemDelete(semId: int64): int64 {
+  return sys_semctl(semId, 0, IPC_RMID, 0);
+}
+
+// ============================================================
+// SysV Message Queues
+// ============================================================
+
+// msgbuf-Layout:
+//   +0: mtype (int64, 8 Bytes) — Nachrichtentyp (muss > 0 sein)
+//   +8: mtext (variabel)        — Nutzdaten
+pub con MSG_HDR_SIZE: int64 := 8;   // sizeof(mtype) im msgbuf-Header
+
+// msgrcv-Flags
+pub con MSG_NOERROR: int64 := 4096; // 0x1000 — Nachricht abschneiden statt -E2BIG
+
+// MsgQueueCreate: erzeugt oder öffnet eine SysV-Message-Queue.
+// key:   IPC_PRIVATE oder Integer-Key
+// flags: IPC_CREAT | IPC_EXCL | Zugriffsrechte
+pub fn MsgQueueCreate(key: int64, flags: int64): int64 {
+  return sys_msgget(key, flags);
+}
+
+// MsgSend: sendet eine Nachricht an die Queue.
+// mqId:  Queue-Identifier aus MsgQueueCreate
+// buf:   Zeiger auf msgbuf: erste 8 Bytes = mtype (int64 > 0), dann Nutzdaten
+// size:  Größe der NUTZDATEN in Bytes (OHNE den 8-Byte-mtype-Header)
+// flags: 0 oder IPC_NOWAIT
+pub fn MsgSend(mqId: int64, buf: int64, size: int64, flags: int64): int64 {
+  return sys_msgsnd(mqId, buf, size, flags);
+}
+
+// MsgRecv: empfängt eine Nachricht aus der Queue.
+// mqId:    Queue-Identifier
+// buf:     Empfangspuffer — nach dem Call: +0 = mtype, +8 = Nutzdaten
+// size:    maximale Nutzdatengröße (OHNE den 8-Byte-mtype-Header)
+// msgType: 0 = beliebiger Typ, > 0 = genau dieser Typ, < 0 = Typ <= |msgType|
+// flags:   0, IPC_NOWAIT oder MSG_NOERROR
+// Gibt Anzahl empfangener Nutzdaten-Bytes zurück (>= 0) oder -errno.
+pub fn MsgRecv(mqId: int64, buf: int64, size: int64, msgType: int64, flags: int64): int64 {
+  return sys_msgrcv(mqId, buf, size, msgType, flags);
+}
+
+// MsgQueueDelete: löscht die Message-Queue (IPC_RMID).
+pub fn MsgQueueDelete(mqId: int64): int64 {
+  return sys_msgctl(mqId, IPC_RMID, 0);
+}

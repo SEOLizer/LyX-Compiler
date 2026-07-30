@@ -1,0 +1,2581 @@
+// std/db/postgres.lyx — PostgreSQL Frontend/Backend Protocol v3 Client
+// WP-PG-01: TCP-Verbindung & Nachrichtenrahmen
+// WP-PG-02: Handshake & Authentifizierung
+//
+// Reine Lyx-Implementierung ohne externe Abhängigkeiten (kein libpq).
+// Protokoll: PostgreSQL v3 (Protocol 3.0 / wire format since PostgreSQL 7.4+)
+
+unit std.db.postgres;
+
+import std.alloc;
+import std.string;
+import std.crypto.md5;
+
+// ============================================================================
+// Konstanten
+// ============================================================================
+
+pub con PG_PROTOCOL_MAJOR:   int64 := 3;
+pub con PG_PROTOCOL_MINOR:   int64 := 0;
+pub con PG_PROTOCOL_VERSION: int64 := 196608;  // (3 << 16) | 0
+
+// Fehler-Codes
+pub con PG_ERR_NONE:         int64 := 0;
+pub con PG_ERR_SOCKET:       int64 := 3001;
+pub con PG_ERR_CONNECT:      int64 := 3002;
+pub con PG_ERR_OOM:          int64 := 3003;
+pub con PG_ERR_SEND:         int64 := 3004;
+pub con PG_ERR_RECV:         int64 := 3005;
+pub con PG_ERR_PROTO:        int64 := 3006;
+
+// Backend-Nachrichten-Typen (Server → Client)
+pub con PG_MSG_AUTH:         int64 := 82;   // 'R'
+pub con PG_MSG_PARAM_STATUS: int64 := 83;   // 'S'
+pub con PG_MSG_BACKEND_KEY:  int64 := 75;   // 'K'
+pub con PG_MSG_READY:        int64 := 90;   // 'Z'
+pub con PG_MSG_ROW_DESC:     int64 := 84;   // 'T'
+pub con PG_MSG_DATA_ROW:     int64 := 68;   // 'D'
+pub con PG_MSG_CMD_COMPLETE: int64 := 67;   // 'C'
+pub con PG_MSG_ERROR:        int64 := 69;   // 'E'
+pub con PG_MSG_NOTICE:       int64 := 78;   // 'N'
+pub con PG_MSG_PARSE_DONE:   int64 := 49;   // '1'
+pub con PG_MSG_BIND_DONE:    int64 := 50;   // '2'
+pub con PG_MSG_NO_DATA:      int64 := 110;  // 'n'
+pub con PG_MSG_EMPTY_QUERY:  int64 := 73;   // 'I'
+pub con PG_MSG_NOTIFY:       int64 := 65;   // 'A'
+pub con PG_MSG_COPY_IN:      int64 := 71;   // 'G'
+pub con PG_MSG_COPY_OUT:     int64 := 72;   // 'H'
+pub con PG_MSG_COPY_DATA:    int64 := 100;  // 'd'
+pub con PG_MSG_COPY_DONE:    int64 := 99;   // 'c'
+
+// Frontend-Nachrichten-Typen (Client → Server)
+pub con PG_FE_QUERY:         int64 := 81;   // 'Q'
+pub con PG_FE_PARSE:         int64 := 80;   // 'P'
+pub con PG_FE_BIND:          int64 := 66;   // 'B'
+pub con PG_FE_EXECUTE:       int64 := 69;   // 'E'
+pub con PG_FE_DESCRIBE:      int64 := 68;   // 'D'
+pub con PG_FE_SYNC:          int64 := 83;   // 'S'
+pub con PG_FE_CLOSE:         int64 := 67;   // 'C'
+pub con PG_FE_TERMINATE:     int64 := 88;   // 'X'
+pub con PG_FE_PASSWORD:      int64 := 112;  // 'p'
+pub con PG_FE_COPY_DATA:     int64 := 100;  // 'd'
+pub con PG_FE_COPY_DONE:     int64 := 99;   // 'c'
+pub con PG_FE_COPY_FAIL:     int64 := 102;  // 'f'
+
+// Auth-Subtypen
+pub con PG_AUTH_OK:          int64 := 0;
+pub con PG_AUTH_CLEARTEXT:   int64 := 3;
+pub con PG_AUTH_MD5:         int64 := 5;
+pub con PG_AUTH_SASL:        int64 := 10;
+
+// ReadyForQuery-Transaktionsstatus
+pub con PG_TX_IDLE:          int64 := 73;   // 'I'
+pub con PG_TX_ACTIVE:        int64 := 84;   // 'T'
+pub con PG_TX_ERROR:         int64 := 69;   // 'E'
+
+// PGMsgBuf-Kapazität initial
+con PG_BUF_INIT_CAP: int64 := 4096;
+
+// ============================================================================
+// Big-Endian Hilfsfunktionen
+// ============================================================================
+
+// Schreibt 32-Bit-Wert big-endian in buf[off..off+3]
+pub fn pgWriteInt32BE(buf: int64, off: int64, v: int64) {
+  poke8(buf + off,     (v >> 24) & 0xFF);
+  poke8(buf + off + 1, (v >> 16) & 0xFF);
+  poke8(buf + off + 2, (v >> 8)  & 0xFF);
+  poke8(buf + off + 3, v         & 0xFF);
+}
+
+// Liest 32-Bit-Wert big-endian aus buf[off..off+3]
+pub fn pgReadInt32BE(buf: int64, off: int64): int64 {
+  var b0: int64 := peek8(buf + off)     & 0xFF;
+  var b1: int64 := peek8(buf + off + 1) & 0xFF;
+  var b2: int64 := peek8(buf + off + 2) & 0xFF;
+  var b3: int64 := peek8(buf + off + 3) & 0xFF;
+  return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+// Schreibt 16-Bit-Wert big-endian in buf[off..off+1]
+pub fn pgWriteInt16BE(buf: int64, off: int64, v: int64) {
+  poke8(buf + off,     (v >> 8) & 0xFF);
+  poke8(buf + off + 1, v        & 0xFF);
+}
+
+// Liest 16-Bit-Wert big-endian aus buf[off..off+1]
+pub fn pgReadInt16BE(buf: int64, off: int64): int64 {
+  var b0: int64 := peek8(buf + off)     & 0xFF;
+  var b1: int64 := peek8(buf + off + 1) & 0xFF;
+  return (b0 << 8) | b1;
+}
+
+// ============================================================================
+// PGMsgBuf — dynamischer Nachrichtenaufbau-Buffer
+// ============================================================================
+// Speicher-Layout: buf(int64) + cap(int64) + len(int64) = 24 Bytes
+
+con PGMSGBUF_SZ: int64 := 24;
+
+// Allokiert einen neuen PGMsgBuf, gibt Zeiger zurück
+pub fn pgBufNew(): int64 {
+  var b: int64 := alloc(PGMSGBUF_SZ);
+  var data: int64 := alloc(PG_BUF_INIT_CAP);
+  poke64(b,      data);           // buf
+  poke64(b + 8,  PG_BUF_INIT_CAP); // cap
+  poke64(b + 16, 0);              // len
+  return b;
+}
+
+pub fn pgBufFree(b: int64) {
+  if (b == 0) { return; }
+  var data: int64 := peek64(b);
+  var cap:  int64 := peek64(b + 8);
+  if (data != 0) { free(data, cap); }
+  free(b, PGMSGBUF_SZ);
+}
+
+pub fn pgBufReset(b: int64) {
+  poke64(b + 16, 0);
+}
+
+fn pgBufGrow(b: int64, need: int64) {
+  var cap: int64 := peek64(b + 8);
+  var len: int64 := peek64(b + 16);
+  if (cap >= len + need) { return; }
+  var nc: int64 := cap * 2;
+  while (nc < len + need) { nc := nc * 2; }
+  var old: int64 := peek64(b);
+  var nb:  int64 := alloc(nc);
+  var i:   int64 := 0;
+  while (i < len) { poke8(nb + i, peek8(old + i)); i := i + 1; }
+  free(old, cap);
+  poke64(b,     nb);
+  poke64(b + 8, nc);
+}
+
+pub fn pgBufAppend8(b: int64, v: int64) {
+  pgBufGrow(b, 1);
+  var data: int64 := peek64(b);
+  var len:  int64 := peek64(b + 16);
+  poke8(data + len, v & 0xFF);
+  poke64(b + 16, len + 1);
+}
+
+pub fn pgBufAppend16BE(b: int64, v: int64) {
+  pgBufGrow(b, 2);
+  var data: int64 := peek64(b);
+  var len:  int64 := peek64(b + 16);
+  pgWriteInt16BE(data, len, v);
+  poke64(b + 16, len + 2);
+}
+
+pub fn pgBufAppend32BE(b: int64, v: int64) {
+  pgBufGrow(b, 4);
+  var data: int64 := peek64(b);
+  var len:  int64 := peek64(b + 16);
+  pgWriteInt32BE(data, len, v);
+  poke64(b + 16, len + 4);
+}
+
+pub fn pgBufAppendStr(b: int64, s: pchar) {
+  if (s == 0 as pchar) { pgBufAppend8(b, 0); return; }
+  var i: int64 := 0;
+  while (true) {
+    var c: int64 := peek8(s as int64 + i) & 0xFF;
+    pgBufAppend8(b, c);
+    if (c == 0) { break; }
+    i += 1;
+  }
+}
+
+// Schreibt n Bytes aus src in den Buffer
+pub fn pgBufAppendBytes(b: int64, src: int64, n: int64) {
+  pgBufGrow(b, n);
+  var data: int64 := peek64(b);
+  var len:  int64 := peek64(b + 16);
+  var i:    int64 := 0;
+  while (i < n) { poke8(data + len + i, peek8(src + i)); i := i + 1; }
+  poke64(b + 16, len + n);
+}
+
+pub fn pgBufLen(b: int64): int64 {
+  return peek64(b + 16);
+}
+
+pub fn pgBufData(b: int64): int64 {
+  return peek64(b);
+}
+
+// ============================================================================
+// TCP-Primitiven
+// ============================================================================
+
+// IPv4-Byte aus Host-String lesen (vor dem nächsten '.' oder '\0')
+fn pgParseIPv4Byte(host: pchar, off: int64): int64 {
+  var val: int64 := 0;
+  var i: int64 := off;
+  while (true) {
+    var c: int64 := peek8(host as int64 + i) & 0xFF;
+    if (c == 0 || c == 46) { break; }  // '\0' or '.'
+    val := val * 10 + (c - 48);
+    i += 1;
+  }
+  return val;
+}
+
+// Überspringt ein IPv4-Segment, gibt Offset nach dem '.' zurück
+fn pgSkipIPv4Part(host: pchar, off: int64): int64 {
+  var i: int64 := off;
+  while (true) {
+    var c: int64 := peek8(host as int64 + i) & 0xFF;
+    if (c == 0) { return i; }
+    if (c == 46) { return i + 1; }
+    i += 1;
+  }
+  return i;
+}
+
+// Öffnet TCP-Socket zu host:port, gibt fd zurück oder -1 bei Fehler
+pub fn pgTCPConnect(host: pchar, port: int64): int64 {
+  var fd: int64 := sys_socket(2, 1, 0);
+  if (fd < 0) { return -1; }
+
+  var addr: int64 := alloc(16);
+  poke8(addr,     2);   // AF_INET
+  poke8(addr + 1, 0);
+  // Port big-endian
+  poke8(addr + 2, (port >> 8) & 0xFF);
+  poke8(addr + 3, port & 0xFF);
+  // IPv4-Adresse
+  var o0: int64 := 0;
+  var b0: int64 := pgParseIPv4Byte(host, o0);
+  var o1: int64 := pgSkipIPv4Part(host, o0);
+  var b1: int64 := pgParseIPv4Byte(host, o1);
+  var o2: int64 := pgSkipIPv4Part(host, o1);
+  var b2: int64 := pgParseIPv4Byte(host, o2);
+  var o3: int64 := pgSkipIPv4Part(host, o2);
+  var b3: int64 := pgParseIPv4Byte(host, o3);
+  poke8(addr + 4, b0);
+  poke8(addr + 5, b1);
+  poke8(addr + 6, b2);
+  poke8(addr + 7, b3);
+  var k: int64 := 0;
+  while (k < 8) { poke8(addr + 8 + k, 0); k := k + 1; }
+
+  var rc: int64 := sys_connect(fd, addr, 16);
+  free(addr, 16);
+  if (rc < 0) { sys_close(fd); return -1; }
+  return fd;
+}
+
+// ============================================================================
+// Rohe I/O (exakte Byte-Übertragung)
+// ============================================================================
+
+// Schreibt exakt `len` Bytes aus buf über fd (retry bei partiellen writes)
+// Gibt 0 bei Erfolg zurück, -1 bei Fehler
+pub fn pgSendRaw(fd: int64, buf: int64, len: int64): int64 {
+  var sent: int64 := 0;
+  while (sent < len) {
+    var n: int64 := sys_write(fd, buf + sent, len - sent);
+    if (n <= 0) { return -1; }
+    sent += n;
+  }
+  return 0;
+}
+
+// Liest exakt `len` Bytes in buf (retry bei partiellen reads)
+// Gibt 0 bei Erfolg, -1 bei Fehler oder EOF
+pub fn pgRecvRaw(fd: int64, buf: int64, len: int64): int64 {
+  var got: int64 := 0;
+  while (got < len) {
+    var n: int64 := sys_read(fd, buf + got, len - got);
+    if (n <= 0) { return -1; }
+    got += n;
+  }
+  return 0;
+}
+
+// ============================================================================
+// PG-Nachrichten senden
+// ============================================================================
+
+// Sendet eine PG-Nachricht: [type(1)][length BE(4) = payloadLen+4][payload]
+// Gibt 0 bei Erfolg, -1 bei Fehler
+pub fn pgSendMsg(fd: int64, msgType: int64, payload: int64, payloadLen: int64): int64 {
+  // Header: 1 Byte type + 4 Byte length (big-endian, zählt sich selbst mit)
+  var hdr: int64 := alloc(5);
+  poke8(hdr, msgType & 0xFF);
+  pgWriteInt32BE(hdr, 1, payloadLen + 4);
+  var rc: int64 := pgSendRaw(fd, hdr, 5);
+  free(hdr, 5);
+  if (rc < 0) { return -1; }
+  if (payloadLen > 0) {
+    if (pgSendRaw(fd, payload, payloadLen) < 0) { return -1; }
+  }
+  return 0;
+}
+
+// Sendet eine Nachricht aus einem PGMsgBuf
+pub fn pgSendMsgBuf(fd: int64, msgType: int64, b: int64): int64 {
+  var data: int64 := pgBufData(b);
+  var len:  int64 := pgBufLen(b);
+  return pgSendMsg(fd, msgType, data, len);
+}
+
+// ============================================================================
+// StartupMessage (kein Type-Byte, nur Length + Protocol + Parameter)
+// ============================================================================
+
+// Baut und sendet die StartupMessage:
+// [4 Byte total length BE][4 Byte protocol=196608]
+// ["user\0" user "\0"]["database\0" db "\0"]["application_name\0lyx\0"]["\0"]
+pub fn pgSendStartup(fd: int64, user: pchar, database: pchar): int64 {
+  var b: int64 := pgBufNew();
+
+  // protocol version
+  pgBufAppend32BE(b, PG_PROTOCOL_VERSION);
+
+  // "user\0" + username + "\0"
+  pgBufAppendStr(b, "user"c);      // includes trailing \0
+  pgBufAppendStr(b, user);         // includes trailing \0
+
+  // "database\0" + dbname + "\0"
+  pgBufAppendStr(b, "database"c);
+  pgBufAppendStr(b, database);
+
+  // "application_name\0lyx\0"
+  pgBufAppendStr(b, "application_name"c);
+  pgBufAppendStr(b, "lyx"c);
+
+  // Terminating \0
+  pgBufAppend8(b, 0);
+
+  var payloadLen: int64 := pgBufLen(b);
+  var totalLen:   int64 := payloadLen + 4;  // +4 für die Length-Feld selbst
+
+  // StartupMessage: kein type-Byte; nur [4 Byte length][payload]
+  var lenBuf: int64 := alloc(4);
+  pgWriteInt32BE(lenBuf, 0, totalLen);
+  var rc: int64 := pgSendRaw(fd, lenBuf, 4);
+  free(lenBuf, 4);
+  if (rc < 0) { pgBufFree(b); return -1; }
+
+  rc := pgSendRaw(fd, pgBufData(b), payloadLen);
+  pgBufFree(b);
+  return rc;
+}
+
+// ============================================================================
+// PG-Nachrichten empfangen
+// ============================================================================
+
+// Liest die nächste PG-Nachricht vom Server.
+// outType: Zeiger auf int64 → wird mit dem 1-Byte-Typ befüllt
+// outBuf:  Zeiger auf int64 → wird mit mmap-Puffer der Payload befüllt (Aufrufer muss freigeben)
+// outLen:  Zeiger auf int64 → wird mit Payload-Länge befüllt
+// Gibt 0 bei Erfolg, -1 bei Fehler
+pub fn pgRecvMsg(fd: int64, outType: int64, outBuf: int64, outLen: int64): int64 {
+  // Lese 1 Byte type + 4 Byte length
+  var hdr: int64 := alloc(5);
+  if (pgRecvRaw(fd, hdr, 5) < 0) {
+    free(hdr, 5);
+    return -1;
+  }
+  var msgType:    int64 := peek8(hdr) & 0xFF;
+  var msgLen:     int64 := pgReadInt32BE(hdr, 1);  // inkl. 4 Bytes Length-Feld selbst
+  free(hdr, 5);
+
+  poke64(outType, msgType);
+
+  var payloadLen: int64 := msgLen - 4;
+  if (payloadLen < 0) { return -1; }
+
+  poke64(outLen, payloadLen);
+
+  if (payloadLen == 0) {
+    poke64(outBuf, 0);
+    return 0;
+  }
+
+  var payload: int64 := alloc(payloadLen + 1);
+  if (pgRecvRaw(fd, payload, payloadLen) < 0) {
+    free(payload, payloadLen + 1);
+    return -1;
+  }
+  poke64(outBuf, payload);
+  return 0;
+}
+
+// Gibt einen mit pgRecvMsg allokierten Payload frei
+pub fn pgFreeMsg(buf: int64, len: int64) {
+  if (buf != 0 && len > 0) { free(buf, len + 1); }
+}
+
+// ============================================================================
+// Nachrichten verwerfen bis zu einem bestimmten Typ
+// Nützlich um ParameterStatus-Flood nach Auth durchzuarbeiten
+// ============================================================================
+
+// Liest Nachrichten und verwirft sie bis Typ `stopType` empfangen wird.
+// Gibt den Payload des StopType zurück (Aufrufer muss ihn freigeben).
+// outBuf/outLen werden auf den letzten (stop-)Payload gesetzt.
+// Gibt 0 bei Erfolg, -1 bei Fehler
+pub fn pgSkipUntil(fd: int64, stopType: int64, outBuf: int64, outLen: int64): int64 {
+  while (true) {
+    var msgType:    int64 := 0;
+    var msgBuf:     int64 := 0;
+    var msgLen:     int64 := 0;
+    var typeBuf:    int64 := alloc(8);
+    var bufBuf:     int64 := alloc(8);
+    var lenBuf:     int64 := alloc(8);
+
+    var rc: int64 := pgRecvMsg(fd, typeBuf, bufBuf, lenBuf);
+    msgType := peek64(typeBuf);
+    msgBuf  := peek64(bufBuf);
+    msgLen  := peek64(lenBuf);
+    free(typeBuf, 8); free(bufBuf, 8); free(lenBuf, 8);
+
+    if (rc < 0) { return -1; }
+
+    if (msgType == stopType) {
+      poke64(outBuf, msgBuf);
+      poke64(outLen, msgLen);
+      return 0;
+    }
+    // Verwerfen
+    pgFreeMsg(msgBuf, msgLen);
+  }
+  return -1;
+}
+
+// ============================================================================
+// Fehler aus ErrorResponse extrahieren
+// ErrorResponse-Payload: [field-type(1)][text\0] ... [\0]
+// Feld 'M' = Message, 'C' = SQLSTATE Code, 'S' = Severity
+// ============================================================================
+
+// Gibt einen Zeiger auf das Feld fieldType im ErrorResponse-Payload zurück,
+// oder 0 wenn nicht vorhanden
+pub fn pgErrorField(payload: int64, payloadLen: int64, fieldType: int64): int64 {
+  var pos: int64 := 0;
+  while (pos < payloadLen) {
+    var ft: int64 := peek8(payload + pos) & 0xFF;
+    pos += 1;
+    if (ft == 0) { break; }
+    // Find end of string (next \0)
+    var start: int64 := pos;
+    while (pos < payloadLen && (peek8(payload + pos) & 0xFF) != 0) { pos := pos + 1; }
+    if (ft == fieldType) { return payload + start; }
+    pos += 1;  // skip the \0
+  }
+  return 0;
+}
+
+// ============================================================================
+// Test-Hilfe: einfache Verbindungs-Probe
+// ============================================================================
+
+// Prüft ob ein PostgreSQL-Server auf host:port erreichbar ist.
+// Sendet StartupMessage, liest erste Antwort, schließt sofort wieder.
+// Gibt 1 zurück wenn eine Antwort empfangen wurde, 0 bei Fehler.
+pub fn pgProbe(host: pchar, port: int64, user: pchar, database: pchar): int64 {
+  var fd: int64 := pgTCPConnect(host, port);
+  if (fd < 0) { return 0; }
+
+  if (pgSendStartup(fd, user, database) < 0) {
+    sys_close(fd);
+    return 0;
+  }
+
+  // Erste Antwort lesen (AuthenticationRequest 'R' oder ErrorResponse 'E')
+  var typeBuf: int64 := alloc(8);
+  var bufBuf:  int64 := alloc(8);
+  var lenBuf:  int64 := alloc(8);
+  var rc: int64 := pgRecvMsg(fd, typeBuf, bufBuf, lenBuf);
+  var msgBuf: int64 := peek64(bufBuf);
+  var msgLen: int64 := peek64(lenBuf);
+  free(typeBuf, 8); free(bufBuf, 8); free(lenBuf, 8);
+  pgFreeMsg(msgBuf, msgLen);
+
+  sys_close(fd);
+  return 1;
+}
+
+// ============================================================================
+// WP-PG-02: Handshake & Authentifizierung
+// ============================================================================
+
+// String-Länge (wie StrLen aber für int64-Pointer)
+fn pgStrLen(s: int64): int64 {
+  if (s == 0) { return 0; }
+  var n: int64 := 0;
+  while ((peek8(s + n) & 0xFF) != 0) { n := n + 1; }
+  return n;
+}
+
+// Kopiert src-String (NUL-terminiert) nach dst, gibt Anzahl kopierter Bytes zurück (inkl. NUL)
+fn pgStrCopy(dst: int64, src: pchar): int64 {
+  var i: int64 := 0;
+  while (true) {
+    var c: int64 := peek8(src as int64 + i) & 0xFF;
+    poke8(dst + i, c);
+    i += 1;
+    if (c == 0) { break; }
+  }
+  return i;
+}
+
+// Konkateniert zwei int64-Buffer der Länge lenA, lenB in out
+fn pgConcat(out: int64, a: int64, lenA: int64, b: int64, lenB: int64) {
+  var i: int64 := 0;
+  while (i < lenA) { poke8(out + i,       peek8(a + i)); i := i + 1; }
+  i := 0;
+  while (i < lenB) { poke8(out + lenA + i, peek8(b + i)); i := i + 1; }
+}
+
+// MD5-Hex-String eines Puffers (Ergebnis: 32 Zeichen + NUL in out)
+fn pgMD5Hex(data: int64, len: int64, out: int64) {
+  MD5Hex(data, len, out);
+}
+
+// Berechnet PostgreSQL-MD5-Auth-Antwort:
+//   inner = md5hex(password + user)        // 32 Hex-Zeichen
+//   outer = md5hex(inner + salt[4])        // 32 Hex-Zeichen (salt als raw bytes)
+//   response = "md5" + outer               // 35 Zeichen + NUL → out[0..35]
+pub fn pgMD5AuthResponse(password: pchar, user: pchar, salt: int64, out: int64) {
+  var passLen: int64 := pgStrLen(password as int64);
+  var userLen: int64 := pgStrLen(user as int64);
+
+  // inner = MD5Hex(password + user)
+  var combined1: int64 := alloc(passLen + userLen + 1);
+  pgConcat(combined1, password as int64, passLen, user as int64, userLen);
+  var inner: int64 := alloc(33);  // 32 hex chars + NUL
+  pgMD5Hex(combined1, passLen + userLen, inner);
+  free(combined1, passLen + userLen + 1);
+
+  // outer = MD5Hex(inner[0..31] + salt[0..3])
+  var combined2: int64 := alloc(36);  // 32 + 4 bytes
+  var i: int64 := 0;
+  while (i < 32) { poke8(combined2 + i, peek8(inner + i)); i := i + 1; }
+  poke8(combined2 + 32, peek8(salt + 0) & 0xFF);
+  poke8(combined2 + 33, peek8(salt + 1) & 0xFF);
+  poke8(combined2 + 34, peek8(salt + 2) & 0xFF);
+  poke8(combined2 + 35, peek8(salt + 3) & 0xFF);
+  free(inner, 33);
+
+  var outer: int64 := alloc(33);
+  pgMD5Hex(combined2, 36, outer);
+  free(combined2, 36);
+
+  // response = "md5" + outer (35 chars + NUL)
+  poke8(out + 0, 109); // 'm'
+  poke8(out + 1, 100); // 'd'
+  poke8(out + 2, 53);  // '5'
+  i := 0;
+  while (i < 32) { poke8(out + 3 + i, peek8(outer + i)); i := i + 1; }
+  poke8(out + 35, 0);
+  free(outer, 33);
+}
+
+// Sendet eine PasswordMessage: type='p', payload = NUL-terminierter Passwort-String
+pub fn pgSendPassword(fd: int64, password: int64): int64 {
+  var len: int64 := pgStrLen(password) + 1;  // +1 für NUL
+  return pgSendMsg(fd, PG_FE_PASSWORD, password, len);
+}
+
+// Empfangs-Hilfspuffer (stack-ähnlich, aber mmap-basiert)
+con PGRECV_TYPE: int64 := 0;
+con PGRECV_BUF:  int64 := 8;
+con PGRECV_LEN:  int64 := 16;
+
+fn pgAllocRecv(): int64 { return alloc(24); }
+fn pgFreeRecv(r: int64) { free(r, 24); }
+
+fn pgDoRecv(fd: int64, r: int64): int64 {
+  var rc: int64 := pgRecvMsg(fd, r + PGRECV_TYPE, r + PGRECV_BUF, r + PGRECV_LEN);
+  return rc;
+}
+
+fn pgRecvType(r: int64): int64 { return peek64(r + PGRECV_TYPE); }
+fn pgRecvBuf(r:  int64): int64 { return peek64(r + PGRECV_BUF); }
+fn pgRecvLen(r:  int64): int64 { return peek64(r + PGRECV_LEN); }
+
+fn pgFreeRecvMsg(r: int64) {
+  pgFreeMsg(pgRecvBuf(r), pgRecvLen(r));
+  poke64(r + PGRECV_BUF, 0);
+  poke64(r + PGRECV_LEN, 0);
+}
+
+// ============================================================================
+// WP-PG-03: PGConn — vollständiges Verbindungs-Handle
+// ============================================================================
+// Speicher-Layout (112 Bytes = 14 × int64):
+//   fd(8) + status(8) + lastError(8) + pid(8) + secretKey(8) + txStatus(8)
+//   + serverVersPtr(8) + errMsgPtr(8) + hostPtr(8) + port(8)
+//   + userPtr(8) + passwordPtr(8) + databasePtr(8) + msgBufPtr(8)
+
+con PGCONN_SZ:         int64 := 120;
+con PGCONN_FD:         int64 := 0;
+con PGCONN_STATUS:     int64 := 8;
+con PGCONN_LASTERR:    int64 := 16;
+con PGCONN_PID:        int64 := 24;
+con PGCONN_SECRETKEY:  int64 := 32;
+con PGCONN_TXSTATUS:   int64 := 40;
+con PGCONN_SERVERVERS: int64 := 48;
+con PGCONN_ERRMSG:     int64 := 56;
+con PGCONN_HOST:       int64 := 64;
+con PGCONN_PORT:       int64 := 72;
+con PGCONN_USER:       int64 := 80;
+con PGCONN_PASSWORD:   int64 := 88;
+con PGCONN_DATABASE:   int64 := 96;
+con PGCONN_MSGBUF:     int64 := 104;
+con PGCONN_CHANGES:    int64 := 112;  // WP-PG-09: affected rows of last command
+
+pub con PG_STATUS_DISCONNECTED: int64 := 0;
+pub con PG_STATUS_CONNECTED:    int64 := 1;
+pub con PG_STATUS_IN_TX:        int64 := 2;   // WP-PG-03: active transaction
+pub con PG_STATUS_TX_ERROR:     int64 := 3;   // WP-PG-03: transaction in error state
+
+fn pgConnNew(): int64 {
+  var c: int64 := alloc(PGCONN_SZ);  // zeroed by mmap
+  poke64(c + PGCONN_FD,       -1);
+  poke64(c + PGCONN_STATUS,   PG_STATUS_DISCONNECTED);
+  poke64(c + PGCONN_LASTERR,  PG_ERR_NONE);
+  poke64(c + PGCONN_TXSTATUS, PG_TX_IDLE);
+  poke64(c + PGCONN_PORT,     0);
+  // msg_buf: allocate reusable send buffer
+  poke64(c + PGCONN_MSGBUF,   pgBufNew());
+  return c;
+}
+
+// Heap-Kopie eines pchar-Strings allokieren
+fn pgDupStr(s: pchar): int64 {
+  if (s == 0 as pchar) { return 0; }
+  var len: int64 := pgStrLen(s as int64) + 1;
+  var buf: int64 := alloc(len);
+  pgStrCopy(buf, s);
+  return buf;
+}
+
+// Heap-String freigeben
+fn pgFreeStr(p: int64) {
+  if (p != 0) { free(p, pgStrLen(p) + 1); }
+}
+
+fn pgConnSetError(c: int64, code: int64, msg: pchar) {
+  poke64(c + PGCONN_LASTERR, code);
+  // free old errmsg if any
+  var old: int64 := peek64(c + PGCONN_ERRMSG);
+  if (old != 0) { free(old, pgStrLen(old) + 1); }
+  if (msg == 0 as pchar) {
+    poke64(c + PGCONN_ERRMSG, 0);
+    return;
+  }
+  var len: int64 := pgStrLen(msg as int64) + 1;
+  var buf: int64 := alloc(len);
+  pgStrCopy(buf, msg);
+  poke64(c + PGCONN_ERRMSG, buf);
+}
+
+fn pgConnSetErrorFromPayload(c: int64, payload: int64, payloadLen: int64) {
+  var sqlstate: int64 := pgErrorField(payload, payloadLen, 67);  // 'C' = 67, SQLSTATE
+  if (sqlstate != 0) {
+    pgConnSetError(c, PG_ERR_PROTO, sqlstate as pchar);
+    return;
+  }
+  var msg: int64 := pgErrorField(payload, payloadLen, 77);  // 'M' = 77, Message
+  if (msg != 0) {
+    pgConnSetError(c, PG_ERR_PROTO, msg as pchar);
+  } else {
+    pgConnSetError(c, PG_ERR_PROTO, "PostgreSQL error"c);
+  }
+}
+
+// Stores a copy of the server_version ParameterStatus value
+fn pgConnSetServerVersion(c: int64, val: int64) {
+  var old: int64 := peek64(c + PGCONN_SERVERVERS);
+  if (old != 0) { free(old, pgStrLen(old) + 1); }
+  var len: int64 := pgStrLen(val) + 1;
+  var buf: int64 := alloc(len);
+  var i: int64 := 0;
+  while (i < len) { poke8(buf + i, peek8(val + i)); i := i + 1; }
+  poke64(c + PGCONN_SERVERVERS, buf);
+}
+
+// Parse a ParameterStatus payload: name\0value\0
+// If name == "server_version", store value
+fn pgHandleParamStatus(c: int64, payload: int64, payloadLen: int64) {
+  // name is at offset 0, value follows after first \0
+  var nameLen: int64 := pgStrLen(payload);
+  var valueOff: int64 := nameLen + 1;
+  if (valueOff >= payloadLen) { return; }
+  // Check if name == "server_version" (14 chars)
+  var svName: pchar := "server_version"c;
+  if (nameLen == 14) {
+    var ok: int64 := 1;
+    var i: int64 := 0;
+    while (i < 14) {
+      if ((peek8(payload + i) & 0xFF) != (peek8(svName as int64 + i) & 0xFF)) { ok := 0; break; }
+      i += 1;
+    }
+    if (ok != 0) { pgConnSetServerVersion(c, payload + valueOff); }
+  }
+}
+
+// ============================================================================
+// pgHandshake — vollständiger Verbindungsaufbau nach TCP-Connect
+// ============================================================================
+// Sendet StartupMessage, verarbeitet Auth, konsumiert ParameterStatus/BackendKeyData,
+// wartet auf ReadyForQuery.
+// Gibt 0 bei Erfolg, -1 bei Fehler (mit gesetztem Fehlercode in conn).
+pub fn pgHandshake(conn: int64, user: pchar, password: pchar, database: pchar): int64 {
+  var fd: int64 := peek64(conn + PGCONN_FD);
+
+  // Sende StartupMessage
+  if (pgSendStartup(fd, user, database) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send startup failed"c);
+    return -1;
+  }
+
+  var r: int64 := pgAllocRecv();
+
+  // Auth-Schleife: empfange Nachrichten bis ReadyForQuery
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgConnSetError(conn, PG_ERR_RECV, "recv failed"c);
+      pgFreeRecv(r);
+      return -1;
+    }
+
+    var msgType: int64 := pgRecvType(r);
+    var payload:  int64 := pgRecvBuf(r);
+    var payLen:   int64 := pgRecvLen(r);
+
+    if (msgType == PG_MSG_AUTH) {
+      // AuthenticationRequest: 4 Byte Subtyp
+      if (payLen < 4) {
+        pgFreeRecvMsg(r);
+        pgConnSetError(conn, PG_ERR_PROTO, "auth payload too short"c);
+        pgFreeRecv(r);
+        return -1;
+      }
+      var authType: int64 := pgReadInt32BE(payload, 0);
+
+      if (authType == PG_AUTH_OK) {
+        // Auth OK — continue until ReadyForQuery
+        pgFreeRecvMsg(r);
+
+      } else if (authType == PG_AUTH_CLEARTEXT) {
+        // Cleartext password
+        pgFreeRecvMsg(r);
+        var passLen: int64 := pgStrLen(password as int64) + 1;
+        if (pgSendMsg(fd, PG_FE_PASSWORD, password as int64, passLen) < 0) {
+          pgConnSetError(conn, PG_ERR_SEND, "send cleartext password failed"c);
+          pgFreeRecv(r);
+          return -1;
+        }
+
+      } else if (authType == PG_AUTH_MD5) {
+        // MD5 password: salt is bytes 4..7 of payload
+        if (payLen < 8) {
+          pgFreeRecvMsg(r);
+          pgConnSetError(conn, PG_ERR_PROTO, "md5 auth: payload too short"c);
+          pgFreeRecv(r);
+          return -1;
+        }
+        var salt: int64 := payload + 4;
+        var response: int64 := alloc(36);  // "md5" + 32 hex + NUL
+        pgMD5AuthResponse(password, user, salt, response);
+        pgFreeRecvMsg(r);
+        if (pgSendMsg(fd, PG_FE_PASSWORD, response, 36) < 0) {
+          free(response, 36);
+          pgConnSetError(conn, PG_ERR_SEND, "send md5 password failed"c);
+          pgFreeRecv(r);
+          return -1;
+        }
+        free(response, 36);
+
+      } else {
+        // Unsupported auth method (SASL etc.)
+        pgFreeRecvMsg(r);
+        pgConnSetError(conn, PG_ERR_PROTO, "unsupported auth method"c);
+        pgFreeRecv(r);
+        return -1;
+      }
+
+    } else if (msgType == PG_MSG_PARAM_STATUS) {
+      pgHandleParamStatus(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+
+    } else if (msgType == PG_MSG_BACKEND_KEY) {
+      // BackendKeyData: PID(4) + SecretKey(4)
+      if (payLen >= 8) {
+        poke64(conn + PGCONN_PID,       pgReadInt32BE(payload, 0));
+        poke64(conn + PGCONN_SECRETKEY, pgReadInt32BE(payload, 4));
+      }
+      pgFreeRecvMsg(r);
+
+    } else if (msgType == PG_MSG_READY) {
+      // ReadyForQuery: tx_status byte
+      if (payLen >= 1) {
+        poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF);
+      }
+      pgFreeRecvMsg(r);
+      poke64(conn + PGCONN_STATUS, PG_STATUS_CONNECTED);
+      pgFreeRecv(r);
+      return 0;
+
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      return -1;
+
+    } else {
+      // Skip unknown messages
+      pgFreeRecvMsg(r);
+    }
+  }
+
+  pgFreeRecv(r);
+  return -1;
+}
+
+// ============================================================================
+// WP-PG-03: PGConnect — öffentliche Verbindungsfunktion (TCP + Handshake + Metadaten)
+// ============================================================================
+
+// Öffnet Verbindung zu PostgreSQL-Server.
+// Gibt PGConn-Ptr zurück; 0 nur bei TCP-Fehler (Port falsch, nicht erreichbar).
+// Bei Auth-Fehler: gibt PGConn zurück mit PGIsConnected()==0 und PGError() gesetzt.
+pub fn PGConnect(host: pchar, port: int64, user: pchar, password: pchar, database: pchar): int64 {
+  var conn: int64 := pgConnNew();
+
+  // Metadaten speichern (WP-PG-03)
+  poke64(conn + PGCONN_HOST,     pgDupStr(host));
+  poke64(conn + PGCONN_PORT,     port);
+  poke64(conn + PGCONN_USER,     pgDupStr(user));
+  poke64(conn + PGCONN_PASSWORD, pgDupStr(password));
+  poke64(conn + PGCONN_DATABASE, pgDupStr(database));
+
+  var fd: int64 := pgTCPConnect(host, port);
+  if (fd < 0) {
+    // TCP-Fehler: conn freigeben, 0 zurückgeben (laut Spec)
+    PGClose(conn);
+    return 0;
+  }
+  poke64(conn + PGCONN_FD, fd);
+
+  if (pgHandshake(conn, user, password, database) < 0) {
+    // Auth-Fehler: conn bleibt für PGError(), aber fd schließen
+    sys_close(fd);
+    poke64(conn + PGCONN_FD, -1);
+  }
+
+  // Passwort nach Auth aus Speicher löschen (Security)
+  var pwPtr: int64 := peek64(conn + PGCONN_PASSWORD);
+  if (pwPtr != 0) {
+    var pwLen: int64 := pgStrLen(pwPtr);
+    var zi: int64 := 0;
+    while (zi < pwLen) { poke8(pwPtr + zi, 0); zi := zi + 1; }
+  }
+
+  return conn;
+}
+
+// Sendet Terminate-Nachricht und schließt die Verbindung
+pub fn PGClose(conn: int64) {
+  if (conn == 0) { return; }
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  if (fd >= 0) {
+    // Terminate: type='X', length=4, kein Payload
+    var hdr: int64 := alloc(5);
+    poke8(hdr, PG_FE_TERMINATE & 0xFF);
+    pgWriteInt32BE(hdr, 1, 4);
+    pgSendRaw(fd, hdr, 5);
+    free(hdr, 5);
+    sys_close(fd);
+    poke64(conn + PGCONN_FD, -1);
+  }
+  poke64(conn + PGCONN_STATUS, PG_STATUS_DISCONNECTED);
+  // Alle heap-allokierten Strings freigeben (WP-PG-03: erweiterte Felder)
+  pgFreeStr(peek64(conn + PGCONN_SERVERVERS));
+  pgFreeStr(peek64(conn + PGCONN_ERRMSG));
+  pgFreeStr(peek64(conn + PGCONN_HOST));
+  pgFreeStr(peek64(conn + PGCONN_USER));
+  pgFreeStr(peek64(conn + PGCONN_PASSWORD));
+  pgFreeStr(peek64(conn + PGCONN_DATABASE));
+  // Reusable msg_buf freigeben
+  var mb: int64 := peek64(conn + PGCONN_MSGBUF);
+  if (mb != 0) { pgBufFree(mb); }
+  free(conn, PGCONN_SZ);
+}
+
+// Zugriffs-Accessoren
+pub fn PGError(conn: int64): pchar {
+  if (conn == 0) { return 0 as pchar; }
+  return peek64(conn + PGCONN_ERRMSG) as pchar;
+}
+
+pub fn PGErrno(conn: int64): int64 {
+  if (conn == 0) { return PG_ERR_NONE; }
+  return peek64(conn + PGCONN_LASTERR);
+}
+
+pub fn PGIsConnected(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  return peek64(conn + PGCONN_STATUS) == PG_STATUS_CONNECTED;
+}
+
+pub fn PGServerVersion(conn: int64): pchar {
+  if (conn == 0) { return 0 as pchar; }
+  return peek64(conn + PGCONN_SERVERVERS) as pchar;
+}
+
+pub fn PGBackendPID(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  return peek64(conn + PGCONN_PID);
+}
+
+// ============================================================================
+// WP-PG-03: Verbindungsmetadaten-Accessoren
+// ============================================================================
+
+pub fn PGGetHost(conn: int64): pchar {
+  if (conn == 0) { return 0 as pchar; }
+  return peek64(conn + PGCONN_HOST) as pchar;
+}
+
+pub fn PGGetPort(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  return peek64(conn + PGCONN_PORT);
+}
+
+pub fn PGGetUser(conn: int64): pchar {
+  if (conn == 0) { return 0 as pchar; }
+  return peek64(conn + PGCONN_USER) as pchar;
+}
+
+pub fn PGGetDatabase(conn: int64): pchar {
+  if (conn == 0) { return 0 as pchar; }
+  return peek64(conn + PGCONN_DATABASE) as pchar;
+}
+
+pub fn PGGetTxStatus(conn: int64): int64 {
+  if (conn == 0) { return PG_TX_IDLE; }
+  return peek64(conn + PGCONN_TXSTATUS);
+}
+
+// Gibt den wiederverwendbaren Sende-Buffer zurück (für Query-Implementierungen)
+pub fn pgConnMsgBuf(conn: int64): int64 {
+  return peek64(conn + PGCONN_MSGBUF);
+}
+
+// ============================================================================
+// WP-PG-04: Simple Query Protocol
+// ============================================================================
+
+// PGResult layout (10 × int64 = 80 bytes)
+con PGRESULT_SZ:            int64 := 80;
+con PGRESULT_FIELD_COUNT:   int64 := 0;
+con PGRESULT_ROW_COUNT:     int64 := 8;
+con PGRESULT_AFFECTED_ROWS: int64 := 16;
+con PGRESULT_INSERT_OID:    int64 := 24;
+con PGRESULT_FIELDS:        int64 := 32;
+con PGRESULT_ROWS:          int64 := 40;
+con PGRESULT_ROW_ALLOC:     int64 := 48;
+con PGRESULT_CURRENT_ROW:   int64 := 56;
+con PGRESULT_FIELD_BUF:     int64 := 64;
+con PGRESULT_FIELD_BUF_SZ:  int64 := 72;
+
+// PGField layout (7 × int64 = 56 bytes)
+con PGFIELD_SZ:        int64 := 56;
+con PGFIELD_NAME:      int64 := 0;
+con PGFIELD_TABLE_OID: int64 := 8;
+con PGFIELD_COL_ATTR:  int64 := 16;
+con PGFIELD_TYPE_OID:  int64 := 24;
+con PGFIELD_TYPE_SZ:   int64 := 32;
+con PGFIELD_TYPE_MOD:  int64 := 40;
+con PGFIELD_FORMAT:    int64 := 48;
+
+// PGRow layout (4 × int64 = 32 bytes)
+con PGROW_SZ:      int64 := 32;
+con PGROW_VALUES:  int64 := 0;
+con PGROW_LENGTHS: int64 := 8;
+con PGROW_IS_NULL: int64 := 16;
+con PGROW_COUNT:   int64 := 24;
+
+con PG_ROW_ALLOC_INIT: int64 := 16;
+con PG_NULL_LEN:       int64 := 4294967295;  // 0xFFFFFFFF — NULL indicator in DataRow
+
+fn pgResultNew(): int64 {
+  var r: int64 := alloc(PGRESULT_SZ);
+  var rowsArr: int64 := alloc(PG_ROW_ALLOC_INIT * 8);
+  poke64(r + PGRESULT_ROWS,      rowsArr);
+  poke64(r + PGRESULT_ROW_ALLOC, PG_ROW_ALLOC_INIT);
+  return r;
+}
+
+// Skips one word (chars until space/NUL) plus the space, returns byte count consumed
+fn pgSkipWord(s: int64): int64 {
+  var i: int64 := 0;
+  while (true) {
+    var c: int64 := peek8(s + i) & 0xFF;
+    if (c == 0 || c == 32) { break; }
+    i += 1;
+  }
+  if ((peek8(s + i) & 0xFF) == 32) { i := i + 1; }
+  return i;
+}
+
+// Parses unsigned decimal integer from NUL/non-digit terminated string
+fn pgParseInt(s: int64): int64 {
+  var val: int64 := 0;
+  var i: int64 := 0;
+  while (true) {
+    var c: int64 := peek8(s + i) & 0xFF;
+    if (c < 48 || c > 57) { break; }
+    val := val * 10 + (c - 48);
+    i += 1;
+  }
+  return val;
+}
+
+// Parses CommandComplete tag (e.g. "INSERT 0 1", "SELECT 5") into result
+fn pgParseCommandTag(result: int64, tag: int64) {
+  var c0: int64 := peek8(tag) & 0xFF;
+  var off: int64 := pgSkipWord(tag);
+  if (c0 == 73) {
+    // INSERT oid n
+    var oid: int64 := pgParseInt(tag + off);
+    off := off + pgSkipWord(tag + off);
+    poke64(result + PGRESULT_INSERT_OID,    oid);
+    poke64(result + PGRESULT_AFFECTED_ROWS, pgParseInt(tag + off));
+  } else if (c0 == 83) {
+    // SELECT n
+    poke64(result + PGRESULT_AFFECTED_ROWS, pgParseInt(tag + off));
+  } else if (c0 == 85) {
+    // UPDATE n
+    poke64(result + PGRESULT_AFFECTED_ROWS, pgParseInt(tag + off));
+  } else if (c0 == 68) {
+    // DELETE n
+    poke64(result + PGRESULT_AFFECTED_ROWS, pgParseInt(tag + off));
+  }
+  // CREATE, DROP, TRUNCATE, etc. → affected_rows stays 0
+}
+
+// Parses RowDescription payload into result (allocates fields array + name buffer)
+fn pgParseRowDescription(result: int64, payload: int64, payloadLen: int64) {
+  if (payloadLen < 2) { return; }
+  var numFields: int64 := pgReadInt16BE(payload, 0);
+  poke64(result + PGRESULT_FIELD_COUNT, numFields);
+  if (numFields == 0) { return; }
+
+  var fields: int64 := alloc(numFields * PGFIELD_SZ);
+  poke64(result + PGRESULT_FIELDS, fields);
+
+  // Use full payload as upper bound for name storage (conservative but safe)
+  var fbSz: int64 := payloadLen + 1;
+  var fb: int64 := alloc(fbSz);
+  poke64(result + PGRESULT_FIELD_BUF,    fb);
+  poke64(result + PGRESULT_FIELD_BUF_SZ, fbSz);
+
+  var pos: int64 := 2;
+  var fbOff: int64 := 0;
+  var i: int64 := 0;
+  while (i < numFields) {
+    var fp: int64 := fields + i * PGFIELD_SZ;
+    // name: cstring
+    var nameStart: int64 := pos;
+    while (pos < payloadLen && (peek8(payload + pos) & 0xFF) != 0) { pos := pos + 1; }
+    var nameLen: int64 := pos - nameStart;
+    pos += 1;  // skip NUL
+    var ni: int64 := 0;
+    while (ni < nameLen) {
+      poke8(fb + fbOff + ni, peek8(payload + nameStart + ni));
+      ni += 1;
+    }
+    poke8(fb + fbOff + nameLen, 0);
+    poke64(fp + PGFIELD_NAME, fb + fbOff);
+    fbOff := fbOff + nameLen + 1;
+    // fixed-length fields
+    poke64(fp + PGFIELD_TABLE_OID, pgReadInt32BE(payload, pos)); pos := pos + 4;
+    poke64(fp + PGFIELD_COL_ATTR,  pgReadInt16BE(payload, pos)); pos := pos + 2;
+    poke64(fp + PGFIELD_TYPE_OID,  pgReadInt32BE(payload, pos)); pos := pos + 4;
+    poke64(fp + PGFIELD_TYPE_SZ,   pgReadInt16BE(payload, pos)); pos := pos + 2;
+    poke64(fp + PGFIELD_TYPE_MOD,  pgReadInt32BE(payload, pos)); pos := pos + 4;
+    poke64(fp + PGFIELD_FORMAT,    pgReadInt16BE(payload, pos)); pos := pos + 2;
+    i += 1;
+  }
+}
+
+// Appends a DataRow to result (grows rows array as needed)
+fn pgParseDataRow(result: int64, payload: int64, payloadLen: int64) {
+  if (payloadLen < 2) { return; }
+  var numCols: int64 := pgReadInt16BE(payload, 0);
+
+  // Grow rows pointer array if needed
+  var rowCount: int64 := peek64(result + PGRESULT_ROW_COUNT);
+  var rowAlloc: int64 := peek64(result + PGRESULT_ROW_ALLOC);
+  var rowsArr:  int64 := peek64(result + PGRESULT_ROWS);
+  if (rowCount >= rowAlloc) {
+    var newAlloc: int64 := rowAlloc * 2;
+    var newArr:   int64 := alloc(newAlloc * 8);
+    var ci: int64 := 0;
+    while (ci < rowAlloc) {
+      poke64(newArr + ci * 8, peek64(rowsArr + ci * 8));
+      ci += 1;
+    }
+    free(rowsArr, rowAlloc * 8);
+    rowsArr  := newArr;
+    rowAlloc := newAlloc;
+    poke64(result + PGRESULT_ROWS,      rowsArr);
+    poke64(result + PGRESULT_ROW_ALLOC, rowAlloc);
+  }
+
+  var row:   int64 := alloc(PGROW_SZ);
+  var vals:  int64 := 0;
+  var lens:  int64 := 0;
+  var nulls: int64 := 0;
+  if (numCols > 0) {
+    vals  := alloc(numCols * 8);
+    lens  := alloc(numCols * 8);
+    nulls := alloc(numCols * 8);
+  }
+  poke64(row + PGROW_VALUES,  vals);
+  poke64(row + PGROW_LENGTHS, lens);
+  poke64(row + PGROW_IS_NULL, nulls);
+  poke64(row + PGROW_COUNT,   numCols);
+
+  var pos: int64 := 2;
+  var j: int64 := 0;
+  while (j < numCols) {
+    if (pos + 4 > payloadLen) { break; }
+    var valLen: int64 := pgReadInt32BE(payload, pos); pos := pos + 4;
+    if (valLen == PG_NULL_LEN) {
+      poke64(nulls + j * 8, 1);
+      poke64(vals  + j * 8, 0);
+      poke64(lens  + j * 8, 0);
+    } else {
+      poke64(nulls + j * 8, 0);
+      var vbuf: int64 := alloc(valLen + 1);
+      var vi: int64 := 0;
+      while (vi < valLen) { poke8(vbuf + vi, peek8(payload + pos + vi)); vi := vi + 1; }
+      poke8(vbuf + valLen, 0);
+      poke64(vals + j * 8, vbuf);
+      poke64(lens + j * 8, valLen);
+      pos += valLen;
+    }
+    j += 1;
+  }
+
+  poke64(rowsArr + rowCount * 8, row);
+  poke64(result + PGRESULT_ROW_COUNT, rowCount + 1);
+}
+
+// Frees all memory owned by a PGResult
+pub fn PGFreeResult(result: int64) {
+  if (result == 0) { return; }
+  var rows:       int64 := peek64(result + PGRESULT_ROWS);
+  var rowCount:   int64 := peek64(result + PGRESULT_ROW_COUNT);
+  var rowAlloc:   int64 := peek64(result + PGRESULT_ROW_ALLOC);
+  var fieldCount: int64 := peek64(result + PGRESULT_FIELD_COUNT);
+
+  var i: int64 := 0;
+  while (i < rowCount) {
+    var row: int64 := peek64(rows + i * 8);
+    if (row != 0) {
+      var vals:  int64 := peek64(row + PGROW_VALUES);
+      var lens:  int64 := peek64(row + PGROW_LENGTHS);
+      var nulls: int64 := peek64(row + PGROW_IS_NULL);
+      var count: int64 := peek64(row + PGROW_COUNT);
+      var j: int64 := 0;
+      while (j < count) {
+        if (peek64(nulls + j * 8) == 0) {
+          var vp: int64 := peek64(vals + j * 8);
+          var vl: int64 := peek64(lens + j * 8);
+          if (vp != 0) { free(vp, vl + 1); }
+        }
+        j += 1;
+      }
+      if (count > 0) {
+        if (vals  != 0) { free(vals,  count * 8); }
+        if (lens  != 0) { free(lens,  count * 8); }
+        if (nulls != 0) { free(nulls, count * 8); }
+      }
+      free(row, PGROW_SZ);
+    }
+    i += 1;
+  }
+  if (rows != 0 && rowAlloc > 0) { free(rows, rowAlloc * 8); }
+
+  var fields: int64 := peek64(result + PGRESULT_FIELDS);
+  if (fields != 0 && fieldCount > 0) { free(fields, fieldCount * PGFIELD_SZ); }
+
+  var fbuf: int64 := peek64(result + PGRESULT_FIELD_BUF);
+  var fbsz: int64 := peek64(result + PGRESULT_FIELD_BUF_SZ);
+  if (fbuf != 0 && fbsz > 0) { free(fbuf, fbsz); }
+
+  free(result, PGRESULT_SZ);
+}
+
+// Sends a simple SQL query, collects all response messages, returns PGResult or 0 on error
+pub fn PGQuery(conn: int64, sql: pchar): int64 {
+  if (conn == 0) { return 0; }
+  pgConnSetError(conn, PG_ERR_NONE, 0 as pchar);
+  if (peek64(conn + PGCONN_STATUS) != PG_STATUS_CONNECTED) {
+    pgConnSetError(conn, PG_ERR_CONNECT, "not connected"c);
+    return 0;
+  }
+
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var sqlLen: int64 := pgStrLen(sql as int64) + 1;
+  if (pgSendMsg(fd, PG_FE_QUERY, sql as int64, sqlLen) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send query failed"c);
+    return 0;
+  }
+
+  var result:   int64 := pgResultNew();
+  var hadError: int64 := 0;
+  var r:        int64 := pgAllocRecv();
+
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgConnSetError(conn, PG_ERR_RECV, "recv failed during query"c);
+      pgFreeRecv(r);
+      PGFreeResult(result);
+      return 0;
+    }
+
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+
+    if (msgType == PG_MSG_ROW_DESC) {
+      pgParseRowDescription(result, payload, payLen);
+      pgFreeRecvMsg(r);
+
+    } else if (msgType == PG_MSG_DATA_ROW) {
+      pgParseDataRow(result, payload, payLen);
+      pgFreeRecvMsg(r);
+
+    } else if (msgType == PG_MSG_CMD_COMPLETE) {
+      pgParseCommandTag(result, payload);
+      poke64(conn + PGCONN_CHANGES, peek64(result + PGRESULT_AFFECTED_ROWS));
+      pgFreeRecvMsg(r);
+
+    } else if (msgType == PG_MSG_EMPTY_QUERY) {
+      pgFreeRecvMsg(r);
+
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+      hadError := 1;
+
+    } else if (msgType == PG_MSG_NOTICE) {
+      pgFreeRecvMsg(r);
+
+    } else if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) {
+        poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF);
+      }
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      if (hadError != 0) {
+        PGFreeResult(result);
+        return 0;
+      }
+      return result;
+
+    } else {
+      pgFreeRecvMsg(r);
+    }
+  }
+
+  pgFreeRecv(r);
+  return 0;
+}
+
+// ============================================================================
+// WP-PG-05: Result-Set Accessoren
+// ============================================================================
+
+// PostgreSQL OID-Konstanten (häufige Typen)
+pub con PG_OID_BOOL:      int64 := 16;
+pub con PG_OID_BYTEA:     int64 := 17;
+pub con PG_OID_INT8:      int64 := 20;
+pub con PG_OID_INT2:      int64 := 21;
+pub con PG_OID_INT4:      int64 := 23;
+pub con PG_OID_TEXT:      int64 := 25;
+pub con PG_OID_FLOAT4:    int64 := 700;
+pub con PG_OID_FLOAT8:    int64 := 701;
+pub con PG_OID_VARCHAR:   int64 := 1043;
+pub con PG_OID_DATE:      int64 := 1082;
+pub con PG_OID_TIMESTAMP: int64 := 1114;
+pub con PG_OID_NUMERIC:   int64 := 1700;
+
+// --- Internal helpers ---
+
+// Returns pointer to PGRow at rowIdx, or 0 if out of bounds
+fn pgGetRow(result: int64, rowIdx: int64): int64 {
+  if (rowIdx < 0) { return 0; }
+  var rowCount: int64 := peek64(result + PGRESULT_ROW_COUNT);
+  if (rowIdx >= rowCount) { return 0; }
+  return peek64(peek64(result + PGRESULT_ROWS) + rowIdx * 8);
+}
+
+// Parses signed decimal integer from NUL/non-digit terminated string
+fn pgParseSignedInt(s: int64): int64 {
+  if (s == 0) { return 0; }
+  var c: int64 := peek8(s) & 0xFF;
+  if (c == 45) { return 0 - pgParseInt(s + 1); }  // '-'
+  return pgParseInt(s);
+}
+
+// Parses f64 from decimal string, handles sign and fractional part.
+// Uses integer accumulation to avoid 0.0-x negation bug.
+fn pgParseFloat(s: int64): f64 {
+  if (s == 0) { return 0 as f64; }
+  var i: int64 := 0;
+  var neg: int64 := 0;
+  var c: int64 := peek8(s) & 0xFF;
+  if (c == 45) { neg := 1; i := i + 1; }  // '-'
+
+  // Accumulate all significant digits as one integer + decimal count
+  var combined: int64 := 0;
+  var decimals: int64 := 0;
+  var inFrac: int64 := 0;
+  while (true) {
+    c := peek8(s + i) & 0xFF;
+    if (c == 46 && inFrac == 0) {
+      inFrac := 1;
+      i += 1;
+    } else if (c >= 48 && c <= 57) {
+      combined := combined * 10 + (c - 48);
+      if (inFrac != 0) { decimals := decimals + 1; }
+      i += 1;
+    } else {
+      break;
+    }
+  }
+
+  // Apply sign in integer space to avoid the 0.0-x f64 bug
+  if (neg != 0) { combined := 0 - combined; }
+
+  var result: f64 := combined as f64;
+  var j: int64 := 0;
+  while (j < decimals) {
+    result := result / (10 as f64);
+    j += 1;
+  }
+  return result;
+}
+
+// --- Public accessors (WP-PG-04 basics kept here) ---
+
+pub fn PGNumRows(result: int64): int64 {
+  if (result == 0) { return 0; }
+  return peek64(result + PGRESULT_ROW_COUNT);
+}
+
+pub fn PGNumFields(result: int64): int64 {
+  if (result == 0) { return 0; }
+  return peek64(result + PGRESULT_FIELD_COUNT);
+}
+
+pub fn PGAffectedRows(result: int64): int64 {
+  if (result == 0) { return 0; }
+  return peek64(result + PGRESULT_AFFECTED_ROWS);
+}
+
+// Advances cursor to next row. Returns 1 if a row is available, 0 if exhausted.
+// PGRESULT_CURRENT_ROW is the "next to fetch" index (starts at 0).
+// After a successful call, accessors read at current_row-1.
+pub fn PGFetchRow(result: int64): int64 {
+  if (result == 0) { return 0; }
+  var cur: int64 := peek64(result + PGRESULT_CURRENT_ROW);
+  var cnt: int64 := peek64(result + PGRESULT_ROW_COUNT);
+  if (cur >= cnt) { return 0; }
+  poke64(result + PGRESULT_CURRENT_ROW, cur + 1);
+  return 1;
+}
+
+// Returns column value as NUL-terminated string, or 0 for NULL/out-of-bounds.
+pub fn PGGetStr(result: int64, col: int64): pchar {
+  if (result == 0) { return 0 as pchar; }
+  var rowIdx: int64 := peek64(result + PGRESULT_CURRENT_ROW) - 1;
+  var row: int64 := pgGetRow(result, rowIdx);
+  if (row == 0) { return 0 as pchar; }
+  var count: int64 := peek64(row + PGROW_COUNT);
+  if (col < 0 || col >= count) { return 0 as pchar; }
+  if (peek64(peek64(row + PGROW_IS_NULL) + col * 8) != 0) { return 0 as pchar; }
+  return peek64(peek64(row + PGROW_VALUES) + col * 8) as pchar;
+}
+
+// Returns column value parsed as int64 (text → int64).
+pub fn PGGetInt(result: int64, col: int64): int64 {
+  var s: pchar := PGGetStr(result, col);
+  if (s == 0 as pchar) { return 0; }
+  return pgParseSignedInt(s as int64);
+}
+
+// Returns column value parsed as f64 (text → f64).
+pub fn PGGetFloat(result: int64, col: int64): f64 {
+  var s: pchar := PGGetStr(result, col);
+  if (s == 0 as pchar) { return 0 as f64; }
+  return pgParseFloat(s as int64);
+}
+
+// Returns column value as bool: "t", "T", "true", "1" → 1; else → 0.
+pub fn PGGetBool(result: int64, col: int64): int64 {
+  var s: pchar := PGGetStr(result, col);
+  if (s == 0 as pchar) { return 0; }
+  var c0: int64 := peek8(s as int64) & 0xFF;
+  if (c0 == 116) { return 1; }  // 't'
+  if (c0 == 84)  { return 1; }  // 'T'
+  if (c0 == 49)  { return 1; }  // '1'
+  return 0;
+}
+
+// Returns 1 if the value at (row, col) is NULL, 0 otherwise.
+// Uses explicit row index (not cursor-based).
+pub fn PGIsNull(result: int64, row: int64, col: int64): int64 {
+  if (result == 0) { return 1; }
+  var rowPtr: int64 := pgGetRow(result, row);
+  if (rowPtr == 0) { return 1; }
+  var count: int64 := peek64(rowPtr + PGROW_COUNT);
+  if (col < 0 || col >= count) { return 1; }
+  return peek64(peek64(rowPtr + PGROW_IS_NULL) + col * 8) != 0;
+}
+
+// Returns field name for column col, or 0 if out of bounds.
+pub fn PGGetFieldName(result: int64, col: int64): pchar {
+  if (result == 0) { return 0 as pchar; }
+  var fc: int64 := peek64(result + PGRESULT_FIELD_COUNT);
+  if (col < 0 || col >= fc) { return 0 as pchar; }
+  return peek64(peek64(result + PGRESULT_FIELDS) + col * PGFIELD_SZ + PGFIELD_NAME) as pchar;
+}
+
+// Returns PostgreSQL type OID for column col (e.g. 23 = int4, 25 = text).
+pub fn PGGetFieldTypeOid(result: int64, col: int64): int64 {
+  if (result == 0) { return 0; }
+  var fc: int64 := peek64(result + PGRESULT_FIELD_COUNT);
+  if (col < 0 || col >= fc) { return 0; }
+  return peek64(peek64(result + PGRESULT_FIELDS) + col * PGFIELD_SZ + PGFIELD_TYPE_OID);
+}
+
+// Positions cursor so next PGFetchRow returns row `row`.
+pub fn PGDataSeek(result: int64, row: int64) {
+  if (result == 0) { return; }
+  if (row < 0) { poke64(result + PGRESULT_CURRENT_ROW, 0); return; }
+  poke64(result + PGRESULT_CURRENT_ROW, row);
+}
+
+// ============================================================================
+// WP-PG-06: Extended Query Protocol (Prepared Statements)
+// ============================================================================
+
+pub con PG_MSG_CLOSE_DONE: int64 := 51;   // '3' — CloseComplete
+pub con PG_MSG_PARAM_DESC: int64 := 116;  // 't' — ParameterDescription
+
+// PGStmt layout (6 × int64 = 48 bytes)
+con PGSTMT_SZ:           int64 := 48;
+con PGSTMT_NAME:         int64 := 0;    // pchar — heap copy of stmt name
+con PGSTMT_SQL:          int64 := 8;    // pchar — heap copy of SQL
+con PGSTMT_PARAM_COUNT:  int64 := 16;   // int64 — number of bound params
+con PGSTMT_PARAMS:       int64 := 24;   // int64 — pointer to PGParam* array
+con PGSTMT_PARAMS_ALLOC: int64 := 32;   // int64 — allocated param slots
+con PGSTMT_CONN:         int64 := 40;   // int64 — back-reference to PGConn
+
+// PGParam layout (3 × int64 = 24 bytes) — populated by WP-PG-07 bind functions
+pub con PGPARAM_SZ:       int64 := 24;
+pub con PGPARAM_TEXT_VAL: int64 := 0;   // int64 — pchar, heap-allocated text
+pub con PGPARAM_LEN:      int64 := 8;   // int64 — byte length (excl. NUL)
+pub con PGPARAM_IS_NULL:  int64 := 16;  // int64 — 1=NULL, 0=value
+
+fn pgStmtNew(conn: int64, name: pchar, sql: pchar): int64 {
+  var s: int64 := alloc(PGSTMT_SZ);
+  poke64(s + PGSTMT_NAME, pgDupStr(name));
+  poke64(s + PGSTMT_SQL,  pgDupStr(sql));
+  poke64(s + PGSTMT_CONN, conn);
+  return s;
+}
+
+// Clears all bound params and frees their memory
+pub fn PGStmtReset(stmt: int64) {
+  if (stmt == 0) { return; }
+  var params: int64 := peek64(stmt + PGSTMT_PARAMS);
+  var count:  int64 := peek64(stmt + PGSTMT_PARAM_COUNT);
+  var i: int64 := 0;
+  while (i < count) {
+    var p: int64 := peek64(params + i * 8);
+    if (p != 0) {
+      var tv: int64 := peek64(p + PGPARAM_TEXT_VAL);
+      var tl: int64 := peek64(p + PGPARAM_LEN);
+      if (tv != 0 && tl > 0) { free(tv, tl + 1); }
+      free(p, PGPARAM_SZ);
+    }
+    i += 1;
+  }
+  poke64(stmt + PGSTMT_PARAM_COUNT, 0);
+}
+
+// Frees client-side PGStmt memory (call after PGStmtClose)
+pub fn PGStmtFree(stmt: int64) {
+  if (stmt == 0) { return; }
+  PGStmtReset(stmt);
+  var params: int64 := peek64(stmt + PGSTMT_PARAMS);
+  var alloc:  int64 := peek64(stmt + PGSTMT_PARAMS_ALLOC);
+  if (params != 0 && alloc > 0) { free(params, alloc * 8); }
+  pgFreeStr(peek64(stmt + PGSTMT_NAME));
+  pgFreeStr(peek64(stmt + PGSTMT_SQL));
+  free(stmt, PGSTMT_SZ);
+}
+
+// Sends Parse + Sync, returns PGStmt* or 0 on error
+pub fn PGStmtPrepare(conn: int64, name: pchar, sql: pchar): int64 {
+  if (conn == 0) { return 0; }
+  pgConnSetError(conn, PG_ERR_NONE, 0 as pchar);
+  if (peek64(conn + PGCONN_STATUS) != PG_STATUS_CONNECTED) {
+    pgConnSetError(conn, PG_ERR_CONNECT, "not connected"c);
+    return 0;
+  }
+
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var b:  int64 := pgConnMsgBuf(conn);
+
+  // Build Parse payload: name\0 + sql\0 + numParams(0)
+  pgBufReset(b);
+  pgBufAppendStr(b, name);
+  pgBufAppendStr(b, sql);
+  pgBufAppend16BE(b, 0);  // 0 param type hints — server infers
+  if (pgSendMsgBuf(fd, PG_FE_PARSE, b) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send parse failed"c);
+    return 0;
+  }
+  if (pgSendMsg(fd, PG_FE_SYNC, 0, 0) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send sync failed"c);
+    return 0;
+  }
+
+  var stmt:     int64 := pgStmtNew(conn, name, sql);
+  var hadError: int64 := 0;
+  var r:        int64 := pgAllocRecv();
+
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgConnSetError(conn, PG_ERR_RECV, "recv failed in prepare"c);
+      pgFreeRecv(r);
+      PGStmtFree(stmt);
+      return 0;
+    }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+
+    if (msgType == PG_MSG_PARSE_DONE) {
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+      hadError := 1;
+    } else if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      if (hadError != 0) { PGStmtFree(stmt); return 0; }
+      return stmt;
+    } else {
+      pgFreeRecvMsg(r);
+    }
+  }
+
+  pgFreeRecv(r);
+  PGStmtFree(stmt);
+  return 0;
+}
+
+// Builds Bind message payload into b from stmt's param array
+fn pgBuildBindPayload(b: int64, stmtName: int64, paramCount: int64, params: int64) {
+  pgBufAppend8(b, 0);                    // empty portal name (NUL only)
+  pgBufAppendStr(b, stmtName as pchar);  // stmt name + NUL
+  pgBufAppend16BE(b, 0);                 // 0 format codes — all text
+  pgBufAppend16BE(b, paramCount);
+  var i: int64 := 0;
+  while (i < paramCount) {
+    var p: int64 := 0;
+    if (params != 0) { p := peek64(params + i * 8); }
+    if (p != 0 && peek64(p + PGPARAM_IS_NULL) == 0) {
+      var tl: int64 := peek64(p + PGPARAM_LEN);
+      pgBufAppend32BE(b, tl);
+      pgBufAppendBytes(b, peek64(p + PGPARAM_TEXT_VAL), tl);
+    } else {
+      pgBufAppend32BE(b, 4294967295);  // NULL (-1 as uint32)
+    }
+    i += 1;
+  }
+  pgBufAppend16BE(b, 0);  // 0 result format codes — all text
+}
+
+// Sends Bind + Execute + Sync, parses response, returns PGResult or 0 on error
+pub fn PGStmtExecute(conn: int64, stmt: int64): int64 {
+  if (conn == 0 || stmt == 0) { return 0; }
+  pgConnSetError(conn, PG_ERR_NONE, 0 as pchar);
+  if (peek64(conn + PGCONN_STATUS) != PG_STATUS_CONNECTED) {
+    pgConnSetError(conn, PG_ERR_CONNECT, "not connected"c);
+    return 0;
+  }
+
+  var fd:         int64 := peek64(conn + PGCONN_FD);
+  var b:          int64 := pgConnMsgBuf(conn);
+  var namePtr:    int64 := peek64(stmt + PGSTMT_NAME);
+  var paramCount: int64 := peek64(stmt + PGSTMT_PARAM_COUNT);
+  var params:     int64 := peek64(stmt + PGSTMT_PARAMS);
+
+  // Send Bind
+  pgBufReset(b);
+  pgBuildBindPayload(b, namePtr, paramCount, params);
+  if (pgSendMsgBuf(fd, PG_FE_BIND, b) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send bind failed"c);
+    return 0;
+  }
+
+  // Send Execute: empty portal + maxRows=0
+  pgBufReset(b);
+  pgBufAppend8(b, 0);
+  pgBufAppend32BE(b, 0);
+  if (pgSendMsgBuf(fd, PG_FE_EXECUTE, b) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send execute failed"c);
+    return 0;
+  }
+
+  // Send Sync
+  if (pgSendMsg(fd, PG_FE_SYNC, 0, 0) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "send sync failed"c);
+    return 0;
+  }
+
+  var result:   int64 := pgResultNew();
+  var hadError: int64 := 0;
+  var r:        int64 := pgAllocRecv();
+
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgConnSetError(conn, PG_ERR_RECV, "recv failed in execute"c);
+      pgFreeRecv(r);
+      PGFreeResult(result);
+      return 0;
+    }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+
+    if (msgType == PG_MSG_BIND_DONE) {
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_ROW_DESC) {
+      pgParseRowDescription(result, payload, payLen);
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_DATA_ROW) {
+      pgParseDataRow(result, payload, payLen);
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_CMD_COMPLETE) {
+      pgParseCommandTag(result, payload);
+      poke64(conn + PGCONN_CHANGES, peek64(result + PGRESULT_AFFECTED_ROWS));
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_EMPTY_QUERY) {
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+      hadError := 1;
+    } else if (msgType == PG_MSG_NOTICE) {
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      if (hadError != 0) { PGFreeResult(result); return 0; }
+      return result;
+    } else {
+      pgFreeRecvMsg(r);
+    }
+  }
+
+  pgFreeRecv(r);
+  return 0;
+}
+
+// Sends Close (statement) + Sync, drains until ReadyForQuery
+pub fn PGStmtClose(conn: int64, name: pchar) {
+  if (conn == 0) { return; }
+  if (peek64(conn + PGCONN_STATUS) != PG_STATUS_CONNECTED) { return; }
+
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var b:  int64 := pgConnMsgBuf(conn);
+
+  // Close payload: 'S' + name\0
+  pgBufReset(b);
+  pgBufAppend8(b, 83);  // 'S' — statement (not portal)
+  pgBufAppendStr(b, name);
+  pgSendMsgBuf(fd, PG_FE_CLOSE, b);
+  pgSendMsg(fd, PG_FE_SYNC, 0, 0);
+
+  var r: int64 := pgAllocRecv();
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) { pgFreeRecv(r); return; }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+    if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      return;
+    }
+    if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+    }
+    pgFreeRecvMsg(r);
+  }
+  pgFreeRecv(r);
+}
+
+// Describes a prepared statement, returns PGResult with field metadata (0 rows)
+pub fn PGStmtDescribe(conn: int64, name: pchar): int64 {
+  if (conn == 0) { return 0; }
+  if (peek64(conn + PGCONN_STATUS) != PG_STATUS_CONNECTED) { return 0; }
+
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var b:  int64 := pgConnMsgBuf(conn);
+
+  // Describe payload: 'S' + name\0
+  pgBufReset(b);
+  pgBufAppend8(b, 83);  // 'S' — statement
+  pgBufAppendStr(b, name);
+  pgSendMsgBuf(fd, PG_FE_DESCRIBE, b);
+  pgSendMsg(fd, PG_FE_SYNC, 0, 0);
+
+  var result: int64 := pgResultNew();
+  var r:      int64 := pgAllocRecv();
+
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgFreeRecv(r);
+      PGFreeResult(result);
+      return 0;
+    }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+
+    if (msgType == PG_MSG_PARAM_DESC) {
+      pgFreeRecvMsg(r);  // skip — param OIDs not needed here
+    } else if (msgType == PG_MSG_ROW_DESC) {
+      pgParseRowDescription(result, payload, payLen);
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_NO_DATA) {
+      pgFreeRecvMsg(r);  // non-SELECT statement — no result columns
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      PGFreeResult(result);
+      return 0;
+    } else if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r);
+      pgFreeRecv(r);
+      return result;
+    } else {
+      pgFreeRecvMsg(r);
+    }
+  }
+
+  pgFreeRecv(r);
+  return 0;
+}
+
+// ============================================================================
+// WP-PG-07: Parameter-Binding (Text-Format)
+// ============================================================================
+
+// Grows params array to hold index i, frees any old param there,
+// allocates a fresh PGParam. Returns PGParam* or 0 on failure.
+fn pgAllocParamAt(stmt: int64, i: int64): int64 {
+  if (stmt == 0 || i < 0) { return 0; }
+  var params: int64 := peek64(stmt + PGSTMT_PARAMS);
+  var alloc:  int64 := peek64(stmt + PGSTMT_PARAMS_ALLOC);
+
+  if (i >= alloc) {
+    var newAlloc: int64 := alloc * 2;
+    if (newAlloc < i + 1) { newAlloc := i + 4; }
+    var newArr: int64 := alloc(newAlloc * 8);
+    if (params != 0 && alloc > 0) {
+      var ci: int64 := 0;
+      while (ci < alloc) { poke64(newArr + ci * 8, peek64(params + ci * 8)); ci := ci + 1; }
+      free(params, alloc * 8);
+    }
+    params := newArr;
+    poke64(stmt + PGSTMT_PARAMS,       params);
+    poke64(stmt + PGSTMT_PARAMS_ALLOC, newAlloc);
+  }
+
+  var old: int64 := peek64(params + i * 8);
+  if (old != 0) {
+    var tv: int64 := peek64(old + PGPARAM_TEXT_VAL);
+    var tl: int64 := peek64(old + PGPARAM_LEN);
+    if (tv != 0 && tl > 0) { free(tv, tl + 1); }
+    free(old, PGPARAM_SZ);
+    poke64(params + i * 8, 0);
+  }
+
+  var p: int64 := alloc(PGPARAM_SZ);
+  poke64(params + i * 8, p);
+
+  var count: int64 := peek64(stmt + PGSTMT_PARAM_COUNT);
+  if (i + 1 > count) { poke64(stmt + PGSTMT_PARAM_COUNT, i + 1); }
+  return p;
+}
+
+// Formats int64 as decimal into buf, returns char count (excl. NUL)
+fn pgFormatInt64(val: int64, buf: int64): int64 {
+  if (val == 0) { poke8(buf, 48); poke8(buf + 1, 0); return 1; }
+  var tmp: int64 := alloc(24);
+  var isNeg: int64 := 0;
+  var n: int64 := val;
+  if (n < 0) { isNeg := 1; n := 0 - n; }
+  var pos: int64 := 0;
+  while (n > 0) { poke8(tmp + pos, (n % 10) + 48); n := n / 10; pos := pos + 1; }
+  var out: int64 := 0;
+  if (isNeg != 0) { poke8(buf, 45); out := 1; }
+  var i: int64 := pos - 1;
+  while (i >= 0) { poke8(buf + out, peek8(tmp + i)); out := out + 1; i := i - 1; }
+  poke8(buf + out, 0);
+  free(tmp, 24);
+  return out;
+}
+
+// Formats f64 as decimal with 6 fractional digits.
+// Scales to int64 first to avoid the 0.0-x f64 negation bug.
+fn pgFormatFloat64(val: f64, buf: int64): int64 {
+  var scaled:  f64   := val * (1000000 as f64);
+  var iscaled: int64 := scaled as int64;
+  var out: int64 := 0;
+  if (iscaled < 0) { poke8(buf, 45); out := 1; iscaled := 0 - iscaled; }
+  var intPart:  int64 := iscaled / 1000000;
+  var fracPart: int64 := iscaled - intPart * 1000000;
+
+  var tmp: int64 := alloc(32);
+  var iLen: int64 := pgFormatInt64(intPart, tmp);
+  var k: int64 := 0;
+  while (k < iLen) { poke8(buf + out, peek8(tmp + k)); out := out + 1; k := k + 1; }
+
+  poke8(buf + out, 46); out := out + 1;  // '.'
+
+  var digits: int64 := alloc(8);
+  var j: int64 := 5;
+  var f: int64 := fracPart;
+  while (j >= 0) { poke8(digits + j, (f % 10) + 48); f := f / 10; j := j - 1; }
+  j := 0;
+  while (j < 6) { poke8(buf + out, peek8(digits + j)); out := out + 1; j := j + 1; }
+
+  poke8(buf + out, 0);
+  free(tmp, 32);
+  free(digits, 8);
+  return out;
+}
+
+// Binds int64 to parameter slot i (0-based) as decimal text
+pub fn PGBindInt(stmt: int64, i: int64, v: int64) {
+  var p: int64 := pgAllocParamAt(stmt, i);
+  if (p == 0) { return; }
+  var buf: int64 := alloc(24);
+  var len: int64 := pgFormatInt64(v, buf);
+  poke64(p + PGPARAM_TEXT_VAL, buf);
+  poke64(p + PGPARAM_LEN,      len);
+  poke64(p + PGPARAM_IS_NULL,  0);
+}
+
+// Binds f64 to parameter slot i as decimal text (6 decimal places)
+pub fn PGBindFloat(stmt: int64, i: int64, v: f64) {
+  var p: int64 := pgAllocParamAt(stmt, i);
+  if (p == 0) { return; }
+  var buf: int64 := alloc(32);
+  var len: int64 := pgFormatFloat64(v, buf);
+  poke64(p + PGPARAM_TEXT_VAL, buf);
+  poke64(p + PGPARAM_LEN,      len);
+  poke64(p + PGPARAM_IS_NULL,  0);
+}
+
+// Binds string to parameter slot i (heap copy — no escaping needed in text protocol)
+pub fn PGBindStr(stmt: int64, i: int64, v: pchar) {
+  var p: int64 := pgAllocParamAt(stmt, i);
+  if (p == 0) { return; }
+  if (v == 0 as pchar) { poke64(p + PGPARAM_IS_NULL, 1); return; }
+  var len: int64 := pgStrLen(v as int64);
+  var buf: int64 := alloc(len + 1);
+  var k: int64 := 0;
+  while (k <= len) { poke8(buf + k, peek8(v as int64 + k)); k := k + 1; }
+  poke64(p + PGPARAM_TEXT_VAL, buf);
+  poke64(p + PGPARAM_LEN,      len);
+  poke64(p + PGPARAM_IS_NULL,  0);
+}
+
+// Binds bool to parameter slot i ("t" or "f")
+pub fn PGBindBool(stmt: int64, i: int64, v: int64) {
+  var p: int64 := pgAllocParamAt(stmt, i);
+  if (p == 0) { return; }
+  var buf: int64 := alloc(2);
+  if (v != 0) { poke8(buf, 116); } else { poke8(buf, 102); }  // 't' / 'f'
+  poke8(buf + 1, 0);
+  poke64(p + PGPARAM_TEXT_VAL, buf);
+  poke64(p + PGPARAM_LEN,      1);
+  poke64(p + PGPARAM_IS_NULL,  0);
+}
+
+// Binds NULL to parameter slot i
+pub fn PGBindNull(stmt: int64, i: int64) {
+  var p: int64 := pgAllocParamAt(stmt, i);
+  if (p == 0) { return; }
+  poke64(p + PGPARAM_IS_NULL, 1);
+}
+
+// ============================================================================
+// WP-PG-08: Transaktionen & Savepoints
+// ============================================================================
+
+// Executes a fixed SQL command, frees result, returns 1 on success
+fn pgExecSimple(conn: int64, sql: pchar): int64 {
+  var r: int64 := PGQuery(conn, sql);
+  if (r == 0) { return 0; }
+  PGFreeResult(r);
+  return 1;
+}
+
+// Executes "prefix name" (e.g. "SAVEPOINT sp1"), returns 1 on success
+fn pgExecWithName(conn: int64, prefix: pchar, name: pchar): int64 {
+  var plen: int64 := pgStrLen(prefix as int64);
+  var nlen: int64 := pgStrLen(name as int64);
+  var buf: int64 := alloc(plen + nlen + 2);
+  var i: int64 := 0;
+  while (i < plen) { poke8(buf + i, peek8(prefix as int64 + i)); i := i + 1; }
+  poke8(buf + plen, 32);  // space
+  i := 0;
+  while (i <= nlen) { poke8(buf + plen + 1 + i, peek8(name as int64 + i)); i := i + 1; }
+  var r: int64 := PGQuery(conn, buf as pchar);
+  free(buf, plen + nlen + 2);
+  if (r == 0) { return 0; }
+  PGFreeResult(r);
+  return 1;
+}
+
+pub fn PGBegin(conn: int64): int64              { return pgExecSimple(conn, "BEGIN"c); }
+pub fn PGCommit(conn: int64): int64             { return pgExecSimple(conn, "COMMIT"c); }
+pub fn PGRollback(conn: int64): int64           { return pgExecSimple(conn, "ROLLBACK"c); }
+pub fn PGBeginReadOnly(conn: int64): int64      { return pgExecSimple(conn, "BEGIN READ ONLY"c); }
+pub fn PGBeginSerializable(conn: int64): int64  { return pgExecSimple(conn, "BEGIN ISOLATION LEVEL SERIALIZABLE"c); }
+
+pub fn PGSavepoint(conn: int64, name: pchar): int64 {
+  return pgExecWithName(conn, "SAVEPOINT"c, name);
+}
+pub fn PGRollbackTo(conn: int64, name: pchar): int64 {
+  return pgExecWithName(conn, "ROLLBACK TO SAVEPOINT"c, name);
+}
+pub fn PGReleaseSavepoint(conn: int64, name: pchar): int64 {
+  return pgExecWithName(conn, "RELEASE SAVEPOINT"c, name);
+}
+
+pub fn PGInTransaction(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  return peek64(conn + PGCONN_TXSTATUS) == PG_TX_ACTIVE;
+}
+pub fn PGTxFailed(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  return peek64(conn + PGCONN_TXSTATUS) == PG_TX_ERROR;
+}
+
+// PostgreSQL has no protocol-level autocommit toggle — no-op, returns 1
+pub fn PGSetAutoCommit(conn: int64, on: int64): int64 {
+  if (conn == 0) { return 0; }
+  return 1;
+}
+
+// ============================================================================
+// WP-PG-09: Hilfsfunktionen & Connection-Pool
+// ============================================================================
+
+// Returns affected rows from the last query on this connection
+pub fn PGChanges(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  return peek64(conn + PGCONN_CHANGES);
+}
+
+// Returns the last auto-generated sequence value in this session
+pub fn PGLastInsertId(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  var r: int64 := PGQuery(conn, "SELECT lastval()"c);
+  if (r == 0) { return 0; }
+  PGFetchRow(r);
+  var id: int64 := PGGetInt(r, 0);
+  PGFreeResult(r);
+  return id;
+}
+
+// Escapes src by doubling single-quotes (' → '') into dst. Returns char count (excl. NUL).
+pub fn PGEscapeStr(dst: int64, src: pchar): int64 {
+  if (src == 0 as pchar) { poke8(dst, 0); return 0; }
+  var i: int64 := 0;
+  var out: int64 := 0;
+  while (true) {
+    var c: int64 := peek8(src as int64 + i) & 0xFF;
+    if (c == 0) { break; }
+    if (c == 39) { poke8(dst + out, 39); out := out + 1; }  // double the quote
+    poke8(dst + out, c); out := out + 1;
+    i += 1;
+  }
+  poke8(dst + out, 0);
+  return out;
+}
+
+// Concatenates three pchar parts into a fresh mmap buffer (caller must munmap).
+// Returns pointer to the NUL-terminated result string.
+fn pgConcat3(a: pchar, b: pchar, c: pchar): int64 {
+  var al: int64 := pgStrLen(a as int64);
+  var bl: int64 := pgStrLen(b as int64);
+  var cl: int64 := pgStrLen(c as int64);
+  var buf: int64 := alloc(al + bl + cl + 1);
+  var i: int64 := 0;
+  while (i < al) { poke8(buf + i,          peek8(a as int64 + i)); i := i + 1; }
+  i := 0;
+  while (i < bl) { poke8(buf + al + i,     peek8(b as int64 + i)); i := i + 1; }
+  i := 0;
+  while (i <= cl) { poke8(buf + al + bl + i, peek8(c as int64 + i)); i := i + 1; }
+  return buf;
+}
+
+// Concatenates five pchar parts into a fresh mmap buffer.
+fn pgConcat5(a: pchar, b: pchar, c: pchar, d: pchar, e: pchar): int64 {
+  var al: int64 := pgStrLen(a as int64);
+  var bl: int64 := pgStrLen(b as int64);
+  var cl: int64 := pgStrLen(c as int64);
+  var dl: int64 := pgStrLen(d as int64);
+  var el: int64 := pgStrLen(e as int64);
+  var total: int64 := al + bl + cl + dl + el + 1;
+  var buf: int64 := alloc(total);
+  var off: int64 := 0;
+  var i: int64 := 0;
+  while (i < al) { poke8(buf + off, peek8(a as int64 + i)); off := off + 1; i := i + 1; }
+  i := 0;
+  while (i < bl) { poke8(buf + off, peek8(b as int64 + i)); off := off + 1; i := i + 1; }
+  i := 0;
+  while (i < cl) { poke8(buf + off, peek8(c as int64 + i)); off := off + 1; i := i + 1; }
+  i := 0;
+  while (i < dl) { poke8(buf + off, peek8(d as int64 + i)); off := off + 1; i := i + 1; }
+  i := 0;
+  while (i <= el) { poke8(buf + off, peek8(e as int64 + i)); off := off + 1; i := i + 1; }
+  return buf;
+}
+
+// WP-8: Prüft ob name nur sichere SQL-Identifier-Zeichen enthält [a-zA-Z0-9_.].
+// Verhindert Injection bei DDL-Statements die keine Parameterisierung unterstützen.
+fn pgValidateIdentifier(name: pchar): bool {
+  if (name == 0 as pchar) { return false; }
+  var i: int64 := 0;
+  var c: int64 := StrCharAt(name, i) & 255;
+  if (c == 0) { return false; }
+  while (c != 0) {
+    var safe: int64 := 0;
+    if (c >= 65 && c <= 90)  { safe := 1; }  // A-Z
+    if (c >= 97 && c <= 122) { safe := 1; }  // a-z
+    if (c >= 48 && c <= 57)  { safe := 1; }  // 0-9
+    if (c == 95)              { safe := 1; }  // _
+    if (c == 46)              { safe := 1; }  // .
+    if (safe == 0) { return false; }
+    i += 1;
+    c := StrCharAt(name, i) & 255;
+  }
+  return true;
+}
+
+// Returns 1 if table exists in any non-system schema, 0 otherwise.
+// WP-8: parametrisiert mit $1 statt String-Konkatenation.
+pub fn PGTableExists(conn: int64, table: pchar): int64 {
+  if (conn == 0 || table == 0 as pchar) { return 0; }
+  var stmt: int64 := PGStmtPrepare(conn, ""c,
+    "SELECT 1 FROM information_schema.tables WHERE table_name=$1 AND table_schema NOT IN ('information_schema','pg_catalog') LIMIT 1"c);
+  if (stmt == 0) { return 0; }
+  PGBindStr(stmt, 0, table);
+  var r: int64 := PGStmtExecute(conn, stmt);
+  PGStmtFree(stmt);
+  if (r == 0) { return 0; }
+  var found: int64 := 0;
+  if (PGNumRows(r) > 0) { found := 1; }
+  PGFreeResult(r);
+  return found;
+}
+
+// Returns 1 if column exists in table (any non-system schema), 0 otherwise.
+// WP-8: parametrisiert mit $1/$2 statt String-Konkatenation.
+pub fn PGColumnExists(conn: int64, table: pchar, column: pchar): int64 {
+  if (conn == 0 || table == 0 as pchar || column == 0 as pchar) { return 0; }
+  var stmt: int64 := PGStmtPrepare(conn, ""c,
+    "SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2 AND table_schema NOT IN ('information_schema','pg_catalog') LIMIT 1"c);
+  if (stmt == 0) { return 0; }
+  PGBindStr(stmt, 0, table);
+  PGBindStr(stmt, 1, column);
+  var r: int64 := PGStmtExecute(conn, stmt);
+  PGStmtFree(stmt);
+  if (r == 0) { return 0; }
+  var found: int64 := 0;
+  if (PGNumRows(r) > 0) { found := 1; }
+  PGFreeResult(r);
+  return found;
+}
+
+// Executes DROP TABLE IF EXISTS "table" — WP-8: Identifier-Validierung.
+// Lehnt Namen ab die nicht aus [a-zA-Z0-9_.] bestehen (gibt -1 zurück).
+pub fn PGDropTable(conn: int64, table: pchar): int64 {
+  if (!pgValidateIdentifier(table)) { return 0 - 1; }
+  return pgExecWithName(conn, "DROP TABLE IF EXISTS"c, table);
+}
+
+// ============================================================================
+// Connection-Pool
+// ============================================================================
+
+// PGPool layout (3 × int64 = 24 bytes)
+con PGPOOL_SZ:    int64 := 24;
+con PGPOOL_SIZE:  int64 := 0;   // int64 — number of slots
+con PGPOOL_CONNS: int64 := 8;   // int64 — pointer to int64[size] of PGConn*
+con PGPOOL_BUSY:  int64 := 16;  // int64 — pointer to int64[size] flags (0=free,1=busy)
+
+// Allocates a connection pool with the given number of slots (all initially empty)
+pub fn PGPoolCreate(size: int64): int64 {
+  if (size < 1) { return 0; }
+  var pg: int64 := alloc(PGPOOL_SZ);
+  poke64(pg + PGPOOL_SIZE,  size);
+  poke64(pg + PGPOOL_CONNS, alloc(size * 8));
+  poke64(pg + PGPOOL_BUSY,  alloc(size * 8));
+  return pg;
+}
+
+// Closes all connections and frees pool memory
+pub fn PGPoolDestroy(pg: int64) {
+  if (pg == 0) { return; }
+  var size:  int64 := peek64(pg + PGPOOL_SIZE);
+  var conns: int64 := peek64(pg + PGPOOL_CONNS);
+  var busy:  int64 := peek64(pg + PGPOOL_BUSY);
+  var i: int64 := 0;
+  while (i < size) {
+    var conn: int64 := peek64(conns + i * 8);
+    if (conn != 0) { PGClose(conn); }
+    i += 1;
+  }
+  if (conns != 0) { free(conns, size * 8); }
+  if (busy  != 0) { free(busy,  size * 8); }
+  free(pg, PGPOOL_SZ);
+}
+
+// Returns a free connected slot (reuses existing or opens new). Returns 0 if all slots busy.
+pub fn PGPoolAcquire(pg: int64, host: pchar, port: int64, user: pchar, password: pchar, database: pchar): int64 {
+  if (pg == 0) { return 0; }
+  var size:  int64 := peek64(pg + PGPOOL_SIZE);
+  var conns: int64 := peek64(pg + PGPOOL_CONNS);
+  var busy:  int64 := peek64(pg + PGPOOL_BUSY);
+
+  // First pass: reuse an idle, connected slot
+  var i: int64 := 0;
+  while (i < size) {
+    if (peek64(busy + i * 8) == 0) {
+      var conn: int64 := peek64(conns + i * 8);
+      if (conn != 0 && PGIsConnected(conn) != 0) {
+        poke64(busy + i * 8, 1);
+        return conn;
+      }
+    }
+    i += 1;
+  }
+
+  // Second pass: open a new connection in a free slot
+  i := 0;
+  while (i < size) {
+    if (peek64(busy + i * 8) == 0) {
+      var old: int64 := peek64(conns + i * 8);
+      if (old != 0) { PGClose(old); poke64(conns + i * 8, 0); }
+      var conn: int64 := PGConnect(host, port, user, password, database);
+      if (conn != 0 && PGIsConnected(conn) != 0) {
+        poke64(conns + i * 8, conn);
+        poke64(busy  + i * 8, 1);
+        return conn;
+      }
+      if (conn != 0) { PGClose(conn); }
+    }
+    i += 1;
+  }
+
+  return 0;
+}
+
+// Marks a connection as free so it can be reused
+pub fn PGPoolRelease(pg: int64, conn: int64) {
+  if (pg == 0 || conn == 0) { return; }
+  var size:  int64 := peek64(pg + PGPOOL_SIZE);
+  var conns: int64 := peek64(pg + PGPOOL_CONNS);
+  var busy:  int64 := peek64(pg + PGPOOL_BUSY);
+  var i: int64 := 0;
+  while (i < size) {
+    if (peek64(conns + i * 8) == conn) { poke64(busy + i * 8, 0); return; }
+    i += 1;
+  }
+}
+
+// ============================================================================
+// WP-PG-10: LISTEN / NOTIFY
+// ============================================================================
+
+extern fn sys_select(nfds: int64, readfds: pchar, writefds: pchar, exceptfds: pchar, timeout: pchar): int64;
+
+// PGNotification layout (3 x int64 = 24 bytes)
+con PGNOTIF_SZ:      int64 := 24;
+con PGNOTIF_PID:     int64 := 0;   // int64 — backend PID that sent the notify
+con PGNOTIF_CHANNEL: int64 := 8;   // int64 — pchar, heap-allocated channel name
+con PGNOTIF_PAYLOAD: int64 := 16;  // int64 — pchar, heap-allocated payload string
+
+// Returns 1 if fd has readable data (non-blocking poll via select timeout=0)
+fn pgSocketReadable(fd: int64): int64 {
+  var fds: int64 := alloc(128);
+  var byteIdx: int64 := fd / 8;
+  var bitIdx:  int64 := fd - byteIdx * 8;
+  poke8(fds + byteIdx, (peek8(fds + byteIdx) & 0xFF) | (1 << bitIdx));
+  var tv: int64 := alloc(16);  // {tv_sec=0, tv_usec=0}
+  var n: int64 := sys_select(fd + 1, fds as pchar, 0 as pchar, 0 as pchar, tv as pchar);
+  free(fds, 128);
+  free(tv, 16);
+  var result: int64 := 0;
+  if (n > 0) { result := 1; }
+  return result;
+}
+
+// Parses a NotificationResponse payload ('A') into a fresh PGNotification struct.
+// payload format: [pid: int32 BE][channel: cstring][payload: cstring]
+fn pgParseNotification(payload: int64, payLen: int64): int64 {
+  if (payLen < 5) { return 0; }
+  var pid: int64 := pgReadInt32BE(payload, 0);
+  var pos: int64 := 4;
+
+  var chanStart: int64 := pos;
+  while (pos < payLen && (peek8(payload + pos) & 0xFF) != 0) { pos := pos + 1; }
+  var chanLen: int64 := pos - chanStart;
+  pos += 1;
+
+  var pvStart: int64 := pos;
+  while (pos < payLen && (peek8(payload + pos) & 0xFF) != 0) { pos := pos + 1; }
+  var pvLen: int64 := pos - pvStart;
+
+  var notif: int64 := alloc(PGNOTIF_SZ);
+  poke64(notif + PGNOTIF_PID, pid);
+
+  var chanBuf: int64 := alloc(chanLen + 1);
+  var i: int64 := 0;
+  while (i < chanLen) { poke8(chanBuf + i, peek8(payload + chanStart + i)); i := i + 1; }
+  poke8(chanBuf + chanLen, 0);
+  poke64(notif + PGNOTIF_CHANNEL, chanBuf);
+
+  var pvBuf: int64 := alloc(pvLen + 1);
+  i := 0;
+  while (i < pvLen) { poke8(pvBuf + i, peek8(payload + pvStart + i)); i := i + 1; }
+  poke8(pvBuf + pvLen, 0);
+  poke64(notif + PGNOTIF_PAYLOAD, pvBuf);
+
+  return notif;
+}
+
+// Tries to read one message from fd; returns PGNotification* if it is a NOTIFY, else 0.
+fn pgReadNotification(fd: int64): int64 {
+  var r: int64 := pgAllocRecv();
+  if (pgDoRecv(fd, r) < 0) { pgFreeRecv(r); return 0; }
+  var msgType: int64 := pgRecvType(r);
+  var payload: int64 := pgRecvBuf(r);
+  var payLen:  int64 := pgRecvLen(r);
+  var notif: int64 := 0;
+  if (msgType == PG_MSG_NOTIFY) {
+    notif := pgParseNotification(payload, payLen);
+  }
+  pgFreeRecvMsg(r);
+  pgFreeRecv(r);
+  return notif;
+}
+
+// Subscribes to a PostgreSQL notification channel
+pub fn PGListen(conn: int64, channel: pchar): int64 {
+  return pgExecWithName(conn, "LISTEN"c, channel);
+}
+
+// Unsubscribes from a notification channel
+pub fn PGUnlisten(conn: int64, channel: pchar): int64 {
+  return pgExecWithName(conn, "UNLISTEN"c, channel);
+}
+
+// Sends a NOTIFY to a channel with an optional payload
+pub fn PGNotify(conn: int64, channel: pchar, payload: pchar): int64 {
+  if (conn == 0 || channel == 0 as pchar) { return 0; }
+  var plen: int64 := 0;
+  if (payload != 0 as pchar) { plen := pgStrLen(payload as int64); }
+  var esc: int64 := alloc(plen * 2 + 2);
+  var escLen: int64 := 0;
+  if (payload != 0 as pchar) { escLen := PGEscapeStr(esc, payload); }
+  poke8(esc + escLen, 0);
+  var sql: int64 := pgConcat5("NOTIFY "c, channel, ", '"c, esc as pchar, "'"c);
+  free(esc, plen * 2 + 2);
+  var r: int64 := PGQuery(conn, sql as pchar);
+  free(sql, pgStrLen(sql) + 1);
+  if (r == 0) { return 0; }
+  PGFreeResult(r);
+  return 1;
+}
+
+// Polls the socket non-blocking; returns PGNotification* if a NOTIFY is pending, else 0
+pub fn PGGetNotification(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  if (PGIsConnected(conn) == 0) { return 0; }
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  if (pgSocketReadable(fd) == 0) { return 0; }
+  return pgReadNotification(fd);
+}
+
+// Frees a PGNotification struct
+pub fn PGFreeNotification(notif: int64) {
+  if (notif == 0) { return; }
+  var ch: int64 := peek64(notif + PGNOTIF_CHANNEL);
+  if (ch != 0) { free(ch, pgStrLen(ch) + 1); }
+  var pv: int64 := peek64(notif + PGNOTIF_PAYLOAD);
+  if (pv != 0) { free(pv, pgStrLen(pv) + 1); }
+  free(notif, PGNOTIF_SZ);
+}
+
+// Blocks up to timeout_ms waiting for a notification; returns PGNotification* or 0
+pub fn PGWaitNotification(conn: int64, timeout_ms: int64): int64 {
+  if (conn == 0) { return 0; }
+  if (PGIsConnected(conn) == 0) { return 0; }
+  var fd: int64 := peek64(conn + PGCONN_FD);
+
+  var fds: int64 := alloc(128);
+  var byteIdx: int64 := fd / 8;
+  var bitIdx:  int64 := fd - byteIdx * 8;
+  poke8(fds + byteIdx, (peek8(fds + byteIdx) & 0xFF) | (1 << bitIdx));
+
+  var secs:  int64 := timeout_ms / 1000;
+  var usecs: int64 := (timeout_ms - secs * 1000) * 1000;
+  var tv: int64 := alloc(16);
+  poke64(tv, secs);
+  poke64(tv + 8, usecs);
+
+  var n: int64 := sys_select(fd + 1, fds as pchar, 0 as pchar, 0 as pchar, tv as pchar);
+  free(fds, 128);
+  free(tv, 16);
+
+  if (n <= 0) { return 0; }
+  return pgReadNotification(fd);
+}
+
+// PGNotification accessors
+pub fn PGNotifPid(notif: int64): int64 {
+  if (notif == 0) { return 0; }
+  return peek64(notif + PGNOTIF_PID);
+}
+pub fn PGNotifChannel(notif: int64): pchar {
+  if (notif == 0) { return 0 as pchar; }
+  return peek64(notif + PGNOTIF_CHANNEL) as pchar;
+}
+pub fn PGNotifPayload(notif: int64): pchar {
+  if (notif == 0) { return 0 as pchar; }
+  return peek64(notif + PGNOTIF_PAYLOAD) as pchar;
+}
+
+// ============================================================================
+// WP-PG-11: COPY IN — Bulk-Insert
+// ============================================================================
+
+// Escapes a string value for PostgreSQL CSV COPY:
+// wraps in double-quotes, doubles any internal double-quote.
+// Returns char count written to dst (excl. NUL).
+// If src is 0, writes nothing (empty = NULL marker for caller to decide).
+pub fn pgCsvEscape(dst: int64, src: pchar): int64 {
+  if (src == 0 as pchar) { poke8(dst, 0); return 0; }
+  var out: int64 := 0;
+  poke8(dst + out, 34); out := out + 1;  // opening "
+  var i: int64 := 0;
+  while (true) {
+    var c: int64 := peek8(src as int64 + i) & 0xFF;
+    if (c == 0) { break; }
+    if (c == 34) { poke8(dst + out, 34); out := out + 1; }  // "" for "
+    poke8(dst + out, c); out := out + 1;
+    i += 1;
+  }
+  poke8(dst + out, 34); out := out + 1;  // closing "
+  poke8(dst + out, 0);
+  return out;
+}
+
+// Sends "COPY table [(columns)] FROM STDIN WITH (FORMAT CSV)"
+// and waits for CopyInResponse ('G'). Returns 1 on success, 0 on error.
+pub fn PGCopyBegin(conn: int64, table: pchar, columns: pchar): int64 {
+  if (conn == 0 || table == 0 as pchar) { return 0; }
+  pgConnSetError(conn, PG_ERR_NONE, 0 as pchar);
+
+  var sql: int64 := 0;
+  if (columns == 0 as pchar) {
+    sql := pgConcat3("COPY "c, table, " FROM STDIN WITH (FORMAT CSV)"c);
+  } else {
+    sql := pgConcat5("COPY "c, table, " ("c, columns, ") FROM STDIN WITH (FORMAT CSV)"c);
+  }
+
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var sqlLen: int64 := pgStrLen(sql) + 1;
+  var rc: int64 := pgSendMsg(fd, PG_FE_QUERY, sql, sqlLen);
+  free(sql, sqlLen);
+  if (rc < 0) { pgConnSetError(conn, PG_ERR_SEND, "copy begin send failed"c); return 0; }
+
+  // Wait for CopyInResponse or error
+  var r: int64 := pgAllocRecv();
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgConnSetError(conn, PG_ERR_RECV, "copy begin recv failed"c);
+      pgFreeRecv(r); return 0;
+    }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+    if (msgType == PG_MSG_COPY_IN) {
+      pgFreeRecvMsg(r); pgFreeRecv(r); return 1;
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+    } else if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r); pgFreeRecv(r); return 0;
+    } else {
+      pgFreeRecvMsg(r);
+    }
+  }
+  pgFreeRecv(r);
+  return 0;
+}
+
+// Sends one CSV row as CopyData ('d').
+// values: pointer to int64[count] — each element is pchar (0 = NULL).
+// NULL fields emit an empty unquoted field (PostgreSQL CSV default NULL = '').
+// Non-NULL fields are quoted: "value" with internal " escaped as "".
+pub fn PGCopyRow(conn: int64, values: int64, count: int64): int64 {
+  if (conn == 0 || values == 0 || count <= 0) { return 0; }
+  var b: int64 := pgConnMsgBuf(conn);
+  pgBufReset(b);
+  var i: int64 := 0;
+  while (i < count) {
+    if (i > 0) { pgBufAppend8(b, 44); }  // ','
+    var v: int64 := peek64(values + i * 8);
+    if (v != 0) {
+      pgBufAppend8(b, 34);  // opening "
+      var j: int64 := 0;
+      while (true) {
+        var c: int64 := peek8(v + j) & 0xFF;
+        if (c == 0) { break; }
+        if (c == 34) { pgBufAppend8(b, 34); }  // double the quote
+        pgBufAppend8(b, c);
+        j += 1;
+      }
+      pgBufAppend8(b, 34);  // closing "
+    }
+    // NULL: nothing (empty unquoted field)
+    i += 1;
+  }
+  pgBufAppend8(b, 10);  // '\n'
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var rc: int64 := pgSendMsgBuf(fd, PG_FE_COPY_DATA, b);
+  var result: int64 := 0;
+  if (rc >= 0) { result := 1; }
+  return result;
+}
+
+// Signals end of COPY data, waits for CommandComplete + ReadyForQuery.
+// Returns 1 on success (rows inserted), 0 on error.
+pub fn PGCopyEnd(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  if (pgSendMsg(fd, PG_FE_COPY_DONE, 0, 0) < 0) {
+    pgConnSetError(conn, PG_ERR_SEND, "copy done send failed"c); return 0;
+  }
+
+  var r: int64 := pgAllocRecv();
+  var success: int64 := 0;
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) {
+      pgConnSetError(conn, PG_ERR_RECV, "copy end recv failed"c);
+      pgFreeRecv(r); return 0;
+    }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+    if (msgType == PG_MSG_CMD_COMPLETE) {
+      var tmp: int64 := pgResultNew();
+      pgParseCommandTag(tmp, payload);
+      poke64(conn + PGCONN_CHANGES, peek64(tmp + PGRESULT_AFFECTED_ROWS));
+      PGFreeResult(tmp);
+      pgFreeRecvMsg(r);
+      success := 1;
+    } else if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+      pgFreeRecvMsg(r);
+      success := 0;
+    } else if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r); pgFreeRecv(r); return success;
+    } else {
+      pgFreeRecvMsg(r);
+    }
+  }
+  pgFreeRecv(r);
+  return 0;
+}
+
+// Aborts an active COPY IN by sending CopyFail ('f') with an error message.
+// Returns 1 after draining the server response, 0 on send error.
+pub fn PGCopyAbort(conn: int64, errmsg: pchar): int64 {
+  if (conn == 0) { return 0; }
+  var fd: int64 := peek64(conn + PGCONN_FD);
+  var msg: pchar := errmsg;
+  if (msg == 0 as pchar) { msg := "COPY aborted by client"c; }
+  var msgLen: int64 := pgStrLen(msg as int64) + 1;
+  if (pgSendMsg(fd, PG_FE_COPY_FAIL, msg as int64, msgLen) < 0) { return 0; }
+
+  // Drain until ReadyForQuery
+  var r: int64 := pgAllocRecv();
+  while (true) {
+    if (pgDoRecv(fd, r) < 0) { pgFreeRecv(r); return 0; }
+    var msgType: int64 := pgRecvType(r);
+    var payload: int64 := pgRecvBuf(r);
+    var payLen:  int64 := pgRecvLen(r);
+    if (msgType == PG_MSG_READY) {
+      if (payLen >= 1) { poke64(conn + PGCONN_TXSTATUS, peek8(payload) & 0xFF); }
+      pgFreeRecvMsg(r); pgFreeRecv(r); return 1;
+    }
+    if (msgType == PG_MSG_ERROR) {
+      pgConnSetErrorFromPayload(conn, payload, payLen);
+    }
+    pgFreeRecvMsg(r);
+  }
+  pgFreeRecv(r);
+  return 0;
+}
+
+// Ping — sendet SELECT 1 als Heartbeat, gibt 1 bei Erfolg zurück
+pub fn PGPing(conn: int64): int64 {
+  if (conn == 0) { return 0; }
+  if (peek64(conn + PGCONN_STATUS) != PG_STATUS_CONNECTED) { return 0; }
+  var result: int64 := PGQuery(conn, "SELECT 1"c);
+  if (result == 0) { return 0; }
+  PGFreeResult(result);
+  return 1;
+}

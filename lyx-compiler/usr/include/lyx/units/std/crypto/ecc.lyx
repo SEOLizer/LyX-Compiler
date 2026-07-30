@@ -1,0 +1,794 @@
+// std/crypto/ecc.lyx — secp256k1 ECDSA (WP-BL-01)
+//
+// All 256-bit values: 32-byte little-endian buffers (byte 0 = LSB).
+// Jacobian EC points: 96 bytes = X(0..31) | Y(32..63) | Z(64..95).
+// Point at infinity: Z == all-zero.
+//
+// Public API:
+//   ECCPubFromPriv(privk, pubx, puby)              — public key from private key
+//   ECCGenKey(privk, pubx, puby)                   — generate random key pair
+//   ECDSASign(hash, privk, r_out, s_out): int64    — sign 32-byte hash
+//   ECDSAVerify(hash, pubx, puby, r, s): int64     — verify, returns 1 if valid
+
+unit std.crypto.ecc;
+import std.alloc;
+import std.crypto.rand;
+
+// ============================================================================
+// Section 1 — 256-bit integer utilities
+// ============================================================================
+
+fn eccU256Copy(d: int64, s: int64): void {
+    var i: int64 := 0;
+    while (i < 32) { poke8(d + i, peek8(s + i)); i := i + 1; }
+}
+
+fn eccU256Zero(r: int64): void {
+    var i: int64 := 0;
+    while (i < 32) { poke8(r + i, 0); i := i + 1; }
+}
+
+fn eccU256IsZero(a: int64): int64 {
+    var i: int64 := 0;
+    while (i < 32) {
+        if (peek8(a + i) != 0) { return 0; }
+        i += 1;
+    }
+    return 1;
+}
+
+// Returns 1 if a >= b (unsigned little-endian), 0 otherwise.
+fn eccU256GE(a: int64, b: int64): int64 {
+    var i: int64 := 31;
+    while (i >= 0) {
+        var ai: int64 := peek8(a + i);
+        var bi: int64 := peek8(b + i);
+        if (ai > bi) { return 1; }
+        if (ai < bi) { return 0; }
+        i -= 1;
+    }
+    return 1;
+}
+
+// r = a + b (256-bit). Returns carry (0 or 1).
+fn eccU256Add(r: int64, a: int64, b: int64): int64 {
+    var carry: int64 := 0;
+    var i: int64 := 0;
+    while (i < 32) {
+        var v: int64 := peek8(a + i) + peek8(b + i) + carry;
+        poke8(r + i, v & 0xFF);
+        carry := v >> 8;
+        i += 1;
+    }
+    return carry;
+}
+
+// r = a - b (256-bit). Returns borrow (1 if a < b, else 0).
+fn eccU256Sub(r: int64, a: int64, b: int64): int64 {
+    var borrow: int64 := 0;
+    var i: int64 := 0;
+    while (i < 32) {
+        var v: int64 := peek8(a + i) - peek8(b + i) - borrow;
+        if (v < 0) {
+            poke8(r + i, (v + 256) & 0xFF);
+            borrow := 1;
+        } else {
+            poke8(r + i, v & 0xFF);
+            borrow := 0;
+        }
+        i += 1;
+    }
+    return borrow;
+}
+
+// r (64 bytes) = a * b  (schoolbook 256×256→512 bit, byte digits).
+fn eccU256Mul(r: int64, a: int64, b: int64): void {
+    var tmp: int64 := alloc(512);  // 64 int64 slots, one per output byte
+    var i: int64 := 0;
+    while (i < 64) { poke64(tmp + i * 8, 0); i := i + 1; }
+    i := 0;
+    while (i < 32) {
+        var j: int64 := 0;
+        while (j < 32) {
+            var pos: int64 := (i + j) * 8;
+            poke64(tmp + pos, peek64(tmp + pos) + peek8(a + i) * peek8(b + j));
+            j += 1;
+        }
+        i += 1;
+    }
+    i := 0;
+    while (i < 63) {
+        var v: int64 := peek64(tmp + i * 8);
+        poke64(tmp + (i + 1) * 8, peek64(tmp + (i + 1) * 8) + (v >> 8));
+        poke64(tmp + i * 8, v & 0xFF);
+        i += 1;
+    }
+    i := 0;
+    while (i < 64) { poke8(r + i, peek64(tmp + i * 8) & 0xFF); i := i + 1; }
+    free(tmp, 512);
+}
+
+// ============================================================================
+// Section 2 — Modular reduction helper
+// ============================================================================
+
+// Fold work[32..workLen-1] into work[0..] using 2^256 ≡ eps (mod m).
+// Clears work[32..workLen-1] as it processes them.
+fn eccFoldOnce(work: int64, workLen: int64, eps: int64, epsLen: int64): void {
+    var hiLen: int64 := workLen - 32;
+    var i: int64 := 0;
+    while (i < hiLen) {
+        var hiByte: int64 := peek8(work + 32 + i);
+        poke8(work + 32 + i, 0);
+        if (hiByte != 0) {
+            var carry: int64 := 0;
+            var j: int64 := 0;
+            while (j < epsLen) {
+                var v: int64 := peek8(work + i + j) + hiByte * peek8(eps + j) + carry;
+                poke8(work + i + j, v & 0xFF);
+                carry := v >> 8;
+                j += 1;
+            }
+            var pos: int64 := i + epsLen;
+            while (carry > 0) {
+                var v: int64 := peek8(work + pos) + carry;
+                poke8(work + pos, v & 0xFF);
+                carry := v >> 8;
+                pos += 1;
+            }
+        }
+        i += 1;
+    }
+}
+
+// ============================================================================
+// Section 3 — secp256k1 constants (all little-endian)
+// ============================================================================
+
+// p = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+fn eccP(r: int64): void {
+    poke8(r+ 0,0x2F); poke8(r+ 1,0xFC); poke8(r+ 2,0xFF); poke8(r+ 3,0xFF);
+    poke8(r+ 4,0xFE); poke8(r+ 5,0xFF); poke8(r+ 6,0xFF); poke8(r+ 7,0xFF);
+    poke8(r+ 8,0xFF); poke8(r+ 9,0xFF); poke8(r+10,0xFF); poke8(r+11,0xFF);
+    poke8(r+12,0xFF); poke8(r+13,0xFF); poke8(r+14,0xFF); poke8(r+15,0xFF);
+    poke8(r+16,0xFF); poke8(r+17,0xFF); poke8(r+18,0xFF); poke8(r+19,0xFF);
+    poke8(r+20,0xFF); poke8(r+21,0xFF); poke8(r+22,0xFF); poke8(r+23,0xFF);
+    poke8(r+24,0xFF); poke8(r+25,0xFF); poke8(r+26,0xFF); poke8(r+27,0xFF);
+    poke8(r+28,0xFF); poke8(r+29,0xFF); poke8(r+30,0xFF); poke8(r+31,0xFF);
+}
+
+// Reduction constant: eps_p = 2^32 + 977 = 0x100003D1  (5 bytes LE)
+fn eccEpsP(r: int64): void {
+    poke8(r+0,0xD1); poke8(r+1,0x03); poke8(r+2,0x00); poke8(r+3,0x00); poke8(r+4,0x01);
+}
+
+// n = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+fn eccN(r: int64): void {
+    poke8(r+ 0,0x41); poke8(r+ 1,0x41); poke8(r+ 2,0x36); poke8(r+ 3,0xD0);
+    poke8(r+ 4,0x8C); poke8(r+ 5,0x5E); poke8(r+ 6,0xD2); poke8(r+ 7,0xBF);
+    poke8(r+ 8,0x3B); poke8(r+ 9,0xA0); poke8(r+10,0x48); poke8(r+11,0xAF);
+    poke8(r+12,0xE6); poke8(r+13,0xDC); poke8(r+14,0xAE); poke8(r+15,0xBA);
+    poke8(r+16,0xFE); poke8(r+17,0xFF); poke8(r+18,0xFF); poke8(r+19,0xFF);
+    poke8(r+20,0xFF); poke8(r+21,0xFF); poke8(r+22,0xFF); poke8(r+23,0xFF);
+    poke8(r+24,0xFF); poke8(r+25,0xFF); poke8(r+26,0xFF); poke8(r+27,0xFF);
+    poke8(r+28,0xFF); poke8(r+29,0xFF); poke8(r+30,0xFF); poke8(r+31,0xFF);
+}
+
+// Reduction constant: eps_n = 2^256 - n  (17 bytes LE)
+fn eccEpsN(r: int64): void {
+    poke8(r+ 0,0xBF); poke8(r+ 1,0xBE); poke8(r+ 2,0xC9); poke8(r+ 3,0x2F);
+    poke8(r+ 4,0x73); poke8(r+ 5,0xA1); poke8(r+ 6,0x2D); poke8(r+ 7,0x40);
+    poke8(r+ 8,0xC4); poke8(r+ 9,0x5F); poke8(r+10,0xB7); poke8(r+11,0x50);
+    poke8(r+12,0x19); poke8(r+13,0x23); poke8(r+14,0x51); poke8(r+15,0x45);
+    poke8(r+16,0x01);
+}
+
+// Generator Gx (LE)
+fn eccGx(r: int64): void {
+    poke8(r+ 0,0x98); poke8(r+ 1,0x17); poke8(r+ 2,0xF8); poke8(r+ 3,0x16);
+    poke8(r+ 4,0x5B); poke8(r+ 5,0x81); poke8(r+ 6,0xF2); poke8(r+ 7,0x59);
+    poke8(r+ 8,0xD9); poke8(r+ 9,0x28); poke8(r+10,0xCE); poke8(r+11,0x2D);
+    poke8(r+12,0xDB); poke8(r+13,0xFC); poke8(r+14,0x9B); poke8(r+15,0x02);
+    poke8(r+16,0x07); poke8(r+17,0x0B); poke8(r+18,0x87); poke8(r+19,0xCE);
+    poke8(r+20,0x95); poke8(r+21,0x62); poke8(r+22,0xA0); poke8(r+23,0x55);
+    poke8(r+24,0xAC); poke8(r+25,0xBB); poke8(r+26,0xDC); poke8(r+27,0xF9);
+    poke8(r+28,0x7E); poke8(r+29,0x66); poke8(r+30,0xBE); poke8(r+31,0x79);
+}
+
+// Generator Gy (LE)
+fn eccGy(r: int64): void {
+    poke8(r+ 0,0xB8); poke8(r+ 1,0xD4); poke8(r+ 2,0x10); poke8(r+ 3,0xFB);
+    poke8(r+ 4,0x8F); poke8(r+ 5,0xD0); poke8(r+ 6,0x47); poke8(r+ 7,0x9C);
+    poke8(r+ 8,0x19); poke8(r+ 9,0x54); poke8(r+10,0x85); poke8(r+11,0xA6);
+    poke8(r+12,0x48); poke8(r+13,0xB4); poke8(r+14,0x17); poke8(r+15,0xFD);
+    poke8(r+16,0xA8); poke8(r+17,0x08); poke8(r+18,0x11); poke8(r+19,0x0E);
+    poke8(r+20,0xFC); poke8(r+21,0xFB); poke8(r+22,0xA4); poke8(r+23,0x5D);
+    poke8(r+24,0x65); poke8(r+25,0xC4); poke8(r+26,0xA3); poke8(r+27,0x26);
+    poke8(r+28,0x77); poke8(r+29,0xDA); poke8(r+30,0x3A); poke8(r+31,0x48);
+}
+
+// ============================================================================
+// Section 4 — Field arithmetic mod p
+// ============================================================================
+
+// Reduce 64-byte product x mod p → r (32 bytes). Fast reduction for secp256k1.
+fn fpReduce(r: int64, x: int64): void {
+    var work: int64 := alloc(64);
+    var eps:  int64 := alloc(5);
+    eccEpsP(eps);
+    var i: int64 := 0;
+    while (i < 64) { poke8(work + i, peek8(x + i)); i := i + 1; }
+
+    var iter: int64 := 0;
+    while (iter < 6) {
+        var nz: int64 := 0;
+        i := 32;
+        while (i < 64 && nz == 0) {
+            if (peek8(work + i) != 0) { nz := 1; }
+            i += 1;
+        }
+        if (nz == 0) { iter := 6; }
+        if (nz != 0) { eccFoldOnce(work, 64, eps, 5); }
+        iter += 1;
+    }
+
+    i := 0;
+    while (i < 32) { poke8(r + i, peek8(work + i)); i := i + 1; }
+
+    var p: int64 := alloc(32);
+    eccP(p);
+    if (eccU256GE(r, p) == 1) { eccU256Sub(r, r, p); }
+    if (eccU256GE(r, p) == 1) { eccU256Sub(r, r, p); }
+    free(work, 64); free(eps, 5); free(p, 32);
+}
+
+// r = (a + b) mod p
+fn fpAdd(r: int64, a: int64, b: int64): void {
+    var carry: int64 := eccU256Add(r, a, b);
+    var p: int64 := alloc(32);
+    eccP(p);
+    var doSub: int64 := carry;
+    if (doSub == 0 && eccU256GE(r, p) == 1) { doSub := 1; }
+    if (doSub != 0) { eccU256Sub(r, r, p); }
+    free(p, 32);
+}
+
+// r = (a - b) mod p
+fn fpSub(r: int64, a: int64, b: int64): void {
+    var borrow: int64 := eccU256Sub(r, a, b);
+    if (borrow != 0) {
+        var p: int64 := alloc(32);
+        eccP(p);
+        eccU256Add(r, r, p);
+        free(p, 32);
+    }
+}
+
+// r = -a mod p
+fn fpNeg(r: int64, a: int64): void {
+    if (eccU256IsZero(a) == 1) { eccU256Zero(r); return; }
+    var p: int64 := alloc(32);
+    eccP(p);
+    eccU256Sub(r, p, a);
+    free(p, 32);
+}
+
+// r = a * b mod p
+fn fpMul(r: int64, a: int64, b: int64): void {
+    var prod: int64 := alloc(64);
+    eccU256Mul(prod, a, b);
+    fpReduce(r, prod);
+    free(prod, 64);
+}
+
+// r = a^2 mod p
+fn fpSqr(r: int64, a: int64): void {
+    fpMul(r, a, a);
+}
+
+// r = base^exp mod p  (left-to-right square-and-multiply)
+fn fpPow(r: int64, base: int64, exp: int64): void {
+    var msb: int64 := 0 - 1;
+    var b: int64 := 255;
+    while (b >= 0 && msb < 0) {
+        var bi: int64 := b / 8;
+        var bb: int64 := b - bi * 8;
+        if ((peek8(exp + bi) >> bb) & 1) { msb := b; }
+        b -= 1;
+    }
+    if (msb < 0) { eccU256Zero(r); poke8(r, 1); return; }
+
+    var res: int64 := alloc(32);
+    var cur: int64 := alloc(32);
+    eccU256Copy(res, base);
+
+    b := msb - 1;
+    while (b >= 0) {
+        var bi: int64 := b / 8;
+        var bb: int64 := b - bi * 8;
+        var bit: int64 := (peek8(exp + bi) >> bb) & 1;
+        fpSqr(cur, res);
+        eccU256Copy(res, cur);
+        if (bit != 0) { fpMul(cur, res, base); eccU256Copy(res, cur); }
+        b -= 1;
+    }
+    eccU256Copy(r, res);
+    free(res, 32); free(cur, 32);
+}
+
+// r = a^(-1) mod p via Fermat: a^(p-2) mod p
+fn fpInv(r: int64, a: int64): void {
+    var exp: int64 := alloc(32);
+    eccP(exp);
+    poke8(exp, peek8(exp) - 2);  // p[0]=0x2F → 0x2D, no borrow
+    fpPow(r, a, exp);
+    free(exp, 32);
+}
+
+// Returns 1 if a == b (field equality), 0 otherwise.
+fn fpEqual(a: int64, b: int64): int64 {
+    var i: int64 := 0;
+    while (i < 32) {
+        if (peek8(a + i) != peek8(b + i)) { return 0; }
+        i += 1;
+    }
+    return 1;
+}
+
+// ============================================================================
+// Section 5 — Scalar arithmetic mod n
+// ============================================================================
+
+// Reduce 64-byte product x mod n → r (32 bytes).
+fn scReduce(r: int64, x: int64): void {
+    var work: int64 := alloc(64);
+    var eps:  int64 := alloc(17);
+    eccEpsN(eps);
+    var i: int64 := 0;
+    while (i < 64) { poke8(work + i, peek8(x + i)); i := i + 1; }
+
+    var iter: int64 := 0;
+    while (iter < 8) {
+        var nz: int64 := 0;
+        i := 32;
+        while (i < 64 && nz == 0) {
+            if (peek8(work + i) != 0) { nz := 1; }
+            i += 1;
+        }
+        if (nz == 0) { iter := 8; }
+        if (nz != 0) { eccFoldOnce(work, 64, eps, 17); }
+        iter += 1;
+    }
+
+    i := 0;
+    while (i < 32) { poke8(r + i, peek8(work + i)); i := i + 1; }
+
+    var n: int64 := alloc(32);
+    eccN(n);
+    if (eccU256GE(r, n) == 1) { eccU256Sub(r, r, n); }
+    if (eccU256GE(r, n) == 1) { eccU256Sub(r, r, n); }
+    free(work, 64); free(eps, 17); free(n, 32);
+}
+
+// Reduce a 32-byte value mod n (x < p ≈ n, at most one subtraction).
+fn scReduce32(r: int64, x: int64): void {
+    eccU256Copy(r, x);
+    var n: int64 := alloc(32);
+    eccN(n);
+    if (eccU256GE(r, n) == 1) { eccU256Sub(r, r, n); }
+    free(n, 32);
+}
+
+// r = (a + b) mod n
+fn scAdd(r: int64, a: int64, b: int64): void {
+    var carry: int64 := eccU256Add(r, a, b);
+    var n: int64 := alloc(32);
+    eccN(n);
+    var doSub: int64 := carry;
+    if (doSub == 0 && eccU256GE(r, n) == 1) { doSub := 1; }
+    if (doSub != 0) { eccU256Sub(r, r, n); }
+    free(n, 32);
+}
+
+// r = a * b mod n
+fn scMul(r: int64, a: int64, b: int64): void {
+    var prod: int64 := alloc(64);
+    eccU256Mul(prod, a, b);
+    scReduce(r, prod);
+    free(prod, 64);
+}
+
+// r = a^(-1) mod n via Fermat: a^(n-2) mod n
+fn scInv(r: int64, a: int64): void {
+    var exp: int64 := alloc(32);
+    eccN(exp);
+    poke8(exp, peek8(exp) - 2);  // n[0]=0x41 → 0x3F, no borrow
+
+    var msb: int64 := 0 - 1;
+    var b: int64 := 255;
+    while (b >= 0 && msb < 0) {
+        var bi: int64 := b / 8;
+        var bb: int64 := b - bi * 8;
+        if ((peek8(exp + bi) >> bb) & 1) { msb := b; }
+        b -= 1;
+    }
+    if (msb < 0) { eccU256Zero(r); poke8(r, 1); free(exp, 32); return; }
+
+    var res: int64 := alloc(32);
+    var cur: int64 := alloc(32);
+    eccU256Copy(res, a);
+
+    b := msb - 1;
+    while (b >= 0) {
+        var bi: int64 := b / 8;
+        var bb: int64 := b - bi * 8;
+        var bit: int64 := (peek8(exp + bi) >> bb) & 1;
+        scMul(cur, res, res);
+        eccU256Copy(res, cur);
+        if (bit != 0) { scMul(cur, res, a); eccU256Copy(res, cur); }
+        b -= 1;
+    }
+    eccU256Copy(r, res);
+    free(res, 32); free(cur, 32); free(exp, 32);
+}
+
+// ============================================================================
+// Section 6 — EC Jacobian point operations
+// ============================================================================
+
+fn jacSetInf(p: int64): void {
+    eccU256Zero(p); eccU256Zero(p + 32); eccU256Zero(p + 64);
+}
+
+fn jacIsInf(p: int64): int64 {
+    return eccU256IsZero(p + 64);
+}
+
+fn jacFromAff(j: int64, ax: int64, ay: int64): void {
+    eccU256Copy(j,      ax);
+    eccU256Copy(j + 32, ay);
+    eccU256Zero(j + 64);
+    poke8(j + 64, 1);  // Z = 1
+}
+
+fn jacCopy(d: int64, s: int64): void {
+    eccU256Copy(d,      s);
+    eccU256Copy(d + 32, s + 32);
+    eccU256Copy(d + 64, s + 64);
+}
+
+fn jacToAff(ax: int64, ay: int64, j: int64): void {
+    if (jacIsInf(j) == 1) { eccU256Zero(ax); eccU256Zero(ay); return; }
+    var zi:  int64 := alloc(32);
+    var zi2: int64 := alloc(32);
+    var zi3: int64 := alloc(32);
+    fpInv(zi, j + 64);
+    fpMul(zi2, zi, zi);
+    fpMul(zi3, zi2, zi);
+    fpMul(ax, j,      zi2);
+    fpMul(ay, j + 32, zi3);
+    free(zi, 32); free(zi2, 32); free(zi3, 32);
+}
+
+// r = 2*p  (Jacobian doubling, secp256k1 a=0)
+// REQUIRES r != p.
+fn jacDouble(r: int64, p: int64): void {
+    if (jacIsInf(p) == 1) { jacSetInf(r); return; }
+    if (eccU256IsZero(p + 32) == 1) { jacSetInf(r); return; }
+
+    var A:  int64 := alloc(32);
+    var B:  int64 := alloc(32);
+    var C:  int64 := alloc(32);
+    var t1: int64 := alloc(32);
+    var t2: int64 := alloc(32);
+
+    // A = 4*X*Y^2
+    fpSqr(t1, p + 32);
+    fpMul(t2, p, t1);
+    fpAdd(t2, t2, t2);
+    fpAdd(A, t2, t2);
+
+    // B = 8*Y^4
+    fpSqr(t2, t1);
+    fpAdd(t2, t2, t2);
+    fpAdd(t2, t2, t2);
+    fpAdd(B, t2, t2);
+
+    // C = 3*X^2  (a=0 so no a*Z^4 term)
+    fpSqr(t1, p);
+    fpAdd(C, t1, t1);
+    fpAdd(C, C, t1);
+
+    // X3 = C^2 - 2*A
+    fpSqr(t1, C);
+    fpAdd(t2, A, A);
+    fpSub(r, t1, t2);
+
+    // Y3 = C*(A - X3) - B
+    fpSub(t1, A, r);
+    fpMul(t2, C, t1);
+    fpSub(r + 32, t2, B);
+
+    // Z3 = 2*Y*Z
+    fpMul(t1, p + 32, p + 64);
+    fpAdd(r + 64, t1, t1);
+
+    free(A, 32); free(B, 32); free(C, 32); free(t1, 32); free(t2, 32);
+}
+
+// r = p (Jacobian) + (qx, qy) (affine).
+// REQUIRES r != p.
+fn jacAddMixed(r: int64, p: int64, qx: int64, qy: int64): void {
+    if (jacIsInf(p) == 1) { jacFromAff(r, qx, qy); return; }
+
+    var Z2: int64 := alloc(32);
+    var Z3: int64 := alloc(32);
+    var U2: int64 := alloc(32);
+    var S2: int64 := alloc(32);
+    var H:  int64 := alloc(32);
+    var R2: int64 := alloc(32);
+    var H2: int64 := alloc(32);
+    var H3: int64 := alloc(32);
+    var t1: int64 := alloc(32);
+    var t2: int64 := alloc(32);
+
+    fpSqr(Z2, p + 64);
+    fpMul(Z3, Z2, p + 64);
+    fpMul(U2, qx, Z2);
+    fpMul(S2, qy, Z3);
+    fpSub(H, U2, p);
+    fpSub(R2, S2, p + 32);
+
+    if (eccU256IsZero(H) == 1) {
+        if (eccU256IsZero(R2) == 1) {
+            var tmp: int64 := alloc(96);
+            jacDouble(tmp, p);
+            jacCopy(r, tmp);
+            free(tmp, 96);
+        } else {
+            jacSetInf(r);
+        }
+        free(Z2,32); free(Z3,32); free(U2,32); free(S2,32);
+        free(H,32); free(R2,32); free(H2,32); free(H3,32);
+        free(t1,32); free(t2,32);
+        return;
+    }
+
+    fpSqr(H2, H);
+    fpMul(H3, H, H2);
+
+    // X3 = R^2 - H^3 - 2*X1*H^2
+    fpSqr(t1, R2);
+    fpSub(t1, t1, H3);
+    fpMul(t2, p, H2);
+    fpAdd(t2, t2, t2);
+    fpSub(r, t1, t2);
+
+    // Y3 = R*(X1*H^2 - X3) - Y1*H^3
+    fpMul(t1, p, H2);
+    fpSub(t1, t1, r);
+    fpMul(t1, R2, t1);
+    fpMul(t2, p + 32, H3);
+    fpSub(r + 32, t1, t2);
+
+    // Z3 = H * Z1
+    fpMul(r + 64, H, p + 64);
+
+    free(Z2,32); free(Z3,32); free(U2,32); free(S2,32);
+    free(H,32); free(R2,32); free(H2,32); free(H3,32);
+    free(t1,32); free(t2,32);
+}
+
+// r (Jacobian) = scalar * (px, py) [affine]  — left-to-right binary.
+fn jacMul(r: int64, scalar: int64, px: int64, py: int64): void {
+    var msb: int64 := 0 - 1;
+    var b: int64 := 255;
+    while (b >= 0 && msb < 0) {
+        var bi: int64 := b / 8;
+        var bb: int64 := b - bi * 8;
+        if ((peek8(scalar + bi) >> bb) & 1) { msb := b; }
+        b -= 1;
+    }
+    if (msb < 0) { jacSetInf(r); return; }
+
+    var result: int64 := alloc(96);
+    var temp:   int64 := alloc(96);
+    jacFromAff(result, px, py);
+
+    b := msb - 1;
+    while (b >= 0) {
+        var bi: int64 := b / 8;
+        var bb: int64 := b - bi * 8;
+        var bit: int64 := (peek8(scalar + bi) >> bb) & 1;
+
+        jacDouble(temp, result);
+        jacCopy(result, temp);
+
+        if (bit != 0) {
+            jacAddMixed(temp, result, px, py);
+            jacCopy(result, temp);
+        }
+
+        b -= 1;
+    }
+
+    jacCopy(r, result);
+    free(result, 96); free(temp, 96);
+}
+
+// ============================================================================
+// Section 7 — Affine EC helper (for verification sum)
+// ============================================================================
+
+fn ecAffDouble(rx: int64, ry: int64, px: int64, py: int64): void {
+    var t1: int64 := alloc(32);
+    var t2: int64 := alloc(32);
+    var m:  int64 := alloc(32);
+    // m = 3*x^2 / (2*y) mod p  (secp256k1 a=0)
+    fpSqr(t1, px);
+    fpAdd(t2, t1, t1);
+    fpAdd(t1, t2, t1);   // t1 = 3*x^2
+    fpAdd(t2, py, py);   // t2 = 2*y
+    fpInv(t2, t2);
+    fpMul(m, t1, t2);
+    // rx = m^2 - 2*px
+    fpSqr(t1, m);
+    fpSub(t1, t1, px);
+    fpSub(rx, t1, px);
+    // ry = m*(px - rx) - py
+    fpSub(t1, px, rx);
+    fpMul(t1, m, t1);
+    fpSub(ry, t1, py);
+    free(t1, 32); free(t2, 32); free(m, 32);
+}
+
+fn ecAffAdd(rx: int64, ry: int64, px: int64, py: int64, qx: int64, qy: int64): void {
+    if (eccU256IsZero(px) == 1 && eccU256IsZero(py) == 1) {
+        eccU256Copy(rx, qx); eccU256Copy(ry, qy); return;
+    }
+    if (eccU256IsZero(qx) == 1 && eccU256IsZero(qy) == 1) {
+        eccU256Copy(rx, px); eccU256Copy(ry, py); return;
+    }
+    if (fpEqual(px, qx) == 1) {
+        if (fpEqual(py, qy) == 1) { ecAffDouble(rx, ry, px, py); return; }
+        eccU256Zero(rx); eccU256Zero(ry); return;
+    }
+    var dx: int64 := alloc(32);
+    var dy: int64 := alloc(32);
+    var m:  int64 := alloc(32);
+    var t:  int64 := alloc(32);
+    fpSub(dx, qx, px);
+    fpSub(dy, qy, py);
+    fpInv(t, dx);
+    fpMul(m, dy, t);
+    fpSqr(t, m);
+    fpSub(t, t, px);
+    fpSub(rx, t, qx);
+    fpSub(t, px, rx);
+    fpMul(t, m, t);
+    fpSub(ry, t, py);
+    free(dx, 32); free(dy, 32); free(m, 32); free(t, 32);
+}
+
+// ============================================================================
+// Section 8 — Public ECDSA API
+// ============================================================================
+
+// Compute public key from private key: pubkey = privk * G.
+pub fn ECCPubFromPriv(privk: int64, pubx: int64, puby: int64): void {
+    var gx:  int64 := alloc(32);
+    var gy:  int64 := alloc(32);
+    var jac: int64 := alloc(96);
+    eccGx(gx); eccGy(gy);
+    jacMul(jac, privk, gx, gy);
+    jacToAff(pubx, puby, jac);
+    free(gx, 32); free(gy, 32); free(jac, 96);
+}
+
+// Generate a random key pair.
+pub fn ECCGenKey(privk: int64, pubx: int64, puby: int64): void {
+    var n: int64 := alloc(32);
+    eccN(n);
+    var valid: int64 := 0;
+    while (valid == 0) {
+        RandBytesExact(privk, 32);
+        poke8(privk + 31, peek8(privk + 31) & 0x7F);
+        if (eccU256IsZero(privk) == 0 && eccU256GE(privk, n) == 0) { valid := 1; }
+    }
+    free(n, 32);
+    ECCPubFromPriv(privk, pubx, puby);
+}
+
+// Sign a 32-byte hash with privk. Returns 1.
+pub fn ECDSASign(hash: int64, privk: int64, r_out: int64, s_out: int64): int64 {
+    var n:   int64 := alloc(32);
+    var gx:  int64 := alloc(32);
+    var gy:  int64 := alloc(32);
+    var k:   int64 := alloc(32);
+    var ki:  int64 := alloc(32);
+    var jac: int64 := alloc(96);
+    var rx:  int64 := alloc(32);
+    var ry:  int64 := alloc(32);
+    var t1:  int64 := alloc(32);
+    var t2:  int64 := alloc(32);
+    eccN(n); eccGx(gx); eccGy(gy);
+
+    var ok: int64 := 0;
+    while (ok == 0) {
+        RandBytesExact(k, 32);
+        poke8(k + 31, peek8(k + 31) & 0x7F);
+        if (eccU256IsZero(k) == 0 && eccU256GE(k, n) == 0) {
+            jacMul(jac, k, gx, gy);
+            jacToAff(rx, ry, jac);
+            scReduce32(r_out, rx);
+            if (eccU256IsZero(r_out) == 0) {
+                scInv(ki, k);
+                scMul(t1, r_out, privk);
+                scAdd(t2, hash, t1);
+                scMul(s_out, ki, t2);
+                if (eccU256IsZero(s_out) == 0) { ok := 1; }
+            }
+        }
+    }
+
+    free(n,32); free(gx,32); free(gy,32); free(k,32); free(ki,32);
+    free(jac,96); free(rx,32); free(ry,32); free(t1,32); free(t2,32);
+    return 1;
+}
+
+// Verify ECDSA signature. Returns 1 if valid, 0 otherwise.
+pub fn ECDSAVerify(hash: int64, pubx: int64, puby: int64, r: int64, s: int64): int64 {
+    var n: int64 := alloc(32);
+    eccN(n);
+    var bad: int64 := 0;
+    if (eccU256IsZero(r) == 1) { bad := 1; }
+    if (eccU256GE(r, n) == 1) { bad := 1; }
+    if (eccU256IsZero(s) == 1) { bad := 1; }
+    if (eccU256GE(s, n) == 1) { bad := 1; }
+    if (bad != 0) { free(n, 32); return 0; }
+
+    var gx:  int64 := alloc(32);
+    var gy:  int64 := alloc(32);
+    var si:  int64 := alloc(32);
+    var u1:  int64 := alloc(32);
+    var u2:  int64 := alloc(32);
+    var j1:  int64 := alloc(96);
+    var j2:  int64 := alloc(96);
+    var ax1: int64 := alloc(32);
+    var ay1: int64 := alloc(32);
+    var ax2: int64 := alloc(32);
+    var ay2: int64 := alloc(32);
+    var sx:  int64 := alloc(32);
+    var sy:  int64 := alloc(32);
+    var rv:  int64 := alloc(32);
+    eccGx(gx); eccGy(gy);
+
+    scInv(si, s);
+    scMul(u1, hash, si);
+    scMul(u2, r, si);
+
+    jacMul(j1, u1, gx, gy);
+    jacToAff(ax1, ay1, j1);
+
+    jacMul(j2, u2, pubx, puby);
+    jacToAff(ax2, ay2, j2);
+
+    ecAffAdd(sx, sy, ax1, ay1, ax2, ay2);
+
+    var result: int64 := 0;
+    if (eccU256IsZero(sx) == 0 || eccU256IsZero(sy) == 0) {
+        scReduce32(rv, sx);
+        var eq: int64 := 1;
+        var i: int64 := 0;
+        while (i < 32) {
+            if (peek8(rv + i) != peek8(r + i)) { eq := 0; }
+            i += 1;
+        }
+        result := eq;
+    }
+
+    free(n,32); free(gx,32); free(gy,32); free(si,32); free(u1,32); free(u2,32);
+    free(j1,96); free(j2,96); free(ax1,32); free(ay1,32); free(ax2,32); free(ay2,32);
+    free(sx,32); free(sy,32); free(rv,32);
+    return result;
+}

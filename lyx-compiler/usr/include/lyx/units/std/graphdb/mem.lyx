@@ -1,0 +1,259 @@
+// std/graphdb/mem.lyx
+// WP-GRP-04: In-Memory-Store für Nodes und Edges
+
+@description("GraphDB in-memory store: node/edge storage, adjacency lists, traversal")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.graphdb.mem;
+
+import std.alloc;
+import std.graphdb.core;
+import std.graphdb.node;
+import std.graphdb.edge;
+
+pub con GMEM_OFF_NODEIDS:   int64 := 0;
+pub con GMEM_OFF_NODEPTRS:  int64 := 8;
+pub con GMEM_OFF_NODECOUNT: int64 := 16;
+pub con GMEM_OFF_NODECAP:   int64 := 24;
+pub con GMEM_OFF_EDGEIDS:   int64 := 32;
+pub con GMEM_OFF_EDGEPTRS:  int64 := 40;
+pub con GMEM_OFF_EDGECOUNT: int64 := 48;
+pub con GMEM_OFF_EDGECAP:   int64 := 56;
+pub con GMEM_OFF_ADJBUF:    int64 := 64;
+pub con GMEM_OFF_ADJCOUNT:  int64 := 72;
+pub con GMEM_OFF_ADJCAP:    int64 := 80;
+pub con GMEM_SIZE:          int64 := 88;
+
+con GMEM_NODE_INIT_CAP: int64 := 64;
+con GMEM_EDGE_INIT_CAP: int64 := 128;
+con GMEM_ADJ_INIT_CAP:  int64 := 512;
+
+// ============================================================
+// Grow helpers
+// ============================================================
+
+fn _memGrowNodes(s: int64, need: int64) {
+    var cap: int64 := peek64(s + GMEM_OFF_NODECAP);
+    var cnt: int64 := peek64(s + GMEM_OFF_NODECOUNT);
+    if (cnt + need <= cap) { return; }
+    var nc: int64 := cap * 2;
+    if (nc < cnt + need) { nc := cnt + need + 64; }
+    var oi: int64 := peek64(s + GMEM_OFF_NODEIDS);
+    var op: int64 := peek64(s + GMEM_OFF_NODEPTRS);
+    var ni: int64 := alloc(nc * 8);
+    var np: int64 := alloc(nc * 8);
+    memcpy(ni, oi, cnt * 8);
+    memcpy(np, op, cnt * 8);
+    free(oi, cap * 8);
+    free(op, cap * 8);
+    poke64(s + GMEM_OFF_NODEIDS,  ni);
+    poke64(s + GMEM_OFF_NODEPTRS, np);
+    poke64(s + GMEM_OFF_NODECAP,  nc);
+}
+
+fn _memGrowEdges(s: int64, need: int64) {
+    var cap: int64 := peek64(s + GMEM_OFF_EDGECAP);
+    var cnt: int64 := peek64(s + GMEM_OFF_EDGECOUNT);
+    if (cnt + need <= cap) { return; }
+    var nc: int64 := cap * 2;
+    if (nc < cnt + need) { nc := cnt + need + 128; }
+    var oi: int64 := peek64(s + GMEM_OFF_EDGEIDS);
+    var op: int64 := peek64(s + GMEM_OFF_EDGEPTRS);
+    var ni: int64 := alloc(nc * 8);
+    var np: int64 := alloc(nc * 8);
+    memcpy(ni, oi, cnt * 8);
+    memcpy(np, op, cnt * 8);
+    free(oi, cap * 8);
+    free(op, cap * 8);
+    poke64(s + GMEM_OFF_EDGEIDS,  ni);
+    poke64(s + GMEM_OFF_EDGEPTRS, np);
+    poke64(s + GMEM_OFF_EDGECAP,  nc);
+}
+
+fn _memGrowAdj(s: int64, need: int64) {
+    var cap: int64 := peek64(s + GMEM_OFF_ADJCAP);
+    var cnt: int64 := peek64(s + GMEM_OFF_ADJCOUNT);
+    if (cnt + need <= cap) { return; }
+    var nc: int64 := cap * 2;
+    if (nc < cnt + need) { nc := cnt + need + 256; }
+    var ob: int64 := peek64(s + GMEM_OFF_ADJBUF);
+    var nb: int64 := alloc(nc * 16);
+    memcpy(nb, ob, cnt * 16);
+    free(ob, cap * 16);
+    poke64(s + GMEM_OFF_ADJBUF, nb);
+    poke64(s + GMEM_OFF_ADJCAP, nc);
+}
+
+fn _memAddAdj(s: int64, nodeId: int64, edgeId: int64) {
+    _memGrowAdj(s, 1);
+    var adj: int64 := peek64(s + GMEM_OFF_ADJBUF);
+    var cnt: int64 := peek64(s + GMEM_OFF_ADJCOUNT);
+    poke64(adj + cnt * 16,     nodeId);
+    poke64(adj + cnt * 16 + 8, edgeId);
+    poke64(s + GMEM_OFF_ADJCOUNT, cnt + 1);
+}
+
+// ============================================================
+// Init / Free
+// ============================================================
+
+pub fn GraphMemStoreInit(s: int64) {
+    var ni: int64 := alloc(GMEM_NODE_INIT_CAP * 8);
+    var np: int64 := alloc(GMEM_NODE_INIT_CAP * 8);
+    poke64(s + GMEM_OFF_NODEIDS,   ni);
+    poke64(s + GMEM_OFF_NODEPTRS,  np);
+    poke64(s + GMEM_OFF_NODECOUNT, 0);
+    poke64(s + GMEM_OFF_NODECAP,   GMEM_NODE_INIT_CAP);
+    var ei: int64 := alloc(GMEM_EDGE_INIT_CAP * 8);
+    var ep: int64 := alloc(GMEM_EDGE_INIT_CAP * 8);
+    poke64(s + GMEM_OFF_EDGEIDS,   ei);
+    poke64(s + GMEM_OFF_EDGEPTRS,  ep);
+    poke64(s + GMEM_OFF_EDGECOUNT, 0);
+    poke64(s + GMEM_OFF_EDGECAP,   GMEM_EDGE_INIT_CAP);
+    var ab: int64 := alloc(GMEM_ADJ_INIT_CAP * 16);
+    poke64(s + GMEM_OFF_ADJBUF,    ab);
+    poke64(s + GMEM_OFF_ADJCOUNT,  0);
+    poke64(s + GMEM_OFF_ADJCAP,    GMEM_ADJ_INIT_CAP);
+}
+
+pub fn GraphMemStoreFree(s: int64) {
+    var ni: int64 := peek64(s + GMEM_OFF_NODEIDS);
+    var np: int64 := peek64(s + GMEM_OFF_NODEPTRS);
+    var nc: int64 := peek64(s + GMEM_OFF_NODECAP);
+    if (ni != 0) { free(ni, nc * 8); }
+    if (np != 0) { free(np, nc * 8); }
+    var ei: int64 := peek64(s + GMEM_OFF_EDGEIDS);
+    var ep: int64 := peek64(s + GMEM_OFF_EDGEPTRS);
+    var ec: int64 := peek64(s + GMEM_OFF_EDGECAP);
+    if (ei != 0) { free(ei, ec * 8); }
+    if (ep != 0) { free(ep, ec * 8); }
+    var ab: int64 := peek64(s + GMEM_OFF_ADJBUF);
+    var ac: int64 := peek64(s + GMEM_OFF_ADJCAP);
+    if (ab != 0) { free(ab, ac * 16); }
+}
+
+// ============================================================
+// Lookup
+// ============================================================
+
+pub fn GraphMemStoreGetNode(s: int64, id: int64): int64 {
+    var ids: int64  := peek64(s + GMEM_OFF_NODEIDS);
+    var ptrs: int64 := peek64(s + GMEM_OFF_NODEPTRS);
+    var cnt: int64  := peek64(s + GMEM_OFF_NODECOUNT);
+    var i: int64    := 0;
+    while (i < cnt) {
+        if (peek64(ids + i * 8) == id) { return peek64(ptrs + i * 8); }
+        i += 1;
+    }
+    return 0;
+}
+
+pub fn GraphMemStoreGetEdge(s: int64, id: int64): int64 {
+    var ids: int64  := peek64(s + GMEM_OFF_EDGEIDS);
+    var ptrs: int64 := peek64(s + GMEM_OFF_EDGEPTRS);
+    var cnt: int64  := peek64(s + GMEM_OFF_EDGECOUNT);
+    var i: int64    := 0;
+    while (i < cnt) {
+        if (peek64(ids + i * 8) == id) { return peek64(ptrs + i * 8); }
+        i += 1;
+    }
+    return 0;
+}
+
+// ============================================================
+// Add
+// ============================================================
+
+pub fn GraphMemStoreAddNode(s: int64, n: int64): int64 {
+    var id: int64   := peek64(n + GNODE_OFF_ID);
+    var ids: int64  := peek64(s + GMEM_OFF_NODEIDS);
+    var cnt: int64  := peek64(s + GMEM_OFF_NODECOUNT);
+    var ptrs: int64 := 0;
+    var i: int64    := 0;
+    if (id == GRAPH_ID_INVALID) { return 0; }
+    while (i < cnt) {
+        if (peek64(ids + i * 8) == id) { return 0; }
+        i += 1;
+    }
+    _memGrowNodes(s, 1);
+    ids  := peek64(s + GMEM_OFF_NODEIDS);
+    ptrs := peek64(s + GMEM_OFF_NODEPTRS);
+    poke64(ids  + cnt * 8, id);
+    poke64(ptrs + cnt * 8, n);
+    poke64(s + GMEM_OFF_NODECOUNT, cnt + 1);
+    return 1;
+}
+
+pub fn GraphMemStoreAddEdge(s: int64, e: int64): int64 {
+    var id: int64    := peek64(e + GEDGE_OFF_ID);
+    var cat: int64   := peek64(e + GEDGE_OFF_CREATEDAT);
+    var src: int64   := peek64(e + GEDGE_OFF_SOURCE);
+    var eids: int64  := 0;
+    var ecnt: int64  := 0;
+    var eptrs: int64 := 0;
+    var i: int64     := 0;
+    if (id == GRAPH_ID_INVALID) { return 0; }
+    if (cat == 0) { return 0; }
+    if (GraphMemStoreGetNode(s, src) == 0) { return 0; }
+    if (GraphMemStoreGetNode(s, peek64(e + GEDGE_OFF_TARGET)) == 0) { return 0; }
+    eids := peek64(s + GMEM_OFF_EDGEIDS);
+    ecnt := peek64(s + GMEM_OFF_EDGECOUNT);
+    while (i < ecnt) {
+        if (peek64(eids + i * 8) == id) { return 0; }
+        i += 1;
+    }
+    _memGrowEdges(s, 1);
+    eids  := peek64(s + GMEM_OFF_EDGEIDS);
+    eptrs := peek64(s + GMEM_OFF_EDGEPTRS);
+    poke64(eids  + ecnt * 8, id);
+    poke64(eptrs + ecnt * 8, e);
+    poke64(s + GMEM_OFF_EDGECOUNT, ecnt + 1);
+    _memAddAdj(s, src, id);
+    return 1;
+}
+
+// ============================================================
+// Traversal
+// ============================================================
+
+// Gibt Edge-IDs zurück, die von nodeId ausgehen. Gibt Anzahl zurück.
+pub fn GraphMemStoreOutEdges(s: int64, nodeId: int64, outBuf: int64, maxOut: int64): int64 {
+    var adj: int64   := peek64(s + GMEM_OFF_ADJBUF);
+    var acnt: int64  := peek64(s + GMEM_OFF_ADJCOUNT);
+    var found: int64 := 0;
+    var i: int64     := 0;
+    while (i < acnt) {
+        if (peek64(adj + i * 16) == nodeId) {
+            if (found < maxOut) {
+                poke64(outBuf + found * 8, peek64(adj + i * 16 + 8));
+                found += 1;
+            }
+        }
+        i += 1;
+    }
+    return found;
+}
+
+// Gibt Target-Node-IDs über ausgehende Kanten zurück. Gibt Anzahl zurück.
+pub fn GraphMemStoreNeighbors(s: int64, nodeId: int64, outBuf: int64, maxOut: int64): int64 {
+    var adj: int64   := peek64(s + GMEM_OFF_ADJBUF);
+    var acnt: int64  := peek64(s + GMEM_OFF_ADJCOUNT);
+    var found: int64 := 0;
+    var i: int64     := 0;
+    var eid: int64   := 0;
+    var ep: int64    := 0;
+    while (i < acnt) {
+        if (peek64(adj + i * 16) == nodeId) {
+            if (found < maxOut) {
+                eid := peek64(adj + i * 16 + 8);
+                ep  := GraphMemStoreGetEdge(s, eid);
+                if (ep != 0) {
+                    poke64(outBuf + found * 8, peek64(ep + GEDGE_OFF_TARGET));
+                    found += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    return found;
+}

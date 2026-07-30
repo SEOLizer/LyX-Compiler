@@ -1,0 +1,507 @@
+// std/cloud/iam.lyx — AWS IAM + STS Client
+// WP-AWS-08
+// Query protocol (POST form-urlencoded → XML responses)
+
+unit std.cloud.iam;
+
+import std.cloud.aws.core;
+import std.cloud.aws.transport;
+import std.cloud.aws.xml;
+import std.alloc;
+import std.io;
+
+pub type IAMClient = struct {
+    creds:  AWSCreds;
+    region: int64;  // pchar (always "us-east-1" for IAM global)
+    host:   int64;  // pchar alloc'd
+};
+
+pub type STSClient = struct {
+    creds:  AWSCreds;
+    region: int64;  // pchar
+    host:   int64;  // pchar alloc'd
+};
+
+pub type IAMUser = struct {
+    userId:   int64;  // pchar
+    userName: int64;  // pchar
+    arn:      int64;  // pchar
+    path:     int64;  // pchar
+    created:  int64;  // pchar
+};
+
+pub type IAMRole = struct {
+    roleId:   int64;  // pchar
+    roleName: int64;  // pchar
+    arn:      int64;  // pchar
+    path:     int64;  // pchar
+    created:  int64;  // pchar
+};
+
+pub type STSCredentials = struct {
+    accessKeyId:     int64;  // pchar
+    secretAccessKey: int64;  // pchar
+    sessionToken:    int64;  // pchar
+    expiration:      int64;  // pchar
+};
+
+pub fn IAMUserFree(u: IAMUser) {
+    if (u.userId   != 0) { free(u.userId,   StrLen(u.userId   as pchar)+1); }
+    if (u.userName != 0) { free(u.userName, StrLen(u.userName as pchar)+1); }
+    if (u.arn      != 0) { free(u.arn,      StrLen(u.arn      as pchar)+1); }
+    if (u.path     != 0) { free(u.path,     StrLen(u.path     as pchar)+1); }
+    if (u.created  != 0) { free(u.created,  StrLen(u.created  as pchar)+1); }
+}
+
+pub fn IAMRoleFree(r: IAMRole) {
+    if (r.roleId   != 0) { free(r.roleId,   StrLen(r.roleId   as pchar)+1); }
+    if (r.roleName != 0) { free(r.roleName, StrLen(r.roleName as pchar)+1); }
+    if (r.arn      != 0) { free(r.arn,      StrLen(r.arn      as pchar)+1); }
+    if (r.path     != 0) { free(r.path,     StrLen(r.path     as pchar)+1); }
+    if (r.created  != 0) { free(r.created,  StrLen(r.created  as pchar)+1); }
+}
+
+pub fn STSCredentialsFree(c: STSCredentials) {
+    if (c.accessKeyId     != 0) { free(c.accessKeyId,     StrLen(c.accessKeyId     as pchar)+1); }
+    if (c.secretAccessKey != 0) { free(c.secretAccessKey, StrLen(c.secretAccessKey as pchar)+1); }
+    if (c.sessionToken    != 0) { free(c.sessionToken,    StrLen(c.sessionToken    as pchar)+1); }
+    if (c.expiration      != 0) { free(c.expiration,      StrLen(c.expiration      as pchar)+1); }
+}
+
+fn iamSend(client: IAMClient, body: int64, bodyLen: int64): AWSResponse {
+    return AWSQueryRequest(client.creds, client.host as pchar,
+                           body, bodyLen,
+                           client.region as pchar, "iam"c);
+}
+
+fn stsSend(client: STSClient, body: int64, bodyLen: int64): AWSResponse {
+    return AWSQueryRequest(client.creds, client.host as pchar,
+                           body, bodyLen,
+                           client.region as pchar, "sts"c);
+}
+
+// ── IAM Client ────────────────────────────────────────────────────────────────
+
+pub fn IAMConnect(creds: AWSCreds): IAMClient {
+    var c: IAMClient;
+    c.creds  := creds;
+    c.region := "us-east-1"c as int64;
+    c.host   := AWSEndpoint("iam"c, "us-east-1"c) as int64;
+    return c;
+}
+
+pub fn IAMClose(client: IAMClient) {
+    AWSCredentialsFree(client.creds);
+    if (client.host != 0) { free(client.host, StrLen(client.host as pchar)+1); }
+}
+
+// ── Users ─────────────────────────────────────────────────────────────────────
+
+pub fn IAMListUsers(client: IAMClient): int64 {
+    var body: pchar := "Action=ListUsers&Version=2010-05-08"c;
+    var resp: AWSResponse := iamSend(client, body as int64, StrLen(body));
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn IAMGetUser(client: IAMClient, userName: pchar): IAMUser {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    var s: pchar := "Action=GetUser&Version=2010-05-08"c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    if (userName != 0 as pchar && StrLen(userName) > 0) {
+        var un: pchar := "&UserName="c; n:=StrLen(un);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(un,i)&0xFF);i:=i+1;} off:=off+n;
+        n:=StrLen(userName); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(userName,i)&0xFF);i:=i+1;} off:=off+n;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := iamSend(client, buf, off);
+    free(buf, 256);
+    var u: IAMUser;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        var user: int64 := XMLFind(resp.body, resp.bodyLen, "User"c);
+        if (user != 0) {
+            var ul: int64 := StrLen(user as pchar);
+            u.userId   := XMLFind(user, ul, "UserId"c);
+            u.userName := XMLFind(user, ul, "UserName"c);
+            u.arn      := XMLFind(user, ul, "Arn"c);
+            u.path     := XMLFind(user, ul, "Path"c);
+            u.created  := XMLFind(user, ul, "CreateDate"c);
+            free(user, ul+1);
+        }
+    }
+    AWSResponseFree(resp);
+    return u;
+}
+
+pub fn IAMCreateUser(client: IAMClient, userName: pchar, path: pchar): IAMUser {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=CreateUser&Version=2010-05-08&UserName="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(userName); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(userName,i)&0xFF);i:=i+1;} off:=off+n;
+    if (path != 0 as pchar && StrLen(path) > 0) {
+        var p: pchar := "&Path="c; n:=StrLen(p);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(p,i)&0xFF);i:=i+1;} off:=off+n;
+        n:=StrLen(path); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(path,i)&0xFF);i:=i+1;} off:=off+n;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := iamSend(client, buf, off);
+    free(buf, 512);
+    var u: IAMUser;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        var user: int64 := XMLFind(resp.body, resp.bodyLen, "User"c);
+        if (user != 0) {
+            var ul: int64 := StrLen(user as pchar);
+            u.userId   := XMLFind(user, ul, "UserId"c);
+            u.userName := XMLFind(user, ul, "UserName"c);
+            u.arn      := XMLFind(user, ul, "Arn"c);
+            u.path     := XMLFind(user, ul, "Path"c);
+            u.created  := XMLFind(user, ul, "CreateDate"c);
+            free(user, ul+1);
+        }
+    }
+    AWSResponseFree(resp);
+    return u;
+}
+
+pub fn IAMDeleteUser(client: IAMClient, userName: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    var s: pchar := "Action=DeleteUser&Version=2010-05-08&UserName="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(userName); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(userName,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := iamSend(client, buf, off);
+    free(buf, 256);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+// ── Roles ─────────────────────────────────────────────────────────────────────
+
+pub fn IAMListRoles(client: IAMClient): int64 {
+    var body: pchar := "Action=ListRoles&Version=2010-05-08"c;
+    var resp: AWSResponse := iamSend(client, body as int64, StrLen(body));
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn IAMGetRole(client: IAMClient, roleName: pchar): IAMRole {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    var s: pchar := "Action=GetRole&Version=2010-05-08&RoleName="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(roleName); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(roleName,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := iamSend(client, buf, off);
+    free(buf, 256);
+    var r: IAMRole;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        var role: int64 := XMLFind(resp.body, resp.bodyLen, "Role"c);
+        if (role != 0) {
+            var rl: int64 := StrLen(role as pchar);
+            r.roleId   := XMLFind(role, rl, "RoleId"c);
+            r.roleName := XMLFind(role, rl, "RoleName"c);
+            r.arn      := XMLFind(role, rl, "Arn"c);
+            r.path     := XMLFind(role, rl, "Path"c);
+            r.created  := XMLFind(role, rl, "CreateDate"c);
+            free(role, rl+1);
+        }
+    }
+    AWSResponseFree(resp);
+    return r;
+}
+
+pub fn IAMCreateRole(client: IAMClient, roleName: pchar,
+                     trustPolicy: pchar, path: pchar): IAMRole {
+    var buf: int64 := alloc(4096); var off: int64 := 0;
+    var s: pchar := "Action=CreateRole&Version=2010-05-08&RoleName="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(roleName); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(roleName,i)&0xFF);i:=i+1;} off:=off+n;
+    var tp: pchar := "&AssumeRolePolicyDocument="c; n:=StrLen(tp);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(tp,i)&0xFF);i:=i+1;} off:=off+n;
+    // URL-encode the trust policy JSON
+    n:=StrLen(trustPolicy); i:=0;
+    while(i<n){
+        var c: int64 := StrCharAt(trustPolicy,i)&0xFF;
+        if ((c>=65&&c<=90)||(c>=97&&c<=122)||(c>=48&&c<=57)||c==45||c==95||c==46||c==126) {
+            poke8(buf+off,c); off:=off+1;
+        } else {
+            poke8(buf+off,37);
+            poke8(buf+off+1,if((c>>4)<10){48+(c>>4)}else{87+(c>>4)});
+            poke8(buf+off+2,if((c&0xF)<10){48+(c&0xF)}else{87+(c&0xF)});
+            off:=off+3;
+        }
+        i:=i+1;
+    }
+    if (path != 0 as pchar && StrLen(path) > 0) {
+        var p: pchar := "&Path="c; n:=StrLen(p);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(p,i)&0xFF);i:=i+1;} off:=off+n;
+        n:=StrLen(path); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(path,i)&0xFF);i:=i+1;} off:=off+n;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := iamSend(client, buf, off);
+    free(buf, 4096);
+    var r: IAMRole;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        var role: int64 := XMLFind(resp.body, resp.bodyLen, "Role"c);
+        if (role != 0) {
+            var rl: int64 := StrLen(role as pchar);
+            r.roleId   := XMLFind(role, rl, "RoleId"c);
+            r.roleName := XMLFind(role, rl, "RoleName"c);
+            r.arn      := XMLFind(role, rl, "Arn"c);
+            r.path     := XMLFind(role, rl, "Path"c);
+            r.created  := XMLFind(role, rl, "CreateDate"c);
+            free(role, rl+1);
+        }
+    }
+    AWSResponseFree(resp);
+    return r;
+}
+
+pub fn IAMDeleteRole(client: IAMClient, roleName: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    var s: pchar := "Action=DeleteRole&Version=2010-05-08&RoleName="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(roleName); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(roleName,i)&0xFF);i:=i+1;} off:=off+n;
+    poke8(buf+off,0);
+    var resp: AWSResponse := iamSend(client, buf, off);
+    free(buf, 256);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+// ── Policies ─────────────────────────────────────────────────────────────────
+
+pub fn IAMListPolicies(client: IAMClient, scope: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    var s: pchar := "Action=ListPolicies&Version=2010-05-08"c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    if (scope != 0 as pchar && StrLen(scope) > 0) {
+        var sc: pchar := "&Scope="c; n:=StrLen(sc);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(sc,i)&0xFF);i:=i+1;} off:=off+n;
+        n:=StrLen(scope); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(scope,i)&0xFF);i:=i+1;} off:=off+n;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := iamSend(client, buf, off);
+    free(buf, 256);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn IAMAttachRolePolicy(client: IAMClient, roleName: pchar, policyArn: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=AttachRolePolicy&Version=2010-05-08&RoleName="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(roleName); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(roleName,i)&0xFF);i:=i+1;} off:=off+n;
+    var pa: pchar := "&PolicyArn="c; n:=StrLen(pa);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(pa,i)&0xFF);i:=i+1;} off:=off+n;
+    // URL-encode the ARN (colons)
+    n:=StrLen(policyArn); i:=0;
+    while(i<n){
+        var c: int64 := StrCharAt(policyArn,i)&0xFF;
+        if ((c>=65&&c<=90)||(c>=97&&c<=122)||(c>=48&&c<=57)||c==45||c==95||c==46||c==126||c==47) {
+            poke8(buf+off,c); off:=off+1;
+        } else {
+            poke8(buf+off,37);
+            poke8(buf+off+1,if((c>>4)<10){48+(c>>4)}else{87+(c>>4)});
+            poke8(buf+off+2,if((c&0xF)<10){48+(c&0xF)}else{87+(c&0xF)});
+            off:=off+3;
+        }
+        i:=i+1;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := iamSend(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn IAMDetachRolePolicy(client: IAMClient, roleName: pchar, policyArn: pchar): int64 {
+    var buf: int64 := alloc(512); var off: int64 := 0;
+    var s: pchar := "Action=DetachRolePolicy&Version=2010-05-08&RoleName="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(roleName); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(roleName,i)&0xFF);i:=i+1;} off:=off+n;
+    var pa: pchar := "&PolicyArn="c; n:=StrLen(pa);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(pa,i)&0xFF);i:=i+1;} off:=off+n;
+    n:=StrLen(policyArn); i:=0;
+    while(i<n){
+        var c: int64 := StrCharAt(policyArn,i)&0xFF;
+        if ((c>=65&&c<=90)||(c>=97&&c<=122)||(c>=48&&c<=57)||c==45||c==95||c==46||c==126||c==47) {
+            poke8(buf+off,c); off:=off+1;
+        } else {
+            poke8(buf+off,37);
+            poke8(buf+off+1,if((c>>4)<10){48+(c>>4)}else{87+(c>>4)});
+            poke8(buf+off+2,if((c&0xF)<10){48+(c&0xF)}else{87+(c&0xF)});
+            off:=off+3;
+        }
+        i:=i+1;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := iamSend(client, buf, off);
+    free(buf, 512);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+pub fn IAMCreateAccessKey(client: IAMClient, userName: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    var s: pchar := "Action=CreateAccessKey&Version=2010-05-08"c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    if (userName != 0 as pchar && StrLen(userName) > 0) {
+        var un: pchar := "&UserName="c; n:=StrLen(un);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(un,i)&0xFF);i:=i+1;} off:=off+n;
+        n:=StrLen(userName); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(userName,i)&0xFF);i:=i+1;} off:=off+n;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := iamSend(client, buf, off);
+    free(buf, 256);
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn IAMDeleteAccessKey(client: IAMClient, userName: pchar, keyId: pchar): int64 {
+    var buf: int64 := alloc(256); var off: int64 := 0;
+    var s: pchar := "Action=DeleteAccessKey&Version=2010-05-08&AccessKeyId="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    n:=StrLen(keyId); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(keyId,i)&0xFF);i:=i+1;} off:=off+n;
+    if (userName != 0 as pchar && StrLen(userName) > 0) {
+        var un: pchar := "&UserName="c; n:=StrLen(un);
+        i:=0; while(i<n){poke8(buf+off+i,StrCharAt(un,i)&0xFF);i:=i+1;} off:=off+n;
+        n:=StrLen(userName); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(userName,i)&0xFF);i:=i+1;} off:=off+n;
+    }
+    poke8(buf+off,0);
+    var resp: AWSResponse := iamSend(client, buf, off);
+    free(buf, 256);
+    var ok: int64 := 0; if (resp.statusCode == 200) { ok:=1; }
+    AWSResponseFree(resp);
+    return ok;
+}
+
+// ── STS Client ────────────────────────────────────────────────────────────────
+
+pub fn STSConnect(creds: AWSCreds, region: pchar): STSClient {
+    var c: STSClient;
+    c.creds  := creds;
+    c.region := region as int64;
+    c.host   := AWSEndpoint("sts"c, region) as int64;
+    return c;
+}
+
+pub fn STSClose(client: STSClient) {
+    AWSCredentialsFree(client.creds);
+    if (client.host != 0) { free(client.host, StrLen(client.host as pchar)+1); }
+}
+
+pub fn STSGetCallerIdentity(client: STSClient): int64 {
+    var body: pchar := "Action=GetCallerIdentity&Version=2011-06-15"c;
+    var resp: AWSResponse := stsSend(client, body as int64, StrLen(body));
+    var result: int64 := 0;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        result := resp.body; resp.body := 0;
+    }
+    AWSResponseFree(resp);
+    return result;
+}
+
+pub fn STSAssumeRole(client: STSClient, roleArn: pchar, sessionName: pchar,
+                     durationSec: int64): STSCredentials {
+    var buf: int64 := alloc(1024); var off: int64 := 0;
+    var s: pchar := "Action=AssumeRole&Version=2011-06-15&RoleArn="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    // URL-encode roleArn
+    n:=StrLen(roleArn); i:=0;
+    while(i<n){
+        var c: int64 := StrCharAt(roleArn,i)&0xFF;
+        if ((c>=65&&c<=90)||(c>=97&&c<=122)||(c>=48&&c<=57)||c==45||c==95||c==46||c==126||c==47) {
+            poke8(buf+off,c); off:=off+1;
+        } else {
+            poke8(buf+off,37);
+            poke8(buf+off+1,if((c>>4)<10){48+(c>>4)}else{87+(c>>4)});
+            poke8(buf+off+2,if((c&0xF)<10){48+(c&0xF)}else{87+(c&0xF)});
+            off:=off+3;
+        }
+        i:=i+1;
+    }
+    var sn: pchar := "&RoleSessionName="c; n:=StrLen(sn);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(sn,i)&0xFF);i:=i+1;} off:=off+n;
+    n:=StrLen(sessionName); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(sessionName,i)&0xFF);i:=i+1;} off:=off+n;
+    var dur: pchar := "&DurationSeconds="c; n:=StrLen(dur);
+    i:=0; while(i<n){poke8(buf+off+i,StrCharAt(dur,i)&0xFF);i:=i+1;} off:=off+n;
+    var tmp: int64 := alloc(24); Int64ToStr(durationSec, tmp as pchar);
+    n:=StrLen(tmp as pchar); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(tmp as pchar,i)&0xFF);i:=i+1;} off:=off+n;
+    free(tmp, 24);
+    poke8(buf+off,0);
+    var resp: AWSResponse := stsSend(client, buf, off);
+    free(buf, 1024);
+    var cred: STSCredentials;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        var credXml: int64 := XMLFind(resp.body, resp.bodyLen, "Credentials"c);
+        if (credXml != 0) {
+            var cl: int64 := StrLen(credXml as pchar);
+            cred.accessKeyId     := XMLFind(credXml, cl, "AccessKeyId"c);
+            cred.secretAccessKey := XMLFind(credXml, cl, "SecretAccessKey"c);
+            cred.sessionToken    := XMLFind(credXml, cl, "SessionToken"c);
+            cred.expiration      := XMLFind(credXml, cl, "Expiration"c);
+            free(credXml, cl+1);
+        }
+    }
+    AWSResponseFree(resp);
+    return cred;
+}
+
+pub fn STSGetSessionToken(client: STSClient, durationSec: int64): STSCredentials {
+    var buf: int64 := alloc(128); var off: int64 := 0;
+    var s: pchar := "Action=GetSessionToken&Version=2011-06-15&DurationSeconds="c;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0; while(i<n){poke8(buf+i,StrCharAt(s,i)&0xFF);i:=i+1;} off:=n;
+    var tmp: int64 := alloc(24); Int64ToStr(durationSec, tmp as pchar);
+    n:=StrLen(tmp as pchar); i:=0; while(i<n){poke8(buf+off+i,StrCharAt(tmp as pchar,i)&0xFF);i:=i+1;} off:=off+n;
+    free(tmp, 24);
+    poke8(buf+off,0);
+    var resp: AWSResponse := stsSend(client, buf, off);
+    free(buf, 128);
+    var cred: STSCredentials;
+    if (resp.statusCode == 200 && resp.body != 0) {
+        var credXml: int64 := XMLFind(resp.body, resp.bodyLen, "Credentials"c);
+        if (credXml != 0) {
+            var cl: int64 := StrLen(credXml as pchar);
+            cred.accessKeyId     := XMLFind(credXml, cl, "AccessKeyId"c);
+            cred.secretAccessKey := XMLFind(credXml, cl, "SecretAccessKey"c);
+            cred.sessionToken    := XMLFind(credXml, cl, "SessionToken"c);
+            cred.expiration      := XMLFind(credXml, cl, "Expiration"c);
+            free(credXml, cl+1);
+        }
+    }
+    AWSResponseFree(resp);
+    return cred;
+}

@@ -1,0 +1,357 @@
+// std/office/odf_doc.lyx — OFF-03: OdfDocument-Kern + SaveToFile
+
+unit std.office.odf_doc;
+
+import std.alloc;
+import std.string;
+import std.zip;
+import std.office.odf_xml;
+
+pub con ODF_TYPE_TEXT:        int64 := 1;
+pub con ODF_TYPE_SPREADSHEET: int64 := 2;
+pub con ODF_OK:  int64 := 0;
+pub con ODF_ERR: int64 := 0 - 1;
+
+con ODF_BUF_INIT: int64 := 8192;
+
+// ============================================================================
+// Interne String-Copy-Hilfsfunktion
+// ============================================================================
+
+fn odfCopyStr(dst: int64, dstPos: int64, src: pchar): int64 {
+  var slen: int64 := StrLen(src);
+  var i: int64 := 0;
+  while i < slen {
+    poke8(dst + dstPos + i, peek8(src as int64 + i));
+    i += 1;
+  }
+  return dstPos + slen;
+}
+
+// ============================================================================
+// OdfDocument
+// ============================================================================
+
+pub type OdfDocument = class {
+
+  pub docType: int64;
+
+  contentBuf:     int64;
+  contentLen:     int64;
+  contentCap:     int64;
+
+  autoStyleBuf:   int64;
+  autoStyleLen:   int64;
+  autoStyleCap:   int64;
+  autoStyleIdx:   int64;
+
+  // Deduplication cache: -1 = nicht angelegt
+  styleNone:      int64;
+  styleBold:      int64;
+  styleItalic:    int64;
+  styleBoldIt:    int64;
+
+  // ODS state
+  odsSheetOpen:   int64;
+  odsRowOpen:     int64;
+  odsCurRow:      int64;
+  odsCurCol:      int64;
+
+  // ── Puffer-Wachstum ────────────────────────────────────────────────────────
+
+  fn _growContent() {
+    var nc: int64 := self.contentCap * 2;
+    var nb: int64 := alloc(nc);
+    var i: int64 := 0;
+    while i < self.contentLen {
+      poke8(nb + i, peek8(self.contentBuf + i));
+      i += 1;
+    }
+    free(self.contentBuf, self.contentCap);
+    self.contentBuf := nb;
+    self.contentCap := nc;
+  }
+
+  fn _growAutoStyle() {
+    var nc: int64 := self.autoStyleCap * 2;
+    var nb: int64 := alloc(nc);
+    var i: int64 := 0;
+    while i < self.autoStyleLen {
+      poke8(nb + i, peek8(self.autoStyleBuf + i));
+      i += 1;
+    }
+    free(self.autoStyleBuf, self.autoStyleCap);
+    self.autoStyleBuf := nb;
+    self.autoStyleCap := nc;
+  }
+
+  // ── Append-Helfer ──────────────────────────────────────────────────────────
+
+  pub fn _appendContent(s: pchar) {
+    var slen: int64 := StrLen(s);
+    var i: int64 := 0;
+    while i < slen {
+      if self.contentLen + 1 >= self.contentCap { self._growContent(); }
+      poke8(self.contentBuf + self.contentLen, peek8(s as int64 + i));
+      self.contentLen += 1;
+      i += 1;
+    }
+  }
+
+  pub fn _appendContentRaw(src: int64, n: int64) {
+    var i: int64 := 0;
+    while i < n {
+      if self.contentLen + 1 >= self.contentCap { self._growContent(); }
+      poke8(self.contentBuf + self.contentLen, peek8(src + i));
+      self.contentLen += 1;
+      i += 1;
+    }
+  }
+
+  pub fn _appendAutoStyle(s: pchar) {
+    var slen: int64 := StrLen(s);
+    var i: int64 := 0;
+    while i < slen {
+      if self.autoStyleLen + 1 >= self.autoStyleCap { self._growAutoStyle(); }
+      poke8(self.autoStyleBuf + self.autoStyleLen, peek8(s as int64 + i));
+      self.autoStyleLen += 1;
+      i += 1;
+    }
+  }
+
+  pub fn _appendEscaped(src: pchar) {
+    var slen: int64 := StrLen(src);
+    var escCap: int64 := slen * 6 + 16;
+    var escBuf: int64 := alloc(escCap);
+    var escLen: int64 := odfEscapeInto(src as int64, escBuf, escCap);
+    self._appendContentRaw(escBuf, escLen);
+    free(escBuf, escCap);
+  }
+
+  pub fn _appendInt(n: int64) {
+    var tbuf: int64 := alloc(24);
+    Int64ToStr(n, tbuf);
+    self._appendContent(tbuf as pchar);
+    free(tbuf, 24);
+  }
+
+  // ── Auto-Style-Verwaltung ──────────────────────────────────────────────────
+
+  fn _newAutoStyle(bold: int64, italic: int64): int64 {
+    var idx: int64 := self.autoStyleIdx;
+    self.autoStyleIdx += 1;
+
+    var nbuf: int64 := alloc(8);
+    Int64ToStr(idx, nbuf);
+
+    self._appendAutoStyle("<style:style style:name=\"as"c);
+    self._appendAutoStyle(nbuf as pchar);
+    self._appendAutoStyle("\" style:family=\"text\"><style:text-properties"c);
+    if bold != 0 {
+      self._appendAutoStyle(" fo:font-weight=\"bold\""c);
+    }
+    if italic != 0 {
+      self._appendAutoStyle(" fo:font-style=\"italic\""c);
+    }
+    self._appendAutoStyle("/></style:style>\n"c);
+
+    free(nbuf, 8);
+    return idx;
+  }
+
+  pub fn _getOrCreateStyle(bold: int64, italic: int64): int64 {
+    if bold == 0 && italic == 0 {
+      if self.styleNone >= 0 { return self.styleNone; }
+      self.styleNone := self._newAutoStyle(0, 0);
+      return self.styleNone;
+    }
+    if bold != 0 && italic == 0 {
+      if self.styleBold >= 0 { return self.styleBold; }
+      self.styleBold := self._newAutoStyle(1, 0);
+      return self.styleBold;
+    }
+    if bold == 0 {
+      if self.styleItalic >= 0 { return self.styleItalic; }
+      self.styleItalic := self._newAutoStyle(0, 1);
+      return self.styleItalic;
+    }
+    if self.styleBoldIt >= 0 { return self.styleBoldIt; }
+    self.styleBoldIt := self._newAutoStyle(1, 1);
+    return self.styleBoldIt;
+  }
+
+  // ── Interne Bau-Funktionen ─────────────────────────────────────────────────
+
+  fn _buildManifest(outLen: int64): int64 {
+    var buf: int64 := alloc(2048);
+    var pos: int64 := 0;
+
+    pos := odfCopyStr(buf, pos, odfGetManifestHeader());
+
+    if self.docType == ODF_TYPE_TEXT {
+      pos := odfCopyStr(buf, pos, "<manifest:file-entry manifest:full-path=\"/\" manifest:media-type=\"application/vnd.oasis.opendocument.text\"/>\n"c);
+    } else {
+      pos := odfCopyStr(buf, pos, "<manifest:file-entry manifest:full-path=\"/\" manifest:media-type=\"application/vnd.oasis.opendocument.spreadsheet\"/>\n"c);
+    }
+    pos := odfCopyStr(buf, pos, "<manifest:file-entry manifest:full-path=\"content.xml\" manifest:media-type=\"text/xml\"/>\n"c);
+    pos := odfCopyStr(buf, pos, "<manifest:file-entry manifest:full-path=\"styles.xml\" manifest:media-type=\"text/xml\"/>\n"c);
+    pos := odfCopyStr(buf, pos, "<manifest:file-entry manifest:full-path=\"meta.xml\" manifest:media-type=\"text/xml\"/>\n"c);
+    pos := odfCopyStr(buf, pos, "<manifest:file-entry manifest:full-path=\"META-INF/manifest.xml\" manifest:media-type=\"text/xml\"/>\n"c);
+    pos := odfCopyStr(buf, pos, odfGetManifestFooter());
+
+    poke8(buf + pos, 0);
+    poke64(outLen, pos);
+    return buf;
+  }
+
+  fn _buildMeta(outLen: int64): int64 {
+    var buf: int64 := alloc(512);
+    var pos: int64 := 0;
+    pos := odfCopyStr(buf, pos, odfGetMetaHeader());
+    pos := odfCopyStr(buf, pos, odfGetMetaFooter());
+    poke8(buf + pos, 0);
+    poke64(outLen, pos);
+    return buf;
+  }
+
+  fn _buildContent(outLen: int64): int64 {
+    var hdr: pchar := 0 as pchar;
+    var bodyOpen: pchar := 0 as pchar;
+    var ftr: pchar := 0 as pchar;
+    if self.docType == ODF_TYPE_TEXT {
+      hdr      := odfGetContentOdtHeader();
+      bodyOpen := odfGetContentOdtBodyOpen();
+      ftr      := odfGetContentOdtFooter();
+    } else {
+      hdr      := odfGetContentOdsHeader();
+      bodyOpen := odfGetContentOdsBodyOpen();
+      ftr      := odfGetContentOdsFooter();
+    }
+
+    var hlen: int64 := StrLen(hdr);
+    var blen: int64 := StrLen(bodyOpen);
+    var flen: int64 := StrLen(ftr);
+
+    var total: int64 := hlen + self.autoStyleLen + blen + self.contentLen + flen + 16;
+    var buf: int64 := alloc(total);
+    var pos: int64 := 0;
+
+    pos := odfCopyStr(buf, pos, hdr);
+
+    var i: int64 := 0;
+    while i < self.autoStyleLen {
+      poke8(buf + pos, peek8(self.autoStyleBuf + i));
+      pos += 1;
+      i += 1;
+    }
+
+    pos := odfCopyStr(buf, pos, bodyOpen);
+
+    i := 0;
+    while i < self.contentLen {
+      poke8(buf + pos, peek8(self.contentBuf + i));
+      pos += 1;
+      i += 1;
+    }
+
+    pos := odfCopyStr(buf, pos, ftr);
+
+    poke8(buf + pos, 0);
+    poke64(outLen, pos);
+    return buf;
+  }
+
+  // ── Öffentliche API ────────────────────────────────────────────────────────
+
+  pub fn Init(docType: int64) {
+    self.docType      := docType;
+    self.contentBuf   := alloc(ODF_BUF_INIT);
+    self.contentLen   := 0;
+    self.contentCap   := ODF_BUF_INIT;
+    self.autoStyleBuf := alloc(ODF_BUF_INIT);
+    self.autoStyleLen := 0;
+    self.autoStyleCap := ODF_BUF_INIT;
+    self.autoStyleIdx := 0;
+    self.styleNone    := 0 - 1;
+    self.styleBold    := 0 - 1;
+    self.styleItalic  := 0 - 1;
+    self.styleBoldIt  := 0 - 1;
+    self.odsSheetOpen := 0;
+    self.odsRowOpen   := 0;
+    self.odsCurRow    := 0 - 1;
+    self.odsCurCol    := 0 - 1;
+  }
+
+  pub fn Close() {
+    if self.contentBuf != 0 {
+      free(self.contentBuf, self.contentCap);
+      self.contentBuf := 0;
+    }
+    if self.autoStyleBuf != 0 {
+      free(self.autoStyleBuf, self.autoStyleCap);
+      self.autoStyleBuf := 0;
+    }
+  }
+
+  pub fn SaveToFile(path: pchar): int64 {
+    // Offene ODS-Zeile / -Sheet schließen
+    if self.odsRowOpen != 0 {
+      self._appendContent("</table:table-row>\n"c);
+      self.odsRowOpen := 0;
+    }
+    if self.odsSheetOpen != 0 {
+      self._appendContent("</table:table>\n"c);
+      self.odsSheetOpen := 0;
+    }
+
+    // Puffer bauen
+    var cLenBuf: int64 := alloc(8);
+    var cBuf: int64 := self._buildContent(cLenBuf);
+    var cSize: int64 := peek64(cLenBuf);
+    free(cLenBuf, 8);
+
+    var mLenBuf: int64 := alloc(8);
+    var mBuf: int64 := self._buildMeta(mLenBuf);
+    var mSize: int64 := peek64(mLenBuf);
+    free(mLenBuf, 8);
+
+    var manifLenBuf: int64 := alloc(8);
+    var manifBuf: int64 := self._buildManifest(manifLenBuf);
+    var manifSize: int64 := peek64(manifLenBuf);
+    free(manifLenBuf, 8);
+
+    var stylesBuf: pchar := odfGetStylesXml();
+    var stylesSize: int64 := StrLen(stylesBuf);
+
+    var mimetype: pchar := 0 as pchar;
+    if self.docType == ODF_TYPE_TEXT {
+      mimetype := odfGetMimetypeText();
+    } else {
+      mimetype := odfGetMimetypeSpreadsheet();
+    }
+    var mimetypeSize: int64 := StrLen(mimetype);
+
+    // ZIP-Archiv: mimetype MUSS als erstes Element (STORE wegen < 64 Bytes)
+    var writer: int64 := ZipWriterNew();
+    ZipWriterAdd(writer, "mimetype"c as int64, mimetype as int64, mimetypeSize);
+    ZipWriterAdd(writer, "META-INF/manifest.xml"c as int64, manifBuf, manifSize);
+    ZipWriterAdd(writer, "content.xml"c as int64, cBuf, cSize);
+    ZipWriterAdd(writer, "styles.xml"c as int64, stylesBuf as int64, stylesSize);
+    ZipWriterAdd(writer, "meta.xml"c as int64, mBuf, mSize);
+
+    var rc: int64 := ZipWriterSaveStore(writer, path as int64);
+    ZipWriterFree(writer);
+
+    // Temporäre Puffer freigeben (mit Allokationsgröße)
+    var cTotal: int64 := cSize + 32;
+    var mTotal: int64 := 512;
+    var manifTotal: int64 := 2048;
+    free(cBuf, cTotal);
+    free(mBuf, mTotal);
+    free(manifBuf, manifTotal);
+
+    if rc != 0 { return ODF_ERR; }
+    return ODF_OK;
+  }
+
+}
