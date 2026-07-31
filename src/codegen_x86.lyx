@@ -571,6 +571,12 @@ pub type Codegen = class {
   deferCount: int64;
   deferCap:   int64;
 
+  // Verschachtelte fn-Deklarationen, die nach der äußeren Funktion emittiert
+  // werden. Inline emittiert liefe die äußere Funktion in den Rumpf hinein.
+  nestedBuf:   int64;
+  nestedCount: int64;
+  nestedCap:   int64;
+
   // WP-04: set to 1 when current function has a [T, T] tuple return type
   funcHasTupleReturn: int64;
 
@@ -8399,9 +8405,12 @@ pub type Codegen = class {
     var stmt: int64 := self.cg_nc0(ni);
     while (stmt != -1) {
       var sk: int64 := self.cg_nkind(stmt);
-      // WP-13: Nested function declaration inside a block - generate as closure
+      // WP-13: verschachtelte fn-Deklaration. NICHT hier emittieren — der Rumpf
+      // landete sonst mitten im Instruktionsstrom der äußeren Funktion, die
+      // anschließend hineinfällt (der Grund für den SIGSEGV). Stattdessen
+      // vormerken und nach der äußeren Funktion emittieren.
       if (sk == CGN_FUNC_DECL) {
-        self.cg_genNestedFunc(stmt);
+        self.cg_addPendingNested(stmt);
       } else {
         self.cg_genStmt(stmt);
       }
@@ -9308,6 +9317,19 @@ pub type Codegen = class {
     return 4;  // levels 3 and 4
   }
 
+  // Verschachtelte fn-Deklaration für spätere Emission vormerken.
+  fn cg_addPendingNested(ni: int64) {
+    if (self.nestedCount >= self.nestedCap) {
+      var nc: int64 := self.nestedCap * 2;
+      var nb: int64 := alloc(nc * 8);
+      memcpy(nb, self.nestedBuf, self.nestedCount * 8);
+      self.nestedBuf := nb;
+      self.nestedCap := nc;
+    }
+    poke64(self.nestedBuf + self.nestedCount * 8, ni);
+    self.nestedCount += 1;
+  }
+
   fn cg_genFuncDecl(ni: int64) {
     // Register label for this function
     var fname: pchar := self.cg_nsval(ni);
@@ -9437,6 +9459,26 @@ pub type Codegen = class {
     // Restore outer function context
     self.outerFuncName := savedOuterName;
     self.outerFuncNameLen := savedOuterLen;
+
+    // Vorgemerkte verschachtelte Funktionen jetzt emittieren — NACH der äußeren,
+    // damit deren Instruktionsstrom nicht in sie hineinläuft.
+    //
+    // Die Liste wird zuerst kopiert und geleert: cg_genFuncDecl ruft sich für den
+    // Rumpf rekursiv wieder hier hinein und meldet dort ggf. eigene verschachtelte
+    // Funktionen an (fn in fn). Ohne die Kopie würde man über einen Puffer
+    // iterieren, der sich unter einem verändert.
+    if (self.nestedCount > 0) {
+      var cnt: int64 := self.nestedCount;
+      var snap: int64 := alloc(cnt * 8);
+      memcpy(snap, self.nestedBuf, cnt * 8);
+      self.nestedCount := 0;
+      var i: int64 := 0;
+      while (i < cnt) {
+        self.cg_genFuncDecl(peek64(snap + i * 8));
+        i += 1;
+      }
+      free(snap, cnt * 8);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -10860,6 +10902,9 @@ pub type Codegen = class {
     // WP-AS-10: defer buffer
     self.deferCap   := 64;
     self.deferBuf   := alloc(self.deferCap * 8);
+    self.nestedCap   := 64;
+    self.nestedBuf   := alloc(self.nestedCap * 8);
+    self.nestedCount := 0;
     self.deferCount := 0;
 
     self.includePath := 0;
