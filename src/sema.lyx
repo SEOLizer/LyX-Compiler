@@ -397,6 +397,11 @@ pub type Sema = class {
   // 0 = User-Code. Unbekannte FFI (FFI_CLASS_UNKNOWN) ist nur in User-Code
   // fail-closed (erfordert @capabilities) — std-Bindings (571 Externs) bleiben erlaubt.
   ffiTrusted: int64;
+  // Symbolanzahl nach Pass1 = Wasserzeichen der globalen Symbole. Alles darüber
+  // ist Funktions-lokal und damit für eine verschachtelte Funktion tabu.
+  globalSymCount: int64;
+  // Symbolanzahl beim Betreten einer verschachtelten fn; -1 = nicht in einer.
+  nestedBarrier: int64;
   // Vom Treiber gesetzt: 1, wenn das Root-Modul selbst eine stdlib-Unit ist
   // (--compile-unit auf einer Datei im stdlib-Baum). Siehe Check().
   unitTrusted: int64;
@@ -1325,6 +1330,14 @@ pub type Sema = class {
       var si: int64 := self.Lookup(nm, nl);
       if (si < 0) {
         self._errorNodeName("undefined symbol", ni, nm, nl);
+      } else if (self.nestedBarrier >= 0) {
+        // Verschachtelte Funktionen haben keinen Zugriff auf die Locals der
+        // umgebenden Funktion: sie werden als gewöhnliche Funktionen emittiert
+        // und bekommen keinen Static Link. Vorher lief das still falsch — der
+        // Wert kam schlicht als 0 an. Lieber laut abbrechen als falsch rechnen.
+        if (si >= self.globalSymCount && si < self.nestedBarrier) {
+          self._errorNodeName("verschachtelte Funktion darf keine lokale Variable der umgebenden Funktion verwenden", ni, nm, nl);
+        }
       }
 
     } else if (k == SNK_CALL) {
@@ -1579,9 +1592,32 @@ pub type Sema = class {
 
     if (k == SNK_BLOCK) {
       self._pushScope();
+      // Verschachtelte `fn`-Deklarationen VOR den übrigen Statements registrieren.
+      // NestedFnDecl steht in der EBNF, aber Pass1 läuft nur über die oberste
+      // Ebene — der Name war deshalb nie in der Symboltabelle und jeder Aufruf
+      // scheiterte an "undefined function". Vorab registrieren heißt zugleich:
+      // Aufrufe vor der Deklaration und gegenseitige Aufrufe funktionieren.
+      var pre: int64 := self.sn_c0(ni);
+      while (pre >= 0) {
+        if (self.sn_kind(pre) == SNK_FUNC_DECL) {
+          self._pushSym(self.sn_sVal(pre), self.sn_sLen(pre), SYM_FUNC, TY_VOID, pre);
+        }
+        pre := self.sn_next(pre);
+      }
       var s: int64 := self.sn_c0(ni);
       while (s >= 0) { self._checkStmt(s); s := self.sn_next(s); }
       self._popScope();
+
+    } else if (k == SNK_FUNC_DECL) {
+      // Verschachtelte Funktion: Rumpf prüfen. Vorher übersprang sema ihn ganz,
+      // Fehler darin fielen erst im Codegen auf ("no codegen implementation").
+      // `nestedBarrier` markiert die Symbolgrenze: alles, was oberhalb der
+      // globalen Symbole und unterhalb dieser Marke liegt, ist ein Local der
+      // umgebenden Funktion und für die verschachtelte tabu.
+      var savedBarrier: int64 := self.nestedBarrier;
+      self.nestedBarrier := self.symCount;
+      self._checkFuncDecl(ni);
+      self.nestedBarrier := savedBarrier;
 
     } else if (k == SNK_ASM) {
       // WSP-05: Inline-Assembly — Mnemonic-Strings, keine sema-Prüfung (Codegen validiert).
@@ -3889,6 +3925,8 @@ pub type Sema = class {
     self.classCapNode := -1;
     self.curFile     := 0 as pchar;
     self.ffiTrusted  := 0;   // Root/User-Modul ist NICHT vertrauenswürdig (fail-closed)
+    self.globalSymCount := 0;
+    self.nestedBarrier  := 0 - 1;
     self.unitTrusted := 0;   // vom Treiber nach Init() gesetzt; Check() übernimmt es
 
     // WP-10e: import dedup table
@@ -3970,6 +4008,7 @@ pub type Sema = class {
     self._collectParentCaps(head);
 
     self.Pass1(head);
+    self.globalSymCount := self.symCount;   // ab hier: Funktions-lokale Symbole
     self.Pass2(head);
     self._checkCapabilityInheritance(head);  // WP-L3
     self._buildCapGraph(head, "<root>"c, 6); // WP-L4

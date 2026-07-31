@@ -143,6 +143,14 @@ test: lyxc
 	@echo "--- Statischer Methodenaufruf TypeName.Method() (7 tests) ---"
 	@bash tests/static_method_call_test.sh
 	@echo "OK"
+	@echo "--- Verschachtelte Funktionen (8 Prüfungen) ---"
+	./lyxc --std-path=std tests/nested_fn_test.lyx -o /tmp/lyxc_nfn_test
+	@/tmp/lyxc_nfn_test > /dev/null
+	@rm -f /tmp/lyxc_nfn_test
+	@echo "OK"
+	@echo "--- Verschachtelte Funktionen: Capture-Grenze (7 tests) ---"
+	@bash tests/nested_fn_capture_test.sh
+	@echo "OK"
 	@echo "--- Methodenaufruf auf Aufruf-Ergebnis (13 Prüfungen) ---"
 	./lyxc --std-path=std tests/method_result_dispatch_test.lyx -o /tmp/lyxc_mrd_test
 	@/tmp/lyxc_mrd_test > /dev/null
