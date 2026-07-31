@@ -20,7 +20,11 @@ HexDigit            = Digit | "A"…"F" | "a"…"f" ;
 BinaryDigit         = "0" | "1" ;
 OctalDigit          = "0"…"7" ;
 
-Ident               = Letter { Letter | Digit } ;
+Ident               = ( Letter | "_" ) { Letter | Digit | "_" } ;
+
+(* Der Unterstrich fehlte hier, obwohl er ueberall verwendet wird -- auch
+   fuehrend (`_thrCtl`, `cg_genCall`). Geprueft: `my_var`, `_x` und `x1` sind
+   gueltig, `1x` nicht. *)
 
 DecimalLiteral      = Digit { Digit | "_" } ;
 
@@ -41,6 +45,10 @@ IntLiteral          = DecimalLiteral
 FloatLiteral        = Digit { Digit | "_" }
                       "."
                       Digit { Digit | "_" } ;
+
+(* Der Ziffern-Trenner ist hier zwar erlaubt, wird bei Fliesskommazahlen aber
+   falsch umgesetzt: `3.14_159` liefert einen abweichenden Wert. Bei
+   Ganzzahlen funktioniert er. Siehe 20.1 und Issue #1011. *)
 
 StringLiteral       = '"'
                       { StringChar | EscapeSequence }
@@ -130,6 +138,10 @@ range wraps defer
 ```
 
 Soft keywords are tokenized as identifiers and interpreted contextually by the parser.
+
+ACHTUNG: `defer` laeuft in einem inneren Block am Funktionsende statt am
+Blockende, und `range(N)` iteriert nicht. Siehe 20.1 sowie die Issues #1006
+und #1007.
 
 ```text
 "defer" is recognized as DeferStmt only when an identifier token with text "defer"
@@ -297,9 +309,19 @@ ExternFnDecl        = [ "@cap" "(" CapabilityPath ")" ]
    relocatable Objekt (`--emit=obj`); ohne Objektmodus ist es ein Compile-Fehler. *)
 ExternDataDecl      = "extern" StringLiteral Ident ":" Type ";" ;
 
-TypeParamClause     = "[" TypeParamList "]" ;
+TypeParamClause     = "<" TypeParamList ">" ;
 
 TypeParamList       = Ident { "," Ident } ;
+
+(* Die eckige Form `[T]` stand hier frueher und war nie gueltig -- der Parser
+   erwartet spitze Klammern. `tests/generics_monomorph_test.lyx` folgte der
+   alten Angabe und scheiterte deshalb.
+
+   Auch mit `<T>` ist das Feature nicht nutzbar: die Deklaration parst, die
+   Semantikpruefung loest den Typparameter aber nicht auf
+   ("unknown param type"). Generische TYPEN (`type P<T> = struct {...}`)
+   werden ueberhaupt nicht angenommen -- TypeParamClause steht daher nur an
+   Funktionen, nicht an Typdeklarationen. Siehe 20.1 und Issue #1009. *)
 
 ParamList           = Param { "," Param } ;
 
@@ -729,6 +751,9 @@ IdentPattern        = Ident ;
 
 EnumPattern         = Ident "." Ident ;   (* z. B. Color.Green *)
 
+(* ACHTUNG: keines der hier beschriebenen Patterns ist derzeit erreichbar --
+   `match` laesst sich gar nicht verwenden. Siehe 20.1 und Issue #1008. *)
+
 WildcardPattern     = "_" ;
 
 TuplePattern        = "(" Pattern "," Pattern { "," Pattern } ")" ;
@@ -1104,11 +1129,23 @@ Stellen, an denen der Parser mehr annimmt, als der Rest der Werkzeugkette
 tragen kann. Sie sind hier festgehalten, damit die Grammatik nicht mehr
 verspricht, als eingeloest wird.
 
-| Konstrukt | Verhalten |
-|---|---|
-| `var f: fn(int64): int64 := g;` | Uebersetzt fehlerfrei, das erzeugte Programm stuerzt beim Aufruf ab. Kanonisch ist der Typalias (`type Cb = fn(int64): int64;`). |
-| `Set<T>` | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
-| Methodenzeiger-Bindung | `feld := obj.Method` ist als Grammatik vorhanden; Teile der Bindung sind derzeit nicht funktionsfaehig (siehe `tests/method_ptr_test.sh`). |
+Der Stand ist aus der Testinventur zu Issue #1004 hervorgegangen; die
+Einzelbefunde sind dort verlinkt.
+
+| Konstrukt | Abschnitt | Verhalten |
+|---|---|---|
+| `match` / `case` | 14 | **Nicht nutzbar.** Der Parser verlangt `case`, kommt danach aber weder mit einem Literal noch mit einem Bezeichner noch mit `Enum.Member` zurecht. Keines der in 14 beschriebenen Patterns ist erreichbar; `match` wird im gesamten Projekt nirgends verwendet. (#1008) |
+| `fn f<T>(...)` | 6, 7 | Parst, die Semantikpruefung loest den Typparameter nicht auf (`unknown param type`). Monomorphisierung ist in sema angelegt, der Weg vom Parameter zum Typ fehlt. Generische TYPEN werden gar nicht angenommen. Bis zu dieser Fassung nannte die Grammatik ausserdem die eckige Form `[T]`, die nie gueltig war. (#1009) |
+| `range(N)` | 2.2 | Uebersetzt, iteriert aber nicht: `for i in range(5)` summiert zu 0, an anderer Stelle zu Datenmuell. (#1007) |
+| `defer` im inneren Block | 2.2 | Laeuft am **Funktionsende** statt am Blockende. Auf Funktionsebene korrekt. (#1006) |
+| Unterstrich im Float-Literal | 1 | `FloatLiteral` erlaubt `_` ausdruecklich; `3.14_159` uebersetzt, liefert aber einen falschen Wert. Bei Ganzzahlen funktioniert der Trenner. (#1011) |
+| `var f: fn(int64): int64 := g;` | 7 | Uebersetzt fehlerfrei, das erzeugte Programm stuerzt beim Aufruf ab. Kanonisch ist der Typalias (`type Cb = fn(int64): int64;`). (#1003) |
+| `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
+
+Nicht mehr betroffen: die Bindung von Methodenzeigern (`feld := obj.Method`)
+war bis PR #1005 abgewiesen, weil die Existenzpruefung fuer Feldnamen nur die
+Felder einer Klasse durchsuchte und nicht ihre Methoden. Sie funktioniert
+wieder und ist durch `tests/method_ptr_test.sh` abgedeckt.
 
 ---
 
