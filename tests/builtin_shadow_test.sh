@@ -59,9 +59,6 @@ sema = open(os.path.join(root, "src/sema.lyx"), encoding="utf-8").read()
 builtin_fn  = set(re.findall(r'_regBuiltin\("([^"]+)"\)', sema))
 builtin_con = set(re.findall(r'_regBuiltinCon\("([^"]+)"\)', sema))
 
-# Historische Sicherungskopien, nicht im Makefile referenziert.
-DEAD = ("lyxc_backup", "lyxc_original", "lyxc_stage1", "lyxc_test")
-
 pub_fn, pub_con = {}, {}
 for sub in ("std", "src"):
     for dp, _, fns in os.walk(os.path.join(root, sub)):
@@ -69,8 +66,6 @@ for sub in ("std", "src"):
             if not fn.endswith(".lyx"):
                 continue
             p = os.path.join(dp, fn)
-            if any(d in p for d in DEAD):
-                continue
             rel = os.path.relpath(p, root)
             txt = open(p, encoding="utf-8").read()
             for m in re.finditer(r'^\s*pub\s+fn\s+(\w+)', txt, re.M):

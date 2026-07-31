@@ -1,6 +1,6 @@
 # Nicht kompilierbare Beispiele (Stand 2026-07-31, lyxc 1.0.9A)
 
-**336 von 342 Beispielen übersetzen** (Ausgangslage: 256).
+**336 von 341 Beispielen übersetzen** (Ausgangslage: 256 von 342).
 
 ## Wie geprüft wird
 
@@ -23,11 +23,15 @@ Dateikopf absucht, meldet sechs Bibliotheken fälschlich als kaputt.
 | `examples/syntax_highlight_examples/case_switch.lyx` | dito |
 | `examples/syntax_highlight_examples/consts.lyx` | dito |
 
-## Verbleibend: eines
+## Verbleibend: keines
 
-| Beispiel | Fehler | Bewertung |
-|---|---|---|
-| `examples/io/mmap/main_with_mmap.lyx` | `sema error (line 1): Modul nicht gefunden … 'myunit'` | Wortgleiches, aber kaputtes Duplikat von `examples/units/main_with_unit.lyx`: es nutzt qualifizierten Zugriff (`myunit.call_ioctl()`, den es nicht gibt) und liegt in einem Verzeichnis ohne `myunit`-Geschwisterdatei. Demonstriert außerdem nichts zu mmap. Kandidat zum Löschen — nicht ohne Rückfrage entfernt. |
+`examples/io/mmap/main_with_mmap.lyx` ist entfernt. Es war ein wortgleiches, aber
+kaputtes Duplikat von `examples/units/main_with_unit.lyx`: qualifizierter Zugriff
+(`myunit.call_ioctl()`, den es in Lyx nicht gibt) und ein Import auf eine Unit,
+die nicht im selben Verzeichnis lag. Zu mmap zeigte es nichts. Das Verzeichnis
+`examples/io/mmap/` enthielt sonst nichts und ist mit entfallen.
+
+Damit übersetzen alle Beispiele, die übersetzen sollen.
 
 ## Was in dieser Runde behoben wurde
 

@@ -41,16 +41,12 @@ def args_of(s, idx):
             cur += ch
     return args
 
-# Historische Sicherungskopien, nicht im Makefile referenziert.
-DEAD = ('lyxc_backup', 'lyxc_original', 'lyxc_stage1', 'lyxc_test')
-
 bad = []
 for sub in ('src', 'std'):
     for dp, _, fns in os.walk(os.path.join(root, sub)):
         for fn in fns:
             if not fn.endswith('.lyx'): continue
             p = os.path.join(dp, fn)
-            if any(d in p for d in DEAD): continue
             rel = os.path.relpath(p, root)
             with open(p, encoding='utf-8') as fh:
                 for i, line in enumerate(fh):
