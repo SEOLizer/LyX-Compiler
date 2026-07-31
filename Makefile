@@ -143,6 +143,9 @@ test: lyxc
 	@echo "--- Statischer Methodenaufruf TypeName.Method() (7 tests) ---"
 	@bash tests/static_method_call_test.sh
 	@echo "OK"
+	@echo "--- Import auf fehlendes Modul (6 tests) ---"
+	@bash tests/dangling_import_test.sh
+	@echo "OK"
 	@echo "--- Verschachtelte Funktionen (8 Prüfungen) ---"
 	./lyxc --std-path=std tests/nested_fn_test.lyx -o /tmp/lyxc_nfn_test
 	@/tmp/lyxc_nfn_test > /dev/null
