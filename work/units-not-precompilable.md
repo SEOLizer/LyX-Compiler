@@ -1,37 +1,50 @@
-# Nicht vorkompilierbare Units (Stand 2026-07-31, lyxc 1.0.9A)
+# Unit-Übersetzbarkeit (Stand 2026-07-31, lyxc 1.0.9A)
 
-**388 von 390 Units übersetzen.** Ausgangslage war 302 von 390.
-
-Es verbleiben zwei — beide brauchen eine Entscheidung, keine Reparatur:
-
-| Unit | Fehler | Was zu klären ist |
-|------|--------|-------------------|
-| `std/cloud/ec2.lyx` | verschachtelte Funktion darf keine lokale Variable der umgebenden Funktion verwenden (`buf`, Zeile 137) | Die Helfer `ap`/`apc`/`apN` **mutieren** `buf` und `off` der umgebenden Funktion. Verschachtelte Funktionen bekommen keinen Static Link, ein Lesen liefe still ins Leere — deshalb lehnt sema es ab. Umbau: Cursor als Parameter (Zeiger auf ein 2-Slot-Feld mit `buf` und `off`), oder die Helfer auf Unit-Ebene ziehen. |
-| `std/net/ssh.lyx` | extern fn mit OS-Zugriff erfordert `@capabilities([...])` (Zeile 56) | Sicherheits-Policy. Entweder die Unit annotieren, oder — wie bei `std.process` geschehen — auf Compiler-Builtins umstellen, sodass gar kein OS-Klassen-Extern nötig ist. |
+**390 von 390 Unit-Quellen übersetzen.** Diese Datei hielt die Ausnahmen fest;
+es gibt derzeit keine mehr.
 
 ## Verlauf
 
 | Stand | übersetzbar | offen |
 |---|---:|---:|
 | Sitzungsbeginn | 302 | 88 |
-| nach Keyword-Umbenennungen (#971) | 315 | 75 |
-| nach Syntax + Imports (#972) | 352 | 38 |
-| nach verschachtelten Funktionen (#974) | 361 | 29 |
-| nach `do` → `digitalocean` (#975) | 374 | 16 |
-| nach den mechanischen Resten | **388** | **2** |
+| Keyword-Kollisionen (#971) | 315 | 75 |
+| nicht existierende Syntax, Imports, Builtin-Namen (#972) | 352 | 38 |
+| verschachtelte Funktionen fertiggebaut (#974) | 361 | 29 |
+| `do` → `digitalocean` (#975) | 374 | 16 |
+| falsche Namen, Sichtbarkeit, Reste (#976) | 388 | 2 |
+| `ec2` Cursor-Umbau, `ssh` Capability | **390** | **0** |
 
-## Sweep-Abdeckung
+## Wo die Fehler herkamen
 
-`test_compile_units.sh` lief bis 2026-07-31 nur über `"$STD_DIR"/*.lyx` — die
-oberste Ebene. Genau deshalb blieben die 88 so lange unsichtbar: der Sweep
-meldete 92 OK / 0 failed, während ein Viertel der stdlib nie geprüft wurde.
+Nichts davon war ein Compiler-Fehler im engeren Sinn — mit einer Ausnahme
+(verschachtelte Funktionen, #973/#974). Der Rest waren Unit-Quellen, die nie
+übersetzt wurden und deshalb Syntax und Namen benutzten, die es nicht gibt:
 
-Er läuft jetzt **rekursiv** über `std/` und `data/` (390 Quellen, 388 OK) und
-kennt zwei Wächter:
+- reservierte Wörter als Bezeichner (`match`, `do`, `to`, `pool`, `unit`, `i8`)
+- Konstrukte, die Lyx nicht hat: Struct-Literale, `if` als Ausdruck,
+  `import … as`, `pub use`
+- falsch geschriebene Funktionen (`int64ToStr`, `Open`, `MmapAnon`,
+  `sys_munmap`, `read_raw`) und fehlende Imports
+- ein fehlendes Semikolon nach `extern fn`, das die folgenden `pub con`
+  verschluckte
 
-- ein **neuer** Fehlschlag färbt den Lauf rot
-- eine Unit aus `KNOWN_FAILURES`, die wieder übersetzt, wird als `[FIXED]`
-  gemeldet und färbt den Lauf ebenfalls rot — damit die Liste nicht
-  stillschweigend veraltet
+## Was den Zustand so lange verdeckt hat
 
-Die beiden Einträge oben stehen in `KNOWN_FAILURES` im Skript, jeweils mit Grund.
+`test_compile_units.sh` lief über `"$STD_DIR"/*.lyx` — nur die oberste Ebene.
+Er meldete 92 OK / 0 failed, während ein Viertel der stdlib nie geprüft wurde.
+Seit #977 läuft er rekursiv über `std/` und `data/` und kennt zwei Wächter: ein
+neuer Fehlschlag färbt rot, und eine Unit aus `KNOWN_FAILURES`, die wieder
+übersetzt, ebenfalls — damit die Liste nicht still verrottet. `KNOWN_FAILURES`
+ist derzeit leer.
+
+## Zwei Details, die man wiederfinden will
+
+- **`@cap(pfad)` statt `@capabilities([...])` bei `extern fn`.** Der Parser hängt
+  `@capabilities` als Geschwisterknoten vor die Deklaration; sema liest die
+  Annotation aber aus `c2`. Nur `@cap(...)` schreibt dorthin. Bei einem
+  OS-Klassen-Extern ist `@capabilities([...])` also wirkungslos — siehe
+  `std/net/ssh.lyx` und `std/net/dns.lyx`.
+- **Verschachtelte Funktionen sehen die Locals der umgebenden Funktion nicht.**
+  Wer einen Cursor braucht, gibt ihn durch: `xxAppend(buf, off, s): int64` mit
+  neuem Offset als Rückgabewert, wie in `lambda`, `cloudwatch` und jetzt `ec2`.
