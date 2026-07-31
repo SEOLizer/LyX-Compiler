@@ -2,6 +2,23 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler (sema) — sechs Phantom-Builtins entfernt
+- sema registrierte `PrintStrLn`, `PrintIntLn`, `StrCmp`, `StrNCmp`, `StrToInt`
+  und `StrToFloat` als Builtins, **die kein Backend implementiert**. Ein Aufruf
+  ohne passenden Import bestand sema und starb erst im Codegen mit
+  `no codegen implementation found` — an der Aufrufstelle, ohne Hinweis auf den
+  fehlenden Import.
+- Registrierungen entfernt. Der Fehler kommt jetzt aus sema
+  (`undefined function`), mit Import funktionieren die Funktionen normal.
+- **Verdeckte einen echten Fehler**: `std/db/sqlite.lyx` rief `StrCmp` ohne
+  `import std.string` auf und galt trotzdem als übersetzbar. Import ergänzt.
+- `StrToInt` in `std/string.lyx` implementiert (es gab zwei Aufrufer in
+  `lpm/registry/`); `StrNCmp` und `StrToFloat` haben keine Aufrufer und bleiben
+  ohne Implementierung — wer sie braucht, ergänzt eine Bibliotheksfunktion.
+- Neuer Test `tests/no_phantom_builtins_test.sh` (10 Prüfungen), in `make test`:
+  alle sechs Namen müssen **von sema** abgelehnt werden (nicht vom Codegen), und
+  die vier vorhandenen Funktionen müssen mit Import laufen.
+
 ### Compiler (sema) — Import auf ein fehlendes Modul meldet jetzt einen Fehler (#978)
 - `_sema_processImport` kehrte kommentarlos zurück, wenn weder `.lyx` noch der
   `.lyu`-Fallback gefunden wurde. Der Import verschwand, und der Fehler tauchte
