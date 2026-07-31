@@ -3,12 +3,12 @@
 //
 // Thread creation:  sys_clone(CLONE_VM|...) — shares address space.
 //                   Child calls the function via _indirect_call_1(func, arg).
-// Thread join:      CLONE_CHILD_CLEARTID: kernel zeroes tidSlot and wakes futex
-//                   when the thread exits.
-// Mutex:            futex-based spin+sleep; 32-bit word at mutex.ptr (mmap'd).
+// Thread join:      CLONE_PARENT_SETTID schreibt die TID synchron, bevor clone
+//                   zurueckkehrt; CLONE_CHILD_CLEARTID nullt denselben Slot beim
+//                   Thread-Ende und weckt den futex.
+// Mutex:            futex-basiert, Zustandswechsel per atomic_cas/xchg.
 // Condition var:    futex on a sequence counter at cond.ptr (mmap'd).
-// Atomics:          best-effort (no lock cmpxchg builtin yet; race window tiny
-//                   on x86-64 due to naturally atomic aligned 64-bit stores).
+// Atomics:          echte lock-Instruktionen ueber die atomic_*-Builtins.
 // TLS:              global mmap table, tid → slot → key values (Option A).
 
 @description("Thread creation and synchronization via clone(2) + futex(2)")
@@ -28,9 +28,17 @@ con CLONE_THREAD:         int64 := 65536;
 con CLONE_SYSVSEM:        int64 := 262144;
 con CLONE_CHILD_SETTID:   int64 := 16777216;
 con CLONE_CHILD_CLEARTID: int64 := 2097152;
+con CLONE_PARENT_SETTID:  int64 := 1048576;
 
-// THREAD_FLAGS = VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTID|CLEARTID
-con THREAD_FLAGS: int64 := 19205888;
+// THREAD_FLAGS = VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|CHILD_CLEARTID
+//
+// PARENT_SETTID statt CHILD_SETTID: CHILD_SETTID schreibt die TID erst, wenn der
+// Kindthread zum ersten Mal laeuft. Der Elternprozess las den Slot direkt nach
+// clone und fand dort noch die 0, mit der er ihn selbst vorbelegt hatte --
+// ThreadJoin hielt den Thread damit fuer bereits beendet, kehrte sofort zurueck
+// und gab den TID-Slot frei, waehrend der Kindthread gerade erst startete.
+// PARENT_SETTID schreibt die TID synchron, bevor clone zurueckkehrt.
+con THREAD_FLAGS: int64 := 3477248;
 
 con THREAD_STACK_SIZE: int64 := 2097152;  // 2 MB per thread
 
@@ -65,6 +73,7 @@ con FUTEX_WAKE_ALL: int64 := 2147483647;  // INT_MAX
 pub type Thread = struct {
   handle: int64;   // ptr to mmap'd 32-bit TID slot; 0 = invalid
   tid:    int64;   // TID as returned by clone() in parent
+  stack:  int64;   // Basis des Kind-Stacks; von ThreadJoin freigegeben
 };
 
 // Mutex: futex on a mmap'd 32-bit word.
@@ -97,37 +106,101 @@ pub type Atomic = struct {
 // Thread creation and management
 // ============================================================================
 
+// Handoff-Block fuer die Uebergabe an den Kindthread:
+//   [0] func   [8] arg   [16] uebernommen-Flag   [24] Spawn-Lock
+//
+// clone(2) setzt im Kind nur RSP, RBP bleibt unveraendert -- der Kindthread
+// sieht also zunaechst den Frame des Elternteils. Die fruehere Fassung nutzte
+// das aus und las 'func' und 'arg' direkt daraus. Das ist ueber die MAPPING-
+// Frage hinaus falsch: CLONE_VM garantiert den geteilten Adressraum, nicht die
+// LEBENSDAUER des Frames. Sobald ThreadCreate zurueckkehrte, wurde genau dieser
+// Speicher wiederverwendet -- schon ein direkt folgendes ThreadJoin genuegte --
+// und der Kindthread sprang auf einen ueberschriebenen Funktionszeiger.
+// Ohne Frame-Wiederverwendung lief es zufaellig durch, mit Join segfaultete es.
+//
+// Jetzt liegen func und arg in diesem Heap-Block, und der Kindthread springt
+// zuerst in _thrTrampoline: dessen Prologue legt einen eigenen Frame auf dem
+// KIND-Stack an, ab da sind Locals dort sicher. Der Elternteil kehrt erst
+// zurueck, wenn der Kindthread die Werte uebernommen hat.
+pub var _thrCtl: int64;
+
+fn _thrCtlEnsure(): int64 {
+  if (_thrCtl == 0) { _thrCtl := alloc(32); }
+  return _thrCtl;
+}
+
+// Laeuft bereits mit eigenem Frame auf dem Kind-Stack.
+fn _thrTrampoline(unused: int64): int64 {
+  var c: int64 := _thrCtl;
+  var f: int64 := peek64(c);
+  var g: int64 := peek64(c + 8);
+  var taken: int64 := atomic_store(c + 16, 1);   // Elternteil freigeben
+  _indirect_call_1(f, g);
+  return 0;
+}
+
 // ThreadCreate: spawns a new thread that calls func(arg).
 // Returns a Thread; handle == 0 on allocation failure.
-// RBP remains unchanged by clone(2), so 'func' and 'arg' (stored as
-// RBP-relative locals by the Lyx codegen) are readable in the child too
-// because CLONE_VM guarantees a shared address space.
 pub fn ThreadCreate(func: int64, arg: int64): Thread {
   var t: Thread;
   t.handle := 0;
   t.tid    := 0;
+  t.stack  := 0;
+
+  var ctl: int64 := _thrCtlEnsure();
+  if (ctl == 0) { return t; }
+
+  // Spawns serialisieren: der Handoff-Block ist prozessweit einer.
+  while (atomic_cas(ctl + 24, 0, 1) != 0) { }
+  poke64(ctl, func);
+  poke64(ctl + 8, arg);
+  var resetTaken: int64 := atomic_store(ctl + 16, 0);
 
   var childStack: int64 := alloc(THREAD_STACK_SIZE);
-  if (childStack == 0) { return t; }
+  if (childStack == 0) {
+    var ul1: int64 := atomic_store(ctl + 24, 0);
+    return t;
+  }
 
   // TID slot: kernel writes the TID here on start and zeroes it on exit.
   var tidSlot: int64 := alloc(8);
-  if (tidSlot == 0) { free(childStack, THREAD_STACK_SIZE); return t; }
+  if (tidSlot == 0) {
+    free(childStack, THREAD_STACK_SIZE);
+    var ul2: int64 := atomic_store(ctl + 24, 0);
+    return t;
+  }
   poke32(tidSlot, 0);
 
   var stackTop: int64 := childStack + THREAD_STACK_SIZE;
 
-  // sys_clone(flags, stack_top, parent_tidptr=0, child_tidptr=tidSlot, tls=0)
-  var tid: int64 := sys_clone(THREAD_FLAGS, stackTop, 0, tidSlot, 0);
+  // sys_clone(flags, stack_top, parent_tidptr, child_tidptr, tls=0)
+  // tidSlot dient beidem: PARENT_SETTID schreibt die TID synchron hinein,
+  // CHILD_CLEARTID nullt ihn beim Thread-Ende und weckt den futex.
+  var tid: int64 := sys_clone(THREAD_FLAGS, stackTop, tidSlot, tidSlot, 0);
 
   if (tid == 0) {
-    // Child thread: func and arg accessible via RBP (shared VM).
-    _indirect_call_1(func, arg);
-    exit(0);  // syscall 60 — exits this thread only
+    // Kind: NUR Konstanten verwenden -- kein Zugriff auf Frame-Locals, deren
+    // Lebensdauer hier nicht garantiert ist. _thrTrampoline holt func und arg
+    // aus dem Handoff-Block, sobald es einen eigenen Frame hat.
+    _indirect_call_1(_thrTrampoline, 0);
+    exit(0);  // syscall 60 — beendet nur diesen Thread
   }
+
+  if (tid < 0) {
+    free(tidSlot, 8);
+    free(childStack, THREAD_STACK_SIZE);
+    var ul3: int64 := atomic_store(ctl + 24, 0);
+    return t;
+  }
+
+  // Warten, bis der Kindthread func und arg uebernommen hat -- erst danach darf
+  // der Handoff-Block neu belegt und dieser Frame aufgegeben werden.
+  while (atomic_load(ctl + 16) == 0) { }
+  var ul4: int64 := atomic_store(ctl + 24, 0);
 
   t.handle := tidSlot;
   t.tid    := tid;
+  t.stack  := childStack;
   return t;
 }
 
