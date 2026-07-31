@@ -143,6 +143,9 @@ test: lyxc
 	@echo "--- Statischer Methodenaufruf TypeName.Method() (7 tests) ---"
 	@bash tests/static_method_call_test.sh
 	@echo "OK"
+	@echo "--- Keine Phantom-Builtins in sema (10 tests) ---"
+	@bash tests/no_phantom_builtins_test.sh
+	@echo "OK"
 	@echo "--- Import auf fehlendes Modul (6 tests) ---"
 	@bash tests/dangling_import_test.sh
 	@echo "OK"
