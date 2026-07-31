@@ -118,5 +118,32 @@ else
   no "vier Threads, Atomics und Mutex" "compile fehlgeschlagen"
 fi
 
+# --------------------------------------------- Kind-Stacks werden freigegeben ---
+# ThreadJoin gab den 2-MB-Stack des Threads nicht frei. Unter einem VM-Limit
+# scheiterte ThreadCreate dadurch reproduzierbar (bei 1 GB ab dem 509. Thread).
+# Das Limit ist der eigentliche Test: ohne Freigabe reicht der Adressraum nicht.
+cat > "$TMP/leak.lyx" <<'EOF'
+import std.thread;
+fn tw(a: int64): int64 { return 0; }
+fn main(): int64 {
+  var i: int64 := 0;
+  while (i < 400) {
+    var t: Thread := ThreadCreate(tw, 0);
+    if (t.handle == 0) { return 1; }   // Stack konnte nicht alloziert werden
+    ThreadJoin(t);
+    i := i + 1;
+  }
+  return 42;
+}
+EOF
+rm -f "$TMP/leak"
+if (cd "$ROOT" && "$LYXC" --std-path="$ROOT" "$TMP/leak.lyx" -o "$TMP/leak" >/dev/null 2>&1); then
+  # 400 Threads x 2 MB = 800 MB, wenn nichts freigegeben wird; Limit 256 MB.
+  ( ulimit -v 262144 && timeout 120 "$TMP/leak" ) >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 42 ]; then ok "ThreadJoin gibt den Kind-Stack frei"; else no "ThreadJoin gibt den Kind-Stack frei" "exit=$rc unter ulimit -v 256M"; fi
+else
+  no "ThreadJoin gibt den Kind-Stack frei" "compile fehlgeschlagen"
+fi
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
