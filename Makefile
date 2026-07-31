@@ -210,6 +210,9 @@ test: lyxc
 	@echo "--- free-Arity: free(ptr, size) ueberall ---"
 	@bash tests/free_arity_test.sh
 	@echo "OK"
+	@echo "--- Builtins, die Unit-Namen verdecken ---"
+	@bash tests/builtin_shadow_test.sh
+	@echo "OK"
 	@echo "--- Geometrie-/Result-Units (Struct-Literal-Umbau, 31 Prüfungen) ---"
 	./lyxc --std-path=std tests/geom_units_test.lyx -o /tmp/lyxc_geom_test
 	@/tmp/lyxc_geom_test > /dev/null
