@@ -143,6 +143,11 @@ test: lyxc
 	@echo "--- Statischer Methodenaufruf TypeName.Method() (7 tests) ---"
 	@bash tests/static_method_call_test.sh
 	@echo "OK"
+	@echo "--- sys_open/sys_lseek Datei-Roundtrip (6 Prüfungen) ---"
+	./lyxc --std-path=. tests/sys_file_syscalls_test.lyx -o /tmp/lyxc_sf_test
+	@/tmp/lyxc_sf_test > /dev/null
+	@rm -f /tmp/lyxc_sf_test
+	@echo "OK"
 	@echo "--- Select/Poll I/O-Multiplexing (3 Prüfungen) ---"
 	./lyxc --std-path=. tests/select_poll_test.lyx -o /tmp/lyxc_sp_test
 	@/tmp/lyxc_sp_test > /dev/null
