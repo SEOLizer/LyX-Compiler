@@ -201,6 +201,9 @@ test: lyxc
 	@echo "--- unbekannte Feldnamen (4 tests) ---"
 	@bash tests/unknown_field_test.sh
 	@echo "OK"
+	@echo "--- AST-Sentinel fuer Knotenindex -1 (3 tests) ---"
+	@bash tests/node_sentinel_test.sh
+	@echo "OK"
 	@echo "--- Geometrie-/Result-Units (Struct-Literal-Umbau, 31 Prüfungen) ---"
 	./lyxc --std-path=std tests/geom_units_test.lyx -o /tmp/lyxc_geom_test
 	@/tmp/lyxc_geom_test > /dev/null
