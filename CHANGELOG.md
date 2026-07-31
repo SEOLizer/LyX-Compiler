@@ -1,5 +1,25 @@
 # Changelog - Lyx Compiler
 
+## Unveröffentlicht (develop)
+
+### Compiler (sema) — Import auf ein fehlendes Modul meldet jetzt einen Fehler (#978)
+- `_sema_processImport` kehrte kommentarlos zurück, wenn weder `.lyx` noch der
+  `.lyu`-Fallback gefunden wurde. Der Import verschwand, und der Fehler tauchte
+  erst an der **ersten Nutzung** als `undefined function` auf — was nach einem
+  Tippfehler im Funktionsnamen aussieht, während die Ursache im Import-Pfad
+  liegt. In `std/cpu/dispatch.lyx` zeigte die Meldung auf `CpuFeatureDetect`,
+  während `import src.std.cpu.features` ins Leere lief (`src/std/cpu/` existiert
+  nicht).
+- Die Meldung nennt Modul, Zeile und den gesuchten Dateipfad, dazu `-I` und
+  `--std-path`, falls gesetzt — die Verwechslung `std.` ↔ `src.` ist genau der
+  Fall, in dem man das braucht.
+- Neuer Test `tests/dangling_import_test.sh` (6 Prüfungen), in `make test`:
+  fehlendes std-/src-Modul, tief verschachtelter Pfad, Pfadangabe in der
+  Meldung, Meldung **vor** dem Folgefehler, und kein Fehlalarm bei gültigen
+  Imports.
+- Nichts im Baum verließ sich auf das stille Verhalten: der Unit-Sweep bleibt
+  bei 390 OK / 0 failed.
+
 ## Version 1.0.9A (Juli 2026)
 
 Aufruf-Protokoll im Codegen korrigiert, kompletter Unicode-/Text-Stack, alle
