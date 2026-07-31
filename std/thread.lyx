@@ -175,29 +175,27 @@ pub fn MutexFree(m: Mutex): void {
 }
 
 // MutexLock: acquires the mutex, sleeping via futex when contended.
+//
+// Zustaende: 0 = frei, 1 = gehalten, 2 = gehalten mit Wartenden.
+// Die fruehere Fassung las den Zustand mit peek32 und schrieb ihn mit poke32 --
+// zwei Threads konnten beide die 0 sehen und beide "gewinnen". Jetzt wird der
+// Uebergang 0 -> 1 mit einem einzigen atomic_cas gemacht; im umkaempften Fall
+// setzt ein atomic_store (xchg) auf 2 und liefert zugleich den alten Wert.
 pub fn MutexLock(m: Mutex): void {
   if (m.ptr == 0) { return; }
-  var spins: int64 := 0;
-  while (1 == 1) {
-    if (peek32(m.ptr) == 0) {
-      poke32(m.ptr, 1);
-      return;
-    }
-    spins += 1;
-    if (spins >= 64) {
-      poke32(m.ptr, 2);  // mark: has waiters
-      sys_futex(m.ptr, FUTEX_WAIT, 2, 0, 0, 0);
-      spins := 0;
-    }
+  // Schneller Pfad: unbestritten frei
+  if (atomic_cas(m.ptr, 0, 1) == 0) { return; }
+  // Umkaempft: auf 2 setzen und schlafen, bis der alte Wert 0 war
+  while (atomic_store(m.ptr, 2) != 0) {
+    sys_futex(m.ptr, FUTEX_WAIT, 2, 0, 0, 0);
   }
 }
 
 // MutexUnlock: releases the mutex and wakes one waiter if any.
 pub fn MutexUnlock(m: Mutex): void {
   if (m.ptr == 0) { return; }
-  var old: int64 := peek32(m.ptr);
-  poke32(m.ptr, 0);
-  if (old == 2) {
+  // Freigeben und alten Zustand in einem Schritt lesen: nur bei 2 gab es Warter.
+  if (atomic_store(m.ptr, 0) == 2) {
     sys_futex(m.ptr, FUTEX_WAKE, 1, 0, 0, 0);
   }
 }
@@ -205,7 +203,7 @@ pub fn MutexUnlock(m: Mutex): void {
 // MutexTryLock: non-blocking attempt.  Returns 1 on success, 0 if busy.
 pub fn MutexTryLock(m: Mutex): int64 {
   if (m.ptr == 0) { return 0; }
-  if (peek32(m.ptr) == 0) { poke32(m.ptr, 1); return 1; }
+  if (atomic_cas(m.ptr, 0, 1) == 0) { return 1; }
   return 0;
 }
 
@@ -267,10 +265,15 @@ pub fn SharedMemFree(mem: SharedMem): void {
 // ============================================================================
 // Atomic operations
 // Note: peek64/poke64 on naturally aligned addresses are single-bus-cycle
-// on x86-64, giving de-facto atomicity for plain loads/stores.  For
-// read-modify-write (AtomicAdd, CAS) a tiny race window exists because
-// Lyx does not yet expose a lock-cmpxchg builtin.  Guard RMW sequences
-// that require strict sequential consistency with a Mutex.
+// Alle Operationen laufen ueber die atomic_*-Builtins und sind damit echt
+// atomar (lock xadd / lock cmpxchg / xchg auf x86-64).
+//
+// Frueher war das nicht so: AtomicAdd und CAS lasen mit peek64 und schrieben
+// mit poke64, waren also trotz des Namens ein Read-Modify-Write mit Rennen --
+// zwei Threads konnten denselben Ausgangswert lesen und einer der beiden
+// Zuwaechse ging verloren. Der Kommentar an dieser Stelle wies auf das Rennen
+// hin und nannte als Grund, Lyx biete kein lock-cmpxchg; seit die
+// atomic_*-Builtins auch im ELF-Codegen emittiert werden, gilt das nicht mehr.
 // ============================================================================
 
 pub fn AtomicNew(initial: int64): Atomic {
@@ -286,26 +289,27 @@ pub fn AtomicFree(a: Atomic): void {
 
 pub fn AtomicLoad(a: Atomic): int64 {
   if (a.ptr == 0) { return 0; }
-  return peek64(a.ptr);
+  return atomic_load(a.ptr);
 }
 
 pub fn AtomicStore(a: Atomic, val: int64): void {
   if (a.ptr == 0) { return; }
-  poke64(a.ptr, val);
+  // atomic_store liefert den alten Wert; hier nicht gebraucht.
+  var prev: int64 := atomic_store(a.ptr, val);
 }
 
-// AtomicAdd: adds delta, returns new value.
+// AtomicAdd: addiert delta und liefert den NEUEN Wert (unveraenderter Vertrag).
+// atomic_fetch_add liefert den alten Wert, daher delta addieren.
 pub fn AtomicAdd(a: Atomic, delta: int64): int64 {
   if (a.ptr == 0) { return 0; }
-  var v: int64 := peek64(a.ptr) + delta;
-  poke64(a.ptr, v);
-  return v;
+  return atomic_fetch_add(a.ptr, delta) + delta;
 }
 
-// CAS: returns 1 on success, 0 if current value != expected.
+// CAS: liefert 1 bei Erfolg, 0 wenn der aktuelle Wert nicht expected war.
+// atomic_cas liefert den alten Wert; Erfolg heisst "alter Wert == expected".
 pub fn CAS(a: Atomic, expected: int64, newVal: int64): int64 {
   if (a.ptr == 0) { return 0; }
-  if (peek64(a.ptr) == expected) { poke64(a.ptr, newVal); return 1; }
+  if (atomic_cas(a.ptr, expected, newVal) == expected) { return 1; }
   return 0;
 }
 

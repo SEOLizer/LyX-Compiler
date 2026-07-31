@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# tests/atomics_test.sh — echte Atomarität in std/thread.lyx.
+#
+# AtomicAdd und CAS lasen früher mit peek64 und schrieben mit poke64, waren also
+# trotz des Namens ein Read-Modify-Write mit Rennen: zwei Threads konnten
+# denselben Ausgangswert lesen, und einer der beiden Zuwächse ging verloren.
+# Ebenso der Mutex — `if (peek32(p) == 0) { poke32(p, 1) }` ist ein
+# nicht-atomares Test-and-Set, bei dem beide Seiten "gewinnen" können.
+#
+# Ursache dahinter: die atomic_*- und fence_*-Builtins waren in sema
+# registriert, aber NUR im lyxos-Backend emittiert. Auf dem ELF-Pfad endete
+# jeder Aufruf in "no codegen implementation found" — die stdlib konnte sie also
+# gar nicht verwenden. Sie sind jetzt auch in codegen_x86.lyx implementiert.
+#
+# Geprüft wird zweierlei:
+#   1. Semantik jeder Operation (Rückgabewert UND Wirkung im Speicher)
+#   2. dass tatsächlich sperrende Instruktionen emittiert werden — ohne
+#      `lock`-Präfix wäre die Semantik einthreadig identisch und der Test
+#      grün, obwohl nichts atomar ist. Deshalb der Byte-Nachweis.
+#
+# Kein Nebenläufigkeitstest: ThreadCreate in std/thread.lyx startet derzeit
+# keinen laufenden Kindthread (Zähler bleibt 0, Prozess segfaultet) — das ist
+# ein vorbestehender, separater Defekt, reproduzierbar auch mit der
+# unveränderten std/thread.lyx.
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+LYXC="$ROOT/lyxc"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+PASS=0; FAIL=0
+
+ok() { echo "PASS $1"; PASS=$((PASS+1)); }
+no() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
+
+# ---------------------------------------------------------------- Semantik ---
+cat > "$TMP/sem.lyx" <<'EOF'
+import std.thread;
+fn main(): int64 {
+  var a: Atomic := AtomicNew(40);
+  if (AtomicLoad(a) != 40)      { return 1; }
+  if (AtomicAdd(a, 2) != 42)    { return 2; }   // liefert NEUEN Wert
+  if (AtomicLoad(a) != 42)      { return 3; }
+  AtomicStore(a, 7);
+  if (AtomicLoad(a) != 7)       { return 4; }
+  if (CAS(a, 7, 99) != 1)       { return 5; }   // Erfolg
+  if (AtomicLoad(a) != 99)      { return 6; }
+  if (CAS(a, 7, 123) != 0)      { return 7; }   // muss scheitern
+  if (AtomicLoad(a) != 99)      { return 8; }   // und nichts geschrieben haben
+  if (AtomicAdd(a, 0 - 99) != 0){ return 9; }   // negatives Delta
+  AtomicFree(a);
+
+  var m: Mutex := MutexNew();
+  MutexLock(m);
+  if (MutexTryLock(m) != 0)     { return 10; }  // gehalten -> belegt
+  MutexUnlock(m);
+  if (MutexTryLock(m) != 1)     { return 11; }  // frei -> Erfolg
+  MutexUnlock(m);
+  MutexFree(m);
+  return 42;
+}
+EOF
+if (cd "$ROOT" && "$LYXC" --std-path="$ROOT" "$TMP/sem.lyx" -o "$TMP/sem" >/dev/null 2>&1); then
+  timeout 10 "$TMP/sem" >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 42 ]; then ok "Semantik von Atomic und Mutex"; else no "Semantik" "exit=$rc (Nummer = fehlgeschlagene Prüfung)"; fi
+else
+  no "Semantik" "compile fehlgeschlagen"
+fi
+
+# ------------------------------------------------- Builtins direkt aufrufbar ---
+cat > "$TMP/bi.lyx" <<'EOF'
+import std.alloc;
+fn main(): int64 {
+  var p: int64 := alloc(8);
+  poke64(p, 40);
+  if (atomic_fetch_add(p, 2) != 40) { return 1; }  // liefert ALTEN Wert
+  if (atomic_load(p) != 42)         { return 2; }
+  if (atomic_store(p, 7) != 42)     { return 3; }  // liefert ALTEN Wert
+  if (atomic_cas(p, 7, 99) != 7)    { return 4; }  // liefert ALTEN Wert
+  if (atomic_load(p) != 99)         { return 5; }
+  fence_mfence(); fence_sfence(); fence_lfence();
+  return 42;
+}
+EOF
+if (cd "$ROOT" && "$LYXC" --std-path="$ROOT" "$TMP/bi.lyx" -o "$TMP/bi" >/dev/null 2>&1); then
+  timeout 10 "$TMP/bi" >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 42 ]; then ok "atomic_*/fence_* Builtins auf dem ELF-Pfad"; else no "Builtins" "exit=$rc"; fi
+else
+  no "atomic_*/fence_* Builtins auf dem ELF-Pfad" "compile fehlgeschlagen — Phantom-Builtin?"
+fi
+
+# ------------------------------------------------------- Byte-Nachweis lock ---
+# Ohne diese Prüfung wäre der Test auch dann grün, wenn die Operationen als
+# schlichte Lade-/Speicherbefehle emittiert würden.
+hex=$(xxd -p "$TMP/bi" 2>/dev/null | tr -d '\n')
+check_bytes() { # name, hexmuster
+  if echo "$hex" | grep -q "$2"; then ok "$1"; else no "$1" "Bytefolge $2 fehlt"; fi
+}
+check_bytes "lock xadd [rdi],rax emittiert"     "f0480fc107"
+check_bytes "lock cmpxchg [rdi],rdx emittiert"  "f0480fb117"
+check_bytes "xchg [rdi],rax emittiert"          "488707"
+check_bytes "mfence emittiert"                  "0faef0"
+check_bytes "sfence emittiert"                  "0faef8"
+check_bytes "lfence emittiert"                  "0faee8"
+
+# Auch die stdlib muss die sperrenden Formen tragen, nicht nur der Direktaufruf.
+hexs=$(xxd -p "$TMP/sem" 2>/dev/null | tr -d '\n')
+if echo "$hexs" | grep -q "f0480fc107" && echo "$hexs" | grep -q "f0480fb117"; then
+  ok "std/thread.lyx nutzt die sperrenden Formen"
+else
+  no "std/thread.lyx nutzt die sperrenden Formen" "lock-Praefixe fehlen — peek/poke-Fassung zurueck?"
+fi
+
+echo "Ergebnis: $PASS PASS, $FAIL FAIL"
+[ "$FAIL" -eq 0 ]
