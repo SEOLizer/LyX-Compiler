@@ -18,10 +18,8 @@
 #      `lock`-Präfix wäre die Semantik einthreadig identisch und der Test
 #      grün, obwohl nichts atomar ist. Deshalb der Byte-Nachweis.
 #
-# Kein Nebenläufigkeitstest: ThreadCreate in std/thread.lyx startet derzeit
-# keinen laufenden Kindthread (Zähler bleibt 0, Prozess segfaultet) — das ist
-# ein vorbestehender, separater Defekt, reproduzierbar auch mit der
-# unveränderten std/thread.lyx.
+# Der Nebenläufigkeitsteil steht in tests/thread_concurrency_test.lyx: er ist
+# erst möglich, seit ThreadCreate wirklich einen Kindthread startet (Issue #992).
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="$ROOT/lyxc"
@@ -107,6 +105,17 @@ if echo "$hexs" | grep -q "f0480fc107" && echo "$hexs" | grep -q "f0480fb117"; t
   ok "std/thread.lyx nutzt die sperrenden Formen"
 else
   no "std/thread.lyx nutzt die sperrenden Formen" "lock-Praefixe fehlen — peek/poke-Fassung zurueck?"
+fi
+
+# ------------------------------------------------ echte Nebenlaeufigkeit ---
+# Der eigentliche Beweis: vier Threads erhoehen denselben Zaehler. Ohne echte
+# lock-Instruktionen gehen Zuwaechse verloren.
+rm -f "$TMP/conc"
+if (cd "$ROOT" && "$LYXC" --std-path="$ROOT" "$ROOT/tests/thread_concurrency_test.lyx" -o "$TMP/conc" >/dev/null 2>&1); then
+  timeout 180 "$TMP/conc" >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 42 ]; then ok "vier Threads, Atomics und Mutex"; else no "Nebenlaeufigkeit" "exit=$rc"; fi
+else
+  no "vier Threads, Atomics und Mutex" "compile fehlgeschlagen"
 fi
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
