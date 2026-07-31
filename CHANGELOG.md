@@ -2,6 +2,21 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler (Codegen) — `_indirect_call_2/3/4` implementiert
+- `_indirect_call_0` und `_1` gab es; `_2`, `_3` und `_4` waren in sema
+  registriert, aber **nie emittiert** — der Aufruf bestand sema und starb im
+  Codegen mit `no codegen implementation found`.
+- Gleiches Schema wie `_1`: Argumente in umgekehrter Reihenfolge pushen, fnPtr
+  nach `rax`, dann nach `rdi`/`rsi`/`rdx`/`rcx` zurückholen.
+- **Warum das kein Sweep gefunden hat**: `std/android/jni.lyx` benutzt
+  `_indirect_call_2` und `_4` und galt trotzdem als übersetzbar, weil
+  `--compile-unit` den Codegen nicht erreicht. Diese Fehlerklasse zeigt sich nur
+  beim Bauen eines echten Programms.
+- Entsperrt die drei Android-JNI-Beispiele.
+- Neuer Test `tests/indirect_call_test.lyx` (5 Prüfungen), in `make test`: prüft
+  die Argumentlage mit stellenwertigen Erwartungen (123, 1234), die eine
+  Vertauschung nicht überleben würden.
+
 ### Compiler (sema) — sechs Phantom-Builtins entfernt
 - sema registrierte `PrintStrLn`, `PrintIntLn`, `StrCmp`, `StrNCmp`, `StrToInt`
   und `StrToFloat` als Builtins, **die kein Backend implementiert**. Ein Aufruf
