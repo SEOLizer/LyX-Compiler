@@ -657,6 +657,88 @@ pub type Sema = class {
     return self.SymNodeIdx(enumSym);
   }
 
+  // Sucht ein Feld in einer Struct-/Klassendeklaration und laeuft dabei die
+  // Vererbungskette hoch (c2 = Elterntyp). 1 = gefunden bzw. nicht entscheidbar,
+  // 0 = sicher nicht vorhanden. Iterativ statt rekursiv gehalten.
+  fn _fieldExistsInDecl(startNi: int64, fldName: pchar, fldLen: int64): int64 {
+    var declNi: int64 := startNi;
+    var depth:  int64 := 0;
+    while (declNi >= 0) {
+      // Zyklus in der Vererbungskette: sema meldet das an anderer Stelle,
+      // hier nur abbrechen und im Zweifel nicht meckern.
+      if (depth > 16) { return 1; }
+      var f: int64 := self.sn_c0(declNi);
+      while (f >= 0) {
+        if (self.sn_kind(f) == 7) {
+          if (self._strNEq(fldName, fldLen, self.sn_sVal(f), self.sn_sLen(f)) != 0) { return 1; }
+        }
+        f := self.sn_next(f);
+      }
+      var parentNi: int64 := self.sn_c2(declNi);
+      if (parentNi < 0) { return 0; }
+      var pSym: int64 := self.Lookup(self.sn_sVal(parentNi), self.sn_sLen(parentNi));
+      if (pSym < 0) { return 1; }        // Elternteil unbekannt -> nicht meckern
+      // Elternklasse aus einem importierten Unit hat hier keinen AST-Knoten:
+      // die Felderliste ist von dieser Uebersetzungseinheit aus nicht
+      // einsehbar, Abwesenheit also nicht belegbar. Das betraf die gesamte
+      // lyxvision-Hierarchie (TView -> TGroup -> ...) und meldete dort zwoelf
+      // Units faelschlich als kaputt.
+      declNi := self.SymNodeIdx(pSym);
+      if (declNi < 0) { return 1; }
+      depth := depth + 1;
+    }
+    return 0;
+  }
+
+  // Prueft bei `basis.feld`, ob `feld` im deklarierten Typ von `basis` existiert.
+  //
+  // Ohne diese Pruefung akzeptierte sema jeden Feldnamen auf jeder Basis: ein
+  // Tippfehler (`p.lenght`) uebersetzte klaglos und lieferte zur Laufzeit 0,
+  // ebenso `x.irgendwas` auf einem int64. Aufgefallen an std/qt5_egl.lyx, wo
+  // ein Beispiel `disp.display` auf einem `pub type EGLDisplay = int64`
+  // schrieb -- einem Typ ganz ohne Felder.
+  //
+  // Bewusst konservativ: gemeldet wird nur, wenn die Basis ein schlichter
+  // Bezeichner ist, dessen deklarierter Typ sich eindeutig zu einer Struct-
+  // oder Klassendeklaration mit mindestens einem Feld aufloesen laesst. Alles
+  // andere (zusammengesetzte Ausdruecke, generische Instanzen, unbekannte oder
+  // importierte Typen) bleibt ungeprueft, damit die Pruefung keine gueltigen
+  // Programme abweist.
+  fn _checkFieldExists(ni: int64) {
+    var baseNi: int64 := self.sn_c0(ni);
+    if (baseNi < 0) { return; }
+    if (self.sn_kind(baseNi) != SNK_IDENT) { return; }
+    var bn: pchar := self.sn_sVal(baseNi);
+    var bl: int64 := self.sn_sLen(baseNi);
+    if (bn == 0) { return; }
+    if (bl <= 0) { return; }
+    var sym: int64 := self.Lookup(bn, bl);
+    if (sym < 0) { return; }
+    var sk: int64 := self.SymKind(sym);
+    if (sk != SYM_VAR && sk != SYM_PARAM) { return; }
+    var declNi: int64 := self.SymNodeIdx(sym);
+    if (declNi < 0) { return; }
+    var typeNi: int64 := self.sn_c0(declNi);
+    if (typeNi < 0) { return; }
+    if (self.sn_kind(typeNi) != SNK_TYPE_NAME) { return; }
+    if (self.sn_c1(typeNi) >= 0) { return; }
+    var tSym: int64 := self.Lookup(self.sn_sVal(typeNi), self.sn_sLen(typeNi));
+    if (tSym < 0) { return; }
+    var tk: int64 := self.SymKind(tSym);
+    if (tk != SYM_STRUCT && tk != SYM_TYPE) { return; }
+    var tDecl: int64 := self.SymNodeIdx(tSym);
+    if (tDecl < 0) { return; }
+    if (self.sn_c0(tDecl) < 0) { return; }
+    if (self.sn_kind(self.sn_c0(tDecl)) != 7) { return; }
+    var fldName: pchar := self.sn_sVal(ni);
+    var fldLen:  int64 := self.sn_sLen(ni);
+    if (fldName == 0) { return; }
+    if (fldLen <= 0) { return; }
+    if (self._fieldExistsInDecl(tDecl, fldName, fldLen) == 0) {
+      self._errorNodeName("unknown field", ni, fldName, fldLen);
+    }
+  }
+
   // ------------------------------------------------------------------
   // Type resolution
   // ------------------------------------------------------------------
@@ -1442,6 +1524,7 @@ pub type Sema = class {
     } else if (k == SNK_FIELD) {
       // child0 = base object; field name is in sn_sVal (not a symbol ref)
       self._checkExpr(self.sn_c0(ni));
+      self._checkFieldExists(ni);
       // WP-BC-22: visibility check when inside a class and base is 'self'
       var baseNi: int64 := self.sn_c0(ni);
       if (self.curClassNi >= 0 && baseNi >= 0 && self.sn_kind(baseNi) == SNK_IDENT) {
