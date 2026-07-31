@@ -2,6 +2,22 @@
 
 ## Unveröffentlicht (develop)
 
+### Beispiele — FFI-Sandbox
+- **Zwei Beispiele deklarierten Builtins als `extern fn`** (`read`/`write` in
+  `games/game1`, `sys_socket`/`mmap`/`poke8`/… in `test_extern_redis`). Das war
+  überflüssig und lief in die Fail-Closed-Prüfung. Deklarationen entfernt — die
+  Builtins waren die ganze Zeit direkt verfügbar.
+- **Sechs Grafik-Beispiele** (X11/GLX/EGL) tragen jetzt `@cap(network.unix)` an
+  ihren Externs: X11 spricht über einen Unix-Socket mit dem X-Server. Die
+  Annotation dokumentiert den Bedarf — die Sandbox verlangt bei einem
+  unbekannten Symbol lediglich, **dass** eine Capability deklariert ist, nicht
+  dass sie zum Symbol passt.
+- **`graphics/dlopen_test.lyx` bleibt bewusst nicht übersetzbar.** `dlopen` steht
+  auf der harten Blacklist, weil dynamisches Nachladen die Sandbox aushebelt.
+  Die Datei belegt das Verhalten und trägt jetzt einen Kopfkommentar, der das
+  erklärt — sie wird nicht „repariert".
+- Beispiele 315 → 323 von 342.
+
 ### Standardbibliothek — `Select` und `Poll` in `std.net.syscalls`
 - Die Unit trug „I/O multiplexing" seit jeher in der Überschrift, hatte die
   beiden Wrapper aber nicht — acht Beispiele riefen sie ins Leere.
