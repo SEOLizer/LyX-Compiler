@@ -216,6 +216,16 @@ test: lyxc
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
 	@echo "OK"
+	@echo "--- Funktions- und Methodenzeiger (8 Suiten) ---"
+	@bash tests/arity_check_test.sh
+	@bash tests/asm_block_test.sh
+	@bash tests/elf_reloc_test.sh
+	@bash tests/fnptr_field_test.sh
+	@bash tests/inline_fnptr_test.sh
+	@bash tests/local_fnptr_test.sh
+	@bash tests/method_ptr_test.sh
+	@bash tests/method_ptr_xmod_test.sh
+	@echo "OK"
 	@echo "--- Geometrie-/Result-Units (Struct-Literal-Umbau, 31 Prüfungen) ---"
 	./lyxc --std-path=std tests/geom_units_test.lyx -o /tmp/lyxc_geom_test
 	@/tmp/lyxc_geom_test > /dev/null
