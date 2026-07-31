@@ -1,0 +1,772 @@
+// std/cloud/do/networking.lyx — DigitalOcean Networking
+// WP-DO-07: DNS, Load Balancer, VPC, Firewall, Floating IPs
+
+unit std.cloud.digitalocean.networking;
+
+import std.cloud.digitalocean.transport;
+import std.cloud.digitalocean.credentials;
+import std.alloc;
+import std.io;
+
+// ============================================================================
+// Structs
+// ============================================================================
+
+pub type DODomain = struct {
+    name:     int64;  // pchar (alloc'd)
+    ttl:      int64;
+    zoneFile: int64;  // pchar (alloc'd)
+};
+
+pub fn DODomainFree(d: DODomain) {
+    if (d.name     != 0) { free(d.name,     StrLen(d.name     as pchar) + 1); }
+    if (d.zoneFile != 0) { free(d.zoneFile, StrLen(d.zoneFile as pchar) + 1); }
+}
+
+pub type DODNSRecord = struct {
+    id:       int64;
+    recType:  int64;  // pchar: "A","AAAA","CNAME","MX","TXT","NS","SRV","CAA" (alloc'd)
+    name:     int64;  // pchar (alloc'd)
+    data:     int64;  // pchar (alloc'd)
+    priority: int64;
+    port:     int64;
+    ttl:      int64;
+    weight:   int64;
+};
+
+pub fn DODNSRecordFree(r: DODNSRecord) {
+    if (r.recType != 0) { free(r.recType, StrLen(r.recType as pchar) + 1); }
+    if (r.name    != 0) { free(r.name,    StrLen(r.name    as pchar) + 1); }
+    if (r.data    != 0) { free(r.data,    StrLen(r.data    as pchar) + 1); }
+}
+
+pub type DOLoadBalancer = struct {
+    id:        int64;  // pchar UUID (alloc'd)
+    name:      int64;  // pchar (alloc'd)
+    ip:        int64;  // pchar (alloc'd)
+    status:    int64;  // pchar (alloc'd)
+    region:    int64;  // pchar (alloc'd)
+    algorithm: int64;  // pchar (alloc'd)
+};
+
+pub fn DOLoadBalancerFree(lb: DOLoadBalancer) {
+    if (lb.id        != 0) { free(lb.id,        StrLen(lb.id        as pchar) + 1); }
+    if (lb.name      != 0) { free(lb.name,       StrLen(lb.name      as pchar) + 1); }
+    if (lb.ip        != 0) { free(lb.ip,         StrLen(lb.ip        as pchar) + 1); }
+    if (lb.status    != 0) { free(lb.status,     StrLen(lb.status    as pchar) + 1); }
+    if (lb.region    != 0) { free(lb.region,     StrLen(lb.region    as pchar) + 1); }
+    if (lb.algorithm != 0) { free(lb.algorithm,  StrLen(lb.algorithm as pchar) + 1); }
+}
+
+pub type DOFloatingIP = struct {
+    ip:        int64;  // pchar (alloc'd)
+    region:    int64;  // pchar (alloc'd)
+    dropletId: int64;
+};
+
+pub fn DOFloatingIPFree(f: DOFloatingIP) {
+    if (f.ip     != 0) { free(f.ip,     StrLen(f.ip     as pchar) + 1); }
+    if (f.region != 0) { free(f.region, StrLen(f.region as pchar) + 1); }
+}
+
+pub type DOVPC = struct {
+    id:        int64;  // pchar UUID (alloc'd)
+    name:      int64;  // pchar (alloc'd)
+    region:    int64;  // pchar (alloc'd)
+    ipRange:   int64;  // pchar (alloc'd)
+    isDefault: int64;
+};
+
+pub fn DOVPCFree(v: DOVPC) {
+    if (v.id      != 0) { free(v.id,      StrLen(v.id      as pchar) + 1); }
+    if (v.name    != 0) { free(v.name,    StrLen(v.name    as pchar) + 1); }
+    if (v.region  != 0) { free(v.region,  StrLen(v.region  as pchar) + 1); }
+    if (v.ipRange != 0) { free(v.ipRange, StrLen(v.ipRange as pchar) + 1); }
+}
+
+pub type DOFirewall = struct {
+    id:     int64;  // pchar UUID (alloc'd)
+    name:   int64;  // pchar (alloc'd)
+    status: int64;  // pchar (alloc'd)
+};
+
+pub fn DOFirewallFree(f: DOFirewall) {
+    if (f.id     != 0) { free(f.id,     StrLen(f.id     as pchar) + 1); }
+    if (f.name   != 0) { free(f.name,   StrLen(f.name   as pchar) + 1); }
+    if (f.status != 0) { free(f.status, StrLen(f.status as pchar) + 1); }
+}
+
+// ============================================================================
+// Internal helper
+// ============================================================================
+
+fn doClientNet(creds: DOCredentials): DOClient {
+    var c: DOClient;
+    c.token    := creds.token;
+    c.tokenLen := creds.tokenLen;
+    return c;
+}
+
+fn netStrDup(json: int64, key: pchar): int64 {
+    return doJsonStr(json, key);
+}
+
+// ============================================================================
+// DNS: Domains
+// ============================================================================
+
+pub fn DomainCreate(creds: DOCredentials, name: pchar, ipAddress: pchar): DODomain {
+    var d: DODomain; d.name := 0; d.ttl := 0; d.zoneFile := 0;
+    var buf: int64 := alloc(512);
+    var p: int64 := buf;
+    var h: pchar := "{\"name\":\""c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while (i < lh) { poke8(p+i, StrCharAt(h,i)&0xFF); i:=i+1; } p:=p+lh;
+    var nl: int64 := StrLen(name);
+    i:=0; while (i<nl) { poke8(p+i, StrCharAt(name,i)&0xFF); i:=i+1; } p:=p+nl;
+    var s: pchar := "\",\"ip_address\":\""c; var ls: int64 := StrLen(s);
+    i:=0; while (i<ls) { poke8(p+i, StrCharAt(s,i)&0xFF); i:=i+1; } p:=p+ls;
+    var il: int64 := StrLen(ipAddress);
+    i:=0; while (i<il) { poke8(p+i, StrCharAt(ipAddress,i)&0xFF); i:=i+1; } p:=p+il;
+    var t: pchar := "\"}"c; var lt: int64 := StrLen(t);
+    i:=0; while (i<lt) { poke8(p+i, StrCharAt(t,i)&0xFF); i:=i+1; } p:=p+lt;
+    poke8(p,0);
+    var bodyLen: int64 := p - buf;
+    var c: DOClient := doClientNet(creds);
+    var path: pchar := "/v2/domains"c;
+    var resp: HTTPResponse := DOPost(c, path, buf, bodyLen);
+    free(buf, 512);
+    if (resp.statusCode == 201 && resp.bodyPtr != 0) {
+        d.name    := netStrDup(resp.bodyPtr, "name"c);
+        d.ttl     := doJsonInt(resp.bodyPtr, "ttl"c);
+        d.zoneFile:= netStrDup(resp.bodyPtr, "zone_file"c);
+    }
+    HTTPResponseFree(resp);
+    return d;
+}
+
+pub fn DomainDelete(creds: DOCredentials, name: pchar): int64 {
+    var c: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    var base: pchar := "/v2/domains/"c;
+    doMakePath(pathBuf, base, name);
+    var resp: HTTPResponse := DODelete(c, pathBuf as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(pathBuf, 256);
+    return ok;
+}
+
+pub fn DomainGet(creds: DOCredentials, name: pchar): DODomain {
+    var d: DODomain; d.name := 0; d.ttl := 0; d.zoneFile := 0;
+    var c: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    var base: pchar := "/v2/domains/"c;
+    doMakePath(pathBuf, base, name);
+    var resp: HTTPResponse := DOGet(c, pathBuf as pchar);
+    if (resp.statusCode == 200 && resp.bodyPtr != 0) {
+        d.name     := netStrDup(resp.bodyPtr, "name"c);
+        d.ttl      := doJsonInt(resp.bodyPtr, "ttl"c);
+        d.zoneFile := netStrDup(resp.bodyPtr, "zone_file"c);
+    }
+    HTTPResponseFree(resp);
+    free(pathBuf, 256);
+    return d;
+}
+
+pub fn DomainList(creds: DOCredentials): int64 {
+    var c: DOClient := doClientNet(creds);
+    var path: pchar := "/v2/domains"c;
+    return DOGetAll(c, path, "domains"c);
+}
+
+// ============================================================================
+// DNS: Records
+// ============================================================================
+
+fn parseDNSRecord(json: int64): DODNSRecord {
+    var r: DODNSRecord;
+    r.id       := doJsonInt(json, "id"c);
+    r.recType  := netStrDup(json, "type"c);
+    r.name     := netStrDup(json, "name"c);
+    r.data     := netStrDup(json, "data"c);
+    r.priority := doJsonInt(json, "priority"c);
+    r.port     := doJsonInt(json, "port"c);
+    r.ttl      := doJsonInt(json, "ttl"c);
+    r.weight   := doJsonInt(json, "weight"c);
+    return r;
+}
+
+pub fn DomainRecordCreate(creds: DOCredentials, domain: pchar,
+                          recType: pchar, name: pchar,
+                          data: pchar, ttl: int64): DODNSRecord {
+    var rec: DODNSRecord;
+    rec.id := 0; rec.recType := 0; rec.name := 0; rec.data := 0;
+    rec.priority := 0; rec.port := 0; rec.ttl := 0; rec.weight := 0;
+    var buf: int64 := alloc(1024);
+    var p: int64 := buf;
+    var h: pchar := "{\"type\":\""c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while (i<lh) { poke8(p+i,StrCharAt(h,i)&0xFF); i:=i+1; } p:=p+lh;
+    var tl: int64 := StrLen(recType);
+    i:=0; while(i<tl){poke8(p+i,StrCharAt(recType,i)&0xFF);i:=i+1;} p:=p+tl;
+    var s1: pchar := "\",\"name\":\""c; var l1: int64 := StrLen(s1);
+    i:=0; while(i<l1){poke8(p+i,StrCharAt(s1,i)&0xFF);i:=i+1;} p:=p+l1;
+    var nl: int64 := StrLen(name);
+    i:=0; while(i<nl){poke8(p+i,StrCharAt(name,i)&0xFF);i:=i+1;} p:=p+nl;
+    var s2: pchar := "\",\"data\":\""c; var l2: int64 := StrLen(s2);
+    i:=0; while(i<l2){poke8(p+i,StrCharAt(s2,i)&0xFF);i:=i+1;} p:=p+l2;
+    var dl: int64 := StrLen(data);
+    i:=0; while(i<dl){poke8(p+i,StrCharAt(data,i)&0xFF);i:=i+1;} p:=p+dl;
+    var s3: pchar := "\",\"ttl\":"c; var l3: int64 := StrLen(s3);
+    i:=0; while(i<l3){poke8(p+i,StrCharAt(s3,i)&0xFF);i:=i+1;} p:=p+l3;
+    var numBuf: int64 := alloc(24);
+    var numStr: pchar := Int64ToStr(ttl, numBuf);
+    var nn: int64 := StrLen(numStr);
+    i:=0; while(i<nn){poke8(p+i,StrCharAt(numStr,i)&0xFF);i:=i+1;} p:=p+nn;
+    free(numBuf, 24);
+    poke8(p,125); p:=p+1; poke8(p,0); // '}'
+    var bodyLen: int64 := p - buf;
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    doMakePath3(pathBuf, "/v2/domains/"c, domain, "/records"c);
+    var resp: HTTPResponse := DOPost(cl, pathBuf as pchar, buf, bodyLen);
+    free(buf, 1024);
+    if (resp.statusCode == 201 && resp.bodyPtr != 0) { rec := parseDNSRecord(resp.bodyPtr); }
+    HTTPResponseFree(resp);
+    free(pathBuf, 256);
+    return rec;
+}
+
+pub fn DomainRecordUpdate(creds: DOCredentials, domain: pchar,
+                          id: int64, data: pchar, ttl: int64): DODNSRecord {
+    var rec: DODNSRecord;
+    rec.id := 0; rec.recType := 0; rec.name := 0; rec.data := 0;
+    rec.priority := 0; rec.port := 0; rec.ttl := 0; rec.weight := 0;
+    var buf: int64 := alloc(512);
+    var p: int64 := buf;
+    var h: pchar := "{\"data\":\""c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(p+i,StrCharAt(h,i)&0xFF);i:=i+1;} p:=p+lh;
+    var dl: int64 := StrLen(data);
+    i:=0; while(i<dl){poke8(p+i,StrCharAt(data,i)&0xFF);i:=i+1;} p:=p+dl;
+    var t: pchar := "\"}"c; var lt: int64 := StrLen(t);
+    i:=0; while(i<lt){poke8(p+i,StrCharAt(t,i)&0xFF);i:=i+1;} p:=p+lt;
+    poke8(p,0);
+    var bodyLen: int64 := p - buf;
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    var numBuf: int64 := alloc(24);
+    var numStr: pchar := Int64ToStr(id, numBuf);
+    doMakePath3(pathBuf, "/v2/domains/"c, domain, "/records/"c);
+    var existLen: int64 := StrLen(pathBuf as pchar);
+    var nn: int64 := StrLen(numStr);
+    i:=0; while(i<nn){poke8(pathBuf+existLen+i,StrCharAt(numStr,i)&0xFF);i:=i+1;}
+    poke8(pathBuf+existLen+nn,0);
+    free(numBuf, 24);
+    var resp: HTTPResponse := DOPut(cl, pathBuf as pchar, buf, bodyLen);
+    free(buf, 512);
+    if (resp.statusCode == 200 && resp.bodyPtr != 0) { rec := parseDNSRecord(resp.bodyPtr); }
+    HTTPResponseFree(resp);
+    free(pathBuf, 256);
+    return rec;
+}
+
+pub fn DomainRecordDelete(creds: DOCredentials, domain: pchar, id: int64): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    var numBuf: int64 := alloc(24);
+    var numStr: pchar := Int64ToStr(id, numBuf);
+    doMakePath3(pathBuf, "/v2/domains/"c, domain, "/records/"c);
+    var existLen: int64 := StrLen(pathBuf as pchar);
+    var nn: int64 := StrLen(numStr);
+    var i: int64 := 0;
+    while(i<nn){poke8(pathBuf+existLen+i,StrCharAt(numStr,i)&0xFF);i:=i+1;}
+    poke8(pathBuf+existLen+nn,0);
+    free(numBuf, 24);
+    var resp: HTTPResponse := DODelete(cl, pathBuf as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(pathBuf, 256);
+    return ok;
+}
+
+pub fn DomainRecordList(creds: DOCredentials, domain: pchar): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    doMakePath3(pathBuf, "/v2/domains/"c, domain, "/records"c);
+    var result: int64 := DOGetAll(cl, pathBuf as pchar, "domain_records"c);
+    free(pathBuf, 256);
+    return result;
+}
+
+pub fn DomainRecordGet(creds: DOCredentials, domain: pchar, id: int64): DODNSRecord {
+    var rec: DODNSRecord;
+    rec.id := 0; rec.recType := 0; rec.name := 0; rec.data := 0;
+    rec.priority := 0; rec.port := 0; rec.ttl := 0; rec.weight := 0;
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    var numBuf: int64 := alloc(24);
+    var numStr: pchar := Int64ToStr(id, numBuf);
+    doMakePath3(pathBuf, "/v2/domains/"c, domain, "/records/"c);
+    var existLen: int64 := StrLen(pathBuf as pchar);
+    var nn: int64 := StrLen(numStr);
+    var i: int64 := 0;
+    while(i<nn){poke8(pathBuf+existLen+i,StrCharAt(numStr,i)&0xFF);i:=i+1;}
+    poke8(pathBuf+existLen+nn,0);
+    free(numBuf, 24);
+    var resp: HTTPResponse := DOGet(cl, pathBuf as pchar);
+    if (resp.statusCode == 200 && resp.bodyPtr != 0) { rec := parseDNSRecord(resp.bodyPtr); }
+    HTTPResponseFree(resp);
+    free(pathBuf, 256);
+    return rec;
+}
+
+// ============================================================================
+// Load Balancer
+// ============================================================================
+
+fn parseLB(json: int64): DOLoadBalancer {
+    var lb: DOLoadBalancer;
+    lb.id        := netStrDup(json, "id"c);
+    lb.name      := netStrDup(json, "name"c);
+    lb.ip        := netStrDup(json, "ip"c);
+    lb.status    := netStrDup(json, "status"c);
+    lb.region    := netStrDup(json, "slug"c);
+    lb.algorithm := netStrDup(json, "algorithm"c);
+    return lb;
+}
+
+pub fn LBCreate(creds: DOCredentials,
+                name: pchar, region: pchar,
+                dropletIds: int64, dropletCount: int64): DOLoadBalancer {
+    var lb: DOLoadBalancer;
+    lb.id := 0; lb.name := 0; lb.ip := 0; lb.status := 0; lb.region := 0; lb.algorithm := 0;
+    var buf: int64 := alloc(2048);
+    var p: int64 := buf;
+    var h: pchar := "{\"name\":\""c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(p+i,StrCharAt(h,i)&0xFF);i:=i+1;} p:=p+lh;
+    var nl: int64 := StrLen(name);
+    i:=0; while(i<nl){poke8(p+i,StrCharAt(name,i)&0xFF);i:=i+1;} p:=p+nl;
+    var s1: pchar := "\",\"region\":\""c; var l1: int64 := StrLen(s1);
+    i:=0; while(i<l1){poke8(p+i,StrCharAt(s1,i)&0xFF);i:=i+1;} p:=p+l1;
+    var rl: int64 := StrLen(region);
+    i:=0; while(i<rl){poke8(p+i,StrCharAt(region,i)&0xFF);i:=i+1;} p:=p+rl;
+    var s2: pchar := "\",\"forwarding_rules\":[{\"entry_protocol\":\"http\",\"entry_port\":80,\"target_protocol\":\"http\",\"target_port\":80}]}"c;
+    var l2: int64 := StrLen(s2);
+    i:=0; while(i<l2){poke8(p+i,StrCharAt(s2,i)&0xFF);i:=i+1;} p:=p+l2;
+    poke8(p,0);
+    var bodyLen: int64 := p - buf;
+    var cl: DOClient := doClientNet(creds);
+    var path: pchar := "/v2/load_balancers"c;
+    var resp: HTTPResponse := DOPost(cl, path, buf, bodyLen);
+    free(buf, 2048);
+    if ((resp.statusCode == 200 || resp.statusCode == 202) && resp.bodyPtr != 0) {
+        lb := parseLB(resp.bodyPtr);
+    }
+    HTTPResponseFree(resp);
+    return lb;
+}
+
+pub fn LBDelete(creds: DOCredentials, id: pchar): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    var base: pchar := "/v2/load_balancers/"c;
+    doMakePath(pathBuf, base, id);
+    var resp: HTTPResponse := DODelete(cl, pathBuf as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(pathBuf, 256);
+    return ok;
+}
+
+pub fn LBGet(creds: DOCredentials, id: pchar): DOLoadBalancer {
+    var lb: DOLoadBalancer;
+    lb.id := 0; lb.name := 0; lb.ip := 0; lb.status := 0; lb.region := 0; lb.algorithm := 0;
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    var base: pchar := "/v2/load_balancers/"c;
+    doMakePath(pathBuf, base, id);
+    var resp: HTTPResponse := DOGet(cl, pathBuf as pchar);
+    if (resp.statusCode == 200 && resp.bodyPtr != 0) { lb := parseLB(resp.bodyPtr); }
+    HTTPResponseFree(resp);
+    free(pathBuf, 256);
+    return lb;
+}
+
+pub fn LBList(creds: DOCredentials): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var path: pchar := "/v2/load_balancers"c;
+    return DOGetAll(cl, path, "load_balancers"c);
+}
+
+pub fn LBAddDroplets(creds: DOCredentials, id: pchar, dropletIds: int64, count: int64): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var buf: int64 := alloc(1024);
+    var h: pchar := "{\"droplet_ids\":[]}"c;
+    var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(buf+i,StrCharAt(h,i)&0xFF);i:=i+1;}
+    poke8(buf+lh,0);
+    var pathBuf: int64 := alloc(256);
+    var base: pchar := "/v2/load_balancers/"c;
+    var sub: pchar := "/droplets"c;
+    doMakePath3(pathBuf, base, id, sub);
+    var resp: HTTPResponse := DOPost(cl, pathBuf as pchar, buf, lh);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(buf, 1024);
+    free(pathBuf, 256);
+    return ok;
+}
+
+pub fn LBRemoveDroplets(creds: DOCredentials, id: pchar, dropletIds: int64, count: int64): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var buf: int64 := alloc(1024);
+    var h: pchar := "{\"droplet_ids\":[]}"c;
+    var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(buf+i,StrCharAt(h,i)&0xFF);i:=i+1;}
+    poke8(buf+lh,0);
+    var pathBuf: int64 := alloc(256);
+    var base: pchar := "/v2/load_balancers/"c;
+    var sub: pchar := "/droplets"c;
+    doMakePath3(pathBuf, base, id, sub);
+    var resp: HTTPResponse := DODelete(cl, pathBuf as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(buf, 1024);
+    free(pathBuf, 256);
+    return ok;
+}
+
+// ============================================================================
+// Floating IPs
+// ============================================================================
+
+fn parseFloatingIP(json: int64): DOFloatingIP {
+    var f: DOFloatingIP;
+    f.ip        := netStrDup(json, "ip"c);
+    f.region    := netStrDup(json, "slug"c);
+    f.dropletId := doJsonInt(json, "id"c);
+    return f;
+}
+
+pub fn FloatingIPCreate(creds: DOCredentials, region: pchar): DOFloatingIP {
+    var f: DOFloatingIP; f.ip := 0; f.region := 0; f.dropletId := 0;
+    var buf: int64 := alloc(256);
+    var h: pchar := "{\"region\":\""c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(buf+i,StrCharAt(h,i)&0xFF);i:=i+1;}
+    var rl: int64 := StrLen(region);
+    i:=0; while(i<rl){poke8(buf+lh+i,StrCharAt(region,i)&0xFF);i:=i+1;}
+    var t: pchar := "\"}"c; var lt: int64 := StrLen(t);
+    var off: int64 := lh + rl;
+    i:=0; while(i<lt){poke8(buf+off+i,StrCharAt(t,i)&0xFF);i:=i+1;}
+    poke8(buf+off+lt,0);
+    var bodyLen: int64 := off + lt;
+    var cl: DOClient := doClientNet(creds);
+    var path: pchar := "/v2/floating_ips"c;
+    var resp: HTTPResponse := DOPost(cl, path, buf, bodyLen);
+    free(buf, 256);
+    if (resp.statusCode == 202 && resp.bodyPtr != 0) { f := parseFloatingIP(resp.bodyPtr); }
+    HTTPResponseFree(resp);
+    return f;
+}
+
+pub fn FloatingIPDelete(creds: DOCredentials, ip: pchar): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(128);
+    var base: pchar := "/v2/floating_ips/"c;
+    doMakePath(pathBuf, base, ip);
+    var resp: HTTPResponse := DODelete(cl, pathBuf as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(pathBuf, 128);
+    return ok;
+}
+
+pub fn FloatingIPAssign(creds: DOCredentials, ip: pchar, dropletId: int64): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var buf: int64 := alloc(256);
+    var h: pchar := "{\"type\":\"assign\",\"droplet_id\":"c;
+    var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(buf+i,StrCharAt(h,i)&0xFF);i:=i+1;}
+    var numBuf: int64 := alloc(24);
+    var numStr: pchar := Int64ToStr(dropletId, numBuf);
+    var nn: int64 := StrLen(numStr);
+    i:=0; while(i<nn){poke8(buf+lh+i,StrCharAt(numStr,i)&0xFF);i:=i+1;}
+    free(numBuf, 24);
+    poke8(buf+lh+nn,125); poke8(buf+lh+nn+1,0); // '}'
+    var bodyLen: int64 := lh + nn + 1;
+    var pathBuf: int64 := alloc(128);
+    var base: pchar := "/v2/floating_ips/"c;
+    var sub: pchar := "/actions"c;
+    doMakePath3(pathBuf, base, ip, sub);
+    var resp: HTTPResponse := DOPost(cl, pathBuf as pchar, buf, bodyLen);
+    var ok: int64 := 0;
+    if (resp.statusCode == 201) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(buf, 256);
+    free(pathBuf, 128);
+    return ok;
+}
+
+pub fn FloatingIPUnassign(creds: DOCredentials, ip: pchar): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var buf: int64 := alloc(64);
+    var h: pchar := "{\"type\":\"unassign\"}"c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(buf+i,StrCharAt(h,i)&0xFF);i:=i+1;} poke8(buf+lh,0);
+    var pathBuf: int64 := alloc(128);
+    var base: pchar := "/v2/floating_ips/"c;
+    var sub: pchar := "/actions"c;
+    doMakePath3(pathBuf, base, ip, sub);
+    var resp: HTTPResponse := DOPost(cl, pathBuf as pchar, buf, lh);
+    var ok: int64 := 0;
+    if (resp.statusCode == 201) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(buf, 64);
+    free(pathBuf, 128);
+    return ok;
+}
+
+pub fn FloatingIPList(creds: DOCredentials): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var path: pchar := "/v2/floating_ips"c;
+    return DOGetAll(cl, path, "floating_ips"c);
+}
+
+// ============================================================================
+// VPC
+// ============================================================================
+
+fn parseVPC(json: int64): DOVPC {
+    var v: DOVPC;
+    v.id        := netStrDup(json, "id"c);
+    v.name      := netStrDup(json, "name"c);
+    v.region    := netStrDup(json, "region_slug"c);
+    v.ipRange   := netStrDup(json, "ip_range"c);
+    v.isDefault := doJsonBool(json, "default"c);
+    return v;
+}
+
+pub fn VPCCreate(creds: DOCredentials, name: pchar, region: pchar, ipRange: pchar): DOVPC {
+    var v: DOVPC; v.id := 0; v.name := 0; v.region := 0; v.ipRange := 0; v.isDefault := 0;
+    var buf: int64 := alloc(512);
+    var p: int64 := buf;
+    var h: pchar := "{\"name\":\""c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(p+i,StrCharAt(h,i)&0xFF);i:=i+1;} p:=p+lh;
+    var nl: int64 := StrLen(name);
+    i:=0; while(i<nl){poke8(p+i,StrCharAt(name,i)&0xFF);i:=i+1;} p:=p+nl;
+    var s1: pchar := "\",\"region\":\""c; var l1: int64 := StrLen(s1);
+    i:=0; while(i<l1){poke8(p+i,StrCharAt(s1,i)&0xFF);i:=i+1;} p:=p+l1;
+    var rl: int64 := StrLen(region);
+    i:=0; while(i<rl){poke8(p+i,StrCharAt(region,i)&0xFF);i:=i+1;} p:=p+rl;
+    var s2: pchar := "\",\"ip_range\":\""c; var l2: int64 := StrLen(s2);
+    i:=0; while(i<l2){poke8(p+i,StrCharAt(s2,i)&0xFF);i:=i+1;} p:=p+l2;
+    var il: int64 := StrLen(ipRange);
+    i:=0; while(i<il){poke8(p+i,StrCharAt(ipRange,i)&0xFF);i:=i+1;} p:=p+il;
+    var t: pchar := "\"}"c; var lt: int64 := StrLen(t);
+    i:=0; while(i<lt){poke8(p+i,StrCharAt(t,i)&0xFF);i:=i+1;} p:=p+lt;
+    poke8(p,0);
+    var bodyLen: int64 := p - buf;
+    var cl: DOClient := doClientNet(creds);
+    var path: pchar := "/v2/vpcs"c;
+    var resp: HTTPResponse := DOPost(cl, path, buf, bodyLen);
+    free(buf, 512);
+    if (resp.statusCode == 201 && resp.bodyPtr != 0) { v := parseVPC(resp.bodyPtr); }
+    HTTPResponseFree(resp);
+    return v;
+}
+
+pub fn VPCDelete(creds: DOCredentials, id: pchar): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(128);
+    var base: pchar := "/v2/vpcs/"c;
+    doMakePath(pathBuf, base, id);
+    var resp: HTTPResponse := DODelete(cl, pathBuf as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(pathBuf, 128);
+    return ok;
+}
+
+pub fn VPCGet(creds: DOCredentials, id: pchar): DOVPC {
+    var v: DOVPC; v.id := 0; v.name := 0; v.region := 0; v.ipRange := 0; v.isDefault := 0;
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(128);
+    var base: pchar := "/v2/vpcs/"c;
+    doMakePath(pathBuf, base, id);
+    var resp: HTTPResponse := DOGet(cl, pathBuf as pchar);
+    if (resp.statusCode == 200 && resp.bodyPtr != 0) { v := parseVPC(resp.bodyPtr); }
+    HTTPResponseFree(resp);
+    free(pathBuf, 128);
+    return v;
+}
+
+pub fn VPCList(creds: DOCredentials): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var path: pchar := "/v2/vpcs"c;
+    return DOGetAll(cl, path, "vpcs"c);
+}
+
+pub fn VPCMemberList(creds: DOCredentials, id: pchar): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    var base: pchar := "/v2/vpcs/"c;
+    var sub: pchar := "/members"c;
+    doMakePath3(pathBuf, base, id, sub);
+    var result: int64 := DOGetAll(cl, pathBuf as pchar, "members"c);
+    free(pathBuf, 256);
+    return result;
+}
+
+// ============================================================================
+// Firewall
+// ============================================================================
+
+fn parseFirewall(json: int64): DOFirewall {
+    var f: DOFirewall;
+    f.id     := netStrDup(json, "id"c);
+    f.name   := netStrDup(json, "name"c);
+    f.status := netStrDup(json, "status"c);
+    return f;
+}
+
+pub fn FirewallCreate(creds: DOCredentials, name: pchar,
+                      inbound: int64, inCount: int64,
+                      outbound: int64, outCount: int64): DOFirewall {
+    var f: DOFirewall; f.id := 0; f.name := 0; f.status := 0;
+    var buf: int64 := alloc(2048);
+    var p: int64 := buf;
+    var h: pchar := "{\"name\":\""c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(p+i,StrCharAt(h,i)&0xFF);i:=i+1;} p:=p+lh;
+    var nl: int64 := StrLen(name);
+    i:=0; while(i<nl){poke8(p+i,StrCharAt(name,i)&0xFF);i:=i+1;} p:=p+nl;
+    var t: pchar := "\",\"inbound_rules\":[],\"outbound_rules\":[]}"c;
+    var lt: int64 := StrLen(t);
+    i:=0; while(i<lt){poke8(p+i,StrCharAt(t,i)&0xFF);i:=i+1;} p:=p+lt;
+    poke8(p,0);
+    var bodyLen: int64 := p - buf;
+    var cl: DOClient := doClientNet(creds);
+    var path: pchar := "/v2/firewalls"c;
+    var resp: HTTPResponse := DOPost(cl, path, buf, bodyLen);
+    free(buf, 2048);
+    if (resp.statusCode == 202 && resp.bodyPtr != 0) { f := parseFirewall(resp.bodyPtr); }
+    HTTPResponseFree(resp);
+    return f;
+}
+
+pub fn FirewallDelete(creds: DOCredentials, id: pchar): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(128);
+    var base: pchar := "/v2/firewalls/"c;
+    doMakePath(pathBuf, base, id);
+    var resp: HTTPResponse := DODelete(cl, pathBuf as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(pathBuf, 128);
+    return ok;
+}
+
+pub fn FirewallGet(creds: DOCredentials, id: pchar): DOFirewall {
+    var f: DOFirewall; f.id := 0; f.name := 0; f.status := 0;
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(128);
+    var base: pchar := "/v2/firewalls/"c;
+    doMakePath(pathBuf, base, id);
+    var resp: HTTPResponse := DOGet(cl, pathBuf as pchar);
+    if (resp.statusCode == 200 && resp.bodyPtr != 0) { f := parseFirewall(resp.bodyPtr); }
+    HTTPResponseFree(resp);
+    free(pathBuf, 128);
+    return f;
+}
+
+pub fn FirewallList(creds: DOCredentials): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var path: pchar := "/v2/firewalls"c;
+    return DOGetAll(cl, path, "firewalls"c);
+}
+
+pub fn FirewallAddDroplets(creds: DOCredentials, id: pchar, dropletIds: int64, count: int64): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var buf: int64 := alloc(512);
+    var h: pchar := "{\"droplet_ids\":[]}"c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(buf+i,StrCharAt(h,i)&0xFF);i:=i+1;} poke8(buf+lh,0);
+    var pathBuf: int64 := alloc(256);
+    doMakePath3(pathBuf, "/v2/firewalls/"c, id, "/droplets"c);
+    var resp: HTTPResponse := DOPost(cl, pathBuf as pchar, buf, lh);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(buf, 512);
+    free(pathBuf, 256);
+    return ok;
+}
+
+pub fn FirewallRemoveDroplets(creds: DOCredentials, id: pchar, dropletIds: int64, count: int64): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var buf: int64 := alloc(512);
+    var h: pchar := "{\"droplet_ids\":[]}"c; var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(buf+i,StrCharAt(h,i)&0xFF);i:=i+1;} poke8(buf+lh,0);
+    var pathBuf: int64 := alloc(256);
+    doMakePath3(pathBuf, "/v2/firewalls/"c, id, "/droplets"c);
+    var resp: HTTPResponse := DODelete(cl, pathBuf as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(buf, 512);
+    free(pathBuf, 256);
+    return ok;
+}
+
+pub fn FirewallAddRules(creds: DOCredentials, id: pchar, rules: int64, isInbound: int64): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    doMakePath3(pathBuf, "/v2/firewalls/"c, id, "/rules"c);
+    var buf: int64 := alloc(1024);
+    var h: pchar := "{\"inbound_rules\":[],\"outbound_rules\":[]}"c;
+    var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(buf+i,StrCharAt(h,i)&0xFF);i:=i+1;} poke8(buf+lh,0);
+    var resp: HTTPResponse := DOPost(cl, pathBuf as pchar, buf, lh);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(buf, 1024);
+    free(pathBuf, 256);
+    return ok;
+}
+
+pub fn FirewallRemoveRules(creds: DOCredentials, id: pchar, rules: int64, isInbound: int64): int64 {
+    var cl: DOClient := doClientNet(creds);
+    var pathBuf: int64 := alloc(256);
+    doMakePath3(pathBuf, "/v2/firewalls/"c, id, "/rules"c);
+    var buf: int64 := alloc(1024);
+    var h: pchar := "{\"inbound_rules\":[],\"outbound_rules\":[]}"c;
+    var lh: int64 := StrLen(h);
+    var i: int64 := 0;
+    while(i<lh){poke8(buf+i,StrCharAt(h,i)&0xFF);i:=i+1;} poke8(buf+lh,0);
+    var resp: HTTPResponse := DODelete(cl, pathBuf as pchar);
+    var ok: int64 := 0;
+    if (resp.statusCode == 204) { ok := 1; }
+    HTTPResponseFree(resp);
+    free(buf, 1024);
+    free(pathBuf, 256);
+    return ok;
+}
