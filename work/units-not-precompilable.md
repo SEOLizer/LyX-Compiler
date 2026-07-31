@@ -1,4 +1,4 @@
-# Unit-Übersetzbarkeit (Stand 2026-07-31, lyxc 1.0.9A)
+# Unit-Übersetzbarkeit (Stand 2026-07-31, lyxc 1.0.10A)
 
 **390 von 390 Unit-Quellen übersetzen.** Diese Datei hielt die Ausnahmen fest;
 es gibt derzeit keine mehr.

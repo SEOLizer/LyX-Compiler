@@ -2,6 +2,106 @@
 
 ## Unveröffentlicht (develop)
 
+_(noch nichts)_
+
+## Version 1.0.10A (Juli 2026)
+
+### Compiler (sema) — unbekannte Feldnamen werden gemeldet (#988)
+- sema prüfte bei `basis.feld` nur die **Sichtbarkeit**, nie die **Existenz**. Ein
+  Tippfehler übersetzte klaglos und lieferte zur Laufzeit 0: `p.zzz := 99;
+  return p.zzz;` auf einem Struct ohne dieses Feld ergab 0 statt eines Fehlers.
+- `_checkFieldExists` prüft jetzt gegen den deklarierten Typ der Basis und läuft
+  dabei die Vererbungskette hoch. Bewusst konservativ: gemeldet wird nur, wenn
+  sich der Typ eindeutig zu einer Struct-/Klassendeklaration mit Feldern auflöst.
+- Fallstrick dabei: eine Elternklasse aus einem importierten Unit hat in dieser
+  Übersetzungseinheit **keinen AST-Knoten**. Das als „Feld fehlt“ zu werten
+  meldete zwölf lyxvision-Units fälschlich als kaputt — ohne einsehbare
+  Felderliste ist Abwesenheit nicht belegbar.
+
+### Compiler (Parser) — Sentinel-Knoten für AST-Index -1 (#989)
+- Der AST nutzt `-1` als Marker für „kein Kind“; etliche Baumläufe riefen die
+  Knoten-Zugriffsfunktionen ungeprüft damit auf. `sn_off` rechnete dann
+  `nodes + (-1)*88`, also **unter die Knoten-Arena**.
+- Ob das tödlich war, entschied allein die Speicherlage: lag dort noch eine
+  gemappte Seite, wurde still Garbage gelesen; fiel der Puffer an einen
+  Mapping-Anfang, faultete der Compiler. Sichtbar wurde es als scheinbare
+  Größengrenze — **jede** Zwei-Zeilen-Ergänzung in `src/sema.lyx` brach den
+  Selbstbau, dieselbe Ergänzung in `parser.lyx` war harmlos.
+- Der Parser alloziert den Knotenpuffer jetzt um einen Knoten größer und lässt
+  `self.nodes` hinter einen Sentinel zeigen. Weil alle Konsumenten denselben
+  Basiszeiger bekommen, wirkt das für die ganze Pipeline.
+
+### Compiler (Codegen) + Standardbibliothek — echte Atomics (#991)
+- `atomic_load/store/cas/fetch_add` und die drei `fence_*` waren in sema
+  registriert, aber **nur im lyxos-Backend emittiert**. Auf dem ELF-Pfad endete
+  jeder Aufruf in `no codegen implementation found` — die stdlib konnte sie also
+  gar nicht verwenden.
+- Jetzt auch im x86-Codegen: `lock xadd`, `lock cmpxchg`, `xchg`,
+  `sfence`/`lfence`/`mfence`.
+- Damit sind `AtomicAdd` und `CAS` in `std/thread.lyx` echt atomar; sie nutzten
+  vorher `peek64`/`poke64` und hatten trotz des Namens ein Rennen. Derselbe
+  Defekt steckte im Mutex: `if (peek32(p) == 0) { poke32(p, 1) }` ist ein
+  nicht-atomares Test-and-Set — ein Mutex, der nicht ausschließt.
+
+### Standardbibliothek — `ThreadCreate` startet wieder Threads (#992)
+- `func` und `arg` lagen in `ThreadCreate`s eigenem Frame. `CLONE_VM` garantiert
+  den geteilten **Adressraum**, nicht die **Lebensdauer** des Frames — nach dem
+  Return wurde der Speicher wiederverwendet, und der Kindthread sprang auf einen
+  überschriebenen Funktionszeiger. Ohne Join lief es zufällig durch, mit Join
+  segfaultete es; `ThreadJoin` war nur das erste, was den Frame überschrieb.
+- Übergabe jetzt über einen Heap-Block plus Trampolin, das auf dem Kind-Stack
+  einen eigenen Frame bekommt; Handshake über Atomics, Spawns serialisiert.
+- Zweiter Teil: `CLONE_CHILD_SETTID` schreibt die TID erst, wenn das Kind läuft —
+  der Elternteil las vorher die selbst geschriebene 0 und hielt den Thread für
+  beendet. Jetzt `CLONE_PARENT_SETTID` (Kernel schreibt synchron).
+- `ThreadJoin` gibt den Kind-Stack frei; ohne das scheiterte `ThreadCreate` unter
+  `ulimit -v 1G` ab dem 509. Thread.
+
+### Compiler — `free`-Builtin entfernt, Freigaben wirken wieder (#995)
+- `free` war ein Builtin, das **nichts tat** („no-op in bootstrap ... leaks are
+  acceptable“) und dabei `std/alloc.lyx` verdeckte. Jede Freigabe im Projekt war
+  wirkungslos: 1000× `alloc(2 MB)` + `free(2 MB)` scheiterte unter
+  `ulimit -v 262144` beim 127. Durchlauf.
+- Es auf `munmap` umzustellen wäre falsch gewesen — der so gebaute Compiler
+  übersetzte seine eigene Quelle nicht mehr. Grund: es gibt **zwei Allokatoren**.
+  `std/alloc.lyx` macht ein `mmap` je Allokation (dort muss `free` `munmap`
+  rufen), `src/std/alloc.lyx` ist eine Arena mit Bump-Pointer (dort ist `free`
+  korrekt ein No-op) — und den nutzt der Compiler selbst.
+- Ein globales Builtin kann nur eine der beiden Seiten richtig bedienen. Es ist
+  jetzt entfernt; jede Übersetzungseinheit bekommt das `free` ihres eigenen
+  Allokators.
+- Voraussetzung war, alle 135 einargumentigen Aufrufstellen auf
+  `free(ptr, size)` zu bringen. `tests/free_arity_test.sh` hält das fest.
+
+### Standardbibliothek — GLX-/EGL-Wrapper geschrieben
+- `std/qt5_glx.lyx` und `std/qt5_egl.lyx` enthielten nur Konstanten und rohe
+  `extern fn`-Bindings. Die typisierten Wrapper, die der Kommentarblock
+  „Usage pattern“ als API beschreibt, waren **nie geschrieben worden** — die
+  Beispiele riefen sie trotzdem auf.
+- Zwölf Wrapper ergänzt. `EGLDisplay` ist dabei vom `int64`-Alias zum Struct
+  geworden, damit `eglTerminate` nicht auf ein uninitialisiertes Display läuft.
+
+### Tests — Builtins, die Unit-Namen verdecken
+- Ein registriertes Builtin gewinnt gegen eine gleichnamige Deklaration in einer
+  importierten Unit; die Unit-Fassung ist dann stillschweigend wirkungslos. Diese
+  Klasse hat das Projekt mehrfach getroffen (`free`, Phantom-Builtins,
+  POSIX-Flag-Konstanten).
+- `tests/builtin_shadow_test.sh` führt die 31 bekannten Kollisionen und schlägt
+  bei einer neuen fehl. Dabei gefunden: `std/audio.lyx` deklarierte
+  `MAP_ANON := 32`, das Builtin liefert 34 — wer die Konstante aus der Unit las,
+  bekam still den anderen Wert.
+- Bewusst **kein** Compiler-Warnhinweis: er würde bei jedem Programm feuern, das
+  `std.io` oder `std.string` importiert, weil die dortigen Kollisionen gewollt
+  sind.
+
+### Beispiele — 256 → 336 von 341
+- Qualifizierter Modulzugriff entfernt (den gibt es in Lyx nicht), alte
+  Funktionsnamen nachgezogen, fehlende Imports ergänzt, `&x` → `@x`.
+- `examples/io/net/echo_client.lyx` war durchgängig Go (Tupel-Destructuring,
+  Slices, `nil`) und ist gegen die echte Socket-API neu geschrieben — end-to-end
+  gegen `echo_server.lyx` verifiziert.
+
+
 ### Compiler (Codegen) — `sys_open`, `sys_lseek`, `sys_stat` auf dem ELF-Pfad
 - `sys_read`, `sys_write` und `sys_close` waren im x86-Codegen als Alias der
   gleichnamigen Builtins vorhanden, `sys_open`/`sys_lseek`/`sys_stat` **nicht** —
