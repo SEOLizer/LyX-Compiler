@@ -1,4 +1,9 @@
-# Lyx v0.9.5B — Canonical EBNF Grammar
+# Lyx 1.0.10A — Canonical EBNF Grammar
+
+> Stand 2026-07-31, gegen lyxc 1.0.10A geprueft. Die Keyword-Liste in
+> Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
+> Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt.
+> Bekannte Abweichungen zwischen Grammatik und Compiler stehen in 20.1.
 
 Status: Draft
 Target parser: Recursive Descent + Pratt Expression Parser
@@ -86,20 +91,37 @@ Examples:
 
 ## 2.1 Reserved Keywords
 
+Diese 70 Woerter sind reserviert und koennen nicht als Bezeichner
+verwendet werden. Die Liste ist gegen den Compiler geprueft: jedes Wort wurde
+als Variablenname eingesetzt und muss einen Fehler ausloesen.
+
 ```text
-fn var let co con
-if else while for do downto to repeat until
-switch case break continue default return
-true false null
-extern unit import pub as
-array struct flat packed class extends
-new dispose super static self Self
-private protected
-panic assert check
-enum match try catch throw limit
-virtual override abstract
-dim utype
+abstract and array as assert
+break case catch class co
+con continue default dim dispose
+do downto else enum extends
+extern false finally fn for
+if implements import in interface
+is layout let Map match
+new not null or override
+panic parallel pool private protected
+pub public repeat return RingBuffer
+self Set signal static struct
+super switch throw to true
+try type unit until utype
+var virtual where while widget
 ```
+
+Zwei Sonderfaelle:
+
+- `self` steht nicht in der Keyword-Tabelle des Lexers, sondern wird im Parser
+  gesondert behandelt (`src/parser.lyx`) — reserviert ist es dennoch.
+- `char` steht umgekehrt in der Keyword-Tabelle, laesst sich aber als Bezeichner
+  verwenden: es ist ein Typname, kein reserviertes Wort.
+
+Fruehere Fassungen dieses Dokuments fuehrten ausserdem `Self`, `flat`, `packed`,
+`check` und `limit` als reserviert. Das trifft nicht zu; alle fuenf sind als
+Bezeichner verwendbar.
 
 ## 2.2 Soft Keywords
 
@@ -310,12 +332,12 @@ Type                = PrimaryType [ "?" ] ;
 
 PrimaryType         = BuiltinType
                     | Ident
-                    | QualifiedIdent
                     | ArrayType
                     | ParallelArrayType
                     | TupleType
                     | MapType
-                    | SetType ;
+                    | FnPtrType
+                    | MethodPtrType ;
 
 BuiltinType         = "bool"
                     | BaseIntType
@@ -335,7 +357,10 @@ BaseIntType         = "int8"
                     | "isize"
                     | "usize" ;
 
-QualifiedIdent      = Ident "::" Ident ;
+(* Es gibt in Lyx KEINEN qualifizierten Zugriff. Weder `Modul::Name` noch
+   `Modul.Name` ist gueltig -- Symbole importierter Units liegen in einem
+   flachen Namensraum und werden unqualifiziert angesprochen. Frueher stand
+   hier `QualifiedIdent = Ident "::" Ident`; `::` erzeugt einen Parse-Fehler. *)
 
 ArrayType           = "array" "[" Type "]"
                     | "Array" "<" Type ">" ;
@@ -344,9 +369,37 @@ ParallelArrayType   = "ParallelArray" "<" Type ">" ;
 
 TupleType           = "(" Type "," Type { "," Type } ")" ;
 
+(* Funktions- und Methodenzeiger (seit 1.0.4A). In der Praxis ueber einen
+   Typalias verwendet:
+
+       type Cb = fn(int64): int64;
+       var f: Cb := dbl;          (* Funktionsname als Wert *)
+       f(21)
+
+   Ein Methodenzeiger fuehrt den Empfaenger als ersten Parameter und bindet
+   beim Zuweisen die Instanz; intern ist er ein 16-Byte-Paar {Code, Daten}:
+
+       type TM = method(TC): int64;
+       btn.on_click := form.Handle;   (* bindet form als self *)
+       btn.on_click(rcv)
+
+   Ein inline geschriebener Funktionszeigertyp (`var f: fn(int64): int64`)
+   wird vom Parser zwar angenommen, erzeugt aber fehlerhaften Code -- siehe
+   Abschnitt 20. Kanonisch ist der Typalias. *)
+
+FnPtrType           = "fn" "(" [ FnPtrParams ] ")" [ ":" Type ] ;
+
+MethodPtrType       = "method" "(" [ FnPtrParams ] ")" [ ":" Type ] ;
+
+FnPtrParams         = FnPtrParam { "," FnPtrParam } ;
+
+FnPtrParam          = [ Ident ":" ] Type ;   (* Parametername optional *)
+
 MapType             = "Map" "<" Type "," Type ">" ;
 
-SetType             = "Set" "<" Type ">" ;
+(* `Set` ist als Wort reserviert, `Set<T>` wird von der Semantikpruefung aber
+   nicht aufgeloest ("unknown type in var decl"). Die Form ist fuer spaeter
+   vorgesehen und hier bewusst nicht als gueltige Produktion gefuehrt. *)
 ```
 
 ---
@@ -674,7 +727,7 @@ LiteralPattern      = Literal ;
 
 IdentPattern        = Ident ;
 
-EnumPattern         = QualifiedIdent ;
+EnumPattern         = Ident "." Ident ;   (* z. B. Color.Green *)
 
 WildcardPattern     = "_" ;
 
@@ -694,7 +747,6 @@ PipeExpr            = NullCoalesceExpr
                       { "|>" PipeTarget } ;
 
 PipeTarget          = Ident [ "(" [ PipeArgList ] ")" ]
-                    | QualifiedIdent [ "(" [ PipeArgList ] ")" ]
                     | FieldPipelineTarget ;
 
 FieldPipelineTarget = Ident "." Ident [ "(" [ PipeArgList ] ")" ] ;
@@ -764,7 +816,6 @@ PrimaryExpr         = Literal
                     | SelfExpr
                     | SuperExpr
                     | Ident
-                    | QualifiedIdent
                     | BuiltinCall
                     | NewExpr
                     | DisposeExpr
@@ -892,8 +943,7 @@ ConstExpr                 = ConstPipeExpr ;
 ConstPipeExpr             = ConstNullCoalesceExpr
                             { "|>" ConstPipeTarget } ;
 
-ConstPipeTarget           = Ident [ "(" [ ConstPipeArgList ] ")" ]
-                          | QualifiedIdent [ "(" [ ConstPipeArgList ] ")" ] ;
+ConstPipeTarget           = Ident [ "(" [ ConstPipeArgList ] ")" ] ;
 
 ConstPipeArgList          = "?" { "," ConstExpr }
                           | ConstExpr { "," ConstExpr } ;
@@ -953,7 +1003,6 @@ ConstSafeFieldSuffix      = "?." Ident ;
 
 ConstPrimaryExpr          = Literal
                           | Ident
-                          | QualifiedIdent
                           | ConstTupleExpr
                           | "(" ConstExpr ")" ;
 
@@ -1048,6 +1097,18 @@ visibility and module export rules
 default parameter value evaluation order and scoping
 named argument resolution when callee is an imported or builtin function
 ```
+
+## 20.1 Bekannte Abweichungen zwischen Grammatik und Compiler
+
+Stellen, an denen der Parser mehr annimmt, als der Rest der Werkzeugkette
+tragen kann. Sie sind hier festgehalten, damit die Grammatik nicht mehr
+verspricht, als eingeloest wird.
+
+| Konstrukt | Verhalten |
+|---|---|
+| `var f: fn(int64): int64 := g;` | Uebersetzt fehlerfrei, das erzeugte Programm stuerzt beim Aufruf ab. Kanonisch ist der Typalias (`type Cb = fn(int64): int64;`). |
+| `Set<T>` | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
+| Methodenzeiger-Bindung | `feld := obj.Method` ist als Grammatik vorhanden; Teile der Bindung sind derzeit nicht funktionsfaehig (siehe `tests/method_ptr_test.sh`). |
 
 ---
 
