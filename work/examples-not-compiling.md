@@ -1,6 +1,6 @@
 # Nicht kompilierbare Beispiele (Stand 2026-07-31, lyxc 1.0.9A)
 
-**325 von 342 Beispielen übersetzen** (Ausgangslage: 256).
+**336 von 342 Beispielen übersetzen** (Ausgangslage: 256).
 
 ## Wie geprüft wird
 
@@ -10,44 +10,56 @@ Der Resolver baut aus `import std.foo` den Pfad `std/foo.lyx` und hängt ihn an
 die Suchwurzeln; `--std-path=…/std` sucht deshalb `std/std/foo.lyx`.
 
 Dateien mit `unit …;` sind Bibliotheken und werden mit `--compile-unit` geprüft.
+Die `unit`-Zeile steht nicht zwingend in den ersten drei Zeilen — wer nur den
+Dateikopf absucht, meldet sechs Bibliotheken fälschlich als kaputt.
 
-## Drei davon sollen NICHT übersetzen
+## Fünf davon sollen NICHT übersetzen
 
 | Datei | Grund |
 |---|---|
 | `examples/graphics/dlopen_test.lyx` | `dlopen` steht auf der harten FFI-Blacklist — dynamisches Nachladen hebelt die Sandbox aus. Die Datei belegt das Verhalten und trägt einen entsprechenden Kopfkommentar. |
+| `examples/graphics/test_ffi.lyx` | ≥2 `pchar`-Parameter ohne Größenlimit ⇒ Klasse 3 über die Signatur. Belegt die Signatur-Heuristik der Sandbox. |
 | `examples/syntax_highlight_examples/hello.lyx` | Fixture für Editor-Highlighting, kein Programm (`let`, `print_str`) |
 | `examples/syntax_highlight_examples/case_switch.lyx` | dito |
 | `examples/syntax_highlight_examples/consts.lyx` | dito |
 
-## Verbleibende
+## Verbleibend: eines
 
-| Beispiel | Fehler |
-|---|---|
-| `examples/graphics/dlopen_test.lyx` | sema error (line 1): extern fn in FFI-Blacklist (Klasse 3) — direkter Aufruf verboten |
-| `examples/graphics/glx_test.lyx` | sema error (line 70): undefined function 'GLXCreateContextLegacy' |
-| `examples/graphics/qt5_egl_test.lyx` | sema error (line 39): undefined function 'EGLBindOpenGL' |
-| `examples/graphics/test_ffi.lyx` | sema error (line 2): extern fn: ≥2 pchar-Parameter ohne Größenlimit (Klasse 3 via Signatur) |
-| `examples/io/mmap/main_with_mmap.lyx` | sema error (line 1): Modul nicht gefunden (weder .lyx noch .lyu) 'myunit' |
-| `examples/io/net/echo_client.lyx` | Parse error at line 40: expected ], got : ':' |
-| `examples/io/net/echo_server.lyx` | sema error (line 129): undefined function 'read_raw' |
-| `examples/io/net/icmp_test.lyx` | sema error (line 54): unknown type in var decl 'uint16' |
-| `examples/ldap_test_simple.lyx` | sema error (line 9): undefined function 'LDAPErrorToStr' |
-| `examples/lyxvision/lyxvision_demo.lyx` | sema error (line 79): undefined symbol 'IO' |
-| `examples/syntax_highlight_examples/case_switch.lyx` | sema error (line 3): undefined function 'print_str' |
-| `examples/syntax_highlight_examples/consts.lyx` | Parse error at line 6: expected expression |
-| `examples/syntax_highlight_examples/hello.lyx` | sema error (line 3): undefined function 'print_str' |
-| `examples/test_stack_peek.lyx` | Parse error at line 10: expected expression |
-| `examples/thread_test.lyx` | sema error (line 13): undefined function 'MutexInit' |
-| `examples/units/test/params.lyx` | sema error (line 5): undefined function 'print_int' |
-| `examples/units/use_math_utils.lyx` | sema error (line 10): undefined symbol 'math_utils' |
+| Beispiel | Fehler | Bewertung |
+|---|---|---|
+| `examples/io/mmap/main_with_mmap.lyx` | `sema error (line 1): Modul nicht gefunden … 'myunit'` | Wortgleiches, aber kaputtes Duplikat von `examples/units/main_with_unit.lyx`: es nutzt qualifizierten Zugriff (`myunit.call_ioctl()`, den es nicht gibt) und liegt in einem Verzeichnis ohne `myunit`-Geschwisterdatei. Demonstriert außerdem nichts zu mmap. Kandidat zum Löschen — nicht ohne Rückfrage entfernt. |
 
-## Muster in den verbleibenden
+## Was in dieser Runde behoben wurde
 
-- **Funktionen, die es nicht gibt**: `GLXCreateContextLegacy`, `EGLBindOpenGL`,
-  `LDAPErrorToStr`, `MutexInit`, `read_raw`, `print_int` — teils Wrapper, die
-  nie geschrieben wurden, teils alte Namen.
-- **Qualifizierter Modulzugriff** (`math_utils.x`, `IO.x`): Modul-Symbole teilen
-  sich einen flachen Namespace, `modul.name` gibt es nicht.
-- **Sonstiges**: `uint16` als Typ, ein Parse-Fehler in `echo_client`, ein
-  fehlendes `myunit` (Geschwister-Import ohne Suchpfad).
+- **Qualifizierter Modulzugriff** (`IO.alloc`, `math_utils.add`): Modul-Symbole
+  teilen sich einen flachen Namespace, `modul.name` gibt es nicht — Präfix weg.
+- **Alte Funktionsnamen**: `read_raw`→`read`, `MutexInit`→`MutexNew`,
+  `AtomicInit`→`AtomicNew`, `print_int`/`print_str`→`PrintInt`/`PrintStr`.
+- **Fehlender Import**: `LDAPErrorToStr` existiert in `std/net/ldap.lyx`, das
+  Beispiel importierte die Unit nicht.
+- **Adressoperator**: `&y` → `@y`.
+- **`uint16` als var-Typ** → `int64`.
+- **`echo_client.lyx` neu geschrieben**: war durchgängig Go (Tupel-Destructuring,
+  Slices, `nil`, `err.Error()`). Jetzt gegen die echte Socket-API
+  (`TCPConnect`/`TCPConnWrite`/`TCPConnRead`/`TCPConnClose`); end-to-end gegen
+  `echo_server.lyx` verifiziert.
+- **GLX-/EGL-Wrapper geschrieben**: `std/qt5_glx.lyx` und `std/qt5_egl.lyx`
+  enthielten nur Konstanten und rohe `extern fn`-Bindings. Die typisierten
+  Hüllen, die der Kommentarblock „Usage pattern“ in `qt5_egl.lyx` als API
+  beschreibt, waren nie geschrieben worden — die Beispiele riefen sie trotzdem.
+  Ergänzt: `GLXCreateContextLegacy`/`GLXMakeCurrent`/`GLXDestroyContext`/
+  `GLXSwapBuffers` sowie `EGLGetDisplay`/`EGLBindOpenGL`/`EGLBindOpenGLES`/
+  `EGLCreateContext`/`EGLCreateWindowSurface`/`EGLMakeCurrent`/`EGLSwapBuffers`/
+  `EGLTerminate`. `EGLDisplay` ist dabei vom `int64`-Alias zum Struct mit
+  `display`/`initialized` geworden (es hatte keine anderen Nutzer), damit
+  `eglTerminate` nicht auf uninitialisierte Displays läuft.
+  Regressionstest: `tests/glx_egl_wrappers_test.sh` (compile-only — libGL/libEGL
+  sind auf einem Buildhost ohne GPU nicht sinnvoll aufrufbar).
+
+## Nebenbefund
+
+`AtomicAdd` in `std/thread.lyx` liest und schreibt mit `peek64`/`poke64` und ist
+damit **nicht atomar** — trotz des Namens. Für echte Atomarität müssten die
+WSP-Atomics-Builtins verwendet werden. Separat zu behandeln, hier nur notiert;
+das Beispiel beschriftete den Rückgabewert zusätzlich als „old value“, obwohl die
+Funktion laut eigenem Kommentar den neuen Wert liefert (Beschriftung korrigiert).

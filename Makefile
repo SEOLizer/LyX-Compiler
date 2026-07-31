@@ -195,6 +195,9 @@ test: lyxc
 	@echo "--- FFI-Trust-Grenze von --compile-unit (5 tests) ---"
 	@bash tests/ffi_unit_trust_test.sh
 	@echo "OK"
+	@echo "--- GLX-/EGL-Wrapper (4 tests) ---"
+	@bash tests/glx_egl_wrappers_test.sh
+	@echo "OK"
 	@echo "--- Geometrie-/Result-Units (Struct-Literal-Umbau, 31 Prüfungen) ---"
 	./lyxc --std-path=std tests/geom_units_test.lyx -o /tmp/lyxc_geom_test
 	@/tmp/lyxc_geom_test > /dev/null
