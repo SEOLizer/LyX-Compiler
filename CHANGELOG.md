@@ -2,6 +2,17 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler (Codegen) — `sys_open`, `sys_lseek`, `sys_stat` auf dem ELF-Pfad
+- `sys_read`, `sys_write` und `sys_close` waren im x86-Codegen als Alias der
+  gleichnamigen Builtins vorhanden, `sys_open`/`sys_lseek`/`sys_stat` **nicht** —
+  obwohl `sys_open` in sema registriert und im IR-Pfad gelowert war. Auf ELF
+  starb der Aufruf mit `no codegen implementation found`, auf LyxOS lief er.
+- Aliase ergänzt (Syscalls 2, 8, 4). `sys_lseek` war zusätzlich in sema gar nicht
+  registriert und ist jetzt nachgetragen.
+- Neuer Test `tests/sys_file_syscalls_test.lyx` (6 Prüfungen), in `make test`:
+  echter Datei-Roundtrip — schreiben, zurücklesen, Inhalt vergleichen, per
+  `lseek` die Größe bestimmen.
+
 ### Beispiele — FFI-Sandbox
 - **Zwei Beispiele deklarierten Builtins als `extern fn`** (`read`/`write` in
   `games/game1`, `sys_socket`/`mmap`/`poke8`/… in `test_extern_redis`). Das war

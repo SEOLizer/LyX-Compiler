@@ -1,6 +1,6 @@
 # Nicht kompilierbare Beispiele (Stand 2026-07-31, lyxc 1.0.9A)
 
-**323 von 342 Beispielen übersetzen** (Ausgangslage: 256).
+**325 von 342 Beispielen übersetzen** (Ausgangslage: 256).
 
 ## Wie geprüft wird
 
@@ -37,8 +37,6 @@ Dateien mit `unit …;` sind Bibliotheken und werden mit `--compile-unit` geprü
 | `examples/syntax_highlight_examples/case_switch.lyx` | sema error (line 3): undefined function 'print_str' |
 | `examples/syntax_highlight_examples/consts.lyx` | Parse error at line 6: expected expression |
 | `examples/syntax_highlight_examples/hello.lyx` | sema error (line 3): undefined function 'print_str' |
-| `examples/test_file_read.lyx` | error: undefined function 'sys_open' — no codegen implementation found |
-| `examples/test_mmap_file.lyx` | error: undefined function 'sys_open' — no codegen implementation found |
 | `examples/test_stack_peek.lyx` | Parse error at line 10: expected expression |
 | `examples/thread_test.lyx` | sema error (line 13): undefined function 'MutexInit' |
 | `examples/units/test/params.lyx` | sema error (line 5): undefined function 'print_int' |
@@ -49,9 +47,6 @@ Dateien mit `unit …;` sind Bibliotheken und werden mit `--compile-unit` geprü
 - **Funktionen, die es nicht gibt**: `GLXCreateContextLegacy`, `EGLBindOpenGL`,
   `LDAPErrorToStr`, `MutexInit`, `read_raw`, `print_int` — teils Wrapper, die
   nie geschrieben wurden, teils alte Namen.
-- **`sys_open` fehlt im x86-Backend** (2 Dateien): in sema registriert, nur in
-  emit_lyxos implementiert. Dieselbe Klasse wie die entfernten Phantom-Builtins,
-  aber backend-spezifisch.
 - **Qualifizierter Modulzugriff** (`math_utils.x`, `IO.x`): Modul-Symbole teilen
   sich einen flachen Namespace, `modul.name` gibt es nicht.
 - **Sonstiges**: `uint16` als Typ, ein Parse-Fehler in `echo_client`, ein
