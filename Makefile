@@ -143,6 +143,11 @@ test: lyxc
 	@echo "--- Statischer Methodenaufruf TypeName.Method() (7 tests) ---"
 	@bash tests/static_method_call_test.sh
 	@echo "OK"
+	@echo "--- _indirect_call_N Argumentlage (5 Prüfungen) ---"
+	./lyxc --std-path=. tests/indirect_call_test.lyx -o /tmp/lyxc_ic_test
+	@/tmp/lyxc_ic_test > /dev/null
+	@rm -f /tmp/lyxc_ic_test
+	@echo "OK"
 	@echo "--- Keine Phantom-Builtins in sema (10 tests) ---"
 	@bash tests/no_phantom_builtins_test.sh
 	@echo "OK"

@@ -1,6 +1,6 @@
 # Nicht kompilierbare Beispiele (Stand 2026-07-31, lyxc 1.0.9A)
 
-**304 von 342 Beispielen übersetzen** (Ausgangslage: 256).
+**307 von 342 Beispielen übersetzen** (Ausgangslage: 256).
 
 ## Wie geprüft wird
 
@@ -17,7 +17,7 @@ Dateien mit `unit …;` sind Bibliotheken und werden mit `--compile-unit` geprü
 |---|---:|---|
 | FFI-Sandbox fail-closed (`@capabilities` fehlt) | 7 | Beispiele mit rohem FFI — brauchen `@cap(...)` bzw. eine Policy-Entscheidung |
 | `Select` / `Poll` existieren nicht | 8 | weder Builtin noch stdlib-Funktion; gemeint ist vermutlich `sys_select` / `sys_poll` |
-| `_indirect_call_2` fehlt im Codegen | 3 | `_indirect_call_0/1` gibt es, `_2/_3/_4` sind in sema registriert, aber nirgends implementiert (Android-JNI-Beispiele) |
+
 | `print_str` / `let` | 2 | `examples/syntax_highlight_examples/` sind **Highlighting-Fixtures**, keine Programme — gehören aus einem Compile-Sweep ausgenommen |
 | `sys_open` fehlt im Codegen | 2 | in sema registriert, im x86-Backend nicht implementiert |
 | Rest (Syntax, `uint16`, Einzelfälle) | 16 | einzeln zu prüfen |
@@ -26,9 +26,6 @@ Dateien mit `unit …;` sind Bibliotheken und werden mit `--compile-unit` geprü
 
 | Beispiel | Fehler |
 |---|---|
-| `examples/android/jni_callback_inline.lyx` | error: undefined function '_indirect_call_2' — no codegen implementation found |
-| `examples/android/jni_callback_local.lyx` | error: undefined function '_indirect_call_2' — no codegen implementation found |
-| `examples/android/jni_native_add.lyx` | error: undefined function '_indirect_call_2' — no codegen implementation found |
 | `examples/games/game1/game1.lyx` | sema error (line 1): extern fn mit OS-Zugriff erfordert @capabilities([...])-Annotation |
 | `examples/graphics/dlopen_test.lyx` | sema error (line 1): extern fn in FFI-Blacklist (Klasse 3) — direkter Aufruf verboten |
 | `examples/graphics/egl_test.lyx` | sema error (line 1): extern fn: unbekanntes FFI-Symbol erfordert @capabilities([...]) (FFI-Sandbox Fail-Closed) |
