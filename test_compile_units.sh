@@ -22,10 +22,8 @@ TIMEOUT_S=90
 
 # Units, die bekannt nicht übersetzen — mit Grund.
 # Beide brauchen eine Entscheidung, keine Reparatur (siehe work/-Dokument).
-KNOWN_FAILURES="
-std/cloud/ec2.lyx|verschachtelte Helfer mutieren buf/off der umgebenden Funktion
-std/net/ssh.lyx|OS-Klassen-extern ohne @capabilities (Policy)
-"
+# Derzeit leer: alle 390 Unit-Quellen übersetzen.
+KNOWN_FAILURES=""
 
 is_known() {
     printf '%s\n' "$KNOWN_FAILURES" | grep -q "^$1|"
