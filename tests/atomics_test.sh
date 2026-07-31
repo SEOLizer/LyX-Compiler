@@ -138,8 +138,11 @@ fn main(): int64 {
 EOF
 rm -f "$TMP/leak"
 if (cd "$ROOT" && "$LYXC" --std-path="$ROOT" "$TMP/leak.lyx" -o "$TMP/leak" >/dev/null 2>&1); then
-  # 400 Threads x 2 MB = 800 MB, wenn nichts freigegeben wird; Limit 256 MB.
-  ( ulimit -v 262144 && timeout 120 "$TMP/leak" ) >/dev/null 2>&1; rc=$?
+  # 400 Threads x 2 MB = 800 MB, wenn nichts freigegeben wird; Limit 384 MB.
+  # Die Marge ist bewusst nicht knapper: der Adressraum des Prozesses enthaelt
+  # neben den Stacks noch Arena und Bibliotheken, ein zu enges Limit macht den
+  # Test wackelig statt aussagekraeftig.
+  ( ulimit -v 393216 && timeout 120 "$TMP/leak" ) >/dev/null 2>&1; rc=$?
   if [ "$rc" -eq 42 ]; then ok "ThreadJoin gibt den Kind-Stack frei"; else no "ThreadJoin gibt den Kind-Stack frei" "exit=$rc unter ulimit -v 256M"; fi
 else
   no "ThreadJoin gibt den Kind-Stack frei" "compile fehlgeschlagen"
