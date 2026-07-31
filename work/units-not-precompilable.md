@@ -22,10 +22,16 @@ Es verbleiben zwei — beide brauchen eine Entscheidung, keine Reparatur:
 
 ## Sweep-Abdeckung
 
-`test_compile_units.sh` iteriert über `"$STD_DIR"/*.lyx` — nur die oberste Ebene.
-Genau deshalb blieben die 88 so lange unsichtbar: der Sweep meldete 92 OK / 0 failed,
-während ein Viertel der stdlib nie geprüft wurde.
+`test_compile_units.sh` lief bis 2026-07-31 nur über `"$STD_DIR"/*.lyx` — die
+oberste Ebene. Genau deshalb blieben die 88 so lange unsichtbar: der Sweep
+meldete 92 OK / 0 failed, während ein Viertel der stdlib nie geprüft wurde.
 
-Mit nur noch zwei bekannten Fehlern ist die Umstellung auf
-`find std data -name '*.lyx'` jetzt in Reichweite — sinnvollerweise zusammen mit
-einer expliziten Known-Failures-Liste für die beiden Einträge oben.
+Er läuft jetzt **rekursiv** über `std/` und `data/` (390 Quellen, 388 OK) und
+kennt zwei Wächter:
+
+- ein **neuer** Fehlschlag färbt den Lauf rot
+- eine Unit aus `KNOWN_FAILURES`, die wieder übersetzt, wird als `[FIXED]`
+  gemeldet und färbt den Lauf ebenfalls rot — damit die Liste nicht
+  stillschweigend veraltet
+
+Die beiden Einträge oben stehen in `KNOWN_FAILURES` im Skript, jeweils mit Grund.
