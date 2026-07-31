@@ -165,7 +165,8 @@ fn zsFSEAlloc(AL: int64): int64 {
     return tab;
 }
 
-fn zsFSEFree(tab: int64): void { if (tab != 0) { free(tab); } }
+// Groesse gemaess zsFSEAlloc: 16 + (1 << AL) * 8, und AL liegt in tab[0].
+fn zsFSEFree(tab: int64): void { if (tab != 0) { free(tab, 16 + ((1 << peek64(tab)) * 8)); } }
 
 fn zsFSESym(tab: int64, state: int64): int64 {
     return peek64(peek64(tab + 8) + state * 8) & 0xFF;
@@ -249,7 +250,7 @@ fn zsFSEBuild(probs: int64, numProbs: int64, AL: int64): int64 {
         i += 1;
     }
 
-    free(symArr); free(symNext);
+    free(symArr, tableSize * 8); free(symNext, numProbs * 8);
     return tab;
 }
 
@@ -350,7 +351,7 @@ fn zsLLPredefined(): int64 {
     var s: int64 := 0;
     while (s < 36) { poke64(probs + s * 8, zsLLProb(s)); s := s + 1; }
     var tab: int64 := zsFSEBuild(probs, 36, 6);
-    free(probs);
+    free(probs, 36 * 8);
     return tab;
 }
 
@@ -359,7 +360,7 @@ fn zsMLPredefined(): int64 {
     var s: int64 := 0;
     while (s < 53) { poke64(probs + s * 8, zsMLProb(s)); s := s + 1; }
     var tab: int64 := zsFSEBuild(probs, 53, 6);
-    free(probs);
+    free(probs, 53 * 8);
     return tab;
 }
 
@@ -368,7 +369,7 @@ fn zsOFFPredefined(): int64 {
     var s: int64 := 0;
     while (s < 29) { poke64(probs + s * 8, zsOFFProb(s)); s := s + 1; }
     var tab: int64 := zsFSEBuild(probs, 29, 5);
-    free(probs);
+    free(probs, 29 * 8);
     return tab;
 }
 
@@ -474,14 +475,20 @@ fn zsMLExtra(code: int64): int64 {
 // ========================================================================
 
 fn zsHuffNew(): int64 {
-    var t: int64 := alloc(408);
+    // 416 statt 408: Slot [408] haelt die Symbolzahl fuer zsHuffFree.
+    var t: int64 := alloc(416);
     var k: int64 := 0;
-    while (k < 408) { poke8(t + k, 0); k := k + 1; }
+    while (k < 416) { poke8(t + k, 0); k := k + 1; }
     poke64(t + 400, 0 - 1);  // trivialSym = -1 (no trivial)
     return t;
 }
 
-fn zsHuffFree(t: int64): void { if (t != 0) { free(peek64(t + 392)); free(t, 408); } }
+fn zsHuffFree(t: int64): void {
+    if (t == 0) { return; }
+    var syms: int64 := peek64(t + 392);
+    if (syms != 0) { free(syms, peek64(t + 408) * 8); }
+    free(t, 416);
+}
 
 // Build canonical Huffman from code-length array.
 // lens[sym] = code length in bits (0 = absent)
@@ -522,6 +529,7 @@ fn zsHuffBuildLens(t: int64, lens: int64, numSyms: int64): void {
 
     var syms: int64 := alloc(total * 8);
     poke64(t + 392, syms);
+    poke64(t + 408, total);   // fuer zsHuffFree
 
     // Build firstIdx and symbols sorted by length
     var idx: int64 := 0;
@@ -663,7 +671,8 @@ fn zsHuffFromWeights(weights: int64, numSyms: int64): int64 {
     // Build code-length array: len[s] = weight[s] (non-zero), adjusted by maxWeight
     // In zstd: code_length[s] = maxBits + 1 - weight[s]  (but weight=0 means absent)
     // Actually: weight IS the code length for non-zero entries
-    var lens: int64 := alloc((numSyms + 1) * 8);
+    var lensSize: int64 := (numSyms + 1) * 8;
+    var lens: int64 := alloc(lensSize);
     s := 0;
     while (s < numSyms) {
         poke64(lens + s * 8, peek64(weights + s * 8));
@@ -676,7 +685,7 @@ fn zsHuffFromWeights(weights: int64, numSyms: int64): int64 {
     }
 
     zsHuffBuildLens(t, lens, numSyms);
-    free(lens);
+    free(lens, lensSize);
     return t;
 }
 
@@ -851,7 +860,7 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
         var weights: int64 := alloc(256 * 8);
         var nw: int64 := zsReadHuffWeights(wbr, litPtr, weights);
         var hdrConsumed: int64 := zsbrPos(wbr);
-        free(wbr);
+        free(wbr, 24);
         htree := zsHuffFromWeights(weights, nw);
         free(weights, 256 * 8);
         litDataStart += hdrConsumed;
@@ -884,7 +893,7 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
         // 4-stream interleaved Huffman (jump table = 6 bytes)
         // jump table: stream 1 size (LE16), stream 2 size (LE16), stream 3 size (LE16)
         if (compSize < 6) {
-            zsHuffFree(htree); free(litBuf);
+            zsHuffFree(htree); free(litBuf, regenSize + 1);
             poke64(outLen, 0); zsbrSkip(br, compSize); return 0;
         }
         var s1len: int64 := (peek8(litPtr) & 0xFF) | ((peek8(litPtr + 1) & 0xFF) << 8);
@@ -924,7 +933,7 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
             k += 1;
         }
 
-        free(rbr1); free(rbr2); free(rbr3); free(rbr4);
+        free(rbr1, 32); free(rbr2, 32); free(rbr3, 32); free(rbr4, 32);
     }
 
     zsHuffFree(htree);
@@ -973,7 +982,7 @@ fn zsGetSeqTable(ctx: int64, zb: int64, mode: int64, which: int64): int64 {
         var probs: int64 := alloc((maxSym + 1) * 8);
         var AL: int64 := zsReadFSEProbs(zb, maxSym, probs);
         var tab: int64 := zsFSEBuild(probs, maxSym + 1, AL);
-        free(probs);
+        free(probs, (maxSym + 1) * 8);
         zsFSEFree(peek64(ctx + tabField));
         poke64(ctx + tabField, tab);
         poke64(ctx + modeField, 2);
@@ -1090,7 +1099,7 @@ fn zsDecompressCompressed(ctx: int64, blkPtr: int64, blkLen: int64): void {
         // No sequences — just output literals
         var k: int64 := 0;
         while (k < litLen) { zsOutput(ctx, peek8(litBuf + k)); k := k + 1; }
-        free(litBuf); free(br, 24);
+        free(litBuf, litLen + 1); free(br, 24);
         return;
     }
 
@@ -1113,7 +1122,7 @@ fn zsDecompressCompressed(ctx: int64, blkPtr: int64, blkLen: int64): void {
         // Output all literals
         var k: int64 := 0;
         while (k < litLen) { zsOutput(ctx, peek8(litBuf + k)); k := k + 1; }
-        free(litBuf); free(br, 24);
+        free(litBuf, litLen + 1); free(br, 24);
         return;
     }
 
@@ -1141,7 +1150,7 @@ fn zsDecompressCompressed(ctx: int64, blkPtr: int64, blkLen: int64): void {
     zsDecodeSeqs(ctx, rbr, litBuf, litLen, numSeq);
 
     free(rbr, 32);
-    free(litBuf);
+    free(litBuf, litLen + 1);
     free(br, 24);
 }
 
