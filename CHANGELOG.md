@@ -2,6 +2,18 @@
 
 ## Unveröffentlicht (develop)
 
+### Standardbibliothek — `Select` und `Poll` in `std.net.syscalls`
+- Die Unit trug „I/O multiplexing" seit jeher in der Überschrift, hatte die
+  beiden Wrapper aber nicht — acht Beispiele riefen sie ins Leere.
+- `sys_poll` gab es als Builtin; **`sys_select` fehlte ganz** und ist jetzt
+  ergänzt (Syscall 23). Das vierte Argument steht nach SysV-Aufrufkonvention in
+  `rcx`, die Syscall-Konvention erwartet es in `r10` — ohne Umladen bekäme der
+  Kernel Müll als `exceptfds`.
+- Neuer Test `tests/select_poll_test.lyx` (3 Prüfungen), in `make test`: prüft
+  echte Syscall-Ergebnisse (leeres fd-Set → 0, `Poll` mit `nfds=0` → 0, stdout
+  als schreibbar → 1), nicht nur dass der Aufruf übersetzt.
+- Beispiele 307 → 315 von 342.
+
 ### Compiler (Codegen) — `_indirect_call_2/3/4` implementiert
 - `_indirect_call_0` und `_1` gab es; `_2`, `_3` und `_4` waren in sema
   registriert, aber **nie emittiert** — der Aufruf bestand sema und starb im

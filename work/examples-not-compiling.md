@@ -1,6 +1,6 @@
 # Nicht kompilierbare Beispiele (Stand 2026-07-31, lyxc 1.0.9A)
 
-**307 von 342 Beispielen übersetzen** (Ausgangslage: 256).
+**315 von 342 Beispielen übersetzen** (Ausgangslage: 256).
 
 ## Wie geprüft wird
 
@@ -16,7 +16,6 @@ Dateien mit `unit …;` sind Bibliotheken und werden mit `--compile-unit` geprü
 | Ursache | Anzahl | Charakter |
 |---|---:|---|
 | FFI-Sandbox fail-closed (`@capabilities` fehlt) | 7 | Beispiele mit rohem FFI — brauchen `@cap(...)` bzw. eine Policy-Entscheidung |
-| `Select` / `Poll` existieren nicht | 8 | weder Builtin noch stdlib-Funktion; gemeint ist vermutlich `sys_select` / `sys_poll` |
 
 | `print_str` / `let` | 2 | `examples/syntax_highlight_examples/` sind **Highlighting-Fixtures**, keine Programme — gehören aus einem Compile-Sweep ausgenommen |
 | `sys_open` fehlt im Codegen | 2 | in sema registriert, im x86-Backend nicht implementiert |
@@ -49,14 +48,6 @@ Dateien mit `unit …;` sind Bibliotheken und werden mit `--compile-unit` geprü
 | `examples/test_extern_redis.lyx` | sema error (line 2): extern fn: unbekanntes FFI-Symbol erfordert @capabilities([...]) (FFI-Sandbox Fail-Closed) |
 | `examples/test_file_read.lyx` | error: undefined function 'sys_open' — no codegen implementation found |
 | `examples/test_mmap_file.lyx` | error: undefined function 'sys_open' — no codegen implementation found |
-| `examples/test_poll2.lyx` | sema error (line 31): undefined function 'Poll' |
-| `examples/test_poll_check.lyx` | sema error (line 21): undefined function 'Poll' |
-| `examples/test_poll_debug.lyx` | sema error (line 20): undefined function 'Poll' |
-| `examples/test_select3.lyx` | sema error (line 25): undefined function 'Select' |
-| `examples/test_select.lyx` | sema error (line 39): undefined function 'Select' |
-| `examples/test_select_read2.lyx` | sema error (line 23): undefined function 'Select' |
-| `examples/test_select_sanity.lyx` | sema error (line 29): undefined function 'Select' |
-| `examples/test_select_workaround.lyx` | sema error (line 24): undefined function 'Select' |
 | `examples/test_stack_peek.lyx` | Parse error at line 10: expected expression |
 | `examples/thread_test.lyx` | sema error (line 13): undefined function 'MutexInit' |
 | `examples/units/test/params.lyx` | sema error (line 5): undefined function 'print_int' |
