@@ -4,6 +4,24 @@
 
 _(noch nichts)_
 
+## Version 1.0.11B (August 2026)
+
+### Compiler (Codegen) — `&&` und `||` schlossen nicht kurz (#1023)
+- Beide Operatoren werteten **immer beide** Operanden aus. Die Ursache war
+  nicht eine falsche Auswertungsreihenfolge, sondern dass überhaupt keine
+  bedingte Auswertung erzeugt wurde: `CGT_AND`/`CGT_OR` fielen in den
+  generischen `CGN_BINOP`-Pfad, der beide Seiten zu Werten auswertet und danach
+  verknüpft (`test`/`setnz`/`and` bzw. `or` mit Normierung).
+- Damit lief das übliche Null-Guard-Idiom `if (p != 0 && deref(p))` auch bei
+  `p == 0` in die Dereferenzierung — Segfault. Gefunden beim Bau des
+  Paketmanagers lpm, dort an zwei Stellen.
+- Beide Operatoren werden jetzt vor der Operandenauswertung abgefangen und als
+  Sprungfolge emittiert; das Ergebnis bleibt auf 0/1 normiert. Semantik in
+  `ebnf.md` bei `LogicalOrExpr` festgehalten.
+- `tests/shortcircuit_test.sh` **zählt** die Auswertungen der rechten Seite,
+  statt nur das Ergebnis zu prüfen — ein reiner Ergebnistest wäre auch vor dem
+  Fix grün gewesen, denn das Ergebnis stimmte, nur der Weg dorthin war falsch.
+
 ## Version 1.0.11A (August 2026)
 
 ### Compiler (Codegen) — `for i in range(...)` erzeugte gar keinen Code (#1007)
