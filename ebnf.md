@@ -408,9 +408,11 @@ TupleType           = "(" Type "," Type { "," Type } ")" ;
        btn.on_click := form.Handle;   (* bindet form als self *)
        btn.on_click(rcv)
 
-   Ein inline geschriebener Funktionszeigertyp (`var f: fn(int64): int64`)
-   wird vom Parser zwar angenommen, erzeugt aber fehlerhaften Code -- siehe
-   Abschnitt 20. Kanonisch ist der Typalias. *)
+   Der Typ darf inline geschrieben werden (`var f: fn(int64): int64 := g;`) --
+   als lokale Variable, als Parameter und als Feld. Bis 1.0.11B stuerzte der
+   AUFRUF eines inline geschriebenen fn-Zeigers ab, weil der Aufrufpfad ihn nur
+   am Namen eines Typalias erkannte (#1003); der Typalias war deshalb die
+   einzige verlaessliche Form. *)
 
 FnPtrType           = "fn" "(" [ FnPtrParams ] ")" [ ":" Type ] ;
 
@@ -1173,7 +1175,6 @@ Einzelbefunde sind dort verlinkt.
 | `fn f<T>(...)` | 6, 7 | Parst, die Semantikpruefung loest den Typparameter nicht auf (`unknown param type`). Monomorphisierung ist in sema angelegt, der Weg vom Parameter zum Typ fehlt. Generische TYPEN werden gar nicht angenommen. Bis zu dieser Fassung nannte die Grammatik ausserdem die eckige Form `[T]`, die nie gueltig war. (#1009) |
 | `range(N)` | 2.2 | Uebersetzt, iteriert aber nicht: `for i in range(5)` summiert zu 0, an anderer Stelle zu Datenmuell. (#1007) |
 | `defer` im inneren Block | 2.2 | Laeuft am **Funktionsende** statt am Blockende. Auf Funktionsebene korrekt. (#1006) |
-| `var f: fn(int64): int64 := g;` | 7 | Uebersetzt fehlerfrei, das erzeugte Programm stuerzt beim Aufruf ab. Kanonisch ist der Typalias (`type Cb = fn(int64): int64;`). (#1003) |
 | `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
 
 Nicht mehr betroffen: die Bindung von Methodenzeigern (`feld := obj.Method`)
@@ -1185,6 +1186,12 @@ Ebenfalls nicht mehr betroffen: der Ziffern-Trenner im Float-Literal
 (`3.14_159`, `1_000.5`). Bis 1.0.11B kuerzten die Literal-Umwandlungen den Wert
 stillschweigend am ersten `_`; seither ueberspringen sie ihn in allen
 Ziffernschleifen. Abgedeckt durch `tests/lexer_float_dot_test.lyx`. (#1011)
+
+Ebenfalls nicht mehr betroffen: der inline geschriebene Funktionszeigertyp
+(`var f: fn(int64): int64 := g;`) als lokale Variable und als Parameter. Der
+Aufrufpfad erkannte einen fn-Zeiger bis 1.0.11B nur am Namen eines Typalias;
+inline geschrieben lief der Aufruf ueber den Closure-Pfad und stuerzte ab.
+Abgedeckt durch `tests/inline_fnptr_test.sh`. (#1003)
 
 ---
 
