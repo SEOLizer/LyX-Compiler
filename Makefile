@@ -231,6 +231,9 @@ test: lyxc
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
 	@echo "OK"
+	@echo "--- Print/PrintLn geben f64 aus (7 Pruefungen) ---"
+	@bash tests/print_f64_test.sh
+	@echo "OK"
 	@echo "--- pub wird beim Import ausgewertet (6 Pruefungen) ---"
 	@bash tests/pub_visibility_test.sh
 	@echo "OK"
