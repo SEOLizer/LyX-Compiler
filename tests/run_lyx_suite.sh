@@ -25,7 +25,6 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # ab. Jeder Eintrag braucht ein Issue — sonst verschwindet er hier lautlos.
 declare -A KNOWN_RED=(
   [defer_scope_test]="#1006 defer im inneren Block"
-  [lexer_float_dot_test]="#1011 Unterstrich im Float-Literal"
   [meta_safe_test]="#1017 GetPageHash"
   [pdf_text_test]="#1017 pdf_text"
   [pg_08_test]="#1017 pg_08"
