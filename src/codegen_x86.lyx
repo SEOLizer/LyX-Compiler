@@ -8916,7 +8916,7 @@ pub type Codegen = class {
       // c0 = pattern, c1 = body expression
       var bodyNode: int64 := self.cg_nc1(ni);
       if (bodyNode >= 0) {
-        self.cg_genExpr(bodyNode);
+        self.cg_genMatchBody(bodyNode);
       }
 
     } else if (k == CGN_FIELD_DECL) {
@@ -9653,14 +9653,30 @@ pub type Codegen = class {
     } else {
       self.cg_loadRax(matchOff);
       self.cg_pushRax();
-      var patVal: int64 := self.cg_nival(altPat);
-      if (patVal != 0) {
-        self.cg_movRaxImm(patVal);
+      // #1024: Hier stand noch die alte Unterscheidung `ival != 0`, die #1020
+      // im Hauptmuster laengst ersetzt hat — und der Bezeichner wurde nur in
+      // den Locals gesucht, nicht in der Konstantentabelle. Enum-Mitglieder
+      // trafen damit NIE; `case R | B` traf ausgerechnet R, weil der
+      // Fehlschlagpfad 0 lud und R zufaellig 0 ist. Jetzt dieselbe Aufloesung
+      // wie im Hauptmuster: unterschieden wird an der NAMENSLAENGE.
+      var pl: int64 := self.cg_nslen(altPat);
+      if (pl == 0) {
+        self.cg_movRaxImm(self.cg_nival(altPat));
       } else {
         var pn: pchar := self.cg_nsval(altPat);
-        var pl: int64  := self.cg_nslen(altPat);
-        var po: int64  := self.cg_findLocal(pn, pl);
-        if (po != 0) { self.cg_loadRax(po); } else { self.cg_zeroRax(); }
+        var po: int64 := self.cg_findLocal(pn, pl);
+        if (po != 0) {
+          self.cg_loadRax(po);
+        } else if (self.cg_hasConVal(pn, pl) != 0) {
+          self.cg_movRaxImm(self.cg_findConVal(pn, pl));
+        } else {
+          EPrintStr("error: codegen: match-Muster ist weder Konstante noch "c);
+          EPrintStr("lokale Variable: "c);
+          var pc: int64 := 0;
+          while (pc < pl) { PrintChar(StrCharAt(pn, pc)); pc := pc + 1; }
+          EPrintStrLn(""c);
+          exit(70);
+        }
       }
       self.cg_popRbx();
       self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);   // cmp rbx, rax
@@ -9669,6 +9685,37 @@ pub type Codegen = class {
       self.cg_e32(self.orBodyHead);
       self.orBodyHead := jePos;
     }
+  }
+
+  // #1024: Rumpf eines match-Falls emittieren. Ein Ausdruck laesst seinen Wert
+  // in rax; ein BLOCK wird als Anweisungsfolge erzeugt und liefert den Wert
+  // seiner letzten Anweisung, sofern das ein Ausdruck ist — sonst 0. Damit
+  // bleibt `match` in beiden Rollen brauchbar: als Anweisung mit mehreren
+  // Schritten je Zweig, und als Ausdruck mit einem Wert.
+  fn cg_genMatchBody(bodyNode: int64) {
+    if (bodyNode < 0) { self.cg_zeroRax(); return; }
+    if (self.cg_nkind(bodyNode) != CGN_BLOCK) {
+      self.cg_genExpr(bodyNode);
+      return;
+    }
+    var savedLocals: int64 := self.localCount;
+    var savedDefers: int64 := self.deferCount;
+    var stmt: int64 := self.cg_nc0(bodyNode);
+    if (stmt < 0) { self.cg_zeroRax(); return; }
+    while (stmt != -1) {
+      var nxt: int64 := self.cg_nnext(stmt);
+      if (nxt == -1 && self.cg_nkind(stmt) == CGN_EXPR_STMT) {
+        // letzte Anweisung ist ein Ausdruck → sein Wert ist der Wert des Blocks
+        self.cg_genExpr(self.cg_nc0(stmt));
+      } else {
+        self.cg_genStmt(stmt);
+        if (nxt == -1) { self.cg_zeroRax(); }
+      }
+      stmt := nxt;
+    }
+    self.cg_emitDefersDownTo(savedDefers);
+    self.deferCount := savedDefers;
+    self.localCount := savedLocals;
   }
 
   fn cg_genMatch(ni: int64) {
@@ -9719,7 +9766,7 @@ pub type Codegen = class {
           guardFailPos := self.codeLen;
           self.cg_e32(0);
         }
-        self.cg_genExpr(bodyNode);
+        self.cg_genMatchBody(bodyNode);
         self.cg_e8(0xE9);
         var bpOR: int64 := self.codeLen;
         self.cg_e32(self.curBreakHead);
@@ -9802,7 +9849,7 @@ pub type Codegen = class {
           }
           // All fields matched - execute case body
           self.cg_popRax();
-          self.cg_genExpr(bodyNode);
+          self.cg_genMatchBody(bodyNode);
           // Implicit jmp to match_end
           self.cg_e8(0xE9);
           var bp2: int64 := self.codeLen;
@@ -9876,7 +9923,7 @@ pub type Codegen = class {
           self.cg_popRax();  // discard saved subject
 
           // Execute case body
-          self.cg_genExpr(bodyNode);
+          self.cg_genMatchBody(bodyNode);
           // Implicit jmp to match_end
           self.cg_e8(0xE9);
           var bp: int64 := self.codeLen;
@@ -9948,7 +9995,7 @@ pub type Codegen = class {
           self.cg_e32(0);
         }
         // Execute case body
-        self.cg_genExpr(bodyNode);
+        self.cg_genMatchBody(bodyNode);
         // Implicit jmp to match_end
         self.cg_e8(0xE9);
         var bp: int64 := self.codeLen;
@@ -9971,14 +10018,14 @@ pub type Codegen = class {
         self.cg_e8(0x74);                                         // jz short (skip default)
         var defSkip: int64 := self.codeLen;
         self.cg_e8(0);
-        self.cg_genExpr(bodyNode);
+        self.cg_genMatchBody(bodyNode);
         self.cg_e8(0xE9);
         var bpDefG: int64 := self.codeLen;
         self.cg_e32(self.curBreakHead);
         self.curBreakHead := bpDefG;
         poke8(self.code + defSkip, self.codeLen - defSkip - 1);
       } else {
-        self.cg_genExpr(bodyNode);
+        self.cg_genMatchBody(bodyNode);
         self.cg_e8(0xE9);
         var bpd: int64 := self.codeLen;
         self.cg_e32(self.curBreakHead);
