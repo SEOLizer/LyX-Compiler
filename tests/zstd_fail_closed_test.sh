@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# tests/zstd_fail_closed_test.sh — #1027: ZstdDecompress muss melden statt raten.
+# tests/zstd_fail_closed_test.sh — #1027/#1072: ZstdDecompress liefert richtige
+# Daten oder meldet, aber raet nie.
 #
-# Der Decoder fuer Compressed Blocks (Huffman/FSE) ist defekt: ueber 97 Frames
-# derselben Textquelle in aufsteigender Groesse stuerzte er 67-mal ab und lieferte
-# 5-mal stillschweigend falschen Inhalt. Solange er nicht repariert ist, muss
-# ZSTD_ERR zurueckkommen — ein Aufrufer kann Muell nicht von echten Daten
-# unterscheiden.
+# Der Name stammt aus der Zeit, in der der Pfad fuer Compressed Blocks gesperrt
+# war: er stuerzte ueber 97 Messframes 67-mal ab und log 5-mal. Diese Sperre
+# ist mit #1027 gefallen und der Pfad mit #1072 vollstaendig; der Test prueft
+# seitdem das Gegenteil seiner urspruenglichen Behauptung — ein Compressed
+# Block muss WOERTLICH zurueckkommen.
 #
-# Geprueft wird deshalb dreierlei: Raw Blocks und der eigene Store-Modus liefern
-# weiterhin korrekte Daten, und ein Compressed Block wird gemeldet statt geraten
-# oder abgestuerzt.
+# Geprueft werden vier Dinge: Raw Blocks, ein Compressed Block, der eigene
+# Store-Modus im Round-Trip und ein verfaelschter Frame, der gemeldet werden
+# muss. Der letzte Punkt ist der eigentliche Waechter: ohne ihn wuerde ein
+# Decoder, der alles gutmuetig durchwinkt, hier gruen aussehen.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="$ROOT/lyxc"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
@@ -21,6 +23,14 @@ head -c 200 /dev/urandom > "$TMP/raw.bin"
 zstd -1 -f -q "$TMP/raw.bin" -o "$TMP/raw.zst"
 printf 'hello world, hello world, hello world!\n%.0s' 1 2 3 > "$TMP/comp.bin"
 zstd -1 -f -q "$TMP/comp.bin" -o "$TMP/comp.zst"
+# Verfaelschter Frame fuer die Gegenprobe: ein Byte in der Mitte kippen.
+python3 - "$TMP" <<'PYEOF'
+import sys
+d = sys.argv[1]
+b = bytearray(open(f"{d}/comp.zst", "rb").read())
+b[len(b) // 2] ^= 0x55
+open(f"{d}/corrupt.zst", "wb").write(bytes(b))
+PYEOF
 
 cat > "$TMP/t.lyx" <<EOF
 import std.zstd;
@@ -54,13 +64,33 @@ fn main(): int64 {
     else { PrintStrLn("PASS raw_block"); }
   }
 
-  // 2. Compressed Block: muss ZSTD_ERR liefern, nicht raten und nicht abstuerzen
+  // 2. Compressed Block (Huffman/FSE): muss woertlich zurueckkommen.
+  //    Bis #1072 lieferte genau dieser Frame einen Fehler -- die Literale
+  //    standen im RLE-Format mit Size_Format 10, das der Kopfleser als
+  //    Drei-Byte-Kopf missverstand.
   var z2: int64 := load("$TMP/comp.zst"c, lo);
   var zn2: int64 := peek64(lo);
+  var o2: int64 := load("$TMP/comp.bin"c, lo);
+  var on2: int64 := peek64(lo);
   var out2: int64 := alloc(262144);
   var r2: int64 := ZstdDecompress(z2, zn2, out2, 262144);
-  if (r2 != ZSTD_ERR) { PrintStrLn("FAIL compressed_block: kein ZSTD_ERR"); rc := 1; }
-  else { PrintStrLn("PASS compressed_block (gemeldet)"); }
+  if (r2 != on2) { PrintStrLn("FAIL compressed_block: Laenge"); rc := 1; }
+  else {
+    var j: int64 := 0; var badc: int64 := 0;
+    while (j < on2) { if (peek8(out2 + j) != peek8(o2 + j)) { badc := badc + 1; } j := j + 1; }
+    if (badc != 0) { PrintStrLn("FAIL compressed_block: Inhalt"); rc := 1; }
+    else { PrintStrLn("PASS compressed_block"); }
+  }
+
+  // 2b. Gegenprobe: ein verfaelschter Frame MUSS gemeldet werden. Ohne diese
+  //     Pruefung wuerde ein Decoder, der jeden Muell durchwinkt, oben gruen
+  //     aussehen.
+  var z3: int64 := load("$TMP/corrupt.zst"c, lo);
+  var zn3: int64 := peek64(lo);
+  var out3: int64 := alloc(262144);
+  var r3: int64 := ZstdDecompress(z3, zn3, out3, 262144);
+  if (r3 >= 0) { PrintStrLn("FAIL corrupt_frame: nicht gemeldet"); rc := 1; }
+  else { PrintStrLn("PASS corrupt_frame (gemeldet)"); }
 
   // 3. Eigener Store-Modus: round-trip
   var src2: int64 := alloc(8192);
