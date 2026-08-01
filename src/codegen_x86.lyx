@@ -3312,7 +3312,9 @@ pub type Codegen = class {
         if (self.cg_nkind(ftypeNode) == CGN_METHOD_PTR) { isMth := 1; }
         else if (self.cg_nkind(ftypeNode) == 60 && self.cg_isMethodType(self.cg_nsval(ftypeNode), self.cg_nslen(ftypeNode)) != 0) { isMth := 1; }
       }
-      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag | (tWidth << 8) | (isMth << 1));
+      // #1038: Bit2 = vorzeichenbehafteter Schmaltyp (int8/i8/int16/i16/int32/i32).
+      // Der Ladepfad braucht es, um movsx statt movzx zu emittieren.
+      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag | (tWidth << 8) | (isMth << 1) | (self.cg_typeIsSignedNarrow(ftypeNode) << 2));
       offset += 8;
       i += 1;
       tmp := self.cg_nnext(tmp);
@@ -3439,6 +3441,22 @@ pub type Codegen = class {
     return 8;  // int64, uint64, f64, pchar, pointers — all 8 bytes
   }
 
+  // #1038: Ist der Typ ein VORZEICHENBEHAFTETER Schmaltyp? Nur fuer diese wird
+  // beim Laden vorzeichenrichtig erweitert (movsx); uintN/uN und char werden
+  // genullt (movzx). Breite 8 spielt hier keine Rolle.
+  fn cg_typeIsSignedNarrow(typeNode: int64): int64 {
+    if (typeNode < 0) { return 0; }
+    var tn: pchar := self.cg_nsval(typeNode);
+    var tl: int64 := self.cg_nslen(typeNode);
+    if (tl == 4 && self.cg_seq(tn, tl, "int8"c,  4)) { return 1; }
+    if (tl == 5 && self.cg_seq(tn, tl, "int16"c, 5)) { return 1; }
+    if (tl == 5 && self.cg_seq(tn, tl, "int32"c, 5)) { return 1; }
+    if (tl == 2 && self.cg_seq(tn, tl, "i8"c,    2)) { return 1; }
+    if (tl == 3 && self.cg_seq(tn, tl, "i16"c,   3)) { return 1; }
+    if (tl == 3 && self.cg_seq(tn, tl, "i32"c,   3)) { return 1; }
+    return 0;
+  }
+
   fn cg_buildStructLayout(ni: int64) {
     var sName: pchar := self.cg_nsval(ni);
     var sLen:  int64 := self.cg_nslen(ni);
@@ -3510,7 +3528,8 @@ pub type Codegen = class {
         if (self.cg_nkind(ftypeNode) == CGN_METHOD_PTR) { isMth2 := 1; }
         else if (self.cg_nkind(ftypeNode) == 60 && self.cg_isMethodType(self.cg_nsval(ftypeNode), self.cg_nslen(ftypeNode)) != 0) { isMth2 := 1; }
       }
-      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag2 | (tWidth2 << 8) | (isMth2 << 1));
+      // #1038: Bit2 = vorzeichenbehafteter Schmaltyp, siehe cg_buildClassLayout.
+      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag2 | (tWidth2 << 8) | (isMth2 << 1) | (self.cg_typeIsSignedNarrow(ftypeNode) << 2));
       // WP-4.1-A: field stride
       if (isPacked != 0) {
         offset := offset + self.cg_typeSize(ftypeNode);
@@ -4033,8 +4052,21 @@ pub type Codegen = class {
     var classIdx: int64 := self.cg_objClassIdx(obj);
     var foff: int64 := -1;
     if (classIdx >= 0) { foff := self.cg_getFieldOffset(classIdx, fieldName, fieldLen); }
+    // #1038: Breite des Feldes. Bisher wurde IMMER mit 8 Byte geladen — in einem
+    // @packed-Struct liegen die Nachbarfelder aber unmittelbar dahinter und kamen
+    // damit im Ergebnis mit hoch: `magic` (uint8) auf Offset 0 lieferte alle acht
+    // Bytes der Struktur. Beim SCHREIBEN wurde die Breite laengst beachtet, nur
+    // beim Lesen nicht.
+    var fFlags: int64 := 0;
+    if (foff >= 0 && classIdx >= 0) {
+      fFlags := self.cg_getFieldBigEndian(classIdx, fieldName, fieldLen);
+    }
+    var ldW: int64 := (fFlags >> 8) & 0xFF;
+    var ldSigned: int64 := (fFlags >> 2) & 1;
     if (foff < 0) {
       self.cg_zeroRax();
+    } else if (ldW == 1 || ldW == 2 || ldW == 4) {
+      self.cg_emitNarrowLoadRax(foff, ldW, ldSigned);
     } else if (foff == 0) {
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x00);
     } else if (foff <= 127) {
@@ -4044,11 +4076,34 @@ pub type Codegen = class {
     }
     // WP-4.1-B: emit BSWAP after load for @big_endian fields
     if (foff >= 0 && classIdx >= 0) {
-      var beInfo: int64 := self.cg_getFieldBigEndian(classIdx, fieldName, fieldLen);
-      if ((beInfo & 1) != 0) {
-        var tWidth: int64 := (beInfo >> 8) & 0xFF;
+      if ((fFlags & 1) != 0) {
+        var tWidth: int64 := (fFlags >> 8) & 0xFF;
         self.cg_emitBswapRax(tWidth);
       }
+    }
+  }
+
+  // #1038: schmales Feld aus [rax+off] nach rax laden.
+  // width 1/2: movzx bzw. movsx nach rax; width 4: mov eax (nullt die oberen
+  // 32 Bit implizit) bzw. movsxd. Vorzeichenbehaftet sind int8/i8/int16/i16/
+  // int32/i32 — bei uintN/uN wird genullt.
+  fn cg_emitNarrowLoadRax(off: int64, width: int64, isSigned: int64) {
+    if (width == 1) {
+      if (isSigned != 0) { self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBE); }  // movsx rax, byte
+      else               { self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); }  // movzx rax, byte
+    } else if (width == 2) {
+      if (isSigned != 0) { self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBF); }  // movsx rax, word
+      else               { self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB7); }  // movzx rax, word
+    } else {
+      if (isSigned != 0) { self.cg_e8(0x48); self.cg_e8(0x63); }                    // movsxd rax, dword
+      else               { self.cg_e8(0x8B); }                                      // mov eax, dword
+    }
+    if (off == 0) {
+      self.cg_e8(0x00);
+    } else if (off <= 127) {
+      self.cg_e8(0x40); self.cg_e8(off);
+    } else {
+      self.cg_e8(0x80); self.cg_e32(off);
     }
   }
 
