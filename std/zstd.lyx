@@ -1,30 +1,39 @@
 // std/zstd.lyx — Zstandard (RFC 8878)
 //
-// STAND Compressed Blocks (#1027): der Pfad ist FAIL-CLOSED, siehe
-// zsDecompressBlock. Gemessen wird mit tests/zstd_measure.sh ueber 97 Frames
-// derselben Textquelle in aufsteigender Groesse (`zstd -1`, 20..116 Byte); die
-// vier Ausgaenge werden getrennt gezaehlt, weil sie unterschiedlich schlimm
-// sind.
+// STAND Compressed Blocks (#1027): der Pfad LAEUFT. Gemessen wird mit
+// tests/zstd_measure.sh ueber 97 Frames derselben Textquelle in aufsteigender
+// Groesse (`zstd -1`, 20..116 Byte); die vier Ausgaenge werden getrennt
+// gezaehlt, weil sie unterschiedlich schlimm sind.
 //
 //                             korrekt  still falsch  gemeldet  abgestuerzt
 //   vor #1041                    5          6           19         67
 //   nach #1041 (fail-closed)    44          0           53          0
-//   heute, Pfad eingeschaltet   59          2           36          0
-//   heute, fail-closed          44          0           53          0
+//   Literale richtig             63         0           34          0
+//   Sequenzen richtig            97         0            0          0
 //
-// Der Decoder liest inzwischen die Huffman-Literale RICHTIG: die Gewichte, die
-// abgeleiteten Codelaengen und die Codezuweisung stimmen, und die meisten
-// Frames kommen woertlich zurueck. Zwei Frames liefern noch stillschweigend
-// falschen Inhalt — deshalb bleibt die Sperre.
+// Was auf dem Weg dorthin falsch war, in der Reihenfolge des Findens:
 //
-// NAECHSTER SCHRITT: die Terminierung des FSE-Gewichtslesers in
-// zsReadHuffWeights. Sie dekodiert derzeit einige Gewichte zu viel; die
-// Zahl der Gewichte bestimmt aber die Nummer des IMPLIZITEN letzten Symbols.
-// Das Abschneiden nachlaufender Nullen in zsHuffFromWeights ist nur eine
-// Naeherung dafuer — sie traegt, solange die ueberzaehligen Gewichte null sind,
-// und verschiebt sonst die Symbole innerhalb einer Codelaenge. Genau das sind
-// die zwei verbliebenen Faelle. Danach folgt der Sequenzpfad, der noch gar
-// nicht geprueft ist.
+//  1. Der FSE-Gewichtsleser lief zu lange. RFC 8878 §4.2.1.2 macht die
+//     Terminierung daran fest, ob das ZUSTANDS-UPDATE noch in den Strom passt
+//     — geprueft VOR dem Verbrauch, nicht danach (zsRevBitsLeft).
+//  2. Die Codezuweisung lief in der falschen Richtung: in zstd beginnt der
+//     LAENGSTE Code bei 0, nicht der kuerzeste (zsHuffBuildLens).
+//  3. Der FSE-Tabellenkopf endet an einer BYTEGRENZE. Ohne zsBitSkipToByte
+//     wurde das angebrochene Byte mitgezaehlt und der Rueckwaertsstrom begann
+//     ein Byte zu frueh — das war die Ursache hinter 1. und 2.
+//  4. Die drei Sequenztabellen stehen in der Reihenfolge LL, OFFSET, ML.
+//  5. Im Sequenzpfad wurden die FSE-Zustaende VOR den Zusatzbits
+//     fortgeschrieben und in der Reihenfolge LL, OFF, ML. Richtig ist:
+//     erst die Zusatzbits (Offset, ML, LL), dann das Update LL, ML, OFF.
+//  6. Vier der eingebauten Tabellen wichen vom RFC ab — die vordefinierte
+//     LL-Verteilung (2er-Lauf bis Symbol 12, nicht 8), die vordefinierte
+//     OFFSET-Verteilung (2er bei 6..8, nicht 5..7), die LL-Zusatzbits ab
+//     Code 25 und die ML-Basen und -Zusatzbits ab Code 43.
+//
+// Punkt 6 ist die Lehre dieses Issues: eine von Hand abgetippte Konstanten-
+// tabelle sieht plausibel aus und ist trotzdem falsch. Gefunden wurden alle
+// vier erst, als eine unabhaengige Referenzdekodierung derselben vier Bytes
+// danebengelegt wurde — nicht durch Lesen des eigenen Codes.
 unit std.zstd;
 
 import std.alloc;
@@ -150,6 +159,18 @@ fn zsRevReadBit(rbr: int64): int64 {
     var val: int64 := (peek64(rbr + 16) >> bitPos) & 1;
     poke64(rbr + 24, bitPos - 1);
     return val;
+}
+
+// #1027: Wie viele Bits stehen im Rueckwaertsstrom noch bereit?
+// RFC 8878 §4.2.1.2 macht die Terminierung des Gewichtslesers daran fest:
+// "if updating state after decoding a symbol would require more bits than
+//  remain in the stream, it is assumed that extra bits are zero."
+// Geprueft wird also VOR dem Verbrauch, nicht danach.
+fn zsRevBitsLeft(rbr: int64): int64 {
+    var bitPos: int64 := peek64(rbr + 24);
+    var bytePos: int64 := peek64(rbr + 8);
+    if (bitPos < 0 && bytePos <= 0) { return 0; }
+    return bytePos * 8 + bitPos + 1;
 }
 
 // #1027: Ist der Rueckwaertsstrom aufgebraucht? Erschoepft heisst: das erste
@@ -354,8 +375,8 @@ fn zsReadFSEProbs(zb: int64, maxSym: int64, probs: int64): int64 {
 fn zsLLProb(sym: int64): int64 {
     if (sym == 0)  { return 4; }
     if (sym == 1)  { return 3; }
-    if ((sym >= 2)  & (sym <= 8))  { return 2; }
-    if ((sym >= 9)  & (sym <= 15)) { return 1; }
+    if ((sym >= 2)  & (sym <= 12)) { return 2; }
+    if ((sym >= 13) & (sym <= 15)) { return 1; }
     if ((sym >= 16) & (sym <= 24)) { return 2; }
     if (sym == 25) { return 3; }
     if (sym == 26) { return 2; }
@@ -374,7 +395,7 @@ fn zsMLProb(sym: int64): int64 {
 }
 
 fn zsOFFProb(sym: int64): int64 {
-    if ((sym >= 5) & (sym <= 7)) { return 2; }
+    if ((sym >= 6) & (sym <= 8)) { return 2; }
     if ((sym >= 24) & (sym <= 28)) { return 0 - 1; }
     if ((sym >= 0) & (sym <= 28)) { return 1; }
     return 0;
@@ -446,17 +467,17 @@ fn zsLLExtra(code: int64): int64 {
     if (code == 22) { return 3; }
     if (code == 23) { return 3; }
     if (code == 24) { return 4; }
-    if (code == 25) { return 4; }
-    if (code == 26) { return 5; }
-    if (code == 27) { return 5; }
-    if (code == 28) { return 6; }
-    if (code == 29) { return 7; }
-    if (code == 30) { return 8; }
-    if (code == 31) { return 9; }
-    if (code == 32) { return 10; }
-    if (code == 33) { return 11; }
-    if (code == 34) { return 12; }
-    return 13;
+    if (code == 25) { return 6; }
+    if (code == 26) { return 7; }
+    if (code == 27) { return 8; }
+    if (code == 28) { return 9; }
+    if (code == 29) { return 10; }
+    if (code == 30) { return 11; }
+    if (code == 31) { return 12; }
+    if (code == 32) { return 13; }
+    if (code == 33) { return 14; }
+    if (code == 34) { return 15; }
+    return 16;
 }
 
 fn zsMLBase(code: int64): int64 {
@@ -473,15 +494,15 @@ fn zsMLBase(code: int64): int64 {
     if (code == 41) { return 83; }
     if (code == 42) { return 99; }
     if (code == 43) { return 131; }
-    if (code == 44) { return 163; }
-    if (code == 45) { return 227; }
-    if (code == 46) { return 355; }
-    if (code == 47) { return 611; }
-    if (code == 48) { return 1123; }
-    if (code == 49) { return 2147; }
-    if (code == 50) { return 4195; }
-    if (code == 51) { return 8291; }
-    return 16483;
+    if (code == 44) { return 259; }
+    if (code == 45) { return 515; }
+    if (code == 46) { return 1027; }
+    if (code == 47) { return 2051; }
+    if (code == 48) { return 4099; }
+    if (code == 49) { return 8195; }
+    if (code == 50) { return 16387; }
+    if (code == 51) { return 32771; }
+    return 65539;
 }
 
 fn zsMLExtra(code: int64): int64 {
@@ -490,16 +511,17 @@ fn zsMLExtra(code: int64): int64 {
     if ((code >= 36) & (code <= 37)) { return 2; }
     if ((code >= 38) & (code <= 39)) { return 3; }
     if ((code >= 40) & (code <= 41)) { return 4; }
-    if ((code >= 42) & (code <= 43)) { return 5; }
-    if (code == 44) { return 6; }
-    if (code == 45) { return 7; }
-    if (code == 46) { return 8; }
-    if (code == 47) { return 9; }
-    if (code == 48) { return 10; }
-    if (code == 49) { return 11; }
-    if (code == 50) { return 12; }
-    if (code == 51) { return 13; }
-    return 14;
+    if (code == 42) { return 5; }
+    if (code == 43) { return 7; }
+    if (code == 44) { return 8; }
+    if (code == 45) { return 9; }
+    if (code == 46) { return 10; }
+    if (code == 47) { return 11; }
+    if (code == 48) { return 12; }
+    if (code == 49) { return 13; }
+    if (code == 50) { return 14; }
+    if (code == 51) { return 15; }
+    return 16;
 }
 
 // ========================================================================
@@ -651,6 +673,12 @@ fn zsReadHuffWeights(br: int64, ptr: int64, weights: int64): int64 {
     // Read FSE prob table for weights (max symbol = 255, weights are 0..11)
     var wprobs: int64 := alloc(256 * 8);
     var AL: int64 := zsReadFSEProbs(zb, 255, wprobs);
+    // #1027: Der Tabellenkopf endet an einer BYTEGRENZE. Ohne das Aufrunden
+    // zaehlte das angebrochene letzte Byte zum Bitstrom, der Rueckwaertsleser
+    // bekam ein Byte zu viel am Anfang — und die Schleife lief nach den echten
+    // Gewichten noch elf Schritte weiter, alle mit Gewicht null. Genau diese
+    // ueberzaehligen Nullen verschoben das implizite letzte Symbol.
+    zsBitSkipToByte(zb);
     var tableHdrSize: int64 := zsBitBytePos(zb);
     free(zb, 24);
 
@@ -669,6 +697,20 @@ fn zsReadHuffWeights(br: int64, ptr: int64, weights: int64): int64 {
     // FSE-Zustaenden (RFC 8878, Huffman_Tree_Description) — hier lief nur einer.
     // Damit stimmte ab dem zweiten Gewicht nichts mehr, und der gebaute Baum
     // lieferte statt der Literale Muell.
+    // #1027: Terminierung nach RFC 8878 §4.2.1.2. Zwei Zustaende teilen sich
+    // eine Verteilungstabelle; State1 traegt die geradzahligen, State2 die
+    // ungeradzahligen Indizes. Sie geben abwechselnd ein Symbol aus und
+    // wechseln danach ihren Zustand.
+    //
+    // Abgebrochen wird, wenn der Zustandswechsel mehr Bits braeuchte, als noch
+    // im Strom stehen — die fehlenden gelten als null. Danach gibt der jeweils
+    // andere Zustand noch sein Symbol aus, dann ist Schluss.
+    //
+    // Die Zahl der Gewichte ist nicht belanglos: sie bestimmt die Nummer des
+    // IMPLIZITEN letzten Symbols. Ein Gewicht zu viel verschiebt es und laesst
+    // es den Codeplatz eines echten Symbols einnehmen.
+    //
+    // Hoechstens 255 Gewichte — das letzte Symbol traegt keines im Strom.
     var state1: int64 := zsRevReadBits(rbr, AL);
     var state2: int64 := zsRevReadBits(rbr, AL);
     var numSyms: int64 := 0;
@@ -678,11 +720,13 @@ fn zsReadHuffWeights(br: int64, ptr: int64, weights: int64): int64 {
         numSyms += 1;
         if (numSyms >= 255) { done := 1; }
         if (done == 0) {
-            if (zsRevExhausted(rbr) != 0) { done := 1; }
-            else {
-                var nb1: int64 := zsFSENbBits(wtab, state1);
-                var ns1: int64 := zsFSENewState(wtab, state1);
-                state1 := ns1 + zsRevReadBits(rbr, nb1);
+            var nb1: int64 := zsFSENbBits(wtab, state1);
+            if (zsRevBitsLeft(rbr) < nb1) {
+                poke64(weights + numSyms * 8, zsFSESym(wtab, state2));
+                numSyms += 1;
+                done := 1;
+            } else {
+                state1 := zsFSENewState(wtab, state1) + zsRevReadBits(rbr, nb1);
             }
         }
         if (done == 0) {
@@ -690,11 +734,13 @@ fn zsReadHuffWeights(br: int64, ptr: int64, weights: int64): int64 {
             numSyms += 1;
             if (numSyms >= 255) { done := 1; }
             if (done == 0) {
-                if (zsRevExhausted(rbr) != 0) { done := 1; }
-                else {
-                    var nb2: int64 := zsFSENbBits(wtab, state2);
-                    var ns2: int64 := zsFSENewState(wtab, state2);
-                    state2 := ns2 + zsRevReadBits(rbr, nb2);
+                var nb2: int64 := zsFSENbBits(wtab, state2);
+                if (zsRevBitsLeft(rbr) < nb2) {
+                    poke64(weights + numSyms * 8, zsFSESym(wtab, state1));
+                    numSyms += 1;
+                    done := 1;
+                } else {
+                    state2 := zsFSENewState(wtab, state2) + zsRevReadBits(rbr, nb2);
                 }
             }
         }
@@ -728,16 +774,6 @@ fn zsHuffFromWeights(weights: int64, numSyms: int64): int64 {
     // total = Summe 2^(W-1) ueber alle gelesenen Gewichte > 0. Das letzte
     // Symbol traegt kein eigenes Gewicht im Strom — seines wird so bestimmt,
     // dass die Summe eine Zweierpotenz wird.
-    // #1027: Nachlaufende Nullgewichte abschneiden. Die FSE-Schleife liest die
-    // Gewichte, bis der Rueckwaertsstrom aufgebraucht ist, und lieferte dabei
-    // regelmaessig einige Nullen zu viel. Fuer den BAUM sind die belanglos —
-    // fuer das IMPLIZITE letzte Symbol nicht: dessen Nummer ist die Position
-    // hinter dem letzten Gewicht. Neun Nullen zu viel hiessen neun Positionen
-    // zu weit, und das implizite Symbol nahm den Codeplatz eines echten ein.
-    // Messbar an genau einem falschen Buchstaben: statt 'y' (121) kam 130.
-    while (numSyms > 0 && peek64(weights + (numSyms - 1) * 8) == 0) { numSyms := numSyms - 1; }
-    if (numSyms <= 0) { return t; }
-
     var total: int64 := 0;
     var s: int64 := 0;
     while (s < numSyms) {
@@ -1202,19 +1238,6 @@ fn zsDecodeSeqs(ctx: int64, rbr: int64, litBuf: int64, litLen: int64, numSeq: in
         // #1027: entgleiste Symbolcodes vor der Weiterverwendung abfangen
         if (zsCodesOk(llCode, mlCode, offCode) == 0) { poke64(ctx + 48, 1); return; }
 
-        // Update states (read bits) — skip for last sequence
-        if (isLast == 0) {
-            if (llMode  != 1) { llState  := zsFSENewState(llTab,  llState)  + zsRevReadBits(rbr, zsFSENbBits(llTab,  llState)); }
-            if (offMode != 1) { offState := zsFSENewState(offTab, offState) + zsRevReadBits(rbr, zsFSENbBits(offTab, offState)); }
-            if (mlMode  != 1) { mlState  := zsFSENewState(mlTab,  mlState)  + zsRevReadBits(rbr, zsFSENbBits(mlTab,  mlState)); }
-
-            // #1027: Zustand muss in der Tabelle bleiben, sonst liest der
-            // naechste Durchlauf ausserhalb.
-            if (llMode  != 1) { if (zsStateOk(llState,  llAL)  == 0) { poke64(ctx + 48, 1); return; } }
-            if (mlMode  != 1) { if (zsStateOk(mlState,  mlAL)  == 0) { poke64(ctx + 48, 1); return; } }
-            if (offMode != 1) { if (zsStateOk(offState, offAL) == 0) { poke64(ctx + 48, 1); return; } }
-        }
-
         // Decode extra bits
         var offExtra: int64 := zsRevReadBits(rbr, offCode);
         var offVal:   int64 := (1 << offCode) + offExtra;
@@ -1222,6 +1245,23 @@ fn zsDecodeSeqs(ctx: int64, rbr: int64, litBuf: int64, litLen: int64, numSeq: in
         var mlLen:    int64 := zsMLBase(mlCode) + zsRevReadBits(rbr, mlExtra);
         var llExtra:  int64 := zsLLExtra(llCode);
         var llLen:    int64 := zsLLBase(llCode) + zsRevReadBits(rbr, llExtra);
+
+        // #1027 RFC 8878 3.1.1.3.2.1: die Zustaende werden ERST NACH den
+        // Zusatzbits fortgeschrieben, und zwar in der Reihenfolge LL, ML, OFF.
+        // Vorher lief das Update vor den Zusatzbits und mit LL, OFF, ML --
+        // beides verschiebt den Rueckwaertsstrom und laesst jede Sequenz nach
+        // der ersten auf falschen Bits landen.
+        if (isLast == 0) {
+            if (llMode  != 1) { llState  := zsFSENewState(llTab,  llState)  + zsRevReadBits(rbr, zsFSENbBits(llTab,  llState)); }
+            if (mlMode  != 1) { mlState  := zsFSENewState(mlTab,  mlState)  + zsRevReadBits(rbr, zsFSENbBits(mlTab,  mlState)); }
+            if (offMode != 1) { offState := zsFSENewState(offTab, offState) + zsRevReadBits(rbr, zsFSENbBits(offTab, offState)); }
+
+            // #1027: Zustand muss in der Tabelle bleiben, sonst liest der
+            // naechste Durchlauf ausserhalb.
+            if (llMode  != 1) { if (zsStateOk(llState,  llAL)  == 0) { poke64(ctx + 48, 1); return; } }
+            if (mlMode  != 1) { if (zsStateOk(mlState,  mlAL)  == 0) { poke64(ctx + 48, 1); return; } }
+            if (offMode != 1) { if (zsStateOk(offState, offAL) == 0) { poke64(ctx + 48, 1); return; } }
+        }
 
         // Resolve offset
         var actual: int64 := zsResolveOffset(ctx, offVal, llLen);
@@ -1314,6 +1354,8 @@ fn zsDecompressCompressed(ctx: int64, blkPtr: int64, blkLen: int64): void {
     zsGetSeqTable(ctx, zb, llMode,  0);
     zsGetSeqTable(ctx, zb, offMode, 2);
     zsGetSeqTable(ctx, zb, mlMode,  1);
+    // #1027: ebenso hier — die drei Sequenztabellen enden an einer Bytegrenze.
+    zsBitSkipToByte(zb);
     var tabBytesUsed: int64 := zsBitBytePos(zb);
     free(zb, 24);
 
@@ -1353,41 +1395,16 @@ fn zsDecompressBlock(ctx: int64, blkPtr: int64, blkLen: int64, blkType: int64): 
             // The actual byte payload is 1 byte; blkLen from header is the count
             while (k < blkLen) { zsOutput(ctx, rleByte); k := k + 1; }
         } else {
-            // #1027: Compressed Blocks (Huffman/FSE) sind FAIL-CLOSED.
+            // #1027: Compressed Blocks (Huffman/FSE) laufen wieder.
             //
-            // Gemessen ueber 97 Frames derselben Textquelle in aufsteigender
-            // Groesse (zstd -1): 67 Abstuerze, 5 stillschweigend falsche
-            // Ergebnisse, 20 gemeldete Fehler, 5 korrekt. Ein Decoder, der in
-            // zwei von drei Faellen den Prozess abraeumt und in weiteren Faellen
-            // ohne Fehlerflag Muell liefert, darf nicht laufen -- ein Aufrufer
-            // kann das Ergebnis nicht von einem echten unterscheiden.
-            //
-            // Der Dekodierpfad bleibt vollstaendig erhalten und ist unten
-            // gehaertet (Tabellen-, Zustands- und Laengengrenzen); zum
-            // Weiterarbeiten diese Zeile durch den Aufruf ersetzen:
-            //     zsDecompressCompressed(ctx, blkPtr, blkLen);
-            // Solange gilt: melden statt raten. Siehe Issue #1027.
-            // #1027: Compressed Blocks (Huffman/FSE) bleiben FAIL-CLOSED.
-            //
-            // Der Pfad ist gegenueber dem letzten Stand deutlich weiter — sechs
-            // belegte Defekte sind behoben (siehe Kopf dieser Datei) und die
-            // Huffman-GEWICHTE werden nachweislich richtig dekodiert. Der Baum
-            // dahinter stimmt aber noch nicht: gemessen ueber 97 Frames liefert
-            // der Pfad 19-mal stillschweigend falschen Inhalt.
-            //
-            // Ein Ergebnis, das der Aufrufer nicht von einem echten unterscheiden
-            // kann, ist schlimmer als eine Fehlermeldung. Zum Weiterarbeiten
-            // diese Zeile durch den Aufruf ersetzen:
-            //     zsDecompressCompressed(ctx, blkPtr, blkLen);
-            // Naechster Schritt laut Messung: die kanonische Codezuweisung in
-            // zsHuffBuildLens/zsHuffDecSym, danach der Sequenzpfad.
-            // #1027: Compressed Blocks bleiben FAIL-CLOSED, solange zwei der
-            // 97 Messframes stillschweigend falschen Inhalt liefern. Ein
-            // Ergebnis, das der Aufrufer nicht von einem echten unterscheiden
-            // kann, ist schlimmer als eine Fehlermeldung. Zum Weiterarbeiten
-            // diese Zeile ersetzen durch:
-            //     zsDecompressCompressed(ctx, blkPtr, blkLen);
-            poke64(ctx + 48, 1);
+            // Der Pfad war fail-closed, solange er stillschweigend falschen
+            // Inhalt lieferte. Gemessen ueber 97 Frames derselben Textquelle in
+            // aufsteigender Groesse (zstd -1) steht er jetzt bei
+            // 97 korrekt / 0 still falsch / 0 gemeldet / 0 abgestuerzt --
+            // Ausgangslage waren 5 korrekt, 6 still falsch, 19 gemeldet,
+            // 67 Abstuerze. tests/zstd_measure.sh haelt die Messung fest und
+            // wird rot, sobald wieder ein Frame still falsch endet.
+            zsDecompressCompressed(ctx, blkPtr, blkLen);
         }
     }
 }
