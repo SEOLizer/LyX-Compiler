@@ -240,6 +240,9 @@ test: lyxc
 	@echo "--- Inline-Array als Struct-Feld (6 Pruefungen) ---"
 	@bash tests/inline_array_field_test.sh
 	@echo "OK"
+	@echo "--- macOS-Backend: BSD-Socket-Syscallnummern (12 Pruefungen) ---"
+	@bash tests/macos_socket_syscalls_test.sh
+	@echo "OK"
 	@echo "--- Print/PrintLn mit Aufruf-Ergebnis (6 Pruefungen) ---"
 	@bash tests/print_call_result_test.sh
 	@echo "OK"
