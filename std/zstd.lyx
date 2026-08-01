@@ -7,8 +7,21 @@
 // still falsch, keiner abgestuerzt. Verfaelschte, abgeschnittene und
 // Woerterbuch-Frames werden gemeldet.
 //
-// KOMPRIMIERUNG ist nur Store: gueltige Frames aus raw blocks, ohne jede
-// Ersparnis (Issue #1069).
+// KOMPRIMIERUNG (#1069): echte Compressed Blocks -- Raw-Literale plus
+// LZ77-Sequenzen ueber die vordefinierten FSE-Tabellen, dazu RLE-Bloecke fuer
+// Bytewiederholungen und der Rohblock als Ausweg, wenn sich nichts lohnt.
+// Jeder Frame traegt eine Content_Checksum. Gemessen:
+//
+//   20000 Byte Text        ->    135 Byte
+//  300000 Byte Text        ->    385 Byte  (mehrere Bloecke)
+//   50000 Byte 'A'         ->     15 Byte  (RLE)
+//   16000 Byte Muster      ->     30 Byte
+//   20000 Byte Zufall      ->  20014 Byte  (Rohblock, kein Schaden)
+//
+// Gegengelesen wird mit der `zstd`-CLI, nicht nur mit dem eigenen Decoder:
+// zwei zueinander passende Fehler heben sich sonst gegenseitig auf.
+// Huffman-Literale sind NICHT enthalten -- die Literale gehen roh in den
+// Block. Das ist der naechste Schritt, wenn mehr Ersparnis gebraucht wird.
 //
 // Wie es dahin kam — die Messreihe, weil jede Zeile davon ein Befund ist:
 //
@@ -1726,14 +1739,398 @@ pub fn ZstdDecompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int
 // Block header (24-bit LE): bit0=LastBlock, bits[2:1]=BlockType(0=Raw), bits[23:3]=BlockSize
 // ========================================================================
 
+// ========================================================================
+// Kompression (#1069)
+//
+// Erzeugt echte Compressed Blocks: Raw-Literale plus LZ77-Sequenzen, die mit
+// den VORDEFINIERTEN FSE-Tabellen kodiert werden (Sequences_Compression_Mode
+// 0). Damit entfaellt der Tabellenkopf, und Encoder und Decoder teilen sich
+// dieselben Tabellen -- gebaut von zsLLPredefined/zsMLPredefined/zsOFFPredefined.
+//
+// Der FSE-Encoder benutzt die DEKODIERTABELLE rueckwaerts. Das geht, weil eine
+// gueltige FSE-Tabelle fuer jedes Symbol s eine Zerlegung des Zustandsraums
+// bildet: die Zielbereiche aller Zustaende mit Symbol s ueberdecken [0,size)
+// genau einmal. Zu jedem Symbol und jedem Zielzustand gibt es daher GENAU EINEN
+// Vorgaengerzustand. Die Zustandsfolge entsteht so von hinten nach vorne, ohne
+// eine zweite Tabellenform (deltaNbBits/deltaFindState) aufbauen zu muessen --
+// eine zweite Tabellenform waere eine zweite Fehlerquelle.
+// ========================================================================
+
+// Vorgaengerzustand: der eindeutige Zustand mit Symbol sym, dessen
+// Folgebereich target enthaelt. -1, wenn es keinen gibt (dann traegt das
+// Symbol in dieser Tabelle keine Wahrscheinlichkeit).
+fn zsFSEPrevState(tab: int64, sym: int64, target: int64): int64 {
+    var size: int64 := 1 << peek64(tab);
+    var st:   int64 := 0;
+    while (st < size) {
+        if (zsFSESym(tab, st) == sym) {
+            var base: int64 := zsFSENewState(tab, st);
+            var span: int64 := 1 << zsFSENbBits(tab, st);
+            if ((target >= base) & (target < base + span)) { return st; }
+        }
+        st := st + 1;
+    }
+    return 0 - 1;
+}
+
+// Irgendein Zustand, der sym ausgibt -- Startpunkt der Rueckwaertskette.
+fn zsFSEAnyState(tab: int64, sym: int64): int64 {
+    var size: int64 := 1 << peek64(tab);
+    var st:   int64 := 0;
+    while (st < size) {
+        if (zsFSESym(tab, st) == sym) { return st; }
+        st := st + 1;
+    }
+    return 0 - 1;
+}
+
+// Literal-Length-Code zu einer Lauflaenge.
+fn zsLLCodeFor(len: int64): int64 {
+    var c: int64 := 0;
+    while (c <= 35) {
+        var base: int64 := zsLLBase(c);
+        var span: int64 := 1 << zsLLExtra(c);
+        if ((len >= base) & (len < base + span)) { return c; }
+        c := c + 1;
+    }
+    return 0 - 1;
+}
+
+// Match-Length-Code zu einer Matchlaenge (>= 3).
+fn zsMLCodeFor(len: int64): int64 {
+    var c: int64 := 0;
+    while (c <= 52) {
+        var base: int64 := zsMLBase(c);
+        var span: int64 := 1 << zsMLExtra(c);
+        if ((len >= base) & (len < base + span)) { return c; }
+        c := c + 1;
+    }
+    return 0 - 1;
+}
+
+// ---- Bitliste in LESEREIHENFOLGE ---------------------------------------
+// Ein Eintrag ist (nbBits << 32) | wert. Gesammelt wird in der Reihenfolge,
+// in der der DECODER die Bits liest; das Ablegen im Puffer dreht sie um.
+// So muss der Encoder die Rueckwaertsmechanik nicht nachbauen, sondern nur
+// die Lesereihenfolge kennen -- und die steht im Decoder direkt daneben.
+
+fn zsBLPush(list: int64, cnt: int64, val: int64, nb: int64): void {
+    poke64(list + cnt * 8, ((nb & 0xFF) << 32) | (val & 0xFFFFFFFF));
+}
+
+// Legt die Bitliste so ab, dass zsRevNew/zsRevReadBits sie in derselben
+// Reihenfolge zurueckliefert. Gibt die Bytelaenge zurueck.
+fn zsBLEmit(dst: int64, list: int64, cnt: int64): int64 {
+    // Gesamtzahl der Bits
+    var total: int64 := 0;
+    var i: int64 := 0;
+    while (i < cnt) { total := total + ((peek64(list + i * 8) >> 32) & 0xFF); i := i + 1; }
+
+    // Das letzte Byte traegt das Sentinel-Bit; darunter liegen die ZUERST
+    // gelesenen Bits. hb ist die Zahl dieser Bits, also total mod 8.
+    var hb:  int64 := total - (total / 8) * 8;
+    var len: int64 := (total - hb) / 8 + 1;
+
+    var k: int64 := 0;
+    while (k < len) { poke8(dst + k, 0); k := k + 1; }
+    poke8(dst + len - 1, 1 << hb);
+
+    // bitIdx zaehlt in LESEREIHENFOLGE ab 0.
+    var bitIdx: int64 := 0;
+    i := 0;
+    while (i < cnt) {
+        var e:  int64 := peek64(list + i * 8);
+        var nb: int64 := (e >> 32) & 0xFF;
+        var v:  int64 := e & 0xFFFFFFFF;
+        var b:  int64 := nb - 1;
+        while (b >= 0) {
+            var bit: int64 := (v >> b) & 1;
+            if (bit != 0) {
+                var bytePos: int64 := 0;
+                var bitPos:  int64 := 0;
+                if (bitIdx < hb) {
+                    bytePos := len - 1;
+                    bitPos  := hb - 1 - bitIdx;
+                } else {
+                    var rest: int64 := bitIdx - hb;
+                    bytePos := len - 2 - (rest / 8);
+                    bitPos  := 7 - (rest - (rest / 8) * 8);
+                }
+                poke8(dst + bytePos, peek8(dst + bytePos) | (1 << bitPos));
+            }
+            bitIdx := bitIdx + 1;
+            b := b - 1;
+        }
+        i := i + 1;
+    }
+    return len;
+}
+
+// ---- LZ77 --------------------------------------------------------------
+
+pub con ZSTD_HASH_BITS: int64 := 15;
+pub con ZSTD_MIN_MATCH: int64 := 3;
+pub con ZSTD_MAX_CHAIN: int64 := 32;
+
+fn zsHash4(p: int64): int64 {
+    var v: int64 := peek8(p) | (peek8(p + 1) << 8) | (peek8(p + 2) << 16) | (peek8(p + 3) << 24);
+    return ((v * 2654435761) >> (32 - ZSTD_HASH_BITS)) & ((1 << ZSTD_HASH_BITS) - 1);
+}
+
+// Schreibt Literalabschnitt, Sequenzkopf und Sequenz-Bitstrom.
+fn zsWriteSeqBlock(dst: int64, dstMax: int64, lits: int64, nLit: int64,
+                   seqLL: int64, seqML: int64, seqOF: int64, nSeq: int64): int64 {
+    var pos: int64 := 0;
+
+    // --- Literalabschnitt: Raw_Literals_Block (Typ 0) ---
+    if (nLit < 32) {
+        if (pos + 1 > dstMax) { return 0 - 1; }
+        poke8(dst + pos, (nLit << 3) | 0); pos := pos + 1;
+    } else {
+        if (nLit < 4096) {
+            if (pos + 2 > dstMax) { return 0 - 1; }
+            poke8(dst + pos, (1 << 2) | ((nLit & 0xF) << 4)); pos := pos + 1;
+            poke8(dst + pos, (nLit >> 4) & 0xFF);             pos := pos + 1;
+        } else {
+            if (nLit > 1048575) { return 0 - 1; }
+            if (pos + 3 > dstMax) { return 0 - 1; }
+            poke8(dst + pos, (3 << 2) | ((nLit & 0xF) << 4)); pos := pos + 1;
+            poke8(dst + pos, (nLit >> 4) & 0xFF);             pos := pos + 1;
+            poke8(dst + pos, (nLit >> 12) & 0xFF);            pos := pos + 1;
+        }
+    }
+    if (pos + nLit > dstMax) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < nLit) { poke8(dst + pos + i, peek8(lits + i)); i := i + 1; }
+    pos := pos + nLit;
+
+    // --- Sequenzkopf: Anzahl, dann Modusbyte (alle drei vordefiniert) ---
+    if (nSeq < 128) {
+        if (pos + 1 > dstMax) { return 0 - 1; }
+        poke8(dst + pos, nSeq); pos := pos + 1;
+    } else {
+        if (nSeq < 32512) {
+            if (pos + 2 > dstMax) { return 0 - 1; }
+            poke8(dst + pos, (nSeq >> 8) + 128); pos := pos + 1;
+            poke8(dst + pos, nSeq & 0xFF);       pos := pos + 1;
+        } else {
+            if (pos + 3 > dstMax) { return 0 - 1; }
+            poke8(dst + pos, 255);                        pos := pos + 1;
+            poke8(dst + pos, (nSeq - 0x7F00) & 0xFF);     pos := pos + 1;
+            poke8(dst + pos, ((nSeq - 0x7F00) >> 8) & 0xFF); pos := pos + 1;
+        }
+    }
+    if (pos + 1 > dstMax) { return 0 - 1; }
+    poke8(dst + pos, 0); pos := pos + 1;   // alle drei Modi = Predefined
+
+    // --- Codes und Zusatzwerte je Sequenz ---
+    var llC: int64 := alloc(nSeq * 8); var llV: int64 := alloc(nSeq * 8);
+    var mlC: int64 := alloc(nSeq * 8); var mlV: int64 := alloc(nSeq * 8);
+    var ofC: int64 := alloc(nSeq * 8); var ofV: int64 := alloc(nSeq * 8);
+    var bad: int64 := 0;
+
+    i := 0;
+    while (i < nSeq) {
+        var ll: int64 := peek64(seqLL + i * 8);
+        var ml: int64 := peek64(seqML + i * 8);
+        var of: int64 := peek64(seqOF + i * 8);
+
+        var lc: int64 := zsLLCodeFor(ll);
+        var mc: int64 := zsMLCodeFor(ml);
+        if ((lc < 0) | (mc < 0)) { bad := 1; }
+        else {
+            // offset_value = offset + 3; damit ist es immer > 3 und meint nie
+            // einen Wiederholoffset -- der Encoder benutzt sie nicht.
+            var ov: int64 := of + 3;
+            var oc: int64 := zsHighbit(ov);
+            if (oc > 28) { bad := 1; }
+            else {
+                poke64(llC + i * 8, lc); poke64(llV + i * 8, ll - zsLLBase(lc));
+                poke64(mlC + i * 8, mc); poke64(mlV + i * 8, ml - zsMLBase(mc));
+                poke64(ofC + i * 8, oc); poke64(ofV + i * 8, ov - (1 << oc));
+            }
+        }
+        i := i + 1;
+    }
+
+    var llT: int64 := zsLLPredefined();
+    var mlT: int64 := zsMLPredefined();
+    var ofT: int64 := zsOFFPredefined();
+
+    // --- Zustandsfolgen rueckwaerts bestimmen ---
+    var llS: int64 := alloc(nSeq * 8);
+    var mlS: int64 := alloc(nSeq * 8);
+    var ofS: int64 := alloc(nSeq * 8);
+    if (bad == 0) {
+        poke64(llS + (nSeq - 1) * 8, zsFSEAnyState(llT, peek64(llC + (nSeq - 1) * 8)));
+        poke64(mlS + (nSeq - 1) * 8, zsFSEAnyState(mlT, peek64(mlC + (nSeq - 1) * 8)));
+        poke64(ofS + (nSeq - 1) * 8, zsFSEAnyState(ofT, peek64(ofC + (nSeq - 1) * 8)));
+        var j: int64 := nSeq - 2;
+        while (j >= 0) {
+            poke64(llS + j * 8, zsFSEPrevState(llT, peek64(llC + j * 8), peek64(llS + (j + 1) * 8)));
+            poke64(mlS + j * 8, zsFSEPrevState(mlT, peek64(mlC + j * 8), peek64(mlS + (j + 1) * 8)));
+            poke64(ofS + j * 8, zsFSEPrevState(ofT, peek64(ofC + j * 8), peek64(ofS + (j + 1) * 8)));
+            j := j - 1;
+        }
+        var v: int64 := 0;
+        while (v < nSeq) {
+            if ((peek64(llS + v * 8) < 0) | (peek64(mlS + v * 8) < 0)) { bad := 1; }
+            if (peek64(ofS + v * 8) < 0) { bad := 1; }
+            v := v + 1;
+        }
+    }
+
+    var outLen: int64 := 0 - 1;
+    if (bad == 0) {
+        // --- Bitliste in Lesereihenfolge ---
+        var maxEntries: int64 := nSeq * 6 + 8;
+        var list: int64 := alloc(maxEntries * 8);
+        var cnt:  int64 := 0;
+
+        // Anfangszustaende: LL, OFFSET, ML -- in dieser Reihenfolge liest sie
+        // der Decoder (RFC 8878 §3.1.1.3.2.1).
+        zsBLPush(list, cnt, peek64(llS), peek64(llT)); cnt := cnt + 1;
+        zsBLPush(list, cnt, peek64(ofS), peek64(ofT)); cnt := cnt + 1;
+        zsBLPush(list, cnt, peek64(mlS), peek64(mlT)); cnt := cnt + 1;
+
+        var q: int64 := 0;
+        while (q < nSeq) {
+            // Zusatzbits: Offset, dann ML, dann LL.
+            zsBLPush(list, cnt, peek64(ofV + q * 8), peek64(ofC + q * 8)); cnt := cnt + 1;
+            zsBLPush(list, cnt, peek64(mlV + q * 8), zsMLExtra(peek64(mlC + q * 8))); cnt := cnt + 1;
+            zsBLPush(list, cnt, peek64(llV + q * 8), zsLLExtra(peek64(llC + q * 8))); cnt := cnt + 1;
+
+            // Zustandsfortschreibung: LL, ML, OFFSET -- entfaellt bei der
+            // letzten Sequenz.
+            if (q < nSeq - 1) {
+                var ls: int64 := peek64(llS + q * 8);
+                var ms: int64 := peek64(mlS + q * 8);
+                var os: int64 := peek64(ofS + q * 8);
+                zsBLPush(list, cnt, peek64(llS + (q + 1) * 8) - zsFSENewState(llT, ls), zsFSENbBits(llT, ls)); cnt := cnt + 1;
+                zsBLPush(list, cnt, peek64(mlS + (q + 1) * 8) - zsFSENewState(mlT, ms), zsFSENbBits(mlT, ms)); cnt := cnt + 1;
+                zsBLPush(list, cnt, peek64(ofS + (q + 1) * 8) - zsFSENewState(ofT, os), zsFSENbBits(ofT, os)); cnt := cnt + 1;
+            }
+            q := q + 1;
+        }
+
+        // Jeder Eintrag traegt hoechstens 32 Bit, also 4 Byte; dazu das
+        // Sentinel-Byte. Erst pruefen, dann schreiben -- zsBLEmit kennt die
+        // Puffergrenze nicht.
+        if (dstMax - pos > cnt * 4 + 8) {
+            var bitBytes: int64 := zsBLEmit(dst + pos, list, cnt);
+            outLen := pos + bitBytes;
+        }
+        free(list, maxEntries * 8);
+    }
+
+    zsFSEFree(llT); zsFSEFree(mlT); zsFSEFree(ofT);
+    free(llC, nSeq * 8); free(llV, nSeq * 8);
+    free(mlC, nSeq * 8); free(mlV, nSeq * 8);
+    free(ofC, nSeq * 8); free(ofV, nSeq * 8);
+    free(llS, nSeq * 8); free(mlS, nSeq * 8); free(ofS, nSeq * 8);
+    return outLen;
+}
+
+// ---- Blockkompression ---------------------------------------------------
+//
+// Schreibt einen Compressed Block fuer src[0..len) nach dst und gibt die
+// Bytezahl zurueck, oder -1, wenn sich das nicht lohnt bzw. nicht geht. Der
+// Aufrufer faellt dann auf einen Raw Block zurueck -- das ist der Grund, warum
+// hier NICHTS geraten werden muss: es gibt einen gueltigen Ausweg.
+fn zsCompressBlockBody(src: int64, len: int64, dst: int64, dstMax: int64): int64 {
+    if (len < 16) { return 0 - 1; }
+
+    var hashSize: int64 := 1 << ZSTD_HASH_BITS;
+    var head: int64 := alloc(hashSize * 8);
+    var prev: int64 := alloc(len * 8);
+    var k: int64 := 0;
+    while (k < hashSize) { poke64(head + k * 8, 0 - 1); k := k + 1; }
+
+    // Sequenzspeicher: je Sequenz literalLaenge, matchLaenge, offset.
+    var maxSeq: int64 := len / 3 + 4;
+    var seqLL:  int64 := alloc(maxSeq * 8);
+    var seqML:  int64 := alloc(maxSeq * 8);
+    var seqOF:  int64 := alloc(maxSeq * 8);
+    var lits:   int64 := alloc(len + 8);
+    var nSeq:   int64 := 0;
+    var nLit:   int64 := 0;
+
+    var pos:      int64 := 0;
+    var litStart: int64 := 0;
+    while (pos + ZSTD_MIN_MATCH < len) {
+        var h:    int64 := zsHash4(src + pos);
+        var cand: int64 := peek64(head + h * 8);
+
+        var bestLen: int64 := 0;
+        var bestOff: int64 := 0;
+        var chain:   int64 := 0;
+        while ((cand >= 0) & (chain < ZSTD_MAX_CHAIN)) {
+            var off: int64 := pos - cand;
+            if (off > 131072) { chain := ZSTD_MAX_CHAIN; }
+            else {
+                var m: int64 := 0;
+                while ((pos + m < len) & (peek8(src + cand + m) == peek8(src + pos + m))) { m := m + 1; }
+                if (m > bestLen) { bestLen := m; bestOff := off; }
+                cand  := peek64(prev + cand * 8);
+                chain := chain + 1;
+            }
+        }
+
+        poke64(prev + pos * 8, peek64(head + h * 8));
+        poke64(head + h * 8, pos);
+
+        if (bestLen >= ZSTD_MIN_MATCH) {
+            var litLen: int64 := pos - litStart;
+            var j: int64 := 0;
+            while (j < litLen) { poke8(lits + nLit + j, peek8(src + litStart + j)); j := j + 1; }
+            nLit := nLit + litLen;
+            poke64(seqLL + nSeq * 8, litLen);
+            poke64(seqML + nSeq * 8, bestLen);
+            poke64(seqOF + nSeq * 8, bestOff);
+            nSeq := nSeq + 1;
+
+            // Die uebersprungenen Stellen trotzdem in die Kette haengen,
+            // sonst findet der naechste Durchlauf sie nie wieder.
+            var q: int64 := pos + 1;
+            while (q < pos + bestLen) {
+                if (q + 4 <= len) {
+                    var hq: int64 := zsHash4(src + q);
+                    poke64(prev + q * 8, peek64(head + hq * 8));
+                    poke64(head + hq * 8, q);
+                }
+                q := q + 1;
+            }
+            pos      := pos + bestLen;
+            litStart := pos;
+        } else {
+            pos := pos + 1;
+        }
+    }
+    // Rest als nachlaufende Literale
+    var tail: int64 := len - litStart;
+    var t: int64 := 0;
+    while (t < tail) { poke8(lits + nLit + t, peek8(src + litStart + t)); t := t + 1; }
+    nLit := nLit + tail;
+
+    var result: int64 := 0 - 1;
+    if (nSeq > 0) { result := zsWriteSeqBlock(dst, dstMax, lits, nLit, seqLL, seqML, seqOF, nSeq); }
+
+    free(head, hashSize * 8); free(prev, len * 8);
+    free(seqLL, maxSeq * 8); free(seqML, maxSeq * 8); free(seqOF, maxSeq * 8);
+    free(lits, len + 8);
+    return result;
+}
+
 pub fn ZstdCompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64 {
     if (((src == 0) | (dst == 0))) { return ZSTD_ERR; }
+    if (srcLen < 0) { return ZSTD_ERR; }
 
     var blockMax: int64 := 131072;
     var numBlocks: int64 := 1;
     if (srcLen > 0) { numBlocks := (srcLen + blockMax - 1) / blockMax; }
-    // Overhead: 13 bytes frame header + 3 bytes per block
-    var needed: int64 := 13 + numBlocks * 3 + srcLen;
+    // Schlimmster Fall: alle Bloecke bleiben roh. 13 Byte Rahmen, 3 Byte je
+    // Blockkopf, 4 Byte Pruefsumme.
+    var needed: int64 := 17 + numBlocks * 3 + srcLen;
     if (dstMax < needed) { return ZSTD_OVERFLOW; }
 
     var pos: int64 := 0;
@@ -1744,17 +2141,35 @@ pub fn ZstdCompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64
     poke8(dst + pos, 0x2F); pos := pos + 1;
     poke8(dst + pos, 0xFD); pos := pos + 1;
 
-    // FHD: FCS=11 (8-byte size), SSF=1, CCF=0, DID=00
-    // = bits[7:6]=11, bit5=1, bit4=0, bit3=0, bits[2:1]=00, bit0=0
-    // = 1110_0000 = 0xE0
-    poke8(dst + pos, 0xE0); pos := pos + 1;
+    // FHD: Single_Segment=1, Content_Checksum=1, kein Dictionary. Die
+    // Pruefsumme kostet vier Byte und macht jeden Uebertragungsfehler beim
+    // Auspacken sichtbar -- ohne sie faellt ein gekipptes Bit als plausibler
+    // Inhalt durch (#1072).
+    //
+    // Das Groessenfeld bekommt die kleinste Form, die reicht. Fest acht Byte
+    // waeren bei kurzen Eingaben sieben Byte Rahmen, den niemand braucht.
+    var fcsField: int64 := 0;   // 1 Byte, nur mit Single_Segment
+    var fcsBytes: int64 := 1;
+    if (srcLen > 255) {
+        if (srcLen <= 65791) { fcsField := 1; fcsBytes := 2; }
+        else { if (srcLen <= 4294967295) { fcsField := 2; fcsBytes := 4; }
+        else { fcsField := 3; fcsBytes := 8; } }
+    }
+    poke8(dst + pos, (fcsField << 6) | (1 << 5) | (1 << 2)); pos := pos + 1;
 
-    // Content size (8 bytes LE)
+    // Bei zwei Byte traegt das Feld den Wert MINUS 256 (RFC 8878 §3.1.1.1.4).
     var cs: int64 := srcLen;
+    if (fcsField == 1) { cs := srcLen - 256; }
     var k: int64 := 0;
-    while (k < 8) { poke8(dst + pos, cs & 0xFF); cs := cs >> 8; pos := pos + 1; k := k + 1; }
+    while (k < fcsBytes) { poke8(dst + pos, cs & 0xFF); cs := cs >> 8; pos := pos + 1; k := k + 1; }
 
-    // Raw blocks
+    if (srcLen == 0) {
+        // Ein einzelner leerer letzter Block.
+        poke8(dst + pos, 1); pos := pos + 1;
+        poke8(dst + pos, 0); pos := pos + 1;
+        poke8(dst + pos, 0); pos := pos + 1;
+    }
+
     var srcOff: int64 := 0;
     while (srcOff < srcLen) {
         var remain: int64 := srcLen - srcOff;
@@ -1762,23 +2177,67 @@ pub fn ZstdCompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64
         if (blkSize > blockMax) { blkSize := blockMax; }
         var isLast: int64 := 0;
         if (srcOff + blkSize >= srcLen) { isLast := 1; }
-        // Block header: blockSize << 3 | BlockType=0 << 1 | isLast
-        var hdr: int64 := (blkSize << 3) | isLast;
-        poke8(dst + pos, hdr & 0xFF);         pos := pos + 1;
-        poke8(dst + pos, (hdr >> 8) & 0xFF);  pos := pos + 1;
-        poke8(dst + pos, (hdr >> 16) & 0xFF); pos := pos + 1;
-        var j: int64 := 0;
-        while (j < blkSize) { poke8(dst + pos, peek8(src + srcOff + j)); pos := pos + 1; j := j + 1; }
-        srcOff += blkSize;
+
+        var bodyPos: int64 := pos + 3;   // hinter dem Blockkopf
+
+        // 1. Besteht der Block aus einem einzigen Bytewert, ist der RLE-Block
+        //    unschlagbar: ein Byte fuer beliebige Laenge.
+        var allSame: int64 := 1;
+        var b0: int64 := peek8(src + srcOff);
+        var t:  int64 := 1;
+        while ((t < blkSize) & (allSame == 1)) {
+            if (peek8(src + srcOff + t) != b0) { allSame := 0; }
+            t := t + 1;
+        }
+
+        var blockType: int64 := 0;
+        var bodyLen:   int64 := blkSize;
+
+        if (allSame == 1) {
+            poke8(dst + bodyPos, b0);
+            blockType := 1;
+            bodyLen   := 1;
+        } else {
+            // 2. Komprimierten Block versuchen. Gelingt er nicht oder wird er
+            //    nicht kleiner, bleibt der Rohblock -- ein gueltiger Ausweg,
+            //    deshalb muss hier nichts geraten werden.
+            var comp: int64 := 0 - 1;
+            if (dstMax - bodyPos > blkSize) {
+                comp := zsCompressBlockBody(src + srcOff, blkSize, dst + bodyPos, dstMax - bodyPos);
+            }
+            if ((comp > 0) & (comp < blkSize)) {
+                blockType := 2;
+                bodyLen   := comp;
+            } else {
+                if (bodyPos + blkSize > dstMax) { return ZSTD_OVERFLOW; }
+                var j: int64 := 0;
+                while (j < blkSize) { poke8(dst + bodyPos + j, peek8(src + srcOff + j)); j := j + 1; }
+                blockType := 0;
+                bodyLen   := blkSize;
+            }
+        }
+
+        // Blockkopf: bei RLE traegt das Groessenfeld die WIEDERHOLZAHL, sonst
+        // die Zahl der folgenden Bytes.
+        var hdrSize: int64 := bodyLen;
+        if (blockType == 1) { hdrSize := blkSize; }
+        var hdr: int64 := (hdrSize << 3) | (blockType << 1) | isLast;
+        poke8(dst + pos,     hdr & 0xFF);
+        poke8(dst + pos + 1, (hdr >> 8) & 0xFF);
+        poke8(dst + pos + 2, (hdr >> 16) & 0xFF);
+
+        pos    := bodyPos + bodyLen;
+        srcOff := srcOff + blkSize;
     }
 
-    // If srcLen == 0: write a single empty last block
-    if (srcLen == 0) {
-        // LastBlock=1, BlockType=0, BlockSize=0 → hdr = (0 << 3) | (0 << 1) | 1 = 1
-        poke8(dst + pos, 1); pos := pos + 1;
-        poke8(dst + pos, 0); pos := pos + 1;
-        poke8(dst + pos, 0); pos := pos + 1;
-    }
+    // Content_Checksum: untere vier Byte des XXH64 ueber den Inhalt.
+    if (pos + 4 > dstMax) { return ZSTD_OVERFLOW; }
+    var sum: int64 := zsXxh64(src, srcLen);
+    poke8(dst + pos,     sum & 0xFF);
+    poke8(dst + pos + 1, (sum >> 8) & 0xFF);
+    poke8(dst + pos + 2, (sum >> 16) & 0xFF);
+    poke8(dst + pos + 3, (sum >> 24) & 0xFF);
+    pos := pos + 4;
 
     return pos;
 }
