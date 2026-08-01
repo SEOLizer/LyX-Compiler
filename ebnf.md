@@ -365,16 +365,22 @@ BuiltinType         = "bool"
                     | "pchar"
                     | "void" ;
 
-BaseIntType         = "int8"
-                    | "int16"
-                    | "int32"
-                    | "int64"
-                    | "uint8"
-                    | "uint16"
-                    | "uint32"
-                    | "uint64"
-                    | "isize"
-                    | "usize" ;
+BaseIntType         = "int8"  | "i8"
+                    | "int16" | "i16"
+                    | "int32" | "i32"
+                    | "int64" | "i64"
+                    | "uint8"  | "u8"
+                    | "uint16" | "u16"
+                    | "uint32" | "u32"
+                    | "uint64" | "u64" ;
+
+(* Beide Schreibweisen sind gueltig und bezeichnen denselben Typ; die kurze
+   (`u8`) ist im Bestand die haeufigere. Bis 1.0.11B kannte der Compiler die
+   kurze Form im var-Deklarator und die lange nur als Feldtyp -- `var x: uint8`
+   wurde abgewiesen, `feld: uint8` stillschweigend angenommen (#1010).
+
+   `isize` und `usize` standen hier frueher ebenfalls; der Compiler kennt sie
+   nicht (`unknown type in var decl`). *)
 
 (* Es gibt in Lyx KEINEN qualifizierten Zugriff. Weder `Modul::Name` noch
    `Modul.Name` ist gueltig -- Symbole importierter Units liegen in einem
