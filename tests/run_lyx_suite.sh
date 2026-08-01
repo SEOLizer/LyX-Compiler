@@ -13,6 +13,10 @@
 #
 # Aufruf:  run_lyx_suite.sh <listendatei> [name]
 # Die Listendatei enthält einen Testnamen je Zeile (ohne .lyx), `#` ist Kommentar.
+# Hinter dem Namen dürfen Übersetzungsoptionen stehen, die NUR dieser Test
+# braucht — etwa `meta_safe_test --meta-safe`. Ohne diese Möglichkeit lief
+# meta_safe_test zwangsläufig rot: er prüft eine ELF-Sektion, die der Compiler
+# nur mit dieser Option anlegt (#1017).
 
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,27 +28,32 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # Bekannt rote Tests: sie laufen mit, ihr Fehlschlag bricht den Lauf aber nicht
 # ab. Jeder Eintrag braucht ein Issue — sonst verschwindet er hier lautlos.
 declare -A KNOWN_RED=(
-  [meta_safe_test]="#1017 GetPageHash"
-  [pdf_text_test]="#1017 pdf_text"
-  [pg_08_test]="#1017 pg_08"
-  [usb_wp8_test]="#1017 usb_wp8"
-  [usb_wp21_test]="#1017 usb_wp21"
-  [do_test_transport]="#1017 do_test_transport"
-  [wp06_macos_socket]="#1017 macOS-Socket-Test auf Linux"
 )
 
 pass=0; fail=0; known=0; failed_names=""
 
-while read -r t; do
-  case "$t" in ''|\#*) continue ;; esac
+while read -r line; do
+  case "$line" in ''|\#*) continue ;; esac
+  # Erstes Wort = Testname, Rest = testeigene Übersetzungsoptionen.
+  # Ein `#` beendet die Zeile — sonst landete der Kommentar als Option beim
+  # Compiler.
+  line="${line%%#*}"
+  line="$(printf '%s' "$line" | sed -e 's/[[:space:]]*$//')"
+  t="${line%% *}"
+  if [ "$line" = "$t" ]; then extra=""; else extra="${line#* }"; fi
   src="$ROOT/tests/$t.lyx"
   [ -f "$src" ] || { echo "FEHLT   $t (Datei nicht vorhanden)"; fail=$((fail+1)); continue; }
 
-  if ! timeout 120 "$LYXC" --std-path="$ROOT" "$src" -o "$TMP/b" >/dev/null 2>&1; then
+  if ! timeout 120 "$LYXC" $extra --std-path="$ROOT" "$src" -o "$TMP/b" >/dev/null 2>&1; then
     verdict=red; detail="uebersetzt nicht"
   else
     out=$(timeout 30 "$TMP/b" 2>&1); rc=$?
-    nf=$(printf '%s' "$out" | grep -ciE "FAIL" || true)
+    # #1017: FAIL nur als MARKIERUNG am Zeilenanfang und GROSS geschrieben.
+    # Vorher war es eine Teilzeichenkettensuche ohne Ruecksicht auf Gross- und
+    # Kleinschreibung — sie traf gewoehnliche Woerter in gruenen Zeilen
+    # ("OK: upool in_use=0 after failed submit", "lseek failure",
+    # "PGTxFailed on null safe") und faerbte drei einwandfreie Tests rot.
+    nf=$(printf '%s' "$out" | grep -cE "^[[:space:]]*FAIL" || true)
     np=$(printf '%s' "$out" | grep -ciE "PASS|OK:" || true)
     if   [ "$rc" -ge 128 ]; then verdict=red;   detail="Absturz (rc=$rc)"
     elif [ "$rc" -eq 124 ]; then verdict=red;   detail="Zeitueberschreitung"
