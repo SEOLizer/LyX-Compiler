@@ -219,6 +219,9 @@ test: lyxc
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
 	@echo "OK"
+	@echo "--- match: Mustervergleich (9 tests) ---"
+	@bash tests/match_patterns_test.sh
+	@echo "OK"
 	@echo "--- Kernsprache (.lyx-Suite) ---"
 	@bash tests/run_lyx_suite.sh tests/suite-core.txt "Kernsprache"
 	@echo "OK"
