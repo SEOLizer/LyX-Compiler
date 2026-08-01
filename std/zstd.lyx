@@ -1,20 +1,30 @@
 // std/zstd.lyx — Zstandard (RFC 8878)
 //
 // STAND Compressed Blocks (#1027): der Pfad ist FAIL-CLOSED, siehe
-// zsDecompressBlock. Gemessen wird ueber 97 Frames derselben Textquelle in
-// aufsteigender Groesse (`zstd -1`, 20..116 Byte Inhalt); gezaehlt werden vier
-// Ausgaenge getrennt: korrekt / stillschweigend falsch / gemeldet / abgestuerzt.
+// zsDecompressBlock. Gemessen wird mit tests/zstd_measure.sh ueber 97 Frames
+// derselben Textquelle in aufsteigender Groesse (`zstd -1`, 20..116 Byte); die
+// vier Ausgaenge werden getrennt gezaehlt, weil sie unterschiedlich schlimm
+// sind.
 //
-//   vor #1041:   5 korrekt,  6 still falsch, 19 gemeldet, 67 abgestuerzt
-//   nach #1041: 44 korrekt,  0 still falsch, 53 gemeldet,  0 abgestuerzt
-//   heute:      44 korrekt,  0 still falsch, 53 gemeldet,  0 abgestuerzt
-//                (bei versuchsweise eingeschaltetem Pfad: 19 still falsch)
+//                             korrekt  still falsch  gemeldet  abgestuerzt
+//   vor #1041                    5          6           19         67
+//   nach #1041 (fail-closed)    44          0           53          0
+//   heute, Pfad eingeschaltet   59          2           36          0
+//   heute, fail-closed          44          0           53          0
 //
-// Sechs belegte Defekte sind seither behoben; die Huffman-GEWICHTE werden
-// nachweislich richtig dekodiert (Probe: nichtnull genau bei den im Text
-// vorkommenden Grossbuchstaben C, D, L, S). Der Baum dahinter stimmt noch
-// nicht — naechster Schritt ist die kanonische Codezuweisung, danach der
-// Sequenzpfad.
+// Der Decoder liest inzwischen die Huffman-Literale RICHTIG: die Gewichte, die
+// abgeleiteten Codelaengen und die Codezuweisung stimmen, und die meisten
+// Frames kommen woertlich zurueck. Zwei Frames liefern noch stillschweigend
+// falschen Inhalt — deshalb bleibt die Sperre.
+//
+// NAECHSTER SCHRITT: die Terminierung des FSE-Gewichtslesers in
+// zsReadHuffWeights. Sie dekodiert derzeit einige Gewichte zu viel; die
+// Zahl der Gewichte bestimmt aber die Nummer des IMPLIZITEN letzten Symbols.
+// Das Abschneiden nachlaufender Nullen in zsHuffFromWeights ist nur eine
+// Naeherung dafuer — sie traegt, solange die ueberzaehligen Gewichte null sind,
+// und verschiebt sonst die Symbole innerhalb einer Codelaenge. Genau das sind
+// die zwei verbliebenen Faelle. Danach folgt der Sequenzpfad, der noch gar
+// nicht geprueft ist.
 unit std.zstd;
 
 import std.alloc;
@@ -529,15 +539,31 @@ fn zsHuffBuildLens(t: int64, lens: int64, numSyms: int64): void {
     s := 0;
     while (s < numSyms) { var l: int64 := peek64(lens + s * 8); if (l > 0) { poke64(t + 264 + l * 8, peek64(t + 264 + l * 8) + 1); } s := s + 1; }
 
-    // Compute firstCode per length (canonical Huffman)
-    var code: int64 := 0;
-    poke64(t + 8, 0);   // firstCode[0] = 0 (unused)
-    poke64(t + 8 + 8, 0);  // firstCode[1] = 0
-    k := 1;
-    while (k < maxLen) {
-        code := (code + peek64(t + 264 + k * 8)) << 1;
-        poke64(t + 8 + (k + 1) * 8, code);
-        k += 1;
+    // #1027: zstd weist die Codes NICHT wie ueblich kanonisch zu.
+    //
+    // In der Referenz (HUF_readDTableX1) fuellen die Symbole mit dem KLEINSTEN
+    // Gewicht — also dem LAENGSTEN Code — die Tabelle ab Index 0; die kuerzesten
+    // Codes liegen oben. Der uebliche Aufbau (kuerzeste Codes ab 0) ist genau
+    // die Spiegelung davon und lieferte deshalb echte, aber falsch zugeordnete
+    // Symbole: der dekodierte Text bestand aus den richtigen Buchstaben in
+    // falscher Reihenfolge.
+    //
+    // Richtig ist die Rekursion von der laengsten Laenge nach unten:
+    //     firstCode[maxLen] = 0
+    //     firstCode[l]      = (firstCode[l+1] + count[l+1]) >> 1
+    //
+    // Gegenprobe am Beispiel aus RFC 8878 (Gewichte 4,3,2,0,1,1):
+    //     Laenge 4: firstCode 0 -> Symbole 4,5 = 0000, 0001
+    //     Laenge 3: (0+2)>>1 = 1 -> Symbol 2   = 001
+    //     Laenge 2: (1+1)>>1 = 1 -> Symbol 1   = 01
+    //     Laenge 1: (1+1)>>1 = 1 -> Symbol 0   = 1
+    poke64(t + 8, 0);                       // firstCode[0] unbenutzt
+    poke64(t + 8 + maxLen * 8, 0);          // laengster Code beginnt bei 0
+    k := maxLen - 1;
+    while (k >= 1) {
+        var above: int64 := peek64(t + 8 + (k + 1) * 8) + peek64(t + 264 + (k + 1) * 8);
+        poke64(t + 8 + k * 8, above >> 1);
+        k := k - 1;
     }
 
     // Count total symbols and allocate symsPtr
@@ -702,6 +728,16 @@ fn zsHuffFromWeights(weights: int64, numSyms: int64): int64 {
     // total = Summe 2^(W-1) ueber alle gelesenen Gewichte > 0. Das letzte
     // Symbol traegt kein eigenes Gewicht im Strom — seines wird so bestimmt,
     // dass die Summe eine Zweierpotenz wird.
+    // #1027: Nachlaufende Nullgewichte abschneiden. Die FSE-Schleife liest die
+    // Gewichte, bis der Rueckwaertsstrom aufgebraucht ist, und lieferte dabei
+    // regelmaessig einige Nullen zu viel. Fuer den BAUM sind die belanglos —
+    // fuer das IMPLIZITE letzte Symbol nicht: dessen Nummer ist die Position
+    // hinter dem letzten Gewicht. Neun Nullen zu viel hiessen neun Positionen
+    // zu weit, und das implizite Symbol nahm den Codeplatz eines echten ein.
+    // Messbar an genau einem falschen Buchstaben: statt 'y' (121) kam 130.
+    while (numSyms > 0 && peek64(weights + (numSyms - 1) * 8) == 0) { numSyms := numSyms - 1; }
+    if (numSyms <= 0) { return t; }
+
     var total: int64 := 0;
     var s: int64 := 0;
     while (s < numSyms) {
@@ -716,6 +752,12 @@ fn zsHuffFromWeights(weights: int64, numSyms: int64): int64 {
     var rest: int64 := (1 << maxBits) - total;
     if (rest <= 0) { return t; }             // Gewichtssumme unstimmig
     var lastW: int64 := zsHighbit(rest) + 1;
+    // #1027: Der Rest MUSS eine Zweierpotenz sein — nur dann ergibt das
+    // abgeleitete letzte Gewicht einen vollstaendigen Baum. Ist er es nicht,
+    // waren die gelesenen Gewichte unstimmig; zsHighbit rundet dann ab und der
+    // Baum ist still falsch. Lieber einen leeren Baum liefern, den der Aufrufer
+    // als Fehler sieht, als geraten.
+    if ((1 << (lastW - 1)) != rest) { return t; }
 
     // Codelaengen: len[s] = maxBits + 1 - W[s], 0 bedeutet "Symbol kommt nicht vor".
     var nAll: int64 := numSyms + 1;
@@ -1339,6 +1381,12 @@ fn zsDecompressBlock(ctx: int64, blkPtr: int64, blkLen: int64, blkType: int64): 
             //     zsDecompressCompressed(ctx, blkPtr, blkLen);
             // Naechster Schritt laut Messung: die kanonische Codezuweisung in
             // zsHuffBuildLens/zsHuffDecSym, danach der Sequenzpfad.
+            // #1027: Compressed Blocks bleiben FAIL-CLOSED, solange zwei der
+            // 97 Messframes stillschweigend falschen Inhalt liefern. Ein
+            // Ergebnis, das der Aufrufer nicht von einem echten unterscheiden
+            // kann, ist schlimmer als eine Fehlermeldung. Zum Weiterarbeiten
+            // diese Zeile ersetzen durch:
+            //     zsDecompressCompressed(ctx, blkPtr, blkLen);
             poke64(ctx + 48, 1);
         }
     }
