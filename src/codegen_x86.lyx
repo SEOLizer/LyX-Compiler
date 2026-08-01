@@ -3207,6 +3207,106 @@ pub type Codegen = class {
   }
 
   // Returns 1 if the named class field has type "Array<T>" (any T), 0 otherwise.
+  // #1052: rax = [rax + rbx*w], breitengerecht (unsigned erweitert).
+  fn cg_emitScaledLoadRax(w: int64) {
+    if (w == 1) {
+      // movzx rax, byte [rax+rbx*1]
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x04); self.cg_e8(0x18);
+    } else if (w == 2) {
+      // movzx rax, word [rax+rbx*2]
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB7); self.cg_e8(0x04); self.cg_e8(0x58);
+    } else if (w == 4) {
+      // mov eax, [rax+rbx*4]  (nullt die oberen 32 Bit)
+      self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0x98);
+    } else {
+      // mov rax, [rax+rbx*8]
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0xD8);
+    }
+  }
+
+  // #1052: [rax + rbx*w] := rsi, breitengerecht.
+  fn cg_emitScaledStore(w: int64) {
+    if (w == 1) {
+      // mov [rax+rbx*1], sil
+      self.cg_e8(0x40); self.cg_e8(0x88); self.cg_e8(0x34); self.cg_e8(0x18);
+    } else if (w == 2) {
+      // mov [rax+rbx*2], si
+      self.cg_e8(0x66); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0x58);
+    } else if (w == 4) {
+      // mov [rax+rbx*4], esi
+      self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0x98);
+    } else {
+      // mov [rax+rbx*8], rsi
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD8);
+    }
+  }
+
+  // #1052: Adresse eines inline-Array-Feldes nach rax. Fuer ein gewoehnliches
+  // Feld liefert cg_genExpr den INHALT; ein inline liegendes Array hat aber
+  // keinen Zeiger, seine Daten stehen unmittelbar an der Feldadresse.
+  // Liefert die Elementbreite, oder 0 wenn `fieldNode` kein solches Feld ist —
+  // dann hat der Aufrufer nichts emittiert bekommen.
+  fn cg_emitInlineArrayAddr(fieldNode: int64): int64 {
+    if (fieldNode < 0) { return 0; }
+    if (self.cg_nkind(fieldNode) != CGN_FIELD) { return 0; }
+    var innerObj: int64 := self.cg_nc0(fieldNode);
+    var fldNm: pchar := self.cg_nsval(fieldNode);
+    var fldNl: int64 := self.cg_nslen(fieldNode);
+    var ci: int64 := self.cg_objClassIdx(innerObj);
+    var w: int64 := self.cg_fieldInlineElemW(ci, fldNm, fldNl);
+    if (w <= 0) { return 0; }
+    var off: int64 := self.cg_getFieldOffset(ci, fldNm, fldNl);
+    if (off < 0) { return 0; }
+    self.cg_genExpr(innerObj);                 // rax = Objektzeiger
+    if (off > 0) {
+      // lea rax, [rax + off]
+      if (off <= 127) {
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x40); self.cg_e8(off);
+      } else {
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x80); self.cg_e32(off);
+      }
+    }
+    return w;
+  }
+
+  // #1052: Zahl der Elemente eines `[N]T`-Typknotens (NK_TYPE_ARRAY_FIXED=101),
+  // 0 wenn der Knoten keiner ist oder N kein Ganzzahl-Literal.
+  fn cg_arrayFixedCount(typeNode: int64): int64 {
+    if (typeNode < 0) { return 0; }
+    if (self.cg_nkind(typeNode) != 101) { return 0; }
+    var sizeNode: int64 := self.cg_nc1(typeNode);
+    if (sizeNode < 0) { return 0; }
+    if (self.cg_nkind(sizeNode) != CGN_LIT_INT) { return 0; }
+    var n: int64 := self.cg_nival(sizeNode);
+    if (n <= 0) { return 0; }
+    return n;
+  }
+
+  // #1052: Elementbreite eines INLINE-Array-Feldes (`items: [4]int64`), sonst 0.
+  // Abgegrenzt von cg_isFieldArray, das ausschliesslich `Array<T>` erkennt —
+  // eine Heap-Struktur mit 16-Byte-Kopf. Ein inline geschriebenes Array liegt
+  // dagegen unmittelbar im Objekt; sein Feldname bezeichnet die ADRESSE, nicht
+  // einen Zeiger auf die Daten.
+  fn cg_fieldInlineElemW(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
+    if (classIdx < 0) { return 0; }
+    var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var p: pchar := peek64(fb) as pchar;
+      var n: int64 := peek64(fb + CG_CFIELD_OFF_FIELDLEN);
+      if (n == fieldLen && self.cg_seq(p, n, fieldName, fieldLen)) {
+        var fl: int64 := peek64(fb + CG_CFIELD_OFF_FLAGS);
+        if (((fl >> 3) & 1) == 0) { return 0; }
+        return (fl >> 8) & 0xFF;
+      }
+      i += 1;
+    }
+    return 0;
+  }
+
   fn cg_isFieldArray(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
     if (classIdx < 0) { return 0; }
     var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
@@ -3325,8 +3425,16 @@ pub type Codegen = class {
       }
       // #1038: Bit2 = vorzeichenbehafteter Schmaltyp (int8/i8/int16/i16/int32/i32).
       // Der Ladepfad braucht es, um movsx statt movzx zu emittieren.
-      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag | (tWidth << 8) | (isMth << 1) | (self.cg_typeIsSignedNarrow(ftypeNode) << 2));
-      offset += 8;
+      // #1052: `feld: [N]T` liegt INLINE im Objekt. Bit3 kennzeichnet das, die
+      // Breite in Bits 8..15 ist dann die ELEMENTbreite.
+      var inlN: int64 := self.cg_arrayFixedCount(ftypeNode);
+      if (inlN > 0) { tWidth := self.cg_typeSize(self.cg_nc0(ftypeNode)); }
+      var inlBit: int64 := 0;
+      if (inlN > 0) { inlBit := 1; }
+      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag | (tWidth << 8) | (isMth << 1) | (self.cg_typeIsSignedNarrow(ftypeNode) << 2) | (inlBit << 3));
+      // #1052: ein inline `[N]T`-Feld belegt N * Elementbreite, nicht 8 Byte.
+      // Ohne das ueberlappte das Folgefeld die Arraydaten.
+      if (inlN > 0) { offset := offset + inlN * tWidth; } else { offset += 8; }
       i += 1;
       tmp := self.cg_nnext(tmp);
     }
@@ -3540,9 +3648,17 @@ pub type Codegen = class {
         else if (self.cg_nkind(ftypeNode) == 60 && self.cg_isMethodType(self.cg_nsval(ftypeNode), self.cg_nslen(ftypeNode)) != 0) { isMth2 := 1; }
       }
       // #1038: Bit2 = vorzeichenbehafteter Schmaltyp, siehe cg_buildClassLayout.
-      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag2 | (tWidth2 << 8) | (isMth2 << 1) | (self.cg_typeIsSignedNarrow(ftypeNode) << 2));
+      // #1052: siehe cg_buildClassLayout — inline `[N]T`-Feld.
+      var inlN2: int64 := self.cg_arrayFixedCount(ftypeNode);
+      if (inlN2 > 0) { tWidth2 := self.cg_typeSize(self.cg_nc0(ftypeNode)); }
+      var inlBit2: int64 := 0;
+      if (inlN2 > 0) { inlBit2 := 1; }
+      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag2 | (tWidth2 << 8) | (isMth2 << 1) | (self.cg_typeIsSignedNarrow(ftypeNode) << 2) | (inlBit2 << 3));
       // WP-4.1-A: field stride
-      if (isPacked != 0) {
+      // #1052: inline `[N]T` belegt N * Elementbreite — auch ungepackt.
+      if (inlN2 > 0) {
+        offset := offset + inlN2 * tWidth2;
+      } else if (isPacked != 0) {
         offset := offset + self.cg_typeSize(ftypeNode);
       } else {
         offset += 8;  // default: 8-byte aligned
@@ -4708,8 +4824,14 @@ pub type Codegen = class {
       // Eval index first, push; then eval arr; pop index into rbx
       self.cg_genExpr(self.cg_nc1(ni));   // rax = index
       self.cg_pushRax();
-      self.cg_genExpr(self.cg_nc0(ni));   // rax = array ptr
+      // #1052: inline `[N]T`-Feld — Adresse statt Inhalt laden.
+      var rdInlW: int64 := self.cg_emitInlineArrayAddr(self.cg_nc0(ni));
+      if (rdInlW == 0) { self.cg_genExpr(self.cg_nc0(ni)); }   // rax = array ptr
       self.cg_popRbx();                    // rbx = index
+      if (rdInlW > 0) {
+        self.cg_emitScaledLoadRax(rdInlW);
+        return;
+      }
       var baseNode: int64 := self.cg_nc0(ni);
       var isPchar:  int64 := 0;
       var isArray:  int64 := 0;
@@ -8448,8 +8570,17 @@ pub type Codegen = class {
         self.cg_pushRax();
         self.cg_genExpr(self.cg_nc1(lhs)); // rax = index
         self.cg_pushRax();
-        self.cg_genExpr(self.cg_nc0(lhs)); // rax = array ptr
+        // #1052: inline `[N]T`-Feld — Adresse statt Inhalt. Vorher wurde der
+        // FELDINHALT als Zieladresse genommen (bei genulltem Speicher also 0),
+        // was jeden Schreibzugriff zum Segfault machte.
+        var wrInlW: int64 := self.cg_emitInlineArrayAddr(self.cg_nc0(lhs));
+        if (wrInlW == 0) { self.cg_genExpr(self.cg_nc0(lhs)); }  // rax = array ptr
         self.cg_popRbx();                  // rbx = index
+        if (wrInlW > 0) {
+          self.cg_e8(0x5E);                // pop rsi (Wert)
+          self.cg_emitScaledStore(wrInlW);
+          return;
+        }
         var lhsBase: int64 := self.cg_nc0(lhs);
         var lhsIsArray: int64 := 0;
         var lhsIsSimd:  int64 := 0;
