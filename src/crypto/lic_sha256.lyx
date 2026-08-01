@@ -1,0 +1,237 @@
+// src/crypto/lic_sha256.lyx — SHA-256 fuer den Compiler-Selbstbau
+//
+// Fachlich identisch zu std/crypto/sha256.lyx, aber gegen src.std.alloc
+// (Arena) gebaut und mit eigenem Namensraum (lic_*).
+//
+// Grund (#1035): der Compiler zog ueber
+//   lyxc -> src.tools.lbf.writer -> src.tools.lbf.security -> std.crypto.sha256
+// die Unit std.alloc in seinen eigenen Build. Damit lagen ZWEI Allokatoren mit
+// gleichnamigem alloc/free in derselben flachen Symboltabelle — welcher gebunden
+// wird, entschied allein die Import-Reihenfolge. Das blieb unbemerkt, solange
+// alloc/free in src/std/alloc.lyx kein pub trugen und die Kollisionspruefung aus
+// #1028 sie deshalb nicht sah.
+//
+// Die beiden Allokatoren sind nicht austauschbar: std/alloc.lyx mappt je
+// Allokation und free() munmapped, src/std/alloc.lyx ist eine Arena mit
+// Bump-Pointer, deren free() korrekt ein No-op ist. Ein munmap auf
+// Arena-Speicher waere Speicherkorruption.
+
+unit std.crypto.sha256;
+
+import src.std.alloc;
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+fn licSha256Rotr32(x: int64, n: int64): int64 {
+    return (((x & 0xFFFFFFFF) >> n) | ((x << (32 - n)) & 0xFFFFFFFF)) & 0xFFFFFFFF;
+}
+
+// Fill 256-byte K table with the 64 SHA-256 round constants (big-endian cube roots)
+fn licSha256InitK(K: int64): void {
+    poke32(K +   0, 0x428a2f98); poke32(K +   4, 0x71374491);
+    poke32(K +   8, 0xb5c0fbcf); poke32(K +  12, 0xe9b5dba5);
+    poke32(K +  16, 0x3956c25b); poke32(K +  20, 0x59f111f1);
+    poke32(K +  24, 0x923f82a4); poke32(K +  28, 0xab1c5ed5);
+    poke32(K +  32, 0xd807aa98); poke32(K +  36, 0x12835b01);
+    poke32(K +  40, 0x243185be); poke32(K +  44, 0x550c7dc3);
+    poke32(K +  48, 0x72be5d74); poke32(K +  52, 0x80deb1fe);
+    poke32(K +  56, 0x9bdc06a7); poke32(K +  60, 0xc19bf174);
+    poke32(K +  64, 0xe49b69c1); poke32(K +  68, 0xefbe4786);
+    poke32(K +  72, 0x0fc19dc6); poke32(K +  76, 0x240ca1cc);
+    poke32(K +  80, 0x2de92c6f); poke32(K +  84, 0x4a7484aa);
+    poke32(K +  88, 0x5cb0a9dc); poke32(K +  92, 0x76f988da);
+    poke32(K +  96, 0x983e5152); poke32(K + 100, 0xa831c66d);
+    poke32(K + 104, 0xb00327c8); poke32(K + 108, 0xbf597fc7);
+    poke32(K + 112, 0xc6e00bf3); poke32(K + 116, 0xd5a79147);
+    poke32(K + 120, 0x06ca6351); poke32(K + 124, 0x14292967);
+    poke32(K + 128, 0x27b70a85); poke32(K + 132, 0x2e1b2138);
+    poke32(K + 136, 0x4d2c6dfc); poke32(K + 140, 0x53380d13);
+    poke32(K + 144, 0x650a7354); poke32(K + 148, 0x766a0abb);
+    poke32(K + 152, 0x81c2c92e); poke32(K + 156, 0x92722c85);
+    poke32(K + 160, 0xa2bfe8a1); poke32(K + 164, 0xa81a664b);
+    poke32(K + 168, 0xc24b8b70); poke32(K + 172, 0xc76c51a3);
+    poke32(K + 176, 0xd192e819); poke32(K + 180, 0xd6990624);
+    poke32(K + 184, 0xf40e3585); poke32(K + 188, 0x106aa070);
+    poke32(K + 192, 0x19a4c116); poke32(K + 196, 0x1e376c08);
+    poke32(K + 200, 0x2748774c); poke32(K + 204, 0x34b0bcb5);
+    poke32(K + 208, 0x391c0cb3); poke32(K + 212, 0x4ed8aa4a);
+    poke32(K + 216, 0x5b9cca4f); poke32(K + 220, 0x682e6ff3);
+    poke32(K + 224, 0x748f82ee); poke32(K + 228, 0x78a5636f);
+    poke32(K + 232, 0x84c87814); poke32(K + 236, 0x8cc70208);
+    poke32(K + 240, 0x90befffa); poke32(K + 244, 0xa4506ceb);
+    poke32(K + 248, 0xbef9a3f7); poke32(K + 252, 0xc67178f2);
+}
+
+// Process one 64-byte (512-bit) block into the 8-word state buffer
+fn licSha256Block(state: int64, block: int64): void {
+    var W: int64 := alloc(256);  // W[0..63]: 64 x 4 bytes
+    var K: int64 := alloc(256);  // K[0..63]: 64 x 4 bytes
+    licSha256InitK(K);
+
+    // Load W[0..15] as big-endian 32-bit words from the input block
+    var i: int64 := 0;
+    while (i < 16) {
+        var off: int64 := i * 4;
+        var w: int64 := (peek8(block + off)     << 24)
+                      | (peek8(block + off + 1) << 16)
+                      | (peek8(block + off + 2) <<  8)
+                      |  peek8(block + off + 3);
+        poke32(W + i * 4, w & 0xFFFFFFFF);
+        i += 1;
+    }
+
+    // Expand W[16..63]: W[i] = sigma1(W[i-2]) + W[i-7] + sigma0(W[i-15]) + W[i-16]
+    i := 16;
+    while (i < 64) {
+        var w15: int64 := peek32(W + (i - 15) * 4) & 0xFFFFFFFF;
+        var w2:  int64 := peek32(W + (i -  2) * 4) & 0xFFFFFFFF;
+        var s0:  int64 := licSha256Rotr32(w15, 7) ^ licSha256Rotr32(w15, 18) ^ (w15 >> 3);
+        var s1:  int64 := licSha256Rotr32(w2, 17) ^ licSha256Rotr32(w2,  19) ^ (w2  >> 10);
+        var wv:  int64 := (peek32(W + (i - 16) * 4) + s0
+                         + peek32(W + (i -  7) * 4) + s1) & 0xFFFFFFFF;
+        poke32(W + i * 4, wv);
+        i += 1;
+    }
+
+    // Working variables a..h from state
+    var a: int64 := peek32(state +  0) & 0xFFFFFFFF;
+    var b: int64 := peek32(state +  4) & 0xFFFFFFFF;
+    var c: int64 := peek32(state +  8) & 0xFFFFFFFF;
+    var d: int64 := peek32(state + 12) & 0xFFFFFFFF;
+    var e: int64 := peek32(state + 16) & 0xFFFFFFFF;
+    var f: int64 := peek32(state + 20) & 0xFFFFFFFF;
+    var g: int64 := peek32(state + 24) & 0xFFFFFFFF;
+    var h: int64 := peek32(state + 28) & 0xFFFFFFFF;
+
+    // 64 compression rounds
+    i := 0;
+    while (i < 64) {
+        var S1:   int64 := licSha256Rotr32(e, 6) ^ licSha256Rotr32(e, 11) ^ licSha256Rotr32(e, 25);
+        var ch:   int64 := (e & f) ^ ((e ^ 0xFFFFFFFF) & g);
+        var tmp1: int64 := (h + S1 + (ch & 0xFFFFFFFF) + peek32(K + i * 4) + peek32(W + i * 4)) & 0xFFFFFFFF;
+        var S0:   int64 := licSha256Rotr32(a, 2) ^ licSha256Rotr32(a, 13) ^ licSha256Rotr32(a, 22);
+        var maj:  int64 := (a & b) ^ (a & c) ^ (b & c);
+        var tmp2: int64 := (S0 + (maj & 0xFFFFFFFF)) & 0xFFFFFFFF;
+        h := g;
+        g := f;
+        f := e;
+        e := (d + tmp1) & 0xFFFFFFFF;
+        d := c;
+        c := b;
+        b := a;
+        a := (tmp1 + tmp2) & 0xFFFFFFFF;
+        i += 1;
+    }
+
+    // Add compressed chunk to current hash state
+    poke32(state +  0, (peek32(state +  0) + a) & 0xFFFFFFFF);
+    poke32(state +  4, (peek32(state +  4) + b) & 0xFFFFFFFF);
+    poke32(state +  8, (peek32(state +  8) + c) & 0xFFFFFFFF);
+    poke32(state + 12, (peek32(state + 12) + d) & 0xFFFFFFFF);
+    poke32(state + 16, (peek32(state + 16) + e) & 0xFFFFFFFF);
+    poke32(state + 20, (peek32(state + 20) + f) & 0xFFFFFFFF);
+    poke32(state + 24, (peek32(state + 24) + g) & 0xFFFFFFFF);
+    poke32(state + 28, (peek32(state + 28) + h) & 0xFFFFFFFF);
+
+    free(W, 256);
+    free(K, 256);
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+// lic_SHA256: writes a 32-byte digest into out.
+// out must point to at least 32 writable bytes.
+pub fn lic_SHA256(data: int64, len: int64, out: int64): void {
+    // Initial hash values (first 32 bits of fractional parts of sqrt of first 8 primes)
+    var state: int64 := alloc(32);
+    poke32(state +  0, 0x6a09e667);
+    poke32(state +  4, 0xbb67ae85);
+    poke32(state +  8, 0x3c6ef372);
+    poke32(state + 12, 0xa54ff53a);
+    poke32(state + 16, 0x510e527f);
+    poke32(state + 20, 0x9b05688c);
+    poke32(state + 24, 0x1f83d9ab);
+    poke32(state + 28, 0x5be0cd19);
+
+    // Process all complete 64-byte blocks
+    var processed: int64 := 0;
+    while (processed + 64 <= len) {
+        licSha256Block(state, data + processed);
+        processed += 64;
+    }
+
+    // Build final padded block(s): at most 2 blocks (128 bytes)
+    var padBuf: int64 := alloc(128);
+    var remaining: int64 := len - processed;
+
+    var i: int64 := 0;
+    while (i < remaining) {
+        poke8(padBuf + i, peek8(data + processed + i));
+        i += 1;
+    }
+    poke8(padBuf + remaining, 0x80);
+    i := remaining + 1;
+    while (i < 128) { poke8(padBuf + i, 0); i := i + 1; }
+
+    // Append original message bit-length as big-endian 64-bit at offset 56 (or 120)
+    var bitLen: int64 := len * 8;
+    var lenOff: int64 := 56;
+    if (remaining >= 56) { lenOff := 120; }
+
+    poke8(padBuf + lenOff,     (bitLen >> 56) & 0xFF);
+    poke8(padBuf + lenOff + 1, (bitLen >> 48) & 0xFF);
+    poke8(padBuf + lenOff + 2, (bitLen >> 40) & 0xFF);
+    poke8(padBuf + lenOff + 3, (bitLen >> 32) & 0xFF);
+    poke8(padBuf + lenOff + 4, (bitLen >> 24) & 0xFF);
+    poke8(padBuf + lenOff + 5, (bitLen >> 16) & 0xFF);
+    poke8(padBuf + lenOff + 6, (bitLen >>  8) & 0xFF);
+    poke8(padBuf + lenOff + 7,  bitLen        & 0xFF);
+
+    licSha256Block(state, padBuf);
+    if (remaining >= 56) { licSha256Block(state, padBuf + 64); }
+
+    // Write 32-byte big-endian digest
+    i := 0;
+    while (i < 8) {
+        var hw:   int64 := peek32(state + i * 4) & 0xFFFFFFFF;
+        var base: int64 := out + i * 4;
+        poke8(base,     (hw >> 24) & 0xFF);
+        poke8(base + 1, (hw >> 16) & 0xFF);
+        poke8(base + 2, (hw >>  8) & 0xFF);
+        poke8(base + 3,  hw        & 0xFF);
+        i += 1;
+    }
+
+    free(state, 32);
+    free(padBuf, 128);
+}
+
+// lic_SHA256Hex: writes 64-char lowercase hex + NUL into out (65 bytes).
+pub fn lic_SHA256Hex(data: int64, len: int64, out: int64): void {
+    var digest: int64 := alloc(32);
+    lic_SHA256(data, len, digest);
+    var hex: pchar := "0123456789abcdef";
+    var i: int64 := 0;
+    while (i < 32) {
+        var b: int64 := peek8(digest + i) & 0xFF;
+        poke8(out + i * 2,     peek8(hex as int64 + (b >> 4)));
+        poke8(out + i * 2 + 1, peek8(hex as int64 + (b & 15)));
+        i += 1;
+    }
+    poke8(out + 64, 0);
+    free(digest, 32);
+}
+
+// lic_SHA256Str: convenience wrapper for pchar inputs.
+pub fn lic_SHA256Str(data: pchar, len: int64, out: int64): void {
+    lic_SHA256(data as int64, len, out);
+}
+
+// WP-PQC-02: lic_HashSHA256Bytes — canonical multi-block alias (same as lic_SHA256)
+pub fn lic_HashSHA256Bytes(data: int64, len: int64, out: int64): void {
+    lic_SHA256(data, len, out);
+}

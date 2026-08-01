@@ -16,7 +16,7 @@ PASS=0; FAIL=0
 
 # Klasse in einem separaten Modul (cwd-relativ auflösbar von ROOT).
 cat > "$ROOT/_implib_test.lyx" <<'LYX'
-type Panel = class {
+pub type Panel = class {
   a: int64; b: int64; c: int64; d: int64;
   fn Id(): int64 { return self.a; }
   fn Answer(): int64 { return 42; }
