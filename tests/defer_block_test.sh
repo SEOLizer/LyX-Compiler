@@ -156,5 +156,57 @@ else
   no "return fuehrt alle offenen defers aus" "compile fehlgeschlagen"
 fi
 
+# --- Argument-Zeitpunkt (#1030) -----------------------------------------
+# Die Argumente werden bei der VORMERKUNG ausgewertet, nicht am Blockende.
+# Ohne das sah `defer f(i)` in einer Schleife das bereits erhoehte i.
+run "Schleife: Argument zur defer-Zeit" '
+  var i: int64 := 0;
+  while (i < 3) {
+    defer PrintLn(10 + i);
+    PrintLn(i);
+    i := i + 1;
+  }' '0|10|1|11|2|12|'
+
+run "spaetere Zuweisung aendert das Argument nicht" '
+  var v: int64 := 5;
+  {
+    defer PrintLn(v);
+    v := 99;
+  }
+  PrintLn(v);' '5|99|'
+
+run "Zeichenkette wird zur defer-Zeit gebunden" '
+  var s: pchar := "alt"c;
+  {
+    defer PrintLn(s);
+    s := "neu"c;
+  }
+  PrintLn(s);' 'alt|neu|'
+
+# Ein Argument mit Nebenwirkung darf GENAU EINMAL laufen, und zwar sofort.
+cat > "$TMP/s.lyx" <<'EOF'
+import std.io;
+pub var g_c: int64;
+fn side(v: int64): int64 { g_c := g_c + 1; return v; }
+fn main(): int64 {
+  g_c := 0;
+  {
+    defer PrintLn(side(3));
+    Print("vor-ende "); PrintLn(g_c);
+  }
+  Print("aufrufe "); PrintLn(g_c);
+  return 0;
+}
+EOF
+rm -f "$TMP/s"
+if (cd "$ROOT" && "$LYXC" --std-path="$ROOT" "$TMP/s.lyx" -o "$TMP/s" >/dev/null 2>&1); then
+  got=$(timeout 5 "$TMP/s" 2>&1 | tr '\n' '|')
+  want='vor-ende 1|3|aufrufe 1|'
+  if [ "$got" = "$want" ]; then ok "Nebenwirkung laeuft einmal, zur defer-Zeit"
+  else no "Nebenwirkung laeuft einmal, zur defer-Zeit" "'$got' erwartet '$want'"; fi
+else
+  no "Nebenwirkung laeuft einmal, zur defer-Zeit" "compile fehlgeschlagen"
+fi
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
