@@ -4,6 +4,88 @@
 
 _(noch nichts)_
 
+## Version 1.0.11C (August 2026)
+
+Neun PRs. Roter Faden: **stille Lücken laut machen** — sechs der Befunde
+lieferten etwas Plausibles, statt zu melden.
+
+### Compiler (Codegen) — `defer` lief am Funktionsende statt am Blockende (#1006)
+- Ursache war nicht eine falsch berechnete Blockgrenze, sondern **gar keine**:
+  `cg_collectDefers` sammelte funktionsweit in einen Puffer, den
+  `cg_emitDefers` an den Funktionsausgängen abarbeitete — Blockzugehörigkeit
+  kam im Entwurf nicht vor.
+- Jetzt Vormerkung an der Quelltextstelle, Abarbeitung am Ende des
+  umschließenden Blocks (LIFO, vor dem Verwerfen der Locals). `return` führt
+  weiterhin alle offenen defers aus.
+- Zusätzlich gefunden: **`break` und `continue` übersprangen die defers** des
+  Schleifenrumpfes. Neues Feld `loopDeferMark`, gesetzt in allen fünf
+  Schleifenformen.
+- Nicht enthalten (#1030): die **Argumente** werden weiterhin beim Blockende
+  ausgewertet, nicht bei der Vormerkung.
+
+### Compiler (Codegen) — `Printf` fehlte im x86-Backend (#1012)
+- In sema als Builtin registriert und für ARM64 gelowert, auf ELF endete jeder
+  Aufruf mit `undefined function 'Printf'`.
+- Der Formatstring wird zur **Übersetzungszeit** zerlegt (`cg_genPrintf`), je
+  Bestandteil eigene Emission (`%s`, `%d`, `%f`, `%c`, `%%`) — damit ohne
+  varargs und ohne Laufzeit-Interpreter. Grenzfälle melden laut.
+
+### Compiler (Codegen) — inline geschriebener fn-Zeigertyp stürzte ab (#1003)
+- Die Eigenschaft *ist ein fn-Zeiger* hing am Typ**namen**: `cg_isFnPtrAlias`
+  suchte in der Liste der `type X = fn(...)`-Aliase. Ein inline geschriebener
+  Typ hat keinen Namen, der Aufruf lief über den Closure-Pfad und sprang in
+  Datenmüll. Dieselbe Klasse wie bei `defer` — die richtige Ebene fehlte.
+- Vermerkt wird die Eigenschaft jetzt am Local selbst (`localIsFnPtr`), gesetzt
+  an allen vier Entstehungsstellen. Als Klassenfeld war der Fall seit #889 in
+  Ordnung.
+
+### Compiler (Lexer) — Ziffern-Trenner im Float-Literal wurde verschluckt (#1011)
+- Der Lexer akzeptiert `_` im Zahlliteral, die beiden Umwandlungen nach
+  IEEE-754 (`cg_parseFloat`, `_parseFloatBits`) hielten am `_` an: `3.14_159`
+  wurde zu 3.139999, `1_000.5` zu 1.0 — ohne Meldung.
+- Der vorhandene Test **konnte den Fehler nicht sehen**: er verglich über
+  `as int64`, wodurch beide Werte zu 3 kollabierten. Vergleich läuft jetzt auf
+  f64.
+
+### Compiler (sema) — gleichnamige Exporte zweier Units (#1028)
+- `Lookup()` durchsucht die flache Symboltabelle rückwärts: bei Namensgleichheit
+  gewann die Import-Reihenfolge, ohne Warnung. Bei unterschiedlicher Semantik —
+  `DirList` als flacher Puffer vs. Hashmap — übersetzt das Programm und rechnet
+  falsch.
+- Kollisionen werden mit beiden Modulnamen gemeldet; nur `pub`,
+  Builtin-Shadowing bleibt erlaubt. Drei echte Funde im Bestand bereinigt.
+
+### Compiler (sema, Codegen) — `uintN` und `uN` waren uneinheitlich (#1010)
+- Vier Stellen kannten unterschiedliche Teilmengen: der var-Deklarator wies
+  `uint8` ab, `cg_typeSize` kannte umgekehrt **nur** die Langform, und ein
+  `u16`-Feld bekam stillschweigend Breite 8.
+- Beide Schreibweisen an allen vier Stellen. `ebnf.md` §7 führt jetzt beide;
+  `isize`/`usize` gestrichen, weil der Compiler sie nachweislich nicht kennt.
+
+### stdlib — zstd meldet Compressed Blocks, statt zu raten (#1027, entschärft)
+- Messung über 97 Frames: vorher 67 Abstürze und 6-mal **still falscher**
+  Inhalt; nachher 0 und 0. Bei 44 Byte Inhalt kam die richtige Länge mit
+  9 falschen Bytes zurück — ein Längenvergleich allein sichert nicht ab.
+- `blockType == 2` ist jetzt fail-closed; der Dekodierpfad wurde gehärtet
+  (u.a. Bereichsprüfung im FSE-Zustand, Ursache der Abstürze). **Der Decoder
+  ist damit nicht repariert**, #1027 bleibt offen.
+
+### Tests
+- `edi06_desadv_test` las aus einem freigegebenen Puffer (#1016) — kein
+  Bibliotheks- oder Compilerfehler, sondern ein Use-after-free im Test, der
+  erst auffiel, seit `free` tatsächlich `munmap` ruft. Vollsuite jetzt
+  132 grün.
+- zstd-Test importiert nur noch eine stdlib-Familie.
+
+### Dokumentation
+- `CLAUDE.md` neu: Arbeitsregeln aus den Postmortems dieses Projekts — die zwei
+  dominanten Fehlerursachen (stiller Default; die im Entwurf fehlende Ebene),
+  Testdisziplin, Nachweispflicht vor dem PR, wiederkehrende Sprach- und
+  Repo-Fallen.
+- Darin festgehalten: `Closes #N` greift hier **nie**, weil GitHub die
+  Verknüpfung nur beim Merge in den Default-Branch (`main`) auslöst — gearbeitet
+  wird gegen `develop`. Issues sind von Hand zu schließen.
+
 ## Version 1.0.11B (August 2026)
 
 ### Compiler (Codegen) — `&&` und `||` schlossen nicht kurz (#1023)
