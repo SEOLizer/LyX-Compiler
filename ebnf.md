@@ -855,15 +855,19 @@ CastExpr            = PostfixExpr [ "as" Type ] ;
 
 PostfixExpr         = PrimaryExpr { PostfixSuffix } ;
 
-PostfixSuffix       = CallSuffix
-                    | GenericCallSuffix
-                    | IndexSuffix
+PostfixSuffix       = IndexSuffix
                     | FieldSuffix
                     | SafeFieldSuffix ;
 
-CallSuffix          = "(" [ ArgList ] ")" ;
+(* Ein Aufruf haengt am NAMEN, nicht an einem beliebigen Ausdruck: `f(a, b)`
+   und `f<T>(a, b)` sind Primaerausdruecke. Ein Aufruf ueber einen indizierten
+   Ausdruck -- `handlers[0](a, b)` -- ist NICHT vorgesehen und wird abgewiesen;
+   ein Funktionszeiger wird zuerst einer Variablen zugewiesen und ueber diese
+   aufgerufen. Der Methodenaufruf `obj.m(a, b)` steht bei FieldSuffix. *)
 
-GenericCallSuffix   = "[" TypeArgList "]" "(" [ ArgList ] ")" ;
+CallExpr            = Ident "(" [ ArgList ] ")" ;
+
+GenericCallExpr     = Ident "<" TypeArgList ">" "(" [ ArgList ] ")" ;
 
 IndexSuffix         = "[" Expr "]" ;
 
@@ -874,6 +878,8 @@ SafeFieldSuffix     = "?." Ident ;
 PrimaryExpr         = Literal
                     | SelfExpr
                     | SuperExpr
+                    | CallExpr
+                    | GenericCallExpr
                     | Ident
                     | MatchExpr
                     | BuiltinCall

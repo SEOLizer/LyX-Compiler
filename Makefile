@@ -231,6 +231,9 @@ test: lyxc
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
 	@echo "OK"
+	@echo "--- Aufruf ueber indizierten Ausdruck wird abgewiesen (6 Pruefungen) ---"
+	@bash tests/indexed_call_reject_test.sh
+	@echo "OK"
 	@echo "--- Inline-Array als Struct-Feld (6 Pruefungen) ---"
 	@bash tests/inline_array_field_test.sh
 	@echo "OK"
