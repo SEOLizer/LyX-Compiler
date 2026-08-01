@@ -406,9 +406,11 @@ TupleType           = "(" Type "," Type { "," Type } ")" ;
        btn.on_click := form.Handle;   (* bindet form als self *)
        btn.on_click(rcv)
 
-   Ein inline geschriebener Funktionszeigertyp (`var f: fn(int64): int64`)
-   wird vom Parser zwar angenommen, erzeugt aber fehlerhaften Code -- siehe
-   Abschnitt 20. Kanonisch ist der Typalias. *)
+   Der Typ darf inline geschrieben werden (`var f: fn(int64): int64 := g;`) --
+   als lokale Variable, als Parameter und als Feld. Bis 1.0.11B stuerzte der
+   AUFRUF eines inline geschriebenen fn-Zeigers ab, weil der Aufrufpfad ihn nur
+   am Namen eines Typalias erkannte (#1003); der Typalias war deshalb die
+   einzige verlaessliche Form. *)
 
 FnPtrType           = "fn" "(" [ FnPtrParams ] ")" [ ":" Type ] ;
 
@@ -1172,7 +1174,6 @@ Einzelbefunde sind dort verlinkt.
 | `range(N)` | 2.2 | Uebersetzt, iteriert aber nicht: `for i in range(5)` summiert zu 0, an anderer Stelle zu Datenmuell. (#1007) |
 | `defer` im inneren Block | 2.2 | Laeuft am **Funktionsende** statt am Blockende. Auf Funktionsebene korrekt. (#1006) |
 | Unterstrich im Float-Literal | 1 | `FloatLiteral` erlaubt `_` ausdruecklich; `3.14_159` uebersetzt, liefert aber einen falschen Wert. Bei Ganzzahlen funktioniert der Trenner. (#1011) |
-| `var f: fn(int64): int64 := g;` | 7 | Uebersetzt fehlerfrei, das erzeugte Programm stuerzt beim Aufruf ab. Kanonisch ist der Typalias (`type Cb = fn(int64): int64;`). (#1003) |
 | `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
 
 Nicht mehr betroffen: die Bindung von Methodenzeigern (`feld := obj.Method`)

@@ -518,6 +518,11 @@ pub type Codegen = class {
   localIsRedundant:  int64;
   // WP-GPU-01: byte buffer parallel to locals, 1 = parallel Array<f32> (SIMD)
   localIsSimd:       int64;
+  // #1003: byte buffer parallel to locals, 1 = INLINE geschriebener fn-Zeigertyp
+  // (`var f: fn(int64): int64`). Ueber einen Typalias merkt sich das die
+  // fnAlias-Liste am Namen; ein inline geschriebener Typ HAT keinen Namen und
+  // fiel deshalb in den Closure-Pfad, der {fnPtr,env} erwartet -> Absturz.
+  localIsFnPtr:      int64;
   foldBuf:          int64;  // WP-10g: scratch for cg_tryFold constant-folding results
 
   // Temporary buffer tracking (BUG-02: prevent mmap leaks)
@@ -791,6 +796,10 @@ pub type Codegen = class {
       i := 0;
       memcpy(simdb, self.localIsSimd, self.localCount);
       self.localIsSimd := simdb;
+      var fpb: int64 := alloc(nc);
+      i := 0;
+      memcpy(fpb, self.localIsFnPtr, self.localCount);
+      self.localIsFnPtr := fpb;
       self.localCap := nc;
     }
     self.frameSize += 8;
@@ -806,6 +815,7 @@ pub type Codegen = class {
     poke64(self.localArraySize   + self.localCount * 8, 0);
     poke8(self.localIsRedundant  + self.localCount, 0);  // WP-3.1
     poke8(self.localIsSimd       + self.localCount, 0);  // WP-GPU-01
+    poke8(self.localIsFnPtr      + self.localCount, 0);  // #1003
     self.localCount += 1;
     return 0 - self.frameSize;
   }
@@ -4058,6 +4068,10 @@ pub type Codegen = class {
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
       }
+      // #1003: inline geschriebener fn-Zeigertyp als Parameter
+      if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == CGN_FN_PTR_NODE) {
+        poke8(self.localIsFnPtr + self.localCount - 1, 1);
+      }
       if (paramIdx == 1) { self.cg_spillRsi(poff); }
       else if (paramIdx == 2) { self.cg_spillRdx(poff); }
       else if (paramIdx == 3) { self.cg_spillRcx(poff); }
@@ -5178,6 +5192,8 @@ pub type Codegen = class {
           var ltp: pchar := peek64(ltb) as pchar;
           var ltl: int64 := peek64(ltb + CG_LOCTYPE_OFF_LEN);
           if (ltp != 0 as pchar && ltl > 0 && self.cg_isFnPtrAlias(ltp, ltl) != 0) { isThinFn := 1; }
+          // #1003: inline geschriebener fn-Zeigertyp — gleicher thin-call
+          if (peek8(self.localIsFnPtr + clIdx) != 0) { isThinFn := 1; }
         }
         if (isThinFn != 0) {
           var tfCur: int64 := argNode;
@@ -7967,6 +7983,11 @@ pub type Codegen = class {
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 60) {
         self.cg_setLocalType(localIdx, self.cg_nsval(typeNode), self.cg_nslen(typeNode));
       }
+      // #1003: inline geschriebener fn-Zeigertyp — hat keinen Namen, den die
+      // fnAlias-Liste tragen koennte, also am Local selbst vermerken.
+      if (typeNode >= 0 && self.cg_nkind(typeNode) == CGN_FN_PTR_NODE) {
+        poke8(self.localIsFnPtr + localIdx, 1);
+      }
       // Track array locals: NK_TYPE_ARRAY (=61) or NK_TYPE_NAME "Array<T>" (uppercase, =60)
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 61) {
         poke8(self.localIsArray + localIdx, 1);
@@ -8495,6 +8516,10 @@ pub type Codegen = class {
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
       }
+      // #1003: inline geschriebener fn-Zeigertyp als Parameter
+      if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == CGN_FN_PTR_NODE) {
+        poke8(self.localIsFnPtr + self.localCount - 1, 1);
+      }
 
     } else if (k == CGN_AT_DIRECTIVE) {  // WP-CS-07 / WP-AS-04/05
       var kind: int64 := self.cg_nival(ni);
@@ -8607,6 +8632,11 @@ pub type Codegen = class {
       var pname: pchar := self.cg_nsval(param);
       var pnlen: int64 := self.cg_nslen(param);
       var off: int64 := self.cg_addLocal(pname, pnlen);
+      // #1003: inline geschriebener fn-Zeigertyp als Parameter
+      var nfpType: int64 := self.cg_nc0(param);
+      if (nfpType >= 0 && self.cg_nkind(nfpType) == CGN_FN_PTR_NODE) {
+        poke8(self.localIsFnPtr + self.localCount - 1, 1);
+      }
       if (paramIdx == 0) { self.cg_spillRdi(off); }
       else if (paramIdx == 1) { self.cg_spillRsi(off); }
       else if (paramIdx == 2) { self.cg_spillRdx(off); }
@@ -9650,6 +9680,10 @@ pub type Codegen = class {
       var ptypeNode: int64 := self.cg_nc0(param);
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
+      }
+      // #1003: inline geschriebener fn-Zeigertyp als Parameter
+      if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == CGN_FN_PTR_NODE) {
+        poke8(self.localIsFnPtr + self.localCount - 1, 1);
       }
       if (paramIdx == 0) { self.cg_spillRdi(off); }
       else if (paramIdx == 1) { self.cg_spillRsi(off); }
@@ -11173,6 +11207,7 @@ pub type Codegen = class {
     self.localIsRedundant := alloc(self.localCap);
     // WP-GPU-01: per-local SIMD flag
     self.localIsSimd      := alloc(self.localCap);
+    self.localIsFnPtr     := alloc(self.localCap);
 
     // BUG-02: Temporary buffer tracking (prevent mmap leaks)
     self.tempBufCap   := 64;
