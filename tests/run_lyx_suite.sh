@@ -32,7 +32,6 @@ declare -A KNOWN_RED=(
   [usb_wp21_test]="#1017 usb_wp21"
   [do_test_transport]="#1017 do_test_transport"
   [wp06_macos_socket]="#1017 macOS-Socket-Test auf Linux"
-  [edi06_desadv_test]="#1016 Absturz nach allen PASS (Speicherfehler)"
 )
 
 pass=0; fail=0; known=0; failed_names=""
