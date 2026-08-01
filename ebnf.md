@@ -751,8 +751,12 @@ IdentPattern        = Ident ;
 
 EnumPattern         = Ident "." Ident ;   (* z. B. Color.Green *)
 
-(* ACHTUNG: keines der hier beschriebenen Patterns ist derzeit erreichbar --
-   `match` laesst sich gar nicht verwenden. Siehe 20.1 und Issue #1008. *)
+(* Erreichbar sind: LiteralPattern, WildcardPattern, IdentPattern (aufgeloest
+   ueber Konstanten und Enum-Mitglieder), Guards und Or-Muster.
+
+   NICHT erreichbar: EnumPattern in qualifizierter Form (`Color.Green`) sowie
+   bindende Bezeichner-Muster. `match` ist ausserdem nur eine Anweisung, kein
+   Ausdruck, und Fallruempfe muessen Ausdruecke sein. Siehe 20.1. *)
 
 WildcardPattern     = "_" ;
 
@@ -1134,7 +1138,10 @@ Einzelbefunde sind dort verlinkt.
 
 | Konstrukt | Abschnitt | Verhalten |
 |---|---|---|
-| `match` / `case` | 14 | **Nicht nutzbar.** Der Parser verlangt `case`, kommt danach aber weder mit einem Literal noch mit einem Bezeichner noch mit `Enum.Member` zurecht. Keines der in 14 beschriebenen Patterns ist erreichbar; `match` wird im gesamten Projekt nirgends verwendet. (#1008) |
+| `match` als Ausdruck | 14, 15 | `match` ist nur als ANWEISUNG erreichbar; `var r := match ... ` scheitert im Ausdrucksparser. Ein Ergebnis laesst sich daher nur ueber Seiteneffekte gewinnen. (#1008) |
+| Fallrumpf als Block | 14 | `case p => { ... }` scheitert -- der Rumpf muss ein AUSDRUCK sein. Da eine Zuweisung in Lyx kein Ausdruck ist, bleibt nur der Funktionsaufruf. (#1008) |
+| `case Enum.Member =>` | 14 | Qualifizierte Muster scheitern am Punkt (`expected =>, got '.'`). Der blanke Name (`case Green =>`) wird ueber die Konstantentabelle aufgeloest und funktioniert. (#1008) |
+| Bindendes Muster | 14 | `case x =>` (jeden Wert annehmen und binden) ist nicht umgesetzt. Ein Bezeichner, der weder Konstante noch lokale Variable benennt, wird jetzt gemeldet statt still nie zu treffen. (#1008) |
 | `fn f<T>(...)` | 6, 7 | Parst, die Semantikpruefung loest den Typparameter nicht auf (`unknown param type`). Monomorphisierung ist in sema angelegt, der Weg vom Parameter zum Typ fehlt. Generische TYPEN werden gar nicht angenommen. Bis zu dieser Fassung nannte die Grammatik ausserdem die eckige Form `[T]`, die nie gueltig war. (#1009) |
 | `range(N)` | 2.2 | Uebersetzt, iteriert aber nicht: `for i in range(5)` summiert zu 0, an anderer Stelle zu Datenmuell. (#1007) |
 | `defer` im inneren Block | 2.2 | Laeuft am **Funktionsende** statt am Blockende. Auf Funktionsebene korrekt. (#1006) |
