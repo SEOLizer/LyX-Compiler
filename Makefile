@@ -23,7 +23,7 @@ BIN_DST   := $(PKG_DIR)/usr/local/bin
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test test-lyxos snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen sync-units-src
+.PHONY: build bootstrap singularity test test-external test-lyxos snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen sync-units-src
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -464,6 +464,12 @@ clean:
 # Alle uebersetzbaren .lyx-Tests ausserhalb von `make test` (Inventur zu #1004).
 # Dauert rund fuenf Minuten und ist deshalb nicht Teil von `make test`.
 .PHONY: test-lyx
+# Externe Tests: uebersetzen ohne Zugangsdaten pruefen (#1004).
+# Ausgefuehrt werden sie nicht — sie brauchen AWS, Cloudflare, Postgres o.ae.
+test-external: lyxc
+	@echo "=== Externe Tests: Uebersetzbarkeit ==="
+	@bash tests/run_external_compile.sh
+
 test-lyx: lyxc
 	@bash tests/run_lyx_suite.sh tests/suite-full.txt "Vollsuite"
 
