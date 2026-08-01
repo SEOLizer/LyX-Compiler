@@ -304,6 +304,23 @@ pub type Sema = class {
   importedCount: int64;
   importedCap:   int64;
 
+  // #1028: Register der von Imports EXPORTIERTEN Symbole. Je Eintrag 32 Byte:
+  //  +0  namePtr:8    Symbolname (nicht null-terminiert)
+  //  +8  nameLen:8
+  //  +16 modPtr:8     Modul, das ihn exportiert
+  //  +24 modLen:8
+  // Ohne diese Zuordnung laesst sich nicht sagen, WOHER ein doppelter Name
+  // stammt -- und ohne das ist eine Kollisionsmeldung nicht brauchbar.
+  expSyms:      int64;
+  expSymCount:  int64;
+  expSymCap:    int64;
+  // Bis zu welchem Symbolindex die Exporte bereits erfasst sind. Ein Import
+  // verarbeitet in Pass1 auch seine eigenen Imports; deren Symbole liegen mit
+  // im Bereich des aeusseren Imports und sind dort bereits (mit ihrem echten
+  // Modul) eingetragen. Ohne diese Marke meldete der aeussere Durchlauf sie
+  // ein zweites Mal -- als Kollision mit sich selbst.
+  expScanned:   int64;
+
   // WP-14/2.1: Generic instantiation cache
   // Record layout (64 bytes each):
   //  +0  genNamePtr:8   pointer to generic function name
@@ -836,6 +853,107 @@ pub type Sema = class {
     self.importedCount += 1;
   }
 
+  // ------------------------------------------------------------------
+  // #1028: Register der exportierten Symbole und Kollisionspruefung
+  // ------------------------------------------------------------------
+
+  // Traegt ein exportiertes Symbol mit seinem Herkunftsmodul ein.
+  fn _recordExportedSym(name: pchar, nameLen: int64, modName: pchar, modLen: int64) {
+    if (self.expSymCount >= self.expSymCap) {
+      var nc: int64 := self.expSymCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.expSyms, self.expSymCount * 32);
+      self.expSyms   := nb;
+      self.expSymCap := nc;
+    }
+    var base: int64 := self.expSyms + self.expSymCount * 32;
+    poke64(base,      name as int64);
+    poke64(base + 8,  nameLen);
+    poke64(base + 16, modName as int64);
+    poke64(base + 24, modLen);
+    self.expSymCount += 1;
+  }
+
+  // Eintrag zu einem bereits registrierten Exportnamen; 0 = keiner.
+  fn _findExportedSym(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.expSymCount) {
+      var base: int64 := self.expSyms + i * 32;
+      if (self._strNEq(peek64(base) as pchar, peek64(base + 8), name, nameLen)) { return base; }
+      i += 1;
+    }
+    return 0;
+  }
+
+  // Nur Symbole, deren Doppeldeutigkeit den Aufrufer treffen kann: aufrufbare
+  // bzw. referenzierbare Namen. Felder, Parameter und Locals stehen nie in der
+  // globalen Tabelle zweier Module nebeneinander.
+  fn _symKindIsAmbiguityRelevant(k: int64): int64 {
+    if (k == SYM_FUNC)         { return 1; }
+    if (k == SYM_GENERIC_FUNC) { return 1; }
+    if (k == SYM_VAR)          { return 1; }
+    if (k == SYM_STRUCT)       { return 1; }
+    if (k == SYM_TYPE)         { return 1; }
+    if (k == SYM_ENUM)         { return 1; }
+    return 0;
+  }
+
+  // Prueft die frisch registrierten Symbole eines Imports gegen die bereits
+  // bekannten Exporte und traegt sie danach selbst ein.
+  //
+  // Nur `pub`-Symbole zaehlen: ein unit-privater Helfer ist kein Angebot an den
+  // Aufrufer, auch wenn Pass1 ihn (noch) in dieselbe flache Tabelle legt.
+  // Zwei Units duerfen also weiterhin je ein eigenes internes `AlignUp` haben.
+  //
+  // Ohne diese Pruefung entschied allein die Reihenfolge in Lookup()
+  // (rueckwaerts, letzter gewinnt), welche von zwei gleichnamigen
+  // Implementierungen aufgerufen wird -- fehlerfrei uebersetzt, fehlerfrei
+  // ausgefuehrt, falsches Ergebnis. Siehe Issue #1028.
+  //
+  // WICHTIG: vor dem nodeIdx-Fixup aufrufen. Danach ist der Knotenindex der
+  // SYM_TYPE-Symbole auf -2 gesetzt und das pub-Flag nicht mehr lesbar.
+  fn _checkAndRecordExports(symStart: int64, modName: pchar, modLen: int64) {
+    var i: int64 := symStart;
+    if (self.expScanned > i) { i := self.expScanned; }
+    while (i < self.symCount) {
+      if (self._symKindIsAmbiguityRelevant(self.SymKind(i)) != 0) {
+        var ni: int64 := self.SymNodeIdx(i);
+        // ni < 0: Builtin oder kein einsehbarer Knoten — nicht entscheidbar,
+        // also nicht melden (fail-open, wie bei jeder Pruefung ueber
+        // Typdeklarationen).
+        if (ni >= 0 && peek64(self.sn_off(ni) + NODE_OFF_ISPUB) != 0) {
+          var nm:  pchar := self.SymName(i);
+          var nl:  int64 := self.SymNameLen(i);
+          var hit: int64 := self._findExportedSym(nm, nl);
+          if (hit != 0) {
+            self._reportSymbolCollision(nm, nl, modName, modLen,
+                                        peek64(hit + 16) as pchar, peek64(hit + 24));
+          } else {
+            self._recordExportedSym(nm, nl, modName, modLen);
+          }
+        }
+      }
+      i += 1;
+    }
+    self.expScanned := self.symCount;
+  }
+
+  fn _reportSymbolCollision(symName: pchar, symLen: int64,
+                            modA: pchar, modALen: int64,
+                            modB: pchar, modBLen: int64) {
+    EPrintStr("sema error: mehrdeutiges Symbol '"c);
+    sys_write(2, symName as int64, symLen);
+    EPrintStr("' — exportiert von '"c);
+    sys_write(2, modB as int64, modBLen);
+    EPrintStr("' und '"c);
+    sys_write(2, modA as int64, modALen);
+    EPrintStrLn("'"c);
+    EPrintStrLn("  Beide Units sind importiert; welche gebunden wird, entschiede allein die Import-Reihenfolge."c);
+    EPrintStrLn("  Abhilfe: nur eine der beiden Units importieren oder eines der Symbole umbenennen."c);
+    self.hadError   := 1;
+    self.errorCount += 1;
+  }
+
   fn _sema_readFile(path: pchar): pchar {
     var fd: int64 := open(path, 0, 0);
     if (fd < 0) {
@@ -1176,6 +1294,10 @@ pub type Sema = class {
     // Nicht gepruned: Pass1 ausführen um Symbole zu registrieren
     var symsBefore: int64 := self.symCount;
     self.Pass1(head);
+
+    // #1028: exportierte Namen gegen die frueher importierten pruefen. Muss vor
+    // dem nodeIdx-Fixup laufen — der macht das pub-Flag unlesbar.
+    self._checkAndRecordExports(symsBefore, modName, modLen);
     // Fix stale nodeIdx (bestehende Logik, unverändert)
     var si: int64 := symsBefore;
     while (si < self.symCount) {
@@ -4069,6 +4191,12 @@ pub type Sema = class {
     self.importedCap   := 16;
     self.importedMods  := alloc(self.importedCap * 16);
     self.importedCount := 0;
+
+    // #1028: Register der exportierten Symbole
+    self.expSymCap   := 256;
+    self.expSyms     := alloc(self.expSymCap * 32);
+    self.expSymCount := 0;
+    self.expScanned  := 0;
 
     // WP-14: generic instantiation cache
     self.instCap   := 64;

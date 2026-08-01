@@ -47,10 +47,6 @@ FloatLiteral        = Digit { Digit | "_" }
                       "."
                       Digit { Digit | "_" } ;
 
-(* Der Ziffern-Trenner ist hier zwar erlaubt, wird bei Fliesskommazahlen aber
-   falsch umgesetzt: `3.14_159` liefert einen abweichenden Wert. Bei
-   Ganzzahlen funktioniert er. Siehe 20.1 und Issue #1011. *)
-
 StringLiteral       = '"'
                       { StringChar | EscapeSequence }
                       '"' ;
@@ -1177,7 +1173,6 @@ Einzelbefunde sind dort verlinkt.
 | `fn f<T>(...)` | 6, 7 | Parst, die Semantikpruefung loest den Typparameter nicht auf (`unknown param type`). Monomorphisierung ist in sema angelegt, der Weg vom Parameter zum Typ fehlt. Generische TYPEN werden gar nicht angenommen. Bis zu dieser Fassung nannte die Grammatik ausserdem die eckige Form `[T]`, die nie gueltig war. (#1009) |
 | `range(N)` | 2.2 | Uebersetzt, iteriert aber nicht: `for i in range(5)` summiert zu 0, an anderer Stelle zu Datenmuell. (#1007) |
 | `defer` im inneren Block | 2.2 | Laeuft am **Funktionsende** statt am Blockende. Auf Funktionsebene korrekt. (#1006) |
-| Unterstrich im Float-Literal | 1 | `FloatLiteral` erlaubt `_` ausdruecklich; `3.14_159` uebersetzt, liefert aber einen falschen Wert. Bei Ganzzahlen funktioniert der Trenner. (#1011) |
 | `var f: fn(int64): int64 := g;` | 7 | Uebersetzt fehlerfrei, das erzeugte Programm stuerzt beim Aufruf ab. Kanonisch ist der Typalias (`type Cb = fn(int64): int64;`). (#1003) |
 | `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
 
@@ -1185,6 +1180,11 @@ Nicht mehr betroffen: die Bindung von Methodenzeigern (`feld := obj.Method`)
 war bis PR #1005 abgewiesen, weil die Existenzpruefung fuer Feldnamen nur die
 Felder einer Klasse durchsuchte und nicht ihre Methoden. Sie funktioniert
 wieder und ist durch `tests/method_ptr_test.sh` abgedeckt.
+
+Ebenfalls nicht mehr betroffen: der Ziffern-Trenner im Float-Literal
+(`3.14_159`, `1_000.5`). Bis 1.0.11B kuerzten die Literal-Umwandlungen den Wert
+stillschweigend am ersten `_`; seither ueberspringen sie ihn in allen
+Ziffernschleifen. Abgedeckt durch `tests/lexer_float_dot_test.lyx`. (#1011)
 
 ---
 
