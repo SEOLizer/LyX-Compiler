@@ -25,7 +25,7 @@ zstd -1 -f -q "$TMP/comp.bin" -o "$TMP/comp.zst"
 cat > "$TMP/t.lyx" <<EOF
 import std.zstd;
 import std.alloc;
-import src.std.io;
+import std.io;
 fn load(path: pchar, lenOut: int64): int64 {
   var fd: int64 := open(path, 0, 0);
   if (fd < 0) { poke64(lenOut, 0); return 0; }
