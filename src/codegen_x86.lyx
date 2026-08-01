@@ -443,6 +443,12 @@ pub type Codegen = class {
   // Continue support: linked list of pending jmp-rel32 placeholders for continue
   curContHead: int64;
 
+  // #1006: Stand des defer-Puffers beim Eintritt in den Rumpf der innersten
+  // Schleife. break und continue verlassen den Rumpf, ohne dessen Blockende zu
+  // erreichen — sie muessen die dort offenen defers vorher selbst abarbeiten.
+  // -1 = ausserhalb jeder Schleife.
+  loopDeferMark: int64;
+
   // WP-BC-11: or-pattern body forward jump list (je body, linked list of rel32 positions)
   orBodyHead: int64;
 
@@ -8438,6 +8444,10 @@ pub type Codegen = class {
       if (bodyNode >= 0) { self.cg_genStmt(bodyNode); }
 
     } else if (k == CGN_BREAK) {
+      // #1006: offene defers des Schleifenrumpfes laufen vor dem Sprung.
+      // Der Zaehler bleibt stehen — der Blockcode dahinter wird weiter erzeugt
+      // und gilt fuer den Weg ohne break.
+      if (self.loopDeferMark >= 0) { self.cg_emitDefersDownTo(self.loopDeferMark); }
       // jmp rel32 to loop exit; placeholder stores previous break-list head
       self.cg_e8(0xE9);
       var bp: int64 := self.codeLen;
@@ -8445,6 +8455,8 @@ pub type Codegen = class {
       self.curBreakHead := bp;
 
     } else if (k == CGN_CONTINUE) {
+      // #1006: wie bei break — der Rumpf wird verlassen, seine defers laufen.
+      if (self.loopDeferMark >= 0) { self.cg_emitDefersDownTo(self.loopDeferMark); }
       // jmp rel32 to loop continue; placeholder stores previous continue-list head
       self.cg_e8(0xE9);
       var cp: int64 := self.codeLen;
@@ -8497,52 +8509,24 @@ pub type Codegen = class {
       self.fnEnergyLevel := self.cg_nival(ni);
 
     } else if (k == CGN_DEFER) {
-      // WP-AS-10/19: defer nodes are collected in cg_collectDefers pre-pass;
-      // do not emit inline — they will be emitted at function exit points.
+      // #1006: Der aufgeschobene Aufruf wird hier nur VORGEMERKT. Emittiert
+      // wird er am Ende des umschliessenden Blocks (cg_genBlock) bzw. an jedem
+      // vorzeitigen return. Die Vormerkung geschieht an der Stelle, an der das
+      // defer im Quelltext steht — ein defer hinter einem return wird damit
+      // nicht mehr ausgefuehrt, was der Blocksemantik entspricht.
+      if (self.deferCount < self.deferCap) {
+        poke64(self.deferBuf + self.deferCount * 8, self.cg_nc0(ni));
+        self.deferCount += 1;
+      }
 
     } else {
       // Other statement kinds: skip
     }
   }
 
-  // WP-AS-10: first pass — collect NK_DEFER c0 nodes into deferBuf (LIFO append).
-  // Does NOT recurse into nested function declarations.
-  fn cg_collectDefers(ni: int64) {
-    if (ni < 0) { return; }
-    var k: int64 := self.cg_nkind(ni);
-    if (k == CGN_DEFER) {
-      if (self.deferCount < self.deferCap) {
-        poke64(self.deferBuf + self.deferCount * 8, self.cg_nc0(ni));
-        self.deferCount += 1;
-      }
-      return;
-    }
-    if (k == CGN_BLOCK) {
-      var s: int64 := self.cg_nc0(ni);
-      while (s >= 0) { self.cg_collectDefers(s); s := self.cg_nnext(s); }
-      return;
-    }
-    if (k == CGN_IF) {
-      self.cg_collectDefers(self.cg_nc1(ni));
-      self.cg_collectDefers(self.cg_nc2(ni));
-      return;
-    }
-    if (k == CGN_WHILE || k == CGN_REPEAT_UNTIL) {
-      self.cg_collectDefers(self.cg_nc1(ni));
-      return;
-    }
-    if (k == CGN_FOR) {
-      self.cg_collectDefers(self.cg_nc2(ni));
-      return;
-    }
-    if (k == CGN_FOR_C) {
-      self.cg_collectDefers(self.cg_nc3(ni));
-      return;
-    }
-    // CGN_FUNC_DECL and all expression-only nodes: stop traversal
-  }
-
   // WP-AS-10: emit deferred statements in LIFO order (last defer first).
+  // Wird an return-Punkten benutzt: dort laufen ALLE noch offenen defers ab,
+  // also auch die der umschliessenden Bloecke.
   fn cg_emitDefers() {
     var i: int64 := self.deferCount - 1;
     while (i >= 0) {
@@ -8551,9 +8535,22 @@ pub type Codegen = class {
     }
   }
 
+  // #1006: defers eines Blocks abarbeiten — LIFO bis zurueck zum Stand bei
+  // Blockeintritt. Der Rest gehoert den umschliessenden Bloecken und bleibt
+  // stehen.
+  fn cg_emitDefersDownTo(mark: int64) {
+    var i: int64 := self.deferCount - 1;
+    while (i >= mark) {
+      self.cg_genStmt(peek64(self.deferBuf + i * 8));
+      i -= 1;
+    }
+  }
+
   fn cg_genBlock(ni: int64) {
     if (ni < 0) { return; }
     var savedLocals: int64 := self.localCount;
+    // #1006: Stand der offenen defers bei Blockeintritt merken.
+    var savedDefers: int64 := self.deferCount;
     var stmt: int64 := self.cg_nc0(ni);
     while (stmt != -1) {
       var sk: int64 := self.cg_nkind(stmt);
@@ -8568,6 +8565,10 @@ pub type Codegen = class {
       }
       stmt := self.cg_nnext(stmt);
     }
+    // #1006: defers dieses Blocks laufen VOR dem Verwerfen der Locals — der
+    // aufgeschobene Ausdruck darf auf Variablen des Blocks zugreifen.
+    self.cg_emitDefersDownTo(savedDefers);
+    self.deferCount := savedDefers;
     // Restore local scope (pop locals declared in this block)
     self.localCount := savedLocals;
   }
@@ -8800,7 +8801,10 @@ pub type Codegen = class {
       // Body
       self.curBreakHead := -1;
       self.curContHead  := -1;
+      var savedMarkW: int64 := self.loopDeferMark;   // #1006
+      self.loopDeferMark := self.deferCount;
       self.cg_genBlock(self.cg_nc1(ni));
+      self.loopDeferMark := savedMarkW;
       // Accumulate break list; save this copy's continue list for later
       allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
       prevContHead := self.curContHead;
@@ -8830,7 +8834,10 @@ pub type Codegen = class {
     self.curBreakHead := -1;
     self.curContHead  := -1;
     // Body
+    var savedMarkR: int64 := self.loopDeferMark;   // #1006
+    self.loopDeferMark := self.deferCount;
     self.cg_genBlock(self.cg_nc0(ni));
+    self.loopDeferMark := savedMarkR;
     // contPos: patch all continue jumps to here (before condition eval)
     var contPos: int64 := self.codeLen;
     var ch: int64 := self.curContHead;
@@ -8920,7 +8927,10 @@ pub type Codegen = class {
       // Body
       self.curBreakHead := -1;
       self.curContHead  := -1;
+      var savedMarkF: int64 := self.loopDeferMark;   // #1006
+      self.loopDeferMark := self.deferCount;
       self.cg_genBlock(self.cg_nc2(ni));
+      self.loopDeferMark := savedMarkF;
       // contPos: continue lands here, before step
       self.cg_patchList(self.curContHead, self.codeLen);
       allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
@@ -8979,7 +8989,10 @@ pub type Codegen = class {
     // Rumpf
     self.curBreakHead := -1;
     self.curContHead  := -1;
+    var savedMarkG: int64 := self.loopDeferMark;   // #1006
+    self.loopDeferMark := self.deferCount;
     self.cg_genBlock(self.cg_nc2(ni));
+    self.loopDeferMark := savedMarkG;
     self.cg_patchList(self.curContHead, self.codeLen);
     allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
 
@@ -9041,7 +9054,10 @@ pub type Codegen = class {
       // Body
       self.curBreakHead := -1;
       self.curContHead  := -1;
+      var savedMarkC: int64 := self.loopDeferMark;   // #1006
+      self.loopDeferMark := self.deferCount;
       if (bodyNi >= 0) { self.cg_genBlock(bodyNi); }
+      self.loopDeferMark := savedMarkC;
       // contPos: continue lands here, before step
       self.cg_patchList(self.curContHead, self.codeLen);
       allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
@@ -9674,13 +9690,14 @@ pub type Codegen = class {
     }
     // Generate function body (child2 = block)
     var body: int64 := self.cg_nc2(ni);
-    // WP-AS-10: collect defers before generating body so return points can emit them
+    // #1006: defers werden beim Durchlaufen des Rumpfes vorgemerkt und an der
+    // jeweiligen Blockgrenze emittiert; ein Vorab-Sammellauf ueber die ganze
+    // Funktion gibt es nicht mehr. cg_genBlock arbeitet die defers der
+    // aeussersten Ebene am Rumpfende ab, daher hier kein cg_emitDefers.
     self.deferCount := 0;
-    self.cg_collectDefers(body);
+    self.loopDeferMark := -1;   // #1006: ausserhalb jeder Schleife
     self.cg_genBlock(body);
 
-    // Implicit return — emit defers first, then xor rax,rax + epilogue
-    self.cg_emitDefers();  // WP-AS-10
     self.cg_zeroRax();
     self.cg_emitEpilogue();
 
@@ -11143,6 +11160,7 @@ pub type Codegen = class {
     self.nestedBuf   := alloc(self.nestedCap * 8);
     self.nestedCount := 0;
     self.deferCount := 0;
+    self.loopDeferMark := -1;   // #1006
 
     self.includePath := 0;
     self.stdPath     := 0;
