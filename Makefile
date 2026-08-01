@@ -213,8 +213,14 @@ test: lyxc
 	@echo "--- Builtins, die Unit-Namen verdecken ---"
 	@bash tests/builtin_shadow_test.sh
 	@echo "OK"
+	@echo "--- Testabdeckung: jede Datei einem Ziel zugeordnet ---"
+	@bash tests/test_coverage_test.sh
+	@echo "OK"
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
+	@echo "OK"
+	@echo "--- Kernsprache (.lyx-Suite) ---"
+	@bash tests/run_lyx_suite.sh tests/suite-core.txt "Kernsprache"
 	@echo "OK"
 	@echo "--- Funktions- und Methodenzeiger (8 Suiten) ---"
 	@bash tests/arity_check_test.sh
@@ -409,3 +415,24 @@ keygen:
 
 clean:
 	rm -f lyxc lyxc.new lyxc-keygen
+
+# Alle uebersetzbaren .lyx-Tests ausserhalb von `make test` (Inventur zu #1004).
+# Dauert rund fuenf Minuten und ist deshalb nicht Teil von `make test`.
+.PHONY: test-lyx
+test-lyx: lyxc
+	@bash tests/run_lyx_suite.sh tests/suite-full.txt "Vollsuite"
+
+# LyxOS-Tests aus tests/ (nicht tests/lyxos/ -- dafuer gibt es `test-lyxos`).
+# Nur uebersetzen, der erzeugte Code laeuft nicht auf dem Buildhost.
+.PHONY: test-lyxos-units
+test-lyxos-units: lyxc
+	@fail=0; n=0; \
+	while read -r t; do \
+	  case "$$t" in ''|\#*) continue ;; esac; \
+	  n=$$((n+1)); \
+	  if ! ./lyxc --std-path=. --target=lyxos tests/$$t.lyx -o /tmp/lyxos_$$t >/dev/null 2>&1; then \
+	    echo "FAIL $$t"; fail=$$((fail+1)); \
+	  fi; \
+	done < tests/suite-lyxos.txt; \
+	echo "LyxOS-Suite: $$((n-fail))/$$n uebersetzen"; \
+	test $$fail -eq 0
