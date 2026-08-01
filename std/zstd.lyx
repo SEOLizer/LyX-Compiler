@@ -1,4 +1,20 @@
-// std/zstd.lyx — Zstd-Dekompressor (RFC 8878) + Store-Modus-Kompressor
+// std/zstd.lyx — Zstandard (RFC 8878)
+//
+// STAND Compressed Blocks (#1027): der Pfad ist FAIL-CLOSED, siehe
+// zsDecompressBlock. Gemessen wird ueber 97 Frames derselben Textquelle in
+// aufsteigender Groesse (`zstd -1`, 20..116 Byte Inhalt); gezaehlt werden vier
+// Ausgaenge getrennt: korrekt / stillschweigend falsch / gemeldet / abgestuerzt.
+//
+//   vor #1041:   5 korrekt,  6 still falsch, 19 gemeldet, 67 abgestuerzt
+//   nach #1041: 44 korrekt,  0 still falsch, 53 gemeldet,  0 abgestuerzt
+//   heute:      44 korrekt,  0 still falsch, 53 gemeldet,  0 abgestuerzt
+//                (bei versuchsweise eingeschaltetem Pfad: 19 still falsch)
+//
+// Sechs belegte Defekte sind seither behoben; die Huffman-GEWICHTE werden
+// nachweislich richtig dekodiert (Probe: nichtnull genau bei den im Text
+// vorkommenden Grossbuchstaben C, D, L, S). Der Baum dahinter stimmt noch
+// nicht — naechster Schritt ist die kanonische Codezuweisung, danach der
+// Sequenzpfad.
 unit std.zstd;
 
 import std.alloc;
@@ -124,6 +140,14 @@ fn zsRevReadBit(rbr: int64): int64 {
     var val: int64 := (peek64(rbr + 16) >> bitPos) & 1;
     poke64(rbr + 24, bitPos - 1);
     return val;
+}
+
+// #1027: Ist der Rueckwaertsstrom aufgebraucht? Erschoepft heisst: das erste
+// Byte ist erreicht UND darin sind alle Bits verbraucht. Vorher wurde an zwei
+// Rohfeldern geprueft, was den Zustand nur zufaellig traf.
+fn zsRevExhausted(rbr: int64): int64 {
+    if (peek64(rbr + 24) < 0 && peek64(rbr + 8) <= 0) { return 1; }
+    return 0;
 }
 
 fn zsRevReadBits(rbr: int64, n: int64): int64 {
@@ -615,21 +639,39 @@ fn zsReadHuffWeights(br: int64, ptr: int64, weights: int64): int64 {
     var rbr:     int64 := zsRevNew(ptr + bsStart, bsLen);
 
     // Decode weights (FSE state machine)
-    var state: int64 := zsRevReadBits(rbr, AL);
+    // #1027: zstd dekodiert die Huffman-Gewichte mit ZWEI verschraenkten
+    // FSE-Zustaenden (RFC 8878, Huffman_Tree_Description) — hier lief nur einer.
+    // Damit stimmte ab dem zweiten Gewicht nichts mehr, und der gebaute Baum
+    // lieferte statt der Literale Muell.
+    var state1: int64 := zsRevReadBits(rbr, AL);
+    var state2: int64 := zsRevReadBits(rbr, AL);
     var numSyms: int64 := 0;
     var done: int64 := 0;
     while (done == 0) {
-        var w: int64 := zsFSESym(wtab, state);
-        if (numSyms < 256) { poke64(weights + numSyms * 8, w); }
+        poke64(weights + numSyms * 8, zsFSESym(wtab, state1));
         numSyms += 1;
-        var nb: int64 := zsFSENbBits(wtab, state);
-        var ns: int64 := zsFSENewState(wtab, state);
-        // Check if bitstream exhausted
-        var bl: int64 := peek64(rbr + 24);
-        var bp: int64 := peek64(rbr + 8);
-        if ((bl < 0) & (bp < 0)) { done := 1; }
-        else { state := ns + zsRevReadBits(rbr, nb); }
-        if (numSyms >= 256) { done := 1; }
+        if (numSyms >= 255) { done := 1; }
+        if (done == 0) {
+            if (zsRevExhausted(rbr) != 0) { done := 1; }
+            else {
+                var nb1: int64 := zsFSENbBits(wtab, state1);
+                var ns1: int64 := zsFSENewState(wtab, state1);
+                state1 := ns1 + zsRevReadBits(rbr, nb1);
+            }
+        }
+        if (done == 0) {
+            poke64(weights + numSyms * 8, zsFSESym(wtab, state2));
+            numSyms += 1;
+            if (numSyms >= 255) { done := 1; }
+            if (done == 0) {
+                if (zsRevExhausted(rbr) != 0) { done := 1; }
+                else {
+                    var nb2: int64 := zsFSENbBits(wtab, state2);
+                    var ns2: int64 := zsFSENewState(wtab, state2);
+                    state2 := ns2 + zsRevReadBits(rbr, nb2);
+                }
+            }
+        }
     }
 
     free(rbr, 32);
@@ -643,48 +685,52 @@ fn zsReadHuffWeights(br: int64, ptr: int64, weights: int64): int64 {
 // The last symbol's weight is derived to complete the tree.
 fn zsHuffFromWeights(weights: int64, numSyms: int64): int64 {
     var t: int64 := zsHuffNew();
-    if (numSyms == 0) { return t; }
+    if (numSyms <= 0) { return t; }
 
-    // Compute max weight
-    var maxW: int64 := 0;
+    // #1027: Ein Gewicht ist NICHT die Codelaenge. RFC 8878 §4.2.1:
+    //
+    //     Number_of_Bits = Max_Number_of_Bits + 1 - Weight    (fuer Weight > 0)
+    //
+    // Ein HOHES Gewicht ergibt also einen KURZEN Code. Bisher wurde das Gewicht
+    // unmittelbar als Laenge eingetragen — genau umgekehrt. Der Baum bevorzugte
+    // dadurch die seltensten Zeichen: in einem Testframe kamen als Literale
+    // ausschliesslich '.', 'C', 'L' und 'S' heraus, also die Symbole mit
+    // Gewicht 1. Der Kommentar an dieser Stelle nannte die richtige Formel und
+    // verwarf sie im Satz darauf.
+    //
+    // Max_Number_of_Bits ergibt sich aus der Summe der Gewichtswertigkeiten:
+    // total = Summe 2^(W-1) ueber alle gelesenen Gewichte > 0. Das letzte
+    // Symbol traegt kein eigenes Gewicht im Strom — seines wird so bestimmt,
+    // dass die Summe eine Zweierpotenz wird.
+    var total: int64 := 0;
     var s: int64 := 0;
-    while (s < numSyms) { var w: int64 := peek64(weights + s * 8); if (w > maxW) { maxW := w; } s := s + 1; }
-    if (maxW == 0) { return t; }
-
-    // Implicit last weight: find the missing bits to complete the tree.
-    // sum of 2^(maxWeight - weight[s]) for s with weight > 0 must = 2^maxWeight
-    var sumPow: int64 := 0;
-    s := 0;
     while (s < numSyms) {
         var w: int64 := peek64(weights + s * 8);
-        if (w > 0) {
-            var diff: int64 := maxW - w;
-            sumPow := sumPow + (1 << diff);
-        }
+        if (w > 0) { total := total + (1 << (w - 1)); }
         s += 1;
     }
-    // The "remaining" after accounting for all symbols should be a power of 2
-    var remaining: int64 := (1 << maxW) - sumPow;
-    var implicitW: int64 := 0;
-    if (remaining > 0) { implicitW := maxW - zsHighbit(remaining); }
+    if (total <= 0) { return t; }
 
-    // Build code-length array: len[s] = weight[s] (non-zero), adjusted by maxWeight
-    // In zstd: code_length[s] = maxBits + 1 - weight[s]  (but weight=0 means absent)
-    // Actually: weight IS the code length for non-zero entries
-    var lensSize: int64 := (numSyms + 1) * 8;
+    var maxBits: int64 := zsHighbit(total) + 1;
+    if (maxBits > 11) { return t; }          // zstd erlaubt hoechstens 11 Bit
+    var rest: int64 := (1 << maxBits) - total;
+    if (rest <= 0) { return t; }             // Gewichtssumme unstimmig
+    var lastW: int64 := zsHighbit(rest) + 1;
+
+    // Codelaengen: len[s] = maxBits + 1 - W[s], 0 bedeutet "Symbol kommt nicht vor".
+    var nAll: int64 := numSyms + 1;
+    var lensSize: int64 := nAll * 8;
     var lens: int64 := alloc(lensSize);
     s := 0;
     while (s < numSyms) {
-        poke64(lens + s * 8, peek64(weights + s * 8));
+        var w2: int64 := peek64(weights + s * 8);
+        if (w2 > 0) { poke64(lens + s * 8, maxBits + 1 - w2); }
+        else        { poke64(lens + s * 8, 0); }
         s += 1;
     }
-    // Last symbol gets implicitW
-    if (implicitW > 0) {
-        poke64(lens + numSyms * 8, implicitW);
-        numSyms += 1;
-    }
+    poke64(lens + numSyms * 8, maxBits + 1 - lastW);
 
-    zsHuffBuildLens(t, lens, numSyms);
+    zsHuffBuildLens(t, lens, nAll);
     free(lens, lensSize);
     return t;
 }
@@ -857,6 +903,13 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
 
     var litDataStart: int64 := zsbrPos(br);
     var litPtr: int64 := blockPtr + litDataStart;
+    var huffSize: int64 := compSize;   // #1027: Groesse des Huffman-Bitstroms
+    // #1027: Die Zahl der Stroeme steht im Size_Format, nicht in regenSize:
+    // Format 0 = EIN Strom, die Formate 1..3 = VIER Stroeme mit Sprungtabelle
+    // (RFC 8878, Literals_Section_Header). Vorher wurde an `regenSize < 1024`
+    // entschieden — bei kleinen Vierstrom-Bloecken also falsch.
+    var nStreams: int64 := 4;
+    if (szFmt == 0) { nStreams := 1; }
 
     // Read Huffman tree (if type=2) or reuse (type=3)
     // We build a local tree here; for Treeless we'd need the ctx, but to keep ≤6 params
@@ -873,7 +926,10 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
         // #1027: nw kommt aus dem Bitstrom; oberhalb von 255 laeuft schon das
         // Gewichts-Array (256 Eintraege) ueber. Und zsHuffDecSym laeuft ueber
         // maxLen Tabellenplaetze -- zstd erlaubt hoechstens 11.
-        if ((nw <= 0) | (nw > 255)) {
+        // #1027: Die Grenze war um EINS zu streng. Das Gewichts-Array fasst 256
+        // Eintraege (Indizes 0..255), und 256 Symbole sind der zulaessige
+        // Hoechstfall — die Pruefung wies damit gueltige Frames ab.
+        if ((nw <= 0) | (nw > 256)) {
             zsHuffFree(htree); poke64(outLen, 0); zsbrSkip(br, compSize); return 0;
         }
         if (peek64(htree + 400) < 0) {
@@ -887,7 +943,12 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
         }
         litDataStart += hdrConsumed;
         litPtr := blockPtr + litDataStart;
-        compSize -= hdrConsumed;
+        // #1027: compSize wurde hier verkleinert und am Ende nur noch der
+        // VERKLEINERTE Wert uebersprungen — der Leser blieb damit um die Groesse
+        // der Baumbeschreibung hinter dem Ende der Literals-Sektion zurueck, und
+        // die Sequenzen wurden ab der falschen Stelle gelesen. Die Sektionsgroesse
+        // bleibt jetzt unangetastet; huffSize ist nur die Groesse des Bitstroms.
+        huffSize := compSize - hdrConsumed;
     } else {
         // Treeless: would need previous tree; return error (not supported in this block)
         poke64(outLen, 0);
@@ -901,9 +962,9 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
     var litBuf: int64 := alloc(regenSize + 1);
     poke64(outLen, regenSize);
 
-    if (regenSize < 1024) {
+    if (nStreams == 1) {
         // Single stream
-        var rbr: int64 := zsRevNew(litPtr, compSize);
+        var rbr: int64 := zsRevNew(litPtr, huffSize);
         var k: int64 := 0;
         while (k < regenSize) {
             var sym: int64 := zsHuffDecSym(htree, rbr);
@@ -914,14 +975,14 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
     } else {
         // 4-stream interleaved Huffman (jump table = 6 bytes)
         // jump table: stream 1 size (LE16), stream 2 size (LE16), stream 3 size (LE16)
-        if (compSize < 6) {
+        if (huffSize < 6) {
             zsHuffFree(htree); free(litBuf, regenSize + 1);
             poke64(outLen, 0); zsbrSkip(br, compSize); return 0;
         }
         var s1len: int64 := (peek8(litPtr) & 0xFF) | ((peek8(litPtr + 1) & 0xFF) << 8);
         var s2len: int64 := (peek8(litPtr + 2) & 0xFF) | ((peek8(litPtr + 3) & 0xFF) << 8);
         var s3len: int64 := (peek8(litPtr + 4) & 0xFF) | ((peek8(litPtr + 5) & 0xFF) << 8);
-        var s4len: int64 := compSize - 6 - s1len - s2len - s3len;
+        var s4len: int64 := huffSize - 6 - s1len - s2len - s3len;
         // #1027: Die drei Laengen stehen unkontrolliert im Bitstrom. Ergeben sie
         // zusammen mehr als der Block hergibt, zeigen p2..p4 hinter den Puffer.
         if (s4len <= 0) {
@@ -934,32 +995,32 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
         var p3: int64 := p2 + s2len;
         var p4: int64 := p3 + s3len;
 
-        var perStream: int64 := regenSize / 4;
-        var remainder: int64 := regenSize - perStream * 4;
+        // #1027: Die ersten DREI Stroeme liefern je ceil(regenSize/4) Symbole,
+        // der vierte den Rest (RFC 8878). Vorher wurde durch vier geteilt und
+        // der Rest hinten angehaengt — bei jedem regenSize, das nicht durch vier
+        // teilbar ist, lagen die Segmente damit falsch.
+        var perStream: int64 := (regenSize + 3) / 4;
+        var lastLen:   int64 := regenSize - perStream * 3;
+        if (lastLen < 0) { lastLen := 0; }
 
         var rbr1: int64 := zsRevNew(p1, s1len);
         var rbr2: int64 := zsRevNew(p2, s2len);
         var rbr3: int64 := zsRevNew(p3, s3len);
         var rbr4: int64 := zsRevNew(p4, s4len);
 
-        var outPos: int64 := 0;
         var k: int64 := 0;
-
         while (k < perStream) {
-            poke8(litBuf + outPos,              zsHuffDecSym(htree, rbr1) & 0xFF);
-            poke8(litBuf + outPos + perStream,  zsHuffDecSym(htree, rbr2) & 0xFF);
-            poke8(litBuf + outPos + perStream * 2, zsHuffDecSym(htree, rbr3) & 0xFF);
-            poke8(litBuf + outPos + perStream * 3, zsHuffDecSym(htree, rbr4) & 0xFF);
-            outPos += 1;
+            poke8(litBuf + k,                  zsHuffDecSym(htree, rbr1) & 0xFF);
+            poke8(litBuf + perStream + k,      zsHuffDecSym(htree, rbr2) & 0xFF);
+            poke8(litBuf + perStream * 2 + k,  zsHuffDecSym(htree, rbr3) & 0xFF);
             k += 1;
         }
-        // Remainder from stream 4
-        var remBase: int64 := perStream * 4;
         k := 0;
-        while (k < remainder) {
-            poke8(litBuf + remBase + k, zsHuffDecSym(htree, rbr4) & 0xFF);
+        while (k < lastLen) {
+            poke8(litBuf + perStream * 3 + k, zsHuffDecSym(htree, rbr4) & 0xFF);
             k += 1;
         }
+
 
         free(rbr1, 32); free(rbr2, 32); free(rbr3, 32); free(rbr4, 32);
     }
@@ -1205,9 +1266,12 @@ fn zsDecompressCompressed(ctx: int64, blkPtr: int64, blkLen: int64): void {
 
     // Read FSE tables into ctx
     var zb: int64 := zsBitNew(blkPtr, zsbrPos(br));
+    // #1027: Die Tabellen stehen im Block in der Reihenfolge LL, OFFSET, ML
+    // (RFC 8878, Sequences_Section) — hier wurde ML vor OFFSET gelesen. Damit
+    // war ab der zweiten Tabelle jede Bitposition falsch.
     zsGetSeqTable(ctx, zb, llMode,  0);
-    zsGetSeqTable(ctx, zb, mlMode,  1);
     zsGetSeqTable(ctx, zb, offMode, 2);
+    zsGetSeqTable(ctx, zb, mlMode,  1);
     var tabBytesUsed: int64 := zsBitBytePos(zb);
     free(zb, 24);
 
@@ -1261,6 +1325,20 @@ fn zsDecompressBlock(ctx: int64, blkPtr: int64, blkLen: int64, blkType: int64): 
             // Weiterarbeiten diese Zeile durch den Aufruf ersetzen:
             //     zsDecompressCompressed(ctx, blkPtr, blkLen);
             // Solange gilt: melden statt raten. Siehe Issue #1027.
+            // #1027: Compressed Blocks (Huffman/FSE) bleiben FAIL-CLOSED.
+            //
+            // Der Pfad ist gegenueber dem letzten Stand deutlich weiter — sechs
+            // belegte Defekte sind behoben (siehe Kopf dieser Datei) und die
+            // Huffman-GEWICHTE werden nachweislich richtig dekodiert. Der Baum
+            // dahinter stimmt aber noch nicht: gemessen ueber 97 Frames liefert
+            // der Pfad 19-mal stillschweigend falschen Inhalt.
+            //
+            // Ein Ergebnis, das der Aufrufer nicht von einem echten unterscheiden
+            // kann, ist schlimmer als eine Fehlermeldung. Zum Weiterarbeiten
+            // diese Zeile durch den Aufruf ersetzen:
+            //     zsDecompressCompressed(ctx, blkPtr, blkLen);
+            // Naechster Schritt laut Messung: die kanonische Codezuweisung in
+            // zsHuffBuildLens/zsHuffDecSym, danach der Sequenzpfad.
             poke64(ctx + 48, 1);
         }
     }

@@ -240,6 +240,9 @@ test: lyxc
 	@echo "--- Inline-Array als Struct-Feld (6 Pruefungen) ---"
 	@bash tests/inline_array_field_test.sh
 	@echo "OK"
+	@echo "--- zstd: Decoder ueber einen Groessenbereich (#1027) ---"
+	@bash tests/zstd_measure.sh
+	@echo "OK"
 	@echo "--- macOS-Backend: BSD-Socket-Syscallnummern (12 Pruefungen) ---"
 	@bash tests/macos_socket_syscalls_test.sh
 	@echo "OK"
