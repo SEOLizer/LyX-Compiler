@@ -240,6 +240,9 @@ test: lyxc
 	@echo "--- Inline-Array als Struct-Feld (6 Pruefungen) ---"
 	@bash tests/inline_array_field_test.sh
 	@echo "OK"
+	@echo "--- Print/PrintLn mit Aufruf-Ergebnis (6 Pruefungen) ---"
+	@bash tests/print_call_result_test.sh
+	@echo "OK"
 	@echo "--- Print/PrintLn geben f64 aus (7 Pruefungen) ---"
 	@bash tests/print_f64_test.sh
 	@echo "OK"
