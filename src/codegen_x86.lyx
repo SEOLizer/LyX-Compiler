@@ -518,6 +518,11 @@ pub type Codegen = class {
   localIsRedundant:  int64;
   // WP-GPU-01: byte buffer parallel to locals, 1 = parallel Array<f32> (SIMD)
   localIsSimd:       int64;
+  // #1003: byte buffer parallel to locals, 1 = INLINE geschriebener fn-Zeigertyp
+  // (`var f: fn(int64): int64`). Ueber einen Typalias merkt sich das die
+  // fnAlias-Liste am Namen; ein inline geschriebener Typ HAT keinen Namen und
+  // fiel deshalb in den Closure-Pfad, der {fnPtr,env} erwartet -> Absturz.
+  localIsFnPtr:      int64;
   foldBuf:          int64;  // WP-10g: scratch for cg_tryFold constant-folding results
 
   // Temporary buffer tracking (BUG-02: prevent mmap leaks)
@@ -791,6 +796,10 @@ pub type Codegen = class {
       i := 0;
       memcpy(simdb, self.localIsSimd, self.localCount);
       self.localIsSimd := simdb;
+      var fpb: int64 := alloc(nc);
+      i := 0;
+      memcpy(fpb, self.localIsFnPtr, self.localCount);
+      self.localIsFnPtr := fpb;
       self.localCap := nc;
     }
     self.frameSize += 8;
@@ -806,6 +815,7 @@ pub type Codegen = class {
     poke64(self.localArraySize   + self.localCount * 8, 0);
     poke8(self.localIsRedundant  + self.localCount, 0);  // WP-3.1
     poke8(self.localIsSimd       + self.localCount, 0);  // WP-GPU-01
+    poke8(self.localIsFnPtr      + self.localCount, 0);  // #1003
     self.localCount += 1;
     return 0 - self.frameSize;
   }
@@ -2124,21 +2134,35 @@ pub type Codegen = class {
     var num: int64 := 0;
     var den: int64 := 1;
     var intExtra: int64 := 0;
-    while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57) {
-      if (num < 900000000000000) { num := num * 10 + StrCharAt(src, i) - 48; }
-      else { intExtra := intExtra + 1; }
-      i += 1;
+    // Digit separators ('_') are accepted by the lexer in the whole literal
+    // (ebnf.md §1), so every digit loop here has to skip them — a loop that
+    // merely stops at '_' silently truncates the value (3.14_159 → 3.14).
+    while (i < end) {
+      var ic: int64 := StrCharAt(src, i);
+      if (ic == 95) { i += 1; }
+      else if (ic >= 48 && ic <= 57) {
+        if (num < 900000000000000) { num := num * 10 + ic - 48; }
+        else { intExtra := intExtra + 1; }
+        i += 1;
+      } else { break; }
     }
     if (i < end && StrCharAt(src, i) == 46) {
       i += 1;
       if (intExtra == 0) {
-        while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57 && den < 100000000) {
-          num := num * 10 + StrCharAt(src, i) - 48;
-          den := den * 10;
-          i += 1;
+        while (i < end && den < 100000000) {
+          var fc: int64 := StrCharAt(src, i);
+          if (fc == 95) { i += 1; }
+          else if (fc >= 48 && fc <= 57) {
+            num := num * 10 + fc - 48;
+            den := den * 10;
+            i += 1;
+          } else { break; }
         }
       }
-      while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57) { i := i + 1; }
+      while (i < end) {
+        var sc: int64 := StrCharAt(src, i);
+        if (sc == 95 || (sc >= 48 && sc <= 57)) { i := i + 1; } else { break; }
+      }
     }
     var expNeg: int64 := 0;
     var expVal: int64 := 0;
@@ -2146,9 +2170,13 @@ pub type Codegen = class {
       i += 1;
       if (i < end && StrCharAt(src, i) == 45) { expNeg := 1; i := i + 1; }
       else if (i < end && StrCharAt(src, i) == 43) { i := i + 1; }
-      while (i < end && StrCharAt(src, i) >= 48 && StrCharAt(src, i) <= 57) {
-        expVal := expVal * 10 + StrCharAt(src, i) - 48;
-        i += 1;
+      while (i < end) {
+        var xc: int64 := StrCharAt(src, i);
+        if (xc == 95) { i += 1; }
+        else if (xc >= 48 && xc <= 57) {
+          expVal := expVal * 10 + xc - 48;
+          i += 1;
+        } else { break; }
       }
     }
     if (num == 0) { return 0; }
@@ -3398,6 +3426,15 @@ pub type Codegen = class {
     if (tl == 5 && self.cg_seq(tn, tl, "int16"c,  5)) { return 2; }
     if (tl == 6 && self.cg_seq(tn, tl, "uint32"c, 6)) { return 4; }
     if (tl == 5 && self.cg_seq(tn, tl, "int32"c,  5)) { return 4; }
+    // #1010: hier standen bisher NUR die uintN-Schreibweisen -- ein `u16`-Feld
+    // bekam damit Breite 8. Das trifft die @big_endian-Byteordnung (Breite steckt
+    // im Feld-Flag) und die @packed-Schrittweite. Beide Schreibweisen jetzt gleich.
+    if (tl == 2 && self.cg_seq(tn, tl, "u8"c,     2)) { return 1; }
+    if (tl == 2 && self.cg_seq(tn, tl, "i8"c,     2)) { return 1; }
+    if (tl == 3 && self.cg_seq(tn, tl, "u16"c,    3)) { return 2; }
+    if (tl == 3 && self.cg_seq(tn, tl, "i16"c,    3)) { return 2; }
+    if (tl == 3 && self.cg_seq(tn, tl, "u32"c,    3)) { return 4; }
+    if (tl == 3 && self.cg_seq(tn, tl, "i32"c,    3)) { return 4; }
     if (tl == 3 && self.cg_seq(tn, tl, "f32"c,    3)) { return 4; }
     return 8;  // int64, uint64, f64, pchar, pointers — all 8 bytes
   }
@@ -4058,6 +4095,10 @@ pub type Codegen = class {
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
       }
+      // #1003: inline geschriebener fn-Zeigertyp als Parameter
+      if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == CGN_FN_PTR_NODE) {
+        poke8(self.localIsFnPtr + self.localCount - 1, 1);
+      }
       if (paramIdx == 1) { self.cg_spillRsi(poff); }
       else if (paramIdx == 2) { self.cg_spillRdx(poff); }
       else if (paramIdx == 3) { self.cg_spillRcx(poff); }
@@ -4700,19 +4741,22 @@ pub type Codegen = class {
         if (self.cg_seq(tname, tlen, "i8", 2)) {
           // movsx rax, al  — sign-extend byte to qword
           self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBE); self.cg_e8(0xC0);
-        } else if (self.cg_seq(tname, tlen, "u8", 2)) {
-          // movzx rax, al  — zero-extend byte to qword
+        } else if (self.cg_seq(tname, tlen, "u8", 2) ||
+                   self.cg_seq(tname, tlen, "uint8", 5)) {
+          // movzx rax, al  — zero-extend byte to qword  (#1010: uint8 = u8)
           self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);
         } else if (self.cg_seq(tname, tlen, "i16", 3)) {
           // movsx rax, ax  — sign-extend word to qword
           self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBF); self.cg_e8(0xC0);
-        } else if (self.cg_seq(tname, tlen, "u16", 3)) {
-          // movzx rax, ax  — zero-extend word to qword
+        } else if (self.cg_seq(tname, tlen, "u16", 3) ||
+                   self.cg_seq(tname, tlen, "uint16", 6)) {
+          // movzx rax, ax  — zero-extend word to qword  (#1010: uint16 = u16)
           self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB7); self.cg_e8(0xC0);
         } else if (self.cg_seq(tname, tlen, "i32", 3)) {
           // movsxd rax, eax  — sign-extend dword to qword
           self.cg_e8(0x48); self.cg_e8(0x63); self.cg_e8(0xC0);
-        } else if (self.cg_seq(tname, tlen, "u32", 3)) {
+        } else if (self.cg_seq(tname, tlen, "u32", 3) ||
+                   self.cg_seq(tname, tlen, "uint32", 6)) {
           // mov eax, eax  — zero-extends to rax automatically on x86-64
           self.cg_e8(0x89); self.cg_e8(0xC0);
         }
@@ -5106,6 +5150,128 @@ pub type Codegen = class {
     self.cg_zeroRax();
   }
 
+  // #1012: Printf(fmt, a1, a2, …) — Formatausgabe im x86-Codegen.
+  //
+  // Der Formatstring wird zur ÜBERSETZUNGSZEIT zerlegt: jeder Literalabschnitt
+  // wird zu einem Datenkonstanten-Aufruf von _lyx_print_str, jeder Platzhalter
+  // zu genau der Ausgaberoutine, die sein Typ verlangt. Damit braucht es weder
+  // varargs (die Lyx nicht hat) noch einen Format-Interpreter zur Laufzeit.
+  //
+  // Zulaessig sind %s, %d, %f, %c und %%. Alles andere ist ein Fehler --
+  // ein unbekannter Platzhalter, der einfach durchgereicht wird, waere wieder
+  // ein stiller Default. Ebenso zaehlt die Argumentzahl gegen die Platzhalter.
+  fn cg_genPrintf(fmtNode: int64, argNode: int64) {
+    if (fmtNode < 0 || self.cg_nkind(fmtNode) != CGN_LIT_STR) {
+      EPrintStrLn("error: Printf verlangt ein Zeichenkettenliteral als Format"c);
+      EPrintStrLn("  Der Format-String wird zur Uebersetzungszeit zerlegt; ein zur Laufzeit"c);
+      EPrintStrLn("  berechneter Wert kann dort nicht stehen."c);
+      exit(1);
+    }
+
+    // Quelltextbereich des Literals ohne Anfuehrungszeichen und ohne 'c'-Suffix
+    var sOff: int64 := self.cg_nsoff(fmtNode);
+    var sLen: int64 := self.cg_nslen(fmtNode);
+    var pEnd: int64 := sOff + sLen - 1;
+    if (StrCharAt(self.pSrc, sOff + sLen - 1) == 99) { pEnd := pEnd - 1; }
+    var i: int64 := sOff + 1;
+
+    var cur: int64 := argNode;
+    while (i < pEnd) {
+      var c: int64 := StrCharAt(self.pSrc, i) & 255;
+
+      if (c != 37) {
+        // Literalabschnitt bis zum naechsten '%' als Datenkonstante ausgeben
+        var dOff: int64 := self.dataLen;
+        var wrote: int64 := 0;
+        var stop: int64 := 0;
+        while (i < pEnd && stop == 0) {
+          var lc: int64 := StrCharAt(self.pSrc, i) & 255;
+          if (lc == 37) { stop := 1; }   // '%' erreicht — i bleibt darauf stehen
+          else {
+            if (lc == 92 && i + 1 < pEnd) {   // '\' — Escape aufloesen
+              i := i + 1;
+              var ec: int64 := StrCharAt(self.pSrc, i) & 255;
+              if (ec == 110)      { lc := 10; }   // \n
+              else if (ec == 116) { lc := 9;  }   // \t
+              else if (ec == 114) { lc := 13; }   // \r
+              else if (ec == 48)  { lc := 0;  }   // \0
+              else                { lc := ec; }   // \\ , \" , sonst wortwoertlich
+            }
+            self.cg_edata(lc);
+            wrote := wrote + 1;
+            i := i + 1;
+          }
+        }
+        self.cg_edata(0);
+        if (wrote > 0) {
+          self.cg_emitLeaRdiData(dOff);
+          var ppL: int64 := self.cg_emitCall();
+          poke32(self.code + ppL, CG_H_PRINTSTR - ppL - 4);
+        }
+
+      } else {
+        // Platzhalter
+        i := i + 1;
+        if (i >= pEnd) {
+          EPrintStrLn("error: Printf-Format endet mit einem einzelnen '%'"c);
+          exit(1);
+        }
+        var spec: int64 := StrCharAt(self.pSrc, i) & 255;
+        i := i + 1;
+
+        if (spec == 37) {
+          // %% → ein Prozentzeichen
+          var pcOff: int64 := self.dataLen;
+          self.cg_edata(37); self.cg_edata(0);
+          self.cg_emitLeaRdiData(pcOff);
+          var ppP: int64 := self.cg_emitCall();
+          poke32(self.code + ppP, CG_H_PRINTSTR - ppP - 4);
+        } else {
+          if (cur < 0) {
+            EPrintStrLn("error: Printf hat mehr Platzhalter als Argumente"c);
+            exit(1);
+          }
+          self.cg_genExpr(cur);
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+          cur := self.cg_nnext(cur);
+
+          if (spec == 115) {          // %s
+            var ppS: int64 := self.cg_emitCall();
+            poke32(self.code + ppS, CG_H_PRINTSTR - ppS - 4);
+          } else if (spec == 100) {   // %d
+            var ppD: int64 := self.cg_emitCall();
+            poke32(self.code + ppD, CG_H_PRINTINT - ppD - 4);
+          } else if (spec == 102) {   // %f — Bits nach _lyx_f64_to_str, dann ausgeben
+            var ppF: int64 := self.cg_emitCall();
+            poke32(self.code + ppF, CG_H_F64STR - ppF - 4);
+            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);  // mov rdi, rax
+            var ppFs: int64 := self.cg_emitCall();
+            poke32(self.code + ppFs, CG_H_PRINTSTR - ppFs - 4);
+          } else if (spec == 99) {    // %c — ein Byte direkt schreiben
+            self.cg_e8(0x57);                                        // push rdi
+            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE6);   // mov rsi, rsp
+            self.cg_e8(0xBA); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edx,1
+            self.cg_e8(0xBF); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edi,1
+            self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax,1
+            self.cg_e8(0x0F); self.cg_e8(0x05);                      // syscall
+            self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x08);  // add rsp,8
+          } else {
+            EPrintStr("error: Printf kennt den Platzhalter '%"c);
+            sys_write(2, self.pSrc as int64 + i - 1, 1);
+            EPrintStrLn("' nicht — zulaessig sind %s, %d, %f, %c und %%"c);
+            exit(1);
+          }
+        }
+      }
+    }
+
+    if (cur >= 0) {
+      EPrintStrLn("error: Printf hat mehr Argumente als Platzhalter"c);
+      exit(1);
+    }
+    self.cg_zeroRax();
+  }
+
   // Generate a function call (NK_CALL node)
   fn cg_genCall(ni: int64) {
     var fname: pchar := self.cg_nsval(ni);
@@ -5178,6 +5344,8 @@ pub type Codegen = class {
           var ltp: pchar := peek64(ltb) as pchar;
           var ltl: int64 := peek64(ltb + CG_LOCTYPE_OFF_LEN);
           if (ltp != 0 as pchar && ltl > 0 && self.cg_isFnPtrAlias(ltp, ltl) != 0) { isThinFn := 1; }
+          // #1003: inline geschriebener fn-Zeigertyp — gleicher thin-call
+          if (peek8(self.localIsFnPtr + clIdx) != 0) { isThinFn := 1; }
         }
         if (isThinFn != 0) {
           var tfCur: int64 := argNode;
@@ -5309,6 +5477,13 @@ pub type Codegen = class {
         if (self.cg_seq(fname, fnlen, "PrintLn", 7) ||
             self.cg_seq(fname, fnlen, "Println", 7)) { addNl := 1; }
         self.cg_genPrintMulti(argNode, addNl, 0);
+        return;
+      }
+      // #1012: Printf(fmt, …) — Format zur Uebersetzungszeit zerlegen. Muss vor
+      // der allgemeinen Argumentauswertung stehen, weil jedes Argument seine
+      // eigene Ausgaberoutine bekommt.
+      if (self.cg_seq(fname, fnlen, "Printf", 6)) {
+        self.cg_genPrintf(argNode, self.cg_nnext(argNode));
         return;
       }
       // EPrint / EPrintLn multi-arg to stderr (WP-OUT-02)
@@ -7967,6 +8142,11 @@ pub type Codegen = class {
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 60) {
         self.cg_setLocalType(localIdx, self.cg_nsval(typeNode), self.cg_nslen(typeNode));
       }
+      // #1003: inline geschriebener fn-Zeigertyp — hat keinen Namen, den die
+      // fnAlias-Liste tragen koennte, also am Local selbst vermerken.
+      if (typeNode >= 0 && self.cg_nkind(typeNode) == CGN_FN_PTR_NODE) {
+        poke8(self.localIsFnPtr + localIdx, 1);
+      }
       // Track array locals: NK_TYPE_ARRAY (=61) or NK_TYPE_NAME "Array<T>" (uppercase, =60)
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 61) {
         poke8(self.localIsArray + localIdx, 1);
@@ -8495,6 +8675,10 @@ pub type Codegen = class {
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
       }
+      // #1003: inline geschriebener fn-Zeigertyp als Parameter
+      if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == CGN_FN_PTR_NODE) {
+        poke8(self.localIsFnPtr + self.localCount - 1, 1);
+      }
 
     } else if (k == CGN_AT_DIRECTIVE) {  // WP-CS-07 / WP-AS-04/05
       var kind: int64 := self.cg_nival(ni);
@@ -8607,6 +8791,11 @@ pub type Codegen = class {
       var pname: pchar := self.cg_nsval(param);
       var pnlen: int64 := self.cg_nslen(param);
       var off: int64 := self.cg_addLocal(pname, pnlen);
+      // #1003: inline geschriebener fn-Zeigertyp als Parameter
+      var nfpType: int64 := self.cg_nc0(param);
+      if (nfpType >= 0 && self.cg_nkind(nfpType) == CGN_FN_PTR_NODE) {
+        poke8(self.localIsFnPtr + self.localCount - 1, 1);
+      }
       if (paramIdx == 0) { self.cg_spillRdi(off); }
       else if (paramIdx == 1) { self.cg_spillRsi(off); }
       else if (paramIdx == 2) { self.cg_spillRdx(off); }
@@ -9650,6 +9839,10 @@ pub type Codegen = class {
       var ptypeNode: int64 := self.cg_nc0(param);
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
+      }
+      // #1003: inline geschriebener fn-Zeigertyp als Parameter
+      if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == CGN_FN_PTR_NODE) {
+        poke8(self.localIsFnPtr + self.localCount - 1, 1);
       }
       if (paramIdx == 0) { self.cg_spillRdi(off); }
       else if (paramIdx == 1) { self.cg_spillRsi(off); }
@@ -11173,6 +11366,7 @@ pub type Codegen = class {
     self.localIsRedundant := alloc(self.localCap);
     // WP-GPU-01: per-local SIMD flag
     self.localIsSimd      := alloc(self.localCap);
+    self.localIsFnPtr     := alloc(self.localCap);
 
     // BUG-02: Temporary buffer tracking (prevent mmap leaks)
     self.tempBufCap   := 64;
