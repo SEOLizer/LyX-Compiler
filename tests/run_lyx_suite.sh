@@ -24,8 +24,6 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # Bekannt rote Tests: sie laufen mit, ihr Fehlschlag bricht den Lauf aber nicht
 # ab. Jeder Eintrag braucht ein Issue — sonst verschwindet er hier lautlos.
 declare -A KNOWN_RED=(
-  [soft_keywords_test]="#1007 range(N) iteriert nicht"
-  [compound_tokens_test]="#1007 range(N) iteriert nicht"
   [defer_scope_test]="#1006 defer im inneren Block"
   [lexer_float_dot_test]="#1011 Unterstrich im Float-Literal"
   [meta_safe_test]="#1017 GetPageHash"
