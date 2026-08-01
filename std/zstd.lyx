@@ -848,6 +848,13 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
 
     if (regenSize == 0) { poke64(outLen, 0); return alloc(1); }
 
+    // #1027: Die Groessen stammen aus dem Header und wurden bisher ungeprueft
+    // als Zeigerdistanzen verwendet -- ein zu grosser Wert liess den Leser
+    // ueber das Blockende hinauslaufen (Absturz statt Fehlermeldung).
+    if (compSize <= 0)             { poke64(outLen, 0); return 0; }
+    if (compSize > zsbrLeft(br))   { poke64(outLen, 0); return 0; }
+    if (regenSize > 131072)        { poke64(outLen, 0); return 0; }
+
     var litDataStart: int64 := zsbrPos(br);
     var litPtr: int64 := blockPtr + litDataStart;
 
@@ -863,6 +870,21 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
         free(wbr, 24);
         htree := zsHuffFromWeights(weights, nw);
         free(weights, 256 * 8);
+        // #1027: nw kommt aus dem Bitstrom; oberhalb von 255 laeuft schon das
+        // Gewichts-Array (256 Eintraege) ueber. Und zsHuffDecSym laeuft ueber
+        // maxLen Tabellenplaetze -- zstd erlaubt hoechstens 11.
+        if ((nw <= 0) | (nw > 255)) {
+            zsHuffFree(htree); poke64(outLen, 0); zsbrSkip(br, compSize); return 0;
+        }
+        if (peek64(htree + 400) < 0) {
+            var hMaxLen: int64 := peek64(htree);
+            if ((hMaxLen < 1) | (hMaxLen > 11)) {
+                zsHuffFree(htree); poke64(outLen, 0); zsbrSkip(br, compSize); return 0;
+            }
+        }
+        if (hdrConsumed > compSize) {
+            zsHuffFree(htree); poke64(outLen, 0); zsbrSkip(br, compSize); return 0;
+        }
         litDataStart += hdrConsumed;
         litPtr := blockPtr + litDataStart;
         compSize -= hdrConsumed;
@@ -900,6 +922,12 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
         var s2len: int64 := (peek8(litPtr + 2) & 0xFF) | ((peek8(litPtr + 3) & 0xFF) << 8);
         var s3len: int64 := (peek8(litPtr + 4) & 0xFF) | ((peek8(litPtr + 5) & 0xFF) << 8);
         var s4len: int64 := compSize - 6 - s1len - s2len - s3len;
+        // #1027: Die drei Laengen stehen unkontrolliert im Bitstrom. Ergeben sie
+        // zusammen mehr als der Block hergibt, zeigen p2..p4 hinter den Puffer.
+        if (s4len <= 0) {
+            zsHuffFree(htree); free(litBuf, regenSize + 1);
+            poke64(outLen, 0); zsbrSkip(br, compSize); return 0;
+        }
 
         var p1: int64 := litPtr + 6;
         var p2: int64 := p1 + s1len;
@@ -995,6 +1023,25 @@ fn zsGetSeqTable(ctx: int64, zb: int64, mode: int64, which: int64): int64 {
 
 // Decode all sequences and apply to output.
 // Reads from rbr (reverse bitstream over sequence data).
+// #1027: Ein FSE-Zustand ausserhalb der Tabelle las bisher an einer beliebigen
+// Adresse (zsFSESym rechnet ungeprueft tab[state]) -- daher die Abstuerze bei
+// jedem etwas groesseren Compressed Block. Gueltig ist 0 <= state < 2^AL.
+fn zsStateOk(state: int64, AL: int64): int64 {
+    if (state < 0) { return 0; }
+    if (state >= (1 << AL)) { return 0; }
+    return 1;
+}
+
+// Symbolcodes nach RFC 8878: literal-length <= 35, match-length <= 52,
+// offset-code <= 31. Groessere Werte kommen nur aus einem entgleisten Decoder;
+// sie wuerden als Schiebeweite bzw. Bitanzahl weiterverwendet.
+fn zsCodesOk(llCode: int64, mlCode: int64, offCode: int64): int64 {
+    if ((llCode  < 0) | (llCode  > 35)) { return 0; }
+    if ((mlCode  < 0) | (mlCode  > 52)) { return 0; }
+    if ((offCode < 0) | (offCode > 31)) { return 0; }
+    return 1;
+}
+
 fn zsDecodeSeqs(ctx: int64, rbr: int64, litBuf: int64, litLen: int64, numSeq: int64): void {
     if (numSeq == 0) {
         // No sequences — copy all literals
@@ -1020,9 +1067,19 @@ fn zsDecodeSeqs(ctx: int64, rbr: int64, litBuf: int64, litLen: int64, numSeq: in
     var llState:  int64 := 0;
     var mlState:  int64 := 0;
     var offState: int64 := 0;
+    // #1027: fehlende Tabelle heisst, dass zsGetSeqTable nicht durchkam. Vorher
+    // lief der Decoder mit AL=0 und einer Nullzeiger-Tabelle weiter.
+    if ((llMode  != 1) & (llTab  == 0)) { poke64(ctx + 48, 1); return; }
+    if ((mlMode  != 1) & (mlTab  == 0)) { poke64(ctx + 48, 1); return; }
+    if ((offMode != 1) & (offTab == 0)) { poke64(ctx + 48, 1); return; }
+
     if (llMode  != 1) { llState  := zsRevReadBits(rbr, llAL); }
     if (offMode != 1) { offState := zsRevReadBits(rbr, offAL); }
     if (mlMode  != 1) { mlState  := zsRevReadBits(rbr, mlAL); }
+
+    if (llMode  != 1) { if (zsStateOk(llState,  llAL)  == 0) { poke64(ctx + 48, 1); return; } }
+    if (mlMode  != 1) { if (zsStateOk(mlState,  mlAL)  == 0) { poke64(ctx + 48, 1); return; } }
+    if (offMode != 1) { if (zsStateOk(offState, offAL) == 0) { poke64(ctx + 48, 1); return; } }
 
     var litPos: int64 := 0;
     var seqIdx: int64 := 0;
@@ -1039,11 +1096,20 @@ fn zsDecodeSeqs(ctx: int64, rbr: int64, litBuf: int64, litLen: int64, numSeq: in
         if (mlMode  != 1) { mlCode  := zsFSESym(mlTab,  mlState); }
         if (offMode != 1) { offCode := zsFSESym(offTab, offState); }
 
+        // #1027: entgleiste Symbolcodes vor der Weiterverwendung abfangen
+        if (zsCodesOk(llCode, mlCode, offCode) == 0) { poke64(ctx + 48, 1); return; }
+
         // Update states (read bits) — skip for last sequence
         if (isLast == 0) {
             if (llMode  != 1) { llState  := zsFSENewState(llTab,  llState)  + zsRevReadBits(rbr, zsFSENbBits(llTab,  llState)); }
             if (offMode != 1) { offState := zsFSENewState(offTab, offState) + zsRevReadBits(rbr, zsFSENbBits(offTab, offState)); }
             if (mlMode  != 1) { mlState  := zsFSENewState(mlTab,  mlState)  + zsRevReadBits(rbr, zsFSENbBits(mlTab,  mlState)); }
+
+            // #1027: Zustand muss in der Tabelle bleiben, sonst liest der
+            // naechste Durchlauf ausserhalb.
+            if (llMode  != 1) { if (zsStateOk(llState,  llAL)  == 0) { poke64(ctx + 48, 1); return; } }
+            if (mlMode  != 1) { if (zsStateOk(mlState,  mlAL)  == 0) { poke64(ctx + 48, 1); return; } }
+            if (offMode != 1) { if (zsStateOk(offState, offAL) == 0) { poke64(ctx + 48, 1); return; } }
         }
 
         // Decode extra bits
@@ -1064,9 +1130,14 @@ fn zsDecodeSeqs(ctx: int64, rbr: int64, litBuf: int64, litLen: int64, numSeq: in
             litPos += 1;
             k += 1;
         }
+        // #1027: Reichen die Literale nicht fuer den angeforderten Lauf, ist der
+        // Decoder aus dem Tritt. Vorher wurde der Lauf still gekuerzt und die
+        // Ausgabe lief zu kurz weiter -- ohne gesetztes Fehlerflag.
+        if (k < llLen) { poke64(ctx + 48, 1); return; }
 
         // Copy match
         zsCopyBack(ctx, actual, mlLen);
+        if (peek64(ctx + 48) != 0) { return; }
 
         seqIdx += 1;
     }
@@ -1145,6 +1216,14 @@ fn zsDecompressCompressed(ctx: int64, blkPtr: int64, blkLen: int64): void {
     // The rest of the block is the reverse bitstream for sequences
     var seqBitStart: int64 := zsbrPos(br);
     var seqBitLen:   int64 := blkLen - seqBitStart;
+    // #1027: Stimmt die verbrauchte Tabellengroesse nicht, wird seqBitLen <= 0.
+    // zsRevNew las dann bei ptr + len - 1 UNTERHALB des Puffers -- der Bus-Fehler
+    // an einer Mapping-Grenze. Jetzt: melden statt lesen.
+    if (seqBitLen <= 0) {
+        poke64(ctx + 48, 1);
+        free(litBuf, litLen + 1); free(br, 24);
+        return;
+    }
     var rbr: int64 := zsRevNew(blkPtr + seqBitStart, seqBitLen);
 
     zsDecodeSeqs(ctx, rbr, litBuf, litLen, numSeq);
@@ -1168,8 +1247,21 @@ fn zsDecompressBlock(ctx: int64, blkPtr: int64, blkLen: int64, blkType: int64): 
             // The actual byte payload is 1 byte; blkLen from header is the count
             while (k < blkLen) { zsOutput(ctx, rleByte); k := k + 1; }
         } else {
-            // Compressed block
-            zsDecompressCompressed(ctx, blkPtr, blkLen);
+            // #1027: Compressed Blocks (Huffman/FSE) sind FAIL-CLOSED.
+            //
+            // Gemessen ueber 97 Frames derselben Textquelle in aufsteigender
+            // Groesse (zstd -1): 67 Abstuerze, 5 stillschweigend falsche
+            // Ergebnisse, 20 gemeldete Fehler, 5 korrekt. Ein Decoder, der in
+            // zwei von drei Faellen den Prozess abraeumt und in weiteren Faellen
+            // ohne Fehlerflag Muell liefert, darf nicht laufen -- ein Aufrufer
+            // kann das Ergebnis nicht von einem echten unterscheiden.
+            //
+            // Der Dekodierpfad bleibt vollstaendig erhalten und ist unten
+            // gehaertet (Tabellen-, Zustands- und Laengengrenzen); zum
+            // Weiterarbeiten diese Zeile durch den Aufruf ersetzen:
+            //     zsDecompressCompressed(ctx, blkPtr, blkLen);
+            // Solange gilt: melden statt raten. Siehe Issue #1027.
+            poke64(ctx + 48, 1);
         }
     }
 }
@@ -1252,6 +1344,13 @@ pub fn ZstdDecompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int
             } else {
                 var blkPtr: int64 := src + zsbrPos(br);
 
+                // #1027: Blockgroesse gegen die verbleibende Eingabe pruefen.
+                // Ein zu grosser Wert (verstuemmelter oder falsch gelesener
+                // Header) liess den Decoder ueber das Ende des Puffers laufen.
+                if (blockType != 1) {
+                    if (blockSize > zsbrLeft(br)) { poke64(ctx + 48, 1); done := 1; }
+                }
+
                 if (blockType == 1) {
                     // RLE: 1 byte in stream, blockSize = repetition count
                     zsDecompressBlock(ctx, blkPtr, blockSize, 1);
@@ -1271,6 +1370,13 @@ pub fn ZstdDecompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int
     var result: int64 := ZSTD_ERR;
     if (peek64(ctx + 48) == 0) {
         result := peek64(ctx + 32);
+        // #1027: Der Frame-Header nennt die Groesse des Inhalts. Weicht die
+        // geschriebene Menge davon ab, war die Dekodierung falsch -- egal ob
+        // unterwegs ein Fehler auffiel. Genau dieser Fall lieferte bisher
+        // stillschweigend eine falsche Laenge samt Muell im Puffer.
+        if (contentSize > 0) {
+            if (result != contentSize) { result := ZSTD_ERR; }
+        }
     }
 
     free(br, 24);
