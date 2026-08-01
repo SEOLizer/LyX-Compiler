@@ -4,6 +4,50 @@
 
 _(noch nichts)_
 
+## Version 1.0.11D (August 2026)
+
+### Standardbibliothek — zstd: Compressed Blocks dekodieren wieder (#1027)
+
+Der komprimierte Blockpfad (Huffman-Literale + FSE-Sequenzen) war
+fail-closed, weil er stillschweigend falschen Inhalt lieferte. Gemessen
+ueber 97 Frames derselben Textquelle in aufsteigender Groesse
+(`zstd -1`, 20..116 Byte):
+
+| | korrekt | still falsch | gemeldet | abgestuerzt |
+|---|---|---|---|---|
+| Ausgangslage | 5 | 6 | 19 | 67 |
+| fail-closed (1.0.11C) | 44 | 0 | 53 | 0 |
+| **jetzt** | **97** | **0** | **0** | **0** |
+
+Sechs Defekte, drei davon Positionsfehler im Bitstrom, drei falsch
+uebernommene Konstantentabellen:
+
+- Der FSE-Gewichtsleser terminierte nach statt vor dem Verbrauch. RFC 8878
+  §4.2.1.2 macht die Terminierung daran fest, ob das **Zustands-Update** noch
+  in den Strom passt.
+- Die kanonische Codezuweisung lief rueckwaerts: in zstd beginnt der
+  **laengste** Code bei 0, nicht der kuerzeste.
+- Der FSE-Tabellenkopf endet an einer **Bytegrenze**. Das angebrochene Byte
+  wurde mitgezaehlt, der Rueckwaertsstrom begann ein Byte zu frueh — das war
+  die Wurzel hinter den ersten beiden Befunden.
+- Die drei Sequenztabellen stehen als LL, OFFSET, ML; gelesen wurde ML als
+  zweite.
+- Im Sequenzpfad wurden die FSE-Zustaende **vor** den Zusatzbits und in der
+  Reihenfolge LL, OFF, ML fortgeschrieben. Richtig ist: erst die Zusatzbits
+  (Offset, ML, LL), dann das Update LL, ML, OFF.
+- Vier eingebaute Tabellen wichen vom RFC ab — die vordefinierte
+  LL-Verteilung (2er-Lauf bis Symbol 12, nicht 8), die vordefinierte
+  OFFSET-Verteilung (2er bei 6..8, nicht 5..7), die LL-Zusatzbits ab Code 25
+  und die ML-Basen und -Zusatzbits ab Code 43.
+
+Der letzte Punkt ist die Lehre dieser Runde: eine von Hand uebernommene
+Konstantentabelle sieht plausibel aus und ist trotzdem falsch. Alle vier
+fielen erst auf, als eine unabhaengige Referenzdekodierung derselben vier
+Bytes danebengelegt wurde — nicht durch Lesen des eigenen Codes.
+
+`tests/zstd_measure.sh` laeuft in `make test` und wird rot, sobald wieder ein
+Frame stillschweigend falsch endet.
+
 ## Version 1.0.11C (August 2026)
 
 Neun PRs. Roter Faden: **stille Lücken laut machen** — sechs der Befunde
