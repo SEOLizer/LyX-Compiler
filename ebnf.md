@@ -47,10 +47,6 @@ FloatLiteral        = Digit { Digit | "_" }
                       "."
                       Digit { Digit | "_" } ;
 
-(* Der Ziffern-Trenner ist hier zwar erlaubt, wird bei Fliesskommazahlen aber
-   falsch umgesetzt: `3.14_159` liefert einen abweichenden Wert. Bei
-   Ganzzahlen funktioniert er. Siehe 20.1 und Issue #1011. *)
-
 StringLiteral       = '"'
                       { StringChar | EscapeSequence }
                       '"' ;
@@ -369,16 +365,22 @@ BuiltinType         = "bool"
                     | "pchar"
                     | "void" ;
 
-BaseIntType         = "int8"
-                    | "int16"
-                    | "int32"
-                    | "int64"
-                    | "uint8"
-                    | "uint16"
-                    | "uint32"
-                    | "uint64"
-                    | "isize"
-                    | "usize" ;
+BaseIntType         = "int8"  | "i8"
+                    | "int16" | "i16"
+                    | "int32" | "i32"
+                    | "int64" | "i64"
+                    | "uint8"  | "u8"
+                    | "uint16" | "u16"
+                    | "uint32" | "u32"
+                    | "uint64" | "u64" ;
+
+(* Beide Schreibweisen sind gueltig und bezeichnen denselben Typ; die kurze
+   (`u8`) ist im Bestand die haeufigere. Bis 1.0.11B kannte der Compiler die
+   kurze Form im var-Deklarator und die lange nur als Feldtyp -- `var x: uint8`
+   wurde abgewiesen, `feld: uint8` stillschweigend angenommen (#1010).
+
+   `isize` und `usize` standen hier frueher ebenfalls; der Compiler kennt sie
+   nicht (`unknown type in var decl`). *)
 
 (* Es gibt in Lyx KEINEN qualifizierten Zugriff. Weder `Modul::Name` noch
    `Modul.Name` ist gueltig -- Symbole importierter Units liegen in einem
@@ -1173,13 +1175,23 @@ Einzelbefunde sind dort verlinkt.
 | `fn f<T>(...)` | 6, 7 | Parst, die Semantikpruefung loest den Typparameter nicht auf (`unknown param type`). Monomorphisierung ist in sema angelegt, der Weg vom Parameter zum Typ fehlt. Generische TYPEN werden gar nicht angenommen. Bis zu dieser Fassung nannte die Grammatik ausserdem die eckige Form `[T]`, die nie gueltig war. (#1009) |
 | `range(N)` | 2.2 | Uebersetzt, iteriert aber nicht: `for i in range(5)` summiert zu 0, an anderer Stelle zu Datenmuell. (#1007) |
 | `defer` im inneren Block | 2.2 | Laeuft am **Funktionsende** statt am Blockende. Auf Funktionsebene korrekt. (#1006) |
-| Unterstrich im Float-Literal | 1 | `FloatLiteral` erlaubt `_` ausdruecklich; `3.14_159` uebersetzt, liefert aber einen falschen Wert. Bei Ganzzahlen funktioniert der Trenner. (#1011) |
 | `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
 
 Nicht mehr betroffen: die Bindung von Methodenzeigern (`feld := obj.Method`)
 war bis PR #1005 abgewiesen, weil die Existenzpruefung fuer Feldnamen nur die
 Felder einer Klasse durchsuchte und nicht ihre Methoden. Sie funktioniert
 wieder und ist durch `tests/method_ptr_test.sh` abgedeckt.
+
+Ebenfalls nicht mehr betroffen: der Ziffern-Trenner im Float-Literal
+(`3.14_159`, `1_000.5`). Bis 1.0.11B kuerzten die Literal-Umwandlungen den Wert
+stillschweigend am ersten `_`; seither ueberspringen sie ihn in allen
+Ziffernschleifen. Abgedeckt durch `tests/lexer_float_dot_test.lyx`. (#1011)
+
+Ebenfalls nicht mehr betroffen: der inline geschriebene Funktionszeigertyp
+(`var f: fn(int64): int64 := g;`) als lokale Variable und als Parameter. Der
+Aufrufpfad erkannte einen fn-Zeiger bis 1.0.11B nur am Namen eines Typalias;
+inline geschrieben lief der Aufruf ueber den Closure-Pfad und stuerzte ab.
+Abgedeckt durch `tests/inline_fnptr_test.sh`. (#1003)
 
 ---
 

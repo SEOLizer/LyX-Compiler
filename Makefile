@@ -164,6 +164,15 @@ test: lyxc
 	@echo "--- Import auf fehlendes Modul (6 tests) ---"
 	@bash tests/dangling_import_test.sh
 	@echo "OK"
+	@echo "--- Mehrdeutige Symbole aus zwei Units (4 Prüfungen) ---"
+	@bash tests/ambiguous_symbol_test.sh
+	@echo "OK"
+	@echo "--- Printf im x86-Codegen (15 Prüfungen) ---"
+	@bash tests/printf_x86_test.sh
+	@echo "OK"
+	@echo "--- uintN als Schreibweise von uN (6 Prüfungen) ---"
+	@bash tests/uint_alias_test.sh
+	@echo "OK"
 	@echo "--- Verschachtelte Funktionen (8 Prüfungen) ---"
 	./lyxc --std-path=std tests/nested_fn_test.lyx -o /tmp/lyxc_nfn_test
 	@/tmp/lyxc_nfn_test > /dev/null
