@@ -59,6 +59,16 @@ runs "Guard trifft"        "$PRE fn main(): int64 { g_hit := 0; match 5 { case 5
 runs "Guard trifft nicht"  "$PRE fn main(): int64 { g_hit := 0; match 5 { case 5 if 1 == 2 => set(9); case _ => set(42); } return g_hit; }" 42
 runs "Or-Muster"           "$PRE fn main(): int64 { g_hit := 0; match 3 { case 1 | 3 => set(42); case _ => set(9); } return g_hit; }" 42
 
+# match als AUSDRUCK: liefert den Wert des getroffenen Fallrumpfes.
+runs "Ausdruck: Literal"        "$PRE fn main(): int64 { var r: int64 := match 2 { case 1 => 10; case 2 => 42; case _ => 0; }; return r; }" 42
+runs "Ausdruck: Wildcard"       "$PRE fn main(): int64 { var r: int64 := match 99 { case 1 => 10; case _ => 42; }; return r; }" 42
+runs "Ausdruck: Enum"           "$PRE fn main(): int64 { var r: int64 := match C.G { case R => 1; case G => 42; case B => 3; }; return r; }" 42
+runs "Ausdruck: direkt return"  "$PRE fn main(): int64 { return match 3 { case 3 => 42; case _ => 0; }; }" 42
+runs "Ausdruck: in Arithmetik"  "$PRE fn main(): int64 { var r: int64 := 2 + match 1 { case 1 => 40; case _ => 0; }; return r; }" 42
+# Ohne Treffer und ohne Default ist der Wert definiert 0 -- vorher stand dort
+# der Rest des letzten Vergleichs.
+runs "Ausdruck: kein Treffer=0" "$PRE fn main(): int64 { var r: int64 := match 99 { case 1 => 10; }; return r + 42; }" 42
+
 # Ein blankes Bezeichner-Muster, das nichts benennt, ist ein Fehler statt
 # stillschweigend nie zu treffen. Bindende Muster gibt es (noch) nicht.
 printf 'fn main(): int64 { match 7 { case unbekannt => 1; } return 0; }' > "$TMP/b.lyx"

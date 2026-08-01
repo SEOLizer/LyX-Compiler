@@ -645,19 +645,32 @@ SwitchCase          = "case" ConstExpr ":" { Statement } ;
 SwitchDefault       = "default" ":" { Statement } ;
 
 MatchStmt           = "match"
-                      Expr
+                      [ "(" ] Expr [ ")" ]
                       "{"
                       { MatchCase }
-                      [ MatchDefault ]
                       "}" ;
 
 MatchCase           = "case"
                       Pattern
                       { "|" Pattern }
+                      [ "if" Expr ]          (* Guard *)
                       "=>"
-                      Block ;
+                      Expr
+                      [ ";" ] ;
 
-MatchDefault        = "default" "=>" Block ;
+(* Dieselbe Form ist auch als Ausdruck verwendbar (Abschnitt 15,
+   PrimaryExpr -> MatchExpr) und liefert dann den Wert des getroffenen
+   Fallrumpfes; trifft kein Fall, ist das Ergebnis 0. *)
+
+MatchExpr           = MatchStmt ;
+
+(* Korrekturen gegenueber frueheren Fassungen dieses Dokuments:
+   - Der Fallrumpf ist ein AUSDRUCK, kein Block. `case p => { ... }` scheitert.
+     Da eine Zuweisung in Lyx ebenfalls kein Ausdruck ist, bleibt fuer
+     Seiteneffekte nur der Funktionsaufruf.
+   - Der Guard (`case p if cond => ...`) fehlte hier ganz, existiert aber.
+   - Ein `MatchDefault` mit dem Wort `default` gibt es NICHT -- der Parser
+     erwartet `case`. Der Auffangfall wird als `case _ =>` geschrieben. *)
 
 TryStmt             = "try"
                       Block
@@ -755,8 +768,12 @@ EnumPattern         = Ident "." Ident ;   (* z. B. Color.Green *)
    ueber Konstanten und Enum-Mitglieder), Guards und Or-Muster.
 
    NICHT erreichbar: EnumPattern in qualifizierter Form (`Color.Green`) sowie
-   bindende Bezeichner-Muster. `match` ist ausserdem nur eine Anweisung, kein
-   Ausdruck, und Fallruempfe muessen Ausdruecke sein. Siehe 20.1. *)
+   bindende Bezeichner-Muster.
+
+   `match` ist Anweisung UND Ausdruck. Als Ausdruck liefert es den Wert des
+   getroffenen Fallrumpfes; trifft kein Fall und gibt es keinen Default, ist
+   das Ergebnis 0. Fallruempfe muessen Ausdruecke sein -- ein Block ist keiner,
+   und eine Zuweisung in Lyx ebenfalls nicht. Siehe 20.1. *)
 
 WildcardPattern     = "_" ;
 
@@ -845,6 +862,7 @@ PrimaryExpr         = Literal
                     | SelfExpr
                     | SuperExpr
                     | Ident
+                    | MatchExpr
                     | BuiltinCall
                     | NewExpr
                     | DisposeExpr
@@ -1138,7 +1156,6 @@ Einzelbefunde sind dort verlinkt.
 
 | Konstrukt | Abschnitt | Verhalten |
 |---|---|---|
-| `match` als Ausdruck | 14, 15 | `match` ist nur als ANWEISUNG erreichbar; `var r := match ... ` scheitert im Ausdrucksparser. Ein Ergebnis laesst sich daher nur ueber Seiteneffekte gewinnen. (#1008) |
 | Fallrumpf als Block | 14 | `case p => { ... }` scheitert -- der Rumpf muss ein AUSDRUCK sein. Da eine Zuweisung in Lyx kein Ausdruck ist, bleibt nur der Funktionsaufruf. (#1008) |
 | `case Enum.Member =>` | 14 | Qualifizierte Muster scheitern am Punkt (`expected =>, got '.'`). Der blanke Name (`case Green =>`) wird ueber die Konstantentabelle aufgeloest und funktioniert. (#1008) |
 | Bindendes Muster | 14 | `case x =>` (jeden Wert annehmen und binden) ist nicht umgesetzt. Ein Bezeichner, der weder Konstante noch lokale Variable benennt, wird jetzt gemeldet statt still nie zu treffen. (#1008) |
