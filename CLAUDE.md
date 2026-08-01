@@ -120,9 +120,12 @@ Bestand nicht auf das alte Verhalten gestützt hat.
 
 - Feature- und Fix-Branches von **`develop`** ableiten, PRs gegen `develop`.
   Nie direkt auf `main` pushen.
-- **GitHub schließt nur bei englischen Schlüsselwörtern.** „schliesst #995" im
-  Commit tut nichts — `Closes #995` in den PR-**Text**, und zwar bevor gemergt
-  wird. Danach nachprüfen, ob das Issue wirklich zu ist.
+- **Issues gehen hier nie automatisch zu — immer von Hand schließen.** GitHub
+  löst `Closes #N` nur aus, wenn der PR in den **Default-Branch** gemergt wird;
+  der ist `main`, gearbeitet wird aber gegen `develop`. Das englische
+  Schlüsselwort ist trotzdem richtig (deutsches „schliesst #995" wirkt ohnehin
+  nie), es greift hier nur nicht. Nach jedem Merge den Issue-Status prüfen und
+  mit einem Kommentar schließen, der Ursache, Fix und Nachweis nennt.
 - **Ein Issue mit falscher Prämisse gehört geschlossen und neu aufgesetzt**,
   nicht korrigiert-und-offengelassen: wer später sucht, liest den Titel.
 - Beim Versionsbump gehört `ebnf.md` dazu, wenn die Grammatik geändert wurde.
