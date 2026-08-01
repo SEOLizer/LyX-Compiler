@@ -164,6 +164,9 @@ test: lyxc
 	@echo "--- Import auf fehlendes Modul (6 tests) ---"
 	@bash tests/dangling_import_test.sh
 	@echo "OK"
+	@echo "--- zstd: melden statt raten (3 Prüfungen) ---"
+	@bash tests/zstd_fail_closed_test.sh
+	@echo "OK"
 	@echo "--- Verschachtelte Funktionen (8 Prüfungen) ---"
 	./lyxc --std-path=std tests/nested_fn_test.lyx -o /tmp/lyxc_nfn_test
 	@/tmp/lyxc_nfn_test > /dev/null
