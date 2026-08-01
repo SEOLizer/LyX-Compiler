@@ -109,6 +109,7 @@ con CGN_TYPE_RINGBUF:   int64 := 92; // WP-BC-17: RingBuffer<T> type node
 con CGN_TYPE_PARALLEL:  int64 := 93; // WP-BC-18: parallel Array<T> type node
 con CGN_SIMD_NEW:       int64 := 94; // WP-BC-18: parallel Array<T>(size) expression
 con CGN_FOR_C:          int64 := 102; // C-style for: c0=init(NK_VAR_DECL), c1=cond, c2=step, c3=body
+con CGN_FOR_RANGE:      int64 := 107; // for i in range([start,] stop): c0=start, c1=stop (exklusiv), c2=body
 con CGN_AT_IF:          int64 := 103; // WP-CS-01: @if (nach Sema-Pruning nicht mehr sichtbar; Alias für Vollständigkeit)
 con CGN_AT_DIRECTIVE:   int64 := 104; // WP-CS-08: @io_check/@overflow_check; iv=kind, iv2=value
 con CGN_AT_ENERGY:      int64 := 105; // WP-EN-04: @energy(N) — iv=level(1-5)
@@ -2958,8 +2959,18 @@ pub type Codegen = class {
     } else if (op == 89) {
       // bitwise xor rax, rbx  (TK_BITXOR = 89, no CGT_BITXOR alias)
       self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD8);
+    } else if (op == 88) {
+      // bitwise nor: `a |~ b` = ~(a | b)  (TK_NOR = 88)
+      // Der Lexer kennt |~ und der Parser gibt ihm eine Praezedenz, emittiert
+      // wurde bisher aber nichts -- der Operator fiel in den Catch-all unten
+      // und lieferte still 0.
+      self.cg_e8(0x48); self.cg_e8(0x09); self.cg_e8(0xD8);  // or  rax, rbx
+      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xD0);  // not rax
     } else {
-      // Unknown op: emit 0 (nop effect, rax=0)
+      // Unbekannter Operator: laut abbrechen statt still 0 zu liefern.
+      EPrintStr("error: codegen: unbekannter Binaeroperator "c);
+      EPrintInt(op); EPrintStrLn(""c);
+      exit(70);
       self.cg_zeroRax();
     }
   }
@@ -8223,6 +8234,9 @@ pub type Codegen = class {
     } else if (k == CGN_FOR_C) {
       self.cg_genForC(ni);
 
+    } else if (k == CGN_FOR_RANGE) {
+      self.cg_genForRange(ni);
+
     } else if (k == CGN_SWITCH) {
       self.cg_genSwitch(ni);
 
@@ -8874,6 +8888,62 @@ pub type Codegen = class {
     self.cg_e8(0xE9);
     self.cg_e32(loopTop - self.codeLen - 4);
     // .exit
+    var exitPos: int64 := self.codeLen;
+    self.cg_patchList(jzHead, exitPos);
+    self.cg_patchList(allBreakHead, exitPos);
+    self.curBreakHead := savedBreakHead;
+    self.curContHead  := savedContHead;
+  }
+
+  // for i in range([start,] stop) { }
+  //
+  // Wie cg_genFor, aber mit AUSSCHLIESSENDER Obergrenze: `to` laeuft bis
+  // einschliesslich limit, `range` bis stop-1. Der Abbruch prueft daher
+  // v >= stop (jge) statt v > limit (jg).
+  //
+  // Der Knoten wurde von Parser und sema erzeugt bzw. geprueft, hier aber nie
+  // behandelt -- er fiel in den Catch-all am Ende von cg_genStmt und
+  // verschwand spurlos. `for i in range(5) { s := s + i; }` liess s deshalb
+  // unveraendert (Issue #1007).
+  fn cg_genForRange(ni: int64) {
+    var name: pchar := self.cg_nsval(ni);
+    var nlen: int64 := self.cg_nslen(ni);
+    var off:  int64 := self.cg_addLocal(name, nlen);
+    // Init: v = start
+    self.cg_genExpr(self.cg_nc0(ni));
+    self.cg_storeRax(off);
+
+    var savedBreakHead: int64 := self.curBreakHead;
+    var savedContHead:  int64 := self.curContHead;
+    var allBreakHead:   int64 := -1;
+    var jzHead:         int64 := -1;
+    var loopTop:        int64 := self.codeLen;
+
+    // Bedingung: v < stop, sonst raus
+    self.cg_loadRax(off);
+    self.cg_pushRax();
+    self.cg_genExpr(self.cg_nc1(ni));
+    self.cg_popRbx();  // rbx = v, rax = stop
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);  // cmp rbx, rax
+    self.cg_e8(0x0F); self.cg_e8(0x8D);                    // jge exit
+    self.cg_e32(jzHead);
+    jzHead := self.codeLen - 4;
+
+    // Rumpf
+    self.curBreakHead := -1;
+    self.curContHead  := -1;
+    self.cg_genBlock(self.cg_nc2(ni));
+    self.cg_patchList(self.curContHead, self.codeLen);
+    allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
+
+    // Schritt: v++
+    self.cg_loadRax(off);
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);  // inc rax
+    self.cg_storeRax(off);
+
+    self.cg_e8(0xE9);
+    self.cg_e32(loopTop - self.codeLen - 4);
+
     var exitPos: int64 := self.codeLen;
     self.cg_patchList(jzHead, exitPos);
     self.cg_patchList(allBreakHead, exitPos);
