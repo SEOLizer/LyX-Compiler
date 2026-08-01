@@ -69,6 +69,26 @@ runs "Ausdruck: in Arithmetik"  "$PRE fn main(): int64 { var r: int64 := 2 + mat
 # der Rest des letzten Vergleichs.
 runs "Ausdruck: kein Treffer=0" "$PRE fn main(): int64 { var r: int64 := match 99 { case 1 => 10; }; return r + 42; }" 42
 
+# --- #1024: Blockrumpf, qualifizierte Enum-Muster, Or mit Bezeichnern -----
+# Der Fallrumpf darf ein Block sein. Als AUSDRUCK benutzt liefert er den Wert
+# seiner letzten Anweisung, sofern das ein Ausdruck ist — sonst 0.
+runs "Blockrumpf, mehrere Anweisungen" "$PRE fn main(): int64 { g_hit := 0; match 2 { case 1 => { set(1); } case 2 => { set(10); set(42); } case _ => { set(9); } } return g_hit; }" 42
+runs "Blockrumpf mit Zuweisung"        "$PRE fn main(): int64 { var r: int64 := 0; match 2 { case 2 => { r := 40; r := r + 2; } case _ => { r := 1; } } return r; }" 42
+runs "Block als Ausdruck: letzte Anweisung ist der Wert" "$PRE fn main(): int64 { var v: int64 := match 1 { case 1 => { set(1); set(42) } case _ => 0; }; return v; }" 42
+runs "Blockrumpf mit Waechter"         "$PRE fn main(): int64 { var r: int64 := 0; match 5 { case 5 if 1 == 1 => { r := 42; } case _ => { r := 1; } } return r; }" 42
+
+# Qualifizierte Enum-Muster: ebnf.md §14 fuehrt EnumPattern = Ident "." Ident.
+runs "qualifiziertes Enum-Muster"      "$PRE fn main(): int64 { g_hit := 0; match C.G { case C.R => set(10); case C.G => set(42); case C.B => set(12); } return g_hit; }" 42
+runs "qualifiziert und blank gemischt" "$PRE fn main(): int64 { g_hit := 0; match C.B { case R => set(10); case C.B => set(42); case _ => set(9); } return g_hit; }" 42
+
+# Or-Muster mit BEZEICHNERN. Hier stand noch die alte Unterscheidung aus #1020:
+# `case R | B` traf ausgerechnet R, weil der Fehlschlagpfad 0 lud und R = 0 ist —
+# die rechte Seite traf NIE. Deshalb wird beide Seiten einzeln geprueft.
+runs "Or mit Bezeichnern, links"       "$PRE fn main(): int64 { g_hit := 0; match C.R { case R | B => set(42); case _ => set(9); } return g_hit; }" 42
+runs "Or mit Bezeichnern, rechts"      "$PRE fn main(): int64 { g_hit := 0; match C.B { case R | B => set(42); case _ => set(9); } return g_hit; }" 42
+runs "Or mit Bezeichnern, kein Treffer" "$PRE fn main(): int64 { g_hit := 0; match C.G { case R | B => set(9); case _ => set(42); } return g_hit; }" 42
+runs "Or qualifiziert"                 "$PRE fn main(): int64 { g_hit := 0; match C.B { case C.R | C.B => set(42); case _ => set(9); } return g_hit; }" 42
+
 # Ein blankes Bezeichner-Muster, das nichts benennt, ist ein Fehler statt
 # stillschweigend nie zu treffen. Bindende Muster gibt es (noch) nicht.
 printf 'fn main(): int64 { match 7 { case unbekannt => 1; } return 0; }' > "$TMP/b.lyx"

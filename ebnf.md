@@ -136,9 +136,9 @@ range wraps defer
 
 Soft keywords are tokenized as identifiers and interpreted contextually by the parser.
 
-ACHTUNG: `defer` laeuft in einem inneren Block am Funktionsende statt am
-Blockende, und `range(N)` iteriert nicht. Siehe 20.1 sowie die Issues #1006
-und #1007.
+Hinweis zur Geschichte: `defer` lief in einem inneren Block lange am
+Funktionsende statt am Blockende (#1006, samt Argument-Zeitpunkt #1030), und
+`range(N)` erzeugte gar keinen Code (#1007). Beides ist behoben.
 
 ```text
 "defer" is recognized as DeferStmt only when an identifier token with text "defer"
@@ -660,22 +660,26 @@ MatchCase           = "case"
                       { "|" Pattern }
                       [ "if" Expr ]          (* Guard *)
                       "=>"
-                      Expr
+                      ( Expr | Block )
                       [ ";" ] ;
 
 (* Dieselbe Form ist auch als Ausdruck verwendbar (Abschnitt 15,
    PrimaryExpr -> MatchExpr) und liefert dann den Wert des getroffenen
-   Fallrumpfes; trifft kein Fall, ist das Ergebnis 0. *)
+   Fallrumpfes; trifft kein Fall, ist das Ergebnis 0.
+
+   Ein BLOCK als Fallrumpf traegt eine Anweisungsfolge -- das ist der Weg zu
+   mehreren Schritten je Zweig, denn eine Zuweisung ist in Lyx kein Ausdruck.
+   Als Ausdruck benutzt liefert ein Block den Wert seiner LETZTEN Anweisung,
+   sofern das ein Ausdruck ist; sonst 0. *)
 
 MatchExpr           = MatchStmt ;
 
 (* Korrekturen gegenueber frueheren Fassungen dieses Dokuments:
-   - Der Fallrumpf ist ein AUSDRUCK, kein Block. `case p => { ... }` scheitert.
-     Da eine Zuweisung in Lyx ebenfalls kein Ausdruck ist, bleibt fuer
-     Seiteneffekte nur der Funktionsaufruf.
    - Der Guard (`case p if cond => ...`) fehlte hier ganz, existiert aber.
    - Ein `MatchDefault` mit dem Wort `default` gibt es NICHT -- der Parser
-     erwartet `case`. Der Auffangfall wird als `case _ =>` geschrieben. *)
+     erwartet `case`. Der Auffangfall wird als `case _ =>` geschrieben.
+   - Der Fallrumpf durfte bis 1.0.11C nur ein AUSDRUCK sein; seit #1024 ist
+     auch ein Block zugelassen. *)
 
 TryStmt             = "try"
                       Block
@@ -770,15 +774,25 @@ IdentPattern        = Ident ;
 EnumPattern         = Ident "." Ident ;   (* z. B. Color.Green *)
 
 (* Erreichbar sind: LiteralPattern, WildcardPattern, IdentPattern (aufgeloest
-   ueber Konstanten und Enum-Mitglieder), Guards und Or-Muster.
+   ueber Konstanten und Enum-Mitglieder), EnumPattern in qualifizierter Form
+   (`Color.Green`), Guards und Or-Muster -- letztere auch mit Bezeichnern auf
+   beiden Seiten.
 
-   NICHT erreichbar: EnumPattern in qualifizierter Form (`Color.Green`) sowie
-   bindende Bezeichner-Muster.
+   NICHT umgesetzt: BINDENDE Bezeichner-Muster. Ein blanker Bezeichner ist ein
+   VERWEIS auf eine Konstante, ein Enum-Mitglied oder eine lokale Variable --
+   nicht ein Name, an den der Wert gebunden wird. Beide Lesarten zugleich gehen
+   nicht, und die Verweis-Lesart ist die, auf der Enum-Muster beruhen. Benennt
+   der Bezeichner nichts, wird das gemeldet. Wer jeden Wert annehmen will,
+   schreibt `case _`.
+
+   Ein qualifiziertes Enum-Muster wird ueber den MITGLIEDSnamen aufgeloest --
+   Enum-Mitglieder liegen in einer flachen Konstantentabelle. Der Typname davor
+   dient der Lesbarkeit; zwei Enums mit gleichnamigen Mitgliedern kollidieren
+   deshalb weiterhin.
 
    `match` ist Anweisung UND Ausdruck. Als Ausdruck liefert es den Wert des
    getroffenen Fallrumpfes; trifft kein Fall und gibt es keinen Default, ist
-   das Ergebnis 0. Fallruempfe muessen Ausdruecke sein -- ein Block ist keiner,
-   und eine Zuweisung in Lyx ebenfalls nicht. Siehe 20.1. *)
+   das Ergebnis 0. *)
 
 WildcardPattern     = "_" ;
 
@@ -1175,13 +1189,15 @@ Einzelbefunde sind dort verlinkt.
 
 | Konstrukt | Abschnitt | Verhalten |
 |---|---|---|
-| Fallrumpf als Block | 14 | `case p => { ... }` scheitert -- der Rumpf muss ein AUSDRUCK sein. Da eine Zuweisung in Lyx kein Ausdruck ist, bleibt nur der Funktionsaufruf. (#1008) |
-| `case Enum.Member =>` | 14 | Qualifizierte Muster scheitern am Punkt (`expected =>, got '.'`). Der blanke Name (`case Green =>`) wird ueber die Konstantentabelle aufgeloest und funktioniert. (#1008) |
-| Bindendes Muster | 14 | `case x =>` (jeden Wert annehmen und binden) ist nicht umgesetzt. Ein Bezeichner, der weder Konstante noch lokale Variable benennt, wird jetzt gemeldet statt still nie zu treffen. (#1008) |
-| `fn f<T>(...)` | 6, 7 | Parst, die Semantikpruefung loest den Typparameter nicht auf (`unknown param type`). Monomorphisierung ist in sema angelegt, der Weg vom Parameter zum Typ fehlt. Generische TYPEN werden gar nicht angenommen. Bis zu dieser Fassung nannte die Grammatik ausserdem die eckige Form `[T]`, die nie gueltig war. (#1009) |
-| `range(N)` | 2.2 | Uebersetzt, iteriert aber nicht: `for i in range(5)` summiert zu 0, an anderer Stelle zu Datenmuell. (#1007) |
-| `defer` im inneren Block | 2.2 | Laeuft am **Funktionsende** statt am Blockende. Auf Funktionsebene korrekt. (#1006) |
+| Bindendes Muster | 14 | `case x =>` (jeden Wert annehmen und an den Namen binden) ist **nicht umgesetzt und auch nicht vorgesehen**. Ein blanker Bezeichner ist ein VERWEIS auf eine Konstante, ein Enum-Mitglied oder eine lokale Variable; beide Lesarten zugleich gehen nicht, und auf der Verweis-Lesart beruhen die Enum-Muster. Wer jeden Wert annehmen will, schreibt `case _`. (#1024) |
 | `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
+| `&x` (Adress-Operator) | 15 | Gibt es nicht. Ein Ausgabeparameter wird als Zelle uebergeben (`alloc(8)`, danach `peek64`). (#1061) |
+| Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
+
+Behoben seit der letzten Fassung dieses Abschnitts und daher hier entfallen:
+Fallrumpf als Block und qualifizierte Enum-Muster (#1024), `fn f<T>(...)`
+(#1009), `range(N)` (#1007), `defer` im inneren Block (#1006) samt
+Argument-Zeitpunkt (#1030).
 
 Nicht mehr betroffen: die Bindung von Methodenzeigern (`feld := obj.Method`)
 war bis PR #1005 abgewiesen, weil die Existenzpruefung fuer Feldnamen nur die
