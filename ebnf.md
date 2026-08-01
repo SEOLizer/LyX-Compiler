@@ -1,8 +1,9 @@
-# Lyx 1.0.10A — Canonical EBNF Grammar
+# Lyx 1.0.11A — Canonical EBNF Grammar
 
-> Stand 2026-07-31, gegen lyxc 1.0.10A geprueft. Die Keyword-Liste in
+> Stand 2026-08-01, gegen lyxc 1.0.11A geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
-> Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt.
+> Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
+> und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
 > Bekannte Abweichungen zwischen Grammatik und Compiler stehen in 20.1.
 
 Status: Draft

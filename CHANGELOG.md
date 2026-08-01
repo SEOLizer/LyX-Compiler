@@ -4,6 +4,87 @@
 
 _(noch nichts)_
 
+## Version 1.0.11A (August 2026)
+
+### Compiler (Codegen) — `for i in range(...)` erzeugte gar keinen Code (#1007)
+- Der Parser baut dafür `NK_FOR_RANGE`, sema prüft den Knoten — im x86-Codegen
+  kam er nicht vor und fiel in den stillen Catch-all `// Other statement kinds:
+  skip` am Ende von `cg_genStmt`. Die Schleife lief **null Mal**:
+  `for i in range(5) { s := s + i; }` ließ `s` unverändert.
+- `cg_genForRange` ergänzt, nach dem Vorbild von `cg_genFor`. Einziger
+  inhaltlicher Unterschied: `to` läuft bis **einschließlich** limit, `range` bis
+  stop−1 — der Abbruch prüft `v >= stop` statt `v > limit`.
+
+### Compiler (Codegen) — `|~` (bitweises NOR) emittierte nichts
+- Lexer-Token (`TK_NOR`) und Parser-Präzedenz waren vorhanden, im
+  Binäroperator-Dispatch fehlte der Operator und lieferte **still 0**.
+- Der Catch-all dort bricht jetzt laut ab. Verifiziert, dass kein Operator
+  legitim durchfällt.
+
+### Compiler (Lexer, Codegen) — `match` funktionierte nur mit Literalen ≠ 0 (#1008)
+- Zwei Ursachen, die still zusammenwirkten:
+  1. Die Lexer-Prüfung für `_` stand **innerhalb** des `len == 3`-Blocks und war
+     damit toter Code — `_` hat Länge 1. Der Parser erzeugte statt eines
+     Wildcards ein Bezeichner-Muster namens `_`.
+  2. Der Codegen unterschied Ganzzahl-Literal und Bezeichner an `ival != 0`. Für
+     den vermeintlichen Bezeichner `_` wurde 0 geladen und verglichen —
+     **`case _ =>` traf ausgerechnet nur bei Wert 0**; umgekehrt galt
+     `case 0 =>` als Bezeichner.
+- Unterstrich-Prüfung herausgezogen; unterschieden wird jetzt an der
+  Namenslänge. Bezeichner werden auch über die Konstantentabelle aufgelöst,
+  wodurch Enum-Mitglieder (`case Green =>`) treffen. Ein Bezeichner, der weder
+  Konstante noch lokale Variable benennt, wird gemeldet statt still gegen 0
+  verglichen.
+
+### Sprache — `match` ist jetzt auch ein Ausdruck (#1008)
+- `var r: int64 := match c { case 1 => 10; case _ => 0; };` — bisher war `match`
+  nur eine Anweisung, ein Ergebnis ließ sich nur über Seiteneffekte gewinnen.
+- `cg_genMatch` ließ den Wert des getroffenen Fallrumpfes ohnehin in `rax`;
+  nötig waren `TK_MATCH` in `ParsePrimary`, `SNK_MATCH` in `_checkExpr` und
+  `CGN_MATCH` in `cg_genExpr`. Ohne Treffer und ohne Default ist das Ergebnis
+  jetzt definiert 0.
+
+### sema — Methodenzeiger-Bindung war seit 1.0.10A abgewiesen
+- `_checkFieldExists` (aus der Feldnamen-Prüfung) lief nur über die Felder einer
+  Klasse, nie über ihre Methoden. `btn.on_click := form.Handle` wurde daher als
+  `unknown field 'Handle'` abgelehnt. Die Methodenliste wird jetzt mitgeprüft.
+- Die Regression blieb zwei PRs lang unbemerkt, weil die vier Testsuiten, die
+  sie gefunden hätten, nicht in `make test` liefen.
+
+### Tests — Bestand vollständig zugeordnet (#1004)
+- In `tests/` lagen rund 200 Dateien, die von keinem Make-Ziel aufgerufen
+  wurden. Jetzt sind alle **264** einem Ziel oder einer dokumentierten Liste
+  zugeordnet: `suite-core` (in `make test`), `suite-full` (`make test-lyx`),
+  `suite-lyxos`, `suite-external`, `suite-broken`, `suite-manual`.
+- Der Runner urteilt nach der **Ausgabe**, nicht nach dem Exit-Code: die
+  Konvention ist uneinheitlich (0, 42, und die `edi*`-Familie druckt „ALL PASS"
+  und endet mit Exit 1). Ein Absturz ist immer rot — so kam heraus, dass
+  `edi06_desadv_test` alle Prüfungen besteht und danach segfaultet (#1016).
+- `tests/test_coverage_test.sh` meldet neue Testdateien, die in keinem Ziel
+  stehen.
+
+### Dokumentation — ebnf.md gegen den Compiler geprüft
+- Die Datei trug noch v0.9.5B. 19 reservierte Wörter fehlten, fünf gelistete
+  waren keine; Funktions- und Methodenzeiger fehlten komplett;
+  `QualifiedIdent = Ident "::" Ident` war Fiktion; `SetType` ist nicht
+  implementiert.
+- `Ident` war ohne Unterstrich angegeben, obwohl er überall verwendet wird;
+  `TypeParamClause` mit eckigen statt spitzen Klammern — **danach hatte sich ein
+  Test gerichtet**, der deshalb als „veraltet" fehleingeordnet wurde.
+- Die `match`-Produktion war an drei Stellen falsch: Fallrumpf als `Block`
+  statt `Expr`, fehlender Guard, und ein `default =>`, das es nicht gibt.
+- Neuer Abschnitt 20.1 hält fest, wo der Parser mehr annimmt, als die
+  Werkzeugkette trägt. `tests/ebnf_keywords_test.sh` bindet die Keyword-Liste
+  dauerhaft an den Compiler.
+
+### Aufräumen
+- Vier tote `src/lyxc_*`-Sicherungskopien entfernt (seit Mai unangetastet, in
+  keinem Build-Ziel). Sie verfälschten jede Messung über das Repository — die
+  Zählung der einargumentigen `free`-Aufrufe fiel dadurch zu hoch aus, und beide
+  neuen Testskripte brauchten eine Ausnahmeliste.
+- `examples/io/mmap/main_with_mmap.lyx` entfernt (kaputtes Duplikat). Damit
+  übersetzen alle Beispiele, die übersetzen sollen: 336 von 341.
+
 ## Version 1.0.10A (Juli 2026)
 
 ### Compiler (sema) — unbekannte Feldnamen werden gemeldet (#988)
