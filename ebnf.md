@@ -804,6 +804,14 @@ PipeArgList         = "?" { "," Expr }
 NullCoalesceExpr    = LogicalOrExpr
                       { "??" LogicalOrExpr } ;
 
+(* `&&` und `||` werten KURZ: ist das Ergebnis nach der linken Seite bereits
+   entschieden, wird die rechte gar nicht ausgewertet. Damit traegt das
+   uebliche Null-Guard-Idiom `p != 0 && deref(p)`.
+
+   Bis lyxc 1.0.11A war das nicht so -- beide Seiten wurden ausgewertet und
+   danach verknuepft, wodurch genau dieses Idiom segfaultete. Siehe Issue
+   #1023. Das Ergebnis ist in beiden Faellen 0 oder 1. *)
+
 LogicalOrExpr       = LogicalAndExpr
                       { "||" LogicalAndExpr } ;
 

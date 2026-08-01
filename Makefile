@@ -219,7 +219,10 @@ test: lyxc
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
 	@echo "OK"
-	@echo "--- match: Mustervergleich (9 tests) ---"
+	@echo "--- Kurzschluss von && und || (10 tests) ---"
+	@bash tests/shortcircuit_test.sh
+	@echo "OK"
+	@echo "--- match: Mustervergleich (15 tests) ---"
 	@bash tests/match_patterns_test.sh
 	@echo "OK"
 	@echo "--- Kernsprache (.lyx-Suite) ---"
