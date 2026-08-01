@@ -231,6 +231,9 @@ test: lyxc
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
 	@echo "OK"
+	@echo "--- Builtin-IDs eindeutig vergeben (2 tests) ---"
+	@bash tests/builtin_id_test.sh
+	@echo "OK"
 	@echo "--- Kurzschluss von && und || (10 tests) ---"
 	@bash tests/shortcircuit_test.sh
 	@echo "OK"
