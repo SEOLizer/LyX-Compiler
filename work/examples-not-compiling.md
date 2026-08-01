@@ -1,4 +1,4 @@
-# Nicht kompilierbare Beispiele (Stand 2026-07-31, lyxc 1.0.10A)
+# Nicht kompilierbare Beispiele (Stand 2026-07-31, lyxc 1.0.11A)
 
 **336 von 341 Beispielen übersetzen** (Ausgangslage: 256 von 342).
 

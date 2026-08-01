@@ -1,6 +1,6 @@
 # Testbestand ausserhalb von `make test` (Inventur zu Issue #1004)
 
-Stand 2026-07-31, lyxc 1.0.10A.
+Stand 2026-07-31, lyxc 1.0.11A.
 
 `make test` ruft 20 Prueflaeufe auf. In `tests/` liegen daneben **8 Shell-Tests
 und 193 `.lyx`-Tests**, die dabei nicht angefasst werden. Diese Inventur haelt
