@@ -225,6 +225,9 @@ test: lyxc
 	@echo "--- match: Mustervergleich (15 tests) ---"
 	@bash tests/match_patterns_test.sh
 	@echo "OK"
+	@echo "--- defer an der Blockgrenze (11 tests) ---"
+	@bash tests/defer_block_test.sh
+	@echo "OK"
 	@echo "--- Kernsprache (.lyx-Suite) ---"
 	@bash tests/run_lyx_suite.sh tests/suite-core.txt "Kernsprache"
 	@echo "OK"
