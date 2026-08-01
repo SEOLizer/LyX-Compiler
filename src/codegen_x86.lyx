@@ -443,6 +443,17 @@ pub type Codegen = class {
   // Continue support: linked list of pending jmp-rel32 placeholders for continue
   curContHead: int64;
 
+  // #1030: Argumente eines aufgeschobenen Aufrufs werden bei der VORMERKUNG
+  // ausgewertet und in verdeckte lokale Slots gelegt. dfNodes haelt die
+  // Argumentknoten, dfSlots den zugehoerigen Rahmen-Offset. Beim Emittieren
+  // des Aufrufs am Blockende liefert cg_genExpr fuer diese Knoten den
+  // gespeicherten Wert statt neu auszuwerten.
+  dfNodes:  int64;
+  dfSlots:  int64;
+  dfCount:  int64;
+  dfCap:    int64;
+  dfReplay: int64;   // 1 = wir emittieren gerade einen aufgeschobenen Aufruf
+
   // #1006: Stand des defer-Puffers beim Eintritt in den Rumpf der innersten
   // Schleife. break und continue verlassen den Rumpf, ohne dessen Blockende zu
   // erreichen — sie muessen die dort offenen defers vorher selbst abarbeiten.
@@ -4217,6 +4228,12 @@ pub type Codegen = class {
 
   fn cg_genExpr(ni: int64) {
     if (ni < 0) { self.cg_zeroRax(); return; }
+    // #1030: Beim Emittieren eines aufgeschobenen Aufrufs liefern die
+    // Argumentknoten den bei der Vormerkung gesicherten Wert.
+    if (self.dfReplay != 0) {
+      var dfIdx: int64 := self.cg_deferArgIdx(ni);
+      if (dfIdx >= 0) { self.cg_loadRax(peek64(self.dfSlots + dfIdx * 8)); return; }
+    }
     var k: int64 := self.cg_nkind(ni);
 
     if (k == CGN_MATCH) {
@@ -8756,6 +8773,8 @@ pub type Codegen = class {
       if (self.deferCount < self.deferCap) {
         poke64(self.deferBuf + self.deferCount * 8, self.cg_nc0(ni));
         self.deferCount += 1;
+        // #1030: Argumente JETZT auswerten und sichern.
+        self.cg_captureDeferArgs(self.cg_nc0(ni));
       }
 
     } else {
@@ -8780,9 +8799,49 @@ pub type Codegen = class {
   fn cg_emitDefersDownTo(mark: int64) {
     var i: int64 := self.deferCount - 1;
     while (i >= mark) {
+      var savedReplay: int64 := self.dfReplay;
+      self.dfReplay := 1;                      // #1030
       self.cg_genStmt(peek64(self.deferBuf + i * 8));
+      self.dfReplay := savedReplay;
       i -= 1;
     }
+  }
+
+  // #1030: Argumente des aufgeschobenen Aufrufs an der Stelle des `defer`
+  // auswerten und in verdeckte Slots legen. Ohne das wuerden sie erst am
+  // Blockende ausgewertet — `defer f(i)` in einer Schleife saehe dort das
+  // bereits erhoehte i.
+  fn cg_captureDeferArgs(stmtNi: int64) {
+    if (stmtNi < 0) { return; }
+    var callNi: int64 := stmtNi;
+    if (self.cg_nkind(callNi) == CGN_EXPR_STMT) { callNi := self.cg_nc0(callNi); }
+    if (callNi < 0) { return; }
+    if (self.cg_nkind(callNi) != CGN_CALL) { return; }
+    // Methodenaufruf (iVal==1): Argumente haengen an c1, sonst an c0.
+    var argNi: int64 := self.cg_nc0(callNi);
+    if (self.cg_nival(callNi) == 1) { argNi := self.cg_nc1(callNi); }
+    while (argNi >= 0) {
+      if (self.dfCount >= self.dfCap) { return; }
+      self.cg_genExpr(argNi);
+      var off: int64 := self.cg_addLocal("__dfarg__", 9);
+      self.cg_storeRax(off);
+      poke64(self.dfNodes + self.dfCount * 8, argNi);
+      poke64(self.dfSlots + self.dfCount * 8, off);
+      self.dfCount += 1;
+      argNi := self.cg_nnext(argNi);
+    }
+  }
+
+  // #1030: Index des gesicherten Slots fuer einen Argumentknoten, sonst -1.
+  // Geliefert wird der INDEX, nicht der Offset: Rahmen-Offsets sind rbp-relativ
+  // und damit negativ, ein Offset taugt hier nicht als Trefferkennung.
+  fn cg_deferArgIdx(ni: int64): int64 {
+    var i: int64 := self.dfCount - 1;
+    while (i >= 0) {
+      if (peek64(self.dfNodes + i * 8) == ni) { return i; }
+      i -= 1;
+    }
+    return 0 - 1;
   }
 
   fn cg_genBlock(ni: int64) {
@@ -9943,6 +10002,7 @@ pub type Codegen = class {
     // Funktion gibt es nicht mehr. cg_genBlock arbeitet die defers der
     // aeussersten Ebene am Rumpfende ab, daher hier kein cg_emitDefers.
     self.deferCount := 0;
+    self.dfCount    := 0;       // #1030: Argument-Slots gelten je Funktion
     self.loopDeferMark := -1;   // #1006: ausserhalb jeder Schleife
     self.cg_genBlock(body);
 
@@ -11402,6 +11462,11 @@ pub type Codegen = class {
     self.optLevel           := 2;
 
     // WP-AS-10: defer buffer
+    self.dfCap      := 256;
+    self.dfNodes    := alloc(self.dfCap * 8);
+    self.dfSlots    := alloc(self.dfCap * 8);
+    self.dfCount    := 0;
+    self.dfReplay   := 0;
     self.deferCap   := 64;
     self.deferBuf   := alloc(self.deferCap * 8);
     self.nestedCap   := 64;
