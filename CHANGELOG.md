@@ -4,6 +4,11 @@
 
 _(noch nichts)_
 
+## Version 1.0.11B (August 2026)
+
+- Versionsstand angehoben. Inhaltlich unverändert gegenüber 1.0.11A; die
+  Rubrik nimmt die Änderungen auf, die nach dem Bump auf `develop` landen.
+
 ## Version 1.0.11A (August 2026)
 
 ### Compiler (Codegen) — `for i in range(...)` erzeugte gar keinen Code (#1007)
