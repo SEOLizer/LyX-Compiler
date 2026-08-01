@@ -329,6 +329,15 @@ pub type Sema = class {
   privCap:    int64;
   privEnforce: int64;   // #1035: nur waehrend Pass2 des Wurzelmoduls pruefen
 
+  // #1009: Typparameter der GERADE geprueften generischen Deklaration.
+  // Innerhalb einer Vorlage ist `T` ein gueltiger Typname, auch wenn
+  // ResolveType ihn nicht kennt — der konkrete Typ entsteht erst bei der
+  // Monomorphisierung am Aufrufort.
+  tpNames: int64;
+  tpLens:  int64;
+  tpCount: int64;
+  tpCap:   int64;
+
   // WP-14/2.1: Generic instantiation cache
   // Record layout (64 bytes each):
   //  +0  genNamePtr:8   pointer to generic function name
@@ -2652,6 +2661,43 @@ pub type Sema = class {
     }
   }
 
+  // #1009: Typparameter aus c3 (NK_TYPE_PARAM-Kette) uebernehmen.
+  // Liefert den vorherigen Stand zurueck, damit der Aufrufer ihn nach dem
+  // Pruefen wiederherstellen kann (verschachtelte Funktionen).
+  fn _pushTypeParams(ni: int64): int64 {
+    var saved: int64 := self.tpCount;
+    // Bei `extern fn` traegt c3 den gepackten link-String ((len << 32) | offset),
+    // KEINEN Knotenindex — siehe ParseFuncDecl. Ein sn_kind() darauf liest weit
+    // ausserhalb der Knotenarena und bringt den Compiler zum Absturz.
+    if ((self.sn_iVal(ni) & 1) != 0) { return saved; }
+    var tp: int64 := self.sn_c3(ni);
+    while (tp >= 0 && tp < self.pNodeCount) {
+      if (self.sn_kind(tp) == SNK_TYPE_PARAM && self.tpCount < self.tpCap) {
+        poke64(self.tpNames + self.tpCount * 8, self.sn_sVal(tp) as int64);
+        poke64(self.tpLens  + self.tpCount * 8, self.sn_sLen(tp));
+        self.tpCount += 1;
+      }
+      tp := self.sn_next(tp);
+    }
+    return saved;
+  }
+
+  // #1009: Benennt dieser Typknoten einen aktiven Typparameter?
+  fn _isTypeParamRef(typeNi: int64): int64 {
+    if (typeNi < 0) { return 0; }
+    if (self.sn_kind(typeNi) != SNK_TYPE_NAME) { return 0; }
+    var nm: pchar := self.sn_sVal(typeNi);
+    var nl: int64 := self.sn_sLen(typeNi);
+    var i: int64 := 0;
+    while (i < self.tpCount) {
+      var pn: pchar := peek64(self.tpNames + i * 8) as pchar;
+      var pl: int64 := peek64(self.tpLens + i * 8);
+      if (self._strNEq(pn, pl, nm, nl)) { return 1; }
+      i += 1;
+    }
+    return 0;
+  }
+
   fn _checkFuncDecl(ni: int64) {
     self._pushScope();
 
@@ -2688,12 +2734,20 @@ pub type Sema = class {
     var funcName: pchar := self.sn_sVal(ni);
     var funcNameLen: int64 := self.sn_sLen(ni);
 
+    // #1009: Typparameter dieser Deklaration bekannt machen. Ohne das meldete
+    // sema fuer `fn max<T>(a: T, b: T): T` "unknown param type" — der Parser
+    // legt die Parameter in c3 ab, _checkFuncDecl las den Slot aber nie.
+    // ACHTUNG: bei `extern fn` traegt c3 den link-String, nicht Typparameter
+    // (siehe Kommentar in ParseFuncDecl) — _pushTypeParams laeuft deshalb nur
+    // ueber Knoten der Art SNK_TYPE_PARAM und ignoriert alles andere.
+    var savedTp: int64 := self._pushTypeParams(ni);
+
     // Register parameters (c0 = first param, sn_next-linked)
     var param: int64 := self.sn_c0(ni);
     while (param >= 0) {
       var typeNi: int64 := self.sn_c0(param);
       var tid:    int64 := self.ResolveType(typeNi);
-      if (tid == TY_UNKNOWN) {
+      if (tid == TY_UNKNOWN && self._isTypeParamRef(typeNi) == 0) {
         self._errorNode("unknown param type", param);
       }
       self._logReason("param"c, param, tid);
@@ -2705,7 +2759,7 @@ pub type Sema = class {
     var retNi: int64 := self.sn_c1(ni);
     if (retNi >= 0) {
       var retTid: int64 := self.ResolveType(retNi);
-      if (retTid == TY_UNKNOWN) {
+      if (retTid == TY_UNKNOWN && self._isTypeParamRef(retNi) == 0) {
         self._errorNodeName("unknown return type", ni, self.sn_sVal(retNi), self.sn_sLen(retNi));
       }
       self._logReason("return-type"c, ni, retTid);
@@ -2720,6 +2774,8 @@ pub type Sema = class {
       // WP-AS-15: DAA — check after body so locals are known
       if (self.daaEnabled != 0) { self._daaBlock(body, 0); }
     }
+    // #1009: Typparameter gelten nur innerhalb dieser Deklaration.
+    self.tpCount := savedTp;
 
     self._popScope();
   }
@@ -4257,6 +4313,10 @@ pub type Sema = class {
     self.expSymCount := 0;
     self.expScanned  := 0;
     self.privEnforce := 0;
+    self.tpCap   := 32;
+    self.tpNames := alloc(self.tpCap * 8);
+    self.tpLens  := alloc(self.tpCap * 8);
+    self.tpCount := 0;
     self.privCap    := 16384;
     self.privFlags  := alloc(self.privCap);
     self.privModPtr := alloc(self.privCap * 8);
