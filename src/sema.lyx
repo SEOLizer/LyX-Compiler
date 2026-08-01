@@ -320,6 +320,14 @@ pub type Sema = class {
   // Modul) eingetragen. Ohne diese Marke meldete der aeussere Durchlauf sie
   // ein zweites Mal -- als Kollision mit sich selbst.
   expScanned:   int64;
+  // #1035: Sichtbarkeit importierter Symbole. privFlags[i] != 0 bedeutet: das
+  // Symbol stammt aus einem Import und traegt dort KEIN pub. privMod* haelt den
+  // Modulnamen fuer die Meldung.
+  privFlags:  int64;
+  privModPtr: int64;
+  privModLen: int64;
+  privCap:    int64;
+  privEnforce: int64;   // #1035: nur waehrend Pass2 des Wurzelmoduls pruefen
 
   // WP-14/2.1: Generic instantiation cache
   // Record layout (64 bytes each):
@@ -519,11 +527,32 @@ pub type Sema = class {
   // Lookup by name pointer + length; returns symbol index or -1
   fn Lookup(name: pchar, nameLen: int64): int64 {
     var i: int64 := self.symCount - 1;
+    var privHit: int64 := 0 - 1;   // #1035: erster Treffer, der unit-privat ist
     while (i >= 0) {
       var sName: pchar  := self.SymName(i);
       var sLen:  int64  := self.SymNameLen(i);
-      if (self._strNEq(sName, sLen, name, nameLen)) { return i; }
+      if (self._strNEq(sName, sLen, name, nameLen)) {
+        // #1035: Ein importiertes Symbol OHNE pub ist unit-intern und fuer den
+        // Importeur nicht sichtbar. Es wird uebersprungen, die Suche laeuft
+        // weiter — damit bindet `import std.alloc; alloc(16)` an die oeffentliche
+        // Fassung, auch wenn eine gleichnamige private aus einem anderen Import
+        // spaeter in der flachen Tabelle steht. Erst wenn es GAR keine
+        // oeffentliche Fassung gibt, wird gemeldet.
+        if (self.privEnforce != 0 && i < self.privCap && peek8(self.privFlags + i) != 0) {
+          if (privHit < 0) { privHit := i; }
+          i -= 1;
+          continue;
+        }
+        return i;
+      }
       i -= 1;
+    }
+    // #1035: nur ein privater Treffer, keine oeffentliche Fassung — melden.
+    if (privHit >= 0) {
+      if (peek8(self.privFlags + privHit) == 1) {
+        self._reportPrivateAccess(privHit, self.SymName(privHit), self.SymNameLen(privHit));
+      }
+      return privHit;
     }
     return -1;
   }
@@ -921,6 +950,21 @@ pub type Sema = class {
         // ni < 0: Builtin oder kein einsehbarer Knoten — nicht entscheidbar,
         // also nicht melden (fail-open, wie bei jeder Pruefung ueber
         // Typdeklarationen).
+        // #1035: importiertes Symbol OHNE pub vormerken. Ausgenommen sind
+        // `extern fn` (iVal Bit0): eine FFI-Bindung ist eine Link-Zeit-Zusage
+        // und der eigentliche Zweck solcher Units — std/audio/alsa.lyx traegt
+        // an keiner ihrer snd_pcm_*-Deklarationen ein pub, bietet sie aber
+        // genau dafuer an. Sie als privat zu behandeln wuerde jede FFI-Unit
+        // unbrauchbar machen.
+        if (ni >= 0 && peek64(self.sn_off(ni) + NODE_OFF_ISPUB) == 0) {
+          var isExternFn: int64 := 0;
+          if (self.sn_kind(ni) == SNK_FUNC_DECL && (self.sn_iVal(ni) & 1) != 0) { isExternFn := 1; }
+          if (isExternFn == 0 && i < self.privCap) {
+            poke8(self.privFlags + i, 1);
+            poke64(self.privModPtr + i * 8, modName as int64);
+            poke64(self.privModLen + i * 8, modLen);
+          }
+        }
         if (ni >= 0 && peek64(self.sn_off(ni) + NODE_OFF_ISPUB) != 0) {
           var nm:  pchar := self.SymName(i);
           var nl:  int64 := self.SymNameLen(i);
@@ -950,6 +994,21 @@ pub type Sema = class {
     EPrintStrLn("'"c);
     EPrintStrLn("  Beide Units sind importiert; welche gebunden wird, entschiede allein die Import-Reihenfolge."c);
     EPrintStrLn("  Abhilfe: nur eine der beiden Units importieren oder eines der Symbole umbenennen."c);
+    self.hadError   := 1;
+    self.errorCount += 1;
+  }
+
+  // #1035: Zugriff auf ein importiertes Symbol, das in seiner Unit kein pub
+  // traegt. Gemeldet wird einmal je Symbol (privFlags wird auf 2 gesetzt).
+  fn _reportPrivateAccess(symIdx: int64, symName: pchar, symLen: int64) {
+    EPrintStr("sema error: '"c);
+    sys_write(2, symName as int64, symLen);
+    EPrintStr("' ist in Unit '"c);
+    sys_write(2, peek64(self.privModPtr + symIdx * 8), peek64(self.privModLen + symIdx * 8));
+    EPrintStrLn("' nicht pub"c);
+    EPrintStrLn("  Ohne pub ist eine Deklaration unit-intern und kein Angebot an den Aufrufer."c);
+    EPrintStrLn("  Abhilfe: in der Unit ein pub davorsetzen, wenn sie zur Schnittstelle gehoert."c);
+    poke8(self.privFlags + symIdx, 2);
     self.hadError   := 1;
     self.errorCount += 1;
   }
@@ -4197,6 +4256,13 @@ pub type Sema = class {
     self.expSyms     := alloc(self.expSymCap * 32);
     self.expSymCount := 0;
     self.expScanned  := 0;
+    self.privEnforce := 0;
+    self.privCap    := 16384;
+    self.privFlags  := alloc(self.privCap);
+    self.privModPtr := alloc(self.privCap * 8);
+    self.privModLen := alloc(self.privCap * 8);
+    var pz: int64 := 0;
+    while (pz < self.privCap) { poke8(self.privFlags + pz, 0); pz := pz + 1; }
 
     // WP-14: generic instantiation cache
     self.instCap   := 64;
@@ -4273,7 +4339,12 @@ pub type Sema = class {
 
     self.Pass1(head);
     self.globalSymCount := self.symCount;   // ab hier: Funktions-lokale Symbole
+    // #1035: Die Sichtbarkeitspruefung gilt fuer das WURZELMODUL. Waehrend Pass1
+    // laufen auch die Bodies importierter Units durch Lookup — deren Zugriffe auf
+    // die eigenen privaten Symbole sind voellig legitim und duerfen nicht melden.
+    self.privEnforce := 1;
     self.Pass2(head);
+    self.privEnforce := 0;
     self._checkCapabilityInheritance(head);  // WP-L3
     self._buildCapGraph(head, "<root>"c, 6); // WP-L4
     self.capStripper.PrintReport();          // WP-L6: Pruning-Report

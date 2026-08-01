@@ -7,7 +7,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 mkdir -p "$TMP/widgets"
 cat > "$TMP/widgets/vui.lyx" <<'EOF'
-type TControl = class { x: int64; };
+pub type TControl = class { x: int64; };
 pub type TNotifyMethod = method(TControl): int64;
 pub type TButton = class extends TControl { on_click: TNotifyMethod; };
 EOF
