@@ -180,6 +180,7 @@ test: lyxc
 	@bash tests/deflate_single_source_test.sh
 	@bash tests/brotli_compress_test.sh
 	@bash tests/brotli_decode_test.sh
+	@bash tests/match_guard_test.sh
 	@echo "OK"
 	@echo "--- Verschachtelte Funktionen (8 Prüfungen) ---"
 	./lyxc --std-path=std tests/nested_fn_test.lyx -o /tmp/lyxc_nfn_test

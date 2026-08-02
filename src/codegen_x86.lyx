@@ -9775,9 +9775,40 @@ pub type Codegen = class {
         poke32(self.code + jmpNextCase, self.codeLen - jmpNextCase - 4);
         if (guardFailPos >= 0) { poke32(self.code + guardFailPos, self.codeLen - guardFailPos - 4); }
 
-      // Wildcard pattern - treat as default
+      // `case _ =>` trifft immer.
+      //
+      // OHNE Guard ist das der Default-Fall: er wird ans Ende gestellt, damit
+      // die konkreten Faelle zuerst geprueft werden. (Frueher fiel der
+      // Wildcard in den Vergleichszweig unten, wo sein ival 0 gegen den Wert
+      // verglichen wurde -- `case _` traf damit ausgerechnet nur bei 0,
+      // Issue #1008.)
+      //
+      // MIT Guard darf er das NICHT. #1080: Ein bedingter Arm ist kein
+      // Default; er gehoert an SEINE Stelle in der Reihenfolge, sonst
+      // verliert er gegen spaetere Faelle. Zudem gibt es nur EINEN
+      // defaultCaseNode -- ein zweiter Wildcard ueberschrieb den ersten
+      // stillschweigend, und genau das liess `case _ if <cond>` nie treffen,
+      // sobald ein `case _` folgte. Beides ohne Fehlermeldung.
       } else if (patKind == CGN_PATTERN_WILD) {
-        defaultCaseNode := caseCur;
+        if (guardNode >= 0) {
+          // Bedingter Wildcard: an Ort und Stelle auswerten wie ein normaler
+          // Fall, dessen Muster immer passt.
+          self.cg_genExpr(guardNode);
+          self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
+          self.cg_e8(0x0F); self.cg_e8(0x84);                       // jz next_case
+          var wildGuardFail: int64 := self.codeLen;
+          self.cg_e32(0);
+          self.cg_genMatchBody(bodyNode);
+          self.cg_e8(0xE9);
+          var bpWG: int64 := self.codeLen;
+          self.cg_e32(self.curBreakHead);
+          self.curBreakHead := bpWG;
+          poke32(self.code + wildGuardFail, self.codeLen - wildGuardFail - 4);
+        } else {
+          // Der ERSTE unbedingte Wildcard gewinnt; alles danach ist
+          // unerreichbar und darf ihn nicht verdraengen.
+          if (defaultCaseNode == -1) { defaultCaseNode := caseCur; }
+        }
       } else if (patKind == CGN_PATTERN_STRUCT) {
         // WP-15: Struct destructure pattern: Point { x: patX, y: patY }
         // sval = struct type name, c0 = first field pattern (NK_PATTERN_BIND)
@@ -9936,15 +9967,6 @@ pub type Codegen = class {
           // Unknown variant — treat as wildcard/default
           defaultCaseNode := caseCur;
         }
-      } else if (patKind == CGN_PATTERN_WILD) {
-        // `case _ =>` trifft immer und wird als Default-Fall hinten angehaengt.
-        //
-        // Bisher fiel der Wildcard in den Vergleichszweig unten. Dort ist sein
-        // ival 0 und sein Name leer, er wurde also gegen die Konstante 0
-        // verglichen -- `case _` traf damit ausgerechnet nur dann, wenn der
-        // Wert 0 war (Issue #1008).
-        defaultCaseNode := caseCur;
-
       } else {
         // Load subject value, compare with pattern
         self.cg_loadRax(matchOff);
