@@ -1588,6 +1588,70 @@ pub type Sema = class {
     free(loBox, 8); free(hiBox, 8); free(vBox, 8);
   }
 
+  // #1156: Feste Groesse einer indizierten Variablen ermitteln.
+  //
+  // Zwei Schreibweisen tragen die Groesse zur Uebersetzungszeit:
+  //   var a: int64[3];        -> Typknoten NK_TYPE_ARRAY_FIXED, c1 = Literal
+  //   var a := [1, 2, 3];     -> Initialisierung ist ein Array-Literal
+  // Alles andere (dynamische Arrays, Zeiger, Parameter) ist hier nicht
+  // entscheidbar. Rueckgabe 0 heisst deshalb "unbekannt", nicht "Groesse 0" —
+  // wer das verwechselt, meldet jeden Zeigerzugriff als Bereichsfehler.
+  fn _fixedArraySize(baseNi: int64): int64 {
+    if (baseNi < 0) { return 0; }
+    if (self.sn_kind(baseNi) != SNK_IDENT) { return 0; }
+    var si: int64 := self.Lookup(self.sn_sVal(baseNi), self.sn_sLen(baseNi));
+    if (si < 0) { return 0; }
+    if (self.SymKind(si) != SYM_VAR) { return 0; }
+    var declNi: int64 := self.SymNodeIdx(si);
+    // Importiert oder ohne Deklarationsknoten: unentscheidbar.
+    if (declNi < 0) { return 0; }
+    if (self.sn_kind(declNi) != SNK_VAR_DECL) { return 0; }
+
+    var typeNi: int64 := self.sn_c0(declNi);
+    if (typeNi >= 0 && self.sn_kind(typeNi) == 101) {
+      var sizeNi: int64 := self.sn_c1(typeNi);
+      var sBox: int64 := alloc(8);
+      var got:  int64 := self._constIntOf(sizeNi, sBox);
+      var sz:   int64 := 0;
+      if (got != 0) { sz := peek64(sBox); }
+      free(sBox, 8);
+      if (sz > 0) { return sz; }
+      return 0;
+    }
+
+    var initNi: int64 := self.sn_c1(declNi);
+    if (initNi >= 0 && self.sn_kind(initNi) == 100) {
+      var cnt: int64 := 0;
+      var el:  int64 := self.sn_c0(initNi);
+      while (el >= 0) { cnt := cnt + 1; el := self.sn_next(el); }
+      return cnt;
+    }
+    return 0;
+  }
+
+  // #1156: `arr[5]` bei `int64[3]` ist zur Uebersetzungszeit entscheidbar.
+  //
+  // Bis 1.0.11D las so ein Zugriff kommentarlos den Speicher hinter dem Array;
+  // der gelesene Wert war Stack-Muell. Weder sema noch der Codegen sagten
+  // etwas — auch nicht unter --runtime-checks, das Bereichspruefungen
+  // ausdruecklich verspricht.
+  //
+  // Geprueft wird nur, was hier sicher entscheidbar ist: konstanter Index auf
+  // eine Variable mit fester Groesse. Der Rest gehoert in die Laufzeitpruefung
+  // des Codegens.
+  fn _checkIndexBounds(ni: int64): void {
+    var sz: int64 := self._fixedArraySize(self.sn_c0(ni));
+    if (sz <= 0) { return; }
+    var iBox: int64 := alloc(8);
+    if (self._constIntOf(self.sn_c1(ni), iBox) != 0) {
+      var idx: int64 := peek64(iBox);
+      if (idx < 0 || idx >= sz) {
+        self._errorNode("Index liegt ausserhalb des Arrays", ni);
+      }
+    }
+    free(iBox, 8);
+  }
+
   // #1087: Benannte Argumente `F(b: 3, a: 10)`.
   //
   // Der Parser legt sie als NK_NAMED_ARG ab (sVal = Name, c0 = Wert), danach
@@ -1972,6 +2036,7 @@ pub type Sema = class {
     } else if (k == SNK_INDEX) {
       self._checkExpr(self.sn_c0(ni));
       self._checkExpr(self.sn_c1(ni));
+      self._checkIndexBounds(ni);   // #1156
 
     } else if (k == SNK_MATCH) {
       // match als Ausdruck: dieselbe Pruefung wie in Anweisungsposition.

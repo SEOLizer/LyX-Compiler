@@ -253,6 +253,9 @@ test: lyxc
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
 	@echo "OK"
+	@echo "--- Array-Bereichspruefung (12 Pruefungen) ---"
+	@bash tests/bounds_check_test.sh
+	@echo "OK"
 	@echo "--- TextMate-Grammatik: Schluesselwoerter und Typen vollstaendig ---"
 	@bash tests/syntax/test_grammar.sh
 	@echo "OK"
