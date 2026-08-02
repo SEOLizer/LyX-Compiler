@@ -3,12 +3,12 @@
 //
 // Thread creation:  sys_clone(CLONE_VM|...) — shares address space.
 //                   Child calls the function via _indirect_call_1(func, arg).
-// Thread join:      CLONE_CHILD_CLEARTID: kernel zeroes tidSlot and wakes futex
-//                   when the thread exits.
-// Mutex:            futex-based spin+sleep; 32-bit word at mutex.ptr (mmap'd).
+// Thread join:      CLONE_PARENT_SETTID schreibt die TID synchron, bevor clone
+//                   zurueckkehrt; CLONE_CHILD_CLEARTID nullt denselben Slot beim
+//                   Thread-Ende und weckt den futex.
+// Mutex:            futex-basiert, Zustandswechsel per atomic_cas/xchg.
 // Condition var:    futex on a sequence counter at cond.ptr (mmap'd).
-// Atomics:          best-effort (no lock cmpxchg builtin yet; race window tiny
-//                   on x86-64 due to naturally atomic aligned 64-bit stores).
+// Atomics:          echte lock-Instruktionen ueber die atomic_*-Builtins.
 // TLS:              global mmap table, tid → slot → key values (Option A).
 
 @description("Thread creation and synchronization via clone(2) + futex(2)")
@@ -28,9 +28,17 @@ con CLONE_THREAD:         int64 := 65536;
 con CLONE_SYSVSEM:        int64 := 262144;
 con CLONE_CHILD_SETTID:   int64 := 16777216;
 con CLONE_CHILD_CLEARTID: int64 := 2097152;
+con CLONE_PARENT_SETTID:  int64 := 1048576;
 
-// THREAD_FLAGS = VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTID|CLEARTID
-con THREAD_FLAGS: int64 := 19205888;
+// THREAD_FLAGS = VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|CHILD_CLEARTID
+//
+// PARENT_SETTID statt CHILD_SETTID: CHILD_SETTID schreibt die TID erst, wenn der
+// Kindthread zum ersten Mal laeuft. Der Elternprozess las den Slot direkt nach
+// clone und fand dort noch die 0, mit der er ihn selbst vorbelegt hatte --
+// ThreadJoin hielt den Thread damit fuer bereits beendet, kehrte sofort zurueck
+// und gab den TID-Slot frei, waehrend der Kindthread gerade erst startete.
+// PARENT_SETTID schreibt die TID synchron, bevor clone zurueckkehrt.
+con THREAD_FLAGS: int64 := 3477248;
 
 con THREAD_STACK_SIZE: int64 := 2097152;  // 2 MB per thread
 
@@ -65,6 +73,7 @@ con FUTEX_WAKE_ALL: int64 := 2147483647;  // INT_MAX
 pub type Thread = struct {
   handle: int64;   // ptr to mmap'd 32-bit TID slot; 0 = invalid
   tid:    int64;   // TID as returned by clone() in parent
+  stack:  int64;   // Basis des Kind-Stacks; von ThreadJoin freigegeben
 };
 
 // Mutex: futex on a mmap'd 32-bit word.
@@ -97,37 +106,101 @@ pub type Atomic = struct {
 // Thread creation and management
 // ============================================================================
 
+// Handoff-Block fuer die Uebergabe an den Kindthread:
+//   [0] func   [8] arg   [16] uebernommen-Flag   [24] Spawn-Lock
+//
+// clone(2) setzt im Kind nur RSP, RBP bleibt unveraendert -- der Kindthread
+// sieht also zunaechst den Frame des Elternteils. Die fruehere Fassung nutzte
+// das aus und las 'func' und 'arg' direkt daraus. Das ist ueber die MAPPING-
+// Frage hinaus falsch: CLONE_VM garantiert den geteilten Adressraum, nicht die
+// LEBENSDAUER des Frames. Sobald ThreadCreate zurueckkehrte, wurde genau dieser
+// Speicher wiederverwendet -- schon ein direkt folgendes ThreadJoin genuegte --
+// und der Kindthread sprang auf einen ueberschriebenen Funktionszeiger.
+// Ohne Frame-Wiederverwendung lief es zufaellig durch, mit Join segfaultete es.
+//
+// Jetzt liegen func und arg in diesem Heap-Block, und der Kindthread springt
+// zuerst in _thrTrampoline: dessen Prologue legt einen eigenen Frame auf dem
+// KIND-Stack an, ab da sind Locals dort sicher. Der Elternteil kehrt erst
+// zurueck, wenn der Kindthread die Werte uebernommen hat.
+pub var _thrCtl: int64;
+
+fn _thrCtlEnsure(): int64 {
+  if (_thrCtl == 0) { _thrCtl := alloc(32); }
+  return _thrCtl;
+}
+
+// Laeuft bereits mit eigenem Frame auf dem Kind-Stack.
+fn _thrTrampoline(unused: int64): int64 {
+  var c: int64 := _thrCtl;
+  var f: int64 := peek64(c);
+  var g: int64 := peek64(c + 8);
+  var taken: int64 := atomic_store(c + 16, 1);   // Elternteil freigeben
+  _indirect_call_1(f, g);
+  return 0;
+}
+
 // ThreadCreate: spawns a new thread that calls func(arg).
 // Returns a Thread; handle == 0 on allocation failure.
-// RBP remains unchanged by clone(2), so 'func' and 'arg' (stored as
-// RBP-relative locals by the Lyx codegen) are readable in the child too
-// because CLONE_VM guarantees a shared address space.
 pub fn ThreadCreate(func: int64, arg: int64): Thread {
   var t: Thread;
   t.handle := 0;
   t.tid    := 0;
+  t.stack  := 0;
+
+  var ctl: int64 := _thrCtlEnsure();
+  if (ctl == 0) { return t; }
+
+  // Spawns serialisieren: der Handoff-Block ist prozessweit einer.
+  while (atomic_cas(ctl + 24, 0, 1) != 0) { }
+  poke64(ctl, func);
+  poke64(ctl + 8, arg);
+  var resetTaken: int64 := atomic_store(ctl + 16, 0);
 
   var childStack: int64 := alloc(THREAD_STACK_SIZE);
-  if (childStack == 0) { return t; }
+  if (childStack == 0) {
+    var ul1: int64 := atomic_store(ctl + 24, 0);
+    return t;
+  }
 
   // TID slot: kernel writes the TID here on start and zeroes it on exit.
   var tidSlot: int64 := alloc(8);
-  if (tidSlot == 0) { free(childStack, THREAD_STACK_SIZE); return t; }
+  if (tidSlot == 0) {
+    free(childStack, THREAD_STACK_SIZE);
+    var ul2: int64 := atomic_store(ctl + 24, 0);
+    return t;
+  }
   poke32(tidSlot, 0);
 
   var stackTop: int64 := childStack + THREAD_STACK_SIZE;
 
-  // sys_clone(flags, stack_top, parent_tidptr=0, child_tidptr=tidSlot, tls=0)
-  var tid: int64 := sys_clone(THREAD_FLAGS, stackTop, 0, tidSlot, 0);
+  // sys_clone(flags, stack_top, parent_tidptr, child_tidptr, tls=0)
+  // tidSlot dient beidem: PARENT_SETTID schreibt die TID synchron hinein,
+  // CHILD_CLEARTID nullt ihn beim Thread-Ende und weckt den futex.
+  var tid: int64 := sys_clone(THREAD_FLAGS, stackTop, tidSlot, tidSlot, 0);
 
   if (tid == 0) {
-    // Child thread: func and arg accessible via RBP (shared VM).
-    _indirect_call_1(func, arg);
-    exit(0);  // syscall 60 — exits this thread only
+    // Kind: NUR Konstanten verwenden -- kein Zugriff auf Frame-Locals, deren
+    // Lebensdauer hier nicht garantiert ist. _thrTrampoline holt func und arg
+    // aus dem Handoff-Block, sobald es einen eigenen Frame hat.
+    _indirect_call_1(_thrTrampoline, 0);
+    exit(0);  // syscall 60 — beendet nur diesen Thread
   }
+
+  if (tid < 0) {
+    free(tidSlot, 8);
+    free(childStack, THREAD_STACK_SIZE);
+    var ul3: int64 := atomic_store(ctl + 24, 0);
+    return t;
+  }
+
+  // Warten, bis der Kindthread func und arg uebernommen hat -- erst danach darf
+  // der Handoff-Block neu belegt und dieser Frame aufgegeben werden.
+  while (atomic_load(ctl + 16) == 0) { }
+  var ul4: int64 := atomic_store(ctl + 24, 0);
 
   t.handle := tidSlot;
   t.tid    := tid;
+  t.stack  := childStack;
   return t;
 }
 
@@ -154,6 +227,26 @@ pub fn ThreadJoin(t: Thread): void {
     cur := peek32(t.handle);
   }
   free(t.handle, 8);
+
+  // Kind-Stack freigeben. Sicher genau ab hier: den TID-Slot nullt und den
+  // futex weckt der Kernel in mm_release() waehrend do_exit() -- zu diesem
+  // Zeitpunkt fuehrt der Thread keinen Nutzercode mehr aus, er laeuft nur noch
+  // auf seinem Kernel-Stack. Wer die Schleife oben verlassen hat, weiss also,
+  // dass dieser Speicher nicht mehr benutzt wird. musl macht es in
+  // pthread_join genauso.
+  //
+  // Ohne die Freigabe leckte jeder verbundene Thread THREAD_STACK_SIZE
+  // (2 MB): unter `ulimit -v 1048576` scheiterte ThreadCreate reproduzierbar
+  // beim 509. Thread.
+  //
+  // Hier steht bewusst munmap und nicht free: `free` ist im Compiler als
+  // Builtin registriert, das NICHTS tut ("no-op in bootstrap ... leaks are
+  // acceptable", src/codegen_x86.lyx). Dieses Builtin verdeckt das free aus
+  // std/alloc.lyx, das eigentlich munmap aufruft -- mit free bliebe der Stack
+  // also liegen. Gemessen: 1000x alloc(2 MB)+free(2 MB) scheitert unter
+  // `ulimit -v 262144` beim 127. Durchlauf, dieselbe Schleife mit munmap
+  // laeuft durch.
+  if (t.stack != 0) { munmap(t.stack, THREAD_STACK_SIZE); }
 }
 
 // ============================================================================
@@ -175,29 +268,27 @@ pub fn MutexFree(m: Mutex): void {
 }
 
 // MutexLock: acquires the mutex, sleeping via futex when contended.
+//
+// Zustaende: 0 = frei, 1 = gehalten, 2 = gehalten mit Wartenden.
+// Die fruehere Fassung las den Zustand mit peek32 und schrieb ihn mit poke32 --
+// zwei Threads konnten beide die 0 sehen und beide "gewinnen". Jetzt wird der
+// Uebergang 0 -> 1 mit einem einzigen atomic_cas gemacht; im umkaempften Fall
+// setzt ein atomic_store (xchg) auf 2 und liefert zugleich den alten Wert.
 pub fn MutexLock(m: Mutex): void {
   if (m.ptr == 0) { return; }
-  var spins: int64 := 0;
-  while (1 == 1) {
-    if (peek32(m.ptr) == 0) {
-      poke32(m.ptr, 1);
-      return;
-    }
-    spins += 1;
-    if (spins >= 64) {
-      poke32(m.ptr, 2);  // mark: has waiters
-      sys_futex(m.ptr, FUTEX_WAIT, 2, 0, 0, 0);
-      spins := 0;
-    }
+  // Schneller Pfad: unbestritten frei
+  if (atomic_cas(m.ptr, 0, 1) == 0) { return; }
+  // Umkaempft: auf 2 setzen und schlafen, bis der alte Wert 0 war
+  while (atomic_store(m.ptr, 2) != 0) {
+    sys_futex(m.ptr, FUTEX_WAIT, 2, 0, 0, 0);
   }
 }
 
 // MutexUnlock: releases the mutex and wakes one waiter if any.
 pub fn MutexUnlock(m: Mutex): void {
   if (m.ptr == 0) { return; }
-  var old: int64 := peek32(m.ptr);
-  poke32(m.ptr, 0);
-  if (old == 2) {
+  // Freigeben und alten Zustand in einem Schritt lesen: nur bei 2 gab es Warter.
+  if (atomic_store(m.ptr, 0) == 2) {
     sys_futex(m.ptr, FUTEX_WAKE, 1, 0, 0, 0);
   }
 }
@@ -205,7 +296,7 @@ pub fn MutexUnlock(m: Mutex): void {
 // MutexTryLock: non-blocking attempt.  Returns 1 on success, 0 if busy.
 pub fn MutexTryLock(m: Mutex): int64 {
   if (m.ptr == 0) { return 0; }
-  if (peek32(m.ptr) == 0) { poke32(m.ptr, 1); return 1; }
+  if (atomic_cas(m.ptr, 0, 1) == 0) { return 1; }
   return 0;
 }
 
@@ -267,10 +358,15 @@ pub fn SharedMemFree(mem: SharedMem): void {
 // ============================================================================
 // Atomic operations
 // Note: peek64/poke64 on naturally aligned addresses are single-bus-cycle
-// on x86-64, giving de-facto atomicity for plain loads/stores.  For
-// read-modify-write (AtomicAdd, CAS) a tiny race window exists because
-// Lyx does not yet expose a lock-cmpxchg builtin.  Guard RMW sequences
-// that require strict sequential consistency with a Mutex.
+// Alle Operationen laufen ueber die atomic_*-Builtins und sind damit echt
+// atomar (lock xadd / lock cmpxchg / xchg auf x86-64).
+//
+// Frueher war das nicht so: AtomicAdd und CAS lasen mit peek64 und schrieben
+// mit poke64, waren also trotz des Namens ein Read-Modify-Write mit Rennen --
+// zwei Threads konnten denselben Ausgangswert lesen und einer der beiden
+// Zuwaechse ging verloren. Der Kommentar an dieser Stelle wies auf das Rennen
+// hin und nannte als Grund, Lyx biete kein lock-cmpxchg; seit die
+// atomic_*-Builtins auch im ELF-Codegen emittiert werden, gilt das nicht mehr.
 // ============================================================================
 
 pub fn AtomicNew(initial: int64): Atomic {
@@ -286,26 +382,27 @@ pub fn AtomicFree(a: Atomic): void {
 
 pub fn AtomicLoad(a: Atomic): int64 {
   if (a.ptr == 0) { return 0; }
-  return peek64(a.ptr);
+  return atomic_load(a.ptr);
 }
 
 pub fn AtomicStore(a: Atomic, val: int64): void {
   if (a.ptr == 0) { return; }
-  poke64(a.ptr, val);
+  // atomic_store liefert den alten Wert; hier nicht gebraucht.
+  var prev: int64 := atomic_store(a.ptr, val);
 }
 
-// AtomicAdd: adds delta, returns new value.
+// AtomicAdd: addiert delta und liefert den NEUEN Wert (unveraenderter Vertrag).
+// atomic_fetch_add liefert den alten Wert, daher delta addieren.
 pub fn AtomicAdd(a: Atomic, delta: int64): int64 {
   if (a.ptr == 0) { return 0; }
-  var v: int64 := peek64(a.ptr) + delta;
-  poke64(a.ptr, v);
-  return v;
+  return atomic_fetch_add(a.ptr, delta) + delta;
 }
 
-// CAS: returns 1 on success, 0 if current value != expected.
+// CAS: liefert 1 bei Erfolg, 0 wenn der aktuelle Wert nicht expected war.
+// atomic_cas liefert den alten Wert; Erfolg heisst "alter Wert == expected".
 pub fn CAS(a: Atomic, expected: int64, newVal: int64): int64 {
   if (a.ptr == 0) { return 0; }
-  if (peek64(a.ptr) == expected) { poke64(a.ptr, newVal); return 1; }
+  if (atomic_cas(a.ptr, expected, newVal) == expected) { return 1; }
   return 0;
 }
 

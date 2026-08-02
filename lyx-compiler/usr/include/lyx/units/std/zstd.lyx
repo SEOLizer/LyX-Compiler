@@ -1,4 +1,83 @@
-// std/zstd.lyx — Zstd-Dekompressor (RFC 8878) + Store-Modus-Kompressor
+// std/zstd.lyx — Zstandard (RFC 8878)
+//
+// STAND: Dekodierung vollstaendig fuer alles, was tests/zstd_measure.sh
+// abdeckt — Stufen -1/-3/-9/-19 ueber Mischtext, Bytewiederholung,
+// Wiederholmuster und Zufallsdaten von 20 Byte bis 400 kB, mit und ohne
+// Content_Checksum, ein- und mehrblockig. 75 von 75 Frames korrekt, keiner
+// still falsch, keiner abgestuerzt. Verfaelschte, abgeschnittene und
+// Woerterbuch-Frames werden gemeldet.
+//
+// KOMPRIMIERUNG (#1069): echte Compressed Blocks -- Raw-Literale plus
+// LZ77-Sequenzen ueber die vordefinierten FSE-Tabellen, dazu RLE-Bloecke fuer
+// Bytewiederholungen und der Rohblock als Ausweg, wenn sich nichts lohnt.
+// Jeder Frame traegt eine Content_Checksum. Gemessen:
+//
+//   20000 Byte Text        ->    135 Byte
+//  300000 Byte Text        ->    385 Byte  (mehrere Bloecke)
+//   50000 Byte 'A'         ->     15 Byte  (RLE)
+//   16000 Byte Muster      ->     30 Byte
+//   20000 Byte Zufall      ->  20014 Byte  (Rohblock, kein Schaden)
+//
+// Gegengelesen wird mit der `zstd`-CLI, nicht nur mit dem eigenen Decoder:
+// zwei zueinander passende Fehler heben sich sonst gegenseitig auf.
+// Huffman-Literale sind NICHT enthalten -- die Literale gehen roh in den
+// Block. Das ist der naechste Schritt, wenn mehr Ersparnis gebraucht wird.
+//
+// Wie es dahin kam — die Messreihe, weil jede Zeile davon ein Befund ist:
+//
+//                                korrekt  still falsch  gemeldet  abgestuerzt
+//   vor #1041 (97 Textframes)       5          6           19         67
+//   fail-closed (#1041)            44          0           53          0
+//   Literale richtig (#1027)       63          0           34          0
+//   Sequenzen richtig (#1027)      97          0            0          0
+//   Matrix statt Groessenreihe     57          2           16          0
+//   Wiederholoffsets (#1072)       59          0           16          0
+//   Literalkopf (#1072)            75          0            0          0
+//
+// Die Zeile „Matrix statt Groessenreihe" ist die wichtigste: DERSELBE Decoder,
+// der ueber 97 Textframes zu 100 % gruen war, fiel ueber eine breitere Matrix
+// auf 57 zurueck. Die 97 Frames nahmen alle denselben Weg — Einzelblock,
+// vordefinierte Tabellen, ein Literalformat. Vollstaendigkeit einer Messung
+// heisst nicht Groesse, sondern ZWEIGABDECKUNG.
+//
+// Die Defekte in der Reihenfolge des Findens (#1027, dann #1072):
+//
+//  1. Der FSE-Gewichtsleser lief zu lange. RFC 8878 §4.2.1.2 macht die
+//     Terminierung daran fest, ob das ZUSTANDS-UPDATE noch in den Strom passt
+//     — geprueft VOR dem Verbrauch, nicht danach (zsRevBitsLeft).
+//  2. Die Codezuweisung lief in der falschen Richtung: in zstd beginnt der
+//     LAENGSTE Code bei 0, nicht der kuerzeste (zsHuffBuildLens).
+//  3. Der FSE-Tabellenkopf endet an einer BYTEGRENZE. Ohne zsBitSkipToByte
+//     wurde das angebrochene Byte mitgezaehlt und der Rueckwaertsstrom begann
+//     ein Byte zu frueh — das war die Ursache hinter 1. und 2.
+//  4. Die drei Sequenztabellen stehen in der Reihenfolge LL, OFFSET, ML.
+//  5. Im Sequenzpfad wurden die FSE-Zustaende VOR den Zusatzbits
+//     fortgeschrieben und in der Reihenfolge LL, OFF, ML. Richtig ist:
+//     erst die Zusatzbits (Offset, ML, LL), dann das Update LL, ML, OFF.
+//  6. Vier eingebaute Tabellen wichen vom RFC ab — die vordefinierte
+//     LL-Verteilung (2er-Lauf bis Symbol 12, nicht 8), die vordefinierte
+//     OFFSET-Verteilung (2er bei 6..8, nicht 5..7), die LL-Zusatzbits ab
+//     Code 25 und die ML-Basen und -Zusatzbits ab Code 43.
+//  7. Die Wiederholoffsets hatten die Ausnahme auf der FALSCHEN Seite:
+//     verschoben wird bei literals_length NULL. offset_value 3 mit nichtleerem
+//     Literallauf fiel dadurch auf Offset 0, und zsCopyBack schrieb den noch
+//     uninitialisierten Puffer fort — richtige Laenge, Inhalt Null, kein
+//     Fehler. Zusaetzlich haengt die Fortschreibung am benutzten EINTRAG,
+//     nicht am offset_value.
+//  8. Der Literalkopf kannte die Groessenformate nicht: bei Raw und RLE meint
+//     Size_Format 10 denselben Ein-Byte-Kopf wie 00, und bei komprimierten
+//     Literalen ist 10 ein VIER-Byte-Kopf mit 14 Bit, nicht der Fuenf-Byte-
+//     Kopf. Beides trifft man erst jenseits kleiner Bloecke.
+//  9. Die Content_Checksum wurde gelesen und nie geprueft; Frames mit
+//     Dictionary_ID liefen ohne das Woerterbuch einfach weiter. Beides jetzt
+//     geprueft bzw. gemeldet (zsXxh64).
+//
+// Zwei Lehren, die ueber zstd hinausgehen:
+//   * Eine von Hand uebernommene Konstantentabelle sieht plausibel aus und ist
+//     trotzdem falsch. Die vier Tabellenfehler fielen erst auf, als eine
+//     unabhaengige Referenzdekodierung derselben vier Bytes danebengelegt
+//     wurde — nicht durch Lesen des eigenen Codes.
+//   * Ein gruener Messwert belegt nur die Zweige, die er ausgefuehrt hat.
 unit std.zstd;
 
 import std.alloc;
@@ -124,6 +203,26 @@ fn zsRevReadBit(rbr: int64): int64 {
     var val: int64 := (peek64(rbr + 16) >> bitPos) & 1;
     poke64(rbr + 24, bitPos - 1);
     return val;
+}
+
+// #1027: Wie viele Bits stehen im Rueckwaertsstrom noch bereit?
+// RFC 8878 §4.2.1.2 macht die Terminierung des Gewichtslesers daran fest:
+// "if updating state after decoding a symbol would require more bits than
+//  remain in the stream, it is assumed that extra bits are zero."
+// Geprueft wird also VOR dem Verbrauch, nicht danach.
+fn zsRevBitsLeft(rbr: int64): int64 {
+    var bitPos: int64 := peek64(rbr + 24);
+    var bytePos: int64 := peek64(rbr + 8);
+    if (bitPos < 0 && bytePos <= 0) { return 0; }
+    return bytePos * 8 + bitPos + 1;
+}
+
+// #1027: Ist der Rueckwaertsstrom aufgebraucht? Erschoepft heisst: das erste
+// Byte ist erreicht UND darin sind alle Bits verbraucht. Vorher wurde an zwei
+// Rohfeldern geprueft, was den Zustand nur zufaellig traf.
+fn zsRevExhausted(rbr: int64): int64 {
+    if (peek64(rbr + 24) < 0 && peek64(rbr + 8) <= 0) { return 1; }
+    return 0;
 }
 
 fn zsRevReadBits(rbr: int64, n: int64): int64 {
@@ -320,8 +419,8 @@ fn zsReadFSEProbs(zb: int64, maxSym: int64, probs: int64): int64 {
 fn zsLLProb(sym: int64): int64 {
     if (sym == 0)  { return 4; }
     if (sym == 1)  { return 3; }
-    if ((sym >= 2)  & (sym <= 8))  { return 2; }
-    if ((sym >= 9)  & (sym <= 15)) { return 1; }
+    if ((sym >= 2)  & (sym <= 12)) { return 2; }
+    if ((sym >= 13) & (sym <= 15)) { return 1; }
     if ((sym >= 16) & (sym <= 24)) { return 2; }
     if (sym == 25) { return 3; }
     if (sym == 26) { return 2; }
@@ -340,7 +439,7 @@ fn zsMLProb(sym: int64): int64 {
 }
 
 fn zsOFFProb(sym: int64): int64 {
-    if ((sym >= 5) & (sym <= 7)) { return 2; }
+    if ((sym >= 6) & (sym <= 8)) { return 2; }
     if ((sym >= 24) & (sym <= 28)) { return 0 - 1; }
     if ((sym >= 0) & (sym <= 28)) { return 1; }
     return 0;
@@ -412,17 +511,17 @@ fn zsLLExtra(code: int64): int64 {
     if (code == 22) { return 3; }
     if (code == 23) { return 3; }
     if (code == 24) { return 4; }
-    if (code == 25) { return 4; }
-    if (code == 26) { return 5; }
-    if (code == 27) { return 5; }
-    if (code == 28) { return 6; }
-    if (code == 29) { return 7; }
-    if (code == 30) { return 8; }
-    if (code == 31) { return 9; }
-    if (code == 32) { return 10; }
-    if (code == 33) { return 11; }
-    if (code == 34) { return 12; }
-    return 13;
+    if (code == 25) { return 6; }
+    if (code == 26) { return 7; }
+    if (code == 27) { return 8; }
+    if (code == 28) { return 9; }
+    if (code == 29) { return 10; }
+    if (code == 30) { return 11; }
+    if (code == 31) { return 12; }
+    if (code == 32) { return 13; }
+    if (code == 33) { return 14; }
+    if (code == 34) { return 15; }
+    return 16;
 }
 
 fn zsMLBase(code: int64): int64 {
@@ -439,15 +538,15 @@ fn zsMLBase(code: int64): int64 {
     if (code == 41) { return 83; }
     if (code == 42) { return 99; }
     if (code == 43) { return 131; }
-    if (code == 44) { return 163; }
-    if (code == 45) { return 227; }
-    if (code == 46) { return 355; }
-    if (code == 47) { return 611; }
-    if (code == 48) { return 1123; }
-    if (code == 49) { return 2147; }
-    if (code == 50) { return 4195; }
-    if (code == 51) { return 8291; }
-    return 16483;
+    if (code == 44) { return 259; }
+    if (code == 45) { return 515; }
+    if (code == 46) { return 1027; }
+    if (code == 47) { return 2051; }
+    if (code == 48) { return 4099; }
+    if (code == 49) { return 8195; }
+    if (code == 50) { return 16387; }
+    if (code == 51) { return 32771; }
+    return 65539;
 }
 
 fn zsMLExtra(code: int64): int64 {
@@ -456,16 +555,17 @@ fn zsMLExtra(code: int64): int64 {
     if ((code >= 36) & (code <= 37)) { return 2; }
     if ((code >= 38) & (code <= 39)) { return 3; }
     if ((code >= 40) & (code <= 41)) { return 4; }
-    if ((code >= 42) & (code <= 43)) { return 5; }
-    if (code == 44) { return 6; }
-    if (code == 45) { return 7; }
-    if (code == 46) { return 8; }
-    if (code == 47) { return 9; }
-    if (code == 48) { return 10; }
-    if (code == 49) { return 11; }
-    if (code == 50) { return 12; }
-    if (code == 51) { return 13; }
-    return 14;
+    if (code == 42) { return 5; }
+    if (code == 43) { return 7; }
+    if (code == 44) { return 8; }
+    if (code == 45) { return 9; }
+    if (code == 46) { return 10; }
+    if (code == 47) { return 11; }
+    if (code == 48) { return 12; }
+    if (code == 49) { return 13; }
+    if (code == 50) { return 14; }
+    if (code == 51) { return 15; }
+    return 16;
 }
 
 // ========================================================================
@@ -505,15 +605,31 @@ fn zsHuffBuildLens(t: int64, lens: int64, numSyms: int64): void {
     s := 0;
     while (s < numSyms) { var l: int64 := peek64(lens + s * 8); if (l > 0) { poke64(t + 264 + l * 8, peek64(t + 264 + l * 8) + 1); } s := s + 1; }
 
-    // Compute firstCode per length (canonical Huffman)
-    var code: int64 := 0;
-    poke64(t + 8, 0);   // firstCode[0] = 0 (unused)
-    poke64(t + 8 + 8, 0);  // firstCode[1] = 0
-    k := 1;
-    while (k < maxLen) {
-        code := (code + peek64(t + 264 + k * 8)) << 1;
-        poke64(t + 8 + (k + 1) * 8, code);
-        k += 1;
+    // #1027: zstd weist die Codes NICHT wie ueblich kanonisch zu.
+    //
+    // In der Referenz (HUF_readDTableX1) fuellen die Symbole mit dem KLEINSTEN
+    // Gewicht — also dem LAENGSTEN Code — die Tabelle ab Index 0; die kuerzesten
+    // Codes liegen oben. Der uebliche Aufbau (kuerzeste Codes ab 0) ist genau
+    // die Spiegelung davon und lieferte deshalb echte, aber falsch zugeordnete
+    // Symbole: der dekodierte Text bestand aus den richtigen Buchstaben in
+    // falscher Reihenfolge.
+    //
+    // Richtig ist die Rekursion von der laengsten Laenge nach unten:
+    //     firstCode[maxLen] = 0
+    //     firstCode[l]      = (firstCode[l+1] + count[l+1]) >> 1
+    //
+    // Gegenprobe am Beispiel aus RFC 8878 (Gewichte 4,3,2,0,1,1):
+    //     Laenge 4: firstCode 0 -> Symbole 4,5 = 0000, 0001
+    //     Laenge 3: (0+2)>>1 = 1 -> Symbol 2   = 001
+    //     Laenge 2: (1+1)>>1 = 1 -> Symbol 1   = 01
+    //     Laenge 1: (1+1)>>1 = 1 -> Symbol 0   = 1
+    poke64(t + 8, 0);                       // firstCode[0] unbenutzt
+    poke64(t + 8 + maxLen * 8, 0);          // laengster Code beginnt bei 0
+    k := maxLen - 1;
+    while (k >= 1) {
+        var above: int64 := peek64(t + 8 + (k + 1) * 8) + peek64(t + 264 + (k + 1) * 8);
+        poke64(t + 8 + k * 8, above >> 1);
+        k := k - 1;
     }
 
     // Count total symbols and allocate symsPtr
@@ -601,6 +717,12 @@ fn zsReadHuffWeights(br: int64, ptr: int64, weights: int64): int64 {
     // Read FSE prob table for weights (max symbol = 255, weights are 0..11)
     var wprobs: int64 := alloc(256 * 8);
     var AL: int64 := zsReadFSEProbs(zb, 255, wprobs);
+    // #1027: Der Tabellenkopf endet an einer BYTEGRENZE. Ohne das Aufrunden
+    // zaehlte das angebrochene letzte Byte zum Bitstrom, der Rueckwaertsleser
+    // bekam ein Byte zu viel am Anfang — und die Schleife lief nach den echten
+    // Gewichten noch elf Schritte weiter, alle mit Gewicht null. Genau diese
+    // ueberzaehligen Nullen verschoben das implizite letzte Symbol.
+    zsBitSkipToByte(zb);
     var tableHdrSize: int64 := zsBitBytePos(zb);
     free(zb, 24);
 
@@ -615,21 +737,57 @@ fn zsReadHuffWeights(br: int64, ptr: int64, weights: int64): int64 {
     var rbr:     int64 := zsRevNew(ptr + bsStart, bsLen);
 
     // Decode weights (FSE state machine)
-    var state: int64 := zsRevReadBits(rbr, AL);
+    // #1027: zstd dekodiert die Huffman-Gewichte mit ZWEI verschraenkten
+    // FSE-Zustaenden (RFC 8878, Huffman_Tree_Description) — hier lief nur einer.
+    // Damit stimmte ab dem zweiten Gewicht nichts mehr, und der gebaute Baum
+    // lieferte statt der Literale Muell.
+    // #1027: Terminierung nach RFC 8878 §4.2.1.2. Zwei Zustaende teilen sich
+    // eine Verteilungstabelle; State1 traegt die geradzahligen, State2 die
+    // ungeradzahligen Indizes. Sie geben abwechselnd ein Symbol aus und
+    // wechseln danach ihren Zustand.
+    //
+    // Abgebrochen wird, wenn der Zustandswechsel mehr Bits braeuchte, als noch
+    // im Strom stehen — die fehlenden gelten als null. Danach gibt der jeweils
+    // andere Zustand noch sein Symbol aus, dann ist Schluss.
+    //
+    // Die Zahl der Gewichte ist nicht belanglos: sie bestimmt die Nummer des
+    // IMPLIZITEN letzten Symbols. Ein Gewicht zu viel verschiebt es und laesst
+    // es den Codeplatz eines echten Symbols einnehmen.
+    //
+    // Hoechstens 255 Gewichte — das letzte Symbol traegt keines im Strom.
+    var state1: int64 := zsRevReadBits(rbr, AL);
+    var state2: int64 := zsRevReadBits(rbr, AL);
     var numSyms: int64 := 0;
     var done: int64 := 0;
     while (done == 0) {
-        var w: int64 := zsFSESym(wtab, state);
-        if (numSyms < 256) { poke64(weights + numSyms * 8, w); }
+        poke64(weights + numSyms * 8, zsFSESym(wtab, state1));
         numSyms += 1;
-        var nb: int64 := zsFSENbBits(wtab, state);
-        var ns: int64 := zsFSENewState(wtab, state);
-        // Check if bitstream exhausted
-        var bl: int64 := peek64(rbr + 24);
-        var bp: int64 := peek64(rbr + 8);
-        if ((bl < 0) & (bp < 0)) { done := 1; }
-        else { state := ns + zsRevReadBits(rbr, nb); }
-        if (numSyms >= 256) { done := 1; }
+        if (numSyms >= 255) { done := 1; }
+        if (done == 0) {
+            var nb1: int64 := zsFSENbBits(wtab, state1);
+            if (zsRevBitsLeft(rbr) < nb1) {
+                poke64(weights + numSyms * 8, zsFSESym(wtab, state2));
+                numSyms += 1;
+                done := 1;
+            } else {
+                state1 := zsFSENewState(wtab, state1) + zsRevReadBits(rbr, nb1);
+            }
+        }
+        if (done == 0) {
+            poke64(weights + numSyms * 8, zsFSESym(wtab, state2));
+            numSyms += 1;
+            if (numSyms >= 255) { done := 1; }
+            if (done == 0) {
+                var nb2: int64 := zsFSENbBits(wtab, state2);
+                if (zsRevBitsLeft(rbr) < nb2) {
+                    poke64(weights + numSyms * 8, zsFSESym(wtab, state1));
+                    numSyms += 1;
+                    done := 1;
+                } else {
+                    state2 := zsFSENewState(wtab, state2) + zsRevReadBits(rbr, nb2);
+                }
+            }
+        }
     }
 
     free(rbr, 32);
@@ -643,48 +801,58 @@ fn zsReadHuffWeights(br: int64, ptr: int64, weights: int64): int64 {
 // The last symbol's weight is derived to complete the tree.
 fn zsHuffFromWeights(weights: int64, numSyms: int64): int64 {
     var t: int64 := zsHuffNew();
-    if (numSyms == 0) { return t; }
+    if (numSyms <= 0) { return t; }
 
-    // Compute max weight
-    var maxW: int64 := 0;
+    // #1027: Ein Gewicht ist NICHT die Codelaenge. RFC 8878 §4.2.1:
+    //
+    //     Number_of_Bits = Max_Number_of_Bits + 1 - Weight    (fuer Weight > 0)
+    //
+    // Ein HOHES Gewicht ergibt also einen KURZEN Code. Bisher wurde das Gewicht
+    // unmittelbar als Laenge eingetragen — genau umgekehrt. Der Baum bevorzugte
+    // dadurch die seltensten Zeichen: in einem Testframe kamen als Literale
+    // ausschliesslich '.', 'C', 'L' und 'S' heraus, also die Symbole mit
+    // Gewicht 1. Der Kommentar an dieser Stelle nannte die richtige Formel und
+    // verwarf sie im Satz darauf.
+    //
+    // Max_Number_of_Bits ergibt sich aus der Summe der Gewichtswertigkeiten:
+    // total = Summe 2^(W-1) ueber alle gelesenen Gewichte > 0. Das letzte
+    // Symbol traegt kein eigenes Gewicht im Strom — seines wird so bestimmt,
+    // dass die Summe eine Zweierpotenz wird.
+    var total: int64 := 0;
     var s: int64 := 0;
-    while (s < numSyms) { var w: int64 := peek64(weights + s * 8); if (w > maxW) { maxW := w; } s := s + 1; }
-    if (maxW == 0) { return t; }
-
-    // Implicit last weight: find the missing bits to complete the tree.
-    // sum of 2^(maxWeight - weight[s]) for s with weight > 0 must = 2^maxWeight
-    var sumPow: int64 := 0;
-    s := 0;
     while (s < numSyms) {
         var w: int64 := peek64(weights + s * 8);
-        if (w > 0) {
-            var diff: int64 := maxW - w;
-            sumPow := sumPow + (1 << diff);
-        }
+        if (w > 0) { total := total + (1 << (w - 1)); }
         s += 1;
     }
-    // The "remaining" after accounting for all symbols should be a power of 2
-    var remaining: int64 := (1 << maxW) - sumPow;
-    var implicitW: int64 := 0;
-    if (remaining > 0) { implicitW := maxW - zsHighbit(remaining); }
+    if (total <= 0) { return t; }
 
-    // Build code-length array: len[s] = weight[s] (non-zero), adjusted by maxWeight
-    // In zstd: code_length[s] = maxBits + 1 - weight[s]  (but weight=0 means absent)
-    // Actually: weight IS the code length for non-zero entries
-    var lensSize: int64 := (numSyms + 1) * 8;
+    var maxBits: int64 := zsHighbit(total) + 1;
+    if (maxBits > 11) { return t; }          // zstd erlaubt hoechstens 11 Bit
+    var rest: int64 := (1 << maxBits) - total;
+    if (rest <= 0) { return t; }             // Gewichtssumme unstimmig
+    var lastW: int64 := zsHighbit(rest) + 1;
+    // #1027: Der Rest MUSS eine Zweierpotenz sein — nur dann ergibt das
+    // abgeleitete letzte Gewicht einen vollstaendigen Baum. Ist er es nicht,
+    // waren die gelesenen Gewichte unstimmig; zsHighbit rundet dann ab und der
+    // Baum ist still falsch. Lieber einen leeren Baum liefern, den der Aufrufer
+    // als Fehler sieht, als geraten.
+    if ((1 << (lastW - 1)) != rest) { return t; }
+
+    // Codelaengen: len[s] = maxBits + 1 - W[s], 0 bedeutet "Symbol kommt nicht vor".
+    var nAll: int64 := numSyms + 1;
+    var lensSize: int64 := nAll * 8;
     var lens: int64 := alloc(lensSize);
     s := 0;
     while (s < numSyms) {
-        poke64(lens + s * 8, peek64(weights + s * 8));
+        var w2: int64 := peek64(weights + s * 8);
+        if (w2 > 0) { poke64(lens + s * 8, maxBits + 1 - w2); }
+        else        { poke64(lens + s * 8, 0); }
         s += 1;
     }
-    // Last symbol gets implicitW
-    if (implicitW > 0) {
-        poke64(lens + numSyms * 8, implicitW);
-        numSyms += 1;
-    }
+    poke64(lens + numSyms * 8, maxBits + 1 - lastW);
 
-    zsHuffBuildLens(t, lens, numSyms);
+    zsHuffBuildLens(t, lens, nAll);
     free(lens, lensSize);
     return t;
 }
@@ -751,35 +919,153 @@ fn zsCopyBack(ctx: int64, offset: int64, matchLen: int64): void {
 }
 
 // Resolve offset_value (raw from bitstream) with repeat-offset logic.
-// Returns actual offset. Updates ctx's off1/off2/off3.
+// Returns actual offset (0 = korrupt), aktualisiert off1/off2/off3 im ctx.
+//
+// #1072 RFC 8878 §3.1.1.5. Die Vorgaengerfassung hatte die Ausnahme auf der
+// FALSCHEN Seite: verschoben wird, wenn literals_length NULL ist, nicht wenn
+// sie ungleich null ist. Folge war, dass offset_value 3 mit nichtleerem
+// Literallauf auf `off1 - 1` fiel — beim ersten Vorkommen also auf OFFSET 0.
+// zsCopyBack kopierte dann jedes Byte auf sich selbst und schrieb den noch
+// uninitialisierten Ausgabepuffer fort: richtige Laenge, Inhalt Null, kein
+// Fehlerflag. Genau der Ausgang, der nicht vorkommen darf.
+//
+// Ebenso falsch war die Fortschreibung: sie haengt nicht am offset_value,
+// sondern daran, welcher Eintrag benutzt wurde. Ein Treffer auf
+// Repeated_Offset1 laesst die Liste unveraendert; ein Treffer weiter hinten
+// rotiert nur bis zu diesem Eintrag; ein NEUER Offset schiebt alle zurueck.
 fn zsResolveOffset(ctx: int64, offVal: int64, llLen: int64): int64 {
     var off1: int64 := peek64(ctx + 56);
     var off2: int64 := peek64(ctx + 64);
     var off3: int64 := peek64(ctx + 72);
-    var actual: int64 := 0;
 
     if (offVal > 3) {
-        actual := offVal - 3;
+        // Neuer Offset: alle zurueckschieben.
+        var actual: int64 := offVal - 3;
         poke64(ctx + 72, off2); poke64(ctx + 64, off1); poke64(ctx + 56, actual);
-    } else {
-        if (offVal == 1) {
-            actual := off1;
-        } else {
-            if (offVal == 2) {
-                actual := off2;
-                poke64(ctx + 64, off1); poke64(ctx + 56, actual);
-            } else {
-                // offVal == 3
-                if (llLen == 0) {
-                    actual := off3;
-                    poke64(ctx + 72, off2); poke64(ctx + 64, off1); poke64(ctx + 56, actual);
-                } else {
-                    actual := off1 - 1;
-                }
-            }
-        }
+        return actual;
     }
-    return actual;
+    if (offVal < 1) { return 0; }
+
+    // Bei leerem Literallauf verschiebt sich die Bedeutung um eins:
+    // 1 -> Repeated_Offset2, 2 -> Repeated_Offset3, 3 -> Repeated_Offset1 - 1.
+    var slot: int64 := offVal;
+    if (llLen == 0) { slot := slot + 1; }
+
+    if (slot == 1) {
+        // Bereits der juengste Eintrag — keine Umsortierung.
+        return off1;
+    }
+    if (slot == 2) {
+        poke64(ctx + 64, off1); poke64(ctx + 56, off2);
+        return off2;
+    }
+    if (slot == 3) {
+        poke64(ctx + 72, off2); poke64(ctx + 64, off1); poke64(ctx + 56, off3);
+        return off3;
+    }
+    // slot == 4: offset_value 3 bei leerem Literallauf — ein NEUER Offset,
+    // abgeleitet aus Repeated_Offset1. off1 == 1 macht ihn zu 0; das ist ein
+    // korrupter Strom und wird als solcher gemeldet, nicht kopiert.
+    var derived: int64 := off1 - 1;
+    if (derived < 1) { return 0; }
+    poke64(ctx + 72, off2); poke64(ctx + 64, off1); poke64(ctx + 56, derived);
+    return derived;
+}
+
+// ========================================================================
+// XXH64 — fuer die Content_Checksum eines Frames (#1072)
+//
+// zstd legt bei gesetztem Content_Checksum_Flag die UNTEREN VIER BYTE des
+// XXH64-Hashes ueber den unkomprimierten Inhalt ans Frameende. Vorher wurde
+// das Flag zwar gelesen, die Pruefsumme aber nie geprueft: ein verfaelschtes
+// Byte kam als plausibler Inhalt richtiger Laenge zurueck, ohne Fehler.
+//
+// Die Konstanten liegen oberhalb von 2^63 und werden deshalb aus zwei
+// 32-Bit-Haelften zusammengesetzt. `>>` ist in Lyx logisch, die Rotation
+// darf also direkt damit gebaut werden.
+// ========================================================================
+
+fn zsP1(): int64 { return (0x9E3779B1 << 32) | 0x85EBCA87; }
+fn zsP2(): int64 { return (0xC2B2AE3D << 32) | 0x27D4EB4F; }
+fn zsP3(): int64 { return (0x165667B1 << 32) | 0x9E3779F9; }
+fn zsP4(): int64 { return (0x85EBCA77 << 32) | 0xC2B2AE63; }
+fn zsP5(): int64 { return (0x27D4EB2F << 32) | 0x165667C5; }
+
+fn zsRotl64(x: int64, r: int64): int64 {
+    return (x << r) | (x >> (64 - r));
+}
+
+fn zsXxhRound(acc: int64, input: int64): int64 {
+    var a: int64 := acc + input * zsP2();
+    a := zsRotl64(a, 31);
+    return a * zsP1();
+}
+
+fn zsXxhMerge(h: int64, v: int64): int64 {
+    var val: int64 := zsXxhRound(0, v);
+    return (h ^ val) * zsP1() + zsP4();
+}
+
+fn zsReadLE64At(p: int64): int64 {
+    var v: int64 := 0;
+    var k: int64 := 7;
+    while (k >= 0) { v := (v << 8) | peek8(p + k); k := k - 1; }
+    return v;
+}
+
+fn zsReadLE32At(p: int64): int64 {
+    return peek8(p) | (peek8(p + 1) << 8) | (peek8(p + 2) << 16) | (peek8(p + 3) << 24);
+}
+
+// XXH64 mit Seed 0 ueber len Bytes ab ptr.
+fn zsXxh64(ptr: int64, len: int64): int64 {
+    var h:   int64 := 0;
+    var pos: int64 := 0;
+
+    if (len >= 32) {
+        var v1: int64 := zsP1() + zsP2();
+        var v2: int64 := zsP2();
+        var v3: int64 := 0;
+        var v4: int64 := 0 - zsP1();
+        while (len - pos >= 32) {
+            v1 := zsXxhRound(v1, zsReadLE64At(ptr + pos));
+            v2 := zsXxhRound(v2, zsReadLE64At(ptr + pos + 8));
+            v3 := zsXxhRound(v3, zsReadLE64At(ptr + pos + 16));
+            v4 := zsXxhRound(v4, zsReadLE64At(ptr + pos + 24));
+            pos := pos + 32;
+        }
+        h := zsRotl64(v1, 1) + zsRotl64(v2, 7) + zsRotl64(v3, 12) + zsRotl64(v4, 18);
+        h := zsXxhMerge(h, v1);
+        h := zsXxhMerge(h, v2);
+        h := zsXxhMerge(h, v3);
+        h := zsXxhMerge(h, v4);
+    } else {
+        h := zsP5();
+    }
+
+    h := h + len;
+
+    while (len - pos >= 8) {
+        var k: int64 := zsXxhRound(0, zsReadLE64At(ptr + pos));
+        h := zsRotl64(h ^ k, 27) * zsP1() + zsP4();
+        pos := pos + 8;
+    }
+    if (len - pos >= 4) {
+        var w: int64 := zsReadLE32At(ptr + pos) & 0xFFFFFFFF;
+        h := zsRotl64(h ^ (w * zsP1()), 23) * zsP2() + zsP3();
+        pos := pos + 4;
+    }
+    while (pos < len) {
+        h := zsRotl64(h ^ (peek8(ptr + pos) * zsP5()), 11) * zsP1();
+        pos := pos + 1;
+    }
+
+    h := h ^ (h >> 33);
+    h := h * zsP2();
+    h := h ^ (h >> 29);
+    h := h * zsP3();
+    h := h ^ (h >> 32);
+    return h;
 }
 
 // ========================================================================
@@ -795,8 +1081,13 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
 
     if (ltype == 0) {
         // Raw_Literals_Block: literals are uncompressed
+        // #1072 RFC 8878 §3.1.1.3.1.1: bei Raw und RLE benutzt Size_Format nur
+        // EIN Bit, wenn der Wert 00 oder 10 ist -- beide meinen denselben
+        // Ein-Byte-Header mit 5-Bit-Groesse. Die Vorgaengerfassung las 10 als
+        // Drei-Byte-Header und damit Laengen aus fremden Bytes: `zstd -19` auf
+        // eine Bytewiederholung ergab 5136 statt 1 Literal.
         var rlen: int64 := 0;
-        if (szFmt == 0) { rlen := (hdr0 >> 3) & 0x1F; }
+        if ((szFmt == 0) | (szFmt == 2)) { rlen := (hdr0 >> 3) & 0x1F; }
         else { if (szFmt == 1) { rlen := ((hdr0 >> 4) & 0x0F) | (zsbrReadU8(br) << 4); }
         else { rlen := ((hdr0 >> 4) & 0x0F) | (zsbrReadU8(br) << 4) | (zsbrReadU8(br) << 12); } }
         poke64(outLen, rlen);
@@ -808,8 +1099,13 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
 
     if (ltype == 1) {
         // RLE_Literals_Block: single byte repeated
+        // #1072 RFC 8878 §3.1.1.3.1.1: bei Raw und RLE benutzt Size_Format nur
+        // EIN Bit, wenn der Wert 00 oder 10 ist -- beide meinen denselben
+        // Ein-Byte-Header mit 5-Bit-Groesse. Die Vorgaengerfassung las 10 als
+        // Drei-Byte-Header und damit Laengen aus fremden Bytes: `zstd -19` auf
+        // eine Bytewiederholung ergab 5136 statt 1 Literal.
         var rlen: int64 := 0;
-        if (szFmt == 0) { rlen := (hdr0 >> 3) & 0x1F; }
+        if ((szFmt == 0) | (szFmt == 2)) { rlen := (hdr0 >> 3) & 0x1F; }
         else { if (szFmt == 1) { rlen := ((hdr0 >> 4) & 0x0F) | (zsbrReadU8(br) << 4); }
         else { rlen := ((hdr0 >> 4) & 0x0F) | (zsbrReadU8(br) << 4) | (zsbrReadU8(br) << 12); } }
         var rleByte: int64 := zsbrReadU8(br);
@@ -825,24 +1121,32 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
     var regenSize: int64 := 0;
     var compSize:  int64 := 0;
 
-    if (szFmt == 0) {
+    // #1072 RFC 8878 §3.1.1.3.1.1: die vier Size_Formate sind
+    //   00 -> 1 Strom,  10+10 Bit, 3 Byte Kopf
+    //   01 -> 4 Stroeme, 10+10 Bit, 3 Byte Kopf
+    //   10 -> 4 Stroeme, 14+14 Bit, 4 Byte Kopf
+    //   11 -> 4 Stroeme, 18+18 Bit, 5 Byte Kopf
+    // Die Vorgaengerfassung warf 10 und 11 zusammen und las fuer 10 einen
+    // Fuenf-Byte-Kopf. Ab Blockgroessen um 16 KB kommt 10 regelmaessig vor.
+    if ((szFmt == 0) | (szFmt == 1)) {
         var hdr1: int64 := zsbrReadU8(br);
         var hdr2: int64 := zsbrReadU8(br);
         regenSize := ((hdr0 >> 4) & 0x0F) | ((hdr1 & 0x3F) << 4);
         compSize  := ((hdr1 >> 6) & 0x03) | (hdr2 << 2);
     } else {
-        if (szFmt == 1) {
+        if (szFmt == 2) {
             var hdr1: int64 := zsbrReadU8(br);
             var hdr2: int64 := zsbrReadU8(br);
-            regenSize := ((hdr0 >> 4) & 0x0F) | ((hdr1 & 0x3F) << 4);
-            compSize  := ((hdr1 >> 6) & 0x03) | (hdr2 << 2);
+            var hdr3: int64 := zsbrReadU8(br);
+            regenSize := ((hdr0 >> 4) & 0x0F) | (hdr1 << 4) | ((hdr2 & 0x03) << 12);
+            compSize  := ((hdr2 >> 2) & 0x3F) | (hdr3 << 6);
         } else {
             var hdr1: int64 := zsbrReadU8(br);
             var hdr2: int64 := zsbrReadU8(br);
             var hdr3: int64 := zsbrReadU8(br);
             var hdr4: int64 := zsbrReadU8(br);
-            regenSize := ((hdr0 >> 4) & 0x0F) | (hdr1 << 4) | ((hdr2 & 0x03) << 12);
-            compSize  := ((hdr2 >> 2) & 0x3F) | (hdr3 << 6) | ((hdr4 & 0x03) << 14);
+            regenSize := ((hdr0 >> 4) & 0x0F) | (hdr1 << 4) | ((hdr2 & 0x3F) << 12);
+            compSize  := ((hdr2 >> 6) & 0x03) | (hdr3 << 2) | (hdr4 << 10);
         }
     }
 
@@ -857,6 +1161,13 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
 
     var litDataStart: int64 := zsbrPos(br);
     var litPtr: int64 := blockPtr + litDataStart;
+    var huffSize: int64 := compSize;   // #1027: Groesse des Huffman-Bitstroms
+    // #1027: Die Zahl der Stroeme steht im Size_Format, nicht in regenSize:
+    // Format 0 = EIN Strom, die Formate 1..3 = VIER Stroeme mit Sprungtabelle
+    // (RFC 8878, Literals_Section_Header). Vorher wurde an `regenSize < 1024`
+    // entschieden — bei kleinen Vierstrom-Bloecken also falsch.
+    var nStreams: int64 := 4;
+    if (szFmt == 0) { nStreams := 1; }
 
     // Read Huffman tree (if type=2) or reuse (type=3)
     // We build a local tree here; for Treeless we'd need the ctx, but to keep ≤6 params
@@ -873,7 +1184,10 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
         // #1027: nw kommt aus dem Bitstrom; oberhalb von 255 laeuft schon das
         // Gewichts-Array (256 Eintraege) ueber. Und zsHuffDecSym laeuft ueber
         // maxLen Tabellenplaetze -- zstd erlaubt hoechstens 11.
-        if ((nw <= 0) | (nw > 255)) {
+        // #1027: Die Grenze war um EINS zu streng. Das Gewichts-Array fasst 256
+        // Eintraege (Indizes 0..255), und 256 Symbole sind der zulaessige
+        // Hoechstfall — die Pruefung wies damit gueltige Frames ab.
+        if ((nw <= 0) | (nw > 256)) {
             zsHuffFree(htree); poke64(outLen, 0); zsbrSkip(br, compSize); return 0;
         }
         if (peek64(htree + 400) < 0) {
@@ -887,7 +1201,12 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
         }
         litDataStart += hdrConsumed;
         litPtr := blockPtr + litDataStart;
-        compSize -= hdrConsumed;
+        // #1027: compSize wurde hier verkleinert und am Ende nur noch der
+        // VERKLEINERTE Wert uebersprungen — der Leser blieb damit um die Groesse
+        // der Baumbeschreibung hinter dem Ende der Literals-Sektion zurueck, und
+        // die Sequenzen wurden ab der falschen Stelle gelesen. Die Sektionsgroesse
+        // bleibt jetzt unangetastet; huffSize ist nur die Groesse des Bitstroms.
+        huffSize := compSize - hdrConsumed;
     } else {
         // Treeless: would need previous tree; return error (not supported in this block)
         poke64(outLen, 0);
@@ -901,9 +1220,9 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
     var litBuf: int64 := alloc(regenSize + 1);
     poke64(outLen, regenSize);
 
-    if (regenSize < 1024) {
+    if (nStreams == 1) {
         // Single stream
-        var rbr: int64 := zsRevNew(litPtr, compSize);
+        var rbr: int64 := zsRevNew(litPtr, huffSize);
         var k: int64 := 0;
         while (k < regenSize) {
             var sym: int64 := zsHuffDecSym(htree, rbr);
@@ -914,14 +1233,14 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
     } else {
         // 4-stream interleaved Huffman (jump table = 6 bytes)
         // jump table: stream 1 size (LE16), stream 2 size (LE16), stream 3 size (LE16)
-        if (compSize < 6) {
+        if (huffSize < 6) {
             zsHuffFree(htree); free(litBuf, regenSize + 1);
             poke64(outLen, 0); zsbrSkip(br, compSize); return 0;
         }
         var s1len: int64 := (peek8(litPtr) & 0xFF) | ((peek8(litPtr + 1) & 0xFF) << 8);
         var s2len: int64 := (peek8(litPtr + 2) & 0xFF) | ((peek8(litPtr + 3) & 0xFF) << 8);
         var s3len: int64 := (peek8(litPtr + 4) & 0xFF) | ((peek8(litPtr + 5) & 0xFF) << 8);
-        var s4len: int64 := compSize - 6 - s1len - s2len - s3len;
+        var s4len: int64 := huffSize - 6 - s1len - s2len - s3len;
         // #1027: Die drei Laengen stehen unkontrolliert im Bitstrom. Ergeben sie
         // zusammen mehr als der Block hergibt, zeigen p2..p4 hinter den Puffer.
         if (s4len <= 0) {
@@ -934,32 +1253,32 @@ fn zsReadLiterals(br: int64, blockPtr: int64, outLen: int64): int64 {
         var p3: int64 := p2 + s2len;
         var p4: int64 := p3 + s3len;
 
-        var perStream: int64 := regenSize / 4;
-        var remainder: int64 := regenSize - perStream * 4;
+        // #1027: Die ersten DREI Stroeme liefern je ceil(regenSize/4) Symbole,
+        // der vierte den Rest (RFC 8878). Vorher wurde durch vier geteilt und
+        // der Rest hinten angehaengt — bei jedem regenSize, das nicht durch vier
+        // teilbar ist, lagen die Segmente damit falsch.
+        var perStream: int64 := (regenSize + 3) / 4;
+        var lastLen:   int64 := regenSize - perStream * 3;
+        if (lastLen < 0) { lastLen := 0; }
 
         var rbr1: int64 := zsRevNew(p1, s1len);
         var rbr2: int64 := zsRevNew(p2, s2len);
         var rbr3: int64 := zsRevNew(p3, s3len);
         var rbr4: int64 := zsRevNew(p4, s4len);
 
-        var outPos: int64 := 0;
         var k: int64 := 0;
-
         while (k < perStream) {
-            poke8(litBuf + outPos,              zsHuffDecSym(htree, rbr1) & 0xFF);
-            poke8(litBuf + outPos + perStream,  zsHuffDecSym(htree, rbr2) & 0xFF);
-            poke8(litBuf + outPos + perStream * 2, zsHuffDecSym(htree, rbr3) & 0xFF);
-            poke8(litBuf + outPos + perStream * 3, zsHuffDecSym(htree, rbr4) & 0xFF);
-            outPos += 1;
+            poke8(litBuf + k,                  zsHuffDecSym(htree, rbr1) & 0xFF);
+            poke8(litBuf + perStream + k,      zsHuffDecSym(htree, rbr2) & 0xFF);
+            poke8(litBuf + perStream * 2 + k,  zsHuffDecSym(htree, rbr3) & 0xFF);
             k += 1;
         }
-        // Remainder from stream 4
-        var remBase: int64 := perStream * 4;
         k := 0;
-        while (k < remainder) {
-            poke8(litBuf + remBase + k, zsHuffDecSym(htree, rbr4) & 0xFF);
+        while (k < lastLen) {
+            poke8(litBuf + perStream * 3 + k, zsHuffDecSym(htree, rbr4) & 0xFF);
             k += 1;
         }
+
 
         free(rbr1, 32); free(rbr2, 32); free(rbr3, 32); free(rbr4, 32);
     }
@@ -1099,19 +1418,6 @@ fn zsDecodeSeqs(ctx: int64, rbr: int64, litBuf: int64, litLen: int64, numSeq: in
         // #1027: entgleiste Symbolcodes vor der Weiterverwendung abfangen
         if (zsCodesOk(llCode, mlCode, offCode) == 0) { poke64(ctx + 48, 1); return; }
 
-        // Update states (read bits) — skip for last sequence
-        if (isLast == 0) {
-            if (llMode  != 1) { llState  := zsFSENewState(llTab,  llState)  + zsRevReadBits(rbr, zsFSENbBits(llTab,  llState)); }
-            if (offMode != 1) { offState := zsFSENewState(offTab, offState) + zsRevReadBits(rbr, zsFSENbBits(offTab, offState)); }
-            if (mlMode  != 1) { mlState  := zsFSENewState(mlTab,  mlState)  + zsRevReadBits(rbr, zsFSENbBits(mlTab,  mlState)); }
-
-            // #1027: Zustand muss in der Tabelle bleiben, sonst liest der
-            // naechste Durchlauf ausserhalb.
-            if (llMode  != 1) { if (zsStateOk(llState,  llAL)  == 0) { poke64(ctx + 48, 1); return; } }
-            if (mlMode  != 1) { if (zsStateOk(mlState,  mlAL)  == 0) { poke64(ctx + 48, 1); return; } }
-            if (offMode != 1) { if (zsStateOk(offState, offAL) == 0) { poke64(ctx + 48, 1); return; } }
-        }
-
         // Decode extra bits
         var offExtra: int64 := zsRevReadBits(rbr, offCode);
         var offVal:   int64 := (1 << offCode) + offExtra;
@@ -1120,8 +1426,28 @@ fn zsDecodeSeqs(ctx: int64, rbr: int64, litBuf: int64, litLen: int64, numSeq: in
         var llExtra:  int64 := zsLLExtra(llCode);
         var llLen:    int64 := zsLLBase(llCode) + zsRevReadBits(rbr, llExtra);
 
+        // #1027 RFC 8878 3.1.1.3.2.1: die Zustaende werden ERST NACH den
+        // Zusatzbits fortgeschrieben, und zwar in der Reihenfolge LL, ML, OFF.
+        // Vorher lief das Update vor den Zusatzbits und mit LL, OFF, ML --
+        // beides verschiebt den Rueckwaertsstrom und laesst jede Sequenz nach
+        // der ersten auf falschen Bits landen.
+        if (isLast == 0) {
+            if (llMode  != 1) { llState  := zsFSENewState(llTab,  llState)  + zsRevReadBits(rbr, zsFSENbBits(llTab,  llState)); }
+            if (mlMode  != 1) { mlState  := zsFSENewState(mlTab,  mlState)  + zsRevReadBits(rbr, zsFSENbBits(mlTab,  mlState)); }
+            if (offMode != 1) { offState := zsFSENewState(offTab, offState) + zsRevReadBits(rbr, zsFSENbBits(offTab, offState)); }
+
+            // #1027: Zustand muss in der Tabelle bleiben, sonst liest der
+            // naechste Durchlauf ausserhalb.
+            if (llMode  != 1) { if (zsStateOk(llState,  llAL)  == 0) { poke64(ctx + 48, 1); return; } }
+            if (mlMode  != 1) { if (zsStateOk(mlState,  mlAL)  == 0) { poke64(ctx + 48, 1); return; } }
+            if (offMode != 1) { if (zsStateOk(offState, offAL) == 0) { poke64(ctx + 48, 1); return; } }
+        }
+
         // Resolve offset
         var actual: int64 := zsResolveOffset(ctx, offVal, llLen);
+        // #1072: Offset 0 gibt es nicht. Ohne diese Pruefung kopierte
+        // zsCopyBack jedes Byte auf sich selbst und lieferte still Nullen.
+        if (actual < 1) { poke64(ctx + 48, 1); return; }
 
         // Copy literal run
         var k: int64 := 0;
@@ -1205,9 +1531,14 @@ fn zsDecompressCompressed(ctx: int64, blkPtr: int64, blkLen: int64): void {
 
     // Read FSE tables into ctx
     var zb: int64 := zsBitNew(blkPtr, zsbrPos(br));
+    // #1027: Die Tabellen stehen im Block in der Reihenfolge LL, OFFSET, ML
+    // (RFC 8878, Sequences_Section) — hier wurde ML vor OFFSET gelesen. Damit
+    // war ab der zweiten Tabelle jede Bitposition falsch.
     zsGetSeqTable(ctx, zb, llMode,  0);
-    zsGetSeqTable(ctx, zb, mlMode,  1);
     zsGetSeqTable(ctx, zb, offMode, 2);
+    zsGetSeqTable(ctx, zb, mlMode,  1);
+    // #1027: ebenso hier — die drei Sequenztabellen enden an einer Bytegrenze.
+    zsBitSkipToByte(zb);
     var tabBytesUsed: int64 := zsBitBytePos(zb);
     free(zb, 24);
 
@@ -1247,21 +1578,16 @@ fn zsDecompressBlock(ctx: int64, blkPtr: int64, blkLen: int64, blkType: int64): 
             // The actual byte payload is 1 byte; blkLen from header is the count
             while (k < blkLen) { zsOutput(ctx, rleByte); k := k + 1; }
         } else {
-            // #1027: Compressed Blocks (Huffman/FSE) sind FAIL-CLOSED.
+            // #1027: Compressed Blocks (Huffman/FSE) laufen wieder.
             //
-            // Gemessen ueber 97 Frames derselben Textquelle in aufsteigender
-            // Groesse (zstd -1): 67 Abstuerze, 5 stillschweigend falsche
-            // Ergebnisse, 20 gemeldete Fehler, 5 korrekt. Ein Decoder, der in
-            // zwei von drei Faellen den Prozess abraeumt und in weiteren Faellen
-            // ohne Fehlerflag Muell liefert, darf nicht laufen -- ein Aufrufer
-            // kann das Ergebnis nicht von einem echten unterscheiden.
-            //
-            // Der Dekodierpfad bleibt vollstaendig erhalten und ist unten
-            // gehaertet (Tabellen-, Zustands- und Laengengrenzen); zum
-            // Weiterarbeiten diese Zeile durch den Aufruf ersetzen:
-            //     zsDecompressCompressed(ctx, blkPtr, blkLen);
-            // Solange gilt: melden statt raten. Siehe Issue #1027.
-            poke64(ctx + 48, 1);
+            // Der Pfad war fail-closed, solange er stillschweigend falschen
+            // Inhalt lieferte. Gemessen ueber 97 Frames derselben Textquelle in
+            // aufsteigender Groesse (zstd -1) steht er jetzt bei
+            // 97 korrekt / 0 still falsch / 0 gemeldet / 0 abgestuerzt --
+            // Ausgangslage waren 5 korrekt, 6 still falsch, 19 gemeldet,
+            // 67 Abstuerze. tests/zstd_measure.sh haelt die Messung fest und
+            // wird rot, sobald wieder ein Frame still falsch endet.
+            zsDecompressCompressed(ctx, blkPtr, blkLen);
         }
     }
 }
@@ -1307,9 +1633,18 @@ pub fn ZstdDecompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int
     }
 
     // Dictionary_ID field
-    if (didFlag == 1) { zsbrReadU8(br); }
-    else { if (didFlag == 2) { zsbrReadLE16(br); }
-    else { if (didFlag == 3) { zsbrReadLE32(br); } } }
+    // #1072: Ein Frame mit Dictionary_ID braucht dieses Woerterbuch, um
+    // ueberhaupt richtig dekodiert werden zu koennen -- Wiederholoffsets und
+    // Entropietabellen stammen daraus. Die Kennung nur zu ueberlesen und
+    // weiterzumachen hiess, mit falschem Anfangszustand zu raten. Wir koennen
+    // Woerterbuecher nicht, also wird das gemeldet.
+    if (didFlag != 0) {
+        if (didFlag == 1) { zsbrReadU8(br); }
+        else { if (didFlag == 2) { zsbrReadLE16(br); }
+        else { zsbrReadLE32(br); } }
+        free(br, 24); zsCtxFree(ctx);
+        return ZSTD_ERR;
+    }
 
     // Content_Size field
     var contentSize: int64 := 0;
@@ -1377,6 +1712,18 @@ pub fn ZstdDecompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int
         if (contentSize > 0) {
             if (result != contentSize) { result := ZSTD_ERR; }
         }
+        // #1072: Content_Checksum pruefen, wenn der Frame eine traegt. Das
+        // Flag wurde bisher gelesen und dann ignoriert -- ein verfaelschtes
+        // Byte kam als plausibler Inhalt richtiger Laenge zurueck. zstd legt
+        // die UNTEREN VIER BYTE des XXH64 ueber den Inhalt ans Frameende.
+        if ((ccf == 1) & (result > 0)) {
+            if (zsbrLeft(br) < 4) { result := ZSTD_ERR; }
+            else {
+                var want: int64 := zsbrReadLE32(br) & 0xFFFFFFFF;
+                var got:  int64 := zsXxh64(dst, result) & 0xFFFFFFFF;
+                if (want != got) { result := ZSTD_ERR; }
+            }
+        }
     }
 
     free(br, 24);
@@ -1392,14 +1739,398 @@ pub fn ZstdDecompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int
 // Block header (24-bit LE): bit0=LastBlock, bits[2:1]=BlockType(0=Raw), bits[23:3]=BlockSize
 // ========================================================================
 
+// ========================================================================
+// Kompression (#1069)
+//
+// Erzeugt echte Compressed Blocks: Raw-Literale plus LZ77-Sequenzen, die mit
+// den VORDEFINIERTEN FSE-Tabellen kodiert werden (Sequences_Compression_Mode
+// 0). Damit entfaellt der Tabellenkopf, und Encoder und Decoder teilen sich
+// dieselben Tabellen -- gebaut von zsLLPredefined/zsMLPredefined/zsOFFPredefined.
+//
+// Der FSE-Encoder benutzt die DEKODIERTABELLE rueckwaerts. Das geht, weil eine
+// gueltige FSE-Tabelle fuer jedes Symbol s eine Zerlegung des Zustandsraums
+// bildet: die Zielbereiche aller Zustaende mit Symbol s ueberdecken [0,size)
+// genau einmal. Zu jedem Symbol und jedem Zielzustand gibt es daher GENAU EINEN
+// Vorgaengerzustand. Die Zustandsfolge entsteht so von hinten nach vorne, ohne
+// eine zweite Tabellenform (deltaNbBits/deltaFindState) aufbauen zu muessen --
+// eine zweite Tabellenform waere eine zweite Fehlerquelle.
+// ========================================================================
+
+// Vorgaengerzustand: der eindeutige Zustand mit Symbol sym, dessen
+// Folgebereich target enthaelt. -1, wenn es keinen gibt (dann traegt das
+// Symbol in dieser Tabelle keine Wahrscheinlichkeit).
+fn zsFSEPrevState(tab: int64, sym: int64, target: int64): int64 {
+    var size: int64 := 1 << peek64(tab);
+    var st:   int64 := 0;
+    while (st < size) {
+        if (zsFSESym(tab, st) == sym) {
+            var base: int64 := zsFSENewState(tab, st);
+            var span: int64 := 1 << zsFSENbBits(tab, st);
+            if ((target >= base) & (target < base + span)) { return st; }
+        }
+        st := st + 1;
+    }
+    return 0 - 1;
+}
+
+// Irgendein Zustand, der sym ausgibt -- Startpunkt der Rueckwaertskette.
+fn zsFSEAnyState(tab: int64, sym: int64): int64 {
+    var size: int64 := 1 << peek64(tab);
+    var st:   int64 := 0;
+    while (st < size) {
+        if (zsFSESym(tab, st) == sym) { return st; }
+        st := st + 1;
+    }
+    return 0 - 1;
+}
+
+// Literal-Length-Code zu einer Lauflaenge.
+fn zsLLCodeFor(len: int64): int64 {
+    var c: int64 := 0;
+    while (c <= 35) {
+        var base: int64 := zsLLBase(c);
+        var span: int64 := 1 << zsLLExtra(c);
+        if ((len >= base) & (len < base + span)) { return c; }
+        c := c + 1;
+    }
+    return 0 - 1;
+}
+
+// Match-Length-Code zu einer Matchlaenge (>= 3).
+fn zsMLCodeFor(len: int64): int64 {
+    var c: int64 := 0;
+    while (c <= 52) {
+        var base: int64 := zsMLBase(c);
+        var span: int64 := 1 << zsMLExtra(c);
+        if ((len >= base) & (len < base + span)) { return c; }
+        c := c + 1;
+    }
+    return 0 - 1;
+}
+
+// ---- Bitliste in LESEREIHENFOLGE ---------------------------------------
+// Ein Eintrag ist (nbBits << 32) | wert. Gesammelt wird in der Reihenfolge,
+// in der der DECODER die Bits liest; das Ablegen im Puffer dreht sie um.
+// So muss der Encoder die Rueckwaertsmechanik nicht nachbauen, sondern nur
+// die Lesereihenfolge kennen -- und die steht im Decoder direkt daneben.
+
+fn zsBLPush(list: int64, cnt: int64, val: int64, nb: int64): void {
+    poke64(list + cnt * 8, ((nb & 0xFF) << 32) | (val & 0xFFFFFFFF));
+}
+
+// Legt die Bitliste so ab, dass zsRevNew/zsRevReadBits sie in derselben
+// Reihenfolge zurueckliefert. Gibt die Bytelaenge zurueck.
+fn zsBLEmit(dst: int64, list: int64, cnt: int64): int64 {
+    // Gesamtzahl der Bits
+    var total: int64 := 0;
+    var i: int64 := 0;
+    while (i < cnt) { total := total + ((peek64(list + i * 8) >> 32) & 0xFF); i := i + 1; }
+
+    // Das letzte Byte traegt das Sentinel-Bit; darunter liegen die ZUERST
+    // gelesenen Bits. hb ist die Zahl dieser Bits, also total mod 8.
+    var hb:  int64 := total - (total / 8) * 8;
+    var len: int64 := (total - hb) / 8 + 1;
+
+    var k: int64 := 0;
+    while (k < len) { poke8(dst + k, 0); k := k + 1; }
+    poke8(dst + len - 1, 1 << hb);
+
+    // bitIdx zaehlt in LESEREIHENFOLGE ab 0.
+    var bitIdx: int64 := 0;
+    i := 0;
+    while (i < cnt) {
+        var e:  int64 := peek64(list + i * 8);
+        var nb: int64 := (e >> 32) & 0xFF;
+        var v:  int64 := e & 0xFFFFFFFF;
+        var b:  int64 := nb - 1;
+        while (b >= 0) {
+            var bit: int64 := (v >> b) & 1;
+            if (bit != 0) {
+                var bytePos: int64 := 0;
+                var bitPos:  int64 := 0;
+                if (bitIdx < hb) {
+                    bytePos := len - 1;
+                    bitPos  := hb - 1 - bitIdx;
+                } else {
+                    var rest: int64 := bitIdx - hb;
+                    bytePos := len - 2 - (rest / 8);
+                    bitPos  := 7 - (rest - (rest / 8) * 8);
+                }
+                poke8(dst + bytePos, peek8(dst + bytePos) | (1 << bitPos));
+            }
+            bitIdx := bitIdx + 1;
+            b := b - 1;
+        }
+        i := i + 1;
+    }
+    return len;
+}
+
+// ---- LZ77 --------------------------------------------------------------
+
+pub con ZSTD_HASH_BITS: int64 := 15;
+pub con ZSTD_MIN_MATCH: int64 := 3;
+pub con ZSTD_MAX_CHAIN: int64 := 32;
+
+fn zsHash4(p: int64): int64 {
+    var v: int64 := peek8(p) | (peek8(p + 1) << 8) | (peek8(p + 2) << 16) | (peek8(p + 3) << 24);
+    return ((v * 2654435761) >> (32 - ZSTD_HASH_BITS)) & ((1 << ZSTD_HASH_BITS) - 1);
+}
+
+// Schreibt Literalabschnitt, Sequenzkopf und Sequenz-Bitstrom.
+fn zsWriteSeqBlock(dst: int64, dstMax: int64, lits: int64, nLit: int64,
+                   seqLL: int64, seqML: int64, seqOF: int64, nSeq: int64): int64 {
+    var pos: int64 := 0;
+
+    // --- Literalabschnitt: Raw_Literals_Block (Typ 0) ---
+    if (nLit < 32) {
+        if (pos + 1 > dstMax) { return 0 - 1; }
+        poke8(dst + pos, (nLit << 3) | 0); pos := pos + 1;
+    } else {
+        if (nLit < 4096) {
+            if (pos + 2 > dstMax) { return 0 - 1; }
+            poke8(dst + pos, (1 << 2) | ((nLit & 0xF) << 4)); pos := pos + 1;
+            poke8(dst + pos, (nLit >> 4) & 0xFF);             pos := pos + 1;
+        } else {
+            if (nLit > 1048575) { return 0 - 1; }
+            if (pos + 3 > dstMax) { return 0 - 1; }
+            poke8(dst + pos, (3 << 2) | ((nLit & 0xF) << 4)); pos := pos + 1;
+            poke8(dst + pos, (nLit >> 4) & 0xFF);             pos := pos + 1;
+            poke8(dst + pos, (nLit >> 12) & 0xFF);            pos := pos + 1;
+        }
+    }
+    if (pos + nLit > dstMax) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < nLit) { poke8(dst + pos + i, peek8(lits + i)); i := i + 1; }
+    pos := pos + nLit;
+
+    // --- Sequenzkopf: Anzahl, dann Modusbyte (alle drei vordefiniert) ---
+    if (nSeq < 128) {
+        if (pos + 1 > dstMax) { return 0 - 1; }
+        poke8(dst + pos, nSeq); pos := pos + 1;
+    } else {
+        if (nSeq < 32512) {
+            if (pos + 2 > dstMax) { return 0 - 1; }
+            poke8(dst + pos, (nSeq >> 8) + 128); pos := pos + 1;
+            poke8(dst + pos, nSeq & 0xFF);       pos := pos + 1;
+        } else {
+            if (pos + 3 > dstMax) { return 0 - 1; }
+            poke8(dst + pos, 255);                        pos := pos + 1;
+            poke8(dst + pos, (nSeq - 0x7F00) & 0xFF);     pos := pos + 1;
+            poke8(dst + pos, ((nSeq - 0x7F00) >> 8) & 0xFF); pos := pos + 1;
+        }
+    }
+    if (pos + 1 > dstMax) { return 0 - 1; }
+    poke8(dst + pos, 0); pos := pos + 1;   // alle drei Modi = Predefined
+
+    // --- Codes und Zusatzwerte je Sequenz ---
+    var llC: int64 := alloc(nSeq * 8); var llV: int64 := alloc(nSeq * 8);
+    var mlC: int64 := alloc(nSeq * 8); var mlV: int64 := alloc(nSeq * 8);
+    var ofC: int64 := alloc(nSeq * 8); var ofV: int64 := alloc(nSeq * 8);
+    var bad: int64 := 0;
+
+    i := 0;
+    while (i < nSeq) {
+        var ll: int64 := peek64(seqLL + i * 8);
+        var ml: int64 := peek64(seqML + i * 8);
+        var of: int64 := peek64(seqOF + i * 8);
+
+        var lc: int64 := zsLLCodeFor(ll);
+        var mc: int64 := zsMLCodeFor(ml);
+        if ((lc < 0) | (mc < 0)) { bad := 1; }
+        else {
+            // offset_value = offset + 3; damit ist es immer > 3 und meint nie
+            // einen Wiederholoffset -- der Encoder benutzt sie nicht.
+            var ov: int64 := of + 3;
+            var oc: int64 := zsHighbit(ov);
+            if (oc > 28) { bad := 1; }
+            else {
+                poke64(llC + i * 8, lc); poke64(llV + i * 8, ll - zsLLBase(lc));
+                poke64(mlC + i * 8, mc); poke64(mlV + i * 8, ml - zsMLBase(mc));
+                poke64(ofC + i * 8, oc); poke64(ofV + i * 8, ov - (1 << oc));
+            }
+        }
+        i := i + 1;
+    }
+
+    var llT: int64 := zsLLPredefined();
+    var mlT: int64 := zsMLPredefined();
+    var ofT: int64 := zsOFFPredefined();
+
+    // --- Zustandsfolgen rueckwaerts bestimmen ---
+    var llS: int64 := alloc(nSeq * 8);
+    var mlS: int64 := alloc(nSeq * 8);
+    var ofS: int64 := alloc(nSeq * 8);
+    if (bad == 0) {
+        poke64(llS + (nSeq - 1) * 8, zsFSEAnyState(llT, peek64(llC + (nSeq - 1) * 8)));
+        poke64(mlS + (nSeq - 1) * 8, zsFSEAnyState(mlT, peek64(mlC + (nSeq - 1) * 8)));
+        poke64(ofS + (nSeq - 1) * 8, zsFSEAnyState(ofT, peek64(ofC + (nSeq - 1) * 8)));
+        var j: int64 := nSeq - 2;
+        while (j >= 0) {
+            poke64(llS + j * 8, zsFSEPrevState(llT, peek64(llC + j * 8), peek64(llS + (j + 1) * 8)));
+            poke64(mlS + j * 8, zsFSEPrevState(mlT, peek64(mlC + j * 8), peek64(mlS + (j + 1) * 8)));
+            poke64(ofS + j * 8, zsFSEPrevState(ofT, peek64(ofC + j * 8), peek64(ofS + (j + 1) * 8)));
+            j := j - 1;
+        }
+        var v: int64 := 0;
+        while (v < nSeq) {
+            if ((peek64(llS + v * 8) < 0) | (peek64(mlS + v * 8) < 0)) { bad := 1; }
+            if (peek64(ofS + v * 8) < 0) { bad := 1; }
+            v := v + 1;
+        }
+    }
+
+    var outLen: int64 := 0 - 1;
+    if (bad == 0) {
+        // --- Bitliste in Lesereihenfolge ---
+        var maxEntries: int64 := nSeq * 6 + 8;
+        var list: int64 := alloc(maxEntries * 8);
+        var cnt:  int64 := 0;
+
+        // Anfangszustaende: LL, OFFSET, ML -- in dieser Reihenfolge liest sie
+        // der Decoder (RFC 8878 §3.1.1.3.2.1).
+        zsBLPush(list, cnt, peek64(llS), peek64(llT)); cnt := cnt + 1;
+        zsBLPush(list, cnt, peek64(ofS), peek64(ofT)); cnt := cnt + 1;
+        zsBLPush(list, cnt, peek64(mlS), peek64(mlT)); cnt := cnt + 1;
+
+        var q: int64 := 0;
+        while (q < nSeq) {
+            // Zusatzbits: Offset, dann ML, dann LL.
+            zsBLPush(list, cnt, peek64(ofV + q * 8), peek64(ofC + q * 8)); cnt := cnt + 1;
+            zsBLPush(list, cnt, peek64(mlV + q * 8), zsMLExtra(peek64(mlC + q * 8))); cnt := cnt + 1;
+            zsBLPush(list, cnt, peek64(llV + q * 8), zsLLExtra(peek64(llC + q * 8))); cnt := cnt + 1;
+
+            // Zustandsfortschreibung: LL, ML, OFFSET -- entfaellt bei der
+            // letzten Sequenz.
+            if (q < nSeq - 1) {
+                var ls: int64 := peek64(llS + q * 8);
+                var ms: int64 := peek64(mlS + q * 8);
+                var os: int64 := peek64(ofS + q * 8);
+                zsBLPush(list, cnt, peek64(llS + (q + 1) * 8) - zsFSENewState(llT, ls), zsFSENbBits(llT, ls)); cnt := cnt + 1;
+                zsBLPush(list, cnt, peek64(mlS + (q + 1) * 8) - zsFSENewState(mlT, ms), zsFSENbBits(mlT, ms)); cnt := cnt + 1;
+                zsBLPush(list, cnt, peek64(ofS + (q + 1) * 8) - zsFSENewState(ofT, os), zsFSENbBits(ofT, os)); cnt := cnt + 1;
+            }
+            q := q + 1;
+        }
+
+        // Jeder Eintrag traegt hoechstens 32 Bit, also 4 Byte; dazu das
+        // Sentinel-Byte. Erst pruefen, dann schreiben -- zsBLEmit kennt die
+        // Puffergrenze nicht.
+        if (dstMax - pos > cnt * 4 + 8) {
+            var bitBytes: int64 := zsBLEmit(dst + pos, list, cnt);
+            outLen := pos + bitBytes;
+        }
+        free(list, maxEntries * 8);
+    }
+
+    zsFSEFree(llT); zsFSEFree(mlT); zsFSEFree(ofT);
+    free(llC, nSeq * 8); free(llV, nSeq * 8);
+    free(mlC, nSeq * 8); free(mlV, nSeq * 8);
+    free(ofC, nSeq * 8); free(ofV, nSeq * 8);
+    free(llS, nSeq * 8); free(mlS, nSeq * 8); free(ofS, nSeq * 8);
+    return outLen;
+}
+
+// ---- Blockkompression ---------------------------------------------------
+//
+// Schreibt einen Compressed Block fuer src[0..len) nach dst und gibt die
+// Bytezahl zurueck, oder -1, wenn sich das nicht lohnt bzw. nicht geht. Der
+// Aufrufer faellt dann auf einen Raw Block zurueck -- das ist der Grund, warum
+// hier NICHTS geraten werden muss: es gibt einen gueltigen Ausweg.
+fn zsCompressBlockBody(src: int64, len: int64, dst: int64, dstMax: int64): int64 {
+    if (len < 16) { return 0 - 1; }
+
+    var hashSize: int64 := 1 << ZSTD_HASH_BITS;
+    var head: int64 := alloc(hashSize * 8);
+    var prev: int64 := alloc(len * 8);
+    var k: int64 := 0;
+    while (k < hashSize) { poke64(head + k * 8, 0 - 1); k := k + 1; }
+
+    // Sequenzspeicher: je Sequenz literalLaenge, matchLaenge, offset.
+    var maxSeq: int64 := len / 3 + 4;
+    var seqLL:  int64 := alloc(maxSeq * 8);
+    var seqML:  int64 := alloc(maxSeq * 8);
+    var seqOF:  int64 := alloc(maxSeq * 8);
+    var lits:   int64 := alloc(len + 8);
+    var nSeq:   int64 := 0;
+    var nLit:   int64 := 0;
+
+    var pos:      int64 := 0;
+    var litStart: int64 := 0;
+    while (pos + ZSTD_MIN_MATCH < len) {
+        var h:    int64 := zsHash4(src + pos);
+        var cand: int64 := peek64(head + h * 8);
+
+        var bestLen: int64 := 0;
+        var bestOff: int64 := 0;
+        var chain:   int64 := 0;
+        while ((cand >= 0) & (chain < ZSTD_MAX_CHAIN)) {
+            var off: int64 := pos - cand;
+            if (off > 131072) { chain := ZSTD_MAX_CHAIN; }
+            else {
+                var m: int64 := 0;
+                while ((pos + m < len) & (peek8(src + cand + m) == peek8(src + pos + m))) { m := m + 1; }
+                if (m > bestLen) { bestLen := m; bestOff := off; }
+                cand  := peek64(prev + cand * 8);
+                chain := chain + 1;
+            }
+        }
+
+        poke64(prev + pos * 8, peek64(head + h * 8));
+        poke64(head + h * 8, pos);
+
+        if (bestLen >= ZSTD_MIN_MATCH) {
+            var litLen: int64 := pos - litStart;
+            var j: int64 := 0;
+            while (j < litLen) { poke8(lits + nLit + j, peek8(src + litStart + j)); j := j + 1; }
+            nLit := nLit + litLen;
+            poke64(seqLL + nSeq * 8, litLen);
+            poke64(seqML + nSeq * 8, bestLen);
+            poke64(seqOF + nSeq * 8, bestOff);
+            nSeq := nSeq + 1;
+
+            // Die uebersprungenen Stellen trotzdem in die Kette haengen,
+            // sonst findet der naechste Durchlauf sie nie wieder.
+            var q: int64 := pos + 1;
+            while (q < pos + bestLen) {
+                if (q + 4 <= len) {
+                    var hq: int64 := zsHash4(src + q);
+                    poke64(prev + q * 8, peek64(head + hq * 8));
+                    poke64(head + hq * 8, q);
+                }
+                q := q + 1;
+            }
+            pos      := pos + bestLen;
+            litStart := pos;
+        } else {
+            pos := pos + 1;
+        }
+    }
+    // Rest als nachlaufende Literale
+    var tail: int64 := len - litStart;
+    var t: int64 := 0;
+    while (t < tail) { poke8(lits + nLit + t, peek8(src + litStart + t)); t := t + 1; }
+    nLit := nLit + tail;
+
+    var result: int64 := 0 - 1;
+    if (nSeq > 0) { result := zsWriteSeqBlock(dst, dstMax, lits, nLit, seqLL, seqML, seqOF, nSeq); }
+
+    free(head, hashSize * 8); free(prev, len * 8);
+    free(seqLL, maxSeq * 8); free(seqML, maxSeq * 8); free(seqOF, maxSeq * 8);
+    free(lits, len + 8);
+    return result;
+}
+
 pub fn ZstdCompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64 {
     if (((src == 0) | (dst == 0))) { return ZSTD_ERR; }
+    if (srcLen < 0) { return ZSTD_ERR; }
 
     var blockMax: int64 := 131072;
     var numBlocks: int64 := 1;
     if (srcLen > 0) { numBlocks := (srcLen + blockMax - 1) / blockMax; }
-    // Overhead: 13 bytes frame header + 3 bytes per block
-    var needed: int64 := 13 + numBlocks * 3 + srcLen;
+    // Schlimmster Fall: alle Bloecke bleiben roh. 13 Byte Rahmen, 3 Byte je
+    // Blockkopf, 4 Byte Pruefsumme.
+    var needed: int64 := 17 + numBlocks * 3 + srcLen;
     if (dstMax < needed) { return ZSTD_OVERFLOW; }
 
     var pos: int64 := 0;
@@ -1410,17 +2141,35 @@ pub fn ZstdCompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64
     poke8(dst + pos, 0x2F); pos := pos + 1;
     poke8(dst + pos, 0xFD); pos := pos + 1;
 
-    // FHD: FCS=11 (8-byte size), SSF=1, CCF=0, DID=00
-    // = bits[7:6]=11, bit5=1, bit4=0, bit3=0, bits[2:1]=00, bit0=0
-    // = 1110_0000 = 0xE0
-    poke8(dst + pos, 0xE0); pos := pos + 1;
+    // FHD: Single_Segment=1, Content_Checksum=1, kein Dictionary. Die
+    // Pruefsumme kostet vier Byte und macht jeden Uebertragungsfehler beim
+    // Auspacken sichtbar -- ohne sie faellt ein gekipptes Bit als plausibler
+    // Inhalt durch (#1072).
+    //
+    // Das Groessenfeld bekommt die kleinste Form, die reicht. Fest acht Byte
+    // waeren bei kurzen Eingaben sieben Byte Rahmen, den niemand braucht.
+    var fcsField: int64 := 0;   // 1 Byte, nur mit Single_Segment
+    var fcsBytes: int64 := 1;
+    if (srcLen > 255) {
+        if (srcLen <= 65791) { fcsField := 1; fcsBytes := 2; }
+        else { if (srcLen <= 4294967295) { fcsField := 2; fcsBytes := 4; }
+        else { fcsField := 3; fcsBytes := 8; } }
+    }
+    poke8(dst + pos, (fcsField << 6) | (1 << 5) | (1 << 2)); pos := pos + 1;
 
-    // Content size (8 bytes LE)
+    // Bei zwei Byte traegt das Feld den Wert MINUS 256 (RFC 8878 §3.1.1.1.4).
     var cs: int64 := srcLen;
+    if (fcsField == 1) { cs := srcLen - 256; }
     var k: int64 := 0;
-    while (k < 8) { poke8(dst + pos, cs & 0xFF); cs := cs >> 8; pos := pos + 1; k := k + 1; }
+    while (k < fcsBytes) { poke8(dst + pos, cs & 0xFF); cs := cs >> 8; pos := pos + 1; k := k + 1; }
 
-    // Raw blocks
+    if (srcLen == 0) {
+        // Ein einzelner leerer letzter Block.
+        poke8(dst + pos, 1); pos := pos + 1;
+        poke8(dst + pos, 0); pos := pos + 1;
+        poke8(dst + pos, 0); pos := pos + 1;
+    }
+
     var srcOff: int64 := 0;
     while (srcOff < srcLen) {
         var remain: int64 := srcLen - srcOff;
@@ -1428,23 +2177,67 @@ pub fn ZstdCompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64
         if (blkSize > blockMax) { blkSize := blockMax; }
         var isLast: int64 := 0;
         if (srcOff + blkSize >= srcLen) { isLast := 1; }
-        // Block header: blockSize << 3 | BlockType=0 << 1 | isLast
-        var hdr: int64 := (blkSize << 3) | isLast;
-        poke8(dst + pos, hdr & 0xFF);         pos := pos + 1;
-        poke8(dst + pos, (hdr >> 8) & 0xFF);  pos := pos + 1;
-        poke8(dst + pos, (hdr >> 16) & 0xFF); pos := pos + 1;
-        var j: int64 := 0;
-        while (j < blkSize) { poke8(dst + pos, peek8(src + srcOff + j)); pos := pos + 1; j := j + 1; }
-        srcOff += blkSize;
+
+        var bodyPos: int64 := pos + 3;   // hinter dem Blockkopf
+
+        // 1. Besteht der Block aus einem einzigen Bytewert, ist der RLE-Block
+        //    unschlagbar: ein Byte fuer beliebige Laenge.
+        var allSame: int64 := 1;
+        var b0: int64 := peek8(src + srcOff);
+        var t:  int64 := 1;
+        while ((t < blkSize) & (allSame == 1)) {
+            if (peek8(src + srcOff + t) != b0) { allSame := 0; }
+            t := t + 1;
+        }
+
+        var blockType: int64 := 0;
+        var bodyLen:   int64 := blkSize;
+
+        if (allSame == 1) {
+            poke8(dst + bodyPos, b0);
+            blockType := 1;
+            bodyLen   := 1;
+        } else {
+            // 2. Komprimierten Block versuchen. Gelingt er nicht oder wird er
+            //    nicht kleiner, bleibt der Rohblock -- ein gueltiger Ausweg,
+            //    deshalb muss hier nichts geraten werden.
+            var comp: int64 := 0 - 1;
+            if (dstMax - bodyPos > blkSize) {
+                comp := zsCompressBlockBody(src + srcOff, blkSize, dst + bodyPos, dstMax - bodyPos);
+            }
+            if ((comp > 0) & (comp < blkSize)) {
+                blockType := 2;
+                bodyLen   := comp;
+            } else {
+                if (bodyPos + blkSize > dstMax) { return ZSTD_OVERFLOW; }
+                var j: int64 := 0;
+                while (j < blkSize) { poke8(dst + bodyPos + j, peek8(src + srcOff + j)); j := j + 1; }
+                blockType := 0;
+                bodyLen   := blkSize;
+            }
+        }
+
+        // Blockkopf: bei RLE traegt das Groessenfeld die WIEDERHOLZAHL, sonst
+        // die Zahl der folgenden Bytes.
+        var hdrSize: int64 := bodyLen;
+        if (blockType == 1) { hdrSize := blkSize; }
+        var hdr: int64 := (hdrSize << 3) | (blockType << 1) | isLast;
+        poke8(dst + pos,     hdr & 0xFF);
+        poke8(dst + pos + 1, (hdr >> 8) & 0xFF);
+        poke8(dst + pos + 2, (hdr >> 16) & 0xFF);
+
+        pos    := bodyPos + bodyLen;
+        srcOff := srcOff + blkSize;
     }
 
-    // If srcLen == 0: write a single empty last block
-    if (srcLen == 0) {
-        // LastBlock=1, BlockType=0, BlockSize=0 → hdr = (0 << 3) | (0 << 1) | 1 = 1
-        poke8(dst + pos, 1); pos := pos + 1;
-        poke8(dst + pos, 0); pos := pos + 1;
-        poke8(dst + pos, 0); pos := pos + 1;
-    }
+    // Content_Checksum: untere vier Byte des XXH64 ueber den Inhalt.
+    if (pos + 4 > dstMax) { return ZSTD_OVERFLOW; }
+    var sum: int64 := zsXxh64(src, srcLen);
+    poke8(dst + pos,     sum & 0xFF);
+    poke8(dst + pos + 1, (sum >> 8) & 0xFF);
+    poke8(dst + pos + 2, (sum >> 16) & 0xFF);
+    poke8(dst + pos + 3, (sum >> 24) & 0xFF);
+    pos := pos + 4;
 
     return pos;
 }

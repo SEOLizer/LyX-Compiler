@@ -679,6 +679,8 @@ pub type Inflater = class {
     output:    int64;   // Ausgabe-Buffer
     bit_pos:   int64;   // absolute Bit-Position in input
     out_pos:   int64;   // geschriebene Ausgabe-Bytes
+    out_max:   int64;   // #1070: Obergrenze; 0 = unbeschraenkt (Altverhalten)
+    out_full:  int64;   // #1070: 1, wenn an out_max abgebrochen wurde
 
     lenBase:   int64;   // int64[29]  Längen-Basiswerte (Symbol 257..285)
     lenExtra:  int64;   // int64[29]  Längen-Extrabits
@@ -699,6 +701,8 @@ pub type Inflater = class {
         self.output    := outp;
         self.bit_pos   := 0;
         self.out_pos   := 0;
+        self.out_max   := 0;
+        self.out_full  := 0;
         self.lenBase   := alloc(29 * 8);
         self.lenExtra  := alloc(29 * 8);
         self.distBase  := alloc(30 * 8);
@@ -920,6 +924,7 @@ pub type Inflater = class {
             var s: int64 := self.decode(self.litCnt, self.litSym);
             if (s < 0) { return -1; }
             if (s < 256) {
+                if (self.out_max > 0 && self.out_pos >= self.out_max) { self.out_full := 1; return -1; }
                 poke8(self.output + self.out_pos, s & 0xFF);
                 self.out_pos += 1;
             } else if (s == 256) {
@@ -934,6 +939,7 @@ pub type Inflater = class {
                 if (dist < 1 || dist > self.out_pos) { return -1; }
                 var k: int64 := 0;
                 while (k < length) {
+                    if (self.out_max > 0 && self.out_pos >= self.out_max) { self.out_full := 1; return -1; }
                     var b: int64 := peek8(self.output + (self.out_pos - dist));
                     poke8(self.output + self.out_pos, b);
                     self.out_pos += 1;
@@ -962,6 +968,7 @@ pub type Inflater = class {
                 if (bytePos + slen > self.input_len) { return -1; }
                 var k: int64 := 0;
                 while (k < slen) {
+                    if (self.out_max > 0 && self.out_pos >= self.out_max) { self.out_full := 1; return -1; }
                     poke8(self.output + self.out_pos, peek8(self.input + bytePos + k));
                     self.out_pos += 1;
                     k += 1;
@@ -986,6 +993,26 @@ pub fn InflateDEFLATE(input: pchar, input_len: int64, output: pchar): int64 {
     var inf: Inflater := new Inflater();
     inf.init(input as int64, input_len, output as int64);
     return inf.run();
+}
+
+// #1070: Wie InflateDEFLATE, aber mit Obergrenze fuer die Ausgabe. Ohne sie
+// schreibt der Inflater so weit, wie der Strom es verlangt -- bei fremden
+// Daten also ueber jeden Puffer hinaus. Fuer gzip ist das Pflicht, weil dort
+// die Groesse erst im Trailer steht und bis dahin nichts geprueft ist.
+// consumedOut (oder 0) nimmt die Zahl der VERBRAUCHTEN EINGABEBYTES auf; die
+// braucht ein Aufrufer, um hinter dem Strom weiterzulesen (gzip-Trailer,
+// weitere Member).
+pub fn InflateDEFLATEBounded(input: pchar, input_len: int64, output: pchar,
+                             out_max: int64, consumedOut: int64): int64 {
+    var inf: Inflater := new Inflater();
+    inf.init(input as int64, input_len, output as int64);
+    inf.out_max := out_max;
+    var n: int64 := inf.run();
+    if (consumedOut != 0) { poke64(consumedOut, (inf.bit_pos + 7) / 8); }
+    // #1070: "Puffer zu klein" und "Strom kaputt" muessen unterscheidbar sein,
+    // sonst meldet der Aufrufer einem zu kleinen Puffer Datenverfall.
+    if ((n < 0) && (inf.out_full != 0)) { return -2; }
+    return n;
 }
 
 // Zlib Decompress
