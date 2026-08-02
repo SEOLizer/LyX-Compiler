@@ -557,6 +557,13 @@ pub type Codegen = class {
   globalVarCount: int64;
   globalVarCap:   int64;
   globalIsPchar:  int64;  // byte buffer parallel to globalVars: 1 = pchar type
+  // #1094: deklarierter Typname je globaler Variable {ptr:8, len:8}, parallel
+  // zu globalVars. Ohne ihn waere der statische Typ einer globalen Variablen
+  // im Codegen nicht bestimmbar — `g is int64` muesste dann melden statt zu
+  // antworten.
+  globalTypeNames: int64;
+  // #1094: Laenge des zuletzt von cg_staticTypeName gelieferten Typnamens.
+  stnLen:         int64;
 
   // WP-BC-40: Compile-time profiling entry table (x86_64 only)
   // Entry: {namePtr:8 (src ptr), nameLen:8, dataOff:8, nameDataOff:8} = 32 bytes
@@ -933,11 +940,14 @@ pub type Codegen = class {
       var nc: int64 := self.globalVarCap * 2;
       var nb: int64 := alloc(nc * 24);
       var np: int64 := alloc(nc);
+      var nt: int64 := alloc(nc * 16);
       var i: int64 := 0;
       memcpy(nb, self.globalVars, self.globalVarCount * 24);
       i := 0;
       memcpy(np, self.globalIsPchar, self.globalVarCount);
+      memcpy(nt, self.globalTypeNames, self.globalVarCount * 16);
       self.globalVars := nb; self.globalVarCap := nc; self.globalIsPchar := np;
+      self.globalTypeNames := nt;
     }
     var doff: int64 := self.dataLen;
     // Reserve 8 zero bytes in data section (mmap is zero-initialized)
@@ -948,6 +958,8 @@ pub type Codegen = class {
     poke64(base + CG_GLOBAL_OFF_NAMELEN,  nlen);
     poke64(base + CG_GLOBAL_OFF_DOFF, doff);
     poke8(self.globalIsPchar + self.globalVarCount, 0);
+    poke64(self.globalTypeNames + self.globalVarCount * 16, 0);
+    poke64(self.globalTypeNames + self.globalVarCount * 16 + 8, 0);
     self.globalVarCount += 1;
     return doff;
   }
@@ -3637,8 +3649,9 @@ pub type Codegen = class {
     var parentNi: int64 := self.cg_nc2(ni);
     var parentFieldCnt: int64 := 0;
     var parentFldsPtr: int64 := 0;
+    var pIdx: int64 := 0 - 1;
     if (parentNi >= 0) {
-      var pIdx: int64 := self.cg_findClass(self.cg_nsval(parentNi), self.cg_nslen(parentNi));
+      pIdx := self.cg_findClass(self.cg_nsval(parentNi), self.cg_nslen(parentNi));
       if (pIdx >= 0) {
         parentFieldCnt := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_FIELDCNT);
         parentFldsPtr  := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_FIELDSPTR);
@@ -3736,7 +3749,12 @@ pub type Codegen = class {
     poke64(base + CG_CLASS_OFF_VMTOFF,   -1);
     poke64(base + CG_CLASS_OFF_VMTSLOTS, 0);
     poke64(base + CG_CLASS_OFF_VMTLIST, 0);
-    poke64(base + CG_CLASS_OFF_PARENTIDX, -1);  // structs/flattened classes carry no vtable
+    // #1094: Die Elternklasse wird auch hier vermerkt. Sie steht fuer die
+    // Vererbungskette, nicht fuer eine VMT — die bleibt ueber VMTOFF == -1
+    // ausgeschlossen, und die Slot-Weitergabe (WP-BC-L2) prueft genau darauf.
+    // Ohne den Eintrag waere `b is A` bei methodenlosen Klassen falsch: sie
+    // bekommen struct-Layout, und die Kette waere abgeschnitten.
+    poke64(base + CG_CLASS_OFF_PARENTIDX, pIdx);
     poke64(base + CG_CLASS_OFF_ISSTRUCT, (self.cg_nival(ni) >> 4) & 1);
     self.classCount += 1;
     // Track temporary field array for later cleanup (BUG-02)
@@ -3895,6 +3913,160 @@ pub type Codegen = class {
   fn cg_getBaseRelocCount(): int64 { return self.baseRelocCount; }
 
   // Helper: get class index for object node (IDENT, FIELD chain, or INDEX for struct arrays)
+  // #1094: Kanonische Nummer eines eingebauten Typnamens, 0 = kein eingebauter
+  // Typ. Die Schreibvarianten muessen dieselbe Nummer bekommen, sonst waere
+  // `x is uint64` bei `var x: u64` falsch — sie bezeichnen denselben Typ.
+  fn cg_builtinTypeId(nm: pchar, nl: int64): int64 {
+    if (self.cg_seq(nm, nl, "bool",   4)) { return 1; }
+    if (self.cg_seq(nm, nl, "int64",  5)) { return 2; }
+    if (self.cg_seq(nm, nl, "i64",    3)) { return 2; }
+    if (self.cg_seq(nm, nl, "int32",  5)) { return 3; }
+    if (self.cg_seq(nm, nl, "i32",    3)) { return 3; }
+    if (self.cg_seq(nm, nl, "int16",  5)) { return 4; }
+    if (self.cg_seq(nm, nl, "i16",    3)) { return 4; }
+    if (self.cg_seq(nm, nl, "int8",   4)) { return 5; }
+    if (self.cg_seq(nm, nl, "i8",     2)) { return 5; }
+    if (self.cg_seq(nm, nl, "u64",    3)) { return 6; }
+    if (self.cg_seq(nm, nl, "uint64", 6)) { return 6; }
+    if (self.cg_seq(nm, nl, "u32",    3)) { return 7; }
+    if (self.cg_seq(nm, nl, "uint32", 6)) { return 7; }
+    if (self.cg_seq(nm, nl, "u16",    3)) { return 8; }
+    if (self.cg_seq(nm, nl, "uint16", 6)) { return 8; }
+    if (self.cg_seq(nm, nl, "u8",     2)) { return 9; }
+    if (self.cg_seq(nm, nl, "uint8",  5)) { return 9; }
+    if (self.cg_seq(nm, nl, "pchar",  5)) { return 10; }
+    if (self.cg_seq(nm, nl, "f64",    3)) { return 11; }
+    if (self.cg_seq(nm, nl, "f32",    3)) { return 12; }
+    if (self.cg_seq(nm, nl, "char",   4)) { return 13; }
+    if (self.cg_seq(nm, nl, "void",   4)) { return 14; }
+    return 0;
+  }
+
+  // #1094: statischer Typname eines Ausdrucks; 0 = nicht bestimmbar.
+  // Die Laenge steht danach in self.stnLen.
+  //
+  // `is` braucht diesen Namen zweimal: fuer die Frage, ob der Empfaenger
+  // ueberhaupt eine Klasse mit VMT ist (nur dann darf zur Laufzeit geprueft
+  // werden — bei einem int64 laege an [rax] keine VMT), und fuer die Antwort
+  // in allen uebrigen Faellen, die statisch feststeht. Wo der Typ nicht
+  // bestimmbar ist, MELDET `is` das; ein „unbekannt heisst false" waere genau
+  // der stille Default, der den Fehler ausgemacht hat.
+  fn cg_staticTypeName(ni: int64): pchar {
+    self.stnLen := 0;
+    if (ni < 0) { return 0 as pchar; }
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_LIT_INT)   { self.stnLen := 5; return "int64"c; }
+    if (k == CGN_LIT_STR)   { self.stnLen := 5; return "pchar"c; }
+    if (k == CGN_LIT_FLOAT) { self.stnLen := 3; return "f64"c;   }
+    if (k == CGN_LIT_BOOL)  { self.stnLen := 4; return "bool"c;  }
+    if (k == CGN_LIT_CHAR)  { self.stnLen := 4; return "char"c;  }
+    // `x as T` und `new T` nennen ihren Typ selbst.
+    if (k == CGN_CAST) {
+      var tn2: int64 := self.cg_nc1(ni);
+      if (tn2 < 0) { return 0 as pchar; }
+      self.stnLen := self.cg_nslen(tn2);
+      return self.cg_nsval(tn2);
+    }
+    if (k == CGN_NEW) {
+      self.stnLen := self.cg_nslen(ni);
+      return self.cg_nsval(ni);
+    }
+    if (k == CGN_IDENT) {
+      var nm: pchar := self.cg_nsval(ni);
+      var nl: int64 := self.cg_nslen(ni);
+      if (self.cg_seq(nm, nl, "self", 4)) {
+        if (self.curClassName == 0 as pchar) { return 0 as pchar; }
+        self.stnLen := self.curClassNameLen;
+        return self.curClassName;
+      }
+      var lidx: int64 := self.cg_findLocalIdx(nm, nl);
+      if (lidx >= 0) {
+        var tb: int64 := self.localTypes + lidx * CG_LOCTYPE_SZ;
+        var tp: pchar := peek64(tb) as pchar;
+        var tl: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+        if (tp == 0 as pchar || tl <= 0) { return 0 as pchar; }
+        self.stnLen := tl;
+        return tp;
+      }
+      var gidx: int64 := self.cg_findGlobalIdx(nm, nl);
+      if (gidx >= 0) {
+        var gp: pchar := peek64(self.globalTypeNames + gidx * 16) as pchar;
+        var gl: int64 := peek64(self.globalTypeNames + gidx * 16 + 8);
+        if (gp == 0 as pchar || gl <= 0) { return 0 as pchar; }
+        self.stnLen := gl;
+        return gp;
+      }
+      var cidx: int64 := self.cg_findConIdx(nm, nl);
+      if (cidx >= 0) {
+        if (peek8(self.conIsPchar + cidx) != 0) { self.stnLen := 5; return "pchar"c; }
+        self.stnLen := 5; return "int64"c;
+      }
+      return 0 as pchar;
+    }
+    if (k == CGN_FIELD) {
+      var ci: int64 := self.cg_objClassIdx(self.cg_nc0(ni));
+      if (ci < 0) { return 0 as pchar; }
+      var base: int64 := self.classLayouts + ci * CG_CLASS_SZ;
+      var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+      var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+      var fn2: pchar  := self.cg_nsval(ni);
+      var fl2: int64  := self.cg_nslen(ni);
+      var i: int64 := 0;
+      while (i < cnt) {
+        var fb: int64 := flds + i * CG_CFIELD_SZ;
+        var p: pchar  := peek64(fb) as pchar;
+        var n: int64  := peek64(fb + CG_CFIELD_OFF_FIELDLEN);
+        if (self.cg_seq(p, n, fn2, fl2)) {
+          var tp2: pchar := peek64(fb + CG_CFIELD_OFF_TYPENAMEPTR) as pchar;
+          var tl2: int64 := peek64(fb + CG_CFIELD_OFF_TYPENAMELEN);
+          if (tp2 == 0 as pchar || tl2 <= 0) { return 0 as pchar; }
+          self.stnLen := tl2;
+          return tp2;
+        }
+        i += 1;
+      }
+      return 0 as pchar;
+    }
+    if (k == CGN_CALL && self.cg_nival(ni) == 0) {
+      var cnm: pchar := self.cg_nsval(ni);
+      var cnl: int64 := self.cg_nslen(ni);
+      var j: int64 := 0;
+      while (j < self.fnRetCount) {
+        var rb: int64 := self.fnRetList + j * 32;
+        var rn: pchar := peek64(rb) as pchar;
+        var rl: int64 := peek64(rb + 8);
+        if (self.cg_seq(rn, rl, cnm, cnl)) {
+          var rt: pchar := peek64(rb + 16) as pchar;
+          var rtl: int64 := peek64(rb + 24);
+          if (rt == 0 as pchar || rtl <= 0) { return 0 as pchar; }
+          self.stnLen := rtl;
+          return rt;
+        }
+        j += 1;
+      }
+      return 0 as pchar;
+    }
+    return 0 as pchar;
+  }
+
+  // #1094: Ist ci eine Klasse, die von target abstammt (oder target selbst)?
+  fn cg_isDescendantClass(ci: int64, target: int64): int64 {
+    var cur: int64 := ci;
+    while (cur >= 0) {
+      if (cur == target) { return 1; }
+      cur := peek64(self.classLayouts + cur * CG_CLASS_SZ + CG_CLASS_OFF_PARENTIDX);
+    }
+    return 0;
+  }
+
+  // #1094: Hat die Klasse eine VMT? Ein `struct` hat keine — an [obj+0] liegt
+  // dann das erste Feld, und ein Vergleich dort waere Unsinn.
+  fn cg_classHasVmt(ci: int64): int64 {
+    if (ci < 0) { return 0; }
+    if (peek64(self.classLayouts + ci * CG_CLASS_SZ + CG_CLASS_OFF_VMTOFF) == -1) { return 0; }
+    return 1;
+  }
+
   fn cg_objClassIdx(objNode: int64): int64 {
     var k: int64 := self.cg_nkind(objNode);
     if (k == CGN_FIELD) {
@@ -5049,32 +5221,111 @@ pub type Codegen = class {
       }
 
     } else if (k == CGN_IS_EXPR) {
-      // BUG-08 supplement: x is Type — runtime type check via VMT
-      // c0 = object expression, c1 = type node
-      self.cg_genExpr(self.cg_nc0(ni));
+      // #1094: `x is T`.
+      //
+      // Der Operator hatte drei Wege, und alle drei endeten bei `false`: die
+      // erwartete VMT-Adresse wurde aus der eigenen Codeposition gerechnet
+      // statt aus der Patch-Tabelle und traf nie zu; jeder Nicht-Klassentyp
+      // fiel auf cg_zeroRax; ein frei erfundener Typname ebenso. Ein Typtest,
+      // der konstant `false` liefert, nimmt den Zweig nie und weist auf
+      // nichts hin — der stille Default in Reinform.
+      //
+      // Jetzt: bei einer Klasse mit VMT eine echte Laufzeitpruefung, sonst die
+      // statisch feststehende Antwort, und wo weder das eine noch das andere
+      // entscheidbar ist, eine Meldung.
       var typeNode: int64 := self.cg_nc1(ni);
-      if (typeNode >= 0) {
-        var tname: pchar := self.cg_nsval(typeNode);
-        var tlen: int64 := self.cg_nslen(typeNode);
-        var classIdx: int64 := self.cg_findClass(tname, tlen);
-        if (classIdx >= 0) {
-          // Load VMT pointer from object: mov rcx, [rax]
-          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x08);
-          // Load expected VMT address
-          var vmtOff: int64 := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTOFF);
-          var expectedVmt: int64 := CG_ELF_BASE + CG_CODE_OFF + self.codeLen + 20 + vmtOff;
-          // mov rdx, imm64 (expected VMT)
-          self.cg_e8(0x48); self.cg_e8(0xBA);
-          self.cg_e64(expectedVmt);
-          // cmp rcx, rdx; sete al; movzx rax, al
-          self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xD1);
-          self.cg_e8(0x0F); self.cg_e8(0x94); self.cg_e8(0xC0);
-          self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);
-        } else {
-          self.cg_zeroRax();
+      if (typeNode < 0) {
+        EPrintStrLn("error: `is` ohne Typ"c);
+        exit(1);
+      }
+      var tname: pchar := self.cg_nsval(typeNode);
+      var tlen:  int64 := self.cg_nslen(typeNode);
+      var classIdx: int64 := self.cg_findClass(tname, tlen);
+      var tBuiltin: int64 := self.cg_builtinTypeId(tname, tlen);
+      if (classIdx < 0 && tBuiltin == 0) {
+        EPrintStr("error: unbekannter Typ in `is`-Ausdruck: '"c);
+        sys_write(2, tname, tlen);
+        EPrintStr("'\n"c);
+        EPrintStrLn("  `is` prueft gegen einen Klassen-, Struktur- oder eingebauten Typ."c);
+        exit(1);
+      }
+      // Statischer Typ des Empfaengers. Er entscheidet, ob ueberhaupt zur
+      // Laufzeit geprueft werden darf: nur eine Klasse mit VMT traegt an
+      // [obj+0] den Typzeiger.
+      var srcName: pchar := self.cg_staticTypeName(self.cg_nc0(ni));
+      var srcLen:  int64 := self.stnLen;
+      if (srcName == 0 as pchar) {
+        EPrintStrLn("error: statischer Typ des Ausdrucks vor `is` ist nicht bestimmbar"c);
+        EPrintStrLn("  Der Ausdruck zuerst einer Variablen mit deklariertem Typ zuweisen."c);
+        exit(1);
+      }
+      var srcIdx: int64 := self.cg_findClass(srcName, srcLen);
+      // Ein Typname, den weder die Klassentabelle noch die Liste der
+      // eingebauten Typen kennt (Alias, Generik, importierter Typ), macht die
+      // Antwort unentscheidbar. Sie hier auf `false` zu setzen waere derselbe
+      // stille Default noch einmal.
+      if (srcIdx < 0 && self.cg_builtinTypeId(srcName, srcLen) == 0) {
+        EPrintStr("error: `is` kann den Typ '"c);
+        sys_write(2, srcName, srcLen);
+        EPrintStr("' nicht pruefen\n"c);
+        EPrintStrLn("  Geprueft werden Klassen (zur Laufzeit) und eingebaute Typen (statisch)."c);
+        exit(1);
+      }
+
+      if (self.cg_classHasVmt(classIdx) != 0 && self.cg_classHasVmt(srcIdx) != 0) {
+        // Laufzeitpruefung. Getroffen wird die Zielklasse SAMT ihrer
+        // Nachfahren — sonst waere `b is A` bei `B extends A` falsch, und
+        // genau dafuer gibt es den Operator.
+        self.cg_genExpr(self.cg_nc0(ni));
+        self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);   // xor r8, r8
+        self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
+        self.cg_e8(0x0F); self.cg_e8(0x84);                     // jz .done  (null ist nie ein T)
+        var doneJ: int64 := self.codeLen;
+        self.cg_e32(0);
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x08);   // mov rcx, [rax]
+        var ci: int64 := 0;
+        while (ci < self.classCount) {
+          if (self.cg_classHasVmt(ci) != 0 && self.cg_isDescendantClass(ci, classIdx) != 0) {
+            var cb: int64 := self.classLayouts + ci * CG_CLASS_SZ;
+            var cnp: pchar := peek64(cb) as pchar;
+            var cnl: int64 := peek64(cb + CG_PATCH_OFF_NAMEPTR);
+            self.cg_e8(0x48); self.cg_e8(0xBA);                 // mov rdx, imm64
+            var vp: int64 := self.codeLen;
+            self.cg_e64(0);
+            self.cg_addVmtPatch(vp, cnp, cnl);
+            self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xD1); // cmp rcx, rdx
+            self.cg_e8(0x75); self.cg_e8(0x07);                   // jne +7
+            self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); // mov r8, 1
+            self.cg_e32(1);
+          }
+          ci += 1;
         }
+        poke32(self.code + doneJ, self.codeLen - doneJ - 4);
+        self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xC0);   // mov rax, r8
       } else {
-        self.cg_zeroRax();
+        // Kein polymorpher Fall: die Antwort steht zur Uebersetzungszeit fest.
+        // Der Empfaenger wird trotzdem ausgewertet — er kann Seiteneffekte
+        // haben, und `f() is A` darf f nicht verschlucken.
+        self.cg_genExpr(self.cg_nc0(ni));
+        var res: int64 := 0;
+        if (classIdx >= 0) {
+          // Klassen OHNE Methode bekommen struct-Layout und damit keine VMT
+          // (cg_buildStructLayout) — es gibt zur Laufzeit nichts zu lesen.
+          // Die Antwort ist dann der statisch bekannte Vererbungsweg, und
+          // `null` bleibt trotzdem kein T.
+          if (srcIdx >= 0 && self.cg_isDescendantClass(srcIdx, classIdx) != 0) { res := 1; }
+          if (res != 0) {
+            self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
+            self.cg_e8(0x0F); self.cg_e8(0x95); self.cg_e8(0xC0);   // setne al
+            self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);   // movzx rax, al
+          } else {
+            self.cg_movRaxImm(0);
+          }
+        } else {
+          var sBuiltin: int64 := self.cg_builtinTypeId(srcName, srcLen);
+          if (sBuiltin != 0 && sBuiltin == tBuiltin) { res := 1; }
+          self.cg_movRaxImm(res);
+        }
       }
 
     } else if (k == CGN_CLOSURE) {
@@ -11645,6 +11896,9 @@ pub type Codegen = class {
           if (gtn == 5 && self.cg_seq(gtp, gtn, "pchar", 5)) {
             poke8(self.globalIsPchar + gIdx, 1);
           }
+          // #1094: Typname merken (siehe cg_staticTypeName).
+          poke64(self.globalTypeNames + gIdx * 16,     gtp as int64);
+          poke64(self.globalTypeNames + gIdx * 16 + 8, gtn);
         }
         // Write literal initializer directly into data section
         var initNode: int64 := self.cg_nc1(cur);
@@ -11915,7 +12169,9 @@ pub type Codegen = class {
     self.globalVarCap   := 64;
     self.globalVars     := alloc(self.globalVarCap * 24);
     self.globalIsPchar  := alloc(self.globalVarCap);
+    self.globalTypeNames := alloc(self.globalVarCap * 16);
     self.globalVarCount := 0;
+    self.stnLen         := 0;
 
     // WP-BC-40: Profiling entry table (initially empty)
     self.profEntryCap   := 16;
