@@ -527,7 +527,10 @@ MethodModifier      = "static"
 
 MemberVisibility    = "private"
                     | "protected"
-                    | "pub" ;
+                    | ( "pub" | "public" ) ;
+
+(* `public` ist eine gleichwertige Schreibweise zu `pub` -- an Funktionen wie
+   an Klassenmitgliedern (#1104). *)
 ```
 
 ---
@@ -688,6 +691,13 @@ SwitchCase          = "case" ConstExpr ":" { Statement } ;
 
 SwitchDefault       = "default" ":" { Statement } ;
 
+(* Jeder Zweig muss mit `break` oder `return` enden; ein durchfallender Zweig
+   wird gemeldet ("switch case may fall through"). Das kehrt das Verhalten von
+   C bewusst um: dort faellt ein Zweig ohne `break` in den naechsten, und die
+   haeufigste Fehlerquelle des Konstrukts ist genau das vergessene `break`.
+   Die Regel ist eine semantische Pruefung; die Grammatik allein erzwingt sie
+   nicht (#1104). *)
+
 MatchStmt           = "match"
                       [ "(" ] Expr [ ")" ]
                       "{"
@@ -804,7 +814,8 @@ Pattern             = LiteralPattern
                     | IdentPattern
                     | EnumPattern
                     | WildcardPattern
-                    | TuplePattern ;
+                    | TuplePattern
+                    | StructPattern ;
 
 LiteralPattern      = Literal ;
 
@@ -836,6 +847,27 @@ EnumPattern         = Ident "." Ident ;   (* z. B. Color.Green *)
 WildcardPattern     = "_" ;
 
 TuplePattern        = "(" Pattern "," Pattern { "," Pattern } ")" ;
+
+StructPattern       = Ident "{" [ FieldPattern { "," FieldPattern } ] "}" ;
+
+FieldPattern        = Ident ":" ( IntLiteral | Ident | "_" ) ;
+
+(* Struktur-Muster: `case P { t: 1, f: _ }`. Das Muster passt, wenn ALLE
+   genannten Felder passen; nicht genannte Felder werden nicht geprueft.
+   Der Feldwert ist ein Vergleich (Ganzzahlliteral oder `con`), `_` (Feld
+   ungeprueft) oder eine BINDUNG: ein Bezeichner, der nichts benennt, bindet
+   den Feldwert an diesen Namen und ist im Fallrumpf sichtbar. Die Lesart
+   "Bezeichner = Verweis, wenn er einen kennt" ist dieselbe wie beim
+   Enum-Muster.
+
+   Ein unbekannter Typname oder Feldname wird gemeldet. Bis #1104 passte das
+   Muster IMMER: der Sprung bei einem nicht passenden Feld ging auf die
+   naechste Anweisung statt zum naechsten Fall, und der Vergleich lief
+   ohnehin nie an. Ein `match` mit mehreren Struktur-Fallen nahm damit stets
+   den ersten -- ohne Meldung.
+
+   Die geschweifte Form ist ein MUSTER, kein Wert: `var p: P := P { t: 1 };`
+   gibt es nicht (siehe Abschnitt 20.1). *)
 ```
 
 ---
@@ -870,10 +902,14 @@ NullCoalesceExpr    = LogicalOrExpr
    #1023. Das Ergebnis ist in beiden Faellen 0 oder 1. *)
 
 LogicalOrExpr       = LogicalAndExpr
-                      { "||" LogicalAndExpr } ;
+                      { ( "||" | "or" ) LogicalAndExpr } ;
 
 LogicalAndExpr      = BitwiseOrExpr
-                      { "&&" BitwiseOrExpr } ;
+                      { ( "&&" | "and" ) BitwiseOrExpr } ;
+
+(* `and`, `or` und `not` sind gleichwertige Schreibweisen zu `&&`, `||` und
+   `!` -- gleiche Praezedenz, gleiche KURZSCHLUSSauswertung: die rechte Seite
+   wird nur ausgewertet, wenn die linke sie nicht schon entscheidet (#1104). *)
 
 BitwiseOrExpr       = BitwiseXorExpr
                       { ( "|" | "|~" ) BitwiseXorExpr } ;
@@ -899,7 +935,7 @@ AdditiveExpr        = MultiplicativeExpr
 MultiplicativeExpr  = UnaryExpr
                       { ( "*" | "/" | "%" ) UnaryExpr } ;
 
-UnaryExpr           = ( "+" | "-" | "!" | "~" | "@" ) UnaryExpr
+UnaryExpr           = ( "+" | "-" | "!" | "not" | "~" | "@" ) UnaryExpr
                     | CastExpr ;
 (* "@" Ident  = Adresse-von (address-of) eines Locals/Params → Slot-Adresse.
    Codegen: ELF lea rax,[rbp+off]; LyxOS IRO_LOAD_LOCAL_ADDR (PR #872). *)
@@ -1163,8 +1199,8 @@ Whether a construct is compile-time evaluable is a semantic decision.
 | ----: | ---------------------------------------------------------- | ------------- |
 |     1 | `\|>`                                                      | Left          |
 |     2 | `??`                                                       | Left          |
-|     3 | `\|\|`                                                     | Left          |
-|     4 | `&&`                                                       | Left          |
+|     3 | `\|\|`, `or`                                               | Left          |
+|     4 | `&&`, `and`                                                | Left          |
 |     5 | `\|`, `\|~`                                                | Left          |
 |     6 | `^`                                                        | Left          |
 |     7 | `&`                                                        | Left          |
@@ -1173,8 +1209,8 @@ Whether a construct is compile-time evaluable is a semantic decision.
 |    10 | `<<`, `>>`                                                 | Left          |
 |    11 | `+`, `-`                                                   | Left          |
 |    12 | `*`, `/`, `%`                                              | Left          |
-|    13 | unary `+`, unary `-`, `!`, `~`                             | Right         |
-|    14 | `as`                                                       | Left          |
+|    13 | unary `+`, unary `-`, `!`, `not`, `~`                      | Right         |
+|    14 | `as`, `is`                                                 | Left          |
 |    15 | call, generic call, index, field access, safe field access | Left          |
 
 ---
@@ -1240,6 +1276,7 @@ Einzelbefunde sind dort verlinkt.
 | `&x` (Adress-Operator) | 15 | Gibt es nicht. Ein Ausgabeparameter wird als Zelle uebergeben (`alloc(8)`, danach `peek64`). (#1061) |
 | Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
 | Nullable-Suffix, Pruefung | 7 | `T?` wird geparst und am Typknoten vermerkt, loest aber KEINE zusaetzliche Pruefung aus: ein nicht-nullbarer Typ nimmt weiterhin `null` an, und ein nullbarer wird ohne `?.` ungeprueft dereferenziert. Das Suffix dokumentiert die Absicht, es erzwingt sie nicht. `?.` dagegen prueft zur Laufzeit. (#1092) |
+| Struktur-Literal als Wert | 15 | `P { t: 1, f: 0 }` gibt es nur als MUSTER (§14, StructPattern), nicht als Ausdruck: `var p: P := P { t: 1 };` wird mit "expected expression" abgewiesen. Ein struct-Local wird ohne Initialisierer angelegt und feldweise gefuellt. Die Asymmetrie ist festgehalten, nicht behoben. (#1104) |
 | Attribute ohne Nachweis | 4 | `@wcet`, `@stack_limit`, `@integrity`, `@flight_crit`, `@dal` und `@critical` werden geparst, in ihrer Argumentform geprueft und am Knoten vermerkt -- der Compiler weist die Zusicherung aber **nicht** nach. Kein WCET-Beweis, keine Stapelanalyse, keine TMR-Verifikation, keine FPU-Traps. Sie sind seit #1099 nicht mehr stumm: jedes Vorkommen meldet den fehlenden Nachweis. Wer die Annotation setzt, bekommt sie also als Vermerk, nicht als Beweis. Unbekannte Attributnamen und falsche Argumentformen werden abgewiesen. |
 | Typtest `is`, Reichweite | 15 | Zur LAUFZEIT geprueft wird nur gegen eine Klasse MIT Methoden -- nur die traegt einen Typzeiger. Eine Klasse OHNE Methode bekommt struct-Layout und damit keine VMT; dort ist die Antwort der statisch bekannte Vererbungsweg (plus `null`-Probe), und ein zur Laufzeit eingelagerter anderer Typ waere nicht zu sehen. Wo der statische Typ des Empfaengers nicht bestimmbar ist oder der genannte Typ weder Klasse noch eingebauter Typ ist (Alias, Generik), MELDET der Compiler das, statt `false` zu liefern. (#1094) |
 | `static` an Feldern | 9 | `static fn` gibt es (Aufruf ueber den Typnamen, `self` darin abgewiesen). `static` an einem FELD wird abgewiesen: der Zugriff hiesse `A.v`, und diese Schreibweise bezeichnet in Lyx bereits den Byte-OFFSET des Feldes -- std/string.lyx nutzt sie so (`StringBuilder.capacity`). Welche Bedeutung gelten soll, ist eine Sprachentscheidung. Eine Klassenkonstante wird als `con` auf Modulebene geschrieben. (#1090) |

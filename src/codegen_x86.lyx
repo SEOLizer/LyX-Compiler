@@ -10469,87 +10469,96 @@ pub type Codegen = class {
           if (defaultCaseNode == -1) { defaultCaseNode := caseCur; }
         }
       } else if (patKind == CGN_PATTERN_STRUCT) {
-        // WP-15: Struct destructure pattern: Point { x: patX, y: patY }
-        // sval = struct type name, c0 = first field pattern (NK_PATTERN_BIND)
+        // WP-15 / #1104: Struktur-Muster `case P { t: 1, f: 0 } =>`.
+        //
+        // Das Muster passte IMMER. Zwei Fehler uebereinander: der Sprung bei
+        // einem nicht passenden Feld wurde auf die unmittelbar folgende
+        // Anweisung gepatcht (er sprang also nirgendwohin), und der Vergleich
+        // lief ohnehin nie an -- der Parser legt den Feldwert als AUSDRUCK ab
+        // (NK_LIT_INT), gepruef wurde aber auf CGN_PATTERN_LIT. Ein `match`
+        // mit mehreren Struktur-Fallen nahm damit stets den ersten, ohne
+        // Meldung.
+        //
+        // sval = Typname, c0 = erstes Feldmuster (NK_PATTERN_BIND: sval =
+        // Feldname, c0 = Wert bzw. Bindung).
         var structName: pchar := self.cg_nsval(patNode);
         var structLen: int64 := self.cg_nslen(patNode);
-        
-        // Load the struct value
-        self.cg_loadRax(matchOff);
-        self.cg_pushRax();  // save struct value
-        
-        // Find the struct/class layout
         var structOff: int64 := self.cg_findClass(structName, structLen);
-        if (structOff != -1) {
-          // Iterate over field patterns
-          var fieldPat: int64 := self.cg_nc0(patNode);
-          var matchFailed: int64 := 0;
-          while (fieldPat != -1) {
-            // fieldPat is NK_PATTERN_BIND with sval = field name
-            var fieldName: pchar := self.cg_nsval(fieldPat);
-            var fieldLen: int64 := self.cg_nslen(fieldPat);
-            var innerPat: int64 := self.cg_nc0(fieldPat);  // inner pattern
-            
-            // Find field offset in struct
-            var fldOff: int64 := self.cg_findField(structOff, fieldName, fieldLen);
-            if (fldOff != -1) {
-              // Load field value from struct
-              self.cg_popRax();
-              self.cg_pushRax();
-              // mov rax, [rax + fieldOffset]
-              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40);
-              self.cg_e8(fldOff as int64);
-              
-              // Generate code for inner pattern (recursive match on field value)
-              var innerPatKind: int64 := self.cg_nkind(innerPat);
-              if (innerPatKind == CGN_PATTERN_BIND) {
-                // Binding pattern: bind field value to new variable
-                var bindName: pchar := self.cg_nsval(innerPat);
-                var bindLen: int64 := self.cg_nslen(innerPat);
-                var bindOff: int64 := self.cg_addLocal(bindName, bindLen);
-                self.cg_storeRax(bindOff);
-              } else if (innerPatKind == CGN_PATTERN_LIT) {
-                // Literal pattern: compare
-                var patVal: int64 := self.cg_nival(innerPat);
-                self.cg_pushRax();
-                if (patVal != 0) {
-                  self.cg_movRaxImm(patVal);
-                } else {
-                  var patName: pchar := self.cg_nsval(innerPat);
-                  var patNameLen: int64 := self.cg_nslen(innerPat);
-                  var patNameOff: int64 := self.cg_findLocal(patName, patNameLen);
-                  if (patNameOff != 0) {
-                    self.cg_loadRax(patNameOff);
-                  } else {
-                    self.cg_zeroRax();
-                  }
-                }
-                self.cg_popRbx();
-                // cmp rbx, rax; jne fail
-                self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);
-                self.cg_e8(0x0F); self.cg_e8(0x85);
-                var jnePos2: int64 := self.codeLen;
-                self.cg_e32(0);
-                // Field matched - continue
-                poke32(self.code + jnePos2, self.codeLen - jnePos2 - 4);
-              }
-              // Wildcard pattern: do nothing (field value ignored)
-            }
-            fieldPat := self.cg_nnext(fieldPat);
-          }
-          // All fields matched - execute case body
-          self.cg_popRax();
-          self.cg_genMatchBody(bodyNode);
-          // Implicit jmp to match_end
-          self.cg_e8(0xE9);
-          var bp2: int64 := self.codeLen;
-          self.cg_e32(self.curBreakHead);
-          self.curBreakHead := bp2;
-        } else {
-          // Unknown struct type - treat as wildcard
-          self.cg_popRax();
-          defaultCaseNode := caseCur;
+        if (structOff < 0) {
+          // Frueher: "unbekannter Typ → wie ein Wildcard behandeln". Damit
+          // wurde ein vertippter Typname zum Default-Fall.
+          EPrintStr("error: unbekannter Typ im Struktur-Muster: '"c);
+          sys_write(2, structName, structLen);
+          EPrintStr("'\n"c);
+          exit(1);
         }
+        var failHead: int64 := 0 - 1;
+        var fieldPat: int64 := self.cg_nc0(patNode);
+        while (fieldPat != -1) {
+          var fieldName: pchar := self.cg_nsval(fieldPat);
+          var fieldLen: int64 := self.cg_nslen(fieldPat);
+          var innerPat: int64 := self.cg_nc0(fieldPat);
+          var fldOff: int64 := self.cg_findField(structOff, fieldName, fieldLen);
+          if (fldOff < 0) {
+            EPrintStr("error: unbekanntes Feld im Struktur-Muster: '"c);
+            sys_write(2, fieldName, fieldLen);
+            EPrintStr("'\n"c);
+            exit(1);
+          }
+          // Feldwert laden: rax = [struct + fldOff]
+          self.cg_loadRax(matchOff);
+          if (fldOff == 0) {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x00);
+          } else if (fldOff <= 127) {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(fldOff);
+          } else {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x80); self.cg_e32(fldOff);
+          }
+          var innerKind: int64 := self.cg_nkind(innerPat);
+          var cmpVal: int64 := 0;
+          var doCmp: int64 := 0;
+          if (innerKind == CGN_LIT_INT) {
+            cmpVal := self.cg_nival(innerPat); doCmp := 1;
+          } else if (innerKind == CGN_IDENT) {
+            var inm: pchar := self.cg_nsval(innerPat);
+            var inl: int64 := self.cg_nslen(innerPat);
+            if (inl == 1 && StrCharAt(inm, 0) == 95) {
+              doCmp := 0;               // `_` — Feld wird nicht geprueft
+            } else if (self.cg_hasConVal(inm, inl) != 0) {
+              // Ein blanker Bezeichner ist ein VERWEIS, wenn er einen kennt --
+              // dieselbe Lesart wie beim Enum-Muster (#1024).
+              cmpVal := self.cg_findConVal(inm, inl); doCmp := 1;
+            } else {
+              // sonst: Bindung, das Feld wird an den Namen gebunden
+              var bindOff: int64 := self.cg_addLocal(inm, inl);
+              self.cg_storeRax(bindOff);
+              doCmp := 0;
+            }
+          } else if (innerKind == CGN_PATTERN_WILD) {
+            doCmp := 0;
+          } else {
+            EPrintStrLn("error: Feldmuster muss ein Ganzzahlliteral, ein `con`, ein Name oder `_` sein"c);
+            exit(1);
+          }
+          if (doCmp != 0) {
+            self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(cmpVal);   // mov rcx, wert
+            self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);      // cmp rax, rcx
+            self.cg_e8(0x0F); self.cg_e8(0x85);                        // jne -> naechster Fall
+            self.cg_e32(failHead);
+            failHead := self.codeLen - 4;
+          }
+          fieldPat := self.cg_nnext(fieldPat);
+        }
+        // Alle Felder passen: Rumpf, dann ans Ende des match.
+        self.cg_genMatchBody(bodyNode);
+        self.cg_e8(0xE9);
+        var bp2: int64 := self.codeLen;
+        self.cg_e32(self.curBreakHead);
+        self.curBreakHead := bp2;
+        // Fehlschlaege springen HIERHER -- an den naechsten Fall, nicht auf
+        // die naechste Anweisung.
+        self.cg_patchList(failHead, self.codeLen);
+
       } else if (patKind == CGN_PATTERN_ENUM) {
         // BUG-08: Enum payload pattern: Ok(value) or Err(msg)
         // sval = enum variant name, c0 = binding pattern for payload
