@@ -848,6 +848,19 @@ pub type Codegen = class {
   }
 
   // Returns index (0-based) of local by name, or -1 if not found
+  // #1091: Klassenindex der gerade erzeugten Klasse (fuer `super`).
+  fn cg_curClassIdx(): int64 {
+    if (self.curClassName == 0 as pchar) { return 0 - 1; }
+    return self.cg_findClass(self.curClassName, self.curClassNameLen);
+  }
+
+  // #1091: Lokale Variable ueber ihren Namen nach rax laden.
+  fn cg_loadLocalByName(name: pchar, nlen: int64): void {
+    var li: int64 := self.cg_findLocalIdx(name, nlen);
+    if (li < 0) { self.cg_zeroRax(); return; }
+    self.cg_loadRax(peek64(self.locals + li * CG_LOCAL_SZ + CG_LOCAL_OFF_RBPOFF));
+  }
+
   fn cg_findLocalIdx(name: pchar, nlen: int64): int64 {
     var i: int64 := self.localCount - 1;
     while (i >= self.localBase) {  // WP-02: respect localBase
@@ -5536,6 +5549,14 @@ pub type Codegen = class {
     var fname: pchar := self.cg_nsval(ni);
     var fnlen: int64 := self.cg_nslen(ni);
     var isMethod: int64 := self.cg_nival(ni);
+    // #1091: iVal 3 markiert `super.M()`. Die Umsetzung auf 1 muss HIER
+    // geschehen, vor jeder Verzweigung: die Argumentliste eines Methoden-
+    // aufrufs steht in c1, die eines gewoehnlichen in c0. Wurde der Marker
+    // erst spaeter aufgeloest, nahm der Aufruf den Nicht-Methoden-Pfad, fand
+    // dort keine Argumente und der Aufgerufene las, was zufaellig in den
+    // Registern stand -- `super.One(7)` lieferte 4096.
+    var isSuperCall: int64 := 0;
+    if (isMethod == 3) { isSuperCall := 1; isMethod := 1; }
 
     // WP-BC-24: generic call (iVal==2) — build mangled name and register JMP stub
     if (isMethod == 2) {
@@ -5849,8 +5870,9 @@ pub type Codegen = class {
     if (nTotal <= 6) {
       // Simple path: all fit in registers — push self first (method), then args, then defaults
       if (isMethod == 1) {
-        if (isStaticCall == 0) { self.cg_genExpr(smObj); }
-        else { self.cg_zeroRax(); }          // statisch: self = 0
+        if (isSuperCall != 0) { self.cg_loadLocalByName("self"c, 4); }
+        else { if (isStaticCall == 0) { self.cg_genExpr(smObj); }
+        else { self.cg_zeroRax(); } }        // statisch: self = 0
         self.cg_pushRax();
         argc += 1;
       }
@@ -5898,8 +5920,11 @@ pub type Codegen = class {
           si -= 1;
         }
         // Push self into rdi slot (statisch: 0 — siehe Kommentar oben)
-        if (isStaticCall == 0) { self.cg_genExpr(smObj); }
-        else { self.cg_zeroRax(); }
+        // #1091: Bei `super.M()` gibt es keinen Empfaengerknoten -- der Aufruf
+        // laeuft auf derselben Instanz, also das lokale `self` laden.
+        if (isSuperCall != 0) { self.cg_loadLocalByName("self"c, 4); }
+        else { if (isStaticCall == 0) { self.cg_genExpr(smObj); }
+        else { self.cg_zeroRax(); } }
         self.cg_pushRax();
         // Push register explicit args: arg[0..4]
         var ri: int64 := 0;
@@ -5951,7 +5976,38 @@ pub type Codegen = class {
     if (isMethod == 1) {
       var objNode: int64 := self.cg_nc0(ni);
       var classIdx: int64 := self.cg_objClassIdx(objNode);
-      if (classIdx >= 0) {
+      // #1091: Bei `super.M()` zaehlt die ELTERNKLASSE der gerade erzeugten
+      // Klasse, und der Aufruf geht DIREKT dorthin -- nicht ueber die VMT.
+      // Ueber die VMT riefe `super.F()` in einem `override fn F()` sich
+      // selbst, endlos.
+      if (isSuperCall != 0) {
+        classIdx := 0 - 1;
+        var curIdx: int64 := self.cg_curClassIdx();
+        if (curIdx >= 0) {
+          var parIdx: int64 := peek64(self.classLayouts + curIdx * CG_CLASS_SZ + CG_CLASS_OFF_PARENTIDX);
+          if (parIdx >= 0) {
+            var pcName: pchar := peek64(self.classLayouts + parIdx * CG_CLASS_SZ) as pchar;
+            var pcLen:  int64 := peek64(self.classLayouts + parIdx * CG_CLASS_SZ + CG_CLASS_OFF_NAMELEN);
+            var spLen: int64 := pcLen + 1 + fnlen;
+            var spBuf: int64 := alloc(spLen + 1);
+            var spI: int64 := 0;
+            while (spI < pcLen) { poke8(spBuf + spI, StrCharAt(pcName, spI)); spI := spI + 1; }
+            StrSetChar(spBuf as pchar, pcLen, 95);
+            var spJ: int64 := 0;
+            while (spJ < fnlen) { poke8(spBuf + pcLen + 1 + spJ, StrCharAt(fname, spJ)); spJ := spJ + 1; }
+            poke8(spBuf + spLen, 0);
+            var spPp: int64 := self.cg_emitCall();
+            self.cg_addPatch(spPp, spBuf, spLen, CG_PATCH_CALL);
+            self.cg_trackTempBuf(spBuf, spLen + 1);
+          } else {
+            EPrintStrLn("error: super ohne Elternklasse"c);
+            self.cg_zeroRax();
+          }
+        } else {
+          EPrintStrLn("error: super ausserhalb einer Klassenmethode"c);
+          self.cg_zeroRax();
+        }
+      } else if (classIdx >= 0) {
         var clsBase: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
         // WP-BC-L2: virtual dispatch. If the method occupies a VMT slot in the
         // object's static class, call through the runtime vtable instead of a
