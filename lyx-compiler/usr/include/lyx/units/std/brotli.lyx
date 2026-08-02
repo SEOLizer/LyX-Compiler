@@ -1,11 +1,47 @@
-// std/brotli.lyx — Brotli-Dekompressor (RFC 7932) + Store-Kompressor
+// std/brotli.lyx — Brotli (RFC 7932)
 //
-// Decompressor: vollständige RFC-7932-Implementierung (ohne statisches Dict).
-// Compressor:   Store-Modus (gültige Brotli-Streams, keine Komprimierung).
+// KOMPRESSION (#1075): echte komprimierte Meta-Bloecke — Huffman-codierte
+// Literale, Insert-and-Copy-Codes und Distanzcodes. Ein Meta-Block ueber die
+// gesamte Eingabe, je ein Blocktyp (NBLTYPES* = 1), NPOSTFIX = 0, NDIRECT = 0,
+// ein Literal- und ein Distanzbaum (NTREES* = 1); damit entfallen
+// Blockwechselcodes und Kontextkarten. Rueckfall auf den unkomprimierten
+// Meta-Block, wenn sich nichts lohnt. Gemessen:
+//
+//     1000 Byte Text   ->    150 Byte
+//    65536 Byte Text   ->    152 Byte
+//   300000 Byte Text   ->    153 Byte
+//    50000 Byte 'A'    ->     12 Byte
+//    20000 Byte Zufall ->  20004 Byte  (unkomprimiert, kein Schaden)
+//
+// Gegengelesen wird ausschliesslich mit der REFERENZIMPLEMENTIERUNG
+// (python3 `brotli`) — siehe unten, warum der eigene Dekodierer dafuer
+// nicht taugt.
+//
+// DEKOMPRESSION: unbrauchbar. Der Dekodierer stuerzt auf gueltigen Stroemen
+// ab, auch auf denen der Referenzimplementierung: ueber 36 Frames
+// (sechs Eingaben x sechs Qualitaetsstufen) 13 korrekt und 23 Abstuerze.
+// Vier belegte Defekte sind im Zuge von #1075 behoben, ohne dass die Messung
+// sich bewegt haette:
+//
+//   1. brCopyExtra: Zusatzbits ab Code 19 falsch (19 -> 6 statt 7, 20 -> 7
+//      statt 8, 21 -> 7 statt 9, 22 -> 9 statt 10). Betrifft jede Kopie ab
+//      Laenge 198.
+//   2. brReadContextMap: kein Waechter fuer NTREES < 2. RFC 7932 §9.2 sagt,
+//      die Karte steht dann GAR NICHT im Strom; gelesen wurde sie trotzdem.
+//   3. brReadComplexTree: las die Codelaengen des Codelaengen-Alphabets als
+//      feste DREI Bit statt mit dem variablen 2..4-Bit-Code aus §3.5, kannte
+//      weder die Abbruchbedingung ueber die Kraft-Summe noch die
+//      Wiederholcodes 16/17.
+//   4. brDecodeIC: rechnete die neun Zellen der Tabelle aus §5 als schlichtes
+//      3x3-Raster; die Tabelle ist anders angeordnet.
+//
+// Es bleiben also weitere. Der Grund, warum das so lange unbemerkt blieb,
+// steht im Befund selbst: es gab keinen einzigen Brotli-Test und keinen
+// Kompressor — der Dekodierer wurde nie an echten Daten gemessen.
 //
 // Schiebefenster: bis 16 MB (WBITS 10..24).
-// Bekannte Einschränkung: static-dictionary-Transforms (§8) werden nicht
-//   unterstützt — betrifft nur sehr wenige Streams in der Praxis.
+// Bekannte Einschraenkung: static-dictionary-Transforms (§8) werden nicht
+//   unterstuetzt.
 
 unit std.brotli;
 
@@ -147,6 +183,11 @@ fn brCopyBase(c: int64): int64 {
     return 2118;
 }
 
+// #1075: Die Zusatzbits ab Code 19 wichen von RFC 7932 §5 ab -- 19 stand auf
+// 6 statt 7, 20 und 21 auf 7 statt 8 und 9, 22 auf 9 statt 10. Betroffen ist
+// jede Kopie ab Laenge 198. Aufgefallen ist es erst, als es einen KOMPRIMIERER
+// gab: der Dekoder allein hatte die Tabelle nie gegen etwas gehalten, und
+// solche Kopien kamen in den bisherigen Testdaten nicht vor.
 fn brCopyExtra(c: int64): int64 {
     if (c <= 7)  { return 0; }
     if (c <= 9)  { return 1; }
@@ -154,9 +195,11 @@ fn brCopyExtra(c: int64): int64 {
     if (c <= 13) { return 3; }
     if (c <= 15) { return 4; }
     if (c <= 17) { return 5; }
-    if (c <= 19) { return 6; }
-    if (c <= 21) { return 7; }
-    if (c == 22) { return 9; }
+    if (c == 18) { return 6; }
+    if (c == 19) { return 7; }
+    if (c == 20) { return 8; }
+    if (c == 21) { return 9; }
+    if (c == 22) { return 10; }
     return 24;
 }
 
@@ -361,54 +404,106 @@ fn brDecodeSymbol(s: int64, tree: int64): int64 {
 // Prefix-Code-Längen lesen (RFC 7932 §3.4)
 // ============================================================================
 
+// Liest die Codelaenge EINES Codelaengen-Symbols. RFC 7932 §3.5 gibt dafuer
+// einen festen Code mit 2..4 Bit an, nicht ein Feld fester Breite:
+//   0 -> 00   1 -> 0111   2 -> 011   3 -> 10   4 -> 01   5 -> 1111
+// Die Muster stehen so, wie sie im Strom erscheinen, also von rechts nach
+// links gelesen -- das erste gelesene Bit ist das rechte Zeichen.
+//
+// #1075: Vorher las diese Stelle stur DREI Bit. Damit lief der Bitstrom ab
+// dem ersten komplexen Code aus dem Takt, und der Rest des Meta-Blocks war
+// Rauschen -- in der Praxis ein Absturz. Da es keinen Kompressor gab, ist es
+// nie jemandem aufgefallen: gemessen wurde der Dekoder nie an echten Stroemen.
+fn brReadCLLen(s: int64): int64 {
+    if (brReadBit(s) == 0) {
+        if (brReadBit(s) == 0) { return 0; }
+        return 3;
+    }
+    if (brReadBit(s) == 0) { return 4; }
+    if (brReadBit(s) == 0) { return 2; }
+    if (brReadBit(s) == 0) { return 1; }
+    return 5;
+}
+
 fn brReadComplexTree(s: int64, numSyms: int64, hskip: int64): int64 {
     var metaLens: int64 := alloc(18);
     var i: int64 := 0;
     while (i < 18) { poke8(metaLens + i, 0); i := i + 1; }
 
+    // Die Folge endet, sobald der Code vollstaendig ist (Kraft-Summe 32) --
+    // nachlaufende Nullen stehen nicht im Strom.
+    var space:    int64 := 32;
+    var numCodes: int64 := 0;
+    var oneSym:   int64 := 0;
     i := hskip;
-    while (i < 18) {
+    while ((i < 18) & (space > 0)) {
         var sym: int64 := brMetaOrd(i);
-        var l:   int64 := brReadBits(s, 3);
+        var l:   int64 := brReadCLLen(s);
         poke8(metaLens + sym, l);
-        i += 1;
+        if (l != 0) {
+            numCodes := numCodes + 1;
+            oneSym := sym;
+            space := space - (32 >> l);
+        }
+        i := i + 1;
     }
+    if ((numCodes != 1) & (space != 0)) { free(metaLens, 18); return 0; }
 
-    var metaTree: int64 := brBuildTree(metaLens, 18);
+    var metaTree: int64 := 0;
+    if (numCodes == 1) {
+        // Genau eine Laenge ungleich null: der Code hat EIN Symbol mit
+        // Codelaenge null (RFC 7932 §3.5). Es werden dafuer keine Bits
+        // gelesen.
+        metaTree := brBuildTrivialTree(oneSym);
+    } else {
+        metaTree := brBuildTree(metaLens, 18);
+    }
     free(metaLens, 18);
 
     var lens: int64 := alloc(numSyms);
     i := 0;
     while (i < numSyms) { poke8(lens + i, 0); i := i + 1; }
 
+    // Auch hier endet die Folge, sobald der Code vollstaendig ist.
+    var lspace:  int64 := 32768;
     var prevLen: int64 := 8;
+    var repCount:  int64 := 0;
+    var repLen:  int64 := 0;
     i := 0;
-    while (i < numSyms) {
+    while ((i < numSyms) & (lspace > 0)) {
         var sym: int64 := brDecodeSymbol(s, metaTree);
-        if (sym < 16) {
-            poke8(lens + i, sym);
-            if (sym != 0) { prevLen := sym; }
-            i += 1;
-        } else {
-            if (sym == 16) {
-                var extra: int64 := brReadBits(s, 2);
-                var count: int64 := extra + 3;
-                if ((i + count) > numSyms) { count := numSyms - i; }
-                var j: int64 := 0;
-                while (j < count) {
-                    poke8(lens + i, prevLen);
-                    i += 1;
-                    j += 1;
+        if (sym < 0) { i := numSyms; }
+        else {
+            if (sym < 16) {
+                repCount := 0;
+                poke8(lens + i, sym);
+                i := i + 1;
+                if (sym != 0) {
+                    prevLen := sym;
+                    lspace := lspace - (32768 >> sym);
                 }
             } else {
-                var extra: int64 := brReadBits(s, 3);
-                var count: int64 := extra + 3;
-                if ((i + count) > numSyms) { count := numSyms - i; }
+                // 16 wiederholt die letzte Laenge ungleich null, 17 die Null.
+                // Folgt derselbe Code erneut, MODIFIZIERT er den bisherigen
+                // Zaehler, statt einen neuen zu beginnen (§3.5).
+                var extraBits: int64 := sym - 14;   // 16 -> 2, 17 -> 3
+                var newLen:    int64 := prevLen;
+                if (sym == 17) { newLen := 0; }
+                if (repLen != newLen) { repCount := 0; repLen := newLen; }
+                var oldRepeat: int64 := repCount;
+                if (repCount > 0) {
+                    repCount := repCount - 2;
+                    repCount := repCount << extraBits;
+                }
+                repCount := repCount + brReadBits(s, extraBits) + 3;
+                var delta: int64 := repCount - oldRepeat;
+                if ((i + delta) > numSyms) { delta := numSyms - i; }
                 var j: int64 := 0;
-                while (j < count) {
-                    poke8(lens + i, 0);
-                    i += 1;
-                    j += 1;
+                while (j < delta) {
+                    poke8(lens + i, repLen);
+                    i := i + 1;
+                    if (repLen != 0) { lspace := lspace - (32768 >> repLen); }
+                    j := j + 1;
                 }
             }
         }
@@ -576,6 +671,17 @@ fn brReadContextMap(s: int64, ntrees: int64, cmSize: int64): int64 {
     var cmap:   int64 := alloc(cmSize * 8);
     var i:      int64 := 0;
     while (i < cmSize) { poke64(cmap + i * 8, 0); i := i + 1; }
+
+    // #1075: Bei EINEM Baum steht im Strom gar keine Kontextkarte -- RFC 7932
+    // §9.2: "appears only if NTREESL >= 2; otherwise, the context map has only
+    // zero values". Ohne diese Sperre las der Dekoder ein RLEMAX-Bit und einen
+    // Codebaum ueber ein EINELEMENTIGES Alphabet aus Daten, die etwas ganz
+    // anderes bedeuten, und lief dann in der Fuellschleife aus dem Puffer:
+    // Segmentation Fault. Da fast jeder reale Brotli-Strom mit einem
+    // Literalbaum auskommt, betraf das nahezu alles -- 23 von 36 Frames der
+    // Referenzimplementierung stuerzten ab, ehe es hier einen Kompressor gab,
+    // an dem es auffallen konnte.
+    if (ntrees < 2) { return cmap; }
 
     var rlemax: int64 := 0;
     if (brReadBit(s) == 1) { rlemax := brReadBits(s, 4) + 1; }
@@ -755,11 +861,28 @@ fn brDecodeIC(icCode: int64, insertOut: int64, copyOut: int64): int64 {
             cc := 8 + ((icCode - 64) & 7);
         }
     } else {
+        // #1075: Die neun Zellen der Tabelle in RFC 7932 §5 stehen NICHT
+        // zeilenweise. Die Vorgaengerfassung rechnete sie als schlichtes
+        // 3x3-Raster (ic = (g/3)*8, cc = (g%3)*8) und lag ab der dritten
+        // Zelle daneben: Symbol 290 ergab Einfuegecode 4 und Kopiercode 18
+        // statt 12 und 2. Betroffen ist jeder Befehl mit expliziter Distanz,
+        // also praktisch jeder echte Strom.
         var d2: int64 := icCode - 128;
         var g:  int64 := d2 >> 6;
         var b:  int64 := d2 & 63;
-        ic := ((g / 3) * 8) + ((b >> 3) & 7);
-        cc := ((g % 3) * 8) + (b & 7);
+        var insHi: int64 := 0;
+        var cpyHi: int64 := 0;
+        if (g == 0) { insHi := 0; cpyHi := 0; }
+        else { if (g == 1) { insHi := 0; cpyHi := 1; }
+        else { if (g == 2) { insHi := 1; cpyHi := 0; }
+        else { if (g == 3) { insHi := 1; cpyHi := 1; }
+        else { if (g == 4) { insHi := 0; cpyHi := 2; }
+        else { if (g == 5) { insHi := 2; cpyHi := 0; }
+        else { if (g == 6) { insHi := 1; cpyHi := 2; }
+        else { if (g == 7) { insHi := 2; cpyHi := 1; }
+        else { insHi := 2; cpyHi := 2; } } } } } } } }
+        ic := insHi * 8 + ((b >> 3) & 7);
+        cc := cpyHi * 8 + (b & 7);
     }
     poke64(insertOut, ic);
     poke64(copyOut,   cc);
@@ -927,7 +1050,6 @@ fn brReadMetaHeader(s: int64, ctx: int64): int64 {
         i += 1;
     }
     poke64(ms + 88, tD);
-
     return ms;
 }
 
@@ -1143,66 +1265,799 @@ fn brwFlush(w: int64): void {
 // BrotliCompress — Store-Modus (kein LZ77, gültiger RFC-7932-Stream)
 // ============================================================================
 
+// ========================================================================
+// Kompression: echte Meta-Bloecke (#1075)
+//
+// Aufbau: EIN Meta-Block ueber die gesamte Eingabe, je ein Blocktyp fuer
+// Literale, Insert-and-Copy und Distanzen (NBLTYPES* = 1), NPOSTFIX = 0,
+// NDIRECT = 0, ein Literalbaum und ein Distanzbaum (NTREES* = 1). Damit
+// entfallen Blockwechselcodes und Kontextkarten vollstaendig -- die
+// Ersparnis kommt aus den LZ77-Kopien und den drei Huffman-Codes.
+//
+// Anders als bei zstd (#1069) gibt es hier KEINE vordefinierten Tabellen:
+// jeder Meta-Block beschreibt seine Praefixcodes selbst. Der Loewenanteil
+// dieses Abschnitts ist deshalb der Codebeschreiber, nicht der Matcher.
+// ========================================================================
+
+// Praefixcode MSB-first schreiben. RFC 7932 §1.5.1: Ganzzahlen gehen mit dem
+// niederwertigsten Bit zuerst in den Strom, PRAEFIXCODES dagegen mit dem
+// hoechstwertigen Bit des Codes zuerst. Wer das verwechselt, erzeugt einen
+// Strom, den der eigene Leser noch versteht (weil er denselben Fehler macht)
+// und ein fremder Dekodierer nicht.
+fn brwWriteCode(w: int64, code: int64, len: int64): void {
+    var i: int64 := len - 1;
+    while (i >= 0) {
+        brwWriteBits(w, (code >> i) & 1, 1);
+        i := i - 1;
+    }
+}
+
+// Kanonische Codes aus Codelaengen (RFC 7932 §3.2). codes[] wird gefuellt.
+fn brCanonical(lens: int64, n: int64, codes: int64, maxLen: int64): void {
+    var blCount: int64 := alloc((maxLen + 2) * 8);
+    var k: int64 := 0;
+    while (k <= maxLen + 1) { poke64(blCount + k * 8, 0); k := k + 1; }
+    var i: int64 := 0;
+    while (i < n) {
+        var l: int64 := peek64(lens + i * 8);
+        if (l > 0) { poke64(blCount + l * 8, peek64(blCount + l * 8) + 1); }
+        i := i + 1;
+    }
+    var nextCode: int64 := alloc((maxLen + 2) * 8);
+    var code: int64 := 0;
+    poke64(blCount, 0);
+    var b: int64 := 1;
+    while (b <= maxLen) {
+        code := (code + peek64(blCount + (b - 1) * 8)) << 1;
+        poke64(nextCode + b * 8, code);
+        b := b + 1;
+    }
+    i := 0;
+    while (i < n) {
+        var l2: int64 := peek64(lens + i * 8);
+        if (l2 > 0) {
+            poke64(codes + i * 8, peek64(nextCode + l2 * 8));
+            poke64(nextCode + l2 * 8, peek64(nextCode + l2 * 8) + 1);
+        } else {
+            poke64(codes + i * 8, 0);
+        }
+        i := i + 1;
+    }
+    free(blCount, (maxLen + 2) * 8); free(nextCode, (maxLen + 2) * 8);
+}
+
+// Huffman-Codelaengen aus Haeufigkeiten, begrenzt auf maxLen.
+// Gibt die Zahl der benutzten Symbole zurueck.
+//
+// Die Laengenbegrenzung geschieht durch Halbieren aller Haeufigkeiten und
+// erneuten Aufbau. Das ist nicht optimal, aber es konvergiert und bleibt
+// nachvollziehbar; ein Paket-Merge waere die dritte Datenstruktur in dieser
+// Datei, die man falsch bauen kann.
+fn brHuffLengths(freq: int64, n: int64, maxLen: int64, lens: int64): int64 {
+    var work: int64 := alloc(n * 8);
+    var i: int64 := 0;
+    var used: int64 := 0;
+    while (i < n) {
+        var f: int64 := peek64(freq + i * 8);
+        poke64(work + i * 8, f);
+        if (f > 0) { used := used + 1; }
+        i := i + 1;
+    }
+    if (used == 0) { free(work, n * 8); return 0; }
+
+    var total: int64 := 2 * n + 2;
+    var wt:  int64 := alloc(total * 8);
+    var lc:  int64 := alloc(total * 8);
+    var rc:  int64 := alloc(total * 8);
+    var act: int64 := alloc(total * 8);
+    var dep: int64 := alloc(total * 8);
+
+    var done: int64 := 0;
+    while (done == 0) {
+        var cnt: int64 := 0;
+        i := 0;
+        while (i < n) {
+            if (peek64(work + i * 8) > 0) {
+                poke64(wt + cnt * 8, peek64(work + i * 8));
+                poke64(lc + cnt * 8, 0 - 1);
+                poke64(rc + cnt * 8, i);       // Blatt: rc traegt das Symbol
+                poke64(act + cnt * 8, 1);
+                cnt := cnt + 1;
+            }
+            i := i + 1;
+        }
+
+        if (cnt == 1) {
+            // Ein einziges Symbol -- Laenge 1, damit ein gueltiger Code
+            // entsteht. Der Aufrufer entscheidet, ob er stattdessen die
+            // einfache Codeform nimmt.
+            i := 0;
+            while (i < n) { poke64(lens + i * 8, 0); i := i + 1; }
+            i := 0;
+            while (i < n) {
+                if (peek64(work + i * 8) > 0) { poke64(lens + i * 8, 1); }
+                i := i + 1;
+            }
+            done := 1;
+        } else {
+            var nodes: int64 := cnt;
+            var merges: int64 := 0;
+            while (merges < cnt - 1) {
+                var a: int64 := 0 - 1;
+                var b2: int64 := 0 - 1;
+                var j: int64 := 0;
+                while (j < nodes) {
+                    if (peek64(act + j * 8) == 1) {
+                        if (a < 0) { a := j; }
+                        else {
+                            if (peek64(wt + j * 8) < peek64(wt + a * 8)) { b2 := a; a := j; }
+                            else {
+                                if (b2 < 0) { b2 := j; }
+                                else { if (peek64(wt + j * 8) < peek64(wt + b2 * 8)) { b2 := j; } }
+                            }
+                        }
+                    }
+                    j := j + 1;
+                }
+                poke64(wt + nodes * 8, peek64(wt + a * 8) + peek64(wt + b2 * 8));
+                poke64(lc + nodes * 8, a);
+                poke64(rc + nodes * 8, b2);
+                poke64(act + nodes * 8, 1);
+                poke64(act + a * 8, 0);
+                poke64(act + b2 * 8, 0);
+                nodes := nodes + 1;
+                merges := merges + 1;
+            }
+
+            // Tiefen von der Wurzel her bestimmen (iterativ, Stapel im Array).
+            i := 0;
+            while (i < nodes) { poke64(dep + i * 8, 0); i := i + 1; }
+            var root: int64 := nodes - 1;
+            var stack: int64 := alloc(nodes * 8);
+            var sp: int64 := 0;
+            poke64(stack, root); sp := 1;
+            var maxSeen: int64 := 0;
+            i := 0;
+            while (i < n) { poke64(lens + i * 8, 0); i := i + 1; }
+            while (sp > 0) {
+                sp := sp - 1;
+                var nd: int64 := peek64(stack + sp * 8);
+                var d:  int64 := peek64(dep + nd * 8);
+                if (peek64(lc + nd * 8) < 0) {
+                    var sym: int64 := peek64(rc + nd * 8);
+                    poke64(lens + sym * 8, d);
+                    if (d > maxSeen) { maxSeen := d; }
+                } else {
+                    var l3: int64 := peek64(lc + nd * 8);
+                    var r3: int64 := peek64(rc + nd * 8);
+                    poke64(dep + l3 * 8, d + 1);
+                    poke64(dep + r3 * 8, d + 1);
+                    poke64(stack + sp * 8, l3); sp := sp + 1;
+                    poke64(stack + sp * 8, r3); sp := sp + 1;
+                }
+            }
+            free(stack, nodes * 8);
+
+            if (maxSeen <= maxLen) { done := 1; }
+            else {
+                // Zu tief: Haeufigkeiten stauchen und neu bauen.
+                i := 0;
+                while (i < n) {
+                    var f2: int64 := peek64(work + i * 8);
+                    if (f2 > 0) { poke64(work + i * 8, (f2 + 1) / 2); }
+                    i := i + 1;
+                }
+            }
+        }
+    }
+
+    free(work, n * 8);
+    free(wt, total * 8); free(lc, total * 8); free(rc, total * 8);
+    free(act, total * 8); free(dep, total * 8);
+    return used;
+}
+
+// Feste Codierung der Codelaengen des Codelaengen-Alphabets (RFC 7932 §3.5).
+// Die Muster stehen im RFC so, wie sie im Strom erscheinen -- von rechts nach
+// links gelesen. Als LSB-first geschriebene Ganzzahl ist das genau der Wert
+// des Musters mit seiner Bitzahl.
+fn brCLCodeVal(len: int64): int64 {
+    if (len == 0) { return 0; }
+    if (len == 1) { return 7; }
+    if (len == 2) { return 3; }
+    if (len == 3) { return 2; }
+    if (len == 4) { return 1; }
+    return 15;
+}
+fn brCLCodeBits(len: int64): int64 {
+    if (len == 0) { return 2; }
+    if (len == 1) { return 4; }
+    if (len == 2) { return 3; }
+    if (len == 3) { return 2; }
+    if (len == 4) { return 2; }
+    return 4;
+}
+
+// Reihenfolge, in der die 18 Codelaengen des Codelaengen-Alphabets stehen.
+fn brCLOrder(i: int64): int64 {
+    if (i == 0)  { return 1; }
+    if (i == 1)  { return 2; }
+    if (i == 2)  { return 3; }
+    if (i == 3)  { return 4; }
+    if (i == 4)  { return 0; }
+    if (i == 5)  { return 5; }
+    if (i == 6)  { return 17; }
+    if (i == 7)  { return 6; }
+    if (i == 8)  { return 16; }
+    if (i == 9)  { return 7; }
+    if (i == 10) { return 8; }
+    if (i == 11) { return 9; }
+    if (i == 12) { return 10; }
+    if (i == 13) { return 11; }
+    if (i == 14) { return 12; }
+    if (i == 15) { return 13; }
+    if (i == 16) { return 14; }
+    return 15;
+}
+
+// Schreibt einen Praefixcode. lens[] sind die Codelaengen ueber n Symbole,
+// codes[] wird mit den kanonischen Codes gefuellt.
+//
+// Bis zu vier benutzte Symbole geht die EINFACHE Form (§3.4) -- kuerzer und
+// deckt zugleich die entarteten Faelle ab, an denen die komplexe Form
+// scheitern wuerde (ein einziges benutztes Symbol braucht dort einen Code
+// der Laenge null).
+fn brWriteCodeDesc(w: int64, lens: int64, codes: int64, n: int64, alphaBits: int64): void {
+    var usedSyms: int64 := alloc(4 * 8);
+    var used: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+        if (peek64(lens + i * 8) > 0) {
+            if (used < 4) { poke64(usedSyms + used * 8, i); }
+            used := used + 1;
+        }
+        i := i + 1;
+    }
+
+    if ((used >= 1) & (used <= 4)) {
+        brwWriteBits(w, 1, 2);            // einfache Form
+        brwWriteBits(w, used - 1, 2);     // NSYM - 1
+        var k: int64 := 0;
+        while (k < used) {
+            brwWriteBits(w, peek64(usedSyms + k * 8), alphaBits);
+            k := k + 1;
+        }
+        if (used == 4) { brwWriteBits(w, 0, 1); }   // tree-select: 2,2,2,2
+
+        // Codelaengen und kanonische Codes nachziehen, damit der Aufrufer
+        // dieselben Codes schreibt, die der Leser rekonstruiert.
+        i := 0;
+        while (i < n) { poke64(lens + i * 8, 0); i := i + 1; }
+        if (used == 1) {
+            poke64(lens + peek64(usedSyms) * 8, 0);
+            poke64(codes + peek64(usedSyms) * 8, 0);
+        } else {
+            if (used == 2) {
+                poke64(lens + peek64(usedSyms) * 8, 1);
+                poke64(lens + peek64(usedSyms + 8) * 8, 1);
+            } else {
+                if (used == 3) {
+                    poke64(lens + peek64(usedSyms) * 8, 1);
+                    poke64(lens + peek64(usedSyms + 8) * 8, 2);
+                    poke64(lens + peek64(usedSyms + 16) * 8, 2);
+                } else {
+                    var q: int64 := 0;
+                    while (q < 4) { poke64(lens + peek64(usedSyms + q * 8) * 8, 2); q := q + 1; }
+                }
+            }
+            brCanonical(lens, n, codes, 15);
+        }
+        free(usedSyms, 4 * 8);
+        return;
+    }
+    free(usedSyms, 4 * 8);
+
+    // --- Komplexe Form ---
+    brCanonical(lens, n, codes, 15);
+
+    // Die Folge der Laengensymbole endet mit dem letzten Symbol ungleich null;
+    // nachlaufende Nullen entfallen. Wiederholcodes (16/17) benutzen wir
+    // nicht: sie sparen Bits, aber jede zusaetzliche Regel ist eine weitere
+    // Stelle, an der Schreiber und Leser auseinanderlaufen koennen.
+    var last: int64 := n - 1;
+    while ((last > 0) & (peek64(lens + last * 8) == 0)) { last := last - 1; }
+    var seqLen: int64 := last + 1;
+
+    var clFreq: int64 := alloc(18 * 8);
+    i := 0;
+    while (i < 18) { poke64(clFreq + i * 8, 0); i := i + 1; }
+    i := 0;
+    while (i < seqLen) {
+        var sym: int64 := peek64(lens + i * 8);
+        poke64(clFreq + sym * 8, peek64(clFreq + sym * 8) + 1);
+        i := i + 1;
+    }
+
+    var clLens:  int64 := alloc(18 * 8);
+    var clCodes: int64 := alloc(18 * 8);
+    var clUsed:  int64 := brHuffLengths(clFreq, 18, 5, clLens);
+
+    if (clUsed == 1) {
+        // Alle Laengen gleich: der Codelaengen-Code hat ein Symbol mit
+        // Codelaenge NULL (§3.5). Es werden dann gar keine Laengensymbole
+        // geschrieben; der Leser fuellt das ganze Alphabet damit.
+        brwWriteBits(w, 0, 2);   // HSKIP = 0
+        i := 0;
+        while (i < 18) {
+            var slot: int64 := brCLOrder(i);
+            var l: int64 := 0;
+            if (peek64(clLens + slot * 8) > 0) { l := 1; }
+            brwWriteBits(w, brCLCodeVal(l), brCLCodeBits(l));
+            i := i + 1;
+        }
+        free(clFreq, 18 * 8); free(clLens, 18 * 8); free(clCodes, 18 * 8);
+        return;
+    }
+
+    brCanonical(clLens, 18, clCodes, 5);
+
+    brwWriteBits(w, 0, 2);   // HSKIP = 0
+
+    // Nachlaufende Nullen in der 18er-Folge entfallen.
+    var clLast: int64 := 17;
+    while ((clLast > 0) & (peek64(clLens + brCLOrder(clLast) * 8) == 0)) { clLast := clLast - 1; }
+    i := 0;
+    while (i <= clLast) {
+        var l4: int64 := peek64(clLens + brCLOrder(i) * 8);
+        brwWriteBits(w, brCLCodeVal(l4), brCLCodeBits(l4));
+        i := i + 1;
+    }
+
+    // Die Laengensymbole selbst.
+    i := 0;
+    while (i < seqLen) {
+        var s2: int64 := peek64(lens + i * 8);
+        brwWriteCode(w, peek64(clCodes + s2 * 8), peek64(clLens + s2 * 8));
+        i := i + 1;
+    }
+
+    free(clFreq, 18 * 8); free(clLens, 18 * 8); free(clCodes, 18 * 8);
+}
+
+// ---- Insert- und Copy-Laengencodes (RFC 7932 §5) ------------------------
+
+fn brInsCodeFor(len: int64): int64 {
+    var c: int64 := 0;
+    while (c <= 23) {
+        var base: int64 := brInsertBase(c);
+        var span: int64 := 1 << brInsertExtra(c);
+        if ((len >= base) & (len < base + span)) { return c; }
+        c := c + 1;
+    }
+    return 0 - 1;
+}
+fn brCopyCodeFor(len: int64): int64 {
+    var c: int64 := 0;
+    while (c <= 23) {
+        var base: int64 := brCopyBase(c);
+        var span: int64 := 1 << brCopyExtra(c);
+        if ((len >= base) & (len < base + span)) { return c; }
+        c := c + 1;
+    }
+    return 0 - 1;
+}
+
+// Insert- und Copy-Code zum kombinierten Symbol (RFC 7932 §5, Tabelle).
+// useLast = 1 waehlt die Zeile mit IMPLIZITER Distanz 0 (Symbol 0..127) --
+// dann steht im Strom kein Distanzcode. Das braucht der letzte Befehl, der
+// nur noch Literale nachschiebt.
+fn brInsCopySym(insCode: int64, copyCode: int64, useLast: int64): int64 {
+    var base: int64 := 0;
+    if (useLast == 1) {
+        if (copyCode < 8) { base := 0; } else { base := 64; }
+    } else {
+        if (insCode < 8) {
+            if (copyCode < 8)       { base := 128; }
+            else { if (copyCode < 16) { base := 192; } else { base := 384; } }
+        } else {
+            if (insCode < 16) {
+                if (copyCode < 8)       { base := 256; }
+                else { if (copyCode < 16) { base := 320; } else { base := 512; } }
+            } else {
+                if (copyCode < 8)       { base := 448; }
+                else { if (copyCode < 16) { base := 576; } else { base := 640; } }
+            }
+        }
+    }
+    return base + ((insCode & 7) << 3) + (copyCode & 7);
+}
+
+// ---- Distanzcodes bei NPOSTFIX = 0, NDIRECT = 0 (RFC 7932 §4) ----------
+// ndistbits = 1 + ((dcode - 16) >> 1)
+// offset    = ((2 + ((dcode - 16) & 1)) << ndistbits) - 4
+// distance  = offset + dextra + 1
+fn brDistCodeFor(dist: int64, extraOut: int64): int64 {
+    var dcode: int64 := 16;
+    while (dcode < 64) {
+        var h: int64 := dcode - 16;
+        var nb: int64 := 1 + (h >> 1);
+        var offset: int64 := ((2 + (h & 1)) << nb) - 4;
+        var dextra: int64 := dist - offset - 1;
+        if ((dextra >= 0) & (dextra < (1 << nb))) {
+            poke64(extraOut, dextra);
+            return dcode;
+        }
+        dcode := dcode + 1;
+    }
+    return 0 - 1;
+}
+fn brDistExtraBits(dcode: int64): int64 {
+    return 1 + ((dcode - 16) >> 1);
+}
+
+// Schreibt Kopf und Daten eines komprimierten Meta-Blocks.
+// cmdCopy[i] == -1 heisst: letzter Befehl, nur Literale, keine Kopie.
+fn brWriteMeta(dst: int64, dstMax: int64, src: int64, len: int64,
+               lits: int64, nLit: int64,
+               cmdIns: int64, cmdCopy: int64, cmdDist: int64, nCmd: int64): int64 {
+    // --- Symbole je Befehl vorberechnen und dabei zaehlen ---
+    var icSym:  int64 := alloc(nCmd * 8);
+    var dSym:   int64 := alloc(nCmd * 8);
+    var dExtra: int64 := alloc(nCmd * 8);
+    var extraBox: int64 := alloc(8);
+    var bad: int64 := 0;
+
+    var icFreq:  int64 := alloc(704 * 8);
+    var litFreq: int64 := alloc(256 * 8);
+    var dFreq:   int64 := alloc(64 * 8);
+    var i: int64 := 0;
+    while (i < 704) { poke64(icFreq + i * 8, 0); i := i + 1; }
+    i := 0;
+    while (i < 256) { poke64(litFreq + i * 8, 0); i := i + 1; }
+    i := 0;
+    while (i < 64) { poke64(dFreq + i * 8, 0); i := i + 1; }
+
+    i := 0;
+    while (i < nLit) {
+        var b: int64 := peek8(lits + i);
+        poke64(litFreq + b * 8, peek64(litFreq + b * 8) + 1);
+        i := i + 1;
+    }
+
+    i := 0;
+    while (i < nCmd) {
+        var ins: int64 := peek64(cmdIns + i * 8);
+        var cpy: int64 := peek64(cmdCopy + i * 8);
+        var ic:  int64 := brInsCodeFor(ins);
+        if (ic < 0) { bad := 1; }
+        else {
+            if (cpy < 0) {
+                // Letzter Befehl: die Kopielaenge wird vom Leser ignoriert,
+                // sobald nach dem Einfuegeteil MLEN Bytes erzeugt sind.
+                //
+                // #1075: Die Zeilen mit IMPLIZITER Distanz (Symbole 0..127)
+                // decken laut RFC 7932 §5 nur die Einfuegecodes 0..7 ab.
+                // Ein laengerer Nachlauf braucht Code 8 oder mehr, und dafuer
+                // gibt es dort kein Symbol: die alte Rechnung lieferte eines,
+                // das beim Lesen auf Einfuegecode 1 hinauslief -- der Leser
+                // schrieb ein Literal statt vierzehn und lief aus dem Takt.
+                // Ab Code 8 also die explizite Form, samt Distanzcode.
+                var sym: int64 := 0;
+                if (ic < 8) {
+                    sym := brInsCopySym(ic, 0, 1);
+                    poke64(dSym + i * 8, 0 - 1);
+                } else {
+                    sym := brInsCopySym(ic, 0, 0);
+                    poke64(extraBox, 0);
+                    var dcT: int64 := brDistCodeFor(1, extraBox);
+                    poke64(dSym + i * 8, dcT);
+                    poke64(dExtra + i * 8, peek64(extraBox));
+                    poke64(dFreq + dcT * 8, peek64(dFreq + dcT * 8) + 1);
+                }
+                poke64(icSym + i * 8, sym);
+                poke64(icFreq + sym * 8, peek64(icFreq + sym * 8) + 1);
+            } else {
+                var cc: int64 := brCopyCodeFor(cpy);
+                if (cc < 0) { bad := 1; }
+                else {
+                    var sym2: int64 := brInsCopySym(ic, cc, 0);
+                    poke64(icSym + i * 8, sym2);
+                    poke64(icFreq + sym2 * 8, peek64(icFreq + sym2 * 8) + 1);
+                    poke64(extraBox, 0);
+                    var dc: int64 := brDistCodeFor(peek64(cmdDist + i * 8), extraBox);
+                    if (dc < 0) { bad := 1; }
+                    else {
+                        poke64(dSym + i * 8, dc);
+                        poke64(dExtra + i * 8, peek64(extraBox));
+                        poke64(dFreq + dc * 8, peek64(dFreq + dc * 8) + 1);
+                    }
+                }
+            }
+        }
+        i := i + 1;
+    }
+
+    if (bad != 0) {
+        free(icSym, nCmd * 8); free(dSym, nCmd * 8); free(dExtra, nCmd * 8);
+        free(extraBox, 8);
+        free(icFreq, 704 * 8); free(litFreq, 256 * 8); free(dFreq, 64 * 8);
+        return 0 - 1;
+    }
+
+    // Ein Praefixcode braucht mindestens ein benutztes Symbol. Wird der
+    // Distanzcode gar nicht gebraucht (kein einziger Kopierbefehl), bekommt
+    // er trotzdem ein Symbol -- sonst waere die Codebeschreibung ungueltig.
+    var anyD: int64 := 0;
+    i := 0;
+    while (i < 64) { if (peek64(dFreq + i * 8) > 0) { anyD := 1; } i := i + 1; }
+    if (anyD == 0) { poke64(dFreq + 16 * 8, 1); }
+    var anyL: int64 := 0;
+    i := 0;
+    while (i < 256) { if (peek64(litFreq + i * 8) > 0) { anyL := 1; } i := i + 1; }
+    if (anyL == 0) { poke64(litFreq, 1); }
+
+    var litLens:  int64 := alloc(256 * 8);
+    var litCodes: int64 := alloc(256 * 8);
+    var icLens:   int64 := alloc(704 * 8);
+    var icCodes:  int64 := alloc(704 * 8);
+    var dLens:    int64 := alloc(64 * 8);
+    var dCodes:   int64 := alloc(64 * 8);
+    brHuffLengths(litFreq, 256, 15, litLens);
+    brHuffLengths(icFreq,  704, 15, icLens);
+    brHuffLengths(dFreq,   64,  15, dLens);
+
+    var w: int64 := brwNew(dst, dstMax);
+
+    // --- Stromkopf: WBITS = 16 ---
+    brwWriteBits(w, 0, 1);
+
+    // --- Meta-Block-Kopf (RFC 7932 §9.2) ---
+    brwWriteBits(w, 1, 1);   // ISLAST = 1
+    brwWriteBits(w, 0, 1);   // ISLASTEMPTY = 0
+
+    var M: int64 := len - 1;
+    var mnib: int64 := 4;
+    if (M >= 0x100000) { mnib := 6; }
+    else { if (M >= 0x10000) { mnib := 5; } }
+    // Codetabelle: 4 -> 00, 5 -> 01, 6 -> 10
+    brwWriteBits(w, mnib - 4, 2);
+    var nb: int64 := 0;
+    while (nb < mnib) { brwWriteBits(w, (M >> (nb * 4)) & 0xF, 4); nb := nb + 1; }
+    // ISUNCOMPRESSED entfaellt, weil ISLAST gesetzt ist.
+
+    brwWriteBits(w, 0, 1);   // NBLTYPESL = 1
+    brwWriteBits(w, 0, 1);   // NBLTYPESI = 1
+    brwWriteBits(w, 0, 1);   // NBLTYPESD = 1
+    brwWriteBits(w, 0, 2);   // NPOSTFIX = 0
+    brwWriteBits(w, 0, 4);   // NDIRECT = 0
+    brwWriteBits(w, 0, 2);   // Kontextmodus des einen Literal-Blocktyps
+    brwWriteBits(w, 0, 1);   // NTREESL = 1  -> Kontextkarte entfaellt
+    brwWriteBits(w, 0, 1);   // NTREESD = 1
+
+    brWriteCodeDesc(w, litLens, litCodes, 256, 8);
+    brWriteCodeDesc(w, icLens,  icCodes,  704, 10);
+    brWriteCodeDesc(w, dLens,   dCodes,   64,  6);
+
+    // --- Befehle (RFC 7932 §9.3) ---
+    var litPos: int64 := 0;
+    i := 0;
+    while (i < nCmd) {
+        var ins: int64 := peek64(cmdIns + i * 8);
+        var cpy: int64 := peek64(cmdCopy + i * 8);
+        var sym: int64 := peek64(icSym + i * 8);
+
+        brwWriteCode(w, peek64(icCodes + sym * 8), peek64(icLens + sym * 8));
+
+        var ic: int64 := brInsCodeFor(ins);
+        brwWriteBits(w, ins - brInsertBase(ic), brInsertExtra(ic));
+        if (cpy < 0) {
+            // Kopiecode 0 hat keine Zusatzbits.
+            brwWriteBits(w, 0, 0);
+        } else {
+            var cc: int64 := brCopyCodeFor(cpy);
+            brwWriteBits(w, cpy - brCopyBase(cc), brCopyExtra(cc));
+        }
+
+        var j: int64 := 0;
+        while (j < ins) {
+            var b2: int64 := peek8(lits + litPos + j);
+            brwWriteCode(w, peek64(litCodes + b2 * 8), peek64(litLens + b2 * 8));
+            j := j + 1;
+        }
+        litPos := litPos + ins;
+
+        if (peek64(dSym + i * 8) >= 0) {
+            var dc2: int64 := peek64(dSym + i * 8);
+            brwWriteCode(w, peek64(dCodes + dc2 * 8), peek64(dLens + dc2 * 8));
+            brwWriteBits(w, peek64(dExtra + i * 8), brDistExtraBits(dc2));
+        }
+        i := i + 1;
+    }
+
+    brwFlush(w);
+    var written: int64 := peek64(w + 8);
+    free(w, 40);
+
+    free(icSym, nCmd * 8); free(dSym, nCmd * 8); free(dExtra, nCmd * 8);
+    free(extraBox, 8);
+    free(icFreq, 704 * 8); free(litFreq, 256 * 8); free(dFreq, 64 * 8);
+    free(litLens, 256 * 8); free(litCodes, 256 * 8);
+    free(icLens, 704 * 8); free(icCodes, 704 * 8);
+    free(dLens, 64 * 8); free(dCodes, 64 * 8);
+
+    if (written > dstMax) { return 0 - 1; }
+    return written;
+}
+
+// ---- LZ77 ---------------------------------------------------------------
+
+pub con BROTLI_HASH_BITS: int64 := 15;
+pub con BROTLI_MIN_MATCH: int64 := 4;
+pub con BROTLI_MAX_CHAIN: int64 := 24;
+// Das Fenster ergibt sich aus WBITS = 16: (1 << 16) - 16.
+pub con BROTLI_MAX_DIST:  int64 := 65520;
+
+fn brHash4(p: int64): int64 {
+    var v: int64 := peek8(p) | (peek8(p + 1) << 8) | (peek8(p + 2) << 16) | (peek8(p + 3) << 24);
+    return ((v * 2654435761) >> (32 - BROTLI_HASH_BITS)) & ((1 << BROTLI_HASH_BITS) - 1);
+}
+
+// Schreibt EINEN komprimierten Meta-Block ueber src[0..len). Gibt die Zahl
+// der geschriebenen Bytes zurueck oder -1, wenn es nicht geht bzw. sich nicht
+// lohnt -- der Aufrufer faellt dann auf den unkomprimierten Meta-Block
+// zurueck. Weil es diesen Ausweg gibt, muss hier nichts geraten werden.
+fn brCompressMeta(src: int64, len: int64, dst: int64, dstMax: int64): int64 {
+    if (len < 16) { return 0 - 1; }
+
+    var hashSize: int64 := 1 << BROTLI_HASH_BITS;
+    var head: int64 := alloc(hashSize * 8);
+    var prev: int64 := alloc(len * 8);
+    var k: int64 := 0;
+    while (k < hashSize) { poke64(head + k * 8, 0 - 1); k := k + 1; }
+
+    // Befehle: Einfuegelaenge, Kopielaenge, Distanz.
+    var maxCmd: int64 := len / 4 + 8;
+    var cmdIns:  int64 := alloc(maxCmd * 8);
+    var cmdCopy: int64 := alloc(maxCmd * 8);
+    var cmdDist: int64 := alloc(maxCmd * 8);
+    var lits:    int64 := alloc(len + 8);
+    var nCmd: int64 := 0;
+    var nLit: int64 := 0;
+
+    var pos: int64 := 0;
+    var litStart: int64 := 0;
+    while (pos + BROTLI_MIN_MATCH < len) {
+        var h: int64 := brHash4(src + pos);
+        var cand: int64 := peek64(head + h * 8);
+        var bestLen: int64 := 0;
+        var bestDist: int64 := 0;
+        var chain: int64 := 0;
+        while ((cand >= 0) & (chain < BROTLI_MAX_CHAIN)) {
+            var d: int64 := pos - cand;
+            if (d > BROTLI_MAX_DIST) { chain := BROTLI_MAX_CHAIN; }
+            else {
+                var m: int64 := 0;
+                while ((pos + m < len) & (peek8(src + cand + m) == peek8(src + pos + m))) { m := m + 1; }
+                if (m > bestLen) { bestLen := m; bestDist := d; }
+                cand := peek64(prev + cand * 8);
+                chain := chain + 1;
+            }
+        }
+        poke64(prev + pos * 8, peek64(head + h * 8));
+        poke64(head + h * 8, pos);
+
+        if (bestLen >= BROTLI_MIN_MATCH) {
+            var insLen: int64 := pos - litStart;
+            var j: int64 := 0;
+            while (j < insLen) { poke8(lits + nLit + j, peek8(src + litStart + j)); j := j + 1; }
+            nLit := nLit + insLen;
+            poke64(cmdIns  + nCmd * 8, insLen);
+            poke64(cmdCopy + nCmd * 8, bestLen);
+            poke64(cmdDist + nCmd * 8, bestDist);
+            nCmd := nCmd + 1;
+
+            var q: int64 := pos + 1;
+            while (q < pos + bestLen) {
+                if (q + 4 <= len) {
+                    var hq: int64 := brHash4(src + q);
+                    poke64(prev + q * 8, peek64(head + hq * 8));
+                    poke64(head + hq * 8, q);
+                }
+                q := q + 1;
+            }
+            pos := pos + bestLen;
+            litStart := pos;
+        } else {
+            pos := pos + 1;
+        }
+    }
+
+    // Nachlauf: die restlichen Literale bilden einen letzten Befehl OHNE
+    // Kopie. RFC 7932 §9.3/§10: sind nach dem Einfuegeteil MLEN Bytes
+    // erzeugt, wird die Kopielaenge ignoriert und KEIN Distanzcode gelesen.
+    //
+    // NUR wenn ueberhaupt etwas uebrig ist. Endet die letzte Kopie genau auf
+    // MLEN, verlaesst der Leser die Befehlsschleife dort ("while number of
+    // uncompressed bytes for this meta-block < MLEN") und liest den leeren
+    // Nachlaufbefehl nie -- seine Bits waeren Muell am Stromende, und der
+    // RFC verlangt, dass die ungenutzten Bits des letzten Bytes null sind.
+    // Genau daran scheiterte eine 100-Byte-Eingabe, deren Kopie punktgenau
+    // aufging.
+    var tail: int64 := len - litStart;
+    if (tail > 0) {
+        var t: int64 := 0;
+        while (t < tail) { poke8(lits + nLit + t, peek8(src + litStart + t)); t := t + 1; }
+        nLit := nLit + tail;
+        poke64(cmdIns  + nCmd * 8, tail);
+        poke64(cmdCopy + nCmd * 8, 0 - 1);   // -1 = kein Kopierteil
+        poke64(cmdDist + nCmd * 8, 0);
+        nCmd := nCmd + 1;
+    }
+
+    var out: int64 := 0 - 1;
+    if (nCmd >= 1) {
+        out := brWriteMeta(dst, dstMax, src, len, lits, nLit, cmdIns, cmdCopy, cmdDist, nCmd);
+    }
+
+    free(head, hashSize * 8); free(prev, len * 8);
+    free(cmdIns, maxCmd * 8); free(cmdCopy, maxCmd * 8); free(cmdDist, maxCmd * 8);
+    free(lits, len + 8);
+    return out;
+}
+
 pub fn BrotliCompress(src: int64, srcLen: int64, dst: int64, dstMax: int64): int64 {
     if ((src == 0) | (dst == 0)) { return BROTLI_ERR; }
+    if (srcLen < 0) { return BROTLI_ERR; }
     if (srcLen == 0) {
         if (dstMax < 1) { return BROTLI_OVERFLOW; }
-        poke8(dst, 0x06);  // WBITS=16(0) ISLAST=1 ISLASTEMPTY=1 → 0b00000110 → 0x06
+        poke8(dst, 0x06);  // WBITS=16(0) ISLAST=1 ISLASTEMPTY=1
         return 1;
     }
 
-    // Worst case: 4 bytes header per chunk + srcLen + 1 byte terminal
+    // Schlimmster Fall bleibt der unkomprimierte Meta-Block.
     var chunks: int64 := (srcLen + 16777215) / 16777216;
     var needed: int64 := srcLen + chunks * 5 + 2;
     if (dstMax < needed) { return BROTLI_OVERFLOW; }
 
-    var w:   int64 := brwNew(dst, dstMax);
+    // Ein komprimierter Meta-Block deckt bis zu 2^24-1 Byte ab. Groessere
+    // Eingaben bekommen mehrere; jeder ist fuer sich vollstaendig.
+    var metaMax: int64 := 16777215;
+    if (srcLen <= metaMax) {
+        var comp: int64 := brCompressMeta(src, srcLen, dst, dstMax);
+        if ((comp > 0) & (comp < needed)) { return comp; }
+    }
 
-    // WBITS = 16: single bit 0
-    brwWriteBits(w, 0, 1);
+    // Rueckfall: unkomprimierte Meta-Bloecke (der bisherige Store-Modus).
+    var w: int64 := brwNew(dst, dstMax);
+    brwWriteBits(w, 0, 1);         // WBITS = 16
 
     var pos: int64 := 0;
     while (pos < srcLen) {
         var remain: int64 := srcLen - pos;
-        var blk:    int64 := remain;
+        var blk: int64 := remain;
         if (blk > 16777216) { blk := 16777216; }
-
         var M: int64 := blk - 1;
-
-        // RFC 7932 §9.2: last nibble of MLEN-1 MUST NOT be zero → use minimum nibbles
-        var mnibCode: int64 := 0;  // 0→4 nibbles, 1→5 nibbles, 2→6 nibbles
+        var mnibCode: int64 := 0;
         if (M >= 0x100000) { mnibCode := 2; }
         else { if (M >= 0x10000) { mnibCode := 1; } }
-
-        // ISLAST=0 always for data blocks — ISUNCOMPRESSED only allowed when ISLAST=0
-        brwWriteBits(w, 0, 1);         // ISLAST=0
-        brwWriteBits(w, mnibCode, 2);  // MNIBBLES
-        // MLEN-1 in (mnibCode+4) nibbles
+        brwWriteBits(w, 0, 1);         // ISLAST = 0
+        brwWriteBits(w, mnibCode, 2);
         var nnibs: int64 := mnibCode + 4;
-        var k: int64 := 0;
-        while (k < nnibs) {
-            brwWriteBits(w, (M >> (k * 4)) & 0xF, 4);
-            k += 1;
-        }
-        brwWriteBits(w, 1, 1);    // ISUNCOMPRESSED=1
-        brwFlush(w);              // auf Bytegrenze ausrichten
-
-        // Rohdaten
-        var i: int64 := 0;
-        while (i < blk) {
+        var k2: int64 := 0;
+        while (k2 < nnibs) { brwWriteBits(w, (M >> (k2 * 4)) & 0xF, 4); k2 := k2 + 1; }
+        brwWriteBits(w, 1, 1);         // ISUNCOMPRESSED = 1
+        brwFlush(w);
+        var i2: int64 := 0;
+        while (i2 < blk) {
             var outPos: int64 := peek64(w + 8);
-            var outDst: int64 := peek64(w);
-            poke8(outDst + outPos, peek8(src + pos + i));
+            poke8(peek64(w) + outPos, peek8(src + pos + i2));
             poke64(w + 8, outPos + 1);
-            i += 1;
+            i2 := i2 + 1;
         }
-        pos += blk;
+        pos := pos + blk;
     }
-
-    // Terminal empty last block: ISLAST=1 ISLASTEMPTY=1 (2 bits) + flush
-    brwWriteBits(w, 3, 2);   // 0b11 = ISLAST=1, ISLASTEMPTY=1
+    brwWriteBits(w, 3, 2);   // ISLAST = 1, ISLASTEMPTY = 1
     brwFlush(w);
-
     var written: int64 := peek64(w + 8);
     free(w, 40);
     return written;
