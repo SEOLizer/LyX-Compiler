@@ -1492,6 +1492,101 @@ pub type Sema = class {
     return 8;
   }
 
+  // #1082: Bereichstyp `type X = int64 range LO..HI;`.
+  //
+  // Liefert 1, wenn typeNi auf einen Bereichstyp zeigt, und legt die Grenzen
+  // in loBox/hiBox ab. Der Parser haengt die Grenzen als NK_RANGE-Knoten an
+  // c1 der Typdeklaration und setzt iv-Bit 2 (Wert 4).
+  fn _rangeBounds(typeNi: int64, loBox: int64, hiBox: int64): int64 {
+    if (typeNi < 0) { return 0; }
+    var nm:  pchar := self.sn_sVal(typeNi);
+    var nml: int64 := self.sn_sLen(typeNi);
+    if (nml <= 0) { return 0; }
+    var si: int64 := self.Lookup(nm, nml);
+    if (si < 0) { return 0; }
+    if (self.SymKind(si) != SYM_TYPE) { return 0; }
+    var declNi: int64 := self.SymNodeIdx(si);
+    // Ein importierter Typ ist hier nicht entscheidbar (SymNodeIdx == -1).
+    // Das heisst "unbekannt", nicht "kein Bereichstyp" -- also nichts melden.
+    if (declNi < 0) { return 0; }
+    if ((self.sn_iVal(declNi) & 4) == 0) { return 0; }
+    var rn: int64 := self.sn_c1(declNi);
+    if (rn < 0) { return 0; }
+    var loN: int64 := self.sn_c0(rn);
+    var hiN: int64 := self.sn_c1(rn);
+    if (loN < 0 || hiN < 0) { return 0; }
+    poke64(loBox, self.sn_iVal(loN));
+    poke64(hiBox, self.sn_iVal(hiN));
+    return 1;
+  }
+
+  // #1082: Ist der Ausdruck eine Ganzzahlkonstante? 1 = ja, Wert in outBox.
+  //
+  // Bewusst eng gehalten: Literal, negiertes Literal und `con`-Bezeichner.
+  // _evalConstExpr liefert bei nicht-konstanten Ausdruecken 0 und laesst sich
+  // deshalb nicht von einer echten 0 unterscheiden -- hier braucht es aber
+  // genau diese Unterscheidung, sonst wuerde jede Variable als "0" geprueft.
+  fn _constIntOf(ni: int64, outBox: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.sn_kind(ni);
+    if (k == 40) { poke64(outBox, self.sn_iVal(ni)); return 1; }
+    if (k == SNK_UNOP) {
+      if (self.sn_iVal(ni) != 71) { return 0; }   // nur unaeres Minus
+      var innerNi: int64 := self.sn_c0(ni);
+      if (innerNi < 0) { return 0; }
+      if (self.sn_kind(innerNi) != 40) { return 0; }
+      poke64(outBox, 0 - self.sn_iVal(innerNi));
+      return 1;
+    }
+    if (k == SNK_IDENT) {
+      var si: int64 := self.Lookup(self.sn_sVal(ni), self.sn_sLen(ni));
+      if (si < 0) { return 0; }
+      if (self.SymKind(si) != SYM_CON) { return 0; }
+      poke64(outBox, self._lookupConst(self.sn_sVal(ni), self.sn_sLen(ni)));
+      return 1;
+    }
+    if (k == SNK_BINOP) {
+      // Beide Seiten konstant -> der ganze Ausdruck ist es. Deckt `0 - 5` ab,
+      // die uebliche Schreibweise fuer negative Werte in diesem Bestand.
+      var lBox: int64 := alloc(8);
+      var rBox: int64 := alloc(8);
+      var okL: int64 := self._constIntOf(self.sn_c0(ni), lBox);
+      var okR: int64 := 0;
+      if (okL != 0) { okR := self._constIntOf(self.sn_c1(ni), rBox); }
+      var res: int64 := 0;
+      if (okR != 0) {
+        var bop: int64 := self.sn_iVal(ni);
+        var lv: int64 := peek64(lBox);
+        var rv: int64 := peek64(rBox);
+        if (bop == 70) { poke64(outBox, lv + rv); res := 1; }
+        if (bop == 71) { poke64(outBox, lv - rv); res := 1; }
+        if (bop == 72) { poke64(outBox, lv * rv); res := 1; }
+        if (bop == 93) { poke64(outBox, lv << rv); res := 1; }
+      }
+      free(lBox, 8); free(rBox, 8);
+      return res;
+    }
+    return 0;
+  }
+
+  // #1082: Konstante gegen die Grenzen eines Bereichstyps pruefen.
+  fn _checkRangeAssign(typeNi: int64, valNi: int64, atNi: int64): void {
+    var loBox: int64 := alloc(8);
+    var hiBox: int64 := alloc(8);
+    var vBox:  int64 := alloc(8);
+    if (self._rangeBounds(typeNi, loBox, hiBox) != 0) {
+      if (self._constIntOf(valNi, vBox) != 0) {
+        var v:  int64 := peek64(vBox);
+        var lo: int64 := peek64(loBox);
+        var hi: int64 := peek64(hiBox);
+        if (v < lo || v > hi) {
+          self._errorNode("Wert liegt ausserhalb des Bereichs des Typs", atNi);
+        }
+      }
+    }
+    free(loBox, 8); free(hiBox, 8); free(vBox, 8);
+  }
+
   fn _evalConstExpr(ni: int64): int64 {
     if (ni < 0) { return 0; }
     var k: int64 := self.sn_kind(ni);
@@ -1952,6 +2047,8 @@ pub type Sema = class {
       if (initNi >= 0) {
         self._checkExpr(initNi);
         self._logConstraint(tid, TY_UNKNOWN, "var-init"c, ni);
+        // #1082: Bereichstyp -- konstante Initialisierung sofort pruefen.
+        self._checkRangeAssign(typeNi, initNi, initNi);
       }
       var varSi: int64 := self.symCount;
       self._pushSym(self.sn_sVal(ni), self.sn_sLen(ni), SYM_VAR, tid, ni);
@@ -1979,6 +2076,17 @@ pub type Sema = class {
       }
       self._checkExpr(self.sn_c0(ni));
       self._checkExpr(self.sn_c1(ni));
+      // #1082: Zuweisung an eine Variable mit Bereichstyp -- konstante
+      // rechte Seite sofort pruefen.
+      if (self.sn_kind(lval) == SNK_IDENT) {
+        var asi: int64 := self.Lookup(self.sn_sVal(lval), self.sn_sLen(lval));
+        if (asi >= 0) {
+          var adecl: int64 := self.SymNodeIdx(asi);
+          if (adecl >= 0) {
+            self._checkRangeAssign(self.sn_c0(adecl), self.sn_c1(ni), self.sn_c1(ni));
+          }
+        }
+      }
 
     } else if (k == SNK_RETURN) {
       self._checkExpr(self.sn_c0(ni));

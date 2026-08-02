@@ -1193,6 +1193,7 @@ Einzelbefunde sind dort verlinkt.
 | `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
 | `&x` (Adress-Operator) | 15 | Gibt es nicht. Ein Ausgabeparameter wird als Zelle uebergeben (`alloc(8)`, danach `peek64`). (#1061) |
 | Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
+| Bereichstyp, Laufzeitpruefung | 7 | `type X = int64 range LO..HI;` parst und wird geprueft, solange der zugewiesene Wert zur UEBERSETZUNGSZEIT feststeht (Literal, `con`, konstanter Ausdruck) -- bei Initialisierung und bei Zuweisung. **Berechnete** Werte werden nicht geprueft, ebenso wenig Parameter, Rueckgaben und Strukturfelder. Der Typ sichert also weniger zu, als sein Name nahelegt. (#1082) |
 
 Behoben seit der letzten Fassung dieses Abschnitts und daher hier entfallen:
 Fallrumpf als Block und qualifizierte Enum-Muster (#1024), `fn f<T>(...)`
