@@ -253,6 +253,12 @@ test: lyxc
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
 	@echo "OK"
+	@echo "--- Schmale Ganzzahltypen kuerzen beim Speichern (20 Pruefungen) ---"
+	@bash tests/int_width_test.sh
+	@echo "OK"
+	@echo "--- Ganzzahlbreiten Ende-zu-Ende ---"
+	@bash tests/e2e/test_int_widths.sh
+	@echo "OK"
 	@echo "--- Array-Bereichspruefung (12 Pruefungen) ---"
 	@bash tests/bounds_check_test.sh
 	@echo "OK"
