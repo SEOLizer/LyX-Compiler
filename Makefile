@@ -196,6 +196,7 @@ test: lyxc
 	@bash tests/range_runtime_test.sh
 	@bash tests/attribute_test.sh
 	@bash tests/while_limit_test.sh
+	@bash tests/grammar_gaps_test.sh
 	@echo "OK"
 	@echo "--- Verschachtelte Funktionen (8 Prüfungen) ---"
 	./lyxc --std-path=std tests/nested_fn_test.lyx -o /tmp/lyxc_nfn_test
