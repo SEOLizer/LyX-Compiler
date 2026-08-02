@@ -1318,6 +1318,29 @@ pub type Parser = class {
       self.Expect(TK_RPAREN);
       return n;
     }
+    // #1091: `super.M(args)` (ebnf.md §15, SuperExpr). Wird als
+    // METHODENAUFRUF auf `self` gebaut, aber mit iVal 3 statt 1 markiert:
+    // der Codegen waehlt daran die Implementierung der ELTERNKLASSE und ruft
+    // sie DIREKT auf, nicht ueber die VMT. Ohne diese Direktheit riefe
+    // `super.F()` in einem `override fn F()` sich selbst -- endlos.
+    if (k == TK_SUPER) {
+      var sti: int64 := self.cur;
+      self.Advance();
+      self.Expect(TK_DOT);
+      var smTok: int64 := self.cur;
+      self.Expect(TK_IDENT);
+      var sn: int64 := self._alloc(NK_CALL, sti);
+      self._ssv(sn, self._tokOff(smTok), self._tokLen(smTok));
+      self._siv(sn, 3);
+      // Kein Empfaengerknoten: der Codegen laedt bei Marker 3 das lokale
+      // `self` der laufenden Methode. Einen IDENT-Knoten "self" liesse sich
+      // hier nur mit geliehenem Quelltext bauen -- der Name muesste im Text
+      // stehen, und an dieser Stelle steht dort `super`.
+      self.Expect(TK_LPAREN);
+      self._sc1(sn, self._parseArgList());
+      self.Expect(TK_RPAREN);
+      return sn;
+    }
     if (k == 100) {  // TK_LPAREN=100
       self.Advance();
       var inner: int64 := self.ParseExpr();
@@ -2343,6 +2366,12 @@ pub type Parser = class {
     return n;
   }
 
+  // #1091: Hat die Funktionsdeklaration keinen Rumpf? (c2 == -1)
+  fn cg_hasNoBody(n: int64): int64 {
+    if (self.NChild2(n) < 0) { return 1; }
+    return 0;
+  }
+
   fn ParseStructDecl(isPub: int64): int64 {
     var ti: int64 := self.cur;
     self.Advance();
@@ -2736,6 +2765,18 @@ pub type Parser = class {
             }
             if (self.Check(TK_FN) != 0) {
               var cm: int64 := self.ParseFuncDecl(cPub);
+              // #1091: Abstrakte Methode ohne Rumpf -- `abstract fn F(): T;`
+              // (ebnf.md §9: "Block durch ';' ersetzt"). ParseFuncDecl liest
+              // keinen Block, wenn keiner dasteht; das uebrige Semikolon fiel
+              // danach in den FELD-Zweig und ergab "expected IDENT, got ;",
+              // eine Meldung, die mit der Ursache nichts zu tun hatte.
+              if (self.cg_hasNoBody(cm) != 0) {
+                if (cAbstract == 0) {
+                  self._err("Methode ohne Rumpf muss abstract sein"c);
+                  self._err("  `abstract fn F(): T;` -- sonst gehoert ein Block dahinter"c);
+                }
+                self.Match(TK_SEMI);
+              }
               // bit0=isPub, bit1=isVirtual, bit2=isOverride, bit3=isAbstract, bits4-5=visibility
               self._siv(cm, cPub | (cVirtual << 1) | (cOverride << 2) | (cAbstract << 3) | (cVis << 4) | (cStatic << 6));
               // WP-L8: chain method cap/ucc annotation nodes BEFORE method in c1 list
