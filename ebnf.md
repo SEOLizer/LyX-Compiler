@@ -462,6 +462,13 @@ StructField         = Ident ":" Type ";" ;
 PackedField         = Ident ":" Type [ "at" "(" IntLiteral ")" ] ";" ;
 ```
 
+`flat` und `packed` sind WEICHE Schluesselwoerter und werden nur unmittelbar
+vor `struct` als solche gelesen (§2.1 haelt fest, dass sie nicht reserviert
+sind); ueberall sonst bleiben sie gewoehnliche Bezeichner. Beide Formen legen
+die Felder ohne Auffuellung hintereinander, jedes so breit wie sein Typ --
+dasselbe, was die Annotation `@packed` bewirkt. `at(N)` ist ein **Byte**-Offset
+vom Anfang des Structs, kein Bit-Offset. (#1084)
+
 ---
 
 # 9. Classes
