@@ -1,0 +1,420 @@
+// std/hl7/results.lyx — HL7 v2 Befunde: ORU^R01 / OUL^R22 (WP-HL7-03)
+//
+// Public API:
+//   Hl7ObxParse(seg, segLen, obx)        — OBX-Segment → Hl7Obx-Struct
+//   Hl7NteParse(seg, segLen, note)       — NTE-Segment → Hl7Nte-Struct
+//   Hl7OruParse(msg, len, report)        — ORU^R01 → Hl7Report-Struct
+//   Hl7OulParse(msg, len, report)        — OUL^R22 → Hl7Report-Struct
+//   Hl7OruWrite(report, obx, out, outMax) → int64 (geschriebene Bytes)
+//
+// Aufbau und Idiome folgen std/hl7/orders.lyx: Felder werden nicht kopiert,
+// sondern als Zeiger+Länge in die Nachricht hinein gehalten. Der Aufrufer muss
+// den Nachrichtenpuffer daher so lange am Leben lassen wie die Struct.
+
+unit std.hl7.results;
+
+import std.hl7.core;
+import std.alloc;
+
+// ── Hl7Obx: ein Befundwert (OBX-Segment) ─────────────────────────────────────
+pub con HL7_OBX_SETID:        int64 := 0;    // OBX-1  Set ID
+pub con HL7_OBX_SETID_LEN:    int64 := 8;
+pub con HL7_OBX_VALTYPE:      int64 := 16;   // OBX-2  Werttyp (NM/ST/TX/CWE/SN/FT/RP)
+pub con HL7_OBX_VALTYPE_LEN:  int64 := 24;
+pub con HL7_OBX_OBSID:        int64 := 32;   // OBX-3  Observation Identifier (LOINC)
+pub con HL7_OBX_OBSID_LEN:    int64 := 40;
+pub con HL7_OBX_VALUE:        int64 := 48;   // OBX-5  Wert
+pub con HL7_OBX_VALUE_LEN:    int64 := 56;
+pub con HL7_OBX_UNIT:         int64 := 64;   // OBX-6  Einheit
+pub con HL7_OBX_UNIT_LEN:     int64 := 72;
+pub con HL7_OBX_REFRANGE:     int64 := 80;   // OBX-7  Referenzbereich
+pub con HL7_OBX_REFRANGE_LEN: int64 := 88;
+pub con HL7_OBX_ABNFLAG:      int64 := 96;   // OBX-8  Abnormal-Kennzeichen
+pub con HL7_OBX_ABNFLAG_LEN:  int64 := 104;
+pub con HL7_OBX_STATUS:       int64 := 112;  // OBX-11 Ergebnisstatus
+pub con HL7_OBX_STATUS_LEN:   int64 := 120;
+pub con HL7_OBX_ISCORR:       int64 := 128;  // abgeleitet: korrigierter Wert
+pub con HL7_OBX_ISCRIT:       int64 := 136;  // abgeleitet: kritischer Wert
+pub con HL7_OBX_SIZE:         int64 := 144;
+
+// ── Hl7Nte: Kommentarzeile (NTE-Segment) ─────────────────────────────────────
+pub con HL7_NTE_TEXT:      int64 := 0;    // NTE-3 Kommentartext
+pub con HL7_NTE_TEXT_LEN:  int64 := 8;
+pub con HL7_NTE_SIZE:      int64 := 16;
+
+// ── Hl7Report: Kopfdaten einer Befundnachricht ───────────────────────────────
+pub con HL7_RPT_MSGTYPE:      int64 := 0;    // 1 = ORU, 2 = OUL
+pub con HL7_RPT_EVENT:        int64 := 8;    // MSH-9.2, z. B. "R01"
+pub con HL7_RPT_EVENT_LEN:    int64 := 16;
+pub con HL7_RPT_PAT_ID:       int64 := 24;   // PID-3.1
+pub con HL7_RPT_PAT_ID_LEN:   int64 := 32;
+pub con HL7_RPT_PLACER:       int64 := 40;   // OBR-2
+pub con HL7_RPT_PLACER_LEN:   int64 := 48;
+pub con HL7_RPT_FILLER:       int64 := 56;   // OBR-3
+pub con HL7_RPT_FILLER_LEN:   int64 := 64;
+pub con HL7_RPT_SERVICE:      int64 := 72;   // OBR-4
+pub con HL7_RPT_SERVICE_LEN:  int64 := 80;
+pub con HL7_RPT_OBS_DT:       int64 := 88;   // OBR-7 Beobachtungszeitpunkt
+pub con HL7_RPT_OBS_DT_LEN:   int64 := 96;
+pub con HL7_RPT_SIZE:         int64 := 104;
+
+// Nachrichtenarten
+pub con HL7_RPT_TYPE_ORU: int64 := 1;
+pub con HL7_RPT_TYPE_OUL: int64 := 2;
+
+// ── Interne Helfer ───────────────────────────────────────────────────────────
+
+// N-tes Feld (1-basiert nach dem Segmentnamen) als Zeiger+Länge.
+// Liefert 0/0, wenn das Feld nicht existiert.
+fn resFieldGet(seg: int64, segLen: int64, sep: int64, fieldNum: int64,
+               outPtr: int64, outLen: int64) {
+    var pos:  int64 := 0;
+    var fnum: int64 := 0;
+    while (pos < segLen && peek8(seg + pos) != sep) { pos := pos + 1; }
+    while (pos < segLen && fnum < fieldNum) {
+        pos += 1;
+        fnum += 1;
+        if (fnum == fieldNum) {
+            var start: int64 := pos;
+            while (pos < segLen && peek8(seg + pos) != sep
+                   && peek8(seg + pos) != 13 && peek8(seg + pos) != 10) {
+                pos += 1;
+            }
+            poke64(outPtr, seg + start);
+            poke64(outLen, pos - start);
+            return;
+        }
+        while (pos < segLen && peek8(seg + pos) != sep && peek8(seg + pos) != 13) {
+            pos += 1;
+        }
+    }
+    poke64(outPtr, 0);
+    poke64(outLen, 0);
+}
+
+// N-te Komponente (1-basiert) innerhalb eines Feldwerts.
+fn resCompGet(fldPtr: int64, fldLen: int64, csep: int64, compNum: int64,
+              outPtr: int64, outLen: int64) {
+    var pos:   int64 := 0;
+    var cnum:  int64 := 1;
+    var start: int64 := 0;
+    while (cnum < compNum && pos < fldLen) {
+        if (peek8(fldPtr + pos) == csep) { cnum := cnum + 1; start := pos + 1; }
+        pos += 1;
+    }
+    var end: int64 := start;
+    while (end < fldLen && peek8(fldPtr + end) != csep) { end := end + 1; }
+    poke64(outPtr, fldPtr + start);
+    poke64(outLen, end - start);
+}
+
+// Erstes Segment mit dem Namen c1c2c3 suchen; 0 wenn nicht vorhanden.
+// Ein Segmentname zählt nur am Nachrichtenanfang oder direkt nach CR/LF —
+// sonst würde ein "OBR" mitten in einem Textfeld fälschlich treffen.
+fn resFindSeg(msg: int64, len: int64, c1: int64, c2: int64, c3: int64, sep: int64): int64 {
+    var i: int64 := 0;
+    while (i + 3 < len) {
+        var atStart: int64 := 0;
+        if (i == 0) { atStart := 1; }
+        else {
+            var prev: int64 := peek8(msg + i - 1);
+            if (prev == 13 || prev == 10) { atStart := 1; }
+        }
+        if (atStart == 1) {
+            if (peek8(msg + i) == c1 && peek8(msg + i + 1) == c2
+                && peek8(msg + i + 2) == c3 && peek8(msg + i + 3) == sep) {
+                return msg + i;
+            }
+        }
+        i := i + 1;
+    }
+    return 0;
+}
+
+// Länge eines Segments ab seg bis CR/LF bzw. Nachrichtenende.
+fn resSegLen(msg: int64, len: int64, seg: int64): int64 {
+    var off: int64 := seg - msg;
+    var end: int64 := off;
+    while (end < len && peek8(msg + end) != 13 && peek8(msg + end) != 10) { end := end + 1; }
+    return end - off;
+}
+
+fn resCopy(dst: int64, src: int64, n: int64) {
+    var i: int64 := 0;
+    while (i < n) { poke8(dst + i, peek8(src + i)); i := i + 1; }
+}
+
+fn resWriteField(out: int64, pos: int64, ptr: int64, len: int64): int64 {
+    resCopy(out + pos, ptr, len);
+    return pos + len;
+}
+
+// Zwei gleiche Buchstaben aus {A,L,H,C} kennzeichnen einen KRITISCHEN Befund
+// (AA panic, LL kritisch niedrig, HH kritisch hoch, CC Rückrufpflicht).
+// Ein einzelnes H oder L ist nur auffällig, nicht kritisch.
+fn resIsCritFlag(ptr: int64, len: int64): int64 {
+    if (len != 2) { return 0; }
+    var a: int64 := peek8(ptr);
+    var b: int64 := peek8(ptr + 1);
+    if (a != b) { return 0; }
+    if (a == 65) { return 1; }   // AA
+    if (a == 76) { return 1; }   // LL
+    if (a == 72) { return 1; }   // HH
+    if (a == 67) { return 1; }   // CC
+    return 0;
+}
+
+// Ergebnisstatus C (korrigiert) oder W (fehlerhaft/zurückgezogen).
+fn resIsCorrStatus(ptr: int64, len: int64): int64 {
+    if (len != 1) { return 0; }
+    var c: int64 := peek8(ptr);
+    if (c == 67) { return 1; }   // C
+    if (c == 87) { return 1; }   // W
+    return 0;
+}
+
+// Kopfdaten aus MSH und den Auftragssegmenten füllen — gemeinsam für ORU und OUL.
+fn resParseCommon(msg: int64, len: int64, report: int64) {
+    var fsep: int64 := 124;
+    var csep: int64 := 94;
+    var fptr: int64 := alloc(16);
+    var flen: int64 := alloc(16);
+    var cptr: int64 := alloc(16);
+    var clen: int64 := alloc(16);
+
+    // MSH-9.2 → Ereigniscode (z. B. "R01").
+    // ACHTUNG: In MSH ist MSH-1 der Feldtrenner SELBST, die Zählung ist damit
+    // um eins verschoben — MSH-9 ist das achte Feld hinter dem Segmentnamen.
+    // std/hl7/core.lyx haelt dasselbe fest ("fieldNum = MSH-N minus 1").
+    var mshSeg: int64 := resFindSeg(msg, len, 77, 83, 72, fsep);   // M,S,H,|
+    if (mshSeg != 0) {
+        var mshLen: int64 := resSegLen(msg, len, mshSeg);
+        resFieldGet(mshSeg, mshLen, fsep, 8, fptr, flen);
+        resCompGet(peek64(fptr), peek64(flen), csep, 2, cptr, clen);
+        poke64(report + HL7_RPT_EVENT, peek64(cptr));
+        poke64(report + HL7_RPT_EVENT_LEN, peek64(clen));
+    }
+
+    // PID-3.1 → Patientenkennung
+    var pidSeg: int64 := resFindSeg(msg, len, 80, 73, 68, fsep);   // P,I,D,|
+    if (pidSeg != 0) {
+        var pidLen: int64 := resSegLen(msg, len, pidSeg);
+        resFieldGet(pidSeg, pidLen, fsep, 3, fptr, flen);
+        resCompGet(peek64(fptr), peek64(flen), csep, 1, cptr, clen);
+        poke64(report + HL7_RPT_PAT_ID, peek64(cptr));
+        poke64(report + HL7_RPT_PAT_ID_LEN, peek64(clen));
+    }
+
+    // OBR-2/3/4/7 → Auftragsnummern, Leistung, Beobachtungszeitpunkt
+    var obrSeg: int64 := resFindSeg(msg, len, 79, 66, 82, fsep);   // O,B,R,|
+    if (obrSeg != 0) {
+        var obrLen: int64 := resSegLen(msg, len, obrSeg);
+        resFieldGet(obrSeg, obrLen, fsep, 2, fptr, flen);
+        poke64(report + HL7_RPT_PLACER, peek64(fptr));
+        poke64(report + HL7_RPT_PLACER_LEN, peek64(flen));
+        resFieldGet(obrSeg, obrLen, fsep, 3, fptr, flen);
+        poke64(report + HL7_RPT_FILLER, peek64(fptr));
+        poke64(report + HL7_RPT_FILLER_LEN, peek64(flen));
+        resFieldGet(obrSeg, obrLen, fsep, 4, fptr, flen);
+        poke64(report + HL7_RPT_SERVICE, peek64(fptr));
+        poke64(report + HL7_RPT_SERVICE_LEN, peek64(flen));
+        resFieldGet(obrSeg, obrLen, fsep, 7, fptr, flen);
+        poke64(report + HL7_RPT_OBS_DT, peek64(fptr));
+        poke64(report + HL7_RPT_OBS_DT_LEN, peek64(flen));
+    }
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+// OBX-Segment zerlegen. ISCORR und ISCRIT werden dabei aus OBX-11 bzw. OBX-8
+// abgeleitet, damit der Aufrufer die Kennzeichen nicht selbst deuten muss.
+pub fn Hl7ObxParse(seg: int64, segLen: int64, obx: int64) {
+    var fsep: int64 := 124;
+    var fptr: int64 := alloc(16);
+    var flen: int64 := alloc(16);
+
+    resFieldGet(seg, segLen, fsep, 1, fptr, flen);
+    poke64(obx + HL7_OBX_SETID, peek64(fptr));
+    poke64(obx + HL7_OBX_SETID_LEN, peek64(flen));
+
+    resFieldGet(seg, segLen, fsep, 2, fptr, flen);
+    poke64(obx + HL7_OBX_VALTYPE, peek64(fptr));
+    poke64(obx + HL7_OBX_VALTYPE_LEN, peek64(flen));
+
+    resFieldGet(seg, segLen, fsep, 3, fptr, flen);
+    poke64(obx + HL7_OBX_OBSID, peek64(fptr));
+    poke64(obx + HL7_OBX_OBSID_LEN, peek64(flen));
+
+    resFieldGet(seg, segLen, fsep, 5, fptr, flen);
+    poke64(obx + HL7_OBX_VALUE, peek64(fptr));
+    poke64(obx + HL7_OBX_VALUE_LEN, peek64(flen));
+
+    resFieldGet(seg, segLen, fsep, 6, fptr, flen);
+    poke64(obx + HL7_OBX_UNIT, peek64(fptr));
+    poke64(obx + HL7_OBX_UNIT_LEN, peek64(flen));
+
+    resFieldGet(seg, segLen, fsep, 7, fptr, flen);
+    poke64(obx + HL7_OBX_REFRANGE, peek64(fptr));
+    poke64(obx + HL7_OBX_REFRANGE_LEN, peek64(flen));
+
+    resFieldGet(seg, segLen, fsep, 8, fptr, flen);
+    var abnP: int64 := peek64(fptr);
+    var abnL: int64 := peek64(flen);
+    poke64(obx + HL7_OBX_ABNFLAG, abnP);
+    poke64(obx + HL7_OBX_ABNFLAG_LEN, abnL);
+    poke64(obx + HL7_OBX_ISCRIT, resIsCritFlag(abnP, abnL));
+
+    resFieldGet(seg, segLen, fsep, 11, fptr, flen);
+    var stP: int64 := peek64(fptr);
+    var stL: int64 := peek64(flen);
+    poke64(obx + HL7_OBX_STATUS, stP);
+    poke64(obx + HL7_OBX_STATUS_LEN, stL);
+    poke64(obx + HL7_OBX_ISCORR, resIsCorrStatus(stP, stL));
+}
+
+// NTE-Segment zerlegen (NTE-3 Kommentartext).
+pub fn Hl7NteParse(seg: int64, segLen: int64, note: int64) {
+    var fsep: int64 := 124;
+    var fptr: int64 := alloc(16);
+    var flen: int64 := alloc(16);
+    resFieldGet(seg, segLen, fsep, 3, fptr, flen);
+    poke64(note + HL7_NTE_TEXT, peek64(fptr));
+    poke64(note + HL7_NTE_TEXT_LEN, peek64(flen));
+}
+
+// ORU^R01 (Befundübermittlung) zerlegen.
+pub fn Hl7OruParse(msg: int64, len: int64, report: int64) {
+    poke64(report + HL7_RPT_MSGTYPE, HL7_RPT_TYPE_ORU);
+    resParseCommon(msg, len, report);
+}
+
+// OUL^R22 (Laborergebnis mit Probenbezug) zerlegen. Ein zusätzliches
+// SPM-Segment darf die übrigen Felder nicht verschieben — resFindSeg sucht
+// segmentweise, nicht nach Position.
+pub fn Hl7OulParse(msg: int64, len: int64, report: int64) {
+    poke64(report + HL7_RPT_MSGTYPE, HL7_RPT_TYPE_OUL);
+    resParseCommon(msg, len, report);
+}
+
+// ORU^R01 aus Kopfdaten und einem Befundwert schreiben.
+// Liefert die Anzahl geschriebener Bytes, 0 wenn der Puffer zu klein ist.
+pub fn Hl7OruWrite(report: int64, obx: int64, out: int64, outMax: int64): int64 {
+    if (outMax < 128) { return 0; }
+    var fsep: int64 := 124;
+    var csep: int64 := 94;
+    var pos:  int64 := 0;
+
+    // MSH|^~\&|||||||ORU^R01||P|2.5.1
+    poke8(out + pos, 77); pos := pos + 1;   // M
+    poke8(out + pos, 83); pos := pos + 1;   // S
+    poke8(out + pos, 72); pos := pos + 1;   // H
+    poke8(out + pos, fsep); pos := pos + 1;
+    poke8(out + pos, csep); pos := pos + 1; // ^
+    poke8(out + pos, 126); pos := pos + 1;  // ~
+    poke8(out + pos, 92);  pos := pos + 1;  // backslash
+    poke8(out + pos, 38);  pos := pos + 1;  // &
+    var i: int64 := 0;
+    while (i < 7) { poke8(out + pos, fsep); pos := pos + 1; i := i + 1; }
+    poke8(out + pos, 79); pos := pos + 1;   // O
+    poke8(out + pos, 82); pos := pos + 1;   // R
+    poke8(out + pos, 85); pos := pos + 1;   // U
+    poke8(out + pos, csep); pos := pos + 1;
+    poke8(out + pos, 82); pos := pos + 1;   // R
+    poke8(out + pos, 48); pos := pos + 1;   // 0
+    poke8(out + pos, 49); pos := pos + 1;   // 1
+    poke8(out + pos, fsep); pos := pos + 1;
+    poke8(out + pos, fsep); pos := pos + 1;
+    poke8(out + pos, 80); pos := pos + 1;   // P
+    poke8(out + pos, fsep); pos := pos + 1;
+    poke8(out + pos, 50); pos := pos + 1;   // 2
+    poke8(out + pos, 46); pos := pos + 1;   // .
+    poke8(out + pos, 53); pos := pos + 1;   // 5
+    poke8(out + pos, 46); pos := pos + 1;   // .
+    poke8(out + pos, 49); pos := pos + 1;   // 1
+    poke8(out + pos, 13); pos := pos + 1;   // CR
+
+    // PID|1||<PAT_ID>
+    var patP: int64 := peek64(report + HL7_RPT_PAT_ID);
+    var patL: int64 := peek64(report + HL7_RPT_PAT_ID_LEN);
+    if (patL > 0) {
+        if (pos + patL + 8 > outMax) { return 0; }
+        poke8(out + pos, 80); pos := pos + 1;   // P
+        poke8(out + pos, 73); pos := pos + 1;   // I
+        poke8(out + pos, 68); pos := pos + 1;   // D
+        poke8(out + pos, fsep); pos := pos + 1;
+        poke8(out + pos, 49); pos := pos + 1;   // 1
+        poke8(out + pos, fsep); pos := pos + 1;
+        poke8(out + pos, fsep); pos := pos + 1;
+        pos := resWriteField(out, pos, patP, patL);
+        poke8(out + pos, 13); pos := pos + 1;
+    }
+
+    // OBR|1|<PLACER>|<FILLER>|<SERVICE>|||<OBS_DT>
+    var plP: int64 := peek64(report + HL7_RPT_PLACER);
+    var plL: int64 := peek64(report + HL7_RPT_PLACER_LEN);
+    var flP: int64 := peek64(report + HL7_RPT_FILLER);
+    var flL: int64 := peek64(report + HL7_RPT_FILLER_LEN);
+    var svP: int64 := peek64(report + HL7_RPT_SERVICE);
+    var svL: int64 := peek64(report + HL7_RPT_SERVICE_LEN);
+    var dtP: int64 := peek64(report + HL7_RPT_OBS_DT);
+    var dtL: int64 := peek64(report + HL7_RPT_OBS_DT_LEN);
+    if (pos + plL + flL + svL + dtL + 16 > outMax) { return 0; }
+    poke8(out + pos, 79); pos := pos + 1;   // O
+    poke8(out + pos, 66); pos := pos + 1;   // B
+    poke8(out + pos, 82); pos := pos + 1;   // R
+    poke8(out + pos, fsep); pos := pos + 1;
+    poke8(out + pos, 49); pos := pos + 1;   // OBR-1 = 1
+    poke8(out + pos, fsep); pos := pos + 1;
+    if (plL > 0) { pos := resWriteField(out, pos, plP, plL); }
+    poke8(out + pos, fsep); pos := pos + 1;
+    if (flL > 0) { pos := resWriteField(out, pos, flP, flL); }
+    poke8(out + pos, fsep); pos := pos + 1;
+    if (svL > 0) { pos := resWriteField(out, pos, svP, svL); }
+    poke8(out + pos, fsep); pos := pos + 1;
+    poke8(out + pos, fsep); pos := pos + 1;  // OBR-5 leer
+    poke8(out + pos, fsep); pos := pos + 1;  // OBR-6 leer
+    if (dtL > 0) { pos := resWriteField(out, pos, dtP, dtL); }
+    poke8(out + pos, 13); pos := pos + 1;
+
+    // OBX|1|<VALTYPE>|<OBSID>||<VALUE>|<UNIT>|<REFRANGE>|<ABNFLAG>|||<STATUS>
+    var vtP: int64 := peek64(obx + HL7_OBX_VALTYPE);
+    var vtL: int64 := peek64(obx + HL7_OBX_VALTYPE_LEN);
+    var idP: int64 := peek64(obx + HL7_OBX_OBSID);
+    var idL: int64 := peek64(obx + HL7_OBX_OBSID_LEN);
+    var vlP: int64 := peek64(obx + HL7_OBX_VALUE);
+    var vlL: int64 := peek64(obx + HL7_OBX_VALUE_LEN);
+    var unP: int64 := peek64(obx + HL7_OBX_UNIT);
+    var unL: int64 := peek64(obx + HL7_OBX_UNIT_LEN);
+    var rrP: int64 := peek64(obx + HL7_OBX_REFRANGE);
+    var rrL: int64 := peek64(obx + HL7_OBX_REFRANGE_LEN);
+    var afP: int64 := peek64(obx + HL7_OBX_ABNFLAG);
+    var afL: int64 := peek64(obx + HL7_OBX_ABNFLAG_LEN);
+    var stP: int64 := peek64(obx + HL7_OBX_STATUS);
+    var stL: int64 := peek64(obx + HL7_OBX_STATUS_LEN);
+    if (pos + vtL + idL + vlL + unL + rrL + afL + stL + 20 > outMax) { return 0; }
+    poke8(out + pos, 79); pos := pos + 1;   // O
+    poke8(out + pos, 66); pos := pos + 1;   // B
+    poke8(out + pos, 88); pos := pos + 1;   // X
+    poke8(out + pos, fsep); pos := pos + 1;
+    poke8(out + pos, 49); pos := pos + 1;   // OBX-1 = 1
+    poke8(out + pos, fsep); pos := pos + 1;
+    if (vtL > 0) { pos := resWriteField(out, pos, vtP, vtL); }
+    poke8(out + pos, fsep); pos := pos + 1;
+    if (idL > 0) { pos := resWriteField(out, pos, idP, idL); }
+    poke8(out + pos, fsep); pos := pos + 1;
+    poke8(out + pos, fsep); pos := pos + 1;  // OBX-4 leer
+    if (vlL > 0) { pos := resWriteField(out, pos, vlP, vlL); }
+    poke8(out + pos, fsep); pos := pos + 1;
+    if (unL > 0) { pos := resWriteField(out, pos, unP, unL); }
+    poke8(out + pos, fsep); pos := pos + 1;
+    if (rrL > 0) { pos := resWriteField(out, pos, rrP, rrL); }
+    poke8(out + pos, fsep); pos := pos + 1;
+    if (afL > 0) { pos := resWriteField(out, pos, afP, afL); }
+    poke8(out + pos, fsep); pos := pos + 1;
+    poke8(out + pos, fsep); pos := pos + 1;  // OBX-9 leer
+    poke8(out + pos, fsep); pos := pos + 1;  // OBX-10 leer
+    if (stL > 0) { pos := resWriteField(out, pos, stP, stL); }
+    poke8(out + pos, 13); pos := pos + 1;
+
+    return pos;
+}
