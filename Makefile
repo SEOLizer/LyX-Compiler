@@ -177,6 +177,7 @@ test: lyxc
 	@bash tests/zstd_fail_closed_test.sh
 	@bash tests/zstd_compress_test.sh
 	@bash tests/gzip_test.sh
+	@bash tests/deflate_single_source_test.sh
 	@echo "OK"
 	@echo "--- Verschachtelte Funktionen (8 Prüfungen) ---"
 	./lyxc --std-path=std tests/nested_fn_test.lyx -o /tmp/lyxc_nfn_test

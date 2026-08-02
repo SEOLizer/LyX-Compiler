@@ -1,251 +1,42 @@
 // std/pdf/compress.lyx
-// zlib/DEFLATE (RFC 1951) compression for PDF FlateDecode filter (WP-PDF-05)
-// Uses fixed Huffman codes (BTYPE=01) with greedy LZ77 and a 4096-entry hash table.
+// zlib/DEFLATE (RFC 1950/1951) für den PDF-Filter FlateDecode (WP-PDF-05)
+//
+// #1071: Diese Datei trug bis 1.0.11D eine ZWEITE, unabhängige
+// DEFLATE-Implementierung — eigener Bitschreiber, eigene Symbolemission,
+// eigene Hashtabelle — neben der in std/zlib.lyx. Beide lösten dasselbe
+// Problem mit denselben Parametern, und ein Fix in der einen erreichte die
+// andere nicht.
+//
+// Genau das war eingetreten: die Fassung in std/zlib.lyx schrieb je 32768 Byte
+// einen neuen Blockkopf, setzte das End-of-Block-Symbol aber nur einmal ganz
+// am Schluss, und erzeugte damit ab 32 kB Eingabe ungültige Ströme — während
+// die Fassung hier korrekt war. Aufgefallen ist das erst, als beide auf
+// dieselbe Eingabe geworfen und mit einem fremden Inflater gegengelesen
+// wurden.
+//
+// Aufgelöst wurde es in die Richtung, die der Messung standhielt: der Rumpf
+// von hier ist jetzt die einzige DEFLATE-Kompression der stdlib und steht in
+// std/zlib.lyx. Übrig bleibt hier der Adapter, den PDF braucht.
 
 @description("zlib/DEFLATE compression: zlibCompress, zlibMaxOutputSize")
 @author("Andreas Röne")
 @copyright("2026 Andreas Röne")
 unit std.pdf.compress;
 
-import std.alloc;
-con ADLER_MOD:  int64 := 65521;
-con HASH_SIZE:  int64 := 4096;
-con HASH_BYTES: int64 := 32768;   // 4096 * 8
-con BW_SIZE:    int64 := 32;
+import std.zlib;
 
-fn _mmapAlloc(size: int64): int64 {
-  return alloc(size);
-}
-
-// Reverse the low n bits of v.
-// Needed because fixed Huffman codes are MSB-first but the bit stream is packed LSB-first.
-fn _revBits(v: int64, n: int64): int64 {
-  var r: int64 := 0;
-  var i: int64 := 0;
-  while (i < n) {
-    r := (r << 1) | (v & 1);
-    v := v >> 1;
-    i += 1;
-  }
-  return r;
-}
-
-// BitWriter — 32-byte mmap'd state block:
-//   bw+0 : output buffer pointer
-//   bw+8 : byte position in output buffer
-//   bw+16: bit accumulator (up to 15 pending bits)
-//   bw+24: pending bit count (0-7 after each flush)
-
-fn _bwWrite(bw: int64, code: int64, nbits: int64): void {
-  var bitbuf: int64 := peek64(bw + 16);
-  var bitcnt: int64 := peek64(bw + 24);
-  var buf:    int64 := peek64(bw);
-  var pos:    int64 := peek64(bw + 8);
-  bitbuf := bitbuf | (code << bitcnt);
-  bitcnt += nbits;
-  while (bitcnt >= 8) {
-    poke8(buf + pos, bitbuf & 0xFF);
-    pos    := pos + 1;
-    bitbuf := bitbuf >> 8;
-    bitcnt -= 8;
-  }
-  poke64(bw + 8,  pos);
-  poke64(bw + 16, bitbuf);
-  poke64(bw + 24, bitcnt);
-}
-
-fn _bwFlushFinal(bw: int64): void {
-  var bitcnt: int64 := peek64(bw + 24);
-  if (bitcnt > 0) {
-    var buf: int64 := peek64(bw);
-    var pos: int64 := peek64(bw + 8);
-    poke8(buf + pos, peek64(bw + 16) & 0xFF);
-    poke64(bw + 8,  pos + 1);
-    poke64(bw + 16, 0);
-    poke64(bw + 24, 0);
-  }
-}
-
-// Emit one fixed-Huffman literal/length symbol (0..287).
-fn _emitLitLen(bw: int64, sym: int64): void {
-  if (sym <= 143) {
-    _bwWrite(bw, _revBits(sym + 48, 8), 8);
-    return;
-  }
-  if (sym <= 255) {
-    _bwWrite(bw, _revBits(sym - 144 + 400, 9), 9);
-    return;
-  }
-  if (sym <= 279) {
-    _bwWrite(bw, _revBits(sym - 256, 7), 7);
-    return;
-  }
-  _bwWrite(bw, _revBits(sym - 280 + 192, 8), 8);
-}
-
-// Emit the fixed-Huffman length code + extra bits for match length 3..258.
-fn _emitLength(bw: int64, length: int64): void {
-  if (length <= 10)  { _emitLitLen(bw, 254 + length); return; }
-  if (length <= 12)  { _emitLitLen(bw, 265); _bwWrite(bw, length - 11,  1); return; }
-  if (length <= 14)  { _emitLitLen(bw, 266); _bwWrite(bw, length - 13,  1); return; }
-  if (length <= 16)  { _emitLitLen(bw, 267); _bwWrite(bw, length - 15,  1); return; }
-  if (length <= 18)  { _emitLitLen(bw, 268); _bwWrite(bw, length - 17,  1); return; }
-  if (length <= 22)  { _emitLitLen(bw, 269); _bwWrite(bw, length - 19,  2); return; }
-  if (length <= 26)  { _emitLitLen(bw, 270); _bwWrite(bw, length - 23,  2); return; }
-  if (length <= 30)  { _emitLitLen(bw, 271); _bwWrite(bw, length - 27,  2); return; }
-  if (length <= 34)  { _emitLitLen(bw, 272); _bwWrite(bw, length - 31,  2); return; }
-  if (length <= 42)  { _emitLitLen(bw, 273); _bwWrite(bw, length - 35,  3); return; }
-  if (length <= 50)  { _emitLitLen(bw, 274); _bwWrite(bw, length - 43,  3); return; }
-  if (length <= 58)  { _emitLitLen(bw, 275); _bwWrite(bw, length - 51,  3); return; }
-  if (length <= 66)  { _emitLitLen(bw, 276); _bwWrite(bw, length - 59,  3); return; }
-  if (length <= 82)  { _emitLitLen(bw, 277); _bwWrite(bw, length - 67,  4); return; }
-  if (length <= 98)  { _emitLitLen(bw, 278); _bwWrite(bw, length - 83,  4); return; }
-  if (length <= 114) { _emitLitLen(bw, 279); _bwWrite(bw, length - 99,  4); return; }
-  if (length <= 130) { _emitLitLen(bw, 280); _bwWrite(bw, length - 115, 4); return; }
-  if (length <= 162) { _emitLitLen(bw, 281); _bwWrite(bw, length - 131, 5); return; }
-  if (length <= 194) { _emitLitLen(bw, 282); _bwWrite(bw, length - 163, 5); return; }
-  if (length <= 226) { _emitLitLen(bw, 283); _bwWrite(bw, length - 195, 5); return; }
-  if (length <= 257) { _emitLitLen(bw, 284); _bwWrite(bw, length - 227, 5); return; }
-  _emitLitLen(bw, 285);
-}
-
-// Emit the 5-bit distance code + extra bits for back-reference distance 1..32768.
-fn _emitDist(bw: int64, dist: int64): void {
-  if (dist <= 4)   { _bwWrite(bw, _revBits(dist - 1, 5), 5); return; }
-  if (dist <= 6)   { _bwWrite(bw, _revBits(4,  5), 5); _bwWrite(bw, dist - 5,     1); return; }
-  if (dist <= 8)   { _bwWrite(bw, _revBits(5,  5), 5); _bwWrite(bw, dist - 7,     1); return; }
-  if (dist <= 12)  { _bwWrite(bw, _revBits(6,  5), 5); _bwWrite(bw, dist - 9,     2); return; }
-  if (dist <= 16)  { _bwWrite(bw, _revBits(7,  5), 5); _bwWrite(bw, dist - 13,    2); return; }
-  if (dist <= 24)  { _bwWrite(bw, _revBits(8,  5), 5); _bwWrite(bw, dist - 17,    3); return; }
-  if (dist <= 32)  { _bwWrite(bw, _revBits(9,  5), 5); _bwWrite(bw, dist - 25,    3); return; }
-  if (dist <= 48)  { _bwWrite(bw, _revBits(10, 5), 5); _bwWrite(bw, dist - 33,    4); return; }
-  if (dist <= 64)  { _bwWrite(bw, _revBits(11, 5), 5); _bwWrite(bw, dist - 49,    4); return; }
-  if (dist <= 96)  { _bwWrite(bw, _revBits(12, 5), 5); _bwWrite(bw, dist - 65,    5); return; }
-  if (dist <= 128) { _bwWrite(bw, _revBits(13, 5), 5); _bwWrite(bw, dist - 97,    5); return; }
-  if (dist <= 192) { _bwWrite(bw, _revBits(14, 5), 5); _bwWrite(bw, dist - 129,   6); return; }
-  if (dist <= 256) { _bwWrite(bw, _revBits(15, 5), 5); _bwWrite(bw, dist - 193,   6); return; }
-  if (dist <= 384) { _bwWrite(bw, _revBits(16, 5), 5); _bwWrite(bw, dist - 257,   7); return; }
-  if (dist <= 512) { _bwWrite(bw, _revBits(17, 5), 5); _bwWrite(bw, dist - 385,   7); return; }
-  if (dist <= 768) { _bwWrite(bw, _revBits(18, 5), 5); _bwWrite(bw, dist - 513,   8); return; }
-  if (dist <= 1024)  { _bwWrite(bw, _revBits(19, 5), 5); _bwWrite(bw, dist - 769,   8); return; }
-  if (dist <= 1536)  { _bwWrite(bw, _revBits(20, 5), 5); _bwWrite(bw, dist - 1025,  9); return; }
-  if (dist <= 2048)  { _bwWrite(bw, _revBits(21, 5), 5); _bwWrite(bw, dist - 1537,  9); return; }
-  if (dist <= 3072)  { _bwWrite(bw, _revBits(22, 5), 5); _bwWrite(bw, dist - 2049, 10); return; }
-  if (dist <= 4096)  { _bwWrite(bw, _revBits(23, 5), 5); _bwWrite(bw, dist - 3073, 10); return; }
-  if (dist <= 6144)  { _bwWrite(bw, _revBits(24, 5), 5); _bwWrite(bw, dist - 4097, 11); return; }
-  if (dist <= 8192)  { _bwWrite(bw, _revBits(25, 5), 5); _bwWrite(bw, dist - 6145, 11); return; }
-  if (dist <= 12288) { _bwWrite(bw, _revBits(26, 5), 5); _bwWrite(bw, dist - 8193, 12); return; }
-  if (dist <= 16384) { _bwWrite(bw, _revBits(27, 5), 5); _bwWrite(bw, dist - 12289, 12); return; }
-  if (dist <= 24576) { _bwWrite(bw, _revBits(28, 5), 5); _bwWrite(bw, dist - 16385, 13); return; }
-  _bwWrite(bw, _revBits(29, 5), 5);
-  _bwWrite(bw, dist - 24577, 13);
-}
-
-// 3-byte rolling hash → 12-bit index (0..HASH_SIZE-1).
-fn _hash3(input: int64, pos: int64): int64 {
-  var b0: int64 := peek8(input + pos);
-  var b1: int64 := peek8(input + pos + 1);
-  var b2: int64 := peek8(input + pos + 2);
-  return ((b0 * 31 + b1) * 31 + b2) & 4095;
-}
-
-// Compress input[0..inLen) into the bit stream bw using greedy LZ77.
-// The BFINAL+BTYPE header bits must have been written by the caller.
-fn _deflate(input: int64, inLen: int64, bw: int64): void {
-  var htab: int64 := _mmapAlloc(HASH_BYTES);
-  if (htab == 0) {
-    var k: int64 := 0;
-    while (k < inLen) {
-      _emitLitLen(bw, peek8(input + k));
-      k += 1;
-    }
-    _emitLitLen(bw, 256);
-    return;
-  }
-  var hi: int64 := 0;
-  while (hi < HASH_SIZE) {
-    poke64(htab + hi * 8, -1);
-    hi += 1;
-  }
-  var i: int64 := 0;
-  while (i < inLen) {
-    var matched: int64 := 0;
-    if (i + 3 <= inLen) {
-      var h:    int64 := _hash3(input, i);
-      var prev: int64 := peek64(htab + h * 8);
-      poke64(htab + h * 8, i);
-      if (prev >= 0) {
-        var dist: int64 := i - prev;
-        if (dist <= 32768) {
-          var maxLen: int64 := inLen - i;
-          if (maxLen > 258) { maxLen := 258; }
-          var mlen: int64 := 0;
-          while (mlen < maxLen) {
-            if (peek8(input + prev + mlen) != peek8(input + i + mlen)) {
-              break;
-            }
-            mlen += 1;
-          }
-          if (mlen >= 3) {
-            _emitLength(bw, mlen);
-            _emitDist(bw, dist);
-            i       := i + mlen;
-            matched := 1;
-          }
-        }
-      }
-    }
-    if (matched == 0) {
-      _emitLitLen(bw, peek8(input + i));
-      i += 1;
-    }
-  }
-  _emitLitLen(bw, 256);
-  free(htab, HASH_BYTES);
-}
-
-// Returns the maximum number of bytes zlibCompress may write for inLen input bytes.
+// Höchstzahl Bytes, die zlibCompress für inLen Eingabebytes schreibt.
 pub fn zlibMaxOutputSize(inLen: int64): int64 {
-  return inLen + inLen / 8 + 64;
+  return ZlibCompressBound(inLen);
 }
 
-// Compress input[0..inLen) into output using zlib format (RFC 1950) with DEFLATE body.
-// output must have at least zlibMaxOutputSize(inLen) bytes available.
-// Returns the number of bytes written, or 0 on error.
+// Komprimiert input[0..inLen) nach output im zlib-Format (RFC 1950) mit
+// DEFLATE-Rumpf. output braucht mindestens zlibMaxOutputSize(inLen) Bytes.
+// Gibt die Zahl der geschriebenen Bytes zurück, 0 bei leerer Eingabe.
+//
+// Die Zeiger kommen bei PDF als int64 an, in std/zlib.lyx heißen sie pchar —
+// derselbe Wert, andere Schreibweise.
 pub fn zlibCompress(input: int64, inLen: int64, output: int64): int64 {
   if (inLen <= 0) { return 0; }
-  // zlib header: CMF=0x78 (deflate, 32K window), FLG=0x01
-  // (0x78*256 + 0x01) = 30721 = 31*991 → check field = 0 ✓
-  poke8(output,     0x78);
-  poke8(output + 1, 0x01);
-  var bw: int64 := _mmapAlloc(BW_SIZE);
-  if (bw == 0) { return 0; }
-  poke64(bw,      output + 2);
-  poke64(bw + 8,  0);
-  poke64(bw + 16, 0);
-  poke64(bw + 24, 0);
-  // BFINAL=1, BTYPE=01 → bits [1,1,0] packed as value 3 (3 bits)
-  _bwWrite(bw, 3, 3);
-  _deflate(input, inLen, bw);
-  _bwFlushFinal(bw);
-  var deflateLen: int64 := peek64(bw + 8);
-  free(bw, BW_SIZE);
-  var pos: int64 := 2 + deflateLen;
-  // Adler-32 of uncompressed input, appended big-endian
-  var s1: int64 := 1;
-  var s2: int64 := 0;
-  var ai: int64 := 0;
-  while (ai < inLen) {
-    var b: int64 := peek8(input + ai);
-    s1 += b;
-    if (s1 >= ADLER_MOD) { s1 := s1 - ADLER_MOD; }
-    s2 += s1;
-    if (s2 >= ADLER_MOD) { s2 := s2 - ADLER_MOD; }
-    ai += 1;
-  }
-  poke8(output + pos, (s2 >> 8) & 0xFF); pos := pos + 1;
-  poke8(output + pos, s2 & 0xFF);        pos := pos + 1;
-  poke8(output + pos, (s1 >> 8) & 0xFF); pos := pos + 1;
-  poke8(output + pos, s1 & 0xFF);        pos := pos + 1;
-  return pos;
+  return ZlibCompress(input as pchar, inLen, output as pchar, Z_DEFAULT_COMPRESSION);
 }
