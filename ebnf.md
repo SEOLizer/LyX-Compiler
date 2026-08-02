@@ -399,6 +399,10 @@ ParallelArrayType   = "ParallelArray" "<" Type ">" ;
 
 TupleType           = "(" Type "," Type { "," Type } ")" ;
 
+(* Die eckige Schreibweise `[T, T]` ist gleichbedeutend und bleibt gueltig;
+   der Bestand benutzt sie. Mehr als ZWEI Elemente werden abgewiesen: die
+   Aufrufkonvention traegt zwei Rueckgabewerte (rax, rdx). (#1088) *)
+
 (* Funktions- und Methodenzeiger (seit 1.0.4A). In der Praxis ueber einen
    Typalias verwendet:
 
@@ -1205,6 +1209,7 @@ Einzelbefunde sind dort verlinkt.
 | `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
 | `&x` (Adress-Operator) | 15 | Gibt es nicht. Ein Ausgabeparameter wird als Zelle uebergeben (`alloc(8)`, danach `peek64`). (#1061) |
 | Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
+| Tupel-Entpacken, geklammerte Form | 12 | `var (q, r) := f();` gibt es nicht -- §12 (TupleUnpackStmt) schreibt die Form OHNE Klammern vor: `var q, r := f();`. Die DokuWiki fuehrt faelschlich die geklammerte. (#1088) |
 | Benannte Argumente, Auswertungsreihenfolge | 15.1 | `F(b: 2, a: 1)` ordnet richtig zu, wertet die Argumente aber in PARAMETERREIHENFOLGE aus, nicht in der geschriebenen. Bei Seiteneffekten in den Argumenten ist das sichtbar. Wo die Deklaration nicht herangezogen werden kann (importiert, extern, variadisch, generisch, Builtin), werden benannte Argumente ABGEWIESEN statt stillschweigend positionell genommen. (#1087) |
 | Bereichstyp, Laufzeitpruefung | 7 | `type X = int64 range LO..HI;` parst und wird geprueft, solange der zugewiesene Wert zur UEBERSETZUNGSZEIT feststeht (Literal, `con`, konstanter Ausdruck) -- bei Initialisierung und bei Zuweisung. **Berechnete** Werte werden nicht geprueft, ebenso wenig Parameter, Rueckgaben und Strukturfelder. Der Typ sichert also weniger zu, als sein Name nahelegt. (#1082) |
 
