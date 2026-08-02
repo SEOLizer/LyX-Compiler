@@ -299,65 +299,68 @@ fn GetLengthCode(len: int64): int64 {
 }
 
 // Compress using LZ77 with fixed Huffman
+// Greedy LZ77 mit fixed Huffman (RFC 1951, BTYPE=01) — die EINZIGE
+// DEFLATE-Kompression der stdlib.
+//
+// #1071: Die Vorgaengerfassung hatte zwei Defekte, die erst der direkte
+// Vergleich mit der zweiten, unabhaengigen Implementierung in
+// std/pdf/compress.lyx zutage foerderte:
+//
+//  1. Sie schrieb je 32768 Byte einen NEUEN Blockkopf, setzte das
+//     End-of-Block-Symbol 256 aber nur EINMAL ganz am Schluss. Ein Strom mit
+//     mehr als 32768 Byte Eingabe war damit ungueltig — jeder fremde Inflater
+//     bricht ab. Gemeldet wurde nichts: die Funktion lieferte eine plausible
+//     Bytezahl. Betroffen waren std/gzip.lyx und der ZIP-Writer.
+//  2. Die Suche verglich jede Position mit JEDER frueheren im Fenster, war
+//     also quadratisch: 20 kB Zufallsdaten brauchten 6,8 Sekunden statt 0,01.
+//
+// Jetzt: EIN Block ueber die gesamte Eingabe (RFC 1951 kennt keine
+// Blockgroessenschranke, die 32 KB sind das FENSTER) und eine Hashtabelle
+// ueber drei Bytes. Der Rumpf stammt aus std/pdf/compress.lyx, wo er sich
+// bewaehrt hatte; jene Datei ruft jetzt hierher.
 pub fn DeflateCompressLZ77(input: pchar, input_len: int64, output: pchar): int64 {
     if (input_len <= 0) { return 0; }
-    
+
     var bit_pos: int64 := 0;
+    // BFINAL=1, BTYPE=01 (fixed Huffman). BTYPE wird mit dem niederwertigen
+    // Bit zuerst geschrieben.
+    bit_pos := BitWriteBit(output, bit_pos, 1);
+    bit_pos := BitWriteBit(output, bit_pos, 1);
+    bit_pos := BitWriteBit(output, bit_pos, 0);
+
+    var htab: int64 := alloc(HASH_SIZE * 8);
+    var hi: int64 := 0;
+    while (hi < HASH_SIZE) { poke64(htab + hi * 8, 0 - 1); hi := hi + 1; }
+
     var pos: int64 := 0;
-    var is_final: int64 := 1;
-    
     while (pos < input_len) {
-        // Check if this is the last block
-        var remaining: int64 := input_len - pos;
-        if (remaining <= 32768) {
-            is_final := 1;
-        } else {
-            is_final := 0;
-        }
-        
-        // Write block header: BFINAL + BTYPE=01 (fixed Huffman)
-        // BTYPE=01: BTYPE[0]=1 (LSB, sent first), BTYPE[1]=0 (MSB, sent second)
-        bit_pos := BitWriteBit(output, bit_pos, is_final);
-        bit_pos := BitWriteBit(output, bit_pos, 1);  // BTYPE[0]=1
-        bit_pos := BitWriteBit(output, bit_pos, 0);  // BTYPE[1]=0
-        
-        var block_end: int64 := pos + 32768;
-        if (block_end > input_len) { block_end := input_len; }
-        
-        // Process block with LZ77
-        while (pos < block_end) {
-            // Find longest match
-            var match_len: int64 := 0;
-            var match_dist: int64 := 0;
-            
-            // Search in window
-            var search_start: int64 := 0;
-            if (pos > MAX_DISTANCE) { search_start := pos - MAX_DISTANCE; }
-            
-            var max_look: int64 := 258;
-            if (block_end - pos < max_look) { max_look := block_end - pos; }
-            
-            if (max_look >= MIN_MATCH) {
-                var i: int64 := search_start;
-                while (i < pos) {
+        var match_len:  int64 := 0;
+        var match_dist: int64 := 0;
+
+        if (pos + MIN_MATCH <= input_len) {
+            var b0: int64 := StrCharAt(input, pos);
+            var b1: int64 := StrCharAt(input, pos + 1);
+            var b2: int64 := StrCharAt(input, pos + 2);
+            var h:  int64 := ((b0 * 31 + b1) * 31 + b2) & HASH_MASK;
+            var prev: int64 := peek64(htab + h * 8);
+            poke64(htab + h * 8, pos);
+            if (prev >= 0) {
+                var dist: int64 := pos - prev;
+                if (dist <= MAX_DISTANCE) {
+                    var maxLen: int64 := input_len - pos;
+                    if (maxLen > MAX_MATCH) { maxLen := MAX_MATCH; }
                     var m: int64 := 0;
-                    while (m < max_look && m < MAX_MATCH) {
-                        if (StrCharAt(input, i + m) != StrCharAt(input, pos + m)) {
-                            break;
-                        }
-                        m += 1;
+                    var stop: int64 := 0;
+                    while ((m < maxLen) & (stop == 0)) {
+                        if (StrCharAt(input, prev + m) != StrCharAt(input, pos + m)) { stop := 1; }
+                        else { m := m + 1; }
                     }
-                    
-                    if (m >= MIN_MATCH && m > match_len) {
-                        match_len := m;
-                        match_dist := pos - i;
-                    }
-                    
-                    i += 1;
+                    if (m >= MIN_MATCH) { match_len := m; match_dist := dist; }
                 }
             }
-            
-            if (match_len >= MIN_MATCH) {
+        }
+
+        if (match_len >= MIN_MATCH) {
                 // Write length-distance pair
                 var len_code: int64 := GetLengthCode(match_len);
                 bit_pos := EncodeLitLen(output, bit_pos, len_code);
@@ -432,22 +435,20 @@ pub fn DeflateCompressLZ77(input: pchar, input_len: int64, output: pchar): int64
                 }
                 
                 pos += match_len;
-            } else {
+        } else {
                 // Write literal
                 var literal: int64 := StrCharAt(input, pos);
                 bit_pos := EncodeLitLen(output, bit_pos, literal);
                 pos += 1;
-            }
         }
     }
-    
-    // Write EOF symbol
+
+    free(htab, HASH_SIZE * 8);
+
+    // End-of-Block. Genau EINMAL, weil es genau EINEN Block gibt.
     bit_pos := EncodeLitLen(output, bit_pos, 256);
-    
-    // Flush bits
     bit_pos := BitFlush(output, bit_pos);
-    
-    // Convert bit position to byte position (rounded up)
+
     var result: int64 := bit_pos + 7;
     result := result / 8;
     return result;
