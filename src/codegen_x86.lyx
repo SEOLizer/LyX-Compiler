@@ -3297,6 +3297,46 @@ pub type Codegen = class {
     return -1;
   }
 
+  // #1156: Bereichspruefung fuer einen Indexzugriff. rax = Basiszeiger,
+  // rbx = Index; beide bleiben erhalten, wenn der Zugriff gueltig ist.
+  //
+  // `--runtime-checks` versprach seit jeher "bounds, null, zero" und emittierte
+  // fuer Indizes nichts: ein Zugriff ausserhalb las den Speicher hinter dem
+  // Array und lief weiter. Eine Option, die Pruefungen zusagt und keine
+  // erzeugt, ist schlimmer als gar keine — sie begruendet Vertrauen, das
+  // nichts traegt.
+  //
+  //   fixedSz > 0 : Groesse steht zur Uebersetzungszeit fest -> gegen Immediate
+  //   isDyn  != 0 : dynamisches Array mit {cap,len}-Kopf     -> gegen [rax+8]
+  //   sonst       : es gibt keine Laenge (roher Zeiger, pchar) — nichts zu
+  //                 pruefen. Das ist eine benannte Luecke, kein stiller Default.
+  //
+  // Der Vergleich ist UNSIGNED (jb): ein negativer Index ist als vorzeichenlose
+  // Zahl riesig und faellt damit in denselben Zweig wie ein zu grosser.
+  fn cg_emitIndexBoundsCheck(fixedSz: int64, isDyn: int64) {
+    if (self.runtimeChecks == 0) { return; }
+    if (self.boundsCheckEnabled == 0) { return; }   // @bounds_check(false)
+    if (fixedSz > 0) {
+      // cmp rbx, imm32
+      self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xFB); self.cg_e32(fixedSz);
+    } else if (isDyn != 0) {
+      // cmp rbx, [rax+8]   (Laenge des dynamischen Arrays)
+      self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x58); self.cg_e8(0x08);
+    } else {
+      return;
+    }
+    self.cg_e8(0x72);                                  // jb short .ok
+    var pSkip: int64 := self.codeLen; self.cg_e8(0);
+    var msgOff: int64 := self.dataLen;
+    var msg: pchar := "index out of bounds\n"c;
+    var mi: int64 := 0;
+    while (mi < 20) { self.cg_edata(StrCharAt(msg, mi)); mi := mi + 1; }
+    self.cg_edata(0);
+    self.cg_emitLeaRdiData(msgOff);
+    self.cg_emitPanicBody();
+    poke8(self.code + pSkip, self.codeLen - pSkip - 1);
+  }
+
   // Returns 1 if the named class field has type "Array<T>" (any T), 0 otherwise.
   // #1052: rax = [rax + rbx*w], breitengerecht (unsigned erweitert).
   fn cg_emitScaledLoadRax(w: int64) {
@@ -5265,11 +5305,13 @@ pub type Codegen = class {
       var isSimd:   int64 := 0;
       var arrElemClassIdx: int64 := -1;
       var arrElemSize: int64 := 8;
+      var arrFixedSize: int64 := 0;   // #1156: 0 = zur Uebersetzungszeit unbekannt
       if (self.cg_nkind(baseNode) == CGN_IDENT) {
         var bname: pchar := self.cg_nsval(baseNode);
         var blen:  int64 := self.cg_nslen(baseNode);
         var lidx: int64 := self.cg_findLocalIdx(bname, blen);
         if (lidx >= 0) {
+          arrFixedSize := peek64(self.localArraySize + lidx * 8);
           // WP-GPU-01: check SIMD flag first
           if (peek8(self.localIsSimd + lidx) != 0) { isSimd := 1; }
           var tb: int64 := self.localTypes + lidx * CG_LOCTYPE_SZ;
@@ -5307,6 +5349,9 @@ pub type Codegen = class {
           // arrElemSize bleibt 8 (scalar Array<int64> etc.)
         }
       }
+      // #1156: Bereichspruefung, bevor gelesen wird. Nur fuer Arrays — ein
+      // pchar oder ein roher Zeiger traegt keine Laenge.
+      if (isArray == 1) { self.cg_emitIndexBoundsCheck(arrFixedSize, 1); }
       if (isSimd == 1) {
         // WP-GPU-01: parallel Array<f32>[i] — 4-byte stride, no header, SSE2 movss
         // rax=base ptr, rbx=index
@@ -9235,8 +9280,10 @@ pub type Codegen = class {
         var lhsBase: int64 := self.cg_nc0(lhs);
         var lhsIsArray: int64 := 0;
         var lhsIsSimd:  int64 := 0;
+        var lhsFixedSize: int64 := 0;   // #1156
         if (self.cg_nkind(lhsBase) == CGN_IDENT) {
           var llidx: int64 := self.cg_findLocalIdx(self.cg_nsval(lhsBase), self.cg_nslen(lhsBase));
+          if (llidx >= 0) { lhsFixedSize := peek64(self.localArraySize + llidx * 8); }
           if (llidx >= 0 && peek8(self.localIsArray + llidx) != 0) { lhsIsArray := 1; }
           // WP-GPU-01: SIMD array store check
           if (llidx >= 0 && peek8(self.localIsSimd + llidx) != 0) { lhsIsSimd := 1; }
@@ -9247,6 +9294,10 @@ pub type Codegen = class {
           var lhsParentCi: int64 := self.cg_objClassIdx(lhsInner);
           if (self.cg_isFieldArray(lhsParentCi, lhsFldNm, lhsFldNl) != 0) { lhsIsArray := 1; }
         }
+        // #1156: Bereichspruefung vor dem Schreiben. Der Wert liegt noch auf
+        // dem Stack; der Panic-Pfad kehrt nicht zurueck, die Unwucht ist also
+        // folgenlos.
+        if (lhsIsArray == 1) { self.cg_emitIndexBoundsCheck(lhsFixedSize, 1); }
         if (lhsIsSimd == 1) {
           // WP-GPU-01: parallel Array<f32>[i] = val — movss store, 4-byte stride
           // stack: [value(rsi)]  rax=base  rbx=index
