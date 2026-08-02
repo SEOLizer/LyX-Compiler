@@ -1588,6 +1588,121 @@ pub type Sema = class {
     free(loBox, 8); free(hiBox, 8); free(vBox, 8);
   }
 
+  // #1087: Benannte Argumente `F(b: 3, a: 10)`.
+  //
+  // Der Parser legt sie als NK_NAMED_ARG ab (sVal = Name, c0 = Wert), danach
+  // wurden sie nur noch ausgewertet -- die Zuordnung blieb POSITIONELL. Wer
+  // die Namen schreibt, um sich nicht auf die Reihenfolge verlassen zu
+  // muessen, bekam still ein falsches Ergebnis; erfundene Namen fielen gar
+  // nicht auf.
+  //
+  // Hier wird die Argumentliste in die Reihenfolge der Parameter gebracht.
+  // Sema und Codegen arbeiten auf DERSELBEN Knotenarena (beide bekommen
+  // parser.nodes), das Umhaengen der next-Kette wirkt also bis in die
+  // Codeerzeugung.
+  //
+  // Rueckgabe: 1 = in Ordnung (ggf. umsortiert), 0 = Fehler bereits gemeldet.
+  fn _reorderNamedArgs(callNi: int64, declNi: int64, nm: pchar, nl: int64): int64 {
+    // Parameterzahl und -namen
+    var pc: int64 := 0;
+    var pp: int64 := self.sn_c0(declNi);
+    while (pp >= 0) { pc := pc + 1; pp := self.sn_next(pp); }
+    if (pc <= 0) { return 1; }
+    if (pc > 32) { return 1; }   // absurd viele Parameter: nicht umsortieren
+
+    var slot: int64 := alloc(pc * 8);
+    var i: int64 := 0;
+    while (i < pc) { poke64(slot + i * 8, 0 - 1); i := i + 1; }
+
+    var ok: int64 := 1;
+    var seenNamed: int64 := 0;
+    var pos: int64 := 0;
+    var arg: int64 := self.sn_c0(callNi);
+    while (arg >= 0) {
+      var nxt: int64 := self.sn_next(arg);
+      if (self.sn_kind(arg) == 108) {
+        seenNamed := 1;
+        var an: pchar := self.sn_sVal(arg);
+        var al: int64 := self.sn_sLen(arg);
+        // Parameterindex zum Namen suchen
+        var idx: int64 := 0 - 1;
+        var q: int64 := self.sn_c0(declNi);
+        var qi: int64 := 0;
+        while (q >= 0) {
+          if (self._strNEq(self.sn_sVal(q), self.sn_sLen(q), an, al)) { idx := qi; }
+          qi := qi + 1;
+          q := self.sn_next(q);
+        }
+        if (idx < 0) {
+          self._errorNodeName("unbekannter Parametername im Aufruf von", callNi, nm, nl);
+          ok := 0;
+        } else {
+          if (peek64(slot + idx * 8) >= 0) {
+            self._errorNodeName("Parameter doppelt belegt im Aufruf von", callNi, nm, nl);
+            ok := 0;
+          } else {
+            poke64(slot + idx * 8, arg);
+          }
+        }
+      } else {
+        // Positionelles Argument nach einem benannten waere mehrdeutig.
+        if (seenNamed != 0) {
+          self._errorNodeName("positionelles Argument nach benanntem im Aufruf von", callNi, nm, nl);
+          ok := 0;
+        } else {
+          if (pos < pc) {
+            if (peek64(slot + pos * 8) >= 0) {
+              self._errorNodeName("Parameter doppelt belegt im Aufruf von", callNi, nm, nl);
+              ok := 0;
+            } else {
+              poke64(slot + pos * 8, arg);
+            }
+          }
+          pos := pos + 1;
+        }
+      }
+      arg := nxt;
+    }
+
+    if (seenNamed == 0) { free(slot, pc * 8); return 1; }
+
+    // Alle Parameter belegt?
+    if (ok != 0) {
+      i := 0;
+      while (i < pc) {
+        if (peek64(slot + i * 8) < 0) {
+          self._errorNodeName("Parameter ohne Argument im Aufruf von", callNi, nm, nl);
+          ok := 0;
+        }
+        i := i + 1;
+      }
+    }
+
+    // Neu verketten
+    if (ok != 0) {
+      poke64(self.sn_off(callNi) + NODE_OFF_C0, peek64(slot));
+      i := 0;
+      while (i < pc - 1) {
+        poke64(self.sn_off(peek64(slot + i * 8)) + NODE_OFF_NEXT, peek64(slot + (i + 1) * 8));
+        i := i + 1;
+      }
+      poke64(self.sn_off(peek64(slot + (pc - 1) * 8)) + NODE_OFF_NEXT, 0 - 1);
+    }
+
+    free(slot, pc * 8);
+    return ok;
+  }
+
+  // #1087: Traegt der Aufruf ueberhaupt ein benanntes Argument?
+  fn _hasNamedArg(callNi: int64): int64 {
+    var a: int64 := self.sn_c0(callNi);
+    while (a >= 0) {
+      if (self.sn_kind(a) == 108) { return 1; }
+      a := self.sn_next(a);
+    }
+    return 0;
+  }
+
   fn _evalConstExpr(ni: int64): int64 {
     if (ni < 0) { return 0; }
     var k: int64 := self.sn_kind(ni);
@@ -1779,6 +1894,7 @@ pub type Sema = class {
           self._checkCallerCap(ni, nm, nl);
           // WP-14: Check if this is a generic function call with type arguments
           // c2 contains type arguments (e.g., Foo<int64>(args))
+          var namedHandled: int64 := 0;
           var typeArgs: int64 := self.sn_c2(ni);
           if (typeArgs >= 0) {
             // This is a generic call - resolve type arguments and check instantiation
@@ -1806,7 +1922,23 @@ pub type Sema = class {
                 var ac: int64 := 0; var aa: int64 := self.sn_c0(ni);
                 while (aa >= 0) { ac := ac + 1; aa := self.sn_next(aa); }
                 if (pc != ac) { self._errorNodeName("falsche Argument-Anzahl im Aufruf von", ni, nm, nl); }
+                // #1087: Benannte Argumente in die Parameterreihenfolge bringen.
+                else { self._reorderNamedArgs(ni, declNi, nm, nl); }
+                namedHandled := 1;
               }
+            }
+          }
+          // #1087: Laesst sich die Deklaration hier nicht heranziehen
+          // (importiert, extern, variadisch, generisch, Builtin), koennen
+          // benannte Argumente nicht zugeordnet werden. Sie stillschweigend
+          // als positionell zu nehmen ist genau der gemeldete Fehler --
+          // also melden. Ausnahme ist die eine eingebaute Sonderform
+          // mmap(size:)/mmap(len:), die der Codegen kennt.
+          if (namedHandled == 0 && self._hasNamedArg(ni) != 0) {
+            var isMmapCall: int64 := 0;
+            if (self._strNEq(nm, nl, "mmap"c, 4)) { isMmapCall := 1; }
+            if (isMmapCall == 0) {
+              self._errorNodeName("benannte Argumente werden fuer diesen Aufruf nicht unterstuetzt", ni, nm, nl);
             }
           }
         }
