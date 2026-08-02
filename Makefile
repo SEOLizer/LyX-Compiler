@@ -184,6 +184,7 @@ test: lyxc
 	@bash tests/range_type_test.sh
 	@bash tests/storage_class_test.sh
 	@bash tests/struct_layout_test.sh
+	@bash tests/type_inference_test.sh
 	@echo "OK"
 	@echo "--- Verschachtelte Funktionen (8 Prüfungen) ---"
 	./lyxc --std-path=std tests/nested_fn_test.lyx -o /tmp/lyxc_nfn_test
