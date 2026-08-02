@@ -17,27 +17,51 @@
 // (python3 `brotli`) — siehe unten, warum der eigene Dekodierer dafuer
 // nicht taugt.
 //
-// DEKOMPRESSION: unbrauchbar. Der Dekodierer stuerzt auf gueltigen Stroemen
-// ab, auch auf denen der Referenzimplementierung: ueber 36 Frames
-// (sechs Eingaben x sechs Qualitaetsstufen) 13 korrekt und 23 Abstuerze.
-// Vier belegte Defekte sind im Zuge von #1075 behoben, ohne dass die Messung
-// sich bewegt haette:
+// DEKOMPRESSION (#1079): laeuft. Gemessen ueber 120 Frames der
+// Referenzimplementierung (zehn Eingaben x zwoelf Qualitaetsstufen):
 //
-//   1. brCopyExtra: Zusatzbits ab Code 19 falsch (19 -> 6 statt 7, 20 -> 7
-//      statt 8, 21 -> 7 statt 9, 22 -> 9 statt 10). Betrifft jede Kopie ab
+//                              korrekt  still falsch  gemeldet  abgestuerzt
+//   Ausgangslage (36 Frames)      13         0            0         23
+//   nach #1075 (36 Frames)        13         0            0         23
+//   heute (120 Frames)            88         0           32          0
+//
+// Die 32 gemeldeten sind Stroeme, die das STATISCHE WOERTERBUCH (§8) brauchen.
+// Das ist nicht umgesetzt und wird deshalb als Fehler zurueckgegeben, nicht
+// geraten -- vorher kopierte der Dekodierer an dieser Stelle aus dem Fenster
+// und lieferte stillschweigend falschen Inhalt.
+//
+// Acht belegte Defekte, in der Reihenfolge des Findens (#1075 und #1079):
+//
+//   1. brCopyExtra: Zusatzbits ab Code 19 falsch. Betrifft jede Kopie ab
 //      Laenge 198.
-//   2. brReadContextMap: kein Waechter fuer NTREES < 2. RFC 7932 §9.2 sagt,
-//      die Karte steht dann GAR NICHT im Strom; gelesen wurde sie trotzdem.
-//   3. brReadComplexTree: las die Codelaengen des Codelaengen-Alphabets als
-//      feste DREI Bit statt mit dem variablen 2..4-Bit-Code aus §3.5, kannte
-//      weder die Abbruchbedingung ueber die Kraft-Summe noch die
-//      Wiederholcodes 16/17.
+//   2. brReadContextMap: kein Waechter fuer NTREES < 2. Laut §9.2 steht die
+//      Karte dann GAR NICHT im Strom.
+//   3. brReadComplexTree: las die Codelaengen als feste DREI Bit statt mit dem
+//      variablen 2..4-Bit-Code aus §3.5, ohne Abbruch ueber die Kraft-Summe
+//      und ohne die Wiederholcodes 16/17.
 //   4. brDecodeIC: rechnete die neun Zellen der Tabelle aus §5 als schlichtes
 //      3x3-Raster; die Tabelle ist anders angeordnet.
+//   5. brDecodeDistance kannte nur VIER Sondersymbole statt SECHZEHN (§4).
+//      Damit war alles danach um zwoelf verschoben -- und weil die Zahl der
+//      Zusatzbits aus derselben Rechnung kam, wurde auch die falsche BITZAHL
+//      gelesen. Ab der ersten Distanz war der Strom aus dem Takt.
+//   6. brFreeMetaState las die Zahl der Baeume aus dem bereits freigegebenen
+//      Blockzustand -- ein Use-after-free, der NACH vollstaendig richtiger
+//      Dekodierung zuschlug.
+//   7. brReadContextMap hatte die Symbolreihenfolge vertauscht: laut §7.3
+//      stehen die Lauflaengencodes VORN (1..RLEMAX), die Werte dahinter.
+//   8. brLiteralCtx kannte von den vier Kontextmodi nur zwei. UTF8 fiel still
+//      auf LSB6 zurueck, Signed rechnete etwas Eigenes. Beide brauchen die
+//      Tabellen aus §7.1 -- sie stehen jetzt als brLut0/1/2 hier und werden
+//      im Test gegen die CRC-32 aus dem RFC gehalten.
+//   Dazu brReadWBits, das die zweite Stufe des WBITS-Codes nie las (10..17).
 //
-// Es bleiben also weitere. Der Grund, warum das so lange unbemerkt blieb,
-// steht im Befund selbst: es gab keinen einzigen Brotli-Test und keinen
-// Kompressor — der Dekodierer wurde nie an echten Daten gemessen.
+// Was den Befund erst sichtbar gemacht hat, war nicht scharfes Hinsehen,
+// sondern der KOMPRESSOR: erst mit ihm gab es kleine Stroeme mit bekanntem
+// Inhalt, gegen die sich Schritt fuer Schritt vergleichen liess.
+//
+// NICHT umgesetzt: das statische Woerterbuch (§8) samt Transformationen.
+// Ein Strom, der es braucht, wird gemeldet.
 //
 // Schiebefenster: bis 16 MB (WBITS 10..24).
 // Bekannte Einschraenkung: static-dictionary-Transforms (§8) werden nicht
@@ -575,14 +599,21 @@ fn brReadTree(s: int64, numSyms: int64): int64 {
 // Hilfsfunktionen: WBITS, NBLTYPES, Block-Zähler
 // ============================================================================
 
+// WBITS aus dem Stromkopf (RFC 7932 §9.1).
+//
+// #1079: Die Vorgaengerfassung gab bei n == 0 sofort 17 zurueck und las die
+// ZWEITE Stufe nie. Genau dort stehen aber die Werte 10..17: n == 0 heisst
+// "drei weitere Bits folgen". Umgekehrt las sie bei n == 7 drei Bits zu viel,
+// obwohl n == 7 fuer sich schon WBITS 24 bedeutet. Nur 18..23 kamen zufaellig
+// richtig heraus -- jeder Strom mit kleinerem Fenster lief aus dem Takt.
 fn brReadWBits(s: int64): int64 {
     if (brReadBit(s) == 0) { return 16; }
     var n: int64 := brReadBits(s, 3);
-    if (n < 7) { return n + 17; }
+    if (n != 0) { return n + 17; }          // 1..7 -> 18..24
     var m: int64 := brReadBits(s, 3);
-    if (m == 0) { return 24; }
-    if (m < 7)  { return m + 9; }
-    return 0 - 1;  // error
+    if (m == 0) { return 17; }
+    if (m == 1) { return 0 - 1; }           // laut RFC ungueltig
+    return m + 8;                            // 2..7 -> 10..15
 }
 
 fn brReadNBltypes(s: int64): int64 {
@@ -689,21 +720,41 @@ fn brReadContextMap(s: int64, ntrees: int64, cmSize: int64): int64 {
     var cmAlph: int64 := ntrees + rlemax;
     var cmTree: int64 := brReadTree(s, cmAlph);
 
+    // #1079: Das Alphabet steht laut RFC 7932 §7.3 in dieser Reihenfolge:
+    //     0                        -> Wert 0
+    //     1 .. RLEMAX              -> Lauf von Nullen, rc = sym, rc Zusatzbits
+    //     RLEMAX+1 .. RLEMAX+N-1   -> Werte 1 .. NTREES-1
+    // Die Vorgaengerfassung hatte es genau andersherum: alles unter NTREES galt
+    // als Wert, alles darueber als Lauflaenge. Werte wurden damit als Laeufe
+    // gelesen und umgekehrt; die Karte war Rauschen und ihre Eintraege landeten
+    // anschliessend als Index in einer Zeigertabelle -- daher der Absturz.
     i := 0;
     while (i < cmSize) {
         var sym: int64 := brDecodeSymbol(s, cmTree);
-        if (sym < ntrees) {
-            poke64(cmap + i * 8, sym);
+        if (sym < 0) {
+            // Kein gueltiges Symbol: der Strom ist kaputt. Vorher wurde die -1
+            // als Wert uebernommen und spaeter als Index benutzt.
+            brFreeTree(cmTree);
+            free(cmap, cmSize * 8);
+            return 0;
+        }
+        if (sym == 0) {
+            poke64(cmap + i * 8, 0);
             i += 1;
         } else {
-            var rc:  int64 := sym - ntrees + 1;
-            var run: int64 := (1 << rc) + brReadBits(s, rc);
-            if ((i + run) > cmSize) { run := cmSize - i; }
-            var j: int64 := 0;
-            while (j < run) {
-                poke64(cmap + i * 8, 0);
+            if (sym <= rlemax) {
+                var rc:  int64 := sym;
+                var run: int64 := (1 << rc) + brReadBits(s, rc);
+                if ((i + run) > cmSize) { run := cmSize - i; }
+                var j: int64 := 0;
+                while (j < run) {
+                    poke64(cmap + i * 8, 0);
+                    i += 1;
+                    j += 1;
+                }
+            } else {
+                poke64(cmap + i * 8, sym - rlemax);
                 i += 1;
-                j += 1;
             }
         }
     }
@@ -822,23 +873,51 @@ fn brPushDist(ctx: int64, d: int64): void {
 // Distanz-Dekodierung (RFC 7932 §7.4)
 // ============================================================================
 
+// Distanzcode zu Distanz (RFC 7932 §4). Rueckgabe < 1 heisst: ungueltig.
+//
+// #1079: Die Vorgaengerfassung kannte nur VIER Sondersymbole. Es sind
+// SECHZEHN: 0..3 sind die vier zuletzt benutzten Distanzen, 4..15 sind
+// dieselben mit +/-1, +/-2, +/-3. Alles danach war entsprechend um zwoelf
+// verschoben -- und weil die Zahl der Zusatzbits aus derselben verschobenen
+// Rechnung kam, las der Dekodierer auch die FALSCHE BITZAHL. Ab der ersten
+// Distanz lief der Strom damit aus dem Takt; was danach kam, war Rauschen.
+// Sichtbar wurde es als Absturz, nicht als Fehlermeldung.
 fn brDecodeDistance(ctx: int64, s: int64, distCode: int64): int64 {
-    if (distCode == 0) { return peek64(ctx + 72); }
-    if (distCode == 1) { return peek64(ctx + 80); }
-    if (distCode == 2) { return peek64(ctx + 88); }
-    if (distCode == 3) { return peek64(ctx + 96); }
-    var ndirect: int64 := peek64(ctx + 128);
-    if (distCode <= (ndirect + 3)) {
-        return distCode - 3;
-    }
+    var last:  int64 := peek64(ctx + 72);
+    var last2: int64 := peek64(ctx + 80);
+    var last3: int64 := peek64(ctx + 88);
+    var last4: int64 := peek64(ctx + 96);
+
+    if (distCode == 0)  { return last; }
+    if (distCode == 1)  { return last2; }
+    if (distCode == 2)  { return last3; }
+    if (distCode == 3)  { return last4; }
+    if (distCode == 4)  { return last - 1; }
+    if (distCode == 5)  { return last + 1; }
+    if (distCode == 6)  { return last - 2; }
+    if (distCode == 7)  { return last + 2; }
+    if (distCode == 8)  { return last - 3; }
+    if (distCode == 9)  { return last + 3; }
+    if (distCode == 10) { return last2 - 1; }
+    if (distCode == 11) { return last2 + 1; }
+    if (distCode == 12) { return last2 - 2; }
+    if (distCode == 13) { return last2 + 2; }
+    if (distCode == 14) { return last2 - 3; }
+    if (distCode == 15) { return last2 + 3; }
+
+    var ndirect:  int64 := peek64(ctx + 128);
     var npostfix: int64 := peek64(ctx + 120);
-    var d2:       int64 := distCode - ndirect - 4;
-    var half:     int64 := (d2 >> npostfix) >> 1;
-    var pmask:    int64 := (1 << npostfix) - 1;
-    var postfix:  int64 := d2 & pmask;
-    var nbits:    int64 := half + 1;
-    var extra:    int64 := brReadBits(s, nbits);
-    return ((2 + ((d2 >> npostfix) & 1)) << nbits) - 4 + ndirect + (extra << npostfix) + postfix;
+
+    // Die naechsten NDIRECT Symbole stehen unmittelbar fuer 1..NDIRECT.
+    if (distCode < (16 + ndirect)) { return distCode - 15; }
+
+    var d2:        int64 := distCode - ndirect - 16;
+    var ndistbits: int64 := 1 + (d2 >> (npostfix + 1));
+    var hcode:     int64 := d2 >> npostfix;
+    var lcode:     int64 := d2 & ((1 << npostfix) - 1);
+    var offset:    int64 := ((2 + (hcode & 1)) << ndistbits) - 4;
+    var dextra:    int64 := brReadBits(s, ndistbits);
+    return ((offset + dextra) << npostfix) + lcode + ndirect + 1;
 }
 
 // ============================================================================
@@ -893,14 +972,246 @@ fn brDecodeIC(icCode: int64, insertOut: int64, copyOut: int64): int64 {
 // Literal-Kontext-ID (RFC 7932 §7.2)
 // ============================================================================
 
+// Lut0 fuer den Kontextmodus UTF8.
+// Aus RFC 7932 §7.1 uebernommen; die Tabelle ist dort mit einer CRC-32
+// versehen, gegen die tests/brotli_decode_test.sh sie prueft.
+fn brLut0(p: int64): int64 {
+    if (p <= 8) { return 0; }
+    if (p <= 10) { return 4; }
+    if (p <= 12) { return 0; }
+    if (p == 13) { return 4; }
+    if (p <= 31) { return 0; }
+    if (p == 32) { return 8; }
+    if (p == 33) { return 12; }
+    if (p == 34) { return 16; }
+    if (p <= 36) { return 12; }
+    if (p == 37) { return 20; }
+    if (p == 38) { return 12; }
+    if (p == 39) { return 16; }
+    if (p == 40) { return 24; }
+    if (p == 41) { return 28; }
+    if (p <= 43) { return 12; }
+    if (p == 44) { return 32; }
+    if (p == 45) { return 12; }
+    if (p == 46) { return 36; }
+    if (p == 47) { return 12; }
+    if (p <= 57) { return 44; }
+    if (p <= 59) { return 32; }
+    if (p == 60) { return 24; }
+    if (p == 61) { return 40; }
+    if (p == 62) { return 28; }
+    if (p <= 64) { return 12; }
+    if (p == 65) { return 48; }
+    if (p <= 68) { return 52; }
+    if (p == 69) { return 48; }
+    if (p <= 72) { return 52; }
+    if (p == 73) { return 48; }
+    if (p <= 78) { return 52; }
+    if (p == 79) { return 48; }
+    if (p <= 84) { return 52; }
+    if (p == 85) { return 48; }
+    if (p <= 90) { return 52; }
+    if (p == 91) { return 24; }
+    if (p == 92) { return 12; }
+    if (p == 93) { return 28; }
+    if (p <= 96) { return 12; }
+    if (p == 97) { return 56; }
+    if (p <= 100) { return 60; }
+    if (p == 101) { return 56; }
+    if (p <= 104) { return 60; }
+    if (p == 105) { return 56; }
+    if (p <= 110) { return 60; }
+    if (p == 111) { return 56; }
+    if (p <= 116) { return 60; }
+    if (p == 117) { return 56; }
+    if (p <= 122) { return 60; }
+    if (p == 123) { return 24; }
+    if (p == 124) { return 12; }
+    if (p == 125) { return 28; }
+    if (p == 126) { return 12; }
+    if (p <= 128) { return 0; }
+    if (p == 129) { return 1; }
+    if (p == 130) { return 0; }
+    if (p == 131) { return 1; }
+    if (p == 132) { return 0; }
+    if (p == 133) { return 1; }
+    if (p == 134) { return 0; }
+    if (p == 135) { return 1; }
+    if (p == 136) { return 0; }
+    if (p == 137) { return 1; }
+    if (p == 138) { return 0; }
+    if (p == 139) { return 1; }
+    if (p == 140) { return 0; }
+    if (p == 141) { return 1; }
+    if (p == 142) { return 0; }
+    if (p == 143) { return 1; }
+    if (p == 144) { return 0; }
+    if (p == 145) { return 1; }
+    if (p == 146) { return 0; }
+    if (p == 147) { return 1; }
+    if (p == 148) { return 0; }
+    if (p == 149) { return 1; }
+    if (p == 150) { return 0; }
+    if (p == 151) { return 1; }
+    if (p == 152) { return 0; }
+    if (p == 153) { return 1; }
+    if (p == 154) { return 0; }
+    if (p == 155) { return 1; }
+    if (p == 156) { return 0; }
+    if (p == 157) { return 1; }
+    if (p == 158) { return 0; }
+    if (p == 159) { return 1; }
+    if (p == 160) { return 0; }
+    if (p == 161) { return 1; }
+    if (p == 162) { return 0; }
+    if (p == 163) { return 1; }
+    if (p == 164) { return 0; }
+    if (p == 165) { return 1; }
+    if (p == 166) { return 0; }
+    if (p == 167) { return 1; }
+    if (p == 168) { return 0; }
+    if (p == 169) { return 1; }
+    if (p == 170) { return 0; }
+    if (p == 171) { return 1; }
+    if (p == 172) { return 0; }
+    if (p == 173) { return 1; }
+    if (p == 174) { return 0; }
+    if (p == 175) { return 1; }
+    if (p == 176) { return 0; }
+    if (p == 177) { return 1; }
+    if (p == 178) { return 0; }
+    if (p == 179) { return 1; }
+    if (p == 180) { return 0; }
+    if (p == 181) { return 1; }
+    if (p == 182) { return 0; }
+    if (p == 183) { return 1; }
+    if (p == 184) { return 0; }
+    if (p == 185) { return 1; }
+    if (p == 186) { return 0; }
+    if (p == 187) { return 1; }
+    if (p == 188) { return 0; }
+    if (p == 189) { return 1; }
+    if (p == 190) { return 0; }
+    if (p == 191) { return 1; }
+    if (p == 192) { return 2; }
+    if (p == 193) { return 3; }
+    if (p == 194) { return 2; }
+    if (p == 195) { return 3; }
+    if (p == 196) { return 2; }
+    if (p == 197) { return 3; }
+    if (p == 198) { return 2; }
+    if (p == 199) { return 3; }
+    if (p == 200) { return 2; }
+    if (p == 201) { return 3; }
+    if (p == 202) { return 2; }
+    if (p == 203) { return 3; }
+    if (p == 204) { return 2; }
+    if (p == 205) { return 3; }
+    if (p == 206) { return 2; }
+    if (p == 207) { return 3; }
+    if (p == 208) { return 2; }
+    if (p == 209) { return 3; }
+    if (p == 210) { return 2; }
+    if (p == 211) { return 3; }
+    if (p == 212) { return 2; }
+    if (p == 213) { return 3; }
+    if (p == 214) { return 2; }
+    if (p == 215) { return 3; }
+    if (p == 216) { return 2; }
+    if (p == 217) { return 3; }
+    if (p == 218) { return 2; }
+    if (p == 219) { return 3; }
+    if (p == 220) { return 2; }
+    if (p == 221) { return 3; }
+    if (p == 222) { return 2; }
+    if (p == 223) { return 3; }
+    if (p == 224) { return 2; }
+    if (p == 225) { return 3; }
+    if (p == 226) { return 2; }
+    if (p == 227) { return 3; }
+    if (p == 228) { return 2; }
+    if (p == 229) { return 3; }
+    if (p == 230) { return 2; }
+    if (p == 231) { return 3; }
+    if (p == 232) { return 2; }
+    if (p == 233) { return 3; }
+    if (p == 234) { return 2; }
+    if (p == 235) { return 3; }
+    if (p == 236) { return 2; }
+    if (p == 237) { return 3; }
+    if (p == 238) { return 2; }
+    if (p == 239) { return 3; }
+    if (p == 240) { return 2; }
+    if (p == 241) { return 3; }
+    if (p == 242) { return 2; }
+    if (p == 243) { return 3; }
+    if (p == 244) { return 2; }
+    if (p == 245) { return 3; }
+    if (p == 246) { return 2; }
+    if (p == 247) { return 3; }
+    if (p == 248) { return 2; }
+    if (p == 249) { return 3; }
+    if (p == 250) { return 2; }
+    if (p == 251) { return 3; }
+    if (p == 252) { return 2; }
+    if (p == 253) { return 3; }
+    if (p == 254) { return 2; }
+    return 3;
+}
+
+// Lut1 fuer den Kontextmodus UTF8.
+// Aus RFC 7932 §7.1 uebernommen; die Tabelle ist dort mit einer CRC-32
+// versehen, gegen die tests/brotli_decode_test.sh sie prueft.
+fn brLut1(p: int64): int64 {
+    if (p <= 32) { return 0; }
+    if (p <= 47) { return 1; }
+    if (p <= 57) { return 2; }
+    if (p <= 64) { return 1; }
+    if (p <= 90) { return 2; }
+    if (p <= 96) { return 1; }
+    if (p <= 122) { return 3; }
+    if (p <= 126) { return 1; }
+    if (p <= 223) { return 0; }
+    return 2;
+}
+
+// Lut2 fuer den Kontextmodus Signed.
+// Aus RFC 7932 §7.1 uebernommen; die Tabelle ist dort mit einer CRC-32
+// versehen, gegen die tests/brotli_decode_test.sh sie prueft.
+fn brLut2(p: int64): int64 {
+    if (p == 0) { return 0; }
+    if (p <= 15) { return 1; }
+    if (p <= 63) { return 2; }
+    if (p <= 127) { return 3; }
+    if (p <= 191) { return 4; }
+    if (p <= 239) { return 5; }
+    if (p <= 254) { return 6; }
+    return 7;
+}
+
+// Die drei Tabellen sind von aussen abfragbar, damit tests/brotli_decode_test.sh
+// sie gegen die im RFC angegebenen CRC-32-Werte halten kann. Von Hand
+// uebernommene Konstantentabellen waren in diesem Repo schon mehrfach falsch
+// (zstd #1027, brotli #1075) -- eine Pruefsumme, die der Standard selbst
+// mitliefert, ist der billigste Schutz dagegen.
+pub fn BrLut0(p: int64): int64 { return brLut0(p); }
+pub fn BrLut1(p: int64): int64 { return brLut1(p); }
+pub fn BrLut2(p: int64): int64 { return brLut2(p); }
+
+// Kontext-ID fuer das naechste Literal (RFC 7932 §7.1).
+//
+// #1079: Von den vier Modi waren nur LSB6 und MSB6 umgesetzt. UTF8 fiel
+// stillschweigend auf LSB6 zurueck, und Signed rechnete eine Bitschieberei,
+// die mit der Vorschrift nichts zu tun hat. Beide brauchen die Tabellen aus
+// dem RFC. Folge war ein falscher Baumindex und damit falsche Literale --
+// bei richtiger Laenge und ohne Fehlerflag, also der schlimmste Ausgang.
 fn brLiteralCtx(ctx: int64, mode: int64): int64 {
-    var l0: int64 := peek64(ctx + 104);
-    var l1: int64 := peek64(ctx + 112);
-    if (mode == 0) { return l0 & 0x3F; }
-    if (mode == 1) { return l0 >> 2; }
-    if (mode == 3) { return ((l0 >> 3) & 7) | ((l1 >> 1) & 56); }
-    // mode 2 (UTF-8): simplified fallback to mode 0
-    return l0 & 0x3F;
+    var p1: int64 := peek64(ctx + 104) & 0xFF;
+    var p2: int64 := peek64(ctx + 112) & 0xFF;
+    if (mode == 0) { return p1 & 0x3F; }
+    if (mode == 1) { return p1 >> 2; }
+    if (mode == 2) { return brLut0(p1) | brLut1(p2); }
+    return (brLut2(p1) << 3) | brLut2(p2);
 }
 
 // ============================================================================
@@ -915,9 +1226,19 @@ fn brLiteralCtx(ctx: int64, mode: int64): int64 {
 
 fn brFreeMetaState(ms: int64): void {
     if (ms == 0) { return; }
+
+    // #1079: Die Zahl der Insert-and-Copy-Baeume steht IM Blockzustand. Die
+    // Vorgaengerfassung gab die Blockzustaende zuerst frei und las die Zahl
+    // danach aus dem freigegebenen Speicher -- ein Use-after-free. Der
+    // Allokator in std/alloc.lyx gibt per munmap zurueck, die Seite war also
+    // weg; die anschliessende Schleife rief brFreeTree auf Zufallszeiger auf.
+    // Ergebnis: Absturz NACH vollstaendig richtiger Dekodierung.
     var bL: int64 := peek64(ms + 8);
     var bI: int64 := peek64(ms + 16);
     var bD: int64 := peek64(ms + 24);
+    var nbI: int64 := 0;
+    if (bI != 0) { nbI := peek64(bI); }
+
     if (bL != 0) { brFreeBlkState(bL); }
     if (bI != 0) { brFreeBlkState(bI); }
     if (bD != 0) { brFreeBlkState(bD); }
@@ -938,10 +1259,8 @@ fn brFreeMetaState(ms: int64): void {
     var tD: int64 := peek64(ms + 88);
 
     if (tL != 0) {
-        var bsL: int64 := peek64(ms + 8);
-        var nbL: int64 := ntL;
         var i: int64 := 0;
-        while (i < nbL) {
+        while (i < ntL) {
             var t: int64 := peek64(tL + i * 8);
             if (t != 0) { brFreeTree(t); }
             i += 1;
@@ -949,8 +1268,6 @@ fn brFreeMetaState(ms: int64): void {
         free(tL, ntL * 8);
     }
     if (tI != 0) {
-        var bsI: int64 := peek64(ms + 16);
-        var nbI: int64 := peek64(bsI);
         var i: int64 := 0;
         while (i < nbI) {
             var t: int64 := peek64(tI + i * 8);
@@ -960,14 +1277,13 @@ fn brFreeMetaState(ms: int64): void {
         free(tI, nbI * 8);
     }
     if (tD != 0) {
-        var nbD: int64 := ntD;
         var i: int64 := 0;
-        while (i < nbD) {
+        while (i < ntD) {
             var t: int64 := peek64(tD + i * 8);
             if (t != 0) { brFreeTree(t); }
             i += 1;
         }
-        free(tD, nbD * 8);
+        free(tD, ntD * 8);
     }
 
     free(ms, 128);
@@ -1017,6 +1333,9 @@ fn brReadMetaHeader(s: int64, ctx: int64): int64 {
     var cmD: int64 := brReadContextMap(s, ntD, nbD * 4);
     poke64(ms + 56, cmL);
     poke64(ms + 64, cmD);
+    // #1079: Eine abgewiesene Kontextkarte muss den Meta-Block scheitern
+    // lassen, nicht mit einem Nullzeiger weiterlaufen.
+    if ((cmL == 0) | (cmD == 0)) { brFreeMetaState(ms); return 0; }
     poke64(ms + 112, nbL * 64);   // Eintraege in cmL
     poke64(ms + 120, nbD * 4);    // Eintraege in cmD
 
@@ -1127,13 +1446,37 @@ fn brDecompressMeta(ctx: int64, ms: int64, mlen: int64): void {
                     var dTree:  int64 := peek64(tD + tidx * 8);
                     var dCode:  int64 := brDecodeSymbol(s, dTree);
                     dist := brDecodeDistance(ctx, s, dCode);
-                    brPushDist(ctx, dist);
+                    // #1079: RFC 7932 §4 -- eine ueber Symbol 0 geholte
+                    // Distanz wird NICHT neu eingereiht, sonst verschiebt sich
+                    // die Bedeutung von "zweitletzte" bei jedem Treffer.
+                    // Ausserdem: loest ein Sondersymbol auf null oder negativ
+                    // auf, ist der Strom kaputt und nicht etwa "irgendwie
+                    // weiterzulesen".
+                    if (dist < 1) { poke64(ctx + 64, 1); }
+                    else { if (dCode != 0) { brPushDist(ctx, dist); } }
                 }
 
-                // Copy
-                brCopyRef(ctx, dist, cpLen);
-                remain -= cpLen;
-                if (remain < 0) { remain := 0; }
+                // #1079: Zeigt die Distanz ueber den Anfang des Stroms oder
+                // ueber das Fenster hinaus, ist sie laut RFC 7932 §10 KEIN
+                // Rueckverweis, sondern ein Wort aus dem statischen
+                // Woerterbuch (§8). Das unterstuetzen wir nicht -- also wird
+                // es gemeldet. Vorher kopierte der Dekodierer stattdessen aus
+                // dem Fenster und lieferte stillschweigend falschen Inhalt,
+                // meist mit falscher Laenge obendrein.
+                var produced: int64 := peek64(ctx + 48);
+                // Fenstergroesse ist (1 << WBITS) - 16 (RFC 7932 §9.1);
+                // der Puffer selbst ist die volle Zweierpotenz.
+                var maxDist:  int64 := peek64(ctx + 16) - 16;
+                if (produced < maxDist) { maxDist := produced; }
+                if (dist > maxDist) {
+                    poke64(ctx + 64, 1);
+                    remain := 0;
+                } else {
+                    // Copy
+                    brCopyRef(ctx, dist, cpLen);
+                    remain -= cpLen;
+                    if (remain < 0) { remain := 0; }
+                }
             }
         }
     }
