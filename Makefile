@@ -23,7 +23,7 @@ BIN_DST   := $(PKG_DIR)/usr/local/bin
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test test-external test-lyxos snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen sync-units-src
+.PHONY: build bootstrap singularity test test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen sync-units-src
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -252,6 +252,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
+	@echo "OK"
+	@echo "--- TextMate-Grammatik: Schluesselwoerter und Typen vollstaendig ---"
+	@bash tests/syntax/test_grammar.sh
 	@echo "OK"
 	@echo "--- Generics: Typparameter (8 Pruefungen) ---"
 	@bash tests/generics_typeparam_test.sh
@@ -497,6 +500,35 @@ test-external: lyxc
 
 test-lyx: lyxc
 	@bash tests/run_lyx_suite.sh tests/suite-full.txt "Vollsuite"
+
+# Die 268 .lyx-Dateien unter tests/lyx/** mit ihren .expected-Dateien. Der
+# Runner dafuer lag seit jeher im Repo, hing aber an keinem Ziel — bemerkt
+# wurde das erst, als die Abdeckungspruefung rekursiv suchte (#1112). Bekannt
+# rote Eintraege stehen in tests/known-red.txt (#1153); nicht Teil von
+# `make test`, weil ein Teil davon Soundkarte oder MySQL braucht.
+.PHONY: test-lyx-integration
+test-lyx-integration: lyxc
+	@bash tests/run_lyx_tests.sh
+
+# Die .sh-Eintraege aus tests/known-red.txt. Sie laufen, ihr Fehlschlag ist
+# erwartet und bricht nichts ab — aber wenn einer wieder gruen wird, wird
+# DIESES Ziel rot, damit der Eintrag verschwindet statt zu veralten.
+.PHONY: test-known-red
+test-known-red: lyxc
+	@fail=0; n=0; \
+	while read -r line; do \
+	  line="$${line%%\#*}"; line="$$(printf '%s' "$$line" | sed -e 's/[[:space:]]*$$//' -e 's/[[:space:]]*!flaky$$//')"; \
+	  case "$$line" in ''|*.lyx) continue ;; esac; \
+	  n=$$((n+1)); \
+	  if bash "$$line" >/dev/null 2>&1; then \
+	    echo "WIEDER GRUEN $$line — Eintrag aus tests/known-red.txt streichen"; \
+	    fail=$$((fail+1)); \
+	  else \
+	    echo "bekannt rot   $$line"; \
+	  fi; \
+	done < tests/known-red.txt; \
+	echo "known-red (.sh): $$n geprueft, $$fail unerwartet gruen"; \
+	test $$fail -eq 0
 
 # LyxOS-Tests aus tests/ (nicht tests/lyxos/ -- dafuer gibt es `test-lyxos`).
 # Nur uebersetzen, der erzeugte Code laeuft nicht auf dem Buildhost.

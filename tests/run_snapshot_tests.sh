@@ -50,6 +50,11 @@ PASS=0
 FAIL=0
 SKIP=0
 
+# Compiler-Banner mit Versionsnummer aus einer Ausgabe entfernen.
+strip_banner() {
+  printf '%s' "$1" | grep -vE '^lyxc [0-9][^ ]* — Copyright'
+}
+
 run_test() {
   local lyx_file="$1"
   local name
@@ -89,12 +94,16 @@ run_test() {
     elif [ ! -f "$expected_file" ]; then
       echo -e "${YELLOW}MISS ${RESET} $name  (no .expected — run with --update)"
       FAIL=$((FAIL + 1))
-    elif [ "$cf_out" = "$(cat "$expected_file")" ]; then
+    # Die Copyright-Zeile traegt die Compilerversion und veraltet bei jedem
+    # Versionsbump — 14_at_if_syntax_dead erwartete noch 0.9.1A und war
+    # deshalb rot, ohne dass sich an der geprueften Fehlermeldung etwas
+    # geaendert haette. Verglichen wird die Diagnose, nicht das Banner.
+    elif [ "$(strip_banner "$cf_out")" = "$(strip_banner "$(cat "$expected_file")")" ]; then
       echo -e "${GREEN}PASS ${RESET} $name"
       PASS=$((PASS + 1))
     else
       echo -e "${RED}FAIL ${RESET} $name  (compile error output mismatch)"
-      diff <(cat "$expected_file") <(echo "$cf_out") | head -10 | sed 's/^/       /'
+      diff <(strip_banner "$(cat "$expected_file")") <(strip_banner "$cf_out") | head -10 | sed 's/^/       /'
       FAIL=$((FAIL + 1))
     fi
     return
@@ -162,10 +171,13 @@ run_test() {
 
   local ok=1
 
-  if [ "$actual_stdout" != "$expected_stdout" ]; then
+  # Bei --migrate-capabilities ist die Compilerausgabe das Ergebnis; sie
+  # beginnt mit dem Versionsbanner, das bei jedem Bump veraltet (wpt14_migrate_fopen
+  # erwartete noch 0.9.1A). Verglichen wird der Inhalt, nicht die Version.
+  if [ "$(strip_banner "$actual_stdout")" != "$(strip_banner "$expected_stdout")" ]; then
     ok=0
     echo -e "${RED}FAIL ${RESET} $name  (stdout mismatch)"
-    diff <(echo "$expected_stdout") <(echo "$actual_stdout") | head -20 | sed 's/^/       /'
+    diff <(strip_banner "$expected_stdout") <(strip_banner "$actual_stdout") | head -20 | sed 's/^/       /'
   fi
 
   if [ "$actual_exit" != "$expected_exit" ]; then

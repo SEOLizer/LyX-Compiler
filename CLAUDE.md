@@ -38,7 +38,16 @@ erzeugt), `ir_lower` (kannte nur das eigene Modul).
   Seiteneffekt identifizieren. Prüffrage: *wäre der Test vor dem Fix rot?*
   Dreimal in Folge wäre ein Ergebnistest grün gewesen (`case _`, `&&`, `defer`).
 - **Ein Test, der nicht läuft, ist schlimmer als keiner.** Neue Suiten ins
-  `test`-Target bzw. in `tests/suite-*.txt`; `test_coverage_test.sh` wacht.
+  `test`-Target bzw. in `tests/suite-*.txt`; `test_coverage_test.sh` wacht —
+  seit #1112 rekursiv, denn davor sah er nur `tests/*.sh` und übersah damit
+  621 Dateien in Unterverzeichnissen. Ein *Runner*, der an keinem Ziel hängt,
+  ist derselbe Verfall; die Prüfung erkennt ein Verzeichnis nur dann als
+  abgedeckt, wenn sein Runner im Makefile aufgerufen wird.
+- **Roter Test bleibt im Lauf.** Wer ihn aus dem Ziel nimmt, macht ihn
+  unsichtbar. `tests/known-red.txt` führt ihn mit Issue weiter mit; wird er
+  wieder grün, wird das Ziel rot, damit der Eintrag verschwindet.
+- **Erwartete Ausgaben ohne Versionsbanner.** Snapshot-Erwartungen, die die
+  Copyright-Zeile enthielten, verrotteten bei jedem Bump (`0.9.1A`).
 - **Kein Test darf an einem fremden offenen Defekt hängen** — sonst ist unklar,
   was er misst. Rest als eigenes Issue.
 - **Repro wörtlich übernehmen**, nicht in die eigene Schreibweise übersetzen.
