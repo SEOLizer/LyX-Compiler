@@ -193,6 +193,7 @@ test: lyxc
 	@bash tests/oop_super_abstract_test.sh
 	@bash tests/nullable_test.sh
 	@bash tests/is_type_test.sh
+	@bash tests/range_runtime_test.sh
 	@echo "OK"
 	@echo "--- Verschachtelte Funktionen (8 Prüfungen) ---"
 	./lyxc --std-path=std tests/nested_fn_test.lyx -o /tmp/lyxc_nfn_test
