@@ -238,7 +238,17 @@ VarAttr             = "@redundant"
 
 EndianAttr          = "@big_endian"
                     | "@little_endian" ;
+
+ModuleDocAttr       = ( "@description" | "@author" | "@copyright" | "@version" )
+                      "(" StringLiteral ")" ;
+(* Modulkopf-Angaben vor `unit`/`import`. Rein beschreibend; der Bestand
+   benutzt sie durchgaengig (#1099). *)
 ```
+
+Ein Attributname ausserhalb dieser Mengen ist ein Fehler, ebenso ein
+fehlendes, ueberzaehliges oder falsch getipptes Argument (#1099). Welche
+Attribute eine Wirkung haben und welche nur vermerkt werden, steht in
+Abschnitt 20.1.
 
 ---
 
@@ -1217,6 +1227,7 @@ Einzelbefunde sind dort verlinkt.
 | `&x` (Adress-Operator) | 15 | Gibt es nicht. Ein Ausgabeparameter wird als Zelle uebergeben (`alloc(8)`, danach `peek64`). (#1061) |
 | Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
 | Nullable-Suffix, Pruefung | 7 | `T?` wird geparst und am Typknoten vermerkt, loest aber KEINE zusaetzliche Pruefung aus: ein nicht-nullbarer Typ nimmt weiterhin `null` an, und ein nullbarer wird ohne `?.` ungeprueft dereferenziert. Das Suffix dokumentiert die Absicht, es erzwingt sie nicht. `?.` dagegen prueft zur Laufzeit. (#1092) |
+| Attribute ohne Nachweis | 4 | `@wcet`, `@stack_limit`, `@integrity`, `@flight_crit`, `@dal` und `@critical` werden geparst, in ihrer Argumentform geprueft und am Knoten vermerkt -- der Compiler weist die Zusicherung aber **nicht** nach. Kein WCET-Beweis, keine Stapelanalyse, keine TMR-Verifikation, keine FPU-Traps. Sie sind seit #1099 nicht mehr stumm: jedes Vorkommen meldet den fehlenden Nachweis. Wer die Annotation setzt, bekommt sie also als Vermerk, nicht als Beweis. Unbekannte Attributnamen und falsche Argumentformen werden abgewiesen. |
 | Typtest `is`, Reichweite | 15 | Zur LAUFZEIT geprueft wird nur gegen eine Klasse MIT Methoden -- nur die traegt einen Typzeiger. Eine Klasse OHNE Methode bekommt struct-Layout und damit keine VMT; dort ist die Antwort der statisch bekannte Vererbungsweg (plus `null`-Probe), und ein zur Laufzeit eingelagerter anderer Typ waere nicht zu sehen. Wo der statische Typ des Empfaengers nicht bestimmbar ist oder der genannte Typ weder Klasse noch eingebauter Typ ist (Alias, Generik), MELDET der Compiler das, statt `false` zu liefern. (#1094) |
 | `static` an Feldern | 9 | `static fn` gibt es (Aufruf ueber den Typnamen, `self` darin abgewiesen). `static` an einem FELD wird abgewiesen: der Zugriff hiesse `A.v`, und diese Schreibweise bezeichnet in Lyx bereits den Byte-OFFSET des Feldes -- std/string.lyx nutzt sie so (`StringBuilder.capacity`). Welche Bedeutung gelten soll, ist eine Sprachentscheidung. Eine Klassenkonstante wird als `con` auf Modulebene geschrieben. (#1090) |
 | Default-Werte, Auswertung | 15.1 | Ein weggelassenes Argument wird durch den Default ersetzt, solange die uebersprungenen Parameter am ENDE stehen. Steht hinter einem Default noch ein Parameter OHNE, laesst sich der Default nicht ueberspringen. Der Ausdruck muss zur Uebersetzungszeit feststehen -- er wird an jeder Aufrufstelle eingesetzt, ein nicht-konstanter liefe sonst je Aufruf erneut. Die Kombination aus benannten Argumenten und uebersprungenen Defaults gibt es nicht. (#1089) |
