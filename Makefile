@@ -182,6 +182,7 @@ test: lyxc
 	@bash tests/brotli_decode_test.sh
 	@bash tests/match_guard_test.sh
 	@bash tests/range_type_test.sh
+	@bash tests/storage_class_test.sh
 	@echo "OK"
 	@echo "--- Verschachtelte Funktionen (8 Prüfungen) ---"
 	./lyxc --std-path=std tests/nested_fn_test.lyx -o /tmp/lyxc_nfn_test

@@ -265,6 +265,11 @@ VarDecl             = [ Visibility ]
 
 VarKind             = "var" | "let" | "co" ;
 
+(* `let` und `co` binden einmal: eine Zuweisung nach der Initialisierung
+   wird abgewiesen. `var` bleibt beschreibbar. Bis 1.0.11D trug `let` den
+   Schutz nur im Namen und `co` wurde vom Parser gar nicht angenommen --
+   siehe #1083. *)
+
 IdentList           = Ident { "," Ident } ;
 ```
 
