@@ -188,6 +188,7 @@ test: lyxc
 	@bash tests/struct_method_test.sh
 	@bash tests/named_args_test.sh
 	@bash tests/tuple_test.sh
+	@bash tests/default_param_test.sh
 	@echo "OK"
 	@echo "--- Verschachtelte Funktionen (8 Prüfungen) ---"
 	./lyxc --std-path=std tests/nested_fn_test.lyx -o /tmp/lyxc_nfn_test
