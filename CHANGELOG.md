@@ -4,6 +4,145 @@
 
 _(noch nichts)_
 
+## Version 1.0.12A (August 2026)
+
+Drei Befunde derselben Bauart: eine Zusicherung, die nur im Namen bestand.
+Der erste hat die anderen beiden erst sichtbar gemacht.
+
+### Testabdeckung — die Prüfung sah nur ein Drittel des Bestands (#1112)
+
+`tests/test_coverage_test.sh` — der Wächter, der seit #1004 verhindern soll,
+dass Testdateien unbemerkt verfallen — scannte **flach**: `tests/*.sh` und
+`tests/*.lyx`, 307 von 928 Dateien. Die 621 in Unterverzeichnissen waren
+unsichtbar, und er meldete trotzdem "alle Testdateien sind zugeordnet".
+
+Die Lehre eine Stufe über #1004: *eine Abdeckungsprüfung, die nicht überall
+hinsieht, meldet Vollständigkeit über den Ausschnitt, den sie kennt — und
+sieht dabei genauso grün aus wie eine vollständige.*
+
+Der Scan läuft jetzt über `find`. Zugeordnet ist eine Datei, wenn das Makefile
+sie nennt, sie in einer Suite-Liste steht, sie in der neuen Liste
+`tests/known-red.txt` geführt ist — oder sie unter einem Verzeichnis liegt,
+dessen Runner **an einem Make-Ziel hängt**. Die letzte Bedingung wird
+mitgeprüft: `tests/run_lyx_tests.sh` lief über 268 Dateien und wurde von
+keinem Ziel aufgerufen. Ein Runner ohne Ziel ist derselbe Verfall wie ein Test
+ohne Runner.
+
+Triage der 621:
+
+| Bereich | Dateien | Zuordnung |
+|---|---|---|
+| `tests/regression/**` + `tests/feature_checks/**` | 284 | 143 grün → `suite-full`; 141 verrottet → `suite-broken` (#1150) |
+| `tests/lyx/**` | 268 | neues Ziel `test-lyx-integration`; 218 grün, 46 bekannt rot (#1153, #1156) |
+| `tests/snapshot/**` | 49 | war über `make snapshot` verdrahtet |
+| `tests/lyxos/**` | 17 | im `test-lyxos`-Ziel |
+| `tests/e2e`, `tests/syntax`, `tests/integration` | 3 | einzeln |
+
+**Rote Tests wandern nicht aus dem Lauf.** `tests/known-red.txt` führt sie mit
+Issue weiter mit; wird ein Eintrag wieder grün, wird das Ziel **rot**, damit er
+verschwindet statt zu veralten. Geräteabhängige Fälle tragen `!flaky` — sie
+werden gemeldet, färben den Lauf aber in keine Richtung.
+
+Vier Nebenbefunde, alle vom selben Muster:
+
+- `tests/syntax/test_grammar.sh` **konnte gar nicht rot werden**: die
+  JSON-Prüfung las `$GRAMMAR` in einem quotierten Here-Dokument, wo die Shell
+  nicht ersetzt, und fehlende Schlüsselwörter gaben nur `WARNING` aus, Exit 0.
+- `tests/e2e/test_int_widths.sh` zeigte auf einen gelöschten Pfad und nutzte
+  entfernte Builtins.
+- `tests/integration/run_examples.sh` entfernt: baute mit `fpc` den nicht mehr
+  vorhandenen Pascal-Seed, hängte `|| true` an jeden Aufruf und prüfte nichts.
+- `make snapshot` war rot: `11_at_if` fragte `TARGET_X86_64` ab, ein Name, den
+  es nicht gibt (`@if` nimmt bei unbekanntem Bezeichner still den else-Zweig,
+  #1159), und zwei `.expected` pinnten die Compilerversion im Copyright-Banner
+  fest. Der Runner vergleicht jetzt die Diagnose ohne Banner. **49/49 grün.**
+
+### Compiler — `--runtime-checks` prüfte Indizes gar nicht (#1156)
+
+Die Option ist als *"Runtime-Assertions (bounds, null, zero) für DO-178C"*
+dokumentiert. Für Array-Indizes passierte nichts: `arr[5]` bei `int64[3]` las
+den Speicher hinter dem Array und lief weiter. Der Rückgabewert war Stack-Müll
+und wechselte von Lauf zu Lauf. Das Feld `boundsCheckEnabled` (aus
+`@bounds_check`) existierte, wurde geschrieben — und von keiner
+Emissionsstelle gelesen.
+
+Behoben auf zwei Ebenen, weil der Defekt auf zweien lag:
+
+- **sema**: ein konstanter Index auf eine Variable mit fester Größe ist zur
+  Übersetzungszeit entscheidbar und wird abgewiesen — ohne Schalter.
+- **codegen**: berechnete Indizes prüfen zur Laufzeit, lesend wie schreibend.
+  Feste Größe gegen Immediate, dynamisches Array gegen die Länge im
+  `{cap,len}`-Kopf. Der Vergleich ist **vorzeichenlos**, ein negativer Index
+  fällt damit in denselben Zweig wie ein zu großer.
+
+Wo es keine Länge gibt — roher Zeiger, `pchar`, inline liegendes Struct-Feld —
+wird weiterhin nicht geprüft. Das steht als benannte Lücke in `ebnf.md` §20.1,
+statt als stiller Durchfall. Nur das x86-64-Backend trägt die Prüfung; die
+übrigen kennen `--runtime-checks` insgesamt nicht.
+
+### Compiler — schmale Ganzzahltypen trugen ihre Breite nur im Namen (#1151)
+
+Ein Local, ein Parameter und eine globale Variable belegen immer einen
+64-Bit-Slot, auch wenn sie `int8` heißen. Der Wert ging ungekürzt hinein:
+
+| Ausdruck | erwartet | war |
+|---|---|---|
+| `var a: int8 := 130` | -126 | 130 |
+| `var b: uint8 := 300` | 44 | 300 |
+| `var d: uint32 := 0 - 1` | 4294967295 | -1 |
+| `f(200)` bei `x: int8` | -56 | 200 |
+| `return 300` bei `: uint8` | 44 | 300 |
+
+Strukturfelder waren als einzige korrekt — sie liegen in ihrer eigenen Breite
+im Speicher, dort kürzt der Speicherbefehl. Genau das verdeckte den Defekt.
+
+Gekürzt wird jetzt an jeder Stelle, an der ein Wert in einen solchen Slot
+geht: Initialisierung, Zuweisung (lokal, global, Closure), Parameter am
+Funktions- wie am Methodeneintritt, `return`, und die globale
+Literal-Initialisierung im Datenbereich (zur Übersetzungszeit gerechnet).
+
+Zwei Nebenbefunde mit derselben Wurzel — die kurze und die lange Schreibweise
+galten nicht überall als derselbe Typ, obwohl §7 sie so führt:
+
+- `x as int8` und `x as int16` kürzten nicht; die Kette im Codegen kannte nur
+  `i8`/`i16`.
+- `var a: i8` wurde von sema abgewiesen, während `feld: i8` und `as i8`
+  durchgingen — dieselbe Asymmetrie, die #1010 für die vorzeichenlose Hälfte
+  (`u8`/`uint8`) geschlossen hat.
+
+### Tests
+
+Drei neue Suiten im `test`-Ziel, alle messen die **Ausführung**, nicht die
+Übersetzung — ein Test, der nur schaut, ob etwas übersetzt, wäre in allen drei
+Fällen vorher grün gewesen:
+
+| Suite | Prüfungen | vor dem Fix |
+|---|---|---|
+| `tests/bounds_check_test.sh` | 12 | 6 PASS / 6 FAIL |
+| `tests/int_width_test.sh` | 20 | 3 PASS / 17 FAIL |
+| `tests/syntax/test_grammar.sh` | — | konnte nicht rot werden |
+
+Jeder Fehlerfall kommt paarweise mit dem gültigen daneben, und die Gegenprobe
+gehört dazu: ohne `--runtime-checks` und mit `@bounds_check(false)` darf
+**nicht** geprüft werden; `int64`/`uint64` dürfen **nicht** gekürzt werden.
+Ohne diese Fälle wäre eine Prüfung, die immer zuschlägt, ebenso grün.
+
+Neue Ziele: `test-lyx-integration` (tests/lyx/**) und `test-known-red`; beide
+laufen in der CI mit.
+
+### Offen
+
+- **#1150** — 141 verrottete Dateien in `tests/regression/**`, nach Ursache
+  gebündelt.
+- **#1153** — 45 rote Tests in `tests/lyx/**`; es fehlt eine Kategorie
+  "übersetzen ja, ausführen nein" für die geräte- und dienstabhängigen.
+- **#1159** — `@if` mit unbekanntem Bezeichner ist stillschweigend false.
+- **#1164** — globale Variable mit **berechneter** Initialisierung bleibt
+  still 0; nur Ganzzahlliterale landen im Datenbereich.
+- **#1167** — `make singularity` ist rot: der Seed (1.0.7B) erzeugt nicht mehr
+  denselben Compiler wie der Compiler selbst. Vorbestehend, gegen den
+  Vorgängerstand belegt. Der Fixpunkt selbst hält (gen2 == gen3 == gen4).
+
 ## Version 1.0.11D (August 2026)
 
 ### Standardbibliothek — zstd: Compressed Blocks dekodieren wieder (#1027)
