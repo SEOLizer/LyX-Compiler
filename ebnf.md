@@ -881,7 +881,14 @@ UnaryExpr           = ( "+" | "-" | "!" | "~" | "@" ) UnaryExpr
 (* "@" Ident  = Adresse-von (address-of) eines Locals/Params → Slot-Adresse.
    Codegen: ELF lea rax,[rbp+off]; LyxOS IRO_LOAD_LOCAL_ADDR (PR #872). *)
 
-CastExpr            = PostfixExpr [ "as" Type ] ;
+CastExpr            = PostfixExpr [ ( "as" | "as" "?" | "is" ) Type ] ;
+
+(* "is" prueft die Typzugehoerigkeit und liefert bool (#1094).
+   Zielt der Test auf eine Klasse MIT Methoden, so wird zur Laufzeit ueber den
+   Typzeiger geprueft, und zwar gegen die Zielklasse SAMT ihrer Nachfahren:
+   `b is A` ist wahr, wenn B von A abstammt. `null` ist nie ein T.
+   In allen uebrigen Faellen steht die Antwort zur Uebersetzungszeit fest;
+   der Empfaenger wird dennoch ausgewertet. Siehe Abschnitt 20.1. *)
 
 PostfixExpr         = PrimaryExpr { PostfixSuffix } ;
 
@@ -1210,6 +1217,7 @@ Einzelbefunde sind dort verlinkt.
 | `&x` (Adress-Operator) | 15 | Gibt es nicht. Ein Ausgabeparameter wird als Zelle uebergeben (`alloc(8)`, danach `peek64`). (#1061) |
 | Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
 | Nullable-Suffix, Pruefung | 7 | `T?` wird geparst und am Typknoten vermerkt, loest aber KEINE zusaetzliche Pruefung aus: ein nicht-nullbarer Typ nimmt weiterhin `null` an, und ein nullbarer wird ohne `?.` ungeprueft dereferenziert. Das Suffix dokumentiert die Absicht, es erzwingt sie nicht. `?.` dagegen prueft zur Laufzeit. (#1092) |
+| Typtest `is`, Reichweite | 15 | Zur LAUFZEIT geprueft wird nur gegen eine Klasse MIT Methoden -- nur die traegt einen Typzeiger. Eine Klasse OHNE Methode bekommt struct-Layout und damit keine VMT; dort ist die Antwort der statisch bekannte Vererbungsweg (plus `null`-Probe), und ein zur Laufzeit eingelagerter anderer Typ waere nicht zu sehen. Wo der statische Typ des Empfaengers nicht bestimmbar ist oder der genannte Typ weder Klasse noch eingebauter Typ ist (Alias, Generik), MELDET der Compiler das, statt `false` zu liefern. (#1094) |
 | `static` an Feldern | 9 | `static fn` gibt es (Aufruf ueber den Typnamen, `self` darin abgewiesen). `static` an einem FELD wird abgewiesen: der Zugriff hiesse `A.v`, und diese Schreibweise bezeichnet in Lyx bereits den Byte-OFFSET des Feldes -- std/string.lyx nutzt sie so (`StringBuilder.capacity`). Welche Bedeutung gelten soll, ist eine Sprachentscheidung. Eine Klassenkonstante wird als `con` auf Modulebene geschrieben. (#1090) |
 | Default-Werte, Auswertung | 15.1 | Ein weggelassenes Argument wird durch den Default ersetzt, solange die uebersprungenen Parameter am ENDE stehen. Steht hinter einem Default noch ein Parameter OHNE, laesst sich der Default nicht ueberspringen. Der Ausdruck muss zur Uebersetzungszeit feststehen -- er wird an jeder Aufrufstelle eingesetzt, ein nicht-konstanter liefe sonst je Aufruf erneut. Die Kombination aus benannten Argumenten und uebersprungenen Defaults gibt es nicht. (#1089) |
 | Tupel-Entpacken, geklammerte Form | 12 | `var (q, r) := f();` gibt es nicht -- §12 (TupleUnpackStmt) schreibt die Form OHNE Klammern vor: `var q, r := f();`. Die DokuWiki fuehrt faelschlich die geklammerte. (#1088) |
