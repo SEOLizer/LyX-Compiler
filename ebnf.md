@@ -131,10 +131,15 @@ Bezeichner verwendbar.
 ## 2.2 Soft Keywords
 
 ```text
-range wraps defer
+range wraps defer limit
 ```
 
 Soft keywords are tokenized as identifiers and interpreted contextually by the parser.
+
+`limit` wird nur unmittelbar hinter der Bedingung eines `while` und vor dem
+Block erkannt, gefolgt von "(" -- ueberall sonst bleibt es ein gewoehnlicher
+Bezeichner (#1103). Damit stimmen die WhileStmt-Produktion in Abschnitt 12 und
+die Feststellung oben, `limit` sei nicht reserviert, wieder ueberein.
 
 Hinweis zur Geschichte: `defer` lief in einem inneren Block lange am
 Funktionsende statt am Blockende (#1006, samt Argument-Zeitpunkt #1030), und
@@ -632,6 +637,14 @@ WhileStmt           = "while"
                       "(" Expr ")"
                       [ "limit" "(" ConstExpr ")" ]
                       Block ;
+
+(* limit(N) begrenzt die Zahl der DURCHLAEUFE des Rumpfes, einschliesslich:
+   N sind erlaubt, N+1 bricht mit panic ab. Die Schranke wird durchgesetzt,
+   nicht nur vermerkt -- sie ist das Mittel, die Endlichkeit einer Schleife
+   zuzusichern, und ein ungeprueftes Versprechen sagt darueber nichts aus.
+   N muss zur Uebersetzungszeit feststehen (Literal oder `con`); der Zaehler
+   beginnt bei jedem EINTRITT in die Schleife neu. `limit` ist ein weiches
+   Schluesselwort, siehe Abschnitt 2.2. RepeatStmt fuehrt es nicht. (#1103) *)
 
 ForStmt             = ForRangeStmt
                     | ForCStyleStmt ;

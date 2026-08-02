@@ -9873,6 +9873,46 @@ pub type Codegen = class {
   // Continue in copy K (K<U-1) → start of copy K+1's condition.
   // Continue in last copy → loopTop.
   // All breaks → exit.
+  // #1103: Iterationsschranke `while (c) limit(N)`. Der Wert muss zur
+  // Uebersetzungszeit feststehen (ebnf.md §12: ConstExpr) -- eine Schranke,
+  // die selbst erst berechnet wird, sichert nichts zu. -1 = keine Schranke.
+  fn cg_limitValue(limNode: int64): int64 {
+    if (limNode < 0) { return 0 - 1; }
+    var k: int64 := self.cg_nkind(limNode);
+    if (k == CGN_LIT_INT) { return self.cg_nival(limNode); }
+    if (k == CGN_IDENT) {
+      var nm: pchar := self.cg_nsval(limNode);
+      var nl: int64 := self.cg_nslen(limNode);
+      if (self.cg_hasConVal(nm, nl) != 0) { return self.cg_findConVal(nm, nl); }
+    }
+    EPrintStrLn("error: limit(N) verlangt eine Konstante"c);
+    EPrintStrLn("  Zulaessig sind ein Ganzzahlliteral und ein `con`. Eine berechnete"c);
+    EPrintStrLn("  Schranke sichert die Endlichkeit der Schleife nicht zu."c);
+    exit(1);
+    return 0 - 1;
+  }
+
+  // #1103: Zaehler hochzaehlen und gegen die Schranke pruefen. Steht am Anfang
+  // des Rumpfes, also VOR dem ersten Durchlauf des Rumpfinhalts: die Schranke
+  // begrenzt die Zahl der Durchlaeufe, nicht die der Bedingungspruefungen.
+  //
+  // Die Schranke wird DURCHGESETZT, nicht bloss vermerkt. Ein Vermerk, den
+  // niemand prueft, sagt ueber die Endlichkeit der Schleife nichts aus -- das
+  // ist derselbe stille Nachweis wie bei den Attributen in #1099.
+  fn cg_emitLimitCheck(cntOff: int64, limVal: int64, msgOff: int64) {
+    self.cg_loadRax(cntOff);
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);   // inc rax
+    self.cg_storeRax(cntOff);
+    self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(limVal); // mov rcx, N
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);   // cmp rax, rcx
+    self.cg_e8(0x0F); self.cg_e8(0x8E);                     // jle .ok
+    var jOk: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_emitLeaRdiData(msgOff);
+    self.cg_emitPanicBody();
+    poke32(self.code + jOk, self.codeLen - jOk - 4);
+  }
+
   fn cg_genWhile(ni: int64) {
     var U:              int64 := self.cg_unrollFactor();
     var savedBreakHead: int64 := self.curBreakHead;
@@ -9880,6 +9920,21 @@ pub type Codegen = class {
     var allBreakHead:   int64 := -1;
     var jzHead:         int64 := -1;
     var prevContHead:   int64 := -1;
+
+    // #1103: Schranke vorbereiten -- Zaehlerzelle nullen, Meldung ablegen.
+    // Beides VOR loopTop, sonst begaenne jeder Durchlauf wieder bei null.
+    var limVal: int64 := self.cg_limitValue(self.cg_nc2(ni));
+    var limCnt: int64 := 0;
+    var limMsg: int64 := 0;
+    if (limVal >= 0) {
+      limCnt := self.cg_addLocal("__lyx_limit"c, 11);
+      self.cg_zeroRax();
+      self.cg_storeRax(limCnt);
+      var lm: pchar := StrConcat("Schleifenschranke ueberschritten: limit("c, IntToStr(limVal));
+      lm := StrConcat(lm, ")\n"c);
+      limMsg := self.cg_emitCStrData(lm);
+    }
+
     var loopTop:        int64 := self.codeLen;
 
     var copy: int64 := 0;
@@ -9897,6 +9952,7 @@ pub type Codegen = class {
       self.curContHead  := -1;
       var savedMarkW: int64 := self.loopDeferMark;   // #1006
       self.loopDeferMark := self.deferCount;
+      if (limVal >= 0) { self.cg_emitLimitCheck(limCnt, limVal, limMsg); }   // #1103
       self.cg_genBlock(self.cg_nc1(ni));
       self.loopDeferMark := savedMarkW;
       // Accumulate break list; save this copy's continue list for later
