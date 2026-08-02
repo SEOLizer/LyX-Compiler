@@ -570,6 +570,8 @@ pub type Codegen = class {
   rangeTypeCap:    int64;
   // #1097: Bereichstyp des Rueckgabewerts der gerade erzeugten Funktion (-1 = keiner).
   curFnRetRange:   int64;
+  // #1151: Breite des Rueckgabetyps der gerade erzeugten Funktion (0 = voll).
+  curFnRetNarrow:  int64;
 
   // WP-BC-40: Compile-time profiling entry table (x86_64 only)
   // Entry: {namePtr:8 (src ptr), nameLen:8, dataOff:8, nameDataOff:8} = 32 bytes
@@ -4066,6 +4068,96 @@ pub type Codegen = class {
     return 0 - 1;
   }
 
+  // #1151: Schmale Ganzzahltypen. Ein Local, ein Parameter und eine globale
+  // Variable belegen IMMER einen 64-Bit-Slot — auch wenn sie `int8` heissen.
+  // Bis 1.0.11D wurde der Wert ungekuerzt hineingelegt: `var a: int8 := 130`
+  // lieferte 130 statt -126, `var d: uint8 := 0-1` lieferte -1 statt 255. Der
+  // Typ trug seine Breite also nur im Namen.
+  //
+  // Strukturfelder waren nie betroffen: sie liegen in ihrer eigenen Breite im
+  // Speicher, das Kuerzen erledigt dort der Speicherbefehl.
+  //
+  // Rueckgabe: 0 = kein schmaler Typ, sonst die Kennung fuer cg_emitNarrowRax.
+  fn cg_narrowKindOf(tname: pchar, tlen: int64): int64 {
+    if (tlen <= 0) { return 0; }
+    if (self.cg_seq(tname, tlen, "i8", 2)     || self.cg_seq(tname, tlen, "int8", 4))   { return 1; }
+    if (self.cg_seq(tname, tlen, "u8", 2)     || self.cg_seq(tname, tlen, "uint8", 5))  { return 2; }
+    if (self.cg_seq(tname, tlen, "i16", 3)    || self.cg_seq(tname, tlen, "int16", 5))  { return 3; }
+    if (self.cg_seq(tname, tlen, "u16", 3)    || self.cg_seq(tname, tlen, "uint16", 6)) { return 4; }
+    if (self.cg_seq(tname, tlen, "i32", 3)    || self.cg_seq(tname, tlen, "int32", 5))  { return 5; }
+    if (self.cg_seq(tname, tlen, "u32", 3)    || self.cg_seq(tname, tlen, "uint32", 6)) { return 6; }
+    return 0;
+  }
+
+  // rax auf die Breite des Typs kuerzen: vorzeichenbehaftet bei `intN`,
+  // vorzeichenlos bei `uintN`.
+  fn cg_emitNarrowRax(kind: int64) {
+    if (kind == 1) {
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBE); self.cg_e8(0xC0);  // movsx rax, al
+    } else if (kind == 2) {
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);  // movzx rax, al
+    } else if (kind == 3) {
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBF); self.cg_e8(0xC0);  // movsx rax, ax
+    } else if (kind == 4) {
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB7); self.cg_e8(0xC0);  // movzx rax, ax
+    } else if (kind == 5) {
+      self.cg_e8(0x48); self.cg_e8(0x63); self.cg_e8(0xC0);                     // movsxd rax, eax
+    } else if (kind == 6) {
+      self.cg_e8(0x89); self.cg_e8(0xC0);                                       // mov eax, eax
+    }
+  }
+
+  // Dieselbe Kuerzung zur Uebersetzungszeit, fuer Werte, die ohne Codeerzeugung
+  // in den Datenbereich gehen (globale Literal-Initialisierung).
+  fn cg_narrowConst(v: int64, kind: int64): int64 {
+    if (kind == 1) { var b: int64 := v & 255;        if (b >= 128)        { return b - 256; }        return b; }
+    if (kind == 2) { return v & 255; }
+    if (kind == 3) { var w: int64 := v & 65535;      if (w >= 32768)      { return w - 65536; }      return w; }
+    if (kind == 4) { return v & 65535; }
+    if (kind == 5) { var d: int64 := v & 4294967295; if (d >= 2147483648) { return d - 4294967296; } return d; }
+    if (kind == 6) { return v & 4294967295; }
+    return v;
+  }
+
+  fn cg_narrowKindOfTypeNode(typeNode: int64): int64 {
+    if (typeNode < 0) { return 0; }
+    if (self.cg_nkind(typeNode) != 60) { return 0; }
+    return self.cg_narrowKindOf(self.cg_nsval(typeNode), self.cg_nslen(typeNode));
+  }
+
+  // Breite einer Variablen ueber ihren deklarierten Typnamen — lokal wie
+  // global. Ohne den globalen Zweig bliebe `var g: int8` der eine Weg, auf
+  // dem die Breite weiter durchfiele.
+  fn cg_narrowKindOfVar(name: pchar, nameLen: int64): int64 {
+    var lidx: int64 := self.cg_findLocalIdx(name, nameLen);
+    if (lidx >= 0) {
+      var tb: int64 := self.localTypes + lidx * CG_LOCTYPE_SZ;
+      var tp: pchar := peek64(tb) as pchar;
+      var tl: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+      if (tp == 0 as pchar || tl <= 0) { return 0; }
+      return self.cg_narrowKindOf(tp, tl);
+    }
+    var gidx: int64 := self.cg_findGlobalIdx(name, nameLen);
+    if (gidx >= 0) {
+      var gp: pchar := peek64(self.globalTypeNames + gidx * 16) as pchar;
+      var gl: int64 := peek64(self.globalTypeNames + gidx * 16 + 8);
+      if (gp == 0 as pchar || gl <= 0) { return 0; }
+      return self.cg_narrowKindOf(gp, gl);
+    }
+    return 0;
+  }
+
+  // Einen bereits abgelegten Slot nachtraeglich kuerzen. Parameter kommen aus
+  // dem Register in ihren Slot; die Kuerzung dort nachzuziehen ist billiger,
+  // als jede der sechs Spill-Stellen zu verdoppeln.
+  fn cg_narrowLocalSlot(off: int64, typeNode: int64) {
+    var kind: int64 := self.cg_narrowKindOfTypeNode(typeNode);
+    if (kind == 0) { return; }
+    self.cg_loadRax(off);
+    self.cg_emitNarrowRax(kind);
+    self.cg_storeRax(off);
+  }
+
   // Zeichenkette als NUL-terminierte Datenkonstante ablegen; liefert den Offset.
   fn cg_emitCStrData(s: pchar): int64 {
     var off: int64 := self.dataLen;
@@ -4766,14 +4858,20 @@ pub type Codegen = class {
         self.cg_loadLocalByName(self.cg_nsval(mrgP), self.cg_nslen(mrgP));
         self.cg_emitRangeCheck(mrgIdx, "Parameter"c);
       }
+      // #1151: schmaler Parametertyp an einer Methode.
+      self.cg_narrowLocalSlot(self.cg_findLocal(self.cg_nsval(mrgP), self.cg_nslen(mrgP)),
+                              self.cg_nc0(mrgP));
       mrgP := self.cg_nnext(mrgP);
     }
     var savedMRetRange: int64 := self.curFnRetRange;
     self.curFnRetRange := self.cg_rangeOfTypeNode(self.cg_nc1(ni));
+    var savedMRetNarrow: int64 := self.curFnRetNarrow;          // #1151
+    self.curFnRetNarrow := self.cg_narrowKindOfTypeNode(self.cg_nc1(ni));
     // Generate body
     var body: int64 := self.cg_nc2(ni);
     self.cg_genBlock(body);
     self.curFnRetRange := savedMRetRange;
+    self.curFnRetNarrow := savedMRetNarrow;                     // #1151
     // Implicit return
     self.cg_zeroRax();
     self.cg_emitEpilogue();
@@ -5404,28 +5502,11 @@ pub type Codegen = class {
       if (typeNode >= 0) {
         var tname: pchar := self.cg_nsval(typeNode);
         var tlen: int64 := self.cg_nslen(typeNode);
-        if (self.cg_seq(tname, tlen, "i8", 2)) {
-          // movsx rax, al  — sign-extend byte to qword
-          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBE); self.cg_e8(0xC0);
-        } else if (self.cg_seq(tname, tlen, "u8", 2) ||
-                   self.cg_seq(tname, tlen, "uint8", 5)) {
-          // movzx rax, al  — zero-extend byte to qword  (#1010: uint8 = u8)
-          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);
-        } else if (self.cg_seq(tname, tlen, "i16", 3)) {
-          // movsx rax, ax  — sign-extend word to qword
-          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBF); self.cg_e8(0xC0);
-        } else if (self.cg_seq(tname, tlen, "u16", 3) ||
-                   self.cg_seq(tname, tlen, "uint16", 6)) {
-          // movzx rax, ax  — zero-extend word to qword  (#1010: uint16 = u16)
-          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB7); self.cg_e8(0xC0);
-        } else if (self.cg_seq(tname, tlen, "i32", 3)) {
-          // movsxd rax, eax  — sign-extend dword to qword
-          self.cg_e8(0x48); self.cg_e8(0x63); self.cg_e8(0xC0);
-        } else if (self.cg_seq(tname, tlen, "u32", 3) ||
-                   self.cg_seq(tname, tlen, "uint32", 6)) {
-          // mov eax, eax  — zero-extends to rax automatically on x86-64
-          self.cg_e8(0x89); self.cg_e8(0xC0);
-        }
+        // #1151: eine Stelle fuer alle Breiten. Vorher stand die Kette hier
+        // ausgeschrieben und kannte nur die KURZEN Schreibweisen der
+        // vorzeichenbehafteten Typen: `x as int8` und `x as int16` kuerzten
+        // nichts, `x as i8` schon — obwohl §7 beide als denselben Typ fuehrt.
+        self.cg_emitNarrowRax(self.cg_narrowKindOf(tname, tlen));
         // f64: convert int64 bits in rax to IEEE 754 double via cvtsi2sd
         if (self.cg_seq(tname, tlen, "f64", 3)) {
           // cvtsi2sd xmm0, rax  (F2 48 0F 2A C0)
@@ -9161,6 +9242,9 @@ pub type Codegen = class {
       // vorliegt: `var a: Alt := f(x);` ist zur Uebersetzungszeit unbekannt.
       if (init >= 0) {
         self.cg_emitRangeCheck(self.cg_rangeOfTypeNode(typeNode), "Initialisierung"c);
+        // #1151: auf die deklarierte Breite kuerzen, bevor der Wert im
+        // 64-Bit-Slot landet.
+        self.cg_emitNarrowRax(self.cg_narrowKindOfTypeNode(typeNode));
       }
       // WP-B1: @redundant vars need 3 slots; mark + write all copies
       // Layout: A=off-16 (lowest addr, @x returns this), B=off-8, C=off
@@ -9186,6 +9270,9 @@ pub type Codegen = class {
         var nlen: int64 := self.cg_nslen(lhs);
         // #1097: Zuweisung an eine Variable vom Bereichstyp.
         self.cg_emitRangeCheck(self.cg_rangeOfLocal(name, nlen), "Zuweisung"c);
+        // #1151: Zuweisung an eine schmale Variable — lokal, global oder in
+        // der Closure-Umgebung; alle drei Wege liegen hinter dieser Stelle.
+        self.cg_emitNarrowRax(self.cg_narrowKindOfVar(name, nlen));
         var off: int64 := self.cg_findLocal(name, nlen);
         if (off != 0) {
           // WP-B1: @redundant vars write all 3 copies (A=off-16, B=off-8, C=off)
@@ -9357,6 +9444,9 @@ pub type Codegen = class {
       // beim Aufrufer und traegt den Typ, also muss er hier passen.
       if (expr >= 0) {
         self.cg_emitRangeCheck(self.curFnRetRange, "Rueckgabe"c);
+        // #1151: auf die Breite des Rueckgabetyps kuerzen. Der Aufrufer sieht
+        // nur rax und kann die Breite nicht mehr kennen.
+        self.cg_emitNarrowRax(self.curFnRetNarrow);
       }
       self.cg_emitEpilogue();
 
@@ -10969,12 +11059,19 @@ pub type Codegen = class {
         self.cg_loadLocalByName(self.cg_nsval(rgP), self.cg_nslen(rgP));
         self.cg_emitRangeCheck(rgIdx, "Parameter"c);
       }
+      // #1151: schmaler Parametertyp — der Aufrufer legt einen vollen int64
+      // ins Register, gekuerzt wird am Eintritt.
+      self.cg_narrowLocalSlot(self.cg_findLocal(self.cg_nsval(rgP), self.cg_nslen(rgP)),
+                              self.cg_nc0(rgP));
       rgP := self.cg_nnext(rgP);
     }
 
     // #1097: Bereichstyp des Rueckgabewerts fuer die `return`-Pruefung merken.
     var savedRetRange: int64 := self.curFnRetRange;
     self.curFnRetRange := self.cg_rangeOfTypeNode(retTyNode);
+    // #1151: Breite des Rueckgabetyps ebenso.
+    var savedRetNarrow: int64 := self.curFnRetNarrow;
+    self.curFnRetNarrow := self.cg_narrowKindOfTypeNode(retTyNode);
 
     // WP-25.2: Compat-Warnung + WP-R9/R10/R11: Proxy/Landlock/seccomp am Anfang von 'main'
     if fnlen == 4 {
@@ -11011,6 +11108,7 @@ pub type Codegen = class {
     // WP-EN-04: restore energy level for enclosing scope
     self.fnEnergyLevel := savedEnergy;
     self.curFnRetRange := savedRetRange;   // #1097
+    self.curFnRetNarrow := savedRetNarrow; // #1151
 
     // Restore outer function context
     self.outerFuncName := savedOuterName;
@@ -12234,7 +12332,10 @@ pub type Codegen = class {
         // Write literal initializer directly into data section
         var initNode: int64 := self.cg_nc1(cur);
         if (initNode >= 0 && self.cg_nkind(initNode) == CGN_LIT_INT) {
-          poke64(self.data + doff, self.cg_nival(initNode));
+          // #1151: Der Wert geht hier ohne Codeerzeugung in den Datenbereich —
+          // die Kuerzung muss deshalb der Compiler selbst rechnen.
+          poke64(self.data + doff,
+                 self.cg_narrowConst(self.cg_nival(initNode), self.cg_narrowKindOfTypeNode(gtNode)));
         }
       } else if (k == CGN_CON_DECL) {
         // Populate constant table; evaluate arbitrary constant expressions
@@ -12509,6 +12610,7 @@ pub type Codegen = class {
     self.rangeTypes     := alloc(self.rangeTypeCap * 32);
     self.rangeTypeCount := 0;
     self.curFnRetRange  := 0 - 1;
+    self.curFnRetNarrow := 0;
 
     // WP-BC-40: Profiling entry table (initially empty)
     self.profEntryCap   := 16;

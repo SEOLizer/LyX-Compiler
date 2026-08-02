@@ -400,7 +400,12 @@ BaseIntType         = "int8"  | "i8"
    wurde abgewiesen, `feld: uint8` stillschweigend angenommen (#1010).
 
    `isize` und `usize` standen hier frueher ebenfalls; der Compiler kennt sie
-   nicht (`unknown type in var decl`). *)
+   nicht (`unknown type in var decl`).
+
+   Die kurze Schreibweise der VORZEICHENBEHAFTETEN Typen (`i8`, `i16`, `i32`,
+   `i64`) wurde im var-Deklarator bis 1.0.11D abgewiesen -- als Feldtyp und im
+   `as`-Cast ging sie durch. Das ist dieselbe Asymmetrie, die #1010 fuer die
+   vorzeichenlose Haelfte geschlossen hat; sie ist seit #1151 beseitigt. *)
 
 (* Es gibt in Lyx KEINEN qualifizierten Zugriff. Weder `Modul::Name` noch
    `Modul.Name` ist gueltig -- Symbole importierter Units liegen in einem
@@ -1283,6 +1288,7 @@ Einzelbefunde sind dort verlinkt.
 | Default-Werte, Auswertung | 15.1 | Ein weggelassenes Argument wird durch den Default ersetzt, solange die uebersprungenen Parameter am ENDE stehen. Steht hinter einem Default noch ein Parameter OHNE, laesst sich der Default nicht ueberspringen. Der Ausdruck muss zur Uebersetzungszeit feststehen -- er wird an jeder Aufrufstelle eingesetzt, ein nicht-konstanter liefe sonst je Aufruf erneut. Die Kombination aus benannten Argumenten und uebersprungenen Defaults gibt es nicht. (#1089) |
 | Tupel-Entpacken, geklammerte Form | 12 | `var (q, r) := f();` gibt es nicht -- §12 (TupleUnpackStmt) schreibt die Form OHNE Klammern vor: `var q, r := f();`. Die DokuWiki fuehrt faelschlich die geklammerte. (#1088) |
 | Benannte Argumente, Auswertungsreihenfolge | 15.1 | `F(b: 2, a: 1)` ordnet richtig zu, wertet die Argumente aber in PARAMETERREIHENFOLGE aus, nicht in der geschriebenen. Bei Seiteneffekten in den Argumenten ist das sichtbar. Wo die Deklaration nicht herangezogen werden kann (importiert, extern, variadisch, generisch, Builtin), werden benannte Argumente ABGEWIESEN statt stillschweigend positionell genommen. (#1087) |
+| Schmale Ganzzahltypen, Breite | 7 | `intN`/`uintN` mit N < 64 belegen einen vollen 64-Bit-Slot; gekuerzt wird beim SPEICHERN, vorzeichenbehaftet bei `intN`, vorzeichenlos bei `uintN`. Erfasst sind Initialisierung, Zuweisung, Parameter, Rueckgabe, globale Variablen und der `as`-Cast; Strukturfelder liegen ohnehin in ihrer eigenen Breite. Bis 1.0.11D fand die Kuerzung an KEINER dieser Stellen statt (`var a: int8 := 130` ergab 130 statt -126), und `as int8`/`as int16` kuerzten nur in der kurzen Schreibweise (`as i8`) -- #1151. Ein konstanter Wert, der nicht in die Breite passt, wird gekuerzt und nicht gemeldet. Eine globale Variable mit BERECHNETER Initialisierung bleibt weiterhin still 0 (#1164). |
 | Indexzugriff, Bereichspruefung | 15 | Ein konstanter Index auf eine Variable mit fester Groesse (`int64[N]` oder ein Array-Literal als Initialisierung) wird zur UEBERSETZUNGSZEIT geprueft und ausserhalb der Grenzen abgewiesen -- ohne Schalter. Berechnete Indizes prueft der erzeugte Code nur unter `--runtime-checks`; dann bricht ein Zugriff ausserhalb mit `panic` ab ("index out of bounds"). Der Vergleich ist vorzeichenLOS, ein negativer Index faellt also in denselben Zweig. `@bounds_check(false)` schaltet die Laufzeitpruefung im Geltungsbereich ab. NICHT geprueft wird, wo es keine Laenge gibt: roher Zeiger, `pchar`, Array-Parameter und inline liegende Struct-Felder. Bis 1.0.11D emittierte `--runtime-checks` fuer Indizes gar nichts -- der Zugriff las still den Speicher dahinter (#1156). Nur das x86-64-Backend traegt diese Pruefung; die uebrigen Backends kennen `--runtime-checks` insgesamt nicht. |
 | Bereichstyp, Pruefzeitpunkt | 7 | `type X = int64 range LO..HI;` wird geprueft, wo ein Wert den Typ ANNIMMT: Initialisierung, Zuweisung (lokal wie global), Parameter, Rueckgabe und Strukturfeld -- bei Funktionen wie bei Methoden. Steht der Wert zur UEBERSETZUNGSZEIT fest (Literal, `con`, konstanter Ausdruck), meldet der Compiler ihn dort (#1082); sonst prueft der erzeugte Code zur Laufzeit und bricht mit `panic` ab (#1097). Die Laufzeitpruefung haengt NICHT an `--runtime-checks`: der Bereich ist der einzige Inhalt dieses Typs. Grenzen sind einschliesslich, der Vergleich vorzeichenbehaftet. Nicht erfasst: ein Wert, der ueber einen `as`-Cast oder einen Zeiger am Typ vorbei geschrieben wird. |
 
