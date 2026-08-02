@@ -564,6 +564,12 @@ pub type Codegen = class {
   globalTypeNames: int64;
   // #1094: Laenge des zuletzt von cg_staticTypeName gelieferten Typnamens.
   stnLen:         int64;
+  // #1097: Bereichstypen {namePtr:8, nameLen:8, lo:8, hi:8} = 32 Byte je Eintrag.
+  rangeTypes:      int64;
+  rangeTypeCount:  int64;
+  rangeTypeCap:    int64;
+  // #1097: Bereichstyp des Rueckgabewerts der gerade erzeugten Funktion (-1 = keiner).
+  curFnRetRange:   int64;
 
   // WP-BC-40: Compile-time profiling entry table (x86_64 only)
   // Entry: {namePtr:8 (src ptr), nameLen:8, dataOff:8, nameDataOff:8} = 32 bytes
@@ -2591,6 +2597,28 @@ pub type Codegen = class {
       cur := self.cg_nnext(cur);
     }
   }
+  // #1097: Bereichstypen einsammeln, BEVOR Funktionen erzeugt werden — eine
+  // hinter der ersten Funktion deklarierte Typdeklaration waere sonst zur
+  // Pruefzeit noch unbekannt, und die Zusicherung haenge an der Reihenfolge im
+  // Quelltext.
+  fn cg_collectRangeTypes(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      if (self.cg_nkind(cur) == CGN_TYPE_DECL && (self.cg_nival(cur) & 4) != 0) {
+        var rn: int64 := self.cg_nc1(cur);
+        if (rn >= 0) {
+          var loN: int64 := self.cg_nc0(rn);
+          var hiN: int64 := self.cg_nc1(rn);
+          if (loN >= 0 && hiN >= 0) {
+            self.cg_addRangeType(self.cg_nsval(cur), self.cg_nslen(cur),
+                                 self.cg_nival(loN), self.cg_nival(hiN));
+          }
+        }
+      }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
   fn cg_registerFnAlias(name: pchar, nameLen: int64) {
     if (self.fnAliasCount >= self.fnAliasCap) {
       var nc: int64 := self.fnAliasCap * 2;
@@ -3913,6 +3941,143 @@ pub type Codegen = class {
   fn cg_getBaseRelocCount(): int64 { return self.baseRelocCount; }
 
   // Helper: get class index for object node (IDENT, FIELD chain, or INDEX for struct arrays)
+  // #1097: Bereichstyp-Registry. `type X = int64 range LO..HI;` sicherte bisher
+  // nur zu, was zur UEBERSETZUNGSZEIT feststand — ein berechneter Wert, ein
+  // Parameter, eine Rueckgabe liefen ungeprueft durch. Die Grenzen stehen im
+  // Typ, also muss die Pruefung dort stattfinden, wo ein Wert diesen Typ
+  // ANNIMMT, und nicht nur dort, wo sie sich statisch ausrechnen laesst.
+  fn cg_addRangeType(name: pchar, nameLen: int64, lo: int64, hi: int64) {
+    if (self.rangeTypeCount >= self.rangeTypeCap) {
+      var nc: int64 := self.rangeTypeCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.rangeTypes, self.rangeTypeCount * 32);
+      self.rangeTypes := nb;
+      self.rangeTypeCap := nc;
+    }
+    var base: int64 := self.rangeTypes + self.rangeTypeCount * 32;
+    poke64(base,      name as int64);
+    poke64(base + 8,  nameLen);
+    poke64(base + 16, lo);
+    poke64(base + 24, hi);
+    self.rangeTypeCount += 1;
+  }
+
+  fn cg_findRangeType(name: pchar, nameLen: int64): int64 {
+    if (nameLen <= 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < self.rangeTypeCount) {
+      var base: int64 := self.rangeTypes + i * 32;
+      var p: pchar := peek64(base) as pchar;
+      var n: int64 := peek64(base + 8);
+      if (self.cg_seq(p, n, name, nameLen)) { return i; }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // Bereichstyp eines Typknotens (NK_TYPE_NAME); -1 wenn keiner.
+  fn cg_rangeOfTypeNode(typeNode: int64): int64 {
+    if (typeNode < 0) { return 0 - 1; }
+    if (self.cg_nkind(typeNode) != 60) { return 0 - 1; }
+    return self.cg_findRangeType(self.cg_nsval(typeNode), self.cg_nslen(typeNode));
+  }
+
+  // Bereichstyp einer Variablen ueber ihren deklarierten Typnamen — lokal wie
+  // global. Eine globale Variable vom Bereichstyp waere sonst der eine Weg,
+  // auf dem die Zusicherung weiter durchfiele.
+  fn cg_rangeOfLocal(name: pchar, nameLen: int64): int64 {
+    var lidx: int64 := self.cg_findLocalIdx(name, nameLen);
+    if (lidx >= 0) {
+      var tb: int64 := self.localTypes + lidx * CG_LOCTYPE_SZ;
+      var tp: pchar := peek64(tb) as pchar;
+      var tl: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+      if (tp == 0 as pchar || tl <= 0) { return 0 - 1; }
+      return self.cg_findRangeType(tp, tl);
+    }
+    var gidx: int64 := self.cg_findGlobalIdx(name, nameLen);
+    if (gidx >= 0) {
+      var gp: pchar := peek64(self.globalTypeNames + gidx * 16) as pchar;
+      var gl: int64 := peek64(self.globalTypeNames + gidx * 16 + 8);
+      if (gp == 0 as pchar || gl <= 0) { return 0 - 1; }
+      return self.cg_findRangeType(gp, gl);
+    }
+    return 0 - 1;
+  }
+
+  // Bereichstyp eines Strukturfeldes ueber seinen deklarierten Typnamen.
+  fn cg_rangeOfField(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
+    if (classIdx < 0) { return 0 - 1; }
+    var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var p: pchar := peek64(fb) as pchar;
+      var n: int64 := peek64(fb + CG_CFIELD_OFF_FIELDLEN);
+      if (self.cg_seq(p, n, fieldName, fieldLen)) {
+        var tp: pchar := peek64(fb + CG_CFIELD_OFF_TYPENAMEPTR) as pchar;
+        var tl: int64 := peek64(fb + CG_CFIELD_OFF_TYPENAMELEN);
+        if (tp == 0 as pchar || tl <= 0) { return 0 - 1; }
+        return self.cg_findRangeType(tp, tl);
+      }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // Zeichenkette als NUL-terminierte Datenkonstante ablegen; liefert den Offset.
+  fn cg_emitCStrData(s: pchar): int64 {
+    var off: int64 := self.dataLen;
+    var n: int64 := StrLen(s);
+    var i: int64 := 0;
+    while (i < n) { self.cg_edata(StrCharAt(s, i)); i += 1; }
+    self.cg_edata(0);
+    return off;
+  }
+
+  // #1097: rax gegen die Grenzen des Bereichstyps pruefen; ausserhalb → panic.
+  //
+  // rax bleibt erhalten, die Pruefung benutzt nur rcx. Sie haengt NICHT an
+  // --runtime-checks: eine Zusicherung, die von einem Uebersetzungsschalter
+  // abhaengt, ist eine Zusicherung mit Fussnote, und der Bereich ist der
+  // einzige Inhalt dieses Typs.
+  fn cg_emitRangeCheck(idx: int64, ctx: pchar) {
+    if (idx < 0) { return; }
+    var base: int64 := self.rangeTypes + idx * 32;
+    var tnp: pchar := peek64(base) as pchar;
+    var tnl: int64 := peek64(base + 8);
+    var lo: int64 := peek64(base + 16);
+    var hi: int64 := peek64(base + 24);
+    // Meldung zur Uebersetzungszeit bauen: sie nennt den Typ, die Grenzen und
+    // die Stelle — "ausserhalb des Bereichs" allein liesse offen, welcher.
+    var msg: pchar := StrConcat("Bereichstyp "c, StrSub(tnp, 0, tnl));
+    msg := StrConcat(msg, ": Wert ausserhalb von "c);
+    msg := StrConcat(msg, IntToStr(lo));
+    msg := StrConcat(msg, ".."c);
+    msg := StrConcat(msg, IntToStr(hi));
+    msg := StrConcat(msg, " ("c);
+    msg := StrConcat(msg, ctx);
+    msg := StrConcat(msg, ")\n"c);
+    var msgOff: int64 := self.cg_emitCStrData(msg);
+    // mov rcx, lo ; cmp rax, rcx ; jl fail
+    self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(lo);
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);   // cmp rax, rcx
+    self.cg_e8(0x0F); self.cg_e8(0x8C);                     // jl  .fail
+    var jFail: int64 := self.codeLen;
+    self.cg_e32(0);
+    // mov rcx, hi ; cmp rax, rcx ; jle ok
+    self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(hi);
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);   // cmp rax, rcx
+    self.cg_e8(0x0F); self.cg_e8(0x8E);                     // jle .ok
+    var jOk: int64 := self.codeLen;
+    self.cg_e32(0);
+    poke32(self.code + jFail, self.codeLen - jFail - 4);
+    self.cg_emitLeaRdiData(msgOff);
+    self.cg_emitPanicBody();
+    poke32(self.code + jOk, self.codeLen - jOk - 4);
+  }
+
   // #1094: Kanonische Nummer eines eingebauten Typnamens, 0 = kein eingebauter
   // Typ. Die Schreibvarianten muessen dieselbe Nummer bekommen, sonst waere
   // `x is uint64` bei `var x: u64` falsch — sie bezeichnen denselben Typ.
@@ -4551,9 +4716,24 @@ pub type Codegen = class {
       mspOff += 8;
       param := self.cg_nnext(param);
     }
+    // #1097: Bereichstyp an Methoden-Parametern und -Rueckgabe. Ohne diese
+    // Stelle gaelte die Zusicherung fuer freie Funktionen und nicht fuer
+    // Methoden -- eine Zusicherung, die vom Ort der Deklaration abhaengt.
+    var mrgP: int64 := self.cg_nc0(ni);
+    while (mrgP != -1) {
+      var mrgIdx: int64 := self.cg_rangeOfTypeNode(self.cg_nc0(mrgP));
+      if (mrgIdx >= 0) {
+        self.cg_loadLocalByName(self.cg_nsval(mrgP), self.cg_nslen(mrgP));
+        self.cg_emitRangeCheck(mrgIdx, "Parameter"c);
+      }
+      mrgP := self.cg_nnext(mrgP);
+    }
+    var savedMRetRange: int64 := self.curFnRetRange;
+    self.curFnRetRange := self.cg_rangeOfTypeNode(self.cg_nc1(ni));
     // Generate body
     var body: int64 := self.cg_nc2(ni);
     self.cg_genBlock(body);
+    self.curFnRetRange := savedMRetRange;
     // Implicit return
     self.cg_zeroRax();
     self.cg_emitEpilogue();
@@ -8931,6 +9111,12 @@ pub type Codegen = class {
         }
         }
       }
+      // #1097: Bereichstyp — der Wert steht in rax, bevor er in die Variable
+      // geht. Geprueft wird hier und nicht in sema, weil der Wert erst jetzt
+      // vorliegt: `var a: Alt := f(x);` ist zur Uebersetzungszeit unbekannt.
+      if (init >= 0) {
+        self.cg_emitRangeCheck(self.cg_rangeOfTypeNode(typeNode), "Initialisierung"c);
+      }
       // WP-B1: @redundant vars need 3 slots; mark + write all copies
       // Layout: A=off-16 (lowest addr, @x returns this), B=off-8, C=off
       var isRedundant: int64 := (self.cg_nival(ni) & 4) != 0;
@@ -8953,6 +9139,8 @@ pub type Codegen = class {
         self.cg_genExpr(rhs);
         var name: pchar := self.cg_nsval(lhs);
         var nlen: int64 := self.cg_nslen(lhs);
+        // #1097: Zuweisung an eine Variable vom Bereichstyp.
+        self.cg_emitRangeCheck(self.cg_rangeOfLocal(name, nlen), "Zuweisung"c);
         var off: int64 := self.cg_findLocal(name, nlen);
         if (off != 0) {
           // WP-B1: @redundant vars write all 3 copies (A=off-16, B=off-8, C=off)
@@ -9003,6 +9191,9 @@ pub type Codegen = class {
         } else {
           self.cg_genExpr(rhs);
         }
+        // #1097: Feld vom Bereichstyp — der Wert steht in rax, bevor er in das
+        // Feld geht.
+        self.cg_emitRangeCheck(self.cg_rangeOfField(classIdx, fieldName, fieldLen), "Feld"c);
         self.cg_pushRax();
         self.cg_genExpr(obj);
         var foff: int64 := -1;
@@ -9110,6 +9301,11 @@ pub type Codegen = class {
         } else {
           self.cg_zeroRax();
         }
+      }
+      // #1097: Rueckgabe vom Bereichstyp. Der Wert steht in rax; danach ist er
+      // beim Aufrufer und traegt den Typ, also muss er hier passen.
+      if (expr >= 0) {
+        self.cg_emitRangeCheck(self.curFnRetRange, "Rueckgabe"c);
       }
       self.cg_emitEpilogue();
 
@@ -10647,6 +10843,23 @@ pub type Codegen = class {
       param := self.cg_nnext(param);
     }
 
+    // #1097: Parameter vom Bereichstyp pruefen, nachdem alle abgelegt sind.
+    // Der Aufrufer kann einen beliebigen int64 uebergeben haben; die Grenzen
+    // stehen im Typ des PARAMETERS, also gehoert die Pruefung an den Eintritt.
+    var rgP: int64 := self.cg_nc0(ni);
+    while (rgP != -1) {
+      var rgIdx: int64 := self.cg_rangeOfTypeNode(self.cg_nc0(rgP));
+      if (rgIdx >= 0) {
+        self.cg_loadLocalByName(self.cg_nsval(rgP), self.cg_nslen(rgP));
+        self.cg_emitRangeCheck(rgIdx, "Parameter"c);
+      }
+      rgP := self.cg_nnext(rgP);
+    }
+
+    // #1097: Bereichstyp des Rueckgabewerts fuer die `return`-Pruefung merken.
+    var savedRetRange: int64 := self.curFnRetRange;
+    self.curFnRetRange := self.cg_rangeOfTypeNode(retTyNode);
+
     // WP-25.2: Compat-Warnung + WP-R9/R10/R11: Proxy/Landlock/seccomp am Anfang von 'main'
     if fnlen == 4 {
       if StrCharAt(fname, 0) == 109 && StrCharAt(fname, 1) == 97 &&
@@ -10681,6 +10894,7 @@ pub type Codegen = class {
 
     // WP-EN-04: restore energy level for enclosing scope
     self.fnEnergyLevel := savedEnergy;
+    self.curFnRetRange := savedRetRange;   // #1097
 
     // Restore outer function context
     self.outerFuncName := savedOuterName;
@@ -11800,6 +12014,7 @@ pub type Codegen = class {
     // Pre-pass: collect all user-defined functions returning f64 for cg_isF64Expr.
     self.cg_collectF64Funcs(head);
     self.cg_collectMethodAliases(head);   // B2: method-Typ-Aliase registrieren
+    self.cg_collectRangeTypes(head);      // #1097: Bereichstypen samt Grenzen
 
     var cur: int64 := head;
     while (cur != -1) {
@@ -12172,6 +12387,12 @@ pub type Codegen = class {
     self.globalTypeNames := alloc(self.globalVarCap * 16);
     self.globalVarCount := 0;
     self.stnLen         := 0;
+
+    // #1097: Bereichstyp-Registry
+    self.rangeTypeCap   := 16;
+    self.rangeTypes     := alloc(self.rangeTypeCap * 32);
+    self.rangeTypeCount := 0;
+    self.curFnRetRange  := 0 - 1;
 
     // WP-BC-40: Profiling entry table (initially empty)
     self.profEntryCap   := 16;
