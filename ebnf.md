@@ -1,6 +1,6 @@
-# Lyx 1.0.13P — Canonical EBNF Grammar
+# Lyx 1.0.13Q — Canonical EBNF Grammar
 
-> Stand 2026-08-08, gegen lyxc 1.0.13P geprueft. Die Keyword-Liste in
+> Stand 2026-08-08, gegen lyxc 1.0.13Q geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -426,11 +426,13 @@ ArrayType           = "array" "[" Type "]"
 
 ParallelArrayType   = "ParallelArray" "<" Type ">" ;
 
-TupleType           = "(" Type "," Type { "," Type } ")" ;
+TupleType           = "(" Type "," Type ")" ;
 
 (* Die eckige Schreibweise `[T, T]` ist gleichbedeutend und bleibt gueltig;
-   der Bestand benutzt sie. Mehr als ZWEI Elemente werden abgewiesen: die
-   Aufrufkonvention traegt zwei Rueckgabewerte (rax, rdx). (#1088) *)
+   der Bestand benutzt sie. GENAU ZWEI Elemente: die Aufrufkonvention traegt
+   zwei Rueckgabewerte (rax, rdx). Die Produktion liess bis 1.0.13P beliebig
+   viele zu, der Compiler wies ab drei ab -- jetzt sagen beide dasselbe.
+   (#1088, #1122) *)
 
 (* Funktions- und Methodenzeiger (seit 1.0.4A). In der Praxis ueber einen
    Typalias verwendet:
@@ -1310,6 +1312,7 @@ Einzelbefunde sind dort verlinkt.
 | `static` an Feldern | 9 | `static fn` gibt es (Aufruf ueber den Typnamen, `self` darin abgewiesen). `static` an einem FELD wird abgewiesen: der Zugriff hiesse `A.v`, und diese Schreibweise bezeichnet in Lyx bereits den Byte-OFFSET des Feldes -- std/string.lyx nutzt sie so (`StringBuilder.capacity`). Welche Bedeutung gelten soll, ist eine Sprachentscheidung. Eine Klassenkonstante wird als `con` auf Modulebene geschrieben. (#1090) |
 | Default-Werte, Auswertung | 15.1 | Ein weggelassenes Argument wird durch den Default ersetzt, solange die uebersprungenen Parameter am ENDE stehen. Steht hinter einem Default noch ein Parameter OHNE, laesst sich der Default nicht ueberspringen. Der Ausdruck muss zur Uebersetzungszeit feststehen -- er wird an jeder Aufrufstelle eingesetzt, ein nicht-konstanter liefe sonst je Aufruf erneut. Die Kombination aus benannten Argumenten und uebersprungenen Defaults gibt es nicht. (#1089) |
 | Tupel-Entpacken, geklammerte Form | 12 | `var (q, r) := f();` gibt es nicht -- §12 (TupleUnpackStmt) schreibt die Form OHNE Klammern vor: `var q, r := f();`. Die DokuWiki fuehrt faelschlich die geklammerte. (#1088) |
+| Tupel, Stelligkeit und Elementtypen | 7 | Ein Tupel hat GENAU ZWEI Elemente -- die Aufrufkonvention traegt zwei Rueckgabewerte (`rax`, `rdx`). Mehr wird beim Parsen abgewiesen; die Grammatik in §7 nannte bis 1.0.13P faelschlich `{ "," Type }`. Als Element sind auch Struct- und Klassentypen zugelassen: der Slot haelt den ZEIGER, wie bei jeder Struct-Variablen sonst. Bis 1.0.13P trug der entpackte Name keinen Typ -- der Zeiger kam an, aber `a.v` fand kein Feld und lieferte still `0` (#1122). Der Typ wird jetzt aus dem deklarierten Rueckgabetyp des Aufgerufenen uebernommen, bei freien Funktionen wie bei Methoden (auch geerbten). Ist der Aufgerufene dem Codegen unbekannt (importiert, Builtin), bleibt der Name typlos wie bisher. |
 | Benannte Argumente, Auswertungsreihenfolge | 15.1 | `F(b: 2, a: 1)` ordnet richtig zu, wertet die Argumente aber in PARAMETERREIHENFOLGE aus, nicht in der geschriebenen. Bei Seiteneffekten in den Argumenten ist das sichtbar. Wo die Deklaration nicht herangezogen werden kann (importiert, extern, variadisch, generisch, Builtin), werden benannte Argumente ABGEWIESEN statt stillschweigend positionell genommen. (#1087) |
 | Einheitentypen, Semantik | 11 | `utype N: Dim = Faktor` wirkt: bei Zuweisung zwischen Einheiten DERSELBEN Dimension rechnet der Compiler mit dem Faktorverhaeltnis um — erst multiplizieren, dann ganzzahlig teilen, `Km` nach `M` also exakt, `M` nach `Km` abschneidend wie die Ganzzahldivision sonst. Die DIMENSION wird geprueft: Zuweisung ueber Dimensionsgrenzen, Addition zweier Dimensionen und das Verrechnen mit einer dimensionslosen Zahl werden abgewiesen. Erlaubt bleiben ein Literal als Wert (`var a: Km := 2`), die Skalierung mit einer Zahl (`a * 3` behaelt die Einheit) und der `as`-Cast als bewusster Fluchtweg. `range LO..HI` bricht ausserhalb mit `panic` ab, `wraps LO..HI` rechnet in den Bereich zurueck; Grenzen einschliesslich, konstante Werte meldet der Compiler sofort. Bis 1.0.13D war `utype` ein Typalias mit dekorativem Faktor, und `range`/`wraps` parsten gar nicht (#1110). NICHT gerechnet werden abgeleitete Dimensionen: `dim Speed = Meter / Second` wird angenommen, aber `laenge / zeit` ergibt keine `Speed` — das Ergebnis gilt als dimensionslos, und `utype`-Werte sind ganzzahlig. |
 | Array als Funktionsparameter | 6 | `fn F(a: int64[4])` uebergibt den ZEIGER auf die Ablage: der Callee liest und schreibt denselben Speicher, eine Zuweisung darin ist beim Aufrufer sichtbar. Die deklarierte Groesse wird mitgenommen, `len(a)` liefert sie, und die Bereichspruefung unter `--runtime-checks` (#1156) greift auch hier. Gilt fuer alle Uebergabewege: Register, Stack (ab dem siebten Argument) und Methodenparameter. Bis 1.0.13F fehlte im Callee die Merkung "das ist ein Array" — der Indexzugriff fiel in den Zweig fuer einen rohen Zeiger, lieferte lesend eine Adresse und schrieb ins Leere (#1115). Die Schreibweise `array[T]` ist als Parametertyp weiterhin nicht zugelassen. |

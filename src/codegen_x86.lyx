@@ -509,6 +509,14 @@ pub type Codegen = class {
   // expression's static class be resolved (retName -> cg_findClass at lookup).
   fnRetList:  int64;
   fnRetCount: int64;
+  // #1122: Elementtypen eines TUPEL-Rueckgabetyps, je Funktion bzw. je
+  // gemangelter Methode. Die gewoehnliche Rueckgabetyp-Registry haelt EINEN
+  // Namen; ein Tupel hat zwei, und ohne sie blieb der entpackte Wert ohne
+  // Typ — `a.v` fand kein Feld und lieferte still 0.
+  // Eintrag (48 Byte): {namePtr, nameLen, t0Ptr, t0Len, t1Ptr, t1Len}.
+  fnTupRetList:  int64;
+  fnTupRetCount: int64;
+  fnTupRetCap:   int64;
   fnRetCap:   int64;
   // B2: method-Typ-Alias-Namen (Registry für fat-pointer-Detektion)
   methodAliasList:  int64;
@@ -2503,6 +2511,39 @@ pub type Codegen = class {
     self.fnRetCount += 1;
   }
 
+  // #1122: die beiden Elementtypen eines Tupel-Rueckgabetyps vermerken.
+  fn cg_registerTupleRet(name: pchar, nameLen: int64,
+                         t0: pchar, t0Len: int64, t1: pchar, t1Len: int64) {
+    if (self.fnTupRetCount >= self.fnTupRetCap) {
+      var nc: int64 := self.fnTupRetCap * 2;
+      var nb: int64 := alloc(nc * 48);
+      memcpy(nb, self.fnTupRetList, self.fnTupRetCount * 48);
+      self.fnTupRetList := nb;
+      self.fnTupRetCap  := nc;
+    }
+    var base: int64 := self.fnTupRetList + self.fnTupRetCount * 48;
+    poke64(base,      name as int64);
+    poke64(base + 8,  nameLen);
+    poke64(base + 16, t0 as int64);
+    poke64(base + 24, t0Len);
+    poke64(base + 32, t1 as int64);
+    poke64(base + 40, t1Len);
+    self.fnTupRetCount += 1;
+  }
+
+  // #1122: Eintrag suchen; liefert die Basisadresse des Eintrags oder -1.
+  fn cg_findTupleRet(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.fnTupRetCount) {
+      var base: int64 := self.fnTupRetList + i * 48;
+      var n: pchar := peek64(base) as pchar;
+      var l: int64 := peek64(base + 8);
+      if (self.cg_seq(n, l, name, nameLen) != 0) { return base; }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
   // Operator overloading (Stage 2c): class-layout index of a function's return
   // type, or -1 if the function is unknown or doesn't return a class.
   // #1058: Traegt die Funktion `name` den deklarierten Rueckgabetyp `tname`?
@@ -2734,6 +2775,19 @@ pub type Codegen = class {
           if (rlen > 0) {
             self.cg_registerFuncRet(self.cg_nsval(cur), self.cg_nslen(cur), rname, rlen);
           }
+          // #1122: Tupel-Rueckgabe traegt zwei Typen — der Knoten selbst hat
+          // keinen Namen, die Elementtypen haengen an c0 und dessen next.
+          if (self.cg_nkind(retNi) == CGN_TYPE_TUPLE) {
+            var e0: int64 := self.cg_nc0(retNi);
+            if (e0 >= 0) {
+              var e1: int64 := self.cg_nnext(e0);
+              if (e1 >= 0) {
+                self.cg_registerTupleRet(self.cg_nsval(cur), self.cg_nslen(cur),
+                                         self.cg_nsval(e0), self.cg_nslen(e0),
+                                         self.cg_nsval(e1), self.cg_nslen(e1));
+              }
+            }
+          }
         }
       }
       // Stage 2c (methods): record class methods' return types under their
@@ -2744,6 +2798,23 @@ pub type Codegen = class {
         var method: int64 := self.cg_nc1(cur);
         while (method != -1) {
           var mRetNi: int64 := self.cg_nc1(method);
+          if (mRetNi >= 0 && self.cg_nkind(mRetNi) == CGN_TYPE_TUPLE) {
+            // #1122: dieselbe Merkung fuer Methoden, unter dem gemangelten Namen.
+            var me0: int64 := self.cg_nc0(mRetNi);
+            if (me0 >= 0) {
+              var me1: int64 := self.cg_nnext(me0);
+              if (me1 >= 0) {
+                var mlc: int64 := alloc(8);
+                var mmb: int64 := self.cg_mangleInto(cln, clnLen, self.cg_nsval(method), self.cg_nslen(method), mlc);
+                var mmbLen: int64 := peek64(mlc);
+                free(mlc, 8);
+                self.cg_registerTupleRet(mmb as pchar, mmbLen,
+                                         self.cg_nsval(me0), self.cg_nslen(me0),
+                                         self.cg_nsval(me1), self.cg_nslen(me1));
+                self.cg_trackTempBuf(mmb, mmbLen + 1);
+              }
+            }
+          }
           if (mRetNi >= 0) {
             var mrn: pchar := self.cg_nsval(mRetNi);
             var mrl: int64 := self.cg_nslen(mRetNi);
@@ -10684,17 +10755,67 @@ pub type Codegen = class {
     var name1: pchar := self.cg_nsval(ni);
     var len1:  int64 := self.cg_nslen(ni);
     var off1:  int64 := self.cg_addLocal(name1, len1);
+    var idx1:  int64 := self.localCount - 1;
 
     var secondNode: int64 := self.cg_nc0(ni);
     var name2: pchar := self.cg_nsval(secondNode);
     var len2:  int64 := self.cg_nslen(secondNode);
     var off2:  int64 := self.cg_addLocal(name2, len2);
+    var idx2:  int64 := self.localCount - 1;
+
+    // #1122: Der Typ der beiden Namen steht nirgends im Quelltext -- die
+    // Schreibweise `var a, b := F();` traegt keine Annotation. Ohne Vermerk
+    // blieb der Slot typlos: `a.v` fand keine Klasse, bekam Feldoffset -1 und
+    // lieferte still 0, obwohl der ZEIGER korrekt ankam. Also den deklarierten
+    // Elementtyp des Aufgerufenen uebernehmen.
+    var initNi: int64 := self.cg_nc1(ni);
+    self.cg_applyTupleElemTypes(initNi, idx1, idx2);
 
     // Evaluate init (function call) → rax = first, rdx = second
-    self.cg_genExpr(self.cg_nc1(ni));
+    self.cg_genExpr(initNi);
 
     self.cg_storeRax(off1);
     self.cg_storeRdx(off2);
+  }
+
+  // #1122: Elementtypen des Tupel-Rueckgabetyps an den beiden entpackten
+  // Namen vermerken. Ist der Aufgerufene unbekannt (Builtin, importiert, kein
+  // Aufruf), bleibt es beim bisherigen Zustand -- die Slots bleiben typlos,
+  // wie sie es vorher immer waren.
+  fn cg_applyTupleElemTypes(initNi: int64, idx1: int64, idx2: int64) {
+    if (initNi < 0) { return; }
+    if (self.cg_nkind(initNi) != CGN_CALL) { return; }
+    var entry: int64 := 0 - 1;
+    var callKind: int64 := self.cg_nival(initNi);
+    if (callKind == 0) {
+      entry := self.cg_findTupleRet(self.cg_nsval(initNi), self.cg_nslen(initNi));
+    } else if (callKind == 1) {
+      // Methodenaufruf: der Eintrag steht unter "Klasse_Methode". Massgeblich
+      // ist die Klasse, die die Methode DEKLARIERT (#1120) -- bei einer
+      // geerbten Methode liegt der Rueckgabetyp beim Elternteil.
+      var recvNi: int64 := self.cg_nc0(initNi);
+      var recvCi: int64 := self.cg_exprClassName(recvNi);
+      if (recvCi < 0 && recvNi >= 0 && self.cg_nkind(recvNi) == CGN_IDENT) {
+        // `TypeName.M()`: der Empfaenger ist die KLASSE selbst, kein Wert —
+        // cg_exprClassName findet dafuer nichts. Wie in cg_genCall gilt der
+        // Name nur dann als Typ, wenn es keine gleichnamige lokale Variable gibt.
+        if (self.cg_findLocalIdx(self.cg_nsval(recvNi), self.cg_nslen(recvNi)) < 0) {
+          recvCi := self.cg_findClass(self.cg_nsval(recvNi), self.cg_nslen(recvNi));
+        }
+      }
+      if (recvCi < 0) { return; }
+      var ownCi: int64 := self.cg_findMethodOwner(recvCi, self.cg_nsval(initNi), self.cg_nslen(initNi));
+      if (ownCi >= 0) { recvCi := ownCi; }
+      var lc: int64 := alloc(8);
+      var mb: int64 := self.cg_buildMethodMangled(recvCi, self.cg_nsval(initNi), self.cg_nslen(initNi), lc);
+      var mbLen: int64 := peek64(lc);
+      free(lc, 8);
+      entry := self.cg_findTupleRet(mb as pchar, mbLen);
+      self.cg_trackTempBuf(mb, mbLen + 1);
+    }
+    if (entry < 0) { return; }
+    self.cg_setLocalType(idx1, peek64(entry + 16) as pchar, peek64(entry + 24));
+    self.cg_setLocalType(idx2, peek64(entry + 32) as pchar, peek64(entry + 40));
   }
 
   // WP-EN-05: copy-unrolling for range-based for.
@@ -13106,6 +13227,9 @@ pub type Codegen = class {
     self.fnRetCap   := 64;
     self.fnRetList  := alloc(self.fnRetCap * 32);
     self.fnRetCount := 0;
+    self.fnTupRetCap   := 64;                     // #1122
+    self.fnTupRetList  := alloc(self.fnTupRetCap * 48);
+    self.fnTupRetCount := 0;
     self.methodAliasCap   := 64;
     self.methodAliasList  := alloc(self.methodAliasCap * 16);
     self.methodAliasCount := 0;
