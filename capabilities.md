@@ -108,6 +108,12 @@ Zwei Festlegungen, die sich nicht aus der Tabelle ergeben:
 * **`rename` verlangt `fs.create` UND `fs.delete`.** Umbenennen legt am Ziel an
   und entfernt an der Quelle; mit nur einer der beiden waere es ein Weg, ohne
   `fs.delete` zu loeschen.
+* **Optionen der eigenen Verbindung gehören zur Netzwerk-Capability.**
+  `setsockopt`, `getsockopt`, `getsockname` und `getpeername` sind mit jeder
+  `network.*`-Capability erlaubt: wer eine Verbindung aufbauen darf, darf ihre
+  Puffergrößen und Zeitgrenzen einstellen und wissen, mit wem er spricht. Ohne
+  `setsockopt` stirbt jeder TLS-Handshake, weil OpenSSL `TCP_ULP` setzt
+  (#1193).
 * **Metadaten lesen und schreiben sind getrennt.** `chmod` und `chown` hängen
   an `fs.perm`, nicht an `fs.meta` — wer nur ein Verzeichnis auflisten will,
   soll nicht stillschweigend Rechte umschreiben dürfen (#1188).
