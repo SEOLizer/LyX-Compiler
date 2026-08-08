@@ -3,6 +3,14 @@
 # Der Lyx-Compiler ist vollständig selbstkompilierend (100% self-hosted).
 # Quelle:  src/lyxc.lyx
 # Seed:    src/lyxc_bootstrap  (singularitätsverifiziertes Binary)
+#
+# Der Seed muss neu verankert werden, sobald sich die AUSGABE des Codegens
+# ändert — nicht erst beim Versionsbump. `make singularity` ist der Detektor:
+# S3 (Seed → Quelle) und S4 (S3 → Quelle) laufen dann auseinander, weil S3 die
+# Bytes des alten Codegens trägt. Der Seed war bis 1.0.12A auf 1.0.7B stehen
+# geblieben und belegte damit nichts mehr (#1167). Verankern heißt: den
+# Fixpunkt (gen2 == gen3 == gen4) nach src/lyxc_bootstrap kopieren, dann
+# `make singularity` — sie muss SINGULAR melden.
 
 SEED := src/lyxc_bootstrap
 SRC  := src/lyxc.lyx
@@ -13,7 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.12A
+VERSION   := 1.0.13A
+VERSION_DATE := 2026-08-08
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -252,6 +261,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
+	@echo "OK"
+	@echo "--- Versionsangaben stimmen ueberein ---"
+	@bash tests/version_consistency_test.sh
 	@echo "OK"
 	@echo "--- Schmale Ganzzahltypen kuerzen beim Speichern (20 Pruefungen) ---"
 	@bash tests/int_width_test.sh
