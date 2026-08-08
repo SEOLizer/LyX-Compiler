@@ -2,6 +2,39 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — Tupel-Rückgabe aus Methoden lieferte Müll (#1121)
+
+```lyx
+type C = class { v: int64; fn Pair(): (int64, int64) { return (3, 6); } };
+var a, b := c.Pair();   // a = 3, b = 140726350547195
+```
+
+Der zweite Wert war Speichermüll — wechselnd, adressartig, ohne jede Meldung
+beim Übersetzen. Bei freien Funktionen lief dieselbe Rückgabe seit #1088
+korrekt; betroffen waren alle Methodenarten (Klasse, `struct`, `static`,
+`virtual`).
+
+**Ursache:** nicht die im Issue vermutete Registerkonkurrenz zwischen `self`
+und der Zwei-Register-Rückgabe, sondern eine nicht mitgezogene Kopie.
+`cg_genFuncDecl` erkennt den Tupel-Rückgabetyp und setzt
+`funcHasTupleReturn`; `cg_genMethodDecl` tat das nie. Ohne die Merkung legte
+`return (3, 6)` nur `rax` an — `rdx` trug, was zufällig darin stand, und der
+Aufrufer las daraus seinen zweiten Wert. Die Merkung blieb dabei auf dem
+Stand der zuletzt übersetzten *Funktion* stehen, weshalb der Fehler mal
+plausibel und mal offensichtlich aussah.
+
+**Fix:** dieselbe Erkennung in `cg_genMethodDecl`. Der Parser baut eine
+Methode als gewöhnlichen Funktionsknoten (`ParseFuncDecl`), der
+Rückgabetyp steht also ebenfalls in `c1`.
+
+Neu: `tests/method_tuple_return_test.sh` (14 Prüfungen, davon 11 gegen
+1.0.13O rot). Geprüft werden beide Rückgabewerte **einzeln** — ein Test auf
+ihre Summe könnte durch zufällig passenden Müll grün werden.
+
+Unverändert: Tupel mit mehr als zwei Elementen lehnt der Parser weiterhin ab
+(„Tupel mit mehr als zwei Elementen wird nicht unterstuetzt"), die SysV-ABI
+gibt zwei Werte in `rax`/`rdx` zurück.
+
 ### Compiler — geerbte nicht-virtuelle Methode nicht aufrufbar (#1120)
 
 ```lyx
