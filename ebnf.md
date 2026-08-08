@@ -1,6 +1,6 @@
-# Lyx 1.0.13B — Canonical EBNF Grammar
+# Lyx 1.0.13C — Canonical EBNF Grammar
 
-> Stand 2026-08-08, gegen lyxc 1.0.13B geprueft. Die Keyword-Liste in
+> Stand 2026-08-08, gegen lyxc 1.0.13C geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -1292,6 +1292,7 @@ Einzelbefunde sind dort verlinkt.
 | Default-Werte, Auswertung | 15.1 | Ein weggelassenes Argument wird durch den Default ersetzt, solange die uebersprungenen Parameter am ENDE stehen. Steht hinter einem Default noch ein Parameter OHNE, laesst sich der Default nicht ueberspringen. Der Ausdruck muss zur Uebersetzungszeit feststehen -- er wird an jeder Aufrufstelle eingesetzt, ein nicht-konstanter liefe sonst je Aufruf erneut. Die Kombination aus benannten Argumenten und uebersprungenen Defaults gibt es nicht. (#1089) |
 | Tupel-Entpacken, geklammerte Form | 12 | `var (q, r) := f();` gibt es nicht -- §12 (TupleUnpackStmt) schreibt die Form OHNE Klammern vor: `var q, r := f();`. Die DokuWiki fuehrt faelschlich die geklammerte. (#1088) |
 | Benannte Argumente, Auswertungsreihenfolge | 15.1 | `F(b: 2, a: 1)` ordnet richtig zu, wertet die Argumente aber in PARAMETERREIHENFOLGE aus, nicht in der geschriebenen. Bei Seiteneffekten in den Argumenten ist das sichtbar. Wo die Deklaration nicht herangezogen werden kann (importiert, extern, variadisch, generisch, Builtin), werden benannte Argumente ABGEWIESEN statt stillschweigend positionell genommen. (#1087) |
+| Capability-Argumente, Wirkung | 22 | Der Capability-NAME wird geprueft, der ARGUMENTNAME seit 1.0.13C ebenfalls: ein unbekannter Schluessel (`fs.read(pfad: …)`) und ein Argument an einer Capability, die keine nimmt, werden abgewiesen. Gueltige Schluessel: `path` (fs.*, process.exec), `host`/`port` (network.*), `pin` (hardware.gpio), `bus` (i2c/spi), `cs` (spi), `vendor`/`product` (usb). Der WERT wird jedoch **nicht durchgesetzt** — die Sandbox wirkt als Ja/Nein (seccomp-Syscallfilter plus EINE Landlock-Regel fuer `/`), nicht als Beschraenkung auf den genannten Pfad, Rechner oder Port. Der Compiler meldet das an jedem Argument, statt eine Sicherheitszusage vorzutaeuschen, die es nicht gibt (#1108); die Durchsetzung ist als #1173 geführt. Die PortSpec-Bereichsform (`"host":8000-9000`) parst seit 1.0.13C und wird auf Start <= Ende geprueft. |
 | Schmale Ganzzahltypen, Breite | 7 | `intN`/`uintN` mit N < 64 belegen einen vollen 64-Bit-Slot; gekuerzt wird beim SPEICHERN, vorzeichenbehaftet bei `intN`, vorzeichenlos bei `uintN`. Erfasst sind Initialisierung, Zuweisung, Parameter, Rueckgabe, globale Variablen und der `as`-Cast; Strukturfelder liegen ohnehin in ihrer eigenen Breite. Bis 1.0.11D fand die Kuerzung an KEINER dieser Stellen statt (`var a: int8 := 130` ergab 130 statt -126), und `as int8`/`as int16` kuerzten nur in der kurzen Schreibweise (`as i8`) -- #1151. Ein konstanter Wert, der nicht in die Breite passt, wird gekuerzt und nicht gemeldet. Eine globale Variable mit BERECHNETER Initialisierung bleibt weiterhin still 0 (#1164). |
 | Indexzugriff, Bereichspruefung | 15 | Ein konstanter Index auf eine Variable mit fester Groesse (`int64[N]` oder ein Array-Literal als Initialisierung) wird zur UEBERSETZUNGSZEIT geprueft und ausserhalb der Grenzen abgewiesen -- ohne Schalter. Berechnete Indizes prueft der erzeugte Code nur unter `--runtime-checks`; dann bricht ein Zugriff ausserhalb mit `panic` ab ("index out of bounds"). Der Vergleich ist vorzeichenLOS, ein negativer Index faellt also in denselben Zweig. `@bounds_check(false)` schaltet die Laufzeitpruefung im Geltungsbereich ab. NICHT geprueft wird, wo es keine Laenge gibt: roher Zeiger, `pchar`, Array-Parameter und inline liegende Struct-Felder. Bis 1.0.11D emittierte `--runtime-checks` fuer Indizes gar nichts -- der Zugriff las still den Speicher dahinter (#1156). Nur das x86-64-Backend traegt diese Pruefung; die uebrigen Backends kennen `--runtime-checks` insgesamt nicht. |
 | Bereichstyp, Pruefzeitpunkt | 7 | `type X = int64 range LO..HI;` wird geprueft, wo ein Wert den Typ ANNIMMT: Initialisierung, Zuweisung (lokal wie global), Parameter, Rueckgabe und Strukturfeld -- bei Funktionen wie bei Methoden. Steht der Wert zur UEBERSETZUNGSZEIT fest (Literal, `con`, konstanter Ausdruck), meldet der Compiler ihn dort (#1082); sonst prueft der erzeugte Code zur Laufzeit und bricht mit `panic` ab (#1097). Die Laufzeitpruefung haengt NICHT an `--runtime-checks`: der Bereich ist der einzige Inhalt dieses Typs. Grenzen sind einschliesslich, der Vergleich vorzeichenbehaftet. Nicht erfasst: ein Wert, der ueber einen `as`-Cast oder einen Zeiger am Typ vorbei geschrieben wird. |
@@ -1396,6 +1397,14 @@ PortSpec          = "*"
                   | IntLiteral
                   | IntLiteral "-" IntLiteral ;
 ```
+
+(* Gueltige Argumentnamen je Capability: `path` fuer `fs.*` und
+   `process.exec`; `host` und `port` fuer `network.*`; `pin` fuer
+   `hardware.gpio`; `bus` fuer `hardware.i2c` und `hardware.spi`; `cs` fuer
+   `hardware.spi`; `vendor` und `product` fuer `hardware.usb`. Alle uebrigen
+   Capabilities nehmen keine Argumente. Ein anderer Name wird abgewiesen.
+
+   Der WERT wird nicht durchgesetzt — siehe 20.1. *)
 
 ## 22.1 ImportItem with grant/restrict (amended from Section 3)
 

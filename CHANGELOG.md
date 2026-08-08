@@ -4,6 +4,51 @@
 
 _(noch nichts)_
 
+## Version 1.0.13C (August 2026)
+
+### Sicherheit — Capability-Argumente ohne Wirkung und ohne Prüfung (#1108)
+
+Die Capability-**Ebene** greift: ohne `fs.read` bricht ein Dateizugriff zur
+Laufzeit mit SIGSYS ab, und ein erfundener Capability-**Name** wird abgewiesen.
+Die **Argumente** waren der blinde Fleck.
+
+**Argumentnamen werden jetzt geprüft.** `fs.read(zzz_arg: "x")` und
+`fs.read(pfad: "/tmp")` übersetzten kommentarlos: `ValidateArg` sah nur
+Wertebereiche bekannter Schlüssel an und fiel für alles andere auf „in
+Ordnung" — und es lief ohnehin nur für Ganzzahlwerte, Zeichenketten kamen dort
+nie an. Ein Tippfehler fiel damit doppelt nicht auf: nicht beim Übersetzen, und
+zur Laufzeit nicht, weil die Angabe folgenlos bleibt. Gültige Schlüssel:
+`path` (`fs.*`, `process.exec`), `host`/`port` (`network.*`), `pin`
+(`hardware.gpio`), `bus` (i2c/spi), `cs` (spi), `vendor`/`product` (usb). Ein
+Argument an einer Capability, die keine nimmt, wird ebenfalls abgewiesen.
+
+**Die fehlende Wirkung wird gemeldet.** `fs.read(path: "/tmp")` schränkt
+nichts ein — die Sandbox wirkt als Ja/Nein: seccomp filtert Syscalls, und
+Landlock bekommt **eine** Regel für `/`, in die der genannte Pfad nicht
+eingeht. Eine Annotation, die eine Beschränkung ausdrückt und sie nicht
+einhält, erzeugt eine Sicherheitszusage, die es nicht gibt — dasselbe Muster
+wie bei den Safety-Attributen in #1099, also dieselbe Antwort: melden. Die
+Durchsetzung selbst ist als **#1173** herausgelöst; sie ist handgeschriebener
+x86-Code an einer Sicherheitsgrenze und braucht einen Test, der die
+Verweigerung *misst*.
+
+**PortSpec-Bereich parst.** `"host":8000-9000` stand seit jeher in §22 und
+scheiterte am Parser (`expected ), got - '-'`). Der Endport hängt jetzt an `c1`
+des `NK_NETWORK_TARGET`; Start > Ende wird abgewiesen.
+
+Randnotiz zum Issue: die dort vermuteten fehlenden `net.*`-Capabilities gibt es
+sehr wohl — sie heißen `network.tcp.bind`, `network.tcp.connect`,
+`network.udp.*`, `network.unix`, `network.raw`.
+
+`tests/capability_args_test.sh` (14 Prüfungen, in `make test`) misst, was der
+Compiler **meldet**. Ein Test auf Übersetzbarkeit wäre bei jedem der drei
+Punkte grün gewesen — genau das war der Befund. Gegen den Vorgängerstand:
+4 PASS, 10 FAIL.
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`df0c2b09…`).
+
 ## Version 1.0.13B (August 2026)
 
 ### Compiler — Methodenzeiger als lokale Variable stürzte beim Aufruf ab (#1106)
