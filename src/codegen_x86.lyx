@@ -568,6 +568,12 @@ pub type Codegen = class {
   rangeTypes:      int64;
   rangeTypeCount:  int64;
   rangeTypeCap:    int64;
+  // #1110: Einheitentypen. Eintrag: {namePtr, nameLen, faktor, dimPtr, dimLen,
+  // rngLo, rngHi, flags} = 64 Byte. flags Bit0 = Grenzen vorhanden,
+  // Bit1 = `wraps` statt `range`.
+  utypes:          int64;
+  utypeCount:      int64;
+  utypeCap:        int64;
   // #1097: Bereichstyp des Rueckgabewerts der gerade erzeugten Funktion (-1 = keiner).
   curFnRetRange:   int64;
   // #1151: Breite des Rueckgabetyps der gerade erzeugten Funktion (0 = voll).
@@ -2621,6 +2627,41 @@ pub type Codegen = class {
     }
   }
 
+  // #1110: Einheitentypen einsammeln, BEVOR Funktionen erzeugt werden — aus
+  // demselben Grund wie bei den Bereichstypen: sonst haenge die Umrechnung an
+  // der Reihenfolge im Quelltext.
+  fn cg_collectUtypes(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      if (self.cg_nkind(cur) == CGN_UTYPE_DECL) {
+        var utDim: int64 := self.cg_nc0(cur);
+        var utFac: int64 := self.cg_nc1(cur);
+        var utRng: int64 := self.cg_nc2(cur);
+        var facVal: int64 := 1;
+        if (utFac >= 0 && self.cg_nkind(utFac) == CGN_LIT_INT) { facVal := self.cg_nival(utFac); }
+        var dimP: pchar := 0 as pchar;
+        var dimL: int64 := 0;
+        if (utDim >= 0) { dimP := self.cg_nsval(utDim); dimL := self.cg_nslen(utDim); }
+        var rlo: int64 := 0;
+        var rhi: int64 := 0;
+        var uflags: int64 := 0;
+        if (utRng >= 0) {
+          var loN: int64 := self.cg_nc0(utRng);
+          var hiN: int64 := self.cg_nc1(utRng);
+          if (loN >= 0 && hiN >= 0) {
+            rlo := self.cg_nival(loN);
+            rhi := self.cg_nival(hiN);
+            uflags := 1;
+            if ((self.cg_nival(cur) & 2) != 0) { uflags := 3; }   // wraps
+          }
+        }
+        self.cg_addUtype(self.cg_nsval(cur), self.cg_nslen(cur), facVal,
+                         dimP, dimL, rlo, rhi, uflags);
+      }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
   fn cg_registerFnAlias(name: pchar, nameLen: int64) {
     if (self.fnAliasCount >= self.fnAliasCap) {
       var nc: int64 := self.fnAliasCap * 2;
@@ -4025,6 +4066,154 @@ pub type Codegen = class {
   // Parameter, eine Rueckgabe liefen ungeprueft durch. Die Grenzen stehen im
   // Typ, also muss die Pruefung dort stattfinden, wo ein Wert diesen Typ
   // ANNIMMT, und nicht nur dort, wo sie sich statisch ausrechnen laesst.
+  // #1110: Einheitentyp merken. Der Faktor ist das, was `utype Km: Meter = 1000`
+  // zusagt — und was bis 1.0.13D folgenlos blieb: `var b: M := a` uebernahm den
+  // Zahlenwert unveraendert, statt ihn umzurechnen.
+  fn cg_addUtype(name: pchar, nameLen: int64, factor: int64,
+                 dimName: pchar, dimLen: int64,
+                 rlo: int64, rhi: int64, flags: int64) {
+    if (self.utypeCount >= self.utypeCap) {
+      var nc: int64 := self.utypeCap * 2;
+      var nb: int64 := alloc(nc * 64);
+      memcpy(nb, self.utypes, self.utypeCount * 64);
+      self.utypes := nb;
+      self.utypeCap := nc;
+    }
+    var base: int64 := self.utypes + self.utypeCount * 64;
+    poke64(base,      name as int64);
+    poke64(base + 8,  nameLen);
+    poke64(base + 16, factor);
+    poke64(base + 24, dimName as int64);
+    poke64(base + 32, dimLen);
+    poke64(base + 40, rlo);
+    poke64(base + 48, rhi);
+    poke64(base + 56, flags);
+    self.utypeCount += 1;
+  }
+
+  // Index des Einheitentyps mit diesem Namen, sonst -1.
+  fn cg_findUtype(name: pchar, nameLen: int64): int64 {
+    if (nameLen <= 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < self.utypeCount) {
+      var base: int64 := self.utypes + i * 64;
+      var p: pchar := peek64(base) as pchar;
+      var n: int64 := peek64(base + 8);
+      if (n == nameLen && self.cg_seq(p, n, name, nameLen)) { return i; }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  fn cg_utypeFactor(idx: int64): int64 {
+    if (idx < 0) { return 1; }
+    var f: int64 := peek64(self.utypes + idx * 64 + 16);
+    if (f <= 0) { return 1; }
+    return f;
+  }
+
+  // Einheitentyp einer lokalen Variablen ueber ihren deklarierten Typnamen.
+  fn cg_utypeOfLocal(name: pchar, nameLen: int64): int64 {
+    var lidx: int64 := self.cg_findLocalIdx(name, nameLen);
+    if (lidx < 0) { return 0 - 1; }
+    var tb: int64 := self.localTypes + lidx * CG_LOCTYPE_SZ;
+    var tp: pchar := peek64(tb) as pchar;
+    var tl: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+    if (tp == 0 as pchar || tl <= 0) { return 0 - 1; }
+    return self.cg_findUtype(tp, tl);
+  }
+
+  fn cg_utypeOfTypeNode(typeNode: int64): int64 {
+    if (typeNode < 0) { return 0 - 1; }
+    if (self.cg_nkind(typeNode) != 60) { return 0 - 1; }
+    return self.cg_findUtype(self.cg_nsval(typeNode), self.cg_nslen(typeNode));
+  }
+
+  // #1110: rax von der Quell- in die Zieleinheit umrechnen. Erst
+  // multiplizieren, dann teilen — die andere Reihenfolge verschenkte bei
+  // ganzzahliger Rechnung unnoetig Stellen. Km -> M ist exakt, M -> Km
+  // schneidet ab, wie die Ganzzahldivision sonst auch (ebnf.md §20.1).
+  fn cg_emitUtypeConv(dstIdx: int64, srcIdx: int64) {
+    if (dstIdx < 0 || srcIdx < 0) { return; }
+    if (dstIdx == srcIdx) { return; }
+    var sf: int64 := self.cg_utypeFactor(srcIdx);
+    var df: int64 := self.cg_utypeFactor(dstIdx);
+    if (sf == df) { return; }
+    if (sf != 1) {
+      // imul rax, rax, sf
+      self.cg_e8(0x48); self.cg_e8(0x69); self.cg_e8(0xC0); self.cg_e32(sf);
+    }
+    if (df != 1) {
+      // mov rcx, df; cqo; idiv rcx
+      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1); self.cg_e32(df);
+      self.cg_e8(0x48); self.cg_e8(0x99);
+      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
+    }
+  }
+
+  // #1110: Grenzen eines Einheitentyps durchsetzen (§11 UtypeRangeModifier).
+  // `range` bricht ausserhalb mit panic ab — wie der Bereichstyp aus #1097.
+  // `wraps` rechnet stattdessen in den Bereich zurueck; dafuer gibt es die
+  // Schreibweise ueberhaupt (Winkel, Uhrzeiten).
+  //
+  // Die Grenzen sind EINSCHLIESSLICH, wie bei den Bereichstypen; die Spanne
+  // ist also hi-lo+1.
+  fn cg_emitUtypeRange(idx: int64) {
+    if (idx < 0) { return; }
+    var base: int64  := self.utypes + idx * 64;
+    var flags: int64 := peek64(base + 56);
+    if ((flags & 1) == 0) { return; }
+    var lo: int64 := peek64(base + 40);
+    var hi: int64 := peek64(base + 48);
+    if ((flags & 2) != 0) {
+      // wraps: rax := ((rax - lo) mod span + span) mod span + lo
+      var span: int64 := hi - lo + 1;
+      if (span <= 0) { return; }
+      if (lo != 0) {
+        self.cg_e8(0x48); self.cg_e8(0x2D); self.cg_e32(lo);           // sub rax, lo
+      }
+      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1); self.cg_e32(span); // mov rcx, span
+      self.cg_e8(0x48); self.cg_e8(0x99);                               // cqo
+      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);            // idiv rcx
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);            // mov rax, rdx (Rest)
+      // Rest kann negativ sein: + span, dann erneut mod
+      self.cg_e8(0x48); self.cg_e8(0x05); self.cg_e32(span);            // add rax, span
+      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1); self.cg_e32(span);
+      self.cg_e8(0x48); self.cg_e8(0x99);
+      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);
+      if (lo != 0) {
+        self.cg_e8(0x48); self.cg_e8(0x05); self.cg_e32(lo);            // add rax, lo
+      }
+      return;
+    }
+    // range: unter lo oder ueber hi -> panic
+    self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e32(lo);                // cmp rax, lo
+    self.cg_e8(0x7C); var pLo: int64 := self.codeLen; self.cg_e8(0);    // jl -> panic
+    self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e32(hi);                // cmp rax, hi
+    self.cg_e8(0x7E); var pOk: int64 := self.codeLen; self.cg_e8(0);    // jle -> ok
+    poke8(self.code + pLo, self.codeLen - pLo - 1);
+    self.cg_pushRax();
+    var msgOff: int64 := self.dataLen;
+    var msg: pchar := "unit value out of range\n"c;
+    var mi: int64 := 0;
+    while (mi < 24) { self.cg_edata(StrCharAt(msg, mi)); mi := mi + 1; }
+    self.cg_edata(0);
+    self.cg_emitLeaRdiData(msgOff);
+    self.cg_emitPanicBody();
+    self.cg_popRax();
+    poke8(self.code + pOk, self.codeLen - pOk - 1);
+  }
+
+  // #1110: Einheit des Ausdrucks, soweit der Codegen sie kennt. Nur der Fall,
+  // der zaehlt: eine Variable mit deklariertem Einheitentyp. Alles andere
+  // liefert -1 und loest keine Umrechnung aus.
+  fn cg_utypeOfExpr(ni: int64): int64 {
+    if (ni < 0) { return 0 - 1; }
+    if (self.cg_nkind(ni) != CGN_IDENT) { return 0 - 1; }
+    return self.cg_utypeOfLocal(self.cg_nsval(ni), self.cg_nslen(ni));
+  }
+
   fn cg_addRangeType(name: pchar, nameLen: int64, lo: int64, hi: int64) {
     if (self.rangeTypeCount >= self.rangeTypeCap) {
       var nc: int64 := self.rangeTypeCap * 2;
@@ -9369,6 +9558,10 @@ pub type Codegen = class {
         // #1151: auf die deklarierte Breite kuerzen, bevor der Wert im
         // 64-Bit-Slot landet.
         self.cg_emitNarrowRax(self.cg_narrowKindOfTypeNode(typeNode));
+        // #1110: in die Zieleinheit umrechnen, dann die Grenzen durchsetzen.
+        var utDst1: int64 := self.cg_utypeOfTypeNode(typeNode);
+        self.cg_emitUtypeConv(utDst1, self.cg_utypeOfExpr(init));
+        self.cg_emitUtypeRange(utDst1);
       }
       // WP-B1: @redundant vars need 3 slots; mark + write all copies
       // Layout: A=off-16 (lowest addr, @x returns this), B=off-8, C=off
@@ -9408,6 +9601,10 @@ pub type Codegen = class {
         // #1151: Zuweisung an eine schmale Variable — lokal, global oder in
         // der Closure-Umgebung; alle drei Wege liegen hinter dieser Stelle.
         self.cg_emitNarrowRax(self.cg_narrowKindOfVar(name, nlen));
+        // #1110: in die Einheit der Zielvariablen umrechnen, dann die Grenzen.
+        var utDst2: int64 := self.cg_utypeOfLocal(name, nlen);
+        self.cg_emitUtypeConv(utDst2, self.cg_utypeOfExpr(rhs));
+        self.cg_emitUtypeRange(utDst2);
         var off: int64 := self.cg_findLocal(name, nlen);
         if (off != 0) {
           // WP-B1: @redundant vars write all 3 copies (A=off-16, B=off-8, C=off)
@@ -12364,6 +12561,7 @@ pub type Codegen = class {
     self.cg_collectF64Funcs(head);
     self.cg_collectMethodAliases(head);   // B2: method-Typ-Aliase registrieren
     self.cg_collectRangeTypes(head);      // #1097: Bereichstypen samt Grenzen
+    self.cg_collectUtypes(head);          // #1110: Einheitentypen samt Faktor
 
     var cur: int64 := head;
     while (cur != -1) {
@@ -12502,7 +12700,8 @@ pub type Codegen = class {
           mem := self.cg_nnext(mem);
         }
       } else if (k == CGN_DIM_DECL || k == CGN_UTYPE_DECL) {
-        // WP-BC-16: dim/utype are compile-time-only; no code generated
+        // WP-BC-16: rein uebersetzungszeitlich; kein Code. Die Faktoren und
+        // Grenzen sammelt cg_collectUtypes vorab ein (#1110).
       } else if (k == CGN_BLOCK) {
         // WP-CS-06: inlined @if branch — recurse into children
         self.cg_genFile(self.cg_nc0(cur));
@@ -12746,6 +12945,9 @@ pub type Codegen = class {
     self.rangeTypeCount := 0;
     self.curFnRetRange  := 0 - 1;
     self.curFnRetNarrow := 0;
+    self.utypes     := alloc(32 * 64);   // #1110
+    self.utypeCount := 0;
+    self.utypeCap   := 32;
 
     // WP-BC-40: Profiling entry table (initially empty)
     self.profEntryCap   := 16;

@@ -1596,6 +1596,151 @@ pub type Sema = class {
     free(loBox, 8); free(hiBox, 8); free(vBox, 8);
   }
 
+  // #1110: Einheitentypen (§11). `dim` und `utype` wurden geparst und hatten
+  // keinerlei Semantik: eine Laenge liess sich in eine Zeit zuweisen, und eine
+  // rohe Zahl mischte sich kommentarlos darunter. Genau das ist die
+  // Fehlerklasse, gegen die Einheitentypen antreten (Mars Climate Orbiter);
+  // eine Annotation, die sie nicht erkennt, ist irrefuehrend.
+  //
+  // Die Deklaration traegt alles Noetige, eine eigene Registry braucht es
+  // nicht: SNK_UTYPE_DECL hat c0 = Dimensionsname, c1 = Faktor, c2 = Grenzen.
+  fn _utypeDeclOfName(nm: pchar, nml: int64): int64 {
+    if (nml <= 0) { return 0 - 1; }
+    var si: int64 := self.Lookup(nm, nml);
+    if (si < 0) { return 0 - 1; }
+    if (self.SymKind(si) != SYM_TYPE) { return 0 - 1; }
+    var declNi: int64 := self.SymNodeIdx(si);
+    // Importiert und damit hier nicht entscheidbar — nichts melden.
+    if (declNi < 0) { return 0 - 1; }
+    if (self.sn_kind(declNi) != SNK_UTYPE_DECL) { return 0 - 1; }
+    return declNi;
+  }
+
+  fn _utypeDeclOfTypeNode(typeNi: int64): int64 {
+    if (typeNi < 0) { return 0 - 1; }
+    if (self.sn_kind(typeNi) != SNK_TYPE_NAME) { return 0 - 1; }
+    return self._utypeDeclOfName(self.sn_sVal(typeNi), self.sn_sLen(typeNi));
+  }
+
+  // Dimensionsname einer utype-Deklaration; Laenge in lenBox.
+  fn _utypeDimName(declNi: int64, lenBox: int64): pchar {
+    poke64(lenBox, 0);
+    if (declNi < 0) { return 0 as pchar; }
+    var dimNi: int64 := self.sn_c0(declNi);
+    if (dimNi < 0) { return 0 as pchar; }
+    poke64(lenBox, self.sn_sLen(dimNi));
+    return self.sn_sVal(dimNi);
+  }
+
+  // Tragen zwei utype-Deklarationen dieselbe Dimension?
+  fn _utypeSameDim(aNi: int64, bNi: int64): int64 {
+    var la: int64 := alloc(8);
+    var lb: int64 := alloc(8);
+    var na: pchar := self._utypeDimName(aNi, la);
+    var nb: pchar := self._utypeDimName(bNi, lb);
+    var res: int64 := 0;
+    if (na != 0 as pchar && nb != 0 as pchar) {
+      if (self._strNEq(na, peek64(la), nb, peek64(lb))) { res := 1; }
+    }
+    free(la, 8); free(lb, 8);
+    return res;
+  }
+
+  // #1110: Welche Einheit hat dieser Ausdruck? Rueckgabe: Deklarationsknoten
+  // des utype, oder -1 fuer "dimensionslos bzw. nicht entscheidbar".
+  //
+  // Bewusst eng: ein `as`-Cast fuehrt heraus (der Fluchtweg, wenn jemand die
+  // Pruefung ausdruecklich umgehen will), und wo die Einheit nicht bestimmbar
+  // ist, wird NICHTS gemeldet — unentscheidbar heisst nicht falsch.
+  fn _utypeOfExpr(ni: int64): int64 {
+    if (ni < 0) { return 0 - 1; }
+    var k: int64 := self.sn_kind(ni);
+    if (k == SNK_IDENT) {
+      var si: int64 := self.Lookup(self.sn_sVal(ni), self.sn_sLen(ni));
+      if (si < 0) { return 0 - 1; }
+      var declNi: int64 := self.SymNodeIdx(si);
+      if (declNi < 0) { return 0 - 1; }
+      var dk: int64 := self.sn_kind(declNi);
+      if (dk == SNK_VAR_DECL || dk == SNK_PARAM) {
+        return self._utypeDeclOfTypeNode(self.sn_c0(declNi));
+      }
+      return 0 - 1;
+    }
+    if (k == SNK_BINOP) {
+      var bop: int64 := self.sn_iVal(ni);
+      var lu: int64 := self._utypeOfExpr(self.sn_c0(ni));
+      var ru: int64 := self._utypeOfExpr(self.sn_c1(ni));
+      // Multiplikation und Division mit einem Skalar skalieren die Einheit:
+      // `a * 3` bleibt eine Laenge. Zwei Einheiten miteinander ergaeben eine
+      // ABGELEITETE Dimension (m/s); die rechnet der Compiler nicht aus, also
+      // liefert dieser Fall "unbekannt" statt einer falschen Behauptung.
+      if (bop == 72 || bop == 73) {
+        if (lu >= 0 && ru >= 0) { return 0 - 1; }
+        if (lu >= 0) { return lu; }
+        return ru;
+      }
+      // Alles andere (+, -, Vergleiche): die Seiten muessen zusammenpassen,
+      // geprueft wird das in _checkUtypeBinop. Hier zaehlt die linke Seite.
+      if (lu >= 0) { return lu; }
+      return ru;
+    }
+    return 0 - 1;
+  }
+
+  // #1110: `a + b`, wo eine Seite eine Einheit traegt.
+  fn _checkUtypeBinop(ni: int64): void {
+    var bop: int64 := self.sn_iVal(ni);
+    // Nur Addition und Subtraktion; Skalierung per * und / ist erlaubt.
+    if (bop != 70 && bop != 71) { return; }
+    var lu: int64 := self._utypeOfExpr(self.sn_c0(ni));
+    var ru: int64 := self._utypeOfExpr(self.sn_c1(ni));
+    if (lu < 0 && ru < 0) { return; }
+    if (lu < 0 || ru < 0) {
+      self._errorNode("Einheitentyp mit dimensionsloser Zahl verrechnet"c, ni);
+      return;
+    }
+    if (self._utypeSameDim(lu, ru) == 0) {
+      self._errorNode("Einheitentypen verschiedener Dimension verrechnet"c, ni);
+    }
+  }
+
+  // #1110: Ein Wert nimmt einen Einheitentyp an — Initialisierung, Zuweisung,
+  // Parameter, Rueckgabe. Die Dimension muss passen; ein Literal ist
+  // dimensionslos und deshalb immer erlaubt (`var a: Km := 2`).
+  fn _checkUtypeAssign(typeNi: int64, valNi: int64, atNi: int64): void {
+    var tu: int64 := self._utypeDeclOfTypeNode(typeNi);
+    var vu: int64 := self._utypeOfExpr(valNi);
+    if (tu < 0 && vu < 0) { return; }
+    if (tu < 0) {
+      self._errorNode("Einheitentyp an einen dimensionslosen Typ zugewiesen"c, atNi);
+      return;
+    }
+    if (vu >= 0) {
+      if (self._utypeSameDim(tu, vu) == 0) {
+        self._errorNode("Zuweisung ueber Dimensionsgrenzen hinweg"c, atNi);
+      }
+      return;
+    }
+    // #1110: dimensionsloser Wert an eine Einheit — erlaubt (ein Literal muss
+    // sich zuweisen lassen). Steht der Wert aber FEST und der Typ traegt
+    // `range`-Grenzen, ist das hier entscheidbar; dieselbe Antwort wie beim
+    // Bereichstyp in #1082. `wraps` rechnet um und meldet deshalb nichts.
+    var rngNi: int64 := self.sn_c2(tu);
+    if (rngNi < 0) { return; }
+    if ((self.sn_iVal(tu) & 2) != 0) { return; }   // wraps
+    var loNi: int64 := self.sn_c0(rngNi);
+    var hiNi: int64 := self.sn_c1(rngNi);
+    if (loNi < 0 || hiNi < 0) { return; }
+    var vBox: int64 := alloc(8);
+    if (self._constIntOf(valNi, vBox) != 0) {
+      var v: int64 := peek64(vBox);
+      if (v < self.sn_iVal(loNi) || v > self.sn_iVal(hiNi)) {
+        self._errorNode("Wert liegt ausserhalb der Grenzen des Einheitentyps"c, atNi);
+      }
+    }
+    free(vBox, 8);
+  }
+
   // #1156: Feste Groesse einer indizierten Variablen ermitteln.
   //
   // Zwei Schreibweisen tragen die Groesse zur Uebersetzungszeit:
@@ -2037,6 +2182,7 @@ pub type Sema = class {
     } else if (k == SNK_BINOP) {
       self._checkExpr(self.sn_c0(ni));
       self._checkExpr(self.sn_c1(ni));
+      self._checkUtypeBinop(ni);   // #1110
 
     } else if (k == SNK_UNOP) {
       self._checkExpr(self.sn_c0(ni));
@@ -2271,6 +2417,8 @@ pub type Sema = class {
         self._logConstraint(tid, TY_UNKNOWN, "var-init"c, ni);
         // #1082: Bereichstyp -- konstante Initialisierung sofort pruefen.
         self._checkRangeAssign(typeNi, initNi, initNi);
+        // #1110: Einheitentyp -- Dimension pruefen.
+        self._checkUtypeAssign(typeNi, initNi, initNi);
       }
       var varSi: int64 := self.symCount;
       self._pushSym(self.sn_sVal(ni), self.sn_sLen(ni), SYM_VAR, tid, ni);
@@ -2320,6 +2468,7 @@ pub type Sema = class {
           var adecl: int64 := self.SymNodeIdx(asi);
           if (adecl >= 0) {
             self._checkRangeAssign(self.sn_c0(adecl), self.sn_c1(ni), self.sn_c1(ni));
+            self._checkUtypeAssign(self.sn_c0(adecl), self.sn_c1(ni), self.sn_c1(ni));   // #1110
           }
         }
       }
