@@ -3199,6 +3199,34 @@ pub type Codegen = class {
     return 0;
   }
 
+  // #1106: Ist `expr` eine ungerufene Methoden-Referenz `obj.Method`?
+  //
+  // Die Unterscheidung, auf die es ankommt: `obj.name` ist entweder ein FELD
+  // (dann wird geladen) oder eine METHODE (dann muss ein fat pointer gebunden
+  // werden). Entschieden wird sie am Klassenlayout — ein Name, den die Klasse
+  // nicht als Feld führt, ist die Methode. Ohne diese Frage lud `var m: TM :=
+  // f.Handle;` das Feld `Handle`, das es nicht gibt: Offset 0, also der
+  // VMT-Zeiger, und der Aufruf sprang ins Leere (Exit 139).
+  //
+  // Der Zieltyp wird zusaetzlich verlangt, damit die Regel eng bleibt: nur wo
+  // ein `method(...)`-Alias steht, wird gebunden.
+  fn cg_isMethodRefExpr(expr: int64): int64 {
+    if (expr < 0) { return 0; }
+    if (self.cg_nkind(expr) != CGN_FIELD) { return 0; }
+    var ci: int64 := self.cg_objClassIdx(self.cg_nc0(expr));
+    if (ci < 0) { return 0; }
+    if (self.cg_findField(ci, self.cg_nsval(expr), self.cg_nslen(expr)) >= 0) { return 0; }
+    return 1;
+  }
+
+  // #1106: Wert fuer eine Variable vom `method(...)`-Typ erzeugen. Steht rechts
+  // eine Methoden-Referenz, wird gebunden; steht dort ein bereits gebundener
+  // fat pointer (Feld, andere Variable), wird schlicht geladen.
+  fn cg_genMethodTypedValue(rhs: int64) {
+    if (self.cg_isMethodRefExpr(rhs) != 0) { self.cg_genMethodRef(rhs); }
+    else { self.cg_genExpr(rhs); }
+  }
+
   // B2: method-Referenz `obj.Method` (ungerufen) → heap-fat-pointer {code, data} (16B); rax = ptr.
   // code = Adresse von Klasse_Method (mangled), data = obj-Instanz-Pointer.
   fn cg_genMethodRef(rhs: int64) {
@@ -9186,7 +9214,15 @@ pub type Codegen = class {
         poke64(self.localArraySize + localIdx * 8, acnt);
       }
       if (init >= 0) {
-        self.cg_genExpr(init);
+        // #1106: `var m: TM := f.Handle;` muss binden, nicht laden. Der Fall
+        // gab es bisher nur fuer FELDER — als lokale Variable uebersetzte er
+        // klaglos und stuerzte beim Aufruf ab.
+        if (typeNode >= 0 && self.cg_nkind(typeNode) == 60
+            && self.cg_isMethodType(self.cg_nsval(typeNode), self.cg_nslen(typeNode)) != 0) {
+          self.cg_genMethodTypedValue(init);
+        } else {
+          self.cg_genExpr(init);
+        }
       } else {
         // Fixed-size array (int64[N]): heap-allocate N*8 bytes
         var fixedSz: int64 := peek64(self.localArraySize + localIdx * 8);
@@ -9265,7 +9301,18 @@ pub type Codegen = class {
       var lhs: int64 := self.cg_nc0(ni);
       var rhs: int64 := self.cg_nc1(ni);
       if (self.cg_nkind(lhs) == CGN_IDENT) {
-        self.cg_genExpr(rhs);
+        // #1106: `m := f.Handle;` bei `var m: TM;` — dieselbe Bindung wie bei
+        // der Initialisierung. Ohne diesen Zweig traf es der getrennt
+        // geschriebene Fall genauso.
+        var asgLIdx: int64 := self.cg_findLocalIdx(self.cg_nsval(lhs), self.cg_nslen(lhs));
+        var asgIsMth: int64 := 0;
+        if (asgLIdx >= 0) {
+          var asgTb: int64 := self.localTypes + asgLIdx * CG_LOCTYPE_SZ;
+          var asgTp: pchar := peek64(asgTb) as pchar;
+          var asgTl: int64 := peek64(asgTb + CG_LOCTYPE_OFF_LEN);
+          if (asgTp != 0 as pchar && asgTl > 0 && self.cg_isMethodType(asgTp, asgTl) != 0) { asgIsMth := 1; }
+        }
+        if (asgIsMth != 0) { self.cg_genMethodTypedValue(rhs); } else { self.cg_genExpr(rhs); }
         var name: pchar := self.cg_nsval(lhs);
         var nlen: int64 := self.cg_nslen(lhs);
         // #1097: Zuweisung an eine Variable vom Bereichstyp.
