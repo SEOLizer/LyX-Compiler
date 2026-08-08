@@ -4,6 +4,57 @@
 
 _(noch nichts)_
 
+## Version 1.0.13I (August 2026)
+
+### Sicherheit — seccomp-Filter kannte die emittierten Syscalls nicht (#1185)
+
+Ein Programm mit `@capabilities([… fs.create …])` starb beim ersten `mkdir` mit
+`SIGSYS`. Dasselbe bei `unlink` trotz `fs.delete` und bei `rename`. Mit
+`--capabilities=compat` — also ohne seccomp — lief derselbe Code durch; es lag
+am Filter, nicht am Codegen.
+
+**Ursache:** der Filter kannte nur die `*at`-Varianten (`unlinkat`, `openat`),
+der Codegen emittiert aber die **direkten** Formen. `rmdir` war zufällig dabei,
+`mkdir` und `unlink` nicht — die Lücke betraf also einzelne Nummern, nicht
+ganze Kategorien.
+
+Abgeglichen wurde entlang `capabilities.md`, nicht nach Gefühl:
+
+| Capability | neu freigegeben |
+|---|---|
+| `fs.create` | `mkdir` (83), `mkdirat` (258), `creat` (85) |
+| `fs.delete` | `unlink` (87) |
+| `fs.write` | `truncate` (76), `ftruncate` (77), `fsync` (74), `fdatasync` (75) |
+| `fs.read` | `readlink` (89), `getcwd` (79) |
+| `fs.meta` | `stat` (4), `lstat` (6), `access` (21) |
+
+**`rename` verlangt beide Capabilities.** Umbenennen legt am Ziel an *und*
+entfernt an der Quelle — mit nur `fs.create` wäre es ein Weg, ohne `fs.delete`
+zu löschen. Der Generator prüft deshalb `fs.create && fs.delete`.
+
+**Basissatz harmloser Introspektion**, immer erlaubt: `getpid`, `gettid`,
+`getppid`, `getuid`, `geteuid`, `getgid`, `getegid`. Sie geben Auskunft über
+den eigenen Prozess und berühren nichts außerhalb davon. Ohne sie ist eine
+extern gelinkte Bibliothek nicht benutzbar: OpenSSL ruft `getpid` beim Init
+(RNG-Reseed-Check), womit HTTPS mit aktivem LCBS gar nicht lief.
+`clock_gettime` gehört bewusst **nicht** dazu — dafür gibt es `system.time`,
+und ein immer erlaubter Zeitzugriff entwertete die Capability.
+
+**Nicht freigegeben: `chmod` und `chown`.** Sie *schreiben* Metadaten;
+`fs.meta` deckt laut Doku das *Lesen* ab. Sie an `fs.meta` zu hängen wäre eine
+stille Ausweitung für jeden, der die Capability nur zum Auflisten anfordert —
+als **#1188** aufgesetzt.
+
+`tests/seccomp_filter_test.sh` (12 Prüfungen, in `make test`) prüft **beide
+Richtungen**: dass der erlaubte Aufruf läuft und der nicht gewährte weiterhin
+mit `SIGSYS` stirbt. Ein Test, der nur das erste prüft, wäre auch von einem
+Filter erfüllt, der alles durchlässt. Gegen den Vorgängerstand: 7 PASS,
+5 FAIL.
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`1707b6ec…`).
+
 ## Version 1.0.13H (August 2026)
 
 ### Compiler — dynamisches Array ohne Initialisierung war null (#1177)
