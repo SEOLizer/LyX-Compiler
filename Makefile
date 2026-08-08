@@ -21,7 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.12A
+VERSION   := 1.0.13A
+VERSION_DATE := 2026-08-08
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -260,6 +261,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
+	@echo "OK"
+	@echo "--- Versionsangaben stimmen ueberein ---"
+	@bash tests/version_consistency_test.sh
 	@echo "OK"
 	@echo "--- Schmale Ganzzahltypen kuerzen beim Speichern (20 Pruefungen) ---"
 	@bash tests/int_width_test.sh

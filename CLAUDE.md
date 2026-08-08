@@ -63,6 +63,22 @@ erzeugt), `ir_lower` (kannte nur das eigene Modul).
   wird sonst rot: S3 trägt die Bytes des alten Seeds. Fixpunkt nach
   `src/lyxc_bootstrap` kopieren, `make singularity` muss SINGULAR melden.
   Der Seed stand bis 1.0.12A auf 1.0.7B und belegte nichts mehr (#1167).
+
+## Versionsschema
+
+`MAJOR.MINOR.TAG` + Suffix. **TAG** zählt die Build-*Tage*, nicht die
+Kalendertage: der erste Build an einem neuen Tag erhöht ihn und setzt den
+Suffix auf `A`. Der **Suffix** zählt die Kompilate innerhalb des Tages —
+`A`…`Z`, dann `BA`…`BZ`, dann `CA`…; `AA` gibt es nicht.
+
+- `tools/next_version.sh` rechnet und setzt (aus `VERSION`/`VERSION_DATE`).
+- **Reihenfolge: erst bumpen, dann verankern.** Die Version steckt im Binary,
+  ein Bump erzeugt also einen neuen Fixpunkt — umgekehrt ist `singularity`
+  sofort wieder rot.
+- Vier lebende Stellen (Makefile, README-Badge, vier Strings in `lyxc.lyx`,
+  ebnf.md-Kopf); `tests/version_consistency_test.sh` hält sie zusammen.
+  **Historische Angaben bleiben stehen** — „bis 1.0.11D war das so" nennt
+  einen Zeitpunkt.
 - **Verbleibende Fehlschläge gegen den Vorgängerstand belegen**, statt sie als
   vorbestehend abzutun.
 - Bei **Semantikänderungen** zusätzlich der Gegenbeleg, dass sich der Bestand

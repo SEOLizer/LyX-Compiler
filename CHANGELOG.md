@@ -4,6 +4,52 @@
 
 _(noch nichts)_
 
+## Version 1.0.13A (August 2026)
+
+### Bootstrap — der Seed belegte nichts mehr (#1167)
+
+`make singularity` prüft S3 == S4: das Seed-Binary übersetzt die Quelle (S3),
+S3 übersetzt sie erneut (S4), beide müssen Byte für Byte gleich sein. Sie
+waren es nicht — der Seed stand auf **1.0.7B**, die Quelle auf 1.0.12A.
+
+S3 trägt das *Verhalten* der neuen Quelle, aber die *Bytes* des alten
+Codegens; S4 beides aus der neuen. Nach jeder Codegen-Änderung laufen die zwei
+zwangsläufig auseinander — kein Nichtdeterminismus, und der Fixpunkt selbst
+(gen2 == gen3 == gen4) war die ganze Zeit intakt. Aber ein Seed, der den
+Compiler nicht mehr reproduziert, belegt nichts: die Vertrauenswurzel des
+Bootstraps war seit mehreren Versionen ohne Aussage, und die CI-Stufe
+„Singularity check" konnte nur rot sein.
+
+`src/lyxc_bootstrap` ist jetzt der Fixpunkt dieser Version:
+
+| | SHA-256 | Version |
+|---|---|---|
+| vorher | `968084de…` | 1.0.7B |
+| nachher | `61662af5…` | 1.0.13A |
+
+Der Anlass steht jetzt dort, wo er gilt — Makefile-Kopf und `CLAUDE.md`: die
+Neuverankerung hängt an der **Codegen-Änderung**, nicht am Versionsbump. Einen
+Automatismus braucht es nicht, `make singularity` *ist* der Detektor.
+
+### Versionsschema festgeschrieben
+
+`MAJOR.MINOR.TAG` + Suffix. **TAG** zählt die Build-*Tage*: der erste Build an
+einem neuen Tag erhöht ihn und setzt den Suffix auf `A`. Der **Suffix** zählt
+die Kompilate innerhalb des Tages — `A`…`Z`, dann `BA`…`BZ`, dann `CA`…;
+`AA` gibt es nicht.
+
+- `tools/next_version.sh` rechnet die nächste Version aus `VERSION` und dem
+  neuen `VERSION_DATE` und setzt sie an allen vier lebenden Stellen.
+- `tests/version_consistency_test.sh` (in `make test`) hält Makefile,
+  README-Badge, die vier Strings in `src/lyxc.lyx`, den ebnf.md-Kopf und das
+  gebaute Binary zusammen. Beim Bump auf 1.0.12A stand der ebnf.md-Kopf noch
+  auf 1.0.11C — zwei Versionen hinter dem Compiler, und niemandem fiel es auf,
+  weil keine der Stellen sich aus einer anderen ableitet.
+
+**Reihenfolge:** erst bumpen, dann verankern. Die Version steckt im Binary,
+ein Bump erzeugt also einen neuen Fixpunkt; umgekehrt wäre `singularity`
+sofort wieder rot.
+
 ## Version 1.0.12A (August 2026)
 
 Drei Befunde derselben Bauart: eine Zusicherung, die nur im Namen bestand.
