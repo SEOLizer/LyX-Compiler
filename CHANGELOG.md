@@ -4,6 +4,59 @@
 
 _(noch nichts)_
 
+## Version 1.0.13M (August 2026)
+
+### Compiler — das vierte Syscall-Argument lag im falschen Register (#1192)
+
+`sendto` bekam als Flags-Maske, was zufällig in `r10` stand:
+
+```
+sendto(3, "…", 33, MSG_OOB|MSG_CTRUNC|MSG_TRUNC|MSG_DONTWAIT|…|0x19400000, …) = -1 EOPNOTSUPP
+```
+
+Der Wert wechselte von Lauf zu Lauf — deshalb mal Timeout (ohne
+`MSG_DONTWAIT` blockiert der Aufruf), mal sofortiger Fehler (`MSG_OOB` →
+`EOPNOTSUPP`). Betroffen war jede Namensauflösung über `std.net.dns`, damit
+`GetHostByName`, `HTTPGet` und `HTTPSGet`.
+
+**Ursache:** die Argumente eines Intrinsics kommen nach C-Konvention an —
+`rdi`, `rsi`, `rdx`, **`rcx`**, `r8`, `r9`. Der Linux-*Syscall* nimmt das
+vierte aber in **`r10`**. Wer das `mov r10, rcx` vergisst, lässt dort stehen,
+was vorher drin war.
+
+**Systematisch geprüft statt einzeln nachgetragen.** Ein Abgleich über alle
+35 Intrinsics mit vier oder mehr Argumenten zeigt: genau zwei fehlten,
+`sendto` (44) und `recvfrom` (45). `wait4` nullt `r10` absichtlich
+(`rusage = NULL`), alle übrigen setzen es korrekt. Die Vermutung im Issue —
+„die 6-Argument-Konvention an sich scheint zu stehen" — trifft also zu.
+
+**Beim Testen mitgefunden:** `sys_send`/`sys_recv` teilten sich den Zweig mit
+`sendto`/`recvfrom`. Auf x86-64 gibt es `send` aber nicht als eigene Nummer;
+der Kernel kennt nur `sendto`, und die fehlenden zwei Argumente (`addr`,
+`addrlen`) müssen **NULL** sein. Sie enthielten stattdessen Reste, und der
+Aufruf scheiterte mit `EINVAL`. Beide haben jetzt einen eigenen Zweig, der
+`r8`/`r9` nullt.
+
+`tests/syscall_r10_test.sh` (5 Prüfungen, in `make test`) kommt **ohne
+externes Netz** aus — zwei UDP-Sockets auf `127.0.0.1`. Geprüft wird das
+Ergebnis des Aufrufs samt Timeout, denn der Fehler zeigte sich auch als
+Hängen. Ein Fall prüft, dass die Flags nicht nur `0` sind, sondern **wirken**:
+`MSG_DONTWAIT` auf einem leeren Socket muss sofort `EAGAIN` liefern. Gegen den
+Vorgängerstand: 2 PASS, 3 FAIL.
+
+Nachweis der Auswirkung — `GetHostByName("one.one.one.one")`:
+
+| | Ergebnis |
+|---|---|
+| vorher | `0` (fehlgeschlagen) |
+| jetzt | `16843009` = 1.1.1.1 |
+
+Zusammen mit #1193 ist HTTPS damit auf beiden Wegen frei.
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`647e2d3a…`).
+
 ## Version 1.0.13L (August 2026)
 
 ### Sicherheit — `setsockopt` fehlte bei den Netzwerk-Capabilities (#1193)
