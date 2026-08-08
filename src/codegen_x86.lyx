@@ -465,6 +465,10 @@ pub type Codegen = class {
   // erreichen — sie muessen die dort offenen defers vorher selbst abarbeiten.
   // -1 = ausserhalb jeder Schleife.
   loopDeferMark: int64;
+  // #1118: Stand des defer-Stapels beim Eintritt in den try-Block. `throw`
+  // verlaesst den Block wie ein `break` die Schleife — die offenen defers
+  // muessen vorher laufen, sonst leckt die Freigabe genau im Fehlerfall.
+  tryDeferMark: int64;
 
   // WP-BC-11: or-pattern body forward jump list (je body, linked list of rel32 positions)
   orBodyHead: int64;
@@ -9927,7 +9931,12 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE0);   // mov rax, rsp
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x01);   // mov [rcx], rax
       // Generate try body
+      // #1118: Stand merken, damit `throw` die defers dieses Blocks abarbeiten
+      // kann. Verschachtelte try: der aeussere Stand wird gerettet.
+      var savedTryMark: int64 := self.tryDeferMark;
+      self.tryDeferMark := self.deferCount;
       self.cg_genBlock(self.cg_nc0(ni));
+      self.tryDeferMark := savedTryMark;
       // Try success: restore old handler
       self.cg_emitLeaRcxData(CG_EXN_PTR);
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x40); // mov rax, [rsp+64]
@@ -9971,6 +9980,14 @@ pub type Codegen = class {
     } else if (k == CGN_THROW) {
       // WP-12: throw expr — store exception value, longjmp or exit(1)
       self.cg_genExpr(self.cg_nc0(ni));               // rax = exception value
+      // #1118: Der try-Block wird hier verlassen — seine defers laufen zuerst,
+      // wie bei break/continue in einer Schleife (#1006). Der Wert steht schon
+      // in rax; die defers duerfen ihn nicht verlieren, also gerettet.
+      if (self.tryDeferMark >= 0 && self.deferCount > self.tryDeferMark) {
+        self.cg_pushRax();
+        self.cg_emitDefersDownTo(self.tryDeferMark);
+        self.cg_popRax();
+      }
       self.cg_emitLeaRcxData(CG_EXN_VAL);
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x01);   // mov [rcx], rax
       self.cg_emitLeaRcxData(CG_EXN_PTR);
@@ -10796,6 +10813,13 @@ pub type Codegen = class {
     var savedBreakHead: int64 := self.curBreakHead;
     self.curBreakHead := -1;
 
+    // #1118: Ein `break` im switch-Zweig verlaesst diesen Zweig — seine defers
+    // laufen davor, genau wie beim Schleifen-break (#1006). Der Compiler
+    // ERZWINGT `break` oder `return` in jedem Zweig ("switch case may fall
+    // through"), der fehleranfaellige Pfad war also der vorgeschriebene.
+    var savedSwMark: int64 := self.loopDeferMark;
+    self.loopDeferMark := self.deferCount;
+
     var defaultCaseNode: int64 := -1;
     var caseCur: int64 := self.cg_nc1(ni);
     while (caseCur != -1) {
@@ -10849,6 +10873,7 @@ pub type Codegen = class {
       bh := nextLink;
     }
     self.curBreakHead := savedBreakHead;
+    self.loopDeferMark := savedSwMark;   // #1118
   }
 
   // WP-15: Generate match statement (like switch but for pattern matching)
@@ -10960,6 +10985,10 @@ pub type Codegen = class {
     // Save and reset break list
     var savedBreakHead: int64 := self.curBreakHead;
     self.curBreakHead := -1;
+
+    // #1118: wie beim switch — ein `break` im Zweig verlaesst nur diesen Zweig.
+    var savedSwMark: int64 := self.loopDeferMark;
+    self.loopDeferMark := self.deferCount;
 
     var defaultCaseNode: int64 := -1;
     var caseCur: int64 := self.cg_nc1(ni);  // first match case
@@ -11350,6 +11379,7 @@ pub type Codegen = class {
       bh := nextLink;
     }
     self.curBreakHead := savedBreakHead;
+    self.loopDeferMark := savedSwMark;   // #1118
   }
 
   // ------------------------------------------------------------------
@@ -11562,6 +11592,7 @@ pub type Codegen = class {
     self.deferCount := 0;
     self.dfCount    := 0;       // #1030: Argument-Slots gelten je Funktion
     self.loopDeferMark := -1;   // #1006: ausserhalb jeder Schleife
+    self.tryDeferMark  := -1;   // #1118: ausserhalb jedes try
     self.cg_genBlock(body);
 
     self.cg_zeroRax();
@@ -13043,6 +13074,7 @@ pub type Codegen = class {
     self.nestedCount := 0;
     self.deferCount := 0;
     self.loopDeferMark := -1;   // #1006
+    self.tryDeferMark  := -1;   // #1118
 
     self.includePath := 0;
     self.stdPath     := 0;

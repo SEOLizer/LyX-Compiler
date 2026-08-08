@@ -2,7 +2,51 @@
 
 ## Unveröffentlicht (develop)
 
-_(noch nichts)_
+### Compiler — `defer` lief auf zwei Ausgängen nicht (#1118)
+
+`defer` wurde bislang nur beim regulären Blockende und bei `return`
+abgearbeitet. Zwei Ausgänge übersprangen ihn:
+
+```lyx
+try { defer Print("d"c); throw 1; }
+catch { Print("c"c); }
+// erwartet: dc     tatsächlich: c
+
+switch (x) {
+  case 1: { defer Print("a"c); Print("n"c); break; }
+}
+// erwartet: na     tatsächlich: n
+```
+
+Genau im Fehlerfall unterblieb also die Freigabe — der Zweck von `defer`.
+Der `switch`-Fall wiegt zusätzlich, weil der Compiler in jedem Zweig `break`
+oder `return` **erzwingt** („switch case may fall through"): der defekte
+Pfad war der vorgeschriebene.
+
+**Ursache:** die fehlende Ebene, nicht eine falsche Rechnung. Für Schleifen
+gibt es seit #1006 die Marke `loopDeferMark` — den Stand des defer-Stapels
+beim Schleifeneintritt, bis zu dem `break`/`continue` vor dem Sprung
+abräumen. Für `try` existierte keine Entsprechung, und `cg_genSwitch` setzte
+die Marke nie, sodass der `break` dort mit der Marke der *umgebenden*
+Schleife (oder −1) lief.
+
+**Fix:** ein `tryDeferMark` analog zu `loopDeferMark`, um den try-Rumpf
+gesetzt und geschachtelt gerettet; `throw` arbeitet vor dem `longjmp` bis
+dorthin ab (den geworfenen Wert in `rax` über `push`/`pop` gerettet).
+`cg_genSwitch` und `cg_genMatch` setzen `loopDeferMark` auf den Eintritt
+ihres Zweigs, womit der bestehende `break`-Pfad greift.
+
+Ein `defer` **vor** dem `try` bleibt liegen, verschachtelte `try` räumen nur
+ihren eigenen Block ab, und ein `switch` innerhalb einer Schleife lässt die
+Schleifen-defers unberührt — vorher liefen die bei jedem `break` im Zweig
+zusätzlich, also doppelt.
+
+Nicht enthalten: `catch` bindet den geworfenen Wert nicht (`catch (e)` →
+„undefined symbol", `catch (e: int64)` → Parse-Fehler), obwohl ebnf.md §12
+die Bindung vorsieht. Eigene Lücke, eigenes Issue.
+
+Neu: `tests/defer_exit_paths_test.sh` (16 Prüfungen, misst die Reihenfolge
+der Ausgaben — 8 davon waren gegen 1.0.13M rot).
 
 ## Version 1.0.13M (August 2026)
 
