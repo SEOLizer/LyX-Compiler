@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.13P
+VERSION   := 1.0.13Q
 VERSION_DATE := 2026-08-08
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -267,6 +267,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- seccomp-Filter deckt die emittierten Syscalls (12 Pruefungen) ---"
 	@bash tests/seccomp_filter_test.sh
+	@echo "OK"
+	@echo "--- Struct-Elemente in Tupeln (16 Pruefungen) ---"
+	@bash tests/tuple_struct_elem_test.sh
 	@echo "OK"
 	@echo "--- Tupel-Rueckgabe aus Methoden (14 Pruefungen) ---"
 	@bash tests/method_tuple_return_test.sh

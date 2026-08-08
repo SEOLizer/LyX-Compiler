@@ -2,6 +2,44 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — Struct-Elemente in Tupeln gingen verloren (#1122)
+
+```lyx
+type S = struct { v: int64; };
+fn F(): (S, int64) { var s: S; s.v := 3; return (s, 4); }
+var a, b := F();   // a.v = 0 (erwartet 3), b = 4
+```
+
+Kein Müllwert wie bei #1121, sondern konstant `0` — und ohne jede Meldung.
+Betroffen war jede Position und jede Anzahl: `(S, int64)`, `(int64, S)`,
+`(S, S)`.
+
+**Ursache:** der Zeiger kam die ganze Zeit korrekt an —
+`tests/wp04_geo_tuple.lyx` prüft genau das und war grün. Was fehlte, war der
+**Typ** am entpackten Namen: die Schreibweise `var a, b := F();` trägt keine
+Annotation, der Slot blieb also typlos, `cg_objClassIdx` fand keine Klasse,
+der Feldzugriff bekam Offset `-1` und `cg_genFieldLoad` nullte `rax`. Ein
+stiller Default an der Stelle, an der ein unbekanntes Feld hätte auffallen
+müssen.
+
+**Fix:** eine Registry der Tupel-Elementtypen je Funktion bzw. je gemangelter
+Methode (`cg_registerTupleRet`/`cg_findTupleRet`), gefüllt im selben
+Vorabpass, der die übrigen Rückgabetypen sammelt. `cg_genTupleVarDecl`
+überträgt sie auf die beiden Namen. Erfasst sind freie Funktionen, Methoden,
+geerbte Methoden (der Rückgabetyp steht beim Elternteil, #1120) und
+`TypeName.M()`. Ist der Aufgerufene dem Codegen unbekannt (importiert,
+Builtin), bleibt der Name typlos wie bisher.
+
+**Stelligkeit:** Tupel haben genau **zwei** Elemente — die Aufrufkonvention
+trägt zwei Rückgabewerte (`rax`, `rdx`). Der Compiler wies mehr schon ab
+(#1088), die Grammatik in `ebnf.md` §7 nannte aber `{ "," Type }`. Beide
+sagen jetzt dasselbe; die Abweichung ist in §20.1 vermerkt. Ein N-Tupel
+bräuchte eine Rückgabe über Speicher plus ein N-stelliges Entpacken — das ist
+ein eigener Umbau und hier nicht enthalten.
+
+Neu: `tests/tuple_struct_elem_test.sh` (16 Prüfungen, davon 9 gegen 1.0.13P
+rot).
+
 ### Compiler — Tupel-Rückgabe aus Methoden lieferte Müll (#1121)
 
 ```lyx
