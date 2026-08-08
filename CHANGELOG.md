@@ -2,6 +2,27 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `f32` lieferte das Bitmuster statt des Werts (#1127)
+
+```lyx
+var a: f32 := 1.5;
+a as int64        // 4609434218613702656 statt 1
+```
+
+`cg_isF64Expr` prüfte den Typnamen ausschließlich gegen `"f64"`. Eine
+`f32`-Variable galt damit als Ganzzahl: Arithmetik und `as`-Konversion
+arbeiteten auf dem rohen IEEE-754-Bitmuster. `f64` war nie betroffen.
+
+Neu ist `cg_isFloatTypeName`, das beide Namen abdeckt. Umgestellt sind die
+Erkennung eines Bezeichners, die Cast-Erkennung, die Registrierung des
+Rückgabetyps, die `as`-Konversion (`cvtsi2sd`) und die Typklassifikation.
+
+Eine eigene 32-Bit-Darstellung gibt es weiterhin nicht: `f32` liegt wie `f64`
+als double im Register, und Struct-Felder wie Array-Elemente belegen ohnehin
+8 Byte. Der Typ dokumentiert damit die Absicht, nicht die Breite.
+
+Neuer Test: `tests/f32_value_test.sh`
+
 ### Compiler — `uint64`-Vergleiche liefen signiert (#1126)
 
 ```lyx
