@@ -1,6 +1,6 @@
-# Lyx 1.0.13J — Canonical EBNF Grammar
+# Lyx 1.0.13K — Canonical EBNF Grammar
 
-> Stand 2026-08-08, gegen lyxc 1.0.13J geprueft. Die Keyword-Liste in
+> Stand 2026-08-08, gegen lyxc 1.0.13K geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -338,11 +338,16 @@ TypeParamList       = Ident { "," Ident } ;
    erwartet spitze Klammern. `tests/generics_monomorph_test.lyx` folgte der
    alten Angabe und scheiterte deshalb.
 
-   Auch mit `<T>` ist das Feature nicht nutzbar: die Deklaration parst, die
-   Semantikpruefung loest den Typparameter aber nicht auf
-   ("unknown param type"). Generische TYPEN (`type P<T> = struct {...}`)
-   werden ueberhaupt nicht angenommen -- TypeParamClause steht daher nur an
-   Funktionen, nicht an Typdeklarationen. Siehe 20.1 und Issue #1009. *)
+   Generische FUNKTIONEN sind seit #1009 nutzbar: `fn Id<T>(x: T): T`, mehrere
+   Typparameter (`fn Pair<A, B>(a: A, b: B): A`), Aufrufe mit Struct-Typen
+   (`Id<P>(p)`) und -- seit #1117 -- die Weitergabe des eigenen Typparameters
+   an einen generischen Aufruf (`fn Twice<T>(x: T): T { return Id<T>(x); }`).
+   Ein Typparameter gilt nur INNERHALB seiner Funktion; ausserhalb ist er ein
+   unbekannter Typ und wird gemeldet.
+
+   Generische TYPEN (`type P<T> = struct {...}`) werden weiterhin nicht
+   angenommen -- TypeParamClause steht daher nur an Funktionen, nicht an
+   Typdeklarationen. Siehe 20.1. *)
 
 ParamList           = Param { "," Param } ;
 
