@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.13C
+VERSION   := 1.0.13D
 VERSION_DATE := 2026-08-08
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -261,6 +261,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
+	@echo "OK"
+	@echo "--- Arrays mit Struct-/Klassen-Elementtyp (12 Pruefungen) ---"
+	@bash tests/struct_array_test.sh
 	@echo "OK"
 	@echo "--- Capability-Argumente: Namen geprueft, Wirkung gemeldet (14 Pruefungen) ---"
 	@bash tests/capability_args_test.sh

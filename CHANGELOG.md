@@ -4,6 +4,55 @@
 
 _(noch nichts)_
 
+## Version 1.0.13D (August 2026)
+
+### Compiler — Arrays mit Struct- oder Klassen-Elementtyp (#1109)
+
+`var arr: S[3]; arr[0] := s; PrintLn(arr[0].v)` gab **0** statt `1`. Übersetzt
+wurde ohne Meldung.
+
+Drei Fehler übereinander, und die ersten beiden verdeckten sich gegenseitig:
+
+1. **Der Elementtyp wurde am Local nicht vermerkt.** Nur `NK_TYPE_NAME`
+   führte zu `cg_setLocalType`, `NK_TYPE_ARRAY_FIXED` nicht. Damit fand
+   `cg_arrayElemClassIdx` die Klasse nicht, `arr[0].v` bekam Feldoffset -1 und
+   lieferte still `0` — der bekannte „unbekanntes Feld → Offset 0"-Fall. Das
+   *Element* selbst kam korrekt an: `var q: S := arr[0]` las den richtigen
+   Wert. Sichtbar wurde der Fehler also nur über den Feldzugriff.
+2. **Die Allokation ließ den `{cap,len}`-Kopf aus.** Angefordert wurden `N*8`
+   Byte, der Indexzugriff überspringt aber 16 Byte (`lea rcx,[rax+16]`). Beide
+   Seiten waren gleich verschoben, deshalb fiel es bei skalaren Elementen nie
+   auf — gedeckt war das allein durch die Seitengröße der `mmap`. Mit
+   Zeiger-Slots traf der Zugriff Nullen, und `arr[2].v := 7` schrieb an
+   Adresse 0.
+3. **Der Index-Operator einer Klasse griff auf das Array zu.** Sobald der
+   Elementtyp vermerkt war, hielt `cg_tryClassIndex` die Array-Variable für
+   ein Klassenobjekt und machte aus `cs[1]` ein `cs.Get(1)` — mit der
+   Array-Basis als Empfänger. Der Index-Operator gehört nur einer Variablen,
+   die selbst ein Klassenobjekt *ist*.
+
+**Semantik: Zeiger-Slots.** `arr[i] := s` teilt das Objekt mit `s`, wie die
+Struct-Zuweisung sonst auch. Die Slots werden bei der Deklaration mit frischen
+Objekten belegt — `arr[0].v := 42` braucht also kein vorheriges `new`, genauso
+wie ein `var s: S;` seit WP-10d angelegt wird. Die Vorbelegung läuft als
+Laufzeitschleife: `N` steht zwar fest, aber ein `S[1000]` hätte sonst tausend
+Kopien derselben Befehlsfolge im Code.
+
+`tests/struct_array_test.sh` (12 Prüfungen, in `make test`) misst den **Wert**
+nach dem Schreiben; ein Test auf Übersetzbarkeit wäre grün gewesen, denn
+übersetzt wurde immer — nur eben Falsches. Mit Gegenproben: skalare Arrays
+unverändert, `len()` unverändert, und der Index-Operator einer Klasse bleibt
+überladen. Gegen den Vorgängerstand: 4 PASS, 8 FAIL.
+
+**Nicht enthalten:** `array[T]` und `Array<T>` ohne Initialisierung sind
+**null** und stürzen beim Zugriff ab. Das Issue schrieb das dem
+Struct-Elementtyp zu — es trifft alle Elementtypen, auch `Array<int64>`, und
+ist als **#1177** herausgelöst.
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`f0752a14…`).
+
 ## Version 1.0.13C (August 2026)
 
 ### Sicherheit — Capability-Argumente ohne Wirkung und ohne Prüfung (#1108)
