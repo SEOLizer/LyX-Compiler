@@ -2,6 +2,29 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — NaN-Vergleiche folgen IEEE 754 (#1128)
+
+```lyx
+var z: f64 := 0.0;
+var n: f64 := 0.0 / z;
+n == n        // war wahr, muss falsch sein
+n != n        // war falsch — das verbreitete NaN-Idiom erkannte nichts
+```
+
+`ucomisd` setzt bei einem NaN-Operanden ZF=1, PF=1 **und** CF=1 („unordered").
+Von den sechs Vergleichen waren nur `>` und `>=` schon richtig: `seta`/`setae`
+verlangen CF=0 und liefern deshalb ohnehin `false`. `sete`, `setb` und `setbe`
+lasen dagegen bloß ZF bzw. CF und meldeten wahr.
+
+`<` und `<=` werden jetzt mit vertauschten Operanden als `>`/`>=` gerechnet;
+Gleichheit und Ungleichheit prüfen zusätzlich das Paritätsflag (`setnp`/`setp`).
+Damit ist jeder Vergleich mit NaN falsch außer `!=` — wie es die Tabelle in
+`sprache/datentypen.txt` zusichert.
+
+Gewöhnliche Werte sind unberührt.
+
+Neuer Test: `tests/nan_compare_test.sh`
+
 ### Compiler — `f32` lieferte das Bitmuster statt des Werts (#1127)
 
 ```lyx
