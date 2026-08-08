@@ -36,6 +36,21 @@ Die Übersetzungszeit-Faltung rechnet den Shift jetzt ausdrücklich
 benutzen — dessen Verhalten war genau der Fehler, der Fixpunkt hätte sonst
 davon abgehangen, mit welchem Wirt gebaut wurde.
 
+**Der Bestand stützte sich auf das alte Verhalten** — die Gegenprobe fand
+neun Stellen, die den logischen Shift *brauchen*, und fünf Tests wurden davon
+rot (`pqc_wp01/04/07/10/11`, SHA3/SHAKE stimmten nicht mehr mit den
+NIST-Vektoren überein). Sie fordern ihn jetzt ausdrücklich per `as uint64` an:
+
+- Rotationen `(x << n) | (x >> (64 - n))` in `std/crypto/keccak.lyx`,
+  `std/hash.lyx` und `std/zstd.lyx` — `keccak.lyx` hielt die Abhängigkeit
+  sogar im Kommentar fest („Lyx >> ist SHR (logisch)").
+- Die Konstante-Zeit-Idiome in `std/crypto/ct.lyx` (`(x | -x) >> 63`), die
+  Bit 63 *herausziehen* statt es zu schmieren, sowie je eine Stelle in
+  `std/hash.lyx` und `src/crypto/lic_ed25519.lyx`.
+
+Byte-Extraktionen der Form `(v >> 56) & 255` sind unberührt: die Maske
+entfernt die nachgezogenen Vorzeichenbits ohnehin.
+
 Unverändert: `<<`, Division und Modulo (die waren schon korrekt), sowie die
 Maskierung des Shift-Betrags auf 6 Bit (`1 << 64` ergibt `1` — Verhalten der
 Hardware, im Issue als Randnotiz und nicht als Fehler geführt).
