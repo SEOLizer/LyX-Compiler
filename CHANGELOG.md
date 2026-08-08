@@ -4,6 +4,49 @@
 
 _(noch nichts)_
 
+## Version 1.0.13H (August 2026)
+
+### Compiler — dynamisches Array ohne Initialisierung war null (#1177)
+
+```lyx
+var a: Array<int64>;
+PrintLn(len(a));      // traf die Null
+a[0] := 5;            // schrieb dorthin
+```
+
+Betroffen waren alle drei Schreibweisen (`Array<T>`, `array[T]`, `T[]`) und
+jeder Elementtyp — das Ausgangs-Issue #1109 schrieb den Absturz fälschlich dem
+Struct-Elementtyp zu.
+
+Auffällig war der Widerspruch im Bestand: `int64[N]` wird seit jeher belegt,
+`var s: S;` seit WP-10d, und `push` legte **lazy** an — die dynamische
+Schreibweise fiel als einzige heraus. Genau das machte auch die Entscheidung
+leicht: **abweisen** schied aus, weil `var a: int64[]; push(a, 5);`
+nachweislich funktioniert und damit gebrochen wäre.
+
+Die Deklaration legt jetzt dasselbe leere Array an, das `push` sonst beim
+ersten Aufruf erzeugt (`cap` = 1024, `len` = 0). `push` findet den Zeiger
+gesetzt vor und überspringt seinen eigenen Allokationszweig.
+
+Damit die beiden Stellen nicht auseinanderlaufen können, liegt die Folge jetzt
+**einmal** als `cg_emitEmptyDynArray` vor und wird von beiden benutzt — vorher
+stand sie ausgeschrieben in `cg_genArrayPush`.
+
+`tests/dyn_array_decl_test.sh` (12 Prüfungen, in `make test`) misst das
+Verhalten **vor** dem ersten `push`: `len` liefert 0 statt abzustürzen, der
+Zeiger ist gesetzt, ein Schreibzugriff kommt an. Vier Gegenproben: mit
+Initialisierung (`= []` und `= [7,8,9]`) darf nicht zusätzlich belegt werden,
+und `int64[N]` wie `S[N]` bleiben unberührt. Gegen den Vorgängerstand:
+6 PASS, 6 FAIL.
+
+Zu beachten: jede solche Deklaration belegt 8208 Byte — dieselbe Größe, die
+`push` bisher beim ersten Aufruf nahm, nur früher. Wer viele dynamische Arrays
+deklariert und nie füllt, zahlt das jetzt sofort.
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`b37ffe10…`).
+
 ## Version 1.0.13G (August 2026)
 
 ### Compiler — Array als Funktionsparameter (#1115)
