@@ -63,6 +63,9 @@ pub con NK_CAST:      int64 := 53;  // WP-11: x as Type
 pub con NK_CLOSURE:   int64 := 54;  // closure { fn ptr, captured env }
 pub con NK_FN_PTR:    int64 := 55;  // function pointer type: fn(T1, T2): R
 pub con NK_METHOD_PTR: int64 := 129; // B2: method(T1,T2): R — fat pointer {code,data} (16B)
+// #1113: Bereichsmuster `case lo..hi =>` und `case lo.. =>` (§14).
+// iVal = untere Grenze, c1 = NK_LIT_INT der oberen Grenze oder -1 (offen).
+pub con NK_PATTERN_RANGE: int64 := 131;
 pub con NK_ASM:        int64 := 130; // WSP-05: asm { "mnemonic" ... } inline-assembly; c0=NK_LIT_STR-Kette
 
 // WP-14: Generic type nodes
@@ -2209,11 +2212,37 @@ pub type Parser = class {
       if (self.Check(TK_UNDER) != 0) {
         self.Advance();
         pat := self._alloc(NK_PATTERN_WILD, cti);
-      } else if (self.Check(TK_INT) != 0) {
-        // Integer literal pattern
-        pat := self._alloc(NK_PATTERN_LIT, cti);
-        self._siv(pat, self.TokIVal(self.cur));
+      } else if (self.Check(TK_INT) != 0 || (self.Check(TK_MINUS) != 0 && self.TokKind(self.cur + 1) == TK_INT)) {
+        // Integer literal pattern — oder ein Bereichsmuster, wenn `..` folgt.
+        var negLo: int64 := 0;
+        if (self.Check(TK_MINUS) != 0) { negLo := 1; self.Advance(); }
+        var loVal: int64 := self.TokIVal(self.cur);
+        if (negLo != 0) { loVal := 0 - loVal; }
         self.Advance();
+        if (self.Check(TK_DOTDOT) != 0) {
+          // #1113: RangePattern = RangeBound ".." [ RangeBound ]  (§14)
+          self.Advance();
+          pat := self._alloc(NK_PATTERN_RANGE, cti);
+          self._siv(pat, loVal);
+          self._sc1(pat, 0 - 1);
+          if (self.Check(TK_INT) != 0 || self.Check(TK_MINUS) != 0) {
+            var negHi: int64 := 0;
+            if (self.Check(TK_MINUS) != 0) { negHi := 1; self.Advance(); }
+            var hiTok: int64 := self.cur;
+            self.Expect(TK_INT);
+            var hiVal: int64 := self.TokIVal(hiTok);
+            if (negHi != 0) { hiVal := 0 - hiVal; }
+            var hiNode: int64 := self._alloc(NK_LIT_INT, hiTok);
+            self._siv(hiNode, hiVal);
+            self._sc1(pat, hiNode);
+            if (hiVal < loVal) {
+              self._err("Bereichsmuster: obere Grenze liegt unter der unteren"c);
+            }
+          }
+        } else {
+          pat := self._alloc(NK_PATTERN_LIT, cti);
+          self._siv(pat, loVal);
+        }
       } else if (self.Check(TK_IDENT) != 0) {
         // Check for enum payload pattern: IDENT(IDENT)
         var identStart: int64 := self._tokOff(self.cur);
@@ -2300,9 +2329,28 @@ pub type Parser = class {
         if (self.Check(TK_UNDER) != 0) {
           self.Advance(); rhs := self._alloc(NK_PATTERN_WILD, cti);
         } else if (self.Check(TK_INT) != 0) {
-          rhs := self._alloc(NK_PATTERN_LIT, cti);
-          self._siv(rhs, self.TokIVal(self.cur));
+          // #1113: auch als Alternative eines Or-Musters: `case 0..9 | 20..29 =>`
+          var orLo: int64 := self.TokIVal(self.cur);
           self.Advance();
+          if (self.Check(TK_DOTDOT) != 0) {
+            self.Advance();
+            rhs := self._alloc(NK_PATTERN_RANGE, cti);
+            self._siv(rhs, orLo);
+            self._sc1(rhs, 0 - 1);
+            if (self.Check(TK_INT) != 0) {
+              var orHiTok: int64 := self.cur;
+              self.Advance();
+              var orHi: int64 := self._alloc(NK_LIT_INT, orHiTok);
+              self._siv(orHi, self.TokIVal(orHiTok));
+              self._sc1(rhs, orHi);
+              if (self.TokIVal(orHiTok) < orLo) {
+                self._err("Bereichsmuster: obere Grenze liegt unter der unteren"c);
+              }
+            }
+          } else {
+            rhs := self._alloc(NK_PATTERN_LIT, cti);
+            self._siv(rhs, orLo);
+          }
         } else if (self.Check(TK_IDENT) != 0) {
           rhs := self._alloc(NK_PATTERN_LIT, cti);
           self._ssv(rhs, self._tokOff(self.cur), self._tokLen(self.cur));
