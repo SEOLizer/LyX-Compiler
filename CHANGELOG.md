@@ -2,6 +2,34 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `@bounds_check(true)` war wirkungslos (#1124)
+
+Die Direktive erzeugte dieselbe Binary wie gar keine Angabe. Wer die
+Indexprüfung ausdrücklich anforderte, bekam sie ohne `--runtime-checks`
+trotzdem nicht.
+
+**Ursache:** der Vorgabewert. `boundsCheckEnabled` steht auf 1, „angefordert"
+und „nicht gesetzt" waren davon nicht zu unterscheiden — der
+Emissionszweig fragte nur ab, ob jemand *abgeschaltet* hat. Die Direktive
+konnte also ausschließlich in der Richtung `false` wirken.
+
+**Fix:** ein zweites Feld `boundsCheckForced`. `@bounds_check(true)` fordert
+die Prüfung an und wirkt damit auch ohne `--runtime-checks`;
+`@bounds_check(false)` schaltet sie weiterhin ab, auch *wenn* die Option
+gesetzt ist — die Direktive steht näher am Code. Gilt am Dateikopf wie auf
+Anweisungsebene, für feste und dynamische Arrays.
+
+Nicht betroffen und schon vorhanden: ein **konstanter** Index außerhalb der
+Grenzen wird zur Übersetzungszeit abgewiesen (sema, ohne Schalter), und
+`--runtime-checks` prüft berechnete Indizes — beides seit #1156. Der
+Issue-Text beschrieb den Stand von 1.0.11D, davor.
+
+Neu: `tests/bounds_check_directive_test.sh` (12 Prüfungen, davon 5 gegen
+1.0.13Q rot). §20.1 nennt jetzt beide Richtungen der Direktive.
+
+Nicht enthalten: der Nebenbefund zu `Map<K,V>` (deklarierbar, aber ohne
+Zugriffsfunktionen) — als #1205 geführt.
+
 ### Compiler — Struct-Elemente in Tupeln gingen verloren (#1122)
 
 ```lyx
