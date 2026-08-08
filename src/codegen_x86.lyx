@@ -222,7 +222,7 @@ con CGN_FN_PTR_NODE: int64 := 55;  // fn(...): R thin-fn-pointer-Typ-Node
 con CGN_ASM:         int64 := 130; // WSP-05: asm-Block-Statement
 con CGN_FIELD_DECL: int64 := 7;
 
-con CG_CLASS_SZ:           int64 := 72;
+con CG_CLASS_SZ:           int64 := 88;
 con CG_CLASS_OFF_NAMELEN:  int64 := 8;
 con CG_CLASS_OFF_FIELDSPTR: int64 := 16;
 con CG_CLASS_OFF_FIELDCNT: int64 := 24;
@@ -234,6 +234,13 @@ con CG_CLASS_OFF_PARENTIDX: int64 := 56;  // WP-BC-L2: parent class layout index
 // Methoden bekommt Klassen-Layout; ohne diese Merkung waere es davon nicht
 // mehr zu unterscheiden, und lokale Variablen blieben uneingerichtet.
 con CG_CLASS_OFF_ISSTRUCT:  int64 := 64;
+// #1120: Namen ALLER in dieser Klasse deklarierten Methoden — auch der nicht
+// virtuellen. VMTLIST fuehrt nur die virtuellen; ohne diese Liste laesst sich
+// nicht feststellen, WELCHE Klasse der Kette eine geerbte Methode definiert,
+// und der Aufruf wurde auf den Namen der abgeleiteten Klasse gemangelt (`B_G`
+// fuer eine bei A liegende Methode). Eintrag wie bei VMTLIST: {ptr:8, len:8}.
+con CG_CLASS_OFF_METHLIST:  int64 := 72;
+con CG_CLASS_OFF_METHCNT:   int64 := 80;
 
 con CG_VMT_METH_PATCH_SZ:       int64 := 16;
 con CG_VMT_METH_OFF_CODESTART:  int64 := 8;
@@ -3761,6 +3768,23 @@ pub type Codegen = class {
       self.classLayouts := nb;
       self.classCap := nc;
     }
+    // #1120: alle deklarierten Methoden dieser Klasse merken (virtuell oder
+    // nicht). Nur die eigenen — die geerbten findet cg_findMethodOwner ueber
+    // PARENTIDX, und genau diese Trennung entscheidet bei gleichem Namen fuer
+    // die naeher liegende Definition.
+    var declCnt: int64 := 0;
+    var mthC: int64 := self.cg_nc1(ni);
+    while (mthC != -1) { declCnt := declCnt + 1; mthC := self.cg_nnext(mthC); }
+    var declList: int64 := alloc((declCnt + 1) * 16);
+    var declI: int64 := 0;
+    mthC := self.cg_nc1(ni);
+    while (mthC != -1) {
+      poke64(declList + declI * 16,     self.cg_nsval(mthC) as int64);
+      poke64(declList + declI * 16 + 8, self.cg_nslen(mthC));
+      declI := declI + 1;
+      mthC := self.cg_nnext(mthC);
+    }
+
     var base: int64 := self.classLayouts + self.classCount * CG_CLASS_SZ;
     poke64(base,      className as int64);
     poke64(base + CG_PATCH_OFF_NAMEPTR,  classLen);
@@ -3773,7 +3797,10 @@ pub type Codegen = class {
     // #1095: als struct deklariert? Ein struct MIT Methoden landet hier im
     // Klassen-Layout und ist sonst nicht mehr als struct erkennbar.
     poke64(base + CG_CLASS_OFF_ISSTRUCT, (self.cg_nival(ni) >> 4) & 1);
+    poke64(base + CG_CLASS_OFF_METHLIST, declList);   // #1120
+    poke64(base + CG_CLASS_OFF_METHCNT,  declCnt);
     self.classCount += 1;
+    self.cg_trackTempBuf(declList, (declCnt + 1) * 16);
     // Track temporary field array for later cleanup (BUG-02)
     // The flds pointer is stored in classLayouts and used by cg_findField/cg_getFieldOffset
     // until cg_patchAll() completes. cg_freeAllTempBufs() will release it.
@@ -3938,7 +3965,23 @@ pub type Codegen = class {
     // bekommen struct-Layout, und die Kette waere abgeschnitten.
     poke64(base + CG_CLASS_OFF_PARENTIDX, pIdx);
     poke64(base + CG_CLASS_OFF_ISSTRUCT, (self.cg_nival(ni) >> 4) & 1);
+    // #1120: auch hier — ein struct kann Methoden tragen und beerbt werden.
+    var sDeclCnt: int64 := 0;
+    var sMth: int64 := self.cg_nc1(ni);
+    while (sMth != -1) { sDeclCnt := sDeclCnt + 1; sMth := self.cg_nnext(sMth); }
+    var sDeclList: int64 := alloc((sDeclCnt + 1) * 16);
+    var sDeclI: int64 := 0;
+    sMth := self.cg_nc1(ni);
+    while (sMth != -1) {
+      poke64(sDeclList + sDeclI * 16,     self.cg_nsval(sMth) as int64);
+      poke64(sDeclList + sDeclI * 16 + 8, self.cg_nslen(sMth));
+      sDeclI := sDeclI + 1;
+      sMth := self.cg_nnext(sMth);
+    }
+    poke64(base + CG_CLASS_OFF_METHLIST, sDeclList);
+    poke64(base + CG_CLASS_OFF_METHCNT,  sDeclCnt);
     self.classCount += 1;
+    self.cg_trackTempBuf(sDeclList, (sDeclCnt + 1) * 16);
     // Track temporary field array for later cleanup (BUG-02)
     self.cg_trackTempBuf(flds, (cnt + 1) * CG_CFIELD_SZ);
   }
@@ -4607,6 +4650,33 @@ pub type Codegen = class {
   }
 
   // #1094: Ist ci eine Klasse, die von target abstammt (oder target selbst)?
+  // #1120: die Klasse der Kette finden, die `name` tatsaechlich DEKLARIERT.
+  // Der Aufruf `b.G()` wurde bisher stur auf den statischen Typ des Empfaengers
+  // gemangelt (`B_G`), obwohl die nicht-virtuelle Methode bei A liegt und nicht
+  // wie die Felder in die abgeleitete Klasse kopiert wird. Ergebnis war ein
+  // Abbruch mit einem Namen, den niemand geschrieben hat.
+  //
+  // Die naeheste Definition gewinnt: eine in B neu definierte Methode gleichen
+  // Namens trifft weiterhin B. Findet sich nichts, kommt -1 zurueck — der
+  // Aufrufer mangelt dann wie bisher und der Fehler bleibt laut.
+  fn cg_findMethodOwner(ci: int64, name: pchar, nameLen: int64): int64 {
+    var cur: int64 := ci;
+    while (cur >= 0) {
+      var cb: int64 := self.classLayouts + cur * CG_CLASS_SZ;
+      var lst: int64 := peek64(cb + CG_CLASS_OFF_METHLIST);
+      var cnt: int64 := peek64(cb + CG_CLASS_OFF_METHCNT);
+      var k: int64 := 0;
+      while (k < cnt) {
+        var mn: pchar := peek64(lst + k * 16) as pchar;
+        var ml: int64 := peek64(lst + k * 16 + 8);
+        if (self.cg_seq(mn, ml, name, nameLen) != 0) { return cur; }
+        k := k + 1;
+      }
+      cur := peek64(cb + CG_CLASS_OFF_PARENTIDX);
+    }
+    return 0 - 1;
+  }
+
   fn cg_isDescendantClass(ci: int64, target: int64): int64 {
     var cur: int64 := ci;
     while (cur >= 0) {
@@ -6882,8 +6952,16 @@ pub type Codegen = class {
           self.cg_e8(0xFF); self.cg_e8(0xD0);
           return;
         }
-        var clsName: pchar := peek64(clsBase) as pchar;
-        var clsLen:  int64 := peek64(clsBase + CG_CLASS_OFF_NAMELEN);
+        // #1120: nicht die statische Klasse des Empfaengers mangeln, sondern
+        // die Klasse, die die Methode deklariert. Fuer eine geerbte
+        // nicht-virtuelle Methode gibt es kein `B_G` — der Rumpf steht unter
+        // `A_G`. Wird nichts gefunden, bleibt es beim statischen Namen und der
+        // Abbruch in cg_patchAll meldet ihn wie bisher.
+        var mangBase: int64 := clsBase;
+        var ownerIdx: int64 := self.cg_findMethodOwner(classIdx, fname, fnlen);
+        if (ownerIdx >= 0) { mangBase := self.classLayouts + ownerIdx * CG_CLASS_SZ; }
+        var clsName: pchar := peek64(mangBase) as pchar;
+        var clsLen:  int64 := peek64(mangBase + CG_CLASS_OFF_NAMELEN);
         var mangLen: int64 := clsLen + 1 + fnlen;
         var mangBuf: int64 := alloc(mangLen + 1);
         var mi: int64 := 0;

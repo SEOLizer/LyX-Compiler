@@ -2,6 +2,40 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — geerbte nicht-virtuelle Methode nicht aufrufbar (#1120)
+
+```lyx
+type A = class { v: int64; fn G(): int64 { return 7; } };
+type B = class extends A { };
+var b: B := new B(); b.G();
+// error: undefined function 'B_G' — no codegen implementation found
+```
+
+Der Aufruf wurde auf den gemangelten Namen der **statischen** Klasse des
+Empfängers abgebildet. Anders als die Felder wird eine Methode aber nicht in
+die abgeleitete Klasse kopiert — der Rumpf steht unter `A_G`, ein `B_G` gibt
+es nie. Die Meldung nannte damit einen Namen, den niemand geschrieben hat,
+und der einzige Ausweg war, jede geerbte Methode `virtual` zu machen (nur
+dann lief der Aufruf über die VMT), auch wo keine Überschreibung vorgesehen
+war.
+
+**Fix:** das Klassen-Layout führt jetzt die je Klasse *deklarierten*
+Methoden mit (`CG_CLASS_OFF_METHLIST`/`METHCNT`) — `VMTLIST` kannte nur die
+virtuellen, damit ließ sich nicht feststellen, welche Klasse der Kette eine
+Methode definiert. `cg_findMethodOwner` läuft die Kette über
+`CG_CLASS_OFF_PARENTIDX` hoch, dieselbe, die `cg_isDescendantClass` schon
+benutzt, und der Aufruf mangelt auf die gefundene Klasse.
+
+Die *näheste* Definition gewinnt: bei `A → B → C` mit `G` in A und B trifft
+`c.G()` die von B. Findet sich nichts in der Kette, bleibt es beim statischen
+Namen und der Abbruch meldet ihn wie bisher — kein stiller Default.
+`virtual` bleibt spät gebunden, `super.G()` geht weiter direkt zur
+Elternimplementierung (#1091). Cross-Module vererbte Methoden funktionieren
+ebenfalls.
+
+Neu: `tests/inherited_method_call_test.sh` (14 Prüfungen, davon 7 gegen
+1.0.13N rot).
+
 ### Compiler — `defer` lief auf zwei Ausgängen nicht (#1118)
 
 `defer` wurde bislang nur beim regulären Blockende und bei `return`
