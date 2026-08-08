@@ -2,6 +2,32 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `uint64`-Vergleiche liefen signiert (#1126)
+
+```lyx
+var a: uint64 := 18446744073709551615;
+var b: uint64 := 1;
+a > b        // falsch statt wahr
+```
+
+Jeder Wert ab 2^63 wurde als negativ gelesen: Der Codegen erzeugte durchgängig
+`setl`/`setg` (signiert) statt `setb`/`seta`. Unterhalb von 2^63 fiel das nicht
+auf, weil sich beide Lesarten dort nicht unterscheiden — betroffen war also
+gerade der Bereich, für den man `uint64` überhaupt wählt: Dateigrößen, Hashes,
+Zeitstempel jenseits von 2^63.
+
+`cg_emitBinOp` bekommt den Parameter `cmpUnsigned`. Anders als beim Rechtsshift,
+wo allein der linke Operand entscheidet, zählt beim Vergleich, ob **einer** der
+beiden vorzeichenlos ist — wie bei den üblichen arithmetischen Konversionen.
+Damit greift die Korrektur auch bei `5 < b`, wo der unsignierte Operand rechts
+steht.
+
+Der zweite Teil des Issues — schmale Typen wrappen nicht auf ihre Breite — war
+bereits mit #1151 erledigt und ist mitgeprüft: `uint8 255 + 1` ergibt `0`,
+`int8 127 + 1` ergibt `-128`.
+
+Neuer Test: `tests/unsigned_compare_test.sh`
+
 ### Compiler — `>>` auf `int64` war logisch statt arithmetisch (#1125)
 
 ```lyx
