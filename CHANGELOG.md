@@ -4,6 +4,47 @@
 
 _(noch nichts)_
 
+## Version 1.0.13J (August 2026)
+
+### Sicherheit — neue Capability `fs.perm` für Rechteänderungen (#1188)
+
+`chmod` und `chown` waren mit aktivem LCBS **gar nicht erreichbar**: die
+Intrinsics gibt es, `std.fs` benutzt sie, aber keine der fünf
+Dateisystem-Capabilities deckte sie ab. Jedes Programm mit `@capabilities`
+starb dort mit `SIGSYS`, egal welche Rechte es anforderte.
+
+Von den drei in #1188 aufgeführten Wegen ist der additive umgesetzt:
+
+| Capability | Bedeutung |
+|---|---|
+| `fs.meta` | Metadaten **lesen** (stat, Verzeichnislisting) |
+| **`fs.perm`** | **Zugriffsrechte und Eigentümer ändern** (chmod, chown) |
+
+`chmod` an `fs.meta` zu hängen wäre der kleinere Eingriff gewesen und genau
+deshalb falsch: wer die Capability anfordert, um ein Verzeichnis aufzulisten,
+bekäme stillschweigend das Recht, Zugriffsrechte umzuschreiben. Eine
+Ausweitung, die niemand angefordert hat, ist das Gegenteil dessen, wofür ein
+Capability-Modell da ist.
+
+Freigegeben werden mit `fs.perm`: `chmod` (90), `fchmod` (91), `fchmodat`
+(268), `chown` (92), `fchown` (93), `lchown` (94), `fchownat` (260).
+
+Die Capability ist an allen Stellen registriert, an denen die anderen stehen —
+Registry, Namensauflösung, seccomp-Generator, Audit-Report und die
+Argument-Whitelist (`fs.perm(path: …)`). Der Audit-Report nannte sie zunächst
+`unknown`, weil die Namenstabelle in `src/tooling/audit.lyx` eine eigene Kopie
+ist; auch das ist nachgezogen.
+
+`tests/seccomp_filter_test.sh` wächst auf 16 Prüfungen und hält beide
+Richtungen fest: `chmod`/`chown` laufen mit `fs.perm` und sterben ohne — auch
+mit allen anderen fs-Capabilities zusammen. Dazu die Gegenprobe, dass
+`fs.perm` **keine** Dateien öffnet: die Capability gibt Rechte frei, nicht
+Inhalte. Gegen den Vorgängerstand: 13 PASS, 3 FAIL.
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`04bd05a9…`).
+
 ## Version 1.0.13I (August 2026)
 
 ### Sicherheit — seccomp-Filter kannte die emittierten Syscalls nicht (#1185)
