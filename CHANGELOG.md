@@ -4,6 +4,59 @@
 
 _(noch nichts)_
 
+## Version 1.0.13F (August 2026)
+
+### Sprache — Bereichsmuster in `match` (#1113)
+
+```lyx
+match (altitude) {
+    case 0..500      => { return "Bodennaher Betrieb"; }
+    case 501..3000   => { return "Platzrunde / Anflug"; }
+    case 3001..10000 => { return "Steigflug"; }
+    case 13001..     => { return "Hochflug"; }
+    case _           => { return "Ungültig"; }
+}
+```
+
+Vorher: `Parse error: expected =>, got '..'`.
+
+Ein Feature-Request, kein Bug — §14 sah Bereichsmuster nicht vor. Der Ersatz
+war allerdings deutlich schlechter: eine OR-Liste bräuchte für `0..500`
+fünfhunderteins Alternativen, und eine `if`-Kette nimmt `match` genau den
+Vorteil, für den es da ist. Die Bausteine lagen vor: `..` ist ein etabliertes
+Token mit eigener Disambiguierungsregel (§1.1), und die Grenzenauswertung gibt
+es seit den Bereichstypen (#1082).
+
+Festgelegt, in §14 dokumentiert:
+
+- Grenzen sind **einschließlich** — `500` trifft noch `0..500`, `501` schon den
+  nächsten Zweig. Dieselbe Lesart wie beim Bereichstyp.
+- Die **obere** Grenze darf fehlen (`case 13001.. =>`), die untere nicht; so
+  steht es in der vorgeschlagenen Produktion `RangeBound ".." [ RangeBound ]`.
+- Negative Grenzen sind erlaubt (`case -10..-1`).
+- Bei **Überschneidung** gewinnt der erste passende Zweig, wie bei den übrigen
+  Mustern; eine **Lücke** zwischen zwei Bändern fällt an den Wildcard und nicht
+  an das nächstliegende Band.
+- Verdrehte Grenzen (`case 9..1`) werden abgewiesen.
+
+Ein Bereich ist auch als Alternative eines **Or-Musters** (`case 0..9 | 20..29`)
+und mit **Guard** verwendbar. Der Or-Fall brauchte eigene Sorgfalt: anders als
+der Gleichheitsvergleich prüft ein Bereich zwei Bedingungen, der
+Treffer-Sprung darf also erst fallen, wenn beide zusagen.
+
+Erzeugt werden zwei Vergleiche je Bereich, keine Sprungtabelle — das wäre eine
+eigene Optimierung.
+
+`tests/match_range_test.sh` (12 Prüfungen, in `make test`) prüft, **welcher
+Zweig trifft** — an den Grenzen und daneben. Ein Test auf Übersetzbarkeit
+könnte einen Bereich nicht von einem Wildcard unterscheiden. Zwei Gegenproben:
+ein Einzelwert-Muster bleibt ein Einzelwert, und `..` außerhalb von Mustern
+bleibt der Bereichstyp. Gegen den Vorgängerstand: 2 PASS, 10 FAIL.
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`dad0dfb9…`).
+
 ## Version 1.0.13E (August 2026)
 
 ### Sicherheit — `dim`/`utype` hatten keine Semantik (#1110)

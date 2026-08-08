@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.13E
+VERSION   := 1.0.13F
 VERSION_DATE := 2026-08-08
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -261,6 +261,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
+	@echo "OK"
+	@echo "--- Bereichsmuster in match (12 Pruefungen) ---"
+	@bash tests/match_range_test.sh
 	@echo "OK"
 	@echo "--- Einheitentypen: Faktor, Dimension, range/wraps (18 Pruefungen) ---"
 	@bash tests/utype_test.sh

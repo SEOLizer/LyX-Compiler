@@ -84,6 +84,8 @@ con CGN_FIELD:       int64 := 51;
 con CGN_NEW:         int64 := 52;
 con CGN_CAST:        int64 := 53;  // WP-11: x as Type
 con CGN_CLOSURE:     int64 := 54;  // WP-13: closure { fn ptr, captured env }
+// #1113: Bereichsmuster; iVal = untere Grenze, c1 = obere Grenze oder -1.
+con CGN_PATTERN_RANGE: int64 := 131;
 con CGN_MATCH:       int64 := 64;  // WP-15: match expr { cases }
 con CGN_NAMED_ARG:   int64 := 108; // WP-MEM-05: named call arg; nc0=value
 con CGN_MATCH_CASE:  int64 := 65;  // WP-15: case pattern => expr
@@ -10782,6 +10784,30 @@ pub type Codegen = class {
     if (self.cg_nkind(altPat) == CGN_PATTERN_OR) {
       self.cg_emitOrAlt(matchOff, self.cg_nc0(altPat));
       self.cg_emitOrAlt(matchOff, self.cg_nc1(altPat));
+    } else if (self.cg_nkind(altPat) == CGN_PATTERN_RANGE) {
+      // #1113: `case 0..9 | 20..29 =>`. Anders als der Gleichheitsvergleich
+      // braucht ein Bereich ZWEI Vergleiche, und der Treffer-Sprung darf erst
+      // fallen, wenn beide zusagen. Deshalb zuerst ueber die Alternative
+      // hinwegspringen, wenn eine Grenze verletzt ist.
+      var oLo: int64 := self.cg_nival(altPat);
+      var oHiN: int64 := self.cg_nc1(altPat);
+      self.cg_loadRax(matchOff);
+      self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e32(oLo);      // cmp rax, lo
+      self.cg_e8(0x0F); self.cg_e8(0x8C);                          // jl  weiter
+      var ojLo: int64 := self.codeLen; self.cg_e32(0);
+      var ojHi: int64 := 0 - 1;
+      if (oHiN >= 0) {
+        self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e32(self.cg_nival(oHiN));
+        self.cg_e8(0x0F); self.cg_e8(0x8F);                        // jg  weiter
+        ojHi := self.codeLen; self.cg_e32(0);
+      }
+      // Getroffen: in die Trefferkette einhaengen (unbedingter Sprung).
+      self.cg_e8(0xE9);
+      var oHit: int64 := self.codeLen;
+      self.cg_e32(self.orBodyHead);
+      self.orBodyHead := oHit;
+      poke32(self.code + ojLo, self.codeLen - ojLo - 4);
+      if (ojHi >= 0) { poke32(self.code + ojHi, self.codeLen - ojHi - 4); }
     } else {
       self.cg_loadRax(matchOff);
       self.cg_pushRax();
@@ -11108,6 +11134,41 @@ pub type Codegen = class {
           // Unknown variant — treat as wildcard/default
           defaultCaseNode := caseCur;
         }
+      } else if (patKind == CGN_PATTERN_RANGE) {
+        // #1113: `case lo..hi =>` bzw. `case lo.. =>`. Zwei Vergleiche statt
+        // einem — die OR-Liste waere bei `0..500` 501 Alternativen, und eine
+        // if-Kette nimmt `match` genau den Vorteil, fuer den es da ist.
+        var rLo: int64 := self.cg_nival(patNode);
+        var rHiNode: int64 := self.cg_nc1(patNode);
+        self.cg_loadRax(matchOff);
+        // cmp rax, lo; jl next_case
+        self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e32(rLo);
+        self.cg_e8(0x0F); self.cg_e8(0x8C);
+        var rjLo: int64 := self.codeLen; self.cg_e32(0);
+        var rjHi: int64 := 0 - 1;
+        if (rHiNode >= 0) {
+          // cmp rax, hi; jg next_case   — Grenzen einschliesslich, wie beim
+          // Bereichstyp (#1082).
+          self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e32(self.cg_nival(rHiNode));
+          self.cg_e8(0x0F); self.cg_e8(0x8F);
+          rjHi := self.codeLen; self.cg_e32(0);
+        }
+        var rGuardFail: int64 := 0 - 1;
+        if (guardNode >= 0) {
+          self.cg_genExpr(guardNode);
+          self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);
+          self.cg_e8(0x0F); self.cg_e8(0x84);
+          rGuardFail := self.codeLen; self.cg_e32(0);
+        }
+        self.cg_genMatchBody(bodyNode);
+        self.cg_e8(0xE9);
+        var bpR: int64 := self.codeLen;
+        self.cg_e32(self.curBreakHead);
+        self.curBreakHead := bpR;
+        poke32(self.code + rjLo, self.codeLen - rjLo - 4);
+        if (rjHi >= 0) { poke32(self.code + rjHi, self.codeLen - rjHi - 4); }
+        if (rGuardFail >= 0) { poke32(self.code + rGuardFail, self.codeLen - rGuardFail - 4); }
+
       } else {
         // Load subject value, compare with pattern
         self.cg_loadRax(matchOff);

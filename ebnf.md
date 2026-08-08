@@ -1,6 +1,6 @@
-# Lyx 1.0.13E — Canonical EBNF Grammar
+# Lyx 1.0.13F — Canonical EBNF Grammar
 
-> Stand 2026-08-08, gegen lyxc 1.0.13E geprueft. Die Keyword-Liste in
+> Stand 2026-08-08, gegen lyxc 1.0.13F geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -820,6 +820,7 @@ LValueSuffix        = "." Ident
 
 ```ebnf
 Pattern             = LiteralPattern
+                    | RangePattern
                     | IdentPattern
                     | EnumPattern
                     | WildcardPattern
@@ -827,6 +828,19 @@ Pattern             = LiteralPattern
                     | StructPattern ;
 
 LiteralPattern      = Literal ;
+
+RangePattern        = RangeBound ".." [ RangeBound ] ;
+
+RangeBound          = [ "-" ] IntLiteral ;
+
+(* #1113: Grenzen sind EINSCHLIESSLICH, wie beim Bereichstyp in Abschnitt 7.
+   Die obere Grenze darf fehlen (`case 13001.. =>`), die untere nicht. Bei
+   Ueberschneidung gewinnt der ERSTE passende Zweig, wie bei den uebrigen
+   Mustern auch; eine Luecke zwischen zwei Baendern faellt an den Wildcard und
+   nicht an das naechstliegende Band. Ein Bereich ist auch als Alternative
+   eines Or-Musters (`case 0..9 | 20..29`) und mit Guard verwendbar.
+
+   Erzeugt werden zwei Vergleiche je Bereich, keine Sprungtabelle. *)
 
 IdentPattern        = Ident ;
 
