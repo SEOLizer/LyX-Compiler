@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.13G
+VERSION   := 1.0.13H
 VERSION_DATE := 2026-08-08
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -261,6 +261,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
+	@echo "OK"
+	@echo "--- Dynamisches Array ohne Initialisierung (12 Pruefungen) ---"
+	@bash tests/dyn_array_decl_test.sh
 	@echo "OK"
 	@echo "--- Array als Funktionsparameter (12 Pruefungen) ---"
 	@bash tests/array_param_test.sh

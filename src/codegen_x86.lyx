@@ -4684,6 +4684,38 @@ pub type Codegen = class {
 
   // Inline code for arr.push(val): alloc on first use, then append
   // Layout: [ptr+0]=cap, [ptr+8]=len, [ptr+16+i*8]=data[i]
+  // #1177: Ein leeres dynamisches Array anlegen — rax = Zeiger auf
+  // {cap=1024, len=0} samt Ablage dahinter.
+  //
+  // Bis 1.0.13G legte NUR `push` an, und zwar beim ersten Aufruf. Eine
+  // Variable, die nur deklariert war, blieb NULL: `len(a)` und `a[0]` trafen
+  // die Null, und `a[0] := 5` schrieb dorthin. Ein `int64[N]` wird seit jeher
+  // belegt, ein `var s: S;` seit WP-10d — die dynamische Schreibweise fiel als
+  // einzige heraus.
+  //
+  // Dieselbe Folge steht in cg_genArrayPush; sie liegt hier, damit beide
+  // Stellen nicht auseinanderlaufen koennen. `push` findet den Zeiger dann
+  // gesetzt vor und ueberspringt seinen eigenen Allokationszweig.
+  fn cg_emitEmptyDynArray() {
+    self.cg_e8(0x31); self.cg_e8(0xFF);                                        // xor edi, edi
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6);
+    self.cg_e8(0x10); self.cg_e8(0x20); self.cg_e8(0x00); self.cg_e8(0x00);   // mov rsi, (1024+2)*8
+    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edx, PROT_RW
+    self.cg_e8(0xB8); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, MAP_ANON|PRIVATE
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);                      // mov r10, rax
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0);
+    self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);   // mov rax, -1
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC0);                      // mov r8, rax
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);                      // xor r9d, r9d
+    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, SYS_mmap
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                        // syscall
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+    self.cg_e8(0x00); self.cg_e8(0x04); self.cg_e8(0x00); self.cg_e8(0x00);   // mov rcx, 1024
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x08);                      // mov [rax], rcx   (cap)
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC9);                      // xor rcx, rcx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0x08);   // mov [rax+8], rcx (len)
+  }
+
   fn cg_genArrayPush(objNode: int64, valNode: int64) {
     var aname: pchar := self.cg_nsval(objNode);
     var anlen: int64 := self.cg_nslen(objNode);
@@ -4704,38 +4736,8 @@ pub type Codegen = class {
     self.cg_e8(0x0F); self.cg_e8(0x85);
     var jnzPos: int64 := self.codeLen;
     self.cg_e32(0);
-    // ---- mmap block: allocate (1026)*8 bytes ----
-    // xor edi, edi          (rdi=0, addr=0)
-    self.cg_e8(0x31); self.cg_e8(0xFF);
-    // mov rsi, 8208         ((1024+2)*8)
-    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6);
-    self.cg_e8(0x10); self.cg_e8(0x20); self.cg_e8(0x00); self.cg_e8(0x00);
-    // mov edx, 3            (PROT_RW)
-    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-    // mov eax, 34           (MAP_ANON|MAP_PRIVATE)
-    self.cg_e8(0xB8); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-    // mov r10, rax          (REX.B extends rm to r10: 49 89 C2)
-    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);
-    // mov rax, -1           (fd=-1)
-    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0);
-    self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
-    // mov r8, rax
-    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC0);
-    // xor r9d, r9d          (offset=0)
-    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);
-    // mov eax, 9            (SYS_mmap)
-    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-    // syscall
-    self.cg_e8(0x0F); self.cg_e8(0x05);
-    // mov rcx, 1024         (cap)
-    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
-    self.cg_e8(0x00); self.cg_e8(0x04); self.cg_e8(0x00); self.cg_e8(0x00);
-    // mov [rax], rcx        ([ptr+0] = cap)
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x08);
-    // xor rcx, rcx
-    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC9);
-    // mov [rax+8], rcx      ([ptr+8] = len=0)
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0x08);
+    // ---- #1177: dieselbe Folge wie bei der Deklaration ----
+    self.cg_emitEmptyDynArray();
     // store rax back to local variable
     self.cg_storeRax(off);
     // mov rcx, rax
@@ -9460,6 +9462,19 @@ pub type Codegen = class {
         poke8(self.localIsArray + localIdx, 1);
         poke64(self.localArraySize + localIdx * 8, acnt);
       }
+      // #1177: Ein dynamisches Array ohne Initialisierung wurde NICHT belegt
+      // und blieb null — `len(a)` und `a[0]` trafen die Null, `a[0] := 5`
+      // schrieb dorthin. `int64[N]` wird seit jeher belegt, `var s: S;` seit
+      // WP-10d; die dynamische Schreibweise fiel als einzige heraus. `push`
+      // legte zwar lazy an, aber eben erst beim ersten Aufruf.
+      //
+      // Die Merkung localIsArray steht hier schon; sie allein sagt aber nichts
+      // ueber die Groesse — deshalb zaehlt zusaetzlich, dass keine feste
+      // Groesse vermerkt ist (die hat ihren eigenen Zweig weiter unten).
+      var dynNoInit: int64 := 0;
+      if (init < 0 && peek8(self.localIsArray + localIdx) != 0
+          && peek64(self.localArraySize + localIdx * 8) == 0) { dynNoInit := 1; }
+
       if (init >= 0) {
         // #1106: `var m: TM := f.Handle;` muss binden, nicht laden. Der Fall
         // gab es bisher nur fuer FELDER — als lokale Variable uebersetzte er
@@ -9470,6 +9485,11 @@ pub type Codegen = class {
         } else {
           self.cg_genExpr(init);
         }
+      } else if (dynNoInit != 0) {
+        // #1177: leeres dynamisches Array — dieselbe Struktur, die `push`
+        // sonst beim ersten Aufruf anlegt (cap=1024, len=0). `push` findet den
+        // Zeiger danach gesetzt vor und ueberspringt seinen Allokationszweig.
+        self.cg_emitEmptyDynArray();
       } else {
         // Fixed-size array (int64[N]): heap-allocate N*8 bytes
         var fixedSz: int64 := peek64(self.localArraySize + localIdx * 8);
