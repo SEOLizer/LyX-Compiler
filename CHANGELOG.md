@@ -4,6 +4,49 @@
 
 _(noch nichts)_
 
+## Version 1.0.13G (August 2026)
+
+### Compiler — Array als Funktionsparameter (#1115)
+
+```lyx
+fn F(a: int64[4]): int64 { return a[0]; }
+```
+
+Der Callee las eine **Adresse** statt eines Werts — bei jedem Index dieselbe,
+der Index wirkte also gar nicht. Schreibzugriffe kamen beim Aufrufer nicht an.
+Übersetzt wurde ohne Meldung.
+
+**Die Übergabe selbst war in Ordnung.** Der Aufrufer legt den Zeiger auf die
+Ablage ins Register; das ließ sich zeigen, indem man ihn als `int64` annahm und
+mit `peek64` daraus las. Im Callee fehlte die Merkung *„das ist ein Array"*:
+der Prologue wertete den Parametertyp nur für `NK_TYPE_NAME` aus und nicht für
+`NK_TYPE_ARRAY_FIXED`, `localIsArray` blieb also 0 — und der Indexzugriff fiel
+in den Zweig für einen rohen Zeiger.
+
+Behoben an allen fünf Stellen, an denen ein Parameter abgelegt wird: die sechs
+Register-Argumente und die Stack-Argumente, jeweils für freie Funktionen und
+für Methoden. Mitgenommen wird auch die deklarierte **Größe** — damit liefert
+`len(a)` sie, und die Bereichsprüfung aus #1156 greift jetzt auch am Parameter
+— sowie der **Elementtyp**, sonst fände `a[0].feld` die Klasse nicht (#1109).
+
+Semantik: das Array wird als **Zeiger** übergeben, der Callee arbeitet auf
+demselben Speicher. Das passt zur Zeiger-Semantik der Struct-Arrays aus #1109
+und steht in §20.1.
+
+Im Bestand fiel der Fehler nicht auf, weil `std/` und `src/` **keinen einzigen**
+Array-Parameter verwenden — dort laufen Puffer durchgängig als `int64`-Adresse
+mit `peek`/`poke`.
+
+`tests/array_param_test.sh` (12 Prüfungen, in `make test`) misst den Wert im
+Callee **und** die Wirkung beim Aufrufer, über alle drei Übergabewege
+(Register, Stack ab dem siebten Argument, Methode) und mit Struct-Elementtyp.
+Zwei Gegenproben: ein `int64`-Parameter bleibt `int64`, und das lokale Array
+bleibt unberührt. Gegen den Vorgängerstand: 2 PASS, 10 FAIL.
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`346b61d9…`).
+
 ## Version 1.0.13F (August 2026)
 
 ### Sprache — Bereichsmuster in `match` (#1113)
