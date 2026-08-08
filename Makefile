@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.13R
+VERSION   := 1.0.13S
 VERSION_DATE := 2026-08-08
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -267,6 +267,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- seccomp-Filter deckt die emittierten Syscalls (12 Pruefungen) ---"
 	@bash tests/seccomp_filter_test.sh
+	@echo "OK"
+	@echo "--- Rechtsshift auf int64 zieht das Vorzeichen nach (17 Pruefungen) ---"
+	@bash tests/shift_right_signed_test.sh
 	@echo "OK"
 	@echo "--- @bounds_check(true) wirkt (12 Pruefungen) ---"
 	@bash tests/bounds_check_directive_test.sh
