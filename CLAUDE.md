@@ -59,6 +59,10 @@ erzeugt), `ir_lower` (kannte nur das eigene Modul).
 
 - **Fixpunkt gen2 == gen3** (SHA-256), `make test` 0 FAIL, `make test-lyx`
   0 unerwartet rot; bei Codegen-Änderungen zusätzlich der Beispiel-Sweep.
+- **Codegen-Änderung heißt Seed neu verankern.** `make singularity` (S3 == S4)
+  wird sonst rot: S3 trägt die Bytes des alten Seeds. Fixpunkt nach
+  `src/lyxc_bootstrap` kopieren, `make singularity` muss SINGULAR melden.
+  Der Seed stand bis 1.0.12A auf 1.0.7B und belegte nichts mehr (#1167).
 - **Verbleibende Fehlschläge gegen den Vorgängerstand belegen**, statt sie als
   vorbestehend abzutun.
 - Bei **Semantikänderungen** zusätzlich der Gegenbeleg, dass sich der Bestand
