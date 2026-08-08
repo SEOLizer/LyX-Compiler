@@ -4,6 +4,56 @@
 
 _(noch nichts)_
 
+## Version 1.0.13L (August 2026)
+
+### Sicherheit — `setsockopt` fehlte bei den Netzwerk-Capabilities (#1193)
+
+Der TLS-Handshake starb mit `SIGSYS`: `sys_socket` und `sys_connect` waren
+erlaubt, `sys_setsockopt` (54) nicht. Damit lief HTTPS auch mit fester IP nicht,
+und `std.net.socket` bot vier Funktionen an — `TCPConnSetNodelay`,
+`TCPConnSetKeepAlive`, `TCPConnSetRecvBuf`, `TCPConnGetError` —, die alle in
+SIGSYS liefen.
+
+Freigegeben mit **jeder** `network.*`-Capability: `setsockopt` (54),
+`getsockopt` (55), `getsockname` (51), `getpeername` (52).
+
+Die Abwägung dahinter: diese Aufrufe öffnen keinen neuen Weg nach draußen. Sie
+betreffen die **bereits erlaubte** Verbindung — wer sie aufbauen darf, darf
+ihre Puffergrößen und Zeitgrenzen einstellen und wissen, mit wem er spricht.
+`TCP_ULP`, das OpenSSL beim Handshake setzt, fällt in dieselbe Kategorie.
+
+**Nicht freigegeben: `fcntl` (72)**, obwohl `std.net.socket` es zum
+Nicht-Blockierend-Schalten nutzt. `fcntl` wirkt auf jeden Dateideskriptor, nicht
+nur auf Sockets — es über eine Netzwerk-Capability zu erlauben, gäbe
+stillschweigend auch Operationen auf Dateien frei. Das braucht einen
+Argument-Filter auf `cmd` und ist eine eigene Änderung.
+
+### Der Nebenbefund im Issue ist keiner
+
+Das Issue vermutet hinter `setsockopt(3, SOL_TCP, TCP_ULP, [7564404], 4) = 54`
+einen zweiten Fehler bei der Argumentübergabe, verwandt mit #1192. Gemessen
+trifft das nicht zu — dasselbe Programm einmal mit altem und einmal mit neuem
+Compiler unter `strace`:
+
+```
+alt:  setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 54   +++ killed by SIGSYS +++
+neu:  setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+```
+
+Die **Argumente sind in beiden Fällen identisch und richtig**. Die „54" ist
+kein Rückgabewert, sondern die Syscall-Nummer, die `strace` anzeigt, wenn
+seccomp den Aufruf mit `KILL` beendet — ein Artefakt des Sterbens, nicht die
+Wurzel von #1192.
+
+`tests/seccomp_filter_test.sh` wächst auf 19 Prüfungen: `setsockopt` und
+`getsockopt` laufen mit `network.tcp.connect`, und `setsockopt` ohne
+Netzwerk-Capability stirbt weiterhin. Gegen den Vorgängerstand: 17 PASS,
+2 FAIL.
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`54b73fea…`).
+
 ## Version 1.0.13K (August 2026)
 
 ### Sprache — Typparameter als Typargument weiterreichen (#1117)

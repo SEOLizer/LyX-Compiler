@@ -166,6 +166,43 @@ fn main(): int64 {
   return 0;
 }"
 
+# --- #1193: Optionen und Adressen der eigenen Verbindung ------------------
+# Ohne setsockopt stirbt jeder TLS-Handshake: OpenSSL setzt TCP_ULP. Und
+# std.net.socket bietet TCPConnSetNodelay/SetKeepAlive/SetRecvBuf/GetError an,
+# die alle darauf laufen.
+runs "setsockopt mit network.tcp.connect" "@capabilities([fs.read, fs.write, network.tcp.connect])
+$IO
+fn main(): int64 {
+  var fd: int64 := sys_socket(2, 1, 0);
+  var val: int64 := alloc(8);
+  poke64(val, 1);
+  var r: int64 := sys_setsockopt(fd, 1, 9, val, 4);
+  if (r != 0) { return 1; }
+  return 0;
+}"
+
+runs "getsockopt mit network.tcp.connect" "@capabilities([fs.read, fs.write, network.tcp.connect])
+$IO
+fn main(): int64 {
+  var fd: int64 := sys_socket(2, 1, 0);
+  var val: int64 := alloc(8);
+  var lenp: int64 := alloc(8);
+  poke64(lenp, 4);
+  var r: int64 := sys_getsockopt(fd, 1, 4, val, lenp);
+  return 0;
+}"
+
+# Ohne Netzwerk-Capability bleibt es geblockt — die Freigabe haengt an der
+# Verbindung, nicht an der Sandbox allgemein.
+blocked "setsockopt ohne Netzwerk-Capability" "@capabilities([fs.read, fs.write])
+$IO
+fn main(): int64 {
+  var val: int64 := alloc(8);
+  poke64(val, 1);
+  var r: int64 := sys_setsockopt(3, 1, 9, val, 4);
+  return 0;
+}"
+
 # --- Gegenproben: der Filter bleibt scharf --------------------------------
 # Ohne jede fs-Capability darf auch das Oeffnen nicht gehen.
 blocked "open ohne fs-Capability" "@capabilities([system.exit])
