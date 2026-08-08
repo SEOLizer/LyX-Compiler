@@ -2898,6 +2898,15 @@ pub type Codegen = class {
   // defines Get, emit `base.Get(idx)` and return 1; otherwise return 0.
   fn cg_tryClassIndex(ni: int64): int64 {
     var baseNi: int64 := self.cg_nc0(ni);
+    // #1109: Ein ARRAY von Klassenwerten ist kein Klassenobjekt. Seit der
+    // Elementtyp am Local vermerkt wird, faende cg_exprClassName hier die
+    // Klasse des ELEMENTS — und `cs[1]` wuerde zu `cs.Get(1)`, mit der
+    // Array-Basis als Empfaenger. Der Index-Operator gehoert nur einer
+    // Variablen, die selbst ein Klassenobjekt IST.
+    if (self.cg_nkind(baseNi) == CGN_IDENT) {
+      var abIdx: int64 := self.cg_findLocalIdx(self.cg_nsval(baseNi), self.cg_nslen(baseNi));
+      if (abIdx >= 0 && peek8(self.localIsArray + abIdx) != 0) { return 0; }
+    }
     var ci: int64 := self.cg_exprClassName(baseNi);
     if (ci < 0) { return 0; }
     var lenCell: int64 := alloc(8);
@@ -5488,7 +5497,12 @@ pub type Codegen = class {
       } else if (isPchar == 1) {
         // movzx rax, byte [rax+rbx]
         self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x04); self.cg_e8(0x18);
-      } else if (isArray == 1 && arrElemSize > 8) {
+      } else if (isArray == 1 && arrElemSize > 8 && arrFixedSize == 0) {
+        // #1109: NUR fuer `Array<T>` mit Struct-Elementen, die INLINE liegen.
+        // Ein `T[N]` belegt N*8 Byte — Zeiger-Slots, wie die Struct-Zuweisung
+        // sonst auch: `arr[i] := s` teilt das Objekt mit `s`. Dort muss der
+        // Zeiger GELADEN werden; die Elementadresse zu liefern wuerde die
+        // Ablage und den Zugriff auseinanderlaufen lassen.
         // Struct array: return element ADDRESS (not value)
         // lea rcx, [rax+16]  (skip {cap,len} header)
         self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);
@@ -9132,6 +9146,18 @@ pub type Codegen = class {
         if (sizeNode >= 0 && self.cg_nkind(sizeNode) == CGN_LIT_INT) {
           poke64(self.localArraySize + localIdx * 8, self.cg_nival(sizeNode));
         }
+        // #1109: Elementtyp merken. Ohne ihn fand cg_arrayElemClassIdx die
+        // Klasse nicht, `arr[0].v` bekam Feldoffset -1 und lieferte still 0 —
+        // der bekannte "unbekanntes Feld → Offset 0"-Fall. Das ELEMENT selbst
+        // kam korrekt an: `var q: S := arr[0]` las den richtigen Wert.
+        var elemTyNode: int64 := self.cg_nc0(typeNode);
+        if (elemTyNode >= 0 && self.cg_nkind(elemTyNode) == 60) {
+          var etn3: pchar := self.cg_nsval(elemTyNode);
+          var etl3: int64 := self.cg_nslen(elemTyNode);
+          if (self.cg_findClass(etn3, etl3) >= 0) {
+            self.cg_setLocalType(localIdx, etn3, etl3);
+          }
+        }
       }
       // Infer class type when declared as int64 but initialized from:
       //   var x: int64 := SomeClass.Create(...)  — static constructor
@@ -9227,9 +9253,16 @@ pub type Codegen = class {
         // Fixed-size array (int64[N]): heap-allocate N*8 bytes
         var fixedSz: int64 := peek64(self.localArraySize + localIdx * 8);
         if (typeNode >= 0 && self.cg_nkind(typeNode) == 101 && fixedSz > 0) {
-          // mmap(0, fixedSz*8, PROT_RW, MAP_ANON, -1, 0)
+          // #1109: Platz fuer den {cap,len}-Kopf mitrechnen. Der Lesepfad
+          // ueberspringt seit jeher 16 Byte (`lea rcx,[rax+16]`), angefordert
+          // wurden aber nur fixedSz*8 — die Zugriffe lagen also um einen Kopf
+          // verschoben hinter dem angeforderten Bereich und waren nur durch die
+          // Seitengroesse der mmap gedeckt. Bei skalaren Elementen fiel das
+          // nicht auf (beide Seiten waren gleich verschoben); mit Zeiger-Slots
+          // traf der Zugriff Nullen und `arr[2].v := 7` schrieb an Adresse 0.
+          // mmap(0, 16 + fixedSz*8, PROT_RW, MAP_ANON, -1, 0)
           self.cg_zeroRax();    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7); // mov rdi,0
-          self.cg_movRaxImm(fixedSz * 8); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6); // mov rsi,sz
+          self.cg_movRaxImm(16 + fixedSz * 8); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6); // mov rsi,sz
           self.cg_movRaxImm(3);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2); // mov rdx,3
           self.cg_movRaxImm(34);
           self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov r10, rax
@@ -9238,6 +9271,61 @@ pub type Codegen = class {
           self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
           self.cg_movRaxImm(9);
           self.cg_e8(0x0F); self.cg_e8(0x05);
+          // #1109: {cap,len}-Kopf fuellen. `len(arr)` nimmt bei fester Groesse
+          // zwar den Wert aus der Uebersetzungszeit, aber jede Stelle, die den
+          // Kopf liest — etwa die Bereichspruefung aus #1156 — findet ihn nun
+          // vor, statt auf die ersten beiden Elemente zu sehen.
+          // mov rbx, rax; mov qword [rbx], N; mov qword [rbx+8], N
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);
+          self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0x03); self.cg_e32(fixedSz);
+          self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0x43); self.cg_e8(0x08); self.cg_e32(fixedSz);
+          // #1109: Bei einem Struct- oder Klassen-Elementtyp haelt jeder Slot
+          // einen ZEIGER — und der ist nach der mmap null. `arr[0].v := 42`
+          // schriebe an Adresse 0. Ein `var s: S;` wird genau deshalb schon
+          // seit WP-10d/#1095 angelegt; ein Array solcher Werte braucht
+          // dasselbe, sonst ist die Form nur halb benutzbar.
+          //
+          // Die Slots werden in einer LAUFZEITschleife belegt statt entrollt:
+          // N steht zwar zur Uebersetzungszeit fest, aber ein `S[1000]` haette
+          // sonst tausend Kopien derselben Befehlsfolge im Code.
+          // Stack: [rsp] = i, [rsp+8] = Basiszeiger. Der syscall zerstoert rcx
+          // und r11, deshalb liegt der Zaehler im Speicher und nicht im Register.
+          var elemTy2: int64 := self.cg_nc0(typeNode);
+          var elemCls: int64 := -1;
+          if (elemTy2 >= 0 && self.cg_nkind(elemTy2) == 60) {
+            elemCls := self.cg_findClass(self.cg_nsval(elemTy2), self.cg_nslen(elemTy2));
+          }
+          if (elemCls >= 0) {
+            self.cg_pushRax();                                     // [rsp] = base
+            self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor rax, rax
+            self.cg_pushRax();                                     // [rsp] = i = 0
+            var loopTop: int64 := self.codeLen;
+            // mmap(0, 4096, PROT_RW, MAP_ANON, -1, 0) → rax = Objekt
+            self.cg_movRaxImm(0);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);
+            self.cg_movRaxImm(4096); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);
+            self.cg_movRaxImm(3);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);
+            self.cg_movRaxImm(34);
+            self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov r10, rax
+            self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor r8, r8
+            self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);  // dec r8 → -1
+            self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
+            self.cg_movRaxImm(9);
+            self.cg_e8(0x0F); self.cg_e8(0x05);                     // syscall
+            // mov rbx, [rsp+8] (base); mov rcx, [rsp] (i);
+            // mov [rbx+rcx*8+16], rax — hinter dem {cap,len}-Kopf
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x5C); self.cg_e8(0x24); self.cg_e8(0x08);
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x0C); self.cg_e8(0x24);
+            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0xCB); self.cg_e8(0x10);
+            // inc rcx; mov [rsp], rcx; cmp rcx, N
+            self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC1);
+            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0C); self.cg_e8(0x24);
+            self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xF9); self.cg_e32(fixedSz);
+            // jl loopTop
+            self.cg_e8(0x0F); self.cg_e8(0x8C);
+            self.cg_e32(loopTop - self.codeLen - 4);
+            self.cg_popRax();                                      // i verwerfen
+            self.cg_popRax();                                      // rax = base
+          }
         } else {
         // WP-10d: auto-allocate struct locals (NK_TYPE_NAME=60, vmtDataOff==-1)
         // #1095: Ein struct-Local wird ohne `new` angelegt. Die Bedingung hing
