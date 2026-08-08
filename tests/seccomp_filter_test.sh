@@ -17,8 +17,9 @@
 #   fs.create — "Neue Dateien und Verzeichnisse anlegen"
 #   fs.delete — "Dateien und Verzeichnisse loeschen"
 #   fs.meta   — "Metadaten LESEN (stat, Verzeichnislisting)"
-# Deshalb sind chmod/chown NICHT erlaubt: sie schreiben Metadaten, und dafuer
-# gibt es keine Capability (#1188).
+#   fs.perm   — "Zugriffsrechte und Eigentuemer aendern" (#1188)
+# chmod/chown haengen an fs.perm, NICHT an fs.meta: wer nur auflisten will,
+# soll nicht stillschweigend Rechte umschreiben duerfen.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="$ROOT/lyxc"
@@ -127,13 +128,41 @@ fn main(): int64 {
   return 0;
 }"
 
-# chmod SCHREIBT Metadaten. capabilities.md kennt dafuer keine Capability, also
-# bleibt es geblockt — auch mit fs.meta. Faellt das eines Tages weg, muss es
-# eine eigene Capability geben (#1188).
-blocked "chmod bleibt geblockt (auch mit fs.meta)" "@capabilities([fs.read, fs.write, fs.create, fs.delete, fs.meta])
+# #1188: chmod SCHREIBT Metadaten und haengt deshalb an fs.perm — nicht an
+# fs.meta, das laut Doku das LESEN abdeckt. Beide Richtungen geprueft.
+runs "chmod mit fs.perm" "@capabilities([fs.read, fs.perm])
 $IO
 fn main(): int64 {
   var r: int64 := chmod(\"/tmp/lyx_sc_probe_gibtesnicht\"c, 420);
+  return 0;
+}"
+
+blocked "chmod mit fs.meta allein bleibt geblockt" "@capabilities([fs.read, fs.write, fs.create, fs.delete, fs.meta])
+$IO
+fn main(): int64 {
+  var r: int64 := chmod(\"/tmp/lyx_sc_probe_gibtesnicht\"c, 420);
+  return 0;
+}"
+
+runs "chown mit fs.perm" "@capabilities([fs.read, fs.perm])
+$IO
+fn main(): int64 {
+  var r: int64 := chown(\"/tmp/lyx_sc_probe_gibtesnicht\"c, 0 - 1, 0 - 1);
+  return 0;
+}"
+
+blocked "chown ohne fs.perm" "@capabilities([fs.read, fs.meta])
+$IO
+fn main(): int64 {
+  var r: int64 := chown(\"/tmp/lyx_sc_probe_gibtesnicht\"c, 0 - 1, 0 - 1);
+  return 0;
+}"
+
+# fs.perm gibt NUR Rechte frei — kein Lesen, kein Schreiben von Inhalten.
+blocked "fs.perm oeffnet keine Dateien" "@capabilities([fs.perm])
+$IO
+fn main(): int64 {
+  var fd: int64 := sys_open(\"/etc/hostname\"c, 0, 0);
   return 0;
 }"
 
