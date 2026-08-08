@@ -1452,7 +1452,7 @@ pub type Codegen = class {
       if (bop == 90) { return lv & rv; }                                  // TK_BITAND
       if (bop == 91) { return lv | rv; }                                  // TK_BITOR
       if (bop == 93) { return lv << rv; }                                 // TK_SHL
-      if (bop == 94) { return lv >> rv; }                                 // TK_SHR
+      if (bop == 94) { return self.cg_sarConst(lv, rv); }                 // TK_SHR (#1125)
       if (bop == 79) { if (lv == rv) { return 1; } else { return 0; } }  // TK_EQ2 ==
       if (bop == 80) { if (lv != rv) { return 1; } else { return 0; } }  // TK_NEQ !=
       if (bop == 81) { if (lv < rv)  { return 1; } else { return 0; } }  // TK_LT  <
@@ -1573,7 +1573,7 @@ pub type Codegen = class {
       if (bop == CGT_BITAND) { self.foldBuf := lv & rv; return 1; }
       if (bop == CGT_BITOR)  { self.foldBuf := lv | rv; return 1; }
       if (bop == CGT_SHL)    { self.foldBuf := lv << rv; return 1; }
-      if (bop == CGT_SHR)    { self.foldBuf := lv >> rv; return 1; }
+      if (bop == CGT_SHR)    { self.foldBuf := self.cg_sarConst(lv, rv); return 1; }  // #1125
       return 0;
     }
     return 0;
@@ -3120,7 +3120,10 @@ pub type Codegen = class {
 
   // Emit binary operation: rax=right operand, rbx=left operand (from stack pop)
   // Result left in rax.
-  fn cg_emitBinOp(op: int64) {
+  // #1125: `lhsUnsigned` beschreibt den LINKEN Operanden — nur der entscheidet
+  // beim Rechtsshift zwischen SAR und SHR. Alle uebrigen Operationen sind von
+  // ihm unberuehrt.
+  fn cg_emitBinOp(op: int64, lhsUnsigned: int64) {
     if (op == CGT_PLUS) {
       // add rax, rbx  (48 01 D8)
       self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD8);
@@ -3185,8 +3188,19 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0xD3); self.cg_e8(0xE3);  // shl rbx, cl
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);  // mov rax, rbx
     } else if (op == CGT_SHR) {
+      // #1125: Der Kommentar sagte seit jeher "sar (signed)", die Bytes taten
+      // etwas anderes: ModRM 0xEB ist /5 = SHR, SAR waere /7 = 0xFB. Auf einem
+      // vorzeichenbehafteten Typ fuellte der Shift also mit Nullen auf, und
+      // `-8 >> 1` ergab 9223372036854775804 statt -4 — still, und das Ergebnis
+      // riesig positiv, weshalb typischerweise ein Speicher- oder Indexfehler
+      // folgte statt einer Meldung.
+      //
+      // Auf einem vorzeichenLOSEN Typ (u8..u64) ist das Auffuellen richtig, dort
+      // bleibt es bei SHR.
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);  // mov rcx, rax
-      self.cg_e8(0x48); self.cg_e8(0xD3); self.cg_e8(0xEB);  // sar rbx, cl (signed)
+      self.cg_e8(0x48); self.cg_e8(0xD3);
+      if (lhsUnsigned != 0) { self.cg_e8(0xEB); }            // shr rbx, cl (/5)
+      else                  { self.cg_e8(0xFB); }            // sar rbx, cl (/7)
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);  // mov rax, rbx
     } else if (op == CGT_EQ2) {
       // cmp rbx, rax; sete al; movzx rax, al
@@ -4460,6 +4474,73 @@ pub type Codegen = class {
   // Speicher, das Kuerzen erledigt dort der Speicherbefehl.
   //
   // Rueckgabe: 0 = kein schmaler Typ, sonst die Kennung fuer cg_emitNarrowRax.
+  // #1125: Ist der Typname vorzeichenlos? Deckt die kurze und die lange
+  // Schreibweise ab (`u32` wie `uint32`) und schliesst `uint64`/`u64` ein, das
+  // cg_narrowKindOf nicht kennt — dort geht es um die BREITE, hier um das
+  // Vorzeichen.
+  // #1125: Arithmetischer Rechtsshift zur UEBERSETZUNGSZEIT. Der Falter darf
+  // nicht das `>>` des bauenden Compilers benutzen: dessen Verhalten ist
+  // genau das, was hier repariert wird — ein aelterer Wirt faltete logisch,
+  // ein neuerer arithmetisch, und der Fixpunkt haette davon abgehangen.
+  // Gerechnet wird deshalb ausdruecklich: floor(v / 2^n), also fuer negative
+  // Werte abrundend statt gegen null trunkierend (die Division tut Letzteres).
+  // Der Shift-Betrag wird wie in der Hardware auf 6 Bit maskiert.
+  fn cg_sarConst(v: int64, n: int64): int64 {
+    var sh: int64 := n & 63;
+    var pow: int64 := 1;
+    var i: int64 := 0;
+    while (i < sh) { pow := pow * 2; i := i + 1; }
+    if (v >= 0) { return v / pow; }
+    return 0 - ((0 - v + pow - 1) / pow);
+  }
+
+  fn cg_typeNameIsUnsigned(tname: pchar, tlen: int64): int64 {
+    if (tlen <= 0) { return 0; }
+    if (self.cg_seq(tname, tlen, "u8", 2)  || self.cg_seq(tname, tlen, "uint8", 5))  { return 1; }
+    if (self.cg_seq(tname, tlen, "u16", 3) || self.cg_seq(tname, tlen, "uint16", 6)) { return 1; }
+    if (self.cg_seq(tname, tlen, "u32", 3) || self.cg_seq(tname, tlen, "uint32", 6)) { return 1; }
+    if (self.cg_seq(tname, tlen, "u64", 3) || self.cg_seq(tname, tlen, "uint64", 6)) { return 1; }
+    return 0;
+  }
+
+  // #1125: Traegt der Ausdruck einen vorzeichenlosen Typ? Massgeblich fuer den
+  // Rechtsshift. Bekannt sind die Faelle, in denen der Typ ohne Aufwand
+  // feststeht: eine Variable mit deklariertem Typ (lokal oder global) und ein
+  // `as`-Cast. Alles andere gilt als vorzeichenbehaftet — das ist die Vorgabe
+  // von `int64` und die sichere Antwort, denn sie erhaelt das Vorzeichen.
+  fn cg_isUnsignedExpr(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_IDENT) {
+      var nm: pchar := self.cg_nsval(ni);
+      var nl: int64 := self.cg_nslen(ni);
+      var lidx: int64 := self.cg_findLocalIdx(nm, nl);
+      if (lidx >= 0) {
+        var tb: int64 := self.localTypes + lidx * CG_LOCTYPE_SZ;
+        var tp: pchar := peek64(tb) as pchar;
+        var tl: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+        if (tp == 0 as pchar || tl <= 0) { return 0; }
+        return self.cg_typeNameIsUnsigned(tp, tl);
+      }
+      var gidx: int64 := self.cg_findGlobalIdx(nm, nl);
+      if (gidx >= 0) {
+        var gp: pchar := peek64(self.globalTypeNames + gidx * 16) as pchar;
+        var gl: int64 := peek64(self.globalTypeNames + gidx * 16 + 8);
+        if (gp == 0 as pchar || gl <= 0) { return 0; }
+        return self.cg_typeNameIsUnsigned(gp, gl);
+      }
+      return 0;
+    }
+    if (k == CGN_CAST) {
+      var tn: int64 := self.cg_nc1(ni);
+      if (tn >= 0 && self.cg_nkind(tn) == 60) {
+        return self.cg_typeNameIsUnsigned(self.cg_nsval(tn), self.cg_nslen(tn));
+      }
+      return 0;
+    }
+    return 0;
+  }
+
   fn cg_narrowKindOf(tname: pchar, tlen: int64): int64 {
     if (tlen <= 0) { return 0; }
     if (self.cg_seq(tname, tlen, "i8", 2)     || self.cg_seq(tname, tlen, "int8", 4))   { return 1; }
@@ -5578,14 +5659,14 @@ pub type Codegen = class {
         self.cg_pushRax();
         self.cg_genExpr(rhsNi);
         self.cg_popRbx();
-        self.cg_emitBinOp(op);
+        self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi));
       } else if (op != CGT_AND && op != CGT_OR && self.cg_tryFold(rhsNi) != 0) {
         // CSE: RHS is constant → eval LHS into rax, mov rbx,rax, load const (no push/pop)
         var rhsVal: int64 := self.foldBuf;
         self.cg_genExpr(lhsNi);
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);  // mov rbx, rax
         self.cg_movRaxImm(rhsVal);
-        self.cg_emitBinOp(op);
+        self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi));
       } else if (self.cg_tryClassBinop(ni) != 0) {
         // operator overloading: a.Op(b) for a class-typed left operand — emitted
         // by cg_tryClassBinop (result already in rax).
@@ -5666,7 +5747,7 @@ pub type Codegen = class {
           if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
             self.cg_emitF64BinOp(op);
           } else {
-            self.cg_emitBinOp(op);
+            self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi));
           }
         }
       } else {
@@ -5678,7 +5759,7 @@ pub type Codegen = class {
         if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
           self.cg_emitF64BinOp(op);
         } else {
-          self.cg_emitBinOp(op);
+          self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi));
         }
       }
 

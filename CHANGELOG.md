@@ -2,6 +2,47 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `>>` auf `int64` war logisch statt arithmetisch (#1125)
+
+```lyx
+var a: int64 := -8;
+a >> 1        // 9223372036854775804 statt -4
+```
+
+Der Shift füllte mit Nullen auf, statt das Vorzeichenbit nachzuziehen. Bei
+negativen Werten entstanden riesige positive Zahlen — still, und weil das
+Ergebnis riesig positiv ist, folgte typischerweise ein Speicher- oder
+Indexfehler statt einer Meldung. Jede Halbierung per Shift (Binärsuche,
+Mittelwert, Skalierung) lieferte bei negativen Werten Unsinn.
+
+**Ursache:** eine falsche Kodierung, vom Kommentar daneben verdeckt.
+
+```lyx
+self.cg_e8(0x48); self.cg_e8(0xD3); self.cg_e8(0xEB);  // sar rbx, cl (signed)
+```
+
+ModRM `0xEB` ist `/5` = **SHR**; `SAR` wäre `/7` = `0xFB`. Der Disassembler
+sagte `shr %cl,%rbx`, der Quelltext behauptete `sar`.
+
+**Fix:** `SAR` für vorzeichenbehaftete, `SHR` für vorzeichenlose Typen — der
+**linke** Operand entscheidet (`cg_isUnsignedExpr`: deklarierter Typ einer
+Variablen, lokal wie global, sowie der `as`-Cast; alles andere gilt als
+vorzeichenbehaftet, das ist die Vorgabe von `int64` und die sichere
+Antwort). `(a as uint64) >> 1` bleibt damit der ausdrückliche Weg zum
+logischen Shift.
+
+Die Übersetzungszeit-Faltung rechnet den Shift jetzt ausdrücklich
+(`cg_sarConst`, floor-Division), statt das `>>` des *bauenden* Compilers zu
+benutzen — dessen Verhalten war genau der Fehler, der Fixpunkt hätte sonst
+davon abgehangen, mit welchem Wirt gebaut wurde.
+
+Unverändert: `<<`, Division und Modulo (die waren schon korrekt), sowie die
+Maskierung des Shift-Betrags auf 6 Bit (`1 << 64` ergibt `1` — Verhalten der
+Hardware, im Issue als Randnotiz und nicht als Fehler geführt).
+
+Neu: `tests/shift_right_signed_test.sh` (17 Prüfungen, davon 10 gegen 1.0.13R
+rot).
+
 ### Compiler — `@bounds_check(true)` war wirkungslos (#1124)
 
 Die Direktive erzeugte dieselbe Binary wie gar keine Angabe. Wer die
