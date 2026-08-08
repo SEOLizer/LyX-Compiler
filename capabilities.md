@@ -96,6 +96,29 @@ Diese Capabilities sind in jedem Lyx-Programm automatisch aktiv:
 | `fs.create` | Neue Dateien und Verzeichnisse anlegen |
 | `fs.delete` | Dateien und Verzeichnisse löschen |
 | `fs.meta` | Metadaten lesen (stat, Verzeichnislisting) |
+
+Welche Syscalls die einzelne Capability freigibt, steht im seccomp-Generator
+(`src/security/seccomp_gen.lyx`) und ist durch `tests/seccomp_filter_test.sh`
+festgehalten — je Fall wird geprueft, dass der erlaubte Aufruf laeuft **und**
+der nicht gewaehrte weiterhin mit `SIGSYS` stirbt.
+
+Zwei Festlegungen, die sich nicht aus der Tabelle ergeben:
+
+* **`rename` verlangt `fs.create` UND `fs.delete`.** Umbenennen legt am Ziel an
+  und entfernt an der Quelle; mit nur einer der beiden waere es ein Weg, ohne
+  `fs.delete` zu loeschen.
+* **Metadaten SCHREIBEN hat keine Capability.** `chmod` und `chown` bleiben
+  deshalb geblockt, auch mit `fs.meta` — das deckt laut Tabelle das *Lesen* ab.
+  Siehe #1188.
+
+Immer erlaubt, ohne Capability: `exit_group`, `exit`, `brk`, `mmap(anon)`,
+`munmap`, `write`, `prctl`, `prlimit64`, `futex`, Signal-Rueckkehr,
+`getrandom` (Stack-Canary) sowie ein Basissatz harmloser Introspektion —
+`getpid`, `gettid`, `getppid`, `getuid`, `geteuid`, `getgid`, `getegid`. Diese
+geben Auskunft ueber den eigenen Prozess und beruehren nichts ausserhalb davon;
+ohne sie ist eine extern gelinkte Bibliothek nicht benutzbar (OpenSSL ruft
+`getpid` beim Init). `clock_gettime` gehoert bewusst NICHT dazu — dafuer gibt
+es `system.time`.
 | `fs.exec` | Ausführbare Dateien starten |
 
 #### Memory

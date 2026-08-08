@@ -64,6 +64,33 @@ con SC_SYS_EXECVE:        int64 := 59;
 con SC_SYS_EXIT:          int64 := 60;
 con SC_SYS_KILL:          int64 := 62;
 con SC_SYS_RMDIR:         int64 := 84;
+// #1185: die DIREKTvarianten. Der Filter kannte nur die *at-Formen, der Codegen
+// emittiert aber die direkten — mkdir(83), unlink(87), rename(82) starben
+// deshalb mit SIGSYS, obwohl die passende Capability gewaehrt war.
+con SC_SYS_RENAME:        int64 := 82;
+con SC_SYS_MKDIR:         int64 := 83;
+con SC_SYS_CREAT:         int64 := 85;
+con SC_SYS_UNLINK:        int64 := 87;
+con SC_SYS_READLINK:      int64 := 89;
+con SC_SYS_STAT:          int64 := 4;
+con SC_SYS_LSTAT:         int64 := 6;
+con SC_SYS_ACCESS:        int64 := 21;
+con SC_SYS_GETCWD:        int64 := 79;
+con SC_SYS_TRUNCATE:      int64 := 76;
+con SC_SYS_FTRUNCATE:     int64 := 77;
+con SC_SYS_FSYNC:         int64 := 74;
+con SC_SYS_FDATASYNC:     int64 := 75;
+con SC_SYS_MKDIRAT:       int64 := 258;
+con SC_SYS_RENAMEAT:      int64 := 264;
+con SC_SYS_RENAMEAT2:     int64 := 316;
+// #1185: harmlose Introspektion — siehe Basissatz unten.
+con SC_SYS_GETPID:        int64 := 39;
+con SC_SYS_GETTID:        int64 := 186;
+con SC_SYS_GETUID:        int64 := 102;
+con SC_SYS_GETEUID:       int64 := 107;
+con SC_SYS_GETGID:        int64 := 104;
+con SC_SYS_GETEGID:       int64 := 108;
+con SC_SYS_GETPPID:       int64 := 110;
 con SC_SYS_MLOCK:         int64 := 149;
 con SC_SYS_MLOCKALL:      int64 := 151;
 con SC_SYS_PRCTL:         int64 := 157;
@@ -236,6 +263,23 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
   // WP-24.1: getrandom immer erlauben — Stack-Canary-Init (__lyx_canary_init) braucht es
   n := sc_allow_nr(bpfBuf, n, SC_SYS_GETRANDOM);   // getrandom (canary init)
 
+  // #1185: Basissatz harmloser Introspektion. Diese Aufrufe geben Auskunft
+  // ueber den EIGENEN Prozess und beruehren nichts ausserhalb davon — sie
+  // koennen weder lesen, schreiben, verbinden noch etwas veraendern. Ohne sie
+  // ist eine extern gelinkte Bibliothek nicht benutzbar: OpenSSL ruft `getpid`
+  // beim Init (RNG-Reseed-Check), und der Prozess stirbt, bevor ueberhaupt
+  // eine Verbindung zustande kommt.
+  //
+  // Bewusst NICHT hier: `clock_gettime` — dafuer gibt es `system.time`, und
+  // ein immer erlaubter Zeitzugriff entwertete die Capability.
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_GETPID);
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_GETTID);
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_GETPPID);
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_GETUID);
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_GETEUID);
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_GETGID);
+  n := sc_allow_nr(bpfBuf, n, SC_SYS_GETEGID);
+
   // ---- Capability-spezifische Syscalls -----------------------------------
 
   // fs.read + fs.write + fs.create → openat
@@ -284,15 +328,55 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
     n := sc_allow_nr(bpfBuf, n, SC_SYS_NEWFSTATAT);   // WP-24.3: path-based stat
   }
 
+  // #1185: fs.create — "Neue Dateien und Verzeichnisse anlegen" (capabilities.md).
+  // Verzeichnisse anlegen heisst mkdir; der Filter kannte davon nichts.
+  if hasCreate {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_MKDIR);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_MKDIRAT);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_CREAT);
+  }
+
   if sc_has_cap(capBuf, capCount, SC_CAP_FS_DELETE) {
     n := sc_allow_nr(bpfBuf, n, SC_SYS_UNLINKAT);
     n := sc_allow_nr(bpfBuf, n, SC_SYS_RMDIR);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_UNLINK);      // #1185: die Direktvariante
+  }
+
+  // #1185: Umbenennen legt am Ziel an UND entfernt an der Quelle. Deshalb
+  // verlangt es BEIDE Capabilities — eine allein reicht nicht, sonst waere
+  // `rename` ein Weg, ohne fs.delete zu loeschen.
+  if hasCreate && sc_has_cap(capBuf, capCount, SC_CAP_FS_DELETE) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_RENAME);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_RENAMEAT);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_RENAMEAT2);
+  }
+
+  // #1185: fs.write — in Dateien schreiben. Kuerzen und Synchronisieren
+  // aendern den Inhalt einer bereits geoeffneten Datei und gehoeren dazu.
+  if hasWrite {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_TRUNCATE);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_FTRUNCATE);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_FSYNC);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_FDATASYNC);
+  }
+
+  // #1185: fs.read — "Dateien und Verzeichnisse lesen". Ein Symlink-Ziel und
+  // das Arbeitsverzeichnis sind Lesevorgaenge.
+  if hasRead {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_READLINK);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_GETCWD);
   }
 
   if sc_has_cap(capBuf, capCount, SC_CAP_FS_META) {
     n := sc_allow_nr(bpfBuf, n, SC_SYS_STATX);
     n := sc_allow_nr(bpfBuf, n, SC_SYS_GETDENTS64);
     n := sc_allow_nr(bpfBuf, n, SC_SYS_NEWFSTATAT);   // WP-24.3: path-based stat
+    // #1185: "Metadaten lesen (stat, Verzeichnislisting)" — die aelteren
+    // Direktvarianten gehoeren dazu. NICHT dabei: chmod und chown; sie
+    // SCHREIBEN Metadaten, und dafuer gibt es keine Capability (#1188).
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_STAT);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_LSTAT);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_ACCESS);
   }
 
   if sc_has_cap(capBuf, capCount, SC_CAP_FS_EXEC) {
