@@ -4,6 +4,50 @@
 
 _(noch nichts)_
 
+## Version 1.0.13K (August 2026)
+
+### Sprache — Typparameter als Typargument weiterreichen (#1117)
+
+```lyx
+fn Id<T>(x: T): T { return x; }
+fn Twice<T>(x: T): T { return Id<T>(Id<T>(x)); }
+```
+
+Vorher: `sema error: unknown type in generic arguments 'T'`.
+
+`T` war als Parameter- und Rückgabetyp gültig, im **Typargument** eines Aufrufs
+aber nicht. Der Aufruf ohne Typargument (`Id(Id(x))`) war der Workaround — die
+explizite Weitergabe ist die natürliche Schreibweise, gerade wenn die Inferenz
+nicht eindeutig ist.
+
+Die Mechanik lag bereits vor: `_isTypeParamRef` unterscheidet seit #1009 einen
+aktiven Typparameter von einem unbekannten Typ, und `_checkFuncDecl` nutzt sie
+für Parameter- und Rückgabetypen. In `_resolveGenericCall` fehlte genau diese
+eine Frage.
+
+**Der Geltungsbereich bleibt eng:** ein Typparameter gilt nur *innerhalb*
+seiner Funktion. `Id<T>(1)` aus `main` heraus wird weiterhin gemeldet, ebenso
+ein erfundener Typ im Typargument — auch innerhalb einer generischen Funktion.
+Ohne diese Grenze wäre die Ausnahme ein Freibrief für jeden Tippfehler, der
+zufällig wie ein Typparameter aussieht.
+
+`tests/generics_typeparam_test.sh` wächst von 9 auf 15 Prüfungen. Die vier
+neuen Positivfälle prüfen den **Wert**, nicht die Übersetzbarkeit — eine
+Weitergabe, die den falschen Typ instanziiert, würde sonst durchgehen. Dazu
+drei Gegenproben. Gegen den Vorgängerstand: 11 PASS, 4 FAIL.
+
+### Dokumentation
+
+Der Nebenbefund aus dem Issue ist erledigt: `ebnf.md` §6 hielt fest, generische
+Funktionen seien „auch mit `<T>` nicht nutzbar" — das stimmt seit #1009 nicht
+mehr. Der Absatz nennt jetzt, was geht (ein und mehrere Typparameter,
+Struct-Typen, Weitergabe des eigenen Typparameters, Geltungsbereich) und was
+weiterhin nicht: generische **Typen** (`type Box<T> = struct { v: T; }`).
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`2cf9f154…`).
+
 ## Version 1.0.13J (August 2026)
 
 ### Sicherheit — neue Capability `fs.perm` für Rechteänderungen (#1188)
