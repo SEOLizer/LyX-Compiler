@@ -4,6 +4,48 @@
 
 _(noch nichts)_
 
+## Version 1.0.13B (August 2026)
+
+### Compiler — Methodenzeiger als lokale Variable stürzte beim Aufruf ab (#1106)
+
+Ein Methodenzeiger funktionierte als **Klassenfeld** und nicht als **lokale
+Variable**. Übersetzt wurde ohne jede Meldung, der Aufruf endete mit Exit 139:
+
+```lyx
+var m: TM := f.Handle;
+return m(c);          // Speicherzugriffsfehler
+```
+
+Die Vermutung im Issue — ein lokaler Slot fasse nur 8 statt der 16 Byte des
+Paares `{Code, Daten}` — trifft nicht zu: der fat pointer liegt auf dem Heap,
+in der Variablen steht ein gewöhnlicher Zeiger darauf. Auch der Aufrufpfad war
+in Ordnung; der Closure-Fallback für lokale Variablen lädt bereits
+`rdi = [p+8]` (self) und `rbx = [p]` (Code) und ruft damit korrekt an.
+
+Kaputt war allein die **Bindung**: `cg_genMethodRef` wurde nur aufgerufen, wenn
+links ein Klassenfeld stand. Für eine lokale Variable lief die rechte Seite
+durch den gewöhnlichen Feld-Load — und weil `Handle` kein Feld ist, wurde
+Offset 0 gelesen, also der VMT-Zeiger. Der Aufruf sprang ins Leere. Das ist die
+Bauart, die in diesem Projekt schon mehrfach Zeit gekostet hat: *das Konstrukt
+trifft konsequent das Falsche, weil die Stelle fehlt, an der das Richtige
+entstünde.*
+
+Entschieden wird jetzt am Klassenlayout: `obj.name` ist ein **Feld**, wenn die
+Klasse es als Feld führt — sonst ist es die **Methode** und wird gebunden. Die
+Regel greift an beiden Stellen, an denen eine Variable vom `method(...)`-Typ
+einen Wert bekommt: Initialisierung und spätere Zuweisung.
+
+`tests/method_ptr_test.sh` deckte ausschließlich die Feldvariante ab (3 PASS)
+und sagte über die lokale nichts aus. Jetzt 8 Prüfungen, darunter das Umbinden
+auf eine andere Instanz und zwei Gegenproben: das Kopieren eines bereits
+gebundenen Felds in eine lokale Variable darf **nicht** neu binden, und ein
+gewöhnliches Feld wird weiterhin geladen. Vor dem Fix: 5 PASS, 3 FAIL.
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`dc530bef…`), wie es die Regel
+aus #1167 für jede Codegen-Änderung vorsieht.
+
 ## Version 1.0.13A (August 2026)
 
 ### Bootstrap — der Seed belegte nichts mehr (#1167)
