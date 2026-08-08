@@ -4,6 +4,53 @@
 
 _(noch nichts)_
 
+## Version 1.0.13E (August 2026)
+
+### Sicherheit — `dim`/`utype` hatten keine Semantik (#1110)
+
+Einheitentypen wurden geparst und bewirkten nichts. Der Faktor war dekorativ,
+die Dimension folgenlos, und der Range-Modifier scheiterte am Parser. Für die
+Fehlerklasse, gegen die Einheitentypen antreten — Einheitenverwechslung, Mars
+Climate Orbiter — ist eine Annotation, die sie nicht erkennt, irreführend.
+
+**Der Faktor rechnet um.** `var b: M := a` bei `a: Km` ergibt jetzt `2000`
+statt `2`. Erst multiplizieren, dann ganzzahlig teilen: `Km` → `M` ist exakt,
+`M` → `Km` schneidet ab, wie die Ganzzahldivision sonst auch. §20 führt die
+Konversionssemantik ausdrücklich als undefiniert; sie steht jetzt in §20.1.
+
+**Die Dimension wird geprüft.** Abgewiesen werden die Zuweisung über
+Dimensionsgrenzen (`var t: S := a` mit `a: Km`), das Addieren zweier
+Dimensionen und das Verrechnen mit einer dimensionslosen Zahl (`a + r`).
+Erlaubt bleiben, was die Einheit benutzbar hält:
+
+| Form | Grund |
+|---|---|
+| `var a: Km := 2` | ein Literal ist dimensionslos und muss sich zuweisen lassen |
+| `a * 3` | Skalierung behält die Einheit |
+| `(a as int64) + r` | der `as`-Cast ist der bewusste Fluchtweg |
+
+Wo die Einheit nicht bestimmbar ist, wird **nichts** gemeldet — unentscheidbar
+heißt nicht falsch. Zwei Einheiten miteinander multipliziert ergäbe eine
+abgeleitete Dimension; die rechnet der Compiler nicht aus und behauptet
+deshalb auch nichts.
+
+**`range` und `wraps` parsen und wirken.** Beide standen seit jeher in §11 und
+scheiterten mit `expected ;, got IDENT 'range'`. Jetzt: `range 0..100` bricht
+außerhalb mit `panic` ab, `wraps 0..359` rechnet in den Bereich zurück
+(`400` → `40`, `-10` → `350`). Grenzen einschließlich, wie beim Bereichstyp;
+steht der Wert zur Übersetzungszeit fest, meldet der Compiler ihn sofort
+(#1082), und verdrehte Grenzen werden abgewiesen.
+
+`tests/utype_test.sh` (18 Prüfungen, in `make test`) misst das **Verhalten**:
+den umgerechneten Wert, die Meldung, den Abbruch bzw. das Umrechnen. Ein Test
+auf Übersetzbarkeit wäre bei jedem Punkt grün gewesen. Mit fünf Gegenproben,
+ohne die eine Prüfung, die alles abweist, ebenso grün wäre. Gegen den
+Vorgängerstand: 5 PASS, 13 FAIL.
+
+### Seed
+
+Neu verankert auf den Fixpunkt dieser Version (`0cbd64ab…`).
+
 ## Version 1.0.13D (August 2026)
 
 ### Compiler — Arrays mit Struct- oder Klassen-Elementtyp (#1109)
