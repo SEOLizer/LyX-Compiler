@@ -4144,17 +4144,55 @@ pub type Codegen = class {
     // Allocate variant array: 32 bytes per variant
     var vars: int64 := alloc(cnt * 32);
     var i: int64 := 0;
+    // #1131: Zaehler fuer Mitglieder OHNE eigenen Wert. Ein expliziter Wert
+    // setzt ihn neu, das naechste Mitglied zaehlt von dort weiter (`A = 5, B`
+    // ergibt 5 und 6) — dieselbe Regel wie in C.
+    var nextTag: int64 := 0;
     tmp := variantNode;
     while (tmp != -1) {
       var vb: int64 := vars + i * 32;
       poke64(vb,      self.cg_nsval(tmp) as int64);   // variant name
       poke64(vb + CG_EVAR_OFF_NAMELEN,  self.cg_nslen(tmp));             // variant name len
-      poke64(vb + CG_EVAR_OFF_TAGVAL, i);                              // tag value = index
-      // Payload size: count children of variant (NK_PATTERN_BIND etc.)
-      var payloadCnt: int64 := 0;
-      var pc: int64 := self.cg_nc0(tmp);
-      while (pc != -1) { payloadCnt := payloadCnt + 1; pc := self.cg_nnext(pc); }
-      poke64(vb + CG_EVAR_OFF_PAYLOADSZ, payloadCnt);
+      // #1131: c0 traegt den ausdruecklich angegebenen Wert (`A = 10`). Er
+      // wurde bisher als NUTZLAST gezaehlt: payloadCnt wurde 1, landete in der
+      // oberen Haelfte des gepackten Ergebnisses und der Tag blieb der
+      // Positionsindex — `E.A` lieferte 2^32 + 0 statt 10.
+      var valNi: int64 := self.cg_nc0(tmp);
+      var tagVal: int64 := nextTag;
+      if (valNi >= 0) {
+        if (self.cg_tryFold(valNi) != 0) {
+          tagVal := self.foldBuf;
+          // #1131: Der Wert wird zusammen mit der Nutzlastgroesse in einer
+          // int64 gefuehrt (Wert unten, Groesse oben). Ein negativer Wert oder
+          // einer jenseits von 2^32-1 liefe in die obere Haelfte und kaeme als
+          // etwas voellig anderem zurueck. `EnumMember = Ident [ "=" IntLiteral ]`
+          // (ebnf.md §10) sieht ohnehin keine negativen Werte vor — also melden,
+          // statt still das Falsche zu tun.
+          if (tagVal < 0 || tagVal > 4294967295) {
+            EPrintStr("error: enum "c);
+            sys_write(2, enumName as int64, enumLen);
+            EPrintStr(": der Wert von "c);
+            sys_write(2, self.cg_nsval(tmp) as int64, self.cg_nslen(tmp));
+            EPrintStrLn(" liegt ausserhalb von 0..4294967295"c);
+            exit(1);
+          }
+        } else {
+          // Kein stiller Default: ein Wert, der erst zur Laufzeit feststuende,
+          // waere als Marke im uebersetzten Code nicht darstellbar.
+          EPrintStr("error: enum "c);
+          sys_write(2, enumName as int64, enumLen);
+          EPrintStr(": der Wert von "c);
+          sys_write(2, self.cg_nsval(tmp) as int64, self.cg_nslen(tmp));
+          EPrintStrLn(" muss zur Uebersetzungszeit feststehen"c);
+          exit(1);
+        }
+      }
+      poke64(vb + CG_EVAR_OFF_TAGVAL, tagVal);
+      nextTag := tagVal + 1;
+      // Eine Nutzlast gibt es in der Deklaration nicht — `EnumMember` ist
+      // `Ident [ "=" IntLiteral ]` (ebnf.md §10). Die Musterform `Ok(wert)`
+      // wird beim MATCH aufgeloest, nicht hier.
+      poke64(vb + CG_EVAR_OFF_PAYLOADSZ, 0);
       i += 1;
       tmp := self.cg_nnext(tmp);
     }

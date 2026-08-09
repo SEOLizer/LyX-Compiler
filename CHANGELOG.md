@@ -2,6 +2,40 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — explizite Enum-Werte wurden verworfen (#1131, #1157)
+
+```lyx
+enum E { A = 10, B = 20 }
+E.A   // 4294967296 statt 10   (= 2^32 + 0)
+E.B   // 4294967297 statt 20   (= 2^32 + 1)
+```
+
+Der angegebene Wert spielte keine Rolle — auch dann nicht, wenn er der
+impliziten Zählung entsprach (`A = 0, B = 1`): die 2^32 kam trotzdem oben
+drauf. Ein Enum mit expliziten Werten war damit unbrauchbar, und genau die
+sind der Zweck der Sache (Protokollkonstanten, Fehlercodes,
+Hardware-Register).
+
+**Ursache:** der Wertausdruck hängt am Mitglied als Kind, und
+`cg_buildEnumLayout` zählte die Kinder als **Nutzlast**. `payloadCnt` wurde
+damit 1, landete in der oberen Hälfte des gepackten Ergebnisses (`{Wert
+unten, Nutzlastgröße oben}`), und der Tag blieb der Positionsindex. Eine
+Nutzlast gibt es in der Deklaration überhaupt nicht — `EnumMember = Ident
+[ "=" IntLiteral ]` (§10); die Musterform `Ok(wert)` wird beim `match`
+aufgelöst.
+
+**Fix:** der Wert wird zur Übersetzungszeit gefaltet und als Tag eingetragen;
+ein Mitglied ohne eigenen Wert zählt vom vorigen weiter (`A = 5, B, C` ergibt
+5, 6, 7 — wie in C). Was zur Übersetzungszeit nicht feststeht, wird gemeldet,
+ebenso ein Wert außerhalb von `0..4294967295` — der liefe in die obere Hälfte
+und käme als etwas anderem zurück.
+
+Rein implizite Enums waren korrekt und bleiben es.
+
+Neu: `tests/enum_explicit_value_test.sh` (16 Prüfungen, davon 14 gegen
+1.0.14A rot). §20.1 hält die Zählregel und die Grenzen fest.
+
+
 ### Compiler — `x in a..b` stürzte ab, `for i in a..b` fehlte (#1129)
 
 ```lyx
