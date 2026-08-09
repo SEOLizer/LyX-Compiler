@@ -2,6 +2,46 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `@stack_limit` wird nachgewiesen (#1138)
+
+Das Attribut war ein bloßer Vermerk: seit #1099 meldete jedes Vorkommen, dass
+der Compiler die Zusicherung **nicht** nachweist. Jetzt prüfen zwei Teile:
+
+**Rahmengröße.** Der Codegen kennt sie, wenn er `sub rsp, imm32` patcht. Ist
+der Rahmen größer als die Schranke, ist die Zusage schon für *einen* Aufruf
+verletzt:
+
+```
+error: Viele: @stack_limit(16) verletzt — der Rahmen belegt 48 Byte
+```
+
+**Rekursion.** Ohne nachweisbare Aufruftiefe ist der Gesamtverbrauch
+unbeschränkt. Der vorhandene Aufrufgraph (`src/ir_call_graph.lyx`) erkennt
+auch **indirekte** Zyklen; gebaut wird er nur, wenn das Attribut im Programm
+überhaupt vorkommt:
+
+```
+error: Tief: @stack_limit ist mit Rekursion nicht nachweisbar — die Aufruftiefe ist unbeschraenkt
+```
+
+Damit der Codegen die Schranke kennt, reicht der Parser den Wert jetzt durch
+(Bits 16–39 von `iVal`, wie `@energy` seine Stufe in Bits 8–10). Die Einheit
+ist **Byte** — das ist die Einheit, in der der Compiler rechnet.
+
+**Wichtig für die Erwartung:** ein `var puffer: int64[4096]` liegt in Lyx
+*nicht* im Rahmen. Arrays bekommen einen Heap-Block, der Slot hält den Zeiger;
+der Rahmen wächst nur um 8 Byte je Variable. Der Repro aus dem Issue wird
+deshalb wegen der **Rekursion** abgewiesen, nicht wegen des Puffers.
+
+Nicht erfasst: der Verbrauch der aufgerufenen Funktionen entlang der
+Aufrufkette und dynamisch angeforderter Speicher. Beides steht in §20.1.
+
+`@stack_limit` ist aus der Liste „Attribute ohne Nachweis" gestrichen; `@wcet`,
+`@integrity`, `@flight_crit`, `@dal` und `@critical` melden weiterhin.
+
+Neu: `tests/stack_limit_test.sh` (12 Prüfungen, davon 6 gegen 1.0.14J rot).
+
+
 ### Compiler — Zeilennummern in allen Meldungen; Linter wieder lesbar (#1137)
 
 Der Befund im Issue lautete „der Linter meldet nichts". Er meldete sehr wohl —
