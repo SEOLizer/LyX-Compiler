@@ -514,6 +514,15 @@ pub type Codegen = class {
   // Namen; ein Tupel hat zwei, und ohne sie blieb der entpackte Wert ohne
   // Typ — `a.v` fand kein Feld und lieferte still 0.
   // Eintrag (48 Byte): {namePtr, nameLen, t0Ptr, t0Len, t1Ptr, t1Len}.
+  // #1133: Selektoren — die Namen ALLER in Interfaces deklarierten Methoden,
+  // in Deklarationsreihenfolge. Ihr Index ist der VMT-Slot, den JEDE Klasse an
+  // derselben Stelle fuehrt. Nur so trifft ein Aufruf ueber den Interface-Typ
+  // (wo nur das Interface bekannt ist) die Methode der wirklichen Klasse.
+  // Eintrag: {namePtr:8, nameLen:8}.
+  ifaceSelList:  int64;
+  ifaceSelCount: int64;
+  ifaceSelCap:   int64;
+
   fnTupRetList:  int64;
   fnTupRetCount: int64;
   fnTupRetCap:   int64;
@@ -3326,6 +3335,58 @@ pub type Codegen = class {
     poke64(base + CG_PATCH_OFF_NAMEPTR, typeLen);
   }
 
+  // #1133: Selektor eintragen, falls noch nicht vorhanden; liefert den Index.
+  fn cg_addIfaceSelector(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.ifaceSelCount) {
+      var b: int64 := self.ifaceSelList + i * 16;
+      if (self.cg_seq(peek64(b) as pchar, peek64(b + 8), name, nameLen) != 0) { return i; }
+      i += 1;
+    }
+    if (self.ifaceSelCount >= self.ifaceSelCap) {
+      var nc: int64 := self.ifaceSelCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.ifaceSelList, self.ifaceSelCount * 16);
+      self.ifaceSelList := nb;
+      self.ifaceSelCap  := nc;
+    }
+    var base: int64 := self.ifaceSelList + self.ifaceSelCount * 16;
+    poke64(base,     name as int64);
+    poke64(base + 8, nameLen);
+    var idx: int64 := self.ifaceSelCount;
+    self.ifaceSelCount += 1;
+    return idx;
+  }
+
+  // #1133: Steht der Name unter den Selektoren? Dann hat er seinen Slot schon.
+  fn cg_isIfaceSelector(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.ifaceSelCount) {
+      var b: int64 := self.ifaceSelList + i * 16;
+      if (self.cg_seq(peek64(b) as pchar, peek64(b + 8), name, nameLen) != 0) { return 1; }
+      i += 1;
+    }
+    return 0;
+  }
+
+  // #1133: Vorabpass ueber alle Interface-Deklarationen. Muss VOR dem Bau der
+  // Klassen-Layouts laufen: die Slotzahl steht sonst noch nicht fest, und eine
+  // Klasse, die frueher gebaut wird als ein spaeter deklariertes Interface,
+  // haette zu wenige Slots.
+  fn cg_collectIfaceSelectors(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      if (self.cg_nkind(cur) == CGN_TYPE_DECL && (self.cg_nival(cur) & 32) != 0) {
+        var m: int64 := self.cg_nc1(cur);
+        while (m != -1) {
+          self.cg_addIfaceSelector(self.cg_nsval(m), self.cg_nslen(m));
+          m := self.cg_nnext(m);
+        }
+      }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
   fn cg_findClass(name: pchar, nameLen: int64): int64 {
     var i: int64 := 0;
     while (i < self.classCount) {
@@ -3839,6 +3900,16 @@ pub type Codegen = class {
       parentSlotCount  := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTSLOTS);
       parentMethodList := peek64(self.classLayouts + pIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTLIST);
     }
+    // #1133: Ohne Elternklasse bilden die Selektoren die Basis der VMT — bei
+    // JEDER Klasse, nicht nur bei implementierenden. Nur wenn alle dieselbe
+    // Basis haben, stimmen die Slotnummern zwischen Elternteil und Kind
+    // weiterhin ueberein (die Slot-Weitergabe kopiert stellengleich), und ein
+    // Aufruf ueber den Interface-Typ trifft dieselbe Stelle. Mit Elternteil
+    // kommen die Selektoren ueber dessen Liste mit, sie stehen dort ebenfalls
+    // vorn.
+    var selBase: int64 := 0;
+    if (pIdx < 0) { selBase := self.ifaceSelCount; }
+
     // Count own virtual methods that are new (not overriding a parent slot)
     var ownMethodCount: int64 := 0;
     var mthTmp2: int64 := self.cg_nc1(ni);
@@ -3855,22 +3926,33 @@ pub type Codegen = class {
           if (self.cg_seq(sName2, sLen2, mname2, mlen2) != 0) { overrides := 1; break; }
           si2 += 1;
         }
+        // #1133: Ein Name, der schon als Selektor einen Slot hat, bekommt
+        // keinen zweiten.
+        if (selBase > 0 && self.cg_isIfaceSelector(mname2, mlen2) != 0) { overrides := 1; }
         if (overrides == 0) { ownMethodCount := ownMethodCount + 1; }
       }
       mthTmp2 := self.cg_nnext(mthTmp2);
     }
-    var totalSlots: int64 := parentSlotCount + ownMethodCount;
+    var totalSlots: int64 := selBase + parentSlotCount + ownMethodCount;
     // Allocate method name list: {namePtr:8, nameLen:8} per slot
     var methodList: int64 := alloc((totalSlots + 1) * 16);
+    // #1133: Selektoren zuerst (nur ohne Elternteil — sonst stecken sie schon
+    // in dessen Liste).
+    var sel0: int64 := 0;
+    while (sel0 < selBase) {
+      poke64(methodList + sel0 * 16,     peek64(self.ifaceSelList + sel0 * 16));
+      poke64(methodList + sel0 * CG_VMTMETH_SZ + CG_VMTMETH_OFF_NAMELEN, peek64(self.ifaceSelList + sel0 * 16 + 8));
+      sel0 += 1;
+    }
     // Copy parent slots first
     var si3: int64 := 0;
     while (si3 < parentSlotCount) {
-      poke64(methodList + si3 * 16,     peek64(parentMethodList + si3 * 16));
-      poke64(methodList + si3 * CG_VMTMETH_SZ + CG_VMTMETH_OFF_NAMELEN, peek64(parentMethodList + si3 * 16 + 8));
+      poke64(methodList + (selBase + si3) * 16,     peek64(parentMethodList + si3 * 16));
+      poke64(methodList + (selBase + si3) * CG_VMTMETH_SZ + CG_VMTMETH_OFF_NAMELEN, peek64(parentMethodList + si3 * 16 + 8));
       si3 += 1;
     }
     // Append own new virtual methods
-    var slotAppend: int64 := parentSlotCount;
+    var slotAppend: int64 := selBase + parentSlotCount;
     var mthTmp3: int64 := self.cg_nc1(ni);
     while (mthTmp3 != -1) {
       var isVirt3: int64 := (self.cg_nival(mthTmp3) >> 1) & 1;
@@ -3885,6 +3967,7 @@ pub type Codegen = class {
           if (self.cg_seq(sName4, sLen4, mname3, mlen3) != 0) { overrides3 := 1; break; }
           si4 += 1;
         }
+        if (selBase > 0 && self.cg_isIfaceSelector(mname3, mlen3) != 0) { overrides3 := 1; }
         if (overrides3 == 0) {
           poke64(methodList + slotAppend * 16,     mname3 as int64);
           poke64(methodList + slotAppend * CG_VMTMETH_SZ + CG_VMTMETH_OFF_NAMELEN, mlen3);
@@ -5475,8 +5558,13 @@ pub type Codegen = class {
     // Clear class context
     self.curClassName    := 0 as pchar;
     self.curClassNameLen := 0;
-    // WP-BC-19: register VMT method slot patch for virtual methods only
+    // WP-BC-19: register VMT method slot patch for virtual methods.
+    // #1133: ebenso fuer eine Methode, die einen Interface-Selektor erfuellt.
+    // Sie traegt kein `virtual` — die Zusage steckt im `implements` der Klasse,
+    // und ihr Slot existiert bereits. Ohne den Eintrag bliebe er 0 und der
+    // Aufruf ueber den Interface-Typ spraenge nach null.
     var isVirtM: int64 := (self.cg_nival(ni) >> 1) & 1;
+    if (isVirtM == 0 && self.cg_isIfaceSelector(mname, mlen) != 0) { isVirtM := 1; }
     var classIdx: int64 := self.cg_findClass(className, classNameLen);
     if (isVirtM != 0 && classIdx >= 0) {
       var slotCount: int64   := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTSLOTS);
@@ -13157,6 +13245,7 @@ pub type Codegen = class {
     self.cg_collectMethodAliases(head);   // B2: method-Typ-Aliase registrieren
     self.cg_collectRangeTypes(head);      // #1097: Bereichstypen samt Grenzen
     self.cg_collectUtypes(head);          // #1110: Einheitentypen samt Faktor
+    self.cg_collectIfaceSelectors(head);  // #1133: Interface-Selektoren (vor den Layouts!)
 
     var cur: int64 := head;
     while (cur != -1) {
@@ -13204,7 +13293,14 @@ pub type Codegen = class {
             if (peek64(self.classLayouts + tdPi * CG_CLASS_SZ + CG_CLASS_OFF_VMTSLOTS) > 0) { forceClass := 1; }
           }
         }
-        if (hasMethods == -1 && forceClass == 0) {
+        if ((self.cg_nival(cur) & 32) != 0) {
+          // #1133: Interface. Es bekommt ein Klassen-Layout, damit der Aufruf
+          // ueber den Interface-Typ die Slotnummer findet — aber KEINE
+          // Methodenruempfe. Bis 1.0.14C entstand fuer jede Interface-Methode
+          // ein leerer Rumpf (`I_Zeig`), der 0 zurueckgab; genau den rief der
+          // Aufruf ueber die Schnittstelle auf.
+          self.cg_buildClassLayout(cur);
+        } else if (hasMethods == -1 && forceClass == 0) {
           // No methods → treat as struct (fields start at offset 0, no VMT)
           self.cg_buildStructLayout(cur);
         } else {
@@ -13446,6 +13542,9 @@ pub type Codegen = class {
     self.fnRetCap   := 64;
     self.fnRetList  := alloc(self.fnRetCap * 32);
     self.fnRetCount := 0;
+    self.ifaceSelCap   := 32;                     // #1133
+    self.ifaceSelList  := alloc(self.ifaceSelCap * 16);
+    self.ifaceSelCount := 0;
     self.fnTupRetCap   := 64;                     // #1122
     self.fnTupRetList  := alloc(self.fnTupRetCap * 48);
     self.fnTupRetCount := 0;
