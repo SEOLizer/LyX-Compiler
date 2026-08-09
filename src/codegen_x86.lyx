@@ -360,6 +360,11 @@ con CG_FLOAT_BUF: int64 := 48; // data[48..79]: _lyx_float_buf
 // WP-18: Stack canary — initialized from sys_getrandom at start of main
 con CG_CANARY: int64 := 80; // data[80..87]: _lyx_canary (8 bytes)
 
+// #1140: Zeiger auf den Namen der @flight_crit-Funktion, in deren
+// Geltungsbereich gerade gerechnet wird. Der SIGFPE-Handler liest ihn, damit
+// die Meldung sagt, WO es passierte. 0 = ausserhalb.
+con CG_FC_NAME: int64 := 88; // data[88..95]: _lyx_fc_name (8 bytes)
+
 // ============================================================================
 // Codegen class
 // ============================================================================
@@ -662,6 +667,16 @@ pub type Codegen = class {
 
   // WP-04: set to 1 when current function has a [T, T] tuple return type
   funcHasTupleReturn: int64;
+
+  // #1140: @flight_crit — SSE-Ausnahmen fuer *invalid* und *divide-by-zero*
+  // sind in der annotierten Funktion freigeschaltet. fcSeen sagt, ob das
+  // Programm ueberhaupt eine solche Funktion hat (dann wird der SIGFPE-Handler
+  // installiert); fcActive gilt waehrend der Erzeugung EINER solchen Funktion
+  // und laesst den Epilog den alten MXCSR zurueckschreiben.
+  fcSeen:      int64;
+  fcActive:    int64;
+  fcMxSlot:    int64;   // rbp-Offset: gesicherter MXCSR (+4: der entschaerfte)
+  fcNameSlot:  int64;   // rbp-Offset: vorheriger Wert von _lyx_fc_name
 
   // Import search paths (mirrors sema's includePath/stdPath)
   // Set by lyxc after CLI parsing / env-var reading
@@ -2395,6 +2410,10 @@ pub type Codegen = class {
   // WP-18: Uses r10/r11 (scratch) to compare [rbp-8] with _lyx_canary global.
   //        Does NOT touch rax (return value).
   fn cg_emitEpilogue() {
+    // #1140: @flight_crit — alten MXCSR und Namenszeiger zurueck, BEVOR der
+    // Rahmen faellt (beide liegen darin). Jede Rueckkehr kommt hier vorbei,
+    // deshalb genuegt diese eine Stelle.
+    if (self.fcActive != 0) { self.cg_fcDisarm(); }
     // WP-18: canary check — r10/r11 are caller-saved scratch, do not affect rax
     // mov r11, [rbp-8]
     self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x5D); self.cg_e8(0xF8);
@@ -5498,6 +5517,17 @@ pub type Codegen = class {
     self.curClassNameLen := classNameLen;
     // Emit prologue
     var prologuePatch: int64 := self.cg_emitPrologue();
+    // #1140: @flight_crit an einer METHODE. Ohne diese Stelle gaelte die
+    // Zusicherung fuer freie Funktionen und nicht fuer Methoden — sie haenge
+    // also am Ort der Deklaration statt an der Annotation.
+    var savedMFcActive: int64 := self.fcActive;
+    var savedMFcMx:     int64 := self.fcMxSlot;
+    var savedMFcName:   int64 := self.fcNameSlot;
+    self.fcActive := 0;
+    if ((self.cg_nival(ni) & ANNO_FLIGHTCRIT) != 0) {
+      self.cg_fcArm(self.cg_nsval(ni), self.cg_nslen(ni));
+      self.fcActive := 1;
+    }
     // Implicit self parameter at register 0 (rdi)
     var selfOff: int64 := self.cg_addLocal("self", 4);
     self.cg_setLocalType(self.localCount - 1, className, classNameLen);
@@ -5575,6 +5605,9 @@ pub type Codegen = class {
     var aligned: int64 := fs - (fs & 15);
     if (aligned == 0) { aligned := 16; }
     poke32(self.code + prologuePatch, aligned);
+    self.fcActive   := savedMFcActive;   // #1140
+    self.fcMxSlot   := savedMFcMx;
+    self.fcNameSlot := savedMFcName;
     // Clear class context
     self.curClassName    := 0 as pchar;
     self.curClassNameLen := 0;
@@ -11984,6 +12017,219 @@ pub type Codegen = class {
     self.nestedCount += 1;
   }
 
+  // ------------------------------------------------------------------
+  // #1140: @flight_crit — FPU-Ausnahmen fuer NaN/Inf
+  // ------------------------------------------------------------------
+  //
+  // `sprache/datentypen.txt` sagt zu, dass in @flight_crit-Code jede
+  // entstehende NaN/Inf-Operation panic ausloest statt still weiterzulaufen.
+  // Umgesetzt ueber MXCSR: die Masken fuer *invalid* (Bit 7) und
+  // *divide-by-zero* (Bit 9) werden beim Eintritt geloescht und beim
+  // Verlassen zurueckgeschrieben.
+  //
+  // REICHWEITE: MXCSR ist Thread-Zustand. Ab dem Eintritt gilt der Trap
+  // deshalb auch fuer alles, was die Funktion RUFT — bis sie zurueckkehrt.
+  // Das ist die Zusage "hier entsteht keine NaN unbemerkt"; ein Maskieren vor
+  // jedem Aufruf wuerde sie an der ersten Funktionsgrenze enden lassen.
+  //
+  // Der ausgeloeste SIGFPE trifft einen Handler, den der Compiler mitgibt —
+  // ohne ihn staerbe das Programm wortlos, was fuer einen Nachweis zu wenig
+  // waere. Damit die Meldung sagt, WO es passierte, legt der Prolog einen
+  // Zeiger auf den Funktionsnamen in _lyx_fc_name ab (alter Wert im Rahmen,
+  // damit Schachtelung traegt).
+
+  // Zeichenkette in den Datenbereich legen, NUL-terminiert. Liefert den Offset.
+  fn cg_fcDataStr(sptr: pchar, slen: int64): int64 {
+    var doff: int64 := self.dataLen;
+    var i: int64 := 0;
+    while (i < slen) { self.cg_edata(peek8(sptr + i)); i := i + 1; }
+    self.cg_edata(0);
+    return doff;
+  }
+
+  // Kommt @flight_crit ueberhaupt vor? Methoden zaehlen mit — dort steht das
+  // Flag in derselben iVal wie die Modifier-Bits.
+  fn cg_collectFlightCrit(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      var k: int64 := self.cg_nkind(cur);
+      if (k == CGN_FUNC_DECL) {
+        if ((self.cg_nival(cur) & ANNO_FLIGHTCRIT) != 0) { self.fcSeen := 1; }
+      } else if (k == CGN_TYPE_DECL) {
+        var m: int64 := self.cg_nc1(cur);
+        while (m != -1) {
+          if (self.cg_nkind(m) == CGN_FUNC_DECL) {
+            if ((self.cg_nival(m) & ANNO_FLIGHTCRIT) != 0) { self.fcSeen := 1; }
+          }
+          m := self.cg_nnext(m);
+        }
+      }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
+  // Prolog: MXCSR sichern, Masken 7 und 9 loeschen, Namenszeiger setzen.
+  fn cg_fcArm(fname: pchar, fnlen: int64) {
+    self.fcMxSlot   := self.cg_addLocal("__fc_mxcsr"c, 10);
+    self.fcNameSlot := self.cg_addLocal("__fc_name"c, 9);
+    // stmxcsr [rbp+mx]
+    self.cg_e8(0x0F); self.cg_e8(0xAE); self.cg_e8(0x9D); self.cg_e32(self.fcMxSlot);
+    // mov eax, [rbp+mx]
+    self.cg_e8(0x8B); self.cg_e8(0x85); self.cg_e32(self.fcMxSlot);
+    // and eax, 0xFFFFFD7F   (Bit 7 = invalid, Bit 9 = divide-by-zero loeschen)
+    self.cg_e8(0x25); self.cg_e8(0x7F); self.cg_e8(0xFD); self.cg_e8(0xFF); self.cg_e8(0xFF);
+    // mov [rbp+mx+4], eax   (der entschaerfte Wert; die oberen 4 Byte des Slots)
+    self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(self.fcMxSlot + 4);
+    // ldmxcsr [rbp+mx+4]
+    self.cg_e8(0x0F); self.cg_e8(0xAE); self.cg_e8(0x95); self.cg_e32(self.fcMxSlot + 4);
+    // mov rax, [rip+CG_FC_NAME]   (bisheriger Name)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+    var pOld: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pOld, CG_FC_NAME, 0, CG_PATCH_STR);
+    // mov [rbp+nm], rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(self.fcNameSlot);
+    // lea rax, [rip+name]
+    var nOff: int64 := self.cg_fcDataStr(fname, fnlen);
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);
+    var pName: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pName, nOff, 0, CG_PATCH_STR);
+    // mov [rip+CG_FC_NAME], rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
+    var pSet: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pSet, CG_FC_NAME, 0, CG_PATCH_STR);
+  }
+
+  // Epilog: alten MXCSR und alten Namenszeiger zurueck. rax bleibt unberuehrt
+  // (Rueckgabewert) — deshalb r11 als Zwischenspeicher, wie bei der Canary.
+  fn cg_fcDisarm() {
+    // ldmxcsr [rbp+mx]
+    self.cg_e8(0x0F); self.cg_e8(0xAE); self.cg_e8(0x95); self.cg_e32(self.fcMxSlot);
+    // mov r11, [rbp+nm]
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x9D); self.cg_e32(self.fcNameSlot);
+    // mov [rip+CG_FC_NAME], r11
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x1D);
+    var pR: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pR, CG_FC_NAME, 0, CG_PATCH_STR);
+  }
+
+  // In main: rt_sigaction(SIGFPE, {handler, SA_RESTORER, restorer, 0}, 0, 8).
+  // SA_RESTORER ist auf x86-64 PFLICHT — ohne das Flag und einen Restorer
+  // bricht die Zustellung selbst zusammen (der Rahmenaufbau scheitert, das
+  // Programm stirbt mit SIGSEGV statt den Handler zu erreichen).
+  fn cg_fcInstallHandler() {
+    // sub rsp, 32   (Platz fuer die sigaction-Struktur, 16-Byte-Ausrichtung bleibt)
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x20);
+    // lea rax, [rip+__lyx_fc_handler]; mov [rsp], rax
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);
+    var pH: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pH, "__lyx_fc_handler" as int64, 16, CG_PATCH_CALL);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);
+    // mov rax, 0x04000000 (SA_RESTORER); mov [rsp+8], rax
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0);
+    self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x04);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x08);
+    // lea rax, [rip+__lyx_fc_restorer]; mov [rsp+16], rax
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);
+    var pR2: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pR2, "__lyx_fc_restorer" as int64, 17, CG_PATCH_CALL);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x10);
+    // xor rax, rax; mov [rsp+24], rax   (leere sa_mask)
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x18);
+    // mov rax, 13 (rt_sigaction); mov rdi, 8 (SIGFPE); mov rsi, rsp;
+    // xor rdx, rdx; mov r10, 8; syscall
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0x0D); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e8(0x08); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE6);
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x08); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // add rsp, 32
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x20);
+  }
+
+  // Restorer und Handler. Beide werden NACH dem Benutzercode emittiert — der
+  // feste Helfer-Block am Dateianfang hat eine nachgerechnete Groesse
+  // (CG_H_USER), an der andere Backends haengen.
+  fn cg_fcEmitHandler() {
+    // ---- __lyx_fc_restorer: mov eax, 15 (rt_sigreturn); syscall ----
+    self.cg_addLabel("__lyx_fc_restorer", 17, 0);
+    self.cg_e8(0xB8); self.cg_e8(0x0F); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    // ---- __lyx_fc_handler ----
+    // Der Text nennt beide Anlaesse: SIGFPE kommt sowohl von den
+    // freigeschalteten SSE-Ausnahmen als auch von einer ganzzahligen Division
+    // durch 0 (#DE). "nur NaN/Inf" waere im zweiten Fall falsch.
+    var m1: pchar := "panic: FPU-Ausnahme (NaN/Inf oder Division durch 0) unter @flight_crit in `"c;
+    var m1len: int64 := StrLen(m1);
+    var m2: pchar := "`\n"c;
+    var m2len: int64 := StrLen(m2);
+    var m1off: int64 := self.cg_fcDataStr(m1, m1len);
+    var m2off: int64 := self.cg_fcDataStr(m2, m2len);
+
+    self.cg_addLabel("__lyx_fc_handler", 16, 0);
+    // write(2, m1, m1len)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+    var p1: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(p1, m1off, 0, CG_PATCH_STR);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(m1len);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    // rsi := [rip+CG_FC_NAME]; ist er 0, wird kein Name geschrieben.
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x35);
+    var p2: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(p2, CG_FC_NAME, 0, CG_PATCH_STR);
+    // test rsi, rsi
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xF6);
+    // jz +len(strlen+write)  — Sprungweite unten nachgetragen
+    self.cg_e8(0x74);
+    var pJz: int64 := self.codeLen;
+    self.cg_e8(0);
+    var afterJz: int64 := self.codeLen;
+    // xor rdx, rdx
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);
+    var loopStart: int64 := self.codeLen;
+    // cmp byte [rsi+rdx], 0
+    self.cg_e8(0x80); self.cg_e8(0x3C); self.cg_e8(0x16); self.cg_e8(0x00);
+    // je +5 (ueber inc/jmp hinweg)
+    self.cg_e8(0x74); self.cg_e8(0x05);
+    // inc rdx
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC2);
+    // jmp loopStart
+    self.cg_e8(0xEB);
+    self.cg_e8((loopStart - self.codeLen - 1) & 255);
+    // write(2, rsi, rdx)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    poke8(self.code + pJz, (self.codeLen - afterJz) & 255);
+
+    // write(2, m2, m2len)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+    var p3: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(p3, m2off, 0, CG_PATCH_STR);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(m2len);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // exit_group(134)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xE7); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e8(0x86); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+  }
+
   fn cg_genFuncDecl(ni: int64) {
     // Register label for this function
     var fname: pchar := self.cg_nsval(ni);
@@ -12039,6 +12285,26 @@ pub type Codegen = class {
 
     // Emit prologue, capture patch position for sub rsp imm32
     var prologuePatch: int64 := self.cg_emitPrologue();
+
+    // #1140: @flight_crit — SSE-Ausnahmen freischalten. Der Zustand wird
+    // gerettet und wiederhergestellt, damit eine geschachtelt erzeugte
+    // Funktion die aeussere nicht umschaltet.
+    var savedFcActive: int64 := self.fcActive;
+    var savedFcMx:     int64 := self.fcMxSlot;
+    var savedFcName:   int64 := self.fcNameSlot;
+    self.fcActive := 0;
+    if ((self.cg_nival(ni) & ANNO_FLIGHTCRIT) != 0) {
+      self.cg_fcArm(fname, fnlen);
+      self.fcActive := 1;
+    }
+    // Der SIGFPE-Handler wird einmal in main eingehaengt — vor jedem
+    // Benutzercode, damit auch ein Trap in der ersten Anweisung ankommt.
+    if (self.fcSeen != 0 && fnlen == 4) {
+      if StrCharAt(fname, 0) == 109 && StrCharAt(fname, 1) == 97 &&
+         StrCharAt(fname, 2) == 105 && StrCharAt(fname, 3) == 110 {
+        self.cg_fcInstallHandler();
+      }
+    }
 
     // Spill parameters (child0 = first param, linked via next)
     var param: int64 := self.cg_nc0(ni);
@@ -12159,6 +12425,9 @@ pub type Codegen = class {
 
     // WP-EN-04: restore energy level for enclosing scope
     self.fnEnergyLevel := savedEnergy;
+    self.fcActive   := savedFcActive;   // #1140
+    self.fcMxSlot   := savedFcMx;
+    self.fcNameSlot := savedFcName;
     self.curFnRetRange := savedRetRange;   // #1097
     self.curFnRetNarrow := savedRetNarrow; // #1151
 
@@ -13283,6 +13552,7 @@ pub type Codegen = class {
     self.cg_collectRangeTypes(head);      // #1097: Bereichstypen samt Grenzen
     self.cg_collectUtypes(head);          // #1110: Einheitentypen samt Faktor
     self.cg_collectIfaceSelectors(head);  // #1133: Interface-Selektoren (vor den Layouts!)
+    self.cg_collectFlightCrit(head);      // #1140: gibt es @flight_crit im Programm?
 
     var cur: int64 := head;
     while (cur != -1) {
@@ -13462,6 +13732,9 @@ pub type Codegen = class {
       self.cg_e32(0);
       mi += 1;
     }
+    // #1140: Restorer und SIGFPE-Handler ans Ende des Codes — nur wenn das
+    // Programm ueberhaupt eine @flight_crit-Funktion hat.
+    if (self.fcSeen != 0) { self.cg_fcEmitHandler(); }
   }
 
   // ------------------------------------------------------------------
@@ -13480,7 +13753,7 @@ pub type Codegen = class {
 
     self.dataCap     := 16384;
     self.data        := alloc(self.dataCap);
-    self.dataLen     := 88;  // WP-18: pre-reserve 88 bytes
+    self.dataLen     := 96;  // WP-18: 88 Byte reserviert, +8 fuer CG_FC_NAME (#1140)
     self.dataOverflow := 0;  // WP-34  // WP-18: pre-reserve 88 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24, ARGC@32, ARGV@40, FLOAT_BUF@48, CANARY@80)
 
     self.localCap  := 64;

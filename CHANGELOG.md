@@ -2,6 +2,48 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `@flight_crit` schaltet die FPU-Traps frei (#1140)
+
+`sprache/datentypen.txt` sagt zu, dass in `@flight_crit`-Code jede entstehende
+NaN/Inf-Operation `panic` auslöst statt still weiterzulaufen. Bis 1.0.14L
+geschah nichts: `1.0 / 0.0` lieferte still `+Inf`.
+
+**Umsetzung: MXCSR.** Der Prolog der annotierten Funktion sichert MXCSR und
+löscht die Masken für *invalid* (Bit 7) und *divide-by-zero* (Bit 9); der
+Epilog schreibt den alten Wert zurück — an der einen Stelle, an der jede
+Rückkehr vorbeikommt.
+
+**Reichweite: dynamisch.** MXCSR ist Thread-Zustand. Ab dem Eintritt gilt der
+Trap deshalb auch für alles, was die Funktion *ruft*, bis sie zurückkehrt. Ein
+Maskieren vor jedem Aufruf würde die Zusage an der ersten Funktionsgrenze
+enden lassen.
+
+**Der Handler kommt mit.** Ohne ihn stürbe das Programm wortlos, was für einen
+Nachweis zu wenig wäre. Der Compiler emittiert `__lyx_fc_handler` samt
+Restorer und hängt ihn in `main` ein; ein Zeiger auf den Funktionsnamen liegt
+in `_lyx_fc_name` (alter Wert im Rahmen, damit Schachtelung trägt):
+
+```
+panic: FPU-Ausnahme (NaN/Inf oder Division durch 0) unter @flight_crit in `F`
+exit 134
+```
+
+Der Text nennt beide Anlässe: SIGFPE kommt auch von einer ganzzahligen
+Division durch 0 (#DE), und „nur NaN/Inf" wäre dort falsch. Ohne das Attribut
+stirbt derselbe Fall weiterhin wortlos mit Signal 8 — der Handler wird nur
+eingehängt, wenn das Programm eine `@flight_crit`-Funktion hat.
+
+Gilt auch für **Methoden**. Nicht erfasst: Überlauf, Unterlauf und
+Ungenauigkeit bleiben maskiert — zugesagt sind NaN und Inf, nicht jede
+IEEE-Ausnahme.
+
+Nebenbefund: `SA_RESTORER` ist auf x86-64 Pflicht. `std/signals.lyx` setzt es
+nicht (`sa_restorer = 0` mit dem Kommentar „Kernel nutzt vDSO"); ein damit
+registrierter Handler bringt das Programm beim ersten Signal zum Absturz.
+Eigenes Issue #1267.
+
+`tests/flight_crit_test.sh`: 15 Prüfungen, 8 davon rot gegen 1.0.14L.
+
 ### Compiler — `@wcet` wird nachgewiesen (#1139)
 
 Auch dieses Attribut war ein bloßer Vermerk. Jetzt zählt der Compiler die
