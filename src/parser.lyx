@@ -138,6 +138,12 @@ pub con ANNO_ENERGY_SHIFT: int64 := 8; // WP-EN-02: Bits 8-10 in iVal von NK_FUN
 // wird abgewiesen.
 pub con ANNO_STACKLIMIT_SHIFT: int64 := 16;
 pub con ANNO_STACKLIMIT_MAX:   int64 := 16777215;
+// #1139: @wcet(N) — die Schranke in ITERATIONEN, Bits 40-63 von iVal (bis
+// 16777215). Zyklen waeren ohne Mikroarchitekturmodell erfunden; Iterationen
+// sind das, was sich am Baum abzaehlen laesst. Die Pruefung sitzt im Treiber
+// (src/frontend/wcet.lyx), sie braucht den Wert am Knoten.
+pub con ANNO_WCET_SHIFT: int64 := 40;
+pub con ANNO_WCET_MAX:   int64 := 16777215;
 
 // WP-AS-11: NK_PARAM flag — bit 0 of iv signals a const-qualified parameter
 pub con PARAM_FLAG_CON: int64 := 1; // NK_PARAM.iv bit 0: parameter is read-only
@@ -602,7 +608,10 @@ pub type Parser = class {
   // Safety-Attribut ist schlechter als keines, weil es einen Nachweis
   // vortaeuscht, den es nicht gibt.
   fn _annoUnverified(tokIdx: int64): int64 {
-    if self._tokTextEq(tokIdx, "wcet"c)        != 0 { return 1; }
+    // #1139: `@wcet` wird nachgewiesen — der Treiber zaehlt die Iterationen
+    // des Rumpfes gegen die Schranke und weist zurueck, was sich strukturell
+    // nicht entscheiden laesst (berechnete Schleifengrenze, Rekursion, Aufruf
+    // ohne eigene Schranke). Damit ist es kein blosser Vermerk mehr.
     // #1138: `@stack_limit` wird nachgewiesen — der Codegen haelt die
     // Rahmengroesse gegen die Schranke, und eine rekursive Funktion mit dem
     // Attribut wird abgewiesen (unbeschraenkte Aufruftiefe). Damit ist es
@@ -3044,12 +3053,31 @@ pub type Parser = class {
             // class-level cap and must not be overwritten before the TYPE_DECL is chained.
             var cMthCapAttr: int64 := 0 - 1;
             var cMthUccAttr: int64 := 0 - 1;
+            // #1139: @wcet an einer METHODE. Ohne diesen Zweig fiele der Wert
+            // in die Klammerzaehlung unten -- das Attribut waere angenommen
+            // und nie geprueft, also genau der stille Default, den es
+            // verhindern soll.
+            var cMthWcet: int64 := 0;
             while self.Check(TK_AT) != 0 {
               self.Advance();
               var mFlag: int64 := 0;
-              if self.Check(TK_IDENT) != 0 { mFlag := self._annoNameToFlag(self.cur); self.Advance(); }
+              var mIsWcet: int64 := 0;
+              if self.Check(TK_IDENT) != 0 {
+                mIsWcet := self._tokTextEq(self.cur, "wcet"c);
+                mFlag := self._annoNameToFlag(self.cur);
+                self.Advance();
+              }
               if self.Check(TK_LPAREN) != 0 {
-                if mFlag == ANNO_CAPABILITIES {
+                if mIsWcet != 0 {
+                  self.Advance();  // consume (
+                  if (self.Check(TK_INT) != 0) {
+                    var mwv: int64 := self.TokIVal(self.cur);
+                    if (mwv >= 1 && mwv <= ANNO_WCET_MAX) { cMthWcet := mwv; }
+                    else { self._err("@wcet: Schranke muss zwischen 1 und 16777215 Iterationen liegen"); }
+                    self.Advance();
+                  } else { self._err("@wcet: erwartet eine ganze Zahl (Iterationen)"); }
+                  self.Expect(TK_RPAREN);
+                } else if mFlag == ANNO_CAPABILITIES {
                   cMthCapAttr := self._parseCapabilityAttr();
                 } else if mFlag == ANNO_USES_CAP {
                   cMthUccAttr := self._parseUsesCallerCap();
@@ -3079,7 +3107,7 @@ pub type Parser = class {
                 self.Match(TK_SEMI);
               }
               // bit0=isPub, bit1=isVirtual, bit2=isOverride, bit3=isAbstract, bits4-5=visibility
-              self._siv(cm, cPub | (cVirtual << 1) | (cOverride << 2) | (cAbstract << 3) | (cVis << 4) | (cStatic << 6));
+              self._siv(cm, cPub | (cVirtual << 1) | (cOverride << 2) | (cAbstract << 3) | (cVis << 4) | (cStatic << 6) | (cMthWcet << ANNO_WCET_SHIFT));
               // WP-L8: chain method cap/ucc annotation nodes BEFORE method in c1 list
               var mHead: int64 := cm;
               if cMthUccAttr >= 0 {
@@ -3989,9 +4017,11 @@ pub type Parser = class {
         var flag: int64 := 0;
         var isEnergy: int64 := 0;
         var isStackLimit: int64 := 0;   // #1138
+        var isWcet: int64 := 0;         // #1139
         if (self.Check(TK_IDENT) != 0) {
           isEnergy := self._tokTextEq(self.cur, "energy"c);
           isStackLimit := self._tokTextEq(self.cur, "stack_limit"c);   // #1138
+          isWcet := self._tokTextEq(self.cur, "wcet"c);                // #1139
           if (self._tokTextEq(self.cur, "volatile"c)  != 0) { isVolatile := 1; }   // WP-AS-17
           if (self._tokTextEq(self.cur, "redundant"c) != 0) { isRedundant := 1; }  // WP-3.1
           flag := self._annoNameToFlag(self.cur);
@@ -4025,6 +4055,19 @@ pub type Parser = class {
               }
               self.Advance();
             } else { self._err("@stack_limit: erwartet eine ganze Zahl (Bytes)"); }
+            self.Expect(TK_RPAREN);
+          } else if (isWcet != 0) {
+            // #1139: @wcet(N) — N ist eine ITERATIONSSCHRANKE (ebnf.md §20.1).
+            self.Advance();  // consume (
+            if (self.Check(TK_INT) != 0) {
+              var wcv: int64 := self.TokIVal(self.cur);
+              if (wcv >= 1 && wcv <= ANNO_WCET_MAX) {
+                annoFlags := annoFlags | (wcv << ANNO_WCET_SHIFT);
+              } else {
+                self._err("@wcet: Schranke muss zwischen 1 und 16777215 Iterationen liegen");
+              }
+              self.Advance();
+            } else { self._err("@wcet: erwartet eine ganze Zahl (Iterationen)"); }
             self.Expect(TK_RPAREN);
           } else if (flag == ANNO_CAPABILITIES) {  // WP-L1: @capabilities([...])
             self._pendingCapAttr := self._parseCapabilityAttr();

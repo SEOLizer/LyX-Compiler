@@ -14,8 +14,9 @@
 #    ebenso grün — und die stdlib benutzt @description/@author/@copyright
 #    340-fach.
 #
-# 2. Attribute, deren Zusicherung der Compiler NICHT nachweist (@wcet,
-#    @stack_limit, @integrity, @flight_crit, @dal, @critical), melden das.
+# 2. Attribute, deren Zusicherung der Compiler NICHT nachweist (@integrity,
+#    @flight_crit, @dal, @critical), melden das. @stack_limit (#1138) und
+#    @wcet (#1139) gehoeren nicht mehr dazu — sie werden geprueft.
 #    Sie bleiben gültig — abweisen hieße, sie aus der Sprache zu nehmen —,
 #    aber sie sind nicht mehr stumm. Ein Safety-Attribut, das schweigend nichts
 #    tut, täuscht einen Nachweis vor, den es nicht gibt.
@@ -149,11 +150,11 @@ type P = struct { a: int64; };
 fn main(): int64 { return 0; }'
 
 # --- 4. Die Zusicherungen ohne Nachweis melden sich ----------------------
-warns "@wcet meldet den fehlenden Nachweis" 'import std.io;
-@wcet(10)
-fn F(): int64 { var i: int64 := 0; while (i < 1000000) { i := i + 1; } return i; }
-fn main(): int64 { return 0; }' "NICHT nachgewiesen"
-
+# #1139: `@wcet` wird seit 1.0.14L NACHGEWIESEN und gehoert nicht mehr in
+# diese Gruppe. Genau dieses Programm — Schranke 10 bei einer Million
+# Durchlaeufen — wird jetzt abgewiesen; die Pruefungen dazu stehen in
+# tests/wcet_test.sh.
+#
 # #1138: `@stack_limit` wird seit 1.0.14K NACHGEWIESEN und gehoert nicht mehr
 # in diese Gruppe. Genau dieses Programm — rekursiv unter der Zusicherung —
 # wird jetzt abgewiesen; die Pruefungen dazu stehen in

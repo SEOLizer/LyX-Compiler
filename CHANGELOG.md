@@ -2,6 +2,48 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `@wcet` wird nachgewiesen (#1139)
+
+Auch dieses Attribut war ein bloßer Vermerk. Jetzt zählt der Compiler die
+Iterationen des Rumpfes gegen die Schranke:
+
+```
+error: Endlos: @wcet(10) verletzt — der Rumpf laeuft bis zu 1000000 Iterationen
+```
+
+**Einheit: Iterationen, nicht Zyklen.** Eine Zyklenzahl bräuchte ein
+Mikroarchitekturmodell; jede Zahl in einer Kostentabelle wäre erfunden und
+damit ein Beweisanschein. Iterationen sind das, was sich am Baum abzählen
+lässt. Gezählt wird kumulativ: eine Schleife mit Schranke B, in deren Rumpf I
+Iterationen stecken, trägt `B * (1 + I)` bei — zwei geschachtelte
+Zehnerschleifen ergeben 110.
+
+**Abzählbar** sind `for ... to`/`downto` und `for i in a..b` mit literalen
+Grenzen, `for i in range(A, B)`, `while (c) limit(N)` (die Sprache hat die
+Form seit #1103) und `while (i < C)` mit literalem Startwert des Zählers,
+konstanter Grenze und genau einer Fortschaltung `i := i + K`, K > 0.
+
+**Nicht nachweisbar ist ein Fehler**, kein stiller Durchlass: berechnete
+Schleifengrenzen, `repeat/until`, das C-artige `for`, Rekursion (auch
+indirekt, über den Aufrufgraphen) und der Aufruf einer Funktion ohne eigene
+Schranke. Trägt der Gerufene selbst ein `@wcet`, geht dessen N in die Summe
+ein. Kostenfrei sind allein `peek8/16/32/64`, `poke8/16/32/64` und `exit`;
+die Liste steht in `src/frontend/wcet.lyx` und in §20.1, damit sie
+nachprüfbar bleibt statt als stiller Default zu wirken. Importierte
+Funktionen liegen nicht vor — `PrintLn` in einer `@wcet`-Funktion wird
+abgewiesen.
+
+Gilt auch für **Methoden**: dort belegen die Modifier-Bits die `iVal`, der
+Wert braucht deshalb einen eigenen Zweig im Parser. Ohne ihn wäre das
+Attribut an einer Methode angenommen und nie geprüft worden.
+
+Nicht enthalten: Attribute an *geschachtelten* Funktionen kommen gar nicht
+erst durch den Parser (`undefined function 'wcet'`) — das gilt für alle
+Attribute außer `@energy` und ist älter als diese Änderung; eigenes Issue
+#1261.
+
+`tests/wcet_test.sh`: 30 Prüfungen, 14 davon rot gegen 1.0.14K.
+
 ### Compiler — `@stack_limit` wird nachgewiesen (#1138)
 
 Das Attribut war ein bloßer Vermerk: seit #1099 meldete jedes Vorkommen, dass
