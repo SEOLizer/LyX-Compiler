@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.14G
+VERSION   := 1.0.14H
 VERSION_DATE := 2026-08-09
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -271,7 +271,7 @@ test: lyxc
 	@echo "--- Deklarationspruefungen: return, Doppelname (17 Pruefungen) ---"
 	@bash tests/decl_checks_test.sh
 	@echo "OK"
-	@echo "--- Typpruefung bei Zuweisung, Rueckgabe, Argumenten (17 Pruefungen) ---"
+	@echo "--- Typpruefung bei Zuweisung, Rueckgabe, Argumenten (18 Pruefungen) ---"
 	@bash tests/type_check_test.sh
 	@echo "OK"
 	@echo "--- Meldung bei zyklischem Import (13 Pruefungen) ---"

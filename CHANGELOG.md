@@ -2,6 +2,33 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — Typableitung eines Aufrufs prüft jetzt, welche Funktion sie gefunden hat (#1135)
+
+Die Ausdrucks-Typableitung aus #1135 nahm den Rückgabetyp aus dem Knoten, den
+`SymNodeIdx` liefert — ohne zu prüfen, ob dieser Knoten wirklich die gerufene
+Funktion ist. Über Modulgrenzen hinweg zeigt der Eintrag auf einen fremden
+Baum, und der abgeleitete Typ gehört dann zu irgendeiner anderen Funktion.
+
+Sichtbar wurde es beim Messlauf zu #1221: in `std/cloud/cf/analytics.lyx`
+meldete die scharfe Regel 91 Stellen, darunter
+
+```lyx
+var path: int64 := alloc(512);   // "Initialisierung: int64 erwartet, pchar gegeben"
+```
+
+`alloc` liefert `int64`. **Alle 91 Meldungen dieser Datei waren Fehlalarme.**
+
+**Fix:** derselbe Abgleich, den die Stelligkeitsprüfung seit jeher macht — der
+Knoten muss ein `SNK_FUNC_DECL` sein *und* denselben Namen tragen wie der
+Aufruf. Sonst gilt der Typ als unbestimmt.
+
+Heute fiel das nicht auf, weil die betroffene Richtung (Zeiger in eine Zahl)
+bis zum Abschluss von #1221 ohnehin zugelassen ist. Beim letzten Schritt hätte
+es reihenweise falsche Meldungen gegeben.
+
+Die Gesamtzahl der #1221-Fundstellen sinkt dadurch von 148 auf **54**.
+
+
 ### stdlib — `net`-Module benennen Zeichenketten als `pchar` (#1221, Schritt 3 von 5)
 
 Der erste Schritt mit echter Kaskade: `std/net/sip.lyx`, `ldap.lyx`,

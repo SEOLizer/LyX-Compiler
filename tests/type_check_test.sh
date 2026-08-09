@@ -88,6 +88,17 @@ fails "Rueckgabewert einer Funktion, falscher Typ" "$K
 fn G(): f64 { return 1.5; }
 fn main(): int64 { var x: int64 := G(); PrintLn(x); return 0; }" "int64 erwartet, f64 gegeben"
 
+# Ein Aufruf, dessen Name auch in einer importierten Unit vorkommt, darf den
+# Rueckgabetyp nicht aus dem fremden Baum nehmen. `alloc` liefert int64 --
+# ohne den Namensabgleich meldete die Ableitung hier "pchar gegeben".
+out "Aufruf-Typ wird nicht aus einer fremden Unit geraten" "$K
+fn main(): int64 {
+    var p: int64 := alloc(512);
+    poke64(p, 7);
+    PrintLn(peek64(p));
+    return 0;
+}" '7'
+
 # --- Gegenproben: der `as`-Cast ist der vorgesehene Weg ------------------
 out "as-Cast wird nicht bemaengelt" "$K
 fn main(): int64 {
