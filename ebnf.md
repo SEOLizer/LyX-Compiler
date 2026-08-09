@@ -1,6 +1,6 @@
-# Lyx 1.0.13S — Canonical EBNF Grammar
+# Lyx 1.0.14A — Canonical EBNF Grammar
 
-> Stand 2026-08-08, gegen lyxc 1.0.13S geprueft. Die Keyword-Liste in
+> Stand 2026-08-09, gegen lyxc 1.0.14A geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -670,12 +670,17 @@ ForStmt             = ForRangeStmt
 
 ForRangeStmt        = "for"
                       Ident
-                      ":="
-                      Expr
-                      ( "to" | "downto" )
-                      Expr
+                      ( ":=" Expr ( "to" | "downto" ) Expr
+                      | "in" Expr ".." Expr
+                      | "in" "range" "(" Expr [ "," Expr ] ")" )
                       [ "do" ]
                       Block ;
+
+(* Drei Schreibweisen, zwei Bedeutungen der oberen Grenze:
+   `:= a to b` und `in a..b` laufen EINSCHLIESSLICH bis b, `in range(a, b)`
+   AUSSCHLIESSLICH bis b (`range(n)` beginnt bei 0). `in a..b` gab es bis
+   1.0.13S nicht -- der Parser wies es ab, obwohl `in` und `..` als Ausdruck
+   beide existieren (#1129). Rueckwaerts laeuft nur `downto`. *)
 
 ForCStyleStmt       = "for"
                       Ident
@@ -1314,6 +1319,7 @@ Einzelbefunde sind dort verlinkt.
 | Tupel-Entpacken, geklammerte Form | 12 | `var (q, r) := f();` gibt es nicht -- §12 (TupleUnpackStmt) schreibt die Form OHNE Klammern vor: `var q, r := f();`. Die DokuWiki fuehrt faelschlich die geklammerte. (#1088) |
 | Tupel, Stelligkeit und Elementtypen | 7 | Ein Tupel hat GENAU ZWEI Elemente -- die Aufrufkonvention traegt zwei Rueckgabewerte (`rax`, `rdx`). Mehr wird beim Parsen abgewiesen; die Grammatik in §7 nannte bis 1.0.13P faelschlich `{ "," Type }`. Als Element sind auch Struct- und Klassentypen zugelassen: der Slot haelt den ZEIGER, wie bei jeder Struct-Variablen sonst. Bis 1.0.13P trug der entpackte Name keinen Typ -- der Zeiger kam an, aber `a.v` fand kein Feld und lieferte still `0` (#1122). Der Typ wird jetzt aus dem deklarierten Rueckgabetyp des Aufgerufenen uebernommen, bei freien Funktionen wie bei Methoden (auch geerbten). Ist der Aufgerufene dem Codegen unbekannt (importiert, Builtin), bleibt der Name typlos wie bisher. |
 | Rechtsshift, Vorzeichen | 15 | `>>` zieht auf einem vorzeichenBEHAFTETEN Typ das Vorzeichenbit nach (arithmetisch, `SAR`) und fuellt auf einem vorzeichenLOSEN mit Nullen auf (`SHR`) -- massgeblich ist der LINKE Operand. Erkannt wird der Typ, wo er ohne Aufwand feststeht: eine Variable mit deklariertem Typ (lokal oder global) und der `as`-Cast; alles andere gilt als vorzeichenbehaftet. `(x as uint64) >> n` ist damit der ausdrueckliche Weg zum logischen Shift, den Rotationen und Konstante-Zeit-Idiome brauchen. Bis 1.0.13R fuellte `>>` IMMER mit Nullen auf: `-8 >> 1` ergab 9223372036854775804 statt -4, und weil das Ergebnis riesig positiv ist, folgte meist ein Speicher- oder Indexfehler statt einer Meldung (#1125). Der Shift-BETRAG wird wie in der Hardware auf 6 Bit maskiert -- `1 << 64` ergibt `1`, nicht `0`. |
+| `in` als Operator | 15 | `x in a..b` prueft die Zugehoerigkeit zu einem Bereich, Grenzen EINSCHLIESSLICH wie beim Bereichsmuster in `match` und beim Bereichstyp; ein offenes Ende (`a..`) ist nach oben unbeschraenkt. Steht rechts kein Bereich, gilt weiterhin die Woerterbuch-Zugehoerigkeit (`schluessel in map`). Bis 1.0.13S lief JEDES `in` in den Woerterbuch-Zweig: `_lyx_map_has` bekam als "Map" das, was der Bereichsknoten hinterliess -- kein Zeiger, sondern die obere Grenze, waehrend die untere unbalanciert auf dem Stack blieb. Der Ausdruck uebersetzte und stuerzte zur Laufzeit ab (#1129). |
 | Benannte Argumente, Auswertungsreihenfolge | 15.1 | `F(b: 2, a: 1)` ordnet richtig zu, wertet die Argumente aber in PARAMETERREIHENFOLGE aus, nicht in der geschriebenen. Bei Seiteneffekten in den Argumenten ist das sichtbar. Wo die Deklaration nicht herangezogen werden kann (importiert, extern, variadisch, generisch, Builtin), werden benannte Argumente ABGEWIESEN statt stillschweigend positionell genommen. (#1087) |
 | Einheitentypen, Semantik | 11 | `utype N: Dim = Faktor` wirkt: bei Zuweisung zwischen Einheiten DERSELBEN Dimension rechnet der Compiler mit dem Faktorverhaeltnis um — erst multiplizieren, dann ganzzahlig teilen, `Km` nach `M` also exakt, `M` nach `Km` abschneidend wie die Ganzzahldivision sonst. Die DIMENSION wird geprueft: Zuweisung ueber Dimensionsgrenzen, Addition zweier Dimensionen und das Verrechnen mit einer dimensionslosen Zahl werden abgewiesen. Erlaubt bleiben ein Literal als Wert (`var a: Km := 2`), die Skalierung mit einer Zahl (`a * 3` behaelt die Einheit) und der `as`-Cast als bewusster Fluchtweg. `range LO..HI` bricht ausserhalb mit `panic` ab, `wraps LO..HI` rechnet in den Bereich zurueck; Grenzen einschliesslich, konstante Werte meldet der Compiler sofort. Bis 1.0.13D war `utype` ein Typalias mit dekorativem Faktor, und `range`/`wraps` parsten gar nicht (#1110). NICHT gerechnet werden abgeleitete Dimensionen: `dim Speed = Meter / Second` wird angenommen, aber `laenge / zeit` ergibt keine `Speed` — das Ergebnis gilt als dimensionslos, und `utype`-Werte sind ganzzahlig. |
 | Array als Funktionsparameter | 6 | `fn F(a: int64[4])` uebergibt den ZEIGER auf die Ablage: der Callee liest und schreibt denselben Speicher, eine Zuweisung darin ist beim Aufrufer sichtbar. Die deklarierte Groesse wird mitgenommen, `len(a)` liefert sie, und die Bereichspruefung unter `--runtime-checks` (#1156) greift auch hier. Gilt fuer alle Uebergabewege: Register, Stack (ab dem siebten Argument) und Methodenparameter. Bis 1.0.13F fehlte im Callee die Merkung "das ist ein Array" — der Indexzugriff fiel in den Zweig fuer einen rohen Zeiger, lieferte lesend eine Adresse und schrieb ins Leere (#1115). Die Schreibweise `array[T]` ist als Parametertyp weiterhin nicht zugelassen. |
