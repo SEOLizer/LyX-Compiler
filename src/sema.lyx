@@ -2494,6 +2494,61 @@ pub type Sema = class {
   // WP-2.2-C: Return 1 if a case body (SNK_BLOCK) ends with an explicit terminator:
   // break, return, throw, continue, or panic. Recurse into nested ifs where ALL
   // branches terminate. Empty blocks return 0 (treated as potentially falling through).
+  // #1135: Enthaelt der Teilbaum ueberhaupt einen Ausgang (`return`, `throw`,
+  // `panic`)? BEWUSST keine Flussanalyse: gemeldet wird nur, wenn gar keiner
+  // vorkommt. `if (a > 0) { return 1; }` ohne weiteren Ausgang laesst sich
+  // erst mit einer Pfadbetrachtung beurteilen -- die waere eine eigene
+  // Baustelle, und ein Fehlalarm hier waere schlimmer als die Luecke.
+  //
+  // Getrennt nach KNOTEN und KETTE: die Anweisungen eines Blockes haengen als
+  // next-Kette an c0. Wer beides in einer Schleife erledigt, verliert die
+  // Geschwister des ersten Kindes, sobald dieses uebersprungen wird -- und
+  // genau das passiert bei einer verschachtelten Funktion an erster Stelle
+  // (tests/nested_fn_test.lyx).
+  fn _hasReturnIn(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.sn_kind(ni);
+    if (k == SNK_RETURN) { return 1; }
+    if (k == SNK_THROW)  { return 1; }
+    if (k == SNK_PANIC)  { return 1; }
+    // `exit(...)` verlaesst das Programm und ist damit ebenfalls ein Ausgang.
+    // examples/test_aes_debug.lyx endet so, ohne `return` -- und zu Recht.
+    if (k == SNK_CALL) {
+      if (self._strNEq(self.sn_sVal(ni), self.sn_sLen(ni), "exit"c, 4) != 0) { return 1; }
+    }
+    // Eine geschachtelte Funktion hat ihren eigenen Ausgang — er zaehlt nicht
+    // fuer die umgebende.
+    if (k == SNK_FUNC_DECL) { return 0; }
+    if (self._hasReturnChain(self.sn_c0(ni)) != 0) { return 1; }
+    if (self._hasReturnChain(self.sn_c1(ni)) != 0) { return 1; }
+    if (self._hasReturnChain(self.sn_c2(ni)) != 0) { return 1; }
+    if (self._hasReturnChain(self.sn_c3(ni)) != 0) { return 1; }
+    return 0;
+  }
+
+  fn _hasReturnChain(ni: int64): int64 {
+    var cur: int64 := ni;
+    while (cur >= 0) {
+      if (self._hasReturnIn(cur) != 0) { return 1; }
+      cur := self.sn_next(cur);
+    }
+    return 0;
+  }
+
+  // #1135: Ist der Name im AKTUELLEN Geltungsbereich schon vergeben? Die
+  // Symbole eines Bereichs liegen zwischen dem beim Betreten gemerkten Stand
+  // und dem jetzigen.
+  fn _declaredInCurrentScope(name: pchar, nameLen: int64): int64 {
+    if (self.scopeDepth <= 0) { return 0; }
+    var from: int64 := peek64(self.scopes + (self.scopeDepth - 1) * 8);
+    var i: int64 := from;
+    while (i < self.symCount) {
+      if (self._strNEq(self.SymName(i), self.SymNameLen(i), name, nameLen) != 0) { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
   fn _caseBodyTerminates(bodyNi: int64): int64 {
     if (bodyNi < 0) { return 0; }
     var k: int64 := self.sn_kind(bodyNi);
@@ -2589,6 +2644,13 @@ pub type Sema = class {
         self._checkRangeAssign(typeNi, initNi, initNi);
         // #1110: Einheitentyp -- Dimension pruefen.
         self._checkUtypeAssign(typeNi, initNi, initNi);
+      }
+      // #1135: Derselbe Name zweimal im selben Geltungsbereich. Bisher gewann
+      // die zweite Deklaration stillschweigend — ein Tippfehler beim
+      // Wiederverwenden eines Namens blieb damit unbemerkt. In einem INNEREN
+      // Block bleibt das Verdecken erlaubt, das ist eine andere Frage.
+      if (self._declaredInCurrentScope(self.sn_sVal(ni), self.sn_sLen(ni)) != 0) {
+        self._errorNodeName("Name im selben Block bereits deklariert"c, ni, self.sn_sVal(ni), self.sn_sLen(ni));
       }
       var varSi: int64 := self.symCount;
       self._pushSym(self.sn_sVal(ni), self.sn_sLen(ni), SYM_VAR, tid, ni);
@@ -3607,6 +3669,21 @@ pub type Sema = class {
     // #1009: Typparameter gelten nur innerhalb dieser Deklaration.
     self.tpCount := savedTp;
 
+    // #1135: Eine Funktion mit Rueckgabetyp muss einen Ausgang haben. Ohne
+    // `return` lieferte sie stillschweigend 0 — der Codegen setzt am
+    // Funktionsende `xor rax,rax`. Extern deklarierte und abstrakte Methoden
+    // haben keinen Rumpf und sind ausgenommen.
+    var fnRet: int64 := self.ResolveType(self.sn_c1(ni));
+    var fnBody: int64 := self.sn_c2(ni);
+    var isExternFn: int64 := self.sn_iVal(ni) & 1;
+    var isAbstractFn: int64 := (self.sn_iVal(ni) >> 3) & 1;
+    if (fnRet != TY_VOID && fnRet != TY_UNKNOWN && fnBody >= 0
+        && isExternFn == 0 && isAbstractFn == 0) {
+      if (self._hasReturnIn(fnBody) == 0) {
+        self._errorNodeName("Funktion ohne return, Rueckgabetyp verlangt einen Wert"c, ni, self.sn_sVal(ni), self.sn_sLen(ni));
+      }
+    }
+
     self.curFnRetType := savedRetType;   // #1135
     self._popScope();
   }
@@ -4452,6 +4529,25 @@ pub type Sema = class {
         }
         ifaceListNi := self.sn_next(ifaceListNi);
       }
+      // #1135: Auch die Rueckgabe-Frage muss ueberall gestellt werden, aus
+      // demselben Grund wie bei #1090: die volle Rumpfpruefung unten laeuft
+      // nur fuer capability-annotierte Klassen, eine Methode ohne `return`
+      // liefert aber genauso still 0 wie eine freie Funktion.
+      var rMth: int64 := self.sn_c1(ni);
+      while (rMth >= 0) {
+        if (self.sn_kind(rMth) == SNK_FUNC_DECL) {
+          var mRet: int64 := self.ResolveType(self.sn_c1(rMth));
+          var mBody: int64 := self.sn_c2(rMth);
+          var mAbstract: int64 := (self.sn_iVal(rMth) >> 3) & 1;
+          if (mRet != TY_VOID && mRet != TY_UNKNOWN && mBody >= 0 && mAbstract == 0) {
+            if (self._hasReturnIn(mBody) == 0) {
+              self._errorNodeName("Methode ohne return, Rueckgabetyp verlangt einen Wert"c, rMth, self.sn_sVal(rMth), self.sn_sLen(rMth));
+            }
+          }
+        }
+        rMth := self.sn_next(rMth);
+      }
+
       // #1090: `static`-Methoden pruefen -- unabhaengig von Annotationen.
       // Die volle Rumpfpruefung unten laeuft aus Ruecksicht auf Altbestand nur
       // fuer capability-annotierte Klassen; diese eine Frage muss aber ueberall
@@ -5262,10 +5358,36 @@ pub type Sema = class {
     self.privEnforce := 1;
     self.Pass2(head);
     self.privEnforce := 0;
+    self._checkDuplicateFuncs(head);         // #1135
     self._checkCapabilityInheritance(head);  // WP-L3
     self._buildCapGraph(head, "<root>"c, 6); // WP-L4
     self.capStripper.PrintReport();          // WP-L6: Pruning-Report
     return self.hadError;
+  }
+
+  // #1135: Zwei Funktionen gleichen Namens im SELBEN Modul. Bisher gewann
+  // stillschweigend die erste, die zweite war toter Text — ein Kopierfehler
+  // beim Umbenennen blieb damit unbemerkt. Geprueft wird nur die oberste
+  // Ebene des Wurzelmoduls: gleichnamige Funktionen in verschiedenen Units
+  // sind kein Fehler, dafuer gibt es die Mehrdeutigkeitspruefung.
+  fn _checkDuplicateFuncs(head: int64) {
+    var a: int64 := head;
+    while (a >= 0) {
+      if (self.sn_kind(a) == SNK_FUNC_DECL) {
+        var an: pchar := self.sn_sVal(a);
+        var al: int64 := self.sn_sLen(a);
+        var b: int64 := self.sn_next(a);
+        while (b >= 0) {
+          if (self.sn_kind(b) == SNK_FUNC_DECL) {
+            if (self._strNEq(an, al, self.sn_sVal(b), self.sn_sLen(b)) != 0) {
+              self._errorNodeName("Funktion bereits deklariert"c, b, self.sn_sVal(b), self.sn_sLen(b));
+            }
+          }
+          b := self.sn_next(b);
+        }
+      }
+      a := self.sn_next(a);
+    }
   }
 
   // WP-BC-46: get source line for a node via its token index
