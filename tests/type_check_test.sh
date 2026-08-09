@@ -116,12 +116,23 @@ fn main(): int64 { var p: pchar := 0; if ((p as int64) == 0) { PrintStrLn(\"null
 out "ganzzahliges Literal in f64 bleibt zulaessig" "$K
 fn main(): int64 { var f: f64 := 0; var g: f64 := 1.5; PrintStrLn(\"ok\"); return 0; }" 'ok'
 
-# int64 ist in Lyx zugleich der Zeigertyp — das Muster der stdlib bleibt
-# zulaessig. Bis das aufgeraeumt ist (473 Stellen in 15 Dateien), waere jede
-# Meldung hier ein Fehlalarm.
-out "Zeichenkette in int64-Ziel bleibt zulaessig" "$K
+# #1221: `int64` diente in der stdlib durchgehend als Zeigertyp; das ist
+# aufgeraeumt (470 Stellen in 16 Dateien tragen jetzt pchar). Seit 1.0.14I
+# wird auch diese Richtung gemeldet — der Haupt-Repro aus #1135.
+fails "Repro #1135: Zeichenkette in int64-Ziel" "$K
+fn main(): int64 { var x: int64 := \"text\"; PrintLn(x); return 0; }" "int64 erwartet, pchar gegeben"
+
+fails "Zeichenkette als Rueckgabe bei int64" "$K
 fn Name(): int64 { return \"Visa\"; }
-fn main(): int64 { PrintStr(Name()); PrintStrLn(\"\"); return 0; }" 'Visa'
+fn main(): int64 { PrintLn(Name()); return 0; }" "Rueckgabe: int64 erwartet, pchar gegeben"
+
+fails "Zeichenkette als Argument an int64-Parameter" "$K
+fn F(a: int64): int64 { return a * 2; }
+fn main(): int64 { PrintLn(F(\"x\")); return 0; }" "Argument: int64 erwartet, pchar gegeben"
+
+# Der Weg dorthin bleibt der Cast.
+out "Zeichenkette in int64 mit Cast" "$K
+fn main(): int64 { var x: int64 := \"text\" as int64; if (x != 0) { PrintStrLn(\"ok\"); } return 0; }" 'ok'
 
 # --- Gegenproben: richtige Programme laufen unveraendert -----------------
 out "korrektes Programm" "$K
