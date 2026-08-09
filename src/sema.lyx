@@ -385,6 +385,9 @@ pub type Sema = class {
 
   // WP-AS-03: @bounds_check / @debug_info / @optimization_level scope state
   boundsCheckEnabled: int64;  // 1=on (default, safety-first), 0=off
+  // #1135: Rueckgabetyp der Funktion, die gerade geprueft wird — fuer den
+  // Abgleich beim `return`.
+  curFnRetType: int64;
   // #1124: Wurde @bounds_check(true) geschrieben? Der Vorgabewert 1 laesst
   // "an" und "nicht gesetzt" sonst nicht auseinanderhalten; der Codegen
   // braucht die Unterscheidung, um die Pruefung auch ohne --runtime-checks
@@ -813,6 +816,146 @@ pub type Sema = class {
   // ------------------------------------------------------------------
   // Type resolution
   // ------------------------------------------------------------------
+
+  // ------------------------------------------------------------------
+  // #1135: Typpruefung bei Zuweisung, Rueckgabe und Argumenten
+  // ------------------------------------------------------------------
+  //
+  // Geprueft wurden bisher NAMEN und STELLIGKEIT, nicht aber Typen:
+  // `var x: int64 := "text"c` uebersetzte und gab die Adresse des Literals
+  // aus, `var x: pchar := 42` stuerzte ab. Das widerspricht der Zusage
+  // "statische Typisierung ohne implizite Konvertierungen".
+  //
+  // Die Ableitung bleibt bewusst KLEIN und sicher: sie kennt Literale,
+  // Variablen mit deklariertem Typ, den `as`-Cast und den Rueckgabetyp einer
+  // im selben Lauf deklarierten Funktion. Alles andere -- Builtins,
+  // importierte Funktionen, Feld- und Indexzugriffe, Methodenaufrufe --
+  // liefert TY_UNKNOWN, und Unbekanntes wird NICHT gemeldet. Sonst braeche
+  // der Bestand an Stellen, an denen der Typ gar nicht bestimmbar ist.
+  fn _inferExprType(ni: int64): int64 {
+    if (ni < 0) { return TY_UNKNOWN; }
+    var k: int64 := self.sn_kind(ni);
+    if (k == 40)            { return TY_INT64; }     // NK_LIT_INT
+    if (k == 41)            { return TY_FLOAT64; }   // NK_LIT_FLOAT
+    if (k == 42)            { return TY_PCHAR; }     // NK_LIT_STR
+    if (k == 43)            { return TY_CHAR; }      // NK_LIT_CHAR
+    if (k == 44)            { return TY_BOOL; }      // NK_LIT_BOOL
+    if (k == SNK_CAST) {
+      // `x as T` — der Cast IST die ausdrueckliche Umwandlung, sein Zieltyp
+      // gilt.
+      var ct: int64 := self.sn_c1(ni);
+      if (ct < 0) { ct := self.sn_c0(ni); }
+      return self.ResolveType(ct);
+    }
+    if (k == SNK_IDENT) {
+      var si: int64 := self.Lookup(self.sn_sVal(ni), self.sn_sLen(ni));
+      if (si < 0) { return TY_UNKNOWN; }
+      var sk: int64 := self.SymKind(si);
+      if (sk != SYM_VAR && sk != SYM_PARAM) { return TY_UNKNOWN; }
+      return self.SymTypeId(si);
+    }
+    if (k == SNK_CALL) {
+      // Nur der Aufruf einer FREIEN, hier deklarierten Funktion. Ein
+      // Methodenaufruf (iVal != 0) und alles Importierte bleibt unbestimmt.
+      if (self.sn_iVal(ni) != 0) { return TY_UNKNOWN; }
+      var fi: int64 := self.Lookup(self.sn_sVal(ni), self.sn_sLen(ni));
+      if (fi < 0) { return TY_UNKNOWN; }
+      if (self.SymKind(fi) != SYM_FUNC) { return TY_UNKNOWN; }
+      var fd: int64 := self.SymNodeIdx(fi);
+      if (fd < 0) { return TY_UNKNOWN; }
+      return self.ResolveType(self.sn_c1(fd));
+    }
+    return TY_UNKNOWN;
+  }
+
+  // #1135: Grobklasse eines Typs. 1 = Zahl (ganzzahlig, bool, char),
+  // 2 = Zeichenkette (pchar), 3 = Gleitkomma. 0 = unbestimmt oder
+  // zusammengesetzt — dort wird nicht geurteilt.
+  fn _typeClass(t: int64): int64 {
+    if (t == TY_INT64 || t == TY_INT32 || t == TY_INT16 || t == TY_INT8) { return 1; }
+    if (t == TY_UINT64 || t == TY_UINT32 || t == TY_UINT16 || t == TY_UINT8) { return 1; }
+    if (t == TY_BOOL || t == TY_CHAR) { return 1; }
+    if (t == TY_PCHAR) { return 2; }
+    if (t == TY_FLOAT64 || t == TY_FLOAT32) { return 3; }
+    return 0;
+  }
+
+  // #1135: Passt der Wert zum Ziel? Geurteilt wird nur, wenn BEIDE Klassen
+  // bestimmt sind und sich unterscheiden. Innerhalb einer Klasse wird nicht
+  // gemeckert: die Breiten mischen sich im Bestand durchgehend (int64 und
+  // uint8 an derselben Stelle), und das Kuerzen ist seit #1151 geregelt.
+  // Ein ganzzahliges LITERAL in einem Gleitkommaziel (`var f: f64 := 0`)
+  // bleibt ebenfalls zugelassen -- der Bestand schreibt es so.
+  fn _typeMismatch(want: int64, got: int64, valueNi: int64): int64 {
+    // Ein `as`-Cast ist die AUSDRUECKLICHE Umwandlung — ihn zu bemaengeln
+    // waere widersinnig, er ist ja der vorgesehene Weg. Der Bestand nutzt das
+    // durchgehend: `return 0 as pchar;` in einer Funktion mit int64-Rueckgabe
+    // (std/string.lyx) meint den Nullzeiger, und Adresse und int64 sind in
+    // Lyx dasselbe Maschinenwort.
+    if (valueNi >= 0 && self.sn_kind(valueNi) == SNK_CAST) { return 0; }
+    var cw: int64 := self._typeClass(want);
+    var cg: int64 := self._typeClass(got);
+    if (cw == 0 || cg == 0) { return 0; }
+    if (cw == cg) { return 0; }
+    // Ein ganzzahliges LITERAL in einem Gleitkommaziel (`var f: f64 := 0`)
+    // bleibt zugelassen -- der Bestand schreibt es so.
+    if (cw == 3 && cg == 1 && valueNi >= 0 && self.sn_kind(valueNi) == 40) { return 0; }
+    // Eine Zeichenkette in ein GANZZAHL-Ziel bleibt ebenfalls zugelassen:
+    // `int64` ist in Lyx zugleich der Zeigertyp, und der Bestand nutzt ihn
+    // durchgehend so -- `pub fn Name(): int64 { return "Visa"; }` in
+    // std/validate/luhn.lyx, String-Literale an `int64`-Parameter in
+    // std/net/dns.lyx, und so an 39 weiteren Stellen der Suite. Die Zusage
+    // "keine impliziten Konvertierungen" laesst sich hier nicht einloesen,
+    // ohne die halbe stdlib umzuschreiben; das ist ein eigenes Paket.
+    //
+    // Die GEFAEHRLICHE Richtung wird geprueft: eine Zahl in ein pchar-Ziel
+    // ergibt einen Zeiger auf nichts -- `var x: pchar := 42` stuerzte beim
+    // ersten Lesen ab.
+    if (cw == 1 && cg == 2) { return 0; }
+    // Und die Null als Zeiger: `var p: pchar := 0;` ist der uebliche
+    // Nullzeiger, kein Tippfehler.
+    if (cw == 2 && cg == 1 && valueNi >= 0 && self.sn_kind(valueNi) == 40 && self.sn_iVal(valueNi) == 0) { return 0; }
+    return 1;
+  }
+
+  fn _typeName(t: int64): pchar {
+    if (t == TY_INT64) { return "int64"c; }
+    if (t == TY_INT32) { return "int32"c; }
+    if (t == TY_INT16) { return "int16"c; }
+    if (t == TY_INT8)  { return "int8"c; }
+    if (t == TY_UINT64) { return "uint64"c; }
+    if (t == TY_UINT32) { return "uint32"c; }
+    if (t == TY_UINT16) { return "uint16"c; }
+    if (t == TY_UINT8)  { return "uint8"c; }
+    if (t == TY_PCHAR) { return "pchar"c; }
+    if (t == TY_FLOAT64) { return "f64"c; }
+    if (t == TY_FLOAT32) { return "f32"c; }
+    if (t == TY_BOOL) { return "bool"c; }
+    if (t == TY_CHAR) { return "char"c; }
+    return "?"c;
+  }
+
+  // #1135: Meldung "<was>: <Zieltyp> erwartet, <Werttyp> gegeben".
+  fn _errType(stelle: pchar, ni: int64, want: int64, got: int64) {
+    var wn: pchar := self._typeName(want);
+    var gn: pchar := self._typeName(got);
+    var wl: int64 := StrLen(stelle);
+    var buf: int64 := alloc(wl + 64);
+    memcpy(buf, stelle as int64, wl);
+    var pos: int64 := wl;
+    var lit1: pchar := ": "c;
+    memcpy(buf + pos, lit1 as int64, 2); pos := pos + 2;
+    var l2: int64 := StrLen(wn);
+    memcpy(buf + pos, wn as int64, l2); pos := pos + l2;
+    var lit2: pchar := " erwartet, "c;
+    memcpy(buf + pos, lit2 as int64, 11); pos := pos + 11;
+    var l3: int64 := StrLen(gn);
+    memcpy(buf + pos, gn as int64, l3); pos := pos + l3;
+    var lit3: pchar := " gegeben"c;
+    memcpy(buf + pos, lit3 as int64, 8); pos := pos + 8;
+    poke8(buf + pos, 0);
+    self._errorNode(buf as pchar, ni);
+  }
 
   fn ResolveType(typeNi: int64): int64 {
     if (typeNi < 0) { return TY_VOID; }
@@ -2161,7 +2304,24 @@ pub type Sema = class {
                 while (aa >= 0) { ac := ac + 1; aa := self.sn_next(aa); }
                 if (ac < pcMin || ac > pc) { self._errorNodeName("falsche Argument-Anzahl im Aufruf von", ni, nm, nl); }
                 // #1087: Benannte Argumente in die Parameterreihenfolge bringen.
-                else { self._reorderNamedArgs(ni, declNi, nm, nl); }
+                else {
+                  self._reorderNamedArgs(ni, declNi, nm, nl);
+                  // #1135: Jetzt, wo Argumente und Parameter stellengleich
+                  // stehen, auch die TYPEN abgleichen. Dieselbe Ruecksicht wie
+                  // bei der Stelligkeit: nur diese Funktion, nicht variadisch,
+                  // nicht extern -- und nur, wo beide Typen bestimmt sind.
+                  var apP: int64 := self.sn_c0(declNi);
+                  var apA: int64 := self.sn_c0(ni);
+                  while (apP >= 0 && apA >= 0) {
+                    var wantP: int64 := self.ResolveType(self.sn_c0(apP));
+                    var gotA:  int64 := self._inferExprType(apA);
+                    if (self._typeMismatch(wantP, gotA, apA) != 0) {
+                      self._errType("Argument"c, apA, wantP, gotA);
+                    }
+                    apP := self.sn_next(apP);
+                    apA := self.sn_next(apA);
+                  }
+                }
                 namedHandled := 1;
               }
             }
@@ -2419,6 +2579,11 @@ pub type Sema = class {
       self._logReason("var-decl", ni, tid);
       if (initNi >= 0) {
         self._checkExpr(initNi);
+        // #1135: der Wert muss zum deklarierten Typ passen.
+        var initT: int64 := self._inferExprType(initNi);
+        if (self._typeMismatch(tid, initT, initNi) != 0) {
+          self._errType("Initialisierung"c, ni, tid, initT);
+        }
         self._logConstraint(tid, TY_UNKNOWN, "var-init"c, ni);
         // #1082: Bereichstyp -- konstante Initialisierung sofort pruefen.
         self._checkRangeAssign(typeNi, initNi, initNi);
@@ -2477,6 +2642,20 @@ pub type Sema = class {
           self._errorNodeName("assignment to con constant not allowed", ni, self.sn_sVal(lval), self.sn_sLen(lval));
         }
       }
+      // #1135: die rechte Seite muss zum Typ der linken passen.
+      if (self.sn_kind(lval) == SNK_IDENT) {
+        var tsi: int64 := self.Lookup(self.sn_sVal(lval), self.sn_sLen(lval));
+        if (tsi >= 0) {
+          var tk: int64 := self.SymKind(tsi);
+          if (tk == SYM_VAR || tk == SYM_PARAM) {
+            var wantT: int64 := self.SymTypeId(tsi);
+            var gotT:  int64 := self._inferExprType(self.sn_c1(ni));
+            if (self._typeMismatch(wantT, gotT, self.sn_c1(ni)) != 0) {
+              self._errType("Zuweisung"c, ni, wantT, gotT);
+            }
+          }
+        }
+      }
       // #1082: Zuweisung an eine Variable mit Bereichstyp -- konstante
       // rechte Seite sofort pruefen.
       if (self.sn_kind(lval) == SNK_IDENT) {
@@ -2492,6 +2671,13 @@ pub type Sema = class {
 
     } else if (k == SNK_RETURN) {
       self._checkExpr(self.sn_c0(ni));
+      // #1135: der zurueckgegebene Wert muss zum Rueckgabetyp passen.
+      if (self.sn_c0(ni) >= 0 && self.curFnRetType != TY_UNKNOWN) {
+        var retT: int64 := self._inferExprType(self.sn_c0(ni));
+        if (self._typeMismatch(self.curFnRetType, retT, self.sn_c0(ni)) != 0) {
+          self._errType("Rueckgabe"c, ni, self.curFnRetType, retT);
+        }
+      }
 
     } else if (k == SNK_EXPR_STMT) {
       self._checkExpr(self.sn_c0(ni));
@@ -3324,6 +3510,10 @@ pub type Sema = class {
 
   fn _checkFuncDecl(ni: int64) {
     self._pushScope();
+    // #1135: Rueckgabetyp merken (und den der umgebenden Funktion retten —
+    // Lyx kennt geschachtelte Funktionen).
+    var savedRetType: int64 := self.curFnRetType;
+    self.curFnRetType := self.ResolveType(self.sn_c1(ni));
 
     // #1089: Default-Werte muessen zur UEBERSETZUNGSZEIT feststehen
     // (ebnf.md §15.1). Der Codegen wertet den Ausdruck an JEDER Aufrufstelle
@@ -3417,6 +3607,7 @@ pub type Sema = class {
     // #1009: Typparameter gelten nur innerhalb dieser Deklaration.
     self.tpCount := savedTp;
 
+    self.curFnRetType := savedRetType;   // #1135
     self._popScope();
   }
 
@@ -5018,6 +5209,7 @@ pub type Sema = class {
 
     // WP-AS-03: new directive defaults
     self.boundsCheckEnabled := 1;  // on by default (safety-first)
+    self.curFnRetType := TY_UNKNOWN;   // #1135
     self.boundsCheckForced  := 0;  // #1124
     self.debugInfoEnabled   := 0;
     self.optLevel           := 2;  // default optimisation level

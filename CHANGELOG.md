@@ -2,6 +2,52 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — Typprüfung bei Initialisierung, Zuweisung, Rückgabe und Argumenten (#1135, erste Stufe)
+
+Geprüft wurden bisher **Namen und Stelligkeit**, nicht aber Typen:
+`var x: pchar := 42` übersetzte und stürzte beim ersten Lesen ab, eine
+Funktion mit `int64`-Rückgabetyp durfte ein `f64` zurückgeben.
+
+Neu ist eine Ausdrucks-Typableitung in sema (`_inferExprType`) und ihre
+Anwendung an vier Stellen: **Initialisierung** mit deklariertem Typ,
+**Zuweisung**, **`return`** und **Argumente**. Die Ableitung bleibt bewusst
+klein und sicher — sie kennt Literale, Variablen mit deklariertem Typ, den
+`as`-Cast und den Rückgabetyp einer im selben Lauf deklarierten Funktion.
+Alles andere (Builtins, Importiertes, Feld- und Indexzugriffe,
+Methodenaufrufe) bleibt unbestimmt und wird **nicht** gemeldet; sonst bräche
+der Bestand an Stellen, an denen der Typ gar nicht bestimmbar ist.
+
+Gemeldet wird jetzt zum Beispiel:
+
+```
+sema error (line 2): Initialisierung: pchar erwartet, int64 gegeben
+sema error (line 3): Argument: int64 erwartet, f64 gegeben
+sema error (line 2): Rueckgabe: int64 erwartet, f64 gegeben
+```
+
+**Drei Ausnahmen, jede durch den Bestand erzwungen:**
+
+1. Ein `as`-Cast wird nie bemängelt — er *ist* die ausdrückliche Umwandlung.
+2. Eine Zeichenkette in einem **Ganzzahl**-Ziel bleibt zulässig: `int64` ist
+   in Lyx zugleich der Zeigertyp, und die stdlib nutzt ihn durchgehend so
+   (`pub fn CreditCardTypeName(…): int64 { return "Visa"; }`). Ein Messlauf
+   mit scharfer Regel ergab **473 Fundstellen in 16 Dateien** — als #1221
+   abgetrennt. Der im Issue genannte Fall `var x: int64 := "text"` bleibt
+   deshalb vorerst ungeprüft.
+3. Die Null in einem `pchar`-Ziel (`var p: pchar := 0;`) ist der übliche
+   Nullzeiger.
+
+Im Bestand angepasst: drei Aufrufe in `std/db/sqlite.lyx`, die einen
+`alloc`-Puffer an einen `pchar`-Parameter geben — jetzt mit `as pchar`
+geschrieben, also als das benannt, was sie sind.
+
+Nicht enthalten und weiterhin offen (#1135): fehlendes `return` bei
+nicht-`void`, Variable zweimal im selben Block, zwei Funktionen gleichen
+Namens, Arithmetik auf `pchar`.
+
+Neu: `tests/type_check_test.sh` (17 Prüfungen, davon 9 gegen 1.0.14E rot).
+
+
 ### Compiler — Meldung bei zyklischem Import gab den Dateiinhalt aus (#1134)
 
 ```
