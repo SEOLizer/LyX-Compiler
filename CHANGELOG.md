@@ -2,6 +2,39 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — Meldung bei zyklischem Import gab den Dateiinhalt aus (#1134)
+
+```
+sema error: zyklischer Import erkannt: za;
+pub fn B(): int64 { return 2; }
+ → zb;
+pub fn A(): int64 { return 1; }
+ → …
+```
+
+Der Zyklus wurde korrekt erkannt, die Meldung war aber unbrauchbar: bei einer
+Unit mit einigen hundert Zeilen stand die halbe Datei darin.
+
+**Ursache:** die Namen im Capability-Graphen zeigen in den **Quelltext** und
+sind nicht nullterminiert. `PrintStr` lief bis zum nächsten NUL, also bis zum
+Dateiende. Dass Name und Inhalt „gegeneinander verschoben" wirkten, kam daher,
+dass die Zeiger in verschiedene Quelltexte zeigen.
+
+**Fix:** Namen mit ihrer Länge schreiben. Dazu führt der DFS jetzt den Weg der
+grauen Knoten mit und meldet die ganze **Kette** statt zweier Namen und einer
+Auslassung:
+
+```
+sema error: zyklischer Import erkannt: zb → za → zb
+sema error: zyklischer Import erkannt: cc → ca → cb → cc
+```
+
+Neu: `tests/import_cycle_message_test.sh` (13 Prüfungen, davon 6 gegen 1.0.14D
+rot). Geprüft wird unter anderem, dass **jedes Kettenglied ein reiner
+Unit-Name** ist — eine bloße „enthält `za`"-Prüfung wäre auch vorher grün
+gewesen.
+
+
 ### Compiler — Interface-Dispatch lieferte 0 (#1133)
 
 ```lyx
