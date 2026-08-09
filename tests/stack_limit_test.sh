@@ -134,15 +134,16 @@ case "$wmsg" in
   *) echo "PASS Vermerk 'nicht nachgewiesen' ist weg"; PASS=$((PASS+1)) ;;
 esac
 
-# Die uebrigen unbewiesenen Attribute melden weiterhin.
+# Die uebrigen unbewiesenen Attribute melden weiterhin. (@wcet stand hier bis
+# 1.0.14K -- seit #1139 wird es nachgewiesen und meldet nichts mehr.)
 printf '%s\n' "$K
-@wcet(100)
+@integrity(mode: software_lockstep)
 fn F(): int64 { return 1; }
 fn main(): int64 { return F(); }" > "$TMP/v.lyx"
 vmsg="$("$LYXC" --std-path="$ROOT" "$TMP/v.lyx" -o "$TMP/v" 2>&1)"
 case "$vmsg" in
-  *"NICHT nachgewiesen"*) echo "PASS @wcet meldet weiterhin"; PASS=$((PASS+1)) ;;
-  *) echo "FAIL @wcet meldet weiterhin: Meldung fehlt"; FAIL=$((FAIL+1)) ;;
+  *"NICHT nachgewiesen"*) echo "PASS @integrity meldet weiterhin"; PASS=$((PASS+1)) ;;
+  *) echo "FAIL @integrity meldet weiterhin: Meldung fehlt"; FAIL=$((FAIL+1)) ;;
 esac
 
 echo

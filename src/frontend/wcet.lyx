@@ -1,0 +1,541 @@
+// ==================================================================
+// #1139: @wcet(N) — Nachweis der Iterationsschranke
+// ==================================================================
+//
+// `@wcet(N)` sagte bis 1.0.14K nichts zu, was geprueft wurde: das Attribut
+// wurde geparst, in seiner Argumentform kontrolliert und am Knoten vermerkt.
+// Seit #1099 meldete jedes Vorkommen den fehlenden Nachweis — eine Zusicherung
+// ohne Pruefung ist schlechter als keine, weil sie im Quelltext wie eine
+// Garantie aussieht.
+//
+// EINHEIT. N zaehlt ITERATIONEN, nicht Zyklen. Zyklen waeren ohne
+// Mikroarchitekturmodell erfunden: jede Zahl in einer Kostentabelle waere ein
+// Beweisanschein, den es nicht gibt. Iterationen sind das, was sich am Baum
+// tatsaechlich abzaehlen laesst. `@wcet` heisst hier also ausdruecklich
+// "obere Schranke der Schleifendurchlaeufe" (ebnf.md §20.1).
+//
+// Gezaehlt wird kumulativ: eine Schleife mit Schranke B, in deren Rumpf I
+// Iterationen stecken, traegt B * (1 + I) bei. Zwei geschachtelte Schleifen zu
+// je 10 ergeben also 10 + 100 = 110 — genau die Zahl der Durchlaeufe, die
+// wirklich stattfinden.
+//
+// NACHWEISBAR ist nur, was strukturell entschieden werden kann:
+//
+//   for i := A to B          A, B ganzzahlige Literale
+//   for i in A..B            dito, Grenzen einschliesslich
+//   for i in range(A, B)     dito, Ende ausschliessend
+//   while (c) limit(N)       N Literal (#1103 — die Sprache hat die Form schon)
+//   while (i < C)            Zaehler mit literalem Startwert, konstanter
+//                            Schranke C und genau einer Fortschaltung
+//                            i := i + K mit K > 0
+//
+// NICHT nachweisbar und darum in einer `@wcet`-Funktion ein FEHLER:
+// berechnete Schleifengrenzen, `repeat/until`, das C-artige `for`, Rekursion
+// (auch indirekt) und der Aufruf einer Funktion ohne eigene Schranke. Das ist
+// der Kern der Sache: was nicht bewiesen werden kann, darf nicht
+// stillschweigend als bewiesen gelten.
+//
+// Aufrufe: eine `@wcet`-Funktion darf nur Funktionen rufen, die selbst eine
+// Schranke tragen; deren N geht in die Summe ein. Alles andere — importierte
+// Funktionen, deren Rumpf hier gar nicht vorliegt, und Funktionen ohne
+// Attribut — wird abgewiesen. Ausgenommen sind die Speicher-Builtins
+// (peek8/16/32/64, poke8/16/32/64) und `exit`: sie erzeugen geradlinigen Code
+// ohne Schleife. Die Liste steht hier und in §20.1, damit sie nachpruefbar
+// bleibt statt als stiller Default zu wirken.
+//
+// Alle Methoden tragen das Praefix wc_ (VMT-Kollisionen, wie im Linter).
+
+import src.parser;
+import src.lexer;
+import src.std.alloc;
+
+con WC_NODE_SIZE: int64 := 88;
+con WC_OFF_C0:    int64 := 8;
+con WC_OFF_C1:    int64 := 16;
+con WC_OFF_C2:    int64 := 24;
+con WC_OFF_C3:    int64 := 32;
+con WC_OFF_NEXT:  int64 := 40;
+con WC_OFF_IVAL:  int64 := 56;
+con WC_OFF_SVAL:  int64 := 64;
+con WC_OFF_SLEN:  int64 := 72;
+
+// Tabelleneintrag je Funktion: Name (Offset/Laenge), Schranke, Knotenindex.
+con WC_FN_SZ: int64 := 32;
+
+// "nicht nachweisbar" — von den Grenzenrechnungen zurueckgegeben. Eine echte
+// Iterationszahl ist nie negativ, der Wert kann also nicht verwechselt werden.
+con WC_UNPROVABLE: int64 := 0 - 1;
+
+pub type WcetCheck = class {
+  wcNodes:     int64;
+  wcSrc:       pchar;
+  wcNodeCount: int64;
+  wcTab:       int64;
+  wcCount:     int64;
+  wcCap:       int64;
+  wcFailed:    int64;   // 1, sobald etwas gemeldet wurde
+  wcCurName:   int64;   // Name der gerade geprueften Funktion (Quelltext-Offset)
+  wcCurLen:    int64;
+  // Ergebnis von wc_constInt/wc_findInit: ein eigener Rueckgabewert reicht
+  // nicht, weil 0 ein gueltiger konstanter Wert ist.
+  wcConstVal:  int64;
+  // Ergebnis von wc_countAssigns.
+  wcAsgCount:  int64;
+  wcAsgNode:   int64;
+
+  // ------------------------------------------------------------------
+  // Knotenzugriff
+  // ------------------------------------------------------------------
+
+  fn wc_base(ni: int64): int64 { return self.wcNodes + ni * WC_NODE_SIZE; }
+  fn wc_kind(ni: int64): int64 { return peek64(self.wc_base(ni)); }
+  fn wc_c0(ni: int64): int64   { return peek64(self.wc_base(ni) + WC_OFF_C0); }
+  fn wc_c1(ni: int64): int64   { return peek64(self.wc_base(ni) + WC_OFF_C1); }
+  fn wc_c2(ni: int64): int64   { return peek64(self.wc_base(ni) + WC_OFF_C2); }
+  fn wc_c3(ni: int64): int64   { return peek64(self.wc_base(ni) + WC_OFF_C3); }
+  fn wc_next(ni: int64): int64 { return peek64(self.wc_base(ni) + WC_OFF_NEXT); }
+  fn wc_iv(ni: int64): int64   { return peek64(self.wc_base(ni) + WC_OFF_IVAL); }
+  fn wc_soff(ni: int64): int64 { return peek64(self.wc_base(ni) + WC_OFF_SVAL); }
+  fn wc_slen(ni: int64): int64 { return peek64(self.wc_base(ni) + WC_OFF_SLEN); }
+
+  fn wc_nameEq(offA: int64, lenA: int64, offB: int64, lenB: int64): int64 {
+    if (lenA != lenB) { return 0; }
+    var i: int64 := 0;
+    while (i < lenA) {
+      if (peek8(self.wcSrc + offA + i) != peek8(self.wcSrc + offB + i)) { return 0; }
+      i := i + 1;
+    }
+    return 1;
+  }
+
+  fn wc_isLit(off: int64, len: int64, s: pchar): int64 {
+    var i: int64 := 0;
+    while (i < len) {
+      if (peek8(self.wcSrc + off + i) != peek8(s + i)) { return 0; }
+      i := i + 1;
+    }
+    if (peek8(s + len) != 0) { return 0; }
+    return 1;
+  }
+
+  // ------------------------------------------------------------------
+  // Meldungen
+  // ------------------------------------------------------------------
+
+  fn wc_putInt(v: int64) {
+    if (v == 0) { EPrintStr("0"c); return; }
+    var buf: int64 := alloc(24);
+    var n: int64 := 0;
+    var x: int64 := v;
+    while (x > 0) {
+      poke8(buf + n, 48 + (x % 10));
+      x := x / 10;
+      n := n + 1;
+    }
+    var i: int64 := n - 1;
+    while (i >= 0) {
+      sys_write(2, buf + i, 1);
+      i := i - 1;
+    }
+  }
+
+  // Jede Meldung nennt die Funktion, um die es geht — ohne den Namen muesste
+  // man sie im Quelltext suchen.
+  fn wc_err() {
+    self.wcFailed := 1;
+    EPrintStr("error: "c);
+    sys_write(2, (self.wcSrc as int64) + self.wcCurName, self.wcCurLen);
+    EPrintStr(": "c);
+  }
+
+  fn wc_unprovable(was: pchar) {
+    self.wc_err();
+    EPrintStr("@wcet ist nicht nachweisbar — "c);
+    EPrintStrLn(was);
+  }
+
+  // ------------------------------------------------------------------
+  // Funktionstabelle
+  // ------------------------------------------------------------------
+
+  fn wc_addFunc(off: int64, len: int64, bound: int64, ni: int64) {
+    if (self.wcCount >= self.wcCap) { return; }
+    var e: int64 := self.wcTab + self.wcCount * WC_FN_SZ;
+    poke64(e, off);
+    poke64(e + 8, len);
+    poke64(e + 16, bound);
+    poke64(e + 24, ni);
+    self.wcCount := self.wcCount + 1;
+  }
+
+  fn wc_findFunc(off: int64, len: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.wcCount) {
+      var e: int64 := self.wcTab + i * WC_FN_SZ;
+      if (self.wc_nameEq(peek64(e), peek64(e + 8), off, len) != 0) { return i; }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  fn wc_boundOf(idx: int64): int64 { return peek64(self.wcTab + idx * WC_FN_SZ + 16); }
+
+  // ------------------------------------------------------------------
+  // Konstante Ausdruecke
+  // ------------------------------------------------------------------
+
+  // Liefert 1 und legt den Wert in self.wcConstVal ab.
+  fn wc_constInt(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (self.wc_kind(ni) == NK_LIT_INT) {
+      self.wcConstVal := self.wc_iv(ni);
+      return 1;
+    }
+    // Unaeres Minus vor einem Literal: `-5` steht als UNOP ueber LIT_INT.
+    if (self.wc_kind(ni) == NK_UNOP) {
+      if (self.wc_iv(ni) == TK_MINUS) {
+        if (self.wc_constInt(self.wc_c0(ni)) != 0) {
+          self.wcConstVal := 0 - self.wcConstVal;
+          return 1;
+        }
+      }
+    }
+    return 0;
+  }
+
+  // ------------------------------------------------------------------
+  // Schleifengrenzen
+  // ------------------------------------------------------------------
+
+  // for i := A to B  /  downto  — Grenzen EINSCHLIESSLICH (ebnf.md §12).
+  fn wc_forBound(ni: int64): int64 {
+    if (self.wc_constInt(self.wc_c0(ni)) == 0) { return WC_UNPROVABLE; }
+    var a: int64 := self.wcConstVal;
+    if (self.wc_constInt(self.wc_c1(ni)) == 0) { return WC_UNPROVABLE; }
+    var b: int64 := self.wcConstVal;
+    if ((self.wc_iv(ni) & 1) != 0) {
+      if (a < b) { return 0; }
+      return a - b + 1;
+    }
+    if (b < a) { return 0; }
+    return b - a + 1;
+  }
+
+  // for i in range(A, B) — Ende AUSSCHLIESSEND.
+  fn wc_forRangeBound(ni: int64): int64 {
+    if (self.wc_constInt(self.wc_c0(ni)) == 0) { return WC_UNPROVABLE; }
+    var a: int64 := self.wcConstVal;
+    if (self.wc_constInt(self.wc_c1(ni)) == 0) { return WC_UNPROVABLE; }
+    var b: int64 := self.wcConstVal;
+    if (b <= a) { return 0; }
+    return b - a;
+  }
+
+  // Zaehlt die Zuweisungen an `name` im Teilbaum und merkt sich die letzte.
+  fn wc_countAssigns(ni: int64, off: int64, len: int64) {
+    var x: int64 := ni;
+    while (x >= 0) {
+      if (self.wc_kind(x) == NK_ASSIGN) {
+        var tgt: int64 := self.wc_c0(x);
+        if (tgt >= 0) {
+          if (self.wc_kind(tgt) == NK_IDENT) {
+            if (self.wc_nameEq(self.wc_soff(tgt), self.wc_slen(tgt), off, len) != 0) {
+              self.wcAsgCount := self.wcAsgCount + 1;
+              self.wcAsgNode := x;
+            }
+          }
+        }
+      }
+      self.wc_countAssigns(self.wc_c0(x), off, len);
+      self.wc_countAssigns(self.wc_c1(x), off, len);
+      self.wc_countAssigns(self.wc_c2(x), off, len);
+      self.wc_countAssigns(self.wc_c3(x), off, len);
+      x := self.wc_next(x);
+    }
+  }
+
+  // Sucht `var name := LITERAL` im Teilbaum. Ergebnis in wcConstVal.
+  fn wc_findInit(ni: int64, off: int64, len: int64): int64 {
+    var x: int64 := ni;
+    while (x >= 0) {
+      if (self.wc_kind(x) == NK_VAR_DECL) {
+        if (self.wc_nameEq(self.wc_soff(x), self.wc_slen(x), off, len) != 0) {
+          if (self.wc_constInt(self.wc_c1(x)) != 0) { return 1; }
+          return 0;
+        }
+      }
+      if (self.wc_findInit(self.wc_c0(x), off, len) != 0) { return 1; }
+      if (self.wc_findInit(self.wc_c1(x), off, len) != 0) { return 1; }
+      if (self.wc_findInit(self.wc_c2(x), off, len) != 0) { return 1; }
+      if (self.wc_findInit(self.wc_c3(x), off, len) != 0) { return 1; }
+      x := self.wc_next(x);
+    }
+    return 0;
+  }
+
+  // while (...) — erst `limit(N)` (#1103), sonst die Zaehlerbetrachtung.
+  // fnBody ist der Rumpf der umgebenden Funktion; dort steht die Deklaration
+  // des Zaehlers.
+  fn wc_whileBound(ni: int64, fnBody: int64): int64 {
+    var lim: int64 := self.wc_c2(ni);
+    if (lim >= 0) {
+      if (self.wc_constInt(lim) != 0) { return self.wcConstVal; }
+      return WC_UNPROVABLE;
+    }
+    var cond: int64 := self.wc_c0(ni);
+    if (cond < 0) { return WC_UNPROVABLE; }
+    if (self.wc_kind(cond) != NK_BINOP) { return WC_UNPROVABLE; }
+    var op: int64 := self.wc_iv(cond);
+    if (op != TK_LT && op != TK_LE) { return WC_UNPROVABLE; }
+    var lhs: int64 := self.wc_c0(cond);
+    if (lhs < 0) { return WC_UNPROVABLE; }
+    if (self.wc_kind(lhs) != NK_IDENT) { return WC_UNPROVABLE; }
+    if (self.wc_constInt(self.wc_c1(cond)) == 0) { return WC_UNPROVABLE; }
+    var grenze: int64 := self.wcConstVal;
+
+    var voff: int64 := self.wc_soff(lhs);
+    var vlen: int64 := self.wc_slen(lhs);
+
+    // Startwert: die Deklaration des Zaehlers muss ein Literal tragen.
+    if (self.wc_findInit(fnBody, voff, vlen) == 0) { return WC_UNPROVABLE; }
+    var start: int64 := self.wcConstVal;
+
+    // Fortschaltung: GENAU eine Zuweisung an den Zaehler im Rumpf, und zwar
+    // `i := i + K` mit K > 0. Zwei Zuweisungen koennen einander aufheben —
+    // dann ist die Schleife nicht mehr abzuzaehlen.
+    self.wcAsgCount := 0;
+    self.wcAsgNode := 0 - 1;
+    self.wc_countAssigns(self.wc_c1(ni), voff, vlen);
+    if (self.wcAsgCount != 1) { return WC_UNPROVABLE; }
+    var asg: int64 := self.wcAsgNode;
+    var rhs: int64 := self.wc_c1(asg);
+    if (rhs < 0) { return WC_UNPROVABLE; }
+    if (self.wc_kind(rhs) != NK_BINOP) { return WC_UNPROVABLE; }
+    if (self.wc_iv(rhs) != TK_PLUS) { return WC_UNPROVABLE; }
+    var addL: int64 := self.wc_c0(rhs);
+    if (addL < 0) { return WC_UNPROVABLE; }
+    if (self.wc_kind(addL) != NK_IDENT) { return WC_UNPROVABLE; }
+    if (self.wc_nameEq(self.wc_soff(addL), self.wc_slen(addL), voff, vlen) == 0) {
+      return WC_UNPROVABLE;
+    }
+    if (self.wc_constInt(self.wc_c1(rhs)) == 0) { return WC_UNPROVABLE; }
+    var schritt: int64 := self.wcConstVal;
+    if (schritt <= 0) { return WC_UNPROVABLE; }
+
+    var spanne: int64 := grenze - start;
+    if (op == TK_LE) { spanne := spanne + 1; }
+    if (spanne <= 0) { return 0; }
+    return (spanne + schritt - 1) / schritt;
+  }
+
+  // ------------------------------------------------------------------
+  // Aufrufe
+  // ------------------------------------------------------------------
+
+  // Builtins ohne Schleife. Die Liste ist absichtlich kurz und steht auch in
+  // §20.1; ein Catch-all "alles Unbekannte kostet nichts" waere genau der
+  // stille Default, den das Attribut vortaeuschen soll.
+  fn wc_isFreeBuiltin(off: int64, len: int64): int64 {
+    if (self.wc_isLit(off, len, "peek8"c)  != 0) { return 1; }
+    if (self.wc_isLit(off, len, "peek16"c) != 0) { return 1; }
+    if (self.wc_isLit(off, len, "peek32"c) != 0) { return 1; }
+    if (self.wc_isLit(off, len, "peek64"c) != 0) { return 1; }
+    if (self.wc_isLit(off, len, "poke8"c)  != 0) { return 1; }
+    if (self.wc_isLit(off, len, "poke16"c) != 0) { return 1; }
+    if (self.wc_isLit(off, len, "poke32"c) != 0) { return 1; }
+    if (self.wc_isLit(off, len, "poke64"c) != 0) { return 1; }
+    if (self.wc_isLit(off, len, "exit"c)   != 0) { return 1; }
+    return 0;
+  }
+
+  fn wc_callCost(ni: int64): int64 {
+    var off: int64 := self.wc_soff(ni);
+    var len: int64 := self.wc_slen(ni);
+    if (len <= 0) { return 0; }
+    if (self.wc_isFreeBuiltin(off, len) != 0) { return 0; }
+    var idx: int64 := self.wc_findFunc(off, len);
+    if (idx < 0) {
+      self.wc_err();
+      EPrintStr("@wcet ist nicht nachweisbar — `"c);
+      sys_write(2, (self.wcSrc as int64) + off, len);
+      EPrintStrLn("` liegt nicht in dieser Einheit (Import oder Builtin) und traegt keine Schranke"c);
+      return WC_UNPROVABLE;
+    }
+    var b: int64 := self.wc_boundOf(idx);
+    if (b <= 0) {
+      self.wc_err();
+      EPrintStr("@wcet ist nicht nachweisbar — `"c);
+      sys_write(2, (self.wcSrc as int64) + off, len);
+      EPrintStrLn("` hat selbst kein @wcet"c);
+      return WC_UNPROVABLE;
+    }
+    return b;
+  }
+
+  // ------------------------------------------------------------------
+  // Iterationen eines Teilbaums
+  // ------------------------------------------------------------------
+
+  // Summiert ueber die Geschwisterkette; WC_UNPROVABLE steckt an.
+  fn wc_itersList(ni: int64, fnBody: int64): int64 {
+    var sum: int64 := 0;
+    var x: int64 := ni;
+    while (x >= 0) {
+      var v: int64 := self.wc_itersNode(x, fnBody);
+      if (v == WC_UNPROVABLE) { return WC_UNPROVABLE; }
+      sum := sum + v;
+      x := self.wc_next(x);
+    }
+    return sum;
+  }
+
+  fn wc_itersKids(ni: int64, fnBody: int64): int64 {
+    var sum: int64 := 0;
+    var v: int64 := self.wc_itersList(self.wc_c0(ni), fnBody);
+    if (v == WC_UNPROVABLE) { return WC_UNPROVABLE; }
+    sum := sum + v;
+    v := self.wc_itersList(self.wc_c1(ni), fnBody);
+    if (v == WC_UNPROVABLE) { return WC_UNPROVABLE; }
+    sum := sum + v;
+    v := self.wc_itersList(self.wc_c2(ni), fnBody);
+    if (v == WC_UNPROVABLE) { return WC_UNPROVABLE; }
+    sum := sum + v;
+    v := self.wc_itersList(self.wc_c3(ni), fnBody);
+    if (v == WC_UNPROVABLE) { return WC_UNPROVABLE; }
+    return sum + v;
+  }
+
+  fn wc_loopTotal(bound: int64, body: int64, fnBody: int64): int64 {
+    if (bound == WC_UNPROVABLE) { return WC_UNPROVABLE; }
+    var inner: int64 := self.wc_itersList(body, fnBody);
+    if (inner == WC_UNPROVABLE) { return WC_UNPROVABLE; }
+    return bound * (1 + inner);
+  }
+
+  fn wc_itersNode(ni: int64, fnBody: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.wc_kind(ni);
+
+    if (k == NK_FOR) {
+      var b: int64 := self.wc_forBound(ni);
+      if (b == WC_UNPROVABLE) {
+        self.wc_unprovable("die Grenzen der for-Schleife sind nicht konstant"c);
+        return WC_UNPROVABLE;
+      }
+      return self.wc_loopTotal(b, self.wc_c2(ni), fnBody);
+    }
+    if (k == NK_FOR_RANGE) {
+      var br: int64 := self.wc_forRangeBound(ni);
+      if (br == WC_UNPROVABLE) {
+        self.wc_unprovable("die Grenzen von range(...) sind nicht konstant"c);
+        return WC_UNPROVABLE;
+      }
+      return self.wc_loopTotal(br, self.wc_c2(ni), fnBody);
+    }
+    if (k == NK_WHILE) {
+      var bw: int64 := self.wc_whileBound(ni, fnBody);
+      if (bw == WC_UNPROVABLE) {
+        self.wc_unprovable("die while-Schleife hat keine abzaehlbare Durchlaufzahl (Zaehler mit literalem Start, konstanter Grenze und fester Schrittweite — oder `limit(N)`)"c);
+        return WC_UNPROVABLE;
+      }
+      return self.wc_loopTotal(bw, self.wc_c1(ni), fnBody);
+    }
+    if (k == NK_FOR_C) {
+      self.wc_unprovable("das C-artige `for` hat keine abzaehlbare Durchlaufzahl"c);
+      return WC_UNPROVABLE;
+    }
+    if (k == NK_REPEAT_UNTIL) {
+      self.wc_unprovable("`repeat/until` hat keine abzaehlbare Durchlaufzahl (`limit(N)` gibt es nur an `while`)"c);
+      return WC_UNPROVABLE;
+    }
+    if (k == NK_CALL) {
+      var c: int64 := self.wc_callCost(ni);
+      if (c == WC_UNPROVABLE) { return WC_UNPROVABLE; }
+      var args: int64 := self.wc_itersKids(ni, fnBody);
+      if (args == WC_UNPROVABLE) { return WC_UNPROVABLE; }
+      return c + args;
+    }
+    // Eine geschachtelte Funktion gehoert nicht in die Rechnung der aeusseren.
+    if (k == NK_FUNC_DECL) { return 0; }
+    return self.wc_itersKids(ni, fnBody);
+  }
+
+  // ------------------------------------------------------------------
+  // Oeffentlich
+  // ------------------------------------------------------------------
+
+  pub fn Init(nodes: int64, src: pchar, nodeCount: int64) {
+    self.wcNodes := nodes;
+    self.wcSrc := src;
+    self.wcNodeCount := nodeCount;
+    self.wcCap := 512;
+    self.wcTab := alloc(self.wcCap * WC_FN_SZ);
+    self.wcCount := 0;
+    self.wcFailed := 0;
+    self.wcCurName := 0;
+    self.wcCurLen := 0;
+    self.wcConstVal := 0;
+    self.wcAsgCount := 0;
+    self.wcAsgNode := 0 - 1;
+  }
+
+  // Kommt `@wcet` ueberhaupt vor? Sonst kostet die Pruefung nichts.
+  //
+  // Gelaufen wird FLACH ueber die Knotentabelle, nicht ueber die Kette der
+  // obersten Deklarationen: Methoden und geschachtelte Funktionen haengen an
+  // ihrer Klasse beziehungsweise an einem Block, tragen das Attribut aber
+  // genauso. Der Aufrufgraph laeuft aus demselben Grund flach.
+  pub fn Any(): int64 {
+    var ni: int64 := 0;
+    while (ni < self.wcNodeCount) {
+      if (self.wc_kind(ni) == NK_FUNC_DECL) {
+        if (((self.wc_iv(ni) >> ANNO_WCET_SHIFT) & ANNO_WCET_MAX) > 0) { return 1; }
+      }
+      ni := ni + 1;
+    }
+    return 0;
+  }
+
+  // 0 = alles nachgewiesen, 1 = gemeldet. Die Rekursion prueft der Treiber
+  // vorher ueber den Aufrufgraphen und bricht dort ab — hier geht es nur noch
+  // um Schleifen und Aufrufe.
+  pub fn Check(): int64 {
+    // Erst alle Schranken sammeln — ein Aufruf darf auf eine Funktion zeigen,
+    // die weiter unten steht.
+    var ni: int64 := 0;
+    while (ni < self.wcNodeCount) {
+      if (self.wc_kind(ni) == NK_FUNC_DECL) {
+        var b: int64 := (self.wc_iv(ni) >> ANNO_WCET_SHIFT) & ANNO_WCET_MAX;
+        self.wc_addFunc(self.wc_soff(ni), self.wc_slen(ni), b, ni);
+      }
+      ni := ni + 1;
+    }
+
+    ni := 0;
+    while (ni < self.wcNodeCount) {
+      if (self.wc_kind(ni) == NK_FUNC_DECL) {
+        var bound: int64 := (self.wc_iv(ni) >> ANNO_WCET_SHIFT) & ANNO_WCET_MAX;
+        if (bound > 0) {
+          self.wcCurName := self.wc_soff(ni);
+          self.wcCurLen := self.wc_slen(ni);
+          var body: int64 := self.wc_c2(ni);
+          var got: int64 := self.wc_itersList(body, body);
+          if (got != WC_UNPROVABLE) {
+            if (got > bound) {
+              self.wcFailed := 1;
+              EPrintStr("error: "c);
+              sys_write(2, (self.wcSrc as int64) + self.wcCurName, self.wcCurLen);
+              EPrintStr(": @wcet("c);
+              self.wc_putInt(bound);
+              EPrintStr(") verletzt — der Rumpf laeuft bis zu "c);
+              self.wc_putInt(got);
+              EPrintStrLn(" Iterationen"c);
+            }
+          }
+        }
+      }
+      ni := ni + 1;
+    }
+    return self.wcFailed;
+  }
+};
