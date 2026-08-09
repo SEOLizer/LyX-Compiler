@@ -268,6 +268,12 @@ test: lyxc
 	@echo "--- seccomp-Filter deckt die emittierten Syscalls (12 Pruefungen) ---"
 	@bash tests/seccomp_filter_test.sh
 	@echo "OK"
+	@echo "--- uint64-Vergleiche laufen unsigniert (#1126) ---"
+	@bash tests/unsigned_compare_test.sh
+	@echo "OK"
+	@echo "--- f32 liefert den Wert statt des Bitmusters (#1127) ---"
+	@bash tests/f32_value_test.sh
+	@echo "OK"
 	@echo "--- Rechtsshift auf int64 zieht das Vorzeichen nach (17 Pruefungen) ---"
 	@bash tests/shift_right_signed_test.sh
 	@echo "OK"
