@@ -154,10 +154,10 @@ warns "@wcet meldet den fehlenden Nachweis" 'import std.io;
 fn F(): int64 { var i: int64 := 0; while (i < 1000000) { i := i + 1; } return i; }
 fn main(): int64 { return 0; }' "NICHT nachgewiesen"
 
-warns "@stack_limit meldet den fehlenden Nachweis" 'import std.io;
-@stack_limit(8)
-fn F(n: int64): int64 { if (n <= 0) { return 0; } return F(n-1); }
-fn main(): int64 { return 0; }' "NICHT nachgewiesen"
+# #1138: `@stack_limit` wird seit 1.0.14K NACHGEWIESEN und gehoert nicht mehr
+# in diese Gruppe. Genau dieses Programm — rekursiv unter der Zusicherung —
+# wird jetzt abgewiesen; die Pruefungen dazu stehen in
+# tests/stack_limit_test.sh.
 
 warns "@flight_crit meldet den fehlenden Nachweis" 'import std.io;
 @flight_crit
