@@ -2,6 +2,44 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — Interface-Dispatch lieferte 0 (#1133)
+
+```lyx
+type I = interface { fn Zeig(): int64; };
+type P = class implements I { v: int64; fn Zeig(): int64 { return 7; } };
+
+var p: P := new P();  p.Zeig();   // 7 — über den Klassentyp
+var i: I := p;        i.Zeig();   // 0 — über die Schnittstelle
+```
+
+Mit zwei Implementierungen lieferten **beide** 0 — es wurde also nicht die
+falsche Methode gewählt, sondern gar keine. Damit war der Zweck von
+`interface` nicht nutzbar.
+
+**Ursache:** ein Interface hat Methoden, bekam also ein ganz normales
+Klassen-Layout. Seine Signaturen tragen weder `virtual` noch `abstract`, und
+so erzeugte der Codegen für jede von ihnen einen **Rumpf** — der leer ist, es
+gibt ja keinen. `I_Zeig` bestand aus Prolog, `xor rax,rax`, Epilog. Der Aufruf
+über die Interface-Variable fand keinen VMT-Slot (`VMTSLOTS` war 0) und
+landete statisch genau dort.
+
+**Fix — Selektoren:** die Namen aller in Interfaces deklarierten Methoden
+bekommen je einen festen Slot, den **jede** Klasse an derselben Stelle führt
+(ein Vorabpass sammelt sie, bevor die Layouts gebaut werden). Nur so trifft
+ein Aufruf, der bloß das Interface kennt, dieselbe Stelle wie einer über die
+Klasse. Eine Methode, die einen Selektor erfüllt, braucht kein `virtual` — die
+Zusage steckt im `implements` — und trägt ihre Adresse in den Slot ein.
+Interfaces bekommen kein Codestück mehr.
+
+Abgedeckt sind mehrere Interfaces an einer Klasse, geerbte und überschriebene
+Interface-Methoden, die Mischung mit `virtual`/`override` und Arrays mit
+Interface-Elementtyp.
+
+Neu: `tests/interface_dispatch_test.sh` (15 Prüfungen, davon 10 gegen 1.0.14C
+rot). `ebnf.md` kannte `interface`/`implements` bisher nur als Schlüsselwörter
+— die Grammatik führt beide jetzt (§9), §20.1 hält das Verfahren fest.
+
+
 ### Compiler — Zuweisung an `con` wurde nicht abgewiesen (#1132)
 
 ```lyx
