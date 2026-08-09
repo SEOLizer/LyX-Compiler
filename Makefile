@@ -268,6 +268,9 @@ test: lyxc
 	@echo "--- seccomp-Filter deckt die emittierten Syscalls (12 Pruefungen) ---"
 	@bash tests/seccomp_filter_test.sh
 	@echo "OK"
+	@echo "--- NaN-Vergleiche folgen IEEE 754 (#1128) ---"
+	@bash tests/nan_compare_test.sh
+	@echo "OK"
 	@echo "--- uint64-Vergleiche laufen unsigniert (#1126) ---"
 	@bash tests/unsigned_compare_test.sh
 	@echo "OK"
