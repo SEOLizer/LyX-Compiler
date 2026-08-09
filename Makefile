@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.13S
-VERSION_DATE := 2026-08-08
+VERSION   := 1.0.14A
+VERSION_DATE := 2026-08-09
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -267,6 +267,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- seccomp-Filter deckt die emittierten Syscalls (12 Pruefungen) ---"
 	@bash tests/seccomp_filter_test.sh
+	@echo "OK"
+	@echo "--- x in a..b und for i in a..b (18 Pruefungen) ---"
+	@bash tests/in_range_test.sh
 	@echo "OK"
 	@echo "--- NaN-Vergleiche folgen IEEE 754 (#1128) ---"
 	@bash tests/nan_compare_test.sh

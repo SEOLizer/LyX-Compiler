@@ -2,6 +2,35 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `x in a..b` stürzte ab, `for i in a..b` fehlte (#1129)
+
+```lyx
+var i: int64 := 2;
+if (i in 0..3) { … }      // Segmentation fault
+for i in 0..3 { … }       // Parse error: expected :=, got in
+```
+
+**Ursache:** *jedes* `in` lief in den Wörterbuch-Zweig. `_lyx_map_has` bekam
+als „Map" das, was der Bereichsknoten hinterließ — kein Zeiger, sondern die
+obere Grenze, während die untere unbalanciert auf dem Stack liegen blieb. Der
+Ausdruck übersetzte und starb erst beim Laufen; die schlechteste der drei
+Möglichkeiten, wie das Issue zu Recht anmerkt.
+
+**Fix:** steht rechts von `in` ein Bereich, wird der Zugehörigkeitstest
+erzeugt — Grenzen **einschließlich**, wie beim Bereichsmuster in `match`
+(#1113) und beim Bereichstyp (§7); ein offenes Ende (`a..`) ist nach oben
+unbeschränkt. Für jede andere rechte Seite gilt unverändert die
+Wörterbuch-Zugehörigkeit (`schlüssel in map`).
+
+Dazu die Schleifenform `for i in a..b` als dritte `ForRangeStmt`-Alternative
+in Parser und `ebnf.md` §12 — sie läuft auf dieselbe Schleife wie
+`for i := a to b`. **Achtung:** `in a..b` schließt die obere Grenze **ein**,
+`in range(a, b)` schließt sie **aus**; die beiden Formen sind nicht dasselbe.
+`for … in` ohne Bereich und ohne `range(…)` meldet, statt etwas zu raten.
+
+Neu: `tests/in_range_test.sh` (18 Prüfungen, davon 14 gegen 1.0.13S rot).
+§20.1 hält das Verhalten von `in` fest.
+
 ### Compiler — NaN-Vergleiche folgen IEEE 754 (#1128)
 
 ```lyx
