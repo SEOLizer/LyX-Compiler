@@ -2,6 +2,39 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — Deklarationsprüfungen: fehlendes `return`, doppelte Namen (#1135, zweite Stufe)
+
+Drei weitere Lücken aus der Tabelle des Issues, alle mit demselben Muster —
+der Compiler nahm etwas an und tat stillschweigend das Naheliegende:
+
+| Fall | vorher | jetzt |
+|---|---|---|
+| Funktion mit Rückgabetyp ohne `return` | lieferte `0` | `Funktion ohne return, Rueckgabetyp verlangt einen Wert` |
+| Variable zweimal im selben Block | die zweite gewann | `Name im selben Block bereits deklariert` |
+| Zwei Funktionen gleichen Namens | die erste gewann | `Funktion bereits deklariert` |
+
+Die `return`-Prüfung gilt auch für **Methoden** — die volle Rumpfprüfung läuft
+aus Rücksicht auf Altbestand nur bei capability-annotierten Klassen, diese
+Frage muss aber überall gestellt werden (wie bei #1090 für `static`).
+
+Sie ist **bewusst keine Flussanalyse**: gemeldet wird nur, wenn im Rumpf
+überhaupt kein Ausgang vorkommt — `return`, `throw`, `panic` oder `exit(…)`
+(`examples/test_aes_debug.lyx` endet so, und zu Recht).
+`if (a > 0) { return 1; }` ohne weiteren Ausgang bleibt damit unbemerkt — das
+zu beurteilen braucht eine Pfadbetrachtung, und ein Fehlalarm wäre schlimmer
+als die Lücke. Verdecken in einem *inneren* Block bleibt erlaubt, ebenso
+gleichnamige Methoden in verschiedenen Klassen und gleichnamige Funktionen in
+verschiedenen Units.
+
+**Nicht umgesetzt, mit Begründung:** Arithmetik auf `pchar`. Sie ist im
+Bestand legitim — `pchar` *ist* ein Zeiger, und `peek8(src + i)` ist die
+übliche zeichenweise Iteration (`std/db/sqlite.lyx` u. a.). Eine Meldung wäre
+ein Fehlalarm; der Test hält das ausdrücklich fest.
+
+Neu: `tests/decl_checks_test.sh` (16 Prüfungen, davon 7 gegen 1.0.14F rot).
+§20.1 fasst die Reichweite der statischen Prüfungen jetzt zusammen.
+
+
 ### Compiler — Typprüfung bei Initialisierung, Zuweisung, Rückgabe und Argumenten (#1135, erste Stufe)
 
 Geprüft wurden bisher **Namen und Stelligkeit**, nicht aber Typen:
