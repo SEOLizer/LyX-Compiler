@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.14I
+VERSION   := 1.0.14J
 VERSION_DATE := 2026-08-09
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -267,6 +267,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- seccomp-Filter deckt die emittierten Syscalls (12 Pruefungen) ---"
 	@bash tests/seccomp_filter_test.sh
+	@echo "OK"
+	@echo "--- Linter meldet lesbar (14 Pruefungen) ---"
+	@bash tests/lint_output_test.sh
 	@echo "OK"
 	@echo "--- Deklarationspruefungen: return, Doppelname (17 Pruefungen) ---"
 	@bash tests/decl_checks_test.sh

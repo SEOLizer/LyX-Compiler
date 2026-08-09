@@ -196,11 +196,38 @@ pub type Linter = class {
   // Warning output
   // ----------------------------------------------------------------
 
-  fn lnt_warn(code: int64, msg: pchar, msgLen: int64, ni: int64) {
-    var line: int64 := self.lnt_lineOf(ni);
+  // #1137: Zahl auf stderr schreiben — PrintInt geht nach stdout und trennte
+  // die Zeilennummer vom Rest der Meldung.
+  fn lnt_writeInt(v: int64) {
+    if (v < 0) { write(2, "-", 1); v := 0 - v; }
+    if (v == 0) { write(2, "0", 1); return; }
+    var buf: int64 := alloc(24);
+    var pos: int64 := 0;
+    while (v > 0) {
+      poke8(buf + pos, 48 + (v % 10));
+      v := v / 10;
+      pos := pos + 1;
+    }
+    var i: int64 := pos - 1;
+    while (i >= 0) {
+      write(2, (buf + i) as pchar, 1);
+      i := i - 1;
+    }
+    free(buf, 24);
+  }
+
+  // #1137: Der vierte Parameter ist die ZEILE. Vorher hiess er `ni` und wurde
+  // durch `lnt_lineOf` geschickt — die Aufrufer waren aber uneinheitlich: W001,
+  // W008 und W009 uebergaben laengst eine fertige Zeilennummer, die dann als
+  // Knotenindex gedeutet wurde. Heraus kam eine beliebige Zahl.
+  fn lnt_warn(code: int64, msg: pchar, msgLen: int64, line: int64) {
     write(2, self.srcFile, StrLen(self.srcFile));
     write(2, ":", 1);
-    PrintInt(line);
+    // #1137: Die Zeilennummer ging ueber PrintInt auf STDOUT, waehrend der Rest
+    // der Meldung auf stderr geht. Auf stderr allein las sich das als
+    // "datei:: W001 ..." — ohne Zeile, dafuer standen die Ziffern
+    // zusammenhanglos im Programmausgabe-Strom.
+    self.lnt_writeInt(line);
     write(2, ": ", 2);
     
     if code == 1 { write(2, "W001", 4); }
@@ -398,7 +425,7 @@ pub type Linter = class {
       if (right >= 0) { rightKind := self.lnt_kind(right); }
       if ((leftKind == LNK_LIT_INT && rightKind == LNK_LIT_FLOAT) ||
           (leftKind == LNK_LIT_FLOAT && rightKind == LNK_LIT_INT)) {
-        self.lnt_warn(12, "implicit int/float conversion in binary operation", 47, ni);
+        self.lnt_warn(12, "implicit int/float conversion in binary operation", 49, self.lnt_lineOf(ni));
       }
       self.lnt_lintExpr(left);
       self.lnt_lintExpr(right);
@@ -458,7 +485,7 @@ pub type Linter = class {
             self.lnt_strEq(tName, tLen, "u32", 3) ||
             self.lnt_strEq(tName, tLen, "u64", 3)) {
           // Source might be float — warn about potential precision loss
-          self.lnt_warn(13, "float to int cast may lose precision", 34, ni);
+          self.lnt_warn(13, "float to int cast may lose precision", 36, self.lnt_lineOf(ni));
         }
       }
       self.lnt_lintExpr(self.lnt_c0(ni));
@@ -485,7 +512,7 @@ pub type Linter = class {
       if (vLen > 0 && StrCharAt(vName, 0) != 95) {
         var firstChar: int64 := StrCharAt(vName, 0);
         if (not self.lnt_isLowerCase(firstChar)) {
-          self.lnt_warn(3, "variable should use camelCase naming", 34, ni);
+          self.lnt_warn(3, "variable should use camelCase naming", 36, self.lnt_lineOf(ni));
         }
       }
       
@@ -515,7 +542,7 @@ pub type Linter = class {
           if (allCaps == 1) { isValid := 1; }
         }
         if (isValid == 0) {
-          self.lnt_warn(5, "constant should use UPPER_CASE || PascalCase naming", 45, ni);
+          self.lnt_warn(5, "constant should use UPPER_CASE || PascalCase naming", 51, self.lnt_lineOf(ni));
         }
       }
       
@@ -566,7 +593,7 @@ pub type Linter = class {
           var elseBlock: int64 := self.lnt_c2(ni);
           var elseStmt: int64 := self.lnt_c0(elseBlock);
           if (elseStmt < 0) {
-            self.lnt_warn(14, "empty else block", 17, ni);
+            self.lnt_warn(14, "empty else block", 16, self.lnt_lineOf(ni));
           }
           self.lnt_lintBlock(elseBlock, 0);
         } else {
@@ -638,7 +665,7 @@ pub type Linter = class {
     var firstStmt: int64 := self.lnt_c0(ni);
 
     if (firstStmt < 0) {
-      self.lnt_warn(7, "empty block {}", 14, ni);
+      self.lnt_warn(7, "empty block {}", 14, self.lnt_lineOf(ni));
       return;
     }
 
@@ -648,7 +675,7 @@ pub type Linter = class {
     var seenReturn: int64 := 0;
     while (stmt >= 0) {
       if (seenReturn != 0) {
-        self.lnt_warn(6, "unreachable code after return statement", 43, stmt);
+        self.lnt_warn(6, "unreachable code after return statement", 39, self.lnt_lineOf(stmt));
         break;
       }
       if (self.lnt_kind(stmt) == LNK_RETURN) { seenReturn := 1; }
@@ -672,11 +699,14 @@ pub type Linter = class {
 
     var fName: pchar := self.lnt_sPtr(ni);
     var fLen: int64 := self.lnt_sLen(ni);
-    if (fLen > 0 && fName != "main") {
+    // #1137: `fName != "main"` verglich ZEIGER, nicht Inhalt — die Ausnahme
+    // griff nie, und W004 meldete `main` in JEDEM Programm. Der Einstiegspunkt
+    // muss klein geschrieben sein, der Codegen sucht genau diesen Namen.
+    if (fLen > 0 && self.lnt_strEq(fName, fLen, "main", 4) == false) {
       if (fLen > 0 && StrCharAt(fName, 0) != 95) {
         var firstChar: int64 := StrCharAt(fName, 0);
         if (not self.lnt_isUpperCase(firstChar)) {
-          self.lnt_warn(4, "function should use PascalCase naming", 38, ni);
+          self.lnt_warn(4, "function should use PascalCase naming", 37, self.lnt_lineOf(ni));
         }
       }
     }
@@ -704,7 +734,7 @@ pub type Linter = class {
       complexity := complexity + self.lnt_calcComplexity(body);
     }
     if (complexity > 15) {
-      self.lnt_warn(18, "cyclomatic complexity exceeds 15", 31, ni);
+      self.lnt_warn(18, "cyclomatic complexity exceeds 15", 32, self.lnt_lineOf(ni));
     }
 
     // W019: Recursion detection — push function onto funcStack
@@ -732,7 +762,7 @@ pub type Linter = class {
       }
       if (isVoid == 0) {
         if (self.lnt_blockReturns(body) == 0) {
-          self.lnt_warn(10, "non-void function has no guaranteed return path", 51, ni);
+          self.lnt_warn(10, "non-void function has no guaranteed return path", 47, self.lnt_lineOf(ni));
         }
       }
     }
@@ -741,7 +771,7 @@ pub type Linter = class {
       var endLine: int64 := self.lnt_lineOf(body);
       var lineCount: int64 := endLine - self.funcStartLine;
       if (lineCount > 60) {
-        self.lnt_warn(17, "function exceeds 60 lines", 26, ni);
+        self.lnt_warn(17, "function exceeds 60 lines", 25, self.lnt_lineOf(ni));
       }
     }
 
@@ -826,8 +856,17 @@ pub type Linter = class {
       var p: pchar := peek64(base) as pchar;
       var n: int64 := peek64(base + 8);
       var used: int64 := peek64(base + 16);
-      if (used == 0) {
-        self.lnt_warn(16, p, n, 0);  // W016: unused import
+      // #1137: W016 ist abgeschaltet. Die Pruefung war strukturell nicht
+      // zu erfuellen: `lnt_markImportUsed` wird mit dem FUNKTIONSNAMEN
+      // aufgerufen (`PrintStr`), verglichen wird aber gegen den MODULnamen
+      // (`std.io`) — das trifft nie. Also galt JEDER Import als unbenutzt,
+      // auch in einem Programm, das ihn benutzt. Eine Meldung, die immer
+      // kommt, ist keine Pruefung, sondern Rauschen.
+      //
+      // Eine tragfaehige Fassung braucht die Zuordnung Symbol -> Unit; die
+      // hat sema, nicht der Linter. Als eigenes Paket geführt.
+      if (used == 0 && 0 != 0) {
+        self.lnt_warn(16, p, n, 0);
       }
       i := i + 1;
     }
