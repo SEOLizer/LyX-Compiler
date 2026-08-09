@@ -15,7 +15,7 @@
 #    340-fach.
 #
 # 2. Attribute, deren Zusicherung der Compiler NICHT nachweist (@integrity,
-#    @flight_crit, @dal, @critical), melden das. @stack_limit (#1138) und
+#    @dal, @critical), melden das. @stack_limit (#1138) und
 #    @wcet (#1139) gehoeren nicht mehr dazu — sie werden geprueft.
 #    Sie bleiben gültig — abweisen hieße, sie aus der Sprache zu nehmen —,
 #    aber sie sind nicht mehr stumm. Ein Safety-Attribut, das schweigend nichts
@@ -160,10 +160,9 @@ fn main(): int64 { return 0; }'
 # wird jetzt abgewiesen; die Pruefungen dazu stehen in
 # tests/stack_limit_test.sh.
 
-warns "@flight_crit meldet den fehlenden Nachweis" 'import std.io;
-@flight_crit
-fn F(): int64 { return 1; }
-fn main(): int64 { return F(); }' "NICHT nachgewiesen"
+# #1140: `@flight_crit` WIRKT seit 1.0.14M — es schaltet die SSE-Ausnahmen
+# fuer invalid/divide-by-zero frei und haengt den SIGFPE-Handler ein. Die
+# Pruefungen dazu stehen in tests/flight_crit_test.sh.
 
 warns "@dal meldet den fehlenden Nachweis" 'import std.io;
 @dal(A)
