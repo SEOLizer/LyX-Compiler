@@ -2,6 +2,32 @@
 
 ## Unveröffentlicht (develop)
 
+### stdlib — `net`-Module benennen Zeichenketten als `pchar` (#1221, Schritt 3 von 5)
+
+Der erste Schritt mit echter Kaskade: `std/net/sip.lyx`, `ldap.lyx`,
+`imap.lyx` und `mqtt.lyx`. **273 → 148** Fundstellen; alle vier Dateien
+melden 0.
+
+Umgestellt wurden Rückgabetypen (`LDAPGetSASLMechanismName`,
+`LDAPErrorToStr`), Schreibhelfer (`SIPWriteStr`, `SIPWriteLit`,
+`MQTTWriteString`, `SIPStrLen`, `MQTTStrLen`) und die **öffentliche API**, wo
+sie Zeichenketten annimmt: `SIPBuildRegister`, `SIPBuildMessage`,
+`SIPBuildOptions`, `SIPRegister`, `SIPSendMessage`, `SIPOptions`,
+`MQTTBuildConnect`, `MQTTPublish`, `MQTTBuildSubscribe`,
+`MQTTBuildUnsubscribe`, `MQTTConnect`, `MQTTSubscribe`, `MQTTPublishMsg`,
+`IMAPBuildTaggedCmd`.
+
+Wo ein **selbst allozierter Puffer** übergeben wird (`uri`, `branch`, `tag`,
+`fromTag`, `msg`, `cmdBuf`), steht jetzt `as pchar` an der Aufrufstelle — der
+Cast benennt, was dort geschieht: eine Adresse wird als Zeichenkette
+weitergereicht.
+
+Eine Umstellung war **falsch und wurde zurückgenommen**: `method` in
+`SIPBuildRequestLine` sieht wie ein Textparameter aus, ist aber eine Nummer
+(`SIP_METHOD_REGISTER: int64 := 1`). Nur `uri` daneben ist eine Zeichenkette.
+Aufgefallen ist es, weil die Meldungszahl nach der Umstellung nicht auf 0 fiel.
+
+
 ### stdlib — Zeichenketten-Parameter in mysql, quic und dns heißen `pchar` (#1221, Schritt 2 von 5)
 
 Drei Parameter, die eine Zeichenkette meinen, hießen `int64`:
