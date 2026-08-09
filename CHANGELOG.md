@@ -2,6 +2,32 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — Zuweisung an `con` wurde nicht abgewiesen (#1132)
+
+```lyx
+con X: int64 := 10;
+X := 5;              // übersetzte kommentarlos
+```
+
+Die Prüfung gab es nur für `let`/`co` („assignment to let/co binding not
+allowed", #1083) und für con-*Parameter* (WP-AS-13) — die con-Deklaration
+selbst fiel durch.
+
+Irreführend war vor allem der Unterschied nach Geltungsbereich: eine
+**lokale** `con` ließ sich tatsächlich ändern (Ausgabe 5), bei einer
+**globalen** verpuffte die Zuweisung, weil der Wert als Immediate im Code
+steht (Ausgabe 10). Derselbe Quelltext tat je nach Ort etwas anderes, und
+gemeldet wurde nichts.
+
+**Fix:** dieselbe Prüfung wie bei `let`/`co`, anhand der Symbolart `SYM_CON`.
+Sie greift in jeder Form der Zuweisung (`:=`, `+=`, `-=`, `++`, `--`) und in
+beiden Geltungsbereichen. Lesen und Rechnen mit `con` bleibt unverändert,
+ebenso `var`; `let` behält seine eigene Meldung.
+
+Neu: `tests/con_assignment_test.sh` (16 Prüfungen, davon 9 gegen 1.0.14B
+rot). §20.1 hält den Schreibschutz der Speicherklassen fest.
+
+
 ### Compiler — explizite Enum-Werte wurden verworfen (#1131, #1157)
 
 ```lyx
