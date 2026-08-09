@@ -2,6 +2,34 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — die Typprüfung gilt jetzt ohne Ausnahme (#1221 abgeschlossen, #1135 vollständig)
+
+Der letzte Schritt: die Ausnahme in `_typeMismatch` ist entfernt. Eine
+Zeichenkette in einem Ganzzahl-Ziel wird gemeldet — der **Haupt-Repro aus
+#1135**:
+
+```lyx
+var x: int64 := "text";   // sema error: Initialisierung: int64 erwartet, pchar gegeben
+fn F(): int64 { return "text"; }        // Rueckgabe: …
+fn G(a: int64): int64 { … }  G("x")     // Argument: …
+```
+
+Möglich wurde das durch #1221 in fünf Schritten: 470 Fundstellen in 16
+Dateien tragen jetzt `pchar`, wo eine Zeichenkette gemeint ist. Dazu kamen
+zwölf Stellen in Testdateien und drei im Compiler selbst
+(`WriteElf64`/`WritePE64`/`WriteMachO64` nehmen einen Dateinamen).
+
+Damit gilt die Zusage aus der Dokumentation endlich ohne Einschränkung:
+*„Implizite Konvertierungen gibt es nicht — alle Typumwandlungen müssen mit
+dem `as`-Operator explizit geschrieben werden."*
+
+Weiterhin zugelassen: der `as`-Cast selbst und die Null in einem
+`pchar`-Ziel (Nullzeiger).
+
+`tests/type_check_test.sh` ist auf 21 Prüfungen gewachsen; der Fall, der
+dort bis eben als „bleibt zulässig" stand, ist jetzt ein Fehlerfall.
+
+
 ### stdlib — `data/core.lyx` benennt Spaltennamen als `pchar` (#1221, Schritt 5 von 5)
 
 Der letzte und tiefste Schritt: Spaltennamen, Schlüssel und Labels hießen
