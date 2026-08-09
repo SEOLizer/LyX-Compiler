@@ -2,6 +2,28 @@
 
 ## Unveröffentlicht (develop)
 
+### stdlib — Zeichenketten-Rückgaben heißen jetzt `pchar` (#1221, Schritt 1 von 5)
+
+Neun Funktionen in `std/validate/*` und `std/country.lyx` hatten `int64` als
+Rückgabetyp und lieferten Zeichenketten:
+
+```lyx
+pub fn CreditCardTypeName(cardType: int64): int64 { … return "Visa"; }
+```
+
+Sie heißen jetzt `pchar`. Damit fallen **189 der 470** Fundstellen weg, die
+der Typprüfung aus #1135 im Weg stehen (470 → 281); `std/validate/*` und
+`std/country.lyx` sind vollständig sauber.
+
+Betroffen: `EAN13GetCountry`, `IBANGetCountryName`, `VATGetCountryName`,
+`VATGetFormat`, `CreditCardTypeName`, `CountryGetName`, `CountryGetCode`,
+`CountryGetCurrency`, `CountryGetRegionName`.
+
+Keine Kaskade: die Aufrufer speichern das Ergebnis in `int64`-Variablen, und
+diese Richtung (Zeiger in eine Zahl) bleibt bis zum letzten Schritt zulässig.
+Kein Eingriff in den Compiler, keine neue Version — nur Deklarationen.
+
+
 ### Compiler — Deklarationsprüfungen: fehlendes `return`, doppelte Namen (#1135, zweite Stufe)
 
 Drei weitere Lücken aus der Tabelle des Issues, alle mit demselben Muster —
