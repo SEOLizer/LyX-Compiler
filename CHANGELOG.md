@@ -2,6 +2,30 @@
 
 ## Unveröffentlicht (develop)
 
+### stdlib — `data/core.lyx` benennt Spaltennamen als `pchar` (#1221, Schritt 5 von 5)
+
+Der letzte und tiefste Schritt: Spaltennamen, Schlüssel und Labels hießen
+`int64`, obwohl der Quelltext selbst es besser wusste —
+
+```lyx
+name: int64;          // Pointer to column name (pchar)
+```
+
+Umgestellt in acht Runden, jede mit sofortiger Nachmessung: die
+`DataFrame`-API (`AddColumn`, `GetSeries`, `ColIndex`, `Get/SetInt`,
+`Get/SetString`, `Filter`, `Query`, `Explode`, `Pivot`, `JoinRight`,
+`JoinOuter`, `GroupBy*`, `GetDummies`, …), die `Series`-Konstruktoren
+(`SeriesNewInt64`, `SeriesNewString`, `SeriesNewFloat64`),
+`SeriesGet/SetString`, `DataStrLen` und die Zeichenketten-Helfer.
+
+Wo ein Name per `peek64` aus dem Spaltenkopf kommt, steht `as pchar` an der
+Aufrufstelle — das ist eine Adresse, und der Cast sagt das.
+
+Die Fundstellen aus #1221 sinken damit auf **12**, und alle zwölf liegen in
+**Testdateien**, nicht mehr in der stdlib. Der Weg ist frei, die Ausnahme in
+`_typeMismatch` zu entfernen.
+
+
 ### Compiler — Typableitung eines Aufrufs prüft jetzt, welche Funktion sie gefunden hat (#1135)
 
 Die Ausdrucks-Typableitung aus #1135 nahm den Rückgabetyp aus dem Knoten, den
