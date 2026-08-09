@@ -2,6 +2,21 @@
 
 ## Unveröffentlicht (develop)
 
+### stdlib — Zeichenketten-Parameter in mysql, quic und dns heißen `pchar` (#1221, Schritt 2 von 5)
+
+Drei Parameter, die eine Zeichenkette meinen, hießen `int64`:
+`mysqlSendCommand(… data …)`, `QUICBuildConnectionClose(… reason)` und
+`dns_lit(… src …)`. Sie heißen jetzt `pchar`; alle drei Dateien sind damit
+sauber (281 → 273 Fundstellen).
+
+`std/net/imap.lyx` und `std/net/mqtt.lyx` waren ebenfalls für diesen Schritt
+vorgesehen, sind aber **zurückgestellt**: dort kaskadiert die Umstellung in
+die öffentliche API (`MQTTPublish`, `MQTTSubscribe`, `IMAPBuildTaggedCmd` und
+deren Aufrufer) und in Struct-Felder (`topic: int64; // Pointer to topic
+string`). Das gehört zu Schritt 3, wo die übrigen `net`-Module ohnehin mit
+ihren Aufrufern umgestellt werden.
+
+
 ### stdlib — Zeichenketten-Rückgaben heißen jetzt `pchar` (#1221, Schritt 1 von 5)
 
 Neun Funktionen in `std/validate/*` und `std/country.lyx` hatten `int64` als
