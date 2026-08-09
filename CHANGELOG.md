@@ -2,6 +2,46 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — Zeilennummern in allen Meldungen; Linter wieder lesbar (#1137)
+
+Der Befund im Issue lautete „der Linter meldet nichts". Er meldete sehr wohl —
+nur unbrauchbar, und die Meldungen landeten zerrissen auf zwei Strömen:
+
+```
+datei:: W004 function should use PascalCase naming
+datei:: W006 unreachable code after return statement mai
+```
+
+**Vier Fehler kamen zusammen:**
+
+1. Die **Zeilennummer** ging über `PrintInt` auf **stdout**, während der Rest
+   der Meldung auf stderr geht. Auf stderr blieb `datei::` übrig, die Ziffern
+   standen zusammenhanglos in der Programmausgabe.
+2. Zehn Meldungstexte wurden mit **handgezählter Länge** geschrieben, acht
+   davon falsch — mal abgeschnitten, mal über das Ende hinaus.
+3. `lnt_warn` bekam von den einen Aufrufern einen **Knoten**, von den anderen
+   eine fertige **Zeile**, schickte aber alles durch `lnt_lineOf` — die Zeile
+   wurde als Knotenindex gedeutet.
+4. **Die Wurzel, und die weicht weit über den Linter hinaus:** im Parser bekam
+   jedes Token die Zeile des **vorigen**. `_tokenize` las `lx.line` *vor*
+   `Next()`. Innerhalb einer Zeile fällt das nicht auf, beim ersten Token einer
+   neuen Zeile aber schon — und zwar um so viele Zeilen, wie dazwischen leer
+   waren. Eine Funktion in Zeile 5 nach drei Leerzeilen wurde als Zeile 1
+   gemeldet, **auch von sema**.
+
+Dazu zwei Prüfungen, die *immer* meldeten und damit reines Rauschen waren:
+`W004` nahm `main` nicht aus (Zeigervergleich statt Inhaltsvergleich), und
+`W016` verglich Funktions- gegen Modulnamen und konnte nie treffen — jeder
+Import galt als unbenutzt. W016 ist abgeschaltet, bis es eine tragfähige
+Fassung gibt (die braucht die Zuordnung Symbol → Unit, die sema hat).
+
+`--lint` unterdrückt **keine** Warnungen; die Grant-Warnung stand immer auf
+stdout, die Lint-Meldungen auf stderr. Der Eindruck im Issue entstand durch
+diese Trennung.
+
+Neu: `tests/lint_output_test.sh` (14 Prüfungen, davon 8 gegen 1.0.14I rot).
+
+
 ### Compiler — die Typprüfung gilt jetzt ohne Ausnahme (#1221 abgeschlossen, #1135 vollständig)
 
 Der letzte Schritt: die Ausnahme in `_typeMismatch` ist entfernt. Eine
