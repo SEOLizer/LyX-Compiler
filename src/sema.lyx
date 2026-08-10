@@ -1841,6 +1841,156 @@ pub type Sema = class {
   }
 
   // #1110: `a + b`, wo eine Seite eine Einheit traegt.
+  // #1143: Typen der binaeren Operatoren. Das Gegenstueck zu #1135 (dort:
+  // Zuweisung, Rueckgabe, Argumente) — hier die Operatoren selbst. `true + 1`
+  // ergab 2, `"abc" * 2` eine Adresse mal zwei — beides ohne Meldung.
+  //
+  // ZWEI Formen sind AUSDRUECKLICH GEWOLLT und bleiben zugelassen; der
+  // Issue-Text zaehlte sie faelschlich mit auf:
+  //
+  //   `pchar + pchar` VERKETTET. Der Codegen erkennt den Fall und emittiert
+  //   StrConcat (cg_isPcharExpr/CGT_PLUS); tests/regression/test_string_format
+  //   haelt es fest. Der Repro des Issues gab nur deshalb eine Zahl aus, weil
+  //   `PrintLn` eine ZAHL druckt — `PrintStrLn("Wert: " + IntToStr(7))`
+  //   liefert korrekt `Wert: 7`.
+  //
+  //   `bool ^ bool` (ebenso & und |) ist boolesche Algebra;
+  //   tests/regression/operators/simple_xor lebt davon.
+  //
+  // ZUGELASSEN bleibt die ZEIGERARITHMETIK `pchar + int64` / `pchar - int64`:
+  // `peek8(src + i)` ist die uebliche zeichenweise Iteration, ein Messlauf
+  // ueber std/, src/, data/ und examples/ fand davon 807 Fundstellen — und
+  // KEINE einzige der Formen, die hier abgewiesen werden. Die Regel ist also
+  // scharf, ohne den Bestand zu brechen.
+  //
+  // NICHT geprueft wird gemischte int/f64-Arithmetik: `10 - 2.5` rechnet
+  // falsch, das ist #1212 und dort zu entscheiden. Ein Fehler hier wuerde dem
+  // vorgreifen.
+  //
+  // Geurteilt wird nur, wenn BEIDE Typen bestimmt sind — Unbekanntes bleibt
+  // still, wie bei #1135.
+  // #1143: Builtins, die eine Zeichenkette liefern. Der Codegen fuehrt
+  // dieselbe Liste (cg_builtinReturnsPchar) -- sie werden unmittelbar
+  // emittiert und tragen keinen Eintrag in der Rueckgabetyp-Registry, das
+  // Symbol steht auf TY_UNKNOWN. Ohne diese Kenntnis bliebe ausgerechnet der
+  // Repro des Issues still: `"Wert: " + IntToStr(7)`.
+  //
+  // Benutzt wird sie NUR hier, nicht in _inferExprType: dort speiste sie auch
+  // die Pruefungen aus #1135 (Zuweisung, Rueckgabe, Argumente), und ein
+  // Messlauf zeigte, dass der Bestand daran an 190 Stellen haengt -- das ist
+  // der Rueckstand aus #1238, nicht dieses Issue.
+  fn _builtinReturnsPchar(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (self.sn_kind(ni) != SNK_CALL) { return 0; }
+    var nm: pchar := self.sn_sVal(ni);
+    var nl: int64 := self.sn_sLen(ni);
+    if (self._strNEq(nm, nl, "StrFromInt"c, 10)) { return 1; }
+    if (self._strNEq(nm, nl, "IntToStr"c,    8)) { return 1; }
+    if (self._strNEq(nm, nl, "FloatToStr"c, 10)) { return 1; }
+    if (self._strNEq(nm, nl, "StrConcat"c,   9)) { return 1; }
+    if (self._strNEq(nm, nl, "StrCopy"c,     7)) { return 1; }
+    if (self._strNEq(nm, nl, "StrSub"c,      6)) { return 1; }
+    if (self._strNEq(nm, nl, "StrNew"c,      6)) { return 1; }
+    if (self._strNEq(nm, nl, "StrTrim"c,     7)) { return 1; }
+    return 0;
+  }
+
+  // Typ eines Operanden fuer die Operatorpruefung: die Ableitung aus #1135,
+  // erweitert um die zeichenketten-liefernden Builtins.
+  fn _binopTypeOf(ni: int64): int64 {
+    var t: int64 := self._inferExprType(ni);
+    if (t != TY_UNKNOWN) { return t; }
+    if (self._builtinReturnsPchar(ni) != 0) { return TY_PCHAR; }
+    // Eine VERKETTUNG liefert wieder eine Zeichenkette. Nur wenn BEIDE Seiten
+    // sicher pchar sind -- `s + i` ist Zeigerarithmetik und ergibt hier
+    // nichts Bestimmtes.
+    if (ni >= 0 && self.sn_kind(ni) == SNK_BINOP && self.sn_iVal(ni) == 70) {
+      if (self._binopTypeOf(self.sn_c0(ni)) == TY_PCHAR) {
+        if (self._binopTypeOf(self.sn_c1(ni)) == TY_PCHAR) { return TY_PCHAR; }
+      }
+    }
+    return TY_UNKNOWN;
+  }
+
+  fn _checkBinopTypes(ni: int64): void {
+    var bop: int64 := self.sn_iVal(ni);
+    var arith: int64 := 0;
+    if (bop == 70 || bop == 71 || bop == 72 || bop == 73 || bop == 74) { arith := 1; }
+    var bits: int64 := 0;
+    if (bop == 89 || bop == 90 || bop == 91 || bop == 93 || bop == 94) { bits := 1; }
+    if (arith == 0 && bits == 0) { return; }
+
+    var lt: int64 := self._binopTypeOf(self.sn_c0(ni));
+    var rt: int64 := self._binopTypeOf(self.sn_c1(ni));
+    if (lt == TY_UNKNOWN || rt == TY_UNKNOWN) { return; }
+
+    var lp: int64 := 0; if (lt == TY_PCHAR) { lp := 1; }
+    var rp: int64 := 0; if (rt == TY_PCHAR) { rp := 1; }
+    var lb: int64 := 0; if (lt == TY_BOOL) { lb := 1; }
+    var rb: int64 := 0; if (rt == TY_BOOL) { rb := 1; }
+    if (lp == 0 && rp == 0 && lb == 0 && rb == 0) { return; }
+
+    // Verkettung: `pchar + pchar` ist eine umgesetzte Sprachform.
+    if (bop == 70 && lp != 0 && rp != 0) { return; }
+
+    // Zeigerarithmetik: pchar +/- Ganzzahl (in beiden Schreibrichtungen).
+    if (arith != 0 && (bop == 70 || bop == 71)) {
+      if (lp != 0 && rp == 0 && rb == 0 && self._typeClass(rt) == 1) { return; }
+      if (rp != 0 && lp == 0 && lb == 0 && self._typeClass(lt) == 1 && bop == 70) { return; }
+    }
+
+    // Boolesche Algebra: ^, & und | auf zwei Wahrheitswerten.
+    if (bits != 0 && lb != 0 && rb != 0 && (bop == 89 || bop == 90 || bop == 91)) { return; }
+
+    self._errBinop(ni, bop, lt, rt);
+  }
+
+  // Meldung: "Operator +: pchar und pchar (Verkettung: StrConcat(a, b))".
+  // Der Text wird zusammengesetzt, weil _errorNode eine fertige Zeichenkette
+  // erwartet -- sie traegt die Zeilennummer bei.
+  fn _errBinop(ni: int64, bop: int64, lt: int64, rt: int64): void {
+    var on: pchar := self._opName(bop);
+    var ln: pchar := self._typeName(lt);
+    var rn: pchar := self._typeName(rt);
+    var buf: int64 := alloc(160);
+    var pos: int64 := 0;
+    var p1: pchar := "Operator "c;
+    memcpy(buf + pos, p1 as int64, 9); pos := pos + 9;
+    var lo: int64 := StrLen(on);
+    memcpy(buf + pos, on as int64, lo); pos := pos + lo;
+    var p2: pchar := ": "c;
+    memcpy(buf + pos, p2 as int64, 2); pos := pos + 2;
+    var ll: int64 := StrLen(ln);
+    memcpy(buf + pos, ln as int64, ll); pos := pos + ll;
+    var p3: pchar := " und "c;
+    memcpy(buf + pos, p3 as int64, 5); pos := pos + 5;
+    var lr: int64 := StrLen(rn);
+    memcpy(buf + pos, rn as int64, lr); pos := pos + lr;
+    // Bei einer Zeichenkette in einer RECHNUNG wird der Weg genannt, statt sie
+    // nur abzuweisen: verkettet wird mit `+` oder StrConcat, gerechnet auf der
+    // Adresse nur nach ausdruecklichem Cast.
+    if (lt == TY_PCHAR || rt == TY_PCHAR) {
+      var p4: pchar := " (verkettet wird mit + oder StrConcat; fuer die Adresse `as int64`)"c;
+      memcpy(buf + pos, p4 as int64, 67); pos := pos + 67;
+    }
+    poke8(buf + pos, 0);
+    self._errorNode(buf as pchar, ni);
+  }
+
+  fn _opName(bop: int64): pchar {
+    if (bop == 70) { return "+"c; }
+    if (bop == 71) { return "-"c; }
+    if (bop == 72) { return "*"c; }
+    if (bop == 73) { return "/"c; }
+    if (bop == 74) { return "%"c; }
+    if (bop == 89) { return "^"c; }
+    if (bop == 90) { return "&"c; }
+    if (bop == 91) { return "|"c; }
+    if (bop == 93) { return "<<"c; }
+    if (bop == 94) { return ">>"c; }
+    return "?"c;
+  }
+
   fn _checkUtypeBinop(ni: int64): void {
     var bop: int64 := self.sn_iVal(ni);
     // Nur Addition und Subtraktion; Skalierung per * und / ist erlaubt.
@@ -2353,6 +2503,7 @@ pub type Sema = class {
       self._checkExpr(self.sn_c0(ni));
       self._checkExpr(self.sn_c1(ni));
       self._checkUtypeBinop(ni);   // #1110
+      self._checkBinopTypes(ni);   // #1143
 
     } else if (k == SNK_UNOP) {
       self._checkExpr(self.sn_c0(ni));

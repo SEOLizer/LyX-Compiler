@@ -2,6 +2,44 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — Print druckt Verkettungen als Text, Operatoren prüfen ihre Typen (#1143)
+
+**Zur Prämisse des Issues.** `"a" + "b"` verkettet — und zwar richtig. Der
+Codegen erkennt zwei `pchar`-Operanden an `+` und emittiert `StrConcat`;
+`tests/regression/test_string_format.lyx` lebt davon. Der Repro
+
+```lyx
+PrintLn("Wert: " + IntToStr(7));   // gab 130895145168896 aus
+```
+
+gab nur deshalb eine Zahl aus, weil `cg_inferPrintType` eine Verkettung nicht
+als Zeichenkette einstufte und `Print`/`PrintLn` sie folglich als Ganzzahl
+ausgaben. Der Fehler saß im **Drucker**, nicht im Operator. Behoben: derselbe
+Ausdruck druckt jetzt `Wert: 7`. Ein Aufruf wurde seit #1058 schon richtig
+eingestuft, der Binop-Fall fehlte.
+
+**Typprüfung der Operatoren.** Das Gegenstück zu #1135 (dort Zuweisung,
+Rückgabe, Argumente). `pchar` und `bool` sind in einer Rechnung keine
+Ganzzahlen:
+
+```
+sema error (line 3): Operator +: bool und int64
+sema error (line 3): Operator *: pchar und int64 (verkettet wird mit + oder StrConcat; fuer die Adresse `as int64`)
+```
+
+Zugelassen bleibt, was die Sprache umgesetzt hat: die Verkettung
+`pchar + pchar`, die Zeigerarithmetik `pchar ± int64` (807 Fundstellen im
+Bestand) und die boolesche Algebra `^ & |` auf zwei Wahrheitswerten
+(`tests/regression/operators/simple_xor.lyx`). Geurteilt wird nur, wenn beide
+Typen bestimmt sind — Unbekanntes bleibt still, wie bei #1135. Die Zahl der
+sema-Meldungen im Bestand ist vor und nach der Änderung dieselbe (727).
+
+**Nicht enthalten:** gemischte int/f64-Arithmetik. `10 - 2.5` rechnet falsch,
+das ist #1212 — ob dort gemeldet oder hochgezogen wird, ist eine
+Sprachentscheidung, der eine Meldung hier vorgreifen würde.
+
+`tests/binop_types_test.sh`: 28 Prüfungen, 11 davon rot gegen den Vorstand.
+
 ### Compiler — `@redundant` wirkt auch an Globals, `--verify-tmr` prüft (#1141)
 
 Die Sache lag zweigeteilt: **lokal** funktionierte TMR (drei Kopien im Rahmen,
