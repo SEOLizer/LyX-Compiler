@@ -280,6 +280,9 @@ test: lyxc
 	@echo "--- @redundant an Globals + --verify-tmr (17 Pruefungen) ---"
 	@bash tests/verify_tmr_test.sh
 	@echo "OK"
+	@echo "--- Typen der binaeren Operatoren + Print (28 Pruefungen) ---"
+	@bash tests/binop_types_test.sh
+	@echo "OK"
 	@echo "--- Linter meldet lesbar (14 Pruefungen) ---"
 	@bash tests/lint_output_test.sh
 	@echo "OK"
