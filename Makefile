@@ -283,6 +283,9 @@ test: lyxc
 	@echo "--- Typen der binaeren Operatoren + Print (28 Pruefungen) ---"
 	@bash tests/binop_types_test.sh
 	@echo "OK"
+	@echo "--- finally beim vorzeitigen Verlassen des try (12 Pruefungen) ---"
+	@bash tests/finally_exit_test.sh
+	@echo "OK"
 	@echo "--- catch bindet den geworfenen Wert (13 Pruefungen) ---"
 	@bash tests/catch_binding_test.sh
 	@echo "OK"
