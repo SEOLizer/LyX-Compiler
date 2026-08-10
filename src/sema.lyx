@@ -388,6 +388,11 @@ pub type Sema = class {
   // #1135: Rueckgabetyp der Funktion, die gerade geprueft wird — fuer den
   // Abgleich beim `return`.
   curFnRetType: int64;
+  // #1155: Rumpf der Funktion, die gerade geprueft wird. Die Bereichspruefung
+  // ueber ein Array-Literal braucht ihn, um zu sehen, ob die Variable im
+  // selben Rumpf waechst (push/append) — dann ist die Literal-Laenge keine
+  // Schranke mehr.
+  curFnBody: int64;
   // #1124: Wurde @bounds_check(true) geschrieben? Der Vorgabewert 1 laesst
   // "an" und "nicht gesetzt" sonst nicht auseinanderhalten; der Codegen
   // braucht die Unterscheidung, um die Pruefung auch ohne --runtime-checks
@@ -794,6 +799,37 @@ pub type Sema = class {
     if (declNi < 0) { return; }
     var typeNi: int64 := self.sn_c0(declNi);
     if (typeNi < 0) { return; }
+    var fName: pchar := self.sn_sVal(ni);
+    var fLen:  int64 := self.sn_sLen(ni);
+    // #1154: Ein Feldzugriff auf etwas ohne benannte Felder wurde kommentarlos
+    // angenommen und lieferte 0 — ein Tippfehler blieb damit unsichtbar. Der
+    // Codegen kennt an einem Array genau vier Zugriffe; alles andere ist ein
+    // Fehler, nicht eine Null.
+    if (fName != 0 && fLen > 0) {
+      var tk0: int64 := self.sn_kind(typeNi);
+      var isArr: int64 := 0;
+      if (tk0 == SNK_TYPE_ARRAY || tk0 == 101) { isArr := 1; }
+      if (tk0 == SNK_TYPE_NAME
+          && self._strNEq(self.sn_sVal(typeNi), self.sn_sLen(typeNi), "array"c, 5)) { isArr := 1; }
+      if (isArr != 0) {
+        if (self._strNEq(fName, fLen, "length"c, 6)) { return; }
+        if (self._strNEq(fName, fLen, "len"c,    3)) { return; }
+        if (self._strNEq(fName, fLen, "cap"c,    3)) { return; }
+        if (self._strNEq(fName, fLen, "data"c,   4)) { return; }
+        self._errorNodeName("unknown field", ni, fName, fLen);
+        return;
+      }
+      if (tk0 == SNK_TYPE_NAME && self.sn_c1(typeNi) < 0) {
+        // Ein eingebauter Grundtyp traegt ueberhaupt keine Felder.
+        var pt: int64 := self.ResolveType(typeNi);
+        if (pt == TY_INT64 || pt == TY_INT32 || pt == TY_INT16 || pt == TY_INT8 ||
+            pt == TY_UINT64 || pt == TY_UINT32 || pt == TY_UINT16 || pt == TY_UINT8 ||
+            pt == TY_BOOL || pt == TY_F64 || pt == TY_PCHAR || pt == TY_VOID) {
+          self._errorNodeName("unknown field", ni, fName, fLen);
+          return;
+        }
+      }
+    }
     if (self.sn_kind(typeNi) != SNK_TYPE_NAME) { return; }
     if (self.sn_c1(typeNi) >= 0) { return; }
     var tSym: int64 := self.Lookup(self.sn_sVal(typeNi), self.sn_sLen(typeNi));
@@ -2096,10 +2132,75 @@ pub type Sema = class {
 
     var initNi: int64 := self.sn_c1(declNi);
     if (initNi >= 0 && self.sn_kind(initNi) == 100) {
+      // #1155: Die Laenge des Literals ist nur dann eine Schranke, wenn das
+      // Array nicht WAECHST. `push`/`append` haengen an, `pop` nimmt weg —
+      // danach sagt die Literal-Laenge nichts mehr ueber den Bestand.
+      // Bis 1.0.15A wurde sie trotzdem als feste Groesse behandelt: `l[3]`
+      // nach einem `push` galt als Bereichsfehler, obwohl das Element da war.
+      if (self._arrayGrowsInFn(self.sn_sVal(baseNi), self.sn_sLen(baseNi)) != 0) { return 0; }
       var cnt: int64 := 0;
       var el:  int64 := self.sn_c0(initNi);
       while (el >= 0) { cnt := cnt + 1; el := self.sn_next(el); }
       return cnt;
+    }
+    return 0;
+  }
+
+  // #1155: Waechst oder schrumpft `name` irgendwo im Rumpf der laufenden
+  // Funktion? Gesucht wird nach push/append/pop — in beiden Schreibweisen,
+  // als freier Aufruf `push(a, x)` und als Methode `a.push(x)`.
+  fn _arrayGrowsInFn(name: pchar, nameLen: int64): int64 {
+    if (self.curFnBody < 0) { return 0; }
+    return self._scanGrows(self.curFnBody, name, nameLen);
+  }
+
+  fn _scanGrows(ni: int64, name: pchar, nameLen: int64): int64 {
+    var cur: int64 := ni;
+    // Die Grenze ist keine Vorsicht, sondern Bedingung: die Kindslots werden
+    // hier roh als Knotenindex gelesen, und nicht jeder Knoten fuellt sie so.
+    while (cur >= 0 && cur < self.pNodeCount) {
+      // SNK_AT_DIRECTIVE traegt in c0 den WERT der Direktive (0/1 bzw. 0..3),
+      // keinen Knoten. Wer hier hineinlaeuft, landet bei Knoten 0 oder 1 —
+      // also wieder am Programmanfang, samt dieser Direktive: die Rekursion
+      // kehrt nie zurueck und der Stapel reisst (@bounds_check liess lyxc
+      // mit SIGSEGV abbrechen). Der Knoten hat keine Kinder; nichts geht
+      // verloren, wenn er uebersprungen wird.
+      if (self.sn_kind(cur) == SNK_AT_DIRECTIVE) {
+        cur := self.sn_next(cur);
+        continue;
+      }
+      if (self.sn_kind(cur) == SNK_CALL) {
+        var isGrow: int64 := 0;
+        var cname:    pchar := self.sn_sVal(cur);
+        var cnameLen: int64 := self.sn_sLen(cur);
+        if (self._strNEq(cname, cnameLen, "push"c, 4))   { isGrow := 1; }
+        if (self._strNEq(cname, cnameLen, "append"c, 6)) { isGrow := 1; }
+        if (self._strNEq(cname, cnameLen, "pop"c, 3))    { isGrow := 1; }
+        if (isGrow != 0) {
+          // Freie Form `push(a, x)`: Argumente haengen an c0, das erste ist
+          // das Array. Methodenform `a.push(x)`: c0 ist der Empfaenger, die
+          // Argumente haengen an c1. Beide Male genuegt der Name — geprueft
+          // wird c0 und die Kette an c1.
+          var recv: int64 := self.sn_c0(cur);
+          if (recv >= 0 && self.sn_kind(recv) == SNK_IDENT
+              && self._strNEq(self.sn_sVal(recv), self.sn_sLen(recv), name, nameLen)) {
+            return 1;
+          }
+          var arg: int64 := self.sn_c1(cur);
+          while (arg >= 0) {
+            if (self.sn_kind(arg) == SNK_IDENT
+                && self._strNEq(self.sn_sVal(arg), self.sn_sLen(arg), name, nameLen)) {
+              return 1;
+            }
+            arg := self.sn_next(arg);
+          }
+        }
+      }
+      if (self._scanGrows(self.sn_c0(cur), name, nameLen) != 0) { return 1; }
+      if (self._scanGrows(self.sn_c1(cur), name, nameLen) != 0) { return 1; }
+      if (self._scanGrows(self.sn_c2(cur), name, nameLen) != 0) { return 1; }
+      if (self._scanGrows(self.sn_c3(cur), name, nameLen) != 0) { return 1; }
+      cur := self.sn_next(cur);
     }
     return 0;
   }
@@ -3788,6 +3889,8 @@ pub type Sema = class {
     // Lyx kennt geschachtelte Funktionen).
     var savedRetType: int64 := self.curFnRetType;
     self.curFnRetType := self.ResolveType(self.sn_c1(ni));
+    var savedFnBody: int64 := self.curFnBody;      // #1155
+    self.curFnBody := self.sn_c2(ni);
 
     // #1089: Default-Werte muessen zur UEBERSETZUNGSZEIT feststehen
     // (ebnf.md §15.1). Der Codegen wertet den Ausdruck an JEDER Aufrufstelle
@@ -3903,6 +4006,7 @@ pub type Sema = class {
     }
 
     self.curFnRetType := savedRetType;   // #1135
+    self.curFnBody    := savedFnBody;    // #1155
     self._popScope();
   }
 
@@ -5524,6 +5628,7 @@ pub type Sema = class {
     // WP-AS-03: new directive defaults
     self.boundsCheckEnabled := 1;  // on by default (safety-first)
     self.curFnRetType := TY_UNKNOWN;   // #1135
+    self.curFnBody    := -1;           // #1155: kein Rumpf ausserhalb einer fn
     self.boundsCheckForced  := 0;  // #1124
     self.debugInfoEnabled   := 0;
     self.optLevel           := 2;  // default optimisation level

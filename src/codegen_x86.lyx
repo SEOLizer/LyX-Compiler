@@ -5530,10 +5530,20 @@ pub type Codegen = class {
       if (self.cg_seq(fieldName, fieldLen, lenStr, 6)) {
         // mov rax, [rax+8]   (load len field)
         self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(0x08);
+      // #1154: `len` und `cap` sind die Namen, unter denen die Dokumentation
+      // den Fat-Pointer beschreibt. Sie lieferten still 0 — jetzt lesen sie
+      // die Felder, die es wirklich gibt: [ptr+8] Laenge, [ptr+0] Kapazitaet.
+      } else if (self.cg_seq(fieldName, fieldLen, "len"c, 3)) {
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(0x08); // mov rax,[rax+8]
+      } else if (self.cg_seq(fieldName, fieldLen, "cap"c, 3)) {
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x00);                   // mov rax,[rax]
       } else if (self.cg_seq(fieldName, fieldLen, dataStr, 4)) {
         // lea rax, [rax+16]  (pointer to first element, past {cap,len} header)
         self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x40); self.cg_e8(0x10);
       } else {
+        // Unbekannter Name an einem Array: sema meldet ihn (#1154). Kommt er
+        // hier trotzdem an (importiert, nicht entscheidbar), bleibt es beim
+        // alten Verhalten.
         self.cg_zeroRax();
       }
       if (safeJz >= 0) { poke32(self.code + safeJz, self.codeLen - safeJz - 4); }
@@ -6308,7 +6318,10 @@ pub type Codegen = class {
         var blen:  int64 := self.cg_nslen(baseNode);
         var lidx: int64 := self.cg_findLocalIdx(bname, blen);
         if (lidx >= 0) {
-          arrFixedSize := peek64(self.localArraySize + lidx * 8);
+          // #1155: nur eine FESTE Groesse ist eine Schranke (Flag 2).
+          if (peek8(self.localIsArray + lidx) == 2) {
+            arrFixedSize := peek64(self.localArraySize + lidx * 8);
+          }
           // WP-GPU-01: check SIMD flag first
           if (peek8(self.localIsSimd + lidx) != 0) { isSimd := 1; }
           var tb: int64 := self.localTypes + lidx * CG_LOCTYPE_SZ;
@@ -7754,7 +7767,12 @@ pub type Codegen = class {
         var anlen: int64 := self.cg_nslen(lenArgNi);
         var lidx: int64 := self.cg_findLocalIdx(aname, anlen);
         if (lidx >= 0) {
-          var sz: int64 := peek64(self.localArraySize + lidx * 8);
+          // #1155: die vermerkte Groesse gilt nur fuer `int64[N]`. Bei einem
+          // Array-Literal stand dort die ANFANGSlaenge — `len` meldete nach
+          // jedem push weiterhin sie, obwohl push das Laengenfeld korrekt
+          // fortschreibt. Fuer alles Wachsende wird das Feld gelesen.
+          var sz: int64 := 0;
+          if (peek8(self.localIsArray + lidx) == 2) { sz := peek64(self.localArraySize + lidx * 8); }
           if (sz > 0) {
             self.cg_movRaxImm(sz);
           } else if (peek8(self.localIsArray + lidx) != 0) {
@@ -10082,7 +10100,12 @@ pub type Codegen = class {
       }
       // WP-BC-51: NK_TYPE_ARRAY_FIXED (=101) — store compile-time size
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 101) {
-        poke8(self.localIsArray + localIdx, 1);
+        // #1155: 2 statt 1 heisst "feste Groesse". Alle Abfragen pruefen auf
+        // != 0 und sehen weiterhin ein Array; nur wer die vermerkte GROESSE
+        // benutzen will, fragt zusaetzlich auf 2. Ein Array-Literal traegt
+        // seine Laenge naemlich auch in localArraySize, waechst aber mit
+        // push/append — dort ist der Vermerk nur die ANFANGSlaenge.
+        poke8(self.localIsArray + localIdx, 2);
         var sizeNode: int64 := self.cg_nc1(typeNode);
         if (sizeNode >= 0 && self.cg_nkind(sizeNode) == CGN_LIT_INT) {
           poke64(self.localArraySize + localIdx * 8, self.cg_nival(sizeNode));
@@ -10506,7 +10529,9 @@ pub type Codegen = class {
         var lhsFixedSize: int64 := 0;   // #1156
         if (self.cg_nkind(lhsBase) == CGN_IDENT) {
           var llidx: int64 := self.cg_findLocalIdx(self.cg_nsval(lhsBase), self.cg_nslen(lhsBase));
-          if (llidx >= 0) { lhsFixedSize := peek64(self.localArraySize + llidx * 8); }
+          if (llidx >= 0 && peek8(self.localIsArray + llidx) == 2) {   // #1155
+            lhsFixedSize := peek64(self.localArraySize + llidx * 8);
+          }
           if (llidx >= 0 && peek8(self.localIsArray + llidx) != 0) { lhsIsArray := 1; }
           // WP-GPU-01: SIMD array store check
           if (llidx >= 0 && peek8(self.localIsSimd + llidx) != 0) { lhsIsSimd := 1; }
