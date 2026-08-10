@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.15E
+VERSION   := 1.0.15F
 VERSION_DATE := 2026-08-10
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -40,22 +40,47 @@ DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 lic_build_flags:
 	@printf 'con LYXC_LICENSE_REQUIRED: int64 := %s;\n' $(LYXC_LICENSE_REQUIRED) > src/lic_build_flags.lyx
 
+# #1170: src/crypto/lic_secret.lyx ist gitignoriert, wird zum Uebersetzen der
+# Compilerquelle aber gebraucht. Ein frischer Checkout scheiterte deshalb mit
+# vier sema-Fehlern ("undefined function 'lic_getMasterSecret'" und Geschwister),
+# und die CI konnte ihre eigene Bootstrap-Pruefung nicht ausfuehren.
+#
+# Fehlt die Datei, tritt die committete Entwicklungsvorgabe an ihre Stelle. Der
+# Hinweis dazu ist Absicht: der Unterschied zwischen Dev- und Release-Bau soll
+# im Protokoll stehen und nicht daran haengen, ob jemand eine Datei lokal hat.
+# Fehlt auch die Vorgabe, wird das gemeldet statt es den Compiler mit vier
+# Folgefehlern quittieren zu lassen.
+lic_secret:
+	@if [ ! -f src/crypto/lic_secret.lyx ]; then \
+		if [ -f src/crypto/lic_secret.dev.lyx ]; then \
+			cp src/crypto/lic_secret.dev.lyx src/crypto/lic_secret.lyx; \
+			echo "Hinweis: src/crypto/lic_secret.lyx fehlte — Entwicklungsvorgabe eingesetzt"; \
+			echo "         (Testvektor-Werte, NICHT fuer ein Release)."; \
+			echo "         Echte Werte erzeugen: python3 tools/gen_lic_secret.py"; \
+		else \
+			echo "FEHLER: src/crypto/lic_secret.lyx fehlt, und die Vorgabe"          >&2; \
+			echo "        src/crypto/lic_secret.dev.lyx ist ebenfalls nicht da."     >&2; \
+			echo "        Erzeugen mit: python3 tools/gen_lic_secret.py"             >&2; \
+			exit 1; \
+		fi; \
+	fi
+
 # RAM-Limit für Bootstrap-Läufe: verhindert OOM-Kill der Shell bei Endlosschleifen.
 ULIMIT_VM := ulimit -v $$(( 8 * 1024 * 1024 )) &&
 
 # Aus Seed-Binary kompilieren (erster Bootstrap-Schritt)
-build: lic_build_flags
+build: lic_build_flags lic_secret
 	$(ULIMIT_VM) $(SEED) $(SRC) -o lyxc
 
 # Selbstkompilierung: lyxc kompiliert sich selbst (erfordert vorhandenes lyxc)
-bootstrap: lyxc lic_build_flags
+bootstrap: lyxc lic_build_flags lic_secret
 	$(ULIMIT_VM) ./lyxc $(SRC) -o lyxc.new
 	mv lyxc.new lyxc
 
 # Singularitätsprüfung: S3 (Seed→Quelle) == S4 (S3→Quelle)
 # Hinweis: Der Seed kompiliert die große Quelle in bis zu 5 Versuchen
 # (ASLR-bedingte non-deterministische Crashes bei großem Adressraum).
-singularity: lic_build_flags
+singularity: lic_build_flags lic_secret
 	@echo "=== Singularitätsprüfung ==="
 	@for i in 1 2 3 4 5; do \
 		$(ULIMIT_VM) $(SEED) $(SRC) -o /tmp/lyxc_s3 2>/dev/null && break; \
@@ -390,6 +415,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Capability-Pfade und Typinferenz (10 Pruefungen) ---"
 	@bash tests/caps_ffi_inference_test.sh
+	@echo "OK"
+	@echo "--- Gemischte Arithmetik, try/catch, Build-Vorgabe (12 Pruefungen) ---"
+	@bash tests/mixed_arith_trycatch_test.sh
 	@echo "OK"
 	@echo "--- TextMate-Grammatik: Schluesselwoerter und Typen vollstaendig ---"
 	@bash tests/syntax/test_grammar.sh

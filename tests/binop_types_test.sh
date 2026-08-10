@@ -147,12 +147,16 @@ out "Wahrheitswerte vergleichen" \
 out "Unbestimmtes wird nicht gemeldet" \
   'var p: int64 := alloc(16); poke64(p + 8, 7); PrintLn(peek64(p + 8));' '7'
 
-# --- Ausdruecklich NICHT enthalten: gemischte int/f64-Arithmetik ---------
-# `1.5 + 1` rechnet falsch (#1212). Hier wird nichts gemeldet -- welche
-# Loesung richtig ist (Meldung oder Hochziehen), entscheidet #1212. Der Test
-# haelt den Stand fest, damit die Aenderung dort auffaellt.
-out "gemischte int/f64-Arithmetik bleibt unberuehrt (#1212)" \
-  'PrintLn((1.5 + 1) as int64);' '1'
+# --- Gemischte int/f64-Arithmetik: entschieden in #1212 -------------------
+# Bis 1.0.15E rechnete `1.5 + 1` falsch und ergab 1: die ganzzahlige Seite
+# ging als Bitmuster eines double in die Rechnung. Dieser Testfall hielt den
+# Stand bewusst fest, "damit die Aenderung dort auffaellt" — und hat genau das
+# getan, als #1212 umgesetzt wurde.
+#
+# Entschieden ist HOCHZIEHEN, nicht melden: die ganzzahlige Seite wird nach
+# f64 gewandelt. 1.5 + 1 = 2.5, `as int64` schneidet auf 2 ab.
+out "gemischte int/f64-Arithmetik zieht hoch (#1212)" \
+  'PrintLn((1.5 + 1) as int64);' '2'
 
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"

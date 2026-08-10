@@ -2,7 +2,7 @@
 
 > A self-hosting systems programming language focused on native code generation, predictable performance, minimal runtime dependencies, and built-in capability-based security.
 
-![Version](https://img.shields.io/badge/version-v1.0.15E-blue)
+![Version](https://img.shields.io/badge/version-v1.0.15F-blue)
 ![Status](https://img.shields.io/badge/status-self--hosting-success)
 ![Platform](https://img.shields.io/badge/linux-x86__64-success)
 ![Platform](https://img.shields.io/badge/linux-arm64-success)
@@ -444,6 +444,26 @@ git clone https://github.com/SEOLizer/Lyx.git
 cd Lyx
 make
 ```
+
+### License Secret (Dev vs. Release)
+
+The compiler source needs `src/crypto/lic_secret.lyx`, which is gitignored. If
+it is missing, the build copies the committed development default
+`src/crypto/lic_secret.dev.lyx` into place and says so. A fresh clone therefore
+builds without extra steps.
+
+The development default holds a readable placeholder secret and the Ed25519
+public key from RFC 8032 test vector 1 — **not** production values. A release
+build uses real values:
+
+```bash
+python3 tools/gen_lic_secret.py   # writes src/crypto/lic_secret.lyx
+```
+
+Consequence worth knowing: a build with the development default is **not**
+byte-identical to a release build, because the secret is compiled in.
+`make singularity` still passes (it compares S3 against S4, both built from the
+same source), but the resulting hash differs from the anchored fixpoint.
 
 ### Running Tests
 
