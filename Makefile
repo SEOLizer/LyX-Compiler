@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.14M
-VERSION_DATE := 2026-08-09
+VERSION   := 1.0.15A
+VERSION_DATE := 2026-08-10
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -276,6 +276,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- @flight_crit schaltet die FPU-Traps frei (15 Pruefungen) ---"
 	@bash tests/flight_crit_test.sh
+	@echo "OK"
+	@echo "--- @redundant an Globals + --verify-tmr (17 Pruefungen) ---"
+	@bash tests/verify_tmr_test.sh
 	@echo "OK"
 	@echo "--- Linter meldet lesbar (14 Pruefungen) ---"
 	@bash tests/lint_output_test.sh
