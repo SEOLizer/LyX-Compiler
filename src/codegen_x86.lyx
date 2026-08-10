@@ -194,6 +194,10 @@ con CG_PATCH_STR:      int64 := 1;
 con CG_PATCH_VMT_ADDR: int64 := 2;  // absolute 8-byte VMT address in code buffer
 con CG_PATCH_EXTERN:   int64 := 3;  // FFI call: disp32 of `call *got(%rip)`, namePtr field = extern index
 con CG_PATCH_EXTERN_DATA: int64 := 4;  // WSP-07: disp32 von `lea rax,[rip+0]` auf externes Daten-Symbol; wird zu R_X86_64_PC32 in cg_writeELFObj
+// #1164/#1298: absoluter Zeiger IM DATENBEREICH auf eine Zeichenkette, die
+// ebenfalls dort liegt (globaler Startwert `var s: pchar := "..."`). Anders als
+// CG_PATCH_STR zeigt das erste Feld hier in `self.data`, nicht in `self.code`.
+con CG_PATCH_DATA_PTR:    int64 := 5;
 
 // FFI imports (extern fn ... link "lib.so")
 con CG_EXTERN_SZ:          int64 := 32;
@@ -1584,6 +1588,39 @@ pub type Codegen = class {
   // Evaluates a compile-time constant expression node and returns its int64 value.
   // Handles literals, unary minus/not, and binary arithmetic/bitwise/comparison ops.
   // Used by cg_genFile to populate conTable for con declarations.
+  // #1164: Laesst sich dieser Ausdruck zur Uebersetzungszeit ausrechnen?
+  //
+  // cg_evalConExpr liefert fuer alles Unbekannte 0 und ist davon nicht zu
+  // unterscheiden. Fuer die globale Initialisierung braucht es aber genau
+  // diese Unterscheidung: eine 0, die herausgerechnet wurde, ist etwas
+  // anderes als eine 0, die entstand, weil niemand hingesehen hat. Die Liste
+  // haelt sich absichtlich an dieselben Knotenarten wie cg_evalConExpr —
+  // wer dort einen Fall ergaenzt, ergaenzt ihn hier mit.
+  fn cg_isConstExpr(node: int64): int64 {
+    if (node < 0) { return 0; }
+    var k: int64 := self.cg_nkind(node);
+    if (k == CGN_LIT_INT)   { return 1; }
+    if (k == CGN_LIT_FLOAT) { return 1; }
+    if (k == CGN_IDENT) {
+      return self.cg_hasConVal(self.cg_nsval(node), self.cg_nslen(node));
+    }
+    if (k == CGN_UNOP) {
+      var uop: int64 := self.cg_nival(node);
+      if (uop != 87 && uop != 71) { return 0; }   // nur ! und unaeres Minus
+      return self.cg_isConstExpr(self.cg_nc0(node));
+    }
+    if (k == CGN_BINOP) {
+      if (self.cg_isConstExpr(self.cg_nc0(node)) == 0) { return 0; }
+      return self.cg_isConstExpr(self.cg_nc1(node));
+    }
+    if (k == CGN_CALL) {
+      // sizeof(Type) ist zur Uebersetzungszeit bekannt (BUG-5).
+      if (self.cg_seq(self.cg_nsval(node), self.cg_nslen(node), "sizeof", 6)) { return 1; }
+      return 0;
+    }
+    return 0;
+  }
+
   fn cg_evalConExpr(node: int64): int64 {
     if (node < 0) { return 0; }
     var k: int64 := self.cg_nkind(node);
@@ -1892,6 +1929,18 @@ pub type Codegen = class {
           exit(1);
         }
         // disp32 bleibt 0 → wird in cg_writeELFObj zu R_X86_64_PC32.
+      } else if (kind == CG_PATCH_DATA_PTR) {
+        // #1164/#1298: Der Datenbereich folgt unmittelbar auf den Code — die
+        // Adresse steht also erst hier fest. codeOff ist der Slot IM
+        // DATENBEREICH, namePtr der Offset der Zeichenkette.
+        var slotOff: int64 := codeOff;
+        var strOff:  int64 := namePtr;
+        poke64(self.data + slotOff, CG_ELF_BASE + CG_CODE_OFF + self.codeLen + strOff);
+        // Der Slot traegt eine absolute Adresse: PE und der LyxOS-Loader
+        // muessen ihn um (load_base - CG_ELF_BASE) verschieben. Ohne diesen
+        // Eintrag waere der Zeiger ueberall dort falsch, wo nicht auf
+        // 0x400000 geladen wird.
+        self.cg_addBaseReloc(CG_CODE_OFF + self.codeLen + slotOff);
       } else {
         // CG_PATCH_STR: namePtr encodes data offset
         var dataOff: int64 := namePtr;
@@ -10376,8 +10425,22 @@ pub type Codegen = class {
         // #1106: `var m: TM := f.Handle;` muss binden, nicht laden. Der Fall
         // gab es bisher nur fuer FELDER — als lokale Variable uebersetzte er
         // klaglos und stuerzte beim Aufruf ab.
+        var declIsMethodType: int64 := 0;
         if (typeNode >= 0 && self.cg_nkind(typeNode) == 60
             && self.cg_isMethodType(self.cg_nsval(typeNode), self.cg_nslen(typeNode)) != 0) {
+          declIsMethodType := 1;
+        }
+        // #1172: Ohne Typangabe wurde nicht gebunden, sondern GELADEN — also
+        // das Feld mit diesem Namen, das die Klasse gar nicht fuehrt: Offset 0,
+        // und damit der VMT-Zeiger. Der Aufruf sprang ins Leere (Exit 139).
+        // Der Aufrufpfad selbst kann fat pointer (er laedt [rax] als Code und
+        // [rax+8] nach rdi), es fehlte allein der richtige Wert. Ob rechts eine
+        // Methoden-Referenz steht, entscheidet cg_isMethodRefExpr am
+        // Klassenlayout und braucht den deklarierten Typ nicht.
+        if (declIsMethodType == 0 && typeNode < 0 && self.cg_isMethodRefExpr(init) != 0) {
+          declIsMethodType := 1;
+        }
+        if (declIsMethodType != 0) {
           self.cg_genMethodTypedValue(init);
         } else {
           self.cg_genExpr(init);
@@ -14188,18 +14251,54 @@ pub type Codegen = class {
           while (gz < 16) { self.cg_edata(0); gz := gz + 1; }
           self.tmrVarCount += 1;
         }
-        // Write literal initializer directly into data section
+        // Write initializer directly into data section
+        //
+        // #1164: Bis 1.0.15C stand hier `== CGN_LIT_INT`, und alles andere fiel
+        // durch — ohne Rechnung, ohne Code, ohne Meldung. Der Datenbereich ist
+        // genullt, das Ergebnis sah deshalb aus wie eine gewollte Null. Betroffen
+        // war ausgerechnet `0 - 1`, die uebliche Schreibweise fuer negative
+        // Werte, und ebenso ein Float-Startwert oder ein benannter con.
         var initNode: int64 := self.cg_nc1(cur);
-        if (initNode >= 0 && self.cg_nkind(initNode) == CGN_LIT_INT) {
-          // #1151: Der Wert geht hier ohne Codeerzeugung in den Datenbereich —
-          // die Kuerzung muss deshalb der Compiler selbst rechnen.
-          var gInit: int64 := self.cg_narrowConst(self.cg_nival(initNode), self.cg_narrowKindOfTypeNode(gtNode));
-          poke64(self.data + doff, gInit);
-          // Alle drei Kopien tragen den Anfangswert — sonst waere die Mehrheit
-          // beim ersten Lesen 0 und der Initialisierer verloren.
-          if (gRedundant != 0) {
-            poke64(self.data + doff + 8,  gInit);
-            poke64(self.data + doff + 16, gInit);
+        if (initNode >= 0) {
+          var ik: int64 := self.cg_nkind(initNode);
+          if (ik == CGN_LIT_STR) {
+            // #1164: Der Startwert ist die ADRESSE der Zeichenkette. Sie steht
+            // erst fest, wenn die Codelaenge feststeht (der Datenbereich folgt
+            // unmittelbar darauf), also wird der Slot vorgemerkt und in
+            // cg_patchAll gefuellt — samt Basis-Relokation, damit der Zeiger
+            // auch auf PE und LyxOS stimmt. Bis 1.0.15C blieb hier eine 0
+            // stehen: ein Nullzeiger, der wie eine leere Zeichenkette aussieht.
+            var gsOff: int64 := self.cg_addStr(self.cg_nsoff(initNode), self.cg_nslen(initNode));
+            self.cg_addPatch(doff, gsOff, 0, CG_PATCH_DATA_PTR);
+            if (gRedundant != 0) {
+              self.cg_addPatch(doff + 8,  gsOff, 0, CG_PATCH_DATA_PTR);
+              self.cg_addPatch(doff + 16, gsOff, 0, CG_PATCH_DATA_PTR);
+            }
+          } else if (self.cg_isConstExpr(initNode) != 0) {
+            // #1151: Der Wert geht hier ohne Codeerzeugung in den Datenbereich —
+            // die Kuerzung muss deshalb der Compiler selbst rechnen.
+            var gRaw: int64 := self.cg_evalConExpr(initNode);
+            var gInit: int64 := gRaw;
+            // Ein f64-Startwert traegt IEEE-Bits; die Kuerzung auf schmale
+            // Ganzzahltypen darf daran nicht drehen.
+            if (ik != CGN_LIT_FLOAT) {
+              gInit := self.cg_narrowConst(gRaw, self.cg_narrowKindOfTypeNode(gtNode));
+            }
+            poke64(self.data + doff, gInit);
+            // Alle drei Kopien tragen den Anfangswert — sonst waere die Mehrheit
+            // beim ersten Lesen 0 und der Initialisierer verloren.
+            if (gRedundant != 0) {
+              poke64(self.data + doff + 8,  gInit);
+              poke64(self.data + doff + 16, gInit);
+            }
+          } else {
+            // Nicht ausrechenbar: melden statt still auf 0 stehen lassen. Eine
+            // Initialisierungssequenz vor main gibt es fuer Globale nicht.
+            EPrintStr("codegen error: globale Variable '"c);
+            sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+            EPrintStrLn("': Startwert ist zur Uebersetzungszeit nicht bekannt"c);
+            EPrintStrLn("  Globale Startwerte muessen konstant sein; sonst in einer fn zuweisen."c);
+            exit(1);
           }
         }
       } else if (k == CGN_CON_DECL) {
