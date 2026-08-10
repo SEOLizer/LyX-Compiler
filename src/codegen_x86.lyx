@@ -481,6 +481,19 @@ pub type Codegen = class {
   // verlaesst den Block wie ein `break` die Schleife — die offenen defers
   // muessen vorher laufen, sonst leckt die Freigabe genau im Fehlerfall.
   tryDeferMark: int64;
+  // #1148: die offenen try-Bloecke der laufenden Funktion. `return`, `break`
+  // und `continue` verlassen sie, ohne ihr Blockende zu erreichen — ihre
+  // finally-Bloecke liefen deshalb nicht (die Freigabe unterblieb lautlos),
+  // und der installierte Ausnahme-Handler zeigte danach auf einen toten
+  // Rahmen. Je Ebene: rbp-Offset eines verdeckten Slots mit der jmp_buf-Basis
+  // und der Knoten des finally-Blocks (-1 = keiner).
+  trySlotBuf:  int64;
+  tryFinBuf:   int64;
+  tryDepth:    int64;
+  tryCap:      int64;
+  // Stand von tryDepth beim Eintritt in den innersten Schleifenrumpf; break
+  // und continue raeumen nur die try-Bloecke ab, die sie wirklich verlassen.
+  loopTryMark: int64;
 
   // WP-BC-11: or-pattern body forward jump list (je body, linked list of rel32 positions)
   orBodyHead: int64;
@@ -10503,6 +10516,16 @@ pub type Codegen = class {
           self.cg_zeroRax();
         }
       }
+      // #1148: `return` verlaesst jeden offenen try-Block, ohne dessen Ende zu
+      // erreichen. Die finally-Bloecke laufen hier — von innen nach aussen —
+      // und der Ausnahme-Handler wird zurueckgesetzt, sonst zeigte er nach der
+      // Rueckkehr auf einen toten Rahmen. Der Rueckgabewert steht in rax und
+      // wird ueber die Rumpfe gerettet.
+      if (self.tryDepth > 0) {
+        self.cg_pushRax();
+        self.cg_emitTryUnwindDownTo(0);
+        self.cg_popRax();
+      }
       // #1097: Rueckgabe vom Bereichstyp. Der Wert steht in rax; danach ist er
       // beim Aufrufer und traegt den Typ, also muss er hier passen.
       if (expr >= 0) {
@@ -10583,6 +10606,31 @@ pub type Codegen = class {
       self.cg_emitLeaRcxData(CG_EXN_PTR);
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE0);   // mov rax, rsp
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x01);   // mov [rcx], rax
+      // #1148: Ebene anmelden. Die jmp_buf-Basis (= rsp jetzt) kommt in einen
+      // verdeckten Slot, damit `return` sie spaeter findet — an einer
+      // return-Stelle ist rsp durch Zwischenwerte verschoben, [rsp+64] taugt
+      // dort also nicht mehr.
+      var finallyNi: int64 := self.cg_nc2(ni);
+      var myTryLevel: int64 := self.tryDepth;
+      var tryBaseSlot: int64 := self.cg_addLocal("__try_base"c, 10);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE0);   // mov rax, rsp
+      self.cg_storeRax(tryBaseSlot);
+      if (self.tryDepth >= self.tryCap) {
+        // Wachsen statt Verwerfen: ein uebergangener Eintrag hiesse, dass
+        // finally bei `return` wieder stumm ausfaellt — genau der Fehler,
+        // den #1148 behebt.
+        var ntc: int64 := self.tryCap * 2;
+        var nsb: int64 := alloc(ntc * 8);
+        var nfb: int64 := alloc(ntc * 8);
+        memcpy(nsb, self.trySlotBuf, self.tryCap * 8);
+        memcpy(nfb, self.tryFinBuf,  self.tryCap * 8);
+        self.trySlotBuf := nsb;
+        self.tryFinBuf  := nfb;
+        self.tryCap     := ntc;
+      }
+      poke64(self.trySlotBuf + self.tryDepth * 8, tryBaseSlot);
+      poke64(self.tryFinBuf  + self.tryDepth * 8, finallyNi);
+      self.tryDepth += 1;
       // Generate try body
       // #1118: Stand merken, damit `throw` die defers dieses Blocks abarbeiten
       // kann. Verschachtelte try: der aeussere Stand wird gerettet.
@@ -10595,8 +10643,13 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x40); // mov rax, [rsp+64]
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x01);   // mov [rcx], rax
       // Generate finally block on success path (if present)
-      var finallyNi: int64 := self.cg_nc2(ni);
-      if (finallyNi >= 0) { self.cg_genBlock(finallyNi); }
+      // #1148: waehrend des finally-Rumpfes gilt diese Ebene als verlassen —
+      // ein `return` darin raeumt nur die aeusseren try-Bloecke ab.
+      if (finallyNi >= 0) {
+        self.tryDepth := myTryLevel;
+        self.cg_genBlock(finallyNi);
+        self.tryDepth := myTryLevel + 1;
+      }
       // Jump past catch to try_done
       self.cg_e8(0xE9);
       var tryDonePatch: int64 := self.codeLen;
@@ -10640,7 +10693,13 @@ pub type Codegen = class {
         catchNi := self.cg_nnext(catchNi);
       }
       // Generate finally block on catch path
-      if (finallyNi >= 0) { self.cg_genBlock(finallyNi); }
+      if (finallyNi >= 0) {
+        self.tryDepth := myTryLevel;                 // #1148, wie oben
+        self.cg_genBlock(finallyNi);
+        self.tryDepth := myTryLevel + 1;
+      }
+      // #1148: Ebene abmelden — ab hier ist der try-Block verlassen.
+      self.tryDepth := myTryLevel;
       // === try_done ===
       poke32(self.code + tryDonePatch, self.codeLen - tryDonePatch - 4);
       // add rsp, 80  — restore stack frame
@@ -10729,6 +10788,9 @@ pub type Codegen = class {
       // Der Zaehler bleibt stehen — der Blockcode dahinter wird weiter erzeugt
       // und gilt fuer den Weg ohne break.
       if (self.loopDeferMark >= 0) { self.cg_emitDefersDownTo(self.loopDeferMark); }
+      // #1148: dasselbe fuer die try-Bloecke, die der Sprung verlaesst — die
+      // defers des Rumpfes zuerst, dann die finally-Bloecke darum herum.
+      if (self.tryDepth > self.loopTryMark) { self.cg_emitTryUnwindDownTo(self.loopTryMark); }
       // jmp rel32 to loop exit; placeholder stores previous break-list head
       self.cg_e8(0xE9);
       var bp: int64 := self.codeLen;
@@ -10738,6 +10800,7 @@ pub type Codegen = class {
     } else if (k == CGN_CONTINUE) {
       // #1006: wie bei break — der Rumpf wird verlassen, seine defers laufen.
       if (self.loopDeferMark >= 0) { self.cg_emitDefersDownTo(self.loopDeferMark); }
+      if (self.tryDepth > self.loopTryMark) { self.cg_emitTryUnwindDownTo(self.loopTryMark); }  // #1148
       // jmp rel32 to loop continue; placeholder stores previous continue-list head
       self.cg_e8(0xE9);
       var cp: int64 := self.codeLen;
@@ -10836,6 +10899,37 @@ pub type Codegen = class {
       self.dfReplay := savedReplay;
       i -= 1;
     }
+  }
+
+  // #1148: die try-Bloecke bis zurueck zu `mark` verlassen — von innen nach
+  // aussen. Je Ebene wird zuerst der Ausnahme-Handler auf den Stand vor diesem
+  // try zurueckgesetzt (er steht im jmp_buf bei +64, dessen Basis in einem
+  // verdeckten Slot liegt), dann laeuft der finally-Block.
+  //
+  // Der Rueckgabewert steht beim Aufruf in rax und muss ihn ueberleben — der
+  // Aufrufer rettet ihn. Hier duerfen nur rax und rcx benutzt werden, was
+  // ausser dem finally-Rumpf selbst auch zutrifft; der Rumpf laeuft vor dem
+  // Wiederherstellen des Wertes.
+  //
+  // Waehrend ein finally-Rumpf erzeugt wird, gilt seine eigene Ebene als
+  // verlassen: ein `return` darin raeumt nur noch die AEUSSEREN try-Bloecke ab
+  // und nicht sich selbst (sonst endlose Rekursion im Codegen).
+  fn cg_emitTryUnwindDownTo(mark: int64) {
+    var savedDepth: int64 := self.tryDepth;
+    var i: int64 := self.tryDepth - 1;
+    while (i >= mark) {
+      self.cg_loadRax(peek64(self.trySlotBuf + i * 8));        // rax = jmp_buf-Basis
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(0x40);  // mov rax, [rax+64]
+      self.cg_emitLeaRcxData(CG_EXN_PTR);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x01);    // mov [rcx], rax
+      var fin: int64 := peek64(self.tryFinBuf + i * 8);
+      if (fin >= 0) {
+        self.tryDepth := i;
+        self.cg_genBlock(fin);
+      }
+      i -= 1;
+    }
+    self.tryDepth := savedDepth;
   }
 
   // #1030: Argumente des aufgeschobenen Aufrufs an der Stelle des `defer`
@@ -11190,11 +11284,14 @@ pub type Codegen = class {
       // Body
       self.curBreakHead := -1;
       self.curContHead  := -1;
-      var savedMarkW: int64 := self.loopDeferMark;   // #1006
+      var savedMarkW: int64 := self.loopDeferMark;
+      var savedTryMarkW: int64 := self.loopTryMark;   // #1148
       self.loopDeferMark := self.deferCount;
+      self.loopTryMark   := self.tryDepth;   // #1148
       if (limVal >= 0) { self.cg_emitLimitCheck(limCnt, limVal, limMsg); }   // #1103
       self.cg_genBlock(self.cg_nc1(ni));
       self.loopDeferMark := savedMarkW;
+      self.loopTryMark   := savedTryMarkW;   // #1148
       // Accumulate break list; save this copy's continue list for later
       allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
       prevContHead := self.curContHead;
@@ -11224,10 +11321,13 @@ pub type Codegen = class {
     self.curBreakHead := -1;
     self.curContHead  := -1;
     // Body
-    var savedMarkR: int64 := self.loopDeferMark;   // #1006
+    var savedMarkR: int64 := self.loopDeferMark;
+    var savedTryMarkR: int64 := self.loopTryMark;   // #1148
     self.loopDeferMark := self.deferCount;
+    self.loopTryMark   := self.tryDepth;   // #1148
     self.cg_genBlock(self.cg_nc0(ni));
     self.loopDeferMark := savedMarkR;
+    self.loopTryMark   := savedTryMarkR;   // #1148
     // contPos: patch all continue jumps to here (before condition eval)
     var contPos: int64 := self.codeLen;
     var ch: int64 := self.curContHead;
@@ -11367,10 +11467,13 @@ pub type Codegen = class {
       // Body
       self.curBreakHead := -1;
       self.curContHead  := -1;
-      var savedMarkF: int64 := self.loopDeferMark;   // #1006
+      var savedMarkF: int64 := self.loopDeferMark;
+      var savedTryMarkF: int64 := self.loopTryMark;   // #1148
       self.loopDeferMark := self.deferCount;
+      self.loopTryMark   := self.tryDepth;   // #1148
       self.cg_genBlock(self.cg_nc2(ni));
       self.loopDeferMark := savedMarkF;
+      self.loopTryMark   := savedTryMarkF;   // #1148
       // contPos: continue lands here, before step
       self.cg_patchList(self.curContHead, self.codeLen);
       allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
@@ -11429,10 +11532,13 @@ pub type Codegen = class {
     // Rumpf
     self.curBreakHead := -1;
     self.curContHead  := -1;
-    var savedMarkG: int64 := self.loopDeferMark;   // #1006
+    var savedMarkG: int64 := self.loopDeferMark;
+    var savedTryMarkG: int64 := self.loopTryMark;   // #1148
     self.loopDeferMark := self.deferCount;
+    self.loopTryMark   := self.tryDepth;   // #1148
     self.cg_genBlock(self.cg_nc2(ni));
     self.loopDeferMark := savedMarkG;
+    self.loopTryMark   := savedTryMarkG;   // #1148
     self.cg_patchList(self.curContHead, self.codeLen);
     allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
 
@@ -11494,10 +11600,13 @@ pub type Codegen = class {
       // Body
       self.curBreakHead := -1;
       self.curContHead  := -1;
-      var savedMarkC: int64 := self.loopDeferMark;   // #1006
+      var savedMarkC: int64 := self.loopDeferMark;
+      var savedTryMarkC: int64 := self.loopTryMark;   // #1148
       self.loopDeferMark := self.deferCount;
+      self.loopTryMark   := self.tryDepth;   // #1148
       if (bodyNi >= 0) { self.cg_genBlock(bodyNi); }
       self.loopDeferMark := savedMarkC;
+      self.loopTryMark   := savedTryMarkC;   // #1148
       // contPos: continue lands here, before step
       self.cg_patchList(self.curContHead, self.codeLen);
       allBreakHead := self.cg_mergeBreakList(allBreakHead, self.curBreakHead);
@@ -11543,7 +11652,9 @@ pub type Codegen = class {
     // ERZWINGT `break` oder `return` in jedem Zweig ("switch case may fall
     // through"), der fehleranfaellige Pfad war also der vorgeschriebene.
     var savedSwMark: int64 := self.loopDeferMark;
+    var savedTrySwMark: int64 := self.loopTryMark;   // #1148
     self.loopDeferMark := self.deferCount;
+    self.loopTryMark   := self.tryDepth;   // #1148
 
     var defaultCaseNode: int64 := -1;
     var caseCur: int64 := self.cg_nc1(ni);
@@ -11599,6 +11710,7 @@ pub type Codegen = class {
     }
     self.curBreakHead := savedBreakHead;
     self.loopDeferMark := savedSwMark;   // #1118
+    self.loopTryMark   := savedTrySwMark;   // #1148
   }
 
   // WP-15: Generate match statement (like switch but for pattern matching)
@@ -11713,7 +11825,9 @@ pub type Codegen = class {
 
     // #1118: wie beim switch — ein `break` im Zweig verlaesst nur diesen Zweig.
     var savedSwMark: int64 := self.loopDeferMark;
+    var savedTrySwMark: int64 := self.loopTryMark;   // #1148
     self.loopDeferMark := self.deferCount;
+    self.loopTryMark   := self.tryDepth;   // #1148
 
     var defaultCaseNode: int64 := -1;
     var caseCur: int64 := self.cg_nc1(ni);  // first match case
@@ -12105,6 +12219,7 @@ pub type Codegen = class {
     }
     self.curBreakHead := savedBreakHead;
     self.loopDeferMark := savedSwMark;   // #1118
+    self.loopTryMark   := savedTrySwMark;   // #1148
   }
 
   // ------------------------------------------------------------------
@@ -12550,6 +12665,8 @@ pub type Codegen = class {
     self.deferCount := 0;
     self.dfCount    := 0;       // #1030: Argument-Slots gelten je Funktion
     self.loopDeferMark := -1;   // #1006: ausserhalb jeder Schleife
+    self.tryDepth      := 0;    // #1148
+    self.loopTryMark   := 0;
     self.tryDeferMark  := -1;   // #1118: ausserhalb jedes try
     self.cg_genBlock(body);
 
@@ -14089,7 +14206,14 @@ pub type Codegen = class {
     self.nestedCount := 0;
     self.deferCount := 0;
     self.loopDeferMark := -1;   // #1006
+    self.tryDepth      := 0;    // #1148
+    self.loopTryMark   := 0;
     self.tryDeferMark  := -1;   // #1118
+    self.tryCap     := 64;      // #1148
+    self.trySlotBuf := alloc(self.tryCap * 8);
+    self.tryFinBuf  := alloc(self.tryCap * 8);
+    self.tryDepth   := 0;
+    self.loopTryMark := 0;
 
     self.includePath := 0;
     self.stdPath     := 0;

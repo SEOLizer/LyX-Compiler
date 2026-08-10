@@ -2,6 +2,38 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `finally` läuft auch beim vorzeitigen Verlassen des try-Blocks (#1148)
+
+`return` aus dem `try`-Block sprang direkt in den Epilog; der `finally`-Block
+wurde übersprungen und die Freigabe unterblieb lautlos:
+
+```lyx
+fn F(): int64 {
+    try { PrintLn("A"); return 1; } finally { PrintLn("F"); }
+    return 0;
+}
+// gab A, 1 aus — erwartet A, F, 1
+```
+
+**Auch `break` und `continue` waren betroffen** — der Issue hielt sie für in
+Ordnung, weil im dortigen Beispiel eine *andere* Schleifenrunde das erwartete
+`F` druckte. Drei Runden mit Abbruch in der zweiten liefern jetzt zwei
+finally-Läufe statt einem.
+
+**Zweite, unsichtbare Hälfte:** der beim `try` installierte Ausnahme-Handler
+blieb beim `return` stehen und zeigte danach in den Rahmen einer bereits
+verlassenen Funktion. Ein späterer `throw` sprang dorthin — im Test SIGSEGV
+bzw. `stack smashing detected`. Der Handler wird jetzt zurückgesetzt.
+
+Der Codegen führt dafür die offenen try-Blöcke der laufenden Funktion mit
+(`tryDepth`, je Ebene ein verdeckter Slot mit der jmp_buf-Basis und der
+finally-Knoten). `return` räumt alle ab, `break`/`continue` die, die der
+Sprung wirklich verlässt (`loopTryMark`, analog zu `loopDeferMark` aus #1006).
+Reihenfolge: von innen nach außen, defers des Blocks vor dem finally.
+
+`tests/finally_exit_test.sh`: 12 Prüfungen, 10 davon rot gegen den Vorstand.
+Kein Versionsbump; S3 == S4 unverändert.
+
 ### Compiler — `catch` bindet den geworfenen Wert (#1147)
 
 Der geworfene Wert war in **keiner** Schreibweise auslesbar; `catch` war damit
