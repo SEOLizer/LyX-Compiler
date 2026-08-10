@@ -44,8 +44,19 @@ while read -r line; do
   src="$ROOT/tests/$t.lyx"
   [ -f "$src" ] || { echo "FEHLT   $t (Datei nicht vorhanden)"; fail=$((fail+1)); continue; }
 
+  # #1150: `!compileonly` unter den Optionen heisst "uebersetzen, nicht
+  # ausfuehren". Gebraucht fuer Tests, die fuer ein ANDERES Ziel uebersetzen
+  # (win64, macos, arm64): ihr Ergebnis liesse sich hier nicht starten, ihr
+  # UEBERSETZEN ist aber genau das, was sie pruefen. Ohne die Moeglichkeit
+  # blieben sie entweder rot oder muessten geloescht werden — beides verliert
+  # die Abdeckung.
+  compileonly=0
+  case " $extra " in *" !compileonly "*) compileonly=1; extra="${extra//!compileonly/}" ;; esac
+
   if ! timeout 120 "$LYXC" $extra --std-path="$ROOT" "$src" -o "$TMP/b" >/dev/null 2>&1; then
     verdict=red; detail="uebersetzt nicht"
+  elif [ "$compileonly" -eq 1 ]; then
+    verdict=green; detail="uebersetzt (nicht ausgefuehrt)"
   else
     out=$(timeout 30 "$TMP/b" 2>&1); rc=$?
     # #1017: FAIL nur als MARKIERUNG am Zeilenanfang und GROSS geschrieben.

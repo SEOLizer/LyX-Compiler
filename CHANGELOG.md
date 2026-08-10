@@ -2,6 +2,45 @@
 
 ## Unveröffentlicht (develop)
 
+### Tests — 73 verrottete Alttests portiert, Vollsuite 286 → 362 grün (#1150, erster Teil)
+
+Der Altbestand unter `tests/regression/**` und `tests/feature_checks/**` war an
+der Sprache vorbeigealtert, weil ihn nie ein Ziel ausgeführt hat (sichtbar erst
+durch die rekursive Abdeckungsprüfung aus #1112). Von 140 roten Einträgen sind
+73 nachgezogen:
+
+- `print_str`/`print_int` → `Print` (19 Dateien), dazu `strlen`→`StrLen`,
+  `str_to_int`→`StrToInt`, `sleep_ms`→`Sleep`, `parse_lat`→`ParseLat`,
+  `str_length`→`StrLength`, `str_compare`→`StrEquals`
+- `extern fn` auf libc-Symbole → die heutigen Builtins (`exit`, `getpid`,
+  `open`/`write`/`close`/`unlink`, `PrintChar`, `Printf`). Sie waren an der
+  FFI-Sandbox gescheitert, die es bei ihrer Ablage noch nicht gab.
+- alte Schreibweisen: `fn(...) -> T` → `fn(...): T`, `type X := struct` →
+  `type X = struct`, Struktur-Literal als Wert → Variable + Feldzuweisungen
+  (das Literal gibt es nur als Muster, #1104), `};` nach Blöcken, `unit`-Kopf
+- **Exit-Code-Konvention**: 22 Tests trugen ihr Ergebnis im Rückgabewert
+  (`return sum;`). Der Suite-Runner urteilt nach der Ausgabe, ein Code ≠ 0/42
+  gilt ihm als rot — und ab 128 als Absturz, weshalb `return 142` als SIGSEGV
+  gezählt wurde. Sie prüfen den Wert jetzt und drucken `PASS`/`FAIL`.
+
+Neu im Runner: `!compileonly` unter den testeigenen Optionen. Damit bleiben
+die drei Fremdziel-Tests (win64, macOS) als Übersetzungsprüfung erhalten,
+statt gelöscht oder dauerhaft rot zu sein.
+
+Beim Portieren aufgefallen und getrennt aufgesetzt — es sind echte
+Compiler-Defekte, keine Testrottung:
+
+- **#1287** `extern fn` mit `@cap` auf unbekanntem FFI-Symbol: der Aufruf wird
+  still zum No-op, die Binary bleibt statisch (`_exit(42)` kehrt zurück).
+- **#1288** abstrakte Methode, in der Unterklasse ohne `override`
+  implementiert: der VMT-Slot bleibt 0, der Aufruf springt nach null.
+- **#1289** `append(arr, wert)` fällt in den Catch-all und nullt `rax`; das
+  Array bleibt uninitialisiert, `len`/Index stürzen ab. `push` ist in Ordnung.
+
+`tests/suite-broken.txt` führt die verbleibenden 63 Einträge weiter, jetzt
+nach Ursache gruppiert und mit dem Befund des letzten Laufs. #1150 bleibt
+offen, bis auch sie zugeordnet sind.
+
 ### Compiler — `panic` ist nicht mehr mit try/catch abfangbar (#1149)
 
 `panic` sprang in einen installierten Ausnahme-Handler. Ein umschließendes
