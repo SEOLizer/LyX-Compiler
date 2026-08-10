@@ -2,6 +2,37 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `catch` bindet den geworfenen Wert (#1147)
+
+Der geworfene Wert war in **keiner** Schreibweise auslesbar; `catch` war damit
+auf „ein Fehler ist aufgetreten" beschränkt. Drei Ausprägungen:
+
+- `catch (e: int64)` — die Form aus `ebnf.md` §12 — wies der Parser ab
+  (`expected ), got :`),
+- `catch (e)` parste, band aber nichts (`undefined symbol 'e'`),
+- gab es außen ein gleichnamiges `e`, **übersetzte es und lief** — und las
+  still dessen alten Wert. Der Repro gab `0` aus statt `5`.
+
+Der Parser las den Bezeichner und warf ihn weg (`// currently just consumes
+type name`). Jetzt trägt `NK_CATCH` den Namen in `sVal` und die Typangabe in
+`c1`; sema legt für den catch-Block einen eigenen Gültigkeitsbereich an und
+bindet den Namen darin; der Codegen gibt der Bindung einen Stack-Slot und
+schreibt den geworfenen Wert (aus `CG_EXN_VAL`) hinein. Eine gleichnamige
+äußere Variable ist im Rumpf verdeckt und danach wieder sichtbar.
+
+Ohne Typangabe gilt `int64` — der geworfene Wert ist das rohe Maschinenwort.
+Ein unbekannter Typ in der Klausel wird gemeldet.
+
+**Die Typangabe wählt nicht aus.** Der geworfene Wert trägt keine
+Typkennung; mehrere `catch`-Klauseln liefen deshalb bisher **alle
+nacheinander**. Das wird jetzt gemeldet statt still getan — die neue
+Typangabe legt die Auswahl sonst erst recht nahe.
+
+`tests/catch_binding_test.sh`: 13 Prüfungen. `tests/feature_checks/exceptions/
+test_try_catch` ist von `suite-broken.txt` nach `suite-full.txt` gewandert
+(Vollsuite 285 → 286 grün). `ebnf.md` §12 nachgezogen: Typangabe optional,
+`finally` ergänzt, keine Auswahl. Kein Versionsbump; S3 == S4 unverändert.
+
 ### Compiler — `self` als Parametername wird gemeldet statt zu segfaulten (#1144)
 
 `self` ist in Lyx der **implizite** Empfänger einer Methode. Als Variablenname
