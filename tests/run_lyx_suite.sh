@@ -28,6 +28,12 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # Bekannt rote Tests: sie laufen mit, ihr Fehlschlag bricht den Lauf aber nicht
 # ab. Jeder Eintrag braucht ein Issue — sonst verschwindet er hier lautlos.
 declare -A KNOWN_RED=(
+  # #1299: Array-Literal als globaler Startwert wird nicht initialisiert. Bis
+  # 1.0.15C uebersetzte der Test und druckte 0/0/0 statt 10/20/30 — gruen war er
+  # nur, weil dieser Runner die Ausgabe nicht gegen eine Erwartung prueft. Seit
+  # #1164 meldet der Compiler den nicht ausrechenbaren Startwert, statt ihn
+  # stillschweigend zu verwerfen; damit ist der Test ehrlich rot.
+  [regression/arrays/test_global_array]="#1299 globales Array-Literal wird nicht initialisiert"
 )
 
 pass=0; fail=0; known=0; failed_names=""

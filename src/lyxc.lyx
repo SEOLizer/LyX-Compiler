@@ -492,6 +492,9 @@ pub type CompilerConfig = class {
   // Compilation state
   exitCode: int64;
   earlyExit: bool;
+  // #1163: unbekannter Schalter oder ungueltiger Wert auf der Kommandozeile.
+  // Der Lauf bricht danach ab, statt etwas anderes zu bauen als gemeint.
+  badArg: bool;
   errorCount: int64;
   warningCount: int64;
   codeSize: int64;
@@ -587,6 +590,7 @@ pub type CompilerConfig = class {
     self.daaWarn       := 0;  // WP-AS-15: off by default
     self.exitCode := 0;
     self.earlyExit := false;
+    self.badArg := false;
     self.errorCount := 0;
     self.warningCount := 0;
     self.unitCache := map_new(32);
@@ -691,6 +695,13 @@ pub type CompilerConfig = class {
       i += 1;
     }
 
+    // #1163: Ein beanstandetes Argument beendet den Lauf, statt etwas
+    // anderes zu bauen als gemeint. Vor earlyExit geprueft, damit ein
+    // Tippfehler neben --help nicht doch noch als Erfolg endet.
+    if self.badArg {
+      self.exitCode := 2;
+      return false;
+    }
     // Validate required options
     if self.earlyExit {
       return false;
@@ -964,8 +975,36 @@ pub type CompilerConfig = class {
 
     // CLI P2: --target-energy=N
     if StrStartsWith(arg, "--target-energy=") {
+      // #1163: Derselbe Wert als Attribut (`@energy(9)`) wird sauber
+      // abgewiesen; ueber das Flag fiel er still auf einen Default zurueck.
+      // Die Pruefung gab es also schon, sie lief nur auf dem CLI-Pfad nicht.
       var val: int64 := arg + 16;
-      self.targetEnergy := ParseInt(val);
+      var vp:  pchar := val as pchar;
+      var vlen: int64 := StrLen(vp);
+      var ok: int64 := 1;
+      if vlen == 0 { ok := 0; }
+      var vi: int64 := 0;
+      while vi < vlen {
+        var vc: int64 := peek8(val + vi);
+        if vc < 48 || vc > 57 { ok := 0; }
+        vi += 1;
+      }
+      if ok == 0 {
+        EPrintStr("lyxc: --target-energy erwartet eine Zahl 1..5, nicht '"c);
+        sys_write(2, val, vlen);
+        EPrintStrLn("'"c);
+        self.badArg := true;
+        return;
+      }
+      var lvl: int64 := ParseInt(val);
+      if lvl < 1 || lvl > 5 {
+        EPrintStr("lyxc: --target-energy: Stufe ausserhalb 1..5: '"c);
+        sys_write(2, val, vlen);
+        EPrintStrLn("'"c);
+        self.badArg := true;
+        return;
+      }
+      self.targetEnergy := lvl;
       return;
     }
 
@@ -1135,7 +1174,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.0.15C"c);
+      PrintStrLn("1.0.15D"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1157,7 +1196,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.0.15C"c);
+      PrintStrLn("1.0.15D"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1227,6 +1266,16 @@ pub type CompilerConfig = class {
       self.noLicense := true;
       return;
     }
+    // #1163: Bis 1.0.15C endete diese Kette ohne Zweig — ein unbekanntes
+    // Langflag wurde stillschweigend verschluckt und der Bau lief mit Exit 0
+    // weiter. `--voellig-erfunden` und ein vertipptes echtes Flag waren damit
+    // nicht zu unterscheiden. Auch `--energy-stats` aus guides/ fiel hier
+    // durch, weshalb der Fehler in der Doku nie auffiel.
+    EPrintStr("lyxc: unbekannter Schalter '"c);
+    sys_write(2, arg, argLen);
+    EPrintStrLn("'"c);
+    EPrintStrLn("  `lyxc --help` listet die gueltigen Schalter."c);
+    self.badArg := true;
   }
   
   fn parseShortFlags(arg: int64, argLen: int64): void {
@@ -1245,7 +1294,14 @@ pub type CompilerConfig = class {
           self.optLevel := OPT_O2;
         } else if level == 51 {  // '3'
           self.optLevel := OPT_O3;
+        } else {
+          // #1163: -O ohne Stufe oder mit einer, die es nicht gibt.
+          EPrintStrLn("lyxc: -O erwartet eine Stufe 0..3"c);
+          self.badArg := true;
         }
+        // Die Stufe gehoert zum Schalter — sonst laeuft die Ziffer gleich
+        // darauf als eigenes, unbekanntes Zeichen durch die Pruefung.
+        if level >= 48 && level <= 51 { i += 1; }
       } else if c == 118 {  // 'v'
         self.enableVerbose := true;
       } else if c == 100 {  // 'd'
@@ -1254,23 +1310,47 @@ pub type CompilerConfig = class {
         self.enableLint := true;
       } else if c == 71 {  // 'g'
         self.enableDebug := true;
-      } else if c == 119 {  // 'W'
+      } else if c == 111 {  // 'o'
+        // #1163: `-o` selbst traegt keinen Zustand — die Ausgabedatei folgt
+        // als eigenes Argument und wird von der Positionslogik aufgenommen.
+        // Hier steht der Fall nur, damit die Pruefung unten ihn nicht als
+        // unbekannt meldet.
+        i += 0;
+      } else if c == 119 {  // 'w'
+        var wOk: int64 := 0;
         if i + 1 < argLen {
           var next: int64 := peek8(arg + i + 1);
           if next == 101 {  // 'e'
             self.warningsAsErrors := true;
+            wOk := 1;
           } else if next == 97 {  // 'a'
             self.warnAll := true;
+            wOk := 1;
           }
         }
+        if wOk == 0 {
+          EPrintStrLn("lyxc: -w erwartet 'a' (alle Warnungen) oder 'e' (Warnungen als Fehler)"c);
+          self.badArg := true;
+        } else {
+          i += 1;   // den verbrauchten Buchstaben ueberspringen
+        }
+      } else {
+        // #1163: Bis 1.0.15C wurde jedes unbekannte Zeichen stillschweigend
+        // verschluckt — `-Xyz` uebersetzte klaglos und mit Exit 0. Wer sich
+        // vertippt, bekam ein Binary, das anders uebersetzt wurde als
+        // beabsichtigt, ohne es zu merken.
+        EPrintStr("lyxc: unbekannter Schalter '-"c);
+        sys_write(2, arg + i, 1);
+        EPrintStrLn("'"c);
+        self.badArg := true;
       }
-      
+
       i += 1;
     }
   }
   
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.0.15C (bootstrap)");
+    PrintStrLn("lyxc 1.0.15D (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -4671,7 +4751,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.0.15C — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.0.15D — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
