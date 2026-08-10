@@ -3252,6 +3252,35 @@ pub type Codegen = class {
     return 0;
   }
 
+  // #1212: Ganzzahl in rax nach IEEE-754 double wandeln (cvtsi2sd + movq
+  // zurueck). Dieselbe Folge wie im Cast-Pfad `x as f64` — hier als eigene
+  // Funktion, weil die gemischte Arithmetik sie an zwei Stellen braucht.
+  fn cg_emitRaxIntToF64() {
+    self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xC0); // cvtsi2sd xmm0, rax
+    self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0); // movq rax, xmm0
+  }
+
+  // #1212: dasselbe fuer rbx (die linke Seite liegt dort, siehe cg_popRbx).
+  fn cg_emitRbxIntToF64() {
+    self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xC3); // cvtsi2sd xmm0, rbx
+    self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC3); // movq rbx, xmm0
+  }
+
+  // #1212: Gemischte Arithmetik. Ist EINE Seite f64, wurde bisher einfach die
+  // f64-Operation emittiert — die ganzzahlige Seite ging dabei als Bitmuster
+  // eines double in die Rechnung. `10 - 2.5` ergab -1.75, `2.5 + 10` ergab
+  // 2.5, `7.0 / 2` ergab 0.0: stille Falschrechnung in jeder Formel, die
+  // beide Arten mischt. Die ganzzahlige Seite wird jetzt gewandelt.
+  //
+  // Aufzurufen NACH `cg_popRbx` (lhs in rbx, rhs in rax) und VOR
+  // cg_emitF64BinOp.
+  fn cg_emitMixedToF64(lhsNi: int64, rhsNi: int64) {
+    var lF: int64 := self.cg_isF64Expr(lhsNi);
+    var rF: int64 := self.cg_isF64Expr(rhsNi);
+    if (lF != 0 && rF == 0) { self.cg_emitRaxIntToF64(); }
+    if (rF != 0 && lF == 0) { self.cg_emitRbxIntToF64(); }
+  }
+
   // Operator overloading: the method name a binary operator maps to, or 0 if the
   // operator has no overload. + Add, - Sub, * Mul, / Div, % Mod, == Eq, != Ne,
   // < Lt, <= Le, > Gt, >= Ge. (Index [] → Get is handled on CGN_INDEX.)
@@ -6271,16 +6300,32 @@ pub type Codegen = class {
         self.cg_pushRax();
         self.cg_genExpr(rhsNi);
         self.cg_popRbx();
-        self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi),
-                          self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi));
+        // #1212: Dieser Schnellpfad emittierte immer die GANZZAHL-Operation,
+        // auch wenn die andere Seite ein f64 ist — `10 - 2.5` subtrahierte
+        // ganzzahlig auf dem Bitmuster des double. cg_tryFold liefert nur
+        // ganzzahlige Konstanten, die linke Seite ist hier also stets int.
+        if (self.cg_isF64Expr(rhsNi) != 0) {
+          self.cg_emitMixedToF64(lhsNi, rhsNi);
+          self.cg_emitF64BinOp(op);
+        } else {
+          self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi),
+                            self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi));
+        }
       } else if (op != CGT_AND && op != CGT_OR && self.cg_tryFold(rhsNi) != 0) {
         // CSE: RHS is constant → eval LHS into rax, mov rbx,rax, load const (no push/pop)
         var rhsVal: int64 := self.foldBuf;
         self.cg_genExpr(lhsNi);
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);  // mov rbx, rax
         self.cg_movRaxImm(rhsVal);
-        self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi),
-                          self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi));
+        // #1212: dieselbe Luecke mit vertauschten Rollen — `2.5 + 10` liess
+        // den ganzzahligen Summanden unbeachtet und ergab 2.5.
+        if (self.cg_isF64Expr(lhsNi) != 0) {
+          self.cg_emitMixedToF64(lhsNi, rhsNi);
+          self.cg_emitF64BinOp(op);
+        } else {
+          self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi),
+                            self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi));
+        }
       } else if (self.cg_tryClassBinop(ni) != 0) {
         // operator overloading: a.Op(b) for a class-typed left operand — emitted
         // by cg_tryClassBinop (result already in rax).
@@ -6359,6 +6404,7 @@ pub type Codegen = class {
           self.cg_genExpr(rhsNi);
           self.cg_popRbx();
           if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
+            self.cg_emitMixedToF64(lhsNi, rhsNi);   // #1212
             self.cg_emitF64BinOp(op);
           } else {
             self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi),
@@ -6372,6 +6418,7 @@ pub type Codegen = class {
         self.cg_genExpr(rhsNi);
         self.cg_popRbx();
         if self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0 {
+          self.cg_emitMixedToF64(lhsNi, rhsNi);   // #1212
           self.cg_emitF64BinOp(op);
         } else {
           self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi),
