@@ -465,6 +465,23 @@ FnPtrParam          = [ Ident ":" ] Type ;   (* Parametername optional *)
 
 MapType             = "Map" "<" Type "," Type ">" ;
 
+(* Seit #1152/#1205 ein benutzbarer Typ, nicht nur ein Wort: das Literal
+   `{k: v, ...}` legt an, `m[k]` liest, `m[k] := v` schreibt (legt an oder
+   aktualisiert), `k in m` prueft, `len(m)` zaehlt. Eine Deklaration OHNE
+   Initialisierung ist ebenfalls benutzbar — sie legt eine leere Map an.
+   Ein fehlender Schluessel liefert 0.
+
+   SCHLUESSELTYP: nur ganzzahlig (und `bool`). Die Laufzeit vergleicht den
+   Schluessel als Zahl; bei `pchar` waere das die ADRESSE, und gleich
+   geschriebene Literale haben verschiedene Adressen. `Map<pchar, V>` wird
+   deshalb bei der Deklaration abgewiesen — siehe #1291.
+
+   Bis 1.0.15A war nichts davon nutzbar: Lesen lieferte still eine Adresse,
+   Schreiben stuerzte ab, `in` war immer falsch. Die falschen WERTE kamen aus
+   dem Parser — `{5: 100}` verlor den Doppelpunkt an die Format-Schreibweise
+   `expr:breite` (§13) und wurde zur MENGE, deren Zweig jeden Wert auf 1 setzt.
+   NICHT umgesetzt sind `delete m[k]` und `for k, v in m` (#1152). *)
+
 (* `Set` ist als Wort reserviert, `Set<T>` wird von der Semantikpruefung aber
    nicht aufgeloest ("unknown type in var decl"). Die Form ist fuer spaeter
    vorgesehen und hier bewusst nicht als gueltige Produktion gefuehrt. *)
@@ -1340,6 +1357,7 @@ Einzelbefunde sind dort verlinkt.
 |---|---|---|
 | Bindendes Muster | 14 | `case x =>` (jeden Wert annehmen und an den Namen binden) ist **nicht umgesetzt und auch nicht vorgesehen**. Ein blanker Bezeichner ist ein VERWEIS auf eine Konstante, ein Enum-Mitglied oder eine lokale Variable; beide Lesarten zugleich gehen nicht, und auf der Verweis-Lesart beruhen die Enum-Muster. Wer jeden Wert annehmen will, schreibt `case _`. (#1024) |
 | `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
+| `Map<K,V>` | 14 | Benutzbar seit 1.0.15A (#1152/#1205): Literal, `m[k]` lesen und schreiben, `k in m`, `len(m)`, Deklaration ohne Initialisierung. Schluessel nur ganzzahlig — ein `pchar`-Schluessel wuerde ueber die Adresse verglichen und wird abgewiesen (#1291). Ein fehlender Schluessel liefert 0. `delete m[k]` und `for k, v in m` gibt es nicht. |
 | `&x` (Adress-Operator) | 15 | Gibt es nicht. Ein Ausgabeparameter wird als Zelle uebergeben (`alloc(8)`, danach `peek64`). (#1061) |
 | Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
 | Nullable-Suffix, Pruefung | 7 | `T?` wird geparst und am Typknoten vermerkt, loest aber KEINE zusaetzliche Pruefung aus: ein nicht-nullbarer Typ nimmt weiterhin `null` an, und ein nullbarer wird ohne `?.` ungeprueft dereferenziert. Das Suffix dokumentiert die Absicht, es erzwingt sie nicht. `?.` dagegen prueft zur Laufzeit. (#1092) |

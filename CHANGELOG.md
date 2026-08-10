@@ -2,6 +2,40 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `Map<K,V>` ist ein benutzbarer Sprachtyp (#1152, #1205)
+
+`Map<K,V>` wurde geparst, das Literal übersetzte, und **keine** Operation
+arbeitete richtig: `m[k]` lieferte still eine Adresse, `m[k] := v`
+segfaultete ohne Meldung, `k in m` war immer falsch, eine Deklaration ohne
+Initialisierung ließ den Slot null. Das war der schlechteste Mittelweg —
+Code übersetzt, läuft, liefert falsche Werte.
+
+**Die Richtung ist entschieden** (die Frage aus #1205): `Map<K,V>` ist ein
+Sprachtyp, nicht nur ein reserviertes Wort. Umgesetzt sind Literal,
+`m[k]` lesen und schreiben (anlegen wie aktualisieren), `k in m`, `len(m)`
+und die Deklaration ohne Initialisierung; ein fehlender Schlüssel liefert 0.
+Die Laufzeit dafür (`_lyx_map_*`, open addressing) gab es längst — sie war
+nur an nichts angeschlossen.
+
+**Die falschen Werte kamen aus dem Parser.** `{5: 100}` verlor den
+Doppelpunkt an die Format-Schreibweise `expr:breite` (WP-BC-13): der Schlüssel
+wurde zu `5:100`, das Literal damit zur **Menge** mit einem Element — und
+deren Zweig setzt jeden Wert auf 1. Genau deshalb las `m[5]` eine 1 statt 100.
+Der Schlüssel eines `{...}`-Literals wird jetzt ohne Format-Suffix gelesen;
+außerhalb bleibt die Formatangabe unverändert.
+
+**Schlüsseltyp nur ganzzahlig.** Die Laufzeit vergleicht den Schlüssel als
+Zahl; bei `pchar` wäre das die Adresse, und gleich geschriebene Literale haben
+verschiedene Adressen — `m["Alpha"]` fände seinen eigenen Eintrag nicht.
+`Map<pchar, V>` wird deshalb bei der Deklaration abgewiesen statt still
+danebenzugreifen; der Inhaltsvergleich ist als #1291 aufgesetzt.
+Nicht umgesetzt bleiben `delete m[k]` und `for k, v in m`.
+
+`tests/map_type_test.sh`: 14 Prüfungen, 13 davon rot gegen den Vorstand.
+`tests/in_range_test.sh` trug den Defekt als Sollwert (`in` auf einer Map
+erwartete `nein`) und ist nachgezogen. `ebnf.md` §7 und die Tabelle in §20.1
+beschreiben jetzt den tatsächlichen Stand. Kein Versionsbump; S3 == S4.
+
 ### Tests — 73 verrottete Alttests portiert, Vollsuite 286 → 362 grün (#1150, erster Teil)
 
 Der Altbestand unter `tests/regression/**` und `tests/feature_checks/**` war an
