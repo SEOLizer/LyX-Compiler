@@ -3480,6 +3480,22 @@ pub type Codegen = class {
   // OOP support: class layout table and local type tracking
   // ------------------------------------------------------------------
 
+  // #1152/#1205: Ist `node` eine lokale Variable vom Typ Map<K,V>?
+  // Der Typname steht bereits in localTypes — NK_TYPE_NAME traegt "Map" als
+  // sVal, CGN_VAR_DECL uebernimmt ihn wie jeden anderen Typnamen. Damit
+  // braucht die Unterscheidung kein eigenes Flag-Feld.
+  fn cg_localIsMap(node: int64): int64 {
+    if (node < 0) { return 0; }
+    if (self.cg_nkind(node) != CGN_IDENT) { return 0; }
+    var li: int64 := self.cg_findLocalIdx(self.cg_nsval(node), self.cg_nslen(node));
+    if (li < 0) { return 0; }
+    var tb: int64 := self.localTypes + li * CG_LOCTYPE_SZ;
+    var tp: pchar := peek64(tb) as pchar;
+    var tn: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+    if (tn == 3 && self.cg_seq(tp, tn, "Map", 3)) { return 1; }
+    return 0;
+  }
+
   fn cg_setLocalType(idx: int64, typePtr: pchar, typeLen: int64) {
     var base: int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
     poke64(base,     typePtr as int64);
@@ -6255,6 +6271,18 @@ pub type Codegen = class {
     } else if (k == CGN_INDEX && self.cg_tryClassIndex(ni) != 0) {
       // operator overloading: base[idx] → base.Get(idx) for a class-typed base
       // (emitted by cg_tryClassIndex; result in rax).
+    } else if (k == CGN_INDEX && self.cg_localIsMap(self.cg_nc0(ni)) != 0) {
+      // #1152: m[k] auf einer Map liest ueber _lyx_map_get. Bis 1.0.15A lief
+      // der Zugriff durch den Array-Zweig: er nahm den Map-Zeiger als
+      // Array-Basis und lieferte still eine ADRESSE statt des Wertes.
+      self.cg_genExpr(self.cg_nc1(ni));                        // rax = key
+      self.cg_pushRax();
+      self.cg_genExpr(self.cg_nc0(ni));                        // rax = map
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+      self.cg_e8(0x5E);                                        // pop rsi (key)
+      var ppMG: int64 := self.cg_emitCall();
+      poke32(self.code + ppMG, CG_H_MAP_GET - ppMG - 4);
+
     } else if (k == CGN_INDEX) {
       // arr[i]: nc0=arr, nc1=index
       // Eval index first, push; then eval arr; pop index into rbx
@@ -7713,6 +7741,14 @@ pub type Codegen = class {
     } else if (self.cg_seq(fname, fnlen, "len", 3)) {
       // len(arr): compile-time size for fixed/literal arrays; runtime [arr+8] for dynamic
       var lenArgNi: int64 := self.cg_nc0(ni);
+      // #1152: eine Map traegt ihre Laenge im selben Feld wie das dynamische
+      // Array ([ptr+8]), nur ohne Groessenvermerk am Local. Ohne diesen Zweig
+      // fiel `len(m)` in den Zweig "nicht gefunden" und lieferte still 0.
+      if (self.cg_localIsMap(lenArgNi) != 0) {
+        self.cg_genExpr(lenArgNi);
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(0x08); // mov rax,[rax+8]
+        return;
+      }
       if (lenArgNi >= 0 && self.cg_nkind(lenArgNi) == CGN_IDENT) {
         var aname: pchar := self.cg_nsval(lenArgNi);
         var anlen: int64 := self.cg_nslen(lenArgNi);
@@ -10157,6 +10193,16 @@ pub type Codegen = class {
       if (init < 0 && peek8(self.localIsArray + localIdx) != 0
           && peek64(self.localArraySize + localIdx * 8) == 0) { dynNoInit := 1; }
 
+      // #1152: dasselbe fuer eine Map ohne Initialisierung. `var m: Map<int64,
+      // int64>;` liess den Slot null, und der erste Schreibzugriff traf die
+      // Null. Es gab auch keine Form, die das haette heilen koennen: `new
+      // Map<...>()` weist der Parser ab, ein Modul std.map existiert nicht.
+      var mapNoInit: int64 := 0;
+      if (init < 0 && typeNode >= 0 && self.cg_nkind(typeNode) == 60
+          && self.cg_seq(self.cg_nsval(typeNode), self.cg_nslen(typeNode), "Map"c, 3)) {
+        mapNoInit := 1;
+      }
+
       if (init >= 0) {
         // #1106: `var m: TM := f.Handle;` muss binden, nicht laden. Der Fall
         // gab es bisher nur fuer FELDER — als lokale Variable uebersetzte er
@@ -10167,6 +10213,12 @@ pub type Codegen = class {
         } else {
           self.cg_genExpr(init);
         }
+      } else if (mapNoInit != 0) {
+        // #1152: leere Map mit derselben Anfangskapazitaet wie das Literal.
+        self.cg_movRaxImm(16);
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+        var ppMNv: int64 := self.cg_emitCall();
+        poke32(self.code + ppMNv, CG_H_MAP_NEW - ppMNv - 4);
       } else if (dynNoInit != 0) {
         // #1177: leeres dynamisches Array — dieselbe Struktur, die `push`
         // sonst beim ersten Aufruf anlegt (cap=1024, len=0). `push` findet den
@@ -10415,6 +10467,22 @@ pub type Codegen = class {
         } else if (foff > 127) {
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xB0); self.cg_e32(foff);
         }
+      } else if (self.cg_nkind(lhs) == CGN_INDEX && self.cg_localIsMap(self.cg_nc0(lhs)) != 0) {
+        // #1152: m[k] := v schreibt ueber _lyx_map_set. Bis 1.0.15A nahm der
+        // Array-Zweig den Map-Zeiger als Basis und schrieb an map+16+k*8 —
+        // das war der SIGSEGV ohne Meldung.
+        self.cg_genExpr(rhs);                                    // rax = Wert
+        self.cg_pushRax();
+        self.cg_genExpr(self.cg_nc1(lhs));                       // rax = Schluessel
+        self.cg_pushRax();
+        self.cg_genExpr(self.cg_nc0(lhs));                       // rax = Map
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+        self.cg_e8(0x5E);                                        // pop rsi (Schluessel)
+        self.cg_e8(0x5A);                                        // pop rdx (Wert)
+        var ppMSt: int64 := self.cg_emitCall();
+        poke32(self.code + ppMSt, CG_H_MAP_SET - ppMSt - 4);
+        return;
+
       } else if (self.cg_nkind(lhs) == CGN_INDEX) {
         // arr[i] := rhs — three-way dispatch (same as CGN_INDEX read)
         self.cg_genExpr(rhs);              // rax = value

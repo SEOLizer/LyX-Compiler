@@ -283,6 +283,9 @@ test: lyxc
 	@echo "--- Typen der binaeren Operatoren + Print (28 Pruefungen) ---"
 	@bash tests/binop_types_test.sh
 	@echo "OK"
+	@echo "--- Map<K,V> als Sprachtyp (14 Pruefungen) ---"
+	@bash tests/map_type_test.sh
+	@echo "OK"
 	@echo "--- panic ist nicht fangbar (10 Pruefungen) ---"
 	@bash tests/panic_uncatchable_test.sh
 	@echo "OK"

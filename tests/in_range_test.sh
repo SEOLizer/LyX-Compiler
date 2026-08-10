@@ -188,12 +188,18 @@ fn main(): int64 {
 }" '321'
 
 # Steht rechts von `in` kein Bereich, gilt weiter die Woerterbuch-Zugehoerigkeit.
+# #1152: der Fall stand hier bis 1.0.15A mit einem pchar-Schluessel und der
+# Erwartung 'nein' — also mit dem DEFEKT als Sollwert: `in` war auf einer Map
+# immer falsch. Beides ist behoben: `in` antwortet richtig, und ein
+# pchar-Schluessel wird abgewiesen (die Laufzeit vergliche Adressen, #1291).
 out "Woerterbuch-Zugehoerigkeit unveraendert" "$K
 fn main(): int64 {
-    var m: Map<pchar, int64> = {\"a\": 1};
-    if (\"a\"c in m) { PrintStrLn(\"ja\"c); } else { PrintStrLn(\"nein\"c); }
+    var m: Map<int64, int64> = {7: 1};
+    if (7 in m) { PrintStrLn(\"ja\"c); } else { PrintStrLn(\"nein\"c); }
+    if (8 in m) { PrintStrLn(\"ja\"c); } else { PrintStrLn(\"nein\"c); }
     return 0;
-}" 'nein'
+}" 'ja
+nein'
 
 # `for ... in` ohne Bereich und ohne range() meldet, statt etwas zu raten.
 fails "for in ohne Bereich meldet" "$K
