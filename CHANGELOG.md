@@ -2,6 +2,39 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `self` als Parametername wird gemeldet statt zu segfaulten (#1144)
+
+`self` ist in Lyx der **implizite** Empfänger einer Methode. Als Variablenname
+wies der Parser ihn seit BUG-8 zurück, als Parametername ließ er ihn durch:
+
+```lyx
+type P = class {
+    a: int64;
+    fn Get(self: P): int64 { return self.a; }   // Exit 139, ohne Meldung
+};
+```
+
+Der Parameter verdeckte die Bindung, jeder Feldzugriff griff ins Leere, das
+Programm starb mit SIGSEGV — schweigend. Der Fall trifft alle, die die
+Signatur aus Python oder Rust übernehmen. Jetzt:
+
+```
+Parse error: 'self' is a reserved keyword and cannot be used as a parameter name
+```
+
+Die Prüfung sitzt an beiden Stellen: im Parser (`_parseParam`) und in sema
+(`_checkFuncDecl`, Parameter-Registrierung), damit sie auch dann greift, wenn
+die Deklaration nicht über den Parser kommt.
+
+**Zu `super`,** das im Issue mitvermutet wurde: der Defekt besteht dort nicht.
+`super` ist ein eigener Token-Typ, den `Expect(TK_IDENT)` in der
+Parameterliste bereits abweist. `tests/self_param_test.sh` hält das fest,
+damit ein späterer Umbau zum weichen Schlüsselwort die Lücke nicht unbemerkt
+aufreißt.
+
+`tests/self_param_test.sh`: 12 Prüfungen. Kein Versionsbump, keine
+Codegen-Änderung (S3 == S4 unverändert).
+
 ### Compiler — Print druckt Verkettungen als Text, Operatoren prüfen ihre Typen (#1143)
 
 **Zur Prämisse des Issues.** `"a" + "b"` verkettet — und zwar richtig. Der
