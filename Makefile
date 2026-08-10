@@ -283,6 +283,9 @@ test: lyxc
 	@echo "--- Typen der binaeren Operatoren + Print (28 Pruefungen) ---"
 	@bash tests/binop_types_test.sh
 	@echo "OK"
+	@echo "--- 'self'/'super' als Parametername (12 Pruefungen) ---"
+	@bash tests/self_param_test.sh
+	@echo "OK"
 	@echo "--- Linter meldet lesbar (14 Pruefungen) ---"
 	@bash tests/lint_output_test.sh
 	@echo "OK"
