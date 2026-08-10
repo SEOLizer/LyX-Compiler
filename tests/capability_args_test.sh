@@ -87,10 +87,12 @@ rejects "gueltiger Name, Wert ausserhalb des Bereichs" \
 $M" "Pin außerhalb"
 
 # --- 2. Gueltige Namen werden als folgenlos gemeldet ----------------------
-warns "path an fs.read" \
-  "@capabilities([fs.read(path: \"/tmp\"), system.exit])
-$M" "NICHT durchgesetzt"
-
+#
+# #1173: `path:` an einer fs-Capability wird inzwischen DURCHGESETZT — der
+# Codegen legt je genanntem Pfad eine eigene Landlock-Regel an. Die Warnung
+# waere dort jetzt selbst falsch und ist deshalb entfallen; gemessen wird sie
+# hier nur noch fuer die Argumente, die weiterhin folgenlos sind. Den
+# Laufzeitnachweis fuehrt tests/caps_ffi_inference_test.sh.
 warns "pin an hardware.gpio" \
   "@capabilities([hardware.gpio(pin: 4)])
 $M" "NICHT durchgesetzt"
