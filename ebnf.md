@@ -771,9 +771,16 @@ MatchExpr           = MatchStmt ;
 
 TryStmt             = "try"
                       Block
-                      "catch"
-                      "(" Ident ":" Type ")"
-                      Block ;
+                      [ "catch" [ "(" Ident [ ":" Type ] ")" ] Block ]
+                      [ "finally" Block ] ;
+(* - Die Bindung ist seit #1147 lesbar: `catch (e: int64)` legt `e` im
+     catch-Block an und traegt den geworfenen Wert. Sie verdeckt eine
+     gleichnamige aeussere Variable NUR im Rumpf. Bis 1.0.15A wies der Parser
+     die Typangabe ab und band den Bezeichner nicht.
+   - Die Typangabe darf fehlen; der geworfene Wert ist dann `int64` (das rohe
+     Maschinenwort).
+   - Sie WAEHLT NICHT AUS: der Wert traegt keine Typkennung. Mehr als eine
+     catch-Klausel wird deshalb gemeldet statt still nacheinander ausgefuehrt. *)
 
 ThrowStmt           = "throw" Expr ";" ;
 
