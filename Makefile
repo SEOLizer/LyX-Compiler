@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.15B
+VERSION   := 1.0.15C
 VERSION_DATE := 2026-08-10
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -381,6 +381,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Array-Felder und Laenge (11 Pruefungen) ---"
 	@bash tests/array_field_len_test.sh
+	@echo "OK"
+	@echo "--- Einheitentypen, @if und @energy (18 Pruefungen) ---"
+	@bash tests/units_atif_energy_test.sh
 	@echo "OK"
 	@echo "--- TextMate-Grammatik: Schluesselwoerter und Typen vollstaendig ---"
 	@bash tests/syntax/test_grammar.sh

@@ -669,6 +669,12 @@ pub type Codegen = class {
   // WP-EN-01: energy levels — 0 = not set (codegen will default to 3)
   globalEnergyLevel: int64;  // from CLI --target-energy
   fnEnergyLevel:     int64;  // effective for current function
+  // #1162: `@energy(N);` als Direktive vor/zwischen den Deklarationen. Auf
+  // oberster Ebene nimmt der Parser diese Schreibweise als eigenen Knoten,
+  // nicht als Annotation der folgenden fn — der Wert ging deshalb verloren,
+  // sobald genFunc die Stufe neu bestimmte. Er steht hier als Quelltext-Stand
+  // und schlaegt das CLI-Flag; 0 = nicht gesetzt.
+  scopeEnergyLevel:  int64;
 
   // WP-AS-04/05: @bounds_check / @debug_info / @optimization_level scope flags
   boundsCheckEnabled: int64;  // 1=on (default 1), 0=off
@@ -2362,6 +2368,100 @@ pub type Codegen = class {
 
   // WP-11: Parse float literal string src[off..off+len) to IEEE 754 double bits.
   // Handles: N, N.M, N[eE][+-]P format.
+  // #1158: Umrechnungsfaktor eines Einheitentyps als BRUCH.
+  //
+  // cg_parseFloat liefert IEEE-Bits; die Umrechnung rechnet aber ganzzahlig,
+  // und ein Faktor wie `0.017453` (Grad in Radiant) laesst sich als int64 gar
+  // nicht ausdruecken. Hier entsteht deshalb Zaehler und Nenner: `1000.0`
+  // wird 1000/1, `0.017453` wird 17453/1000000.
+  //
+  // Rueckgabe ist der Zaehler, der Nenner landet in denBox. Ein Ausdruck, den
+  // diese Funktion nicht vollstaendig liest, ergibt 0 — der Aufrufer meldet
+  // das, statt stillschweigend mit 1 weiterzurechnen (bis 1.0.15B fiel jeder
+  // Float-Faktor genau so auf 1 zurueck und blieb damit wirkungslos).
+  fn cg_parseFactorRatio(src: pchar, off: int64, len: int64, denBox: int64): int64 {
+    poke64(denBox, 1);
+    var i:   int64 := off;
+    var end: int64 := off + len;
+    if (i < end && StrCharAt(src, i) == 45) { return 0; }   // negative Faktoren: sinnlos
+    var num: int64 := 0;
+    var den: int64 := 1;
+    var seen: int64 := 0;
+    while (i < end) {
+      var ic: int64 := StrCharAt(src, i);
+      if (ic == 95) { i += 1; }
+      else if (ic >= 48 && ic <= 57) {
+        if (num > 900000000000000) { return 0; }   // zu gross: lieber melden
+        num := num * 10 + ic - 48;
+        seen := 1;
+        i += 1;
+      } else { break; }
+    }
+    if (i < end && StrCharAt(src, i) == 46) {
+      i += 1;
+      while (i < end) {
+        var fc: int64 := StrCharAt(src, i);
+        if (fc == 95) { i += 1; }
+        else if (fc >= 48 && fc <= 57) {
+          if (num > 900000000000000 || den > 100000000000000) { return 0; }
+          num := num * 10 + fc - 48;
+          den := den * 10;
+          seen := 1;
+          i += 1;
+        } else { break; }
+      }
+    }
+    // Zehnerexponent: `1e3` und `1.5e-3` sind gueltige Zahlliterale (§1).
+    if (i < end && (StrCharAt(src, i) == 101 || StrCharAt(src, i) == 69)) {
+      i += 1;
+      var eNeg: int64 := 0;
+      if (i < end && StrCharAt(src, i) == 45) { eNeg := 1; i += 1; }
+      else if (i < end && StrCharAt(src, i) == 43) { i += 1; }
+      var eVal: int64 := 0;
+      var eSeen: int64 := 0;
+      while (i < end) {
+        var xc: int64 := StrCharAt(src, i);
+        if (xc == 95) { i += 1; }
+        else if (xc >= 48 && xc <= 57) { eVal := eVal * 10 + xc - 48; eSeen := 1; i += 1; }
+        else { break; }
+      }
+      if (eSeen == 0) { return 0; }
+      var ej: int64 := 0;
+      while (ej < eVal) {
+        if (eNeg == 0) {
+          if (num > 900000000000000) { return 0; }
+          num := num * 10;
+        } else {
+          if (den > 100000000000000) { return 0; }
+          den := den * 10;
+        }
+        ej += 1;
+      }
+    }
+    // Der Ausdruck muss VOLLSTAENDIG gelesen sein — ein Rest bedeutet, dass
+    // hier etwas steht, das diese Funktion nicht versteht.
+    if (i != end) { return 0; }
+    if (seen == 0 || num <= 0) { return 0; }
+    poke64(denBox, den);
+    return num;
+  }
+
+  // Groesster gemeinsamer Teiler — kuerzt den Umrechnungsbruch, damit die
+  // Zwischenprodukte klein bleiben (#1158).
+  fn cg_gcd(a: int64, b: int64): int64 {
+    var x: int64 := a;
+    var y: int64 := b;
+    if (x < 0) { x := 0 - x; }
+    if (y < 0) { y := 0 - y; }
+    while (y != 0) {
+      var t: int64 := x % y;
+      x := y;
+      y := t;
+    }
+    if (x == 0) { return 1; }
+    return x;
+  }
+
   fn cg_parseFloat(src: pchar, off: int64, len: int64): int64 {
     var i: int64 := off;
     var end: int64 := off + len;
@@ -2856,8 +2956,31 @@ pub type Codegen = class {
         var utDim: int64 := self.cg_nc0(cur);
         var utFac: int64 := self.cg_nc1(cur);
         var utRng: int64 := self.cg_nc2(cur);
+        // #1158: Bis 1.0.15B wurde hier NUR ein ganzzahliges Literal gelesen.
+        // Ein Faktor wie `1000.0` fiel stillschweigend auf 1 zurueck und blieb
+        // damit wirkungslos — genau die Schreibweise, die std/units.lyx
+        // durchgehend benutzt. Jetzt wird der Faktor als Bruch gelesen.
         var facVal: int64 := 1;
-        if (utFac >= 0 && self.cg_nkind(utFac) == CGN_LIT_INT) { facVal := self.cg_nival(utFac); }
+        var facDenBox: int64 := alloc(8);
+        poke64(facDenBox, 1);
+        if (utFac >= 0 && self.cg_nkind(utFac) == CGN_LIT_INT) {
+          facVal := self.cg_nival(utFac);
+        } else if (utFac >= 0 && self.cg_nkind(utFac) == CGN_LIT_FLOAT) {
+          facVal := self.cg_parseFactorRatio(self.pSrc, self.cg_nsoff(utFac),
+                                             self.cg_nslen(utFac), facDenBox);
+          if (facVal <= 0) {
+            // Nicht lesbar heisst melden, nicht heimlich 1 rechnen.
+            EPrintStr("codegen error: utype '"c);
+            sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+            EPrintStrLn("': Umrechnungsfaktor ist kein lesbares Zahlliteral"c);
+            facVal := 1;
+            poke64(facDenBox, 1);
+          }
+        } else if (utFac >= 0) {
+          EPrintStr("codegen error: utype '"c);
+          sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+          EPrintStrLn("': Umrechnungsfaktor muss ein Zahlliteral sein"c);
+        }
         var dimP: pchar := 0 as pchar;
         var dimL: int64 := 0;
         if (utDim >= 0) { dimP := self.cg_nsval(utDim); dimL := self.cg_nslen(utDim); }
@@ -2875,7 +2998,7 @@ pub type Codegen = class {
           }
         }
         self.cg_addUtype(self.cg_nsval(cur), self.cg_nslen(cur), facVal,
-                         dimP, dimL, rlo, rhi, uflags);
+                         dimP, dimL, rlo, rhi, uflags, peek64(facDenBox));
       }
       cur := self.cg_nnext(cur);
     }
@@ -4598,15 +4721,15 @@ pub type Codegen = class {
   // Zahlenwert unveraendert, statt ihn umzurechnen.
   fn cg_addUtype(name: pchar, nameLen: int64, factor: int64,
                  dimName: pchar, dimLen: int64,
-                 rlo: int64, rhi: int64, flags: int64) {
+                 rlo: int64, rhi: int64, flags: int64, factorDen: int64) {
     if (self.utypeCount >= self.utypeCap) {
       var nc: int64 := self.utypeCap * 2;
-      var nb: int64 := alloc(nc * 64);
-      memcpy(nb, self.utypes, self.utypeCount * 64);
+      var nb: int64 := alloc(nc * 72);
+      memcpy(nb, self.utypes, self.utypeCount * 72);
       self.utypes := nb;
       self.utypeCap := nc;
     }
-    var base: int64 := self.utypes + self.utypeCount * 64;
+    var base: int64 := self.utypes + self.utypeCount * 72;
     poke64(base,      name as int64);
     poke64(base + 8,  nameLen);
     poke64(base + 16, factor);
@@ -4615,6 +4738,7 @@ pub type Codegen = class {
     poke64(base + 40, rlo);
     poke64(base + 48, rhi);
     poke64(base + 56, flags);
+    poke64(base + 64, factorDen);   // #1158: Nenner des Umrechnungsbruchs
     self.utypeCount += 1;
   }
 
@@ -4623,7 +4747,7 @@ pub type Codegen = class {
     if (nameLen <= 0) { return 0 - 1; }
     var i: int64 := 0;
     while (i < self.utypeCount) {
-      var base: int64 := self.utypes + i * 64;
+      var base: int64 := self.utypes + i * 72;
       var p: pchar := peek64(base) as pchar;
       var n: int64 := peek64(base + 8);
       if (n == nameLen && self.cg_seq(p, n, name, nameLen)) { return i; }
@@ -4634,9 +4758,17 @@ pub type Codegen = class {
 
   fn cg_utypeFactor(idx: int64): int64 {
     if (idx < 0) { return 1; }
-    var f: int64 := peek64(self.utypes + idx * 64 + 16);
+    var f: int64 := peek64(self.utypes + idx * 72 + 16);
     if (f <= 0) { return 1; }
     return f;
+  }
+
+  // #1158: Nenner des Umrechnungsfaktors. 1 fuer ganzzahlige Faktoren.
+  fn cg_utypeFactorDen(idx: int64): int64 {
+    if (idx < 0) { return 1; }
+    var d: int64 := peek64(self.utypes + idx * 72 + 64);
+    if (d <= 0) { return 1; }
+    return d;
   }
 
   // Einheitentyp einer lokalen Variablen ueber ihren deklarierten Typnamen.
@@ -4663,16 +4795,30 @@ pub type Codegen = class {
   fn cg_emitUtypeConv(dstIdx: int64, srcIdx: int64) {
     if (dstIdx < 0 || srcIdx < 0) { return; }
     if (dstIdx == srcIdx) { return; }
-    var sf: int64 := self.cg_utypeFactor(srcIdx);
-    var df: int64 := self.cg_utypeFactor(dstIdx);
-    if (sf == df) { return; }
-    if (sf != 1) {
-      // imul rax, rax, sf
-      self.cg_e8(0x48); self.cg_e8(0x69); self.cg_e8(0xC0); self.cg_e32(sf);
+    // #1158: Die Faktoren sind Brueche (sn/sd bzw. dn/dd). Umgerechnet wird
+    // mit  wert * (sn*dd) / (sd*dn)  — erst multiplizieren, dann teilen, wie
+    // schon bei den ganzzahligen Faktoren, damit moeglichst wenig Stellen
+    // verloren gehen. Gekuerzt wird vorher, sonst laufen die Zwischenprodukte
+    // bei Faktoren wie 0.017453 unnoetig gross.
+    var sn: int64 := self.cg_utypeFactor(srcIdx);
+    var sd: int64 := self.cg_utypeFactorDen(srcIdx);
+    var dn: int64 := self.cg_utypeFactor(dstIdx);
+    var dd: int64 := self.cg_utypeFactorDen(dstIdx);
+    var mul: int64 := sn * dd;
+    var div: int64 := sd * dn;
+    var g: int64 := self.cg_gcd(mul, div);
+    mul := mul / g;
+    div := div / g;
+    if (mul == div) { return; }
+    if (mul != 1) {
+      // movabs rcx, mul; imul rax, rcx  — imm64, weil der gekuerzte Zaehler
+      // nicht in 32 Bit passen muss.
+      self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(mul);
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xAF); self.cg_e8(0xC1);
     }
-    if (df != 1) {
-      // mov rcx, df; cqo; idiv rcx
-      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1); self.cg_e32(df);
+    if (div != 1) {
+      // movabs rcx, div; cqo; idiv rcx
+      self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(div);
       self.cg_e8(0x48); self.cg_e8(0x99);
       self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
     }
@@ -4687,7 +4833,7 @@ pub type Codegen = class {
   // ist also hi-lo+1.
   fn cg_emitUtypeRange(idx: int64) {
     if (idx < 0) { return; }
-    var base: int64  := self.utypes + idx * 64;
+    var base: int64  := self.utypes + idx * 72;
     var flags: int64 := peek64(base + 56);
     if ((flags & 1) == 0) { return; }
     var lo: int64 := peek64(base + 40);
@@ -12599,15 +12745,28 @@ pub type Codegen = class {
     self.outerFuncNameLen := fnlen;
 
     // WP-EN-04: resolve effective energy level for this function
-    // Priority: @energy(N) pragma on fn > CLI/global > hard-coded default 3
+    // Reihenfolge: @energy(N) an der fn > `@energy(N);` als Direktive im
+    // Quelltext > CLI/global > Vorgabe 3.
+    //
+    // #1162: Bis 1.0.15B gewann das CLI-Flag gegen beide Quelltext-Formen,
+    // weil `@energy(N)` vor einer fn auf oberster Ebene als eigener Knoten
+    // geparst wird und die Annotationsbits deshalb 0 blieben. Eine Funktion,
+    // die ausdruecklich `@energy(1)` trug, wurde bei --target-energy=5
+    // trotzdem aggressiv uebersetzt — die zugesagte Energie-Barriere gab es
+    // nicht. Der Quelltext ist die genauere Angabe und schlaegt das Flag.
     var savedEnergy: int64 := self.fnEnergyLevel;
     var annoEnergy: int64 := (self.cg_nival(ni) >> ANNO_ENERGY_SHIFT) & 7;
     if (annoEnergy >= 1 && annoEnergy <= 5) {
       self.fnEnergyLevel := annoEnergy;
+    } else if (self.scopeEnergyLevel >= 1) {
+      self.fnEnergyLevel := self.scopeEnergyLevel;
     } else if (self.globalEnergyLevel >= 1) {
       self.fnEnergyLevel := self.globalEnergyLevel;
     } else {
-      self.fnEnergyLevel := 1;  // default: no unrolling (bootstrap-safe)
+      // #1162: Vorgabe 3, wie Quelltext-Kommentar und `sprache/`-Doku sie
+      // seit WP-EN-01 zusagen. Bis 1.0.15B stand hier 1, der Normalfall
+      // uebersetzte also durchgaengig im sparsamsten Modus.
+      self.fnEnergyLevel := 3;
     }
 
     // Reset locals
@@ -14088,7 +14247,11 @@ pub type Codegen = class {
         if (kind == 3) { self.debugMode            := val; }  // WP-AS-05
         if (kind == 4) { self.optLevel             := val; }  // WP-AS-04
       } else if (k == CGN_AT_ENERGY) {  // WP-EN-04: top-level @energy(N)
-        self.fnEnergyLevel := self.cg_nival(cur);
+        // #1162: als Quelltext-Stand vermerken, nicht nur als aktuelle Stufe —
+        // genFunc bestimmt die Stufe je Funktion neu und verwarf den Wert
+        // sonst zugunsten des CLI-Flags.
+        self.scopeEnergyLevel := self.cg_nival(cur);
+        self.fnEnergyLevel    := self.cg_nival(cur);
       }
       cur := self.cg_nnext(cur);
     }
@@ -14270,7 +14433,8 @@ pub type Codegen = class {
 
     // WP-EN-01: energy levels
     self.globalEnergyLevel := 0;
-    self.fnEnergyLevel     := 1;  // default: no unrolling (bootstrap-safe)
+    self.scopeEnergyLevel  := 0;   // #1162: kein Quelltext-Stand gesetzt
+    self.fnEnergyLevel     := 3;   // #1162: Vorgabe 3 wie zugesagt (war 1)
 
     // WP-AS-04/05: directive flags
     self.boundsCheckEnabled := 1;  // on by default
@@ -14343,7 +14507,7 @@ pub type Codegen = class {
     self.rangeTypeCount := 0;
     self.curFnRetRange  := 0 - 1;
     self.curFnRetNarrow := 0;
-    self.utypes     := alloc(32 * 64);   // #1110
+    self.utypes     := alloc(32 * 72);   // #1110 (72 B: +64 Nenner, #1158)
     self.utypeCount := 0;
     self.utypeCap   := 32;
 
