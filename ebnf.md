@@ -1143,6 +1143,13 @@ BuiltinCall         = CheckExpr
 CheckExpr           = "check" "(" Expr ")" ;
 
 PanicExpr           = "panic" "(" [ Expr ] ")" ;
+(* panic ist KEIN Ausnahmemechanismus: die Meldung geht nach stderr, dann
+   endet der Prozess mit 1. Ein umschliessendes `try` faengt ihn NICHT, und
+   `finally` laeuft nicht mehr an — der Abbruch ist die Zusicherung des
+   Konstrukts. Bis 1.0.15A sprang er in einen installierten Handler und war
+   damit fangbar; das Programm lief mit gebrochener Invariante weiter (#1149).
+   Dasselbe gilt fuer `assert`, die Bereichs- und die Grenzpruefung. Fangbar
+   ist allein `throw`. *)
 
 AssertExpr          = "assert" "(" Expr ")" ;
 

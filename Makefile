@@ -283,6 +283,9 @@ test: lyxc
 	@echo "--- Typen der binaeren Operatoren + Print (28 Pruefungen) ---"
 	@bash tests/binop_types_test.sh
 	@echo "OK"
+	@echo "--- panic ist nicht fangbar (10 Pruefungen) ---"
+	@bash tests/panic_uncatchable_test.sh
+	@echo "OK"
 	@echo "--- finally beim vorzeitigen Verlassen des try (12 Pruefungen) ---"
 	@bash tests/finally_exit_test.sh
 	@echo "OK"

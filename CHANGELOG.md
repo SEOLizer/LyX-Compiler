@@ -2,6 +2,39 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `panic` ist nicht mehr mit try/catch abfangbar (#1149)
+
+`panic` sprang in einen installierten Ausnahme-Handler. Ein umschließendes
+`try`/`catch` verschluckte den Abbruch, `finally` lief an, und das Programm
+lief mit gebrochener Invariante bis Exit 0 weiter:
+
+```lyx
+fn Tief(): int64 { panic("kaputt"); return 0; }
+fn main(): int64 {
+    try { Tief(); } catch (e) { PrintLn("verschluckt"); }
+    PrintLn("laeuft weiter");        // wurde erreicht
+    return 0;
+}
+```
+
+`panic` meldet einen Zustand, der nicht auftreten darf — Invariantverletzung,
+Programmierfehler, Hardwaredefekt. Der kontrollierte Abbruch **ist** die
+Zusicherung; ihn abfangen zu können macht aus dem sichersten Ausgang den
+schlechtesten. Beide Emitter (`cg_emitPanicBody` und der `panic`-Builtin)
+schreiben die Meldung jetzt nach stderr und beenden den Prozess unbedingt
+mit 1 — kein `longjmp` mehr.
+
+`finally` läuft dabei **nicht** mehr an; das ist die Entscheidung, die der
+Issue offen ließ, und deckt sich mit „beendet das Programm sofort".
+
+Dieselbe Klasse und derselbe Codepfad: `assert`, `assertNotNull`, die
+Bereichs- und die Grenzprüfung waren ebenso fangbar und sind mitgezogen.
+Fangbar bleibt allein `throw`.
+
+`tests/panic_uncatchable_test.sh`: 10 Prüfungen, 5 davon rot gegen den
+Vorstand. `ebnf.md` bei `PanicExpr` nachgezogen. Kein Versionsbump;
+S3 == S4 unverändert.
+
 ### Compiler — `finally` läuft auch beim vorzeitigen Verlassen des try-Blocks (#1148)
 
 `return` aus dem `try`-Block sprang direkt in den Epilog; der `finally`-Block
