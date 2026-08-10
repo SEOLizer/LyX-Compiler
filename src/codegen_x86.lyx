@@ -566,6 +566,19 @@ pub type Codegen = class {
   localArraySize:    int64;  // WP-BC-51: int64 buffer, stores array length per local (0 = not array)
   // WP-3.1: byte buffer parallel to locals, 1 = @redundant var (TMR triple storage)
   localIsRedundant:  int64;
+
+  // #1141: dasselbe fuer GLOBALE Variablen. `@redundant` wirkte dort gar
+  // nicht — die Variable bekam 8 Byte im Datensegment, keinen Voter, keine
+  // Kopien. Das Attribut war auf Modulebene ein stiller Default.
+  globalIsRedundant: int64;
+
+  // #1141: Bilanz der TMR-Zugriffe fuer --verify-tmr. Gezaehlt wird beim
+  // Erzeugen des Codes; was am Voter vorbeigeht, wird einzeln gemeldet.
+  verifyTmr:     int64;   // 1 = --verify-tmr
+  tmrVarCount:   int64;   // deklarierte @redundant-Variablen
+  tmrReadVoted:  int64;   // Lesezugriffe ueber die Mehrheitsentscheidung
+  tmrWriteTriple:int64;   // Schreibzugriffe in alle drei Kopien
+  tmrBypass:     int64;   // Zugriffe am Voter vorbei (Adresse-von)
   // WP-GPU-01: byte buffer parallel to locals, 1 = parallel Array<f32> (SIMD)
   localIsSimd:       int64;
   // #1003: byte buffer parallel to locals, 1 = INLINE geschriebener fn-Zeigertyp
@@ -958,6 +971,110 @@ pub type Codegen = class {
   //            else:    result=B, self-heal A  (B is majority)
   //   else:    result=A  (A==B, A==C, or triple mismatch → keep A)
   // Always uses 32-bit rbp displacement forms for predictable encoding.
+  // #1141: derselbe Mehrheitsentscheid fuer eine GLOBALE Variable. Die drei
+  // Zellen liegen hintereinander im Datensegment (A = doff, B = doff+8,
+  // C = doff+16); jede rip-relative Form ist genauso lang wie ihre
+  // rbp-relative Entsprechung (7 Byte), die Sprungweiten unten sind deshalb
+  // dieselben wie in cg_emitTmrRead.
+  fn cg_emitTmrReadGlobal(doff: int64) {
+    // mov rax,[rip+A]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+    var pA: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pA, doff, 0, CG_PATCH_STR);
+    // mov rdx,[rip+B]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x15);
+    var pB: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pB, doff + 8, 0, CG_PATCH_STR);
+    // mov rcx,[rip+C]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x0D);
+    var pC: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pC, doff + 16, 0, CG_PATCH_STR);
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xD0);   // cmp rax,rdx
+    self.cg_e8(0x74); self.cg_e8(0x11);                      // je a_eq_b (+17)
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);   // cmp rax,rcx
+    self.cg_e8(0x74); self.cg_e8(0x1A);                      // je a_eq_c (+26)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);   // mov rax,rdx
+    // mov [rip+A],rax   (Minderheit heilen)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
+    var hA: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(hA, doff, 0, CG_PATCH_STR);
+    self.cg_e8(0xEB); self.cg_e8(0x15);                      // jmp done (+21)
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);   // a_eq_b: cmp rax,rcx
+    self.cg_e8(0x74); self.cg_e8(0x10);                      // je done (+16)
+    // mov [rip+C],rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
+    var hC: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(hC, doff + 16, 0, CG_PATCH_STR);
+    self.cg_e8(0xEB); self.cg_e8(0x07);                      // jmp done (+7)
+    // a_eq_c: mov [rip+B],rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
+    var hB: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(hB, doff + 8, 0, CG_PATCH_STR);
+    // done
+  }
+
+  // #1141: Bilanz nach --verify-tmr. Sie ist kein blosser Bericht: geht auch
+  // nur EIN Zugriff am Voter vorbei, schlaegt der Lauf fehl. Ein Bericht, den
+  // man uebersehen kann, waere fuer eine Sicherheitszusage wertlos.
+  fn cg_tmrReport() {
+    if (self.verifyTmr == 0) { return; }
+    EPrintStr("TMR: "c);
+    self.cg_eprintInt(self.tmrVarCount);
+    EPrintStr(" @redundant-Variable(n), "c);
+    self.cg_eprintInt(self.tmrReadVoted);
+    EPrintStr(" gevotete(r) Lesezugriff(e), "c);
+    self.cg_eprintInt(self.tmrWriteTriple);
+    EPrintStr(" dreifache(r) Schreibzugriff(e), "c);
+    self.cg_eprintInt(self.tmrBypass);
+    EPrintStrLn(" am Voter vorbei"c);
+    if (self.tmrBypass > 0) {
+      EPrintStrLn("error: --verify-tmr: die Redundanz ist nicht durchgehend — siehe die Meldungen oben"c);
+      exit(1);
+    }
+  }
+
+  fn cg_isGlobalRedundant(idx: int64): int64 {
+    if (idx < 0) { return 0; }
+    return peek8(self.globalIsRedundant + idx) as int64;
+  }
+
+  // #1141: Lesezugriff auf eine globale Variable — ueber den Voter, wenn sie
+  // redundant ist. Alle Lesestellen laufen hier zusammen, damit die Bilanz
+  // vollstaendig ist.
+  fn cg_emitGlobalRead(name: pchar, nlen: int64, doff: int64) {
+    if (self.cg_isGlobalRedundant(self.cg_findGlobalIdx(name, nlen)) != 0) {
+      self.cg_emitTmrReadGlobal(doff);
+      self.tmrReadVoted += 1;
+      return;
+    }
+    self.cg_loadRaxGlobal(doff);
+  }
+
+  // #1141: Schreibzugriff — alle drei Kopien.
+  fn cg_emitGlobalWrite(name: pchar, nlen: int64, doff: int64) {
+    if (self.cg_isGlobalRedundant(self.cg_findGlobalIdx(name, nlen)) != 0) {
+      self.cg_storeRaxGlobal(doff);
+      self.cg_storeRaxGlobal(doff + 8);
+      self.cg_storeRaxGlobal(doff + 16);
+      self.tmrWriteTriple += 1;
+      return;
+    }
+    self.cg_storeRaxGlobal(doff);
+  }
+
+  // #1141: Die Adresse-von-Form liefert die Adresse EINER Kopie; wer darueber
+  // schreibt, umgeht den Voter, und der Schreibzugriff geht beim naechsten
+  // Mehrheitsentscheid verloren. Das wird gezaehlt und gemeldet — unter
+  // --verify-tmr als Fehler, sonst als Warnung. Stillschweigend durchlassen
+  // waere das Gegenteil dessen, was das Attribut zusagt.
+  fn cg_tmrBypassAt(name: pchar, nlen: int64) {
+    self.tmrBypass += 1;
+    if (self.verifyTmr != 0) { EPrintStr("error: "c); } else { EPrintStr("warning: "c); }
+    EPrintStr("@"c);
+    sys_write(2, name as int64, nlen);
+    EPrintStrLn(": Adresse-von umgeht die TMR-Mehrheitsentscheidung — ein Schreibzugriff darueber trifft nur eine Kopie"c);
+  }
+
   fn cg_emitTmrRead(offA: int64, offB: int64, offC: int64) {
     // WP-B1: Full majority-vote with self-heal for all 3 single-fault cases.
     // Layout: A=offA (lowest addr, &var+0), B=offB (&var+8), C=offC (&var+16)
@@ -1005,13 +1122,16 @@ pub type Codegen = class {
       var nb: int64 := alloc(nc * 24);
       var np: int64 := alloc(nc);
       var nt: int64 := alloc(nc * 16);
+      var nr: int64 := alloc(nc);          // #1141
       var i: int64 := 0;
       memcpy(nb, self.globalVars, self.globalVarCount * 24);
       i := 0;
       memcpy(np, self.globalIsPchar, self.globalVarCount);
       memcpy(nt, self.globalTypeNames, self.globalVarCount * 16);
+      memcpy(nr, self.globalIsRedundant, self.globalVarCount);   // #1141
       self.globalVars := nb; self.globalVarCap := nc; self.globalIsPchar := np;
       self.globalTypeNames := nt;
+      self.globalIsRedundant := nr;
     }
     var doff: int64 := self.dataLen;
     // Reserve 8 zero bytes in data section (mmap is zero-initialized)
@@ -1022,6 +1142,7 @@ pub type Codegen = class {
     poke64(base + CG_GLOBAL_OFF_NAMELEN,  nlen);
     poke64(base + CG_GLOBAL_OFF_DOFF, doff);
     poke8(self.globalIsPchar + self.globalVarCount, 0);
+    poke8(self.globalIsRedundant + self.globalVarCount, 0);   // #1141
     poke64(self.globalTypeNames + self.globalVarCount * 16, 0);
     poke64(self.globalTypeNames + self.globalVarCount * 16 + 8, 0);
     self.globalVarCount += 1;
@@ -5760,6 +5881,7 @@ pub type Codegen = class {
         var ridx: int64 := self.cg_findLocalIdx(name, nlen);
         if (ridx >= 0 && self.cg_isLocalRedundant(ridx) != 0) {
           self.cg_emitTmrRead(off - 16, off - 8, off);
+          self.tmrReadVoted += 1;   // #1141
         } else {
           self.cg_loadRax(off);
         }
@@ -5780,7 +5902,7 @@ pub type Codegen = class {
           }
         } else {
           var goffC: int64 := self.cg_findGlobal(name, nlen);
-          if (goffC >= 0) { self.cg_loadRaxGlobal(goffC); }
+          if (goffC >= 0) { self.cg_emitGlobalRead(name, nlen, goffC); }   // #1141
           else if (self.cg_hasConVal(name, nlen) != 0) { self.cg_emitConLoad(name, nlen); }
           else if (self.cg_findExternDataIdx(name, nlen) >= 0) { self.cg_emitExternDataAddr(name, nlen); }
           else if (self.cg_isDeclaredFunc(name, nlen) != 0) { self.cg_emitFuncAddr(name, nlen); }
@@ -5805,7 +5927,7 @@ pub type Codegen = class {
             // Not local and not captured - check global, then constant
             var goff1: int64 := self.cg_findGlobal(name, nlen);
             if (goff1 >= 0) {
-              self.cg_loadRaxGlobal(goff1);
+              self.cg_emitGlobalRead(name, nlen, goff1);   // #1141
             } else if (self.cg_hasConVal(name, nlen) != 0) {
               self.cg_emitConLoad(name, nlen);
             } else if (self.cg_findExternDataIdx(name, nlen) >= 0) {
@@ -5819,7 +5941,7 @@ pub type Codegen = class {
         } else {
           var goff2: int64 := self.cg_findGlobal(name, nlen);
           if (goff2 >= 0) {
-            self.cg_loadRaxGlobal(goff2);
+            self.cg_emitGlobalRead(name, nlen, goff2);   // #1141
           } else if (self.cg_hasConVal(name, nlen) != 0) {
             self.cg_emitConLoad(name, nlen);
           } else if (self.cg_findExternDataIdx(name, nlen) >= 0) {
@@ -6011,6 +6133,7 @@ pub type Codegen = class {
             var iridx0: int64 := self.cg_findLocalIdx(iname0, ilen0);
             if (iridx0 >= 0 && self.cg_isLocalRedundant(iridx0) != 0) {
               addrOff0 := ioff0 - 16;
+              self.cg_tmrBypassAt(iname0, ilen0);   // #1141
             }
             if (addrOff0 >= -128 && addrOff0 <= -1) {
               self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x45); self.cg_e8(addrOff0);
@@ -10164,6 +10287,7 @@ pub type Codegen = class {
       var isRedundant: int64 := (self.cg_nival(ni) & 4) != 0;
       if (isRedundant != 0) {
         poke8(self.localIsRedundant + localIdx, 1);
+        self.tmrVarCount += 1;   // #1141
         // Reserve 2 extra stack slots (A and B) below the C slot
         self.frameSize += 16;
         // Write value to A, B, C
@@ -10206,6 +10330,7 @@ pub type Codegen = class {
           // WP-B1: @redundant vars write all 3 copies (A=off-16, B=off-8, C=off)
           var lidx: int64 := self.cg_findLocalIdx(name, nlen);
           if (lidx >= 0 && self.cg_isLocalRedundant(lidx) != 0) {
+            self.tmrWriteTriple += 1;   // #1141
             self.cg_storeRax(off - 16);  // A
             self.cg_storeRax(off - 8);   // B
             self.cg_storeRax(off);
@@ -10236,7 +10361,7 @@ pub type Codegen = class {
           }
         } else {
           var goff: int64 := self.cg_findGlobal(name, nlen);
-          if (goff >= 0) { self.cg_storeRaxGlobal(goff); }
+          if (goff >= 0) { self.cg_emitGlobalWrite(name, nlen, goff); }   // #1141
         }
       } else if (self.cg_nkind(lhs) == CGN_FIELD) {
         // obj.field := rhs
@@ -13660,13 +13785,30 @@ pub type Codegen = class {
           poke64(self.globalTypeNames + gIdx * 16,     gtp as int64);
           poke64(self.globalTypeNames + gIdx * 16 + 8, gtn);
         }
+        // #1141: @redundant an einer GLOBALEN Variablen. Bis 1.0.14M bekam sie
+        // 8 Byte und keinen Voter — das Attribut war hier ein stiller Default.
+        // Jetzt liegen drei Zellen hintereinander (A = doff, B, C), genau wie
+        // im Rahmen bei einem Local.
+        var gRedundant: int64 := (self.cg_nival(cur) & 4) != 0;
+        if (gRedundant != 0) {
+          poke8(self.globalIsRedundant + gIdx, 1);
+          var gz: int64 := 0;
+          while (gz < 16) { self.cg_edata(0); gz := gz + 1; }
+          self.tmrVarCount += 1;
+        }
         // Write literal initializer directly into data section
         var initNode: int64 := self.cg_nc1(cur);
         if (initNode >= 0 && self.cg_nkind(initNode) == CGN_LIT_INT) {
           // #1151: Der Wert geht hier ohne Codeerzeugung in den Datenbereich —
           // die Kuerzung muss deshalb der Compiler selbst rechnen.
-          poke64(self.data + doff,
-                 self.cg_narrowConst(self.cg_nival(initNode), self.cg_narrowKindOfTypeNode(gtNode)));
+          var gInit: int64 := self.cg_narrowConst(self.cg_nival(initNode), self.cg_narrowKindOfTypeNode(gtNode));
+          poke64(self.data + doff, gInit);
+          // Alle drei Kopien tragen den Anfangswert — sonst waere die Mehrheit
+          // beim ersten Lesen 0 und der Initialisierer verloren.
+          if (gRedundant != 0) {
+            poke64(self.data + doff + 8,  gInit);
+            poke64(self.data + doff + 16, gInit);
+          }
         }
       } else if (k == CGN_CON_DECL) {
         // Populate constant table; evaluate arbitrary constant expressions
@@ -13927,6 +14069,11 @@ pub type Codegen = class {
     self.localIsArray     := alloc(self.localCap);
     // WP-3.1: per-local redundant flag
     self.localIsRedundant := alloc(self.localCap);
+    self.verifyTmr      := 0;
+    self.tmrVarCount    := 0;
+    self.tmrReadVoted   := 0;
+    self.tmrWriteTriple := 0;
+    self.tmrBypass      := 0;
     // WP-GPU-01: per-local SIMD flag
     self.localIsSimd      := alloc(self.localCap);
     self.localIsFnPtr     := alloc(self.localCap);
@@ -13943,6 +14090,7 @@ pub type Codegen = class {
 
     // Global variable table
     self.globalVarCap   := 64;
+    self.globalIsRedundant := alloc(self.globalVarCap);   // #1141
     self.globalVars     := alloc(self.globalVarCap * 24);
     self.globalIsPchar  := alloc(self.globalVarCap);
     self.globalTypeNames := alloc(self.globalVarCap * 16);
@@ -14744,6 +14892,9 @@ pub type Codegen = class {
     self.cg_genHwDevPathSection(); // WP-H12: Gerätepfad-Strings in Datensektion
     self.cg_emitProxyLoop();       // WP-R11: Proxy-Kind-Loop-Code in Codesektion (vor main)
     self.cg_genFile(head);
+    // #1141: die Bilanz erst hier — cg_genFile laeuft je importierter Einheit
+    // erneut, dort gedruckt gaebe es eine Zeile je Import.
+    self.cg_tmrReport();
     // WP-6: Pad code to 4096-byte boundary so data starts on a page boundary.
     // This allows two PT_LOAD segments: RX (code) and RW (data), no overlap.
     // Padding must happen BEFORE cg_patchAll() so all disp32 patches use

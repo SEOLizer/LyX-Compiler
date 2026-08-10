@@ -2,6 +2,41 @@
 
 ## Unveröffentlicht (develop)
 
+### Compiler — `@redundant` wirkt auch an Globals, `--verify-tmr` prüft (#1141)
+
+Die Sache lag zweigeteilt: **lokal** funktionierte TMR (drei Kopien im Rahmen,
+Lesen über die Mehrheitsentscheidung, Schreiben in alle drei — WP-B1),
+**global** wirkte `@redundant` gar nicht. Die Variable bekam acht Byte im
+Datensegment, keinen Voter, keine Kopien und keinen Hinweis. Auf Modulebene
+war das Attribut ein stiller Default — und der Repro des Issues ist genau so
+eine globale Variable.
+
+Jetzt bekommen Globals drei Zellen hintereinander (A, B, C), der Anfangswert
+steht in allen dreien (sonst wäre die Mehrheit beim ersten Lesen 0 und der
+Initialisierer verloren). Lesen und Schreiben laufen über je eine Stelle im
+Codegen — dieselbe, die auch die Bilanz zählt.
+
+**`--verify-tmr`** gab es bisher nicht; das Flag fiel unter #1098 (unbekannte
+Flags werden stillschweigend ignoriert). Es druckt die Bilanz
+
+```
+TMR: 1 @redundant-Variable(n), 2 gevotete(r) Lesezugriff(e), 1 dreifache(r) Schreibzugriff(e), 0 am Voter vorbei
+```
+
+und ist **kein bloßer Bericht**: geht auch nur ein Zugriff am Voter vorbei,
+schlägt der Lauf mit Exit 1 fehl und es entsteht keine Binary.
+
+Der einzige solche Weg ist die Adresse-von-Form `@x`. Sie liefert die Adresse
+*einer* Kopie; ein Schreibzugriff darüber geht beim nächsten
+Mehrheitsentscheid verloren. Ohne das Flag wird derselbe Fall gewarnt —
+stillschweigend durchlassen wäre das Gegenteil dessen, was das Attribut
+zusagt, abbrechen ohne ausdrückliche Prüfbitte zu scharf.
+
+Nebenbei belegt: der Voter *heilt*. Wird gezielt eine Kopie verfälscht,
+liefert das Lesen den richtigen Wert und schreibt die Minderheit zurück.
+
+`tests/verify_tmr_test.sh`: 17 Prüfungen, 9 davon rot gegen 1.0.14M.
+
 ### Compiler — `@flight_crit` schaltet die FPU-Traps frei (#1140)
 
 `sprache/datentypen.txt` sagt zu, dass in `@flight_crit`-Code jede entstehende
