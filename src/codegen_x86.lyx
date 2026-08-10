@@ -5891,6 +5891,37 @@ pub type Codegen = class {
     }
   }
 
+  // #1248: schmales Feld aus rsi nach [rax+off] schreiben — das Gegenstueck zu
+  // cg_emitNarrowLoadRax.
+  //
+  // Der Schreibzugriff emittierte bisher IMMER `mov [rax+off], rsi` mit REX.W,
+  // also volle 8 Byte, unabhaengig von der deklarierten Feldbreite. In einem
+  // packed struct liegen die Nachbarfelder unmittelbar dahinter und wurden
+  // dabei mitgenullt: `s.a := 20` bei `packed { a: int16; b: int8; }` loeschte
+  // `b`. Ohne `packed` verdeckte das Ausrichtungs-Padding den Fehler, weil
+  // jedes Feld ohnehin 8 Byte belegt.
+  //
+  // Der LESEpfad verschmaelert seit #1038 bei Breite 1/2/4 — fuer gepackte wie
+  // ungepackte Strukturen. Der Kommentar dort sagt, beim Schreiben werde die
+  // Breite "laengst beachtet"; das war die Annahme, die hier fehlte. Jetzt sind
+  // beide Seiten symmetrisch.
+  fn cg_emitNarrowStoreRsi(off: int64, width: int64) {
+    if (width == 1) {
+      self.cg_e8(0x40); self.cg_e8(0x88);            // mov [..], sil (REX fuer sil noetig)
+    } else if (width == 2) {
+      self.cg_e8(0x66); self.cg_e8(0x89);            // mov [..], si
+    } else {
+      self.cg_e8(0x89);                              // mov [..], esi
+    }
+    if (off == 0) {
+      self.cg_e8(0x30);
+    } else if (off <= 127) {
+      self.cg_e8(0x70); self.cg_e8(off);
+    } else {
+      self.cg_e8(0xB0); self.cg_e32(off);
+    }
+  }
+
   // Generate a method declaration (with implicit self as first param)
   fn cg_genMethodDecl(ni: int64, className: pchar, classNameLen: int64) {
     var mname: pchar := self.cg_nsval(ni);
@@ -10800,7 +10831,16 @@ pub type Codegen = class {
             self.cg_emitBswapRsi(tWidth3);
           }
         }
-        if (foff == 0) {
+        // #1248: Breite des Feldes beachten — spiegelbildlich zum Lesepfad
+        // (#1038). Ohne sie schrieb jede Feldzuweisung 8 Byte und loeschte in
+        // einem packed struct die Nachbarfelder.
+        var stW: int64 := 0;
+        if (foff >= 0 && classIdx >= 0) {
+          stW := (self.cg_getFieldBigEndian(classIdx, fieldName, fieldLen) >> 8) & 0xFF;
+        }
+        if (foff >= 0 && (stW == 1 || stW == 2 || stW == 4)) {
+          self.cg_emitNarrowStoreRsi(foff, stW);
+        } else if (foff == 0) {
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x30);
         } else if (foff > 0 && foff <= 127) {
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x70); self.cg_e8(foff);
@@ -10843,6 +10883,7 @@ pub type Codegen = class {
         var lhsBase: int64 := self.cg_nc0(lhs);
         var lhsIsArray: int64 := 0;
         var lhsIsSimd:  int64 := 0;
+        var lhsIsPchar: int64 := 0;     // #1266
         var lhsFixedSize: int64 := 0;   // #1156
         if (self.cg_nkind(lhsBase) == CGN_IDENT) {
           var llidx: int64 := self.cg_findLocalIdx(self.cg_nsval(lhsBase), self.cg_nslen(lhsBase));
@@ -10852,6 +10893,21 @@ pub type Codegen = class {
           if (llidx >= 0 && peek8(self.localIsArray + llidx) != 0) { lhsIsArray := 1; }
           // WP-GPU-01: SIMD array store check
           if (llidx >= 0 && peek8(self.localIsSimd + llidx) != 0) { lhsIsSimd := 1; }
+          // #1266: `p[i] := x` auf einem pchar schrieb 8 Byte an Offset i*8 —
+          // `p[0]` belegte die Bytes 0-7, `p[1]` die Bytes 8-15. Der LESEpfad
+          // ermittelt die Zeichenkette laengst ueber denselben Typnamen und
+          // liest byteweise; nur hier fehlte die Frage. std.conv war dadurch
+          // unbrauchbar, und die Schreibvorgaenge trafen fremden Speicher.
+          if (llidx >= 0) {
+            var wtb: int64 := self.localTypes + llidx * CG_LOCTYPE_SZ;
+            var wtp: pchar := peek64(wtb) as pchar;
+            var wtn: int64 := peek64(wtb + CG_LOCTYPE_OFF_LEN);
+            if (wtn == 5 && self.cg_seq(wtp, wtn, "pchar", 5)) { lhsIsPchar := 1; }
+          }
+          if (llidx < 0) {
+            var wgidx: int64 := self.cg_findGlobalIdx(self.cg_nsval(lhsBase), self.cg_nslen(lhsBase));
+            if (wgidx >= 0 && peek8(self.globalIsPchar + wgidx) != 0) { lhsIsPchar := 1; }
+          }
         } else if (self.cg_nkind(lhsBase) == CGN_FIELD) {
           var lhsInner: int64 := self.cg_nc0(lhsBase);
           var lhsFldNm: pchar := self.cg_nsval(lhsBase);
@@ -10880,6 +10936,11 @@ pub type Codegen = class {
           self.cg_e8(0x5E);
           // mov [rcx+rbx*8], rsi
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD9);
+        } else if (lhsIsPchar == 1) {
+          // #1266: pchar zeigt auf BYTES. Schrittweite 1, ein Byte breit —
+          // spiegelbildlich zum Lesepfad, der movzx aus [rax+rbx] holt.
+          self.cg_e8(0x5E);                                     // pop rsi (Wert)
+          self.cg_e8(0x40); self.cg_e8(0x88); self.cg_e8(0x34); self.cg_e8(0x18); // mov [rax+rbx], sil
         } else {
           // plain ptr: direct 8-byte stride
           // pop rsi (value)
