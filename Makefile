@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.15D
+VERSION   := 1.0.15E
 VERSION_DATE := 2026-08-10
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -387,6 +387,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- CLI-Pruefung, globale Startwerte, Methodenzeiger (22 Pruefungen) ---"
 	@bash tests/cli_globals_methodptr_test.sh
+	@echo "OK"
+	@echo "--- Capability-Pfade und Typinferenz (10 Pruefungen) ---"
+	@bash tests/caps_ffi_inference_test.sh
 	@echo "OK"
 	@echo "--- TextMate-Grammatik: Schluesselwoerter und Typen vollstaendig ---"
 	@bash tests/syntax/test_grammar.sh
