@@ -450,6 +450,9 @@ test: lyxc
 	@echo "--- Klassen-Lebenszyklus: dispose, new, override (11 Pruefungen) ---"
 	@bash tests/class_lifecycle_test.sh
 	@echo "OK"
+	@echo "--- ebnf.md gegen den Compiler gemessen (12 Pruefungen) ---"
+	@bash tests/ebnf_claims_test.sh
+	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh
 	@echo "OK"

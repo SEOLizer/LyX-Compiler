@@ -193,7 +193,12 @@ ImportItem          = DotPath
 # 4. Attributes and Directives
 
 ```ebnf
-Visibility          = "pub" ;
+Visibility          = ( "pub" | "public" ) ;
+
+(* #1245: `public` wurde vom Parser schon immer angenommen, war hier aber nicht
+   verzeichnet -- bei MemberVisibility stand es bereits. Wer nachschlug, hielt
+   `public fn` fuer ungueltig, obwohl es uebersetzt. Kanonisch bleibt `pub`;
+   `public` ist die gleichwertige Langform. *)
 
 Directive           = IoCheckDirective
                     | OverflowCheckDirective
@@ -745,9 +750,15 @@ SwitchStmt          = "switch"
                       [ SwitchDefault ]
                       "}" ;
 
-SwitchCase          = "case" ConstExpr ":" { Statement } ;
+SwitchCase          = "case" ConstExpr ":" Block ;
 
-SwitchDefault       = "default" ":" { Statement } ;
+SwitchDefault       = "default" ":" Block ;
+
+(* #1232: Hier stand `{ Statement }`, also eine Anweisungsfolge ohne Klammern.
+   Der Parser verlangt einen Block; `case 1: PrintLn("a"); break;` scheitert mit
+   "expected {, got IDENT". Der Bestand hatte sich bereits nach dem Compiler
+   gerichtet und schrieb ueberall Bloecke -- die Grammatik sagte etwas anderes
+   zu, als der Compiler traegt. *)
 
 (* Jeder Zweig muss mit `break` oder `return` enden; ein durchfallender Zweig
    wird gemeldet ("switch case may fall through"). Das kehrt das Verhalten von
@@ -1154,12 +1165,14 @@ built-in meaning; there is no runtime fallback.
 # 16. Built-in and Special Expressions
 
 ```ebnf
-BuiltinCall         = CheckExpr
-                    | PanicExpr
-                    | AssertExpr
-                    | VerifyIntegrityCall ;
+BuiltinCall         = PanicExpr
+                    | AssertExpr ;
 
-CheckExpr           = "check" "(" Expr ")" ;
+(* #1234: Hier standen zusaetzlich CheckExpr (`check(...)`) und
+   VerifyIntegrityCall (`VerifyIntegrity()`). Beide gibt es nicht -- der
+   Compiler meldet "undefined function 'check'" bzw.
+   "undefined function 'VerifyIntegrity'". `panic` und `assert` sind dagegen
+   vorhanden und verhalten sich wie unten beschrieben. *)
 
 PanicExpr           = "panic" "(" [ Expr ] ")" ;
 (* panic ist KEIN Ausnahmemechanismus: die Meldung geht nach stderr, dann
@@ -1171,8 +1184,6 @@ PanicExpr           = "panic" "(" [ Expr ] ")" ;
    ist allein `throw`. *)
 
 AssertExpr          = "assert" "(" Expr ")" ;
-
-VerifyIntegrityCall = "VerifyIntegrity" "(" ")" ;
 
 NewExpr             = "new" Type "(" [ ArgList ] ")" ;
 
@@ -1186,15 +1197,15 @@ DisposeExpr         = "dispose" Expr ;
 Constant expressions use the same precedence model as runtime expressions, but with a restricted primary set.
 
 ```ebnf
-ConstExpr                 = ConstPipeExpr ;
+ConstExpr                 = ConstNullCoalesceExpr ;
 
-ConstPipeExpr             = ConstNullCoalesceExpr
-                            { "|>" ConstPipeTarget } ;
-
-ConstPipeTarget           = Ident [ "(" [ ConstPipeArgList ] ")" ] ;
-
-ConstPipeArgList          = "?" { "," ConstExpr }
-                          | ConstExpr { "," ConstExpr } ;
+(* #1232: Hier standen ConstPipeExpr, ConstPipeTarget und ConstPipeArgList.
+   Der Pipe-Operator ist im Konstantenausdruck nicht umgesetzt und wird
+   ausdruecklich abgewiesen ("pipe-forward not allowed in const expression").
+   Das ist auch stimmig: `|>` reicht einen Wert an eine FUNKTION weiter, und
+   ein Funktionsaufruf steht zur Uebersetzungszeit nicht zur Verfuegung --
+   dieselbe Grenze, an der auch WP-1.2 Aufrufe im Konstantenausdruck sperrt.
+   Zur Laufzeit gibt es den Operator unveraendert. *)
 
 ConstNullCoalesceExpr     = ConstLogicalOrExpr
                             { "??" ConstLogicalOrExpr } ;
