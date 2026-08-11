@@ -4,6 +4,7 @@
 # = Garbage/Crash (z.B. DNSResolve(1 statt 4 Args) → Core-Dump). Nur same-module reguläre
 # Lyx-Funktionen werden geprüft; extern/FFI + cross-module (modul-relative declNi) bleiben außen.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="$ROOT/lyxc"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 # rc==expectFail: 1 = soll Compile-Fehler, 0 = soll kompilieren

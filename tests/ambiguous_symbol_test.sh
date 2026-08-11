@@ -6,6 +6,7 @@
 # finden, weil beide Implementierungen plausible Werte liefern -- der Defekt war
 # gerade, dass die Bindung unbemerkt von der Import-Reihenfolge abhing.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="$ROOT/lyxc"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 

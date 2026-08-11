@@ -20,6 +20,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_DIR="$REPO_ROOT/tests/lyx"
 LYXC="$REPO_ROOT/lyxc"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$REPO_ROOT/.lyx_test_tmp"
 
 GREEN='\033[0;32m'
