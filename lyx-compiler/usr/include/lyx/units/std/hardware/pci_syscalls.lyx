@@ -1,0 +1,327 @@
+// std/hardware/pci_syscalls.lyx
+// PCI-02: Duenne Systemaufruf-Schicht und Adress-/Pfadhilfen.
+//
+// Diese Unit entscheidet nichts. Sie reicht Aufrufe durch und rechnet
+// Adressen um — damit bleibt die Logik darueber ohne Hardware pruefbar
+// (Muster wie std/hardware/usb_syscalls.lyx).
+//
+// BDF-Packung: (domain << 16) | (bus << 8) | (device << 3) | function
+//   domain 0..65535, bus 0..255, device 0..31, function 0..7
+
+@description("PCI low-level syscalls, BDF and sysfs path helpers")
+@author("Andreas Roene")
+unit std.hardware.pci_syscalls;
+
+import std.hardware.pci_types;
+import std.alloc;
+
+// ============================================================
+// Konstanten
+// ============================================================
+
+pub con PCI_O_RDONLY: int64 := 0;
+pub con PCI_O_WRONLY: int64 := 1;
+pub con PCI_O_RDWR:   int64 := 2;
+pub con PCI_O_DIRECTORY: int64 := 65536;  // 0x10000
+pub con PCI_O_SYNC:      int64 := 1052672; // O_SYNC (0x101000) fuer /dev/mem
+
+// mmap
+pub con PCI_PROT_READ:  int64 := 1;
+pub con PCI_PROT_WRITE: int64 := 2;
+pub con PCI_MAP_SHARED: int64 := 1;
+pub con PCI_MAP_ANON:   int64 := 32;
+pub con PCI_MAP_FAILED: int64 := -1;
+
+pub con PCI_SEEK_SET: int64 := 0;
+
+// Laenge des laengsten erzeugten sysfs-Pfades:
+// "/sys/bus/pci/devices/" (21) + BDF (12) + "/" + "resource0" (9) + NUL
+pub con PCI_PATH_MAX: int64 := 96;
+
+// "0000:03:00.0" = 12 Zeichen + NUL
+pub con PCI_BDF_STR_LEN: int64 := 13;
+
+pub con PCI_SYSFS_DEVICES: pchar := "/sys/bus/pci/devices";
+
+// ============================================================
+// Systemaufrufe
+// ============================================================
+
+pub fn PciOpenFile(path: pchar, flags: int64): int64 {
+  return open(path, flags, 0);
+}
+
+pub fn PciCloseFile(fd: int64): int64 {
+  return close(fd);
+}
+
+// Positioniertes Lesen — der Config-Space wird nie sequentiell gelesen,
+// deshalb pread statt lseek+read (kein gemeinsamer Dateizeiger).
+pub fn PciPread(fd: int64, buf: int64, len: int64, off: int64): int64 {
+  return sys_pread64(fd, buf as pchar, len, off);
+}
+
+pub fn PciPwrite(fd: int64, buf: int64, len: int64, off: int64): int64 {
+  return sys_pwrite64(fd, buf as pchar, len, off);
+}
+
+pub fn PciMmap(len: int64, prot: int64, flags: int64, fd: int64, off: int64): int64 {
+  return mmap(0, len, prot, flags, fd, off);
+}
+
+pub fn PciMunmap(addr: int64, len: int64): int64 {
+  return munmap(addr as pchar, len);
+}
+
+pub fn PciIoctl(fd: int64, request: int64, arg: int64): int64 {
+  return ioctl(fd, request, arg as pchar);
+}
+
+// ============================================================
+// BDF: packen, zerlegen
+// ============================================================
+
+pub fn PciBdfMake(dom: int64, bus: int64, dev: int64, fun: int64): int64 {
+  if (dom < 0 || dom > 65535) { return PCI_E_BADARG; }
+  if (bus < 0 || bus > 255)   { return PCI_E_BADARG; }
+  if (dev < 0 || dev > 31)    { return PCI_E_BADARG; }
+  if (fun < 0 || fun > 7)     { return PCI_E_BADARG; }
+  return (dom << 16) | (bus << 8) | (dev << 3) | fun;
+}
+
+pub fn PciBdfDomain(bdf: int64): int64 { return (bdf >> 16) & 65535; }
+pub fn PciBdfBus(bdf: int64): int64    { return (bdf >> 8) & 255; }
+pub fn PciBdfDevice(bdf: int64): int64 { return (bdf >> 3) & 31; }
+pub fn PciBdfFunction(bdf: int64): int64 { return bdf & 7; }
+
+// ============================================================
+// Zeichenhilfen (lokal, damit diese Unit nur von std.alloc abhaengt)
+// ============================================================
+
+// Hex-Ziffer -> Wert, sonst -1.
+fn hexVal(c: int64): int64 {
+  if (c >= 48 && c <= 57)  { return c - 48; }       // '0'..'9'
+  if (c >= 97 && c <= 102) { return (c - 97) + 10; } // 'a'..'f'
+  if (c >= 65 && c <= 70)  { return (c - 65) + 10; } // 'A'..'F'
+  return -1;
+}
+
+fn hexChar(v: int64): int64 {
+  if (v < 10) { return 48 + v; }
+  return 87 + v;   // 'a' + (v - 10)
+}
+
+// Schreibt src (NUL-terminiert) ab dst+pos, gibt die neue Position zurueck.
+// Schreibt nie ueber dst+cap-1 hinaus und terminiert immer.
+pub fn PciStrAppend(dst: int64, pos: int64, cap: int64, src: pchar): int64 {
+  var i: int64 := 0;
+  var p: int64 := pos;
+  var n: int64 := StrLen(src);
+  while (i < n && p < (cap - 1)) {
+    poke8(dst + p, StrCharAt(src, i));
+    p := p + 1;
+    i := i + 1;
+  }
+  poke8(dst + p, 0);
+  return p;
+}
+
+// Schreibt `digits` Hex-Ziffern von val ab dst+pos.
+pub fn PciStrAppendHex(dst: int64, pos: int64, cap: int64, val: int64, digits: int64): int64 {
+  var p: int64 := pos;
+  var i: int64 := digits - 1;
+  while (i >= 0) {
+    if (p >= (cap - 1)) { poke8(dst + p, 0); return p; }
+    poke8(dst + p, hexChar((val >> (i * 4)) & 15));
+    p := p + 1;
+    i := i - 1;
+  }
+  poke8(dst + p, 0);
+  return p;
+}
+
+// ============================================================
+// BDF: Text lesen und schreiben
+// ============================================================
+
+// Akzeptiert "0000:03:00.0" und die Kurzform "03:00.0" (Domain 0).
+// Alles andere ist ein Fehler — eine halb gelesene Adresse waere schlimmer
+// als gar keine, weil sie auf ein fremdes Geraet zeigt.
+pub fn PciBdfParse(s: pchar): int64 {
+  if (s == 0 as pchar) { return PCI_E_BADARG; }
+  var n: int64 := StrLen(s);
+  if (n < 7) { return PCI_E_BADARG; }
+
+  var dom: int64 := 0;
+  var idx: int64 := 0;
+
+  // Langform erkennen: vier Hex-Ziffern gefolgt von ':'
+  var isLong: int64 := 0;
+  if (n >= 12) {
+    if (StrCharAt(s, 4) == 58) {   // ':'
+      var k: int64 := 0;
+      isLong := 1;
+      while (k < 4) {
+        if (hexVal(StrCharAt(s, k)) < 0) { isLong := 0; }
+        k := k + 1;
+      }
+    }
+  }
+
+  if (isLong == 1) {
+    var d: int64 := 0;
+    while (idx < 4) {
+      d := (d << 4) | hexVal(StrCharAt(s, idx));
+      idx := idx + 1;
+    }
+    dom := d;
+    idx := idx + 1;   // ':' ueberspringen
+  }
+
+  // bus (2 Hex) ':' dev (2 Hex) '.' fn (1 Ziffer)
+  if ((idx + 7) > n) { return PCI_E_BADARG; }
+
+  var h0: int64 := hexVal(StrCharAt(s, idx));
+  var h1: int64 := hexVal(StrCharAt(s, idx + 1));
+  if (h0 < 0 || h1 < 0) { return PCI_E_BADARG; }
+  if (StrCharAt(s, idx + 2) != 58) { return PCI_E_BADARG; }   // ':'
+  var bus: int64 := (h0 << 4) | h1;
+
+  var h2: int64 := hexVal(StrCharAt(s, idx + 3));
+  var h3: int64 := hexVal(StrCharAt(s, idx + 4));
+  if (h2 < 0 || h3 < 0) { return PCI_E_BADARG; }
+  if (StrCharAt(s, idx + 5) != 46) { return PCI_E_BADARG; }   // '.'
+  var dev: int64 := (h2 << 4) | h3;
+
+  var f: int64 := hexVal(StrCharAt(s, idx + 6));
+  if (f < 0 || f > 7) { return PCI_E_BADARG; }
+  if (dev > 31) { return PCI_E_BADARG; }
+
+  // Rest muss leer sein — "03:00.0x" ist keine gueltige Adresse.
+  if ((idx + 7) != n) { return PCI_E_BADARG; }
+
+  return PciBdfMake(dom, bus, dev, f);
+}
+
+// Schreibt "0000:03:00.0" nach dest (mindestens PCI_BDF_STR_LEN Bytes).
+pub fn PciBdfFormat(dest: int64, bdf: int64): int64 {
+  if (dest == 0) { return PCI_E_BADARG; }
+  if (bdf < 0)   { return PCI_E_BADARG; }
+  var p: int64 := 0;
+  p := PciStrAppendHex(dest, p, PCI_BDF_STR_LEN, PciBdfDomain(bdf), 4);
+  poke8(dest + p, 58); p := p + 1;                                    // ':'
+  p := PciStrAppendHex(dest, p, PCI_BDF_STR_LEN, PciBdfBus(bdf), 2);
+  poke8(dest + p, 58); p := p + 1;                                    // ':'
+  p := PciStrAppendHex(dest, p, PCI_BDF_STR_LEN, PciBdfDevice(bdf), 2);
+  poke8(dest + p, 46); p := p + 1;                                    // '.'
+  poke8(dest + p, 48 + PciBdfFunction(bdf)); p := p + 1;
+  poke8(dest + p, 0);
+  return p;
+}
+
+// ============================================================
+// sysfs-Pfade
+// ============================================================
+
+// Baut "/sys/bus/pci/devices/<bdf>[/<suffix>]" nach dest (PCI_PATH_MAX Bytes).
+// suffix == 0 laesst den Anhang weg.
+pub fn PciSysfsPath(dest: int64, bdf: int64, suffix: pchar): int64 {
+  if (dest == 0) { return PCI_E_BADARG; }
+  if (bdf < 0)   { return PCI_E_BADARG; }
+  var p: int64 := 0;
+  p := PciStrAppend(dest, p, PCI_PATH_MAX, PCI_SYSFS_DEVICES);
+  poke8(dest + p, 47); p := p + 1;   // '/'
+  poke8(dest + p, 0);
+  p := PciStrAppendHex(dest, p, PCI_PATH_MAX, PciBdfDomain(bdf), 4);
+  poke8(dest + p, 58); p := p + 1;
+  p := PciStrAppendHex(dest, p, PCI_PATH_MAX, PciBdfBus(bdf), 2);
+  poke8(dest + p, 58); p := p + 1;
+  p := PciStrAppendHex(dest, p, PCI_PATH_MAX, PciBdfDevice(bdf), 2);
+  poke8(dest + p, 46); p := p + 1;
+  poke8(dest + p, 48 + PciBdfFunction(bdf)); p := p + 1;
+  poke8(dest + p, 0);
+  if (suffix != 0 as pchar) {
+    poke8(dest + p, 47); p := p + 1;  // '/'
+    poke8(dest + p, 0);
+    p := PciStrAppend(dest, p, PCI_PATH_MAX, suffix);
+  }
+  return p;
+}
+
+// "resource0".."resource5" — der Index wird geprueft, weil ein falscher
+// Index sonst auf eine fremde Datei zeigen wuerde.
+pub fn PciSysfsResourcePath(dest: int64, bdf: int64, idx: int64): int64 {
+  if (idx < 0 || idx >= PCI_BAR_COUNT) { return PCI_E_BADARG; }
+  var suffix: int64 := alloc(16);
+  if (suffix == 0) { return PCI_E_NOMEM; }
+  var q: int64 := PciStrAppend(suffix, 0, 16, "resource");
+  poke8(suffix + q, 48 + idx); q := q + 1;
+  poke8(suffix + q, 0);
+  var r: int64 := PciSysfsPath(dest, bdf, suffix as pchar);
+  free(suffix, 16);
+  return r;
+}
+
+// ============================================================
+// Umgebungsvariablen ohne libc
+// ============================================================
+//
+// getenv() kaeme aus der C-Bibliothek und machte jedes Programm, das diese
+// Unit nutzt, dynamisch gelinkt — auf LyxOS gibt es dafuer keinen Loader.
+// /proc/self/environ liefert dieselbe Information als NUL-getrennte Liste.
+
+pub con PCI_ENV_BUF: int64 := 8192;
+
+// Sucht name in /proc/self/environ. Treffer: frisch allokierte Kopie des
+// Wertes (Aufrufer gibt sie mit free(ptr, PCI_ENV_BUF) frei). Kein Treffer
+// oder /proc nicht lesbar: 0.
+pub fn PciGetEnv(name: pchar): pchar {
+  var fd: int64 := open("/proc/self/environ", PCI_O_RDONLY, 0);
+  if (fd < 0) { return 0 as pchar; }
+  var buf: int64 := alloc(PCI_ENV_BUF);
+  if (buf == 0) { close(fd); return 0 as pchar; }
+  var n: int64 := read(fd, buf as pchar, PCI_ENV_BUF - 1);
+  close(fd);
+  if (n <= 0) { free(buf, PCI_ENV_BUF); return 0 as pchar; }
+  poke8(buf + n, 0);
+
+  var nameLen: int64 := StrLen(name);
+  var i: int64 := 0;
+  while (i < n) {
+    // Eintrag beginnt bei i und endet am naechsten NUL.
+    var end: int64 := i;
+    while (end < n && peek8(buf + end) != 0) { end := end + 1; }
+
+    var matches: int64 := 0;
+    if ((end - i) > nameLen) {
+      if (peek8(buf + i + nameLen) == 61) {   // '='
+        matches := 1;
+        var k: int64 := 0;
+        while (k < nameLen) {
+          if (peek8(buf + i + k) != StrCharAt(name, k)) { matches := 0; }
+          k := k + 1;
+        }
+      }
+    }
+
+    if (matches == 1) {
+      var valStart: int64 := i + nameLen + 1;
+      var valLen: int64 := end - valStart;
+      var outp: int64 := alloc(PCI_ENV_BUF);
+      if (outp == 0) { free(buf, PCI_ENV_BUF); return 0 as pchar; }
+      var j: int64 := 0;
+      while (j < valLen && j < (PCI_ENV_BUF - 1)) {
+        poke8(outp + j, peek8(buf + valStart + j));
+        j := j + 1;
+      }
+      poke8(outp + j, 0);
+      free(buf, PCI_ENV_BUF);
+      return outp as pchar;
+    }
+
+    i := end + 1;
+  }
+
+  free(buf, PCI_ENV_BUF);
+  return 0 as pchar;
+}

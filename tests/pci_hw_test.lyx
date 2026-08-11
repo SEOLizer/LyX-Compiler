@@ -1,0 +1,116 @@
+// tests/pci_hw_test.lyx
+// PCI Phase 1 — Test gegen echte Hardware, ausschliesslich lesend.
+//
+// Er schreibt nichts in irgendeinen Config-Space: ein Testlauf darf die
+// Maschine nicht umkonfigurieren. Fehlt /sys/bus/pci (Container, LyxOS,
+// anderer Kernel), sagt der Lauf das ausdruecklich, statt gruen zu melden,
+// er habe etwas geprueft.
+//
+// Abnahmekriterien:
+// AC-H1 Die Host-Bridge 0000:00:00.0 ist lesbar und plausibel
+// AC-H2 Enumeration liefert mindestens ein Geraet
+// AC-H3 Jede gemeldete BDF laesst sich wieder oeffnen und lesen
+// AC-H4 Format(Parse(x)) == x fuer jede gemeldete Adresse
+
+unit tests.pci_hw_test;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.hardware.pci_config;
+import std.hardware.pci_enum;
+import std.alloc;
+import std.string;
+import std.fs;
+import std.io;
+
+var failures: int64 := 0;
+
+fn ok(name: pchar) {
+  Print("PASS "); PrintLn(name);
+}
+
+fn bad(name: pchar, detail: pchar) {
+  failures := failures + 1;
+  Print("FAIL "); Print(name); Print(": "); PrintLn(detail);
+}
+
+fn main(): int64 {
+  PrintLn("=== PCI Phase 1: Hardware (nur lesend) ===");
+
+  if (!IsDirectory(PCI_SYSFS_DEVICES)) {
+    PrintLn("SKIP kein /sys/bus/pci — nichts geprueft (kein PCI-Bus sichtbar)");
+    return 0;
+  }
+
+  // AC-H1: Host-Bridge
+  var hostBdf: int64 := PciBdfParse("0000:00:00.0");
+  var hctx: int64 := PciCfgOpenSysfs(hostBdf);
+  if (hctx <= 0) {
+    // Kein Fehlschlag: nicht jede Maschine legt 00:00.0 an (manche VMs).
+    PrintLn("HINWEIS 0000:00:00.0 nicht vorhanden — AC-H1 uebersprungen");
+  } else {
+    var vid: int64 := PciVendorId(hctx);
+    if (vid > 0 && vid != 65535) { ok("AC-H1 host bridge vendor-id gelesen"); }
+    else { bad("AC-H1 host bridge vendor-id", "0 oder 0xFFFF"); }
+
+    var hdr: int64 := PciHeaderType(hctx);
+    if (hdr == PCI_HDR_ENDPOINT || hdr == PCI_HDR_BRIDGE) { ok("AC-H1 header-typ plausibel"); }
+    else { bad("AC-H1 header-typ", IntToStr(hdr)); }
+
+    var size: int64 := PciCfgSize(hctx);
+    if (size == PCI_CFG_SIZE_LEGACY || size == PCI_CFG_SIZE_PCIE) { ok("AC-H1 config-groesse erkannt"); }
+    else { bad("AC-H1 config-groesse", IntToStr(size)); }
+
+    PciCfgClose(hctx);
+  }
+
+  // AC-H2: Enumeration
+  var buf: int64 := alloc(PCI_ENUM_MAX * 8);
+  var n: int64 := PciEnumSysfs(buf, PCI_ENUM_MAX);
+  if (n < 0) {
+    bad("AC-H2 enumeration", PciErrorName(n));
+    free(buf, PCI_ENUM_MAX * 8);
+    Print("=== Fehlgeschlagen: "); PrintLn(IntToStr(failures));
+    if (failures > 0) { return 1; }
+    return 0;
+  }
+  if (n >= 1) { Print("PASS AC-H2 geraete gefunden: "); PrintLn(IntToStr(n)); }
+  else { bad("AC-H2 geraete gefunden", "0 — sysfs vorhanden, aber leer"); }
+
+  // AC-H3/AC-H4 fuer jedes gemeldete Geraet
+  var pathBuf: int64 := alloc(PCI_PATH_MAX);
+  var pathStr: pchar := pathBuf as pchar;
+  var i: int64 := 0;
+  var openFails: int64 := 0;
+  var roundtripFails: int64 := 0;
+  while (i < n) {
+    var bdf: int64 := peek64(buf + i * 8);
+
+    PciBdfFormat(pathBuf, bdf);
+    if (PciBdfParse(pathStr) != bdf) { roundtripFails := roundtripFails + 1; }
+
+    var ctx: int64 := PciCfgOpenSysfs(bdf);
+    if (ctx <= 0) {
+      openFails := openFails + 1;
+    } else {
+      var vid: int64 := PciVendorId(ctx);
+      var cls: int64 := PciBaseClass(ctx);
+      if (vid <= 0 || vid == 65535 || cls < 0) { openFails := openFails + 1; }
+      PciCfgClose(ctx);
+    }
+    i := i + 1;
+  }
+
+  if (openFails == 0) { ok("AC-H3 alle gemeldeten geraete lesbar"); }
+  else { bad("AC-H3 lesbare geraete", IntToStr(openFails)); }
+
+  if (roundtripFails == 0) { ok("AC-H4 format/parse rundlauf stabil"); }
+  else { bad("AC-H4 format/parse rundlauf", IntToStr(roundtripFails)); }
+
+  free(pathBuf, PCI_PATH_MAX);
+  free(buf, PCI_ENUM_MAX * 8);
+
+  Print("=== Fehlgeschlagen: "); PrintLn(IntToStr(failures));
+  if (failures > 0) { return 1; }
+  return 0;
+}

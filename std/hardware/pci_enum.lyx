@@ -1,0 +1,196 @@
+// std/hardware/pci_enum.lyx
+// PCI-04: Geraete finden.
+//
+// Zwei Wege, dieselbe Ausgabe (eine Liste gepackter BDFs):
+//   * sysfs — der Kernel hat den Bus bereits durchsucht, wir lesen nur ab.
+//   * Scan  — Bus/Device/Function selbst durchgehen. Fuer bare metal und
+//             LyxOS, wo es kein sysfs gibt.
+//
+// Beide liefern BDFs, keine offenen Kontexte: Enumeration darf nicht
+// nebenbei hunderte Dateideskriptoren offen halten.
+
+@description("PCI device enumeration via sysfs or bus scan")
+@author("Andreas Roene")
+unit std.hardware.pci_enum;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.hardware.pci_config;
+import std.alloc;
+import std.fs;
+
+// ============================================================
+// sysfs
+// ============================================================
+
+// Schreibt bis zu maxCount gepackte BDFs als int64-Array nach out.
+// Rueckgabe: Anzahl gefundener Geraete oder ein negativer Fehlercode.
+//
+// Ein Verzeichniseintrag, der nicht wie eine BDF aussieht, wird uebergangen
+// (sysfs legt dort nichts anderes ab, aber ein unerwarteter Name darf die
+// Aufzaehlung nicht abbrechen). Ein nicht lesbares Verzeichnis dagegen ist
+// ein Fehler und wird gemeldet — sonst saehe "kein PCI vorhanden" genauso
+// aus wie "keine Rechte".
+pub fn PciEnumSysfs(out: int64, maxCount: int64): int64 {
+  if (out == 0 || maxCount <= 0) { return PCI_E_BADARG; }
+  if (!IsDirectory(PCI_SYSFS_DEVICES)) { return PCI_E_NOTSUP; }
+
+  var dl: int64 := DirList(PCI_SYSFS_DEVICES);
+  if (dl == 0) { return PCI_E_PERM; }
+
+  var total: int64 := DirEntryCount(dl);
+  var i: int64 := 0;
+  var n: int64 := 0;
+  while (i < total && n < maxCount) {
+    var name: pchar := DirEntryName(dl, i);
+    if (name != 0 as pchar) {
+      var bdf: int64 := PciBdfParse(name);
+      if (bdf >= 0) {
+        poke64(out + n * 8, bdf);
+        n := n + 1;
+      }
+    }
+    i := i + 1;
+  }
+  DirFree(dl);
+  return n;
+}
+
+// ============================================================
+// Bus-Scan (ohne Kernel-Hilfe)
+// ============================================================
+
+// Oeffnet einen Config-Kontext fuer eine Adresse ueber das gewaehlte
+// Backend. base wird nur von ECAM benutzt.
+fn openScanCtx(backend: int64, base: int64, bdf: int64): int64 {
+  if (backend == PCI_BACKEND_ECAM) {
+    // ECAM-Fenster: base + (bus << 20) + (dev << 15) + (fn << 12)
+    var off: int64 := (PciBdfBus(bdf) << 20) | (PciBdfDevice(bdf) << 15) | (PciBdfFunction(bdf) << 12);
+    return PciCfgOpenEcam(base + off, bdf);
+  }
+  if (backend == PCI_BACKEND_PORTIO) { return PciCfgOpenPortIo(bdf); }
+  return PCI_E_NOBACKEND;
+}
+
+// Durchsucht die Busse von busFrom bis busTo (einschliesslich).
+// Function > 0 wird nur betreten, wenn Funktion 0 das Multifunction-Bit
+// gesetzt hat — sonst antwortet ein Single-Function-Geraet auf allen acht
+// Funktionen und die Liste enthaelt dasselbe Geraet achtmal.
+pub fn PciEnumScanRange(out: int64, maxCount: int64, backend: int64, base: int64,
+                        busFrom: int64, busTo: int64): int64 {
+  if (out == 0 || maxCount <= 0) { return PCI_E_BADARG; }
+  if (busFrom < 0 || busTo > 255 || busFrom > busTo) { return PCI_E_BADARG; }
+  if (backend != PCI_BACKEND_ECAM && backend != PCI_BACKEND_PORTIO) { return PCI_E_NOBACKEND; }
+
+  var n: int64 := 0;
+  var bus: int64 := busFrom;
+  while (bus <= busTo && n < maxCount) {
+    var dev: int64 := 0;
+    while (dev < 32 && n < maxCount) {
+      var maxFn: int64 := 1;
+      var fun: int64 := 0;
+      while (fun < maxFn && n < maxCount) {
+        var bdf: int64 := PciBdfMake(0, bus, dev, fun);
+        if (bdf >= 0) {
+          var ctx: int64 := openScanCtx(backend, base, bdf);
+          if (ctx > 0) {
+            var present: int64 := PciCfgDevicePresent(ctx);
+            if (present == 1) {
+              poke64(out + n * 8, bdf);
+              n := n + 1;
+              if (fun == 0) {
+                if (PciIsMultifunction(ctx) == 1) { maxFn := 8; }
+              }
+            }
+            PciCfgClose(ctx);
+          } else {
+            // Backend nicht benutzbar (z.B. portio ohne Portrechte): das
+            // ist ein Fehler des Aufrufs, kein leeres Ergebnis.
+            return ctx;
+          }
+        }
+        fun := fun + 1;
+      }
+      dev := dev + 1;
+    }
+    bus := bus + 1;
+  }
+  return n;
+}
+
+pub fn PciEnumScan(out: int64, maxCount: int64, backend: int64, base: int64): int64 {
+  return PciEnumScanRange(out, maxCount, backend, base, 0, 255);
+}
+
+// ============================================================
+// Suchen
+// ============================================================
+
+pub con PCI_ENUM_MAX: int64 := 512;
+
+// Interner Helfer: Liste besorgen. Rueckgabe wie PciEnumSysfs.
+fn listDevices(out: int64, maxCount: int64): int64 {
+  return PciEnumSysfs(out, maxCount);
+}
+
+// Erstes Geraet mit passender Klasse. sub < 0 heisst "Subklasse egal".
+// Kein Treffer: PCI_E_NODEV. Fehler beim Auflisten wird durchgereicht.
+pub fn PciFindByClass(cls: int64, sub: int64): int64 {
+  var buf: int64 := alloc(PCI_ENUM_MAX * 8);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var n: int64 := listDevices(buf, PCI_ENUM_MAX);
+  if (n < 0) { free(buf, PCI_ENUM_MAX * 8); return n; }
+
+  var i: int64 := 0;
+  var found: int64 := PCI_E_NODEV;
+  while (i < n && found < 0) {
+    var bdf: int64 := peek64(buf + i * 8);
+    var ctx: int64 := PciCfgOpenSysfs(bdf);
+    if (ctx > 0) {
+      var c: int64 := PciBaseClass(ctx);
+      var s: int64 := PciSubclass(ctx);
+      if (c == cls) {
+        if (sub < 0 || s == sub) { found := bdf; }
+      }
+      PciCfgClose(ctx);
+    }
+    i := i + 1;
+  }
+  free(buf, PCI_ENUM_MAX * 8);
+  return found;
+}
+
+// Erstes Geraet mit passender Vendor-/Device-ID. did < 0 heisst "egal".
+pub fn PciFindById(vid: int64, did: int64): int64 {
+  var buf: int64 := alloc(PCI_ENUM_MAX * 8);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var n: int64 := listDevices(buf, PCI_ENUM_MAX);
+  if (n < 0) { free(buf, PCI_ENUM_MAX * 8); return n; }
+
+  var i: int64 := 0;
+  var found: int64 := PCI_E_NODEV;
+  while (i < n && found < 0) {
+    var bdf: int64 := peek64(buf + i * 8);
+    var ctx: int64 := PciCfgOpenSysfs(bdf);
+    if (ctx > 0) {
+      var v: int64 := PciVendorId(ctx);
+      var d: int64 := PciDeviceId(ctx);
+      if (v == vid) {
+        if (did < 0 || d == did) { found := bdf; }
+      }
+      PciCfgClose(ctx);
+    }
+    i := i + 1;
+  }
+  free(buf, PCI_ENUM_MAX * 8);
+  return found;
+}
+
+// Zaehlt die Geraete, die der Kernel kennt.
+pub fn PciDeviceCount(): int64 {
+  var buf: int64 := alloc(PCI_ENUM_MAX * 8);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var n: int64 := listDevices(buf, PCI_ENUM_MAX);
+  free(buf, PCI_ENUM_MAX * 8);
+  return n;
+}
