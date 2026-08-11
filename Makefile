@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.15F
+VERSION   := 1.0.15G
 VERSION_DATE := 2026-08-10
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -418,6 +418,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Gemischte Arithmetik, try/catch, Build-Vorgabe (12 Pruefungen) ---"
 	@bash tests/mixed_arith_trycatch_test.sh
+	@echo "OK"
+	@echo "--- Schmale Schreibzugriffe und fn-Zeiger-Konvention (12 Pruefungen) ---"
+	@bash tests/narrow_store_test.sh
 	@echo "OK"
 	@echo "--- TextMate-Grammatik: Schluesselwoerter und Typen vollstaendig ---"
 	@bash tests/syntax/test_grammar.sh

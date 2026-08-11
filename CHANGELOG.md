@@ -2,6 +2,35 @@
 
 ## Unveröffentlicht (develop)
 
+### BRUCH seit 1.0.x — Aufrufkonvention für `fn`-Zeiger (#1274)
+
+**Wer `fn`-Zeiger aus roher Maschinencode-Adresse baut, muss seinen Code
+prüfen.** Der Compiler meldet hier nichts, und alter Code übersetzt weiterhin.
+
+Bis 0.9.x war ein `fn`-Zeiger ein **Closure-Deskriptor**: der Wert zeigte auf
+einen Zwei-Wort-Block, `[fp+0]` = Codeadresse, `[fp+8]` = Umgebung. Der Aufruf
+übergab die Umgebung in `rdi` und schob die deklarierten Argumente nach `rsi`,
+`rdx`, …
+
+Seither **ist** der Wert die Codeadresse, und die deklarierten Argumente folgen
+SysV unmittelbar: arg0 in `rdi`, arg1 in `rsi`, arg2 in `rdx`.
+
+```lyx
+var f: fn(int64,int64): int64 := adresse as fn(int64,int64): int64;
+f(a, b);        // a landet in rdi, b in rsi
+```
+
+Betroffen ist handgeschriebener Maschinencode, der über einen `fn`-Zeiger
+gerufen wird und die Argumente noch nach der alten Regel aus `rsi`/`rdx` liest
+— etwa Kontextwechsel, Scheduler-Primitive oder Fences in LyxOS. Solcher Code
+läuft nach dem Wechsel weiter und liest die falschen Register.
+
+Die neue Konvention bleibt: sie ist die einfachere und kostet keinen
+Indirektionsschritt. Eine Warnung an der `as`-Umwandlung wäre kein Gewinn —
+sie träfe genau die legitime Schreibweise, mit der man einen solchen Zeiger
+überhaupt baut, und sagte nichts darüber, welche Konvention der Zielcode
+erwartet. Der Hinweis gehört deshalb hierher und nicht in den Compiler.
+
 ### Compiler — `Map<K,V>` ist ein benutzbarer Sprachtyp (#1152, #1205)
 
 `Map<K,V>` wurde geparst, das Literal übersetzte, und **keine** Operation
