@@ -1209,6 +1209,27 @@ pub type Sema = class {
     self.expScanned := self.symCount;
   }
 
+  // #1235: Deklarationsknoten der Klasse eines Ausdrucks, oder -1.
+  // Bewusst nur fuer einen Bezeichner — `dispose` steht in der Praxis auf einer
+  // Variablen, und eine breitere Aufloesung waere hier ungeprueftes Gelaende.
+  fn _exprClassDeclNi(ni: int64): int64 {
+    if (ni < 0) { return 0 - 1; }
+    if (self.sn_kind(ni) != SNK_IDENT) { return 0 - 1; }
+    var si: int64 := self.Lookup(self.sn_sVal(ni), self.sn_sLen(ni));
+    if (si < 0) { return 0 - 1; }
+    if (self.SymKind(si) != SYM_VAR) { return 0 - 1; }
+    var declNi: int64 := self.SymNodeIdx(si);
+    if (declNi < 0) { return 0 - 1; }
+    if (self.sn_kind(declNi) != SNK_VAR_DECL) { return 0 - 1; }
+    var typeNi: int64 := self.sn_c0(declNi);
+    if (typeNi < 0) { return 0 - 1; }
+    var tlen: int64 := self.sn_sLen(typeNi);
+    if (tlen <= 0) { return 0 - 1; }
+    var cs: int64 := self.Lookup(self.sn_sVal(typeNi), tlen);
+    if (cs < 0) { return 0 - 1; }
+    return self.SymNodeIdx(cs);
+  }
+
   fn _reportSymbolCollision(symName: pchar, symLen: int64,
                             modA: pchar, modALen: int64,
                             modB: pchar, modBLen: int64) {
@@ -2772,6 +2793,46 @@ pub type Sema = class {
       var arg: int64 := self.sn_c0(ni);
       while (arg >= 0) { self._checkExpr(arg); arg := self.sn_next(arg); }
 
+      // #1236: Die Argumente wurden geprueft, aber nie gegen den Konstruktor
+      // GEZAEHLT. `new L()` bei `Create(x: int64)` uebersetzte deshalb klaglos;
+      // Create las als x, was zufaellig im Register stand, und das Feld trug
+      // danach einen Speicherrest (beobachtet: 4096). Fuer freie Funktionen
+      // greift die Zaehlung seit WP-ARITY laengst — der Konstruktor war die
+      // Luecke.
+      if (newSym >= 0) {
+        var cNi: int64 := self.SymNodeIdx(newSym);
+        if (cNi >= 0) {
+          var cm: int64 := self.sn_c1(cNi);
+          while (cm >= 0) {
+            if (self.sn_kind(cm) == SNK_FUNC_DECL &&
+                self._strNEq(self.sn_sVal(cm), self.sn_sLen(cm), "Create"c, 6) != 0) {
+              var cVariadic: int64 := (self.sn_iVal(cm) >> 24) & 1;
+              if (cVariadic == 0) {
+                var cpc: int64 := 0;
+                var cpcMin: int64 := 0;
+                var sawDef: int64 := 0;
+                var cp: int64 := self.sn_c0(cm);
+                while (cp >= 0) {
+                  cpc := cpc + 1;
+                  if (self.sn_c1(cp) >= 0) { sawDef := 1; }
+                  else { if (sawDef == 0) { cpcMin := cpcMin + 1; } else { cpcMin := cpc; } }
+                  cp := self.sn_next(cp);
+                }
+                var cac: int64 := 0;
+                var ca: int64 := self.sn_c0(ni);
+                while (ca >= 0) { cac := cac + 1; ca := self.sn_next(ca); }
+                if (cac < cpcMin || cac > cpc) {
+                  self._errorNodeName("falsche Argument-Anzahl fuer den Konstruktor von", ni, newName, newLen);
+                }
+              }
+              cm := 0 - 1;
+            } else {
+              cm := self.sn_next(cm);
+            }
+          }
+        }
+      }
+
     } else if (k == SNK_CAST) {
       // WP-11: x as Type — check source expression and target type
       self._checkExpr(self.sn_c0(ni));
@@ -3212,6 +3273,24 @@ pub type Sema = class {
 
     } else if (k == SNK_DISPOSE) {
       self._checkExpr(self.sn_c0(ni));
+      // #1235: Vermerken, ob die Klasse einen Destruktor hat. Der Codegen kann
+      // das selbst nicht feststellen — seine Registry fuehrt nur Methoden MIT
+      // Rueckgabetyp, und ein Destruktor hat typischerweise keinen. Hier liegt
+      // die Methodenliste der Klasse vor, also wird die Antwort hier bestimmt
+      // und im iVal des Knotens hinterlegt (1 = Destroy vorhanden).
+      var dTypeName: int64 := self._exprClassDeclNi(self.sn_c0(ni));
+      if (dTypeName >= 0) {
+        var dm: int64 := self.sn_c1(dTypeName);
+        while (dm >= 0) {
+          if (self.sn_kind(dm) == SNK_FUNC_DECL &&
+              self._strNEq(self.sn_sVal(dm), self.sn_sLen(dm), "Destroy"c, 7) != 0) {
+            poke64(self.sn_off(ni) + NODE_OFF_IVAL, 1);
+            dm := 0 - 1;
+          } else {
+            dm := self.sn_next(dm);
+          }
+        }
+      }
 
     // WP-BC-07: assert(cond)
     } else if (k == SNK_ASSERT) {
@@ -4906,13 +4985,41 @@ pub type Sema = class {
           self._errorNodeName("unknown parent class", ni, parentName, parentLen);
         }
         // Check that methods marked override exist in parent (name check only)
+        //
+        // #1288: Hier stand ein leerer Zweig ("full method signature check
+        // deferred"). Die Folge war kein bloss fehlender Hinweis, sondern ein
+        // Absturz: implementiert eine Unterklasse eine ABSTRAKTE Methode ohne
+        // `override`, gilt sie als eigene, neue Methode. Der geerbte
+        // VMT-Eintrag der abstrakten Methode bleibt leer, und der Aufruf
+        // springt eine Null an — SIGSEGV, ohne jede Meldung beim Uebersetzen.
+        //
+        // Mit `override` laeuft dasselbe Programm. Der Unterschied ist fuer den
+        // Schreibenden nicht sichtbar, deshalb wird er jetzt benannt.
         var mth: int64 := self.sn_c1(ni);
         while (mth >= 0) {
           if self.sn_kind(mth) == SNK_FUNC_DECL {
             var flags: int64 := self.sn_iVal(mth);
             var isOverride: int64 := (flags >> 2) & 1;
-            if (isOverride != 0 && parentSym >= 0) {
-              // Minimal check: parent exists; full method signature check deferred
+            if (isOverride == 0 && parentSym >= 0) {
+              var pNi: int64 := self.SymNodeIdx(parentSym);
+              if (pNi >= 0) {
+                var mName: pchar := self.sn_sVal(mth);
+                var mLen:  int64 := self.sn_sLen(mth);
+                var pm: int64 := self.sn_c1(pNi);
+                while (pm >= 0) {
+                  if (self.sn_kind(pm) == SNK_FUNC_DECL &&
+                      self._strNEq(mName, mLen, self.sn_sVal(pm), self.sn_sLen(pm)) != 0) {
+                    // Bit1 des Methoden-iVal markiert abstract.
+                    var pAbstract: int64 := (self.sn_iVal(pm) >> 1) & 1;
+                    if (pAbstract != 0) {
+                      self._errorNodeName("implementiert eine abstrakte Methode, braucht dafuer aber 'override' —", mth, mName, mLen);
+                    }
+                    pm := 0 - 1;
+                  } else {
+                    pm := self.sn_next(pm);
+                  }
+                }
+              }
             }
           }
           mth := self.sn_next(mth);

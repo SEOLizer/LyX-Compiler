@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.16E
+VERSION   := 1.0.16F
 VERSION_DATE := 2026-08-11
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -445,6 +445,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Builtin-Auswahl: Cast und Argumentzahl (7 Pruefungen) ---"
 	@bash tests/builtin_dispatch_test.sh
+	@echo "OK"
+	@echo "--- Klassen-Lebenszyklus: dispose, new, override (11 Pruefungen) ---"
+	@bash tests/class_lifecycle_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh
