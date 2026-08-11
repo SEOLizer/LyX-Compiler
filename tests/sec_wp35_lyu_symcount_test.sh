@@ -82,10 +82,14 @@ EC=0; "$LYXC" "$TMP/t2.lyx" -o "$TMP/t2" 2>/dev/null || EC=$?
 if [ $EC -eq 0 ] && "$TMP/t2" > /dev/null 2>&1; then _pass 2; else _fail 2 "import src.std.io schlägt fehl (EC=$EC)"; fi
 
 # Test 3: import src.std.fs kompiliert
+# #1264: Der Aufruf liess `mode` weg — `FileOpen` hat drei Parameter. Beim
+# reinen Lesen ignoriert der Kernel den Wert, deshalb fiel nie auf, dass er vom
+# Stack kam. Seit die Stelligkeit ueber Unit-Grenzen geprueft wird, steht er
+# hier vollstaendig.
 cat > "$TMP/t3.lyx" << 'LYXEOF'
 import src.std.fs;
 fn main(): int64 {
-  var fd: int64 := FileOpen("/dev/null"c, 0);
+  var fd: int64 := FileOpen("/dev/null"c, 0, 0);
   if fd >= 0 { FileClose(fd); return 0; }
   return 1;
 }

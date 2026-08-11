@@ -99,14 +99,18 @@ fn main(): int64 { var a := new V(); a.x := 5; PrintLn(IntToStr(a.Get())); retur
 if ! grep -q landlock /sys/kernel/security/lsm 2>/dev/null; then
   echo "SKIP #1173: Kernel ohne Landlock (/sys/kernel/security/lsm) — Verweigerung nicht messbar"
 else
+  # #1264: Die Aufrufe gaben `mode` nicht mit — `FileOpen` hat drei Parameter.
+  # Beim reinen Lesen ignoriert der Kernel den Wert, deshalb fiel nie auf, dass
+  # er vom Stack kam. Seit die Stelligkeit ueber Unit-Grenzen geprueft wird,
+  # ist der Aufruf ein Fehler; hier steht er jetzt vollstaendig.
   echo "hallo" > /tmp/lyx_caps_test_datei.txt
   printf '%s\n' '@capabilities([fs.read(path: "/tmp"), system.exit, system.memory.heap])
 import src.std.fs;
 import src.std.io;
 fn main(): int64 {
-    var f: int64 := FileOpen("/tmp/lyx_caps_test_datei.txt"c, 0);
+    var f: int64 := FileOpen("/tmp/lyx_caps_test_datei.txt"c, 0, 0);
     if (f >= 0) { PrintLn("innen offen"); } else { PrintLn("innen verweigert"); }
-    var g: int64 := FileOpen("/etc/hostname"c, 0);
+    var g: int64 := FileOpen("/etc/hostname"c, 0, 0);
     if (g >= 0) { PrintLn("aussen offen"); } else { PrintLn("aussen verweigert"); }
     return 0;
 }' > "$TMP/ll.lyx"
@@ -125,7 +129,7 @@ aussen verweigert" ]; then ok "fs.read(path:) beschraenkt auf den genannten Pfad
 import src.std.fs;
 import src.std.io;
 fn main(): int64 {
-    var g: int64 := FileOpen("/etc/hostname"c, 0);
+    var g: int64 := FileOpen("/etc/hostname"c, 0, 0);
     if (g >= 0) { PrintLn("aussen offen"); } else { PrintLn("aussen verweigert"); }
     return 0;
 }' > "$TMP/ll2.lyx"

@@ -82,6 +82,14 @@ pub con TY_RANGE:      int64 := 26;  // range type: 1..100
 pub con TY_PCHAR_NULLABLE: int64 := 27;  // pchar? — optional pointer, null-safe
 pub con TY_RING_BUFFER:    int64 := 28;  // WP-BC-17: RingBuffer<T> lock-free ring buffer
 pub con TY_PARALLEL_ARRAY: int64 := 29;  // WP-BC-18: parallel Array<T> SIMD vector
+// #1295/#1238: Einheitentyp (utype). Eigene Kennung, weil er WEDER Zahl noch
+// zusammengesetzter Typ ist: `var w: Deg := calc()` mit int64-Rueckgabe ist
+// voellig richtig (Einheiten rechnen), und `Struct/Klasse` zu melden waere
+// ebenso falsch. _typeClass gibt dafuer 0 zurueck — unbestimmt, wird also
+// nicht beurteilt —, aber die Kennung ist NICHT TY_UNKNOWN, damit
+// `var w: Deg` weiterhin ein bekannter Typ ist. Die Dimensionspruefung aus
+// #1110 laeuft unabhaengig davon ueber utDimTab.
+pub con TY_UTYPE: int64 := 31;
 pub con TY_TUPLE:          int64 := 30;  // WP-04: [T, T] tuple return type
 
 // Local copies of parser constants to avoid import-resolution issues
@@ -282,6 +290,36 @@ pub type Sema = class {
 
   // Symbol table (flat buffer of SEMA_SYM_SIZE byte entries)
   syms:     Array<SymRecord>;  // WP-POKE-08: heap array of symbol records
+  // #1295: Dimensionsname je utype-SYMBOL. Ein importiertes Modul wird in eine
+  // eigene Knoten-Arena geparst; danach zeigt der Knotenindex des Symbols ins
+  // Leere und wird auf -2 gesetzt ("unentscheidbar"). Damit war die Dimension
+  // eines importierten Einheitentyps nicht mehr feststellbar, und eine Laenge
+  // liess sich kommentarlos einer Zeit zuweisen — genau das, wogegen
+  // Einheitentypen antreten. Der Name wird deshalb ABGESCHRIEBEN, solange die
+  // fremde Arena noch gilt; die Zeichen liegen im Quelltextpuffer des Moduls,
+  // der erhalten bleibt. Eintrag: {namePtr, nameLen, dimPtr, dimLen} = 32 Byte.
+  // Geschluesselt wird ueber den NAMEN: Symbolindizes werden beim Verlassen
+  // eines Geltungsbereichs wiederverwendet.
+  utDimTab:   int64;
+  utDimCount: int64;
+  utDimCap:   int64;
+  // #1264: Signatur je FUNKTIONSsymbol. Die Stelligkeits- und Typpruefung am
+  // Aufruf brauchte bisher den Deklarationsknoten — den gibt es fuer eine
+  // importierte Funktion nicht mehr (eigene Arena, Index zeigt danach ins
+  // Leere). Geprueft wurde deshalb nur, was in DERSELBEN Datei steht; ein
+  // `Add(1)` auf eine importierte Funktion mit zwei Parametern uebersetzte
+  // klaglos und las den zweiten Wert vom Stack.
+  // Eintrag: {namePtr, nameLen, pcMin, pc, flags, typklassen} = 48 Byte.
+  // Geschluesselt wird ueber den NAMEN, nicht ueber den Symbolindex: Indizes
+  // werden beim Verlassen eines Geltungsbereichs wiederverwendet, ein Eintrag
+  // haette dann zu einer voellig anderen Funktion gehoert (beim Bauen des
+  // Compilers selbst aufgefallen: eine Signatur landete auf StrLen).
+  // flags Bit0 = variadisch, Bit1 = extern.
+  // typklassen: 4 Bit je Parameter (bis 16), Klasse aus _typeClass + 1;
+  // 0 heisst "unbestimmt" und wird nicht beurteilt.
+  fnSigTab:   int64;
+  fnSigCount: int64;
+  fnSigCap:   int64;
   symCount: int64;
   symCap:   int64;
 
@@ -943,6 +981,7 @@ pub type Sema = class {
     if (t == TY_BOOL || t == TY_CHAR) { return 1; }
     if (t == TY_PCHAR) { return 2; }
     if (t == TY_FLOAT64 || t == TY_FLOAT32) { return 3; }
+    if (t == TY_USER) { return 4; }   // #1238 MESSUNG
     return 0;
   }
 
@@ -993,6 +1032,9 @@ pub type Sema = class {
     if (t == TY_FLOAT32) { return "f32"c; }
     if (t == TY_BOOL) { return "bool"c; }
     if (t == TY_CHAR) { return "char"c; }
+    // #1238: Struct-, Klassen- und Enum-Typen sind jetzt beurteilbar; sie als
+    // `?` auszugeben, verschweigt dem Leser die Haelfte der Meldung.
+    if (t == TY_USER) { return "Struct/Klasse"c; }
     return "?"c;
   }
 
@@ -1073,7 +1115,28 @@ pub type Sema = class {
     var si: int64 := self.Lookup(nm, nl);
     if (si >= 0) {
       var sk: int64 := self.SymKind(si);
-      if (sk == SYM_STRUCT || sk == SYM_ENUM || sk == SYM_TYPE) { return TY_USER; }
+      // #1238: Ein Typ-ALIAS traegt seinen Grundtyp im Symbol (siehe die
+      // Registrierung von SNK_TYPE_DECL). Hier wurde er ignoriert und pauschal
+      // TY_USER geliefert — damit galt `date` als zusammengesetzter Typ, und
+      // die Typpruefung meldete jede Rueckgabe eines int64 an einer
+      // `date`-Signatur. Structs, Enums und Klassen bleiben TY_USER, weil ihr
+      // Symbol genau das traegt.
+      if (sk == SYM_TYPE) {
+        // #1238: Ein Alias traegt seinen Grundtyp im Symbol. Steht dort
+        // nichts (importierte Typen bekommen beim Einlesen TY_UNKNOWN), bleibt
+        // es bei der alten Lesart TY_USER — sonst gilt ein voellig gueltiger
+        // Typ als unbekannt, und `var m: Meter` wird abgewiesen.
+        // #1295: Ein importierter Einheitentyp kommt als TY_USER bzw.
+        // TY_UNKNOWN herein (die .lyu-Symboltabelle kennt utype nicht). Die
+        // Dimensionstabelle kennt ihn — und ein Einheitentyp RECHNET, er ist
+        // f64. Ohne diesen Zweig meldete `var m: Meter := 5` einen
+        // Typunterschied gegen "Struct/Klasse".
+        if (self._utFindDim(nm, nl) >= 0) { return TY_UTYPE; }
+        var stid: int64 := self.SymTypeId(si);
+        if (stid == TY_UNKNOWN) { return TY_USER; }
+        return stid;
+      }
+      if (sk == SYM_STRUCT || sk == SYM_ENUM) { return TY_USER; }
     }
     return TY_UNKNOWN;
   }
@@ -1447,6 +1510,76 @@ pub type Sema = class {
     return 0;
   }
 
+  // #1237: Die `unit`-Zeile war reine Dekoration — der Import loest ueber den
+  // DATEIPFAD auf, und niemand verglich den deklarierten Namen damit. Eine
+  // verschobene oder umbenannte Datei lief damit still auseinander: sie trug
+  // weiter den alten Namen, und niemand erfuhr davon.
+  //
+  // Geprueft wird der Name gegen den Importpfad. NICHT geprueft werden die
+  // beiden anderen Punkte aus dem Bericht: dass die Zeile ueberhaupt da sein
+  // muss (139 der 530 Dateien im Bestand haben keine — das waere eine
+  // Sprachaenderung, keine Fehlerbehebung) und dass sie in der ersten Zeile
+  // steht. Beides gehoert entschieden, nicht nebenbei verschaerft.
+  fn _sema_checkUnitName(src: pchar, srcLen: int64, modName: pchar, modLen: int64) {
+    var i: int64 := 0;
+    var done: int64 := 0;
+    while (i < srcLen && done == 0) {
+      // Leerraum am Zeilenanfang ueberspringen
+      var c: int64 := StrCharAt(src, i) & 255;
+      while (i < srcLen && (c == 32 || c == 9)) {
+        i := i + 1;
+        if (i < srcLen) { c := StrCharAt(src, i) & 255; }
+      }
+      // Beginnt hier `unit` + Trenner?
+      var isUnit: int64 := 0;
+      if (i + 5 <= srcLen) {
+        var c4: int64 := StrCharAt(src, i + 4) & 255;
+        if ((StrCharAt(src, i)     & 255) == 117 && (StrCharAt(src, i + 1) & 255) == 110
+         && (StrCharAt(src, i + 2) & 255) == 105 && (StrCharAt(src, i + 3) & 255) == 116
+         && (c4 == 32 || c4 == 9)) { isUnit := 1; }
+      }
+      if (isUnit != 0) {
+        var j: int64 := i + 4;
+        while (j < srcLen && ((StrCharAt(src, j) & 255) == 32 || (StrCharAt(src, j) & 255) == 9)) { j := j + 1; }
+        var nameStart: int64 := j;
+        var scanning: int64 := 1;
+        while (j < srcLen && scanning != 0) {
+          var nc: int64 := StrCharAt(src, j) & 255;
+          if (nc == 59 || nc == 10 || nc == 13 || nc == 32 || nc == 9) { scanning := 0; }
+          else { j := j + 1; }
+        }
+        var nameLen: int64 := j - nameStart;
+        if (nameLen > 0) {
+          var same: int64 := 1;
+          if (nameLen != modLen) { same := 0; }
+          else {
+            var k: int64 := 0;
+            while (k < nameLen) {
+              if ((StrCharAt(src, nameStart + k) & 255) != (StrCharAt(modName, k) & 255)) { same := 0; }
+              k := k + 1;
+            }
+          }
+          if (same == 0) {
+            EPrintStr("sema error: unit-Name stimmt nicht mit dem Importpfad ueberein: '"c);
+            sys_write(2, (src as int64) + nameStart, nameLen);
+            EPrintStr("' deklariert, '"c);
+            sys_write(2, modName as int64, modLen);
+            EPrintStrLn("' importiert"c);
+            EPrintStrLn("  Beim Verschieben oder Umbenennen laufen die beiden sonst still auseinander."c);
+            self.hadError   := 1;
+            self.errorCount += 1;
+          }
+        }
+        done := 1;
+      }
+      if (done == 0) {
+        // zur naechsten Zeile
+        while (i < srcLen && (StrCharAt(src, i) & 255) != 10) { i := i + 1; }
+        i := i + 1;
+      }
+    }
+  }
+
   fn _sema_processImport(modName: pchar, modLen: int64, importNi: int64) {
     if (self._sema_hasImported(modName, modLen) != 0) { return; }
     self._sema_markImported(modName, modLen);
@@ -1491,6 +1624,10 @@ pub type Sema = class {
 
     var path: pchar := pathBuf as pchar;
     var src: pchar  := self._sema_readFile(path);
+    if (src != 0 as pchar) {
+      // #1237: nur fuer .lyx — eine .lyu ist binaer und traegt keine Quelle.
+      self._sema_checkUnitName(src, StrLen(src), modName, modLen);
+    }
     if (src == 0 as pchar) {
       // WP-BC-50b: .lyx not found — try .lyu fallback (pre-compiled unit)
       StrSetChar(pathBuf as pchar, modLen + 3, 117);  // 'x' → 'u' → ".lyu"
@@ -1853,14 +1990,143 @@ pub type Sema = class {
   //
   // Die Deklaration traegt alles Noetige, eine eigene Registry braucht es
   // nicht: SNK_UTYPE_DECL hat c0 = Dimensionsname, c1 = Faktor, c2 = Grenzen.
+  // #1264: Signatur einer Funktion abschreiben, solange ihre Arena gilt.
+  fn _fnRecordSig(fname: pchar, fnameLen: int64, declNi: int64) {
+    if (declNi < 0) { return; }
+    var pc: int64 := 0;
+    var pcMin: int64 := 0;
+    var sawDefault: int64 := 0;
+    var tcls: int64 := 0;
+    var pp: int64 := self.sn_c0(declNi);
+    while (pp >= 0) {
+      if (pc < 16) {
+        var ptid: int64 := self.ResolveType(self.sn_c0(pp));
+        var cls: int64 := self._typeClass(ptid);
+        if (cls > 0) { tcls := tcls | ((cls + 1) << (pc * 4)); }
+      }
+      pc := pc + 1;
+      if (self.sn_c1(pp) >= 0) { sawDefault := 1; }
+      else { if (sawDefault == 0) { pcMin := pcMin + 1; } else { pcMin := pc; } }
+      pp := self.sn_next(pp);
+    }
+    var flags: int64 := 0;
+    if (((self.sn_iVal(declNi) >> 24) & 1) != 0) { flags := flags | 1; }
+    if ((self.sn_iVal(declNi) & 1) != 0)         { flags := flags | 2; }
+    if (self.fnSigCount >= self.fnSigCap) {
+      var nc: int64 := self.fnSigCap * 2;
+      if (nc < 64) { nc := 64; }
+      var nb: int64 := alloc(nc * 48);
+      memcpy(nb, self.fnSigTab, self.fnSigCount * 48);
+      self.fnSigTab := nb;
+      self.fnSigCap := nc;
+    }
+    var base: int64 := self.fnSigTab + self.fnSigCount * 48;
+    poke64(base,      fname as int64);
+    poke64(base + 8,  fnameLen);
+    poke64(base + 16, pcMin);
+    poke64(base + 24, pc);
+    poke64(base + 32, flags);
+    poke64(base + 40, tcls);
+    self.fnSigCount := self.fnSigCount + 1;
+  }
+
+  // Eintrag zu einem Funktionsnamen, oder -1.
+  //
+  // MEHRDEUTIGE Namen werden nicht beurteilt. Der Namensraum ist flach, und
+  // manche Namen gibt es doppelt: `PrintLn` etwa als Unit-Funktion OHNE
+  // Parameter und zugleich als Builtin, das eines nimmt — `PrintLn(x)` ist
+  // voellig richtig. Wer da den zuletzt eingetragenen Eintrag nimmt, meldet
+  // gueltige Aufrufe. Weichen zwei Eintraege in der Stelligkeit voneinander
+  // ab, gilt der Name deshalb als unentscheidbar.
+  // Gibt es ein BUILTIN dieses Namens? Dann wird nicht geurteilt: `PrintLn`
+  // etwa ist zugleich eine Unit-Funktion OHNE Parameter und ein Builtin, das
+  // eines nimmt — `PrintLn(x)` ist voellig richtig, und die Stelligkeit der
+  // Unit-Funktion sagt darueber nichts.
+  fn _fnNameIsBuiltin(fname: pchar, fnameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.symCount) {
+      if (self.SymKind(i) == SYM_BUILTIN
+          && self._strNEq(self.SymName(i), self.SymNameLen(i), fname, fnameLen)) { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  fn _fnFindSig(fname: pchar, fnameLen: int64): int64 {
+    if (self._fnNameIsBuiltin(fname, fnameLen) != 0) { return 0 - 1; }
+    var found: int64 := 0 - 1;
+    var i: int64 := self.fnSigCount - 1;
+    while (i >= 0) {
+      var b: int64 := self.fnSigTab + i * 48;
+      if (self._strNEq(peek64(b) as pchar, peek64(b + 8), fname, fnameLen)) {
+        if (found < 0) { found := i; }
+        else {
+          var bf: int64 := self.fnSigTab + found * 48;
+          if (peek64(b + 16) != peek64(bf + 16) || peek64(b + 24) != peek64(bf + 24)) {
+            return 0 - 1;
+          }
+        }
+      }
+      i := i - 1;
+    }
+    return found;
+  }
+
+  // #1295: Dimensionsnamen eines utype-Symbols abschreiben (siehe utDimTab).
+  fn _utRecordDim(utName: pchar, utNameLen: int64, declNi: int64) {
+    if (declNi < 0) { return; }
+    var dimNi: int64 := self.sn_c0(declNi);
+    if (dimNi < 0) { return; }
+    if (self.utDimCount >= self.utDimCap) {
+      var nc: int64 := self.utDimCap * 2;
+      if (nc < 16) { nc := 16; }
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.utDimTab, self.utDimCount * 32);
+      self.utDimTab := nb;
+      self.utDimCap := nc;
+    }
+    var base: int64 := self.utDimTab + self.utDimCount * 32;
+    poke64(base,      utName as int64);
+    poke64(base + 8,  utNameLen);
+    poke64(base + 16, self.sn_sVal(dimNi) as int64);
+    poke64(base + 24, self.sn_sLen(dimNi));
+    self.utDimCount := self.utDimCount + 1;
+  }
+
+  // Index in utDimTab zu einem Einheitentyp-NAMEN, oder -1.
+  fn _utFindDim(utName: pchar, utNameLen: int64): int64 {
+    var i: int64 := self.utDimCount - 1;
+    while (i >= 0) {
+      var b: int64 := self.utDimTab + i * 32;
+      if (self._strNEq(peek64(b) as pchar, peek64(b + 8), utName, utNameLen)) { return i; }
+      i := i - 1;
+    }
+    return 0 - 1;
+  }
+
+  // #1295: Ein Handle auf einen Einheitentyp. Nicht-negativ = Deklarations-
+  // knoten der EIGENEN Datei (dort ist auch `range` entscheidbar). Werte <= -3
+  // stehen fuer einen IMPORTIERTEN Typ: `-3 - index` in utDimTab; von dem ist
+  // die Dimension bekannt, der Knoten aber nicht. -1 heisst nach wie vor
+  // "unbestimmt" und meldet nichts.
+  fn _utypeHandleKnown(h: int64): int64 {
+    if (h >= 0) { return 1; }
+    if (h <= 0 - 3) { return 1; }
+    return 0;
+  }
+
   fn _utypeDeclOfName(nm: pchar, nml: int64): int64 {
     if (nml <= 0) { return 0 - 1; }
     var si: int64 := self.Lookup(nm, nml);
     if (si < 0) { return 0 - 1; }
     if (self.SymKind(si) != SYM_TYPE) { return 0 - 1; }
     var declNi: int64 := self.SymNodeIdx(si);
-    // Importiert und damit hier nicht entscheidbar — nichts melden.
-    if (declNi < 0) { return 0 - 1; }
+    if (declNi < 0) {
+      // #1295: importiert — der Knoten ist weg, die Dimension steht in utDimTab.
+      var di: int64 := self._utFindDim(nm, nml);
+      if (di < 0) { return 0 - 1; }
+      return 0 - 3 - di;
+    }
     if (self.sn_kind(declNi) != SNK_UTYPE_DECL) { return 0 - 1; }
     return declNi;
   }
@@ -1874,6 +2140,14 @@ pub type Sema = class {
   // Dimensionsname einer utype-Deklaration; Laenge in lenBox.
   fn _utypeDimName(declNi: int64, lenBox: int64): pchar {
     poke64(lenBox, 0);
+    if (declNi <= 0 - 3) {
+      // #1295: importierter Einheitentyp — Name aus der abgeschriebenen Tabelle.
+      var di: int64 := (0 - 3) - declNi;
+      if (di < 0 || di >= self.utDimCount) { return 0 as pchar; }
+      var base: int64 := self.utDimTab + di * 32;
+      poke64(lenBox, peek64(base + 24));
+      return peek64(base + 16) as pchar;
+    }
     if (declNi < 0) { return 0 as pchar; }
     var dimNi: int64 := self.sn_c0(declNi);
     if (dimNi < 0) { return 0 as pchar; }
@@ -2093,8 +2367,10 @@ pub type Sema = class {
     if (bop != 70 && bop != 71) { return; }
     var lu: int64 := self._utypeOfExpr(self.sn_c0(ni));
     var ru: int64 := self._utypeOfExpr(self.sn_c1(ni));
-    if (lu < 0 && ru < 0) { return; }
-    if (lu < 0 || ru < 0) {
+    var lk: int64 := self._utypeHandleKnown(lu);   // #1295
+    var rk: int64 := self._utypeHandleKnown(ru);
+    if (lk == 0 && rk == 0) { return; }
+    if (lk == 0 || rk == 0) {
       self._errorNode("Einheitentyp mit dimensionsloser Zahl verrechnet"c, ni);
       return;
     }
@@ -2109,12 +2385,14 @@ pub type Sema = class {
   fn _checkUtypeAssign(typeNi: int64, valNi: int64, atNi: int64): void {
     var tu: int64 := self._utypeDeclOfTypeNode(typeNi);
     var vu: int64 := self._utypeOfExpr(valNi);
-    if (tu < 0 && vu < 0) { return; }
-    if (tu < 0) {
+    var tk: int64 := self._utypeHandleKnown(tu);   // #1295
+    var vk: int64 := self._utypeHandleKnown(vu);
+    if (tk == 0 && vk == 0) { return; }
+    if (tk == 0) {
       self._errorNode("Einheitentyp an einen dimensionslosen Typ zugewiesen"c, atNi);
       return;
     }
-    if (vu >= 0) {
+    if (vk != 0) {
       if (self._utypeSameDim(tu, vu) == 0) {
         self._errorNode("Zuweisung ueber Dimensionsgrenzen hinweg"c, atNi);
       }
@@ -2124,6 +2402,10 @@ pub type Sema = class {
     // sich zuweisen lassen). Steht der Wert aber FEST und der Typ traegt
     // `range`-Grenzen, ist das hier entscheidbar; dieselbe Antwort wie beim
     // Bereichstyp in #1082. `wraps` rechnet um und meldet deshalb nichts.
+    // #1295: Die Grenzen stehen im Knoten — bei einem IMPORTIERTEN Typ gibt es
+    // den hier nicht. Die Dimension ist trotzdem geprueft (oben); nur die
+    // Bereichsprobe entfaellt, statt auf einen fremden Knoten zuzugreifen.
+    if (tu < 0) { return; }
     var rngNi: int64 := self.sn_c2(tu);
     if (rngNi < 0) { return; }
     if ((self.sn_iVal(tu) & 2) != 0) { return; }   // wraps
@@ -2537,10 +2819,23 @@ pub type Sema = class {
     var nlen: int64 := self.sn_sLen(ni);
     if (k == SNK_FUNC_DECL) {
       self._pushSym(name, nlen, SYM_FUNC, TY_VOID, ni);
+      self._fnRecordSig(name, nlen, ni);   // #1264
     } else if (k == SNK_STRUCT_DECL) {
       self._pushSym(name, nlen, SYM_STRUCT, TY_USER, ni);
     } else if (k == SNK_TYPE_DECL) {
-      self._pushSym(name, nlen, SYM_TYPE, TY_USER, ni);
+      // #1238: Ein ALIAS auf einen eingebauten Typ (`type date = int64;`) ist
+      // kein zusammengesetzter Typ — er IST der Grundtyp. Wird er wie ein
+      // Struct als TY_USER gefuehrt, meldet die Typpruefung jede Rueckgabe
+      // eines int64 an einer `date`-Signatur als Fehler; im Bestand traefe das
+      // allein std/time.lyx zwoelfmal. Deshalb den Grundtyp uebernehmen,
+      // sofern er sich aufloesen laesst; alles andere bleibt TY_USER.
+      var aliasTid: int64 := TY_USER;
+      var aliasTarget: int64 := self.sn_c0(ni);
+      if (aliasTarget >= 0 && self.sn_kind(aliasTarget) == SNK_TYPE_NAME) {
+        var atid: int64 := self.ResolveType(aliasTarget);
+        if (atid != TY_UNKNOWN && atid != TY_USER) { aliasTid := atid; }
+      }
+      self._pushSym(name, nlen, SYM_TYPE, aliasTid, ni);
     } else if (k == SNK_ENUM_DECL) {
       self._pushSym(name, nlen, SYM_ENUM, TY_USER, ni);
       // Register enum members as int64 constants
@@ -2585,6 +2880,7 @@ pub type Sema = class {
       self._pushSym(name, nlen, SYM_TYPE, TY_USER, ni);
     } else if (k == SNK_UTYPE_DECL) {
       self._pushSym(name, nlen, SYM_TYPE, TY_F64, ni);
+      self._utRecordDim(name, nlen, ni);   // #1295
     } else if (k == SNK_AT_IF) {
       self._pruneAtIf(ni);
       self._p1Decl(ni);  // recurse — ni is now SNK_BLOCK
@@ -2651,6 +2947,13 @@ pub type Sema = class {
           var rsi: int64 := self.Lookup(rnm, rnl);
           if (rsi >= 0 && self.SymKind(rsi) == SYM_TYPE) {
             self._checkStaticMethodCall(ni, rsi, rnm, rnl);
+          }
+          // #1264: Stelligkeit eines INSTANZ-Methodenaufrufs. Sie wurde nie
+          // geprueft — auch nicht bei einer Klasse aus derselben Datei:
+          // `c.M(1)` auf `fn M(a: int64, b: int64)` uebersetzte, und der
+          // fehlende Wert kam vom Stack.
+          if (rsi >= 0 && self.SymKind(rsi) == SYM_VAR) {
+            self._checkInstanceMethodArity(ni, rsi);
           }
         }
         self._checkExpr(recv);
@@ -2732,6 +3035,47 @@ pub type Sema = class {
                   }
                 }
                 namedHandled := 1;
+              }
+            } else {
+              // #1264: Kein brauchbarer Deklarationsknoten — die Funktion kommt
+              // aus einer anderen Unit. Bis 1.0.16J endete die Pruefung hier,
+              // und `Add(1)` auf eine importierte Funktion mit zwei Parametern
+              // uebersetzte klaglos: der fehlende Wert wurde vom Stack gelesen.
+              // Die Signatur steht in fnSigTab, abgeschrieben beim Import.
+              var sgi: int64 := self._fnFindSig(nm, nl);
+              if (sgi >= 0) {
+                var sgBase: int64 := self.fnSigTab + sgi * 48;
+                var sgFlags: int64 := peek64(sgBase + 32);
+                if ((sgFlags & 3) == 0) {          // nicht variadisch, nicht extern
+                  var sgMin: int64 := peek64(sgBase + 16);
+                  var sgMax: int64 := peek64(sgBase + 24);
+                  var sgAc: int64 := 0;
+                  var sgA: int64 := self.sn_c0(ni);
+                  while (sgA >= 0) { sgAc := sgAc + 1; sgA := self.sn_next(sgA); }
+                  if (sgAc < sgMin || sgAc > sgMax) {
+                    self._errorNodeName("falsche Argument-Anzahl im Aufruf von", ni, nm, nl);
+                  } else if (sgAc < sgMax) {
+                    // #1264: Der Aufruf laesst Parameter weg, die einen
+                    // VORGABEWERT haben. Bei einer Funktion derselben Datei
+                    // setzt der Codegen ihn ein — bei einer IMPORTIERTEN nicht:
+                    // er sucht die Deklaration nur in der eigenen
+                    // Modulkette (WP-MEM-05). Der Aufruf liefe also mit einem
+                    // Wert vom Stack statt mit dem Vorgabewert. Das wird
+                    // gemeldet, bis der Codegen die Signatur importierter
+                    // Funktionen kennt.
+                    self._errorNodeName("Vorgabewert einer importierten Funktion wird nicht eingesetzt — alle Argumente angeben, im Aufruf von", ni, nm, nl);
+                  }
+                  // #1264: Die TYPEN werden hier bewusst NICHT geprueft.
+                  // Der Versuch legte eine aeltere Spaltung frei: `StrLen`
+                  // deklariert `ptr: int64`, die Aufrufer uebergeben `pchar` —
+                  // beides ist dasselbe Maschinenwort, und #1221 hat 470
+                  // Stellen auf pchar gezogen, die Signaturen der stdlib aber
+                  // nicht. Eine Typpruefung ueber Unit-Grenzen meldet deshalb
+                  // heute vor allem diese Altlast; sie gehoert zusammen mit der
+                  // Bereinigung der Signaturen gemacht, nicht davor.
+                  // Die STELLIGKEIT oben ist davon unberuehrt — sie ist der
+                  // Teil, an dem ein fehlendes Argument vom Stack gelesen wird.
+                }
               }
             }
           }
@@ -4794,6 +5138,57 @@ pub type Sema = class {
   //
   // Importierte Typen tragen SymNodeIdx -2 (siehe Import-Pass), deren Rümpfe sind hier
   // nicht sichtbar → übersprungen, lieber ungeprüft als falsch-positiv.
+  // #1264: Stelligkeit eines Instanz-Methodenaufrufs `obj.M(...)`.
+  //
+  // Der Weg zur Deklaration: Empfaengervariable -> deklarierter Typname ->
+  // Typsymbol -> Methodenliste der Klasse (c1). Fehlt eines der Glieder — etwa
+  // weil die Klasse aus einer anderen Unit kommt und ihr Knoten nach dem
+  // Import nicht mehr gilt —, wird NICHTS gemeldet: unentscheidbar ist nicht
+  // falsch. Argumente eines Methodenaufrufs haengen an c1, nicht an c0.
+  fn _checkInstanceMethodArity(callNi: int64, recvSi: int64): void {
+    var vDecl: int64 := self.SymNodeIdx(recvSi);
+    if (vDecl < 0) { return; }
+    var vKind: int64 := self.sn_kind(vDecl);
+    if (vKind != SNK_VAR_DECL && vKind != SNK_PARAM) { return; }
+    var tNode: int64 := self.sn_c0(vDecl);
+    if (tNode < 0) { return; }
+    if (self.sn_kind(tNode) != SNK_TYPE_NAME) { return; }
+    var tsi: int64 := self.Lookup(self.sn_sVal(tNode), self.sn_sLen(tNode));
+    if (tsi < 0) { return; }
+    var cDecl: int64 := self.SymNodeIdx(tsi);
+    if (cDecl < 0) { return; }
+    if (self.sn_kind(cDecl) != SNK_TYPE_DECL) { return; }
+
+    var mname: pchar := self.sn_sVal(callNi);
+    var mlen:  int64 := self.sn_sLen(callNi);
+    var mth: int64 := self.sn_c1(cDecl);
+    while (mth >= 0) {
+      if (self.sn_kind(mth) == SNK_FUNC_DECL
+          && self._strNEq(self.sn_sVal(mth), self.sn_sLen(mth), mname, mlen)) {
+        // Variadisch: nicht zaehlbar.
+        if (((self.sn_iVal(mth) >> 24) & 1) != 0) { return; }
+        var pc: int64 := 0;
+        var pcMin: int64 := 0;
+        var sawDefault: int64 := 0;
+        var pp: int64 := self.sn_c0(mth);
+        while (pp >= 0) {
+          pc := pc + 1;
+          if (self.sn_c1(pp) >= 0) { sawDefault := 1; }
+          else { if (sawDefault == 0) { pcMin := pcMin + 1; } else { pcMin := pc; } }
+          pp := self.sn_next(pp);
+        }
+        var ac: int64 := 0;
+        var aa: int64 := self.sn_c1(callNi);
+        while (aa >= 0) { ac := ac + 1; aa := self.sn_next(aa); }
+        if (ac < pcMin || ac > pc) {
+          self._errorNodeName("falsche Argument-Anzahl im Methodenaufruf von", callNi, mname, mlen);
+        }
+        return;
+      }
+      mth := self.sn_next(mth);
+    }
+  }
+
   fn _checkStaticMethodCall(callNi: int64, typeSi: int64, tname: pchar, tlen: int64): void {
     var declNi: int64 := self.SymNodeIdx(typeSi);
     if (declNi < 0) { return; }
@@ -5794,6 +6189,16 @@ pub type Sema = class {
     poke64(self.syms, self.symCap);  // Array header: cap
     poke64(self.syms + 8, 0);        // Array header: len
     self.symCount := 0;
+
+    // #1295: Dimensionstabelle fuer utype-Symbole (auch importierte).
+    self.utDimCap   := 16;
+    self.utDimTab   := alloc(self.utDimCap * 32);
+    self.utDimCount := 0;
+
+    // #1264: Signaturtabelle (auch fuer importierte Funktionen).
+    self.fnSigCap   := 64;
+    self.fnSigTab   := alloc(self.fnSigCap * 48);
+    self.fnSigCount := 0;
 
     self.scopeCap   := 64;
     self.scopes     := alloc(self.scopeCap * 8);

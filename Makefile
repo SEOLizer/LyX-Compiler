@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.16J
+VERSION   := 1.0.16K
 VERSION_DATE := 2026-08-11
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -470,6 +470,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- FFI/Capabilities: link-Pflicht, @cap wirkt, Grant-Modell unbewertet (16 Pruefungen) ---"
 	@bash tests/ffi_link_caps_test.sh
+	@echo "OK"
+	@echo "--- sema-Pruefungen ueber Unit-Grenzen, Methoden, Aliase, Attribute (21 Pruefungen) ---"
+	@bash tests/sema_checks_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh

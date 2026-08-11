@@ -46,6 +46,13 @@ pub type CallGraph = class {
   fn cgr_nkind(i: int64): int64  { return peek64(self.cgr_noff(i));           }
   fn cgr_nsval(i: int64): pchar  { return (self.cgrSrc as int64 + peek64(self.cgr_noff(i) + 64)) as pchar; }
   fn cgr_nslen(i: int64): int64  { return peek64(self.cgr_noff(i) + 72);      }
+  // #1261: Kinder und Geschwister — fuer den Rumpflauf, der Aufrufe ihrem
+  // WIRKLICHEN Rahmen zuordnet statt der zuletzt gesehenen Deklaration.
+  fn cgr_nc0(i: int64): int64    { return peek64(self.cgr_noff(i) + 8);       }
+  fn cgr_nc1(i: int64): int64    { return peek64(self.cgr_noff(i) + 16);      }
+  fn cgr_nc2(i: int64): int64    { return peek64(self.cgr_noff(i) + 24);      }
+  fn cgr_nc3(i: int64): int64    { return peek64(self.cgr_noff(i) + 32);      }
+  fn cgr_nnext(i: int64): int64  { return peek64(self.cgr_noff(i) + 40);      }
 
   // ------------------------------------------------------------------
   // String comparison
@@ -205,26 +212,64 @@ pub type CallGraph = class {
       ni += 1;
     }
 
-    // Pass 2: flat scan for NK_CALL nodes; attribute each to the last
-    // preceding NK_FUNC_DECL in the node table (parser creates nodes
-    // in depth-first order, so this correctly identifies the enclosing fn).
-    var curCaller: int64 := -1;
+    // Pass 2: Aufrufe ihrem Rahmen zuordnen.
+    //
+    // #1261: Hier stand ein flacher Lauf, der jeden Aufruf "der zuletzt
+    // davorstehenden fn-Deklaration" zuschrieb — mit der Begruendung, der
+    // Parser lege die Knoten in Tiefensuche an. Fuer eine GESCHACHTELTE
+    // Funktion stimmt das nicht: ihr Deklarationsknoten entsteht mitten im
+    // Rumpf der aeusseren, also VOR dem Aufruf, der sie ruft. Der Aufruf wurde
+    // damit ihr selbst zugeschrieben — eine Selbstkante, und `@wcet` meldete
+    // an einer voellig schleifenfoermigen Funktion "ist rekursiv". Aufgefallen,
+    // als geschachtelte Funktionen ueberhaupt erst Attribute annehmen durften.
+    //
+    // Jetzt laeuft der RUMPF jeder Funktion als Baum ab, und der Lauf haelt an
+    // jeder geschachtelten Deklaration an — die bekommt ihren eigenen Durchgang
+    // aus dem flachen Lauf darueber.
     ni := 0;
     while (ni < nodeCount) {
-      var kind: int64 := self.cgr_nkind(ni);
-      if (kind == CGR_NK_FUNC_DECL) {
-        var fname: pchar := self.cgr_nsval(ni);
-        var flen:  int64 := self.cgr_nslen(ni);
-        if (flen > 0) { curCaller := self.cgr_findFunc(fname, flen); }
-      } else if (kind == CGR_NK_CALL && curCaller >= 0) {
-        var fname: pchar := self.cgr_nsval(ni);
-        var flen:  int64 := self.cgr_nslen(ni);
-        if (flen > 0) {
-          var calleeIdx: int64 := self.cgr_findFunc(fname, flen);
-          if (calleeIdx >= 0) { self.cgr_addEdge(curCaller, calleeIdx); }
+      if (self.cgr_nkind(ni) == CGR_NK_FUNC_DECL) {
+        var fname2: pchar := self.cgr_nsval(ni);
+        var flen2:  int64 := self.cgr_nslen(ni);
+        if (flen2 > 0) {
+          var callerIdx: int64 := self.cgr_findFunc(fname2, flen2);
+          if (callerIdx >= 0) { self.cgr_walkBody(callerIdx, self.cgr_nc2(ni), 0); }
         }
       }
       ni += 1;
+    }
+  }
+
+  // #1261: Rumpf eines Rahmens ablaufen und jeden Aufruf darin dem Rahmen
+  // zuschreiben. Geschachtelte Deklarationen werden NICHT betreten: ihre
+  // Aufrufe gehoeren ihnen, nicht dem umgebenden Rahmen.
+  //
+  // Die Tiefe ist begrenzt — ein beschaedigter Baum mit einem Zyklus wuerde
+  // sonst endlos laufen, und ein Compiler, der haengt, ist schlimmer als einer,
+  // der eine Kante uebersieht.
+  fn cgr_walkBody(callerIdx: int64, ni: int64, depth: int64) {
+    if (ni < 0 || ni >= self.cgrNodeCount) { return; }
+    if (depth > 512) { return; }
+    var cur: int64 := ni;
+    while (cur >= 0 && cur < self.cgrNodeCount) {
+      var kind: int64 := self.cgr_nkind(cur);
+      if (kind == CGR_NK_FUNC_DECL) {
+        // eigener Rahmen — nicht betreten
+      } else {
+        if (kind == CGR_NK_CALL) {
+          var cname: pchar := self.cgr_nsval(cur);
+          var clen:  int64 := self.cgr_nslen(cur);
+          if (clen > 0) {
+            var calleeIdx: int64 := self.cgr_findFunc(cname, clen);
+            if (calleeIdx >= 0) { self.cgr_addEdge(callerIdx, calleeIdx); }
+          }
+        }
+        self.cgr_walkBody(callerIdx, self.cgr_nc0(cur), depth + 1);
+        self.cgr_walkBody(callerIdx, self.cgr_nc1(cur), depth + 1);
+        self.cgr_walkBody(callerIdx, self.cgr_nc2(cur), depth + 1);
+        self.cgr_walkBody(callerIdx, self.cgr_nc3(cur), depth + 1);
+      }
+      cur := self.cgr_nnext(cur);
     }
   }
 
