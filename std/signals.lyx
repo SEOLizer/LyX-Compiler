@@ -1,7 +1,9 @@
 // std/signal — WP-3: Signalbehandlung
 // Wrapper um sys_rt_sigaction, sys_rt_sigprocmask, sys_signalfd4, sys_kill, sys_tgkill
 //
-// Signal-Restorer: Wir nutzen den vDSO-Restorer des Kernels (SA_RESTORER nicht gesetzt).
+// Signal-Restorer: eigenes Trampolin (siehe _sigRestorer, #1267). Einen
+// vDSO-Restorer, den rt_sigaction von sich aus benutzen wuerde, gibt es auf
+// x86-64 NICHT — die libc liefert ihn sonst mit.
 // Das funktioniert auf allen Linux-Kerneln >= 2.6 ohne eigenen Trampolin-Code.
 
 import std.alloc;
@@ -49,7 +51,7 @@ pub con SIG_IGN: int64 := 1;  // Signal ignorieren
 // sigaction-Struktur (x86-64 Linux, 32 Bytes)
 //   +0:  sa_handler / sa_sigaction  (8 Bytes)
 //   +8:  sa_flags                   (8 Bytes)
-//   +16: sa_restorer                (8 Bytes, 0 = vDSO)
+//   +16: sa_restorer                (8 Bytes, Pflicht auf x86-64)
 //   +24: sa_mask (kernel_sigset_t)  (8 Bytes)
 // ============================================================
 pub con SIGACTION_SIZE: int64 := 32;
@@ -58,7 +60,7 @@ pub con SIGACTION_SIZE: int64 := 32;
 pub con SA_NOCLDSTOP: int64 := 1;
 pub con SA_NOCLDWAIT: int64 := 2;
 pub con SA_SIGINFO:   int64 := 4;
-pub con SA_RESTORER:  int64 := 67108864;   // 0x04000000 (wir setzen dies NICHT)
+pub con SA_RESTORER:  int64 := 67108864;   // 0x04000000 (#1267: wird gesetzt)
 pub con SA_RESTART:   int64 := 268435456;  // 0x10000000
 pub con SA_NODEFER:   int64 := 1073741824; // 0x40000000
 pub con SA_RESETHAND: int64 := 2147483648; // 0x80000000
@@ -83,16 +85,47 @@ pub con SIGNALFD_SIGINFO_SIZE: int64 := 128;
 // handler: Adresse einer Lyx-Funktion fn(signo: int64) oder SIG_DFL / SIG_IGN.
 // Unterbrochene Syscalls werden bei echten Handlern automatisch neu gestartet (SA_RESTART).
 // Der Kernel-vDSO-Restorer wird verwendet — kein eigener Trampolin nötig.
+// #1267: Das Restorer-Trampolin. Der Kernel springt es nach dem Handler an,
+// und zwar OHNE Aufrufrahmen: rsp zeigt auf den Sigframe, den `rt_sigreturn`
+// (Nr. 15) genau dort erwartet. Eine gewoehnliche Lyx-Funktion taugt deshalb
+// nicht — ihr Prolog verschiebt rsp und damit den Frame. Uebrig bleiben zwei
+// Befehle in einer eigenen ausfuehrbaren Seite:
+//
+//     48 c7 c0 0f 00 00 00    mov rax, 15   (rt_sigreturn)
+//     0f 05                   syscall
+//
+// Ohne diesen Zeiger UND das Flag SA_RESTORER kehrt der Handler nicht zurueck:
+// der Kernel springt eine Null an, der Prozess stirbt an SIGSEGV. Vorher stand
+// hier eine 0 mit dem Vermerk "Kernel nutzt vDSO" — den gibt es nicht.
+var _sigRestorerAddr: int64 := 0;
+
+fn _sigRestorer(): int64 {
+  if (_sigRestorerAddr != 0) { return _sigRestorerAddr; }
+  // PROT_READ|WRITE|EXEC = 7, MAP_PRIVATE|MAP_ANONYMOUS = 0x22
+  var pg: int64 := mmap(0, 4096, 7, 34, 0 - 1, 0);
+  if (pg <= 0) { return 0; }
+  poke8(pg + 0, 72); poke8(pg + 1, 199); poke8(pg + 2, 192);
+  poke8(pg + 3, 15); poke8(pg + 4, 0); poke8(pg + 5, 0); poke8(pg + 6, 0);
+  poke8(pg + 7, 15); poke8(pg + 8, 5);
+  _sigRestorerAddr := pg;
+  return pg;
+}
+
 pub fn SignalSet(signum: int64, handler: int64): int64 {
   var act: int64 := alloc(SIGACTION_SIZE);
   if (act == 0) { return -1; }
   poke64(act + 0,  handler);
   var flags: int64 := 0;
+  var restorer: int64 := 0;
   if (handler != SIG_DFL && handler != SIG_IGN) {
-    flags := SA_RESTART;
+    restorer := _sigRestorer();
+    // Fail-loud: ohne Trampolin wuerde die Registrierung gelingen und der
+    // Prozess erst bei der Zustellung sterben — weit weg von der Ursache.
+    if (restorer == 0) { free(act, SIGACTION_SIZE); return -1; }
+    flags := SA_RESTART + SA_RESTORER;
   }
   poke64(act + 8,  flags);
-  poke64(act + 16, 0);  // sa_restorer = 0 → Kernel nutzt vDSO
+  poke64(act + 16, restorer);
   poke64(act + 24, 0);  // sa_mask leer
   var r: int64 := sys_rt_sigaction(signum, act, 0, 8);
   free(act, SIGACTION_SIZE);

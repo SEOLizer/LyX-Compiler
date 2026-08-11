@@ -434,6 +434,12 @@ test: lyxc
 	@echo "--- stdlib: string, json, pack, result, log (14 Pruefungen) ---"
 	@bash tests/stdlib_bundle_test.sh
 	@echo "OK"
+	@echo "--- stdlib: AES gegen FIPS-197, PQC-Level, Signale, std.fs (13 Pruefungen) ---"
+	@bash tests/stdlib_bundle2_test.sh
+	@echo "OK"
+	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
+	@bash tests/std_import_test.sh
+	@echo "OK"
 	@echo "--- TextMate-Grammatik: Schluesselwoerter und Typen vollstaendig ---"
 	@bash tests/syntax/test_grammar.sh
 	@echo "OK"
