@@ -5,6 +5,7 @@ unit std.cloud.cf.transport;
 
 import std.cloud.cf.credentials;
 import std.net.http;
+import std.net.https;
 import std.net.socket;
 import std.net.dns;
 import std.net.tls;
@@ -178,7 +179,16 @@ pub fn cfExtractBool(json: int64, jsonLen: int64, key: pchar): int64 {
 pub fn cfExtractInt(json: int64, jsonLen: int64, key: pchar): int64 {
     var val: int64 := cfExtractValue(json, jsonLen, key);
     if (val == 0) { return 0; }
-    var r: int64 := StrToInt64(val as pchar);
+    // #1264: `StrToInt64` hat ZWEI Parameter — die Zeichenkette und einen
+    // Zeiger, in den es den Erfolg schreibt. Der Aufruf gab nur den ersten mit;
+    // als "ok"-Zeiger diente, was gerade auf dem Stack lag, und die Funktion
+    // schrieb dorthin. Jetzt mit eigenem Feld — und der Wert gilt nur, wenn es
+    // den Erfolg meldet.
+    var okBox: int64 := alloc(8);
+    poke64(okBox, 0);
+    var r: int64 := StrToInt64(val as pchar, okBox);
+    if (peek64(okBox) == 0) { r := 0; }
+    free(okBox, 8);
     free(val, StrLen(val as pchar) + 1);
     return r;
 }
@@ -217,28 +227,12 @@ fn cfParseResponse(body: int64, bodyLen: int64, statusCode: int64): CFResponse {
 // ── Low-level TLS send ────────────────────────────────────────────────────────
 
 fn cfDoSend(req: HTTPRequest): HTTPResponse {
-    var emptyResp: HTTPResponse;
-    emptyResp.statusCode := 0; emptyResp.bodyPtr := 0; emptyResp.bodySize := 0;
-    emptyResp.headers := 0; emptyResp.headerCount := 0;
-
-    var ip: int64 := DNSResolve("api.cloudflare.com"c);
-    if (ip == 0) { return emptyResp; }
-    var conn: TCPConn := TCPConnect(ip, 443);
-    if (conn.fd < 0) { return emptyResp; }
-    var tlsCtx: TLSContext := TLSInit();
-    var tlsConn: TLSConn := TLSConnect(tlsCtx, conn.fd, "api.cloudflare.com"c);
-    if (tlsConn.connected == 0) { TLSFree(tlsCtx); return emptyResp; }
-
-    var reqBuf: int64  := HTTPRequestBuild(req);
-    var allocSz: int64 := peek64(reqBuf);
-    var reqSz: int64   := peek64(reqBuf + 8);
-    TLSWrite(tlsConn, reqBuf + 16, reqSz);
-    free(reqBuf, allocSz);
-
-    var resp: HTTPResponse := HTTPSend(tlsConn, conn);
-    TLSClose(tlsConn);
-    TLSFree(tlsCtx);
-    return resp;
+    // #1264: Der selbst zusammengesetzte TLS-Weg rief `DNSResolve` mit EINEM
+    // statt vier Argumenten und `HTTPSend` mit ZWEIEN statt einem. Beides kam
+    // durch, weil die Signaturpruefung an der Unit-Grenze endete; die fehlenden
+    // Werte las der Aufruf vom Stack. Der Pfad hat nie getragen. std.net.https
+    // macht denselben Ablauf vollstaendig und geprueft.
+    return HTTPSSend(req);
 }
 
 // ── Core send with auth headers ───────────────────────────────────────────────

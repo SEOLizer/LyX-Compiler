@@ -245,12 +245,18 @@ case "$vmsg" in
   *) echo "FAIL @integrity meldet weiterhin: Meldung fehlt"; FAIL=$((FAIL+1)) ;;
 esac
 
-# --- Bekannte Luecke, eigenes Issue --------------------------------------
-# Ein Attribut an einer GESCHACHTELTEN Funktion (WP-13) kommt gar nicht erst
-# durch den Parser: `@stack_limit(64)` ergibt dort "undefined function
-# 'stack_limit'", `@packed` ein "undefined symbol". Das gilt fuer alle
-# Attribute ausser @energy und ist aelter als #1139 -- eigenes Issue #1261.
-# Hier steht nur der Beleg, dass es an dieser Stelle nicht still danebengeht.
+# --- Geschachtelte Funktionen (#1261) ------------------------------------
+# Bis 1.0.16J kam ein Attribut an einer GESCHACHTELTEN Funktion gar nicht durch
+# den Parser (`undefined function 'stack_limit'`); hier stand deshalb nur der
+# Beleg, dass es nicht still danebengeht. Jetzt wird es angenommen — und der
+# Nachweis greift auch dort.
+#
+# Beim Umdrehen kam ein zweiter Fehler zum Vorschein: der Aufrufgraph schrieb
+# jeden Aufruf "der zuletzt davorstehenden fn-Deklaration" zu. Der Knoten einer
+# geschachtelten Funktion entsteht aber MITTEN im Rumpf der aeusseren, also vor
+# dem Aufruf, der sie ruft — die Kante zeigte auf sie selbst, und `@wcet`
+# meldete an einer voellig schleifenfoermigen Funktion "ist rekursiv". Deshalb
+# prueft der erste Fall die MELDUNG, nicht bloss den Fehlschlag.
 printf '%s\n' "$K
 fn Aussen(): int64 {
   @wcet(3)
@@ -259,11 +265,62 @@ fn Aussen(): int64 {
 }
 fn main(): int64 { PrintLn(Aussen()); return 0; }" > "$TMP/n.lyx"
 rm -f "$TMP/n"
-"$LYXC" --std-path="$ROOT" "$TMP/n.lyx" -o "$TMP/n" >/dev/null 2>&1
+nmsg="$("$LYXC" --std-path="$ROOT" "$TMP/n.lyx" -o "$TMP/n" 2>&1)"
 if [ -f "$TMP/n" ]; then
-  echo "FAIL Attribut an geschachtelter fn: uebersetzt still durch"; FAIL=$((FAIL+1))
+  echo "FAIL @wcet an geschachtelter fn: Ueberschreitung nicht gemeldet"; FAIL=$((FAIL+1))
+elif echo "$nmsg" | grep -q "rekursiv"; then
+  echo "FAIL @wcet an geschachtelter fn: als rekursiv gemeldet (Aufrufgraph-Fehler)"; FAIL=$((FAIL+1))
+elif echo "$nmsg" | grep -q "10 Iterationen"; then
+  echo "PASS @wcet an geschachtelter fn wird mit der richtigen Begruendung abgewiesen"; PASS=$((PASS+1))
 else
-  echo "PASS Attribut an geschachtelter fn wird abgewiesen (bekannte Luecke)"; PASS=$((PASS+1))
+  echo "FAIL @wcet an geschachtelter fn: unerwartete Meldung: $nmsg"; FAIL=$((FAIL+1))
+fi
+
+# Gegenprobe: eine ausreichende Schranke traegt — sonst waere der Fall oben
+# auch mit einer Meldung "immer rot" gruen.
+printf '%s\n' "$K
+fn Aussen(): int64 {
+  @wcet(20)
+  fn Innen(): int64 { var s: int64 := 0; for i := 1 to 10 { s := s + 1; } return s; }
+  return Innen();
+}
+fn main(): int64 { PrintLn(Aussen()); return 0; }" > "$TMP/n2.lyx"
+rm -f "$TMP/n2"
+if "$LYXC" --std-path="$ROOT" "$TMP/n2.lyx" -o "$TMP/n2" >/dev/null 2>&1; then
+  echo "PASS ausreichende Schranke an geschachtelter fn traegt"; PASS=$((PASS+1))
+else
+  echo "FAIL ausreichende Schranke an geschachtelter fn wurde abgewiesen"; FAIL=$((FAIL+1))
+fi
+
+# Und @stack_limit greift dort ebenso.
+printf '%s\n' "$K
+fn Aussen(): int64 {
+  @stack_limit(8)
+  fn Innen(): int64 { var a: int64 := 1; var b: int64 := 2; var c: int64 := 3; var d: int64 := 4; return a+b+c+d; }
+  return Innen();
+}
+fn main(): int64 { PrintLn(Aussen()); return 0; }" > "$TMP/n3.lyx"
+rm -f "$TMP/n3"
+if [ ! -f "$TMP/n3" ] && ! "$LYXC" --std-path="$ROOT" "$TMP/n3.lyx" -o "$TMP/n3" >/dev/null 2>&1; then
+  echo "PASS @stack_limit an geschachtelter fn greift"; PASS=$((PASS+1))
+else
+  echo "FAIL @stack_limit an geschachtelter fn blieb wirkungslos"; FAIL=$((FAIL+1))
+fi
+
+# Ein unbekanntes Attribut wird dort gemeldet statt als Ausdruck gelesen.
+printf '%s\n' "$K
+fn Aussen(): int64 {
+  @tippfehler(3)
+  fn Innen(): int64 { return 7; }
+  return Innen();
+}
+fn main(): int64 { PrintLn(Aussen()); return 0; }" > "$TMP/n4.lyx"
+rm -f "$TMP/n4"
+n4msg="$("$LYXC" --std-path="$ROOT" "$TMP/n4.lyx" -o "$TMP/n4" 2>&1)"
+if [ ! -f "$TMP/n4" ] && echo "$n4msg" | grep -q "unbekanntes Attribut"; then
+  echo "PASS unbekanntes Attribut an geschachtelter fn wird gemeldet"; PASS=$((PASS+1))
+else
+  echo "FAIL unbekanntes Attribut an geschachtelter fn: $n4msg"; FAIL=$((FAIL+1))
 fi
 
 echo

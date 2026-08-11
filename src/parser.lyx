@@ -2219,7 +2219,18 @@ pub type Parser = class {
     var tail: int64 := -1;
     while (self.Check(TK_RBRACE) == 0 && self.Check(TK_EOF) == 0) {
       // WP-13: Allow nested function declarations inside blocks
-      if (self.Check(TK_FN) != 0) {
+      // #1261: auch mit Attributen davor. Erkannt wird die Form daran, dass
+      // hinter der Attributkette ein `fn` steht — `@energy(2);` als eigene
+      // ANWEISUNG bleibt damit unberuehrt.
+      if (self.Check(TK_AT) != 0 && self.TokKind(self.cur + 1) == TK_IDENT
+          && self._atChainEndsInFn() != 0) {
+        var annoF: int64 := self._parseNestedFnAnnos();
+        var afnode: int64 := self.ParseNestedFuncAnno(annoF);
+        if (afnode >= 0) {
+          if (head == -1) { head := afnode; tail := afnode; }
+          else { self._sn(tail, afnode); tail := afnode; }
+        }
+      } else if (self.Check(TK_FN) != 0) {
         var fnode: int64 := self.ParseNestedFunc();
         if (fnode >= 0) {
           if (head == -1) { head := fnode; tail := fnode; }
@@ -2236,8 +2247,39 @@ pub type Parser = class {
     return n;
   }
 
+  // #1261: Steht hinter der Attributkette ab self.cur ein `fn`? Nur dann ist
+  // die Kette die Annotation einer geschachtelten Funktion. Geschaut wird ohne
+  // zu verbrauchen: Attributname, optional eine geklammerte Argumentliste.
+  fn _atChainEndsInFn(): int64 {
+    var i: int64 := self.cur;
+    while (self.TokKind(i) == TK_AT && self.TokKind(i + 1) == TK_IDENT) {
+      i := i + 2;
+      if (self.TokKind(i) == TK_LPAREN) {
+        var depth: int64 := 1;
+        i := i + 1;
+        while (depth > 0 && self.TokKind(i) != TK_EOF) {
+          if (self.TokKind(i) == TK_LPAREN) { depth := depth + 1; }
+          else if (self.TokKind(i) == TK_RPAREN) { depth := depth - 1; }
+          i := i + 1;
+        }
+      }
+    }
+    if (self.TokKind(i) == TK_FN) { return 1; }
+    return 0;
+  }
+
   // WP-13: Parse nested function inside a block
   fn ParseNestedFunc(): int64 {
+    return self.ParseNestedFuncAnno(0);
+  }
+
+  // #1261: Eine geschachtelte Funktion nahm KEIN Attribut an. ParseBlock kannte
+  // an dieser Stelle nur `@energy` namentlich; alles andere landete in der
+  // Ausdrucksposition und endete als `undefined function 'stack_limit'`.
+  // Angenommen werden jetzt dieselben Attribute wie an einer freien Funktion,
+  // und ihre Flags kommen in die iVal des Knotens — damit greifen die
+  // Nachweise aus #1138 (@stack_limit) und #1139 (@wcet) auch hier.
+  fn ParseNestedFuncAnno(annoFlags: int64): int64 {
     var ti: int64 := self.cur;
     self.Advance();
     var nameTok: int64 := self.cur;
@@ -2249,8 +2291,58 @@ pub type Parser = class {
     self._sc0(n, self._parseParamList());
     self.Expect(TK_RPAREN);
     if (self.Match(TK_COLON) != 0) { self._sc1(n, self.ParseType()); }
+    if (annoFlags != 0) { self._siv(n, annoFlags); }   // #1261
     self._sc2(n, self.ParseBlock());
     return n;
+  }
+
+  // #1261: Attribute VOR einer geschachtelten `fn` einsammeln. Getragen werden
+  // die Attribute, die an einer Funktion eine Bedeutung haben: die
+  // Wertattribute @energy/@stack_limit/@wcet und die reinen Markierungen aus
+  // _annoNameToFlag. Ein Attribut, das hier nichts bedeutet, wird GEMELDET —
+  // stillschweigend zu verwerfen waere derselbe Fehler in neuer Form.
+  fn _parseNestedFnAnnos(): int64 {
+    var flags: int64 := 0;
+    while (self.Check(TK_AT) != 0 && self.TokKind(self.cur + 1) == TK_IDENT) {
+      self.Advance();                       // @
+      var isEnergy:     int64 := self._tokTextEq(self.cur, "energy"c);
+      var isStackLimit: int64 := self._tokTextEq(self.cur, "stack_limit"c);
+      var isWcet:       int64 := self._tokTextEq(self.cur, "wcet"c);
+      var flag:         int64 := self._annoNameToFlag(self.cur);
+      if (flag == 0 && isEnergy == 0 && isStackLimit == 0 && isWcet == 0) {
+        self._err("unbekanntes Attribut an einer geschachtelten Funktion"c);
+      }
+      flags := flags | flag;
+      self.Advance();                       // Attributname
+      if (self.Check(TK_LPAREN) != 0) {
+        self.Advance();
+        if (self.Check(TK_INT) != 0) {
+          var v: int64 := self.TokIVal(self.cur);
+          if (isEnergy != 0) {
+            if (v >= 1 && v <= 5) { flags := flags | (v << ANNO_ENERGY_SHIFT); }
+            else { self._err("@energy: level must be 1-5"c); }
+          } else if (isStackLimit != 0) {
+            if (v >= 1 && v <= ANNO_STACKLIMIT_MAX) { flags := flags | (v << ANNO_STACKLIMIT_SHIFT); }
+            else { self._err("@stack_limit: Schranke muss zwischen 1 und 16777215 Byte liegen"c); }
+          } else if (isWcet != 0) {
+            if (v >= 1 && v <= ANNO_WCET_MAX) { flags := flags | (v << ANNO_WCET_SHIFT); }
+            else { self._err("@wcet: Schranke muss zwischen 1 und 16777215 Iterationen liegen"c); }
+          }
+          self.Advance();
+        } else if (isEnergy != 0 || isStackLimit != 0 || isWcet != 0) {
+          self._err("Attribut erwartet eine ganze Zahl"c);
+        }
+        // Rest der Klammer ueberspringen (mehrteilige Argumentformen)
+        var depth: int64 := 1;
+        while (depth > 0 && self.Peek() != TK_EOF) {
+          if (self.Check(TK_LPAREN) != 0) { depth := depth + 1; }
+          else if (self.Check(TK_RPAREN) != 0) { depth := depth - 1; }
+          if (depth > 0) { self.Advance(); }
+        }
+        self.Expect(TK_RPAREN);
+      }
+    }
+    return flags;
   }
 
   // WP-12: try/catch/finally parsing
