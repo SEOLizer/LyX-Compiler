@@ -12,6 +12,9 @@ _fail() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
 
 SEMA="src/sema.lyx"
 CG="src/codegen_x86.lyx"
+# Achtung: LYXC ist hier der QUELLTEXT, kein Compiler-Aufruf — das Script
+# durchsucht die Datei mit grep. Deshalb bindet es die Ressourcengrenze aus
+# #1294 bewusst NICHT ein; sie wuerde die Variable auf den Wrapper umbiegen.
 LYXC="src/lyxc.lyx"
 KEYGEN="src/lyxc_keygen.lyx"
 

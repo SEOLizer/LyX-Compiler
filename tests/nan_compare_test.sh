@@ -2,6 +2,7 @@
 # #1128: Vergleiche mit NaN folgen IEEE 754 — jeder ist false, ausser `!=`.
 set -u
 LYXC="${LYXC:-./lyxc}"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 fail=0
 check() {

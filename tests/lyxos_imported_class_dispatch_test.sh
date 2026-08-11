@@ -11,6 +11,7 @@
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="$ROOT/lyxc"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -f "$ROOT/_implib_test.lyx" "$ROOT/_impapp_test.lyx"; rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 

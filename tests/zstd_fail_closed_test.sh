@@ -13,6 +13,7 @@
 # muss. Der letzte Punkt ist der eigentliche Waechter: ohne ihn wuerde ein
 # Decoder, der alles gutmuetig durchwinkt, hier gruen aussehen.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="$ROOT/lyxc"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 
