@@ -1,0 +1,283 @@
+// tests/pci_wp1_test.lyx
+// PCI Phase 1 (PCI-01..PCI-04) — Tests ohne Hardware und ohne root.
+//
+// Geprueft wird der WEG, nicht das Ergebnis eines Registerlesens: die
+// Adressrechnung (BDF, Pfade), die Auswertung des Config-Space-Layouts und
+// das Verhalten der Fehlerzweige. Ein synthetischer Config-Space-Puffer
+// steht dafuer an der Stelle der Hardware.
+//
+// Abnahmekriterien:
+// AC-1  BDF-Parse: Lang- und Kurzform, Grenzwerte, Muell -> Fehler
+// AC-2  BDF-Format und sysfs-Pfade zeichengenau
+// AC-3  Config-Felder aus dem Puffer korrekt gelesen (8/16/32 Bit)
+// AC-4  Header-Typ und Multifunction-Bit getrennt ausgewertet
+// AC-5  Command-Register: benannte Schalter setzen nur ihr Bit
+// AC-6  Fehlerzweige melden statt zu raten (kein Backend, Bereich, Argument)
+// AC-7  Anwesenheitspruefung: 0xFFFF und 0x0000 heissen "kein Geraet"
+
+unit tests.pci_wp1_test;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.hardware.pci_config;
+import std.hardware.pci_enum;
+import std.alloc;
+import std.string;
+import std.io;
+
+var failures: int64 := 0;
+
+fn checkInt(name: pchar, got: int64, want: int64) {
+  if (got == want) {
+    Print("PASS "); Print(name); Print(" = "); PrintLn(IntToStr(got));
+  } else {
+    failures := failures + 1;
+    Print("FAIL "); Print(name); Print(": erwartet "); Print(IntToStr(want));
+    Print(", bekommen "); PrintLn(IntToStr(got));
+  }
+}
+
+fn checkStr(name: pchar, got: pchar, want: pchar) {
+  if (StrCmp(got, want) == 0) {
+    Print("PASS "); Print(name); Print(" = "); PrintLn(got);
+  } else {
+    failures := failures + 1;
+    Print("FAIL "); Print(name); Print(": erwartet '"); Print(want);
+    Print("', bekommen '"); Print(got); PrintLn("'");
+  }
+}
+
+// ============================================================
+// AC-1: BDF-Parse
+// ============================================================
+
+fn testBdfParse() {
+  PrintLn("-- AC-1 BDF-Parse --");
+  checkInt("langform 0000:03:00.0", PciBdfParse("0000:03:00.0"), (3 << 8) | (0 << 3) | 0);
+  checkInt("kurzform 03:00.0",      PciBdfParse("03:00.0"),      (3 << 8) | (0 << 3) | 0);
+  checkInt("domain 0001:00:1f.3",   PciBdfParse("0001:00:1f.3"), (1 << 16) | (0 << 8) | (31 << 3) | 3);
+  checkInt("grossbuchstaben 0000:0A:1F.7", PciBdfParse("0000:0A:1F.7"), (10 << 8) | (31 << 3) | 7);
+  checkInt("max 0000:ff:1f.7",      PciBdfParse("0000:ff:1f.7"), (255 << 8) | (31 << 3) | 7);
+
+  // Muell muss scheitern — eine halb gelesene Adresse zeigt auf ein
+  // fremdes Geraet und ist schlimmer als gar keine.
+  checkInt("muell 'quatsch!'",   PciBdfParse("quatsch!"),      PCI_E_BADARG);
+  checkInt("zu kurz '3:0.0'",    PciBdfParse("3:0.0"),         PCI_E_BADARG);
+  checkInt("funktion 8",         PciBdfParse("0000:03:00.8"),  PCI_E_BADARG);
+  checkInt("device 32",          PciBdfParse("0000:03:20.0"),  PCI_E_BADARG);
+  checkInt("nachlauf '03:00.0x'", PciBdfParse("03:00.0x"),     PCI_E_BADARG);
+  checkInt("falscher trenner",   PciBdfParse("0000:03-00.0"),  PCI_E_BADARG);
+  checkInt("leerstring",         PciBdfParse(""),              PCI_E_BADARG);
+
+  // Zerlegung muss die Packung genau umkehren.
+  var bdf: int64 := PciBdfMake(1, 255, 31, 7);
+  checkInt("make/domain",   PciBdfDomain(bdf),   1);
+  checkInt("make/bus",      PciBdfBus(bdf),      255);
+  checkInt("make/device",   PciBdfDevice(bdf),   31);
+  checkInt("make/function", PciBdfFunction(bdf), 7);
+  checkInt("make bus 256",  PciBdfMake(0, 256, 0, 0), PCI_E_BADARG);
+  checkInt("make dev 32",   PciBdfMake(0, 0, 32, 0),  PCI_E_BADARG);
+}
+
+// ============================================================
+// AC-2: Format und Pfade
+// ============================================================
+
+fn testFormat() {
+  PrintLn("-- AC-2 Format und Pfade --");
+  var buf: int64 := alloc(PCI_PATH_MAX);
+  var p: pchar := buf as pchar;
+
+  PciBdfFormat(buf, PciBdfParse("0000:03:00.0"));
+  checkStr("format kurz->lang", p, "0000:03:00.0");
+
+  PciBdfFormat(buf, PciBdfParse("0001:0a:1f.7"));
+  checkStr("format hex klein", p, "0001:0a:1f.7");
+
+  PciSysfsPath(buf, PciBdfParse("0000:03:00.0"), "config");
+  checkStr("sysfs config", p, "/sys/bus/pci/devices/0000:03:00.0/config");
+
+  PciSysfsPath(buf, PciBdfParse("0000:03:00.0"), 0 as pchar);
+  checkStr("sysfs ohne suffix", p, "/sys/bus/pci/devices/0000:03:00.0");
+
+  PciSysfsResourcePath(buf, PciBdfParse("0000:00:1f.3"), 5);
+  checkStr("sysfs resource5", p, "/sys/bus/pci/devices/0000:00:1f.3/resource5");
+
+  checkInt("resource index 6", PciSysfsResourcePath(buf, 0, 6),  PCI_E_BADARG);
+  checkInt("resource index -1", PciSysfsResourcePath(buf, 0, -1), PCI_E_BADARG);
+  free(buf, PCI_PATH_MAX);
+}
+
+// ============================================================
+// Synthetischer Config-Space
+// ============================================================
+
+con TEST_CFG_SIZE: int64 := 256;
+
+// Intel-Netzwerkkarte, Multifunction, Bus-Mastering aus.
+fn makeFakeConfig(): int64 {
+  var buf: int64 := allocZeroed(TEST_CFG_SIZE);
+  poke16(buf + PCI_CFG_VENDOR_ID,    0x8086);
+  poke16(buf + PCI_CFG_DEVICE_ID,    0x10D3);
+  poke16(buf + PCI_CFG_COMMAND,      PCI_CMD_MEM_SPACE);
+  poke16(buf + PCI_CFG_STATUS,       PCI_STATUS_CAP_LIST);
+  poke8(buf + PCI_CFG_REVISION,      0x03);
+  poke8(buf + PCI_CFG_PROG_IF,       0x00);
+  poke8(buf + PCI_CFG_SUBCLASS,      PCI_SUBCLASS_NETWORK_ETH);
+  poke8(buf + PCI_CFG_CLASS,         PCI_CLASS_NETWORK);
+  poke8(buf + PCI_CFG_HEADER_TYPE,   PCI_HDR_ENDPOINT | PCI_HDR_MULTIFUNCTION);
+  poke32(buf + PCI_CFG_BAR0,         0xF7C00000);
+  poke16(buf + PCI_CFG_SUBSYS_VENDOR, 0x8086);
+  poke16(buf + PCI_CFG_SUBSYS_ID,    0x0001);
+  poke8(buf + PCI_CFG_CAP_PTR,       0xC8);
+  poke8(buf + PCI_CFG_INT_PIN,       0x01);
+  poke8(buf + PCI_CFG_INT_LINE,      0x0B);
+  return buf;
+}
+
+// ============================================================
+// AC-3/AC-4: Felder lesen
+// ============================================================
+
+fn testFields() {
+  PrintLn("-- AC-3/AC-4 Config-Felder --");
+  var buf: int64 := makeFakeConfig();
+  var ctx: int64 := PciCfgOpenMem(buf, TEST_CFG_SIZE, PciBdfParse("0000:03:00.0"));
+
+  checkInt("backend",     PciCfgBackend(ctx), PCI_BACKEND_MEM);
+  checkInt("groesse",     PciCfgSize(ctx),    TEST_CFG_SIZE);
+  checkInt("vendor",      PciVendorId(ctx),   0x8086);
+  checkInt("device",      PciDeviceId(ctx),   0x10D3);
+  checkInt("revision",    PciRevision(ctx),   0x03);
+  checkInt("basisklasse", PciBaseClass(ctx),  PCI_CLASS_NETWORK);
+  checkInt("subklasse",   PciSubclass(ctx),   PCI_SUBCLASS_NETWORK_ETH);
+  checkInt("subsys vid",  PciSubsysVendor(ctx), 0x8086);
+  checkInt("int pin",     PciIntPin(ctx),     0x01);
+  checkInt("int line",    PciIntLine(ctx),    0x0B);
+  checkInt("bar0 32 bit", PciCfgRead32(ctx, PCI_CFG_BAR0), 0xF7C00000);
+
+  // Header-Typ und Multifunction sind zwei Aussagen in einem Byte. Wer sie
+  // nicht trennt, haelt jedes Multifunction-Geraet fuer eine Bridge (0x81).
+  checkInt("header roh",  PciHeaderTypeRaw(ctx), 0x80);
+  checkInt("header typ",  PciHeaderType(ctx),    PCI_HDR_ENDPOINT);
+  checkInt("multifunction", PciIsMultifunction(ctx), 1);
+
+  poke8(buf + PCI_CFG_HEADER_TYPE, PCI_HDR_BRIDGE);
+  checkInt("bridge typ",  PciHeaderType(ctx),      PCI_HDR_BRIDGE);
+  checkInt("bridge singlefn", PciIsMultifunction(ctx), 0);
+
+  checkStr("klassenname", PciClassNameBuiltin(PCI_CLASS_NETWORK), "Network controller");
+  checkStr("klasse unbekannt", PciClassNameBuiltin(0x42), "Unknown class");
+
+  PciCfgClose(ctx);
+  free(buf, TEST_CFG_SIZE);
+}
+
+// ============================================================
+// AC-5: Command-Register
+// ============================================================
+
+fn testCommand() {
+  PrintLn("-- AC-5 Command-Register --");
+  var buf: int64 := makeFakeConfig();
+  var ctx: int64 := PciCfgOpenMem(buf, TEST_CFG_SIZE, 0);
+
+  checkInt("start: nur mem-space", PciCfgRead16(ctx, PCI_CFG_COMMAND), PCI_CMD_MEM_SPACE);
+
+  PciEnableBusMaster(ctx);
+  checkInt("bus master an", PciCfgRead16(ctx, PCI_CFG_COMMAND),
+           PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER);
+
+  PciDisableIntx(ctx);
+  checkInt("intx aus", PciCfgRead16(ctx, PCI_CFG_COMMAND),
+           PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER | PCI_CMD_INTX_DISABLE);
+
+  // Ausschalten darf nur das eigene Bit treffen.
+  PciDisableBusMaster(ctx);
+  checkInt("bus master aus, rest bleibt", PciCfgRead16(ctx, PCI_CFG_COMMAND),
+           PCI_CMD_MEM_SPACE | PCI_CMD_INTX_DISABLE);
+
+  PciCfgClose(ctx);
+  free(buf, TEST_CFG_SIZE);
+}
+
+// ============================================================
+// AC-6: Fehlerzweige
+// ============================================================
+
+fn testErrors() {
+  PrintLn("-- AC-6 Fehlerzweige --");
+  var buf: int64 := makeFakeConfig();
+  var ctx: int64 := PciCfgOpenMem(buf, TEST_CFG_SIZE, 0);
+
+  // Bereich: 256-Byte-Raum, ein 32-Bit-Zugriff bei 254 liegt teilweise
+  // ausserhalb und darf nicht abgeschnitten gelesen werden.
+  checkInt("lesen 32 bit bei 254", PciCfgRead32(ctx, 254), PCI_E_RANGE);
+  checkInt("lesen bei 256",        PciCfgRead8(ctx, 256),  PCI_E_RANGE);
+  checkInt("negativer offset",     PciCfgRead8(ctx, -1),   PCI_E_BADARG);
+  checkInt("schreiben ausserhalb", PciCfgWrite32(ctx, 254, 0), PCI_E_RANGE);
+
+  // Kein Backend: der Default-Zweig muss melden. Waere er ein stilles 0,
+  // liesse sich das Ergebnis von einem echten Registerwert nicht
+  // unterscheiden — dieser Test waere vor der Haertung gruen gewesen.
+  var noBackend: int64 := PciCfgOpenMem(buf, TEST_CFG_SIZE, 0);
+  poke64(noBackend, PCI_BACKEND_NONE);
+  checkInt("kein backend lesen",    PciCfgRead8(noBackend, 0),     PCI_E_NOBACKEND);
+  checkInt("kein backend schreiben", PciCfgWrite8(noBackend, 0, 1), PCI_E_NOBACKEND);
+  poke64(noBackend, 99);
+  checkInt("unbekanntes backend",   PciCfgRead8(noBackend, 0),     PCI_E_NOBACKEND);
+
+  // portio ist in Phase 1 noch nicht implementiert — die Unit sagt das,
+  // statt einen Ersatzwert zu liefern.
+  poke64(noBackend, PCI_BACKEND_PORTIO);
+  checkInt("portio noch nicht da",  PciCfgRead8(noBackend, 0),     PCI_E_NOTSUP);
+  PciCfgClose(noBackend);
+
+  checkInt("ungueltiger kontext",   PciCfgRead8(0, 0),  PCI_E_BADARG);
+  checkInt("mem-backend ohne puffer", PciCfgOpenMem(0, 256, 0), PCI_E_BADARG);
+  checkInt("mem-backend zu klein",  PciCfgOpenMem(buf, 8, 0),  PCI_E_BADARG);
+
+  // Enumeration mit unsinnigen Argumenten.
+  checkInt("enum ohne puffer",  PciEnumSysfs(0, 16),   PCI_E_BADARG);
+  checkInt("enum maxCount 0",   PciEnumSysfs(buf, 0),  PCI_E_BADARG);
+  checkInt("scan ohne backend", PciEnumScan(buf, 16, PCI_BACKEND_MEM, 0), PCI_E_NOBACKEND);
+  checkInt("scan busbereich",   PciEnumScanRange(buf, 16, PCI_BACKEND_ECAM, 4096, 5, 4), PCI_E_BADARG);
+
+  checkStr("fehlername", PciErrorName(PCI_E_CAPLOOP), "capability list contains a loop");
+
+  PciCfgClose(ctx);
+  free(buf, TEST_CFG_SIZE);
+}
+
+// ============================================================
+// AC-7: Anwesenheit
+// ============================================================
+
+fn testPresence() {
+  PrintLn("-- AC-7 Anwesenheit --");
+  var buf: int64 := makeFakeConfig();
+  var ctx: int64 := PciCfgOpenMem(buf, TEST_CFG_SIZE, 0);
+  checkInt("geraet vorhanden", PciCfgDevicePresent(ctx), 1);
+
+  poke16(buf + PCI_CFG_VENDOR_ID, 0xFFFF);
+  checkInt("vendor 0xFFFF = leer", PciCfgDevicePresent(ctx), 0);
+
+  poke16(buf + PCI_CFG_VENDOR_ID, 0x0000);
+  checkInt("vendor 0x0000 = leer", PciCfgDevicePresent(ctx), 0);
+
+  PciCfgClose(ctx);
+  free(buf, TEST_CFG_SIZE);
+}
+
+fn main(): int64 {
+  PrintLn("=== PCI Phase 1: pci_types / pci_syscalls / pci_config / pci_enum ===");
+  testBdfParse();
+  testFormat();
+  testFields();
+  testCommand();
+  testErrors();
+  testPresence();
+  Print("=== Fehlgeschlagen: "); PrintLn(IntToStr(failures));
+  if (failures > 0) { return 1; }
+  return 0;
+}
