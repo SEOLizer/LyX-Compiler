@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.16C
+VERSION   := 1.0.16E
 VERSION_DATE := 2026-08-11
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -442,6 +442,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- stdlib: base64, regex, yaml, sha256, Socket-Select (12 Pruefungen) ---"
 	@bash tests/stdlib_bundle3_test.sh
+	@echo "OK"
+	@echo "--- Builtin-Auswahl: Cast und Argumentzahl (7 Pruefungen) ---"
+	@bash tests/builtin_dispatch_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh

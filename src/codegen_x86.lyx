@@ -7221,6 +7221,27 @@ pub type Codegen = class {
         if (self.cg_isPcharExpr(self.cg_nc1(argNi)) != 0) { return 1; }
       }
     }
+    // #1308/#1316: der CAST. `PrintLn(x as pchar)` fiel hier durch bis zum
+    // `return 0` am Ende und wurde als Ganzzahl ausgegeben — gedruckt wurde
+    // also die ADRESSE. Ueber eine Zwischenvariable ging es, weil der Zweig
+    // fuer CGN_IDENT den deklarierten Typ liest; genau dieser Unterschied
+    // machte den Fehler so verwirrend.
+    //
+    // Dieselbe Luecke wie bei cg_isF64Expr in #905: die Typbestimmung kannte
+    // den Cast-Knoten nicht. Ein Cast ist die ausdrueckliche Angabe des
+    // Aufrufers, welchen Typ der Wert hat — sie darf nicht die einzige Form
+    // sein, die ignoriert wird.
+    if (k == CGN_CAST) {
+      var ctn: int64 := self.cg_nc1(argNi);
+      if (ctn >= 0) {
+        var ctp: pchar := self.cg_nsval(ctn);
+        var ctl: int64 := self.cg_nslen(ctn);
+        if (self.cg_seq(ctp, ctl, "pchar", 5)) { return 1; }
+        if (self.cg_isFloatTypeName(ctp, ctl) != 0) { return 2; }
+        if (self.cg_seq(ctp, ctl, "bool", 4)) { return 3; }
+      }
+      return 0;
+    }
     if (k == CGN_IDENT) {
       var nm: pchar := self.cg_nsval(argNi);
       var nl: int64  := self.cg_nslen(argNi);
@@ -7428,6 +7449,37 @@ pub type Codegen = class {
   }
 
   // Generate a function call (NK_CALL node)
+  // #1311: Sieben Namen existieren sowohl als Builtin als auch als `pub fn` in
+  // std/ — ArgvGetStr, FileSize, FloatToStr, Print, StrFind, StrSplit, StrTrim.
+  // Der Builtin gewann bisher IMMER, unabhaengig von der Argumentzahl: die
+  // ueberzaehligen Argumente verpufften, die Unit-Funktion war vom Programm aus
+  // unerreichbar, und heraus kam ein plausibel aussehender Muellwert.
+  //
+  // Belegt an zwei Stellen im eigenen Bestand, die genau deshalb still falsch
+  // liefen: tests/feature_checks/strings/test_stringbuilder.lyx ruft
+  // StrSplit(s, ",", parts, 10) — die Vier-Argument-Form aus std/string.lyx —
+  // und tests/feature_checks/stdlib/test_filereadall.lyx ruft
+  // ArgvGetStr(argc, argv, "check") aus std/env.lyx. Beide bedienten den
+  // Builtin mit seiner Zwei-Argument-Form.
+  //
+  // Deshalb wird hier NICHT abgewiesen, sondern durchgereicht: passt die
+  // Argumentzahl nicht zur Builtin-Form, ist die gleichnamige Unit-Funktion
+  // gemeint. Ein harter Fehler waere das falsche Mittel — er wuerde
+  // Aufrufstellen brechen, die die richtige Funktion meinen und deren einziger
+  // Fehler es ist, dass es den Builtin ueberhaupt gibt.
+  //
+  // Print/PrintLn bleiben aussen vor: sie sind variadisch, eine Erwartung an
+  // die Argumentzahl gibt es dort nicht.
+  fn cg_builtinArity(name: pchar, nlen: int64): int64 {
+    if (self.cg_seq(name, nlen, "StrSplit",   8))  { return 2; }
+    if (self.cg_seq(name, nlen, "StrFind",    7))  { return 2; }
+    if (self.cg_seq(name, nlen, "StrTrim",    7))  { return 1; }
+    if (self.cg_seq(name, nlen, "FloatToStr", 10)) { return 1; }
+    if (self.cg_seq(name, nlen, "FileSize",   8))  { return 1; }
+    if (self.cg_seq(name, nlen, "ArgvGetStr", 10)) { return 2; }
+    return 0 - 1;
+  }
+
   fn cg_genCall(ni: int64) {
     var fname: pchar := self.cg_nsval(ni);
     var fnlen: int64 := self.cg_nslen(ni);
@@ -7981,6 +8033,17 @@ pub type Codegen = class {
     var gk64: pchar := "peek64";
     var pk32: pchar := "poke32";
     var gk32: pchar := "peek32";
+
+    // #1311: Weiche VOR der Builtin-Kette — siehe cg_builtinArity.
+    if (isMethod == 0) {
+      var wantArgc: int64 := self.cg_builtinArity(fname, fnlen);
+      if (wantArgc >= 0 && argc != wantArgc) {
+        var uPp: int64 := self.cg_emitCall();
+        self.cg_addPatch(uPp, fname as int64, fnlen, CG_PATCH_CALL);
+        self.cg_popStackArgs(nTotal);
+        return;
+      }
+    }
 
     if (self.cg_seq(fname, fnlen, pstr, 8)) {
       // call _lyx_print_str  (rdi already has the arg)
