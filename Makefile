@@ -440,6 +440,9 @@ test: lyxc
 	@echo "--- Allokator-Pool: Korrektheit und Syscall-Zahl (9 Pruefungen) ---"
 	@bash tests/alloc_pool_test.sh
 	@echo "OK"
+	@echo "--- stdlib: base64, regex, yaml, sha256, Socket-Select (12 Pruefungen) ---"
+	@bash tests/stdlib_bundle3_test.sh
+	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh
 	@echo "OK"

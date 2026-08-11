@@ -112,7 +112,127 @@ fn isEmptyLine(s: pchar, pos: int64): bool {
 
 // Internal: scan for "key: value" at the top-level (indent=0).
 // Returns position of value start, or -1 if not found.
+// #1312: Pfadaufloesung ueber Ebenen.
+//
+// _yamlFindKey suchte den GESAMTEN Pfad als einen einzigen Schluesselnamen und
+// nur auf oberster Ebene. "server.host" wurde also als Schluessel dieses Namens
+// gesucht, den es nicht gibt — Get lieferte still die Vorgabe, HasPath false.
+// Da eingerueckte Zeilen ausdruecklich uebersprungen wurden, war jede
+// verschachtelte Struktur unerreichbar.
+//
+// Die Einrueckung ist in YAML die Struktur; hier wird sie entsprechend gelesen:
+// je Pfadabschnitt wird der Schluessel auf der erwarteten Einrueckung gesucht,
+// danach steigt die Suche in den Block darunter ab.
+
+fn _yamlIndentAt(content: pchar, pos: int64, clen: int64): int64 {
+    var n: int64 := 0;
+    while (pos + n < clen) {
+        var c: int64 := StrCharAt(content, pos + n);
+        if (c == 32) { n := n + 1; } else { return n; }
+    }
+    return n;
+}
+
+fn _yamlLineEnd(content: pchar, pos: int64, clen: int64): int64 {
+    var i: int64 := pos;
+    while (i < clen && StrCharAt(content, i) != 10 && StrCharAt(content, i) != 13) { i := i + 1; }
+    return i;
+}
+
+fn _yamlNextLine(content: pchar, pos: int64, clen: int64): int64 {
+    var i: int64 := _yamlLineEnd(content, pos, clen);
+    while (i < clen && (StrCharAt(content, i) == 10 || StrCharAt(content, i) == 13)) { i := i + 1; }
+    return i;
+}
+
+// Sucht den Schluessel [segStart,segEnd) auf Einrueckung `indent` im Bereich
+// [from,to). Liefert den Zeilenanfang, oder -1.
+fn _yamlFindSegLine(content: pchar, clen: int64, fromPos: int64, toPos: int64,
+                    path: pchar, segStart: int64, segEnd: int64, indent: int64): int64 {
+    var seglen: int64 := segEnd - segStart;
+    var pos: int64 := fromPos;
+    while (pos < toPos) {
+        var ind: int64 := _yamlIndentAt(content, pos, clen);
+        var c: int64 := StrCharAt(content, pos + ind);
+        var skip: int64 := 0;
+        if (c == 35 || c == 10 || c == 13 || c == 0) { skip := 1; }
+        if (ind < indent) { return 0 - 1; }   // Block zu Ende
+        if (skip == 0 && ind == indent) {
+            var pi: int64 := 0;
+            while (pi < seglen && pos + ind + pi < clen &&
+                   StrCharAt(content, pos + ind + pi) == StrCharAt(path, segStart + pi)) {
+                pi := pi + 1;
+            }
+            if (pi == seglen) {
+                var after: int64 := pos + ind + pi;
+                while (after < clen && (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9)) {
+                    after := after + 1;
+                }
+                if (after < clen && StrCharAt(content, after) == 58) { return pos; }
+            }
+        }
+        pos := _yamlNextLine(content, pos, clen);
+    }
+    return 0 - 1;
+}
+
+// Liefert den Anfang des WERTES zum Pfad, oder -1.
+// outLine, wenn != 0, bekommt den Zeilenanfang der Fundstelle.
+fn _yamlFindPath(content: pchar, clen: int64, path: pchar, plen: int64, outLine: int64): int64 {
+    var fromPos: int64 := 0;
+    var toPos: int64 := clen;
+    var indent: int64 := 0;
+    var segStart: int64 := 0;
+
+    while (segStart <= plen) {
+        var segEnd: int64 := segStart;
+        while (segEnd < plen && StrCharAt(path, segEnd) != 46) { segEnd := segEnd + 1; }
+        if (segEnd == segStart) { return 0 - 1; }
+
+        var line: int64 := _yamlFindSegLine(content, clen, fromPos, toPos, path, segStart, segEnd, indent);
+        if (line < 0) { return 0 - 1; }
+
+        var ind: int64 := _yamlIndentAt(content, line, clen);
+        var after: int64 := line + ind + (segEnd - segStart);
+        while (after < clen && (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9)) {
+            after := after + 1;
+        }
+        if (after < clen && StrCharAt(content, after) == 58) { after := after + 1; }
+        while (after < clen && (StrCharAt(content, after) == 32 || StrCharAt(content, after) == 9)) {
+            after := after + 1;
+        }
+
+        if (segEnd >= plen) {
+            if (outLine != 0) { poke64(outLine, line); }
+            return after;
+        }
+
+        // Absteigen: der Block sind die folgenden Zeilen mit groesserer Einrueckung.
+        var nl: int64 := _yamlNextLine(content, line, clen);
+        if (nl >= clen) { return 0 - 1; }
+        var childIndent: int64 := _yamlIndentAt(content, nl, clen);
+        if (childIndent <= ind) { return 0 - 1; }
+        var blockEnd: int64 := nl;
+        var scan: int64 := nl;
+        while (scan < clen) {
+            var si: int64 := _yamlIndentAt(content, scan, clen);
+            var sc: int64 := StrCharAt(content, scan + si);
+            if (si < childIndent && sc != 10 && sc != 13 && sc != 0 && sc != 35) { scan := clen; }
+            else { blockEnd := _yamlNextLine(content, scan, clen); scan := blockEnd; }
+        }
+        fromPos := nl;
+        toPos := blockEnd;
+        indent := childIndent;
+        segStart := segEnd + 1;
+    }
+    return 0 - 1;
+}
+
 fn _yamlFindKey(content: pchar, clen: int64, path: pchar, plen: int64): int64 {
+    return _yamlFindPath(content, clen, path, plen, 0);
+}
+
+fn _yamlFindKeyFlat(content: pchar, clen: int64, path: pchar, plen: int64): int64 {
     var pos: int64 := 0;
     while (pos < clen) {
         // Only match top-level keys (no leading indent)
@@ -156,7 +276,15 @@ fn _yamlFindKey(content: pchar, clen: int64, path: pchar, plen: int64): int64 {
 pub fn ParseString(input: pchar): int64 {
     if (input == 0) { return 0; }
     var len: int64 := StrLen(input);
-    var buf: pchar := alloc(len + 1);
+    // #1312: Hier stand alloc(len + 1). Der Schreibweg (_yamlSetKey) legt das
+    // geaenderte Dokument in denselben Puffer zurueck und nimmt laut eigenem
+    // Kommentar 65536 Byte an — so gross legt auch LoadFile an. Ein per
+    // ParseString erzeugtes Dokument war damit zu klein: schon eine
+    // Wertaenderung gleicher Laenge schrieb ueber das Ende hinaus, und
+    // Zurueckgelesenes war verstuemmelt ("example.oex" statt "example.org").
+    var YAML_BUF: int64 := 65536;
+    if (len + 1 > YAML_BUF) { return 0; }
+    var buf: pchar := alloc(YAML_BUF);
     if (buf == 0) { return 0; }
     var i: int64 := 0;
     while (i < len) {
@@ -289,10 +417,95 @@ pub fn WriteFile(doc: int64, path: pchar): bool {
 // Modification
 // ============================================================================
 
+// #1312: Schreibt einen verschachtelten Pfad. Liefert 1, wenn zustaendig und
+// erledigt, sonst 0 (dann uebernimmt der flache Weg).
+//
+// Vorhandener Pfad: die gefundene Zeile wird durch "<Einrueckung><letzter
+// Abschnitt>: <Wert>" ersetzt, die Einrueckung also beibehalten.
+// Fehlender Pfad: die fehlenden Ebenen werden am Ende angelegt, je Ebene zwei
+// Leerzeichen tiefer — dieselbe Schreibweise, die der Leseweg erwartet.
+fn _yamlSetNested(doc: int64, path: pchar, value_str: pchar): int64 {
+    var plen: int64 := StrLen(path);
+    var hasDot: int64 := 0;
+    var i: int64 := 0;
+    while (i < plen) { if (StrCharAt(path, i) == 46) { hasDot := 1; } i := i + 1; }
+    if (hasDot == 0) { return 0; }
+
+    var content: pchar := doc as pchar;
+    var clen: int64 := StrLen(content);
+    var vlen: int64 := StrLen(value_str);
+    var BUF: int64 := 65536;
+    var lineBox: int64 := alloc(8);
+    poke64(lineBox, 0 - 1);
+    var vstart: int64 := _yamlFindPath(content, clen, path, plen, lineBox);
+    var line: int64 := peek64(lineBox);
+    free(lineBox, 8);
+
+    var tmp: int64 := alloc(BUF);
+    if (tmp == 0) { return 1; }
+    var out: int64 := 0;
+
+    // letzter Abschnitt des Pfades
+    var lastStart: int64 := 0;
+    i := 0;
+    while (i < plen) { if (StrCharAt(path, i) == 46) { lastStart := i + 1; } i := i + 1; }
+
+    if (vstart >= 0) {
+        var ind: int64 := _yamlIndentAt(content, line, clen);
+        var j: int64 := 0;
+        while (j < line && out < BUF - 1) { poke8(tmp + out, StrCharAt(content, j)); out := out + 1; j := j + 1; }
+        var k: int64 := 0;
+        while (k < ind && out < BUF - 1) { poke8(tmp + out, 32); out := out + 1; k := k + 1; }
+        var si: int64 := lastStart;
+        while (si < plen && out < BUF - 1) { poke8(tmp + out, StrCharAt(path, si)); out := out + 1; si := si + 1; }
+        if (out < BUF - 1) { poke8(tmp + out, 58); out := out + 1; }
+        if (out < BUF - 1) { poke8(tmp + out, 32); out := out + 1; }
+        var vi: int64 := 0;
+        while (vi < vlen && out < BUF - 1) { poke8(tmp + out, StrCharAt(value_str, vi)); out := out + 1; vi := vi + 1; }
+        if (out < BUF - 1) { poke8(tmp + out, 10); out := out + 1; }
+        var rest: int64 := _yamlNextLine(content, line, clen);
+        while (rest < clen && out < BUF - 1) { poke8(tmp + out, StrCharAt(content, rest)); out := out + 1; rest := rest + 1; }
+    } else {
+        var j2: int64 := 0;
+        while (j2 < clen && out < BUF - 1) { poke8(tmp + out, StrCharAt(content, j2)); out := out + 1; j2 := j2 + 1; }
+        if (out > 0 && peek8(tmp + out - 1) != 10 && out < BUF - 1) { poke8(tmp + out, 10); out := out + 1; }
+        // fehlende Ebenen anlegen
+        var segStart: int64 := 0;
+        var depth: int64 := 0;
+        while (segStart <= plen) {
+            var segEnd: int64 := segStart;
+            while (segEnd < plen && StrCharAt(path, segEnd) != 46) { segEnd := segEnd + 1; }
+            var sp: int64 := 0;
+            while (sp < depth * 2 && out < BUF - 1) { poke8(tmp + out, 32); out := out + 1; sp := sp + 1; }
+            var ci: int64 := segStart;
+            while (ci < segEnd && out < BUF - 1) { poke8(tmp + out, StrCharAt(path, ci)); out := out + 1; ci := ci + 1; }
+            if (out < BUF - 1) { poke8(tmp + out, 58); out := out + 1; }
+            if (segEnd >= plen) {
+                if (out < BUF - 1) { poke8(tmp + out, 32); out := out + 1; }
+                var vj: int64 := 0;
+                while (vj < vlen && out < BUF - 1) { poke8(tmp + out, StrCharAt(value_str, vj)); out := out + 1; vj := vj + 1; }
+            }
+            if (out < BUF - 1) { poke8(tmp + out, 10); out := out + 1; }
+            if (segEnd >= plen) { segStart := plen + 1; }
+            else { segStart := segEnd + 1; depth := depth + 1; }
+        }
+    }
+    poke8(tmp + out, 0);
+    var w: int64 := 0;
+    while (w <= out) { poke8(doc + w, peek8(tmp + w)); w := w + 1; }
+    free(tmp, BUF);
+    return 1;
+}
+
 // Internal: replace or append "path: value_str\n" in the doc buffer.
 // The doc buffer is assumed to be 65536 bytes (from LoadFile/ParseString).
 fn _yamlSetKey(doc: int64, path: pchar, value_str: pchar): void {
     if (doc == 0 || path == 0 || value_str == 0) { return; }
+    // #1312: Bei einem Pfad mit Punkt legte der Weg unten einen Schluessel
+    // WOERTLICH dieses Namens an ("server.host: …" auf oberster Ebene), statt in
+    // die Struktur zu schreiben. Ein anschliessendes Get fand weiterhin den
+    // alten Wert — die Aenderung war also spurlos verpufft, ohne Meldung.
+    if (_yamlSetNested(doc, path, value_str) != 0) { return; }
     var content: pchar := doc as pchar;
     var clen: int64 := StrLen(content);
     var plen: int64 := StrLen(path);
