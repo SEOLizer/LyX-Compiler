@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.16B
+VERSION   := 1.0.16C
 VERSION_DATE := 2026-08-11
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -427,6 +427,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Ressourcengrenze um jeden lyxc-Aufruf (5 Pruefungen) ---"
 	@bash tests/lyxc_guard_coverage_test.sh
+	@echo "OK"
+	@echo "--- Enum-Member, doppelte Namen, Escape-Sequenzen (12 Pruefungen) ---"
+	@bash tests/enum_escape_test.sh
 	@echo "OK"
 	@echo "--- TextMate-Grammatik: Schluesselwoerter und Typen vollstaendig ---"
 	@bash tests/syntax/test_grammar.sh
