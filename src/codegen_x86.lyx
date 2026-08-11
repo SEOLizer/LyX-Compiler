@@ -2370,6 +2370,32 @@ pub type Codegen = class {
     self.cg_e8(0xFF); self.cg_e8(0x64); self.cg_e8(0x24); self.cg_e8(0x38);  // jmp [rsp+56]
   }
 
+  // #1242: Die anliegende Ausnahme weiterreichen. Der Wert steht unveraendert
+  // in CG_EXN_VAL — niemand hat ihn gefangen —, gesucht wird also nur der
+  // naechste Handler. Gibt es keinen, endet das Programm mit 1, genau wie ein
+  // `throw` ohne jeden try. Aufgerufen wird das auf dem Ausnahmeweg eines
+  // try-Blocks OHNE catch, nachdem sein finally gelaufen ist.
+  //
+  // Die verbliebenen defers dieses Rahmens laufen davor: die Ausnahme verlaesst
+  // die Funktion, und was der Rumpf vor dem try angemeldet hat, waere sonst
+  // uebersprungen (dieselbe Luecke wie #1241 am throw selbst).
+  fn cg_emitRethrow() {
+    if (self.deferCount > 0) { self.cg_emitDefersDownTo(0); }
+    self.cg_emitLeaRcxData(CG_EXN_PTR);
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x01);   // mov rax, [rcx]
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
+    self.cg_e8(0x0F); self.cg_e8(0x84);                      // jz .noHandler
+    var rtNH: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_genLongjmp();
+    poke32(self.code + rtNH, self.codeLen - rtNH - 4);
+    // kein Handler: sys_exit(1)
+    self.cg_movRaxImm(1);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+    self.cg_movRaxImm(60);
+    self.cg_e8(0x0F); self.cg_e8(0x05);                      // syscall
+  }
+
   // WP-BC-01: Emit inline panic body — rdi must hold the message pointer.
   // Writes message to stderr then exits(1) (or longjmps if handler is installed).
   fn cg_emitPanicBody() {
@@ -11581,6 +11607,16 @@ pub type Codegen = class {
         self.cg_genBlock(finallyNi);
         self.tryDepth := myTryLevel + 1;
       }
+      // #1242: `try { … } finally { … }` OHNE catch faengt nichts — es raeumt
+      // nur auf. Der Handler wird trotzdem installiert, damit das finally auf
+      // dem Ausnahmeweg laeuft; danach muss die Ausnahme aber WEITERGEHEN.
+      // Vorher fiel der Weg hier auf try_done durch: die Ausnahme war
+      // verschluckt, das Programm lief weiter und endete mit rc=0 — aus einem
+      // gemeldeten Fehler wurde stiller Erfolg. Jetzt wird sie erneut geworfen.
+      if (self.cg_nc1(ni) < 0) {
+        self.tryDepth := myTryLevel;
+        self.cg_emitRethrow();
+      }
       // #1148: Ebene abmelden — ab hier ist der try-Block verlassen.
       self.tryDepth := myTryLevel;
       // === try_done ===
@@ -11599,9 +11635,18 @@ pub type Codegen = class {
       // #1118: Der try-Block wird hier verlassen — seine defers laufen zuerst,
       // wie bei break/continue in einer Schleife (#1006). Der Wert steht schon
       // in rax; die defers duerfen ihn nicht verlieren, also gerettet.
-      if (self.tryDeferMark >= 0 && self.deferCount > self.tryDeferMark) {
+      //
+      // #1241: Steht der `throw` in KEINEM try dieser Funktion, dann verlaesst
+      // die Ausnahme den Rahmen — der Sprung geht zu einem Handler im Aufrufer
+      // oder gar nirgendwohin. Dann laufen ALLE defers dieser Funktion, nicht
+      // bloss die eines try-Blocks. Vorher lief hier keiner: die Bedingung
+      // verlangte einen umgebenden try, und genau im Fehlerfall — dem einzigen,
+      // fuer den man `defer CloseFile(fd)` schreibt — leckte der Deskriptor.
+      var throwDeferMark: int64 := self.tryDeferMark;
+      if (throwDeferMark < 0) { throwDeferMark := 0; }
+      if (self.deferCount > throwDeferMark) {
         self.cg_pushRax();
-        self.cg_emitDefersDownTo(self.tryDeferMark);
+        self.cg_emitDefersDownTo(throwDeferMark);
         self.cg_popRax();
       }
       self.cg_emitLeaRcxData(CG_EXN_VAL);
