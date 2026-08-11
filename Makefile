@@ -437,6 +437,9 @@ test: lyxc
 	@echo "--- stdlib: AES gegen FIPS-197, PQC-Level, Signale, std.fs (13 Pruefungen) ---"
 	@bash tests/stdlib_bundle2_test.sh
 	@echo "OK"
+	@echo "--- Allokator-Pool: Korrektheit und Syscall-Zahl (9 Pruefungen) ---"
+	@bash tests/alloc_pool_test.sh
+	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh
 	@echo "OK"
