@@ -3,8 +3,8 @@
 //
 // Vier Backends teilen sich eine Schnittstelle:
 //   1 sysfs  — /sys/bus/pci/devices/<bdf>/config (Linux)
-//   2 portio — 0xCF8/0xCFC (PCI-11, spaetere Phase)
-//   3 ecam   — memory-mapped Config-Space (PCI-12, spaetere Phase)
+//   2 portio — 0xCF8/0xCFC (PCI-11)
+//   3 ecam   — memory-mapped Config-Space (PCI-12)
 //   4 mem    — ein Puffer im Speicher; kein Hardwarezugriff, sondern ein
 //              vollwertiger Weg fuer Momentaufnahmen und fuer Tests ohne
 //              Geraet. Bewusst oeffentlich, nicht heimlich.
@@ -20,6 +20,7 @@ unit std.hardware.pci_config;
 
 import std.hardware.pci_types;
 import std.hardware.pci_syscalls;
+import std.hardware.pci_portio;
 import std.alloc;
 
 // ============================================================
@@ -110,13 +111,22 @@ pub fn PciCfgOpenEcam(base: int64, bdf: int64): int64 {
   return ctxAlloc(PCI_BACKEND_ECAM, base, bdf, PCI_CFG_SIZE_PCIE);
 }
 
+// Legacy-Portweg (PCI-11). Der Deskriptor auf /dev/port ist der Griff;
+// ohne ihn gibt es keinen Zugriff, deshalb scheitert das Oeffnen hier und
+// nicht erst beim ersten Lesen.
 pub fn PciCfgOpenPortIo(bdf: int64): int64 {
-  return ctxAlloc(PCI_BACKEND_PORTIO, 0, bdf, PCI_CFG_SIZE_LEGACY);
+  if (bdf < 0) { return PCI_E_BADARG; }
+  var fd: int64 := PciPortOpen();
+  if (fd < 0) { return fd; }
+  var ctx: int64 := ctxAlloc(PCI_BACKEND_PORTIO, fd, bdf, PCI_CFG_SIZE_LEGACY);
+  if (ctx < 0) { PciPortClose(fd); return ctx; }
+  return ctx;
 }
 
 pub fn PciCfgClose(ctx: int64) {
   if (ctx <= 0) { return; }
-  if (peek64(ctx) == PCI_BACKEND_SYSFS) { PciCloseFile(peek64(ctx + 8)); }
+  if (peek64(ctx) == PCI_BACKEND_SYSFS)  { PciCloseFile(peek64(ctx + 8)); }
+  if (peek64(ctx) == PCI_BACKEND_PORTIO) { PciPortClose(peek64(ctx + 8)); }
   free(ctx, PCI_CFG_CTX_SIZE);
 }
 
@@ -154,8 +164,7 @@ fn readRaw(ctx: int64, off: int64, width: int64): int64 {
   }
 
   if (backend == PCI_BACKEND_PORTIO) {
-    // PCI-11 liefert die Umsetzung. Bis dahin gilt: melden, nicht raten.
-    return PCI_E_NOTSUP;
+    return PciPortIoCfgRead(handle, peek64(ctx + 16), off, width);
   }
 
   return PCI_E_NOBACKEND;
@@ -197,7 +206,9 @@ fn writeRaw(ctx: int64, off: int64, val: int64, width: int64): int64 {
     return PCI_E_BADARG;
   }
 
-  if (backend == PCI_BACKEND_PORTIO) { return PCI_E_NOTSUP; }
+  if (backend == PCI_BACKEND_PORTIO) {
+    return PciPortIoCfgWrite(handle, peek64(ctx + 16), off, val, width);
+  }
 
   return PCI_E_NOBACKEND;
 }

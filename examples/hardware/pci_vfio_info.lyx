@@ -1,0 +1,188 @@
+// examples/hardware/pci_vfio_info.lyx
+// Zeigt, was VFIO ueber ein Geraet hergibt: Regionen, Config-Space,
+// Interruptquellen — und richtet einmal eine DMA-Abbildung ein.
+//
+// Voraussetzungen (einmalig, als root):
+//   modprobe vfio-pci
+//   echo <bdf> > /sys/bus/pci/devices/<bdf>/driver/unbind
+//   echo "<vendor> <device>" > /sys/bus/pci/drivers/vfio-pci/new_id
+//   chown $USER /dev/vfio/<gruppe>
+//
+// Das Gerät muss allein in seiner IOMMU-Gruppe sitzen, sonst muessen alle
+// Geraete der Gruppe mit. Welche Gruppe: /sys/kernel/iommu_groups/.
+//
+// Aufruf:
+//   lyxc examples/hardware/pci_vfio_info.lyx -o pci_vfio_info
+//   ./pci_vfio_info 0000:00:08.0
+//
+// Ohne Argument sucht das Programm selbst das erste Geraet, das an
+// vfio-pci gebunden ist.
+
+unit examples.hardware.pci_vfio_info;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.hardware.pci_config;
+import std.hardware.pci_enum;
+import std.hardware.pci_vfio;
+import std.hardware.pci_irq;
+import std.alloc;
+import std.io;
+
+fn printHex(val: int64, digits: int64) {
+  var buf: int64 := alloc(24);
+  var s: pchar := buf as pchar;
+  PciStrAppendHex(buf, 0, 24, val, digits);
+  Print(s);
+  free(buf, 24);
+}
+
+// Sucht das erste Geraet, fuer das VFIO einen Deskriptor herausgibt.
+// Fuer Geraete an einem Kerneltreiber scheitert das, ohne sie anzufassen.
+fn findVfioDevice(): int64 {
+  var buf: int64 := alloc(PCI_ENUM_MAX * 8);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var n: int64 := PciEnumSysfs(buf, PCI_ENUM_MAX);
+  if (n < 0) { free(buf, PCI_ENUM_MAX * 8); return n; }
+
+  var i: int64 := 0;
+  var found: int64 := PCI_E_NODEV;
+  while (i < n && found < 0) {
+    var bdf: int64 := peek64(buf + i * 8);
+    var ctx: int64 := PciVfioOpen(bdf);
+    if (ctx > 0) { PciVfioClose(ctx); found := bdf; }
+    i := i + 1;
+  }
+  free(buf, PCI_ENUM_MAX * 8);
+  return found;
+}
+
+fn showRegions(ctx: int64) {
+  PrintLn("Regionen:");
+  var i: int64 := 0;
+  while (i < PciVfioNumRegions(ctx)) {
+    var size: int64 := PciVfioRegionSize(ctx, i);
+    if (size > 0) {
+      Print("  ");
+      if (i < PCI_BAR_COUNT) { Print("BAR"); Print(IntToStr(i)); }
+      else if (i == VFIO_PCI_ROM_REGION_INDEX)    { Print("ROM "); }
+      else if (i == VFIO_PCI_CONFIG_REGION_INDEX) { Print("CFG "); }
+      else if (i == VFIO_PCI_VGA_REGION_INDEX)    { Print("VGA "); }
+      else { Print("R"); Print(IntToStr(i)); }
+      Print("  Groesse=");
+      Print(IntToStr(size));
+      if (PciVfioRegionIsMappable(ctx, i) == 1) { Print("  abbildbar"); }
+      else { Print("  nur lesen/schreiben"); }
+      PrintLn("");
+    }
+    i := i + 1;
+  }
+}
+
+fn showIrqs(ctx: int64) {
+  PrintLn("Interruptquellen:");
+  var i: int64 := 0;
+  while (i < PciVfioNumIrqs(ctx)) {
+    var count: int64 := PciIrqCount(ctx, i);
+    if (count > 0) {
+      Print("  ");
+      Print(PciIrqTypeName(i));
+      Print(": ");
+      Print(IntToStr(count));
+      Print(" Vektor(en)");
+      if (PciIrqIsMaskable(ctx, i) == 1) { Print(", maskierbar"); }
+      PrintLn("");
+    }
+    i := i + 1;
+  }
+}
+
+fn showConfig(ctx: int64) {
+  Print("Config-Space: ");
+  printHex(PciVfioCfgRead(ctx, PCI_CFG_VENDOR_ID, 2), 4);
+  Print(":");
+  printHex(PciVfioCfgRead(ctx, PCI_CFG_DEVICE_ID, 2), 4);
+  Print("  Klasse ");
+  printHex(PciVfioCfgRead(ctx, PCI_CFG_CLASS, 1), 2);
+  printHex(PciVfioCfgRead(ctx, PCI_CFG_SUBCLASS, 1), 2);
+  Print("  Rev ");
+  printHex(PciVfioCfgRead(ctx, PCI_CFG_REVISION, 1), 2);
+  PrintLn("");
+
+  // Ueber VFIO steht der ganze Config-Space offen — auch der Teil, den
+  // sysfs einem unprivilegierten Leser verweigert.
+  Print("  Command=");
+  printHex(PciVfioCfgRead(ctx, PCI_CFG_COMMAND, 2), 4);
+  Print("  Status=");
+  printHex(PciVfioCfgRead(ctx, PCI_CFG_STATUS, 2), 4);
+  Print("  CapPtr=");
+  printHex(PciVfioCfgRead(ctx, PCI_CFG_CAP_PTR, 1), 2);
+  PrintLn("");
+}
+
+fn showDma(ctx: int64) {
+  var iovaSlot: int64 := alloc(8);
+  poke64(iovaSlot, 0);
+  var dma: int64 := PciVfioDmaAlloc(ctx, 65536, iovaSlot);
+  if (dma < 0) {
+    Print("DMA: nicht moeglich — ");
+    PrintLn(PciErrorName(dma));
+  } else {
+    Print("DMA: 64 KB abgebildet, IOVA 0x");
+    printHex(peek64(iovaSlot), 8);
+    PrintLn(" (das Geraet sieht den Puffer unter dieser Adresse)");
+    PciVfioDmaFree(ctx, dma, peek64(iovaSlot), 65536);
+    PrintLn("     wieder abgebaut");
+  }
+  free(iovaSlot, 8);
+}
+
+fn main(argc: int64, argv: pchar): int64 {
+  var bdf: int64 := PCI_E_NODEV;
+
+  if (argc > 1) {
+    var p: pchar := ArgvGet(argv, 1);
+    bdf := PciBdfParse(p);
+    if (bdf < 0) {
+      PrintLn("Unbrauchbare Adresse. Erwartet wird z.B. 0000:00:08.0");
+      return 1;
+    }
+  } else {
+    bdf := findVfioDevice();
+    if (bdf < 0) {
+      PrintLn("Kein Geraet an vfio-pci gebunden.");
+      PrintLn("Siehe Kopf dieser Datei — das Binden ist Sache des Betreibers,");
+      PrintLn("weil es dem laufenden System die Hardware entzieht.");
+      return 1;
+    }
+  }
+
+  var addr: int64 := alloc(PCI_BDF_STR_LEN);
+  var addrStr: pchar := addr as pchar;
+  PciBdfFormat(addr, bdf);
+  Print("Geraet: ");
+  Print(addrStr);
+  Print("  IOMMU-Gruppe ");
+  PrintLn(IntToStr(PciVfioGroupOf(bdf)));
+  free(addr, PCI_BDF_STR_LEN);
+
+  var ctx: int64 := PciVfioOpen(bdf);
+  if (ctx < 0) {
+    Print("VFIO nicht verfuegbar: ");
+    PrintLn(PciErrorName(ctx));
+    return 1;
+  }
+
+  showConfig(ctx);
+  showRegions(ctx);
+  showIrqs(ctx);
+  showDma(ctx);
+
+  Print("Ruecksetzen: ");
+  var rc: int64 := PciVfioReset(ctx);
+  if (rc == 0) { PrintLn("durchgefuehrt"); }
+  else { PrintLn(PciErrorName(rc)); }
+
+  PciVfioClose(ctx);
+  return 0;
+}

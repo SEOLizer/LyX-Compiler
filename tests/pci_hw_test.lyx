@@ -1,5 +1,5 @@
 // tests/pci_hw_test.lyx
-// PCI Phase 1 — Test gegen echte Hardware, ausschliesslich lesend.
+// PCI Phase 1+2 — Test gegen echte Hardware, ausschliesslich lesend.
 //
 // Er schreibt nichts in irgendeinen Config-Space: ein Testlauf darf die
 // Maschine nicht umkonfigurieren. Fehlt /sys/bus/pci (Container, LyxOS,
@@ -11,6 +11,10 @@
 // AC-H2 Enumeration liefert mindestens ein Geraet
 // AC-H3 Jede gemeldete BDF laesst sich wieder oeffnen und lesen
 // AC-H4 Format(Parse(x)) == x fuer jede gemeldete Adresse
+// AC-H5 Fassade: oeffnen, Kopfdaten, BAR-Groessen, sauber schliessen
+// AC-H6 Zugriff auf ein nicht abgebildetes BAR wird abgewiesen
+// AC-H7 VFIO: Geraet oeffnen, Regionen, Config-Space, DMA, IRQ-Auskunft
+//       (uebersprungen, wenn kein Geraet an vfio-pci gebunden ist)
 
 unit tests.pci_hw_test;
 
@@ -18,6 +22,11 @@ import std.hardware.pci_types;
 import std.hardware.pci_syscalls;
 import std.hardware.pci_config;
 import std.hardware.pci_enum;
+import std.hardware.pci;
+import std.hardware.pci_bar;
+import std.hardware.pci_caps;
+import std.hardware.pci_vfio;
+import std.hardware.pci_irq;
 import std.alloc;
 import std.string;
 import std.fs;
@@ -35,7 +44,7 @@ fn bad(name: pchar, detail: pchar) {
 }
 
 fn main(): int64 {
-  PrintLn("=== PCI Phase 1: Hardware (nur lesend) ===");
+  PrintLn("=== PCI Phase 1-3: Hardware ===");
 
   if (!IsDirectory(PCI_SYSFS_DEVICES)) {
     PrintLn("SKIP kein /sys/bus/pci — nichts geprueft (kein PCI-Bus sichtbar)");
@@ -106,6 +115,154 @@ fn main(): int64 {
 
   if (roundtripFails == 0) { ok("AC-H4 format/parse rundlauf stabil"); }
   else { bad("AC-H4 format/parse rundlauf", IntToStr(roundtripFails)); }
+
+  // AC-H5/AC-H6: Fassade am ersten gemeldeten Geraet.
+  if (n > 0) {
+    var dev: int64 := PciOpen(peek64(buf));
+    if (dev <= 0) {
+      bad("AC-H5 fassade oeffnen", PciErrorName(dev));
+    } else {
+      var vid: int64 := PciDevVendorId(dev);
+      if (vid > 0 && vid != 65535) { ok("AC-H5 fassade liest vendor-id"); }
+      else { bad("AC-H5 fassade vendor-id", IntToStr(vid)); }
+
+      // Jede belegte Region muss eine Groesse und einen Anfang haben; die
+      // Angaben stammen aus zwei verschiedenen Quellen (Config-Space und
+      // resource-Datei) und muessen zueinander passen.
+      var bi: int64 := 0;
+      var barFails: int64 := 0;
+      while (bi < PCI_BAR_COUNT) {
+        var size: int64 := PciDevBarSize(dev, bi);
+        if (size > 0) {
+          var start: int64 := PciBarStart(PciDevBdf(dev), bi);
+          if (start <= 0) { barFails := barFails + 1; }
+          var raw: int64 := PciDevBarRaw(dev, bi);
+          if (raw <= 0) { barFails := barFails + 1; }
+        }
+        bi := bi + 1;
+      }
+      if (barFails == 0) { ok("AC-H5 BAR-Angaben stimmig"); }
+      else { bad("AC-H5 BAR-Angaben", IntToStr(barFails)); }
+
+      // AC-H6: ohne Abbildung darf kein Zugriff durchgehen — sonst
+      // schriebe die Fassade auf Adresse 0 + Offset.
+      if (PciDevRead32(dev, 0, 0) == PCI_E_BADARG) { ok("AC-H6 zugriff ohne abbildung abgewiesen"); }
+      else { bad("AC-H6 zugriff ohne abbildung", IntToStr(PciDevRead32(dev, 0, 0))); }
+      if (PciDevMapBar(dev, 9) == PCI_E_BADARG) { ok("AC-H6 BAR-index geprueft"); }
+      else { bad("AC-H6 BAR-index", "9 nicht abgewiesen"); }
+
+      PciClose(dev);
+      ok("AC-H5 fassade geschlossen");
+    }
+  }
+
+  // ============================================================
+  // AC-H7: VFIO
+  //
+  // Gesucht wird ein Geraet, das an vfio-pci gebunden ist. Fuer alle
+  // anderen scheitert VFIO_GROUP_GET_DEVICE_FD, ohne sie anzufassen.
+  // Findet sich keines, wird der Abschnitt mit Begruendung uebersprungen —
+  // ein stilles Durchwinken saehe aus wie eine bestandene Pruefung.
+  // ============================================================
+  var vctx: int64 := 0;
+  var vbdf: int64 := 0;
+  var vi: int64 := 0;
+  while (vi < n && vctx <= 0) {
+    var cand: int64 := peek64(buf + vi * 8);
+    // `try` ist in Lyx reserviert — deshalb attempt.
+    var attempt: int64 := PciVfioOpen(cand);
+    if (attempt > 0) { vctx := attempt; vbdf := cand; }
+    vi := vi + 1;
+  }
+
+  if (vctx <= 0) {
+    PrintLn("SKIP AC-H7 kein Geraet an vfio-pci gebunden — VFIO nicht geprueft");
+  } else {
+    PciBdfFormat(pathBuf, vbdf);
+    Print("HINWEIS VFIO-Geraet: "); PrintLn(pathStr);
+
+    if (PciVfioIsPciDevice(vctx) == 1) { ok("AC-H7 als PCI-Geraet gemeldet"); }
+    else { bad("AC-H7 PCI-Flag", "fehlt"); }
+
+    // Ein PCI-Geraet hat neun Regionen: sechs BARs, ROM, Config, VGA.
+    if (PciVfioNumRegions(vctx) == VFIO_PCI_NUM_REGIONS) { ok("AC-H7 neun Regionen"); }
+    else { bad("AC-H7 Regionenzahl", IntToStr(PciVfioNumRegions(vctx))); }
+
+    // Der Config-Space ist ueber VFIO lesbar — und zwar vollstaendig,
+    // auch ohne root. Genau das kann der sysfs-Weg nicht.
+    var cfgSize: int64 := PciVfioRegionSize(vctx, VFIO_PCI_CONFIG_REGION_INDEX);
+    if (cfgSize == PCI_CFG_SIZE_LEGACY || cfgSize == PCI_CFG_SIZE_PCIE) { ok("AC-H7 Config-Region-Groesse plausibel"); }
+    else { bad("AC-H7 Config-Region", IntToStr(cfgSize)); }
+
+    // Der Config-Space ist absichtlich NICHT abbildbar: der Kernel muss
+    // bei Schreibzugriffen mitreden koennen.
+    if (PciVfioRegionIsMappable(vctx, VFIO_PCI_CONFIG_REGION_INDEX) == 0) { ok("AC-H7 Config-Region nicht abbildbar"); }
+    else { bad("AC-H7 Config-Region", "als abbildbar gemeldet"); }
+
+    // Dieselbe Vendor-ID ueber zwei voellig verschiedene Wege.
+    var sysCtx: int64 := PciCfgOpenSysfs(vbdf);
+    var vidSys: int64 := -1;
+    if (sysCtx > 0) { vidSys := PciVendorId(sysCtx); PciCfgClose(sysCtx); }
+    var vidVfio: int64 := PciVfioCfgRead(vctx, PCI_CFG_VENDOR_ID, 2);
+    if (vidVfio == vidSys && vidVfio > 0) { ok("AC-H7 Vendor-ID stimmt mit sysfs ueberein"); }
+    else {
+      Print("FAIL AC-H7 Vendor-ID: vfio="); Print(IntToStr(vidVfio));
+      Print(" sysfs="); PrintLn(IntToStr(vidSys));
+      failures := failures + 1;
+    }
+
+    // Lesen ausserhalb der Region ist ein Programmierfehler und wird als
+    // solcher gemeldet, nicht als Geraetefehler.
+    if (PciVfioCfgRead(vctx, cfgSize, 4) == PCI_E_RANGE) { ok("AC-H7 Config-Lesen ausserhalb abgewiesen"); }
+    else { bad("AC-H7 Config-Bereich", IntToStr(PciVfioCfgRead(vctx, cfgSize, 4))); }
+
+    // DMA: Puffer besorgen, abbilden, beschreiben, zuruecklesen, abbauen.
+    var iovaSlot: int64 := alloc(8);
+    poke64(iovaSlot, 0);
+    var dma: int64 := PciVfioDmaAlloc(vctx, 8192, iovaSlot);
+    if (dma <= 0) {
+      bad("AC-H7 DMA-Abbildung", PciErrorName(dma));
+    } else {
+      var iova: int64 := peek64(iovaSlot);
+      poke64(dma, 305419896);
+      poke64(dma + 4088, 987654321);
+      if (peek64(dma) == 305419896 && peek64(dma + 4088) == 987654321) { ok("AC-H7 DMA-Puffer beschreibbar"); }
+      else { bad("AC-H7 DMA-Puffer", "Inhalt weicht ab"); }
+      if (iova >= PCI_VFIO_IOVA_BASE) { ok("AC-H7 IOVA vergeben"); }
+      else { bad("AC-H7 IOVA", IntToStr(iova)); }
+      if (PciVfioDmaFree(vctx, dma, iova, 8192) == 0) { ok("AC-H7 DMA-Abbildung abgebaut"); }
+      else { bad("AC-H7 DMA-Abbau", "fehlgeschlagen"); }
+    }
+    free(iovaSlot, 8);
+
+    // IRQ-Auskunft: mindestens ein Typ muss Vektoren melden, sonst waere
+    // das Geraet nicht unterbrechungsfaehig.
+    var best: int64 := PciIrqBestType(vctx);
+    if (best >= 0) {
+      Print("HINWEIS bester IRQ-Typ: "); Print(PciIrqTypeName(best));
+      Print(" mit "); Print(IntToStr(PciIrqCount(vctx, best))); PrintLn(" Vektor(en)");
+      var fds: int64 := alloc(8);
+      var t: int64 := PciIrqEnable(vctx, 1, fds);
+      if (t >= 0) {
+        ok("AC-H7 IRQ-Vektor eingerichtet");
+        // Ohne Arbeitslast feuert das Geraet nicht — der Zeitablauf ist
+        // hier das erwartete Ergebnis, kein Fehlschlag. Dass der Zaehler
+        // richtig ankommt, prueft pci_wp3_test ohne Hardware.
+        if (PciIrqWait(peek64(fds), 20) == 0) { ok("AC-H7 kein Interrupt im Leerlauf (erwartet)"); }
+        else { PrintLn("HINWEIS unerwarteter Interrupt im Leerlauf"); }
+        PciIrqDisableAll(vctx, t, 1, fds);
+        ok("AC-H7 IRQ-Vektor abgebaut");
+      } else {
+        bad("AC-H7 IRQ einrichten", PciErrorName(t));
+      }
+      free(fds, 8);
+    } else {
+      PrintLn("HINWEIS Geraet meldet keine Interruptquelle");
+    }
+
+    PciVfioClose(vctx);
+    ok("AC-H7 VFIO-Kontext geschlossen");
+  }
 
   free(pathBuf, PCI_PATH_MAX);
   free(buf, PCI_ENUM_MAX * 8);

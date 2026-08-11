@@ -1,0 +1,295 @@
+// std/hardware/pci_bar.lyx
+// PCI-05: Base Address Register auswerten, abbilden, benutzen.
+//
+// Ein BAR sagt drei Dinge in einem 32-Bit-Wort: wohin (Adresse), wohin
+// nicht (I/O oder Speicher), und wie (32 oder 64 Bit, prefetchable). Die
+// Groesse steht NICHT darin — klassisch ermittelt man sie, indem man
+// 0xFFFFFFFF schreibt und zurueckliest. Das stoert ein laufendes Geraet,
+// deshalb nimmt diese Unit auf Linux die Datei
+// /sys/bus/pci/devices/<bdf>/resource, in der der Kernel Anfang, Ende und
+// Flags jeder Region bereits stehen hat.
+//
+// MMIO-Schreibzugriffe bekommen anschliessend eine Speicherbarriere. Ohne
+// sie darf die CPU umordnen, und die Reihenfolge zweier Registerschreiber
+// ist bei Geraeten oft die eigentliche Aussage.
+
+@description("PCI BAR decoding and MMIO access")
+@author("Andreas Roene")
+unit std.hardware.pci_bar;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.hardware.pci_config;
+import std.alloc;
+
+// ============================================================
+// Reine Auswertung eines BAR-Wortes
+// ============================================================
+
+// 1 = I/O-Space, 0 = Memory-Space.
+pub fn PciBarIsIo(bar: int64): int64 {
+  if ((bar & PCI_BAR_SPACE_MASK) == PCI_BAR_SPACE_IO) { return 1; }
+  return 0;
+}
+
+// 1 = das BAR ist 64 Bit breit und belegt zusaetzlich den Folgeslot.
+pub fn PciBarIs64(bar: int64): int64 {
+  if (PciBarIsIo(bar) == 1) { return 0; }
+  if ((bar & PCI_BAR_MEM_TYPE_MASK) == PCI_BAR_MEM_TYPE_64) { return 1; }
+  return 0;
+}
+
+pub fn PciBarIsPrefetchable(bar: int64): int64 {
+  if (PciBarIsIo(bar) == 1) { return 0; }
+  if ((bar & PCI_BAR_PREFETCH) != 0) { return 1; }
+  return 0;
+}
+
+// Adressanteil eines einzelnen BAR-Wortes (untere 32 Bit).
+pub fn PciBarAddress32(bar: int64): int64 {
+  if (PciBarIsIo(bar) == 1) { return bar & PCI_BAR_IO_ADDR_MASK & 4294967295; }
+  return bar & PCI_BAR_MEM_ADDR_MASK & 4294967295;
+}
+
+// Adresse aus einem 64-Bit-Paar.
+pub fn PciBarAddress64(barLow: int64, barHigh: int64): int64 {
+  return PciBarAddress32(barLow) | ((barHigh & 4294967295) << 32);
+}
+
+// ============================================================
+// BAR aus dem Config-Space lesen
+// ============================================================
+
+// Rohwert von BAR idx.
+pub fn PciBarRaw(ctx: int64, idx: int64): int64 {
+  if (idx < 0 || idx >= PCI_BAR_COUNT) { return PCI_E_BADARG; }
+  return PciCfgRead32(ctx, PCI_CFG_BAR0 + idx * 4);
+}
+
+// Vollstaendige Adresse von BAR idx. Bei einem 64-Bit-BAR wird der
+// Folgeslot mitgelesen; steht das BAR im letzten Slot, fehlt der zweite
+// Teil und die Angabe waere unvollstaendig — das meldet die Funktion,
+// statt die oberen 32 Bit als 0 anzunehmen.
+pub fn PciBarAddress(ctx: int64, idx: int64): int64 {
+  var raw: int64 := PciBarRaw(ctx, idx);
+  if (raw < 0) { return raw; }
+  if (PciBarIs64(raw) == 0) { return PciBarAddress32(raw); }
+  if ((idx + 1) >= PCI_BAR_COUNT) { return PCI_E_RANGE; }
+  var high: int64 := PciBarRaw(ctx, idx + 1);
+  if (high < 0) { return high; }
+  return PciBarAddress64(raw, high);
+}
+
+// Index des naechsten belegbaren BAR-Slots — ein 64-Bit-BAR ueberspringt
+// den Folgeslot. Wer das vergisst, liest die oberen 32 Adressbits als
+// eigenstaendiges BAR und meldet ein Geraet mit einer Region zu viel.
+pub fn PciBarNextIndex(ctx: int64, idx: int64): int64 {
+  var raw: int64 := PciBarRaw(ctx, idx);
+  if (raw < 0) { return raw; }
+  if (PciBarIs64(raw) == 1) { return idx + 2; }
+  return idx + 1;
+}
+
+// ============================================================
+// Groesse und Flags aus der sysfs-resource-Datei
+// ============================================================
+//
+// Aufbau je Zeile: "<start> <end> <flags>" in Hex mit 0x-Vorsatz.
+// Die ersten sechs Zeilen sind BAR0..BAR5, danach folgen ROM und
+// Bridge-Fenster. Eine unbelegte Region steht als 0 0 0.
+
+con RESOURCE_BUF: int64 := 4096;
+
+// Liest das i-te Hex-Feld (nullbasiert, ueber Zeilen hinweg gezaehlt).
+// Rueckgabe: Wert, oder PCI_E_IO wenn so viele Felder nicht da sind.
+pub fn PciResourceField(buf: int64, len: int64, fieldIdx: int64): int64 {
+  return parseHexField(buf, len, fieldIdx);
+}
+
+// Groesse der Region idx aus einem bereits gelesenen resource-Text.
+// Oeffentlich, weil genau hier der Fehler sitzen wuerde und ein Test ohne
+// Hardware sonst nicht an die Rechnung herankaeme.
+pub fn PciResourceSize(buf: int64, len: int64, idx: int64): int64 {
+  if (idx < 0 || idx >= PCI_BAR_COUNT) { return PCI_E_BADARG; }
+  var start: int64 := parseHexField(buf, len, idx * 3);
+  var end:   int64 := parseHexField(buf, len, idx * 3 + 1);
+  if (start < 0) { return start; }
+  if (end < 0)   { return end; }
+  if (start == 0 && end == 0) { return 0; }
+  if (end < start) { return PCI_E_IO; }
+  return (end - start) + 1;
+}
+
+fn parseHexField(buf: int64, len: int64, fieldIdx: int64): int64 {
+  var i: int64 := 0;
+  var field: int64 := 0;
+  while (i < len) {
+    // Trennzeichen ueberspringen
+    var skipping: int64 := 1;
+    while (i < len && skipping == 1) {
+      var c: int64 := peek8(buf + i);
+      if (c == 32 || c == 10 || c == 13 || c == 9) { i := i + 1; } else { skipping := 0; }
+    }
+    if (i >= len) { return PCI_E_IO; }
+
+    // "0x" ueberspringen, falls vorhanden
+    if ((i + 1) < len) {
+      if (peek8(buf + i) == 48) {
+        var c2: int64 := peek8(buf + i + 1);
+        if (c2 == 120 || c2 == 88) { i := i + 2; }
+      }
+    }
+
+    var val: int64 := 0;
+    var digits: int64 := 0;
+    var run: int64 := 1;
+    while (i < len && run == 1) {
+      var c3: int64 := peek8(buf + i);
+      var d: int64 := -1;
+      if (c3 >= 48 && c3 <= 57)  { d := c3 - 48; }
+      if (c3 >= 97 && c3 <= 102) { d := (c3 - 97) + 10; }
+      if (c3 >= 65 && c3 <= 70)  { d := (c3 - 65) + 10; }
+      if (d < 0) { run := 0; } else {
+        val := (val << 4) | d;
+        digits := digits + 1;
+        i := i + 1;
+      }
+    }
+    if (digits == 0) { return PCI_E_IO; }
+    if (field == fieldIdx) { return val; }
+    field := field + 1;
+  }
+  return PCI_E_IO;
+}
+
+fn readResourceFile(bdf: int64, buf: int64): int64 {
+  var path: int64 := alloc(PCI_PATH_MAX);
+  if (path == 0) { return PCI_E_NOMEM; }
+  var r: int64 := PciSysfsPath(path, bdf, "resource");
+  if (r < 0) { free(path, PCI_PATH_MAX); return r; }
+  var fd: int64 := PciOpenFile(path as pchar, PCI_O_RDONLY);
+  free(path, PCI_PATH_MAX);
+  if (fd < 0) { return PCI_E_NODEV; }
+  var n: int64 := read(fd, buf as pchar, RESOURCE_BUF - 1);
+  PciCloseFile(fd);
+  if (n <= 0) { return PCI_E_IO; }
+  poke8(buf + n, 0);
+  return n;
+}
+
+// Groesse der Region idx in Bytes. 0 = Region nicht belegt.
+// Nur auf Systemen mit sysfs; anderswo PCI_E_NOTSUP (die Ermittlung ueber
+// Schreiben/Zuruecklesen gehoert in den bare-metal-Pfad und darf hier
+// nicht heimlich passieren).
+pub fn PciBarSize(bdf: int64, idx: int64): int64 {
+  if (idx < 0 || idx >= PCI_BAR_COUNT) { return PCI_E_BADARG; }
+  var buf: int64 := alloc(RESOURCE_BUF);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var n: int64 := readResourceFile(bdf, buf);
+  if (n < 0) { free(buf, RESOURCE_BUF); return n; }
+
+  var size: int64 := PciResourceSize(buf, n, idx);
+  free(buf, RESOURCE_BUF);
+  return size;
+}
+
+// Physische Startadresse der Region idx laut Kernel.
+pub fn PciBarStart(bdf: int64, idx: int64): int64 {
+  if (idx < 0 || idx >= PCI_BAR_COUNT) { return PCI_E_BADARG; }
+  var buf: int64 := alloc(RESOURCE_BUF);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var n: int64 := readResourceFile(bdf, buf);
+  if (n < 0) { free(buf, RESOURCE_BUF); return n; }
+  var start: int64 := parseHexField(buf, n, idx * 3);
+  free(buf, RESOURCE_BUF);
+  return start;
+}
+
+// Flags der Region idx (IORESOURCE_*-Bits des Kernels).
+pub fn PciBarFlags(bdf: int64, idx: int64): int64 {
+  if (idx < 0 || idx >= PCI_BAR_COUNT) { return PCI_E_BADARG; }
+  var buf: int64 := alloc(RESOURCE_BUF);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var n: int64 := readResourceFile(bdf, buf);
+  if (n < 0) { free(buf, RESOURCE_BUF); return n; }
+  var flags: int64 := parseHexField(buf, n, idx * 3 + 2);
+  free(buf, RESOURCE_BUF);
+  return flags;
+}
+
+// ============================================================
+// Abbilden
+// ============================================================
+
+// Bildet BAR idx in den Adressraum ab. Rueckgabe: virtuelle Basisadresse
+// oder ein negativer Fehlercode. len wird, wenn > 0, ausgegeben in
+// lenOut (Zeiger auf int64) geschrieben.
+//
+// Braucht in aller Regel root: /sys/.../resourceN ist nur fuer den
+// Eigentuemer schreib- und abbildbar.
+pub fn PciBarMap(bdf: int64, idx: int64, lenOut: int64): int64 {
+  if (idx < 0 || idx >= PCI_BAR_COUNT) { return PCI_E_BADARG; }
+
+  var size: int64 := PciBarSize(bdf, idx);
+  if (size < 0) { return size; }
+  if (size == 0) { return PCI_E_NODEV; }   // Region nicht belegt
+
+  var path: int64 := alloc(PCI_PATH_MAX);
+  if (path == 0) { return PCI_E_NOMEM; }
+  var r: int64 := PciSysfsResourcePath(path, bdf, idx);
+  if (r < 0) { free(path, PCI_PATH_MAX); return r; }
+
+  var fd: int64 := PciOpenFile(path as pchar, PCI_O_RDWR);
+  free(path, PCI_PATH_MAX);
+  if (fd < 0) { return PCI_E_PERM; }
+
+  var addr: int64 := PciMmap(size, PCI_PROT_READ | PCI_PROT_WRITE, PCI_MAP_SHARED, fd, 0);
+  PciCloseFile(fd);
+  if (addr == PCI_MAP_FAILED || addr == 0) { return PCI_E_PERM; }
+
+  // Vor dem ersten Registerzugriff auf eine frische Abbildung.
+  mem_barrier();
+
+  if (lenOut != 0) { poke64(lenOut, size); }
+  return addr;
+}
+
+pub fn PciBarUnmap(addr: int64, len: int64): int64 {
+  if (addr <= 0 || len <= 0) { return PCI_E_BADARG; }
+  mem_barrier();
+  if (PciMunmap(addr, len) != 0) { return PCI_E_IO; }
+  return 0;
+}
+
+// ============================================================
+// MMIO-Zugriffe
+//
+// Lesen braucht keine Barriere: der Wert wird gebraucht, die CPU kann ihn
+// nicht vorziehen. Nach jedem Schreiben steht eine, damit die Reihenfolge
+// beim Geraet die des Programms ist.
+// ============================================================
+
+pub fn PciMmioRead8(base: int64, off: int64): int64  { return peek8(base + off); }
+pub fn PciMmioRead16(base: int64, off: int64): int64 { return peek16(base + off); }
+pub fn PciMmioRead32(base: int64, off: int64): int64 { return peek32(base + off) & 4294967295; }
+pub fn PciMmioRead64(base: int64, off: int64): int64 { return peek64(base + off); }
+
+pub fn PciMmioWrite8(base: int64, off: int64, val: int64) {
+  poke8(base + off, val & 255);
+  mem_barrier();
+}
+
+pub fn PciMmioWrite16(base: int64, off: int64, val: int64) {
+  poke16(base + off, val & 65535);
+  mem_barrier();
+}
+
+pub fn PciMmioWrite32(base: int64, off: int64, val: int64) {
+  poke32(base + off, val & 4294967295);
+  mem_barrier();
+}
+
+pub fn PciMmioWrite64(base: int64, off: int64, val: int64) {
+  poke64(base + off, val);
+  mem_barrier();
+}

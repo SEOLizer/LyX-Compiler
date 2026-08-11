@@ -1,0 +1,300 @@
+// std/hardware/pci_ecam.lyx
+// PCI-12: Konfigurationsraum als Speicher (Enhanced Configuration Access
+// Mechanism).
+//
+// PCIe legt den Config-Space jedes Geraets als 4096 Bytes in den
+// physischen Adressraum:
+//
+//   Adresse = base + (bus << 20) + (device << 15) + (funktion << 12) + offset
+//
+// Nur so ist der erweiterte Bereich ab 0x100 erreichbar — ueber
+// 0xCF8/0xCFC endet der Raum bei 256 Bytes.
+//
+// Woher die Basis kommt, ist plattformabhaengig:
+//   Linux:  ACPI-Tabelle MCFG unter /sys/firmware/acpi/tables/MCFG (root)
+//   LyxOS:  vom Kernel gereicht
+//   bare metal: aus der eigenen ACPI-Auswertung
+//
+// Der Zugriff auf die physische Adresse geht unter Linux ueber /dev/mem.
+// Das verlangt root, und bei CONFIG_IO_STRICT_DEVMEM=y verweigert der
+// Kernel Bereiche, die ein Treiber beansprucht — beides wird gemeldet und
+// nicht umgangen.
+
+@description("PCI configuration space via ECAM (memory mapped)")
+@author("Andreas Roene")
+unit std.hardware.pci_ecam;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.alloc;
+
+// ============================================================
+// Konstanten
+// ============================================================
+
+pub con PCI_MCFG_PATH: pchar := "/sys/firmware/acpi/tables/MCFG";
+pub con PCI_DEV_MEM:   pchar := "/dev/mem";
+
+// ACPI-Tabellenkopf: 36 Bytes, danach 8 reservierte Bytes, dann die
+// Eintraege zu je 16 Bytes.
+pub con PCI_MCFG_HEADER_SIZE: int64 := 36;
+pub con PCI_MCFG_ENTRY_START: int64 := 44;
+pub con PCI_MCFG_ENTRY_SIZE:  int64 := 16;
+
+// Eintragsfelder
+//   +0  Basisadresse (64 Bit)
+//   +8  PCI-Segmentgruppe (16 Bit)
+//   +10 erster Bus (8 Bit)
+//   +11 letzter Bus (8 Bit)
+//   +12 reserviert (32 Bit)
+
+pub con PCI_MCFG_MAX_SIZE: int64 := 4096;
+
+// Ein Segment umfasst hoechstens 256 Busse zu je 32 Geraeten mit je acht
+// Funktionen und 4096 Bytes: 256 MB.
+pub con PCI_ECAM_BUS_SIZE:     int64 := 1048576;    // 1 MB je Bus
+pub con PCI_ECAM_SEGMENT_SIZE: int64 := 268435456;  // 256 MB
+
+// ============================================================
+// Adressrechnung
+// ============================================================
+
+// Offset eines Geraets innerhalb des ECAM-Fensters, gerechnet ab dem
+// ersten Bus des Segments.
+pub fn PciEcamOffset(bus: int64, dev: int64, fun: int64, off: int64): int64 {
+  if (bus < 0 || bus > 255) { return PCI_E_BADARG; }
+  if (dev < 0 || dev > 31)  { return PCI_E_BADARG; }
+  if (fun < 0 || fun > 7)   { return PCI_E_BADARG; }
+  if (off < 0 || off >= PCI_CFG_SIZE_PCIE) { return PCI_E_RANGE; }
+  return (bus << 20) | (dev << 15) | (fun << 12) | off;
+}
+
+// Vollstaendige physische Adresse. startBus ist der erste Bus, den das
+// Fenster abdeckt — steht so in der MCFG und ist nicht immer 0.
+pub fn PciEcamAddress(base: int64, startBus: int64, bus: int64, dev: int64, fun: int64, off: int64): int64 {
+  if (base <= 0) { return PCI_E_BADARG; }
+  if (bus < startBus) { return PCI_E_RANGE; }
+  var rel: int64 := PciEcamOffset(bus - startBus, dev, fun, off);
+  if (rel < 0) { return rel; }
+  return base + rel;
+}
+
+// ============================================================
+// MCFG auswerten
+//
+// Der Parser arbeitet auf einem Puffer, nicht auf einer Datei — damit ist
+// er ohne root und ohne ACPI pruefbar. Die Dateifassung darunter fuellt
+// nur den Puffer.
+// ============================================================
+
+// Anzahl der Eintraege in einem MCFG-Puffer.
+pub fn PciMcfgEntryCount(buf: int64, len: int64): int64 {
+  if (buf == 0 || len < PCI_MCFG_ENTRY_START) { return PCI_E_BADARG; }
+
+  // Signatur pruefen: "MCFG". Ohne diese Pruefung wuerde jede beliebige
+  // Datei als Tabelle gelesen und lieferte Adressen, die nirgends
+  // hinzeigen.
+  if (peek8(buf) != 77 || peek8(buf + 1) != 67 ||
+      peek8(buf + 2) != 70 || peek8(buf + 3) != 71) { return PCI_E_IO; }
+
+  // Laengenfeld der Tabelle gegen die tatsaechliche Laenge halten.
+  var tlen: int64 := peek32(buf + 4) & 4294967295;
+  if (tlen > len) { return PCI_E_IO; }
+  if (tlen < PCI_MCFG_ENTRY_START) { return PCI_E_IO; }
+
+  return (tlen - PCI_MCFG_ENTRY_START) / PCI_MCFG_ENTRY_SIZE;
+}
+
+fn entryPtr(buf: int64, idx: int64): int64 {
+  return buf + PCI_MCFG_ENTRY_START + idx * PCI_MCFG_ENTRY_SIZE;
+}
+
+pub fn PciMcfgBase(buf: int64, len: int64, idx: int64): int64 {
+  var n: int64 := PciMcfgEntryCount(buf, len);
+  if (n < 0) { return n; }
+  if (idx < 0 || idx >= n) { return PCI_E_BADARG; }
+  return peek64(entryPtr(buf, idx));
+}
+
+pub fn PciMcfgSegment(buf: int64, len: int64, idx: int64): int64 {
+  var n: int64 := PciMcfgEntryCount(buf, len);
+  if (n < 0) { return n; }
+  if (idx < 0 || idx >= n) { return PCI_E_BADARG; }
+  return peek16(entryPtr(buf, idx) + 8);
+}
+
+pub fn PciMcfgStartBus(buf: int64, len: int64, idx: int64): int64 {
+  var n: int64 := PciMcfgEntryCount(buf, len);
+  if (n < 0) { return n; }
+  if (idx < 0 || idx >= n) { return PCI_E_BADARG; }
+  return peek8(entryPtr(buf, idx) + 10);
+}
+
+pub fn PciMcfgEndBus(buf: int64, len: int64, idx: int64): int64 {
+  var n: int64 := PciMcfgEntryCount(buf, len);
+  if (n < 0) { return n; }
+  if (idx < 0 || idx >= n) { return PCI_E_BADARG; }
+  return peek8(entryPtr(buf, idx) + 11);
+}
+
+// Liest die MCFG-Tabelle in einen frisch allokierten Puffer.
+// lenOut (Zeiger auf int64) erhaelt die gelesene Laenge.
+// Rueckgabe: Puffer (mit free(ptr, PCI_MCFG_MAX_SIZE) freizugeben) oder
+//   PCI_E_PERM    Datei vorhanden, keine Rechte (root noetig)
+//   PCI_E_NOTSUP  keine MCFG-Tabelle (kein ACPI, oder reines PCI ohne PCIe)
+pub fn PciMcfgRead(lenOut: int64): int64 {
+  var fd: int64 := PciOpenFile(PCI_MCFG_PATH, PCI_O_RDONLY);
+  if (fd < 0) {
+    // Existiert die Tabelle ueberhaupt? Der Unterschied zwischen "dieses
+    // System hat kein ECAM" und "ich darf nicht" ist fuer den Aufrufer
+    // wesentlich. Die Tabellendateien sind root-only, aber nicht von
+    // Lockdown betroffen — anders als /dev/mem.
+    if (PciPathExists(PCI_MCFG_PATH) == 0) { return PCI_E_NOTSUP; }
+    return PCI_E_PERM;
+  }
+
+  var buf: int64 := alloc(PCI_MCFG_MAX_SIZE);
+  if (buf == 0) { PciCloseFile(fd); return PCI_E_NOMEM; }
+  var n: int64 := read(fd, buf as pchar, PCI_MCFG_MAX_SIZE);
+  PciCloseFile(fd);
+  if (n <= 0) { free(buf, PCI_MCFG_MAX_SIZE); return PCI_E_IO; }
+
+  var count: int64 := PciMcfgEntryCount(buf, n);
+  if (count < 0) { free(buf, PCI_MCFG_MAX_SIZE); return count; }
+
+  if (lenOut != 0) { poke64(lenOut, n); }
+  return buf;
+}
+
+pub fn PciMcfgFree(buf: int64) {
+  if (buf > 0) { free(buf, PCI_MCFG_MAX_SIZE); }
+}
+
+// ============================================================
+// Fenster abbilden
+// ============================================================
+
+// Kontext (heap-allokiert, 40 Bytes)
+//   +0   virtuelle Basis der Abbildung
+//   +8   Laenge der Abbildung
+//   +16  physische Basis
+//   +24  erster Bus
+//   +32  letzter Bus
+pub con PCI_ECAM_CTX_SIZE: int64 := 40;
+
+pub fn PciEcamBaseVirt(ctx: int64): int64 { return peek64(ctx); }
+pub fn PciEcamMapLen(ctx: int64): int64   { return peek64(ctx + 8); }
+pub fn PciEcamBasePhys(ctx: int64): int64 { return peek64(ctx + 16); }
+pub fn PciEcamFirstBus(ctx: int64): int64 { return peek64(ctx + 24); }
+pub fn PciEcamLastBus(ctx: int64): int64  { return peek64(ctx + 32); }
+
+// Bildet das ECAM-Fenster ab. Unter Linux ueber /dev/mem; das verlangt
+// root und scheitert bei CONFIG_IO_STRICT_DEVMEM=y, wenn ein Treiber den
+// Bereich beansprucht.
+pub fn PciEcamOpen(base: int64, startBus: int64, endBus: int64): int64 {
+  if (base <= 0) { return PCI_E_BADARG; }
+  if (startBus < 0 || endBus > 255 || startBus > endBus) { return PCI_E_BADARG; }
+
+  var len: int64 := ((endBus - startBus) + 1) * PCI_ECAM_BUS_SIZE;
+
+  var fd: int64 := PciOpenFile(PCI_DEV_MEM, PCI_O_RDWR | PCI_O_SYNC);
+  if (fd < 0) {
+    // Wie bei /dev/port: Existenz per stat, dann Lockdown, erst dann
+    // Rechte. Bei aktivem Secure Boot ist /dev/mem auch fuer root zu.
+    if (PciPathExists(PCI_DEV_MEM) == 0) { return PCI_E_NOTSUP; }
+    if (PciLockdownBlocksHwAccess() == 1) { return PCI_E_LOCKED; }
+    return PCI_E_PERM;
+  }
+
+  var addr: int64 := PciMmap(len, PCI_PROT_READ | PCI_PROT_WRITE, PCI_MAP_SHARED, fd, base);
+  PciCloseFile(fd);
+  if (addr == PCI_MAP_FAILED || addr == 0) { return PCI_E_PERM; }
+  mem_barrier();
+
+  var ctx: int64 := alloc(PCI_ECAM_CTX_SIZE);
+  if (ctx == 0) { PciMunmap(addr, len); return PCI_E_NOMEM; }
+  poke64(ctx,      addr);
+  poke64(ctx + 8,  len);
+  poke64(ctx + 16, base);
+  poke64(ctx + 24, startBus);
+  poke64(ctx + 32, endBus);
+  return ctx;
+}
+
+// Bequemer Weg: Basis und Busbereich aus der MCFG des Systems holen.
+pub fn PciEcamOpenAuto(): int64 {
+  var lenSlot: int64 := alloc(8);
+  if (lenSlot == 0) { return PCI_E_NOMEM; }
+  poke64(lenSlot, 0);
+  var buf: int64 := PciMcfgRead(lenSlot);
+  if (buf < 0) { free(lenSlot, 8); return buf; }
+  var len: int64 := peek64(lenSlot);
+  free(lenSlot, 8);
+
+  var count: int64 := PciMcfgEntryCount(buf, len);
+  if (count <= 0) { PciMcfgFree(buf); return PCI_E_NOTSUP; }
+
+  // Nur das erste Segment. Mehrere Segmente sind auf Serverhardware
+  // ueblich; sie brauchen je einen eigenen Kontext, den der Aufrufer mit
+  // PciEcamOpen selbst anlegt. Hier stillschweigend das erste zu nehmen
+  // und so zu tun, als gaebe es nur eines, waere die falsche Vereinfachung
+  // — deshalb steht die Zahl ueber PciMcfgEntryCount offen.
+  var base:  int64 := PciMcfgBase(buf, len, 0);
+  var first: int64 := PciMcfgStartBus(buf, len, 0);
+  var last:  int64 := PciMcfgEndBus(buf, len, 0);
+  PciMcfgFree(buf);
+
+  if (base <= 0) { return PCI_E_IO; }
+  return PciEcamOpen(base, first, last);
+}
+
+pub fn PciEcamClose(ctx: int64) {
+  if (ctx <= 0) { return; }
+  var addr: int64 := peek64(ctx);
+  var len:  int64 := peek64(ctx + 8);
+  if (addr > 0 && len > 0) { mem_barrier(); PciMunmap(addr, len); }
+  free(ctx, PCI_ECAM_CTX_SIZE);
+}
+
+// Virtuelle Adresse des Config-Space eines Geraets.
+pub fn PciEcamDeviceAddr(ctx: int64, bdf: int64, off: int64): int64 {
+  if (ctx <= 0 || bdf < 0) { return PCI_E_BADARG; }
+  // Der Legacy-Weg kennt nur Domain 0; ECAM kennt Segmente, aber dieser
+  // Kontext deckt genau eines ab.
+  var bus: int64 := PciBdfBus(bdf);
+  if (bus < peek64(ctx + 24) || bus > peek64(ctx + 32)) { return PCI_E_RANGE; }
+  var rel: int64 := PciEcamOffset(bus - peek64(ctx + 24), PciBdfDevice(bdf), PciBdfFunction(bdf), off);
+  if (rel < 0) { return rel; }
+  return peek64(ctx) + rel;
+}
+
+// ============================================================
+// Zugriffe
+// ============================================================
+
+pub fn PciEcamRead(ctx: int64, bdf: int64, off: int64, width: int64): int64 {
+  if (width != 1 && width != 2 && width != 4) { return PCI_E_BADARG; }
+  var a: int64 := PciEcamDeviceAddr(ctx, bdf, off);
+  if (a < 0) { return a; }
+  if (width == 1) { return peek8(a); }
+  if (width == 2) { return peek16(a); }
+  return peek32(a) & 4294967295;
+}
+
+pub fn PciEcamWrite(ctx: int64, bdf: int64, off: int64, val: int64, width: int64): int64 {
+  if (width != 1 && width != 2 && width != 4) { return PCI_E_BADARG; }
+  var a: int64 := PciEcamDeviceAddr(ctx, bdf, off);
+  if (a < 0) { return a; }
+  if (width == 1) { poke8(a, val & 255); }
+  if (width == 2) { poke16(a, val & 65535); }
+  if (width == 4) { poke32(a, val & 4294967295); }
+  mem_barrier();
+  return 0;
+}
+
+pub fn PciEcamDevicePresent(ctx: int64, bdf: int64): int64 {
+  var v: int64 := PciEcamRead(ctx, bdf, PCI_CFG_VENDOR_ID, 2);
+  if (v < 0) { return v; }
+  if (v == 65535 || v == 0) { return 0; }
+  return 1;
+}
