@@ -1,6 +1,6 @@
-# Lyx 1.0.16F — Canonical EBNF Grammar
+# Lyx 1.0.16G — Canonical EBNF Grammar
 
-> Stand 2026-08-11, gegen lyxc 1.0.16F geprueft. Die Keyword-Liste in
+> Stand 2026-08-11, gegen lyxc 1.0.16G geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -430,7 +430,22 @@ BaseIntType         = "int8"  | "i8"
    hier `QualifiedIdent = Ident "::" Ident`; `::` erzeugt einen Parse-Fehler. *)
 
 ArrayType           = "array" "[" Type "]"
-                    | "Array" "<" Type ">" ;
+                    | "Array" "<" Type ">"
+                    | FixedArrayType ;
+
+FixedArrayType      = "[" ConstExpr "]" Type
+                    | Type "[" ConstExpr "]" ;
+
+(* Beide Schreibweisen ergeben denselben Typ; die Groesse ist eine Konstante,
+   ein Bereich (`int64[0..100]`) wird abgewiesen. GENAU EINE Verschachtelung
+   ist umgesetzt: `[N][M]T` liegt FLACH -- N*M Slots hinter einem
+   `{cap,len}`-Kopf --, `m[i]` liefert die ADRESSE der Zeile i und `m[i][j]`
+   liest von dort mit Schrittweite 8. Beide Indizes werden unter
+   `--runtime-checks` geprueft. Eine ganze Zeile zuzuweisen (`m[i] := x`) hat
+   keine Bedeutung und wird gemeldet, ebenso eine dritte Dimension: der
+   Lesepfad kennt genau eine Zeilenlaenge. Bis 1.0.16G wurde `[N][M]T`
+   abgewiesen, davor belegte es nur N Slots und stuerzte bei JEDEM Zugriff ab
+   (#1230). *)
 
 ParallelArrayType   = "ParallelArray" "<" Type ">" ;
 
@@ -1185,7 +1200,14 @@ PanicExpr           = "panic" "(" [ Expr ] ")" ;
 
 AssertExpr          = "assert" "(" Expr ")" ;
 
-NewExpr             = "new" Type "(" [ ArgList ] ")" ;
+NewExpr             = "new" Type "(" [ ArgList ] ")"
+                    | "new" Type "[" Expr "]" ;
+
+(* Die zweite Form belegt ein Array, dessen Laenge erst zur LAUFZEIT feststeht:
+   `16 + n*8` Byte, also `{cap,len}`-Kopf und n Slots, wie ein `[N]T`. `len(a)`
+   liest denselben Kopf, und die dynamische Bereichspruefung haelt den Index
+   dagegen. Eine Laenge <= 0 bricht mit `panic` ab. Bis 1.0.16G gab es die Form
+   nicht -- eine gerechnete Groesse zwang zu alloc/poke64 (#1255). *)
 
 DisposeExpr         = "dispose" Expr ;
 ```
@@ -1397,6 +1419,7 @@ Einzelbefunde sind dort verlinkt.
 | Einheitentypen, Semantik | 11 | `utype N: Dim = Faktor` wirkt: bei Zuweisung zwischen Einheiten DERSELBEN Dimension rechnet der Compiler mit dem Faktorverhaeltnis um — erst multiplizieren, dann ganzzahlig teilen, `Km` nach `M` also exakt, `M` nach `Km` abschneidend wie die Ganzzahldivision sonst. Die DIMENSION wird geprueft: Zuweisung ueber Dimensionsgrenzen, Addition zweier Dimensionen und das Verrechnen mit einer dimensionslosen Zahl werden abgewiesen. Erlaubt bleiben ein Literal als Wert (`var a: Km := 2`), die Skalierung mit einer Zahl (`a * 3` behaelt die Einheit) und der `as`-Cast als bewusster Fluchtweg. `range LO..HI` bricht ausserhalb mit `panic` ab, `wraps LO..HI` rechnet in den Bereich zurueck; Grenzen einschliesslich, konstante Werte meldet der Compiler sofort. Bis 1.0.13D war `utype` ein Typalias mit dekorativem Faktor, und `range`/`wraps` parsten gar nicht (#1110). NICHT gerechnet werden abgeleitete Dimensionen: `dim Speed = Meter / Second` wird angenommen, aber `laenge / zeit` ergibt keine `Speed` — das Ergebnis gilt als dimensionslos, und `utype`-Werte sind ganzzahlig. |
 | Array als Funktionsparameter | 6 | `fn F(a: int64[4])` uebergibt den ZEIGER auf die Ablage: der Callee liest und schreibt denselben Speicher, eine Zuweisung darin ist beim Aufrufer sichtbar. Die deklarierte Groesse wird mitgenommen, `len(a)` liefert sie, und die Bereichspruefung unter `--runtime-checks` (#1156) greift auch hier. Gilt fuer alle Uebergabewege: Register, Stack (ab dem siebten Argument) und Methodenparameter. Bis 1.0.13F fehlte im Callee die Merkung "das ist ein Array" — der Indexzugriff fiel in den Zweig fuer einen rohen Zeiger, lieferte lesend eine Adresse und schrieb ins Leere (#1115). Die Schreibweise `array[T]` ist als Parametertyp weiterhin nicht zugelassen. |
 | Array mit Struct-/Klassen-Elementtyp | 7 | `T[N]` haelt ZEIGER-Slots: `arr[i] := s` teilt das Objekt mit `s`, wie die Struct-Zuweisung sonst auch, und `arr[i].feld := x` wirkt auf beide. Die Slots werden bei der Deklaration mit frischen Objekten belegt — ein `arr[0].v := 42` braucht also kein vorheriges `new`, genau wie ein `var s: S;` seit WP-10d angelegt wird. Belegt werden `16 + N*8` Byte: die 16 sind der `{cap,len}`-Kopf, den der Indexzugriff ueberspringt. Bis 1.0.13C wurde der Elementtyp am Local nicht vermerkt, `arr[0].v` bekam Feldoffset -1 und lieferte still `0`; ausserdem wurden nur `N*8` Byte angefordert, die Zugriffe lagen also um einen Kopf verschoben dahinter (#1109). Ein `array[T]`, `Array<T>` oder `T[]` OHNE Initialisierung wird seit 1.0.13H ebenfalls belegt: leer, mit `{cap,len}`-Kopf (`len` = 0). `len(a)` liefert damit 0 statt auf eine Null zu treffen, und ein Schreibzugriff kommt an; `push` findet den Zeiger gesetzt vor und legt nicht erneut an. Bis 1.0.13G war die Variable null, und nur `push` legte an — beim ERSTEN Aufruf (#1177). |
+| Aggregate auf Modulebene | 10 | Ein globales `[N]T` oder ein globales Struct passt nicht in den 8-Byte-Slot der Variablen. Es bekommt seit 1.0.16G einen eigenen Block im Datenbereich -- `{cap,len}`-Kopf plus `N*8` Byte beim Array, die Feldgroesse beim Struct --, der Slot traegt einen ZEIGER darauf; das ist dieselbe Form, die ein Local zur Laufzeit per mmap anlegt, nur schon zur Uebersetzungszeit. Damit wirken `q[0] := 3`, `s.x := 3`, `len(q)` und ein Array-Literal als Startwert auch auf Modulebene, und der Typ darf UNTER der Variablen deklariert stehen (das Layout wird vorgezogen). Bis 1.0.16G blieb der Slot 0: `q[0] := 3` schrieb nach Adresse 16 und stuerzte ab, `s.x := 3` verpuffte still, und ein Array-Literal als Startwert fiel ersatzlos weg -- der zugehoerige Test druckte 0/0/0 und galt trotzdem als gruen (#1256, #1299). Nicht umgesetzt und deshalb GEMELDET: Struct-Elemente in einem globalen Array (jedes Element braeuchte ein eigenes Objekt, das es zur Uebersetzungszeit nicht gibt), `@redundant` auf einem Aggregat und eine Elementzahl, die keine Konstante zwischen 1 und 33554431 ist. |
 | Capability-Argumente, Wirkung | 22 | Der Capability-NAME wird geprueft, der ARGUMENTNAME seit 1.0.13C ebenfalls: ein unbekannter Schluessel (`fs.read(pfad: …)`) und ein Argument an einer Capability, die keine nimmt, werden abgewiesen. Gueltige Schluessel: `path` (fs.*, process.exec), `host`/`port` (network.*), `pin` (hardware.gpio), `bus` (i2c/spi), `cs` (spi), `vendor`/`product` (usb). Der WERT wird jedoch **nicht durchgesetzt** — die Sandbox wirkt als Ja/Nein (seccomp-Syscallfilter plus EINE Landlock-Regel fuer `/`), nicht als Beschraenkung auf den genannten Pfad, Rechner oder Port. Der Compiler meldet das an jedem Argument, statt eine Sicherheitszusage vorzutaeuschen, die es nicht gibt (#1108); die Durchsetzung ist als #1173 geführt. Die PortSpec-Bereichsform (`"host":8000-9000`) parst seit 1.0.13C und wird auf Start <= Ende geprueft. |
 | Schmale Ganzzahltypen, Breite | 7 | `intN`/`uintN` mit N < 64 belegen einen vollen 64-Bit-Slot; gekuerzt wird beim SPEICHERN, vorzeichenbehaftet bei `intN`, vorzeichenlos bei `uintN`. Erfasst sind Initialisierung, Zuweisung, Parameter, Rueckgabe, globale Variablen und der `as`-Cast; Strukturfelder liegen ohnehin in ihrer eigenen Breite. Bis 1.0.11D fand die Kuerzung an KEINER dieser Stellen statt (`var a: int8 := 130` ergab 130 statt -126), und `as int8`/`as int16` kuerzten nur in der kurzen Schreibweise (`as i8`) -- #1151. Ein konstanter Wert, der nicht in die Breite passt, wird gekuerzt und nicht gemeldet. Eine globale Variable mit BERECHNETER Initialisierung bleibt weiterhin still 0 (#1164). |
 | Indexzugriff, Bereichspruefung | 15 | Ein konstanter Index auf eine Variable mit fester Groesse (`int64[N]` oder ein Array-Literal als Initialisierung) wird zur UEBERSETZUNGSZEIT geprueft und ausserhalb der Grenzen abgewiesen -- ohne Schalter. Berechnete Indizes prueft der erzeugte Code nur unter `--runtime-checks`; dann bricht ein Zugriff ausserhalb mit `panic` ab ("index out of bounds"). Der Vergleich ist vorzeichenLOS, ein negativer Index faellt also in denselben Zweig. `@bounds_check(true)` fordert sie umgekehrt AN und wirkt damit auch OHNE `--runtime-checks`; `@bounds_check(false)` schaltet sie im Geltungsbereich ab, auch WENN die Option gesetzt ist -- die Direktive steht naeher am Code. Bis 1.0.13Q war die Direktive nur in der Richtung `false` wirksam: der Vorgabewert stand auf "an", "angefordert" und "nicht gesetzt" waren nicht zu unterscheiden, und `@bounds_check(true)` erzeugte dieselbe Binary wie gar keine Angabe (#1124). NICHT geprueft wird, wo es keine Laenge gibt: roher Zeiger, `pchar`, Array-Parameter und inline liegende Struct-Felder. Bis 1.0.11D emittierte `--runtime-checks` fuer Indizes gar nichts -- der Zugriff las still den Speicher dahinter (#1156). Nur das x86-64-Backend traegt diese Pruefung; die uebrigen Backends kennen `--runtime-checks` insgesamt nicht. |

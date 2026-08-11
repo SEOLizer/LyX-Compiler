@@ -581,6 +581,13 @@ pub type Codegen = class {
   // Per-local array flag (WP-10b): byte buffer parallel to locals, 1 = array type
   localIsArray:      int64;
   localArraySize:    int64;  // WP-BC-51: int64 buffer, stores array length per local (0 = not array)
+  // #1230: Zeilenlaenge M eines `[N][M]T`. 0 = eindimensional. Das Layout ist
+  // FLACH (N*M Slots hinter einem {cap,len}-Kopf); `m[i]` liefert die Adresse
+  // der Zeile i, `m[i][j]` liest von dort mit Schrittweite 8. Zeiger auf
+  // Zeiger waere die Alternative gewesen und haette je Zeile eine eigene
+  // Belegung gebraucht — genau die fehlte bis 1.0.16G und war der Absturz.
+  localArrayRow:     int64;
+  globalArrayRow:    int64;
   // WP-3.1: byte buffer parallel to locals, 1 = @redundant var (TMR triple storage)
   localIsRedundant:  int64;
 
@@ -622,6 +629,14 @@ pub type Codegen = class {
   globalVarCount: int64;
   globalVarCap:   int64;
   globalIsPchar:  int64;  // byte buffer parallel to globalVars: 1 = pchar type
+  // #1256/#1299: Ein globales AGGREGAT — `[N]T` oder ein Struct — passt nicht
+  // in den 8-Byte-Slot. Der Slot traegt deshalb einen ZEIGER auf einen eigenen
+  // Block im Datenbereich, genau wie ein Local auf seinen mmap-Block zeigt.
+  // Bis 1.0.16G blieb dieser Slot 0: `q[0] := 3` schrieb nach Adresse 16 und
+  // stuerzte ab, `s.x := 3` verpuffte, ein Startwert fiel weg.
+  // 2 = feste Groesse `[N]T` (Laenge in globalArraySize), 3 = Struct/Klasse.
+  globalIsArray:  int64;  // byte buffer parallel zu globalVars
+  globalArraySize: int64; // int64-Puffer: Elementzahl bei 2, sonst 0
   // #1094: deklarierter Typname je globaler Variable {ptr:8, len:8}, parallel
   // zu globalVars. Ohne ihn waere der statische Typ einer globalen Variablen
   // im Codegen nicht bestimmbar — `g is int64` muesste dann melden statt zu
@@ -919,6 +934,9 @@ pub type Codegen = class {
       i := 0;
       memcpy(sb, self.localArraySize, self.localCount * 8);
       self.localArraySize := sb;
+      var rowb: int64 := alloc(nc * 8);        // #1230
+      memcpy(rowb, self.localArrayRow, self.localCount * 8);
+      self.localArrayRow := rowb;
       // WP-3.1: grow redundant flag buffer
       var rb: int64 := alloc(nc);
       i := 0;
@@ -945,6 +963,7 @@ pub type Codegen = class {
     poke64(toff + CG_LOCTYPE_OFF_LEN, 0);
     poke8(self.localIsArray      + self.localCount, 0);
     poke64(self.localArraySize   + self.localCount * 8, 0);
+    poke64(self.localArrayRow    + self.localCount * 8, 0);   // #1230
     poke8(self.localIsRedundant  + self.localCount, 0);  // WP-3.1
     poke8(self.localIsSimd       + self.localCount, 0);  // WP-GPU-01
     poke8(self.localIsFnPtr      + self.localCount, 0);  // #1003
@@ -1156,15 +1175,24 @@ pub type Codegen = class {
       var np: int64 := alloc(nc);
       var nt: int64 := alloc(nc * 16);
       var nr: int64 := alloc(nc);          // #1141
+      var na: int64 := alloc(nc);          // #1256
+      var ns: int64 := alloc(nc * 8);      // #1256
+      var ng: int64 := alloc(nc * 8);      // #1230
       var i: int64 := 0;
       memcpy(nb, self.globalVars, self.globalVarCount * 24);
       i := 0;
       memcpy(np, self.globalIsPchar, self.globalVarCount);
       memcpy(nt, self.globalTypeNames, self.globalVarCount * 16);
       memcpy(nr, self.globalIsRedundant, self.globalVarCount);   // #1141
+      memcpy(na, self.globalIsArray, self.globalVarCount);       // #1256
+      memcpy(ns, self.globalArraySize, self.globalVarCount * 8); // #1256
+      memcpy(ng, self.globalArrayRow, self.globalVarCount * 8);  // #1230
       self.globalVars := nb; self.globalVarCap := nc; self.globalIsPchar := np;
       self.globalTypeNames := nt;
       self.globalIsRedundant := nr;
+      self.globalIsArray := na;
+      self.globalArraySize := ns;
+      self.globalArrayRow := ng;
     }
     var doff: int64 := self.dataLen;
     // Reserve 8 zero bytes in data section (mmap is zero-initialized)
@@ -1176,10 +1204,52 @@ pub type Codegen = class {
     poke64(base + CG_GLOBAL_OFF_DOFF, doff);
     poke8(self.globalIsPchar + self.globalVarCount, 0);
     poke8(self.globalIsRedundant + self.globalVarCount, 0);   // #1141
+    poke8(self.globalIsArray + self.globalVarCount, 0);       // #1256
+    poke64(self.globalArraySize + self.globalVarCount * 8, 0);
+    poke64(self.globalArrayRow + self.globalVarCount * 8, 0);   // #1230
     poke64(self.globalTypeNames + self.globalVarCount * 16, 0);
     poke64(self.globalTypeNames + self.globalVarCount * 16 + 8, 0);
     self.globalVarCount += 1;
     return doff;
+  }
+
+  // #1256: n genullte Bytes im Datenbereich belegen, Offset zurueckgeben.
+  fn cg_reserveData(nbytes: int64): int64 {
+    var off: int64 := self.dataLen;
+    var i: int64 := 0;
+    while (i < nbytes) { self.cg_edata(0); i := i + 1; }
+    return off;
+  }
+
+  // #1256: Layout eines Structs vorziehen, das erst WEITER UNTEN in der Datei
+  // steht. Eine globale Variable dieses Typs braucht die Groesse schon bei
+  // ihrer Deklaration — der Hauptdurchlauf ist an dieser Stelle noch nicht bis
+  // zum Typ gekommen. Ohne das Vorziehen waere die Groesse unbekannt und die
+  // Variable bekaeme wieder nur einen Zeiger-Slot ohne Ziel.
+  fn cg_ensureStructLayout(name: pchar, nlen: int64): int64 {
+    var ci: int64 := self.cg_findClass(name, nlen);
+    if (ci >= 0) { return ci; }
+    var cur: int64 := self.topLevelHead;
+    while (cur != -1) {
+      var k: int64 := self.cg_nkind(cur);
+      // `type S = struct {…}` steht als CGN_TYPE_DECL im Baum, `struct S {…}`
+      // als CGN_STRUCT_DECL. Ein Alias (iVal-Bit1) benennt nur um, und ein Typ
+      // MIT Methoden ist eine Klasse: die braucht VMT-Layout und bleibt hier
+      // aussen vor — eine globale Klassenvariable ist nicht Teil von #1256.
+      var isStructDecl: int64 := 0;
+      if (k == CGN_STRUCT_DECL) { isStructDecl := 1; }
+      if (k == CGN_TYPE_DECL && (self.cg_nival(cur) & 2) == 0 && self.cg_nc1(cur) == -1) {
+        isStructDecl := 1;
+      }
+      if (isStructDecl != 0) {
+        if (self.cg_seq(self.cg_nsval(cur), self.cg_nslen(cur), name, nlen)) {
+          self.cg_buildStructLayout(cur);
+          return self.cg_findClass(name, nlen);
+        }
+      }
+      cur := self.cg_nnext(cur);
+    }
+    return -1;
   }
 
   fn cg_findGlobal(name: pchar, nlen: int64): int64 {
@@ -4118,6 +4188,43 @@ pub type Codegen = class {
     poke8(self.code + pSkip, self.codeLen - pSkip - 1);
   }
 
+  // #1255: `new T[n]` — Belegung mit einer erst zur Laufzeit bekannten Laenge.
+  // Dieselbe Form wie ein festes `[N]T`: {cap,len}-Kopf, dann n Slots zu 8
+  // Byte. Der Kopf ist nicht schmueckend — die dynamische Bereichspruefung
+  // liest die Laenge aus [rax+8], und `len(a)` liest denselben Slot.
+  fn cg_genArrayNew(cntNi: int64) {
+    self.cg_genExpr(cntNi);              // rax = n
+    // Eine Laenge <= 0 waere ein negatives oder leeres mmap: es scheiterte,
+    // lieferte -errno, und der Kopf-Schreibzugriff darauf stuerzte ab. Melden
+    // statt danebenzutreffen.
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xF8); self.cg_e8(0x00);  // cmp rax, 0
+    self.cg_e8(0x7F);                                   // jg short .ok
+    var pSkip: int64 := self.codeLen; self.cg_e8(0);
+    var msgOff: int64 := self.dataLen;
+    var msg: pchar := "new T[n]: Laenge muss > 0 sein\n"c;
+    var mi: int64 := 0;
+    while (mi < 31) { self.cg_edata(StrCharAt(msg, mi)); mi := mi + 1; }
+    self.cg_edata(0);
+    self.cg_emitLeaRdiData(msgOff);
+    self.cg_emitPanicBody();
+    poke8(self.code + pSkip, self.codeLen - pSkip - 1);
+    self.cg_pushRax();                                                        // n retten
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);                     // mov rsi, rax
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE6); self.cg_e8(0x03);   // shl rsi, 3
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x10);   // add rsi, 16 (Kopf)
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);                     // xor rdi, rdi
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(3);     // mov rdx, PROT_READ|WRITE
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(34);    // mov r10, MAP_PRIVATE|ANON
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);                     // xor r8, r8
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);                     // dec r8 -> fd = -1
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);                     // xor r9, r9
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(9);     // mov rax, SYS_mmap
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                       // syscall
+    self.cg_e8(0x5B);                                                         // pop rbx (n)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x18);                     // mov [rax], rbx    (cap)
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x58); self.cg_e8(0x08);   // mov [rax+8], rbx  (len)
+  }
+
   // Returns 1 if the named class field has type "Array<T>" (any T), 0 otherwise.
   // #1052: rax = [rax + rbx*w], breitengerecht (unsigned erweitert).
   fn cg_emitScaledLoadRax(w: int64) {
@@ -4536,6 +4643,12 @@ pub type Codegen = class {
   fn cg_buildStructLayout(ni: int64) {
     var sName: pchar := self.cg_nsval(ni);
     var sLen:  int64 := self.cg_nslen(ni);
+    // #1256: Ein globales Struct braucht seine GROESSE schon bei der
+    // Deklaration — steht der Typ weiter unten in der Datei, wird sein Layout
+    // vorgezogen (cg_ensureStructLayout). Der Hauptdurchlauf kommt danach
+    // erneut vorbei; ein zweiter Eintrag waere tote Last, denn cg_findClass
+    // liefert ohnehin den ersten. Also einmal registrieren und fertig.
+    if (self.cg_findClass(sName, sLen) >= 0) { return; }
     // WP-BC-INH: a method-less class may still `extends` a base — flatten base fields.
     var parentNi: int64 := self.cg_nc2(ni);
     var parentFieldCnt: int64 := 0;
@@ -4803,6 +4916,17 @@ pub type Codegen = class {
         return self.cg_findClass(tp, tn);
       }
       i -= 1;
+    }
+    // #1256: kein Local dieses Namens — dann kann es eine GLOBALE Variable
+    // sein. Ihr Typname steht seit #1094 in globalTypeNames; ohne diese Frage
+    // blieb der Klassenindex -1, der Feldoffset damit -1, und `s.x := 3` fiel
+    // durch alle Schreibzweige, ohne etwas zu tun. Genau das war der stille
+    // Teil von #1256: kein Absturz, nur Nullen.
+    var gi: int64 := self.cg_findGlobalIdx(varName, varLen);
+    if (gi >= 0) {
+      var gp: pchar := peek64(self.globalTypeNames + gi * 16) as pchar;
+      var gl: int64 := peek64(self.globalTypeNames + gi * 16 + 8);
+      if (gp != 0 as pchar && gl > 0) { return self.cg_findClass(gp, gl); }
     }
     return -1;
   }
@@ -6550,6 +6674,15 @@ pub type Codegen = class {
       self.cg_genCall(ni);
 
     } else if (k == CGN_NEW) {
+      // #1255: `new T[n]` — Laenge erst zur LAUFZEIT bekannt (iVal-Bit 8, die
+      // Anzahl steht in c1). Ohne diesen Zweig fiel die Form in den Pfad
+      // darunter und belegte die feste Instanzgroesse von 4096 Byte: ab 512
+      // Elementen schrieb der Zugriff hinter die Belegung (SIGSEGV), und der
+      // {cap,len}-Kopf blieb leer, weshalb `len(a)` still 0 meldete.
+      if ((self.cg_nival(ni) & 8) != 0) {
+        self.cg_genArrayNew(self.cg_nc1(ni));
+        return;
+      }
       // new T() — allocate class instance via alloc(4096)
       self.cg_movRaxImm(0);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7); // mov rdi,rax
       self.cg_movRaxImm(4096); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6); // mov rsi,rax
@@ -6655,6 +6788,26 @@ pub type Codegen = class {
       var arrElemClassIdx: int64 := -1;
       var arrElemSize: int64 := 8;
       var arrFixedSize: int64 := 0;   // #1156: 0 = zur Uebersetzungszeit unbekannt
+      // #1230: Zeilenlaenge M eines `[N][M]T`. rowOuter > 0 heisst: dieser
+      // Zugriff waehlt eine ZEILE und liefert deren Adresse. rowInner > 0
+      // heisst: die Basis IST bereits eine Zeilenadresse — kein Kopf, feste
+      // Schrittweite 8, Schranke ist die Zeilenlaenge.
+      var rowOuter: int64 := 0;
+      var rowInner: int64 := 0;
+      if (self.cg_nkind(baseNode) == CGN_INDEX) {
+        var rowBase: int64 := self.cg_nc0(baseNode);
+        if (self.cg_nkind(rowBase) == CGN_IDENT) {
+          var rbn: pchar := self.cg_nsval(rowBase);
+          var rbl: int64 := self.cg_nslen(rowBase);
+          var rbLi: int64 := self.cg_findLocalIdx(rbn, rbl);
+          if (rbLi >= 0) {
+            rowInner := peek64(self.localArrayRow + rbLi * 8);
+          } else {
+            var rbGi: int64 := self.cg_findGlobalIdx(rbn, rbl);
+            if (rbGi >= 0) { rowInner := peek64(self.globalArrayRow + rbGi * 8); }
+          }
+        }
+      }
       if (self.cg_nkind(baseNode) == CGN_IDENT) {
         var bname: pchar := self.cg_nsval(baseNode);
         var blen:  int64 := self.cg_nslen(baseNode);
@@ -6663,6 +6816,7 @@ pub type Codegen = class {
           // #1155: nur eine FESTE Groesse ist eine Schranke (Flag 2).
           if (peek8(self.localIsArray + lidx) == 2) {
             arrFixedSize := peek64(self.localArraySize + lidx * 8);
+            rowOuter := peek64(self.localArrayRow + lidx * 8);   // #1230
           }
           // WP-GPU-01: check SIMD flag first
           if (peek8(self.localIsSimd + lidx) != 0) { isSimd := 1; }
@@ -6684,6 +6838,14 @@ pub type Codegen = class {
         } else {
           var gidx: int64 := self.cg_findGlobalIdx(bname, blen);
           if (gidx >= 0 && peek8(self.globalIsPchar + gidx) != 0) { isPchar := 1; }
+          // #1256: ein globales `[N]T` traegt denselben {cap,len}-Kopf wie ein
+          // lokales. Ohne diesen Zweig fiel es in den Zweig "roher Zeiger" und
+          // las 16 Byte zu frueh — also den Kopf statt der Elemente.
+          if (gidx >= 0 && peek8(self.globalIsArray + gidx) == 2) {
+            isArray := 1;
+            arrFixedSize := peek64(self.globalArraySize + gidx * 8);
+            rowOuter := peek64(self.globalArrayRow + gidx * 8);   // #1230
+          }
         }
       } else if (self.cg_nkind(baseNode) == CGN_FIELD) {
         // Class field: check if it's Array<StructType>
@@ -6703,7 +6865,33 @@ pub type Codegen = class {
       }
       // #1156: Bereichspruefung, bevor gelesen wird. Nur fuer Arrays — ein
       // pchar oder ein roher Zeiger traegt keine Laenge.
+      if (rowInner > 0) {
+        // #1230: `m[i][j]` — die Basis ist die Adresse der Zeile i. Geprueft
+        // wird gegen die Zeilenlaenge; ohne die Schranke waere der zweite
+        // Index der einzige unbewachte Zugriff im Array-Pfad.
+        self.cg_emitIndexBoundsCheck(rowInner, 0);
+        // mov rax, [rax+rbx*8]
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0xD8);
+        return;
+      }
       if (isArray == 1) { self.cg_emitIndexBoundsCheck(arrFixedSize, 1); }
+      if (rowOuter > 0) {
+        // #1230: `m[i]` waehlt eine Zeile. Das Layout ist flach, die Zeile
+        // beginnt also bei Kopf + i*M*8; geliefert wird ihre ADRESSE, denn
+        // eine Zeile ist kein Wert, der in ein Register passt.
+        // lea rcx, [rax+16]
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);
+        // imul rbx, rbx, rowOuter*8
+        var rowBytes: int64 := rowOuter * 8;
+        if (rowBytes <= 127) {
+          self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xDB); self.cg_e8(rowBytes);
+        } else {
+          self.cg_e8(0x48); self.cg_e8(0x69); self.cg_e8(0xDB); self.cg_e32(rowBytes);
+        }
+        // lea rax, [rcx+rbx]
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x04); self.cg_e8(0x19);
+        return;
+      }
       if (isSimd == 1) {
         // WP-GPU-01: parallel Array<f32>[i] — 4-byte stride, no header, SSE2 movss
         // rax=base ptr, rbx=index
@@ -8193,7 +8381,14 @@ pub type Codegen = class {
             self.cg_zeroRax();
           }
         } else {
-          self.cg_zeroRax();
+          // #1256: kein Local — eine GLOBALE Variable kann seit dieser Aenderung
+          // ebenfalls ein `[N]T` sein. Ohne diesen Zweig meldete `len(g)` still 0.
+          var glidx: int64 := self.cg_findGlobalIdx(aname, anlen);
+          if (glidx >= 0 && peek8(self.globalIsArray + glidx) == 2) {
+            self.cg_movRaxImm(peek64(self.globalArraySize + glidx * 8));
+          } else {
+            self.cg_zeroRax();
+          }
         }
       } else {
         self.cg_zeroRax();
@@ -10521,6 +10716,16 @@ pub type Codegen = class {
         if (sizeNode >= 0 && self.cg_nkind(sizeNode) == CGN_LIT_INT) {
           poke64(self.localArraySize + localIdx * 8, self.cg_nival(sizeNode));
         }
+        // #1230: `[N][M]T` — der Elementtyp ist selbst ein Array fester
+        // Groesse. Vermerkt wird die ZEILENlaenge M; belegt wird flach
+        // (N*M Slots), und `m[i]` liefert die Adresse der Zeile.
+        var rowTyNode: int64 := self.cg_nc0(typeNode);
+        if (rowTyNode >= 0 && self.cg_nkind(rowTyNode) == 101) {
+          var rowSzNode: int64 := self.cg_nc1(rowTyNode);
+          if (rowSzNode >= 0 && self.cg_nkind(rowSzNode) == CGN_LIT_INT) {
+            poke64(self.localArrayRow + localIdx * 8, self.cg_nival(rowSzNode));
+          }
+        }
         // #1109: Elementtyp merken. Ohne ihn fand cg_arrayElemClassIdx die
         // Klasse nicht, `arr[0].v` bekam Feldoffset -1 und lieferte still 0 —
         // der bekannte "unbekanntes Feld → Offset 0"-Fall. Das ELEMENT selbst
@@ -10736,6 +10941,10 @@ pub type Codegen = class {
       } else {
         // Fixed-size array (int64[N]): heap-allocate N*8 bytes
         var fixedSz: int64 := peek64(self.localArraySize + localIdx * 8);
+        // #1230: bei `[N][M]T` sind es N*M Slots. Ohne diese Rechnung waeren
+        // nur N belegt, und die zweite Zeile laege hinter dem Bereich.
+        var rowLen0: int64 := peek64(self.localArrayRow + localIdx * 8);
+        if (rowLen0 > 0) { fixedSz := fixedSz * rowLen0; }
         if (typeNode >= 0 && self.cg_nkind(typeNode) == 101 && fixedSz > 0) {
           // #1109: Platz fuer den {cap,len}-Kopf mitrechnen. Der Lesepfad
           // ueberspringt seit jeher 16 Byte (`lea rcx,[rax+16]`), angefordert
@@ -11023,10 +11232,33 @@ pub type Codegen = class {
         var lhsIsSimd:  int64 := 0;
         var lhsIsPchar: int64 := 0;     // #1266
         var lhsFixedSize: int64 := 0;   // #1156
+        // #1230: `m[i][j] := v` — die Basis ist die Zeilenadresse aus dem
+        // Lesepfad. Kein Kopf, Schrittweite 8, Schranke ist die Zeilenlaenge.
+        var lhsRowInner: int64 := 0;
+        var lhsRowOuter: int64 := 0;
+        if (self.cg_nkind(lhsBase) == CGN_INDEX) {
+          var lrBase: int64 := self.cg_nc0(lhsBase);
+          if (self.cg_nkind(lrBase) == CGN_IDENT) {
+            var lrLi: int64 := self.cg_findLocalIdx(self.cg_nsval(lrBase), self.cg_nslen(lrBase));
+            if (lrLi >= 0) {
+              lhsRowInner := peek64(self.localArrayRow + lrLi * 8);
+            } else {
+              var lrGi: int64 := self.cg_findGlobalIdx(self.cg_nsval(lrBase), self.cg_nslen(lrBase));
+              if (lrGi >= 0) { lhsRowInner := peek64(self.globalArrayRow + lrGi * 8); }
+            }
+          }
+        }
+        if (lhsRowInner > 0) {
+          self.cg_emitIndexBoundsCheck(lhsRowInner, 0);
+          self.cg_e8(0x5E);                                      // pop rsi (Wert)
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD8); // mov [rax+rbx*8], rsi
+          return;
+        }
         if (self.cg_nkind(lhsBase) == CGN_IDENT) {
           var llidx: int64 := self.cg_findLocalIdx(self.cg_nsval(lhsBase), self.cg_nslen(lhsBase));
           if (llidx >= 0 && peek8(self.localIsArray + llidx) == 2) {   // #1155
             lhsFixedSize := peek64(self.localArraySize + llidx * 8);
+            lhsRowOuter := peek64(self.localArrayRow + llidx * 8);   // #1230
           }
           if (llidx >= 0 && peek8(self.localIsArray + llidx) != 0) { lhsIsArray := 1; }
           // WP-GPU-01: SIMD array store check
@@ -11045,6 +11277,12 @@ pub type Codegen = class {
           if (llidx < 0) {
             var wgidx: int64 := self.cg_findGlobalIdx(self.cg_nsval(lhsBase), self.cg_nslen(lhsBase));
             if (wgidx >= 0 && peek8(self.globalIsPchar + wgidx) != 0) { lhsIsPchar := 1; }
+            // #1256: globales `[N]T` — Kopf ueberspringen wie beim Local.
+            if (wgidx >= 0 && peek8(self.globalIsArray + wgidx) == 2) {
+              lhsIsArray := 1;
+              lhsFixedSize := peek64(self.globalArraySize + wgidx * 8);
+              lhsRowOuter := peek64(self.globalArrayRow + wgidx * 8);   // #1230
+            }
           }
         } else if (self.cg_nkind(lhsBase) == CGN_FIELD) {
           var lhsInner: int64 := self.cg_nc0(lhsBase);
@@ -11052,6 +11290,15 @@ pub type Codegen = class {
           var lhsFldNl: int64 := self.cg_nslen(lhsBase);
           var lhsParentCi: int64 := self.cg_objClassIdx(lhsInner);
           if (self.cg_isFieldArray(lhsParentCi, lhsFldNm, lhsFldNl) != 0) { lhsIsArray := 1; }
+        }
+        // #1230: `m[i] := v` weist eine ganze ZEILE zu. Dafuer gibt es keine
+        // Bedeutung — eine Zeile ist kein Wert, sondern eine Adresse im
+        // flachen Block. Der Array-Zweig wuerde an Kopf+i*8 schreiben und
+        // damit mitten in die erste Zeile: melden statt still danebenzutreffen.
+        if (lhsRowOuter > 0) {
+          EPrintStrLn("codegen error: Zuweisung an eine ganze Zeile eines mehrdimensionalen Arrays"c);
+          EPrintStrLn("  Beide Indizes angeben: m[i][j] := v"c);
+          exit(1);
         }
         // #1156: Bereichspruefung vor dem Schreiben. Der Wert liegt noch auf
         // dem Stack; der Panic-Pfad kehrt nicht zurueck, die Unwucht ist also
@@ -14593,6 +14840,79 @@ pub type Codegen = class {
           while (gz < 16) { self.cg_edata(0); gz := gz + 1; }
           self.tmrVarCount += 1;
         }
+        // #1256/#1299: Ein AGGREGAT passt nicht in den 8-Byte-Slot. Es bekommt
+        // einen eigenen Block im Datenbereich, der Slot einen Zeiger darauf —
+        // dieselbe Form, die ein Local zur Laufzeit per mmap anlegt, nur schon
+        // zur Uebersetzungszeit. Bis 1.0.16G blieb der Slot 0: `q[0] := 3`
+        // schrieb nach Adresse 16 (Kopf uebersprungen) und stuerzte ab, ein
+        // `s.x := 3` verpuffte, und ein Startwert fiel ersatzlos weg.
+        var aggKind: int64 := 0;      // 2 = [N]T, 3 = Struct
+        var aggElems: int64 := 0;
+        var aggBlock: int64 := 0 - 1;
+        if (gtNode >= 0 && self.cg_nkind(gtNode) == 101) {
+          var gszNode: int64 := self.cg_nc1(gtNode);
+          var gN: int64 := 0;
+          if (gszNode >= 0 && self.cg_nkind(gszNode) == CGN_LIT_INT) { gN := self.cg_nival(gszNode); }
+          if (gN <= 0 || gN > 0x1FFFFFF) {
+            EPrintStr("codegen error: globales Array '"c);
+            sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+            EPrintStrLn("': Elementzahl muss eine Konstante zwischen 1 und 33554431 sein"c);
+            exit(1);
+          }
+          // Struct-Elemente traegt ein Local als ZEIGER je Slot, den es zur
+          // Uebersetzungszeit nicht gibt (jedes Element bekaeme sonst ein
+          // eigenes Objekt). Das ist offen und wird gemeldet, statt still
+          // Nullzeiger auszuliefern — #1256 nennt den Fall.
+          var gElemTy: int64 := self.cg_nc0(gtNode);
+          if (gElemTy >= 0 && self.cg_nkind(gElemTy) == 60
+              && self.cg_ensureStructLayout(self.cg_nsval(gElemTy), self.cg_nslen(gElemTy)) >= 0) {
+            EPrintStr("codegen error: globales Array '"c);
+            sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+            EPrintStrLn("': Struct-Elemente sind auf Modulebene noch nicht umgesetzt (#1256)"c);
+            EPrintStrLn("  In einer fn deklarieren, oder Felder in getrennten Arrays halten."c);
+            exit(1);
+          }
+          if (gRedundant != 0) {
+            EPrintStr("codegen error: globales Array '"c);
+            sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+            EPrintStrLn("': @redundant ist fuer Aggregate nicht umgesetzt (#1256)"c);
+            exit(1);
+          }
+          // #1230: `[N][M]T` global — flach, N*M Slots, Zeilenlaenge vermerkt.
+          var gRow: int64 := 0;
+          if (gElemTy >= 0 && self.cg_nkind(gElemTy) == 101) {
+            var gRowSz: int64 := self.cg_nc1(gElemTy);
+            if (gRowSz >= 0 && self.cg_nkind(gRowSz) == CGN_LIT_INT) { gRow := self.cg_nival(gRowSz); }
+            if (gRow <= 0) {
+              EPrintStr("codegen error: globales Array '"c);
+              sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+              EPrintStrLn("': Zeilenlaenge muss eine Konstante > 0 sein"c);
+              exit(1);
+            }
+            poke64(self.globalArrayRow + gIdx * 8, gRow);
+          }
+          var gSlots: int64 := gN;
+          if (gRow > 0) { gSlots := gN * gRow; }
+          aggBlock := self.cg_reserveData(16 + gSlots * 8);
+          // {cap,len}-Kopf, wie ihn der Lesepfad hinter `lea rcx,[rax+16]`
+          // erwartet und die Bereichspruefung aus #1156 liest.
+          poke64(self.data + aggBlock,     gSlots);
+          poke64(self.data + aggBlock + 8, gSlots);
+          self.cg_addPatch(doff, aggBlock, 0, CG_PATCH_DATA_PTR);
+          poke8(self.globalIsArray + gIdx, 2);
+          poke64(self.globalArraySize + gIdx * 8, gN);
+          aggKind := 2; aggElems := gN;
+        } else if (gtNode >= 0 && self.cg_nkind(gtNode) == 60) {
+          var gsci: int64 := self.cg_ensureStructLayout(self.cg_nsval(gtNode), self.cg_nslen(gtNode));
+          if (gsci >= 0 && gRedundant == 0) {
+            var gssz: int64 := self.cg_classStructSize(gsci);
+            aggBlock := self.cg_reserveData(gssz);
+            self.cg_addPatch(doff, aggBlock, 0, CG_PATCH_DATA_PTR);
+            poke8(self.globalIsArray + gIdx, 3);
+            aggKind := 3;
+          }
+        }
+
         // Write initializer directly into data section
         //
         // #1164: Bis 1.0.15C stand hier `== CGN_LIT_INT`, und alles andere fiel
@@ -14603,7 +14923,50 @@ pub type Codegen = class {
         var initNode: int64 := self.cg_nc1(cur);
         if (initNode >= 0) {
           var ik: int64 := self.cg_nkind(initNode);
-          if (ik == CGN_LIT_STR) {
+          if (ik == 100 && aggKind == 0 && gRedundant == 0) {
+            // #1299: `var arr: array := [10,20,30]` — der Typ nennt keine
+            // Groesse, das Literal schon. Der Block wird also nach dem
+            // Startwert bemessen; danach laeuft es wie bei `[N]T`.
+            var lcnt: int64 := 0;
+            var lel: int64 := self.cg_nc0(initNode);
+            while (lel != -1) { lcnt := lcnt + 1; lel := self.cg_nnext(lel); }
+            if (lcnt > 0) {
+              aggBlock := self.cg_reserveData(16 + lcnt * 8);
+              poke64(self.data + aggBlock,     lcnt);
+              poke64(self.data + aggBlock + 8, lcnt);
+              self.cg_addPatch(doff, aggBlock, 0, CG_PATCH_DATA_PTR);
+              poke8(self.globalIsArray + gIdx, 2);
+              poke64(self.globalArraySize + gIdx * 8, lcnt);
+              aggKind := 2; aggElems := lcnt;
+            }
+          }
+          if (ik == 100 && aggKind == 2) {
+            // #1299: Array-Literal als globaler Startwert. Die Elemente stehen
+            // fest, wenn sie konstant sind — dann werden sie hier in den Block
+            // geschrieben, statt (wie im Ausdruckspfad) zur Laufzeit auf dem
+            // Stack aufgebaut. Einen Ort, an dem eine Initialisierungssequenz
+            // vor `main` liefe, gibt es fuer Globale nicht.
+            var aEl: int64 := self.cg_nc0(initNode);
+            var aI: int64 := 0;
+            while (aEl != -1) {
+              if (aI >= aggElems) {
+                EPrintStr("codegen error: globales Array '"c);
+                sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+                EPrintStrLn("': Startwert hat mehr Elemente als das Array"c);
+                exit(1);
+              }
+              if (self.cg_isConstExpr(aEl) == 0) {
+                EPrintStr("codegen error: globales Array '"c);
+                sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+                EPrintStrLn("': Element des Startwerts ist zur Uebersetzungszeit nicht bekannt"c);
+                EPrintStrLn("  Globale Startwerte muessen konstant sein; sonst in einer fn zuweisen."c);
+                exit(1);
+              }
+              poke64(self.data + aggBlock + 16 + aI * 8, self.cg_evalConExpr(aEl));
+              aI := aI + 1;
+              aEl := self.cg_nnext(aEl);
+            }
+          } else if (ik == CGN_LIT_STR) {
             // #1164: Der Startwert ist die ADRESSE der Zeichenkette. Sie steht
             // erst fest, wenn die Codelaenge feststeht (der Datenbereich folgt
             // unmittelbar darauf), also wird der Slot vorgemerkt und in
@@ -14780,6 +15143,7 @@ pub type Codegen = class {
     // Local type tracking (parallel to locals)
     self.localTypes      := alloc(self.localCap * 16);
     self.localArraySize  := alloc(self.localCap * 8);
+    self.localArrayRow   := alloc(self.localCap * 8);   // #1230
 
     // Method class context
     self.curClassName    := 0 as pchar;
@@ -14939,6 +15303,9 @@ pub type Codegen = class {
     self.globalVars     := alloc(self.globalVarCap * 24);
     self.globalIsPchar  := alloc(self.globalVarCap);
     self.globalTypeNames := alloc(self.globalVarCap * 16);
+    self.globalIsArray  := alloc(self.globalVarCap);          // #1256
+    self.globalArraySize := alloc(self.globalVarCap * 8);     // #1256
+    self.globalArrayRow  := alloc(self.globalVarCap * 8);     // #1230
     self.globalVarCount := 0;
     self.stnLen         := 0;
 
