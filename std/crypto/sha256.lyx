@@ -53,11 +53,38 @@ fn sha256InitK(K: int64): void {
     poke32(K + 248, 0xbef9a3f7); poke32(K + 252, 0xc67178f2);
 }
 
+// #1318: Die 64 Rundenkonstanten sind durch FIPS 180-4 festgelegt und aendern
+// sich nie — sie wurden hier trotzdem VOR JEDEM BLOCK neu geschrieben, dazu kam
+// je Block eine Allokation fuer die Tabelle und eine fuer W. Gemessen: 55 µs je
+// 64-Byte-Hash, bei rund 244.000 Blockkompressionen je SLH-DSA-KeyGen.
+//
+// Tabelle und Kratzpuffer entstehen jetzt einmal je Programmlauf. W wird ohnehin
+// in den ersten sechzehn Schritten vollstaendig ueberschrieben und danach von
+// 16 bis 63 fortgeschrieben — sein Inhalt aus dem Vorlauf wird also nirgends
+// gelesen, das Wiederverwenden ist unbedenklich.
+//
+// Die Namen tragen bewusst ein Praefix: Globale teilen sich ueber Unit-Grenzen
+// hinweg den Namensraum.
+var _sha256K: int64 := 0;
+var _sha256W: int64 := 0;
+
+fn sha256Scratch(): int64 {
+    if (_sha256K != 0) { return _sha256K; }
+    var k: int64 := alloc(256);
+    if (k == 0) { return 0; }
+    sha256InitK(k);
+    var w: int64 := alloc(256);
+    if (w == 0) { return 0; }
+    _sha256K := k;
+    _sha256W := w;
+    return k;
+}
+
 // Process one 64-byte (512-bit) block into the 8-word state buffer
 fn sha256Block(state: int64, block: int64): void {
-    var W: int64 := alloc(256);  // W[0..63]: 64 x 4 bytes
-    var K: int64 := alloc(256);  // K[0..63]: 64 x 4 bytes
-    sha256InitK(K);
+    if (sha256Scratch() == 0) { panic("SHA-256: kein Speicher fuer die Rundentabelle (#1318)"); }
+    var W: int64 := _sha256W;
+    var K: int64 := _sha256K;
 
     // Load W[0..15] as big-endian 32-bit words from the input block
     var i: int64 := 0;
@@ -76,8 +103,8 @@ fn sha256Block(state: int64, block: int64): void {
     while (i < 64) {
         var w15: int64 := peek32(W + (i - 15) * 4) & 0xFFFFFFFF;
         var w2:  int64 := peek32(W + (i -  2) * 4) & 0xFFFFFFFF;
-        var s0:  int64 := sha256Rotr32(w15, 7) ^ sha256Rotr32(w15, 18) ^ (w15 >> 3);
-        var s1:  int64 := sha256Rotr32(w2, 17) ^ sha256Rotr32(w2,  19) ^ (w2  >> 10);
+        var s0:  int64 := (((w15 >> 7) | (w15 << 25)) ^ ((w15 >> 18) | (w15 << 14)) ^ (w15 >> 3)) & 0xFFFFFFFF;
+        var s1:  int64 := (((w2 >> 17) | (w2 << 15)) ^ ((w2 >> 19) | (w2 << 13)) ^ (w2 >> 10)) & 0xFFFFFFFF;
         var wv:  int64 := (peek32(W + (i - 16) * 4) + s0
                          + peek32(W + (i -  7) * 4) + s1) & 0xFFFFFFFF;
         poke32(W + i * 4, wv);
@@ -97,10 +124,16 @@ fn sha256Block(state: int64, block: int64): void {
     // 64 compression rounds
     i := 0;
     while (i < 64) {
-        var S1:   int64 := sha256Rotr32(e, 6) ^ sha256Rotr32(e, 11) ^ sha256Rotr32(e, 25);
+        // #1318: Rotationen von Hand eingesetzt. sha256Rotr32 wurde sechsmal je
+        // Runde gerufen, macht bei 64 Runden plus der W-Erweiterung rund 576
+        // Aufrufe je Block — bei gemessenen 50 µs je Block der Hauptposten. Die
+        // Sprache kennt kein inline, also steht die Rechnung hier ausgeschrieben.
+        // e und a sind bereits auf 32 Bit beschnitten; die Linksschiebungen
+        // tragen Muell oberhalb Bit 31, den die Maske am Ende entfernt.
+        var S1:   int64 := (((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7))) & 0xFFFFFFFF;
         var ch:   int64 := (e & f) ^ ((e ^ 0xFFFFFFFF) & g);
         var tmp1: int64 := (h + S1 + (ch & 0xFFFFFFFF) + peek32(K + i * 4) + peek32(W + i * 4)) & 0xFFFFFFFF;
-        var S0:   int64 := sha256Rotr32(a, 2) ^ sha256Rotr32(a, 13) ^ sha256Rotr32(a, 22);
+        var S0:   int64 := (((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10))) & 0xFFFFFFFF;
         var maj:  int64 := (a & b) ^ (a & c) ^ (b & c);
         var tmp2: int64 := (S0 + (maj & 0xFFFFFFFF)) & 0xFFFFFFFF;
         h := g;
@@ -124,8 +157,7 @@ fn sha256Block(state: int64, block: int64): void {
     poke32(state + 24, (peek32(state + 24) + g) & 0xFFFFFFFF);
     poke32(state + 28, (peek32(state + 28) + h) & 0xFFFFFFFF);
 
-    free(W, 256);
-    free(K, 256);
+    // #1318: kein free mehr — beide Puffer leben fuer die Dauer des Programms.
 }
 
 // ============================================================================
