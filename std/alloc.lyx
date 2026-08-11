@@ -154,10 +154,47 @@ pub fn free(ptr: int64, size: int64): void {
   poke64(heads + idx * 8, ptr);
 }
 
-// Deprecated libc-Bindungen (behalten für Kompatibilität)
-extern fn libc_malloc(size: int64): int64;
-extern fn libc_free(ptr: int64): int64;
-extern fn libc_realloc(ptr: int64, size: int64): int64;
+// #1179: Hier standen drei `extern fn libc_*` OHNE link-Klausel. Keines wurde
+// je gebunden: `malloc()` lieferte still 0, `calloc()` schrieb dann in Adresse
+// 0..n (Absturz oder stille Korruption), `free_mem()` gab nichts frei und
+// `realloc_mem()` lieferte 0. Die Einheit hat mit `alloc`/`free` laengst eine
+// eigene, mmap-gestuetzte Belegung — die drei Huellen laufen jetzt darueber
+// und brauchen kein libc.
+//
+// `free_mem(ptr)` kennt die Groesse nicht, `free` (munmap) braucht sie aber.
+// Deshalb wird vor jedem Block ein 8-Byte-Kopf mit der Groesse angelegt; der
+// gelieferte Zeiger zeigt dahinter. Das gilt NUR fuer malloc/calloc/realloc_mem
+// — `alloc`/`free` bleiben unveraendert, sie bekommen die Groesse vom Aufrufer.
+con LIBC_HDR: int64 := 8;
+
+fn libc_malloc(size: int64): int64 {
+  var raw: int64 := alloc(size + LIBC_HDR);
+  if (raw == 0) { return 0; }
+  poke64(raw, size + LIBC_HDR);
+  return raw + LIBC_HDR;
+}
+
+fn libc_free(ptr: int64): int64 {
+  if (ptr == 0) { return 0; }
+  var raw: int64 := ptr - LIBC_HDR;
+  free(raw, peek64(raw));
+  return 0;
+}
+
+fn libc_realloc(ptr: int64, size: int64): int64 {
+  if (ptr == 0) { return libc_malloc(size); }
+  var raw: int64 := ptr - LIBC_HDR;
+  var oldTotal: int64 := peek64(raw);
+  var oldSize: int64 := oldTotal - LIBC_HDR;
+  var neu: int64 := libc_malloc(size);
+  if (neu == 0) { return 0; }
+  var n: int64 := oldSize;
+  if (size < n) { n := size; }
+  var i: int64 := 0;
+  while (i < n) { poke8(neu + i, peek8(ptr + i)); i := i + 1; }
+  libc_free(ptr);
+  return neu;
+}
 
 // Gibt aligned size zurück: ceil(size/8)*8
 fn align_to_8(size: int64): int64 {

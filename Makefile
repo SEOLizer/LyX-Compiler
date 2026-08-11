@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.16I
+VERSION   := 1.0.16J
 VERSION_DATE := 2026-08-11
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -465,8 +465,11 @@ test: lyxc
 	@echo "--- Ausnahmeweg: finally reicht weiter, defer laeuft, throw bricht ab (13 Pruefungen) ---"
 	@bash tests/exception_unwind_test.sh
 	@echo "OK"
-	@echo "--- Frontend: Lambda/fn-Typ, Tupel-Muster, benannte Argumente, Pipe (22 Pruefungen) ---"
+	@echo "--- Frontend: Lambda/fn-Typ, Tupel-Muster, benannte Argumente, Pipe (25 Pruefungen) ---"
 	@bash tests/frontend_calls_patterns_test.sh
+	@echo "OK"
+	@echo "--- FFI/Capabilities: link-Pflicht, @cap wirkt, Grant-Modell unbewertet (16 Pruefungen) ---"
+	@bash tests/ffi_link_caps_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh

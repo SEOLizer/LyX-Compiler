@@ -49,9 +49,15 @@ if "$LYXC" "$TMP/t4.lyx" -o "$TMP/t4" >/dev/null 2>&1; then
   _fail 4 "link-Alias auf system kompilierte (SEC-BUG-01-Regression!)"
 else _pass 4; fi
 
-# 5 (S3): no-link PROCESS-Extern (fork) in User-Code OHNE @cap → abgelehnt
+# 5 (S3): PROCESS-Extern (fork) in User-Code OHNE @cap → abgelehnt
+#
+# #1179: Die drei Sonden unten trugen keine link-Klausel. Seit 1.0.16J ist die
+# Pflicht, und die Sonden waeren aus DIESEM Grund abgewiesen worden — Nr. 5 und
+# 7 waeren also aus dem falschen Grund gruen geblieben, Nr. 6 (die eine
+# Annahme erwartet) rot. Mit link messen alle drei wieder das, was ihr Name
+# sagt: die FFI-Klasse und das @cap-Opt-in.
 cat > "$TMP/t5.lyx" << 'EOF'
-extern fn fork(): int64;
+extern fn fork(): int64 link "libc.so.6";
 fn main(): int64 { return 0; }
 EOF
 if "$LYXC" "$TMP/t5.lyx" -o "$TMP/t5" >/dev/null 2>&1; then
@@ -61,20 +67,31 @@ else _pass 5; fi
 # 6 (S3): fork MIT @cap → erlaubt (Opt-in)
 cat > "$TMP/t6.lyx" << 'EOF'
 @cap(process.spawn)
-extern fn fork(): int64;
+extern fn fork(): int64 link "libc.so.6";
 fn main(): int64 { return 0; }
 EOF
 if "$LYXC" "$TMP/t6.lyx" -o "$TMP/t6" >/dev/null 2>&1; then _pass 6
 else _fail 6 "fork() mit @cap abgelehnt (Opt-in kaputt)"; fi
 
-# 7 (S3): unbekannte no-link-Extern in User-Code OHNE @cap → abgelehnt
+# 7 (S3): unbekannte Extern in User-Code OHNE @cap → abgelehnt
 cat > "$TMP/t7.lyx" << 'EOF'
-extern fn weird_nolink_sym(x: int64): int64;
+extern fn weird_nolink_sym(x: int64): int64 link "libweird.so";
 fn main(): int64 { return 0; }
 EOF
 if "$LYXC" "$TMP/t7.lyx" -o "$TMP/t7" >/dev/null 2>&1; then
   _fail 7 "unbekannte no-link-Extern ohne @cap kompilierte (Fail-Open no-link)"
 else _pass 7; fi
+
+# 8 (#1179): die link-lose Form wird als solche gemeldet — vorher wurde sie
+# angenommen und das Symbol nie gebunden, der Aufruf lieferte still 0.
+cat > "$TMP/t8.lyx" << 'EOF'
+@cap(process.spawn)
+extern fn fork(): int64;
+fn main(): int64 { return 0; }
+EOF
+out8=$("$LYXC" "$TMP/t8.lyx" -o "$TMP/t8" 2>&1)
+if [ ! -f "$TMP/t8" ] && echo "$out8" | grep -q "link-Klausel"; then _pass 8
+else _fail 8 "fehlende link-Klausel blieb unbeanstandet"; fi
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
