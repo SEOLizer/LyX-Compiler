@@ -22,16 +22,113 @@ pub con MMAP_PROT_RWX:  int64 := 7;   // PROT_READ | PROT_WRITE | PROT_EXEC
 pub con MMAP_ANON:   int64 := 34;  // MAP_PRIVATE | MAP_ANONYMOUS
 pub con MMAP_SHARED: int64 := 1;   // MAP_SHARED (für File-mmap)
 
+// ── Kleinspeicher-Pool (#1258) ───────────────────────────────────────────────
+//
+// Bis 1.0.16C setzte alloc() JEDE Anforderung in ein eigenes mmap um und free()
+// in ein munmap. Das ist bei wenigen grossen Puffern richtig und bei vielen
+// kleinen ruinoes: ein Syscall-Paar kostet auf der Messmaschine rund 25 µs,
+// unabhaengig davon, ob 32 Byte oder 32 KB angefordert werden.
+//
+// Gemessen an SLH-DSA, das praktisch nur aus Hash-Aufrufen mit kleinen
+// Kratzpuffern besteht: SLHParamsMini-KeyGen fuehrte 18.080 mmap und 18.074
+// munmap aus, SLHParams128s hochgerechnet ueber eine Million Paare. Die
+// Laufzeit von 94 s teilte sich in 31,9 s Rechnen und 58,8 s Kernel — zwei
+// Drittel der Zeit lagen also nicht im Verfahren, sondern hier. Der Bericht
+// vermutete die Ursache in der SHA-256-Kompression; die trifft es nicht.
+//
+// Deshalb: kleine Anforderungen werden aus 1-MiB-Bloecken bedient (Bump), grosse
+// behalten ihr eigenes mmap. Freigegebene Kleinbloecke wandern in eine
+// Freiliste je Groessenklasse und werden wiederverwendet.
+//
+// Die Null-Garantie von MAP_ANONYMOUS bleibt erhalten: frischer Speicher kommt
+// genullt vom Kernel, wiederverwendeter wird beim Herausgeben genullt. Das ist
+// kein Luxus — allocZeroed() ist nur ein anderer Name fuer alloc(), und der
+// Bestand verlaesst sich darauf.
+//
+// Was sich VERHAELT anders: ein Zugriff nach free() lief bisher in einen
+// Speicherfehler, weil die Seite wirklich weg war. Jetzt trifft er
+// moeglicherweise wiederverwendeten Speicher. Der Fehler war vorher schon
+// einer — er faellt nur nicht mehr sofort auf.
+
+pub con APOOL_CHUNK:  int64 := 1048576;   // 1 MiB je Block
+pub con APOOL_MAX:    int64 := 4096;      // darueber: eigenes mmap
+con APOOL_CLASSES:    int64 := 10;        // 8,16,32,…,4096
+
+var _apoolNext:  int64 := 0;   // naechste freie Adresse im laufenden Block
+var _apoolEnd:   int64 := 0;   // Ende des laufenden Blocks
+var _apoolHeads: int64 := 0;   // Tabelle der Freilisten-Koepfe, APOOL_CLASSES Eintraege
+
+// Groessenklasse zu einer Anforderung: die kleinste Zweierpotenz >= size,
+// mindestens 8 (ein freier Block traegt den Zeiger auf den naechsten in seinen
+// ersten acht Bytes, muss also mindestens acht Byte gross sein).
+fn _apoolClassSize(size: int64): int64 {
+  var c: int64 := 8;
+  while (c < size) { c := c * 2; }
+  return c;
+}
+
+fn _apoolClassIndex(csz: int64): int64 {
+  var c: int64 := 8;
+  var i: int64 := 0;
+  while (c < csz) { c := c * 2; i := i + 1; }
+  return i;
+}
+
+// Die Kopftabelle liegt selbst in einer eigenen Seite. Sie wird von alloc UND
+// free gebraucht — ein free vor dem ersten alloc ist zulaessig, deshalb legen
+// beide sie an.
+fn _apoolEnsureHeads(): int64 {
+  if (_apoolHeads != 0) { return _apoolHeads; }
+  var t: int64 := mmap(0, 4096, MMAP_PROT_RW, MMAP_ANON, -1, 0);
+  if (t < 0) { return 0; }
+  _apoolHeads := t;
+  return t;
+}
+
+fn _apoolZero(p: int64, n: int64): void {
+  var i: int64 := 0;
+  while (i < n) { poke64(p + i, 0); i := i + 8; }
+}
+
 // Anonymer Heap-Speicher — mmap-basiert, kein libc
 pub fn alloc(size: int64): int64 {
   // WP-26: Zero-Alloc-Guard — verhindert Aliasing-Angriff (C-2)
   if size <= 0 { size := 1; }
   // WP-26: Integer-Overflow-Guard — max 1 GB (C-1)
   if size > 1073741824 { return 0; }
-  var result: int64 := mmap(0, size, MMAP_PROT_RW, MMAP_ANON, -1, 0);
-  // MAP_FAILED (-1) → 0 zurückgeben statt ungültigen Pointer
-  if result < 0 { return 0; }
-  return result;
+
+  // Grosse Anforderungen unveraendert: ein mmap lohnt sich hier, und free()
+  // gibt die Seiten sofort ans System zurueck.
+  if (size > APOOL_MAX) {
+    var big: int64 := mmap(0, size, MMAP_PROT_RW, MMAP_ANON, -1, 0);
+    // MAP_FAILED (-1) → 0 zurückgeben statt ungültigen Pointer
+    if big < 0 { return 0; }
+    return big;
+  }
+
+  var csz: int64 := _apoolClassSize(size);
+  var heads: int64 := _apoolEnsureHeads();
+  if (heads == 0) { return 0; }
+  var idx: int64 := _apoolClassIndex(csz);
+
+  // Zuerst die Freiliste der Klasse.
+  var h: int64 := peek64(heads + idx * 8);
+  if (h != 0) {
+    poke64(heads + idx * 8, peek64(h));
+    _apoolZero(h, csz);
+    return h;
+  }
+
+  // Sonst aus dem laufenden Block schneiden; reicht er nicht, ein neuer.
+  if (_apoolNext + csz > _apoolEnd) {
+    var chunk: int64 := mmap(0, APOOL_CHUNK, MMAP_PROT_RW, MMAP_ANON, -1, 0);
+    if (chunk < 0) { return 0; }
+    _apoolNext := chunk;
+    _apoolEnd  := chunk + APOOL_CHUNK;
+  }
+  var p: int64 := _apoolNext;
+  _apoolNext := _apoolNext + csz;
+  return p;   // frisch aus MAP_ANONYMOUS: bereits genullt
 }
 
 // MAP_ANONYMOUS liefert bereits zero-initialisierte Seiten
@@ -40,8 +137,21 @@ pub fn allocZeroed(size: int64): int64 {
 }
 
 // Speicher freigeben
+//
+// size muss dieselbe Groesse sein, die alloc() bekommen hat — daran hat sich
+// nichts geaendert, munmap verlangte das ebenso.
 pub fn free(ptr: int64, size: int64): void {
-  munmap(ptr, size);
+  if (ptr == 0) { return; }
+  if size <= 0 { size := 1; }
+  if (size > APOOL_MAX) {
+    munmap(ptr, size);
+    return;
+  }
+  var heads: int64 := _apoolEnsureHeads();
+  if (heads == 0) { return; }
+  var idx: int64 := _apoolClassIndex(_apoolClassSize(size));
+  poke64(ptr, peek64(heads + idx * 8));
+  poke64(heads + idx * 8, ptr);
 }
 
 // Deprecated libc-Bindungen (behalten für Kompatibilität)
