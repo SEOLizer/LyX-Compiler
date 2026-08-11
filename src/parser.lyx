@@ -66,6 +66,7 @@ pub con NK_METHOD_PTR: int64 := 129; // B2: method(T1,T2): R — fat pointer {co
 // #1113: Bereichsmuster `case lo..hi =>` und `case lo.. =>` (§14).
 // iVal = untere Grenze, c1 = NK_LIT_INT der oberen Grenze oder -1 (offen).
 pub con NK_PATTERN_RANGE: int64 := 131;
+pub con NK_PATTERN_TUPLE: int64 := 132;  // #1250: TuplePattern `case (1, 2)`; c0 = erstes Teilmuster
 pub con NK_ASM:        int64 := 130; // WSP-05: asm { "mnemonic" ... } inline-assembly; c0=NK_LIT_STR-Kette
 
 // WP-14: Generic type nodes
@@ -1291,12 +1292,22 @@ pub type Parser = class {
   }
 
   // Parse arg list where ? is replaced by pipeVal (the piped expression)
+  //
+  // #1253: Steht KEIN Platzhalter in der Liste, wird der gepipte Wert VORAN-
+  // gestellt — `50 |> Clamp(0, 30)` heisst `Clamp(50, 0, 30)`. Vorher fiel er
+  // in diesem Fall ersatzlos weg, und der Aufruf scheiterte an der
+  // Argumentzahl; benutzbar war `|>` damit nur ohne weitere Argumente oder mit
+  // ausdruecklichem `?`. Die Grammatik sieht beide Formen vor (PipeArgList),
+  // und die zweite ergibt nur mit dem vorangestellten Wert einen Sinn — sonst
+  // waere sie eine Aufrufschreibweise mit zu wenigen Argumenten.
   fn _parsePipeArgList(pipeVal: int64): int64 {
     if (self.Check(TK_RPAREN) != 0) { return pipeVal; }
+    var sawPlaceholder: int64 := 0;
     var head: int64 := -1;
     if (self.Check(TK_QUEST) != 0) {
       self.Advance();
       head := pipeVal;
+      sawPlaceholder := 1;
     } else {
       head := self.ParseExpr();
     }
@@ -1306,11 +1317,16 @@ pub type Parser = class {
       if (self.Check(TK_QUEST) != 0) {
         self.Advance();
         arg := pipeVal;
+        sawPlaceholder := 1;
       } else {
         arg := self.ParseExpr();
       }
       self._sn(tail, arg);
       tail := arg;
+    }
+    if (sawPlaceholder == 0) {
+      self._sn(pipeVal, head);
+      return pipeVal;
     }
     return head;
   }
@@ -2303,8 +2319,61 @@ pub type Parser = class {
       self.Expect(TK_CASE);
       // Parse pattern
       var pat: int64 := -1;
+      // #1250: `case (1, 2)` — das Tupel-Muster aus ebnf.md 14. Es fehlte
+      // ganz; die Meldung lautete `expected =>, got (` und wies auf die
+      // Klammer statt auf die fehlende Sache.
+      //
+      // Ein Tupel-Ausdruck `(a, b)` ist in Lyx dasselbe wie ein Array-Literal
+      // (NK_ARRAY_LIT): Kopf {cap,len}, dann die Elemente. Das Muster prueft
+      // daher die Laenge und die Elemente der Reihe nach — Teilmuster sind ein
+      // Ganzzahlliteral (auch negativ), ein `con`/Enum-Name oder `_`.
+      if (self.Check(TK_LPAREN) != 0) {
+        self.Advance();
+        pat := self._alloc(NK_PATTERN_TUPLE, cti);
+        var tpHead: int64 := 0 - 1;
+        var tpTail: int64 := 0 - 1;
+        var tpCount: int64 := 0;
+        while (self.Check(TK_RPAREN) == 0 && self.Check(TK_EOF) == 0) {
+          var tpElem: int64 := 0 - 1;
+          if (self.Check(TK_UNDER) != 0) {
+            self.Advance();
+            tpElem := self._alloc(NK_PATTERN_WILD, cti);
+          } else {
+            var tpNeg: int64 := 0;
+            if (self.Check(TK_MINUS) != 0) { tpNeg := 1; self.Advance(); }
+            if (self.Check(TK_INT) != 0) {
+              var tpVal: int64 := self.TokIVal(self.cur);
+              if (tpNeg != 0) { tpVal := 0 - tpVal; }
+              self.Advance();
+              tpElem := self._alloc(NK_PATTERN_LIT, cti);
+              self._siv(tpElem, tpVal);
+            } else if (tpNeg == 0 && self.Check(TK_IDENT) != 0) {
+              tpElem := self._alloc(NK_IDENT, self.cur);
+              self._ssv(tpElem, self._tokOff(self.cur), self._tokLen(self.cur));
+              self.Advance();
+            } else {
+              self._err("Tupel-Muster: erwartet ein Ganzzahlliteral, einen Namen oder `_`"c);
+              self.Advance();
+            }
+          }
+          if (tpElem >= 0) {
+            if (tpHead == -1) { tpHead := tpElem; } else { self._sn(tpTail, tpElem); }
+            tpTail := tpElem;
+            tpCount := tpCount + 1;
+          }
+          if (self.Match(TK_COMMA) == 0) { }
+        }
+        self.Expect(TK_RPAREN);
+        // Ein einzelnes geklammertes Muster waere kein Tupel, sondern eine
+        // ueberfluessige Klammer — und `case ()` bezeichnet nichts.
+        if (tpCount < 2) {
+          self._err("Tupel-Muster braucht mindestens zwei Teilmuster"c);
+        }
+        self._sc0(pat, tpHead);
+        self._siv(pat, tpCount);
+      }
       // Check for wildcard (simplified - just use identifier)
-      if (self.Check(TK_UNDER) != 0) {
+      if (pat < 0 && self.Check(TK_UNDER) != 0) {
         self.Advance();
         pat := self._alloc(NK_PATTERN_WILD, cti);
       } else if (self.Check(TK_INT) != 0 || (self.Check(TK_MINUS) != 0 && self.TokKind(self.cur + 1) == TK_INT)) {
@@ -2414,8 +2483,13 @@ pub type Parser = class {
           self._ssv(pat, identStart, identLen);
         }
       } else {
-        // Default pattern
-        pat := self._alloc(NK_PATTERN_WILD, cti);
+        // #1250: Ein bereits erkanntes Tupel-Muster darf hier nicht
+        // ueberschrieben werden — sonst waere `case (1, 2)` still ein
+        // Wildcard und traefe IMMER.
+        if (pat < 0) {
+          // Default pattern
+          pat := self._alloc(NK_PATTERN_WILD, cti);
+        }
       }
       // WP-BC-11: or-patterns — case p1 | p2 | p3 => body
       while (self.Check(TK_BITOR) != 0) {

@@ -86,6 +86,7 @@ con CGN_CAST:        int64 := 53;  // WP-11: x as Type
 con CGN_CLOSURE:     int64 := 54;  // WP-13: closure { fn ptr, captured env }
 // #1113: Bereichsmuster; iVal = untere Grenze, c1 = obere Grenze oder -1.
 con CGN_PATTERN_RANGE: int64 := 131;
+con CGN_PATTERN_TUPLE: int64 := 132; // #1250: `case (1, 2)`; c0 = erstes Teilmuster, iVal = Anzahl
 con CGN_MATCH:       int64 := 64;  // WP-15: match expr { cases }
 con CGN_NAMED_ARG:   int64 := 108; // WP-MEM-05: named call arg; nc0=value
 con CGN_MATCH_CASE:  int64 := 65;  // WP-15: case pattern => expr
@@ -740,6 +741,10 @@ pub type Codegen = class {
 
   // WP-MEM-05: top-level AST head for default-param lookup in cg_genCall
   topLevelHead: int64;
+  // #1252: geordnete Argumentliste eines Aufrufs mit benannten Argumenten UND
+  // einer Luecke, die ein Vorgabewert schliesst. Sie entsteht nur fuer diesen
+  // Fall; jeder andere Aufruf laeuft weiter ueber die Knotenkette.
+  cgOrdBuf: int64;
 
   // WP-R9: seccomp-BPF
   lcbsCapBuf:     int64;  // alloc'd int64[64]: collected capIds
@@ -7148,23 +7153,43 @@ pub type Codegen = class {
       // 7. Emit prologue
       var innerProloguePatch: int64 := self.cg_emitPrologueNested();
 
-      // 8. Spill env ptr (rdi = hidden first arg)
-      var envPtrOff: int64 := self.cg_addLocal("__env_ptr__", 11);
-      self.closureEnvPtrOff := envPtrOff;
-      self.cg_spillRdi(envPtrOff);
-
-      // 9. Spill explicit params (rsi=arg0, rdx=arg1, ...)
+      // 8./9. Parameter ablegen. #1249: FAENGT das Lambda nichts ein, ist es
+      // eine gewoehnliche Funktion — dann gibt es keine Umgebung, rdi bleibt
+      // das erste echte Argument, und nichts wird verschoben. Nur mit
+      // Captures kommt die Umgebung verdeckt in rdi und alles rutscht eins
+      // weiter.
+      //
+      // Das ist der Kern von #1249: die Aufrufstelle waehlt ihre Konvention
+      // nach dem DEKLARIERTEN Typ. Ein `var f: fn(int64): int64` gilt dort als
+      // duenner Zeiger, das Lambda lieferte aber einen {fnPtr,env}-Satz auf dem
+      // Heap — `call rbx` sprang mitten in diesen Satz. Mit derselben
+      // Konvention auf beiden Seiten faellt der Fall weg.
+      if (numCap > 0) {
+        var envPtrOff: int64 := self.cg_addLocal("__env_ptr__", 11);
+        self.closureEnvPtrOff := envPtrOff;
+        self.cg_spillRdi(envPtrOff);
+      } else {
+        self.closureEnvPtrOff := 0;
+      }
       var cparam: int64 := closureParams;
       var cparamIdx: int64 := 0;
       while (cparam >= 0 && cparamIdx < 5) {
         var pname2: pchar := self.cg_nsval(cparam);
         var pnlen2: int64 := self.cg_nslen(cparam);
         var cpoff: int64 := self.cg_addLocal(pname2, pnlen2);
-        if (cparamIdx == 0) { self.cg_spillRsi(cpoff); }
-        else if (cparamIdx == 1) { self.cg_spillRdx(cpoff); }
-        else if (cparamIdx == 2) { self.cg_spillRcx(cpoff); }
-        else if (cparamIdx == 3) { self.cg_spillR8(cpoff); }
-        else if (cparamIdx == 4) { self.cg_spillR9(cpoff); }
+        if (numCap > 0) {
+          if (cparamIdx == 0) { self.cg_spillRsi(cpoff); }
+          else if (cparamIdx == 1) { self.cg_spillRdx(cpoff); }
+          else if (cparamIdx == 2) { self.cg_spillRcx(cpoff); }
+          else if (cparamIdx == 3) { self.cg_spillR8(cpoff); }
+          else if (cparamIdx == 4) { self.cg_spillR9(cpoff); }
+        } else {
+          if (cparamIdx == 0) { self.cg_spillRdi(cpoff); }
+          else if (cparamIdx == 1) { self.cg_spillRsi(cpoff); }
+          else if (cparamIdx == 2) { self.cg_spillRdx(cpoff); }
+          else if (cparamIdx == 3) { self.cg_spillRcx(cpoff); }
+          else if (cparamIdx == 4) { self.cg_spillR8(cpoff); }
+        }
         cparamIdx += 1;
         cparam := self.cg_nnext(cparam);
       }
@@ -7223,6 +7248,16 @@ pub type Codegen = class {
           }
           ci += 1;
         }
+      }
+
+      // #1249: ohne Captures ist der WERT die Codeadresse — kein Satz auf dem
+      // Heap, keine Belegung, kein zweiter Zugriff beim Aufruf.
+      if (numCap == 0) {
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);   // lea rax, [rip+anonLabel]
+        var thinPatch: int64 := self.codeLen;
+        self.cg_e32(0);
+        self.cg_addPatch(thinPatch, anonLabel as int64, anonLabelLen, CG_PATCH_CALL);
+        return;
       }
 
       // 15. Heap-allocate closure struct (16 bytes) via mmap
@@ -7694,6 +7729,121 @@ pub type Codegen = class {
     return 0 - 1;
   }
 
+  // #1249: Faengt dieses Lambda etwas aus seiner Umgebung ein?
+  fn cg_closureCaptures(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (self.cg_nkind(ni) != CGN_CLOSURE) { return 0; }
+    var saved: int64 := self.closureCapturedCount;
+    self.cg_scanClosureCaptures(self.cg_nc2(ni), self.cg_nc0(ni));
+    var cnt: int64 := self.closureCapturedCount;
+    self.closureCapturedCount := saved;
+    return cnt;
+  }
+
+  // #1249: Ein EINFANGENDES Lambda in einem `fn(...)`-Ziel. Ein solcher Typ
+  // traegt acht Byte — eine Adresse. Die eingefangene Umgebung liegt daneben
+  // und hat dort keinen Platz; der Aufruf ueber diesen Typ springt an die
+  // Adresse und laesst die Umgebung weg. Bisher entstand daraus ein SIGSEGV
+  // ohne jede Meldung, weil der Wert ein {fnPtr,env}-Satz war und der Sprung
+  // mitten hinein ging.
+  //
+  // Ohne Captures ist das Lambda seit 1.0.16I eine gewoehnliche Funktion und
+  // passt in den Typ. Mit Captures braucht es einen Typ, der beides traegt —
+  // den gibt es noch nicht, also wird gemeldet statt geraten.
+  fn cg_rejectCapturingClosure(ni: int64, wo: pchar) {
+    if (self.cg_closureCaptures(ni) <= 0) { return; }
+    EPrintStr("codegen error: einfangendes Lambda "c);
+    sys_write(2, wo as int64, StrLen(wo));
+    EPrintStrLn(" (#1249)"c);
+    EPrintStrLn("  Ein `fn(...)`-Typ traegt nur eine Adresse, nicht die eingefangene Umgebung."c);
+    EPrintStrLn("  Ohne Einfangen passt das Lambda; sonst die Werte als Parameter uebergeben."c);
+    exit(1);
+  }
+
+  // #1252: Argumente eines Aufrufs in die Reihenfolge der PARAMETER bringen und
+  // Luecken mit dem Vorgabewert schliessen.
+  //
+  // sema sortiert benannte Argumente selbst um — aber nur, wenn jeder Parameter
+  // belegt ist. Fehlt einer, der einen Vorgabewert hat (`G(1, c: 9)`), bleibt
+  // eine Luecke mitten in der Kette, und sema kann sie nicht schliessen: dafuer
+  // braeuchte es einen neuen Knoten, und die Knotenarena gehoert dem Parser.
+  // Hier ist der Vorgabewert dagegen zur Hand — der Codegen wertet ihn fuer
+  // HINTERE Parameter ohnehin aus (WP-MEM-05).
+  //
+  // Ergebnis in self.cgOrdBuf, Rueckgabe = Zahl der Argumente. -1 heisst
+  // "nicht zustaendig": dann bleibt es beim bisherigen Weg ueber die Kette.
+  // Das ist Absicht — angefasst wird nur der Fall, den #1252 nennt.
+  fn cg_orderCallArgs(defFuncNi: int64, argNode: int64): int64 {
+    var pc: int64 := 0;
+    var pp: int64 := self.cg_nc0(defFuncNi);
+    while (pp >= 0) { pc := pc + 1; pp := self.cg_nnext(pp); }
+    if (pc <= 0 || pc > 32) { return 0 - 1; }
+
+    // Beim Testen von #1252 aufgefallen und hier mit erledigt: der Pfad fuer
+    // SIEBEN und mehr Argumente setzte Vorgabewerte ueberhaupt nicht ein — er
+    // baut seine Liste aus der Knotenkette, und der Nachlauf, der die hinteren
+    // Parameter ergaenzt, steht nur im Pfad fuer bis zu sechs. `H(1,2,3,4,5,6)`
+    // mit zwei Vorgabewerten uebergab also sechs Argumente an eine Funktion mit
+    // acht Parametern: die Werte lagen verschoben, das Ergebnis war Muell (mit
+    // 1.0.16F nachgemessen). Deshalb ordnet diese Stelle JEDEN Aufruf mit einer
+    // Luecke — mit benanntem Argument oder ohne.
+    var a: int64 := argNode;
+    var buf: int64 := alloc(pc * 8);
+    var i: int64 := 0;
+    while (i < pc) { poke64(buf + i * 8, 0 - 1); i := i + 1; }
+
+    var posIdx: int64 := 0;
+    var okOrder: int64 := 1;
+    a := argNode;
+    while (a != -1) {
+      var slotIdx: int64 := 0 - 1;
+      if (self.cg_nkind(a) == CGN_NAMED_ARG) {
+        var an: pchar := self.cg_nsval(a);
+        var al: int64 := self.cg_nslen(a);
+        var q: int64 := self.cg_nc0(defFuncNi);
+        var qi: int64 := 0;
+        while (q >= 0) {
+          if (self.cg_seq(self.cg_nsval(q), self.cg_nslen(q), an, al)) { slotIdx := qi; }
+          qi := qi + 1;
+          q := self.cg_nnext(q);
+        }
+      } else {
+        slotIdx := posIdx;
+        posIdx := posIdx + 1;
+      }
+      // Unbekannter Name, doppelte Belegung, zu viele Argumente: sema hat das
+      // bereits gemeldet. Hier wird nur nicht geordnet — eine zweite Meldung
+      // waere Laerm, ein Raten waere schlimmer.
+      if (slotIdx < 0 || slotIdx >= pc) { okOrder := 0; }
+      else {
+        if (peek64(buf + slotIdx * 8) >= 0) { okOrder := 0; }
+        else { poke64(buf + slotIdx * 8, a); }
+      }
+      a := self.cg_nnext(a);
+    }
+
+    // Luecken schliessen — und feststellen, ob es ueberhaupt welche gab.
+    var hasGap: int64 := 0;
+    if (okOrder != 0) {
+      var pn: int64 := self.cg_nc0(defFuncNi);
+      i := 0;
+      while (i < pc) {
+        if (peek64(buf + i * 8) < 0) {
+          var dflt: int64 := 0 - 1;
+          if (pn >= 0) { dflt := self.cg_nc1(pn); }
+          if (dflt < 0) { okOrder := 0; }
+          else { poke64(buf + i * 8, dflt); hasGap := 1; }
+        }
+        if (pn >= 0) { pn := self.cg_nnext(pn); }
+        i := i + 1;
+      }
+    }
+
+    if (okOrder == 0 || hasGap == 0) { free(buf, pc * 8); return 0 - 1; }
+    self.cgOrdBuf := buf;
+    return pc;
+  }
+
   fn cg_genCall(ni: int64) {
     var fname: pchar := self.cg_nsval(ni);
     var fnlen: int64 := self.cg_nslen(ni);
@@ -7936,6 +8086,15 @@ pub type Codegen = class {
     var cur: int64 := argNode;
     while (cur != -1) { argc := argc + 1; cur := self.cg_nnext(cur); }
 
+    // #1249: Ein Lambda als ARGUMENT landet immer in einem `fn(...)`-Parameter
+    // — eine andere Form, es entgegenzunehmen, gibt es nicht. Faengt es etwas
+    // ein, passt es dort nicht hinein.
+    cur := argNode;
+    while (cur != -1) {
+      self.cg_rejectCapturingClosure(cur, "als Argument eines Aufrufs"c);
+      cur := self.cg_nnext(cur);
+    }
+
     // WP-MEM-05: mmap(size: N) or mmap(len: N) — expand single named arg to 6-arg syscall
     if (isMethod == 0 && argc == 1 && argNode >= 0 && self.cg_nkind(argNode) == CGN_NAMED_ARG) {
       var mmArg: pchar := self.cg_nsval(argNode);
@@ -7997,6 +8156,14 @@ pub type Codegen = class {
       }
     }
 
+    // #1252: Aufruf mit benanntem Argument UND einer Luecke, die ein
+    // Vorgabewert schliesst — dann steht die fertige Reihenfolge in cgOrdBuf
+    // und tritt an die Stelle der Knotenkette. In jedem anderen Fall ist
+    // ordCnt -1 und unten aendert sich nichts.
+    var ordCnt: int64 := 0 - 1;
+    if (cgDefFuncNi >= 0) { ordCnt := self.cg_orderCallArgs(cgDefFuncNi, argNode); }
+    if (ordCnt >= 0) { argc := ordCnt; }
+
     // L-4: resolve smObj and static-call BEFORE ordering push
     var smObj: int64 := -1;
     if (isMethod == 1) {
@@ -8031,6 +8198,16 @@ pub type Codegen = class {
         self.cg_pushRax();
         argc += 1;
       }
+      if (ordCnt >= 0) {
+        // #1252: fertige Reihenfolge, Vorgabewerte inbegriffen — der Nachlauf
+        // fuer hintere Parameter unten entfaellt damit.
+        var oi: int64 := 0;
+        while (oi < ordCnt) {
+          self.cg_genExpr(peek64(self.cgOrdBuf + oi * 8));
+          self.cg_pushRax();
+          oi := oi + 1;
+        }
+      } else {
       cur := argNode;
       while (cur != -1) {
         self.cg_genExpr(cur);
@@ -8055,15 +8232,25 @@ pub type Codegen = class {
           cgPn := self.cg_nnext(cgPn);
         }
       }
+      }
     } else {
       // L-4: 7+ param path — push stack args first (reverse), then register args
       var argBuf: int64 := alloc(nExpl * 8);
       var acnt: int64 := 0;
+      if (ordCnt >= 0) {
+        // #1252: dieselbe geordnete Liste, nur in der Reihenfolge des 7+-Pfades
+        // abgearbeitet.
+        while (acnt < ordCnt) {
+          poke64(argBuf + acnt * 8, peek64(self.cgOrdBuf + acnt * 8));
+          acnt += 1;
+        }
+      } else {
       var acur: int64 := argNode;
       while (acur != -1) {
         poke64(argBuf + acnt * 8, acur);
         acnt += 1;
         acur := self.cg_nnext(acur);
+      }
       }
       if (isMethod == 1) {
         argc += 1;
@@ -10695,6 +10882,31 @@ pub type Codegen = class {
       // fnAlias-Liste tragen koennte, also am Local selbst vermerken.
       if (typeNode >= 0 && self.cg_nkind(typeNode) == CGN_FN_PTR_NODE) {
         poke8(self.localIsFnPtr + localIdx, 1);
+        self.cg_rejectCapturingClosure(self.cg_nc1(ni),
+          "als Wert einer Variablen mit `fn(...)`-Typ"c);
+      }
+      // #1249: `var f := fn(x: int64): int64 { … };` OHNE Typangabe. Faengt das
+      // Lambda nichts ein, ist sein Wert seit 1.0.16I die blanke Codeadresse —
+      // dann muss auch der Aufruf ueber diesen Namen duenn sein. Ohne die
+      // Markierung liefe er in den Closure-Zweig und laese {fnPtr,env} aus dem
+      // Code. Ein EINFANGENDES Lambda bleibt ein Satz auf dem Heap und damit
+      // ungemarkt.
+      var vdInit: int64 := self.cg_nc1(ni);
+      if (vdInit >= 0 && self.cg_nkind(vdInit) == CGN_CLOSURE) {
+        var vdSavedCap: int64 := self.closureCapturedCount;
+        self.cg_scanClosureCaptures(self.cg_nc2(vdInit), self.cg_nc0(vdInit));
+        var vdCap: int64 := self.closureCapturedCount;
+        self.closureCapturedCount := vdSavedCap;
+        if (vdCap == 0) { poke8(self.localIsFnPtr + localIdx, 1); }
+      }
+      // #1249: `var g := f;` — die Konvention haengt am Wert, also muss sie
+      // mitwandern. Ohne das galt die Kopie als Closure und las {fnPtr,env}
+      // aus dem Code des Originals.
+      if (vdInit >= 0 && self.cg_nkind(vdInit) == CGN_IDENT) {
+        var srcIdx: int64 := self.cg_findLocalIdx(self.cg_nsval(vdInit), self.cg_nslen(vdInit));
+        if (srcIdx >= 0 && srcIdx != localIdx && peek8(self.localIsFnPtr + srcIdx) != 0) {
+          poke8(self.localIsFnPtr + localIdx, 1);
+        }
       }
       // Track array locals: NK_TYPE_ARRAY (=61) or NK_TYPE_NAME "Array<T>" (uppercase, =60)
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 61) {
@@ -12926,6 +13138,76 @@ pub type Codegen = class {
         // Fehlschlaege springen HIERHER -- an den naechsten Fall, nicht auf
         // die naechste Anweisung.
         self.cg_patchList(failHead, self.codeLen);
+
+      } else if (patKind == CGN_PATTERN_TUPLE) {
+        // #1250: `case (1, 2)`. Ein Tupel-Ausdruck `(a, b)` ist in Lyx
+        // dasselbe wie ein Array-Literal: Kopf {cap,len}, dann die Elemente.
+        // Geprueft wird deshalb zuerst die LAENGE — ein Muster mit zwei
+        // Teilen darf nicht auf ein dreielementiges Tupel passen — und danach
+        // Element fuer Element. `_` laesst seine Stelle aus.
+        //
+        // Vorher gab es das Muster nicht: der Parser meldete `expected =>,
+        // got (` und nannte damit die Klammer statt der fehlenden Sache.
+        var tupCount: int64 := self.cg_nival(patNode);
+        var tupFail: int64 := 0 - 1;
+        // Laenge vergleichen: rax = [subject + 8]
+        self.cg_loadRax(matchOff);
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(0x08);  // mov rax,[rax+8]
+        self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(tupCount);               // mov rcx, n
+        self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
+        self.cg_e8(0x0F); self.cg_e8(0x85); self.cg_e32(tupFail);                // jne -> naechster Fall
+        tupFail := self.codeLen - 4;
+        var tupElem: int64 := self.cg_nc0(patNode);
+        var tupIdx: int64 := 0;
+        while (tupElem != -1) {
+          var teKind: int64 := self.cg_nkind(tupElem);
+          var teCmp: int64 := 0;
+          var teVal: int64 := 0;
+          if (teKind == CGN_PATTERN_LIT) {
+            teVal := self.cg_nival(tupElem); teCmp := 1;
+          } else if (teKind == CGN_IDENT) {
+            var teNm: pchar := self.cg_nsval(tupElem);
+            var teNl: int64 := self.cg_nslen(tupElem);
+            if (self.cg_hasConVal(teNm, teNl) != 0) {
+              teVal := self.cg_findConVal(teNm, teNl); teCmp := 1;
+            } else {
+              // Wie beim Struktur- und beim Bezeichner-Muster: ein blanker
+              // Name ist ein VERWEIS. Benennt er nichts, wird das gemeldet —
+              // eine Bindung gibt es in Mustern nicht (ebnf.md 14).
+              EPrintStr("error: unbekannter Name im Tupel-Muster: '"c);
+              sys_write(2, teNm as int64, teNl);
+              EPrintStrLn("'"c);
+              exit(1);
+            }
+          } else if (teKind == CGN_PATTERN_WILD) {
+            teCmp := 0;
+          } else {
+            EPrintStrLn("error: Tupel-Muster: Teilmuster muss ein Ganzzahlliteral, ein `con` oder `_` sein"c);
+            exit(1);
+          }
+          if (teCmp != 0) {
+            // rax = [subject + 16 + idx*8]  (16 = {cap,len}-Kopf)
+            self.cg_loadRax(matchOff);
+            var teOff: int64 := 16 + tupIdx * 8;
+            if (teOff <= 127) {
+              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(teOff);
+            } else {
+              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x80); self.cg_e32(teOff);
+            }
+            self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(teVal);              // mov rcx, wert
+            self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                // cmp rax, rcx
+            self.cg_e8(0x0F); self.cg_e8(0x85); self.cg_e32(tupFail);            // jne -> naechster Fall
+            tupFail := self.codeLen - 4;
+          }
+          tupIdx := tupIdx + 1;
+          tupElem := self.cg_nnext(tupElem);
+        }
+        self.cg_genMatchBody(bodyNode);
+        self.cg_e8(0xE9);
+        var bpTup: int64 := self.codeLen;
+        self.cg_e32(self.curBreakHead);
+        self.curBreakHead := bpTup;
+        self.cg_patchList(tupFail, self.codeLen);
 
       } else if (patKind == CGN_PATTERN_ENUM) {
         // BUG-08: Enum payload pattern: Ok(value) or Err(msg)
