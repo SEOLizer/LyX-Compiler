@@ -1,6 +1,6 @@
-# Lyx 1.0.16G — Canonical EBNF Grammar
+# Lyx 1.0.16H — Canonical EBNF Grammar
 
-> Stand 2026-08-11, gegen lyxc 1.0.16G geprueft. Die Keyword-Liste in
+> Stand 2026-08-11, gegen lyxc 1.0.16H geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -825,9 +825,23 @@ TryStmt             = "try"
    - Die Typangabe darf fehlen; der geworfene Wert ist dann `int64` (das rohe
      Maschinenwort).
    - Sie WAEHLT NICHT AUS: der Wert traegt keine Typkennung. Mehr als eine
-     catch-Klausel wird deshalb gemeldet statt still nacheinander ausgefuehrt. *)
+     catch-Klausel wird deshalb gemeldet statt still nacheinander ausgefuehrt.
+   - OHNE catch faengt der try-Block nichts: `finally` raeumt auf, danach geht
+     die Ausnahme WEITER zum naechsten Handler, und findet sie keinen, endet
+     das Programm mit 1. Bis 1.0.16G war sie verschluckt -- das finally lief,
+     der Code dahinter ebenfalls, und das Programm meldete rc=0, wo der nackte
+     `throw` mit rc=1 abbricht (#1242).
+   - Nur der x86-64-Pfad senkt try/catch ab. Fuer lyxos, arm64, riscv, arm-cm4
+     und xtensa wird es GEMELDET; eine Uebersetzung waere still falsch, weil
+     dort kein Handler installiert wird (#1281). *)
 
 ThrowStmt           = "throw" Expr ";" ;
+
+(* Findet der Wurf keinen Handler, endet das Programm mit 1. Fuer die
+   IR-Backends (lyxos, arm64, riscv, arm-cm4) ist das der einzige Fall, denn
+   try/catch wird dort gemeldet; bis 1.0.16G erzeugte `throw` fuer diese Ziele
+   gar keinen Code und war ein No-op (#1281). Auf xtensa wird `throw` gemeldet:
+   dort fehlt eine gepruefte Trap-Kodierung. *)
 
 ReturnStmt          = "return" [ Expr ] ";" ;
 
@@ -836,6 +850,16 @@ BreakStmt           = "break" ";" ;
 ContinueStmt        = "continue" ";" ;
 
 DeferStmt           = "defer" Statement ;
+
+(* Die angemeldete Anweisung laeuft beim Verlassen des Rahmens in LIFO-Reihen-
+   folge -- auf dem `return`-Weg, bei `break`/`continue` aus einer Schleife und
+   seit 1.0.16G auch dann, wenn die Funktion per `throw` verlassen wird. Bis
+   dahin uebersprang genau der Ausnahmeweg die Kette: ein `defer CloseFile(fd)`
+   leckte still im Fehlerfall, also in dem einzigen Fall, fuer den man es
+   schreibt (#1241). NICHT erfasst ist der DURCHLAUFENE Rahmen: wirft eine
+   gerufene Funktion, springt die Ausnahme ueber die Zwischenrahmen hinweg zum
+   Handler, und deren defers laufen nicht -- die Kette ist zur Uebersetzungszeit
+   bekannt, die erreichte Tiefe eines fremden Rahmens dagegen nicht. *)
 
 AsmStmt             = "asm" "{" { StringLiteral } "}" ;
 
