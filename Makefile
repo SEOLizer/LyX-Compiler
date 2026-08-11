@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.16F
+VERSION   := 1.0.16G
 VERSION_DATE := 2026-08-11
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -452,6 +452,15 @@ test: lyxc
 	@echo "OK"
 	@echo "--- ebnf.md gegen den Compiler gemessen (12 Pruefungen) ---"
 	@bash tests/ebnf_claims_test.sh
+	@echo "OK"
+	@echo "--- globale Aggregate: Arrays und Structs auf Modulebene (10 Pruefungen) ---"
+	@bash tests/global_aggregate_test.sh
+	@echo "OK"
+	@echo "--- mehrdimensionale Arrays [N][M]T (8 Pruefungen) ---"
+	@bash tests/multidim_array_test.sh
+	@echo "OK"
+	@echo "--- new T[n] mit Laufzeitlaenge (9 Pruefungen) ---"
+	@bash tests/dynamic_array_new_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh

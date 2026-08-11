@@ -13,10 +13,11 @@
 # der Argumentauswertung kannte nur `push` und `pop`. Der Kommentar dort sagte
 # "should not reach here"; genau das war die falsche Annahme.
 #
-# #1230: `[N][M]T` wird abgewiesen statt uebersetzt. Der Belegungszweig legt N
-# Slots zu je 8 Byte an; fuer den Elementtyp, der selbst ein Array ist,
-# entsteht kein Speicher, und `m[0][0]` indiziert in eine Null. Die Umsetzung
-# ist eine Entwurfsentscheidung und gehoert in ein eigenes Paket.
+# #1230: `[N][M]T` legte N Slots zu je 8 Byte an; fuer den Elementtyp, der
+# selbst ein Array ist, entstand kein Speicher, und `m[0][0]` indizierte in
+# eine Null. Seit 1.0.16G liegt es FLACH (N*M Slots hinter einem
+# {cap,len}-Kopf); die Einzelheiten prueft tests/multidim_array_test.sh, hier
+# steht nur, dass zwei Dimensionen tragen und die dritte gemeldet wird.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="$ROOT/lyxc"
@@ -139,21 +140,25 @@ fn main(): int64 {
 # ===========================================================================
 # #1230 — mehrdimensionale Arrays
 # ===========================================================================
-# Geprueft werden Meldung UND Exit-Code: ein Compiler, der meldet und trotzdem
-# ein Binary hinlegt, waere sonst ebenso gruen.
+# Bei der Gegenprobe werden Meldung UND Exit-Code geprueft: ein Compiler, der
+# meldet und trotzdem ein Binary hinlegt, waere sonst ebenso gruen.
 
-rejects "mehrdimensionales Array wird abgewiesen" "$KOPF
+out "mehrdimensionales Array traegt" "$KOPF
 fn main(): int64 {
     var m: [2][2]int64;
     m[0][0] := 5;
+    m[1][1] := 7;
+    PrintLn(IntToStr(m[0][0]));
+    PrintLn(IntToStr(m[1][1]));
     return 0;
-}" "mehrdimensionales Array ist noch nicht umgesetzt"
+}" "5
+7"
 
-rejects "auch ohne Zugriff abgewiesen" "$KOPF
+rejects "drei Dimensionen werden gemeldet" "$KOPF
 fn main(): int64 {
-    var m: [3][3]int64;
+    var m: [3][3][3]int64;
     return 0;
-}" "mehrdimensionales Array"
+}" "mehr als zwei Dimensionen"
 
 # Gegenprobe: eindimensional bleibt erlaubt — sonst waere die Pruefung zu weit
 # gefasst.
