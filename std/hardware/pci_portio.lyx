@@ -1,0 +1,196 @@
+// std/hardware/pci_portio.lyx
+// PCI-11: Konfigurationsraum ueber die Portpaare 0xCF8/0xCFC.
+//
+// Das ist der aelteste Weg zum Config-Space und der einzige, der ohne
+// Kernelhilfe und ohne ACPI auskommt: Adresse nach 0xCF8, Daten von 0xCFC.
+//
+//   Adresse = 0x80000000
+//           | (bus    << 16)
+//           | (device << 11)
+//           | (funktion << 8)
+//           | (offset & 0xFC)
+//
+// Auf x86-64 geschieht das mit den Befehlen `in` und `out`. Diese Unit
+// benutzt sie NICHT direkt — und der Grund gehoert hierher, damit ihn
+// niemand fuer eine Nachlaessigkeit haelt:
+//
+//   Das `asm { "..." }` des Compilers kennt eine feste Mnemonic-Tabelle
+//   ohne Operandenbindung (src/codegen_x86.lyx, cg_genAsm). Es gibt keine
+//   Moeglichkeit, einen Lyx-Wert nach dx oder eax zu bringen, und damit
+//   auch keine Moeglichkeit, eine berechnete Portadresse anzusprechen.
+//   Ein `in eax, dx` in die Tabelle aufzunehmen brachte nichts, solange
+//   die Register nicht gefuellt werden koennen.
+//
+// Unter Linux gibt es dafuer /dev/port: Lesen und Schreiben an Offset N
+// dieser Zeichengeraetedatei fuehrt der Kernel als Portzugriff auf Port N
+// aus. Das ist kein Ersatzverhalten, sondern derselbe Zugriff, nur vom
+// Kernel ausgefuehrt — und er braucht dieselben Rechte (root), die auch
+// iopl() verlangen wuerde.
+//
+// Fuer LyxOS und bare metal fehlt dieser Umweg. Dort werden `in`/`out`
+// gebraucht; die Compilerarbeit dafuer ist als eigenes Issue geführt und
+// diese Unit meldet auf solchen Zielen PCI_E_NOTSUP, statt etwas
+// vorzutaeuschen.
+
+@description("PCI configuration space via legacy port I/O (0xCF8/0xCFC)")
+@author("Andreas Roene")
+unit std.hardware.pci_portio;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.alloc;
+
+// ============================================================
+// Konstanten
+// ============================================================
+
+pub con PCI_PORT_ADDRESS: int64 := 0xCF8;   // Adressregister (32 Bit)
+pub con PCI_PORT_DATA:    int64 := 0xCFC;   // Datenregister (32 Bit)
+
+pub con PCI_PORT_ENABLE_BIT: int64 := 0x80000000;   // Bit 31 der Adresse
+
+pub con PCI_DEV_PORT: pchar := "/dev/port";
+
+// ============================================================
+// Adressrechnung — der Kern dieser Unit und die Stelle, an der ein
+// Fehler auf ein fremdes Geraet zeigt. Deshalb oeffentlich und einzeln
+// pruefbar.
+// ============================================================
+
+pub fn PciPortIoAddress(bus: int64, dev: int64, fun: int64, off: int64): int64 {
+  if (bus < 0 || bus > 255) { return PCI_E_BADARG; }
+  if (dev < 0 || dev > 31)  { return PCI_E_BADARG; }
+  if (fun < 0 || fun > 7)   { return PCI_E_BADARG; }
+  // Nur die unteren 256 Bytes sind ueber diesen Weg erreichbar; der
+  // erweiterte Raum braucht ECAM (PCI-12).
+  if (off < 0 || off >= PCI_CFG_SIZE_LEGACY) { return PCI_E_RANGE; }
+  return PCI_PORT_ENABLE_BIT | (bus << 16) | (dev << 11) | (fun << 8) | (off & 252);
+}
+
+// Dieselbe Rechnung aus einer gepackten BDF. Die Domain wird dabei
+// ignoriert — der Legacy-Weg kennt nur Domain 0. Eine BDF mit anderer
+// Domain ist deshalb ein Fehler und keine stille Naeherung.
+pub fn PciPortIoAddressBdf(bdf: int64, off: int64): int64 {
+  if (bdf < 0) { return PCI_E_BADARG; }
+  if (PciBdfDomain(bdf) != 0) { return PCI_E_NOTSUP; }
+  return PciPortIoAddress(PciBdfBus(bdf), PciBdfDevice(bdf), PciBdfFunction(bdf), off);
+}
+
+// ============================================================
+// Portzugriffe ueber /dev/port
+// ============================================================
+
+// Oeffnet /dev/port. Rueckgabe: Deskriptor oder
+//   PCI_E_LOCKED  Kernel-Lockdown (Secure Boot) sperrt den Zugriff — auch
+//                 fuer root; kein Rechteproblem, sondern eine Eigenschaft
+//                 des laufenden Systems
+//   PCI_E_PERM    vorhanden, aber keine Rechte (root noetig)
+//   PCI_E_NOTSUP  nicht vorhanden (kein Linux, oder ohne CONFIG_DEVPORT)
+//
+// Die Unterscheidung ist nicht kosmetisch: bei Lockdown fuehrt jede Suche
+// nach fehlenden Rechten ins Leere, und der Betreiber muss stattdessen
+// wissen, dass Secure Boot der Grund ist.
+pub fn PciPortOpen(): int64 {
+  var fd: int64 := PciOpenFile(PCI_DEV_PORT, PCI_O_RDWR);
+  if (fd >= 0) { return fd; }
+
+  // Ein zweiter open-Versuch taugt zur Unterscheidung nicht — /dev/port
+  // ist fuer Nicht-root in jeder Betriebsart verschlossen und liefert
+  // beide Male dieselbe Absage. stat() dagegen braucht nur das
+  // Durchsuchrecht auf /dev und beantwortet genau die Existenzfrage.
+  if (PciPathExists(PCI_DEV_PORT) == 0) { return PCI_E_NOTSUP; }
+  if (PciLockdownBlocksHwAccess() == 1) { return PCI_E_LOCKED; }
+  return PCI_E_PERM;
+}
+
+pub fn PciPortClose(fd: int64) {
+  if (fd >= 0) { PciCloseFile(fd); }
+}
+
+// Liest width Bytes von Port `port`.
+pub fn PciPortRead(fd: int64, port: int64, width: int64): int64 {
+  if (fd < 0) { return PCI_E_BADARG; }
+  if (port < 0 || port > 65535) { return PCI_E_BADARG; }
+  if (width != 1 && width != 2 && width != 4) { return PCI_E_BADARG; }
+
+  var tmp: int64 := alloc(8);
+  if (tmp == 0) { return PCI_E_NOMEM; }
+  poke64(tmp, 0);
+  var n: int64 := PciPread(fd, tmp, width, port);
+  var v: int64 := 0;
+  if (width == 1) { v := peek8(tmp); }
+  if (width == 2) { v := peek16(tmp); }
+  if (width == 4) { v := peek32(tmp) & 4294967295; }
+  free(tmp, 8);
+  if (n != width) { return PCI_E_IO; }
+  return v;
+}
+
+pub fn PciPortWrite(fd: int64, port: int64, val: int64, width: int64): int64 {
+  if (fd < 0) { return PCI_E_BADARG; }
+  if (port < 0 || port > 65535) { return PCI_E_BADARG; }
+  if (width != 1 && width != 2 && width != 4) { return PCI_E_BADARG; }
+
+  var tmp: int64 := alloc(8);
+  if (tmp == 0) { return PCI_E_NOMEM; }
+  poke64(tmp, 0);
+  if (width == 1) { poke8(tmp, val & 255); }
+  if (width == 2) { poke16(tmp, val & 65535); }
+  if (width == 4) { poke32(tmp, val & 4294967295); }
+  var n: int64 := PciPwrite(fd, tmp, width, port);
+  free(tmp, 8);
+  if (n != width) { return PCI_E_PERM; }
+  return 0;
+}
+
+// Bequeme Einzelbreiten
+pub fn PciPortInb(fd: int64, port: int64): int64 { return PciPortRead(fd, port, 1); }
+pub fn PciPortInw(fd: int64, port: int64): int64 { return PciPortRead(fd, port, 2); }
+pub fn PciPortInl(fd: int64, port: int64): int64 { return PciPortRead(fd, port, 4); }
+
+pub fn PciPortOutb(fd: int64, port: int64, val: int64): int64 { return PciPortWrite(fd, port, val, 1); }
+pub fn PciPortOutw(fd: int64, port: int64, val: int64): int64 { return PciPortWrite(fd, port, val, 2); }
+pub fn PciPortOutl(fd: int64, port: int64, val: int64): int64 { return PciPortWrite(fd, port, val, 4); }
+
+// ============================================================
+// Config-Space ueber CF8/CFC
+//
+// Der Zugriff besteht aus zwei Schritten und ist damit nicht atomar: ein
+// anderer Prozess (oder der Kernel) kann zwischen Adress- und
+// Datenzugriff dieselben Ports benutzen. Der Kernel selbst nimmt dafuer
+// ein Schloss, das dem Benutzerland nicht offensteht. Auf einem
+// laufenden Linux ist dieser Weg deshalb zum Lesen brauchbar und zum
+// Schreiben gefaehrlich — er ist fuer bare metal und LyxOS gedacht, wo
+// niemand sonst diese Ports anfasst.
+// ============================================================
+
+pub fn PciPortIoCfgRead(fd: int64, bdf: int64, off: int64, width: int64): int64 {
+  if (width != 1 && width != 2 && width != 4) { return PCI_E_BADARG; }
+  var addr: int64 := PciPortIoAddressBdf(bdf, off);
+  if (addr < 0) { return addr; }
+  if (((off & 3) + width) > 4) { return PCI_E_BADARG; }   // Zugriff ueber die Wortgrenze
+
+  var rc: int64 := PciPortWrite(fd, PCI_PORT_ADDRESS, addr, 4);
+  if (rc < 0) { return rc; }
+  return PciPortRead(fd, PCI_PORT_DATA + (off & 3), width);
+}
+
+pub fn PciPortIoCfgWrite(fd: int64, bdf: int64, off: int64, val: int64, width: int64): int64 {
+  if (width != 1 && width != 2 && width != 4) { return PCI_E_BADARG; }
+  var addr: int64 := PciPortIoAddressBdf(bdf, off);
+  if (addr < 0) { return addr; }
+  if (((off & 3) + width) > 4) { return PCI_E_BADARG; }
+
+  var rc: int64 := PciPortWrite(fd, PCI_PORT_ADDRESS, addr, 4);
+  if (rc < 0) { return rc; }
+  return PciPortWrite(fd, PCI_PORT_DATA + (off & 3), val, width);
+}
+
+// Ist an dieser Adresse ein Geraet? Ohne offenen Deskriptor ist die
+// Frage nicht zu beantworten, und die Antwort lautet dann nicht "nein".
+pub fn PciPortIoDevicePresent(fd: int64, bdf: int64): int64 {
+  var v: int64 := PciPortIoCfgRead(fd, bdf, PCI_CFG_VENDOR_ID, 2);
+  if (v < 0) { return v; }
+  if (v == 65535 || v == 0) { return 0; }
+  return 1;
+}

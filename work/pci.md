@@ -5,8 +5,9 @@ ansteuern und (via VFIO) mit DMA und Interrupts betreiben — ohne C-FFI.
 
 **Ort:** `std/hardware/pci*.lyx`, Fassade `std/hardware/pci.lyx`
 **Branch-Namensschema:** `feat/pci-wp<nn>-<kürzel>`
-**Stand:** Phase 1–3 umgesetzt (PCI-01..10). Offen: Phase 4 (PCI-11/12,
-Port-I/O und ECAM).
+**Stand:** alle zwölf Arbeitspakete umgesetzt (PCI-01..12). Der
+Linux-Anteil von Phase 4 läuft über `/dev/port` und `/dev/mem`; `in`/`out`
+für LyxOS und bare metal fehlen noch im Compiler (eigenes Issue).
 
 ---
 
@@ -41,8 +42,8 @@ ergäbe etwas, das auf keinem normalen Linux-System nutzbar ist.
 | PCI-08 ✅ | `pci.lyx` | Fassade: `PciDevice`-Kontext, Öffnen/Suchen/Schließen | 2 | 03–07 |
 | PCI-09 ✅ | `pci_vfio.lyx` | Container/Group/Device, `VFIO_IOMMU_MAP_DMA`, DMA-Puffer | 3 | 08 |
 | PCI-10 ✅ | `pci_irq.lyx` | `VFIO_DEVICE_SET_IRQS`, eventfd-Warten, MSI-X-Vektortabelle | 3 | 09 |
-| PCI-11 | `pci_portio.lyx` | `iopl`/`ioperm`, `asm{}` in/out, CF8-Adressrechnung | 4 | 03 |
-| PCI-12 | `pci_ecam.lyx` | MCFG-Basis, ECAM-Adressrechnung, Mapping | 4 | 03 |
+| PCI-11 ✅ | `pci_portio.lyx` | `iopl`/`ioperm`, `asm{}` in/out, CF8-Adressrechnung | 4 | 03 |
+| PCI-12 ✅ | `pci_ecam.lyx` | MCFG-Basis, ECAM-Adressrechnung, Mapping | 4 | 03 |
 
 **Phase 1** liefert einen `lspci`-Klon als Beispiel — nachweisbar auf jedem
 Linux ohne IOMMU, ohne Treiber-Unbind, für Lesen sogar ohne root.
