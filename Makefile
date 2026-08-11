@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.15G
-VERSION_DATE := 2026-08-10
+VERSION   := 1.0.16A
+VERSION_DATE := 2026-08-11
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -421,6 +421,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Schmale Schreibzugriffe und fn-Zeiger-Konvention (12 Pruefungen) ---"
 	@bash tests/narrow_store_test.sh
+	@echo "OK"
+	@echo "--- Array-Deklarationen: leeres Literal, append, mehrdimensional (11 Pruefungen) ---"
+	@bash tests/array_decl_test.sh
 	@echo "OK"
 	@echo "--- TextMate-Grammatik: Schluesselwoerter und Typen vollstaendig ---"
 	@bash tests/syntax/test_grammar.sh
