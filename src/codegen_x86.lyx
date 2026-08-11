@@ -87,6 +87,7 @@ con CGN_CLOSURE:     int64 := 54;  // WP-13: closure { fn ptr, captured env }
 // #1113: Bereichsmuster; iVal = untere Grenze, c1 = obere Grenze oder -1.
 con CGN_PATTERN_RANGE: int64 := 131;
 con CGN_PATTERN_TUPLE: int64 := 132; // #1250: `case (1, 2)`; c0 = erstes Teilmuster, iVal = Anzahl
+con CGN_CAPABILITY_ATTR: int64 := 110; // #1287: @cap(...)/@capabilities(...) — haengt bei `extern fn` in c2
 con CGN_MATCH:       int64 := 64;  // WP-15: match expr { cases }
 con CGN_NAMED_ARG:   int64 := 108; // WP-MEM-05: named call arg; nc0=value
 con CGN_MATCH_CASE:  int64 := 65;  // WP-15: case pattern => expr
@@ -9050,6 +9051,13 @@ pub type Codegen = class {
     } else if (self.cg_seq(fname, fnlen, "sys_gettimeofday", 16)) {
       // gettimeofday(tv, tz): int64 -- syscall 96
       self.cg_movRaxImm(96); self.cg_e8(0x0F); self.cg_e8(0x05);
+    } else if (self.cg_seq(fname, fnlen, "sys_clock_gettime", 17)) {
+      // clock_gettime(clockid, timespec*): int64 -- syscall 228.
+      // #1179: DIE Zeitquelle unter `system.time` — der seccomp-Filter laesst
+      // fuer diese Capability genau 228 durch, `gettimeofday` (96) und `time`
+      // (201) dagegen nicht. Ohne dieses Builtin blieb der stdlib nur ein
+      // libc-Symbol, und genau daran haengt #1179.
+      self.cg_movRaxImm(228); self.cg_e8(0x0F); self.cg_e8(0x05);
     } else if (self.cg_seq(fname, fnlen, "sys_timerfd_create", 18)) {
       // timerfd_create(clockid, flags): int64 -- syscall 283
       self.cg_movRaxImm(283); self.cg_e8(0x0F); self.cg_e8(0x05);
@@ -15060,7 +15068,19 @@ pub type Codegen = class {
         // distinguishes externs from @export functions, which share iVal==1
         // but always carry a body.
         var libPacked: int64 := self.cg_nc3(cur);
-        if (self.cg_nc2(cur) == -1 && libPacked != -1) {
+        // #1287: c2 traegt den RUMPF — bei `extern fn` gibt es keinen, also -1.
+        // Steht aber ein `@cap(...)` an der Deklaration, legt der Parser dort
+        // die Annotation ab. Der Test "c2 == -1" las das als "hat einen Rumpf",
+        // die Deklaration lief in cg_genFuncDecl und wurde als LEERE Funktion
+        // emittiert: der Aufruf traf sie, tat nichts und lieferte 0 — kein
+        // DT_NEEDED, kein PLT-Eintrag, das Binary blieb statisch. Genau die
+        // Annotation, mit der jemand sagt "ich weiss, was ich tue", schaltete
+        // den FFI-Aufruf also ab.
+        var exBody: int64 := self.cg_nc2(cur);
+        var exHasBody: int64 := 1;
+        if (exBody == -1) { exHasBody := 0; }
+        else if (self.cg_nkind(exBody) == CGN_CAPABILITY_ATTR) { exHasBody := 0; }
+        if (exHasBody == 0 && libPacked != -1) {
           var libOff: int64 := libPacked & 0xFFFFFFFF;
           var libLen: int64 := (libPacked >> 32) & 0xFFFFFFFF;
           if (libLen > 0) {
@@ -16501,7 +16521,7 @@ pub type Codegen = class {
     score += 5;
     EPrintStr("Sicherheits-Score: "c);
     EPrintInt(score);
-    EPrintStrLn("/45  (PIE +0)"c);
+    EPrintStrLn("/35  (PIE +0, Grant-Modell unbewertet -- #1231)"c);
     EPrintStrLn("  +10: Kein Klasse-3-Extern ohne system.unsafe.format_string"c);
     if self.lcbsWxActive != 0 {
       EPrintStrLn("  + 5: W^X aktiv (zwei PT_LOAD: RX + RW)"c);
@@ -16514,14 +16534,13 @@ pub type Codegen = class {
       EPrintStrLn("  + 0: RELRO fehlt (kein PT_GNU_RELRO — dynamisch)"c);
     }
     EPrintStrLn("  + 0: PIE  (nicht implementiert)"c);
+    // #1231: unbewertet, siehe audit_compute_score. Die Zeile bleibt stehen,
+    // damit sichtbar ist, was deklariert wurde — sie zaehlt nur nicht mehr mit.
     if self.lcbsMissingGrants == 0 {
-      EPrintStrLn("  +10: Grant-Modell -- alle Imports haben explizites grant"c);
+      EPrintStrLn("  + 0: Grant-Modell -- alle Imports mit grant, aber NICHT erzwungen (#1231)"c);
     } else {
-      var gs: int64 := 10 - self.lcbsMissingGrants * 2;
-      if gs < 0 { gs := 0; }
-      EPrintStr("  +"c); EPrintInt(gs);
-      EPrintStr(": Grant-Modell -- "c); EPrintInt(self.lcbsMissingGrants);
-      EPrintStrLn(" Import(e) ohne grant (-2 pro fehlendem grant)"c);
+      EPrintStr("  + 0: Grant-Modell -- "c); EPrintInt(self.lcbsMissingGrants);
+      EPrintStrLn(" Import(e) ohne grant; grant wird ohnehin nicht erzwungen (#1231)"c);
     }
     if seccompOk != 0 {
       EPrintStrLn("  + 5: seccomp aktiv"c);
