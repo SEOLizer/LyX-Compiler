@@ -1,0 +1,383 @@
+// std/hardware/pci_irq.lyx
+// PCI-10: Interrupts eines VFIO-Geraets im Benutzerland empfangen.
+//
+// Ein Interrupt erreicht ein Programm im Benutzerland nicht als Signal,
+// sondern als Zaehler auf einem eventfd: der Kernel nimmt den Interrupt
+// entgegen und erhoeht den Zaehler, das Programm wartet mit poll() darauf.
+// Damit ist Warten unterbrechbar, mehrere Quellen sind zusammen
+// beobachtbar, und nichts laeuft in Signalkontext.
+//
+// Der Weg dahin ist VFIO_DEVICE_SET_IRQS mit einer Struktur variabler
+// Laenge:
+//
+//   vfio_irq_set {
+//     u32 argsz; u32 flags; u32 index; u32 start; u32 count;
+//     u8  data[];        // je nach flags: nichts, Bools oder eventfds
+//   }
+//
+// Wichtig und leicht zu uebersehen: ein Geraet hat je Typ (INTx, MSI,
+// MSI-X) eine eigene Vektorliste, und es darf immer nur EIN Typ zugleich
+// aktiv sein. Wer MSI-X einschaltet, ohne INTx abzuschalten, bekommt vom
+// Kernel eine Absage — die hier durchgereicht und nicht verschluckt wird.
+
+@description("PCI interrupt handling via VFIO eventfd")
+@author("Andreas Roene")
+unit std.hardware.pci_irq;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.hardware.pci_vfio;
+import std.alloc;
+
+// ============================================================
+// Konstanten
+// ============================================================
+
+// IRQ-Typen (Index in VFIO_DEVICE_GET_IRQ_INFO)
+pub con VFIO_PCI_INTX_IRQ_INDEX: int64 := 0;
+pub con VFIO_PCI_MSI_IRQ_INDEX:  int64 := 1;
+pub con VFIO_PCI_MSIX_IRQ_INDEX: int64 := 2;
+pub con VFIO_PCI_ERR_IRQ_INDEX:  int64 := 3;
+pub con VFIO_PCI_REQ_IRQ_INDEX:  int64 := 4;
+pub con VFIO_PCI_NUM_IRQS:       int64 := 5;
+
+// vfio_irq_info.flags
+pub con VFIO_IRQ_INFO_EVENTFD:    int64 := 1;
+pub con VFIO_IRQ_INFO_MASKABLE:   int64 := 2;
+pub con VFIO_IRQ_INFO_AUTOMASKED: int64 := 4;
+pub con VFIO_IRQ_INFO_NORESIZE:   int64 := 8;
+
+// vfio_irq_set.flags
+pub con VFIO_IRQ_SET_DATA_NONE:    int64 := 1;
+pub con VFIO_IRQ_SET_DATA_BOOL:    int64 := 2;
+pub con VFIO_IRQ_SET_DATA_EVENTFD: int64 := 4;
+pub con VFIO_IRQ_SET_ACTION_MASK:    int64 := 8;
+pub con VFIO_IRQ_SET_ACTION_UNMASK:  int64 := 16;
+pub con VFIO_IRQ_SET_ACTION_TRIGGER: int64 := 32;
+
+// poll
+pub con PCI_POLLIN: int64 := 1;
+
+// Groesse der festen Felder von vfio_irq_set
+con IRQ_SET_HEADER: int64 := 20;
+
+// Eine sinnvolle Obergrenze: mehr als 2048 MSI-X-Vektoren sieht der
+// Standard nicht vor.
+pub con PCI_IRQ_MAX_VECTORS: int64 := 2048;
+
+// ============================================================
+// Auskunft ueber die Interruptquellen
+//
+// vfio_irq_info { u32 argsz; u32 flags; u32 index; u32 count; }
+// ============================================================
+
+pub fn PciIrqInfo(ctx: int64, index: int64, out: int64): int64 {
+  if (ctx <= 0 || out == 0) { return PCI_E_BADARG; }
+  if (index < 0 || index >= PciVfioNumIrqs(ctx)) { return PCI_E_BADARG; }
+  poke32(out,      16);
+  poke32(out + 4,  0);
+  poke32(out + 8,  index);
+  poke32(out + 12, 0);
+  if (PciIoctl(PciVfioDeviceFd(ctx), VFIO_DEVICE_GET_IRQ_INFO, out) < 0) { return PCI_E_IO; }
+  return 0;
+}
+
+// Wie viele Vektoren dieses Typs hat das Geraet? 0 heisst: keine.
+pub fn PciIrqCount(ctx: int64, index: int64): int64 {
+  var buf: int64 := alloc(16);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var rc: int64 := PciIrqInfo(ctx, index, buf);
+  var count: int64 := 0;
+  if (rc == 0) { count := peek32(buf + 12) & 4294967295; }
+  free(buf, 16);
+  if (rc < 0) { return rc; }
+  return count;
+}
+
+pub fn PciIrqFlags(ctx: int64, index: int64): int64 {
+  var buf: int64 := alloc(16);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var rc: int64 := PciIrqInfo(ctx, index, buf);
+  var flags: int64 := 0;
+  if (rc == 0) { flags := peek32(buf + 4) & 4294967295; }
+  free(buf, 16);
+  if (rc < 0) { return rc; }
+  return flags;
+}
+
+pub fn PciIrqIsMaskable(ctx: int64, index: int64): int64 {
+  var f: int64 := PciIrqFlags(ctx, index);
+  if (f < 0) { return f; }
+  if ((f & VFIO_IRQ_INFO_MASKABLE) != 0) { return 1; }
+  return 0;
+}
+
+pub fn PciIrqTypeName(index: int64): pchar {
+  if (index == VFIO_PCI_INTX_IRQ_INDEX) { return "INTx"; }
+  if (index == VFIO_PCI_MSI_IRQ_INDEX)  { return "MSI"; }
+  if (index == VFIO_PCI_MSIX_IRQ_INDEX) { return "MSI-X"; }
+  if (index == VFIO_PCI_ERR_IRQ_INDEX)  { return "PCIe error"; }
+  if (index == VFIO_PCI_REQ_IRQ_INDEX)  { return "device request"; }
+  return "unknown IRQ type";
+}
+
+// Waehlt den besten verfuegbaren Typ: MSI-X vor MSI vor INTx.
+// Kein Typ vorhanden: PCI_E_NODEV.
+pub fn PciIrqBestType(ctx: int64): int64 {
+  if (PciIrqCount(ctx, VFIO_PCI_MSIX_IRQ_INDEX) > 0) { return VFIO_PCI_MSIX_IRQ_INDEX; }
+  if (PciIrqCount(ctx, VFIO_PCI_MSI_IRQ_INDEX) > 0)  { return VFIO_PCI_MSI_IRQ_INDEX; }
+  if (PciIrqCount(ctx, VFIO_PCI_INTX_IRQ_INDEX) > 0) { return VFIO_PCI_INTX_IRQ_INDEX; }
+  return PCI_E_NODEV;
+}
+
+// ============================================================
+// eventfd
+// ============================================================
+
+// Erzeugt einen eventfd (Startwert 0, blockierend).
+pub fn PciIrqEventFd(): int64 {
+  var fd: int64 := sys_eventfd2(0, 0);
+  if (fd < 0) { return PCI_E_IO; }
+  return fd;
+}
+
+// Nicht blockierender eventfd (EFD_NONBLOCK = 0x800).
+pub fn PciIrqEventFdNonblock(): int64 {
+  var fd: int64 := sys_eventfd2(0, 2048);
+  if (fd < 0) { return PCI_E_IO; }
+  return fd;
+}
+
+// ============================================================
+// Vektoren einrichten
+// ============================================================
+
+// Verbindet count Vektoren ab start mit den eventfds in fds (Array von
+// int64, je Eintrag ein Deskriptor; -1 laesst einen Vektor unbelegt).
+//
+// Der Kernel erwartet die Deskriptoren als 32-Bit-Werte hintereinander,
+// nicht als 64-Bit — deshalb wird umgepackt.
+pub fn PciIrqSetEventFds(ctx: int64, index: int64, start: int64, count: int64, fds: int64): int64 {
+  if (ctx <= 0 || fds == 0) { return PCI_E_BADARG; }
+  if (index < 0 || index >= PciVfioNumIrqs(ctx)) { return PCI_E_BADARG; }
+  if (count <= 0 || count > PCI_IRQ_MAX_VECTORS) { return PCI_E_BADARG; }
+  if (start < 0) { return PCI_E_BADARG; }
+
+  var have: int64 := PciIrqCount(ctx, index);
+  if (have < 0) { return have; }
+  if ((start + count) > have) { return PCI_E_RANGE; }
+
+  var size: int64 := IRQ_SET_HEADER + count * 4;
+  var req: int64 := alloc(size);
+  if (req == 0) { return PCI_E_NOMEM; }
+  poke32(req,      size);
+  poke32(req + 4,  VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER);
+  poke32(req + 8,  index);
+  poke32(req + 12, start);
+  poke32(req + 16, count);
+
+  var i: int64 := 0;
+  while (i < count) {
+    poke32(req + IRQ_SET_HEADER + i * 4, peek64(fds + i * 8) & 4294967295);
+    i := i + 1;
+  }
+
+  var rc: int64 := PciIoctl(PciVfioDeviceFd(ctx), VFIO_DEVICE_SET_IRQS, req);
+  free(req, size);
+  if (rc < 0) { return PCI_E_IO; }
+  return 0;
+}
+
+// Bequemer Fall: ein einzelner Vektor.
+pub fn PciIrqSetEventFd(ctx: int64, index: int64, vector: int64, fd: int64): int64 {
+  var one: int64 := alloc(8);
+  if (one == 0) { return PCI_E_NOMEM; }
+  poke64(one, fd);
+  var rc: int64 := PciIrqSetEventFds(ctx, index, vector, 1, one);
+  free(one, 8);
+  return rc;
+}
+
+// Schaltet alle Vektoren eines Typs ab. Notwendig, bevor ein anderer Typ
+// eingeschaltet wird — zwei Typen zugleich laesst der Kernel nicht zu.
+pub fn PciIrqDisable(ctx: int64, index: int64): int64 {
+  if (ctx <= 0) { return PCI_E_BADARG; }
+  if (index < 0 || index >= PciVfioNumIrqs(ctx)) { return PCI_E_BADARG; }
+  var req: int64 := alloc(IRQ_SET_HEADER);
+  if (req == 0) { return PCI_E_NOMEM; }
+  poke32(req,      IRQ_SET_HEADER);
+  poke32(req + 4,  VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER);
+  poke32(req + 8,  index);
+  poke32(req + 12, 0);
+  poke32(req + 16, 0);
+  var rc: int64 := PciIoctl(PciVfioDeviceFd(ctx), VFIO_DEVICE_SET_IRQS, req);
+  free(req, IRQ_SET_HEADER);
+  if (rc < 0) { return PCI_E_IO; }
+  return 0;
+}
+
+// Maskiert oder demaskiert einen Vektor. Nur bei Typen mit
+// VFIO_IRQ_INFO_MASKABLE moeglich; sonst PCI_E_NOTSUP statt eines
+// vorgetaeuschten Erfolgs.
+fn maskSet(ctx: int64, index: int64, vector: int64, mask: int64): int64 {
+  if (ctx <= 0) { return PCI_E_BADARG; }
+  if (index < 0 || index >= PciVfioNumIrqs(ctx)) { return PCI_E_BADARG; }
+  if (PciIrqIsMaskable(ctx, index) != 1) { return PCI_E_NOTSUP; }
+
+  var action: int64 := VFIO_IRQ_SET_ACTION_UNMASK;
+  if (mask == 1) { action := VFIO_IRQ_SET_ACTION_MASK; }
+
+  var req: int64 := alloc(IRQ_SET_HEADER);
+  if (req == 0) { return PCI_E_NOMEM; }
+  poke32(req,      IRQ_SET_HEADER);
+  poke32(req + 4,  VFIO_IRQ_SET_DATA_NONE | action);
+  poke32(req + 8,  index);
+  poke32(req + 12, vector);
+  poke32(req + 16, 1);
+  var rc: int64 := PciIoctl(PciVfioDeviceFd(ctx), VFIO_DEVICE_SET_IRQS, req);
+  free(req, IRQ_SET_HEADER);
+  if (rc < 0) { return PCI_E_IO; }
+  return 0;
+}
+
+pub fn PciIrqMask(ctx: int64, index: int64, vector: int64): int64 {
+  return maskSet(ctx, index, vector, 1);
+}
+
+pub fn PciIrqUnmask(ctx: int64, index: int64, vector: int64): int64 {
+  return maskSet(ctx, index, vector, 0);
+}
+
+// ============================================================
+// Warten
+// ============================================================
+
+// Wartet bis zu timeoutMs Millisekunden auf einen Interrupt.
+// Rueckgabe: Anzahl der seit dem letzten Abholen aufgelaufenen Interrupts
+// (der eventfd-Zaehler), 0 bei Zeitablauf, negativ bei Fehler.
+//
+// Der Zaehler ist wichtig: waehrend das Programm anderswo war, koennen
+// mehrere Interrupts eingetroffen sein. Wer nur "es gab einen" meldet,
+// verliert die uebrigen.
+pub fn PciIrqWait(fd: int64, timeoutMs: int64): int64 {
+  if (fd < 0) { return PCI_E_BADARG; }
+
+  // struct pollfd { int fd; short events; short revents; } — 8 Bytes
+  var pfd: int64 := alloc(8);
+  if (pfd == 0) { return PCI_E_NOMEM; }
+  poke32(pfd, fd);
+  poke16(pfd + 4, PCI_POLLIN);
+  poke16(pfd + 6, 0);
+
+  var rc: int64 := sys_poll(pfd, 1, timeoutMs);
+  var revents: int64 := peek16(pfd + 6);
+  free(pfd, 8);
+
+  if (rc < 0) { return PCI_E_IO; }
+  if (rc == 0) { return 0; }               // Zeitablauf
+  if ((revents & PCI_POLLIN) == 0) { return PCI_E_IO; }
+
+  // eventfd liefert genau acht Bytes: den Zaehler.
+  var buf: int64 := alloc(8);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  poke64(buf, 0);
+  var n: int64 := read(fd, buf as pchar, 8);
+  var count: int64 := peek64(buf);
+  free(buf, 8);
+  if (n != 8) { return PCI_E_IO; }
+  return count;
+}
+
+// Wartet auf den ersten von mehreren eventfds.
+// Rueckgabe: Index im Array (>= 0), PCI_E_NODEV bei Zeitablauf.
+// Der Zaehler wird dabei NICHT abgeholt — das erledigt der Aufrufer mit
+// PciIrqWait(fds[i], 0) fuer den gemeldeten Deskriptor.
+pub fn PciIrqWaitAny(fds: int64, count: int64, timeoutMs: int64): int64 {
+  if (fds == 0 || count <= 0 || count > PCI_IRQ_MAX_VECTORS) { return PCI_E_BADARG; }
+
+  var pfds: int64 := alloc(count * 8);
+  if (pfds == 0) { return PCI_E_NOMEM; }
+  var i: int64 := 0;
+  while (i < count) {
+    poke32(pfds + i * 8, peek64(fds + i * 8) & 4294967295);
+    poke16(pfds + i * 8 + 4, PCI_POLLIN);
+    poke16(pfds + i * 8 + 6, 0);
+    i := i + 1;
+  }
+
+  var rc: int64 := sys_poll(pfds, count, timeoutMs);
+  var found: int64 := PCI_E_NODEV;
+  if (rc > 0) {
+    var k: int64 := 0;
+    while (k < count && found < 0) {
+      if ((peek16(pfds + k * 8 + 6) & PCI_POLLIN) != 0) { found := k; }
+      k := k + 1;
+    }
+  }
+  free(pfds, count * 8);
+  if (rc < 0) { return PCI_E_IO; }
+  return found;
+}
+
+// Holt einen anstehenden Zaehler ab, ohne zu warten. 0 = nichts da.
+pub fn PciIrqPoll(fd: int64): int64 {
+  return PciIrqWait(fd, 0);
+}
+
+// ============================================================
+// Bequemer Gesamtaufbau
+// ============================================================
+
+// Richtet count Vektoren des besten verfuegbaren Typs ein und legt die
+// erzeugten eventfds als int64-Array in fdsOut ab (Aufrufer stellt Platz
+// fuer count Eintraege).
+// Rueckgabe: der benutzte IRQ-Typ (Index) oder ein Fehlercode.
+//
+// Schlaegt das Einrichten fehl, werden die bereits erzeugten Deskriptoren
+// wieder geschlossen — ein halb eingerichteter Zustand mit lecken
+// Deskriptoren waere schlimmer als ein sauberer Fehlschlag.
+pub fn PciIrqEnable(ctx: int64, count: int64, fdsOut: int64): int64 {
+  if (ctx <= 0 || fdsOut == 0) { return PCI_E_BADARG; }
+  if (count <= 0 || count > PCI_IRQ_MAX_VECTORS) { return PCI_E_BADARG; }
+
+  var index: int64 := PciIrqBestType(ctx);
+  if (index < 0) { return index; }
+
+  var have: int64 := PciIrqCount(ctx, index);
+  if (have < count) { return PCI_E_RANGE; }
+
+  var i: int64 := 0;
+  var ok: int64 := 1;
+  while (i < count && ok == 1) {
+    var fd: int64 := PciIrqEventFd();
+    if (fd < 0) { ok := 0; } else { poke64(fdsOut + i * 8, fd); i := i + 1; }
+  }
+  if (ok == 0) {
+    var k: int64 := 0;
+    while (k < i) { PciCloseFile(peek64(fdsOut + k * 8)); k := k + 1; }
+    return PCI_E_IO;
+  }
+
+  var rc: int64 := PciIrqSetEventFds(ctx, index, 0, count, fdsOut);
+  if (rc < 0) {
+    var j: int64 := 0;
+    while (j < count) { PciCloseFile(peek64(fdsOut + j * 8)); j := j + 1; }
+    return rc;
+  }
+  return index;
+}
+
+// Gegenstueck zu PciIrqEnable.
+pub fn PciIrqDisableAll(ctx: int64, index: int64, count: int64, fds: int64): int64 {
+  var rc: int64 := PciIrqDisable(ctx, index);
+  if (fds != 0) {
+    var i: int64 := 0;
+    while (i < count) {
+      var fd: int64 := peek64(fds + i * 8);
+      if (fd > 0) { PciCloseFile(fd); }
+      poke64(fds + i * 8, 0);
+      i := i + 1;
+    }
+  }
+  return rc;
+}

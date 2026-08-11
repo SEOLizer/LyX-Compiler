@@ -1,0 +1,562 @@
+// std/hardware/pci_vfio.lyx
+// PCI-09: Geraete ueber VFIO betreiben — Regionen, DMA, Ruecksetzen.
+//
+// VFIO gibt einem Programm im Benutzerland ein PCI-Geraet vollstaendig in
+// die Hand, ohne dass es dabei den Rest des Systems beschaedigen kann: die
+// IOMMU begrenzt, welchen Speicher das Geraet per DMA erreicht. Der Preis
+// ist eine feste Reihenfolge, die eingehalten werden muss:
+//
+//   1. /dev/vfio/vfio oeffnen                     (Container)
+//   2. /dev/vfio/<gruppe> oeffnen                 (Gruppe)
+//   3. Gruppe pruefen: VIABLE?                    (sonst haengt noch ein
+//                                                  Geraet der Gruppe an
+//                                                  einem Kerneltreiber)
+//   4. VFIO_GROUP_SET_CONTAINER
+//   5. VFIO_SET_IOMMU (Typ 1)                     — erst NACH Schritt 4,
+//                                                  vorher scheitert er
+//   6. VFIO_GROUP_GET_DEVICE_FD
+//
+// Diese Unit bindet nichts selbst an vfio-pci um. Das ist Sache des
+// Betreibers: einem laufenden System die Hardware unter dem Treiber
+// wegzuziehen ist keine Nebenwirkung, die eine Bibliothek verursachen darf.
+
+@description("VFIO device access: regions, DMA mapping, reset")
+@author("Andreas Roene")
+unit std.hardware.pci_vfio;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.alloc;
+
+// ============================================================
+// ioctl-Nummern
+//
+// Alle VFIO-ioctls sind _IO(';', 100 + n) — ohne Groessenanteil, also
+// schlicht (0x3B << 8) | (100 + n).
+// ============================================================
+
+pub con VFIO_GET_API_VERSION:       int64 := 0x3B64;
+pub con VFIO_CHECK_EXTENSION:       int64 := 0x3B65;
+pub con VFIO_SET_IOMMU:             int64 := 0x3B66;
+pub con VFIO_GROUP_GET_STATUS:      int64 := 0x3B67;
+pub con VFIO_GROUP_SET_CONTAINER:   int64 := 0x3B68;
+pub con VFIO_GROUP_UNSET_CONTAINER: int64 := 0x3B69;
+pub con VFIO_GROUP_GET_DEVICE_FD:   int64 := 0x3B6A;
+pub con VFIO_DEVICE_GET_INFO:       int64 := 0x3B6B;
+pub con VFIO_DEVICE_GET_REGION_INFO: int64 := 0x3B6C;
+pub con VFIO_DEVICE_GET_IRQ_INFO:   int64 := 0x3B6D;
+pub con VFIO_DEVICE_SET_IRQS:       int64 := 0x3B6E;
+pub con VFIO_DEVICE_RESET:          int64 := 0x3B6F;
+pub con VFIO_IOMMU_GET_INFO:        int64 := 0x3B70;
+pub con VFIO_IOMMU_MAP_DMA:         int64 := 0x3B71;
+pub con VFIO_IOMMU_UNMAP_DMA:       int64 := 0x3B72;
+
+pub con VFIO_API_VERSION:   int64 := 0;
+pub con VFIO_TYPE1_IOMMU:   int64 := 1;
+pub con VFIO_TYPE1v2_IOMMU: int64 := 3;
+
+// vfio_group_status.flags
+pub con VFIO_GROUP_FLAGS_VIABLE:        int64 := 1;
+pub con VFIO_GROUP_FLAGS_CONTAINER_SET: int64 := 2;
+
+// vfio_device_info.flags
+pub con VFIO_DEVICE_FLAGS_RESET: int64 := 1;
+pub con VFIO_DEVICE_FLAGS_PCI:   int64 := 2;
+
+// vfio_region_info.flags
+pub con VFIO_REGION_INFO_FLAG_READ:  int64 := 1;
+pub con VFIO_REGION_INFO_FLAG_WRITE: int64 := 2;
+pub con VFIO_REGION_INFO_FLAG_MMAP:  int64 := 4;
+
+// Regionen eines PCI-Geraets
+pub con VFIO_PCI_BAR0_REGION_INDEX:   int64 := 0;
+pub con VFIO_PCI_ROM_REGION_INDEX:    int64 := 6;
+pub con VFIO_PCI_CONFIG_REGION_INDEX: int64 := 7;
+pub con VFIO_PCI_VGA_REGION_INDEX:    int64 := 8;
+pub con VFIO_PCI_NUM_REGIONS:         int64 := 9;
+
+// DMA-Richtungen
+pub con VFIO_DMA_MAP_FLAG_READ:  int64 := 1;   // Geraet darf lesen
+pub con VFIO_DMA_MAP_FLAG_WRITE: int64 := 2;   // Geraet darf schreiben
+
+pub con VFIO_GROUP_PATH_MAX: int64 := 64;
+
+// ============================================================
+// Kontext (heap-allokiert, 64 Bytes)
+//   +0   Container-fd
+//   +8   Gruppen-fd
+//   +16  Geraete-fd
+//   +24  Gruppennummer
+//   +32  Anzahl Regionen (aus VFIO_DEVICE_GET_INFO)
+//   +40  Anzahl IRQ-Typen
+//   +48  Geraete-Flags
+//   +56  naechste freie IOVA (Bump-Allokator)
+// ============================================================
+
+pub con PCI_VFIO_CTX_SIZE: int64 := 64;
+
+// Der IOVA-Raum beginnt bewusst nicht bei 0: viele Geraete behandeln die
+// Adresse 0 als "kein Puffer", und ein Fehler faellt so eher auf.
+pub con PCI_VFIO_IOVA_BASE: int64 := 0x10000000;
+
+pub fn PciVfioContainerFd(ctx: int64): int64 { return peek64(ctx); }
+pub fn PciVfioGroupFd(ctx: int64): int64     { return peek64(ctx + 8); }
+pub fn PciVfioDeviceFd(ctx: int64): int64    { return peek64(ctx + 16); }
+pub fn PciVfioGroupNum(ctx: int64): int64    { return peek64(ctx + 24); }
+pub fn PciVfioNumRegions(ctx: int64): int64  { return peek64(ctx + 32); }
+pub fn PciVfioNumIrqs(ctx: int64): int64     { return peek64(ctx + 40); }
+pub fn PciVfioDeviceFlags(ctx: int64): int64 { return peek64(ctx + 48); }
+
+// ============================================================
+// IOMMU-Gruppe eines Geraets ermitteln
+// ============================================================
+
+// Liest /sys/bus/pci/devices/<bdf>/iommu_group — ein Symlink, dessen
+// letzter Pfadbestandteil die Gruppennummer ist.
+// Rueckgabe: Nummer, PCI_E_NOIOMMU wenn der Symlink fehlt (dann laeuft der
+// Kernel ohne IOMMU, und VFIO waere ohnehin nicht benutzbar).
+pub fn PciVfioGroupOf(bdf: int64): int64 {
+  var path: int64 := alloc(PCI_PATH_MAX);
+  if (path == 0) { return PCI_E_NOMEM; }
+  var r: int64 := PciSysfsPath(path, bdf, "iommu_group");
+  if (r < 0) { free(path, PCI_PATH_MAX); return r; }
+
+  var target: int64 := alloc(PCI_PATH_MAX);
+  if (target == 0) { free(path, PCI_PATH_MAX); return PCI_E_NOMEM; }
+  var n: int64 := readlink(path as pchar, target as pchar, PCI_PATH_MAX - 1);
+  free(path, PCI_PATH_MAX);
+  if (n <= 0) { free(target, PCI_PATH_MAX); return PCI_E_NOIOMMU; }
+  poke8(target + n, 0);
+
+  // Letzten '/'-Abschnitt als Dezimalzahl lesen.
+  var i: int64 := n - 1;
+  while (i >= 0 && peek8(target + i) != 47) { i := i - 1; }
+  var pos: int64 := i + 1;
+  var val: int64 := 0;
+  var digits: int64 := 0;
+  while (pos < n) {
+    var c: int64 := peek8(target + pos);
+    if (c < 48 || c > 57) { free(target, PCI_PATH_MAX); return PCI_E_IO; }
+    val := val * 10 + (c - 48);
+    digits := digits + 1;
+    pos := pos + 1;
+  }
+  free(target, PCI_PATH_MAX);
+  if (digits == 0) { return PCI_E_IO; }
+  return val;
+}
+
+// "/dev/vfio/<nummer>"
+fn groupPath(dest: int64, group: int64): int64 {
+  var p: int64 := PciStrAppend(dest, 0, VFIO_GROUP_PATH_MAX, "/dev/vfio/");
+  // Dezimal anhaengen
+  if (group == 0) { poke8(dest + p, 48); p := p + 1; }
+  else {
+    var digits: int64 := 0;
+    var tmp: int64 := group;
+    while (tmp > 0) { digits := digits + 1; tmp := tmp / 10; }
+    var i: int64 := digits - 1;
+    while (i >= 0) {
+      var div: int64 := 1;
+      var k: int64 := 0;
+      while (k < i) { div := div * 10; k := k + 1; }
+      poke8(dest + p, 48 + ((group / div) % 10));
+      p := p + 1;
+      i := i - 1;
+    }
+  }
+  poke8(dest + p, 0);
+  return p;
+}
+
+// ============================================================
+// Oeffnen
+// ============================================================
+
+// Oeffnet Container, Gruppe und Geraet in der vorgeschriebenen Reihenfolge.
+//
+// Rueckgabe: Kontext oder negativer Fehlercode. Die Fehlerfaelle sind
+// bewusst unterscheidbar:
+//   PCI_E_NOIOMMU  kein /dev/vfio/vfio, kein iommu_group, oder die Gruppe
+//                  ist nicht VIABLE (ein Geraet der Gruppe haengt noch an
+//                  einem Kerneltreiber)
+//   PCI_E_PERM     Zugriff auf die Gruppendatei verweigert
+//   PCI_E_NOTSUP   Kernel spricht eine andere API-Version oder kennt
+//                  den Typ-1-IOMMU nicht
+pub fn PciVfioOpen(bdf: int64): int64 {
+  var group: int64 := PciVfioGroupOf(bdf);
+  if (group < 0) { return group; }
+
+  var container: int64 := PciOpenFile("/dev/vfio/vfio", PCI_O_RDWR);
+  if (container < 0) { return PCI_E_NOIOMMU; }
+
+  // Version pruefen, bevor irgendetwas anderes passiert: eine fremde
+  // Version bedeutet andere Strukturen, nicht bloss andere Zahlen.
+  if (PciIoctl(container, VFIO_GET_API_VERSION, 0) != VFIO_API_VERSION) {
+    PciCloseFile(container);
+    return PCI_E_NOTSUP;
+  }
+  if (PciIoctl(container, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU) != 1) {
+    PciCloseFile(container);
+    return PCI_E_NOTSUP;
+  }
+
+  var gpath: int64 := alloc(VFIO_GROUP_PATH_MAX);
+  if (gpath == 0) { PciCloseFile(container); return PCI_E_NOMEM; }
+  groupPath(gpath, group);
+  var gfd: int64 := PciOpenFile(gpath as pchar, PCI_O_RDWR);
+  free(gpath, VFIO_GROUP_PATH_MAX);
+  if (gfd < 0) { PciCloseFile(container); return PCI_E_PERM; }
+
+  // vfio_group_status { u32 argsz; u32 flags; }
+  var status: int64 := alloc(16);
+  if (status == 0) { PciCloseFile(gfd); PciCloseFile(container); return PCI_E_NOMEM; }
+  poke32(status, 8);
+  poke32(status + 4, 0);
+  if (PciIoctl(gfd, VFIO_GROUP_GET_STATUS, status) < 0) {
+    free(status, 16); PciCloseFile(gfd); PciCloseFile(container);
+    return PCI_E_IO;
+  }
+  var flags: int64 := peek32(status + 4) & 4294967295;
+  free(status, 16);
+  if ((flags & VFIO_GROUP_FLAGS_VIABLE) == 0) {
+    PciCloseFile(gfd); PciCloseFile(container);
+    return PCI_E_NOIOMMU;
+  }
+
+  var cfd: int64 := alloc(8);
+  if (cfd == 0) { PciCloseFile(gfd); PciCloseFile(container); return PCI_E_NOMEM; }
+  poke32(cfd, container);
+  var rc: int64 := PciIoctl(gfd, VFIO_GROUP_SET_CONTAINER, cfd);
+  free(cfd, 8);
+  if (rc < 0) { PciCloseFile(gfd); PciCloseFile(container); return PCI_E_IO; }
+
+  // Erst jetzt darf der IOMMU-Typ gesetzt werden.
+  if (PciIoctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) < 0) {
+    PciCloseFile(gfd); PciCloseFile(container);
+    return PCI_E_NOTSUP;
+  }
+
+  // Der Geraetename ist die BDF in Langform.
+  var name: int64 := alloc(PCI_BDF_STR_LEN);
+  if (name == 0) { PciCloseFile(gfd); PciCloseFile(container); return PCI_E_NOMEM; }
+  PciBdfFormat(name, bdf);
+  var dfd: int64 := PciIoctl(gfd, VFIO_GROUP_GET_DEVICE_FD, name);
+  free(name, PCI_BDF_STR_LEN);
+  if (dfd < 0) { PciCloseFile(gfd); PciCloseFile(container); return PCI_E_NODEV; }
+
+  // vfio_device_info { u32 argsz; u32 flags; u32 num_regions; u32 num_irqs; }
+  var info: int64 := alloc(32);
+  if (info == 0) {
+    PciCloseFile(dfd); PciCloseFile(gfd); PciCloseFile(container);
+    return PCI_E_NOMEM;
+  }
+  poke32(info, 16);
+  poke32(info + 4, 0);
+  poke32(info + 8, 0);
+  poke32(info + 12, 0);
+  if (PciIoctl(dfd, VFIO_DEVICE_GET_INFO, info) < 0) {
+    free(info, 32);
+    PciCloseFile(dfd); PciCloseFile(gfd); PciCloseFile(container);
+    return PCI_E_IO;
+  }
+  var dflags:  int64 := peek32(info + 4) & 4294967295;
+  var regions: int64 := peek32(info + 8) & 4294967295;
+  var irqs:    int64 := peek32(info + 12) & 4294967295;
+  free(info, 32);
+
+  var ctx: int64 := allocZeroed(PCI_VFIO_CTX_SIZE);
+  if (ctx == 0) {
+    PciCloseFile(dfd); PciCloseFile(gfd); PciCloseFile(container);
+    return PCI_E_NOMEM;
+  }
+  poke64(ctx,      container);
+  poke64(ctx + 8,  gfd);
+  poke64(ctx + 16, dfd);
+  poke64(ctx + 24, group);
+  poke64(ctx + 32, regions);
+  poke64(ctx + 40, irqs);
+  poke64(ctx + 48, dflags);
+  poke64(ctx + 56, PCI_VFIO_IOVA_BASE);
+  return ctx;
+}
+
+pub fn PciVfioOpenByPath(s: pchar): int64 {
+  var bdf: int64 := PciBdfParse(s);
+  if (bdf < 0) { return bdf; }
+  return PciVfioOpen(bdf);
+}
+
+// Reihenfolge umgekehrt zum Oeffnen: erst Geraet, dann Gruppe, dann
+// Container. Der Kernel gibt das Geraet erst frei, wenn der Geraete-fd zu
+// ist; ein zuerst geschlossener Container liesse es haengen.
+pub fn PciVfioClose(ctx: int64) {
+  if (ctx <= 0) { return; }
+  var dfd: int64 := peek64(ctx + 16);
+  var gfd: int64 := peek64(ctx + 8);
+  var cfd: int64 := peek64(ctx);
+  if (dfd > 0) { PciCloseFile(dfd); }
+  if (gfd > 0) { PciCloseFile(gfd); }
+  if (cfd > 0) { PciCloseFile(cfd); }
+  free(ctx, PCI_VFIO_CTX_SIZE);
+}
+
+// ============================================================
+// Regionen
+//
+// vfio_region_info {
+//   u32 argsz; u32 flags; u32 index; u32 cap_offset;
+//   u64 size;  u64 offset;
+// }  — 32 Bytes
+// ============================================================
+
+pub con VFIO_REGION_INFO_SIZE: int64 := 32;
+
+// Fuellt einen vom Aufrufer gestellten 32-Byte-Puffer.
+pub fn PciVfioRegionInfo(ctx: int64, index: int64, out: int64): int64 {
+  if (ctx <= 0 || out == 0) { return PCI_E_BADARG; }
+  if (index < 0 || index >= peek64(ctx + 32)) { return PCI_E_BADARG; }
+  poke32(out,      VFIO_REGION_INFO_SIZE);
+  poke32(out + 4,  0);
+  poke32(out + 8,  index);
+  poke32(out + 12, 0);
+  poke64(out + 16, 0);
+  poke64(out + 24, 0);
+  if (PciIoctl(peek64(ctx + 16), VFIO_DEVICE_GET_REGION_INFO, out) < 0) { return PCI_E_IO; }
+  return 0;
+}
+
+pub fn PciVfioRegionSize(ctx: int64, index: int64): int64 {
+  var buf: int64 := alloc(VFIO_REGION_INFO_SIZE);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var rc: int64 := PciVfioRegionInfo(ctx, index, buf);
+  var size: int64 := 0;
+  if (rc == 0) { size := peek64(buf + 16); }
+  free(buf, VFIO_REGION_INFO_SIZE);
+  if (rc < 0) { return rc; }
+  return size;
+}
+
+pub fn PciVfioRegionOffset(ctx: int64, index: int64): int64 {
+  var buf: int64 := alloc(VFIO_REGION_INFO_SIZE);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var rc: int64 := PciVfioRegionInfo(ctx, index, buf);
+  var off: int64 := 0;
+  if (rc == 0) { off := peek64(buf + 24); }
+  free(buf, VFIO_REGION_INFO_SIZE);
+  if (rc < 0) { return rc; }
+  return off;
+}
+
+pub fn PciVfioRegionFlags(ctx: int64, index: int64): int64 {
+  var buf: int64 := alloc(VFIO_REGION_INFO_SIZE);
+  if (buf == 0) { return PCI_E_NOMEM; }
+  var rc: int64 := PciVfioRegionInfo(ctx, index, buf);
+  var flags: int64 := 0;
+  if (rc == 0) { flags := peek32(buf + 4) & 4294967295; }
+  free(buf, VFIO_REGION_INFO_SIZE);
+  if (rc < 0) { return rc; }
+  return flags;
+}
+
+pub fn PciVfioRegionIsMappable(ctx: int64, index: int64): int64 {
+  var f: int64 := PciVfioRegionFlags(ctx, index);
+  if (f < 0) { return f; }
+  if ((f & VFIO_REGION_INFO_FLAG_MMAP) != 0) { return 1; }
+  return 0;
+}
+
+// Bildet eine Region ab. lenOut (Zeiger auf int64) erhaelt die Laenge.
+// Nicht jede Region ist abbildbar — der Config-Space etwa wird
+// ausschliesslich ueber Lesen/Schreiben zugaenglich gemacht, damit der
+// Kernel dort mitreden kann. Dieser Fall wird gemeldet, nicht umgangen.
+pub fn PciVfioMapRegion(ctx: int64, index: int64, lenOut: int64): int64 {
+  if (ctx <= 0) { return PCI_E_BADARG; }
+  var info: int64 := alloc(VFIO_REGION_INFO_SIZE);
+  if (info == 0) { return PCI_E_NOMEM; }
+  var rc: int64 := PciVfioRegionInfo(ctx, index, info);
+  if (rc < 0) { free(info, VFIO_REGION_INFO_SIZE); return rc; }
+
+  var flags: int64 := peek32(info + 4) & 4294967295;
+  var size:  int64 := peek64(info + 16);
+  var off:   int64 := peek64(info + 24);
+  free(info, VFIO_REGION_INFO_SIZE);
+
+  if ((flags & VFIO_REGION_INFO_FLAG_MMAP) == 0) { return PCI_E_NOTSUP; }
+  if (size == 0) { return PCI_E_NODEV; }
+
+  var addr: int64 := PciMmap(size, PCI_PROT_READ | PCI_PROT_WRITE,
+                             PCI_MAP_SHARED, peek64(ctx + 16), off);
+  if (addr == PCI_MAP_FAILED || addr == 0) { return PCI_E_PERM; }
+  mem_barrier();
+  if (lenOut != 0) { poke64(lenOut, size); }
+  return addr;
+}
+
+pub fn PciVfioUnmapRegion(addr: int64, len: int64): int64 {
+  if (addr <= 0 || len <= 0) { return PCI_E_BADARG; }
+  mem_barrier();
+  if (PciMunmap(addr, len) != 0) { return PCI_E_IO; }
+  return 0;
+}
+
+// ============================================================
+// Config-Space ueber VFIO
+//
+// Der Config-Space ist eine Region wie jede andere, nur nicht abbildbar:
+// gelesen und geschrieben wird an ihrem Offset im Geraete-fd. Ueber diesen
+// Weg steht er vollstaendig offen — auch die Capabilities, die sysfs einem
+// unprivilegierten Leser verweigert.
+// ============================================================
+
+pub fn PciVfioCfgRead(ctx: int64, off: int64, width: int64): int64 {
+  if (ctx <= 0) { return PCI_E_BADARG; }
+  if (width != 1 && width != 2 && width != 4) { return PCI_E_BADARG; }
+  if (off < 0) { return PCI_E_RANGE; }
+
+  // Die tatsaechliche Groesse steht in der Region — 256 Bytes bei reinem
+  // PCI, 4096 bei PCIe. Gegen eine feste Obergrenze zu pruefen liesse den
+  // Zugriff bis zum Lesefehler laufen und meldete dann PCI_E_IO, was nach
+  // einem Geraetefehler aussieht statt nach einem Programmierfehler.
+  var rsize: int64 := PciVfioRegionSize(ctx, VFIO_PCI_CONFIG_REGION_INDEX);
+  if (rsize < 0) { return rsize; }
+  if ((off + width) > rsize) { return PCI_E_RANGE; }
+
+  var base: int64 := PciVfioRegionOffset(ctx, VFIO_PCI_CONFIG_REGION_INDEX);
+  if (base < 0) { return base; }
+
+  var tmp: int64 := alloc(8);
+  if (tmp == 0) { return PCI_E_NOMEM; }
+  poke64(tmp, 0);
+  var n: int64 := PciPread(peek64(ctx + 16), tmp, width, base + off);
+  var v: int64 := 0;
+  if (width == 1) { v := peek8(tmp); }
+  if (width == 2) { v := peek16(tmp); }
+  if (width == 4) { v := peek32(tmp) & 4294967295; }
+  free(tmp, 8);
+  if (n != width) { return PCI_E_IO; }
+  return v;
+}
+
+pub fn PciVfioCfgWrite(ctx: int64, off: int64, val: int64, width: int64): int64 {
+  if (ctx <= 0) { return PCI_E_BADARG; }
+  if (width != 1 && width != 2 && width != 4) { return PCI_E_BADARG; }
+  if (off < 0) { return PCI_E_RANGE; }
+  var rsize: int64 := PciVfioRegionSize(ctx, VFIO_PCI_CONFIG_REGION_INDEX);
+  if (rsize < 0) { return rsize; }
+  if ((off + width) > rsize) { return PCI_E_RANGE; }
+
+  var base: int64 := PciVfioRegionOffset(ctx, VFIO_PCI_CONFIG_REGION_INDEX);
+  if (base < 0) { return base; }
+
+  var tmp: int64 := alloc(8);
+  if (tmp == 0) { return PCI_E_NOMEM; }
+  poke64(tmp, 0);
+  if (width == 1) { poke8(tmp, val & 255); }
+  if (width == 2) { poke16(tmp, val & 65535); }
+  if (width == 4) { poke32(tmp, val & 4294967295); }
+  var n: int64 := PciPwrite(peek64(ctx + 16), tmp, width, base + off);
+  free(tmp, 8);
+  if (n != width) { return PCI_E_PERM; }
+  return 0;
+}
+
+// ============================================================
+// DMA
+//
+// vfio_iommu_type1_dma_map {
+//   u32 argsz; u32 flags; u64 vaddr; u64 iova; u64 size;
+// }  — 32 Bytes
+// vfio_iommu_type1_dma_unmap {
+//   u32 argsz; u32 flags; u64 iova; u64 size;
+// }  — 32 Bytes (das letzte Feld ist Ausgabe)
+// ============================================================
+
+// Bildet einen bereits vorhandenen Speicherbereich in den IOMMU-Raum ab.
+// iova waehlt der Aufrufer; PciVfioDmaAlloc nimmt ihm das ab.
+pub fn PciVfioDmaMap(ctx: int64, vaddr: int64, iova: int64, size: int64, flags: int64): int64 {
+  if (ctx <= 0 || vaddr == 0 || size <= 0) { return PCI_E_BADARG; }
+  var req: int64 := alloc(32);
+  if (req == 0) { return PCI_E_NOMEM; }
+  poke32(req,      32);
+  poke32(req + 4,  flags);
+  poke64(req + 8,  vaddr);
+  poke64(req + 16, iova);
+  poke64(req + 24, size);
+  var rc: int64 := PciIoctl(peek64(ctx), VFIO_IOMMU_MAP_DMA, req);
+  free(req, 32);
+  if (rc < 0) { return PCI_E_IO; }
+  return 0;
+}
+
+pub fn PciVfioDmaUnmap(ctx: int64, iova: int64, size: int64): int64 {
+  if (ctx <= 0 || size <= 0) { return PCI_E_BADARG; }
+  var req: int64 := alloc(32);
+  if (req == 0) { return PCI_E_NOMEM; }
+  poke32(req,      32);
+  poke32(req + 4,  0);
+  poke64(req + 8,  iova);
+  poke64(req + 16, size);
+  poke64(req + 24, 0);
+  var rc: int64 := PciIoctl(peek64(ctx), VFIO_IOMMU_UNMAP_DMA, req);
+  free(req, 32);
+  if (rc < 0) { return PCI_E_IO; }
+  return 0;
+}
+
+// Besorgt Speicher und bildet ihn ab. iovaOut (Zeiger auf int64) erhaelt
+// die IOVA, unter der das Geraet den Puffer sieht.
+//
+// Der IOVA-Allokator ist ein Bump-Zaehler: er vergibt aufsteigend und gibt
+// nichts zurueck. Das genuegt fuer Puffer, die so lange leben wie das
+// Geraet; wer staendig auf- und abbaut, braucht eine Freiliste — dann aber
+// bewusst und nicht als stille Wiederverwendung, denn eine zu frueh neu
+// vergebene IOVA laesst ein Geraet in fremden Speicher schreiben.
+pub fn PciVfioDmaAlloc(ctx: int64, size: int64, iovaOut: int64): int64 {
+  if (ctx <= 0 || size <= 0) { return PCI_E_BADARG; }
+
+  // Auf Seitengroesse aufrunden — die IOMMU bildet nur ganze Seiten ab.
+  var aligned: int64 := ((size + 4095) / 4096) * 4096;
+
+  var buf: int64 := PciMmap(aligned, PCI_PROT_READ | PCI_PROT_WRITE,
+                            PCI_MAP_SHARED | PCI_MAP_ANON, -1, 0);
+  if (buf == PCI_MAP_FAILED || buf == 0) { return PCI_E_NOMEM; }
+
+  var iova: int64 := peek64(ctx + 56);
+  var rc: int64 := PciVfioDmaMap(ctx, buf, iova, aligned,
+                                 VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE);
+  if (rc < 0) { PciMunmap(buf, aligned); return rc; }
+
+  poke64(ctx + 56, iova + aligned);
+  if (iovaOut != 0) { poke64(iovaOut, iova); }
+  return buf;
+}
+
+pub fn PciVfioDmaFree(ctx: int64, vaddr: int64, iova: int64, size: int64): int64 {
+  if (ctx <= 0 || vaddr <= 0) { return PCI_E_BADARG; }
+  var aligned: int64 := ((size + 4095) / 4096) * 4096;
+  var rc: int64 := PciVfioDmaUnmap(ctx, iova, aligned);
+  PciMunmap(vaddr, aligned);
+  return rc;
+}
+
+// ============================================================
+// Ruecksetzen
+// ============================================================
+
+// Setzt das Geraet zurueck, sofern es das kann. Kann es das nicht, sagt
+// die Funktion das (PCI_E_NOTSUP) — ein stiller Erfolg waere hier
+// besonders teuer, weil der Aufrufer danach von einem definierten Zustand
+// ausgeht, den es nie gab.
+pub fn PciVfioReset(ctx: int64): int64 {
+  if (ctx <= 0) { return PCI_E_BADARG; }
+  if ((peek64(ctx + 48) & VFIO_DEVICE_FLAGS_RESET) == 0) { return PCI_E_NOTSUP; }
+  if (PciIoctl(peek64(ctx + 16), VFIO_DEVICE_RESET, 0) < 0) { return PCI_E_IO; }
+  return 0;
+}
+
+pub fn PciVfioIsPciDevice(ctx: int64): int64 {
+  if (ctx <= 0) { return PCI_E_BADARG; }
+  if ((peek64(ctx + 48) & VFIO_DEVICE_FLAGS_PCI) != 0) { return 1; }
+  return 0;
+}

@@ -5,8 +5,8 @@ ansteuern und (via VFIO) mit DMA und Interrupts betreiben — ohne C-FFI.
 
 **Ort:** `std/hardware/pci*.lyx`, Fassade `std/hardware/pci.lyx`
 **Branch-Namensschema:** `feat/pci-wp<nn>-<kürzel>`
-**Stand:** Phase 1 und Phase 2 umgesetzt (PCI-01..08). Offen: Phase 3
-(PCI-09/10, VFIO und Interrupts) und Phase 4 (PCI-11/12, Port-I/O und ECAM).
+**Stand:** Phase 1–3 umgesetzt (PCI-01..10). Offen: Phase 4 (PCI-11/12,
+Port-I/O und ECAM).
 
 ---
 
@@ -39,8 +39,8 @@ ergäbe etwas, das auf keinem normalen Linux-System nutzbar ist.
 | PCI-06 ✅ | `pci_caps.lyx` | Capability- und Extended-Capability-Liste, MSI/MSI-X, PCIe-Link | 2 | 03 |
 | PCI-07 ✅ | `pci_ids.lyx` | Namensauflösung Vendor/Device/Class aus `pci.ids` | 2 | 02 |
 | PCI-08 ✅ | `pci.lyx` | Fassade: `PciDevice`-Kontext, Öffnen/Suchen/Schließen | 2 | 03–07 |
-| PCI-09 | `pci_vfio.lyx` | Container/Group/Device, `VFIO_IOMMU_MAP_DMA`, DMA-Puffer | 3 | 08 |
-| PCI-10 | `pci_irq.lyx` | `VFIO_DEVICE_SET_IRQS`, eventfd-Warten, MSI-X-Vektortabelle | 3 | 09 |
+| PCI-09 ✅ | `pci_vfio.lyx` | Container/Group/Device, `VFIO_IOMMU_MAP_DMA`, DMA-Puffer | 3 | 08 |
+| PCI-10 ✅ | `pci_irq.lyx` | `VFIO_DEVICE_SET_IRQS`, eventfd-Warten, MSI-X-Vektortabelle | 3 | 09 |
 | PCI-11 | `pci_portio.lyx` | `iopl`/`ioperm`, `asm{}` in/out, CF8-Adressrechnung | 4 | 03 |
 | PCI-12 | `pci_ecam.lyx` | MCFG-Basis, ECAM-Adressrechnung, Mapping | 4 | 03 |
 
