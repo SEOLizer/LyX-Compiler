@@ -1,6 +1,6 @@
-# Lyx 1.0.16H — Canonical EBNF Grammar
+# Lyx 1.0.16I — Canonical EBNF Grammar
 
-> Stand 2026-08-11, gegen lyxc 1.0.16H geprueft. Die Keyword-Liste in
+> Stand 2026-08-11, gegen lyxc 1.0.16I geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -977,6 +977,16 @@ WildcardPattern     = "_" ;
 
 TuplePattern        = "(" Pattern "," Pattern { "," Pattern } ")" ;
 
+(* Umgesetzt seit 1.0.16I (#1250). Geprueft wird zuerst die LAENGE -- ein
+   Muster mit zwei Teilen passt nicht auf ein dreielementiges Tupel --, dann
+   Element fuer Element. Teilmuster sind ein Ganzzahlliteral (auch negativ),
+   ein `con`- oder Enum-Name oder `_`; ein blanker Name ist auch hier ein
+   VERWEIS und keine Bindung, wie im uebrigen Abschnitt. Beliebig viele
+   Teilmuster sind zulaessig, weil der Tupel-Ausdruck die Ablage eines
+   Array-Literals hat; die Zweierschranke aus TupleType gilt nur fuer
+   RUECKGABEwerte. Bis 1.0.16I fehlte das Muster ganz und die Meldung lautete
+   `expected =>, got (`. *)
+
 StructPattern       = Ident "{" [ FieldPattern { "," FieldPattern } ] "}" ;
 
 FieldPattern        = Ident ":" ( IntLiteral | Ident | "_" ) ;
@@ -1018,6 +1028,12 @@ FieldPipelineTarget = Ident "." Ident [ "(" [ PipeArgList ] ")" ] ;
 
 PipeArgList         = "?" { "," Expr }
                     | Expr { "," Expr } ;
+
+(* Der gepipte Wert wird VORANGESTELLT: `50 |> Clamp(0, 30)` heisst
+   `Clamp(50, 0, 30)`. Steht ein `?` in der Liste, tritt der Wert an DESSEN
+   Stelle und wird nicht zusaetzlich vorangestellt. Bis 1.0.16I fiel er ohne
+   Platzhalter ersatzlos weg, und der Aufruf scheiterte an der Argumentzahl --
+   benutzbar war `|>` damit nur ohne weitere Argumente oder mit `?` (#1253). *)
 
 NullCoalesceExpr    = LogicalOrExpr
                       { "??" LogicalOrExpr } ;
@@ -1110,8 +1126,28 @@ PrimaryExpr         = Literal
                     | BuiltinCall
                     | NewExpr
                     | DisposeExpr
+                    | LambdaExpr
                     | TupleExpr
                     | "(" Expr ")" ;
+
+LambdaExpr          = "fn" "(" [ ParamList ] ")" [ ":" Type ] Block ;
+
+(* Bis 1.0.16I fehlte diese Produktion, obwohl der Parser die Form seit jeher
+   annimmt und die Doku sie an 35 Stellen nennt.
+
+   EINFANGEN: was der Rumpf aus der umgebenden Funktion liest, wird BEIM
+   ANLEGEN kopiert (by value). Eine spaetere Zuweisung an die aeussere Variable
+   wirkt nicht mehr -- `var f := fn(x: int64): int64 { return x + n; };` mit
+   anschliessendem `n := 1` rechnet weiter mit dem alten `n`.
+
+   DARSTELLUNG: ein Lambda OHNE Einfangen ist eine gewoehnliche Funktion -- der
+   Wert ist ihre Adresse, und es passt damit in einen `fn(...)`-Typ, als
+   Variable wie als Parameter. Faengt es etwas ein, ist der Wert ein Satz aus
+   Adresse und Umgebung; ein `fn(...)`-Typ traegt davon nur die Adresse, und
+   der Uebergang wird deshalb GEMELDET. Bis 1.0.16I entschied die Aufrufstelle
+   ihre Aufrufkonvention allein nach dem deklarierten Typ, waehrend der Wert
+   stets ein Satz war: `var f: fn(int64): int64 := fn(x: int64): int64 {…}`
+   sprang mitten in diesen Satz -- SIGSEGV ohne jede Meldung (#1249). *)
 
 SelfExpr            = "self" | "Self" ;
 
@@ -1119,12 +1155,29 @@ SuperExpr           = "super" ;
 
 TupleExpr           = "(" Expr "," Expr { "," Expr } ")" ;
 
+(* Ein Tupel-AUSDRUCK ist dieselbe Ablage wie ein Array-Literal: `{cap,len}`-Kopf,
+   dann die Elemente. `var u := (1, 2);` ist damit indizierbar (`u[0]`, `u[1]`)
+   und traegt `len(u)` = 2; der Tupel-TYP einer Variablen wird nicht getrennt
+   gefuehrt. Davon unabhaengig ist die Rueckgabe ZWEIER Werte in rax und rdx,
+   entnommen mit `var a, b := f();` -- dort gilt die Zweierschranke aus
+   TupleType. *)
+
 ArgList             = Arg { "," Arg } ;
 
 Arg                 = NamedArg
                     | Expr ;
 
 NamedArg            = Ident ":" Expr ;
+
+(* Benannte Argumente duerfen in beliebiger Reihenfolge stehen; ein
+   POSITIONELLES Argument nach einem benannten wird gemeldet. Ein Parameter
+   gilt als versorgt, wenn er positionell oder benannt belegt ist ODER einen
+   Vorgabewert hat -- damit laesst sich ein hinterer Parameter einzeln setzen
+   und ein mittlerer auf seinem Vorgabewert lassen (`G(1, c: 9)`). Bis 1.0.16I
+   schaltete jedes benannte Argument die Vorgabewerte ab: sobald eines im
+   Aufruf stand, verlangte die Pruefung jeden Parameter (#1252). Ebenfalls bis
+   1.0.16I setzte der Pfad fuer SIEBEN und mehr Argumente Vorgabewerte gar
+   nicht ein -- die Werte lagen dann verschoben. *)
 
 TypeArgList         = Type { "," Type } ;
 ```
