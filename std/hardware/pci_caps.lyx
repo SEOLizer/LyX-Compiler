@@ -1,0 +1,329 @@
+// std/hardware/pci_caps.lyx
+// PCI-06: Capability-Listen laufen und auswerten.
+//
+// Die Standardliste beginnt bei 0x34 und haengt sich ueber `next`-Zeiger
+// durch den 256-Byte-Raum. Eine defekte oder halb initialisierte Liste
+// kann im Kreis zeigen — deshalb laeuft hier nichts ohne Schrittzaehler
+// und Besuchsmarkierung. Ein Treiber, der beim Sondieren haengenbleibt,
+// ist schlimmer als einer, der einen Fehler meldet.
+//
+// Extended Capabilities (PCIe) liegen ab 0x100 und haben ein anderes
+// Format: 16 Bit ID, 4 Bit Version, 12 Bit Zeiger.
+
+@description("PCI capability list traversal and parsing")
+@author("Andreas Roene")
+unit std.hardware.pci_caps;
+
+import std.hardware.pci_types;
+import std.hardware.pci_config;
+import std.alloc;
+
+// ============================================================
+// Standard-Capabilities
+// ============================================================
+
+// Sucht die Capability mit der ID capId. Rueckgabe: Offset im
+// Config-Space, PCI_E_NODEV wenn nicht vorhanden, PCI_E_CAPLOOP wenn die
+// Kette im Kreis zeigt.
+pub fn PciCapFind(ctx: int64, capId: int64): int64 {
+  var status: int64 := PciCfgRead16(ctx, PCI_CFG_STATUS);
+  if (status < 0) { return status; }
+  // Ohne dieses Bit gibt es keine Liste; 0x34 enthaelt dann Muell.
+  if ((status & PCI_STATUS_CAP_LIST) == 0) { return PCI_E_NODEV; }
+
+  var ptr: int64 := PciCfgRead8(ctx, PCI_CFG_CAP_PTR);
+  if (ptr < 0) { return ptr; }
+  ptr := ptr & 252;   // Zeiger sind 4-Byte-ausgerichtet (~0x3)
+
+  // Besuchsmarkierung: 256 Bytes, ein Byte je moeglichem Offset. Der
+  // Schrittzaehler allein wuerde einen Zweierzyklus zwar begrenzen, aber
+  // erst nach PCI_CAP_MAX_STEPS Runden — die Markierung erkennt ihn sofort.
+  var seen: int64 := allocZeroed(PCI_CFG_SIZE_LEGACY);
+  if (seen == 0) { return PCI_E_NOMEM; }
+
+  var steps: int64 := 0;
+  var result: int64 := PCI_E_NODEV;
+  var running: int64 := 1;
+
+  while (running == 1) {
+    if (ptr < 64 || ptr >= PCI_CFG_SIZE_LEGACY) { running := 0; }
+    else if (steps >= PCI_CAP_MAX_STEPS) { result := PCI_E_CAPLOOP; running := 0; }
+    else if (peek8(seen + ptr) != 0) { result := PCI_E_CAPLOOP; running := 0; }
+    else {
+      poke8(seen + ptr, 1);
+      steps := steps + 1;
+
+      var id: int64 := PciCfgRead8(ctx, ptr);
+      if (id < 0) { result := id; running := 0; }
+      else if (id == capId) { result := ptr; running := 0; }
+      else {
+        var nxt: int64 := PciCfgRead8(ctx, ptr + 1);
+        if (nxt < 0) { result := nxt; running := 0; }
+        else if (nxt == 0) { running := 0; }
+        else { ptr := nxt & 252; }
+      }
+    }
+  }
+
+  free(seen, PCI_CFG_SIZE_LEGACY);
+  return result;
+}
+
+// Zaehlt die Eintraege der Standardliste. Bei einem Zyklus:
+// PCI_E_CAPLOOP. Ohne Liste: 0.
+pub fn PciCapCount(ctx: int64): int64 {
+  var status: int64 := PciCfgRead16(ctx, PCI_CFG_STATUS);
+  if (status < 0) { return status; }
+  if ((status & PCI_STATUS_CAP_LIST) == 0) { return 0; }
+
+  var ptr: int64 := PciCfgRead8(ctx, PCI_CFG_CAP_PTR);
+  if (ptr < 0) { return ptr; }
+  ptr := ptr & 252;
+
+  var seen: int64 := allocZeroed(PCI_CFG_SIZE_LEGACY);
+  if (seen == 0) { return PCI_E_NOMEM; }
+
+  var count: int64 := 0;
+  var result: int64 := -1000;   // noch kein Ergebnis
+  var running: int64 := 1;
+
+  while (running == 1) {
+    if (ptr < 64 || ptr >= PCI_CFG_SIZE_LEGACY) { result := count; running := 0; }
+    else if (count >= PCI_CAP_MAX_STEPS) { result := PCI_E_CAPLOOP; running := 0; }
+    else if (peek8(seen + ptr) != 0) { result := PCI_E_CAPLOOP; running := 0; }
+    else {
+      poke8(seen + ptr, 1);
+      count := count + 1;
+      var nxt: int64 := PciCfgRead8(ctx, ptr + 1);
+      if (nxt < 0) { result := nxt; running := 0; }
+      else if (nxt == 0) { result := count; running := 0; }
+      else { ptr := nxt & 252; }
+    }
+  }
+
+  free(seen, PCI_CFG_SIZE_LEGACY);
+  return result;
+}
+
+// Iterator: liefert den Offset der naechsten Capability nach `from`, oder
+// PCI_E_NODEV am Ende. from == 0 beginnt am Listenkopf.
+pub fn PciCapNext(ctx: int64, from: int64): int64 {
+  if (from == 0) {
+    var status: int64 := PciCfgRead16(ctx, PCI_CFG_STATUS);
+    if (status < 0) { return status; }
+    if ((status & PCI_STATUS_CAP_LIST) == 0) { return PCI_E_NODEV; }
+    var head: int64 := PciCfgRead8(ctx, PCI_CFG_CAP_PTR);
+    if (head < 0) { return head; }
+    head := head & 252;
+    if (head < 64 || head >= PCI_CFG_SIZE_LEGACY) { return PCI_E_NODEV; }
+    return head;
+  }
+  var nxt: int64 := PciCfgRead8(ctx, from + 1);
+  if (nxt < 0) { return nxt; }
+  nxt := nxt & 252;
+  if (nxt < 64 || nxt >= PCI_CFG_SIZE_LEGACY) { return PCI_E_NODEV; }
+  // Rueckwaerts oder auf sich selbst zeigen beide auf einen Zyklus hin.
+  if (nxt <= from) { return PCI_E_CAPLOOP; }
+  return nxt;
+}
+
+pub fn PciCapId(ctx: int64, off: int64): int64 {
+  if (off < 64 || off >= PCI_CFG_SIZE_LEGACY) { return PCI_E_RANGE; }
+  return PciCfgRead8(ctx, off);
+}
+
+pub fn PciCapIdName(id: int64): pchar {
+  if (id == PCI_CAP_ID_PM)     { return "Power Management"; }
+  if (id == PCI_CAP_ID_AGP)    { return "AGP"; }
+  if (id == PCI_CAP_ID_VPD)    { return "Vital Product Data"; }
+  if (id == PCI_CAP_ID_MSI)    { return "MSI"; }
+  if (id == PCI_CAP_ID_VENDOR) { return "Vendor Specific"; }
+  if (id == PCI_CAP_ID_PCIE)   { return "PCI Express"; }
+  if (id == PCI_CAP_ID_MSIX)   { return "MSI-X"; }
+  return "Unknown capability";
+}
+
+// ============================================================
+// Extended Capabilities (PCIe, ab 0x100)
+//
+// Kopfwort: Bits 15:0 ID, Bits 19:16 Version, Bits 31:20 naechster Offset.
+// ============================================================
+
+pub fn PciExtCapFind(ctx: int64, capId: int64): int64 {
+  // Der erweiterte Raum existiert nur, wenn das Backend ihn erreicht.
+  if (PciCfgSize(ctx) < PCI_CFG_SIZE_PCIE) { return PCI_E_NODEV; }
+
+  var off: int64 := PCI_EXT_CAP_START;
+  var steps: int64 := 0;
+  var result: int64 := PCI_E_NODEV;
+  var running: int64 := 1;
+  var lastOff: int64 := 0;
+
+  while (running == 1) {
+    if (off < PCI_EXT_CAP_START || off >= PCI_CFG_SIZE_PCIE) { running := 0; }
+    else if (steps >= PCI_CAP_MAX_STEPS) { result := PCI_E_CAPLOOP; running := 0; }
+    else {
+      var head: int64 := PciCfgRead32(ctx, off);
+      if (head < 0) { result := head; running := 0; }
+      else if (head == 0 || head == 4294967295) { running := 0; }   // leer
+      else {
+        var id: int64 := head & 65535;
+        if (id == capId) { result := off; running := 0; }
+        else {
+          var nxt: int64 := (head >> 20) & 4095;
+          if (nxt == 0) { running := 0; }
+          else if (nxt <= lastOff) { result := PCI_E_CAPLOOP; running := 0; }
+          else { lastOff := off; off := nxt & 4092; steps := steps + 1; }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+pub fn PciExtCapId(ctx: int64, off: int64): int64 {
+  if (off < PCI_EXT_CAP_START || off >= PCI_CFG_SIZE_PCIE) { return PCI_E_RANGE; }
+  var head: int64 := PciCfgRead32(ctx, off);
+  if (head < 0) { return head; }
+  return head & 65535;
+}
+
+pub fn PciExtCapVersion(ctx: int64, off: int64): int64 {
+  if (off < PCI_EXT_CAP_START || off >= PCI_CFG_SIZE_PCIE) { return PCI_E_RANGE; }
+  var head: int64 := PciCfgRead32(ctx, off);
+  if (head < 0) { return head; }
+  return (head >> 16) & 15;
+}
+
+// ============================================================
+// MSI (Capability-ID 0x05)
+//
+//  +0 ID, +1 next, +2 Message Control
+//  Message Control Bit 0 = Enable, Bits 3:1 = angeforderte Vektoren
+//  (als Zweierpotenz-Exponent), Bit 7 = 64-Bit-Adresse moeglich
+// ============================================================
+
+pub fn PciMsiControl(ctx: int64, capOff: int64): int64 {
+  return PciCfgRead16(ctx, capOff + 2);
+}
+
+pub fn PciMsiIsEnabled(ctx: int64, capOff: int64): int64 {
+  var c: int64 := PciMsiControl(ctx, capOff);
+  if (c < 0) { return c; }
+  if ((c & 1) != 0) { return 1; }
+  return 0;
+}
+
+// Anzahl der vom Geraet angeforderten Vektoren (1, 2, 4, ... 32).
+pub fn PciMsiRequestedVectors(ctx: int64, capOff: int64): int64 {
+  var c: int64 := PciMsiControl(ctx, capOff);
+  if (c < 0) { return c; }
+  return 1 << ((c >> 1) & 7);
+}
+
+pub fn PciMsiIs64Bit(ctx: int64, capOff: int64): int64 {
+  var c: int64 := PciMsiControl(ctx, capOff);
+  if (c < 0) { return c; }
+  if ((c & 128) != 0) { return 1; }
+  return 0;
+}
+
+// ============================================================
+// MSI-X (Capability-ID 0x11)
+//
+//  +0 ID, +1 next, +2 Message Control (Bits 10:0 = Tabellengroesse - 1,
+//  Bit 15 = Enable, Bit 14 = Function Mask)
+//  +4 Table Offset/BIR, +8 PBA Offset/BIR (jeweils Bits 2:0 = BAR-Index)
+// ============================================================
+
+pub fn PciMsixControl(ctx: int64, capOff: int64): int64 {
+  return PciCfgRead16(ctx, capOff + 2);
+}
+
+// Anzahl der Vektoren in der Tabelle.
+pub fn PciMsixTableSize(ctx: int64, capOff: int64): int64 {
+  var c: int64 := PciMsixControl(ctx, capOff);
+  if (c < 0) { return c; }
+  return (c & 2047) + 1;
+}
+
+pub fn PciMsixIsEnabled(ctx: int64, capOff: int64): int64 {
+  var c: int64 := PciMsixControl(ctx, capOff);
+  if (c < 0) { return c; }
+  if ((c & 32768) != 0) { return 1; }
+  return 0;
+}
+
+// In welchem BAR liegt die Vektortabelle?
+pub fn PciMsixTableBar(ctx: int64, capOff: int64): int64 {
+  var v: int64 := PciCfgRead32(ctx, capOff + 4);
+  if (v < 0) { return v; }
+  return v & 7;
+}
+
+// Offset der Vektortabelle innerhalb dieses BARs.
+pub fn PciMsixTableOffset(ctx: int64, capOff: int64): int64 {
+  var v: int64 := PciCfgRead32(ctx, capOff + 4);
+  if (v < 0) { return v; }
+  return v & (~7);
+}
+
+pub fn PciMsixPbaBar(ctx: int64, capOff: int64): int64 {
+  var v: int64 := PciCfgRead32(ctx, capOff + 8);
+  if (v < 0) { return v; }
+  return v & 7;
+}
+
+pub fn PciMsixPbaOffset(ctx: int64, capOff: int64): int64 {
+  var v: int64 := PciCfgRead32(ctx, capOff + 8);
+  if (v < 0) { return v; }
+  return v & (~7);
+}
+
+// ============================================================
+// PCI Express (Capability-ID 0x10)
+//
+//  +0x0C Link Capabilities, +0x12 Link Status
+//  Link Status: Bits 3:0 aktuelle Geschwindigkeit, Bits 9:4 Breite
+// ============================================================
+
+pub fn PciPcieLinkStatus(ctx: int64, capOff: int64): int64 {
+  return PciCfgRead16(ctx, capOff + 0x12);
+}
+
+pub fn PciPcieLinkSpeed(ctx: int64, capOff: int64): int64 {
+  var s: int64 := PciPcieLinkStatus(ctx, capOff);
+  if (s < 0) { return s; }
+  return s & 15;
+}
+
+pub fn PciPcieLinkWidth(ctx: int64, capOff: int64): int64 {
+  var s: int64 := PciPcieLinkStatus(ctx, capOff);
+  if (s < 0) { return s; }
+  return (s >> 4) & 63;
+}
+
+// Maximal moegliche Geschwindigkeit und Breite laut Link Capabilities.
+pub fn PciPcieMaxLinkSpeed(ctx: int64, capOff: int64): int64 {
+  var c: int64 := PciCfgRead32(ctx, capOff + 0x0C);
+  if (c < 0) { return c; }
+  return c & 15;
+}
+
+pub fn PciPcieMaxLinkWidth(ctx: int64, capOff: int64): int64 {
+  var c: int64 := PciCfgRead32(ctx, capOff + 0x0C);
+  if (c < 0) { return c; }
+  return (c >> 4) & 63;
+}
+
+// Kodierung der Geschwindigkeit als Text. Unbekannte Werte werden als
+// solche gemeldet, statt auf die naechstliegende Stufe gerundet zu werden.
+pub fn PciPcieSpeedName(code: int64): pchar {
+  if (code == 1) { return "2.5 GT/s"; }
+  if (code == 2) { return "5 GT/s"; }
+  if (code == 3) { return "8 GT/s"; }
+  if (code == 4) { return "16 GT/s"; }
+  if (code == 5) { return "32 GT/s"; }
+  if (code == 6) { return "64 GT/s"; }
+  return "unknown speed";
+}

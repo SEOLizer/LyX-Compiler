@@ -1,0 +1,384 @@
+// std/hardware/pci_ids.lyx
+// PCI-07: Klarnamen zu Vendor-, Device- und Klassen-IDs.
+//
+// Datenquelle ist die Datei pci.ids des PCI-ID-Projekts
+// (https://pci-ids.ucw.cz/), die mit ausgeliefert wird. Sie wird zur
+// LAUFZEIT gelesen und nie in Lyx-Quelltext uebersetzt: eine generierte
+// Datenunit dieser Groesse bringt lyxc zum Absturz.
+//
+// Aufbau der Datei (Einrueckung mit Tabulatoren bestimmt die Ebene):
+//
+//   1002  Advanced Micro Devices, Inc. [AMD/ATI]
+//   \t1234  Geraetename
+//   \t\t1043 1234  Subsystem-Name
+//   C 03  Display controller
+//   \t00  VGA compatible controller
+//
+// Es wird nicht in Objekte geparst — 1,4 MB Text ergaeben zehntausende
+// Allokationen. Stattdessen liegt die Datei am Stueck im Speicher, und ein
+// einmaliger Durchlauf merkt sich je Vendor und je Klasse den Offset.
+// Gesucht wird darin binaer.
+//
+// Findet sich keine Datei, liefert PciIdsOpen PCI_E_NODB und die
+// Namensfunktionen geben 0 zurueck. Sie erfinden keinen Namen — ein
+// erfundener Name waere von einem echten nicht zu unterscheiden.
+
+@description("PCI vendor/device/class name lookup from pci.ids")
+@author("Andreas Roene")
+unit std.hardware.pci_ids;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.alloc;
+
+// ============================================================
+// Suchpfade, erster Treffer gewinnt
+// ============================================================
+
+pub con PCI_IDS_ENV:      pchar := "LYX_PCI_IDS";
+pub con PCI_IDS_PATH_LYX: pchar := "/usr/share/lyx/pci.ids";
+pub con PCI_IDS_PATH_HW:  pchar := "/usr/share/hwdata/pci.ids";
+pub con PCI_IDS_PATH_MISC: pchar := "/usr/share/misc/pci.ids";
+
+// Obergrenze fuer die Datei. Die ausgelieferte Fassung ist rund 1,4 MB;
+// 8 MB laesst Luft fuer kuenftige Ausgaben und begrenzt zugleich, was ein
+// vertauschter Pfad in den Speicher zieht.
+pub con PCI_IDS_MAX_BYTES: int64 := 8388608;
+
+pub con PCI_IDS_MAX_VENDORS: int64 := 8192;
+pub con PCI_IDS_MAX_CLASSES: int64 := 256;
+
+// ============================================================
+// Kontext (heap-allokiert, 56 Bytes)
+//   +0   Puffer mit dem Dateiinhalt
+//   +8   Laenge in Bytes
+//   +16  Vendor-Index (Paare id/offset, je 16 Bytes)
+//   +24  Anzahl Vendor-Eintraege
+//   +32  Klassen-Index (Paare id/offset)
+//   +40  Anzahl Klassen-Eintraege
+//   +48  belegte Groesse des Puffers (fuer free)
+// ============================================================
+
+pub con PCI_IDS_CTX_SIZE: int64 := 56;
+
+fn idxSize(maxEntries: int64): int64 { return maxEntries * 16; }
+
+pub fn PciIdsVendorCount(db: int64): int64 {
+  if (db <= 0) { return PCI_E_BADARG; }
+  return peek64(db + 24);
+}
+
+pub fn PciIdsClassCount(db: int64): int64 {
+  if (db <= 0) { return PCI_E_BADARG; }
+  return peek64(db + 40);
+}
+
+// ============================================================
+// Zeichenhilfen
+// ============================================================
+
+fn isHexDigit(c: int64): int64 {
+  if (c >= 48 && c <= 57)  { return 1; }
+  if (c >= 97 && c <= 102) { return 1; }
+  if (c >= 65 && c <= 70)  { return 1; }
+  return 0;
+}
+
+fn hexAt(buf: int64, pos: int64, digits: int64): int64 {
+  var v: int64 := 0;
+  var i: int64 := 0;
+  while (i < digits) {
+    var c: int64 := peek8(buf + pos + i);
+    if (isHexDigit(c) == 0) { return -1; }
+    var d: int64 := 0;
+    if (c >= 48 && c <= 57)  { d := c - 48; }
+    if (c >= 97 && c <= 102) { d := (c - 97) + 10; }
+    if (c >= 65 && c <= 70)  { d := (c - 65) + 10; }
+    v := (v << 4) | d;
+    i := i + 1;
+  }
+  return v;
+}
+
+// Position nach dem naechsten Zeilenumbruch.
+fn nextLine(buf: int64, len: int64, pos: int64): int64 {
+  var i: int64 := pos;
+  while (i < len && peek8(buf + i) != 10) { i := i + 1; }
+  return i + 1;
+}
+
+// ============================================================
+// Datei finden und laden
+// ============================================================
+
+fn tryOpen(path: pchar): int64 {
+  if (path == 0 as pchar) { return -1; }
+  return PciOpenFile(path, PCI_O_RDONLY);
+}
+
+// Oeffnet die Datenbank aus einer bestimmten Datei. Rueckgabe: Kontext
+// oder PCI_E_NODB / PCI_E_NOMEM. Nuetzlich fuer eigene Fassungen der
+// Datei und fuer Tests, die nicht von der Systeminstallation abhaengen
+// sollen.
+pub fn PciIdsOpenPath(path: pchar): int64 {
+  var fd: int64 := tryOpen(path);
+  if (fd < 0) { return PCI_E_NODB; }
+  return loadFrom(fd);
+}
+
+// Oeffnet die Datenbank aus dem ersten Suchpfad, der traegt.
+pub fn PciIdsOpen(): int64 {
+  var fd: int64 := -1;
+
+  var envPath: pchar := PciGetEnv(PCI_IDS_ENV);
+  if (envPath != 0 as pchar) {
+    fd := tryOpen(envPath);
+    free(envPath as int64, PCI_ENV_BUF);
+  }
+  if (fd < 0) { fd := tryOpen(PCI_IDS_PATH_LYX); }
+  if (fd < 0) { fd := tryOpen(PCI_IDS_PATH_HW); }
+  if (fd < 0) { fd := tryOpen(PCI_IDS_PATH_MISC); }
+  if (fd < 0) { return PCI_E_NODB; }
+  return loadFrom(fd);
+}
+
+// Liest die geoeffnete Datei ein und baut die Indizes.
+fn loadFrom(fd: int64): int64 {
+
+  var buf: int64 := alloc(PCI_IDS_MAX_BYTES);
+  if (buf == 0) { PciCloseFile(fd); return PCI_E_NOMEM; }
+
+  var total: int64 := 0;
+  var running: int64 := 1;
+  while (running == 1) {
+    var n: int64 := read(fd, (buf + total) as pchar, 65536);
+    if (n <= 0) { running := 0; }
+    else {
+      total := total + n;
+      if (total >= (PCI_IDS_MAX_BYTES - 65536)) { running := 0; }
+    }
+  }
+  PciCloseFile(fd);
+  if (total <= 0) { free(buf, PCI_IDS_MAX_BYTES); return PCI_E_NODB; }
+
+  var vidx: int64 := alloc(idxSize(PCI_IDS_MAX_VENDORS));
+  var cidx: int64 := alloc(idxSize(PCI_IDS_MAX_CLASSES));
+  if (vidx == 0 || cidx == 0) {
+    free(buf, PCI_IDS_MAX_BYTES);
+    if (vidx != 0) { free(vidx, idxSize(PCI_IDS_MAX_VENDORS)); }
+    if (cidx != 0) { free(cidx, idxSize(PCI_IDS_MAX_CLASSES)); }
+    return PCI_E_NOMEM;
+  }
+
+  // Einmaliger Durchlauf: Zeilen ohne Einrueckung sind Vendor-Zeilen,
+  // Zeilen mit "C " davor beginnen den Klassenabschnitt.
+  var vcount: int64 := 0;
+  var ccount: int64 := 0;
+  var pos: int64 := 0;
+  while (pos < total) {
+    var c0: int64 := peek8(buf + pos);
+    if (c0 == 35 || c0 == 10 || c0 == 13) {
+      // Kommentar oder Leerzeile
+    } else if (c0 == 67) {
+      // "C xx  Name"
+      if (peek8(buf + pos + 1) == 32) {
+        var cid: int64 := hexAt(buf, pos + 2, 2);
+        if (cid >= 0 && ccount < PCI_IDS_MAX_CLASSES) {
+          poke64(cidx + ccount * 16,     cid);
+          poke64(cidx + ccount * 16 + 8, pos);
+          ccount := ccount + 1;
+        }
+      }
+    } else if (isHexDigit(c0) == 1) {
+      var vid: int64 := hexAt(buf, pos, 4);
+      if (vid >= 0 && vcount < PCI_IDS_MAX_VENDORS) {
+        poke64(vidx + vcount * 16,     vid);
+        poke64(vidx + vcount * 16 + 8, pos);
+        vcount := vcount + 1;
+      }
+    }
+    pos := nextLine(buf, total, pos);
+  }
+
+  var db: int64 := alloc(PCI_IDS_CTX_SIZE);
+  if (db == 0) {
+    free(buf, PCI_IDS_MAX_BYTES);
+    free(vidx, idxSize(PCI_IDS_MAX_VENDORS));
+    free(cidx, idxSize(PCI_IDS_MAX_CLASSES));
+    return PCI_E_NOMEM;
+  }
+  poke64(db,      buf);
+  poke64(db + 8,  total);
+  poke64(db + 16, vidx);
+  poke64(db + 24, vcount);
+  poke64(db + 32, cidx);
+  poke64(db + 40, ccount);
+  poke64(db + 48, PCI_IDS_MAX_BYTES);
+  return db;
+}
+
+pub fn PciIdsClose(db: int64) {
+  if (db <= 0) { return; }
+  free(peek64(db), peek64(db + 48));
+  free(peek64(db + 16), idxSize(PCI_IDS_MAX_VENDORS));
+  free(peek64(db + 32), idxSize(PCI_IDS_MAX_CLASSES));
+  free(db, PCI_IDS_CTX_SIZE);
+}
+
+// ============================================================
+// Suche im Index
+// ============================================================
+//
+// Die Datei ist nach Vendor-ID sortiert, der Index uebernimmt diese
+// Ordnung — deshalb binaere Suche. Ist die Datei wider Erwarten
+// unsortiert, findet die Suche einen Eintrag womoeglich nicht; sie liefert
+// dann "nicht gefunden" und nie einen falschen Namen.
+
+fn indexFind(idx: int64, count: int64, id: int64): int64 {
+  var lo: int64 := 0;
+  var hi: int64 := count - 1;
+  while (lo <= hi) {
+    var mid: int64 := lo + (hi - lo) / 2;
+    var v: int64 := peek64(idx + mid * 16);
+    if (v == id) { return peek64(idx + mid * 16 + 8); }
+    if (v < id) { lo := mid + 1; } else { hi := mid - 1; }
+  }
+  return -1;
+}
+
+// Schreibt den Namensteil ab Position pos (zeigt auf den Zeilenanfang)
+// nach dest. Der Name beginnt nach der ID und den zwei Leerzeichen.
+fn writeNameFromLine(buf: int64, len: int64, lineStart: int64, idDigits: int64,
+                     skipTabs: int64, dest: int64, cap: int64): int64 {
+  var i: int64 := lineStart + skipTabs + idDigits;
+  // Trennzeichen zwischen ID und Name ueberspringen
+  var skipping: int64 := 1;
+  while (i < len && skipping == 1) {
+    var c: int64 := peek8(buf + i);
+    if (c == 32 || c == 9) { i := i + 1; } else { skipping := 0; }
+  }
+  var w: int64 := 0;
+  while (i < len && w < (cap - 1)) {
+    var c2: int64 := peek8(buf + i);
+    if (c2 == 10 || c2 == 13) { i := len; } else {
+      poke8(dest + w, c2);
+      w := w + 1;
+      i := i + 1;
+    }
+  }
+  poke8(dest + w, 0);
+  return w;
+}
+
+// ============================================================
+// Namen nachschlagen
+//
+// Alle drei Funktionen schreiben in einen vom Aufrufer gestellten Puffer.
+// Rueckgabe: Laenge des Namens, PCI_E_NODEV wenn die ID nicht in der
+// Datenbank steht, PCI_E_BADARG bei unsinnigen Argumenten.
+// ============================================================
+
+pub fn PciIdsVendorName(db: int64, vid: int64, dest: int64, cap: int64): int64 {
+  if (db <= 0 || dest == 0 || cap < 2) { return PCI_E_BADARG; }
+  var off: int64 := indexFind(peek64(db + 16), peek64(db + 24), vid);
+  if (off < 0) { return PCI_E_NODEV; }
+  return writeNameFromLine(peek64(db), peek64(db + 8), off, 4, 0, dest, cap);
+}
+
+// Sucht innerhalb des Vendor-Blocks die Geraetezeile (ein Tabulator).
+pub fn PciIdsDeviceName(db: int64, vid: int64, did: int64, dest: int64, cap: int64): int64 {
+  if (db <= 0 || dest == 0 || cap < 2) { return PCI_E_BADARG; }
+  var off: int64 := indexFind(peek64(db + 16), peek64(db + 24), vid);
+  if (off < 0) { return PCI_E_NODEV; }
+
+  var buf: int64 := peek64(db);
+  var len: int64 := peek64(db + 8);
+  var pos: int64 := nextLine(buf, len, off);
+
+  while (pos < len) {
+    var c0: int64 := peek8(buf + pos);
+    // Kommentare und Leerzeilen stehen mitten in den Bloecken und duerfen
+    // die Suche nicht beenden — sonst endet sie bei Intel nach 268 von
+    // ueber 4000 Geraetezeilen.
+    if (c0 == 35 || c0 == 10 || c0 == 13) { pos := nextLine(buf, len, pos); }
+    else if (c0 != 9) { return PCI_E_NODEV; }
+    else if (peek8(buf + pos + 1) != 9) {
+      var id: int64 := hexAt(buf, pos + 1, 4);
+      if (id == did) {
+        return writeNameFromLine(buf, len, pos, 4, 1, dest, cap);
+      }
+      pos := nextLine(buf, len, pos);
+    }
+    else { pos := nextLine(buf, len, pos); }
+  }
+  return PCI_E_NODEV;
+}
+
+// Subsystem-Zeile (zwei Tabulatoren) innerhalb der passenden Geraetezeile.
+pub fn PciIdsSubsystemName(db: int64, vid: int64, did: int64,
+                           svid: int64, sdid: int64, dest: int64, cap: int64): int64 {
+  if (db <= 0 || dest == 0 || cap < 2) { return PCI_E_BADARG; }
+  var off: int64 := indexFind(peek64(db + 16), peek64(db + 24), vid);
+  if (off < 0) { return PCI_E_NODEV; }
+
+  var buf: int64 := peek64(db);
+  var len: int64 := peek64(db + 8);
+  var pos: int64 := nextLine(buf, len, off);
+  var inDevice: int64 := 0;
+
+  while (pos < len) {
+    var c0: int64 := peek8(buf + pos);
+    if (c0 == 35 || c0 == 10 || c0 == 13) { pos := nextLine(buf, len, pos); }
+    else if (c0 != 9) { return PCI_E_NODEV; }
+    else {
+      if (peek8(buf + pos + 1) == 9) {
+        if (inDevice == 1) {
+          var sv: int64 := hexAt(buf, pos + 2, 4);
+          var sd: int64 := hexAt(buf, pos + 7, 4);
+          if (sv == svid && sd == sdid) {
+            // Name beginnt nach "\t\txxxx xxxx"
+            return writeNameFromLine(buf, len, pos, 9, 2, dest, cap);
+          }
+        }
+      } else {
+        var id: int64 := hexAt(buf, pos + 1, 4);
+        if (id == did) { inDevice := 1; } else { inDevice := 0; }
+      }
+      pos := nextLine(buf, len, pos);
+    }
+  }
+  return PCI_E_NODEV;
+}
+
+// Basisklasse. sub < 0 liefert den Namen der Basisklasse, sonst wird die
+// Unterklasse im Block gesucht.
+pub fn PciIdsClassName(db: int64, cls: int64, sub: int64, dest: int64, cap: int64): int64 {
+  if (db <= 0 || dest == 0 || cap < 2) { return PCI_E_BADARG; }
+  var off: int64 := indexFind(peek64(db + 32), peek64(db + 40), cls);
+  if (off < 0) { return PCI_E_NODEV; }
+
+  var buf: int64 := peek64(db);
+  var len: int64 := peek64(db + 8);
+
+  if (sub < 0) {
+    // "C xx  Name" — ID beginnt bei +2, ist zwei Ziffern lang
+    return writeNameFromLine(buf, len, off, 2, 2, dest, cap);
+  }
+
+  var pos: int64 := nextLine(buf, len, off);
+  while (pos < len) {
+    var c0: int64 := peek8(buf + pos);
+    if (c0 == 35 || c0 == 10 || c0 == 13) { pos := nextLine(buf, len, pos); }
+    else if (c0 != 9) { return PCI_E_NODEV; }
+    else {
+      if (peek8(buf + pos + 1) != 9) {
+        var id: int64 := hexAt(buf, pos + 1, 2);
+        if (id == sub) {
+          return writeNameFromLine(buf, len, pos, 2, 1, dest, cap);
+        }
+      }
+      pos := nextLine(buf, len, pos);
+    }
+  }
+  return PCI_E_NODEV;
+}

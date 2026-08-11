@@ -1,0 +1,301 @@
+// std/hardware/pci.lyx
+// PCI-08: Fassade — ein Import, ein Kontext, ein Aufraeumpunkt.
+//
+// Die Einzelunits bleiben benutzbar; wer aber nur ein Geraet ansprechen
+// will, soll sich nicht selbst um Config-Deskriptor, sechs moegliche
+// BAR-Abbildungen und die Namensdatenbank kuemmern muessen. Genau das
+// haelt dieser Kontext zusammen, und PciClose gibt alles davon frei — es
+// ist die einzige Stelle, die weiss, was offen ist.
+
+@description("PCI facade: device context, BAR mapping, capabilities")
+@author("Andreas Roene")
+unit std.hardware.pci;
+
+import std.hardware.pci_types;
+import std.hardware.pci_syscalls;
+import std.hardware.pci_config;
+import std.hardware.pci_enum;
+import std.hardware.pci_bar;
+import std.hardware.pci_caps;
+import std.hardware.pci_ids;
+import std.alloc;
+
+// ============================================================
+// Kontext (heap-allokiert, 128 Bytes)
+//   +0    bdf
+//   +8    Config-Kontext (pci_config)
+//   +16   pci.ids-Datenbank oder 0
+//   +24   Flag: Datenbank selbst geoeffnet (1) oder geliehen (0)
+//   +32   sechs Paare (Basisadresse, Laenge) je BAR, 16 Bytes je Paar
+// ============================================================
+
+pub con PCI_DEV_SIZE: int64 := 128;
+con BAR_SLOT_BASE: int64 := 32;
+
+fn barAddrOff(idx: int64): int64 { return BAR_SLOT_BASE + idx * 16; }
+fn barLenOff(idx: int64): int64  { return BAR_SLOT_BASE + idx * 16 + 8; }
+
+pub fn PciDevBdf(dev: int64): int64 { return peek64(dev); }
+pub fn PciDevCfg(dev: int64): int64 { return peek64(dev + 8); }
+pub fn PciDevIds(dev: int64): int64 { return peek64(dev + 16); }
+
+// ============================================================
+// Oeffnen und Schliessen
+// ============================================================
+
+// Oeffnet ein Geraet ueber sysfs. Rueckgabe: Kontext oder Fehlercode.
+pub fn PciOpen(bdf: int64): int64 {
+  if (bdf < 0) { return PCI_E_BADARG; }
+  var cfg: int64 := PciCfgOpenSysfs(bdf);
+  if (cfg < 0) { return cfg; }
+
+  var dev: int64 := allocZeroed(PCI_DEV_SIZE);
+  if (dev == 0) { PciCfgClose(cfg); return PCI_E_NOMEM; }
+  poke64(dev,     bdf);
+  poke64(dev + 8, cfg);
+  return dev;
+}
+
+// "0000:03:00.0" oder "03:00.0".
+pub fn PciOpenByPath(s: pchar): int64 {
+  var bdf: int64 := PciBdfParse(s);
+  if (bdf < 0) { return bdf; }
+  return PciOpen(bdf);
+}
+
+// Erstes Geraet der Klasse oeffnen. sub < 0 heisst "Subklasse egal".
+pub fn PciOpenByClass(cls: int64, sub: int64): int64 {
+  var bdf: int64 := PciFindByClass(cls, sub);
+  if (bdf < 0) { return bdf; }
+  return PciOpen(bdf);
+}
+
+// Erstes Geraet mit dieser Vendor-/Device-ID oeffnen. did < 0 = egal.
+pub fn PciOpenById(vid: int64, did: int64): int64 {
+  var bdf: int64 := PciFindById(vid, did);
+  if (bdf < 0) { return bdf; }
+  return PciOpen(bdf);
+}
+
+// Namensdatenbank anhaengen. Ohne Argument (db == 0) oeffnet die Fassade
+// selbst eine und schliesst sie spaeter mit. Eine geliehene Datenbank
+// bleibt beim Schliessen unangetastet — sonst zoege PciClose einem
+// zweiten Geraet die Datenbank unter den Fuessen weg.
+pub fn PciAttachIds(dev: int64, db: int64): int64 {
+  if (dev <= 0) { return PCI_E_BADARG; }
+  if (peek64(dev + 16) != 0) { return 0; }   // schon vorhanden
+  if (db > 0) {
+    poke64(dev + 16, db);
+    poke64(dev + 24, 0);
+    return 0;
+  }
+  var own: int64 := PciIdsOpen();
+  if (own < 0) { return own; }
+  poke64(dev + 16, own);
+  poke64(dev + 24, 1);
+  return 0;
+}
+
+pub fn PciClose(dev: int64) {
+  if (dev <= 0) { return; }
+
+  var i: int64 := 0;
+  while (i < PCI_BAR_COUNT) {
+    var addr: int64 := peek64(dev + barAddrOff(i));
+    var len:  int64 := peek64(dev + barLenOff(i));
+    if (addr > 0 && len > 0) { PciBarUnmap(addr, len); }
+    i := i + 1;
+  }
+
+  var cfg: int64 := peek64(dev + 8);
+  if (cfg > 0) { PciCfgClose(cfg); }
+
+  if (peek64(dev + 24) == 1) {
+    var db: int64 := peek64(dev + 16);
+    if (db > 0) { PciIdsClose(db); }
+  }
+
+  free(dev, PCI_DEV_SIZE);
+}
+
+// ============================================================
+// Kopfdaten
+// ============================================================
+
+pub fn PciDevVendorId(dev: int64): int64  { return PciVendorId(PciDevCfg(dev)); }
+pub fn PciDevDeviceId(dev: int64): int64  { return PciDeviceId(PciDevCfg(dev)); }
+pub fn PciDevRevision(dev: int64): int64  { return PciRevision(PciDevCfg(dev)); }
+pub fn PciDevBaseClass(dev: int64): int64 { return PciBaseClass(PciDevCfg(dev)); }
+pub fn PciDevSubclass(dev: int64): int64  { return PciSubclass(PciDevCfg(dev)); }
+pub fn PciDevProgIf(dev: int64): int64    { return PciProgIf(PciDevCfg(dev)); }
+pub fn PciDevSubsysVendor(dev: int64): int64 { return PciSubsysVendor(PciDevCfg(dev)); }
+pub fn PciDevSubsysId(dev: int64): int64  { return PciSubsysId(PciDevCfg(dev)); }
+pub fn PciDevHeaderType(dev: int64): int64 { return PciHeaderType(PciDevCfg(dev)); }
+pub fn PciDevIntPin(dev: int64): int64    { return PciIntPin(PciDevCfg(dev)); }
+pub fn PciDevIntLine(dev: int64): int64   { return PciIntLine(PciDevCfg(dev)); }
+
+pub fn PciDevEnableBusMaster(dev: int64): int64 { return PciEnableBusMaster(PciDevCfg(dev)); }
+pub fn PciDevEnableMemSpace(dev: int64): int64  { return PciEnableMemSpace(PciDevCfg(dev)); }
+pub fn PciDevDisableIntx(dev: int64): int64     { return PciDisableIntx(PciDevCfg(dev)); }
+
+// Adresse als Text, z.B. "0000:03:00.0". dest braucht PCI_BDF_STR_LEN Bytes.
+pub fn PciDevAddressStr(dev: int64, dest: int64): int64 {
+  if (dev <= 0) { return PCI_E_BADARG; }
+  return PciBdfFormat(dest, peek64(dev));
+}
+
+// ============================================================
+// Namen
+//
+// Ohne angehaengte Datenbank liefern diese Funktionen PCI_E_NODB. Sie
+// weichen nicht auf einen erfundenen Namen aus; nur der Klassenname hat
+// mit PciClassNameBuiltin eine Rueckfallebene, weil er in der
+// Spezifikation festgeschrieben ist.
+// ============================================================
+
+pub fn PciDevVendorName(dev: int64, dest: int64, cap: int64): int64 {
+  var db: int64 := peek64(dev + 16);
+  if (db <= 0) { return PCI_E_NODB; }
+  return PciIdsVendorName(db, PciDevVendorId(dev), dest, cap);
+}
+
+pub fn PciDevDeviceName(dev: int64, dest: int64, cap: int64): int64 {
+  var db: int64 := peek64(dev + 16);
+  if (db <= 0) { return PCI_E_NODB; }
+  return PciIdsDeviceName(db, PciDevVendorId(dev), PciDevDeviceId(dev), dest, cap);
+}
+
+pub fn PciDevClassName(dev: int64, dest: int64, cap: int64): int64 {
+  var db: int64 := peek64(dev + 16);
+  if (db <= 0) { return PCI_E_NODB; }
+  return PciIdsClassName(db, PciDevBaseClass(dev), PciDevSubclass(dev), dest, cap);
+}
+
+// ============================================================
+// BARs
+// ============================================================
+
+pub fn PciDevBarRaw(dev: int64, idx: int64): int64 {
+  return PciBarRaw(PciDevCfg(dev), idx);
+}
+
+pub fn PciDevBarSize(dev: int64, idx: int64): int64 {
+  if (dev <= 0) { return PCI_E_BADARG; }
+  return PciBarSize(peek64(dev), idx);
+}
+
+pub fn PciDevBarIsIo(dev: int64, idx: int64): int64 {
+  var raw: int64 := PciBarRaw(PciDevCfg(dev), idx);
+  if (raw < 0) { return raw; }
+  return PciBarIsIo(raw);
+}
+
+// Bildet BAR idx ab (oder gibt die bestehende Abbildung zurueck).
+pub fn PciDevMapBar(dev: int64, idx: int64): int64 {
+  if (dev <= 0) { return PCI_E_BADARG; }
+  if (idx < 0 || idx >= PCI_BAR_COUNT) { return PCI_E_BADARG; }
+
+  var have: int64 := peek64(dev + barAddrOff(idx));
+  if (have > 0) { return have; }
+
+  var lenSlot: int64 := dev + barLenOff(idx);
+  var addr: int64 := PciBarMap(peek64(dev), idx, lenSlot);
+  if (addr < 0) { poke64(lenSlot, 0); return addr; }
+  poke64(dev + barAddrOff(idx), addr);
+  return addr;
+}
+
+pub fn PciDevBarBase(dev: int64, idx: int64): int64 {
+  if (dev <= 0 || idx < 0 || idx >= PCI_BAR_COUNT) { return PCI_E_BADARG; }
+  return peek64(dev + barAddrOff(idx));
+}
+
+pub fn PciDevBarMappedLen(dev: int64, idx: int64): int64 {
+  if (dev <= 0 || idx < 0 || idx >= PCI_BAR_COUNT) { return PCI_E_BADARG; }
+  return peek64(dev + barLenOff(idx));
+}
+
+pub fn PciDevUnmapBar(dev: int64, idx: int64): int64 {
+  if (dev <= 0 || idx < 0 || idx >= PCI_BAR_COUNT) { return PCI_E_BADARG; }
+  var addr: int64 := peek64(dev + barAddrOff(idx));
+  var len:  int64 := peek64(dev + barLenOff(idx));
+  if (addr <= 0) { return 0; }
+  var r: int64 := PciBarUnmap(addr, len);
+  poke64(dev + barAddrOff(idx), 0);
+  poke64(dev + barLenOff(idx), 0);
+  return r;
+}
+
+// ============================================================
+// Capabilities
+// ============================================================
+
+pub fn PciDevCapFind(dev: int64, capId: int64): int64 {
+  return PciCapFind(PciDevCfg(dev), capId);
+}
+
+pub fn PciDevHasMsix(dev: int64): int64 {
+  var off: int64 := PciCapFind(PciDevCfg(dev), PCI_CAP_ID_MSIX);
+  if (off == PCI_E_NODEV) { return 0; }
+  if (off < 0) { return off; }
+  return 1;
+}
+
+pub fn PciDevMsixVectors(dev: int64): int64 {
+  var off: int64 := PciCapFind(PciDevCfg(dev), PCI_CAP_ID_MSIX);
+  if (off < 0) { return off; }
+  return PciMsixTableSize(PciDevCfg(dev), off);
+}
+
+pub fn PciDevLinkSpeed(dev: int64): int64 {
+  var off: int64 := PciCapFind(PciDevCfg(dev), PCI_CAP_ID_PCIE);
+  if (off < 0) { return off; }
+  return PciPcieLinkSpeed(PciDevCfg(dev), off);
+}
+
+pub fn PciDevLinkWidth(dev: int64): int64 {
+  var off: int64 := PciCapFind(PciDevCfg(dev), PCI_CAP_ID_PCIE);
+  if (off < 0) { return off; }
+  return PciPcieLinkWidth(PciDevCfg(dev), off);
+}
+
+// ============================================================
+// MMIO ueber ein abgebildetes BAR
+//
+// Der Index wird jedes Mal geprueft: ein Zugriff auf ein nicht
+// abgebildetes BAR wuerde sonst auf Adresse 0 + Offset schreiben.
+// ============================================================
+
+pub fn PciDevRead32(dev: int64, idx: int64, off: int64): int64 {
+  var base: int64 := PciDevBarBase(dev, idx);
+  if (base <= 0) { return PCI_E_BADARG; }
+  var len: int64 := peek64(dev + barLenOff(idx));
+  if (off < 0 || (off + 4) > len) { return PCI_E_RANGE; }
+  return PciMmioRead32(base, off);
+}
+
+pub fn PciDevWrite32(dev: int64, idx: int64, off: int64, val: int64): int64 {
+  var base: int64 := PciDevBarBase(dev, idx);
+  if (base <= 0) { return PCI_E_BADARG; }
+  var len: int64 := peek64(dev + barLenOff(idx));
+  if (off < 0 || (off + 4) > len) { return PCI_E_RANGE; }
+  PciMmioWrite32(base, off, val);
+  return 0;
+}
+
+pub fn PciDevRead64(dev: int64, idx: int64, off: int64): int64 {
+  var base: int64 := PciDevBarBase(dev, idx);
+  if (base <= 0) { return PCI_E_BADARG; }
+  var len: int64 := peek64(dev + barLenOff(idx));
+  if (off < 0 || (off + 8) > len) { return PCI_E_RANGE; }
+  return PciMmioRead64(base, off);
+}
+
+pub fn PciDevWrite64(dev: int64, idx: int64, off: int64, val: int64): int64 {
+  var base: int64 := PciDevBarBase(dev, idx);
+  if (base <= 0) { return PCI_E_BADARG; }
+  var len: int64 := peek64(dev + barLenOff(idx));
+  if (off < 0 || (off + 8) > len) { return PCI_E_RANGE; }
+  PciMmioWrite64(base, off, val);
+  return 0;
+}

@@ -1,26 +1,31 @@
 // examples/hardware/pci_list.lyx
-// Ein kleiner lspci-Klon auf Basis von std/hardware/pci_* (Phase 1).
+// Ein lspci-Klon auf Basis von std/hardware/pci.lyx.
 //
 // Uebersetzen und starten:
 //   lyxc examples/hardware/pci_list.lyx -o pci_list && ./pci_list
 //
-// Lesen genuegt ohne root. Klarnamen zu Vendor- und Device-ID kommen erst
-// mit PCI-07 (pci.ids); bis dahin zeigt die Ausgabe die numerischen IDs
-// und den Klassennamen aus der eingebauten Tabelle.
+// Lesen der ersten 64 Config-Bytes geht ohne root. Alles darueber —
+// Capabilities, Link-Geschwindigkeit — laesst der Kernel nur den
+// Berechtigten sehen; ohne root steht dort deshalb nichts, und das Programm
+// sagt es einmal, statt Nullen zu zeigen.
 
 unit examples.hardware.pci_list;
 
+import std.hardware.pci;
 import std.hardware.pci_types;
 import std.hardware.pci_syscalls;
 import std.hardware.pci_config;
 import std.hardware.pci_enum;
+import std.hardware.pci_bar;
+import std.hardware.pci_caps;
+import std.hardware.pci_ids;
 import std.alloc;
 import std.fs;
 import std.io;
 
 // Hinweis: die pchar-Zwischenvariable ist noetig. `Print(buf as pchar)`
 // waehlt die int64-Ueberladung und druckt die Adresse statt des Textes
-// (Compiler-Defekt, siehe Issue zur Ueberladungsauswahl bei Cast-Argument).
+// (Compiler-Defekt #1316).
 fn printHex(val: int64, digits: int64) {
   var buf: int64 := alloc(24);
   var s: pchar := buf as pchar;
@@ -29,54 +34,95 @@ fn printHex(val: int64, digits: int64) {
   free(buf, 24);
 }
 
-fn printDevice(bdf: int64) {
-  var path: int64 := alloc(PCI_PATH_MAX);
-  var pathStr: pchar := path as pchar;
-  PciBdfFormat(path, bdf);
-  Print(pathStr);
-  free(path, PCI_PATH_MAX);
+var nameBuf: int64 := 0;
 
-  var ctx: int64 := PciCfgOpenSysfs(bdf);
-  if (ctx <= 0) {
-    Print("  <nicht lesbar: ");
-    Print(PciErrorName(ctx));
-    PrintLn(">");
-    return;
-  }
+// Der Zeiger wird bewusst hier erzeugt und nicht als globale pchar-Variable
+// gehalten: ein globaler Startwert muss zur Uebersetzungszeit feststehen.
+fn nameStr(): pchar {
+  var s: pchar := nameBuf as pchar;
+  return s;
+}
+
+// Gibt den Namen aus der Datenbank aus, sonst den Ersatztext.
+fn printNameOr(rc: int64, fallback: pchar) {
+  if (rc > 0) { Print(nameStr()); } else { Print(fallback); }
+}
+
+fn printDevice(dev: int64) {
+  var addr: int64 := alloc(PCI_BDF_STR_LEN);
+  var addrStr: pchar := addr as pchar;
+  PciDevAddressStr(dev, addr);
+  Print(addrStr);
+  free(addr, PCI_BDF_STR_LEN);
 
   Print(" ");
-  Print(PciClassNameBuiltin(PciBaseClass(ctx)));
-  Print(" [");
-  printHex(PciBaseClass(ctx), 2);
-  printHex(PciSubclass(ctx), 2);
-  Print("]: ");
-  printHex(PciVendorId(ctx), 4);
-  Print(":");
-  printHex(PciDeviceId(ctx), 4);
-  Print(" (rev ");
-  printHex(PciRevision(ctx), 2);
-  Print(")");
+  printNameOr(PciDevClassName(dev, nameBuf, 256),
+              PciClassNameBuiltin(PciDevBaseClass(dev)));
+  Print(": ");
 
-  if (PciIsMultifunction(ctx) == 1) { Print(" [multifunction]"); }
-  if (PciHeaderType(ctx) == PCI_HDR_BRIDGE) { Print(" [bridge]"); }
+  var vname: int64 := PciDevVendorName(dev, nameBuf, 256);
+  if (vname > 0) { Print(nameStr()); Print(" "); }
 
-  var cmd: int64 := PciCfgRead16(ctx, PCI_CFG_COMMAND);
-  if (cmd >= 0) {
-    Print("  cmd:");
-    if ((cmd & PCI_CMD_IO_SPACE) != 0)   { Print(" io"); }
-    if ((cmd & PCI_CMD_MEM_SPACE) != 0)  { Print(" mem"); }
-    if ((cmd & PCI_CMD_BUS_MASTER) != 0) { Print(" master"); }
-    if ((cmd & PCI_CMD_INTX_DISABLE) != 0) { Print(" intx-off"); }
+  var dname: int64 := PciDevDeviceName(dev, nameBuf, 256);
+  if (dname > 0) { Print(nameStr()); }
+  else {
+    printHex(PciDevVendorId(dev), 4);
+    Print(":");
+    printHex(PciDevDeviceId(dev), 4);
   }
 
+  Print(" (rev ");
+  printHex(PciDevRevision(dev), 2);
+  Print(")");
   PrintLn("");
-  PciCfgClose(ctx);
+
+  // Regionen
+  var i: int64 := 0;
+  while (i < PCI_BAR_COUNT) {
+    var size: int64 := PciDevBarSize(dev, i);
+    if (size > 0) {
+      Print("        Region ");
+      Print(IntToStr(i));
+      Print(": ");
+      if (PciDevBarIsIo(dev, i) == 1) { Print("I/O bei 0x"); } else { Print("Speicher bei 0x"); }
+      printHex(PciBarStart(PciDevBdf(dev), i), 8);
+      Print(" [Groesse=");
+      Print(IntToStr(size));
+      PrintLn("]");
+    }
+    i := i + 1;
+  }
+
+  // Capabilities — ohne root nicht lesbar, dann steht hier nichts.
+  var cap: int64 := PciDevCapFind(dev, PCI_CAP_ID_MSIX);
+  if (cap > 0) {
+    Print("        MSI-X: ");
+    Print(IntToStr(PciDevMsixVectors(dev)));
+    PrintLn(" Vektoren");
+  }
+  var speed: int64 := PciDevLinkSpeed(dev);
+  if (speed > 0) {
+    Print("        Link: ");
+    Print(PciPcieSpeedName(speed));
+    Print(" x");
+    PrintLn(IntToStr(PciDevLinkWidth(dev)));
+  }
 }
 
 fn main(): int64 {
   if (!IsDirectory(PCI_SYSFS_DEVICES)) {
     PrintLn("Kein /sys/bus/pci — dieser Kernel zeigt keinen PCI-Bus.");
     return 1;
+  }
+
+  nameBuf := alloc(256);
+
+  // Eine Datenbank fuer alle Geraete: sie ist 1,4 MB gross und soll nicht
+  // je Geraet neu gelesen werden.
+  var db: int64 := PciIdsOpen();
+  if (db < 0) {
+    PrintLn("Hinweis: keine pci.ids gefunden — es werden numerische IDs gezeigt.");
+    db := 0;
   }
 
   var buf: int64 := alloc(PCI_ENUM_MAX * 8);
@@ -92,7 +138,16 @@ fn main(): int64 {
 
   var i: int64 := 0;
   while (i < n) {
-    printDevice(peek64(buf + i * 8));
+    var dev: int64 := PciOpen(peek64(buf + i * 8));
+    if (dev < 0) {
+      Print("<nicht lesbar: ");
+      Print(PciErrorName(dev));
+      PrintLn(">");
+    } else {
+      if (db > 0) { PciAttachIds(dev, db); }
+      printDevice(dev);
+      PciClose(dev);
+    }
     i := i + 1;
   }
 
@@ -101,5 +156,7 @@ fn main(): int64 {
   PrintLn(" Geraete");
 
   free(buf, PCI_ENUM_MAX * 8);
+  if (db > 0) { PciIdsClose(db); }
+  free(nameBuf, 256);
   return 0;
 }

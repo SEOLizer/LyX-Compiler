@@ -1,5 +1,5 @@
 // tests/pci_hw_test.lyx
-// PCI Phase 1 — Test gegen echte Hardware, ausschliesslich lesend.
+// PCI Phase 1+2 — Test gegen echte Hardware, ausschliesslich lesend.
 //
 // Er schreibt nichts in irgendeinen Config-Space: ein Testlauf darf die
 // Maschine nicht umkonfigurieren. Fehlt /sys/bus/pci (Container, LyxOS,
@@ -11,6 +11,8 @@
 // AC-H2 Enumeration liefert mindestens ein Geraet
 // AC-H3 Jede gemeldete BDF laesst sich wieder oeffnen und lesen
 // AC-H4 Format(Parse(x)) == x fuer jede gemeldete Adresse
+// AC-H5 Fassade: oeffnen, Kopfdaten, BAR-Groessen, sauber schliessen
+// AC-H6 Zugriff auf ein nicht abgebildetes BAR wird abgewiesen
 
 unit tests.pci_hw_test;
 
@@ -18,6 +20,9 @@ import std.hardware.pci_types;
 import std.hardware.pci_syscalls;
 import std.hardware.pci_config;
 import std.hardware.pci_enum;
+import std.hardware.pci;
+import std.hardware.pci_bar;
+import std.hardware.pci_caps;
 import std.alloc;
 import std.string;
 import std.fs;
@@ -35,7 +40,7 @@ fn bad(name: pchar, detail: pchar) {
 }
 
 fn main(): int64 {
-  PrintLn("=== PCI Phase 1: Hardware (nur lesend) ===");
+  PrintLn("=== PCI Phase 1+2: Hardware (nur lesend) ===");
 
   if (!IsDirectory(PCI_SYSFS_DEVICES)) {
     PrintLn("SKIP kein /sys/bus/pci — nichts geprueft (kein PCI-Bus sichtbar)");
@@ -106,6 +111,46 @@ fn main(): int64 {
 
   if (roundtripFails == 0) { ok("AC-H4 format/parse rundlauf stabil"); }
   else { bad("AC-H4 format/parse rundlauf", IntToStr(roundtripFails)); }
+
+  // AC-H5/AC-H6: Fassade am ersten gemeldeten Geraet.
+  if (n > 0) {
+    var dev: int64 := PciOpen(peek64(buf));
+    if (dev <= 0) {
+      bad("AC-H5 fassade oeffnen", PciErrorName(dev));
+    } else {
+      var vid: int64 := PciDevVendorId(dev);
+      if (vid > 0 && vid != 65535) { ok("AC-H5 fassade liest vendor-id"); }
+      else { bad("AC-H5 fassade vendor-id", IntToStr(vid)); }
+
+      // Jede belegte Region muss eine Groesse und einen Anfang haben; die
+      // Angaben stammen aus zwei verschiedenen Quellen (Config-Space und
+      // resource-Datei) und muessen zueinander passen.
+      var bi: int64 := 0;
+      var barFails: int64 := 0;
+      while (bi < PCI_BAR_COUNT) {
+        var size: int64 := PciDevBarSize(dev, bi);
+        if (size > 0) {
+          var start: int64 := PciBarStart(PciDevBdf(dev), bi);
+          if (start <= 0) { barFails := barFails + 1; }
+          var raw: int64 := PciDevBarRaw(dev, bi);
+          if (raw <= 0) { barFails := barFails + 1; }
+        }
+        bi := bi + 1;
+      }
+      if (barFails == 0) { ok("AC-H5 BAR-Angaben stimmig"); }
+      else { bad("AC-H5 BAR-Angaben", IntToStr(barFails)); }
+
+      // AC-H6: ohne Abbildung darf kein Zugriff durchgehen — sonst
+      // schriebe die Fassade auf Adresse 0 + Offset.
+      if (PciDevRead32(dev, 0, 0) == PCI_E_BADARG) { ok("AC-H6 zugriff ohne abbildung abgewiesen"); }
+      else { bad("AC-H6 zugriff ohne abbildung", IntToStr(PciDevRead32(dev, 0, 0))); }
+      if (PciDevMapBar(dev, 9) == PCI_E_BADARG) { ok("AC-H6 BAR-index geprueft"); }
+      else { bad("AC-H6 BAR-index", "9 nicht abgewiesen"); }
+
+      PciClose(dev);
+      ok("AC-H5 fassade geschlossen");
+    }
+  }
 
   free(pathBuf, PCI_PATH_MAX);
   free(buf, PCI_ENUM_MAX * 8);

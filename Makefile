@@ -28,11 +28,12 @@ PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
 DATA_DST  := $(PKG_DIR)/usr/include/lyx/units/data
 BIN_DST   := $(PKG_DIR)/usr/local/bin
+SHARE_DST := $(PKG_DIR)/usr/share/lyx
 
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin lic_build_flags keygen sync-units-src
+.PHONY: build bootstrap singularity test test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin install-data lic_build_flags keygen sync-units-src
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -619,7 +620,7 @@ snapshot-update: lyxc
 
 # ── Paketierung ───────────────────────────────────────────────────────────────
 
-package: sync-units-src precompile-units install-bin
+package: sync-units-src precompile-units install-bin install-data
 	dpkg-deb --build $(PKG_DIR) $(DEB_NAME)
 	@echo ""
 	@echo "Paket fertig: $(DEB_NAME)"
@@ -648,6 +649,16 @@ precompile-units: lyxc
 	@echo "Pass 2: Kompiliere abhängige Units..."
 	$(MAKE) --no-print-directory $(UNITS_LYU) $(DATA_LYU)
 	@echo "$(words $(UNITS_LYU) $(DATA_LYU)) Units vorkompiliert."
+
+# Mitgelieferte Datendateien in den Paketbaum. Derzeit nur share/pci.ids
+# (PCI-ID-Datenbank, von std/hardware/pci_ids.lyx zur Laufzeit gelesen).
+# Sie wird bewusst NICHT zu einer Lyx-Datenunit uebersetzt: eine generierte
+# Unit dieser Groesse bringt lyxc zum Absturz.
+install-data:
+	@echo "Installiere share/ -> $(SHARE_DST)/"
+	@mkdir -p $(SHARE_DST)
+	cp share/pci.ids $(SHARE_DST)/pci.ids
+	cp share/pci.ids.LICENSE $(SHARE_DST)/pci.ids.LICENSE
 
 install-bin: lyxc
 	@echo "Installiere lyxc -> $(BIN_DST)/"
