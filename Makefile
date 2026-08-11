@@ -431,6 +431,9 @@ test: lyxc
 	@echo "--- Enum-Member, doppelte Namen, Escape-Sequenzen (12 Pruefungen) ---"
 	@bash tests/enum_escape_test.sh
 	@echo "OK"
+	@echo "--- stdlib: string, json, pack, result, log (14 Pruefungen) ---"
+	@bash tests/stdlib_bundle_test.sh
+	@echo "OK"
 	@echo "--- TextMate-Grammatik: Schluesselwoerter und Typen vollstaendig ---"
 	@bash tests/syntax/test_grammar.sh
 	@echo "OK"
