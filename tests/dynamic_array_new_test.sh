@@ -120,6 +120,32 @@ fn main(): int64 {
   return 0;
 }' "new T[n]: Laenge muss > 0 sein"
 
+# ── #1355: OHNE Typangabe. Der Wert ist ein Array, also muss das Local als
+#    solches gelten — sonst liest `len` die falsche Stelle und der Index
+#    ueberspringt den Kopf nicht. Mit ausgeschriebenem `: array` trug es
+#    laengst; genau diese Form fehlte, und aus dem lauten Parse-Fehler vor
+#    #1255 war ein stiller falscher Wert geworden.
+out "new T[n] ohne Typangabe" 'fn main(): int64 {
+  var a := new int64[4];
+  PrintStr("len "); PrintInt(len(a)); PrintLn("");
+  a[0] := 1; a[3] := 9;
+  PrintStr("sum "); PrintInt(a[0] + a[3]); PrintLn("");
+  return 0;
+}' "len 4
+sum 10"
+
+out "new T[n] ohne Typangabe, gerechnete Laenge" 'import std.io;
+fn groesse(): int64 { return 6; }
+fn main(): int64 {
+  var a := new int64[groesse()];
+  var i: int64 := 0;
+  while (i < len(a)) { a[i] := i * 2; i := i + 1; }
+  PrintLn(IntToStr(len(a)));
+  PrintLn(IntToStr(a[5]));
+  return 0;
+}' "6
+10"
+
 # ── Gegenprobe: `new T()` darf davon unberuehrt bleiben.
 out "new T() ohne Klammer-Index bleibt eine Instanz" 'import std.io;
 type P = struct { x: int64; y: int64; };
