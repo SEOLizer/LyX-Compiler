@@ -1632,6 +1632,16 @@ pub type Codegen = class {
   }
 
   fn cg_addCon(name: pchar, nlen: int64, val: int64) {
+    // #1338: Der Vorpass laeuft zweimal, damit eine Konstante gilt, die auf
+    // eine weiter unten stehende verweist. Beim zweiten Lauf muss der bessere
+    // Wert den ersten ERSETZEN — wuerde er nur angehaengt, faende die Suche
+    // weiter den alten Eintrag (sie nimmt den ersten Treffer), und die
+    // Ableitung bliebe auf ihrem Zwischenwert stehen.
+    var vorh: int64 := self.cg_findConIdx(name, nlen);
+    if (vorh >= 0) {
+      poke64(self.conTable + vorh * CG_CON_SZ + CG_CON_OFF_VAL, val);
+      return;
+    }
     if (self.conCount >= self.conCap) {
       var nc: int64 := self.conCap * 2;
       var nb: int64 := alloc(nc * CG_CON_SZ);
@@ -1689,7 +1699,13 @@ pub type Codegen = class {
   // Add a pchar string constant: stores data offset in conTable and marks conIsPchar.
   fn cg_addConStr(name: pchar, nlen: int64, dataOff: int64) {
     self.cg_addCon(name, nlen, dataOff);
-    poke8(self.conIsPchar + (self.conCount - 1), 1);
+    // #1338: seit cg_addCon einen vorhandenen Eintrag ERSETZT, ist der neue
+    // nicht mehr zwingend der letzte. Die Markierung gehoert an den Eintrag,
+    // der eben geschrieben wurde — sonst traegt bei einem gleichnamigen
+    // zweiten Eintrag eine fremde Konstante das pchar-Kennzeichen und wird als
+    // Adresse geladen.
+    var idx: int64 := self.cg_findConIdx(name, nlen);
+    if (idx >= 0) { poke8(self.conIsPchar + idx, 1); }
   }
 
   // Emit code to load a constant into rax.
@@ -3774,8 +3790,17 @@ pub type Codegen = class {
       }
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);  // mov rcx, rax (divisor)
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);  // mov rax, rbx (dividend)
-      self.cg_e8(0x48); self.cg_e8(0x99);                     // cqo — sign-extend rax → rdx:rax
-      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);  // idiv rcx
+      // #1352: Vergleiche und Rechtsshift richteten sich laengst nach dem
+      // Vorzeichen des Typs, Division und Rest nicht — hier stand immer
+      // `cqo; idiv`. Bei einem uint64 mit gesetztem oberstem Bit las idiv den
+      // Wert als negativ: 2^64-2 durch 2 ergab -1 statt 9223372036854775807.
+      if (lhsUnsigned != 0) {
+        self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);  // xor rdx, rdx
+        self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF1);  // div rcx (vorzeichenlos)
+      } else {
+        self.cg_e8(0x48); self.cg_e8(0x99);                     // cqo — sign-extend rax → rdx:rax
+        self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);  // idiv rcx
+      }
     } else if (op == CGT_PERCENT) {
       // same as div but result = rdx (remainder)
       // WP-BC-48: --runtime-checks → zero-check divisor before mod
@@ -3796,8 +3821,13 @@ pub type Codegen = class {
       }
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);  // mov rcx, rax
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);  // mov rax, rbx
-      self.cg_e8(0x48); self.cg_e8(0x99);                     // cqo — sign-extend rax → rdx:rax
-      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);  // idiv rcx
+      if (lhsUnsigned != 0) {                                  // #1352
+        self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);  // xor rdx, rdx
+        self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF1);  // div rcx
+      } else {
+        self.cg_e8(0x48); self.cg_e8(0x99);                     // cqo
+        self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);  // idiv rcx
+      }
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);  // mov rax, rdx
     } else if (op == CGT_SHL) {
       // shl rbx, cl  (48 D3 E3)  — rax=count → move to cl
@@ -15318,6 +15348,59 @@ pub type Codegen = class {
   // Top-level file generation
   // ------------------------------------------------------------------
 
+  // #1338: Konstanten und Enum-Mitglieder wurden in DEMSELBEN Durchlauf
+  // eingetragen, der auch die Funktionsruempfe erzeugt. Eine `con`-Zeile
+  // UNTER einer Funktion war beim Uebersetzen ihres Rumpfes also noch nicht
+  // bekannt — und der Bezeichner loeste still zu 0 auf. 0 ist ein
+  // unauffaelliger Wert: der Vergleich wird nie wahr, die Rechnung ergibt 0.
+  // Genau so verschwanden in std/os.lyx alle Zweige gegen SC_PAGESIZE.
+  //
+  // Fuer FUNKTIONEN galt die Vorwaertsreferenz laengst; dass ausgerechnet
+  // Konstanten anders sind, kann niemand erwarten. Dieser Vorpass traegt sie
+  // ein, bevor der erste Rumpf entsteht — zweimal, damit auch eine Konstante
+  // gilt, die auf eine weiter unten stehende verweist.
+  fn cg_collectCons(head: int64) {
+    var runde: int64 := 0;
+    while (runde < 2) {
+      var cur: int64 := head;
+      while (cur != -1) {
+        var k: int64 := self.cg_nkind(cur);
+        if (k == CGN_CON_DECL) {
+          var initNode: int64 := self.cg_nc1(cur);
+          if (initNode >= 0) {
+            if (self.cg_nkind(initNode) == CGN_LIT_STR) {
+              // Die Zeichenkette darf nur EINMAL in den Datenbereich.
+              if (runde == 0) {
+                var dataOff: int64 := self.cg_addStr(self.cg_nsoff(initNode), self.cg_nslen(initNode));
+                self.cg_addConStr(self.cg_nsval(cur), self.cg_nslen(cur), dataOff);
+              }
+            } else {
+              self.cg_addCon(self.cg_nsval(cur), self.cg_nslen(cur), self.cg_evalConExpr(initNode));
+            }
+          }
+        } else if (k == CGN_ENUM_DECL) {
+          if (runde == 0) {
+            var mem: int64 := self.cg_nc0(cur);
+            var nextVal: int64 := 0;
+            while (mem != -1) {
+              var valNode: int64 := self.cg_nc0(mem);
+              if (valNode >= 0 && self.cg_nkind(valNode) == CGN_LIT_INT) {
+                nextVal := self.cg_nival(valNode);
+              }
+              self.cg_addCon(self.cg_nsval(mem), self.cg_nslen(mem), nextVal);
+              nextVal += 1;
+              mem := self.cg_nnext(mem);
+            }
+          }
+        } else if (k == CGN_BLOCK) {
+          self.cg_collectCons(self.cg_nc0(cur));   // @if-Zweig
+        }
+        cur := self.cg_nnext(cur);
+      }
+      runde += 1;
+    }
+  }
+
   fn cg_genFile(head: int64) {
     self.topLevelHead := head;   // A1: früh setzen (für cg_isDeclaredFunc beim Fn-Name-als-Wert)
     // Pre-pass: collect all user-defined functions returning f64 for cg_isF64Expr.
@@ -15327,6 +15410,7 @@ pub type Codegen = class {
     self.cg_collectUtypes(head);          // #1110: Einheitentypen samt Faktor
     self.cg_collectIfaceSelectors(head);  // #1133: Interface-Selektoren (vor den Layouts!)
     self.cg_collectFlightCrit(head);      // #1140: gibt es @flight_crit im Programm?
+    self.cg_collectCons(head);            // #1338: Konstanten VOR den Rumpfen
 
     var cur: int64 := head;
     while (cur != -1) {
@@ -15624,34 +15708,11 @@ pub type Codegen = class {
           }
         }
       } else if (k == CGN_CON_DECL) {
-        // Populate constant table; evaluate arbitrary constant expressions
-        var initNode: int64 := self.cg_nc1(cur);
-        if (initNode >= 0) {
-          if (self.cg_nkind(initNode) == CGN_LIT_STR) {
-            // String literal init → pchar constant; store data offset + mark pchar
-            var dataOff: int64 := self.cg_addStr(self.cg_nsoff(initNode), self.cg_nslen(initNode));
-            self.cg_addConStr(self.cg_nsval(cur), self.cg_nslen(cur), dataOff);
-          } else {
-            var conVal: int64 := self.cg_evalConExpr(initNode);
-            self.cg_addCon(self.cg_nsval(cur), self.cg_nslen(cur), conVal);
-          }
-        }
+        // #1338: bereits im Vorpass cg_collectCons eingetragen.
       } else if (k == CGN_ENUM_DECL) {
-        // WP-10f: register each enum member as an int64 constant
-        // auto-increment from 0; explicit value overrides via child0
-        var mem: int64 := self.cg_nc0(cur);
-        var nextVal: int64 := 0;
-        while (mem != -1) {
-          var mname: pchar := self.cg_nsval(mem);
-          var mlen:  int64 := self.cg_nslen(mem);
-          var valNode: int64 := self.cg_nc0(mem);
-          if (valNode >= 0 && self.cg_nkind(valNode) == CGN_LIT_INT) {
-            nextVal := self.cg_nival(valNode);
-          }
-          self.cg_addCon(mname, mlen, nextVal);
-          nextVal += 1;
-          mem := self.cg_nnext(mem);
-        }
+        // WP-10f: Enum-Mitglieder sind Konstanten — seit #1338 traegt sie der
+        // Vorpass cg_collectCons ein, damit sie auch in einer Funktion
+        // DARUEBER gelten.
       } else if (k == CGN_DIM_DECL || k == CGN_UTYPE_DECL) {
         // WP-BC-16: rein uebersetzungszeitlich; kein Code. Die Faktoren und
         // Grenzen sammelt cg_collectUtypes vorab ein (#1110).
