@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.17J
+VERSION   := 1.0.17K
 VERSION_DATE := 2026-08-12
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -497,6 +497,12 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Backend-Opcodes und VerifyIntegrity: kein stiller Default mehr (18 Pruefungen) ---"
 	@bash tests/backend_opcodes_test.sh
+	@echo "OK"
+	@echo "--- f64-Typspur: globale, Array-Elemente, Felder, Casts (13 Pruefungen) ---"
+	@bash tests/f64_typspur_test.sh
+	@echo "OK"
+	@echo "--- StringBuilder waechst, r-Literal, Methodenrueckgabe (11 Pruefungen) ---"
+	@bash tests/stringbuilder_rawstring_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh

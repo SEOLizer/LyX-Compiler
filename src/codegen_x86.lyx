@@ -587,6 +587,7 @@ pub type Codegen = class {
 
   // Per-local array flag (WP-10b): byte buffer parallel to locals, 1 = array type
   localIsArray:      int64;
+  localElemFloat:    int64;   // #1374: 1 = Elementtyp des Arrays ist f64/f32
   localArraySize:    int64;  // WP-BC-51: int64 buffer, stores array length per local (0 = not array)
   // #1230: Zeilenlaenge M eines `[N][M]T`. 0 = eindimensional. Das Layout ist
   // FLACH (N*M Slots hinter einem {cap,len}-Kopf); `m[i]` liefert die Adresse
@@ -943,6 +944,9 @@ pub type Codegen = class {
       i := 0;
       memcpy(ab, self.localIsArray, self.localCount);
       self.localIsArray := ab;
+      var efb: int64 := alloc(nc);              // #1374
+      memcpy(efb, self.localElemFloat, self.localCount);
+      self.localElemFloat := efb;
       var sb: int64 := alloc(nc * 8);
       i := 0;
       memcpy(sb, self.localArraySize, self.localCount * 8);
@@ -975,6 +979,7 @@ pub type Codegen = class {
     poke64(toff,                   0);
     poke64(toff + CG_LOCTYPE_OFF_LEN, 0);
     poke8(self.localIsArray      + self.localCount, 0);
+    poke8(self.localElemFloat    + self.localCount, 0);   // #1374
     poke64(self.localArraySize   + self.localCount * 8, 0);
     poke64(self.localArrayRow    + self.localCount * 8, 0);   // #1230
     poke8(self.localIsRedundant  + self.localCount, 0);  // WP-3.1
@@ -1346,6 +1351,8 @@ pub type Codegen = class {
       // Adresssumme wurde dereferenziert. Die Angabe steht im Quelltext; sie
       // wurde an dieser Stelle nur nicht herangezogen.
       if (self.cg_funcRetTypeIs(fp, fl, "pchar"c, 5) == 1) { return 1; }
+      // #1381: dasselbe fuer Methodenaufrufe (gemangelter Name in der Registry).
+      if (self.cg_callRetTypeIs(ni, "pchar"c, 5) == 1) { return 1; }
       if (self.cg_seq(fp, fl, "IntToStr",    8))  { return 1; }
       if (self.cg_seq(fp, fl, "StrFromInt",  10)) { return 1; }
       if (self.cg_seq(fp, fl, "StrConcat",   9))  { return 1; }
@@ -2165,6 +2172,23 @@ pub type Codegen = class {
     if (ch >= 97 && ch <= 102) { return ch - 97 + 10; }   // a-f
     if (ch >= 65 && ch <= 70)  { return ch - 65 + 10; }   // A-F
     return 0 - 1;
+  }
+
+  // #1378: Rohzeichenkette — Bytes unveraendert uebernehmen. Ein Regex-Literal
+  // `r"\d+"` ist genau dafuer da, dass der Backslash stehen bleibt; die
+  // Escape-Auswertung von cg_addStr machte daraus einen Fehler
+  // ("unbekannte Escape-Sequenz '\d'") und aus `r"a\nb"` einen Zeilenumbruch.
+  // Uebersprungen werden nur die beiden Anfuehrungszeichen.
+  fn cg_addStrRaw(sOff: int64, sLen: int64): int64 {
+    var doff: int64 := self.dataLen;
+    var i: int64 := sOff + 1;
+    var eend: int64 := sOff + sLen - 1;
+    while (i < eend) {
+      self.cg_edata(StrCharAt(self.pSrc, i) & 255);
+      i := i + 1;
+    }
+    self.cg_edata(0);
+    return doff;
   }
 
   fn cg_addStr(sOff: int64, sLen: int64): int64 {
@@ -3011,6 +3035,33 @@ pub type Codegen = class {
     return 0;
   }
 
+  // #1381: Rueckgabetyp eines AUFRUFS — gleich, ob freie Funktion oder Methode.
+  // Methoden stehen in der Registry unter dem gemangelten Namen
+  // `Klasse_Methode`; wer nur den Methodennamen nachschlaegt, findet nichts und
+  // haelt das Ergebnis fuer eine Ganzzahl. Genau daran gab
+  // `PrintLn(sb.ToString())` die Adresse aus statt der Zeichenkette.
+  // Rueckgabe: 1 = ja, 0 = nein (Typ bekannt), -1 = unbekannt.
+  fn cg_callRetTypeIs(ni: int64, tname: pchar, tlen: int64): int64 {
+    var fp: pchar := self.cg_nsval(ni);
+    var fl: int64 := self.cg_nslen(ni);
+    if (self.cg_nival(ni) == 0) {
+      return self.cg_funcRetTypeIs(fp, fl, tname, tlen);
+    }
+    var clsIdx: int64 := self.cg_exprClassName(self.cg_nc0(ni));
+    if (clsIdx < 0) { return 0 - 1; }
+    var cbase: int64 := self.classLayouts + clsIdx * CG_CLASS_SZ;
+    var cnp: pchar := peek64(cbase) as pchar;
+    var cnl: int64 := peek64(cbase + CG_PATCH_OFF_NAMEPTR);
+    if (cnp == 0 as pchar || cnl <= 0) { return 0 - 1; }
+    var lcell: int64 := alloc(8);
+    var mbuf: int64 := self.cg_mangleInto(cnp, cnl, fp, fl, lcell);
+    var mlen: int64 := peek64(lcell);
+    free(lcell, 8);
+    var r: int64 := self.cg_funcRetTypeIs(mbuf as pchar, mlen, tname, tlen);
+    self.cg_trackTempBuf(mbuf, mlen + 1);
+    return r;
+  }
+
   // Operator overloading (Stage 2c): record a function's declared return type.
   fn cg_registerFuncRet(name: pchar, nameLen: int64, retName: pchar, retLen: int64) {
     if (self.fnRetCount >= self.fnRetCap) {
@@ -3405,6 +3456,31 @@ pub type Codegen = class {
     return 0;
   }
 
+  // #1374: Elementtyp beim Anlegen des Locals vermerken. Der Typname des
+  // Arrays selbst taugt dafuer nicht — `[3]f64` steht als eigener Knoten da,
+  // und localTypes traegt (fuer Klassen) den Elementtyp, fuer f64 aber nichts.
+  // Ein eigenes Kennzeichen ist sauberer, als den Typnamen umzudeuten: `arr`
+  // ist KEIN f64, nur `arr[i]` ist eines.
+  fn cg_markElemFloat(localIdx: int64, elemTypeNode: int64) {
+    if (localIdx < 0 || elemTypeNode < 0) { return; }
+    if (self.cg_nkind(elemTypeNode) != 60) { return; }
+    if (self.cg_isFloatTypeName(self.cg_nsval(elemTypeNode), self.cg_nslen(elemTypeNode)) != 0) {
+      poke8(self.localElemFloat + localIdx, 1);
+    }
+  }
+
+  // #1374: Traegt der Grundausdruck eines Index-Zugriffs Fliesskomma-Elemente?
+  // Der deklarierte Typ steht als NAME da — `[3]f64`, `f64[]`, `Array<f64>`.
+  // Geprueft wird deshalb auf den Elementnamen im Typnamen, statt eine eigene
+  // Typdarstellung zu erfinden, die es an dieser Stelle nicht gibt.
+  fn cg_isF64ElemOf(baseNi: int64): int64 {
+    if (baseNi < 0) { return 0; }
+    if (self.cg_nkind(baseNi) != CGN_IDENT) { return 0; }
+    var li: int64 := self.cg_findLocalIdx(self.cg_nsval(baseNi), self.cg_nslen(baseNi));
+    if (li < 0) { return 0; }
+    return peek8(self.localElemFloat + li) as int64;
+  }
+
   // Returns 1 if expression ni produces an f64 value (IEEE-754 bits in GP register).
   fn cg_isF64Expr(ni: int64): int64 {
     if ni < 0 { return 0; }
@@ -3412,11 +3488,32 @@ pub type Codegen = class {
     if k == CGN_LIT_FLOAT { return 1; }
     if k == CGN_IDENT {
       var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
-      if idx < 0 { return 0; }
-      var tb:  int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
-      var tp:  pchar := peek64(tb) as pchar;
-      var tln: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
-      return self.cg_isFloatTypeName(tp, tln);
+      if idx >= 0 {
+        var tb:  int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
+        var tp:  pchar := peek64(tb) as pchar;
+        var tln: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+        return self.cg_isFloatTypeName(tp, tln);
+      }
+      // #1373: GLOBALE waren hier nicht vorgesehen — die Funktion sah nur in
+      // der Liste der Locals nach und gab sonst 0 zurueck. Eine globale f64
+      // galt damit als Ganzzahl: `g as int64` lieferte das rohe Bitmuster,
+      // Arithmetik rechnete auf den IEEE-Bits. Dieselbe Luecke wie beim
+      // `as`-Cast (#905), beim Feldzugriff (#1203) und beim Einheitentyp
+      // (#1358) — nur eine Knotenart weiter.
+      var gidx: int64 := self.cg_findGlobalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if gidx >= 0 {
+        var gp: pchar := peek64(self.globalTypeNames + gidx * 16) as pchar;
+        var gl: int64 := peek64(self.globalTypeNames + gidx * 16 + 8);
+        if (gp == 0 as pchar || gl <= 0) { return 0; }
+        return self.cg_isFloatTypeName(gp, gl);
+      }
+      return 0;
+    }
+    // #1374: das ARRAY-ELEMENT. `arr[0]` mit `arr: [3]f64` galt ebenfalls als
+    // Ganzzahl. Massgeblich ist der Elementtyp des Grundausdrucks; steht dort
+    // ein Fliesskommatyp, traegt auch das Element einen.
+    if k == CGN_INDEX {
+      return self.cg_isF64ElemOf(self.cg_nc0(ni));
     }
     if k == CGN_BINOP {
       var bop: int64 := self.cg_nival(ni);
@@ -6532,7 +6629,7 @@ pub type Codegen = class {
     } else if (k == CGN_REGEX_LIT) {
       var sOff: int64 := self.cg_nsoff(ni);
       var sLen: int64 := self.cg_nslen(ni);
-      var dataOff: int64 := self.cg_addStr(sOff, sLen);
+      var dataOff: int64 := self.cg_addStrRaw(sOff, sLen);   // #1378
       var patchPos: int64 := self.cg_emitLeaStr();
       self.cg_addPatch(patchPos, dataOff, 0, CG_PATCH_STR);
 
@@ -7595,16 +7692,20 @@ pub type Codegen = class {
     // `PrintLn(StrFromInt(42))` gab den Zeiger aus. Zuerst der deklarierte
     // Rueckgabetyp (die Registry kennt die Benutzerfunktionen), sonst die Liste
     // der Zeichenketten-Builtins.
-    if (k == CGN_CALL && self.cg_nival(argNi) == 0) {
+    if (k == CGN_CALL) {
       var cnm: pchar := self.cg_nsval(argNi);
       var cnl: int64 := self.cg_nslen(argNi);
-      var decl: int64 := self.cg_funcRetTypeIs(cnm, cnl, "pchar"c, 5);
+      // #1381: greift jetzt auch fuer Methodenaufrufe — vorher stand hier
+      // `&& self.cg_nival(argNi) == 0`, und `PrintLn(sb.ToString())` fiel
+      // durch auf "Ganzzahl", obwohl der Rueckgabetyp deklariert ist.
+      var decl: int64 := self.cg_callRetTypeIs(argNi, "pchar"c, 5);
       if (decl == 1) { return 1; }
       if (decl == 0) {
-        if (self.cg_funcRetTypeIs(cnm, cnl, "f64"c, 3) == 1) { return 2; }
-        if (self.cg_funcRetTypeIs(cnm, cnl, "bool"c, 4) == 1) { return 3; }
+        if (self.cg_callRetTypeIs(argNi, "f64"c, 3) == 1) { return 2; }
+        if (self.cg_callRetTypeIs(argNi, "bool"c, 4) == 1) { return 3; }
         return 0;
       }
+      if (self.cg_nival(argNi) != 0) { return 0; }
       // Funktion nicht in der Registry → Builtin
       if (self.cg_builtinReturnsPchar(cnm, cnl) != 0) { return 1; }
       return 0;
@@ -11181,6 +11282,7 @@ pub type Codegen = class {
       // Track array locals: NK_TYPE_ARRAY (=61) or NK_TYPE_NAME "Array<T>" (uppercase, =60)
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 61) {
         poke8(self.localIsArray + localIdx, 1);
+        self.cg_markElemFloat(localIdx, self.cg_nc0(typeNode));   // #1374
         // For T[] where T is a struct: store element type name in localTypes
         var elemNode: int64 := self.cg_nc0(typeNode);
         if (elemNode >= 0 && self.cg_nkind(elemNode) == 60) {
@@ -11196,6 +11298,7 @@ pub type Codegen = class {
         var tnLen: int64 := self.cg_nslen(typeNode);
         if (self.cg_seq(tnArr, tnLen, "Array", 5)) {
           poke8(self.localIsArray + localIdx, 1);
+          self.cg_markElemFloat(localIdx, self.cg_nc1(typeNode));   // #1374
           // For Array<T> where T is a struct: store element type name in localTypes
           var elemNode2: int64 := self.cg_nc1(typeNode);
           if (elemNode2 >= 0 && self.cg_nkind(elemNode2) == 60) {
@@ -11220,6 +11323,7 @@ pub type Codegen = class {
         // seine Laenge naemlich auch in localArraySize, waechst aber mit
         // push/append — dort ist der Vermerk nur die ANFANGSlaenge.
         poke8(self.localIsArray + localIdx, 2);
+        self.cg_markElemFloat(localIdx, self.cg_nc0(typeNode));   // #1374
         var sizeNode: int64 := self.cg_nc1(typeNode);
         if (sizeNode >= 0 && self.cg_nkind(sizeNode) == CGN_LIT_INT) {
           poke64(self.localArraySize + localIdx * 8, self.cg_nival(sizeNode));
@@ -16014,6 +16118,7 @@ pub type Codegen = class {
 
     // Per-local array flag (WP-10b)
     self.localIsArray     := alloc(self.localCap);
+    self.localElemFloat   := alloc(self.localCap);   // #1374
     // WP-3.1: per-local redundant flag
     self.localIsRedundant := alloc(self.localCap);
     self.verifyTmr      := 0;

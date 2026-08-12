@@ -515,46 +515,93 @@ pub fn StrCount(s: pchar, needle: pchar): int64 {
 
 pub type StringBuilder = class {
   buf: pchar;
+  cap: int64;   // #1377: belegte Groesse des Puffers
+  len: int64;   // #1377: benutzte Laenge (ohne die abschliessende 0)
 
+  // #1377: Der Puffer wurde bei Init einmal angelegt und danach NIE
+  // vergroessert. `StrAppendStr` haengt an Ort und Stelle an und kennt keine
+  // Kapazitaet — wer mehr anhaengte, als hineinpasste, schrieb hinter das Ende
+  // und zerschrieb den Heap. Ein `sb.Init(16)` mit drei Append war genug.
+  //
+  // Ausserdem stand hier zweimal `poke64(addr - 8, …)`, als traege StrNew ein
+  // Laengenwort vor dem Puffer. Das tut es nicht: StrNew ist ein blankes mmap.
+  // Die Schreibzugriffe gingen also in die Seite DAVOR.
+  //
+  // Jetzt fuehrt der Builder seine eigene Buchhaltung und waechst, wenn es eng
+  // wird.
   fn Init(initialCap: int64) {
-    self.buf := StrNew(initialCap);
+    var c: int64 := initialCap;
+    if (c < 16) { c := 16; }
+    self.buf := StrNew(c);
+    self.cap := c;
+    self.len := 0;
+    StrSetChar(self.buf, 0, 0);
+  }
+
+  // Platz fuer `zusatz` weitere Zeichen schaffen (plus die abschliessende 0).
+  fn Reserve(zusatz: int64) {
+    var noetig: int64 := self.len + zusatz + 1;
+    if (noetig <= self.cap) { return; }
+    var neu: int64 := self.cap * 2;
+    if (neu < 16) { neu := 16; }
+    while (neu < noetig) { neu := neu * 2; }
+    var nb: pchar := StrNew(neu);
+    var i: int64 := 0;
+    while (i < self.len) {
+      StrSetChar(nb, i, StrCharAt(self.buf, i));
+      i := i + 1;
+    }
+    StrSetChar(nb, self.len, 0);
+    StrFree(self.buf);
+    self.buf := nb;
+    self.cap := neu;
   }
 
   fn Append(s: pchar) {
-    self.buf := StrAppendStr(self.buf, s);
+    if (s == 0 as pchar) { return; }
+    var sl: int64 := StrLen(s);
+    self.Reserve(sl);
+    var i: int64 := 0;
+    while (i < sl) {
+      StrSetChar(self.buf, self.len + i, StrCharAt(s, i));
+      i := i + 1;
+    }
+    self.len := self.len + sl;
+    StrSetChar(self.buf, self.len, 0);
   }
 
   fn AppendChar(c: int64) {
-    var tmp: pchar := StrNew(2);
-    StrSetChar(tmp, 0, c);
-    var tmpaddr: int64 := tmp as int64;
-    poke64(tmpaddr - 8, 1);
-    self.buf := StrAppendStr(self.buf, tmp);
-    StrFree(tmp);
+    self.Reserve(1);
+    StrSetChar(self.buf, self.len, c);
+    self.len := self.len + 1;
+    StrSetChar(self.buf, self.len, 0);
   }
 
   fn AppendInt(n: int64) {
     var ns: pchar := IntToStr(n);
-    self.buf := StrAppendStr(self.buf, ns);
+    self.Append(ns);
     StrFree(ns);
   }
 
+  fn Length(): int64 { return self.len; }
+  fn Capacity(): int64 { return self.cap; }
+
   fn ToString(): pchar {
-    var len: int64 := StrLen(self.buf);
-    return StrSub(self.buf, 0, len);
+    return StrSub(self.buf, 0, self.len);
   }
 
   fn Clear() {
+    self.len := 0;
     StrSetChar(self.buf, 0, 0);
-    var bufaddr: int64 := self.buf as int64;
-    poke64(bufaddr - 8, 0);
   }
 
   fn FreeBuffer() {
     StrFree(self.buf);
+    self.buf := 0 as pchar;
+    self.cap := 0;
+    self.len := 0;
   }
 };
-
 // ============================================================================
 // STRTRIM — returns heap-allocated trimmed copy (distinct from StrTrimWhitespace)
 // ============================================================================
