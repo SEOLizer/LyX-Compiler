@@ -794,6 +794,8 @@ pub type Codegen = class {
 
   // WP-T14: --capabilities=compat: kein seccomp/landlock/proxy trotz @capabilities
   lcbsCompatMode:     int64;  // 1 = Compat-Modus aktiv (gesetzt von lyxc.lyx)
+  lcbsSeccompTrap:    int64;  // #1348: 1 = SECCOMP_RET_TRAP statt KILL_PROCESS
+  lcbsUsesTls:        int64;  // #1348: Programm importiert std.net.tls/https
   // WP-25: Runtime-Warnung im generierten Binary
   lcbsCompatWarnOff:  int64;  // Daten-Offset der Warnung (-1 = nicht gesetzt)
   lcbsCompatWarnLen:  int64;  // Länge der Warnung in Bytes
@@ -15975,6 +15977,8 @@ pub type Codegen = class {
 
     // WP-T14: Compat-Modus (kein seccomp/landlock)
     self.lcbsCompatMode    := 0;
+    self.lcbsSeccompTrap   := 0;
+    self.lcbsUsesTls       := 0;
     self.lcbsCompatWarnOff := 0 - 1;
     self.lcbsCompatWarnLen := 0;
     self.lcbsWxActive      := 0;
@@ -16105,9 +16109,60 @@ pub type Codegen = class {
         var hasGrant: int64 := 0;
         if grantNi >= 0 && self.cg_nkind(grantNi) == 114 { hasGrant := 1; }
         if hasGrant == 0 { self.lcbsMissingGrants := self.lcbsMissingGrants + 1; }
+        // #1348: TLS braucht mehr als die naheliegenden Capabilities. Zur
+        // Zertifikatspruefung stattet OpenSSL den CA-Store ab (getdents64,
+        // stat, lstat, statx) — das haengt an fs.meta, nicht an fs.read.
+        // Fehlt es, stirbt der Prozess mitten im Handshake an SIGSYS: kein
+        // Rueckgabewert, keine Meldung. Diagnose per Bisektion der
+        // Capability-Liste ist zumutbar fuer niemanden, also sagen wir es
+        // hier, wo beides bekannt ist: die Importe und die Deklaration.
+        var impName: pchar := self.cg_nsval(ni);
+        var impLen:  int64 := self.cg_nslen(ni);
+        if self.cg_pathHas(impName, impLen, "net.tls"c, 7) != 0
+           || self.cg_pathHas(impName, impLen, "net.https"c, 9) != 0 {
+          self.lcbsUsesTls := 1;
+        }
       }
       ni := self.cg_nnext(ni);
     }
+
+    if self.lcbsEnabled != 0 && self.lcbsUsesTls != 0 {
+      var hasMeta: int64 := 0;
+      var hasRead: int64 := 0;
+      var mi: int64 := 0;
+      while mi < self.lcbsCapCount {
+        var cv: int64 := peek64(self.lcbsCapBuf + mi * 8);
+        if cv == 11 { hasMeta := 1; }   // fs.meta
+        if cv == 7  { hasRead := 1; }   // fs.read
+        mi += 1;
+      }
+      if hasMeta == 0 || hasRead == 0 {
+        EPrintStrLn("warning: TLS prueft Zertifikate gegen den CA-Store des Systems und braucht dafuer"c);
+        EPrintStrLn("         fs.read UND fs.meta (Verzeichnis abstatten: getdents64, stat, lstat, statx)."c);
+        EPrintStr("         In der Capability-Liste fehlt: "c);
+        if hasRead == 0 { EPrintStr("fs.read "c); }
+        if hasMeta == 0 { EPrintStr("fs.meta"c); }
+        EPrintStrLn(""c);
+        EPrintStrLn("         Ohne sie stirbt der Handshake an SIGSYS, ohne Meldung und ohne Rueckgabewert (#1348)."c);
+      }
+    }
+  }
+
+  // Enthaelt der Modulpfad das Teilstueck `nadel`?
+  fn cg_pathHas(hay: pchar, hayLen: int64, nadel: pchar, nadelLen: int64): int64 {
+    if hayLen < nadelLen { return 0; }
+    var i: int64 := 0;
+    while i + nadelLen <= hayLen {
+      var j: int64 := 0;
+      var gleich: int64 := 1;
+      while j < nadelLen {
+        if (StrCharAt(hay, i + j) & 255) != (StrCharAt(nadel, j) & 255) { gleich := 0; j := nadelLen; }
+        j += 1;
+      }
+      if gleich != 0 { return 1; }
+      i += 1;
+    }
+    return 0;
   }
 
   // WP-25.2: Warnung-String in Datensektion schreiben (nur wenn Compat-Modus aktiv)
@@ -16150,7 +16205,8 @@ pub type Codegen = class {
   fn cg_genBpfSection(): void {
     if self.lcbsEnabled == 0 { return; }
     if self.lcbsCompatMode != 0 { return; }  // WP-T14: Compat-Modus überspringt seccomp
-    var bpfBuf: int64 := alloc(256 * 8);
+    seccomp_set_trap_mode(self.lcbsSeccompTrap);   // #1348
+    var bpfBuf: int64 := alloc(1024 * 8);   // #1276: siehe SC_BPF_CAP
     var bpfCount: int64 := seccomp_build_filter(self.lcbsCapBuf, self.lcbsCapCount, bpfBuf);
     self.lcbsBpfDataOff := self.dataLen;
     self.lcbsBpfCount   := bpfCount;
@@ -16159,7 +16215,7 @@ pub type Codegen = class {
       self.cg_edata(peek8(bpfBuf + i));
       i += 1;
     }
-    free(bpfBuf, 256 * 8);
+    free(bpfBuf, 1024 * 8);
   }
 
   // WP-R11: Setzt lcbsProxyEnabled wenn Netzwerk-Proxy-Caps vorhanden.
