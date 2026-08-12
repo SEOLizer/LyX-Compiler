@@ -188,7 +188,12 @@ con CG_H_MAP_GET:    int64 := 1130;
 con CG_H_MAP_HAS:    int64 := 1202;
 con CG_H_STACK_FAIL:   int64 := 1275;  // WP-18: __lyx_stack_fail handler (70 bytes)
 con CG_H_CANARY_INIT: int64 := 1345;  // WP-18: __lyx_canary_init handler (27 bytes)
-con CG_H_USER:         int64 := 1372;  // WP-33: was 1363, +9 for strlen null-guard
+// #1284: Vorschalter vor _lyx_f64_to_str (NaN, unendlich, nicht darstellbar).
+// Die Laenge wird beim Erzeugen GEMESSEN und gegen diesen Wert geprueft — ein
+// stiller Versatz haette den Benutzercode an die falsche Stelle gelegt.
+con CG_H_F64STR_CHK: int64 := 1372;
+con CG_H_F64STR_CHK_LEN: int64 := 106;
+con CG_H_USER:         int64 := 1478;  // 1372 + 106 (#1284)
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -1331,6 +1336,14 @@ pub type Codegen = class {
     if (k == CGN_CALL) {
       var fp: pchar := self.cg_nsval(ni);
       var fl: int64 := self.cg_nslen(ni);
+      // #1286: Zuerst der DEKLARIERTE Rueckgabetyp. Hier stand nur eine feste
+      // Liste von Builtins; der Aufruf einer eigenen Funktion mit
+      // `pchar`-Rueckgabe galt damit nicht als Zeichenkette, und `+` addierte
+      // die Adressen statt zu verketten. Bei zwei Operanden kam eine sinnlose
+      // Zahl heraus, bei dreien stuerzte das Programm ab — die erfundene
+      // Adresssumme wurde dereferenziert. Die Angabe steht im Quelltext; sie
+      // wurde an dieser Stelle nur nicht herangezogen.
+      if (self.cg_funcRetTypeIs(fp, fl, "pchar"c, 5) == 1) { return 1; }
       if (self.cg_seq(fp, fl, "IntToStr",    8))  { return 1; }
       if (self.cg_seq(fp, fl, "StrFromInt",  10)) { return 1; }
       if (self.cg_seq(fp, fl, "StrConcat",   9))  { return 1; }
@@ -1338,6 +1351,27 @@ pub type Codegen = class {
       if (self.cg_seq(fp, fl, "StrSub",      6))  { return 1; }
       if (self.cg_seq(fp, fl, "FloatToStr",  10)) { return 1; }
       if (self.cg_seq(fp, fl, "ArgvGetStr",  10)) { return 1; }
+      if (self.cg_builtinReturnsPchar(fp, fl) != 0) { return 1; }
+      return 0;
+    }
+    // #1328/#1286: ein pchar-FELD ist ebenfalls eine Zeichenkette —
+    // `"[" + t.name + "]"` verkettet damit, statt Adressen zu addieren.
+    if (k == CGN_FIELD) {
+      var pfBox: int64 := alloc(8);
+      var pftp: pchar := self.cg_fieldTypeNameOf(ni, pfBox);
+      var pftl: int64 := peek64(pfBox);
+      free(pfBox, 8);
+      if (pftp != 0 as pchar && pftl > 0) {
+        if (self.cg_seq(pftp, pftl, "pchar", 5)) { return 1; }
+      }
+      return 0;
+    }
+    // Ein `x as pchar` sagt es ausdruecklich.
+    if (k == CGN_CAST) {
+      var ctn2: int64 := self.cg_nc1(ni);
+      if (ctn2 >= 0) {
+        if (self.cg_seq(self.cg_nsval(ctn2), self.cg_nslen(ctn2), "pchar", 5)) { return 1; }
+      }
       return 0;
     }
     if (k == CGN_BINOP && self.cg_nival(ni) == CGT_PLUS) {
@@ -3380,6 +3414,18 @@ pub type Codegen = class {
       var fl: int64 := self.cg_nslen(ni);
       return self.cg_isF64Func(fp, fl);
     }
+    // #1203: der FELDZUGRIFF. `s.lat as int64` mit `lat: f64` lieferte das
+    // rohe Bitmuster statt der Umrechnung, weil diese Funktion den Knoten
+    // nicht kannte und das Feld als Ganzzahl galt. Dieselbe Luecke wie beim
+    // Cast in #905 — nur eine Knotenart weiter.
+    if k == CGN_FIELD {
+      var fbox: int64 := alloc(8);
+      var ftp: pchar := self.cg_fieldTypeNameOf(ni, fbox);
+      var ftl: int64 := peek64(fbox);
+      free(fbox, 8);
+      if (ftp != 0 as pchar && ftl > 0) { return self.cg_isFloatTypeName(ftp, ftl); }
+      return 0;
+    }
     // A cast `x as f64` yields an f64. Without this, a binop whose operands are
     // both `... as f64` casts was treated as int64 and used integer division on
     // the raw IEEE-754 bit patterns (e.g. (a as f64)/(b as f64) => garbage).
@@ -3980,6 +4026,45 @@ pub type Codegen = class {
     return -1;
   }
 
+  // #1328/#1203: Deklarierter TYPNAME eines Feldzugriffs `obj.feld`.
+  //
+  // Die Typbestimmungen des Codegens kannten den Feldzugriff nicht: sie fielen
+  // auf 0 durch und behandelten den Wert als Ganzzahl. Bei `Print(t.name)` mit
+  // `name: pchar` wurde deshalb die ADRESSE gedruckt, bei `s.lat as int64` mit
+  // `lat: f64` das rohe Bitmuster statt der Umrechnung. Ueber eine
+  // Zwischenvariable ging beides, weil der Zweig fuer CGN_IDENT den
+  // deklarierten Typ liest — genau dieser Unterschied machte die Faelle so
+  // verwirrend.
+  //
+  // Der Typname steht im Feldeintrag der Klassenablage; hier wird er
+  // herausgesucht. Laenge in lenBox, 0 wenn der Typ nicht bestimmbar ist
+  // (unbekannte Klasse, unbekanntes Feld) — dann bleibt es beim bisherigen
+  // Verhalten, unentscheidbar ist nicht falsch.
+  fn cg_fieldTypeNameOf(fieldNi: int64, lenBox: int64): pchar {
+    poke64(lenBox, 0);
+    if (fieldNi < 0) { return 0 as pchar; }
+    if (self.cg_nkind(fieldNi) != CGN_FIELD) { return 0 as pchar; }
+    var ci: int64 := self.cg_objClassIdx(self.cg_nc0(fieldNi));
+    if (ci < 0) { return 0 as pchar; }
+    var fname: pchar := self.cg_nsval(fieldNi);
+    var flen:  int64 := self.cg_nslen(fieldNi);
+    var base: int64 := self.classLayouts + ci * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var p: pchar := peek64(fb) as pchar;
+      var n: int64 := peek64(fb + CG_CFIELD_OFF_FIELDLEN);
+      if (n == flen && self.cg_seq(p, n, fname, flen)) {
+        poke64(lenBox, peek64(fb + CG_CFIELD_OFF_TYPENAMELEN));
+        return peek64(fb + CG_CFIELD_OFF_TYPENAMEPTR) as pchar;
+      }
+      i += 1;
+    }
+    return 0 as pchar;
+  }
+
   fn cg_getFieldClassIdx(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
     if (classIdx < 0) { return -1; }
     var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
@@ -4044,7 +4129,38 @@ pub type Codegen = class {
   fn cg_markArrayParam(localIdx: int64, ptypeNode: int64) {
     if (localIdx < 0) { return; }
     if (ptypeNode < 0) { return; }
-    if (self.cg_nkind(ptypeNode) != 101) { return; }
+    // #1197: Bis 1.0.16K griff das nur fuer die FESTE Form `T[N]` (Knotenart
+    // 101). Ein `array<T>`/`Array<T>`/`T[]`-Parameter blieb ungemarkt, der
+    // Indexzugriff fiel in den Zweig fuer einen rohen Zeiger und las 16 Byte zu
+    // frueh — also den {cap,len}-Kopf statt des ersten Elements. `F(v)` gab
+    // deshalb eine Adresse zurueck, wechselnd von Lauf zu Lauf. Dieselbe
+    // Merkung, die die Deklaration seit jeher setzt, gilt jetzt auch hier.
+    var pk: int64 := self.cg_nkind(ptypeNode);
+    if (pk == 61) {
+      poke8(self.localIsArray + localIdx, 1);
+      var dynEl: int64 := self.cg_nc0(ptypeNode);
+      if (dynEl >= 0 && self.cg_nkind(dynEl) == 60) {
+        var dtn: pchar := self.cg_nsval(dynEl);
+        var dtl: int64 := self.cg_nslen(dynEl);
+        if (self.cg_findClass(dtn, dtl) >= 0) { self.cg_setLocalType(localIdx, dtn, dtl); }
+      }
+      return;
+    }
+    if (pk == 60) {
+      var anm: pchar := self.cg_nsval(ptypeNode);
+      var anl: int64 := self.cg_nslen(ptypeNode);
+      if (self.cg_seq(anm, anl, "Array", 5) || self.cg_seq(anm, anl, "array", 5)) {
+        poke8(self.localIsArray + localIdx, 1);
+        var genEl: int64 := self.cg_nc1(ptypeNode);
+        if (genEl >= 0 && self.cg_nkind(genEl) == 60) {
+          var gtn: pchar := self.cg_nsval(genEl);
+          var gtl: int64 := self.cg_nslen(genEl);
+          if (self.cg_findClass(gtn, gtl) >= 0) { self.cg_setLocalType(localIdx, gtn, gtl); }
+        }
+      }
+      return;
+    }
+    if (pk != 101) { return; }
     poke8(self.localIsArray + localIdx, 1);
     var szNode: int64 := self.cg_nc1(ptypeNode);
     if (szNode >= 0 && self.cg_nkind(szNode) == CGN_LIT_INT) {
@@ -7492,6 +7608,22 @@ pub type Codegen = class {
       }
       return 0;
     }
+    // #1328: der FELDZUGRIFF. `PrintLn(t.name)` mit `name: pchar` gab die
+    // Adresse aus — die Typbestimmung kannte den Knoten nicht und fiel auf
+    // "Ganzzahl". Derselbe Wert ueber eine Zwischenvariable ging, weil der
+    // Zweig darunter den deklarierten Typ liest.
+    if (k == CGN_FIELD) {
+      var fLenBox: int64 := alloc(8);
+      var ftp: pchar := self.cg_fieldTypeNameOf(argNi, fLenBox);
+      var ftl: int64 := peek64(fLenBox);
+      free(fLenBox, 8);
+      if (ftp != 0 as pchar && ftl > 0) {
+        if (self.cg_seq(ftp, ftl, "pchar", 5)) { return 1; }
+        if (self.cg_isFloatTypeName(ftp, ftl) != 0) { return 2; }
+        if (self.cg_seq(ftp, ftl, "bool", 4)) { return 3; }
+      }
+      return 0;
+    }
     if (k == CGN_IDENT) {
       var nm: pchar := self.cg_nsval(argNi);
       var nl: int64  := self.cg_nslen(argNi);
@@ -10312,9 +10444,9 @@ pub type Codegen = class {
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "FloatToStr", 10)) {
-      // FloatToStr(f: f64): call _lyx_f64_to_str(xmm0) → rax = buffer pointer
+      // FloatToStr(f: f64): #1284 — ueber den geprueften Vorschalter.
       var ppFts: int64 := self.cg_emitCall();
-      poke32(self.code + ppFts, CG_H_F64STR - ppFts - 4);
+      poke32(self.code + ppFts, CG_H_F64STR_CHK - ppFts - 4);
 
     } else if (self.cg_seq(fname, fnlen, "StrEquals", 9) ||
                self.cg_seq(fname, fnlen, "StrEq", 5)) {
@@ -14815,7 +14947,97 @@ pub type Codegen = class {
     // ret
     self.cg_e8(0xC3);                                                                                                                 // 1 byte
     // __lyx_canary_init is 27 bytes ✓ (7+3+4+7+3+2+1 = 27)
-    // Total helpers: 79+24+26+104+71+6+26+104+335+215+47+93+72+73+70+27 = 1372 = CG_H_USER  ✓
+
+    // ---- __lyx_f64_to_str_chk (starts at offset 1372) — #1284 ----
+    //
+    // Vorschalter fuer _lyx_f64_to_str. Der eigentliche Umwandler ist ein
+    // Block mit festen Sprungweiten und schreibt in einen 32-Byte-Puffer; er
+    // kennt weder NaN noch unendlich noch Werte, die nicht in einen int64
+    // passen. `cvttsd2si` liefert fuer all das 0x8000000000000000, und der
+    // Ziffernpfad machte daraus `9223372036854775808.<0xFF>75808` — eine Zahl,
+    // die nie gerechnet wurde, samt eines Bytes, das aus keinem Ziffernpfad
+    // stammt (der Nachkommateil lief hinter den Puffer).
+    //
+    // Erkannt wird an den IEEE-Bits: nach dem Verdoppeln (Vorzeichen faellt
+    // heraus) liegt unendlich bei 0xFFE0000000000000, alles darueber ist NaN.
+    // Ein endlicher Wert, den `cvttsd2si` nicht traegt, bekommt "overflow" —
+    // in 32 Byte passt seine Ziffernfolge ohnehin nicht, und eine erfundene
+    // Zahl waere das Schlechtere. Wer grosse Werte braucht, nimmt
+    // `FloatToStr(v, prec)` aus std.io: die Fassung rechnet mit Exponent.
+    self.cg_addLabel("__lyx_f64_to_str_chk", 20, 0);
+    var chkStart: int64 := self.codeLen;
+    // mov rax, rdi
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);
+    // add rax, rax        (Vorzeichenbit heraus)
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xC0);
+    // mov rcx, 0xFFE0000000000000
+    self.cg_e8(0x48); self.cg_e8(0xB9);
+    self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0xE0); self.cg_e8(0xFF);
+    // cmp rax, rcx
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);
+    // ja .nan
+    self.cg_e8(0x0F); self.cg_e8(0x87);
+    var pNan: int64 := self.codeLen; self.cg_e32(0);
+    // je .inf
+    self.cg_e8(0x0F); self.cg_e8(0x84);
+    var pInf: int64 := self.codeLen; self.cg_e32(0);
+    // movq xmm0, rdi
+    self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC7);
+    // cvttsd2si rsi, xmm0
+    self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2C); self.cg_e8(0xF0);
+    // mov rcx, 0x8000000000000000   (Kennzeichen "passt nicht")
+    self.cg_e8(0x48); self.cg_e8(0xB9);
+    self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x80);
+    // cmp rsi, rcx
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xCE);
+    // je .big
+    self.cg_e8(0x0F); self.cg_e8(0x84);
+    var pBig: int64 := self.codeLen; self.cg_e32(0);
+    // jmp _lyx_f64_to_str  (rdi traegt die Bits unveraendert)
+    self.cg_e8(0xE9);
+    var pTail: int64 := self.codeLen; self.cg_e32(0);
+    poke32(self.code + pTail, CG_H_F64STR - pTail - 4);
+    // .nan:
+    poke32(self.code + pNan, self.codeLen - pNan - 4);
+    var offNan: int64 := self.dataLen;
+    self.cg_edata(110); self.cg_edata(97); self.cg_edata(110); self.cg_edata(0);      // "nan"
+    self.cg_emitLeaRaxData(offNan);
+    self.cg_e8(0xC3);
+    // .inf:
+    poke32(self.code + pInf, self.codeLen - pInf - 4);
+    // test rdi, rdi ; js .neg
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);
+    self.cg_e8(0x0F); self.cg_e8(0x88);
+    var pNeg: int64 := self.codeLen; self.cg_e32(0);
+    var offInf: int64 := self.dataLen;
+    self.cg_edata(105); self.cg_edata(110); self.cg_edata(102); self.cg_edata(0);     // "inf"
+    self.cg_emitLeaRaxData(offInf);
+    self.cg_e8(0xC3);
+    poke32(self.code + pNeg, self.codeLen - pNeg - 4);
+    var offNegInf: int64 := self.dataLen;
+    self.cg_edata(45); self.cg_edata(105); self.cg_edata(110); self.cg_edata(102); self.cg_edata(0);  // "-inf"
+    self.cg_emitLeaRaxData(offNegInf);
+    self.cg_e8(0xC3);
+    // .big:
+    poke32(self.code + pBig, self.codeLen - pBig - 4);
+    var offBig: int64 := self.dataLen;
+    self.cg_edata(111); self.cg_edata(118); self.cg_edata(101); self.cg_edata(114);
+    self.cg_edata(102); self.cg_edata(108); self.cg_edata(111); self.cg_edata(119); self.cg_edata(0);  // "overflow"
+    self.cg_emitLeaRaxData(offBig);
+    self.cg_e8(0xC3);
+    // Laenge zur Kontrolle: sie MUSS zu CG_H_USER passen, sonst liegt der
+    // Benutzercode falsch. Deshalb nicht gezaehlt, sondern gemessen.
+    if (self.codeLen - chkStart != CG_H_F64STR_CHK_LEN) {
+      EPrintStr("codegen error: __lyx_f64_to_str_chk hat "c);
+      EPrintInt(self.codeLen - chkStart);
+      EPrintStr(" Byte, erwartet "c);
+      EPrintInt(CG_H_F64STR_CHK_LEN);
+      EPrintStrLn(" — CG_H_USER anpassen (#1284)"c);
+      exit(1);
+    }
+    // Total helpers: ... + 27 + CG_H_F64STR_CHK_LEN = CG_H_USER  ✓
   }
 
   // ------------------------------------------------------------------
