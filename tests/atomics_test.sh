@@ -123,14 +123,32 @@ fi
 # ThreadJoin gab den 2-MB-Stack des Threads nicht frei. Unter einem VM-Limit
 # scheiterte ThreadCreate dadurch reproduzierbar (bei 1 GB ab dem 509. Thread).
 # Das Limit ist der eigentliche Test: ohne Freigabe reicht der Adressraum nicht.
+#
+# #1297: Die Pruefung war einmal rot und danach dreimal gruen, ohne dass sich
+# etwas geaendert haette. Nachgemessen: das Programm braucht im richtigen Fall
+# weniger als 32 MB Adressraum (fuenf Laeufe je Stufe, 32/64/128/256/384 MB
+# alle gruen) — die 384 MB waren also nicht knapp, und der Fehlschlag kam
+# nicht von der Marge. Was fehlte, war die Auskunft, WAS schiefging: der Test
+# sah nur einen Rueckgabewert.
+#
+# Deshalb jetzt: das Programm sagt, an welcher Stelle es aufgab, die Meldung
+# nennt das tatsaechliche Limit (vorher stand dort 256M, waehrend 384M gesetzt
+# war), und das Limit liegt auf 128 MB — viermal der gemessene Bedarf und weit
+# unter den 800 MB, die 400 nicht freigegebene Stacks braeuchten. Damit ist die
+# Pruefung schaerfer als vorher und trotzdem nicht knapp.
 cat > "$TMP/leak.lyx" <<'EOF'
+import std.io;
 import std.thread;
 fn tw(a: int64): int64 { return 0; }
 fn main(): int64 {
   var i: int64 := 0;
   while (i < 400) {
     var t: Thread := ThreadCreate(tw, 0);
-    if (t.handle == 0) { return 1; }   // Stack konnte nicht alloziert werden
+    if (t.handle == 0) {
+      PrintStr("ThreadCreate scheiterte bei Durchlauf ");
+      PrintLn(IntToStr(i));
+      return 1;                        // Stack konnte nicht alloziert werden
+    }
     ThreadJoin(t);
     i := i + 1;
   }
@@ -138,13 +156,14 @@ fn main(): int64 {
 }
 EOF
 rm -f "$TMP/leak"
+VMLIMIT_KB=131072
 if (cd "$ROOT" && "$LYXC" --std-path="$ROOT" "$TMP/leak.lyx" -o "$TMP/leak" >/dev/null 2>&1); then
-  # 400 Threads x 2 MB = 800 MB, wenn nichts freigegeben wird; Limit 384 MB.
-  # Die Marge ist bewusst nicht knapper: der Adressraum des Prozesses enthaelt
-  # neben den Stacks noch Arena und Bibliotheken, ein zu enges Limit macht den
-  # Test wackelig statt aussagekraeftig.
-  ( ulimit -v 393216 && timeout 120 "$TMP/leak" ) >/dev/null 2>&1; rc=$?
-  if [ "$rc" -eq 42 ]; then ok "ThreadJoin gibt den Kind-Stack frei"; else no "ThreadJoin gibt den Kind-Stack frei" "exit=$rc unter ulimit -v 256M"; fi
+  leakout="$( ( ulimit -v "$VMLIMIT_KB"; timeout 120 "$TMP/leak" ) 2>&1 )"; rc=$?
+  if [ "$rc" -eq 42 ]; then
+    ok "ThreadJoin gibt den Kind-Stack frei"
+  else
+    no "ThreadJoin gibt den Kind-Stack frei" "exit=$rc unter ulimit -v $((VMLIMIT_KB / 1024))M${leakout:+ — $leakout}"
+  fi
 else
   no "ThreadJoin gibt den Kind-Stack frei" "compile fehlgeschlagen"
 fi
