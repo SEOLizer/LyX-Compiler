@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.17I
+VERSION   := 1.0.17J
 VERSION_DATE := 2026-08-12
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -494,6 +494,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Codegen-Werte: uint64-Division, con-Vorwaertsreferenz, Einheitentypen (15 Pruefungen) ---"
 	@bash tests/codegen_werte_test.sh
+	@echo "OK"
+	@echo "--- Backend-Opcodes und VerifyIntegrity: kein stiller Default mehr (18 Pruefungen) ---"
+	@bash tests/backend_opcodes_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh

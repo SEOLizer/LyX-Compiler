@@ -9,7 +9,8 @@
 # #1232 (a) SwitchCase/SwitchDefault verlangen einen BLOCK, nicht `{ Statement }`.
 #       (b) ConstPipeExpr gibt es nicht — der Pipe-Operator ist im
 #           Konstantenausdruck ausdruecklich gesperrt.
-# #1234 `check(...)` und `VerifyIntegrity()` existieren nicht; `panic` und
+# #1234 `check(...)` existiert nicht; `panic` und
+# (`VerifyIntegrity()` gab es damals ebenfalls nicht — seit #1363 schon.)
 #       `assert` dagegen schon.
 # #1245 `public` ist eine gleichwertige Schreibweise zu `pub`. Sie war bei
 #       MemberVisibility verzeichnet, bei Visibility nicht.
@@ -104,8 +105,16 @@ fn main(): int64 { PrintLn(IntToStr(5 |> Dbl)); return 0; }' "10"
 rejects "check() gibt es nicht" 'import std.io;
 fn main(): int64 { check(1 == 1); return 0; }' "undefined function .check."
 
-rejects "VerifyIntegrity() gibt es nicht" 'import std.io;
-fn main(): int64 { VerifyIntegrity(); return 0; }' "undefined function .VerifyIntegrity."
+# #1363: VerifyIntegrity() GIBT es seit 1.0.17J. Als #1234 aufgenommen wurde,
+# war der Builtin nicht angebunden und die Grammatik versprach ihn trotzdem —
+# die Korrektur bestand damals darin, die Zusage zu streichen. Jetzt ist der
+# Weg andersherum gegangen: der Builtin ist verdrahtet (er prueft die
+# @redundant-Globalen ueber ihren Voter), also darf der Aufruf nicht mehr
+# abgewiesen werden. Die Grammatik fuehrt ihn weiterhin nicht als eigene Regel —
+# er ist ein gewoehnlicher Aufruf, kein Sprachkonstrukt.
+out "VerifyIntegrity() ist aufrufbar und meldet Uebereinstimmung" 'import std.io;
+@redundant var t: int64;
+fn main(): int64 { t := 5; PrintLn(IntToStr(VerifyIntegrity())); return 0; }' "0"
 
 # Gegenprobe: panic und assert sind vorhanden — die Grammatik fuehrt sie zu
 # Recht, und die Korrektur darf sie nicht mit entfernt haben.
