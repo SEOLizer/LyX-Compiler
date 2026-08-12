@@ -1,6 +1,6 @@
-# Lyx 1.0.17F — Canonical EBNF Grammar
+# Lyx 1.0.17G — Canonical EBNF Grammar
 
-> Stand 2026-08-12, gegen lyxc 1.0.17F geprueft. Die Keyword-Liste in
+> Stand 2026-08-12, gegen lyxc 1.0.17G geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -325,7 +325,8 @@ NestedFnDecl        = "fn"
                       [ ":" ReturnType ]
                       Block ;
 
-ExternFnDecl        = [ "@cap" "(" CapabilityPath ")" ]
+ExternFnDecl        = [ "@cap" "(" CapabilityPath ")"
+                      | CapabilitiesAttr ]
                       "extern"
                       "fn"
                       Ident
@@ -1588,7 +1589,14 @@ CapabilityDecl    = CapabilityPath
                     [ "(" CapabilityArgList ")" ]
                     [ "@fastpath" ] ;
 
-CapabilityPath    = Ident { "." Ident } ;
+CapabilityPath    = CapSegment { "." CapSegment } ;
+
+(* Ein Segment ist ein NAME, keine Ausdrucksform: auch reservierte Woerter
+   sind zulaessig. `process.signal` ist der gaengige Fall — `signal` ist ein
+   Schluesselwort und war bis 1.0.17F nicht schreibbar, obwohl die Capability
+   in der Registry steht (#1198, #1347). Der Parser prueft die Schreibweise
+   des Tokens, nicht seine Art. *)
+CapSegment        = Ident | Keyword ;
 
 CapabilityArgList = CapabilityArg { "," CapabilityArg } ;
 

@@ -24,6 +24,28 @@ con SC_RET_K:       int64 := 0x06;  // BPF_RET|BPF_K
 // seccomp Rückgabewerte
 con SC_ALLOW:    int64 := 0x7fff0000;  // SECCOMP_RET_ALLOW
 con SC_KILL:     int64 := 0x80000000;  // SECCOMP_RET_KILL_PROCESS
+con SC_TRAP:     int64 := 0x00030000;  // SECCOMP_RET_TRAP — #1348
+
+// #1348: KILL_PROCESS beendet den Prozess, BEVOR irgendein Beobachter etwas
+// sieht: strace protokolliert den killenden Syscall nicht (der Filter laeuft
+// vor dem ptrace-Stop), gdb bekommt keinen Stop, und ohne coredumpctl gibt es
+// keine Quelle fuer si_syscall. Wer eine Capability vergessen hat, sieht nur
+// "Ungueltiger Betriebssystemaufruf" — und bisektiert.
+//
+// TRAP stellt stattdessen SIGSYS zu. Der Prozess stirbt weiterhin (fail-closed
+// bleibt fail-closed), aber die Nummer des Syscalls steht in si_syscall und
+// ist fuer strace, gdb und den Coredump sichtbar. Nur ueber --seccomp-trap
+// erreichbar, nie Vorgabe.
+var sc_retAction: int64 := 0;   // 0 = KILL (Vorgabe), sonst TRAP
+
+pub fn seccomp_set_trap_mode(on: int64): void {
+  if (on != 0) { sc_retAction := SC_TRAP; } else { sc_retAction := 0; }
+}
+
+fn sc_deny(): int64 {
+  if (sc_retAction != 0) { return sc_retAction; }
+  return SC_KILL;
+}
 
 // AUDIT_ARCH_X86_64 = EM_X86_64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE
 con SC_ARCH_X86_64:  int64 := 0xC000003E;
@@ -42,6 +64,22 @@ con SC_SYS_OPEN:          int64 := 2;
 con SC_SYS_WRITE:         int64 := 1;
 con SC_SYS_CLOSE:         int64 := 3;
 con SC_SYS_FSTAT:         int64 := 5;
+con SC_SYS_FCNTL:         int64 := 72;   // #1276
+con SC_BPF_CAP:           int64 := 1024;  // #1276: Kapazitaet des BPF-Puffers in Befehlen
+// fcntl-Kommandos, die Dateizugriff begleiten (F_DUPFD und alles rund um
+// Deskriptor-Vererbung, Statusflags und Datei-Sperren). Bewusst NICHT
+// dabei: F_SETOWN/F_GETOWN (Signalzustellung), F_SETPIPE_SZ, F_ADD_SEALS,
+// F_NOTIFY — die haben mit Lesen und Schreiben nichts zu tun.
+con SC_F_GETFD:           int64 := 1;
+con SC_F_SETFD:           int64 := 2;
+con SC_F_GETFL:           int64 := 3;
+con SC_F_SETFL:           int64 := 4;
+con SC_F_GETLK:           int64 := 5;
+con SC_F_SETLK:           int64 := 6;
+con SC_F_SETLKW:          int64 := 7;
+con SC_F_OFD_GETLK:       int64 := 36;
+con SC_F_OFD_SETLK:       int64 := 37;
+con SC_F_OFD_SETLKW:      int64 := 38;
 con SC_SYS_LSEEK:         int64 := 8;
 con SC_SYS_MMAP:          int64 := 9;
 con SC_SYS_MPROTECT:      int64 := 10;
@@ -215,8 +253,21 @@ pub fn seccomp_cap_id_from_path(path: pchar, len: int64): int64 {
   return 0 - 1;
 }
 
+// #1276: Der Puffer war eine Zusage im Kommentar ("mind. 256 * 8 Bytes") und
+// sonst nichts — kein Aufruf pruefte, ob er reicht. Waechst die Filterliste
+// ueber die Kapazitaet, schreibt sc_emit hinter das Ende: Heap-Korruption,
+// erzeugt ausgerechnet beim Bau eines SICHERHEITSfilters, und niemand merkt es.
+// Deshalb eine Obergrenze, die der Erzeuger setzt und die hier haelt.
+var sc_bufCap: int64 := 0;   // Kapazitaet in Befehlen; 0 = ungeprueft
+
 // Schreibt einen BPF-Befehl als 8 Bytes LE in buf[idx]
 fn sc_emit(buf: int64, idx: int64, op: int64, jt: int64, jf: int64, k: int64): void {
+  if (sc_bufCap > 0 && idx >= sc_bufCap) {
+    EPrintStr("lyxc: seccomp-Filter passt nicht in den Puffer ("c);
+    EPrintInt(sc_bufCap);
+    EPrintStrLn(" Befehle) — Abbruch statt Speicherkorruption."c);
+    exit(1);
+  }
   var off: int64 := buf + idx * 8;
   poke8(off + 0, op & 0xFF);
   poke8(off + 1, (op >> 8) & 0xFF);
@@ -233,6 +284,20 @@ fn sc_allow_nr(buf: int64, n: int64, nr: int64): int64 {
   sc_emit(buf, n,     SC_JMP_JEQ_K, 0, 1, nr);  // match → RET ALLOW; no match → skip
   sc_emit(buf, n + 1, SC_RET_K, 0, 0, SC_ALLOW);
   return n + 2;
+}
+
+// #1276: Allow-Block mit Argumentfilter — erlaubt `nr` nur, wenn args[1]
+// genau `cmd` ist (5 Befehle + NR-Reload, wie der O_RDONLY-Filter unten).
+// Ohne Filter waere `fcntl` ein Sammelbecken: derselbe Syscall setzt Sperren,
+// vererbt Deskriptoren und stellt Signale zu. Eine Datei-Capability soll das
+// Erste erlauben und das Letzte nicht.
+fn sc_allow_nr_arg1(buf: int64, n: int64, nr: int64, cmd: int64): int64 {
+  sc_emit(buf, n,     SC_JMP_JEQ_K, 0, 4, nr);        n := n + 1;
+  sc_emit(buf, n,     SC_LD_ABS_W,  0, 0, SC_OFF_ARG1); n := n + 1;
+  sc_emit(buf, n,     SC_JMP_JEQ_K, 0, 1, cmd);       n := n + 1;
+  sc_emit(buf, n,     SC_RET_K,     0, 0, SC_ALLOW);  n := n + 1;
+  sc_emit(buf, n,     SC_LD_ABS_W,  0, 0, SC_OFF_NR); n := n + 1;
+  return n;
 }
 
 // Prüft ob capId in capBuf[0..capCount-1] enthalten ist
@@ -254,11 +319,12 @@ fn sc_has_cap(capBuf: int64, capCount: int64, capId: int64): bool {
 // ===========================================================================
 pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int64 {
   var n: int64 := 0;
+  sc_bufCap := SC_BPF_CAP;
 
   // ---- Architektur-Check ------------------------------------------------
   sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARCH); n := n + 1;
   sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 1, 0, SC_ARCH_X86_64); n := n + 1; // x86-64 → skip kill
-  sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_KILL); n := n + 1;
+  sc_emit(bpfBuf, n, SC_RET_K, 0, 0, sc_deny()); n := n + 1;
 
   // ---- Lade syscall-Nummer ----------------------------------------------
   sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;
@@ -326,6 +392,23 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
     sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 1, 0); n := n + 1;
     sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_ALLOW); n := n + 1;
     sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;
+  }
+
+  // #1276: fcntl fehlte vollstaendig. Eine gehaertete std.db.sqlite starb
+  // deshalb beim ersten Zugriff an SIGSYS — SQLite setzt vor jedem Lesen eine
+  // Sperre (F_SETLK). Ohne Haertung lief dieselbe Unit, was den Verdacht
+  // zunaechst auf die Unit lenkte statt auf den Filter.
+  if hasRead || hasWrite {
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_FCNTL, SC_F_GETFD);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_FCNTL, SC_F_SETFD);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_FCNTL, SC_F_GETFL);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_FCNTL, SC_F_SETFL);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_FCNTL, SC_F_GETLK);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_FCNTL, SC_F_SETLK);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_FCNTL, SC_F_SETLKW);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_FCNTL, SC_F_OFD_GETLK);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_FCNTL, SC_F_OFD_SETLK);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_FCNTL, SC_F_OFD_SETLKW);
   }
 
   if hasRead {
@@ -536,7 +619,7 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
   }
 
   // ---- Standard-Aktion: Kill ----------------------------------------
-  sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_KILL); n := n + 1;
+  sc_emit(bpfBuf, n, SC_RET_K, 0, 0, sc_deny()); n := n + 1;
 
   return n;
 }
