@@ -194,5 +194,28 @@ fn main(): int64 {
 -2.250000
 0.000000"
 
+# ===========================================================================
+# #1254 — PrintF64 als Builtin, und Float-Ausgabe an den Raendern
+# ===========================================================================
+# Die Doku benutzt `PrintF64` an 48 Stellen, oft in Schnipseln OHNE Import —
+# `Print`, `PrintLn` und `IntToStr` sind Builtins, also muss es dieses auch
+# sein, sonst scheitert ein Beispiel an einer einzigen fehlenden Zeile.
+out "PrintF64 ohne Import" 'fn main(): int64 { PrintF64(3.75); return 0; }' "3.750000"
+
+out "PrintF64 mit Import unveraendert" 'import std.io;
+fn main(): int64 { PrintF64(0.0 - 1.5); return 0; }' "-1.500000"
+
+# #1284 gilt jetzt auch fuer die AUSGABE, nicht nur fuer FloatToStr: vorher
+# druckte `PrintFloat(inf)` dieselbe erfundene Zahl.
+out "Float-Ausgabe an den Raendern" 'fn main(): int64 {
+  var z: f64 := 0.0;
+  var a: f64 := 1.0;
+  PrintF64(a / z);
+  PrintFloat(z / z);
+  PrintLn("");
+  return 0;
+}' "inf
+nan"
+
 echo "--- $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
