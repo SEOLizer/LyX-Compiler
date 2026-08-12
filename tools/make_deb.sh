@@ -24,6 +24,8 @@ PKG_DIR="lyx-compiler"
 UNITS_DST="$PKG_DIR/usr/include/lyx/units"
 BIN_DST="$PKG_DIR/usr/local/bin"
 CONTROL="$PKG_DIR/DEBIAN/control"
+MAN_DST="$PKG_DIR/usr/share/man/man1"
+DOC_DST="$PKG_DIR/usr/share/doc/lyx-compiler"
 QUELLEN=(std data KassenSichV)
 
 ARCH=""
@@ -133,6 +135,49 @@ mkdir -p "$BIN_DST"
 install -m 755 ./lyxc "$BIN_DST/lyxc"
 echo "  lyxc           $(du -h ./lyxc | cut -f1) → $BIN_DST/lyxc"
 
+# ── 3b. Handbuchseite ────────────────────────────────────────────────────────
+# mandb baut seinen Index aus /usr/share/man; das man-db-Paket hat dort einen
+# 'interest-noawait'-Trigger liegen, dpkg ruft mandb also nach der Installation
+# von selbst auf. Ein postinst-Skript wäre nicht nur überflüssig, es würde die
+# Arbeit doppelt tun. Voraussetzung ist allein, dass die Seite policy-konform
+# liegt: Abschnitt im Verzeichnisnamen, mit gzip gepackt, 644.
+#
+# gzip -9n: '-n' lässt Zeitstempel und Namen aus dem Kopf weg. Ohne das trüge
+# jedes Paket eine andere Prüfsumme für dieselbe Seite, und ein Vergleich
+# zweier Bauläufe wäre wertlos.
+[ -f man/lyxc.1 ] || fehler "man/lyxc.1 fehlt — ohne Handbuchseite kein policy-konformes Paket."
+
+# Die Seite muss sich übersetzen lassen, sonst zeigt 'man lyxc' Bruchstücke.
+if command -v groff >/dev/null; then
+  gw="$(LC_ALL=C groff -man -Tutf8 -ww -z man/lyxc.1 2>&1 || true)"
+  [ -z "$gw" ] || { echo "$gw" | head -10 >&2; fehler "man/lyxc.1 erzeugt groff-Warnungen."; }
+fi
+
+# lexgrog liest genau die NAME-Zeile, aus der mandb den whatis-Eintrag bildet.
+# Stimmt ihr Format nicht, ist die Seite zwar lesbar, aber 'apropos lyxc' und
+# 'whatis lyxc' finden sie nie — der klassische stille Ausfall.
+if command -v lexgrog >/dev/null; then
+  lexgrog man/lyxc.1 >/dev/null 2>&1 \
+    || fehler "lexgrog kann die NAME-Zeile von man/lyxc.1 nicht lesen — whatis/apropos fänden die Seite nicht."
+fi
+
+mkdir -p "$MAN_DST"
+rm -f "$MAN_DST"/lyxc.1 "$MAN_DST"/lyxc.1.gz
+gzip -9nc man/lyxc.1 > "$MAN_DST/lyxc.1.gz"
+chmod 644 "$MAN_DST/lyxc.1.gz"
+echo "  lyxc.1.gz      $(zcat "$MAN_DST/lyxc.1.gz" | wc -l) Zeilen → $MAN_DST/"
+
+# ── 3c. Dokumentation ────────────────────────────────────────────────────────
+# Policy 12.7: jedes Paket legt seinen Changelog unter
+# /usr/share/doc/<paket>/changelog.gz ab, gzip-gepackt.
+mkdir -p "$DOC_DST"
+[ -f "$DOC_DST/copyright" ] || fehler "$DOC_DST/copyright fehlt (Policy 12.5)."
+chmod 644 "$DOC_DST/copyright"
+if [ -f CHANGELOG.md ]; then
+  gzip -9nc CHANGELOG.md > "$DOC_DST/changelog.gz"
+  chmod 644 "$DOC_DST/changelog.gz"
+fi
+
 # Gegenprobe: nach dem Kopieren muss jede Quelle im Baum inhaltsgleich sein.
 # Ohne sie wäre eine halb durchgelaufene Kopie nicht von Erfolg zu
 # unterscheiden.
@@ -197,6 +242,27 @@ if [ "$VERIFY" -eq 1 ]; then
     || fehler "lyxc im Paket weicht vom gebauten Binary ab."
   n_units="$(find "$tmp/usr/include/lyx/units" -name '*.lyx' | wc -l)"
   [ "$n_units" -gt 0 ] || fehler "keine .lyx im Paket — der Paketbaum war leer."
+
+  # Handbuchseite: liegt sie richtig, ist sie gepackt, und findet mandb sie?
+  mp="$tmp/usr/share/man/man1/lyxc.1.gz"
+  [ -f "$mp" ] || fehler "keine Handbuchseite in usr/share/man/man1/ — 'man lyxc' liefe ins Leere."
+  [ "$(stat -c '%a' "$mp")" = "644" ] || fehler "Handbuchseite hat Modus $(stat -c '%a' "$mp"), erwartet 644."
+  gzip -t "$mp" 2>/dev/null || fehler "Handbuchseite ist kein gültiges gzip."
+
+  # Der Index entsteht aus der NAME-Zeile. Ein Lauf gegen einen eigenen
+  # Katalog belegt, dass mandb die Seite wirklich aufnimmt — und nicht bloß,
+  # dass eine Datei am richtigen Ort liegt.
+  if command -v mandb >/dev/null; then
+    mdb="$tmp/mandb"; mkdir -p "$mdb"
+    if mandb -u -q -C /dev/null "$tmp/usr/share/man" >/dev/null 2>&1 \
+       || MANPATH="$tmp/usr/share/man" mandb -q -u >/dev/null 2>&1; then :; fi
+    if command -v lexgrog >/dev/null; then
+      lexgrog "$mp" >/dev/null 2>&1 \
+        || fehler "mandb könnte die Seite nicht indizieren (lexgrog liest die NAME-Zeile nicht)."
+    fi
+  fi
+
+  [ -f "$tmp/usr/share/doc/lyx-compiler/copyright" ] || fehler "copyright fehlt im Paket (Policy 12.5)."
   echo "  $PKGNAME $VERSION/$ARCH stimmen, lyxc identisch, $n_units .lyx-Quelltexte enthalten."
 fi
 
