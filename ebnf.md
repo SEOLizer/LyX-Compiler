@@ -10,7 +10,12 @@
 > wo schmale Ganzzahltypen gekuerzt werden.
 > Bekannte Abweichungen zwischen Grammatik und Compiler stehen in 20.1.
 
-Status: Draft
+Status: Normativ — verbindliche Fassung. Massgeblich ist ausschliesslich
+`ebnf.md` im Compiler-Repository (aurum); Dateien gleichen Namens in anderen
+Projekten sind Abschriften und veralten. Wer eine Abweichung zwischen
+Grammatik und Compiler meldet, nennt bitte die Versionszeile der Datei, gegen
+die er gemessen hat — fuenf Meldungen einer einzigen Runde (#1350, #1353,
+#1354, #1356, #1357) stammten aus einer Abschrift des Standes v0.9.3A.
 Target parser: Recursive Descent + Pratt Expression Parser
 Scope: Concrete syntax only.
 
