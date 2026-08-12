@@ -70,11 +70,25 @@ fi
 # Ein Paket, das ein x86-64-Binary enthält, ist nicht 'all'. Ein falscher Wert
 # hier lässt sich auf fremder Architektur installieren und scheitert erst beim
 # Aufruf — deshalb wird er gesetzt, nicht bloß geprüft.
-case "$ARCH" in
-  amd64|i386|arm64|armhf|riscv64|ppc64el|s390x) ;;
-  all) fehler "Architektur 'all' passt nicht zu einem Paket mit Binary in usr/local/bin." ;;
-  *)   echo "WARNUNG: '$ARCH' ist kein üblicher dpkg-Architekturname (dpkg-architecture -L)." >&2 ;;
-esac
+#
+# Gültig sind ausschliesslich die Namen, die dpkg kennt (amd64, arm64, i386,
+# …). Ein erfundener Name wie 'i64' oder 'x86_64' baut zwar ein .deb, aber
+# 'apt install' findet es auf keiner Maschine, weil apt gegen
+# 'dpkg --print-architecture' vergleicht. Massgeblich ist die Liste des
+# Systems; die Ersatzliste greift nur, wenn dpkg-architecture fehlt.
+if command -v dpkg-architecture >/dev/null; then
+  ARCH_LISTE="$(dpkg-architecture -L 2>/dev/null)"
+else
+  ARCH_LISTE="$(printf '%s\n' amd64 i386 arm64 armhf armel riscv64 ppc64el s390x mips64el loong64)"
+fi
+
+if [ "$ARCH" = "all" ]; then
+  fehler "Architektur 'all' passt nicht zu einem Paket mit Binary in usr/local/bin."
+elif ! printf '%s\n' "$ARCH_LISTE" | grep -qx -- "$ARCH"; then
+  fehler "'$ARCH' ist kein dpkg-Architekturname. Üblich sind amd64, arm64, i386, armhf,
+        riscv64, ppc64el, s390x — vollständige Liste: dpkg-architecture -L.
+        Ein erfundener Name baut ein Paket, das apt auf keiner Maschine installiert."
+fi
 
 # Die Architektur wird auf das Binary bezogen, nicht geglaubt. Ein
 # 'tools/make_deb.sh arm64' auf einem x86-Rechner baute sonst ein Paket, das
@@ -142,15 +156,22 @@ setze_feld() { # feld, wert
 setze_feld Version "$VERSION"
 setze_feld Architecture "$ARCH"
 
-# Debian-Policy 5.6.1: Paketnamen bestehen aus Kleinbuchstaben, Ziffern und
-# '+-.'. 'Lyx-Compiler' verletzt das; dpkg-deb baut trotzdem, apt und die
-# Repository-Werkzeuge nehmen es später übel. Nicht stillschweigend ändern —
-# der Name ist die Installationsidentität.
+# Debian-Policy 5.6.1: Paketnamen bestehen aus mindestens zwei Zeichen aus
+# Kleinbuchstaben, Ziffern und '+-.', und beginnen alphanumerisch. 'control'
+# trug bis 1.0.17E 'Lyx-Compiler'; dpkg-deb schrieb das beim Bauen still klein,
+# der installierte Name lautete also ohnehin 'lyx-compiler' — die Vorlage log
+# bloss. Genau diese Sorte stiller Ausbesserung wird zum Problem, sobald ein
+# anderes Werkzeug (apt-ftparchive, reprepro, ein CI-Skript) den Namen aus der
+# Vorlage liest statt aus dem fertigen Paket. Deshalb hier eine harte Prüfung
+# statt einer Warnung.
 PKGNAME="$(grep -m1 '^Package:' "$CONTROL" | sed 's/^Package:[[:space:]]*//')"
-if [ "$PKGNAME" != "$(echo "$PKGNAME" | tr '[:upper:]' '[:lower:]')" ]; then
-  echo "WARNUNG: Paketname '$PKGNAME' enthält Großbuchstaben (Debian-Policy 5.6.1 verlangt Kleinschreibung)." >&2
-  echo "         Umbenennen ist eine bewusste Entscheidung — installierte Pakete heißen dann anders." >&2
-fi
+case "$PKGNAME" in
+  [a-z0-9][a-z0-9+.-]*) ;;
+  *) fehler "Paketname '$PKGNAME' verletzt Debian-Policy 5.6.1: erlaubt sind
+        Kleinbuchstaben, Ziffern und '+-.', beginnend alphanumerisch.
+        In $CONTROL berichtigen." ;;
+esac
+[ "${#PKGNAME}" -ge 2 ] || fehler "Paketname '$PKGNAME' ist kürzer als zwei Zeichen (Policy 5.6.1)."
 
 echo "control: Version $VERSION, Architecture $ARCH"
 
@@ -162,6 +183,8 @@ dpkg-deb --root-owner-group --build "$PKG_DIR" "$DEB"
 if [ "$VERIFY" -eq 1 ]; then
   echo "Prüfe das fertige Paket..."
   # Ein Feld je Aufruf: bei mehreren stellt dpkg-deb den Feldnamen voran.
+  got_p="$(dpkg-deb --field "$DEB" Package)"
+  [ "$got_p" = "$PKGNAME" ] || fehler "Paket heisst '$got_p', control sagt '$PKGNAME'."
   got_v="$(dpkg-deb --field "$DEB" Version)"
   got_a="$(dpkg-deb --field "$DEB" Architecture)"
   [ "$got_v" = "$VERSION" ] || fehler "Paket meldet Version '$got_v', erwartet '$VERSION'."
@@ -174,7 +197,7 @@ if [ "$VERIFY" -eq 1 ]; then
     || fehler "lyxc im Paket weicht vom gebauten Binary ab."
   n_units="$(find "$tmp/usr/include/lyx/units" -name '*.lyx' | wc -l)"
   [ "$n_units" -gt 0 ] || fehler "keine .lyx im Paket — der Paketbaum war leer."
-  echo "  Version/Architektur stimmen, lyxc identisch, $n_units .lyx-Quelltexte enthalten."
+  echo "  $PKGNAME $VERSION/$ARCH stimmen, lyxc identisch, $n_units .lyx-Quelltexte enthalten."
 fi
 
 echo ""
