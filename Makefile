@@ -33,7 +33,7 @@ SHARE_DST := $(PKG_DIR)/usr/share/lyx
 UNITS_LYU := $(patsubst std/%.lyx,  $(UNITS_DST)/%.lyu, $(UNITS_SRC))
 DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
-.PHONY: build bootstrap singularity test test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin install-data lic_build_flags keygen sync-units-src
+.PHONY: build bootstrap singularity test test-external test-lyxos test-lyx-integration test-known-red snapshot snapshot-update clean package precompile-units install-bin install-data lic_build_flags keygen sync-units-src deb
 
 # ── Compiler bauen ────────────────────────────────────────────────────────────
 
@@ -664,6 +664,13 @@ snapshot-update: lyxc
 	@bash tests/run_snapshot_tests.sh --update
 
 # ── Paketierung ───────────────────────────────────────────────────────────────
+
+# Fertiges .deb mit Version und Architektur im Namen. Das Skript füllt den
+# Paketbaum (std, data, KassenSichV), räumt verwaiste Dateien weg, stempelt
+# DEBIAN/control und prüft anschließend, was tatsächlich im Paket liegt.
+# `package` (darunter) baut ohne diese Prüfungen und ohne Architektur im Namen.
+deb: precompile-units install-data
+	@bash tools/make_deb.sh $(DEB_ARCH)
 
 package: sync-units-src precompile-units install-bin install-data
 	dpkg-deb --build $(PKG_DIR) $(DEB_NAME)
