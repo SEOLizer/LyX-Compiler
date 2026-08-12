@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.17E
+VERSION   := 1.0.17F
 VERSION_DATE := 2026-08-12
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -485,6 +485,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Handbuchseite: uebersetzt, deckt --help, mandb indiziert sie (14 Pruefungen) ---"
 	@bash tests/manpage_test.sh
+	@echo "OK"
+	@echo "--- CLI sagt die Wahrheit: stdlib-Pfad, wirksame Schalter, RISC-V (19 Pruefungen) ---"
+	@bash tests/cli_truth_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh

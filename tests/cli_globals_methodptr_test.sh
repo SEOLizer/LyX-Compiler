@@ -70,7 +70,12 @@ cli_accepts "-O2"                   "-O2"
 cli_accepts "-v"                    "-v"
 cli_accepts "-wa und -we"           "-wa"
 cli_accepts "--target-energy=3"     "--target-energy=3"
-cli_accepts "--emit-asm"            "--emit-asm"
+cli_accepts "--lint"                "--lint"
+
+# --emit-asm stand hier als Beispiel fuer "gueltig". Das war es nie: der
+# Schalter setzte ein Feld, das niemand liest (#1098). Seit 1.0.17F wird er
+# abgewiesen statt still geschluckt; die Umsetzung fuehrt #1370.
+cli_rejects "angenommener, aber nicht umgesetzter Schalter" "--emit-asm" "nicht umgesetzt"
 
 # ===========================================================================
 # #1164 — globale Startwerte
