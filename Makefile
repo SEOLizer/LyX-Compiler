@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.17B
+VERSION   := 1.0.17C
 VERSION_DATE := 2026-08-12
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -459,7 +459,7 @@ test: lyxc
 	@echo "--- mehrdimensionale Arrays [N][M]T (8 Pruefungen) ---"
 	@bash tests/multidim_array_test.sh
 	@echo "OK"
-	@echo "--- new T[n] mit Laufzeitlaenge (9 Pruefungen) ---"
+	@echo "--- new T[n] mit Laufzeitlaenge (11 Pruefungen) ---"
 	@bash tests/dynamic_array_new_test.sh
 	@echo "OK"
 	@echo "--- Ausnahmeweg: finally reicht weiter, defer laeuft, throw bricht ab (13 Pruefungen) ---"
