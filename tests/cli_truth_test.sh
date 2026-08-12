@@ -168,11 +168,18 @@ done
 # #1360 — RISC-V
 # ===========================================================================
 
+# Geprueft wird mit einem Programm OHNE Array-Indizierung. Grund: seit #1339
+# weist das riscv-Backend Opcodes, die es nicht behandelt, laut ab — und
+# IRO_STORE_IDX (87) gehoert dazu. Vorher uebersetzte `a[0] := …` fuer dieses
+# Ziel und der Speicherbefehl verschwand spurlos; dieser Test war also gruen,
+# obwohl das erzeugte Binary unvollstaendig war. Hier geht es um #1360 (kommt
+# ueberhaupt ein RISC-V-ELF heraus), nicht um den Umfang des Backends.
+printf 'fn fak(n: int64): int64 { if n <= 1 { return 1; } return n * fak(n - 1); }\nfn main(): int64 { return fak(5); }\n' > "$TMP/rv.lyx"
 for t in riscv riscv64 linux-riscv64; do
   rm -f "$TMP/rv"
-  "$LYXC" "$TMP/rek.lyx" --target=$t -o "$TMP/rv" >/dev/null 2>&1
+  "$LYXC" "$TMP/rv.lyx" --target=$t -o "$TMP/rv" >/dev/null 2>&1
   if [ ! -f "$TMP/rv" ]; then
-    no "--target=$t erzeugt ein Binary" "keine Ausgabedatei"
+    no "--target=$t erzeugt ein Binary" "keine Ausgabedatei: $("$LYXC" "$TMP/rv.lyx" --target=$t -o "$TMP/rv" 2>&1 | head -1)"
   elif head -c 20 "$TMP/rv" | od -An -tu1 -j18 -N1 | grep -q ' 243'; then
     ok "--target=$t erzeugt ein RISC-V-ELF"
   else
