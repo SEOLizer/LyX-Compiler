@@ -215,6 +215,206 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
 }
 
 // HTTPS POST request
+// #1264: Ein VOLLSTAENDIGER Request ueber TLS — Methode, Kopfzeilen und Rumpf
+// bestimmt der Aufrufer. Die drei Cloud-Transporte (aws, cf, digitalocean)
+// hatten sich diesen Weg selbst zusammengesetzt und dabei zwei Funktionen mit
+// falscher Stelligkeit gerufen: `DNSResolve(host)` (vier Parameter) und
+// `HTTPSend(tlsConn, conn)` (einer). Beides uebersetzte, weil die Pruefung an
+// der Unit-Grenze endete; zur Laufzeit kamen die fehlenden Werte vom Stack.
+// Statt den Fehler dreimal zu flicken, steht der Weg jetzt EINMAL hier — als
+// dieselbe Abfolge, die HTTPSGet seit jeher benutzt.
+pub fn HTTPSSend(req: HTTPRequest): HTTPResponse {
+  var host: int64 := req.host;
+  var response: HTTPResponse;
+  var ctx: TLSContext;
+  var conn: TLSConn;
+  var ip: int64;
+  var tcpConn: TCPConn;
+  var requestBuf: int64;
+  var buf: int64;
+  var n: int64;
+  var i: int64;
+  
+  // Initialize response
+  response.statusCode := 0;
+  response.statusText := 0;
+  response.headerCount := 0;
+  response.contentLength := 0;
+  response.bodyPtr := 0;
+  response.bodySize := 0;
+  
+  // Initialize TLS
+  ctx := TLSInit();
+  if (ctx.initialized == 0) {
+    return response;
+  }
+  
+  // Resolve hostname
+  ip := GetHostByName(host);
+  if (ip == 0) {
+    TLSFree(ctx);
+    return response;
+  }
+  
+  // Connect TCP
+  tcpConn := TCPConnect(ip, HTTPS_PORT);
+  if (tcpConn.fd < 0) {
+    TLSFree(ctx);
+    return response;
+  }
+  
+  // TLS handshake
+  conn := TLSConnect(ctx, tcpConn.fd, host);
+  if (conn.connected == 0) {
+    sys_close(tcpConn.fd);
+    TLSFree(ctx);
+    return response;
+  }
+  
+  requestBuf := HTTPRequestBuild(req);
+  if (requestBuf == 0) {
+    TLSClose(conn);
+    sys_close(tcpConn.fd);
+    TLSFree(ctx);
+    return response;
+  }
+  
+  // Senden: der Puffer traegt Belegungs- und Nutzgroesse im Kopf (je 8 Byte).
+  // HTTPSGet schreibt hier feste 4096 Byte — das ist eine eigene Unsauberkeit
+  // und bleibt unberuehrt; hier wird die wirkliche Laenge benutzt.
+  var reqAlloc: int64 := peek64(requestBuf);
+  var reqSize:  int64 := peek64(requestBuf + 8);
+  n := TLSWrite(conn, requestBuf + 16, reqSize);
+  munmap(requestBuf, reqAlloc);
+  
+  if (n <= 0) {
+    TLSClose(conn);
+    sys_close(tcpConn.fd);
+    TLSFree(ctx);
+    return response;
+  }
+  
+  // Receive the full response. The request sends "Connection: close", so the
+  // server ends the TLS stream when done; we read into a growable buffer until
+  // TLSRead reports the close (<= 0). This handles responses far larger than a
+  // single TLS record — e.g. multi-MB package archives.
+  var cap: int64 := 65536;
+  buf := mmap(0, cap, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) {
+    TLSClose(conn);
+    sys_close(tcpConn.fd);
+    TLSFree(ctx);
+    return response;
+  }
+  var total: int64 := 0;
+  while (true) {
+    // Grow before each read so there is always room for a full chunk.
+    if (total + 16384 > cap) {
+      var newCap: int64 := cap * 2;
+      var nb: int64 := mmap(0, newCap, PROT_RW, MAP_ANON, FD_NONE, 0);
+      if (nb == 0) { break; }
+      var k: int64 := 0;
+      while (k < total) { poke8(nb + k, peek8(buf + k)); k := k + 1; }
+      munmap(buf, cap);
+      buf := nb;
+      cap := newCap;
+    }
+    var r: int64 := TLSRead(conn, buf + total, 16384);
+    if (r <= 0) { break; }
+    total += r;
+    if (total >= 67108864) { break; }   // 64 MiB safety cap
+  }
+  TLSClose(conn);
+  sys_close(tcpConn.fd);
+  TLSFree(ctx);
+
+  if (total <= 0) {
+    munmap(buf, cap);
+    return response;
+  }
+  n := total;   // the parsing below scans the full accumulated response
+
+  // Parse status line
+  i := 0;
+  while (i < n - 13) {
+    if (peek8(buf + i) == 72 && peek8(buf + i + 1) == 84 && 
+        peek8(buf + i + 2) == 84 && peek8(buf + i + 3) == 80 &&
+        peek8(buf + i + 4) == 47) {
+      i += 9;
+      response.statusCode := 0;
+      response.statusCode := response.statusCode * 10 + (peek8(buf + i) - 48);
+      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 1) - 48);
+      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 2) - 48);
+      break;
+    }
+    i += 1;
+  }
+  
+  // Find Content-Length. HTTP header names are case-insensitive, and CDNs
+  // (Cloudflare) send them lowercased — match on (byte | 0x20) so "content-
+  // length" and "Content-Length" both hit. ('-' is unaffected by | 0x20.)
+  i := 0;
+  while (i < n - 16) {
+    if ((peek8(buf + i) | 32) == 99 && (peek8(buf + i + 1) | 32) == 111 &&
+        (peek8(buf + i + 2) | 32) == 110 && (peek8(buf + i + 3) | 32) == 116 &&
+        (peek8(buf + i + 4) | 32) == 101 && (peek8(buf + i + 5) | 32) == 110 &&
+        (peek8(buf + i + 6) | 32) == 116 && (peek8(buf + i + 7) | 32) == 45 &&
+        (peek8(buf + i + 8) | 32) == 108 && (peek8(buf + i + 9) | 32) == 101 &&
+        (peek8(buf + i + 10) | 32) == 110 && (peek8(buf + i + 11) | 32) == 103 &&
+        (peek8(buf + i + 12) | 32) == 116 && (peek8(buf + i + 13) | 32) == 104) {
+      i += 14;
+      // Skip the ":" and any spaces between the header name and its value.
+      while (i < n && (peek8(buf + i) < 48 || peek8(buf + i) > 57)) {
+        i += 1;
+      }
+      response.contentLength := 0;
+      while (i < n) {
+        var c: int64 := peek8(buf + i);
+        if (c < 48 || c > 57) {
+          break;
+        }
+        response.contentLength := response.contentLength * 10 + (c - 48);
+        i += 1;
+      }
+      break;
+    }
+    i += 1;
+  }
+  
+  // Find body start
+  var bodyStart: int64 := 0;
+  i := 0;
+  while (i < n - 4) {
+    if (peek8(buf + i) == 13 && peek8(buf + i + 1) == 10 &&
+        peek8(buf + i + 2) == 13 && peek8(buf + i + 3) == 10) {
+      bodyStart := i + 4;
+      break;
+    }
+    i += 1;
+  }
+  
+  // Extract body
+  if (bodyStart > 0) {
+    var bodyLen: int64 := n - bodyStart;
+    if (bodyLen > 0) {
+      response.bodyPtr := mmap(0, bodyLen, PROT_RW, MAP_ANON, FD_NONE, 0);
+      if (response.bodyPtr != 0) {
+        i := 0;
+        while (i < bodyLen) {
+          poke8(response.bodyPtr + i, peek8(buf + bodyStart + i));
+          i += 1;
+        }
+        response.bodySize := bodyLen;
+      }
+    }
+  }
+
+  munmap(buf, cap);
+  return response;
+}
+
+// HTTPS POST request
+
 pub fn HTTPSPost(host: int64, path: int64, body: int64, bodySize: int64): HTTPResponse {
   var response: HTTPResponse;
   var ctx: TLSContext;
