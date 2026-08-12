@@ -483,6 +483,9 @@ test: lyxc
 	@echo "--- Grammatik-Hinweise: Generics, match-Auffangfall, StrNew, free, Closure (11 Pruefungen) ---"
 	@bash tests/grammar_hints_test.sh
 	@echo "OK"
+	@echo "--- Handbuchseite: uebersetzt, deckt --help, mandb indiziert sie (14 Pruefungen) ---"
+	@bash tests/manpage_test.sh
+	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh
 	@echo "OK"
