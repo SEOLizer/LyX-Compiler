@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.16K
-VERSION_DATE := 2026-08-11
+VERSION   := 1.0.17A
+VERSION_DATE := 2026-08-12
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -473,6 +473,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- sema-Pruefungen ueber Unit-Grenzen, Methoden, Aliase, Attribute (21 Pruefungen) ---"
 	@bash tests/sema_checks_test.sh
+	@echo "OK"
+	@echo "--- Wert statt Adresse: Feldzugriff, Verkettung, Array-Parameter, FloatToStr (16 Pruefungen) ---"
+	@bash tests/value_vs_address_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh
