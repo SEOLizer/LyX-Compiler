@@ -453,6 +453,9 @@ test: lyxc
 	@echo "--- std.time: Kalenderrundlauf 1970-2050 (6 Pruefungen) ---"
 	@bash tests/time_civil_test.sh
 	@echo "OK"
+	@echo "--- std.alloc: malloc_orpanic bricht ab statt zu drehen (7 Pruefungen) ---"
+	@bash tests/alloc_orpanic_test.sh
+	@echo "OK"
 	@echo "--- Import-Namensraum: import X as m, m.Fn() bindet richtig (9 Pruefungen) ---"
 	@bash tests/import_namensraum_test.sh
 	@echo "OK"
