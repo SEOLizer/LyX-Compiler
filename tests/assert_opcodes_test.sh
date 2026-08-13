@@ -72,6 +72,42 @@ hat_muster "riscv: BNE ueberspringt den Abbruch"  "$TMP/d_riscv" "6396020"
 hat_muster "arm-cm4: BNE gefolgt von BKPT"        "$TMP/d_arm-cm4" "00d100be"
 
 # ===========================================================================
+# IRO_CONST_STR — Zeichenketten (#1339, zweite Scheibe)
+# ===========================================================================
+
+# Ohne diesen Opcode scheiterte auf riscv und arm-cm4 schon `PrintLn("hallo")`.
+# Ohne `import std.io`: PrintLn ist ein Builtin, und die IR-Strecke kennt
+# StrLen aus der Unit nicht (eigene Luecke, hier nicht Gegenstand). Geprueft
+# wird die ZEICHENKETTE, nicht die Bibliothek.
+printf 'fn main(): int64 { PrintLn("hallo"); return 0; }\n' > "$TMP/str.lyx"
+for t in arm64 riscv arm-cm4; do
+  rm -f "$TMP/s_$t"
+  if "$LYXC" --std-path="$ROOT" "$TMP/str.lyx" --target=$t -o "$TMP/s_$t" >/dev/null 2>&1; then
+    ok "Zeichenkette uebersetzt fuer $t"
+  else
+    no "Zeichenkette uebersetzt fuer $t" "$("$LYXC" --std-path="$ROOT" "$TMP/str.lyx" --target=$t -o "$TMP/s_$t" 2>&1 | head -1)"
+  fi
+done
+
+msgs="$("$LYXC" --std-path="$ROOT" "$TMP/str.lyx" --target=esp32 -o "$TMP/s_xt" 2>&1)"
+case "$msgs" in
+  *"Zeichenkettenliterale"*"xtensa"*"#1339"*) ok "xtensa weist Zeichenketten laut ab" ;;
+  *) no "xtensa weist Zeichenketten laut ab" "$(echo "$msgs" | head -1)" ;;
+esac
+
+# Die Bytes stehen inline im Codestrom — und der Sprung muss sie GENAU
+# ueberspringen. Das ist die eigentliche Fehlerquelle bei inline abgelegten
+# Daten: eine um zwei Byte falsche Weite laesst den Prozessor in die
+# Zeichenkette hineinlaufen, und das faellt bei keinem Uebersetzungslauf auf.
+pruefe_sprung() { # name, datei, arch
+  if python3 "$ROOT/tests/lib/pruefe_sprung.py" "$2" "$3"; then ok "$1"
+  else no "$1" "Sprungweite passt nicht zur Zeichenkette"; fi
+}
+pruefe_sprung "arm64: Sprung ueberspringt die Zeichenkette genau"   "$TMP/s_arm64"   a64
+pruefe_sprung "riscv: Sprung ueberspringt die Zeichenkette genau"   "$TMP/s_riscv"   rv
+pruefe_sprung "arm-cm4: Sprung ueberspringt die Zeichenkette genau" "$TMP/s_arm-cm4" cm
+
+# ===========================================================================
 # Gegenproben
 # ===========================================================================
 

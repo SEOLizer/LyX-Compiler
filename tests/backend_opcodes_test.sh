@@ -47,16 +47,42 @@ else
   no "arm64-Binary enthaelt die SVC-Abbruchsequenz" "kein SVC #0 im Code"
 fi
 
-# Auf den Zielen ohne Zeichenketten-Opcode faellt panic beim Uebersetzen auf,
-# statt spurlos zu verschwinden. Die Meldung muss den Opcode nennen — sonst
-# steht der Nutzer vor demselben Raetsel wie vorher.
-for t in riscv arm-cm4 esp32; do
-  msg="$("$LYXC" --std-path="$ROOT" "$TMP/panic.lyx" --target=$t -o "$TMP/p_$t" 2>&1)"
-  case "$msg" in
-    *"kennt Opcode"*"#1339"*) ok "$t meldet den unbehandelten Opcode" ;;
-    *) no "$t meldet den unbehandelten Opcode" "$(echo "$msg" | head -1)" ;;
-  esac
+# Seit IRO_CONST_STR umgesetzt ist (#1339, dritte Scheibe), uebersetzt panic
+# auch fuer riscv und arm-cm4 — vorher fehlte die Zeichenkette fuer die
+# Meldung, und der Opcode wurde laut abgewiesen. Diese Pruefung erwartete
+# genau diese Ablehnung und hat damit den alten Zustand festgeschrieben; sie
+# prueft jetzt das Gegenteil.
+for t in riscv arm-cm4; do
+  rm -f "$TMP/p_$t"
+  if "$LYXC" --std-path="$ROOT" "$TMP/panic.lyx" --target=$t -o "$TMP/p_$t" >/dev/null 2>&1; then
+    ok "panic uebersetzt fuer $t"
+  else
+    no "panic uebersetzt fuer $t" "$("$LYXC" --std-path="$ROOT" "$TMP/panic.lyx" --target=$t -o "$TMP/p_$t" 2>&1 | head -1)"
+  fi
 done
+
+# riscv: der Abbruch ist exit(1) per ecall — die Sequenz muss im Code stehen.
+if [ -f "$TMP/p_riscv" ] && od -An -tx1 "$TMP/p_riscv" | tr -d ' \n' | grep -q '73000000'; then
+  ok "riscv-Binary enthaelt die ecall-Abbruchsequenz"
+else
+  no "riscv-Binary enthaelt die ecall-Abbruchsequenz" "kein ecall im Code"
+fi
+
+# arm-cm4: der Abbruch ist BKPT #0.
+if [ -f "$TMP/p_arm-cm4" ] && od -An -tx1 "$TMP/p_arm-cm4" | tr -d ' \n' | grep -q '00be'; then
+  ok "arm-cm4-Binary enthaelt BKPT"
+else
+  no "arm-cm4-Binary enthaelt BKPT" "kein BKPT im Code"
+fi
+
+# xtensa weist weiterhin laut ab — dort fehlt die gepruefte Kodierung sowohl
+# fuer die Zeichenkette als auch fuer den Abbruch. Welcher der beiden zuerst
+# meldet, ist nebensaechlich; dass es eine Meldung MIT Issue-Nummer gibt, nicht.
+msgx="$("$LYXC" --std-path="$ROOT" "$TMP/panic.lyx" --target=esp32 -o "$TMP/p_xt" 2>&1)"
+case "$msgx" in
+  *"nicht umgesetzt"*"#1339"*) ok "xtensa meldet die fehlende Umsetzung" ;;
+  *) no "xtensa meldet die fehlende Umsetzung" "$(echo "$msgx" | head -1)" ;;
+esac
 
 # Gegenprobe, und die ist die wichtigere: was diese Backends koennen, muessen
 # sie weiterhin koennen. Eine Sperre, die alles abweist, waere sonst ebenso

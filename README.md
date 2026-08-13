@@ -2,7 +2,7 @@
 
 > A self-hosting systems programming language focused on native code generation, predictable performance, minimal runtime dependencies, and built-in capability-based security.
 
-![Version](https://img.shields.io/badge/version-v1.0.18C-blue)
+![Version](https://img.shields.io/badge/version-v1.0.18D-blue)
 ![Status](https://img.shields.io/badge/status-self--hosting-success)
 ![Platform](https://img.shields.io/badge/linux-x86__64-success)
 ![Platform](https://img.shields.io/badge/linux-arm64-success)
