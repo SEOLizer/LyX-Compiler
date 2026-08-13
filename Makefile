@@ -447,6 +447,12 @@ test: lyxc
 	@echo "--- std.base64 gehaertet: Puffergrenze, ungueltige Zeichen, Padding (15 Pruefungen) ---"
 	@bash tests/base64_haerte_test.sh
 	@echo "OK"
+	@echo "--- Archiv-Units: tar-prefix, iso-Verzeichnisse, rar-Uebersprungene, zip-Pfad/Zeit (14 Pruefungen) ---"
+	@bash tests/archiv_units_test.sh
+	@echo "OK"
+	@echo "--- std.time: Kalenderrundlauf 1970-2050 (6 Pruefungen) ---"
+	@bash tests/time_civil_test.sh
+	@echo "OK"
 	@echo "--- Builtin-Auswahl: Cast und Argumentzahl (7 Pruefungen) ---"
 	@bash tests/builtin_dispatch_test.sh
 	@echo "OK"

@@ -27,6 +27,38 @@ pub con TAR_ERR_NOTTAR:  int64 := 1;
 pub con TAR_ERR_IO:      int64 := 2;
 pub con TAR_ERR_CORRUPT: int64 := 3;
 pub con TAR_ERR_FULL:    int64 := 4;
+// #1400: Pfad passt weder in name (100) noch in prefix+name (155+1+100).
+pub con TAR_ERR_NAMETOOLONG: int64 := 5;
+
+// #1400: Das ustar-Namensfeld fasst 100 Byte. TarWriterAdd nahm laengere Pfade
+// an, meldete Erfolg, und TarWriterSave schrieb dann den ABGESCHNITTENEN
+// Namen — das Archiv trug einen anderen Pfad als uebergeben, und die Datei war
+// darin nicht mehr auffindbar.
+//
+// POSIX sieht dafuer das prefix-Feld (155 Byte) vor: der Pfad wird an einem
+// Schraegstrich geteilt, vorn prefix, hinten name, beim Lesen mit '/'
+// zusammengesetzt. Das deckt Pfade bis 255 Byte ab und ist Norm, kein
+// GNU-Sonderweg.
+//
+// Diese Funktion liefert die Laenge des prefix-Teils:
+//   0  — passt ohne Teilung ins name-Feld
+//  >0  — an dieser Stelle steht der Schraegstrich, an dem geteilt wird
+//  -1  — laesst sich nicht unterbringen (kein passender Schraegstrich)
+// Gesucht wird der SPAETESTE zulaessige Schnitt: er laesst dem name-Feld so
+// wenig wie moeglich und damit die groesste Chance, dass der Rest hineinpasst.
+fn tarPrefixSplit(name: int64, len: int64): int64 {
+    if (len <= 100) { return 0; }
+    var p: int64 := len - 1;
+    if (p > 155) { p := 155; }
+    while (p > 0) {
+        if (peek8(name + p) == 0x2F) {          // '/'
+            var restLen: int64 := len - p - 1;
+            if ((restLen > 0) & (restLen <= 100)) { return p; }
+        }
+        p := p - 1;
+    }
+    return 0 - 1;
+}
 
 // ============================================================================
 // Struct-Offsets (Kommentare als Dokumentation)
@@ -187,8 +219,21 @@ pub fn TarOpen(path: pchar): int64 {
             var fileSize: int64 := tarReadOctal(header, 124, 12);
             var dataOff:  int64 := pos + 512;
 
-            var name: int64 := alloc(101);
-            tarCopyStr(name, header, 100);
+            // #1400: prefix (155) + '/' + name (100) — das Gegenstueck zur
+            // Teilung beim Schreiben. Ohne das las der Reader nur den hinteren
+            // Teil und meldete einen anderen Pfad, als im Archiv steht.
+            var name: int64 := alloc(257);
+            var pfxLen: int64 := 0;
+            while ((pfxLen < 155) & (peek8(header + 345 + pfxLen) != 0)) { pfxLen := pfxLen + 1; }
+            if (pfxLen > 0) {
+                var q: int64 := 0;
+                while (q < pfxLen) { poke8(name + q, peek8(header + 345 + q)); q := q + 1; }
+                poke8(name + pfxLen, 0x2F);
+                tarCopyStr(name + pfxLen + 1, header, 100);
+            }
+            if (pfxLen == 0) {
+                tarCopyStr(name, header, 100);
+            }
 
             if ((typeflag == 0x30) | (typeflag == 0)) {
                 if ((dataOff + fileSize) <= n) {
@@ -199,10 +244,10 @@ pub fn TarOpen(path: pchar): int64 {
                     poke64(entry + 24, 0);
                     count += 1;
                 } else {
-                    free(name, 101);
+                    free(name, 257);   // #1400: prefix + name
                 }
             } else {
-                free(name, 101);
+                free(name, 257);   // #1400: prefix + name
             }
 
             var dataBlocks: int64 := (fileSize + 511) / 512;
@@ -222,7 +267,7 @@ pub fn TarClose(handle: int64): void {
     var i: int64 := 0;
     while (i < count) {
         var name: int64 := peek64(entries + i * 32);
-        if (name != 0) { free(name, 101); }
+        if (name != 0) { free(name, 257); }   // #1400: prefix + name
         i += 1;
     }
     free(entries, TAR_MAX_ENTRIES * 32);
@@ -317,6 +362,10 @@ pub fn TarWriterAdd(writer: int64, name: int64, data: int64, dataLen: int64): in
     var count: int64 := peek64(writer + 8);
     if (count >= TAR_MAX_ENTRIES) { return TAR_ERR_FULL; }
 
+    // #1400: hier melden, nicht spaeter still kuerzen. Wer den Pfad uebergibt,
+    // steht an der Stelle, an der er ihn noch aendern kann.
+    if (tarPrefixSplit(name, StrLen(name as pchar)) < 0) { return TAR_ERR_NAMETOOLONG; }
+
     var entries: int64 := peek64(writer);
     var entry:   int64 := entries + count * 32;
 
@@ -366,11 +415,22 @@ pub fn TarWriterSave(writer: int64, path: pchar): int64 {
         var j: int64 := 0;
         while (j < 512) { poke8(header + j, 0); j := j + 1; }
 
-        // Name: max 100 Bytes
+        // #1400: Name, bei Bedarf auf prefix (345..499) und name (0..99)
+        // geteilt. TarWriterAdd hat bereits geprueft, dass eine Teilung
+        // existiert; scheitert sie hier trotzdem, wird das gemeldet statt
+        // gekuerzt.
+        var pfx: int64 := tarPrefixSplit(ename, enameLen);
+        if (pfx < 0) { free(buf, bufSize); return TAR_ERR_NAMETOOLONG; }
+        var nameStart: int64 := 0;
         var nc: int64 := enameLen;
-        if (nc > 100) { nc := 100; }
+        if (pfx > 0) {
+            nameStart := pfx + 1;
+            nc := enameLen - nameStart;
+            j := 0;
+            while (j < pfx) { poke8(header + 345 + j, peek8(ename + j)); j := j + 1; }
+        }
         j := 0;
-        while (j < nc) { poke8(header + j, peek8(ename + j)); j := j + 1; }
+        while (j < nc) { poke8(header + j, peek8(ename + nameStart + j)); j := j + 1; }
 
         // mode = 0644 (= 420 dezimal)
         tarWriteOctal(header, 100, 8, 420);

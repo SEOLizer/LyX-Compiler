@@ -14,6 +14,7 @@ import std.io;
 import std.string;
 import std.fs;
 import std.zlib;
+import std.time;   // #1404: echter Zeitstempel statt Festwert
 
 // ============================================================================
 // Struct-Offsets (Kommentare als Dokumentation)
@@ -21,7 +22,7 @@ import std.zlib;
 // ZipReader (32 Bytes):  rawData:0  rawLen:8  entries:16  entryCount:24
 // ZipEntry  (48 Bytes):  name:0  compSize:8  uncompSize:16  crc:24  method:32  dataOff:40
 // ZipWriter (16 Bytes):  entries:0  entryCount:8
-// PendingEntry (32 Bytes): name:0  dataPtr:8  dataLen:16  (pad):24
+// PendingEntry (40 Bytes): name:0  dataPtr:8  dataLen:16  nameLen:24  dosTime:32
 
 pub con ZIP_MAX_ENTRIES:  int64 := 4096;
 pub con ZIP_METHOD_STORE: int64 := 0;
@@ -32,6 +33,37 @@ pub con ZIP_ERR_IO:       int64 := 2;
 pub con ZIP_ERR_CORRUPT:  int64 := 3;
 pub con ZIP_ERR_FULL:     int64 := 4;
 pub con ZIP_STORE_THRESHOLD: int64 := 64;
+
+// #1404: Bis hierher trug jeder Eintrag den festen DOS-Zeitstempel 0x4A21 —
+// den 1. Januar 2017. Das sah im Quelltext wie ein vergessener Testwert aus
+// und war einer. Jetzt uebernimmt ZipWriterAdd die echte Zeit; wer bitgleiche
+// Archive braucht (reproduzierbare Builds), setzt sie mit ZipWriterAddAt
+// ausdruecklich.
+//
+// Das DOS-Format packt Datum und Zeit in je 16 Bit:
+//   Datum: Jahr-1980 (7) | Monat (4) | Tag (5)
+//   Zeit:  Stunde (5) | Minute (6) | Sekunde/2 (5)
+// Hier werden beide in einem int64 gefuehrt: (Datum << 16) | Zeit.
+pub con ZIP_TIME_2017: int64 := 0x4A210000;   // der alte Festwert, benannt
+
+// Wandelt eine Unix-Sekunde in den gepackten DOS-Zeitstempel.
+// Vor 1980 gibt es im Format keinen Zeitpunkt — dann der frueheste (1980-01-01).
+pub fn ZipDosTimeFromUnix(sec: int64): int64 {
+    if (sec < 0) { return 0x00210000; }
+    var tage: int64 := sec / 86400;
+    var rest: int64 := sec % 86400;
+    var jahr: int64 := CivilYearFromDays(tage);
+    if (jahr < 1980) { return 0x00210000; }   // 1980-01-01 00:00:00
+    var monat: int64 := CivilMonthFromDays(tage);
+    var tag:   int64 := CivilDayFromDays(tage);
+    var datum: int64 := ((jahr - 1980) << 9) | (monat << 5) | tag;
+    var zeit:  int64 := ((rest / 3600) << 11) | (((rest / 60) % 60) << 5) | ((rest % 60) / 2);
+    return (datum << 16) | zeit;
+}
+
+pub fn ZipDosTimeNow(): int64 {
+    return ZipDosTimeFromUnix(Now() as int64);
+}
 
 // ============================================================================
 // Interne Hilfsfunktionen
@@ -124,7 +156,7 @@ fn zipFindEOCD(data: int64, len: int64): int64 {
 // Öffnet ein ZIP-Archiv aus einer Datei.
 // Gibt einen alloc'd Handle zurück oder 0 bei Fehler.
 // Aufrufer muss ZipClose() aufrufen.
-pub fn ZipOpen(path: int64): int64 {
+pub fn ZipOpen(path: pchar): int64 {
     var fsize: int64 := FileSize(path);
     if (fsize < 22) { return 0; }
 
@@ -317,7 +349,7 @@ pub fn ZipFind(handle: int64, name: int64): int64 {
 // Erstellt einen neuen ZIP-Writer-Handle.
 pub fn ZipWriterNew(): int64 {
     var writer: int64 := alloc(16);
-    poke64(writer,     alloc(ZIP_MAX_ENTRIES * 32));
+    poke64(writer,     alloc(ZIP_MAX_ENTRIES * 40));
     poke64(writer + 8, 0);
     return writer;
 }
@@ -325,12 +357,19 @@ pub fn ZipWriterNew(): int64 {
 // Fügt einen Eintrag hinzu (kopiert name und data).
 // Gibt ZIP_ERR_OK oder ZIP_ERR_FULL zurück.
 pub fn ZipWriterAdd(writer: int64, name: int64, data: int64, dataLen: int64): int64 {
+    return ZipWriterAddAt(writer, name, data, dataLen, ZipDosTimeNow());
+}
+
+// #1404: wie ZipWriterAdd, aber mit ausdruecklichem Zeitstempel im gepackten
+// DOS-Format ((Datum << 16) | Zeit, siehe ZipDosTimeFromUnix). Fuer
+// reproduzierbare Archive, die bitgleich sein muessen.
+pub fn ZipWriterAddAt(writer: int64, name: int64, data: int64, dataLen: int64, dosTime: int64): int64 {
     if (writer == 0) { return ZIP_ERR_IO; }
     var count: int64 := peek64(writer + 8);
     if (count >= ZIP_MAX_ENTRIES) { return ZIP_ERR_FULL; }
 
     var entries: int64 := peek64(writer);
-    var entry:   int64 := entries + count * 32;
+    var entry:   int64 := entries + count * 40;
 
     // Name und Daten kopieren
     var nameCopy: int64 := zipStrdup(name);
@@ -341,7 +380,8 @@ pub fn ZipWriterAdd(writer: int64, name: int64, data: int64, dataLen: int64): in
     poke64(entry,      nameCopy);
     poke64(entry + 8,  dataCopy);
     poke64(entry + 16, dataLen);
-    poke64(entry + 24, StrLen(name));   // fuer ZipWriterFree: Laenge von nameCopy
+    poke64(entry + 24, StrLen(name as pchar));   // fuer ZipWriterFree: Laenge von nameCopy
+    poke64(entry + 32, dosTime);        // #1404
 
     poke64(writer + 8, count + 1);
     return ZIP_ERR_OK;
@@ -350,7 +390,7 @@ pub fn ZipWriterAdd(writer: int64, name: int64, data: int64, dataLen: int64): in
 // Schreibt das ZIP-Archiv unkomprimiert (STORE) in eine Datei.
 // Alle Einträge werden mit Compression Method 0 gespeichert.
 // Nützlich wenn der DEFLATE-Pfad nicht benötigt wird.
-pub fn ZipWriterSaveStore(writer: int64, path: int64): int64 {
+pub fn ZipWriterSaveStore(writer: int64, path: pchar): int64 {
     if (writer == 0) { return ZIP_ERR_IO; }
     var count: int64   := peek64(writer + 8);
     var entries: int64 := peek64(writer);
@@ -358,7 +398,7 @@ pub fn ZipWriterSaveStore(writer: int64, path: int64): int64 {
     var totalData: int64 := 0;
     var i: int64 := 0;
     while (i < count) {
-        var entry: int64 := entries + i * 32;
+        var entry: int64 := entries + i * 40;
         totalData := totalData + peek64(entry + 16);
         i += 1;
     }
@@ -370,11 +410,12 @@ pub fn ZipWriterSaveStore(writer: int64, path: int64): int64 {
 
     i := 0;
     while (i < count) {
-        var entry:    int64 := entries + i * 32;
+        var entry:    int64 := entries + i * 40;
         var ename:    int64 := peek64(entry);
         var edata:    int64 := peek64(entry + 8);
         var edataLen: int64 := peek64(entry + 16);
-        var enameLen: int64 := StrLen(ename);
+        var enameLen: int64 := StrLen(ename as pchar);
+        var edosTime: int64 := peek64(entry + 32);   // #1404
         var crc:      int64 := zipCrc32(edata, edataLen);
 
         poke64(offsets + i * 8, pos);
@@ -384,8 +425,8 @@ pub fn ZipWriterSaveStore(writer: int64, path: int64): int64 {
         zipPut16(buf, pos + 4,  20);
         zipPut16(buf, pos + 6,  0);
         zipPut16(buf, pos + 8,  0);        // STORE
-        zipPut16(buf, pos + 10, 0);
-        zipPut16(buf, pos + 12, 0x4A21);
+        zipPut16(buf, pos + 10, edosTime & 0xFFFF);          // #1404: Uhrzeit
+        zipPut16(buf, pos + 12, (edosTime >> 16) & 0xFFFF);  // #1404: Datum
         zipPut32(buf, pos + 14, crc);
         zipPut32(buf, pos + 18, edataLen);  // compSize == uncompSize
         zipPut32(buf, pos + 22, edataLen);
@@ -401,11 +442,12 @@ pub fn ZipWriterSaveStore(writer: int64, path: int64): int64 {
     var cdStart: int64 := pos;
     i := 0;
     while (i < count) {
-        var entry:    int64 := entries + i * 32;
+        var entry:    int64 := entries + i * 40;
         var ename:    int64 := peek64(entry);
         var edata:    int64 := peek64(entry + 8);
         var edataLen: int64 := peek64(entry + 16);
-        var enameLen: int64 := StrLen(ename);
+        var enameLen: int64 := StrLen(ename as pchar);
+        var edosTime: int64 := peek64(entry + 32);   // #1404
         var localOff: int64 := peek64(offsets + i * 8);
         var crc:      int64 := zipGet32(buf, localOff + 14);
 
@@ -415,8 +457,8 @@ pub fn ZipWriterSaveStore(writer: int64, path: int64): int64 {
         zipPut16(buf, pos + 6,  20);
         zipPut16(buf, pos + 8,  0);
         zipPut16(buf, pos + 10, 0);    // STORE
-        zipPut16(buf, pos + 12, 0);
-        zipPut16(buf, pos + 14, 0x4A21);
+        zipPut16(buf, pos + 12, edosTime & 0xFFFF);          // #1404: Uhrzeit
+        zipPut16(buf, pos + 14, (edosTime >> 16) & 0xFFFF);  // #1404: Datum
         zipPut32(buf, pos + 16, crc);
         zipPut32(buf, pos + 20, edataLen);
         zipPut32(buf, pos + 24, edataLen);
@@ -453,7 +495,7 @@ pub fn ZipWriterSaveStore(writer: int64, path: int64): int64 {
 
 // Schreibt das ZIP-Archiv in eine Datei.
 // Gibt ZIP_ERR_OK oder Fehlercode zurück.
-pub fn ZipWriterSave(writer: int64, path: int64): int64 {
+pub fn ZipWriterSave(writer: int64, path: pchar): int64 {
     if (writer == 0) { return ZIP_ERR_IO; }
     var count: int64   := peek64(writer + 8);
     var entries: int64 := peek64(writer);
@@ -462,7 +504,7 @@ pub fn ZipWriterSave(writer: int64, path: int64): int64 {
     var totalData: int64 := 0;
     var i: int64 := 0;
     while (i < count) {
-        var entry: int64 := entries + i * 32;
+        var entry: int64 := entries + i * 40;
         totalData := totalData + peek64(entry + 16);
         i += 1;
     }
@@ -480,11 +522,12 @@ pub fn ZipWriterSave(writer: int64, path: int64): int64 {
     // ── Local File Headers + Daten ──────────────────────────────────────────
     i := 0;
     while (i < count) {
-        var entry:     int64 := entries + i * 32;
+        var entry:     int64 := entries + i * 40;
         var ename:     int64 := peek64(entry);
         var edata:     int64 := peek64(entry + 8);
         var edataLen:  int64 := peek64(entry + 16);
-        var enameLen:  int64 := StrLen(ename);
+        var enameLen:  int64 := StrLen(ename as pchar);
+        var edosTime:  int64 := peek64(entry + 32);   // #1404
 
         poke64(offsets + i * 8, pos);
 
@@ -514,8 +557,8 @@ pub fn ZipWriterSave(writer: int64, path: int64): int64 {
         zipPut16(buf, pos + 4,  20);          // Version needed: 2.0
         zipPut16(buf, pos + 6,  0);           // General purpose flags
         zipPut16(buf, pos + 8,  method);      // Compression method
-        zipPut16(buf, pos + 10, 0);           // Last mod time (DOS format)
-        zipPut16(buf, pos + 12, 0x4A21);      // Last mod date (2026-01-01)
+        zipPut16(buf, pos + 10, edosTime & 0xFFFF);          // #1404: Uhrzeit
+        zipPut16(buf, pos + 12, (edosTime >> 16) & 0xFFFF);  // #1404: Datum
         zipPut32(buf, pos + 14, crc);         // CRC-32
         zipPut32(buf, pos + 18, compLen);     // Compressed size
         zipPut32(buf, pos + 22, edataLen);    // Uncompressed size
@@ -537,11 +580,12 @@ pub fn ZipWriterSave(writer: int64, path: int64): int64 {
 
     i := 0;
     while (i < count) {
-        var entry:    int64 := entries + i * 32;
+        var entry:    int64 := entries + i * 40;
         var ename:    int64 := peek64(entry);
         var edata:    int64 := peek64(entry + 8);
         var edataLen: int64 := peek64(entry + 16);
-        var enameLen: int64 := StrLen(ename);
+        var enameLen: int64 := StrLen(ename as pchar);
+        var edosTime: int64 := peek64(entry + 32);   // #1404
         var localOff: int64 := peek64(offsets + i * 8);
 
         // Methode und Größen aus dem Local File Header lesen (bereits geschrieben)
@@ -556,8 +600,8 @@ pub fn ZipWriterSave(writer: int64, path: int64): int64 {
         zipPut16(buf, pos + 6,  20);         // Version needed: 2.0
         zipPut16(buf, pos + 8,  0);          // Flags
         zipPut16(buf, pos + 10, method);     // Method
-        zipPut16(buf, pos + 12, 0);          // Mod time
-        zipPut16(buf, pos + 14, 0x4A21);     // Mod date
+        zipPut16(buf, pos + 12, edosTime & 0xFFFF);          // #1404: Uhrzeit
+        zipPut16(buf, pos + 14, (edosTime >> 16) & 0xFFFF);  // #1404: Datum
         zipPut32(buf, pos + 16, crc);        // CRC-32
         zipPut32(buf, pos + 20, compLen);    // Compressed size
         zipPut32(buf, pos + 24, edataLen);   // Uncompressed size
@@ -603,11 +647,11 @@ pub fn ZipWriterFree(writer: int64): void {
     var count:   int64 := peek64(writer + 8);
     var i: int64 := 0;
     while (i < count) {
-        var entry: int64 := entries + i * 32;
+        var entry: int64 := entries + i * 40;
         if (peek64(entry) != 0)     { free(peek64(entry), peek64(entry + 24) + 1); }
         if (peek64(entry + 8) != 0) { free(peek64(entry + 8), peek64(entry + 16) + 1); }
         i += 1;
     }
-    free(entries, ZIP_MAX_ENTRIES * 32);
+    free(entries, ZIP_MAX_ENTRIES * 40);
     free(writer, 16);
 }
