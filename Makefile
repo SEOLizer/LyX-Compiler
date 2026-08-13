@@ -456,6 +456,9 @@ test: lyxc
 	@echo "--- std.json gehaertet: Rundlauf, Steuerzeichen, Struktur (8 Pruefungen) ---"
 	@bash tests/json_haerte_test.sh
 	@echo "OK"
+	@echo "--- std.datetime/std.io: Locale, Zonenversatz, FloatToStr (9 Pruefungen) ---"
+	@bash tests/datetime_float_test.sh
+	@echo "OK"
 	@echo "--- std.io: Printf schreibt nicht mehr in ein String-Literal (5 Pruefungen) ---"
 	@bash tests/printf_literal_test.sh
 	@echo "OK"
