@@ -84,6 +84,24 @@ pub type EmitRISCV64 = class {
     self.codeLen := self.codeLen + 4;
   }
 
+  // #1339: einzelnes Byte — fuer Zeichenketten, die inline im Codestrom liegen.
+  fn rv_e8(v: int64) {
+    poke8(self.codeBuf + self.codeLen, v & 0xFF);
+    self.codeLen := self.codeLen + 1;
+  }
+
+  // #1339: JAL x0, off — unbedingter Sprung ohne Ruecksprungadresse. Das
+  // Sprungziel steckt in RISC-V verstreut im Befehlswort (imm[20|10:1|11|19:12]);
+  // von Hand zusammengesetzt ist das die haeufigste Fehlerquelle, deshalb hier
+  // an einer Stelle.
+  fn rv_JAL_x0(off: int64) {
+    var b20:    int64 := (off >> 20) & 0x1;
+    var b10_1:  int64 := (off >> 1)  & 0x3FF;
+    var b11:    int64 := (off >> 11) & 0x1;
+    var b19_12: int64 := (off >> 12) & 0xFF;
+    self.rv_e32(0x6F | (b19_12 << 12) | (b11 << 20) | (b10_1 << 21) | (b20 << 31));
+  }
+
   fn rv_poke32at(off: int64, val: int64) {
     poke8(self.codeBuf + off,     val & 0xFF);
     poke8(self.codeBuf + off + 1, (val >> 8) & 0xFF);
@@ -338,6 +356,7 @@ pub type EmitRISCV64 = class {
     // kein Backend.
     if (op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO) { return 1; }
     if (op == IRO_ASSERT_TRUE || op == IRO_ASSERT_BOUNDS) { return 1; }
+    if (op == IRO_CONST_STR) { return 1; }   // #1339
     if (op == 167 || op == IRO_ADD || op == IRO_ALLOC || op == IRO_AND) { return 1; }
     if (op == IRO_BITAND || op == IRO_BITNOT || op == IRO_BITOR || op == IRO_BITXOR) { return 1; }
     if (op == IRO_BR_FALSE || op == IRO_BR_TRUE || op == IRO_CALL || op == IRO_CALL_BUILTIN) { return 1; }
@@ -572,6 +591,35 @@ pub type EmitRISCV64 = class {
       self.rv_LI(RV_A0, 1);
       self.rv_LI(RV_A7, RV_SYS_EXIT);
       self.rv_e32(0x00000073);   // ecall
+    }
+
+    // #1339: IRO_CONST_STR — Zeichenkettenliteral. Es fehlte, und deshalb
+    // scheiterte auf diesem Ziel schon `PrintLn("hallo")`; vor der
+    // Opcode-Pruefung verschwand der Opcode sogar spurlos, und das Programm
+    // bekam einen Zeiger auf nichts.
+    //
+    // Verfahren wie im arm64-Backend: die Bytes stehen INLINE im Codestrom,
+    // die Adresse entsteht PC-relativ, und ein Sprung fuehrt darum herum. Das
+    // spart eine eigene Datensektion und funktioniert auf jedem Ladeort.
+    if op == IRO_CONST_STR {
+      var strBufR: int64 := peek64(self.ir + 32);
+      var spR: int64 := strBufR + imm;
+      var lenR: int64 := StrLen(spR as pchar);
+      var totalR: int64 := lenR + 1;                     // mit der abschliessenden 0
+      var padR: int64 := (4 - (totalR & 3)) & 3;         // auf 4 Byte auffuellen
+      var paddedR: int64 := totalR + padR;
+      // AUIPC t0, 0 → t0 = Adresse DIESES Befehls
+      self.rv_e32(0x00000297);
+      // ADDI t0, t0, 12 → hinter AUIPC + ADDI + JAL, also an den Anfang der Bytes
+      self.rv_ADDI(RV_T0, RV_T0, 12);
+      // JAL x0, 4 + paddedR → ueber die Zeichenkette hinweg
+      self.rv_JAL_x0(4 + paddedR);
+      var iR: int64 := 0;
+      while (iR < lenR) { self.rv_e8(peek8(spR + iR)); iR := iR + 1; }
+      self.rv_e8(0);
+      var pR: int64 := 0;
+      while (pR < padR) { self.rv_e8(0); pR := pR + 1; }
+      self.rv_storeSlot(dest);
     }
 
     // #1339: Die Zusicherungen. Sie entstehen in ir_lower — ASSERT_NOT_ZERO

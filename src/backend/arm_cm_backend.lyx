@@ -82,6 +82,12 @@ pub type EmitARMCM = class {
     self.codeLen := self.codeLen + 2;
   }
 
+  // #1339: einzelnes Byte — fuer Zeichenketten, die inline im Codestrom liegen.
+  fn cm_e8(v: int64) {
+    poke8(self.codeBuf + self.codeLen, v & 0xFF);
+    self.codeLen := self.codeLen + 1;
+  }
+
   // Emit 32-bit Thumb-2 instruction as two consecutive halfwords
   fn cm_t32(hw1: int64, hw2: int64) {
     self.cm_e16(hw1);
@@ -399,6 +405,7 @@ pub type EmitARMCM = class {
     // kein Backend.
     if (op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO) { return 1; }
     if (op == IRO_ASSERT_TRUE || op == IRO_ASSERT_BOUNDS) { return 1; }
+    if (op == IRO_CONST_STR) { return 1; }   // #1339
     if (op == 167 || op == IRO_ADD || op == IRO_ALLOC || op == IRO_AND) { return 1; }
     if (op == IRO_BITAND || op == IRO_BITNOT || op == IRO_BITOR || op == IRO_BITXOR) { return 1; }
     if (op == IRO_BR_FALSE || op == IRO_BR_TRUE || op == IRO_CALL || op == IRO_CALL_BUILTIN) { return 1; }
@@ -625,6 +632,36 @@ pub type EmitARMCM = class {
     // einfach weiter. Fangen kann ihn niemand: ir_lower weist try/catch ab.
     if op == IRO_THROW {
       self.cm_e16(0xBE00);   // bkpt #0
+    }
+
+    // #1339: IRO_CONST_STR — Zeichenkettenliteral. Es fehlte; auf diesem Ziel
+    // scheiterte damit schon `PrintLn("hallo")`.
+    //
+    // Die Bytes stehen INLINE im Codestrom, die Adresse entsteht PC-relativ,
+    // ein Sprung fuehrt darum herum — wie im arm64-Backend. Bewusst NICHT ueber
+    // ADR/LDR-literal: beide rechnen mit Align(PC,4), und ob der Befehl gerade
+    // auf einer 4-Byte-Grenze liegt, haengt vom vorherigen Code ab. `MOV r4, PC`
+    // liest den Wert ohne Ausrichtungsregel und ist damit an jeder Stelle
+    // richtig.
+    if op == IRO_CONST_STR {
+      var strBufC: int64 := peek64(self.ir + 32);
+      var spC: int64 := strBufC + imm;
+      var lenC: int64 := StrLen(spC as pchar);
+      var totalC: int64 := lenC + 1;                 // mit der abschliessenden 0
+      var padC: int64 := totalC & 1;                 // auf gerade Laenge bringen
+      var paddedC: int64 := totalC + padC;
+      // MOV r4, PC  → r4 = Adresse dieses Befehls + 4
+      self.cm_e16(0x467C);
+      // ADDS r4, #2 → zeigt hinter den folgenden Sprung, also auf die Bytes
+      self.cm_e16(0x3402);
+      // B ueber die Zeichenkette: T2-Sprungweite in Halbworten, PC = B + 4
+      self.cm_e16(0xE000 | (((paddedC - 2) / 2) & 0x7FF));
+      var iC: int64 := 0;
+      while (iC < lenC) { self.cm_e8(peek8(spC + iC)); iC := iC + 1; }
+      self.cm_e8(0);
+      var pC: int64 := 0;
+      while (pC < padC) { self.cm_e8(0); pC := pC + 1; }
+      self.cm_storeSlot(dest);
     }
 
     // #1339: Die Zusicherungen. ir_lower setzt ASSERT_NOT_ZERO vor jede
