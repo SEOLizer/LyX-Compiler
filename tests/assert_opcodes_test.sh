@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# tests/assert_opcodes_test.sh — #1339, Teil 2: die Zusicherungen.
+#
+# `ir_lower` erzeugt IRO_ASSERT_NOT_ZERO vor JEDER Division, damit eine Null
+# zu einem kontrollierten Abbruch führt statt zu SIGFPE. Behandelt hat den
+# Opcode ausser dem lyxos-Backend keines — er verschwand lautlos, und die
+# Division lief ungeprüft.
+#
+# Sichtbar wurde das erst durch die Opcode-Prüfung aus dem ersten Teil von
+# #1339: seither scheiterte eine simple Division für arm64, riscv, arm-cm4
+# und esp32 mit "kennt Opcode 159 nicht". Dieser Test hält beides fest — dass
+# Division wieder übersetzt, und dass die Prüfbefehle wirklich im Code stehen.
+#
+# WICHTIG zur Aussagekraft: auf diesem Rechner lässt sich kein arm64-, riscv-
+# oder Cortex-M-Binary AUSFÜHREN (kein qemu-user installiert). Die Prüfung
+# erfolgt deshalb an den Bytes: die Sprung- und Abbruchsequenz muss im
+# erzeugten Code vorkommen. Das belegt die Emission, nicht das Laufverhalten —
+# und genau das steht hier, statt einen Laufzeitnachweis vorzutäuschen.
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+LYXC="$ROOT/lyxc"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+PASS=0; FAIL=0
+ok() { echo "PASS $1"; PASS=$((PASS+1)); }
+no() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
+
+printf 'fn main(): int64 { var a: int64 := 10; var b: int64 := 2; return a / b; }\n' > "$TMP/div.lyx"
+
+# ===========================================================================
+# Division uebersetzt wieder — auf den Zielen, die eine gepruefte Kodierung haben
+# ===========================================================================
+
+for t in arm64 riscv arm-cm4; do
+  rm -f "$TMP/d_$t"
+  if "$LYXC" --std-path="$ROOT" "$TMP/div.lyx" --target=$t -o "$TMP/d_$t" >/dev/null 2>&1; then
+    ok "Division uebersetzt fuer $t"
+  else
+    no "Division uebersetzt fuer $t" "$("$LYXC" --std-path="$ROOT" "$TMP/div.lyx" --target=$t -o "$TMP/d_$t" 2>&1 | head -1)"
+  fi
+done
+
+# xtensa hat ausser `nop` keine gegen die eigene Byte-Konvention gepruefte
+# Kodierung. Eine erfundene Sprungweite waere hier besonders teuer: eine
+# Zusicherung, die falsch springt, laesst das Programm genau dort weiterlaufen,
+# wo es abbrechen sollte. Deshalb Abbruch beim Uebersetzen — und die Meldung
+# muss den Grund nennen.
+msg="$("$LYXC" --std-path="$ROOT" "$TMP/div.lyx" --target=esp32 -o "$TMP/d_xt" 2>&1)"
+case "$msg" in
+  *"Zusicherungen"*"xtensa"*"#1339"*) ok "xtensa weist die Zusicherung laut ab" ;;
+  *) no "xtensa weist die Zusicherung laut ab" "$(echo "$msg" | head -1)" ;;
+esac
+
+# ===========================================================================
+# Die Pruefbefehle stehen wirklich im Code
+# ===========================================================================
+
+# Ein Test auf "uebersetzt" allein waere auch gruen, wenn der Opcode wieder
+# stillschweigend verschwaende — er stuende ja bloss in der Liste. Deshalb die
+# Bytes.
+hat_muster() { # name, datei, hexmuster (little endian, wie im Code)
+  if [ ! -f "$2" ]; then no "$1" "kein Binary"; return; fi
+  if od -An -tx1 "$2" | tr -d ' \n' | grep -q "$3"; then ok "$1"
+  else no "$1" "Muster $3 fehlt im erzeugten Code"; fi
+}
+
+# arm64: CBNZ x0, +16 (B5000080) springt ueber MOV/MOV/SVC.
+hat_muster "arm64: CBNZ ueberspringt den Abbruch" "$TMP/d_arm64" "800000b5"
+# riscv: BNE t0, x0, +12 (00029663) springt ueber LI/LI/ecall.
+hat_muster "riscv: BNE ueberspringt den Abbruch"  "$TMP/d_riscv" "6396020"
+# arm-cm4: BNE +0 (D100) gefolgt von BKPT #0 (BE00).
+hat_muster "arm-cm4: BNE gefolgt von BKPT"        "$TMP/d_arm-cm4" "00d100be"
+
+# ===========================================================================
+# Gegenproben
+# ===========================================================================
+
+# Ohne Division darf keine Zusicherung im Code stehen — sonst waere der
+# Nachweis oben wertlos (das Muster koennte aus dem Rahmencode stammen).
+printf 'fn main(): int64 { var a: int64 := 10; var b: int64 := 2; return a + b; }\n' > "$TMP/add.lyx"
+rm -f "$TMP/a_arm64"
+"$LYXC" --std-path="$ROOT" "$TMP/add.lyx" --target=arm64 -o "$TMP/a_arm64" >/dev/null 2>&1
+if [ -f "$TMP/a_arm64" ]; then
+  if od -An -tx1 "$TMP/a_arm64" | tr -d ' \n' | grep -q "800000b5"; then
+    no "ohne Division keine Zusicherung im Code" "CBNZ-Muster auch ohne Division vorhanden"
+  else
+    ok "ohne Division keine Zusicherung im Code"
+  fi
+else
+  no "ohne Division keine Zusicherung im Code" "uebersetzt nicht"
+fi
+
+# Der x86-Weg ist unberuehrt: er hat seine eigenen Pruefungen im Codegen und
+# geht gar nicht ueber die IR-Strecke.
+printf 'import std.io;\nfn main(): int64 { var a: int64 := 10; var b: int64 := 2; PrintLn(IntToStr(a / b)); return 0; }\n' > "$TMP/x86.lyx"
+rm -f "$TMP/x86"
+if "$LYXC" --std-path="$ROOT" "$TMP/x86.lyx" -o "$TMP/x86" >/dev/null 2>&1; then
+  got="$("$TMP/x86" 2>&1)"
+  if [ "$got" = "5" ]; then ok "x86-Division rechnet unveraendert richtig"
+  else no "x86-Division rechnet unveraendert richtig" "'$got' erwartet '5'"; fi
+else
+  no "x86-Division rechnet unveraendert richtig" "uebersetzt nicht"
+fi
+
+# Und die Liste im Backend muss weiterhin zum Dispatcher passen — die Prüfung
+# aus dem ersten Teil von #1339 gilt auch für die neuen Zweige.
+for b in "src/backend/riscv_linux.lyx:rv" "src/backend/xtensa.lyx:xt" \
+         "src/backend/arm_cm_backend.lyx:cm" "src/backend/arm64/emit_arm64.lyx:a64"; do
+  datei="${b%%:*}"; praefix="${b##*:}"
+  fehlend="$(python3 - "$ROOT/$datei" "$praefix" <<'PY'
+import re,sys
+s=open(sys.argv[1],encoding='utf-8').read(); pre=sys.argv[2]
+i=s.index("fn %s_opBehandelt" % pre); j=s.index("return 0;", i)
+liste=set(re.findall(r'op == ([A-Za-z0-9_]+)', s[i:j]))
+k=s.index("fn emitInstr("); m=s.index("\n  fn ", k+10)
+disp=set(re.findall(r'op == ([A-Za-z0-9_]+)', s[k:m]))
+print(" ".join(sorted(disp - liste)))
+PY
+)"
+  if [ -z "$fehlend" ]; then ok "$(basename "$datei"): Liste deckt den Dispatcher"
+  else no "$(basename "$datei"): Liste deckt den Dispatcher" "nicht eingetragen: $fehlend"; fi
+done
+
+echo "--- $PASS PASS, $FAIL FAIL"
+[ "$FAIL" -eq 0 ]
