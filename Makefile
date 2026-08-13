@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.18E
+VERSION   := 1.0.18F
 VERSION_DATE := 2026-08-13
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -452,6 +452,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- std.time: Kalenderrundlauf 1970-2050 (6 Pruefungen) ---"
 	@bash tests/time_civil_test.sh
+	@echo "OK"
+	@echo "--- Import-Namensraum: import X as m, m.Fn() bindet richtig (9 Pruefungen) ---"
+	@bash tests/import_namensraum_test.sh
 	@echo "OK"
 	@echo "--- Builtin-Auswahl: Cast und Argumentzahl (7 Pruefungen) ---"
 	@bash tests/builtin_dispatch_test.sh

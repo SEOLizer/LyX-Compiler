@@ -368,6 +368,21 @@ pub type Sema = class {
   privCap:    int64;
   privEnforce: int64;   // #1035: nur waehrend Pass2 des Wurzelmoduls pruefen
 
+  // #1262: Namensraum eines Symbols. symAliasPtr[i]/symAliasLen[i] tragen den
+  // Alias des Imports, aus dem das Symbol stammt (`import std.math as m;`),
+  // sonst 0. Parallele Felder wie privFlags — die Symboltabelle selbst bleibt
+  // unveraendert, SEMA_SYM_SIZE haengt an mehreren Rechnungen.
+  //
+  // Der Name wird NICHT umgeschrieben. Ein erster Versuch tat das
+  // (`Clamp64` → `m_Clamp64` beim Registrieren) und scheiterte daran, dass
+  // die Unit ihre EIGENEN Symbole unter dem einfachen Namen anspricht:
+  // std.math ruft intern SqrtF64 und faende sich selbst nicht mehr.
+  // Geaendert wird stattdessen die SICHTBARKEIT beim Nachschlagen.
+  symAliasPtr: int64;
+  symAliasLen: int64;
+  curAlias:    int64;   // Alias des gerade verarbeiteten Imports, 0 = keiner
+  curAliasLen: int64;
+
   // #1009: Typparameter der GERADE geprueften generischen Deklaration.
   // Innerhalb einer Vorlage ist `T` ein gueltiger Typname, auch wenn
   // ResolveType ihn nicht kennt — der konkrete Typ entsteht erst bei der
@@ -570,6 +585,10 @@ pub type Sema = class {
     self.syms[self.symCount].typeId     := typeId;
     self.syms[self.symCount].nodeIdx    := nodeIdx;
     self.syms[self.symCount].isVolatile := 0;
+    if (self.symCount < self.privCap) {   // #1262
+      poke64(self.symAliasPtr + self.symCount * 8, self.curAlias);
+      poke64(self.symAliasLen + self.symCount * 8, self.curAliasLen);
+    }
     poke64(self.syms + 8, self.symCount + 1);
     self.symCount += 1;
   }
@@ -588,6 +607,55 @@ pub type Sema = class {
   }
 
   // Lookup by name pointer + length; returns symbol index or -1
+  // #1262: Traegt Symbol i denselben Namensraum wie der gerade verarbeitete
+  // Kontext? Symbole ohne Alias sind immer sichtbar; ein aliasiertes Symbol
+  // sieht nur, wer selbst in dieser Unit steht (waehrend ihres Pass1/Pass2).
+  fn _symAliasVisible(i: int64): int64 {
+    if (i >= self.privCap) { return 1; }
+    var ap: int64 := peek64(self.symAliasPtr + i * 8);
+    if (ap == 0) { return 1; }
+    if (self.curAlias == 0) { return 0; }
+    var al: int64 := peek64(self.symAliasLen + i * 8);
+    if (al != self.curAliasLen) { return 0; }
+    if (self._strNEq(ap as pchar, al, self.curAlias as pchar, self.curAliasLen)) { return 1; }
+    return 0;
+  }
+
+  // #1262: Nachschlagen INNERHALB eines Namensraums — fuer `m.Wert()`.
+  pub fn LookupInAlias(alias: pchar, aliasLen: int64, name: pchar, nameLen: int64): int64 {
+    var i: int64 := self.symCount - 1;
+    while (i >= 0) {
+      if (i < self.privCap) {
+        var ap: int64 := peek64(self.symAliasPtr + i * 8);
+        if (ap != 0) {
+          var al: int64 := peek64(self.symAliasLen + i * 8);
+          if (al == aliasLen && self._strNEq(ap as pchar, al, alias, aliasLen)) {
+            if (self._strNEq(self.SymName(i), self.SymNameLen(i), name, nameLen)) { return i; }
+          }
+        }
+      }
+      i -= 1;
+    }
+    return 0 - 1;
+  }
+
+  // #1262: Ist `name` ein Import-Alias? Geprueft an den Symbolen, die ihn
+  // tragen — eine eigene Liste waere eine zweite Wahrheit.
+  pub fn IsImportAlias(name: pchar, nameLen: int64): int64 {
+    var i: int64 := self.symCount - 1;
+    while (i >= 0) {
+      if (i < self.privCap) {
+        var ap: int64 := peek64(self.symAliasPtr + i * 8);
+        if (ap != 0) {
+          var al: int64 := peek64(self.symAliasLen + i * 8);
+          if (al == nameLen && self._strNEq(ap as pchar, al, name, nameLen)) { return 1; }
+        }
+      }
+      i -= 1;
+    }
+    return 0;
+  }
+
   fn Lookup(name: pchar, nameLen: int64): int64 {
     var i: int64 := self.symCount - 1;
     var privHit: int64 := 0 - 1;   // #1035: erster Treffer, der unit-privat ist
@@ -595,6 +663,8 @@ pub type Sema = class {
       var sName: pchar  := self.SymName(i);
       var sLen:  int64  := self.SymNameLen(i);
       if (self._strNEq(sName, sLen, name, nameLen)) {
+        // #1262: aus einem fremden Namensraum — unsichtbar ohne Qualifizierung.
+        if (self._symAliasVisible(i) == 0) { i -= 1; continue; }
         // #1035: Ein importiertes Symbol OHNE pub ist unit-intern und fuer den
         // Importeur nicht sichtbar. Es wird uebersprungen, die Suche laeuft
         // weiter — damit bindet `import std.alloc; alloc(16)` an die oeffentliche
@@ -1270,7 +1340,15 @@ pub type Sema = class {
             poke64(self.privModLen + i * 8, modLen);
           }
         }
-        if (ni >= 0 && peek64(self.sn_off(ni) + NODE_OFF_ISPUB) != 0) {
+        // #1262: Ein Symbol in einem eigenen Namensraum kann mit nichts
+        // kollidieren — genau dafuer ist der Alias da. Ohne diese Zeile
+        // meldete die Pruefung weiter Mehrdeutigkeit und der Ausweg waere
+        // keiner gewesen.
+        var aliasedHere: int64 := 0;
+        if (i < self.privCap) {
+          if (peek64(self.symAliasPtr + i * 8) != 0) { aliasedHere := 1; }
+        }
+        if (aliasedHere == 0 && ni >= 0 && peek64(self.sn_off(ni) + NODE_OFF_ISPUB) != 0) {
           var nm:  pchar := self.SymName(i);
           var nl:  int64 := self.SymNameLen(i);
           var hit: int64 := self._findExportedSym(nm, nl);
@@ -1620,6 +1698,22 @@ pub type Sema = class {
   }
 
   fn _sema_processImport(modName: pchar, modLen: int64, importNi: int64) {
+    // #1262: Den Aliasknoten HIER lesen — weiter unten zeigt self.pNodes
+    // bereits auf die Knoten des IMPORTIERTEN Moduls, und derselbe Index
+    // bezeichnet dort einen voellig anderen Knoten. Genau daran ist der erste
+    // Versuch gescheitert: gelesen wurde ein Typknoten, und "int64" galt als
+    // Namensraum.
+    var myAlias:    int64 := 0;
+    var myAliasLen: int64 := 0;
+    if (importNi >= 0) {
+      var aNi: int64 := self.sn_c0(importNi);
+      if (aNi >= 0) {
+        if (self.sn_kind(aNi) == SNK_IDENT) {
+          myAlias    := self.sn_sVal(aNi) as int64;
+          myAliasLen := self.sn_sLen(aNi);
+        }
+      }
+    }
     if (self._sema_hasImported(modName, modLen) != 0) { return; }
     self._sema_markImported(modName, modLen);
 
@@ -1797,6 +1891,16 @@ pub type Sema = class {
       return;
     }
 
+    // #1262: Namensraum dieses Imports setzen. Er gilt fuer Pass1 UND Pass2
+    // der Unit: waehrend Pass2 loest die Unit ihre eigenen Symbole auf, und
+    // die traegt sie ja selbst. Units, die SIE importiert, werden beim
+    // rekursiven Aufruf mit ihrem eigenen Alias verarbeitet — der Alias
+    // vererbt sich also nicht.
+    var aliasSaved:    int64 := self.curAlias;
+    var aliasSavedLen: int64 := self.curAliasLen;
+    self.curAlias    := myAlias;
+    self.curAliasLen := myAliasLen;
+
     // Nicht gepruned: Pass1 ausführen um Symbole zu registrieren
     var symsBefore: int64 := self.symCount;
     self.Pass1(head);
@@ -1869,6 +1973,8 @@ pub type Sema = class {
     self.pToks     := savedToks;
     self.pTokCount := savedTokCount;
     self.curFile   := savedCurFile;
+    self.curAlias    := aliasSaved;      // #1262
+    self.curAliasLen := aliasSavedLen;
 
     dispose p;
   }
@@ -3039,6 +3145,31 @@ pub type Sema = class {
         if (recv >= 0 && self.sn_kind(recv) == SNK_IDENT) {
           var rnm: pchar := self.sn_sVal(recv);
           var rnl: int64 := self.sn_sLen(recv);
+
+          // #1262: `m.Wert()` — der Empfaenger ist kein Objekt, sondern ein
+          // Import-Namensraum. Das muss VOR jeder Empfaengerpruefung stehen:
+          // `m` ist keine Variable, und die Pruefungen darunter wuerden es
+          // als undefiniertes Symbol melden.
+          if (self.IsImportAlias(rnm, rnl) != 0) {
+            var qnm: pchar := self.sn_sVal(ni);
+            var qnl: int64 := self.sn_sLen(ni);
+            if (self.LookupInAlias(rnm, rnl, qnm, qnl) < 0) {
+              EPrintStr("sema error: '"c);
+              sys_write(2, qnm as int64, qnl);
+              EPrintStr("' gibt es nicht im Namensraum '"c);
+              sys_write(2, rnm as int64, rnl);
+              EPrintStrLn("'"c);
+              self.hadError   := 1;
+              self.errorCount += 1;
+            }
+            var qArg: int64 := self.sn_c1(ni);
+            while (qArg >= 0) {
+              self._checkExpr(qArg);
+              qArg := self.sn_next(qArg);
+            }
+            return;
+          }
+
           var rsi: int64 := self.Lookup(rnm, rnl);
           if (rsi >= 0 && self.SymKind(rsi) == SYM_TYPE) {
             self._checkStaticMethodCall(ni, rsi, rnm, rnl);
@@ -6337,7 +6468,13 @@ pub type Sema = class {
     self.tpNames := alloc(self.tpCap * 8);
     self.tpLens  := alloc(self.tpCap * 8);
     self.tpCount := 0;
+    self.curAlias    := 0;   // #1262
+    self.curAliasLen := 0;
     self.privCap    := 16384;
+    self.symAliasPtr := alloc(self.privCap * 8);   // #1262
+    self.symAliasLen := alloc(self.privCap * 8);
+    var az: int64 := 0;
+    while (az < self.privCap) { poke64(self.symAliasPtr + az * 8, 0); az := az + 1; }
     self.privFlags  := alloc(self.privCap);
     self.privModPtr := alloc(self.privCap * 8);
     self.privModLen := alloc(self.privCap * 8);

@@ -1,6 +1,6 @@
-# Lyx 1.0.18E — Canonical EBNF Grammar
+# Lyx 1.0.18F — Canonical EBNF Grammar
 
-> Stand 2026-08-13, gegen lyxc 1.0.18E geprueft. Die Keyword-Liste in
+> Stand 2026-08-13, gegen lyxc 1.0.18F geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -189,6 +189,7 @@ TopDecl             = ImportDecl
 ImportDecl          = "import" ImportItem { "," ImportItem } ";" ;
 
 ImportItem          = DotPath
+                      [ "as" Ident ]
                       [ "grant"    "[" CapabilityList "]" ]
                       [ "restrict" "[" CapabilityList "]" ] ;
 ```
@@ -430,10 +431,18 @@ BaseIntType         = "int8"  | "i8"
    `as`-Cast ging sie durch. Das ist dieselbe Asymmetrie, die #1010 fuer die
    vorzeichenlose Haelfte geschlossen hat; sie ist seit #1151 beseitigt. *)
 
-(* Es gibt in Lyx KEINEN qualifizierten Zugriff. Weder `Modul::Name` noch
-   `Modul.Name` ist gueltig -- Symbole importierter Units liegen in einem
-   flachen Namensraum und werden unqualifiziert angesprochen. Frueher stand
-   hier `QualifiedIdent = Ident "::" Ident`; `::` erzeugt einen Parse-Fehler. *)
+(* Qualifizierter Zugriff gibt es seit 1.0.18F -- aber nur ueber einen
+   Import-Alias, nicht ueber den Modulnamen. `import std.math as m;` legt die
+   Unit in einen eigenen Namensraum; ihre Symbole heissen dann `m.Clamp64(...)`
+   und sind UNQUALIFIZIERT NICHT mehr sichtbar. Ohne Alias bleibt es beim
+   flachen Namensraum.
+
+   `Modul::Name` ist weiterhin ungueltig, und auch `std.math.Clamp64(...)` ist
+   es -- ein Punktpfad bezeichnet eine Datei, keinen Namensraum. Bis 1.0.18E
+   gab es gar keinen qualifizierten Zugriff; 31 Unit-Paare der eigenen
+   Standardbibliothek liessen sich deshalb nicht gemeinsam importieren
+   (#1262). Frueher stand hier `QualifiedIdent = Ident "::" Ident`; `::`
+   erzeugt einen Parse-Fehler. *)
 
 ArrayType           = "array" "[" Type "]"
                     | "Array" "<" Type ">"
