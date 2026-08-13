@@ -453,6 +453,9 @@ test: lyxc
 	@echo "--- std.xml/std.html: Wohlgeformtheit, Parsen, Entities, Bilanz (14 Pruefungen) ---"
 	@bash tests/xml_html_test.sh
 	@echo "OK"
+	@echo "--- std.json gehaertet: Rundlauf, Steuerzeichen, Struktur (8 Pruefungen) ---"
+	@bash tests/json_haerte_test.sh
+	@echo "OK"
 	@echo "--- std.io: Printf schreibt nicht mehr in ein String-Literal (5 Pruefungen) ---"
 	@bash tests/printf_literal_test.sh
 	@echo "OK"

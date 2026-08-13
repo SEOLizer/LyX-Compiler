@@ -7,6 +7,7 @@
 unit std.json;
 
 import std.string;
+import std.alloc;   // #1432: Puffer statt String-Literalen
 
 // ============================================================================
 // Type Constants
@@ -24,6 +25,11 @@ pub con ERR_JSON_INVALID: int64 := 1;
 pub con ERR_JSON_EXPECTED: int64 := 2;
 pub con ERR_JSON_EOF: int64 := 3;
 pub con ERR_JSON_ESCAPE: int64 := 4;
+
+// #1435: Bis hierher meldete parseValue fuer alles, was auf keinen bekannten
+// Fall passte, JSON_NUMBER — auch fuer `Muell` und fuer abgeschnittene
+// Eingaben. Einen Fehlerwert gab es nicht.
+pub con JSON_INVALID: int64 := 0 - 1;
 
 // ============================================================================
 // Internal helpers
@@ -138,6 +144,29 @@ pub fn JSONEscape(dest: pchar, src: pchar): pchar {
     } else if (c == 9) {
       StrSetChar(dest, j, 92); j := j + 1;
       StrSetChar(dest, j, 116); j := j + 1;
+    } else if (c == 8) {
+      StrSetChar(dest, j, 92); j := j + 1;
+      StrSetChar(dest, j, 98); j := j + 1;    // \b
+    } else if (c == 12) {
+      StrSetChar(dest, j, 92); j := j + 1;
+      StrSetChar(dest, j, 102); j := j + 1;   // \f
+    } else if (c < 32) {
+      // #1433: RFC 8259 §7 verlangt, dass JEDES Zeichen unter U+0020 maskiert
+      // wird. Vorher uebernahm der else-Zweig sie roh — das Ergebnis war kein
+      // gueltiges JSON, und ein strenger Parser (python json, jq, Browser)
+      // wies es zurueck. Solche Bytes kommen aus Dateien, Datenbankfeldern und
+      // Protokollzeilen, also genau aus den Daten, die man vor dem Versenden
+      // maskiert.
+      StrSetChar(dest, j, 92);  j := j + 1;
+      StrSetChar(dest, j, 117); j := j + 1;   // 'u'
+      StrSetChar(dest, j, 48);  j := j + 1;   // '0'
+      StrSetChar(dest, j, 48);  j := j + 1;   // '0'
+      var hi: int64 := c / 16;
+      var lo: int64 := c % 16;
+      if (hi < 10) { StrSetChar(dest, j, 48 + hi); } else { StrSetChar(dest, j, 87 + hi); }
+      j := j + 1;
+      if (lo < 10) { StrSetChar(dest, j, 48 + lo); } else { StrSetChar(dest, j, 87 + lo); }
+      j := j + 1;
     } else {
       StrSetChar(dest, j, c); j := j + 1;
     }
@@ -193,59 +222,135 @@ fn JSONUnescape(dest: pchar, src: pchar): pchar {
 // Public API
 // ============================================================================
 
-pub fn isValidJSON(s: pchar): bool {
-  var len: int64 := StrLen(s);
-  if (len == 0) { return false; }
+// #1434: Bei Arrays und Objekten wurde nur geprueft, ob sich zur oeffnenden
+// Klammer eine schliessende finden laesst — `[abc]` und `{,,,}` kamen durch.
+// Fuer die Skalare war die Pruefung seit #1269 in Ordnung; offen waren die
+// zusammengesetzten Typen.
+//
+// Umgesetzt ist die erste der beiden vorgeschlagenen Varianten: eine echte
+// Strukturpruefung. Die folgenden Funktionen laufen ueber den Text und geben
+// die Position HINTER dem gelesenen Teil zurueck, oder -1.
+fn jsonSkipWs(s: pchar, pos: int64, len: int64): int64 {
+  var p: int64 := pos;
+  while (p < len && json_is_ws(StrCharAt(s, p)) != 0) { p := p + 1; }
+  return p;
+}
 
-  var c: int64 := StrCharAt(s, 0);
+fn jsonSkipString(s: pchar, pos: int64, len: int64): int64 {
+  if (pos >= len || StrCharAt(s, pos) != 34) { return 0 - 1; }
+  var p: int64 := pos + 1;
+  while (p < len) {
+    var c: int64 := StrCharAt(s, p);
+    if (c == 92) {
+      p := p + 2;    // Maskierung: naechstes Zeichen gehoert dazu
+    }
+    if (c != 92) {
+      if (c == 34) { return p + 1; }
+      if (c < 32) { return 0 - 1; }   // rohes Steuerzeichen ist unzulaessig
+      p := p + 1;
+    }
+  }
+  return 0 - 1;   // nie geschlossen
+}
+
+fn jsonSkipNumber(s: pchar, pos: int64, len: int64): int64 {
+  var p: int64 := pos;
+  if (p < len && StrCharAt(s, p) == 45) { p := p + 1; }
+  var ziffern: int64 := 0;
+  while (p < len && StrCharAt(s, p) >= 48 && StrCharAt(s, p) <= 57) { p := p + 1; ziffern := 1; }
+  if (ziffern == 0) { return 0 - 1; }
+  if (p < len && StrCharAt(s, p) == 46) {
+    p := p + 1;
+    var nach: int64 := 0;
+    while (p < len && StrCharAt(s, p) >= 48 && StrCharAt(s, p) <= 57) { p := p + 1; nach := 1; }
+    if (nach == 0) { return 0 - 1; }
+  }
+  if (p < len && (StrCharAt(s, p) == 101 || StrCharAt(s, p) == 69)) {
+    p := p + 1;
+    if (p < len && (StrCharAt(s, p) == 43 || StrCharAt(s, p) == 45)) { p := p + 1; }
+    var exp: int64 := 0;
+    while (p < len && StrCharAt(s, p) >= 48 && StrCharAt(s, p) <= 57) { p := p + 1; exp := 1; }
+    if (exp == 0) { return 0 - 1; }
+  }
+  return p;
+}
+
+fn jsonSkipWort(s: pchar, pos: int64, len: int64, w: pchar, wlen: int64): int64 {
+  if (pos + wlen > len) { return 0 - 1; }
+  var k: int64 := 0;
+  while (k < wlen) {
+    if (StrCharAt(s, pos + k) != StrCharAt(w, k)) { return 0 - 1; }
+    k := k + 1;
+  }
+  return pos + wlen;
+}
+
+// Tiefe begrenzen: die Pruefung ist rekursiv, und eine Eingabe aus lauter
+// oeffnenden Klammern soll den Stapel nicht sprengen.
+con JSON_MAX_TIEFE: int64 := 128;
+
+fn jsonSkipValue(s: pchar, pos: int64, len: int64, tiefe: int64): int64 {
+  if (tiefe > JSON_MAX_TIEFE) { return 0 - 1; }
+  var p: int64 := jsonSkipWs(s, pos, len);
+  if (p >= len) { return 0 - 1; }
+  var c: int64 := StrCharAt(s, p);
+
+  if (c == 34)  { return jsonSkipString(s, p, len); }
+  if (c == 116) { return jsonSkipWort(s, p, len, "true"c,  4); }
+  if (c == 102) { return jsonSkipWort(s, p, len, "false"c, 5); }
+  if (c == 110) { return jsonSkipWort(s, p, len, "null"c,  4); }
 
   if (c == 91) {
-    // #1269: Index DER oeffnenden Klammer, nicht dahinter — sonst zaehlt
-    // find_matching sie nicht mit und trifft die 0 nie.
-    var mend: int64 := find_matching(s, 0, 91, 93);
-    return mend > 1;
+    // Array
+    p := jsonSkipWs(s, p + 1, len);
+    if (p < len && StrCharAt(s, p) == 93) { return p + 1; }   // []
+    var weiter: int64 := 1;
+    while (weiter == 1) {
+      p := jsonSkipValue(s, p, len, tiefe + 1);
+      if (p < 0) { return 0 - 1; }
+      p := jsonSkipWs(s, p, len);
+      if (p >= len) { return 0 - 1; }
+      var t: int64 := StrCharAt(s, p);
+      if (t == 44) { p := p + 1; }
+      if (t == 93) { return p + 1; }
+      if (t != 44 && t != 93) { return 0 - 1; }
+    }
+    return 0 - 1;
   }
 
   if (c == 123) {
-    var mend: int64 := find_matching(s, 0, 123, 125);   // #1269
-    return mend > 1;
-  }
-
-  if (c == 34) {
-    var ei: int64 := len - 1;
-    while (ei > 0) {
-      var eiprev: int64 := ei - 1;
-      if (StrCharAt(s, ei) == 34 && StrCharAt(s, eiprev) != 92) {
-        return true;
-      }
-      ei -= 1;
+    // Objekt
+    p := jsonSkipWs(s, p + 1, len);
+    if (p < len && StrCharAt(s, p) == 125) { return p + 1; }   // {}
+    var weiter2: int64 := 1;
+    while (weiter2 == 1) {
+      p := jsonSkipWs(s, p, len);
+      p := jsonSkipString(s, p, len);        // Schluessel MUSS eine Zeichenkette sein
+      if (p < 0) { return 0 - 1; }
+      p := jsonSkipWs(s, p, len);
+      if (p >= len || StrCharAt(s, p) != 58) { return 0 - 1; }   // ':'
+      p := jsonSkipValue(s, p + 1, len, tiefe + 1);
+      if (p < 0) { return 0 - 1; }
+      p := jsonSkipWs(s, p, len);
+      if (p >= len) { return 0 - 1; }
+      var t2: int64 := StrCharAt(s, p);
+      if (t2 == 44) { p := p + 1; }
+      if (t2 == 125) { return p + 1; }
+      if (t2 != 44 && t2 != 125) { return 0 - 1; }
     }
-    return false;
+    return 0 - 1;
   }
 
-  // #1269: Hier stand `return true` — alles, was nicht mit [ { oder " beginnt,
-  // galt damit als gueltiges JSON, auch `nonsense`. Zulaessig sind an dieser
-  // Stelle nur noch die Literale und Zahlen, die der Standard kennt.
-  if (StrCmp(s, "true"c)  == 0) { return true; }
-  if (StrCmp(s, "false"c) == 0) { return true; }
-  if (StrCmp(s, "null"c)  == 0) { return true; }
+  return jsonSkipNumber(s, p, len);
+}
 
-  var ni: int64 := 0;
-  if (StrCharAt(s, 0) == 45) { ni := 1; }        // fuehrendes Minus
-  if (ni >= len) { return false; }
-  var sawDigit: int64 := 0;
-  var sawDot:   int64 := 0;
-  while (ni < len) {
-    var nc: int64 := StrCharAt(s, ni);
-    if (nc >= 48 && nc <= 57) { sawDigit := 1; }
-    else if (nc == 46) {
-      if (sawDot != 0) { return false; }
-      sawDot := 1;
-    }
-    else { return false; }
-    ni += 1;
-  }
-  if (sawDigit == 0) { return false; }
+pub fn isValidJSON(s: pchar): bool {
+  var len: int64 := StrLen(s);
+  if (len == 0) { return false; }
+  var p: int64 := jsonSkipValue(s, 0, len, 0);
+  if (p < 0) { return false; }
+  p := jsonSkipWs(s, p, len);
+  if (p != len) { return false; }   // Rest hinter dem Wert
   return true;
 }
 
@@ -317,10 +422,19 @@ pub fn parseArray(dest: pchar, src: pchar): int64 {
           }
         }
 
+        // #1432: Das Pipe-Format kannte keine Maskierung — ein Pipe-Zeichen
+        // IM WERT zerlegte das Array beim Zurueckwandeln in zwei Elemente.
+        // Beim Kopieren werden deshalb '\\' und '|' maskiert; serializeArray
+        // nimmt es zurueck.
         var j: int64 := 0;
         while (j < elem_len) {
           var src_idx: int64 := elem_start + j;
-          StrSetChar(dest, result_len, StrCharAt(src, src_idx));
+          var ec: int64 := StrCharAt(src, src_idx);
+          if (ec == 92 || ec == 124) {
+            StrSetChar(dest, result_len, 92);
+            result_len += 1;
+          }
+          StrSetChar(dest, result_len, ec);
           result_len += 1;
           j += 1;
         }
@@ -341,55 +455,88 @@ pub fn parseArray(dest: pchar, src: pchar): int64 {
   return ERR_JSON_OK;
 }
 
+// #1432: Hier wurde JEDES Element in Anfuehrungszeichen gesetzt und maskiert,
+// unabhaengig davon, was es war. `[1,2,3]` kam als `["1","2","3"]` zurueck,
+// aus `["a","b"]` wurde `["\"a\"","\"b\""]` (die Anfuehrungszeichen des
+// Originals nochmals maskiert), und ein inneres Array ueberlebte als Text.
+//
+// Das Zwischenformat traegt die Elemente als ROHEN JSON-Text. Wer es
+// zurueckwandelt, muss deshalb ansehen, WAS dort steht: sieht es aus wie ein
+// JSON-Wert, wird es unveraendert uebernommen; alles andere ist eine nackte
+// Zeichenkette und wird maskiert. Damit ueberleben Zahlen, Wahrheitswerte,
+// null und Verschachtelung den Rundlauf.
+//
+// Ausserdem standen hier zwei STRING-LITERALE als Schreibpuffer (Klasse
+// #1259/#1260/#1431) — mit fester Laenge 80 und ohne Pruefung, ein Element
+// darueber schrieb daneben.
+fn jsonLooksLikeValue(s: pchar): int64 {
+  var c: int64 := StrCharAt(s, 0);
+  if (c == 34)  { return 1; }                    // Zeichenkette
+  if (c == 91)  { return 1; }                    // Array
+  if (c == 123) { return 1; }                    // Objekt
+  if (c == 45)  { return 1; }                    // negative Zahl
+  if (c >= 48 && c <= 57) { return 1; }          // Zahl
+  if (StrCmp(s, "true"c)  == 0) { return 1; }
+  if (StrCmp(s, "false"c) == 0) { return 1; }
+  if (StrCmp(s, "null"c)  == 0) { return 1; }
+  return 0;
+}
+
 pub fn serializeArray(dest: pchar, src: pchar): pchar {
   var src_len: int64 := StrLen(src);
   var i: int64 := 0;
   var j: int64 := 0;
-  var elem_start: int64 := 0;
 
   StrSetChar(dest, j, 91);
   j += 1;
 
+  var elem_buf: pchar := alloc(src_len + 2) as pchar;
+  var escaped:  pchar := alloc(src_len * 6 + 8) as pchar;
+  var erstes: int64 := 1;
+
   while (i <= src_len) {
-    var c: int64 := 0;
-    if (i < src_len) { c := StrCharAt(src, i); }
-
-    if (i == src_len || c == 124) {
-      var elem_len: int64 := i - elem_start;
-
-      var elem_buf: pchar := "                                                                                ";
-      var k: int64 := 0;
-      while (k < elem_len) {
-        var esrc: int64 := elem_start + k;
-        StrSetChar(elem_buf, k, StrCharAt(src, esrc));
-        k += 1;
+    // ein Element bis zum naechsten UNMASKIERTEN '|' einsammeln
+    var k: int64 := 0;
+    while (i < src_len && StrCharAt(src, i) != 124) {
+      var c: int64 := StrCharAt(src, i);
+      if (c == 92) {
+        i := i + 1;                       // Maskierung aufloesen
+        if (i < src_len) { c := StrCharAt(src, i); }
       }
-      StrSetChar(elem_buf, elem_len, 0);
+      StrSetChar(elem_buf, k, c);
+      k := k + 1;
+      i := i + 1;
+    }
+    StrSetChar(elem_buf, k, 0);
 
-      var escaped: pchar := "                                                                                ";
-      JSONEscape(escaped, elem_buf);
+    if (k > 0) {
+      if (erstes == 0) { StrSetChar(dest, j, 44); j := j + 1; }
+      erstes := 0;
 
-      k := 0;
-      while (StrCharAt(escaped, k) != 0) {
-        StrSetChar(dest, j, StrCharAt(escaped, k));
-        j += 1;
-        k += 1;
+      if (jsonLooksLikeValue(elem_buf) != 0) {
+        var q: int64 := 0;
+        while (q < k) {
+          StrSetChar(dest, j, StrCharAt(elem_buf, q));
+          j := j + 1;
+          q := q + 1;
+        }
       }
-
-      if (i < src_len) {
-        StrSetChar(dest, j, 44);
-        j += 1;
+      if (jsonLooksLikeValue(elem_buf) == 0) {
+        JSONEscape(escaped, elem_buf);
+        var e: int64 := 0;
+        while (StrCharAt(escaped, e) != 0) {
+          StrSetChar(dest, j, StrCharAt(escaped, e));
+          j := j + 1;
+          e := e + 1;
+        }
       }
-
-      elem_start := i + 1;
     }
 
-    i += 1;
+    i := i + 1;
   }
 
-  if (j > 1 && StrCharAt(dest, j - 1) == 44) {
-    j -= 1;
-  }
+  free(elem_buf as int64, src_len + 2);
+  free(escaped as int64, src_len * 6 + 8);
 
   StrSetChar(dest, j, 93);
   j += 1;
@@ -415,6 +562,11 @@ pub fn parseValue(dest: pchar, src: pchar): int64 {
   }
 
   if (c == 123) {
+    // #1435: Der Puffer blieb hier UNANGETASTET — wer den Rueckgabewert nicht
+    // prueft, las die Daten des vorherigen Aufrufs weiter. Objekte fuehrt die
+    // Unit (noch) nicht in ein Zwischenformat ueber; bis dahin ist ein leerer
+    // Puffer die ehrliche Antwort.
+    StrSetChar(dest, 0, 0);
     return JSON_OBJECT;
   }
 
@@ -438,6 +590,31 @@ pub fn parseValue(dest: pchar, src: pchar): int64 {
     StrSetChar(dest, 2, 108); StrSetChar(dest, 3, 115);
     StrSetChar(dest, 4, 101); StrSetChar(dest, 5, 0);
     return JSON_BOOL;
+  }
+
+  // #1435: Nur was wirklich wie eine Zahl aussieht, wird als Zahl gemeldet.
+  // Alles andere bekommt JSON_INVALID statt einer Zahl, die es nicht ist.
+  var ni2: int64 := 0;
+  if (StrCharAt(src, 0) == 45) { ni2 := 1; }
+  var sawD: int64 := 0;
+  var sawP: int64 := 0;
+  var istZahl: int64 := 1;
+  if (ni2 >= len) { istZahl := 0; }
+  while (istZahl == 1 && ni2 < len) {
+    var nc2: int64 := StrCharAt(src, ni2);
+    if (nc2 >= 48 && nc2 <= 57) { sawD := 1; }
+    if (nc2 == 46) {
+      if (sawP != 0) { istZahl := 0; }
+      sawP := 1;
+    }
+    if ((nc2 < 48 || nc2 > 57) && nc2 != 46) { istZahl := 0; }
+    ni2 += 1;
+  }
+  if (sawD == 0) { istZahl := 0; }
+
+  if (istZahl == 0) {
+    StrSetChar(dest, 0, 0);
+    return JSON_INVALID;
   }
 
   var vi: int64 := 0;
