@@ -427,6 +427,11 @@ pub type Codegen = class {
   externDataCount: int64;
   externDataCap:   int64;
   objMode:         int64;   // WSP-07: 1 = ET_REL-Objekt (--emit=obj); extern "asm" nur hier erlaubt
+  // #1389: 1 = freistehendes Ziel (--target=lyxos-kernel). Unter dem erzeugten
+  // Code laeuft KEIN Linux; jeder `syscall` trifft ins Leere. Betrifft die
+  // beiden Handler, die von sich aus einen absetzen: __lyx_canary_init
+  // (getrandom) und __lyx_stack_fail (write/exit).
+  kernelMode:      int64;
 
   // Parser output (set by Init)
   pSrc:   pchar;
@@ -14436,6 +14441,37 @@ pub type Codegen = class {
   // ------------------------------------------------------------------
 
   fn cg_emitHelpers() {
+    var sStart: int64 := self.codeLen;   // #1389
+    if self.kernelMode != 0 {
+      // #1389: freistehendes _start. Die Linux-Fassung setzt gleich als erstes
+      // prlimit64 ab und beendet sich am Ende mit exit — beides Syscalls.
+      // Ob der Bootloader ueberhaupt hier einspringt oder direkt bei main,
+      // haengt an ihm; springt er hier ein, faellt der Kernel sonst schon vor
+      // der ersten eigenen Anweisung um.
+      // Argumente gibt es auf blankem Blech nicht: argc/argv werden als 0
+      // hinterlegt, damit GetArgC/GetArgV einen definierten Wert lesen statt
+      // dessen, was der Bootloader auf dem Stapel liegen liess.
+      self.cg_e8(0x31); self.cg_e8(0xFF);                   // xor edi, edi (argc = 0)
+      self.cg_e8(0x31); self.cg_e8(0xF6);                   // xor esi, esi (argv = 0)
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x3D); // mov [rip+CG_ARGC], rdi
+      var kArgC: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_addPatch(kArgC, CG_ARGC, 0, CG_PATCH_STR);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x35); // mov [rip+CG_ARGV], rsi
+      var kArgV: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_addPatch(kArgV, CG_ARGV, 0, CG_PATCH_STR);
+      self.cg_e8(0xE8);                                     // call main
+      var kMain: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_addPatch(kMain, "main" as int64, 4, CG_PATCH_CALL);
+      // Kehrt main zurueck, ist der Kernel fertig — es gibt niemanden, dem man
+      // einen Rueckgabewert melden koennte. Anhalten statt exit.
+      self.cg_e8(0xFA); self.cg_e8(0xF4);                   // cli; hlt
+      self.cg_e8(0xEB); self.cg_e8(0xFD);                   // jmp -3
+      while (self.codeLen - sStart) < 79 { self.cg_e8(0x90); }   // feste 79 Bytes
+    }
+    if self.kernelMode == 0 {
     // ---- _start (65 bytes) ----
     // At Linux ABI entry: [rsp]=argc, [rsp+8]=argv[0], ...
     // First: call prlimit64 to remove RLIMIT_STACK (allows deep recursion in parser)
@@ -14490,6 +14526,11 @@ pub type Codegen = class {
     // 0F 05            syscall
     self.cg_e8(0x0F); self.cg_e8(0x05);
     // _start is now 79 bytes  ✓  (WP-BI-01: +14 for argc/argv save)
+    }
+    if (self.codeLen - sStart) != 79 {
+      EPrintStrLn("interner fehler: _start belegt nicht 79 Bytes (#1389)"c);
+      exit(1);
+    }
 
     // ---- _lyx_strlen (24 bytes, starts at offset 79) — WP-33: null-pointer guard ----
     // test rdi, rdi
@@ -15245,6 +15286,22 @@ pub type Codegen = class {
     // Called when stack canary mismatch detected. Writes message to stderr, exits 1.
     // No prologue — this is a terminal handler, never returns.
     self.cg_addLabel("__lyx_stack_fail", 16, 0);
+    var hStart: int64 := self.codeLen;   // #1389: fuer die Laengenpruefung unten
+    if self.kernelMode != 0 {
+      // #1389: Freistehendes Ziel — `write` und `exit` gibt es nicht. Ein
+      // Syscall hier wuerde den Abbruch, den dieser Handler melden soll, durch
+      // einen zweiten Fehler ersetzen: die Ursache waere dann nicht mehr
+      // lesbar. Stattdessen anhalten, so wie ein Kernel bei einem
+      // unbehebbaren Fehler anhaelt — der Zustand bleibt fuer den Debugger
+      // genau so stehen, wie er beim Erkennen war.
+      self.cg_e8(0xFA);                                  // cli
+      self.cg_e8(0xF4);                                  // hlt
+      self.cg_e8(0xEB); self.cg_e8(0xFD);                // jmp -3 (zurueck auf cli)
+      // Auf die festen 70 Bytes auffuellen: die Handler dahinter stehen an
+      // konstanten Offsets (CG_H_CANARY_INIT und die folgenden).
+      while (self.codeLen - hStart) < 70 { self.cg_e8(0x90); }   // nop
+    }
+    if self.kernelMode == 0 {
     // write(2, "stack smashing detected\n", 24)
     self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov rax, 1
     self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov rdi, 2
@@ -15263,11 +15320,42 @@ pub type Codegen = class {
     self.cg_e8(0x65); self.cg_e8(0x74); self.cg_e8(0x65); self.cg_e8(0x63); // "etec"
     self.cg_e8(0x74); self.cg_e8(0x65); self.cg_e8(0x64); self.cg_e8(0x0A); // "ted\n"
     // __lyx_stack_fail is 70 bytes ✓ (7+7+7+7+2 + 7+7+2 + 24 = 70)
+    }
+    // #1389: gemessen, nicht gezaehlt — beide Fassungen muessen exakt 70 Bytes
+    // belegen, sonst verschieben sich alle folgenden Handler gegen ihre
+    // Konstanten und der Aufruf landet mitten in einem Befehl.
+    if (self.codeLen - hStart) != 70 {
+      EPrintStrLn("interner fehler: __lyx_stack_fail belegt nicht 70 Bytes (#1389)"c);
+      exit(1);
+    }
 
     // ---- __lyx_canary_init (27 bytes, starts at offset 1345) — WP-18 ----
     // sys_getrandom(&_lyx_canary, 8, 0) — fills canary global from kernel CSPRNG.
     // Called once at start of main() before any user code runs.
     self.cg_addLabel("__lyx_canary_init", 17, 0);
+    var cStart: int64 := self.codeLen;   // #1389
+    if self.kernelMode != 0 {
+      // #1389: Kein getrandom auf einem freistehenden Ziel. Der Aufruf lief
+      // ins Leere und riss den Kernel gleich beim Eintritt in main() um.
+      //
+      // Entropiequelle stattdessen: der Zeitstempelzaehler, gemischt mit dem
+      // Stapelzeiger. RDTSC braucht keinen Kernel unter sich und ist in Ring 0
+      // immer lesbar. Das ist SCHWAECHER als getrandom — die oberen Bits des
+      // Zaehlers sind beim Systemstart gut vorhersagbar. Es ist aber ein
+      // wirklich veraenderlicher Wert; die Alternative waere ein Canary aus
+      // lauter Nullen, und der prueft nichts.
+      self.cg_e8(0x0F); self.cg_e8(0x31);                                   // rdtsc      → edx:eax
+      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x20); // shl rdx, 32
+      self.cg_e8(0x48); self.cg_e8(0x09); self.cg_e8(0xD0);                 // or  rax, rdx
+      self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xE0);                 // xor rax, rsp
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);                 // mov [rip+CG_CANARY], rax
+      var pCanaryBare: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_addPatch(pCanaryBare, CG_CANARY, 0, CG_PATCH_STR);
+      self.cg_e8(0xC3);                                                     // ret
+      while (self.codeLen - cStart) < 27 { self.cg_e8(0x90); }              // auf 27 auffuellen
+    }
+    if self.kernelMode == 0 {
     // mov rax, 318  (SYS_getrandom)
     self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0x3E); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); // 7 bytes
     // lea rdi, [rip+CG_CANARY]  (address of _lyx_canary in data section)
@@ -15284,6 +15372,11 @@ pub type Codegen = class {
     // ret
     self.cg_e8(0xC3);                                                                                                                 // 1 byte
     // __lyx_canary_init is 27 bytes ✓ (7+3+4+7+3+2+1 = 27)
+    }
+    if (self.codeLen - cStart) != 27 {
+      EPrintStrLn("interner fehler: __lyx_canary_init belegt nicht 27 Bytes (#1389)"c);
+      exit(1);
+    }
 
     // ---- __lyx_f64_to_str_chk (starts at offset 1372) — #1284 ----
     //
@@ -16459,6 +16552,11 @@ pub type Codegen = class {
     self.lcbsMissingGrants := 0;
     self.lcbsFastpathCount := 0;
     self.lcbsAuditSrcPath  := 0 as pchar;
+
+    // #1389: kernelMode wird hier NICHT genullt. `new` liefert das Feld bereits
+    // als 0, und cg_emitHelpers() laeuft am Ende dieses Init — der Aufrufer
+    // muss das Feld also VOR Init setzen, sonst entstuenden die Handler noch in
+    // der Linux-Fassung. Wie objMode, das aus demselben Grund ungenullt bleibt.
 
     // WP-T14: Compat-Modus (kein seccomp/landlock)
     self.lcbsCompatMode    := 0;
