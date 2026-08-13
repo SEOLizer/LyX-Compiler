@@ -450,6 +450,9 @@ test: lyxc
 	@echo "--- std.ini gehaertet: Puffergrenze, Maskierung, Freigabe (12 Pruefungen) ---"
 	@bash tests/ini_haerte_test.sh
 	@echo "OK"
+	@echo "--- std.xml/std.html: Wohlgeformtheit, Parsen, Entities, Bilanz (14 Pruefungen) ---"
+	@bash tests/xml_html_test.sh
+	@echo "OK"
 	@echo "--- std.io: Printf schreibt nicht mehr in ein String-Literal (5 Pruefungen) ---"
 	@bash tests/printf_literal_test.sh
 	@echo "OK"
