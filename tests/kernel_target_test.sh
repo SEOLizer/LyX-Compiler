@@ -79,8 +79,32 @@ else no "lyxos bleibt LBF" "Magic $m2"; fi
 
 # _start: kein prlimit64 (b8 2e 01 00 00), kein exit — argc/argv auf 0, dann
 # call main, dann anhalten.
-s="$(bytes "$TMP/kern" 0 12)"
-hat "_start beginnt ohne Syscall (xor edi/esi)" "$s" "31ff31f6"
+s="$(bytes "$TMP/kern" 0 30)"
+hat "_start beginnt ohne Syscall (xor eax,eax)" "$s" "31c0"
+
+# #1410: RDI und RSI muessen UNANGETASTET bleiben. Der Bootloader reicht dem
+# Kernel seinen boot_info-Zeiger nach SysV in RDI; `fn main(boot_info_ptr)`
+# erwartet ihn dort. Der erste Anlauf zu #1389 nullte beide Register mit der
+# Begruendung, auf blankem Blech gebe es keine Argumente — der Kernel las seine
+# Speicherkarte danach aus Adresse 0.
+#
+# Geprueft an den Bytes bis zum CALL: dort darf kein Schreibzugriff auf rdi
+# oder rsi stehen. Ein Test, der nur "uebersetzt" prueft, war gruen, waehrend
+# genau das drinstand.
+vor_call="${s%%e8*}"
+case "$vor_call" in
+  *31ff*) no "#1410: _start laesst RDI in Ruhe" "xor edi,edi vor dem CALL" ;;
+  *) ok "#1410: _start laesst RDI in Ruhe" ;;
+esac
+case "$vor_call" in
+  *31f6*) no "#1410: _start laesst RSI in Ruhe" "xor esi,esi vor dem CALL" ;;
+  *) ok "#1410: _start laesst RSI in Ruhe" ;;
+esac
+# argc/argv bleiben trotzdem definiert 0 — genullt wird ueber rax.
+case "$vor_call" in
+  31c0*) ok "#1410: argc/argv werden ueber rax genullt, nicht ueber rdi/rsi" ;;
+  *) no "#1410: argc/argv werden ueber rax genullt, nicht ueber rdi/rsi" "$vor_call" ;;
+esac
 
 # __lyx_canary_init: RDTSC statt getrandom.
 c="$(bytes "$TMP/kern" 1345 27)"

@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.18F
+VERSION   := 1.0.18G
 VERSION_DATE := 2026-08-13
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -528,7 +528,7 @@ test: lyxc
 	@echo "--- Zusicherungen in den IR-Backends: Division prueft wieder (13 Pruefungen) ---"
 	@bash tests/assert_opcodes_test.sh
 	@echo "OK"
-	@echo "--- freistehendes Kernel-Ziel: kein Syscall in Compiler-Code (19 Pruefungen) ---"
+	@echo "--- freistehendes Kernel-Ziel: kein Syscall, RDI bleibt unberuehrt (22 Pruefungen) ---"
 	@bash tests/kernel_target_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
