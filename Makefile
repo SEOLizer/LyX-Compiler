@@ -447,6 +447,12 @@ test: lyxc
 	@echo "--- std.base64 gehaertet: Puffergrenze, ungueltige Zeichen, Padding (15 Pruefungen) ---"
 	@bash tests/base64_haerte_test.sh
 	@echo "OK"
+	@echo "--- std.ini gehaertet: Puffergrenze, Maskierung, Freigabe (12 Pruefungen) ---"
+	@bash tests/ini_haerte_test.sh
+	@echo "OK"
+	@echo "--- std.io: Printf schreibt nicht mehr in ein String-Literal (5 Pruefungen) ---"
+	@bash tests/printf_literal_test.sh
+	@echo "OK"
 	@echo "--- Archiv-Units: tar-prefix, iso-Verzeichnisse, rar-Uebersprungene, zip-Pfad/Zeit (14 Pruefungen) ---"
 	@bash tests/archiv_units_test.sh
 	@echo "OK"
