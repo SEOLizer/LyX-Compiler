@@ -115,12 +115,16 @@ pub fn RarOpen(path: pchar): int64 {   // #1264: Pfad ist eine Zeichenkette
         free(raw, fsize + 1); return 0;
     }
 
-    var handle:  int64 := alloc(32);
+    // #1402: 40 statt 32 Byte — Platz fuer die Zahl der uebersprungenen
+    // Eintraege (Offset 32). Ohne sie sah ein Archiv aus lauter komprimierten
+    // Dateien genauso aus wie ein leeres.
+    var handle:  int64 := alloc(40);
     var entries: int64 := alloc(RAR_MAX_ENTRIES * 32);
     poke64(handle,      raw);
     poke64(handle + 8,  n);
     poke64(handle + 16, entries);
     poke64(handle + 24, 0);
+    poke64(handle + 32, 0);   // #1402: uebersprungene Eintraege
 
     // Cursor (heap-allokiert, da kein Adress-Operator in Lyx)
     var cur: int64 := alloc(8);
@@ -191,6 +195,15 @@ pub fn RarOpen(path: pchar): int64 {   // #1264: Pfad ist eine Zeichenkette
                     // Verzeichnisse (FHD_DIRECTORY, bit 0) überspringen
                     var isDir: int64 := fileFlags & 0x0001;
 
+                    // #1402: Ein komprimierter Eintrag wird weiterhin
+                    // uebersprungen — der RAR-Algorithmus ist proprietaer und
+                    // nicht umgesetzt. Gezaehlt wird er jetzt aber. Handelsuebliche
+                    // Packer komprimieren standardmaessig, das ist also der
+                    // Regelfall und nicht die Ausnahme.
+                    if ((isDir == 0) & (method != 0)) {
+                        poke64(handle + 32, peek64(handle + 32) + 1);
+                    }
+
                     // Nur stored reguläre Dateien mit vernünftigem Namen speichern
                     if ((isDir == 0) & (method == 0) & (nameLen > 0) & (nameLen < 512)) {
                         var dataOff: int64 := hdrDataEnd;
@@ -239,7 +252,7 @@ pub fn RarClose(handle: int64): void {
     // raw wurde als alloc(fsize + 1) belegt; handle+8 haelt die gelesene Laenge n,
     // die hoechstens fsize ist -- munmap gibt damit nie mehr frei als belegt wurde.
     free(peek64(handle), peek64(handle + 8) + 1);
-    free(handle, 32);
+    free(handle, 40);   // #1402
 }
 
 // Gibt die Anzahl der stored Einträge zurück.
@@ -285,6 +298,23 @@ pub fn RarRead(handle: int64, idx: int64, outBuf: int64, maxLen: int64): int64 {
 }
 
 // Sucht Eintrag nach exaktem Namen (UTF-8). Gibt Index zurück oder -1.
+// #1402: Zahl der Eintraege, die beim Oeffnen uebersprungen wurden, weil sie
+// komprimiert sind. Damit kann eine Anwendung sagen "Archiv enthaelt 5
+// Dateien, alle komprimiert — kann ich nicht lesen" statt ein leeres Archiv
+// zu melden.
+pub fn RarSkippedCount(handle: int64): int64 {
+    if (handle == 0) { return 0; }
+    return peek64(handle + 32);
+}
+
+// #1402: RAR_ERR_COMPRESSED, wenn mindestens ein Eintrag ausgelassen wurde,
+// sonst RAR_ERR_OK. Die Konstante war deklariert und wurde nirgends vergeben.
+pub fn RarLastError(handle: int64): int64 {
+    if (handle == 0) { return RAR_ERR_IO; }
+    if (peek64(handle + 32) > 0) { return RAR_ERR_COMPRESSED; }
+    return RAR_ERR_OK;
+}
+
 pub fn RarFind(handle: int64, name: int64): int64 {
     if (handle == 0) { return 0 - 1; }
     var count:   int64 := peek64(handle + 24);
