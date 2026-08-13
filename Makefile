@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.18B
+VERSION   := 1.0.18C
 VERSION_DATE := 2026-08-13
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -509,6 +509,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- POSIX-Schicht: pthread, fork/exec/wait/kill, Pdf/Svg (14 Pruefungen) ---"
 	@bash tests/posix_layer_test.sh
+	@echo "OK"
+	@echo "--- Zusicherungen in den IR-Backends: Division prueft wieder (13 Pruefungen) ---"
+	@bash tests/assert_opcodes_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh
