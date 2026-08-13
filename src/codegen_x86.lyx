@@ -193,7 +193,9 @@ con CG_H_CANARY_INIT: int64 := 1345;  // WP-18: __lyx_canary_init handler (27 by
 // stiller Versatz haette den Benutzercode an die falsche Stelle gelegt.
 con CG_H_F64STR_CHK: int64 := 1372;
 con CG_H_F64STR_CHK_LEN: int64 := 106;
-con CG_H_USER:         int64 := 1478;  // 1372 + 106 (#1284)
+con CG_H_MAP_STR:      int64 := 1478;  // #1291: Map mit Zeichenketten-Schluesseln
+con CG_H_MAP_STR_LEN:  int64 := 281;   // beim Erzeugen gemessen, nicht gezaehlt
+con CG_H_USER:         int64 := 1759;  // 1478 + 281 (#1291)
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -588,6 +590,7 @@ pub type Codegen = class {
   // Per-local array flag (WP-10b): byte buffer parallel to locals, 1 = array type
   localIsArray:      int64;
   localElemFloat:    int64;   // #1374: 1 = Elementtyp des Arrays ist f64/f32
+  localMapStrKey:    int64;   // #1291: 1 = Map<pchar,V> — Schluessel per Inhalt vergleichen
   localArraySize:    int64;  // WP-BC-51: int64 buffer, stores array length per local (0 = not array)
   // #1230: Zeilenlaenge M eines `[N][M]T`. 0 = eindimensional. Das Layout ist
   // FLACH (N*M Slots hinter einem {cap,len}-Kopf); `m[i]` liefert die Adresse
@@ -947,6 +950,9 @@ pub type Codegen = class {
       var efb: int64 := alloc(nc);              // #1374
       memcpy(efb, self.localElemFloat, self.localCount);
       self.localElemFloat := efb;
+      var mkb: int64 := alloc(nc);              // #1291
+      memcpy(mkb, self.localMapStrKey, self.localCount);
+      self.localMapStrKey := mkb;
       var sb: int64 := alloc(nc * 8);
       i := 0;
       memcpy(sb, self.localArraySize, self.localCount * 8);
@@ -980,6 +986,7 @@ pub type Codegen = class {
     poke64(toff + CG_LOCTYPE_OFF_LEN, 0);
     poke8(self.localIsArray      + self.localCount, 0);
     poke8(self.localElemFloat    + self.localCount, 0);   // #1374
+    poke8(self.localMapStrKey    + self.localCount, 0);   // #1291
     poke64(self.localArraySize   + self.localCount * 8, 0);
     poke64(self.localArrayRow    + self.localCount * 8, 0);   // #1230
     poke8(self.localIsRedundant  + self.localCount, 0);  // WP-3.1
@@ -3454,6 +3461,31 @@ pub type Codegen = class {
     if (self.cg_seq(tp, tln, "f64"c, 3) != 0) { return 1; }
     if (self.cg_seq(tp, tln, "f32"c, 3) != 0) { return 1; }
     return 0;
+  }
+
+  // #1291: `Map<pchar, V>` am Local vermerken. Der Typname allein sagt es
+  // nicht — er lautet nur "Map"; der Schluesseltyp steht im ersten Typargument
+  // (c0; der Wertetyp in c1, dieselbe Stelle liest sema in _checkMapKeyType).
+  fn cg_markMapStrKey(localIdx: int64, typeNode: int64) {
+    if (localIdx < 0 || typeNode < 0) { return; }
+    if (self.cg_nkind(typeNode) != 60) { return; }
+    if (self.cg_seq(self.cg_nsval(typeNode), self.cg_nslen(typeNode), "Map", 3) == 0) { return; }
+    var keyTy: int64 := self.cg_nc0(typeNode);
+    if (keyTy < 0 || self.cg_nkind(keyTy) != 60) { return; }
+    if (self.cg_seq(self.cg_nsval(keyTy), self.cg_nslen(keyTy), "pchar", 5) != 0) {
+      poke8(self.localMapStrKey + localIdx, 1);
+    }
+  }
+
+  // #1291: Ist der Ausdruck eine Map mit Zeichenketten-Schluesseln? Nur der
+  // einfache Fall — eine Variable. Ein Map-Literal an Ort und Stelle wird
+  // unten am Literal selbst entschieden.
+  fn cg_isStrKeyMap(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (self.cg_nkind(ni) != CGN_IDENT) { return 0; }
+    var li: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+    if (li < 0) { return 0; }
+    return peek8(self.localMapStrKey + li) as int64;
   }
 
   // #1374: Elementtyp beim Anlegen des Locals vermerken. Der Typname des
@@ -6426,8 +6458,15 @@ pub type Codegen = class {
       var ptypeNode: int64 := self.cg_nc0(param);
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
+        // #1291: auch ein PARAMETER kann eine Map mit Zeichenketten-Schluesseln
+        // sein. Ohne diese Zeile las eine Funktion, die so eine Map bekommt,
+        // mit dem Zahlenvergleich — und fand nichts, waehrend derselbe Zugriff
+        // beim Aufrufer stimmte. Die Markierung gehoert an jede Stelle, an der
+        // ein Local mit deklariertem Typ entsteht.
+        self.cg_markMapStrKey(self.localCount - 1, ptypeNode);
       }
       self.cg_markArrayParam(self.localCount - 1, ptypeNode);   // #1115
+      self.cg_markMapStrKey(self.localCount - 1, ptypeNode);            // #1291
       // #1003: inline geschriebener fn-Zeigertyp als Parameter
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == CGN_FN_PTR_NODE) {
         poke8(self.localIsFnPtr + self.localCount - 1, 1);
@@ -6451,6 +6490,7 @@ pub type Codegen = class {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(mspType), self.cg_nslen(mspType));
       }
       self.cg_markArrayParam(self.localCount - 1, mspType);     // #1115
+      self.cg_markMapStrKey(self.localCount - 1, mspType);            // #1291
       self.cg_loadRax(mspOff);
       self.cg_storeRax(mspLocal);
       mspOff += 8;
@@ -7042,8 +7082,17 @@ pub type Codegen = class {
       self.cg_genExpr(self.cg_nc0(ni));                        // rax = map
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
       self.cg_e8(0x5E);                                        // pop rsi (key)
-      var ppMG: int64 := self.cg_emitCall();
-      poke32(self.code + ppMG, CG_H_MAP_GET - ppMG - 4);
+      // #1291: Bei einer Map mit Zeichenketten-Schluesseln uebernimmt
+      // _lyx_map_str (Modus 1 = lesen); sonst bleibt es beim Zahlenvergleich.
+      if (self.cg_isStrKeyMap(self.cg_nc0(ni)) != 0) {
+        self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+        self.cg_e32(1);                                        // mov rcx,1 (lesen)
+        var ppMGs: int64 := self.cg_emitCall();
+        poke32(self.code + ppMGs, CG_H_MAP_STR - ppMGs - 4);
+      } else {
+        var ppMG: int64 := self.cg_emitCall();
+        poke32(self.code + ppMG, CG_H_MAP_GET - ppMG - 4);
+      }
 
     } else if (k == CGN_INDEX) {
       // arr[i]: nc0=arr, nc1=index
@@ -7558,8 +7607,20 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);      // mov rdx, rax
         self.cg_e8(0x5E);                                            // pop rsi (key)
         self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3C); self.cg_e8(0x24); // mov rdi,[rsp]
-        var ppMS: int64 := self.cg_emitCall();
-        poke32(self.code + ppMS, CG_H_MAP_SET - ppMS - 4);
+        // #1291: Ein Literal wie `{"a"c: 1}` fuellt die Map, bevor irgendeine
+        // Variable im Spiel ist — der Schluesseltyp steht hier nur am Eintrag
+        // selbst. Ist der Schluessel eine Zeichenkette, muss schon das
+        // Einfuegen ueber den Inhaltsvergleich laufen; sonst legte das Literal
+        // Eintraege ab, die das spaetere Lesen nie wiederfindet.
+        if (self.cg_nkind(self.cg_nc0(entry)) == CGN_LIT_STR) {
+          self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+          self.cg_e32(0);                                        // mov rcx,0 (setzen)
+          var ppMSl: int64 := self.cg_emitCall();
+          poke32(self.code + ppMSl, CG_H_MAP_STR - ppMSl - 4);
+        } else {
+          var ppMS: int64 := self.cg_emitCall();
+          poke32(self.code + ppMS, CG_H_MAP_SET - ppMS - 4);
+        }
         entry := self.cg_nnext(entry);
       }
       self.cg_e8(0x58);                                              // pop rax (return map ptr)
@@ -7583,8 +7644,15 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);      // mov rsi, rax
         self.cg_e8(0xBA); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edx, 1
         self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3C); self.cg_e8(0x24); // mov rdi,[rsp]
-        var ppSS: int64 := self.cg_emitCall();
-        poke32(self.code + ppSS, CG_H_MAP_SET - ppSS - 4);
+        if (self.cg_nkind(el) == CGN_LIT_STR) {                  // #1291
+          self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+          self.cg_e32(0);
+          var ppSSl: int64 := self.cg_emitCall();
+          poke32(self.code + ppSSl, CG_H_MAP_STR - ppSSl - 4);
+        } else {
+          var ppSS: int64 := self.cg_emitCall();
+          poke32(self.code + ppSS, CG_H_MAP_SET - ppSS - 4);
+        }
         el := self.cg_nnext(el);
       }
       self.cg_e8(0x58);                                              // pop rax (return map ptr)
@@ -7633,8 +7701,15 @@ pub type Codegen = class {
       self.cg_genExpr(self.cg_nc0(ni));                              // lhs (element) → rax
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);        // mov rsi, rax (key)
       self.cg_e8(0x5F);                                              // pop rdi (map ptr)
-      var ppMH: int64 := self.cg_emitCall();
-      poke32(self.code + ppMH, CG_H_MAP_HAS - ppMH - 4);
+      if (self.cg_isStrKeyMap(self.cg_nc1(ni)) != 0) {            // #1291
+        self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+        self.cg_e32(2);                                          // mov rcx,2 (enthalten)
+        var ppMHs: int64 := self.cg_emitCall();
+        poke32(self.code + ppMHs, CG_H_MAP_STR - ppMHs - 4);
+      } else {
+        var ppMH: int64 := self.cg_emitCall();
+        poke32(self.code + ppMH, CG_H_MAP_HAS - ppMH - 4);
+      }
 
     } else if (k == 100) {
       // WP-BC-51: NK_ARRAY_LIT — [e1, e2, ...] stack-allocated array with {cap,len} header
@@ -11233,6 +11308,10 @@ pub type Codegen = class {
       var typeNode: int64 := self.cg_nc0(ni);
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 60) {
         self.cg_setLocalType(localIdx, self.cg_nsval(typeNode), self.cg_nslen(typeNode));
+        // #1291: Bei `Map<pchar, V>` muss die Laufzeit den Schluessel ueber
+        // seinen INHALT vergleichen. Der Typname allein sagt das nicht — er
+        // lautet nur "Map"; der Schluesseltyp steht im ersten Typargument.
+        self.cg_markMapStrKey(localIdx, typeNode);
       }
       // #1003: inline geschriebener fn-Zeigertyp — hat keinen Namen, den die
       // fnAlias-Liste tragen koennte, also am Local selbst vermerken.
@@ -11818,8 +11897,15 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
         self.cg_e8(0x5E);                                        // pop rsi (Schluessel)
         self.cg_e8(0x5A);                                        // pop rdx (Wert)
-        var ppMSt: int64 := self.cg_emitCall();
-        poke32(self.code + ppMSt, CG_H_MAP_SET - ppMSt - 4);
+        if (self.cg_isStrKeyMap(self.cg_nc0(lhs)) != 0) {          // #1291
+          self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
+          self.cg_e32(0);                                          // mov rcx,0 (setzen)
+          var ppMSs: int64 := self.cg_emitCall();
+          poke32(self.code + ppMSs, CG_H_MAP_STR - ppMSs - 4);
+        } else {
+          var ppMSt: int64 := self.cg_emitCall();
+          poke32(self.code + ppMSt, CG_H_MAP_SET - ppMSt - 4);
+        }
         return;
 
       } else if (self.cg_nkind(lhs) == CGN_INDEX) {
@@ -12354,6 +12440,7 @@ pub type Codegen = class {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
       }
       self.cg_markArrayParam(self.localCount - 1, ptypeNode);   // #1115
+      self.cg_markMapStrKey(self.localCount - 1, ptypeNode);            // #1291
       // #1003: inline geschriebener fn-Zeigertyp als Parameter
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == CGN_FN_PTR_NODE) {
         poke8(self.localIsFnPtr + self.localCount - 1, 1);
@@ -14187,6 +14274,7 @@ pub type Codegen = class {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(ptypeNode), self.cg_nslen(ptypeNode));
       }
       self.cg_markArrayParam(self.localCount - 1, ptypeNode);   // #1115
+      self.cg_markMapStrKey(self.localCount - 1, ptypeNode);            // #1291
       // #1003: inline geschriebener fn-Zeigertyp als Parameter
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == CGN_FN_PTR_NODE) {
         poke8(self.localIsFnPtr + self.localCount - 1, 1);
@@ -14211,6 +14299,7 @@ pub type Codegen = class {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(spType), self.cg_nslen(spType));
       }
       self.cg_markArrayParam(self.localCount - 1, spType);      // #1115
+      self.cg_markMapStrKey(self.localCount - 1, spType);            // #1291
       self.cg_loadRax(spOff);
       self.cg_storeRax(spLocal);
       spOff += 8;
@@ -15271,7 +15360,162 @@ pub type Codegen = class {
       EPrintStrLn(" — CG_H_USER anpassen (#1284)"c);
       exit(1);
     }
-    // Total helpers: ... + 27 + CG_H_F64STR_CHK_LEN = CG_H_USER  ✓
+    // ---- _lyx_map_str (#1291) ------------------------------------------
+    // _lyx_map_str(rdi=map, rsi=key(pchar), rdx=value, rcx=modus)
+    //   modus 0 = setzen, 1 = lesen, 2 = enthalten
+    //   rax: setzen → 0, lesen → Wert (0 wenn nicht da), enthalten → 0/1
+    //
+    // Warum eine EINZIGE Routine statt drei: der Unterschied zwischen setzen,
+    // lesen und enthalten sind drei Zeilen am Ende; die Sondierung ist
+    // dieselbe. Drei Kopien haetten dreimal dieselben Sprungweiten von Hand
+    // gebraucht — und genau dort entstehen die Fehler, die man nicht sieht.
+    //
+    // Der Unterschied zur ganzzahligen Fassung: verglichen wird der INHALT.
+    // Der Schluessel-Hash (FNV-1a ueber die Bytes bis NUL) steht im dritten
+    // Feld des Slots, das bisher eine Kopie des Schluessels trug. Beim
+    // Sondieren wird zuerst der Hash verglichen (billig) und nur bei
+    // Gleichheit Byte fuer Byte. Damit finden zwei gleich geschriebene
+    // Literale denselben Eintrag, obwohl sie an verschiedenen Adressen liegen
+    // — das war der Grund, warum pchar-Schluessel bis 1.0.17K abgewiesen
+    // wurden (#1291, #1152).
+    var mapStrStart: int64 := self.codeLen;
+    // Prolog
+    self.cg_e8(0x53);                                              // push rbx
+    self.cg_e8(0x41); self.cg_e8(0x54);                            // push r12
+    self.cg_e8(0x41); self.cg_e8(0x55);                            // push r13
+    self.cg_e8(0x41); self.cg_e8(0x56);                            // push r14
+    self.cg_e8(0x41); self.cg_e8(0x57);                            // push r15
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);          // mov rbx,rdi   (map)
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF4);          // mov r12,rsi   (key)
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xD5);          // mov r13,rdx   (value)
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xCB);          // mov r11,rcx   (modus)
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x33);          // mov r14,[rbx] (cap)
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xCE);          // dec r14       (maske)
+    // FNV-1a: r15 = 14695981039346656037; r10 = 1099511628211
+    self.cg_e8(0x49); self.cg_e8(0xBF);
+    // 14695981039346656037 = 0xCBF29CE484222325, little endian.
+    self.cg_e8(0x25); self.cg_e8(0x23); self.cg_e8(0x22); self.cg_e8(0x84);
+    self.cg_e8(0xE4); self.cg_e8(0x9C); self.cg_e8(0xF2); self.cg_e8(0xCB);   // movabs r15, FNV-Offset
+    self.cg_e8(0x49); self.cg_e8(0xBA);
+    self.cg_e8(0xB3); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);   // movabs r10, FNV-Prime
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE6);          // mov rsi,r12
+    var hLoop: int64 := self.codeLen;
+    self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x06);          // movzx eax,byte [rsi]
+    self.cg_e8(0x84); self.cg_e8(0xC0);                            // test al,al
+    self.cg_e8(0x0F); self.cg_e8(0x84);                            // jz .hdone (rel32)
+    var pHDone: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x49); self.cg_e8(0x31); self.cg_e8(0xC7);          // xor r15,rax
+    self.cg_e8(0x4D); self.cg_e8(0x0F); self.cg_e8(0xAF); self.cg_e8(0xFA);  // imul r15,r10
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);          // inc rsi
+    self.cg_e8(0xE9); self.cg_e32(hLoop - self.codeLen - 4);       // jmp .hloop
+    poke32(self.code + pHDone, self.codeLen - pHDone - 4);         // .hdone:
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xF8);          // mov rax,r15
+    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14   (index)
+    // Sondierschleife
+    var pTop: int64 := self.codeLen;
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);          // mov rcx,rax
+    self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC9); self.cg_e8(0x18);  // imul rcx,rcx,24
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD9);          // add rcx,rbx
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x18);  // add rcx,24
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x11);          // mov r10,[rcx]  (Schluessel im Slot)
+    self.cg_e8(0x4D); self.cg_e8(0x85); self.cg_e8(0xD2);          // test r10,r10
+    self.cg_e8(0x0F); self.cg_e8(0x84);                            // jz .leer
+    var pLeer: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x4C); self.cg_e8(0x3B); self.cg_e8(0x79); self.cg_e8(0x10);  // cmp r15,[rcx+16]
+    self.cg_e8(0x0F); self.cg_e8(0x85);                            // jne .weiter
+    var pW1: int64 := self.codeLen; self.cg_e32(0);
+    // Inhaltsvergleich: rdi=Slot-Schluessel, rsi=gesuchter Schluessel
+    self.cg_e8(0x50);                                              // push rax
+    self.cg_e8(0x51);                                              // push rcx
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xD7);          // mov rdi,r10
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE6);          // mov rsi,r12
+    var sTop: int64 := self.codeLen;
+    self.cg_e8(0x8A); self.cg_e8(0x07);                            // mov al,[rdi]
+    self.cg_e8(0x3A); self.cg_e8(0x06);                            // cmp al,[rsi]
+    self.cg_e8(0x0F); self.cg_e8(0x85);                            // jne .ungleich
+    var pSne: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x84); self.cg_e8(0xC0);                            // test al,al
+    self.cg_e8(0x0F); self.cg_e8(0x84);                            // jz .gleich
+    var pSeq: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);          // inc rdi
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);          // inc rsi
+    self.cg_e8(0xE9); self.cg_e32(sTop - self.codeLen - 4);        // jmp .stop
+    poke32(self.code + pSne, self.codeLen - pSne - 4);             // .ungleich:
+    self.cg_e8(0x59);                                              // pop rcx
+    self.cg_e8(0x58);                                              // pop rax
+    self.cg_e8(0xE9);                                              // jmp .weiter
+    var pW2: int64 := self.codeLen; self.cg_e32(0);
+    poke32(self.code + pSeq, self.codeLen - pSeq - 4);             // .gleich:
+    self.cg_e8(0x59);                                              // pop rcx
+    self.cg_e8(0x58);                                              // pop rax
+    self.cg_e8(0xE9);                                              // jmp .treffer
+    var pTreffer: int64 := self.codeLen; self.cg_e32(0);
+    // .weiter: naechster Slot
+    poke32(self.code + pW1, self.codeLen - pW1 - 4);
+    poke32(self.code + pW2, self.codeLen - pW2 - 4);
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);          // inc rax
+    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
+    self.cg_e8(0xE9); self.cg_e32(pTop - self.codeLen - 4);        // jmp .ptop
+    // .leer: freier Slot
+    poke32(self.code + pLeer, self.codeLen - pLeer - 4);
+    self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0xFB); self.cg_e8(0x00);  // cmp r11,0
+    self.cg_e8(0x0F); self.cg_e8(0x85);                            // jne .null
+    var pNull1: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x53); self.cg_e8(0x08);  // mov r10,[rbx+8]
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC2);          // inc r10
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x53); self.cg_e8(0x08);  // mov [rbx+8],r10
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x21);          // mov [rcx],r12
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x69); self.cg_e8(0x08);  // mov [rcx+8],r13
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x79); self.cg_e8(0x10);  // mov [rcx+16],r15
+    self.cg_e8(0x31); self.cg_e8(0xC0);                            // xor eax,eax
+    self.cg_e8(0xE9);                                              // jmp .ende
+    var pEnde1: int64 := self.codeLen; self.cg_e32(0);
+    // .treffer
+    poke32(self.code + pTreffer, self.codeLen - pTreffer - 4);
+    self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0xFB); self.cg_e8(0x00);  // cmp r11,0
+    self.cg_e8(0x0F); self.cg_e8(0x85);                            // jne .t_lesen
+    var pTLesen: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x69); self.cg_e8(0x08);  // mov [rcx+8],r13
+    self.cg_e8(0x31); self.cg_e8(0xC0);                            // xor eax,eax
+    self.cg_e8(0xE9);                                              // jmp .ende
+    var pEnde2: int64 := self.codeLen; self.cg_e32(0);
+    poke32(self.code + pTLesen, self.codeLen - pTLesen - 4);       // .t_lesen:
+    self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0xFB); self.cg_e8(0x01);  // cmp r11,1
+    self.cg_e8(0x0F); self.cg_e8(0x85);                            // jne .t_hat
+    var pTHat: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x41); self.cg_e8(0x08);  // mov rax,[rcx+8]
+    self.cg_e8(0xE9);                                              // jmp .ende
+    var pEnde3: int64 := self.codeLen; self.cg_e32(0);
+    poke32(self.code + pTHat, self.codeLen - pTHat - 4);           // .t_hat:
+    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,1
+    self.cg_e8(0xE9);                                              // jmp .ende
+    var pEnde4: int64 := self.codeLen; self.cg_e32(0);
+    // .null: nicht gefunden bei lesen/enthalten
+    poke32(self.code + pNull1, self.codeLen - pNull1 - 4);
+    self.cg_e8(0x31); self.cg_e8(0xC0);                            // xor eax,eax
+    // .ende
+    poke32(self.code + pEnde1, self.codeLen - pEnde1 - 4);
+    poke32(self.code + pEnde2, self.codeLen - pEnde2 - 4);
+    poke32(self.code + pEnde3, self.codeLen - pEnde3 - 4);
+    poke32(self.code + pEnde4, self.codeLen - pEnde4 - 4);
+    self.cg_e8(0x41); self.cg_e8(0x5F);                            // pop r15
+    self.cg_e8(0x41); self.cg_e8(0x5E);                            // pop r14
+    self.cg_e8(0x41); self.cg_e8(0x5D);                            // pop r13
+    self.cg_e8(0x41); self.cg_e8(0x5C);                            // pop r12
+    self.cg_e8(0x5B);                                              // pop rbx
+    self.cg_e8(0xC3);                                              // ret
+    // Auch hier gemessen statt gezaehlt (#1284): ein Versatz legte den
+    // Benutzercode an die falsche Stelle, und das traefe JEDES Programm.
+    if (self.codeLen - mapStrStart != CG_H_MAP_STR_LEN) {
+      EPrintStr("codegen error: _lyx_map_str hat "c);
+      EPrintInt(self.codeLen - mapStrStart);
+      EPrintStr(" Byte, erwartet "c);
+      EPrintInt(CG_H_MAP_STR_LEN);
+      EPrintStrLn(" — CG_H_USER anpassen (#1291)"c);
+      exit(1);
+    }
+    // Total helpers: ... + CG_H_F64STR_CHK_LEN + CG_H_MAP_STR_LEN = CG_H_USER  ✓
   }
 
   // ------------------------------------------------------------------
@@ -16119,6 +16363,7 @@ pub type Codegen = class {
     // Per-local array flag (WP-10b)
     self.localIsArray     := alloc(self.localCap);
     self.localElemFloat   := alloc(self.localCap);   // #1374
+    self.localMapStrKey   := alloc(self.localCap);   // #1291
     // WP-3.1: per-local redundant flag
     self.localIsRedundant := alloc(self.localCap);
     self.verifyTmr      := 0;

@@ -128,13 +128,24 @@ out "Map-Literal und Formatangabe im selben Programm" \
    PrintStrLn(s);' '4
 x'
 
-# --- Zeichenketten-Schluessel werden abgewiesen (#1291) ------------------
-fails "pchar-Schluessel wird gemeldet" \
-  'var m: Map<pchar, int64> := {"A": 100};
-   PrintLn(IntToStr(m["A"]));' "nur ganzzahlige Schluesseltypen"
+# --- Zeichenketten-Schluessel sind umgesetzt (#1291) ---------------------
+# Bis 1.0.17K wurden sie abgewiesen: die Laufzeit verglich den Schluessel als
+# Zahl, bei pchar also die Adresse. Seit 1.0.18A vergleicht _lyx_map_str den
+# INHALT (FNV-1a-Hash im Slot, danach Byte fuer Byte). Die beiden Faelle, die
+# hier frueher eine Meldung erwarteten, muessen jetzt tragen — die
+# ausfuehrliche Pruefung steht in tests/map_string_keys_test.sh.
+out "pchar-Schluessel im Literal" \
+  'var m: Map<pchar, int64> := {"A"c: 100};
+   PrintLn(IntToStr(m["A"c]));' '100'
 
-fails "pchar-Schluessel auch ohne Initialisierung gemeldet" \
-  'var m: Map<pchar, int64>;' "nur ganzzahlige Schluesseltypen"
+out "pchar-Schluessel ohne Initialisierung" \
+  'var m: Map<pchar, int64>;
+   m["A"c] := 5;
+   PrintLn(IntToStr(m["A"c]));' '5'
+
+# Was weiterhin nicht geht, wird weiterhin gemeldet.
+fails "Struct als Schluessel wird gemeldet" \
+  'var m: Map<Punkt, int64>;' "Ganzzahlen und pchar"
 
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
