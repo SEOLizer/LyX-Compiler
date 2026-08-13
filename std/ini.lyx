@@ -13,11 +13,19 @@ import std.string;
 // Constants
 // ============================================================================
 
-pub con MAX_SECTIONS: int64 := 64;
-pub con MAX_ENTRIES_PER_SECTION: int64 := 128;
-pub con MAX_KEY_LENGTH: int64 := 64;
-pub con MAX_VALUE_LENGTH: int64 := 256;
-pub con MAX_LINE_LENGTH: int64 := 512;
+// #1429: Hier standen fuenf Grenzwerte — MAX_SECTIONS, MAX_ENTRIES_PER_SECTION,
+// MAX_KEY_LENGTH, MAX_VALUE_LENGTH, MAX_LINE_LENGTH. Keiner wurde je geprueft,
+// und keiner BESCHRIEB etwas: seit der Umstellung auf den textbasierten Ansatz
+// gibt es weder Sektionstabelle noch Eintragstabelle noch feste Schluessel-
+// oder Wertlaenge. Ein Schluessel mit 70 Zeichen ging anstandslos durch.
+//
+// Sie sind entfernt statt durchgesetzt. Eine Grenze einzufuehren, die es nie
+// gab, haette bestehende Dokumente gebrochen; sie stehen zu lassen, haette
+// weiter etwas zugesagt, woran sich niemand haelt. Wer sie las, hat sich auf
+// eine Zusage verlassen, die der Code nicht einhielt.
+//
+// Die einzige echte Grenze ist INI_BUFFER_SIZE (siehe unten), und die wird
+// seit #1426 an jeder Stelle geprueft.
 
 // Error codes
 con ERR_INI_OK: int64 := 0;
@@ -30,10 +38,10 @@ con ERR_INI_BUFFER_TOO_SMALL: int64 := 4;
 // Internal Data Structure
 // ============================================================================
 
-// We'll use a linear buffer approach:
-// - First MAX_SECTIONS * 8 bytes: section pointers (offset in buffer)
-// - Then key-value pairs stored sequentially
-// Each entry: key\0value\0 (null-terminated strings)
+// Das Dokument ist ein einziger Textpuffer: ParseString kopiert die Eingabe,
+// und alle Funktionen suchen darin linear. Es gibt keine Sektionstabelle und
+// keine Eintragstabelle — die Beschreibung hier nannte bis #1429 beides, was
+// die entfernten MAX_*-Konstanten plausibel aussehen liess.
 
 // Total buffer size for parsed INI
 pub con INI_BUFFER_SIZE: int64 := 65536;
@@ -203,10 +211,21 @@ fn _iniFindKeyValue(content: pchar, clen: int64, pos: int64, key: pchar, klen: i
 }
 
 // Parse INI from string — copies input into a heap buffer, returned as doc handle.
+// #1426: Der Puffer war exakt so gross wie der Ausgangstext (alloc(len + 1)).
+// Jede Aenderungsfunktion baut ihr Ergebnis in einem 64-KB-Zwischenpuffer auf
+// und kopiert es danach HIERHER zurueck — wird der Text laenger, und das wird
+// er bei jedem neuen Schluessel, schrieb die Rueckkopie ueber das Pufferende
+// hinaus. In der Meldung landeten 108 Zeichen in 9 Byte.
+//
+// Der Puffer bekommt deshalb von Anfang an dieselbe Groesse, die der
+// Zwischenpuffer und der Datei-Lesepfad ohnehin schon verwenden. Damit ist
+// die Grenze eine und dieselbe an allen drei Stellen, statt dreier
+// verschiedener, von denen zwei nicht geprueft wurden.
 pub fn ParseString(input: pchar): int64 {
     if (input == 0) { return 0; }
     var len: int64 := StrLen(input);
-    var buf: pchar := alloc(len + 1);
+    if (len >= INI_BUFFER_SIZE) { return 0; }   // #1426: passt nicht, also melden
+    var buf: pchar := alloc(INI_BUFFER_SIZE);
     if (buf == 0) { return 0; }
     var i: int64 := 0;
     while (i < len) {
@@ -457,7 +476,19 @@ fn _iniSectionEnd(content: pchar, clen: int64, spos: int64): int64 {
 }
 
 // Internal: copy result from tmp back into doc buffer and free tmp.
-fn _iniCommit(doc: int64, tmp: pchar, out: int64) {
+//
+// #1426: Die Schleife lief bis `out`, ohne die Groesse des Ziels zu kennen —
+// und das Ziel war so gross wie der URSPRUNGSTEXT. Jetzt ist der Dokumentpuffer
+// INI_BUFFER_SIZE gross (siehe ParseString), und die Grenze wird geprueft:
+// passt das Ergebnis nicht, wird NICHTS geschrieben und 0 gemeldet, statt den
+// Nachbarblock zu ueberschreiben.
+//
+// Rueckgabe: 1 = uebernommen, 0 = zu lang (Dokument bleibt unveraendert).
+fn _iniCommit(doc: int64, tmp: pchar, out: int64): int64 {
+    if (out >= INI_BUFFER_SIZE) {
+        free(tmp as int64, INI_BUFFER_SIZE);
+        return 0;
+    }
     var content: pchar := doc as pchar;
     var i: int64 := 0;
     while (i <= out) {
@@ -465,6 +496,7 @@ fn _iniCommit(doc: int64, tmp: pchar, out: int64) {
         i += 1;
     }
     free(tmp as int64, INI_BUFFER_SIZE);   // #1264: free nimmt die Adresse als int64
+    return 1;
 }
 
 // ============================================================================
@@ -521,7 +553,7 @@ pub fn SetString(doc: int64, section: pchar, key: pchar, value: pchar): void {
         }
     }
     StrSetChar(tmp, out, 0);
-    _iniCommit(doc, tmp, out);
+    _iniCommit(doc, tmp, out);   // #1426: passt es nicht, bleibt das Dokument unveraendert
 }
 
 pub fn SetInt(doc: int64, section: pchar, key: pchar, value: int64): void {
@@ -580,7 +612,7 @@ pub fn DeleteKey(doc: int64, section: pchar, key: pchar): bool {
     out := _iniCopyRange(tmp, out, content, 0, lineStart);
     out := _iniCopyRange(tmp, out, content, lineAfter, clen);
     StrSetChar(tmp, out, 0);
-    _iniCommit(doc, tmp, out);
+    if (_iniCommit(doc, tmp, out) == 0) { return false; }   // #1426
     return true;
 }
 
@@ -631,7 +663,7 @@ pub fn DeleteSection(doc: int64, section: pchar): bool {
     out := _iniCopyRange(tmp, out, content, 0, sectLineStart);
     out := _iniCopyRange(tmp, out, content, sectBodyEnd, clen);
     StrSetChar(tmp, out, 0);
-    _iniCommit(doc, tmp, out);
+    if (_iniCommit(doc, tmp, out) == 0) { return false; }   // #1426
     return true;
 }
 
@@ -840,6 +872,32 @@ pub fn AddKeyComment(doc: int64, section: pchar, key: pchar, comment: pchar): vo
 // ============================================================================
 
 // Escape special characters in value
+// #1427: `;` und `#` beginnen im Wert einen Inline-Kommentar — GetString
+// schneidet dort ab. EscapeValue maskierte beide NICHT, obwohl es genau dafuer
+// da ist: ein Wert mit Semikolon ueberlebte den Weg durch die Unit nicht.
+// Jetzt werden sie wie Zeilenumbruch und Backslash behandelt, und
+// UnescapeValue nimmt die Maskierung wieder zurueck.
+// #1428: GetString legt fuer jeden Treffer einen Puffer an, und es gab keine
+// Funktion, ihn zurueckzugeben — in einer Schleife waechst der Verbrauch
+// linear. Ebenso blieb der Dokumentpuffer aus ParseString/LoadFile bis zum
+// Programmende belegt.
+//
+// FreeString rechnet die Groesse aus dem Inhalt zurueck (alloc(vlen + 1) in
+// GetString). Das gilt, solange der Aufrufer die Zeichenkette nicht kuerzt;
+// wer sie veraendert, gibt sie selbst frei.
+pub fn FreeString(value: pchar): void {
+    if (value == 0) { return; }
+    free(value as int64, StrLen(value) + 1);
+}
+
+// #1428: Gegenstueck zu ParseString und LoadFile. Der Dokumentpuffer ist seit
+// #1426 immer INI_BUFFER_SIZE gross — die Groesse steht also fest und muss
+// nicht mitgefuehrt werden.
+pub fn FreeDocument(doc: int64): void {
+    if (doc == 0) { return; }
+    free(doc, INI_BUFFER_SIZE);
+}
+
 pub fn EscapeValue(input: pchar, output: pchar): int64 {
     if (input == 0 || output == 0) { return 0; }
     
@@ -858,6 +916,12 @@ pub fn EscapeValue(input: pchar, output: pchar): int64 {
         } else if (c == 92) {  // backslash -> \\
             StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
             StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+        } else if (c == 59) {  // #1427: ';' -> \;
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            StrSetChar(output, out_pos, 59); out_pos := out_pos + 1;
+        } else if (c == 35) {  // #1427: '#' -> \#
+            StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            StrSetChar(output, out_pos, 35); out_pos := out_pos + 1;
         } else {
             StrSetChar(output, out_pos, c); out_pos := out_pos + 1;
         }
@@ -887,6 +951,12 @@ pub fn UnescapeValue(input: pchar, output: pchar): int64 {
             in_pos += 2;
         } else if (c == 92 && StrCharAt(input, in_pos + 1) == 92) {  // \\
             StrSetChar(output, out_pos, 92); out_pos := out_pos + 1;
+            in_pos += 2;
+        } else if (c == 92 && StrCharAt(input, in_pos + 1) == 59) {  // #1427: \;
+            StrSetChar(output, out_pos, 59); out_pos := out_pos + 1;
+            in_pos += 2;
+        } else if (c == 92 && StrCharAt(input, in_pos + 1) == 35) {  // #1427: \#
+            StrSetChar(output, out_pos, 35); out_pos := out_pos + 1;
             in_pos += 2;
         } else {
             StrSetChar(output, out_pos, c); out_pos := out_pos + 1;
