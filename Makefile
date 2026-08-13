@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.17K
-VERSION_DATE := 2026-08-12
+VERSION   := 1.0.18A
+VERSION_DATE := 2026-08-13
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -503,6 +503,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- StringBuilder waechst, r-Literal, Methodenrueckgabe (11 Pruefungen) ---"
 	@bash tests/stringbuilder_rawstring_test.sh
+	@echo "OK"
+	@echo "--- Map mit Zeichenketten-Schluesseln: Inhalt statt Adresse (12 Pruefungen) ---"
+	@bash tests/map_string_keys_test.sh
 	@echo "OK"
 	@echo "--- jede Unit der Standardbibliothek ist importierbar (dauert einige Minuten) ---"
 	@bash tests/std_import_test.sh
