@@ -453,6 +453,9 @@ test: lyxc
 	@echo "--- std.time: Kalenderrundlauf 1970-2050 (6 Pruefungen) ---"
 	@bash tests/time_civil_test.sh
 	@echo "OK"
+	@echo "--- std.alloc: malloc_orpanic bricht ab statt zu drehen (7 Pruefungen) ---"
+	@bash tests/alloc_orpanic_test.sh
+	@echo "OK"
 	@echo "--- Builtin-Auswahl: Cast und Argumentzahl (7 Pruefungen) ---"
 	@bash tests/builtin_dispatch_test.sh
 	@echo "OK"
