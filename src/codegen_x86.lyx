@@ -432,6 +432,17 @@ pub type Codegen = class {
   // beiden Handler, die von sich aus einen absetzen: __lyx_canary_init
   // (getrandom) und __lyx_stack_fail (write/exit).
   kernelMode:      int64;
+  // #1262: Namensraum der gerade eingelesenen Unit (`import M as m;`). Solange
+  // gesetzt, entstehen Funktionsmarken als "m_Name" — sonst traegt der
+  // Codestrom zweimal dasselbe Symbol und ein Aufruf traefe die falsche
+  // Funktion. Sema kann das nicht fuer uns erledigen: der Codegen liest die
+  // Units ein zweites Mal, unabhaengig davon.
+  cgAlias:         int64;
+  cgAliasLen:      int64;
+  // #1262: bekannte Import-Aliase (Name/Laenge paarweise), fuer die
+  // Aufrufstelle `m.Wert()`.
+  cgAliasTab:      int64;
+  cgAliasTabCount: int64;
 
   // Parser output (set by Init)
   pSrc:   pchar;
@@ -8190,10 +8201,46 @@ pub type Codegen = class {
     return pc;
   }
 
+  // #1262: Ist `name` einer der Import-Aliase?
+  fn cg_isAlias(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.cgAliasTabCount) {
+      if (peek64(self.cgAliasTab + i * 16 + 8) == nameLen) {
+        if (self.cg_seq(peek64(self.cgAliasTab + i * 16) as pchar, nameLen, name, nameLen)) { return 1; }
+      }
+      i := i + 1;
+    }
+    return 0;
+  }
+
   fn cg_genCall(ni: int64) {
     var fname: pchar := self.cg_nsval(ni);
     var fnlen: int64 := self.cg_nslen(ni);
     var isMethod: int64 := self.cg_nival(ni);
+
+    // #1262: `m.Wert()` — der Empfaenger ist ein Namensraum, kein Objekt. Das
+    // ist ein gewoehnlicher Aufruf der Marke "m_Wert"; ohne diese Umsetzung
+    // liefe er als Methodenaufruf mit einem self, das es nicht gibt.
+    //
+    // Die Argumente stehen bei einem Methodenaufruf in c1, bei einem
+    // gewoehnlichen in c0. Nach der Umdeutung auf isMethod=0 muessen sie
+    // weiterhin aus c1 kommen — dafuer dieser Merker.
+    var aliasArgs: int64 := 0 - 1;
+    if (isMethod == 1) {
+      var arecv: int64 := self.cg_nc0(ni);
+      if (arecv >= 0 && self.cg_nkind(arecv) == CGN_IDENT) {
+        var arn: pchar := self.cg_nsval(arecv);
+        var arl: int64 := self.cg_nslen(arecv);
+        if (self.cg_isAlias(arn, arl) != 0) {
+          var alc: int64 := alloc(8);
+          var amb: int64 := self.cg_mangleInto(arn, arl, fname, fnlen, alc);
+          fname     := amb as pchar;
+          fnlen     := peek64(alc);
+          isMethod  := 0;
+          aliasArgs := self.cg_nc1(ni);
+        }
+      }
+    }
     // #1091: iVal 3 markiert `super.M()`. Die Umsetzung auf 1 muss HIER
     // geschehen, vor jeder Verzweigung: die Argumentliste eines Methoden-
     // aufrufs steht in c1, die eines gewoehnlichen in c0. Wurde der Marker
@@ -8220,6 +8267,7 @@ pub type Codegen = class {
     // Count args
     var argNode: int64 := self.cg_nc0(ni);
     if (isMethod == 1) { argNode := self.cg_nc1(ni); }
+    if (aliasArgs >= 0) { argNode := aliasArgs; }   // #1262
 
     // LBF-Loader: _indirect_call_0(fnPtr) / _indirect_call_1(fnPtr, arg) — Aufruf eines
     // ROHEN Code-Pointers (kein Closure-Struct). fnPtr → rax, arg → rdi, dann `call rax`.
@@ -14195,6 +14243,17 @@ pub type Codegen = class {
     // Register label for this function
     var fname: pchar := self.cg_nsval(ni);
     var fnlen: int64 := self.cg_nslen(ni);
+    // #1262: In einem Namensraum heisst die Marke "alias_Name". Ohne das
+    // traegt der Codestrom zweimal `Wert`, und welche Fassung ein Aufruf
+    // trifft, entschiede die Reihenfolge der Marken — genau das stille
+    // Falschbinden, das der Alias verhindern soll.
+    if (self.cgAlias != 0) {
+      var mlc: int64 := alloc(8);
+      var mb:  int64 := self.cg_mangleInto(self.cgAlias as pchar, self.cgAliasLen,
+                                           fname, fnlen, mlc);
+      fname := mb as pchar;
+      fnlen := peek64(mlc);
+    }
     self.cg_addLabel(fname, fnlen, self.cg_lineOf(ni));
 
     // Save and set outer function context for nested function capture analysis
@@ -15694,8 +15753,24 @@ pub type Codegen = class {
   // Process an import: find the .lyx file, parse it, codegen it.
   // Temporarily swaps pSrc/pNodes to the imported file's data.
   fn cg_processImport(modName: pchar, nameLen: int64) {
+    self.cg_processImportAs(modName, nameLen, 0, 0);
+  }
+
+  // #1262: wie cg_processImport, aber mit Namensraum.
+  fn cg_processImportAs(modName: pchar, nameLen: int64, alias: int64, aliasLen: int64) {
     if (self.cg_hasImported(modName, nameLen) != 0) { return; }
     self.cg_markImported(modName, nameLen);
+    // Der Alias gilt nur fuer DIESE Unit. Was sie selbst importiert, wird beim
+    // rekursiven Aufruf mit dessen eigenem Alias verarbeitet.
+    var cgaSaved:    int64 := self.cgAlias;
+    var cgaSavedLen: int64 := self.cgAliasLen;
+    self.cgAlias    := alias;
+    self.cgAliasLen := aliasLen;
+    if (alias != 0 && self.cgAliasTabCount < 256) {
+      poke64(self.cgAliasTab + self.cgAliasTabCount * 16, alias);
+      poke64(self.cgAliasTab + self.cgAliasTabCount * 16 + 8, aliasLen);
+      self.cgAliasTabCount := self.cgAliasTabCount + 1;
+    }
 
     // WP-7a: ".." als Modulkomponente verbieten
     // WP-33: `wptd7 + 1 < nameLen` avoids underflow when nameLen == 0
@@ -15704,6 +15779,7 @@ pub type Codegen = class {
       if ((StrCharAt(modName, wptd7) & 255) == 46 && (StrCharAt(modName, wptd7 + 1) & 255) == 46) {
         EPrintStr("codegen error: import path traversal verboten: "c);
         EPrintStrLn(modName);
+        self.cgAlias := cgaSaved; self.cgAliasLen := cgaSavedLen;   // #1262
         return;
       }
       wptd7 += 1;
@@ -15748,6 +15824,7 @@ pub type Codegen = class {
       PrintStr(path);
       PrintStr("\n");
       free(pathBuf, nameLen + 8);
+      self.cgAlias := cgaSaved; self.cgAliasLen := cgaSavedLen;   // #1262
       return;
     }
 
@@ -15763,6 +15840,7 @@ pub type Codegen = class {
       free(pathBuf, nameLen + 8);
       free(src, srcSize);
       dispose p;
+      self.cgAlias := cgaSaved; self.cgAliasLen := cgaSavedLen;   // #1262
       return;
     }
 
@@ -15786,6 +15864,7 @@ pub type Codegen = class {
     self.pSrc   := savedSrc;
     self.pNodes := savedNodes;
 
+    self.cgAlias := cgaSaved; self.cgAliasLen := cgaSavedLen;   // #1262
     dispose p;
     // NOTE: src (imported source buffer) is intentionally NOT freed here.
     // cg_addLabel/cg_buildStructLayout etc. store raw pointers into src.
@@ -15966,7 +16045,16 @@ pub type Codegen = class {
         // Process the imported module (WP-09: import resolution)
         var modName: pchar := self.cg_nsval(cur);
         var modLen:  int64 := self.cg_nslen(cur);
-        self.cg_processImport(modName, modLen);
+        // #1262: Aliasknoten steht in c0.
+        var aliNi: int64 := self.cg_nc0(cur);
+        if (aliNi >= 0 && self.cg_nkind(aliNi) != CGN_IDENT) { aliNi := 0 - 1; }
+        if (aliNi >= 0) {
+          self.cg_processImportAs(modName, modLen,
+                                  self.cg_nsval(aliNi) as int64, self.cg_nslen(aliNi));
+        }
+        if (aliNi < 0) {
+          self.cg_processImport(modName, modLen);
+        }
       } else if (k == CGN_TYPE_DECL) {
         // B2: Typ-Alias (iv-Bit1) — kein Klassen/Struct-Layout. c0 = Alias-Target (kein Feld).
         // method-Aliase sind bereits via cg_collectMethodAliases registriert.
@@ -16552,6 +16640,10 @@ pub type Codegen = class {
     self.lcbsMissingGrants := 0;
     self.lcbsFastpathCount := 0;
     self.lcbsAuditSrcPath  := 0 as pchar;
+
+    // #1262: Aliastabelle (Platz fuer 256 Eintraege: Zeiger + Laenge).
+    self.cgAliasTab      := alloc(256 * 16);
+    self.cgAliasTabCount := 0;
 
     // #1389: kernelMode wird hier NICHT genullt. `new` liefert das Feld bereits
     // als 0, und cg_emitHelpers() laeuft am Ende dieses Init — der Aufrufer
