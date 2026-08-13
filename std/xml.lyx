@@ -373,6 +373,33 @@ fn parseTag(s: pchar, pos: int64, outTagName: pchar, outText: pchar, indent: int
 // Main Parse Function
 // ============================================================================
 
+// #1423: Die Funktion lieferte unter allen Umstaenden 1 und schrieb NICHTS in
+// den Ausgabepuffer — der Rueckgabewert war im Quelltext als "simple success
+// indicator" kommentiert. Gueltiges XML und Muell waren nicht unterscheidbar,
+// und die gelesenen Werte wurden nach dem Parsen verworfen.
+//
+// Jetzt wird die im Kommentar beschriebene Struktur wirklich befuellt:
+//   [version:32][encoding:32][rootName:256][rootText:256]  = 576 Byte
+// und der Rueckgabewert unterscheidet: 1 = gelesen, 0 = kein Wurzelelement.
+//
+// Der Aufrufer muss also 576 Byte bereitstellen. Das stand schon vorher hier,
+// nur hat es niemanden betroffen, weil nichts geschrieben wurde.
+pub con XML_PARSE_BUFFER_SIZE: int64 := 576;
+pub con XML_OFF_VERSION:  int64 := 0;
+pub con XML_OFF_ENCODING: int64 := 32;
+pub con XML_OFF_ROOTNAME: int64 := 64;
+pub con XML_OFF_ROOTTEXT: int64 := 320;
+
+// Kopiert hoechstens max-1 Zeichen und terminiert.
+fn xmlCopyField(dst: pchar, src: pchar, max: int64): void {
+    var i: int64 := 0;
+    while (i < max - 1 && StrCharAt(src, i) != 0) {
+        StrSetChar(dst, i, StrCharAt(src, i));
+        i := i + 1;
+    }
+    StrSetChar(dst, i, 0);
+}
+
 // Simple XML parser - returns document handle
 // Output buffer structure: [version:32][encoding:32][rootName:256][rootText:256]
 pub fn ParseString(input: pchar, output: pchar): int64 {
@@ -397,6 +424,10 @@ pub fn ParseString(input: pchar, output: pchar): int64 {
         var encoding: int64 := alloc(32);
         
         pos := parseXmlDecl(input, pos, version as pchar, encoding as pchar);   // #1272
+        // #1423: die gelesenen Werte gehoeren in den Ausgabepuffer, nicht in
+        // den Papierkorb.
+        xmlCopyField((output as int64 + XML_OFF_VERSION) as pchar,  version as pchar,  32);
+        xmlCopyField((output as int64 + XML_OFF_ENCODING) as pchar, encoding as pchar, 32);
         
         // Skip ?>
         while (StrCharAt(input, pos) != 63 && StrCharAt(input, pos) != 0) { pos := pos + 1; }
@@ -409,9 +440,20 @@ pub fn ParseString(input: pchar, output: pchar): int64 {
     var tagName: int64 := alloc(256);
     var textContent: int64 := alloc(256);
     
+    // #1423: Ohne Wurzelelement gibt es nichts zu melden — dann 0 statt eines
+    // Erfolgs, den es nicht gab.
+    if (StrCharAt(input, pos) != 60) {
+        StrSetChar((output as int64 + XML_OFF_ROOTNAME) as pchar, 0, 0);
+        StrSetChar((output as int64 + XML_OFF_ROOTTEXT) as pchar, 0, 0);
+        return 0;
+    }
+
     pos := parseTag(input, pos, tagName as pchar, textContent as pchar, 0, output);   // #1272
-    
-    // Return simple success indicator (1)
+
+    xmlCopyField((output as int64 + XML_OFF_ROOTNAME) as pchar, tagName as pchar,     256);
+    xmlCopyField((output as int64 + XML_OFF_ROOTTEXT) as pchar, textContent as pchar, 256);
+
+    if (StrCharAt((output as int64 + XML_OFF_ROOTNAME) as pchar, 0) == 0) { return 0; }
     return 1;
 }
 
@@ -486,6 +528,13 @@ pub fn WriteDeclaration(output: pchar, version: pchar, encoding: pchar): int64 {
     StrSetChar(output, pos, 62); pos := pos + 1;  // '>'
     StrSetChar(output, pos, 10); pos := pos + 1;  // newline
     
+    // #1425: Die Ausgabe wird terminiert. Ohne das las jeder, der den Puffer
+    // danach als Zeichenkette ausgibt, die Reste des vorherigen Inhalts mit —
+    // die Rueckgabelaenge kennt nur, wer sie auswertet. EscapeText und
+    // ArrayToXML terminieren seit jeher; hier fehlte es.
+    // Die Laenge SCHLIESST das Nullbyte NICHT ein, damit WriteDocument die
+    // Teile weiterhin aneinanderhaengen kann.
+    StrSetChar(output, pos, 0);
     return pos;
 }
 
@@ -580,6 +629,7 @@ pub fn WriteElement(output: pchar, tagName: pchar, attrs: pchar, attrCount: int6
     StrSetChar(output, pos, 62); pos := pos + 1;  // '>'
     StrSetChar(output, pos, 10); pos := pos + 1;  // newline
     
+    StrSetChar(output, pos, 0);   // #1425
     return pos;
 }
 
@@ -839,39 +889,137 @@ pub fn GetArrayEntryText(arr: pchar, output: pchar): int64 {
 // ============================================================================
 
 // Validate basic XML structure
+// #1422: Hier stand eine Pruefung, die zwei Dinge ansah — faengt der Text mit
+// '<' an, und steht nach der Deklaration nochmals ein '<'. Verschachtelung,
+// schliessende Tags und Zeichenkorrektheit blieben ungeprueft; '<a' und '</a>'
+// galten als gueltig. Wer die Funktion als Eingangspruefung fuer fremde Daten
+// benutzte, hatte keine.
+//
+// Jetzt wird wirklich auf Wohlgeformtheit geprueft: ein Stapel der offenen
+// Tagnamen, jedes schliessende Tag muss zum obersten passen, am Ende muss der
+// Stapel leer sein und genau EIN Wurzelelement dagewesen sein.
+//
+// Bewusst NICHT geprueft (und deshalb hier genannt, statt es zu verschweigen):
+// Zeichenkorrektheit der Namen, Attributsyntax, Entity-Aufloesung und
+// Zeichenkodierung. Die Funktion beantwortet "ist die Tagstruktur heil", nicht
+// "ist das gueltiges XML nach Norm".
+con XML_MAX_TIEFE: int64 := 256;
+
 pub fn IsValid(xml: pchar): bool {
     if (xml == 0) { return false; }
-    
+
     var pos: int64 := 0;
-    
-    // Skip BOM
     if (StrCharAt(xml, 0) == 239 && StrCharAt(xml, 1) == 187 && StrCharAt(xml, 2) == 191) {
         pos += 3;
     }
-    
-    pos := skipXmlSpace(xml, pos);
-    
-    // Must start with '<'
-    if (StrCharAt(xml, pos) != 60) { return false; }  // '<'
-    
-    // Check for XML declaration
-    if (StrCharAt(xml, pos + 1) == 63) {  // '?'
-        // Find closing ?>
-        pos += 2;
-        while (StrCharAt(xml, pos) != 0) {
-            if (StrCharAt(xml, pos) == 63 && StrCharAt(xml, pos + 1) == 62) {
-                pos += 2;
-                break;
+
+    // Stapel: je Ebene Anfang und Laenge des Tagnamens im Eingabetext.
+    var stapelOff: int64 := alloc(XML_MAX_TIEFE * 8);
+    var stapelLen: int64 := alloc(XML_MAX_TIEFE * 8);
+    var tiefe: int64 := 0;
+    var wurzeln: int64 := 0;    // abgeschlossene Wurzelelemente
+    var gut: int64 := 1;
+
+    while (StrCharAt(xml, pos) != 0 && gut == 1) {
+        var c: int64 := StrCharAt(xml, pos);
+
+        if (c != 60) {
+            // Text. Ausserhalb der Wurzel ist nur Leerraum zulaessig.
+            if (tiefe == 0 && c != 32 && c != 9 && c != 10 && c != 13) { gut := 0; }
+            pos := pos + 1;
+        }
+        if (c == 60 && gut == 1) {
+            var n: int64 := StrCharAt(xml, pos + 1);
+
+            if (n == 63) {
+                // <? ... ?> — Deklaration oder Verarbeitungsanweisung
+                pos := pos + 2;
+                var fertig: int64 := 0;
+                while (StrCharAt(xml, pos) != 0 && fertig == 0) {
+                    if (StrCharAt(xml, pos) == 63 && StrCharAt(xml, pos + 1) == 62) {
+                        pos := pos + 2; fertig := 1;
+                    }
+                    if (fertig == 0) { pos := pos + 1; }
+                }
+                if (fertig == 0) { gut := 0; }   // nie geschlossen
             }
-            pos += 1;
+            if (n == 33 && gut == 1) {
+                // <!-- ... --> oder <!DOCTYPE ...>
+                pos := pos + 2;
+                var fertig2: int64 := 0;
+                while (StrCharAt(xml, pos) != 0 && fertig2 == 0) {
+                    if (StrCharAt(xml, pos) == 62) { pos := pos + 1; fertig2 := 1; }
+                    if (fertig2 == 0) { pos := pos + 1; }
+                }
+                if (fertig2 == 0) { gut := 0; }
+            }
+            if (n == 47 && gut == 1) {
+                // </name>
+                if (tiefe == 0) { gut := 0; }    // schliesst, was nie geoeffnet wurde
+                if (gut == 1) {
+                    var nb: int64 := pos + 2;
+                    var ne: int64 := nb;
+                    while (StrCharAt(xml, ne) != 0 && StrCharAt(xml, ne) != 62 &&
+                           StrCharAt(xml, ne) != 32) { ne := ne + 1; }
+                    if (StrCharAt(xml, ne) == 0) { gut := 0; }   // nie geschlossen
+                    if (gut == 1) {
+                        var oOff: int64 := peek64(stapelOff + (tiefe - 1) * 8);
+                        var oLen: int64 := peek64(stapelLen + (tiefe - 1) * 8);
+                        if ((ne - nb) != oLen) { gut := 0; }
+                        var k: int64 := 0;
+                        while (gut == 1 && k < oLen) {
+                            if (StrCharAt(xml, oOff + k) != StrCharAt(xml, nb + k)) { gut := 0; }
+                            k := k + 1;
+                        }
+                        if (gut == 1) {
+                            tiefe := tiefe - 1;
+                            if (tiefe == 0) { wurzeln := wurzeln + 1; }
+                            while (StrCharAt(xml, pos) != 0 && StrCharAt(xml, pos) != 62) { pos := pos + 1; }
+                            if (StrCharAt(xml, pos) == 62) { pos := pos + 1; }
+                        }
+                    }
+                }
+            }
+            if (n != 63 && n != 33 && n != 47 && gut == 1) {
+                // <name ...> oder <name .../>
+                if (tiefe == 0 && wurzeln > 0) { gut := 0; }   // zweites Wurzelelement
+                var b: int64 := pos + 1;
+                var e: int64 := b;
+                while (StrCharAt(xml, e) != 0 && StrCharAt(xml, e) != 62 &&
+                       StrCharAt(xml, e) != 32 && StrCharAt(xml, e) != 47) { e := e + 1; }
+                if (e == b) { gut := 0; }                        // '<' ohne Namen
+                if (gut == 1 && StrCharAt(xml, e) == 0) { gut := 0; }   // '<a' ohne '>'
+                if (gut == 1) {
+                    // bis zum '>' laufen und dabei auf '/>' achten
+                    var q: int64 := e;
+                    while (StrCharAt(xml, q) != 0 && StrCharAt(xml, q) != 62) { q := q + 1; }
+                    if (StrCharAt(xml, q) == 0) { gut := 0; }
+                    if (gut == 1) {
+                        var selbst: int64 := 0;
+                        if (StrCharAt(xml, q - 1) == 47) { selbst := 1; }
+                        if (selbst == 1) {
+                            if (tiefe == 0) { wurzeln := wurzeln + 1; }
+                        }
+                        if (selbst == 0) {
+                            if (tiefe >= XML_MAX_TIEFE) { gut := 0; }
+                            if (gut == 1) {
+                                poke64(stapelOff + tiefe * 8, b);
+                                poke64(stapelLen + tiefe * 8, e - b);
+                                tiefe := tiefe + 1;
+                            }
+                        }
+                        pos := q + 1;
+                    }
+                }
+            }
         }
     }
-    
-    pos := skipXmlSpace(xml, pos);
-    
-    // Must have root element
-    if (StrCharAt(xml, pos) != 60) { return false; }
-    
+
+    free(stapelOff, XML_MAX_TIEFE * 8);
+    free(stapelLen, XML_MAX_TIEFE * 8);
+    if (gut == 0) { return false; }
+    if (tiefe != 0) { return false; }      // etwas blieb offen
+    if (wurzeln != 1) { return false; }    // kein oder mehr als ein Wurzelelement
     return true;
 }
 
@@ -889,10 +1037,16 @@ pub fn CountElements(xml: pchar): int64 {
         if (c == 60) {  // '<'
             inTag := true;
             
-            // Count opening tags (not closing, not comments, not declarations)
-            if (StrCharAt(xml, i + 1) != 47 &&  // not '</'
-                StrCharAt(xml, i + 1) != 33 &&  // not '<!--'
-                StrCharAt(xml, i + 1) != 63) {  // not '<?'
+            // #1422 (Nebenbefund): gezaehlt wurde jedes '<', dem kein '/', '!'
+            // oder '?' folgte — auch mitten im Text. `<a>3 < 5</a>` ergab 2
+            // Elemente. Ein Tag beginnt mit einem Namensanfang: Buchstabe,
+            // Unterstrich oder Doppelpunkt. Alles andere ist Text.
+            var nx: int64 := StrCharAt(xml, i + 1);
+            var istName: int64 := 0;
+            if (nx >= 65 && nx <= 90)  { istName := 1; }   // A-Z
+            if (nx >= 97 && nx <= 122) { istName := 1; }   // a-z
+            if (nx == 95 || nx == 58)  { istName := 1; }   // '_' ':'
+            if (istName == 1) {
                 count += 1;
             }
         } else if (c == 62) {  // '>'
@@ -909,60 +1063,105 @@ pub fn CountElements(xml: pchar): int64 {
 // Pretty Print
 // ============================================================================
 
-// Format XML with indentation
+// #1424: Die alte Fassung setzte Zeilenumbrueche und Einzuege AUCH INNERHALB
+// von Textinhalten — aus `<a><b>x</b><c/></a>` wurde
+//
+//   <a>
+//     <b>x
+//   </b>
+//     <c/>
+//     </a>
+//
+// Das veraendert die Daten: in XML ist Leerraum im Elementtext bedeutsam,
+// solange kein Schema etwas anderes sagt. Eine Formatierfunktion darf das
+// Dokument nicht umschreiben.
+//
+// Jetzt wird tagweise gearbeitet: ein Tag kommt auf eine eigene Zeile, ein
+// Textinhalt bleibt bei seinem Element, und ein schliessendes Tag folgt
+// unmittelbar auf den Text, zu dem es gehoert. Reiner Leerraum ZWISCHEN Tags
+// ist keine Nutzlast und faellt weg — das ist der Zweck der Funktion.
 pub fn PrettyPrint(input: pchar, output: pchar, indentSize: int64): int64 {
     if (input == 0 || output == 0) { return 0; }
-    
+
     var inPos: int64 := 0;
     var outPos: int64 := 0;
     var indent: int64 := 0;
-    var inText: bool := false;
-    
-    // Skip BOM
+    var textDavor: int64 := 0;   // zuletzt wurde Text ausgegeben (kein Umbruch)
+
     if (StrCharAt(input, 0) == 239 && StrCharAt(input, 1) == 187 && StrCharAt(input, 2) == 191) {
         inPos += 3;
     }
-    
+
     while (StrCharAt(input, inPos) != 0) {
         var c: int64 := StrCharAt(input, inPos);
-        
-        if (c == 60) {  // '<'
-            // Check for closing tag
-            if (StrCharAt(input, inPos + 1) == 47) {
-                indent -= indentSize;
+
+        if (c == 60) {
+            // ---- ein Tag ----
+            var schliessend: int64 := 0;
+            if (StrCharAt(input, inPos + 1) == 47) { schliessend := 1; }
+            var sonder: int64 := 0;
+            if (StrCharAt(input, inPos + 1) == 33 || StrCharAt(input, inPos + 1) == 63) { sonder := 1; }
+
+            if (schliessend == 1) {
+                indent := indent - indentSize;
                 if (indent < 0) { indent := 0; }
             }
-            
-            // Newline before tag
-            if (outPos > 0 && StrCharAt(output, outPos - 1) != 10) {
-                StrSetChar(output, outPos, 10); outPos := outPos + 1;
+
+            // Ein schliessendes Tag direkt hinter seinem Text bleibt in der
+            // Zeile — sonst stuende der Umbruch IM Text.
+            var eigeneZeile: int64 := 1;
+            if (schliessend == 1 && textDavor == 1) { eigeneZeile := 0; }
+
+            if (eigeneZeile == 1) {
+                if (outPos > 0 && StrCharAt(output, outPos - 1) != 10) {
+                    StrSetChar(output, outPos, 10); outPos := outPos + 1;
+                }
+                var k: int64 := 0;
+                while (k < indent) {
+                    StrSetChar(output, outPos, 32); outPos := outPos + 1;
+                    k := k + 1;
+                }
             }
-            
-            // Add indentation
-            var i: int64 := 0;
-            while (i < indent) {
-                StrSetChar(output, outPos, 32); outPos := outPos + 1;
-                i += 1;
+
+            // Tag bis einschliesslich '>' uebernehmen
+            var selbst: int64 := 0;
+            while (StrCharAt(input, inPos) != 0 && StrCharAt(input, inPos) != 62) {
+                if (StrCharAt(input, inPos) == 47) { selbst := 1; }
+                StrSetChar(output, outPos, StrCharAt(input, inPos));
+                outPos := outPos + 1;
+                inPos := inPos + 1;
             }
-            
-            inText := false;
-        } else if (c == 62) {  // '>'
-            // Check if next char starts closing tag or new tag
-            if (StrCharAt(input, inPos + 1) == 60) {
-                indent += indentSize;
+            if (StrCharAt(input, inPos) == 62) {
+                StrSetChar(output, outPos, 62); outPos := outPos + 1;
+                inPos := inPos + 1;
             }
-            inText := true;
+
+            if (schliessend == 0 && sonder == 0 && selbst == 0) {
+                indent := indent + indentSize;
+            }
+            textDavor := 0;
         }
-        
-        // Don't copy whitespace outside tags (except within text)
-        if (not inText || (c != 10 && c != 13)) {
-            StrSetChar(output, outPos, c);
-            outPos += 1;
+        if (c != 60) {
+            // ---- Textinhalt ----
+            var start: int64 := inPos;
+            var nurLeer: int64 := 1;
+            while (StrCharAt(input, inPos) != 0 && StrCharAt(input, inPos) != 60) {
+                var t: int64 := StrCharAt(input, inPos);
+                if (t != 32 && t != 9 && t != 10 && t != 13) { nurLeer := 0; }
+                inPos := inPos + 1;
+            }
+            if (nurLeer == 0) {
+                var q: int64 := start;
+                while (q < inPos) {
+                    StrSetChar(output, outPos, StrCharAt(input, q));
+                    outPos := outPos + 1;
+                    q := q + 1;
+                }
+                textDavor := 1;
+            }
         }
-        
-        inPos += 1;
     }
-    
+
     StrSetChar(output, outPos, 0);
     return outPos;
 }

@@ -69,13 +69,16 @@ pub fn Escape(input: pchar, output: pchar): int64 {
             StrSetChar(output, outPos, 51); outPos := outPos + 1; // 3
             StrSetChar(output, outPos, 57); outPos := outPos + 1; // 9
             StrSetChar(output, outPos, 59); outPos := outPos + 1;
-        } else if (c == 160) {  // NBSP -> &nbsp;
-            StrSetChar(output, outPos, 38); outPos := outPos + 1;
-            StrSetChar(output, outPos, 110); outPos := outPos + 1; // n
-            StrSetChar(output, outPos, 98); outPos := outPos + 1;  // b
-            StrSetChar(output, outPos, 115); outPos := outPos + 1; // s
-            StrSetChar(output, outPos, 112); outPos := outPos + 1; // p
-            StrSetChar(output, outPos, 59); outPos := outPos + 1;
+        // #1419: Hier wurde das BYTE 160 durch `&nbsp;` ersetzt. In Latin-1
+        // waere das richtig; in UTF-8 ist 0xA0 aber kein eigenstaendiges
+        // Zeichen, sondern ein FOLGEBYTE. Jedes Zeichen, dessen zweites Byte
+        // 0xA0 ist, wurde dadurch zerrissen — `a` (C3 A0), `S` (C5 A0),
+        // devanagari TTHA (E0 A4 A0) und viele weitere.
+        //
+        // Ein echtes geschuetztes Leerzeichen ist in UTF-8 die Folge C2 A0 und
+        // braucht keine Maskierung: es ist im HTML-Text unbedenklich. Die
+        // Ersetzung ist deshalb ersatzlos weg, statt sie auf die Folge C2 A0
+        // einzuschraenken — sie loeste kein Problem und schuf eines.
         } else {
             StrSetChar(output, outPos, c);
             outPos += 1;
@@ -92,8 +95,13 @@ pub fn Escape(input: pchar, output: pchar): int64 {
 // ============================================================================
 
 // Find entity name length
+// #1418: Die Funktion brach beim ersten Zeichen ab, das kein Buchstabe und
+// keine Ziffer ist — also sofort beim '#' einer numerischen Entity. Damit war
+// der ganze numerische Zweig in entityToChar unerreichbar: `&#39;` und
+// `&#x41;` kamen nie dort an.
 fn entityNameLen(s: pchar, pos: int64): int64 {
     var i: int64 := 0;
+    if (StrCharAt(s, pos) == 35) { i := 1; }   // '#' einer numerischen Entity
     while (true) {
         var c: int64 := StrCharAt(s, pos + i);
         if (c == 59 || c == 0) { break; }  // ';' or end
@@ -137,28 +145,30 @@ fn entityToChar(s: pchar, pos: int64, len: int64): int64 {
         return value;
     }
     
-    // Named entities
+    // #1418: Hier stimmte keine einzige Laengenklasse. Verglichen wurde
+    // "amp" unter len == 2 (mit zwei Zeichen), "lt"/"gt" unter len == 3,
+    // "apos" unter len == 5 (mit fuenf Zeichen, also "ampos"), "nbsp" unter
+    // len == 6 (mit vier Zeichen). Nur `&quot;` traf zufaellig zu — deshalb
+    // war es die einzige Entity, die je erkannt wurde.
+    //
+    // Die richtigen Laengen: lt=2, gt=2, amp=3, quot=4, apos=4, nbsp=4.
     if (len == 2) {
-        if (StrCharAt(s, pos) == 97 && StrCharAt(s, pos + 1) == 109) { return 38; }  // ampersand
-    }
-    if (len == 3) {
         if (StrCharAt(s, pos) == 108 && StrCharAt(s, pos + 1) == 116) { return 60; }  // lt
         if (StrCharAt(s, pos) == 103 && StrCharAt(s, pos + 1) == 116) { return 62; }  // gt
+    }
+    if (len == 3) {
+        if (StrCharAt(s, pos) == 97 && StrCharAt(s, pos + 1) == 109 &&
+            StrCharAt(s, pos + 2) == 112) { return 38; }  // amp
     }
     if (len == 4) {
         if (StrCharAt(s, pos) == 113 && StrCharAt(s, pos + 1) == 117 &&
             StrCharAt(s, pos + 2) == 111 && StrCharAt(s, pos + 3) == 116) { return 34; }  // quot
-    }
-    if (len == 5) {
-        if (StrCharAt(s, pos) == 97 && StrCharAt(s, pos + 1) == 109 &&
-            StrCharAt(s, pos + 2) == 112 && StrCharAt(s, pos + 3) == 111 &&
-            StrCharAt(s, pos + 4) == 115) { return 38; }  // apos
-    }
-    if (len == 6) {
+        if (StrCharAt(s, pos) == 97 && StrCharAt(s, pos + 1) == 112 &&
+            StrCharAt(s, pos + 2) == 111 && StrCharAt(s, pos + 3) == 115) { return 39; }  // apos
         if (StrCharAt(s, pos) == 110 && StrCharAt(s, pos + 1) == 98 &&
-            StrCharAt(s, pos + 2) == 115 && StrCharAt(s, pos + 3) == 112) { return 160; }  // nbsp
+            StrCharAt(s, pos + 2) == 115 && StrCharAt(s, pos + 3) == 112) { return 160; } // nbsp
     }
-    
+
     return -1;
 }
 
@@ -184,8 +194,23 @@ pub fn Unescape(input: pchar, output: pchar): int64 {
                 var charVal: int64 := entityToChar(input, inPos + 1, nameLen);
                 
                 if (charVal > 0) {
-                    StrSetChar(output, outPos, charVal);
-                    outPos += 1;
+                    // #1418/#1419: Werte ab 128 als UTF-8 ausgeben, nicht als
+                    // rohes Byte. `&nbsp;` ergab sonst das nackte 0xA0 — fuer
+                    // sich allein kein gueltiges UTF-8, also genau der Schaden,
+                    // den #1419 auf der Escape-Seite beschreibt, nur andersherum.
+                    if (charVal < 128) {
+                        StrSetChar(output, outPos, charVal);
+                        outPos += 1;
+                    }
+                    if (charVal >= 128 && charVal < 2048) {
+                        StrSetChar(output, outPos, 192 + (charVal / 64)); outPos := outPos + 1;
+                        StrSetChar(output, outPos, 128 + (charVal % 64)); outPos := outPos + 1;
+                    }
+                    if (charVal >= 2048) {
+                        StrSetChar(output, outPos, 224 + (charVal / 4096)); outPos := outPos + 1;
+                        StrSetChar(output, outPos, 128 + ((charVal / 64) % 64)); outPos := outPos + 1;
+                        StrSetChar(output, outPos, 128 + (charVal % 64)); outPos := outPos + 1;
+                    }
                     inPos := inPos + nameLen + 2;  // Skip & and ;
                     
                     // Handle trailing ;
@@ -335,32 +360,113 @@ pub fn NeedsEscape(s: pchar): bool {
 
 // Validate basic HTML structure (count opening and closing tags)
 // Returns: 0 if balanced, positive = more open, negative = more close
+// #1420: Gezaehlt wurde jedes '<' als geoeffnet und jedes '</' als
+// geschlossen. Void-Elemente (<br>, <img>, …), selbstschliessende Tags
+// (<img/>) und ein '<' im Fliesstext gingen als offen durch — gueltiges HTML
+// bekam eine Bilanz ungleich null. Das `inTag`-Flag wurde gesetzt und nie
+// gelesen.
+//
+// Jetzt: ein Tag beginnt nur, wenn nach '<' ein Namensanfang steht;
+// Void-Elemente und selbstschliessende Tags zaehlen gar nicht mit.
+fn htmlIstVoid(s: pchar, pos: int64, len: int64): int64 {
+    // br, hr, img, meta, link, input, area, base, col, embed, source, track, wbr, param
+    if (len == 2) {
+        var a: int64 := htmlToLower(StrCharAt(s, pos));
+        var b: int64 := htmlToLower(StrCharAt(s, pos + 1));
+        if (a == 98 && b == 114) { return 1; }    // br
+        if (a == 104 && b == 114) { return 1; }   // hr
+    }
+    if (len == 3) {
+        var a3: int64 := htmlToLower(StrCharAt(s, pos));
+        var b3: int64 := htmlToLower(StrCharAt(s, pos + 1));
+        var c3: int64 := htmlToLower(StrCharAt(s, pos + 2));
+        if (a3 == 105 && b3 == 109 && c3 == 103) { return 1; }   // img
+        if (a3 == 99 && b3 == 111 && c3 == 108) { return 1; }    // col
+        if (a3 == 119 && b3 == 98 && c3 == 114) { return 1; }    // wbr
+    }
+    if (len == 4) {
+        var a4: int64 := htmlToLower(StrCharAt(s, pos));
+        var b4: int64 := htmlToLower(StrCharAt(s, pos + 1));
+        var c4: int64 := htmlToLower(StrCharAt(s, pos + 2));
+        var d4: int64 := htmlToLower(StrCharAt(s, pos + 3));
+        if (a4 == 109 && b4 == 101 && c4 == 116 && d4 == 97) { return 1; }   // meta
+        if (a4 == 108 && b4 == 105 && c4 == 110 && d4 == 107) { return 1; }  // link
+        if (a4 == 97 && b4 == 114 && c4 == 101 && d4 == 97) { return 1; }    // area
+        if (a4 == 98 && b4 == 97 && c4 == 115 && d4 == 101) { return 1; }    // base
+    }
+    if (len == 5) {
+        var a5: int64 := htmlToLower(StrCharAt(s, pos));
+        if (a5 == 105) { return 1; }   // input
+        if (a5 == 116) { return 1; }   // track
+        if (a5 == 112) { return 1; }   // param
+        if (a5 == 101) { return 1; }   // embed
+    }
+    if (len == 6) {
+        if (htmlToLower(StrCharAt(s, pos)) == 115) { return 1; }   // source
+    }
+    return 0;
+}
+
+fn htmlToLower(c: int64): int64 {
+    if (c >= 65 && c <= 90) { return c + 32; }
+    return c;
+}
+
 pub fn ValidateBalance(html: pchar): int64 {
     if (html == 0) { return 0; }
-    
+
     var balance: int64 := 0;
-    var inTag: bool := false;
     var i: int64 := 0;
-    
+
     while (StrCharAt(html, i) != 0) {
-        var c: int64 := StrCharAt(html, i);
-        
-        if (c == 60) {  // '<'
-            inTag := true;
-            
-            // Check if closing tag
-            if (StrCharAt(html, i + 1) == 47) {
-                balance -= 1;
-            } else {
-                balance += 1;
-            }
-        } else if (c == 62) {  // '>'
-            inTag := false;
+        if (StrCharAt(html, i) != 60) {
+            i := i + 1;
         }
-        
-        i += 1;
+        if (StrCharAt(html, i) == 60) {
+            var n: int64 := StrCharAt(html, i + 1);
+
+            // Kommentar oder Deklaration — ueberspringen, nicht zaehlen.
+            if (n == 33) {
+                while (StrCharAt(html, i) != 0 && StrCharAt(html, i) != 62) { i := i + 1; }
+                if (StrCharAt(html, i) == 62) { i := i + 1; }
+            }
+            if (n != 33) {
+                var schliessend: int64 := 0;
+                var nb: int64 := i + 1;
+                if (n == 47) { schliessend := 1; nb := i + 2; }
+
+                // Namensanfang? Sonst ist das ein '<' im Fliesstext.
+                var k: int64 := StrCharAt(html, nb);
+                var istName: int64 := 0;
+                if (k >= 65 && k <= 90)  { istName := 1; }
+                if (k >= 97 && k <= 122) { istName := 1; }
+
+                if (istName == 0) {
+                    i := i + 1;
+                }
+                if (istName == 1) {
+                    var ne: int64 := nb;
+                    while (StrCharAt(html, ne) != 0 && StrCharAt(html, ne) != 62 &&
+                           StrCharAt(html, ne) != 32 && StrCharAt(html, ne) != 47 &&
+                           StrCharAt(html, ne) != 9 && StrCharAt(html, ne) != 10) { ne := ne + 1; }
+
+                    // bis zum '>' laufen und auf '/>' achten
+                    var q: int64 := ne;
+                    while (StrCharAt(html, q) != 0 && StrCharAt(html, q) != 62) { q := q + 1; }
+                    var selbst: int64 := 0;
+                    if (q > 0 && StrCharAt(html, q - 1) == 47) { selbst := 1; }
+
+                    if (schliessend == 1) { balance := balance - 1; }
+                    if (schliessend == 0 && selbst == 0 &&
+                        htmlIstVoid(html, nb, ne - nb) == 0) { balance := balance + 1; }
+
+                    if (StrCharAt(html, q) == 62) { i := q + 1; }
+                    if (StrCharAt(html, q) != 62) { i := q; }
+                }
+            }
+        }
     }
-    
+
     return balance;
 }
 
