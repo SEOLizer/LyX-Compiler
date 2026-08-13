@@ -15,6 +15,19 @@ import std.alloc;
 pub con ENCODE_STD: int64 := 0;
 pub con ENCODE_URL_SAFE: int64 := 1;
 
+// #1406: Rueckgabewerte von Decode/DecodeUrlSafe. Bisher gab es nur -1 fuer
+// alles; wer einen zu kleinen Puffer uebergeben hatte, konnte das nicht von
+// ungueltiger Eingabe unterscheiden. Benannt wie GZIP_OVERFLOW in std.gzip.
+pub con BASE64_INVALID:  int64 := 0 - 1;   // Eingabe ist kein gueltiges Base64
+pub con BASE64_OVERFLOW: int64 := 0 - 2;   // Ergebnis passt nicht in max_output_len
+
+// #1407: Markierung fuer "dieses Zeichen ist kein Base64-Zeichen" in der
+// Umkehrtabelle. Hier stand -1, gelesen wird die Tabelle aber mit StrCharAt,
+// und das liefert VORZEICHENLOS: aus -1 wurde 255, und die Pruefung `v < 0`
+// konnte nie zutreffen. Gueltige Werte sind 0..63, also ist alles darueber
+// ungueltig — diese Pruefung haelt auch vorzeichenlos.
+con B64_UNGUELTIG: int64 := 255;
+
 // Encode a string to Base64
 pub fn Encode(input: pchar, output: pchar): int64 {
     var input_len: int64 := 0;
@@ -138,12 +151,26 @@ pub fn EncodedLen(input_len: int64): int64 {
     return result;
 }
 
+// #1408: Die beiden Umkehrtabellen haengen nicht von der Eingabe ab. Bisher
+// legte JEDER Decode-Aufruf eine neue an (alloc(128), nie freigegeben) — in
+// einem Server, der Basic-Auth-Header dekodiert, 128 Byte je Anfrage. Jetzt
+// einmal aufgebaut und wiederverwendet; das spart nebenbei 256 StrSetChar je
+// Dekodierung.
+//
+// Die Namen tragen das Praefix _b64: Globale werden ueber Unit-Grenzen hinweg
+// ueber ihren NAMEN geteilt, ein knappes `_lookup` waere eine Kollision, die
+// erst beim Zusammenspiel zweier Units auffaellt.
+// Als int64 gefuehrt, nicht als pchar: `0 as pchar` ist kein zur
+// Uebersetzungszeit bekannter Startwert, und der Codegen weist das ab.
+var _b64LookupStd: int64 := 0;
+var _b64LookupUrl: int64 := 0;
+
 // Build standard Base64 reverse lookup (returns malloc'd 128-byte table)
 fn buildLookupStd(): pchar {
     var lookup: pchar := alloc(128) as pchar;
     var i: int64 := 0;
     while (i < 128) {
-        StrSetChar(lookup, i, -1);
+        StrSetChar(lookup, i, B64_UNGUELTIG);
         i += 1;
     }
     var c: int64 := 65;
@@ -163,7 +190,7 @@ fn buildLookupUrl(): pchar {
     var lookup: pchar := alloc(128) as pchar;
     var i: int64 := 0;
     while (i < 128) {
-        StrSetChar(lookup, i, -1);
+        StrSetChar(lookup, i, B64_UNGUELTIG);
         i += 1;
     }
     var c: int64 := 65;
@@ -178,6 +205,17 @@ fn buildLookupUrl(): pchar {
     return lookup;
 }
 
+// #1408: Zugriff auf die zwischengespeicherten Tabellen.
+fn lookupStd(): pchar {
+    if (_b64LookupStd == 0) { _b64LookupStd := buildLookupStd() as int64; }
+    return _b64LookupStd as pchar;
+}
+
+fn lookupUrl(): pchar {
+    if (_b64LookupUrl == 0) { _b64LookupUrl := buildLookupUrl() as int64; }
+    return _b64LookupUrl as pchar;
+}
+
 fn decodeWithLookup(input: pchar, output: pchar, max_output_len: int64, lookup: pchar): int64 {
     var input_len: int64 := 0;
     var i: int64 := 0;
@@ -187,6 +225,9 @@ fn decodeWithLookup(input: pchar, output: pchar, max_output_len: int64, lookup: 
     }
 
     if (input_len == 0) {
+        // #1406: auch die abschliessende Null ist ein Schreibzugriff. Bei
+        // max_output_len == 0 gibt es dafuer keinen Platz.
+        if (max_output_len < 1) { return BASE64_OVERFLOW; }
         StrSetChar(output, 0, 0);
         return 0;
     }
@@ -202,6 +243,12 @@ fn decodeWithLookup(input: pchar, output: pchar, max_output_len: int64, lookup: 
 
         if (c0 == 61) { break; }
 
+        // Die Tabelle ist 128 Byte gross. Ein Zeichen darueber (jedes Byte mit
+        // gesetztem oberstem Bit, also alles ausserhalb von ASCII) las bisher
+        // HINTER der Tabelle und entschied ueber fremden Speicher, ob die
+        // Eingabe gueltig ist. Im Issue nicht genannt, aber derselbe Weg.
+        if (c0 > 127 || c1 > 127 || c2 > 127 || c3 > 127) { return BASE64_INVALID; }
+
         var v0: int64 := StrCharAt(lookup, c0);
         var v1: int64 := 0;
         var v2: int64 := 0;
@@ -211,19 +258,31 @@ fn decodeWithLookup(input: pchar, output: pchar, max_output_len: int64, lookup: 
         if (c2 != 61) { v2 := StrCharAt(lookup, c2); }
         if (c3 != 61) { v3 := StrCharAt(lookup, c3); }
 
-        if (v0 < 0 || (c1 != 61 && v1 < 0) || (c2 != 61 && v2 < 0) || (c3 != 61 && v3 < 0)) {
-            return -1;
-        }
+        // #1407: Geprueft wird jetzt gegen die Obergrenze der gueltigen Werte
+        // (0..63) statt auf ein negatives Vorzeichen, das StrCharAt nie
+        // liefert. Vorher rechnete der Dekoder mit 255 weiter und meldete
+        // Erfolg mit Datenmuell.
+        if (v0 > 63) { return BASE64_INVALID; }
+        if (c1 != 61 && v1 > 63) { return BASE64_INVALID; }
+        if (c2 != 61 && v2 > 63) { return BASE64_INVALID; }
+        if (c3 != 61 && v3 > 63) { return BASE64_INVALID; }
 
+        // #1406: max_output_len wurde durchgereicht und nirgends ausgewertet.
+        // Jeder Block schreibt bis zu drei Bytes; geprueft wird VOR dem
+        // Schreiben, einzeln, damit auch der letzte unvollstaendige Block
+        // nicht ein Byte zu weit geht.
+        if (out_pos >= max_output_len) { return BASE64_OVERFLOW; }
         var b0: int64 := (v0 << 2) | ((v1 >> 4) & 3);
         StrSetChar(output, out_pos, b0); out_pos := out_pos + 1;
 
         if (c2 != 61) {
+            if (out_pos >= max_output_len) { return BASE64_OVERFLOW; }
             var b1: int64 := ((v1 & 15) << 4) | ((v2 >> 2) & 15);
             StrSetChar(output, out_pos, b1); out_pos := out_pos + 1;
         }
 
         if (c3 != 61) {
+            if (out_pos >= max_output_len) { return BASE64_OVERFLOW; }
             var b2: int64 := ((v2 & 3) << 6) | v3;
             StrSetChar(output, out_pos, b2); out_pos := out_pos + 1;
         }
@@ -235,15 +294,16 @@ fn decodeWithLookup(input: pchar, output: pchar, max_output_len: int64, lookup: 
 }
 
 // Decode a Base64 string
+// Rueckgabe: Zahl der geschriebenen Bytes, BASE64_INVALID (-1) bei ungueltiger
+// Eingabe, BASE64_OVERFLOW (-2) wenn das Ergebnis nicht in max_output_len
+// passt. DecodedLen(Eingabelaenge) liefert die noetige Puffergroesse.
 pub fn Decode(input: pchar, output: pchar, max_output_len: int64): int64 {
-    var lookup: pchar := buildLookupStd();
-    return decodeWithLookup(input, output, max_output_len, lookup);
+    return decodeWithLookup(input, output, max_output_len, lookupStd());
 }
 
 // Decode URL-safe Base64
 pub fn DecodeUrlSafe(input: pchar, output: pchar, max_output_len: int64): int64 {
-    var lookup: pchar := buildLookupUrl();
-    return decodeWithLookup(input, output, max_output_len, lookup);
+    return decodeWithLookup(input, output, max_output_len, lookupUrl());
 }
 
 // Get maximum decoded length for given input length
@@ -297,14 +357,37 @@ pub fn HasValidPadding(input: pchar): bool {
     if (len == 0) { return true; }
     if (len < 2) { return false; }
 
-    var last: int64 := StrCharAt(input, len - 1);
-    var second_last: int64 := StrCharAt(input, len - 2);
+    // #1409: Hier standen drei Zweige, die zusammen jeden Fall abdeckten und
+    // alle `true` lieferten — das abschliessende `return false` war
+    // unerreichbar, die Funktion also fuer jede Eingabe ab zwei Zeichen
+    // konstant wahr. `IsValid` endete mit ihr und erbte das: `a=b=` galt als
+    // gueltig.
+    //
+    // Geprueft werden jetzt die Regeln aus RFC 4648 §4: '=' steht
+    // ausschliesslich am Ende, hoechstens zweimal, und die Gesamtlaenge ist
+    // ein Vielfaches von 4.
+    if (len % 4 != 0) { return false; }
 
-    if (last != 61) { return true; }
-    if (last == 61 && second_last != 61) { return true; }
-    if (last == 61 && second_last == 61) { return true; }
+    // Erstes '=' suchen. Ab dort duerfen nur noch '=' folgen.
+    var erstes: int64 := 0 - 1;
+    i := 0;
+    while (i < len) {
+        if (StrCharAt(input, i) == 61) { erstes := i; break; }
+        i += 1;
+    }
 
-    return false;
+    if (erstes < 0) { return true; }          // gar kein Padding — zulaessig
+
+    var fuellzeichen: int64 := len - erstes;
+    if (fuellzeichen > 2) { return false; }   // hoechstens zwei
+
+    i := erstes;
+    while (i < len) {
+        if (StrCharAt(input, i) != 61) { return false; }   // '=' mitten drin
+        i += 1;
+    }
+
+    return true;
 }
 
 // Strip padding from Base64 string
@@ -372,6 +455,13 @@ pub fn EncodeBasicAuth(username: pchar, password: pchar, output: pchar): int64 {
     i := 0;
     while (StrCharAt(password, i) != 0) { pass_len := pass_len + 1; i := i + 1; }
 
+    // Dieselben zwei Fehler wie in Decode, nur nicht gemeldet: der Puffer war
+    // fest 512 Byte gross und wurde ungeprueft beschrieben, und beide
+    // Zwischenpuffer wurden nie freigegeben. Ein Passwort ueber die Grenze
+    // hinaus schrieb in fremden Speicher.
+    if (user_len + pass_len + 2 > 512) { return BASE64_OVERFLOW; }
+    if (EncodedLen(user_len + pass_len + 1) + 1 > 1024) { return BASE64_OVERFLOW; }
+
     var combined: pchar := alloc(512) as pchar;
     var pos: int64 := 0;
 
@@ -406,6 +496,8 @@ pub fn EncodeBasicAuth(username: pchar, password: pchar, output: pchar): int64 {
     }
 
     StrSetChar(output, out_pos, 0);
+    free(combined as int64, 512);
+    free(encoded as int64, 1024);
     return out_pos;
 }
 
@@ -424,7 +516,7 @@ pub fn DecodeBasicAuth(auth_header: pchar, username: pchar, password: pchar): in
     var decoded: pchar := alloc(512) as pchar;
     var decoded_len: int64 := Decode(auth_header + encoded_start, decoded, 512);
 
-    if (decoded_len <= 0) { return 0; }
+    if (decoded_len <= 0) { free(decoded as int64, 512); return 0; }
 
     var colon_pos: int64 := -1;
     var i: int64 := 0;
@@ -433,7 +525,7 @@ pub fn DecodeBasicAuth(auth_header: pchar, username: pchar, password: pchar): in
         i += 1;
     }
 
-    if (colon_pos < 0) { return 0; }
+    if (colon_pos < 0) { free(decoded as int64, 512); return 0; }
 
     var user_pos: int64 := 0;
     i := 0;
@@ -451,6 +543,7 @@ pub fn DecodeBasicAuth(auth_header: pchar, username: pchar, password: pchar): in
     }
     StrSetChar(password, pass_pos, 0);
 
+    free(decoded as int64, 512);   // war ein Leck je Anfrage
     return 1;
 }
 
@@ -484,6 +577,8 @@ pub fn EncodeDataUrl(mime_type: pchar, data: pchar, output: pchar): int64 {
     i := 0;
     while (StrCharAt(data, i) != 0) { data_len := data_len + 1; i := i + 1; }
 
+    // Auch hier: fester Puffer, ungeprueft beschrieben, nie freigegeben.
+    if (EncodedLen(data_len) + 1 > 4096) { return BASE64_OVERFLOW; }
     var encoded: pchar := alloc(4096) as pchar;
     var encoded_len: int64 := EncodeBytes(data, data_len, encoded);
 
@@ -494,5 +589,6 @@ pub fn EncodeDataUrl(mime_type: pchar, data: pchar, output: pchar): int64 {
     }
 
     StrSetChar(output, out_pos, 0);
+    free(encoded as int64, 4096);
     return out_pos;
 }

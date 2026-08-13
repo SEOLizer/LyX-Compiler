@@ -444,6 +444,9 @@ test: lyxc
 	@echo "--- stdlib: base64, regex, yaml, sha256, Socket-Select (12 Pruefungen) ---"
 	@bash tests/stdlib_bundle3_test.sh
 	@echo "OK"
+	@echo "--- std.base64 gehaertet: Puffergrenze, ungueltige Zeichen, Padding (15 Pruefungen) ---"
+	@bash tests/base64_haerte_test.sh
+	@echo "OK"
 	@echo "--- Builtin-Auswahl: Cast und Argumentzahl (7 Pruefungen) ---"
 	@bash tests/builtin_dispatch_test.sh
 	@echo "OK"
