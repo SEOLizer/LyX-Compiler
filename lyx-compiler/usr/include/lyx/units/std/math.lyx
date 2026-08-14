@@ -424,13 +424,104 @@ pub fn TruncF64(x: f64): f64 {
 
 pub fn SqrtF64(x: f64): f64 { return sqrt(x); }
 
-// -- f64-Trigonometrie via Taylor-Reihe --
-// Konstanten als f64 (über Ganzzahl-Konvertierung)
-// PI ≈ 3.14159265358979 — Darstellung via bekannte Annäherung
-// PI = 355/113 ≈ 3.14159292... (ausreichend für 5 signifikante Stellen)
+// -- f64-Trigonometrie --
+//
+// Bis 1.0.12A rechneten Sinus und Kosinus mit PI = 355/113 und einer
+// Taylor-Reihe, die nach x^9 abbrach. Beides zusammen kostete rund fuenf
+// Stellen: cos(0) kam als 1.000003 heraus, cos(PI/2) als 0.006925 statt 6e-17.
+// Fuer eine Drehmatrix ist das unbrauchbar — sie erhaelt dann keine Laengen
+// mehr, und der Fehler waechst mit jeder verketteten Drehung.
+//
+// ExpF64 und LogF64 haben ihre Argumentreduktion in #1449 bekommen, die
+// Trigonometrie blieb dabei liegen. Sie bekommt sie hier:
+//
+//   1. Reduktion auf ein Viertelintervall ueber k = round(x / (PI/2)), Rest
+//      r = x - k*(PI/2). PI/2 steht dabei in zwei Teilen (hi + lo), damit
+//      k*(PI/2) selbst kein Rundungsfehler ist — bei k=1 loescht sich in
+//      x - k*hi die fuehrende Stelle aus, und ohne lo bliebe genau dort der
+//      Fehler stehen (Cody-Waite).
+//   2. Reihe auf |r| <= PI/4, wo sie schnell konvergiert: sin bis r^17, cos
+//      bis r^16. Das naechste Glied traegt dort unter 1e-16.
+//
+// GRENZE: fuer sehr grosse |x| (jenseits von rund 1e15) ist k selbst nicht
+// mehr exakt darstellbar; die Reduktion verliert dann Stellen. Wer dort
+// rechnet, reduziert vorher selbst.
 
 fn f64_pi(): f64 {
-  return fDiv((355 as f64), (113 as f64));
+  return 3.141592653589793;
+}
+
+// PI/2, aufgeteilt in einen Teil mit abgeschnittener Mantisse (hi) und den
+// Rest (lo). hi ist exakt in f64 darstellbar, k*hi bleibt damit exakt.
+fn f64_pi2_hi(): f64 {
+  return 1.5707963267948966;
+}
+
+fn f64_pi2_lo(): f64 {
+  return 0.00000000000000006123233995736766;
+}
+
+// sin(r) fuer |r| <= PI/4, Taylor bis r^17.
+fn f64_sinCore(r: f64): f64 {
+  var r2: f64 := fMul(r, r);
+  var r3: f64 := fMul(r2, r);
+  var r5: f64 := fMul(r3, r2);
+  var r7: f64 := fMul(r5, r2);
+  var r9: f64 := fMul(r7, r2);
+  var r11: f64 := fMul(r9, r2);
+  var r13: f64 := fMul(r11, r2);
+  var r15: f64 := fMul(r13, r2);
+  var r17: f64 := fMul(r15, r2);
+  var s: f64 := r;
+  s := fSub(s, fDiv(r3,  (6 as f64)));
+  s := fAdd(s, fDiv(r5,  (120 as f64)));
+  s := fSub(s, fDiv(r7,  (5040 as f64)));
+  s := fAdd(s, fDiv(r9,  (362880 as f64)));
+  s := fSub(s, fDiv(r11, (39916800 as f64)));
+  s := fAdd(s, fDiv(r13, (6227020800 as f64)));
+  s := fSub(s, fDiv(r15, (1307674368000 as f64)));
+  s := fAdd(s, fDiv(r17, (355687428096000 as f64)));
+  return s;
+}
+
+// cos(r) fuer |r| <= PI/4, Taylor bis r^16.
+fn f64_cosCore(r: f64): f64 {
+  var r2: f64 := fMul(r, r);
+  var r4: f64 := fMul(r2, r2);
+  var r6: f64 := fMul(r4, r2);
+  var r8: f64 := fMul(r6, r2);
+  var r10: f64 := fMul(r8, r2);
+  var r12: f64 := fMul(r10, r2);
+  var r14: f64 := fMul(r12, r2);
+  var r16: f64 := fMul(r14, r2);
+  var c: f64 := (1 as f64);
+  c := fSub(c, fDiv(r2,  (2 as f64)));
+  c := fAdd(c, fDiv(r4,  (24 as f64)));
+  c := fSub(c, fDiv(r6,  (720 as f64)));
+  c := fAdd(c, fDiv(r8,  (40320 as f64)));
+  c := fSub(c, fDiv(r10, (3628800 as f64)));
+  c := fAdd(c, fDiv(r12, (479001600 as f64)));
+  c := fSub(c, fDiv(r14, (87178291200 as f64)));
+  c := fAdd(c, fDiv(r16, (20922789888000 as f64)));
+  return c;
+}
+
+// Anzahl der Viertelkreise in x, kaufmaennisch gerundet.
+fn f64_quadrant(ax: f64): int64 {
+  var hi: f64 := f64_pi2_hi();
+  var kf: f64 := fDiv(ax, hi);
+  var k: int64 := kf as int64;
+  var kfi: f64 := k as f64;
+  var frac: f64 := fSub(kf, kfi);
+  if (fGe(frac, fDiv((1 as f64), (2 as f64))) != 0) { k := k + 1; }
+  return k;
+}
+
+// Rest nach Abzug von k Viertelkreisen, zweistufig (Cody-Waite).
+fn f64_reduce(ax: f64, k: int64): f64 {
+  var kf: f64 := k as f64;
+  var r: f64 := fSub(ax, fMul(kf, f64_pi2_hi()));
+  return fSub(r, fMul(kf, f64_pi2_lo()));
 }
 
 fn f64_e(): f64 {
@@ -439,42 +530,57 @@ fn f64_e(): f64 {
   return fDiv((2718281828 as f64), (1000000000 as f64));
 }
 
-// Argument-Reduktion auf [-PI, PI]
-fn f64_fmod(x: f64, m: f64): f64 {
-  var n: int64 := fToInt(fDiv(x, m));
-  return fSub(x, fMul((n as f64), m));
-}
-
-// SinF64 via Taylor-Reihe: sin(x) = x - x³/6 + x⁵/120 - x⁷/5040 + x⁹/362880
+// sin(x). Reduktion auf den Viertelkreis, dann je nach Quadrant sin oder cos
+// der Restgroesse. Ungerade Symmetrie: sin(-x) = -sin(x).
 pub fn SinF64(x: f64): f64 {
-  var pi: f64 := f64_pi();
-  var twopi: f64 := fMul((2 as f64), pi);
-  var xr: f64 := f64_fmod(x, twopi);  // reduce to [0, 2π]
-  // Shift to [-π, π]
-  if (fGt(xr, pi) != 0) { xr := fSub(xr, twopi); }
-  var x2: f64 := fMul(xr, xr);
-  var x3: f64 := fMul(x2, xr);
-  var x5: f64 := fMul(x3, x2);
-  var x7: f64 := fMul(x5, x2);
-  var x9: f64 := fMul(x7, x2);
-  var term1: f64 := fDiv(x3, (6 as f64));
-  var term2: f64 := fDiv(x5, (120 as f64));
-  var term3: f64 := fDiv(x7, (5040 as f64));
-  var term4: f64 := fDiv(x9, (362880 as f64));
-  return fAdd(fSub(fAdd(fSub(xr, term1), term2), term3), term4);
+  var ax: f64 := x;
+  var flip: bool := false;
+  if (fLt(x, (0 as f64)) != 0) {
+    ax := fNeg(x);
+    flip := true;
+  }
+  var k: int64 := f64_quadrant(ax);
+  var r: f64 := f64_reduce(ax, k);
+  var q: int64 := k % 4;
+
+  var res: f64 := (0 as f64);
+  if (q == 0) { res := f64_sinCore(r); }
+  if (q == 1) { res := f64_cosCore(r); }
+  if (q == 2) { res := fNeg(f64_sinCore(r)); }
+  if (q == 3) { res := fNeg(f64_cosCore(r)); }
+
+  if (flip) { return fNeg(res); }
+  return res;
 }
 
-// CosF64 via cos(x) = sin(x + π/2)
+// cos(x). Gerade Symmetrie: cos(-x) = cos(x), deshalb kein Vorzeichen am Ende.
+// Nicht ueber sin(x + PI/2) — das haette den Reduktionsfehler von PI/2
+// zusaetzlich eingeschleppt.
 pub fn CosF64(x: f64): f64 {
-  var pi: f64 := f64_pi();
-  return SinF64(fAdd(x, fDiv(pi, (2 as f64))));
+  var ax: f64 := x;
+  if (fLt(x, (0 as f64)) != 0) { ax := fNeg(x); }
+  var k: int64 := f64_quadrant(ax);
+  var r: f64 := f64_reduce(ax, k);
+  var q: int64 := k % 4;
+
+  if (q == 0) { return f64_cosCore(r); }
+  if (q == 1) { return fNeg(f64_sinCore(r)); }
+  if (q == 2) { return fNeg(f64_cosCore(r)); }
+  return f64_sinCore(r);
 }
 
-// TanF64 via tan(x) = sin(x) / cos(x)
+// tan(x) = sin(x)/cos(x).
+//
+// An den Polen (PI/2 + n*PI) ist der Tangens unendlich. Bis 1.0.12A gab die
+// Funktion dort 0 zurueck — den Wert, der dem richtigen am weitesten
+// entgegensteht, und ohne jeden Hinweis. Die Sonderbehandlung ist deshalb
+// weg: die Division liefert an einem exakten Pol das IEEE-Unendlich, und in
+// jedem anderen Fall den richtigen Wert. Wer den Pol abfangen will, prueft
+// CosF64 vorher selbst.
 pub fn TanF64(x: f64): f64 {
+  var s: f64 := SinF64(x);
   var c: f64 := CosF64(x);
-  if (fEq(c, (0 as f64)) != 0) { return (0 as f64); }
-  return fDiv(SinF64(x), c);
+  return fDiv(s, c);
 }
 
 // ExpF64 via Taylor: e^x = 1 + x + x²/2 + x³/6 + x⁴/24 + x⁵/120 + x⁶/720 + x⁷/5040

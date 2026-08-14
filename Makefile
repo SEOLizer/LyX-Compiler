@@ -474,6 +474,12 @@ test: lyxc
 	@echo "--- Vorgabewerte importierter Funktionen (7 Pruefungen) ---"
 	@bash tests/import_defaults_test.sh
 	@echo "OK"
+	@echo "--- std.matrix: Mat3/Mat4/Vec3/Vec4 und ihre Fehlerfaelle (9 Gruppen) ---"
+	@bash tests/matrix_test.sh
+	@echo "OK"
+	@echo "--- std.math: Sinus/Kosinus/Tangens gegen python (4 Pruefungen) ---"
+	@bash tests/trig_accuracy_test.sh
+	@echo "OK"
 	@echo "--- std.io: Printf schreibt nicht mehr in ein String-Literal (5 Pruefungen) ---"
 	@bash tests/printf_literal_test.sh
 	@echo "OK"
