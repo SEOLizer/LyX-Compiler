@@ -264,7 +264,13 @@ con CG_VMT_METH_OFF_CODESTART:  int64 := 8;
 con CG_VMTMETH_SZ:        int64 := 16;
 con CG_VMTMETH_OFF_NAMELEN: int64 := 8;
 
-con CG_CFIELD_SZ:               int64 := 64;
+// #1513: Ein Feld, das selbst ein Struct ist, liegt INLINE — es belegt die
+// Groesse dieses Structs, nicht acht Byte. Bis hierher rechnete das Layout mit
+// pauschalen acht Byte und der Zugriff LAS die Stelle als Zeiger: `a.innen.wert`
+// dereferenzierte den Wert 5 als Adresse. Deshalb traegt jeder Feldeintrag jetzt
+// seine tatsaechliche Breite mit.
+con CG_CFIELD_SZ:               int64 := 72;
+con CG_CFIELD_OFF_BYTES:        int64 := 64;
 con CG_CFIELD_OFF_FIELDLEN:     int64 := 8;
 con CG_CFIELD_OFF_OFFSET:       int64 := 16;
 con CG_CFIELD_OFF_TYPENAMEPTR:  int64 := 24;
@@ -1897,12 +1903,39 @@ pub type Codegen = class {
       if (self.cg_isConstExpr(self.cg_nc0(node)) == 0) { return 0; }
       return self.cg_isConstExpr(self.cg_nc1(node));
     }
+    // #1507: `P.Read as int64` ist zur Uebersetzungszeit bekannt. Der Cast
+    // aendert am WERT nichts, der Enum-Wert steht in der Variantentabelle.
+    // Bis hierher fiel beides durch: `con MASK := P.Read as int64 | P.Write as
+    // int64` wurde still 0, und jede Pruefung `(w & MASK) != 0` damit immer
+    // falsch — genau die Schreibweise, die man fuer Flagmasken erwartet.
+    if (k == CGN_CAST) {
+      return self.cg_isConstExpr(self.cg_nc0(node));
+    }
+    if (k == CGN_FIELD) {
+      if (self.cg_enumFeldWert(node, 0) != 0) { return 1; }
+      return 0;
+    }
     if (k == CGN_CALL) {
       // sizeof(Type) ist zur Uebersetzungszeit bekannt (BUG-5).
       if (self.cg_seq(self.cg_nsval(node), self.cg_nslen(node), "sizeof", 6)) { return 1; }
       return 0;
     }
     return 0;
+  }
+
+  // #1507: Ist `node` ein Enum-Mitglied (Typname.Variante)? Dann 1, und der
+  // Wert landet in wertZelle, falls diese nicht 0 ist.
+  fn cg_enumFeldWert(node: int64, wertZelle: int64): int64 {
+    if (node < 0) { return 0; }
+    if (self.cg_nkind(node) != CGN_FIELD) { return 0; }
+    var obj: int64 := self.cg_nc0(node);
+    if (obj < 0 || self.cg_nkind(obj) != CGN_IDENT) { return 0; }
+    var ei: int64 := self.cg_findEnum(self.cg_nsval(obj), self.cg_nslen(obj));
+    if (ei < 0) { return 0; }
+    var tag: int64 := self.cg_findEnumVariant(ei, self.cg_nsval(node), self.cg_nslen(node));
+    if (tag < 0) { return 0; }
+    if (wertZelle != 0) { poke64(wertZelle, tag); }
+    return 1;
   }
 
   fn cg_evalConExpr(node: int64): int64 {
@@ -1946,6 +1979,16 @@ pub type Codegen = class {
       if (bop == 84) { if (lv >= rv) { return 1; } else { return 0; } }  // TK_GE  >=
       return 0;
     }
+    if (k == CGN_CAST) { return self.cg_evalConExpr(self.cg_nc0(node)); }   // #1507
+    if (k == CGN_FIELD) {
+      var ez: int64 := alloc(8);
+      poke64(ez, 0);
+      var okE: int64 := self.cg_enumFeldWert(node, ez);
+      var evWert: int64 := peek64(ez);
+      free(ez, 8);
+      if (okE != 0) { return evWert; }
+      return 0;
+    }
     if (k == CGN_CALL) {
       // sizeof(Type) in const expression context (BUG-5)
       var cfname: pchar := self.cg_nsval(node);
@@ -1961,11 +2004,14 @@ pub type Codegen = class {
             var soCb: int64 := self.classLayouts + soClassIdx * CG_CLASS_SZ;
             var soFldCnt:   int64 := peek64(soCb + CG_CLASS_OFF_FIELDCNT);
             var soVmtSlots: int64 := peek64(soCb + CG_CLASS_OFF_VMTSLOTS);
+            // #1513: die Feldzahl mal acht stimmt nicht mehr, sobald ein Feld
+            // inline liegt (Struct als Feld, `[N]T`) oder @packed schmaler ist.
             if (soVmtSlots > 0) {
-              soSize := (soFldCnt + 1) * 8;
+              soSize := self.cg_classStructSize(soClassIdx) + 8;
             } else {
-              soSize := soFldCnt * 8;
+              soSize := self.cg_classStructSize(soClassIdx);
             }
+            if (soFldCnt <= 0) { soSize := 0; }
           }
         }
         return soSize;
@@ -4748,17 +4794,164 @@ pub type Codegen = class {
     return 0;
   }
 
-  // Returns the byte size of a struct given its class index (fieldCnt * 8 for non-packed)
+  // Groesse eines Structs in Byte.
+  //
+  // #1513: gerechnet wurde `fieldCnt * 8`. Das stimmt nur, solange jedes Feld
+  // acht Byte belegt — ein inline `[N]T` (#1052) oder ein Struct als Feld
+  // belegt mehr, ein @packed-Feld weniger. Jetzt wird das Ende des letzten
+  // Feldes genommen: Offset plus die im Eintrag vermerkte Breite.
   fn cg_classStructSize(classIdx: int64): int64 {
     if (classIdx < 0) { return 8; }
     var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
     var cnt: int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
     if (cnt <= 0) { return 8; }
-    // WP-10.2: cnt*8 must not overflow int64
     if (cnt > 0x1FFFFFFFFFFFFFFF) { return 8; }
-    // For struct fields the last field's offset + 8 = total size
-    // Simpler: fieldCnt * 8 (all fields are 8 bytes in non-packed structs)
-    return cnt * 8;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    if (flds == 0) { return cnt * 8; }
+    var ende: int64 := 0;
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var b: int64 := peek64(fb + CG_CFIELD_OFF_BYTES);
+      if (b <= 0) { b := 8; }
+      var e: int64 := peek64(fb + CG_CFIELD_OFF_OFFSET) + b;
+      if (e > ende) { ende := e; }
+      i += 1;
+    }
+    if (ende <= 0) { return cnt * 8; }
+    return ende;
+  }
+
+  // #1513: Benennt der Typknoten ein STRUCT (kein Klassentyp, keine
+  // eingebaute Breite)? Nur dann liegt das Feld inline im Objekt.
+  // Klassen bleiben Referenzen und belegen weiterhin acht Byte.
+  fn cg_typeIstInlineStruct(typeNode: int64): int64 {
+    if (typeNode < 0) { return 0; }
+    if (self.cg_nkind(typeNode) != 60) { return 0; }
+    var tn: pchar := self.cg_nsval(typeNode);
+    var tl: int64 := self.cg_nslen(typeNode);
+    if (tl <= 0) { return 0; }
+    var ci: int64 := self.cg_findClass(tn, tl);
+    if (ci < 0) { return 0; }
+    var base: int64 := self.classLayouts + ci * CG_CLASS_SZ;
+    // Entscheidend ist die Merkung des PARSERS (STRUCT_FLAG_ISSTRUCT), nicht
+    // "hat keine VMT": eine methodenlose KLASSE bekommt ebenfalls
+    // Struct-Layout, bleibt aber ein Referenztyp — `var a: A := null` ist dort
+    // gueltig und darf nicht kopiert werden.
+    if (peek64(base + CG_CLASS_OFF_ISSTRUCT) == 0) { return 0; }
+    if (peek64(base + CG_CLASS_OFF_VMTOFF) != -1) { return 0; }
+    if (peek64(base + CG_CLASS_OFF_VMTSLOTS) > 0) { return 0; }
+    return 1;
+  }
+
+  // #1351: Structs hatten keine Wertsemantik — `var b: T := a` und die
+  // Parameteruebergabe reichten denselben Zeiger weiter, ein Schreiben auf die
+  // "Kopie" traf das Original. Still, ohne Warnung.
+  //
+  // Kopiert `bytes` Byte von der Adresse in rax in frischen Speicher und
+  // laesst dessen Adresse in rax zurueck. Alles, was hier benutzt wird, wird
+  // vorher gesichert: der Aufrufer sieht nur rax veraendert.
+  fn cg_emitStructKopie(bytes: int64) {
+    if (bytes <= 0) { return; }
+    var worte: int64 := (bytes + 7) / 8;
+    self.cg_e8(0x50);                                        // push rax (Quelle)
+    // mmap(0, groesse, PROT_RW, MAP_ANON, -1, 0)
+    self.cg_movRaxImm(0);            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);
+    self.cg_movRaxImm(worte * 8);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);
+    self.cg_movRaxImm(3);            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);
+    self.cg_movRaxImm(34);
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);    // mov r10, rax
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);    // xor r8, r8
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);    // dec r8 -> -1
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);    // xor r9, r9
+    self.cg_movRaxImm(9);
+    self.cg_e8(0x0F); self.cg_e8(0x05);                      // syscall
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);    // mov rdi, rax (Ziel)
+    self.cg_e8(0x5E);                                        // pop rsi (Quelle)
+    self.cg_e8(0x57);                                        // push rdi
+    self.cg_movRaxImm(worte);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);    // mov rcx, rax
+    self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0xA5);    // rep movsq
+    self.cg_e8(0x58);                                        // pop rax (Ziel)
+  }
+
+  // #1351: Inhalt kopieren, statt den Zeiger zu tauschen. `b := a` schreibt in
+  // den Speicher, den b schon hat — eine Neubindung waere bei einem Wertetyp
+  // von aussen nicht zu unterscheiden, wuerde aber jedes `var`-Ziel neu
+  // allokieren und den alten Inhalt verlieren, auf den ein Feldzugriff
+  // vielleicht schon zeigt.
+  // rax = Quelle, [rbp+dstOff] = Ziel.
+  fn cg_emitStructKopieNach(dstOff: int64, bytes: int64) {
+    if (bytes <= 0) { return; }
+    var worte: int64 := (bytes + 7) / 8;
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);   // mov rsi, rax
+    self.cg_loadRax(dstOff);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+    self.cg_movRaxImm(worte);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);   // mov rcx, rax
+    self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0xA5);   // rep movsq
+  }
+
+  // Traegt das Local einen Struct-Typ? Liefert die Groesse in Byte, sonst 0.
+  fn cg_localWertStructBytes(name: pchar, nlen: int64): int64 {
+    var li: int64 := self.cg_findLocalIdx(name, nlen);
+    if (li < 0) { return 0; }
+    var tb: int64 := self.localTypes + li * CG_LOCTYPE_SZ;
+    var tp: pchar := peek64(tb) as pchar;
+    var tl: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+    if (tp == 0 as pchar || tl <= 0) { return 0; }
+    if (peek8(self.localIsArray + li) != 0) { return 0; }
+    var ci: int64 := self.cg_findClass(tp, tl);
+    if (ci < 0) { return 0; }
+    var base: int64 := self.classLayouts + ci * CG_CLASS_SZ;
+    if (peek64(base + CG_CLASS_OFF_ISSTRUCT) == 0) { return 0; }
+    if (peek64(base + CG_CLASS_OFF_VMTOFF) != -1) { return 0; }
+    if (peek64(base + CG_CLASS_OFF_VMTSLOTS) > 0) { return 0; }
+    if (peek64(base + CG_CLASS_OFF_PARENTIDX) >= 0) { return 0; }
+    return self.cg_classStructSize(ci);
+  }
+
+  // Ist der Typknoten ein Struct — also etwas, das nach Wert kopiert gehoert?
+  // Klassen bleiben Referenzen; `new` gibt sie aus, geteilt wird mit Absicht.
+  fn cg_typeIstWertStruct(typeNode: int64): int64 {
+    if (typeNode < 0) { return 0; }
+    if (self.cg_nkind(typeNode) != 60) { return 0; }
+    var ci: int64 := self.cg_findClass(self.cg_nsval(typeNode), self.cg_nslen(typeNode));
+    if (ci < 0) { return 0; }
+    var base: int64 := self.classLayouts + ci * CG_CLASS_SZ;
+    if (peek64(base + CG_CLASS_OFF_ISSTRUCT) == 0) { return 0; }
+    if (peek64(base + CG_CLASS_OFF_VMTOFF) != -1) { return 0; }
+    if (peek64(base + CG_CLASS_OFF_VMTSLOTS) > 0) { return 0; }
+    if (peek64(base + CG_CLASS_OFF_PARENTIDX) >= 0) { return 0; }
+    return 1;
+  }
+
+  fn cg_inlineStructBytes(typeNode: int64): int64 {
+    var ci: int64 := self.cg_findClass(self.cg_nsval(typeNode), self.cg_nslen(typeNode));
+    if (ci < 0) { return 8; }
+    return self.cg_classStructSize(ci);
+  }
+
+  // #1513: Wieviele Byte belegt dieses Feld? Fuer inline liegende Structs die
+  // Groesse des Structs, sonst acht.
+  fn cg_fieldBytes(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
+    if (classIdx < 0) { return 8; }
+    var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var p: pchar := peek64(fb) as pchar;
+      var n: int64 := peek64(fb + CG_CFIELD_OFF_FIELDLEN);
+      if (n == fieldLen && self.cg_seq(p, n, fieldName, fieldLen)) {
+        var b: int64 := peek64(fb + CG_CFIELD_OFF_BYTES);
+        if (b <= 0) { return 8; }
+        return b;
+      }
+      i += 1;
+    }
+    return 8;
   }
 
   // Returns class index of the element type of an Array<T> field, or -1
@@ -5085,13 +5278,32 @@ pub type Codegen = class {
       // #1052: `feld: [N]T` liegt INLINE im Objekt. Bit3 kennzeichnet das, die
       // Breite in Bits 8..15 ist dann die ELEMENTbreite.
       var inlN: int64 := self.cg_arrayFixedCount(ftypeNode);
-      if (inlN > 0) { tWidth := self.cg_typeSize(self.cg_nc0(ftypeNode)); }
+      if (inlN > 0) {
+        tWidth := self.cg_typeSize(self.cg_nc0(ftypeNode));
+        // #1493: Auch bei einem inline `[N]T`-Feld den ELEMENTTYP vermerken.
+        // Bis hierher stand er nur bei `Array<T>` — deshalb wusste
+        // `b.kids[0].x` nicht, WELCHE Klasse dort liegt, fand kein Feld `x`
+        // und lieferte still 0. Mit skalaren Elementen fiel es nicht auf: die
+        // brauchen keinen Klassenbezug.
+        var inlElem: int64 := self.cg_nc0(ftypeNode);
+        if (inlElem >= 0 && self.cg_nkind(inlElem) == 60) {
+          poke64(fb + CG_CFIELD_OFF_ELEMTYPEPTR, self.cg_nsval(inlElem) as int64);
+          poke64(fb + CG_CFIELD_OFF_ELEMTYPELEN, self.cg_nslen(inlElem));
+        }
+      }
       var inlBit: int64 := 0;
       if (inlN > 0) { inlBit := 1; }
-      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag | (tWidth << 8) | (isMth << 1) | (self.cg_typeIsSignedNarrow(ftypeNode) << 2) | (inlBit << 3));
+      // #1513: Bit4 = Struct als Feld, liegt inline (gilt auch in Klassen).
+      var inlStr: int64 := 0;
+      if (inlN == 0 && self.cg_typeIstInlineStruct(ftypeNode) != 0) { inlStr := 1; }
+      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag | (tWidth << 8) | (isMth << 1) | (self.cg_typeIsSignedNarrow(ftypeNode) << 2) | (inlBit << 3) | (inlStr << 4));
       // #1052: ein inline `[N]T`-Feld belegt N * Elementbreite, nicht 8 Byte.
       // Ohne das ueberlappte das Folgefeld die Arraydaten.
-      if (inlN > 0) { offset := offset + inlN * tWidth; } else { offset += 8; }
+      var breite: int64 := 8;
+      if (inlN > 0) { breite := inlN * tWidth; }
+      else if (inlStr != 0) { breite := self.cg_inlineStructBytes(ftypeNode); }
+      poke64(fb + CG_CFIELD_OFF_BYTES, breite);
+      offset := offset + breite;
       i += 1;
       tmp := self.cg_nnext(tmp);
     }
@@ -5359,19 +5571,32 @@ pub type Codegen = class {
       // #1038: Bit2 = vorzeichenbehafteter Schmaltyp, siehe cg_buildClassLayout.
       // #1052: siehe cg_buildClassLayout — inline `[N]T`-Feld.
       var inlN2: int64 := self.cg_arrayFixedCount(ftypeNode);
-      if (inlN2 > 0) { tWidth2 := self.cg_typeSize(self.cg_nc0(ftypeNode)); }
+      if (inlN2 > 0) {
+        tWidth2 := self.cg_typeSize(self.cg_nc0(ftypeNode));
+        var inlElem2: int64 := self.cg_nc0(ftypeNode);   // #1493
+        if (inlElem2 >= 0 && self.cg_nkind(inlElem2) == 60) {
+          poke64(fb + CG_CFIELD_OFF_ELEMTYPEPTR, self.cg_nsval(inlElem2) as int64);
+          poke64(fb + CG_CFIELD_OFF_ELEMTYPELEN, self.cg_nslen(inlElem2));
+        }
+      }
       var inlBit2: int64 := 0;
       if (inlN2 > 0) { inlBit2 := 1; }
-      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag2 | (tWidth2 << 8) | (isMth2 << 1) | (self.cg_typeIsSignedNarrow(ftypeNode) << 2) | (inlBit2 << 3));
+      // #1513: Bit4 = das Feld ist selbst ein Struct und liegt inline.
+      var inlStr2: int64 := 0;
+      if (inlN2 == 0 && self.cg_typeIstInlineStruct(ftypeNode) != 0) { inlStr2 := 1; }
+      poke64(fb + CG_CFIELD_OFF_FLAGS, beFlag2 | (tWidth2 << 8) | (isMth2 << 1) | (self.cg_typeIsSignedNarrow(ftypeNode) << 2) | (inlBit2 << 3) | (inlStr2 << 4));
       // WP-4.1-A: field stride
       // #1052: inline `[N]T` belegt N * Elementbreite — auch ungepackt.
+      var breite2: int64 := 8;
       if (inlN2 > 0) {
-        offset := offset + inlN2 * tWidth2;
+        breite2 := inlN2 * tWidth2;
+      } else if (inlStr2 != 0) {
+        breite2 := self.cg_inlineStructBytes(ftypeNode);
       } else if (isPacked != 0) {
-        offset := offset + self.cg_typeSize(ftypeNode);
-      } else {
-        offset += 8;  // default: 8-byte aligned
+        breite2 := self.cg_typeSize(ftypeNode);
       }
+      poke64(fb + CG_CFIELD_OFF_BYTES, breite2);
+      offset := offset + breite2;
       i += 1;
       tmp := self.cg_nnext(tmp);
     }
@@ -6646,6 +6871,23 @@ pub type Codegen = class {
     }
     var ldW: int64 := (fFlags >> 8) & 0xFF;
     var ldSigned: int64 := (fFlags >> 2) & 1;
+    // #1513: Ein Feld, das selbst ein Struct ist, liegt INLINE. Sein "Wert" ist
+    // die Adresse seiner Felder, nicht der Inhalt der ersten acht Byte —
+    // `a.innen.wert` las bis hierher den Wert von `wert` und benutzte ihn als
+    // Adresse. Deshalb `lea` statt `mov`; der Zugriff dahinter rechnet den
+    // inneren Offset einfach darauf.
+    var istInline: int64 := (fFlags >> 4) & 1;
+    if (foff >= 0 && istInline != 0) {
+      if (foff == 0) {
+        // Adresse unveraendert — rax zeigt schon auf das Feld.
+      } else if (foff <= 127) {
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x40); self.cg_e8(foff);   // lea rax,[rax+off]
+      } else {
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x80); self.cg_e32(foff);
+      }
+      if (safeJz >= 0) { poke32(self.code + safeJz, self.codeLen - safeJz - 4); }
+      return;
+    }
     if (foff < 0) {
       self.cg_zeroRax();
     } else if (ldW == 1 || ldW == 2 || ldW == 4) {
@@ -11736,11 +11978,14 @@ pub type Codegen = class {
             }
             soSize := soMax;
           } else {
+            // #1513: die Feldzahl mal acht stimmt nicht mehr, sobald ein Feld
+            // inline liegt (Struct als Feld, `[N]T`) oder @packed schmaler ist.
             if (soVmtSlots > 0) {
-              soSize := (soFldCnt + 1) * 8;
+              soSize := self.cg_classStructSize(soClassIdx) + 8;
             } else {
-              soSize := soFldCnt * 8;
+              soSize := self.cg_classStructSize(soClassIdx);
             }
+            if (soFldCnt <= 0) { soSize := 0; }
           }
         }
       }
@@ -12129,6 +12374,28 @@ pub type Codegen = class {
           self.cg_genMethodTypedValue(init);
         } else {
           self.cg_genExpr(init);
+          // #1351: `var b: T := a` bei einem Struct legt eine KOPIE an. Bis
+          // hierher trug b denselben Zeiger wie a, und `b.x := 5` schrieb in a.
+          // Steht rechts ein frisch gebautes Struct, kostet die Kopie nur Zeit;
+          // sie wegzulassen hiesse, an jeder Stelle entscheiden zu muessen, ob
+          // der Wert schon jemandem gehoert — und genau das ist die Frage, an
+          // der die Wertsemantik bisher gescheitert ist.
+          //
+          // NICHT kopiert wird bei `var s: S := puffer as S` und bei `new`:
+          //
+          //   * Ein CAST sagt "lies diesen Speicher als S". Genau so legt die
+          //     stdlib Binaerformate ueber einen Puffer (tests/struct_layout_
+          //     test.sh prueft es); eine Kopie schnitte die Sicht ab und jedes
+          //     Schreiben ginge ins Leere — still.
+          //   * `new` liefert frischen Speicher, den noch niemand haelt.
+          //
+          // Beides ist keine Ausnahme von der Wertsemantik, sondern die Frage,
+          // ob ueberhaupt jemand anders den Speicher besitzt.
+          var initKind: int64 := self.cg_nkind(init);
+          if (self.cg_typeIstWertStruct(typeNode) != 0
+              && initKind != CGN_CAST && initKind != CGN_NEW) {
+            self.cg_emitStructKopie(self.cg_inlineStructBytes(typeNode));
+          }
         }
       } else if (mapNoInit != 0) {
         // #1152: leere Map mit derselben Anfangskapazitaet wie das Literal.
@@ -12314,6 +12581,19 @@ pub type Codegen = class {
         self.cg_emitUtypeConv(utDst2, self.cg_utypeOfExpr(rhs));
         self.cg_emitUtypeRange(utDst2);
         var off: int64 := self.cg_findLocal(name, nlen);
+        // #1351: `b := a` bei einem Struct kopiert den INHALT. Bis hierher
+        // wurde der Zeiger uebernommen, und jedes spaetere `b.x := …` schrieb
+        // in a — still, ohne Warnung.
+        var asgStructBytes: int64 := 0;
+        if (off != 0) { asgStructBytes := self.cg_localWertStructBytes(name, nlen); }
+        // `s := puffer as S` bindet um, statt zu kopieren — dieselbe
+        // Ueberlegung wie bei der Deklaration: ein Cast sagt, WELCHEN Speicher
+        // die Variable meint.
+        if (self.cg_nkind(rhs) == CGN_CAST || self.cg_nkind(rhs) == CGN_NEW) { asgStructBytes := 0; }
+        if (asgStructBytes > 0) {
+          self.cg_emitStructKopieNach(off, asgStructBytes);
+          return;
+        }
         if (off != 0) {
           // WP-B1: @redundant vars write all 3 copies (A=off-16, B=off-8, C=off)
           var lidx: int64 := self.cg_findLocalIdx(name, nlen);
@@ -12388,7 +12668,29 @@ pub type Codegen = class {
         if (foff >= 0 && classIdx >= 0) {
           stW := (self.cg_getFieldBigEndian(classIdx, fieldName, fieldLen) >> 8) & 0xFF;
         }
-        if (foff >= 0 && (stW == 1 || stW == 2 || stW == 4)) {
+        // #1351/#1513: Ist das Ziel ein INLINE liegendes Struct, wird sein
+        // Inhalt kopiert. Ein `mov [rax+off], rsi` legte stattdessen die
+        // Adresse der Quelle in die ersten acht Byte des Feldes — der Rest
+        // blieb, wie er war, und jeder spaetere Zugriff las Muell.
+        var stInline: int64 := 0;
+        if (foff >= 0 && classIdx >= 0) {
+          stInline := (self.cg_getFieldBigEndian(classIdx, fieldName, fieldLen) >> 4) & 1;
+        }
+        if (stInline != 0) {
+          var stBytes: int64 := self.cg_fieldBytes(classIdx, fieldName, fieldLen);
+          var stWorte: int64 := (stBytes + 7) / 8;
+          // rax = Zielobjekt, rsi = Quelle
+          if (foff == 0) {
+            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);                 // mov rdi, rax
+          } else if (foff <= 127) {
+            self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x78); self.cg_e8(foff); // lea rdi,[rax+off]
+          } else {
+            self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0xB8); self.cg_e32(foff);
+          }
+          self.cg_movRaxImm(stWorte);
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);                   // mov rcx, rax
+          self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0xA5);                   // rep movsq
+        } else if (foff >= 0 && (stW == 1 || stW == 2 || stW == 4)) {
           self.cg_emitNarrowStoreRsi(foff, stW);
         } else if (foff == 0) {
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x30);
@@ -14811,6 +15113,14 @@ pub type Codegen = class {
       paramIdx += 1;
       param := self.cg_nnext(param);
     }
+    // #1351: Die PARAMETERUEBERGABE bleibt vorerst eine Uebergabe der Adresse.
+    // Eine Kopie beim Eintritt waere schnell emittiert — sie bricht aber den
+    // eigenen Bestand: 51 Funktionen in 18 stdlib-Einheiten aendern ihren
+    // Struct-Parameter mit Absicht und geben das Ergebnis so zurueck
+    // (MySQLQuery, MongoDocAddString, BGPSendOpen, TerminalDraw …). Ohne ein
+    // Sprachmittel fuer "nach Referenz" waere jede dieser Stellen still
+    // wirkungslos geworden — schlechter als der gemeldete Fehler.
+    // Getrennt gefuehrt als #1528.
     // L-4: stack params at [rbp+16], [rbp+24], ... (args 7+ passed on caller stack)
     var spOff: int64 := 16;
     while (param != -1) {
@@ -16413,6 +16723,26 @@ pub type Codegen = class {
   // Konstanten anders sind, kann niemand erwarten. Dieser Vorpass traegt sie
   // ein, bevor der erste Rumpf entsteht — zweimal, damit auch eine Konstante
   // gilt, die auf eine weiter unten stehende verweist.
+  // #1507: Die Enum-TABELLE entstand erst im Hauptdurchlauf — beim Auswerten
+  // der `con`-Zeilen gab es sie also noch nicht, und `P.Read` fiel auf 0
+  // zurueck. Dieselbe Reihenfolgefrage wie bei den Konstanten selbst (#1338)
+  // und den Struct-Layouts (#1451): nicht falsch gerechnet, sondern zu spaet
+  // vorhanden.
+  fn cg_prebuildEnums(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      var k: int64 := self.cg_nkind(cur);
+      if (k == CGN_ENUM_DECL) {
+        if (self.cg_findEnum(self.cg_nsval(cur), self.cg_nslen(cur)) < 0) {
+          self.cg_buildEnumLayout(cur);
+        }
+      } else if (k == CGN_BLOCK) {
+        self.cg_prebuildEnums(self.cg_nc0(cur));   // @if-Zweig
+      }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
   fn cg_collectCons(head: int64) {
     var runde: int64 := 0;
     while (runde < 2) {
@@ -16465,6 +16795,13 @@ pub type Codegen = class {
     self.cg_collectIfaceSelectors(head);  // #1133: Interface-Selektoren (vor den Layouts!)
     self.cg_prebuildStructLayouts(head);  // #1451: Layouts vor jedem Rumpf
     self.cg_collectFlightCrit(head);      // #1140: gibt es @flight_crit im Programm?
+    // #1338/#1507: Konstanten und Enums verweisen wechselseitig aufeinander —
+    // `enum R { CTRL = BASE }` braucht die Konstante, `con MASK := P.Read as
+    // int64` das Enum. Deshalb dreimal: erst die Konstanten aus Literalen,
+    // dann die Enums (die nun BASE kennen), dann die Konstanten erneut (die
+    // nun P.Read kennen). Eine Reihenfolge allein kann es nicht geben.
+    self.cg_collectCons(head);
+    self.cg_prebuildEnums(head);
     self.cg_collectCons(head);            // #1338: Konstanten VOR den Rumpfen
 
     var cur: int64 := head;
