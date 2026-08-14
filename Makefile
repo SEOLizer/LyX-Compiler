@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.19F
+VERSION   := 1.0.19G
 VERSION_DATE := 2026-08-14
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -476,6 +476,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Struct als Feld, Wertsemantik, Feld-Array mit Klassen (13 Pruefungen) ---"
 	@bash tests/struct_inline_wert_test.sh
+	@echo "OK"
+	@echo "--- defer eines durchlaufenen Rahmens, Zielangabe der IR-Meldung (10 Pruefungen) ---"
+	@bash tests/defer_durchlaufener_rahmen_test.sh
 	@echo "OK"
 	@echo "--- Enum-Werte in con und globalen Startwerten (7 Pruefungen) ---"
 	@bash tests/enum_con_test.sh

@@ -746,6 +746,25 @@ pub type Codegen = class {
   deferBuf:   int64;  // mmap'd int64 array of node indices
   deferCount: int64;
   deferCap:   int64;
+  // #1334: Rahmen-eigener Ausnahme-Halt. Der Codegen weiss STATISCH, welche
+  // defers eine Funktion traegt — zur Laufzeit weiss er aber nicht, wie weit
+  // der Rumpf gekommen ist, wenn eine Ausnahme aus einer TIEFEREN Funktion
+  // hereinschlaegt. Deshalb ein Zaehler im Rahmen: jede defer-Anmeldung setzt
+  // ihn hoch, der Landepunkt liest ihn und arbeitet genau die angemeldeten ab.
+  // 0 = diese Funktion hat keinen (kein defer im Rumpf).
+  deferDepthSlot: int64;
+  // #1334: Hoechststand der Anmeldungen in dieser Funktion. deferCount selbst
+  // taugt am Landepunkt nicht: cg_genBlock setzt ihn am Blockende auf den
+  // Stand bei Blockeintritt zurueck, am Rumpfende steht dort also 0. Die
+  // Eintraege im Puffer bleiben — nur der Zeiger wandert.
+  deferMaxCount: int64;
+  // #1334: Hoechststand der Lokalentabelle. cg_genBlock setzt localCount am
+  // Blockende zurueck; die EINTRAEGE bleiben stehen, nur der Zeiger wandert.
+  // Der Landepunkt liegt hinter dem Rumpf und muss die Namen wiederfinden —
+  // sonst loest `x` in einem aufgeschobenen Aufruf zu nichts auf und der
+  // Aufruf bekommt 0 statt des Wertes.
+  localHigh: int64;
+  deferLandePatch: int64;   // #1334: Patchstelle der Landepunktadresse
 
   // Verschachtelte fn-Deklarationen, die nach der äußeren Funktion emittiert
   // werden. Inline emittiert liefe die äußere Funktion in den Rumpf hinein.
@@ -1018,6 +1037,7 @@ pub type Codegen = class {
     poke64(off,                       name as int64);
     poke64(off + CG_LOCAL_OFF_NAMELEN, nlen);
     poke64(off + CG_LOCAL_OFF_RBPOFF,  0 - self.frameSize);
+    if (self.localCount + 1 > self.localHigh) { self.localHigh := self.localCount + 1; }   // #1334
     // Zero the type entry for this new local
     var toff: int64 := self.localTypes + self.localCount * CG_LOCTYPE_SZ;
     poke64(toff,                   0);
@@ -13130,7 +13150,15 @@ pub type Codegen = class {
       // fuer den man `defer CloseFile(fd)` schreibt — leckte der Deskriptor.
       var throwDeferMark: int64 := self.tryDeferMark;
       if (throwDeferMark < 0) { throwDeferMark := 0; }
-      if (self.deferCount > throwDeferMark) {
+      // #1334: Traegt die Funktion einen Rahmen-Halt und steht der `throw` in
+      // keinem try dieser Funktion, dann landet der Sprung im EIGENEN
+      // Landepunkt — und der arbeitet die defers bereits ab. Hier nochmals zu
+      // emittieren, hiesse jeden defer zweimal auszufuehren (die Reproduktion
+      // aus #1241 zeigte "G1" doppelt). Innerhalb eines try bleibt es beim
+      // alten Weg: dort springt der Wurf am Halt vorbei zum catch.
+      var throwEigenerHalt: int64 := 0;
+      if (self.deferDepthSlot != 0 && self.tryDeferMark < 0) { throwEigenerHalt := 1; }
+      if (throwEigenerHalt == 0 && self.deferCount > throwDeferMark) {
         self.cg_pushRax();
         self.cg_emitDefersDownTo(throwDeferMark);
         self.cg_popRax();
@@ -13282,6 +13310,14 @@ pub type Codegen = class {
       if (self.deferCount < self.deferCap) {
         poke64(self.deferBuf + self.deferCount * 8, self.cg_nc0(ni));
         self.deferCount += 1;
+        if (self.deferCount > self.deferMaxCount) { self.deferMaxCount := self.deferCount; }
+        // #1334: Die erreichte Tiefe im Rahmen vermerken. Der Landepunkt
+        // weiss sonst nicht, wie weit der Rumpf gekommen ist, wenn eine
+        // Ausnahme von tiefer unten hereinschlaegt.
+        if (self.deferDepthSlot != 0) {
+          self.cg_movRaxImm(self.deferCount);
+          self.cg_storeRax(self.deferDepthSlot);
+        }
         // #1030: Argumente JETZT auswerten und sichern.
         self.cg_captureDeferArgs(self.cg_nc0(ni));
       }
@@ -13294,11 +13330,137 @@ pub type Codegen = class {
   // WP-AS-10: emit deferred statements in LIFO order (last defer first).
   // Wird an return-Punkten benutzt: dort laufen ALLE noch offenen defers ab,
   // also auch die der umschliessenden Bloecke.
+  // #1334: Rahmen-Halt installieren. Dieselbe Maschinerie wie `try` (jmp_buf
+  // auf dem Stapel, Handler in CG_EXN_PTR), nur ohne catch: der Landepunkt
+  // arbeitet die defers ab und wirft weiter.
+  //
+  // Ohne ihn sprang eine Ausnahme aus einer TIEFEREN Funktion per longjmp
+  // direkt in den Handler weiter oben — der Rahmen dazwischen wurde
+  // uebersprungen, und niemand fuehrte seine defers aus. `defer CloseFile(fd)`
+  // leckte still, und zwar im haeufigeren Fall: man faengt oben, wirft unten.
+  //
+  // Liefert den Slot des Tiefenzaehlers, oder 0, wenn kein Halt noetig war.
+  fn cg_emitDeferHalt(body: int64): int64 {
+    if (self.cg_hatDefer(body) == 0) { return 0; }
+    // sub rsp, 80
+    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xEC);
+    self.cg_e8(0x50); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x1C); self.cg_e8(0x24);                     // mov [rsp], rbx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x6C); self.cg_e8(0x24); self.cg_e8(0x08);   // mov [rsp+8], rbp
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x64); self.cg_e8(0x24); self.cg_e8(0x10);   // r12
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x6C); self.cg_e8(0x24); self.cg_e8(0x18);   // r13
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x20);   // r14
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x28);   // r15
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE0);                                       // mov rax, rsp
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x30);   // mov [rsp+48], rax
+    // Landepunktadresse nach [rsp+56] — vorwaerts gepatcht.
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);
+    var landePatch: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x38);   // mov [rsp+56], rax
+    // Alten Handler retten und eigenen setzen.
+    self.cg_emitLeaRcxData(CG_EXN_PTR);
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x01);                                       // mov rax,[rcx]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x40);   // mov [rsp+64], rax
+    self.cg_emitLeaRcxData(CG_EXN_PTR);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE0);                                       // mov rax, rsp
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x01);                                       // mov [rcx], rax
+    // Als try-Ebene anmelden, damit `return` den Handler zurueckstellt (#1148).
+    var basisSlot: int64 := self.cg_addLocal("__defer_base"c, 12);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE0);                                       // mov rax, rsp
+    self.cg_storeRax(basisSlot);
+    if (self.tryDepth < self.tryCap) {
+      poke64(self.trySlotBuf + self.tryDepth * 8, basisSlot);
+      poke64(self.tryFinBuf  + self.tryDepth * 8, -1);
+      self.tryDepth += 1;
+    }
+    // Tiefenzaehler anlegen und nullen.
+    var zSlot: int64 := self.cg_addLocal("__defer_n"c, 9);
+    self.cg_zeroRax();
+    self.cg_storeRax(zSlot);
+    self.deferLandePatch := landePatch;
+    return zSlot;
+  }
+
+  // #1334: Traegt dieser Teilbaum irgendwo ein `defer`? Verschachtelte
+  // Funktionen zaehlen NICHT mit — die bringen ihren eigenen Rahmen und
+  // damit ihren eigenen Halt.
+  fn cg_hatDefer(ni: int64): int64 {
+    var cur: int64 := ni;
+    while (cur != -1) {
+      var k: int64 := self.cg_nkind(cur);
+      if (k == CGN_DEFER) { return 1; }
+      if (k != CGN_FUNC_DECL) {
+        if (self.cg_hatDefer(self.cg_nc0(cur)) != 0) { return 1; }
+        if (self.cg_hatDefer(self.cg_nc1(cur)) != 0) { return 1; }
+        if (self.cg_hatDefer(self.cg_nc2(cur)) != 0) { return 1; }
+      }
+      cur := self.cg_nnext(cur);
+    }
+    return 0;
+  }
+
+  // #1334: Der Landepunkt des Rahmen-Halts. Erreicht wird er nur ueber
+  // longjmp; der stellt rsp auf die jmp_buf-Basis und die
+  // Callee-saved-Register samt rbp wieder her.
+  //
+  // Abgearbeitet werden GENAU die defers, die zur Wurfzeit angemeldet waren —
+  // das sagt der Zaehler im Rahmen. Ein statisches "alle" waere falsch: ein
+  // defer hinter der Wurfstelle wurde nie angemeldet und darf nicht laufen.
+  fn cg_emitDeferLandepunkt() {
+    if (self.deferDepthSlot == 0) { return; }
+    // Alten Handler zuruecksetzen: er steht im jmp_buf bei +64.
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x40); // mov rax,[rsp+64]
+    self.cg_emitLeaRcxData(CG_EXN_PTR);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x01);   // mov [rcx], rax
+    // Defers in LIFO-Reihenfolge, jeder unter der Bedingung "war angemeldet".
+    var i: int64 := self.deferMaxCount - 1;
+    while (i >= 0) {
+      self.cg_loadRax(self.deferDepthSlot);
+      self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e32(i + 1);   // cmp rax, i+1
+      self.cg_e8(0x0F); self.cg_e8(0x8C);                        // jl ueber diesen defer
+      var ueber: int64 := self.codeLen;
+      self.cg_e32(0);
+      // #1030-Wiedergabe gilt hier NICHT: die verdeckten Argument-Slots
+      // gehoeren zum Rumpf, und der Landepunkt liegt hinter ihm. In einer
+      // Schleife stand dort nichts Brauchbares mehr — der Aufruf gab eine
+      // leere Zeile aus statt des Wertes. Am Landepunkt werden die Argumente
+      // deshalb neu ausgewertet.
+      var savedReplay: int64 := self.dfReplay;
+      self.dfReplay := 0;
+      self.cg_genStmt(peek64(self.deferBuf + i * 8));
+      self.dfReplay := savedReplay;
+      poke32(self.code + ueber, self.codeLen - ueber - 4);
+      i -= 1;
+    }
+    // Weiterwerfen: der Wert steht noch in CG_EXN_VAL. Gibt es keinen
+    // aeusseren Handler mehr, endet der Prozess — wie bei einem `throw` ohne
+    // Handler (#1487).
+    self.cg_emitLeaRcxData(CG_EXN_PTR);
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x01);   // mov rax, [rcx]
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
+    self.cg_e8(0x0F); self.cg_e8(0x84);
+    var keinH: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_genLongjmp();
+    poke32(self.code + keinH, self.codeLen - keinH - 4);
+    self.cg_movRaxImm(1);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+    self.cg_movRaxImm(231);
+    self.cg_e8(0x0F); self.cg_e8(0x05);                      // syscall exit_group
+  }
+
   fn cg_emitDefers() {
     var i: int64 := self.deferCount - 1;
     while (i >= 0) {
       self.cg_genStmt(peek64(self.deferBuf + i * 8));
       i -= 1;
+    }
+    if (self.deferDepthSlot != 0 && self.deferCount > 0) {   // #1334
+      self.cg_pushRax();
+      self.cg_zeroRax();
+      self.cg_storeRax(self.deferDepthSlot);
+      self.cg_popRax();
     }
   }
 
@@ -13313,6 +13475,17 @@ pub type Codegen = class {
       self.cg_genStmt(peek64(self.deferBuf + i * 8));
       self.dfReplay := savedReplay;
       i -= 1;
+    }
+    // #1334: Was hier gelaufen ist, ist nicht mehr angemeldet. Ohne diese
+    // Rueckmeldung an den Rahmenzaehler arbeitete der Landepunkt sie ein
+    // zweites Mal ab — sichtbar an "d-innen", das zweimal kam, wenn ein
+    // try-Block im selben Rahmen die Ausnahme schon teilweise abgewickelt
+    // hatte.
+    if (self.deferDepthSlot != 0 && self.deferCount > mark) {
+      self.cg_pushRax();
+      self.cg_movRaxImm(mark);
+      self.cg_storeRax(self.deferDepthSlot);
+      self.cg_popRax();
     }
   }
 
@@ -15187,10 +15360,22 @@ pub type Codegen = class {
     self.tryDepth      := 0;    // #1148
     self.loopTryMark   := 0;
     self.tryDeferMark  := -1;   // #1118: ausserhalb jedes try
+    // #1334: Traegt die Funktion defers, wird sie zum Halt der Abwicklung.
+    self.deferMaxCount := 0;
+    self.localHigh := self.localCount;
+    self.deferDepthSlot := self.cg_emitDeferHalt(body);
     self.cg_genBlock(body);
 
     self.cg_zeroRax();
     self.cg_emitEpilogue();
+    // #1334: Der Landepunkt liegt HINTER dem Rumpf und wird nur ueber longjmp
+    // erreicht — der normale Weg ist mit dem Epilog vorbei.
+    if (self.deferDepthSlot != 0) {
+      poke32(self.code + self.deferLandePatch, self.codeLen - self.deferLandePatch - 4);
+      self.localCount := self.localHigh;   // #1334: Namen wieder sichtbar
+      self.cg_emitDeferLandepunkt();
+      self.deferDepthSlot := 0;
+    }
 
     // Patch sub rsp with aligned frame size
     var fs: int64 := self.frameSize + 15;
@@ -17342,6 +17527,9 @@ pub type Codegen = class {
     self.tryDepth      := 0;    // #1148
     self.loopTryMark   := 0;
     self.tryDeferMark  := -1;   // #1118
+    self.deferDepthSlot := 0;   // #1334
+    self.deferLandePatch := 0;
+    self.deferMaxCount := 0;
     self.tryCap     := 64;      // #1148
     self.trySlotBuf := alloc(self.tryCap * 8);
     self.tryFinBuf  := alloc(self.tryCap * 8);
