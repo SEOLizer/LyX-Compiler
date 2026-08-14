@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.19E
+VERSION   := 1.0.19F
 VERSION_DATE := 2026-08-14
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -473,6 +473,12 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Vorgabewerte importierter Funktionen (7 Pruefungen) ---"
 	@bash tests/import_defaults_test.sh
+	@echo "OK"
+	@echo "--- Struct als Feld, Wertsemantik, Feld-Array mit Klassen (13 Pruefungen) ---"
+	@bash tests/struct_inline_wert_test.sh
+	@echo "OK"
+	@echo "--- Enum-Werte in con und globalen Startwerten (7 Pruefungen) ---"
+	@bash tests/enum_con_test.sh
 	@echo "OK"
 	@echo "--- Struct-Typ vor seiner Deklaration benutzt (6 Pruefungen) ---"
 	@bash tests/struct_vorwaerts_test.sh
