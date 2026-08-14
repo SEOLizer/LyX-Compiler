@@ -790,6 +790,12 @@ pub fn MySQLQuery(conn: MySQLConn, sql: pchar): MySQLResult {
         return res;
     }
 
+    // #1332: Der Fehlercode blieb ueber Aufrufe hinweg stehen. MySQLBegin,
+    // MySQLCommit und MySQLRollback urteilen nach conn.error_num und
+    // meldeten deshalb false, obwohl die Transaktion lief — der eine alte
+    // Fehler faerbte jede spaetere Anweisung ein.
+    conn.error_num := 0;
+
     var sqlLen: int64 := StrLen(sql);
     if (!mysqlSendCommand(conn, COM_QUERY, sql, sqlLen)) {
         conn.error_num := 2011;
@@ -834,6 +840,7 @@ pub fn MySQLQuery(conn: MySQLConn, sql: pchar): MySQLResult {
         var colPkt: int64 := MySQLReadPacket(conn);
         var colLen: int64 := conn.last_payload_len;
         if (colPkt <= 0) { break; }
+        mysqlParseFieldDef(res, i, colPkt, colLen);   // #1332
         free(colPkt, colLen + 1);
         i += 1;
     }
@@ -939,17 +946,75 @@ pub fn MySQLDataSeek(res: MySQLResult, rowNum: int64): void {
 pub fn MySQLGetFieldName(res: MySQLResult, idx: int64): pchar {
     if (idx < 0 || idx >= res.field_count) { return ""; }
     if (res.fields <= 0) { return ""; }
-    return "";
+    return (res.fields + idx * MYSQL_FIELD_SZ) as pchar;
 }
 
 pub fn MySQLGetFieldType(res: MySQLResult, idx: int64): int64 {
     if (idx < 0 || idx >= res.field_count) { return 0; }
-    return 0;
+    if (res.fields <= 0) { return 0; }
+    return peek64(res.fields + idx * MYSQL_FIELD_SZ + MYSQL_FIELD_OFF_TYPE);
 }
 
 pub fn MySQLGetFieldLength(res: MySQLResult, idx: int64): int64 {
     if (idx < 0 || idx >= res.field_count) { return 0; }
-    return 0;
+    if (res.fields <= 0) { return 0; }
+    return peek64(res.fields + idx * MYSQL_FIELD_SZ + MYSQL_FIELD_OFF_LEN);
+}
+
+// #1332: Ein Eintrag der Feldtabelle (res.fields), 112 Byte:
+//   [0..87]  Name, nullterminiert (laengere Namen werden abgeschnitten)
+//   [88..95] Typ (Protokollcode, z.B. 3 = LONG, 253 = VAR_STRING)
+//   [96..103] Spaltenlaenge
+// Bis hierher wurden die Spaltendefinitionen gelesen und sofort
+// weggeworfen; die drei Auskunftsfunktionen gaben fest "" bzw. 0 zurueck.
+// Ein Aufrufer konnte Spalten zaehlen, aber nicht benennen.
+con MYSQL_FIELD_SZ: int64 := 112;
+con MYSQL_FIELD_NAME_MAX: int64 := 87;
+con MYSQL_FIELD_OFF_TYPE: int64 := 88;
+con MYSQL_FIELD_OFF_LEN: int64 := 96;
+
+// Spaltendefinition (Protokoll 41):
+//   lenenc "def" | schema | table | org_table | name | org_name
+//   dann lenenc 0x0c, charset(2), column_length(4), type(1), flags(2), ...
+fn mysqlParseFieldDef(res: MySQLResult, idx: int64, pkt: int64, pktLen: int64): void {
+    if (res.fields <= 0) { return; }
+    if (idx < 0 || idx >= res.field_alloc) { return; }
+    var e: int64 := res.fields + idx * MYSQL_FIELD_SZ;
+    poke8(e, 0);
+    poke64(e + MYSQL_FIELD_OFF_TYPE, 0);
+    poke64(e + MYSQL_FIELD_OFF_LEN, 0);
+
+    var pos: int64 := 0;
+    var k: int64 := 0;
+    while (k < 4) { pos := skipLenEncStr(pkt, pos); k := k + 1; }   // def/schema/table/org_table
+    if (pos >= pktLen) { return; }
+
+    // name
+    var nb: int64 := peek8(pkt + pos);
+    pos := pos + 1;
+    var nlen: int64 := 0;
+    if (nb < 251) { nlen := nb; }
+    else if (nb == 0xFC) { nlen := peek8(pkt + pos) | (peek8(pkt + pos + 1) << 8); pos := pos + 2; }
+    else if (nb == 0xFD) { nlen := peek8(pkt + pos) | (peek8(pkt + pos + 1) << 8) | (peek8(pkt + pos + 2) << 16); pos := pos + 3; }
+    else { return; }
+    if (pos + nlen > pktLen) { return; }
+    var c: int64 := 0;
+    while (c < nlen && c < MYSQL_FIELD_NAME_MAX) {
+        poke8(e + c, peek8(pkt + pos + c));
+        c := c + 1;
+    }
+    poke8(e + c, 0);
+    pos := pos + nlen;
+
+    pos := skipLenEncStr(pkt, pos);   // org_name
+    if (pos + 10 > pktLen) { return; }
+    pos := pos + 1;                   // lenenc 0x0c
+    pos := pos + 2;                   // charset
+    var clen: int64 := peek8(pkt + pos) | (peek8(pkt + pos + 1) << 8) |
+                       (peek8(pkt + pos + 2) << 16) | (peek8(pkt + pos + 3) << 24);
+    pos := pos + 4;
+    poke64(e + MYSQL_FIELD_OFF_LEN, clen);
+    poke64(e + MYSQL_FIELD_OFF_TYPE, peek8(pkt + pos));
 }
 
 // Skip one length-encoded string in a row packet; returns updated position
@@ -1142,27 +1207,19 @@ pub fn MySQLStmtPrepare(conn: MySQLConn, sql: pchar): MySQLStmt {
         return stmt;
     }
 
-    // Send COM_STMT_PREPARE command
-    // Packet format: [0x16][stmt_data_len:3][sql]
-    var cmdPacketLen: int64 := sqlLen + 4;
-    var cmdPacket: int64 := alloc(cmdPacketLen);
-    if (cmdPacket <= 0) {
-        conn.error_num := 2021;
-        return stmt;
-    }
-
-    poke8(cmdPacket, COM_STMT_PREPARE);
-    writeInt3(cmdPacket + 1, sqlLen);
-
-    var i: int64 := 0;
-    while (i < sqlLen) {
-        poke8(cmdPacket + 4 + i, peek8(sql + i));
-        i += 1;
-    }
-
+    // #1332: Die Nutzlast von COM_STMT_PREPARE ist [0x16][sql] — sonst
+    // nichts. Der Laengenkopf gehoert in den PAKETRAHMEN, den
+    // MySQLSendPacket schreibt, nicht in die Nutzlast.
+    //
+    // Bis hierher wurde ein zweiter, eigener 3-Byte-Laengenkopf hinter das
+    // Kommandobyte gelegt UND dann ab cmdPacket+1 gesendet — das
+    // Kommandobyte fiel damit vorn heraus. Der Server las das erste
+    // Laengenbyte als Kommando und antwortete "#08S01 Unknown command".
+    // Damit gab es gegen MySQL/MariaDB ueberhaupt keine gebundenen
+    // Parameter, also auch keinen Schutz vor SQL-Injection ausser eigenem
+    // Pruefen.
     conn.packet_num := 0;
-    var sent: bool := MySQLSendPacket(conn, cmdPacket + 1, sqlLen + 3);
-    free(cmdPacket, cmdPacketLen);
+    var sent: bool := mysqlSendCommand(conn, COM_STMT_PREPARE, sql, sqlLen);
 
     if (!sent) {
         conn.error_num := 2022;
@@ -1275,15 +1332,14 @@ fn encodeStmtParamBinary(paramIdx: int64, stmt: MySQLStmt, outBuf: int64): int64
     if (paramIdx >= stmt.param_count) { return 0; }
 
     var pos: int64 := 0;
+    // #1332: Im Binaerprotokoll traegt ALLEIN die Nullbitmap die NULLs — an
+    // der Wertstelle steht dann gar nichts. Das 0xFB von vorher gilt nur im
+    // Textprotokoll und verschob alle folgenden Werte um ein Byte.
     var nullBitmap: int64 := peek64(stmt.params + paramIdx * 48 + 32);
-    var isNull: bool := false;
     if (nullBitmap != 0) {
-        isNull := peek8(nullBitmap + (paramIdx >> 3)) != 0;
-    }
-
-    if (isNull) {
-        poke8(outBuf, 0xFB);
-        return 1;
+        if ((peek8(nullBitmap + (paramIdx / 8)) & (1 << (paramIdx & 7))) != 0) {
+            return 0;
+        }
     }
 
     var typeCode: int64 := peek64(stmt.param_types + paramIdx * 8);
@@ -1414,34 +1470,40 @@ pub fn MySQLStmtExecute(conn: MySQLConn, stmt: MySQLStmt): MySQLResult {
     bufPos += 4;
 
     // null bitmap if we have parameters
+    // #1332: Bit p gehoert in Byte p/8 an Stelle p%8. Die alte Rechnung
+    // verglich (p & 7) mit dem Byteindex und setzte damit fuer p >= 8 in
+    // jedem Byte dieselbe Stelle.
     if (stmt.param_count > 0) {
-        var pcount7: int64 := stmt.param_count + 7;
-        var nullBitmapSize: int64 := pcount7 / 8;
+        var nullBitmapSize: int64 := (stmt.param_count + 7) / 8;
         var n: int64 := 0;
-        while (n < nullBitmapSize) {
-            var nullBit: int64 := 0;
-            // Build null bitmap from bound parameters
-            var p: int64 := 0;
-            while (p < stmt.param_count) {
-                var isNullFlag: bool := false;
-                var nullFlagPtr: int64 := peek64(stmt.params + p * 48 + 40);
-                if (nullFlagPtr != 0) {
-                    isNullFlag := peek8(nullFlagPtr) != 0;
-                }
-                if (isNullFlag && ((p & 7) == n)) {
-                    nullBit := nullBit | (1 << (p & 7));
-                }
-                p += 1;
+        while (n < nullBitmapSize) { poke8(execBuf + bufPos + n, 0); n += 1; }
+        var pn: int64 := 0;
+        while (pn < stmt.param_count) {
+            var nbm: int64 := peek64(stmt.params + pn * 48 + 32);
+            if (nbm != 0 && (peek8(nbm + (pn / 8)) & (1 << (pn & 7))) != 0) {
+                var by: int64 := bufPos + (pn / 8);
+                poke8(execBuf + by, peek8(execBuf + by) | (1 << (pn & 7)));
             }
-            poke8(execBuf + bufPos + n, nullBit);
-            n += 1;
+            pn += 1;
         }
         bufPos += nullBitmapSize;
     }
 
-    // new_params_bound_flag: 0x00 (no new parameters)
-    poke8(execBuf + bufPos, 0);
+    // #1332: new_params_bound_flag MUSS 1 sein, samt Typtabelle.
+    // Mit 0 sagt der Client "die Typen von vorhin gelten weiter" — es gab
+    // aber nie ein Vorhin, und die Werte dahinter waren fuer den Server
+    // damit nicht deutbar. Bei 1 folgen je Parameter zwei Byte:
+    // Typcode und ein Flagbyte (0x80 = unsigned).
+    poke8(execBuf + bufPos, 1);
     bufPos += 1;
+
+    var pt: int64 := 0;
+    while (pt < stmt.param_count) {
+        poke8(execBuf + bufPos, peek64(stmt.param_types + pt * 8) & 0xFF);
+        poke8(execBuf + bufPos + 1, 0);
+        bufPos += 2;
+        pt += 1;
+    }
 
     // Encode each bound parameter
     var p: int64 := 0;
@@ -1451,8 +1513,11 @@ pub fn MySQLStmtExecute(conn: MySQLConn, stmt: MySQLStmt): MySQLResult {
         p += 1;
     }
 
+    // #1332: Das Kommandobyte gehoert MIT ins Paket. Gesendet wurde ab
+    // execBuf + 1 — der Server las die untere Haelfte der stmt_id als
+    // Kommando und meldete "#42000 Incorrect database name ''".
     conn.packet_num := 0;
-    if (!MySQLSendPacket(conn, execBuf + 1, bufPos - 1)) {
+    if (!MySQLSendPacket(conn, execBuf, bufPos)) {
         conn.error_num := 2032;
         return res;
     }
@@ -1504,6 +1569,7 @@ pub fn MySQLStmtExecute(conn: MySQLConn, stmt: MySQLStmt): MySQLResult {
         var colDef: int64 := MySQLReadPacket(conn);
         var colDefLen: int64 := conn.last_payload_len;
         if (colDef > 0) {
+            mysqlParseFieldDef(res, f, colDef, colDefLen);   // #1332
             free(colDef, colDefLen + 1);
         }
         f += 1;
@@ -1602,6 +1668,11 @@ pub fn MySQLStmtBindNull(stmt: MySQLStmt, paramIdx: int64, isNull: bool): bool {
         if (nullBitmap <= 0) { return false; }
         poke64(stmt.params + paramIdx * 48 + 32, nullBitmap);
     }
+
+    // #1332: Ohne Typcode stuende in der Typtabelle 0 (MYSQL_TYPE_DECIMAL) —
+    // der Server bekaeme fuer den NULL-Parameter einen Typ genannt, den
+    // niemand gesetzt hat.
+    if (isNull) { poke64(stmt.param_types + paramIdx * 8, MYSQL_TYPE_NULL); }
 
     // Set null bit for this parameter
     if (isNull) {

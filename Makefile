@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.19D
+VERSION   := 1.0.19E
 VERSION_DATE := 2026-08-14
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -473,6 +473,21 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Vorgabewerte importierter Funktionen (7 Pruefungen) ---"
 	@bash tests/import_defaults_test.sh
+	@echo "OK"
+	@echo "--- Struct-Typ vor seiner Deklaration benutzt (6 Pruefungen) ---"
+	@bash tests/struct_vorwaerts_test.sh
+	@echo "OK"
+	@echo "--- Namensaufloesung: literale IP, /etc/hosts, resolv.conf (3 Pruefungen) ---"
+	@bash tests/net_resolver_test.sh
+	@echo "OK"
+	@echo "--- HTTP-Kopfzeilen einzeln und gezaehlt, HTTPS-Rahmen (2 Pruefungen) ---"
+	@bash tests/net_http_kopf_test.sh
+	@echo "OK"
+	@echo "--- std.db.mysql: Prepared Statements gegen MariaDB (6 Pruefungen) ---"
+	@bash tests/db_mysql_prepared_test.sh
+	@echo "OK"
+	@echo "--- std.db.sqlite: REAL ueber FFI in beide Richtungen (3 Pruefungen) ---"
+	@bash tests/db_sqlite_real_test.sh
 	@echo "OK"
 	@echo "--- std.matrix: Mat3/Mat4/Vec3/Vec4 und ihre Fehlerfaelle (9 Gruppen) ---"
 	@bash tests/matrix_test.sh

@@ -1309,6 +1309,106 @@ pub type Codegen = class {
     return -1;
   }
 
+  // #1451: Alle Struct-Layouts vorziehen, bevor irgendein Rumpf uebersetzt
+  // wird. Bis hierher entstand ein Layout erst, wenn der Hauptdurchlauf die
+  // Deklaration erreichte — eine LOKALE Variable eines Typs, der weiter unten
+  // in der Datei steht, bekam deshalb keine Groesse und damit keinen
+  // Speicher. Die Funktion lief durch, der erste Zugriff auf ein Feld traf
+  // ins Leere.
+  //
+  // Fuer GLOBALE Variablen gab es das Vorziehen bereits (#1256,
+  // cg_ensureStructLayout) — nur eben punktuell an der Stelle, an der es
+  // damals fehlte. Das ist dieselbe Sorte Luecke wie beim `con`-Vorabpass
+  // (#1338): nicht "hier wird falsch gerechnet", sondern "die Reihenfolge
+  // entscheidet ueber die Sichtbarkeit".
+  //
+  // In std/net/socket.lyx steht `TCPConn` hinter `TCPListenerAccept`, das den
+  // Typ zurueckgibt — jeder TCP-Server stuerzte beim ersten Zugriff auf das
+  // Ergebnis ab.
+  // Nur, was der Hauptdurchlauf ebenfalls als Struct vermisst — sonst nimmt
+  // das Vorziehen der Klassenstrecke die Arbeit weg.
+  //   iVal-Bit 1 : Typalias, benennt nur um
+  //   iVal-Bit 5 : Interface, bekommt Klassenlayout (#1133)
+  //   c1 != -1   : hat Methoden, ist also eine Klasse
+  //   c2 != -1   : erbt; erbt es von einer Klasse MIT VMT, muss es selbst
+  //                Klassenlayout bekommen (WP-BC-L2). Das entscheidet sich
+  //                erst, wenn die Elternklasse vermessen ist — hier also
+  //                aussen vor lassen, statt es zu raten.
+  fn cg_istStructDecl(ni: int64): int64 {
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_STRUCT_DECL) { return 1; }
+    if (k == CGN_TYPE_DECL && (self.cg_nival(ni) & 2) == 0 && (self.cg_nival(ni) & 32) == 0
+        && self.cg_nc1(ni) == -1 && self.cg_nc2(ni) == -1) { return 1; }
+    return 0;
+  }
+
+  // Gibt es unter den Deklarationen ein Struct dieses Namens?
+  fn cg_findStructDecl(head: int64, name: pchar, nlen: int64): int64 {
+    var cur: int64 := head;
+    while (cur != -1) {
+      if (self.cg_istStructDecl(cur) != 0 && self.cg_nslen(cur) == nlen) {
+        if (self.cg_seq(self.cg_nsval(cur), nlen, name, nlen)) { return cur; }
+      }
+      cur := self.cg_nnext(cur);
+    }
+    return -1;
+  }
+
+  // Ein Struct laesst sich erst vermessen, wenn jedes Feld, das selbst ein
+  // Struct ist, schon ein Layout hat — sonst geht das Feld mit Groesse 0 ein.
+  fn cg_structFelderBereit(head: int64, ni: int64): int64 {
+    var f: int64 := self.cg_nc0(ni);
+    while (f != -1) {
+      var tn: int64 := self.cg_nc0(f);
+      if (tn != -1) {
+        var nm: pchar := self.cg_nsval(tn);
+        var nl: int64 := self.cg_nslen(tn);
+        if (nl > 0) {
+          if (self.cg_findClass(nm, nl) < 0 && self.cg_findStructDecl(head, nm, nl) != -1) {
+            return 0;
+          }
+        }
+      }
+      f := self.cg_nnext(f);
+    }
+    return 1;
+  }
+
+  fn cg_prebuildStructLayouts(head: int64) {
+    // In Runden, weil ein Struct ein anderes enthalten kann, das weiter unten
+    // steht: gebaut wird nur, was vollstaendig vermessbar ist, und danach
+    // erneut geschaut. Ohne die Runden bekam das aeussere Struct fuer sein
+    // inneres Feld die Groesse 0.
+    var fortschritt: int64 := 1;
+    while (fortschritt != 0) {
+      fortschritt := 0;
+      var cur: int64 := head;
+      while (cur != -1) {
+        if (self.cg_istStructDecl(cur) != 0) {
+          if (self.cg_findClass(self.cg_nsval(cur), self.cg_nslen(cur)) < 0) {
+            if (self.cg_structFelderBereit(head, cur) != 0) {
+              self.cg_buildStructLayout(cur);
+              fortschritt := 1;
+            }
+          }
+        }
+        cur := self.cg_nnext(cur);
+      }
+    }
+    // Was uebrig bleibt, haengt in einem Zyklus (A enthaelt B enthaelt A).
+    // Das ist ein eigener Fehler und gehoert nicht hierher entschieden — die
+    // Layouts entstehen wie bisher, damit hier nichts stumm ausfaellt.
+    var rest: int64 := head;
+    while (rest != -1) {
+      if (self.cg_istStructDecl(rest) != 0) {
+        if (self.cg_findClass(self.cg_nsval(rest), self.cg_nslen(rest)) < 0) {
+          self.cg_buildStructLayout(rest);
+        }
+      }
+      rest := self.cg_nnext(rest);
+    }
+  }
+
   fn cg_findGlobal(name: pchar, nlen: int64): int64 {
     var i: int64 := 0;
     while (i < self.globalVarCount) {
@@ -16363,6 +16463,7 @@ pub type Codegen = class {
     self.cg_collectRangeTypes(head);      // #1097: Bereichstypen samt Grenzen
     self.cg_collectUtypes(head);          // #1110: Einheitentypen samt Faktor
     self.cg_collectIfaceSelectors(head);  // #1133: Interface-Selektoren (vor den Layouts!)
+    self.cg_prebuildStructLayouts(head);  // #1451: Layouts vor jedem Rumpf
     self.cg_collectFlightCrit(head);      // #1140: gibt es @flight_crit im Programm?
     self.cg_collectCons(head);            // #1338: Konstanten VOR den Rumpfen
 
