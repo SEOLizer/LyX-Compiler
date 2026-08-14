@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.18H
-VERSION_DATE := 2026-08-13
+VERSION   := 1.0.19A
+VERSION_DATE := 2026-08-14
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -461,6 +461,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- stdlib rechnet richtig: sort, pgp, math, pack, result, argv (14 Pruefungen) ---"
 	@bash tests/stdlib_rechnen_test.sh
+	@echo "OK"
+	@echo "--- f64-Literale: Bitmuster gegen python (5 Pruefungen) ---"
+	@bash tests/f64_literal_test.sh
 	@echo "OK"
 	@echo "--- std.io: Printf schreibt nicht mehr in ein String-Literal (5 Pruefungen) ---"
 	@bash tests/printf_literal_test.sh
