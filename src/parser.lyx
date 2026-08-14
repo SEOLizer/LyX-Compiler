@@ -3636,6 +3636,16 @@ pub type Parser = class {
     var sig_pchar:    int64 := 0;
     var sig_size:     int64 := 0;
     var sig_variadic: int64 := 0;
+    // #1486: Welche Parameter sind Gleitkommawerte, und was gibt die Funktion
+    // zurueck? Die SysV-ABI legt sie in xmm0..xmm7 statt in die
+    // Ganzzahlregister, und der Codegen kann das nur wissen, wenn es hier
+    // festgehalten wird — Parameterknoten baut dieser Zweig bewusst nicht
+    // (siehe oben: c0/c1 bleiben -1, damit sema nicht ueber unbekannte Typen
+    // stolpert). Zwei Bit je Parameter: 1 = f64, 2 = f32.
+    var sig_fmask:    int64 := 0;    // Bit 2*i, 2*i+1 fuer Parameter i (bis 8)
+    var sig_pidx:     int64 := 0;    // laufender Parameterindex
+    var sig_fret:     int64 := 0;    // Rueckgabe: 0 keine, 1 f64, 2 f32
+    var sig_afterParams: int64 := 0; // hinter der schliessenden Klammer
     var sig_depth:    int64 := 0;    // Klammertiefe
     var sig_inParams: int64 := 0;    // innerhalb äußerster ()
     var sig_pastLink: int64 := 0;    // nach 'link' Keyword nicht mehr scannen
@@ -3649,8 +3659,12 @@ pub type Parser = class {
           sig_depth += 1;
           if (sig_depth == 1) { sig_inParams := 1; }
         } else if (tk == TK_RPAREN) {
-          if (sig_depth == 1) { sig_inParams := 0; }
+          if (sig_depth == 1) { sig_inParams := 0; sig_afterParams := 1; }
           sig_depth -= 1;
+        }
+        // #1486: Komma auf oberster Ebene trennt die Parameter.
+        if (sig_inParams != 0 && sig_depth == 1 && tk == TK_COMMA) {
+          sig_pidx := sig_pidx + 1;
         }
         // Tokens im Parameterbereich (äußerste Klammern, nicht tiefer)
         if (sig_inParams != 0 && sig_depth == 1) {
@@ -3679,13 +3693,26 @@ pub type Parser = class {
                      tk == TK_UINT16 || tk == TK_INT16 ||
                      tk == TK_UINT8  || tk == TK_INT8) {
             sig_size += 1;
+          } else if (tk == TK_F64) {
+            // #1486: `f64` und `f32` lexen als EIGENE Tokenarten, nicht als
+            // Bezeichner — ein Textvergleich im IDENT-Zweig trifft sie nie.
+            if (sig_pidx < 8) { sig_fmask := sig_fmask | (1 << (sig_pidx * 2)); }
+          } else if (tk == TK_F32) {
+            if (sig_pidx < 8) { sig_fmask := sig_fmask | (2 << (sig_pidx * 2)); }
           } else if (tk == TK_ELLIPSIS) {
             sig_variadic := 1;
           }
         }
+        // #1486: Rueckgabetyp — zwischen schliessender Klammer und `link`.
+        if (sig_afterParams != 0) {
+          if (tk == TK_F64) { sig_fret := 1; }
+          if (tk == TK_F32) { sig_fret := 2; }
+        }
+
         // 'link' Keyword → Rest-Scan nur noch für String
         if (tk == TK_IDENT && self._tokTextEq(self.cur, "link"c) != 0) {
           sig_pastLink := 1;
+          sig_afterParams := 0;
         }
       }
 
@@ -3711,7 +3738,10 @@ pub type Parser = class {
       self._err("  Schreibweise: extern fn name(...): T link \"libc.so.6\";"c);
     }
     // iVal: bit0=extern, bits8-15=pcharCount, bits16-23=sizeCount, bit24=variadic
-    self._siv(n, 1 | (sig_pchar << 8) | (sig_size << 16) | (sig_variadic << 24));
+    //       #1486: bits32-47 = Gleitkommamaske (2 Bit je Parameter),
+    //              bits48-49 = Rueckgabe (1 = f64, 2 = f32)
+    self._siv(n, 1 | (sig_pchar << 8) | (sig_size << 16) | (sig_variadic << 24)
+                   | (sig_fmask << 32) | (sig_fret << 48));
     self.Match(TK_SEMI);
     return n;
   }
