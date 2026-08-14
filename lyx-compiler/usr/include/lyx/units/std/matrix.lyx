@@ -1,0 +1,981 @@
+// std/matrix.lyx
+// Feste Matrizen und Vektoren in f64: Vec3, Vec4, Mat3, Mat4.
+//
+// Speicherordnung: ROW-MAJOR. Das Feld mRC ist Zeile R, Spalte C — m01 steht
+// also in Zeile 0, Spalte 1. Ein Vektor wird als Spalte rechts multipliziert:
+//
+//     v' = M * v          Mat4MulVec4(m, v)
+//
+// Wer die Matrix an OpenGL weiterreicht, transponiert vorher (Mat4Transpose)
+// oder uebergibt sie mit gesetztem transpose-Flag — GL erwartet column-major.
+//
+// ---------------------------------------------------------------------------
+// WARUM DIESER QUELLTEXT SO UMSTAENDLICH AUSSIEHT
+// ---------------------------------------------------------------------------
+// Drei offene Compilerdefekte verbieten Schreibweisen, die hier naheliegen
+// wuerden. Die Umgehungen sind Absicht und duerfen nicht "aufgeraeumt" werden,
+// solange die Issues offen sind — der Code wird sonst still falsch, nicht laut:
+//
+//   #1496  Ein NEGATIVES LITERAL als Operand rechnet falsch: `x * -1.0` liefert
+//          Muell. Deshalb steht hier ueberall `0.0 - x` bzw. eine umgestellte
+//          Differenz statt eines fuehrenden Minus.
+//   #1499  Eine f64-`con` als Operand rechnet falsch: `x * PI` liefert Muell.
+//          Deshalb wird jede Konstante zuerst in eine `var` kopiert.
+//   #1498  Ein Strukturfeld `[N]f64` rechnet ganzzahlig. Deshalb traegt Mat4
+//          sechzehn BENANNTE Felder statt eines Arrays — mit benannten
+//          f64-Feldern sind Uebergabe per Wert, Rueckgabe per Wert und
+//          Arithmetik nachweislich korrekt.
+//
+// Nachweislich tragfaehig sind: Variablen, Strukturfelder, Aufrufergebnisse,
+// POSITIVE Literale, Verschachtelung, Klammerung, std.math-Aufrufe.
+//
+// Ausgabe: `PrintLn` auf einem f64-BINAERAUSDRUCK druckt Rohbits (#1497).
+// Deshalb geht in Beispielen und Tests jedes Ergebnis erst in eine Variable.
+
+@description("Feste Matrizen und Vektoren in f64 (Vec3, Vec4, Mat3, Mat4)")
+@author("Andreas Röne")
+@copyright("2024-2026 Andreas Röne")
+unit std.matrix;
+
+import std.math;
+
+// ============================================================================
+// Typen
+// ============================================================================
+
+pub type Vec3 = struct {
+  x: f64;
+  y: f64;
+  z: f64;
+}
+
+pub type Vec4 = struct {
+  x: f64;
+  y: f64;
+  z: f64;
+  w: f64;
+}
+
+// Row-major: mRC = Zeile R, Spalte C.
+pub type Mat3 = struct {
+  m00: f64; m01: f64; m02: f64;
+  m10: f64; m11: f64; m12: f64;
+  m20: f64; m21: f64; m22: f64;
+}
+
+pub type Mat4 = struct {
+  m00: f64; m01: f64; m02: f64; m03: f64;
+  m10: f64; m11: f64; m12: f64; m13: f64;
+  m20: f64; m21: f64; m22: f64; m23: f64;
+  m30: f64; m31: f64; m32: f64; m33: f64;
+}
+
+// Eine Inversion kann fehlschlagen (singulaere Matrix). Sie meldet das ueber
+// `ok` statt still die Einheitsmatrix oder Unsinn zu liefern — ein stiller
+// Default an dieser Stelle macht aus jedem entarteten Fall eine unbemerkte
+// Fehlrechnung weiter hinten.
+pub type Mat3Inv = struct {
+  ok: bool;
+  m: Mat3;
+}
+
+pub type Mat4Inv = struct {
+  ok: bool;
+  m: Mat4;
+}
+
+// Perspektivische Division kann an w == 0 scheitern (Punkt in der
+// Fluchtebene). Auch das wird gemeldet, nicht geraten.
+pub type Vec3Result = struct {
+  ok: bool;
+  v: Vec3;
+}
+
+// ============================================================================
+// Interne Helfer
+// ============================================================================
+
+// Negation. `0.0 - x` statt `-x`, siehe #1496.
+fn negf(x: f64): f64 {
+  return 0.0 - x;
+}
+
+// Toleranz fuer Vergleiche und Singularitaetspruefung. Als Funktion statt als
+// `con`, weil eine f64-`con` als Operand falsch rechnet (#1499) — der
+// Rueckgabewert eines Aufrufs dagegen ist korrekt.
+pub fn MatEpsilon(): f64 {
+  return 0.000000001;
+}
+
+fn nearlyEqual(a: f64, b: f64, eps: f64): bool {
+  var d: f64 := a - b;
+  var ad: f64 := AbsF64(d);
+  return ad <= eps;
+}
+
+// ============================================================================
+// Vec3
+// ============================================================================
+
+pub fn Vec3New(x: f64, y: f64, z: f64): Vec3 {
+  var r: Vec3;
+  r.x := x;
+  r.y := y;
+  r.z := z;
+  return r;
+}
+
+pub fn Vec3Zero(): Vec3 {
+  return Vec3New(0.0, 0.0, 0.0);
+}
+
+pub fn Vec3One(): Vec3 {
+  return Vec3New(1.0, 1.0, 1.0);
+}
+
+pub fn Vec3UnitX(): Vec3 {
+  return Vec3New(1.0, 0.0, 0.0);
+}
+
+pub fn Vec3UnitY(): Vec3 {
+  return Vec3New(0.0, 1.0, 0.0);
+}
+
+pub fn Vec3UnitZ(): Vec3 {
+  return Vec3New(0.0, 0.0, 1.0);
+}
+
+pub fn Vec3Add(a: Vec3, b: Vec3): Vec3 {
+  return Vec3New(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+pub fn Vec3Sub(a: Vec3, b: Vec3): Vec3 {
+  return Vec3New(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+pub fn Vec3Neg(a: Vec3): Vec3 {
+  return Vec3New(negf(a.x), negf(a.y), negf(a.z));
+}
+
+pub fn Vec3Scale(a: Vec3, s: f64): Vec3 {
+  return Vec3New(a.x * s, a.y * s, a.z * s);
+}
+
+// Komponentenweises Produkt (Hadamard), nicht das Skalarprodukt.
+pub fn Vec3MulComp(a: Vec3, b: Vec3): Vec3 {
+  return Vec3New(a.x * b.x, a.y * b.y, a.z * b.z);
+}
+
+pub fn Vec3Dot(a: Vec3, b: Vec3): f64 {
+  var xx: f64 := a.x * b.x;
+  var yy: f64 := a.y * b.y;
+  var zz: f64 := a.z * b.z;
+  return xx + yy + zz;
+}
+
+pub fn Vec3Cross(a: Vec3, b: Vec3): Vec3 {
+  var cx: f64 := a.y * b.z - a.z * b.y;
+  var cy: f64 := a.z * b.x - a.x * b.z;
+  var cz: f64 := a.x * b.y - a.y * b.x;
+  return Vec3New(cx, cy, cz);
+}
+
+pub fn Vec3LengthSq(a: Vec3): f64 {
+  return Vec3Dot(a, a);
+}
+
+pub fn Vec3Length(a: Vec3): f64 {
+  var l2: f64 := Vec3LengthSq(a);
+  return SqrtF64(l2);
+}
+
+// Normiert. Der Nullvektor hat keine Richtung — er bleibt der Nullvektor,
+// statt NaN zu erzeugen. Das ist der eine bewusste Durchfall in dieser Unit
+// und deshalb hier benannt: er ist verlustfrei (0 rein, 0 raus) und der
+// Aufrufer kann ihn mit Vec3LengthSq vorher ausschliessen.
+pub fn Vec3Normalize(a: Vec3): Vec3 {
+  var len: f64 := Vec3Length(a);
+  var eps: f64 := MatEpsilon();
+  if (len <= eps) {
+    return Vec3Zero();
+  }
+  return Vec3New(a.x / len, a.y / len, a.z / len);
+}
+
+pub fn Vec3DistanceSq(a: Vec3, b: Vec3): f64 {
+  var d: Vec3 := Vec3Sub(a, b);
+  return Vec3LengthSq(d);
+}
+
+pub fn Vec3Distance(a: Vec3, b: Vec3): f64 {
+  var d: Vec3 := Vec3Sub(a, b);
+  return Vec3Length(d);
+}
+
+pub fn Vec3Lerp(a: Vec3, b: Vec3, t: f64): Vec3 {
+  var d: Vec3 := Vec3Sub(b, a);
+  var st: Vec3 := Vec3Scale(d, t);
+  return Vec3Add(a, st);
+}
+
+// Spiegelung an einer Ebene mit Normale n (n muss normiert sein).
+pub fn Vec3Reflect(v: Vec3, n: Vec3): Vec3 {
+  var d: f64 := Vec3Dot(v, n);
+  var f: f64 := d * 2.0;
+  var s: Vec3 := Vec3Scale(n, f);
+  return Vec3Sub(v, s);
+}
+
+pub fn Vec3Equals(a: Vec3, b: Vec3, eps: f64): bool {
+  if (!nearlyEqual(a.x, b.x, eps)) { return false; }
+  if (!nearlyEqual(a.y, b.y, eps)) { return false; }
+  if (!nearlyEqual(a.z, b.z, eps)) { return false; }
+  return true;
+}
+
+// ============================================================================
+// Vec4
+// ============================================================================
+
+pub fn Vec4New(x: f64, y: f64, z: f64, w: f64): Vec4 {
+  var r: Vec4;
+  r.x := x;
+  r.y := y;
+  r.z := z;
+  r.w := w;
+  return r;
+}
+
+pub fn Vec4Zero(): Vec4 {
+  return Vec4New(0.0, 0.0, 0.0, 0.0);
+}
+
+// Punkt (w = 1) bzw. Richtung (w = 0) aus einem Vec3.
+pub fn Vec4FromPoint(a: Vec3): Vec4 {
+  return Vec4New(a.x, a.y, a.z, 1.0);
+}
+
+pub fn Vec4FromDirection(a: Vec3): Vec4 {
+  return Vec4New(a.x, a.y, a.z, 0.0);
+}
+
+pub fn Vec4XYZ(a: Vec4): Vec3 {
+  return Vec3New(a.x, a.y, a.z);
+}
+
+pub fn Vec4Add(a: Vec4, b: Vec4): Vec4 {
+  return Vec4New(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+}
+
+pub fn Vec4Sub(a: Vec4, b: Vec4): Vec4 {
+  return Vec4New(a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w);
+}
+
+pub fn Vec4Neg(a: Vec4): Vec4 {
+  return Vec4New(negf(a.x), negf(a.y), negf(a.z), negf(a.w));
+}
+
+pub fn Vec4Scale(a: Vec4, s: f64): Vec4 {
+  return Vec4New(a.x * s, a.y * s, a.z * s, a.w * s);
+}
+
+pub fn Vec4Dot(a: Vec4, b: Vec4): f64 {
+  var xx: f64 := a.x * b.x;
+  var yy: f64 := a.y * b.y;
+  var zz: f64 := a.z * b.z;
+  var ww: f64 := a.w * b.w;
+  return xx + yy + zz + ww;
+}
+
+pub fn Vec4LengthSq(a: Vec4): f64 {
+  return Vec4Dot(a, a);
+}
+
+pub fn Vec4Length(a: Vec4): f64 {
+  var l2: f64 := Vec4LengthSq(a);
+  return SqrtF64(l2);
+}
+
+pub fn Vec4Normalize(a: Vec4): Vec4 {
+  var len: f64 := Vec4Length(a);
+  var eps: f64 := MatEpsilon();
+  if (len <= eps) {
+    return Vec4Zero();
+  }
+  return Vec4New(a.x / len, a.y / len, a.z / len, a.w / len);
+}
+
+pub fn Vec4Lerp(a: Vec4, b: Vec4, t: f64): Vec4 {
+  var d: Vec4 := Vec4Sub(b, a);
+  var st: Vec4 := Vec4Scale(d, t);
+  return Vec4Add(a, st);
+}
+
+// Perspektivische Division. w == 0 ist kein Punkt, sondern eine Richtung im
+// Unendlichen — das wird gemeldet (ok = false), nicht stillschweigend zu 0.
+pub fn Vec4PerspectiveDivide(a: Vec4): Vec3Result {
+  var r: Vec3Result;
+  var aw: f64 := AbsF64(a.w);
+  var eps: f64 := MatEpsilon();
+  if (aw <= eps) {
+    r.ok := false;
+    r.v := Vec3Zero();
+    return r;
+  }
+  r.ok := true;
+  r.v := Vec3New(a.x / a.w, a.y / a.w, a.z / a.w);
+  return r;
+}
+
+pub fn Vec4Equals(a: Vec4, b: Vec4, eps: f64): bool {
+  if (!nearlyEqual(a.x, b.x, eps)) { return false; }
+  if (!nearlyEqual(a.y, b.y, eps)) { return false; }
+  if (!nearlyEqual(a.z, b.z, eps)) { return false; }
+  if (!nearlyEqual(a.w, b.w, eps)) { return false; }
+  return true;
+}
+
+// ============================================================================
+// Mat3
+// ============================================================================
+
+pub fn Mat3New(m00: f64, m01: f64, m02: f64,
+               m10: f64, m11: f64, m12: f64,
+               m20: f64, m21: f64, m22: f64): Mat3 {
+  var r: Mat3;
+  r.m00 := m00; r.m01 := m01; r.m02 := m02;
+  r.m10 := m10; r.m11 := m11; r.m12 := m12;
+  r.m20 := m20; r.m21 := m21; r.m22 := m22;
+  return r;
+}
+
+pub fn Mat3Zero(): Mat3 {
+  return Mat3New(0.0, 0.0, 0.0,
+                 0.0, 0.0, 0.0,
+                 0.0, 0.0, 0.0);
+}
+
+pub fn Mat3Identity(): Mat3 {
+  return Mat3New(1.0, 0.0, 0.0,
+                 0.0, 1.0, 0.0,
+                 0.0, 0.0, 1.0);
+}
+
+pub fn Mat3FromRows(r0: Vec3, r1: Vec3, r2: Vec3): Mat3 {
+  return Mat3New(r0.x, r0.y, r0.z,
+                 r1.x, r1.y, r1.z,
+                 r2.x, r2.y, r2.z);
+}
+
+pub fn Mat3FromCols(c0: Vec3, c1: Vec3, c2: Vec3): Mat3 {
+  return Mat3New(c0.x, c1.x, c2.x,
+                 c0.y, c1.y, c2.y,
+                 c0.z, c1.z, c2.z);
+}
+
+pub fn Mat3Row(m: Mat3, i: int64): Vec3 {
+  if (i == 0) { return Vec3New(m.m00, m.m01, m.m02); }
+  if (i == 1) { return Vec3New(m.m10, m.m11, m.m12); }
+  return Vec3New(m.m20, m.m21, m.m22);
+}
+
+pub fn Mat3Col(m: Mat3, j: int64): Vec3 {
+  if (j == 0) { return Vec3New(m.m00, m.m10, m.m20); }
+  if (j == 1) { return Vec3New(m.m01, m.m11, m.m21); }
+  return Vec3New(m.m02, m.m12, m.m22);
+}
+
+pub fn Mat3Add(a: Mat3, b: Mat3): Mat3 {
+  return Mat3New(a.m00 + b.m00, a.m01 + b.m01, a.m02 + b.m02,
+                 a.m10 + b.m10, a.m11 + b.m11, a.m12 + b.m12,
+                 a.m20 + b.m20, a.m21 + b.m21, a.m22 + b.m22);
+}
+
+pub fn Mat3Sub(a: Mat3, b: Mat3): Mat3 {
+  return Mat3New(a.m00 - b.m00, a.m01 - b.m01, a.m02 - b.m02,
+                 a.m10 - b.m10, a.m11 - b.m11, a.m12 - b.m12,
+                 a.m20 - b.m20, a.m21 - b.m21, a.m22 - b.m22);
+}
+
+pub fn Mat3Scale(a: Mat3, s: f64): Mat3 {
+  return Mat3New(a.m00 * s, a.m01 * s, a.m02 * s,
+                 a.m10 * s, a.m11 * s, a.m12 * s,
+                 a.m20 * s, a.m21 * s, a.m22 * s);
+}
+
+pub fn Mat3Mul(a: Mat3, b: Mat3): Mat3 {
+  var r00: f64 := a.m00 * b.m00 + a.m01 * b.m10 + a.m02 * b.m20;
+  var r01: f64 := a.m00 * b.m01 + a.m01 * b.m11 + a.m02 * b.m21;
+  var r02: f64 := a.m00 * b.m02 + a.m01 * b.m12 + a.m02 * b.m22;
+  var r10: f64 := a.m10 * b.m00 + a.m11 * b.m10 + a.m12 * b.m20;
+  var r11: f64 := a.m10 * b.m01 + a.m11 * b.m11 + a.m12 * b.m21;
+  var r12: f64 := a.m10 * b.m02 + a.m11 * b.m12 + a.m12 * b.m22;
+  var r20: f64 := a.m20 * b.m00 + a.m21 * b.m10 + a.m22 * b.m20;
+  var r21: f64 := a.m20 * b.m01 + a.m21 * b.m11 + a.m22 * b.m21;
+  var r22: f64 := a.m20 * b.m02 + a.m21 * b.m12 + a.m22 * b.m22;
+  return Mat3New(r00, r01, r02, r10, r11, r12, r20, r21, r22);
+}
+
+pub fn Mat3MulVec3(m: Mat3, v: Vec3): Vec3 {
+  var x: f64 := m.m00 * v.x + m.m01 * v.y + m.m02 * v.z;
+  var y: f64 := m.m10 * v.x + m.m11 * v.y + m.m12 * v.z;
+  var z: f64 := m.m20 * v.x + m.m21 * v.y + m.m22 * v.z;
+  return Vec3New(x, y, z);
+}
+
+pub fn Mat3Transpose(m: Mat3): Mat3 {
+  return Mat3New(m.m00, m.m10, m.m20,
+                 m.m01, m.m11, m.m21,
+                 m.m02, m.m12, m.m22);
+}
+
+pub fn Mat3Trace(m: Mat3): f64 {
+  return m.m00 + m.m11 + m.m22;
+}
+
+pub fn Mat3Det(m: Mat3): f64 {
+  var t0: f64 := m.m11 * m.m22 - m.m12 * m.m21;
+  var t1: f64 := m.m10 * m.m22 - m.m12 * m.m20;
+  var t2: f64 := m.m10 * m.m21 - m.m11 * m.m20;
+  var p0: f64 := m.m00 * t0;
+  var p1: f64 := m.m01 * t1;
+  var p2: f64 := m.m02 * t2;
+  return p0 - p1 + p2;
+}
+
+pub fn Mat3Inverse(m: Mat3): Mat3Inv {
+  var r: Mat3Inv;
+  var det: f64 := Mat3Det(m);
+  var ad: f64 := AbsF64(det);
+  var eps: f64 := MatEpsilon();
+  if (ad <= eps) {
+    r.ok := false;
+    r.m := Mat3Zero();
+    return r;
+  }
+  var inv: f64 := 1.0 / det;
+  // Adjunkte, transponiert. Jeder Term ist als Differenz geschrieben, damit
+  // kein fuehrendes Minus noetig ist (#1496).
+  var b00: f64 := m.m11 * m.m22 - m.m12 * m.m21;
+  var b01: f64 := m.m02 * m.m21 - m.m01 * m.m22;
+  var b02: f64 := m.m01 * m.m12 - m.m02 * m.m11;
+  var b10: f64 := m.m12 * m.m20 - m.m10 * m.m22;
+  var b11: f64 := m.m00 * m.m22 - m.m02 * m.m20;
+  var b12: f64 := m.m02 * m.m10 - m.m00 * m.m12;
+  var b20: f64 := m.m10 * m.m21 - m.m11 * m.m20;
+  var b21: f64 := m.m01 * m.m20 - m.m00 * m.m21;
+  var b22: f64 := m.m00 * m.m11 - m.m01 * m.m10;
+  r.ok := true;
+  r.m := Mat3New(b00 * inv, b01 * inv, b02 * inv,
+                 b10 * inv, b11 * inv, b12 * inv,
+                 b20 * inv, b21 * inv, b22 * inv);
+  return r;
+}
+
+pub fn Mat3Equals(a: Mat3, b: Mat3, eps: f64): bool {
+  if (!nearlyEqual(a.m00, b.m00, eps)) { return false; }
+  if (!nearlyEqual(a.m01, b.m01, eps)) { return false; }
+  if (!nearlyEqual(a.m02, b.m02, eps)) { return false; }
+  if (!nearlyEqual(a.m10, b.m10, eps)) { return false; }
+  if (!nearlyEqual(a.m11, b.m11, eps)) { return false; }
+  if (!nearlyEqual(a.m12, b.m12, eps)) { return false; }
+  if (!nearlyEqual(a.m20, b.m20, eps)) { return false; }
+  if (!nearlyEqual(a.m21, b.m21, eps)) { return false; }
+  if (!nearlyEqual(a.m22, b.m22, eps)) { return false; }
+  return true;
+}
+
+// --- 2D-Transformationen in homogenen Koordinaten (Mat3 auf Vec3 mit z = 1)
+
+pub fn Mat3Translate2D(tx: f64, ty: f64): Mat3 {
+  return Mat3New(1.0, 0.0, tx,
+                 0.0, 1.0, ty,
+                 0.0, 0.0, 1.0);
+}
+
+pub fn Mat3Scale2D(sx: f64, sy: f64): Mat3 {
+  return Mat3New(sx,  0.0, 0.0,
+                 0.0, sy,  0.0,
+                 0.0, 0.0, 1.0);
+}
+
+pub fn Mat3Rotate2D(rad: f64): Mat3 {
+  var c: f64 := CosF64(rad);
+  var s: f64 := SinF64(rad);
+  var ns: f64 := negf(s);
+  return Mat3New(c,   ns,  0.0,
+                 s,   c,   0.0,
+                 0.0, 0.0, 1.0);
+}
+
+// ============================================================================
+// Mat4
+// ============================================================================
+
+pub fn Mat4Zero(): Mat4 {
+  var r: Mat4;
+  r.m00 := 0.0; r.m01 := 0.0; r.m02 := 0.0; r.m03 := 0.0;
+  r.m10 := 0.0; r.m11 := 0.0; r.m12 := 0.0; r.m13 := 0.0;
+  r.m20 := 0.0; r.m21 := 0.0; r.m22 := 0.0; r.m23 := 0.0;
+  r.m30 := 0.0; r.m31 := 0.0; r.m32 := 0.0; r.m33 := 0.0;
+  return r;
+}
+
+pub fn Mat4Identity(): Mat4 {
+  var r: Mat4 := Mat4Zero();
+  r.m00 := 1.0;
+  r.m11 := 1.0;
+  r.m22 := 1.0;
+  r.m33 := 1.0;
+  return r;
+}
+
+pub fn Mat4FromRows(r0: Vec4, r1: Vec4, r2: Vec4, r3: Vec4): Mat4 {
+  var r: Mat4;
+  r.m00 := r0.x; r.m01 := r0.y; r.m02 := r0.z; r.m03 := r0.w;
+  r.m10 := r1.x; r.m11 := r1.y; r.m12 := r1.z; r.m13 := r1.w;
+  r.m20 := r2.x; r.m21 := r2.y; r.m22 := r2.z; r.m23 := r2.w;
+  r.m30 := r3.x; r.m31 := r3.y; r.m32 := r3.z; r.m33 := r3.w;
+  return r;
+}
+
+pub fn Mat4FromCols(c0: Vec4, c1: Vec4, c2: Vec4, c3: Vec4): Mat4 {
+  var r: Mat4;
+  r.m00 := c0.x; r.m01 := c1.x; r.m02 := c2.x; r.m03 := c3.x;
+  r.m10 := c0.y; r.m11 := c1.y; r.m12 := c2.y; r.m13 := c3.y;
+  r.m20 := c0.z; r.m21 := c1.z; r.m22 := c2.z; r.m23 := c3.z;
+  r.m30 := c0.w; r.m31 := c1.w; r.m32 := c2.w; r.m33 := c3.w;
+  return r;
+}
+
+pub fn Mat4Row(m: Mat4, i: int64): Vec4 {
+  if (i == 0) { return Vec4New(m.m00, m.m01, m.m02, m.m03); }
+  if (i == 1) { return Vec4New(m.m10, m.m11, m.m12, m.m13); }
+  if (i == 2) { return Vec4New(m.m20, m.m21, m.m22, m.m23); }
+  return Vec4New(m.m30, m.m31, m.m32, m.m33);
+}
+
+pub fn Mat4Col(m: Mat4, j: int64): Vec4 {
+  if (j == 0) { return Vec4New(m.m00, m.m10, m.m20, m.m30); }
+  if (j == 1) { return Vec4New(m.m01, m.m11, m.m21, m.m31); }
+  if (j == 2) { return Vec4New(m.m02, m.m12, m.m22, m.m32); }
+  return Vec4New(m.m03, m.m13, m.m23, m.m33);
+}
+
+pub fn Mat4Add(a: Mat4, b: Mat4): Mat4 {
+  var r: Mat4;
+  r.m00 := a.m00 + b.m00; r.m01 := a.m01 + b.m01; r.m02 := a.m02 + b.m02; r.m03 := a.m03 + b.m03;
+  r.m10 := a.m10 + b.m10; r.m11 := a.m11 + b.m11; r.m12 := a.m12 + b.m12; r.m13 := a.m13 + b.m13;
+  r.m20 := a.m20 + b.m20; r.m21 := a.m21 + b.m21; r.m22 := a.m22 + b.m22; r.m23 := a.m23 + b.m23;
+  r.m30 := a.m30 + b.m30; r.m31 := a.m31 + b.m31; r.m32 := a.m32 + b.m32; r.m33 := a.m33 + b.m33;
+  return r;
+}
+
+pub fn Mat4Sub(a: Mat4, b: Mat4): Mat4 {
+  var r: Mat4;
+  r.m00 := a.m00 - b.m00; r.m01 := a.m01 - b.m01; r.m02 := a.m02 - b.m02; r.m03 := a.m03 - b.m03;
+  r.m10 := a.m10 - b.m10; r.m11 := a.m11 - b.m11; r.m12 := a.m12 - b.m12; r.m13 := a.m13 - b.m13;
+  r.m20 := a.m20 - b.m20; r.m21 := a.m21 - b.m21; r.m22 := a.m22 - b.m22; r.m23 := a.m23 - b.m23;
+  r.m30 := a.m30 - b.m30; r.m31 := a.m31 - b.m31; r.m32 := a.m32 - b.m32; r.m33 := a.m33 - b.m33;
+  return r;
+}
+
+pub fn Mat4ScaleBy(a: Mat4, s: f64): Mat4 {
+  var r: Mat4;
+  r.m00 := a.m00 * s; r.m01 := a.m01 * s; r.m02 := a.m02 * s; r.m03 := a.m03 * s;
+  r.m10 := a.m10 * s; r.m11 := a.m11 * s; r.m12 := a.m12 * s; r.m13 := a.m13 * s;
+  r.m20 := a.m20 * s; r.m21 := a.m21 * s; r.m22 := a.m22 * s; r.m23 := a.m23 * s;
+  r.m30 := a.m30 * s; r.m31 := a.m31 * s; r.m32 := a.m32 * s; r.m33 := a.m33 * s;
+  return r;
+}
+
+pub fn Mat4Mul(a: Mat4, b: Mat4): Mat4 {
+  var r: Mat4;
+  r.m00 := a.m00 * b.m00 + a.m01 * b.m10 + a.m02 * b.m20 + a.m03 * b.m30;
+  r.m01 := a.m00 * b.m01 + a.m01 * b.m11 + a.m02 * b.m21 + a.m03 * b.m31;
+  r.m02 := a.m00 * b.m02 + a.m01 * b.m12 + a.m02 * b.m22 + a.m03 * b.m32;
+  r.m03 := a.m00 * b.m03 + a.m01 * b.m13 + a.m02 * b.m23 + a.m03 * b.m33;
+  r.m10 := a.m10 * b.m00 + a.m11 * b.m10 + a.m12 * b.m20 + a.m13 * b.m30;
+  r.m11 := a.m10 * b.m01 + a.m11 * b.m11 + a.m12 * b.m21 + a.m13 * b.m31;
+  r.m12 := a.m10 * b.m02 + a.m11 * b.m12 + a.m12 * b.m22 + a.m13 * b.m32;
+  r.m13 := a.m10 * b.m03 + a.m11 * b.m13 + a.m12 * b.m23 + a.m13 * b.m33;
+  r.m20 := a.m20 * b.m00 + a.m21 * b.m10 + a.m22 * b.m20 + a.m23 * b.m30;
+  r.m21 := a.m20 * b.m01 + a.m21 * b.m11 + a.m22 * b.m21 + a.m23 * b.m31;
+  r.m22 := a.m20 * b.m02 + a.m21 * b.m12 + a.m22 * b.m22 + a.m23 * b.m32;
+  r.m23 := a.m20 * b.m03 + a.m21 * b.m13 + a.m22 * b.m23 + a.m23 * b.m33;
+  r.m30 := a.m30 * b.m00 + a.m31 * b.m10 + a.m32 * b.m20 + a.m33 * b.m30;
+  r.m31 := a.m30 * b.m01 + a.m31 * b.m11 + a.m32 * b.m21 + a.m33 * b.m31;
+  r.m32 := a.m30 * b.m02 + a.m31 * b.m12 + a.m32 * b.m22 + a.m33 * b.m32;
+  r.m33 := a.m30 * b.m03 + a.m31 * b.m13 + a.m32 * b.m23 + a.m33 * b.m33;
+  return r;
+}
+
+pub fn Mat4MulVec4(m: Mat4, v: Vec4): Vec4 {
+  var x: f64 := m.m00 * v.x + m.m01 * v.y + m.m02 * v.z + m.m03 * v.w;
+  var y: f64 := m.m10 * v.x + m.m11 * v.y + m.m12 * v.z + m.m13 * v.w;
+  var z: f64 := m.m20 * v.x + m.m21 * v.y + m.m22 * v.z + m.m23 * v.w;
+  var w: f64 := m.m30 * v.x + m.m31 * v.y + m.m32 * v.z + m.m33 * v.w;
+  return Vec4New(x, y, z, w);
+}
+
+// Punkt (w = 1) ohne perspektivische Division — fuer affine Matrizen.
+// Wer projiziert, nimmt Mat4ProjectPoint3.
+pub fn Mat4MulPoint3(m: Mat4, p: Vec3): Vec3 {
+  var x: f64 := m.m00 * p.x + m.m01 * p.y + m.m02 * p.z + m.m03;
+  var y: f64 := m.m10 * p.x + m.m11 * p.y + m.m12 * p.z + m.m13;
+  var z: f64 := m.m20 * p.x + m.m21 * p.y + m.m22 * p.z + m.m23;
+  return Vec3New(x, y, z);
+}
+
+// Richtung (w = 0) — Translation wirkt nicht.
+pub fn Mat4MulDir3(m: Mat4, d: Vec3): Vec3 {
+  var x: f64 := m.m00 * d.x + m.m01 * d.y + m.m02 * d.z;
+  var y: f64 := m.m10 * d.x + m.m11 * d.y + m.m12 * d.z;
+  var z: f64 := m.m20 * d.x + m.m21 * d.y + m.m22 * d.z;
+  return Vec3New(x, y, z);
+}
+
+// Punkt mit perspektivischer Division. Scheitert an w == 0 laut (ok = false).
+pub fn Mat4ProjectPoint3(m: Mat4, p: Vec3): Vec3Result {
+  var v: Vec4 := Vec4FromPoint(p);
+  var t: Vec4 := Mat4MulVec4(m, v);
+  return Vec4PerspectiveDivide(t);
+}
+
+pub fn Mat4Transpose(m: Mat4): Mat4 {
+  var r: Mat4;
+  r.m00 := m.m00; r.m01 := m.m10; r.m02 := m.m20; r.m03 := m.m30;
+  r.m10 := m.m01; r.m11 := m.m11; r.m12 := m.m21; r.m13 := m.m31;
+  r.m20 := m.m02; r.m21 := m.m12; r.m22 := m.m22; r.m23 := m.m32;
+  r.m30 := m.m03; r.m31 := m.m13; r.m32 := m.m23; r.m33 := m.m33;
+  return r;
+}
+
+pub fn Mat4Trace(m: Mat4): f64 {
+  return m.m00 + m.m11 + m.m22 + m.m33;
+}
+
+pub fn Mat4ToMat3(m: Mat4): Mat3 {
+  return Mat3New(m.m00, m.m01, m.m02,
+                 m.m10, m.m11, m.m12,
+                 m.m20, m.m21, m.m22);
+}
+
+pub fn Mat3ToMat4(m: Mat3): Mat4 {
+  var r: Mat4 := Mat4Identity();
+  r.m00 := m.m00; r.m01 := m.m01; r.m02 := m.m02;
+  r.m10 := m.m10; r.m11 := m.m11; r.m12 := m.m12;
+  r.m20 := m.m20; r.m21 := m.m21; r.m22 := m.m22;
+  return r;
+}
+
+// Determinante ueber die sechs 2x2-Unterdeterminanten der oberen beiden
+// Zeilen (s0..s5) und der unteren beiden (c0..c5). Dieselben Zwischenwerte
+// traegt Mat4Inverse, deshalb stehen sie in einer eigenen Funktion.
+pub fn Mat4Det(m: Mat4): f64 {
+  var s0: f64 := m.m00 * m.m11 - m.m10 * m.m01;
+  var s1: f64 := m.m00 * m.m12 - m.m10 * m.m02;
+  var s2: f64 := m.m00 * m.m13 - m.m10 * m.m03;
+  var s3: f64 := m.m01 * m.m12 - m.m11 * m.m02;
+  var s4: f64 := m.m01 * m.m13 - m.m11 * m.m03;
+  var s5: f64 := m.m02 * m.m13 - m.m12 * m.m03;
+  var c5: f64 := m.m22 * m.m33 - m.m32 * m.m23;
+  var c4: f64 := m.m21 * m.m33 - m.m31 * m.m23;
+  var c3: f64 := m.m21 * m.m32 - m.m31 * m.m22;
+  var c2: f64 := m.m20 * m.m33 - m.m30 * m.m23;
+  var c1: f64 := m.m20 * m.m32 - m.m30 * m.m22;
+  var c0: f64 := m.m20 * m.m31 - m.m30 * m.m21;
+  var p0: f64 := s0 * c5;
+  var p1: f64 := s1 * c4;
+  var p2: f64 := s2 * c3;
+  var p3: f64 := s3 * c2;
+  var p4: f64 := s4 * c1;
+  var p5: f64 := s5 * c0;
+  return p0 - p1 + p2 + p3 - p4 + p5;
+}
+
+pub fn Mat4Inverse(m: Mat4): Mat4Inv {
+  var r: Mat4Inv;
+  var s0: f64 := m.m00 * m.m11 - m.m10 * m.m01;
+  var s1: f64 := m.m00 * m.m12 - m.m10 * m.m02;
+  var s2: f64 := m.m00 * m.m13 - m.m10 * m.m03;
+  var s3: f64 := m.m01 * m.m12 - m.m11 * m.m02;
+  var s4: f64 := m.m01 * m.m13 - m.m11 * m.m03;
+  var s5: f64 := m.m02 * m.m13 - m.m12 * m.m03;
+  var c5: f64 := m.m22 * m.m33 - m.m32 * m.m23;
+  var c4: f64 := m.m21 * m.m33 - m.m31 * m.m23;
+  var c3: f64 := m.m21 * m.m32 - m.m31 * m.m22;
+  var c2: f64 := m.m20 * m.m33 - m.m30 * m.m23;
+  var c1: f64 := m.m20 * m.m32 - m.m30 * m.m22;
+  var c0: f64 := m.m20 * m.m31 - m.m30 * m.m21;
+
+  var d0: f64 := s0 * c5;
+  var d1: f64 := s1 * c4;
+  var d2: f64 := s2 * c3;
+  var d3: f64 := s3 * c2;
+  var d4: f64 := s4 * c1;
+  var d5: f64 := s5 * c0;
+  var det: f64 := d0 - d1 + d2 + d3 - d4 + d5;
+
+  var ad: f64 := AbsF64(det);
+  var eps: f64 := MatEpsilon();
+  if (ad <= eps) {
+    r.ok := false;
+    r.m := Mat4Zero();
+    return r;
+  }
+  var inv: f64 := 1.0 / det;
+
+  var b00: f64 := m.m11 * c5 - m.m12 * c4 + m.m13 * c3;
+  var b01: f64 := m.m02 * c4 - m.m01 * c5 - m.m03 * c3;
+  var b02: f64 := m.m31 * s5 - m.m32 * s4 + m.m33 * s3;
+  var b03: f64 := m.m22 * s4 - m.m21 * s5 - m.m23 * s3;
+
+  var b10: f64 := m.m12 * c2 - m.m10 * c5 - m.m13 * c1;
+  var b11: f64 := m.m00 * c5 - m.m02 * c2 + m.m03 * c1;
+  var b12: f64 := m.m32 * s2 - m.m30 * s5 - m.m33 * s1;
+  var b13: f64 := m.m20 * s5 - m.m22 * s2 + m.m23 * s1;
+
+  var b20: f64 := m.m10 * c4 - m.m11 * c2 + m.m13 * c0;
+  var b21: f64 := m.m01 * c2 - m.m00 * c4 - m.m03 * c0;
+  var b22: f64 := m.m30 * s4 - m.m31 * s2 + m.m33 * s0;
+  var b23: f64 := m.m21 * s2 - m.m20 * s4 - m.m23 * s0;
+
+  var b30: f64 := m.m11 * c1 - m.m10 * c3 - m.m12 * c0;
+  var b31: f64 := m.m00 * c3 - m.m01 * c1 + m.m02 * c0;
+  var b32: f64 := m.m31 * s1 - m.m30 * s3 - m.m32 * s0;
+  var b33: f64 := m.m20 * s3 - m.m21 * s1 + m.m22 * s0;
+
+  var o: Mat4;
+  o.m00 := b00 * inv; o.m01 := b01 * inv; o.m02 := b02 * inv; o.m03 := b03 * inv;
+  o.m10 := b10 * inv; o.m11 := b11 * inv; o.m12 := b12 * inv; o.m13 := b13 * inv;
+  o.m20 := b20 * inv; o.m21 := b21 * inv; o.m22 := b22 * inv; o.m23 := b23 * inv;
+  o.m30 := b30 * inv; o.m31 := b31 * inv; o.m32 := b32 * inv; o.m33 := b33 * inv;
+  r.ok := true;
+  r.m := o;
+  return r;
+}
+
+pub fn Mat4Equals(a: Mat4, b: Mat4, eps: f64): bool {
+  if (!nearlyEqual(a.m00, b.m00, eps)) { return false; }
+  if (!nearlyEqual(a.m01, b.m01, eps)) { return false; }
+  if (!nearlyEqual(a.m02, b.m02, eps)) { return false; }
+  if (!nearlyEqual(a.m03, b.m03, eps)) { return false; }
+  if (!nearlyEqual(a.m10, b.m10, eps)) { return false; }
+  if (!nearlyEqual(a.m11, b.m11, eps)) { return false; }
+  if (!nearlyEqual(a.m12, b.m12, eps)) { return false; }
+  if (!nearlyEqual(a.m13, b.m13, eps)) { return false; }
+  if (!nearlyEqual(a.m20, b.m20, eps)) { return false; }
+  if (!nearlyEqual(a.m21, b.m21, eps)) { return false; }
+  if (!nearlyEqual(a.m22, b.m22, eps)) { return false; }
+  if (!nearlyEqual(a.m23, b.m23, eps)) { return false; }
+  if (!nearlyEqual(a.m30, b.m30, eps)) { return false; }
+  if (!nearlyEqual(a.m31, b.m31, eps)) { return false; }
+  if (!nearlyEqual(a.m32, b.m32, eps)) { return false; }
+  if (!nearlyEqual(a.m33, b.m33, eps)) { return false; }
+  return true;
+}
+
+// ============================================================================
+// Mat4 — Transformationen
+// ============================================================================
+
+pub fn Mat4Translate(t: Vec3): Mat4 {
+  var r: Mat4 := Mat4Identity();
+  r.m03 := t.x;
+  r.m13 := t.y;
+  r.m23 := t.z;
+  return r;
+}
+
+pub fn Mat4ScaleXYZ(s: Vec3): Mat4 {
+  var r: Mat4 := Mat4Zero();
+  r.m00 := s.x;
+  r.m11 := s.y;
+  r.m22 := s.z;
+  r.m33 := 1.0;
+  return r;
+}
+
+pub fn Mat4RotateX(rad: f64): Mat4 {
+  var c: f64 := CosF64(rad);
+  var s: f64 := SinF64(rad);
+  var ns: f64 := negf(s);
+  var r: Mat4 := Mat4Identity();
+  r.m11 := c;  r.m12 := ns;
+  r.m21 := s;  r.m22 := c;
+  return r;
+}
+
+pub fn Mat4RotateY(rad: f64): Mat4 {
+  var c: f64 := CosF64(rad);
+  var s: f64 := SinF64(rad);
+  var ns: f64 := negf(s);
+  var r: Mat4 := Mat4Identity();
+  r.m00 := c;  r.m02 := s;
+  r.m20 := ns; r.m22 := c;
+  return r;
+}
+
+pub fn Mat4RotateZ(rad: f64): Mat4 {
+  var c: f64 := CosF64(rad);
+  var s: f64 := SinF64(rad);
+  var ns: f64 := negf(s);
+  var r: Mat4 := Mat4Identity();
+  r.m00 := c;  r.m01 := ns;
+  r.m10 := s;  r.m11 := c;
+  return r;
+}
+
+// Drehung um eine beliebige Achse (Rodrigues). Die Achse wird normiert; eine
+// Nullachse ergibt die Einheitsmatrix (Drehung um nichts ist keine Drehung).
+pub fn Mat4RotateAxis(axis: Vec3, rad: f64): Mat4 {
+  var a: Vec3 := Vec3Normalize(axis);
+  var l2: f64 := Vec3LengthSq(a);
+  var eps: f64 := MatEpsilon();
+  if (l2 <= eps) {
+    return Mat4Identity();
+  }
+  var c: f64 := CosF64(rad);
+  var s: f64 := SinF64(rad);
+  var t: f64 := 1.0 - c;
+
+  var tx: f64 := t * a.x;
+  var ty: f64 := t * a.y;
+  var tz: f64 := t * a.z;
+  var sx: f64 := s * a.x;
+  var sy: f64 := s * a.y;
+  var sz: f64 := s * a.z;
+
+  var r: Mat4 := Mat4Identity();
+  r.m00 := tx * a.x + c;
+  r.m01 := tx * a.y - sz;
+  r.m02 := tx * a.z + sy;
+  r.m10 := ty * a.x + sz;
+  r.m11 := ty * a.y + c;
+  r.m12 := ty * a.z - sx;
+  r.m20 := tz * a.x - sy;
+  r.m21 := tz * a.y + sx;
+  r.m22 := tz * a.z + c;
+  return r;
+}
+
+// Blickmatrix. Rechtshaendig, Blickrichtung -z, wie bei gluLookAt.
+// Fallen zusammen (eye == center) oder ist up parallel zur Blickrichtung, gibt
+// es keine eindeutige Basis — dann bleibt es bei der Einheitsmatrix, statt
+// eine entartete Basis weiterzureichen.
+pub fn Mat4LookAt(eye: Vec3, center: Vec3, up: Vec3): Mat4 {
+  var dir: Vec3 := Vec3Sub(center, eye);
+  var f: Vec3 := Vec3Normalize(dir);
+  var fl: f64 := Vec3LengthSq(f);
+  var eps: f64 := MatEpsilon();
+  if (fl <= eps) {
+    return Mat4Identity();
+  }
+  var sc: Vec3 := Vec3Cross(f, up);
+  var s: Vec3 := Vec3Normalize(sc);
+  var sl: f64 := Vec3LengthSq(s);
+  if (sl <= eps) {
+    return Mat4Identity();
+  }
+  var u: Vec3 := Vec3Cross(s, f);
+
+  var ex: f64 := Vec3Dot(s, eye);
+  var ey: f64 := Vec3Dot(u, eye);
+  var ez: f64 := Vec3Dot(f, eye);
+
+  var r: Mat4 := Mat4Identity();
+  r.m00 := s.x;       r.m01 := s.y;       r.m02 := s.z;       r.m03 := negf(ex);
+  r.m10 := u.x;       r.m11 := u.y;       r.m12 := u.z;       r.m13 := negf(ey);
+  r.m20 := negf(f.x); r.m21 := negf(f.y); r.m22 := negf(f.z); r.m23 := ez;
+  r.m30 := 0.0;       r.m31 := 0.0;       r.m32 := 0.0;       r.m33 := 1.0;
+  return r;
+}
+
+// Perspektive wie gluPerspective. fovy in Radiant, aspect = Breite/Hoehe.
+// near und far muessen positiv und verschieden sein — sonst waere die Matrix
+// entartet und jede Projektion danach falsch. Entartete Eingaben ergeben
+// deshalb die Nullmatrix, die sofort auffaellt, statt einer Matrix, die
+// beinahe stimmt.
+pub fn Mat4Perspective(fovy: f64, aspect: f64, near: f64, far: f64): Mat4 {
+  var eps: f64 := MatEpsilon();
+  var aa: f64 := AbsF64(aspect);
+  if (aa <= eps) { return Mat4Zero(); }
+  if (near <= eps) { return Mat4Zero(); }
+  if (far <= near) { return Mat4Zero(); }
+
+  var half: f64 := fovy / 2.0;
+  var tanHalf: f64 := TanF64(half);
+  var at: f64 := AbsF64(tanHalf);
+  if (at <= eps) { return Mat4Zero(); }
+  var fcot: f64 := 1.0 / tanHalf;
+
+  var nf: f64 := near - far;
+  var r: Mat4 := Mat4Zero();
+  r.m00 := fcot / aspect;
+  r.m11 := fcot;
+  r.m22 := (far + near) / nf;
+  r.m23 := (far * near * 2.0) / nf;
+  r.m32 := negf(1.0);
+  return r;
+}
+
+// Orthogonale Projektion. Entartete Quader (l == r, b == t, n == f) ergeben
+// die Nullmatrix — siehe Mat4Perspective.
+pub fn Mat4Ortho(left: f64, right: f64, bottom: f64, top: f64, near: f64, far: f64): Mat4 {
+  var eps: f64 := MatEpsilon();
+  var rl: f64 := right - left;
+  var tb: f64 := top - bottom;
+  var fn2: f64 := far - near;
+  var arl: f64 := AbsF64(rl);
+  var atb: f64 := AbsF64(tb);
+  var afn: f64 := AbsF64(fn2);
+  if (arl <= eps) { return Mat4Zero(); }
+  if (atb <= eps) { return Mat4Zero(); }
+  if (afn <= eps) { return Mat4Zero(); }
+
+  var sumRL: f64 := right + left;
+  var sumTB: f64 := top + bottom;
+  var sumFN: f64 := far + near;
+
+  var r: Mat4 := Mat4Zero();
+  r.m00 := 2.0 / rl;
+  r.m11 := 2.0 / tb;
+  r.m22 := negf(2.0 / fn2);
+  r.m03 := negf(sumRL / rl);
+  r.m13 := negf(sumTB / tb);
+  r.m23 := negf(sumFN / fn2);
+  r.m33 := 1.0;
+  return r;
+}
+
+// Allgemeiner Sichtkegelstumpf (glFrustum).
+pub fn Mat4Frustum(left: f64, right: f64, bottom: f64, top: f64, near: f64, far: f64): Mat4 {
+  var eps: f64 := MatEpsilon();
+  var rl: f64 := right - left;
+  var tb: f64 := top - bottom;
+  var fn2: f64 := far - near;
+  var arl: f64 := AbsF64(rl);
+  var atb: f64 := AbsF64(tb);
+  var afn: f64 := AbsF64(fn2);
+  if (arl <= eps) { return Mat4Zero(); }
+  if (atb <= eps) { return Mat4Zero(); }
+  if (afn <= eps) { return Mat4Zero(); }
+  if (near <= eps) { return Mat4Zero(); }
+
+  var n2: f64 := near * 2.0;
+  var sumRL: f64 := right + left;
+  var sumTB: f64 := top + bottom;
+  var sumFN: f64 := far + near;
+  var prodFN: f64 := far * near * 2.0;
+
+  var r: Mat4 := Mat4Zero();
+  r.m00 := n2 / rl;
+  r.m02 := sumRL / rl;
+  r.m11 := n2 / tb;
+  r.m12 := sumTB / tb;
+  r.m22 := negf(sumFN / fn2);
+  r.m23 := negf(prodFN / fn2);
+  r.m32 := negf(1.0);
+  return r;
+}
