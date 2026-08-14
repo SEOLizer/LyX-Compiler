@@ -5,10 +5,23 @@
 @copyright("2024-2025 Andreas Röne")
 unit std.pack;
 
+import std.alloc;   // #1462: 8-Byte-Kratzpuffer fuer die Bit-Umdeutung
+
 // Write a varint (7-bit encoding, high bit = more follows)
+// #1463: `while (v >= 128)` ist fuer negative Werte sofort falsch — es wurde
+// GENAU EIN Byte `v & 127` geschrieben, die oberen Bits fielen weg, und
+// ReadVarInt las eine positive Zahl zurueck (-1 wurde zu 127).
+//
+// Umgesetzt ist die ZickZack-Kodierung (wie in Protocol Buffers): das
+// Vorzeichen wandert ins unterste Bit, kleine Betraege bleiben kurz. Damit
+// braucht -1 ein Byte statt zehn, und der Rundlauf stimmt fuer den ganzen
+// int64-Bereich. Die Kodierung aendert sich damit — wer Dateien mit der alten
+// Fassung geschrieben hat, liest sie nicht mehr; die alte Fassung konnte
+// negative Werte aber ohnehin nicht ablegen.
 pub fn WriteVarInt(buf: int64, pos: int64, val: int64): int64 {
   var i: int64 := 0;
-  var v: int64 := val;
+  var v: int64 := (val << 1);
+  if (val < 0) { v := ((0 - val) << 1) - 1; }
   while (v >= 128) {
     var b: int64 := (v & 127) | 128;
     var off: int64 := pos + i;
@@ -25,7 +38,7 @@ pub fn WriteVarInt(buf: int64, pos: int64, val: int64): int64 {
 
 // Read a varint
 pub fn ReadVarInt(buf: int64, pos: int64): int64 {
-  var result: int64 := 0;
+  var result: int64 := 0;   // #1463: ZickZack, siehe WriteVarInt
   var shift: int64 := 0;
   var i: int64 := 0;
   while (i < 10) {
@@ -36,11 +49,14 @@ pub fn ReadVarInt(buf: int64, pos: int64): int64 {
     result := result | shifted;
     i += 1;
     if ((b & 128) == 0) {
-      return result;
+      // #1463: ZickZack zurueckrechnen — unterstes Bit ist das Vorzeichen.
+      if ((result & 1) == 0) { return result / 2; }
+      return 0 - ((result + 1) / 2);
     }
     shift += 7;
   }
-  return result;
+  if ((result & 1) == 0) { return result / 2; }
+  return 0 - ((result + 1) / 2);
 }
 
 // Pack int64 (8 bytes, little-endian)
@@ -153,28 +169,87 @@ pub fn UnpackBool(buf: int64, pos: int64): bool {
 }
 
 // Pack float64 (8 bytes IEEE 754)
+// #1462: Hier stand `val as int64` — das KONVERTIERT den Zahlenwert (3.5 wird
+// zu 3), statt das Bitmuster zu uebernehmen. Nach dem Rundlauf waren alle
+// Nachkommastellen weg, und ein Empfaenger, der IEEE 754 erwartet, bekam eine
+// ganz andere Zahl.
+//
+// `pokef64`/`peekf64` schreiben und lesen den Wert als f64; ueber dieselbe
+// Adresse mit `peek64` gelesen kommt das Bitmuster heraus. Das ist die
+// Umdeutung, die hier gebraucht wird — eine Umwandlung gibt es dafuer nicht.
+fn f64ZuBits(val: f64): int64 {
+  var t: int64 := alloc(8);
+  pokef64(t, val);
+  var bits: int64 := peek64(t);
+  free(t, 8);
+  return bits;
+}
+
+fn bitsZuF64(bits: int64): f64 {
+  var t: int64 := alloc(8);
+  poke64(t, bits);
+  var v: f64 := peekf64(t);
+  free(t, 8);
+  return v;
+}
+
 pub fn PackFloat64(buf: int64, pos: int64, val: f64): int64 {
-  var bits: int64 := val as int64;
-  return PackInt64(buf, pos, bits);
+  return PackInt64(buf, pos, f64ZuBits(val));
 }
 
 // Unpack float64
 pub fn UnpackFloat64(buf: int64, pos: int64): f64 {
-  var bits: int64 := UnpackInt64(buf, pos);
-  return bits as f64;
+  return bitsZuF64(UnpackInt64(buf, pos));   // #1462
 }
 
 // Pack float32 (4 bytes IEEE 754)
+// #1462: Fuer 32 Bit muss das Muster umgerechnet werden — die unteren 32 Bit
+// eines f64-Musters sind KEIN f32. Vorzeichen, Exponent (11 -> 8 Bit, Bias 1023
+// -> 127) und Mantisse (52 -> 23 Bit) werden einzeln uebertragen.
 pub fn PackFloat32(buf: int64, pos: int64, val: f64): int64 {
-  var bits: int64 := val as int64;
-  var bits32: int64 := bits & 4294967295;
+  var b: int64 := f64ZuBits(val);
+  var sign: int64 := (b >> 63) & 1;
+  var exp:  int64 := (b >> 52) & 2047;
+  var man:  int64 := b & 4503599627370495;
+
+  var e32: int64 := 0;
+  var m32: int64 := 0;
+  if (exp == 0) {
+    // null oder subnormal — als Null uebernehmen
+    e32 := 0;
+    m32 := 0;
+  }
+  if (exp == 2047) {
+    e32 := 255;                       // inf oder NaN
+    if (man != 0) { m32 := 1; }
+  }
+  if (exp != 0 && exp != 2047) {
+    var e: int64 := exp - 1023 + 127;
+    if (e <= 0)   { e32 := 0;   m32 := 0; }        // unterlaeuft f32
+    if (e >= 255) { e32 := 255; m32 := 0; }        // ueberlaeuft f32 -> inf
+    if (e > 0 && e < 255) { e32 := e; m32 := man / 536870912; }   // 52 -> 23 Bit
+  }
+
+  var bits32: int64 := (sign << 31) | (e32 << 23) | m32;
   return PackInt32(buf, pos, bits32);
 }
 
 // Unpack float32
 pub fn UnpackFloat32(buf: int64, pos: int64): f64 {
-  var bits: int64 := UnpackInt32(buf, pos);
-  return bits as f64;
+  var b: int64 := UnpackInt32(buf, pos) & 4294967295;   // #1462
+  var sign: int64 := (b >> 31) & 1;
+  var e32:  int64 := (b >> 23) & 255;
+  var m32:  int64 := b & 8388607;
+
+  var exp: int64 := 0;
+  var man: int64 := 0;
+  if (e32 == 0)   { exp := 0;    man := 0; }
+  if (e32 == 255) { exp := 2047; if (m32 != 0) { man := 1; } }
+  if (e32 != 0 && e32 != 255) {
+    exp := e32 - 127 + 1023;
+    man := m32 * 536870912;
+  }
+  return bitsZuF64((sign << 63) | (exp << 52) | man);
 }
 
 // Pack string: varint length + bytes
