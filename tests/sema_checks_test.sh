@@ -79,13 +79,14 @@ out "importierte Funktion: richtige Anzahl bleibt gueltig" 'import std.io;
 import mm.lib;
 fn main(): int64 { PrintLn(IntToStr(Add(1, 2))); return 0; }' "3"
 
-# Vorgabewerte einer IMPORTIERTEN Funktion setzt der Codegen nicht ein — er
-# sucht die Deklaration nur in der eigenen Modulkette. Der Aufruf liefe also
-# mit einem Wert vom Stack; deshalb wird er gemeldet, statt still falsch zu
-# rechnen. Nachgemessen: ohne die Meldung druckte er -140735687454702.
-rejects "ausgelassener Vorgabewert einer importierten Funktion wird gemeldet" 'import std.io;
+# #1342: Vorgabewerte einer IMPORTIERTEN Funktion werden jetzt eingesetzt. Der
+# Codegen findet die Deklaration zwar weiterhin nur in der eigenen Modulkette,
+# schreibt aber beim Einlesen der Unit die KONSTANTEN Vorgaben ab und setzt
+# sie am Aufrufpunkt ein. Vorher stand hier ein `rejects` — davor druckte der
+# Aufruf -140735687454702, also einen Wert vom Stack.
+out "ausgelassener Vorgabewert einer importierten Funktion wird eingesetzt" 'import std.io;
 import mm.lib;
-fn main(): int64 { PrintLn(IntToStr(WithDefault(10))); return 0; }' "Vorgabewert einer importierten Funktion"
+fn main(): int64 { PrintLn(IntToStr(WithDefault(10))); return 0; }' "5"
 
 out "vollstaendig angegeben rechnet richtig" 'import std.io;
 import mm.lib;

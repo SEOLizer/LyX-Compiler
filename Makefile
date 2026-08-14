@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.19C
+VERSION   := 1.0.19D
 VERSION_DATE := 2026-08-14
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -470,6 +470,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- FFI: Gleitkomma-Argumente nach SysV in xmm (7 Pruefungen) ---"
 	@bash tests/ffi_float_test.sh
+	@echo "OK"
+	@echo "--- Vorgabewerte importierter Funktionen (7 Pruefungen) ---"
+	@bash tests/import_defaults_test.sh
 	@echo "OK"
 	@echo "--- std.io: Printf schreibt nicht mehr in ein String-Literal (5 Pruefungen) ---"
 	@bash tests/printf_literal_test.sh

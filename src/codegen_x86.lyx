@@ -769,6 +769,18 @@ pub type Codegen = class {
   licenseKey:    int64;   // pchar to 29-char key (e.g. "WXDHJ-NFZ18-…"), 0 = no watermark
   licenseKeyLen: int64;   // always 29 when set
 
+  // #1342: Vorgabewerte IMPORTIERTER Funktionen. Der Codegen sucht die
+  // Deklaration nur in der eigenen Modulkette (WP-MEM-05); die Knoten einer
+  // importierten Unit sind nach dem Import ohnehin fort. Beim Einlesen ist der
+  // Ausdruck aber lesbar — konstante Vorgaben werden hier abgeschrieben und am
+  // Aufrufpunkt eingesetzt.
+  // Eintrag (48 Byte): namePtr, nameLen, paramIdx, art, wert, wert2
+  //   art 1 = Ganzzahl/Wahrheitswert (wert), 2 = f64-Bits (wert),
+  //       3 = Zeichenkette (wert = Zeiger, wert2 = Laenge)
+  defTab:      int64;
+  defCount:    int64;
+  defCap:      int64;
+
   // WP-MEM-05: top-level AST head for default-param lookup in cg_genCall
   topLevelHead: int64;
   // #1252: geordnete Argumentliste eines Aufrufs mit benannten Argumenten UND
@@ -2016,6 +2028,124 @@ pub type Codegen = class {
     if (d >= 8)  { rex := rex + 1; d := d - 8; }     // REX.B (rm = Ziel)
     if (sv >= 8) { rex := rex + 4; sv := sv - 8; }   // REX.R (reg = Quelle)
     self.cg_e8(rex); self.cg_e8(0x89); self.cg_e8(0xC0 + sv * 8 + d);
+  }
+
+  // #1342: Eine konstante Vorgabe merken.
+  fn cg_addDefault(namePtr: pchar, nameLen: int64, pidx: int64, art: int64, wert: int64, wert2: int64) {
+    if (self.defCount >= self.defCap) {
+      var nc: int64 := self.defCap * 2;
+      var nb: int64 := alloc(nc * 48);
+      memcpy(nb, self.defTab, self.defCount * 48);
+      self.defTab := nb; self.defCap := nc;
+    }
+    var b: int64 := self.defTab + self.defCount * 48;
+    poke64(b,      namePtr as int64);
+    poke64(b + 8,  nameLen);
+    poke64(b + 16, pidx);
+    poke64(b + 24, art);
+    poke64(b + 32, wert);
+    poke64(b + 40, wert2);
+    self.defCount := self.defCount + 1;
+  }
+
+  // #1342: Vorgabe fuer Parameter pidx von namePtr — Index im defTab oder -1.
+  fn cg_findDefault(namePtr: pchar, nameLen: int64, pidx: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.defCount) {
+      var b: int64 := self.defTab + i * 48;
+      if (peek64(b + 16) == pidx) {
+        if (peek64(b + 8) == nameLen) {
+          if (self.cg_seq(peek64(b) as pchar, nameLen, namePtr, nameLen)) { return i; }
+        }
+      }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  // #1342: Ganzzahlige Vorgabe ausrechnen, soweit sie zur Uebersetzungszeit
+  // feststeht. Bewusst SCHMAL gehalten — Literal, unaeres Minus darauf und die
+  // Grundrechenarten zwischen Literalen. sema muss dieselben Formen annehmen
+  // (siehe _defaultIstKonstant dort): waere sema grosszuegiger, liesse es
+  // einen Aufruf durch, fuer den hier nichts eingesetzt wird, und der
+  // Parameter bekaeme wieder einen Wert vom Stack.
+  // Rueckgabe: 1 = gelungen (Wert in wertZelle), 0 = nicht konstant.
+  fn cg_faltIntConst(ni: int64, wertZelle: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_LIT_INT || k == CGN_LIT_BOOL || k == CGN_LIT_CHAR) {
+      poke64(wertZelle, self.cg_nival(ni));
+      return 1;
+    }
+    if (k == CGN_LIT_NULL) { poke64(wertZelle, 0); return 1; }
+    if (k == CGN_UNOP) {
+      if (self.cg_nival(ni) == CGT_MINUS) {
+        var innen: int64 := alloc(8);
+        var okU: int64 := self.cg_faltIntConst(self.cg_nc0(ni), innen);
+        if (okU != 0) { poke64(wertZelle, 0 - peek64(innen)); }
+        free(innen, 8);
+        return okU;
+      }
+      return 0;
+    }
+    if (k == CGN_BINOP) {
+      var op: int64 := self.cg_nival(ni);
+      if (op != CGT_PLUS && op != CGT_MINUS && op != CGT_STAR) { return 0; }
+      var lz: int64 := alloc(8);
+      var rz: int64 := alloc(8);
+      var okL: int64 := self.cg_faltIntConst(self.cg_nc0(ni), lz);
+      var okR: int64 := self.cg_faltIntConst(self.cg_nc1(ni), rz);
+      var erg: int64 := 0;
+      if (okL != 0 && okR != 0) {
+        if (op == CGT_PLUS)  { poke64(wertZelle, peek64(lz) + peek64(rz)); erg := 1; }
+        if (op == CGT_MINUS) { poke64(wertZelle, peek64(lz) - peek64(rz)); erg := 1; }
+        if (op == CGT_STAR)  { poke64(wertZelle, peek64(lz) * peek64(rz)); erg := 1; }
+      }
+      free(lz, 8); free(rz, 8);
+      return erg;
+    }
+    return 0;
+  }
+
+  // #1342: Beim Einlesen einer Unit die konstanten Vorgaben abschreiben.
+  // Nicht-konstante Vorgaben bleiben aussen vor — fuer sie meldet sema
+  // weiterhin, statt etwas zu raten.
+  fn cg_collectImportDefaults(head: int64) {
+    var cur: int64 := head;
+    while (cur >= 0) {
+      if (self.cg_nkind(cur) == CGN_FUNC_DECL) {
+        var fnm: pchar := self.cg_nsval(cur);
+        var fnl: int64 := self.cg_nslen(cur);
+        var pn: int64 := self.cg_nc0(cur);
+        var pidx: int64 := 0;
+        while (pn >= 0) {
+          var dv: int64 := self.cg_nc1(pn);
+          if (dv >= 0) {
+            var dk: int64 := self.cg_nkind(dv);
+            if (dk != CGN_LIT_FLOAT) {
+              var wz: int64 := alloc(8);
+              if (self.cg_faltIntConst(dv, wz) != 0) {
+                self.cg_addDefault(fnm, fnl, pidx, 1, peek64(wz), 0);
+              }
+              free(wz, 8);
+            }
+            if (dk == CGN_LIT_FLOAT) {
+              // Der Text des Literals liegt in der Quelle der importierten
+              // Unit; die bleibt geladen (siehe Hinweis in cg_processImportAs).
+              self.cg_addDefault(fnm, fnl, pidx, 2,
+                                 self.cg_parseFloat(self.pSrc, self.cg_nsoff(dv), self.cg_nslen(dv)), 0);
+            }
+            // Zeichenketten-Vorgaben bleiben aussen vor: ihr Text liegt in
+            // der Quelle der importierten Unit, und die Aufnahme in den
+            // eigenen Datenbereich ist ein eigener Schritt. sema meldet sie
+            // weiterhin, statt dass hier etwas geraten wird.
+          }
+          pn := self.cg_nnext(pn);
+          pidx := pidx + 1;
+        }
+      }
+      cur := self.cg_nnext(cur);
+    }
   }
 
   // Record a declared extern (lookup only — no GOT slot until it is called).
@@ -8707,6 +8837,27 @@ pub type Codegen = class {
             argc += 1;
           }
           cgPn := self.cg_nnext(cgPn);
+        }
+      }
+
+      // #1342: Die Funktion steht nicht in der eigenen Modulkette — dann
+      // stammt sie aus einem Import, und ihre Knoten gibt es hier nicht mehr.
+      // Die konstanten Vorgaben wurden beim Einlesen abgeschrieben.
+      if (cgDefFuncNi < 0 && isMethod == 0 && ordCnt < 0) {
+        var dpi: int64 := argc;
+        var weiter: int64 := 1;
+        while (weiter == 1) {
+          var di: int64 := self.cg_findDefault(fname, fnlen, dpi);
+          if (di < 0) { weiter := 0; }
+          if (di >= 0) {
+            var db: int64 := self.defTab + di * 48;
+            // Ganzzahl, Wahrheitswert oder f64-Bitmuster — alle drei liegen
+            // in einem Maschinenwort.
+            self.cg_movRaxImm(peek64(db + 32));
+            self.cg_pushRax();
+            argc += 1;
+            dpi := dpi + 1;
+          }
         }
       }
       }
@@ -16067,6 +16218,7 @@ pub type Codegen = class {
     // This makes imported functions visible for patch resolution in main file
     // IMPORTANT: Do this WHILE still switched to import pNodes!
     self.cg_collectImportLabels(head);
+    self.cg_collectImportDefaults(head);   // #1342: konstante Vorgabewerte abschreiben
 
     // Restore main file's source and nodes
     self.pSrc   := savedSrc;
@@ -16848,6 +17000,11 @@ pub type Codegen = class {
     self.lcbsMissingGrants := 0;
     self.lcbsFastpathCount := 0;
     self.lcbsAuditSrcPath  := 0 as pchar;
+
+    // #1342: Vorgabewerte importierter Funktionen
+    self.defCap   := 256;
+    self.defTab   := alloc(self.defCap * 48);
+    self.defCount := 0;
 
     // #1262: Aliastabelle (Platz fuer 256 Eintraege: Zeiger + Laenge).
     self.cgAliasTab      := alloc(256 * 16);
