@@ -142,26 +142,49 @@ else
   ok "--no-opt erzeugt auf der IR-Strecke ein anderes Binary"
 fi
 
-# Und auf dem Schnellweg sagt der Compiler, dass der Schalter dort nichts tut,
-# statt es zu verschweigen.
+# Auf dem Schnellweg WIRKT der Schalter jetzt (#1371): die Vereinfachungen, die
+# der Codegen beim Emittieren macht, haengen an der Stufe. Die frueher noetige
+# Warnung ("bleibt wirkungslos") darf deshalb nicht mehr kommen — sie waere die
+# Unwahrheit in der anderen Richtung.
 wmsg="$("$LYXC" "$TMP/opt.lyx" --no-opt -o "$TMP/o_x86" 2>&1)"
 case "$wmsg" in
-  *"wirkungslos"*"#1371"*) ok "x86-Schnellweg meldet die Wirkungslosigkeit von --no-opt" ;;
-  *) no "x86-Schnellweg meldet die Wirkungslosigkeit von --no-opt" "keine Warnung" ;;
+  *"wirkungslos"*) no "x86-Schnellweg meldet --no-opt nicht mehr als wirkungslos" "$wmsg" ;;
+  *) ok "x86-Schnellweg meldet --no-opt nicht mehr als wirkungslos" ;;
 esac
+# Und der Schalter aendert wirklich etwas — sonst waere die entfernte Warnung
+# eine Beschoenigung. Gemessen wird gegen denselben Quelltext ohne Schalter.
+"$LYXC" "$TMP/opt.lyx" -o "$TMP/o_x86_mit" >/dev/null 2>&1
+if [ -x "$TMP/o_x86_mit" ] && [ -x "$TMP/o_x86" ]; then
+  if cmp -s "$TMP/o_x86_mit" "$TMP/o_x86"; then
+    no "--no-opt aendert das Binary auf dem Schnellweg" "byteweise identisch"
+  else
+    ok "--no-opt aendert das Binary auf dem Schnellweg"
+  fi
+else
+  no "--no-opt aendert das Binary auf dem Schnellweg" "uebersetzt nicht"
+fi
 if [ -x "$TMP/o_x86" ]; then
   "$TMP/o_x86"; rc=$?
   if [ "$rc" -eq 0 ]; then ok "mit --no-opt rechnet das Programm richtig"
   else no "mit --no-opt rechnet das Programm richtig" "rc=$rc statt 0"; fi
 fi
 
-# #1370: die sechs ohne Umsetzung sagen es, statt zu schweigen.
-for f in --emit-asm --dump-asm --dump-relocs --asm-listing --map-file --profile; do
+# #1370: die noch offenen VIER sagen es, statt zu schweigen. --dump-relocs und
+# --map-file sind umgesetzt und muessen angenommen werden; geprueft wird ihr
+# INHALT in tests/diagnose_schalter_test.sh.
+for f in --emit-asm --dump-asm --asm-listing --profile; do
   out="$("$LYXC" "$TMP/rek.lyx" "$f" -o "$TMP/r" 2>&1)"
   case "$out" in
     *"nicht umgesetzt"*"#1370"*) ok "$f wird als nicht umgesetzt gemeldet" ;;
     *) no "$f wird als nicht umgesetzt gemeldet" "$(echo "$out" | head -1)" ;;
   esac
+done
+for f in --dump-relocs --map-file; do
+  if "$LYXC" "$TMP/rek.lyx" "$f" -o "$TMP/r" >/dev/null 2>&1; then
+    ok "$f wird angenommen (umgesetzt)"
+  else
+    no "$f wird angenommen (umgesetzt)" "$("$LYXC" "$TMP/rek.lyx" "$f" -o "$TMP/r" 2>&1 | head -1)"
+  fi
 done
 
 # ===========================================================================
