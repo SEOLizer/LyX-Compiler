@@ -980,9 +980,106 @@ fn hostnameLen(hostname: int64): int64 {
   return 0;
 }
 
+// #1330: Eine Adresse in Textform ist keine Frage an einen Nameserver.
+// Erkennt "a.b.c.d" mit Oktetten 0..255 und liefert sie gepackt; 0 heisst
+// "das ist keine literale IPv4", nicht "unbekannter Host".
+fn dns_parseLiteralIPv4(hostname: int64, len: int64): int64 {
+  var i: int64 := 0;
+  var cur: int64 := 0;
+  var ziffern: int64 := 0;
+  var punkte: int64 := 0;
+  var o1: int64 := 0;
+  var o2: int64 := 0;
+  var o3: int64 := 0;
+  var c: int64 := 0;
+  while (i < len) {
+    c := peek8(hostname + i);
+    if (c >= 48 && c <= 57) {
+      cur := cur * 10 + (c - 48);
+      ziffern := ziffern + 1;
+      if (ziffern > 3 || cur > 255) { return 0; }
+    } else if (c == 46) {
+      if (ziffern == 0) { return 0; }
+      punkte := punkte + 1;
+      if (punkte == 1) { o1 := cur; }
+      else if (punkte == 2) { o2 := cur; }
+      else if (punkte == 3) { o3 := cur; }
+      else { return 0; }
+      cur := 0; ziffern := 0;
+    } else {
+      return 0;
+    }
+    i := i + 1;
+  }
+  if (punkte != 3 || ziffern == 0) { return 0; }
+  // 0.0.0.0 kaeme als 0 heraus und waere von "keine literale IPv4" nicht zu
+  // unterscheiden. Als Verbindungsziel ist die Adresse ohnehin sinnlos —
+  // sie faellt hier bewusst durch und geht den Namensweg.
+  return IPPack(o1, o2, o3, cur);
+}
+
+// #1330: /etc/hosts. Ohne diese Stufe war "localhost" ueber die Unit nicht
+// aufloesbar — oeffentliches DNS kennt den Namen nicht. Gelesen wird nur
+// IPv4; Zeilen ab '#' sind Kommentar, Aliase hinter dem kanonischen Namen
+// zaehlen mit.
+fn dns_lookupEtcHosts(hostname: int64, len: int64): int64 {
+  var buf: int64 := mmap(0, 65536, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) { return 0; }
+  var fd: int64 := open("/etc/hosts", 0, 0);
+  if (fd < 0) { munmap(buf, 65536); return 0; }
+  var n: int64 := sys_read(fd, buf, 65535);
+  sys_close(fd);
+  if (n <= 0) { munmap(buf, 65536); return 0; }
+  poke8(buf + n, 0);
+
+  var i: int64 := 0;
+  while (i < n) {
+    // Zeilenende suchen
+    var ze: int64 := i;
+    while (ze < n && peek8(buf + ze) != 10) { ze := ze + 1; }
+    // Kommentar abschneiden
+    var e: int64 := i;
+    while (e < ze && peek8(buf + e) != 35) { e := e + 1; }
+
+    // Erstes Feld: die Adresse
+    var p: int64 := i;
+    while (p < e && (peek8(buf + p) == 32 || peek8(buf + p) == 9)) { p := p + 1; }
+    var as1: int64 := p;
+    while (p < e && peek8(buf + p) != 32 && peek8(buf + p) != 9) { p := p + 1; }
+    var ip: int64 := dns_parseLiteralIPv4(buf + as1, p - as1);
+
+    // Restliche Felder: kanonischer Name und Aliase
+    if (ip != 0) {
+      while (p < e) {
+        while (p < e && (peek8(buf + p) == 32 || peek8(buf + p) == 9)) { p := p + 1; }
+        var ns: int64 := p;
+        while (p < e && peek8(buf + p) != 32 && peek8(buf + p) != 9) { p := p + 1; }
+        if (p - ns == len) {
+          var k: int64 := 0;
+          var gleich: int64 := 1;
+          while (k < len) {
+            if (peek8(buf + ns + k) != peek8(hostname + k)) { gleich := 0; k := len; }
+            k := k + 1;
+          }
+          if (gleich != 0) { munmap(buf, 65536); return ip; }
+        }
+      }
+    }
+    i := ze + 1;
+  }
+  munmap(buf, 65536);
+  return 0;
+}
+
 // Simple hostname resolver using default DNS server
 // hostname: null-terminated string (e.g., "google.com")
 // Returns: packed IPv4 address in network byte order, or 0 on failure
+//
+// #1330: Reihenfolge wie bei einem System-Resolver — literale Adresse,
+// /etc/hosts, der Nameserver aus /etc/resolv.conf, erst zuletzt Google.
+// Bis hierher ging JEDE Anfrage an 8.8.8.8; damit war weder 127.0.0.1 noch
+// localhost noch irgendein Name im eigenen Netz erreichbar, und jede
+// Verbindung verriet ihr Ziel nach draussen.
 pub fn GetHostByName(hostname: int64): int64 {
   var result: int64;
   var len: int64;
@@ -1000,8 +1097,20 @@ pub fn GetHostByName(hostname: int64): int64 {
     return 0;
   }
   
-  // Resolve using Google DNS
-  success := DNSResolveGoogle(hostname, len, result);
+  // #1330: die beiden lokalen Stufen vor der Netzanfrage
+  var lit: int64 := dns_parseLiteralIPv4(hostname, len);
+  if (lit != 0) { munmap(result, 128); return lit; }
+  var lokal: int64 := dns_lookupEtcHosts(hostname, len);
+  if (lokal != 0) { munmap(result, 128); return lokal; }
+
+  // Nameserver aus /etc/resolv.conf, Google nur als Rueckfall
+  var srv: int64 := dns_parse_resolv_conf();
+  if (srv != 0) {
+    success := DNSResolve(hostname, len, srv, result);
+    if (!success) { success := DNSResolveGoogle(hostname, len, result); }
+  } else {
+    success := DNSResolveGoogle(hostname, len, result);
+  }
   
   if (success) {
     // Extract IPv4 address from result
