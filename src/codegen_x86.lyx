@@ -12053,7 +12053,100 @@ pub type Codegen = class {
   }
 
   // WSP-05: asm { "mnemonic" ... } → x86-Bytes via feste Mnemonic-Tabelle. Unbekannt = Fehler.
+  // #1324: Registername -> Nummer in der x86-64-Kodierung. Nur die Register,
+  // die ein asm-Block sinnvoll binden kann; alles andere wird gemeldet.
+  //   rax/eax/ax/al = 0, rcx/ecx/cx/cl = 1, rdx/edx/dx/dl = 2, rbx.. = 3,
+  //   rsi = 6, rdi = 7
+  // Die Breite spielt fuer das Laden keine Rolle: geladen wird immer 64 Bit,
+  // die Instruktion im Block bestimmt, welcher Teil benutzt wird.
+  fn cg_asmRegNr(name: pchar, nlen: int64): int64 {
+    if (self.cg_seq(name, nlen, "rax"c, 3) || self.cg_seq(name, nlen, "eax"c, 3)
+        || self.cg_seq(name, nlen, "ax"c, 2) || self.cg_seq(name, nlen, "al"c, 2)) { return 0; }
+    if (self.cg_seq(name, nlen, "rcx"c, 3) || self.cg_seq(name, nlen, "ecx"c, 3)
+        || self.cg_seq(name, nlen, "cx"c, 2) || self.cg_seq(name, nlen, "cl"c, 2)) { return 1; }
+    if (self.cg_seq(name, nlen, "rdx"c, 3) || self.cg_seq(name, nlen, "edx"c, 3)
+        || self.cg_seq(name, nlen, "dx"c, 2) || self.cg_seq(name, nlen, "dl"c, 2)) { return 2; }
+    if (self.cg_seq(name, nlen, "rbx"c, 3) || self.cg_seq(name, nlen, "ebx"c, 3)
+        || self.cg_seq(name, nlen, "bx"c, 2) || self.cg_seq(name, nlen, "bl"c, 2)) { return 3; }
+    if (self.cg_seq(name, nlen, "rsi"c, 3) || self.cg_seq(name, nlen, "esi"c, 3)) { return 6; }
+    if (self.cg_seq(name, nlen, "rdi"c, 3) || self.cg_seq(name, nlen, "edi"c, 3)) { return 7; }
+    return -1;
+  }
+
+  // #1324: die Eingabeoperanden in ihre Register legen. Ausgewertet wird von
+  // rechts nach links in EINEM Durchgang ueber den Stapel — sonst zerstoerte
+  // die Auswertung des zweiten Operanden das Register des ersten (dieselbe
+  // Falle wie bei den Parameterkopien in #1351).
+  fn cg_asmLadeEingaben(head: int64) {
+    var n: int64 := 0;
+    var c: int64 := head;
+    while (c >= 0) { n := n + 1; c := self.cg_nnext(c); }
+    if (n == 0) { return; }
+    // Erst alle Werte berechnen und sichern ...
+    c := head;
+    while (c >= 0) {
+      self.cg_genExpr(self.cg_nc0(c));
+      self.cg_pushRax();
+      c := self.cg_nnext(c);
+    }
+    // ... dann von hinten nach vorn in die Register holen (der letzte liegt oben).
+    var i: int64 := n - 1;
+    while (i >= 0) {
+      var k: int64 := 0;
+      var op: int64 := head;
+      while (k < i) { op := self.cg_nnext(op); k := k + 1; }
+      var reg: int64 := self.cg_asmRegNr(self.cg_nsval(op), self.cg_nslen(op));
+      if (reg < 0) {
+        EPrintStr("error: asm: unbekanntes Register in in(...): "c);
+        EPrintStrLn(self.cg_nsval(op));
+        exit(1);
+      }
+      self.cg_popRax();
+      if (reg != 0) {
+        // mov reg, rax
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC0 | reg);
+      }
+      i := i - 1;
+    }
+  }
+
+  // #1324: die Ausgabeoperanden aus ihren Registern in die Variablen.
+  fn cg_asmSchreibeAusgaben(head: int64) {
+    var c: int64 := head;
+    while (c >= 0) {
+      var reg: int64 := self.cg_asmRegNr(self.cg_nsval(c), self.cg_nslen(c));
+      if (reg < 0) {
+        EPrintStr("error: asm: unbekanntes Register in out(...): "c);
+        EPrintStrLn(self.cg_nsval(c));
+        exit(1);
+      }
+      if (reg != 0) {
+        // mov rax, reg
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC0 | (reg << 3));
+      }
+      var ziel: int64 := self.cg_nc0(c);
+      if (ziel < 0 || self.cg_nkind(ziel) != CGN_IDENT) {
+        EPrintStrLn("error: asm: out(...) braucht eine Variable als Ziel"c);
+        exit(1);
+      }
+      var off: int64 := self.cg_findLocal(self.cg_nsval(ziel), self.cg_nslen(ziel));
+      if (off != 0) {
+        self.cg_storeRax(off);
+      } else {
+        var goff: int64 := self.cg_findGlobal(self.cg_nsval(ziel), self.cg_nslen(ziel));
+        if (goff >= 0) { self.cg_emitGlobalWrite(self.cg_nsval(ziel), self.cg_nslen(ziel), goff); }
+        else {
+          EPrintStr("error: asm: out(...) kennt die Variable nicht: "c);
+          EPrintStrLn(self.cg_nsval(ziel));
+          exit(1);
+        }
+      }
+      c := self.cg_nnext(c);
+    }
+  }
+
   fn cg_genAsm(ni: int64) {
+    self.cg_asmLadeEingaben(self.cg_nc2(ni));   // #1324
     var c: int64 := self.cg_nc0(ni);
     while (c >= 0) {
       if      (self.cg_asmIs(c, "cli"c, 3))    { self.cg_e8(0xFA); }
@@ -12073,6 +12166,13 @@ pub type Codegen = class {
       else if (self.cg_asmIs(c, "int3"c, 4))   { self.cg_e8(0xCC); }
       else if (self.cg_asmIs(c, "leave"c, 5))  { self.cg_e8(0xC9); }
       else if (self.cg_asmIs(c, "ret"c, 3))    { self.cg_e8(0xC3); }
+      // #1324: die Portbefehle. Sie waren bewusst nicht in der Tabelle, weil
+      // sie ohne gefuellte Register nutzlos sind — mit der Operandenbindung
+      // sind sie es nicht mehr. Port in dx, Wert in eax/al.
+      else if (self.cg_asmIs(c, "in eax, dx"c, 10))  { self.cg_e8(0xED); }
+      else if (self.cg_asmIs(c, "in al, dx"c, 9))    { self.cg_e8(0xEC); }
+      else if (self.cg_asmIs(c, "out dx, eax"c, 11)) { self.cg_e8(0xEF); }
+      else if (self.cg_asmIs(c, "out dx, al"c, 10))  { self.cg_e8(0xEE); }
       else if (self.cg_asmIs(c, "lgdt [rdi]"c, 10))   { self.cg_e8(0x0F); self.cg_e8(0x01); self.cg_e8(0x17); }
       else if (self.cg_asmIs(c, "lidt [rdi]"c, 10))   { self.cg_e8(0x0F); self.cg_e8(0x01); self.cg_e8(0x1F); }
       else if (self.cg_asmIs(c, "invlpg [rdi]"c, 12)) { self.cg_e8(0x0F); self.cg_e8(0x01); self.cg_e8(0x3F); }
@@ -12082,6 +12182,7 @@ pub type Codegen = class {
       }
       c := self.cg_nnext(c);
     }
+    self.cg_asmSchreibeAusgaben(self.cg_nc1(ni));   // #1324
   }
 
   fn cg_genStmt(ni: int64) {

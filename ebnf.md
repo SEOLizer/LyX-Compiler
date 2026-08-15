@@ -1,6 +1,6 @@
-# Lyx 1.0.20A — Canonical EBNF Grammar
+# Lyx 1.0.20B — Canonical EBNF Grammar
 
-> Stand 2026-08-15, gegen lyxc 1.0.20A geprueft. Die Keyword-Liste in
+> Stand 2026-08-15, gegen lyxc 1.0.20B geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -876,7 +876,10 @@ DeferStmt           = "defer" Statement ;
    Handler, und deren defers laufen nicht -- die Kette ist zur Uebersetzungszeit
    bekannt, die erreichte Tiefe eines fremden Rahmens dagegen nicht. *)
 
-AsmStmt             = "asm" "{" { StringLiteral } "}" ;
+AsmStmt             = "asm" "{" { StringLiteral }
+                      [ ":" [ AsmOperandList ] [ ":" [ AsmOperandList ] ] ] "}" ;
+AsmOperandList      = AsmOperand { "," AsmOperand } ;
+AsmOperand          = ( "out" | "in" ) "(" StringLiteral "," Expr ")" ;
 
 ExprStmt            = Expr ";" ;
 ```
@@ -884,6 +887,34 @@ ExprStmt            = Expr ";" ;
 ## 12.2 Inline-Assembly Rule (WSP-05)
 
 ```text
+### Operandenbindung (#1324)
+
+Nach den Mnemonics koennen zwei durch `:` getrennte Abschnitte folgen: zuerst
+die AUSGABEN, dann die EINGABEN — dieselbe Reihenfolge wie bei GCC. Beide
+Abschnitte duerfen leer sein (`asm { "..." : : in("dx", p) }`).
+
+Jeder Operand nennt sein Register AUSGESCHRIEBEN, nicht als
+Constraint-Buchstaben: es gibt keinen Registerzuteiler, und ein Buchstabe
+wuerde eine Wahl versprechen, die niemand trifft.
+
+    asm { "in eax, dx" : out("eax", wert) : in("dx", port) }
+
+* `in("<reg>", <Ausdruck>)` — der Ausdruck wird VOR dem Block ausgewertet und
+  in das Register gelegt. Mehrere Eingaben werden erst vollstaendig berechnet
+  und danach verteilt; die Auswertung der zweiten kann die erste also nicht
+  zerstoeren.
+* `out("<reg>", <Variable>)` — NACH dem Block wird das Register in die
+  Variable geschrieben. Ziel ist eine lokale oder globale Variable.
+
+Erkannt werden rax/rcx/rdx/rbx/rsi/rdi samt ihren 32-, 16- und 8-Bit-Namen
+(eax, ax, al, ...). Geladen wird immer 64 Bit; welcher Teil benutzt wird,
+entscheidet die Instruktion im Block. Ein unbekannter Registername wird
+gemeldet.
+
+Die Bindung gilt derzeit fuer den x86-64-Weg (ELF, macOS, Windows). Auf den
+IR-Zielen weist ein Block mit Portbefehl laut ab, statt etwas Halbes zu
+erzeugen.
+
 "asm" is a soft keyword: it is recognized as AsmStmt only when an identifier
 token with text "asm" appears in statement position and is immediately followed
 by "{". Otherwise "asm" remains a normal identifier.
@@ -893,6 +924,7 @@ mnemonic set is ARCHITECTURE-SPECIFIC (chosen by the compilation --target):
 
     x86-64 / lyxos : cli sti hlt nop pause cpuid iretq wbinvd invd sfence
                      lfence mfence rdtsc ud2 int3 leave ret
+                     in eax, dx / in al, dx / out dx, eax / out dx, al  (#1324)
                      "lgdt [rdi]" "lidt [rdi]" "invlpg [rdi]"
     arm64          : nop wfi wfe sev sevl yield isb dsb dmb svc brk hlt ret eret
     arm-cm4 (Thumb): nop wfi wfe sev yield isb dsb dmb svc bkpt "cpsid i" "cpsie i"
