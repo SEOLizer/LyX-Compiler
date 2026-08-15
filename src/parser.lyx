@@ -68,6 +68,10 @@ pub con NK_METHOD_PTR: int64 := 129; // B2: method(T1,T2): R — fat pointer {co
 pub con NK_PATTERN_RANGE: int64 := 131;
 pub con NK_PATTERN_TUPLE: int64 := 132;  // #1250: TuplePattern `case (1, 2)`; c0 = erstes Teilmuster
 pub con NK_ASM:        int64 := 130; // WSP-05: asm { "mnemonic" ... } inline-assembly; c0=NK_LIT_STR-Kette
+// #1324: ein Operand einer asm-Bindung. sVal = Registername ("eax", "dx"),
+// c0 = Ausdruck (bei `in`) bzw. Zielbezeichner (bei `out`). iVal: 0 = in, 1 = out.
+// Die Listen haengen an NK_ASM: c1 = out-Kette, c2 = in-Kette.
+pub con NK_ASM_OPERAND: int64 := 131;
 
 // WP-14: Generic type nodes
 pub con NK_TYPE_PARAM:    int64 := 62;  // type parameter: <T>
@@ -1944,7 +1948,10 @@ pub type Parser = class {
       var an: int64 := self._alloc(NK_ASM, ti);
       var ahead: int64 := -1;
       var atail: int64 := -1;
-      while (self.Check(TK_RBRACE) == 0 && self.Check(TK_EOF) == 0) {
+      // #1324: Der Mnemonic-Teil endet am ersten ':' — dahinter beginnt die
+      // Operandenliste. Ohne diese Grenze verschluckte die Schleife sie samt
+      // Klammern und meldete danach "unbekannte Mnemonic".
+      while (self.Check(TK_RBRACE) == 0 && self.Check(TK_COLON) == 0 && self.Check(TK_EOF) == 0) {
         if (self.Check(TK_STRING) != 0) {
           var stok: int64 := self.cur;
           self.Advance();
@@ -1955,8 +1962,61 @@ pub type Parser = class {
           self.Advance();  // unerwartetes Token überspringen (Codegen meldet leeren Block)
         }
       }
+      // #1324: Operandenbindung, GCC-artig, aber mit ausgeschriebenem
+      // Registernamen statt Constraint-Buchstaben:
+      //
+      //   asm { "in eax, dx" : out("eax", wert) : in("dx", port) }
+      //
+      // Vor dem Block wird jeder `in`-Ausdruck in sein Register geladen,
+      // danach jedes `out`-Register in seine Variable geschrieben. Ohne das
+      // liessen sich portbasierte Zugriffe gar nicht ausdruecken: die
+      // Portadresse wird zur Laufzeit gerechnet und muss nach dx (#1324).
+      //
+      // Der Registername steht ausgeschrieben, weil es keinen Registerzuteiler
+      // gibt — ein Constraint-Buchstabe wuerde eine Wahl versprechen, die
+      // niemand trifft.
+      var aOutHead: int64 := -1;
+      var aOutTail: int64 := -1;
+      var aInHead: int64 := -1;
+      var aInTail: int64 := -1;
+      var abschnitt: int64 := 0;      // 1 = out, 2 = in
+      while (self.Check(TK_COLON) != 0) {
+        self.Advance();               // ':'
+        abschnitt := abschnitt + 1;
+        while (self.Check(TK_RBRACE) == 0 && self.Check(TK_COLON) == 0 && self.Check(TK_EOF) == 0) {
+          var opTok: int64 := self.cur;
+          var istOut: int64 := 0;
+          if (self.Check(TK_IDENT) != 0 && self._isSoftKw(self.cur, "out"c) != 0) { istOut := 1; self.Advance(); }
+          else if (self.Check(TK_IN) != 0) { self.Advance(); }
+          else if (self.Check(TK_IDENT) != 0 && self._isSoftKw(self.cur, "in"c) != 0) { self.Advance(); }
+          else {
+            self._err("asm: erwartet in(...) oder out(...) in der Operandenliste"c);
+            self.Advance();
+          }
+          self.Expect(TK_LPAREN);
+          var regTok: int64 := self.cur;
+          self.Expect(TK_STRING);
+          var opn: int64 := self._alloc(NK_ASM_OPERAND, opTok);
+          // Registername ohne die Anfuehrungszeichen.
+          self._ssv(opn, self._tokOff(regTok) + 1, self._tokLen(regTok) - 2);
+          self._siv(opn, istOut);
+          self.Expect(TK_COMMA);
+          self._sc0(opn, self.ParseExpr());
+          self.Expect(TK_RPAREN);
+          if (istOut != 0) {
+            if (aOutHead == -1) { aOutHead := opn; aOutTail := opn; }
+            else { self._sn(aOutTail, opn); aOutTail := opn; }
+          } else {
+            if (aInHead == -1) { aInHead := opn; aInTail := opn; }
+            else { self._sn(aInTail, opn); aInTail := opn; }
+          }
+          if (self.Check(TK_COMMA) != 0) { self.Advance(); }
+        }
+      }
       self.Expect(TK_RBRACE);
       self._sc0(an, ahead);
+      self._sc1(an, aOutHead);
+      self._sc2(an, aInHead);
       return an;
     }
     // WP-AS-08: defer <Stmt> — soft-keyword via TK_IDENT

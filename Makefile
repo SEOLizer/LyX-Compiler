@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.19H
-VERSION_DATE := 2026-08-14
+VERSION   := 1.0.20A
+VERSION_DATE := 2026-08-15
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -476,6 +476,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Struct als Feld, Wertsemantik, Feld-Array mit Klassen (13 Pruefungen) ---"
 	@bash tests/struct_inline_wert_test.sh
+	@echo "OK"
+	@echo "--- asm: Operandenbindung und Portbefehle (9 Pruefungen) ---"
+	@bash tests/asm_operanden_test.sh
 	@echo "OK"
 	@echo "--- Diagnose-Schalter: Relokationen, Karte, Optimierstufe (17 Pruefungen) ---"
 	@bash tests/diagnose_schalter_test.sh
