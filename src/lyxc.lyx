@@ -111,6 +111,7 @@ con OUTPUT_TYPE_SHARED_LIB: int64 := 1;
 
 // Android API levels (WP-AND-03)
 con ANDROID_API_MIN:     int64 := 21;   // Android 5.0 — first 64-bit ARM
+con ANDROID_API_MAX:     int64 := 36;   // #1526: hoechste bekannte Stufe; darueber ist es ein Tippfehler
 con ANDROID_API_DEFAULT: int64 := 26;   // Android 8.0 — current target baseline
 
 // (LicenseInfo and LIC_ERR_* are defined in src.crypto.lic_types)
@@ -400,6 +401,12 @@ pub type CompilerConfig = class {
   // WP-T14: Migration Tool + Compat-Modus
   migrateCaps: bool;  // --migrate-capabilities: Manifest generieren und ausgeben
   capCompat:   bool;  // --capabilities=compat: kein seccomp/landlock trotz @capabilities
+  // #1526: Dieses Feld FEHLTE hier. `seccompTrap` gab es nur in CLIOptions —
+  // gearbeitet wird aber mit CompilerConfig. Sowohl das Setzen (--seccomp-trap)
+  // als auch das Lesen vor cg.Generate liefen damit auf ein Feld, das die
+  // Klasse nicht fuehrt, und blieben folgenlos: der Schalter meldete Erfolg und
+  // das Programm war byte-identisch.
+  seccompTrap: bool;  // #1348 / #1526
 
   // WP-T15: LCBS-Selbsttest
   selfTest: bool;  // --self-test
@@ -852,6 +859,15 @@ pub type CompilerConfig = class {
       } else if StrCmp(val, "arm_cm"c) == 0 {
         self.target := LYX_TC_ARM_CM;
         self.arch := LYX_TC_ARM_CM;
+      } else if StrCmp(val, "xtensa"c) == 0 || StrCmp(val, "esp32"c) == 0 {
+        // #1526: fehlte hier ganz — `--arch=xtensa` erzeugte still ein
+        // x86-64-ELF. Das Ziel gibt es (--target=esp32), nur die Abkuerzung
+        // ueber --arch kannte es nicht.
+        self.target := LYX_TC_XTENSA;
+        self.arch := LYX_TC_XTENSA;
+        self.format := FORMAT_ELF;
+      } else {
+        self._rejectWert("--arch"c, val as pchar, "x86_64, arm64, riscv64, arm_cm, xtensa"c);
       }
       return;
     }
@@ -889,6 +905,13 @@ pub type CompilerConfig = class {
         apiVal := apiVal * 10 + peek8(p) - 48;
         p += 1;
       }
+      // #1526: Nach oben war gar nichts geprueft — `--android-api=99` wurde
+      // klaglos angenommen und wanderte in .note.android.ident. Eine API-Stufe,
+      // die es nicht gibt, ist ein Tippfehler, kein Wunsch.
+      if apiVal > ANDROID_API_MAX {
+        self._rejectWert("--android-api"c, (arg + 14) as pchar, "21..36"c);
+        return;
+      }
       if apiVal >= ANDROID_API_MIN {
         self.androidApiLevel := apiVal;
       } else {
@@ -915,14 +938,36 @@ pub type CompilerConfig = class {
     }
     
     // --format=elf|pe|macho
+    // #1526: Hier wurde nur `self.format` gesetzt — das Ausgabeformat haengt
+    // aber am ZIEL, und das Ziel setzt `format` weiter unten selbst wieder auf
+    // seinen Wert. `--format=pe` erzeugte deshalb ein ELF, ohne jede Meldung.
+    // Ein Format ohne passendes Ziel gibt es nicht, also waehlt der Schalter
+    // jetzt das Ziel mit; wer ausserdem ein widersprechendes --target angibt,
+    // bekommt es gesagt statt still das eine oder andere zu verlieren.
     if StrStartsWith(arg, "--format=") {
       var val: int64 := arg + 9;
       if StrCmp(val, "elf"c) == 0 {
         self.format := FORMAT_ELF;
       } else if StrCmp(val, "pe"c) == 0 {
+        // target == 0 heisst "noch keins angegeben"; der Standard x86_64 wird
+        // erst nach dem Auswerten aller Argumente eingesetzt.
+        if self.target != 0 && self.target != LYX_TC_X86_64 && self.target != LYX_TC_WINDOWS_X86_64
+           && self.target != LYX_TC_WINDOWS_ARM64 {
+          self._rejectKonflikt("--format=pe"c, "windows-x86_64, windows-arm64"c);
+          return;
+        }
+        if self.target == 0 || self.target == LYX_TC_X86_64 { self.target := LYX_TC_WINDOWS_X86_64; }
         self.format := FORMAT_PE;
       } else if StrCmp(val, "macho"c) == 0 {
+        if self.target != 0 && self.target != LYX_TC_X86_64 && self.target != LYX_TC_MACOS_X86_64
+           && self.target != LYX_TC_MACOS_ARM64 {
+          self._rejectKonflikt("--format=macho"c, "macos-x86_64, macos-arm64"c);
+          return;
+        }
+        if self.target == 0 || self.target == LYX_TC_X86_64 { self.target := LYX_TC_MACOS_X86_64; }
         self.format := FORMAT_MACHO;
+      } else {
+        self._rejectWert("--format"c, val as pchar, "elf, pe, macho"c);
       }
       return;
     }
@@ -1084,8 +1129,12 @@ pub type CompilerConfig = class {
     }
     
     // WP-BC-43: --trace / --profile
+    // #1526: `traceEnabled` wurde gesetzt und NIE gelesen. Die Trace-Builtins
+    // (trace/trace_int/trace_str) arbeiten ohnehin ohne Schalter — der hier
+    // versprach eine Umschaltung, die es nicht gibt. Abgewiesen wie --profile,
+    // statt Erfolg zu melden.
     if StrCmp(arg, "--trace"c) == 0 {
-      self.traceEnabled := true;
+      self._rejectUnimplemented("--trace"c);
       return;
     }
     // #1348: SIGSYS aus KILL_PROCESS ist nicht diagnostizierbar — strace sieht
@@ -1202,7 +1251,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.0.20D"c);
+      PrintStrLn("1.0.20E"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1224,7 +1273,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.0.20D"c);
+      PrintStrLn("1.0.20E"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1241,8 +1290,16 @@ pub type CompilerConfig = class {
       PrintStrLn("");
       PrintStr("  Formats: elf, pe, macho"c);
       PrintStrLn("");
-      PrintStr("  Optimization: O0, O1, O2, O3, Osafe"c);
+      PrintStrLn("  Optimization: O0, O1, O2, O3, Osafe"c);
+      // #1527: Hier fehlten drei Dinge, die --version und --build-info direkt
+      // darueber richtig machen: der Zeilenumbruch nach der letzten Zeile
+      // (`Osafe` und die erste Hilfezeile verschmolzen), das Setzen von
+      // earlyExit (ohne das fiel der Lauf weiter in den Zweig "keine
+      // Eingabedatei" und haengte die ganze Hilfe an) und damit auch der
+      // Rueckgabewert — gemeldet wurde rc=1, obwohl der Schalter seine
+      // Aufgabe erfuellt hatte.
       self.exitCode := 0;
+      self.earlyExit := true;
       return;
     }
     
@@ -1380,6 +1437,32 @@ pub type CompilerConfig = class {
   // #1098/#1370: Ein Schalter, dessen Feld niemand liest, ist schlimmer als
   // ein unbekannter — der Benutzer glaubt, die Analyse laufe. Sechs Schalter
   // waren in diesem Zustand. Bis sie umgesetzt sind, sagen sie es.
+  // #1526: Ein unbekannter WERT hinter einem bekannten Schalter fiel bisher
+  // stumm durch: `--arch=xtensa` liess das Ziel auf x86-64 stehen und erzeugte
+  // ein x86-64-ELF, ohne ein Wort. Das ist derselbe stille Default wie ein
+  // Schalter ohne Wirkung, nur schlechter zu finden.
+  fn _rejectWert(name: pchar, wert: pchar, erlaubt: pchar) {
+    EPrintStr("lyxc: "c);
+    EPrintStr(name);
+    EPrintStr(": unbekannter Wert '"c);
+    EPrintStr(wert);
+    EPrintStrLn("'"c);
+    EPrintStr("  erlaubt: "c);
+    EPrintStrLn(erlaubt);
+    self.badArg := true;
+  }
+
+  // #1526: Format und Ziel koennen einander widersprechen — dann ist keine der
+  // beiden Angaben "unbekannt", sie passen nur nicht zusammen.
+  fn _rejectKonflikt(name: pchar, erlaubt: pchar) {
+    EPrintStr("lyxc: "c);
+    EPrintStr(name);
+    EPrintStrLn(" widerspricht dem gewaehlten --target"c);
+    EPrintStr("  passende Ziele: "c);
+    EPrintStrLn(erlaubt);
+    self.badArg := true;
+  }
+
   fn _rejectUnimplemented(name: pchar) {
     EPrintStr("lyxc: '"c);
     EPrintStr(name);
@@ -1389,7 +1472,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.0.20D (bootstrap)");
+    PrintStrLn("lyxc 1.0.20E (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -1418,7 +1501,7 @@ pub type CompilerConfig = class {
     PrintStrLn("  --no-lint              Linter-Warnungen deaktivieren");
     PrintStrLn("  --no-opt               IR-Optimierungen deaktivieren");
     PrintStrLn("  --debug                Debug-Info einbetten");
-    PrintStrLn("  --mcdc                 MC/DC-Instrumentierung fuer DO-178C Coverage");
+    PrintStrLn("  --mcdc                 MC/DC-Strukturanalyse (Uebersetzungszeit, keine Laufzeitmessung)");
     PrintStrLn("  --mcdc-report          MC/DC-Coverage-Bericht nach Kompilierung");
     PrintStrLn("  --static-analysis      Statische Analyse (Data-Flow, Live-Vars, Stack, ...)");
     PrintStrLn("  --call-graph           Statischer Aufrufgraph (WCET, Rekursions-Erkennung)");
@@ -1427,7 +1510,7 @@ pub type CompilerConfig = class {
     PrintStrLn("  --verify-tmr           Bilanz der @redundant-Zugriffe; Fehler, wenn einer am Voter vorbeigeht");
     PrintStrLn("  --profile              NICHT UMGESETZT (#1370) — wird abgewiesen");
     PrintStrLn("  --seccomp-trap         seccomp meldet SIGSYS mit Syscall-Nummer statt stumm zu toeten");
-    PrintStrLn("  --trace                Trace-Builtins: trace/trace_int/trace_str");
+    PrintStrLn("  --trace                (abgewiesen, #1526 — die Trace-Builtins arbeiten ohne Schalter)");
     PrintStrLn("  --provenance           Provenance Tracking: IR->AST->Source");
     PrintStrLn("  --ast-dump             AST-Visualisierung nach dem Parsen");
     PrintStrLn("  --symtab-dump          Symbol-Tabelle ausgeben");
@@ -1438,7 +1521,7 @@ pub type CompilerConfig = class {
     PrintStrLn("");
     PrintStrLn("Unit-Kompilierung:");
     PrintStrLn("  --compile-unit         Unit zu .lyu vorkompilieren (IR-Code)");
-    PrintStrLn("  --debug-symbols        Debug-Info in .lyu einbetten");
+    PrintStrLn("  --debug-symbols        Debug-Info ins Programm einbetten (.lyu: noch nicht, #1555)");
     PrintStrLn("  --unit-info <datei>    Info ueber .lyu-Datei anzeigen");
     PrintStrLn("  --include <hdr.h>      C-Header einlesen und extern-Deklarationen ausgeben");
     PrintStrLn("");
@@ -1610,6 +1693,14 @@ pub type CompilerConfig = class {
 
     // WP-BC-50: --compile-unit → serialise symbol table to .lyu and exit
     if self.compileUnit {
+      // #1526/#1555: Fuer ein ausfuehrbares Programm wirkt --debug-symbols
+      // (cg.debugMode), fuer .lyu nicht — das Unit-Format hat kein Feld dafuer.
+      // Abgewiesen wird der Schalter nicht, er tut anderswo, was er verspricht;
+      // aber still eine byte-identische Datei zu schreiben, waere das Gegenteil
+      // einer Antwort.
+      if self.debugSymbols && !self.quiet {
+        EPrintStrLn("warning: --debug-symbols wirkt nicht auf .lyu — das Unit-Format hat kein Feld dafuer (#1555)"c);
+      }
       var lyw: LyuWriter := new LyuWriter();
       lyw.LywInit();
       lyw.Serialize(inputFile, sema, LYU_ARCH_X86_64);
@@ -1782,6 +1873,31 @@ pub type CompilerConfig = class {
     // Wirkung. Sie schicken die Uebersetzung jetzt ueber die IR-Strecke, statt
     // zu schweigen — wie `--provenance` es hier schon immer tat.
     var _irNoetig: bool := self.provenance || self.dumpIR || self.irSourceMap;
+
+    // #1523: Die drei Schalter sind DIAGNOSE. Sie ueber die IR-Strecke zu
+    // schicken (#1098) hat zwar die Ausgabe gebracht, aber auch die
+    // Codeerzeugung mitgenommen: das erzeugte Programm lief nicht mehr, tat
+    // nichts und endete mit 42 — bei rc=0 und ohne jede Meldung. Ein Schalter,
+    // der beim Ansehen das Ergebnis kaputtmacht, ist schlimmer als einer ohne
+    // Wirkung.
+    //
+    // Also beides: die IR wird gebaut und ausgegeben, das Programm entsteht
+    // danach weiterhin auf dem bewaehrten Schnellweg. Fuer die Diagnose ist
+    // die IR-Strecke gut genug, fuer das Erzeugen ist sie es auf x86-64 nicht.
+    if _irNoetig && self.target == LYX_TC_X86_64 && self.outputType != OUTPUT_TYPE_SHARED_LIB {
+      var dMod: IRModule := new IRModule();
+      dMod.init();
+      dMod.irSourceMap := self.irSourceMap;
+      dMod.provenance  := self.provenance;
+      var dLower: IRLower := new IRLower();
+      dLower.init(dMod as int64, parser.nodes, parser.nodeCount, source, dMod);
+      dLower.target := self.target;
+      dLower.lowerModule(astRoot);
+      if self.dumpIR || self.irSourceMap { dMod.dump(); }
+      if self.provenance { self.dumpProvenance(dMod, parser.nodes, source, inputFile); }
+      _irNoetig := false;   // Diagnose erledigt — erzeugt wird auf dem Schnellweg
+    }
+
     if self.target == LYX_TC_X86_64 && !_irNoetig && self.outputType != OUTPUT_TYPE_SHARED_LIB {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.out"c; }
@@ -5008,7 +5124,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.0.20D — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.0.20E — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
