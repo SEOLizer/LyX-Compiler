@@ -54,29 +54,24 @@ pub fn get_log_level(): int64 {
 // Simple Log Functions (no helper function to avoid nesting issues)
 // ============================================================================
 
-pub fn log_debug(msg: pchar): void {
-  PrintLn("[DEBUG] ", msg);
-  invoke_log_callback(msg);
-}
-
-pub fn log_info(msg: pchar): void {
-  PrintLn("[INFO] ", msg);
-  invoke_log_callback(msg);
-}
-
-pub fn log_warn(msg: pchar): void {
-  PrintLn("[WARN] ", msg);
-  invoke_log_callback(msg);
-}
-
-pub fn log_error(msg: pchar): void {
-  PrintLn("[ERROR] ", msg);
-  invoke_log_callback(msg);
-}
+// #1437: Diese fuenf riefen `PrintLn` und umgingen damit die gesamte
+// Konfiguration der Unit — Level-Filter, Datei-Sink und Zeitstempel. Ein
+// Dienst mit `log_set_file("dienst.log")` hinterliess eine leere Datei,
+// waehrend die Zeilen auf stdout landeten.
+//
+// #1442: Umgekehrt rief NUR dieser Weg den Callback, `log_emit` nicht. Wer
+// korrekt ueber log_emit loggte, verlor die Weiterleitung; wer den Callback
+// brauchte, verlor Filter und Sink. Beides zusammen ging nicht.
+//
+// Es gibt jetzt genau EINEN Weg nach draussen: log_emit. Die Kurzfunktionen
+// sind Namen fuer ihre Stufe, sonst nichts.
+pub fn log_debug(msg: pchar): void { log_emit(LOG_LEVEL_DEBUG, msg); }
+pub fn log_info(msg: pchar): void  { log_emit(LOG_LEVEL_INFO,  msg); }
+pub fn log_warn(msg: pchar): void  { log_emit(LOG_LEVEL_WARN,  msg); }
+pub fn log_error(msg: pchar): void { log_emit(LOG_LEVEL_ERROR, msg); }
 
 pub fn log_fatal(msg: pchar): void {
-  PrintLn("[FATAL] ", msg);
-  invoke_log_callback(msg);
+  log_emit(LOG_LEVEL_FATAL, msg);
   exit(1);
 }
 
@@ -104,21 +99,61 @@ pub fn log_error_if(cond: bool, msg: pchar): void {
 // Section Logging
 // ============================================================================
 
+// #1441: Beide erzeugten dieselbe Zeile — im Log war nicht erkennbar, welche
+// der Eintritt und welche der Austritt war. Damit war der einzige Zweck der
+// beiden Funktionen verfehlt. Die Richtung steht jetzt voran, und die
+// Schachteltiefe ruecke ein, damit verschachtelte Abschnitte lesbar bleiben.
+var _log_section_depth: int64 := 0;
+
+fn _log_section_line(pfeil: pchar, name: pchar): void {
+  var nlen: int64 := StrLen(name);
+  var tiefe: int64 := _log_section_depth;
+  if (tiefe < 0) { tiefe := 0; }
+  if (tiefe > 16) { tiefe := 16; }
+  var b: int64 := alloc(nlen + tiefe * 2 + 4);
+  var pos: int64 := 0;
+  var i: int64 := 0;
+  while (i < tiefe) { poke8(b + pos, 32); poke8(b + pos + 1, 32); pos := pos + 2; i := i + 1; }
+  poke8(b + pos, StrCharAt(pfeil, 0)); pos := pos + 1;
+  poke8(b + pos, StrCharAt(pfeil, 1)); pos := pos + 1;
+  poke8(b + pos, 32); pos := pos + 1;
+  i := 0;
+  while (i < nlen) { poke8(b + pos, StrCharAt(name, i)); pos := pos + 1; i := i + 1; }
+  poke8(b + pos, 0);
+  log_emit(LOG_LEVEL_INFO, b as pchar);
+  free(b, nlen + tiefe * 2 + 4);
+}
+
 pub fn log_section_enter(name: pchar): void {
-  log_info(name);
+  _log_section_line("->", name);
+  _log_section_depth := _log_section_depth + 1;
 }
 
 pub fn log_section_exit(name: pchar): void {
-  log_info(name);
+  if (_log_section_depth > 0) { _log_section_depth := _log_section_depth - 1; }
+  _log_section_line("<-", name);
 }
 
 // ============================================================================
 // App Lifecycle
 // ============================================================================
 
+// #1441: `name` wurde verworfen — jede Anwendung meldete dieselbe Zeile
+// "Application started". Bei mehreren Diensten in einem Log war nicht zu
+// sehen, welcher startete.
 pub fn log_app_start(name: pchar): void {
   log_info("========================================");
-  log_info("Application started");
+  var nlen: int64 := StrLen(name);
+  var b: int64 := alloc(nlen + 24);
+  var vor: pchar := "Application started: ";
+  var pos: int64 := 0;
+  var i: int64 := 0;
+  while (StrCharAt(vor, i) != 0) { poke8(b + pos, StrCharAt(vor, i)); pos := pos + 1; i := i + 1; }
+  i := 0;
+  while (i < nlen) { poke8(b + pos, StrCharAt(name, i)); pos := pos + 1; i := i + 1; }
+  poke8(b + pos, 0);
+  log_info(b as pchar);
+  free(b, nlen + 24);
   log_info("========================================");
 }
 
@@ -195,12 +230,16 @@ pub fn log_set_timestamp(enabled: bool): void {
 }
 
 // ANSI-Farbcodes per Level
+// #1438: Hier standen OKTALE Escapes (`\033`). Lyx kennt die nicht — `\0`
+// wird als NUL gelesen, der String hat damit Laenge 0, und _log_write schrieb
+// null Bytes. `log_set_color(true)` erzeugte kein einziges ANSI-Zeichen.
+// Hexadezimal (`\x1b`) kennt der Lexer.
 fn _log_color_code(level: int64): pchar {
-  if (level == 0) { return "\033[36m"; }   // DEBUG  → Cyan
-  if (level == 1) { return "\033[32m"; }   // INFO   → Grün
-  if (level == 2) { return "\033[33m"; }   // WARN   → Gelb
-  if (level == 3) { return "\033[31m"; }   // ERROR  → Rot
-  return "\033[35m";                        // FATAL  → Magenta
+  if (level == 0) { return "\x1b[36m"; }   // DEBUG  → Cyan
+  if (level == 1) { return "\x1b[32m"; }   // INFO   → Gruen
+  if (level == 2) { return "\x1b[33m"; }   // WARN   → Gelb
+  if (level == 3) { return "\x1b[31m"; }   // ERROR  → Rot
+  return "\x1b[35m";                        // FATAL  → Magenta
 }
 
 // Schreibt null-terminated String auf _log_fd
@@ -235,11 +274,20 @@ pub fn log_emit(level: int64, msg: pchar): void {
   _log_write(log_level_to_string(level));
   _log_write("] ");
   _log_write(msg);
+
+  // #1438: Die Ruecksetzung stand hinter dem Zeilenumbruch und faerbte damit
+  // den Anfang der naechsten Zeile mit — sichtbar, sobald zwischen zwei
+  // Log-Zeilen etwas anderes schreibt. Sie gehoert vor den Umbruch.
+  if (_log_color != 0) {
+    _log_write("\x1b[0m");
+  }
   _log_write("\n");
 
-  if (_log_color != 0) {
-    _log_write("\033[0m");  // Reset
-  }
+  // #1442: Der Callback haengt jetzt HIER, am einen Ausgabeweg. Vorher rief
+  // ihn nur die Kurzfunktion, und log_emit — der laut Doku empfohlene Weg —
+  // gar nicht. Weitergereicht wird die Nachricht, nicht die formatierte Zeile:
+  // ein externes Log-System setzt seine eigene Form.
+  invoke_log_callback(msg);
 }
 
 // Hilfsfunktion: int64 → String direkt in einen Stack-Buffer schreiben
@@ -265,86 +313,120 @@ fn _log_strcpy(dest: int64, msg: pchar, mlen: int64): void {
   while (i < mlen) { poke8(dest + i, StrCharAt(msg, i)); i := i + 1; }
 }
 
-pub fn log_debugf(msg: pchar, n: int64): void {
-  if (_log_level > 0) { return; }
+// #1440: Alle vier Wrapper allokierten zwei Puffer und gaben keinen frei —
+// pro Aufruf gingen 22 + mlen + 24 Byte verloren. Ein Dienst, der im
+// Sekundentakt eine Zahl loggt, verlor rund 9 MB pro Tag.
+//
+// Der Rumpf lag ausserdem viermal fast gleich da; jetzt einmal. log_errorf
+// hatte als einziger keinen Level-Filter — auch das faellt damit weg.
+fn _log_mitZahl(level: int64, msg: pchar, n: int64): void {
+  if (level < _log_level) { return; }
   var mlen: int64 := StrLen(msg);
-  var buf: int64 := alloc(22);
-  Int64ToStrBuf(n, buf);
-  var combined: int64 := alloc(mlen + 24);
+  var zbuf: int64 := alloc(22);
+  Int64ToStrBuf(n, zbuf);
+  var gesamt: int64 := mlen + 24;
+  var combined: int64 := alloc(gesamt);
   _log_strcpy(combined, msg, mlen);
   var i: int64 := 0;
-  while (peek8(buf + i) != 0) { poke8(combined + mlen + i, peek8(buf + i)); i := i + 1; }
+  while (peek8(zbuf + i) != 0) { poke8(combined + mlen + i, peek8(zbuf + i)); i := i + 1; }
   poke8(combined + mlen + i, 0);
-  log_emit(0, combined as pchar);
+  log_emit(level, combined as pchar);
+  free(combined, gesamt);
+  free(zbuf, 22);
 }
 
-pub fn log_infof(msg: pchar, n: int64): void {
-  if (_log_level > 1) { return; }
-  var mlen: int64 := StrLen(msg);
-  var buf: int64 := alloc(22);
-  Int64ToStrBuf(n, buf);
-  var combined: int64 := alloc(mlen + 24);
-  _log_strcpy(combined, msg, mlen);
-  var i: int64 := 0;
-  while (peek8(buf + i) != 0) { poke8(combined + mlen + i, peek8(buf + i)); i := i + 1; }
-  poke8(combined + mlen + i, 0);
-  log_emit(1, combined as pchar);
-}
+pub fn log_debugf(msg: pchar, n: int64): void { _log_mitZahl(LOG_LEVEL_DEBUG, msg, n); }
+pub fn log_infof(msg: pchar, n: int64): void  { _log_mitZahl(LOG_LEVEL_INFO,  msg, n); }
+pub fn log_warnf(msg: pchar, n: int64): void  { _log_mitZahl(LOG_LEVEL_WARN,  msg, n); }
+pub fn log_errorf(msg: pchar, n: int64): void { _log_mitZahl(LOG_LEVEL_ERROR, msg, n); }
 
-pub fn log_warnf(msg: pchar, n: int64): void {
-  if (_log_level > 2) { return; }
-  var mlen: int64 := StrLen(msg);
-  var buf: int64 := alloc(22);
-  Int64ToStrBuf(n, buf);
-  var combined: int64 := alloc(mlen + 24);
-  _log_strcpy(combined, msg, mlen);
-  var i: int64 := 0;
-  while (peek8(buf + i) != 0) { poke8(combined + mlen + i, peek8(buf + i)); i := i + 1; }
-  poke8(combined + mlen + i, 0);
-  log_emit(2, combined as pchar);
-}
-
-pub fn log_errorf(msg: pchar, n: int64): void {
-  var mlen: int64 := StrLen(msg);
-  var buf: int64 := alloc(22);
-  Int64ToStrBuf(n, buf);
-  var combined: int64 := alloc(mlen + 24);
-  _log_strcpy(combined, msg, mlen);
-  var i: int64 := 0;
-  while (peek8(buf + i) != 0) { poke8(combined + mlen + i, peek8(buf + i)); i := i + 1; }
-  poke8(combined + mlen + i, 0);
-  log_emit(3, combined as pchar);
-}
-
-// Schreibt eine JSON-strukturierte Zeile in den konfigurierten Log-Sink:
+// #1439: Zwei Fehler in einer Funktion, deren einziger Zweck maschinenlesbare
+// Ausgabe ist.
+//
+// (1) event, key und value wurden ROH zwischen die Anfuehrungszeichen kopiert.
+//     Ein `"` im Wert zerstoerte die Zeile; dasselbe gilt fuer Backslash,
+//     Zeilenumbruch und alle Steuerzeichen unter 0x20, die RFC 8259 escaped
+//     verlangt. Der Quelltext nannte das eine bewusste Einschraenkung — still
+//     kaputtes JSON ist aber die schlechtere Wahl gegenueber richtigem
+//     Escaping.
+// (2) Der Level-Filter wurde uebergangen: bei set_log_level(LOG_LEVEL_FATAL)
+//     erschien die Zeile trotzdem.
+//
+// Schreibt eine JSON-Zeile in den konfigurierten Sink:
 //   {"level":"info","event":"<event>","<key>":"<value>"}
-// Escaping: nur den Grundfall (keine verschachtelten Anführungszeichen in Strings).
+
+// Laenge des Textes NACH dem Escapen — damit der Puffer passt, statt zu raten.
+fn _log_jsonLen(s: pchar): int64 {
+  var n: int64 := StrLen(s);
+  var i: int64 := 0;
+  var len: int64 := 0;
+  while (i < n) {
+    var c: int64 := StrCharAt(s, i) & 255;
+    if (c == 34 || c == 92) { len := len + 2; }
+    else if (c == 8 || c == 9 || c == 10 || c == 12 || c == 13) { len := len + 2; }
+    else if (c < 32) { len := len + 6; }    // \u00XX
+    else { len := len + 1; }
+    i := i + 1;
+  }
+  return len;
+}
+
+fn _log_hexZiffer(v: int64): int64 {
+  if (v < 10) { return 48 + v; }
+  return 97 + v - 10;
+}
+
+// Schreibt s escaped nach b+pos und liefert die neue Position.
+fn _log_jsonEsc(b: int64, pos: int64, s: pchar): int64 {
+  var n: int64 := StrLen(s);
+  var i: int64 := 0;
+  var p: int64 := pos;
+  while (i < n) {
+    var c: int64 := StrCharAt(s, i) & 255;
+    if (c == 34)      { poke8(b + p, 92); poke8(b + p + 1, 34);  p := p + 2; }
+    else if (c == 92) { poke8(b + p, 92); poke8(b + p + 1, 92);  p := p + 2; }
+    else if (c == 8)  { poke8(b + p, 92); poke8(b + p + 1, 98);  p := p + 2; }   // \b
+    else if (c == 9)  { poke8(b + p, 92); poke8(b + p + 1, 116); p := p + 2; }   // \t
+    else if (c == 10) { poke8(b + p, 92); poke8(b + p + 1, 110); p := p + 2; }   // \n
+    else if (c == 12) { poke8(b + p, 92); poke8(b + p + 1, 102); p := p + 2; }   // \f
+    else if (c == 13) { poke8(b + p, 92); poke8(b + p + 1, 114); p := p + 2; }   // \r
+    else if (c < 32) {
+      poke8(b + p, 92); poke8(b + p + 1, 117);                                   // \u
+      poke8(b + p + 2, 48); poke8(b + p + 3, 48);                                // 00
+      poke8(b + p + 4, _log_hexZiffer((c >> 4) & 15));
+      poke8(b + p + 5, _log_hexZiffer(c & 15));
+      p := p + 6;
+    } else {
+      poke8(b + p, c); p := p + 1;
+    }
+    i := i + 1;
+  }
+  return p;
+}
+
+fn _log_roh(b: int64, pos: int64, s: pchar): int64 {
+  var p: int64 := pos;
+  var i: int64 := 0;
+  while (StrCharAt(s, i) != 0) { poke8(b + p, StrCharAt(s, i)); p := p + 1; i := i + 1; }
+  return p;
+}
+
 pub fn log_info_kv(event: pchar, key: pchar, value: pchar): void {
-  var elen: int64 := StrLen(event);
-  var klen: int64 := StrLen(key);
-  var vlen: int64 := StrLen(value);
-  // Puffer: {"level":"info","event":"<e>","<k>":"<v>"}\n + NUL
-  var bsize: int64 := 30 + elen + klen + vlen + 10;
+  if (LOG_LEVEL_INFO < _log_level) { return; }   // #1439
+  var bsize: int64 := 40 + _log_jsonLen(event) + _log_jsonLen(key) + _log_jsonLen(value);
   var b: int64 := alloc(bsize);
   var pos: int64 := 0;
-  // {"level":"info","event":"
-  var prefix: pchar := "{\"level\":\"info\",\"event\":\"";
-  var i: int64 := 0;
-  while (peek8(prefix as int64 + i) != 0) { poke8(b + pos, peek8(prefix as int64 + i)); pos := pos + 1; i := i + 1; }
-  i := 0; while (i < elen)  { poke8(b + pos, peek8(event as int64 + i)); pos := pos + 1; i := i + 1; }
-  poke8(b + pos, 34); pos := pos + 1; // "
-  poke8(b + pos, 44); pos := pos + 1; // ,
-  poke8(b + pos, 34); pos := pos + 1; // "
-  i := 0; while (i < klen)  { poke8(b + pos, peek8(key   as int64 + i)); pos := pos + 1; i := i + 1; }
-  poke8(b + pos, 34); pos := pos + 1; // "
-  poke8(b + pos, 58); pos := pos + 1; // :
-  poke8(b + pos, 34); pos := pos + 1; // "
-  i := 0; while (i < vlen)  { poke8(b + pos, peek8(value as int64 + i)); pos := pos + 1; i := i + 1; }
-  poke8(b + pos, 34); pos := pos + 1; // "
-  poke8(b + pos, 125); pos := pos + 1; // }
+  pos := _log_roh(b, pos, "{\"level\":\"info\",\"event\":\"");
+  pos := _log_jsonEsc(b, pos, event);
+  pos := _log_roh(b, pos, "\",\"");
+  pos := _log_jsonEsc(b, pos, key);
+  pos := _log_roh(b, pos, "\":\"");
+  pos := _log_jsonEsc(b, pos, value);
+  pos := _log_roh(b, pos, "\"}");
   poke8(b + pos, 0);
   _log_write(b as pchar);
   _log_write("\n");
+  invoke_log_callback(b as pchar);   // #1442: auch dieser Weg meldet weiter
   free(b, bsize);
 }
 

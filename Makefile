@@ -227,6 +227,7 @@ test: lyxc
 	@bash tests/lfd_grammatik_test.sh
 	@bash tests/lfd_parser_test.sh
 	@bash tests/ref_parameter_test.sh
+	@bash tests/log_z4_test.sh
 	@bash tests/sprachluecken_z5_test.sh
 	@bash tests/type_inference_test.sh
 	@bash tests/struct_method_test.sh
