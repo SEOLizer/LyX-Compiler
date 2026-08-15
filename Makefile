@@ -477,6 +477,9 @@ test: lyxc
 	@echo "--- Struct als Feld, Wertsemantik, Feld-Array mit Klassen (13 Pruefungen) ---"
 	@bash tests/struct_inline_wert_test.sh
 	@echo "OK"
+	@echo "--- std.math: Festkomma-Skalierung und Raender (14 Pruefungen) ---"
+	@bash tests/math_festkomma_test.sh
+	@echo "OK"
 	@echo "--- f64-Typspur: Vorzeichen, con, Feld-Array, kleine Literale (11 Pruefungen) ---"
 	@bash tests/f64_typspur_test.sh
 	@echo "OK"
