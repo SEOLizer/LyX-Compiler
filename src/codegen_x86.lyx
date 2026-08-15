@@ -491,6 +491,12 @@ pub type Codegen = class {
   conCount:   int64;
   conCap:     int64;
   conIsPchar: int64;  // byte buffer parallel to conTable: 1 = pchar string constant
+  // #1499: dasselbe fuer Gleitkomma. Eine `con PI: f64 := 3.14159` steht in
+  // derselben Tabelle wie jede andere Konstante — mit den IEEE-Bits als Wert.
+  // Ohne diese Merkung galt sie als Ganzzahl, und `p * PI` multiplizierte zwei
+  // Bitmuster. Der Wert war die ganze Zeit richtig; nur wusste niemand, was er
+  // bedeutet.
+  conIsF64: int64;
 
   // Break support: linked list of pending jmp-rel32 placeholders in code buffer.
   // curBreakHead holds the code offset of the most recent break's 4-byte placeholder,
@@ -1819,14 +1825,17 @@ pub type Codegen = class {
       var nb: int64 := alloc(nc * CG_CON_SZ);
       var np: int64 := alloc(nc);
       memcpy(nb, self.conTable, self.conCount * CG_CON_SZ);
+      var nf: int64 := alloc(nc);
       memcpy(np, self.conIsPchar, self.conCount);
-      self.conTable := nb; self.conCap := nc; self.conIsPchar := np;
+      memcpy(nf, self.conIsF64, self.conCount);
+      self.conTable := nb; self.conCap := nc; self.conIsPchar := np; self.conIsF64 := nf;
     }
     var base: int64 := self.conTable + self.conCount * CG_CON_SZ;
     poke64(base,                       name as int64);
     poke64(base + CG_CON_OFF_NAMELEN,  nlen);
     poke64(base + CG_CON_OFF_VAL,      val);
     poke8(self.conIsPchar + self.conCount, 0);
+    poke8(self.conIsF64 + self.conCount, 0);
     self.conCount += 1;
   }
 
@@ -2087,6 +2096,12 @@ pub type Codegen = class {
   fn cg_tryFold(ni: int64): int64 {
     if (ni < 0) { return 0; }
     if (self.optLevel == 0) { return 0; }
+    // #1499: GLEITKOMMA wird hier nicht gefaltet. Die Faltung rechnet
+    // ganzzahlig; auf zwei f64-Konstanten losgelassen, teilte sie deren
+    // IEEE-Bitmuster durcheinander — `PI / ZWEI` ergab 0. Fuer Gleitkomma
+    // emittiert der Codegen die richtige Rechnung, er darf nur nicht vorher
+    // ueberholt werden.
+    if (self.cg_isF64Expr(ni) != 0) { return 0; }
     var k: int64 := self.cg_nkind(ni);
     // Integer / bool literal
     if (k == CGN_LIT_INT || k == CGN_LIT_BOOL) {
@@ -3197,6 +3212,10 @@ pub type Codegen = class {
     // Negative exp: multiply d by 10; halve both n and d to prevent d overflow.
     var n: int64 := num;
     var d: int64 := den;
+    // #1478: gemeinsame Zehnerfaktoren vorweg kuerzen. `1.0e-27` kommt als
+    // 10/10 herein — gekuerzt 1/1 bleibt dem Nenner der ganze Spielraum fuer
+    // die Skalierung. Ohne das ist er schon belegt, bevor die Rechnung anfaengt.
+    while ((n % 10) == 0 && (d % 10) == 0 && d > 1) { n := n / 10; d := d / 10; }
     var binExp: int64 := 0;
     if (expNeg == 0) {
       while (ej < expVal) {
@@ -3208,13 +3227,36 @@ pub type Codegen = class {
         ej += 1;
       }
     } else {
+      // #1478: Hier wurde der Nenner mit 10 multipliziert und der ZAEHLER dabei
+      // halbiert, sobald der Nenner an die Grenze kam. Bei einer kleinen
+      // Mantisse ist der Zaehler aber winzig — er lief auf 0, und die Funktion
+      // gab 0 zurueck: jedes Literal unterhalb von etwa 1e-18 wurde still zu
+      // null.
+      //
+      // 10 ist 5 mal 2, und der Faktor 2 kostet nichts: er wandert in den
+      // BINAEREXPONENTEN, den die Normalisierung darunter ohnehin fuehrt. Der
+      // Nenner waechst damit je Schritt nur noch um 5 statt um 10 und traegt
+      // bis etwa 1e-27 exakt. Erst darueber hinaus bleibt der alte Weg —
+      // dort ist der Wert ohnehin denormal.
       while (ej < expVal) {
-        while (d > 922337203685477580) {
+        // Wird der Nenner zu gross, wandern seine Zweierfaktoren ebenfalls in
+        // den Binaerexponenten — der Vorlauf hat ihn mit 10 hochgezogen, die
+        // Haelfte davon ist entbehrlich.
+        while (d > 1844674407370955161 && (d % 2) == 0) {
           d := d / 2;
-          n := n / 2;
+          binExp := binExp - 1;
         }
-        d := d * 10;
-        if (n == 0) { return 0; }
+        if (d <= 1844674407370955161) {
+          d := d * 5;
+          binExp := binExp - 1;
+        } else {
+          while (d > 922337203685477580) {
+            d := d / 2;
+            n := n / 2;
+          }
+          d := d * 10;
+          if (n == 0) { return 0; }
+        }
         ej += 1;
       }
     }
@@ -3436,6 +3478,13 @@ pub type Codegen = class {
   }
 
   fn cg_isF64Func(name: pchar, nameLen: int64): int64 {
+    // #1502: die EINGEBAUTEN Gleitkommaquellen. Die Liste darunter fuehrt nur
+    // Benutzerfunktionen mit deklariertem f64-Rueckgabetyp; `peekf64` und
+    // Verwandte stehen nirgends. Ohne sie galt `var v: f64 := peekf64(t);` als
+    // Ganzzahlzuweisung — und die Umrechnung, die #1502 dort einfuehrt, machte
+    // aus dem Bitmuster eine Zahl (std.pack lieferte 4.6e18 statt 3.5).
+    if (self.cg_seq(name, nameLen, "peekf64"c, 7)) { return 1; }
+    if (self.cg_seq(name, nameLen, "peekf32"c, 7)) { return 1; }
     var i: int64 := 0;
     while (i < self.f64FuncCount) {
       var base: int64 := self.f64FuncList + i * 16;
@@ -3912,10 +3961,49 @@ pub type Codegen = class {
   // Typdarstellung zu erfinden, die es an dieser Stelle nicht gibt.
   fn cg_isF64ElemOf(baseNi: int64): int64 {
     if (baseNi < 0) { return 0; }
+    // #1498: der Grundausdruck darf auch ein FELD sein — `s.e[0]` bei
+    // `e: [2]f64`. Bis hierher sah die Funktion nur Locals; ein Feld-Array
+    // lieferte deshalb 0, und `s.e[0] + s.e[1]` addierte Bitmuster (nan).
+    if (self.cg_nkind(baseNi) == CGN_FIELD) {
+      var fbox2: int64 := alloc(8);
+      var etp: pchar := self.cg_fieldElemTypeNameOf(baseNi, fbox2);
+      var etl: int64 := peek64(fbox2);
+      free(fbox2, 8);
+      if (etp != 0 as pchar && etl > 0) { return self.cg_isFloatTypeName(etp, etl); }
+      return 0;
+    }
     if (self.cg_nkind(baseNi) != CGN_IDENT) { return 0; }
     var li: int64 := self.cg_findLocalIdx(self.cg_nsval(baseNi), self.cg_nslen(baseNi));
     if (li < 0) { return 0; }
     return peek8(self.localElemFloat + li) as int64;
+  }
+
+  // #1498: Elementtypname eines inline liegenden Feld-Arrays. Der Name steht
+  // seit #1493 im Feldeintrag (CG_CFIELD_OFF_ELEMTYPEPTR).
+  fn cg_fieldElemTypeNameOf(fieldNi: int64, lenBox: int64): pchar {
+    poke64(lenBox, 0);
+    if (self.cg_nkind(fieldNi) != CGN_FIELD) { return 0 as pchar; }
+    var ci: int64 := self.cg_objClassIdx(self.cg_nc0(fieldNi));
+    if (ci < 0) { return 0 as pchar; }
+    var base: int64 := self.classLayouts + ci * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+    var fname: pchar := self.cg_nsval(fieldNi);
+    var flen:  int64 := self.cg_nslen(fieldNi);
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      if (peek64(fb + CG_CFIELD_OFF_FIELDLEN) == flen
+          && self.cg_seq(peek64(fb) as pchar, flen, fname, flen)) {
+        var ep: pchar := peek64(fb + CG_CFIELD_OFF_ELEMTYPEPTR) as pchar;
+        var el: int64 := peek64(fb + CG_CFIELD_OFF_ELEMTYPELEN);
+        if (ep == 0 as pchar || el <= 0) { return 0 as pchar; }
+        poke64(lenBox, el);
+        return ep;
+      }
+      i += 1;
+    }
+    return 0 as pchar;
   }
 
   // Returns 1 if expression ni produces an f64 value (IEEE-754 bits in GP register).
@@ -3944,6 +4032,11 @@ pub type Codegen = class {
         if (gp == 0 as pchar || gl <= 0) { return 0; }
         return self.cg_isFloatTypeName(gp, gl);
       }
+      // #1499: eine benannte KONSTANTE. Sie steht weder unter den Locals noch
+      // unter den Globalen — ohne diesen Zweig galt jede f64-Konstante als
+      // Ganzzahl.
+      var conIdx: int64 := self.cg_findConIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (conIdx >= 0) { return peek8(self.conIsF64 + conIdx) as int64; }
       return 0;
     }
     // #1374: das ARRAY-ELEMENT. `arr[0]` mit `arr: [3]f64` galt ebenfalls als
@@ -3951,6 +4044,14 @@ pub type Codegen = class {
     // ein Fliesskommatyp, traegt auch das Element einen.
     if k == CGN_INDEX {
       return self.cg_isF64ElemOf(self.cg_nc0(ni));
+    }
+    // #1512/#1496: das unaere Minus. `-a` und `-2.0` galten als Ganzzahl, also
+    // rechnete `-a - b` auf den Bitmustern. Das Vorzeichen aendert den TYP
+    // nicht — massgeblich ist der Operand.
+    if k == CGN_UNOP {
+      var uop: int64 := self.cg_nival(ni);
+      if (uop == CGT_MINUS) { return self.cg_isF64Expr(self.cg_nc0(ni)); }
+      return 0;
     }
     if k == CGN_BINOP {
       var bop: int64 := self.cg_nival(ni);
@@ -7890,7 +7991,14 @@ pub type Codegen = class {
         // nichts, `x as i8` schon — obwohl §7 beide als denselben Typ fuehrt.
         self.cg_emitNarrowRax(self.cg_narrowKindOf(tname, tlen));
         // f64: convert int64 bits in rax to IEEE 754 double via cvtsi2sd
-        if (self.cg_isFloatTypeName(tname, tlen)) {   // #1127: `as f32` ebenso
+        //
+        // #1511: NUR wenn die Quelle eine Ganzzahl ist. Steht links schon ein
+        // Gleitkommawert, ist `a as f64` eine Umdeutung ohne Rechnung — die
+        // Umwandlung nahm stattdessen die IEEE-Bits als Zahl: aus 4.0 wurde
+        // 4616189618054758400. Intern fuehrt Lyx f32 als f64-Bits (#1127),
+        // deshalb gilt das fuer beide Richtungen zwischen f32 und f64.
+        if (self.cg_isFloatTypeName(tname, tlen)
+            && self.cg_isF64Expr(self.cg_nc0(ni)) == 0) {
           // cvtsi2sd xmm0, rax  (F2 48 0F 2A C0)
           self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xC0);
           // movq rax, xmm0      (66 48 0F 7E C0)
@@ -8371,6 +8479,18 @@ pub type Codegen = class {
     if (k == CGN_LIT_STR)  { return 1; }
     if (k == CGN_LIT_FLOAT) { return 2; }
     if (k == CGN_LIT_BOOL)  { return 3; }
+    // #1497: ein RECHENAUSDRUCK. Diese Funktion kannte Literale, Bezeichner,
+    // Felder und Aufrufe — aber nicht `a + b`. `PrintLn(a + b)` gab deshalb die
+    // IEEE-Bits als Ganzzahl aus (4618441417868443648 statt 6.00), obwohl die
+    // Rechnung selbst stimmte.
+    //
+    // Entschieden wird das ueber DIESELBE Typspur, die auch der Codegen
+    // benutzt (cg_isF64Expr) — eine zweite, eigene Meinung darueber, was
+    // Gleitkomma ist, waere genau die Sorte Abweichung, aus der solche Fehler
+    // entstehen.
+    if (k == CGN_BINOP || k == CGN_UNOP || k == CGN_INDEX || k == CGN_CAST) {
+      if (self.cg_isF64Expr(argNi) != 0) { return 2; }
+    }
     // #1058: Ergebnis eines AUFRUFS. Bisher kannte die Funktion nur Literale und
     // Bezeichner; ein CGN_CALL fiel auf 0 und wurde als Ganzzahl ausgegeben —
     // `PrintLn(StrFromInt(42))` gab den Zeiger aus. Zuerst der deklarierte
@@ -12534,6 +12654,16 @@ pub type Codegen = class {
           if (self.cg_typeIstWertStruct(typeNode) != 0
               && initKind != CGN_CAST && initKind != CGN_NEW) {
             self.cg_emitStructKopie(self.cg_inlineStructBytes(typeNode));
+          }
+          // #1502: `var x: f64 := 1;` — die rechte Seite ist eine GANZZAHL, die
+          // Variable ein Gleitkommawert. Bis hierher landete die 1 als
+          // Bitmuster im Slot und wurde als double gelesen: 4,9e-324, formatiert
+          // 0.00. Der Typ steht links und ist eindeutig; hier wird umgerechnet,
+          // wie es der Cast `1 as f64` auch tut.
+          if (typeNode >= 0 && self.cg_nkind(typeNode) == 60
+              && self.cg_isFloatTypeName(self.cg_nsval(typeNode), self.cg_nslen(typeNode)) != 0
+              && self.cg_isF64Expr(init) == 0) {
+            self.cg_emitRaxIntToF64();
           }
         }
       } else if (mapNoInit != 0) {
@@ -17064,6 +17194,17 @@ pub type Codegen = class {
               }
             } else {
               self.cg_addCon(self.cg_nsval(cur), self.cg_nslen(cur), self.cg_evalConExpr(initNode));
+              // #1499: Gleitkomma merken — entweder steht es am Typ
+              // (`con PI: f64 := …`) oder der Wert ist ein Fliesskommaliteral.
+              var conF64: int64 := 0;
+              var conTy: int64 := self.cg_nc0(cur);
+              if (conTy >= 0 && self.cg_nkind(conTy) == 60
+                  && self.cg_isFloatTypeName(self.cg_nsval(conTy), self.cg_nslen(conTy)) != 0) { conF64 := 1; }
+              if (self.cg_nkind(initNode) == CGN_LIT_FLOAT) { conF64 := 1; }
+              if (conF64 != 0) {
+                var ci: int64 := self.cg_findConIdx(self.cg_nsval(cur), self.cg_nslen(cur));
+                if (ci >= 0) { poke8(self.conIsF64 + ci, 1); }
+              }
             }
           }
         } else if (k == CGN_ENUM_DECL) {
@@ -17551,6 +17692,7 @@ pub type Codegen = class {
     self.conTable   := alloc(self.conCap * CG_CON_SZ);
     self.conCount   := 0;
     self.conIsPchar := alloc(self.conCap);
+    self.conIsF64   := alloc(self.conCap);   // #1499
 
     // Break linked list: no pending breaks initially
     self.curBreakHead := -1;
