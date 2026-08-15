@@ -144,73 +144,86 @@ pub fn IntToOct(val: int64, digits: int64): pchar {
 // Parse Hex String to Integer
 // ============================================================================
 
-pub fn ParseHex(s: pchar): int64 {
-  var result: int64 := 0;
-  var i: int64 := 0;
+// #1500: Die drei Parser hatten keinen Fehlerkanal — und behandelten
+// Stoerzeichen nicht einmal einheitlich. `ParseHex("12 34")` lieferte 4660,
+// also den Wert von `1234`: das Leerzeichen wurde UEBERSPRUNGEN, die Eingabe
+// war so nie gemeint. `ParseHex("ZZ")` und `ParseHex("0")` lieferten beide 0
+// und waren nicht unterscheidbar.
+//
+// Gelesen wird jetzt streng: ein erlaubtes Praefix (0x/0b/0o), danach nur
+// Ziffern der jeweiligen Basis, mindestens eine, und nichts dahinter. Jede
+// Abweichung ist ein Fehler — nicht mal Abbruch, mal Ueberspringen.
+//
+// Die Ex-Form meldet ueber einen Ausgabeparameter, wie GetTimeOfDay in
+// std.time. Die kurze Form bleibt fuer den Fall, dass die Eingabe als sicher
+// gilt; sie liefert bei Fehler 0.
+fn _ziffernWert(c: int64, basis: int64): int64 {
+  var d: int64 := 0 - 1;
+  if (c >= 48 && c <= 57) { d := c - 48; }            // '0'-'9'
+  if (c >= 97 && c <= 102) { d := c - 97 + 10; }      // 'a'-'f'
+  if (c >= 65 && c <= 70) { d := c - 65 + 10; }       // 'A'-'F'
+  if (d < 0) { return 0 - 1; }
+  if (d >= basis) { return 0 - 1; }
+  return d;
+}
+
+// basis: 2, 8 oder 16. praefix: der Kleinbuchstabe nach der fuehrenden Null
+// ('x', 'b', 'o'); 0 heisst "kein Praefix erlaubt".
+fn _parseBasis(s: pchar, basis: int64, praefix: int64, okOut: int64): int64 {
+  if (okOut != 0) { poke64(okOut, 0); }
   var len: int64 := StrLen(s);
-  
-  while (i < len) {
-    var c: int64 := StrCharAt(s, i);
-    var digit: int64 := CharToHexDigit(c);
-    
-    if (digit < 0) {
-      // Skip non-hex characters (0x prefix, spaces, etc.)
-      i += 1;
-    } else {
-      result := (result << 4) + digit;
-      i += 1;
+  if (len == 0) { return 0; }
+  var i: int64 := 0;
+  if (praefix != 0 && len > 2) {
+    if (StrCharAt(s, 0) == 48) {
+      var p: int64 := StrCharAt(s, 1);
+      if (p == praefix || p == praefix - 32) { i := 2; }
     }
   }
-  
+  var result: int64 := 0;
+  var ziffern: int64 := 0;
+  while (i < len) {
+    var d: int64 := _ziffernWert(StrCharAt(s, i), basis);
+    if (d < 0) { return 0; }          // Stoerzeichen: kein Ueberspringen mehr
+    result := result * basis + d;
+    ziffern += 1;
+    i += 1;
+  }
+  if (ziffern == 0) { return 0; }     // nur ein Praefix ist keine Zahl
+  if (okOut != 0) { poke64(okOut, 1); }
   return result;
+}
+
+pub fn ParseHexEx(s: pchar, okOut: int64): int64 {
+  return _parseBasis(s, 16, 120, okOut);   // 'x'
+}
+
+pub fn ParseHex(s: pchar): int64 {
+  return _parseBasis(s, 16, 120, 0);
 }
 
 // ============================================================================
 // Parse Binary String to Integer
 // ============================================================================
 
+pub fn ParseBinEx(s: pchar, okOut: int64): int64 {
+  return _parseBasis(s, 2, 98, okOut);     // 'b'
+}
+
 pub fn ParseBin(s: pchar): int64 {
-  var result: int64 := 0;
-  var i: int64 := 0;
-  var len: int64 := StrLen(s);
-  
-  while (i < len) {
-    var c: int64 := StrCharAt(s, i);
-    var digit: int64 := CharToBinDigit(c);
-    
-    if (digit < 0) {
-      // Skip non-binary characters
-      i += 1;
-    } else {
-      result := (result << 1) + digit;
-      i += 1;
-    }
-  }
-  
-  return result;
+  return _parseBasis(s, 2, 98, 0);
 }
 
 // ============================================================================
 // Parse Octal String to Integer
 // ============================================================================
 
+pub fn ParseOctEx(s: pchar, okOut: int64): int64 {
+  return _parseBasis(s, 8, 111, okOut);    // 'o'
+}
+
 pub fn ParseOct(s: pchar): int64 {
-  var result: int64 := 0;
-  var i: int64 := 0;
-  var len: int64 := StrLen(s);
-  
-  while (i < len) {
-    var c: int64 := StrCharAt(s, i);
-    
-    if (c >= 48 && c <= 55) {  // '0'-'7'
-      result := (result << 3) + (c - 48);
-      i += 1;
-    } else {
-      i += 1;
-    }
-  }
-  
-  return result;
+  return _parseBasis(s, 8, 111, 0);
 }
 
 // ============================================================================
@@ -351,18 +364,30 @@ pub fn SetByte(val: int64, byte_pos: int64, byte_val: int64): int64 {
 // Rotate Bits
 // ============================================================================
 
+// #1495: `val << count` schob Bits ueber die 32-Bit-Grenze hinaus, wo sie im
+// int64 stehen blieben statt herauszufallen — das Ergebnis war groesser als
+// 0xFFFFFFFF und keine gueltige 32-Bit-Rotation mehr. Beide Richtungen
+// arbeiten jetzt auf einem auf 32 Bit beschnittenen Eingangswert und
+// beschneiden auch das Ergebnis.
+//
+// count == 0 braucht einen eigenen Zweig: `x >> 32` bzw. `x << 32` waere zwar
+// hier definiert, aber `(1 << 0) - 1` ist 0 und wuerde die Haelfte loeschen.
 pub fn RotateLeft32(val: int64, n: int64): int64 {
   var count: int64 := n & 31;
-  var high: int64 := (val as uint64) >> (32 - count);   // #1125: Rotation auf dem Bitmuster
-  var low: int64 := val << count;
-  return (high & ((1 << count) - 1)) | low;
+  var v: int64 := val & 0xFFFFFFFF;
+  if (count == 0) { return v; }
+  var low: int64 := (v << count) & 0xFFFFFFFF;
+  var high: int64 := v >> (32 - count);
+  return low | high;
 }
 
 pub fn RotateRight32(val: int64, n: int64): int64 {
   var count: int64 := n & 31;
-  var low: int64 := val & ((1 << count) - 1);
-  var high: int64 := (val as uint64) >> count;          // #1125: Rotation auf dem Bitmuster
-  return (low << (32 - count)) | high;
+  var v: int64 := val & 0xFFFFFFFF;
+  if (count == 0) { return v; }
+  var high: int64 := v >> count;
+  var low: int64 := (v << (32 - count)) & 0xFFFFFFFF;
+  return low | high;
 }
 
 // ============================================================================
