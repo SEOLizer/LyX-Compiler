@@ -61,8 +61,30 @@ type S = struct { a: uint8; b: uint8; c: uint8; };')" '1 2 3 0 0 0 '
 out "@packed auf struct-Form" "$(printf "$bytes_body" '@packed
 struct S { a: uint8; b: uint8; c: uint8; }')" '1 2 3 0 0 0 '
 
-# Gegenprobe: ohne Packung bleibt der 8-Byte-Abstand.
-out "ungepackt behaelt 8-Byte-Abstand" "$(printf "$bytes_body" 'type S = struct { a: uint8; b: uint8; c: uint8; };')" '1 0 0 0 0 0 '
+# Gegenprobe: ohne Packung gilt die ABI-Ausrichtung (#1516) — nicht mehr der
+# fruehere 8-Byte-Abstand fuer JEDES Feld. Bei drei uint8 faellt sie mit der
+# gepackten Ablage zusammen; das ist beabsichtigt und C-gleich.
+out "ungepackt: uint8 dicht wie in C" "$(printf "$bytes_body" 'type S = struct { a: uint8; b: uint8; c: uint8; };')" '1 2 3 0 0 0 '
+
+# Hier trennen sich die Formen wirklich: uint32 wird ungepackt auf 4
+# ausgerichtet (a, drei Byte Fuellung, b), gepackt liegt es unmittelbar
+# dahinter. Ohne Ausrichtung saehen beide Faelle gleich aus.
+bytes_ab='import std.io;
+import std.alloc;
+%s
+fn main(): int64 {
+  var m: int64 := alloc(64);
+  var k: int64 := 0;
+  while (k < 64) { poke8(m + k, 0); k := k + 1; }
+  var s: S := m as S;
+  s.a := 1; s.b := 2;
+  k := 0;
+  while (k < 6) { Print(IntToStr(peek8(m + k))); Print(" "); k := k + 1; }
+  PrintLn("");
+  return 0;
+}'
+out "ungepackt: uint32 auf 4 ausgerichtet" "$(printf "$bytes_ab" 'type S = struct { a: uint8; b: uint32; };')" '1 0 0 0 2 0 '
+out "gepackt: uint32 direkt dahinter" "$(printf "$bytes_ab" 'type S = packed struct { a: uint8; b: uint32; };')" '1 2 0 0 0 0 '
 
 # --- sizeof folgt dem tatsächlichen Layout -------------------------------
 out "sizeof folgt dem Layout" 'import std.io;

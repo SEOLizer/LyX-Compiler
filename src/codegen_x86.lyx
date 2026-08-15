@@ -239,7 +239,9 @@ con CGN_FN_PTR_NODE: int64 := 55;  // fn(...): R thin-fn-pointer-Typ-Node
 con CGN_ASM:         int64 := 130; // WSP-05: asm-Block-Statement
 con CGN_FIELD_DECL: int64 := 7;
 
-con CG_CLASS_SZ:           int64 := 88;
+// #1516: 88 -> 96. Neu ist CG_CLASS_OFF_ALIGN — die Ausrichtung des Structs,
+// also das Vielfache, auf das seine Gesamtgroesse aufgerundet wird.
+con CG_CLASS_SZ:           int64 := 96;
 con CG_CLASS_OFF_NAMELEN:  int64 := 8;
 con CG_CLASS_OFF_FIELDSPTR: int64 := 16;
 con CG_CLASS_OFF_FIELDCNT: int64 := 24;
@@ -258,6 +260,10 @@ con CG_CLASS_OFF_ISSTRUCT:  int64 := 64;
 // fuer eine bei A liegende Methode). Eintrag wie bei VMTLIST: {ptr:8, len:8}.
 con CG_CLASS_OFF_METHLIST:  int64 := 72;
 con CG_CLASS_OFF_METHCNT:   int64 := 80;
+// #1516: Ausrichtung des Structs in Byte (1 = keine Aufrundung, etwa @packed).
+// 0 heisst "nicht gesetzt" und wird wie 1 behandelt, damit Klassenlayouts und
+// alte Eintraege unveraendert bleiben.
+con CG_CLASS_OFF_ALIGN:     int64 := 88;
 
 con CG_VMT_METH_PATCH_SZ:       int64 := 16;
 con CG_VMT_METH_OFF_CODESTART:  int64 := 8;
@@ -4950,6 +4956,15 @@ pub type Codegen = class {
       i += 1;
     }
     if (ende <= 0) { return cnt * 8; }
+    // #1516: Die Gesamtgroesse wird auf die groesste Feldausrichtung
+    // aufgerundet — sonst richtet ein Array aus diesen Structs schon das erste
+    // Feld des zweiten Elements nicht mehr aus (die alten 9 und 17 Byte waren
+    // selbst kein Vielfaches von 8). @packed setzt ALIGN auf 1 und rundet nicht.
+    var al: int64 := peek64(base + CG_CLASS_OFF_ALIGN);
+    if (al > 1) {
+      var rest: int64 := ende % al;
+      if (rest != 0) { ende := ende + (al - rest); }
+    }
     return ende;
   }
 
@@ -5566,6 +5581,7 @@ pub type Codegen = class {
     poke64(base + CG_CLASS_OFF_PARENTIDX, pIdx);  // WP-BC-L2: for inherited-slot propagation
     // #1095: als struct deklariert? Ein struct MIT Methoden landet hier im
     // Klassen-Layout und ist sonst nicht mehr als struct erkennbar.
+    poke64(base + CG_CLASS_OFF_ALIGN, 0);   // #1516: Klassen werden nicht aufgerundet
     poke64(base + CG_CLASS_OFF_ISSTRUCT, (self.cg_nival(ni) >> 4) & 1);
     poke64(base + CG_CLASS_OFF_METHLIST, declList);   // #1120
     poke64(base + CG_CLASS_OFF_METHCNT,  declCnt);
@@ -5652,6 +5668,12 @@ pub type Codegen = class {
     if (parentFieldCnt > 0) { memcpy(flds, parentFldsPtr, parentFieldCnt * CG_CFIELD_SZ); }
     // WP-4.1-A: check for @packed flag (bit 0 of struct iVal) and at(offset) fields
     var isPacked: int64 := self.cg_nival(ni) & 1;
+    // #1516: Nur ein echtes `struct` bekommt die ABI-Ausrichtung. Diese Funktion
+    // baut auch das Layout methodenloser KLASSEN; die bleiben Referenztypen mit
+    // acht Byte je Feld, damit die Vererbungskette ihre Offsets behaelt.
+    var istStruct: int64 := (self.cg_nival(ni) >> 4) & 1;
+    var natAlign: int64 := 0;
+    if (istStruct != 0 && isPacked == 0) { natAlign := 1; }
     // Structs: fields start at offset 0 (no VMT slot); derived continue after base.
     var offset: int64 := parentFieldCnt * 8;
     var i: int64 := parentFieldCnt;
@@ -5664,6 +5686,26 @@ pub type Codegen = class {
       // WP-4.1-A: determine field offset
       var fieldOff: int64 := offset;
       var fieldIVal: int64 := self.cg_nival(tmp);
+      // #1516: Jedes Feld nach dem ersten begann bei 8*n, egal wie breit sein
+      // Typ war — drei `int8` belegten 17 statt 3 Byte, und das Speicherbild
+      // passte zu keinem C-Struct. Ausgerichtet wird jetzt auf die Typbreite
+      // (SysV): int8 auf 1, int16 auf 2, int32/f32 auf 4, alles uebrige auf 8.
+      // Die Breite selbst faellt weiter unten (breite2) an; hier wird nur die
+      // ANFANGSGRENZE gesetzt, weshalb cg_typeSize hier ein zweites Mal
+      // gefragt wird statt das Ergebnis herumzureichen.
+      if (natAlign != 0) {
+        var aInl: int64 := self.cg_arrayFixedCount(ftypeNode);
+        var fAlign: int64 := 8;
+        if (aInl > 0) { fAlign := self.cg_typeSize(self.cg_nc0(ftypeNode)); }
+        else if (self.cg_typeIstInlineStruct(ftypeNode) != 0) { fAlign := 8; }
+        else { fAlign := self.cg_typeSize(ftypeNode); }
+        if (fAlign < 1) { fAlign := 1; }
+        if (fAlign > 8) { fAlign := 8; }
+        var vor: int64 := fieldOff % fAlign;
+        if (vor != 0) { fieldOff := fieldOff + (fAlign - vor); }
+        offset := fieldOff;
+        if (fAlign > natAlign) { natAlign := fAlign; }
+      }
       if ((fieldIVal & 1) != 0) {
         // Explicit at(expr) offset: read from c1 node's iVal (must be literal)
         var offsetNi: int64 := self.cg_nc1(tmp);
@@ -5723,7 +5765,9 @@ pub type Codegen = class {
         breite2 := inlN2 * tWidth2;
       } else if (inlStr2 != 0) {
         breite2 := self.cg_inlineStructBytes(ftypeNode);
-      } else if (isPacked != 0) {
+      } else if (isPacked != 0 || natAlign != 0) {
+        // #1516: bisher nur bei @packed — ungepackt belegte auch ein int8
+        // volle acht Byte.
         breite2 := self.cg_typeSize(ftypeNode);
       }
       poke64(fb + CG_CFIELD_OFF_BYTES, breite2);
@@ -5754,6 +5798,7 @@ pub type Codegen = class {
     // bekommen struct-Layout, und die Kette waere abgeschnitten.
     poke64(base + CG_CLASS_OFF_PARENTIDX, pIdx);
     poke64(base + CG_CLASS_OFF_ISSTRUCT, (self.cg_nival(ni) >> 4) & 1);
+    poke64(base + CG_CLASS_OFF_ALIGN, natAlign);   // #1516; 0 = nicht aufrunden
     // #1120: auch hier — ein struct kann Methoden tragen und beerbt werden.
     var sDeclCnt: int64 := 0;
     var sMth: int64 := self.cg_nc1(ni);
@@ -12124,17 +12169,13 @@ pub type Codegen = class {
           // also genau der bisherige Wert.
           var soFlds: int64 := peek64(soCb + CG_CLASS_OFF_FIELDSPTR);
           if (soFldCnt > 0 && soFlds != 0) {
-            var soMax: int64 := 0;
-            var soI: int64 := 0;
-            while (soI < soFldCnt) {
-              var soFb: int64 := soFlds + soI * CG_CFIELD_SZ;
-              var soOff: int64 := peek64(soFb + CG_CFIELD_OFF_OFFSET);
-              var soW: int64 := (peek64(soFb + CG_CFIELD_OFF_FLAGS) >> 8) & 0xFF;
-              if (soW <= 0) { soW := 8; }
-              if (soOff + soW > soMax) { soMax := soOff + soW; }
-              soI := soI + 1;
-            }
-            soSize := soMax;
+            // #1516: Hier lief eine ZWEITE Groessenrechnung ueber dieselben
+            // Felder — mit der Breite aus dem Flag statt aus BYTES und ohne
+            // die Aufrundung auf die Ausrichtung. Zwei Meinungen ueber
+            // dieselbe Tatsache: `sizeof` sagte 17, ein Array aus demselben
+            // Struct rechnete mit 24. Es gilt jetzt cg_classStructSize.
+            soSize := self.cg_classStructSize(soClassIdx);
+            if (soVmtSlots > 0) { soSize := soSize + 8; }
           } else {
             // #1513: die Feldzahl mal acht stimmt nicht mehr, sobald ein Feld
             // inline liegt (Struct als Feld, `[N]T`) oder @packed schmaler ist.
