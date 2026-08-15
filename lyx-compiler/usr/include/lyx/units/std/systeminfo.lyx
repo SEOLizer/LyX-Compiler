@@ -7,118 +7,276 @@
 @copyright("2024-2025 Andreas Röne")
 unit std.systeminfo;
 
+import std.alloc;
+import std.io;
+
+// ============================================================================
+// Grundlage: eine Datei lesen, Zahlen daraus holen
+//
+// #1471: Jeder der sechs Parser dieser Unit las byteweise in einen
+// ZEICHENKETTEN-LITERAL-Puffer (`var buf: pchar := "        ";`) und schrieb
+// mit `read(f, buf + pos, 1)` hinein. Literale sind keine Schreibpuffer — das
+// ist Speicherkorruption, und mehrere Parser "leerten" ihren Puffer sogar
+// durch Neuzuweisung desselben Literals, was gar nichts leert.
+//
+// Dazu diente `pos` in readCpuStat gleichzeitig als Schreibposition UND als
+// Zustandsnummer der Erkennung ("cpu "), weshalb die Felder verrutschten
+// (#1470).
+//
+// Grundlage ist jetzt: Datei ganz in einen alloc-Puffer lesen, danach im
+// Speicher auswerten. Das ist kuerzer, hat keinen Zustand und laesst sich
+// einzeln pruefen.
+// ============================================================================
+
+// #1469: 8192 reichten nicht — /proc/cpuinfo hat je logischem Kern rund 1,5 KB,
+// bei acht Kernen also ueber 12 KB. Abgeschnitten meldete GetLogicalCores 6
+// statt 8, und zwar ohne Hinweis: der Leser sah schlicht ein Dateiende.
+// 64 KB decken auch Maschinen mit 32 Kernen ab; laenger wird die Datei nur mit
+// noch mehr Kernen, und dann faellt es ueber _siLiesVoll auf.
+con SI_BUF: int64 := 65536;
+
+// Liest die Datei vollstaendig in buf (max SI_BUF-1 Byte) und liefert die
+// Laenge; -1 wenn sie nicht zu oeffnen ist.
+fn _siLies(pfad: pchar, buf: int64): int64 {
+  var f: int64 := open(pfad, 0, 0);
+  if (f < 0) { return 0 - 1; }
+  var len: int64 := 0;
+  while (len < SI_BUF - 1) {
+    var n: int64 := read(f, buf + len, SI_BUF - 1 - len);
+    if (n <= 0) { break; }
+    len := len + n;
+  }
+  // Passte die Datei nicht in den Puffer, ist jede Auskunft daraus
+  // unvollstaendig — das gehoert gesagt, nicht verschwiegen.
+  if (len >= SI_BUF - 1) {
+    EPrintStr("std.systeminfo: "c);
+    EPrintStr(pfad);
+    EPrintStrLn(" passt nicht in den Lesepuffer — Auskunft unvollstaendig"c);
+  }
+  close(f);
+  poke8(buf + len, 0);
+  return len;
+}
+
+// Liest ab Position i eine Zahl. Liefert sie; setzt ueber endeOut die Position
+// hinter der letzten Ziffer. Ein fuehrendes '-' zaehlt mit.
+fn _siZahl(buf: int64, len: int64, i: int64, endeOut: int64): int64 {
+  var p: int64 := i;
+  var neg: int64 := 0;
+  if (p < len && peek8(buf + p) == 45) { neg := 1; p := p + 1; }
+  var val: int64 := 0;
+  while (p < len) {
+    var c: int64 := peek8(buf + p) & 255;
+    if (c < 48 || c > 57) { break; }
+    val := val * 10 + (c - 48);
+    p := p + 1;
+  }
+  poke64(endeOut, p);
+  if (neg != 0) { return 0 - val; }
+  return val;
+}
+
+// Position der naechsten Ziffer ab i, oder len.
+fn _siNaechsteZahl(buf: int64, len: int64, i: int64): int64 {
+  var p: int64 := i;
+  while (p < len) {
+    var c: int64 := peek8(buf + p) & 255;
+    if (c >= 48 && c <= 57) { return p; }
+    p := p + 1;
+  }
+  return len;
+}
+
+// Zeilenanfang der ersten Zeile, die mit praefix beginnt; -1 wenn keine.
+fn _siZeileMit(buf: int64, len: int64, praefix: pchar): int64 {
+  var plen: int64 := StrLen(praefix);
+  var zeile: int64 := 0;
+  while (zeile < len) {
+    var passt: int64 := 1;
+    var k: int64 := 0;
+    while (k < plen) {
+      if (zeile + k >= len) { passt := 0; k := plen; }
+      else if ((peek8(buf + zeile + k) & 255) != StrCharAt(praefix, k)) { passt := 0; k := plen; }
+      else { k := k + 1; }
+    }
+    if (passt != 0) { return zeile; }
+    // zur naechsten Zeile
+    while (zeile < len && (peek8(buf + zeile) & 255) != 10) { zeile := zeile + 1; }
+    zeile := zeile + 1;
+  }
+  return 0 - 1;
+}
+
+// Die n-te Zahl (0-basiert) ab Position start bis zum Zeilenende.
+fn _siFeld(buf: int64, len: int64, start: int64, n: int64): int64 {
+  var p: int64 := start;
+  var idx: int64 := 0;
+  var ende: int64 := alloc(8);
+  var erg: int64 := 0;
+  while (p < len) {
+    if ((peek8(buf + p) & 255) == 10) { p := len; }
+    else {
+      var z: int64 := _siNaechsteZahl(buf, len, p);
+      if (z >= len) { p := len; }
+      else {
+        // Zeilenende vor der naechsten Zahl?
+        var q: int64 := p;
+        var umbruch: int64 := 0;
+        while (q < z) {
+          if ((peek8(buf + q) & 255) == 10) { umbruch := 1; q := z; }
+          else { q := q + 1; }
+        }
+        if (umbruch != 0) { p := len; }
+        else {
+          var wert: int64 := _siZahl(buf, len, z, ende);
+          if (idx == n) { erg := wert; p := len; }
+          else { idx := idx + 1; p := peek64(ende); }
+        }
+      }
+    }
+  }
+  free(ende, 8);
+  return erg;
+}
+
 // ============================================================================
 // CPU-Informationen
+
 // ============================================================================
 
-// Gibt die Anzahl logischer CPU-Kerne zurück
+// #1469: Diese drei lieferten die Konstanten 8, 4 und 1 — auf der
+// Entwicklungsmaschine zufaellig fast richtig, auf jedem anderen System
+// falsch, und zwar ohne Hinweis. GetSMTWidth war selbst dort falsch.
+//
+// Gezaehlt wird jetzt in /proc/cpuinfo: jede "processor"-Zeile ist ein
+// logischer Kern; die physischen ergeben sich aus den Paaren (physical id,
+// core id) — nur so stimmt die Zahl auch auf Maschinen mit mehreren Sockeln.
+
+fn _siZaehleZeilen(buf: int64, len: int64, praefix: pchar): int64 {
+  var plen: int64 := StrLen(praefix);
+  var zeile: int64 := 0;
+  var n: int64 := 0;
+  while (zeile < len) {
+    var passt: int64 := 1;
+    var k: int64 := 0;
+    while (k < plen) {
+      if (zeile + k >= len) { passt := 0; k := plen; }
+      else if ((peek8(buf + zeile + k) & 255) != StrCharAt(praefix, k)) { passt := 0; k := plen; }
+      else { k := k + 1; }
+    }
+    if (passt != 0) { n := n + 1; }
+    while (zeile < len && (peek8(buf + zeile) & 255) != 10) { zeile := zeile + 1; }
+    zeile := zeile + 1;
+  }
+  return n;
+}
+
 pub fn GetLogicalCores(): int64 {
-  return 8;
+  var buf: int64 := alloc(SI_BUF);
+  var len: int64 := _siLies("/proc/cpuinfo"c, buf);
+  var n: int64 := 0;
+  if (len > 0) { n := _siZaehleZeilen(buf, len, "processor"c); }
+  free(buf, SI_BUF);
+  if (n <= 0) { return 1; }   // eine CPU hat jedes System
+  return n;
 }
 
-// Gibt die Anzahl physischer CPU-Kerne zurück
+// Zaehlt verschiedene (physical id, core id)-Paare. Beide Zeilen fehlen auf
+// manchen Architekturen (ARM, Container ohne Topologie) — dann ist die
+// physische Zahl nicht zu ermitteln, und die logische ist die beste Auskunft.
 pub fn GetPhysicalCores(): int64 {
-  return 4;
+  var buf: int64 := alloc(SI_BUF);
+  var len: int64 := _siLies("/proc/cpuinfo"c, buf);
+  if (len <= 0) { free(buf, SI_BUF); return 1; }
+
+  var paare: int64 := alloc(256 * 16);
+  var anzahl: int64 := 0;
+  var ende: int64 := alloc(8);
+  var physId: int64 := 0 - 1;
+  var zeile: int64 := 0;
+  while (zeile < len) {
+    var istPhys: int64 := 0;
+    var istCore: int64 := 0;
+    var k: int64 := 0;
+    // "physical id" bzw. "core id" am Zeilenanfang erkennen
+    if (zeile + 11 < len) {
+      istPhys := 1; k := 0;
+      while (k < 11) {
+        if ((peek8(buf + zeile + k) & 255) != StrCharAt("physical id"c, k)) { istPhys := 0; k := 11; }
+        else { k := k + 1; }
+      }
+    }
+    if (istPhys == 0 && zeile + 7 < len) {
+      istCore := 1; k := 0;
+      while (k < 7) {
+        if ((peek8(buf + zeile + k) & 255) != StrCharAt("core id"c, k)) { istCore := 0; k := 7; }
+        else { k := k + 1; }
+      }
+    }
+    if (istPhys != 0) {
+      var zp: int64 := _siNaechsteZahl(buf, len, zeile);
+      physId := _siZahl(buf, len, zp, ende);
+    }
+    if (istCore != 0) {
+      var zc: int64 := _siNaechsteZahl(buf, len, zeile);
+      var coreId: int64 := _siZahl(buf, len, zc, ende);
+      var schonDa: int64 := 0;
+      var i: int64 := 0;
+      while (i < anzahl) {
+        if (peek64(paare + i * 16) == physId && peek64(paare + i * 16 + 8) == coreId) { schonDa := 1; i := anzahl; }
+        else { i := i + 1; }
+      }
+      if (schonDa == 0 && anzahl < 256) {
+        poke64(paare + anzahl * 16, physId);
+        poke64(paare + anzahl * 16 + 8, coreId);
+        anzahl := anzahl + 1;
+      }
+    }
+    while (zeile < len && (peek8(buf + zeile) & 255) != 10) { zeile := zeile + 1; }
+    zeile := zeile + 1;
+  }
+  var logisch: int64 := _siZaehleZeilen(buf, len, "processor"c);
+  free(ende, 8);
+  free(paare, 256 * 16);
+  free(buf, SI_BUF);
+  if (anzahl <= 0) {
+    if (logisch <= 0) { return 1; }
+    return logisch;   // keine Topologie in der Datei
+  }
+  return anzahl;
 }
 
-// Gibt die SMT-Breite zurück
+// Threads je Kern. 1 heisst "kein SMT" — und ist jetzt gerechnet, nicht
+// behauptet.
 pub fn GetSMTWidth(): int64 {
-  return 1;
+  var logisch: int64 := GetLogicalCores();
+  var physisch: int64 := GetPhysicalCores();
+  if (physisch <= 0) { return 1; }
+  var w: int64 := logisch / physisch;
+  if (w < 1) { return 1; }
+  return w;
 }
 
 // ============================================================================
 // Speicher-Informationen
 // ============================================================================
 
-// Liest /proc/meminfo und parst einen Wert
+// Liest einen Wert aus /proc/meminfo (Angabe in kB, wie in der Datei).
+// #1471: las byteweise in ein Zeichenketten-Literal.
 fn readMemValue(key: pchar): int64 {
-  var f: int64 := open("/proc/meminfo", 0, 0);
-  if (f < 0) {
-    return 0;
+  var buf: int64 := alloc(SI_BUF);
+  var len: int64 := _siLies("/proc/meminfo"c, buf);
+  if (len <= 0) { free(buf, SI_BUF); return 0; }
+  var zeile: int64 := _siZeileMit(buf, len, key);
+  var wert: int64 := 0;
+  if (zeile >= 0) {
+    var z: int64 := _siNaechsteZahl(buf, len, zeile);
+    var ende: int64 := alloc(8);
+    if (z < len) { wert := _siZahl(buf, len, z, ende); }
+    free(ende, 8);
   }
-  
-  var key_len: int64 := 0;
-  var k: int64 := 0;
-  while (k < 32) {
-    if (StrCharAt(key, k) == 0) {
-      key_len := k;
-      break;
-    }
-    k += 1;
-  }
-  
-  if (key_len == 0) {
-    close(f);
-    return 0;
-  }
-  
-  var buf: pchar := "                                                                                          ";
-  var pos: int64 := 0;
-  var in_key: bool := false;
-  var val: int64 := 0;
-  
-  while (true) {
-    var n: int64 := read(f, buf + pos, 1);
-    if (n <= 0) {
-      break;
-    }
-    
-    var c: int64 := StrCharAt(buf, pos);
-    
-    if (c == 10 || pos >= 99) {
-      if (pos >= key_len && !in_key) {
-        var keyFound: bool := true;
-        var m: int64 := 0;
-        while (m < key_len) {
-          if (StrCharAt(buf, m) != StrCharAt(key, m)) {
-            keyFound := false;
-            break;
-          }
-          m += 1;
-        }
-        
-        if (keyFound && StrCharAt(buf, key_len) == 58) {
-          in_key := true;
-        }
-      }
-      
-      if (in_key && pos > key_len) {
-        val := 0;
-        var p: int64 := key_len + 1;
-        
-        while (p < pos) {
-          var ch: int64 := StrCharAt(buf, p);
-          if (ch == 32) {
-            p += 1;
-            continue;
-          }
-          if (ch >= 48 && ch <= 57) {
-            val := val * 10 + (ch - 48);
-          }
-          else if (ch == 107) {
-            break;
-          }
-          else {
-            break;
-          }
-          p += 1;
-        }
-        
-        close(f);
-        return val;
-      }
-      
-      buf := "                                                                                          ";
-      pos := 0;
-      in_key := false;
-    }
-    else {
-      pos += 1;
-    }
-  }
-  
-  close(f);
-  return 0;
+  free(buf, SI_BUF);
+  return wert;
 }
 
 pub fn GetTotalMemory(): int64 {
@@ -167,55 +325,18 @@ pub fn GetLoadAverage15(): int64 {
   return readLoadAvgPart(2);
 }
 
-// Interne Funktion: Liest einen Teil des Load Average
+// Load Average als HUNDERTSTEL: 2.29 wird zu 229. Ohne Fliesskomma laesst
+// sich ein Load nicht anders ausdruecken; #1471 merkte an, dass es nirgends
+// stand — jetzt steht es hier und in der Doku der drei Aufrufer.
 fn readLoadAvgPart(part: int64): int64 {
-  var f: int64 := open("/proc/loadavg", 0, 0);
-  if (f < 0) {
-    return 0;
-  }
-  
-  var buf: pchar := "                                                                                          ";
-  var pos: int64 := 0;
-  var current_part: int64 := 0;
-  var val: int64 := 0;
-  var found_dot: bool := false;
-  
-  while (true) {
-    var n: int64 := read(f, buf + pos, 1);
-    if (n <= 0) {
-      break;
-    }
-    
-    var c: int64 := StrCharAt(buf, pos);
-    
-    if (c == 32 || c == 47 || c == 10) {  // Space, /, oder newline
-      if (current_part == part && found_dot) {
-        close(f);
-        return val;
-      }
-      if (c == 32) {
-        current_part += 1;
-      }
-      buf := "                                                                                          ";
-      pos := 0;
-      val := 0;
-      found_dot := false;
-    }
-    else if (c == 46) {  // '.'
-      found_dot := true;
-    }
-    else if (c >= 48 && c <= 57) {
-      val := val * 10 + (c - 48);
-    }
-    
-    pos += 1;
-    if (pos >= 99) {
-      break;
-    }
-  }
-  
-  close(f);
-  return 0;
+  var buf: int64 := alloc(SI_BUF);
+  var len: int64 := _siLies("/proc/loadavg"c, buf);
+  if (len <= 0) { free(buf, SI_BUF); return 0; }
+  // Die Datei beginnt mit drei Zahlen der Form a.bc — je zwei Felder.
+  var ganz: int64 := _siFeld(buf, len, 0, part * 2);
+  var bruch: int64 := _siFeld(buf, len, 0, part * 2 + 1);
+  free(buf, SI_BUF);
+  return ganz * 100 + bruch;
 }
 
 // ============================================================================
@@ -226,44 +347,28 @@ fn readLoadAvgPart(part: int64): int64 {
 // a.b = total uptime in sekunden
 // c.d = idle time in sekunden
 
+// #1471: Der Parser ueberlas den Dezimalpunkt und haengte die Nachkommastellen
+// an die Ganzzahl — aus 94557.17 wurden 9455718 (der hundertfache Wert),
+// waehrend Name und Doku von SEKUNDEN sprachen.
 pub fn GetUptime(): int64 {
-  var f: int64 := open("/proc/uptime", 0, 0);
-  if (f < 0) {
-    return 0;
-  }
-  
-  var buf: pchar := "                                                                                          ";
-  var pos: int64 := 0;
-  var val: int64 := 0;
-  var found_dot: bool := false;
-  
-  while (true) {
-    var n: int64 := read(f, buf + pos, 1);
-    if (n <= 0) {
-      break;
-    }
-    
-    var c: int64 := StrCharAt(buf, pos);
-    
-    if (c == 32 || c == 10) {  // Space oder newline
-      close(f);
-      return val;
-    }
-    else if (c == 46) {  // '.'
-      found_dot := true;
-    }
-    else if (c >= 48 && c <= 57) {
-      val := val * 10 + (c - 48);
-    }
-    
-    pos += 1;
-    if (pos >= 99) {
-      break;
-    }
-  }
-  
-  close(f);
-  return val;
+  var buf: int64 := alloc(SI_BUF);
+  var len: int64 := _siLies("/proc/uptime"c, buf);
+  if (len <= 0) { free(buf, SI_BUF); return 0; }
+  var sek: int64 := _siFeld(buf, len, 0, 0);
+  free(buf, SI_BUF);
+  return sek;
+}
+
+// Dieselbe Zeit in Hundertstelsekunden — fuer Aufrufer, die die
+// Nachkommastellen brauchen (das lieferte GetUptime frueher unfreiwillig).
+pub fn GetUptimeHundertstel(): int64 {
+  var buf: int64 := alloc(SI_BUF);
+  var len: int64 := _siLies("/proc/uptime"c, buf);
+  if (len <= 0) { free(buf, SI_BUF); return 0; }
+  var ganz: int64 := _siFeld(buf, len, 0, 0);
+  var bruch: int64 := _siFeld(buf, len, 0, 1);
+  free(buf, SI_BUF);
+  return ganz * 100 + bruch;
 }
 
 // ============================================================================
@@ -293,49 +398,33 @@ pub fn GetNumThreads(): int64 {
   return readProcSelfStat(19);
 }
 
+// Feld aus /proc/self/stat (0-basiert wie in proc(5)). Der Prozessname steht
+// in Klammern und kann Leerzeichen enthalten — deshalb wird ab der SCHLIESSENDEN
+// Klammer gezaehlt, nicht ab dem Zeilenanfang.
 fn readProcSelfStat(field: int64): int64 {
-  var f: int64 := open("/proc/self/stat", 0, 0);
-  if (f < 0) {
-    return 0;
-  }
-  
-  var buf: pchar := "                                                                                          ";
-  var pos: int64 := 0;
-  var current_field: int64 := 0;
-  var val: int64 := 0;
-  
-  while (true) {
-    var n: int64 := read(f, buf + pos, 1);
-    if (n <= 0) {
-      break;
+  var buf: int64 := alloc(SI_BUF);
+  var len: int64 := _siLies("/proc/self/stat"c, buf);
+  if (len <= 0) { free(buf, SI_BUF); return 0; }
+  var ende: int64 := alloc(8);
+  var wert: int64 := 0;
+  if (field == 0) {
+    wert := _siZahl(buf, len, 0, ende);          // pid steht ganz vorn
+  } else {
+    // letzte ')' suchen; danach folgt Feld 2 (state), dann die Zahlen
+    var kl: int64 := 0 - 1;
+    var i: int64 := 0;
+    while (i < len) {
+      if ((peek8(buf + i) & 255) == 41) { kl := i; }
+      i := i + 1;
     }
-    
-    var c: int64 := StrCharAt(buf, pos);
-    
-    if (c == 32 || c == 41 || c == 40 || c == 10) {  // Space, ), (, newline
-      if (c == 32 && current_field == field && val > 0) {
-        close(f);
-        return val;
-      }
-      if (c == 32) {
-        current_field += 1;
-      }
-      buf := "                                                                                          ";
-      pos := 0;
-      val := 0;
-    }
-    else if (c >= 48 && c <= 57) {
-      val := val * 10 + (c - 48);
-    }
-    
-    pos += 1;
-    if (pos >= 500) {
-      break;
+    if (kl >= 0) {
+      // Felder ab hier: 2 = state (Buchstabe), 3 = ppid, 4 = pgrp, ...
+      wert := _siFeld(buf, len, kl + 1, field - 3);
     }
   }
-  
-  close(f);
-  return val;
+  free(ende, 8);
+  free(buf, SI_BUF);
+  return wert;
 }
 
 // ============================================================================
@@ -345,90 +434,37 @@ fn readProcSelfStat(field: int64): int64 {
 // Format: cpu user nice system idle iowait irq softirq steal guest guest_nice
 // Lines: cpu, cpu0, cpu1, ...
 
+// #1470: Diese drei fragten die Felder 1, 3 und 4 ab — also nice, idle und
+// iowait. Richtig sind 0 (user), 2 (system) und 3 (idle).
 pub fn GetCpuUserTime(): int64 {
-  return readCpuStat(1);
+  return readCpuStat(0);
 }
 
 pub fn GetCpuSystemTime(): int64 {
-  return readCpuStat(3);
+  return readCpuStat(2);
 }
 
 pub fn GetCpuIdleTime(): int64 {
-  return readCpuStat(4);
+  return readCpuStat(3);
 }
 
+// #1470: Der alte Parser benutzte `pos` gleichzeitig als Schreibposition und
+// als Zustandsnummer der Erkennung von "cpu " — beim ersten Ziffernzeichen war
+// der Zustand verloren, die Felder verrutschten, und heraus kamen Werte, die
+// mit der Datei nichts zu tun hatten.
+//
+// which zaehlt die Felder der Zeile "cpu ...": 0 = user, 1 = nice,
+// 2 = system, 3 = idle. (Die Aufrufer unten benutzten 1/3/4 und trafen damit
+// nice/idle/iowait.)
 fn readCpuStat(which: int64): int64 {
-  var f: int64 := open("/proc/stat", 0, 0);
-  if (f < 0) {
-    return 0;
-  }
-  
-  var buf: pchar := "                                                                                          ";
-  var pos: int64 := 0;
-  var fieldIdx: int64 := 0;
-  var val: int64 := 0;
-  var skip_to_next: bool := false;
-  
-  while (true) {
-    var n: int64 := read(f, buf + pos, 1);
-    if (n <= 0) {
-      break;
-    }
-    
-    var c: int64 := StrCharAt(buf, pos);
-    
-    if (c == 10) {
-      if (skip_to_next) {
-        close(f);
-        return val;
-      }
-      buf := "                                                                                          ";
-      pos := 0;
-      fieldIdx := 0;
-      val := 0;
-      skip_to_next := false;
-    }
-    else if (pos == 0 && c == 99) {
-      pos := 1;
-    }
-    else if (pos == 1 && c == 112) {
-      pos := 2;
-    }
-    else if (pos == 2 && c == 117) {
-      pos := 3;
-    }
-    else if (pos == 3 && c == 32) {
-      pos := 0;
-      fieldIdx := 0;
-    }
-    else if (pos > 3 && c >= 48 && c <= 57) {
-      if (skip_to_next) {
-        pos += 1;
-        continue;
-      }
-      val := val * 10 + (c - 48);
-      pos += 1;
-    }
-    else if (pos > 3 && c == 32) {
-      if (fieldIdx == which) {
-        close(f);
-        return val;
-      }
-      fieldIdx += 1;
-      val := 0;
-      pos := 0;
-    }
-    else {
-      pos += 1;
-    }
-    
-    if (pos >= 99) {
-      break;
-    }
-  }
-  
-  close(f);
-  return 0;
+  var buf: int64 := alloc(SI_BUF);
+  var len: int64 := _siLies("/proc/stat"c, buf);
+  if (len <= 0) { free(buf, SI_BUF); return 0; }
+  var zeile: int64 := _siZeileMit(buf, len, "cpu "c);
+  var wert: int64 := 0;
+  if (zeile >= 0) { wert := _siFeld(buf, len, zeile, which); }
+  free(buf, SI_BUF);
+  return wert;
 }
 
 // ============================================================================
@@ -436,51 +472,28 @@ fn readCpuStat(which: int64): int64 {
 // ============================================================================
 
 // Gibt die Anzahl der laufenden/runnable Prozesse zurück
+// #1471: Die Funktion gab die Zahl NACH dem Schraegstrich zurueck, also die
+// Gesamtzahl aller Prozesse (1341 statt 1). /proc/loadavg endet mit
+// `laufend/gesamt`.
 pub fn GetRunningProcesses(): int64 {
-  var f: int64 := open("/proc/loadavg", 0, 0);
-  if (f < 0) {
-    return 0;
-  }
-  
-  var buf: pchar := "                                                                                          ";
-  var pos: int64 := 0;
-  var running: int64 := 0;
-  var found_slash: bool := false;
-  
-  while (true) {
-    var n: int64 := read(f, buf + pos, 1);
-    if (n <= 0) {
-      break;
-    }
-    
-    var c: int64 := StrCharAt(buf, pos);
-    
-    if (c == 47) {  // '/'
-      found_slash := true;
-      running := 0;
-    }
-    else if (c == 32 || c == 10) {
-      if (found_slash) {
-        close(f);
-        return running;
-      }
-      buf := "                                                                                          ";
-      pos := 0;
-    }
-    else if (c >= 48 && c <= 57) {
-      if (found_slash) {
-        running := running * 10 + (c - 48);
-      }
-    }
-    
-    pos += 1;
-    if (pos >= 99) {
-      break;
-    }
-  }
-  
-  close(f);
-  return running;
+  var buf: int64 := alloc(SI_BUF);
+  var len: int64 := _siLies("/proc/loadavg"c, buf);
+  if (len <= 0) { free(buf, SI_BUF); return 0; }
+  // Felder: 3 Loads zu je zwei Zahlen (0..5), dann laufend (6), gesamt (7).
+  var laufend: int64 := _siFeld(buf, len, 0, 6);
+  free(buf, SI_BUF);
+  return laufend;
+}
+
+// Die Zahl hinter dem Schraegstrich — das, was GetRunningProcesses frueher
+// lieferte. Wer sie braucht, bekommt sie jetzt unter dem richtigen Namen.
+pub fn GetTotalProcesses(): int64 {
+  var buf: int64 := alloc(SI_BUF);
+  var len: int64 := _siLies("/proc/loadavg"c, buf);
+  if (len <= 0) { free(buf, SI_BUF); return 0; }
+  var gesamt: int64 := _siFeld(buf, len, 0, 7);
+  free(buf, SI_BUF);
+  return gesamt;
 }
 
 // ============================================================================

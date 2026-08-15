@@ -7,6 +7,8 @@
 unit std.uuid;
 
 import std.alloc;
+import std.io;
+import std.os;   // #1473: unix_time/getpid fuer die Saat des Ausweichwegs
 
 // UUID variants
 con UUID_VARIANT_NCS: int64 := 0;
@@ -52,18 +54,63 @@ fn StrLenManual(s: pchar): int64 {
 }
 
 // Seed counter for random byte generation
-con SEED_INIT: int64 := 12345;
-var SeedCounter: int64 := SEED_INIT;
+// #1473: Hier stand ein LCG mit fest einkompilierter Saat (12345). Der
+// Zustand wurde nirgends aus einer Systemquelle gesetzt — jeder Prozessstart
+// begann bei derselben Zahl und lieferte damit DIESELBE UUID-Folge. Fuer
+// Kennungen, die eindeutig sein sollen, ist das der schlimmste Fehler: er
+// faellt im Test nie auf, weil dort ohnehin nur ein Lauf stattfindet.
+//
+// Gezogen wird jetzt aus dem System: getrandom(2), sonst /dev/urandom. Beide
+// Wege koennen fehlschlagen (alter Kernel, kein /dev) — dann bleibt der LCG,
+// aber mit einer Saat aus Uhrzeit und Prozesskennung statt einer Konstante.
+// Der Ausweichweg meldet sich einmal, damit niemand ihn fuer die Regel haelt.
 
-// Generate random byte using simple algorithm
+var SeedCounter: int64 := 0;
+var _uuidGemeldet: int64 := 0;
+
+fn _uuidSaatSetzen(): void {
+  if (SeedCounter != 0) { return; }
+  var t: int64 := unix_time();
+  var p: int64 := getpid();
+  SeedCounter := (t * 1000003 + p * 7919) & 2147483647;
+  if (SeedCounter == 0) { SeedCounter := 1; }
+}
+
 fn randomByte(): int64 {
-    // Simple pseudo-random using multiplication
-    var temp: int64 := SeedCounter * 1103515245;
-    temp += 12345;
-    temp := temp & 2147483647;
-    SeedCounter := temp;
-    temp := temp >> 16;
-    return temp & 255;
+  _uuidSaatSetzen();
+  var temp: int64 := SeedCounter * 1103515245;
+  temp += 12345;
+  temp := temp & 2147483647;
+  SeedCounter := temp;
+  temp := temp >> 16;
+  return temp & 255;
+}
+
+// Fuellt n Byte ab buf mit Zufall. Liefert 1 bei Systemzufall, 0 beim
+// Ausweichweg.
+fn _uuidZufall(buf: int64, n: int64): int64 {
+  var geholt: int64 := sys_getrandom(buf, n, 0);
+  if (geholt == n) { return 1; }
+
+  var fd: int64 := open("/dev/urandom"c, 0, 0);
+  if (fd >= 0) {
+    var gelesen: int64 := 0;
+    while (gelesen < n) {
+      var r: int64 := read(fd, buf + gelesen, n - gelesen);
+      if (r <= 0) { gelesen := n + 1; }
+      else { gelesen := gelesen + r; }
+    }
+    close(fd);
+    if (gelesen == n) { return 1; }
+  }
+
+  if (_uuidGemeldet == 0) {
+    _uuidGemeldet := 1;
+    EPrintStrLn("std.uuid: kein Systemzufall (getrandom/urandom) — UUIDs stammen aus dem Ersatzgenerator"c);
+  }
+  var i: int64 := 0;
+  while (i < n) { poke8(buf + i, randomByte()); i := i + 1; }
+  return 0;
 }
 
 // ============================================================================
@@ -74,25 +121,21 @@ fn randomByte(): int64 {
 // Output: 16 bytes UUID in buffer
 pub fn GenerateV4(output: pchar): bool {
     if (output == 0) { return false; }
-    
+
+    // #1473: 16 Byte am Stueck aus der Systemquelle, statt sechzehnmal aus
+    // einem LCG mit fester Saat.
+    var roh: int64 := alloc(16);
+    _uuidZufall(roh, 16);
+
     var i: int64 := 0;
     while (i < 16) {
-        var b: int64 := randomByte();
-        
-        // Set version (4) in byte 6
-        if (i == 6) {
-            b := (b & 15) | 64;
-        }
-        
-        // Set variant in byte 8
-        if (i == 8) {
-            b := (b & 63) | 128;
-        }
-        
+        var b: int64 := peek8(roh + i) & 255;
+        if (i == 6) { b := (b & 15) | 64; }    // Version 4
+        if (i == 8) { b := (b & 63) | 128; }   // Variante RFC 4122
         StrSetChar(output, i, b);
         i += 1;
     }
-    
+    free(roh, 16);
     return true;
 }
 
@@ -100,42 +143,37 @@ pub fn GenerateV4(output: pchar): bool {
 // Output: 16 bytes UUID in buffer
 pub fn GenerateV7(output: pchar): bool {
     if (output == 0) { return false; }
-    
-    // Use a pseudo-timestamp based on SeedCounter
-    var timestamp: int64 := SeedCounter * 1000;
-    
-    // Encode timestamp (48 bits) into bytes 0-5
+
+    // #1475: Der Zeitstempel war `SeedCounter * 1000` — also der Zustand des
+    // Zufallsgenerators, keine Zeit. Damit war die zeitliche Sortierbarkeit,
+    // der einzige Grund fuer Version 7, nicht gegeben.
+    //
+    // RFC 9562 will die Millisekunden seit der Unix-Epoche als 48 Bit in
+    // GROSS-Endian-Reihenfolge in den Bytes 0..5. Die alte Schleife schrieb
+    // klein-endian, was die Sortierung selbst bei richtiger Zeit zerstoert
+    // haette.
+    var ms: int64 := unix_time() * 1000;
     var i: int64 := 0;
     while (i < 6) {
-        var b: int64 := (timestamp >> (i * 8)) & 255;
-        StrSetChar(output, i, b);
+        var schub: int64 := (5 - i) * 8;
+        StrSetChar(output, i, (ms >> schub) & 255);
         i += 1;
     }
-    
-    // Random bytes for bytes 6-9
+
+    var roh: int64 := alloc(10);
+    _uuidZufall(roh, 10);
     i := 6;
-    while (i < 10) {
-        StrSetChar(output, i, randomByte());
-        i += 1;
-    }
-    
-    // Set version (7) in byte 6
-    var b6: int64 := StrCharAt(output, 6);
-    b6 := (b6 & 15) | 112;
-    StrSetChar(output, 6, b6);
-    
-    // Set variant in byte 8
-    var b8: int64 := StrCharAt(output, 8);
-    b8 := (b8 & 63) | 128;
-    StrSetChar(output, 8, b8);
-    
-    // Random bytes for bytes 9-15
-    i := 9;
     while (i < 16) {
-        StrSetChar(output, i, randomByte());
+        StrSetChar(output, i, peek8(roh + i - 6) & 255);
         i += 1;
     }
-    
+    free(roh, 10);
+
+    var b6: int64 := StrCharAt(output, 6);
+    StrSetChar(output, 6, (b6 & 15) | 112);    // Version 7
+    var b8: int64 := StrCharAt(output, 8);
+    StrSetChar(output, 8, (b8 & 63) | 128);    // Variante RFC 4122
+
     return true;
 }
 
@@ -187,9 +225,22 @@ pub fn ToString(uuid: pchar, output: pchar): bool {
         i += 1;
     }
     StrSetChar(output, pos, 45); pos := pos + 1;  // '-'
-    
-    // 12 hex chars (bytes 8-15)
+
+    // #1474: Hier wurden die Bytes 8..15 in EINER Schleife ausgegeben — der
+    // vierte Bindestrich nach Byte 9 fehlte, die Ausgabe hatte 35 statt 36
+    // Zeichen, und FromString(ToString(x)) schlug fehl. RFC 4122 verlangt
+    // 8-4-4-4-12.
     i := 8;
+    while (i < 10) {
+        var b89: int64 := StrCharAt(uuid, i);
+        StrSetChar(output, pos, intToHexChar((b89 >> 4) & 15)); pos := pos + 1;
+        StrSetChar(output, pos, intToHexChar(b89 & 15)); pos := pos + 1;
+        i += 1;
+    }
+    StrSetChar(output, pos, 45); pos := pos + 1;  // '-' (der fehlende)
+
+    // 12 hex chars (bytes 10-15)
+    i := 10;
     while (i < 16) {
         var b: int64 := StrCharAt(uuid, i);
         var hi: int64 := (b >> 4) & 15;
@@ -297,14 +348,19 @@ pub fn GetVersion(uuid: pchar): int64 {
 pub fn GetVariant(uuid: pchar): int64 {
     if (uuid == 0) { return -1; }
     
+    // #1475: Die Reihenfolge der Zweige machte UUID_VARIANT_RFC unerreichbar.
+    // Die RFC-Variante hat die oberen Bits `10x`, also (b8 >> 5) in {4, 5} —
+    // beide fielen in `variant < 6` und wurden als NCS gemeldet.
+    //
+    // Nach RFC 4122 gilt: 0xx = NCS, 10x = RFC 4122, 110 = Microsoft,
+    // 111 = reserviert.
     var b8: int64 := StrCharAt(uuid, 8);
     var variant: int64 := (b8 >> 5) & 7;
-    
-    if (variant < 6) { return UUID_VARIANT_NCS; }
+
+    if (variant < 4) { return UUID_VARIANT_NCS; }
+    if (variant < 6) { return UUID_VARIANT_RFC; }
     if (variant == 6) { return UUID_VARIANT_MICROSOFT; }
-    if (variant == 7) { return UUID_VARIANT_FUTURE; }
-    
-    return UUID_VARIANT_RFC;
+    return UUID_VARIANT_FUTURE;
 }
 
 // ============================================================================
@@ -318,10 +374,12 @@ pub fn GenerateV4String(output: pchar): bool {
     
     var uuid: int64 := alloc(16);
     if (not GenerateV4(uuid as pchar)) {   // #1272
+        free(uuid, 16);                    // #1475: auch der Fehlerweg gibt frei
         return false;
     }
-    
+
     var result: bool := ToString(uuid as pchar, output);   // #1272
+    free(uuid, 16);                        // #1475: Leck pro Aufruf
     return result;
 }
 
@@ -332,10 +390,12 @@ pub fn GenerateV7String(output: pchar): bool {
     
     var uuid: int64 := alloc(16);
     if (not GenerateV7(uuid as pchar)) {   // #1272
+        free(uuid, 16);                    // #1475
         return false;
     }
-    
+
     var result: bool := ToString(uuid as pchar, output);   // #1272
+    free(uuid, 16);                        // #1475
     return result;
 }
 
