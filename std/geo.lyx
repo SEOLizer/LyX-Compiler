@@ -6,6 +6,9 @@
 @copyright("2024-2025 Andreas Röne")
 unit std.geo;
 
+import std.math;   // #1481/#1482: gepruefte Winkel- und Wurzelfunktionen
+import std.alloc;  // #1483: Puffer fuer FormatDMS
+
 // GeoPoint: x = Longitude, y = Latitude (both in microdegrees)
 pub type GeoPoint = struct {
   x: int64;
@@ -172,26 +175,27 @@ con EARTH_RADIUS_METERS: int64 := 6371000;
 
 // Berechnet Distanz in Metern zwischen zwei GeoPoints
 // Verwendet Vektor-Operationen intern
+// #1482: Zwei Fehler, die sich addierten. Die Laengendifferenz wurde wie eine
+// Breitendifferenz behandelt (beide mal 111319 m) — ein Laengengrad ist bei
+// 53° Nord aber nur rund 67 km breit, nicht 111,3 km. Und die Wurzel war durch
+// `groesserer + halber kleinerer` ersetzt, was die Hypotenuse um bis zu 12 %
+// ueberschaetzt. Berlin–Hamburg kam so auf 437 km statt 255 km.
+//
+// Jetzt: Kosinus-Korrektur ueber die mittlere Breite und Hypot64 aus std.math
+// (seit #1447 exakt statt genaehert).
 pub fn DistanceM(p1: GeoPoint, p2: GeoPoint): int64 {
-  // Differenz berechnen
   var dx: int64 := p2.x - p1.x;
   var dy: int64 := p2.y - p1.y;
+  if (dx < 0) { dx := 0 - dx; }
+  if (dy < 0) { dy := 0 - dy; }
 
-  // Umrechnung: Microdegrees zu Metern
-  // 1° ≈ 111.319 km = 111319 m
-  // Für int64-Sicherheit: eerst skalieren
-  var x_m: int64 := (dx * 111319) / 1000000;
+  // Kosinus der mittleren Breite; p.y traegt Mikrograd, CosLatTable Grad.
+  var midLat: int64 := (p1.y + p2.y) / 2;
+  var cosLat: int64 := CosLatTable(midLat / 1000000);
+
+  var x_m: int64 := ((dx * 111319) / 1000000 * cosLat) / 1000000;
   var y_m: int64 := (dy * 111319) / 1000000;
-  
-  if (x_m < 0) { x_m := -x_m; }
-  if (y_m < 0) { y_m := -y_m; }
-  
-  // Equirectangular approximation
-  if (x_m > y_m) {
-    return x_m + (y_m / 2);
-  } else {
-    return y_m + (x_m / 2);
-  }
+  return Hypot64(x_m, y_m);
 }
 
 // Legacy-Funktion für Abwärtskompatibilität
@@ -311,38 +315,26 @@ pub fn BoundingBoxCenter(min: GeoPoint, max: GeoPoint): GeoPoint {
 // ============================================================================
 
 // Berechnet Initial-Bearing zwischen zwei Punkten in Grad
+// #1483: Die vier Achsenrichtungen waren als Sonderfaelle verdrahtet, dazwischen
+// stand eine lineare Verhaeltnisrechnung (`90000000 - y*90000000/x`), die schon
+// fuer Nordost 0 lieferte. Ein Kurs ist ein Winkel — dafuer gibt es Atan2, und
+// std.math fuehrt es seit #1447 gepruft.
+//
+// Gezaehlt wird im Uhrzeigersinn ab Nord: atan2(Ost, Nord). Die Ostkomponente
+// braucht die Kosinus-Korrektur, sonst zeigt jeder Kurs zu weit nach Osten, je
+// naeher man dem Pol kommt.
 pub fn Bearing(p1: GeoPoint, p2: GeoPoint): int64 {
-  var p2bx: int64 := p2.x;
-  var p1bx: int64 := p1.x;
-  var dLon: int64 := p2bx - p1bx;
-  var lat1: int64 := p1.y;
-  var lat2: int64 := p2.y;
-  
-  // Simplified bearing calculation
-  // Returns bearing in microdegrees (0 = North, 90000000 = East)
-  var x: int64 := dLon;
-  var y: int64 := lat2 - lat1;
-  
-  // Avoid division by zero
-  if (x == 0) {
-    if (y > 0) { return 0; }
-    if (y < 0) { return 180000000; }
-    return 0;
-  }
-  
-  // Simplified: just return angle based on ratio
-  var angle: int64 := 0;
-  if (x > 0) {
-    var yx90: int64 := y * 90000000;
-    var yx90d: int64 := yx90 / x;
-    angle := 90000000 - yx90d;
-  } else {
-    var yx90b: int64 := y * 90000000;
-    var yx90bd: int64 := yx90b / x;
-    angle := 270000000 - yx90bd;
-  }
-  
-  return angle;
+  var dLon: int64 := p2.x - p1.x;
+  var dLat: int64 := p2.y - p1.y;
+  if (dLon == 0 && dLat == 0) { return 0; }
+
+  var midLat: int64 := (p1.y + p2.y) / 2;
+  var cosLat: int64 := CosLatTable(midLat / 1000000);
+  var ost: int64 := (dLon * cosLat) / 1000000;
+
+  var winkel: int64 := Atan2Microdegrees(ost, dLat);
+  while (winkel < 0) { winkel := winkel + 360000000; }
+  return winkel % 360000000;
 }
 
 // ============================================================================
@@ -356,22 +348,24 @@ con COS_TABLE_SIZE: int64 := 91;
 
 // Cosinus für Breitengrade (vereinfacht, Fixed-Point)
 // cos(°) * 1.000.000
+// #1481: Der Kommentar beschrieb `(deg² × 1000000) / 16500`, der Code rechnete
+// `(deg² × 1000) / 165` — ein Zehntel davon. cos(90°) kam damit als 0,95
+// heraus statt 0, und JEDE Laengenkorrektur war praktisch wirkungslos.
+//
+// Die Parabel wird nicht repariert, sondern ersetzt: std.math fuehrt seit
+// #1444 eine Sinustabelle mit Interpolation, und Cos64 liefert denselben
+// Festkommawert (1000000 = 1,0), den diese Funktion zurueckgeben soll — nur
+// eben ueber den ganzen Bereich richtig. Eine zweite, schlechtere Meinung
+// ueber den Kosinus braucht die Bibliothek nicht.
+//
+// Erwartet werden GRAD (nicht Mikrograd); Cos64 rechnet in Mikrograd.
 fn CosLatTable(latDeg: int64): int64 {
-  // Vereinfachte Tabelle: cos(0°) = 1.000.000, cos(90°) = 0
-  // Lineare Approximation für schnelle Berechnung
-  if (latDeg < 0) { latDeg := -latDeg; }
-  if (latDeg > 90) { latDeg := 90; }
-  
-  //cos(°) = 1 - (°/90)²/2 für kleine Winkel (Parabel-Approximation)
-  //Besser: Lookup-Tabelle
   var deg: int64 := latDeg;
-  
-  // Schnelle Approximation: cos(°) ≈ 1.000.000 - (°² * 1.000.000) / 16.500
-  // Für 45°: 1.000.000 - (2025 * 1.000.000) / 16500 ≈ 877.000
-  var result: int64 := 1000000 - (deg * deg * 1000) / 165;
-  if (result < 0) { result := 0; }
-  
-  return result;
+  if (deg < 0) { deg := 0 - deg; }
+  if (deg > 90) { deg := 90; }
+  var wert: int64 := Cos64(deg * 1000000);
+  if (wert < 0) { wert := 0; }
+  return wert;
 }
 
 // ============================================================================
@@ -465,30 +459,63 @@ pub fn ParseDMS(degrees: int64, minutes: int64, seconds: int64, direction: int64
 
 // Formatiert Koordinate als DMS-String
 // direction: 'N', 'S', 'E', 'W'
-pub fn FormatDMS(coord: int64, isLatitude: bool): pchar {
-  var sign: int64 := 1;
-  var dir: int64 := 78; // 'N' default
-  
-  if (coord < 0) {
-    sign := -1;
-    coord := -coord;
-    if (isLatitude) { dir := 83; } // 'S'
-    if (!isLatitude) { dir := 87; } // 'W'
-  } else {
-    if (!isLatitude) { dir := 69; } // 'E'
+// #1483: Grad, Minuten und Sekunden wurden berechnet und dann VERWORFEN —
+// zurueck kam die feste Zeichenkette "000\u00b0 00' 00\" X", mit einem Kommentar,
+// der die eigentliche Arbeit ankuendigte. Die Himmelsrichtung landete ebenso
+// wenig in der Ausgabe. Jetzt wird wirklich formatiert.
+//
+// Der Puffer kommt aus alloc und gehoert dem Aufrufer. Das Gradzeichen ist in
+// UTF-8 zwei Byte (0xC2 0xB0) — als Literal waere es von der Kodierung der
+// Quelldatei abhaengig, deshalb byteweise.
+fn _dmsZahl(buf: int64, pos: int64, wert: int64, stellen: int64): int64 {
+  var p: int64 := pos;
+  var teiler: int64 := 1;
+  var i: int64 := 1;
+  while (i < stellen) { teiler := teiler * 10; i := i + 1; }
+  while (teiler > 0) {
+    poke8(buf + p, 48 + ((wert / teiler) % 10));
+    p := p + 1;
+    teiler := teiler / 10;
   }
-  
-  var deg: int64 := coord / 1000000;
-  var remainder: int64 := coord % 1000000;
-  var minutes: int64 := remainder / 16667; // 1.000.000 / 60
-  remainder := remainder % 16667;
-  var seconds: int64 := remainder / 278; // 1.000.000 / 3600
-  
-  // Einfache String-Ausgabe (buffer)
-  var buf: pchar := "000° 00' 00\" X ";
-  // Hier würde echte String-Formatierung folgen
-  // Return vereinfachtes Format
-  return buf;
+  return p;
+}
+
+pub fn FormatDMS(coord: int64, isLatitude: bool): pchar {
+  var dir: int64 := 78;                      // 'N'
+  var wert: int64 := coord;
+  if (wert < 0) {
+    wert := 0 - wert;
+    if (isLatitude) { dir := 83; } else { dir := 87; }   // 'S' / 'W'
+  } else {
+    if (!isLatitude) { dir := 69; }                      // 'E'
+  }
+
+  var deg: int64 := wert / 1000000;
+  var rest: int64 := wert % 1000000;
+  // 1 Grad = 60 Minuten = 3600 Sekunden; gerechnet wird in Mikrograd, damit
+  // die Rundung nicht schon bei den Minuten verloren geht.
+  var sekGesamt: int64 := (rest * 3600) / 1000000;
+  var minuten: int64 := sekGesamt / 60;
+  var sekunden: int64 := sekGesamt % 60;
+
+  var buf: int64 := alloc(24);
+  if (buf == 0) { return 0 as pchar; }
+  var p: int64 := 0;
+  var stellen: int64 := 2;
+  if (deg >= 100) { stellen := 3; }
+  p := _dmsZahl(buf, p, deg, stellen);
+  poke8(buf + p, 0xC2); p := p + 1;          // Gradzeichen, UTF-8
+  poke8(buf + p, 0xB0); p := p + 1;
+  poke8(buf + p, 32);   p := p + 1;
+  p := _dmsZahl(buf, p, minuten, 2);
+  poke8(buf + p, 39);   p := p + 1;          // '
+  poke8(buf + p, 32);   p := p + 1;
+  p := _dmsZahl(buf, p, sekunden, 2);
+  poke8(buf + p, 34);   p := p + 1;          // "
+  poke8(buf + p, 32);   p := p + 1;
+  poke8(buf + p, dir);  p := p + 1;
+  poke8(buf + p, 0);
+  return buf as pchar;
 }
 
 // ============================================================================
@@ -512,10 +539,14 @@ pub fn CalculateBoundingBoxMin(center: GeoPoint, radiusM: int64): GeoPoint {
   var cminX: int64 := center.x;
   var latR: int64 := radiusM * 8982;
   var latOffset: int64 := latR / 1000;
+  // #1483: Hier wurde MIT dem Kosinus multipliziert und die Skalierung /1000
+  // aus der Breitenzeile vergessen. Beides zusammen ergab eine Laengenspanne
+  // von ueber 176 Grad statt 0,29 — eine Umkreissuche haette den halben Globus
+  // umfasst. Ein Meter entspricht in Ost-West-Richtung MEHR Grad, je naeher man
+  // dem Pol kommt: also geteilt, nicht multipliziert.
   var cosLat: int64 := CosLatTable(cminY / 1000000);
-  var lonR: int64 := radiusM * 8982;
-  var lonR2: int64 := lonR * cosLat;
-  var lonOffset: int64 := lonR2 / 1000000;
+  var lonOffset: int64 := latOffset;
+  if (cosLat > 0) { lonOffset := (latOffset * 1000000) / cosLat; }
   var r: GeoPoint; r.x := cminX - lonOffset; r.y := cminY - latOffset;
   return r;
 }
@@ -525,10 +556,9 @@ pub fn CalculateBoundingBoxMax(center: GeoPoint, radiusM: int64): GeoPoint {
   var cmaxY: int64 := center.y;
   var latR: int64 := radiusM * 8982;
   var latOffset: int64 := latR / 1000;
-  var cosLat: int64 := CosLatTable(cmaxY / 1000000);
-  var lonR: int64 := radiusM * 8982;
-  var lonR2: int64 := lonR * cosLat;
-  var lonOffset: int64 := lonR2 / 1000000;
+  var cosLat: int64 := CosLatTable(cmaxY / 1000000);   // #1483, siehe Min
+  var lonOffset: int64 := latOffset;
+  if (cosLat > 0) { lonOffset := (latOffset * 1000000) / cosLat; }
   var r: GeoPoint; r.x := center.x + lonOffset; r.y := center.y + latOffset;
   return r;
 }
@@ -549,31 +579,21 @@ pub fn AddOffsetM(center: GeoPoint, bearing: int64, distanceM: int64): GeoPoint 
   var dLon: int64 := 0;
   
   // Vereinfachte Berechnung
-  // Nord-Süd Komponente
-  var dLatTmp: int64 := distanceM * meterToDeg;
-  var dLatTmp2: int64 := dLatTmp * 1000;
-  dLat := dLatTmp2 / 1000000;
-  if (bearing > 270000000 || bearing < 90000000) {
-    // Nord
-    if (bearing <= 90000000) { dLat := dLat; }
-  } else {
-    dLat := -dLat;
-  }
-  
-  // Ost-West Komponente
-  var centerY: int64 := center.y;
-  var cosLat: int64 := CosLatTable(centerY / 1000000);
-  var dLonTmp: int64 := distanceM * meterToDeg;
-  var dLonTmp2: int64 := dLonTmp * cosLat;
-  var dLonTmp3: int64 := dLonTmp2 * 1000;
-  dLon := dLonTmp3 / 1000000;
-  
-  if (bearing > 0 && bearing < 180000000) {
-    // Ost
-  } else {
-    dLon := -dLon;
-  }
-  
+  // #1483: Die Ost-West-Komponente wurde MIT dem Kosinus multipliziert (statt
+  // geteilt) und zusaetzlich mit 1000 skaliert — eine Bewegung von 10 km nach
+  // NORDEN zerstoerte damit die Laenge (lon = -88334714706). Und die Richtung
+  // ging nur als Vorzeichen ein: jeder Kurs zwischen den Achsen bewegte den
+  // Punkt um die volle Strecke in BEIDE Richtungen.
+  //
+  // Jetzt wird der Kurs zerlegt — Nordanteil cos(bearing), Ostanteil
+  // sin(bearing) —, und der Ostanteil durch den Kosinus der Breite geteilt.
+  var strecke: int64 := (distanceM * meterToDeg) / 1000;   // Mikrograd
+  dLat := (strecke * Cos64(bearing)) / 1000000;
+
+  var ostGrad: int64 := (strecke * Sin64(bearing)) / 1000000;
+  var cosLat: int64 := CosLatTable(center.y / 1000000);
+  if (cosLat > 0) { dLon := (ostGrad * 1000000) / cosLat; } else { dLon := 0; }
+
   var ao: GeoPoint; ao.x := center.x + dLon; ao.y := center.y + dLat;
   return ao;
 }
@@ -613,7 +633,9 @@ pub fn DistanceMCorrected(p1: GeoPoint, p2: GeoPoint): int64 {
   var y_m_tmp: int64 := dLat * 111319;
   var y_m: int64 := y_m_tmp / 1000000;
   
-  // Bessere Approximation
+  // #1482: auch hier stand die Oktagon-Naeherung; sie ueberschaetzt die
+  // Hypotenuse um bis zu 12 %. Hypot64 rechnet exakt.
+  return Hypot64(x_m, y_m);
   if (x_m > y_m) {
     return x_m + (y_m / 2);
   } else {
