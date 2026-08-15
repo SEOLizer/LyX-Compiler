@@ -18,45 +18,70 @@ import std.alloc;   // #1462: 8-Byte-Kratzpuffer fuer die Bit-Umdeutung
 // int64-Bereich. Die Kodierung aendert sich damit — wer Dateien mit der alten
 // Fassung geschrieben hat, liest sie nicht mehr; die alte Fassung konnte
 // negative Werte aber ohnehin nicht ablegen.
-pub fn WriteVarInt(buf: int64, pos: int64, val: int64): int64 {
-  var i: int64 := 0;
-  var v: int64 := (val << 1);
-  if (val < 0) { v := ((0 - val) << 1) - 1; }
-  while (v >= 128) {
-    var b: int64 := (v & 127) | 128;
-    var off: int64 := pos + i;
-    poke8(buf + off, b);
-    v := v >> 7;
+// #1501: Die ZickZack-Abbildung liegt jetzt an EINER Stelle. Vorher stand sie
+// in WriteVarInt und fehlte in VarIntSize — die beiden liefen auseinander, und
+// wer die Puffergroesse mit VarIntSize vorausrechnete, reservierte zu wenig.
+//
+// Gerechnet wird in Bitform statt ueber den Betrag: `(v << 1) ^ (v >> 63)`
+// bleibt auch fuer INT64_MIN und INT64_MAX definiert. Die vorherige Fassung
+// bildete `(0 - val) << 1`, was ab 2^62 ueberlief und das Vorzeichen kippte —
+// MAX und MIN kamen als EIN Byte heraus.
+fn _zickZack(val: int64): int64 {
+  return (val << 1) ^ (val >> 63);
+}
+
+// Rueckrichtung. Das `& 0x7FFF...` macht aus dem arithmetischen `>>` ein
+// logisches — sonst zoege das Vorzeichenbit die oberen Bits mit.
+fn _entZickZack(v: int64): int64 {
+  return ((v >> 1) & 0x7FFFFFFFFFFFFFFF) ^ (0 - (v & 1));
+}
+
+// Zahl der Bytes, die die schon abgebildete Zahl belegt. Gezaehlt wird mit
+// LOGISCHER Verschiebung: nach der Abbildung ist der Wert als vorzeichenlose
+// 64-Bit-Zahl zu lesen, und `v >= 128` waere fuer das gesetzte oberste Bit
+// sofort falsch — genau daran brach die alte Zaehlung bei grossen Werten.
+fn _varIntBytes(zz: int64): int64 {
+  var v: int64 := zz;
+  var i: int64 := 1;
+  while (i < 10) {
+    v := (v >> 7) & 0x01FFFFFFFFFFFFFF;
+    if (v == 0) { return i; }
     i += 1;
   }
-  var off2: int64 := pos + i;
-  var b2: int64 := v & 127;
-  poke8(buf + off2, b2);
-  var ret: int64 := i + 1;
-  return ret;
+  return 10;
+}
+
+pub fn WriteVarInt(buf: int64, pos: int64, val: int64): int64 {
+  var v: int64 := _zickZack(val);
+  var i: int64 := 0;
+  while (i < 9) {
+    var rest: int64 := (v >> 7) & 0x01FFFFFFFFFFFFFF;
+    if (rest == 0) {
+      poke8(buf + pos + i, v & 127);
+      return i + 1;
+    }
+    poke8(buf + pos + i, (v & 127) | 128);
+    v := rest;
+    i += 1;
+  }
+  // Zehntes Byte: hier sind hoechstens noch die obersten Bits uebrig.
+  poke8(buf + pos + i, v & 127);
+  return i + 1;
 }
 
 // Read a varint
 pub fn ReadVarInt(buf: int64, pos: int64): int64 {
-  var result: int64 := 0;   // #1463: ZickZack, siehe WriteVarInt
+  var result: int64 := 0;
   var shift: int64 := 0;
   var i: int64 := 0;
   while (i < 10) {
-    var off: int64 := pos + i;
-    var b: int64 := peek8(buf + off) & 255;
-    var bits: int64 := b & 127;
-    var shifted: int64 := bits << shift;
-    result := result | shifted;
+    var b: int64 := peek8(buf + pos + i) & 255;
+    result := result | ((b & 127) << shift);
     i += 1;
-    if ((b & 128) == 0) {
-      // #1463: ZickZack zurueckrechnen — unterstes Bit ist das Vorzeichen.
-      if ((result & 1) == 0) { return result / 2; }
-      return 0 - ((result + 1) / 2);
-    }
+    if ((b & 128) == 0) { return _entZickZack(result); }   // #1501
     shift += 7;
   }
-  if ((result & 1) == 0) { return result / 2; }
-  return 0 - ((result + 1) / 2);
+  return _entZickZack(result);
 }
 
 // Pack int64 (8 bytes, little-endian)
@@ -306,15 +331,11 @@ pub fn UnpackArrayStart(buf: int64, pos: int64): int64 {
 }
 
 // Get size needed for packing an integer in varint format
+// #1501: Rechnet jetzt ueber dieselbe Abbildung wie WriteVarInt. Vorher zaehlte
+// sie auf dem Originalwert; da ZickZack den Betrag verdoppelt, meldete sie fuer
+// 64, 127, 8192 und jeden negativen Wert ein Byte zu wenig.
 pub fn VarIntSize(val: int64): int64 {
-  var i: int64 := 0;
-  var v: int64 := val;
-  while (v >= 128) {
-    v := v >> 7;
-    i += 1;
-  }
-  var ret: int64 := i + 1;
-  return ret;
+  return _varIntBytes(_zickZack(val));
 }
 
 // Calculate total pack size for a string
