@@ -387,6 +387,9 @@ pub type EmitARM64 = class {
     if (op == IRO_CMP_GT || op == IRO_CMP_LE || op == IRO_CMP_LT || op == IRO_CMP_NEQ) { return 1; }
     if (op == IRO_CONST_FLOAT || op == IRO_CONST_INT || op == IRO_CONST_STR || op == IRO_DIV) { return 1; }
     if (op == IRO_FADD || op == IRO_FDIV || op == IRO_FMUL || op == IRO_FNEG) { return 1; }
+    // #1339: die FCMP-Familie — ohne sie gibt es keine Gleitkomma-Verzweigung.
+    if (op == IRO_FCMP_EQ || op == IRO_FCMP_NEQ || op == IRO_FCMP_LT) { return 1; }
+    if (op == IRO_FCMP_LE || op == IRO_FCMP_GT || op == IRO_FCMP_GE) { return 1; }
     if (op == IRO_FREE || op == IRO_FSQRT || op == IRO_FSUB || op == IRO_FTOI) { return 1; }
     if (op == IRO_FUNC_EXIT || op == IRO_INSPECT || op == IRO_ITOF || op == IRO_ITOP) { return 1; }
     if (op == IRO_JMP || op == IRO_LABEL || op == IRO_LOAD_FIELD || op == IRO_LOAD_GLOBAL) { return 1; }
@@ -451,6 +454,12 @@ pub type EmitARM64 = class {
     if op == IRO_FSQRT { self.emitFSqrt(src1, dest); }
 
     // --- Comparisons ---
+    if op == IRO_FCMP_EQ  { self.emitFCmp(0, src1, src2, dest); }   // #1339
+    if op == IRO_FCMP_NEQ { self.emitFCmp(1, src1, src2, dest); }
+    if op == IRO_FCMP_LT  { self.emitFCmp(2, src1, src2, dest); }
+    if op == IRO_FCMP_LE  { self.emitFCmp(3, src1, src2, dest); }
+    if op == IRO_FCMP_GT  { self.emitFCmp(4, src1, src2, dest); }
+    if op == IRO_FCMP_GE  { self.emitFCmp(5, src1, src2, dest); }
     if op == IRO_CMP_EQ  { self.emitCmp(0, src1, src2, dest); }
     if op == IRO_CMP_NEQ { self.emitCmp(1, src1, src2, dest); }
     if op == IRO_CMP_LT  { self.emitCmp(2, src1, src2, dest); }
@@ -665,6 +674,39 @@ pub type EmitARM64 = class {
     var cset: int64 := self.csetEnc(kind);
     self.emit32(cset);
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #1339: Gleitkommavergleich. Bis hierher behandelte KEIN IR-Backend die
+  // FCMP-Familie (40..45) — `if (a < b)` mit f64 erzeugte auf arm64 gar keinen
+  // Code, das Ergebnisregister blieb stehen, was zufaellig drinstand. Ohne sie
+  // gibt es auf diesen Zielen keine Gleitkomma-Verzweigung.
+  //
+  // FCMP d0, d1 setzt die Flags; danach dasselbe CSET wie beim
+  // Ganzzahlvergleich. Bei ungeordneten Operanden (NaN) setzt FCMP C und V —
+  // die vorzeichenlosen Bedingungen HI/HS treffen dann nicht zu, ein Vergleich
+  // mit NaN ist also falsch. Genau das verlangt IEEE 754.
+  fn emitFCmp(kind: int64, src1: int64, src2: int64, dest: int64) {
+    self.emitFLdur(ARM64_D0, ARM64_X29, self.slotOff(src1));
+    self.emitFLdur(ARM64_D1, ARM64_X29, self.slotOff(src2));
+    // FCMP d0, d1  — 0x1E602000 | (Dm << 16) | (Dn << 5)
+    self.emit32(0x1E602000 | (ARM64_D1 << 16) | (ARM64_D0 << 5));
+    self.emit32(self.fcsetEnc(kind));
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // Wie csetEnc, aber mit den Bedingungen fuer Gleitkomma: LT/LE/GT/GE
+  // brauchen MI/LS/GT/GE, damit NaN nicht als "kleiner" durchgeht.
+  //   EQ=0  NE=1  MI=4(LT)  LS=9(LE)  GT=12  GE=10
+  // CSET Xd, cond = CSINC Xd, XZR, XZR, ~cond — eingetragen wird die INVERSE.
+  fn fcsetEnc(kind: int64): int64 {
+    var invCond: int64 := 0;
+    if kind == 0 { invCond := 1; }    // EQ  -> inv NE
+    if kind == 1 { invCond := 0; }    // NE  -> inv EQ
+    if kind == 2 { invCond := 5; }    // LT (MI=4)  -> inv PL=5
+    if kind == 3 { invCond := 8; }    // LE (LS=9)  -> inv HI=8
+    if kind == 4 { invCond := 13; }   // GT (12)    -> inv LE=13
+    if kind == 5 { invCond := 11; }   // GE (10)    -> inv LT=11
+    return 0x9A9F07E0 | ((invCond & 15) << 12) | ARM64_X0;
   }
 
   fn csetEnc(kind: int64): int64 {

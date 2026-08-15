@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.20A
+VERSION   := 1.0.20B
 VERSION_DATE := 2026-08-15
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -479,6 +479,9 @@ test: lyxc
 	@echo "OK"
 	@echo "--- asm: Operandenbindung und Portbefehle (9 Pruefungen) ---"
 	@bash tests/asm_operanden_test.sh
+	@echo "OK"
+	@echo "--- arm64: Gleitkommavergleich (FCMP-Familie, 8 Pruefungen) ---"
+	@bash tests/arm64_fcmp_test.sh
 	@echo "OK"
 	@echo "--- Diagnose-Schalter: Relokationen, Karte, Optimierstufe (17 Pruefungen) ---"
 	@bash tests/diagnose_schalter_test.sh
