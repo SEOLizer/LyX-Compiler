@@ -15576,14 +15576,8 @@ pub type Codegen = class {
       paramIdx += 1;
       param := self.cg_nnext(param);
     }
-    // #1351: Die PARAMETERUEBERGABE bleibt vorerst eine Uebergabe der Adresse.
-    // Eine Kopie beim Eintritt waere schnell emittiert — sie bricht aber den
-    // eigenen Bestand: 51 Funktionen in 18 stdlib-Einheiten aendern ihren
-    // Struct-Parameter mit Absicht und geben das Ergebnis so zurueck
-    // (MySQLQuery, MongoDocAddString, BGPSendOpen, TerminalDraw …). Ohne ein
-    // Sprachmittel fuer "nach Referenz" waere jede dieser Stellen still
-    // wirkungslos geworden — schlechter als der gemeldete Fehler.
-    // Getrennt gefuehrt als #1528.
+    // #1351/#1528: Die Kopie der Wert-Structs steht weiter unten — nach ALLEN
+    // Spills, auch denen der Stack-Parameter.
     // L-4: stack params at [rbp+16], [rbp+24], ... (args 7+ passed on caller stack)
     var spOff: int64 := 16;
     while (param != -1) {
@@ -15600,6 +15594,33 @@ pub type Codegen = class {
       self.cg_storeRax(spLocal);
       spOff += 8;
       param := self.cg_nnext(param);
+    }
+
+    // #1528: Struct-Parameter sind WERTE. Der Aufrufer uebergibt die Adresse
+    // (etwas anderes passt nicht ins Register), also wird beim Eintritt eine
+    // Kopie angelegt und der Slot auf sie umgebogen — `p.x := 999` im Rumpf
+    // trifft dann die Kopie, nicht das Original des Aufrufers.
+    //
+    // ERST HIER, nach ALLEN Spills: `rep movsq` in cg_emitStructKopie
+    // ueberschreibt rdi, rsi und rcx. Zwischen zwei Spills eingefuegt hat es
+    // beim ersten Versuch (#1351) das zweite Argument zerstoert — TCPListenerBind
+    // band an eine falsche Adresse, waehrend bind() weiter 0 lieferte.
+    //
+    // `ref` schliesst die Kopie aus. Das ist der Weg fuer die Faelle, die ihren
+    // Parameter mit Absicht aendern (MySQLQuery, MongoDocAddString,
+    // BGPSendOpen, TerminalDraw und 47 weitere in der stdlib).
+    var kopP: int64 := self.cg_nc0(ni);
+    while (kopP != -1) {
+      var kopTy: int64 := self.cg_nc0(kopP);
+      if ((self.cg_nival(kopP) & 2) == 0 && self.cg_typeIstWertStruct(kopTy) != 0) {
+        var kopOff: int64 := self.cg_findLocal(self.cg_nsval(kopP), self.cg_nslen(kopP));
+        if (kopOff != 0) {
+          self.cg_loadRax(kopOff);
+          self.cg_emitStructKopie(self.cg_inlineStructBytes(kopTy));
+          self.cg_storeRax(kopOff);
+        }
+      }
+      kopP := self.cg_nnext(kopP);
     }
 
     // #1097: Parameter vom Bereichstyp pruefen, nachdem alle abgelegt sind.

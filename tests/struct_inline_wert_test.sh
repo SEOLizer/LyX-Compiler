@@ -6,8 +6,9 @@
 #          Stelle als Zeiger — `a.innen.wert` benutzte den Wert 5 als Adresse.
 #   #1351  Structs hatten keine Wertsemantik: `var b: T := a` und `b := a`
 #          teilten den Speicher, Schreiben auf die Kopie traf das Original.
-#          Der PARAMETERfall bleibt offen und wird in #1528 gefuehrt — 51
-#          stdlib-Funktionen aendern ihren Struct-Parameter mit Absicht.
+#          Der PARAMETERfall folgte in #1528: Wertsemantik als Vorgabe, `ref`
+#          fuer die 51 stdlib-Funktionen, die ihren Parameter mit Absicht
+#          aendern.
 #   #1493  Ein Array mit KLASSEN-Elementtyp als Klassenfeld lieferte still 0:
 #          der Elementtyp war nur bei `Array<T>` vermerkt, nicht bei inline
 #          `[N]T` — `b.kids[0].x` wusste nicht, welche Klasse dort liegt.
@@ -150,18 +151,21 @@ fn main(): int64 {
   return 0;
 }' "7 8"
 
-# Der PARAMETERfall ist offen (#1528): 51 stdlib-Funktionen aendern ihren
-# Struct-Parameter mit Absicht, und die Sprache kennt kein "nach Referenz".
-# Festgehalten wird das HEUTIGE Verhalten, damit eine Aenderung auffaellt.
-out "#1528 (offen): Struct-Parameter wirkt weiterhin auf das Original" 'import std.io;
+# #1528: Der PARAMETERfall ist behoben — Struct-Parameter sind Werte, und
+# `ref` drueckt das Gegenteil aus. Hier steht die Kurzprobe; die ausfuehrliche
+# Absicherung samt stdlib-Gegenproben liegt in tests/ref_parameter_test.sh.
+out "#1528: Struct-Parameter ist ein Wert, ref aendert das Original" 'import std.io;
 type Pt = struct { x: int64; y: int64; };
-fn bump(p: Pt): int64 { p.x := 999; return 0; }
+fn wert(p: Pt): int64 { p.x := 999; return 0; }
+fn refer(ref p: Pt): int64 { p.x := 999; return 0; }
 fn main(): int64 {
   var a: Pt; a.x := 1;
-  bump(a);
-  PrintLn(IntToStr(a.x));
+  wert(a);
+  var b: Pt; b.x := 1;
+  refer(b);
+  PrintStr(IntToStr(a.x)); PrintStr(" "); PrintLn(IntToStr(b.x));
   return 0;
-}' "999"
+}' "1 999"
 
 # ===========================================================================
 # #1493 — Array mit Klassen-Elementtyp als Klassenfeld

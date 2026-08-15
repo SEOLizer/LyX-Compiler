@@ -1,6 +1,6 @@
-# Lyx 1.0.20E — Canonical EBNF Grammar
+# Lyx 1.0.20F — Canonical EBNF Grammar
 
-> Stand 2026-08-15, gegen lyxc 1.0.20E geprueft. Die Keyword-Liste in
+> Stand 2026-08-15, gegen lyxc 1.0.20F geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -365,7 +365,20 @@ TypeParamList       = Ident { "," Ident } ;
 
 ParamList           = Param { "," Param } ;
 
-Param               = [ "con" ] Ident ":" Type [ "=" Expr ] ;
+Param               = [ "con" ] [ "ref" ] Ident ":" Type [ "=" Expr ] ;
+
+(* #1528: `ref` uebergibt einen STRUCT-Parameter nach Referenz. Ohne `ref` ist
+   ein Struct-Parameter ein WERT: die Funktion bekommt beim Eintritt eine
+   Kopie, und Aenderungen daran bleiben in der Funktion. Das entspricht der
+   Zuweisung (`var b: T := a` kopiert seit #1351).
+
+   `ref` ist ein WEICHES Schluesselwort: es gilt nur unmittelbar vor einem
+   Parameternamen, der von einem Doppelpunkt gefolgt wird. `ref: int64` bleibt
+   ein Parameter, der schlicht so heisst, und `var ref := 5` eine gewoehnliche
+   Variable.
+
+   An einem eingebauten Skalartyp ist `ref` wirkungslos und wird gemeldet;
+   Klassen sind ohnehin Referenzen und werden nie kopiert. *)
 
 ReturnType          = Type | TupleType ;
 ```
