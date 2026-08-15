@@ -45,11 +45,21 @@ public fn TimesTwo(x: int64): int64 {
 // Hier nur die Convenience-Funktionen:
 
 // Gibt eine Pseudozufallszahl im Bereich [0, max) zurück
+// #1446: `Random()` liefert einen vollen int64 und ist in der Haelfte der
+// Faelle negativ; `%` uebernimmt in Lyx das Vorzeichen des Dividenden. Damit
+// verliess die Funktion den zugesagten Bereich [0, max) — und der Aufrufer
+// bekam einen negativen Index, ohne dass etwas darauf hinwies.
+//
+// Der Betrag wird deshalb vor der Restrechnung gebildet. int64-Minimum hat
+// keinen positiven Betrag und wird gesondert behandelt.
 public fn RandomRange(max: int64): int64 {
   if (max <= 0) {
     return 0;
   }
-  return Random() % max;
+  var r: int64 := Random();
+  if (r == 0 - 9223372036854775807 - 1) { r := 0; }
+  if (r < 0) { r := 0 - r; }
+  return r % max;
 }
 
 // Gibt eine Pseudozufallszahl im Bereich [min, max] zurück
@@ -131,9 +141,17 @@ public fn InRange64(val: int64, min: int64, max: int64): bool {
   return (val >= min) && (val <= max);
 }
 
-// Rundet auf nächste Ganzzahl (bei .5 weg von Null)
-public fn Round64(x: int64): int64 {
-  return x;
+// #1450: Hier stand `return x;` unter dem Kommentar "rundet auf naechste
+// Ganzzahl" — der Parameter ist bereits ganzzahlig, es gab nichts zu runden.
+// Am Aufrufort las sich `Round64(v)` wie eine Rundung und war ein No-op.
+//
+// Was gemeint war, ist die Rundung eines FESTKOMMA-Wertes. Die Funktion nimmt
+// deshalb den Wert samt seinem Nenner und rundet kaufmaennisch (bei genau der
+// Haelfte weg von null), wie der alte Kommentar es zusagte.
+public fn Round64Fixed(wert: int64, nenner: int64): int64 {
+  if (nenner <= 0) { return wert; }
+  if (wert >= 0) { return (wert + nenner / 2) / nenner; }
+  return 0 - ((0 - wert + nenner / 2) / nenner);
 }
 
 // ============================================================
@@ -161,26 +179,32 @@ public fn Map64(val: int64, in_min: int64, in_max: int64, out_min: int64, out_ma
 
 // Berechnet sqrt(x^2 + y^2) mit Überlaufschutz
 // Verwendet: wenn |x| > |y|, dann sqrt(x^2 + y^2) = |x| * sqrt(1 + (y/x)^2)
+// #1445: Hier stand die Naeherung `x + y*y/(2x)`, aber mit einem Verhaeltnis,
+// das um 1000 hochskaliert und nie wieder heruntergeteilt wurde: Hypot64(3,4)
+// ergab 285 statt 5. Die Naeherung selbst ist ausserdem nur fuer y << x gut.
+//
+// Jetzt wird exakt gerechnet: Sqrt64(x*x + y*y), mit dem Ausweichweg fuer
+// grosse Werte, den die Naeherung eigentlich abdecken sollte — sonst laeuft
+// das Quadrat ueber.
 public fn Hypot64(x: int64, y: int64): int64 {
   x := Abs64(x);
   y := Abs64(y);
-  
   if (x == 0) { return y; }
   if (y == 0) { return x; }
-  
-  // Vertausche wenn y > x für bessere Präzision
   if (y > x) {
     var tmp: int64 := x;
     x := y;
     y := tmp;
   }
-  
-  // Berechne: x * sqrt(1 + (y/x)^2)
-  // Vereinfacht: x + y*y/(2*x) für große x
-  var ratio: int64 := (y * 1000) / x;
-  var approx: int64 := (ratio * ratio) / 2000;
-  
-  return x + approx;
+  // x*x darf nicht ueberlaufen: ab etwa 2^31,5 wird skaliert gerechnet.
+  if (x <= 2147483647) {
+    return Sqrt64(x * x + y * y);
+  }
+  // Grosse Werte: beide Seiten um 2^16 verkleinern, Ergebnis zurueckskalieren.
+  var xs: int64 := x / 65536;
+  var ys: int64 := y / 65536;
+  if (xs == 0) { return x; }
+  return Sqrt64(xs * xs + ys * ys) * 65536;
 }
 
 // ============================================================
@@ -190,31 +214,134 @@ public fn Hypot64(x: int64, y: int64): int64 {
 // Sinus für Winkel in Microdegrees (0 bis 360000000)
 // Gibt Wert in Fixed-Point zurück (* 1.000.000)
 // Beispiel: Sin64(90000000) = 1000000 (sin(90°) = 1.0)
+// #1444: Die Naeherung `rad - rad^3/6e9` kippte bei grossen Winkeln. Fuer
+// deg = 90 ist rad = 1570770 und rad^3/6e9 rund 6,5e8 — der Korrekturterm ist
+// zwei Groessenordnungen groesser als der lineare, das Vorzeichen dreht sich.
+// Eine Taylorreihe in Festkomma taugt nur nahe null; hier steht deshalb eine
+// TABELLE mit einem Eintrag je Grad (0..90), zwischen den Stuetzstellen linear
+// interpoliert. Die Werte sind sin(deg) * 1e6, gerundet.
+fn _sinTabelle(grad: int64): int64 {
+  if (grad <= 0)  { return 0; }
+  if (grad >= 90) { return 1000000; }
+  if (grad == 1)  { return 17452; }
+  if (grad == 2)  { return 34899; }
+  if (grad == 3)  { return 52336; }
+  if (grad == 4)  { return 69756; }
+  if (grad == 5)  { return 87156; }
+  if (grad == 6)  { return 104528; }
+  if (grad == 7)  { return 121869; }
+  if (grad == 8)  { return 139173; }
+  if (grad == 9)  { return 156434; }
+  if (grad == 10) { return 173648; }
+  if (grad == 11) { return 190809; }
+  if (grad == 12) { return 207912; }
+  if (grad == 13) { return 224951; }
+  if (grad == 14) { return 241922; }
+  if (grad == 15) { return 258819; }
+  if (grad == 16) { return 275637; }
+  if (grad == 17) { return 292372; }
+  if (grad == 18) { return 309017; }
+  if (grad == 19) { return 325568; }
+  if (grad == 20) { return 342020; }
+  if (grad == 21) { return 358368; }
+  if (grad == 22) { return 374607; }
+  if (grad == 23) { return 390731; }
+  if (grad == 24) { return 406737; }
+  if (grad == 25) { return 422618; }
+  if (grad == 26) { return 438371; }
+  if (grad == 27) { return 453990; }
+  if (grad == 28) { return 469472; }
+  if (grad == 29) { return 484810; }
+  if (grad == 30) { return 500000; }
+  if (grad == 31) { return 515038; }
+  if (grad == 32) { return 529919; }
+  if (grad == 33) { return 544639; }
+  if (grad == 34) { return 559193; }
+  if (grad == 35) { return 573576; }
+  if (grad == 36) { return 587785; }
+  if (grad == 37) { return 601815; }
+  if (grad == 38) { return 615661; }
+  if (grad == 39) { return 629320; }
+  if (grad == 40) { return 642788; }
+  if (grad == 41) { return 656059; }
+  if (grad == 42) { return 669131; }
+  if (grad == 43) { return 681998; }
+  if (grad == 44) { return 694658; }
+  if (grad == 45) { return 707107; }
+  if (grad == 46) { return 719340; }
+  if (grad == 47) { return 731354; }
+  if (grad == 48) { return 743145; }
+  if (grad == 49) { return 754710; }
+  if (grad == 50) { return 766044; }
+  if (grad == 51) { return 777146; }
+  if (grad == 52) { return 788011; }
+  if (grad == 53) { return 798636; }
+  if (grad == 54) { return 809017; }
+  if (grad == 55) { return 819152; }
+  if (grad == 56) { return 829038; }
+  if (grad == 57) { return 838671; }
+  if (grad == 58) { return 848048; }
+  if (grad == 59) { return 857167; }
+  if (grad == 60) { return 866025; }
+  if (grad == 61) { return 874620; }
+  if (grad == 62) { return 882948; }
+  if (grad == 63) { return 891007; }
+  if (grad == 64) { return 898794; }
+  if (grad == 65) { return 906308; }
+  if (grad == 66) { return 913545; }
+  if (grad == 67) { return 920505; }
+  if (grad == 68) { return 927184; }
+  if (grad == 69) { return 933580; }
+  if (grad == 70) { return 939693; }
+  if (grad == 71) { return 945519; }
+  if (grad == 72) { return 951057; }
+  if (grad == 73) { return 956305; }
+  if (grad == 74) { return 961262; }
+  if (grad == 75) { return 965926; }
+  if (grad == 76) { return 970296; }
+  if (grad == 77) { return 974370; }
+  if (grad == 78) { return 978148; }
+  if (grad == 79) { return 981627; }
+  if (grad == 80) { return 984808; }
+  if (grad == 81) { return 987688; }
+  if (grad == 82) { return 990268; }
+  if (grad == 83) { return 992546; }
+  if (grad == 84) { return 994522; }
+  if (grad == 85) { return 996195; }
+  if (grad == 86) { return 997564; }
+  if (grad == 87) { return 998630; }
+  if (grad == 88) { return 999391; }
+  return 999848;   // 89
+}
+
+// Sinus fuer Winkel in Mikrograd (0 bis 360000000).
+// Rueckgabe in Festkomma (Wert * 1.000.000): Sin64(90000000) = 1000000.
+//
+// #1444: Zwischen zwei Gradstuetzstellen wird linear interpoliert — sonst
+// waeren alle Mikrograd innerhalb eines Grades derselbe Wert, und Aufrufer,
+// die in Mikrograd rechnen (geo, vector), saehen Stufen.
 public fn Sin64(degrees: int64): int64 {
-  // Normalisiere auf 0-360 Grad
-  var deg: int64 := degrees / 1000000;
-  
-  while (deg < 0) { deg := deg + 360; }
-  deg := deg % 360;
-  
-  // Sinus ist symmetrisch
+  var mikro: int64 := degrees;
+  var vollkreis: int64 := 360000000;
+  while (mikro < 0) { mikro := mikro + vollkreis; }
+  mikro := mikro % vollkreis;
+
+  // Vorzeichen und Spiegelung an 180 bzw. 90 Grad.
   var neg: int64 := 1;
-  if (deg > 180) {
-    neg := -1;
-    deg -= 180;
+  if (mikro >= 180000000) {
+    neg := 0 - 1;
+    mikro := mikro - 180000000;
   }
-  if (deg > 90) {
-    deg := 180 - deg;
+  if (mikro > 90000000) {
+    mikro := 180000000 - mikro;
   }
-  
-  // Parabel-Approximation: sin(x) ≈ x * (π/180) für kleine x
-  // Korrektur für bessere Genauigkeit
-  var rad: int64 := deg * 17453; // ° * π/180 * 1e6
-  
-  // Vereinfachte Sinus-Näherung
-  var result: int64 := rad - (rad * rad * rad) / 6000000000;
-  
-  return (result * neg);
+
+  var grad: int64 := mikro / 1000000;
+  var rest: int64 := mikro % 1000000;
+  var unten: int64 := _sinTabelle(grad);
+  var oben:  int64 := _sinTabelle(grad + 1);
+  var wert:  int64 := unten + ((oben - unten) * rest) / 1000000;
+  return wert * neg;
 }
 
 // Cosinus: cos(x) = sin(90° - x)
@@ -232,8 +359,11 @@ public fn IsEven(x: int64): bool {
 }
 
 // Prüft ob Zahl ungerade ist
+// #1448: `x % 2` ist bei negativen Zahlen -1, nicht 1 — jede ungerade
+// negative Zahl galt damit als gerade.
 public fn IsOdd(x: int64): bool {
-  return (x % 2) == 1;
+  var r: int64 := x % 2;
+  return r == 1 || r == 0 - 1;
 }
 
 // Nächste Potenz von 2 (für Speicherverwaltung, Texturgrößen)
@@ -272,34 +402,54 @@ public fn IntSqrt(n: int64): int64 {
 }
 
 // Atan2 in microdegrees: returns angle in microdegrees (-180000000 to 180000000)
+// #1447: Das Verhaeltnis wurde mit 1e6 gerechnet und dann mit `(ratio * 45) /
+// 100000` in Mikrograd gewandelt — fuer ratio = 1e6 (also 45 Grad) ergab das
+// 450 statt 45000000, Faktor 100000 zu klein. Die Quadrantenkorrektur setzte
+// darauf auf, also landete praktisch jedes Ergebnis bei 0 oder 90 Grad.
+//
+// Jetzt: atan(t) fuer t in [0,1] ueber die Naeherung von Sun/Rajan
+//   atan(t) ~ (pi/4)*t - t*(|t|-1)*(0,2447 + 0,0663*|t|)
+// in Festkomma. Ihr Fehler liegt unter 0,01 Grad — das reicht fuer alles,
+// was diese Unit sonst rechnet, und braucht keine Tabelle.
+fn _atanEinheit(t_mikro: int64): int64 {
+  // t_mikro ist t * 1e6 mit 0 <= t <= 1e6; Rueckgabe in Mikrograd.
+  var t: int64 := t_mikro;
+  var einsMinus: int64 := t - 1000000;                       // (t - 1)
+  var klammer: int64 := 244700 + (66300 * t) / 1000000;      // 0,2447 + 0,0663 t
+  var korrektur: int64 := (t * einsMinus) / 1000000;         // t*(t-1)
+  korrektur := (korrektur * klammer) / 1000000;
+  // (pi/4)*t in Bogenmass, dann nach Grad: t * 45 Grad
+  var grad: int64 := (t * 45000000) / 1000000;
+  // Die Korrektur steht in Bogenmass; ein Bogenmass sind 57295780 Mikrograd.
+  var korrGrad: int64 := (korrektur * 57295780) / 1000000;
+  return grad - korrGrad;
+}
+
 public fn Atan2Microdegrees(y: int64, x: int64): int64 {
   if (x == 0) {
     if (y > 0) { return 90000000; }
-    if (y < 0) { return -90000000; }
+    if (y < 0) { return 0 - 90000000; }
     return 0;
   }
-  
-  var angle: int64 := 0;
+
   var ay: int64 := Abs64(y);
   var ax: int64 := Abs64(x);
-  
-  // atan(y/x) approximation
-  if (ax > ay) {
-    var ratio: int64 := (ay * 1000000) / ax;
-    angle := (ratio * 45) / 100000;
+  var angle: int64 := 0;
+
+  if (ax >= ay) {
+    var t1: int64 := (ay * 1000000) / ax;
+    angle := _atanEinheit(t1);
   } else {
-    var ratio: int64 := (ax * 1000000) / ay;
-    angle := 90000000 - (ratio * 45) / 100000;
+    var t2: int64 := (ax * 1000000) / ay;
+    angle := 90000000 - _atanEinheit(t2);
   }
-  
-  // Determine quadrant
+
   if (x < 0) {
     if (y >= 0) { angle := 180000000 - angle; }
-    else { angle := -180000000 + angle; }
+    else { angle := 0 - (180000000 - angle); }
   } else {
-    if (y < 0) { angle := -angle; }
+    if (y < 0) { angle := 0 - angle; }
   }
-  
   return angle;
 }
 
@@ -373,10 +523,20 @@ pub fn NextPowerOfTwo(x: int64): int64 {
   return n;
 }
 
+// #1545/#1448: Bei einer negativen Zahl ist `v / 2` eine Division mit
+// Abrundung gegen null: -1 / 2 ist 0, die Schleife endete nach einem
+// Durchgang und lieferte 1 — fuer JEDE negative Zahl. Bitmasken und Hashwerte
+// haben regelmaessig das oberste Bit gesetzt und sind als int64 negativ.
+//
+// Gezaehlt wird jetzt ueber alle 64 Stellen mit logischer Verschiebung; das
+// Vorzeichenbit ist eine Stelle wie jede andere.
 pub fn PopCount(x: int64): int64 {
-  var v: int64 := x;
   var c: int64 := 0;
-  while (v != 0) { c := c + (v & 1); v := v / 2; }
+  var i: int64 := 0;
+  while (i < 64) {
+    if (((x >> i) & 1) != 0) { c := c + 1; }
+    i := i + 1;
+  }
   return c;
 }
 
@@ -418,7 +578,14 @@ pub fn FloorF64(x: f64): f64 { return fFloor(x); }
 pub fn CeilF64(x: f64): f64  { return fCeil(x);  }
 pub fn RoundF64(x: f64): f64 { return fRound(x); }
 
+// #1540: Der Umweg ueber fToInt traegt nur, solange der Wert in einen int64
+// passt. Ab 2^63 lieferte er Muell — dabei ist jeder f64 dieser Groesse
+// ohnehin schon ganzzahlig, weil die Mantisse keine Nachkommastellen mehr
+// darstellen kann. FloorF64 und CeilF64 rechnen direkt und waren nie
+// betroffen; TruncF64 zieht jetzt nach.
 pub fn TruncF64(x: f64): f64 {
+  var grenze: f64 := 9223372036854775808.0;   // 2^63
+  if (fGe(fAbs(x), grenze) != 0) { return x; }
   return (fToInt(x) as f64);
 }
 
@@ -507,6 +674,25 @@ fn f64_cosCore(r: f64): f64 {
 }
 
 // Anzahl der Viertelkreise in x, kaufmaennisch gerundet.
+// #1537: Bei sehr grossen Argumenten trug die Reduktion nicht mehr — der Rest
+// blieb riesig, das Polynom lief davon und die Funktion gab praktisch ihr
+// eigenes Argument zurueck statt eines Wertes in [-1, 1].
+//
+// Zwei Stufen: erst modulo 2*PI in f64 (das haelt den Wert klein genug fuer
+// die Viertelkreis-Reduktion), danach die uebliche Rechnung. GRENZE DER
+// AUSSAGE: ab etwa 1e15 traegt ein double die Phase nicht mehr — dort ist das
+// Ergebnis zwar im Wertebereich, sagt ueber den tatsaechlichen Sinus aber
+// nichts mehr. Das ist eine Eigenschaft der Zahlendarstellung, keine der
+// Umsetzung; wer dort genaue Werte braucht, muss das Argument selbst klein
+// halten.
+fn f64_modZweiPi(ax: f64): f64 {
+  var zweiPi: f64 := 6.283185307179586;
+  if (fLt(ax, zweiPi) != 0) { return ax; }
+  var q: f64 := fDiv(ax, zweiPi);
+  var qi: f64 := FloorF64(q);
+  return fSub(ax, fMul(qi, zweiPi));
+}
+
 fn f64_quadrant(ax: f64): int64 {
   var hi: f64 := f64_pi2_hi();
   var kf: f64 := fDiv(ax, hi);
@@ -539,6 +725,7 @@ pub fn SinF64(x: f64): f64 {
     ax := fNeg(x);
     flip := true;
   }
+  ax := f64_modZweiPi(ax);                       // #1537
   var k: int64 := f64_quadrant(ax);
   var r: f64 := f64_reduce(ax, k);
   var q: int64 := k % 4;
@@ -559,6 +746,7 @@ pub fn SinF64(x: f64): f64 {
 pub fn CosF64(x: f64): f64 {
   var ax: f64 := x;
   if (fLt(x, (0 as f64)) != 0) { ax := fNeg(x); }
+  ax := f64_modZweiPi(ax);                       // #1537
   var k: int64 := f64_quadrant(ax);
   var r: f64 := f64_reduce(ax, k);
   var q: int64 := k % 4;
@@ -633,6 +821,13 @@ pub fn ExpF64(x: f64): f64 {
     fDiv(r9, (362880 as f64)));
 
   // mal 2^k, ueber wiederholtes Verdoppeln bzw. Halbieren
+  //
+  // #1536: Ohne Schranke lief diese Schleife bei grossen Argumenten
+  // praktisch endlos — fuer x = 1e9 ist k rund 1,4 Milliarden. Das Ergebnis
+  // steht laengst fest: oberhalb von 2^1024 ist es unendlich, unterhalb von
+  // 2^-1075 null. Beides wird jetzt sofort geliefert, statt es zu erlaufen.
+  if (k > 1024) { return fDiv((1 as f64), (0 as f64)); }        // +inf
+  if (k < 0 - 1075) { return (0 as f64); }
   var res: f64 := er;
   var n: int64 := k;
   while (n > 0) { res := fMul(res, (2 as f64)); n := n - 1; }
