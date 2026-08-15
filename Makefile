@@ -224,6 +224,8 @@ test: lyxc
 	@bash tests/stdlib_z3_test.sh
 	@bash tests/cli_schalter_z6_test.sh
 	@bash tests/skalierung_z2b_test.sh
+	@bash tests/lfd_grammatik_test.sh
+	@bash tests/lfd_parser_test.sh
 	@bash tests/sprachluecken_z5_test.sh
 	@bash tests/type_inference_test.sh
 	@bash tests/struct_method_test.sh

@@ -1,20 +1,26 @@
 // std/lfd_parser.lyx — LFD (LyX Form Description) parser
 // Recursive-descent parser for the LFD UI DSL.
 //
-// Node layout (48 bytes, 6 × int64):
+// Node layout (64 bytes, 8 × int64):
 //   +0:  kind       — LFD_TK_* value (form / widget / layout / property type)
 //   +8:  txtPtr     — byte offset into lfd_source where the text starts
 //   +16: txtLen     — byte length of text
 //   +24: firstChild — pointer to first child node  (0 = none)
 //   +32: nextSib    — pointer to next sibling node (0 = none)
 //   +40: numVal     — integer value for number/bool properties
+//   +48: valPtr     — #1393: Offset des ZEICHENKETTEN-Werts einer Eigenschaft
+//   +56: valLen     — #1393: dessen Laenge (0 = kein Zeichenkettenwert)
 //
 // Token layout (24 bytes, 3 × int64):
 //   +0:  kind       — LFD_TK_* value
 //   +8:  start      — byte offset in source
 //   +16: length     — byte count
 
-@description("LFD binary file format parser")
+// #1399: Hier stand "LFD binary file format parser". LFD ist kein
+// Binaerformat — es gibt weder Datei-Lese- noch Schreibroutinen, der Parser
+// arbeitet auf einem pchar. Die Fehlbeschreibung war in die Wiki-Doku
+// gewandert und hat dort jahrelang gestanden.
+@description("Recursive-Descent-Parser fuer die LFD-Textsprache (LyX Form Description)")
 @author("Andreas Röne")
 @copyright("2024-2025 Andreas Röne")
 unit std.lfd_parser;
@@ -69,10 +75,21 @@ pub con LFD_TK_EOF: int64 := 39;
 pub con LFD_TK_INVALID: int64 := 40;
 
 // Node kind constants (aliases kept for user code)
-pub con LFD_NODE_ROOT: int64 := 100;
+// #1396: Diese Liste war teils unbrauchbar, teils tot. LFD_NODE_WIDGET stand
+// auf 3 — demselben Wert wie LFD_TK_HORIZONTAL. Ein Vergleich darauf traf jede
+// waagerechte Anordnung und kein einziges Bedienelement, denn die tragen ihren
+// konkreten Typ (LFD_TK_BUTTON = 6 … LFD_TK_CUSTOM = 21). LFD_NODE_ROOT und
+// LFD_NODE_EVENT wurden nie vergeben.
+//
+// Jetzt: Die Wurzel ist und bleibt ein LFD_TK_FORM-Knoten — dafuer ist
+// LFD_NODE_FORM der Name. LFD_NODE_WIDGET liegt ausserhalb der Token-Werte und
+// bezeichnet keinen Knoten, sondern wird ueber LFDIsWidget(node) beantwortet;
+// eine einzelne Zahl kann sechzehn Typen nicht vertreten. LFD_NODE_EVENT wird
+// jetzt tatsaechlich vergeben: onclick und onchange erzeugen Ereignisknoten.
+pub con LFD_NODE_ROOT: int64 := 0;     // == LFD_TK_FORM, die Wurzel
 pub con LFD_NODE_FORM: int64 := 0;
 pub con LFD_NODE_LAYOUT: int64 := 1;
-pub con LFD_NODE_WIDGET: int64 := 3;
+pub con LFD_NODE_WIDGET: int64 := 103;  // kein Knotenwert — siehe LFDIsWidget
 pub con LFD_NODE_PROPERTY: int64 := 101;
 pub con LFD_NODE_EVENT: int64 := 102;
 
@@ -82,7 +99,7 @@ pub type LFDParser = int64;
 // Internal constants
 // ============================================================================
 
-con LFD_NODE_SZ: int64 := 48;
+con LFD_NODE_SZ: int64 := 64;   // #1393: +valPtr, +valLen
 con LFD_TOK_SZ: int64 := 24;
 
 // ============================================================================
@@ -242,8 +259,13 @@ fn _lfdLex(): void {
                 }
                 _lfdPushTok(LFD_TK_STRING, strStart, p - strStart);
                 if (p < lfd_source_len) { p := p + 1; }   // skip closing '"'
-            } else if (ch >= 48 && ch <= 57) {
+            } else if (ch >= 48 && ch <= 57 || (ch == 45 && p + 1 < lfd_source_len && _lfdCh(p + 1) >= 48 && _lfdCh(p + 1) <= 57)) {
+                // #1394: Das Minuszeichen fiel vorher in "skip unknown char"
+                // ganz unten durch — `width: -5` kam als 5 im Baum an, ohne
+                // Fehler und ohne Warnung. Es gehoert zur Zahl, wenn unmittelbar
+                // eine Ziffer folgt.
                 var numStart: int64 := p;
+                if (ch == 45) { p := p + 1; }
                 var nd: int64 := 1;
                 while (nd == 1 && p < lfd_source_len) {
                     var dc: int64 := _lfdCh(p);
@@ -312,6 +334,8 @@ fn _lfdNewNode(kind: int64, txtPtr: int64, txtLen: int64): int64 {
     poke64(base + 24, 0);
     poke64(base + 32, 0);
     poke64(base + 40, 0);
+    poke64(base + 48, 0);   // #1393: valPtr
+    poke64(base + 56, 0);   // #1393: valLen
     lfd_pool_sz += 1;
     return base;
 }
@@ -367,21 +391,30 @@ fn _lfdIsLayout(k: int64): int64 {
 }
 
 // Parse property value; returns new property node
-fn _lfdParsePropVal(key: int64, keyLen: int64): int64 {
-    var node: int64 := _lfdNewNode(LFD_NODE_PROPERTY, key, keyLen);
+fn _lfdParsePropVal(key: int64, keyLen: int64, istEreignis: int64): int64 {
+    var art: int64 := LFD_NODE_PROPERTY;
+    if (istEreignis != 0) { art := LFD_NODE_EVENT; }   // #1396
+    var node: int64 := _lfdNewNode(art, key, keyLen);
     if (node == 0) { return 0; }
     var vk: int64 := _lfdTokKind();
     if (vk == LFD_TK_STRING || vk == LFD_TK_IDENTIFIER) {
+        // #1393: Der Wert wurde bisher gelesen und VERWORFEN — text, tooltip
+        // und onclick waren ueber die Schnittstelle nicht mehr erreichbar.
+        poke64(node + 48, _lfdTokStart());
+        poke64(node + 56, _lfdTokLen());
         _lfdAdvTok();
     } else if (vk == LFD_TK_NUMBER) {
         var ns: int64 := _lfdTokStart();
         var nl: int64 := _lfdTokLen();
-        var num: int64 := 0;
+        var neg: int64 := 0;
         var i: int64 := 0;
+        if (nl > 0 && _lfdCh(ns) == 45) { neg := 1; i := 1; }   // #1394
+        var num: int64 := 0;
         while (i < nl) {
             num := num * 10 + _lfdCh(ns + i) - 48;
             i += 1;
         }
+        if (neg != 0) { num := 0 - num; }
         poke64(node + 40, num);
         _lfdAdvTok();
     } else if (vk == LFD_TK_TRUE) {
@@ -442,7 +475,9 @@ fn _lfdParseElement(): int64 {
         _lfdAdvTok();
         if (_lfdTokKind() == LFD_TK_COLON) {
             _lfdAdvTok();
-            return _lfdParsePropVal(ps, pl);
+            var ev: int64 := 0;
+            if (k == LFD_TK_ONCLICK || k == LFD_TK_ONCHANGE) { ev := 1; }   // #1396
+            return _lfdParsePropVal(ps, pl, ev);
         }
         lfd_error_count += 1;
         lfd_error_msg := "expected ':'";
@@ -551,6 +586,102 @@ pub fn LFDGetNodeText(node: int64): pchar {
     var off: int64 := peek64(node + 8);
     if (off == 0) { return ""; }
     return (lfd_source as int64 + off) as pchar;
+}
+
+// #1395: LFDGetNodeText liefert einen Zeiger in den Quelltext, der NICHT
+// nullterminiert ist — wer ihn direkt ausgibt, druckt den Rest des Formulars
+// mit. Die Laenge stand nur bei Offset +16 im Knoten, ohne Getter: das
+// Knotenlayout war damit faktisch Teil der Schnittstelle, weil kein Aufrufer
+// ohne `peek64(node + 16)` auskam.
+pub fn LFDGetNodeTextLen(node: int64): int64 {
+    if (node == 0) { return 0; }
+    return peek64(node + 16);
+}
+
+// Schreibt den Text nullterminiert nach dest und liefert die Zahl der
+// geschriebenen Zeichen (ohne Abschluss). Passt er nicht, wird abgeschnitten —
+// destMax zaehlt den Abschluss mit.
+pub fn LFDCopyNodeText(node: int64, dest: int64, destMax: int64): int64 {
+    if (dest == 0 || destMax <= 0) { return 0; }
+    var len: int64 := LFDGetNodeTextLen(node);
+    if (len > destMax - 1) { len := destMax - 1; }
+    var src: int64 := 0;
+    if (node != 0) { src := lfd_source as int64 + peek64(node + 8); }
+    var i: int64 := 0;
+    while (i < len) {
+        poke8(dest + i, peek8(src + i));
+        i += 1;
+    }
+    poke8(dest + i, 0);
+    return len;
+}
+
+// #1393: Der Zeichenketten-WERT einer Eigenschaft. Dieselbe Form wie beim
+// Text: Zeiger in den Quelltext plus Laenge, dazu eine kopierende Variante.
+// 0 bzw. Laenge 0 heisst "kein Zeichenkettenwert" (Zahl, Wahrheitswert oder
+// gar kein Wert).
+pub fn LFDGetNodeValue(node: int64): pchar {
+    if (node == 0) { return ""; }
+    var off: int64 := peek64(node + 48);
+    if (off == 0) { return ""; }
+    return (lfd_source as int64 + off) as pchar;
+}
+
+pub fn LFDGetNodeValueLen(node: int64): int64 {
+    if (node == 0) { return 0; }
+    return peek64(node + 56);
+}
+
+pub fn LFDCopyNodeValue(node: int64, dest: int64, destMax: int64): int64 {
+    if (dest == 0 || destMax <= 0) { return 0; }
+    var len: int64 := LFDGetNodeValueLen(node);
+    if (len > destMax - 1) { len := destMax - 1; }
+    var src: int64 := 0;
+    if (node != 0) { src := lfd_source as int64 + peek64(node + 48); }
+    var i: int64 := 0;
+    while (i < len) {
+        poke8(dest + i, peek8(src + i));
+        i += 1;
+    }
+    poke8(dest + i, 0);
+    return len;
+}
+
+// #1396: Ist der Knoten ein Bedienelement? Eine einzelne Konstante kann das
+// nicht beantworten — Bedienelemente tragen ihren konkreten Typ. Container
+// (layout, vertical, groupbox …) zaehlen nicht dazu, dafuer gibt es
+// LFDIsContainer.
+pub fn LFDIsWidget(node: int64): int64 {
+    if (node == 0) { return 0; }
+    var k: int64 := peek64(node);
+    if (k == LFD_TK_BUTTON)      { return 1; }
+    if (k == LFD_TK_LABEL)       { return 1; }
+    if (k == LFD_TK_INPUT)       { return 1; }
+    if (k == LFD_TK_CHECKBOX)    { return 1; }
+    if (k == LFD_TK_RADIOBUTTON) { return 1; }
+    if (k == LFD_TK_COMBOBOX)    { return 1; }
+    if (k == LFD_TK_SPINBOX)     { return 1; }
+    if (k == LFD_TK_SLIDER)      { return 1; }
+    if (k == LFD_TK_LISTBOX)     { return 1; }
+    if (k == LFD_TK_TEXTEDIT)    { return 1; }
+    if (k == LFD_TK_PROGRESSBAR) { return 1; }
+    if (k == LFD_TK_IMAGE)       { return 1; }
+    if (k == LFD_TK_CUSTOM)      { return 1; }
+    return 0;
+}
+
+pub fn LFDIsContainer(node: int64): int64 {
+    if (node == 0) { return 0; }
+    var k: int64 := peek64(node);
+    if (k == LFD_TK_LAYOUT)     { return 1; }
+    if (k == LFD_TK_VERTICAL)   { return 1; }
+    if (k == LFD_TK_HORIZONTAL) { return 1; }
+    if (k == LFD_TK_GRID)       { return 1; }
+    if (k == LFD_TK_STACK)      { return 1; }
+    if (k == LFD_TK_GROUPBOX)   { return 1; }
+    if (k == LFD_TK_TABWIDGET)  { return 1; }
+    if (k == LFD_TK_SPLITTER)   { return 1; }
+    return 0;
 }
 
 // Return number of direct children of node.
