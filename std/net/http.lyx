@@ -263,6 +263,218 @@ pub fn HTTPRequestBuild(req: HTTPRequest): int64 {
 // WP-9.3: Sendet nur tatsächliche Request-Bytes.
 // WP-9.4: Liest Response-Body basierend auf Content-Length in einer Schleife.
 // ============================================================================
+// #1534/#1539: Der Response-Parser stand VIERMAL im Baum — einmal hier und
+// dreimal in std/net/https.lyx (dort jeweils nur die Statuszeile). Was die
+// Kopien nicht mitbekommen hatten, fehlte dort einfach: keine Kopfzeilen
+// (#1534, mit einem munmap auf einen nie gesetzten Zeiger als Folge) und keine
+// Aufloesung von `Transfer-Encoding: chunked` (#1539, ab der ersten gechunkten
+// Antwort kam der Rumpf mit Laengenrahmen durchsetzt an).
+//
+// Er steht jetzt EINMAL hier. Die Funktion liest NICHT vom Socket — sie
+// bekommt den vollstaendig gelesenen Puffer und wertet ihn aus. Damit koennen
+// TCP- und TLS-Weg denselben Parser benutzen, obwohl sie verschieden lesen.
+//
+// buf gehoert weiter dem Aufrufer; hier wird nichts freigegeben.
+pub fn HTTPParseResponse(response: HTTPResponse, buf: int64, totalRead: int64): HTTPResponse {
+  var res: HTTPResponse := response;
+  if (buf == 0 || totalRead <= 0) { return res; }
+
+  // --- Statuszeile ---
+  var i: int64 := 0;
+  while (i < totalRead - 13) {
+    if (peek8(buf + i) == 72 && peek8(buf + i + 1) == 84 &&
+        peek8(buf + i + 2) == 84 && peek8(buf + i + 3) == 80 &&
+        peek8(buf + i + 4) == 47) {
+      i += 9;
+      res.statusCode := 0;
+      res.statusCode := res.statusCode * 10 + (peek8(buf + i)     - 48);
+      res.statusCode := res.statusCode * 10 + (peek8(buf + i + 1) - 48);
+      res.statusCode := res.statusCode * 10 + (peek8(buf + i + 2) - 48);
+      i := totalRead;
+    } else {
+      i += 1;
+    }
+  }
+
+  // --- Content-Length ---
+  // Kopfzeilennamen sind laut RFC 9110 case-insensitiv, und CDNs (Cloudflare)
+  // senden sie klein. Verglichen wird deshalb auf (Byte | 0x20) — so wie es
+  // die HTTPS-Fassung schon tat und diese hier bisher NICHT: `content-length`
+  // in Kleinschreibung wurde ueberlesen.
+  i := 0;
+  while (i < totalRead - 16) {
+    if ((peek8(buf + i)      | 32) == 99  && (peek8(buf + i + 1)  | 32) == 111 &&
+        (peek8(buf + i + 2)  | 32) == 110 && (peek8(buf + i + 3)  | 32) == 116 &&
+        (peek8(buf + i + 4)  | 32) == 101 && (peek8(buf + i + 5)  | 32) == 110 &&
+        (peek8(buf + i + 6)  | 32) == 116 && (peek8(buf + i + 7)  | 32) == 45  &&
+        (peek8(buf + i + 8)  | 32) == 108 && (peek8(buf + i + 9)  | 32) == 101 &&
+        (peek8(buf + i + 10) | 32) == 110 && (peek8(buf + i + 11) | 32) == 103 &&
+        (peek8(buf + i + 12) | 32) == 116 && (peek8(buf + i + 13) | 32) == 104) {
+      i += 14;
+      while (i < totalRead && (peek8(buf + i) < 48 || peek8(buf + i) > 57)) { i += 1; }
+      res.contentLength := 0;
+      while (i < totalRead) {
+        var c: int64 := peek8(buf + i);
+        if (c < 48 || c > 57) { i := totalRead; }
+        else {
+          res.contentLength := res.contentLength * 10 + (c - 48);
+          i += 1;
+        }
+      }
+    } else {
+      i += 1;
+    }
+  }
+
+  // --- Ende der Kopfzeilen ---
+  var bodyStart: int64 := 0;
+  i := 0;
+  while (i < totalRead - 4) {
+    if (peek8(buf + i) == 13 && peek8(buf + i + 1) == 10 &&
+        peek8(buf + i + 2) == 13 && peek8(buf + i + 3) == 10) {
+      bodyStart := i + 4;
+      i := totalRead;
+    } else {
+      i += 1;
+    }
+  }
+
+  // --- Rohe Kopfzeilen sichern (WP-C6, #1453) ---
+  if (bodyStart > 0) {
+    var hdrLen: int64 := bodyStart - 2;
+    res.headersRaw := mmap(0, hdrLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (res.headersRaw != 0) {
+      var hj: int64 := 0;
+      while (hj < hdrLen) { poke8(res.headersRaw + hj, peek8(buf + hj)); hj := hj + 1; }
+      poke8(res.headersRaw + hdrLen, 0);
+      res.headersSize := hdrLen;
+      var hcnt: int64 := 0;
+      var hk: int64 := 0;
+      while (hk < hdrLen) {
+        if (peek8(res.headersRaw + hk) == 10) { hcnt := hcnt + 1; }
+        hk := hk + 1;
+      }
+      if (hcnt > 0) { hcnt := hcnt - 1; }   // die Statuszeile zaehlt nicht mit
+      res.headerCount := hcnt;
+    }
+  }
+
+  // --- Transfer-Encoding: chunked erkennen ---
+  //
+  // Die alte Erkennung verglich FESTE Offsets ab dem "T" von "Transfer"
+  // (+18 fuer das "c" von "chunked") und traf damit nur die Schreibweise OHNE
+  // Leerzeichen hinter dem Doppelpunkt. Reale Server senden
+  // "Transfer-Encoding: chunked" mit Leerzeichen — dort war das "c" bei +19,
+  // die Erkennung schlug fehl, und der Rumpf blieb gerahmt (#1539).
+  //
+  // Gesucht wird jetzt das Wort selbst, case-insensitiv, irgendwo im
+  // Kopfbereich. Es kommt dort in keiner anderen Bedeutung vor.
+  var isChunked: int64 := 0;
+  if (res.headersRaw != 0 && res.headersSize >= 7) {
+    var hptr: int64 := res.headersRaw;
+    var hcheck: int64 := 0;
+    while (hcheck <= res.headersSize - 7) {
+      if ((peek8(hptr + hcheck)     | 32) == 99  &&   // c
+          (peek8(hptr + hcheck + 1) | 32) == 104 &&   // h
+          (peek8(hptr + hcheck + 2) | 32) == 117 &&   // u
+          (peek8(hptr + hcheck + 3) | 32) == 110 &&   // n
+          (peek8(hptr + hcheck + 4) | 32) == 107 &&   // k
+          (peek8(hptr + hcheck + 5) | 32) == 101 &&   // e
+          (peek8(hptr + hcheck + 6) | 32) == 100) {   // d
+        isChunked := 1;
+        hcheck := res.headersSize;
+      } else {
+        hcheck += 1;
+      }
+    }
+  }
+
+  // --- Rumpf: gechunkt aufloesen oder unveraendert uebernehmen ---
+  if (isChunked != 0 && bodyStart > 0) {
+    var chunkBody: int64 := mmap(0, totalRead + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (chunkBody != 0) {
+      var cpos: int64 := bodyStart;
+      var wpos: int64 := 0;
+      var doneChunk: int64 := 0;
+      while (doneChunk == 0 && cpos < totalRead) {
+        var chunkSz: int64 := 0;
+        while (cpos < totalRead) {
+          var hc: int64 := peek8(buf + cpos);
+          if (hc == 13 || hc == 10) { cpos := cpos; break; }
+          if (hc >= 48 && hc <= 57)       { chunkSz := chunkSz * 16 + (hc - 48); }
+          else if (hc >= 65 && hc <= 70)  { chunkSz := chunkSz * 16 + (hc - 55); }
+          else if (hc >= 97 && hc <= 102) { chunkSz := chunkSz * 16 + (hc - 87); }
+          cpos += 1;
+        }
+        if (cpos < totalRead && peek8(buf + cpos) == 13) { cpos := cpos + 1; }
+        if (cpos < totalRead && peek8(buf + cpos) == 10) { cpos := cpos + 1; }
+        if (chunkSz == 0) { doneChunk := 1; }
+        else {
+          var cj: int64 := 0;
+          while (cj < chunkSz && cpos < totalRead) {
+            poke8(chunkBody + wpos, peek8(buf + cpos));
+            wpos += 1; cpos := cpos + 1; cj := cj + 1;
+          }
+          if (cpos < totalRead && peek8(buf + cpos) == 13) { cpos := cpos + 1; }
+          if (cpos < totalRead && peek8(buf + cpos) == 10) { cpos := cpos + 1; }
+        }
+      }
+      poke8(chunkBody + wpos, 0);
+      res.bodyPtr := chunkBody;
+      res.bodySize := wpos;
+    }
+    return res;
+  }
+
+  if (bodyStart > 0) {
+    var bodyLen: int64 := totalRead - bodyStart;
+    if (res.contentLength > 0 && res.contentLength < bodyLen) {
+      bodyLen := res.contentLength;
+    }
+    if (bodyLen > 0) {
+      res.bodyPtr := mmap(0, bodyLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
+      if (res.bodyPtr != 0) {
+        var j: int64 := 0;
+        while (j < bodyLen) {
+          poke8(res.bodyPtr + j, peek8(buf + bodyStart + j));
+          j += 1;
+        }
+        poke8(res.bodyPtr + bodyLen, 0);
+        res.bodySize := bodyLen;
+      }
+    }
+  }
+  return res;
+}
+
+// Wieviele Bytes fehlen laut Content-Length noch? 0 = nichts oder unbekannt.
+// Wird vor dem Parsen gebraucht, damit der Leser weiterlesen kann.
+pub fn HTTPBodyRest(buf: int64, totalRead: int64): int64 {
+  var probe: HTTPResponse;
+  probe.statusCode := 0; probe.statusText := 0; probe.headerCount := 0;
+  probe.contentLength := 0; probe.bodyPtr := 0; probe.bodySize := 0;
+  probe.headersRaw := 0; probe.headersSize := 0;
+  var bodyStart: int64 := 0;
+  var i: int64 := 0;
+  while (i < totalRead - 4) {
+    if (peek8(buf + i) == 13 && peek8(buf + i + 1) == 10 &&
+        peek8(buf + i + 2) == 13 && peek8(buf + i + 3) == 10) {
+      bodyStart := i + 4;
+      i := totalRead;
+    } else {
+      i += 1;
+    }
+  }
+  if (bodyStart == 0) { return 0; }
+  var g: HTTPResponse := HTTPParseResponse(probe, buf, totalRead);
+  if (g.bodyPtr != 0) { munmap(g.bodyPtr, g.bodySize + 1); }
+  if (g.headersRaw != 0) { munmap(g.headersRaw, g.headersSize + 1); }
+  if (g.contentLength <= 0) { return 0; }
+  var da: int64 := totalRead - bodyStart;
+  if (g.contentLength <= da) { return 0; }
+  return g.contentLength - da;
+}
+
 pub fn HTTPSend(request: HTTPRequest): HTTPResponse {
   var response: HTTPResponse;
   response.statusCode := 0;
@@ -308,189 +520,32 @@ pub fn HTTPSend(request: HTTPRequest): HTTPResponse {
   if (n <= 0) { sys_close(sock); munmap(buf, bufSize); return response; }
   var totalRead: int64 := n;
 
-  // Parse status code
-  var i: int64 := 0;
-  while (i < totalRead - 13) {
-    if (peek8(buf + i) == 72 && peek8(buf + i + 1) == 84 &&
-        peek8(buf + i + 2) == 84 && peek8(buf + i + 3) == 80 &&
-        peek8(buf + i + 4) == 47) {
-      i += 9;
-      response.statusCode := 0;
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i)   - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i+1) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i+2) - 48);
-      break;
-    }
-    i += 1;
-  }
-
-  // Parse Content-Length
-  i := 0;
-  while (i < totalRead - 16) {
-    if (peek8(buf+i)==67 && peek8(buf+i+1)==111 && peek8(buf+i+2)==110 &&
-        peek8(buf+i+3)==116 && peek8(buf+i+4)==101 && peek8(buf+i+5)==110 &&
-        peek8(buf+i+6)==116 && peek8(buf+i+7)==45 && peek8(buf+i+8)==76 &&
-        peek8(buf+i+9)==101 && peek8(buf+i+10)==110 && peek8(buf+i+11)==103 &&
-        peek8(buf+i+12)==116 && peek8(buf+i+13)==104) {
-      i += 14;
-      // skip ": " (colon, optional space)
-      if (peek8(buf + i) == 58) { i := i + 1; }
-      if (peek8(buf + i) == 32) { i := i + 1; }
-      response.contentLength := 0;
-      while (i < totalRead) {
-        var c: int64 := peek8(buf + i);
-        if (c < 48 || c > 57) { break; }
-        response.contentLength := response.contentLength * 10 + (c - 48);
-        i += 1;
+  // #1534/#1539: Hier stand der Parser ein zweites Mal (Statuszeile,
+  // Content-Length, Kopfzeilen, chunked). Er steht jetzt EINMAL in
+  // HTTPParseResponse; hier bleibt nur, was diesen Weg ausmacht: bei bekannter
+  // Content-Length nachlesen, bis der Rumpf vollstaendig ist.
+  var rest: int64 := HTTPBodyRest(buf, totalRead);
+  if (rest > 0) {
+    var newSize: int64 := totalRead + rest + 1;
+    var newBuf: int64 := mmap(0, newSize, PROT_RW, MAP_ANON, FD_NONE, 0);
+    if (newBuf != 0) {
+      var j: int64 := 0;
+      while (j < totalRead) { poke8(newBuf + j, peek8(buf + j)); j := j + 1; }
+      munmap(buf, bufSize);
+      buf := newBuf; bufSize := newSize;
+      var pos: int64 := totalRead;
+      var remaining: int64 := rest;
+      while (remaining > 0) {
+        var ck: int64 := http_readTimeout(sock, buf + pos, remaining, HTTP_RECV_TIMEOUT_MS);
+        if (ck <= 0) { remaining := 0; }
+        else { pos += ck; remaining := remaining - ck; }
       }
-      break;
-    }
-    i += 1;
-  }
-
-  // Find end of headers (\r\n\r\n)
-  var bodyStart: int64 := 0;
-  i := 0;
-  while (i < totalRead - 4) {
-    if (peek8(buf+i)==13 && peek8(buf+i+1)==10 &&
-        peek8(buf+i+2)==13 && peek8(buf+i+3)==10) {
-      bodyStart := i + 4;
-      break;
-    }
-    i += 1;
-  }
-
-  // WP-C6: Speichere rohe Response-Header (ohne body)
-  if (bodyStart > 0) {
-    var hdrLen: int64 := bodyStart - 2;  // ohne abschließendes \r\n\r\n→\r\n
-    response.headersRaw := mmap(0, hdrLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
-    if (response.headersRaw != 0) {
-      var hj: int64 := 0;
-      while (hj < hdrLen) { poke8(response.headersRaw + hj, peek8(buf + hj)); hj := hj + 1; }
-      poke8(response.headersRaw + hdrLen, 0);
-      response.headersSize := hdrLen;
-      // #1453: Kopfzeilen zaehlen. Das Feld gab es schon, gesetzt wurde es
-      // nie — eine Schleife darueber lief null Mal und sah am Aufrufort aus
-      // wie "Antwort ohne Header".
-      // Gezaehlt werden die Zeilenumbrueche; der erste gehoert zur
-      // Statuszeile und zaehlt nicht mit.
-      var hcnt: int64 := 0;
-      var hk: int64 := 0;
-      while (hk < hdrLen) {
-        if (peek8(response.headersRaw + hk) == 10) { hcnt := hcnt + 1; }
-        hk := hk + 1;
-      }
-      if (hcnt > 0) { hcnt := hcnt - 1; }
-      response.headerCount := hcnt;
-    }
-  }
-
-  // WP-C6: Detect Transfer-Encoding: chunked
-  var isChunked: int64 := 0;
-  if (response.headersRaw != 0) {
-    var hptr: int64 := response.headersRaw;
-    var hcheck: int64 := 0;
-    while (hcheck < response.headersSize - 26) {
-      // "Transfer-Encoding: chunked"  (T=84,r=114,a=97,n=110,s=115,f=102,e=101,r=114)
-      if (peek8(hptr+hcheck)==84 && peek8(hptr+hcheck+1)==114 && peek8(hptr+hcheck+2)==97 &&
-          peek8(hptr+hcheck+3)==110 && peek8(hptr+hcheck+4)==115 &&
-          peek8(hptr+hcheck+18)==99 && peek8(hptr+hcheck+19)==104 &&   // "ch"
-          peek8(hptr+hcheck+20)==117 && peek8(hptr+hcheck+21)==110 &&  // "un"
-          peek8(hptr+hcheck+22)==107 && peek8(hptr+hcheck+23)==101 &&  // "ke"
-          peek8(hptr+hcheck+24)==100) {                                  // "d"
-        isChunked := 1; hcheck := response.headersSize;
-      }
-      hcheck += 1;
-    }
-  }
-
-  // WP-9.4: Lese fehlenden Body (Content-Length oder chunked)
-  if (isChunked == 0 && bodyStart > 0 && response.contentLength > 0) {
-    var alreadyHave: int64 := totalRead - bodyStart;
-    var need: int64 := response.contentLength - alreadyHave;
-    if (need > 0) {
-      var newSize: int64 := bodyStart + response.contentLength + 1;
-      var newBuf: int64 := mmap(0, newSize, PROT_RW, MAP_ANON, FD_NONE, 0);
-      if (newBuf != 0) {
-        var j: int64 := 0;
-        while (j < totalRead) { poke8(newBuf + j, peek8(buf + j)); j := j + 1; }
-        munmap(buf, bufSize);
-        buf := newBuf; bufSize := newSize;
-        var pos: int64 := totalRead;
-        var remaining: int64 := need;
-        while (remaining > 0) {
-          var ck: int64 := http_readTimeout(sock, buf + pos, remaining, HTTP_RECV_TIMEOUT_MS);
-          if (ck <= 0) { break; }
-          pos += ck; remaining := remaining - ck;
-        }
-        totalRead := pos;
-      }
+      totalRead := pos;
     }
   }
 
   sys_close(sock);
-
-  // WP-C6: Chunked Transfer Encoding — unchunk body in place
-  if (isChunked != 0 && bodyStart > 0) {
-    var chunkBody: int64 := mmap(0, totalRead + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
-    if (chunkBody != 0) {
-      var cpos: int64 := bodyStart;
-      var wpos: int64 := 0;
-      var doneChunk: int64 := 0;
-      while (doneChunk == 0 && cpos < totalRead) {
-        // Read hex size
-        var chunkSz: int64 := 0;
-        while (cpos < totalRead) {
-          var hc: int64 := peek8(buf + cpos);
-          if (hc == 13 || hc == 10) { break; }
-          if (hc >= 48 && hc <= 57)  { chunkSz := chunkSz * 16 + (hc - 48); }
-          else if (hc >= 65 && hc <= 70) { chunkSz := chunkSz * 16 + (hc - 55); }
-          else if (hc >= 97 && hc <= 102) { chunkSz := chunkSz * 16 + (hc - 87); }
-          cpos += 1;
-        }
-        // Skip \r\n after size
-        if (cpos < totalRead && peek8(buf + cpos) == 13) { cpos := cpos + 1; }
-        if (cpos < totalRead && peek8(buf + cpos) == 10) { cpos := cpos + 1; }
-        if (chunkSz == 0) { doneChunk := 1; }
-        else {
-          var cj: int64 := 0;
-          while (cj < chunkSz && cpos < totalRead) {
-            poke8(chunkBody + wpos, peek8(buf + cpos));
-            wpos += 1; cpos := cpos + 1; cj := cj + 1;
-          }
-          // Skip trailing \r\n
-          if (cpos < totalRead && peek8(buf + cpos) == 13) { cpos := cpos + 1; }
-          if (cpos < totalRead && peek8(buf + cpos) == 10) { cpos := cpos + 1; }
-        }
-      }
-      poke8(chunkBody + wpos, 0);
-      response.bodyPtr := chunkBody;
-      response.bodySize := wpos;
-    }
-    munmap(buf, bufSize);
-    return response;
-  }
-
-  // Non-chunked: extract body normally
-  if (bodyStart > 0) {
-    var bodyLen: int64 := totalRead - bodyStart;
-    if (response.contentLength > 0 && response.contentLength < bodyLen) {
-      bodyLen := response.contentLength;
-    }
-    if (bodyLen > 0) {
-      response.bodyPtr := mmap(0, bodyLen + 1, PROT_RW, MAP_ANON, FD_NONE, 0);
-      if (response.bodyPtr != 0) {
-        var j: int64 := 0;
-        while (j < bodyLen) {
-          poke8(response.bodyPtr + j, peek8(buf + bodyStart + j));
-          j += 1;
-        }
-        poke8(response.bodyPtr + bodyLen, 0);
-        response.bodySize := bodyLen;
-      }
-    }
-  }
-
+  response := HTTPParseResponse(response, buf, totalRead);
   munmap(buf, bufSize);
   return response;
 }
