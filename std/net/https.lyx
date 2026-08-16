@@ -49,6 +49,13 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
   response.contentLength := 0;
   response.bodyPtr := 0;
   response.bodySize := 0;
+  // #1534: Diese beiden fehlten. HTTPResponseFree prueft `headersRaw != 0` und
+  // ruft dann munmap darauf — bei nie gesetztem Feld entschied Stack-Rauschen
+  // ueber Adresse UND Laenge. Meist scheiterte der Aufruf mit EINVAL und fiel
+  // nicht auf; traf der Muellwert eine gemappte Adresse, wurde fremder
+  // Speicher freigegeben.
+  response.headersRaw := 0;
+  response.headersSize := 0;
   
   // Initialize TLS
   ctx := TLSInit();
@@ -155,83 +162,16 @@ pub fn HTTPSGet(host: int64, path: int64): HTTPResponse {
     munmap(buf, cap);
     return response;
   }
-  n := total;   // the parsing below scans the full accumulated response
+  n := total;   // der Parser sieht die vollstaendig gelesene Antwort
 
-  // Parse status line
-  i := 0;
-  while (i < n - 13) {
-    if (peek8(buf + i) == 72 && peek8(buf + i + 1) == 84 && 
-        peek8(buf + i + 2) == 84 && peek8(buf + i + 3) == 80 &&
-        peek8(buf + i + 4) == 47) {
-      i += 9;
-      response.statusCode := 0;
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 1) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 2) - 48);
-      break;
-    }
-    i += 1;
-  }
-  
-  // Find Content-Length. HTTP header names are case-insensitive, and CDNs
-  // (Cloudflare) send them lowercased — match on (byte | 0x20) so "content-
-  // length" and "Content-Length" both hit. ('-' is unaffected by | 0x20.)
-  i := 0;
-  while (i < n - 16) {
-    if ((peek8(buf + i) | 32) == 99 && (peek8(buf + i + 1) | 32) == 111 &&
-        (peek8(buf + i + 2) | 32) == 110 && (peek8(buf + i + 3) | 32) == 116 &&
-        (peek8(buf + i + 4) | 32) == 101 && (peek8(buf + i + 5) | 32) == 110 &&
-        (peek8(buf + i + 6) | 32) == 116 && (peek8(buf + i + 7) | 32) == 45 &&
-        (peek8(buf + i + 8) | 32) == 108 && (peek8(buf + i + 9) | 32) == 101 &&
-        (peek8(buf + i + 10) | 32) == 110 && (peek8(buf + i + 11) | 32) == 103 &&
-        (peek8(buf + i + 12) | 32) == 116 && (peek8(buf + i + 13) | 32) == 104) {
-      i += 14;
-      // Skip the ":" and any spaces between the header name and its value.
-      while (i < n && (peek8(buf + i) < 48 || peek8(buf + i) > 57)) {
-        i += 1;
-      }
-      response.contentLength := 0;
-      while (i < n) {
-        var c: int64 := peek8(buf + i);
-        if (c < 48 || c > 57) {
-          break;
-        }
-        response.contentLength := response.contentLength * 10 + (c - 48);
-        i += 1;
-      }
-      break;
-    }
-    i += 1;
-  }
-  
-  // Find body start
-  var bodyStart: int64 := 0;
-  i := 0;
-  while (i < n - 4) {
-    if (peek8(buf + i) == 13 && peek8(buf + i + 1) == 10 &&
-        peek8(buf + i + 2) == 13 && peek8(buf + i + 3) == 10) {
-      bodyStart := i + 4;
-      break;
-    }
-    i += 1;
-  }
-  
-  // Extract body
-  if (bodyStart > 0) {
-    var bodyLen: int64 := n - bodyStart;
-    if (bodyLen > 0) {
-      response.bodyPtr := mmap(0, bodyLen, PROT_RW, MAP_ANON, FD_NONE, 0);
-      if (response.bodyPtr != 0) {
-        i := 0;
-        while (i < bodyLen) {
-          poke8(response.bodyPtr + i, peek8(buf + bodyStart + i));
-          i += 1;
-        }
-        response.bodySize := bodyLen;
-      }
-    }
-  }
-
+  // #1534/#1539: Hier stand eine eigene, kuerzere Auswertung — nur die
+  // Statuszeile und der Rumpf ab \r\n\r\n. Kopfzeilen wurden nicht uebernommen
+  // (#1534) und `Transfer-Encoding: chunked` nicht aufgeloest (#1539); ab der
+  // ersten gechunkten Antwort kam der Rumpf mit Laengenrahmen durchsetzt an.
+  //
+  // Es gilt jetzt derselbe Parser wie ueber TCP. Er liest nicht vom Socket,
+  // deshalb passt er auch auf den TLS-Weg.
+  response := HTTPParseResponse(response, buf, n);
   munmap(buf, cap);
   return response;
 }
@@ -264,6 +204,13 @@ pub fn HTTPSSend(req: HTTPRequest): HTTPResponse {
   response.contentLength := 0;
   response.bodyPtr := 0;
   response.bodySize := 0;
+  // #1534: Diese beiden fehlten. HTTPResponseFree prueft `headersRaw != 0` und
+  // ruft dann munmap darauf — bei nie gesetztem Feld entschied Stack-Rauschen
+  // ueber Adresse UND Laenge. Meist scheiterte der Aufruf mit EINVAL und fiel
+  // nicht auf; traf der Muellwert eine gemappte Adresse, wurde fremder
+  // Speicher freigegeben.
+  response.headersRaw := 0;
+  response.headersSize := 0;
   
   // Initialize TLS
   ctx := TLSInit();
@@ -354,83 +301,16 @@ pub fn HTTPSSend(req: HTTPRequest): HTTPResponse {
     munmap(buf, cap);
     return response;
   }
-  n := total;   // the parsing below scans the full accumulated response
+  n := total;   // der Parser sieht die vollstaendig gelesene Antwort
 
-  // Parse status line
-  i := 0;
-  while (i < n - 13) {
-    if (peek8(buf + i) == 72 && peek8(buf + i + 1) == 84 && 
-        peek8(buf + i + 2) == 84 && peek8(buf + i + 3) == 80 &&
-        peek8(buf + i + 4) == 47) {
-      i += 9;
-      response.statusCode := 0;
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 1) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 2) - 48);
-      break;
-    }
-    i += 1;
-  }
-  
-  // Find Content-Length. HTTP header names are case-insensitive, and CDNs
-  // (Cloudflare) send them lowercased — match on (byte | 0x20) so "content-
-  // length" and "Content-Length" both hit. ('-' is unaffected by | 0x20.)
-  i := 0;
-  while (i < n - 16) {
-    if ((peek8(buf + i) | 32) == 99 && (peek8(buf + i + 1) | 32) == 111 &&
-        (peek8(buf + i + 2) | 32) == 110 && (peek8(buf + i + 3) | 32) == 116 &&
-        (peek8(buf + i + 4) | 32) == 101 && (peek8(buf + i + 5) | 32) == 110 &&
-        (peek8(buf + i + 6) | 32) == 116 && (peek8(buf + i + 7) | 32) == 45 &&
-        (peek8(buf + i + 8) | 32) == 108 && (peek8(buf + i + 9) | 32) == 101 &&
-        (peek8(buf + i + 10) | 32) == 110 && (peek8(buf + i + 11) | 32) == 103 &&
-        (peek8(buf + i + 12) | 32) == 116 && (peek8(buf + i + 13) | 32) == 104) {
-      i += 14;
-      // Skip the ":" and any spaces between the header name and its value.
-      while (i < n && (peek8(buf + i) < 48 || peek8(buf + i) > 57)) {
-        i += 1;
-      }
-      response.contentLength := 0;
-      while (i < n) {
-        var c: int64 := peek8(buf + i);
-        if (c < 48 || c > 57) {
-          break;
-        }
-        response.contentLength := response.contentLength * 10 + (c - 48);
-        i += 1;
-      }
-      break;
-    }
-    i += 1;
-  }
-  
-  // Find body start
-  var bodyStart: int64 := 0;
-  i := 0;
-  while (i < n - 4) {
-    if (peek8(buf + i) == 13 && peek8(buf + i + 1) == 10 &&
-        peek8(buf + i + 2) == 13 && peek8(buf + i + 3) == 10) {
-      bodyStart := i + 4;
-      break;
-    }
-    i += 1;
-  }
-  
-  // Extract body
-  if (bodyStart > 0) {
-    var bodyLen: int64 := n - bodyStart;
-    if (bodyLen > 0) {
-      response.bodyPtr := mmap(0, bodyLen, PROT_RW, MAP_ANON, FD_NONE, 0);
-      if (response.bodyPtr != 0) {
-        i := 0;
-        while (i < bodyLen) {
-          poke8(response.bodyPtr + i, peek8(buf + bodyStart + i));
-          i += 1;
-        }
-        response.bodySize := bodyLen;
-      }
-    }
-  }
-
+  // #1534/#1539: Hier stand eine eigene, kuerzere Auswertung — nur die
+  // Statuszeile und der Rumpf ab \r\n\r\n. Kopfzeilen wurden nicht uebernommen
+  // (#1534) und `Transfer-Encoding: chunked` nicht aufgeloest (#1539); ab der
+  // ersten gechunkten Antwort kam der Rumpf mit Laengenrahmen durchsetzt an.
+  //
+  // Es gilt jetzt derselbe Parser wie ueber TCP. Er liest nicht vom Socket,
+  // deshalb passt er auch auf den TLS-Weg.
+  response := HTTPParseResponse(response, buf, n);
   munmap(buf, cap);
   return response;
 }
@@ -454,6 +334,13 @@ pub fn HTTPSPost(host: int64, path: int64, body: int64, bodySize: int64): HTTPRe
   response.contentLength := 0;
   response.bodyPtr := 0;
   response.bodySize := 0;
+  // #1534: Diese beiden fehlten. HTTPResponseFree prueft `headersRaw != 0` und
+  // ruft dann munmap darauf — bei nie gesetztem Feld entschied Stack-Rauschen
+  // ueber Adresse UND Laenge. Meist scheiterte der Aufruf mit EINVAL und fiel
+  // nicht auf; traf der Muellwert eine gemappte Adresse, wurde fremder
+  // Speicher freigegeben.
+  response.headersRaw := 0;
+  response.headersSize := 0;
   
   ctx := TLSInit();
   if (ctx.initialized == 0) {
@@ -534,48 +421,9 @@ pub fn HTTPSPost(host: int64, path: int64, body: int64, bodySize: int64): HTTPRe
     return response;
   }
   
-  // Parse response (same as HTTPSGet)
-  i := 0;
-  while (i < n - 13) {
-    if (peek8(buf + i) == 72 && peek8(buf + i + 1) == 84 && 
-        peek8(buf + i + 2) == 84 && peek8(buf + i + 3) == 80 &&
-        peek8(buf + i + 4) == 47) {
-      i += 9;
-      response.statusCode := 0;
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 1) - 48);
-      response.statusCode := response.statusCode * 10 + (peek8(buf + i + 2) - 48);
-      break;
-    }
-    i += 1;
-  }
-  
-  var bodyStart: int64 := 0;
-  i := 0;
-  while (i < n - 4) {
-    if (peek8(buf + i) == 13 && peek8(buf + i + 1) == 10 &&
-        peek8(buf + i + 2) == 13 && peek8(buf + i + 3) == 10) {
-      bodyStart := i + 4;
-      break;
-    }
-    i += 1;
-  }
-  
-  if (bodyStart > 0) {
-    var bodyLen: int64 := n - bodyStart;
-    if (bodyLen > 0) {
-      response.bodyPtr := mmap(0, bodyLen, PROT_RW, MAP_ANON, FD_NONE, 0);
-      if (response.bodyPtr != 0) {
-        i := 0;
-        while (i < bodyLen) {
-          poke8(response.bodyPtr + i, peek8(buf + bodyStart + i));
-          i += 1;
-        }
-        response.bodySize := bodyLen;
-      }
-    }
-  }
-  
+  // #1534/#1539: siehe HTTPSGet — derselbe Parser wie ueber TCP, statt der
+  // dritten Teilkopie im Baum.
+  response := HTTPParseResponse(response, buf, n);
   munmap(buf, 8192);
   return response;
 }
