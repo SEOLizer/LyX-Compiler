@@ -4703,6 +4703,77 @@ pub type Sema = class {
     return found;
   }
 
+  // #1529: `@flight_crit` verspricht laut Doku, dynamische Speicheranforderung
+  // in der Funktion zu unterbinden. Geprueft wurde das nie — `new`, `alloc()`
+  // und lokale Felder gingen klaglos durch. Der Fliesskomma-Teil des Attributs
+  // (SSE-Ausnahmen, #1140) arbeitet dagegen; es fehlte allein die
+  // Speicherpruefung.
+  //
+  // Lokale Felder zaehlen mit: sie entstehen im Codegen per mmap, nicht auf
+  // dem Stapel — bei `int64[100000]` sind das 800 KB, angefordert bei JEDEM
+  // Aufruf. Genau das soll das Attribut verhindern. Die Meldung nennt den
+  // Ausweg: den Puffer ausserhalb anlegen und hereinreichen.
+  fn _istHeapRuf(name: pchar, nlen: int64): int64 {
+    if (self._strNEq(name, nlen, "alloc"c, 5)) { return 1; }
+    if (self._strNEq(name, nlen, "calloc"c, 6)) { return 1; }
+    if (self._strNEq(name, nlen, "realloc"c, 7)) { return 1; }
+    if (self._strNEq(name, nlen, "malloc"c, 6)) { return 1; }
+    if (self._strNEq(name, nlen, "mmap"c, 4)) { return 1; }
+    return 0;
+  }
+
+  // Laeuft ueber den Rumpf und meldet jede Speicheranforderung. Geht bewusst
+  // NUR ueber die Knoten dieser Funktion — ein Aufruf einer anderen Funktion,
+  // die selbst allokiert, ist von hier aus nicht zu sehen und bleibt
+  // unbeanstandet; das waere eine Analyse ueber Aufrufgrenzen hinweg.
+  fn _pruefeFlightCrit(ni: int64) {
+    if (ni < 0) { return; }
+    var k: int64 := self.sn_kind(ni);
+
+    if (k == SNK_NEW) {
+      self._errorNode("new ist unter @flight_crit nicht erlaubt — der Speicher muss ausserhalb angelegt und hereingereicht werden"c, ni);
+    }
+
+    if (k == SNK_CALL) {
+      var callee: int64 := self.sn_c0(ni);
+      if (callee >= 0 && self.sn_kind(callee) == SNK_IDENT
+          && self._istHeapRuf(self.sn_sVal(callee), self.sn_sLen(callee)) != 0) {
+        self._errorNodeName("Speicheranforderung unter @flight_crit nicht erlaubt"c, ni,
+                            self.sn_sVal(callee), self.sn_sLen(callee));
+      }
+      if (self.sn_sLen(ni) > 0 && self._istHeapRuf(self.sn_sVal(ni), self.sn_sLen(ni)) != 0) {
+        self._errorNodeName("Speicheranforderung unter @flight_crit nicht erlaubt"c, ni,
+                            self.sn_sVal(ni), self.sn_sLen(ni));
+      }
+    }
+
+    if (k == SNK_VAR_DECL) {
+      var tn: int64 := self.sn_c0(ni);
+      // 61 = T[] (dynamisch), 101 = T[N] (feste Groesse). Beide entstehen im
+      // Codegen per mmap; die feste Groesse ist der Fall aus der Meldung.
+      if (tn >= 0 && (self.sn_kind(tn) == SNK_TYPE_ARRAY || self.sn_kind(tn) == 101)) {
+        self._errorNodeName("lokales Feld unter @flight_crit nicht erlaubt (es entsteht per mmap, nicht auf dem Stapel)"c,
+                            ni, self.sn_sVal(ni), self.sn_sLen(ni));
+      }
+    }
+
+    // Kinder ueber die KETTEN-Form, damit Geschwister genau einmal besucht
+    // werden. Beides zusammen (Kinder rekursiv UND next am Ende) hat jeden
+    // Knoten doppelt gesehen — `new` wurde zweimal gemeldet.
+    self._pruefeFlightCritKette(self.sn_c0(ni));
+    self._pruefeFlightCritKette(self.sn_c1(ni));
+    self._pruefeFlightCritKette(self.sn_c2(ni));
+    self._pruefeFlightCritKette(self.sn_c3(ni));
+  }
+
+  fn _pruefeFlightCritKette(ni: int64) {
+    var g: int64 := ni;
+    while (g >= 0) {
+      self._pruefeFlightCrit(g);
+      g := self.sn_next(g);
+    }
+  }
+
   fn _checkFuncDecl(ni: int64) {
     self._pushScope();
     // #1135: Rueckgabetyp merken (und den der umgebenden Funktion retten —
@@ -4818,6 +4889,8 @@ pub type Sema = class {
     if (body >= 0) {
       // WP-13: Analyze body for nested function captures
       self._analyzeCaptures(body, funcName, funcNameLen);
+      // #1529: Heap-Verbot durchsetzen, bevor der Rumpf geprueft wird.
+      if ((self.sn_iVal(ni) & 2048) != 0) { self._pruefeFlightCritKette(body); }
       self._checkStmt(body);
       // WP-AS-15: DAA — check after body so locals are known
       if (self.daaEnabled != 0) { self._daaBlock(body, 0); }
