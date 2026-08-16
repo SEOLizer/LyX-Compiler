@@ -1,0 +1,1313 @@
+// std/bignum.lyx
+// Ganze Zahlen beliebiger Groesse: Betrag in 64-Bit-Woertern, Vorzeichen getrennt
+
+@description("Arbitrary precision integers: sign-magnitude representation over 64-bit limbs, addition, subtraction, schoolbook multiplication, division with remainder, shifts, modular exponentiation, greatest common divisor, decimal and hexadecimal conversion")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.bignum;
+
+import std.i128;
+import std.bits;
+import std.alloc;
+
+// ── Wozu ─────────────────────────────────────────────────────────────────────
+//
+// Alles in dieser Sprache endet bei 2^63. Fuer Geld, Zeiten und Indizes reicht
+// das; fuer Zahlentheorie und Verschluesselung nicht einmal ansatzweise. Ein
+// RSA-Schluessel ist 2048 Bit lang, also zweiunddreissig Woerter.
+//
+// Deshalb ist crypto/rsa.lyx im Bestand auch kein RSA, sondern ein
+// FFI-Aufruf nach OpenSSL: 78 Zeilen, die selbst nichts rechnen. Ohne grosse
+// Zahlen laesst sich das gar nicht anders machen.
+//
+// ── Darstellung ──────────────────────────────────────────────────────────────
+//
+// Betrag und Vorzeichen GETRENNT — nicht Zweierkomplement. Der Betrag ist ein
+// Feld aus 64-Bit-Woertern zur Basis 2^64, das niedrigstwertige zuerst:
+//
+//     Wert = vorzeichen * SUMME( wort[i] * 2^(64*i) )
+//
+// Zweierkomplement waere fuer Addition bequemer, aber fuer Multiplikation und
+// Division muesste man ohnehin auf Betraege zurueckrechnen, und die Laenge
+// waere nicht mehr eindeutig. Getrennte Vorzeichen sind der uebliche Weg (GMP,
+// Java BigInteger) und machen jede Schleife hier lesbar.
+//
+// Eine Zahl ist ein Speicherblock:
+//
+//     [p +  0]  cap    Kapazitaet in Woertern
+//     [p +  8]  len    benutzte Woerter, ohne fuehrende Nullen
+//     [p + 16]  sign   1 oder -1; bei len = 0 ist der Wert null
+//     [p + 24]  Woerter, niedrigstwertiges zuerst
+//
+// Die NORMALFORM verlangt: keine fuehrenden Nullwoerter, und die Null hat
+// len = 0 und sign = 1. Jede Funktion hier stellt sie am Ende wieder her —
+// sonst waeren Vergleich und Ausgabe nicht eindeutig.
+//
+// ── Speicher ─────────────────────────────────────────────────────────────────
+//
+// Der Aufrufer besitzt jede Zahl und gibt sie mit BigFree zurueck. Keine
+// Funktion vergroessert eine Zahl selbsttaetig; reicht die Kapazitaet des
+// Ziels nicht, kommt false zurueck. Das ist unbequemer als automatisches
+// Wachsen, aber es macht sichtbar, wo Speicher gebraucht wird — und es gibt in
+// dieser Sprache kein realloc, auf das man sich verlassen koennte.
+//
+// Wie viele Woerter man braucht:
+//
+//     Summe zweier Zahlen      max(la, lb) + 1
+//     Produkt                  la + lb
+//     Quotient                 la
+//     Rest                     lb
+//     Potenz b^e               e * BigBitLen(b) / 64 + 2
+//
+// ── Alles ist int64 ──────────────────────────────────────────────────────────
+//
+// Keine Funktion rechnet in f64; die Unit ist von der peekf64-Regression
+// #1550 nicht betroffen.
+
+pub con BIG_HEADER: int64 := 24;
+
+fn _wordAddr(p: int64, i: int64): int64 { return p + BIG_HEADER + i * 8; }
+fn _w(p: int64, i: int64): int64 { return peek64(_wordAddr(p, i)); }
+fn _setw(p: int64, i: int64, v: int64): void { poke64(_wordAddr(p, i), v); }
+
+// ── Anlegen ──────────────────────────────────────────────────────────────────
+
+// Neue Zahl mit Platz fuer capWords Woerter, Wert null.
+// 0, wenn kein Speicher da ist.
+pub fn BigNew(capWords: int64): int64 {
+  var cap: int64 := capWords;
+  if (cap < 1) { cap := 1; }
+  var p: int64 := alloc(BIG_HEADER + cap * 8);
+  if (p == 0) { return 0; }
+  poke64(p, cap);
+  poke64(p + 8, 0);
+  poke64(p + 16, 1);
+  var i: int64 := 0;
+  while (i < cap) {
+    _setw(p, i, 0);
+    i := i + 1;
+  }
+  return p;
+}
+
+pub fn BigFree(p: int64): void {
+  if (p == 0) { return; }
+  free(p, BIG_HEADER + peek64(p) * 8);
+}
+
+pub fn BigCap(p: int64): int64 { return peek64(p); }
+pub fn BigLen(p: int64): int64 { return peek64(p + 8); }
+pub fn BigSign(p: int64): int64 {
+  if (peek64(p + 8) == 0) { return 0; }
+  return peek64(p + 16);
+}
+pub fn BigIsZero(p: int64): bool { return peek64(p + 8) == 0; }
+pub fn BigIsNeg(p: int64): bool {
+  if (peek64(p + 8) == 0) { return false; }
+  return peek64(p + 16) < 0;
+}
+
+// Das Wort an Stelle i, oder 0 jenseits der Laenge.
+pub fn BigWord(p: int64, i: int64): int64 {
+  if (i < 0) { return 0; }
+  if (i >= peek64(p + 8)) { return 0; }
+  return _w(p, i);
+}
+
+// Fuehrende Nullwoerter abschneiden und die Null vereinheitlichen.
+fn _norm(p: int64): void {
+  var n: int64 := peek64(p + 8);
+  var run: bool := true;
+  while (run) {
+    if (n <= 0) { run := false; }
+    else {
+      if (_w(p, n - 1) == 0) { n := n - 1; }
+      else { run := false; }
+    }
+  }
+  poke64(p + 8, n);
+  if (n == 0) { poke64(p + 16, 1); }
+}
+
+pub fn BigZero(p: int64): void {
+  poke64(p + 8, 0);
+  poke64(p + 16, 1);
+}
+
+pub fn BigSetU64(p: int64, v: int64): bool {
+  if (peek64(p) < 1) { return false; }
+  poke64(p + 16, 1);
+  if (v == 0) {
+    poke64(p + 8, 0);
+    return true;
+  }
+  _setw(p, 0, v);
+  poke64(p + 8, 1);
+  return true;
+}
+
+pub fn BigSetI64(p: int64, v: int64): bool {
+  if (peek64(p) < 1) { return false; }
+  if (v == 0) {
+    poke64(p + 8, 0);
+    poke64(p + 16, 1);
+    return true;
+  }
+  if (v < 0) {
+    poke64(p + 16, 0 - 1);
+    // der kleinste int64 laesst sich nicht negieren; sein Betrag ist 2^63,
+    // und genau das ist sein eigenes Bitmuster
+    var m: int64 := 0 - v;
+    if (v == (1 << 63)) { m := 1 << 63; }
+    _setw(p, 0, m);
+  }
+  else {
+    poke64(p + 16, 1);
+    _setw(p, 0, v);
+  }
+  poke64(p + 8, 1);
+  return true;
+}
+
+pub fn BigCopy(a: int64, out: int64): bool {
+  var la: int64 := peek64(a + 8);
+  if (peek64(out) < la) { return false; }
+  var i: int64 := 0;
+  while (i < la) {
+    _setw(out, i, _w(a, i));
+    i := i + 1;
+  }
+  poke64(out + 8, la);
+  poke64(out + 16, peek64(a + 16));
+  return true;
+}
+
+// Passt der Wert in ein vorzeichenloses 64-Bit-Wort?
+pub fn BigFitsU64(p: int64): bool { return peek64(p + 8) <= 1; }
+
+pub fn BigToU64(p: int64): int64 {
+  if (peek64(p + 8) == 0) { return 0; }
+  return _w(p, 0);
+}
+
+// ── Vergleichen ──────────────────────────────────────────────────────────────
+
+// Nur die Betraege: -1, 0 oder 1.
+pub fn BigCmpAbs(a: int64, b: int64): int64 {
+  var la: int64 := peek64(a + 8);
+  var lb: int64 := peek64(b + 8);
+  if (la != lb) {
+    if (la < lb) { return 0 - 1; }
+    return 1;
+  }
+  var i: int64 := la - 1;
+  while (i >= 0) {
+    var wa: int64 := _w(a, i);
+    var wb: int64 := _w(b, i);
+    if (wa != wb) {
+      // vorzeichenlos vergleichen — die Woerter sind Bitmuster
+      if (I128LtU64(wa, wb)) { return 0 - 1; }
+      return 1;
+    }
+    i := i - 1;
+  }
+  return 0;
+}
+
+// Mit Vorzeichen.
+pub fn BigCmp(a: int64, b: int64): int64 {
+  var sa: int64 := BigSign(a);
+  var sb: int64 := BigSign(b);
+  if (sa != sb) {
+    if (sa < sb) { return 0 - 1; }
+    return 1;
+  }
+  var c: int64 := BigCmpAbs(a, b);
+  if (sa < 0) { return 0 - c; }
+  return c;
+}
+
+pub fn BigEquals(a: int64, b: int64): bool {
+  return BigCmp(a, b) == 0;
+}
+
+// ── Betragsrechnung ──────────────────────────────────────────────────────────
+//
+// Die eigentliche Arbeit passiert auf den Betraegen; das Vorzeichen wird
+// darueber gelegt. Beide Hilfen setzen voraus, dass out gross genug ist.
+
+// out := |a| + |b|
+fn _addAbs(a: int64, b: int64, out: int64): bool {
+  var la: int64 := peek64(a + 8);
+  var lb: int64 := peek64(b + 8);
+  var n: int64 := la;
+  if (lb > n) { n := lb; }
+  if (peek64(out) < n + 1) { return false; }
+
+  var carry: int64 := 0;
+  var cout: int64 := alloc(8);
+  if (cout == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    var wa: int64 := 0;
+    if (i < la) { wa := _w(a, i); }
+    var wb: int64 := 0;
+    if (i < lb) { wb := _w(b, i); }
+    var s: int64 := I128AddCarry(wa, wb, carry, cout);
+    _setw(out, i, s);
+    carry := peek64(cout);
+    i := i + 1;
+  }
+  free(cout, 8);
+
+  if (carry != 0) {
+    _setw(out, n, 1);
+    n := n + 1;
+  }
+  poke64(out + 8, n);
+  poke64(out + 16, 1);
+  return true;
+}
+
+// out := |a| - |b|, setzt |a| >= |b| voraus.
+fn _subAbs(a: int64, b: int64, out: int64): bool {
+  var la: int64 := peek64(a + 8);
+  var lb: int64 := peek64(b + 8);
+  if (peek64(out) < la) { return false; }
+
+  var borrow: int64 := 0;
+  var bout: int64 := alloc(8);
+  if (bout == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < la) {
+    var wa: int64 := _w(a, i);
+    var wb: int64 := 0;
+    if (i < lb) { wb := _w(b, i); }
+    var d: int64 := I128SubBorrow(wa, wb, borrow, bout);
+    _setw(out, i, d);
+    borrow := peek64(bout);
+    i := i + 1;
+  }
+  free(bout, 8);
+
+  poke64(out + 8, la);
+  poke64(out + 16, 1);
+  _norm(out);
+  return true;
+}
+
+// ── Addieren und Subtrahieren ────────────────────────────────────────────────
+
+// out := a + b. false, wenn out zu klein ist (max(la,lb)+1 Woerter noetig).
+pub fn BigAdd(a: int64, b: int64, out: int64): bool {
+  var sa: int64 := BigSign(a);
+  var sb: int64 := BigSign(b);
+  if (sa == 0) { return BigCopy(b, out); }
+  if (sb == 0) { return BigCopy(a, out); }
+
+  if (sa == sb) {
+    if (!_addAbs(a, b, out)) { return false; }
+    poke64(out + 16, sa);
+    _norm(out);
+    return true;
+  }
+
+  // verschiedene Vorzeichen: der groessere Betrag gewinnt
+  var c: int64 := BigCmpAbs(a, b);
+  if (c == 0) {
+    BigZero(out);
+    return true;
+  }
+  if (c > 0) {
+    if (!_subAbs(a, b, out)) { return false; }
+    poke64(out + 16, sa);
+  }
+  else {
+    if (!_subAbs(b, a, out)) { return false; }
+    poke64(out + 16, sb);
+  }
+  _norm(out);
+  return true;
+}
+
+// out := a - b.
+pub fn BigSub(a: int64, b: int64, out: int64): bool {
+  var sb: int64 := BigSign(b);
+  if (sb == 0) { return BigCopy(a, out); }
+  var sa: int64 := BigSign(a);
+  if (sa == 0) {
+    if (!BigCopy(b, out)) { return false; }
+    poke64(out + 16, 0 - sb);
+    return true;
+  }
+
+  if (sa != sb) {
+    if (!_addAbs(a, b, out)) { return false; }
+    poke64(out + 16, sa);
+    _norm(out);
+    return true;
+  }
+
+  var c: int64 := BigCmpAbs(a, b);
+  if (c == 0) {
+    BigZero(out);
+    return true;
+  }
+  if (c > 0) {
+    if (!_subAbs(a, b, out)) { return false; }
+    poke64(out + 16, sa);
+  }
+  else {
+    if (!_subAbs(b, a, out)) { return false; }
+    poke64(out + 16, 0 - sa);
+  }
+  _norm(out);
+  return true;
+}
+
+pub fn BigNeg(a: int64, out: int64): bool {
+  if (!BigCopy(a, out)) { return false; }
+  if (peek64(out + 8) != 0) { poke64(out + 16, 0 - peek64(out + 16)); }
+  return true;
+}
+
+pub fn BigAbs(a: int64, out: int64): bool {
+  if (!BigCopy(a, out)) { return false; }
+  poke64(out + 16, 1);
+  return true;
+}
+
+// ── Multiplizieren ───────────────────────────────────────────────────────────
+
+// out := a * b, Schulmethode. out braucht la + lb Woerter und darf NICHT auf
+// a oder b liegen — es wird von vorn beschrieben, waehrend noch gelesen wird.
+//
+// Jedes Teilprodukt zweier Woerter braucht 128 Bit; die obere Haelfte kommt
+// aus I128MulHiU. Genau dafuer gibt es std.i128.
+pub fn BigMul(a: int64, b: int64, out: int64): bool {
+  var la: int64 := peek64(a + 8);
+  var lb: int64 := peek64(b + 8);
+  if (la == 0) {
+    BigZero(out);
+    return true;
+  }
+  if (lb == 0) {
+    BigZero(out);
+    return true;
+  }
+  var n: int64 := la + lb;
+  if (peek64(out) < n) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    _setw(out, i, 0);
+    i := i + 1;
+  }
+
+  var cout: int64 := alloc(8);
+  if (cout == 0) { return false; }
+
+  i := 0;
+  while (i < la) {
+    var wa: int64 := _w(a, i);
+    var carry: int64 := 0;
+    var j: int64 := 0;
+    while (j < lb) {
+      var wb: int64 := _w(b, j);
+      // vorhandenes Wort + wa*wb + Uebertrag, alles in 128 Bit
+      var lo: int64 := wa * wb;
+      var hi: int64 := I128MulHiU(wa, wb);
+
+      var acc: int64 := _w(out, i + j);
+      var s1: int64 := I128AddCarry(acc, lo, 0, cout);
+      hi := hi + peek64(cout);
+      var s2: int64 := I128AddCarry(s1, carry, 0, cout);
+      hi := hi + peek64(cout);
+
+      _setw(out, i + j, s2);
+      carry := hi;
+      j := j + 1;
+    }
+    // uebrig gebliebener Uebertrag weiter nach oben
+    var k: int64 := i + lb;
+    while (carry != 0) {
+      var s3: int64 := I128AddCarry(_w(out, k), carry, 0, cout);
+      _setw(out, k, s3);
+      carry := peek64(cout);
+      k := k + 1;
+    }
+    i := i + 1;
+  }
+  free(cout, 8);
+
+  poke64(out + 8, n);
+  var sa: int64 := peek64(a + 16);
+  var sb: int64 := peek64(b + 16);
+  poke64(out + 16, sa * sb);
+  _norm(out);
+  return true;
+}
+
+// out := a * k mit einem vorzeichenlosen 64-Bit-Faktor.
+pub fn BigMulU64(a: int64, k: int64, out: int64): bool {
+  var la: int64 := peek64(a + 8);
+  if (la == 0) {
+    BigZero(out);
+    return true;
+  }
+  if (k == 0) {
+    BigZero(out);
+    return true;
+  }
+  if (peek64(out) < la + 1) { return false; }
+
+  var cout: int64 := alloc(8);
+  if (cout == 0) { return false; }
+
+  var carry: int64 := 0;
+  var i: int64 := 0;
+  while (i < la) {
+    var w: int64 := _w(a, i);
+    var lo: int64 := w * k;
+    var hi: int64 := I128MulHiU(w, k);
+    var s: int64 := I128AddCarry(lo, carry, 0, cout);
+    hi := hi + peek64(cout);
+    _setw(out, i, s);
+    carry := hi;
+    i := i + 1;
+  }
+  free(cout, 8);
+
+  var n: int64 := la;
+  if (carry != 0) {
+    _setw(out, n, carry);
+    n := n + 1;
+  }
+  poke64(out + 8, n);
+  poke64(out + 16, peek64(a + 16));
+  _norm(out);
+  return true;
+}
+
+// ── Schieben ─────────────────────────────────────────────────────────────────
+
+// out := a << n (Betrag; das Vorzeichen bleibt).
+pub fn BigShl(a: int64, n: int64, out: int64): bool {
+  var la: int64 := peek64(a + 8);
+  if (la == 0) {
+    BigZero(out);
+    return true;
+  }
+  if (n < 0) { return false; }
+  if (n == 0) { return BigCopy(a, out); }
+
+  var words: int64 := n / 64;
+  var bits: int64 := n % 64;
+  var need: int64 := la + words + 1;
+  if (peek64(out) < need) { return false; }
+
+  var i: int64 := need - 1;
+  while (i >= 0) {
+    var v: int64 := 0;
+    var src: int64 := i - words;
+    if (src >= 0) {
+      var hiPart: int64 := 0;
+      if (src < la) { hiPart := _w(a, src); }
+      var loPart: int64 := 0;
+      if (src - 1 >= 0) {
+        if (src - 1 < la) { loPart := _w(a, src - 1); }
+      }
+      if (bits == 0) { v := hiPart; }
+      else { v := BitsShlPair(hiPart, loPart, bits); }
+    }
+    _setw(out, i, v);
+    i := i - 1;
+  }
+  poke64(out + 8, need);
+  poke64(out + 16, peek64(a + 16));
+  _norm(out);
+  return true;
+}
+
+// out := a >> n (Betrag; Bits fallen unten heraus).
+pub fn BigShr(a: int64, n: int64, out: int64): bool {
+  var la: int64 := peek64(a + 8);
+  if (n < 0) { return false; }
+  if (n == 0) { return BigCopy(a, out); }
+
+  var words: int64 := n / 64;
+  var bits: int64 := n % 64;
+  if (words >= la) {
+    BigZero(out);
+    return true;
+  }
+  var need: int64 := la - words;
+  if (peek64(out) < need) { return false; }
+
+  var i: int64 := 0;
+  while (i < need) {
+    var src: int64 := i + words;
+    var loPart: int64 := 0;
+    if (src < la) { loPart := _w(a, src); }
+    var hiPart: int64 := 0;
+    if (src + 1 < la) { hiPart := _w(a, src + 1); }
+    var v: int64 := loPart;
+    if (bits != 0) { v := BitsShrPair(hiPart, loPart, bits); }
+    _setw(out, i, v);
+    i := i + 1;
+  }
+  poke64(out + 8, need);
+  poke64(out + 16, peek64(a + 16));
+  _norm(out);
+  return true;
+}
+
+// ── Bits ─────────────────────────────────────────────────────────────────────
+
+// Zahl der Bits des Betrags; fuer null ist sie 0.
+pub fn BigBitLen(p: int64): int64 {
+  var n: int64 := peek64(p + 8);
+  if (n == 0) { return 0; }
+  var top: int64 := _w(p, n - 1);
+  return (n - 1) * 64 + BitsHighestSet(top) + 1;
+}
+
+pub fn BigTestBit(p: int64, i: int64): bool {
+  if (i < 0) { return false; }
+  var w: int64 := i / 64;
+  if (w >= peek64(p + 8)) { return false; }
+  return BitsTest(_w(p, w), i % 64);
+}
+
+pub fn BigIsOdd(p: int64): bool {
+  if (peek64(p + 8) == 0) { return false; }
+  return (_w(p, 0) & 1) == 1;
+}
+
+// ── Teilen ───────────────────────────────────────────────────────────────────
+
+// outQ := a / b, outR := a % b, beide vorzeichenlos auf den Betraegen.
+// false bei Division durch null oder zu kleinem Ziel.
+//
+// Bitweise Schulmethode: der Rest wird Bit fuer Bit aufgebaut und, sobald er
+// den Nenner erreicht, um diesen verringert. Das ist O(bits * woerter) und
+// damit die langsamste vertretbare Fassung — fuer 2048-Bit-Zahlen sind das
+// einige Millionen Wortoperationen.
+//
+// Sie steht hier, weil sie offensichtlich richtig ist. Knuths Algorithmus D
+// waere um Groessenordnungen schneller, aber auch die Stelle, an der
+// Bignum-Umsetzungen erfahrungsgemaess falsch werden; wer ihn einbaut, hat mit
+// dieser Fassung eine Referenz zum Gegenrechnen.
+pub fn BigDivRemAbs(a: int64, b: int64, outQ: int64, outR: int64): bool {
+  var lb: int64 := peek64(b + 8);
+  if (lb == 0) { return false; }
+  var la: int64 := peek64(a + 8);
+
+  if (outQ != 0) {
+    if (peek64(outQ) < la) { return false; }
+  }
+  if (outR != 0) {
+    if (peek64(outR) < lb) { return false; }
+  }
+
+  // Arbeitskopien: Rest waechst auf hoechstens lb+1 Woerter
+  var rem: int64 := BigNew(lb + 2);
+  var tmp: int64 := BigNew(lb + 2);
+  var qq: int64 := BigNew(la + 1);
+  if (rem == 0) { return false; }
+  if (tmp == 0) { return false; }
+  if (qq == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < la + 1) {
+    _setw(qq, i, 0);
+    i := i + 1;
+  }
+  poke64(qq + 8, la);
+  poke64(qq + 16, 1);
+
+  var bit: int64 := BigBitLen(a) - 1;
+  while (bit >= 0) {
+    // Rest um eins nach links und das naechste Bit hineinziehen
+    BigShl(rem, 1, tmp);
+    BigCopy(tmp, rem);
+    if (BigTestBit(a, bit)) {
+      if (peek64(rem + 8) == 0) {
+        _setw(rem, 0, 1);
+        poke64(rem + 8, 1);
+        poke64(rem + 16, 1);
+      }
+      else {
+        _setw(rem, 0, _w(rem, 0) | 1);
+      }
+    }
+
+    if (BigCmpAbs(rem, b) >= 0) {
+      _subAbs(rem, b, tmp);
+      BigCopy(tmp, rem);
+      var qw: int64 := bit / 64;
+      _setw(qq, qw, BitsSet(_w(qq, qw), bit % 64));
+    }
+    bit := bit - 1;
+  }
+
+  _norm(qq);
+  var ok: bool := true;
+  if (outQ != 0) {
+    if (!BigCopy(qq, outQ)) { ok := false; }
+  }
+  if (outR != 0) {
+    if (!BigCopy(rem, outR)) { ok := false; }
+  }
+
+  BigFree(rem);  BigFree(tmp);  BigFree(qq);
+  return ok;
+}
+
+// Division mit Vorzeichen: Quotient Richtung null, Rest mit dem Vorzeichen des
+// Zaehlers — wie `/` und `%` auf int64.
+pub fn BigDivRem(a: int64, b: int64, outQ: int64, outR: int64): bool {
+  if (!BigDivRemAbs(a, b, outQ, outR)) { return false; }
+  var sa: int64 := BigSign(a);
+  var sb: int64 := BigSign(b);
+  if (outQ != 0) {
+    if (peek64(outQ + 8) != 0) { poke64(outQ + 16, sa * sb); }
+  }
+  if (outR != 0) {
+    if (peek64(outR + 8) != 0) { poke64(outR + 16, sa); }
+  }
+  return true;
+}
+
+// out := a mod m, immer im Bereich [0, |m|) — anders als der Rest der
+// Division, der bei negativem Zaehler negativ ist.
+pub fn BigMod(a: int64, m: int64, out: int64): bool {
+  if (!BigDivRemAbs(a, m, 0, out)) { return false; }
+  if (BigSign(a) < 0) {
+    if (peek64(out + 8) != 0) {
+      var t: int64 := BigNew(peek64(m + 8) + 1);
+      if (t == 0) { return false; }
+      var ok: bool := _subAbs(m, out, t);
+      if (ok) { ok := BigCopy(t, out); }
+      BigFree(t);
+      if (!ok) { return false; }
+    }
+  }
+  poke64(out + 16, 1);
+  return true;
+}
+
+// ── Modulare Potenz ──────────────────────────────────────────────────────────
+
+// out := (b ^ e) mod m, mit Quadrieren und Multiplizieren.
+//
+// Der Exponent wird von oben nach unten Bit fuer Bit abgearbeitet: quadrieren
+// fuer jedes Bit, zusaetzlich multiplizieren fuer jede Eins. Damit sind es
+// etwa 1,5 * bitlen(e) Multiplikationen statt e Stueck — der Unterschied
+// zwischen Sekunden und dem Ende des Universums.
+//
+// ACHTUNG: nicht konstantzeit. Die Laufzeit haengt von den Bits des Exponenten
+// ab, und die sind bei RSA der geheime Schluessel. Fuer Signaturen und
+// Entschluesselung ist das ungeeignet — dafuer braucht es eine Montgomery-
+// Leiter wie in std.crypto.ec. Fuer oeffentliche Exponenten, Primzahltests und
+// Zahlentheorie ist es richtig.
+pub fn BigPowMod(b: int64, e: int64, m: int64, out: int64): bool {
+  if (peek64(m + 8) == 0) { return false; }
+
+  var lm: int64 := peek64(m + 8);
+  var acc: int64 := BigNew(2 * lm + 2);
+  var base: int64 := BigNew(2 * lm + 2);
+  var prod: int64 := BigNew(4 * lm + 4);
+  var red: int64 := BigNew(2 * lm + 2);
+  if (acc == 0) { return false; }
+  if (base == 0) { return false; }
+  if (prod == 0) { return false; }
+  if (red == 0) { return false; }
+
+  var ok: bool := true;
+  BigSetU64(acc, 1);
+  if (!BigMod(b, m, base)) { ok := false; }
+
+  // Sonderfall m = 1: alles ist null
+  if (ok) {
+    if (BigCmpAbs(m, acc) == 0) {
+      BigZero(out);
+      BigFree(acc);  BigFree(base);  BigFree(prod);  BigFree(red);
+      return true;
+    }
+  }
+
+  var bit: int64 := BigBitLen(e) - 1;
+  while (bit >= 0) {
+    if (ok) {
+      // quadrieren
+      if (!BigMul(acc, acc, prod)) { ok := false; }
+      if (ok) {
+        if (!BigDivRemAbs(prod, m, 0, red)) { ok := false; }
+      }
+      if (ok) {
+        if (!BigCopy(red, acc)) { ok := false; }
+      }
+      // und bei gesetztem Bit mit der Basis multiplizieren
+      if (ok) {
+        if (BigTestBit(e, bit)) {
+          if (!BigMul(acc, base, prod)) { ok := false; }
+          if (ok) {
+            if (!BigDivRemAbs(prod, m, 0, red)) { ok := false; }
+          }
+          if (ok) {
+            if (!BigCopy(red, acc)) { ok := false; }
+          }
+        }
+      }
+    }
+    bit := bit - 1;
+  }
+
+  if (ok) { ok := BigCopy(acc, out); }
+  BigFree(acc);  BigFree(base);  BigFree(prod);  BigFree(red);
+  return ok;
+}
+
+// ── Groesster gemeinsamer Teiler ─────────────────────────────────────────────
+
+// out := ggT(|a|, |b|), euklidisch mit Rest.
+pub fn BigGcd(a: int64, b: int64, out: int64): bool {
+  var la: int64 := peek64(a + 8);
+  var lb: int64 := peek64(b + 8);
+  var n: int64 := la;
+  if (lb > n) { n := lb; }
+  if (n == 0) {
+    BigZero(out);
+    return true;
+  }
+
+  var x: int64 := BigNew(n + 1);
+  var y: int64 := BigNew(n + 1);
+  var r: int64 := BigNew(n + 1);
+  if (x == 0) { return false; }
+  if (y == 0) { return false; }
+  if (r == 0) { return false; }
+
+  var ok: bool := BigAbs(a, x);
+  if (ok) { ok := BigAbs(b, y); }
+
+  var run: bool := ok;
+  while (run) {
+    if (peek64(y + 8) == 0) { run := false; }
+    else {
+      if (!BigDivRemAbs(x, y, 0, r)) {
+        ok := false;
+        run := false;
+      }
+      else {
+        BigCopy(y, x);
+        BigCopy(r, y);
+      }
+    }
+  }
+
+  if (ok) { ok := BigCopy(x, out); }
+  if (ok) { poke64(out + 16, 1); }
+  BigFree(x);  BigFree(y);  BigFree(r);
+  return ok;
+}
+
+// ── Dezimal ──────────────────────────────────────────────────────────────────
+
+// Zahl als Dezimalzeichenkette nach buf. Rueckgabe ist die Zahl der Zeichen,
+// oder -1, wenn bufLen nicht reicht.
+//
+// Wiederholt durch 10^18 geteilt, nicht durch 10: das sind achtzehn Ziffern je
+// Division statt einer, und die Division ist hier der teure Teil.
+pub fn BigToDecimal(p: int64, buf: int64, bufLen: int64): int64 {
+  if (bufLen < 2) { return 0 - 1; }
+  if (peek64(p + 8) == 0) {
+    poke8(buf, 48);
+    poke8(buf + 1, 0);
+    return 1;
+  }
+
+  var lp: int64 := peek64(p + 8);
+  var cur: int64 := BigNew(lp + 1);
+  var q: int64 := BigNew(lp + 1);
+  var r: int64 := BigNew(2);
+  var d: int64 := BigNew(1);
+  if (cur == 0) { return 0 - 1; }
+  if (q == 0) { return 0 - 1; }
+  if (r == 0) { return 0 - 1; }
+  if (d == 0) { return 0 - 1; }
+
+  BigAbs(p, cur);
+  BigSetU64(d, 1000000000000000000);
+
+  // Ziffern rueckwaerts sammeln
+  var tmpLen: int64 := lp * 20 + 24;
+  var tmp: int64 := alloc(tmpLen);
+  if (tmp == 0) { return 0 - 1; }
+  var n: int64 := 0;
+
+  var run: bool := true;
+  while (run) {
+    BigDivRemAbs(cur, d, q, r);
+    var chunk: int64 := 0;
+    if (peek64(r + 8) != 0) { chunk := _w(r, 0); }
+    BigCopy(q, cur);
+    var last: bool := peek64(cur + 8) == 0;
+
+    // achtzehn Stellen je Block, beim letzten ohne fuehrende Nullen
+    var k: int64 := 0;
+    while (k < 18) {
+      poke8(tmp + n, 48 + (chunk % 10));
+      chunk := chunk / 10;
+      n := n + 1;
+      k := k + 1;
+      if (last) {
+        if (chunk == 0) { k := 18; }
+      }
+    }
+    if (last) { run := false; }
+  }
+
+  var neg: bool := BigIsNeg(p);
+  var total: int64 := n;
+  if (neg) { total := total + 1; }
+
+  var res: int64 := total;
+  if (total + 1 > bufLen) { res := 0 - 1; }
+  else {
+    var pos: int64 := 0;
+    if (neg) {
+      poke8(buf, 45);
+      pos := 1;
+    }
+    var i: int64 := 0;
+    while (i < n) {
+      poke8(buf + pos + i, peek8(tmp + (n - 1 - i)));
+      i := i + 1;
+    }
+    poke8(buf + pos + n, 0);
+  }
+
+  free(tmp, tmpLen);
+  BigFree(cur);  BigFree(q);  BigFree(r);  BigFree(d);
+  return res;
+}
+
+// Dezimalzeichenkette einlesen. false bei ungueltiger Eingabe oder wenn out zu
+// klein ist.
+pub fn BigFromDecimal(s: int64, out: int64): bool {
+  if (s == 0) { return false; }
+
+  var neg: bool := false;
+  var i: int64 := 0;
+  var c0: int64 := peek8(s);
+  if (c0 == 45) { neg := true; i := 1; }
+  else {
+    if (c0 == 43) { i := 1; }
+  }
+
+  var lo: int64 := peek64(out);
+  var acc: int64 := BigNew(lo + 2);
+  var tmp: int64 := BigNew(lo + 2);
+  if (acc == 0) { return false; }
+  if (tmp == 0) { return false; }
+  BigZero(acc);
+
+  var seen: bool := false;
+  var ok: bool := true;
+  var run: bool := true;
+  while (run) {
+    var ch: int64 := peek8(s + i);
+    if (ch == 0) { run := false; }
+    else {
+      var isDigit: bool := ch >= 48;
+      if (isDigit) { isDigit := ch <= 57; }
+      if (!isDigit) {
+        ok := false;
+        run := false;
+      }
+      else {
+        seen := true;
+        if (!BigMulU64(acc, 10, tmp)) { ok := false; run := false; }
+        else {
+          var dig: int64 := BigNew(1);
+          if (dig == 0) { ok := false; run := false; }
+          else {
+            BigSetU64(dig, ch - 48);
+            if (!BigAdd(tmp, dig, acc)) { ok := false; run := false; }
+            BigFree(dig);
+          }
+        }
+        i := i + 1;
+      }
+    }
+  }
+
+  if (ok) {
+    if (!seen) { ok := false; }
+  }
+  if (ok) { ok := BigCopy(acc, out); }
+  if (ok) {
+    if (neg) {
+      if (peek64(out + 8) != 0) { poke64(out + 16, 0 - 1); }
+    }
+  }
+  BigFree(acc);  BigFree(tmp);
+  return ok;
+}
+
+// ── Hexadezimal ──────────────────────────────────────────────────────────────
+
+// Betrag als Hexzeichenkette, ohne fuehrende Nullen und ohne Vorsatz.
+// Fuer Schluesselmaterial und Pruefwerte, wo die Wortgrenzen sichtbar bleiben
+// sollen.
+pub fn BigToHex(p: int64, buf: int64, bufLen: int64): int64 {
+  var n: int64 := peek64(p + 8);
+  if (n == 0) {
+    if (bufLen < 2) { return 0 - 1; }
+    poke8(buf, 48);
+    poke8(buf + 1, 0);
+    return 1;
+  }
+
+  var digits: int64 := (BigBitLen(p) + 3) / 4;
+  if (digits + 1 > bufLen) { return 0 - 1; }
+
+  var i: int64 := 0;
+  while (i < digits) {
+    var nib: int64 := digits - 1 - i;
+    var w: int64 := _w(p, nib / 16);
+    var v: int64 := BitsShr(w, (nib % 16) * 4) & 15;
+    var ch: int64 := 48 + v;
+    if (v > 9) { ch := 97 + v - 10; }
+    poke8(buf + i, ch);
+    i := i + 1;
+  }
+  poke8(buf + digits, 0);
+  return digits;
+}
+
+// ── Montgomery-Rechnung ──────────────────────────────────────────────────────
+//
+// BigPowMod oben reduziert nach jeder Multiplikation mit einer Division. Das
+// ist der teure Teil: gemessen mit lyxc 1.0.20C kostet eine Division 512/256
+// rund 815 Mikrosekunden, eine Multiplikation 256x256 nur 13. Die Division ist
+// also sechzigmal so teuer wie die Multiplikation, die sie begleitet — und in
+// einer Potenzrechnung stehen beide gleich oft.
+//
+// Montgomerys Verfahren ersetzt die Division durch Multiplikation und
+// Schieben. Der Kniff: alle Zahlen werden mit R = 2^(64*n) multipliziert
+// ("Montgomery-Form"), und in dieser Form laesst sich modulo m reduzieren,
+// indem man Vielfache von m addiert, bis die unteren Woerter null sind — dann
+// ist die Division durch R ein blosses Verschieben um ganze Woerter.
+//
+//     REDC(T) = (T + (T * n0 mod R) * m) / R      mit n0 = -m^-1 mod 2^64
+//
+// Voraussetzung ist ein UNGERADES m; nur dann existiert das Inverse von m
+// modulo einer Zweierpotenz. Fuer Primzahltests ist das nie eine Einschraenkung
+// — gerade Zahlen ausser der Zwei sind ohnehin keine Primzahlen.
+
+// -m^-1 mod 2^64, per Newton-Iteration.
+//
+// Fuer ungerades m gilt: x mit m*x = 1 mod 2^k laesst sich verdoppeln in der
+// Genauigkeit durch x' = x * (2 - m*x). Startwert x = m stimmt bereits modulo
+// 8, fuenf Verdopplungen reichen bis 64 Bit.
+fn _montN0(m0: int64): int64 {
+  var x: int64 := m0;
+  var i: int64 := 0;
+  while (i < 6) {
+    x := x * (2 - m0 * x);
+    i := i + 1;
+  }
+  return 0 - x;
+}
+
+// T := REDC(T) fuer ein Arbeitsfeld T aus 2n+1 Woertern (roh, ohne Kopf).
+// m ist die Bignum-Zahl, n ihre Wortzahl.
+fn _redc(T: int64, m: int64, n: int64, n0: int64): void {
+  var cout: int64 := alloc(8);
+  if (cout == 0) { return; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    var u: int64 := peek64(T + i * 8) * n0;
+    // T += u * m * 2^(64*i)
+    var carry: int64 := 0;
+    var j: int64 := 0;
+    while (j < n) {
+      var mw: int64 := BigWord(m, j);
+      var lo: int64 := u * mw;
+      var hi: int64 := I128MulHiU(u, mw);
+      var addr: int64 := T + (i + j) * 8;
+
+      var s1: int64 := I128AddCarry(peek64(addr), lo, 0, cout);
+      hi := hi + peek64(cout);
+      var s2: int64 := I128AddCarry(s1, carry, 0, cout);
+      hi := hi + peek64(cout);
+      poke64(addr, s2);
+      carry := hi;
+      j := j + 1;
+    }
+    // Uebertrag nach oben durchreichen
+    var k: int64 := i + n;
+    while (carry != 0) {
+      var s3: int64 := I128AddCarry(peek64(T + k * 8), carry, 0, cout);
+      poke64(T + k * 8, s3);
+      carry := peek64(cout);
+      k := k + 1;
+    }
+    i := i + 1;
+  }
+  free(cout, 8);
+
+  // durch R teilen heisst: die unteren n Woerter wegwerfen
+  i := 0;
+  while (i < n + 1) {
+    poke64(T + i * 8, peek64(T + (i + n) * 8));
+    i := i + 1;
+  }
+  i := n + 1;
+  while (i < 2 * n + 1) {
+    poke64(T + i * 8, 0);
+    i := i + 1;
+  }
+}
+
+// Ist das Rohfeld T (n+1 Woerter) groesser oder gleich m? Dann m abziehen.
+fn _condSub(T: int64, m: int64, n: int64): void {
+  var ge: bool := peek64(T + n * 8) != 0;
+  if (!ge) {
+    var i: int64 := n - 1;
+    var decided: bool := false;
+    while (i >= 0) {
+      if (!decided) {
+        var tw: int64 := peek64(T + i * 8);
+        var mw: int64 := BigWord(m, i);
+        if (tw != mw) {
+          ge := !I128LtU64(tw, mw);
+          decided := true;
+        }
+      }
+      i := i - 1;
+    }
+    if (!decided) { ge := true; }      // gleich
+  }
+  if (!ge) { return; }
+
+  var bout: int64 := alloc(8);
+  if (bout == 0) { return; }
+  var borrow: int64 := 0;
+  var j: int64 := 0;
+  while (j < n) {
+    var d: int64 := I128SubBorrow(peek64(T + j * 8), BigWord(m, j), borrow, bout);
+    poke64(T + j * 8, d);
+    borrow := peek64(bout);
+    j := j + 1;
+  }
+  poke64(T + n * 8, peek64(T + n * 8) - borrow);
+  free(bout, 8);
+}
+
+// T := a * b im Montgomery-Sinn, beide als Rohfelder aus n Woertern.
+// Ergebnis steht in n+1 Woertern von T.
+fn _montMul(ra: int64, rb: int64, T: int64, m: int64, n: int64,
+            n0: int64): void {
+  var i: int64 := 0;
+  while (i < 2 * n + 2) {
+    poke64(T + i * 8, 0);
+    i := i + 1;
+  }
+
+  var cout: int64 := alloc(8);
+  if (cout == 0) { return; }
+  i := 0;
+  while (i < n) {
+    var aw: int64 := peek64(ra + i * 8);
+    var carry: int64 := 0;
+    var j: int64 := 0;
+    while (j < n) {
+      var bw: int64 := peek64(rb + j * 8);
+      var lo: int64 := aw * bw;
+      var hi: int64 := I128MulHiU(aw, bw);
+      var addr: int64 := T + (i + j) * 8;
+
+      var s1: int64 := I128AddCarry(peek64(addr), lo, 0, cout);
+      hi := hi + peek64(cout);
+      var s2: int64 := I128AddCarry(s1, carry, 0, cout);
+      hi := hi + peek64(cout);
+      poke64(addr, s2);
+      carry := hi;
+      j := j + 1;
+    }
+    var k: int64 := i + n;
+    while (carry != 0) {
+      var s3: int64 := I128AddCarry(peek64(T + k * 8), carry, 0, cout);
+      poke64(T + k * 8, s3);
+      carry := peek64(cout);
+      k := k + 1;
+    }
+    i := i + 1;
+  }
+  free(cout, 8);
+
+  _redc(T, m, n, n0);
+  _condSub(T, m, n);
+}
+
+// out := (b ^ e) mod m fuer UNGERADES m, ohne eine einzige Division im
+// Rechenkern.
+//
+// Nur der Ein- und Ausstieg kostet je eine Division: hinein, um b*R mod m zu
+// bilden, hinaus, um das Ergebnis aus der Montgomery-Form zu holen. Dazwischen
+// sind es Multiplikationen und Verschiebungen.
+//
+// false, wenn m gerade oder null ist — dann ist BigPowMod zu nehmen.
+//
+// ACHTUNG: ebenso wenig konstantzeit wie BigPowMod. Die Bits des Exponenten
+// bestimmen, wie oft multipliziert wird.
+pub fn BigPowModOdd(b: int64, e: int64, m: int64, out: int64): bool {
+  var n: int64 := BigLen(m);
+  if (n == 0) { return false; }
+  if ((BigWord(m, 0) & 1) == 0) { return false; }
+
+  var n0: int64 := _montN0(BigWord(m, 0));
+
+  // R mod m und R^2 mod m ueber die gewoehnliche Division — einmalig
+  var r2: int64 := BigNew(2 * n + 2);
+  var one: int64 := BigNew(n + 2);
+  var tmp: int64 := BigNew(4 * n + 4);
+  var red: int64 := BigNew(2 * n + 2);
+  var bb: int64 := BigNew(2 * n + 2);
+  if (r2 == 0) { return false; }
+  if (one == 0) { return false; }
+  if (tmp == 0) { return false; }
+  if (red == 0) { return false; }
+  if (bb == 0) { return false; }
+
+  var ok: bool := true;
+  BigSetU64(one, 1);
+  // R^2 = 2^(128*n) mod m
+  if (!BigShl(one, 128 * n, tmp)) { ok := false; }
+  if (ok) {
+    if (!BigDivRemAbs(tmp, m, 0, r2)) { ok := false; }
+  }
+  // b mod m
+  if (ok) {
+    if (!BigMod(b, m, bb)) { ok := false; }
+  }
+
+  // Rohfelder fuer die Montgomery-Schleife
+  var accR: int64 := alloc((2 * n + 4) * 8);
+  var baseR: int64 := alloc((2 * n + 4) * 8);
+  var work: int64 := alloc((2 * n + 4) * 8);
+  if (accR == 0) { ok := false; }
+  if (baseR == 0) { ok := false; }
+  if (work == 0) { ok := false; }
+
+  if (ok) {
+    // acc := 1 * R mod m, base := b * R mod m — beides ueber REDC mit R^2
+    var i: int64 := 0;
+    while (i < 2 * n + 4) {
+      poke64(accR + i * 8, 0);
+      poke64(baseR + i * 8, 0);
+      i := i + 1;
+    }
+    // acc = REDC(1 * R^2) = R mod m
+    i := 0;
+    while (i < n) {
+      poke64(work + i * 8, BigWord(r2, i));
+      i := i + 1;
+    }
+    i := n;
+    while (i < 2 * n + 2) {
+      poke64(work + i * 8, 0);
+      i := i + 1;
+    }
+    _redc(work, m, n, n0);
+    _condSub(work, m, n);
+    i := 0;
+    while (i < n) {
+      poke64(accR + i * 8, peek64(work + i * 8));
+      i := i + 1;
+    }
+
+    // base = REDC(b * R^2)
+    var bRaw: int64 := alloc((n + 1) * 8);
+    var r2Raw: int64 := alloc((n + 1) * 8);
+    if (bRaw == 0) { ok := false; }
+    if (r2Raw == 0) { ok := false; }
+    if (ok) {
+      i := 0;
+      while (i < n) {
+        poke64(bRaw + i * 8, BigWord(bb, i));
+        poke64(r2Raw + i * 8, BigWord(r2, i));
+        i := i + 1;
+      }
+      _montMul(bRaw, r2Raw, work, m, n, n0);
+      i := 0;
+      while (i < n) {
+        poke64(baseR + i * 8, peek64(work + i * 8));
+        i := i + 1;
+      }
+      free(bRaw, (n + 1) * 8);
+      free(r2Raw, (n + 1) * 8);
+    }
+  }
+
+  // Quadrieren und Multiplizieren, alles in Montgomery-Form
+  if (ok) {
+    var bit: int64 := BigBitLen(e) - 1;
+    while (bit >= 0) {
+      _montMul(accR, accR, work, m, n, n0);
+      var i2: int64 := 0;
+      while (i2 < n) {
+        poke64(accR + i2 * 8, peek64(work + i2 * 8));
+        i2 := i2 + 1;
+      }
+      if (BigTestBit(e, bit)) {
+        _montMul(accR, baseR, work, m, n, n0);
+        i2 := 0;
+        while (i2 < n) {
+          poke64(accR + i2 * 8, peek64(work + i2 * 8));
+          i2 := i2 + 1;
+        }
+      }
+      bit := bit - 1;
+    }
+
+    // zurueck aus der Montgomery-Form: REDC(acc)
+    var i3: int64 := 0;
+    while (i3 < n) {
+      poke64(work + i3 * 8, peek64(accR + i3 * 8));
+      i3 := i3 + 1;
+    }
+    i3 := n;
+    while (i3 < 2 * n + 2) {
+      poke64(work + i3 * 8, 0);
+      i3 := i3 + 1;
+    }
+    _redc(work, m, n, n0);
+    _condSub(work, m, n);
+
+    if (BigCap(out) < n) { ok := false; }
+    else {
+      i3 := 0;
+      while (i3 < n) {
+        poke64(out + BIG_HEADER + i3 * 8, peek64(work + i3 * 8));
+        i3 := i3 + 1;
+      }
+      poke64(out + 8, n);
+      poke64(out + 16, 1);
+      _norm(out);
+    }
+  }
+
+  if (accR != 0) { free(accR, (2 * n + 4) * 8); }
+  if (baseR != 0) { free(baseR, (2 * n + 4) * 8); }
+  if (work != 0) { free(work, (2 * n + 4) * 8); }
+  BigFree(r2);  BigFree(one);  BigFree(tmp);  BigFree(red);  BigFree(bb);
+  return ok;
+}

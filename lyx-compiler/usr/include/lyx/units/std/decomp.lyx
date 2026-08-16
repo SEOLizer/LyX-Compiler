@@ -1,0 +1,913 @@
+// std/decomp.lyx
+// Matrixzerlegungen: SVD, allgemeine Eigenwerte, Pseudoinverse, Rang-k-Naeherung
+
+@description("Matrix decompositions: singular value decomposition, general eigenvalues, pseudoinverse, low-rank approximation, polar decomposition")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.decomp;
+
+import std.math;
+import std.alloc;
+import std.linalg;
+
+// ── Abgrenzung zu std.linalg ─────────────────────────────────────────────────
+//
+// std.linalg deckt die Zerlegungen ab, die man zum Loesen braucht: LU mit
+// Pivotisierung, QR nach Householder, Cholesky, und Eigenwerte SYMMETRISCHER
+// Matrizen ueber Jacobi. Zwei Grenzen sind dort ausdruecklich vermerkt:
+//
+//   - LinSingularValues rechnet ueber die Eigenwerte von A^T*A. Das quadriert
+//     die Konditionszahl: bei Kondition 1e8 sind die kleinen Singulaerwerte
+//     danach reines Rauschen. Fuer die Kondition einer gutartigen Matrix
+//     reicht es, fuer eine Rangbestimmung an der Grenze nicht.
+//   - LinEigenSym verlangt Symmetrie. Nicht symmetrische Matrizen haben im
+//     Allgemeinen komplexe Eigenwerte, und Jacobi kann sie nicht finden.
+//
+// Diese Einheit schliesst beide Luecken und baut darauf auf, was sich damit
+// erst ergibt: Pseudoinverse, Ausgleichsrechnung bei Rangdefekt, beste
+// Rang-k-Naeherung, polare Zerlegung.
+//
+// ── Darstellung ──────────────────────────────────────────────────────────────
+//
+// Wie in std.linalg: m-mal-n zeilenweise (row-major) als Adresse, Element
+// (i,j) bei i*n+j. Zugriff ueber LinGet/LinSet aus std.linalg.
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+
+fn _get(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn _put(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+pub fn DecompEpsilon(): f64 { return 0.000000000000001; }   // 1e-15
+
+// ── Singulaerwertzerlegung ───────────────────────────────────────────────────
+//
+// A (m x n, m >= n) = U * diag(s) * V^T mit U (m x n) spaltenorthonormal,
+// s absteigend, V (n x n) orthogonal. Das ist die "schmale" Form: U hat n
+// statt m Spalten, was fuer alles hier ausreicht und bei m >> n viel Speicher
+// spart.
+//
+// Verfahren: einseitiges Jacobi. Es dreht Spaltenpaare von A so lange, bis
+// alle Spalten paarweise orthogonal sind; dann sind ihre Laengen die
+// Singulaerwerte und die aufgesammelten Drehungen ergeben V.
+//
+// Warum nicht Golub-Kahan (Bidiagonalisierung + QR), das Lehrbuchverfahren?
+// Einseitiges Jacobi ist langsamer, aber GENAUER: es erreicht hohe RELATIVE
+// Genauigkeit auch fuer die kleinen Singulaerwerte, waehrend Golub-Kahan sie
+// nur bis auf eps*sigma_max bestimmt. Genau die kleinen Werte sind es aber,
+// wegen derer man eine echte SVD statt A^T*A nimmt. Ausserdem konvergiert
+// Jacobi immer und braucht keine Verschiebungsstrategie.
+pub fn DecompSvd(a: int64, m: int64, n: int64, u: int64, s: int64, v: int64): bool {
+  if (m < 1) { return false; }
+  if (n < 1) { return false; }
+  if (m < n) { return false; }
+  if (u == a) { return false; }
+
+  // U beginnt als Kopie von A, V als Einheitsmatrix
+  var i: int64 := 0;
+  var cnt: int64 := m * n;
+  while (i < cnt) {
+    _put(u, i, _get(a, i));
+    i := i + 1;
+  }
+  if (v != 0) { LinIdentity(v, n); }
+
+  var eps: f64 := DecompEpsilon();
+  var sweep: int64 := 0;
+  var running: bool := true;
+
+  while (running) {
+    var rotations: int64 := 0;
+
+    var p: int64 := 0;
+    while (p < n - 1) {
+      var q: int64 := p + 1;
+      while (q < n) {
+        // Skalarprodukte der Spalten p und q
+        var alpha: f64 := _zero();
+        var beta: f64 := _zero();
+        var gamma: f64 := _zero();
+        var r: int64 := 0;
+        while (r < m) {
+          var up: f64 := LinGet(u, n, r, p);
+          var uq: f64 := LinGet(u, n, r, q);
+          alpha := alpha + up * up;
+          beta := beta + uq * uq;
+          gamma := gamma + up * uq;
+          r := r + 1;
+        }
+
+        // Schon orthogonal? Der Vergleich steht bewusst relativ zu den
+        // Spaltenlaengen: eine absolute Schranke wuerde bei grossen Werten
+        // nie und bei kleinen immer greifen.
+        var thresh: f64 := eps * SqrtF64(alpha * beta);
+        if (AbsF64(gamma) > thresh) {
+          rotations := rotations + 1;
+
+          // Drehwinkel; die Form t = sign(z)/(|z| + sqrt(z^2+1)) vermeidet
+          // die Ausloeschung, die -z + sqrt(z^2+1) bei grossem z hat.
+          var zeta: f64 := (beta - alpha) / (2.0 * gamma);
+          var t: f64 := _one() / (AbsF64(zeta) + SqrtF64(zeta * zeta + _one()));
+          if (zeta < _zero()) { t := _neg(t); }
+
+          var c: f64 := _one() / SqrtF64(t * t + _one());
+          var sn: f64 := c * t;
+
+          r := 0;
+          while (r < m) {
+            var up: f64 := LinGet(u, n, r, p);
+            var uq: f64 := LinGet(u, n, r, q);
+            LinSet(u, n, r, p, c * up - sn * uq);
+            LinSet(u, n, r, q, sn * up + c * uq);
+            r := r + 1;
+          }
+
+          if (v != 0) {
+            r := 0;
+            while (r < n) {
+              var vp: f64 := LinGet(v, n, r, p);
+              var vq: f64 := LinGet(v, n, r, q);
+              LinSet(v, n, r, p, c * vp - sn * vq);
+              LinSet(v, n, r, q, sn * vp + c * vq);
+              r := r + 1;
+            }
+          }
+        }
+        q := q + 1;
+      }
+      p := p + 1;
+    }
+
+    sweep := sweep + 1;
+    if (rotations == 0) { running := false; }
+    if (sweep >= 60) { running := false; }
+  }
+
+  // Spaltenlaengen sind die Singulaerwerte; Spalten auf Laenge 1 bringen.
+  var j: int64 := 0;
+  while (j < n) {
+    var norm: f64 := _zero();
+    var r2: int64 := 0;
+    while (r2 < m) {
+      var uv: f64 := LinGet(u, n, r2, j);
+      norm := norm + uv * uv;
+      r2 := r2 + 1;
+    }
+    norm := SqrtF64(norm);
+    _put(s, j, norm);
+
+    // Bei Rangdefekt ist die Spalte null und hat keine Richtung. Sie bleibt
+    // dann null, statt durch fast nichts geteilt zu werden — der zugehoerige
+    // Singulaerwert ist 0, und U ist dort nicht eindeutig.
+    if (norm > eps) {
+      r2 := 0;
+      while (r2 < m) {
+        LinSet(u, n, r2, j, LinGet(u, n, r2, j) / norm);
+        r2 := r2 + 1;
+      }
+    }
+    j := j + 1;
+  }
+
+  // absteigend sortieren, U- und V-Spalten mitziehen
+  var ii: int64 := 0;
+  while (ii < n - 1) {
+    var best: int64 := ii;
+    var bestV: f64 := _get(s, ii);
+    var jj: int64 := ii + 1;
+    while (jj < n) {
+      var sv: f64 := _get(s, jj);
+      if (sv > bestV) { bestV := sv; best := jj; }
+      jj := jj + 1;
+    }
+    if (best != ii) {
+      var tmp: f64 := _get(s, ii);
+      _put(s, ii, _get(s, best));
+      _put(s, best, tmp);
+
+      var r3: int64 := 0;
+      while (r3 < m) {
+        var t2: f64 := LinGet(u, n, r3, ii);
+        LinSet(u, n, r3, ii, LinGet(u, n, r3, best));
+        LinSet(u, n, r3, best, t2);
+        r3 := r3 + 1;
+      }
+      if (v != 0) {
+        r3 := 0;
+        while (r3 < n) {
+          var t3: f64 := LinGet(v, n, r3, ii);
+          LinSet(v, n, r3, ii, LinGet(v, n, r3, best));
+          LinSet(v, n, r3, best, t3);
+          r3 := r3 + 1;
+        }
+      }
+    }
+    ii := ii + 1;
+  }
+  return true;
+}
+
+// Nur die Singulaerwerte, absteigend.
+pub fn DecompSvdValues(a: int64, m: int64, n: int64, s: int64): bool {
+  var u: int64 := alloc(m * n * 8);
+  if (u == 0) { return false; }
+  var ok: bool := DecompSvd(a, m, n, u, s, 0);
+  free(u, m * n * 8);
+  return ok;
+}
+
+// Groesster Singulaerwert = Spektralnorm
+pub fn DecompNorm2(a: int64, m: int64, n: int64): f64 {
+  var s: int64 := alloc(n * 8);
+  if (s == 0) { return _zero(); }
+  var r: f64 := _zero();
+  if (DecompSvdValues(a, m, n, s)) { r := _get(s, 0); }
+  free(s, n * 8);
+  return r;
+}
+
+// Konditionszahl in der 2-Norm. 0 steht fuer "singulaer" — unendlich laesst
+// sich nicht als Zahl ausdruecken, und 0 ist als Sonderfall eindeutig.
+pub fn DecompCond2(a: int64, m: int64, n: int64): f64 {
+  var s: int64 := alloc(n * 8);
+  if (s == 0) { return _zero(); }
+
+  var c: f64 := _zero();
+  if (DecompSvdValues(a, m, n, s)) {
+    var smax: f64 := _get(s, 0);
+    var smin: f64 := _get(s, n - 1);
+    if (smin > DecompEpsilon() * smax) { c := smax / smin; }
+  }
+  free(s, n * 8);
+  return c;
+}
+
+// Numerischer Rang: Zahl der Singulaerwerte oberhalb der Schranke.
+//
+// tol <= 0 waehlt die uebliche Vorgabe max(m,n) * eps * sigma_max. Ein fester
+// absoluter Wert waere hier falsch: ob 1e-9 gross oder klein ist, haengt an
+// der Groessenordnung der Matrix.
+pub fn DecompRank(a: int64, m: int64, n: int64, tol: f64): int64 {
+  var s: int64 := alloc(n * 8);
+  if (s == 0) { return 0; }
+  if (!DecompSvdValues(a, m, n, s)) {
+    free(s, n * 8);
+    return 0;
+  }
+
+  var t: f64 := tol;
+  if (t <= _zero()) {
+    var dmax: int64 := m;
+    if (n > dmax) { dmax := n; }
+    t := (dmax as f64) * 0.000000000000000222 * _get(s, 0);
+  }
+
+  var rank: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    if (_get(s, i) > t) { rank := rank + 1; }
+    i := i + 1;
+  }
+  free(s, n * 8);
+  return rank;
+}
+
+// Moore-Penrose-Pseudoinverse A+ = V * diag(1/s) * U^T, Groesse n x m.
+//
+// Singulaerwerte unterhalb der Schranke werden auf 0 gesetzt statt invertiert.
+// Das ist der Kern der Sache: 1/s waechst fuer kleine s ins Unendliche, und
+// ohne diesen Schnitt wuerde die Pseudoinverse jedes Rauschen im Nullraum
+// masslos verstaerken.
+pub fn DecompPseudoInverse(a: int64, m: int64, n: int64, tol: f64, out: int64): bool {
+  if (m < n) { return false; }
+  if (out == a) { return false; }
+
+  var u: int64 := alloc(m * n * 8);
+  var s: int64 := alloc(n * 8);
+  var v: int64 := alloc(n * n * 8);
+  if (u == 0) { return false; }
+  if (s == 0) { return false; }
+  if (v == 0) { return false; }
+
+  var ok: bool := DecompSvd(a, m, n, u, s, v);
+  if (ok) {
+    var t: f64 := tol;
+    if (t <= _zero()) {
+      var dmax: int64 := m;
+      if (n > dmax) { dmax := n; }
+      t := (dmax as f64) * 0.000000000000000222 * _get(s, 0);
+    }
+
+    var i: int64 := 0;
+    while (i < n) {
+      var j: int64 := 0;
+      while (j < m) {
+        var acc: f64 := _zero();
+        var k: int64 := 0;
+        while (k < n) {
+          var sk: f64 := _get(s, k);
+          if (sk > t) {
+            acc := acc + LinGet(v, n, i, k) * LinGet(u, n, j, k) / sk;
+          }
+          k := k + 1;
+        }
+        LinSet(out, m, i, j, acc);
+        j := j + 1;
+      }
+      i := i + 1;
+    }
+  }
+
+  free(u, m * n * 8);
+  free(s, n * 8);
+  free(v, n * n * 8);
+  return ok;
+}
+
+// Ausgleichsrechnung ueber die SVD: x = A+ * b.
+//
+// Gegenueber LinLstSq (QR) ist das langsamer, aber es funktioniert auch bei
+// RANGDEFEKT — dort hat das Problem unendlich viele Loesungen, und die SVD
+// liefert von allen die mit der kleinsten Norm. Die QR-Fassung scheitert in
+// dem Fall an einem Nullpivot.
+pub fn DecompLstSq(a: int64, m: int64, n: int64, b: int64, tol: f64, x: int64): bool {
+  if (m < n) { return false; }
+
+  var u: int64 := alloc(m * n * 8);
+  var s: int64 := alloc(n * 8);
+  var v: int64 := alloc(n * n * 8);
+  if (u == 0) { return false; }
+  if (s == 0) { return false; }
+  if (v == 0) { return false; }
+
+  var ok: bool := DecompSvd(a, m, n, u, s, v);
+  if (ok) {
+    var t: f64 := tol;
+    if (t <= _zero()) {
+      var dmax: int64 := m;
+      if (n > dmax) { dmax := n; }
+      t := (dmax as f64) * 0.000000000000000222 * _get(s, 0);
+    }
+
+    // c = U^T b, dann durch s teilen, dann mit V multiplizieren
+    var c: int64 := alloc(n * 8);
+    if (c == 0) { ok := false; }
+    else {
+      var k: int64 := 0;
+      while (k < n) {
+        var acc: f64 := _zero();
+        var r: int64 := 0;
+        while (r < m) {
+          var bv: f64 := _get(b, r);
+          acc := acc + LinGet(u, n, r, k) * bv;
+          r := r + 1;
+        }
+        var sk: f64 := _get(s, k);
+        if (sk > t) { _put(c, k, acc / sk); }
+        else { _put(c, k, _zero()); }
+        k := k + 1;
+      }
+
+      var i: int64 := 0;
+      while (i < n) {
+        var acc2: f64 := _zero();
+        var j: int64 := 0;
+        while (j < n) {
+          acc2 := acc2 + LinGet(v, n, i, j) * _get(c, j);
+          j := j + 1;
+        }
+        _put(x, i, acc2);
+        i := i + 1;
+      }
+      free(c, n * 8);
+    }
+  }
+
+  free(u, m * n * 8);
+  free(s, n * 8);
+  free(v, n * n * 8);
+  return ok;
+}
+
+// Beste Naeherung vom Rang k, gemessen in der Frobenius- wie in der
+// Spektralnorm (Satz von Eckart und Young): die k groessten Singulaerwerte
+// behalten, alle anderen null setzen.
+//
+// Das ist die Grundlage von Hauptkomponentenanalyse und
+// Datenkompression — und der Grund, warum die SVD mehr ist als ein
+// Loesungsverfahren.
+pub fn DecompLowRank(a: int64, m: int64, n: int64, k: int64, out: int64): bool {
+  if (m < n) { return false; }
+  if (k < 0) { return false; }
+  if (out == a) { return false; }
+
+  var u: int64 := alloc(m * n * 8);
+  var s: int64 := alloc(n * 8);
+  var v: int64 := alloc(n * n * 8);
+  if (u == 0) { return false; }
+  if (s == 0) { return false; }
+  if (v == 0) { return false; }
+
+  var ok: bool := DecompSvd(a, m, n, u, s, v);
+  if (ok) {
+    var kk: int64 := k;
+    if (kk > n) { kk := n; }
+
+    var i: int64 := 0;
+    while (i < m) {
+      var j: int64 := 0;
+      while (j < n) {
+        var acc: f64 := _zero();
+        var t: int64 := 0;
+        while (t < kk) {
+          acc := acc + LinGet(u, n, i, t) * _get(s, t) * LinGet(v, n, j, t);
+          t := t + 1;
+        }
+        LinSet(out, n, i, j, acc);
+        j := j + 1;
+      }
+      i := i + 1;
+    }
+  }
+
+  free(u, m * n * 8);
+  free(s, n * 8);
+  free(v, n * n * 8);
+  return ok;
+}
+
+// Polare Zerlegung A = Q * P einer quadratischen Matrix: Q orthogonal,
+// P symmetrisch positiv semidefinit. Ueber die SVD ist es ein Zweizeiler —
+// Q = U*V^T, P = V*diag(s)*V^T.
+//
+// Anwendung: die naechstgelegene Drehung zu einer durch Rundung verzerrten
+// Transformationsmatrix. Q ist von allen orthogonalen Matrizen die, die A am
+// naechsten kommt.
+pub fn DecompPolar(a: int64, n: int64, q: int64, p: int64): bool {
+  if (n < 1) { return false; }
+  if (q == a) { return false; }
+
+  var u: int64 := alloc(n * n * 8);
+  var s: int64 := alloc(n * 8);
+  var v: int64 := alloc(n * n * 8);
+  if (u == 0) { return false; }
+  if (s == 0) { return false; }
+  if (v == 0) { return false; }
+
+  var ok: bool := DecompSvd(a, n, n, u, s, v);
+  if (ok) {
+    if (q != 0) {
+      var i: int64 := 0;
+      while (i < n) {
+        var j: int64 := 0;
+        while (j < n) {
+          var acc: f64 := _zero();
+          var k: int64 := 0;
+          while (k < n) {
+            acc := acc + LinGet(u, n, i, k) * LinGet(v, n, j, k);
+            k := k + 1;
+          }
+          LinSet(q, n, i, j, acc);
+          j := j + 1;
+        }
+        i := i + 1;
+      }
+    }
+    if (p != 0) {
+      var i2: int64 := 0;
+      while (i2 < n) {
+        var j2: int64 := 0;
+        while (j2 < n) {
+          var acc2: f64 := _zero();
+          var k2: int64 := 0;
+          while (k2 < n) {
+            acc2 := acc2 + LinGet(v, n, i2, k2) * _get(s, k2) * LinGet(v, n, j2, k2);
+            k2 := k2 + 1;
+          }
+          LinSet(p, n, i2, j2, acc2);
+          j2 := j2 + 1;
+        }
+        i2 := i2 + 1;
+      }
+    }
+  }
+
+  free(u, n * n * 8);
+  free(s, n * 8);
+  free(v, n * n * 8);
+  return ok;
+}
+
+// ── Hessenberg-Form ──────────────────────────────────────────────────────────
+
+// Reduziert A auf obere Hessenberg-Form (unterhalb der ersten Nebendiagonale
+// alles null) mit Householder-Spiegelungen. h = Q^T*A*Q; q darf 0 sein.
+//
+// Der Sinn: die QR-Iteration fuer Eigenwerte kostet auf einer vollen Matrix
+// O(n^3) je Schritt, auf einer Hessenberg-Matrix nur O(n^2) — und die Form
+// bleibt unter QR-Schritten erhalten. Die Reduktion ist ein einmaliger
+// O(n^3)-Aufwand und macht das Verfahren ueberhaupt erst brauchbar.
+pub fn DecompHessenberg(a: int64, n: int64, h: int64, q: int64): bool {
+  if (n < 1) { return false; }
+  if (h == a) { return false; }
+
+  LinCopy(a, h, n, n);
+  if (q != 0) { LinIdentity(q, n); }
+  if (n < 3) { return true; }
+
+  var v: int64 := alloc(n * 8);
+  if (v == 0) { return false; }
+
+  var k: int64 := 0;
+  while (k < n - 2) {
+    var norm: f64 := _zero();
+    var i: int64 := k + 1;
+    while (i < n) {
+      var x: f64 := LinGet(h, n, i, k);
+      norm := norm + x * x;
+      i := i + 1;
+    }
+    norm := SqrtF64(norm);
+
+    if (norm > DecompEpsilon()) {
+      var alpha: f64 := norm;
+      if (LinGet(h, n, k + 1, k) > _zero()) { alpha := _neg(norm); }
+
+      i := k + 1;
+      while (i < n) {
+        _put(v, i, LinGet(h, n, i, k));
+        i := i + 1;
+      }
+      _put(v, k + 1, LinGet(h, n, k + 1, k) - alpha);
+
+      var vnorm: f64 := _zero();
+      i := k + 1;
+      while (i < n) {
+        var vi: f64 := _get(v, i);
+        vnorm := vnorm + vi * vi;
+        i := i + 1;
+      }
+
+      if (vnorm > DecompEpsilon()) {
+        // H := P*H (Zeilen)
+        var j: int64 := 0;
+        while (j < n) {
+          var dot: f64 := _zero();
+          i := k + 1;
+          while (i < n) {
+            dot := dot + _get(v, i) * LinGet(h, n, i, j);
+            i := i + 1;
+          }
+          var f: f64 := 2.0 * dot / vnorm;
+          i := k + 1;
+          while (i < n) {
+            LinSet(h, n, i, j, LinGet(h, n, i, j) - f * _get(v, i));
+            i := i + 1;
+          }
+          j := j + 1;
+        }
+
+        // H := H*P (Spalten) — beide Seiten, damit die Eigenwerte erhalten
+        // bleiben: eine einseitige Spiegelung wuerde sie veraendern.
+        j := 0;
+        while (j < n) {
+          var dot2: f64 := _zero();
+          i := k + 1;
+          while (i < n) {
+            dot2 := dot2 + LinGet(h, n, j, i) * _get(v, i);
+            i := i + 1;
+          }
+          var f2: f64 := 2.0 * dot2 / vnorm;
+          i := k + 1;
+          while (i < n) {
+            LinSet(h, n, j, i, LinGet(h, n, j, i) - f2 * _get(v, i));
+            i := i + 1;
+          }
+          j := j + 1;
+        }
+
+        if (q != 0) {
+          j := 0;
+          while (j < n) {
+            var dot3: f64 := _zero();
+            i := k + 1;
+            while (i < n) {
+              dot3 := dot3 + LinGet(q, n, j, i) * _get(v, i);
+              i := i + 1;
+            }
+            var f3: f64 := 2.0 * dot3 / vnorm;
+            i := k + 1;
+            while (i < n) {
+              LinSet(q, n, j, i, LinGet(q, n, j, i) - f3 * _get(v, i));
+              i := i + 1;
+            }
+            j := j + 1;
+          }
+        }
+      }
+    }
+    k := k + 1;
+  }
+
+  free(v, n * 8);
+  return true;
+}
+
+// ── Eigenwerte allgemeiner Matrizen ──────────────────────────────────────────
+
+// Eigenwerte einer beliebigen reellen quadratischen Matrix. evRe und evIm
+// fassen je n Werte; komplexe Eigenwerte treten als konjugiertes Paar in zwei
+// aufeinanderfolgenden Eintraegen auf.
+//
+// Verfahren: Hessenberg-Reduktion, dann QR-Iteration mit Verschiebung und
+// Deflation. Ein 1x1-Block am Rand liefert einen reellen Eigenwert, ein
+// 2x2-Block wird analytisch geloest — dort kommen die komplexen Paare her.
+// Ganz ohne komplexe Arithmetik: das Ergebnis ist die reelle Schur-Form, in
+// der komplexe Paare als 2x2-Bloecke stehen bleiben.
+//
+// Rueckgabe false, wenn die Iterationsgrenze erreicht wird, ohne dass alles
+// deflatiert ist. Das ist selten, aber moeglich; ein stilles Teilergebnis
+// waere schlimmer.
+pub fn DecompEigenGeneral(a: int64, n: int64, evRe: int64, evIm: int64): bool {
+  if (n < 1) { return false; }
+
+  var h: int64 := alloc(n * n * 8);
+  if (h == 0) { return false; }
+  if (!DecompHessenberg(a, n, h, 0)) {
+    free(h, n * n * 8);
+    return false;
+  }
+
+  var hi: int64 := n - 1;       // obere Grenze des noch aktiven Blocks
+  var iter: int64 := 0;
+  var ok: bool := true;
+  var running: bool := true;
+
+  while (running) {
+    if (hi < 0) { running := false; }
+    else {
+      // Kleine Nebendiagonalelemente auf null setzen: dort zerfaellt das
+      // Problem. Die Schranke ist relativ zu den Nachbarn auf der Diagonale,
+      // nicht absolut — sonst haengt die Deflation an der Skalierung der
+      // Matrix.
+      var l: int64 := hi;
+      var searching: bool := true;
+      while (searching) {
+        if (l <= 0) { searching := false; }
+        else {
+          var s: f64 := AbsF64(LinGet(h, n, l - 1, l - 1)) + AbsF64(LinGet(h, n, l, l));
+          if (s < DecompEpsilon()) { s := _one(); }
+          if (AbsF64(LinGet(h, n, l, l - 1)) < DecompEpsilon() * s) {
+            LinSet(h, n, l, l - 1, _zero());
+            searching := false;
+          }
+          else { l := l - 1; }
+        }
+      }
+
+      if (l == hi) {
+        // 1x1: reeller Eigenwert
+        _put(evRe, hi, LinGet(h, n, hi, hi));
+        _put(evIm, hi, _zero());
+        hi := hi - 1;
+        iter := 0;
+      }
+      else {
+        if (l == hi - 1) {
+          // 2x2: analytisch
+          var p: f64 := LinGet(h, n, hi - 1, hi - 1);
+          var qv: f64 := LinGet(h, n, hi - 1, hi);
+          var rv: f64 := LinGet(h, n, hi, hi - 1);
+          var sv: f64 := LinGet(h, n, hi, hi);
+
+          var tr: f64 := p + sv;
+          var det: f64 := p * sv - qv * rv;
+          var disc: f64 := tr * tr / 4.0 - det;
+
+          if (disc >= _zero()) {
+            var rt: f64 := SqrtF64(disc);
+            _put(evRe, hi - 1, tr / 2.0 + rt);
+            _put(evIm, hi - 1, _zero());
+            _put(evRe, hi, tr / 2.0 - rt);
+            _put(evIm, hi, _zero());
+          }
+          else {
+            var im: f64 := SqrtF64(_neg(disc));
+            _put(evRe, hi - 1, tr / 2.0);
+            _put(evIm, hi - 1, im);
+            _put(evRe, hi, tr / 2.0);
+            _put(evIm, hi, _neg(im));
+          }
+          hi := hi - 2;
+          iter := 0;
+        }
+        else {
+          // QR-Schritt auf dem aktiven Block l..hi
+          iter := iter + 1;
+          if (iter > 100) {
+            ok := false;
+            running := false;
+          }
+          else {
+            // Wilkinson-Verschiebung aus dem letzten 2x2-Block: der der
+            // beiden Eigenwerte, der naeher am Eckelement liegt.
+            var p2: f64 := LinGet(h, n, hi - 1, hi - 1);
+            var q2: f64 := LinGet(h, n, hi - 1, hi);
+            var r2: f64 := LinGet(h, n, hi, hi - 1);
+            var s2: f64 := LinGet(h, n, hi, hi);
+            var tr2: f64 := p2 + s2;
+            var det2: f64 := p2 * s2 - q2 * r2;
+            var disc2: f64 := tr2 * tr2 / 4.0 - det2;
+
+            var shift: f64 := s2;
+            if (disc2 >= _zero()) {
+              var rt2: f64 := SqrtF64(disc2);
+              var e1: f64 := tr2 / 2.0 + rt2;
+              var e2: f64 := tr2 / 2.0 - rt2;
+              if (AbsF64(e1 - s2) < AbsF64(e2 - s2)) { shift := e1; }
+              else { shift := e2; }
+            }
+            // Bei komplexem Paar bleibt shift = s2: eine reelle Verschiebung
+            // kann das Paar nicht treffen. Der Block schrumpft trotzdem, weil
+            // die Ausnahmeverschiebung unten die Symmetrie bricht.
+            if ((iter % 12) == 0) {
+              shift := AbsF64(LinGet(h, n, hi, hi - 1)) + AbsF64(LinGet(h, n, hi - 1, hi - 2));
+            }
+
+            // verschobene QR-Zerlegung per Givens-Rotationen, direkt auf der
+            // Hessenberg-Form
+            var i2: int64 := l;
+            while (i2 <= hi) {
+              LinSet(h, n, i2, i2, LinGet(h, n, i2, i2) - shift);
+              i2 := i2 + 1;
+            }
+
+            var cs: int64 := alloc((hi - l + 1) * 8);
+            var sn2: int64 := alloc((hi - l + 1) * 8);
+            if (cs == 0) { ok := false; running := false; }
+            else {
+              if (sn2 == 0) { ok := false; running := false; }
+              else {
+                var k2: int64 := l;
+                while (k2 < hi) {
+                  var x: f64 := LinGet(h, n, k2, k2);
+                  var y: f64 := LinGet(h, n, k2 + 1, k2);
+                  var rr: f64 := SqrtF64(x * x + y * y);
+                  var c2: f64 := _one();
+                  var s3: f64 := _zero();
+                  if (rr > DecompEpsilon()) {
+                    c2 := x / rr;
+                    s3 := y / rr;
+                  }
+                  _put(cs, k2 - l, c2);
+                  _put(sn2, k2 - l, s3);
+
+                  var j2: int64 := k2;
+                  while (j2 < n) {
+                    var hkj: f64 := LinGet(h, n, k2, j2);
+                    var hk1j: f64 := LinGet(h, n, k2 + 1, j2);
+                    LinSet(h, n, k2, j2, c2 * hkj + s3 * hk1j);
+                    LinSet(h, n, k2 + 1, j2, c2 * hk1j - s3 * hkj);
+                    j2 := j2 + 1;
+                  }
+                  k2 := k2 + 1;
+                }
+
+                // R*Q: dieselben Rotationen von rechts
+                k2 := l;
+                while (k2 < hi) {
+                  var c3: f64 := _get(cs, k2 - l);
+                  var s4: f64 := _get(sn2, k2 - l);
+                  var top: int64 := k2 + 2;
+                  if (top > hi) { top := hi; }
+                  var i3: int64 := 0;
+                  while (i3 <= top) {
+                    var hik: f64 := LinGet(h, n, i3, k2);
+                    var hik1: f64 := LinGet(h, n, i3, k2 + 1);
+                    LinSet(h, n, i3, k2, c3 * hik + s4 * hik1);
+                    LinSet(h, n, i3, k2 + 1, c3 * hik1 - s4 * hik);
+                    i3 := i3 + 1;
+                  }
+                  k2 := k2 + 1;
+                }
+
+                var i4: int64 := l;
+                while (i4 <= hi) {
+                  LinSet(h, n, i4, i4, LinGet(h, n, i4, i4) + shift);
+                  i4 := i4 + 1;
+                }
+                free(cs, (hi - l + 1) * 8);
+                free(sn2, (hi - l + 1) * 8);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  free(h, n * n * 8);
+  return ok;
+}
+
+// Spektralradius: groesster Betrag unter den Eigenwerten. Entscheidet, ob eine
+// Iteration x := A*x konvergiert (unter 1) oder auseinanderlaeuft.
+pub fn DecompSpectralRadius(a: int64, n: int64): f64 {
+  var re: int64 := alloc(n * 8);
+  var im: int64 := alloc(n * 8);
+  if (re == 0) { return _zero(); }
+  if (im == 0) { free(re, n * 8); return _zero(); }
+
+  var best: f64 := _zero();
+  if (DecompEigenGeneral(a, n, re, im)) {
+    var i: int64 := 0;
+    while (i < n) {
+      var x: f64 := _get(re, i);
+      var y: f64 := _get(im, i);
+      var mag: f64 := SqrtF64(x * x + y * y);
+      if (mag > best) { best := mag; }
+      i := i + 1;
+    }
+  }
+  free(re, n * 8);
+  free(im, n * 8);
+  return best;
+}
+
+// Eigenvektor zu einem bekannten REELLEN Eigenwert, per inverser Iteration.
+//
+// Geloest wird (A - lambda*I)*x = b mit zufaelligem b, wiederholt und jedes
+// Mal normiert. Dass die Matrix dabei fast singulaer ist, ist kein Problem,
+// sondern der Grund, warum es funktioniert: die Loesung waechst genau in
+// Richtung des gesuchten Eigenvektors. Ein winziger Versatz auf der Diagonale
+// haelt das System loesbar.
+pub fn DecompEigenVector(a: int64, n: int64, lambda: f64, vec: int64): bool {
+  if (n < 1) { return false; }
+
+  var shifted: int64 := alloc(n * n * 8);
+  var b: int64 := alloc(n * 8);
+  var x: int64 := alloc(n * 8);
+  if (shifted == 0) { return false; }
+  if (b == 0) { return false; }
+  if (x == 0) { return false; }
+
+  LinCopy(a, shifted, n, n);
+  var jitter: f64 := 0.0000000001;
+  var i: int64 := 0;
+  while (i < n) {
+    LinSet(shifted, n, i, i, LinGet(shifted, n, i, i) - lambda - jitter);
+    _put(b, i, _one() / ((i + 2) as f64));   // fester Startvektor, reproduzierbar
+    i := i + 1;
+  }
+
+  var ok: bool := true;
+  var it: int64 := 0;
+  while (it < 20) {
+    if (!LinSolve(shifted, n, b, x)) {
+      ok := false;
+      it := 20;
+    }
+    else {
+      var norm: f64 := _zero();
+      i := 0;
+      while (i < n) {
+        var xv: f64 := _get(x, i);
+        norm := norm + xv * xv;
+        i := i + 1;
+      }
+      norm := SqrtF64(norm);
+      if (norm < DecompEpsilon()) {
+        ok := false;
+        it := 20;
+      }
+      else {
+        i := 0;
+        while (i < n) {
+          _put(b, i, _get(x, i) / norm);
+          i := i + 1;
+        }
+        it := it + 1;
+      }
+    }
+  }
+
+  if (ok) {
+    i := 0;
+    while (i < n) {
+      _put(vec, i, _get(b, i));
+      i := i + 1;
+    }
+  }
+
+  free(shifted, n * n * 8);
+  free(b, n * 8);
+  free(x, n * 8);
+  return ok;
+}
