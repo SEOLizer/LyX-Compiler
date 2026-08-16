@@ -8,6 +8,7 @@ import src.parser;
 import src.dwarf_gen;
 import src.crypto.lic_hmac;
 import src.std.alloc;
+import src.wildcard_import;   // #1384
 import src.security.seccomp_gen;
 import src.security.landlock_gen;
 import src.security.proxy_gen;
@@ -43,6 +44,7 @@ con CG_OFF_ISPUB:  int64 := 80;
 
 // Node kinds (mirror NK_xxx from bootstrap.parser)
 con CGN_IMPORT:      int64 := 1;
+con CG_WC_MAX_UNITS: int64 := 512;   // #1384
 con CGN_FUNC_DECL:   int64 := 2;
 con CGN_PARAM:       int64 := 3;
 con CGN_VAR_DECL:    int64 := 4;
@@ -86,6 +88,7 @@ con CGN_CAST:        int64 := 53;  // WP-11: x as Type
 con CGN_CLOSURE:     int64 := 54;  // WP-13: closure { fn ptr, captured env }
 // #1113: Bereichsmuster; iVal = untere Grenze, c1 = obere Grenze oder -1.
 con CGN_PATTERN_RANGE: int64 := 131;
+con CGN_CALL_PTR:    int64 := 133;  // #1505: Aufruf ueber berechneten Zeiger
 con CGN_PATTERN_TUPLE: int64 := 132; // #1250: `case (1, 2)`; c0 = erstes Teilmuster, iVal = Anzahl
 con CGN_CAPABILITY_ATTR: int64 := 110; // #1287: @cap(...)/@capabilities(...) — haengt bei `extern fn` in c2
 con CGN_MATCH:       int64 := 64;  // WP-15: match expr { cases }
@@ -5260,7 +5263,30 @@ pub type Codegen = class {
   // Dieselbe Form wie ein festes `[N]T`: {cap,len}-Kopf, dann n Slots zu 8
   // Byte. Der Kopf ist nicht schmueckend — die dynamische Bereichspruefung
   // liest die Laenge aus [rax+8], und `len(a)` liest denselben Slot.
+  // #1506: `new T` fuer einen EINZELWERT. Bewusst OHNE {cap,len}-Kopf: der
+  // Zeiger zeigt auf die Zelle selbst, `poke64(p, 42)` schreibt also den Wert
+  // und nicht in den Kopf. `new T[1]` bleibt das Array mit einem Element —
+  // die beiden Formen unterscheiden sich, und zwar sichtbar.
+  fn cg_genArrayNewEins() {
+    self.cg_movRaxImm(8);                                                     // eine Zelle
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);                     // mov rsi, rax
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);                     // xor rdi, rdi
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(3);     // rdx = PROT_READ|WRITE
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(34);    // r10 = MAP_PRIVATE|ANON
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);                     // xor r8, r8
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);                     // dec r8 -> fd = -1
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);                     // xor r9, r9
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(9);     // rax = SYS_mmap
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                       // syscall
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0x00); self.cg_e32(0);     // Zelle nullen
+  }
+
   fn cg_genArrayNew(cntNi: int64) {
+    self.cg_genArrayNewEx(cntNi, 0);
+  }
+
+  // #1508: nurKapazitaet = 1 -> Kopf traegt cap = n, len = 0.
+  fn cg_genArrayNewEx(cntNi: int64, nurKapazitaet: int64) {
     self.cg_genExpr(cntNi);              // rax = n
     // Eine Laenge <= 0 waere ein negatives oder leeres mmap: es scheiterte,
     // lieferte -errno, und der Kopf-Schreibzugriff darauf stuerzte ab. Melden
@@ -5290,7 +5316,12 @@ pub type Codegen = class {
     self.cg_e8(0x0F); self.cg_e8(0x05);                                       // syscall
     self.cg_e8(0x5B);                                                         // pop rbx (n)
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x18);                     // mov [rax], rbx    (cap)
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x58); self.cg_e8(0x08);   // mov [rax+8], rbx  (len)
+    if (nurKapazitaet != 0) {
+      // #1508: `new T[](n)` — Platz fuer n, aber noch nichts drin.
+      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0x40); self.cg_e8(0x08); self.cg_e32(0);  // mov qword [rax+8], 0
+    } else {
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x58); self.cg_e8(0x08); // mov [rax+8], rbx  (len)
+    }
   }
 
   // Returns 1 if the named class field has type "Array<T>" (any T), 0 otherwise.
@@ -7840,6 +7871,48 @@ pub type Codegen = class {
     } else if (k == CGN_CALL) {
       self.cg_genCall(ni);
 
+    } else if (k == CGN_CALL_PTR) {
+      // #1505: Aufruf ueber einen berechneten Zeiger (`tabelle[i](args)`).
+      // Derselbe duenne Aufruf wie beim Funktionszeiger in einer Variablen —
+      // nur steht die Adresse hier in einem Ausdruck, nicht in einem Local.
+      // Reihenfolge: erst die Argumente (sie duerfen selbst rufen und dabei
+      // rbx zerstoeren), dann die Adresse, dann die Register fuellen.
+      // Ein Funktionsname mit eckiger Klammer ist KEIN Zeigeraufruf, sondern
+      // der generische Aufruf in falscher Schreibweise (`mx[int64](a, b)`).
+      // Ohne diese Pruefung waere aus dem lauten Fehler von #1053 ein stiller
+      // Default geworden: der Codegen haette den Funktionsnamen indiziert.
+      var cpBasis: int64 := self.cg_nc0(ni);
+      if (cpBasis >= 0 && self.cg_nkind(cpBasis) == CGN_INDEX) {
+        var cpB0: int64 := self.cg_nc0(cpBasis);
+        if (cpB0 >= 0 && self.cg_nkind(cpB0) == CGN_IDENT) {
+          if (self.cg_findLocal(self.cg_nsval(cpB0), self.cg_nslen(cpB0)) == 0
+              && self.cg_isDeclaredFunc(self.cg_nsval(cpB0), self.cg_nslen(cpB0)) != 0) {
+            EPrintStr("error: '"c);
+            sys_write(2, self.cg_nsval(cpB0) as int64, self.cg_nslen(cpB0));
+            EPrintStrLn("' ist eine Funktion — eckige Klammern indizieren, sie rufen nicht generisch auf"c);
+            EPrintStrLn("  Generischer Aufruf wird spitz geschrieben: f<T>(a, b)"c);
+            exit(1);
+          }
+        }
+      }
+      var cpArg: int64 := self.cg_nc1(ni);
+      var cpArgc: int64 := 0;
+      while (cpArg >= 0) {
+        self.cg_genExpr(cpArg);
+        self.cg_pushRax();
+        cpArgc := cpArgc + 1;
+        cpArg := self.cg_nnext(cpArg);
+      }
+      self.cg_genExpr(self.cg_nc0(ni));                       // rax = Codeadresse
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);   // mov rbx, rax
+      if (cpArgc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9
+      if (cpArgc >= 5) { self.cg_e8(0x41); self.cg_e8(0x58); }  // pop r8
+      if (cpArgc >= 4) { self.cg_popRcx(); }
+      if (cpArgc >= 3) { self.cg_popRdx(); }
+      if (cpArgc >= 2) { self.cg_popRsi(); }
+      if (cpArgc >= 1) { self.cg_popRdi(); }
+      self.cg_e8(0xFF); self.cg_e8(0xD3);                     // call rbx
+      return;
     } else if (k == CGN_NEW) {
       // #1255: `new T[n]` — Laenge erst zur LAUFZEIT bekannt (iVal-Bit 8, die
       // Anzahl steht in c1). Ohne diesen Zweig fiel die Form in den Pfad
@@ -7847,8 +7920,20 @@ pub type Codegen = class {
       // Elementen schrieb der Zugriff hinter die Belegung (SIGSEGV), und der
       // {cap,len}-Kopf blieb leer, weshalb `len(a)` still 0 meldete.
       if ((self.cg_nival(ni) & 8) != 0) {
-        self.cg_genArrayNew(self.cg_nc1(ni));
+        var nurCap: int64 := 0;
+        if ((self.cg_nival(ni) & 32) != 0) { nurCap := 1; }   // #1508
+        self.cg_genArrayNewEx(self.cg_nc1(ni), nurCap);
         return;
+      }
+      // #1506: `new T` ohne Klammern. Bei einer Klasse ist das `new T()` — der
+      // Pfad darunter, mit leerer Argumentliste. Bei allem anderen ein
+      // Einzelwert, also `new T[1]`: der Codegen kennt hier die Klassenliste,
+      // der Parser konnte das nicht entscheiden.
+      if ((self.cg_nival(ni) & 16) != 0) {
+        if (self.cg_findClass(self.cg_nsval(ni), self.cg_nslen(ni)) < 0) {
+          self.cg_genArrayNewEins();
+          return;
+        }
       }
       // new T() — allocate class instance via alloc(4096)
       self.cg_movRaxImm(0);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7); // mov rdi,rax
@@ -17491,6 +17576,23 @@ pub type Codegen = class {
         // Process the imported module (WP-09: import resolution)
         var modName: pchar := self.cg_nsval(cur);
         var modLen:  int64 := self.cg_nslen(cur);
+        // #1384: `import pfad.*;`. Der Codegen laeuft seine Importe getrennt
+        // von sema durch — er braucht dieselbe Liste, und die kommt aus
+        // derselben Funktion (src/wildcard_import.lyx), damit die beiden Wege
+        // nicht auseinanderlaufen koennen.
+        if (self.cg_nival(cur) == 1) {
+          var wcListe: int64 := alloc(CG_WC_MAX_UNITS * 16);
+          var wcN: int64 := WildcardUnits(modName, modLen, self.includePath, self.stdPath,
+                                          wcListe, CG_WC_MAX_UNITS);
+          var wcI: int64 := 0;
+          while (wcI < wcN) {
+            self.cg_processImport(peek64(wcListe + wcI * 16) as pchar,
+                                  peek64(wcListe + wcI * 16 + 8));
+            wcI := wcI + 1;
+          }
+          cur := self.cg_nnext(cur);
+          continue;
+        }
         // #1262: Aliasknoten steht in c0.
         var aliNi: int64 := self.cg_nc0(cur);
         if (aliNi >= 0 && self.cg_nkind(aliNi) != CGN_IDENT) { aliNi := 0 - 1; }

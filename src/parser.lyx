@@ -67,6 +67,10 @@ pub con NK_METHOD_PTR: int64 := 129; // B2: method(T1,T2): R — fat pointer {co
 // iVal = untere Grenze, c1 = NK_LIT_INT der oberen Grenze oder -1 (offen).
 pub con NK_PATTERN_RANGE: int64 := 131;
 pub con NK_PATTERN_TUPLE: int64 := 132;  // #1250: TuplePattern `case (1, 2)`; c0 = erstes Teilmuster
+// #1505: Aufruf ueber einen berechneten Ausdruck — `tabelle[i](args)`.
+// c0 = der Ausdruck, der die Codeadresse liefert, c1 = Argumentkette.
+// Ein gewoehnlicher NK_CALL haengt am NAMEN; hier gibt es keinen.
+pub con NK_CALL_PTR:   int64 := 133;
 pub con NK_ASM:        int64 := 130; // WSP-05: asm { "mnemonic" ... } inline-assembly; c0=NK_LIT_STR-Kette
 // #1324: ein Operand einer asm-Bindung. sVal = Registername ("eax", "dx"),
 // c0 = Ausdruck (bei `in`) bzw. Zielbezeichner (bei `out`). iVal: 0 = in, 1 = out.
@@ -1411,10 +1415,21 @@ pub type Parser = class {
         // wurde `(x)` als geklammerter Ausdruck verschluckt und das Programm
         // rechnete falsch (arr[0](21) ergab 12 statt 42), mit ZWEI Argumenten
         // gab es einen unverstaendlichen Fehler ueber ein fehlendes ')'.
+        // #1505: `tabelle[i](args)` ist jetzt ein Aufruf ueber den berechneten
+        // Zeiger. Bis 1.1.0A wurde er abgewiesen (davor, bis #1053, lief er
+        // still schief: mit EINEM Argument verschluckte der Parser `(x)` als
+        // geklammerten Ausdruck und das Programm rechnete falsch).
+        // Dispatch-Tabellen, Zustandsautomaten und Ereignisverteiler brauchen
+        // genau diese Form; der Umweg ueber eine Zwischenvariable war reine
+        // Schreibarbeit ohne inhaltlichen Unterschied.
         if (self.Check(TK_LPAREN) != 0) {
-          self._err("Aufruf ueber einen indizierten Ausdruck wird nicht unterstuetzt"c);
-          self._err("  Funktionszeiger zuerst einer Variablen zuweisen und ueber diese aufrufen"c);
-          self._err("  Generischer Aufruf wird spitz geschrieben: f<T>(a, b)"c);
+          var cti: int64 := self.cur;
+          self.Advance();
+          var cpn: int64 := self._alloc(NK_CALL_PTR, cti);
+          self._sc0(cpn, base);
+          self._sc1(cpn, self._parseArgList());
+          self.Expect(TK_RPAREN);
+          base := cpn;
         }
       } else if (self.Check(TK_AS) != 0) {
         var ti: int64 := self.cur;
@@ -1554,7 +1569,19 @@ pub type Parser = class {
     if (k == 51) {  // TK_NEW=51
       self.Advance();
       var nameTok: int64 := self.cur;
-      self.Expect(TK_IDENT);
+      // #1506: Die eingebauten Typen sind eigene Schluesselwoerter, keine
+      // Bezeichner — `new f64` scheiterte deshalb an "expected IDENT".
+      // `new int64` ging nur, weil int64 als IDENT gelext wird.
+      if (self.Check(TK_INT8) != 0 || self.Check(TK_INT16) != 0 ||
+          self.Check(TK_INT32) != 0 || self.Check(TK_INT64) != 0 ||
+          self.Check(TK_UINT8) != 0 || self.Check(TK_UINT16) != 0 ||
+          self.Check(TK_UINT32) != 0 || self.Check(TK_UINT64) != 0 ||
+          self.Check(TK_F32) != 0 || self.Check(TK_F64) != 0 ||
+          self.Check(TK_CHAR_TYPE) != 0) {
+        self.Advance();
+      } else {
+        self.Expect(TK_IDENT);
+      }
       var n: int64 := self._alloc(NK_NEW, ti);
       self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
       // #1255: `new T[n]` — ein dynamisches Array mit Laenge zur LAUFZEIT.
@@ -1564,10 +1591,32 @@ pub type Parser = class {
       // Markiert wird der Knoten mit iVal 8; die Laenge steht in c1.
       if (self.Check(TK_LBRACK) != 0) {
         self.Advance();
+        // #1508: `new T[](n)` — Kapazitaet n, Laenge 0. Der Unterschied zu
+        // `new T[n]` (dort ist beides n) ist genau das, was ein Puffer
+        // braucht, der per `push` gefuellt wird; die Doku zeigte die Form seit
+        // jeher, der Parser kannte sie nicht. Marke: Bit 8 wie beim
+        // Laufzeit-Array, dazu Bit 32 fuer "Laenge bleibt 0".
+        if (self.Check(TK_RBRACK) != 0) {
+          self.Advance();
+          self.Expect(TK_LPAREN);
+          var capExpr: int64 := self.ParseExpr();
+          self.Expect(TK_RPAREN);
+          self._siv(n, 8 + 32);
+          self._sc1(n, capExpr);
+          return n;
+        }
         var cntExpr: int64 := self.ParseExpr();
         self.Expect(TK_RBRACK);
         self._siv(n, 8);
         self._sc1(n, cntExpr);
+        return n;
+      }
+      // #1506: `new T` ohne Klammern. Was daraus wird, haengt am Typ und ist
+      // hier nicht entscheidbar: bei einer Klasse ist es `new T()`, sonst ein
+      // Einzelwert (also `new T[1]`). Der Codegen kennt die Klassenliste und
+      // entscheidet es dort; markiert wird die Kurzform mit Bit 16.
+      if (self.Check(TK_LPAREN) == 0) {
+        self._siv(n, 16);
         return n;
       }
       self.Expect(TK_LPAREN);
@@ -3267,14 +3316,25 @@ pub type Parser = class {
       var nameTok: int64 := self.cur;
       self.Expect(TK_IDENT);
       var endTok: int64 := nameTok;
+      var istWildcard: int64 := 0;
       while (self.Check(TK_DOT) != 0) {
         self.Advance();
+        // #1384: `import std.audio.*;` — alle Units des Verzeichnisses samt
+        // Unterverzeichnissen. Ein Punktpfad bezeichnet sonst genau eine
+        // Datei; der Stern steht deshalb nur ganz am Ende und der Name endet
+        // davor. Aufgefaltet wird in sema, wo die Suchpfade bekannt sind.
+        if (self.Check(TK_STAR) != 0) {
+          self.Advance();
+          istWildcard := 1;
+          break;
+        }
         endTok := self.cur;
         self.Expect(TK_IDENT);
       }
       var startOff: int64 := self.TokStart(nameTok);
       var endOff: int64 := self.TokStart(endTok) + self.TokLen(endTok);
       self._ssv(n, startOff, endOff - startOff);
+      if (istWildcard != 0) { self._siv(n, 1); }
 
       // #1262: optionaler Namensraum — `import std.math as m;`
       //
