@@ -94,6 +94,16 @@ pub type EmitRISCV64 = class {
   // Sprungziel steckt in RISC-V verstreut im Befehlswort (imm[20|10:1|11|19:12]);
   // von Hand zusammengesetzt ist das die haeufigste Fehlerquelle, deshalb hier
   // an einer Stelle.
+  // #1388: BEQ rs, x0, +off  (B-Type, funct3=0). Nur vorwaerts, Offset gerade.
+  fn rv_BEQZ_fwd(rs: int64, off: int64) {
+    var b11: int64 := (off >> 11) & 1;
+    var b4_1: int64 := (off >> 1) & 0xF;
+    var b10_5: int64 := (off >> 5) & 0x3F;
+    var b12: int64 := (off >> 12) & 1;
+    self.rv_e32(0x63 | (b11 << 7) | (b4_1 << 8) | (0 << 12) | (rs << 15) | (0 << 20)
+                     | (b10_5 << 25) | (b12 << 31));
+  }
+
   fn rv_JAL_x0(off: int64) {
     var b20:    int64 := (off >> 20) & 0x1;
     var b10_1:  int64 := (off >> 1)  & 0x3FF;
@@ -123,6 +133,41 @@ pub type EmitRISCV64 = class {
     var imm5: int64 := off & 0x1F;
     var imm7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
     self.rv_e32(0x23 | (imm5<<7) | (3<<12) | (rs1<<15) | (rs2<<20) | (imm7<<25));
+  }
+
+  // #1388: schmale Zugriffe. Die Speicher-Builtins (peek8/16/32, poke8/16/32)
+  // brauchen sie; bis 1.1.0A fehlten sie, und weil emitBuiltinCall keinen
+  // Default-Zweig hatte, erzeugte `peek8(p)` GAR NICHTS und lieferte, was
+  // zufaellig in a0 stand.
+  // LBU rd, off(rs1) — funct3=4, opcode=3
+  fn rv_LBU(rd: int64, rs1: int64, off: int64) {
+    self.rv_e32(0x3 | (rd<<7) | (4<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
+  }
+  // LHU rd, off(rs1) — funct3=5
+  fn rv_LHU(rd: int64, rs1: int64, off: int64) {
+    self.rv_e32(0x3 | (rd<<7) | (5<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
+  }
+  // LWU rd, off(rs1) — funct3=6
+  fn rv_LWU(rd: int64, rs1: int64, off: int64) {
+    self.rv_e32(0x3 | (rd<<7) | (6<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
+  }
+  // SB rs2, off(rs1) — funct3=0, opcode=0x23
+  fn rv_SB(rs2: int64, rs1: int64, off: int64) {
+    var sbI5: int64 := off & 0x1F;
+    var sbI7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
+    self.rv_e32(0x23 | (sbI5<<7) | (0<<12) | (rs1<<15) | (rs2<<20) | (sbI7<<25));
+  }
+  // SH rs2, off(rs1) — funct3=1
+  fn rv_SH(rs2: int64, rs1: int64, off: int64) {
+    var shI5: int64 := off & 0x1F;
+    var shI7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
+    self.rv_e32(0x23 | (shI5<<7) | (1<<12) | (rs1<<15) | (rs2<<20) | (shI7<<25));
+  }
+  // SW rs2, off(rs1) — funct3=2
+  fn rv_SW(rs2: int64, rs1: int64, off: int64) {
+    var swI5: int64 := off & 0x1F;
+    var swI7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
+    self.rv_e32(0x23 | (swI5<<7) | (2<<12) | (rs1<<15) | (rs2<<20) | (swI7<<25));
   }
 
   // ADDI rd, rs1, imm  — I-type, funct3=0, opcode=0x13
@@ -692,9 +737,65 @@ pub type EmitRISCV64 = class {
       self.rv_LD(RV_A0, RV_FP, self.slotOff(0));
       self.rv_LI(RV_A7, RV_SYS_EXIT);
       self.rv_ECALL();
+    } else if id == 13 {
+      // #1388: EPrintStr — write(2, buf, strlen(buf)); die Laenge rechnet der
+      // Code selbst aus (die Konvention reicht nur einen Sentinel durch).
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(0));   // a1 = buf
+      self.rv_LI(RV_A2, 0);                        // a2 = Laenge
+      var epLoop: int64 := self.codeLen;
+      self.rv_ADD(RV_T1, RV_A1, RV_A2);
+      self.rv_LBU(RV_T2, RV_T1, 0);
+      self.rv_BEQZ_fwd(RV_T2, 12);   // Nullbyte -> hinter den Ruecksprung
+      self.rv_ADDI(RV_A2, RV_A2, 1);
+      var epBack: int64 := epLoop - self.codeLen;
+      self.rv_JAL_x0(epBack);
+      self.rv_LI(RV_A0, 2);                        // fd = stderr
+      self.rv_LI(RV_A7, RV_SYS_WRITE);
+      self.rv_ECALL();
+    } else if id == 15 {
+      // #1388: StrLen — Zeichen bis zur Null zaehlen, Ergebnis nach a0.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(0));   // a1 = buf
+      self.rv_LI(RV_A0, 0);
+      var slLoop: int64 := self.codeLen;
+      self.rv_ADD(RV_T1, RV_A1, RV_A0);
+      self.rv_LBU(RV_T2, RV_T1, 0);
+      self.rv_BEQZ_fwd(RV_T2, 12);
+      self.rv_ADDI(RV_A0, RV_A0, 1);
+      self.rv_JAL_x0(slLoop - self.codeLen);
+    } else if id == 200 || id == 208 || id == 201 || id == 202 {
+      // #1388: peek8/16/32/64 — Adresse aus Slot 0, Wert nach a0.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(0));
+      if (id == 200) { self.rv_LBU(RV_A0, RV_A1, 0); }
+      if (id == 208) { self.rv_LHU(RV_A0, RV_A1, 0); }
+      if (id == 201) { self.rv_LWU(RV_A0, RV_A1, 0); }
+      if (id == 202) { self.rv_LD(RV_A0, RV_A1, 0); }
+    } else if id == 203 || id == 209 || id == 204 || id == 205 {
+      // #1388: poke8/16/32/64 — Adresse aus Slot 0, Wert aus Slot 1.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(0));
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(1));
+      if (id == 203) { self.rv_SB(RV_A2, RV_A1, 0); }
+      if (id == 209) { self.rv_SH(RV_A2, RV_A1, 0); }
+      if (id == 204) { self.rv_SW(RV_A2, RV_A1, 0); }
+      if (id == 205) { self.rv_SD(RV_A2, RV_A1, 0); }
+      self.rv_LI(RV_A0, 0);
+    } else {
+      // #1388: Bis 1.1.0A gab es hier KEINEN Default. Eine unbekannte
+      // Builtin-ID erzeugte gar nichts, und der Aufruf lieferte, was zufaellig
+      // in a0 stand — derselbe stille Default wie bei den Opcodes in #1339,
+      // nur eine Ebene tiefer und ohne Meldung.
+      self._builtinUnsupportedRV(id);
     }
     self.rv_MV(RV_T0, RV_A0);
     self.rv_storeSlot(dest);
+  }
+
+  fn _builtinUnsupportedRV(id: int64) {
+    EPrintStr("error: riscv: Builtin-ID "c);
+    EPrintInt(id);
+    EPrintStrLn(" wird nicht behandelt"c);
+    EPrintStrLn("  Die IDs sind ein globaler Namensraum ueber alle Backends."c);
+    EPrintStrLn("  Vergabe und Belegung stehen in src/backend/_builtin_ids.md."c);
+    exit(1);
   }
 
   // --------------------------------------------------------------------------

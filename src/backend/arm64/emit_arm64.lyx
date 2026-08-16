@@ -1035,6 +1035,11 @@ pub type EmitARM64 = class {
         // WP-GPIO-1: mem_barrier()/inst_barrier(). Auf Windows-ARM64 gibt es
         // keine Barrieren-Emission; ausdruecklich als No-op fuehren, statt in
         // den Fehlerzweig zu fallen.
+      } else if id == 200 || id == 208 || id == 201 || id == 202
+             || id == 203 || id == 209 || id == 204 || id == 205 {
+        // #1388: Speicherzugriffe brauchen kein Betriebssystem und gelten
+        // deshalb auch im Windows-Zweig.
+        self._emitPeekPoke(id);
       } else {
         self._builtinUnsupported(id, 1);
       }
@@ -1110,6 +1115,43 @@ pub type EmitARM64 = class {
     } else if id == 9 {
       // WP-08: PrintFloat — Linux ARM64 fallback (load float bits, no-op print)
       self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+    } else if id == 200 || id == 208 || id == 201 || id == 202
+           || id == 203 || id == 209 || id == 204 || id == 205 {
+      self._emitPeekPoke(id);      // #1388
+    } else if id == 13 {
+      // #1388: EPrintStr — write(2, buf, strlen(buf)). Die Laenge rechnet der
+      // Code selbst aus; die Aufrufkonvention reicht fuer Zeichenketten nur
+      // einen Sentinel (-1) durch, weil sie zur Uebersetzungszeit unbekannt
+      // ist. Ohne diesen Zweig scheiterte JEDES Programm, das std.alloc
+      // importiert — malloc_orpanic meldet dort auf stderr.
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(0));  // x1 = buf
+      self.emit32(0xD2800002);  // MOVZ x2, #0            (Laenge)
+      self.emit32(0x38626823);  // [LOOP] LDRB w3,[x1,x2]
+      self.emit32(0x34000063);  // CBZ w3, +3  (→ WRITE)
+      self.emit32(0x91000442);  // ADD x2,x2,#1
+      self.emit32(0x17FFFFFD);  // B -3        (→ LOOP)
+      self.emit32(0xD2800040);  // [WRITE] MOVZ x0,#2      (fd=stderr)
+      self.emit32(0xD2800808);  // MOVZ x8,#64             (SYS_write)
+      self.emit32(0xD4000001);  // SVC #0
+    } else if id == 15 {
+      // #1388: StrLen — Zeichen bis zur Null zaehlen, Ergebnis nach x0.
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(0));  // x1 = buf
+      self.emit32(0xD2800000);  // MOVZ x0, #0
+      self.emit32(0x38606823);  // [LOOP] LDRB w3,[x1,x0]
+      self.emit32(0x34000063);  // CBZ w3, +3 (→ ENDE)
+      self.emit32(0x91000400);  // ADD x0,x0,#1
+      self.emit32(0x17FFFFFD);  // B -3 (→ LOOP)
+    } else if id == 14 {
+      // #1388: Zeilenumbruch auf stderr (EPrintStrLn/EPrintLn).
+      self.emit32(0xD10043FF);  // SUB sp,sp,#16
+      self.emit32(0x52800143);  // MOVZ w3,#10
+      self.emit32(0x390003E3);  // STRB w3,[sp]
+      self.emit32(0x910003E1);  // MOV x1,sp
+      self.emit32(0xD2800022);  // MOVZ x2,#1
+      self.emit32(0xD2800040);  // MOVZ x0,#2
+      self.emit32(0xD2800808);  // MOVZ x8,#64
+      self.emit32(0xD4000001);  // SVC #0
+      self.emit32(0x910043FF);  // ADD sp,sp,#16
     } else {
       // #1037: bis hierher fiel jede nicht behandelte ID STILL durch — es wurde
       // kein Code erzeugt, keine Meldung ausgegeben. Genau so verschwand Printf
@@ -1122,6 +1164,25 @@ pub type EmitARM64 = class {
 
   // #1037: unbehandelte Builtin-ID laut melden statt still nichts zu erzeugen.
   // winMode: 1 = Windows-Zweig, 0 = Linux-Zweig.
+  // #1388: peek8/16/32/64 und poke8/16/32/64. Bis 1.1.0A meldete arm64 sie als
+  // unbehandelt — richtig gemeldet, aber eben nicht umgesetzt, und damit war
+  // jede Unit unbrauchbar, die Speicher direkt anfasst (also fast die ganze
+  // Standardbibliothek). Adresse steht in Slot 0, der Wert (beim Schreiben) in
+  // Slot 1; das Ergebnis geht wie ueberall ueber x0 zurueck.
+  fn _emitPeekPoke(id: int64) {
+    self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(0));    // x1 = Adresse
+    if (id == 200) { self.emitLdrb0(ARM64_X0, ARM64_X1); return; }
+    if (id == 208) { self.emitLdrh0(ARM64_X0, ARM64_X1); return; }
+    if (id == 201) { self.emitLdrw0(ARM64_X0, ARM64_X1); return; }
+    if (id == 202) { self.emitLdrx0(ARM64_X0, ARM64_X1); return; }
+    self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(1));    // x2 = Wert
+    if (id == 203) { self.emitStrb0(ARM64_X2, ARM64_X1); }
+    if (id == 209) { self.emitStrh0(ARM64_X2, ARM64_X1); }
+    if (id == 204) { self.emitStrw0(ARM64_X2, ARM64_X1); }
+    if (id == 205) { self.emitStrx0(ARM64_X2, ARM64_X1); }
+    self.emitMovImmReg(ARM64_X0, 0);
+  }
+
   fn _builtinUnsupported(id: int64, isWin: int64) {
     EPrintStr("error: arm64: Builtin-ID "c);
     EPrintInt(id);
@@ -1299,6 +1360,34 @@ pub type EmitARM64 = class {
   // -------------------------------------------------------------------------
   // Low-level LDUR/STUR (simm9: -256..255)
   // -------------------------------------------------------------------------
+
+  // #1388: schmale und unskalierte Zugriffe fuer die Speicher-Builtins
+  // (peek8/16/32/64, poke8/16/32/64). Offset ist hier immer 0 — die Adresse
+  // steht bereits im Register.
+  fn emitLdrb0(rt: int64, rn: int64) {   // LDRB Wt, [Xn]
+    self.emit32(0x39400000 | (rn << 5) | rt);
+  }
+  fn emitLdrh0(rt: int64, rn: int64) {   // LDRH Wt, [Xn]
+    self.emit32(0x79400000 | (rn << 5) | rt);
+  }
+  fn emitLdrw0(rt: int64, rn: int64) {   // LDR Wt, [Xn]  (nullt die oberen 32 Bit)
+    self.emit32(0xB9400000 | (rn << 5) | rt);
+  }
+  fn emitLdrx0(rt: int64, rn: int64) {   // LDR Xt, [Xn]
+    self.emit32(0xF9400000 | (rn << 5) | rt);
+  }
+  fn emitStrb0(rt: int64, rn: int64) {   // STRB Wt, [Xn]
+    self.emit32(0x39000000 | (rn << 5) | rt);
+  }
+  fn emitStrh0(rt: int64, rn: int64) {   // STRH Wt, [Xn]
+    self.emit32(0x79000000 | (rn << 5) | rt);
+  }
+  fn emitStrw0(rt: int64, rn: int64) {   // STR Wt, [Xn]
+    self.emit32(0xB9000000 | (rn << 5) | rt);
+  }
+  fn emitStrx0(rt: int64, rn: int64) {   // STR Xt, [Xn]
+    self.emit32(0xF9000000 | (rn << 5) | rt);
+  }
 
   fn emitLdur(rt: int64, rn: int64, off: int64) {
     // LDUR Xt, [Xn, #simm9]
