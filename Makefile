@@ -227,6 +227,7 @@ test: lyxc
 	@bash tests/sema_unitgrenzen_z14_test.sh
 	@bash tests/stdlib_z20_test.sh
 	@bash tests/sprache_z16_test.sh
+	@bash tests/codegen_ausdruecke_test.sh
 	@bash tests/skalierung_z2b_test.sh
 	@bash tests/lfd_grammatik_test.sh
 	@bash tests/lfd_parser_test.sh
