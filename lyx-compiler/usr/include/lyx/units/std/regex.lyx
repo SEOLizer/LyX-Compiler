@@ -373,6 +373,12 @@ fn _reMatchIn(pattern: pchar, pIdx: int64, pEnd: int64, text: pchar, tIdx: int64
   var pc: int64 := StrSafeCharAt(pattern, pIdx);
   if ((pc == 36) && (pIdx == plen - 1)) {
     if (tIdx == tlen) { return tIdx; }
+    // #1564: MULTILINE wurde entgegengenommen und in _reFlags geschrieben,
+    // vom Abgleich aber nie gelesen — `$` meinte weiter das Textende statt
+    // des Zeilenendes. Mit dem Flag gilt es auch unmittelbar vor \n.
+    if ((_reFlags & REGEX_FLAG_MULTILINE) != 0) {
+      if (StrSafeCharAt(text, tIdx) == 10) { return tIdx; }
+    }
     return -1;
   }
 
@@ -506,10 +512,18 @@ pub fn regexSearchFrom(pattern: pchar, text: pchar, startIdx: int64): int64 {
 
   var pStart: int64 := 0;
   var anchored: int64 := 0;
+  // #1564: Mit MULTILINE ist `^` nicht mehr nur der Textanfang, sondern jeder
+  // Zeilenanfang. Die Verankerung bleibt bestehen — nur die Menge der
+  // Ansatzpunkte waechst: Position 0 und jede Stelle hinter einem \n.
+  var mlCaret: int64 := 0;
   if (StrSafeCharAt(pattern, 0) == 94) {
     pStart := 1;
     anchored := 1;
-    if (startIdx != 0) { return -1; }
+    if ((_reFlags & REGEX_FLAG_MULTILINE) != 0) {
+      mlCaret := 1;
+    } else {
+      if (startIdx != 0) { return -1; }
+    }
   }
 
   // #1467: ANCHORED wirkt wie ein vorangestelltes `^`.
@@ -532,7 +546,17 @@ pub fn regexSearchFrom(pattern: pchar, text: pchar, startIdx: int64): int64 {
     // Der `^`-Test stand nur vor der Schleife und griff daher bloss fuer den
     // ersten Versuch. Fuer Eingabepruefung, wo `^...$` fast immer steht, liess
     // das zu viel durch.
-    if (anchored != 0) { return -1; }
+    // #1564: Mit MULTILINE bleibt `^` verankert, aber jeder Zeilenanfang ist
+    // ein eigener Ansatzpunkt — also bis hinter das naechste \n weiterruecken
+    // statt aufzugeben. Ohne MULTILINE gilt #1313 unveraendert.
+    if (anchored != 0) {
+      if (mlCaret == 0) { return -1; }
+      var nl: int64 := ti;
+      while (nl < tlen && StrSafeCharAt(text, nl) != 10) { nl := nl + 1; }
+      if (nl >= tlen) { return -1; }
+      ti := nl + 1;
+      continue;
+    }
     ti += 1;
   }
   return -1;
@@ -631,15 +655,23 @@ pub type RegexProgramInfo = struct {
 
 // regexLastCaps: pointer to alloc'd int64[32] buffer, lazy-initialized on first use
 
+// #1563: Bytecode ist KEINE Zeichenkette. Bis 1.1.0A las der Leser das
+// Programm mit StrSafeCharAt, und das misst seine Grenze mit StrLen — der Kopf
+// traegt bei Offset 3 eine Null, also endete jedes Programm nach drei Bytes und
+// jeder Lesezugriff dahinter lieferte -1. Damit war die kompilierte API auch
+// dann nicht benutzbar, wenn jemand den Bytecode von Hand zusammengesetzt
+// haette: es fehlte nicht nur der Schreiber, der Leser konnte nichts lesen.
 fn regexReadU8(prog: pchar, idx: int64): int64 {
-  return StrSafeCharAt(prog, idx);
+  if (idx < 0) { return -1; }
+  return peek8((prog as int64) + idx) & 255;
 }
 
 fn regexReadU32(prog: pchar, idx: int64): int64 {
-  var b0: int64 := StrSafeCharAt(prog, idx);
-  var b1: int64 := StrSafeCharAt(prog, idx + 1);
-  var b2: int64 := StrSafeCharAt(prog, idx + 2);
-  var b3: int64 := StrSafeCharAt(prog, idx + 3);
+  // #1563: siehe regexReadU8 — roh lesen, nicht als Zeichenkette.
+  var b0: int64 := regexReadU8(prog, idx);
+  var b1: int64 := regexReadU8(prog, idx + 1);
+  var b2: int64 := regexReadU8(prog, idx + 2);
+  var b3: int64 := regexReadU8(prog, idx + 3);
   return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
 }
 
@@ -812,6 +844,381 @@ fn regexRunAt(prog: pchar, progLen: int64, info: RegexProgramInfo, text: pchar,
     }
   }
   return -1;
+}
+
+// ===========================================================================
+// #1563: RegexCompile — der fehlende Schreiber zur kompilierten API
+// ===========================================================================
+//
+// Die vier *Compiled-Funktionen lesen ein Bytecode-Programm, aber es gab keine
+// Funktion, die eines erzeugt: die halbe API war von Lyx aus unbenutzbar, denn
+// der Aufbau stand nirgends. Hier steht er, und RegexCompile schreibt ihn.
+//
+// FORMAT (little endian, so wie regexParseInfo und regexRunAt es lesen):
+//
+//   +0   'R' 'X' '1' 0
+//   +4   u32 captureSlots      (2 je Gruppe, Gruppe 0 mitgezaehlt)
+//   +8   u32 classCount
+//   +12  u32 reserviert
+//   +16  Klassentabelle, je Klasse:
+//          u8  negiert (1 = [^...])
+//          u32 rangeCount
+//          rangeCount x { u32 von, u32 bis }
+//   danach der Befehlsstrom; alle Sprungziele zaehlen AB DIESEM PUNKT.
+//
+// BEFEHLE (Opcode als u8, Operanden als u32):
+//   1 CHAR c      2 ANY        3 CLASS idx    4 SPLIT z1 z2 (z1 zuerst)
+//   5 JMP z       6 MATCH      7 SAVE slot    8 BOL (^)      9 EOL ($)
+//
+// Der Zeichenklassen-Abschnitt steht VOR dem Code, seine Groesse haengt aber
+// vom Code ab (welche Klassen vorkommen). Deshalb zwei Durchgaenge: erst die
+// Klassen einsammeln, dann den Code schreiben.
+
+con RXC_MAX_CLASSES: int64 := 64;
+con RXC_MAX_RANGES:  int64 := 32;
+
+// Sammelzustand des laufenden Uebersetzens.
+var rxcClsBuf:   int64 := 0;   // RXC_MAX_CLASSES x (negiert, count, ranges...)
+var rxcClsCount: int64 := 0;
+var rxcCode:     int64 := 0;   // Befehlsstrom
+var rxcCodeLen:  int64 := 0;
+var rxcCodeCap:  int64 := 0;
+var rxcSlots:    int64 := 0;   // naechster freier Capture-Slot
+var rxcFehler:   int64 := 0;
+
+// Ein Klasseneintrag: 8 Byte Kopf (negiert, rangeCount) + 32 Bereiche a 16 Byte
+con RXC_CLS_SZ: int64 := 8 + 8 + RXC_MAX_RANGES * 16;
+
+fn rxcEmit8(v: int64) {
+  if (rxcCodeLen + 1 > rxcCodeCap) { rxcFehler := 1; return; }
+  poke8(rxcCode + rxcCodeLen, v & 255);
+  rxcCodeLen := rxcCodeLen + 1;
+}
+
+fn rxcEmit32(v: int64) {
+  rxcEmit8(v); rxcEmit8(v >> 8); rxcEmit8(v >> 16); rxcEmit8(v >> 24);
+}
+
+// u32 an einer bereits geschriebenen Stelle nachtragen (Sprungziele).
+fn rxcPatch32(at: int64, v: int64) {
+  if (at < 0 || at + 4 > rxcCodeLen) { rxcFehler := 1; return; }
+  poke8(rxcCode + at,     v & 255);
+  poke8(rxcCode + at + 1, (v >> 8) & 255);
+  poke8(rxcCode + at + 2, (v >> 16) & 255);
+  poke8(rxcCode + at + 3, (v >> 24) & 255);
+}
+
+// Eine Zeichenklasse anlegen; liefert ihren Index oder -1.
+fn rxcClassNeu(negiert: int64): int64 {
+  if (rxcClsCount >= RXC_MAX_CLASSES) { rxcFehler := 1; return -1; }
+  var base: int64 := rxcClsBuf + rxcClsCount * RXC_CLS_SZ;
+  poke64(base, negiert);
+  poke64(base + 8, 0);
+  var idx: int64 := rxcClsCount;
+  rxcClsCount := rxcClsCount + 1;
+  return idx;
+}
+
+fn rxcClassBereich(idx: int64, von: int64, bis: int64) {
+  if (idx < 0) { return; }
+  var base: int64 := rxcClsBuf + idx * RXC_CLS_SZ;
+  var n: int64 := peek64(base + 8);
+  if (n >= RXC_MAX_RANGES) { rxcFehler := 1; return; }
+  poke64(base + 16 + n * 16,     von);
+  poke64(base + 16 + n * 16 + 8, bis);
+  poke64(base + 8, n + 1);
+}
+
+// \d \w \s (und die grossgeschriebenen Verneinungen) als Klasse ablegen —
+// derselbe Zeichenvorrat, den atomMatches fuer die Muster-API benutzt.
+fn rxcKlasseAusEscape(esc: int64): int64 {
+  var neg: int64 := 0;
+  var basis: int64 := esc;
+  if (esc == 68) { neg := 1; basis := 100; }    // \D
+  if (esc == 87) { neg := 1; basis := 119; }    // \W
+  if (esc == 83) { neg := 1; basis := 115; }    // \S
+  var idx: int64 := rxcClassNeu(neg);
+  if (idx < 0) { return -1; }
+  if (basis == 100) {                            // \d
+    rxcClassBereich(idx, 48, 57);
+  } else if (basis == 119) {                     // \w
+    rxcClassBereich(idx, 48, 57);
+    rxcClassBereich(idx, 65, 90);
+    rxcClassBereich(idx, 97, 122);
+    rxcClassBereich(idx, 95, 95);
+  } else if (basis == 115) {                     // \s
+    rxcClassBereich(idx, 32, 32);
+    rxcClassBereich(idx, 9, 13);
+  } else {
+    rxcFehler := 1;
+    return -1;
+  }
+  return idx;
+}
+
+// [...] uebersetzen. i zeigt auf '['; liefert den Index HINTER ']' oder -1.
+fn rxcKlasseAusMenge(pattern: pchar, start: int64, plen: int64, clsOut: int64): int64 {
+  var i: int64 := start + 1;
+  var neg: int64 := 0;
+  if (i < plen && StrSafeCharAt(pattern, i) == 94) { neg := 1; i := i + 1; }
+  var idx: int64 := rxcClassNeu(neg);
+  if (idx < 0) { return -1; }
+  var fertig: int64 := 0;
+  while (i < plen && fertig == 0) {
+    var ch: int64 := StrSafeCharAt(pattern, i);
+    if (ch == 93) { fertig := 1; i := i + 1; }
+    else {
+      if (ch == 92) {
+        i := i + 1;
+        if (i >= plen) { rxcFehler := 1; return -1; }
+        var e: int64 := StrSafeCharAt(pattern, i);
+        if (e == 110) { ch := 10; } else if (e == 114) { ch := 13; }
+        else if (e == 116) { ch := 9; } else { ch := e; }
+      }
+      // Bereich a-z, aber nicht wenn '-' am Ende steht
+      if (i + 2 < plen && StrSafeCharAt(pattern, i + 1) == 45
+          && StrSafeCharAt(pattern, i + 2) != 93) {
+        var bis: int64 := StrSafeCharAt(pattern, i + 2);
+        rxcClassBereich(idx, ch, bis);
+        i := i + 3;
+      } else {
+        rxcClassBereich(idx, ch, ch);
+        i := i + 1;
+      }
+    }
+  }
+  if (fertig == 0) { rxcFehler := 1; return -1; }
+  poke64(clsOut, idx);
+  return i;
+}
+
+// Vorwaertsdeklaration ueber gegenseitige Rekursion ist in Lyx nicht noetig —
+// rxcAlternative ruft rxcFolge, rxcFolge ruft ueber die Gruppe wieder
+// rxcAlternative. Beide stehen deshalb in EINER Funktion mit Tiefenzaehler.
+fn rxcAlternative(pattern: pchar, start: int64, plen: int64, tiefe: int64): int64 {
+  if (tiefe > 32) { rxcFehler := 1; return start; }
+  var i: int64 := start;
+  var zweigStart: int64 := rxcCodeLen;
+  var splitPos: int64 := -1;
+  var sprungPos: int64 := -1;
+  var offen: int64 := 1;
+
+  while (offen == 1) {
+    // ── eine Folge von Atomen ────────────────────────────────────────────
+    while (i < plen) {
+      var c: int64 := StrSafeCharAt(pattern, i);
+      if (c == 124 || c == 41) { break; }        // '|' oder ')'
+      var atomStart: int64 := rxcCodeLen;
+
+      if (c == 94) {                              // ^
+        rxcEmit8(8); i := i + 1;
+      } else if (c == 36) {                       // $
+        rxcEmit8(9); i := i + 1;
+      } else if (c == 46) {                       // .
+        rxcEmit8(2); i := i + 1;
+      } else if (c == 40) {                       // ( ... )
+        var slot: int64 := rxcSlots;
+        if (slot + 2 > REGEX_MAX_CAPTURE_SLOTS) { rxcFehler := 1; return i; }
+        rxcSlots := rxcSlots + 2;
+        rxcEmit8(7); rxcEmit32(slot);
+        i := rxcAlternative(pattern, i + 1, plen, tiefe + 1);
+        if (rxcFehler != 0) { return i; }
+        if (i >= plen || StrSafeCharAt(pattern, i) != 41) { rxcFehler := 1; return i; }
+        i := i + 1;
+        rxcEmit8(7); rxcEmit32(slot + 1);
+      } else if (c == 91) {                       // [ ... ]
+        var clsZelle: int64 := alloc(8);
+        var nachher: int64 := rxcKlasseAusMenge(pattern, i, plen, clsZelle);
+        var clsIdx: int64 := peek64(clsZelle);
+        free(clsZelle, 8);
+        if (nachher < 0) { rxcFehler := 1; return i; }
+        rxcEmit8(3); rxcEmit32(clsIdx);
+        i := nachher;
+      } else if (c == 92) {                       // Escape
+        if (i + 1 >= plen) { rxcFehler := 1; return i; }
+        var e2: int64 := StrSafeCharAt(pattern, i + 1);
+        if (e2 == 100 || e2 == 119 || e2 == 115 || e2 == 68 || e2 == 87 || e2 == 83) {
+          var ci: int64 := rxcKlasseAusEscape(e2);
+          if (ci < 0) { return i; }
+          rxcEmit8(3); rxcEmit32(ci);
+        } else {
+          var lit: int64 := e2;
+          if (e2 == 110) { lit := 10; } else if (e2 == 114) { lit := 13; }
+          else if (e2 == 116) { lit := 9; }
+          rxcEmit8(1); rxcEmit32(lit);
+        }
+        i := i + 2;
+      } else {                                    // gewoehnliches Zeichen
+        rxcEmit8(1); rxcEmit32(c);
+        i := i + 1;
+      }
+      if (rxcFehler != 0) { return i; }
+
+      // ── Wiederholung auf das eben geschriebene Atom ────────────────────
+      if (i < plen) {
+        var q: int64 := StrSafeCharAt(pattern, i);
+        if (q == 42 || q == 43 || q == 63) {
+          var atomLen2: int64 := rxcCodeLen - atomStart;
+          var kopie: int64 := alloc(atomLen2);
+          var k: int64 := 0;
+          while (k < atomLen2) { poke8(kopie + k, peek8(rxcCode + atomStart + k)); k := k + 1; }
+          if (q == 63) {
+            // X? → SPLIT koerper, danach
+            rxcCodeLen := atomStart;
+            rxcEmit8(4);
+            var sp1: int64 := rxcCodeLen; rxcEmit32(0);
+            var sp2: int64 := rxcCodeLen; rxcEmit32(0);
+            rxcPatch32(sp1, rxcCodeLen);
+            k := 0;
+            while (k < atomLen2) { rxcEmit8(peek8(kopie + k)); k := k + 1; }
+            rxcPatch32(sp2, rxcCodeLen);
+          } else if (q == 42) {
+            // X* → L1: SPLIT koerper, ende; koerper: X; JMP L1; ende:
+            rxcCodeLen := atomStart;
+            var l1: int64 := rxcCodeLen;
+            rxcEmit8(4);
+            var sa1: int64 := rxcCodeLen; rxcEmit32(0);
+            var sa2: int64 := rxcCodeLen; rxcEmit32(0);
+            rxcPatch32(sa1, rxcCodeLen);
+            k := 0;
+            while (k < atomLen2) { rxcEmit8(peek8(kopie + k)); k := k + 1; }
+            rxcEmit8(5); rxcEmit32(l1);
+            rxcPatch32(sa2, rxcCodeLen);
+          } else {
+            // X+ → koerper: X; SPLIT koerper, ende
+            var koerper: int64 := atomStart;
+            rxcEmit8(4);
+            var sb1: int64 := rxcCodeLen; rxcEmit32(0);
+            var sb2: int64 := rxcCodeLen; rxcEmit32(0);
+            rxcPatch32(sb1, koerper);
+            rxcPatch32(sb2, rxcCodeLen);
+          }
+          free(kopie, atomLen2);
+          i := i + 1;
+          if (rxcFehler != 0) { return i; }
+        }
+      }
+    }
+
+    // ── Alternative? ─────────────────────────────────────────────────────
+    if (i < plen && StrSafeCharAt(pattern, i) == 124) {
+      // Vor den bisherigen Zweig ein SPLIT setzen und ihn mit einem JMP ans
+      // Ende abschliessen. Der Code muss dafuer verschoben werden — er ist
+      // kurz, und der Uebersetzer laeuft einmal je Muster.
+      var zweigLen: int64 := rxcCodeLen - zweigStart;
+      var puffer: int64 := alloc(zweigLen);
+      var m: int64 := 0;
+      while (m < zweigLen) { poke8(puffer + m, peek8(rxcCode + zweigStart + m)); m := m + 1; }
+      rxcCodeLen := zweigStart;
+      rxcEmit8(4);
+      splitPos := rxcCodeLen; rxcEmit32(0);
+      var altPos: int64 := rxcCodeLen; rxcEmit32(0);
+      rxcPatch32(splitPos, rxcCodeLen);
+      m := 0;
+      while (m < zweigLen) { rxcEmit8(peek8(puffer + m)); m := m + 1; }
+      free(puffer, zweigLen);
+      rxcEmit8(5);
+      sprungPos := rxcCodeLen; rxcEmit32(0);
+      rxcPatch32(altPos, rxcCodeLen);
+      i := i + 1;
+      zweigStart := rxcCodeLen;
+      if (rxcFehler != 0) { return i; }
+      // naechster Zweig: Schleife laeuft weiter
+    } else {
+      offen := 0;
+    }
+    if (sprungPos >= 0 && offen == 0) { rxcPatch32(sprungPos, rxcCodeLen); }
+  }
+  return i;
+}
+
+// Uebersetzt `pattern` in ein Bytecode-Programm und schreibt es nach progOut.
+// Rueckgabe: Laenge in Bytes, 0 bei Fehler (unbekanntes Muster, Puffer zu
+// klein, zu viele Klassen oder Gruppen).
+//
+// Die kompilierte API kostet sich beim Suchen die Musteranalyse: dieselbe
+// Frage wird einmal beantwortet statt bei jedem Zeichen erneut.
+pub fn RegexCompile(pattern: pchar, progOut: pchar, progMax: int64): int64 {
+  if (pattern == 0 as pchar || progOut == 0 as pchar) { return 0; }
+  var plen: int64 := StrLen(pattern);
+  if (plen == 0) { return 0; }
+
+  rxcFehler   := 0;
+  rxcClsCount := 0;
+  rxcSlots    := 2;                    // Slot 0/1 = Gruppe 0 (ganzer Treffer)
+  rxcCodeCap  := 16 + plen * 32;
+  rxcCode     := alloc(rxcCodeCap);
+  rxcCodeLen  := 0;
+  rxcClsBuf   := alloc(RXC_MAX_CLASSES * RXC_CLS_SZ);
+
+  rxcEmit8(7); rxcEmit32(0);           // SAVE 0 — Anfang des Treffers
+  var ende: int64 := rxcAlternative(pattern, 0, plen, 0);
+  if (rxcFehler != 0 || ende != plen) {
+    free(rxcCode, rxcCodeCap);
+    free(rxcClsBuf, RXC_MAX_CLASSES * RXC_CLS_SZ);
+    return 0;
+  }
+  rxcEmit8(7); rxcEmit32(1);           // SAVE 1 — Ende des Treffers
+  rxcEmit8(6);                         // MATCH
+  if (rxcFehler != 0) {
+    free(rxcCode, rxcCodeCap);
+    free(rxcClsBuf, RXC_MAX_CLASSES * RXC_CLS_SZ);
+    return 0;
+  }
+
+  // ── zusammensetzen ───────────────────────────────────────────────────────
+  var clsBytes: int64 := 0;
+  var ci2: int64 := 0;
+  while (ci2 < rxcClsCount) {
+    clsBytes := clsBytes + 1 + 4 + peek64(rxcClsBuf + ci2 * RXC_CLS_SZ + 8) * 8;
+    ci2 := ci2 + 1;
+  }
+  var gesamt: int64 := 16 + clsBytes + rxcCodeLen;
+  if (gesamt > progMax) {
+    free(rxcCode, rxcCodeCap);
+    free(rxcClsBuf, RXC_MAX_CLASSES * RXC_CLS_SZ);
+    return 0;
+  }
+
+  var o: int64 := progOut as int64;
+  poke8(o, 82); poke8(o + 1, 88); poke8(o + 2, 49); poke8(o + 3, 0);   // "RX1\0"
+  var w: int64 := 4;
+  poke8(o + w, rxcSlots & 255); poke8(o + w + 1, (rxcSlots >> 8) & 255);
+  poke8(o + w + 2, (rxcSlots >> 16) & 255); poke8(o + w + 3, (rxcSlots >> 24) & 255);
+  w := 8;
+  poke8(o + w, rxcClsCount & 255); poke8(o + w + 1, (rxcClsCount >> 8) & 255);
+  poke8(o + w + 2, (rxcClsCount >> 16) & 255); poke8(o + w + 3, (rxcClsCount >> 24) & 255);
+  poke8(o + 12, 0); poke8(o + 13, 0); poke8(o + 14, 0); poke8(o + 15, 0);
+
+  w := 16;
+  ci2 := 0;
+  while (ci2 < rxcClsCount) {
+    var cb: int64 := rxcClsBuf + ci2 * RXC_CLS_SZ;
+    var rn: int64 := peek64(cb + 8);
+    poke8(o + w, peek64(cb) & 255); w := w + 1;
+    poke8(o + w, rn & 255); poke8(o + w + 1, (rn >> 8) & 255);
+    poke8(o + w + 2, (rn >> 16) & 255); poke8(o + w + 3, (rn >> 24) & 255);
+    w := w + 4;
+    var ri: int64 := 0;
+    while (ri < rn) {
+      var von: int64 := peek64(cb + 16 + ri * 16);
+      var bis: int64 := peek64(cb + 16 + ri * 16 + 8);
+      poke8(o + w, von & 255); poke8(o + w + 1, (von >> 8) & 255);
+      poke8(o + w + 2, (von >> 16) & 255); poke8(o + w + 3, (von >> 24) & 255);
+      poke8(o + w + 4, bis & 255); poke8(o + w + 5, (bis >> 8) & 255);
+      poke8(o + w + 6, (bis >> 16) & 255); poke8(o + w + 7, (bis >> 24) & 255);
+      w := w + 8;
+      ri := ri + 1;
+    }
+    ci2 := ci2 + 1;
+  }
+
+  var q2: int64 := 0;
+  while (q2 < rxcCodeLen) { poke8(o + w + q2, peek8(rxcCode + q2)); q2 := q2 + 1; }
+
+  free(rxcCode, rxcCodeCap);
+  free(rxcClsBuf, RXC_MAX_CLASSES * RXC_CLS_SZ);
+  return gesamt;
 }
 
 pub fn RegexSearchCompiledEx(prog: pchar, progLen: int64, text: pchar,
