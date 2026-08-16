@@ -292,15 +292,27 @@ pub fn ColorDistance(c1: Color, c2: Color): int64 {
 // Hex Conversion
 // ============================================================================
 
+// #1485: Die Heuristik "groesser als 0xFFFFFF, also ist ein Alphabyte da"
+// kann Alpha 0 nicht darstellen — der Wert bleibt unter der Schwelle und gilt
+// als deckend. Der Rundlauf ColorFromHex(ColorToHexARGB(c)) machte aus einer
+// unsichtbaren Farbe eine deckende.
+//
+// Wie in der Meldung vorgeschlagen: zwei ausdrueckliche Funktionen statt einer
+// ratenden.
+pub fn ColorFromHexRGB(hex: int64): Color {
+  return ColorNew((hex >> 16) & 255, (hex >> 8) & 255, hex & 255, 255);
+}
+
+pub fn ColorFromHexARGB(hex: int64): Color {
+  return ColorNew((hex >> 16) & 255, (hex >> 8) & 255, hex & 255, (hex >> 24) & 255);
+}
+
+// Bleibt fuer vorhandene Aufrufer, mit der alten Heuristik — jetzt aber mit
+// dem Hinweis, dass sie Alpha 0 nicht ausdruecken kann. Wer Transparenz
+// braucht, nimmt ColorFromHexARGB.
 pub fn ColorFromHex(hex: int64): Color {
-  var r: int64 := (hex >> 16) & 255;
-  var g: int64 := (hex >> 8) & 255;
-  var b: int64 := hex & 255;
-  var a: int64 := 255;
-  if (hex > 16777215) {
-    a := (hex >> 24) & 255;
-  }
-  return ColorNew(r, g, b, a);
+  if (hex > 16777215) { return ColorFromHexARGB(hex); }
+  return ColorFromHexRGB(hex);
 }
 
 pub fn ColorToHex(c: Color): int64 {
@@ -315,40 +327,62 @@ pub fn ColorToHexARGB(c: Color): int64 {
 // HSL Conversion
 // ============================================================================
 
-pub fn ColorFromHSL(h: int64, s: int64, l: int64): Color {
-  var h_norm: int64 := h * 255 / 360;
-  var s_norm: int64 := s;
-  var l_norm: int64 := l;
-  if (s_norm == 0) {
-    return ColorGray(l_norm);
-  }
-  var s_sum: int64 := 255 + s_norm;
-  var q: int64 := l_norm * s_sum;
-  q := q / 255;
-  var two_l: int64 := 2 * l_norm;
-  var p: int64 := two_l - q;
-  var r: int64 := HueToRGB(p, q, h_norm + 85);
-  var g: int64 := HueToRGB(p, q, h_norm);
-  var b: int64 := HueToRGB(p, q, h_norm - 85);
-  return ColorRGB(r, g, b);
+// #1484: Die alte Umrechnung war eine verunglueckte Uebertragung der
+// Fliesskomma-Formel: der Farbwinkel wurde auf 0..255 gestaucht, die
+// Sektorgrenzen (42, 127, 170) passten nicht dazu, und `q` lief fuer
+// Helligkeiten ueber 128 aus dem Wertebereich. Die reinen Primaerfarben
+// stimmten zufaellig, alles dazwischen war um rund 30 Grad verschoben —
+// 60 Grad ergab Gelbgruen statt Gelb.
+//
+// Jetzt die uebliche Sektorformel, ganzzahlig gerechnet:
+//   c = (255 - |2l - 255|) * s / 255      Buntheit
+//   x = c * Anteil im Sektor
+//   m = l - c/2                            Grundhelligkeit
+// h in Grad (0..359), s und l in 0..255.
+fn _colBetrag(v: int64): int64 {
+  if (v < 0) { return 0 - v; }
+  return v;
 }
 
-fn HueToRGB(p: int64, q: int64, hue: int64): int64 {
-  if (hue < 0) { hue := hue + 255; }
-  if (hue > 255) { hue := hue - 255; }
-  if (hue < 42) {
-    var diff: int64 := q - p;
-    var num: int64 := diff * hue;
-    return p + num / 42;
-  }
-  if (hue < 127) { return q; }
-  if (hue < 170) {
-    var diff: int64 := q - p;
-    var rem: int64 := 170 - hue;
-    var num: int64 := diff * rem;
-    return p + num / 85;
-  }
-  return p;
+fn _colKlemm(v: int64): int64 {
+  if (v < 0) { return 0; }
+  if (v > 255) { return 255; }
+  return v;
+}
+
+pub fn ColorFromHSL(h: int64, s: int64, l: int64): Color {
+  var hd: int64 := h % 360;
+  if (hd < 0) { hd := hd + 360; }
+  var sn: int64 := _colKlemm(s);
+  var ln: int64 := _colKlemm(l);
+  if (sn == 0) { return ColorGray(ln); }
+
+  // Der Mittelpunkt der Helligkeit liegt auf der 0..255-Skala zwischen 127 und
+  // 128. Gerechnet wird gegen 256, damit l = 128 die REINE Farbe ergibt
+  // (255,0,0) statt (255,1,1) — die Meldung nennt genau diese Werte. Der
+  // Preis ist ein Rundungsschritt bei l = 255 (254 statt 255 in den
+  // Nebenkanaelen), was in 8 Bit nicht sichtbar ist.
+  var c: int64 := ((255 - _colBetrag(2 * ln - 256)) * sn) / 255;
+  if (c < 0) { c := 0; }
+  var sektor: int64 := hd / 60;
+  var f: int64 := ((hd % 60) * 255) / 60;      // Anteil im Sektor, 0..254
+
+  // Im geraden Sektor waechst der Nebenkanal, im ungeraden faellt er.
+  var x: int64 := (c * f) / 255;
+  if ((sektor % 2) != 0) { x := (c * (255 - f)) / 255; }
+
+  var m: int64 := ln - (c + 1) / 2;
+  var r: int64 := 0;
+  var g: int64 := 0;
+  var b: int64 := 0;
+  if (sektor == 0) { r := c; g := x; b := 0; }
+  else if (sektor == 1) { r := x; g := c; b := 0; }
+  else if (sektor == 2) { r := 0; g := c; b := x; }
+  else if (sektor == 3) { r := 0; g := x; b := c; }
+  else if (sektor == 4) { r := x; g := 0; b := c; }
+  else { r := c; g := 0; b := x; }
+
+  return ColorRGB(_colKlemm(r + m), _colKlemm(g + m), _colKlemm(b + m));
 }
 
 // End of std/color.lyx

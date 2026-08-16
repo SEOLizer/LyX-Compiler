@@ -230,6 +230,7 @@ test: lyxc
 	@bash tests/log_z4_test.sh
 	@bash tests/systeminfo_uuid_z7_test.sh
 	@bash tests/regex_z8_test.sh
+	@bash tests/rect_color_z9_test.sh
 	@bash tests/sprachluecken_z5_test.sh
 	@bash tests/type_inference_test.sh
 	@bash tests/struct_method_test.sh
