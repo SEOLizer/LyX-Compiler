@@ -181,6 +181,32 @@ pub type EmitARMCM = class {
     self.cm_t32(0xF850 | rn, (rt << 12) | 0x0C00 | (off & 0xFF));
   }
 
+  // #1388: positive Offsets und schmale Breiten fuer die Speicher-Builtins.
+  // LDR.W Rt, [Rn, #off12]
+  fn cm_LDR_pos(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF8D0 | rn, (rt << 12) | (off & 0xFFF));
+  }
+  // STR.W Rt, [Rn, #off12]
+  fn cm_STR_pos(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF8C0 | rn, (rt << 12) | (off & 0xFFF));
+  }
+  // LDRB.W Rt, [Rn, #off12]
+  fn cm_LDRB(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF890 | rn, (rt << 12) | (off & 0xFFF));
+  }
+  // LDRH.W Rt, [Rn, #off12]
+  fn cm_LDRH(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF8B0 | rn, (rt << 12) | (off & 0xFFF));
+  }
+  // STRB.W Rt, [Rn, #off12]
+  fn cm_STRB(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF880 | rn, (rt << 12) | (off & 0xFFF));
+  }
+  // STRH.W Rt, [Rn, #off12]
+  fn cm_STRH(rt: int64, rn: int64, off: int64) {
+    self.cm_t32(0xF8A0 | rn, (rt << 12) | (off & 0xFFF));
+  }
+
   // STR.W Rt, [Rn, #-off8]: T4 negative-offset form
   fn cm_STR_neg(rt: int64, rn: int64, off: int64) {
     self.cm_t32(0xF840 | rn, (rt << 12) | 0x0C00 | (off & 0xFF));
@@ -716,10 +742,65 @@ pub type EmitARMCM = class {
     }
   }
 
+  // #1388: Hier stand ein einziger Zweig — JEDER Builtin lieferte 0, ohne ein
+  // Wort darueber. Auf einem freistehenden Ziel ist das fuer Ausgabe-Builtins
+  // vertretbar (es gibt kein Betriebssystem), fuer Speicherzugriffe nicht:
+  // `peek8(p)` gab 0 zurueck, statt zu lesen, und `poke8` schrieb nirgendwo
+  // hin. Beides ohne Meldung — derselbe stille Default wie bei den Opcodes in
+  // #1339, eine Ebene tiefer.
+  //
+  // Jetzt: die Speicherzugriffe sind umgesetzt, alles andere wird benannt.
   fn emitBuiltinCall(id: int64, dest: int64) {
-    // Bare-metal stubs: no OS syscalls
-    self.cm_MOVS_imm(CM_R4, 0);
-    self.cm_storeSlot(dest);
+    if (id == 200 || id == 208 || id == 201 || id == 202) {
+      // peek8/16/32/64 — Adresse aus Slot 0. Cortex-M ist 32-bittig; peek64
+      // liest darum das untere Wort und wird als solches gemeldet, wenn es
+      // jemand braucht.
+      self.cm_loadSlot(0);                      // r4 = Adresse
+      if (id == 200) { self.cm_LDRB(CM_R4, CM_R4, 0); }
+      if (id == 208) { self.cm_LDRH(CM_R4, CM_R4, 0); }
+      if (id == 201 || id == 202) { self.cm_LDR_pos(CM_R4, CM_R4, 0); }
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 203 || id == 209 || id == 204 || id == 205) {
+      // poke8/16/32/64 — Adresse aus Slot 0, Wert aus Slot 1.
+      self.cm_loadSlot(0);                      // r4 = Adresse
+      self.cm_loadSlot2(1);                     // r5 = Wert
+      if (id == 203) { self.cm_STRB(CM_R5, CM_R4, 0); }
+      if (id == 209) { self.cm_STRH(CM_R5, CM_R4, 0); }
+      if (id == 204 || id == 205) { self.cm_STR_pos(CM_R5, CM_R4, 0); }
+      self.cm_MOVS_imm(CM_R4, 0);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 1 || id == 2 || id == 9 || id == 12 || id == 13 || id == 14) {
+      // Ausgabe auf einem freistehenden Ziel: es gibt keine Konsole und keinen
+      // Systemaufruf dorthin. Das ist ein AUSDRUECKLICHER No-op — dieselbe
+      // Linie wie bei den Barrieren im Windows-Zweig von arm64 (#1037): lieber
+      // eine benannte Entscheidung als ein Durchfallen in den Fehlerzweig.
+      // Wer auf Cortex-M etwas ausgeben will, schreibt in ein Peripherieregister
+      // (poke8/poke32 sind umgesetzt) oder benutzt semihosting.
+      self.cm_MOVS_imm(CM_R4, 0);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 3) {
+      // Exit: auf Cortex-M gibt es keinen Prozess, den man beenden koennte.
+      // BKPT #0 haelt im Debugger an — dieselbe Sequenz wie bei IRO_PANIC.
+      self.cm_e16(0xBE00);   // bkpt #0
+      return;
+    }
+    self._builtinUnsupportedCM(id);
+  }
+
+  fn _builtinUnsupportedCM(id: int64) {
+    EPrintStr("error: arm-cm: Builtin-ID "c);
+    EPrintInt(id);
+    EPrintStrLn(" wird nicht behandelt"c);
+    EPrintStrLn("  Ein freistehendes Ziel hat kein Betriebssystem: Ausgabe- und"c);
+    EPrintStrLn("  Dateibuiltins gibt es dort nicht. Speicherzugriffe sind umgesetzt."c);
+    EPrintStrLn("  Vergabe und Belegung der IDs: src/backend/_builtin_ids.md."c);
+    exit(1);
   }
 
   // --------------------------------------------------------------------------

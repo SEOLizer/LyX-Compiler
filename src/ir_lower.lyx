@@ -1248,6 +1248,30 @@ pub type IRLower = class {
   // Function Call Lowering
   // ------------------------------------------------------------------
 
+  // #1388: Ist der Name im Modul als Funktion definiert? Dann hat die
+  // Definition Vorrang vor jedem gleichnamigen Builtin.
+  fn _istBenutzerFunktion(fname: pchar, fnlen: int64): int64 {
+    var ubBuf: int64 := peek64(self.ir + IR_MOD_OFF_FUNCBUF);
+    var ubStr: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
+    var ubCnt: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);
+    var ubI: int64 := 0;
+    while ubI < ubCnt {
+      var ubOff: int64 := peek64(ubBuf + ubI * 80);
+      var ubLen: int64 := peek64(ubBuf + ubI * IR_FUNC_SIZE + IR_FUNC_OFF_NAMELEN);
+      if ubLen == fnlen {
+        var ubJ: int64 := 0;
+        var ubGleich: int64 := 1;
+        while ubJ < fnlen {
+          if (peek8(ubStr + ubOff + ubJ) & 255) != (StrCharAt(fname, ubJ) & 255) { ubGleich := 0; ubJ := fnlen; }
+          else { ubJ := ubJ + 1; }
+        }
+        if ubGleich != 0 { return 1; }
+      }
+      ubI := ubI + 1;
+    }
+    return 0;
+  }
+
   fn lowerCall(expr: int64): int64 {
     // WP-2.1: generic calls (iVal=2) go through the monomorphization path
     if (self.nodeIVal(expr) == 2) {
@@ -1576,6 +1600,46 @@ pub type IRLower = class {
     // -1 in slot 1, das Backend (emit_lyxos.emitPrintStr) berechnet dann strlen zur Laufzeit.
     // Muss VOR dem User-Funktions-Lookup stehen, sonst fällt PrintStr(var) in den Legacy-
     // CALL_BUILTIN-Fallback OHNE slot-0-Setup (→ falscher rodata-Pointer / null-flood).
+
+    // #1388: Fehlerausgabe. Dieselbe Bauart wie PrintStr (id 1), nur nach
+    // Dateikennung 2. Gebraucht wird sie, sobald irgendetwas std.alloc
+    // importiert — malloc_orpanic meldet dort auf stderr, und ueber diesen
+    // Weg scheiterte `import std.io` auf JEDEM IR-Ziel.
+    if ((self.seq(fname, fnlen, "EPrintStr", 9) || self.seq(fname, fnlen, "EPrintStrLn", 11)
+         || self.seq(fname, fnlen, "EPrint", 6)) && arg0 >= 0
+        && self._istBenutzerFunktion(fname, fnlen) == 0) {
+      var epPtr: int64 := self.lowerExpr(arg0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 0, epPtr, -1, 0);
+      var epLen: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, epLen, -1, -1, 0 - 1);   // Laenge zur Laufzeit
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 1, epLen, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 13);
+      if (self.seq(fname, fnlen, "EPrintStrLn", 11)) {
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 14);  // Zeilenumbruch
+      }
+      return dest;
+    }
+    if (self.seq(fname, fnlen, "EPrintLn", 8) && self._istBenutzerFunktion(fname, fnlen) == 0) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 14);
+      return dest;
+    }
+
+    // #1388: StrLen. Der erste Name, ueber den std.io stolperte.
+    //
+    // ACHTUNG, teuer gelernt: dieselben Namen gibt es als BENUTZERFUNKTION.
+    // src/std/string.lyx definiert `StrLen` wirklich, und der lyxos-Weg
+    // benutzte genau diese Fassung. Ein Zweig, der den Namen hier abfaengt,
+    // verdeckt sie — `import src.std.io` scheiterte danach auf lyxos mit
+    // "Builtin-ID 15 wird nicht behandelt". Deshalb erst nachsehen, ob der
+    // Name im Modul definiert ist; nur wenn nicht, ist es der Builtin.
+    if ((self.seq(fname, fnlen, "StrLen", 6) || self.seq(fname, fnlen, "StrLength", 9))
+        && arg0 >= 0 && self._istBenutzerFunktion(fname, fnlen) == 0) {
+      var slPtr: int64 := self.lowerExpr(arg0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 0, slPtr, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 15);
+      return dest;
+    }
+
     if (self.seq(fname, fnlen, "PrintStr", 8) && arg0 >= 0) {
       var psvPtr: int64 := self.lowerExpr(arg0);
       self.irAddInstrDirect(IRO_STORE_LOCAL, 0, psvPtr, -1, 0);
