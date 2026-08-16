@@ -221,8 +221,22 @@ fi
 
 printf 'unit u;\npub fn F(): int64 { return 1; }\n' > "$TMP/u.lyx"
 msg="$(timeout 180 "$LYXC" --compile-unit --debug-symbols --std-path="$ROOT" "$TMP/u.lyx" -o "$TMP/u.lyu" 2>&1)"
-if echo "$msg" | grep -q "1555"; then ok "#1526: .lyu-Luecke wird benannt"
-else no "#1526: .lyu-Luecke wird benannt" "keine Warnung"; fi
+# Bis 1.1.0A gab es hier nur eine Warnung mit Verweis auf #1555 — das Format
+# hatte keine Ablage fuer Debug-Info. Seit #1555 gibt es sie, also ist die
+# Warnung weg und die Datei muss sich unterscheiden. Der Test misst jetzt die
+# Aufloesung statt der Ankuendigung; die Einzelheiten prueft
+# tests/cli_schalter_z13_test.sh.
+timeout 180 "$LYXC" --compile-unit --std-path="$ROOT" "$TMP/u.lyx" -o "$TMP/u0.lyu" >/dev/null 2>&1
+if [ -f "$TMP/u.lyu" ] && [ -f "$TMP/u0.lyu" ] && ! cmp -s "$TMP/u.lyu" "$TMP/u0.lyu"; then
+  ok "#1526/#1555: --debug-symbols wirkt auch auf .lyu"
+else
+  no "#1526/#1555: --debug-symbols auf .lyu" "byte-identisch"
+fi
+if echo "$msg" | grep -q "1555"; then
+  no "#1555: Warnung ueberlebt den Fix" "der Hinweis auf die fehlende Ablage steht noch"
+else
+  ok "#1555: keine Warnung mehr — die Ablage gibt es jetzt"
+fi
 
 # ===========================================================================
 # #1527 — --config
@@ -232,14 +246,24 @@ cfg="$(timeout 60 "$LYXC" --config 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ]; then ok "#1527: --config endet mit 0"
 else no "#1527: --config endet mit 0" "rc=$rc"; fi
 
-zeilen="$(echo "$cfg" | wc -l)"
-if [ "$zeilen" -le 6 ]; then ok "#1527: --config haengt keine Hilfe an ($zeilen Zeilen)"
-else no "#1527: --config haengt keine Hilfe an" "$zeilen Zeilen"; fi
+# Gemessen wird, ob die HILFE angehaengt wurde — nicht die Zeilenzahl der
+# Konfiguration selbst. Die ist seit #1522 laenger (alle Ziele und die
+# Suchreihenfolge), was mit dem Defekt nichts zu tun hat.
+if echo "$cfg" | grep -q "Copyright (c)"; then
+  no "#1527: --config haengt keine Hilfe an" "die Hilfe steht mit dran"
+else
+  ok "#1527: --config haengt keine Hilfe an ($(echo "$cfg" | wc -l) Zeilen Konfiguration)"
+fi
 
-# Der verschluckte Zeilenumbruch: `Osafe` und die erste Hilfezeile verschmolzen
-# zu "Osafelyxc ...". Die letzte Zeile muss auf Osafe enden.
-if echo "$cfg" | grep -qE "Osafe$"; then ok "#1527: Zeilenumbruch nach Osafe"
-else no "#1527: Zeilenumbruch nach Osafe" "$(echo "$cfg"|tail -1|cut -c1-50)"; fi
+# Der verschluckte Zeilenumbruch: die letzte Konfigurationszeile und die erste
+# Hilfezeile verschmolzen zu "Osafelyxc ...". Gemessen wird darum die letzte
+# Zeile: sie darf keine Versionszeile angeklebt haben.
+letzte="$(echo "$cfg" | tail -1)"
+if echo "$letzte" | grep -q "lyxc [0-9]"; then
+  no "#1527: Zeilenumbruch am Ende" "letzte Zeile verschmolzen: $(echo "$letzte"|cut -c1-60)"
+else
+  ok "#1527: Zeilenumbruch am Ende der Konfiguration"
+fi
 
 # Gegenprobe: die beiden Nachbarn waren immer richtig und müssen es bleiben.
 v="$(timeout 60 "$LYXC" --version 2>&1)"; vrc=$?

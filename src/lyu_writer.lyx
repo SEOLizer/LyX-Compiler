@@ -34,12 +34,22 @@ pub type LyuWriter = class {
   buf: int64;
   len: int64;
   cap: int64;
+  // #1555: Debug-Abschnitt mitschreiben (--debug-symbols). Bis 1.1.0A hatte
+  // das Format kein Feld dafuer, also erzeugte `--compile-unit
+  // --debug-symbols` eine byte-identische Datei.
+  includeDebug: int64;
+  dbgOffPos:    int64;   // Position des DebugOffset-Feldes im Puffer
 
   pub fn LywInit() {
     self.cap := 4096;
     self.buf := alloc(self.cap);
     self.len := 0;
+    self.includeDebug := 0;
+    self.dbgOffPos    := 0;
   }
+
+  // #1555: vor Serialize aufrufen.
+  pub fn LywSetDebug(on: int64) { self.includeDebug := on; }
 
   fn _grow() {
     var nc: int64 := self.cap * 2;
@@ -62,6 +72,16 @@ pub type LyuWriter = class {
 
   fn _e32le(v: int64) {
     self._e8(v); self._e8(v >> 8); self._e8(v >> 16); self._e8(v >> 24);
+  }
+
+  // #1555: ein bereits geschriebenes u32 nachtragen (Offset-Feld im Kopf, das
+  // erst feststeht, wenn der Abschnitt geschrieben ist).
+  fn _p32le(at: int64, v: int64) {
+    if (at < 0 || at + 4 > self.len) { return; }
+    poke8(self.buf + at,     v & 255);
+    poke8(self.buf + at + 1, (v >> 8) & 255);
+    poke8(self.buf + at + 2, (v >> 16) & 255);
+    poke8(self.buf + at + 3, (v >> 24) & 255);
   }
 
   // u16-length-prefixed UTF-8 string (matches WriteString in S0)
@@ -163,7 +183,7 @@ pub type LyuWriter = class {
     self._e8(LYU_W_M2); self._e8(LYU_W_M3);
     self._e16le(LYU_W_VER);
     self._e8(arch);
-    self._e8(0);  // flags (bit0 = includeDebug, always 0 for now)
+    self._e8(self.includeDebug & 1);  // flags, bit0 = Debug-Abschnitt vorhanden (#1555)
 
     // Unit name
     self._eStr(unPtr, unLenV);
@@ -177,6 +197,7 @@ pub type LyuWriter = class {
     self._e32le(symCount);
     self._e32le(0);  // TypeInfoOffset
     self._e32le(0);  // IRCodeOffset
+    self.dbgOffPos := self.len;   // #1555: hierhin kommt der Offset am Ende
     self._e32le(0);  // DebugOffset
     self._e32le(0);  // Reserved
 
@@ -204,6 +225,32 @@ pub type LyuWriter = class {
     self._e32le(0);          // strings count = 0
     self._e32le(funcCount);  // function count
     self._e32le(0);          // globals count = 0
+
+    // ── Debug-Abschnitt (#1555) ────────────────────────────────────────
+    // Optional und am ENDE, mit Offset und Laenge im Kopf: ein Leser, der ihn
+    // nicht kennt, hoert nach der Symboltabelle auf und liest die Datei
+    // unveraendert. Inhalt: Quelldatei und je Funktion die Startzeile —
+    // dieselben Angaben, die cg.debugMode im ELF ablegt.
+    if (self.includeDebug != 0) {
+      var dbgStart: int64 := self.len;
+      self._p32le(self.dbgOffPos, dbgStart);
+      self._eStr(inputPath, StrLen(inputPath));
+      var lenPos: int64 := self.len;
+      self._e32le(0);                 // Anzahl Eintraege, gleich nachgetragen
+      var written: int64 := 0;
+      si := 0;
+      while (si < total) {
+        if (sema.SymKind(si) == SYM_FUNC) {
+          self._eStr(sema.SymName(si), sema.SymNameLen(si));
+          var ln: int64 := sema.SymLine(si);
+          if (ln < 0) { ln := 0; }    // importiert/eingebaut: keine Zeile
+          self._e32le(ln);
+          written += 1;
+        }
+        si += 1;
+      }
+      self._p32le(lenPos, written);
+    }
   }
 
   // Write buffer to file. Returns true on success.
