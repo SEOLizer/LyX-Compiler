@@ -207,6 +207,11 @@ con CG_PATCH_EXTERN_DATA: int64 := 4;  // WSP-07: disp32 von `lea rax,[rip+0]` a
 // ebenfalls dort liegt (globaler Startwert `var s: pchar := "..."`). Anders als
 // CG_PATCH_STR zeigt das erste Feld hier in `self.data`, nicht in `self.code`.
 con CG_PATCH_DATA_PTR:    int64 := 5;
+// #1574: Funktionsadresse in einen Datenslot. codeOff = Slot IM DATENBEREICH,
+// namePtr/nameLen = Funktionsname. Eine Codeadresse steht zur
+// Uebersetzungszeit fest — sie ist so konstant wie ein Zeichenkettenliteral,
+// nur laesst sie sich erst eintragen, wenn die Marke gesetzt ist.
+con CG_PATCH_DATA_FN:     int64 := 6;
 
 // FFI imports (extern fn ... link "lib.so")
 con CG_EXTERN_SZ:          int64 := 40;   // #1486: +8 fuer den Deklarationsknoten
@@ -682,6 +687,15 @@ pub type Codegen = class {
   globalVarCount: int64;
   globalVarCap:   int64;
   globalIsPchar:  int64;  // byte buffer parallel to globalVars: 1 = pchar type
+  // #1574: 1 = globale Variable traegt einen Funktionszeiger. Ohne diese
+  // Spalte deutete der Codegen `gFn(4.0)` als Aufruf einer FUNKTION dieses
+  // Namens und meldete "undefined function 'gFn'" — lokal ging derselbe Typ
+  // laengst (localIsFnPtr).
+  globalIsFnPtr:  int64;
+  // #1574: 1 = der Zeiger liefert Gleitkomma. Dieselbe Spalte wie
+  // localFnPtrF64 (#1565) — ohne sie faellt `var v: f64 = gFn(4.0)` still auf
+  // int64 zurueck und aus 12.0 wird 4622945017495814144.
+  globalFnPtrF64: int64;
   // #1256/#1299: Ein globales AGGREGAT — `[N]T` oder ein Struct — passt nicht
   // in den 8-Byte-Slot. Der Slot traegt deshalb einen ZEIGER auf einen eigenen
   // Block im Datenbereich, genau wie ein Local auf seinen mmap-Block zeigt.
@@ -1281,10 +1295,14 @@ pub type Codegen = class {
       var na: int64 := alloc(nc);          // #1256
       var ns: int64 := alloc(nc * 8);      // #1256
       var ng: int64 := alloc(nc * 8);      // #1230
+      var nf: int64 := alloc(nc);          // #1574
+      var nff: int64 := alloc(nc);         // #1574
       var i: int64 := 0;
       memcpy(nb, self.globalVars, self.globalVarCount * 24);
       i := 0;
       memcpy(np, self.globalIsPchar, self.globalVarCount);
+      memcpy(nf, self.globalIsFnPtr, self.globalVarCount);       // #1574
+      memcpy(nff, self.globalFnPtrF64, self.globalVarCount);     // #1574
       memcpy(nt, self.globalTypeNames, self.globalVarCount * 16);
       memcpy(nr, self.globalIsRedundant, self.globalVarCount);   // #1141
       memcpy(na, self.globalIsArray, self.globalVarCount);       // #1256
@@ -1296,6 +1314,8 @@ pub type Codegen = class {
       self.globalIsArray := na;
       self.globalArraySize := ns;
       self.globalArrayRow := ng;
+      self.globalIsFnPtr := nf;                                  // #1574
+      self.globalFnPtrF64 := nff;                                // #1574
     }
     var doff: int64 := self.dataLen;
     // Reserve 8 zero bytes in data section (mmap is zero-initialized)
@@ -1306,6 +1326,8 @@ pub type Codegen = class {
     poke64(base + CG_GLOBAL_OFF_NAMELEN,  nlen);
     poke64(base + CG_GLOBAL_OFF_DOFF, doff);
     poke8(self.globalIsPchar + self.globalVarCount, 0);
+    poke8(self.globalIsFnPtr + self.globalVarCount, 0);       // #1574
+    poke8(self.globalFnPtrF64 + self.globalVarCount, 0);      // #1574
     poke8(self.globalIsRedundant + self.globalVarCount, 0);   // #1141
     poke8(self.globalIsArray + self.globalVarCount, 0);       // #1256
     poke64(self.globalArraySize + self.globalVarCount * 8, 0);
@@ -1934,6 +1956,15 @@ pub type Codegen = class {
     var k: int64 := self.cg_nkind(node);
     if (k == CGN_LIT_INT)   { return 1; }
     if (k == CGN_LIT_FLOAT) { return 1; }
+    // #1514: `false`/`true` sind Literale — der Wert steht zur
+    // Uebersetzungszeit fest. Sie fehlten hier, und weil der Zweig fuer
+    // globale Startwerte ohne Ausweg endet, wurde daraus die Meldung
+    // "Startwert ist zur Uebersetzungszeit nicht bekannt": eine Aussage, die
+    // fuer ein Literal nicht zutrifft. `var flag: bool = false` war damit
+    // nicht uebersetzbar, `int64` und `f64` an derselben Stelle schon.
+    // cg_faltIntConst und cg_tryFold kannten CGN_LIT_BOOL laengst.
+    if (k == CGN_LIT_BOOL)  { return 1; }
+    if (k == CGN_LIT_CHAR)  { return 1; }
     if (k == CGN_IDENT) {
       return self.cg_hasConVal(self.cg_nsval(node), self.cg_nslen(node));
     }
@@ -1985,6 +2016,8 @@ pub type Codegen = class {
     if (node < 0) { return 0; }
     var k: int64 := self.cg_nkind(node);
     if (k == CGN_LIT_INT) { return self.cg_nival(node); }
+    if (k == CGN_LIT_BOOL) { return self.cg_nival(node); }   // #1514
+    if (k == CGN_LIT_CHAR) { return self.cg_nival(node); }   // #1514
     if (k == CGN_LIT_FLOAT) {
       return self.cg_parseFloat(self.pSrc, self.cg_nsoff(node), self.cg_nslen(node));
     }
@@ -2482,6 +2515,19 @@ pub type Codegen = class {
           exit(1);
         }
         // disp32 bleibt 0 → wird in cg_writeELFObj zu R_X86_64_PC32.
+      } else if (kind == CG_PATCH_DATA_FN) {
+        // #1574: globaler Funktionszeiger mit Startwert.
+        var fnOff: int64 := self.cg_findLabel(namePtr as pchar, nlen);
+        if (fnOff < 0) {
+          EPrintStr("error: globaler Funktionszeiger: unbekannte Funktion '"c);
+          sys_write(2, namePtr, nlen);
+          EPrintStr("'\n"c);
+          exit(1);
+        }
+        poke64(self.data + codeOff, CG_ELF_BASE + CG_CODE_OFF + fnOff);
+        // Absolute Adresse im Datenbereich: PE und der LyxOS-Loader muessen
+        // sie verschieben, genau wie bei CG_PATCH_DATA_PTR.
+        self.cg_addBaseReloc(CG_CODE_OFF + self.codeLen + codeOff);
       } else if (kind == CG_PATCH_DATA_PTR) {
         // #1164/#1298: Der Datenbereich folgt unmittelbar auf den Code — die
         // Adresse steht also erst hier fest. codeOff ist der Slot IM
@@ -4110,6 +4156,12 @@ pub type Codegen = class {
       // Rueckgabetyp des Zeigertyps, der am Local vermerkt ist.
       var li: int64 := self.cg_findLocalIdx(fp, fl);
       if (li >= 0 && peek8(self.localFnPtrF64 + li) != 0) { return 1; }
+      // #1574: derselbe Fall fuer eine GLOBALE Zeigervariable. Ein Local
+      // gleichen Namens verdeckt sie, darum erst hier.
+      if (li < 0) {
+        var gi2: int64 := self.cg_findGlobalIdx(fp, fl);
+        if (gi2 >= 0 && peek8(self.globalFnPtrF64 + gi2) != 0) { return 1; }
+      }
       return 0;
     }
     // #1203: der FELDZUGRIFF. `s.lat as int64` mit `lat: f64` lieferte das
@@ -9107,6 +9159,30 @@ pub type Codegen = class {
 
     // WP-02: Check if fname is a local closure variable — emit indirect call
     if (isMethod == 0) {
+      // #1574: Aufruf ueber eine GLOBALE Variable vom Funktionstyp. Sie ist
+      // kein Local, also lief der Name weiter bis zur Marken-Aufloesung und
+      // endete in "undefined function 'gFn'". Derselbe duenne Aufruf wie beim
+      // Local, nur wird die Adresse aus dem Datenbereich geladen.
+      // Bewusst NACH der Local-Frage: ein gleichnamiges Local verdeckt die
+      // globale Variable, wie ueberall sonst auch.
+      if (self.cg_findLocal(fname, fnlen) == 0) {
+        var gfIdx: int64 := self.cg_findGlobalIdx(fname, fnlen);
+        if (gfIdx >= 0 && peek8(self.globalIsFnPtr + gfIdx) != 0) {
+          var gfCur: int64 := argNode;
+          var gfArgc: int64 := 0;
+          while (gfCur >= 0) { self.cg_genExpr(gfCur); self.cg_pushRax(); gfArgc := gfArgc + 1; gfCur := self.cg_nnext(gfCur); }
+          self.cg_loadRaxGlobal(self.cg_findGlobal(fname, fnlen));   // rax = Codeadresse
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);      // mov rbx, rax
+          if (gfArgc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }   // pop r9
+          if (gfArgc >= 5) { self.cg_e8(0x41); self.cg_e8(0x58); }   // pop r8
+          if (gfArgc >= 4) { self.cg_popRcx(); }
+          if (gfArgc >= 3) { self.cg_popRdx(); }
+          if (gfArgc >= 2) { self.cg_popRsi(); }
+          if (gfArgc >= 1) { self.cg_popRdi(); }
+          self.cg_e8(0xFF); self.cg_e8(0xD3);                        // call rbx
+          return;
+        }
+      }
       var clOff: int64 := self.cg_findLocal(fname, fnlen);
       if (clOff != 0) {
         // #1: lokaler plain fn-ptr (fn-Typ-Alias)? → thin-call: Adresse laden, Args in normalen
@@ -17502,6 +17578,16 @@ pub type Codegen = class {
           // #1094: Typname merken (siehe cg_staticTypeName).
           poke64(self.globalTypeNames + gIdx * 16,     gtp as int64);
           poke64(self.globalTypeNames + gIdx * 16 + 8, gtn);
+          // #1574: benannter fn-Typ (`type Cb = fn(int64): int64`) — dieselbe
+          // Auskunft wie bei einem Local ueber cg_isFnPtrAlias.
+          if (self.cg_isFnPtrAlias(gtp, gtn) != 0) { poke8(self.globalIsFnPtr + gIdx, 1); }
+        }
+        // #1574: inline geschriebener Zeigertyp `var gFn: fn(f64): f64`.
+        if (gtNode >= 0 && self.cg_nkind(gtNode) == CGN_FN_PTR_NODE) {
+          poke8(self.globalIsFnPtr + gIdx, 1);
+          if (self.cg_fnPtrRetIstF64(gtNode) != 0) {
+            poke8(self.globalFnPtrF64 + gIdx, 1);
+          }
         }
         // #1141: @redundant an einer GLOBALEN Variablen. Bis 1.0.14M bekam sie
         // 8 Byte und keinen Voter — das Attribut war hier ein stiller Default.
@@ -17669,6 +17755,20 @@ pub type Codegen = class {
             if (gRedundant != 0) {
               poke64(self.data + doff + 8,  gInit);
               poke64(self.data + doff + 16, gInit);
+            }
+          } else if (ik == CGN_IDENT && self.cg_isDeclaredFunc(self.cg_nsval(initNode), self.cg_nslen(initNode)) != 0) {
+            // #1574: `var gFn: fn(f64): f64 = Triple;` — der Startwert IST
+            // uebersetzungszeitkonstant, nur eben eine Codeadresse. Bis 1.1.0A
+            // fiel er in den Zweig darunter und wurde als "nicht bekannt"
+            // gemeldet, obwohl derselbe Typ als Local seit #885 funktioniert.
+            self.cg_addPatch(doff, self.cg_nsval(initNode) as int64,
+                             self.cg_nslen(initNode), CG_PATCH_DATA_FN);
+            poke8(self.globalIsFnPtr + gIdx, 1);
+            if (gRedundant != 0) {
+              self.cg_addPatch(doff + 8,  self.cg_nsval(initNode) as int64,
+                               self.cg_nslen(initNode), CG_PATCH_DATA_FN);
+              self.cg_addPatch(doff + 16, self.cg_nsval(initNode) as int64,
+                               self.cg_nslen(initNode), CG_PATCH_DATA_FN);
             }
           } else {
             // Nicht ausrechenbar: melden statt still auf 0 stehen lassen. Eine
@@ -17960,6 +18060,8 @@ pub type Codegen = class {
     self.globalIsRedundant := alloc(self.globalVarCap);   // #1141
     self.globalVars     := alloc(self.globalVarCap * 24);
     self.globalIsPchar  := alloc(self.globalVarCap);
+    self.globalIsFnPtr  := alloc(self.globalVarCap);          // #1574
+    self.globalFnPtrF64 := alloc(self.globalVarCap);          // #1574
     self.globalTypeNames := alloc(self.globalVarCap * 16);
     self.globalIsArray  := alloc(self.globalVarCap);          // #1256
     self.globalArraySize := alloc(self.globalVarCap * 8);     // #1256

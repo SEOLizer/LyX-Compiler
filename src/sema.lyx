@@ -318,6 +318,19 @@ pub type Sema = class {
   klsTab:     int64;
   klsCount:   int64;
   klsCap:     int64;
+  // #1573: Feld- und Methodennamen je importiertem Typ. Dieselbe Lage wie bei
+  // klsTab und aus demselben Grund: bei `basis.feld` gab _checkFieldExists
+  // auf, sobald der Typ importiert war (SymNodeIdx == -2) — ein Tippfehler im
+  // Feldnamen uebersetzte klaglos und lieferte 0. Betroffen war praktisch jede
+  // Struktur der Standardbibliothek.
+  // Eintrag {namePtr, nameLen, blobPtr, anzahl} = 32 Byte; anzahl == -1 heisst
+  // UNVOLLSTAENDIG (eine Elternklasse war beim Abschreiben nicht einsehbar) —
+  // dann wird nicht geprueft, denn Abwesenheit waere nicht belegbar.
+  // blob: Folge von {namePtr, nameLen} je 16 Byte, Namen KOPIERT (die fremde
+  // Arena ist danach fort).
+  fldTab:     int64;
+  fldCount:   int64;
+  fldCap:     int64;
   // #1264: Signatur je FUNKTIONSsymbol. Die Stelligkeits- und Typpruefung am
   // Aufruf brauchte bisher den Deklarationsknoten — den gibt es fuer eine
   // importierte Funktion nicht mehr (eigene Arena, Index zeigt danach ins
@@ -986,7 +999,22 @@ pub type Sema = class {
     var tk: int64 := self.SymKind(tSym);
     if (tk != SYM_STRUCT && tk != SYM_TYPE) { return; }
     var tDecl: int64 := self.SymNodeIdx(tSym);
-    if (tDecl < 0) { return; }
+    if (tDecl < 0) {
+      // #1573: Importierter Typ — der Knoten ist fort (-2). Bis 1.1.0A gab die
+      // Pruefung hier auf, und damit blieb JEDER Feldname auf einer Struktur
+      // aus der stdlib ungeprueft: `p.lat` auf einem GeoPoint (Felder x, y)
+      // uebersetzte klaglos und lieferte 0. Das ist nicht "unentscheidbar",
+      // sondern nur woanders zu beantworten — beim Import abgeschrieben.
+      var fi: int64 := self._fldFind(self.sn_sVal(typeNi), self.sn_sLen(typeNi));
+      if (fi < 0) { return; }
+      var iName: pchar := self.sn_sVal(ni);
+      var iLen:  int64 := self.sn_sLen(ni);
+      if (iName == 0 || iLen <= 0) { return; }
+      if (self._fldHat(fi, iName, iLen) == 0) {
+        self._errorNodeName("unknown field", ni, iName, iLen);
+      }
+      return;
+    }
     if (self.sn_c0(tDecl) < 0) { return; }
     if (self.sn_kind(self.sn_c0(tDecl)) != 7) { return; }
     var fldName: pchar := self.sn_sVal(ni);
@@ -1924,6 +1952,16 @@ pub type Sema = class {
     var symsBefore: int64 := self.symCount;
     self.Pass1(head);
 
+    // #1567: Dieselbe Pruefung wie fuer das Wurzelmodul (#1135) — sie lief
+    // bisher NUR dort. Zwei private `fn` gleichen Namens in einer importierten
+    // Unit wurden deshalb kommentarlos angenommen: der Aufruf band an die
+    // erste Definition, und weil die Stelligkeitspruefung an der Signatur der
+    // zuerst eingetragenen haengt, kam auch die Argumentzahl nicht mehr auf
+    // den Tisch — `intern(7)` traf eine Funktion mit drei Parametern, die
+    // fehlenden zwei kamen als Stapelinhalt an. Bei `pub fn` griff die
+    // Mehrdeutigkeitspruefung, bei privaten fiel alles durch.
+    self._checkDuplicateFuncs(head);
+
     // #1028: exportierte Namen gegen die frueher importierten pruefen. Muss vor
     // dem nodeIdx-Fixup laufen — der macht das pub-Flag unlesbar.
     self._checkAndRecordExports(symsBefore, modName, modLen);
@@ -1936,6 +1974,7 @@ pub type Sema = class {
           // #1570: abschreiben, solange der Knoten noch gilt — danach ist die
           // Frage "Klasse mit Methoden?" von aussen nicht mehr zu beantworten.
           self._klsRecord(self.SymName(si), self.SymNameLen(si), importNi);
+          self._fldRecord(self.SymName(si), self.SymNameLen(si), importNi);   // #1573
           self.SetSymNodeIdx(si, -2);
         }
       }
@@ -2346,6 +2385,130 @@ pub type Sema = class {
     poke64(base + 8,  nmLen);
     poke64(base + 16, 1);
     self.klsCount := self.klsCount + 1;
+  }
+
+  // #1573: Namen aus der fremden Arena in eigenen Speicher holen. Ohne die
+  // Kopie zeigt der Eintrag nach dem Import ins Leere.
+  fn _fldKopie(s: pchar, sLen: int64): int64 {
+    var p: int64 := alloc(sLen + 1);
+    var i: int64 := 0;
+    while (i < sLen) { poke8(p + i, StrCharAt(s, i) & 255); i := i + 1; }
+    poke8(p + sLen, 0);
+    return p;
+  }
+
+  // Zaehlt Felder und Methoden einer Deklaration samt Vererbungskette.
+  // gibt -1 zurueck, wenn die Kette nicht vollstaendig einsehbar ist.
+  fn _fldZaehle(startNi: int64): int64 {
+    var declNi: int64 := startNi;
+    var n: int64 := 0;
+    var depth: int64 := 0;
+    while (declNi >= 0) {
+      if (depth > 16) { return -1; }
+      var f: int64 := self.sn_c0(declNi);
+      while (f >= 0) {
+        if (self.sn_kind(f) == 7) { n := n + 1; }
+        f := self.sn_next(f);
+      }
+      var m: int64 := self.sn_c1(declNi);
+      while (m >= 0) { n := n + 1; m := self.sn_next(m); }
+      var parentNi: int64 := self.sn_c2(declNi);
+      if (parentNi < 0) { return n; }
+      var pSym: int64 := self.Lookup(self.sn_sVal(parentNi), self.sn_sLen(parentNi));
+      if (pSym < 0) { return -1; }              // Elternteil unbekannt
+      declNi := self.SymNodeIdx(pSym);
+      if (declNi < 0) { return -1; }            // Elternteil selbst importiert
+      depth := depth + 1;
+    }
+    return n;
+  }
+
+  // #1573: Feld- und Methodennamen eines Typs abschreiben, BEVOR der Knoten
+  // mit der fremden Arena verschwindet. Aufgerufen an derselben Stelle wie
+  // _klsRecord.
+  fn _fldRecord(nm: pchar, nmLen: int64, declNi: int64) {
+    if (declNi < 0 || nmLen <= 0) { return; }
+    if (self.sn_kind(declNi) != SNK_TYPE_DECL) { return; }
+    var iv: int64 := self.sn_iVal(declNi);
+    if ((iv & 2) != 0) { return; }    // reiner Typalias: keine eigenen Felder
+    if ((iv & 32) != 0) { return; }   // Interface
+    var anz: int64 := self._fldZaehle(declNi);
+    if (anz == 0) { return; }         // keine Felder: nichts zu pruefen
+    if (self.fldCount >= self.fldCap) {
+      var nc: int64 := self.fldCap * 2;
+      if (nc < 16) { nc := 16; }
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.fldTab, self.fldCount * 32);
+      self.fldTab := nb;
+      self.fldCap := nc;
+    }
+    var base: int64 := self.fldTab + self.fldCount * 32;
+    poke64(base,      self._fldKopie(nm, nmLen));
+    poke64(base + 8,  nmLen);
+    if (anz < 0) {
+      // Unvollstaendig: vermerken, aber ohne Liste — die Pruefung schweigt
+      // dann fuer diesen Typ. Genau die lyxvision-Hierarchie faellt hierunter.
+      poke64(base + 16, 0);
+      poke64(base + 24, -1);
+      self.fldCount := self.fldCount + 1;
+      return;
+    }
+    var blob: int64 := alloc(anz * 16);
+    var w: int64 := 0;
+    var cur: int64 := declNi;
+    var depth: int64 := 0;
+    while (cur >= 0 && depth <= 16 && w < anz) {
+      var f: int64 := self.sn_c0(cur);
+      while (f >= 0 && w < anz) {
+        if (self.sn_kind(f) == 7) {
+          poke64(blob + w * 16,     self._fldKopie(self.sn_sVal(f), self.sn_sLen(f)));
+          poke64(blob + w * 16 + 8, self.sn_sLen(f));
+          w := w + 1;
+        }
+        f := self.sn_next(f);
+      }
+      var m: int64 := self.sn_c1(cur);
+      while (m >= 0 && w < anz) {
+        poke64(blob + w * 16,     self._fldKopie(self.sn_sVal(m), self.sn_sLen(m)));
+        poke64(blob + w * 16 + 8, self.sn_sLen(m));
+        w := w + 1;
+      }
+      var parentNi: int64 := self.sn_c2(cur);
+      if (parentNi < 0) { cur := -1; }
+      else {
+        var pSym: int64 := self.Lookup(self.sn_sVal(parentNi), self.sn_sLen(parentNi));
+        if (pSym < 0) { cur := -1; } else { cur := self.SymNodeIdx(pSym); }
+      }
+      depth := depth + 1;
+    }
+    poke64(base + 16, blob);
+    poke64(base + 24, w);
+    self.fldCount := self.fldCount + 1;
+  }
+
+  // Index in fldTab zu einem Typnamen, oder -1.
+  fn _fldFind(nm: pchar, nmLen: int64): int64 {
+    var i: int64 := self.fldCount - 1;
+    while (i >= 0) {
+      var b: int64 := self.fldTab + i * 32;
+      if (self._strNEq(peek64(b) as pchar, peek64(b + 8), nm, nmLen)) { return i; }
+      i := i - 1;
+    }
+    return -1;
+  }
+
+  // 1 = Feld existiert oder ist nicht entscheidbar, 0 = existiert nachweislich nicht.
+  fn _fldHat(idx: int64, f: pchar, fLen: int64): int64 {
+    var b: int64 := self.fldTab + idx * 32;
+    var anz: int64 := peek64(b + 24);
+    if (anz <= 0) { return 1; }        // unvollstaendig oder leer: nichts behaupten
+    var blob: int64 := peek64(b + 16);
+    var i: int64 := 0;
+    while (i < anz) {
+      if (self._strNEq(peek64(blob + i * 16) as pchar, peek64(blob + i * 16 + 8), f, fLen)) { return 1; }
+      i := i + 1;
+    }
+    return 0;
   }
 
   // 1 = bekannter importierter Referenztyp, sonst 0.
@@ -6725,6 +6888,9 @@ pub type Sema = class {
     self.utDimTab   := alloc(self.utDimCap * 32);
     self.klsCap     := 16;                        // #1570
     self.klsTab     := alloc(self.klsCap * 24);
+    self.fldCount   := 0;
+    self.fldCap     := 16;
+    self.fldTab     := alloc(self.fldCap * 32);
     self.klsCount   := 0;
     self.utDimCount := 0;
 
