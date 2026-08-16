@@ -1,0 +1,753 @@
+// std/i128.lyx
+// 128-Bit-Arithmetik als Wortpaar: volle Produkte, Division, Dezimalausgabe
+
+@description("128-bit integer arithmetic on 64-bit word pairs: full 64x64 products with high half, add/subtract with carry, multiplication, unsigned and signed division with remainder, shifts, comparison, decimal parsing and formatting up to 39 digits")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.i128;
+
+import std.bits;
+import std.alloc;
+
+// ── Wozu 128 Bit ─────────────────────────────────────────────────────────────
+//
+// Nicht, um groessere Zahlen zu speichern, sondern um ZWISCHENERGEBNISSE nicht
+// zu verlieren. Das Produkt zweier 64-Bit-Zahlen braucht 128 Bit; die Sprache
+// liefert davon nur die unteren, die oberen fallen weg. Damit ist unmoeglich:
+//
+//   * pruefen, ob a*b ueberlaufen ist, ohne vorher zu dividieren
+//   * (a*b)/c rechnen, wenn a*b nicht in 64 Bit passt, das Ergebnis aber schon
+//   * Montgomery-Reduktion, also praktisch jede Modulararithmetik
+//   * der exakte Mittelwert zweier grosser Zahlen
+//   * jede Zahl mit beliebiger Genauigkeit, die auf 64-Bit-Woertern aufbaut
+//
+// ── Die Hardware kann es laengst ─────────────────────────────────────────────
+//
+// `mul r64` legt das volle 128-Bit-Produkt in RDX:RAX ab, `div r64` teilt
+// 128 durch 64. Der Codegen holt nur RAX ab; RDX wird verworfen. Der Wert ist
+// da, es fehlt der Weg dorthin.
+//
+// Diese Unit rechnet das Produkt deshalb aus 32-Bit-Teilstuecken nach: vier
+// Multiplikationen statt einer. Das ist um ein Vielfaches langsamer als der
+// eine Maschinenbefehl — aber es ist richtig, es laeuft heute, und es ist die
+// Fassung, gegen die man ein spaeteres Compiler-Builtin pruefen kann.
+//
+// ── Darstellung ──────────────────────────────────────────────────────────────
+//
+// Ein 128-Bit-Wert sind ZWEI int64 im Speicher, 16 Byte:
+//
+//     [p + 0]  = lo   die unteren 64 Bit
+//     [p + 8]  = hi   die oberen 64 Bit
+//
+// Beide sind Bitmuster, keine Zahlen mit Vorzeichen. Ob der Wert als
+// vorzeichenbehaftet gilt, entscheidet die FUNKTION, nicht der Speicher:
+// I128CmpU vergleicht vorzeichenlos, I128CmpS mit Vorzeichen. Deshalb gibt es
+// keine getrennten Typen fuer int128 und uint128 — nur getrennte Operationen
+// dort, wo der Unterschied zaehlt (Vergleich, Division, Schieben, Ausgabe).
+//
+// Der Aufrufer besitzt den Speicher. Ausgabe darf auf einen der Eingaenge
+// zeigen; jede Funktion liest ihre Eingaben vollstaendig, bevor sie schreibt.
+//
+// ── Alles ist int64 ──────────────────────────────────────────────────────────
+//
+// Keine einzige Funktion hier rechnet in f64. Damit ist die Unit von der
+// peekf64-Regression #1550 nicht betroffen.
+
+pub con I128_BYTES: int64 := 16;
+
+fn _lo32(x: int64): int64 { return x & 0xFFFFFFFF; }
+fn _hi32(x: int64): int64 { return BitsShr(x, 32); }
+
+// ── Zugriff ──────────────────────────────────────────────────────────────────
+
+pub fn I128Lo(p: int64): int64 { return peek64(p); }
+pub fn I128Hi(p: int64): int64 { return peek64(p + 8); }
+
+pub fn I128Set(p: int64, hi: int64, lo: int64): void {
+  poke64(p, lo);
+  poke64(p + 8, hi);
+}
+
+pub fn I128Zero(p: int64): void {
+  poke64(p, 0);
+  poke64(p + 8, 0);
+}
+
+// Aus einer vorzeichenlosen 64-Bit-Zahl: die oberen Bits sind null.
+pub fn I128SetU64(p: int64, v: int64): void {
+  poke64(p, v);
+  poke64(p + 8, 0);
+}
+
+// Aus einer vorzeichenbehafteten 64-Bit-Zahl: das Vorzeichen wird nach oben
+// fortgesetzt, damit -1 als 128-Bit-Wert auch wirklich -1 ist.
+pub fn I128SetI64(p: int64, v: int64): void {
+  poke64(p, v);
+  if (v < 0) { poke64(p + 8, 0 - 1); }
+  else { poke64(p + 8, 0); }
+}
+
+pub fn I128Copy(a: int64, out: int64): void {
+  var lo: int64 := peek64(a);
+  var hi: int64 := peek64(a + 8);
+  poke64(out, lo);
+  poke64(out + 8, hi);
+}
+
+pub fn I128IsZero(p: int64): bool {
+  if (peek64(p) != 0) { return false; }
+  return peek64(p + 8) == 0;
+}
+
+// Vorzeichen bei vorzeichenbehafteter Deutung: das oberste Bit von hi.
+pub fn I128IsNeg(p: int64): bool {
+  return peek64(p + 8) < 0;
+}
+
+// Passt der Wert noch in ein vorzeichenloses 64-Bit-Wort?
+pub fn I128FitsU64(p: int64): bool {
+  return peek64(p + 8) == 0;
+}
+
+// Passt er in ein vorzeichenbehaftetes? Dann muss hi die Vorzeichenfortsetzung
+// von lo sein.
+pub fn I128FitsI64(p: int64): bool {
+  var lo: int64 := peek64(p);
+  var hi: int64 := peek64(p + 8);
+  if (lo < 0) { return hi == 0 - 1; }
+  return hi == 0;
+}
+
+// ── Der Kern: das volle Produkt ──────────────────────────────────────────────
+
+// Obere 64 Bit des VORZEICHENLOSEN Produkts a*b.
+//
+// Beide Faktoren werden in 32-Bit-Haelften zerlegt; jedes Teilprodukt passt
+// dann sicher in 64 Bit:
+//
+//     a*b = a1*b1 * 2^64 + (a1*b0 + a0*b1) * 2^32 + a0*b0
+//
+// Die Uebertraege aus der mittleren Spalte muessen mitgezaehlt werden — genau
+// dort steckt der Fehler, den fast jede selbstgebaute Fassung hat.
+pub fn I128MulHiU(a: int64, b: int64): int64 {
+  var a0: int64 := _lo32(a);
+  var a1: int64 := _hi32(a);
+  var b0: int64 := _lo32(b);
+  var b1: int64 := _hi32(b);
+
+  var p00: int64 := a0 * b0;
+  var p01: int64 := a0 * b1;
+  var p10: int64 := a1 * b0;
+  var p11: int64 := a1 * b1;
+
+  // mittlere Spalte samt Uebertrag aus der untersten
+  var mid: int64 := _hi32(p00) + _lo32(p01) + _lo32(p10);
+  return p11 + _hi32(p01) + _hi32(p10) + _hi32(mid);
+}
+
+// Untere 64 Bit des Produkts — dasselbe, was der Operator `*` liefert.
+// Als Funktion vorhanden, damit beide Haelften nebeneinander stehen.
+pub fn I128MulLo(a: int64, b: int64): int64 {
+  return a * b;
+}
+
+// Obere 64 Bit des VORZEICHENBEHAFTETEN Produkts.
+//
+// Aus dem vorzeichenlosen Ergebnis, korrigiert um die beiden Ueberhaenge: ist
+// a negativ, wurde b * 2^64 zu viel gezaehlt, und umgekehrt.
+pub fn I128MulHiS(a: int64, b: int64): int64 {
+  var h: int64 := I128MulHiU(a, b);
+  if (a < 0) { h := h - b; }
+  if (b < 0) { h := h - a; }
+  return h;
+}
+
+// Volles vorzeichenloses Produkt zweier 64-Bit-Zahlen nach out (128 Bit).
+pub fn I128Mul64U(a: int64, b: int64, out: int64): void {
+  var hi: int64 := I128MulHiU(a, b);
+  poke64(out, a * b);
+  poke64(out + 8, hi);
+}
+
+// Volles vorzeichenbehaftetes Produkt.
+pub fn I128Mul64S(a: int64, b: int64, out: int64): void {
+  var hi: int64 := I128MulHiS(a, b);
+  poke64(out, a * b);
+  poke64(out + 8, hi);
+}
+
+// Laeuft a*b als vorzeichenloses 64-Bit-Produkt ueber? Die Frage, fuer die man
+// sonst eine Division braucht.
+pub fn I128MulOverflowsU(a: int64, b: int64): bool {
+  return I128MulHiU(a, b) != 0;
+}
+
+// ── Addieren und Subtrahieren ────────────────────────────────────────────────
+
+// Summe zweier 64-Bit-Woerter mit Uebertrag hinein und heraus.
+//
+// Der Uebertrag wird ohne 128-Bit-Zwischenwert bestimmt: die vorzeichenlose
+// Summe ist genau dann uebergelaufen, wenn sie KLEINER ist als einer der
+// Summanden. Verglichen wird vorzeichenlos, deshalb ueber I128CmpU64.
+pub fn I128AddCarry(a: int64, b: int64, cin: int64, coutAddr: int64): int64 {
+  var s: int64 := a + b;
+  var c: int64 := 0;
+  // Ueberlauf der reinen Summe
+  if (_ltu(s, a)) { c := 1; }
+  if (cin != 0) {
+    s := s + 1;
+    if (s == 0) { c := 1; }
+  }
+  if (coutAddr != 0) { poke64(coutAddr, c); }
+  return s;
+}
+
+// Vorzeichenloser Kleiner-Vergleich zweier Woerter.
+//
+// `<` vergleicht mit Vorzeichen; fuer Bitmuster ist das falsch. Der uebliche
+// Kniff: das oberste Bit beider Werte umdrehen, dann stimmt die Reihenfolge
+// wieder mit dem vorzeichenbehafteten Vergleich ueberein.
+fn _ltu(x: int64, y: int64): bool {
+  var fx: int64 := x ^ 0x8000000000000000;
+  var fy: int64 := y ^ 0x8000000000000000;
+  return fx < fy;
+}
+
+// Oeffentlich, weil die Frage ausserhalb genauso auftritt.
+pub fn I128LtU64(x: int64, y: int64): bool { return _ltu(x, y); }
+
+pub fn I128SubBorrow(a: int64, b: int64, bin: int64, boutAddr: int64): int64 {
+  var d: int64 := a - b;
+  var bo: int64 := 0;
+  if (_ltu(a, b)) { bo := 1; }
+  if (bin != 0) {
+    if (d == 0) { bo := 1; }
+    d := d - 1;
+  }
+  if (boutAddr != 0) { poke64(boutAddr, bo); }
+  return d;
+}
+
+// out := a + b. Rueckgabe ist der Uebertrag aus dem obersten Wort (0 oder 1) —
+// bei vorzeichenloser Deutung also die Ueberlaufmeldung.
+pub fn I128Add(a: int64, b: int64, out: int64): int64 {
+  var alo: int64 := peek64(a);
+  var ahi: int64 := peek64(a + 8);
+  var blo: int64 := peek64(b);
+  var bhi: int64 := peek64(b + 8);
+
+  var c: int64 := 0;
+  var lo: int64 := alo + blo;
+  if (_ltu(lo, alo)) { c := 1; }
+
+  var hi: int64 := ahi + bhi;
+  var c2: int64 := 0;
+  if (_ltu(hi, ahi)) { c2 := 1; }
+  var hi2: int64 := hi + c;
+  if (c != 0) {
+    if (hi2 == 0) { c2 := 1; }
+  }
+
+  poke64(out, lo);
+  poke64(out + 8, hi2);
+  return c2;
+}
+
+// out := a - b. Rueckgabe ist der Borgeuebertrag (0 oder 1).
+pub fn I128Sub(a: int64, b: int64, out: int64): int64 {
+  var alo: int64 := peek64(a);
+  var ahi: int64 := peek64(a + 8);
+  var blo: int64 := peek64(b);
+  var bhi: int64 := peek64(b + 8);
+
+  var bw: int64 := 0;
+  var lo: int64 := alo - blo;
+  if (_ltu(alo, blo)) { bw := 1; }
+
+  var hi: int64 := ahi - bhi;
+  var bw2: int64 := 0;
+  if (_ltu(ahi, bhi)) { bw2 := 1; }
+  if (bw != 0) {
+    if (hi == 0) { bw2 := 1; }
+    hi := hi - 1;
+  }
+
+  poke64(out, lo);
+  poke64(out + 8, hi);
+  return bw2;
+}
+
+// out := -a, im Zweierkomplement.
+pub fn I128Neg(a: int64, out: int64): void {
+  var lo: int64 := peek64(a);
+  var hi: int64 := peek64(a + 8);
+  var nlo: int64 := 0 - lo;
+  var nhi: int64 := ~hi;
+  if (lo == 0) { nhi := nhi + 1; }
+  poke64(out, nlo);
+  poke64(out + 8, nhi);
+}
+
+// out := |a| bei vorzeichenbehafteter Deutung.
+pub fn I128Abs(a: int64, out: int64): void {
+  if (peek64(a + 8) < 0) { I128Neg(a, out); }
+  else { I128Copy(a, out); }
+}
+
+// ── Multiplizieren ───────────────────────────────────────────────────────────
+
+// out := a * b, untere 128 Bit. Die oberen fallen weg — bei 128x128 waeren es
+// bis zu 256.
+pub fn I128Mul(a: int64, b: int64, out: int64): void {
+  var alo: int64 := peek64(a);
+  var ahi: int64 := peek64(a + 8);
+  var blo: int64 := peek64(b);
+  var bhi: int64 := peek64(b + 8);
+
+  var lo: int64 := alo * blo;
+  var hi: int64 := I128MulHiU(alo, blo) + ahi * blo + alo * bhi;
+  poke64(out, lo);
+  poke64(out + 8, hi);
+}
+
+// out := a * k mit einem 64-Bit-Faktor.
+pub fn I128MulU64(a: int64, k: int64, out: int64): void {
+  var alo: int64 := peek64(a);
+  var ahi: int64 := peek64(a + 8);
+  var lo: int64 := alo * k;
+  var hi: int64 := I128MulHiU(alo, k) + ahi * k;
+  poke64(out, lo);
+  poke64(out + 8, hi);
+}
+
+// ── Schieben ─────────────────────────────────────────────────────────────────
+
+pub fn I128Shl(a: int64, n: int64, out: int64): void {
+  var lo: int64 := peek64(a);
+  var hi: int64 := peek64(a + 8);
+  if (n <= 0) {
+    poke64(out, lo);
+    poke64(out + 8, hi);
+    return;
+  }
+  if (n >= 128) {
+    poke64(out, 0);
+    poke64(out + 8, 0);
+    return;
+  }
+  if (n >= 64) {
+    poke64(out, 0);
+    poke64(out + 8, BitsShl(lo, n - 64));
+    return;
+  }
+  poke64(out + 8, BitsShlPair(hi, lo, n));
+  poke64(out, BitsShl(lo, n));
+}
+
+// Logisches Rechtsschieben: es kommen Nullen nach.
+pub fn I128ShrU(a: int64, n: int64, out: int64): void {
+  var lo: int64 := peek64(a);
+  var hi: int64 := peek64(a + 8);
+  if (n <= 0) {
+    poke64(out, lo);
+    poke64(out + 8, hi);
+    return;
+  }
+  if (n >= 128) {
+    poke64(out, 0);
+    poke64(out + 8, 0);
+    return;
+  }
+  if (n >= 64) {
+    poke64(out, BitsShr(hi, n - 64));
+    poke64(out + 8, 0);
+    return;
+  }
+  poke64(out, BitsShrPair(hi, lo, n));
+  poke64(out + 8, BitsShr(hi, n));
+}
+
+// Arithmetisches Rechtsschieben: das Vorzeichen wird nachgezogen.
+pub fn I128Sar(a: int64, n: int64, out: int64): void {
+  var lo: int64 := peek64(a);
+  var hi: int64 := peek64(a + 8);
+  var fill: int64 := 0;
+  if (hi < 0) { fill := 0 - 1; }
+
+  if (n <= 0) {
+    poke64(out, lo);
+    poke64(out + 8, hi);
+    return;
+  }
+  if (n >= 128) {
+    poke64(out, fill);
+    poke64(out + 8, fill);
+    return;
+  }
+  if (n >= 64) {
+    poke64(out, BitsSar(hi, n - 64));
+    poke64(out + 8, fill);
+    return;
+  }
+  poke64(out, BitsShrPair(hi, lo, n));
+  poke64(out + 8, BitsSar(hi, n));
+}
+
+// ── Bits ─────────────────────────────────────────────────────────────────────
+
+pub fn I128PopCount(p: int64): int64 {
+  return BitsPopCount(peek64(p)) + BitsPopCount(peek64(p + 8));
+}
+
+// Position des obersten gesetzten Bits (0..127), oder -1 fuer null.
+pub fn I128HighestSet(p: int64): int64 {
+  var hi: int64 := peek64(p + 8);
+  if (hi != 0) { return 64 + BitsHighestSet(hi); }
+  var lo: int64 := peek64(p);
+  if (lo != 0) { return BitsHighestSet(lo); }
+  return 0 - 1;
+}
+
+pub fn I128TestBit(p: int64, i: int64): bool {
+  if (i < 0) { return false; }
+  if (i >= 128) { return false; }
+  if (i >= 64) { return BitsTest(peek64(p + 8), i - 64); }
+  return BitsTest(peek64(p), i);
+}
+
+pub fn I128SetBit(p: int64, i: int64): void {
+  if (i < 0) { return; }
+  if (i >= 128) { return; }
+  if (i >= 64) { poke64(p + 8, BitsSet(peek64(p + 8), i - 64)); }
+  else { poke64(p, BitsSet(peek64(p), i)); }
+}
+
+// ── Vergleichen ──────────────────────────────────────────────────────────────
+
+// Vorzeichenlos: -1, 0 oder 1.
+pub fn I128CmpU(a: int64, b: int64): int64 {
+  var ahi: int64 := peek64(a + 8);
+  var bhi: int64 := peek64(b + 8);
+  if (ahi != bhi) {
+    if (_ltu(ahi, bhi)) { return 0 - 1; }
+    return 1;
+  }
+  var alo: int64 := peek64(a);
+  var blo: int64 := peek64(b);
+  if (alo == blo) { return 0; }
+  if (_ltu(alo, blo)) { return 0 - 1; }
+  return 1;
+}
+
+// Mit Vorzeichen: nur das obere Wort wird vorzeichenbehaftet verglichen.
+pub fn I128CmpS(a: int64, b: int64): int64 {
+  var ahi: int64 := peek64(a + 8);
+  var bhi: int64 := peek64(b + 8);
+  if (ahi != bhi) {
+    if (ahi < bhi) { return 0 - 1; }
+    return 1;
+  }
+  var alo: int64 := peek64(a);
+  var blo: int64 := peek64(b);
+  if (alo == blo) { return 0; }
+  if (_ltu(alo, blo)) { return 0 - 1; }
+  return 1;
+}
+
+pub fn I128Equals(a: int64, b: int64): bool {
+  if (peek64(a) != peek64(b)) { return false; }
+  return peek64(a + 8) == peek64(b + 8);
+}
+
+// ── Teilen ───────────────────────────────────────────────────────────────────
+
+// Vorzeichenlose Division mit Rest: outQ := a / b, outR := a % b.
+// false bei Division durch null. outQ und outR duerfen 0 sein.
+//
+// Schulmethode auf Bitebene: der Rest wird 128 Mal um ein Bit nach links
+// geschoben, das naechste Bit des Zaehlers hineingezogen, und wenn er den
+// Nenner erreicht, wird abgezogen und ein Quotientenbit gesetzt.
+//
+// Das ist die langsame, aber unbestreitbar richtige Fassung — 128 Durchlaeufe
+// statt eines Maschinenbefehls. Sie steht hier bewusst so einfach da, damit
+// eine schnellere Fassung spaeter etwas hat, woran sie sich messen kann.
+pub fn I128DivRemU(a: int64, b: int64, outQ: int64, outR: int64): bool {
+  var blo: int64 := peek64(b);
+  var bhi: int64 := peek64(b + 8);
+  if (blo == 0) {
+    if (bhi == 0) { return false; }
+  }
+
+  var alo: int64 := peek64(a);
+  var ahi: int64 := peek64(a + 8);
+
+  var qlo: int64 := 0;
+  var qhi: int64 := 0;
+  var rlo: int64 := 0;
+  var rhi: int64 := 0;
+
+  var i: int64 := 127;
+  while (i >= 0) {
+    // Rest um eins nach links, naechstes Zaehlerbit herein
+    rhi := BitsShlPair(rhi, rlo, 1);
+    rlo := BitsShl(rlo, 1);
+    var bit: int64 := 0;
+    if (i >= 64) { if (BitsTest(ahi, i - 64)) { bit := 1; } }
+    else { if (BitsTest(alo, i)) { bit := 1; } }
+    if (bit != 0) { rlo := rlo | 1; }
+
+    // Rest >= Nenner?
+    var ge: bool := false;
+    if (rhi != bhi) { ge := !_ltu(rhi, bhi); }
+    else { ge := !_ltu(rlo, blo); }
+
+    if (ge) {
+      var nlo: int64 := rlo - blo;
+      var borrow: bool := _ltu(rlo, blo);
+      rhi := rhi - bhi;
+      if (borrow) { rhi := rhi - 1; }
+      rlo := nlo;
+      if (i >= 64) { qhi := BitsSet(qhi, i - 64); }
+      else { qlo := BitsSet(qlo, i); }
+    }
+    i := i - 1;
+  }
+
+  if (outQ != 0) {
+    poke64(outQ, qlo);
+    poke64(outQ + 8, qhi);
+  }
+  if (outR != 0) {
+    poke64(outR, rlo);
+    poke64(outR + 8, rhi);
+  }
+  return true;
+}
+
+// Division durch ein 64-Bit-Wort. Rest kommt als Rueckgabewert, oder -1 bei
+// Division durch null (dann ist auch outQ unveraendert).
+//
+// Wortweise statt bitweise: erst das obere, dann das untere Wort. Solange der
+// Rest kleiner als der Teiler ist — und das ist er nach Konstruktion —, passt
+// jeder Zwischenschritt in 128 Bit, die hier ueber I128DivRemU abgewickelt
+// werden.
+pub fn I128DivRemU64(a: int64, d: int64, outQ: int64, remAddr: int64): bool {
+  if (d == 0) { return false; }
+
+  var tmpB: int64 := alloc(16);
+  var tmpR: int64 := alloc(16);
+  if (tmpB == 0) { return false; }
+  if (tmpR == 0) { return false; }
+
+  poke64(tmpB, d);
+  poke64(tmpB + 8, 0);
+  var ok: bool := I128DivRemU(a, tmpB, outQ, tmpR);
+  if (remAddr != 0) { poke64(remAddr, peek64(tmpR)); }
+
+  free(tmpB, 16);
+  free(tmpR, 16);
+  return ok;
+}
+
+// Vorzeichenbehaftete Division mit Rest. Es wird Richtung null gerundet, und
+// der Rest traegt das Vorzeichen des Zaehlers — wie bei `/` und `%` auf int64.
+pub fn I128DivRemS(a: int64, b: int64, outQ: int64, outR: int64): bool {
+  var aneg: bool := peek64(a + 8) < 0;
+  var bneg: bool := peek64(b + 8) < 0;
+
+  var ua: int64 := alloc(16);
+  var ub: int64 := alloc(16);
+  if (ua == 0) { return false; }
+  if (ub == 0) { return false; }
+  I128Abs(a, ua);
+  I128Abs(b, ub);
+
+  var ok: bool := I128DivRemU(ua, ub, outQ, outR);
+  if (ok) {
+    var qneg: bool := aneg;
+    if (bneg) { qneg := !qneg; }
+    if (outQ != 0) {
+      if (qneg) { I128Neg(outQ, outQ); }
+    }
+    if (outR != 0) {
+      if (aneg) { I128Neg(outR, outR); }
+    }
+  }
+  free(ua, 16);
+  free(ub, 16);
+  return ok;
+}
+
+// ── Dezimal ──────────────────────────────────────────────────────────────────
+
+// Vorzeichenlose Dezimaldarstellung nach buf (mit abschliessender Null).
+// Rueckgabe ist die Zahl der Zeichen, oder -1 wenn bufLen nicht reicht.
+//
+// Ohne diese Funktion waere die ganze Unit blind: eine 128-Bit-Zahl laesst sich
+// mit PrintInt nicht ausgeben, und ein Wert, den man nicht lesen kann, laesst
+// sich auch nicht pruefen. 2^128 hat 39 Stellen.
+pub fn I128ToDecimalU(p: int64, buf: int64, bufLen: int64): int64 {
+  if (bufLen < 2) { return 0 - 1; }
+
+  var lo: int64 := peek64(p);
+  var hi: int64 := peek64(p + 8);
+  if (lo == 0) {
+    if (hi == 0) {
+      poke8(buf, 48);
+      poke8(buf + 1, 0);
+      return 1;
+    }
+  }
+
+  var tmp: int64 := alloc(48);
+  var cur: int64 := alloc(16);
+  var q: int64 := alloc(16);
+  var d: int64 := alloc(16);
+  var r: int64 := alloc(16);
+  if (tmp == 0) { return 0 - 1; }
+
+  poke64(cur, lo);
+  poke64(cur + 8, hi);
+  poke64(d, 10);
+  poke64(d + 8, 0);
+
+  var n: int64 := 0;
+  var run: bool := true;
+  while (run) {
+    I128DivRemU(cur, d, q, r);
+    poke8(tmp + n, 48 + peek64(r));
+    n := n + 1;
+    I128Copy(q, cur);
+    if (I128IsZero(cur)) { run := false; }
+    if (n >= 40) { run := false; }
+  }
+
+  var res: int64 := n;
+  if (n + 1 > bufLen) { res := 0 - 1; }
+  else {
+    var i: int64 := 0;
+    while (i < n) {
+      poke8(buf + i, peek8(tmp + (n - 1 - i)));
+      i := i + 1;
+    }
+    poke8(buf + n, 0);
+  }
+
+  free(tmp, 48);  free(cur, 16);  free(q, 16);  free(d, 16);  free(r, 16);
+  return res;
+}
+
+// Vorzeichenbehaftete Dezimaldarstellung.
+pub fn I128ToDecimalS(p: int64, buf: int64, bufLen: int64): int64 {
+  if (peek64(p + 8) >= 0) { return I128ToDecimalU(p, buf, bufLen); }
+  if (bufLen < 3) { return 0 - 1; }
+
+  var t: int64 := alloc(16);
+  if (t == 0) { return 0 - 1; }
+  I128Neg(p, t);
+  poke8(buf, 45);
+  var n: int64 := I128ToDecimalU(t, buf + 1, bufLen - 1);
+  free(t, 16);
+  if (n < 0) { return 0 - 1; }
+  return n + 1;
+}
+
+// Dezimalzeichenkette einlesen. Erkennt ein fuehrendes Vorzeichen.
+// false bei ungueltiger Eingabe oder Ueberlauf ueber 128 Bit hinaus.
+pub fn I128FromDecimal(s: int64, out: int64): bool {
+  if (s == 0) { return false; }
+
+  var neg: bool := false;
+  var i: int64 := 0;
+  var c: int64 := peek8(s);
+  if (c == 45) { neg := true; i := 1; }
+  else {
+    if (c == 43) { i := 1; }
+  }
+
+  var acc: int64 := alloc(16);
+  var tmp: int64 := alloc(16);
+  if (acc == 0) { return false; }
+  I128Zero(acc);
+
+  var seen: bool := false;
+  var ok: bool := true;
+  var run: bool := true;
+  while (run) {
+    var ch: int64 := peek8(s + i);
+    if (ch == 0) { run := false; }
+    else {
+      var isDigit: bool := ch >= 48;
+      if (isDigit) { isDigit := ch <= 57; }
+      if (!isDigit) {
+        ok := false;
+        run := false;
+      }
+      else {
+        seen := true;
+        // acc := acc*10 + ziffer, mit Ueberlaufpruefung
+        var hiBefore: int64 := peek64(acc + 8);
+        I128MulU64(acc, 10, acc);
+        // grobe Pruefung: ein Wert mit gesetztem obersten Bit vor der
+        // Multiplikation kann nicht mehr passen
+        if (BitsTest(hiBefore, 63)) { ok := false; run := false; }
+        else {
+          poke64(tmp, ch - 48);
+          poke64(tmp + 8, 0);
+          if (I128Add(acc, tmp, acc) != 0) { ok := false; run := false; }
+        }
+        i := i + 1;
+      }
+    }
+  }
+
+  if (ok) {
+    if (!seen) { ok := false; }
+  }
+  if (ok) {
+    if (neg) { I128Neg(acc, acc); }
+    I128Copy(acc, out);
+  }
+  free(acc, 16);
+  free(tmp, 16);
+  return ok;
+}
+
+// ── Anwendungen, fuer die es die Unit gibt ───────────────────────────────────
+
+// (a * b) / c, ohne dass a*b in 64 Bit passen muss. Rueckgabe -1, wenn c null
+// ist oder das Ergebnis nicht in 64 Bit passt.
+//
+// Das ist die Rechnung hinter jeder Umlage, jedem Prozentsatz auf grossen
+// Betraegen und jeder Einheitenumrechnung: erst mal nehmen, dann teilen, und
+// dazwischen nicht ueberlaufen.
+pub fn I128MulDivU(a: int64, b: int64, c: int64, okAddr: int64): int64 {
+  if (okAddr != 0) { poke64(okAddr, 0); }
+  if (c == 0) { return 0 - 1; }
+
+  var prod: int64 := alloc(16);
+  var div: int64 := alloc(16);
+  var q: int64 := alloc(16);
+  if (prod == 0) { return 0 - 1; }
+
+  I128Mul64U(a, b, prod);
+  poke64(div, c);
+  poke64(div + 8, 0);
+  I128DivRemU(prod, div, q, 0);
+
+  var res: int64 := 0 - 1;
+  if (I128FitsU64(q)) {
+    res := peek64(q);
+    if (okAddr != 0) { poke64(okAddr, 1); }
+  }
+  free(prod, 16);  free(div, 16);  free(q, 16);
+  return res;
+}
+
+// Der exakte Mittelwert zweier vorzeichenloser Zahlen — (a+b)/2 laeuft ueber,
+// sobald die Summe 64 Bit sprengt.
+pub fn I128AvgU(a: int64, b: int64): int64 {
+  // (a & b) + ((a ^ b) >> 1): der gemeinsame Teil plus die halbe Differenz.
+  // Kommt ohne 128 Bit aus und ist trotzdem exakt.
+  return (a & b) + BitsShr(a ^ b, 1);
+}

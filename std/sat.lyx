@@ -1,0 +1,334 @@
+// std/sat.lyx
+// Saettigungsarithmetik und Ueberlaufpruefung fuer int64
+
+@description("Saturating integer arithmetic and overflow detection: add/sub/mul/div/neg/abs, width saturation to 8/16/32 bit, clamping, checked variants")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.sat;
+
+import std.math;
+
+// ── Worum es geht ────────────────────────────────────────────────────────────
+//
+// Lyx' Ganzzahlarithmetik WRAPPT still. 9223372036854775807 + 1 ist
+// -9223372036854775808, ohne Warnung, ohne Fehler. Fuer Hashfunktionen und
+// modulare Arithmetik ist das genau richtig — ueberall sonst ist es ein Fehler,
+// der sich als plausible Zahl tarnt.
+//
+// Diese Einheit bietet die drei ueblichen Antworten darauf:
+//
+//   PRUEFEN     SatAddOverflows(a, b) sagt vorher, ob es schiefgeht.
+//   MELDEN      SatAddChecked(a, b, out) rechnet und meldet Erfolg.
+//   SAETTIGEN   SatAdd(a, b) klemmt auf die Grenze, statt umzuschlagen.
+//
+// Saettigung ist die richtige Wahl, wo ein Ergebnis "so gross wie moeglich"
+// sinnvoll ist: Lautstaerke, Helligkeit, Zaehler, Messwerte. Ein Audiosignal,
+// das bei Uebersteuerung auf das Maximum klemmt, klingt verzerrt; eines, das
+// umschlaegt, knackt und springt vom lautesten in den leisesten Wert.
+//
+// ── Abgrenzung zum Bestand ───────────────────────────────────────────────────
+//
+// std.result hat SafeAdd und SafeMul zur Ueberlauferkennung, std.stats hat
+// Clamp64, std.conv hat ClampUint8/16/32. Was fehlt, ist die Saettigung
+// selbst, die Subtraktion und Division, die Breitenbegrenzung fuer
+// vorzeichenbehaftete Typen — und ein Multiplikationstest, der nicht abstuerzt:
+//
+//   SafeMul(-1, INT64_MIN) loest SIGFPE aus und beendet das Programm.
+//
+// Der Grund ist die Pruefung `result / a != b`: mit a = -1 und result =
+// INT64_MIN ist das die Division INT64_MIN / -1, deren Ergebnis nicht mehr in
+// int64 passt — auf x86 eine Prozessorausnahme, kein abfangbarer Fehler.
+// Umgekehrte Reihenfolge (SafeMul(INT64_MIN, -1)) laeuft dagegen durch. Diese
+// Einheit prueft die beiden -1-Faelle vorab ab, bevor ueberhaupt dividiert wird.
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Hier wird fast nur ganzzahlig gerechnet, wo die bekannten f64-Fehler nicht
+// greifen. Fuer die Umwandlung aus f64 gilt das uebliche: negative Literale
+// und `con f64` nicht als Operand verwenden (#1496, #1499).
+
+fn _neg(x: f64): f64 { return 0.0 - x; }
+
+// ── Grenzen ──────────────────────────────────────────────────────────────────
+//
+// Als Funktionen, nicht als `con`: eine int64-Konstante waere zwar unauffaellig,
+// aber die Einheitlichkeit mit den uebrigen Units dieses Verzeichnisses ist
+// mehr wert als zwei gesparte Aufrufe.
+
+pub fn SatI64Max(): int64 { return 9223372036854775807; }
+pub fn SatI64Min(): int64 { return 0 - 9223372036854775807 - 1; }
+
+pub fn SatI32Max(): int64 { return 2147483647; }
+pub fn SatI32Min(): int64 { return 0 - 2147483648; }
+pub fn SatI16Max(): int64 { return 32767; }
+pub fn SatI16Min(): int64 { return 0 - 32768; }
+pub fn SatI8Max(): int64  { return 127; }
+pub fn SatI8Min(): int64  { return 0 - 128; }
+
+pub fn SatU32Max(): int64 { return 4294967295; }
+pub fn SatU16Max(): int64 { return 65535; }
+pub fn SatU8Max(): int64  { return 255; }
+
+// ── Ueberlauf erkennen ───────────────────────────────────────────────────────
+
+// Die Pruefungen rechnen die kritische Grenze aus, statt das Ergebnis zu
+// bilden und hinterher zu schauen. `SatI64Max() - b` ist fuer b > 0 immer
+// darstellbar, `SatI64Min() - b` fuer b < 0 ebenso — die Pruefung selbst kann
+// also nicht ueberlaufen.
+pub fn SatAddOverflows(a: int64, b: int64): bool {
+  if (b > 0) {
+    if (a > SatI64Max() - b) { return true; }
+  }
+  if (b < 0) {
+    if (a < SatI64Min() - b) { return true; }
+  }
+  return false;
+}
+
+pub fn SatSubOverflows(a: int64, b: int64): bool {
+  // a - b, aber ohne -b zu bilden: bei b = INT64_MIN gaebe es das nicht
+  if (b > 0) {
+    if (a < SatI64Min() + b) { return true; }
+  }
+  if (b < 0) {
+    if (a > SatI64Max() + b) { return true; }
+  }
+  return false;
+}
+
+// Die beiden -1-Faelle stehen VOR der Division. Ohne sie waere genau hier der
+// Absturz, den SafeMul aus std.result hat.
+pub fn SatMulOverflows(a: int64, b: int64): bool {
+  if (a == 0) { return false; }
+  if (b == 0) { return false; }
+
+  // INT64_MIN * -1 ist der einzige Ueberlauf mit einem Faktor von Betrag 1
+  if (a == 0 - 1) { return b == SatI64Min(); }
+  if (b == 0 - 1) { return a == SatI64Min(); }
+
+  // ab hier ist b weder 0 noch -1, die Division also gefahrlos
+  var r: int64 := a * b;
+  return r / b != a;
+}
+
+// Nur ein einziger Fall laeuft ueber: INT64_MIN / -1. Division durch null ist
+// kein Ueberlauf, sondern gar nicht definiert — dafuer gibt es SatDivChecked.
+pub fn SatDivOverflows(a: int64, b: int64): bool {
+  if (b != 0 - 1) { return false; }
+  return a == SatI64Min();
+}
+
+pub fn SatNegOverflows(a: int64): bool {
+  return a == SatI64Min();
+}
+
+// ── Gepruefte Rechnung ───────────────────────────────────────────────────────
+//
+// Ergebnis an die Adresse out (0 = verwerfen), Rueckgabe sagt, ob es
+// dargestellt werden konnte. Bei false bleibt out unberuehrt — ein
+// halbgeschriebenes Ergebnis waere schlimmer als keines.
+
+pub fn SatAddChecked(a: int64, b: int64, out: int64): bool {
+  if (SatAddOverflows(a, b)) { return false; }
+  if (out != 0) { poke64(out, a + b); }
+  return true;
+}
+
+pub fn SatSubChecked(a: int64, b: int64, out: int64): bool {
+  if (SatSubOverflows(a, b)) { return false; }
+  if (out != 0) { poke64(out, a - b); }
+  return true;
+}
+
+pub fn SatMulChecked(a: int64, b: int64, out: int64): bool {
+  if (SatMulOverflows(a, b)) { return false; }
+  if (out != 0) { poke64(out, a * b); }
+  return true;
+}
+
+// false bei Division durch null UND bei INT64_MIN / -1.
+pub fn SatDivChecked(a: int64, b: int64, out: int64): bool {
+  if (b == 0) { return false; }
+  if (SatDivOverflows(a, b)) { return false; }
+  if (out != 0) { poke64(out, a / b); }
+  return true;
+}
+
+// ── Saettigung ───────────────────────────────────────────────────────────────
+
+// Bei Ueberlauf auf die Grenze klemmen, in die Richtung, in die es lief.
+pub fn SatAdd(a: int64, b: int64): int64 {
+  if (!SatAddOverflows(a, b)) { return a + b; }
+  if (b > 0) { return SatI64Max(); }
+  return SatI64Min();
+}
+
+pub fn SatSub(a: int64, b: int64): int64 {
+  if (!SatSubOverflows(a, b)) { return a - b; }
+  if (b > 0) { return SatI64Min(); }
+  return SatI64Max();
+}
+
+// Bei der Multiplikation entscheidet das Vorzeichen des PRODUKTS, in welche
+// Richtung geklemmt wird — nicht das eines einzelnen Faktors.
+pub fn SatMul(a: int64, b: int64): int64 {
+  if (!SatMulOverflows(a, b)) { return a * b; }
+
+  var aNeg: bool := a < 0;
+  var bNeg: bool := b < 0;
+  if (aNeg == bNeg) { return SatI64Max(); }
+  return SatI64Min();
+}
+
+// INT64_MIN / -1 waere INT64_MAX + 1 und klemmt deshalb auf INT64_MAX.
+// Division durch null liefert 0 — sie hat kein sinnvolles gesaettigtes
+// Ergebnis, und ein Absturz waere hier die schlechtere Antwort.
+pub fn SatDiv(a: int64, b: int64): int64 {
+  if (b == 0) { return 0; }
+  if (SatDivOverflows(a, b)) { return SatI64Max(); }
+  return a / b;
+}
+
+// -INT64_MIN gibt es nicht (der Wertebereich ist unsymmetrisch), also
+// INT64_MAX.
+pub fn SatNeg(a: int64): int64 {
+  if (a == SatI64Min()) { return SatI64Max(); }
+  return 0 - a;
+}
+
+pub fn SatAbs(a: int64): int64 {
+  if (a == SatI64Min()) { return SatI64Max(); }
+  if (a < 0) { return 0 - a; }
+  return a;
+}
+
+// ── Klemmen ──────────────────────────────────────────────────────────────────
+
+// Auf einen Bereich begrenzen. Vertauschte Grenzen werden getauscht statt
+// stillschweigend hingenommen — sonst liefert ein Vertipper in den Argumenten
+// immer denselben Wert, ohne dass es auffaellt.
+pub fn SatClamp(x: int64, lo: int64, hi: int64): int64 {
+  var l: int64 := lo;
+  var h: int64 := hi;
+  if (l > h) {
+    l := hi;
+    h := lo;
+  }
+  if (x < l) { return l; }
+  if (x > h) { return h; }
+  return x;
+}
+
+pub fn SatInRange(x: int64, lo: int64, hi: int64): bool {
+  if (x < lo) { return false; }
+  if (x > hi) { return false; }
+  return true;
+}
+
+// ── Breitenbegrenzung ────────────────────────────────────────────────────────
+//
+// Auf den Wertebereich schmalerer Typen klemmen. Das ist in Lyx nicht bloss
+// Bequemlichkeit: schmale Integertypen wrappen dort NICHT auf ihre Breite
+// (uint8 255 + 1 ergibt 256, nicht 0 — Issue #1126). Wer 8-Bit-Semantik
+// braucht, muss sie selbst herstellen.
+//
+// Fuer Bild- und Tonverarbeitung ist Klemmen ohnehin die richtige Antwort:
+// ein zu heller Bildpunkt soll weiss werden, nicht schwarz.
+
+pub fn SatToI8(x: int64): int64 {
+  return SatClamp(x, SatI8Min(), SatI8Max());
+}
+
+pub fn SatToI16(x: int64): int64 {
+  return SatClamp(x, SatI16Min(), SatI16Max());
+}
+
+pub fn SatToI32(x: int64): int64 {
+  return SatClamp(x, SatI32Min(), SatI32Max());
+}
+
+pub fn SatToU8(x: int64): int64 {
+  return SatClamp(x, 0, SatU8Max());
+}
+
+pub fn SatToU16(x: int64): int64 {
+  return SatClamp(x, 0, SatU16Max());
+}
+
+pub fn SatToU32(x: int64): int64 {
+  return SatClamp(x, 0, SatU32Max());
+}
+
+// Passt der Wert ohne Verlust in die Breite?
+pub fn SatFitsI8(x: int64): bool  { return SatInRange(x, SatI8Min(), SatI8Max()); }
+pub fn SatFitsI16(x: int64): bool { return SatInRange(x, SatI16Min(), SatI16Max()); }
+pub fn SatFitsI32(x: int64): bool { return SatInRange(x, SatI32Min(), SatI32Max()); }
+pub fn SatFitsU8(x: int64): bool  { return SatInRange(x, 0, SatU8Max()); }
+pub fn SatFitsU16(x: int64): bool { return SatInRange(x, 0, SatU16Max()); }
+pub fn SatFitsU32(x: int64): bool { return SatInRange(x, 0, SatU32Max()); }
+
+// ── Rechnen in fester Breite ─────────────────────────────────────────────────
+//
+// Addition und Subtraktion mit anschliessendem Klemmen — der Kern jeder
+// Bild- und Tonverarbeitung. Beide Rechnungen laufen in int64 und koennen
+// deshalb nicht selbst ueberlaufen; geklemmt wird erst am Ende.
+
+pub fn SatAddU8(a: int64, b: int64): int64 {
+  return SatToU8(a + b);
+}
+
+pub fn SatSubU8(a: int64, b: int64): int64 {
+  return SatToU8(a - b);
+}
+
+pub fn SatAddI16(a: int64, b: int64): int64 {
+  return SatToI16(a + b);
+}
+
+pub fn SatSubI16(a: int64, b: int64): int64 {
+  return SatToI16(a - b);
+}
+
+// ── Umwandlung aus f64 ───────────────────────────────────────────────────────
+
+// f64 nach int64 mit Saettigung statt undefiniertem Verhalten.
+//
+// Ein `x as int64` mit x jenseits des int64-Bereichs liefert keinen sinnvollen
+// Wert — dieselbe Ursache wie beim fehlerhaften TruncF64 aus std.math
+// (Issue #1540). Hier wird vorher geprueft:
+//
+//   NaN         -> 0        (es gibt keine sinnvolle Ganzzahl dazu)
+//   +unendlich  -> INT64_MAX
+//   -unendlich  -> INT64_MIN
+//   zu gross    -> die jeweilige Grenze
+//
+// Gerundet wird zur Null hin, wie bei einer gewoehnlichen Umwandlung.
+pub fn SatFromF64(x: f64): int64 {
+  // NaN erkennt sich daran, dass es sich selbst ungleich ist
+  if (x != x) { return 0; }
+
+  var maxF: f64 := 9223372036854775807.0;
+  var minF: f64 := _neg(9223372036854775808.0);
+
+  if (x >= maxF) { return SatI64Max(); }
+  if (x <= minF) { return SatI64Min(); }
+
+  // im sicheren Bereich: abschneiden zur Null hin
+  if (x >= 0.0) { return FloorF64(x) as int64; }
+  return CeilF64(x) as int64;
+}
+
+// Mit Rundung statt Abschneiden (kaufmaennisch).
+pub fn SatRoundFromF64(x: f64): int64 {
+  if (x != x) { return 0; }
+  var half: f64 := 0.5;
+  if (x >= 0.0) { return SatFromF64(FloorF64(x + half)); }
+  return SatFromF64(CeilF64(x - half));
+}
+
+// f64 auf einen Bereich klemmen und in eine Ganzzahl wandeln — der uebliche
+// Weg von einem berechneten Wert zu einem Bildpunkt oder Abtastwert.
+pub fn SatFromF64Clamped(x: f64, lo: int64, hi: int64): int64 {
+  if (x != x) { return lo; }
+  return SatClamp(SatRoundFromF64(x), lo, hi);
+}

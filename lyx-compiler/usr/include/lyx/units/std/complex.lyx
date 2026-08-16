@@ -1,0 +1,556 @@
+// std/complex.lyx
+// Komplexe Zahlen — Arithmetik, Polarform, Elementarfunktionen
+
+@description("Complex arithmetic on f64 pairs: overflow-safe abs and division, polar form, exp/log/sqrt/pow, trigonometric and hyperbolic functions with correct branch cuts")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.complex;
+
+import std.math;
+import std.math.constants;
+import std.mathx;
+import std.feq;
+import std.dist;
+import std.io;
+import std.alloc;
+
+// ── Verhaeltnis zu std.fft und std.tensor ────────────────────────────────────
+//
+// Beide tragen komplexe Daten als ZWEI getrennte f64-Felder (Realteil und
+// Imaginaerteil je als eigenes Array). Das bleibt dort richtig: eine reelle
+// Eingabe laesst sich ohne Umkopieren als Realteil durchreichen, und eine
+// Transformation ueber 2^20 Amplituden will keine 2^20 Structs anfassen.
+//
+// Diese Einheit ist die andere Haelfte: die EINZELNE komplexe Zahl als Wert,
+// mit der man rechnet wie mit einer f64. Sie ersetzt die Felderdarstellung
+// nicht, sondern ergaenzt sie — CxLoad() und CxStore() setzen an genau der
+// Stelle an und holen einen Wert aus einem fft- oder tensor-Feld heraus
+// beziehungsweise legen ihn zurueck.
+//
+// Was hier hinzukommt und dort fehlt, ist die allgemeine Arithmetik:
+// Division, Wurzel, Logarithmus, Potenz, Polarform, die trigonometrischen und
+// hyperbolischen Funktionen samt ihren Umkehrungen.
+//
+// ── Wertsemantik ─────────────────────────────────────────────────────────────
+//
+// Wie std.quat ist die Einheit durchgehend funktional gebaut: jede Funktion
+// legt ihr Ergebnis in einer neuen lokalen Variable an und schreibt nie auf
+// einen Parameter. Rueckgabewerte sind damit frisch. Fuer den Aufrufer bleibt
+// die Regel, einen Wert nicht mit `:=` zu kopieren, sondern mit CxCopy().
+//
+// ── Verzweigungsschnitte ─────────────────────────────────────────────────────
+//
+// Der Logarithmus einer komplexen Zahl ist nur bis auf Vielfache von 2*pi*i
+// bestimmt. Die uebliche Festlegung — und die hier verwendete — waehlt den
+// Hauptwert mit Argument in (-pi, +pi]. Der Preis ist ein SCHNITT entlang der
+// negativen reellen Achse: dort springt der Funktionswert um 2*pi*i, je
+// nachdem, ob man sich von oben oder von unten naehert.
+//
+// Welche Seite gemeint ist, entscheidet allein das VORZEICHEN DER NULL im
+// Imaginaerteil:
+//
+//     CxLog(-1 + 0i)  =  i*pi
+//     CxLog(-1 - 0i)  = -i*pi
+//
+// Das ist kein Spitzfindigkeit, sondern die Zusicherung, die numerische
+// Verfahren brauchen: wer sich einem Schnitt stetig von unten naehert, will
+// keinen Sprung um 2*pi geschenkt bekommen.
+//
+
+// Betroffen sind CxLog (und alles, was darauf aufbaut: CxPow, CxSqrt, die
+// Arcus- und Areafunktionen). Die Schnitte folgen der Festlegung von C99
+// Annex G und stimmen mit Pythons cmath ueberein; nachgeprueft wurde das mit
+// Werten DIREKT auf den Schnitten, mit +0.0 und -0.0 im Imaginaerteil.
+//
+// ── Zwei Compiler-Defekte, die hier umgangen werden ──────────────────────────
+//
+// `Atan2F64` aus std.math ignoriert das Vorzeichenbit von y, sobald y eine
+// Null ist (#1577): atan2(-0, -1) liefert +pi statt -pi. Genau dieser Fall IST
+// der Schnitt. Zusaetzlich trifft `AtanF64` nur rund zehn Stellen (groesster
+// gemessener Fehler 2.1e-10) — beides in der Repo-Fassung ebenso wie in der
+// installierten. Ueber den Logarithmus schlaegt das in jede Umkehrfunktion
+// durch: gemessen lag CxLog damit bei 1e-10 statt bei 2e-16, und asin, acos,
+// atanh und pow erbten es.
+//
+// Diese Einheit rechnet deshalb mit `MxAtan2` aus std.mathx. Sinus und
+// Kosinus kommen als `MxSinCos` von dort, weil beide sich eine Reduktion
+// teilen — nicht, weil std.math sie falsch machte.
+
+pub type Cx = struct {
+  re: f64;
+  im: f64
+};
+
+// ── Interne Helfer ───────────────────────────────────────────────────────────
+
+fn _pi(): f64 { return PI; }
+fn _halfPi(): f64 { return HALF_PI; }
+fn _ln10(): f64 { return 2.30258509299404568402; }
+fn _ln2(): f64 { return 0.69314718055994530942; }
+
+fn _mk(a: f64, b: f64): Cx {
+  var z: Cx;
+  z.re := a;
+  z.im := b;
+  return z;
+}
+
+// ── Konstruktion und Zugriff ─────────────────────────────────────────────────
+
+pub fn CxNew(re: f64, im: f64): Cx { return _mk(re, im); }
+
+pub fn CxFromReal(x: f64): Cx { return _mk(x, 0.0); }
+
+pub fn CxFromImag(y: f64): Cx { return _mk(0.0, y); }
+
+pub fn CxZero(): Cx { return _mk(0.0, 0.0); }
+
+pub fn CxOne(): Cx { return _mk(1.0, 0.0); }
+
+pub fn CxI(): Cx { return _mk(0.0, 1.0); }
+
+pub fn CxRe(z: Cx): f64 { return z.re; }
+
+pub fn CxIm(z: Cx): f64 { return z.im; }
+
+pub fn CxCopy(z: Cx): Cx { return _mk(z.re, z.im); }
+
+// Aus Betrag und Winkel. Der Rueckweg ist CxAbs() zusammen mit CxArg().
+pub fn CxFromPolar(r: f64, theta: f64): Cx {
+  var sp: int64 := alloc(8);
+  var cp: int64 := alloc(8);
+  MxSinCos(theta, sp, cp);
+  var z: Cx := _mk(r * peekf64(cp), r * peekf64(sp));
+  free(sp, 8);
+  free(cp, 8);
+  return z;
+}
+
+// ── Brueckenfunktionen zu std.fft und std.tensor ─────────────────────────────
+
+// Element i aus einem Paar getrennter Felder holen.
+pub fn CxLoad(reArr: int64, imArr: int64, i: int64): Cx {
+  return _mk(peekf64(reArr + i * 8), peekf64(imArr + i * 8));
+}
+
+// Element i in ein Paar getrennter Felder zurueckschreiben.
+pub fn CxStore(z: Cx, reArr: int64, imArr: int64, i: int64): void {
+  pokef64(reArr + i * 8, z.re);
+  pokef64(imArr + i * 8, z.im);
+}
+
+// ── Klassifikation ───────────────────────────────────────────────────────────
+
+pub fn CxIsZero(z: Cx): bool { return z.re == 0.0 && z.im == 0.0; }
+
+pub fn CxIsNaN(z: Cx): bool { return FeqIsNaN(z.re) || FeqIsNaN(z.im); }
+
+pub fn CxIsInf(z: Cx): bool { return FeqIsInf(z.re) || FeqIsInf(z.im); }
+
+pub fn CxIsFinite(z: Cx): bool {
+  var bad: bool := FeqIsNaN(z.re) || FeqIsNaN(z.im) || FeqIsInf(z.re) || FeqIsInf(z.im);
+  return !bad;
+}
+
+pub fn CxIsReal(z: Cx): bool { return z.im == 0.0; }
+
+// ── Grundrechenarten ─────────────────────────────────────────────────────────
+
+pub fn CxAdd(a: Cx, b: Cx): Cx { return _mk(a.re + b.re, a.im + b.im); }
+
+pub fn CxSub(a: Cx, b: Cx): Cx { return _mk(a.re - b.re, a.im - b.im); }
+
+pub fn CxNeg(a: Cx): Cx { return _mk(0.0 - a.re, 0.0 - a.im); }
+
+pub fn CxConj(a: Cx): Cx { return _mk(a.re, 0.0 - a.im); }
+
+pub fn CxMul(a: Cx, b: Cx): Cx {
+  return _mk(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re);
+}
+
+// Skalare Varianten — sparen den Umweg ueber einen Wert mit Imaginaerteil 0
+// und, bei CxMulReal, zwei Multiplikationen mit exakter Null.
+pub fn CxAddReal(a: Cx, x: f64): Cx { return _mk(a.re + x, a.im); }
+
+pub fn CxSubReal(a: Cx, x: f64): Cx { return _mk(a.re - x, a.im); }
+
+pub fn CxMulReal(a: Cx, x: f64): Cx { return _mk(a.re * x, a.im * x); }
+
+pub fn CxDivReal(a: Cx, x: f64): Cx { return _mk(a.re / x, a.im / x); }
+
+// Division nach Smith. Die Lehrbuchformel teilt durch c^2 + d^2 und laeuft
+// damit ueber, sobald |c| oder |d| die Wurzel des groessten f64 ueberschreitet
+// — bei etwa 1.3e154, also lange bevor die Zahlen selbst zu gross sind.
+// Umgekehrt faellt sie auf null, wenn beide sehr klein sind. Smith klammert
+// stattdessen den betragsgroesseren Nenner aus, wodurch der Quotient r immer
+// in [-1, 1] liegt und kein Zwischenwert den Bereich verlaesst.
+pub fn CxDiv(a: Cx, b: Cx): Cx {
+  var c: f64 := b.re;
+  var d: f64 := b.im;
+  var ac: f64 := AbsF64(c);
+  var ad: f64 := AbsF64(d);
+  if (ac >= ad) {
+    if (c == 0.0) {
+      // dann ist auch d null: Division durch die exakte Null
+      return _mk(a.re / c, a.im / c);
+    }
+    var r: f64 := d / c;
+    var den: f64 := c + d * r;
+    return _mk((a.re + a.im * r) / den, (a.im - a.re * r) / den);
+  }
+  var r2: f64 := c / d;
+  var den2: f64 := c * r2 + d;
+  return _mk((a.re * r2 + a.im) / den2, (a.im * r2 - a.re) / den2);
+}
+
+pub fn CxInv(a: Cx): Cx { return CxDiv(_mk(1.0, 0.0), a); }
+
+// ── Betrag und Argument ──────────────────────────────────────────────────────
+
+// |z| ueber das ueberlaufsichere hypot aus std.dist: fuer z = 1e200 + 1e200i
+// liefert die naive Wurzel aus re^2+im^2 unendlich, obwohl das Ergebnis
+// darstellbar ist.
+pub fn CxAbs(z: Cx): f64 { return DistHypot(z.re, z.im); }
+
+// |z|^2 ohne Wurzel. Guenstiger als CxAbs(), wenn nur verglichen wird — aber
+// mit dem halben Wertebereich, weil das Quadrat ueberlaufen kann.
+pub fn CxAbs2(z: Cx): f64 { return z.re * z.re + z.im * z.im; }
+
+// Argument (Winkel zur positiven reellen Achse) in (-pi, +pi].
+//
+// Ueber MxAtan2 aus std.mathx, nicht ueber Atan2F64 aus std.math: letzteres
+// verwirft das Vorzeichen einer Null (#1577) und trifft ohnehin nur zehn
+// Stellen. Beides zusammen macht es fuer Verzweigungsschnitte unbrauchbar.
+pub fn CxArg(z: Cx): f64 {
+  return MxAtan2(z.im, z.re);
+}
+
+// z / |z| — die Richtung ohne Laenge. Die Null hat keine Richtung und bleibt
+// die Null.
+pub fn CxNormalize(z: Cx): Cx {
+  var r: f64 := CxAbs(z);
+  if (r == 0.0) { return _mk(z.re, z.im); }
+  return _mk(z.re / r, z.im / r);
+}
+
+// ── Wurzel ───────────────────────────────────────────────────────────────────
+
+// Hauptwurzel, Schnitt entlang der negativen reellen Achse.
+//
+// Gerechnet wird ueber t = sqrt((|z| + |re|) / 2) und nicht ueber die
+// Polarform: das spart Winkelfunktionen und vermeidet die Ausloeschung, die
+// entsteht, wenn |z| und |re| fast gleich sind. Welcher der beiden Teile
+// ueber t laeuft, haengt vom Vorzeichen von re ab — so steht in beiden Faellen
+// eine Summe und nie eine Differenz fast gleicher Zahlen.
+pub fn CxSqrt(z: Cx): Cx {
+  if (z.re == 0.0 && z.im == 0.0) {
+    // Vorzeichen des Imaginaerteils bleibt erhalten
+    return _mk(0.0, z.im);
+  }
+  var r: f64 := CxAbs(z);
+  if (z.re >= 0.0) {
+    var t: f64 := SqrtF64((r + z.re) * 0.5);
+    if (t == 0.0) { return _mk(0.0, z.im); }
+    return _mk(t, z.im / (t + t));
+  }
+  var u: f64 := SqrtF64((r - z.re) * 0.5);
+  var im2: f64 := u;
+  if (z.im < 0.0 || FeqSignBit(z.im)) { im2 := 0.0 - u; }
+  if (u == 0.0) { return _mk(0.0, im2); }
+  return _mk(AbsF64(z.im) / (u + u), im2);
+}
+
+// ── Exponentialfunktion und Logarithmus ──────────────────────────────────────
+
+pub fn CxExp(z: Cx): Cx {
+  var e: f64 := MxExp(z.re);
+  if (z.im == 0.0) {
+    // Imaginaerteil exakt null halten statt e*sin(0) zu rechnen — das
+    // bewahrt auch das Vorzeichen der Null.
+    return _mk(e, z.im);
+  }
+  // Sinus und Kosinus teilen sich eine Argumentreduktion — sie machen den
+  // groesseren Teil der Arbeit aus.
+  var sp: int64 := alloc(8);
+  var cp: int64 := alloc(8);
+  MxSinCos(z.im, sp, cp);
+  var w: Cx := _mk(e * peekf64(cp), e * peekf64(sp));
+  free(sp, 8);
+  free(cp, 8);
+  return w;
+}
+
+// Hauptzweig, Argument in (-pi, +pi].
+//
+// Der Realteil ist log|z|. Die naheliegende Form log(hypot(re,im)) verliert
+// Stellen, sobald |z| nahe bei 1 liegt: der Logarithmus loescht dann die
+// fuehrenden Stellen seines Arguments aus. In diesem Bereich wird deshalb
+// ueber log1p gerechnet, mit |z|^2 - 1 in der Form (|re|-1)(|re|+1) + im^2 —
+// so entsteht die Differenz zu 1 gar nicht erst als Rundung.
+pub fn CxLog(z: Cx): Cx {
+  var a: f64 := AbsF64(z.re);
+  var b: f64 := AbsF64(z.im);
+  var lr: f64 := 0.0;
+  var near: bool := a < 1.5 && b < 1.5 && (a > 0.5 || b > 0.5);
+  if (near) {
+    var t: f64 := (a - 1.0) * (a + 1.0) + b * b;
+    lr := 0.5 * MxLog1p(t);
+  } else {
+    lr := MxLog(DistHypot(a, b));
+  }
+  return _mk(lr, CxArg(z));
+}
+
+pub fn CxLog10(z: Cx): Cx {
+  var l: Cx := CxLog(z);
+  return _mk(l.re / _ln10(), l.im / _ln10());
+}
+
+pub fn CxLog2(z: Cx): Cx {
+  var l: Cx := CxLog(z);
+  return _mk(l.re / _ln2(), l.im / _ln2());
+}
+
+// ── Potenzen ─────────────────────────────────────────────────────────────────
+
+// Ganzzahlige Potenz durch wiederholtes Quadrieren. Gegenueber exp(n*log z)
+// ist das nicht nur schneller, sondern auch genauer: es kommt ohne
+// Winkelfunktionen aus, und fuer reelle z bleibt das Ergebnis exakt reell.
+pub fn CxPowInt(z: Cx, n: int64): Cx {
+  if (n == 0) { return _mk(1.0, 0.0); }
+  var e: int64 := n;
+  var base: Cx := CxCopy(z);
+  if (e < 0) {
+    base := CxInv(base);
+    e := 0 - e;
+  }
+  var acc: Cx := _mk(1.0, 0.0);
+  while (e > 0) {
+    if (e % 2 == 1) { acc := CxMul(acc, base); }
+    e := e / 2;
+    if (e > 0) { base := CxMul(base, base); }
+  }
+  return acc;
+}
+
+pub fn CxPowReal(z: Cx, x: f64): Cx {
+  if (CxIsZero(z)) {
+    if (x == 0.0) { return _mk(1.0, 0.0); }
+    if (x > 0.0) { return _mk(0.0, 0.0); }
+    return _mk(1.0 / 0.0, 0.0);
+  }
+  var l: Cx := CxLog(z);
+  return CxExp(_mk(l.re * x, l.im * x));
+}
+
+pub fn CxPow(z: Cx, w: Cx): Cx {
+  if (CxIsZero(z)) {
+    if (CxIsZero(w)) { return _mk(1.0, 0.0); }
+    if (w.im == 0.0 && w.re > 0.0) { return _mk(0.0, 0.0); }
+    return _mk(1.0 / 0.0, 0.0);
+  }
+  return CxExp(CxMul(w, CxLog(z)));
+}
+
+// Alle n Loesungen von w^n = z, gegen den Uhrzeigersinn ab dem Hauptwert.
+// Sie liegen auf einem Kreis mit Radius |z|^(1/n) und teilen ihn in n gleiche
+// Teile — deshalb wird der Winkel aufaddiert und nicht n-mal neu berechnet.
+// Rueckgabe false, wenn n kleiner als 1 ist.
+pub fn CxRoots(z: Cx, n: int64, outRe: int64, outIm: int64): bool {
+  if (n < 1) { return false; }
+  var r: f64 := CxAbs(z);
+  var rn: f64 := 0.0;
+  if (r > 0.0) { rn := MxExp(MxLog(r) / (n as f64)); }
+  var th: f64 := CxArg(z) / (n as f64);
+  var step: f64 := (2.0 * _pi()) / (n as f64);
+  var sp: int64 := alloc(8);
+  var cp: int64 := alloc(8);
+  var k: int64 := 0;
+  while (k < n) {
+    var ang: f64 := th + (k as f64) * step;
+    MxSinCos(ang, sp, cp);
+    pokef64(outRe + k * 8, rn * peekf64(cp));
+    pokef64(outIm + k * 8, rn * peekf64(sp));
+    k := k + 1;
+  }
+  free(sp, 8);
+  free(cp, 8);
+  return true;
+}
+
+// ── Trigonometrische Funktionen ──────────────────────────────────────────────
+
+pub fn CxSin(z: Cx): Cx {
+  return _mk(MxSin(z.re) * MxCosh(z.im), MxCos(z.re) * MxSinh(z.im));
+}
+
+pub fn CxCos(z: Cx): Cx {
+  return _mk(MxCos(z.re) * MxCosh(z.im), 0.0 - (MxSin(z.re) * MxSinh(z.im)));
+}
+
+// tan ueber die Doppelwinkelform statt als sin/cos: der gemeinsame Nenner
+// cos(2x) + cosh(2y) ist die stabile Groesse. Fuer grosse |y| waechst cosh
+// ueber jede Grenze, waehrend tan gegen ±i strebt — dieser Grenzfall wird
+// abgefangen, bevor der Ueberlauf eine Null durch Unendlich teilt.
+pub fn CxTan(z: Cx): Cx {
+  var y2: f64 := z.im + z.im;
+  if (AbsF64(y2) > 700.0) {
+    var s: f64 := 1.0;
+    if (z.im < 0.0) { s := 0.0 - 1.0; }
+    return _mk(0.0, s);
+  }
+  var x2: f64 := z.re + z.re;
+  var den: f64 := MxCos(x2) + MxCosh(y2);
+  return _mk(MxSin(x2) / den, MxSinh(y2) / den);
+}
+
+// ── Hyperbolische Funktionen ─────────────────────────────────────────────────
+
+pub fn CxSinh(z: Cx): Cx {
+  return _mk(MxSinh(z.re) * MxCos(z.im), MxCosh(z.re) * MxSin(z.im));
+}
+
+pub fn CxCosh(z: Cx): Cx {
+  return _mk(MxCosh(z.re) * MxCos(z.im), MxSinh(z.re) * MxSin(z.im));
+}
+
+pub fn CxTanh(z: Cx): Cx {
+  var x2: f64 := z.re + z.re;
+  if (AbsF64(x2) > 700.0) {
+    var s: f64 := 1.0;
+    if (z.re < 0.0) { s := 0.0 - 1.0; }
+    return _mk(s, 0.0);
+  }
+  var y2: f64 := z.im + z.im;
+  var den: f64 := MxCosh(x2) + MxCos(y2);
+  return _mk(MxSinh(x2) / den, MxSin(y2) / den);
+}
+
+// ── Umkehrfunktionen ─────────────────────────────────────────────────────────
+//
+// Alle laufen ueber Logarithmus und Wurzel und erben deren Schnitte. Die Form
+// der Ausdruecke ist dabei nicht beliebig: acosh(z) etwa MUSS ueber
+// sqrt(z+1)*sqrt(z-1) laufen und nicht ueber sqrt(z^2-1) — die zweite Form
+// legt den Schnitt an die falsche Stelle, weil das Quadrat die Information
+// verliert, aus welcher Halbebene z kam.
+
+// asinh(z) = log(z + sqrt(z^2 + 1))
+//
+// Fuer negativen Realteil wird die Ungeradheit ausgenutzt: asinh(-z) =
+// -asinh(z). Der Grund ist Ausloeschung — bei z = -33 + 38i sind z und
+// sqrt(z^2+1) im Realteil fast entgegengesetzt gleich, und ihre Summe verliert
+// die fuehrenden Stellen. Nach der Spiegelung addieren sich stattdessen zwei
+// gleichgerichtete Werte. Gemessen bringt das den groessten relativen Fehler
+// von 2.6e-13 auf 3.4e-16, also gut den Faktor 750.
+pub fn CxAsinh(z: Cx): Cx {
+  if (z.re < 0.0) {
+    var m: Cx := _mk(0.0 - z.re, 0.0 - z.im);
+    var w: Cx := CxAsinh(m);
+    return _mk(0.0 - w.re, 0.0 - w.im);
+  }
+  var z2: Cx := CxMul(z, z);
+  var s: Cx := CxSqrt(_mk(z2.re + 1.0, z2.im));
+  return CxLog(CxAdd(z, s));
+}
+
+// acosh(z) = log(z + sqrt(z+1) * sqrt(z-1)), Schnitt auf (-inf, 1)
+pub fn CxAcosh(z: Cx): Cx {
+  var p: Cx := CxSqrt(_mk(z.re + 1.0, z.im));
+  var m: Cx := CxSqrt(_mk(z.re - 1.0, z.im));
+  return CxLog(CxAdd(z, CxMul(p, m)));
+}
+
+// atanh(z) = (log(1+z) - log(1-z)) / 2, Schnitte auf (-inf,-1] und [1,inf)
+pub fn CxAtanh(z: Cx): Cx {
+  var p: Cx := CxLog(_mk(1.0 + z.re, z.im));
+  var m: Cx := CxLog(_mk(1.0 - z.re, 0.0 - z.im));
+  return _mk((p.re - m.re) * 0.5, (p.im - m.im) * 0.5);
+}
+
+// asin(z) = -i * asinh(i*z). Die Drehung um i verschiebt die Schnitte von der
+// imaginaeren auf die reelle Achse — dorthin, wo sie fuer asin hingehoeren.
+pub fn CxAsin(z: Cx): Cx {
+  var iz: Cx := _mk(0.0 - z.im, z.re);
+  var w: Cx := CxAsinh(iz);
+  return _mk(w.im, 0.0 - w.re);
+}
+
+// acos(z) = pi/2 - asin(z)
+pub fn CxAcos(z: Cx): Cx {
+  var s: Cx := CxAsin(z);
+  return _mk(_halfPi() - s.re, 0.0 - s.im);
+}
+
+// atan(z) = -i * atanh(i*z)
+pub fn CxAtan(z: Cx): Cx {
+  var iz: Cx := _mk(0.0 - z.im, z.re);
+  var w: Cx := CxAtanh(iz);
+  return _mk(w.im, 0.0 - w.re);
+}
+
+// ── Vergleich ────────────────────────────────────────────────────────────────
+
+pub fn CxEquals(a: Cx, b: Cx): bool { return a.re == b.re && a.im == b.im; }
+
+// Vergleich ueber den Abstand in der Ebene, nicht komponentenweise: zwei
+// Zahlen sind nah, wenn ihre Differenz kurz ist.
+pub fn CxApproxEq(a: Cx, b: Cx, eps: f64): bool {
+  return DistHypot(a.re - b.re, a.im - b.im) <= eps;
+}
+
+// ── Textausgabe ──────────────────────────────────────────────────────────────
+
+// "3+4i", "3-4i", reelle Werte ohne Imaginaerteil, rein imaginaere ohne
+// Realteil. `prec` sind die Nachkommastellen. Rueckgabe ist die Zahl
+// geschriebener Zeichen ohne die Null, oder -1, wenn der Puffer nicht reicht.
+pub fn CxFormat(z: Cx, prec: int64, buf: int64, bufLen: int64): int64 {
+  if (bufLen < 2) { return 0 - 1; }
+  var pos: int64 := 0;
+  var bad: bool := false;
+
+  var showRe: bool := z.re != 0.0 || z.im == 0.0;
+  if (showRe) {
+    var sr: pchar := FloatToStr(z.re, prec);
+    var i: int64 := 0;
+    while (!bad && peek8(sr as int64 + i) != 0) {
+      if (pos + 1 >= bufLen) { bad := true; } else {
+        poke8(buf + pos, peek8(sr as int64 + i));
+        pos := pos + 1;
+        i := i + 1;
+      }
+    }
+  }
+  if (!bad && z.im != 0.0) {
+    var neg: bool := z.im < 0.0;
+    var mag: f64 := z.im;
+    if (neg) { mag := 0.0 - mag; }
+    // Das Vorzeichen wird selbst gesetzt, damit zwischen Real- und
+    // Imaginaerteil immer genau ein + oder - steht.
+    if (showRe || neg) {
+      var ch: int64 := 43;
+      if (neg) { ch := 45; }
+      if (pos + 1 >= bufLen) { bad := true; } else {
+        poke8(buf + pos, ch);
+        pos := pos + 1;
+      }
+    }
+    var si: pchar := FloatToStr(mag, prec);
+    var j: int64 := 0;
+    while (!bad && peek8(si as int64 + j) != 0) {
+      if (pos + 1 >= bufLen) { bad := true; } else {
+        poke8(buf + pos, peek8(si as int64 + j));
+        pos := pos + 1;
+        j := j + 1;
+      }
+    }
+    if (!bad) {
+      if (pos + 1 >= bufLen) { bad := true; } else {
+        poke8(buf + pos, 105);
+        pos := pos + 1;
+      }
+    }
+  }
+  if (bad) { return 0 - 1; }
+  poke8(buf + pos, 0);
+  return pos;
+}

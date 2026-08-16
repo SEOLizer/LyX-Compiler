@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.0.21C
+VERSION   := 1.1.0A
 VERSION_DATE := 2026-08-16
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -766,6 +766,10 @@ test: lyxc
 
 	@echo "--- sec_wp37: RandInt64 Fehlerbehandlung (20 tests) ---"
 	@bash tests/sec_wp37_randint64_test.sh
+	@echo "OK"
+
+	@echo "--- Mathematik-Units: Fuzz gegen Python-Referenzen (7 Einheiten) ---"
+	@bash tests/lyx_units_fuzz_test.sh
 	@echo "OK"
 
 test-lyxos: lyxc

@@ -1,0 +1,1629 @@
+// std/graph.lyx
+// Graphalgorithmen: Durchlauf, kuerzeste Wege, Spannbaum, Komponenten
+
+@description("Graph algorithms on weighted directed and undirected graphs in compressed adjacency form: breadth and depth first traversal, topological sort, cycle detection, Dijkstra and Bellman-Ford shortest paths, Kruskal minimum spanning tree, connected and strongly connected components, union-find")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.graph;
+
+import std.math;
+import std.alloc;
+
+// ── Warum diese Unit ─────────────────────────────────────────────────────────
+//
+// In aurum gibt es 62 Funktionen mit dem Praefix `Graph`. Das ist ein
+// WISSENSGRAPH: Knoten mit Attributen, Kanten mit Typen, Zeit- und
+// Vektorindizes, Musterabfragen. Ein Ablagesystem, kein Rechenwerkzeug — es
+// findet sich dort kein einziger Algorithmus.
+//
+// std.grid kann Wegsuche, aber nur auf Gittern. Strassennetze,
+// Abhaengigkeitsgraphen, Ablaufplaene und Netzwerke sind keine Gitter: dort hat
+// ein Knoten drei oder tausend Nachbarn, nicht vier oder acht, und die
+// Nachbarschaft steht in keiner Koordinate.
+//
+// Der Praefix hier ist `Gph`, weil `Graph` bereits vergeben ist. Zwei Einheiten
+// mit gleichlautenden Namen erzeugen in Lyx keinen Fehler, sondern eine
+// unbestimmte Aufloesung — der Praefix muss also frei sein, nicht bloss
+// schoen.
+//
+// ── Darstellung ──────────────────────────────────────────────────────────────
+//
+// Kanten werden erst GESAMMELT und dann in eine zusammenhaengende
+// Nachbarschaftsliste umgeschrieben (GphBuild). Danach liegen die Nachbarn
+// jedes Knotens hintereinander im Speicher, und ein Durchlauf ueber sie ist ein
+// Durchlauf ueber ein Feldstueck:
+//
+//     offs[u] .. offs[u+1]-1   sind die Nachbarplaetze von u
+//     adjT[i]                  Zielknoten
+//     adjW[i]                  Kantengewicht
+//
+// Das ist dieselbe Bauform, die man aus dem Umfeld duenn besetzter Matrizen als
+// CSR kennt, und sie ist aus demselben Grund gewaehlt: eine Kantenliste zwingt
+// bei jedem Nachbarschaftszugriff zu einem Durchlauf ueber ALLE Kanten, eine
+// Adjazenzmatrix braucht n^2 Speicher. Bei 10.000 Knoten und 50.000 Kanten sind
+// das 400 Megabyte gegen 1,2.
+//
+// Ungerichtete Kanten werden beim Bauen doppelt eingetragen, einmal je
+// Richtung. Die Kantenzahl in der Sammlung bleibt davon unberuehrt.
+//
+// ── Gewichte sind f64 ────────────────────────────────────────────────────────
+//
+// Entfernungen, Kosten und Kapazitaeten sind selten ganzzahlig. Wer ganzzahlige
+// Gewichte hat, verliert nichts: bis 2^53 sind sie in f64 exakt.
+
+pub con GPH_HEADER: int64 := 96;
+
+fn _n(g: int64): int64        { return peek64(g); }
+fn _m(g: int64): int64        { return peek64(g + 8); }
+fn _cap(g: int64): int64      { return peek64(g + 16); }
+fn _built(g: int64): int64    { return peek64(g + 24); }
+fn _dir(g: int64): int64      { return peek64(g + 32); }
+fn _src(g: int64): int64      { return peek64(g + 40); }
+fn _dst(g: int64): int64      { return peek64(g + 48); }
+fn _wgt(g: int64): int64      { return peek64(g + 56); }
+fn _offs(g: int64): int64     { return peek64(g + 64); }
+fn _adjT(g: int64): int64     { return peek64(g + 72); }
+fn _adjW(g: int64): int64     { return peek64(g + 80); }
+fn _adjE(g: int64): int64     { return peek64(g + 88); }
+
+fn _gf(p: int64, i: int64): f64 { return peekf64(p + i * 8); }
+fn _pf(p: int64, i: int64, v: f64): void { pokef64(p + i * 8, v); }
+fn _inf(): f64 { return 1.0e308; }
+
+// ── Aufbau ───────────────────────────────────────────────────────────────────
+
+// Neuer Graph mit n Knoten und Platz fuer maxEdges Kanten.
+// directed = true fuer gerichtete Kanten. 0, wenn kein Speicher da ist.
+pub fn GphNew(n: int64, maxEdges: int64, directed: bool): int64 {
+  if (n < 0) { return 0; }
+  var cap: int64 := maxEdges;
+  if (cap < 1) { cap := 1; }
+
+  var g: int64 := alloc(GPH_HEADER);
+  if (g == 0) { return 0; }
+
+  var slots: int64 := cap;
+  if (!directed) { slots := cap * 2; }
+
+  var src: int64 := alloc(cap * 8);
+  var dst: int64 := alloc(cap * 8);
+  var wgt: int64 := alloc(cap * 8);
+  var offs: int64 := alloc((n + 2) * 8);
+  var adjT: int64 := alloc(slots * 8);
+  var adjW: int64 := alloc(slots * 8);
+  var adjE: int64 := alloc(slots * 8);
+  if (src == 0) { return 0; }
+  if (dst == 0) { return 0; }
+  if (wgt == 0) { return 0; }
+  if (offs == 0) { return 0; }
+  if (adjT == 0) { return 0; }
+  if (adjW == 0) { return 0; }
+  if (adjE == 0) { return 0; }
+
+  poke64(g, n);
+  poke64(g + 8, 0);
+  poke64(g + 16, cap);
+  poke64(g + 24, 0);
+  var d: int64 := 0;
+  if (directed) { d := 1; }
+  poke64(g + 32, d);
+  poke64(g + 40, src);
+  poke64(g + 48, dst);
+  poke64(g + 56, wgt);
+  poke64(g + 64, offs);
+  poke64(g + 72, adjT);
+  poke64(g + 80, adjW);
+  poke64(g + 88, adjE);
+  return g;
+}
+
+pub fn GphFree(g: int64): void {
+  if (g == 0) { return; }
+  var cap: int64 := _cap(g);
+  var n: int64 := _n(g);
+  var slots: int64 := cap;
+  if (_dir(g) == 0) { slots := cap * 2; }
+  free(_src(g), cap * 8);
+  free(_dst(g), cap * 8);
+  free(_wgt(g), cap * 8);
+  free(_offs(g), (n + 2) * 8);
+  free(_adjT(g), slots * 8);
+  free(_adjW(g), slots * 8);
+  free(_adjE(g), slots * 8);
+  free(g, GPH_HEADER);
+}
+
+pub fn GphNodeCount(g: int64): int64 { return _n(g); }
+pub fn GphEdgeCount(g: int64): int64 { return _m(g); }
+pub fn GphIsDirected(g: int64): bool { return _dir(g) == 1; }
+pub fn GphIsBuilt(g: int64): bool { return _built(g) == 1; }
+
+// Kante von u nach v mit Gewicht w. Bei ungerichteten Graphen gilt sie in
+// beide Richtungen. false, wenn die Kapazitaet erschoepft ist oder ein Knoten
+// ausserhalb liegt.
+//
+// Nach dem Hinzufuegen muss GphBuild aufgerufen werden, bevor ein Algorithmus
+// laeuft — sonst arbeitet er auf einer veralteten Nachbarschaftsliste.
+pub fn GphAddEdge(g: int64, u: int64, v: int64, w: f64): bool {
+  var n: int64 := _n(g);
+  if (u < 0) { return false; }
+  if (v < 0) { return false; }
+  if (u >= n) { return false; }
+  if (v >= n) { return false; }
+  var m: int64 := _m(g);
+  if (m >= _cap(g)) { return false; }
+
+  poke64(_src(g) + m * 8, u);
+  poke64(_dst(g) + m * 8, v);
+  _pf(_wgt(g), m, w);
+  poke64(g + 8, m + 1);
+  poke64(g + 24, 0);      // Nachbarschaftsliste ist nicht mehr gueltig
+  return true;
+}
+
+// Nachbarschaftsliste aus den gesammelten Kanten aufbauen.
+//
+// Zwei Durchlaeufe: erst die Grade zaehlen, daraus die Anfangsplaetze bilden,
+// dann die Kanten eintragen. Kein Sortieren noetig — das ist der Grund, warum
+// diese Form in linearer Zeit entsteht.
+pub fn GphBuild(g: int64): bool {
+  var n: int64 := _n(g);
+  var m: int64 := _m(g);
+  var offs: int64 := _offs(g);
+  var directed: bool := _dir(g) == 1;
+
+  var i: int64 := 0;
+  while (i < n + 2) {
+    poke64(offs + i * 8, 0);
+    i := i + 1;
+  }
+
+  // Grade zaehlen, um eins versetzt abgelegt
+  i := 0;
+  while (i < m) {
+    var u: int64 := peek64(_src(g) + i * 8);
+    var v: int64 := peek64(_dst(g) + i * 8);
+    poke64(offs + (u + 1) * 8, peek64(offs + (u + 1) * 8) + 1);
+    if (!directed) {
+      poke64(offs + (v + 1) * 8, peek64(offs + (v + 1) * 8) + 1);
+    }
+    i := i + 1;
+  }
+
+  // Praefixsumme: offs[u] ist der erste Platz von u
+  i := 1;
+  while (i <= n) {
+    poke64(offs + i * 8, peek64(offs + i * 8) + peek64(offs + (i - 1) * 8));
+    i := i + 1;
+  }
+
+  // Fuellstand je Knoten mitfuehren
+  var fill: int64 := alloc((n + 1) * 8);
+  if (fill == 0) { return false; }
+  i := 0;
+  while (i <= n) {
+    poke64(fill + i * 8, peek64(offs + i * 8));
+    i := i + 1;
+  }
+
+  var adjT: int64 := _adjT(g);
+  var adjW: int64 := _adjW(g);
+  var adjE: int64 := _adjE(g);
+  i := 0;
+  while (i < m) {
+    var u: int64 := peek64(_src(g) + i * 8);
+    var v: int64 := peek64(_dst(g) + i * 8);
+    var w: f64 := _gf(_wgt(g), i);
+
+    var p: int64 := peek64(fill + u * 8);
+    poke64(adjT + p * 8, v);
+    _pf(adjW, p, w);
+    poke64(adjE + p * 8, i);
+    poke64(fill + u * 8, p + 1);
+
+    if (!directed) {
+      var q: int64 := peek64(fill + v * 8);
+      poke64(adjT + q * 8, u);
+      _pf(adjW, q, w);
+      poke64(adjE + q * 8, i);
+      poke64(fill + v * 8, q + 1);
+    }
+    i := i + 1;
+  }
+  free(fill, (n + 1) * 8);
+
+  poke64(g + 24, 1);
+  return true;
+}
+
+// ── Nachbarschaft ────────────────────────────────────────────────────────────
+//
+// Durchlauf ueber die Nachbarn von u:
+//
+//     var b: int64 := GphAdjBegin(g, u);
+//     var e: int64 := GphAdjEnd(g, u);
+//     while (b < e) {
+//       var v: int64 := GphAdjTarget(g, b);
+//       var w: f64 := GphAdjWeight(g, b);
+//       ...
+//       b := b + 1;
+//     }
+
+pub fn GphAdjBegin(g: int64, u: int64): int64 {
+  if (u < 0) { return 0; }
+  if (u >= _n(g)) { return 0; }
+  return peek64(_offs(g) + u * 8);
+}
+
+pub fn GphAdjEnd(g: int64, u: int64): int64 {
+  if (u < 0) { return 0; }
+  if (u >= _n(g)) { return 0; }
+  return peek64(_offs(g) + (u + 1) * 8);
+}
+
+pub fn GphAdjTarget(g: int64, i: int64): int64 {
+  return peek64(_adjT(g) + i * 8);
+}
+
+pub fn GphAdjWeight(g: int64, i: int64): f64 {
+  return _gf(_adjW(g), i);
+}
+
+// Nummer der Kante, aus der dieser Nachbarplatz stammt — fuer Kantenattribute,
+// die der Aufrufer selbst fuehrt.
+pub fn GphAdjEdge(g: int64, i: int64): int64 {
+  return peek64(_adjE(g) + i * 8);
+}
+
+// Zahl der ausgehenden Kanten (bei ungerichteten Graphen: der Grad).
+pub fn GphDegree(g: int64, u: int64): int64 {
+  return GphAdjEnd(g, u) - GphAdjBegin(g, u);
+}
+
+// ── Breitensuche ─────────────────────────────────────────────────────────────
+
+// Abstand in SCHRITTEN von s aus, ohne Gewichte. outDist fasst n Werte,
+// unerreichbare Knoten bekommen -1. outPrev darf 0 sein.
+//
+// Ohne Gewichte ist die Breitensuche der richtige Weg: sie braucht keinen
+// Haufen und laeuft in O(n+m), waehrend Dijkstra log-Faktoren mitschleppt.
+pub fn GphBfs(g: int64, s: int64, outDist: int64, outPrev: int64): bool {
+  var n: int64 := _n(g);
+  if (_built(g) == 0) { return false; }
+  if (s < 0) { return false; }
+  if (s >= n) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(outDist + i * 8, 0 - 1);
+    if (outPrev != 0) { poke64(outPrev + i * 8, 0 - 1); }
+    i := i + 1;
+  }
+
+  var queue: int64 := alloc(n * 8);
+  if (queue == 0) { return false; }
+  var head: int64 := 0;
+  var tail: int64 := 0;
+  poke64(queue, s);
+  tail := 1;
+  poke64(outDist + s * 8, 0);
+
+  while (head < tail) {
+    var u: int64 := peek64(queue + head * 8);
+    head := head + 1;
+    var d: int64 := peek64(outDist + u * 8);
+
+    var b: int64 := GphAdjBegin(g, u);
+    var e: int64 := GphAdjEnd(g, u);
+    while (b < e) {
+      var v: int64 := GphAdjTarget(g, b);
+      if (peek64(outDist + v * 8) < 0) {
+        poke64(outDist + v * 8, d + 1);
+        if (outPrev != 0) { poke64(outPrev + v * 8, u); }
+        poke64(queue + tail * 8, v);
+        tail := tail + 1;
+      }
+      b := b + 1;
+    }
+  }
+  free(queue, n * 8);
+  return true;
+}
+
+// Tiefensuche, Knoten in Besuchsreihenfolge nach outOrder.
+// Rueckgabe ist ihre Anzahl, oder -1 bei Fehler.
+//
+// ITERATIV mit eigenem Stapel, nicht rekursiv: bei einer Kette aus 100.000
+// Knoten wuerde die Rekursion den Aufrufstapel sprengen, und ein
+// Stapelueberlauf ist in dieser Sprache kein Fehler, sondern ein Absturz.
+pub fn GphDfsOrder(g: int64, s: int64, outOrder: int64): int64 {
+  var n: int64 := _n(g);
+  if (_built(g) == 0) { return 0 - 1; }
+  if (s < 0) { return 0 - 1; }
+  if (s >= n) { return 0 - 1; }
+
+  var seen: int64 := alloc(n * 8);
+  var stack: int64 := alloc((n + _m(g) * 2 + 4) * 8);
+  if (seen == 0) { return 0 - 1; }
+  if (stack == 0) { return 0 - 1; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(seen + i * 8, 0);
+    i := i + 1;
+  }
+
+  var sp: int64 := 0;
+  poke64(stack, s);
+  sp := 1;
+  var cnt: int64 := 0;
+
+  while (sp > 0) {
+    sp := sp - 1;
+    var u: int64 := peek64(stack + sp * 8);
+    if (peek64(seen + u * 8) == 0) {
+      poke64(seen + u * 8, 1);
+      poke64(outOrder + cnt * 8, u);
+      cnt := cnt + 1;
+
+      // rueckwaerts auflegen, damit der erste Nachbar zuerst besucht wird
+      var b: int64 := GphAdjBegin(g, u);
+      var e: int64 := GphAdjEnd(g, u);
+      var k: int64 := e - 1;
+      while (k >= b) {
+        var v: int64 := GphAdjTarget(g, k);
+        if (peek64(seen + v * 8) == 0) {
+          poke64(stack + sp * 8, v);
+          sp := sp + 1;
+        }
+        k := k - 1;
+      }
+    }
+  }
+
+  free(seen, n * 8);
+  free(stack, (n + _m(g) * 2 + 4) * 8);
+  return cnt;
+}
+
+// Alle von s aus erreichbaren Knoten zaehlen.
+pub fn GphReachable(g: int64, s: int64): int64 {
+  var n: int64 := _n(g);
+  var d: int64 := alloc(n * 8);
+  if (d == 0) { return 0; }
+  var c: int64 := 0;
+  if (GphBfs(g, s, d, 0)) {
+    var i: int64 := 0;
+    while (i < n) {
+      if (peek64(d + i * 8) >= 0) { c := c + 1; }
+      i := i + 1;
+    }
+  }
+  free(d, n * 8);
+  return c;
+}
+
+// ── Topologische Sortierung ──────────────────────────────────────────────────
+
+// Reihenfolge, in der die Knoten abgearbeitet werden koennen, ohne eine
+// Abhaengigkeit zu verletzen. Rueckgabe ist die Zahl der eingeordneten Knoten;
+// ist sie kleiner als n, enthaelt der Graph einen ZYKLUS und es gibt keine
+// solche Reihenfolge.
+//
+// Verfahren nach Kahn: wiederholt einen Knoten ohne offene Vorbedingungen
+// nehmen und seine Kanten entfernen. Dass am Ende Knoten uebrig bleiben, IST
+// der Zyklusnachweis — man braucht keine getrennte Suche.
+//
+// Nur fuer gerichtete Graphen sinnvoll.
+pub fn GphTopoSort(g: int64, out: int64): int64 {
+  var n: int64 := _n(g);
+  if (_built(g) == 0) { return 0 - 1; }
+  if (_dir(g) == 0) { return 0 - 1; }
+
+  var indeg: int64 := alloc(n * 8);
+  var queue: int64 := alloc(n * 8);
+  if (indeg == 0) { return 0 - 1; }
+  if (queue == 0) { return 0 - 1; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(indeg + i * 8, 0);
+    i := i + 1;
+  }
+  i := 0;
+  while (i < n) {
+    var b: int64 := GphAdjBegin(g, i);
+    var e: int64 := GphAdjEnd(g, i);
+    while (b < e) {
+      var v: int64 := GphAdjTarget(g, b);
+      poke64(indeg + v * 8, peek64(indeg + v * 8) + 1);
+      b := b + 1;
+    }
+    i := i + 1;
+  }
+
+  var head: int64 := 0;
+  var tail: int64 := 0;
+  i := 0;
+  while (i < n) {
+    if (peek64(indeg + i * 8) == 0) {
+      poke64(queue + tail * 8, i);
+      tail := tail + 1;
+    }
+    i := i + 1;
+  }
+
+  var cnt: int64 := 0;
+  while (head < tail) {
+    var u: int64 := peek64(queue + head * 8);
+    head := head + 1;
+    poke64(out + cnt * 8, u);
+    cnt := cnt + 1;
+
+    var b2: int64 := GphAdjBegin(g, u);
+    var e2: int64 := GphAdjEnd(g, u);
+    while (b2 < e2) {
+      var v2: int64 := GphAdjTarget(g, b2);
+      var d: int64 := peek64(indeg + v2 * 8) - 1;
+      poke64(indeg + v2 * 8, d);
+      if (d == 0) {
+        poke64(queue + tail * 8, v2);
+        tail := tail + 1;
+      }
+      b2 := b2 + 1;
+    }
+  }
+
+  free(indeg, n * 8);
+  free(queue, n * 8);
+  return cnt;
+}
+
+// Enthaelt der gerichtete Graph einen Zyklus?
+pub fn GphHasCycle(g: int64): bool {
+  var n: int64 := _n(g);
+  if (_dir(g) == 0) { return false; }
+  var tmp: int64 := alloc(n * 8);
+  if (tmp == 0) { return false; }
+  var cnt: int64 := GphTopoSort(g, tmp);
+  free(tmp, n * 8);
+  if (cnt < 0) { return false; }
+  return cnt < n;
+}
+
+// ── Haufen fuer Dijkstra ─────────────────────────────────────────────────────
+//
+// Zwei parallele Felder statt eines Feldes von Paaren, und veraltete Eintraege
+// bleiben liegen statt geloescht zu werden ("lazy deletion"): einen Eintrag
+// mittendrin zu verringern erforderte eine Rueckverweistabelle, und die kostet
+// mehr, als sie spart.
+
+fn _hPush(hp: int64, hn: int64, hs: int64, prio: f64, node: int64): void {
+  var k: int64 := peek64(hs);
+  _pf(hp, k, prio);
+  poke64(hn + k * 8, node);
+  poke64(hs, k + 1);
+
+  while (k > 0) {
+    var par: int64 := (k - 1) / 2;
+    var pp: f64 := _gf(hp, par);
+    var kp: f64 := _gf(hp, k);
+    if (pp <= kp) { k := 0; }
+    else {
+      _pf(hp, par, kp);
+      _pf(hp, k, pp);
+      var t: int64 := peek64(hn + par * 8);
+      poke64(hn + par * 8, peek64(hn + k * 8));
+      poke64(hn + k * 8, t);
+      k := par;
+    }
+  }
+}
+
+fn _hPop(hp: int64, hn: int64, hs: int64): int64 {
+  var cnt: int64 := peek64(hs);
+  if (cnt == 0) { return 0 - 1; }
+  var top: int64 := peek64(hn);
+  cnt := cnt - 1;
+  _pf(hp, 0, _gf(hp, cnt));
+  poke64(hn, peek64(hn + cnt * 8));
+  poke64(hs, cnt);
+
+  var k: int64 := 0;
+  var run: bool := true;
+  while (run) {
+    var l: int64 := 2 * k + 1;
+    var r: int64 := l + 1;
+    var best: int64 := k;
+    if (l < cnt) {
+      if (_gf(hp, l) < _gf(hp, best)) { best := l; }
+    }
+    if (r < cnt) {
+      if (_gf(hp, r) < _gf(hp, best)) { best := r; }
+    }
+    if (best == k) { run := false; }
+    else {
+      var pv: f64 := _gf(hp, k);
+      _pf(hp, k, _gf(hp, best));
+      _pf(hp, best, pv);
+      var t: int64 := peek64(hn + k * 8);
+      poke64(hn + k * 8, peek64(hn + best * 8));
+      poke64(hn + best * 8, t);
+      k := best;
+    }
+  }
+  return top;
+}
+
+// ── Kuerzeste Wege ───────────────────────────────────────────────────────────
+
+// Kuerzeste Wege von s aus, mit Gewichten. outDist fasst n f64-Werte,
+// unerreichbare Knoten bekommen -1. outPrev darf 0 sein.
+//
+// Dijkstra setzt NICHTNEGATIVE Gewichte voraus. Mit einer negativen Kante ist
+// das Ergebnis still falsch: das Verfahren erklaert einen Knoten fuer
+// abgeschlossen, sobald er entnommen wird, und eine spaeter gefundene negative
+// Kante koennte ihn nachtraeglich verbessern. Wer negative Gewichte hat, nimmt
+// GphBellmanFord — hier wird nicht geprueft, weil die Pruefung O(m) kostet und
+// den haeufigen Fall verteuert.
+pub fn GphDijkstra(g: int64, s: int64, outDist: int64, outPrev: int64): bool {
+  var n: int64 := _n(g);
+  if (_built(g) == 0) { return false; }
+  if (s < 0) { return false; }
+  if (s >= n) { return false; }
+
+  var done: int64 := alloc(n * 8);
+  var cap: int64 := _m(g) * 2 + n + 8;
+  var hp: int64 := alloc(cap * 8);
+  var hn: int64 := alloc(cap * 8);
+  var hs: int64 := alloc(8);
+  if (done == 0) { return false; }
+  if (hp == 0) { return false; }
+  if (hn == 0) { return false; }
+  if (hs == 0) { return false; }
+  poke64(hs, 0);
+
+  var i: int64 := 0;
+  while (i < n) {
+    _pf(outDist, i, 0.0 - 1.0);
+    poke64(done + i * 8, 0);
+    if (outPrev != 0) { poke64(outPrev + i * 8, 0 - 1); }
+    i := i + 1;
+  }
+  _pf(outDist, s, 0.0);
+  _hPush(hp, hn, hs, 0.0, s);
+
+  while (peek64(hs) > 0) {
+    var u: int64 := _hPop(hp, hn, hs);
+    if (peek64(done + u * 8) == 0) {
+      poke64(done + u * 8, 1);
+      var du: f64 := _gf(outDist, u);
+
+      var b: int64 := GphAdjBegin(g, u);
+      var e: int64 := GphAdjEnd(g, u);
+      while (b < e) {
+        var v: int64 := GphAdjTarget(g, b);
+        if (peek64(done + v * 8) == 0) {
+          var nd: f64 := du + GphAdjWeight(g, b);
+          var old: f64 := _gf(outDist, v);
+          var better: bool := old < 0.0;
+          if (!better) { better := nd < old; }
+          if (better) {
+            _pf(outDist, v, nd);
+            if (outPrev != 0) { poke64(outPrev + v * 8, u); }
+            _hPush(hp, hn, hs, nd, v);
+          }
+        }
+        b := b + 1;
+      }
+    }
+  }
+
+  free(done, n * 8);
+  free(hp, cap * 8);  free(hn, cap * 8);  free(hs, 8);
+  return true;
+}
+
+// Kuerzeste Wege mit moeglicherweise NEGATIVEN Gewichten.
+//
+// Rueckgabe: 1 wenn alles gut, 0 wenn ein von s aus erreichbarer Zyklus mit
+// negativer Gesamtlaenge existiert (dann gibt es keine kuerzesten Wege — man
+// kann im Kreis laufen und wird beliebig billiger), -1 bei Fehler.
+//
+// Das Verfahren entspannt n-1 Mal alle Kanten. Aendert sich im n-ten Durchlauf
+// noch etwas, muss ein negativer Zyklus im Spiel sein — mehr als n-1 Kanten
+// braucht ein kuerzester Weg nie.
+pub fn GphBellmanFord(g: int64, s: int64, outDist: int64,
+                      outPrev: int64): int64 {
+  var n: int64 := _n(g);
+  var m: int64 := _m(g);
+  if (_built(g) == 0) { return 0 - 1; }
+  if (s < 0) { return 0 - 1; }
+  if (s >= n) { return 0 - 1; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    _pf(outDist, i, _inf());
+    if (outPrev != 0) { poke64(outPrev + i * 8, 0 - 1); }
+    i := i + 1;
+  }
+  _pf(outDist, s, 0.0);
+
+  var directed: bool := _dir(g) == 1;
+  var round: int64 := 0;
+  var changed: bool := true;
+  while (round < n) {
+    if (!changed) { round := n; }
+    else {
+      changed := false;
+      var k: int64 := 0;
+      while (k < m) {
+        var u: int64 := peek64(_src(g) + k * 8);
+        var v: int64 := peek64(_dst(g) + k * 8);
+        var w: f64 := _gf(_wgt(g), k);
+
+        var du: f64 := _gf(outDist, u);
+        if (du < _inf()) {
+          var nd: f64 := du + w;
+          if (nd < _gf(outDist, v)) {
+            _pf(outDist, v, nd);
+            if (outPrev != 0) { poke64(outPrev + v * 8, u); }
+            changed := true;
+          }
+        }
+        if (!directed) {
+          var dv: f64 := _gf(outDist, v);
+          if (dv < _inf()) {
+            var nd2: f64 := dv + w;
+            if (nd2 < _gf(outDist, u)) {
+              _pf(outDist, u, nd2);
+              if (outPrev != 0) { poke64(outPrev + u * 8, v); }
+              changed := true;
+            }
+          }
+        }
+        k := k + 1;
+      }
+      round := round + 1;
+    }
+  }
+
+  // ein weiterer Durchlauf: aendert sich noch etwas, gibt es einen negativen Zyklus
+  var neg: bool := false;
+  var k2: int64 := 0;
+  while (k2 < m) {
+    var u2: int64 := peek64(_src(g) + k2 * 8);
+    var v2: int64 := peek64(_dst(g) + k2 * 8);
+    var w2: f64 := _gf(_wgt(g), k2);
+    var du2: f64 := _gf(outDist, u2);
+    if (du2 < _inf()) {
+      if (du2 + w2 < _gf(outDist, v2)) { neg := true; }
+    }
+    k2 := k2 + 1;
+  }
+
+  // unerreichbare Knoten von der Unendlichkeitsmarke auf -1 bringen
+  i := 0;
+  while (i < n) {
+    if (_gf(outDist, i) >= _inf()) { _pf(outDist, i, 0.0 - 1.0); }
+    i := i + 1;
+  }
+
+  if (neg) { return 0; }
+  return 1;
+}
+
+// Weg aus der Vorgaengertabelle zurueckverfolgen, von s bis target.
+// Rueckgabe ist die Zahl der Knoten, oder -1 wenn maxLen nicht reicht.
+pub fn GphPathFrom(prev: int64, target: int64, out: int64,
+                   maxLen: int64): int64 {
+  var len: int64 := 0;
+  var cur: int64 := target;
+  var run: bool := true;
+  while (run) {
+    len := len + 1;
+    if (len > maxLen) { return 0 - 1; }
+    var p: int64 := peek64(prev + cur * 8);
+    if (p < 0) { run := false; }
+    else { cur := p; }
+  }
+
+  cur := target;
+  var i: int64 := len - 1;
+  while (i >= 0) {
+    poke64(out + i * 8, cur);
+    var p2: int64 := peek64(prev + cur * 8);
+    if (p2 >= 0) { cur := p2; }
+    i := i - 1;
+  }
+  return len;
+}
+
+// ── Vereinigungssuche ────────────────────────────────────────────────────────
+//
+// Verwaltet eine Zerlegung in disjunkte Mengen: welche Elemente gehoeren
+// zusammen? Braucht man fuer Kruskal, aber auch sonst — Aequivalenzklassen,
+// Verschmelzen von Bereichen, Erkennen von Zusammenhang beim Einfuegen.
+//
+// Mit Pfadverkuerzung und Vereinigung nach Groesse ist eine Anfrage praktisch
+// konstant teuer (inverse Ackermannfunktion, unter 5 fuer jede vorstellbare
+// Eingabe).
+
+pub fn GphUfNew(n: int64): int64 {
+  var uf: int64 := alloc((2 * n + 1) * 8);
+  if (uf == 0) { return 0; }
+  poke64(uf, n);
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(uf + 8 + i * 8, i);              // Elternzeiger auf sich selbst
+    poke64(uf + 8 + (n + i) * 8, 1);        // Groesse
+    i := i + 1;
+  }
+  return uf;
+}
+
+pub fn GphUfFree(uf: int64): void {
+  if (uf == 0) { return; }
+  free(uf, (2 * peek64(uf) + 1) * 8);
+}
+
+// Vertreter der Menge, in der x liegt. Verkuerzt dabei die Pfade.
+pub fn GphUfFind(uf: int64, x: int64): int64 {
+  var root: int64 := x;
+  var run: bool := true;
+  while (run) {
+    var p: int64 := peek64(uf + 8 + root * 8);
+    if (p == root) { run := false; }
+    else { root := p; }
+  }
+  // zweiter Durchlauf: alle Zeiger direkt auf die Wurzel
+  var cur: int64 := x;
+  run := true;
+  while (run) {
+    var p2: int64 := peek64(uf + 8 + cur * 8);
+    if (p2 == root) { run := false; }
+    else {
+      poke64(uf + 8 + cur * 8, root);
+      cur := p2;
+    }
+  }
+  return root;
+}
+
+// Mengen von a und b vereinigen. false, wenn sie schon dieselbe waren.
+pub fn GphUfUnion(uf: int64, a: int64, b: int64): bool {
+  var ra: int64 := GphUfFind(uf, a);
+  var rb: int64 := GphUfFind(uf, b);
+  if (ra == rb) { return false; }
+
+  var n: int64 := peek64(uf);
+  var sa: int64 := peek64(uf + 8 + (n + ra) * 8);
+  var sb: int64 := peek64(uf + 8 + (n + rb) * 8);
+  if (sa < sb) {
+    var t: int64 := ra;
+    ra := rb;
+    rb := t;
+    var ts: int64 := sa;
+    sa := sb;
+    sb := ts;
+  }
+  poke64(uf + 8 + rb * 8, ra);
+  poke64(uf + 8 + (n + ra) * 8, sa + sb);
+  return true;
+}
+
+pub fn GphUfSame(uf: int64, a: int64, b: int64): bool {
+  return GphUfFind(uf, a) == GphUfFind(uf, b);
+}
+
+pub fn GphUfSize(uf: int64, x: int64): int64 {
+  var n: int64 := peek64(uf);
+  return peek64(uf + 8 + (n + GphUfFind(uf, x)) * 8);
+}
+
+// ── Minimaler Spannbaum ──────────────────────────────────────────────────────
+
+// Kruskal: Kanten nach Gewicht aufsteigend durchgehen und jede nehmen, die zwei
+// bisher getrennte Teile verbindet.
+//
+// outEdges nimmt die Nummern der gewaehlten Kanten auf (bis zu n-1 Stueck),
+// outWeight die Gesamtlaenge (darf 0 sein). Rueckgabe ist die Zahl der
+// gewaehlten Kanten; ist sie kleiner als n-1, zerfaellt der Graph — dann ist es
+// ein Spannwald, kein Spannbaum.
+//
+// Nur fuer ungerichtete Graphen sinnvoll.
+pub fn GphMstKruskal(g: int64, outEdges: int64, outWeight: int64): int64 {
+  var n: int64 := _n(g);
+  var m: int64 := _m(g);
+  if (n == 0) { return 0; }
+
+  // Kantennummern nach Gewicht sortieren (Einfuegesortierung auf einer
+  // Indexliste — die Kanten selbst bleiben unberuehrt)
+  var order: int64 := alloc(m * 8);
+  if (order == 0) { return 0 - 1; }
+  var i: int64 := 0;
+  while (i < m) {
+    poke64(order + i * 8, i);
+    i := i + 1;
+  }
+
+  i := 1;
+  while (i < m) {
+    var key: int64 := peek64(order + i * 8);
+    var kw: f64 := _gf(_wgt(g), key);
+    var j: int64 := i - 1;
+    var run: bool := true;
+    while (run) {
+      if (j < 0) { run := false; }
+      else {
+        var oj: int64 := peek64(order + j * 8);
+        if (_gf(_wgt(g), oj) > kw) {
+          poke64(order + (j + 1) * 8, oj);
+          j := j - 1;
+        }
+        else { run := false; }
+      }
+    }
+    poke64(order + (j + 1) * 8, key);
+    i := i + 1;
+  }
+
+  var uf: int64 := GphUfNew(n);
+  if (uf == 0) { return 0 - 1; }
+
+  var cnt: int64 := 0;
+  var total: f64 := 0.0;
+  i := 0;
+  while (i < m) {
+    if (cnt < n - 1) {
+      var eidx: int64 := peek64(order + i * 8);
+      var u: int64 := peek64(_src(g) + eidx * 8);
+      var v: int64 := peek64(_dst(g) + eidx * 8);
+      if (GphUfUnion(uf, u, v)) {
+        poke64(outEdges + cnt * 8, eidx);
+        total := total + _gf(_wgt(g), eidx);
+        cnt := cnt + 1;
+      }
+    }
+    i := i + 1;
+  }
+
+  GphUfFree(uf);
+  free(order, m * 8);
+  if (outWeight != 0) { _pf(outWeight, 0, total); }
+  return cnt;
+}
+
+// ── Zusammenhang ─────────────────────────────────────────────────────────────
+
+// Zusammenhangskomponenten eines UNGERICHTETEN Graphen. outComp bekommt je
+// Knoten die Nummer seiner Komponente (ab 0). Rueckgabe ist ihre Anzahl.
+pub fn GphComponents(g: int64, outComp: int64): int64 {
+  var n: int64 := _n(g);
+  if (_built(g) == 0) { return 0 - 1; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(outComp + i * 8, 0 - 1);
+    i := i + 1;
+  }
+
+  var dist: int64 := alloc(n * 8);
+  if (dist == 0) { return 0 - 1; }
+
+  var comp: int64 := 0;
+  i := 0;
+  while (i < n) {
+    if (peek64(outComp + i * 8) < 0) {
+      GphBfs(g, i, dist, 0);
+      var k: int64 := 0;
+      while (k < n) {
+        if (peek64(dist + k * 8) >= 0) {
+          if (peek64(outComp + k * 8) < 0) { poke64(outComp + k * 8, comp); }
+        }
+        k := k + 1;
+      }
+      comp := comp + 1;
+    }
+    i := i + 1;
+  }
+  free(dist, n * 8);
+  return comp;
+}
+
+// Ist der Graph zusammenhaengend?
+pub fn GphIsConnected(g: int64): bool {
+  var n: int64 := _n(g);
+  if (n <= 1) { return true; }
+  return GphReachable(g, 0) == n;
+}
+
+// Starke Zusammenhangskomponenten eines GERICHTETEN Graphen nach Kosaraju:
+// einmal durchlaufen und die Knoten nach Abschlusszeit stapeln, dann den
+// Graphen umdrehen und in dieser Reihenfolge erneut durchlaufen.
+//
+// Zwei Knoten liegen genau dann in derselben Komponente, wenn jeder vom anderen
+// aus erreichbar ist. In einem Ablaufplan sind das die Teile, die sich
+// gegenseitig blockieren; in einem Verweisgeflecht die Zirkelbezuege.
+pub fn GphScc(g: int64, outComp: int64): int64 {
+  var n: int64 := _n(g);
+  var m: int64 := _m(g);
+  if (_built(g) == 0) { return 0 - 1; }
+  if (_dir(g) == 0) { return 0 - 1; }
+
+  var seen: int64 := alloc(n * 8);
+  var order: int64 := alloc(n * 8);
+  var stack: int64 := alloc((2 * n + 4) * 8);
+  var iter: int64 := alloc(n * 8);
+  if (seen == 0) { return 0 - 1; }
+  if (order == 0) { return 0 - 1; }
+  if (stack == 0) { return 0 - 1; }
+  if (iter == 0) { return 0 - 1; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(seen + i * 8, 0);
+    poke64(outComp + i * 8, 0 - 1);
+    i := i + 1;
+  }
+
+  // erster Durchlauf, iterativ, Abschlussreihenfolge sammeln
+  var oc: int64 := 0;
+  var s: int64 := 0;
+  while (s < n) {
+    if (peek64(seen + s * 8) == 0) {
+      var sp: int64 := 0;
+      poke64(stack, s);
+      sp := 1;
+      poke64(seen + s * 8, 1);
+      poke64(iter + s * 8, GphAdjBegin(g, s));
+
+      while (sp > 0) {
+        var u: int64 := peek64(stack + (sp - 1) * 8);
+        var it: int64 := peek64(iter + u * 8);
+        if (it < GphAdjEnd(g, u)) {
+          poke64(iter + u * 8, it + 1);
+          var v: int64 := GphAdjTarget(g, it);
+          if (peek64(seen + v * 8) == 0) {
+            poke64(seen + v * 8, 1);
+            poke64(iter + v * 8, GphAdjBegin(g, v));
+            poke64(stack + sp * 8, v);
+            sp := sp + 1;
+          }
+        }
+        else {
+          sp := sp - 1;
+          poke64(order + oc * 8, u);
+          oc := oc + 1;
+        }
+      }
+    }
+    s := s + 1;
+  }
+
+  // umgedrehten Graphen aufbauen
+  var roffs: int64 := alloc((n + 2) * 8);
+  var radj: int64 := alloc((m + 1) * 8);
+  if (roffs == 0) { return 0 - 1; }
+  if (radj == 0) { return 0 - 1; }
+  i := 0;
+  while (i < n + 2) {
+    poke64(roffs + i * 8, 0);
+    i := i + 1;
+  }
+  i := 0;
+  while (i < m) {
+    var v2: int64 := peek64(_dst(g) + i * 8);
+    poke64(roffs + (v2 + 1) * 8, peek64(roffs + (v2 + 1) * 8) + 1);
+    i := i + 1;
+  }
+  i := 1;
+  while (i <= n) {
+    poke64(roffs + i * 8, peek64(roffs + i * 8) + peek64(roffs + (i - 1) * 8));
+    i := i + 1;
+  }
+  var rfill: int64 := alloc((n + 1) * 8);
+  if (rfill == 0) { return 0 - 1; }
+  i := 0;
+  while (i <= n) {
+    poke64(rfill + i * 8, peek64(roffs + i * 8));
+    i := i + 1;
+  }
+  i := 0;
+  while (i < m) {
+    var u3: int64 := peek64(_src(g) + i * 8);
+    var v3: int64 := peek64(_dst(g) + i * 8);
+    var p: int64 := peek64(rfill + v3 * 8);
+    poke64(radj + p * 8, u3);
+    poke64(rfill + v3 * 8, p + 1);
+    i := i + 1;
+  }
+
+  // zweiter Durchlauf in umgekehrter Abschlussreihenfolge
+  var comp: int64 := 0;
+  var oi: int64 := oc - 1;
+  while (oi >= 0) {
+    var start: int64 := peek64(order + oi * 8);
+    if (peek64(outComp + start * 8) < 0) {
+      var sp2: int64 := 0;
+      poke64(stack, start);
+      sp2 := 1;
+      poke64(outComp + start * 8, comp);
+      while (sp2 > 0) {
+        sp2 := sp2 - 1;
+        var u4: int64 := peek64(stack + sp2 * 8);
+        var b: int64 := peek64(roffs + u4 * 8);
+        var e: int64 := peek64(roffs + (u4 + 1) * 8);
+        while (b < e) {
+          var w: int64 := peek64(radj + b * 8);
+          if (peek64(outComp + w * 8) < 0) {
+            poke64(outComp + w * 8, comp);
+            poke64(stack + sp2 * 8, w);
+            sp2 := sp2 + 1;
+          }
+          b := b + 1;
+        }
+      }
+      comp := comp + 1;
+    }
+    oi := oi - 1;
+  }
+
+  free(seen, n * 8);  free(order, n * 8);
+  free(stack, (2 * n + 4) * 8);  free(iter, n * 8);
+  free(roffs, (n + 2) * 8);  free(radj, (m + 1) * 8);  free(rfill, (n + 1) * 8);
+  return comp;
+}
+
+// ── Zweifaerbbarkeit ─────────────────────────────────────────────────────────
+
+// Laesst sich der Graph mit zwei Farben so faerben, dass keine Kante zwei
+// gleichfarbige Knoten verbindet?
+//
+// outColor bekommt je Knoten 0 oder 1 (unerreichbare Teile beginnen wieder
+// mit 0). Das ist zugleich die Pruefung, ob ein Graph BIPARTIT ist — und
+// gleichbedeutend damit, dass er keinen Kreis ungerader Laenge enthaelt.
+//
+// Breitensuche mit abwechselnder Farbe: findet sie eine Kante zwischen zwei
+// gleichfarbigen Knoten, gibt es einen ungeraden Kreis, und die Antwort ist
+// nein.
+pub fn GphIsBipartite(g: int64, outColor: int64): bool {
+  var n: int64 := _n(g);
+  if (_built(g) == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(outColor + i * 8, 0 - 1);
+    i := i + 1;
+  }
+
+  var queue: int64 := alloc(n * 8);
+  if (queue == 0) { return false; }
+  var ok: bool := true;
+
+  var s: int64 := 0;
+  while (s < n) {
+    if (peek64(outColor + s * 8) < 0) {
+      poke64(outColor + s * 8, 0);
+      var head: int64 := 0;
+      var tail: int64 := 0;
+      poke64(queue, s);
+      tail := 1;
+
+      while (head < tail) {
+        var u: int64 := peek64(queue + head * 8);
+        head := head + 1;
+        var cu: int64 := peek64(outColor + u * 8);
+
+        var b: int64 := GphAdjBegin(g, u);
+        var e: int64 := GphAdjEnd(g, u);
+        while (b < e) {
+          var v: int64 := GphAdjTarget(g, b);
+          var cv: int64 := peek64(outColor + v * 8);
+          if (cv < 0) {
+            poke64(outColor + v * 8, 1 - cu);
+            poke64(queue + tail * 8, v);
+            tail := tail + 1;
+          }
+          else {
+            if (cv == cu) { ok := false; }
+          }
+          b := b + 1;
+        }
+      }
+    }
+    s := s + 1;
+  }
+  free(queue, n * 8);
+  return ok;
+}
+
+// ── Flussnetze ───────────────────────────────────────────────────────────────
+//
+// Ein Flussnetz ist etwas anderes als der Graph oben: seine Kanten haben
+// KAPAZITAETEN, die im Lauf der Rechnung verbraucht werden, und zu jeder Kante
+// gehoert eine Gegenkante, ueber die sich Fluss wieder zuruecknehmen laesst.
+// Genau diese Ruecknahme macht das Verfahren erst korrekt — ohne sie bliebe
+// eine einmal getroffene, ungeschickte Wahl fuer immer stehen.
+//
+// Deshalb eine eigene Struktur statt der Nachbarschaftsliste von oben: die ist
+// nach GphBuild unveraenderlich, ein Restnetz ist es nicht.
+//
+// Kanten liegen PAARWEISE: die Kante mit Nummer 2k ist die Hinkante, 2k+1 ihre
+// Gegenkante. Damit ist die Gegenkante von i immer i^1 — ein XOR statt einer
+// Suchtabelle.
+
+pub con GPHF_HEADER: int64 := 64;
+
+fn _fn(f: int64): int64    { return peek64(f); }
+fn _fm(f: int64): int64    { return peek64(f + 8); }
+fn _fcap(f: int64): int64  { return peek64(f + 16); }
+fn _fto(f: int64): int64   { return peek64(f + 24); }
+fn _fcp(f: int64): int64   { return peek64(f + 32); }
+fn _foffs(f: int64): int64 { return peek64(f + 40); }
+fn _fadj(f: int64): int64  { return peek64(f + 48); }
+fn _fbuilt(f: int64): int64 { return peek64(f + 56); }
+
+// Neues Flussnetz mit n Knoten und Platz fuer maxEdges Kantenpaare.
+pub fn GphFlowNew(n: int64, maxEdges: int64): int64 {
+  if (n < 0) { return 0; }
+  var cap: int64 := maxEdges;
+  if (cap < 1) { cap := 1; }
+
+  var f: int64 := alloc(GPHF_HEADER);
+  if (f == 0) { return 0; }
+  var dst: int64 := alloc(2 * cap * 8);
+  var cp: int64 := alloc(2 * cap * 8);
+  var offs: int64 := alloc((n + 2) * 8);
+  var adj: int64 := alloc(2 * cap * 8);
+  if (dst == 0) { return 0; }
+  if (cp == 0) { return 0; }
+  if (offs == 0) { return 0; }
+  if (adj == 0) { return 0; }
+
+  poke64(f, n);
+  poke64(f + 8, 0);
+  poke64(f + 16, cap);
+  poke64(f + 24, dst);
+  poke64(f + 32, cp);
+  poke64(f + 40, offs);
+  poke64(f + 48, adj);
+  poke64(f + 56, 0);
+  return f;
+}
+
+pub fn GphFlowFree(f: int64): void {
+  if (f == 0) { return; }
+  var cap: int64 := _fcap(f);
+  var n: int64 := _fn(f);
+  free(_fto(f), 2 * cap * 8);
+  free(_fcp(f), 2 * cap * 8);
+  free(_foffs(f), (n + 2) * 8);
+  free(_fadj(f), 2 * cap * 8);
+  free(f, GPHF_HEADER);
+}
+
+pub fn GphFlowNodes(f: int64): int64 { return _fn(f); }
+pub fn GphFlowEdges(f: int64): int64 { return _fm(f); }
+
+// Gerichtete Kante u->v mit Kapazitaet cap. Die Gegenkante bekommt Kapazitaet
+// null — Fluss kann also nur zurueckgenommen, nicht eigenstaendig in die
+// Gegenrichtung geschickt werden.
+//
+// Rueckgabe ist die Nummer des Kantenpaares, oder -1.
+pub fn GphFlowAddEdge(f: int64, u: int64, v: int64, cap: f64): int64 {
+  var n: int64 := _fn(f);
+  if (u < 0) { return 0 - 1; }
+  if (v < 0) { return 0 - 1; }
+  if (u >= n) { return 0 - 1; }
+  if (v >= n) { return 0 - 1; }
+  if (cap < 0.0) { return 0 - 1; }
+  var m: int64 := _fm(f);
+  if (m >= _fcap(f)) { return 0 - 1; }
+
+  poke64(_fto(f) + (2 * m) * 8, v);
+  poke64(_fto(f) + (2 * m + 1) * 8, u);
+  _pf(_fcp(f), 2 * m, cap);
+  _pf(_fcp(f), 2 * m + 1, 0.0);
+  poke64(f + 8, m + 1);
+  poke64(f + 56, 0);
+  return m;
+}
+
+// Ungerichtete Kante: in beiden Richtungen dieselbe Kapazitaet. Hier ist die
+// Gegenkante keine blosse Buchungshilfe, sondern selbst benutzbar.
+pub fn GphFlowAddUndirected(f: int64, u: int64, v: int64, cap: f64): int64 {
+  var k: int64 := GphFlowAddEdge(f, u, v, cap);
+  if (k < 0) { return 0 - 1; }
+  _pf(_fcp(f), 2 * k + 1, cap);
+  return k;
+}
+
+// Nachbarschaft aufbauen — wie bei GphBuild, nur ueber die gerichteten
+// Kantenhaelften.
+pub fn GphFlowBuild(f: int64): bool {
+  var n: int64 := _fn(f);
+  var m: int64 := _fm(f);
+  var offs: int64 := _foffs(f);
+  var dst: int64 := _fto(f);
+
+  var i: int64 := 0;
+  while (i < n + 2) {
+    poke64(offs + i * 8, 0);
+    i := i + 1;
+  }
+  // Ausgangsknoten der gerichteten Kante i ist to[i^1]
+  i := 0;
+  while (i < 2 * m) {
+    var from: int64 := peek64(dst + (i ^ 1) * 8);
+    poke64(offs + (from + 1) * 8, peek64(offs + (from + 1) * 8) + 1);
+    i := i + 1;
+  }
+  i := 1;
+  while (i <= n) {
+    poke64(offs + i * 8, peek64(offs + i * 8) + peek64(offs + (i - 1) * 8));
+    i := i + 1;
+  }
+
+  var fill: int64 := alloc((n + 1) * 8);
+  if (fill == 0) { return false; }
+  i := 0;
+  while (i <= n) {
+    poke64(fill + i * 8, peek64(offs + i * 8));
+    i := i + 1;
+  }
+
+  var adj: int64 := _fadj(f);
+  i := 0;
+  while (i < 2 * m) {
+    var from2: int64 := peek64(dst + (i ^ 1) * 8);
+    var p: int64 := peek64(fill + from2 * 8);
+    poke64(adj + p * 8, i);
+    poke64(fill + from2 * 8, p + 1);
+    i := i + 1;
+  }
+  free(fill, (n + 1) * 8);
+
+  poke64(f + 56, 1);
+  return true;
+}
+
+// Restkapazitaet der gerichteten Kante i.
+pub fn GphFlowResidual(f: int64, i: int64): f64 {
+  return _gf(_fcp(f), i);
+}
+
+// Wie viel fliesst ueber das Kantenpaar k? Das ist, was von der
+// urspruenglichen Kapazitaet auf die Gegenkante gewandert ist.
+pub fn GphFlowOn(f: int64, k: int64): f64 {
+  return _gf(_fcp(f), 2 * k + 1);
+}
+
+// ── Maximaler Fluss ──────────────────────────────────────────────────────────
+
+// Groesste Menge, die von s nach t fliessen kann, ohne eine Kapazitaet zu
+// ueberschreiten. -1 bei Fehler.
+//
+// Verfahren nach Dinic. Der Unterschied zum einfachen Verfahren von
+// Edmonds und Karp: statt EINEN kuerzesten Weg je Durchgang zu nehmen, wird
+// erst eine Schichtung nach Abstand gebaut und dann in einem Zug ALLES
+// geschickt, was auf kuerzesten Wegen noch durchpasst. Das senkt die Schranke
+// von O(V*E^2) auf O(V^2*E) — und auf Netzen mit lauter Kapazitaet eins, wie
+// sie bei Zuordnungsaufgaben entstehen, sogar auf O(E*sqrt(V)).
+//
+// Nach dem Aufruf stehen die Restkapazitaeten im Netz; GphFlowOn liefert den
+// Fluss je Kante, GphMinCut die zugehoerige Schnittmenge.
+pub fn GphMaxFlow(f: int64, s: int64, t: int64): f64 {
+  var n: int64 := _fn(f);
+  if (_fbuilt(f) == 0) { return 0.0 - 1.0; }
+  if (s < 0) { return 0.0 - 1.0; }
+  if (t < 0) { return 0.0 - 1.0; }
+  if (s >= n) { return 0.0 - 1.0; }
+  if (t >= n) { return 0.0 - 1.0; }
+  if (s == t) { return 0.0 - 1.0; }
+
+  var level: int64 := alloc(n * 8);
+  var iter: int64 := alloc(n * 8);
+  var queue: int64 := alloc(n * 8);
+  var path: int64 := alloc((n + 2) * 8);
+  if (level == 0) { return 0.0 - 1.0; }
+  if (iter == 0) { return 0.0 - 1.0; }
+  if (queue == 0) { return 0.0 - 1.0; }
+  if (path == 0) { return 0.0 - 1.0; }
+
+  var offs: int64 := _foffs(f);
+  var adj: int64 := _fadj(f);
+  var dst: int64 := _fto(f);
+  var cp: int64 := _fcp(f);
+  var eps: f64 := 0.000000000001;
+
+  var total: f64 := 0.0;
+  var phases: bool := true;
+  while (phases) {
+    // Schichtung: Abstand von s im Restnetz
+    var i: int64 := 0;
+    while (i < n) {
+      poke64(level + i * 8, 0 - 1);
+      i := i + 1;
+    }
+    poke64(level + s * 8, 0);
+    var head: int64 := 0;
+    var tail: int64 := 0;
+    poke64(queue, s);
+    tail := 1;
+    while (head < tail) {
+      var u: int64 := peek64(queue + head * 8);
+      head := head + 1;
+      var b: int64 := peek64(offs + u * 8);
+      var e: int64 := peek64(offs + (u + 1) * 8);
+      while (b < e) {
+        var ei: int64 := peek64(adj + b * 8);
+        var v: int64 := peek64(dst + ei * 8);
+        if (_gf(cp, ei) > eps) {
+          if (peek64(level + v * 8) < 0) {
+            poke64(level + v * 8, peek64(level + u * 8) + 1);
+            poke64(queue + tail * 8, v);
+            tail := tail + 1;
+          }
+        }
+        b := b + 1;
+      }
+    }
+
+    if (peek64(level + t * 8) < 0) { phases := false; }
+    else {
+      // Sperrfluss: solange Wege in der Schichtung finden und absaettigen
+      i := 0;
+      while (i < n) {
+        poke64(iter + i * 8, peek64(offs + i * 8));
+        i := i + 1;
+      }
+
+      var run: bool := true;
+      var plen: int64 := 0;
+      var u2: int64 := s;
+      while (run) {
+        if (u2 == t) {
+          // Engstelle des Pfades suchen
+          var bott: f64 := 0.0;
+          var first: bool := true;
+          var k: int64 := 0;
+          while (k < plen) {
+            var ei2: int64 := peek64(path + k * 8);
+            var r: f64 := _gf(cp, ei2);
+            if (first) { bott := r; first := false; }
+            else {
+              if (r < bott) { bott := r; }
+            }
+            k := k + 1;
+          }
+          // Fluss eintragen und die erste gesaettigte Kante merken
+          var cut: int64 := plen;
+          k := 0;
+          while (k < plen) {
+            var ei3: int64 := peek64(path + k * 8);
+            _pf(cp, ei3, _gf(cp, ei3) - bott);
+            _pf(cp, ei3 ^ 1, _gf(cp, ei3 ^ 1) + bott);
+            if (_gf(cp, ei3) <= eps) {
+              if (cut == plen) { cut := k; }
+            }
+            k := k + 1;
+          }
+          total := total + bott;
+          // bis zur gesaettigten Kante zuruecknehmen
+          plen := cut;
+          if (plen == 0) { u2 := s; }
+          else {
+            var prevE: int64 := peek64(path + (plen - 1) * 8);
+            u2 := peek64(dst + prevE * 8);
+          }
+        }
+        else {
+          // vorwaerts gehen, wenn eine zulaessige Kante da ist
+          var it: int64 := peek64(iter + u2 * 8);
+          var lim: int64 := peek64(offs + (u2 + 1) * 8);
+          var advanced: bool := false;
+          while (it < lim) {
+            if (advanced) { it := lim; }
+            else {
+              var ec: int64 := peek64(adj + it * 8);
+              var vc: int64 := peek64(dst + ec * 8);
+              var okEdge: bool := _gf(cp, ec) > eps;
+              if (okEdge) {
+                okEdge := peek64(level + vc * 8) == peek64(level + u2 * 8) + 1;
+              }
+              if (okEdge) {
+                poke64(path + plen * 8, ec);
+                plen := plen + 1;
+                u2 := vc;
+                advanced := true;
+              }
+              else {
+                it := it + 1;
+                poke64(iter + u2 * 8, it);
+              }
+            }
+          }
+          if (!advanced) {
+            // Sackgasse: Knoten aus der Schichtung nehmen und zuruecktreten
+            poke64(level + u2 * 8, 0 - 1);
+            if (plen == 0) {
+              if (u2 == s) { run := false; }
+            }
+            else {
+              plen := plen - 1;
+              var backE: int64 := peek64(path + plen * 8);
+              u2 := peek64(dst + (backE ^ 1) * 8);
+              poke64(iter + u2 * 8, peek64(iter + u2 * 8) + 1);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  free(level, n * 8);  free(iter, n * 8);
+  free(queue, n * 8);  free(path, (n + 2) * 8);
+  return total;
+}
+
+// Nach GphMaxFlow: welche Knoten liegen auf der Quellseite des minimalen
+// Schnitts? outSide bekommt je Knoten 1 oder 0. Rueckgabe ist die Zahl der
+// Knoten auf der Quellseite.
+//
+// Der Satz von Ford und Fulkerson besagt, dass der groesste Fluss genau so
+// gross ist wie der kleinste Schnitt. Die Schnittmenge selbst findet man,
+// indem man im RESTNETZ schaut, was von s aus noch erreichbar ist: die Kanten
+// von dort nach draussen sind saemtlich ausgeschoepft, und ihre Summe ist der
+// Fluss.
+pub fn GphMinCut(f: int64, s: int64, outSide: int64): int64 {
+  var n: int64 := _fn(f);
+  if (_fbuilt(f) == 0) { return 0 - 1; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(outSide + i * 8, 0);
+    i := i + 1;
+  }
+
+  var queue: int64 := alloc(n * 8);
+  if (queue == 0) { return 0 - 1; }
+  var offs: int64 := _foffs(f);
+  var adj: int64 := _fadj(f);
+  var dst: int64 := _fto(f);
+  var cp: int64 := _fcp(f);
+  var eps: f64 := 0.000000000001;
+
+  poke64(outSide + s * 8, 1);
+  var head: int64 := 0;
+  var tail: int64 := 1;
+  poke64(queue, s);
+  var cnt: int64 := 1;
+
+  while (head < tail) {
+    var u: int64 := peek64(queue + head * 8);
+    head := head + 1;
+    var b: int64 := peek64(offs + u * 8);
+    var e: int64 := peek64(offs + (u + 1) * 8);
+    while (b < e) {
+      var ei: int64 := peek64(adj + b * 8);
+      var v: int64 := peek64(dst + ei * 8);
+      if (_gf(cp, ei) > eps) {
+        if (peek64(outSide + v * 8) == 0) {
+          poke64(outSide + v * 8, 1);
+          poke64(queue + tail * 8, v);
+          tail := tail + 1;
+          cnt := cnt + 1;
+        }
+      }
+      b := b + 1;
+    }
+  }
+  free(queue, n * 8);
+  return cnt;
+}
+
+// ── Zuordnung in zweigeteilten Graphen ───────────────────────────────────────
+
+// Groesste Zuordnung zwischen zwei Knotenmengen: Knoten 0..nLeft-1 auf der
+// einen Seite, nLeft..n-1 auf der anderen. Jeder Knoten darf hoechstens einmal
+// zugeordnet werden.
+//
+// outMatch fasst n Werte: der Partner jedes Knotens, oder -1. Rueckgabe ist
+// die Zahl der Paare, oder -1 bei Fehler.
+//
+// Umgesetzt als Flussaufgabe: eine kuenstliche Quelle an alle linken Knoten,
+// alle rechten Knoten an eine kuenstliche Senke, jede Kante mit Kapazitaet
+// eins. Der groesste Fluss ist dann genau die groesste Zuordnung — jede
+// Einheit Fluss ist ein Paar, und die Kapazitaet eins verhindert
+// Mehrfachbelegung.
+//
+// Auf solchen Netzen laeuft Dinic in O(E*sqrt(V)); ein eigener Algorithmus fuer
+// den Sonderfall braucht es also nicht.
+pub fn GphBipartiteMatch(g: int64, nLeft: int64, outMatch: int64): int64 {
+  var n: int64 := _n(g);
+  if (_built(g) == 0) { return 0 - 1; }
+  if (nLeft < 0) { return 0 - 1; }
+  if (nLeft > n) { return 0 - 1; }
+
+  // Knoten: 0..n-1 wie gehabt, n = Quelle, n+1 = Senke
+  var m: int64 := _m(g);
+  var f: int64 := GphFlowNew(n + 2, m + n + 2);
+  if (f == 0) { return 0 - 1; }
+
+  var src: int64 := n;
+  var snk: int64 := n + 1;
+
+  var i: int64 := 0;
+  while (i < nLeft) {
+    GphFlowAddEdge(f, src, i, 1.0);
+    i := i + 1;
+  }
+  i := nLeft;
+  while (i < n) {
+    GphFlowAddEdge(f, i, snk, 1.0);
+    i := i + 1;
+  }
+
+  // Kanten von links nach rechts; die Richtung im Ausgangsgraphen ist egal
+  var edgeOf: int64 := alloc((m + 1) * 8);
+  if (edgeOf == 0) { return 0 - 1; }
+  var k: int64 := 0;
+  while (k < m) {
+    poke64(edgeOf + k * 8, 0 - 1);
+    var u: int64 := peek64(_src(g) + k * 8);
+    var v: int64 := peek64(_dst(g) + k * 8);
+    var a: int64 := u;
+    var b: int64 := v;
+    if (a >= nLeft) {
+      a := v;
+      b := u;
+    }
+    var valid: bool := a < nLeft;
+    if (valid) { valid := b >= nLeft; }
+    if (valid) {
+      var fe: int64 := GphFlowAddEdge(f, a, b, 1.0);
+      poke64(edgeOf + k * 8, fe);
+    }
+    k := k + 1;
+  }
+
+  GphFlowBuild(f);
+  var flow: f64 := GphMaxFlow(f, src, snk);
+
+  i := 0;
+  while (i < n) {
+    poke64(outMatch + i * 8, 0 - 1);
+    i := i + 1;
+  }
+
+  // Welche der urspruenglichen Kanten tragen Fluss? Das sind die Paare.
+  k := 0;
+  while (k < m) {
+    var fe2: int64 := peek64(edgeOf + k * 8);
+    if (fe2 >= 0) {
+      if (GphFlowOn(f, fe2) > 0.5) {
+        var u2: int64 := peek64(_src(g) + k * 8);
+        var v2: int64 := peek64(_dst(g) + k * 8);
+        var a2: int64 := u2;
+        var b2: int64 := v2;
+        if (a2 >= nLeft) {
+          a2 := v2;
+          b2 := u2;
+        }
+        if (peek64(outMatch + a2 * 8) < 0) {
+          if (peek64(outMatch + b2 * 8) < 0) {
+            poke64(outMatch + a2 * 8, b2);
+            poke64(outMatch + b2 * 8, a2);
+          }
+        }
+      }
+    }
+    k := k + 1;
+  }
+
+  free(edgeOf, (m + 1) * 8);
+  GphFlowFree(f);
+  var res: f64 := flow + 0.5;
+  return res as int64;
+}

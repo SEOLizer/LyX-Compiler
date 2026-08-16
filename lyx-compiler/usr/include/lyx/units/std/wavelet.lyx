@@ -1,0 +1,752 @@
+// std/wavelet.lyx
+// Diskrete Wavelet-Transformation: Haar, Daubechies, mehrstufig, 2D, Entrauschen
+
+@description("Discrete wavelet transform: Haar and Daubechies filters, multilevel, 2D, thresholding and denoising")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.wavelet;
+
+import std.math;
+import std.alloc;
+
+// ── Wozu, neben std.fft ──────────────────────────────────────────────────────
+//
+// Die Fourier-Transformation sagt, WELCHE Frequenzen in einem Signal stecken,
+// aber nicht, WANN. Ein Knacks in einer Aufnahme verteilt sich im Spektrum
+// ueber alle Frequenzen; man sieht ihn dort nicht. Wavelets zerlegen statt
+// dessen in Frequenz UND Ort: jede Stufe halbiert die Bandbreite und
+// verdoppelt die Zeitunschaerfe. Deshalb sind sie die Grundlage von JPEG 2000
+// und von Entrauschungsverfahren — ein einzelner Ausreisser bleibt in wenigen
+// Koeffizienten sitzt statt sich zu verschmieren.
+//
+// ── Darstellung ──────────────────────────────────────────────────────────────
+//
+// Reihen sind f64-Felder als Adresse. Eine Zerlegungsstufe schreibt zuerst die
+// n/2 Approximationskoeffizienten (Tiefpass), dahinter die n/2 Detailkoeffi-
+// zienten (Hochpass). Mehrstufig wird nur der Approximationsteil weiter
+// zerlegt, die Anordnung ist also
+//
+//     [ cA_L | cD_L | cD_(L-1) | ... | cD_1 ]
+//
+// mit cA_L der Laenge n/2^L. Die Transformation ist laengenerhaltend: n Werte
+// hinein, n Werte heraus.
+//
+// ── Randbehandlung: zyklisch ─────────────────────────────────────────────────
+//
+// Diese Einheit setzt die Reihe periodisch fort. Das ist nicht die schoenste
+// Annahme — am Rand trifft das Ende auf den Anfang, und wenn beide nicht
+// zusammenpassen, entsteht dort ein kuenstlicher Sprung, der sich in grossen
+// Detailkoeffizienten zeigt.
+//
+// Sie ist aber die einzige, die zwei Eigenschaften zugleich haelt: die
+// Transformation bleibt LAENGENERHALTEND (n hinein, n heraus) und exakt
+// umkehrbar. Symmetrische Fortsetzung ist am Rand gutartiger, verlaengert
+// aber die Koeffizientenfolge, und dann passt die Zerlegung nicht mehr in das
+// Eingabefeld. Wer die Randartefakte nicht will, ergaenzt seine Daten vorher
+// selbst (Spiegeln, Abklingen) — das ist eine Entscheidung ueber die Daten,
+// nicht ueber das Verfahren.
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in den uebrigen Units dieses Verzeichnisses: `con f64` als Operand
+// (#1499), negatives Literal als Operand (#1496), unaeres Minus auf einer
+// Variablen im Ausdruck (#1512) und peekf64 direkt im Ausdruck rechnen still
+// falsch. Konstanten stehen als Funktionen, negiert wird ueber _neg(), gelesen
+// wird ueber _get().
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+fn _eps(): f64  { return 0.000000000001; }
+
+fn _get(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn _put(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+// ── Wavelet-Familien ─────────────────────────────────────────────────────────
+//
+// Daubechies-Wavelets mit N verschwindenden Momenten: ein dbN loescht jedes
+// Polynom vom Grad kleiner N aus den Detailkoeffizienten. Haar (= db1) loescht
+// Konstanten, db2 zusaetzlich Geraden, db3 Parabeln, db4 kubische Verlaeufe.
+//
+// Das ist der einzige Grund, ein laengeres Filter zu nehmen: glatte Signale
+// erzeugen damit fast keine Details, und was uebrig bleibt, ist Kante oder
+// Rauschen. Der Preis ist die groessere Traegerbreite — ein db4 verschmiert
+// eine Sprungstelle ueber acht Abtastwerte, Haar ueber zwei.
+
+pub con WAV_HAAR: int64 := 0;   // = db1, 2 Koeffizienten
+pub con WAV_DB2:  int64 := 1;   // 4
+pub con WAV_DB3:  int64 := 2;   // 6
+pub con WAV_DB4:  int64 := 3;   // 8
+
+pub fn WavFilterLen(kind: int64): int64 {
+  if (kind == WAV_HAAR) { return 2; }
+  if (kind == WAV_DB2)  { return 4; }
+  if (kind == WAV_DB3)  { return 6; }
+  if (kind == WAV_DB4)  { return 8; }
+  return 0;
+}
+
+// Anzahl der verschwindenden Momente
+pub fn WavVanishingMoments(kind: int64): int64 {
+  return WavFilterLen(kind) / 2;
+}
+
+// Tiefpass-Zerlegungsfilter in ein Feld der Laenge WavFilterLen(kind).
+// Normiert auf Summe = sqrt(2) und Quadratsumme = 1 — das macht die
+// Transformation orthogonal, also energieerhaltend.
+pub fn WavFilterLow(kind: int64, out: int64): bool {
+  if (out == 0) { return false; }
+
+  if (kind == WAV_HAAR) {
+    var s: f64 := _one() / SqrtF64(2.0);
+    _put(out, 0, s);
+    _put(out, 1, s);
+    return true;
+  }
+
+  if (kind == WAV_DB2) {
+    _put(out, 0,  0.48296291314469025);
+    _put(out, 1,  0.836516303737469);
+    _put(out, 2,  0.22414386804185735);
+    _put(out, 3, _neg(0.12940952255092145));
+    return true;
+  }
+
+  if (kind == WAV_DB3) {
+    _put(out, 0,  0.3326705529509569);
+    _put(out, 1,  0.8068915093133388);
+    _put(out, 2,  0.4598775021193313);
+    _put(out, 3, _neg(0.13501102001039084));
+    _put(out, 4, _neg(0.08544127388224149));
+    _put(out, 5,  0.035226291882100656);
+    return true;
+  }
+
+  if (kind == WAV_DB4) {
+    _put(out, 0,  0.23037781330885523);
+    _put(out, 1,  0.7148465705525415);
+    _put(out, 2,  0.6308807679295904);
+    _put(out, 3, _neg(0.02798376941698385));
+    _put(out, 4, _neg(0.18703481171888114));
+    _put(out, 5,  0.030841381835986965);
+    _put(out, 6,  0.032883011666982945);
+    _put(out, 7, _neg(0.010597401784997278));
+    return true;
+  }
+  return false;
+}
+
+// Hochpassfilter aus dem Tiefpass: g[k] = (-1)^k * h[L-1-k].
+//
+// Diese Spiegelung (quadrature mirror) ist der Grund, warum die Zerlegung
+// umkehrbar ist: Tief- und Hochpass zerlegen den Frequenzbereich luekenlos und
+// ueberschneidungsfrei. Wer die Koeffizienten von Hand einsetzt, muss beide
+// Vorzeichenmuster zusammen aendern, sonst geht die Rekonstruktion still
+// kaputt.
+pub fn WavFilterHigh(kind: int64, out: int64): bool {
+  var len: int64 := WavFilterLen(kind);
+  if (len == 0) { return false; }
+  if (out == 0) { return false; }
+
+  var lo: int64 := alloc(len * 8);
+  if (lo == 0) { return false; }
+  if (!WavFilterLow(kind, lo)) {
+    free(lo, len * 8);
+    return false;
+  }
+
+  var k: int64 := 0;
+  while (k < len) {
+    var v: f64 := _get(lo, len - 1 - k);
+    if ((k % 2) == 1) { v := _neg(v); }
+    _put(out, k, v);
+    k := k + 1;
+  }
+  free(lo, len * 8);
+  return true;
+}
+
+// ── Eine Stufe ───────────────────────────────────────────────────────────────
+
+// Zerlegt n Werte in n/2 Approximations- und n/2 Detailkoeffizienten.
+// n muss gerade sein. out darf nicht auf a zeigen.
+pub fn WavDwt(a: int64, n: int64, kind: int64, out: int64): bool {
+  if (n < 2) { return false; }
+  if ((n % 2) != 0) { return false; }
+  if (out == a) { return false; }
+
+  var len: int64 := WavFilterLen(kind);
+  if (len == 0) { return false; }
+
+  var lo: int64 := alloc(len * 8);
+  var hi: int64 := alloc(len * 8);
+  if (lo == 0) { return false; }
+  if (hi == 0) { free(lo, len * 8); return false; }
+  WavFilterLow(kind, lo);
+  WavFilterHigh(kind, hi);
+
+  var half: int64 := n / 2;
+  var i: int64 := 0;
+  while (i < half) {
+    var sA: f64 := _zero();
+    var sD: f64 := _zero();
+    var k: int64 := 0;
+    while (k < len) {
+      var idx: int64 := (2 * i + k) % n;
+      var v: f64 := _get(a, idx);
+      sA := sA + _get(lo, k) * v;
+      sD := sD + _get(hi, k) * v;
+      k := k + 1;
+    }
+    _put(out, i, sA);
+    _put(out, half + i, sD);
+    i := i + 1;
+  }
+
+  free(lo, len * 8);
+  free(hi, len * 8);
+  return true;
+}
+
+// Setzt eine Stufe wieder zusammen. coeff traegt [cA | cD], out fasst n Werte.
+pub fn WavIdwt(coeff: int64, n: int64, kind: int64, out: int64): bool {
+  if (n < 2) { return false; }
+  if ((n % 2) != 0) { return false; }
+  if (out == coeff) { return false; }
+
+  var len: int64 := WavFilterLen(kind);
+  if (len == 0) { return false; }
+
+  var lo: int64 := alloc(len * 8);
+  var hi: int64 := alloc(len * 8);
+  if (lo == 0) { return false; }
+  if (hi == 0) { free(lo, len * 8); return false; }
+  WavFilterLow(kind, lo);
+  WavFilterHigh(kind, hi);
+
+  var i: int64 := 0;
+  while (i < n) {
+    _put(out, i, _zero());
+    i := i + 1;
+  }
+
+  // Die Rekonstruktion ist die transponierte Zerlegung: jeder Koeffizient
+  // streut ueber die Filterlaenge zurueck, statt dass jeder Ausgabewert
+  // einsammelt. Beides ergibt dasselbe; das Streuen ist hier kuerzer, weil die
+  // zyklische Umkehrung der Indizes entfaellt.
+  var half: int64 := n / 2;
+  i := 0;
+  while (i < half) {
+    var cA: f64 := _get(coeff, i);
+    var cD: f64 := _get(coeff, half + i);
+    var k: int64 := 0;
+    while (k < len) {
+      var idx: int64 := (2 * i + k) % n;
+      var add: f64 := _get(lo, k) * cA + _get(hi, k) * cD;
+      _put(out, idx, _get(out, idx) + add);
+      k := k + 1;
+    }
+    i := i + 1;
+  }
+
+  free(lo, len * 8);
+  free(hi, len * 8);
+  return true;
+}
+
+// ── Mehrere Stufen ───────────────────────────────────────────────────────────
+
+// Groesste Stufenzahl, die n zulaesst: n muss durch 2^L teilbar bleiben, und
+// der verbleibende Approximationsteil sollte nicht kuerzer als das Filter
+// sein — sonst faltet sich das Filter mehrfach um sich selbst und die
+// Koeffizienten verlieren ihre Bedeutung.
+pub fn WavMaxLevel(n: int64, kind: int64): int64 {
+  var len: int64 := WavFilterLen(kind);
+  if (len == 0) { return 0; }
+
+  var l: int64 := 0;
+  var m: int64 := n;
+  var running: bool := true;
+  while (running) {
+    if ((m % 2) != 0) { running := false; }
+    else {
+      if (m / 2 < len) { running := false; }
+      else {
+        m := m / 2;
+        l := l + 1;
+      }
+    }
+  }
+  return l;
+}
+
+// Laenge des Approximationsteils nach `levels` Stufen
+pub fn WavApproxLen(n: int64, levels: int64): int64 {
+  var m: int64 := n;
+  var i: int64 := 0;
+  while (i < levels) {
+    m := m / 2;
+    i := i + 1;
+  }
+  return m;
+}
+
+// Anfang und Laenge des Detailblocks der Stufe `level` (1 = feinste Stufe)
+// in der Gesamtanordnung. Rueckgabe false bei unzulaessigem level.
+pub fn WavDetailRange(n: int64, levels: int64, level: int64,
+                      outOffset: int64, outLen: int64): bool {
+  if (level < 1) { return false; }
+  if (level > levels) { return false; }
+
+  // Stufe L liegt direkt hinter cA_L, Stufe 1 ganz hinten
+  var lenL: int64 := WavApproxLen(n, level);
+  if (outOffset != 0) { poke64(outOffset, lenL); }
+  if (outLen != 0)    { poke64(outLen, lenL); }
+  return true;
+}
+
+// Mehrstufige Zerlegung. out fasst n Werte und darf nicht auf a zeigen.
+pub fn WavDwtMulti(a: int64, n: int64, kind: int64, levels: int64, out: int64): bool {
+  if (levels < 1) { return false; }
+  if (levels > WavMaxLevel(n, kind)) { return false; }
+  if (out == a) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    _put(out, i, _get(a, i));
+    i := i + 1;
+  }
+
+  var tmp: int64 := alloc(n * 8);
+  if (tmp == 0) { return false; }
+
+  var m: int64 := n;
+  var l: int64 := 0;
+  while (l < levels) {
+    if (!WavDwt(out, m, kind, tmp)) {
+      free(tmp, n * 8);
+      return false;
+    }
+    // nur den vorderen Teil zurueckschreiben: alles dahinter sind Details
+    // frueherer Stufen und bleibt unangetastet
+    i := 0;
+    while (i < m) {
+      _put(out, i, _get(tmp, i));
+      i := i + 1;
+    }
+    m := m / 2;
+    l := l + 1;
+  }
+
+  free(tmp, n * 8);
+  return true;
+}
+
+// Mehrstufige Rekonstruktion, Umkehrung von WavDwtMulti.
+pub fn WavIdwtMulti(coeff: int64, n: int64, kind: int64, levels: int64, out: int64): bool {
+  if (levels < 1) { return false; }
+  if (out == coeff) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    _put(out, i, _get(coeff, i));
+    i := i + 1;
+  }
+
+  var tmp: int64 := alloc(n * 8);
+  if (tmp == 0) { return false; }
+
+  // von der groebsten Stufe nach aussen
+  var m: int64 := WavApproxLen(n, levels) * 2;
+  var l: int64 := 0;
+  while (l < levels) {
+    if (!WavIdwt(out, m, kind, tmp)) {
+      free(tmp, n * 8);
+      return false;
+    }
+    i := 0;
+    while (i < m) {
+      _put(out, i, _get(tmp, i));
+      i := i + 1;
+    }
+    m := m * 2;
+    l := l + 1;
+  }
+
+  free(tmp, n * 8);
+  return true;
+}
+
+// ── 2D ───────────────────────────────────────────────────────────────────────
+
+// Eine Stufe auf einem Bild: erst alle Zeilen, dann alle Spalten. Das Ergebnis
+// zerfaellt in vier Viertel — links oben die Approximation, rechts oben die
+// senkrechten Kanten, links unten die waagerechten, rechts unten die
+// diagonalen.
+//
+// Nur das linke obere Viertel wird in der naechsten Stufe weiter zerlegt
+// (Mallat-Anordnung). w und h muessen durch 2^levels teilbar sein.
+pub fn WavDwt2D(img: int64, w: int64, h: int64, kind: int64,
+                levels: int64, out: int64): bool {
+  if (w < 2) { return false; }
+  if (h < 2) { return false; }
+  if (levels < 1) { return false; }
+  if (out == img) { return false; }
+
+  var i: int64 := 0;
+  var cnt: int64 := w * h;
+  while (i < cnt) {
+    _put(out, i, _get(img, i));
+    i := i + 1;
+  }
+
+  var maxDim: int64 := w;
+  if (h > maxDim) { maxDim := h; }
+  var line: int64 := alloc(maxDim * 8);
+  var res: int64 := alloc(maxDim * 8);
+  if (line == 0) { return false; }
+  if (res == 0) { free(line, maxDim * 8); return false; }
+
+  var cw: int64 := w;
+  var ch: int64 := h;
+  var l: int64 := 0;
+  var ok: bool := true;
+
+  while (l < levels) {
+    if ((cw % 2) != 0) { ok := false; l := levels; }
+    if ((ch % 2) != 0) { ok := false; l := levels; }
+
+    if (ok) {
+      // Zeilen
+      var y: int64 := 0;
+      while (y < ch) {
+        var x: int64 := 0;
+        while (x < cw) {
+          _put(line, x, _get(out, y * w + x));
+          x := x + 1;
+        }
+        WavDwt(line, cw, kind, res);
+        x := 0;
+        while (x < cw) {
+          _put(out, y * w + x, _get(res, x));
+          x := x + 1;
+        }
+        y := y + 1;
+      }
+
+      // Spalten
+      var x2: int64 := 0;
+      while (x2 < cw) {
+        var y2: int64 := 0;
+        while (y2 < ch) {
+          _put(line, y2, _get(out, y2 * w + x2));
+          y2 := y2 + 1;
+        }
+        WavDwt(line, ch, kind, res);
+        y2 := 0;
+        while (y2 < ch) {
+          _put(out, y2 * w + x2, _get(res, y2));
+          y2 := y2 + 1;
+        }
+        x2 := x2 + 1;
+      }
+
+      cw := cw / 2;
+      ch := ch / 2;
+      l := l + 1;
+    }
+  }
+
+  free(line, maxDim * 8);
+  free(res, maxDim * 8);
+  return ok;
+}
+
+// Umkehrung von WavDwt2D.
+pub fn WavIdwt2D(coeff: int64, w: int64, h: int64, kind: int64,
+                 levels: int64, out: int64): bool {
+  if (levels < 1) { return false; }
+  if (out == coeff) { return false; }
+
+  var i: int64 := 0;
+  var cnt: int64 := w * h;
+  while (i < cnt) {
+    _put(out, i, _get(coeff, i));
+    i := i + 1;
+  }
+
+  var maxDim: int64 := w;
+  if (h > maxDim) { maxDim := h; }
+  var line: int64 := alloc(maxDim * 8);
+  var res: int64 := alloc(maxDim * 8);
+  if (line == 0) { return false; }
+  if (res == 0) { free(line, maxDim * 8); return false; }
+
+  // Groesse der groebsten Stufe bestimmen
+  var cw: int64 := w;
+  var ch: int64 := h;
+  var l: int64 := 0;
+  while (l < levels) {
+    cw := cw / 2;
+    ch := ch / 2;
+    l := l + 1;
+  }
+
+  l := 0;
+  while (l < levels) {
+    cw := cw * 2;
+    ch := ch * 2;
+
+    // Spalten zuerst — genau umgekehrt zur Zerlegung
+    var x: int64 := 0;
+    while (x < cw) {
+      var y: int64 := 0;
+      while (y < ch) {
+        _put(line, y, _get(out, y * w + x));
+        y := y + 1;
+      }
+      WavIdwt(line, ch, kind, res);
+      y := 0;
+      while (y < ch) {
+        _put(out, y * w + x, _get(res, y));
+        y := y + 1;
+      }
+      x := x + 1;
+    }
+
+    var y2: int64 := 0;
+    while (y2 < ch) {
+      var x2: int64 := 0;
+      while (x2 < cw) {
+        _put(line, x2, _get(out, y2 * w + x2));
+        x2 := x2 + 1;
+      }
+      WavIdwt(line, cw, kind, res);
+      x2 := 0;
+      while (x2 < cw) {
+        _put(out, y2 * w + x2, _get(res, x2));
+        x2 := x2 + 1;
+      }
+      y2 := y2 + 1;
+    }
+    l := l + 1;
+  }
+
+  free(line, maxDim * 8);
+  free(res, maxDim * 8);
+  return true;
+}
+
+// ── Schwellenwerte und Entrauschen ───────────────────────────────────────────
+
+// Harte Schwelle: alles unter t wird null, der Rest bleibt unveraendert.
+// Erhaelt die Amplituden, hat aber eine Sprungstelle bei t — im Ergebnis
+// zeigt sich das als Klingeln um Kanten.
+pub fn WavThresholdHard(c: int64, n: int64, t: f64): void {
+  var i: int64 := 0;
+  while (i < n) {
+    var v: f64 := _get(c, i);
+    if (AbsF64(v) < t) { _put(c, i, _zero()); }
+    i := i + 1;
+  }
+}
+
+// Weiche Schwelle: alles unter t wird null, der Rest um t zur Null hin
+// gezogen. Stetig, deshalb glatter im Ergebnis — dafuer werden auch die
+// grossen Koeffizienten kleiner, das Signal wird leicht gedaempft.
+pub fn WavThresholdSoft(c: int64, n: int64, t: f64): void {
+  var i: int64 := 0;
+  while (i < n) {
+    var v: f64 := _get(c, i);
+    var av: f64 := AbsF64(v);
+    if (av < t) { _put(c, i, _zero()); }
+    else {
+      var shrunk: f64 := av - t;
+      if (v < _zero()) { shrunk := _neg(shrunk); }
+      _put(c, i, shrunk);
+    }
+    i := i + 1;
+  }
+}
+
+// Median der Betraege — Baustein der Rauschschaetzung. Arbeitet auf einer
+// Kopie, die Eingabe bleibt unberuehrt.
+fn _medianAbs(c: int64, n: int64): f64 {
+  if (n < 1) { return _zero(); }
+
+  var t: int64 := alloc(n * 8);
+  if (t == 0) { return _zero(); }
+  var i: int64 := 0;
+  while (i < n) {
+    _put(t, i, AbsF64(_get(c, i)));
+    i := i + 1;
+  }
+
+  // Einfuegesortieren: n ist hier die Laenge der feinsten Detailstufe, also
+  // die Haelfte des Signals. Fuer die Rauschschaetzung wird das einmal
+  // gebraucht, nicht in einer Schleife.
+  i := 1;
+  while (i < n) {
+    var key: f64 := _get(t, i);
+    var j: int64 := i - 1;
+    var placed: bool := false;
+    while (!placed) {
+      if (j < 0) { placed := true; }
+      else {
+        var vj: f64 := _get(t, j);
+        if (vj > key) {
+          _put(t, j + 1, vj);
+          j := j - 1;
+        }
+        else { placed := true; }
+      }
+    }
+    _put(t, j + 1, key);
+    i := i + 1;
+  }
+
+  var m: f64 := _zero();
+  if ((n % 2) == 1) { m := _get(t, n / 2); }
+  else {
+    var a: f64 := _get(t, n / 2 - 1);
+    var b: f64 := _get(t, n / 2);
+    m := (a + b) / 2.0;
+  }
+  free(t, n * 8);
+  return m;
+}
+
+// Rauschschaetzung nach Donoho: sigma = median(|cD_1|) / 0.6745.
+//
+// Genommen wird die FEINSTE Detailstufe, weil dort fast nur Rauschen sitzt —
+// echtes Signal ist auf dieser Skala selten. Der Median statt des Mittelwerts,
+// weil einzelne echte Kanten sonst die Schaetzung nach oben ziehen; 0.6745 ist
+// der Median der Standardnormalverteilung im Betrag und rechnet den Median in
+// eine Standardabweichung um.
+pub fn WavEstimateSigma(coeff: int64, n: int64, levels: int64): f64 {
+  var finestLen: int64 := n / 2;
+  if (finestLen < 1) { return _zero(); }
+  var med: f64 := _medianAbs(coeff + finestLen * 8, finestLen);
+  return med / 0.6745;
+}
+
+// Universelle Schwelle nach Donoho und Johnstone: sigma * sqrt(2*ln n).
+//
+// Sie ist so gewaehlt, dass reines Rauschen mit hoher Wahrscheinlichkeit
+// vollstaendig verschwindet. Das macht sie eher zu streng: schwache echte
+// Anteile fallen mit weg. Wer Details behalten will, nimmt einen Bruchteil
+// davon.
+pub fn WavUniversalThreshold(sigma: f64, n: int64): f64 {
+  if (n < 2) { return _zero(); }
+  return sigma * SqrtF64(2.0 * LogF64(n as f64));
+}
+
+// Entrauschen in einem Zug: zerlegen, Detailkoeffizienten schwellen,
+// zurueckbauen. soft = true fuer die weiche Schwelle.
+//
+// Die Approximationskoeffizienten bleiben unangetastet — dort steckt der
+// Signalverlauf, und ihn zu schwellen wuerde das Signal beschaedigen statt es
+// zu reinigen.
+pub fn WavDenoise(a: int64, n: int64, kind: int64, levels: int64,
+                  soft: bool, out: int64): bool {
+  if (out == a) { return false; }
+  if (levels < 1) { return false; }
+  if (levels > WavMaxLevel(n, kind)) { return false; }
+
+  var c: int64 := alloc(n * 8);
+  if (c == 0) { return false; }
+
+  if (!WavDwtMulti(a, n, kind, levels, c)) {
+    free(c, n * 8);
+    return false;
+  }
+
+  var sigma: f64 := WavEstimateSigma(c, n, levels);
+  var t: f64 := WavUniversalThreshold(sigma, n);
+
+  var approxLen: int64 := WavApproxLen(n, levels);
+  var detailStart: int64 := approxLen;
+  var detailCount: int64 := n - approxLen;
+
+  if (soft) { WavThresholdSoft(c + detailStart * 8, detailCount, t); }
+  else      { WavThresholdHard(c + detailStart * 8, detailCount, t); }
+
+  var ok: bool := WavIdwtMulti(c, n, kind, levels, out);
+  free(c, n * 8);
+  return ok;
+}
+
+// ── Kennzahlen ───────────────────────────────────────────────────────────────
+
+// Energie (Summe der Quadrate). Bei orthogonalen Wavelets ist sie vor und nach
+// der Transformation gleich — die Wavelet-Fassung des Satzes von Parseval, und
+// zugleich der schaerfste Selbsttest einer Zerlegung.
+pub fn WavEnergy(c: int64, n: int64): f64 {
+  var s: f64 := _zero();
+  var i: int64 := 0;
+  while (i < n) {
+    var v: f64 := _get(c, i);
+    s := s + v * v;
+    i := i + 1;
+  }
+  return s;
+}
+
+// Anteil der Energie, der in den groessten k Koeffizienten steckt — ein Mass
+// dafuer, wie gut sich das Signal komprimieren laesst. Ein glattes Signal
+// buendelt seine Energie in wenigen Koeffizienten, Rauschen verteilt sie
+// gleichmaessig.
+pub fn WavEnergyRatio(c: int64, n: int64, k: int64): f64 {
+  if (n < 1) { return _zero(); }
+  if (k < 1) { return _zero(); }
+
+  var total: f64 := WavEnergy(c, n);
+  if (total < _eps()) { return _zero(); }
+
+  var t: int64 := alloc(n * 8);
+  if (t == 0) { return _zero(); }
+  var i: int64 := 0;
+  while (i < n) {
+    var v: f64 := _get(c, i);
+    _put(t, i, v * v);
+    i := i + 1;
+  }
+
+  // absteigend einfuegesortieren
+  i := 1;
+  while (i < n) {
+    var key: f64 := _get(t, i);
+    var j: int64 := i - 1;
+    var placed: bool := false;
+    while (!placed) {
+      if (j < 0) { placed := true; }
+      else {
+        var vj: f64 := _get(t, j);
+        if (vj < key) {
+          _put(t, j + 1, vj);
+          j := j - 1;
+        }
+        else { placed := true; }
+      }
+    }
+    _put(t, j + 1, key);
+    i := i + 1;
+  }
+
+  var kk: int64 := k;
+  if (kk > n) { kk := n; }
+  var sum: f64 := _zero();
+  i := 0;
+  while (i < kk) {
+    sum := sum + _get(t, i);
+    i := i + 1;
+  }
+  free(t, n * 8);
+  return sum / total;
+}

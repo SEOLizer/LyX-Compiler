@@ -1,0 +1,744 @@
+// std/grid.lyx
+// Gitter: Nachbarschaften, Rasterlinien, Flutfuellung, Dijkstra, A*
+
+@description("Grid algorithms: 4/8 neighbourhoods, Bresenham lines and line of sight, BFS distance maps, flood fill, Dijkstra and A* pathfinding with admissible heuristics")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.grid;
+
+import std.math;
+import std.alloc;
+
+// ── Darstellung ──────────────────────────────────────────────────────────────
+//
+// Ein Gitter ist ein int64-Feld mit w*h Zellen, zeilenweise: Zelle (x,y) liegt
+// bei y*w + x. Der Wert einer Zelle sind ihre BETRETUNGSKOSTEN:
+//
+//     > 0   begehbar, mit diesen Kosten (1 = normal, 5 = Sumpf, ...)
+//    <= 0   blockiert
+//
+// Kosten statt eines blossen Ja/Nein, weil Dijkstra und A* ohnehin damit
+// rechnen — und weil ein Gitter aus lauter Einsen genau der einfache Fall ist.
+//
+// ── Bewegung: vier oder acht Richtungen ──────────────────────────────────────
+//
+// Fast jede Funktion hier nimmt ein Flag `diag`. Der Unterschied ist nicht
+// bloss die Zahl der Nachbarn, er entscheidet auch darueber, welche Heuristik
+// zulaessig ist — siehe unten. Diagonale Schritte kosten das Wurzel-Zwei-fache
+// eines geraden; alles andere ergaebe Wege, die diagonal billiger sind als
+// gerade, und laesst Pfade zickzack laufen.
+//
+// ── Zulaessigkeit der Heuristik ──────────────────────────────────────────────
+//
+// A* findet den kuerzesten Weg nur, wenn die Heuristik den Restweg NIE
+// ueberschaetzt. Genau hier liegt der haeufigste Fehler:
+//
+//   4 Richtungen  ->  Manhattan ist richtig.
+//   8 Richtungen  ->  Manhattan UEBERSCHAETZT. Fuer den Schritt von (0,0) nach
+//                     (1,1) liefert es 2, tatsaechlich kostet er 1.414. A*
+//                     liefert dann Pfade, die kuerzer aussehen, als sie sind,
+//                     und bricht die Suche zu frueh ab.
+//                     Richtig ist die Oktil-Distanz.
+//
+// GridHeuristic() waehlt anhand von `diag` die passende — wer selbst eine
+// einsetzt, muss das im Blick behalten.
+
+pub con GRID_BLOCKED: int64 := 0;
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+fn _sqrt2(): f64 { return 1.4142135623730951; }
+
+fn _gf(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn _pf(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+// ── Koordinaten ──────────────────────────────────────────────────────────────
+
+pub fn GridIndex(x: int64, y: int64, w: int64): int64 {
+  return y * w + x;
+}
+
+pub fn GridX(idx: int64, w: int64): int64 {
+  return idx % w;
+}
+
+pub fn GridY(idx: int64, w: int64): int64 {
+  return idx / w;
+}
+
+pub fn GridInBounds(x: int64, y: int64, w: int64, h: int64): bool {
+  if (x < 0) { return false; }
+  if (y < 0) { return false; }
+  if (x >= w) { return false; }
+  if (y >= h) { return false; }
+  return true;
+}
+
+pub fn GridCost(cells: int64, x: int64, y: int64, w: int64, h: int64): int64 {
+  if (!GridInBounds(x, y, w, h)) { return GRID_BLOCKED; }
+  return peek64(cells + (y * w + x) * 8);
+}
+
+pub fn GridWalkable(cells: int64, x: int64, y: int64, w: int64, h: int64): bool {
+  return GridCost(cells, x, y, w, h) > 0;
+}
+
+pub fn GridSet(cells: int64, x: int64, y: int64, w: int64, cost: int64): void {
+  poke64(cells + (y * w + x) * 8, cost);
+}
+
+pub fn GridFill(cells: int64, w: int64, h: int64, cost: int64): void {
+  var i: int64 := 0;
+  var n: int64 := w * h;
+  while (i < n) {
+    poke64(cells + i * 8, cost);
+    i := i + 1;
+  }
+}
+
+// ── Abstaende auf dem Gitter ─────────────────────────────────────────────────
+//
+// Ganzzahlig gerechnet, anders als die Fassungen in std.dist: Gitterkoordinaten
+// sind ganze Zahlen, und ein Umweg ueber f64 wuerde nur runden.
+
+// Zahl der Schritte bei Bewegung in vier Richtungen.
+pub fn GridManhattan(x1: int64, y1: int64, x2: int64, y2: int64): int64 {
+  var dx: int64 := x1 - x2;
+  var dy: int64 := y1 - y2;
+  if (dx < 0) { dx := 0 - dx; }
+  if (dy < 0) { dy := 0 - dy; }
+  return dx + dy;
+}
+
+// Zahl der Schritte bei Bewegung in acht Richtungen, wenn diagonal genauso
+// viel kostet wie gerade (Koenigszuege).
+pub fn GridChebyshev(x1: int64, y1: int64, x2: int64, y2: int64): int64 {
+  var dx: int64 := x1 - x2;
+  var dy: int64 := y1 - y2;
+  if (dx < 0) { dx := 0 - dx; }
+  if (dy < 0) { dy := 0 - dy; }
+  if (dx > dy) { return dx; }
+  return dy;
+}
+
+// Oktil-Distanz: acht Richtungen mit diagonalem Schritt zum Preis von
+// Wurzel Zwei. Die Formel geht so viele Schritte diagonal wie moeglich und den
+// Rest gerade:
+//
+//     min(dx,dy) * sqrt(2) + (max(dx,dy) - min(dx,dy))
+//
+// Das ist die Laenge des kuerzesten Weges auf leerem Gitter — und damit die
+// schaerfste zulaessige Heuristik fuer A* mit acht Richtungen.
+pub fn GridOctile(x1: int64, y1: int64, x2: int64, y2: int64): f64 {
+  var dx: int64 := x1 - x2;
+  var dy: int64 := y1 - y2;
+  if (dx < 0) { dx := 0 - dx; }
+  if (dy < 0) { dy := 0 - dy; }
+
+  var lo: int64 := dx;
+  var hi: int64 := dy;
+  if (dy < dx) {
+    lo := dy;
+    hi := dx;
+  }
+  return (lo as f64) * _sqrt2() + ((hi - lo) as f64);
+}
+
+// Die zur Bewegungsart passende Heuristik. Wer sie selbst waehlt, sollte
+// wissen, warum — bei acht Richtungen ist Manhattan nicht zulaessig.
+pub fn GridHeuristic(x1: int64, y1: int64, x2: int64, y2: int64, diag: bool): f64 {
+  if (diag) { return GridOctile(x1, y1, x2, y2); }
+  return GridManhattan(x1, y1, x2, y2) as f64;
+}
+
+// ── Nachbarschaft ────────────────────────────────────────────────────────────
+
+// Begehbare Nachbarn von (x,y) in outX/outY (je bis zu 8 Werte); Rueckgabe ist
+// ihre Anzahl.
+//
+// Diagonale Schritte sind nur erlaubt, wenn BEIDE angrenzenden geraden Felder
+// frei sind. Sonst schneidet der Weg durch Mauerecken hindurch — auf einem
+// Lageplan sieht das aus wie ein Pfad durch eine geschlossene Tuer.
+pub fn GridNeighbors(cells: int64, x: int64, y: int64, w: int64, h: int64,
+                     diag: bool, outX: int64, outY: int64): int64 {
+  var n: int64 := 0;
+
+  var dxs: int64 := alloc(4 * 8);
+  var dys: int64 := alloc(4 * 8);
+  poke64(dxs, 1);      poke64(dys, 0);
+  poke64(dxs + 8, 0);  poke64(dys + 8, 1);
+  poke64(dxs + 16, 0 - 1);  poke64(dys + 16, 0);
+  poke64(dxs + 24, 0);      poke64(dys + 24, 0 - 1);
+
+  var i: int64 := 0;
+  while (i < 4) {
+    var nx: int64 := x + peek64(dxs + i * 8);
+    var ny: int64 := y + peek64(dys + i * 8);
+    if (GridWalkable(cells, nx, ny, w, h)) {
+      poke64(outX + n * 8, nx);
+      poke64(outY + n * 8, ny);
+      n := n + 1;
+    }
+    i := i + 1;
+  }
+  free(dxs, 4 * 8);
+  free(dys, 4 * 8);
+
+  if (diag) {
+    var ddx: int64 := alloc(4 * 8);
+    var ddy: int64 := alloc(4 * 8);
+    poke64(ddx, 1);       poke64(ddy, 1);
+    poke64(ddx + 8, 1);   poke64(ddy + 8, 0 - 1);
+    poke64(ddx + 16, 0 - 1);  poke64(ddy + 16, 1);
+    poke64(ddx + 24, 0 - 1);  poke64(ddy + 24, 0 - 1);
+
+    i := 0;
+    while (i < 4) {
+      var dx: int64 := peek64(ddx + i * 8);
+      var dy: int64 := peek64(ddy + i * 8);
+      var nx: int64 := x + dx;
+      var ny: int64 := y + dy;
+      if (GridWalkable(cells, nx, ny, w, h)) {
+        // beide Nachbarn der Ecke muessen frei sein
+        if (GridWalkable(cells, x + dx, y, w, h)) {
+          if (GridWalkable(cells, x, y + dy, w, h)) {
+            poke64(outX + n * 8, nx);
+            poke64(outY + n * 8, ny);
+            n := n + 1;
+          }
+        }
+      }
+      i := i + 1;
+    }
+    free(ddx, 4 * 8);
+    free(ddy, 4 * 8);
+  }
+  return n;
+}
+
+// ── Rasterlinien ─────────────────────────────────────────────────────────────
+
+// Bresenham: die Zellen, die eine gerade Linie von (x0,y0) nach (x1,y1)
+// beruehrt, in outX/outY. Rueckgabe ist ihre Anzahl — oder -1, wenn maxLen
+// nicht reicht. Eine abgeschnittene Linie waere schlimmer als ein Fehler: sie
+// sieht aus wie eine Linie, endet aber irgendwo im Nichts.
+//
+// Ohne Division und ohne Fliesskomma — der Fehlerterm wird ganzzahlig
+// mitgefuehrt. Das ist der Grund, warum der Algorithmus seit 1962 in jedem
+// Rasterzeichner steckt: er ist exakt und braucht pro Punkt zwei Additionen.
+pub fn GridLine(x0: int64, y0: int64, x1: int64, y1: int64,
+                outX: int64, outY: int64, maxLen: int64): int64 {
+  var dx: int64 := x1 - x0;
+  if (dx < 0) { dx := 0 - dx; }
+  var dy: int64 := y1 - y0;
+  if (dy < 0) { dy := 0 - dy; }
+
+  var sx: int64 := 1;
+  if (x0 > x1) { sx := 0 - 1; }
+  var sy: int64 := 1;
+  if (y0 > y1) { sy := 0 - 1; }
+
+  var err: int64 := dx - dy;
+  var cx: int64 := x0;
+  var cy: int64 := y0;
+  var n: int64 := 0;
+  var running: bool := true;
+  var over: bool := false;
+
+  while (running) {
+    if (n >= maxLen) { running := false; over := true; }
+    else {
+      poke64(outX + n * 8, cx);
+      poke64(outY + n * 8, cy);
+      n := n + 1;
+
+      if (cx == x1) {
+        if (cy == y1) { running := false; }
+      }
+
+      if (running) {
+        var e2: int64 := 2 * err;
+        if (e2 > 0 - dy) {
+          err := err - dy;
+          cx := cx + sx;
+        }
+        if (e2 < dx) {
+          err := err + dx;
+          cy := cy + sy;
+        }
+      }
+    }
+  }
+  if (over) { return 0 - 1; }
+  return n;
+}
+
+// Sichtlinie: ist der Weg zwischen zwei Zellen frei? Der Startpunkt zaehlt
+// nicht mit — sonst waere von einer blockierten Zelle aus nie etwas sichtbar.
+pub fn GridLineOfSight(cells: int64, x0: int64, y0: int64, x1: int64, y1: int64,
+                       w: int64, h: int64): bool {
+  var maxLen: int64 := w + h + 2;
+  var px: int64 := alloc(maxLen * 8);
+  var py: int64 := alloc(maxLen * 8);
+  if (px == 0) { return false; }
+  if (py == 0) { return false; }
+
+  var n: int64 := GridLine(x0, y0, x1, y1, px, py, maxLen);
+  // maxLen ist mit w+h+2 immer gross genug; der Zweig steht fuer den Fall,
+  // dass jemand die Schranke spaeter aendert.
+  var ok: bool := n >= 0;
+  var i: int64 := 1;
+  while (i < n) {
+    if (!GridWalkable(cells, peek64(px + i * 8), peek64(py + i * 8), w, h)) {
+      ok := false;
+      i := n;
+    }
+    else { i := i + 1; }
+  }
+
+  free(px, maxLen * 8);
+  free(py, maxLen * 8);
+  return ok;
+}
+
+// ── Breitensuche ─────────────────────────────────────────────────────────────
+
+// Abstandskarte in SCHRITTEN vom Startpunkt aus; out fasst w*h Werte,
+// unerreichbare Zellen bekommen -1.
+//
+// Breitensuche, nicht Dijkstra: sie zaehlt Schritte und ignoriert die
+// Zellkosten. Solange alle begehbaren Zellen gleich teuer sind, ist sie das
+// richtige Werkzeug — sie braucht keinen Haufen und ist deshalb deutlich
+// schneller.
+pub fn GridBfs(cells: int64, w: int64, h: int64, sx: int64, sy: int64,
+               diag: bool, out: int64): bool {
+  if (w < 1) { return false; }
+  if (h < 1) { return false; }
+  if (!GridInBounds(sx, sy, w, h)) { return false; }
+
+  var n: int64 := w * h;
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(out + i * 8, 0 - 1);
+    i := i + 1;
+  }
+  if (!GridWalkable(cells, sx, sy, w, h)) { return false; }
+
+  var queue: int64 := alloc(n * 8);
+  if (queue == 0) { return false; }
+  var head: int64 := 0;
+  var tail: int64 := 0;
+
+  poke64(queue + tail * 8, GridIndex(sx, sy, w));
+  tail := tail + 1;
+  poke64(out + GridIndex(sx, sy, w) * 8, 0);
+
+  var nx: int64 := alloc(8 * 8);
+  var ny: int64 := alloc(8 * 8);
+
+  while (head < tail) {
+    var cur: int64 := peek64(queue + head * 8);
+    head := head + 1;
+    var cx: int64 := GridX(cur, w);
+    var cy: int64 := GridY(cur, w);
+    var d: int64 := peek64(out + cur * 8);
+
+    var cnt: int64 := GridNeighbors(cells, cx, cy, w, h, diag, nx, ny);
+    var k: int64 := 0;
+    while (k < cnt) {
+      var idx: int64 := GridIndex(peek64(nx + k * 8), peek64(ny + k * 8), w);
+      if (peek64(out + idx * 8) < 0) {
+        poke64(out + idx * 8, d + 1);
+        poke64(queue + tail * 8, idx);
+        tail := tail + 1;
+      }
+      k := k + 1;
+    }
+  }
+
+  free(queue, n * 8);
+  free(nx, 8 * 8);
+  free(ny, 8 * 8);
+  return true;
+}
+
+// Zahl der von (sx,sy) aus erreichbaren Zellen, den Startpunkt eingeschlossen.
+pub fn GridFloodCount(cells: int64, w: int64, h: int64, sx: int64, sy: int64,
+                      diag: bool): int64 {
+  var n: int64 := w * h;
+  var d: int64 := alloc(n * 8);
+  if (d == 0) { return 0; }
+
+  var c: int64 := 0;
+  if (GridBfs(cells, w, h, sx, sy, diag, d)) {
+    var i: int64 := 0;
+    while (i < n) {
+      if (peek64(d + i * 8) >= 0) { c := c + 1; }
+      i := i + 1;
+    }
+  }
+  free(d, n * 8);
+  return c;
+}
+
+pub fn GridReachable(cells: int64, w: int64, h: int64,
+                     sx: int64, sy: int64, gx: int64, gy: int64,
+                     diag: bool): bool {
+  if (!GridInBounds(gx, gy, w, h)) { return false; }
+
+  var n: int64 := w * h;
+  var d: int64 := alloc(n * 8);
+  if (d == 0) { return false; }
+
+  var ok: bool := false;
+  if (GridBfs(cells, w, h, sx, sy, diag, d)) {
+    ok := peek64(d + GridIndex(gx, gy, w) * 8) >= 0;
+  }
+  free(d, n * 8);
+  return ok;
+}
+
+// ── Haufen fuer Dijkstra und A* ──────────────────────────────────────────────
+//
+// Binaerer Minimum-Haufen ueber zwei gleich lange Felder: Prioritaet (f64) und
+// Knoten (int64). Kein Struct, weil ein Feld aus Structs in lyxc 1.0.19D still
+// 0 liefert (#1109).
+//
+// Bereits besuchte Knoten werden NICHT aus dem Haufen entfernt, sondern beim
+// Herausnehmen uebersprungen ("lazy deletion"). Ein Knoten kann deshalb
+// mehrfach im Haufen liegen; das kostet Speicher und spart die Suche nach dem
+// alten Eintrag, die ohne Rueckverweise linear waere.
+
+fn _heapPush(prio: int64, node: int64, sizePtr: int64, p: f64, v: int64): void {
+  var n: int64 := peek64(sizePtr);
+  _pf(prio, n, p);
+  poke64(node + n * 8, v);
+  poke64(sizePtr, n + 1);
+
+  var i: int64 := n;
+  var running: bool := true;
+  while (running) {
+    if (i == 0) { running := false; }
+    else {
+      var parent: int64 := (i - 1) / 2;
+      if (_gf(prio, parent) <= _gf(prio, i)) { running := false; }
+      else {
+        var tp: f64 := _gf(prio, parent);
+        _pf(prio, parent, _gf(prio, i));
+        _pf(prio, i, tp);
+        var tn: int64 := peek64(node + parent * 8);
+        poke64(node + parent * 8, peek64(node + i * 8));
+        poke64(node + i * 8, tn);
+        i := parent;
+      }
+    }
+  }
+}
+
+fn _heapPop(prio: int64, node: int64, sizePtr: int64): int64 {
+  var n: int64 := peek64(sizePtr);
+  if (n < 1) { return 0 - 1; }
+
+  var top: int64 := peek64(node);
+  n := n - 1;
+  _pf(prio, 0, _gf(prio, n));
+  poke64(node, peek64(node + n * 8));
+  poke64(sizePtr, n);
+
+  var i: int64 := 0;
+  var running: bool := true;
+  while (running) {
+    var l: int64 := 2 * i + 1;
+    var r: int64 := 2 * i + 2;
+    var small: int64 := i;
+    if (l < n) {
+      if (_gf(prio, l) < _gf(prio, small)) { small := l; }
+    }
+    if (r < n) {
+      if (_gf(prio, r) < _gf(prio, small)) { small := r; }
+    }
+    if (small == i) { running := false; }
+    else {
+      var tp: f64 := _gf(prio, small);
+      _pf(prio, small, _gf(prio, i));
+      _pf(prio, i, tp);
+      var tn: int64 := peek64(node + small * 8);
+      poke64(node + small * 8, peek64(node + i * 8));
+      poke64(node + i * 8, tn);
+      i := small;
+    }
+  }
+  return top;
+}
+
+// ── Dijkstra ─────────────────────────────────────────────────────────────────
+
+// Kuerzeste Wege vom Startpunkt zu ALLEN erreichbaren Zellen, unter
+// Beruecksichtigung der Zellkosten.
+//
+// outDist (f64, w*h) nimmt die Wegkosten auf, unerreichbar ist -1.
+// outPrev (int64, w*h) den jeweiligen Vorgaengerknoten fuer die
+// Pfadrekonstruktion, -1 wo es keinen gibt. Beide duerfen 0 sein.
+//
+// Die Kosten einer Zelle fallen beim BETRETEN an, die Startzelle ist frei.
+pub fn GridDijkstra(cells: int64, w: int64, h: int64, sx: int64, sy: int64,
+                    diag: bool, outDist: int64, outPrev: int64): bool {
+  if (w < 1) { return false; }
+  if (h < 1) { return false; }
+  if (!GridInBounds(sx, sy, w, h)) { return false; }
+  if (!GridWalkable(cells, sx, sy, w, h)) { return false; }
+
+  var n: int64 := w * h;
+  var dist: int64 := alloc(n * 8);
+  var prev: int64 := alloc(n * 8);
+  var done: int64 := alloc(n * 8);
+  if (dist == 0) { return false; }
+  if (prev == 0) { return false; }
+  if (done == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    _pf(dist, i, _neg(_one()));
+    poke64(prev + i * 8, 0 - 1);
+    poke64(done + i * 8, 0);
+    i := i + 1;
+  }
+
+  // Der Haufen kann mehr Eintraege als Knoten aufnehmen, weil veraltete
+  // liegen bleiben; acht Nachbarn je Knoten sind die obere Schranke.
+  var cap: int64 := n * 8 + 16;
+  var hp: int64 := alloc(cap * 8);
+  var hn: int64 := alloc(cap * 8);
+  var hs: int64 := alloc(8);
+  if (hp == 0) { return false; }
+  if (hn == 0) { return false; }
+  if (hs == 0) { return false; }
+  poke64(hs, 0);
+
+  var start: int64 := GridIndex(sx, sy, w);
+  _pf(dist, start, _zero());
+  _heapPush(hp, hn, hs, _zero(), start);
+
+  var nx: int64 := alloc(8 * 8);
+  var ny: int64 := alloc(8 * 8);
+
+  while (peek64(hs) > 0) {
+    var cur: int64 := _heapPop(hp, hn, hs);
+    if (peek64(done + cur * 8) == 0) {
+      poke64(done + cur * 8, 1);
+
+      var cx: int64 := GridX(cur, w);
+      var cy: int64 := GridY(cur, w);
+      var d: f64 := _gf(dist, cur);
+
+      var cnt: int64 := GridNeighbors(cells, cx, cy, w, h, diag, nx, ny);
+      var k: int64 := 0;
+      while (k < cnt) {
+        var tx: int64 := peek64(nx + k * 8);
+        var ty: int64 := peek64(ny + k * 8);
+        var idx: int64 := GridIndex(tx, ty, w);
+
+        if (peek64(done + idx * 8) == 0) {
+          var step: f64 := GridCost(cells, tx, ty, w, h) as f64;
+          // diagonale Schritte kosten das Wurzel-Zwei-fache
+          if (tx != cx) {
+            if (ty != cy) { step := step * _sqrt2(); }
+          }
+          var nd: f64 := d + step;
+          var old: f64 := _gf(dist, idx);
+          var better: bool := old < _zero();
+          if (!better) { better := nd < old; }
+          if (better) {
+            _pf(dist, idx, nd);
+            poke64(prev + idx * 8, cur);
+            _heapPush(hp, hn, hs, nd, idx);
+          }
+        }
+        k := k + 1;
+      }
+    }
+  }
+
+  if (outDist != 0) {
+    i := 0;
+    while (i < n) {
+      _pf(outDist, i, _gf(dist, i));
+      i := i + 1;
+    }
+  }
+  if (outPrev != 0) {
+    i := 0;
+    while (i < n) {
+      poke64(outPrev + i * 8, peek64(prev + i * 8));
+      i := i + 1;
+    }
+  }
+
+  free(dist, n * 8);  free(prev, n * 8);  free(done, n * 8);
+  free(hp, cap * 8);  free(hn, cap * 8);  free(hs, 8);
+  free(nx, 8 * 8);    free(ny, 8 * 8);
+  return true;
+}
+
+// ── A* ───────────────────────────────────────────────────────────────────────
+
+// Kuerzester Weg von (sx,sy) nach (gx,gy). Schreibt die Zellen des Weges
+// (einschliesslich Start und Ziel) in outX/outY und gibt ihre Anzahl zurueck;
+// -1, wenn es keinen Weg gibt oder maxLen nicht reicht.
+//
+// A* ist Dijkstra mit einem Vorwissen: statt den Knoten mit den kleinsten
+// bisherigen Kosten zu nehmen, nimmt es den mit der kleinsten SUMME aus
+// bisherigen Kosten und geschaetztem Rest. Ist die Schaetzung zulaessig
+// (nie zu gross), bleibt das Ergebnis optimal — sie schaut nur weniger Knoten
+// an. Die Heuristik kommt aus GridHeuristic und passt sich der Bewegungsart an.
+pub fn GridAStar(cells: int64, w: int64, h: int64,
+                 sx: int64, sy: int64, gx: int64, gy: int64, diag: bool,
+                 outX: int64, outY: int64, maxLen: int64): int64 {
+  if (w < 1) { return 0 - 1; }
+  if (h < 1) { return 0 - 1; }
+  if (!GridInBounds(sx, sy, w, h)) { return 0 - 1; }
+  if (!GridInBounds(gx, gy, w, h)) { return 0 - 1; }
+  if (!GridWalkable(cells, sx, sy, w, h)) { return 0 - 1; }
+  if (!GridWalkable(cells, gx, gy, w, h)) { return 0 - 1; }
+
+  var n: int64 := w * h;
+  var g: int64 := alloc(n * 8);
+  var prev: int64 := alloc(n * 8);
+  var done: int64 := alloc(n * 8);
+  if (g == 0) { return 0 - 1; }
+  if (prev == 0) { return 0 - 1; }
+  if (done == 0) { return 0 - 1; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    _pf(g, i, _neg(_one()));
+    poke64(prev + i * 8, 0 - 1);
+    poke64(done + i * 8, 0);
+    i := i + 1;
+  }
+
+  var cap: int64 := n * 8 + 16;
+  var hp: int64 := alloc(cap * 8);
+  var hn: int64 := alloc(cap * 8);
+  var hs: int64 := alloc(8);
+  if (hp == 0) { return 0 - 1; }
+  if (hn == 0) { return 0 - 1; }
+  if (hs == 0) { return 0 - 1; }
+  poke64(hs, 0);
+
+  var start: int64 := GridIndex(sx, sy, w);
+  var goal: int64 := GridIndex(gx, gy, w);
+  _pf(g, start, _zero());
+  _heapPush(hp, hn, hs, GridHeuristic(sx, sy, gx, gy, diag), start);
+
+  var nx: int64 := alloc(8 * 8);
+  var ny: int64 := alloc(8 * 8);
+  var found: bool := false;
+
+  while (peek64(hs) > 0) {
+    var cur: int64 := _heapPop(hp, hn, hs);
+    if (cur == goal) {
+      found := true;
+      poke64(hs, 0);      // Ziel erreicht, Suche beenden
+    }
+    else {
+      if (peek64(done + cur * 8) == 0) {
+        poke64(done + cur * 8, 1);
+
+        var cx: int64 := GridX(cur, w);
+        var cy: int64 := GridY(cur, w);
+        var gd: f64 := _gf(g, cur);
+
+        var cnt: int64 := GridNeighbors(cells, cx, cy, w, h, diag, nx, ny);
+        var k: int64 := 0;
+        while (k < cnt) {
+          var tx: int64 := peek64(nx + k * 8);
+          var ty: int64 := peek64(ny + k * 8);
+          var idx: int64 := GridIndex(tx, ty, w);
+
+          if (peek64(done + idx * 8) == 0) {
+            var step: f64 := GridCost(cells, tx, ty, w, h) as f64;
+            if (tx != cx) {
+              if (ty != cy) { step := step * _sqrt2(); }
+            }
+            var ng: f64 := gd + step;
+            var old: f64 := _gf(g, idx);
+            var better: bool := old < _zero();
+            if (!better) { better := ng < old; }
+            if (better) {
+              _pf(g, idx, ng);
+              poke64(prev + idx * 8, cur);
+              _heapPush(hp, hn, hs, ng + GridHeuristic(tx, ty, gx, gy, diag), idx);
+            }
+          }
+          k := k + 1;
+        }
+      }
+    }
+  }
+
+  var len: int64 := 0 - 1;
+  if (found) {
+    len := GridPathFrom(prev, goal, w, outX, outY, maxLen);
+  }
+
+  free(g, n * 8);     free(prev, n * 8);  free(done, n * 8);
+  free(hp, cap * 8);  free(hn, cap * 8);  free(hs, 8);
+  free(nx, 8 * 8);    free(ny, 8 * 8);
+  return len;
+}
+
+// Pfad aus einem Vorgaengerfeld zurueckverfolgen, vom Ziel zum Start und dann
+// umgedreht. Rueckgabe ist die Laenge, -1 wenn maxLen nicht reicht.
+pub fn GridPathFrom(prev: int64, goal: int64, w: int64,
+                    outX: int64, outY: int64, maxLen: int64): int64 {
+  // erst zaehlen, dann rueckwaerts eintragen — so steht der Pfad am Ende in
+  // der richtigen Richtung, ohne ihn zweimal umzudrehen
+  var len: int64 := 0;
+  var cur: int64 := goal;
+  var running: bool := true;
+  while (running) {
+    len := len + 1;
+    if (len > maxLen) { return 0 - 1; }
+    var p: int64 := peek64(prev + cur * 8);
+    if (p < 0) { running := false; }
+    else { cur := p; }
+  }
+
+  cur := goal;
+  var i: int64 := len - 1;
+  while (i >= 0) {
+    poke64(outX + i * 8, GridX(cur, w));
+    poke64(outY + i * 8, GridY(cur, w));
+    var p: int64 := peek64(prev + cur * 8);
+    if (p >= 0) { cur := p; }
+    i := i - 1;
+  }
+  return len;
+}
+
+// Laenge des kuerzesten Weges in Kosten, ohne den Weg selbst zu bilden.
+// -1, wenn das Ziel nicht erreichbar ist.
+pub fn GridPathCost(cells: int64, w: int64, h: int64,
+                    sx: int64, sy: int64, gx: int64, gy: int64,
+                    diag: bool): f64 {
+  var n: int64 := w * h;
+  var d: int64 := alloc(n * 8);
+  if (d == 0) { return _neg(_one()); }
+
+  var r: f64 := _neg(_one());
+  if (GridDijkstra(cells, w, h, sx, sy, diag, d, 0)) {
+    if (GridInBounds(gx, gy, w, h)) {
+      r := _gf(d, GridIndex(gx, gy, w));
+    }
+  }
+  free(d, n * 8);
+  return r;
+}

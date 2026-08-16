@@ -1,0 +1,721 @@
+// std/autodiff.lyx
+// Automatische Differenzierung: Rueckwaertsmodus auf einem Band, Vorwaertsmodus
+
+@description("Automatic differentiation: reverse-mode tape with full operator set, forward-mode dual numbers, numeric gradient check")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.autodiff;
+
+import std.math;
+import std.mathx;
+import std.alloc;
+
+// ── Worum es geht ────────────────────────────────────────────────────────────
+//
+// Automatische Differenzierung ist weder symbolisches Ableiten noch der
+// Differenzenquotient. Sie wertet die Funktion aus und fuehrt dabei die
+// Ableitung mit — Schritt fuer Schritt nach der Kettenregel. Das Ergebnis ist
+// auf Rechengenauigkeit exakt, ohne die Ausloeschung, die (f(x+h)-f(x))/h bei
+// kleinem h unvermeidlich hat.
+//
+// Wie gross dieser Unterschied ist, zeigt der Differenzenquotient selbst: sein
+// Fehler faellt mit h, bis die Ausloeschung ihn wieder wachsen laesst. Im
+// besten Fall bleiben etwa acht der sechzehn Stellen uebrig — die Haelfte der
+// Genauigkeit, fuer jede einzelne Ableitung ein zusaetzlicher Funktionsaufruf.
+//
+// std.ml leitet seine Gradienten bisher von Hand her ("Gradient: dJ/dw =
+// (pred - y) * x" steht dort als Kommentar). Das ist fuer die lineare
+// Regression noch machbar und wird bei jedem zusaetzlichen Term
+// fehleranfaelliger.
+//
+// ── Warum ein Band und keine ueberladenen Operatoren ─────────────────────────
+//
+// In den meisten Sprachen schreibt man Autodiff als Typ mit ueberladenen
+// Operatoren: `a * b + c` rechnet dann Wert und Ableitung zugleich. Lyx kennt
+// keine Operatorueberladung, deshalb steht hier jede Rechenoperation als
+// Funktionsaufruf:
+//
+//     var t: int64 := AdTapeNew(64);
+//     var x: int64 := AdVar(t, 3.0);
+//     var y: int64 := AdVar(t, 4.0);
+//     var f: int64 := AdAdd(t, AdMul(t, x, x), AdMul(t, x, y));   // x^2 + x*y
+//     AdBackward(t, f);
+//     // AdGrad(t, x) = 2x + y = 10, AdGrad(t, y) = x = 3
+//
+// Das ist umstaendlicher zu lesen, aendert aber nichts an der Sache: die
+// Aufrufkette IST der Rechenbaum.
+//
+// ── Rueckwaerts- gegen Vorwaertsmodus ────────────────────────────────────────
+//
+// Beide Modi stehen hier. Der Unterschied ist keine Geschmacksfrage:
+//
+//   Vorwaerts  trägt eine Ableitung von den Eingaengen zum Ergebnis. Ein
+//              Durchlauf liefert die Ableitung nach EINER Variablen. Bei n
+//              Eingaengen braucht man n Durchlaeufe, dafuer keinen Speicher.
+//   Rueckwaerts zeichnet den Rechenweg auf und laeuft ihn rueckwaerts zurueck.
+//              EIN Durchlauf liefert die Ableitungen nach ALLEN Eingaengen.
+//              Der Preis ist das Band: Speicher proportional zur Zahl der
+//              Rechenschritte.
+//
+// Fuer eine Funktion mit tausend Parametern und einem skalaren Ergebnis — der
+// Normalfall in Optimierung und maschinellem Lernen — ist der Rueckwaertsmodus
+// tausendmal guenstiger. Genau deshalb heisst er in neuronalen Netzen
+// Backpropagation.
+//
+// ── Aufbau des Bandes ────────────────────────────────────────────────────────
+//
+// Jeder Knoten belegt fuenf Speicherplaetze zu acht Byte:
+//
+//   0  Wert
+//   1  lokale Ableitung nach dem ersten Eingang
+//   2  lokale Ableitung nach dem zweiten Eingang
+//   3  Index des ersten Eingangs  (-1 = keiner)
+//   4  Index des zweiten Eingangs (-1 = keiner)
+//
+// Die lokalen Ableitungen werden schon beim Aufzeichnen berechnet — beim
+// Rueckwaertslauf wird nur noch multipliziert und aufsummiert. Deshalb braucht
+// der Rueckwaertslauf keine Fallunterscheidung nach Operation und kommt ohne
+// Funktionszeiger aus; die waeren in lyxc 1.0.19D als lokale Variable ohnehin
+// nicht benutzbar (#1106).
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in den uebrigen Units dieses Verzeichnisses: `con f64` als Operand
+// (#1499), negatives Literal als Operand (#1496) und unaeres Minus auf einer
+// Variablen im Ausdruck (#1512) rechnen still falsch. Konstanten stehen als
+// Funktionen, negiert wird ueber _neg().
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+fn _eps(): f64  { return 0.000000000001; }
+
+con NODE_SLOTS: int64 := 5;
+con NODE_BYTES: int64 := 40;
+con HDR_BYTES: int64 := 32;      // cap, count, nodes, grads
+
+fn _cap(t: int64): int64 { return peek64(t); }
+fn _count(t: int64): int64 { return peek64(t + 8); }
+fn _nodes(t: int64): int64 { return peek64(t + 16); }
+fn _grads(t: int64): int64 { return peek64(t + 24); }
+
+fn _setCount(t: int64, v: int64): void { poke64(t + 8, v); }
+
+fn _nodeAddr(t: int64, i: int64): int64 {
+  return _nodes(t) + i * NODE_BYTES;
+}
+
+fn _getF(addr: int64, slot: int64): f64 {
+  var v: f64 := peekf64(addr + slot * 8);
+  return v;
+}
+
+fn _setF(addr: int64, slot: int64, v: f64): void {
+  pokef64(addr + slot * 8, v);
+}
+
+fn _getI(addr: int64, slot: int64): int64 {
+  return peek64(addr + slot * 8);
+}
+
+fn _setI(addr: int64, slot: int64, v: int64): void {
+  poke64(addr + slot * 8, v);
+}
+
+// ── Band anlegen und verwalten ───────────────────────────────────────────────
+
+// capacity ist die Zahl der Knoten, die aufgezeichnet werden koennen — also
+// die Zahl der Rechenschritte, nicht die der Variablen. Ist das Band voll,
+// liefern alle weiteren Operationen AD_INVALID, statt ueber den Rand zu
+// schreiben.
+pub con AD_INVALID: int64 := -1;
+
+pub fn AdTapeNew(capacity: int64): int64 {
+  if (capacity < 1) { return 0; }
+
+  var t: int64 := alloc(HDR_BYTES);
+  if (t == 0) { return 0; }
+
+  var nodes: int64 := alloc(capacity * NODE_BYTES);
+  if (nodes == 0) {
+    free(t, HDR_BYTES);
+    return 0;
+  }
+  var grads: int64 := alloc(capacity * 8);
+  if (grads == 0) {
+    free(nodes, capacity * NODE_BYTES);
+    free(t, HDR_BYTES);
+    return 0;
+  }
+
+  poke64(t, capacity);
+  poke64(t + 8, 0);
+  poke64(t + 16, nodes);
+  poke64(t + 24, grads);
+  return t;
+}
+
+pub fn AdTapeFree(t: int64): void {
+  if (t == 0) { return; }
+  var cap: int64 := _cap(t);
+  free(_nodes(t), cap * NODE_BYTES);
+  free(_grads(t), cap * 8);
+  free(t, HDR_BYTES);
+}
+
+// Band leeren, Speicher behalten. Fuer wiederholte Auswertungen — etwa in
+// einer Optimierungsschleife — ist das der richtige Weg: neu aufzeichnen
+// kostet nichts, ein neues Band anzulegen dagegen eine Speicheranforderung
+// je Schritt.
+pub fn AdTapeReset(t: int64): void {
+  if (t == 0) { return; }
+  _setCount(t, 0);
+}
+
+pub fn AdTapeCount(t: int64): int64 {
+  if (t == 0) { return 0; }
+  return _count(t);
+}
+
+pub fn AdTapeCapacity(t: int64): int64 {
+  if (t == 0) { return 0; }
+  return _cap(t);
+}
+
+fn _push(t: int64, value: f64, d1: f64, d2: f64, a: int64, b: int64): int64 {
+  var n: int64 := _count(t);
+  if (n >= _cap(t)) { return AD_INVALID; }
+
+  var addr: int64 := _nodeAddr(t, n);
+  _setF(addr, 0, value);
+  _setF(addr, 1, d1);
+  _setF(addr, 2, d2);
+  _setI(addr, 3, a);
+  _setI(addr, 4, b);
+  _setCount(t, n + 1);
+  return n;
+}
+
+fn _valid(t: int64, i: int64): bool {
+  if (i < 0) { return false; }
+  if (i >= _count(t)) { return false; }
+  return true;
+}
+
+// ── Blaetter ─────────────────────────────────────────────────────────────────
+
+// Eingangsvariable: nach ihr wird abgeleitet.
+pub fn AdVar(t: int64, value: f64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  return _push(t, value, _zero(), _zero(), AD_INVALID, AD_INVALID);
+}
+
+// Konstante. Unterscheidet sich technisch nicht von einer Variablen — der
+// Unterschied liegt allein darin, ob man den Gradienten hinterher abfragt.
+// Beide getrennt zu benennen macht den Quelltext lesbar.
+pub fn AdConst(t: int64, value: f64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  return _push(t, value, _zero(), _zero(), AD_INVALID, AD_INVALID);
+}
+
+pub fn AdValue(t: int64, node: int64): f64 {
+  if (t == 0) { return _zero(); }
+  if (!_valid(t, node)) { return _zero(); }
+  return _getF(_nodeAddr(t, node), 0);
+}
+
+// ── Zweistellige Operationen ─────────────────────────────────────────────────
+//
+// Jede traegt ihre beiden lokalen Ableitungen selbst ein — das ist der ganze
+// Trick des Verfahrens. Fuer c = a*b etwa ist dc/da = b und dc/db = a; beides
+// steht zur Aufzeichnungszeit ohnehin zur Verfuegung.
+
+pub fn AdAdd(t: int64, a: int64, b: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  if (!_valid(t, b)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  var vb: f64 := AdValue(t, b);
+  return _push(t, va + vb, _one(), _one(), a, b);
+}
+
+pub fn AdSub(t: int64, a: int64, b: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  if (!_valid(t, b)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  var vb: f64 := AdValue(t, b);
+  return _push(t, va - vb, _one(), _neg(_one()), a, b);
+}
+
+pub fn AdMul(t: int64, a: int64, b: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  if (!_valid(t, b)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  var vb: f64 := AdValue(t, b);
+  return _push(t, va * vb, vb, va, a, b);
+}
+
+// Bei b = 0 wird der Knoten mit Wert 0 und Ableitungen 0 abgelegt statt eine
+// Division auszufuehren. Ein NaN an dieser Stelle wuerde sich sonst durch den
+// ganzen Rueckwaertslauf ziehen und jeden Gradienten unbrauchbar machen — auch
+// die Zweige, die mit der Division nichts zu tun haben.
+pub fn AdDiv(t: int64, a: int64, b: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  if (!_valid(t, b)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  var vb: f64 := AdValue(t, b);
+  if (AbsF64(vb) < _eps()) {
+    return _push(t, _zero(), _zero(), _zero(), a, b);
+  }
+  var inv: f64 := _one() / vb;
+  return _push(t, va * inv, inv, _neg(va * inv * inv), a, b);
+}
+
+// ── Einstellige Operationen ──────────────────────────────────────────────────
+
+pub fn AdNeg(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  return _push(t, _neg(va), _neg(_one()), _zero(), a, AD_INVALID);
+}
+
+// Verschiebung und Streckung um Konstanten: sparen je einen Knoten gegenueber
+// AdAdd mit AdConst — bei langen Ketten macht das den Unterschied zwischen
+// passendem und zu kleinem Band.
+pub fn AdAddConst(t: int64, a: int64, c: f64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  return _push(t, va + c, _one(), _zero(), a, AD_INVALID);
+}
+
+pub fn AdMulConst(t: int64, a: int64, c: f64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  return _push(t, va * c, c, _zero(), a, AD_INVALID);
+}
+
+pub fn AdSquare(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  return _push(t, va * va, 2.0 * va, _zero(), a, AD_INVALID);
+}
+
+pub fn AdSqrt(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  if (va < _eps()) {
+    return _push(t, _zero(), _zero(), _zero(), a, AD_INVALID);
+  }
+  var s: f64 := SqrtF64(va);
+  return _push(t, s, _one() / (2.0 * s), _zero(), a, AD_INVALID);
+}
+
+// Das Argument wird auf +-709 geklemmt. Darueber gibt es in f64 ohnehin kein
+// Ergebnis mehr (exp(710) ist unendlich), und ExpF64 aus std.math haengt bei
+// Argumenten ab etwa 1e9 in einer Endlosschleife — ein Ausreisser im Modell
+// wuerde also nicht zu einem falschen Gradienten fuehren, sondern den Prozess
+// stehen lassen.
+fn _expClamp(x: f64): f64 {
+  var hi: f64 := 709.0;
+  var lo: f64 := _neg(709.0);
+  var v: f64 := x;
+  if (v > hi) { v := hi; }
+  if (v < lo) { v := lo; }
+  return MxExp(v);
+}
+
+pub fn AdExp(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  var e: f64 := _expClamp(va);
+  // die Ableitung von exp ist exp — der Wert selbst ist die lokale Ableitung
+  return _push(t, e, e, _zero(), a, AD_INVALID);
+}
+
+pub fn AdLog(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  if (va < _eps()) {
+    return _push(t, _zero(), _zero(), _zero(), a, AD_INVALID);
+  }
+  return _push(t, MxLog(va), _one() / va, _zero(), a, AD_INVALID);
+}
+
+pub fn AdSin(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  return _push(t, SinF64(va), CosF64(va), _zero(), a, AD_INVALID);
+}
+
+pub fn AdCos(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  return _push(t, CosF64(va), _neg(SinF64(va)), _zero(), a, AD_INVALID);
+}
+
+pub fn AdTan(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  var c: f64 := CosF64(va);
+  if (AbsF64(c) < _eps()) {
+    return _push(t, _zero(), _zero(), _zero(), a, AD_INVALID);
+  }
+  return _push(t, TanF64(va), _one() / (c * c), _zero(), a, AD_INVALID);
+}
+
+// a^p mit konstantem Exponenten. Der allgemeine Fall a^b braucht log(a) und
+// scheitert damit fuer a <= 0 — der konstante Exponent deckt ab, was in der
+// Praxis vorkommt, und bleibt fuer negative Basen gueltig, solange p ganz ist.
+pub fn AdPowConst(t: int64, a: int64, p: f64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+
+  if (AbsF64(p) < _eps()) {
+    return _push(t, _one(), _zero(), _zero(), a, AD_INVALID);
+  }
+  if (AbsF64(va) < _eps()) {
+    return _push(t, _zero(), _zero(), _zero(), a, AD_INVALID);
+  }
+
+  var pw: f64 := MxPow(va, p);
+  var deriv: f64 := p * MxPow(va, p - _one());
+  return _push(t, pw, deriv, _zero(), a, AD_INVALID);
+}
+
+// Kehrwert
+pub fn AdRecip(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  if (AbsF64(va) < _eps()) {
+    return _push(t, _zero(), _zero(), _zero(), a, AD_INVALID);
+  }
+  var inv: f64 := _one() / va;
+  return _push(t, inv, _neg(inv * inv), _zero(), a, AD_INVALID);
+}
+
+// Betrag. Bei 0 ist die Ableitung nicht definiert; hier wird 0 gesetzt — die
+// uebliche Wahl, und dieselbe, die jede ML-Bibliothek trifft. Wer an dieser
+// Stelle ein sauberes Ergebnis braucht, darf |x| nicht verwenden.
+pub fn AdAbs(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  var d: f64 := _zero();
+  if (va > _zero()) { d := _one(); }
+  if (va < _zero()) { d := _neg(_one()); }
+  return _push(t, AbsF64(va), d, _zero(), a, AD_INVALID);
+}
+
+// ── Bausteine neuronaler Netze ───────────────────────────────────────────────
+
+// tanh, ueber die eigene Ableitung 1 - tanh^2 statt ueber 1/cosh^2: die
+// Ableitung faellt damit als Nebenprodukt des Wertes an.
+pub fn AdTanh(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+
+  // ueber exp(2x) statt (e^x - e^-x)/(e^x + e^-x): eine Exponentialfunktion
+  // statt zweier, und fuer grosse |x| ohne Ueberlauf
+  var e2: f64 := _expClamp(2.0 * va);
+  var th: f64 := (e2 - _one()) / (e2 + _one());
+  if (va > 20.0) { th := _one(); }
+  var lo: f64 := _neg(20.0);
+  if (va < lo) { th := _neg(_one()); }
+
+  return _push(t, th, _one() - th * th, _zero(), a, AD_INVALID);
+}
+
+// Logistische Funktion 1/(1+e^-x); Ableitung s*(1-s).
+// Ab |x| = 40 ist die logistische Funktion in f64 nicht mehr von 0 bzw. 1 zu
+// unterscheiden, und ihre Ableitung ist dort 0. Die Abfrage spart nicht nur
+// Rechenzeit — sie haelt auch den Aufruf von ExpF64 mit riesigem Argument
+// heraus, der haengen wuerde.
+pub fn AdSigmoid(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+
+  if (va > 40.0) { return _push(t, _one(), _zero(), _zero(), a, AD_INVALID); }
+  var lo: f64 := _neg(40.0);
+  if (va < lo) { return _push(t, _zero(), _zero(), _zero(), a, AD_INVALID); }
+
+  var s: f64 := _one() / (_one() + _expClamp(_neg(va)));
+  return _push(t, s, s * (_one() - s), _zero(), a, AD_INVALID);
+}
+
+// Gleichrichter max(0,x). Bei genau 0 wird die Ableitung auf 0 gesetzt — auch
+// das ist Konvention, nicht Mathematik.
+pub fn AdRelu(t: int64, a: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  var v: f64 := _zero();
+  var d: f64 := _zero();
+  if (va > _zero()) {
+    v := va;
+    d := _one();
+  }
+  return _push(t, v, d, _zero(), a, AD_INVALID);
+}
+
+// Groesserer von zwei Knoten. Der Gradient fliesst nur in den Gewinner —
+// bei Gleichstand in den ersten.
+pub fn AdMax(t: int64, a: int64, b: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  if (!_valid(t, b)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  var vb: f64 := AdValue(t, b);
+  if (vb > va) { return _push(t, vb, _zero(), _one(), a, b); }
+  return _push(t, va, _one(), _zero(), a, b);
+}
+
+pub fn AdMin(t: int64, a: int64, b: int64): int64 {
+  if (t == 0) { return AD_INVALID; }
+  if (!_valid(t, a)) { return AD_INVALID; }
+  if (!_valid(t, b)) { return AD_INVALID; }
+  var va: f64 := AdValue(t, a);
+  var vb: f64 := AdValue(t, b);
+  if (vb < va) { return _push(t, vb, _zero(), _one(), a, b); }
+  return _push(t, va, _one(), _zero(), a, b);
+}
+
+// ── Rueckwaertslauf ──────────────────────────────────────────────────────────
+
+// Setzt die Ableitung des Wurzelknotens auf 1 und laeuft das Band von hinten
+// nach vorn: jeder Knoten gibt seine aufgelaufene Ableitung, multipliziert mit
+// der lokalen, an seine Eingaenge weiter.
+//
+// Dass ein einziger Rueckwaertslauf genuegt, liegt an der Reihenfolge: ein
+// Knoten wird erst angefasst, wenn alle Knoten, die ihn benutzen, schon
+// abgearbeitet sind. Das Band ist in Aufzeichnungsreihenfolge topologisch
+// sortiert — ein Knoten kann nur auf frueher angelegte verweisen. Deshalb
+// braucht es hier keine Sortierung und keine Besuchsmarkierung.
+pub fn AdBackward(t: int64, root: int64): bool {
+  if (t == 0) { return false; }
+  if (!_valid(t, root)) { return false; }
+
+  var g: int64 := _grads(t);
+  var n: int64 := _count(t);
+
+  var i: int64 := 0;
+  while (i < n) {
+    pokef64(g + i * 8, _zero());
+    i := i + 1;
+  }
+  pokef64(g + root * 8, _one());
+
+  i := n - 1;
+  while (i >= 0) {
+    var adj: f64 := peekf64(g + i * 8);
+    // Knoten ohne aufgelaufene Ableitung tragen nichts bei; der Zweig spart
+    // Arbeit, aendert das Ergebnis aber nicht
+    if (AbsF64(adj) > _zero()) {
+      var addr: int64 := _nodeAddr(t, i);
+      var a: int64 := _getI(addr, 3);
+      var b: int64 := _getI(addr, 4);
+
+      if (a >= 0) {
+        var d1: f64 := _getF(addr, 1);
+        var cur: f64 := peekf64(g + a * 8);
+        pokef64(g + a * 8, cur + adj * d1);
+      }
+      if (b >= 0) {
+        var d2: f64 := _getF(addr, 2);
+        var cur2: f64 := peekf64(g + b * 8);
+        pokef64(g + b * 8, cur2 + adj * d2);
+      }
+    }
+    i := i - 1;
+  }
+  return true;
+}
+
+// Ableitung des zuletzt zurueckgerechneten Ergebnisses nach diesem Knoten.
+pub fn AdGrad(t: int64, node: int64): f64 {
+  if (t == 0) { return _zero(); }
+  if (!_valid(t, node)) { return _zero(); }
+  var v: f64 := peekf64(_grads(t) + node * 8);
+  return v;
+}
+
+// Gradienten mehrerer Variablen auf einmal abholen. vars ist ein int64-Feld
+// mit Knotenindizes, out ein f64-Feld gleicher Laenge.
+pub fn AdGradients(t: int64, vars: int64, count: int64, out: int64): bool {
+  if (t == 0) { return false; }
+  var i: int64 := 0;
+  while (i < count) {
+    var node: int64 := peek64(vars + i * 8);
+    pokef64(out + i * 8, AdGrad(t, node));
+    i := i + 1;
+  }
+  return true;
+}
+
+// ── Vorwaertsmodus ───────────────────────────────────────────────────────────
+//
+// Eine Dualzahl ist ein Paar (Wert, Ableitung) und liegt hier als Feld aus
+// zwei f64. Sie braucht kein Band: die Ableitung laeuft mit dem Wert
+// zusammen vorwaerts durch die Rechnung.
+//
+// Der Nutzen neben dem Rueckwaertsmodus: Richtungsableitungen ohne
+// Speicherbedarf, und eine unabhaengige Gegenrechnung — die Tests hier
+// vergleichen beide Modi gegeneinander. Sie teilen keinen Code, ein
+// gemeinsamer Fehler ist damit unwahrscheinlich.
+
+pub fn AdDualSet(d: int64, value: f64, deriv: f64): void {
+  pokef64(d, value);
+  pokef64(d + 8, deriv);
+}
+
+// Eine Variable, nach der abgeleitet wird: Ableitung 1.
+pub fn AdDualVar(d: int64, value: f64): void {
+  AdDualSet(d, value, _one());
+}
+
+pub fn AdDualConst(d: int64, value: f64): void {
+  AdDualSet(d, value, _zero());
+}
+
+pub fn AdDualValue(d: int64): f64 {
+  var v: f64 := peekf64(d);
+  return v;
+}
+
+pub fn AdDualDeriv(d: int64): f64 {
+  var v: f64 := peekf64(d + 8);
+  return v;
+}
+
+pub fn AdDualAdd(a: int64, b: int64, out: int64): void {
+  AdDualSet(out, AdDualValue(a) + AdDualValue(b), AdDualDeriv(a) + AdDualDeriv(b));
+}
+
+pub fn AdDualSub(a: int64, b: int64, out: int64): void {
+  AdDualSet(out, AdDualValue(a) - AdDualValue(b), AdDualDeriv(a) - AdDualDeriv(b));
+}
+
+// Produktregel
+pub fn AdDualMul(a: int64, b: int64, out: int64): void {
+  var av: f64 := AdDualValue(a);
+  var bv: f64 := AdDualValue(b);
+  var ad: f64 := AdDualDeriv(a);
+  var bd: f64 := AdDualDeriv(b);
+  AdDualSet(out, av * bv, ad * bv + av * bd);
+}
+
+// Quotientenregel
+pub fn AdDualDiv(a: int64, b: int64, out: int64): void {
+  var av: f64 := AdDualValue(a);
+  var bv: f64 := AdDualValue(b);
+  var ad: f64 := AdDualDeriv(a);
+  var bd: f64 := AdDualDeriv(b);
+  if (AbsF64(bv) < _eps()) {
+    AdDualSet(out, _zero(), _zero());
+    return;
+  }
+  AdDualSet(out, av / bv, (ad * bv - av * bd) / (bv * bv));
+}
+
+pub fn AdDualSin(a: int64, out: int64): void {
+  var av: f64 := AdDualValue(a);
+  AdDualSet(out, SinF64(av), CosF64(av) * AdDualDeriv(a));
+}
+
+pub fn AdDualCos(a: int64, out: int64): void {
+  var av: f64 := AdDualValue(a);
+  AdDualSet(out, CosF64(av), _neg(SinF64(av)) * AdDualDeriv(a));
+}
+
+pub fn AdDualExp(a: int64, out: int64): void {
+  var e: f64 := _expClamp(AdDualValue(a));
+  AdDualSet(out, e, e * AdDualDeriv(a));
+}
+
+pub fn AdDualLog(a: int64, out: int64): void {
+  var av: f64 := AdDualValue(a);
+  if (av < _eps()) {
+    AdDualSet(out, _zero(), _zero());
+    return;
+  }
+  AdDualSet(out, MxLog(av), AdDualDeriv(a) / av);
+}
+
+pub fn AdDualSqrt(a: int64, out: int64): void {
+  var av: f64 := AdDualValue(a);
+  if (av < _eps()) {
+    AdDualSet(out, _zero(), _zero());
+    return;
+  }
+  var s: f64 := SqrtF64(av);
+  AdDualSet(out, s, AdDualDeriv(a) / (2.0 * s));
+}
+
+pub fn AdDualPowConst(a: int64, p: f64, out: int64): void {
+  var av: f64 := AdDualValue(a);
+  if (AbsF64(av) < _eps()) {
+    AdDualSet(out, _zero(), _zero());
+    return;
+  }
+  AdDualSet(out, MxPow(av, p), p * MxPow(av, p - _one()) * AdDualDeriv(a));
+}
+
+pub fn AdDualMulConst(a: int64, c: f64, out: int64): void {
+  AdDualSet(out, AdDualValue(a) * c, AdDualDeriv(a) * c);
+}
+
+pub fn AdDualAddConst(a: int64, c: f64, out: int64): void {
+  AdDualSet(out, AdDualValue(a) + c, AdDualDeriv(a));
+}
+
+// ── Numerische Gegenprobe ────────────────────────────────────────────────────
+
+// Zentraler Differenzenquotient (f(x+h) - f(x-h)) / (2h) fuer einen einzelnen
+// Wert. Nicht als Rechenverfahren gedacht, sondern als Pruefmittel: wer eine
+// eigene Ableitung von Hand einbaut, vergleicht sie damit.
+//
+// Die Schrittweite ist ein Kompromiss. Zu gross, und der Abbruchfehler des
+// Verfahrens dominiert (er waechst mit h^2); zu klein, und die Subtraktion
+// zweier fast gleicher Zahlen loescht die fuehrenden Stellen aus. Das Optimum
+// liegt bei h ungefaehr eps^(1/3), also rund 6e-6, und selbst dort bleiben nur
+// etwa zehn gueltige Stellen. Genau diese Grenze ist der Grund, warum es
+// automatische Differenzierung gibt.
+pub fn AdNumericStep(x: f64): f64 {
+  var h: f64 := 0.000006;
+  var scale: f64 := AbsF64(x);
+  if (scale > _one()) { h := h * scale; }
+  return h;
+}
+
+pub fn AdNumericDeriv(fPlus: f64, fMinus: f64, h: f64): f64 {
+  if (AbsF64(h) < _eps()) { return _zero(); }
+  return (fPlus - fMinus) / (2.0 * h);
+}
+
+// Stimmen zwei Ableitungen im Rahmen der numerischen Genauigkeit ueberein?
+// Der Vergleich ist relativ zur Groesse des Wertes — eine absolute Schranke
+// waere bei Gradienten der Groessenordnung 1e6 sinnlos.
+pub fn AdGradClose(a: f64, b: f64, tol: f64): bool {
+  var diff: f64 := AbsF64(a - b);
+  var scale: f64 := AbsF64(a);
+  var sb: f64 := AbsF64(b);
+  if (sb > scale) { scale := sb; }
+  if (scale < _one()) { scale := _one(); }
+  return diff / scale < tol;
+}

@@ -1,0 +1,821 @@
+// std/money.lyx
+// Geldbetraege: exakte Festkommarechnung, kaufmaennisches Runden, Aufteilung
+
+@description("Exact decimal money arithmetic on scaled integers: seven rounding modes including banker's rounding, VAT and percentage, division without lost cents, allocation by weights, cash rounding to multiples, ISO 4217 currency scales, locale-aware parsing and formatting")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.money;
+
+import std.sat;
+import std.alloc;
+
+// ── Warum Geld kein f64 ist ──────────────────────────────────────────────────
+//
+// 0,10 EUR gibt es als Gleitkommazahl nicht. Der Wert ist im Binaersystem
+// periodisch, genau wie 1/3 im Dezimalsystem, und wird auf 53 Bit gerundet.
+// Was gespeichert wird, ist etwas wie 0,1000000000000000055511151231257827.
+//
+// Einmal fuer sich genommen faellt das nicht auf. Beim Aufsummieren schon:
+//
+//     0,10 + 0,20        ergibt 0,30000000000000004
+//     100 mal 0,01       ergibt 1,0000000000000007
+//
+// Eine Rechnung ueber 1000 Positionen kann so um einen Cent danebenliegen —
+// und ein Cent Differenz in einer Bilanz ist kein Rundungsfehler, sondern ein
+// Fehler. Deshalb rechnet keine Buchhaltung in Gleitkomma.
+//
+// ── Wie stattdessen ──────────────────────────────────────────────────────────
+//
+// Ein Betrag ist eine GANZE Zahl in der kleinsten Einheit:
+//
+//     1050  bei Skala 2  =  10,50 EUR
+//     1050  bei Skala 0  =  1050 JPY
+//     1050  bei Skala 3  =  1,050 KWD
+//
+// Die Skala — die Zahl der Nachkommastellen — gehoert zum Konto, nicht zur
+// einzelnen Zahl. Deshalb steht sie hier nicht in jedem Betrag, sondern nur
+// dort, wo sie das Ergebnis beeinflusst: beim Multiplizieren, Teilen,
+// Umskalieren, Einlesen und Ausgeben. Addieren und Vergleichen brauchen sie
+// nicht.
+//
+// int64 reicht dafuer weit: bei Skala 2 sind das rund 92 Billionen Euro.
+//
+// ── Ungueltige Betraege pflanzen sich fort ───────────────────────────────────
+//
+// Laeuft eine Rechnung ueber oder wird durch null geteilt, ist das Ergebnis
+// MONEY_INVALID. Jede weitere Rechnung damit ergibt wieder MONEY_INVALID —
+// wie NaN bei Gleitkomma, nur dass es hier nicht stillschweigend als Zahl
+// durchgeht. Wer den Wert ausgibt, sieht ihn; wer ihn pruefen will, nimmt
+// MoneyIsValid.
+//
+// ── Es wird an genau EINER Stelle gerundet ───────────────────────────────────
+//
+// Alle Funktionen, die runden, fuehren auf _divRound zurueck. Ein Rundungsfehler
+// waere sonst sieben Mal zu suchen.
+
+// Der kleinste int64 dient als Fehlerwert — als Betrag kaeme er ohnehin nie vor
+// (bei Skala 2 waeren das -92 Billionen Euro), und er ist der einzige Wert, der
+// sich nicht negieren laesst.
+pub con MONEY_INVALID: int64 := 0 - 9223372036854775807 - 1;
+
+// ── Rundungsarten ────────────────────────────────────────────────────────────
+//
+// Der Unterschied zeigt sich nur bei genau der Haelfte; alles andere rundet zur
+// naechstgelegenen Stufe. Aber genau dieser Fall entscheidet, ob eine
+// Jahresabrechnung aufgeht.
+//
+//                        2,5    -2,5    2,4    -2,4
+//   HALF_UP               3      -3      2      -2      kaufmaennisch
+//   HALF_EVEN             2      -2      2      -2      Bankenrundung
+//   HALF_DOWN             2      -2      2      -2
+//   UP                    3      -3      3      -3      von null weg
+//   DOWN                  2      -2      2      -2      zu null hin
+//   FLOOR                 2      -3      2      -3      abwaerts
+//   CEIL                  3      -2      3      -2      aufwaerts
+//
+// HALF_UP ist das, was im deutschen Handel unter „kaufmaennisch runden" laeuft:
+// die Haelfte geht VON NULL WEG, also -2,5 auf -3.
+//
+// HALF_EVEN rundet die Haelfte auf die gerade Nachbarstufe. Ueber viele
+// Buchungen hebt sich der Rundungsfehler dadurch auf, waehrend HALF_UP
+// systematisch nach oben zieht. Deshalb schreiben IEEE 754 und der Bankensektor
+// es vor.
+//
+// Wer gar nicht runden will, teilt mit MoneySplit oder MoneyAllocate — die
+// verteilen den Rest, statt ihn wegzurunden.
+pub con MONEY_HALF_UP: int64   := 0;
+pub con MONEY_HALF_EVEN: int64 := 1;
+pub con MONEY_HALF_DOWN: int64 := 2;
+pub con MONEY_UP: int64        := 3;
+pub con MONEY_DOWN: int64      := 4;
+pub con MONEY_FLOOR: int64     := 5;
+pub con MONEY_CEIL: int64      := 6;
+
+// ── Ausgabeformen ────────────────────────────────────────────────────────────
+pub con MONEY_FMT_PLAIN: int64 := 0;   // 1234.56   Punkt, keine Gruppen
+pub con MONEY_FMT_DE: int64    := 1;   // 1.234,56  Komma, Punkt als Gruppe
+pub con MONEY_FMT_EN: int64    := 2;   // 1,234.56  Punkt, Komma als Gruppe
+pub con MONEY_FMT_CH: int64    := 3;   // 1'234.56  Punkt, Hochkomma als Gruppe
+
+pub fn MoneyIsValid(v: int64): bool {
+  return v != MONEY_INVALID;
+}
+
+// ── Zehnerpotenzen ───────────────────────────────────────────────────────────
+
+// 10^n, oder MONEY_INVALID wenn das nicht mehr in int64 passt (ab n = 19).
+pub fn MoneyPow10(n: int64): int64 {
+  if (n < 0) { return MONEY_INVALID; }
+  if (n > 18) { return MONEY_INVALID; }
+  var r: int64 := 1;
+  var i: int64 := 0;
+  while (i < n) {
+    r := r * 10;
+    i := i + 1;
+  }
+  return r;
+}
+
+// ── Die eine Rundungsstelle ──────────────────────────────────────────────────
+
+// num / den, gerundet nach `mode`. den muss positiv sein.
+//
+// Gerechnet wird mit Betrag und Vorzeichen getrennt, damit die Modi nicht von
+// der Richtung der ganzzahligen Division abhaengen — die trunkiert in Lyx
+// Richtung null, was fuer FLOOR bei negativen Zahlen das Falsche waere.
+fn _divRound(num: int64, den: int64, mode: int64): int64 {
+  if (den <= 0) { return MONEY_INVALID; }
+  if (num == MONEY_INVALID) { return MONEY_INVALID; }
+
+  var neg: bool := num < 0;
+  var a: int64 := num;
+  if (neg) { a := 0 - num; }
+  if (a < 0) { return MONEY_INVALID; }      // war der kleinste int64
+
+  var q: int64 := a / den;
+  var r: int64 := a % den;
+  if (r == 0) {
+    if (neg) { return 0 - q; }
+    return q;
+  }
+
+  // Um die Haelfte ohne Ueberlauf zu vergleichen: 2*r gegen den.
+  var up: bool := false;
+  if (mode == MONEY_HALF_UP) {
+    if (SatMulOverflows(r, 2)) { up := true; }
+    else { up := (r * 2) >= den; }
+  }
+  else {
+    if (mode == MONEY_HALF_DOWN) {
+      if (SatMulOverflows(r, 2)) { up := true; }
+      else { up := (r * 2) > den; }
+    }
+    else {
+      if (mode == MONEY_HALF_EVEN) {
+        var twice: int64 := 0;
+        var ov: bool := SatMulOverflows(r, 2);
+        if (!ov) { twice := r * 2; }
+        if (ov) { up := true; }
+        else {
+          if (twice > den) { up := true; }
+          else {
+            if (twice == den) {
+              // genau die Haelfte: zur geraden Stufe
+              up := (q % 2) != 0;
+            }
+          }
+        }
+      }
+      else {
+        if (mode == MONEY_UP) { up := true; }
+        else {
+          if (mode == MONEY_DOWN) { up := false; }
+          else {
+            if (mode == MONEY_FLOOR) { up := neg; }
+            else {
+              if (mode == MONEY_CEIL) { up := !neg; }
+              else { return MONEY_INVALID; }   // unbekannte Rundungsart
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (up) {
+    if (SatAddOverflows(q, 1)) { return MONEY_INVALID; }
+    q := q + 1;
+  }
+  if (neg) { return 0 - q; }
+  return q;
+}
+
+// Rundung anhand der ERSTEN abgeschnittenen Ziffer.
+//
+// Beim Einlesen steht der Rest nicht als Bruch zur Verfuegung, sondern als
+// Ziffernfolge: `first` ist die erste weggeworfene Stelle, `more` sagt, ob
+// danach noch etwas ungleich null kam. Daraus laesst sich jede Rundungsart
+// bestimmen — bei HALF_EVEN kommt es auf die Paritaet des BEHALTENEN Wertes an,
+// nicht auf irgendeinen Quotienten.
+fn _roundFrac(kept: int64, first: int64, more: bool, neg: bool,
+              mode: int64): int64 {
+  var any: bool := first != 0;
+  if (more) { any := true; }
+  if (!any) { return 0; }
+
+  if (mode == MONEY_UP) { return 1; }
+  if (mode == MONEY_DOWN) { return 0; }
+  if (mode == MONEY_FLOOR) {
+    if (neg) { return 1; }
+    return 0;
+  }
+  if (mode == MONEY_CEIL) {
+    if (neg) { return 0; }
+    return 1;
+  }
+
+  if (first > 5) { return 1; }
+  if (first < 5) { return 0; }
+  // genau bei fuenf
+  if (more) { return 1; }
+  if (mode == MONEY_HALF_UP) { return 1; }
+  if (mode == MONEY_HALF_DOWN) { return 0; }
+  if (mode == MONEY_HALF_EVEN) {
+    if ((kept % 2) != 0) { return 1; }
+    return 0;
+  }
+  return 0;
+}
+
+// Oeffentlich, weil dieselbe Frage auch ausserhalb von Geld auftritt:
+// ganzzahlig teilen mit waehlbarer Rundung.
+pub fn MoneyDivRound(num: int64, den: int64, mode: int64): int64 {
+  if (den == 0) { return MONEY_INVALID; }
+  if (den < 0) {
+    if (num == MONEY_INVALID) { return MONEY_INVALID; }
+    if (den == MONEY_INVALID) { return MONEY_INVALID; }
+    var r: int64 := _divRound(0 - num, 0 - den, mode);
+    return r;
+  }
+  return _divRound(num, den, mode);
+}
+
+// ── Grundrechenarten ─────────────────────────────────────────────────────────
+//
+// Ohne Skala: zwei Betraege derselben Skala werden schlicht addiert. Die
+// Pruefung auf Ueberlauf ist trotzdem da — eine Summe, die still umkippt, waere
+// genau das, was diese Unit verhindern soll.
+
+pub fn MoneyAdd(a: int64, b: int64): int64 {
+  if (a == MONEY_INVALID) { return MONEY_INVALID; }
+  if (b == MONEY_INVALID) { return MONEY_INVALID; }
+  if (SatAddOverflows(a, b)) { return MONEY_INVALID; }
+  return a + b;
+}
+
+pub fn MoneySub(a: int64, b: int64): int64 {
+  if (a == MONEY_INVALID) { return MONEY_INVALID; }
+  if (b == MONEY_INVALID) { return MONEY_INVALID; }
+  if (SatSubOverflows(a, b)) { return MONEY_INVALID; }
+  return a - b;
+}
+
+pub fn MoneyNeg(a: int64): int64 {
+  if (a == MONEY_INVALID) { return MONEY_INVALID; }
+  return 0 - a;
+}
+
+pub fn MoneyAbs(a: int64): int64 {
+  if (a == MONEY_INVALID) { return MONEY_INVALID; }
+  if (a < 0) { return 0 - a; }
+  return a;
+}
+
+// Mit einer Stueckzahl multiplizieren — die einzige Multiplikation, bei der
+// nichts gerundet werden muss.
+pub fn MoneyMulInt(a: int64, k: int64): int64 {
+  if (a == MONEY_INVALID) { return MONEY_INVALID; }
+  if (k == MONEY_INVALID) { return MONEY_INVALID; }
+  if (SatMulOverflows(a, k)) { return MONEY_INVALID; }
+  return a * k;
+}
+
+// Durch eine Stueckzahl teilen. Hier MUSS gerundet werden, deshalb ist die
+// Rundungsart Pflicht und hat keine Vorgabe.
+pub fn MoneyDivInt(a: int64, k: int64, mode: int64): int64 {
+  if (a == MONEY_INVALID) { return MONEY_INVALID; }
+  return MoneyDivRound(a, k, mode);
+}
+
+pub fn MoneySign(a: int64): int64 {
+  if (a == MONEY_INVALID) { return 0; }
+  if (a > 0) { return 1; }
+  if (a < 0) { return 0 - 1; }
+  return 0;
+}
+
+pub fn MoneyCmp(a: int64, b: int64): int64 {
+  if (a < b) { return 0 - 1; }
+  if (a > b) { return 1; }
+  return 0;
+}
+
+pub fn MoneyMin(a: int64, b: int64): int64 {
+  if (a == MONEY_INVALID) { return MONEY_INVALID; }
+  if (b == MONEY_INVALID) { return MONEY_INVALID; }
+  if (a < b) { return a; }
+  return b;
+}
+
+pub fn MoneyMax(a: int64, b: int64): int64 {
+  if (a == MONEY_INVALID) { return MONEY_INVALID; }
+  if (b == MONEY_INVALID) { return MONEY_INVALID; }
+  if (a > b) { return a; }
+  return b;
+}
+
+// Summe eines Feldes von Betraegen. Ein einziges MONEY_INVALID darin macht die
+// ganze Summe ungueltig — was richtig ist: eine Summe, in der ein Posten fehlt,
+// ist keine Summe.
+pub fn MoneySum(arr: int64, n: int64): int64 {
+  var s: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    s := MoneyAdd(s, peek64(arr + i * 8));
+    if (s == MONEY_INVALID) { return MONEY_INVALID; }
+    i := i + 1;
+  }
+  return s;
+}
+
+// ── Skala aendern ────────────────────────────────────────────────────────────
+
+// Denselben Betrag mit anderer Nachkommastellenzahl ausdruecken.
+// Nach unten wird gerundet, nach oben mit Nullen aufgefuellt.
+pub fn MoneyRescale(v: int64, fromScale: int64, toScale: int64,
+                    mode: int64): int64 {
+  if (v == MONEY_INVALID) { return MONEY_INVALID; }
+  if (fromScale < 0) { return MONEY_INVALID; }
+  if (toScale < 0) { return MONEY_INVALID; }
+  if (fromScale == toScale) { return v; }
+
+  if (toScale > fromScale) {
+    var f: int64 := MoneyPow10(toScale - fromScale);
+    if (f == MONEY_INVALID) { return MONEY_INVALID; }
+    return MoneyMulInt(v, f);
+  }
+  var d: int64 := MoneyPow10(fromScale - toScale);
+  if (d == MONEY_INVALID) { return MONEY_INVALID; }
+  return _divRound(v, d, mode);
+}
+
+// Auf `places` Nachkommastellen runden, aber in der urspruenglichen Skala
+// bleiben: aus 12,3456 (Skala 4) wird 12,3500 — nicht 12,35.
+//
+// Fuer Zwischenergebnisse, die weiterhin fein gerechnet werden sollen, deren
+// Wert aber schon festgelegt ist.
+pub fn MoneyRoundTo(v: int64, scale: int64, places: int64, mode: int64): int64 {
+  if (v == MONEY_INVALID) { return MONEY_INVALID; }
+  if (places >= scale) { return v; }
+  var coarse: int64 := MoneyRescale(v, scale, places, mode);
+  return MoneyRescale(coarse, places, scale, mode);
+}
+
+// Auf ein Vielfaches runden — fuer Bargeld, das es in kleinen Stufen nicht
+// gibt. Die Schweiz kennt keine Ein- und Zweirappenstuecke, also wird der
+// Barbetrag auf 5 Rappen gerundet; der BUCHbetrag bleibt unveraendert.
+pub fn MoneyRoundToMultiple(v: int64, mult: int64, mode: int64): int64 {
+  if (v == MONEY_INVALID) { return MONEY_INVALID; }
+  if (mult <= 0) { return MONEY_INVALID; }
+  var q: int64 := _divRound(v, mult, mode);
+  if (q == MONEY_INVALID) { return MONEY_INVALID; }
+  return MoneyMulInt(q, mult);
+}
+
+// ── Saetze und Prozente ──────────────────────────────────────────────────────
+
+// Betrag mal Satz. Der Satz ist selbst eine Festkommazahl:
+//
+//     MoneyMulRate(betrag, 19, 2, ...)      19/100  = 0,19
+//     MoneyMulRate(betrag, 1995, 4, ...)  1995/10000 = 0,1995
+//
+// Zwischendurch wird NICHT gerundet: erst multiplizieren, dann in einem Schritt
+// runden. Zwei aufeinanderfolgende Rundungen ergeben regelmaessig einen Cent
+// mehr Abweichung als eine.
+pub fn MoneyMulRate(v: int64, rate: int64, rateScale: int64,
+                    mode: int64): int64 {
+  if (v == MONEY_INVALID) { return MONEY_INVALID; }
+  if (rate == MONEY_INVALID) { return MONEY_INVALID; }
+  var den: int64 := MoneyPow10(rateScale);
+  if (den == MONEY_INVALID) { return MONEY_INVALID; }
+  if (SatMulOverflows(v, rate)) { return MONEY_INVALID; }
+  return _divRound(v * rate, den, mode);
+}
+
+// Prozent eines Betrages: MoneyPercent(1000, 19, 0, ...) sind 19 Prozent.
+// Der Satz darf Nachkommastellen haben (7,5 % = 75 bei pctScale 1).
+pub fn MoneyPercent(v: int64, pct: int64, pctScale: int64,
+                    mode: int64): int64 {
+  return MoneyMulRate(v, pct, pctScale + 2, mode);
+}
+
+// Netto plus Steuer.
+pub fn MoneyAddTax(net: int64, rate: int64, rateScale: int64,
+                   mode: int64): int64 {
+  var tax: int64 := MoneyMulRate(net, rate, rateScale, mode);
+  return MoneyAdd(net, tax);
+}
+
+// Der Steueranteil, der in einem Bruttobetrag steckt.
+//
+//     steuer = brutto * satz / (1 + satz)
+//
+// Und NICHT brutto * satz — das ist der haeufigste Fehler bei der
+// Mehrwertsteuer. Bei 19 Prozent sind in 119 Euro brutto 19 Euro Steuer
+// enthalten, also 15,97 Prozent des Bruttobetrages, nicht 19 Prozent
+// (das waeren 22,61 Euro).
+pub fn MoneyTaxOfGross(gross: int64, rate: int64, rateScale: int64,
+                       mode: int64): int64 {
+  if (gross == MONEY_INVALID) { return MONEY_INVALID; }
+  var den: int64 := MoneyPow10(rateScale);
+  if (den == MONEY_INVALID) { return MONEY_INVALID; }
+  if (SatMulOverflows(gross, rate)) { return MONEY_INVALID; }
+  if (SatAddOverflows(den, rate)) { return MONEY_INVALID; }
+  return MoneyDivRound(gross * rate, den + rate, mode);
+}
+
+// Der Nettobetrag zu einem Bruttobetrag.
+pub fn MoneyNetOfGross(gross: int64, rate: int64, rateScale: int64,
+                       mode: int64): int64 {
+  var tax: int64 := MoneyTaxOfGross(gross, rate, rateScale, mode);
+  return MoneySub(gross, tax);
+}
+
+// ── Aufteilen ohne verlorene Cents ───────────────────────────────────────────
+//
+// 100,00 Euro auf drei Personen: 33,33 mal drei sind 99,99. Der uebrige Cent
+// verschwindet nicht — er muss jemandem zugeteilt werden.
+//
+// MoneySplit teilt gleichmaessig und verteilt den Rest auf die ersten
+// Empfaenger, einen Cent je Person. Die Summe der Anteile ist danach GENAU der
+// Ausgangsbetrag. Das ist der Punkt der ganzen Funktion; jede Rundung der
+// Einzelanteile fuer sich verfehlt ihn.
+//
+// Rueckgabe ist true, wenn out gefuellt wurde.
+pub fn MoneySplit(total: int64, parts: int64, out: int64): bool {
+  if (total == MONEY_INVALID) { return false; }
+  if (parts <= 0) { return false; }
+
+  var neg: bool := total < 0;
+  var a: int64 := total;
+  if (neg) { a := 0 - total; }
+  if (a < 0) { return false; }
+
+  var base: int64 := a / parts;
+  var rest: int64 := a % parts;
+
+  var i: int64 := 0;
+  while (i < parts) {
+    var share: int64 := base;
+    if (i < rest) { share := share + 1; }
+    if (neg) { share := 0 - share; }
+    poke64(out + i * 8, share);
+    i := i + 1;
+  }
+  return true;
+}
+
+// Aufteilung nach Gewichten — Umlage nach Anteilen, Verteilung nach Quadrat-
+// metern, Skonto ueber Positionen.
+//
+// Jeder Anteil wird zunaechst abgerundet; die dabei uebrig bleibenden Cents
+// gehen an die Empfaenger mit dem GROESSTEN Rundungsrest, bei Gleichstand an
+// den kleineren Index. Auch hier gilt: die Summe der Anteile ist danach genau
+// der Ausgangsbetrag.
+//
+// Das Feld `weights` wird nicht veraendert. Gewichte muessen nichtnegativ sein
+// und ihre Summe positiv.
+pub fn MoneyAllocate(total: int64, weights: int64, n: int64, out: int64): bool {
+  if (total == MONEY_INVALID) { return false; }
+  if (n <= 0) { return false; }
+
+  var wsum: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    var w: int64 := peek64(weights + i * 8);
+    if (w < 0) { return false; }
+    if (SatAddOverflows(wsum, w)) { return false; }
+    wsum := wsum + w;
+    i := i + 1;
+  }
+  if (wsum <= 0) { return false; }
+
+  var neg: bool := total < 0;
+  var a: int64 := total;
+  if (neg) { a := 0 - total; }
+  if (a < 0) { return false; }
+
+  // Reste getrennt merken, damit die Gewichte unangetastet bleiben
+  var rem: int64 := alloc(n * 8);
+  if (rem == 0) { return false; }
+
+  var given: int64 := 0;
+  i := 0;
+  while (i < n) {
+    var w2: int64 := peek64(weights + i * 8);
+    if (SatMulOverflows(a, w2)) { free(rem, n * 8); return false; }
+    var prod: int64 := a * w2;
+    var share: int64 := prod / wsum;
+    poke64(out + i * 8, share);
+    poke64(rem + i * 8, prod % wsum);
+    given := given + share;
+    i := i + 1;
+  }
+
+  var rest: int64 := a - given;
+  while (rest > 0) {
+    var best: int64 := 0 - 1;
+    var bestR: int64 := 0 - 1;
+    i := 0;
+    while (i < n) {
+      var r: int64 := peek64(rem + i * 8);
+      if (r > bestR) {
+        best := i;
+        bestR := r;
+      }
+      i := i + 1;
+    }
+    if (best < 0) { free(rem, n * 8); return false; }
+    poke64(out + best * 8, peek64(out + best * 8) + 1);
+    poke64(rem + best * 8, 0 - 1);      // dieser hat seinen Cent bekommen
+    rest := rest - 1;
+  }
+  free(rem, n * 8);
+
+  if (neg) {
+    i := 0;
+    while (i < n) {
+      poke64(out + i * 8, 0 - peek64(out + i * 8));
+      i := i + 1;
+    }
+  }
+  return true;
+}
+
+// ── Einlesen ─────────────────────────────────────────────────────────────────
+
+// Zeichenkette in einen Betrag mit `scale` Nachkommastellen.
+//
+// Erkennt Vorzeichen, Gruppentrenner (Punkt, Komma, Hochkomma, Leerzeichen,
+// Unterstrich) und beide Dezimaltrenner.
+//
+// ── Welcher Punkt ist der Dezimalpunkt ───────────────────────────────────────
+//
+// "1.234,56" und "1,234.56" meinen dasselbe, "1.234" kann beides sein. Die
+// Regel hier, der Reihe nach:
+//
+//   1. Kommen BEIDE Zeichen vor, ist das letzte der Dezimaltrenner und das
+//      andere der Gruppentrenner.  "1.234,56" -> 1234,56
+//   2. Kommt nur eines vor, aber MEHRFACH, sind es Gruppentrenner.
+//      "1.234.567" -> 1234567
+//   3. Kommt nur eines vor, einmal, und folgen ihm NICHT genau drei Ziffern,
+//      ist es der Dezimaltrenner.  "12.5" -> 12,5   "1.2345" -> 1,2345
+//   4. Folgen genau drei Ziffern, ist die Eingabe mehrdeutig: "1.005" ist
+//      eintausendfuenf oder eins Komma null null fuenf. Entschieden wird nach
+//      der Zielskala — ab drei Nachkommastellen als Dezimaltrenner, sonst als
+//      Gruppentrenner. Bei Skala 2 ist "1.005" also 1005,00.
+//
+// Wer keine Mehrdeutigkeit will, uebergibt eine Zeichenkette ohne
+// Gruppentrenner; Regel 3 greift dann immer.
+//
+// Mehr Nachkommastellen als `scale` werden nach `mode` gerundet.
+// Bei ungueltiger Eingabe kommt MONEY_INVALID zurueck.
+pub fn MoneyParse(s: int64, scale: int64, mode: int64): int64 {
+  if (scale < 0) { return MONEY_INVALID; }
+  if (s == 0) { return MONEY_INVALID; }
+
+  // Laenge und Stelle des Dezimaltrenners bestimmen
+  var len: int64 := 0;
+  while (peek8(s + len) != 0) { len := len + 1; }
+  if (len == 0) { return MONEY_INVALID; }
+
+  var dots: int64 := 0;
+  var commas: int64 := 0;
+  var dot: int64 := 0 - 1;
+  var i: int64 := 0;
+  while (i < len) {
+    var c: int64 := peek8(s + i);
+    if (c == 46) { dots := dots + 1; dot := i; }
+    if (c == 44) { commas := commas + 1; dot := i; }
+    i := i + 1;
+  }
+
+  if (dot >= 0) {
+    var both: bool := dots > 0;
+    if (both) { both := commas > 0; }
+    if (!both) {
+      // nur eine Zeichenart
+      var many: bool := (dots + commas) > 1;
+      if (many) { dot := 0 - 1; }
+      else {
+        var after: int64 := len - dot - 1;
+        if (after == 3) {
+          // mehrdeutig — die Zielskala entscheidet
+          if (scale < 3) { dot := 0 - 1; }
+        }
+      }
+    }
+  }
+
+  var neg: bool := false;
+  var digits: int64 := 0;      // gelesene Nachkommastellen
+  var acc: int64 := 0;
+  var seen: bool := false;
+  var extra: int64 := 0;       // erste weggeschnittene Stelle, fuer die Rundung
+  var restNonZero: bool := false;
+
+  i := 0;
+  while (i < len) {
+    var c2: int64 := peek8(s + i);
+    if (c2 == 45) {
+      if (seen) { return MONEY_INVALID; }
+      neg := true;
+    }
+    else {
+      if (c2 == 43) {
+        if (seen) { return MONEY_INVALID; }
+      }
+      else {
+        var isDigit: bool := c2 >= 48;
+        if (isDigit) { isDigit := c2 <= 57; }
+        if (isDigit) {
+          seen := true;
+          var d: int64 := c2 - 48;
+          var pastDot: bool := dot >= 0;
+          if (pastDot) { pastDot := i > dot; }
+
+          if (pastDot) { digits := digits + 1; }
+
+          var keep: bool := true;
+          if (pastDot) { keep := digits <= scale; }
+          if (keep) {
+            if (SatMulOverflows(acc, 10)) { return MONEY_INVALID; }
+            acc := acc * 10;
+            if (SatAddOverflows(acc, d)) { return MONEY_INVALID; }
+            acc := acc + d;
+          }
+          else {
+            if (digits == scale + 1) { extra := d; }
+            else {
+              if (d != 0) { restNonZero := true; }
+            }
+          }
+        }
+        else {
+          // Trennzeichen sind erlaubt, alles andere nicht
+          var sep: bool := c2 == 46;
+          if (c2 == 44) { sep := true; }
+          if (c2 == 39) { sep := true; }
+          if (c2 == 32) { sep := true; }
+          if (c2 == 95) { sep := true; }
+          if (!sep) { return MONEY_INVALID; }
+        }
+      }
+    }
+    i := i + 1;
+  }
+  if (!seen) { return MONEY_INVALID; }
+
+  // fehlende Nachkommastellen auffuellen
+  var have: int64 := digits;
+  if (dot < 0) { have := 0; }
+  if (have < scale) {
+    var f: int64 := MoneyPow10(scale - have);
+    if (f == MONEY_INVALID) { return MONEY_INVALID; }
+    if (SatMulOverflows(acc, f)) { return MONEY_INVALID; }
+    acc := acc * f;
+  }
+  else {
+    // zu viele Stellen: nach der ersten abgeschnittenen runden
+    if (digits > scale) {
+      var bump: int64 := _roundFrac(acc, extra, restNonZero, neg, mode);
+      if (SatAddOverflows(acc, bump)) { return MONEY_INVALID; }
+      acc := acc + bump;
+    }
+  }
+
+  if (neg) { return 0 - acc; }
+  return acc;
+}
+
+// ── Ausgeben ─────────────────────────────────────────────────────────────────
+
+// Betrag als Zeichenkette in `buf` (mit abschliessender Null).
+// Rueckgabe ist die Zahl der geschriebenen Zeichen, oder -1, wenn bufLen nicht
+// reicht oder der Betrag ungueltig ist.
+//
+// `fmt` waehlt Dezimal- und Gruppentrenner (MONEY_FMT_*). Gruppiert wird nur
+// der ganzzahlige Teil, in Dreiergruppen.
+pub fn MoneyFormat(v: int64, scale: int64, buf: int64, bufLen: int64,
+                   fmt: int64): int64 {
+  if (v == MONEY_INVALID) { return 0 - 1; }
+  if (scale < 0) { return 0 - 1; }
+  if (bufLen < 2) { return 0 - 1; }
+
+  var dec: int64 := 46;      // '.'
+  var grp: int64 := 0;       // 0 = keine Gruppierung
+  if (fmt == MONEY_FMT_DE) { dec := 44; grp := 46; }
+  if (fmt == MONEY_FMT_EN) { dec := 46; grp := 44; }
+  if (fmt == MONEY_FMT_CH) { dec := 46; grp := 39; }
+
+  var neg: bool := v < 0;
+  var a: int64 := v;
+  if (neg) { a := 0 - v; }
+  if (a < 0) { return 0 - 1; }
+
+  // Ziffern rueckwaerts in einen Zwischenpuffer
+  var tmp: int64 := alloc(48);
+  if (tmp == 0) { return 0 - 1; }
+  var cnt: int64 := 0;
+  var val: int64 := a;
+  if (val == 0) {
+    poke8(tmp, 48);
+    cnt := 1;
+  }
+  else {
+    while (val > 0) {
+      poke8(tmp + cnt, 48 + (val % 10));
+      val := val / 10;
+      cnt := cnt + 1;
+    }
+  }
+  // auf mindestens scale+1 Ziffern auffuellen, damit "0,05" entsteht
+  while (cnt < scale + 1) {
+    poke8(tmp + cnt, 48);
+    cnt := cnt + 1;
+  }
+
+  var pos: int64 := 0;
+  if (neg) {
+    if (pos + 1 >= bufLen) { free(tmp, 48); return 0 - 1; }
+    poke8(buf + pos, 45);
+    pos := pos + 1;
+  }
+
+  var intDigits: int64 := cnt - scale;
+  var k: int64 := 0;
+  while (k < intDigits) {
+    if (k > 0) {
+      if (grp != 0) {
+        if (((intDigits - k) % 3) == 0) {
+          if (pos + 1 >= bufLen) { free(tmp, 48); return 0 - 1; }
+          poke8(buf + pos, grp);
+          pos := pos + 1;
+        }
+      }
+    }
+    if (pos + 1 >= bufLen) { free(tmp, 48); return 0 - 1; }
+    poke8(buf + pos, peek8(tmp + (cnt - 1 - k)));
+    pos := pos + 1;
+    k := k + 1;
+  }
+
+  if (scale > 0) {
+    if (pos + 1 >= bufLen) { free(tmp, 48); return 0 - 1; }
+    poke8(buf + pos, dec);
+    pos := pos + 1;
+    var j: int64 := 0;
+    while (j < scale) {
+      if (pos + 1 >= bufLen) { free(tmp, 48); return 0 - 1; }
+      poke8(buf + pos, peek8(tmp + (scale - 1 - j)));
+      pos := pos + 1;
+      j := j + 1;
+    }
+  }
+
+  poke8(buf + pos, 0);
+  free(tmp, 48);
+  return pos;
+}
+
+// ── Waehrungen ───────────────────────────────────────────────────────────────
+
+// Nachkommastellen nach ISO 4217. Der Dreibuchstabencode wird als Zeichenkette
+// uebergeben; unbekannte Codes bekommen 2, weil das die grosse Mehrheit ist.
+//
+// Die Ausreisser sind der Grund, warum die Skala ueberhaupt ein Parameter ist:
+// Yen und Won haben keine Nachkommastellen, die Golfwaehrungen drei.
+pub fn MoneyCurrencyScale(code: int64): int64 {
+  if (code == 0) { return 2; }
+  var c0: int64 := peek8(code);
+  if (c0 == 0) { return 2; }
+  var c1: int64 := peek8(code + 1);
+  var c2: int64 := peek8(code + 2);
+
+  // ohne Nachkommastellen
+  if (c0 == 74) { if (c1 == 80) { if (c2 == 89) { return 0; } } }   // JPY
+  if (c0 == 75) { if (c1 == 82) { if (c2 == 87) { return 0; } } }   // KRW
+  if (c0 == 86) { if (c1 == 78) { if (c2 == 68) { return 0; } } }   // VND
+  if (c0 == 73) { if (c1 == 83) { if (c2 == 75) { return 0; } } }   // ISK
+  if (c0 == 67) { if (c1 == 76) { if (c2 == 80) { return 0; } } }   // CLP
+  if (c0 == 88) { if (c1 == 65) { if (c2 == 70) { return 0; } } }   // XAF
+  if (c0 == 88) { if (c1 == 79) { if (c2 == 70) { return 0; } } }   // XOF
+  if (c0 == 85) { if (c1 == 71) { if (c2 == 88) { return 0; } } }   // UGX
+  if (c0 == 80) { if (c1 == 89) { if (c2 == 71) { return 0; } } }   // PYG
+  if (c0 == 82) { if (c1 == 87) { if (c2 == 70) { return 0; } } }   // RWF
+
+  // drei Nachkommastellen
+  if (c0 == 75) { if (c1 == 87) { if (c2 == 68) { return 3; } } }   // KWD
+  if (c0 == 66) { if (c1 == 72) { if (c2 == 68) { return 3; } } }   // BHD
+  if (c0 == 79) { if (c1 == 77) { if (c2 == 82) { return 3; } } }   // OMR
+  if (c0 == 74) { if (c1 == 79) { if (c2 == 68) { return 3; } } }   // JOD
+  if (c0 == 84) { if (c1 == 78) { if (c2 == 68) { return 3; } } }   // TND
+  if (c0 == 73) { if (c1 == 81) { if (c2 == 68) { return 3; } } }   // IQD
+  if (c0 == 76) { if (c1 == 89) { if (c2 == 68) { return 3; } } }   // LYD
+
+  // vier Nachkommastellen
+  if (c0 == 67) { if (c1 == 76) { if (c2 == 70) { return 4; } } }   // CLF
+  if (c0 == 85) { if (c1 == 89) { if (c2 == 87) { return 4; } } }   // UYW
+
+  return 2;
+}

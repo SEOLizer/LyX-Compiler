@@ -1,0 +1,412 @@
+// std/prime.lyx
+// Primzahltest nach Miller-Rabin, fuer Zahlen beliebiger Groesse
+
+@description("Primality testing for arbitrary precision integers: Miller-Rabin with Montgomery exponentiation, deterministic witness sets below 3.3e24, trial division by small primes, next prime search, and coprimality checks")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.prime;
+
+import std.bignum;
+import std.i128;
+import std.alloc;
+
+// ── Warum nicht einfach teilen ───────────────────────────────────────────────
+//
+// Eine Zahl auf Teilbarkeit zu pruefen kostet Wurzel(n) Divisionen. Fuer eine
+// 2048-Bit-Zahl waeren das 2^1024 Stueck — mehr Schritte, als das Universum
+// Atome hat. Probedivision entscheidet nichts ueber grosse Zahlen; sie siebt
+// nur die offensichtlichen Faelle vorab aus.
+//
+// ── Was Miller-Rabin stattdessen tut ─────────────────────────────────────────
+//
+// Ist p prim, dann hat 1 modulo p genau zwei Quadratwurzeln: 1 und -1. Bei
+// zusammengesetzten Zahlen gibt es weitere. Der Test sucht solche „falschen
+// Wurzeln".
+//
+// Man schreibt n-1 = d * 2^s mit ungeradem d und rechnet x = a^d mod n. Ist n
+// prim, so muss die Folge x, x^2, x^4, ... spaetestens bei 1 ankommen, und der
+// letzte Wert davor muss -1 sein. Findet man stattdessen eine 1, der keine -1
+// vorausging, ist eine falsche Wurzel aufgetaucht — dann ist n mit Sicherheit
+// zusammengesetzt.
+//
+// Der Test kann also BEWEISEN, dass eine Zahl zusammengesetzt ist. Umgekehrt
+// beweist er nichts: er zeigt nur, dass die gepruefte Basis kein Zeuge war.
+// Deshalb prueft man mehrere Basen.
+//
+// ── Wann das Ergebnis sicher ist ─────────────────────────────────────────────
+//
+// Fuer kleine Zahlen ist Miller-Rabin ein BEWEIS, kein Wahrscheinlichkeitsspiel:
+// wenn n < 3.317.044.064.679.887.385.961.981 (etwa 3,3 * 10^24) die ersten
+// dreizehn Primzahlen als Basen ueberlebt, ist n prim. Das ist durchgerechnet
+// und deckt alles ab, was in 64 oder 80 Bit passt.
+//
+// Darueber ist der Test wahrscheinlichkeitsbehaftet: jede Runde mit einer
+// zufaelligen Basis laesst hoechstens ein Viertel der zusammengesetzten Zahlen
+// durch, k Runden also hoechstens 4^-k. Bei zwanzig Runden ist das kleiner als
+// die Wahrscheinlichkeit eines unentdeckten Speicherfehlers.
+//
+// ACHTUNG bei FESTEN Basen: zu jeder festen Basenliste lassen sich
+// zusammengesetzte Zahlen konstruieren, die sie ueberstehen (Arnault). Wer
+// gegen einen Angreifer prueft, der die Zahl waehlt, muss ZUFAELLIGE Basen
+// nehmen — dafuer gibt es PrimeIsPrimeWithBases.
+//
+// ── Geschwindigkeit ──────────────────────────────────────────────────────────
+//
+// Jede Runde ist eine modulare Potenz. Der Test benutzt BigPowModOdd, also die
+// Montgomery-Fassung ohne Division im Rechenkern; bei 256 Bit ist sie rund
+// siebenundvierzigmal schneller als der Weg ueber BigPowMod (12,6 statt
+// 595 Millisekunden, gemessen mit lyxc 1.0.20C).
+
+pub con PRIME_SMALL_COUNT: int64 := 54;   // Primzahlen unter 256
+
+// Die ersten 54 Primzahlen. Sie dienen zwei Zwecken: als Probedivisoren, die
+// etwa achtzig Prozent aller zusammengesetzten Zahlen sofort erledigen, und als
+// Zeugenbasen fuer den deterministischen Bereich.
+fn _smallPrime(i: int64): int64 {
+  if (i == 0) { return 2; }     if (i == 1) { return 3; }
+  if (i == 2) { return 5; }     if (i == 3) { return 7; }
+  if (i == 4) { return 11; }    if (i == 5) { return 13; }
+  if (i == 6) { return 17; }    if (i == 7) { return 19; }
+  if (i == 8) { return 23; }    if (i == 9) { return 29; }
+  if (i == 10) { return 31; }   if (i == 11) { return 37; }
+  if (i == 12) { return 41; }   if (i == 13) { return 43; }
+  if (i == 14) { return 47; }   if (i == 15) { return 53; }
+  if (i == 16) { return 59; }   if (i == 17) { return 61; }
+  if (i == 18) { return 67; }   if (i == 19) { return 71; }
+  if (i == 20) { return 73; }   if (i == 21) { return 79; }
+  if (i == 22) { return 83; }   if (i == 23) { return 89; }
+  if (i == 24) { return 97; }   if (i == 25) { return 101; }
+  if (i == 26) { return 103; }  if (i == 27) { return 107; }
+  if (i == 28) { return 109; }  if (i == 29) { return 113; }
+  if (i == 30) { return 127; }  if (i == 31) { return 131; }
+  if (i == 32) { return 137; }  if (i == 33) { return 139; }
+  if (i == 34) { return 149; }  if (i == 35) { return 151; }
+  if (i == 36) { return 157; }  if (i == 37) { return 163; }
+  if (i == 38) { return 167; }  if (i == 39) { return 173; }
+  if (i == 40) { return 179; }  if (i == 41) { return 181; }
+  if (i == 42) { return 191; }  if (i == 43) { return 193; }
+  if (i == 44) { return 197; }  if (i == 45) { return 199; }
+  if (i == 46) { return 211; }  if (i == 47) { return 223; }
+  if (i == 48) { return 227; }  if (i == 49) { return 229; }
+  if (i == 50) { return 233; }  if (i == 51) { return 239; }
+  if (i == 52) { return 241; }  if (i == 53) { return 251; }
+  return 0;
+}
+
+pub fn PrimeSmall(i: int64): int64 {
+  if (i < 0) { return 0; }
+  if (i >= PRIME_SMALL_COUNT) { return 0; }
+  return _smallPrime(i);
+}
+
+// ── Probedivision ────────────────────────────────────────────────────────────
+
+// Teilt eine der ersten 54 Primzahlen die Zahl? Rueckgabe ist der Teiler, oder
+// 0. Ist n selbst eine dieser Primzahlen, kommt 0 zurueck — sie teilt sich
+// zwar selbst, ist aber kein echter Faktor.
+//
+// Der Vortest lohnt sich: die kleinen Primzahlen erwischen rund achtzig Prozent
+// aller zusammengesetzten Zahlen, und eine Restdivision kostet einen Bruchteil
+// einer modularen Potenz.
+pub fn PrimeTrialDivide(n: int64): int64 {
+  if (BigIsZero(n)) { return 0; }
+
+  var d: int64 := BigNew(2);
+  var r: int64 := BigNew(2);
+  if (d == 0) { return 0; }
+  if (r == 0) { return 0; }
+
+  var found: int64 := 0;
+  var i: int64 := 0;
+  while (i < PRIME_SMALL_COUNT) {
+    if (found == 0) {
+      var p: int64 := _smallPrime(i);
+      BigSetU64(d, p);
+      if (BigCmpAbs(n, d) != 0) {
+        BigDivRemAbs(n, d, 0, r);
+        if (BigIsZero(r)) { found := p; }
+      }
+    }
+    i := i + 1;
+  }
+  BigFree(d);  BigFree(r);
+  return found;
+}
+
+// ── Eine Runde Miller-Rabin ──────────────────────────────────────────────────
+
+// Ist `base` ein Zeuge dafuer, dass n zusammengesetzt ist?
+//
+// true bedeutet: n ist mit Sicherheit zusammengesetzt.
+// false bedeutet: diese Basis sagt nichts — n koennte prim sein.
+//
+// Setzt ungerades n > 2 voraus; sonst kommt false zurueck.
+pub fn PrimeIsWitness(n: int64, base: int64): bool {
+  if (BigIsZero(n)) { return false; }
+  if ((BigWord(n, 0) & 1) == 0) { return false; }
+
+  var ln: int64 := BigLen(n);
+  var nm1: int64 := BigNew(ln + 1);
+  var d: int64 := BigNew(ln + 1);
+  var x: int64 := BigNew(2 * ln + 2);
+  var one: int64 := BigNew(2);
+  var tmp: int64 := BigNew(ln + 2);
+  if (nm1 == 0) { return false; }
+  if (d == 0) { return false; }
+  if (x == 0) { return false; }
+  if (one == 0) { return false; }
+  if (tmp == 0) { return false; }
+
+  BigSetU64(one, 1);
+  BigSub(n, one, nm1);
+
+  // n-1 = d * 2^s mit ungeradem d
+  var s: int64 := 0;
+  BigCopy(nm1, d);
+  var run: bool := true;
+  while (run) {
+    if (BigIsZero(d)) { run := false; }
+    else {
+      if ((BigWord(d, 0) & 1) == 0) {
+        BigShr(d, 1, tmp);
+        BigCopy(tmp, d);
+        s := s + 1;
+      }
+      else { run := false; }
+    }
+  }
+
+  var composite: bool := true;
+  var ok: bool := BigPowModOdd(base, d, n, x);
+
+  if (ok) {
+    // x == 1 oder x == n-1: die Basis sagt nichts
+    if (BigCmpAbs(x, one) == 0) { composite := false; }
+    if (BigCmpAbs(x, nm1) == 0) { composite := false; }
+
+    var i: int64 := 1;
+    while (i < s) {
+      if (composite) {
+        // quadrieren, weiter modulo n
+        var sq: int64 := BigNew(4 * ln + 4);
+        if (sq == 0) { i := s; }
+        else {
+          BigMul(x, x, sq);
+          BigDivRemAbs(sq, n, 0, x);
+          BigFree(sq);
+          if (BigCmpAbs(x, nm1) == 0) { composite := false; }
+        }
+      }
+      i := i + 1;
+    }
+  }
+  else { composite := false; }
+
+  BigFree(nm1);  BigFree(d);  BigFree(x);  BigFree(one);  BigFree(tmp);
+  return composite;
+}
+
+// ── Der vollstaendige Test ───────────────────────────────────────────────────
+
+// Primzahltest mit den ersten `rounds` kleinen Primzahlen als Basen.
+//
+// Fuer n unter 3,3 * 10^24 und rounds >= 13 ist das Ergebnis ein BEWEIS.
+// Darueber ist es eine Aussage mit Fehlerwahrscheinlichkeit hoechstens
+// 4^-rounds — und zwar nur gegen zufaellig gewaehlte Zahlen, nicht gegen
+// eigens konstruierte (siehe Kopf der Unit).
+pub fn PrimeIsPrime(n: int64, rounds: int64): bool {
+  if (BigIsNeg(n)) { return false; }
+  if (BigIsZero(n)) { return false; }
+
+  // Kleine Faelle direkt. ACHTUNG: BigWord liefert ein BITMUSTER — der
+  // groesste Wortwert 2^64-1 ist als int64 negativ. Verglichen wird deshalb
+  // vorzeichenlos, sonst faellt jede Zahl oberhalb von 2^63 in den
+  // Kleinzahl-Zweig und wird faelschlich verworfen.
+  if (BigLen(n) == 1) {
+    var v: int64 := BigWord(n, 0);
+    if (I128LtU64(v, 2)) { return false; }
+    var i0: int64 := 0;
+    while (i0 < PRIME_SMALL_COUNT) {
+      var p0: int64 := _smallPrime(i0);
+      if (v == p0) { return true; }
+      i0 := i0 + 1;
+    }
+    if (I128LtU64(v, 257)) { return false; }   // alles darunter ist oben erfasst
+  }
+
+  if ((BigWord(n, 0) & 1) == 0) { return false; }
+
+  var f: int64 := PrimeTrialDivide(n);
+  if (f != 0) { return false; }
+
+  var k: int64 := rounds;
+  if (k < 1) { k := 1; }
+  if (k > PRIME_SMALL_COUNT) { k := PRIME_SMALL_COUNT; }
+
+  var base: int64 := BigNew(2);
+  if (base == 0) { return false; }
+
+  var prime: bool := true;
+  var i: int64 := 0;
+  while (i < k) {
+    if (prime) {
+      BigSetU64(base, _smallPrime(i));
+      // Basis muss kleiner als n sein; bei kleinen n sind wir oben schon fertig
+      if (BigCmpAbs(base, n) < 0) {
+        if (PrimeIsWitness(n, base)) { prime := false; }
+      }
+    }
+    i := i + 1;
+  }
+  BigFree(base);
+  return prime;
+}
+
+// Test mit selbst gewaehlten Basen — fuer den Fall, dass die zu pruefende Zahl
+// von jemandem stammt, der die Basenliste kennt.
+//
+// `bases` ist ein Feld von Adressen auf Bignum-Zahlen, `count` ihre Anzahl.
+pub fn PrimeIsPrimeWithBases(n: int64, bases: int64, count: int64): bool {
+  if (BigIsNeg(n)) { return false; }
+  if (BigIsZero(n)) { return false; }
+  if (BigLen(n) == 1) {
+    var v: int64 := BigWord(n, 0);
+    if (I128LtU64(v, 2)) { return false; }
+    if (v == 2) { return true; }
+  }
+  if ((BigWord(n, 0) & 1) == 0) { return false; }
+
+  var prime: bool := true;
+  var i: int64 := 0;
+  while (i < count) {
+    if (prime) {
+      var b: int64 := peek64(bases + i * 8);
+      if (b != 0) {
+        if (BigCmpAbs(b, n) < 0) {
+          if (!BigIsZero(b)) {
+            if (PrimeIsWitness(n, b)) { prime := false; }
+          }
+        }
+      }
+    }
+    i := i + 1;
+  }
+  return prime;
+}
+
+// Deterministischer Test fuer alles unter 3,3 * 10^24: dreizehn Basen.
+pub fn PrimeIsPrimeCertain(n: int64): bool {
+  return PrimeIsPrime(n, 13);
+}
+
+// ── Suchen ───────────────────────────────────────────────────────────────────
+
+// Kleinste Primzahl echt groesser als n, nach out.
+// false, wenn out zu klein ist oder nichts gefunden wurde.
+//
+// Es wird in Zweierschritten ueber die ungeraden Zahlen gegangen. Nach dem
+// Primzahlsatz liegt im Mittel etwa jede ln(n)-te Zahl richtig, bei 256 Bit
+// also ungefaehr jede 177. — die Suche kostet entsprechend viele Tests.
+pub fn PrimeNext(n: int64, rounds: int64, out: int64): bool {
+  var ln: int64 := BigLen(n);
+  if (ln == 0) { ln := 1; }
+  var cur: int64 := BigNew(ln + 2);
+  var one: int64 := BigNew(2);
+  var two: int64 := BigNew(2);
+  var tmp: int64 := BigNew(ln + 2);
+  if (cur == 0) { return false; }
+  if (one == 0) { return false; }
+  if (two == 0) { return false; }
+  if (tmp == 0) { return false; }
+
+  BigSetU64(one, 1);
+  BigSetU64(two, 2);
+
+  var ok: bool := true;
+  if (BigIsNeg(n)) { BigSetU64(cur, 1); }
+  else { ok := BigCopy(n, cur); }
+
+  // auf die naechste ungerade Zahl echt oberhalb
+  if (ok) {
+    if (BigLen(cur) == 0) { BigSetU64(cur, 1); }
+    else {
+      if ((BigWord(cur, 0) & 1) == 0) {
+        BigAdd(cur, one, tmp);
+        BigCopy(tmp, cur);
+      }
+      else {
+        BigAdd(cur, two, tmp);
+        BigCopy(tmp, cur);
+      }
+    }
+  }
+
+  // Sonderfall: die Zwei liegt zwischen 1 und 3.
+  //
+  // Die Pruefung muss VORZEICHENLOS sein und die Laenge mit einschliessen.
+  // Ein blosses BigWord(n,0) < 2 waere fuer 2^64-1 wahr — dessen Wort ist als
+  // int64 negativ —, und die Suche wuerde fuer jede grosse Zahl die Zwei
+  // liefern. Genau das ist hier passiert.
+  var isSmall: bool := BigIsNeg(n);
+  if (BigLen(n) == 0) { isSmall := true; }
+  else {
+    if (BigLen(n) == 1) {
+      if (I128LtU64(BigWord(n, 0), 2)) { isSmall := true; }
+    }
+  }
+  if (ok) {
+    if (isSmall) {
+      BigSetU64(cur, 2);
+      ok := BigCopy(cur, out);
+      BigFree(cur);  BigFree(one);  BigFree(two);  BigFree(tmp);
+      return ok;
+    }
+  }
+
+  var found: bool := false;
+  var guard: int64 := 0;
+  while (ok) {
+    if (found) { ok := false; }
+    else {
+      if (guard > 100000) { ok := false; }
+      else {
+        if (PrimeIsPrime(cur, rounds)) { found := true; }
+        else {
+          BigAdd(cur, two, tmp);
+          BigCopy(tmp, cur);
+          guard := guard + 1;
+        }
+      }
+    }
+  }
+
+  var res: bool := false;
+  if (found) { res := BigCopy(cur, out); }
+  BigFree(cur);  BigFree(one);  BigFree(two);  BigFree(tmp);
+  return res;
+}
+
+// ── Teilerfremdheit ──────────────────────────────────────────────────────────
+
+// Sind a und b teilerfremd? Fuer die Wahl eines RSA-Exponenten: e muss
+// teilerfremd zu (p-1)(q-1) sein.
+pub fn PrimeCoprime(a: int64, b: int64): bool {
+  var la: int64 := BigLen(a);
+  var lb: int64 := BigLen(b);
+  var n: int64 := la;
+  if (lb > n) { n := lb; }
+  if (n == 0) { return false; }
+
+  var g: int64 := BigNew(n + 1);
+  var one: int64 := BigNew(2);
+  if (g == 0) { return false; }
+  if (one == 0) { return false; }
+  BigSetU64(one, 1);
+
+  var res: bool := false;
+  if (BigGcd(a, b, g)) {
+    res := BigCmpAbs(g, one) == 0;
+  }
+  BigFree(g);  BigFree(one);
+  return res;
+}
