@@ -1,0 +1,513 @@
+// std/feq.lyx
+// Fliesskomma-Vergleiche: absolut, relativ, in ULP; Klassifikation und Rundung
+
+@description("Floating point comparison and classification: absolute, relative and ULP-based equality, NaN/Inf tests, next-representable, rounding modes")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.feq;
+
+import std.math;
+import std.alloc;
+
+// ── Warum es diese Einheit gibt ──────────────────────────────────────────────
+//
+// `a == b` ist bei Fliesskommazahlen fast immer die falsche Frage. Klassisch:
+//
+//     0.1 + 0.2 == 0.3     ist FALSCH
+//
+// gemessen mit lyxc 1.0.19D liegt die Differenz bei 5.55e-17. Keine der drei
+// Zahlen ist in doppelter Genauigkeit exakt darstellbar; das Ergebnis ist
+// korrekt gerundet und trotzdem ungleich.
+//
+// std.math.constants bietet dafuer ApproxEqual(a, b, epsilon) — einen rein
+// ABSOLUTEN Vergleich. Der ist fuer Werte um 1 brauchbar und sonst
+// irrefuehrend:
+//
+//   - bei grossen Zahlen greift er nie. 1e9 und 1e9 + 1 unterscheiden sich um
+//     1, aber ihr relativer Abstand ist 1e-9 — sie sind so nah beieinander,
+//     wie es die Darstellung zulaesst. Mit epsilon = 1e-9 gelten sie trotzdem
+//     als verschieden.
+//   - bei kleinen Zahlen greift er immer. 1e-20 und 1e-30 unterscheiden sich
+//     um zehn Groessenordnungen und gelten mit demselben epsilon als gleich.
+//
+// Ein rein RELATIVER Vergleich hat das umgekehrte Problem: er versagt bei
+// null, weil dort jede Abweichung unendlich relativ ist. Deshalb braucht es
+// beides zusammen — und fuer den Grenzfall den Vergleich in ULP.
+//
+// ── ULP: der Vergleich, der die Darstellung ernst nimmt ──────────────────────
+//
+// ULP heisst "unit in the last place": der Abstand zwischen zwei benachbarten
+// darstellbaren Zahlen. Er ist nicht konstant, sondern waechst mit der Groesse
+// der Zahl — bei 1.0 betraegt er 2.2e-16, bei 1e9 rund 1.2e-7, bei 1e300
+// etwa 1e284.
+//
+// Zwei Zahlen um n ULP auseinander heisst: zwischen ihnen liegen n-1 weitere
+// darstellbare Werte. Das ist das natuerliche Mass fuer "so gleich, wie es
+// nach k Rechenschritten sein kann" — unabhaengig von der Groessenordnung.
+//
+// Moeglich wird es, weil die IEEE-754-Darstellung ihre Ordnung im Bitmuster
+// behaelt: liest man ein positives f64 als Ganzzahl, so ist die naechstgroessere
+// Zahl genau eins mehr. Fuer negative Werte muss die Ordnung gespiegelt werden,
+// das erledigt _order().
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in den uebrigen Units: `con f64` als Operand (#1499), negatives Literal
+// als Operand (#1496) und unaeres Minus auf einer Variablen im Ausdruck
+// (#1512) rechnen still falsch. Konstanten stehen als Funktionen, negiert wird
+// ueber _neg().
+//
+// NaN und Inf verhalten sich in 1.0.19D IEEE-konform (Issue #1128 ist behoben,
+// nachgemessen): `nan != nan` ist wahr, `nan < 1.0` falsch, `inf > 1e300`
+// wahr. Darauf baut diese Einheit auf.
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+
+// Die Grenzwerte kommen aus ihren BITMUSTERN, nicht aus Dezimalliteralen.
+//
+// Das ist kein Selbstzweck: der Literal-Parser von lyxc 1.0.19D verliert bei
+// vielen fuehrenden Nullen Stellen. Gemessen bleibt von
+// 1.2345678901234567e-12 noch 1.234559 uebrig, von ...e-16 nur 1.199999, und
+// unterhalb von 1e-18 wird das Literal zu 0 (Issue #1478). Ein als Literal
+// geschriebenes Maschinen-Epsilon waere also selbst um Prozente falsch —
+// ausgerechnet die Konstante, mit der Genauigkeit gemessen wird.
+//
+// Ueber das Bitmuster ist der Wert exakt, unabhaengig vom Parser.
+
+// Maschinen-Epsilon: der Abstand von 1.0 zur naechstgroesseren darstellbaren
+// Zahl. Die Zahl, ueber die man in Toleranzen nicht hinunterkommt.
+pub fn FeqEpsilon(): f64 { return FeqFromBits(4372995238176751616); }
+
+// Kleinste positive normalisierte Zahl
+pub fn FeqMinNormal(): f64 { return FeqFromBits(4503599627370496); }
+
+// Kleinste positive Zahl ueberhaupt (subnormal)
+pub fn FeqMinSubnormal(): f64 { return FeqFromBits(1); }
+
+// Groesste endliche Zahl
+pub fn FeqMax(): f64 { return FeqFromBits(9218868437227405311); }
+
+// ── Bitmuster ────────────────────────────────────────────────────────────────
+//
+// f64 und int64 teilen sich hier den Speicher: schreiben als f64, lesen als
+// int64. Einen Typ-Cast dafuer gibt es nicht — `x as int64` waere die
+// WERTumwandlung (1.5 wird zu 1), nicht die Bitsicht.
+
+pub fn FeqBits(x: f64): int64 {
+  var buf: int64 := alloc(8);
+  if (buf == 0) { return 0; }
+  pokef64(buf, x);
+  var b: int64 := peek64(buf);
+  free(buf, 8);
+  return b;
+}
+
+pub fn FeqFromBits(b: int64): f64 {
+  var buf: int64 := alloc(8);
+  if (buf == 0) { return _zero(); }
+  poke64(buf, b);
+  var v: f64 := peekf64(buf);
+  free(buf, 8);
+  return v;
+}
+
+// Bitmuster in eine ordnungserhaltende Ganzzahl umrechnen.
+//
+// Positive Werte sind als Ganzzahl gelesen bereits aufsteigend geordnet.
+// Negative laufen andersherum — deshalb werden sie an INT64_MIN gespiegelt.
+// Danach gilt: a < b als f64 genau dann, wenn _order(a) < _order(b).
+fn _order(x: f64): int64 {
+  var b: int64 := FeqBits(x);
+  if (b < 0) {
+    // INT64_MIN - b; fuer b < 0 ergibt das den gespiegelten Wert
+    return (0 - 9223372036854775807 - 1) - b;
+  }
+  return b;
+}
+
+// ── Klassifikation ───────────────────────────────────────────────────────────
+
+// NaN ist der einzige Wert, der sich selbst ungleich ist — das ist die
+// Definition, nicht ein Trick.
+pub fn FeqIsNaN(x: f64): bool {
+  return x != x;
+}
+
+pub fn FeqIsInf(x: f64): bool {
+  if (FeqIsNaN(x)) { return false; }
+  var big: f64 := FeqMax();
+  if (x > big) { return true; }
+  var negBig: f64 := _neg(big);
+  if (x < negBig) { return true; }
+  return false;
+}
+
+pub fn FeqIsFinite(x: f64): bool {
+  if (FeqIsNaN(x)) { return false; }
+  if (FeqIsInf(x)) { return false; }
+  return true;
+}
+
+// Vorzeichenbit — unterscheidet -0.0 von +0.0, die im Vergleich gleich sind.
+// Der Unterschied ist selten wichtig und dann wichtig: 1/(+0) ist +unendlich,
+// 1/(-0) ist -unendlich.
+pub fn FeqSignBit(x: f64): bool {
+  return FeqBits(x) < 0;
+}
+
+pub fn FeqIsZero(x: f64): bool {
+  return x == _zero();
+}
+
+// Subnormale Zahlen liegen unterhalb der kleinsten normalisierten und
+// verlieren mit jeder Groessenordnung fuehrende Stellen. Wer sie antrifft,
+// rechnet bereits im Bereich, in dem relative Genauigkeit keine Bedeutung
+// mehr hat.
+pub fn FeqIsSubnormal(x: f64): bool {
+  if (x == _zero()) { return false; }
+  if (!FeqIsFinite(x)) { return false; }
+  return AbsF64(x) < FeqMinNormal();
+}
+
+// ── ULP-Rechnung ─────────────────────────────────────────────────────────────
+
+// Abstand zum naechsten darstellbaren Wert oberhalb von x.
+pub fn FeqUlp(x: f64): f64 {
+  if (!FeqIsFinite(x)) { return _zero(); }
+  var next: f64 := FeqNextUp(AbsF64(x));
+  return next - AbsF64(x);
+}
+
+// Naechster darstellbarer Wert in Richtung +unendlich
+pub fn FeqNextUp(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  var big: f64 := FeqMax();
+  if (x > big) { return x; }        // +inf bleibt
+
+  if (x == _zero()) {
+    // von null aus die kleinste positive Zahl, unabhaengig vom Vorzeichen
+    return FeqFromBits(1);
+  }
+
+  var b: int64 := FeqBits(x);
+  if (b >= 0) { return FeqFromBits(b + 1); }
+  return FeqFromBits(b - 1);
+}
+
+// Naechster darstellbarer Wert in Richtung -unendlich
+pub fn FeqNextDown(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  var negBig: f64 := _neg(FeqMax());
+  if (x < negBig) { return x; }
+
+  if (x == _zero()) {
+    return _neg(FeqFromBits(1));
+  }
+
+  var b: int64 := FeqBits(x);
+  if (b > 0) { return FeqFromBits(b - 1); }
+  if (b == 0) { return _neg(FeqFromBits(1)); }
+  return FeqFromBits(b + 1);
+}
+
+// Anzahl darstellbarer Werte zwischen a und b. -1, wenn einer NaN ist.
+//
+// Zahlen mit verschiedenem Vorzeichen liegen ueber die Null hinweg oft
+// naeher beieinander, als ihre Bitmuster nahelegen — die Spiegelung in
+// _order() sorgt dafuer, dass die Zaehlung auch dort stimmt.
+pub fn FeqUlpsBetween(a: f64, b: f64): int64 {
+  if (FeqIsNaN(a)) { return -1; }
+  if (FeqIsNaN(b)) { return -1; }
+
+  var oa: int64 := _order(a);
+  var ob: int64 := _order(b);
+  var d: int64 := oa - ob;
+  if (d < 0) { d := 0 - d; }
+  return d;
+}
+
+// ── Vergleiche ───────────────────────────────────────────────────────────────
+
+// Rein absolut — wie ApproxEqual aus std.math.constants. Richtig, wenn die
+// Groessenordnung der Werte bekannt und beschraenkt ist (Koordinaten in einem
+// festen Bereich, Wahrscheinlichkeiten, Winkel).
+pub fn FeqAbs(a: f64, b: f64, absTol: f64): bool {
+  if (FeqIsNaN(a)) { return false; }
+  if (FeqIsNaN(b)) { return false; }
+  return AbsF64(a - b) <= absTol;
+}
+
+// Rein relativ, bezogen auf den groesseren Betrag. Richtig fuer Werte, die
+// weit von null entfernt sind; bei einem Vergleich GEGEN null immer falsch,
+// weil dort jede Abweichung unendlich relativ ist.
+pub fn FeqRel(a: f64, b: f64, relTol: f64): bool {
+  if (FeqIsNaN(a)) { return false; }
+  if (FeqIsNaN(b)) { return false; }
+  if (a == b) { return true; }
+  if (!FeqIsFinite(a)) { return false; }
+  if (!FeqIsFinite(b)) { return false; }
+
+  var scale: f64 := AbsF64(a);
+  var sb: f64 := AbsF64(b);
+  if (sb > scale) { scale := sb; }
+  if (scale == _zero()) { return true; }
+  return AbsF64(a - b) / scale <= relTol;
+}
+
+// Die empfohlene Fassung: absolut nahe null, relativ darueber.
+//
+// Die absolute Schranke faengt genau den Fall ab, an dem der relative
+// Vergleich scheitert — Werte um null. Ueber ihr uebernimmt die relative
+// Schranke, die mit der Groessenordnung mitwaechst.
+pub fn FeqEqual(a: f64, b: f64, absTol: f64, relTol: f64): bool {
+  if (FeqIsNaN(a)) { return false; }
+  if (FeqIsNaN(b)) { return false; }
+  if (a == b) { return true; }
+
+  var diff: f64 := AbsF64(a - b);
+  if (diff <= absTol) { return true; }
+
+  if (!FeqIsFinite(a)) { return false; }
+  if (!FeqIsFinite(b)) { return false; }
+
+  var scale: f64 := AbsF64(a);
+  var sb: f64 := AbsF64(b);
+  if (sb > scale) { scale := sb; }
+  return diff <= scale * relTol;
+}
+
+// Vergleich in ULP: hoechstens maxUlps darstellbare Werte dazwischen.
+//
+// Das schaerfste sinnvolle Mass fuer "gleich bis auf Rundung". Ein
+// Rechenschritt kostet in der Regel hoechstens ein halbes ULP; nach k
+// Schritten sind wenige ULP zu erwarten. Wer hier 1e9 einsetzt, hat den Sinn
+// verfehlt und sollte FeqRel nehmen.
+//
+// Nahe null ist ULP dagegen ungeeignet: zwischen 1e-300 und 1e-320 liegen
+// Milliarden darstellbarer Werte, obwohl beide praktisch null sind. Deshalb
+// die zusaetzliche absolute Schranke.
+pub fn FeqUlps(a: f64, b: f64, maxUlps: int64, absTol: f64): bool {
+  if (FeqIsNaN(a)) { return false; }
+  if (FeqIsNaN(b)) { return false; }
+  if (a == b) { return true; }
+  if (AbsF64(a - b) <= absTol) { return true; }
+  if (!FeqIsFinite(a)) { return false; }
+  if (!FeqIsFinite(b)) { return false; }
+
+  // verschiedene Vorzeichen: ohne die absolute Schranke oben nicht gleich
+  if (FeqSignBit(a) != FeqSignBit(b)) { return false; }
+
+  return FeqUlpsBetween(a, b) <= maxUlps;
+}
+
+// Gegen null vergleichen. Eine relative Schranke ist hier sinnlos, deshalb
+// nur absolut — und deshalb als eigene Funktion, damit die Entscheidung
+// sichtbar bleibt.
+pub fn FeqZero(a: f64, absTol: f64): bool {
+  if (FeqIsNaN(a)) { return false; }
+  return AbsF64(a) <= absTol;
+}
+
+// Dreiwertiger Vergleich: -1, 0, +1. NaN sortiert ans Ende (2), damit eine
+// Sortierung damit nicht in eine Endlosschleife oder eine kaputte Ordnung
+// laeuft — der uebliche Fehler beim Sortieren mit NaN.
+pub fn FeqCompare(a: f64, b: f64): int64 {
+  if (FeqIsNaN(a)) {
+    if (FeqIsNaN(b)) { return 0; }
+    return 2;
+  }
+  if (FeqIsNaN(b)) { return 2; }
+  if (a < b) { return -1; }
+  if (a > b) { return 1; }
+  return 0;
+}
+
+// Vollstaendige Ordnung ueber ALLE f64 einschliesslich NaN und -0.0, wie sie
+// IEEE 754 als totalOrder festlegt: -NaN < -inf < ... < -0 < +0 < ... < +inf
+// < +NaN. Damit laesst sich sortieren, ohne Sonderfaelle zu behandeln.
+//
+// Hier wird eine ANDERE Abbildung gebraucht als in FeqUlpsBetween: _order()
+// bildet -0.0 und +0.0 auf denselben Schluessel ab, weil sie als Zahl gleich
+// sind und ihr ULP-Abstand null betraegt. Die totale Ordnung trennt sie
+// dagegen ausdruecklich — deshalb das zusaetzliche -1 auf der negativen Seite.
+fn _totalKey(x: f64): int64 {
+  var b: int64 := FeqBits(x);
+  if (b < 0) {
+    return (0 - 9223372036854775807 - 1) - b - 1;
+  }
+  return b;
+}
+
+pub fn FeqTotalOrder(a: f64, b: f64): int64 {
+  var oa: int64 := _totalKey(a);
+  var ob: int64 := _totalKey(b);
+  if (oa < ob) { return -1; }
+  if (oa > ob) { return 1; }
+  return 0;
+}
+
+// ── Hilfsfunktionen, die dieselbe Falle betreffen ────────────────────────────
+
+// Auf einen Bereich begrenzen. NaN bleibt NaN — der Wert ist unbekannt, ihn
+// auf eine Bereichsgrenze zu setzen waere eine Erfindung.
+pub fn FeqClamp(x: f64, lo: f64, hi: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  if (x < lo) { return lo; }
+  if (x > hi) { return hi; }
+  return x;
+}
+
+// Lineare Interpolation mit exakten Endpunkten.
+//
+// Die naheliegende Form a + t*(b-a) trifft bei t = 1 nicht sicher b: der
+// Ausdruck rundet zweimal, und das Ergebnis kann daneben liegen. Die Form
+// (1-t)*a + t*b hat dafuer bei t = 0 dasselbe Problem. Beide Enden exakt
+// bekommt man nur mit der Fallunterscheidung — und exakte Enden braucht man,
+// sobald interpolierte Werte wieder verglichen werden.
+pub fn FeqLerp(a: f64, b: f64, t: f64): f64 {
+  if (t == _zero()) { return a; }
+  if (t == _one()) { return b; }
+  return a + t * (b - a);
+}
+
+// Division, die bei Nenner null nicht NaN liefert, sondern einen Ersatzwert.
+pub fn FeqSafeDiv(a: f64, b: f64, fallback: f64): f64 {
+  if (b == _zero()) { return fallback; }
+  var r: f64 := a / b;
+  if (FeqIsNaN(r)) { return fallback; }
+  return r;
+}
+
+// ── Rundung mit festgelegtem Verhalten bei .5 ────────────────────────────────
+
+// Kaufmaennisch: 0.5 wird von der Null weg gerundet (2.5 -> 3, -2.5 -> -3).
+pub fn FeqRoundHalfAway(x: f64): f64 {
+  if (!FeqIsFinite(x)) { return x; }
+  if (x >= _zero()) { return FloorF64(x + 0.5); }
+  return CeilF64(x - 0.5);
+}
+
+// Bankiersrundung: 0.5 wird zur GERADEN Zahl gerundet (2.5 -> 2, 3.5 -> 4).
+//
+// Der Unterschied ist nicht Geschmack: kaufmaennische Rundung verschiebt
+// Summen systematisch nach oben, weil .5 immer aufrundet. Ueber viele Posten
+// summiert sich das auf — deshalb ist die Bankiersrundung die Vorgabe von
+// IEEE 754 und die Regel in der Buchhaltung.
+pub fn FeqRoundHalfEven(x: f64): f64 {
+  if (!FeqIsFinite(x)) { return x; }
+
+  var f: f64 := FloorF64(x);
+  var diff: f64 := x - f;
+  var half: f64 := 0.5;
+
+  if (diff > half) { return f + _one(); }
+  if (diff < half) { return f; }
+
+  // genau .5: zur geraden Nachbarzahl
+  var h: f64 := f / 2.0;
+  var isEven: bool := h == FloorF64(h);
+  if (isEven) { return f; }
+  return f + _one();
+}
+
+// ── Abschneiden, Nachkommateil, ganzzahlige Division ─────────────────────────
+
+// Zur Null hin abschneiden.
+//
+// std.math bietet TruncF64, das den Umweg ueber fToInt nimmt: `(fToInt(x) as
+// f64)`. Ab |x| >= 2^63 passt das Ergebnis nicht mehr in ein int64, und die
+// Funktion liefert Muell — gemessen bei 1e19, 1e30 und -1e19. Der Umweg ist
+// auch gar nicht noetig: fuer positive Werte ist Abschneiden dasselbe wie
+// Abrunden, fuer negative dasselbe wie Aufrunden. FloorF64 und CeilF64 selbst
+// sind ueber den ganzen Bereich korrekt (nachgemessen bis 1e30).
+pub fn FeqTrunc(x: f64): f64 {
+  if (!FeqIsFinite(x)) { return x; }
+  if (x >= _zero()) { return FloorF64(x); }
+  return CeilF64(x);
+}
+
+// Nachkommateil mit dem Vorzeichen von x: frac(2.75) = 0.75, frac(-2.75) = -0.75.
+pub fn FeqFrac(x: f64): f64 {
+  if (!FeqIsFinite(x)) { return x; }
+  return x - FeqTrunc(x);
+}
+
+// Ganzzahlige Division, die ABRUNDET statt zur Null hin abzuschneiden.
+//
+// Lyx' `/` trunkiert: -7 / 2 ergibt -3, nicht -4. Fuer Indexrechnungen ist
+// das die falsche Richtung — wer eine Reihe in Bloecke teilt und negative
+// Indizes zulaesst, bekommt an der Null eine Luecke: -1/2 und 0/2 sind beide
+// 0, waehrend -1 in den Block -1 gehoert.
+pub fn FeqFloorDiv(a: int64, b: int64): int64 {
+  if (b == 0) { return 0; }
+  var q: int64 := a / b;
+  var r: int64 := a - q * b;
+  // wenn der Rest nicht null ist und die Vorzeichen von Rest und Divisor
+  // auseinanderlaufen, hat die Trunkierung eine Stelle zu weit gerundet
+  if (r != 0) {
+    var neg1: bool := r < 0;
+    var neg2: bool := b < 0;
+    if (neg1 != neg2) { q := q - 1; }
+  }
+  return q;
+}
+
+// Rest zur abrundenden Division: hat immer das Vorzeichen des DIVISORS.
+// -7 mod 3 ist damit 2, nicht -1 — die mathematische Konvention.
+pub fn FeqFloorMod(a: int64, b: int64): int64 {
+  if (b == 0) { return 0; }
+  var r: int64 := a - FeqFloorDiv(a, b) * b;
+  return r;
+}
+
+// Ganzzahlige Division, die AUFRUNDET. Die uebliche Frage "wie viele Bloecke
+// der Groesse b brauche ich fuer a Elemente" — mit `/` bekommt man einen
+// Block zu wenig, sobald etwas uebrig bleibt.
+pub fn FeqCeilDiv(a: int64, b: int64): int64 {
+  if (b == 0) { return 0; }
+  var q: int64 := a / b;
+  var r: int64 := a - q * b;
+  if (r != 0) {
+    var pos1: bool := r > 0;
+    var pos2: bool := b > 0;
+    if (pos1 == pos2) { q := q + 1; }
+  }
+  return q;
+}
+
+// Auf ein Vielfaches abrunden bzw. aufrunden. Fuer Ausrichtung von Groessen
+// und Rasterung von Koordinaten.
+pub fn FeqFloorTo(x: f64, step: f64): f64 {
+  if (step <= _zero()) { return x; }
+  if (!FeqIsFinite(x)) { return x; }
+  return FloorF64(x / step) * step;
+}
+
+pub fn FeqCeilTo(x: f64, step: f64): f64 {
+  if (step <= _zero()) { return x; }
+  if (!FeqIsFinite(x)) { return x; }
+  return CeilF64(x / step) * step;
+}
+
+// Auf n Nachkommastellen runden (kaufmaennisch).
+//
+// Der Umweg ueber Multiplikation und Division ist selbst mit einem
+// Rundungsfehler behaftet — 1.005 auf zwei Stellen ergibt 1.0 statt 1.01,
+// weil 1.005 in f64 knapp unter 1.005 liegt. Wer exakte Dezimalstellen
+// braucht, braucht Festkomma- oder Dezimalarithmetik, keine
+// Fliesskommarundung.
+pub fn FeqRoundTo(x: f64, decimals: int64): f64 {
+  if (!FeqIsFinite(x)) { return x; }
+  if (decimals < 0) { return x; }
+  if (decimals > 15) { return x; }
+
+  var scale: f64 := _one();
+  var i: int64 := 0;
+  while (i < decimals) {
+    scale := scale * 10.0;
+    i := i + 1;
+  }
+  return FeqRoundHalfAway(x * scale) / scale;
+}

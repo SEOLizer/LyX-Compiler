@@ -1,0 +1,478 @@
+// std/quat.lyx
+// Quaternionen — Hamilton-Konvention, f64
+
+@description("Quaternion algebra and 3D rotations: Hamilton product, slerp, axis-angle, Euler, matrix")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.quat;
+
+import std.math;
+import std.math.constants;
+import std.mathx;
+
+// ── Konvention ───────────────────────────────────────────────────────────────
+//
+// Hamilton, nicht JPL: i*j = k, j*k = i, k*i = j, i^2 = j^2 = k^2 = ijk = -1.
+// Der Skalarteil steht VORNE (w, x, y, z). Beide Festlegungen sind die in
+// Grafik und Robotik ueblichen; wer Daten aus einer JPL-Quelle einliest, muss
+// das Vorzeichen des Vektorteils drehen.
+//
+// Eine Rotation um die Achse n (Einheitsvektor) mit Winkel a ist
+//   q = (cos(a/2), n * sin(a/2)),
+// und q dreht den Vektor v ueber q * v * q^-1. Der halbe Winkel ist der Grund,
+// warum q und -q dieselbe Drehung beschreiben — das ist keine Ungenauigkeit,
+// sondern die doppelte Ueberdeckung von SO(3). QuatSlerp() nutzt sie aus, um
+// immer den kurzen Weg zu nehmen.
+//
+// ── Wertsemantik: Achtung ────────────────────────────────────────────────────
+//
+// `struct` hat in lyxc 1.0.19D keine Wertsemantik (#1351). Konkret:
+//
+//   var b: Quat := a;   b.w := 9.0;   // aendert AUCH a.w
+//   fn F(q: Quat)       { q.w := 9.0; }   // aendert das Argument des Aufrufers
+//
+// Diese Einheit ist deshalb durchgehend funktional gebaut: JEDE Funktion legt
+// ihr Ergebnis in einer neuen lokalen Variable an und gibt sie zurueck; KEINE
+// schreibt je auf einen Parameter. Rueckgabewerte sind nachweislich frisch
+// (gegen 1.0.19D geprueft) — `var c: Quat := QuatMul(a, b)` ist also sicher.
+//
+// Fuer den Aufrufer bleibt eine Regel: eine Quaternion NICHT mit `:=` kopieren,
+// sondern mit QuatCopy(). Sonst teilen sich beide Namen einen Speicher, und
+// eine spaetere Feldzuweisung trifft beide.
+//
+// ── Genauigkeit ──────────────────────────────────────────────────────────────
+//
+// Alles in f64. f32 liefert in 1.0.19D das Bitmuster statt des Werts (#1127)
+// und ist hier bewusst nicht verwendet.
+
+pub con QUAT_EPS: f64 := 0.000000000001;   // 1e-12, Schwelle fuer "praktisch null"
+
+// ── Werkzeug: f64-Konstanten nie direkt in Ausdruecken ────────────────────────
+//
+// lyxc 1.0.19D typt eine `con f64` in einem Ausdruck NICHT als f64: mit
+//   con C: f64 := 0.000000000001;   var one: f64 := 1.0;   if (one < C)
+// ist die Bedingung WAHR, und C*C wird negativ. Sobald derselbe Wert ueber eine
+// Variable oder eine Funktion mit deklariertem f64-Rueckgabetyp kommt, stimmt
+// alles. Gleiches Muster wie der bekannte peekf64-Typbug.
+//
+// Deshalb steht QUAT_EPS in der API, wird intern aber ausschliesslich ueber
+// _eps() gelesen. Wer QUAT_EPS im eigenen Code verwendet, muss es genauso
+// halten: erst in ein `var x: f64` legen, dann vergleichen.
+fn _eps(): f64 { return QUAT_EPS; }
+
+fn _halfPi(): f64 { return HALF_PI; }
+
+// Zweiter Fallstrick derselben Familie: ein NEGATIVES f64-Literal wird in
+// einem Ausdruck als rohes Bitmuster behandelt. Mit `var d: f64 := -1.0;` ist
+//   d <= -1.0   FALSCH,   d == -1.0   FALSCH,   d < -0.5   FALSCH
+// (die Bits von -1.0 als int64 gelesen sind rund -4.6e18, also kleiner als
+// jeder echte Wert). Als Initialisierer und als Aufrufargument stimmt dasselbe
+// Literal. Deshalb kommen negative Schranken hier ueber eine Variable.
+fn _minusOne(): f64 { return -1.0; }
+
+pub type Quat = struct {
+  w: f64;
+  x: f64;
+  y: f64;
+  z: f64;
+}
+
+// ── Erzeugen ─────────────────────────────────────────────────────────────────
+
+pub fn QuatNew(w: f64, x: f64, y: f64, z: f64): Quat {
+  var r: Quat;
+  r.w := w;  r.x := x;  r.y := y;  r.z := z;
+  return r;
+}
+
+pub fn QuatIdentity(): Quat {
+  return QuatNew(1.0, 0.0, 0.0, 0.0);
+}
+
+pub fn QuatZero(): Quat {
+  return QuatNew(0.0, 0.0, 0.0, 0.0);
+}
+
+// Echte Kopie. Notwendig, weil `:=` in lyxc 1.0.19D nur den Speicher teilt.
+pub fn QuatCopy(q: Quat): Quat {
+  return QuatNew(q.w, q.x, q.y, q.z);
+}
+
+// Reine Quaternion (Skalarteil 0) — so wird ein 3D-Vektor hier dargestellt.
+pub fn QuatFromVec3(x: f64, y: f64, z: f64): Quat {
+  return QuatNew(0.0, x, y, z);
+}
+
+// ── Algebra ──────────────────────────────────────────────────────────────────
+
+pub fn QuatAdd(a: Quat, b: Quat): Quat {
+  return QuatNew(a.w + b.w, a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+pub fn QuatSub(a: Quat, b: Quat): Quat {
+  return QuatNew(a.w - b.w, a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+pub fn QuatNeg(q: Quat): Quat {
+  return QuatNew(-q.w, -q.x, -q.y, -q.z);
+}
+
+pub fn QuatScale(q: Quat, s: f64): Quat {
+  return QuatNew(q.w * s, q.x * s, q.y * s, q.z * s);
+}
+
+// Hamilton-Produkt. NICHT kommutativ: QuatMul(a,b) dreht erst b, dann a.
+pub fn QuatMul(a: Quat, b: Quat): Quat {
+  var w: f64 := a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
+  var x: f64 := a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
+  var y: f64 := a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
+  var z: f64 := a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
+  return QuatNew(w, x, y, z);
+}
+
+pub fn QuatDot(a: Quat, b: Quat): f64 {
+  return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+// Konjugierte: Vektorteil negiert. Fuer Einheitsquaternionen ist sie zugleich
+// die Inverse — und deutlich billiger.
+pub fn QuatConj(q: Quat): Quat {
+  return QuatNew(q.w, -q.x, -q.y, -q.z);
+}
+
+pub fn QuatNormSq(q: Quat): f64 {
+  return q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+}
+
+pub fn QuatNorm(q: Quat): f64 {
+  return SqrtF64(QuatNormSq(q));
+}
+
+// Auf Laenge 1 bringen. Eine Quaternion der Laenge 0 hat keine Richtung —
+// statt NaN zu erzeugen (und den Fehler damit weiterzureichen) liefert diese
+// Funktion die Identitaet zurueck. Wer den Fall unterscheiden muss, prueft
+// vorher mit QuatNorm() oder QuatIsZero().
+pub fn QuatNormalize(q: Quat): Quat {
+  var n: f64 := QuatNorm(q);
+  if (n < _eps()) { return QuatIdentity(); }
+  return QuatScale(q, 1.0 / n);
+}
+
+pub fn QuatIsZero(q: Quat): bool {
+  return QuatNormSq(q) < _eps() * _eps();
+}
+
+pub fn QuatIsUnit(q: Quat, eps: f64): bool {
+  return AbsF64(QuatNormSq(q) - 1.0) < eps;
+}
+
+// Inverse: conj(q) / |q|^2. Bei der Nullquaternion (nicht invertierbar) die
+// Identitaet, aus demselben Grund wie bei QuatNormalize.
+pub fn QuatInverse(q: Quat): Quat {
+  var n2: f64 := QuatNormSq(q);
+  if (n2 < _eps() * _eps()) { return QuatIdentity(); }
+  return QuatScale(QuatConj(q), 1.0 / n2);
+}
+
+// a * b^-1
+pub fn QuatDiv(a: Quat, b: Quat): Quat {
+  return QuatMul(a, QuatInverse(b));
+}
+
+pub fn QuatApproxEq(a: Quat, b: Quat, eps: f64): bool {
+  if (AbsF64(a.w - b.w) > eps) { return false; }
+  if (AbsF64(a.x - b.x) > eps) { return false; }
+  if (AbsF64(a.y - b.y) > eps) { return false; }
+  if (AbsF64(a.z - b.z) > eps) { return false; }
+  return true;
+}
+
+// Beschreiben a und b DIESELBE Drehung? Wegen der doppelten Ueberdeckung ist
+// das auch fuer a = -b der Fall — QuatApproxEq wuerde dort nein sagen.
+pub fn QuatSameRotation(a: Quat, b: Quat, eps: f64): bool {
+  if (QuatApproxEq(a, b, eps)) { return true; }
+  return QuatApproxEq(a, QuatNeg(b), eps);
+}
+
+// ── Achse und Winkel ─────────────────────────────────────────────────────────
+
+// Drehung um die Achse (ax,ay,az) mit Winkel im Bogenmass. Die Achse wird
+// normalisiert; eine Nullachse ergibt die Identitaet.
+pub fn QuatFromAxisAngle(ax: f64, ay: f64, az: f64, angle: f64): Quat {
+  var len: f64 := SqrtF64(ax * ax + ay * ay + az * az);
+  if (len < _eps()) { return QuatIdentity(); }
+
+  var half: f64 := angle * 0.5;
+  var s: f64 := SinF64(half) / len;
+  return QuatNew(CosF64(half), ax * s, ay * s, az * s);
+}
+
+// Drehwinkel in 0..2*PI. Setzt eine Einheitsquaternion voraus; sonst vorher
+// QuatNormalize().
+//
+// Nicht ueber acos(w) gerechnet, sondern ueber atan2(|v|, w): bei kleinen
+// Winkeln liegt w dicht an 1, und dort verliert acos die fuehrenden Stellen.
+// atan2 bleibt in beiden Randlagen genau.
+pub fn QuatAngle(q: Quat): f64 {
+  var vlen: f64 := SqrtF64(q.x * q.x + q.y * q.y + q.z * q.z);
+  return 2.0 * Atan2F64(vlen, q.w);
+}
+
+// Drehachse als reine Quaternion (w = 0), auf Laenge 1. Bei einer Drehung um
+// 0 ist die Achse unbestimmt — dann kommt (1,0,0) zurueck.
+pub fn QuatAxis(q: Quat): Quat {
+  var vlen: f64 := SqrtF64(q.x * q.x + q.y * q.y + q.z * q.z);
+  if (vlen < _eps()) { return QuatFromVec3(1.0, 0.0, 0.0); }
+  return QuatFromVec3(q.x / vlen, q.y / vlen, q.z / vlen);
+}
+
+// ── Drehen von Vektoren ──────────────────────────────────────────────────────
+
+// Dreht die reine Quaternion v mit q. Erwartet |q| = 1 und nutzt deshalb die
+// Konjugierte statt der Inversen.
+//
+// Gerechnet wird nicht ueber q*v*q^-1 (zwei volle Produkte, 32 Multiplikationen),
+// sondern ueber die Rodrigues-Form t = 2*(qv x v); v' = v + q.w*t + (qv x t).
+// Gleiches Ergebnis, gut die Haelfte der Arbeit.
+pub fn QuatRotate(q: Quat, v: Quat): Quat {
+  var tx: f64 := 2.0 * (q.y * v.z - q.z * v.y);
+  var ty: f64 := 2.0 * (q.z * v.x - q.x * v.z);
+  var tz: f64 := 2.0 * (q.x * v.y - q.y * v.x);
+
+  var rx: f64 := v.x + q.w * tx + (q.y * tz - q.z * ty);
+  var ry: f64 := v.y + q.w * ty + (q.z * tx - q.x * tz);
+  var rz: f64 := v.z + q.w * tz + (q.x * ty - q.y * tx);
+  return QuatFromVec3(rx, ry, rz);
+}
+
+pub fn QuatRotateVec3(q: Quat, x: f64, y: f64, z: f64): Quat {
+  return QuatRotate(q, QuatFromVec3(x, y, z));
+}
+
+// Quaternion, die den Einheitsvektor a auf den Einheitsvektor b dreht.
+pub fn QuatFromTo(ax: f64, ay: f64, az: f64, bx: f64, by: f64, bz: f64): Quat {
+  var d: f64 := ax * bx + ay * by + az * bz;
+
+  // Gegenrichtung: die Drehachse ist nicht bestimmt, jede Achse senkrecht zu a
+  // taugt. Als Ausgangspunkt die Koordinatenachse nehmen, die am wenigsten mit
+  // a fluchtet — sonst wird das Kreuzprodukt beliebig kurz und ungenau.
+  var antipodal: f64 := _minusOne() + _eps();
+  if (d < antipodal) {
+    var px: f64 := 0.0;  var py: f64 := 0.0;  var pz: f64 := 0.0;
+    if ((AbsF64(ax) <= AbsF64(ay)) and (AbsF64(ax) <= AbsF64(az))) { px := 1.0; }
+    else {
+      if (AbsF64(ay) <= AbsF64(az)) { py := 1.0; }
+      else { pz := 1.0; }
+    }
+    var cx: f64 := ay * pz - az * py;
+    var cy: f64 := az * px - ax * pz;
+    var cz: f64 := ax * py - ay * px;
+    return QuatNormalize(QuatNew(0.0, cx, cy, cz));
+  }
+
+  var kx: f64 := ay * bz - az * by;
+  var ky: f64 := az * bx - ax * bz;
+  var kz: f64 := ax * by - ay * bx;
+  return QuatNormalize(QuatNew(1.0 + d, kx, ky, kz));
+}
+
+// ── Euler-Winkel ─────────────────────────────────────────────────────────────
+//
+// Konvention: intrinsisch Z-Y-X (Gier, Nick, Roll) — die in der Luftfahrt und
+// in Robotik uebliche. Rueckgabe in drei Einzelfunktionen statt als Tripel:
+// Tupel aus mehr als zwei Werten gibt es nicht, und ein Struct als Traeger
+// faellt unter #1351.
+
+pub fn QuatFromEuler(roll: f64, pitch: f64, yaw: f64): Quat {
+  var cr: f64 := CosF64(roll * 0.5);   var sr: f64 := SinF64(roll * 0.5);
+  var cp: f64 := CosF64(pitch * 0.5);  var sp: f64 := SinF64(pitch * 0.5);
+  var cy: f64 := CosF64(yaw * 0.5);    var sy: f64 := SinF64(yaw * 0.5);
+
+  var w: f64 := cr * cp * cy + sr * sp * sy;
+  var x: f64 := sr * cp * cy - cr * sp * sy;
+  var y: f64 := cr * sp * cy + sr * cp * sy;
+  var z: f64 := cr * cp * sy - sr * sp * cy;
+  return QuatNew(w, x, y, z);
+}
+
+// Roll (Drehung um X), -PI..PI
+pub fn QuatRoll(q: Quat): f64 {
+  var sinr: f64 := 2.0 * (q.w * q.x + q.y * q.z);
+  var cosr: f64 := 1.0 - 2.0 * (q.x * q.x + q.y * q.y);
+  return Atan2F64(sinr, cosr);
+}
+
+// Nick (Drehung um Y), -PI/2..PI/2.
+//
+// Am Pol (Nick = +-90 Grad) fallen Roll und Gier zusammen — der Gimbal Lock.
+// Das Argument von asin kann dort durch Rundung knapp ueber 1 liegen; ohne
+// Klemmen kaeme NaN heraus. Geklemmt liefert die Funktion sauber +-PI/2, und
+// die Aufteilung zwischen Roll und Gier wird dort willkuerlich.
+pub fn QuatPitch(q: Quat): f64 {
+  var sinp: f64 := 2.0 * (q.w * q.y - q.z * q.x);
+  var lo: f64 := _minusOne();
+  var half: f64 := _halfPi();
+  if (sinp >= 1.0) { return half; }
+  if (sinp <= lo)  { return -half; }
+  return AsinF64(sinp);
+}
+
+// Gier (Drehung um Z), -PI..PI
+pub fn QuatYaw(q: Quat): f64 {
+  var siny: f64 := 2.0 * (q.w * q.z + q.x * q.y);
+  var cosy: f64 := 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+  return Atan2F64(siny, cosy);
+}
+
+// ── Rotationsmatrix ──────────────────────────────────────────────────────────
+//
+// 3x3, zeilenweise in 9 aufeinanderfolgende f64 an der Adresse out (der
+// Aufrufer legt 72 Byte an). Adresse statt Rueckgabewert, weil Arrays als
+// Rueckgabe- oder Parametertyp in 1.0.19D unzuverlaessig sind (#1109/#1115).
+
+pub fn QuatToMatrix(q: Quat, out: int64): bool {
+  if (out == 0) { return false; }
+  var u: Quat := QuatNormalize(q);
+
+  var xx: f64 := u.x * u.x;  var yy: f64 := u.y * u.y;  var zz: f64 := u.z * u.z;
+  var xy: f64 := u.x * u.y;  var xz: f64 := u.x * u.z;  var yz: f64 := u.y * u.z;
+  var wx: f64 := u.w * u.x;  var wy: f64 := u.w * u.y;  var wz: f64 := u.w * u.z;
+
+  pokef64(out,      1.0 - 2.0 * (yy + zz));
+  pokef64(out +  8,       2.0 * (xy - wz));
+  pokef64(out + 16,       2.0 * (xz + wy));
+
+  pokef64(out + 24,       2.0 * (xy + wz));
+  pokef64(out + 32, 1.0 - 2.0 * (xx + zz));
+  pokef64(out + 40,       2.0 * (yz - wx));
+
+  pokef64(out + 48,       2.0 * (xz - wy));
+  pokef64(out + 56,       2.0 * (yz + wx));
+  pokef64(out + 64, 1.0 - 2.0 * (xx + yy));
+  return true;
+}
+
+// Umkehrung, aus 9 zeilenweise gespeicherten f64.
+//
+// Shepperds Verfahren: aus den vier moeglichen Formeln die nehmen, deren
+// Nenner am groessten ist. Die naive Variante (immer ueber w) bricht ein,
+// sobald die Spur gegen null geht — bei Drehungen nahe 180 Grad also genau
+// dort, wo Rotationscode gern falsch wird.
+pub fn QuatFromMatrix(m: int64): Quat {
+  if (m == 0) { return QuatIdentity(); }
+
+  var m00: f64 := peekf64(m);       var m01: f64 := peekf64(m +  8);  var m02: f64 := peekf64(m + 16);
+  var m10: f64 := peekf64(m + 24);  var m11: f64 := peekf64(m + 32);  var m12: f64 := peekf64(m + 40);
+  var m20: f64 := peekf64(m + 48);  var m21: f64 := peekf64(m + 56);  var m22: f64 := peekf64(m + 64);
+
+  var trace: f64 := m00 + m11 + m22;
+
+  if (trace > 0.0) {
+    var s: f64 := SqrtF64(trace + 1.0) * 2.0;
+    return QuatNew(0.25 * s, (m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s);
+  }
+  if ((m00 > m11) and (m00 > m22)) {
+    var s: f64 := SqrtF64(1.0 + m00 - m11 - m22) * 2.0;
+    return QuatNew((m21 - m12) / s, 0.25 * s, (m01 + m10) / s, (m02 + m20) / s);
+  }
+  if (m11 > m22) {
+    var s: f64 := SqrtF64(1.0 + m11 - m00 - m22) * 2.0;
+    return QuatNew((m02 - m20) / s, (m01 + m10) / s, 0.25 * s, (m12 + m21) / s);
+  }
+  var s: f64 := SqrtF64(1.0 + m22 - m00 - m11) * 2.0;
+  return QuatNew((m10 - m01) / s, (m02 + m20) / s, (m12 + m21) / s, 0.25 * s);
+}
+
+// ── Interpolation ────────────────────────────────────────────────────────────
+
+// Lineare Interpolation mit anschliessender Normierung. Schnell, aber nicht
+// winkeltreu: die Drehgeschwindigkeit schwankt ueber den Weg. Fuer kleine
+// Winkel oder wenn ohnehin jede Frame neu interpoliert wird, reicht es.
+pub fn QuatNlerp(a: Quat, b: Quat, t: f64): Quat {
+  var bb: Quat := QuatCopy(b);
+  if (QuatDot(a, b) < 0.0) { bb := QuatNeg(b); }   // kurzer Weg
+  return QuatNormalize(QuatAdd(QuatScale(a, 1.0 - t), QuatScale(bb, t)));
+}
+
+// Spherical linear interpolation: konstante Winkelgeschwindigkeit auf dem
+// kuerzeren Grosskreisbogen.
+//
+// Zwei Sonderfaelle sind Pflicht, nicht Kosmetik:
+//  - Vorzeichen: q und -q sind dieselbe Drehung. Ohne die Umkehrung bei
+//    negativem Skalarprodukt nimmt die Interpolation den langen Weg
+//    (bis zu 360 Grad statt 0).
+//  - fast gleiche Quaternionen: sin(theta) geht gegen 0, die Division wird
+//    beliebig ungenau. Dort auf lineare Interpolation ausweichen — der
+//    Unterschied ist bei diesem Winkel ohnehin unterhalb der Rechengenauigkeit.
+pub fn QuatSlerp(a: Quat, b: Quat, t: f64): Quat {
+  var cosTheta: f64 := QuatDot(a, b);
+
+  var bb: Quat := QuatCopy(b);
+  if (cosTheta < 0.0) {
+    bb := QuatNeg(b);
+    cosTheta := -cosTheta;
+  }
+
+  if (cosTheta > 1.0 - _eps()) {
+    return QuatNormalize(QuatAdd(QuatScale(a, 1.0 - t), QuatScale(bb, t)));
+  }
+
+  var theta: f64 := AcosF64(cosTheta);
+  var sinTheta: f64 := SinF64(theta);
+  var wa: f64 := SinF64((1.0 - t) * theta) / sinTheta;
+  var wb: f64 := SinF64(t * theta) / sinTheta;
+  return QuatAdd(QuatScale(a, wa), QuatScale(bb, wb));
+}
+
+// ── Exponential, Logarithmus, Potenz ─────────────────────────────────────────
+
+// exp(q) = e^w * (cos|v|, v/|v| * sin|v|)
+pub fn QuatExp(q: Quat): Quat {
+  var vlen: f64 := SqrtF64(q.x * q.x + q.y * q.y + q.z * q.z);
+  var ew: f64 := MxExp(q.w);
+
+  if (vlen < _eps()) { return QuatNew(ew, 0.0, 0.0, 0.0); }
+
+  var s: f64 := ew * SinF64(vlen) / vlen;
+  return QuatNew(ew * CosF64(vlen), q.x * s, q.y * s, q.z * s);
+}
+
+// log(q) = (ln|q|, v/|v| * acos(w/|q|)). Die Nullquaternion hat keinen
+// Logarithmus — dort kommt die Nullquaternion zurueck.
+pub fn QuatLog(q: Quat): Quat {
+  var n: f64 := QuatNorm(q);
+  if (n < _eps()) { return QuatZero(); }
+
+  var vlen: f64 := SqrtF64(q.x * q.x + q.y * q.y + q.z * q.z);
+  var lw: f64 := MxLog(n);
+  if (vlen < _eps()) { return QuatNew(lw, 0.0, 0.0, 0.0); }
+
+  // Argument klemmen: w/n kann durch Rundung knapp ueber 1 liegen → acos NaN.
+  var c: f64 := q.w / n;
+  var lo: f64 := _minusOne();
+  if (c > 1.0) { c := 1.0; }
+  if (c < lo)  { c := lo; }
+
+  var s: f64 := AcosF64(c) / vlen;
+  return QuatNew(lw, q.x * s, q.y * s, q.z * s);
+}
+
+// q^t. Fuer Einheitsquaternionen ist das die Drehung um dieselbe Achse mit dem
+// t-fachen Winkel — QuatPow(q, 0.5) ist die halbe Drehung.
+//
+// Der Umweg ueber exp(t * log q) waere allgemeiner, aber ungenauer: Log und Exp
+// aus std.math tragen jeweils ihren eigenen Reihenfehler, gemessen rund 8e-8
+// auf dem Rundgang. Fuer den Normalfall — und das ist bei Drehungen JEDER Fall —
+// geht es direkt ueber Achse und Winkel, und der Fehler faellt auf die
+// Genauigkeit von sin/cos. Nur nicht normierte Quaternionen nehmen den langen
+// Weg, dort wird der Betrag mitskaliert.
+pub fn QuatPow(q: Quat, t: f64): Quat {
+  if (QuatIsZero(q)) { return QuatZero(); }
+
+  if (QuatIsUnit(q, 0.000000001)) {
+    var axis: Quat := QuatAxis(q);
+    var angle: f64 := QuatAngle(q);
+    return QuatFromAxisAngle(axis.x, axis.y, axis.z, angle * t);
+  }
+  return QuatExp(QuatScale(QuatLog(q), t));
+}

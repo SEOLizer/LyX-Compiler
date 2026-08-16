@@ -1,0 +1,1489 @@
+// std/numeric.lyx
+// Numerisches Werkzeug: Nullstellen, Integration, Interpolation, ODE
+
+@description("Numerical methods on caller supplied functions: bisection, Brent and Newton root finding, trapezoid, Simpson, adaptive Simpson, Romberg and Gauss-Legendre integration, linear, Lagrange and natural cubic spline interpolation, Euler, midpoint, RK4 and adaptive Runge-Kutta ODE solvers, central difference derivatives")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.numeric;
+
+import std.math;
+import std.sum;
+import std.alloc;
+
+// ── Wozu ─────────────────────────────────────────────────────────────────────
+//
+// Die meisten Fragen an eine Funktion lassen sich nicht durch Umformen
+// beantworten. Wo ist die Nullstelle von x - cos(x)? Wie gross ist die Flaeche
+// unter exp(-x^2)? Was macht ein Feder-Masse-System nach zehn Sekunden? Fuer
+// keine dieser Fragen gibt es eine geschlossene Formel — man rechnet sie aus,
+// naeherungsweise, mit kontrollierbarem Fehler.
+//
+// ── Funktionen als Argumente ─────────────────────────────────────────────────
+//
+// Alle Verfahren hier bekommen die zu untersuchende Funktion als
+// FUNKTIONSZEIGER uebergeben:
+//
+//     fn MeineFunktion(x: f64): f64 { return x * x - 2.0; }
+//     var w: f64 := NumBrent(MeineFunktion, 0.0, 2.0, 1.0e-12, 100);
+//
+// Das funktioniert seit 1.0.20E zuverlaessig — Funktionszeiger als Parameter,
+// als Variable und im Aufruf (frueher #1106). Wer Zusatzdaten braucht, legt sie
+// in eine unit-eigene Variable; geschlossene Umgebungen gibt es nicht.
+//
+// ── Ableitungen ──────────────────────────────────────────────────────────────
+//
+// Newtons Verfahren braucht die Ableitung. Drei Wege stehen offen:
+//
+//   1. von Hand hinschreiben — genau, aber fehleranfaellig
+//   2. NumDeriv, zentrale Differenz — bequem, kostet die halbe Genauigkeit
+//   3. std.autodiff — exakt bis auf Rundung, ohne Formel von Hand
+//
+// Der dritte Weg ist der Grund, warum std.autodiff ueberhaupt gebaut wurde.
+// Bis jetzt gab es dort Ableitungen, aber nichts, was sie benutzt hat; mit
+// NumNewton ist das erledigt.
+//
+// ── Warum die Verfahren doppelt vorliegen ────────────────────────────────────
+//
+// Zu jeder Aufgabe stehen ein einfaches und ein gutes Verfahren nebeneinander.
+// Das einfache ist da, damit man den Unterschied MESSEN kann — nicht, damit man
+// es benutzt. In den Testbatterien steht jeweils beides nebeneinander, und der
+// Abstand ist die Rechtfertigung des besseren.
+
+// ── Aufruf ueber Funktionszeiger ─────────────────────────────────────────────
+//
+// Compilerfehler #1565: wird der f64-Rueckgabewert eines Aufrufs UEBER EINEN
+// FUNKTIONSZEIGER einer Variablen zugewiesen oder in einem Ausdruck verwendet,
+// kommt statt der Zahl deren Bitmuster heraus. Nur ein Aufruf, der unmittelbar
+// in einem `return` steht, liefert den richtigen Wert.
+//
+// Deshalb geht JEDER Rueckruf hier durch _call bzw. _call2 — dort steht er
+// genau so. Sobald der Fehler behoben ist, koennen die beiden Hilfen
+// verschwinden; bis dahin sind sie der Unterschied zwischen richtigen und
+// unbrauchbaren Ergebnissen.
+fn _call(f: fn(f64): f64, x: f64): f64 { return f(x); }
+fn _call2(f: fn(f64, f64): f64, t: f64, y: f64): f64 { return f(t, y); }
+
+fn _abs(x: f64): f64 {
+  if (x < 0.0) { return 0.0 - x; }
+  return x;
+}
+
+fn _sign(x: f64): f64 {
+  if (x < 0.0) { return 0.0 - 1.0; }
+  if (x > 0.0) { return 1.0; }
+  return 0.0;
+}
+
+// ── Numerische Ableitung ─────────────────────────────────────────────────────
+
+// Zentrale Differenz: (f(x+h) - f(x-h)) / (2h).
+//
+// Der Fehler hat zwei Anteile, die gegeneinander laufen: das Abschneiden der
+// Reihe waechst mit h^2, die Ausloeschung in der Differenz waechst mit 1/h.
+// Ihr Ausgleich liegt bei h ungefaehr gleich der dritten Wurzel der
+// Maschinengenauigkeit, also rund 6e-6 — nicht bei "moeglichst klein".
+//
+// Damit bleiben etwa zehn bis elf Stellen. Wer mehr braucht, nimmt
+// std.autodiff; dort ist die Ableitung exakt.
+pub fn NumDerivStep(x: f64): f64 {
+  var h: f64 := 0.000006055454452393343;   // eps^(1/3)
+  var s: f64 := _abs(x);
+  if (s < 1.0) { s := 1.0; }
+  return h * s;
+}
+
+pub fn NumDeriv(f: fn(f64): f64, x: f64): f64 {
+  var h: f64 := NumDerivStep(x);
+  // x+h und x-h zurueckrechnen, damit die Schrittweite wirklich darstellbar ist
+  var xp: f64 := x + h;
+  var xm: f64 := x - h;
+  var dx: f64 := xp - xm;
+  if (dx == 0.0) { return 0.0; }
+  return (_call(f, xp) - _call(f, xm)) / dx;
+}
+
+// Zweite Ableitung, ebenfalls zentral.
+pub fn NumDeriv2(f: fn(f64): f64, x: f64): f64 {
+  var h: f64 := NumDerivStep(x) * 100.0;
+  var fx: f64 := _call(f, x);
+  return (_call(f, x + h) - 2.0 * fx + _call(f, x - h)) / (h * h);
+}
+
+// ── Nullstellen ──────────────────────────────────────────────────────────────
+
+// Bisektion: das Intervall halbieren und die Haelfte behalten, in der das
+// Vorzeichen wechselt.
+//
+// Braucht ein Intervall, an dessen Enden f verschiedene Vorzeichen hat. Dann
+// findet es die Nullstelle IMMER — und zwar mit einem Bit Genauigkeit je
+// Schritt. Fuenfzig Schritte reichen fuer volle f64-Genauigkeit.
+//
+// Langsam, aber unbeirrbar. Rueckgabe ist die Nullstelle, oder der kleinste
+// f64 (als Fehlerwert), wenn das Intervall keinen Vorzeichenwechsel enthaelt.
+pub fn NumBisect(f: fn(f64): f64, lo: f64, hi: f64, tol: f64,
+                 maxIter: int64): f64 {
+  var a: f64 := lo;
+  var b: f64 := hi;
+  var fa: f64 := _call(f, a);
+  var fb: f64 := _call(f, b);
+
+  if (fa == 0.0) { return a; }
+  if (fb == 0.0) { return b; }
+  // gleiche Vorzeichen: kein Nachweis einer Nullstelle
+  if (_sign(fa) == _sign(fb)) { return 0.0 - 1.0e308; }
+
+  var i: int64 := 0;
+  while (i < maxIter) {
+    var m: f64 := a + (b - a) / 2.0;
+    var fm: f64 := _call(f, m);
+    if (fm == 0.0) { return m; }
+    if (_abs(b - a) < tol) { i := maxIter; }
+    else {
+      if (_sign(fm) == _sign(fa)) {
+        a := m;
+        fa := fm;
+      }
+      else { b := m; }
+      i := i + 1;
+    }
+  }
+  return a + (b - a) / 2.0;
+}
+
+// Brents Verfahren: Bisektion mit eingebauter Abkuerzung.
+//
+// Es versucht in jedem Schritt eine Parabel durch die letzten drei Punkte zu
+// legen und deren Nullstelle zu nehmen. Liegt die nicht im Intervall oder
+// verbessert sie zu wenig, faellt es auf die Halbierung zurueck. Damit hat es
+// die Sicherheit der Bisektion und fast die Geschwindigkeit von Newton — ohne
+// eine Ableitung zu brauchen.
+//
+// Das ist das Verfahren der Wahl, wenn ein einschliessendes Intervall bekannt
+// ist. Rueckgabe wie bei NumBisect.
+pub fn NumBrent(f: fn(f64): f64, lo: f64, hi: f64, tol: f64,
+                maxIter: int64): f64 {
+  var a: f64 := lo;
+  var b: f64 := hi;
+  var fa: f64 := _call(f, a);
+  var fb: f64 := _call(f, b);
+
+  if (fa == 0.0) { return a; }
+  if (fb == 0.0) { return b; }
+  if (_sign(fa) == _sign(fb)) { return 0.0 - 1.0e308; }
+
+  // b soll der bessere Punkt sein
+  if (_abs(fa) < _abs(fb)) {
+    var t: f64 := a;
+    a := b;
+    b := t;
+    var tf: f64 := fa;
+    fa := fb;
+    fb := tf;
+  }
+
+  var c: f64 := a;
+  var fc: f64 := fa;
+  var d: f64 := b - a;
+  var e: f64 := d;
+  var mflag: bool := true;
+
+  var i: int64 := 0;
+  while (i < maxIter) {
+    if (fb == 0.0) { i := maxIter; }
+    else {
+      if (_abs(b - a) < tol) { i := maxIter; }
+      else {
+        var s: f64 := 0.0;
+        var useBisect: bool := true;
+
+        // inverse quadratische Interpolation, wenn drei verschiedene Werte da sind
+        var canQuad: bool := fa != fc;
+        if (canQuad) { canQuad := fb != fc; }
+        if (canQuad) {
+          var t1: f64 := a * fb * fc / ((fa - fb) * (fa - fc));
+          var t2: f64 := b * fa * fc / ((fb - fa) * (fb - fc));
+          var t3: f64 := c * fa * fb / ((fc - fa) * (fc - fb));
+          s := t1 + t2 + t3;
+          useBisect := false;
+        }
+        else {
+          // sonst die Sekante
+          if (fb != fa) {
+            s := b - fb * (b - a) / (fb - fa);
+            useBisect := false;
+          }
+        }
+
+        if (!useBisect) {
+          // Bedingungen, unter denen der Vorschlag verworfen wird
+          var lo2: f64 := (3.0 * a + b) / 4.0;
+          var inRange: bool := true;
+          if (lo2 < b) {
+            if (s < lo2) { inRange := false; }
+            if (s > b) { inRange := false; }
+          }
+          else {
+            if (s < b) { inRange := false; }
+            if (s > lo2) { inRange := false; }
+          }
+          if (!inRange) { useBisect := true; }
+          else {
+            if (mflag) {
+              if (_abs(s - b) >= _abs(b - c) / 2.0) { useBisect := true; }
+              if (_abs(b - c) < tol) { useBisect := true; }
+            }
+            else {
+              if (_abs(s - b) >= _abs(c - d) / 2.0) { useBisect := true; }
+              if (_abs(c - d) < tol) { useBisect := true; }
+            }
+          }
+        }
+
+        if (useBisect) {
+          s := a + (b - a) / 2.0;
+          mflag := true;
+        }
+        else { mflag := false; }
+
+        var fs: f64 := _call(f, s);
+        d := c;
+        c := b;
+        fc := fb;
+
+        if (_sign(fa) != _sign(fs)) {
+          b := s;
+          fb := fs;
+        }
+        else {
+          a := s;
+          fa := fs;
+        }
+
+        if (_abs(fa) < _abs(fb)) {
+          var t4: f64 := a;
+          a := b;
+          b := t4;
+          var t5: f64 := fa;
+          fa := fb;
+          fb := t5;
+        }
+        i := i + 1;
+      }
+    }
+  }
+  return b;
+}
+
+// Newtons Verfahren: die Tangente im aktuellen Punkt schneiden.
+//
+// Verdoppelt die Zahl der richtigen Stellen in jedem Schritt — aus vier werden
+// acht, aus acht sechzehn. Dafuer braucht es die Ableitung und einen
+// brauchbaren Startwert; laeuft es davon oder wird die Ableitung null, kommt
+// der Fehlerwert zurueck.
+//
+// `df` ist die Ableitung. Wer sie nicht hinschreiben will, nimmt NumNewtonNum
+// (numerisch) oder bildet sie mit std.autodiff exakt.
+pub fn NumNewton(f: fn(f64): f64, df: fn(f64): f64, x0: f64, tol: f64,
+                 maxIter: int64): f64 {
+  var x: f64 := x0;
+  var i: int64 := 0;
+  while (i < maxIter) {
+    var fx: f64 := _call(f, x);
+    if (_abs(fx) < tol) { i := maxIter; }
+    else {
+      var d: f64 := _call(df, x);
+      if (d == 0.0) { return 0.0 - 1.0e308; }
+      var step: f64 := fx / d;
+      x := x - step;
+      if (_abs(step) < tol) { i := maxIter; }
+      else { i := i + 1; }
+    }
+  }
+  return x;
+}
+
+// Newton mit numerisch gebildeter Ableitung — bequem, aber nur halb so genau
+// wie mit einer richtigen.
+pub fn NumNewtonNum(f: fn(f64): f64, x0: f64, tol: f64, maxIter: int64): f64 {
+  var x: f64 := x0;
+  var i: int64 := 0;
+  while (i < maxIter) {
+    var fx: f64 := _call(f, x);
+    if (_abs(fx) < tol) { i := maxIter; }
+    else {
+      var d: f64 := NumDeriv(f, x);
+      if (d == 0.0) { return 0.0 - 1.0e308; }
+      var step: f64 := fx / d;
+      x := x - step;
+      if (_abs(step) < tol) { i := maxIter; }
+      else { i := i + 1; }
+    }
+  }
+  return x;
+}
+
+// Sekantenverfahren: wie Newton, aber die Ableitung wird aus den letzten zwei
+// Punkten geschaetzt. Braucht keine Ableitung und ist immer noch deutlich
+// schneller als die Halbierung.
+pub fn NumSecant(f: fn(f64): f64, x0: f64, x1: f64, tol: f64,
+                 maxIter: int64): f64 {
+  var a: f64 := x0;
+  var b: f64 := x1;
+  var fa: f64 := _call(f, a);
+  var fb: f64 := _call(f, b);
+
+  var i: int64 := 0;
+  while (i < maxIter) {
+    if (_abs(fb) < tol) { i := maxIter; }
+    else {
+      var den: f64 := fb - fa;
+      if (den == 0.0) { return 0.0 - 1.0e308; }
+      var c: f64 := b - fb * (b - a) / den;
+      a := b;
+      fa := fb;
+      b := c;
+      fb := _call(f, b);
+      if (_abs(b - a) < tol) { i := maxIter; }
+      else { i := i + 1; }
+    }
+  }
+  return b;
+}
+
+// ── Integration ──────────────────────────────────────────────────────────────
+
+// Trapezregel mit n Teilstuecken. Fehler faellt mit h^2.
+//
+// Die Summe laeuft kompensiert (siehe std.sum) — bei zehntausend Teilstuecken
+// waere der Rundungsfehler sonst in derselben Groessenordnung wie der
+// Verfahrensfehler, und man wuesste nicht mehr, welcher gemessen wird.
+pub fn NumTrapezoid(f: fn(f64): f64, a: f64, b: f64, n: int64): f64 {
+  if (n < 1) { return 0.0; }
+  var h: f64 := (b - a) / (n as f64);
+
+  var acc: int64 := alloc(SUM_ACC_BYTES);
+  if (acc == 0) { return 0.0; }
+  SumNeumaierInit(acc);
+
+  SumNeumaierAdd(acc, _call(f, a) / 2.0);
+  SumNeumaierAdd(acc, _call(f, b) / 2.0);
+  var i: int64 := 1;
+  while (i < n) {
+    SumNeumaierAdd(acc, _call(f, a + (i as f64) * h));
+    i := i + 1;
+  }
+  var s: f64 := SumNeumaierValue(acc);
+  free(acc, SUM_ACC_BYTES);
+  return s * h;
+}
+
+// Simpsonregel: statt Geraden werden Parabeln durch je drei Punkte gelegt.
+// Fehler faellt mit h^4 — bei doppelt so vielen Stuetzstellen wird er
+// sechzehnmal kleiner statt viermal.
+//
+// n muss gerade sein; ungerade Werte werden um eins erhoeht.
+pub fn NumSimpson(f: fn(f64): f64, a: f64, b: f64, n: int64): f64 {
+  var m: int64 := n;
+  if (m < 2) { m := 2; }
+  if ((m % 2) == 1) { m := m + 1; }
+  var h: f64 := (b - a) / (m as f64);
+
+  var acc: int64 := alloc(SUM_ACC_BYTES);
+  if (acc == 0) { return 0.0; }
+  SumNeumaierInit(acc);
+
+  SumNeumaierAdd(acc, _call(f, a));
+  SumNeumaierAdd(acc, _call(f, b));
+  var i: int64 := 1;
+  while (i < m) {
+    var x: f64 := a + (i as f64) * h;
+    var w: f64 := 2.0;
+    if ((i % 2) == 1) { w := 4.0; }
+    SumNeumaierAdd(acc, w * _call(f, x));
+    i := i + 1;
+  }
+  var s: f64 := SumNeumaierValue(acc);
+  free(acc, SUM_ACC_BYTES);
+  return s * h / 3.0;
+}
+
+// Adaptives Simpson: das Intervall wird nur dort geteilt, wo es noetig ist.
+//
+// Der Kniff ist eine eingebaute Fehlerschaetzung: die Simpsonregel ueber das
+// ganze Intervall und die Summe zweier halber Intervalle unterscheiden sich um
+// etwa das Fuenfzehnfache des Fehlers. Ist der Unterschied klein genug, wird
+// nicht weiter geteilt.
+//
+// Damit kostet eine glatte Funktion wenige Auswertungen und eine mit einer
+// scharfen Spitze genau dort viele — statt ueberall gleich viele.
+//
+// Umgesetzt mit eigenem Stapel statt Rekursion.
+pub fn NumAdaptiveSimpson(f: fn(f64): f64, a: f64, b: f64, tol: f64,
+                          maxDepth: int64): f64 {
+  var cap: int64 := 64 * maxDepth + 256;
+  var sa: int64 := alloc(cap * 8);
+  var sb: int64 := alloc(cap * 8);
+  var stol: int64 := alloc(cap * 8);
+  var sdep: int64 := alloc(cap * 8);
+  if (sa == 0) { return 0.0; }
+  if (sb == 0) { return 0.0; }
+  if (stol == 0) { return 0.0; }
+  if (sdep == 0) { return 0.0; }
+
+  var total: f64 := 0.0;
+  var sp: int64 := 0;
+  pokef64(sa, a);
+  pokef64(sb, b);
+  pokef64(stol, tol);
+  poke64(sdep, 0);
+  sp := 1;
+
+  while (sp > 0) {
+    sp := sp - 1;
+    var lo: f64 := peekf64(sa + sp * 8);
+    var hi: f64 := peekf64(sb + sp * 8);
+    var tl: f64 := peekf64(stol + sp * 8);
+    var dep: int64 := peek64(sdep + sp * 8);
+
+    var mid: f64 := (lo + hi) / 2.0;
+    var whole: f64 := NumSimpson(f, lo, hi, 2);
+    var left: f64 := NumSimpson(f, lo, mid, 2);
+    var right: f64 := NumSimpson(f, mid, hi, 2);
+    var diff: f64 := left + right - whole;
+
+    var accept: bool := _abs(diff) <= 15.0 * tl;
+    if (dep >= maxDepth) { accept := true; }
+
+    if (accept) {
+      total := total + left + right + diff / 15.0;
+    }
+    else {
+      if (sp + 2 >= cap) {
+        total := total + left + right;
+      }
+      else {
+        pokef64(sa + sp * 8, lo);
+        pokef64(sb + sp * 8, mid);
+        pokef64(stol + sp * 8, tl / 2.0);
+        poke64(sdep + sp * 8, dep + 1);
+        sp := sp + 1;
+        pokef64(sa + sp * 8, mid);
+        pokef64(sb + sp * 8, hi);
+        pokef64(stol + sp * 8, tl / 2.0);
+        poke64(sdep + sp * 8, dep + 1);
+        sp := sp + 1;
+      }
+    }
+  }
+
+  free(sa, cap * 8);  free(sb, cap * 8);
+  free(stol, cap * 8);  free(sdep, cap * 8);
+  return total;
+}
+
+// Romberg: die Trapezregel wird mehrfach verfeinert, und aus den Ergebnissen
+// wird nach Richardson extrapoliert.
+//
+// Jede Spalte der Tafel hebt die naechste Fehlerordnung auf: aus h^2 wird h^4,
+// dann h^6. Fuer glatte Funktionen ist das ausserordentlich wirksam — sechs
+// Stufen liefern oft mehr als zehntausend Trapeze.
+pub fn NumRomberg(f: fn(f64): f64, a: f64, b: f64, maxLevel: int64,
+                  tol: f64): f64 {
+  var lv: int64 := maxLevel;
+  if (lv < 1) { lv := 1; }
+  if (lv > 24) { lv := 24; }
+
+  var prev: int64 := alloc((lv + 1) * 8);
+  var cur: int64 := alloc((lv + 1) * 8);
+  if (prev == 0) { return 0.0; }
+  if (cur == 0) { return 0.0; }
+
+  var h: f64 := b - a;
+  pokef64(prev, (_call(f, a) + _call(f, b)) * h / 2.0);
+  var result: f64 := peekf64(prev);
+
+  var k: int64 := 1;
+  var done: bool := false;
+  while (k <= lv) {
+    if (done) { k := lv + 1; }
+    else {
+      h := h / 2.0;
+      // neue Zwischenpunkte aufsummieren
+      var acc: int64 := alloc(SUM_ACC_BYTES);
+      SumNeumaierInit(acc);
+      var pts: int64 := 1;
+      var e: int64 := 0;
+      while (e < k - 1) {
+        pts := pts * 2;
+        e := e + 1;
+      }
+      var i: int64 := 1;
+      while (i <= pts) {
+        SumNeumaierAdd(acc, f(a + ((2 * i - 1) as f64) * h));
+        i := i + 1;
+      }
+      var addSum: f64 := SumNeumaierValue(acc);
+      free(acc, SUM_ACC_BYTES);
+
+      pokef64(cur, peekf64(prev) / 2.0 + h * addSum);
+
+      // Richardson-Spalten
+      var p4: f64 := 1.0;
+      var j: int64 := 1;
+      while (j <= k) {
+        p4 := p4 * 4.0;
+        var better: f64 := peekf64(cur + (j - 1) * 8)
+                         + (peekf64(cur + (j - 1) * 8) - peekf64(prev + (j - 1) * 8))
+                           / (p4 - 1.0);
+        pokef64(cur + j * 8, better);
+        j := j + 1;
+      }
+
+      var newRes: f64 := peekf64(cur + k * 8);
+      if (_abs(newRes - result) < tol) { done := true; }
+      result := newRes;
+
+      var c: int64 := 0;
+      while (c <= k) {
+        pokef64(prev + c * 8, peekf64(cur + c * 8));
+        c := c + 1;
+      }
+      k := k + 1;
+    }
+  }
+
+  free(prev, (lv + 1) * 8);
+  free(cur, (lv + 1) * 8);
+  return result;
+}
+
+// Gauss-Legendre mit fuenf Knoten.
+//
+// Statt gleichmaessig verteilter Stuetzstellen werden die Knoten so gewaehlt,
+// dass Polynome bis zum neunten Grad EXAKT integriert werden — mit nur fuenf
+// Auswertungen. Fuer glatte Funktionen ist das unschlagbar; fuer Funktionen mit
+// Knicken oder Spruengen ungeeignet, weil es keine Fehlerschaetzung gibt.
+pub fn NumGauss5(f: fn(f64): f64, a: f64, b: f64): f64 {
+  var c: f64 := (b + a) / 2.0;
+  var hw: f64 := (b - a) / 2.0;
+
+  // Knoten und Gewichte der Fuenfpunktformel
+  var x1: f64 := 0.9061798459386640;
+  var x2: f64 := 0.5384693101056831;
+  var w0: f64 := 0.5688888888888889;
+  var w1: f64 := 0.2369268850561891;
+  var w2: f64 := 0.4786286704993665;
+
+  var s: f64 := w0 * _call(f, c);
+  s := s + w1 * (_call(f, c - hw * x1) + _call(f, c + hw * x1));
+  s := s + w2 * (_call(f, c - hw * x2) + _call(f, c + hw * x2));
+  return s * hw;
+}
+
+// Zusammengesetzte Gauss-Formel: das Intervall wird in n Stuecke geteilt und
+// auf jedem die Fuenfpunktformel angewandt.
+pub fn NumGaussComposite(f: fn(f64): f64, a: f64, b: f64, n: int64): f64 {
+  if (n < 1) { return NumGauss5(f, a, b); }
+  var h: f64 := (b - a) / (n as f64);
+
+  var acc: int64 := alloc(SUM_ACC_BYTES);
+  if (acc == 0) { return 0.0; }
+  SumNeumaierInit(acc);
+  var i: int64 := 0;
+  while (i < n) {
+    var lo: f64 := a + (i as f64) * h;
+    SumNeumaierAdd(acc, NumGauss5(f, lo, lo + h));
+    i := i + 1;
+  }
+  var s: f64 := SumNeumaierValue(acc);
+  free(acc, SUM_ACC_BYTES);
+  return s;
+}
+
+// ── Interpolation ────────────────────────────────────────────────────────────
+
+// Lineare Interpolation zwischen zwei Punkten.
+pub fn NumLerp(x0: f64, y0: f64, x1: f64, y1: f64, x: f64): f64 {
+  if (x1 == x0) { return y0; }
+  var t: f64 := (x - x0) / (x1 - x0);
+  return y0 + t * (y1 - y0);
+}
+
+// Lineare Interpolation in einer Wertetabelle mit aufsteigenden x.
+// Ausserhalb wird der Randwert gehalten.
+pub fn NumInterpLinear(xs: int64, ys: int64, n: int64, x: f64): f64 {
+  if (n < 1) { return 0.0; }
+  if (n == 1) { return peekf64(ys); }
+
+  if (x <= peekf64(xs)) { return peekf64(ys); }
+  if (x >= peekf64(xs + (n - 1) * 8)) { return peekf64(ys + (n - 1) * 8); }
+
+  // binaere Suche nach dem Abschnitt
+  var lo: int64 := 0;
+  var hi: int64 := n - 1;
+  while (hi - lo > 1) {
+    var mid: int64 := lo + (hi - lo) / 2;
+    if (peekf64(xs + mid * 8) <= x) { lo := mid; }
+    else { hi := mid; }
+  }
+  return NumLerp(peekf64(xs + lo * 8), peekf64(ys + lo * 8),
+                 peekf64(xs + hi * 8), peekf64(ys + hi * 8), x);
+}
+
+// Lagrange-Interpolation durch alle n Punkte.
+//
+// ACHTUNG: mit vielen Stuetzstellen wird das unbrauchbar. Ein Polynom vom Grad
+// zwanzig schwingt zwischen den Punkten wild aus (Runges Phaenomen) — es geht
+// zwar durch alle Punkte, sagt aber zwischen ihnen Unsinn voraus. Bis etwa acht
+// Punkte ist es brauchbar, darueber nimmt man Splines.
+pub fn NumLagrange(xs: int64, ys: int64, n: int64, x: f64): f64 {
+  var acc: int64 := alloc(SUM_ACC_BYTES);
+  if (acc == 0) { return 0.0; }
+  SumNeumaierInit(acc);
+
+  var i: int64 := 0;
+  while (i < n) {
+    var term: f64 := peekf64(ys + i * 8);
+    var xi: f64 := peekf64(xs + i * 8);
+    var j: int64 := 0;
+    while (j < n) {
+      if (j != i) {
+        var xj: f64 := peekf64(xs + j * 8);
+        var den: f64 := xi - xj;
+        if (den != 0.0) { term := term * (x - xj) / den; }
+      }
+      j := j + 1;
+    }
+    SumNeumaierAdd(acc, term);
+    i := i + 1;
+  }
+  var s: f64 := SumNeumaierValue(acc);
+  free(acc, SUM_ACC_BYTES);
+  return s;
+}
+
+// ── Kubische Splines ─────────────────────────────────────────────────────────
+//
+// Statt EINES Polynoms durch alle Punkte je ein kubisches Stueck zwischen zwei
+// benachbarten Punkten — so gewaehlt, dass an den Nahtstellen erste und zweite
+// Ableitung zusammenpassen. Damit ist die Kurve glatt und schwingt nicht aus.
+//
+// "Natuerlich" heisst: an den Enden ist die zweite Ableitung null, die Kurve
+// laeuft also gerade aus.
+//
+// NumSplineBuild rechnet die zweiten Ableitungen aus; sie muessen fuer jede
+// Auswertung mitgegeben werden. Das Feld y2 fasst n Werte.
+
+pub fn NumSplineBuild(xs: int64, ys: int64, n: int64, y2: int64): bool {
+  if (n < 3) {
+    var i0: int64 := 0;
+    while (i0 < n) {
+      pokef64(y2 + i0 * 8, 0.0);
+      i0 := i0 + 1;
+    }
+    return n > 0;
+  }
+
+  var u: int64 := alloc(n * 8);
+  if (u == 0) { return false; }
+
+  pokef64(y2, 0.0);
+  pokef64(u, 0.0);
+
+  // Vorwaertslauf des Thomas-Verfahrens fuer das tridiagonale System
+  var i: int64 := 1;
+  while (i < n - 1) {
+    var xm: f64 := peekf64(xs + (i - 1) * 8);
+    var x0: f64 := peekf64(xs + i * 8);
+    var xp: f64 := peekf64(xs + (i + 1) * 8);
+    var ym: f64 := peekf64(ys + (i - 1) * 8);
+    var y0: f64 := peekf64(ys + i * 8);
+    var yp: f64 := peekf64(ys + (i + 1) * 8);
+
+    var sig: f64 := (x0 - xm) / (xp - xm);
+    var p: f64 := sig * peekf64(y2 + (i - 1) * 8) + 2.0;
+    pokef64(y2 + i * 8, (sig - 1.0) / p);
+
+    var d: f64 := (yp - y0) / (xp - x0) - (y0 - ym) / (x0 - xm);
+    var un: f64 := (6.0 * d / (xp - xm) - sig * peekf64(u + (i - 1) * 8)) / p;
+    pokef64(u + i * 8, un);
+    i := i + 1;
+  }
+
+  pokef64(y2 + (n - 1) * 8, 0.0);
+
+  // Rueckwaertslauf
+  var k: int64 := n - 2;
+  while (k >= 0) {
+    var v: f64 := peekf64(y2 + k * 8) * peekf64(y2 + (k + 1) * 8)
+                + peekf64(u + k * 8);
+    pokef64(y2 + k * 8, v);
+    k := k - 1;
+  }
+
+  free(u, n * 8);
+  return true;
+}
+
+pub fn NumSplineEval(xs: int64, ys: int64, y2: int64, n: int64, x: f64): f64 {
+  if (n < 1) { return 0.0; }
+  if (n == 1) { return peekf64(ys); }
+
+  var lo: int64 := 0;
+  var hi: int64 := n - 1;
+  if (x <= peekf64(xs)) { lo := 0; hi := 1; }
+  else {
+    if (x >= peekf64(xs + (n - 1) * 8)) {
+      lo := n - 2;
+      hi := n - 1;
+    }
+    else {
+      while (hi - lo > 1) {
+        var mid: int64 := lo + (hi - lo) / 2;
+        if (peekf64(xs + mid * 8) <= x) { lo := mid; }
+        else { hi := mid; }
+      }
+    }
+  }
+
+  var xl: f64 := peekf64(xs + lo * 8);
+  var xh: f64 := peekf64(xs + hi * 8);
+  var h: f64 := xh - xl;
+  if (h == 0.0) { return peekf64(ys + lo * 8); }
+
+  var a: f64 := (xh - x) / h;
+  var b: f64 := (x - xl) / h;
+  var yl: f64 := peekf64(ys + lo * 8);
+  var yh: f64 := peekf64(ys + hi * 8);
+  var cl: f64 := peekf64(y2 + lo * 8);
+  var ch: f64 := peekf64(y2 + hi * 8);
+
+  return a * yl + b * yh
+       + ((a * a * a - a) * cl + (b * b * b - b) * ch) * (h * h) / 6.0;
+}
+
+// ── Gewoehnliche Differentialgleichungen ─────────────────────────────────────
+//
+// Gesucht ist y(t) mit y' = _call2(f, t, y) und einem bekannten Startwert. Die
+// Verfahren gehen in Schritten vor und schaetzen bei jedem, wie sich y
+// aendert — sie unterscheiden sich darin, wie oft und wo sie dafuer f
+// auswerten.
+
+// Ein Schritt nach Euler: die Steigung am Anfang wird fuer den ganzen Schritt
+// angenommen. Fehler je Schritt h^2, ueber die ganze Strecke h.
+//
+// Steht hier als Vergleichsmass — in der Praxis ist es fast immer zu ungenau.
+pub fn NumEulerStep(f: fn(f64, f64): f64, t: f64, y: f64, h: f64): f64 {
+  return y + h * _call2(f, t, y);
+}
+
+// Mittelpunktverfahren: erst einen halben Schritt voraus schauen, dann mit der
+// dortigen Steigung den ganzen Schritt machen. Fehler h^2.
+pub fn NumMidpointStep(f: fn(f64, f64): f64, t: f64, y: f64, h: f64): f64 {
+  var k1: f64 := _call2(f, t, y);
+  var k2: f64 := _call2(f, t + h / 2.0, y + h * k1 / 2.0);
+  return y + h * k2;
+}
+
+// Ein Schritt nach Runge und Kutta, vierter Ordnung.
+//
+// Vier Auswertungen: am Anfang, zweimal in der Mitte, am Ende — gewichtet
+// 1:2:2:1. Fehler h^4 ueber die Strecke. Das ist seit hundert Jahren der
+// Arbeitspferd-Algorithmus, weil das Verhaeltnis von Aufwand zu Genauigkeit
+// kaum zu schlagen ist.
+pub fn NumRk4Step(f: fn(f64, f64): f64, t: f64, y: f64, h: f64): f64 {
+  var k1: f64 := _call2(f, t, y);
+  var k2: f64 := _call2(f, t + h / 2.0, y + h * k1 / 2.0);
+  var k3: f64 := _call2(f, t + h / 2.0, y + h * k2 / 2.0);
+  var k4: f64 := _call2(f, t + h, y + h * k3);
+  return y + h * (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
+}
+
+// Von t0 bis t1 in `steps` gleichen Schritten.
+pub fn NumRk4Solve(f: fn(f64, f64): f64, t0: f64, y0: f64, t1: f64,
+                   steps: int64): f64 {
+  if (steps < 1) { return y0; }
+  var h: f64 := (t1 - t0) / (steps as f64);
+  var t: f64 := t0;
+  var y: f64 := y0;
+  var i: int64 := 0;
+  while (i < steps) {
+    y := NumRk4Step(f, t, y, h);
+    t := t0 + ((i + 1) as f64) * h;
+    i := i + 1;
+  }
+  return y;
+}
+
+// Euler zum Vergleich — dieselbe Aufgabe, dasselbe Geruest.
+pub fn NumEulerSolve(f: fn(f64, f64): f64, t0: f64, y0: f64, t1: f64,
+                     steps: int64): f64 {
+  if (steps < 1) { return y0; }
+  var h: f64 := (t1 - t0) / (steps as f64);
+  var t: f64 := t0;
+  var y: f64 := y0;
+  var i: int64 := 0;
+  while (i < steps) {
+    y := NumEulerStep(f, t, y, h);
+    t := t0 + ((i + 1) as f64) * h;
+    i := i + 1;
+  }
+  return y;
+}
+
+// Mit veraenderlicher Schrittweite: nach jedem Schritt wird geschaetzt, wie
+// gross der Fehler war, und die Weite entsprechend angepasst.
+//
+// Geschaetzt wird durch Vergleich: ein ganzer Schritt gegen zwei halbe. Ihr
+// Unterschied ist etwa das Fuenfzehnfache des Fehlers des genaueren
+// Ergebnisses. Ist er zu gross, wird der Schritt verworfen und kleiner
+// wiederholt; ist er sehr klein, waechst die Weite.
+//
+// So kostet ein glatter Abschnitt wenige Schritte und ein steiler viele —
+// statt ueberall gleich viele. `outSteps` (darf 0 sein) bekommt die Zahl der
+// tatsaechlich gerechneten Schritte.
+pub fn NumRk4Adaptive(f: fn(f64, f64): f64, t0: f64, y0: f64, t1: f64,
+                      tol: f64, hInit: f64, outSteps: int64): f64 {
+  var t: f64 := t0;
+  var y: f64 := y0;
+  var h: f64 := hInit;
+  if (h <= 0.0) { h := (t1 - t0) / 100.0; }
+  var count: int64 := 0;
+  var guard: int64 := 0;
+
+  var run: bool := true;
+  while (run) {
+    if (t >= t1) { run := false; }
+    else {
+      if (guard > 1000000) { run := false; }
+      else {
+        if (t + h > t1) { h := t1 - t; }
+
+        var whole: f64 := NumRk4Step(f, t, y, h);
+        var half1: f64 := NumRk4Step(f, t, y, h / 2.0);
+        var half2: f64 := NumRk4Step(f, t + h / 2.0, half1, h / 2.0);
+        var errEst: f64 := _abs(half2 - whole) / 15.0;
+
+        if (errEst <= tol) {
+          t := t + h;
+          y := half2 + (half2 - whole) / 15.0;
+          count := count + 1;
+          // Weite vorsichtig vergroessern
+          if (errEst > 0.0) {
+            var grow: f64 := PowF64(tol / errEst, 0.2) * 0.9;
+            if (grow > 4.0) { grow := 4.0; }
+            h := h * grow;
+          }
+          else { h := h * 2.0; }
+        }
+        else {
+          var shrink: f64 := PowF64(tol / errEst, 0.25) * 0.9;
+          if (shrink < 0.1) { shrink := 0.1; }
+          h := h * shrink;
+        }
+        guard := guard + 1;
+      }
+    }
+  }
+
+  if (outSteps != 0) { poke64(outSteps, count); }
+  return y;
+}
+
+// ── Systeme ──────────────────────────────────────────────────────────────────
+
+// Runge-Kutta vierter Ordnung fuer ein System aus n Gleichungen.
+//
+// Die rechte Seite bekommt t, das Feld y und schreibt die Ableitungen nach
+// dydt. Damit lassen sich Bewegungsgleichungen zweiter Ordnung als System
+// erster Ordnung rechnen — der uebliche Weg fuer Feder, Pendel und Umlaufbahn.
+pub fn NumRk4SolveSys(f: fn(f64, int64, int64): void, t0: f64, y0: int64,
+                      n: int64, t1: f64, steps: int64, out: int64): bool {
+  if (steps < 1) { return false; }
+  var h: f64 := (t1 - t0) / (steps as f64);
+
+  var y: int64 := alloc(n * 8);
+  var tmp: int64 := alloc(n * 8);
+  var k1: int64 := alloc(n * 8);
+  var k2: int64 := alloc(n * 8);
+  var k3: int64 := alloc(n * 8);
+  var k4: int64 := alloc(n * 8);
+  if (y == 0) { return false; }
+  if (tmp == 0) { return false; }
+  if (k1 == 0) { return false; }
+  if (k2 == 0) { return false; }
+  if (k3 == 0) { return false; }
+  if (k4 == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    pokef64(y + i * 8, peekf64(y0 + i * 8));
+    i := i + 1;
+  }
+
+  var t: f64 := t0;
+  var s: int64 := 0;
+  while (s < steps) {
+    f(t, y, k1);
+
+    i := 0;
+    while (i < n) {
+      pokef64(tmp + i * 8, peekf64(y + i * 8) + h * peekf64(k1 + i * 8) / 2.0);
+      i := i + 1;
+    }
+    f(t + h / 2.0, tmp, k2);
+
+    i := 0;
+    while (i < n) {
+      pokef64(tmp + i * 8, peekf64(y + i * 8) + h * peekf64(k2 + i * 8) / 2.0);
+      i := i + 1;
+    }
+    f(t + h / 2.0, tmp, k3);
+
+    i := 0;
+    while (i < n) {
+      pokef64(tmp + i * 8, peekf64(y + i * 8) + h * peekf64(k3 + i * 8));
+      i := i + 1;
+    }
+    f(t + h, tmp, k4);
+
+    i := 0;
+    while (i < n) {
+      var d: f64 := peekf64(k1 + i * 8) + 2.0 * peekf64(k2 + i * 8)
+                  + 2.0 * peekf64(k3 + i * 8) + peekf64(k4 + i * 8);
+      pokef64(y + i * 8, peekf64(y + i * 8) + h * d / 6.0);
+      i := i + 1;
+    }
+
+    t := t0 + ((s + 1) as f64) * h;
+    s := s + 1;
+  }
+
+  i := 0;
+  while (i < n) {
+    pokef64(out + i * 8, peekf64(y + i * 8));
+    i := i + 1;
+  }
+
+  free(y, n * 8);  free(tmp, n * 8);
+  free(k1, n * 8);  free(k2, n * 8);
+  free(k3, n * 8);  free(k4, n * 8);
+  return true;
+}
+
+// ── Mehrschrittverfahren ─────────────────────────────────────────────────────
+//
+// Runge-Kutta wertet die rechte Seite in jedem Schritt viermal aus und wirft
+// diese Werte danach weg. Mehrschrittverfahren machen es umgekehrt: sie heben
+// die ALTEN Werte auf und leiten daraus die naechste Naeherung ab. Ein Schritt
+// kostet dann nur EINE Auswertung statt vier.
+//
+// Der Preis ist Umstaendlichkeit: die ersten Schritte lassen sich so nicht
+// rechnen (es gibt noch keine Vergangenheit), deshalb liefert Runge-Kutta die
+// Startwerte. Und die Schrittweite laesst sich nicht ohne Weiteres aendern,
+// weil die gespeicherten Werte auf gleichmaessige Abstaende gebaut sind.
+//
+// Lohnt sich, wenn die Auswertung der rechten Seite teuer ist — bei einem
+// Modell mit tausend Termen zaehlt der Unterschied zwischen einer und vier
+// Auswertungen unmittelbar.
+
+// Adams-Bashforth vierter Ordnung.
+//
+//     y[n+1] = y[n] + h/24 * (55 f[n] - 59 f[n-1] + 37 f[n-2] - 9 f[n-3])
+//
+// Die Koeffizienten stammen daraus, dass man ein Polynom dritten Grades durch
+// die letzten vier Steigungen legt und es ueber den naechsten Schritt
+// integriert. Vierte Ordnung wie RK4, aber eine Auswertung je Schritt.
+//
+// Die ersten drei Schritte kommen aus NumRk4Step; wer sie schlechter berechnet,
+// verdirbt die Ordnung des ganzen Laufs.
+pub fn NumAdamsBashforth4(f: fn(f64, f64): f64, t0: f64, y0: f64, t1: f64,
+                          steps: int64): f64 {
+  if (steps < 1) { return y0; }
+  if (steps < 4) { return NumRk4Solve(f, t0, y0, t1, steps); }
+
+  var h: f64 := (t1 - t0) / (steps as f64);
+  var y: f64 := y0;
+  var t: f64 := t0;
+
+  // Vergangenheit: die letzten vier Steigungen, f0 ist die aktuellste
+  var f0: f64 := 0.0;
+  var f1: f64 := 0.0;
+  var f2: f64 := 0.0;
+  var f3: f64 := 0.0;
+
+  // Anlauf mit Runge-Kutta
+  f3 := _call2(f, t, y);
+  y := NumRk4Step(f, t, y, h);
+  t := t0 + h;
+  f2 := _call2(f, t, y);
+  y := NumRk4Step(f, t, y, h);
+  t := t0 + 2.0 * h;
+  f1 := _call2(f, t, y);
+  y := NumRk4Step(f, t, y, h);
+  t := t0 + 3.0 * h;
+  f0 := _call2(f, t, y);
+
+  var i: int64 := 3;
+  while (i < steps) {
+    var yn: f64 := y + h * (55.0 * f0 - 59.0 * f1 + 37.0 * f2 - 9.0 * f3) / 24.0;
+    t := t0 + ((i + 1) as f64) * h;
+    y := yn;
+
+    // Vergangenheit weiterschieben
+    f3 := f2;
+    f2 := f1;
+    f1 := f0;
+    f0 := _call2(f, t, y);
+    i := i + 1;
+  }
+  return y;
+}
+
+// Adams-Bashforth-Moulton: vorhersagen und nachbessern.
+//
+// Der explizite Adams-Bashforth-Schritt liefert eine Vorhersage, der IMPLIZITE
+// Adams-Moulton-Schritt bessert sie nach:
+//
+//     y* = y[n] + h/24 * (55 f[n] - 59 f[n-1] + 37 f[n-2] - 9 f[n-3])
+//     y[n+1] = y[n] + h/24 * (9 f(t[n+1], y*) + 19 f[n] - 5 f[n-1] + f[n-2])
+//
+// Das kostet zwei Auswertungen statt einer und ist dafuer deutlich genauer als
+// der reine Vorhersageschritt — und die Differenz zwischen Vorhersage und
+// Nachbesserung ist zugleich eine brauchbare Fehlerschaetzung.
+pub fn NumAdamsMoulton4(f: fn(f64, f64): f64, t0: f64, y0: f64, t1: f64,
+                        steps: int64): f64 {
+  if (steps < 1) { return y0; }
+  if (steps < 4) { return NumRk4Solve(f, t0, y0, t1, steps); }
+
+  var h: f64 := (t1 - t0) / (steps as f64);
+  var y: f64 := y0;
+  var t: f64 := t0;
+
+  var f0: f64 := 0.0;
+  var f1: f64 := 0.0;
+  var f2: f64 := 0.0;
+  var f3: f64 := 0.0;
+
+  f3 := _call2(f, t, y);
+  y := NumRk4Step(f, t, y, h);
+  t := t0 + h;
+  f2 := _call2(f, t, y);
+  y := NumRk4Step(f, t, y, h);
+  t := t0 + 2.0 * h;
+  f1 := _call2(f, t, y);
+  y := NumRk4Step(f, t, y, h);
+  t := t0 + 3.0 * h;
+  f0 := _call2(f, t, y);
+
+  var i: int64 := 3;
+  while (i < steps) {
+    var tn: f64 := t0 + ((i + 1) as f64) * h;
+    // vorhersagen
+    var pred: f64 := y + h * (55.0 * f0 - 59.0 * f1 + 37.0 * f2 - 9.0 * f3) / 24.0;
+    var fp: f64 := _call2(f, tn, pred);
+    // nachbessern
+    y := y + h * (9.0 * fp + 19.0 * f0 - 5.0 * f1 + f2) / 24.0;
+    t := tn;
+
+    f3 := f2;
+    f2 := f1;
+    f1 := f0;
+    f0 := _call2(f, t, y);
+    i := i + 1;
+  }
+  return y;
+}
+
+// ── Steife Gleichungen ───────────────────────────────────────────────────────
+//
+// Eine Gleichung heisst steif, wenn ihre Loesung sich langsam aendert, aber
+// benachbarte Loesungen sehr schnell auf sie zulaufen. Beispiel:
+//
+//     y' = -1000 (y - cos t) - sin t
+//
+// Die Loesung ist nahezu cos t und voellig harmlos. Trotzdem zwingt der Faktor
+// -1000 jedes EXPLIZITE Verfahren zu winzigen Schritten: Runge-Kutta ist nur
+// stabil, solange h kleiner als etwa 2.8/1000 ist. Wer groessere Schritte
+// nimmt, bekommt keine ungenaue Loesung, sondern eine, die oszillierend ins
+// Unendliche laeuft.
+//
+// Implizite Verfahren haben diese Schranke nicht. Der Preis: in jedem Schritt
+// steht y[n+1] auf BEIDEN Seiten der Gleichung, man muss also eine Gleichung
+// loesen statt nur einzusetzen. Hier geschieht das mit Newtons Verfahren und
+// numerisch gebildeter Ableitung.
+
+// Implizites Euler-Verfahren (BDF der Ordnung 1):
+//
+//     y[n+1] = y[n] + h * f(t[n+1], y[n+1])
+//
+// Erste Ordnung, also nicht genau — aber uneingeschraenkt stabil. Fuer steife
+// Aufgaben ist das oft der bessere Handel: lieber ein grober Wert, der die
+// Loesung trifft, als ein feiner, der explodiert.
+pub fn NumBdf1(f: fn(f64, f64): f64, t0: f64, y0: f64, t1: f64,
+               steps: int64): f64 {
+  if (steps < 1) { return y0; }
+  var h: f64 := (t1 - t0) / (steps as f64);
+  var y: f64 := y0;
+  var t: f64 := t0;
+
+  var i: int64 := 0;
+  while (i < steps) {
+    var tn: f64 := t0 + ((i + 1) as f64) * h;
+    // Startwert aus dem expliziten Schritt
+    var g: f64 := y + h * _call2(f, t, y);
+
+    // Newton auf G(g) = g - y - h*f(tn, g) = 0
+    var k: int64 := 0;
+    while (k < 50) {
+      var fg: f64 := _call2(f, tn, g);
+      var G: f64 := g - y - h * fg;
+      if (_abs(G) < 1.0e-14) { k := 50; }
+      else {
+        // G'(g) = 1 - h * df/dy, Ableitung zentral gebildet
+        var eps: f64 := 1.0e-7 * (1.0 + _abs(g));
+        var fp: f64 := _call2(f, tn, g + eps);
+        var fm: f64 := _call2(f, tn, g - eps);
+        var dfdy: f64 := (fp - fm) / (2.0 * eps);
+        var Gp: f64 := 1.0 - h * dfdy;
+        if (Gp == 0.0) { k := 50; }
+        else {
+          var step: f64 := G / Gp;
+          g := g - step;
+          if (_abs(step) < 1.0e-14 * (1.0 + _abs(g))) { k := 50; }
+          else { k := k + 1; }
+        }
+      }
+    }
+    y := g;
+    t := tn;
+    i := i + 1;
+  }
+  return y;
+}
+
+// BDF der Ordnung 2:
+//
+//     y[n+1] = (4 y[n] - y[n-1] + 2h f(t[n+1], y[n+1])) / 3
+//
+// Zweite Ordnung und immer noch uneingeschraenkt stabil — die guenstigste
+// Verbindung von beidem. Ab Ordnung 3 gilt das nicht mehr (Dahlquists zweite
+// Schranke); deshalb endet die Reihe hier.
+//
+// Der erste Schritt kommt aus BDF1, weil noch keine Vergangenheit da ist.
+pub fn NumBdf2(f: fn(f64, f64): f64, t0: f64, y0: f64, t1: f64,
+               steps: int64): f64 {
+  if (steps < 1) { return y0; }
+  if (steps < 2) { return NumBdf1(f, t0, y0, t1, steps); }
+
+  var h: f64 := (t1 - t0) / (steps as f64);
+  var yPrev: f64 := y0;
+  var y: f64 := NumBdf1(f, t0, y0, t0 + h, 1);
+  var t: f64 := t0 + h;
+
+  var i: int64 := 1;
+  while (i < steps) {
+    var tn: f64 := t0 + ((i + 1) as f64) * h;
+    var g: f64 := y + h * _call2(f, t, y);
+
+    var k: int64 := 0;
+    while (k < 50) {
+      var fg: f64 := _call2(f, tn, g);
+      var G: f64 := 3.0 * g - 4.0 * y + yPrev - 2.0 * h * fg;
+      if (_abs(G) < 1.0e-14) { k := 50; }
+      else {
+        var eps: f64 := 1.0e-7 * (1.0 + _abs(g));
+        var fp: f64 := _call2(f, tn, g + eps);
+        var fm: f64 := _call2(f, tn, g - eps);
+        var dfdy: f64 := (fp - fm) / (2.0 * eps);
+        var Gp: f64 := 3.0 - 2.0 * h * dfdy;
+        if (Gp == 0.0) { k := 50; }
+        else {
+          var step: f64 := G / Gp;
+          g := g - step;
+          if (_abs(step) < 1.0e-14 * (1.0 + _abs(g))) { k := 50; }
+          else { k := k + 1; }
+        }
+      }
+    }
+    yPrev := y;
+    y := g;
+    t := tn;
+    i := i + 1;
+  }
+  return y;
+}
+
+// Trapezregel als Loeser (implizite Mittelung, auch Crank-Nicolson):
+//
+//     y[n+1] = y[n] + h/2 * (f(t[n], y[n]) + f(t[n+1], y[n+1]))
+//
+// Zweite Ordnung, uneingeschraenkt stabil und ERHALTEND: bei einer
+// Schwingungsgleichung bleibt die Energie erhalten, waehrend BDF sie
+// weggedaempft. Dafuer klingen scharfe Anfangstransienten nicht so schnell ab.
+pub fn NumTrapezoidal(f: fn(f64, f64): f64, t0: f64, y0: f64, t1: f64,
+                      steps: int64): f64 {
+  if (steps < 1) { return y0; }
+  var h: f64 := (t1 - t0) / (steps as f64);
+  var y: f64 := y0;
+  var t: f64 := t0;
+
+  var i: int64 := 0;
+  while (i < steps) {
+    var tn: f64 := t0 + ((i + 1) as f64) * h;
+    var fn0: f64 := _call2(f, t, y);
+    var g: f64 := y + h * fn0;
+
+    var k: int64 := 0;
+    while (k < 50) {
+      var fg: f64 := _call2(f, tn, g);
+      var G: f64 := g - y - h * (fn0 + fg) / 2.0;
+      if (_abs(G) < 1.0e-14) { k := 50; }
+      else {
+        var eps: f64 := 1.0e-7 * (1.0 + _abs(g));
+        var fp: f64 := _call2(f, tn, g + eps);
+        var fm: f64 := _call2(f, tn, g - eps);
+        var dfdy: f64 := (fp - fm) / (2.0 * eps);
+        var Gp: f64 := 1.0 - h * dfdy / 2.0;
+        if (Gp == 0.0) { k := 50; }
+        else {
+          var step: f64 := G / Gp;
+          g := g - step;
+          if (_abs(step) < 1.0e-14 * (1.0 + _abs(g))) { k := 50; }
+          else { k := k + 1; }
+        }
+      }
+    }
+    y := g;
+    t := tn;
+    i := i + 1;
+  }
+  return y;
+}
+
+// ── Randwertprobleme ─────────────────────────────────────────────────────────
+//
+// Bisher war immer der ANFANG bekannt: y(t0) gegeben, gesucht der Verlauf. Bei
+// einem Randwertproblem sind stattdessen beide ENDEN vorgegeben:
+//
+//     y'' = f(x, y, y')     mit y(a) = alpha und y(b) = beta
+//
+// Das ist eine andere Aufgabe. Ein durchgerechneter Verlauf trifft das rechte
+// Ende im Allgemeinen nicht; man muss die fehlende Anfangssteigung erst finden.
+//
+// Zwei Wege stehen hier bereit, und sie taugen fuer verschiedene Faelle:
+//
+//   SCHIESSVERFAHREN — raten, rechnen, nachjustieren. Die unbekannte
+//   Anfangssteigung wird als Stellgroesse behandelt und so lange verstellt, bis
+//   das rechte Ende passt. Das ist eine gewoehnliche Nullstellensuche, und
+//   deshalb erledigt sie NumBrent. Bequem und genau, solange die Loesung nicht
+//   ueber die Strecke stark anwaechst — sonst reagiert das rechte Ende so
+//   empfindlich auf die Anfangssteigung, dass die Suche keinen Halt findet.
+//
+//   FINITE DIFFERENZEN — die Strecke wird in Stuetzstellen zerlegt, jede
+//   Ableitung durch einen Differenzenquotienten ersetzt, und aus den
+//   entstehenden Gleichungen wird ein Gleichungssystem. Bei LINEAREN Problemen
+//   ist es tridiagonal und in einem Durchlauf loesbar. Unempfindlich gegen das
+//   Anwachsen, dafuer nur zweiter Ordnung genau.
+
+// Zustandsspeicher fuer das Schiessverfahren.
+//
+// Der Rueckruf, den NumBrent bekommt, darf nur EIN Argument haben — die
+// gesuchte Steigung. Alles Weitere (die Gleichung, die Raender, die
+// Schrittzahl) muss deshalb woanders stehen. Geschlossene Umgebungen gibt es
+// in dieser Sprache nicht, also unit-eigene Variablen.
+// Der Zeiger liegt als int64 vor: eine globale Variable vom Funktionstyp
+// wird vom Codegen nicht angelegt ("undefined function"). Beim Gebrauch wird
+// zurueckgecastet.
+var _shootF: int64 := 0;
+var _shootA: f64 := 0.0;
+var _shootB: f64 := 0.0;
+var _shootAlpha: f64 := 0.0;
+var _shootBeta: f64 := 0.0;
+var _shootSteps: int64 := 100;
+
+// Einen Verlauf mit gegebener Anfangssteigung durchrechnen und zurueckgeben,
+// wie weit das rechte Ende danebenliegt. Genau diese Funktion sucht NumBrent
+// auf null.
+fn _call3(f: fn(f64, f64, f64): f64, a: f64, b: f64, c: f64): f64 {
+  return f(a, b, c);
+}
+
+fn _shootAt(x: f64, y: f64, v: f64): f64 {
+  var f: fn(f64, f64, f64): f64 := _shootF as fn(f64, f64, f64): f64;
+  return _call3(f, x, y, v);
+}
+
+fn _shootMiss(slope: f64): f64 {
+  var n: int64 := _shootSteps;
+  var h: f64 := (_shootB - _shootA) / (n as f64);
+  var x: f64 := _shootA;
+  var y: f64 := _shootAlpha;
+  var v: f64 := slope;
+
+  // y'' = f(x,y,y') als System y' = v, v' = f — mit Runge-Kutta
+  var i: int64 := 0;
+  while (i < n) {
+    var k1y: f64 := v;
+    var k1v: f64 := _shootAt(x, y, v);
+
+    var k2y: f64 := v + h * k1v / 2.0;
+    var k2v: f64 := _shootAt(x + h / 2.0, y + h * k1y / 2.0, v + h * k1v / 2.0);
+
+    var k3y: f64 := v + h * k2v / 2.0;
+    var k3v: f64 := _shootAt(x + h / 2.0, y + h * k2y / 2.0, v + h * k2v / 2.0);
+
+    var k4y: f64 := v + h * k3v;
+    var k4v: f64 := _shootAt(x + h, y + h * k3y, v + h * k3v);
+
+    y := y + h * (k1y + 2.0 * k2y + 2.0 * k3y + k4y) / 6.0;
+    v := v + h * (k1v + 2.0 * k2v + 2.0 * k3v + k4v) / 6.0;
+    x := _shootA + ((i + 1) as f64) * h;
+    i := i + 1;
+  }
+  return y - _shootBeta;
+}
+
+// Randwertproblem y'' = f(x, y, y') mit y(a) = alpha, y(b) = beta.
+//
+// Gesucht und zurueckgegeben wird die ANFANGSSTEIGUNG y'(a); mit ihr laesst
+// sich der Verlauf anschliessend als gewoehnliches Anfangswertproblem
+// durchrechnen. `slopeLo` und `slopeHi` schliessen sie ein — sie muessen so
+// gewaehlt sein, dass das rechte Ende einmal zu tief und einmal zu hoch
+// herauskommt.
+//
+// Der kleinste f64 als Rueckgabe bedeutet: in diesem Bereich liegt keine
+// Loesung (NumBrent hat keinen Vorzeichenwechsel gefunden).
+pub fn NumShoot(f: fn(f64, f64, f64): f64, a: f64, b: f64,
+                alpha: f64, beta: f64,
+                slopeLo: f64, slopeHi: f64, steps: int64, tol: f64): f64 {
+  _shootF := f as int64;
+  _shootA := a;
+  _shootB := b;
+  _shootAlpha := alpha;
+  _shootBeta := beta;
+  _shootSteps := steps;
+  if (_shootSteps < 1) { _shootSteps := 100; }
+
+  return NumBrent(_shootMiss, slopeLo, slopeHi, tol, 200);
+}
+
+// Den Verlauf zu einer bekannten Anfangssteigung ausrechnen und nach outY
+// schreiben (steps+1 Werte, von a bis b).
+pub fn NumShootTrace(f: fn(f64, f64, f64): f64, a: f64, b: f64,
+                     alpha: f64, slope: f64, steps: int64, outY: int64): bool {
+  if (steps < 1) { return false; }
+  var h: f64 := (b - a) / (steps as f64);
+  var x: f64 := a;
+  var y: f64 := alpha;
+  var v: f64 := slope;
+  pokef64(outY, y);
+
+  var i: int64 := 0;
+  while (i < steps) {
+    var k1y: f64 := v;
+    var k1v: f64 := _call3(f, x, y, v);
+    var k2y: f64 := v + h * k1v / 2.0;
+    var k2v: f64 := _call3(f, x + h / 2.0, y + h * k1y / 2.0, v + h * k1v / 2.0);
+    var k3y: f64 := v + h * k2v / 2.0;
+    var k3v: f64 := _call3(f, x + h / 2.0, y + h * k2y / 2.0, v + h * k2v / 2.0);
+    var k4y: f64 := v + h * k3v;
+    var k4v: f64 := _call3(f, x + h, y + h * k3y, v + h * k3v);
+
+    y := y + h * (k1y + 2.0 * k2y + 2.0 * k3y + k4y) / 6.0;
+    v := v + h * (k1v + 2.0 * k2v + 2.0 * k3v + k4v) / 6.0;
+    x := a + ((i + 1) as f64) * h;
+    pokef64(outY + (i + 1) * 8, y);
+    i := i + 1;
+  }
+  return true;
+}
+
+// Lineares Randwertproblem mit finiten Differenzen:
+//
+//     y'' + p(x) y' + q(x) y = r(x),   y(a) = alpha, y(b) = beta
+//
+// An jeder inneren Stuetzstelle werden die Ableitungen durch zentrale
+// Differenzen ersetzt. Das ergibt je eine Gleichung, in der nur der Knoten
+// selbst und seine beiden Nachbarn vorkommen — das entstehende System ist
+// TRIDIAGONAL und laesst sich in einem Vorwaerts- und einem Rueckwaertslauf
+// loesen (Thomas-Verfahren), ohne je eine Matrix aufzustellen.
+//
+// outY fasst n+1 Werte einschliesslich beider Raender. Rueckgabe false, wenn
+// das System entartet ist.
+pub fn NumBvpLinear(p: fn(f64): f64, q: fn(f64): f64, r: fn(f64): f64,
+                    a: f64, b: f64, alpha: f64, beta: f64,
+                    n: int64, outY: int64): bool {
+  if (n < 2) { return false; }
+  var h: f64 := (b - a) / (n as f64);
+  var m: int64 := n - 1;                 // innere Knoten
+
+  var lo: int64 := alloc(m * 8);
+  var di: int64 := alloc(m * 8);
+  var up: int64 := alloc(m * 8);
+  var rh: int64 := alloc(m * 8);
+  if (lo == 0) { return false; }
+  if (di == 0) { return false; }
+  if (up == 0) { return false; }
+  if (rh == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < m) {
+    var x: f64 := a + ((i + 1) as f64) * h;
+    var pv: f64 := _call(p, x);
+    var qv: f64 := _call(q, x);
+    var rv: f64 := _call(r, x);
+
+    // (y[i-1] - 2y[i] + y[i+1])/h^2 + p*(y[i+1] - y[i-1])/(2h) + q*y[i] = r
+    pokef64(lo + i * 8, 1.0 / (h * h) - pv / (2.0 * h));
+    pokef64(di + i * 8, 0.0 - 2.0 / (h * h) + qv);
+    pokef64(up + i * 8, 1.0 / (h * h) + pv / (2.0 * h));
+    pokef64(rh + i * 8, rv);
+    i := i + 1;
+  }
+
+  // Randwerte auf die rechte Seite bringen
+  pokef64(rh, peekf64(rh) - peekf64(lo) * alpha);
+  pokef64(rh + (m - 1) * 8, peekf64(rh + (m - 1) * 8)
+                          - peekf64(up + (m - 1) * 8) * beta);
+
+  // Thomas-Verfahren: vorwaerts eliminieren
+  var ok: bool := true;
+  i := 1;
+  while (i < m) {
+    var d0: f64 := peekf64(di + (i - 1) * 8);
+    if (d0 == 0.0) { ok := false; i := m; }
+    else {
+      var w: f64 := peekf64(lo + i * 8) / d0;
+      pokef64(di + i * 8, peekf64(di + i * 8) - w * peekf64(up + (i - 1) * 8));
+      pokef64(rh + i * 8, peekf64(rh + i * 8) - w * peekf64(rh + (i - 1) * 8));
+      i := i + 1;
+    }
+  }
+
+  if (ok) {
+    var dl: f64 := peekf64(di + (m - 1) * 8);
+    if (dl == 0.0) { ok := false; }
+    else {
+      // rueckwaerts einsetzen
+      pokef64(outY, alpha);
+      pokef64(outY + n * 8, beta);
+      pokef64(outY + m * 8, peekf64(rh + (m - 1) * 8) / dl);
+
+      var k: int64 := m - 2;
+      while (k >= 0) {
+        var num: f64 := peekf64(rh + k * 8)
+                      - peekf64(up + k * 8) * peekf64(outY + (k + 2) * 8);
+        var dk: f64 := peekf64(di + k * 8);
+        if (dk == 0.0) { ok := false; k := 0 - 1; }
+        else {
+          pokef64(outY + (k + 1) * 8, num / dk);
+          k := k - 1;
+        }
+      }
+    }
+  }
+
+  free(lo, m * 8);  free(di, m * 8);  free(up, m * 8);  free(rh, m * 8);
+  return ok;
+}

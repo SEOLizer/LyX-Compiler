@@ -1,0 +1,871 @@
+// std/bits.lyx
+// Bitzaehlung und Bitmengen: Popcount, Rank/Select, Mengenoperationen
+
+@description("Bit manipulation: SWAR population count correct for all 64 bits, parity, leading/trailing zero counts, logical shift and rotation, bit reversal, byte swap, Gray code, Hamming distance, plus bitsets over word arrays with union/intersection, rank, select and iteration")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.bits;
+
+// ── Warum diese Unit ueberhaupt noetig ist ───────────────────────────────────
+//
+// std.math bringt bereits ein PopCount mit. Gemessen mit lyxc 1.0.19D:
+//
+//     PopCount(-1)  ->  1     richtig waeren 64
+//     PopCount(-2)  ->  1     richtig waeren 63
+//     PopCount(255) ->  8     richtig
+//
+// Die dortige Schleife teilt fortlaufend durch zwei. Bei negativen Zahlen
+// trunkiert die Division Richtung null: -1/2 ist 0, nicht -1. Nach einem
+// einzigen Durchlauf ist der Wert null und die Schleife endet. Fuer alle
+// nichtnegativen Zahlen stimmt das Ergebnis, fuer alle negativen ist es
+// falsch — und zwar still.
+//
+// Das ist keine Randerscheinung: Bitmasken, Hashwerte, Pruefsummen und
+// Bitmengen haben regelmaessig das oberste Bit gesetzt. Deshalb hier eine
+// Fassung, die das BITMUSTER zaehlt und sich um das Vorzeichen nicht kuemmert.
+//
+// ── Rechtsschieben ist arithmetisch ──────────────────────────────────────────
+//
+// Ebenfalls gemessen: `>>` erweitert das Vorzeichen.
+//
+//     (-1) >> 1   ->  -1
+//     (-1) >> 63  ->  -1
+//
+// Jede Bitzaehlung, die den Wert nach rechts schiebt, laeuft bei gesetztem
+// oberstem Bit deshalb endlos oder falsch.
+//
+// Es GIBT einen Weg zum logischen Schieben — der Umweg ueber uint64 (gemessen
+// 2026-08-15, so machen es keccak.lyx und zstd.lyx im Bestand):
+//
+//     ((-1) as uint64) >> 1   ->  9223372036854775807     logisch, richtig
+//     ((-1) as uint64) >> 63  ->  1
+//
+// Er hilft aber nur halb: die SCHIEBEWEITE bleibt modulo 64 maskiert (siehe
+// unten), und der Cast muss an jeder einzelnen Stelle stehen. BitsShr macht
+// beides in einem: logisch schieben UND die Weite saettigen. Alle Funktionen
+// hier benutzen ausschliesslich BitsShr.
+//
+// ── Zaehlweise ───────────────────────────────────────────────────────────────
+//
+// Bit 0 ist das niedrigstwertige, Bit 63 das oberste (das Vorzeichenbit).
+// Ein int64 ist hier ein Behaelter fuer 64 Bit, keine Zahl mit Vorzeichen.
+
+pub con BITS_WORD: int64 := 64;
+
+// ── Masken und Schieben ──────────────────────────────────────────────────────
+
+// Die n niedrigsten Bits gesetzt. n <= 0 gibt 0, n >= 64 gibt alle Bits.
+//
+// Der Sonderfall n = 64 muss von Hand kommen: (1 << 64) - 1 waere ein Schieben
+// um die volle Wortbreite und damit undefiniert.
+pub fn BitsMask(n: int64): int64 {
+  if (n <= 0) { return 0; }
+  if (n >= 64) { return 0 - 1; }
+  return (1 << n) - 1;
+}
+
+// Logisches Rechtsschieben: es werden Nullen nachgezogen, nicht das
+// Vorzeichen. Genau das, was `>>` nicht tut.
+pub fn BitsShr(x: int64, n: int64): int64 {
+  if (n <= 0) { return x; }
+  if (n >= 64) { return 0; }
+  return (x >> n) & BitsMask(64 - n);
+}
+
+// Linksschieben. Um 64 oder mehr Stellen bleibt nichts uebrig — in der Sprache
+// waere das undefiniert, hier ist es 0.
+pub fn BitsShl(x: int64, n: int64): int64 {
+  if (n <= 0) { return x; }
+  if (n >= 64) { return 0; }
+  return x << n;
+}
+
+// ── Warum diese beiden Funktionen nicht bloss Verpackung sind ────────────────
+//
+// Die eingebauten Schiebeoperatoren nehmen die Schiebeweite MODULO 64. Gemessen
+// mit lyxc 1.0.19D:
+//
+//     1 << 64   ->  1     nicht 0   (64 mod 64 = 0, also gar nicht geschoben)
+//     1 << 65   ->  2
+//     1 << -1   ->  kleinste negative Zahl   (-1 mod 64 = 63)
+//     -1 >> 64  ->  -1
+//     8 >> -1   ->  0     (in Wahrheit 8 >> 63)
+//
+// Das ist das Verhalten der Maschinenbefehle, die nur die unteren sechs Bit des
+// Zaehlers ansehen. Es ist still: wer eine Weite aus einer Rechnung bezieht und
+// dabei bei 64 oder darueber landet, bekommt keinen Fehler, sondern den
+// unveraenderten Wert zurueck — was aussieht, als haette das Schieben nichts zu
+// tun gehabt.
+//
+// BitsShl und BitsShr saettigen stattdessen: ab 64 ist alles herausgeschoben,
+// also 0. Negative Weiten schieben nicht rueckwaerts, sondern gar nicht.
+
+// Arithmetisches Rechtsschieben mit gesaettigter Weite: das Vorzeichen wird
+// nachgezogen (Division durch Zweierpotenzen, abgerundet). Ab 64 Stellen bleibt
+// das Vorzeichen uebrig — 0 bei nichtnegativen, -1 bei negativen Werten.
+//
+// Genau das tut `>>` schon, ABER nur fuer Weiten unter 64. Diese Funktion
+// nimmt einem die Bereichspruefung ab.
+pub fn BitsSar(x: int64, n: int64): int64 {
+  if (n <= 0) { return x; }
+  if (n >= 64) {
+    if (x < 0) { return 0 - 1; }
+    return 0;
+  }
+  return x >> n;
+}
+
+// Gehen beim Linksschieben um n Stellen Bits verloren?
+//
+// Fuer Laengen-, Index- und Groessenrechnungen die eigentliche Frage: nicht
+// „was kommt heraus", sondern „ist das Ergebnis ueberhaupt noch der Wert".
+pub fn BitsShlOverflows(x: int64, n: int64): bool {
+  if (n <= 0) { return false; }
+  if (x == 0) { return false; }
+  if (n >= 64) { return true; }
+  // Alles ab Bit (64-n) faellt oben heraus.
+  return BitsShr(x, 64 - n) != 0;
+}
+
+// Linksschieben, das den Verlust meldet: schiebt und gibt ueber `ok` (Adresse
+// eines int64, oder 0) zurueck, ob alle Bits erhalten blieben.
+pub fn BitsShlChecked(x: int64, n: int64, ok: int64): int64 {
+  var lost: bool := BitsShlOverflows(x, n);
+  if (ok != 0) {
+    if (lost) { poke64(ok, 0); }
+    else { poke64(ok, 1); }
+  }
+  return BitsShl(x, n);
+}
+
+// ── Schieben ueber Wortgrenzen (Trichterschieben) ────────────────────────────
+//
+// Ein Fenster aus 64 Bit ueber einem 128-Bit-Paar. hi ist das obere Wort, lo
+// das untere.
+//
+//     BitsShrPair(hi, lo, n)  =  die 64 Bit ab Stelle n des Paares
+//
+// Das ist der Baustein fuer alles, was Bitfolgen liest, die nicht an Woertern
+// ausgerichtet sind: Bitstroeme, gepackte Felder, Verschiebung langer Zahlen.
+// Ohne ihn muesste man Bit fuer Bit zusammensetzen.
+pub fn BitsShrPair(hi: int64, lo: int64, n: int64): int64 {
+  if (n <= 0) { return lo; }
+  if (n >= 64) { return BitsShr(hi, n - 64); }
+  return BitsShr(lo, n) | BitsShl(hi, 64 - n);
+}
+
+// Gegenstueck: die oberen 64 Bit des um n nach links geschobenen Paares.
+pub fn BitsShlPair(hi: int64, lo: int64, n: int64): int64 {
+  if (n <= 0) { return hi; }
+  if (n >= 64) { return BitsShl(lo, n - 64); }
+  return BitsShl(hi, n) | BitsShr(lo, 64 - n);
+}
+
+// ── Zaehlen ──────────────────────────────────────────────────────────────────
+
+// Zahl der gesetzten Bits — fuer ALLE 64 Bit, auch bei negativer Zahl.
+//
+// SWAR ("SIMD within a register"): statt Bit fuer Bit zu pruefen, werden alle
+// 64 Bit gleichzeitig gefaltet. Zuerst zaehlt jedes Bitpaar seine Einsen in
+// sich selbst, dann jedes Viererfeld, dann jedes Byte; die Multiplikation mit
+// 0x0101...01 summiert am Ende alle acht Bytes im obersten Byte auf.
+//
+//     0x5555... = 0101...  jedes zweite Bit
+//     0x3333... = 00110011...
+//     0x0F0F... = Nibblegrenzen
+//
+// Zwoelf Rechenschritte, unabhaengig davon, wie viele Bits gesetzt sind. Die
+// Multiplikation laeuft absichtlich ueber — nur das oberste Byte wird gelesen,
+// und dessen Wert ist hoechstens 64, das Vorzeichenbit bleibt frei.
+pub fn BitsPopCount(x: int64): int64 {
+  var v: int64 := x;
+  v := v - (BitsShr(v, 1) & 0x5555555555555555);
+  v := (v & 0x3333333333333333) + (BitsShr(v, 2) & 0x3333333333333333);
+  v := (v + BitsShr(v, 4)) & 0x0F0F0F0F0F0F0F0F;
+  return BitsShr(v * 0x0101010101010101, 56);
+}
+
+// 1, wenn die Zahl der gesetzten Bits ungerade ist, sonst 0.
+//
+// Nicht ueber den Popcount, sondern durch Falten: der Wert wird mit sich
+// selbst verodert, bis alle Bits im untersten stehen. Acht Schritte ohne
+// Multiplikation.
+pub fn BitsParity(x: int64): int64 {
+  var v: int64 := x;
+  v := v ^ BitsShr(v, 32);
+  v := v ^ BitsShr(v, 16);
+  v := v ^ BitsShr(v, 8);
+  v := v ^ BitsShr(v, 4);
+  v := v ^ BitsShr(v, 2);
+  v := v ^ BitsShr(v, 1);
+  return v & 1;
+}
+
+// Zahl der fuehrenden Nullen (von Bit 63 abwaerts). Fuer 0 sind es 64.
+pub fn BitsClz(x: int64): int64 {
+  if (x == 0) { return 64; }
+  // Alle Bits unterhalb des obersten gesetzten fuellen, dann zaehlen:
+  // aus 0001xxxx wird 00011111, und 64 - popcount ist die Antwort.
+  var v: int64 := x;
+  v := v | BitsShr(v, 1);
+  v := v | BitsShr(v, 2);
+  v := v | BitsShr(v, 4);
+  v := v | BitsShr(v, 8);
+  v := v | BitsShr(v, 16);
+  v := v | BitsShr(v, 32);
+  return 64 - BitsPopCount(v);
+}
+
+// Zahl der nachlaufenden Nullen (von Bit 0 aufwaerts). Fuer 0 sind es 64.
+//
+// x & -x isoliert das unterste gesetzte Bit; dessen Position ist die Zahl der
+// Nullen davor. Bei der kleinsten negativen Zahl ist -x nicht darstellbar und
+// laeuft auf sich selbst zurueck — das Ergebnis stimmt trotzdem, weil dort
+// nur das oberste Bit gesetzt ist.
+pub fn BitsCtz(x: int64): int64 {
+  if (x == 0) { return 64; }
+  var low: int64 := x & (0 - x);
+  return BitsPopCount(low - 1);
+}
+
+// Position des obersten gesetzten Bits, oder -1 fuer 0.
+pub fn BitsHighestSet(x: int64): int64 {
+  if (x == 0) { return 0 - 1; }
+  return 63 - BitsClz(x);
+}
+
+// Position des untersten gesetzten Bits, oder -1 fuer 0.
+pub fn BitsLowestSet(x: int64): int64 {
+  if (x == 0) { return 0 - 1; }
+  return BitsCtz(x);
+}
+
+// Hamming-Abstand: an wie vielen Stellen sich zwei Bitmuster unterscheiden.
+// Das exklusive Oder setzt genau die abweichenden Bits.
+pub fn BitsHamming(a: int64, b: int64): int64 {
+  return BitsPopCount(a ^ b);
+}
+
+// ── Einzelne Bits ────────────────────────────────────────────────────────────
+
+pub fn BitsTest(x: int64, i: int64): bool {
+  if (i < 0) { return false; }
+  if (i >= 64) { return false; }
+  return (BitsShr(x, i) & 1) == 1;
+}
+
+pub fn BitsSet(x: int64, i: int64): int64 {
+  if (i < 0) { return x; }
+  if (i >= 64) { return x; }
+  return x | (1 << i);
+}
+
+pub fn BitsClear(x: int64, i: int64): int64 {
+  if (i < 0) { return x; }
+  if (i >= 64) { return x; }
+  return x & (~(1 << i));
+}
+
+pub fn BitsToggle(x: int64, i: int64): int64 {
+  if (i < 0) { return x; }
+  if (i >= 64) { return x; }
+  return x ^ (1 << i);
+}
+
+// len Bits ab Position pos, nach ganz unten geschoben.
+pub fn BitsExtract(x: int64, pos: int64, len: int64): int64 {
+  if (len <= 0) { return 0; }
+  return BitsShr(x, pos) & BitsMask(len);
+}
+
+// len Bits von v ab Position pos in x einsetzen; alles andere bleibt.
+pub fn BitsDeposit(x: int64, pos: int64, len: int64, v: int64): int64 {
+  if (len <= 0) { return x; }
+  var m: int64 := BitsShl(BitsMask(len), pos);
+  var cleared: int64 := x & (~m);
+  return cleared | (BitsShl(v & BitsMask(len), pos));
+}
+
+// ── Umordnen ─────────────────────────────────────────────────────────────────
+
+// Zyklisches Linksschieben: was oben herausfaellt, kommt unten wieder herein.
+pub fn BitsRotl(x: int64, n: int64): int64 {
+  var k: int64 := n % 64;
+  if (k < 0) { k := k + 64; }
+  if (k == 0) { return x; }
+  return BitsShl(x, k) | BitsShr(x, 64 - k);
+}
+
+// Zyklisches Rechtsschieben.
+pub fn BitsRotr(x: int64, n: int64): int64 {
+  var k: int64 := n % 64;
+  if (k < 0) { k := k + 64; }
+  if (k == 0) { return x; }
+  return BitsShr(x, k) | BitsShl(x, 64 - k);
+}
+
+// ── Rotation schmalerer Breiten ──────────────────────────────────────────────
+//
+// Rotation ueber 64 Bit ist der Sonderfall, nicht die Regel. Fast jede
+// Streuwert- und Verschluesselungsfunktion dreht in 32 Bit: MD5 und ChaCha20
+// links, SHA-256 rechts, xxHash mal so mal so. Wer dafuer die 64-Bit-Fassung
+// nimmt, bekommt stillschweigend Unsinn — die Bits kommen an der falschen
+// Stelle wieder herein.
+//
+// Die Breite ist deshalb ein Parameter, kein Zufall. Der Wert wird VOR der
+// Drehung auf die Breite beschnitten und danach ebenso: alles ausserhalb ist
+// nicht Teil der Zahl.
+//
+// Genau daran scheitert `RotateLeft32` in std/conv.lyx (gemessen 1.0.19D):
+//
+//     RotateLeft32(0x80000000, 1)  ->  0x100000001   richtig waere 1
+//     RotateLeft32(0x12345678, 8)  ->  0x1234567812  richtig waere 0x34567812
+//
+// Dort fehlt die Maskierung nach dem Linksschieben, und was oben herausfallen
+// sollte, bleibt in den Bits 32 und darueber stehen. `RotateRight32` daneben
+// ist richtig.
+
+// Zyklisches Linksschieben innerhalb von `width` Bit (2 bis 64).
+pub fn BitsRotlN(x: int64, n: int64, width: int64): int64 {
+  if (width <= 0) { return 0; }
+  if (width >= 64) { return BitsRotl(x, n); }
+
+  var m: int64 := BitsMask(width);
+  var v: int64 := x & m;
+  var k: int64 := n % width;
+  if (k < 0) { k := k + width; }
+  if (k == 0) { return v; }
+  return (BitsShl(v, k) | BitsShr(v, width - k)) & m;
+}
+
+// Zyklisches Rechtsschieben innerhalb von `width` Bit.
+pub fn BitsRotrN(x: int64, n: int64, width: int64): int64 {
+  if (width <= 0) { return 0; }
+  if (width >= 64) { return BitsRotr(x, n); }
+
+  var m: int64 := BitsMask(width);
+  var v: int64 := x & m;
+  var k: int64 := n % width;
+  if (k < 0) { k := k + width; }
+  if (k == 0) { return v; }
+  return (BitsShr(v, k) | BitsShl(v, width - k)) & m;
+}
+
+// Die gebraeuchlichen Breiten mit Namen — MD5/ChaCha20 drehen links in 32 Bit,
+// SHA-256 rechts.
+pub fn BitsRotl32(x: int64, n: int64): int64 { return BitsRotlN(x, n, 32); }
+pub fn BitsRotr32(x: int64, n: int64): int64 { return BitsRotrN(x, n, 32); }
+pub fn BitsRotl16(x: int64, n: int64): int64 { return BitsRotlN(x, n, 16); }
+pub fn BitsRotr16(x: int64, n: int64): int64 { return BitsRotrN(x, n, 16); }
+pub fn BitsRotl8(x: int64, n: int64): int64  { return BitsRotlN(x, n, 8); }
+pub fn BitsRotr8(x: int64, n: int64): int64  { return BitsRotrN(x, n, 8); }
+
+// Rotation ueber ein 128-Bit-Paar. Ergebnis nach outHi/outLo (Adressen je
+// eines int64); beide duerfen 0 sein, wenn nur eine Haelfte gebraucht wird.
+//
+// Eine Drehung um 64 vertauscht die beiden Woerter — das ist der ganze Trick:
+// jede Weite ab 64 wird auf "vertauschen und um k-64 drehen" zurueckgefuehrt.
+pub fn BitsRotlPair(hi: int64, lo: int64, n: int64,
+                    outHi: int64, outLo: int64): void {
+  var k: int64 := n % 128;
+  if (k < 0) { k := k + 128; }
+
+  var h: int64 := hi;
+  var l: int64 := lo;
+  if (k >= 64) {
+    h := lo;
+    l := hi;
+    k := k - 64;
+  }
+
+  var rh: int64 := h;
+  var rl: int64 := l;
+  if (k != 0) {
+    rh := BitsShlPair(h, l, k);
+    rl := BitsShlPair(l, h, k);
+  }
+  if (outHi != 0) { poke64(outHi, rh); }
+  if (outLo != 0) { poke64(outLo, rl); }
+}
+
+// Alle 64 Bit spiegeln: Bit 0 wird Bit 63 und umgekehrt.
+//
+// Wieder paarweises Falten, nicht Bit fuer Bit: erst benachbarte Bits tauschen,
+// dann Paare, dann Nibbles, Bytes, Halbwoerter, Woerter. Sechs Schritte statt
+// vierundsechzig.
+pub fn BitsReverse(x: int64): int64 {
+  var v: int64 := x;
+  v := (BitsShr(v, 1) & 0x5555555555555555) | BitsShl(v & 0x5555555555555555, 1);
+  v := (BitsShr(v, 2) & 0x3333333333333333) | BitsShl(v & 0x3333333333333333, 2);
+  v := (BitsShr(v, 4) & 0x0F0F0F0F0F0F0F0F) | BitsShl(v & 0x0F0F0F0F0F0F0F0F, 4);
+  v := (BitsShr(v, 8) & 0x00FF00FF00FF00FF) | BitsShl(v & 0x00FF00FF00FF00FF, 8);
+  v := (BitsShr(v, 16) & 0x0000FFFF0000FFFF) | BitsShl(v & 0x0000FFFF0000FFFF, 16);
+  return BitsShr(v, 32) | BitsShl(v, 32);
+}
+
+// Bytereihenfolge umdrehen (Little Endian <-> Big Endian).
+pub fn BitsSwapBytes(x: int64): int64 {
+  var v: int64 := x;
+  v := (BitsShr(v, 8) & 0x00FF00FF00FF00FF) | BitsShl(v & 0x00FF00FF00FF00FF, 8);
+  v := (BitsShr(v, 16) & 0x0000FFFF0000FFFF) | BitsShl(v & 0x0000FFFF0000FFFF, 16);
+  return BitsShr(v, 32) | BitsShl(v, 32);
+}
+
+// ── Zweierpotenzen ───────────────────────────────────────────────────────────
+
+// Genau ein Bit gesetzt? Null ist keine Zweierpotenz. Negative Zahlen sind es
+// nur im Bitsinn — die kleinste negative Zahl hat genau ein Bit.
+pub fn BitsIsPow2(x: int64): bool {
+  if (x == 0) { return false; }
+  return (x & (x - 1)) == 0;
+}
+
+// Groesste Zweierpotenz <= x, oder 0 fuer x <= 0.
+pub fn BitsFloorPow2(x: int64): int64 {
+  if (x <= 0) { return 0; }
+  return BitsShl(1, BitsHighestSet(x));
+}
+
+// Kleinste Zweierpotenz >= x. Fuer x <= 1 ist es 1; ab 2^62 waere das Ergebnis
+// nicht mehr positiv darstellbar, dann kommt 0 zurueck.
+pub fn BitsCeilPow2(x: int64): int64 {
+  if (x <= 1) { return 1; }
+  var h: int64 := BitsHighestSet(x - 1);
+  if (h >= 62) { return 0; }
+  return BitsShl(1, h + 1);
+}
+
+// ── Gray-Code ────────────────────────────────────────────────────────────────
+//
+// Im Gray-Code unterscheiden sich aufeinanderfolgende Zahlen in genau EINEM
+// Bit. Das ist der Grund, warum Drehgeber und Zustandsautomaten ihn benutzen:
+// beim Uebergang kann kein Zwischenwert entstehen, weil nie zwei Bits
+// gleichzeitig kippen muessen.
+
+pub fn BitsGrayEncode(x: int64): int64 {
+  return x ^ BitsShr(x, 1);
+}
+
+pub fn BitsGrayDecode(g: int64): int64 {
+  var v: int64 := g;
+  v := v ^ BitsShr(v, 32);
+  v := v ^ BitsShr(v, 16);
+  v := v ^ BitsShr(v, 8);
+  v := v ^ BitsShr(v, 4);
+  v := v ^ BitsShr(v, 2);
+  v := v ^ BitsShr(v, 1);
+  return v;
+}
+
+// ── Bitmengen ────────────────────────────────────────────────────────────────
+//
+// Eine Bitmenge ueber n Elementen ist ein Feld aus BitsetWords(n) Woertern;
+// Element i sitzt in Wort i/64 an Stelle i%64. Der Aufrufer besitzt den
+// Speicher.
+//
+// Hier ist der Popcount kein Selbstzweck mehr, sondern der Baustein: Rank
+// zaehlt gesetzte Bits vor einer Stelle, Select findet das k-te gesetzte Bit.
+// Beides waere bitweise linear, mit Popcount ist es wortweise.
+
+pub fn BitsetWords(n: int64): int64 {
+  if (n <= 0) { return 0; }
+  return (n + 63) / 64;
+}
+
+pub fn BitsetClearAll(bs: int64, n: int64): void {
+  var w: int64 := BitsetWords(n);
+  var i: int64 := 0;
+  while (i < w) {
+    poke64(bs + i * 8, 0);
+    i := i + 1;
+  }
+}
+
+// Alle n Elemente setzen. Die Bits oberhalb von n im letzten Wort bleiben
+// null — sonst zaehlte BitsetCount sie mit.
+pub fn BitsetSetAll(bs: int64, n: int64): void {
+  var w: int64 := BitsetWords(n);
+  var i: int64 := 0;
+  while (i < w) {
+    poke64(bs + i * 8, 0 - 1);
+    i := i + 1;
+  }
+  var rest: int64 := n % 64;
+  if (rest != 0) {
+    poke64(bs + (w - 1) * 8, BitsMask(rest));
+  }
+}
+
+pub fn BitsetTest(bs: int64, i: int64): bool {
+  if (i < 0) { return false; }
+  var word: int64 := peek64(bs + (i / 64) * 8);
+  return BitsTest(word, i % 64);
+}
+
+pub fn BitsetSet(bs: int64, i: int64): void {
+  if (i < 0) { return; }
+  var a: int64 := bs + (i / 64) * 8;
+  poke64(a, BitsSet(peek64(a), i % 64));
+}
+
+pub fn BitsetClear(bs: int64, i: int64): void {
+  if (i < 0) { return; }
+  var a: int64 := bs + (i / 64) * 8;
+  poke64(a, BitsClear(peek64(a), i % 64));
+}
+
+pub fn BitsetToggle(bs: int64, i: int64): void {
+  if (i < 0) { return; }
+  var a: int64 := bs + (i / 64) * 8;
+  poke64(a, BitsToggle(peek64(a), i % 64));
+}
+
+// Zahl der gesetzten Elemente. Ein Popcount je Wort statt einer Pruefung je
+// Bit — bei n = 10.000 sind das 157 Schritte statt 10.000.
+pub fn BitsetCount(bs: int64, n: int64): int64 {
+  var w: int64 := BitsetWords(n);
+  var c: int64 := 0;
+  var i: int64 := 0;
+  while (i < w) {
+    c := c + BitsPopCount(peek64(bs + i * 8));
+    i := i + 1;
+  }
+  return c;
+}
+
+pub fn BitsetIsEmpty(bs: int64, n: int64): bool {
+  var w: int64 := BitsetWords(n);
+  var i: int64 := 0;
+  while (i < w) {
+    if (peek64(bs + i * 8) != 0) { return false; }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Zahl der gesetzten Elemente UNTERHALB von i (i selbst zaehlt nicht mit).
+//
+// Die vollen Woerter davor per Popcount, im angebrochenen Wort nur die Bits
+// unterhalb der Stelle.
+pub fn BitsetRank(bs: int64, n: int64, i: int64): int64 {
+  var lim: int64 := i;
+  if (lim < 0) { return 0; }
+  if (lim > n) { lim := n; }
+
+  var full: int64 := lim / 64;
+  var c: int64 := 0;
+  var k: int64 := 0;
+  while (k < full) {
+    c := c + BitsPopCount(peek64(bs + k * 8));
+    k := k + 1;
+  }
+  var rest: int64 := lim % 64;
+  if (rest != 0) {
+    c := c + BitsPopCount(peek64(bs + full * 8) & BitsMask(rest));
+  }
+  return c;
+}
+
+// Position des k-ten gesetzten Elements, von null an gezaehlt; -1, wenn es so
+// viele nicht gibt.
+//
+// Wortweise ueberspringen, solange der Popcount des Wortes nicht ausreicht —
+// erst im richtigen Wort wird bitweise gesucht. Das ist der uebliche Aufbau
+// jeder Rank/Select-Struktur, hier ohne vorberechnete Zwischenstaende.
+pub fn BitsetSelect(bs: int64, n: int64, k: int64): int64 {
+  if (k < 0) { return 0 - 1; }
+  var w: int64 := BitsetWords(n);
+  var need: int64 := k;
+  var i: int64 := 0;
+  while (i < w) {
+    var word: int64 := peek64(bs + i * 8);
+    var c: int64 := BitsPopCount(word);
+    if (need < c) {
+      // im Wort das (need+1)-te gesetzte Bit suchen
+      var v: int64 := word;
+      while (need > 0) {
+        v := v & (v - 1);          // unterstes gesetztes Bit loeschen
+        need := need - 1;
+      }
+      var pos: int64 := i * 64 + BitsCtz(v);
+      if (pos >= n) { return 0 - 1; }
+      return pos;
+    }
+    need := need - c;
+    i := i + 1;
+  }
+  return 0 - 1;
+}
+
+// Naechstes gesetztes Element ab einschliesslich `from`, oder -1.
+// Damit laesst sich eine Bitmenge durchlaufen, ohne jedes Bit anzufassen:
+//
+//     var i: int64 := BitsetNext(bs, n, 0);
+//     while (i >= 0) { ... ; i := BitsetNext(bs, n, i + 1); }
+pub fn BitsetNext(bs: int64, n: int64, from: int64): int64 {
+  var start: int64 := from;
+  if (start < 0) { start := 0; }
+  if (start >= n) { return 0 - 1; }
+
+  var w: int64 := BitsetWords(n);
+  var i: int64 := start / 64;
+  var word: int64 := peek64(bs + i * 8) & (~BitsMask(start % 64));
+  while (i < w) {
+    if (word != 0) {
+      var pos: int64 := i * 64 + BitsCtz(word);
+      if (pos >= n) { return 0 - 1; }
+      return pos;
+    }
+    i := i + 1;
+    if (i < w) { word := peek64(bs + i * 8); }
+  }
+  return 0 - 1;
+}
+
+// ── Mengenoperationen ────────────────────────────────────────────────────────
+//
+// out darf auf a oder b liegen: es wird wortweise gelesen und geschrieben.
+
+pub fn BitsetAnd(a: int64, b: int64, out: int64, n: int64): void {
+  var w: int64 := BitsetWords(n);
+  var i: int64 := 0;
+  while (i < w) {
+    poke64(out + i * 8, peek64(a + i * 8) & peek64(b + i * 8));
+    i := i + 1;
+  }
+}
+
+pub fn BitsetOr(a: int64, b: int64, out: int64, n: int64): void {
+  var w: int64 := BitsetWords(n);
+  var i: int64 := 0;
+  while (i < w) {
+    poke64(out + i * 8, peek64(a + i * 8) | peek64(b + i * 8));
+    i := i + 1;
+  }
+}
+
+pub fn BitsetXor(a: int64, b: int64, out: int64, n: int64): void {
+  var w: int64 := BitsetWords(n);
+  var i: int64 := 0;
+  while (i < w) {
+    poke64(out + i * 8, peek64(a + i * 8) ^ peek64(b + i * 8));
+    i := i + 1;
+  }
+}
+
+// Differenz: in a, aber nicht in b.
+pub fn BitsetAndNot(a: int64, b: int64, out: int64, n: int64): void {
+  var w: int64 := BitsetWords(n);
+  var i: int64 := 0;
+  while (i < w) {
+    poke64(out + i * 8, peek64(a + i * 8) & (~peek64(b + i * 8)));
+    i := i + 1;
+  }
+}
+
+// Komplement innerhalb der n Elemente. Die ueberzaehligen Bits des letzten
+// Wortes bleiben null.
+pub fn BitsetNot(a: int64, out: int64, n: int64): void {
+  var w: int64 := BitsetWords(n);
+  var i: int64 := 0;
+  while (i < w) {
+    poke64(out + i * 8, ~peek64(a + i * 8));
+    i := i + 1;
+  }
+  var rest: int64 := n % 64;
+  if (rest != 0) {
+    var a2: int64 := out + (w - 1) * 8;
+    poke64(a2, peek64(a2) & BitsMask(rest));
+  }
+}
+
+pub fn BitsetEquals(a: int64, b: int64, n: int64): bool {
+  var w: int64 := BitsetWords(n);
+  var i: int64 := 0;
+  while (i < w) {
+    if (peek64(a + i * 8) != peek64(b + i * 8)) { return false; }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Ist a ganz in b enthalten?
+pub fn BitsetSubset(a: int64, b: int64, n: int64): bool {
+  var w: int64 := BitsetWords(n);
+  var i: int64 := 0;
+  while (i < w) {
+    var av: int64 := peek64(a + i * 8);
+    if ((av & (~peek64(b + i * 8))) != 0) { return false; }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Zahl der Elemente im Schnitt, ohne ihn zu bilden.
+pub fn BitsetCountAnd(a: int64, b: int64, n: int64): int64 {
+  var w: int64 := BitsetWords(n);
+  var c: int64 := 0;
+  var i: int64 := 0;
+  while (i < w) {
+    c := c + BitsPopCount(peek64(a + i * 8) & peek64(b + i * 8));
+    i := i + 1;
+  }
+  return c;
+}
+
+// Zahl der Elemente in der Vereinigung, ohne sie zu bilden.
+pub fn BitsetCountOr(a: int64, b: int64, n: int64): int64 {
+  var w: int64 := BitsetWords(n);
+  var c: int64 := 0;
+  var i: int64 := 0;
+  while (i < w) {
+    c := c + BitsPopCount(peek64(a + i * 8) | peek64(b + i * 8));
+    i := i + 1;
+  }
+  return c;
+}
+
+// Zahl der Stellen, an denen sich die Mengen unterscheiden — der
+// Hamming-Abstand der Bitmuster.
+pub fn BitsetHamming(a: int64, b: int64, n: int64): int64 {
+  var w: int64 := BitsetWords(n);
+  var c: int64 := 0;
+  var i: int64 := 0;
+  while (i < w) {
+    c := c + BitsPopCount(peek64(a + i * 8) ^ peek64(b + i * 8));
+    i := i + 1;
+  }
+  return c;
+}
+
+// ── Bitmengen verschieben ────────────────────────────────────────────────────
+//
+// Die ganze Menge um k Stellen verschieben, ueber Wortgrenzen hinweg. Element i
+// wandert nach i+k (links) beziehungsweise i-k (rechts); was aus [0,n) heraus
+// faellt, ist weg, nachrueckende Stellen sind leer.
+//
+// Der Kern ist BitsShrPair: jedes Zielwort setzt sich aus ZWEI Quellwoertern
+// zusammen, sobald k kein Vielfaches von 64 ist. Wortweise statt bitweise —
+// bei n = 10.000 sind das 157 Schritte statt 10.000.
+//
+// out darf auf a liegen. Deshalb laeuft die Linksverschiebung von OBEN nach
+// unten und die Rechtsverschiebung von unten nach oben: sonst ueberschriebe man
+// Quellwoerter, die noch gebraucht werden.
+
+pub fn BitsetShl(a: int64, out: int64, n: int64, k: int64): void {
+  var w: int64 := BitsetWords(n);
+  if (w == 0) { return; }
+
+  if (k <= 0) {
+    if (k == 0) {
+      if (out != a) {
+        var c: int64 := 0;
+        while (c < w) {
+          poke64(out + c * 8, peek64(a + c * 8));
+          c := c + 1;
+        }
+      }
+      return;
+    }
+    BitsetShr(a, out, n, 0 - k);
+    return;
+  }
+  if (k >= n) {
+    BitsetClearAll(out, n);
+    return;
+  }
+
+  var words: int64 := k / 64;
+  var bits: int64 := k % 64;
+
+  var i: int64 := w - 1;
+  while (i >= 0) {
+    var src: int64 := i - words;
+    var v: int64 := 0;
+    if (src >= 0) {
+      var lo: int64 := 0;
+      if (src - 1 >= 0) { lo := peek64(a + (src - 1) * 8); }
+      v := BitsShlPair(peek64(a + src * 8), lo, bits);
+    }
+    poke64(out + i * 8, v);
+    i := i - 1;
+  }
+
+  // Bits oberhalb von n duerfen nicht stehenbleiben — sonst zaehlt
+  // BitsetCount sie mit.
+  var rest: int64 := n % 64;
+  if (rest != 0) {
+    var addr: int64 := out + (w - 1) * 8;
+    poke64(addr, peek64(addr) & BitsMask(rest));
+  }
+}
+
+pub fn BitsetShr(a: int64, out: int64, n: int64, k: int64): void {
+  var w: int64 := BitsetWords(n);
+  if (w == 0) { return; }
+
+  if (k <= 0) {
+    if (k == 0) {
+      if (out != a) {
+        var c: int64 := 0;
+        while (c < w) {
+          poke64(out + c * 8, peek64(a + c * 8));
+          c := c + 1;
+        }
+      }
+      return;
+    }
+    BitsetShl(a, out, n, 0 - k);
+    return;
+  }
+  if (k >= n) {
+    BitsetClearAll(out, n);
+    return;
+  }
+
+  var words: int64 := k / 64;
+  var bits: int64 := k % 64;
+
+  var i: int64 := 0;
+  while (i < w) {
+    var src: int64 := i + words;
+    var v: int64 := 0;
+    if (src < w) {
+      var hi: int64 := 0;
+      if (src + 1 < w) { hi := peek64(a + (src + 1) * 8); }
+      v := BitsShrPair(hi, peek64(a + src * 8), bits);
+    }
+    poke64(out + i * 8, v);
+    i := i + 1;
+  }
+
+  var rest: int64 := n % 64;
+  if (rest != 0) {
+    var addr: int64 := out + (w - 1) * 8;
+    poke64(addr, peek64(addr) & BitsMask(rest));
+  }
+}
+
+// Zyklisch verschieben: was aus [0,n) heraus faellt, kommt am anderen Ende
+// wieder herein. out darf NICHT auf a liegen — es wird gelesen, waehrend
+// geschrieben wird.
+pub fn BitsetRotl(a: int64, out: int64, n: int64, k: int64): void {
+  if (n <= 0) { return; }
+  var s: int64 := k % n;
+  if (s < 0) { s := s + n; }
+
+  BitsetClearAll(out, n);
+  var i: int64 := BitsetNext(a, n, 0);
+  while (i >= 0) {
+    var t: int64 := i + s;
+    if (t >= n) { t := t - n; }
+    BitsetSet(out, t);
+    i := BitsetNext(a, n, i + 1);
+  }
+}
+
+// Zyklisch nach rechts. Gegenstueck zu BitsetRotl; out darf NICHT auf a liegen.
+pub fn BitsetRotr(a: int64, out: int64, n: int64, k: int64): void {
+  if (n <= 0) { return; }
+  BitsetRotl(a, out, n, 0 - k);
+}

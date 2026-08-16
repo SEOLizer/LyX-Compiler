@@ -767,6 +767,10 @@ test: lyxc
 	@bash tests/sec_wp37_randint64_test.sh
 	@echo "OK"
 
+	@echo "--- Mathematik-Units: Fuzz gegen Python-Referenzen (7 Einheiten) ---"
+	@bash tests/lyx_units_fuzz_test.sh
+	@echo "OK"
+
 test-lyxos: lyxc
 	@echo "=== LyxOS Integrations-Kompilierungstest ==="
 	@for f in \
