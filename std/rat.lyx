@@ -1,0 +1,950 @@
+// std/rat.lyx
+// Rationale Zahlen — exakte Bruchrechnung auf zwei int64
+
+@description("Exact rational arithmetic: canonical fractions, overflow-checked add/sub/mul/div, continued fractions, best approximation, exact decimal expansion")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.rat;
+
+import std.math;
+import std.i128;
+
+// ── Was diese Einheit zusichert ──────────────────────────────────────────────
+//
+// Ein Rat ist ein Paar (num, den) aus zwei int64 in KANONISCHER Form:
+//
+//   den > 0,  ggT(|num|, den) = 1,  und 0 wird als 0/1 dargestellt.
+//
+// Jede Funktion dieser Einheit liefert kanonische Ergebnisse und setzt sie bei
+// ihren Eingaben voraus. Wer selbst ein Rat zusammenbaut, nimmt RatNew() —
+// nicht das Struct direkt.
+//
+// ── Der ungueltige Wert ──────────────────────────────────────────────────────
+//
+// den = 0 heisst UNGUELTIG (NaR, "not a rational"). Er entsteht bei Division
+// durch null und — das ist der wichtige Fall — bei JEDEM Ueberlauf. Rationale
+// Arithmetik laesst Nenner schnell wachsen: schon das Aufsummieren von 1/1 bis
+// 1/44 sprengt int64. Diese Einheit rechnet deshalb jede Multiplikation und
+// Addition ueber 128 Bit vor und meldet den Ueberlauf, statt ihn abzuschneiden.
+// Ein stiller Falschwert waere hier besonders heimtueckisch, weil der Sinn von
+// Bruchrechnung gerade die Exaktheit ist.
+//
+// NaR pflanzt sich fort: jede Rechnung mit einem ungueltigen Operanden ist
+// ungueltig. Damit ueberlebt ein Ueberlauf bis zum Ende der Rechnung und geht
+// nicht unterwegs verloren. Geprueft wird mit RatIsValid().
+//
+// num = -2^63 ist ebenfalls ungueltig. Dieser eine Zaehler laesst sich nicht
+// negieren und nicht in einen Betrag bringen; ihn zuzulassen hiesse, in Neg(),
+// Abs(), Cmp() und beim Kuerzen je einen Sonderfall zu fuehren, den niemand
+// testet. Die Grenze kostet genau einen darstellbaren Wert.
+//
+// ── Genauigkeit gegenueber f64 ───────────────────────────────────────────────
+//
+// 1/3 + 1/3 + 1/3 ist hier exakt 1, in f64 nicht. Dafuer ist der Wertebereich
+// eng: nach wenigen Operationen mit teilerfremden Nennern ist int64 erschoepft.
+// Rat ist fuer Rechnungen gedacht, in denen die Nenner klein bleiben oder sich
+// wegkuerzen — Wahrscheinlichkeiten, Zeitsignaturen, Getriebeuebersetzungen,
+// Steigungen, exakte Testerwartungen. Fuer lange Summen mit fremden Nennern
+// ist std.bignum die richtige Grundlage, nicht diese Einheit.
+
+pub type Rat = struct {
+  num: int64;
+  den: int64
+};
+
+// ── Interne Helfer ───────────────────────────────────────────────────────────
+
+fn _i64min(): int64 { return (0 - 9223372036854775807) - 1; }
+
+// ── Arbeitspuffer und Ueberlaufflag ──────────────────────────────────────────
+//
+// Die Ueberlaufproben laufen ueber 128-Bit-Zwischenwerte, und die brauchen
+// Speicher. Ihn bei JEDEM Aufruf zu holen, war messbar teuer: std/alloc.lyx
+// legt je Allokation ein eigenes mmap an, und eine einzige RatAdd kam so auf
+// vier Syscalls. Die Testbatterie brauchte dadurch 26 Sekunden statt zwei.
+//
+// Stattdessen ein Puffer, der beim ersten Bedarf entsteht und dann bleibt.
+// Jede Verwendungsstelle hat ihren eigenen Bereich darin, damit sich zwei
+// Rechnungen nie ins Gehege kommen:
+//
+//   0..15    _mulChk           48..63   RatApprox (lhs)
+//   16..31   RatCmp (links)    64..79   RatApprox (verdoppelt)
+//   32..47   RatCmp (rechts)   80..95   RatApprox (rechts)
+//   96..111  RatFormatDecimal (Produkt)
+//   112..127 RatFormatDecimal (Quotient)
+//   128..135 RatFormatDecimal (Rest)
+//
+// Das Ergebnis jeder Funktion bleibt dadurch unveraendert — es entfaellt nur
+// das Holen und Zurueckgeben des Speichers.
+var _buf: int64 := 0;
+
+fn _scratch(): int64 {
+  if (_buf == 0) { _buf := alloc(144); }
+  return _buf;
+}
+
+// Ueberlaufflag statt eines Zeigerparameters. Die Rechnungen, die es setzen,
+// laufen kurz und ohne Verschachtelung: der Aufrufer setzt es auf 0, ruft
+// seine Proben und liest es danach. Kein Aufruf dazwischen fasst es an.
+var _ovf: int64 := 0;
+
+// a*b, wenn es passt. Sonst wird _ovf gesetzt und 0 geliefert.
+//
+// Der Schnellpfad zuerst: liegen beide Betraege unter 2^31, passt das Produkt
+// mit Sicherheit in int64, und die Probe ist ueberfluessig. Das ist nicht
+// bloss Feinschliff — die 128-Bit-Multiplikation ist eine Bibliotheksfunktion
+// aus mehreren Teilprodukten (#1552: der Codegen wirft die obere Haelfte des
+// Maschinenprodukts weg), und sie lag hier auf JEDEM Rechenweg. Fuer die
+// ueblichen Brueche mit kleinen Zaehlern und Nennern entfaellt sie damit
+// vollstaendig.
+//
+// Der 128-Bit-Weg bleibt fuer alles darueber — die Probe ueber das volle
+// Produkt ist beweisbar richtig, waehrend eine Rueckdivision bei -2^63 selbst
+// wieder eine Falle waere.
+fn _mulChk(a: int64, b: int64): int64 {
+  var small: bool := a > 0 - 2147483648 && a < 2147483648
+                  && b > 0 - 2147483648 && b < 2147483648;
+  if (small) { return a * b; }
+  var p: int64 := _scratch();
+  I128Mul64S(a, b, p);
+  var fits: bool := I128FitsI64(p);
+  var lo: int64 := I128Lo(p);
+  if (!fits) { _ovf := 1; return 0; }
+  if (lo == _i64min()) { _ovf := 1; return 0; }
+  return lo;
+}
+
+fn _addChk(a: int64, b: int64): int64 {
+  var s: int64 := a + b;
+  // Ueberlauf genau dann, wenn beide Summanden dasselbe Vorzeichen haben
+  // und die Summe ein anderes.
+  var sameSign: bool := (a < 0) == (b < 0);
+  var flipped: bool := (s < 0) != (a < 0);
+  if (sameSign && flipped) { _ovf := 1; return 0; }
+  if (s == _i64min()) { _ovf := 1; return 0; }
+  return s;
+}
+
+fn _nar(): Rat {
+  var r: Rat;
+  r.num := 0;
+  r.den := 0;
+  return r;
+}
+
+fn _raw(n: int64, d: int64): Rat {
+  var r: Rat;
+  r.num := n;
+  r.den := d;
+  return r;
+}
+
+// ── Konstruktion ─────────────────────────────────────────────────────────────
+
+// Bruch aus Zaehler und Nenner. Kuerzt, zieht das Vorzeichen in den Zaehler
+// und liefert damit die kanonische Form. d = 0 ergibt NaR.
+pub fn RatNew(n: int64, d: int64): Rat {
+  if (d == 0) { return _nar(); }
+  if (n == _i64min() || d == _i64min()) { return _nar(); }
+  if (n == 0) { return _raw(0, 1); }
+  var num: int64 := n;
+  var den: int64 := d;
+  if (den < 0) { num := 0 - num; den := 0 - den; }
+  var g: int64 := GCD(num, den);
+  return _raw(num / g, den / g);
+}
+
+pub fn RatFromInt(n: int64): Rat {
+  if (n == _i64min()) { return _nar(); }
+  return _raw(n, 1);
+}
+
+pub fn RatZero(): Rat { return _raw(0, 1); }
+
+pub fn RatOne(): Rat { return _raw(1, 1); }
+
+// Frische Kopie. Noetig, weil `var b: Rat := a` beide Namen auf denselben
+// Speicher legen kann; Rueckgabewerte dieser Einheit sind dagegen immer neu.
+pub fn RatCopy(a: Rat): Rat { return _raw(a.num, a.den); }
+
+pub fn RatNum(a: Rat): int64 { return a.num; }
+
+pub fn RatDen(a: Rat): int64 { return a.den; }
+
+pub fn RatIsValid(a: Rat): bool { return a.den != 0; }
+
+pub fn RatIsZero(a: Rat): bool { return a.den != 0 && a.num == 0; }
+
+// Ist der Bruch eine ganze Zahl?
+pub fn RatIsInt(a: Rat): bool { return a.den == 1; }
+
+// ── Vorzeichen und Betrag ────────────────────────────────────────────────────
+
+// -1, 0 oder 1. Bei NaR ebenfalls 0 — vorher RatIsValid() fragen.
+pub fn RatSign(a: Rat): int64 {
+  if (a.den == 0) { return 0; }
+  if (a.num > 0) { return 1; }
+  if (a.num < 0) { return 0 - 1; }
+  return 0;
+}
+
+pub fn RatNeg(a: Rat): Rat {
+  if (a.den == 0) { return _nar(); }
+  return _raw(0 - a.num, a.den);
+}
+
+pub fn RatAbs(a: Rat): Rat {
+  if (a.den == 0) { return _nar(); }
+  if (a.num < 0) { return _raw(0 - a.num, a.den); }
+  return _raw(a.num, a.den);
+}
+
+// Kehrwert. 0 hat keinen, das ergibt NaR.
+pub fn RatInv(a: Rat): Rat {
+  if (a.den == 0 || a.num == 0) { return _nar(); }
+  if (a.num < 0) { return _raw(0 - a.den, 0 - a.num); }
+  return _raw(a.den, a.num);
+}
+
+// ── Grundrechenarten ─────────────────────────────────────────────────────────
+//
+// Addition ueber den KLEINSTEN gemeinsamen Nenner, nicht ueber b*d. Der
+// Unterschied ist nicht kosmetisch: 1/6 + 1/10 laeuft ueber 30 statt ueber 60,
+// und bei Nennern in der Groessenordnung von 2^32 entscheidet genau dieser
+// Faktor darueber, ob die Rechnung noch in int64 passt.
+
+pub fn RatAdd(a: Rat, b: Rat): Rat {
+  if (a.den == 0 || b.den == 0) { return _nar(); }
+  if (a.num == 0) { return _raw(b.num, b.den); }
+  if (b.num == 0) { return _raw(a.num, a.den); }
+  _ovf := 0;
+  var g: int64 := GCD(a.den, b.den);
+  var bd: int64 := b.den / g;
+  var den: int64 := _mulChk(a.den, bd);
+  var n1: int64 := _mulChk(a.num, bd);
+  var n2: int64 := _mulChk(b.num, a.den / g);
+  var num: int64 := _addChk(n1, n2);
+  if (_ovf != 0) { return _nar(); }
+  // Nach der Addition kann der Zaehler noch einen Faktor von g enthalten
+  // (1/6 + 1/3 = 3/6 = 1/2), deshalb hier erneut kuerzen.
+  return RatNew(num, den);
+}
+
+pub fn RatSub(a: Rat, b: Rat): Rat {
+  if (b.den == 0) { return _nar(); }
+  return RatAdd(a, RatNeg(b));
+}
+
+// Multiplikation mit Kreuzkuerzen VOR dem Produkt. (6/7)*(7/6) laeuft damit
+// nicht ueber 42, sondern bleibt bei 1 — und vor allem: Produkte, deren
+// Ergebnis passt, scheitern nicht mehr an einem Zwischenwert, der nicht passt.
+pub fn RatMul(a: Rat, b: Rat): Rat {
+  if (a.den == 0 || b.den == 0) { return _nar(); }
+  if (a.num == 0 || b.num == 0) { return _raw(0, 1); }
+  var g1: int64 := GCD(a.num, b.den);
+  var g2: int64 := GCD(b.num, a.den);
+  _ovf := 0;
+  var num: int64 := _mulChk(a.num / g1, b.num / g2);
+  var den: int64 := _mulChk(a.den / g2, b.den / g1);
+  if (_ovf != 0) { return _nar(); }
+  if (den < 0) { num := 0 - num; den := 0 - den; }
+  return _raw(num, den);
+}
+
+pub fn RatDiv(a: Rat, b: Rat): Rat {
+  if (b.den == 0 || b.num == 0) { return _nar(); }
+  return RatMul(a, RatInv(b));
+}
+
+// Ganzzahlige Potenz. Negative Exponenten kehren den Bruch um; 0^0 ist hier 1.
+pub fn RatPow(a: Rat, e: int64): Rat {
+  if (a.den == 0) { return _nar(); }
+  if (e == 0) { return _raw(1, 1); }
+  if (e == _i64min()) { return _nar(); }
+  var base: Rat := RatCopy(a);
+  var n: int64 := e;
+  if (n < 0) {
+    base := RatInv(base);
+    if (base.den == 0) { return _nar(); }
+    n := 0 - n;
+  }
+  var acc: Rat := _raw(1, 1);
+  while (n > 0) {
+    if (n % 2 == 1) {
+      acc := RatMul(acc, base);
+      if (acc.den == 0) { return _nar(); }
+    }
+    n := n / 2;
+    if (n > 0) {
+      base := RatMul(base, base);
+      if (base.den == 0) { return _nar(); }
+    }
+  }
+  return acc;
+}
+
+// ── Vergleich ────────────────────────────────────────────────────────────────
+//
+// Der Kreuzvergleich a.num*b.den gegen b.num*a.den ueberlaeuft in int64 lange
+// bevor die Brueche selbst gross werden. Er laeuft deshalb ueber 128 Bit —
+// damit ist RatCmp() fuer JEDES Paar gueltiger Rat exakt und nie ungenau.
+
+// -1, 0, 1. Ein ungueltiger Operand gilt als kleiner als jeder gueltige; zwei
+// ungueltige sind gleich. Das macht Sortieren total, statt es zu vergiften.
+pub fn RatCmp(a: Rat, b: Rat): int64 {
+  if (a.den == 0 && b.den == 0) { return 0; }
+  if (a.den == 0) { return 0 - 1; }
+  if (b.den == 0) { return 1; }
+  var sa: int64 := RatSign(a);
+  var sb: int64 := RatSign(b);
+  if (sa < sb) { return 0 - 1; }
+  if (sa > sb) { return 1; }
+  if (sa == 0) { return 0; }
+  // Auch hier der Schnellpfad: bei Zaehlern und Nennern unter 2^31 passen
+  // beide Kreuzprodukte in int64, und der Vergleich ist eine Subtraktion.
+  var small: bool := a.num > 0 - 2147483648 && a.num < 2147483648
+                  && a.den < 2147483648
+                  && b.num > 0 - 2147483648 && b.num < 2147483648
+                  && b.den < 2147483648;
+  if (small) {
+    var ls: int64 := a.num * b.den;
+    var rs: int64 := b.num * a.den;
+    if (ls < rs) { return 0 - 1; }
+    if (ls > rs) { return 1; }
+    return 0;
+  }
+  var l: int64 := _scratch() + 16;
+  var r: int64 := _scratch() + 32;
+  I128Mul64S(a.num, b.den, l);
+  I128Mul64S(b.num, a.den, r);
+  return I128CmpS(l, r);
+}
+
+pub fn RatEquals(a: Rat, b: Rat): bool {
+  if (a.den == 0 || b.den == 0) { return false; }
+  // In kanonischer Form ist Gleichheit reine Komponentengleichheit.
+  return a.num == b.num && a.den == b.den;
+}
+
+pub fn RatLt(a: Rat, b: Rat): bool { return RatCmp(a, b) < 0; }
+
+pub fn RatLe(a: Rat, b: Rat): bool { return RatCmp(a, b) <= 0; }
+
+pub fn RatMin(a: Rat, b: Rat): Rat {
+  if (RatCmp(a, b) <= 0) { return RatCopy(a); }
+  return RatCopy(b);
+}
+
+pub fn RatMax(a: Rat, b: Rat): Rat {
+  if (RatCmp(a, b) >= 0) { return RatCopy(a); }
+  return RatCopy(b);
+}
+
+// ── Runden auf ganze Zahlen ──────────────────────────────────────────────────
+//
+// `/` trunkiert in Lyx wie in C, schneidet also gegen null ab. Floor und Ceil
+// muessen den negativen Fall darum selbst nachziehen.
+
+pub fn RatFloor(a: Rat): int64 {
+  if (a.den == 0) { return 0; }
+  var q: int64 := a.num / a.den;
+  if (a.num % a.den != 0 && a.num < 0) { return q - 1; }
+  return q;
+}
+
+pub fn RatCeil(a: Rat): int64 {
+  if (a.den == 0) { return 0; }
+  var q: int64 := a.num / a.den;
+  if (a.num % a.den != 0 && a.num > 0) { return q + 1; }
+  return q;
+}
+
+pub fn RatTrunc(a: Rat): int64 {
+  if (a.den == 0) { return 0; }
+  return a.num / a.den;
+}
+
+// Kaufmaennisch: die Haelfte geht von der Null weg (0.5 -> 1, -0.5 -> -1).
+// Der Halb-Vergleich laeuft als `r > den - r`, nicht als `2*r > den`; das
+// Doppelte des Restes kann ueberlaufen, die Differenz nie.
+pub fn RatRound(a: Rat): int64 {
+  if (a.den == 0) { return 0; }
+  var q: int64 := a.num / a.den;
+  var r: int64 := a.num % a.den;
+  if (r == 0) { return q; }
+  var ar: int64 := r;
+  if (ar < 0) { ar := 0 - ar; }
+  var rest: int64 := a.den - ar;
+  if (ar > rest || ar == rest) {
+    if (a.num < 0) { return q - 1; }
+    return q + 1;
+  }
+  return q;
+}
+
+// Bankiersrundung: die Haelfte geht zur geraden Zahl. Ueber viele Werte
+// hinweg verzerrt das den Mittelwert nicht, waehrend RatRound() ihn nach
+// aussen zieht.
+pub fn RatRoundHalfEven(a: Rat): int64 {
+  if (a.den == 0) { return 0; }
+  var q: int64 := a.num / a.den;
+  var r: int64 := a.num % a.den;
+  if (r == 0) { return q; }
+  var ar: int64 := r;
+  if (ar < 0) { ar := 0 - ar; }
+  var rest: int64 := a.den - ar;
+  var up: bool := false;
+  if (ar > rest) { up := true; }
+  if (ar == rest) {
+    // genau die Haelfte: nur aufrunden, wenn q ungerade ist
+    var odd: int64 := q % 2;
+    if (odd != 0) { up := true; }
+  }
+  if (!up) { return q; }
+  if (a.num < 0) { return q - 1; }
+  return q + 1;
+}
+
+// Ganzzahliger Anteil und Rest, beides als Bruch. Der Rest hat immer das
+// Vorzeichen des Ausgangswerts und Betrag < 1.
+pub fn RatFrac(a: Rat): Rat {
+  if (a.den == 0) { return _nar(); }
+  return _raw(a.num % a.den, a.den);
+}
+
+// ── Umwandlung nach und von f64 ──────────────────────────────────────────────
+
+// Ganzteil und Rest getrennt umwandeln. Die naive Form (num as f64)/(den as f64)
+// rundet bei Zaehlern ueber 2^53 zweimal — einmal in jeder Konvertierung, dann
+// noch in der Division. Ueber den Rest bleibt der Fehler auf eine Rundung
+// beschraenkt, solange der Ganzteil selbst exakt darstellbar ist.
+pub fn RatToF64(a: Rat): f64 {
+  if (a.den == 0) { return 0.0; }
+  var q: int64 := a.num / a.den;
+  var r: int64 := a.num % a.den;
+  if (r == 0) { return q as f64; }
+  return (q as f64) + ((r as f64) / (a.den as f64));
+}
+
+// Exakte Darstellung eines f64 als Bruch — jeder endliche f64 IST rational,
+// mit einer Zweierpotenz als Nenner. Passt der Nenner nicht in int64 (bei
+// Werten unter etwa 2^-62), ist das Ergebnis NaR; dann ist RatFromF64() mit
+// einer Nennerschranke der richtige Weg.
+pub fn RatFromF64Exact(x: f64): Rat {
+  if (x != x) { return _nar(); }
+  if (x == 0.0) { return _raw(0, 1); }
+  var neg: bool := x < 0.0;
+  var v: f64 := x;
+  if (neg) { v := 0.0 - v; }
+  var den: int64 := 1;
+  var guard: int64 := 0;
+  // Solange ein Nachkommaanteil bleibt, mit 2 multiplizieren. Bei einem
+  // endlichen f64 endet das nach hoechstens 1075 Schritten; die Schranke hier
+  // ist der Punkt, ab dem der Nenner nicht mehr in int64 passt.
+  while (v != FloorF64(v) && guard < 62) {
+    v := v * 2.0;
+    den := den * 2;
+    guard := guard + 1;
+  }
+  if (v != FloorF64(v)) { return _nar(); }
+  if (v > 9223372036854775000.0) { return _nar(); }
+  var num: int64 := v as int64;
+  if (neg) { num := 0 - num; }
+  return RatNew(num, den);
+}
+
+// ── Beste Naeherung: warum die Konvergenten allein nicht reichen ─────────────
+//
+// Die Kettenbruchentwicklung liefert die Konvergenten, und die sind beste
+// Naeherungen — aber nur an ihren eigenen Nennern. Zwischen zwei Konvergenten
+// klafft eine Luecke, und darin liegen die SEMIKONVERGENTEN
+//
+//   (h0 + t*h1) / (k0 + t*k1),   t = 1 .. a-1
+//
+// die den erlaubten Nenner besser ausschoepfen. Fuer pi mit maxDen = 100 ist
+// die letzte passende Konvergente 22/7 (Fehler 1.3e-3), die naechste waere
+// 333/106 und damit zu gross. Der beste Bruch mit Nenner bis 100 ist aber
+// 311/99 — ein Semikonvergent, und mit 1.8e-4 sieben Mal genauer als 22/7.
+// Wer hier bei den Konvergenten aufhoert, liefert stillschweigend die falsche
+// Antwort auf die Frage, die gestellt wurde.
+//
+// Welcher der beiden Kandidaten gewinnt, laesst sich NICHT am Koeffizienten
+// allein ablesen. Die naheliegende Regel "2*t gegen a" trifft in den meisten
+// Faellen zu, aber nicht in allen: fuer x = 2.69 mit maxDen = 20 stehen sich
+// 35/13 und 43/16 gegenueber, es gilt 2*t == a — und richtig ist 35/13, das
+// die Regel bei Gleichstand gerade verwirft. Entscheidend ist der noch
+// unverbrauchte Rest der Entwicklung, nicht der abgebrochene Koeffizient:
+//
+//   2 * d * (k0 + t*k1) <= den   =>  die Konvergente gewinnt, sonst der
+//                                    Semikonvergent
+//
+// wobei d der Rest-Nenner an der Abbruchstelle und den der Nenner des
+// Ausgangsbruchs ist. Das ist dasselbe Kriterium, das CPythons
+// Fraction.limit_denominator anwendet.
+
+// Bester Bruch mit Nenner hoechstens maxDen. Kein Bruch mit kleinerem oder
+// gleichem Nenner kommt naeher an x heran.
+//   RatFromF64(pi, 10)   = 22/7
+//   RatFromF64(pi, 100)  = 311/99
+//   RatFromF64(pi, 1000) = 355/113
+pub fn RatFromF64(x: f64, maxDen: int64): Rat {
+  if (x != x || maxDen < 1) { return _nar(); }
+  var neg: bool := x < 0.0;
+  var v: f64 := x;
+  if (neg) { v := 0.0 - v; }
+  if (v > 9223372036854775000.0) { return _nar(); }
+  // Zaehler und Nenner der letzten beiden Naeherungsbrueche
+  var h1: int64 := 1;
+  var h0: int64 := 0;
+  var k1: int64 := 0;
+  var k0: int64 := 1;
+  var b: f64 := v;
+  var running: bool := true;
+  var steps: int64 := 0;
+  while (running && steps < 64) {
+    var fl: f64 := FloorF64(b);
+    if (fl > 9223372036854775000.0) {
+      running := false;
+    } else {
+      var ai: int64 := fl as int64;
+      var rest: f64 := b - fl;
+      // Passt der naechste Nenner noch? Die Frage vor der Multiplikation
+      // stellen, sonst laeuft genau die Rechnung ueber, die den Abbruch
+      // ausloesen sollte.
+      var tooBig: bool := false;
+      if (k1 > 0) {
+        var room: int64 := (maxDen - k0) / k1;
+        if (ai > room) { tooBig := true; }
+      }
+      if (tooBig) {
+        // Bei einem f64 als Eingabe liegt der Rest-Nenner nicht vor, mit dem
+        // das exakte Kriterium arbeitet. Hier entscheidet deshalb der direkte
+        // Fehlervergleich der beiden Kandidaten — bei Gleichstand gewinnt der
+        // kleinere Nenner. Beide Wege liefern dieselbe Antwort; dieser kostet
+        // nur zwei Divisionen mehr.
+        var t: int64 := (maxDen - k0) / k1;
+        if (t > 0) {
+          _ovf := 0;
+          var hs: int64 := _addChk(_mulChk(t, h1), h0);
+          var ks: int64 := _addChk(_mulChk(t, k1), k0);
+          if (_ovf == 0) {
+            var eConv: f64 := v - ((h1 as f64) / (k1 as f64));
+            var eSemi: f64 := v - ((hs as f64) / (ks as f64));
+            if (eConv < 0.0) { eConv := 0.0 - eConv; }
+            if (eSemi < 0.0) { eSemi := 0.0 - eSemi; }
+            if (eSemi < eConv) { h1 := hs; k1 := ks; }
+          }
+        }
+        running := false;
+      } else {
+        _ovf := 0;
+        var h2: int64 := _addChk(_mulChk(ai, h1), h0);
+        var k2: int64 := _addChk(_mulChk(ai, k1), k0);
+        if (_ovf != 0) {
+          running := false;
+        } else {
+          h0 := h1; h1 := h2;
+          k0 := k1; k1 := k2;
+          if (rest == 0.0) { running := false; } else { b := 1.0 / rest; }
+        }
+      }
+    }
+    steps := steps + 1;
+  }
+  if (k1 == 0) { return _nar(); }
+  if (neg) { h1 := 0 - h1; }
+  return RatNew(h1, k1);
+}
+
+// Dasselbe fuer einen Bruch, der schon exakt ist. Nuetzlich, um einen ueber
+// viele Rechnungen gewachsenen Nenner wieder klein zu bekommen, ohne mehr
+// Fehler zu machen als noetig. Passt der Nenner bereits, bleibt der Bruch
+// unveraendert.
+pub fn RatApprox(a: Rat, maxDen: int64): Rat {
+  if (a.den == 0 || maxDen < 1) { return _nar(); }
+  if (a.den <= maxDen) { return _raw(a.num, a.den); }
+  var neg: bool := a.num < 0;
+  var p: int64 := a.num;
+  if (neg) { p := 0 - p; }
+  var q: int64 := a.den;
+  var h1: int64 := 1;
+  var h0: int64 := 0;
+  var k1: int64 := 0;
+  var k0: int64 := 1;
+  var running: bool := true;
+  while (running && q != 0) {
+    var ai: int64 := p / q;
+    var nq: int64 := p - ai * q;
+    var tooBig: bool := false;
+    if (k1 > 0) {
+      var room: int64 := (maxDen - k0) / k1;
+      if (ai > room) { tooBig := true; }
+    }
+    if (tooBig) {
+      var t: int64 := (maxDen - k0) / k1;
+      if (t > 0) {
+        _ovf := 0;
+        var hs: int64 := _addChk(_mulChk(t, h1), h0);
+        var ks: int64 := _addChk(_mulChk(t, k1), k0);
+        if (_ovf == 0) {
+          // 2*q*ks gegen den Ausgangsnenner. Das Produkt reicht bis knapp an
+          // 2^127 heran und wird deshalb in 128 Bit gebildet.
+          var lhs: int64 := _scratch() + 48;
+          var dbl: int64 := _scratch() + 64;
+          var rhs: int64 := _scratch() + 80;
+          I128Mul64U(q, ks, lhs);
+          I128Shl(lhs, 1, dbl);
+          I128SetU64(rhs, a.den);
+          var convWins: bool := I128CmpU(dbl, rhs) <= 0;
+          if (!convWins) { h1 := hs; k1 := ks; }
+        }
+      }
+      running := false;
+    } else {
+      _ovf := 0;
+      var h2: int64 := _addChk(_mulChk(ai, h1), h0);
+      var k2: int64 := _addChk(_mulChk(ai, k1), k0);
+      if (_ovf != 0) {
+        running := false;
+      } else {
+        h0 := h1; h1 := h2;
+        k0 := k1; k1 := k2;
+        p := q;
+        q := nq;
+      }
+    }
+  }
+  if (k1 == 0) { return _nar(); }
+  if (neg) { h1 := 0 - h1; }
+  return RatNew(h1, k1);
+}
+
+// ── Kettenbrueche ────────────────────────────────────────────────────────────
+
+// Koeffizienten der Kettenbruchentwicklung [a0; a1, a2, ...] nach outArr.
+// Rueckgabe ist ihre Anzahl. Fuer jeden Bruch bricht das nach endlich vielen
+// Schritten ab — der Algorithmus ist der euklidische, nur dass die Quotienten
+// aufgehoben statt verworfen werden.
+pub fn RatContinuedFrac(a: Rat, outArr: int64, maxN: int64): int64 {
+  if (a.den == 0 || maxN < 1) { return 0; }
+  var p: int64 := a.num;
+  var q: int64 := a.den;
+  var n: int64 := 0;
+  while (q != 0 && n < maxN) {
+    // Abrundender Quotient, damit alle Koeffizienten ab a1 positiv sind
+    var ai: int64 := p / q;
+    if (p % q != 0 && p < 0) { ai := ai - 1; }
+    poke64(outArr + n * 8, ai);
+    n := n + 1;
+    var t: int64 := p - ai * q;
+    p := q;
+    q := t;
+  }
+  return n;
+}
+
+// Rueckweg: [a0; a1, ...] wieder zu einem Bruch zusammensetzen, von hinten
+// nach vorne. Ueberlauf ergibt NaR.
+pub fn RatFromContinuedFrac(arr: int64, n: int64): Rat {
+  if (n < 1) { return _nar(); }
+  var acc: Rat := RatFromInt(peek64(arr + (n - 1) * 8));
+  var i: int64 := n - 2;
+  while (i >= 0) {
+    var inv: Rat := RatInv(acc);
+    if (inv.den == 0) { return _nar(); }
+    acc := RatAdd(RatFromInt(peek64(arr + i * 8)), inv);
+    if (acc.den == 0) { return _nar(); }
+    i := i - 1;
+  }
+  return acc;
+}
+
+// Mediant (a+c)/(b+d). Liegt immer echt zwischen den beiden Bruechen und ist
+// der Schritt, der den Stern-Brocot-Baum erzeugt. Nicht dasselbe wie der
+// Mittelwert — und genau deshalb nuetzlich: der Mediant hat den kleinsten
+// Nenner aller Brueche zwischen zwei benachbarten Farey-Bruechen.
+pub fn RatMediant(a: Rat, b: Rat): Rat {
+  if (a.den == 0 || b.den == 0) { return _nar(); }
+  _ovf := 0;
+  var num: int64 := _addChk(a.num, b.num);
+  var den: int64 := _addChk(a.den, b.den);
+  if (_ovf != 0) { return _nar(); }
+  return RatNew(num, den);
+}
+
+// Der Bruch mit dem KLEINSTEN Nenner im geschlossenen Intervall [lo, hi].
+// Das ist die Frage hinter jeder Angabe wie "ungefaehr 2/3": welcher einfache
+// Bruch trifft die gemessene Spanne? Der Weg fuehrt ueber die gemeinsame
+// Kettenbruchentwicklung beider Grenzen — an der ersten Stelle, an der sie
+// sich unterscheiden, steht die Antwort.
+pub fn RatSimplest(lo: Rat, hi: Rat): Rat {
+  if (lo.den == 0 || hi.den == 0) { return _nar(); }
+  var a: Rat := RatCopy(lo);
+  var b: Rat := RatCopy(hi);
+  // Tausch ueber Kopien, nicht ueber `:=` — sonst teilen sich t und a einen
+  // Speicher und der Tausch frisst sich selbst auf.
+  if (RatCmp(a, b) > 0) {
+    var t: Rat := RatCopy(a);
+    a := RatCopy(b);
+    b := RatCopy(t);
+  }
+  var coef: int64 := alloc(64 * 8);
+  var n: int64 := 0;
+  var done: bool := false;
+  var fail: bool := false;
+  while (!done && n < 64) {
+    var fa: int64 := RatFloor(a);
+    var fb: int64 := RatFloor(b);
+    if (fa != fb || RatIsInt(a)) {
+      // Es liegt eine ganze Zahl im Intervall — die kleinste davon, die noch
+      // in [a, b] passt, ist die einfachste Loesung dieses Zweigs.
+      var v: int64 := RatCeil(a);
+      poke64(coef + n * 8, v);
+      n := n + 1;
+      done := true;
+    } else {
+      poke64(coef + n * 8, fa);
+      n := n + 1;
+      // Weiter mit den Kehrwerten der Nachkommaanteile — dabei drehen sich
+      // untere und obere Grenze um.
+      var ra: Rat := RatSub(a, RatFromInt(fa));
+      var rb: Rat := RatSub(b, RatFromInt(fa));
+      if (ra.den == 0 || rb.den == 0 || ra.num == 0 || rb.num == 0) {
+        done := true;
+        fail := true;
+      } else {
+        var na: Rat := RatInv(rb);
+        var nb: Rat := RatInv(ra);
+        a := na;
+        b := nb;
+      }
+    }
+  }
+  var res: Rat := _nar();
+  if (!fail && n > 0) { res := RatFromContinuedFrac(coef, n); }
+  free(coef, 64 * 8);
+  return res;
+}
+
+// ── Textausgabe ──────────────────────────────────────────────────────────────
+
+// Ziffern eines nichtnegativen Wertes rueckwaerts in tmp, Rueckgabe ist ihre
+// Zahl. Nur intern; der Aufrufer stellt genug Platz bereit.
+fn _digitsRev(v: int64, tmp: int64): int64 {
+  if (v == 0) { poke8(tmp, 48); return 1; }
+  var x: int64 := v;
+  var n: int64 := 0;
+  while (x > 0) {
+    poke8(tmp + n, 48 + (x % 10));
+    n := n + 1;
+    x := x / 10;
+  }
+  return n;
+}
+
+// "3/4", "-3/4", ganze Zahlen ohne Nenner ("5"), ungueltig als "NaR".
+// Rueckgabe ist die Zahl geschriebener Zeichen ohne die Null, oder -1, wenn
+// der Puffer nicht reicht.
+pub fn RatFormat(a: Rat, buf: int64, bufLen: int64): int64 {
+  if (bufLen < 4) { return 0 - 1; }
+  var pos: int64 := 0;
+  if (a.den == 0) {
+    poke8(buf, 78); poke8(buf + 1, 97); poke8(buf + 2, 82); poke8(buf + 3, 0);
+    return 3;
+  }
+  var num: int64 := a.num;
+  if (num < 0) {
+    poke8(buf, 45);
+    pos := 1;
+    num := 0 - num;
+  }
+  var tmp: int64 := alloc(24);
+  var n: int64 := _digitsRev(num, tmp);
+  var i: int64 := 0;
+  var overflow: bool := false;
+  while (i < n) {
+    if (pos + 1 >= bufLen) { overflow := true; i := n; } else {
+      poke8(buf + pos, peek8(tmp + (n - 1 - i)));
+      pos := pos + 1;
+      i := i + 1;
+    }
+  }
+  if (!overflow && a.den != 1) {
+    if (pos + 1 >= bufLen) { overflow := true; } else {
+      poke8(buf + pos, 47);
+      pos := pos + 1;
+      var m: int64 := _digitsRev(a.den, tmp);
+      var j: int64 := 0;
+      while (j < m) {
+        if (pos + 1 >= bufLen) { overflow := true; j := m; } else {
+          poke8(buf + pos, peek8(tmp + (m - 1 - j)));
+          pos := pos + 1;
+          j := j + 1;
+        }
+      }
+    }
+  }
+  free(tmp, 24);
+  if (overflow) { return 0 - 1; }
+  poke8(buf + pos, 0);
+  return pos;
+}
+
+// Dezimaldarstellung mit genau `digits` Nachkommastellen, exakt gerundet
+// (Haelfte von der Null weg). Die Stellen entstehen durch Langdivision ueber
+// 128 Bit, nicht ueber f64 — RatFormatDecimal(1/3, 30) liefert deshalb dreissig
+// echte Dreien, waehrend der Umweg ueber f64 nach der siebzehnten Stelle
+// Rauschen produziert.
+pub fn RatFormatDecimal(a: Rat, digits: int64, buf: int64, bufLen: int64): int64 {
+  if (bufLen < 4) { return 0 - 1; }
+  if (digits < 0 || digits > 60) { return 0 - 1; }
+  if (a.den == 0) {
+    poke8(buf, 78); poke8(buf + 1, 97); poke8(buf + 2, 82); poke8(buf + 3, 0);
+    return 3;
+  }
+  var neg: bool := a.num < 0;
+  var num: int64 := a.num;
+  if (neg) { num := 0 - num; }
+  var den: int64 := a.den;
+  var ip: int64 := num / den;
+  var rem: int64 := num % den;
+
+  // Alle Ziffern zuerst in einen Arbeitspuffer: erst der Ganzteil, dann die
+  // Nachkommastellen. Der Uebertrag beim Runden kann bis in den Ganzteil
+  // durchschlagen (0.99 auf eine Stelle ist 1.0), deshalb wird er auf dieser
+  // gemeinsamen Ziffernfolge ausgefuehrt und nicht auf zwei getrennten.
+  var cap: int64 := 24 + digits + 2;
+  var ds: int64 := alloc(cap);
+  var tmp: int64 := alloc(24);
+  var ni: int64 := _digitsRev(ip, tmp);
+  var k: int64 := 0;
+  while (k < ni) { poke8(ds + k, peek8(tmp + (ni - 1 - k))); k := k + 1; }
+  free(tmp, 24);
+  var total: int64 := ni;
+
+  var p128: int64 := _scratch() + 96;
+  var q128: int64 := _scratch() + 112;
+  var remp: int64 := _scratch() + 128;
+  var d: int64 := 0;
+  while (d < digits) {
+    if (rem == 0) {
+      poke8(ds + total, 48);
+    } else {
+      I128Mul64U(rem, 10, p128);
+      I128DivRemU64(p128, den, q128, remp);
+      poke8(ds + total, 48 + I128Lo(q128));
+      rem := peek64(remp);
+    }
+    total := total + 1;
+    d := d + 1;
+  }
+
+  // Runden: der verbliebene Rest entscheidet. rem > den - rem vermeidet das
+  // Verdoppeln, das bei grossen Nennern ueberlaufen wuerde.
+  var roundUp: bool := false;
+  if (rem != 0) {
+    var restv: int64 := den - rem;
+    if (rem > restv || rem == restv) { roundUp := true; }
+  }
+  if (roundUp) {
+    var i: int64 := total - 1;
+    var carry: bool := true;
+    while (carry && i >= 0) {
+      var c: int64 := peek8(ds + i);
+      if (c == 57) { poke8(ds + i, 48); i := i - 1; } else {
+        poke8(ds + i, c + 1);
+        carry := false;
+      }
+    }
+    if (carry) {
+      // Alles war 9: eine Stelle nach vorne schieben und eine 1 setzen.
+      var j: int64 := total;
+      while (j > 0) { poke8(ds + j, peek8(ds + j - 1)); j := j - 1; }
+      poke8(ds, 49);
+      total := total + 1;
+      ni := ni + 1;
+    }
+  }
+
+  // Zusammensetzen
+  var pos: int64 := 0;
+  var bad: bool := false;
+  if (neg) {
+    if (pos + 1 >= bufLen) { bad := true; } else { poke8(buf, 45); pos := 1; }
+  }
+  var m: int64 := 0;
+  while (!bad && m < total) {
+    if (m == ni && digits > 0) {
+      if (pos + 1 >= bufLen) { bad := true; } else { poke8(buf + pos, 46); pos := pos + 1; }
+    }
+    if (!bad) {
+      if (pos + 1 >= bufLen) { bad := true; } else {
+        poke8(buf + pos, peek8(ds + m));
+        pos := pos + 1;
+        m := m + 1;
+      }
+    }
+  }
+  free(ds, cap);
+  if (bad) { return 0 - 1; }
+  poke8(buf + pos, 0);
+  return pos;
+}
+
+// ── Einlesen ─────────────────────────────────────────────────────────────────
+
+// "3/4", "-5", "  7 / 8 ". Fehlt der Nenner, ist es eine ganze Zahl. Alles
+// andere — leere Eingabe, Nenner null, Ziffernfolgen jenseits von int64,
+// Nachzuegler hinter der Zahl — ergibt NaR. Stillschweigendes Abschneiden
+// waere hier der falsche Dienst.
+pub fn RatParse(s: int64): Rat {
+  if (s == 0) { return _nar(); }
+  var i: int64 := 0;
+  while (peek8(s + i) == 32 || peek8(s + i) == 9) { i := i + 1; }
+  var neg: bool := false;
+  var ch: int64 := peek8(s + i);
+  if (ch == 45) { neg := true; i := i + 1; }
+  if (ch == 43) { i := i + 1; }
+  var num: int64 := 0;
+  var nd: int64 := 0;
+  var bad: bool := false;
+  var running: bool := true;
+  while (running) {
+    var c: int64 := peek8(s + i);
+    if (c >= 48 && c <= 57) {
+      if (num > 922337203685477580) { bad := true; running := false; } else {
+        num := num * 10 + (c - 48);
+        if (num < 0) { bad := true; running := false; }
+        nd := nd + 1;
+        i := i + 1;
+      }
+    } else { running := false; }
+  }
+  if (nd == 0) { bad := true; }
+  while (peek8(s + i) == 32 || peek8(s + i) == 9) { i := i + 1; }
+  var den: int64 := 1;
+  if (!bad && peek8(s + i) == 47) {
+    i := i + 1;
+    while (peek8(s + i) == 32 || peek8(s + i) == 9) { i := i + 1; }
+    den := 0;
+    var dd: int64 := 0;
+    var run2: bool := true;
+    while (run2) {
+      var c2: int64 := peek8(s + i);
+      if (c2 >= 48 && c2 <= 57) {
+        if (den > 922337203685477580) { bad := true; run2 := false; } else {
+          den := den * 10 + (c2 - 48);
+          if (den < 0) { bad := true; run2 := false; }
+          dd := dd + 1;
+          i := i + 1;
+        }
+      } else { run2 := false; }
+    }
+    if (dd == 0 || den == 0) { bad := true; }
+  }
+  while (peek8(s + i) == 32 || peek8(s + i) == 9) { i := i + 1; }
+  if (peek8(s + i) != 0) { bad := true; }
+  if (bad) { return _nar(); }
+  if (neg) { num := 0 - num; }
+  return RatNew(num, den);
+}

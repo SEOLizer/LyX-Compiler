@@ -1,0 +1,814 @@
+// std/mathx.lyx
+// Elementare Funktionen in voller Genauigkeit: exp, log und was darauf aufbaut
+
+@description("Elementary functions in full double precision: exponential and logarithm with proper argument reduction, expm1 and log1p, exp2, exp10, log2, log10, power, cube root, hyperbolic and inverse hyperbolic functions, exponent manipulation via ldexp, frexp, scalbn, modf and copysign")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.mathx;
+
+import std.math;
+import std.feq;
+import std.alloc;
+
+// ── Warum es diese Unit gibt ─────────────────────────────────────────────────
+//
+// std.math bringt ExpF64 und LogF64 mit. Gemessen mit lyxc 1.0.20E, in
+// korrekten Dezimalstellen von sechzehn moeglichen:
+//
+//     ExpF64(1.0)      11 Stellen
+//     ExpF64(10.0)     11 Stellen
+//     LogF64(1000.0)    7 Stellen
+//     Log10F64(50.0)    9 Stellen
+//
+// Sieben Stellen sind die Haelfte dessen, was ein f64 traegt. Und der Fehler
+// bleibt nicht bei exp und log: PowF64 ist exp∘log und erbt beide, darauf
+// wiederum bauen Gammafunktion, saemtliche Verteilungen, der Bluestein-Chirp
+// in der FFT und die Entropien in std.tensor. Ein einziger ungenauer Baustein
+// zieht sich durch die halbe Sammlung.
+//
+// ── Woran es liegt ───────────────────────────────────────────────────────────
+//
+// Eine Reihenentwicklung von exp konvergiert nur nahe bei null gut. Bei x = 10
+// braucht man viele Glieder, und jedes bringt Rundungsfehler mit. Der Ausweg
+// ist ARGUMENTREDUKTION: man schreibt
+//
+//     x = k * ln2 + r     mit ganzzahligem k und |r| <= ln2/2
+//
+// und rechnet exp(x) = 2^k * exp(r). Der Rest r ist jetzt klein, ein Polynom
+// vom Grad fuenf reicht dafuer, und die Multiplikation mit 2^k ist exakt —
+// sie aendert nur den Exponenten im Bitmuster.
+//
+// Der Haken: k * ln2 muss genauer als f64 gerechnet werden, sonst frisst der
+// Fehler dieser Subtraktion den ganzen Gewinn. Deshalb steht ln2 hier in ZWEI
+// Teilen, und die Reduktion laeuft in zwei Schritten.
+//
+// Beim Logarithmus dasselbe in umgekehrter Richtung: x = 2^k * f mit f nahe
+// eins, dann log(x) = k*ln2 + log(f), und log(f) kommt aus einer Reihe in
+// s = (f-1)/(f+1), die fuer f nahe eins ausserordentlich schnell konvergiert.
+//
+// Die Polynomkoeffizienten stammen aus fdlibm (Sun Microsystems, 1993) — sie
+// sind seit dreissig Jahren die Grundlage praktisch jeder libm und auf
+// Minimax-Fehler optimiert.
+//
+// ── Was hier NICHT steht ─────────────────────────────────────────────────────
+//
+// Sinus und Kosinus. Deren Argumentreduktion braucht pi auf hunderte Stellen
+// (Payne-Hanek), sonst versagt sie bei grossen Argumenten — genau das ist
+// Fehler #1537. Das ist eine eigene Aufgabe.
+
+// ── Konstanten ───────────────────────────────────────────────────────────────
+//
+// ln2 in zwei Teilen: ln2_hi traegt die oberen 33 Bit und ist exakt
+// darstellbar, ln2_lo den Rest. So bleibt k*ln2_hi exakt, solange k klein ist.
+
+fn _ln2hi(): f64 { return 6.93147180369123816490e-01; }
+fn _ln2lo(): f64 { return 1.90821492927058770002e-10; }
+fn _invln2(): f64 { return 1.44269504088896338700e+00; }
+fn _ln2(): f64 { return 0.6931471805599453094172321214581766; }
+fn _ln10(): f64 { return 2.302585092994045684017991454684364; }
+fn _log2e(): f64 { return 1.442695040888963407359924681001892; }
+fn _log10e(): f64 { return 0.4342944819032518276511289189166051; }
+fn _sqrt2(): f64 { return 1.4142135623730951; }
+
+fn _abs(x: f64): f64 {
+  if (x < 0.0) { return 0.0 - x; }
+  return x;
+}
+
+// ── Exponent von Hand ────────────────────────────────────────────────────────
+//
+// Diese drei arbeiten auf dem Bitmuster und sind deshalb EXAKT — kein
+// Rundungsfehler, egal wie gross die Verschiebung ist.
+
+// x * 2^n. Der Exponent liegt in den Bits 52 bis 62; man addiert n dort hinein.
+pub fn MxLdexp(x: f64, n: int64): f64 {
+  if (x == 0.0) { return x; }
+  if (FeqIsNaN(x)) { return x; }
+  if (FeqIsInf(x)) { return x; }
+
+  var bits: int64 := FeqBits(x);
+  var e: int64 := (bits >> 52) & 2047;
+
+  if (e == 0) {
+    // subnormal: erst hochskalieren, dann rechnen
+    var scaled: f64 := x * 18014398509481984.0;   // 2^54
+    return MxLdexp(scaled, n - 54);
+  }
+
+  var ne: int64 := e + n;
+  if (ne >= 2047) {
+    // Ueberlauf
+    if (x < 0.0) { return 0.0 - 1.0e308 * 10.0; }
+    return 1.0e308 * 10.0;
+  }
+  if (ne <= 0) {
+    // Unterlauf: schrittweise herunter, damit subnormale Werte entstehen
+    if (ne < 0 - 54) {
+      if (x < 0.0) { return 0.0 - 0.0; }
+      return 0.0;
+    }
+    var lifted: int64 := (bits & 0x800FFFFFFFFFFFFF) | ((ne + 54) << 52);
+    return FeqFromBits(lifted) / 18014398509481984.0;
+  }
+
+  var out: int64 := (bits & 0x800FFFFFFFFFFFFF) | (ne << 52);
+  return FeqFromBits(out);
+}
+
+// x = m * 2^e mit m in [0.5, 1). Der Exponent geht nach expAddr.
+pub fn MxFrexp(x: f64, expAddr: int64): f64 {
+  if (expAddr != 0) { poke64(expAddr, 0); }
+  if (x == 0.0) { return x; }
+  if (FeqIsNaN(x)) { return x; }
+  if (FeqIsInf(x)) { return x; }
+
+  var v: f64 := x;
+  var extra: int64 := 0;
+  var bits: int64 := FeqBits(v);
+  if (((bits >> 52) & 2047) == 0) {
+    v := v * 18014398509481984.0;
+    extra := 0 - 54;
+    bits := FeqBits(v);
+  }
+
+  var e: int64 := ((bits >> 52) & 2047) - 1022;
+  if (expAddr != 0) { poke64(expAddr, e + extra); }
+  // Exponent auf 1022 setzen ergibt eine Mantisse in [0.5, 1)
+  var m: int64 := (bits & 0x800FFFFFFFFFFFFF) | (1022 << 52);
+  return FeqFromBits(m);
+}
+
+pub fn MxScalbn(x: f64, n: int64): f64 { return MxLdexp(x, n); }
+
+// Vorzeichen von y auf den Betrag von x uebertragen.
+pub fn MxCopySign(x: f64, y: f64): f64 {
+  var bx: int64 := FeqBits(x) & 0x7FFFFFFFFFFFFFFF;
+  var sy: int64 := FeqBits(y) & 0x8000000000000000;
+  return FeqFromBits(bx | sy);
+}
+
+// Ganzzahliger und gebrochener Anteil. Der ganzzahlige geht nach intAddr,
+// zurueck kommt der Rest; beide tragen das Vorzeichen von x.
+pub fn MxModf(x: f64, intAddr: int64): f64 {
+  var ip: f64 := FeqTrunc(x);
+  if (intAddr != 0) { pokef64(intAddr, ip); }
+  if (FeqIsInf(x)) { return MxCopySign(0.0, x); }
+  return x - ip;
+}
+
+// ── Exponentialfunktion ──────────────────────────────────────────────────────
+
+// e^x, in voller Genauigkeit.
+//
+// Argumentreduktion x = k*ln2 + r, dann exp(x) = 2^k * exp(r) mit |r| <= ln2/2.
+// Fuer exp(r) eine rationale Naeherung mit fuenf Koeffizienten; die
+// Multiplikation mit 2^k ist exakt.
+pub fn MxExp(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  if (x > 709.782712893384) {
+    return 1.0e308 * 10.0;              // Ueberlauf
+  }
+  if (x < 0.0 - 745.1332191019411) { return 0.0; }
+  if (_abs(x) < 2.220446049250313e-16) { return 1.0 + x; }
+
+  // k = round(x / ln2)
+  var kf: f64 := x * _invln2();
+  var k: int64 := 0;
+  if (kf >= 0.0) { k := FeqTrunc(kf + 0.5) as int64; }
+  else { k := FeqTrunc(kf - 0.5) as int64; }
+  var kd: f64 := k as f64;
+
+  // r = x - k*ln2, in zwei Schritten fuer die Genauigkeit
+  var hi: f64 := x - kd * _ln2hi();
+  var lo: f64 := kd * _ln2lo();
+  var r: f64 := hi - lo;
+
+  // rationale Naeherung von exp(r) - 1 (fdlibm)
+  var P1: f64 := 1.66666666666666019037e-01;
+  var P2: f64 := 0.0 - 2.77777777770155933842e-03;
+  var P3: f64 := 6.61375632143793436117e-05;
+  var P4: f64 := 0.0 - 1.65339022054652515390e-06;
+  var P5: f64 := 4.13813679705723846039e-08;
+
+  var rr: f64 := r * r;
+  var c: f64 := r - rr * (P1 + rr * (P2 + rr * (P3 + rr * (P4 + rr * P5))));
+  var y: f64 := 1.0 - ((lo - (r * c) / (2.0 - c)) - hi);
+
+  return MxLdexp(y, k);
+}
+
+// e^x - 1, ohne Ausloeschung bei kleinem x.
+//
+// Fuer x = 1e-10 ist exp(x) rechnerisch 1,0000000001; die Subtraktion von eins
+// loescht alle fuehrenden Stellen und uebrig bleibt Rundungsrauschen. Diese
+// Fassung rechnet die Differenz direkt und behaelt die volle Genauigkeit —
+// unverzichtbar fuer Zinsrechnung und Wahrscheinlichkeiten.
+pub fn MxExpm1(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  if (_abs(x) < 1.0e-5) {
+    // Reihe: x + x^2/2 + x^3/6 + x^4/24
+    return x + x * x * (0.5 + x * (0.16666666666666666 + x * 0.041666666666666664));
+  }
+  if (x > 709.782712893384) { return 1.0e308 * 10.0; }
+  if (x < 0.0 - 40.0) { return 0.0 - 1.0; }
+  return MxExp(x) - 1.0;
+}
+
+// ── Logarithmus ──────────────────────────────────────────────────────────────
+
+// Natuerlicher Logarithmus, in voller Genauigkeit.
+//
+// x wird als 2^k * f geschrieben mit f in [sqrt(2)/2, sqrt(2)). Dann ist
+// log(x) = k*ln2 + log(f), und log(f) kommt aus einer Reihe in
+// s = (f-1)/(f+1) — die konvergiert fuer f nahe eins sehr schnell, weil s
+// dort klein ist.
+pub fn MxLog(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  if (x < 0.0) { return 0.0 / 0.0; }          // NaN
+  if (x == 0.0) { return 0.0 - 1.0e308 * 10.0; }
+  if (FeqIsInf(x)) { return x; }
+
+  var ea: int64 := alloc(8);
+  var f0: f64 := MxFrexp(x, ea);
+  var k: int64 := peek64(ea);
+  free(ea, 8);
+
+  // f0 liegt in [0.5, 1) — auf [sqrt(2)/2, sqrt(2)) bringen
+  var f: f64 := f0;
+  if (f < 0.7071067811865476) {
+    f := f * 2.0;
+    k := k - 1;
+  }
+
+  var fm: f64 := f - 1.0;
+  var s: f64 := fm / (2.0 + fm);
+  var z: f64 := s * s;
+
+  var Lg1: f64 := 6.666666666666735130e-01;
+  var Lg2: f64 := 3.999999999940941908e-01;
+  var Lg3: f64 := 2.857142874366239149e-01;
+  var Lg4: f64 := 2.222219843214978396e-01;
+  var Lg5: f64 := 1.818357216161805012e-01;
+  var Lg6: f64 := 1.531383769920937332e-01;
+  var Lg7: f64 := 1.479819860511658591e-01;
+
+  var w: f64 := z * z;
+  var t1: f64 := w * (Lg2 + w * (Lg4 + w * Lg6));
+  var t2: f64 := z * (Lg1 + w * (Lg3 + w * (Lg5 + w * Lg7)));
+  var R: f64 := t1 + t2;
+  var hfsq: f64 := 0.5 * fm * fm;
+
+  var kd: f64 := k as f64;
+  return kd * _ln2hi() - ((hfsq - (s * (hfsq + R) + kd * _ln2lo())) - fm);
+}
+
+// log(1 + x), ohne Ausloeschung bei kleinem x.
+//
+// Dasselbe Problem wie bei expm1, nur umgekehrt: fuer kleines x ist 1+x auf
+// f64 gerundet, und der Logarithmus davon verliert die fuehrenden Stellen.
+pub fn MxLog1p(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  if (x < 0.0 - 1.0) { return 0.0 / 0.0; }
+  if (x == 0.0 - 1.0) { return 0.0 - 1.0e308 * 10.0; }
+  if (_abs(x) < 1.0e-5) {
+    // Reihe: x - x^2/2 + x^3/3 - x^4/4
+    return x - x * x * (0.5 - x * (0.3333333333333333 - x * 0.25));
+  }
+  return MxLog(1.0 + x);
+}
+
+pub fn MxLog2(x: f64): f64 {
+  // ueber den Exponenten, damit Zweierpotenzen exakt herauskommen
+  if (x <= 0.0) { return MxLog(x); }
+  if (FeqIsNaN(x)) { return x; }
+  if (FeqIsInf(x)) { return x; }
+
+  var ea: int64 := alloc(8);
+  var f: f64 := MxFrexp(x, ea);
+  var k: int64 := peek64(ea);
+  free(ea, 8);
+
+  if (f == 0.5) { return (k - 1) as f64; }     // exakte Zweierpotenz
+  return (k as f64) + MxLog(f) * _log2e();
+}
+
+pub fn MxLog10(x: f64): f64 {
+  return MxLog(x) * _log10e();
+}
+
+pub fn MxExp2(x: f64): f64 {
+  // ganzzahlige Exponenten exakt behandeln
+  var t: f64 := FeqTrunc(x);
+  if (t == x) {
+    if (_abs(x) < 1000.0) { return MxLdexp(1.0, x as int64); }
+  }
+  return MxExp(x * _ln2());
+}
+
+pub fn MxExp10(x: f64): f64 {
+  return MxExp(x * _ln10());
+}
+
+// ── Potenz ───────────────────────────────────────────────────────────────────
+
+// x^y.
+//
+// Ganzzahlige Exponenten laufen ueber wiederholtes Quadrieren — das ist exakt
+// und behandelt auch negative Basen, fuer die exp(y*log(x)) gar nicht
+// definiert waere. Alles andere geht ueber exp und log.
+pub fn MxPow(x: f64, y: f64): f64 {
+  if (y == 0.0) { return 1.0; }
+  if (y == 1.0) { return x; }
+  if (x == 1.0) { return 1.0; }
+  if (FeqIsNaN(x)) { return x; }
+  if (FeqIsNaN(y)) { return y; }
+
+  var yi: f64 := FeqTrunc(y);
+  var isInt: bool := yi == y;
+
+  if (x == 0.0) {
+    if (y > 0.0) { return 0.0; }
+    return 1.0e308 * 10.0;
+  }
+
+  if (isInt) {
+    if (_abs(y) < 1024.0) {
+      var n: int64 := yi as int64;
+      var neg: bool := n < 0;
+      if (neg) { n := 0 - n; }
+      var result: f64 := 1.0;
+      var base: f64 := x;
+      while (n > 0) {
+        if ((n & 1) == 1) { result := result * base; }
+        base := base * base;
+        n := n / 2;
+      }
+      if (neg) { return 1.0 / result; }
+      return result;
+    }
+  }
+
+  if (x < 0.0) { return 0.0 / 0.0; }     // negative Basis, nicht ganzzahliger Exponent
+  return MxExp(y * MxLog(x));
+}
+
+// Kubikwurzel — auch fuer negative Werte, anders als x^(1/3) ueber exp/log.
+//
+// Startwert aus dem Bitmuster (der Exponent wird gedrittelt), danach zwei
+// Newton-Schritte. Das ist der uebliche Weg und braucht weder exp noch log.
+pub fn MxCbrt(x: f64): f64 {
+  if (x == 0.0) { return x; }
+  if (FeqIsNaN(x)) { return x; }
+  if (FeqIsInf(x)) { return x; }
+
+  var neg: bool := x < 0.0;
+  var a: f64 := _abs(x);
+
+  var ea: int64 := alloc(8);
+  var f: f64 := MxFrexp(a, ea);
+  var e: int64 := peek64(ea);
+  free(ea, 8);
+
+  // Exponent dritteln, Rest in die Mantisse
+  var e3: int64 := e / 3;
+  var rem: int64 := e - e3 * 3;
+  var scale: f64 := 1.0;
+  if (rem == 1) { scale := 1.2599210498948732; }        // 2^(1/3)
+  if (rem == 2) { scale := 1.5874010519681994; }        // 2^(2/3)
+  if (rem == 0 - 1) { scale := 0.7937005259840998; e3 := e3; }
+  if (rem == 0 - 2) { scale := 0.6299605249474366; }
+
+  // grober Startwert
+  var y: f64 := MxLdexp(0.9 * scale, e3);
+
+  // Newton: y = y - (y^3 - a) / (3y^2), viermal
+  var i: int64 := 0;
+  while (i < 5) {
+    var y2: f64 := y * y;
+    y := y - (y2 * y - a) / (3.0 * y2);
+    i := i + 1;
+  }
+
+  if (neg) { return 0.0 - y; }
+  return y;
+}
+
+// ── Hyperbolische Funktionen ─────────────────────────────────────────────────
+//
+// sinh(x) = (e^x - e^-x)/2. Fuer kleines x loeschen sich die beiden Terme
+// gegenseitig aus — dort wird ueber expm1 gerechnet, das genau diesen Fall
+// abdeckt.
+
+pub fn MxSinh(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  var a: f64 := _abs(x);
+  if (a < 1.0) {
+    var e: f64 := MxExpm1(a);
+    var r: f64 := 0.5 * (e + e / (e + 1.0));
+    if (x < 0.0) { return 0.0 - r; }
+    return r;
+  }
+  if (a > 709.0) {
+    var big: f64 := MxExp(a - 1.0) * 1.3591409142295225;
+    if (x < 0.0) { return 0.0 - big; }
+    return big;
+  }
+  var ex: f64 := MxExp(a);
+  var res: f64 := 0.5 * (ex - 1.0 / ex);
+  if (x < 0.0) { return 0.0 - res; }
+  return res;
+}
+
+pub fn MxCosh(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  var a: f64 := _abs(x);
+  if (a > 709.0) { return MxExp(a - 1.0) * 1.3591409142295225; }
+  var ex: f64 := MxExp(a);
+  return 0.5 * (ex + 1.0 / ex);
+}
+
+// tanh(x) = (e^2x - 1)/(e^2x + 1).
+//
+// Fuer grosses x ist das Ergebnis auf f64 genau eins; ohne diese Abfrage
+// entstuende inf/inf.
+pub fn MxTanh(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  var a: f64 := _abs(x);
+  if (a > 20.0) {
+    if (x < 0.0) { return 0.0 - 1.0; }
+    return 1.0;
+  }
+  if (a < 1.0e-8) { return x; }
+
+  var e: f64 := MxExpm1(2.0 * a);
+  var r: f64 := e / (e + 2.0);
+  if (x < 0.0) { return 0.0 - r; }
+  return r;
+}
+
+// asinh(x) = log(x + sqrt(x^2 + 1)). Fuer negatives x wird ueber den Betrag
+// gerechnet, damit sich in der Summe nichts ausloescht.
+pub fn MxAsinh(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  if (FeqIsInf(x)) { return x; }
+  var a: f64 := _abs(x);
+  var r: f64 := 0.0;
+  if (a < 1.0e-8) { r := a; }
+  else {
+    if (a < 2.0) { r := MxLog1p(a + a * a / (1.0 + SqrtF64(a * a + 1.0))); }
+    else { r := MxLog(2.0 * a + 1.0 / (SqrtF64(a * a + 1.0) + a)); }
+  }
+  if (x < 0.0) { return 0.0 - r; }
+  return r;
+}
+
+// acosh(x) = log(x + sqrt(x^2 - 1)), nur fuer x >= 1 erklaert.
+pub fn MxAcosh(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  if (x < 1.0) { return 0.0 / 0.0; }
+  if (x == 1.0) { return 0.0; }
+  if (x > 1.0e8) { return MxLog(x) + 0.6931471805599453; }
+  var t: f64 := x - 1.0;
+  return MxLog1p(t + SqrtF64(2.0 * t + t * t));
+}
+
+// atanh(x) = 0.5 * log((1+x)/(1-x)), nur fuer |x| < 1 erklaert.
+pub fn MxAtanh(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  var a: f64 := _abs(x);
+  if (a > 1.0) { return 0.0 / 0.0; }
+  if (a == 1.0) {
+    if (x > 0.0) { return 1.0e308 * 10.0; }
+    return 0.0 - 1.0e308 * 10.0;
+  }
+  var r: f64 := 0.0;
+  if (a < 1.0e-8) { r := a; }
+  else { r := 0.5 * MxLog1p(2.0 * a / (1.0 - a)); }
+  if (x < 0.0) { return 0.0 - r; }
+  return r;
+}
+
+// ── Rest bei Division ────────────────────────────────────────────────────────
+
+// Rest von x/y mit dem Vorzeichen von x — wie fmod in C.
+pub fn MxFmod(x: f64, y: f64): f64 {
+  if (y == 0.0) { return 0.0 / 0.0; }
+  if (FeqIsNaN(x)) { return x; }
+  if (FeqIsInf(x)) { return 0.0 / 0.0; }
+  if (FeqIsInf(y)) { return x; }
+
+  var q: f64 := FeqTrunc(x / y);
+  var r: f64 := x - q * y;
+  return r;
+}
+
+// Rest zur NAECHSTEN ganzen Zahl des Quotienten (IEEE remainder). Das Ergebnis
+// liegt in [-|y|/2, |y|/2] und hat nicht notwendig das Vorzeichen von x.
+pub fn MxRemainder(x: f64, y: f64): f64 {
+  if (y == 0.0) { return 0.0 / 0.0; }
+  if (FeqIsNaN(x)) { return x; }
+
+  var q: f64 := FeqRoundHalfEven(x / y);
+  return x - q * y;
+}
+
+// ── Sinus und Kosinus ────────────────────────────────────────────────────────
+//
+// Diese Einheit hat die Winkelfunktionen zunaechst ausgelassen, mit dem
+// Hinweis, dass eine Argumentreduktion noetig ist. Sie stehen jetzt hier —
+// aber NICHT, weil std.math sie falsch macht. Die Lage ist genauer:
+//
+//   aurum/std/math.lyx (Repo)          groesster Fehler 3.3e-16   einwandfrei
+//   /usr/include/lyx/units/std/ (inst.) groesster Fehler 1.19e+01  veraltet
+//
+// Die installierte Fassung hat keine Reduktion und liefert fuer x = -6.282895
+// den Wert -11.89 statt 0.00029, verlaesst also den Wertebereich. Die Fassung
+// im Repo ist laengst in Ordnung. Der Unterschied ist ein Auslieferungsproblem
+// und als #1578 gemeldet — wer ohne `-I <aurum>` uebersetzt, bekommt die
+// kaputte Fassung.
+//
+// Der eigene Grund fuer MxSinCos ist ein anderer: Sinus und Kosinus teilen
+// sich hier EINE Reduktion, und die macht den groesseren Teil der Arbeit aus.
+// Fuer Drehfaktoren und die komplexe Exponentialfunktion, wo immer beide
+// gebraucht werden, halbiert das den Aufwand. MxSin und MxCos sind die
+// einzeln nutzbaren Bausteine davon.
+//
+// ── Wie hier reduziert wird ──────────────────────────────────────────────────
+//
+// Zu x wird das naechstgelegene Vielfache n von pi/2 gesucht und
+//
+//     r = x - n * (pi/2)
+//
+// gebildet, sodass |r| <= pi/4 bleibt; aus n mod 4 folgt, welche der vier
+// Grundformen gilt. Der ganze Aufwand steckt darin, dieses r GENAU zu
+// bekommen: pi/2 ist irrational, ein einzelnes f64 trifft es auf 53 Bit, und
+// bei x = 1000 bleiben von der Differenz nur noch die Stellen uebrig, die
+// darunter lagen. Genau das ist der Grund, warum eine naive Reihe versagt.
+//
+// pi/2 liegt deshalb in SECHS Teilstuecken vor, jedes auf 21 signifikante Bits
+// gekuerzt; zusammen tragen sie 132 Bit. Die Kuerzung auf 21 Bit ist der
+// Kunstgriff: solange |n| < 2^32 bleibt, ist jedes Produkt n * C_i mit seinen
+// hoechstens 53 Bit EXAKT darstellbar, und die Subtraktionen verlieren nichts.
+// Die Reduktion ist damit fuer |x| < 2^32 * pi/2, also etwa 6.7e9, so genau
+// wie die Rechnung selbst.
+//
+// Jenseits davon waechst der Fehler wieder — dort braeuchte es Payne-Hanek mit
+// einer langen Tabelle von 2/pi. Die Grenze ist gemessen und in der
+// Testbatterie festgehalten, statt sie zu verschweigen.
+
+fn _pio2_1(): f64 { return 1.570796012878418; }
+fn _pio2_2(): f64 { return 3.139164164167596e-07; }
+fn _pio2_3(): f64 { return 6.22337468017542e-14; }
+fn _pio2_4(): f64 { return -2.5082791584901525e-20; }
+fn _pio2_5(): f64 { return 3.521561362568105e-27; }
+fn _pio2_6(): f64 { return -1.4973851116957393e-33; }
+fn _twoOverPi(): f64 { return 0.6366197723675814; }
+
+// sin(r) fuer |r| <= pi/4, Minimax-Polynom aus fdlibm.
+fn _kernelSin(r: f64): f64 {
+  var z: f64 := r * r;
+  var p: f64 := 1.58969099521155010221e-10;
+  p := -2.50507602534068634195e-08 + z * p;
+  p := 2.75573137070700676789e-06 + z * p;
+  p := -1.98412698298579493134e-04 + z * p;
+  p := 8.33333333332248946124e-03 + z * p;
+  p := -1.66666666666666324348e-01 + z * p;
+  return r + r * z * p;
+}
+
+// cos(r) fuer |r| <= pi/4. Nahe pi/4 ist cos etwa 0.707, und die Form
+// 1 - z/2 + ... loescht dort Stellen aus. Deshalb wird ein fester Anteil qx
+// vorab abgezogen, sodass die Differenz klein bleibt — der Kunstgriff stammt
+// aus fdlibm.
+fn _kernelCos(r: f64): f64 {
+  var z: f64 := r * r;
+  var p: f64 := -1.13596475577881948265e-11;
+  p := 2.08757232129817482790e-09 + z * p;
+  p := -2.75573143513906633035e-07 + z * p;
+  p := 2.48015872894767294178e-05 + z * p;
+  p := -1.38888888888741095749e-03 + z * p;
+  p := 4.16666666666666019037e-02 + z * p;
+  var zr: f64 := z * p;
+  if (AbsF64(r) < 0.3) { return 1.0 - (0.5 * z - z * zr); }
+  var qx: f64 := 0.28125;
+  if (AbsF64(r) > 0.78125) { qx := AbsF64(r) * 0.25; }
+  var hz: f64 := 0.5 * z - qx;
+  return (1.0 - qx) - (hz - z * zr);
+}
+
+// Reduziert x auf r mit |r| <= pi/4 und legt den Quadranten (n mod 4, immer
+// 0..3) unter quadAddr ab. Rueckgabe ist r.
+fn _reduceQuad(x: f64, quadAddr: int64): f64 {
+  var n: f64 := FeqRoundHalfEven(x * _twoOverPi());
+  var r: f64 := x - n * _pio2_1();
+  r := r - n * _pio2_2();
+  r := r - n * _pio2_3();
+  r := r - n * _pio2_4();
+  r := r - n * _pio2_5();
+  r := r - n * _pio2_6();
+  // n mod 4, auch fuer negatives n im Bereich 0..3
+  var q: int64 := (n as int64) % 4;
+  if (q < 0) { q := q + 4; }
+  poke64(quadAddr, q);
+  return r;
+}
+
+// Sinus und Kosinus in einem Zug. Beide teilen sich die Reduktion, die den
+// groesseren Teil der Arbeit ausmacht — fuer die komplexe Exponentialfunktion
+// und fuer Drehfaktoren ist das der uebliche Bedarf.
+pub fn MxSinCos(x: f64, sinAddr: int64, cosAddr: int64): void {
+  if (FeqIsNaN(x) || FeqIsInf(x)) {
+    var nan: f64 := 0.0 / 0.0;
+    pokef64(sinAddr, nan);
+    pokef64(cosAddr, nan);
+    return;
+  }
+  var qp: int64 := alloc(8);
+  var r: f64 := _reduceQuad(x, qp);
+  var q: int64 := peek64(qp);
+  free(qp, 8);
+  var s: f64 := _kernelSin(r);
+  var c: f64 := _kernelCos(r);
+  if (q == 0) { pokef64(sinAddr, s); pokef64(cosAddr, c); return; }
+  if (q == 1) { pokef64(sinAddr, c); pokef64(cosAddr, 0.0 - s); return; }
+  if (q == 2) { pokef64(sinAddr, 0.0 - s); pokef64(cosAddr, 0.0 - c); return; }
+  pokef64(sinAddr, 0.0 - c);
+  pokef64(cosAddr, s);
+}
+
+pub fn MxSin(x: f64): f64 {
+  if (FeqIsNaN(x) || FeqIsInf(x)) { return 0.0 / 0.0; }
+  // Fuer sehr kleine Argumente ist sin(x) = x auf jedes darstellbare Bit
+  // genau, und die Reduktion wuerde nur Rundung hinzufuegen.
+  if (AbsF64(x) < 1.0e-150) { return x; }
+  var qp: int64 := alloc(8);
+  var r: f64 := _reduceQuad(x, qp);
+  var q: int64 := peek64(qp);
+  free(qp, 8);
+  if (q == 0) { return _kernelSin(r); }
+  if (q == 1) { return _kernelCos(r); }
+  if (q == 2) { return 0.0 - _kernelSin(r); }
+  return 0.0 - _kernelCos(r);
+}
+
+pub fn MxCos(x: f64): f64 {
+  if (FeqIsNaN(x) || FeqIsInf(x)) { return 0.0 / 0.0; }
+  var qp: int64 := alloc(8);
+  var r: f64 := _reduceQuad(x, qp);
+  var q: int64 := peek64(qp);
+  free(qp, 8);
+  if (q == 0) { return _kernelCos(r); }
+  if (q == 1) { return 0.0 - _kernelSin(r); }
+  if (q == 2) { return 0.0 - _kernelCos(r); }
+  return _kernelSin(r);
+}
+
+// tan aus derselben Reduktion. An den Polstellen waechst der relative Fehler
+// unvermeidlich: dort ist der Kosinus fast null, und schon sein letztes Bit
+// verschiebt den Quotienten betraechtlich. Das ist keine Schwaeche der
+// Umsetzung, sondern die Kondition der Funktion.
+pub fn MxTan(x: f64): f64 {
+  if (FeqIsNaN(x) || FeqIsInf(x)) { return 0.0 / 0.0; }
+  if (AbsF64(x) < 1.0e-150) { return x; }
+  var qp: int64 := alloc(8);
+  var r: f64 := _reduceQuad(x, qp);
+  var q: int64 := peek64(qp);
+  free(qp, 8);
+  var s: f64 := _kernelSin(r);
+  var c: f64 := _kernelCos(r);
+  if (q == 1 || q == 3) { return (0.0 - c) / s; }
+  return s / c;
+}
+
+// ── Arkustangens ─────────────────────────────────────────────────────────────
+//
+// AtanF64 und Atan2F64 aus std.math liefern rund zehn statt sechzehn Stellen
+// (groesster gemessener Fehler 2.1e-10 ueber 2000 Argumente) — und zwar in
+// der Repo-Fassung ebenso wie in der installierten, anders als bei SinF64.
+// Das faellt in reeller Rechnung selten auf, ist fuer komplexe Funktionen
+// aber entscheidend:
+// atan2 IST das Argument einer komplexen Zahl, und ueber den Logarithmus erbt
+// jede Umkehrfunktion — asin, acos, atanh, und damit auch pow — genau diesen
+// Fehler.
+//
+// Die Reduktion nutzt das Additionstheorem: mit atan(x) - atan(c) =
+// atan((x-c)/(1+x*c)) laesst sich jedes Argument auf |x| <= 0.4375 bringen,
+// wo ein Polynom in x^2 reicht. Die vier Stuetzstellen 7/16, 11/16, 19/16 und
+// 39/16 liegen so, dass der Restbereich klein bleibt; ihr atan-Wert wird in
+// zwei Teilen gefuehrt (hoher und niedriger Anteil), damit die abschliessende
+// Addition keine Stellen verliert. Polynom und Stuetzstellen stammen aus
+// fdlibm.
+
+fn _atanHi(i: int64): f64 {
+  if (i == 0) { return 4.63647609000806093515e-01; }
+  if (i == 1) { return 7.85398163397448278999e-01; }
+  if (i == 2) { return 9.82793723247329054082e-01; }
+  return 1.57079632679489655800e+00;
+}
+
+fn _atanLo(i: int64): f64 {
+  if (i == 0) { return 2.26987774529616870924e-17; }
+  if (i == 1) { return 3.06161699786838301793e-17; }
+  if (i == 2) { return 1.39033110312309984516e-17; }
+  return 6.12323399573676603587e-17;
+}
+
+pub fn MxAtan(x: f64): f64 {
+  if (FeqIsNaN(x)) { return x; }
+  var neg: bool := x < 0.0;
+  var a: f64 := AbsF64(x);
+  if (FeqIsInf(x)) {
+    if (neg) { return 0.0 - _halfPiC(); }
+    return _halfPiC();
+  }
+  // Jenseits von 2^66 ist 1/a kleiner als das letzte Bit von pi/2
+  if (a > 73786976294838206464.0) {
+    if (neg) { return 0.0 - _halfPiC(); }
+    return _halfPiC();
+  }
+  var id: int64 := 0 - 1;
+  var r: f64 := a;
+  if (a >= 0.4375) {
+    if (a < 1.1875) {
+      if (a < 0.6875) { id := 0; r := (2.0 * a - 1.0) / (2.0 + a); }
+      else { id := 1; r := (a - 1.0) / (a + 1.0); }
+    } else {
+      if (a < 2.4375) { id := 2; r := (a - 1.5) / (1.0 + 1.5 * a); }
+      else { id := 3; r := (0.0 - 1.0) / a; }
+    }
+  }
+  var z: f64 := r * r;
+  var w: f64 := z * z;
+  var s1: f64 := 1.62858201153657823623e-02;
+  s1 := 4.97687799461593236017e-02 + w * s1;
+  s1 := 6.66107313738753120669e-02 + w * s1;
+  s1 := 9.09088713343650656196e-02 + w * s1;
+  s1 := 1.42857142725034663711e-01 + w * s1;
+  s1 := 3.33333333333329318027e-01 + w * s1;
+  s1 := z * s1;
+  var s2: f64 := -3.65315727442169155270e-02;
+  s2 := -5.83357013379057348645e-02 + w * s2;
+  s2 := -7.69187620504482999495e-02 + w * s2;
+  s2 := -1.11111104054623557880e-01 + w * s2;
+  s2 := -1.99999999998764832476e-01 + w * s2;
+  s2 := w * s2;
+  if (id < 0) {
+    var v: f64 := r - r * (s1 + s2);
+    if (neg) { return 0.0 - v; }
+    return v;
+  }
+  var q: f64 := _atanHi(id) - ((r * (s1 + s2) - _atanLo(id)) - r);
+  if (neg) { return 0.0 - q; }
+  return q;
+}
+
+fn _halfPiC(): f64 { return 1.57079632679489661923; }
+fn _piC(): f64 { return 3.14159265358979323846; }
+
+// Winkel des Punktes (x, y) in (-pi, +pi].
+//
+// Die Nullfaelle werden ueber das VORZEICHENBIT entschieden und nicht ueber
+// einen Vergleich: `y == 0` ist fuer +0.0 und -0.0 gleichermassen wahr, und
+// genau ihr Unterschied legt fest, von welcher Seite man sich der negativen
+// reellen Achse naehert. Atan2F64 aus std.math verwirft diese Unterscheidung
+// (#1577) und liefert fuer atan2(-0, -1) den Wert +pi statt -pi.
+pub fn MxAtan2(y: f64, x: f64): f64 {
+  if (FeqIsNaN(x) || FeqIsNaN(y)) { return 0.0 / 0.0; }
+  var ySign: bool := FeqSignBit(y);
+  var xSign: bool := FeqSignBit(x);
+  if (y == 0.0) {
+    if (xSign) {
+      if (ySign) { return 0.0 - _piC(); }
+      return _piC();
+    }
+    return y;
+  }
+  if (x == 0.0) {
+    if (ySign) { return 0.0 - _halfPiC(); }
+    return _halfPiC();
+  }
+  if (FeqIsInf(x) || FeqIsInf(y)) {
+    if (FeqIsInf(x) && FeqIsInf(y)) {
+      // beide unendlich: der Winkel folgt allein aus den Vorzeichen
+      var d: f64 := 0.7853981633974483;
+      if (xSign) { d := 2.356194490192345; }
+      if (ySign) { return 0.0 - d; }
+      return d;
+    }
+    if (FeqIsInf(y)) {
+      if (ySign) { return 0.0 - _halfPiC(); }
+      return _halfPiC();
+    }
+    if (xSign) {
+      if (ySign) { return 0.0 - _piC(); }
+      return _piC();
+    }
+    if (ySign) { return -0.0; }
+    return 0.0;
+  }
+  var a: f64 := MxAtan(AbsF64(y) / AbsF64(x));
+  var r: f64 := a;
+  if (xSign) { r := _piC() - a; }
+  if (ySign) { return 0.0 - r; }
+  return r;
+}

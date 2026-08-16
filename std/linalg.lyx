@@ -1,0 +1,1061 @@
+// std/linalg.lyx
+// Dichte lineare Algebra beliebiger Groesse: LU, QR, Cholesky, Eigenwerte
+
+@description("Dense linear algebra for m-by-n matrices: LU, QR, Cholesky, eigenvalues, solving, rank")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.linalg;
+
+import std.math;
+import std.alloc;
+
+// ── Abgrenzung zu std.matrix ─────────────────────────────────────────────────
+//
+// std.matrix deckt die FESTEN kleinen Groessen ab: Vec3, Vec4, Mat3, Mat4 mit
+// benannten Feldern, zugeschnitten auf Grafik (LookAt, Perspective, RotateAxis).
+// Dort ist die Groesse zur Uebersetzungszeit bekannt, und die Struct-Form ist
+// die richtige.
+//
+// Diese Einheit ist die andere Haelfte: Matrizen, deren Groesse erst zur
+// Laufzeit feststeht, und die Verfahren, die man auf ihnen braucht —
+// Gleichungssysteme, Zerlegungen, Rang, Eigenwerte, Ausgleichsrechnung. Wer
+// eine 4x4-Transformationsmatrix dreht, nimmt std.matrix; wer ein System mit
+// 200 Unbekannten loest, diese hier.
+//
+// ── Darstellung ──────────────────────────────────────────────────────────────
+//
+// Eine m-mal-n-Matrix ist die Adresse eines f64-Feldes mit m*n Werten in
+// ZEILENWEISER Ordnung (row-major): Element (i,j) liegt bei i*n + j. Der
+// Aufrufer legt den Speicher an (alloc(m*n*8)) und gibt ihn frei.
+//
+// Kein Struct mit eingebettetem Feld: ein Strukturfeld `[N]f64` rechnet in
+// lyxc 1.0.19D ganzzahlig (#1498), ein Array VON Structs liefert 0 (#1109),
+// und Arrays als Parameter liefern Muell (#1115). Die Adressform ist die
+// einzige, die bei dynamischer Groesse traegt — und sie ist zugleich die, mit
+// der std.prob und std.fft ihre Reihen uebergeben.
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in std.prob und std.fft: `con f64` als Operand (#1499), negatives Literal
+// als Operand (#1496) und unaeres Minus auf einer Variablen mitten im Ausdruck
+// (#1512) rechnen still falsch. Konstanten stehen deshalb als Funktionen,
+// negiert wird ueber _neg().
+
+// ── Kompensiertes Summieren ──────────────────────────────────────────────────
+//
+// Jedes Skalarprodukt hier laeuft ueber n Terme, und jede Addition rundet.
+// Bei einer Matrix mit 1000 Spalten summieren sich die Rundungsfehler eines
+// einzigen Eintrags des Produkts bereits messbar auf; bei 10^6 Termen bleiben
+// von sechzehn Stellen zwoelf.
+//
+// _corr liefert den bei s + x = t verlorenen Rest (Neumaier). Welcher der
+// beiden Werte groesser ist, entscheidet die Form. Ausfuehrlich in std.sum.
+fn _corr(s: f64, x: f64, t: f64): f64 {
+  if (AbsF64(s) >= AbsF64(x)) { return (s - t) + x; }
+  return (x - t) + s;
+}
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+
+// Schwelle, unterhalb derer ein Pivot als null gilt.
+pub fn LinEpsilon(): f64 { return 0.000000000001; }   // 1e-12
+
+// ── Zugriff ──────────────────────────────────────────────────────────────────
+
+// Element (i,j) einer Matrix mit cols Spalten
+pub fn LinGet(a: int64, cols: int64, i: int64, j: int64): f64 {
+  var v: f64 := peekf64(a + (i * cols + j) * 8);
+  return v;
+}
+
+pub fn LinSet(a: int64, cols: int64, i: int64, j: int64, v: f64): void {
+  pokef64(a + (i * cols + j) * 8, v);
+}
+
+// ── Erzeugen und Umformen ────────────────────────────────────────────────────
+
+pub fn LinFill(a: int64, m: int64, n: int64, v: f64): void {
+  var i: int64 := 0;
+  var cnt: int64 := m * n;
+  while (i < cnt) {
+    pokef64(a + i * 8, v);
+    i := i + 1;
+  }
+}
+
+pub fn LinZero(a: int64, m: int64, n: int64): void {
+  LinFill(a, m, n, _zero());
+}
+
+pub fn LinIdentity(a: int64, n: int64): void {
+  LinZero(a, n, n);
+  var i: int64 := 0;
+  while (i < n) {
+    LinSet(a, n, i, i, _one());
+    i := i + 1;
+  }
+}
+
+pub fn LinCopy(src: int64, dst: int64, m: int64, n: int64): void {
+  var i: int64 := 0;
+  var cnt: int64 := m * n;
+  while (i < cnt) {
+    pokef64(dst + i * 8, peekf64(src + i * 8));
+    i := i + 1;
+  }
+}
+
+// out ist n-mal-m und darf NICHT auf a zeigen.
+pub fn LinTranspose(a: int64, m: int64, n: int64, out: int64): bool {
+  if (out == a) { return false; }
+  var i: int64 := 0;
+  while (i < m) {
+    var j: int64 := 0;
+    while (j < n) {
+      LinSet(out, m, j, i, LinGet(a, n, i, j));
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+pub fn LinAdd(a: int64, b: int64, m: int64, n: int64, out: int64): void {
+  var i: int64 := 0;
+  var cnt: int64 := m * n;
+  while (i < cnt) {
+    var x: f64 := peekf64(a + i * 8);
+    var y: f64 := peekf64(b + i * 8);
+    pokef64(out + i * 8, x + y);
+    i := i + 1;
+  }
+}
+
+pub fn LinSub(a: int64, b: int64, m: int64, n: int64, out: int64): void {
+  var i: int64 := 0;
+  var cnt: int64 := m * n;
+  while (i < cnt) {
+    var x: f64 := peekf64(a + i * 8);
+    var y: f64 := peekf64(b + i * 8);
+    pokef64(out + i * 8, x - y);
+    i := i + 1;
+  }
+}
+
+pub fn LinScale(a: int64, m: int64, n: int64, s: f64, out: int64): void {
+  var i: int64 := 0;
+  var cnt: int64 := m * n;
+  while (i < cnt) {
+    var x: f64 := peekf64(a + i * 8);
+    pokef64(out + i * 8, x * s);
+    i := i + 1;
+  }
+}
+
+// C = A*B mit A (m x k), B (k x n), C (m x n). out darf nicht auf a oder b
+// zeigen — das Ergebnis wird elementweise geschrieben, waehrend die Eingaben
+// noch gelesen werden.
+pub fn LinMul(a: int64, b: int64, m: int64, k: int64, n: int64, out: int64): bool {
+  if (out == a) { return false; }
+  if (out == b) { return false; }
+
+  var i: int64 := 0;
+  while (i < m) {
+    var j: int64 := 0;
+    while (j < n) {
+      var s: f64 := _zero();
+      var c: f64 := _zero();
+      var t: int64 := 0;
+      while (t < k) {
+        var _x: f64 := LinGet(a, k, i, t) * LinGet(b, n, t, j);
+        var _t: f64 := s + _x;
+        c := c + _corr(s, _x, _t);
+        s := _t;
+        t := t + 1;
+      }
+      LinSet(out, n, i, j, s + c);
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// y = A*x mit A (m x n), x (n), y (m)
+pub fn LinMulVec(a: int64, m: int64, n: int64, x: int64, y: int64): bool {
+  if (y == x) { return false; }
+  var i: int64 := 0;
+  while (i < m) {
+    var s: f64 := _zero();
+    var c: f64 := _zero();
+    var j: int64 := 0;
+    while (j < n) {
+      var xv: f64 := peekf64(x + j * 8);
+      var _x: f64 := LinGet(a, n, i, j) * xv;
+      var _t: f64 := s + _x;
+      c := c + _corr(s, _x, _t);
+      s := _t;
+      j := j + 1;
+    }
+    pokef64(y + i * 8, s + c);
+    i := i + 1;
+  }
+  return true;
+}
+
+pub fn LinEquals(a: int64, b: int64, m: int64, n: int64, eps: f64): bool {
+  var i: int64 := 0;
+  var cnt: int64 := m * n;
+  while (i < cnt) {
+    var x: f64 := peekf64(a + i * 8);
+    var y: f64 := peekf64(b + i * 8);
+    if (AbsF64(x - y) > eps) { return false; }
+    i := i + 1;
+  }
+  return true;
+}
+
+// ── Normen und Kennzahlen ────────────────────────────────────────────────────
+
+pub fn LinTrace(a: int64, n: int64): f64 {
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  while (i < n) {
+    var _x: f64 := LinGet(a, n, i, i);
+    var _t: f64 := s + _x;
+    c := c + _corr(s, _x, _t);
+    s := _t;
+    i := i + 1;
+  }
+  return s + c;
+}
+
+// Frobenius-Norm: Wurzel aus der Summe aller Quadrate
+pub fn LinNormFro(a: int64, m: int64, n: int64): f64 {
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  var cnt: int64 := m * n;
+  while (i < cnt) {
+    var x: f64 := peekf64(a + i * 8);
+    var _x: f64 := x * x;
+    var _t: f64 := s + _x;
+    c := c + _corr(s, _x, _t);
+    s := _t;
+    i := i + 1;
+  }
+  return SqrtF64(s + c);
+}
+
+// 1-Norm: groesste Spaltensumme der Betraege
+pub fn LinNormOne(a: int64, m: int64, n: int64): f64 {
+  var best: f64 := _zero();
+  var j: int64 := 0;
+  while (j < n) {
+    var s: f64 := _zero();
+    var c: f64 := _zero();
+    var i: int64 := 0;
+    while (i < m) {
+      var _x: f64 := AbsF64(LinGet(a, n, i, j));
+      var _t: f64 := s + _x;
+      c := c + _corr(s, _x, _t);
+      s := _t;
+      i := i + 1;
+    }
+    var sc: f64 := s + c;
+    if (sc > best) { best := sc; }
+    j := j + 1;
+  }
+  return best;
+}
+
+// Unendlich-Norm: groesste Zeilensumme der Betraege
+pub fn LinNormInf(a: int64, m: int64, n: int64): f64 {
+  var best: f64 := _zero();
+  var i: int64 := 0;
+  while (i < m) {
+    var s: f64 := _zero();
+    var c: f64 := _zero();
+    var j: int64 := 0;
+    while (j < n) {
+      var _x: f64 := AbsF64(LinGet(a, n, i, j));
+      var _t: f64 := s + _x;
+      c := c + _corr(s, _x, _t);
+      s := _t;
+      j := j + 1;
+    }
+    var sc: f64 := s + c;
+    if (sc > best) { best := sc; }
+    i := i + 1;
+  }
+  return best;
+}
+
+pub fn LinIsSymmetric(a: int64, n: int64, eps: f64): bool {
+  var i: int64 := 0;
+  while (i < n) {
+    var j: int64 := i + 1;
+    while (j < n) {
+      if (AbsF64(LinGet(a, n, i, j) - LinGet(a, n, j, i)) > eps) { return false; }
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// ── LU-Zerlegung mit Teilpivotisierung ───────────────────────────────────────
+//
+// Zerlegt A in P*A = L*U, an Ort und Stelle: das Ergebnis traegt U im oberen
+// Dreieck (samt Diagonale) und L darunter (die Einsen der L-Diagonale sind
+// nicht gespeichert). perm ist ein int64-Feld mit n Eintraegen und haelt die
+// Zeilenvertauschungen; outSign nimmt +1 oder -1 auf (0 = verwerfen) und wird
+// fuer die Determinante gebraucht.
+//
+// Die Pivotisierung ist nicht optional. Ohne sie scheitert die Zerlegung schon
+// an [[0,1],[1,0]] — einer voellig harmlosen, gut konditionierten Matrix —
+// weil das erste Pivot null ist. Und bei kleinen Pivots waechst der Fehler
+// unbegrenzt: die Zeilentauschsuche nach dem betragsgroessten Element ist der
+// Unterschied zwischen einem brauchbaren und einem beliebigen Ergebnis.
+//
+// Rueckgabe false, wenn die Matrix singulaer ist (kein Pivot ueber der
+// Schwelle). perm und die Teilzerlegung sind dann unbrauchbar.
+pub fn LinLuDecompose(a: int64, n: int64, perm: int64, outSign: int64): bool {
+  if (n < 1) { return false; }
+
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(perm + i * 8, i);
+    i := i + 1;
+  }
+  var sign: f64 := _one();
+
+  var k: int64 := 0;
+  while (k < n) {
+    // betragsgroesstes Element in Spalte k ab Zeile k
+    var pivRow: int64 := k;
+    var pivVal: f64 := AbsF64(LinGet(a, n, k, k));
+    var r: int64 := k + 1;
+    while (r < n) {
+      var v: f64 := AbsF64(LinGet(a, n, r, k));
+      if (v > pivVal) {
+        pivVal := v;
+        pivRow := r;
+      }
+      r := r + 1;
+    }
+    if (pivVal < LinEpsilon()) { return false; }
+
+    if (pivRow != k) {
+      var j: int64 := 0;
+      while (j < n) {
+        var t: f64 := LinGet(a, n, k, j);
+        LinSet(a, n, k, j, LinGet(a, n, pivRow, j));
+        LinSet(a, n, pivRow, j, t);
+        j := j + 1;
+      }
+      var pk: int64 := peek64(perm + k * 8);
+      poke64(perm + k * 8, peek64(perm + pivRow * 8));
+      poke64(perm + pivRow * 8, pk);
+      sign := _neg(sign);
+    }
+
+    var piv: f64 := LinGet(a, n, k, k);
+    var rr: int64 := k + 1;
+    while (rr < n) {
+      var f: f64 := LinGet(a, n, rr, k) / piv;
+      LinSet(a, n, rr, k, f);
+      var c: int64 := k + 1;
+      while (c < n) {
+        LinSet(a, n, rr, c, LinGet(a, n, rr, c) - f * LinGet(a, n, k, c));
+        c := c + 1;
+      }
+      rr := rr + 1;
+    }
+    k := k + 1;
+  }
+
+  if (outSign != 0) { pokef64(outSign, sign); }
+  return true;
+}
+
+// Loest L*U*x = P*b mit einer fertigen Zerlegung. x darf auf b zeigen.
+pub fn LinLuSolve(lu: int64, n: int64, perm: int64, b: int64, x: int64): bool {
+  if (n < 1) { return false; }
+
+  // Vorwaertseinsetzen (L hat Einsen auf der Diagonale)
+  var i: int64 := 0;
+  while (i < n) {
+    var pi: int64 := peek64(perm + i * 8);
+    var s: f64 := peekf64(b + pi * 8);
+    var j: int64 := 0;
+    while (j < i) {
+      var xj: f64 := peekf64(x + j * 8);
+      s := s - LinGet(lu, n, i, j) * xj;
+      j := j + 1;
+    }
+    pokef64(x + i * 8, s);
+    i := i + 1;
+  }
+
+  // Rueckwaertseinsetzen
+  i := n - 1;
+  while (i >= 0) {
+    var s: f64 := peekf64(x + i * 8);
+    var j: int64 := i + 1;
+    while (j < n) {
+      var xj: f64 := peekf64(x + j * 8);
+      s := s - LinGet(lu, n, i, j) * xj;
+      j := j + 1;
+    }
+    var d: f64 := LinGet(lu, n, i, i);
+    if (AbsF64(d) < LinEpsilon()) { return false; }
+    pokef64(x + i * 8, s / d);
+    i := i - 1;
+  }
+  return true;
+}
+
+// Loest A*x = b fuer eine quadratische Matrix. A bleibt unveraendert.
+pub fn LinSolve(a: int64, n: int64, b: int64, x: int64): bool {
+  if (n < 1) { return false; }
+
+  var lu: int64 := alloc(n * n * 8);
+  var perm: int64 := alloc(n * 8);
+  if (lu == 0) { return false; }
+  if (perm == 0) { free(lu, n * n * 8); return false; }
+
+  LinCopy(a, lu, n, n);
+  var ok: bool := LinLuDecompose(lu, n, perm, 0);
+  if (ok) { ok := LinLuSolve(lu, n, perm, b, x); }
+
+  free(lu, n * n * 8);
+  free(perm, n * 8);
+  return ok;
+}
+
+// Determinante ueber die LU-Zerlegung: Produkt der U-Diagonale mal
+// Permutationsvorzeichen. Die Entwicklung nach Unterdeterminanten waere O(n!)
+// und ab n = 12 nicht mehr berechenbar; hier ist es O(n^3).
+//
+// Bei singulaerer Matrix ist die Determinante 0 — das ist kein Fehlerfall,
+// sondern die Antwort.
+pub fn LinDet(a: int64, n: int64): f64 {
+  if (n < 1) { return _zero(); }
+
+  var lu: int64 := alloc(n * n * 8);
+  var perm: int64 := alloc(n * 8);
+  var sgn: int64 := alloc(8);
+  if (lu == 0) { return _zero(); }
+  if (perm == 0) { free(lu, n * n * 8); return _zero(); }
+  if (sgn == 0) { free(lu, n * n * 8); free(perm, n * 8); return _zero(); }
+
+  LinCopy(a, lu, n, n);
+  var d: f64 := _zero();
+  if (LinLuDecompose(lu, n, perm, sgn)) {
+    d := peekf64(sgn);
+    var i: int64 := 0;
+    while (i < n) {
+      d := d * LinGet(lu, n, i, i);
+      i := i + 1;
+    }
+  }
+
+  free(lu, n * n * 8);
+  free(perm, n * 8);
+  free(sgn, 8);
+  return d;
+}
+
+// Inverse ueber n Gleichungssysteme mit den Einheitsvektoren als rechter Seite.
+// Die Zerlegung wird dabei EINMAL berechnet und n-mal benutzt — das ist der
+// ganze Punkt gegenueber n einzelnen LinSolve-Aufrufen.
+//
+// Hinweis: wer A^-1 nur bildet, um damit ein System zu loesen, sollte LinSolve
+// nehmen. Die Inverse ist ungenauer und langsamer.
+pub fn LinInverse(a: int64, n: int64, out: int64): bool {
+  if (n < 1) { return false; }
+  if (out == a) { return false; }
+
+  var lu: int64 := alloc(n * n * 8);
+  var perm: int64 := alloc(n * 8);
+  var e: int64 := alloc(n * 8);
+  var col: int64 := alloc(n * 8);
+  if (lu == 0) { return false; }
+  if (perm == 0) { return false; }
+  if (e == 0) { return false; }
+  if (col == 0) { return false; }
+
+  LinCopy(a, lu, n, n);
+  var ok: bool := LinLuDecompose(lu, n, perm, 0);
+
+  if (ok) {
+    var j: int64 := 0;
+    while (j < n) {
+      var i: int64 := 0;
+      while (i < n) {
+        pokef64(e + i * 8, _zero());
+        i := i + 1;
+      }
+      pokef64(e + j * 8, _one());
+
+      if (LinLuSolve(lu, n, perm, e, col)) {
+        i := 0;
+        while (i < n) {
+          var v: f64 := peekf64(col + i * 8);
+          LinSet(out, n, i, j, v);
+          i := i + 1;
+        }
+      }
+      else { ok := false; j := n; }
+      j := j + 1;
+    }
+  }
+
+  free(lu, n * n * 8);
+  free(perm, n * 8);
+  free(e, n * 8);
+  free(col, n * 8);
+  return ok;
+}
+
+// ── Gauss-Jordan: Stufenform und Rang ────────────────────────────────────────
+
+// Reduzierte Zeilenstufenform, an Ort und Stelle. Rueckgabe ist der Rang.
+pub fn LinRref(a: int64, m: int64, n: int64): int64 {
+  var lead: int64 := 0;
+  var row: int64 := 0;
+
+  while (row < m) {
+    if (lead >= n) { row := m; }
+    else {
+      // Zeile mit dem betragsgroessten Element in Spalte lead suchen
+      var best: int64 := row;
+      var bestV: f64 := AbsF64(LinGet(a, n, row, lead));
+      var r: int64 := row + 1;
+      while (r < m) {
+        var v: f64 := AbsF64(LinGet(a, n, r, lead));
+        if (v > bestV) { bestV := v; best := r; }
+        r := r + 1;
+      }
+
+      if (bestV < LinEpsilon()) {
+        // Spalte ist praktisch leer — naechste Spalte, gleiche Zeile
+        lead := lead + 1;
+      }
+      else {
+        if (best != row) {
+          var j: int64 := 0;
+          while (j < n) {
+            var t: f64 := LinGet(a, n, row, j);
+            LinSet(a, n, row, j, LinGet(a, n, best, j));
+            LinSet(a, n, best, j, t);
+            j := j + 1;
+          }
+        }
+
+        var piv: f64 := LinGet(a, n, row, lead);
+        var c: int64 := 0;
+        while (c < n) {
+          LinSet(a, n, row, c, LinGet(a, n, row, c) / piv);
+          c := c + 1;
+        }
+
+        var rr: int64 := 0;
+        while (rr < m) {
+          if (rr != row) {
+            var f: f64 := LinGet(a, n, rr, lead);
+            if (AbsF64(f) > _zero()) {
+              var cc: int64 := 0;
+              while (cc < n) {
+                LinSet(a, n, rr, cc, LinGet(a, n, rr, cc) - f * LinGet(a, n, row, cc));
+                cc := cc + 1;
+              }
+            }
+          }
+          rr := rr + 1;
+        }
+        lead := lead + 1;
+        row := row + 1;
+      }
+    }
+  }
+
+  // Rang = Zahl der Zeilen, die nicht komplett null sind
+  var rank: int64 := 0;
+  var i: int64 := 0;
+  while (i < m) {
+    var nz: bool := false;
+    var j: int64 := 0;
+    while (j < n) {
+      if (AbsF64(LinGet(a, n, i, j)) > LinEpsilon()) { nz := true; }
+      j := j + 1;
+    }
+    if (nz) { rank := rank + 1; }
+    i := i + 1;
+  }
+  return rank;
+}
+
+// Rang, ohne die Eingabe zu veraendern.
+pub fn LinRank(a: int64, m: int64, n: int64): int64 {
+  var c: int64 := alloc(m * n * 8);
+  if (c == 0) { return 0; }
+  LinCopy(a, c, m, n);
+  var r: int64 := LinRref(c, m, n);
+  free(c, m * n * 8);
+  return r;
+}
+
+// ── QR-Zerlegung nach Householder ────────────────────────────────────────────
+//
+// A (m x n, m >= n) wird zerlegt in Q (m x m, orthogonal) und R (m x n, obere
+// Dreiecksform). A bleibt unveraendert.
+//
+// Householder-Spiegelungen statt Gram-Schmidt: das klassische Gram-Schmidt
+// verliert bei fast linear abhaengigen Spalten die Orthogonalitaet vollstaendig,
+// und selbst die modifizierte Fassung bleibt schlechter. Spiegelungen sind
+// orthogonale Abbildungen — sie koennen den Fehler nicht verstaerken.
+pub fn LinQr(a: int64, m: int64, n: int64, q: int64, r: int64): bool {
+  if (m < n) { return false; }
+  if (n < 1) { return false; }
+
+  LinCopy(a, r, m, n);
+  LinIdentity(q, m);
+
+  var v: int64 := alloc(m * 8);
+  if (v == 0) { return false; }
+
+  var k: int64 := 0;
+  while (k < n) {
+    // Norm der Teilspalte unterhalb (einschliesslich) der Diagonale
+    var norm: f64 := _zero();
+    var i: int64 := k;
+    while (i < m) {
+      var x: f64 := LinGet(r, n, i, k);
+      norm := norm + x * x;
+      i := i + 1;
+    }
+    norm := SqrtF64(norm);
+
+    if (norm > LinEpsilon()) {
+      // Vorzeichen so waehlen, dass sich v[k] nicht ausloescht: liegt das
+      // Diagonalelement nahe bei -norm, wird die Differenz sonst zu klein und
+      // die Spiegelung ungenau.
+      var alpha: f64 := norm;
+      if (LinGet(r, n, k, k) > _zero()) { alpha := _neg(norm); }
+
+      i := k;
+      while (i < m) {
+        pokef64(v + i * 8, LinGet(r, n, i, k));
+        i := i + 1;
+      }
+      pokef64(v + k * 8, LinGet(r, n, k, k) - alpha);
+
+      var vnorm: f64 := _zero();
+      i := k;
+      while (i < m) {
+        var vi: f64 := peekf64(v + i * 8);
+        vnorm := vnorm + vi * vi;
+        i := i + 1;
+      }
+
+      if (vnorm > LinEpsilon()) {
+        // R := (I - 2vv^T/v^Tv) R
+        var j: int64 := 0;
+        while (j < n) {
+          var s: f64 := _zero();
+          var c: f64 := _zero();
+          i := k;
+          while (i < m) {
+            var vi: f64 := peekf64(v + i * 8);
+            var _x: f64 := vi * LinGet(r, n, i, j);
+            var _t: f64 := s + _x;
+            c := c + _corr(s, _x, _t);
+            s := _t;
+            i := i + 1;
+          }
+          var f: f64 := 2.0 * (s + c) / vnorm;
+          i := k;
+          while (i < m) {
+            var vi: f64 := peekf64(v + i * 8);
+            LinSet(r, n, i, j, LinGet(r, n, i, j) - f * vi);
+            i := i + 1;
+          }
+          j := j + 1;
+        }
+
+        // Q := Q (I - 2vv^T/v^Tv)
+        j := 0;
+        while (j < m) {
+          var s: f64 := _zero();
+          var c: f64 := _zero();
+          i := k;
+          while (i < m) {
+            var vi: f64 := peekf64(v + i * 8);
+            var _x: f64 := LinGet(q, m, j, i) * vi;
+            var _t: f64 := s + _x;
+            c := c + _corr(s, _x, _t);
+            s := _t;
+            i := i + 1;
+          }
+          var f: f64 := 2.0 * (s + c) / vnorm;
+          i := k;
+          while (i < m) {
+            var vi: f64 := peekf64(v + i * 8);
+            LinSet(q, m, j, i, LinGet(q, m, j, i) - f * vi);
+            i := i + 1;
+          }
+          j := j + 1;
+        }
+      }
+    }
+    k := k + 1;
+  }
+
+  free(v, m * 8);
+  return true;
+}
+
+// Ausgleichsrechnung: kleinste Quadrate fuer A*x ~ b mit A (m x n), m >= n.
+//
+// Ueber die QR-Zerlegung, nicht ueber die Normalengleichungen A^T A x = A^T b.
+// Die Normalengleichungen sind kuerzer hinzuschreiben, quadrieren aber die
+// Konditionszahl — bei einer Matrix mit Kondition 1e8 (fuer eine Messreihe
+// nichts Besonderes) bleibt danach keine gueltige Stelle uebrig.
+pub fn LinLstSq(a: int64, m: int64, n: int64, b: int64, x: int64): bool {
+  if (m < n) { return false; }
+
+  var q: int64 := alloc(m * m * 8);
+  var r: int64 := alloc(m * n * 8);
+  var qtb: int64 := alloc(m * 8);
+  if (q == 0) { return false; }
+  if (r == 0) { return false; }
+  if (qtb == 0) { return false; }
+
+  var ok: bool := LinQr(a, m, n, q, r);
+
+  if (ok) {
+    // Q^T b
+    var i: int64 := 0;
+    while (i < m) {
+      var s: f64 := _zero();
+      var c: f64 := _zero();
+      var j: int64 := 0;
+      while (j < m) {
+        var bj: f64 := peekf64(b + j * 8);
+        var _x: f64 := LinGet(q, m, j, i) * bj;
+        var _t: f64 := s + _x;
+        c := c + _corr(s, _x, _t);
+        s := _t;
+        j := j + 1;
+      }
+      pokef64(qtb + i * 8, s + c);
+      i := i + 1;
+    }
+
+    // Rueckwaertseinsetzen im oberen n-mal-n-Block von R
+    i := n - 1;
+    while (i >= 0) {
+      var s: f64 := peekf64(qtb + i * 8);
+      var j: int64 := i + 1;
+      while (j < n) {
+        var xj: f64 := peekf64(x + j * 8);
+        s := s - LinGet(r, n, i, j) * xj;
+        j := j + 1;
+      }
+      var d: f64 := LinGet(r, n, i, i);
+      if (AbsF64(d) < LinEpsilon()) { ok := false; i := 0; }
+      else { pokef64(x + i * 8, s / d); }
+      i := i - 1;
+    }
+  }
+
+  free(q, m * m * 8);
+  free(r, m * n * 8);
+  free(qtb, m * 8);
+  return ok;
+}
+
+// ── Cholesky ─────────────────────────────────────────────────────────────────
+
+// A = L*L^T fuer symmetrisch positiv definite A. out nimmt L auf (unteres
+// Dreieck, oberes genullt). false, wenn A nicht positiv definit ist — der
+// Abbruch beim Wurzelziehen aus einer nichtpositiven Zahl IST der Test.
+//
+// Halb so teuer wie LU und ohne Pivotisierung stabil; fuer Kovarianzmatrizen
+// und Normalengleichungen der richtige Weg.
+pub fn LinCholesky(a: int64, n: int64, out: int64): bool {
+  if (n < 1) { return false; }
+  LinZero(out, n, n);
+
+  var i: int64 := 0;
+  while (i < n) {
+    var j: int64 := 0;
+    while (j <= i) {
+      var s: f64 := LinGet(a, n, i, j);
+      var k: int64 := 0;
+      while (k < j) {
+        s := s - LinGet(out, n, i, k) * LinGet(out, n, j, k);
+        k := k + 1;
+      }
+      if (i == j) {
+        if (s <= LinEpsilon()) { return false; }
+        LinSet(out, n, i, j, SqrtF64(s));
+      }
+      else {
+        var d: f64 := LinGet(out, n, j, j);
+        if (AbsF64(d) < LinEpsilon()) { return false; }
+        LinSet(out, n, i, j, s / d);
+      }
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Loest A*x = b mit fertigem L aus LinCholesky.
+pub fn LinCholeskySolve(l: int64, n: int64, b: int64, x: int64): bool {
+  // L*y = b
+  var i: int64 := 0;
+  while (i < n) {
+    var s: f64 := peekf64(b + i * 8);
+    var j: int64 := 0;
+    while (j < i) {
+      var xj: f64 := peekf64(x + j * 8);
+      s := s - LinGet(l, n, i, j) * xj;
+      j := j + 1;
+    }
+    var d: f64 := LinGet(l, n, i, i);
+    if (AbsF64(d) < LinEpsilon()) { return false; }
+    pokef64(x + i * 8, s / d);
+    i := i + 1;
+  }
+
+  // L^T*x = y
+  i := n - 1;
+  while (i >= 0) {
+    var s: f64 := peekf64(x + i * 8);
+    var j: int64 := i + 1;
+    while (j < n) {
+      var xj: f64 := peekf64(x + j * 8);
+      s := s - LinGet(l, n, j, i) * xj;
+      j := j + 1;
+    }
+    var d: f64 := LinGet(l, n, i, i);
+    if (AbsF64(d) < LinEpsilon()) { return false; }
+    pokef64(x + i * 8, s / d);
+    i := i - 1;
+  }
+  return true;
+}
+
+// Ist A symmetrisch positiv definit? Antwort ueber den Versuch, sie zu
+// zerlegen — ein billigeres Kriterium gibt es nicht.
+pub fn LinIsPosDef(a: int64, n: int64): bool {
+  if (!LinIsSymmetric(a, n, 0.000000001)) { return false; }
+  var l: int64 := alloc(n * n * 8);
+  if (l == 0) { return false; }
+  var ok: bool := LinCholesky(a, n, l);
+  free(l, n * n * 8);
+  return ok;
+}
+
+// ── Eigenwerte symmetrischer Matrizen (Jacobi) ───────────────────────────────
+//
+// Zyklisches Jacobi-Verfahren: dreht wiederholt in der Ebene (p,q) so, dass das
+// groesste Aussendiagonalelement verschwindet. Die Summe der Quadrate aller
+// Aussendiagonalelemente faellt dabei streng monoton — das Verfahren
+// konvergiert IMMER, ohne Startwert und ohne Verschiebungsstrategie.
+//
+// Nur fuer symmetrische Matrizen. Fuer allgemeine Matrizen braeuchte es die
+// QR-Iteration mit Hessenberg-Reduktion; die ist hier bewusst nicht drin,
+// weil komplexe Eigenwerte eine komplexe Arithmetik ueber die ganze Einheit
+// nach sich ziehen wuerden.
+//
+// evals nimmt n Eigenwerte auf, evecs (n x n) die Eigenvektoren SPALTENWEISE
+// (evecs[i][j] ist Komponente i des j-ten Vektors). evecs darf 0 sein.
+pub fn LinEigenSym(a: int64, n: int64, evals: int64, evecs: int64): bool {
+  if (n < 1) { return false; }
+  if (!LinIsSymmetric(a, n, 0.000000001)) { return false; }
+
+  var w: int64 := alloc(n * n * 8);
+  if (w == 0) { return false; }
+  LinCopy(a, w, n, n);
+  if (evecs != 0) { LinIdentity(evecs, n); }
+
+  var sweep: int64 := 0;
+  var running: bool := true;
+  while (running) {
+    // Betragssumme der Aussendiagonalen
+    var off: f64 := _zero();
+    var i: int64 := 0;
+    while (i < n) {
+      var j: int64 := i + 1;
+      while (j < n) {
+        var v: f64 := LinGet(w, n, i, j);
+        off := off + v * v;
+        j := j + 1;
+      }
+      i := i + 1;
+    }
+    if (off < 0.000000000000000000000001) { running := false; }   // 1e-24
+    if (sweep >= 100) { running := false; }
+
+    if (running) {
+      var p: int64 := 0;
+      while (p < n - 1) {
+        var q: int64 := p + 1;
+        while (q < n) {
+          var apq: f64 := LinGet(w, n, p, q);
+          if (AbsF64(apq) > 0.000000000000001) {
+            var app: f64 := LinGet(w, n, p, p);
+            var aqq: f64 := LinGet(w, n, q, q);
+
+            // Drehwinkel ueber t = tan(theta), numerisch stabile Wurzel:
+            // die Formel t = sign(th)/(|th| + sqrt(th^2+1)) vermeidet die
+            // Ausloeschung, die -th + sqrt(th^2+1) bei grossem th hat.
+            var th: f64 := (aqq - app) / (2.0 * apq);
+            var t: f64 := _one() / (AbsF64(th) + SqrtF64(th * th + _one()));
+            if (th < _zero()) { t := _neg(t); }
+
+            var c: f64 := _one() / SqrtF64(t * t + _one());
+            var s: f64 := t * c;
+
+            var k: int64 := 0;
+            while (k < n) {
+              var akp: f64 := LinGet(w, n, k, p);
+              var akq: f64 := LinGet(w, n, k, q);
+              LinSet(w, n, k, p, c * akp - s * akq);
+              LinSet(w, n, k, q, s * akp + c * akq);
+              k := k + 1;
+            }
+            k := 0;
+            while (k < n) {
+              var apk: f64 := LinGet(w, n, p, k);
+              var aqk: f64 := LinGet(w, n, q, k);
+              LinSet(w, n, p, k, c * apk - s * aqk);
+              LinSet(w, n, q, k, s * apk + c * aqk);
+              k := k + 1;
+            }
+
+            if (evecs != 0) {
+              k := 0;
+              while (k < n) {
+                var vkp: f64 := LinGet(evecs, n, k, p);
+                var vkq: f64 := LinGet(evecs, n, k, q);
+                LinSet(evecs, n, k, p, c * vkp - s * vkq);
+                LinSet(evecs, n, k, q, s * vkp + c * vkq);
+                k := k + 1;
+              }
+            }
+          }
+          q := q + 1;
+        }
+        p := p + 1;
+      }
+      sweep := sweep + 1;
+    }
+  }
+
+  var i2: int64 := 0;
+  while (i2 < n) {
+    pokef64(evals + i2 * 8, LinGet(w, n, i2, i2));
+    i2 := i2 + 1;
+  }
+  free(w, n * n * 8);
+  return true;
+}
+
+// Eigenwerte absteigend sortieren, Eigenvektoren mitziehen. evecs darf 0 sein.
+pub fn LinEigenSortDesc(evals: int64, evecs: int64, n: int64): void {
+  var i: int64 := 0;
+  while (i < n - 1) {
+    var best: int64 := i;
+    var bestV: f64 := peekf64(evals + i * 8);
+    var j: int64 := i + 1;
+    while (j < n) {
+      var v: f64 := peekf64(evals + j * 8);
+      if (v > bestV) { bestV := v; best := j; }
+      j := j + 1;
+    }
+    if (best != i) {
+      var t: f64 := peekf64(evals + i * 8);
+      pokef64(evals + i * 8, peekf64(evals + best * 8));
+      pokef64(evals + best * 8, t);
+      if (evecs != 0) {
+        var k: int64 := 0;
+        while (k < n) {
+          var tv: f64 := LinGet(evecs, n, k, i);
+          LinSet(evecs, n, k, i, LinGet(evecs, n, k, best));
+          LinSet(evecs, n, k, best, tv);
+          k := k + 1;
+        }
+      }
+    }
+    i := i + 1;
+  }
+}
+
+// Singulaerwerte von A (m x n) als Wurzeln der Eigenwerte von A^T*A,
+// absteigend. out fasst n Werte.
+//
+// FUER GENAUE WERTE: std.decomp bietet mit DecompSvdValues eine echte SVD
+// (einseitiges Jacobi) ohne den Genauigkeitsverlust dieses Wegs. Diese
+// Fassung bleibt, weil sie ohne zusaetzliche Abhaengigkeit auskommt und fuer
+// gutartige Matrizen genuegt.
+//
+// Der Weg ueber A^T*A quadriert die Kondition — kleine Singulaerwerte kommen
+// entsprechend ungenau heraus. Fuer die Kondition einer gutartigen Matrix und
+// fuer den Rangbegriff reicht es; wer die kleinen Werte genau braucht, braucht
+// eine echte SVD (Golub-Kahan), und die ist hier nicht drin.
+pub fn LinSingularValues(a: int64, m: int64, n: int64, out: int64): bool {
+  if (m < 1) { return false; }
+  if (n < 1) { return false; }
+
+  var at: int64 := alloc(n * m * 8);
+  var ata: int64 := alloc(n * n * 8);
+  if (at == 0) { return false; }
+  if (ata == 0) { free(at, n * m * 8); return false; }
+
+  LinTranspose(a, m, n, at);
+  LinMul(at, a, n, m, n, ata);
+
+  var ok: bool := LinEigenSym(ata, n, out, 0);
+  if (ok) {
+    LinEigenSortDesc(out, 0, n);
+    var i: int64 := 0;
+    while (i < n) {
+      var v: f64 := peekf64(out + i * 8);
+      if (v < _zero()) { v := _zero(); }   // Rundung kann knapp unter 0 fallen
+      pokef64(out + i * 8, SqrtF64(v));
+      i := i + 1;
+    }
+  }
+
+  free(at, n * m * 8);
+  free(ata, n * n * 8);
+  return ok;
+}
+
+// Konditionszahl in der 2-Norm: groesster durch kleinsten Singulaerwert.
+// Genauer: DecompCond2 aus std.decomp.
+// Bei singulaerer Matrix kommt 0 zurueck — "unendlich schlecht konditioniert"
+// laesst sich als Zahl nicht ausdruecken, und 0 ist als Sonderfall eindeutig.
+pub fn LinCond2(a: int64, m: int64, n: int64): f64 {
+  var sv: int64 := alloc(n * 8);
+  if (sv == 0) { return _zero(); }
+
+  var c: f64 := _zero();
+  if (LinSingularValues(a, m, n, sv)) {
+    var smax: f64 := peekf64(sv);
+    var smin: f64 := peekf64(sv + (n - 1) * 8);
+    if (smin > LinEpsilon()) { c := smax / smin; }
+  }
+  free(sv, n * 8);
+  return c;
+}

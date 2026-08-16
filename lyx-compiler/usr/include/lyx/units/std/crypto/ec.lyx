@@ -1,0 +1,1593 @@
+// std/crypto/ec.lyx
+// Elliptische Kurven ueber Primkoerpern: P-256 und secp256k1, konstantzeit
+
+@description("Elliptic curve cryptography over prime fields: P-256 and secp256k1, constant-time scalar multiplication, RFC 6979 deterministic ECDSA, ECDH, SEC1 point encoding")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.crypto.ec;
+
+import std.math;
+import std.alloc;
+import std.crypto.sha256;
+import std.crypto.hmac;
+import std.crypto.rand;
+import std.crypto.ct;
+
+// ── Abgrenzung zu std.crypto.ecc ─────────────────────────────────────────────
+//
+// std.crypto.ecc kann secp256k1-ECDSA. Diese Einheit ergaenzt zwei Dinge, die
+// dort fehlen, und beides ist sicherheitsrelevant:
+//
+//   1. KONSTANTE LAUFZEIT. Die Skalarmultiplikation in ecc.lyx ist ein
+//      Double-and-Add mit `if (bit != 0) { add }`. Die Additionen finden also
+//      nur bei gesetzten Bits statt, und die Laufzeit haengt am Skalar — beim
+//      Signieren ist dieser Skalar der Nonce. Aus wenigen Nonce-Bits laesst
+//      sich der private Schluessel per Gitterangriff rekonstruieren; das ist
+//      der uebliche Weg, auf dem ECDSA in der Praxis bricht. Hier laeuft
+//      stattdessen eine Montgomery-Leiter ueber ALLE 256 Bits, mit
+//      vollstaendigen Additionsformeln und maskiertem Tausch: gleiche Anzahl
+//      Operationen, gleiche Speicherzugriffe, unabhaengig vom Skalar.
+//
+//   2. DETERMINISTISCHER NONCE nach RFC 6979. ecc.lyx zieht ihn aus dem RNG.
+//      Ein wiederholter oder vorhersagbarer Nonce gibt den privaten Schluessel
+//      preis — mit zwei Signaturen unter demselben k ist er eine Zeile
+//      Rechnung. RFC 6979 leitet k deterministisch aus Nachricht und
+//      Schluessel ab; ohne RNG, dafuer reproduzierbar.
+//
+// Zusaetzlich: P-256 (secp256r1), die Kurve von TLS, X.509 und JWT ES256 —
+// im Bestand bisher nicht vorhanden.
+//
+// ── Was diese Einheit NICHT leistet ──────────────────────────────────────────
+//
+// Konstante Laufzeit heisst hier: keine datenabhaengigen Verzweigungen und
+// keine datenabhaengigen Indizes. Gegen Angriffe ueber Stromverbrauch oder
+// elektromagnetische Abstrahlung schuetzt das nicht, und blindende Massnahmen
+// (Skalar- oder Projektiv-Blinding) sind nicht umgesetzt. Fuer Software auf
+// einem Server ist das die uebliche Schwelle; fuer eine Chipkarte in der Hand
+// des Angreifers reicht es nicht.
+//
+// ── Geschwindigkeit ──────────────────────────────────────────────────────────
+//
+// Gemessen auf der Entwicklungsmaschine: rund 230 ms je Signatur, also etwa
+// 200 ms je Skalarmultiplikation. Eine optimierte C-Bibliothek liegt bei
+// einigen Dutzend Mikrosekunden — der Abstand ist also drei Groessenordnungen
+// und hat drei Ursachen, alle bewusst in Kauf genommen:
+//
+//   - 28-Bit-Glieder statt 64-Bit-Woerter, weil Lyx keine 64x64-nach-128-
+//     Multiplikation hat (siehe unten). Das vervierfacht die Zahl der
+//     Teilprodukte.
+//   - Die vollstaendige Additionsformel kostet etwa doppelt so viel wie die
+//     uebliche Jacobi-Addition. Dafuer hat sie keine Sonderfaelle und damit
+//     keine datenabhaengigen Verzweigungen.
+//   - Die Leiter rechnet jedes der 280 Bits, auch die fuehrenden Nullen.
+//     Genau das ist der Sinn der Sache.
+//
+// Vermeidbar ist derzeit nur ein Teil davon: jeder oeffentliche Aufruf baut
+// den Kurvenkontext neu auf, und darin steckt die Bestimmung von R^2 ueber
+// 560 modulare Verdopplungen. Ein zwischengespeicherter Kontext waere die
+// naechstliegende Verbesserung.
+//
+// ── Zahlendarstellung ────────────────────────────────────────────────────────
+//
+// 256-Bit-Zahlen liegen als 10 Glieder zu je 28 Bit in einem int64-Feld
+// (80 Byte, kleinstwertiges Glied zuerst). Warum nicht 32-Bit-Glieder, was
+// naeher laege? Das Produkt zweier 32-Bit-Glieder ist bis zu 2^64 gross und
+// passt damit NICHT mehr in ein vorzeichenbehaftetes int64 — es gibt in Lyx
+// keine 64x64-nach-128-Multiplikation, auf die man ausweichen koennte. Mit
+// 28 Bit bleibt jedes Produkt unter 2^56, und selbst die Summe aus zehn
+// Produkten plus Uebertraegen bleibt weit unter 2^63.
+//
+// Nach aussen sind alle Zahlen 32-Byte-Folgen in GROSSER Bytereihenfolge
+// (most significant first) — so, wie sie in Zertifikaten, Schluesseldateien
+// und auf der Leitung stehen.
+
+con LIMBS: int64 := 10;
+con LIMB_BITS: int64 := 28;
+con LIMB_MASK: int64 := 268435455;      // 2^28 - 1
+con BIG_BYTES: int64 := 80;             // 10 Glieder * 8 Byte
+
+pub con EC_SECP256K1: int64 := 0;
+pub con EC_P256: int64 := 1;
+
+// ── kleine Helfer ────────────────────────────────────────────────────────────
+
+fn _g(a: int64, i: int64): int64 {
+  return peek64(a + i * 8);
+}
+
+fn _s(a: int64, i: int64, v: int64): void {
+  poke64(a + i * 8, v);
+}
+
+fn _hexVal(c: int64): int64 {
+  if (c >= 48) {
+    if (c <= 57) { return c - 48; }
+  }
+  if (c >= 97) {
+    if (c <= 102) { return c - 87; }
+  }
+  if (c >= 65) {
+    if (c <= 70) { return c - 55; }
+  }
+  return 0;
+}
+
+// Hex-Zeichenkette (64 Zeichen) in 32 Byte gross-endian
+fn _hexToBytes(s: pchar, out: int64): void {
+  var p: int64 := s as int64;
+  var i: int64 := 0;
+  while (i < 32) {
+    var hi: int64 := _hexVal(peek8(p + i * 2));
+    var lo: int64 := _hexVal(peek8(p + i * 2 + 1));
+    poke8(out + i, hi * 16 + lo);
+    i := i + 1;
+  }
+}
+
+// ── Kurvenparameter ──────────────────────────────────────────────────────────
+//
+// Beide Kurven sind kurze Weierstrass-Kurven y^2 = x^3 + a*x + b ueber F_p mit
+// Kofaktor 1 und primer Gruppenordnung. Genau das braucht die vollstaendige
+// Additionsformel weiter unten, um ohne Sonderfaelle auszukommen.
+
+fn _pHex(curve: int64): pchar {
+  if (curve == EC_P256) {
+    return "FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF"c;
+  }
+  return "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F"c;
+}
+
+fn _aHex(curve: int64): pchar {
+  if (curve == EC_P256) {
+    return "FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC"c;
+  }
+  return "0000000000000000000000000000000000000000000000000000000000000000"c;
+}
+
+fn _bHex(curve: int64): pchar {
+  if (curve == EC_P256) {
+    return "5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B"c;
+  }
+  return "0000000000000000000000000000000000000000000000000000000000000007"c;
+}
+
+fn _gxHex(curve: int64): pchar {
+  if (curve == EC_P256) {
+    return "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296"c;
+  }
+  return "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"c;
+}
+
+fn _gyHex(curve: int64): pchar {
+  if (curve == EC_P256) {
+    return "4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5"c;
+  }
+  return "483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8"c;
+}
+
+fn _nHex(curve: int64): pchar {
+  if (curve == EC_P256) {
+    return "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551"c;
+  }
+  return "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"c;
+}
+
+pub fn EcIsValidCurve(curve: int64): bool {
+  if (curve == EC_SECP256K1) { return true; }
+  if (curve == EC_P256) { return true; }
+  return false;
+}
+
+// Ordnung der Kurve als 32 Byte gross-endian
+pub fn EcCurveOrder(curve: int64, out32: int64): bool {
+  if (!EcIsValidCurve(curve)) { return false; }
+  _hexToBytes(_nHex(curve), out32);
+  return true;
+}
+
+// Primzahl des Koerpers als 32 Byte gross-endian
+pub fn EcCurvePrime(curve: int64, out32: int64): bool {
+  if (!EcIsValidCurve(curve)) { return false; }
+  _hexToBytes(_pHex(curve), out32);
+  return true;
+}
+
+// ── Grosszahlen: Grundoperationen ────────────────────────────────────────────
+
+fn _bigZero(r: int64): void {
+  var i: int64 := 0;
+  while (i < LIMBS) {
+    _s(r, i, 0);
+    i := i + 1;
+  }
+}
+
+fn _bigCopy(r: int64, a: int64): void {
+  var i: int64 := 0;
+  while (i < LIMBS) {
+    _s(r, i, _g(a, i));
+    i := i + 1;
+  }
+}
+
+// Achtung: CTIsZero aus std.crypto.ct liefert eine MASKE (-1 bei null, sonst
+// 0), keine 1. Hier wird 1/0 gebraucht — das `& 1` ist deshalb kein Schoenheits-
+// fehler, sondern traegt die Umrechnung.
+fn _bigIsZero(a: int64): int64 {
+  var acc: int64 := 0;
+  var i: int64 := 0;
+  while (i < LIMBS) {
+    acc := acc | _g(a, i);
+    i := i + 1;
+  }
+  return CTIsZero(acc) & 1;
+}
+
+// 1 wenn a >= b, sonst 0. Laeuft ueber alle Glieder, ohne fruehen Ausstieg.
+fn _bigGE(a: int64, b: int64): int64 {
+  var borrow: int64 := 0;
+  var i: int64 := 0;
+  while (i < LIMBS) {
+    var d: int64 := _g(a, i) - _g(b, i) - borrow;
+    borrow := (d >> 63) & 1;
+    i := i + 1;
+  }
+  return 1 - borrow;
+}
+
+fn _bigAdd(r: int64, a: int64, b: int64): int64 {
+  var carry: int64 := 0;
+  var i: int64 := 0;
+  while (i < LIMBS) {
+    var t: int64 := _g(a, i) + _g(b, i) + carry;
+    _s(r, i, t & LIMB_MASK);
+    carry := t >> LIMB_BITS;
+    i := i + 1;
+  }
+  return carry;
+}
+
+fn _bigSub(r: int64, a: int64, b: int64): int64 {
+  var borrow: int64 := 0;
+  var i: int64 := 0;
+  while (i < LIMBS) {
+    var t: int64 := _g(a, i) - _g(b, i) - borrow;
+    borrow := (t >> 63) & 1;
+    _s(r, i, t & LIMB_MASK);
+    i := i + 1;
+  }
+  return borrow;
+}
+
+// r := mask ? a : r  (mask ist 0 oder -1)
+fn _bigCmov(r: int64, a: int64, mask: int64): void {
+  var i: int64 := 0;
+  while (i < LIMBS) {
+    var rv: int64 := _g(r, i);
+    var av: int64 := _g(a, i);
+    _s(r, i, rv ^ ((rv ^ av) & mask));
+    i := i + 1;
+  }
+}
+
+fn _bigCswap(a: int64, b: int64, mask: int64): void {
+  var i: int64 := 0;
+  while (i < LIMBS) {
+    var av: int64 := _g(a, i);
+    var bv: int64 := _g(b, i);
+    var t: int64 := (av ^ bv) & mask;
+    _s(a, i, av ^ t);
+    _s(b, i, bv ^ t);
+    i := i + 1;
+  }
+}
+
+// 32 Byte gross-endian in Gliederform
+fn _bigFromBytes(r: int64, be32: int64): void {
+  _bigZero(r);
+  var bitPos: int64 := 0;
+  var i: int64 := 31;
+  while (i >= 0) {
+    var byteVal: int64 := peek8(be32 + i);
+    var limb: int64 := bitPos / LIMB_BITS;
+    var off: int64 := bitPos - limb * LIMB_BITS;
+    var cur: int64 := _g(r, limb) | ((byteVal << off) & LIMB_MASK);
+    _s(r, limb, cur);
+    // Ueberhang ins naechste Glied
+    if (off > LIMB_BITS - 8) {
+      var rest: int64 := byteVal >> (LIMB_BITS - off);
+      if (limb + 1 < LIMBS) {
+        _s(r, limb + 1, _g(r, limb + 1) | rest);
+      }
+    }
+    bitPos := bitPos + 8;
+    i := i - 1;
+  }
+}
+
+fn _bigToBytes(a: int64, be32: int64): void {
+  var i: int64 := 0;
+  while (i < 32) {
+    poke8(be32 + i, 0);
+    i := i + 1;
+  }
+  var bitPos: int64 := 0;
+  i := 31;
+  while (i >= 0) {
+    var limb: int64 := bitPos / LIMB_BITS;
+    var off: int64 := bitPos - limb * LIMB_BITS;
+    var v: int64 := _g(a, limb) >> off;
+    if (off > LIMB_BITS - 8) {
+      if (limb + 1 < LIMBS) {
+        v := v | (_g(a, limb + 1) << (LIMB_BITS - off));
+      }
+    }
+    poke8(be32 + i, v & 255);
+    bitPos := bitPos + 8;
+    i := i - 1;
+  }
+}
+
+// Bit i des Skalars (aus der Gliederform)
+fn _bigBit(a: int64, i: int64): int64 {
+  var limb: int64 := i / LIMB_BITS;
+  var off: int64 := i - limb * LIMB_BITS;
+  return (_g(a, limb) >> off) & 1;
+}
+
+// ── Montgomery-Arithmetik ────────────────────────────────────────────────────
+//
+// Modulare Multiplikation ohne Division: statt a*b mod m wird
+// a*b*R^-1 mod m gerechnet, mit R = 2^280. Solange alle Werte in dieser
+// "Montgomery-Form" bleiben (a' = a*R mod m), stimmt jede Kette von
+// Multiplikationen; erst am Ende wird zurueckgerechnet.
+//
+// Der Gewinn ist nicht nur Geschwindigkeit: die Reduktion besteht aus festen
+// Multiplikationen und Additionen, ohne datenabhaengige Schleifen. Eine
+// Division oder ein "solange groesser, subtrahiere" waere genau die Art von
+// Konstrukt, die Laufzeit an Daten koppelt.
+
+// -m^-1 mod 2^28, per Newton-Iteration
+fn _montN0(m: int64): int64 {
+  var m0: int64 := _g(m, 0);
+  var inv: int64 := 1;
+  var i: int64 := 0;
+  // x := x * (2 - m0*x) verdoppelt die Zahl korrekter Bits je Runde
+  while (i < 6) {
+    inv := (inv * (2 - m0 * inv)) & LIMB_MASK;
+    i := i + 1;
+  }
+  return (LIMB_MASK + 1 - inv) & LIMB_MASK;
+}
+
+// r := a*b*R^-1 mod m  (CIOS, coarsely integrated operand scanning)
+fn _montMul(r: int64, a: int64, b: int64, m: int64, n0: int64): void {
+  var t: int64 := alloc((LIMBS + 2) * 8);
+  var i: int64 := 0;
+  while (i < LIMBS + 2) {
+    poke64(t + i * 8, 0);
+    i := i + 1;
+  }
+
+  i := 0;
+  while (i < LIMBS) {
+    // t := t + a * b[i]
+    var carry: int64 := 0;
+    var bi: int64 := _g(b, i);
+    var j: int64 := 0;
+    while (j < LIMBS) {
+      var cur: int64 := peek64(t + j * 8) + _g(a, j) * bi + carry;
+      poke64(t + j * 8, cur & LIMB_MASK);
+      carry := cur >> LIMB_BITS;
+      j := j + 1;
+    }
+    var top: int64 := peek64(t + LIMBS * 8) + carry;
+    poke64(t + LIMBS * 8, top & LIMB_MASK);
+    poke64(t + (LIMBS + 1) * 8, peek64(t + (LIMBS + 1) * 8) + (top >> LIMB_BITS));
+
+    // t := (t + m * u) / 2^28  mit u so, dass das unterste Glied null wird
+    var u: int64 := (peek64(t) * n0) & LIMB_MASK;
+    carry := 0;
+    j := 0;
+    while (j < LIMBS) {
+      var cur2: int64 := peek64(t + j * 8) + _g(m, j) * u + carry;
+      poke64(t + j * 8, cur2 & LIMB_MASK);
+      carry := cur2 >> LIMB_BITS;
+      j := j + 1;
+    }
+    var top2: int64 := peek64(t + LIMBS * 8) + carry;
+    poke64(t + LIMBS * 8, top2 & LIMB_MASK);
+    poke64(t + (LIMBS + 1) * 8, peek64(t + (LIMBS + 1) * 8) + (top2 >> LIMB_BITS));
+
+    // um ein Glied nach rechts schieben
+    j := 0;
+    while (j < LIMBS + 1) {
+      poke64(t + j * 8, peek64(t + (j + 1) * 8));
+      j := j + 1;
+    }
+    poke64(t + (LIMBS + 1) * 8, 0);
+
+    i := i + 1;
+  }
+
+  // Ergebnis liegt in 0..2m; einmal bedingt subtrahieren — maskiert, nicht
+  // verzweigt
+  var tmp: int64 := alloc(BIG_BYTES);
+  i := 0;
+  while (i < LIMBS) {
+    _s(tmp, i, peek64(t + i * 8));
+    i := i + 1;
+  }
+
+  var sub: int64 := alloc(BIG_BYTES);
+  var borrow: int64 := _bigSub(sub, tmp, m);
+  var overflow: int64 := peek64(t + LIMBS * 8);
+  // nehmen, wenn kein Unterlauf ODER das Extraglied gesetzt war
+  var overflowSet: int64 := 1 - (CTIsZero(overflow) & 1);
+  var takeSub: int64 := (1 - borrow) | overflowSet;
+  var mask: int64 := 0 - (takeSub & 1);
+  _bigCopy(r, tmp);
+  _bigCmov(r, sub, mask);
+
+  free(t, (LIMBS + 2) * 8);
+  free(tmp, BIG_BYTES);
+  free(sub, BIG_BYTES);
+}
+
+// modulare Addition und Subtraktion, beide maskiert statt verzweigt
+fn _modAdd(r: int64, a: int64, b: int64, m: int64): void {
+  var t: int64 := alloc(BIG_BYTES);
+  var carry: int64 := _bigAdd(t, a, b);
+  var sub: int64 := alloc(BIG_BYTES);
+  var borrow: int64 := _bigSub(sub, t, m);
+  var takeSub: int64 := (1 - borrow) | carry;
+  var mask: int64 := 0 - (takeSub & 1);
+  _bigCopy(r, t);
+  _bigCmov(r, sub, mask);
+  free(t, BIG_BYTES);
+  free(sub, BIG_BYTES);
+}
+
+fn _modSub(r: int64, a: int64, b: int64, m: int64): void {
+  var t: int64 := alloc(BIG_BYTES);
+  var borrow: int64 := _bigSub(t, a, b);
+  var add: int64 := alloc(BIG_BYTES);
+  _bigAdd(add, t, m);
+  var mask: int64 := 0 - (borrow & 1);
+  _bigCopy(r, t);
+  _bigCmov(r, add, mask);
+  free(t, BIG_BYTES);
+  free(add, BIG_BYTES);
+}
+
+// R^2 mod m, der Faktor fuer den Wechsel in die Montgomery-Form.
+// Bestimmt durch wiederholtes Verdoppeln modulo m — 560 Schritte, alle
+// datenunabhaengig.
+fn _montR2(r: int64, m: int64): void {
+  _bigZero(r);
+  _s(r, 0, 1);
+  var i: int64 := 0;
+  while (i < 2 * LIMBS * LIMB_BITS) {
+    _modAdd(r, r, r, m);
+    i := i + 1;
+  }
+}
+
+fn _toMont(r: int64, a: int64, m: int64, n0: int64, r2: int64): void {
+  _montMul(r, a, r2, m, n0);
+}
+
+fn _fromMont(r: int64, a: int64, m: int64, n0: int64): void {
+  var one: int64 := alloc(BIG_BYTES);
+  _bigZero(one);
+  _s(one, 0, 1);
+  _montMul(r, a, one, m, n0);
+  free(one, BIG_BYTES);
+}
+
+// Inverses per kleinem Satz von Fermat: a^(m-2) mod m. Quadrieren-und-
+// Multiplizieren ueber ALLE Bits, mit maskierter Uebernahme statt Verzweigung —
+// die naheliegende Variante `if (bit) mul` waere genau das Leck, das diese
+// Einheit vermeiden soll.
+fn _montInv(r: int64, a: int64, m: int64, n0: int64, r2: int64): void {
+  var e: int64 := alloc(BIG_BYTES);
+  var two: int64 := alloc(BIG_BYTES);
+  _bigZero(two);
+  _s(two, 0, 2);
+  _bigSub(e, m, two);
+
+  var result: int64 := alloc(BIG_BYTES);
+  var base: int64 := alloc(BIG_BYTES);
+  var prod: int64 := alloc(BIG_BYTES);
+  var one: int64 := alloc(BIG_BYTES);
+  _bigZero(one);
+  _s(one, 0, 1);
+  _toMont(result, one, m, n0, r2);
+  _bigCopy(base, a);
+
+  var i: int64 := 0;
+  var bits: int64 := LIMBS * LIMB_BITS;
+  while (i < bits) {
+    var bit: int64 := _bigBit(e, i);
+    _montMul(prod, result, base, m, n0);
+    var mask: int64 := 0 - bit;
+    _bigCmov(result, prod, mask);
+    _montMul(base, base, base, m, n0);
+    i := i + 1;
+  }
+
+  _bigCopy(r, result);
+  free(e, BIG_BYTES);   free(two, BIG_BYTES);
+  free(result, BIG_BYTES); free(base, BIG_BYTES);
+  free(prod, BIG_BYTES); free(one, BIG_BYTES);
+}
+
+// Quadratwurzel modulo p fuer p = 3 (mod 4): a^((p+1)/4).
+// Beide Kurven erfuellen das — bei P-256 und secp256k1 endet p auf ...FF und
+// ...2F, in beiden Faellen ist p mod 4 gleich 3.
+fn _montSqrt(r: int64, a: int64, m: int64, n0: int64, r2: int64): void {
+  var e: int64 := alloc(BIG_BYTES);
+  var one: int64 := alloc(BIG_BYTES);
+  _bigZero(one);
+  _s(one, 0, 1);
+  _bigAdd(e, m, one);
+  // durch 4 teilen = zweimal nach rechts schieben
+  var sh: int64 := 0;
+  while (sh < 2) {
+    var carry: int64 := 0;
+    var i: int64 := LIMBS - 1;
+    while (i >= 0) {
+      var cur: int64 := _g(e, i);
+      _s(e, i, (cur >> 1) | ((carry & 1) << (LIMB_BITS - 1)));
+      carry := cur;
+      i := i - 1;
+    }
+    sh := sh + 1;
+  }
+
+  var result: int64 := alloc(BIG_BYTES);
+  var base: int64 := alloc(BIG_BYTES);
+  var prod: int64 := alloc(BIG_BYTES);
+  _toMont(result, one, m, n0, r2);
+  _bigCopy(base, a);
+
+  var i2: int64 := 0;
+  var bits: int64 := LIMBS * LIMB_BITS;
+  while (i2 < bits) {
+    var bit: int64 := _bigBit(e, i2);
+    _montMul(prod, result, base, m, n0);
+    var mask: int64 := 0 - bit;
+    _bigCmov(result, prod, mask);
+    _montMul(base, base, base, m, n0);
+    i2 := i2 + 1;
+  }
+
+  _bigCopy(r, result);
+  free(e, BIG_BYTES);  free(one, BIG_BYTES);
+  free(result, BIG_BYTES); free(base, BIG_BYTES); free(prod, BIG_BYTES);
+}
+
+// ── Kurvenkontext ────────────────────────────────────────────────────────────
+//
+// Ein Kontext haelt die abgeleiteten Groessen, die jede Operation braucht:
+// p und n in Gliederform, die Montgomery-Hilfswerte zu beiden, sowie a und
+// 3*b bereits in Montgomery-Form. Er wird einmal aufgebaut und dann
+// durchgereicht — sonst wuerde jede Punktaddition die Umrechnung neu machen.
+//
+// Aufbau des Blocks (je BIG_BYTES, dann zwei Einzelwerte):
+//   0 p | 1 n | 2 aMont | 3 b3Mont | 4 r2p | 5 r2n | 6 oneMontP | 7 gxMont | 8 gyMont
+//   dann n0p, n0n als int64
+
+con CTX_BIGS: int64 := 9;
+con CTX_BYTES: int64 := 9 * 80 + 16;
+
+fn _ctxBig(ctx: int64, idx: int64): int64 {
+  return ctx + idx * BIG_BYTES;
+}
+
+fn _ctxN0p(ctx: int64): int64 {
+  return peek64(ctx + CTX_BIGS * BIG_BYTES);
+}
+
+fn _ctxN0n(ctx: int64): int64 {
+  return peek64(ctx + CTX_BIGS * BIG_BYTES + 8);
+}
+
+fn _ctxNew(curve: int64): int64 {
+  var ctx: int64 := alloc(CTX_BYTES);
+  if (ctx == 0) { return 0; }
+
+  var buf: int64 := alloc(32);
+  if (buf == 0) { return 0; }
+
+  var p: int64 := _ctxBig(ctx, 0);
+  var n: int64 := _ctxBig(ctx, 1);
+  _hexToBytes(_pHex(curve), buf);  _bigFromBytes(p, buf);
+  _hexToBytes(_nHex(curve), buf);  _bigFromBytes(n, buf);
+
+  var n0p: int64 := _montN0(p);
+  var n0n: int64 := _montN0(n);
+  poke64(ctx + CTX_BIGS * BIG_BYTES, n0p);
+  poke64(ctx + CTX_BIGS * BIG_BYTES + 8, n0n);
+
+  var r2p: int64 := _ctxBig(ctx, 4);
+  var r2n: int64 := _ctxBig(ctx, 5);
+  _montR2(r2p, p);
+  _montR2(r2n, n);
+
+  var tmp: int64 := alloc(BIG_BYTES);
+  var one: int64 := alloc(BIG_BYTES);
+  _bigZero(one);
+  _s(one, 0, 1);
+  _toMont(_ctxBig(ctx, 6), one, p, n0p, r2p);
+
+  // a
+  _hexToBytes(_aHex(curve), buf);
+  _bigFromBytes(tmp, buf);
+  _toMont(_ctxBig(ctx, 2), tmp, p, n0p, r2p);
+
+  // 3*b
+  _hexToBytes(_bHex(curve), buf);
+  _bigFromBytes(tmp, buf);
+  var b3: int64 := alloc(BIG_BYTES);
+  _modAdd(b3, tmp, tmp, p);
+  _modAdd(b3, b3, tmp, p);
+  _toMont(_ctxBig(ctx, 3), b3, p, n0p, r2p);
+
+  // Basispunkt in Montgomery-Form
+  _hexToBytes(_gxHex(curve), buf);
+  _bigFromBytes(tmp, buf);
+  _toMont(_ctxBig(ctx, 7), tmp, p, n0p, r2p);
+  _hexToBytes(_gyHex(curve), buf);
+  _bigFromBytes(tmp, buf);
+  _toMont(_ctxBig(ctx, 8), tmp, p, n0p, r2p);
+
+  free(buf, 32);
+  free(tmp, BIG_BYTES);
+  free(one, BIG_BYTES);
+  free(b3, BIG_BYTES);
+  return ctx;
+}
+
+fn _ctxFree(ctx: int64): void {
+  free(ctx, CTX_BYTES);
+}
+
+// ── Punkte ───────────────────────────────────────────────────────────────────
+//
+// Homogene projektive Koordinaten (X : Y : Z), alle Werte in Montgomery-Form.
+// Der unendlich ferne Punkt ist (0 : 1 : 0).
+//
+// Addiert wird nach der VOLLSTAENDIGEN Formel von Renes, Costello und Batina
+// (2016), Algorithmus 1. "Vollstaendig" heisst: sie gilt fuer alle Eingaben
+// ohne Ausnahme — auch fuer P = Q, fuer P = -Q und wenn einer der Punkte im
+// Unendlichen liegt. Damit entfaellt jede Fallunterscheidung, und genau das
+// ist hier der Punkt: die uebliche Jacobi-Addition braucht `if (H == 0)`, und
+// diese Abfrage haengt an geheimen Daten.
+//
+// Ein Nebeneffekt: eine eigene Verdopplungsformel wird nicht gebraucht, 2P ist
+// schlicht P + P.
+
+con PT_BYTES: int64 := 3 * 80;
+
+fn _ptX(p: int64): int64 { return p; }
+fn _ptY(p: int64): int64 { return p + BIG_BYTES; }
+fn _ptZ(p: int64): int64 { return p + 2 * BIG_BYTES; }
+
+fn _ptSetInf(ctx: int64, p: int64): void {
+  _bigZero(_ptX(p));
+  _bigCopy(_ptY(p), _ctxBig(ctx, 6));   // 1 in Montgomery-Form
+  _bigZero(_ptZ(p));
+}
+
+fn _ptCopy(r: int64, a: int64): void {
+  _bigCopy(_ptX(r), _ptX(a));
+  _bigCopy(_ptY(r), _ptY(a));
+  _bigCopy(_ptZ(r), _ptZ(a));
+}
+
+fn _ptCswap(a: int64, b: int64, mask: int64): void {
+  _bigCswap(_ptX(a), _ptX(b), mask);
+  _bigCswap(_ptY(a), _ptY(b), mask);
+  _bigCswap(_ptZ(a), _ptZ(b), mask);
+}
+
+fn _ptAdd(ctx: int64, r: int64, pp: int64, qq: int64): void {
+  var p: int64 := _ctxBig(ctx, 0);
+  var n0: int64 := _ctxN0p(ctx);
+  var av: int64 := _ctxBig(ctx, 2);
+  var b3: int64 := _ctxBig(ctx, 3);
+
+  var t0: int64 := alloc(BIG_BYTES);  var t1: int64 := alloc(BIG_BYTES);
+  var t2: int64 := alloc(BIG_BYTES);  var t3: int64 := alloc(BIG_BYTES);
+  var t4: int64 := alloc(BIG_BYTES);  var t5: int64 := alloc(BIG_BYTES);
+  var x3: int64 := alloc(BIG_BYTES);  var y3: int64 := alloc(BIG_BYTES);
+  var z3: int64 := alloc(BIG_BYTES);
+
+  var x1: int64 := _ptX(pp);  var y1: int64 := _ptY(pp);  var z1: int64 := _ptZ(pp);
+  var x2: int64 := _ptX(qq);  var y2: int64 := _ptY(qq);  var z2: int64 := _ptZ(qq);
+
+  _montMul(t0, x1, x2, p, n0);
+  _montMul(t1, y1, y2, p, n0);
+  _montMul(t2, z1, z2, p, n0);
+
+  _modAdd(t3, x1, y1, p);
+  _modAdd(t4, x2, y2, p);
+  _montMul(t3, t3, t4, p, n0);
+
+  _modAdd(t4, t0, t1, p);
+  _modSub(t3, t3, t4, p);
+  _modAdd(t4, x1, z1, p);
+
+  _modAdd(t5, x2, z2, p);
+  _montMul(t4, t4, t5, p, n0);
+  _modAdd(t5, t0, t2, p);
+
+  _modSub(t4, t4, t5, p);
+  _modAdd(t5, y1, z1, p);
+  _modAdd(x3, y2, z2, p);
+
+  _montMul(t5, t5, x3, p, n0);
+  _modAdd(x3, t1, t2, p);
+  _modSub(t5, t5, x3, p);
+
+  _montMul(z3, av, t4, p, n0);
+  _montMul(x3, b3, t2, p, n0);
+  _modAdd(z3, x3, z3, p);
+
+  _modSub(x3, t1, z3, p);
+  _modAdd(z3, t1, z3, p);
+  _montMul(y3, x3, z3, p, n0);
+
+  _modAdd(t1, t0, t0, p);
+  _modAdd(t1, t1, t0, p);
+  _montMul(t2, av, t2, p, n0);
+
+  _montMul(t4, b3, t4, p, n0);
+  _modAdd(t1, t1, t2, p);
+  _modSub(t2, t0, t2, p);
+
+  _montMul(t2, av, t2, p, n0);
+  _modAdd(t4, t4, t2, p);
+  _montMul(t0, t1, t4, p, n0);
+
+  _modAdd(y3, y3, t0, p);
+  _montMul(t0, t5, t4, p, n0);
+  _montMul(x3, t3, x3, p, n0);
+
+  _modSub(x3, x3, t0, p);
+  _montMul(t0, t3, t1, p, n0);
+  _montMul(z3, t5, z3, p, n0);
+
+  _modAdd(z3, z3, t0, p);
+
+  _bigCopy(_ptX(r), x3);
+  _bigCopy(_ptY(r), y3);
+  _bigCopy(_ptZ(r), z3);
+
+  free(t0, BIG_BYTES);  free(t1, BIG_BYTES);  free(t2, BIG_BYTES);
+  free(t3, BIG_BYTES);  free(t4, BIG_BYTES);  free(t5, BIG_BYTES);
+  free(x3, BIG_BYTES);  free(y3, BIG_BYTES);  free(z3, BIG_BYTES);
+}
+
+// Montgomery-Leiter: in jedem Schritt genau eine Addition und eine
+// Verdopplung, unabhaengig vom Bit. Der Tausch geschieht maskiert.
+fn _ptMul(ctx: int64, r: int64, k: int64, pt: int64): void {
+  var r0: int64 := alloc(PT_BYTES);
+  var r1: int64 := alloc(PT_BYTES);
+  var tmp: int64 := alloc(PT_BYTES);
+
+  _ptSetInf(ctx, r0);
+  _ptCopy(r1, pt);
+
+  var i: int64 := LIMBS * LIMB_BITS - 1;
+  while (i >= 0) {
+    var bit: int64 := _bigBit(k, i);
+    var mask: int64 := 0 - bit;
+
+    _ptCswap(r0, r1, mask);
+    _ptAdd(ctx, tmp, r0, r1);
+    _ptCopy(r1, tmp);
+    _ptAdd(ctx, tmp, r0, r0);
+    _ptCopy(r0, tmp);
+    _ptCswap(r0, r1, mask);
+
+    i := i - 1;
+  }
+
+  _ptCopy(r, r0);
+  free(r0, PT_BYTES);  free(r1, PT_BYTES);  free(tmp, PT_BYTES);
+}
+
+// Projektive Koordinaten in affine umrechnen; false beim Punkt im Unendlichen.
+fn _ptToAffine(ctx: int64, pt: int64, xOut: int64, yOut: int64): bool {
+  var p: int64 := _ctxBig(ctx, 0);
+  var n0: int64 := _ctxN0p(ctx);
+  var r2: int64 := _ctxBig(ctx, 4);
+
+  if (_bigIsZero(_ptZ(pt)) == 1) { return false; }
+
+  var zinv: int64 := alloc(BIG_BYTES);
+  var t: int64 := alloc(BIG_BYTES);
+  _montInv(zinv, _ptZ(pt), p, n0, r2);
+
+  _montMul(t, _ptX(pt), zinv, p, n0);
+  _fromMont(t, t, p, n0);
+  _bigToBytes(t, xOut);
+
+  _montMul(t, _ptY(pt), zinv, p, n0);
+  _fromMont(t, t, p, n0);
+  _bigToBytes(t, yOut);
+
+  free(zinv, BIG_BYTES);
+  free(t, BIG_BYTES);
+  return true;
+}
+
+fn _ptFromAffine(ctx: int64, pt: int64, x32: int64, y32: int64): void {
+  var p: int64 := _ctxBig(ctx, 0);
+  var n0: int64 := _ctxN0p(ctx);
+  var r2: int64 := _ctxBig(ctx, 4);
+
+  var t: int64 := alloc(BIG_BYTES);
+  _bigFromBytes(t, x32);
+  _toMont(_ptX(pt), t, p, n0, r2);
+  _bigFromBytes(t, y32);
+  _toMont(_ptY(pt), t, p, n0, r2);
+  _bigCopy(_ptZ(pt), _ctxBig(ctx, 6));
+  free(t, BIG_BYTES);
+}
+
+// ── Oeffentliche Punktoperationen ────────────────────────────────────────────
+
+// Liegt (x,y) auf der Kurve? Prueft y^2 = x^3 + a*x + b.
+//
+// Diese Pruefung ist bei fremden Schluesseln PFLICHT. Wer sie weglaesst,
+// oeffnet den Invalid-Curve-Angriff: der Gegner schickt einen Punkt, der auf
+// einer anderen Kurve mit kleiner Gruppenordnung liegt, und liest aus dem
+// gemeinsamen Geheimnis den privaten Schluessel stueckweise ab.
+pub fn EcIsOnCurve(curve: int64, x32: int64, y32: int64): bool {
+  if (!EcIsValidCurve(curve)) { return false; }
+  var ctx: int64 := _ctxNew(curve);
+  if (ctx == 0) { return false; }
+
+  var p: int64 := _ctxBig(ctx, 0);
+  var n0: int64 := _ctxN0p(ctx);
+  var r2: int64 := _ctxBig(ctx, 4);
+
+  var x: int64 := alloc(BIG_BYTES);
+  var y: int64 := alloc(BIG_BYTES);
+  var lhs: int64 := alloc(BIG_BYTES);
+  var rhs: int64 := alloc(BIG_BYTES);
+  var t: int64 := alloc(BIG_BYTES);
+  var bb: int64 := alloc(BIG_BYTES);
+  var buf: int64 := alloc(32);
+
+  _bigFromBytes(t, x32);
+  var xOk: int64 := 1 - _bigGE(t, p);      // x muss kleiner als p sein
+  _toMont(x, t, p, n0, r2);
+  _bigFromBytes(t, y32);
+  var yOk: int64 := 1 - _bigGE(t, p);
+  _toMont(y, t, p, n0, r2);
+
+  // y^2
+  _montMul(lhs, y, y, p, n0);
+  // x^3 + a*x + b
+  _montMul(rhs, x, x, p, n0);
+  _montMul(rhs, rhs, x, p, n0);
+  _montMul(t, _ctxBig(ctx, 2), x, p, n0);
+  _modAdd(rhs, rhs, t, p);
+
+  _hexToBytes(_bHex(curve), buf);
+  _bigFromBytes(t, buf);
+  _toMont(bb, t, p, n0, r2);
+  _modAdd(rhs, rhs, bb, p);
+
+  _modSub(t, lhs, rhs, p);
+  var equal: int64 := _bigIsZero(t);
+
+  free(x, BIG_BYTES);  free(y, BIG_BYTES);  free(lhs, BIG_BYTES);
+  free(rhs, BIG_BYTES); free(t, BIG_BYTES); free(bb, BIG_BYTES);
+  free(buf, 32);
+  _ctxFree(ctx);
+
+  if (equal != 1) { return false; }
+  if (xOk != 1) { return false; }
+  if (yOk != 1) { return false; }
+  return true;
+}
+
+// Vollstaendige Pruefung eines fremden oeffentlichen Schluessels: nicht der
+// unendlich ferne Punkt, Koordinaten im Koerper, Punkt auf der Kurve. Der
+// Test n*Q = unendlich entfaellt, weil beide Kurven Kofaktor 1 und primzahlige
+// Ordnung haben — dort folgt er aus den uebrigen Bedingungen.
+pub fn EcValidatePublicKey(curve: int64, x32: int64, y32: int64): bool {
+  var zx: int64 := 0;
+  var zy: int64 := 0;
+  var i: int64 := 0;
+  while (i < 32) {
+    zx := zx | peek8(x32 + i);
+    zy := zy | peek8(y32 + i);
+    i := i + 1;
+  }
+  if (zx == 0) {
+    if (zy == 0) { return false; }
+  }
+  return EcIsOnCurve(curve, x32, y32);
+}
+
+// Q := k*G, mit k als 32-Byte-Skalar. false, wenn k null oder >= n ist.
+pub fn EcPublicFromPrivate(curve: int64, priv32: int64, xOut: int64, yOut: int64): bool {
+  if (!EcIsValidCurve(curve)) { return false; }
+  var ctx: int64 := _ctxNew(curve);
+  if (ctx == 0) { return false; }
+
+  var k: int64 := alloc(BIG_BYTES);
+  _bigFromBytes(k, priv32);
+
+  var ok: bool := true;
+  if (_bigIsZero(k) == 1) { ok := false; }
+  if (_bigGE(k, _ctxBig(ctx, 1)) == 1) { ok := false; }
+
+  if (ok) {
+    var g: int64 := alloc(PT_BYTES);
+    var r: int64 := alloc(PT_BYTES);
+    _bigCopy(_ptX(g), _ctxBig(ctx, 7));
+    _bigCopy(_ptY(g), _ctxBig(ctx, 8));
+    _bigCopy(_ptZ(g), _ctxBig(ctx, 6));
+
+    _ptMul(ctx, r, k, g);
+    ok := _ptToAffine(ctx, r, xOut, yOut);
+    free(g, PT_BYTES);
+    free(r, PT_BYTES);
+  }
+
+  free(k, BIG_BYTES);
+  _ctxFree(ctx);
+  return ok;
+}
+
+// Skalarmultiplikation mit einem beliebigen Punkt.
+pub fn EcScalarMul(curve: int64, k32: int64, x32: int64, y32: int64,
+                   xOut: int64, yOut: int64): bool {
+  if (!EcIsValidCurve(curve)) { return false; }
+  if (!EcIsOnCurve(curve, x32, y32)) { return false; }
+
+  var ctx: int64 := _ctxNew(curve);
+  if (ctx == 0) { return false; }
+
+  var k: int64 := alloc(BIG_BYTES);
+  _bigFromBytes(k, k32);
+
+  var pt: int64 := alloc(PT_BYTES);
+  var r: int64 := alloc(PT_BYTES);
+  _ptFromAffine(ctx, pt, x32, y32);
+  _ptMul(ctx, r, k, pt);
+  var ok: bool := _ptToAffine(ctx, r, xOut, yOut);
+
+  free(k, BIG_BYTES);
+  free(pt, PT_BYTES);
+  free(r, PT_BYTES);
+  _ctxFree(ctx);
+  return ok;
+}
+
+// Schluesselpaar erzeugen. Der private Schluessel wird verworfen und neu
+// gezogen, falls er null oder groesser gleich der Ordnung ist — Zurueckfalten
+// per Modulo waere hier falsch, weil es die Verteilung verzerrt.
+pub fn EcGenerateKey(curve: int64, priv32: int64, xOut: int64, yOut: int64): bool {
+  if (!EcIsValidCurve(curve)) { return false; }
+
+  var ctx: int64 := _ctxNew(curve);
+  if (ctx == 0) { return false; }
+  var k: int64 := alloc(BIG_BYTES);
+
+  var tries: int64 := 0;
+  var found: bool := false;
+  while (tries < 100) {
+    RandBytesExact(priv32, 32);
+    _bigFromBytes(k, priv32);
+    var zero: int64 := _bigIsZero(k);
+    var tooBig: int64 := _bigGE(k, _ctxBig(ctx, 1));
+    if (zero == 0) {
+      if (tooBig == 0) {
+        found := true;
+        tries := 100;
+      }
+    }
+    if (!found) { tries := tries + 1; }
+  }
+
+  free(k, BIG_BYTES);
+  _ctxFree(ctx);
+  if (!found) { return false; }
+  return EcPublicFromPrivate(curve, priv32, xOut, yOut);
+}
+
+// ── Punktkodierung nach SEC1 ─────────────────────────────────────────────────
+
+// Unkomprimiert: 0x04 || X || Y (65 Byte). Komprimiert: 0x02/0x03 || X
+// (33 Byte), wobei das erste Byte die Paritaet von Y traegt.
+// Rueckgabe ist die geschriebene Laenge, 0 bei Fehler.
+pub fn EcPointEncode(curve: int64, x32: int64, y32: int64, compressed: bool,
+                     out: int64): int64 {
+  if (!EcIsValidCurve(curve)) { return 0; }
+
+  if (compressed) {
+    var lastByte: int64 := peek8(y32 + 31);
+    poke8(out, 2 + (lastByte & 1));
+    var i: int64 := 0;
+    while (i < 32) {
+      poke8(out + 1 + i, peek8(x32 + i));
+      i := i + 1;
+    }
+    return 33;
+  }
+
+  poke8(out, 4);
+  var j: int64 := 0;
+  while (j < 32) {
+    poke8(out + 1 + j, peek8(x32 + j));
+    poke8(out + 33 + j, peek8(y32 + j));
+    j := j + 1;
+  }
+  return 65;
+}
+
+// Gegenstueck. Bei komprimierter Form wird y aus x zurueckgerechnet
+// (y = sqrt(x^3+ax+b), Vorzeichen aus dem Prefixbyte). Der Punkt wird dabei
+// geprueft — eine Dekodierung, die ungueltige Punkte durchlaesst, waere eine
+// Einladung zum Invalid-Curve-Angriff.
+pub fn EcPointDecode(curve: int64, enc: int64, encLen: int64,
+                     xOut: int64, yOut: int64): bool {
+  if (!EcIsValidCurve(curve)) { return false; }
+
+  var prefix: int64 := peek8(enc);
+
+  if (encLen == 65) {
+    if (prefix != 4) { return false; }
+    var i: int64 := 0;
+    while (i < 32) {
+      poke8(xOut + i, peek8(enc + 1 + i));
+      poke8(yOut + i, peek8(enc + 33 + i));
+      i := i + 1;
+    }
+    return EcValidatePublicKey(curve, xOut, yOut);
+  }
+
+  if (encLen != 33) { return false; }
+  if (prefix < 2) { return false; }
+  if (prefix > 3) { return false; }
+
+  var j: int64 := 0;
+  while (j < 32) {
+    poke8(xOut + j, peek8(enc + 1 + j));
+    j := j + 1;
+  }
+
+  var ctx: int64 := _ctxNew(curve);
+  if (ctx == 0) { return false; }
+  var p: int64 := _ctxBig(ctx, 0);
+  var n0: int64 := _ctxN0p(ctx);
+  var r2: int64 := _ctxBig(ctx, 4);
+
+  var x: int64 := alloc(BIG_BYTES);
+  var t: int64 := alloc(BIG_BYTES);
+  var rhs: int64 := alloc(BIG_BYTES);
+  var yv: int64 := alloc(BIG_BYTES);
+  var buf: int64 := alloc(32);
+
+  _bigFromBytes(t, xOut);
+  var inField: int64 := 1 - _bigGE(t, p);
+  _toMont(x, t, p, n0, r2);
+
+  _montMul(rhs, x, x, p, n0);
+  _montMul(rhs, rhs, x, p, n0);
+  _montMul(t, _ctxBig(ctx, 2), x, p, n0);
+  _modAdd(rhs, rhs, t, p);
+  _hexToBytes(_bHex(curve), buf);
+  _bigFromBytes(t, buf);
+  _toMont(t, t, p, n0, r2);
+  _modAdd(rhs, rhs, t, p);
+
+  _montSqrt(yv, rhs, p, n0, r2);
+
+  // Probe: die Wurzel muss beim Quadrieren die rechte Seite ergeben. Wenn
+  // nicht, ist x keine gueltige Abszisse — dann existiert der Punkt nicht.
+  _montMul(t, yv, yv, p, n0);
+  _modSub(t, t, rhs, p);
+  var isSquare: int64 := _bigIsZero(t);
+
+  _fromMont(yv, yv, p, n0);
+  _bigToBytes(yv, yOut);
+
+  // Paritaet anpassen: y oder p-y
+  var wantOdd: int64 := prefix - 2;
+  var haveOdd: int64 := peek8(yOut + 31) & 1;
+  if (haveOdd != wantOdd) {
+    var py: int64 := alloc(BIG_BYTES);
+    var yb: int64 := alloc(BIG_BYTES);
+    _bigFromBytes(yb, yOut);
+    _bigSub(py, p, yb);
+    _bigToBytes(py, yOut);
+    free(py, BIG_BYTES);
+    free(yb, BIG_BYTES);
+  }
+
+  free(x, BIG_BYTES);  free(t, BIG_BYTES);  free(rhs, BIG_BYTES);
+  free(yv, BIG_BYTES); free(buf, 32);
+  _ctxFree(ctx);
+
+  if (isSquare != 1) { return false; }
+  if (inField != 1) { return false; }
+  return EcValidatePublicKey(curve, xOut, yOut);
+}
+
+// ── Skalararithmetik modulo n ────────────────────────────────────────────────
+
+fn _scReduce(ctx: int64, r: int64, a: int64): void {
+  var n: int64 := _ctxBig(ctx, 1);
+  var sub: int64 := alloc(BIG_BYTES);
+  _bigCopy(r, a);
+  // zweimal genuegt: die Eingabe ist kleiner als 2^256 und n groesser als 2^255
+  var i: int64 := 0;
+  while (i < 2) {
+    var borrow: int64 := _bigSub(sub, r, n);
+    var mask: int64 := 0 - (1 - borrow);
+    _bigCmov(r, sub, mask);
+    i := i + 1;
+  }
+  free(sub, BIG_BYTES);
+}
+
+fn _scMulMod(ctx: int64, r: int64, a: int64, b: int64): void {
+  var n: int64 := _ctxBig(ctx, 1);
+  var n0: int64 := _ctxN0n(ctx);
+  var r2: int64 := _ctxBig(ctx, 5);
+
+  var am: int64 := alloc(BIG_BYTES);
+  var bm: int64 := alloc(BIG_BYTES);
+  var rm: int64 := alloc(BIG_BYTES);
+  _toMont(am, a, n, n0, r2);
+  _toMont(bm, b, n, n0, r2);
+  _montMul(rm, am, bm, n, n0);
+  _fromMont(r, rm, n, n0);
+  free(am, BIG_BYTES);  free(bm, BIG_BYTES);  free(rm, BIG_BYTES);
+}
+
+fn _scInvMod(ctx: int64, r: int64, a: int64): void {
+  var n: int64 := _ctxBig(ctx, 1);
+  var n0: int64 := _ctxN0n(ctx);
+  var r2: int64 := _ctxBig(ctx, 5);
+
+  var am: int64 := alloc(BIG_BYTES);
+  var rm: int64 := alloc(BIG_BYTES);
+  _toMont(am, a, n, n0, r2);
+  _montInv(rm, am, n, n0, r2);
+  _fromMont(r, rm, n, n0);
+  free(am, BIG_BYTES);  free(rm, BIG_BYTES);
+}
+
+// ── RFC 6979: deterministischer Nonce ────────────────────────────────────────
+//
+// k wird aus privatem Schluessel und Nachrichten-Hash ueber einen
+// HMAC-SHA256-Generator abgeleitet. Zwei Signaturen derselben Nachricht sind
+// damit identisch, und — wichtiger — zwei VERSCHIEDENE Nachrichten koennen
+// nicht versehentlich denselben Nonce bekommen, auch wenn der Zufallszahlen-
+// generator ausfaellt oder gar nicht existiert.
+fn _rfc6979(ctx: int64, out32: int64, hash32: int64, priv32: int64): bool {
+  var v: int64 := alloc(32);
+  var kk: int64 := alloc(32);
+  var buf: int64 := alloc(97);
+  var tmp: int64 := alloc(BIG_BYTES);
+  var h1: int64 := alloc(32);
+
+  // bits2octets(h1) = h1 mod n
+  _bigFromBytes(tmp, hash32);
+  _scReduce(ctx, tmp, tmp);
+  _bigToBytes(tmp, h1);
+
+  var i: int64 := 0;
+  while (i < 32) {
+    poke8(v + i, 1);
+    poke8(kk + i, 0);
+    i := i + 1;
+  }
+
+  // K = HMAC_K(V || 0x00 || priv || h1)
+  i := 0;
+  while (i < 32) {
+    poke8(buf + i, peek8(v + i));
+    poke8(buf + 33 + i, peek8(priv32 + i));
+    poke8(buf + 65 + i, peek8(h1 + i));
+    i := i + 1;
+  }
+  poke8(buf + 32, 0);
+  HMAC_SHA256(kk, 32, buf, 97, kk);
+  HMAC_SHA256(kk, 32, v, 32, v);
+
+  // K = HMAC_K(V || 0x01 || priv || h1)
+  i := 0;
+  while (i < 32) {
+    poke8(buf + i, peek8(v + i));
+    i := i + 1;
+  }
+  poke8(buf + 32, 1);
+  HMAC_SHA256(kk, 32, buf, 97, kk);
+  HMAC_SHA256(kk, 32, v, 32, v);
+
+  var n: int64 := _ctxBig(ctx, 1);
+  var cand: int64 := alloc(BIG_BYTES);
+  var found: bool := false;
+  var rounds: int64 := 0;
+
+  while (rounds < 32) {
+    HMAC_SHA256(kk, 32, v, 32, v);
+    _bigFromBytes(cand, v);
+
+    var zero: int64 := _bigIsZero(cand);
+    var tooBig: int64 := _bigGE(cand, n);
+    if (zero == 0) {
+      if (tooBig == 0) {
+        _bigToBytes(cand, out32);
+        found := true;
+        rounds := 32;
+      }
+    }
+
+    if (!found) {
+      // K = HMAC_K(V || 0x00), V = HMAC_K(V)
+      i := 0;
+      while (i < 32) {
+        poke8(buf + i, peek8(v + i));
+        i := i + 1;
+      }
+      poke8(buf + 32, 0);
+      HMAC_SHA256(kk, 32, buf, 33, kk);
+      HMAC_SHA256(kk, 32, v, 32, v);
+      rounds := rounds + 1;
+    }
+  }
+
+  free(v, 32);  free(kk, 32);  free(buf, 97);
+  free(tmp, BIG_BYTES);  free(h1, 32);  free(cand, BIG_BYTES);
+  return found;
+}
+
+// Nonce nach RFC 6979 herausgeben — vor allem, um ihn gegen die Testvektoren
+// des Standards pruefen zu koennen.
+pub fn EcRfc6979Nonce(curve: int64, hash32: int64, priv32: int64, out32: int64): bool {
+  if (!EcIsValidCurve(curve)) { return false; }
+  var ctx: int64 := _ctxNew(curve);
+  if (ctx == 0) { return false; }
+  var ok: bool := _rfc6979(ctx, out32, hash32, priv32);
+  _ctxFree(ctx);
+  return ok;
+}
+
+// ── ECDSA ────────────────────────────────────────────────────────────────────
+
+// Signiert einen 32-Byte-Hash. r und s werden als je 32 Byte gross-endian
+// abgelegt.
+//
+// s wird stets in die untere Haelfte gebracht (s <= n/2). Ohne das ist zu
+// jeder gueltigen Signatur (r,s) auch (r, n-s) gueltig — dieselbe Aussage,
+// andere Bytes. Wo Signaturen als Kennung dienen (Bitcoin, Zertifikatsketten),
+// ist diese Verformbarkeit ein Problem; die Normalisierung kostet nichts.
+pub fn EcdsaSign(curve: int64, hash32: int64, priv32: int64,
+                 r32: int64, s32: int64): bool {
+  if (!EcIsValidCurve(curve)) { return false; }
+  var ctx: int64 := _ctxNew(curve);
+  if (ctx == 0) { return false; }
+
+  var n: int64 := _ctxBig(ctx, 1);
+  var kBytes: int64 := alloc(32);
+  var k: int64 := alloc(BIG_BYTES);
+  var d: int64 := alloc(BIG_BYTES);
+  var z: int64 := alloc(BIG_BYTES);
+  var rr: int64 := alloc(BIG_BYTES);
+  var ss: int64 := alloc(BIG_BYTES);
+  var kinv: int64 := alloc(BIG_BYTES);
+  var t: int64 := alloc(BIG_BYTES);
+  var xb: int64 := alloc(32);
+  var yb: int64 := alloc(32);
+
+  _bigFromBytes(d, priv32);
+  _bigFromBytes(z, hash32);
+  _scReduce(ctx, z, z);
+
+  var ok: bool := true;
+  if (_bigIsZero(d) == 1) { ok := false; }
+  if (_bigGE(d, n) == 1) { ok := false; }
+
+  if (ok) { ok := _rfc6979(ctx, kBytes, hash32, priv32); }
+
+  if (ok) {
+    _bigFromBytes(k, kBytes);
+
+    var g: int64 := alloc(PT_BYTES);
+    var pr: int64 := alloc(PT_BYTES);
+    _bigCopy(_ptX(g), _ctxBig(ctx, 7));
+    _bigCopy(_ptY(g), _ctxBig(ctx, 8));
+    _bigCopy(_ptZ(g), _ctxBig(ctx, 6));
+    _ptMul(ctx, pr, k, g);
+    ok := _ptToAffine(ctx, pr, xb, yb);
+    free(g, PT_BYTES);
+    free(pr, PT_BYTES);
+
+    if (ok) {
+      _bigFromBytes(rr, xb);
+      _scReduce(ctx, rr, rr);
+      if (_bigIsZero(rr) == 1) { ok := false; }
+    }
+
+    if (ok) {
+      // s = k^-1 * (z + r*d) mod n
+      _scMulMod(ctx, t, rr, d);
+      var sum: int64 := alloc(BIG_BYTES);
+      _bigAdd(sum, z, t);
+      _scReduce(ctx, sum, sum);
+      _scInvMod(ctx, kinv, k);
+      _scMulMod(ctx, ss, kinv, sum);
+      free(sum, BIG_BYTES);
+
+      if (_bigIsZero(ss) == 1) { ok := false; }
+    }
+
+    if (ok) {
+      // s auf die untere Haelfte normalisieren
+      var half: int64 := alloc(BIG_BYTES);
+      _bigCopy(half, n);
+      var carry: int64 := 0;
+      var i: int64 := LIMBS - 1;
+      while (i >= 0) {
+        var cur: int64 := _g(half, i);
+        _s(half, i, (cur >> 1) | ((carry & 1) << (LIMB_BITS - 1)));
+        carry := cur;
+        i := i - 1;
+      }
+      var high: int64 := _bigGE(ss, half);
+      var neg: int64 := alloc(BIG_BYTES);
+      _bigSub(neg, n, ss);
+      var mask: int64 := 0 - high;
+      _bigCmov(ss, neg, mask);
+      free(half, BIG_BYTES);
+      free(neg, BIG_BYTES);
+
+      _bigToBytes(rr, r32);
+      _bigToBytes(ss, s32);
+    }
+  }
+
+  free(kBytes, 32);  free(k, BIG_BYTES);  free(d, BIG_BYTES);
+  free(z, BIG_BYTES);  free(rr, BIG_BYTES);  free(ss, BIG_BYTES);
+  free(kinv, BIG_BYTES);  free(t, BIG_BYTES);
+  free(xb, 32);  free(yb, 32);
+  _ctxFree(ctx);
+  return ok;
+}
+
+// Prueft eine Signatur. Der oeffentliche Schluessel wird dabei validiert.
+pub fn EcdsaVerify(curve: int64, hash32: int64, pubx: int64, puby: int64,
+                   r32: int64, s32: int64): bool {
+  if (!EcIsValidCurve(curve)) { return false; }
+  if (!EcValidatePublicKey(curve, pubx, puby)) { return false; }
+
+  var ctx: int64 := _ctxNew(curve);
+  if (ctx == 0) { return false; }
+  var n: int64 := _ctxBig(ctx, 1);
+
+  var r: int64 := alloc(BIG_BYTES);
+  var s: int64 := alloc(BIG_BYTES);
+  var z: int64 := alloc(BIG_BYTES);
+  var w: int64 := alloc(BIG_BYTES);
+  var u1: int64 := alloc(BIG_BYTES);
+  var u2: int64 := alloc(BIG_BYTES);
+  var xb: int64 := alloc(32);
+  var yb: int64 := alloc(32);
+
+  _bigFromBytes(r, r32);
+  _bigFromBytes(s, s32);
+  _bigFromBytes(z, hash32);
+  _scReduce(ctx, z, z);
+
+  var ok: bool := true;
+  if (_bigIsZero(r) == 1) { ok := false; }
+  if (_bigIsZero(s) == 1) { ok := false; }
+  if (_bigGE(r, n) == 1) { ok := false; }
+  if (_bigGE(s, n) == 1) { ok := false; }
+
+  if (ok) {
+    _scInvMod(ctx, w, s);
+    _scMulMod(ctx, u1, z, w);
+    _scMulMod(ctx, u2, r, w);
+
+    var g: int64 := alloc(PT_BYTES);
+    var q: int64 := alloc(PT_BYTES);
+    var p1: int64 := alloc(PT_BYTES);
+    var p2: int64 := alloc(PT_BYTES);
+    var sum: int64 := alloc(PT_BYTES);
+
+    _bigCopy(_ptX(g), _ctxBig(ctx, 7));
+    _bigCopy(_ptY(g), _ctxBig(ctx, 8));
+    _bigCopy(_ptZ(g), _ctxBig(ctx, 6));
+    _ptFromAffine(ctx, q, pubx, puby);
+
+    _ptMul(ctx, p1, u1, g);
+    _ptMul(ctx, p2, u2, q);
+    _ptAdd(ctx, sum, p1, p2);
+
+    if (_ptToAffine(ctx, sum, xb, yb)) {
+      var xr: int64 := alloc(BIG_BYTES);
+      _bigFromBytes(xr, xb);
+      _scReduce(ctx, xr, xr);
+      var diff: int64 := alloc(BIG_BYTES);
+      _bigSub(diff, xr, r);
+      if (_bigIsZero(diff) != 1) { ok := false; }
+      free(xr, BIG_BYTES);
+      free(diff, BIG_BYTES);
+    }
+    else { ok := false; }
+
+    free(g, PT_BYTES);  free(q, PT_BYTES);  free(p1, PT_BYTES);
+    free(p2, PT_BYTES);  free(sum, PT_BYTES);
+  }
+
+  free(r, BIG_BYTES);  free(s, BIG_BYTES);  free(z, BIG_BYTES);
+  free(w, BIG_BYTES);  free(u1, BIG_BYTES);  free(u2, BIG_BYTES);
+  free(xb, 32);  free(yb, 32);
+  _ctxFree(ctx);
+  return ok;
+}
+
+// ── ECDH ─────────────────────────────────────────────────────────────────────
+
+// Gemeinsames Geheimnis: die x-Koordinate von priv * PeerPunkt, 32 Byte.
+//
+// Der fremde Punkt wird vorher geprueft (EcScalarMul ruft EcIsOnCurve auf).
+// Das Ergebnis ist ROH und gehoert nicht direkt als Schluessel verwendet —
+// die x-Koordinate ist nicht gleichverteilt. Ueblich ist eine
+// Schluesselableitung (HKDF, oder wenigstens SHA-256) darueber; hier bewusst
+// nicht eingebaut, damit der Aufrufer die Ableitung passend zum Protokoll
+// waehlt.
+pub fn EcdhSharedSecret(curve: int64, priv32: int64, peerx: int64, peery: int64,
+                        out32: int64): bool {
+  if (!EcValidatePublicKey(curve, peerx, peery)) { return false; }
+  var yb: int64 := alloc(32);
+  var ok: bool := EcScalarMul(curve, priv32, peerx, peery, out32, yb);
+  free(yb, 32);
+  return ok;
+}
+
+// Mit anschliessender SHA-256-Ableitung — der uebliche Fall.
+pub fn EcdhSharedSecretHashed(curve: int64, priv32: int64, peerx: int64,
+                              peery: int64, out32: int64): bool {
+  var raw: int64 := alloc(32);
+  if (raw == 0) { return false; }
+  var ok: bool := EcdhSharedSecret(curve, priv32, peerx, peery, raw);
+  if (ok) { SHA256(raw, 32, out32); }
+  SecureZero(raw, 32);
+  free(raw, 32);
+  return ok;
+}
+
+// ── DER-Kodierung von Signaturen ─────────────────────────────────────────────
+
+// SEQUENCE { INTEGER r, INTEGER s } — die Form, in der ECDSA-Signaturen in
+// X.509, TLS und Bitcoin auftreten. Rueckgabe ist die Laenge, 0 bei Fehler.
+//
+// Der Fallstrick bei DER-INTEGER: sie sind vorzeichenbehaftet. Ein Wert, dessen
+// oberstes Bit gesetzt ist, braucht ein fuehrendes 0x00, sonst liest ihn der
+// Gegenpart als negative Zahl. Fuehrende Nullbytes muessen umgekehrt entfernt
+// werden.
+fn _derInt(val32: int64, out: int64): int64 {
+  // fuehrende Nullbytes ueberspringen, aber mindestens ein Byte behalten
+  var first: int64 := 0;
+  var searching: bool := true;
+  while (searching) {
+    if (first >= 31) { searching := false; }
+    else {
+      if (peek8(val32 + first) != 0) { searching := false; }
+      else { first := first + 1; }
+    }
+  }
+
+  var len: int64 := 32 - first;
+  var needPad: int64 := 0;
+  if ((peek8(val32 + first) & 128) != 0) { needPad := 1; }
+
+  poke8(out, 2);
+  poke8(out + 1, len + needPad);
+  var pos: int64 := 2;
+  if (needPad == 1) {
+    poke8(out + pos, 0);
+    pos := pos + 1;
+  }
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(out + pos + i, peek8(val32 + first + i));
+    i := i + 1;
+  }
+  return pos + len;
+}
+
+pub fn EcdsaSigToDer(r32: int64, s32: int64, out: int64): int64 {
+  var body: int64 := alloc(80);
+  if (body == 0) { return 0; }
+
+  var lr: int64 := _derInt(r32, body);
+  var ls: int64 := _derInt(s32, body + lr);
+  var total: int64 := lr + ls;
+
+  poke8(out, 48);          // SEQUENCE
+  poke8(out + 1, total);   // bleibt unter 128, deshalb einbytige Laenge
+  var i: int64 := 0;
+  while (i < total) {
+    poke8(out + 2 + i, peek8(body + i));
+    i := i + 1;
+  }
+  free(body, 80);
+  return total + 2;
+}
+
+// Zerlegt eine DER-Signatur in r und s (je 32 Byte, links mit Nullen
+// aufgefuellt). false bei jeder Abweichung von der erwarteten Form — eine
+// nachlaessige Zerlegung ist der Ausgangspunkt fuer Signatur-Verformung, wie
+// sie Bitcoin 2015 mit BIP 66 abstellen musste.
+pub fn EcdsaSigFromDer(der: int64, derLen: int64, r32: int64, s32: int64): bool {
+  if (derLen < 8) { return false; }
+  if (peek8(der) != 48) { return false; }
+
+  var seqLen: int64 := peek8(der + 1);
+  if (seqLen + 2 != derLen) { return false; }
+
+  var pos: int64 := 2;
+  var idx: int64 := 0;
+  var ok: bool := true;
+
+  while (idx < 2) {
+    if (peek8(der + pos) != 2) { ok := false; idx := 2; }
+    else {
+      var l: int64 := peek8(der + pos + 1);
+      if (l < 1) { ok := false; idx := 2; }
+      else {
+        if (l > 33) { ok := false; idx := 2; }
+        else {
+          if (pos + 2 + l > derLen) { ok := false; idx := 2; }
+          else {
+            var target: int64 := r32;
+            if (idx == 1) { target := s32; }
+
+            var i: int64 := 0;
+            while (i < 32) {
+              poke8(target + i, 0);
+              i := i + 1;
+            }
+
+            // rechtsbuendig eintragen; ein fuehrendes Nullbyte aus der
+            // Vorzeichenregel faellt dabei von selbst weg
+            var src: int64 := pos + 2;
+            var cnt: int64 := l;
+            if (cnt > 32) {
+              src := src + (cnt - 32);
+              cnt := 32;
+            }
+            var off: int64 := 32 - cnt;
+            i := 0;
+            while (i < cnt) {
+              poke8(target + off + i, peek8(der + src + i));
+              i := i + 1;
+            }
+
+            pos := pos + 2 + l;
+            idx := idx + 1;
+          }
+        }
+      }
+    }
+  }
+
+  if (!ok) { return false; }
+  if (pos != derLen) { return false; }
+  return true;
+}

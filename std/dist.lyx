@@ -1,0 +1,503 @@
+// std/dist.lyx
+// Abstandsmasse: euklidisch (ueberlaufsicher), Manhattan, Chebyshev, Kosinus
+
+@description("Distance metrics: overflow-safe Euclidean distance and hypot, Manhattan, Chebyshev, Minkowski, cosine, Hamming, Jaccard, nearest neighbour search")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.dist;
+
+import std.math;
+import std.alloc;
+
+// ── Warum der euklidische Abstand eine eigene Funktion braucht ───────────────
+//
+// Die Formel sqrt(dx*dx + dy*dy) ist mathematisch richtig und als Programm
+// falsch. Sie versagt in BEIDE Richtungen, und zwar lange bevor das Ergebnis
+// selbst unmoeglich waere. Gemessen mit lyxc 1.0.19D:
+//
+//   x = y = 1e180   ->  x*x ist unendlich, also auch das Ergebnis.
+//                       Richtig waere 1.414e180 — bequem darstellbar.
+//   x = y = 1e-180  ->  x*x ist null, also auch das Ergebnis.
+//                       Richtig waere 1.414e-180 — ebenfalls darstellbar.
+//
+// Die Quadrate verlassen den Wertebereich, obwohl ihre Wurzel mitten darin
+// liegt. Der Ausweg ist so alt wie das Problem: den groesseren Betrag
+// ausklammern.
+//
+//     sqrt(x^2 + y^2) = |x| * sqrt(1 + (y/x)^2)     fuer |x| >= |y|
+//
+// Der Quotient liegt dann zwischen 0 und 1, sein Quadrat zwischen 0 und 1,
+// und die Summe zwischen 1 und 2 — nichts davon kann ueberlaufen. Genau das
+// macht DistHypot, und alle mehrdimensionalen Funktionen hier arbeiten nach
+// demselben Muster.
+//
+// ── Wann man die Wurzel weglaesst ────────────────────────────────────────────
+//
+// Zum VERGLEICHEN von Abstaenden wird sie nie gebraucht: a < b gilt genau
+// dann, wenn a^2 < b^2 (fuer nichtnegative Werte). Die Wurzel kostet ein
+// Vielfaches einer Multiplikation und bringt fuer die Reihenfolge nichts.
+// Deshalb steht neben jeder Abstandsfunktion die quadrierte Fassung, und die
+// Nachbarsuche benutzt ausschliesslich sie.
+//
+// ── Darstellung ──────────────────────────────────────────────────────────────
+//
+// Punkte sind f64-Felder als Adresse, die Dimension wird uebergeben. Eine
+// Punktmenge liegt zeilenweise: Punkt i beginnt bei i*nd.
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in den uebrigen Units: `con f64` als Operand (#1499), negatives Literal
+// als Operand (#1496) und unaeres Minus auf einer Variablen im Ausdruck
+// (#1512) rechnen still falsch. Konstanten stehen als Funktionen, negiert wird
+// ueber _neg().
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+fn _eps(): f64  { return 0.000000000001; }
+
+// ── Kompensiertes Summieren ──────────────────────────────────────────────────
+//
+// Jede Addition rundet auf 53 Bit; ueber viele Summanden addiert sich das auf.
+// Bei einer Quadratsumme ueber eine Million Werte bleiben von sechzehn Stellen
+// noch knapp zwoelf (gemessen mit lyxc 1.0.20E).
+//
+// Alle Summenschleifen hier fuehren deshalb einen Korrekturterm nach Neumaier
+// mit: zu jeder Addition laesst sich der verlorene Rest exakt ausrechnen, und
+// am Ende wird er wieder eingerechnet. Kosten sind ein Vergleich und zwei
+// Additionen je Wert.
+//
+// _corr liefert genau diesen Rest fuer s + x = t. Welcher der beiden Werte
+// groesser ist, entscheidet die Form — genau daran scheitert Kahans aeltere
+// Fassung, wenn der neue Summand die bisherige Summe uebersteigt.
+//
+// Ausfuehrlich samt Nachweisen in std.sum.
+fn _corr(s: f64, x: f64, t: f64): f64 {
+  if (AbsF64(s) >= AbsF64(x)) { return (s - t) + x; }
+  return (x - t) + s;
+}
+
+fn _g(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn _p(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+// ── Hypotenuse ───────────────────────────────────────────────────────────────
+
+// sqrt(x^2 + y^2), ohne Zwischenergebnisse ausserhalb des Wertebereichs.
+pub fn DistHypot(x: f64, y: f64): f64 {
+  var ax: f64 := AbsF64(x);
+  var ay: f64 := AbsF64(y);
+
+  var big: f64 := ax;
+  var small: f64 := ay;
+  if (ay > ax) {
+    big := ay;
+    small := ax;
+  }
+
+  if (big == _zero()) { return _zero(); }
+
+  var r: f64 := small / big;
+  return big * SqrtF64(_one() + r * r);
+}
+
+// Dasselbe in drei Dimensionen. Zweimal DistHypot zu schachteln waere auch
+// sicher, kostet aber zwei Wurzeln — hier genuegt eine.
+pub fn DistHypot3(x: f64, y: f64, z: f64): f64 {
+  var ax: f64 := AbsF64(x);
+  var ay: f64 := AbsF64(y);
+  var az: f64 := AbsF64(z);
+
+  var big: f64 := ax;
+  if (ay > big) { big := ay; }
+  if (az > big) { big := az; }
+
+  if (big == _zero()) { return _zero(); }
+
+  var rx: f64 := ax / big;
+  var ry: f64 := ay / big;
+  var rz: f64 := az / big;
+  return big * SqrtF64(rx * rx + ry * ry + rz * rz);
+}
+
+// ── Euklidischer Abstand ─────────────────────────────────────────────────────
+
+// Quadrierter Abstand — schnell und exakt, solange die Quadratsumme im
+// Wertebereich bleibt. Fuer Vergleiche, Sortierungen und Nachbarsuche ist das
+// die richtige Wahl.
+pub fn DistEuclidSq(a: int64, b: int64, nd: int64): f64 {
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nd) {
+    var d: f64 := _g(a, i) - _g(b, i);
+    var x: f64 := d * d;
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+  return s + c;
+}
+
+// Euklidischer Abstand, ueberlaufsicher.
+//
+// Zwei Durchlaeufe: erst den groessten Betrag suchen, dann die Summe der
+// skalierten Quadrate. Das kostet einen zusaetzlichen Durchlauf gegenueber der
+// naiven Fassung und ist der Preis dafuer, dass das Ergebnis auch dann stimmt,
+// wenn die Zwischenwerte es nicht mehr taeten.
+pub fn DistEuclid(a: int64, b: int64, nd: int64): f64 {
+  if (nd < 1) { return _zero(); }
+
+  var big: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nd) {
+    var d: f64 := AbsF64(_g(a, i) - _g(b, i));
+    if (d > big) { big := d; }
+    i := i + 1;
+  }
+
+  if (big == _zero()) { return _zero(); }
+
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  i := 0;
+  while (i < nd) {
+    var r: f64 := (_g(a, i) - _g(b, i)) / big;
+    var x: f64 := r * r;
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+  return big * SqrtF64(s + c);
+}
+
+// Laenge eines Vektors, ebenfalls skaliert gerechnet.
+pub fn DistNorm(a: int64, nd: int64): f64 {
+  if (nd < 1) { return _zero(); }
+
+  var big: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nd) {
+    var v: f64 := AbsF64(_g(a, i));
+    if (v > big) { big := v; }
+    i := i + 1;
+  }
+  if (big == _zero()) { return _zero(); }
+
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  i := 0;
+  while (i < nd) {
+    var r: f64 := _g(a, i) / big;
+    var x: f64 := r * r;
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+  return big * SqrtF64(s + c);
+}
+
+pub fn DistNormSq(a: int64, nd: int64): f64 {
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nd) {
+    var v: f64 := _g(a, i);
+    var x: f64 := v * v;
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+  return s + c;
+}
+
+// ── Andere Metriken ──────────────────────────────────────────────────────────
+
+// Manhattan- oder Taxi-Abstand: Summe der Betraege. Er misst den Weg entlang
+// der Achsen statt auf der Geraden — richtig, wo Bewegung nur achsenparallel
+// moeglich ist (Gitter, Stadtplan), und robuster gegen einzelne Ausreisser,
+// weil Abweichungen nicht quadriert werden.
+pub fn DistManhattan(a: int64, b: int64, nd: int64): f64 {
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nd) {
+    var x: f64 := AbsF64(_g(a, i) - _g(b, i));
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+  return s + c;
+}
+
+// Chebyshev- oder Schachbrett-Abstand: die groesste einzelne Abweichung.
+// Die Zahl der Koenigszuege zwischen zwei Feldern.
+pub fn DistChebyshev(a: int64, b: int64, nd: int64): f64 {
+  var m: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nd) {
+    var d: f64 := AbsF64(_g(a, i) - _g(b, i));
+    if (d > m) { m := d; }
+    i := i + 1;
+  }
+  return m;
+}
+
+// Minkowski-Abstand der Ordnung p — die Verallgemeinerung, die alle drei
+// enthaelt: p = 1 ist Manhattan, p = 2 euklidisch, p gegen unendlich
+// Chebyshev.
+//
+// Ebenfalls skaliert gerechnet: bei grossem p waechst d^p noch schneller aus
+// dem Wertebereich heraus als das Quadrat.
+pub fn DistMinkowski(a: int64, b: int64, nd: int64, p: f64): f64 {
+  if (p <= _zero()) { return _zero(); }
+  if (nd < 1) { return _zero(); }
+
+  var big: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nd) {
+    var d: f64 := AbsF64(_g(a, i) - _g(b, i));
+    if (d > big) { big := d; }
+    i := i + 1;
+  }
+  if (big == _zero()) { return _zero(); }
+
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  i := 0;
+  while (i < nd) {
+    var r: f64 := AbsF64(_g(a, i) - _g(b, i)) / big;
+    var x: f64 := PowF64(r, p);
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+  return big * PowF64(s + c, _one() / p);
+}
+
+// ── Winkelmasse ──────────────────────────────────────────────────────────────
+
+// Kosinus der beiden Vektoren: 1 bei gleicher Richtung, 0 bei rechtem Winkel,
+// -1 bei entgegengesetzter.
+//
+// Er misst nur die RICHTUNG, nicht die Laenge — deshalb das Mittel der Wahl
+// fuer Textvektoren und Einbettungen, wo ein langer und ein kurzer Text
+// dasselbe bedeuten koennen. Bei einem Nullvektor gibt es keine Richtung; dann
+// kommt 0 zurueck.
+pub fn DistCosineSimilarity(a: int64, b: int64, nd: int64): f64 {
+  var na: f64 := DistNorm(a, nd);
+  var nb: f64 := DistNorm(b, nd);
+  if (na < _eps()) { return _zero(); }
+  if (nb < _eps()) { return _zero(); }
+
+  // Skalarprodukt der normierten Vektoren, damit auch hier nichts ueberlaeuft
+  var s: f64 := _zero();
+  var c: f64 := _zero();
+  var i: int64 := 0;
+  while (i < nd) {
+    var x: f64 := (_g(a, i) / na) * (_g(b, i) / nb);
+    var t: f64 := s + x;
+    c := c + _corr(s, x, t);
+    s := t;
+    i := i + 1;
+  }
+
+  s := s + c;
+
+  // Rundung kann knapp ueber 1 hinausschiessen
+  if (s > _one()) { s := _one(); }
+  var lo: f64 := _neg(_one());
+  if (s < lo) { s := lo; }
+  return s;
+}
+
+// Kosinus-Abstand: 1 - Aehnlichkeit, also 0 bei gleicher Richtung.
+//
+// Achtung, das ist KEINE Metrik im mathematischen Sinn — die
+// Dreiecksungleichung gilt nicht. Wer darauf einen Suchbaum aufbaut, bekommt
+// falsche Ergebnisse; dafuer braucht es die Winkeldistanz.
+pub fn DistCosine(a: int64, b: int64, nd: int64): f64 {
+  return _one() - DistCosineSimilarity(a, b, nd);
+}
+
+// Der Winkel selbst, in Radiant. Anders als der Kosinus-Abstand erfuellt er
+// die Dreiecksungleichung und ist damit eine echte Metrik.
+pub fn DistAngular(a: int64, b: int64, nd: int64): f64 {
+  return AcosF64(DistCosineSimilarity(a, b, nd));
+}
+
+// ── Diskrete Masse ───────────────────────────────────────────────────────────
+
+// Hamming-Abstand: die Zahl der Stellen, an denen sich zwei Folgen
+// unterscheiden. Fuer Pruefsummen, Fehlerkorrektur und den Vergleich von
+// Bitmustern.
+pub fn DistHamming(a: int64, b: int64, n: int64): int64 {
+  var c: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    if (peek64(a + i * 8) != peek64(b + i * 8)) { c := c + 1; }
+    i := i + 1;
+  }
+  return c;
+}
+
+// Zahl der unterschiedlichen BITS zweier Ganzzahlen.
+pub fn DistHammingBits(a: int64, b: int64): int64 {
+  var x: int64 := a ^ b;
+  var c: int64 := 0;
+  var i: int64 := 0;
+  while (i < 64) {
+    c := c + ((x >> i) & 1);
+    i := i + 1;
+  }
+  return c;
+}
+
+// Jaccard-Abstand zweier Mengen, die als 0/1-Vektoren vorliegen:
+// 1 - (Schnitt / Vereinigung). Zwei leere Mengen gelten als gleich (0).
+pub fn DistJaccard(a: int64, b: int64, n: int64): f64 {
+  var both: int64 := 0;
+  var either: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    var x: bool := peek64(a + i * 8) != 0;
+    var y: bool := peek64(b + i * 8) != 0;
+    if (x) {
+      if (y) { both := both + 1; }
+    }
+    if (x) { either := either + 1; }
+    else {
+      if (y) { either := either + 1; }
+    }
+    i := i + 1;
+  }
+  if (either == 0) { return _zero(); }
+  return _one() - (both as f64) / (either as f64);
+}
+
+// ── Nachbarsuche ─────────────────────────────────────────────────────────────
+
+// Index des naechstgelegenen Punktes aus einer Menge; -1 bei leerer Menge.
+// outDist nimmt den Abstand auf (0 = verwerfen).
+//
+// Gesucht wird mit dem QUADRIERTEN Abstand — die Reihenfolge ist dieselbe, und
+// die Wurzel faellt nur einmal am Ende an statt bei jedem Punkt. Bei einer
+// Million Punkten ist das der Unterschied zwischen einer und einer Million
+// Wurzeln.
+pub fn DistNearest(point: int64, set: int64, count: int64, nd: int64,
+                   outDist: int64): int64 {
+  if (count < 1) { return -1; }
+  if (nd < 1) { return -1; }
+
+  var best: int64 := 0;
+  var bestSq: f64 := DistEuclidSq(point, set, nd);
+
+  var i: int64 := 1;
+  while (i < count) {
+    var d: f64 := DistEuclidSq(point, set + i * nd * 8, nd);
+    if (d < bestSq) {
+      bestSq := d;
+      best := i;
+    }
+    i := i + 1;
+  }
+
+  if (outDist != 0) { pokef64(outDist, SqrtF64(bestSq)); }
+  return best;
+}
+
+// Index des am weitesten entfernten Punktes — fuer Durchmesserabschaetzungen
+// und die Startpunktwahl beim Clustern.
+pub fn DistFarthest(point: int64, set: int64, count: int64, nd: int64,
+                    outDist: int64): int64 {
+  if (count < 1) { return -1; }
+  if (nd < 1) { return -1; }
+
+  var best: int64 := 0;
+  var bestSq: f64 := DistEuclidSq(point, set, nd);
+
+  var i: int64 := 1;
+  while (i < count) {
+    var d: f64 := DistEuclidSq(point, set + i * nd * 8, nd);
+    if (d > bestSq) {
+      bestSq := d;
+      best := i;
+    }
+    i := i + 1;
+  }
+
+  if (outDist != 0) { pokef64(outDist, SqrtF64(bestSq)); }
+  return best;
+}
+
+// Paarweise Abstaende aller Punkte einer Menge, als count-mal-count-Matrix
+// (zeilenweise). Symmetrisch, mit Nullen auf der Diagonale — gerechnet wird
+// nur die obere Haelfte.
+pub fn DistMatrix(set: int64, count: int64, nd: int64, out: int64): bool {
+  if (count < 1) { return false; }
+  if (nd < 1) { return false; }
+
+  var i: int64 := 0;
+  while (i < count) {
+    _p(out, i * count + i, _zero());
+    var j: int64 := i + 1;
+    while (j < count) {
+      var d: f64 := DistEuclid(set + i * nd * 8, set + j * nd * 8, nd);
+      _p(out, i * count + j, d);
+      _p(out, j * count + i, d);
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Schwerpunkt einer Punktmenge — der Punkt, der die Summe der QUADRIERTEN
+// Abstaende minimiert. (Fuer die Summe der einfachen Abstaende waere es der
+// geometrische Median, der sich nicht geschlossen angeben laesst.)
+pub fn DistCentroid(set: int64, count: int64, nd: int64, out: int64): bool {
+  if (count < 1) { return false; }
+  if (nd < 1) { return false; }
+
+  var j: int64 := 0;
+  while (j < nd) {
+    _p(out, j, _zero());
+    j := j + 1;
+  }
+
+  var i: int64 := 0;
+  while (i < count) {
+    j := 0;
+    while (j < nd) {
+      _p(out, j, _g(out, j) + _g(set + i * nd * 8, j));
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+
+  var n: f64 := count as f64;
+  j := 0;
+  while (j < nd) {
+    _p(out, j, _g(out, j) / n);
+    j := j + 1;
+  }
+  return true;
+}
+
+// Liegt der Punkt innerhalb des Radius? Ohne Wurzel, durch Vergleich der
+// Quadrate — der haeufigste Fall in Kollisionspruefung und Umkreissuche.
+pub fn DistWithin(a: int64, b: int64, nd: int64, radius: f64): bool {
+  if (radius < _zero()) { return false; }
+  return DistEuclidSq(a, b, nd) <= radius * radius;
+}
