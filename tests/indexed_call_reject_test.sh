@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tests/indexed_call_reject_test.sh — Aufruf über einen indizierten Ausdruck
-# wird abgewiesen (Issue #1053).
+# (Issue #1053, seit #1505 zum Teil erlaubt).
 #
 # `handlers[0](x)` sah aus wie ein Aufruf, war aber keiner: ein Aufruf hängt in
 # Lyx am NAMEN. Der Parser hatte für `(` nach einem Postfix-Ausdruck gar keinen
@@ -11,8 +11,13 @@
 #                    (`arr[0](21)` ergab 12 statt 42)
 #   zwei Argumente → unverständliche Meldung über ein fehlendes ')'
 #
-# Der stille Fall ist der gefährlichere. Deshalb wird die Form jetzt ausdrücklich
-# abgewiesen, mit Hinweis auf den Umweg über eine Variable.
+# Der stille Fall ist der gefährlichere. #1053 hat die Form deshalb erst einmal
+# abgewiesen — eine ehrliche Zwischenstufe, kein Ziel.
+#
+# SEIT #1505 IST SIE UMGESETZT: `tabelle[i](args)` ruft über den berechneten
+# Zeiger. Dieser Test misst seither die WIRKUNG (welcher Handler läuft, was er
+# zurückgibt), nicht mehr die Ablehnung. Die Einzelheiten stehen in
+# tests/sprache_z16_test.sh.
 #
 # Dieselbe Lücke traf den generischen Aufruf in eckiger Schreibweise
 # `max[int64](10, 20)` — ebnf.md führte ihn fälschlich, der Compiler kannte nur
@@ -27,7 +32,7 @@ PASS=0; FAIL=0
 rejects() { # name, quelltext
   printf '%s\n' "$2" > "$TMP/c.lyx"; rm -f "$TMP/c"
   got=$("$LYXC" --std-path="$ROOT" "$TMP/c.lyx" -o "$TMP/c" 2>&1)
-  if echo "$got" | grep -q "Aufruf ueber einen indizierten Ausdruck"; then
+  if echo "$got" | grep -qE "Aufruf ueber einen indizierten Ausdruck|eckige Klammern indizieren"; then
     echo "PASS $1 (abgewiesen)"; PASS=$((PASS+1))
   else
     echo "FAIL $1: nicht abgewiesen — $(echo "$got" | grep -i error | head -1)"; FAIL=$((FAIL+1))
@@ -45,13 +50,13 @@ runs() { # name, quelltext, erwarteter exit
 }
 
 # Der stille Fall: EIN Argument. Vorher uebersetzte das und lieferte 12.
-rejects "fn-Zeiger aus Array, ein Argument" 'type H = fn(int64): int64;
+runs "fn-Zeiger aus Array, ein Argument (#1505)" 'type H = fn(int64): int64;
 fn dbl(x: int64): int64 { return x * 2; }
-fn main(): int64 { var arr: [4]H; arr[0] := dbl; return arr[0](21); }'
+fn main(): int64 { var arr: [4]H; arr[0] := dbl; return arr[0](21); }' 42
 
-rejects "fn-Zeiger aus Array, zwei Argumente" 'type H = fn(int64, int64): int64;
+runs "fn-Zeiger aus Array, zwei Argumente (#1505)" 'type H = fn(int64, int64): int64;
 fn add(a: int64, b: int64): int64 { return a + b; }
-fn main(): int64 { var arr: [4]H; arr[0] := add; return arr[0](20, 22); }'
+fn main(): int64 { var arr: [4]H; arr[0] := add; return arr[0](20, 22); }' 42
 
 rejects "generischer Aufruf in eckiger Schreibweise" 'fn mx<T>(a: T, b: T): T { return a; }
 fn main(): int64 { return mx[int64](10, 42); }'

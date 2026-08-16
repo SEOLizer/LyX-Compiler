@@ -1,0 +1,153 @@
+// src/wildcard_import.lyx — #1384: Auffaltung von `import pfad.*;`
+//
+// Ein Punktpfad bezeichnet sonst genau eine Datei. Der Stern steht fuer "alle
+// Units dieses Verzeichnisses, auch in Unterverzeichnissen".
+//
+// WARUM EINE EIGENE UNIT: sema und Codegen laufen ihre Importe GETRENNT durch
+// (sema.\_sema\_processImport, codegen\_x86.cg\_processImport) und suchen ihre
+// Dateien jeweils selbst. Zwei Auffaltungen nebeneinander waeren genau das
+// Muster, das in diesem Projekt schon mehrfach auseinandergelaufen ist —
+// sizeof gegen Layout, https gegen http. Also steht sie einmal hier, und
+// beide fragen dieselbe Funktion.
+//
+// Nicht importiert werden Dateien mit fuehrendem Punkt und alles ausser
+// `.lyx`. Ein leeres Verzeichnis liefert 0 — der Aufrufer meldet das, denn
+// ein vertippter Pfad saehe sonst aus wie ein leerer Ordner.
+
+unit src.wildcard_import;
+
+import src.std.alloc;
+
+con WCI_DIRENT_BUF: int64 := 32768;
+con WCI_MAX_TIEFE:  int64 := 8;
+
+// Haengt zwei Pfadstuecke mit '/' zusammen.
+fn wciPfad(a: pchar, aLen: int64, b: pchar, bLen: int64): int64 {
+  var p: int64 := alloc(aLen + 1 + bLen + 1);
+  var i: int64 := 0;
+  while (i < aLen) { poke8(p + i, StrCharAt(a, i) & 255); i := i + 1; }
+  poke8(p + i, 47); i := i + 1;
+  var j: int64 := 0;
+  while (j < bLen) { poke8(p + i + j, StrCharAt(b, j) & 255); j := j + 1; }
+  poke8(p + i + j, 0);
+  return p;
+}
+
+// "std.audio" -> "std/audio"
+fn wciPunkteZuSlash(name: pchar, nLen: int64): int64 {
+  var p: int64 := alloc(nLen + 1);
+  var i: int64 := 0;
+  while (i < nLen) {
+    var c: int64 := StrCharAt(name, i) & 255;
+    if (c == 46) { c := 47; }
+    poke8(p + i, c);
+    i := i + 1;
+  }
+  poke8(p + nLen, 0);
+  return p;
+}
+
+// O_RDONLY|O_DIRECTORY
+fn wciIstVerzeichnis(pfad: pchar): int64 {
+  var fd: int64 := open(pfad, 65536, 0);
+  if (fd < 0) { return 0; }
+  close(fd);
+  return 1;
+}
+
+// Sucht das Verzeichnis in derselben Reihenfolge, in der auch eine einzelne
+// Unit gesucht wird: relativ, -I/LYX_PATH, --std-path/LYX_STD_PATH, zuletzt
+// der Installationspfad. Rueckgabe: Pfad oder 0.
+pub fn WildcardVerzeichnis(modName: pchar, modLen: int64,
+                           includePath: int64, stdPath: int64): int64 {
+  var rel: int64 := wciPunkteZuSlash(modName, modLen);
+  if (wciIstVerzeichnis(rel as pchar) != 0) { return rel; }
+  var relLen: int64 := StrLen(rel as pchar);
+  if (includePath != 0) {
+    var k1: int64 := wciPfad(includePath as pchar, StrLen(includePath as pchar),
+                             rel as pchar, relLen);
+    if (wciIstVerzeichnis(k1 as pchar) != 0) { return k1; }
+  }
+  if (stdPath != 0) {
+    var k2: int64 := wciPfad(stdPath as pchar, StrLen(stdPath as pchar),
+                             rel as pchar, relLen);
+    if (wciIstVerzeichnis(k2 as pchar) != 0) { return k2; }
+  }
+  var k3: int64 := wciPfad("/usr/include/lyx/units"c, 22, rel as pchar, relLen);
+  if (wciIstVerzeichnis(k3 as pchar) != 0) { return k3; }
+  return 0;
+}
+
+// Traegt jeden gefundenen Unit-Namen als {ptr,len} in out ein (16 Byte je
+// Eintrag). Rueckgabe: Zahl der Eintraege.
+fn wciDurchlaufe(dir: pchar, modPrefix: pchar, prefixLen: int64,
+                 out: int64, maxUnits: int64, anzahl: int64, tiefe: int64): int64 {
+  if (tiefe > WCI_MAX_TIEFE) { return anzahl; }
+  var fd: int64 := open(dir, 65536, 0);
+  if (fd < 0) { return anzahl; }
+  var buf: int64 := alloc(WCI_DIRENT_BUF);
+  var n: int64 := anzahl;
+  var gelesen: int64 := getdents64(fd, buf, WCI_DIRENT_BUF);
+  while (gelesen > 0) {
+    var off: int64 := 0;
+    while (off < gelesen) {
+      // struct linux_dirent64: +0 d_ino(8) +8 d_off(8) +16 d_reclen(2)
+      //                        +18 d_type(1) +19 d_name
+      var reclen: int64 := peek16(buf + off + 16);
+      if (reclen <= 0) { off := gelesen; }
+      else {
+        var dtyp:   int64 := peek8(buf + off + 18) & 255;
+        var namep:  int64 := buf + off + 19;
+        var nlen:   int64 := StrLen(namep as pchar);
+        var erstes: int64 := peek8(namep) & 255;
+        if (nlen > 0 && erstes != 46 && n < maxUnits) {
+          if (dtyp == 4) {
+            var unterDir: int64 := wciPfad(dir, StrLen(dir), namep as pchar, nlen);
+            var unterMod: int64 := alloc(prefixLen + 1 + nlen + 1);
+            var a: int64 := 0;
+            while (a < prefixLen) { poke8(unterMod + a, StrCharAt(modPrefix, a) & 255); a := a + 1; }
+            poke8(unterMod + a, 46); a := a + 1;
+            var b: int64 := 0;
+            while (b < nlen) { poke8(unterMod + a + b, peek8(namep + b) & 255); b := b + 1; }
+            poke8(unterMod + a + b, 0);
+            n := wciDurchlaufe(unterDir as pchar, unterMod as pchar,
+                               prefixLen + 1 + nlen, out, maxUnits, n, tiefe + 1);
+          } else if (nlen > 4) {
+            if ((peek8(namep + nlen - 4) & 255) == 46 &&
+                (peek8(namep + nlen - 3) & 255) == 108 &&
+                (peek8(namep + nlen - 2) & 255) == 121 &&
+                (peek8(namep + nlen - 1) & 255) == 120) {
+              var stamm: int64 := nlen - 4;
+              var unitName: int64 := alloc(prefixLen + 1 + stamm + 1);
+              var c: int64 := 0;
+              while (c < prefixLen) { poke8(unitName + c, StrCharAt(modPrefix, c) & 255); c := c + 1; }
+              poke8(unitName + c, 46); c := c + 1;
+              var d: int64 := 0;
+              while (d < stamm) { poke8(unitName + c + d, peek8(namep + d) & 255); d := d + 1; }
+              poke8(unitName + c + d, 0);
+              poke64(out + n * 16,     unitName);
+              poke64(out + n * 16 + 8, prefixLen + 1 + stamm);
+              n := n + 1;
+            }
+          }
+        }
+        off := off + reclen;
+      }
+    }
+    gelesen := getdents64(fd, buf, WCI_DIRENT_BUF);
+  }
+  close(fd);
+  free(buf, WCI_DIRENT_BUF);
+  return n;
+}
+
+// Sammelt alle Unit-Namen unter `modName`. out fasst maxUnits Eintraege zu je
+// 16 Byte {namePtr, nameLen}. Rueckgabe: Zahl der Units, -1 wenn es das
+// Verzeichnis nicht gibt.
+pub fn WildcardUnits(modName: pchar, modLen: int64,
+                     includePath: int64, stdPath: int64,
+                     out: int64, maxUnits: int64): int64 {
+  var dir: int64 := WildcardVerzeichnis(modName, modLen, includePath, stdPath);
+  if (dir == 0) { return 0 - 1; }
+  return wciDurchlaufe(dir as pchar, modName, modLen, out, maxUnits, 0, 0);
+}
