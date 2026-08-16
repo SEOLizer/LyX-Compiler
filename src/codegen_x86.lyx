@@ -699,6 +699,18 @@ pub type Codegen = class {
   // localFnPtrF64 (#1565) — ohne sie faellt `var v: f64 = gFn(4.0)` still auf
   // int64 zurueck und aus 12.0 wird 4622945017495814144.
   globalFnPtrF64: int64;
+  // #1589: `con f: fn(...) := Dbl;` — ein con mit Funktionsverweis. Der Wert
+  // ist eine Codeadresse, die erst feststeht, wenn die Funktion emittiert ist.
+  // Gemerkt wird das Paar; nach dem Emittieren bekommt der con-Name dieselbe
+  // Marke wie die Funktion, damit Aufruf UND Adressnahme ohne Sonderweg gehen.
+  conFnTab:     int64;   // {aliasPtr, aliasLen, zielPtr, zielLen} je 32 Byte
+  conFnCount:   int64;
+  conFnCap:     int64;
+  // #1589: Name des zuletzt erzeugten anonymen Funktionsrumpfs.
+  lastAnonName:    int64;
+  lastAnonNameLen: int64;
+  // #1580: Bump-Bereich fuer Wert-Kopien von Structs. -1 = noch nicht angelegt.
+  structArenaOff:  int64;   // Datenoffset: [+0] naechste freie Adresse, [+8] Ende
   // #1256/#1299: Ein globales AGGREGAT — `[N]T` oder ein Struct — passt nicht
   // in den 8-Byte-Slot. Der Slot traegt deshalb einen ZEIGER auf einen eigenen
   // Block im Datenbereich, genau wie ein Local auf seinen mmap-Block zeigt.
@@ -2486,6 +2498,45 @@ pub type Codegen = class {
     self.cg_addPatch(pos, name as int64, nlen, CG_PATCH_EXTERN_DATA);
   }
 
+  // #1589: Paar merken (con-Name -> Funktionsname).
+  fn cg_addConFn(aliasP: pchar, aliasL: int64, zielP: pchar, zielL: int64) {
+    if (self.conFnCount >= self.conFnCap) {
+      var nc: int64 := self.conFnCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.conFnTab, self.conFnCount * 32);
+      self.conFnTab := nb;
+      self.conFnCap := nc;
+    }
+    var base: int64 := self.conFnTab + self.conFnCount * 32;
+    poke64(base,      aliasP as int64);
+    poke64(base + 8,  aliasL);
+    poke64(base + 16, zielP as int64);
+    poke64(base + 24, zielL);
+    self.conFnCount := self.conFnCount + 1;
+  }
+
+  // #1589: nach dem Emittieren aller Funktionen den con-Namen auf dieselbe
+  // Stelle legen. Danach loest sich `f(21)` wie ein gewoehnlicher Aufruf auf,
+  // statt in "undefined function 'f'" zu enden.
+  fn cg_bindConFns() {
+    var i: int64 := 0;
+    while (i < self.conFnCount) {
+      var base: int64 := self.conFnTab + i * 32;
+      var zielP: pchar := peek64(base + 16) as pchar;
+      var zielL: int64 := peek64(base + 24);
+      var off: int64 := self.cg_findLabel(zielP, zielL);
+      if (off >= 0) {
+        var aliasP: pchar := peek64(base) as pchar;
+        var aliasL: int64 := peek64(base + 8);
+        if (self.cg_findLabel(aliasP, aliasL) < 0) {
+          self.cg_addLabel(aliasP, aliasL, 0);
+          poke64(self.labels + (self.labelCount - 1) * CG_LABEL_SZ + CG_LABEL_OFF_CODEOFF, off);
+        }
+      }
+      i := i + 1;
+    }
+  }
+
   fn cg_patchAll() {
     var i: int64 := 0;
     while (i < self.patchCount) {
@@ -3290,36 +3341,27 @@ pub type Codegen = class {
         ej += 1;
       }
     } else {
-      // #1478: Hier wurde der Nenner mit 10 multipliziert und der ZAEHLER dabei
-      // halbiert, sobald der Nenner an die Grenze kam. Bei einer kleinen
-      // Mantisse ist der Zaehler aber winzig — er lief auf 0, und die Funktion
-      // gab 0 zurueck: jedes Literal unterhalb von etwa 1e-18 wurde still zu
-      // null.
+      // #1478 hatte hier den Nenner statt um 10 nur um 5 wachsen lassen und
+      // den Faktor 2 in den Binaerexponenten geschoben — das trug bis 1e-27.
+      // #1569: Der Nenner traegt nur bis etwa 1e-27. Danach lief die alte
+      // Fassung in ihren Notzweig, halbierte den ohnehin winzigen Zaehler und
+      // gab bei n == 0 eine glatte Null zurueck — jedes Literal ab 1e-28 wurde
+      // still zu 0, obwohl f64 bis 5e-324 traegt.
       //
-      // 10 ist 5 mal 2, und der Faktor 2 kostet nichts: er wandert in den
-      // BINAEREXPONENTEN, den die Normalisierung darunter ohnehin fuehrt. Der
-      // Nenner waechst damit je Schritt nur noch um 5 statt um 10 und traegt
-      // bis etwa 1e-27 exakt. Erst darueber hinaus bleibt der alte Weg —
-      // dort ist der Wert ohnehin denormal.
+      // Der Bruch wird hier gar nicht mehr gebraucht: 10 ist 5 mal 2, der
+      // Faktor 2 wandert in den Binaerexponenten, und durch 5 kann man TEILEN,
+      // statt den Nenner wachsen zu lassen. Damit die Division nichts
+      // wegwirft, wird der Zaehler vorher so weit nach oben geschoben, wie
+      // int64 es zulaesst — rund 60 Bit Genauigkeit, deutlich mehr als die 53
+      // eines double.
       while (ej < expVal) {
-        // Wird der Nenner zu gross, wandern seine Zweierfaktoren ebenfalls in
-        // den Binaerexponenten — der Vorlauf hat ihn mit 10 hochgezogen, die
-        // Haelfte davon ist entbehrlich.
-        while (d > 1844674407370955161 && (d % 2) == 0) {
-          d := d / 2;
+        while (n <= 4611686018427387903) {   // n*2 bleibt in int64
+          n := n * 2;
           binExp := binExp - 1;
         }
-        if (d <= 1844674407370955161) {
-          d := d * 5;
-          binExp := binExp - 1;
-        } else {
-          while (d > 922337203685477580) {
-            d := d / 2;
-            n := n / 2;
-          }
-          d := d * 10;
-          if (n == 0) { return 0; }
-        }
+        n := n / 5;
+        binExp := binExp - 1;      // der Faktor 2 aus 10 = 5 * 2
+        if (n == 0) { return 0; }  // wirklich unter dem Wertebereich
         ej += 1;
       }
     }
@@ -4247,6 +4289,14 @@ pub type Codegen = class {
   fn cg_exprClassName(ni: int64): int64 {
     if (ni < 0) { return 0 - 1; }
     var k: int64 := self.cg_nkind(ni);
+    // #1588: derselbe Fall wie in cg_objClassIdx — hier haengt der
+    // METHODENAUFRUF daran. Ohne diesen Zweig wurde `(a as Basis).Zeige()`
+    // ungemangelt emittiert und scheiterte mit "undefined function 'Zeige'".
+    if (k == CGN_CAST) {
+      var ecT: int64 := self.cg_nc1(ni);
+      if (ecT < 0) { return 0 - 1; }
+      return self.cg_findClass(self.cg_nsval(ecT), self.cg_nslen(ecT));
+    }
     if (k == CGN_IDENT) {
       var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
       if (idx < 0) { return 0 - 1; }
@@ -5091,21 +5141,95 @@ pub type Codegen = class {
   // Kopiert `bytes` Byte von der Adresse in rax in frischen Speicher und
   // laesst dessen Adresse in rax zurueck. Alles, was hier benutzt wird, wird
   // vorher gesichert: der Aufrufer sieht nur rax veraendert.
+  // #1580: rax := belegte Adresse aus dem Bump-Bereich, um `groesse` weiter.
+  //
+  // NEBENLAEUFIG: der Zeiger ist geteilt. Die erste Fassung las und schrieb ihn
+  // gewoehnlich — zwei Threads bekamen damit DIESELBE Adresse, und der
+  // Atomics-Test (vier Threads, tests/thread_concurrency_test.lyx) lief in
+  // seine Zeitgrenze, weil beide auf demselben Mutex-Speicher arbeiteten.
+  // Deshalb `lock cmpxchg`: gewinnt ein anderer Thread das Rennen, wird der
+  // Versuch wiederholt.
+  //
+  // Reicht der Rest nicht, holt der Thread sich einen eigenen Block. Rennen
+  // sich zwei Threads dabei, kostet das im schlimmsten Fall einen ungenutzten
+  // Block — jeder bekommt gueltigen, eigenen Speicher.
+  //
+  // rdi/rsi/rcx bleiben unberuehrt: der Aufrufer benutzt sie unmittelbar
+  // danach fuer `rep movsq`.
+  fn cg_emitStructArenaAlloc(groesse: int64) {
+    if (self.structArenaOff < 0) {
+      // Die beiden Zeiger werden mit `lock cmpxchg` fortgeschrieben. Ein
+      // unausgerichteter atomarer Zugriff sperrt nicht die Cache-Zeile,
+      // sondern den BUS — gemessen rund 1,9 Mikrosekunden je Belegung statt
+      // weniger als 20 Nanosekunden. Der Datenbereich haette sie sonst an
+      // eine ungerade Adresse gelegt (0x…17f).
+      while ((self.dataLen & 7) != 0) { self.cg_edata(0); }
+      self.structArenaOff := self.cg_reserveData(16);
+    }
+    var aOff: int64 := self.structArenaOff;
+    self.cg_e8(0x52);                                          // push rdx
+    var retry: int64 := self.codeLen;
+    // rax = [arena]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+    var p1: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(p1, aOff, 0, CG_PATCH_STR);
+    // rdx = rax + groesse
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x90); self.cg_e32(groesse);
+    // cmp rdx, [arena+8]
+    self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x15);
+    var p2: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(p2, aOff + 8, 0, CG_PATCH_STR);
+    self.cg_e8(0x77);                                          // ja .nachlegen
+    var jaPos: int64 := self.codeLen; self.cg_e8(0);
+    // lock cmpxchg [arena], rdx   (rax = erwarteter alter Wert)
+    self.cg_e8(0xF0); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB1); self.cg_e8(0x15);
+    var p3: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(p3, aOff, 0, CG_PATCH_STR);
+    self.cg_e8(0x74);                                          // jz .fertig (rax = alte Adresse)
+    var jzPos: int64 := self.codeLen; self.cg_e8(0);
+    self.cg_e8(0xEB);                                          // jmp retry
+    self.cg_e8((retry - self.codeLen - 1) & 255);
+    // --- .nachlegen: eigener Block per mmap(1 MiB) ---
+    poke8(self.code + jaPos, self.codeLen - jaPos - 1);
+    self.cg_e8(0x57); self.cg_e8(0x56); self.cg_e8(0x51);      // push rdi, rsi, rcx
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);      // xor rdi, rdi
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6); self.cg_e32(1048576);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(3);
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(34);
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);      // xor r8, r8
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);      // dec r8 -> -1
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);      // xor r9, r9
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(9);
+    self.cg_e8(0x0F); self.cg_e8(0x05);                        // syscall
+    self.cg_e8(0x59); self.cg_e8(0x5E); self.cg_e8(0x5F);      // pop rcx, rsi, rdi
+    // [arena+8] := rax + 1 MiB ; [arena] := rax + groesse ; rax bleibt der Block
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x90); self.cg_e32(1048576);  // lea rdx,[rax+1MiB]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x15);      // mov [arena+8], rdx
+    var p4: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(p4, aOff + 8, 0, CG_PATCH_STR);
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x90); self.cg_e32(groesse);  // lea rdx,[rax+groesse]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x15);      // mov [arena], rdx
+    var p5: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(p5, aOff, 0, CG_PATCH_STR);
+    // .fertig
+    poke8(self.code + jzPos, self.codeLen - jzPos - 1);
+    self.cg_e8(0x5A);                                          // pop rdx
+  }
+
   fn cg_emitStructKopie(bytes: int64) {
     if (bytes <= 0) { return; }
     var worte: int64 := (bytes + 7) / 8;
     self.cg_e8(0x50);                                        // push rax (Quelle)
-    // mmap(0, groesse, PROT_RW, MAP_ANON, -1, 0)
-    self.cg_movRaxImm(0);            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);
-    self.cg_movRaxImm(worte * 8);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);
-    self.cg_movRaxImm(3);            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);
-    self.cg_movRaxImm(34);
-    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);    // mov r10, rax
-    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);    // xor r8, r8
-    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);    // dec r8 -> -1
-    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);    // xor r9, r9
-    self.cg_movRaxImm(9);
-    self.cg_e8(0x0F); self.cg_e8(0x05);                      // syscall
+    // #1580: Bis 1.1.0A stand hier ein mmap JE KOPIE — zwei je Rueckgabe eines
+    // Structs, und nie ein munmap. Das kostete rund 32 Mikrosekunden statt
+    // 0,05 (Faktor ~640, zwei Systemaufrufe und zwei Seiten Verwaltung je
+    // Aufruf) und liess den Speicher unbegrenzt wachsen: 200 000 Rueckgaben
+    // belegten 1,6 GB, weil mmap immer eine ganze Seite gibt.
+    //
+    // Jetzt kommt der Platz aus einem Bump-Bereich: die naechste freie Adresse
+    // steht im Datensegment, die Belegung ist eine Addition. Nachgelegt wird
+    // seitenweise (1 MiB), also einmal je 65 536 Paaren statt einmal je Kopie.
+    self.cg_emitStructArenaAlloc(worte * 8);
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);    // mov rdi, rax (Ziel)
     self.cg_e8(0x5E);                                        // pop rsi (Quelle)
     self.cg_e8(0x57);                                        // push rdi
@@ -6799,6 +6923,16 @@ pub type Codegen = class {
 
   fn cg_objClassIdx(objNode: int64): int64 {
     var k: int64 := self.cg_nkind(objNode);
+    // #1588: `(x as Klasse)` als Empfaenger. Der Typ steht am Cast-Knoten und
+    // ist damit bekannt — diese Funktion kannte den Knoten nur nicht. Sie gab
+    // -1 zurueck, der Feldoffset wurde -1, und cg_genFieldLoad nullte rax:
+    // `(a as Basis).wert` lieferte STILL 0 statt 42. Die Sprachreferenz zeigt
+    // genau dieses Muster fuer Klassenzeiger in int64-Variablen.
+    if (k == CGN_CAST) {
+      var castT: int64 := self.cg_nc1(objNode);
+      if (castT < 0) { return -1; }
+      return self.cg_findClass(self.cg_nsval(castT), self.cg_nslen(castT));
+    }
     if (k == CGN_FIELD) {
       var innerObj: int64 := self.cg_nc0(objNode);
       var fldName: pchar  := self.cg_nsval(objNode);
@@ -8365,6 +8499,8 @@ pub type Codegen = class {
       self.anonFnCounter += 1;
       var anonLabel: pchar := self.cg_buildAnonName(anonIdx);
       var anonLabelLen: int64 := StrLen(anonLabel);
+      self.lastAnonName    := anonLabel as int64;   // #1589
+      self.lastAnonNameLen := anonLabelLen;
 
       // 3. Emit jmp rel32 over inner function
       self.cg_e8(0xE9);
@@ -11408,6 +11544,59 @@ pub type Codegen = class {
       self.cg_movRaxImm(84);
       self.cg_e8(0x0F); self.cg_e8(0x05);
 
+    } else if (self.cg_seq(fname, fnlen, "mulhi", 5)) {
+      // #1552: obere 64 Bit des VORZEICHENBEHAFTETEN Produkts.
+      // Der Codegen rechnet sonst mit der Zwei-Operanden-Form `imul rax, rbx`,
+      // die per Definition nur die unteren 64 Bit liefert. Die
+      // Ein-Operanden-Form legt das ganze Produkt in RDX:RAX ab und kostet
+      // nicht mehr — verworfen wurde bisher nur die obere Haelfte.
+      // Argumente: rdi = a, rsi = b.
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);   // mov rax, rdi
+      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xEE);   // imul rsi
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);   // mov rax, rdx
+
+    } else if (self.cg_seq(fname, fnlen, "umulhi", 6)) {
+      // #1552: dasselbe vorzeichenlos (`mul rsi`).
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);   // mov rax, rdi
+      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xE6);   // mul rsi
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);   // mov rax, rdx
+
+    } else if (self.cg_seq(fname, fnlen, "divrem128", 9)) {
+      // #1552: 128 / 64 -> 64, Rest nach remAddr.
+      // rdi = hi, rsi = lo, rdx = d, rcx = remAddr.
+      //
+      // `div` loest eine Prozessorausnahme aus, wenn der Quotient nicht in 64
+      // Bit passt (das ist genau dann der Fall, wenn hi >= d) oder d null ist.
+      // Ein #DE waere ein Absturz ohne Erklaerung, also wird beides vorher
+      // geprueft und gemeldet — dieselbe Linie wie bei der Division durch null.
+      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xD0);   // mov r8, rdx (Divisor)
+      self.cg_e8(0x4D); self.cg_e8(0x85); self.cg_e8(0xC0);   // test r8, r8
+      self.cg_e8(0x75); self.cg_e8(0x05);                     // jnz +5
+      self.cg_e8(0xE9); var dvJ1: int64 := self.codeLen; self.cg_e32(0);  // jmp panic
+      self.cg_e8(0x49); self.cg_e8(0x39); self.cg_e8(0xF8);   // cmp r8, rdi   (r8 - hi)
+      self.cg_e8(0x77); self.cg_e8(0x05);                     // ja +5  (d > hi -> ok)
+      self.cg_e8(0xE9); var dvJ2: int64 := self.codeLen; self.cg_e32(0);  // jmp panic
+      // Rechnen
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF0);   // mov rax, rsi (lo)
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFA);   // mov rdx, rdi (hi)
+      self.cg_e8(0x49); self.cg_e8(0xF7); self.cg_e8(0xF0);   // div r8
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC9);   // test rcx, rcx
+      self.cg_e8(0x74); self.cg_e8(0x03);                     // jz +3 (kein Rest gewuenscht)
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x11);   // mov [rcx], rdx
+      self.cg_e8(0xEB); var dvEnd: int64 := self.codeLen; self.cg_e8(0);  // jmp ueber den Panikteil
+      // Panikteil
+      var dvPanic: int64 := self.codeLen;
+      poke32(self.code + dvJ1, dvPanic - dvJ1 - 4);
+      poke32(self.code + dvJ2, dvPanic - dvJ2 - 4);
+      var dvMsgOff: int64 := self.dataLen;
+      var dvMsg: pchar := "divrem128: Divisor 0 oder Quotient passt nicht in 64 Bit\n"c;
+      var dvI: int64 := 0;
+      while (dvI < 57) { self.cg_edata(StrCharAt(dvMsg, dvI)); dvI := dvI + 1; }
+      self.cg_edata(0);
+      self.cg_emitLeaRdiData(dvMsgOff);
+      self.cg_emitPanicBody();
+      poke8(self.code + dvEnd, self.codeLen - dvEnd - 1);
+
     } else if (self.cg_seq(fname, fnlen, "getdents64", 10)) {
       // getdents64(fd, buf, count): syscall 217 — rdi=fd, rsi=buf, rdx=count
       self.cg_movRaxImm(217);
@@ -13015,6 +13204,7 @@ pub type Codegen = class {
         // Adresse nahe null: uebersetzt ohne Warnung, dann Segfault.
         // Jetzt entscheidet die Merkung "als struct deklariert".
         var sdoStruct: int64 := 0;
+        var sdoBytes:  int64 := 0;
         if (typeNode >= 0 && self.cg_nkind(typeNode) == 60) {
           var sdoIdx: int64 := self.cg_findClass(self.cg_nsval(typeNode), self.cg_nslen(typeNode));
           if (sdoIdx >= 0) {
@@ -13022,20 +13212,18 @@ pub type Codegen = class {
             var sdoVmt: int64 := peek64(sdoBase + CG_CLASS_OFF_VMTOFF);
             if (sdoVmt == -1) { sdoStruct := 1; }
             if (peek64(sdoBase + CG_CLASS_OFF_ISSTRUCT) != 0) { sdoStruct := 1; }
+            if (sdoStruct != 0) { sdoBytes := self.cg_classStructSize(sdoIdx); }
           }
         }
         if (sdoStruct != 0) {
-          // alloc(4096) → rax = struct ptr
-          self.cg_movRaxImm(0);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7); // mov rdi,rax
-          self.cg_movRaxImm(4096); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6); // mov rsi,rax
-          self.cg_movRaxImm(3);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2); // mov rdx,rax
-          self.cg_movRaxImm(34);
-          self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov r10, rax
-          self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor r8, r8
-          self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);  // dec r8 → r8=-1
-          self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
-          self.cg_movRaxImm(9);
-          self.cg_e8(0x0F); self.cg_e8(0x05);
+          // #1580: Hier stand ein mmap ueber 4096 Byte JE DEKLARATION — fuer
+          // ein Struct aus zwei Zahlen eine ganze Seite, und in einer Schleife
+          // eine Seite JE DURCHLAUF. Zusammen mit der Kopie bei der Rueckgabe
+          // waren das die zwei Belegungen aus dem Bericht: 1,6 GB bei 200 000
+          // Durchlaeufen. Jetzt kommt der Platz aus demselben Bump-Bereich wie
+          // die Kopien, und zwar in der WIRKLICHEN Groesse des Structs.
+          if (sdoBytes <= 0) { sdoBytes := 64; }
+          self.cg_emitStructArenaAlloc((sdoBytes + 7) / 8 * 8);
         } else {
           self.cg_zeroRax();
         }
@@ -17480,6 +17668,16 @@ pub type Codegen = class {
                 var dataOff: int64 := self.cg_addStr(self.cg_nsoff(initNode), self.cg_nslen(initNode));
                 self.cg_addConStr(self.cg_nsval(cur), self.cg_nslen(cur), dataOff);
               }
+            } else if (self.cg_nkind(initNode) == CGN_IDENT
+                       && self.cg_isDeclaredFunc(self.cg_nsval(initNode), self.cg_nslen(initNode)) != 0) {
+              // #1589: `con f: fn(int64): int64 := Dbl;`. Der Wert ist eine
+              // CODEADRESSE — cg_evalConExpr haette hier 0 eingetragen, und der
+              // Aufruf `f(21)` endete in "undefined function 'f'". Gemerkt
+              // wird das Paar; die Marke bekommt f, sobald Dbl emittiert ist.
+              if (runde == 0) {
+                self.cg_addConFn(self.cg_nsval(cur), self.cg_nslen(cur),
+                                 self.cg_nsval(initNode), self.cg_nslen(initNode));
+              }
             } else {
               self.cg_addCon(self.cg_nsval(cur), self.cg_nslen(cur), self.cg_evalConExpr(initNode));
               // #1499: Gleitkomma merken — entweder steht es am Typ
@@ -17858,6 +18056,37 @@ pub type Codegen = class {
               poke64(self.data + doff + 8,  gInit);
               poke64(self.data + doff + 16, gInit);
             }
+          } else if (ik == CGN_CLOSURE) {
+            // #1589: anonyme Funktion als globaler Startwert. Faengt sie nichts
+            // ein, ist ihr Wert seit #1249 die blanke Codeadresse — also
+            // genauso konstant wie der Verweis auf eine benannte Funktion, der
+            // laengst geht. Die Meldung "Startwert ist zur Uebersetzungszeit
+            // nicht bekannt" traf hier sachlich nicht zu.
+            //
+            // Der Rumpf wird hier in den Codestrom gelegt (mit Sprung
+            // darueber, wie ueberall bei Lambdas); die Adresse traegt danach
+            // dieselbe Patch-Art wie ein benannter Funktionsverweis.
+            var glClos: int64 := self.closureCapturedCount;
+            self.cg_scanClosureCaptures(self.cg_nc2(initNode), self.cg_nc0(initNode));
+            var glCap: int64 := self.closureCapturedCount;
+            self.closureCapturedCount := glClos;
+            if (glCap != 0) {
+              EPrintStr("codegen error: globale Variable '"c);
+              sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+              EPrintStrLn("': die anonyme Funktion faengt Werte ein"c);
+              EPrintStrLn("  Ein einfangendes Lambda lebt auf dem Heap; global gibt es dafuer keinen Ort."c);
+              exit(1);
+            }
+            self.lastAnonName := 0;
+            self.cg_genExpr(initNode);        // legt den Rumpf ab, Adresse in rax (hier tot)
+            if (self.lastAnonName == 0) {
+              EPrintStr("codegen error: globale Variable '"c);
+              sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+              EPrintStrLn("': anonyme Funktion konnte nicht abgelegt werden"c);
+              exit(1);
+            }
+            self.cg_addPatch(doff, self.lastAnonName, self.lastAnonNameLen, CG_PATCH_DATA_FN);
+            poke8(self.globalIsFnPtr + gIdx, 1);
           } else if (ik == CGN_IDENT && self.cg_isDeclaredFunc(self.cg_nsval(initNode), self.cg_nslen(initNode)) != 0) {
             // #1574: `var gFn: fn(f64): f64 = Triple;` — der Startwert IST
             // uebersetzungszeitkonstant, nur eben eine Codeadresse. Bis 1.1.0A
@@ -18164,6 +18393,12 @@ pub type Codegen = class {
     self.globalIsPchar  := alloc(self.globalVarCap);
     self.globalIsFnPtr  := alloc(self.globalVarCap);          // #1574
     self.globalFnPtrF64 := alloc(self.globalVarCap);          // #1574
+    self.conFnCap    := 16;                                   // #1589
+    self.conFnTab    := alloc(self.conFnCap * 32);
+    self.conFnCount  := 0;
+    self.lastAnonName    := 0;
+    self.lastAnonNameLen := 0;
+    self.structArenaOff  := 0 - 1;
     self.globalTypeNames := alloc(self.globalVarCap * 16);
     self.globalIsArray  := alloc(self.globalVarCap);          // #1256
     self.globalArraySize := alloc(self.globalVarCap * 8);     // #1256
@@ -19182,6 +19417,7 @@ pub type Codegen = class {
       self.cg_e8(0x00);  // zero-padding in dead code region
       pi += 1;
     }
+    self.cg_bindConFns();   // #1589: con-Namen an ihre Funktionsmarke haengen
     self.cg_patchAll();
     // BUG-02: Free all temporary mmap buffers after patching is complete
     self.cg_freeAllTempBufs();
