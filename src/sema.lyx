@@ -989,7 +989,7 @@ pub type Sema = class {
         var pt: int64 := self.ResolveType(typeNi);
         if (pt == TY_INT64 || pt == TY_INT32 || pt == TY_INT16 || pt == TY_INT8 ||
             pt == TY_UINT64 || pt == TY_UINT32 || pt == TY_UINT16 || pt == TY_UINT8 ||
-            pt == TY_BOOL || pt == TY_F64 || pt == TY_PCHAR || pt == TY_VOID) {
+            pt == TY_BOOL || pt == TY_FLOAT64 || pt == TY_PCHAR || pt == TY_VOID) {
           self._errorNodeName("unknown field", ni, fName, fLen);
           return;
         }
@@ -2535,6 +2535,50 @@ pub type Sema = class {
     return -1;
   }
 
+  // #1624: Die Klasse, die eine Methode WIRKLICH definiert — die eigene oder
+  // eine ihrer Basisklassen. Gewoehnliche Methoden wurden laengst geerbt;
+  // `Create` und `Destroy` wurden nur an der Klasse selbst gesucht, und wo
+  // nichts stand, geschah nichts. Eine Ableitung ohne eigenen Konstruktor kam
+  // deshalb mit lauter Nullen zur Welt, und `dispose` lief am Destruktor der
+  // Basis vorbei — beides ohne ein Wort.
+  //
+  // Liefert den Deklarationsknoten der definierenden Klasse oder -1.
+  fn _methodOwnerNi(declNi: int64, nm: pchar, nmLen: int64): int64 {
+    var cur: int64 := declNi;
+    var tiefe: int64 := 0;
+    while (cur >= 0 && tiefe < 32) {
+      var m: int64 := self.sn_c1(cur);
+      while (m >= 0) {
+        if (self.sn_kind(m) == SNK_FUNC_DECL &&
+            self._strNEq(self.sn_sVal(m), self.sn_sLen(m), nm, nmLen) != 0) {
+          return cur;
+        }
+        m := self.sn_next(m);
+      }
+      var pNi: int64 := self.sn_c2(cur);
+      if (pNi < 0) { cur := -1; }
+      else {
+        var pSym: int64 := self.Lookup(self.sn_sVal(pNi), self.sn_sLen(pNi));
+        if (pSym < 0) { cur := -1; } else { cur := self.SymNodeIdx(pSym); }
+      }
+      tiefe := tiefe + 1;
+    }
+    return -1;
+  }
+
+  // Der Deklarationsknoten der Methode selbst, oder -1.
+  fn _methodDeclNi(declNi: int64, nm: pchar, nmLen: int64): int64 {
+    var owner: int64 := self._methodOwnerNi(declNi, nm, nmLen);
+    if (owner < 0) { return -1; }
+    var m: int64 := self.sn_c1(owner);
+    while (m >= 0) {
+      if (self.sn_kind(m) == SNK_FUNC_DECL &&
+          self._strNEq(self.sn_sVal(m), self.sn_sLen(m), nm, nmLen) != 0) { return m; }
+      m := self.sn_next(m);
+    }
+    return -1;
+  }
+
   // 1 = Feld existiert oder ist nicht entscheidbar, 0 = existiert nachweislich nicht.
   fn _fldHat(idx: int64, f: pchar, fLen: int64): int64 {
     var b: int64 := self.fldTab + idx * 32;
@@ -3377,7 +3421,7 @@ pub type Sema = class {
     } else if (k == SNK_DIM_DECL) {
       self._pushSym(name, nlen, SYM_TYPE, TY_USER, ni);
     } else if (k == SNK_UTYPE_DECL) {
-      self._pushSym(name, nlen, SYM_TYPE, TY_F64, ni);
+      self._pushSym(name, nlen, SYM_TYPE, TY_FLOAT64, ni);   // #1622
       self._utRecordDim(name, nlen, ni);   // #1295
     } else if (k == SNK_AT_IF) {
       self._pruneAtIf(ni);
@@ -3431,6 +3475,33 @@ pub type Sema = class {
 
     } else if (k == SNK_CALL) {
       var isMethod: int64 := self.sn_iVal(ni);
+      // #1622/#1091: `super.M(args)` traegt die Marke 3 und KEINEN
+      // Empfaengerknoten — der Codegen laedt dort das `self` der laufenden
+      // Methode. Ohne diesen Zweig fiele der Aufruf in den Zweig fuer freie
+      // Funktionen und `super.Foo()` waere "undefined function 'Foo'".
+      // Vorher fiel das nicht auf, weil Methodenruempfe nie geprueft wurden.
+      if (isMethod == 3) {
+        var spArg: int64 := self.sn_c1(ni);
+        while (spArg >= 0) { self._checkExpr(spArg); spArg := self.sn_next(spArg); }
+        // Die Methode muss es in der Basiskette WIRKLICH geben; sonst ruft
+        // `super` ins Leere und der Codegen erzeugt einen Sprung auf ein Label,
+        // das niemand definiert.
+        if (self.curClassNi >= 0) {
+          var spPar: int64 := self.sn_c2(self.curClassNi);
+          if (spPar >= 0) {
+            var spSym: int64 := self.Lookup(self.sn_sVal(spPar), self.sn_sLen(spPar));
+            if (spSym >= 0) {
+              var spNi: int64 := self.SymNodeIdx(spSym);
+              if (spNi >= 0 &&
+                  self._methodOwnerNi(spNi, self.sn_sVal(ni), self.sn_sLen(ni)) < 0) {
+                self._errorNodeName("super: die Basisklasse hat diese Methode nicht",
+                                    ni, self.sn_sVal(ni), self.sn_sLen(ni));
+              }
+            }
+          }
+        }
+        return;
+      }
       if (isMethod == 1) {
         // Method call: obj.method(args) — check object, then args
         // BUG-6: Der Empfänger muss eine Instanz sein, kein Typname. `Pair.Method()`
@@ -3736,7 +3807,9 @@ pub type Sema = class {
       if (newSym >= 0) {
         var cNi: int64 := self.SymNodeIdx(newSym);
         if (cNi >= 0) {
-          var cm: int64 := self.sn_c1(cNi);
+          // #1624: der Konstruktor darf aus einer Basisklasse stammen; dann
+          // gilt DEREN Signatur fuer die Zaehlung.
+          var cm: int64 := self._methodDeclNi(cNi, "Create"c, 6);
           while (cm >= 0) {
             if (self.sn_kind(cm) == SNK_FUNC_DECL &&
                 self._strNEq(self.sn_sVal(cm), self.sn_sLen(cm), "Create"c, 6) != 0) {
@@ -4213,17 +4286,12 @@ pub type Sema = class {
       // Rueckgabetyp, und ein Destruktor hat typischerweise keinen. Hier liegt
       // die Methodenliste der Klasse vor, also wird die Antwort hier bestimmt
       // und im iVal des Knotens hinterlegt (1 = Destroy vorhanden).
+      // #1624: auch der geerbte Destruktor zaehlt — sonst laeuft `dispose` an
+      // ihm vorbei, sobald die Ableitung keinen eigenen mitbringt.
       var dTypeName: int64 := self._exprClassDeclNi(self.sn_c0(ni));
       if (dTypeName >= 0) {
-        var dm: int64 := self.sn_c1(dTypeName);
-        while (dm >= 0) {
-          if (self.sn_kind(dm) == SNK_FUNC_DECL &&
-              self._strNEq(self.sn_sVal(dm), self.sn_sLen(dm), "Destroy"c, 7) != 0) {
-            poke64(self.sn_off(ni) + NODE_OFF_IVAL, 1);
-            dm := 0 - 1;
-          } else {
-            dm := self.sn_next(dm);
-          }
+        if (self._methodOwnerNi(dTypeName, "Destroy"c, 7) >= 0) {
+          poke64(self.sn_off(ni) + NODE_OFF_IVAL, 1);
         }
       }
 
@@ -4481,7 +4549,7 @@ pub type Sema = class {
 
   // WP-L2: Validiert @capabilities([...]) oder @uses_caller_cap([...]) AST-Knoten.
   fn _checkCapabilityAttr(ni: int64): void {
-    var capReg: CapabilityRegistry;
+    var capReg: CapabilityRegistry := new CapabilityRegistry();   // #1622
     capReg.Init();
 
     if self.sn_iVal(ni) == 1 { return; }
@@ -4607,7 +4675,7 @@ pub type Sema = class {
   // WP-L3: Füllt ein CapSet aus einer NK_CAPABILITY_DECL-Kette.
   // declHead: erster NK_CAPABILITY_DECL-Knoten.
   fn _fillCapSet(declHead: int64, set: CapSet): void {
-    var reg: CapabilityRegistry;
+    var reg: CapabilityRegistry := new CapabilityRegistry();   // #1622
     reg.Init();
     var cur: int64 := declHead;
     while cur >= 0 {
@@ -4682,7 +4750,7 @@ pub type Sema = class {
     self._collectParentCaps(head);
 
     // Phase 2: jeden NK_IMPORT-Knoten validieren
-    var resolver: CapabilityResolver;
+    var resolver: CapabilityResolver := new CapabilityResolver();   // #1622
     resolver.Init();
     var effectiveCaps: CapSet := new CapSet();
     effectiveCaps.Init();
@@ -4716,7 +4784,7 @@ pub type Sema = class {
           var escId: int64 := resolver.ComputeGrant(self.currModuleCaps, grantSet, effectiveCaps);
           if escId >= 0 {
             // Eskalationsversuch (Kriterium 3)
-            var reg2: CapabilityRegistry;
+            var reg2: CapabilityRegistry := new CapabilityRegistry();   // #1622
             reg2.Init();
             // Fehlermeldung mit Capability-ID
             self._errorNode("grant enthält Capability die nicht in Parent-Capabilities ist"c, grantNi);
@@ -4842,7 +4910,7 @@ pub type Sema = class {
     var hasFormatCap: bool := false;
     var capAttrNi: int64 := self.sn_c2(ni);
     if capAttrNi >= 0 && self.sn_kind(capAttrNi) == SNK_CAPABILITY_ATTR {
-      var capReg: CapabilityRegistry;
+      var capReg: CapabilityRegistry := new CapabilityRegistry();   // #1622
       capReg.Init();
       var decl: int64 := self.sn_c0(capAttrNi);
       while decl >= 0 {
@@ -5108,7 +5176,11 @@ pub type Sema = class {
     // WP-L5: extern fn-Validierung (iVal & 1 = extern)
     // SEC-BUG-02: auch extern fn OHNE link-String prüfen (c3 == -1).
     // Stdlib-interne Builtins (fork, waitpid, getpid …) sind explizit ausgenommen.
-    if (self.sn_iVal(ni) & 1) != 0 {
+    // #1622: Bit 0 des iVal heisst NUR bei einer freien Funktion "extern"; an
+    // einer Methode bedeutet es `pub`. Seit die Methodenrümpfe geprueft werden,
+    // liefe die FFI-Sandbox sonst ueber jede oeffentliche Methode und meldete
+    // sie als unbekanntes FFI-Symbol. Eine Methode kann nicht extern sein.
+    if (self.sn_iVal(ni) & 1) != 0 && self.curClassNi < 0 {
       if self.sn_c3(ni) != -1 {
         // Hat link-String → volle FFI-Prüfung inkl. link-Target
         self._checkExternFn(ni);
@@ -5658,7 +5730,7 @@ pub type Sema = class {
   // Geborgene UCC-Caps gelten innerhalb der Funktion als vorhanden (für transitive Propagation).
   fn _fillCurFuncCaps(capAttrNi: int64, uccNi: int64): void {
     self.curFuncCapCount := 0;
-    var reg: CapabilityRegistry;
+    var reg: CapabilityRegistry := new CapabilityRegistry();   // #1622
     reg.Init();
     if capAttrNi >= 0 {
       var capDecl: int64 := self.sn_c0(capAttrNi);
@@ -5687,7 +5759,7 @@ pub type Sema = class {
   // WP-L8: Füllt curFuncCapBuf für Klassenmethoden: union(classCapNi, methodCapNi, uccNi).
   fn _fillMethodCaps(classCapNi: int64, methodCapNi: int64, uccNi: int64): void {
     self.curFuncCapCount := 0;
-    var reg: CapabilityRegistry;
+    var reg: CapabilityRegistry := new CapabilityRegistry();   // #1622
     reg.Init();
     // Class-level caps first
     if classCapNi >= 0 {
@@ -5742,7 +5814,7 @@ pub type Sema = class {
     var off: int64 := self.uccBuf + self.uccCount * 88;
     poke64(off,     self.sn_sVal(funcNi) as int64);
     poke64(off + 8, self.sn_sLen(funcNi));
-    var reg: CapabilityRegistry;
+    var reg: CapabilityRegistry := new CapabilityRegistry();   // #1622
     reg.Init();
     var capDecl: int64  := self.sn_c0(uccNi);
     var capCount: int64 := 0;
@@ -6302,7 +6374,16 @@ pub type Sema = class {
         if smk == SNK_CAPABILITY_ATTR || smk == SNK_USES_CALLER_CAP { anyMthAnnotation := 1; }
         scanMth := self.sn_next(scanMth);
       }
-      if self.classCapNode >= 0 || anyMthAnnotation > 0 {
+      // #1622: Der Rumpf einer Methode wurde nur dann geprueft, wenn die
+      // Klasse oder eine ihrer Methoden eine Capability-Annotation trug —
+      // sonst lief die Schleife gar nicht erst. Ein Tippfehler im Rumpf war
+      // damit keine Fehlermeldung, sondern eine Null zur Laufzeit: `return
+      // wert;` bei einem Parameter namens `Wert` uebersetzte klaglos. In einer
+      // freien Funktion wird derselbe Fehler seit jeher abgewiesen.
+      //
+      // Die Annotation entscheidet jetzt nur noch darueber, WELCHE
+      // Capabilities gelten; geprueft wird immer.
+      if (1 == 1) {
         var mthCap: int64 := self.sn_c1(ni);
         var pendMthCap: int64 := 0 - 1;
         var pendMthUcc: int64 := 0 - 1;
