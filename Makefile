@@ -230,6 +230,7 @@ test: lyxc
 	@bash tests/codegen_ausdruecke_test.sh
 	@bash tests/stdlib_mathe_test.sh
 	@bash tests/ir_builtins_test.sh
+	@bash tests/compile_unit_codegen_test.sh
 	@bash tests/skalierung_z2b_test.sh
 	@bash tests/lfd_grammatik_test.sh
 	@bash tests/lfd_parser_test.sh
