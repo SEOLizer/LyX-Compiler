@@ -1985,6 +1985,13 @@ pub type Codegen = class {
     // cg_faltIntConst und cg_tryFold kannten CGN_LIT_BOOL laengst.
     if (k == CGN_LIT_BOOL)  { return 1; }
     if (k == CGN_LIT_CHAR)  { return 1; }
+    // #1619: `null` ist die 0 und steht damit fest. cg_evalConExpr kennt den
+    // Fall laengst; hier fehlte er, und deshalb war `var g: T := null;` als
+    // globaler Startwert nicht uebersetzbar. Zusammen mit #1519 (blosse
+    // Deklaration wird abgewiesen) und dem abgewiesenen `:= 0` gab es damit
+    // GAR KEINEN Weg, eine globale Klassenvariable in einen definierten
+    // Nullzustand zu bringen — das Lazy-Init-Muster war unschreibbar.
+    if (k == CGN_LIT_NULL)  { return 1; }
     if (k == CGN_IDENT) {
       return self.cg_hasConVal(self.cg_nsval(node), self.cg_nslen(node));
     }
@@ -3626,16 +3633,32 @@ pub type Codegen = class {
     }
     var clsIdx: int64 := self.cg_exprClassName(self.cg_nc0(ni));
     if (clsIdx < 0) { return 0 - 1; }
-    var cbase: int64 := self.classLayouts + clsIdx * CG_CLASS_SZ;
-    var cnp: pchar := peek64(cbase) as pchar;
-    var cnl: int64 := peek64(cbase + CG_PATCH_OFF_NAMEPTR);
-    if (cnp == 0 as pchar || cnl <= 0) { return 0 - 1; }
+    // #1621: Die Registry fuehrt die Methode unter dem Namen der Klasse, die
+    // sie DEKLARIERT. Erbt eine Ableitung sie, ohne sie zu ueberschreiben,
+    // stand unter ihrem eigenen Namen nichts — und der Rueckgabetyp galt als
+    // unbekannt, also int64. PrintLn gab bei pchar die Adresse aus. Deshalb
+    // die Kette hoch, bis eine Klasse die Methode kennt.
     var lcell: int64 := alloc(8);
-    var mbuf: int64 := self.cg_mangleInto(cnp, cnl, fp, fl, lcell);
-    var mlen: int64 := peek64(lcell);
+    var r: int64 := 0 - 1;
+    var cur: int64 := clsIdx;
+    var tiefe: int64 := 0;
+    while (cur >= 0 && tiefe < 32) {
+      var cbase: int64 := self.classLayouts + cur * CG_CLASS_SZ;
+      var cnp: pchar := peek64(cbase) as pchar;
+      var cnl: int64 := peek64(cbase + CG_PATCH_OFF_NAMEPTR);
+      if (cnp != 0 as pchar && cnl > 0) {
+        var mbuf: int64 := self.cg_mangleInto(cnp, cnl, fp, fl, lcell);
+        var mlen: int64 := peek64(lcell);
+        var rr: int64 := self.cg_funcRetTypeIs(mbuf as pchar, mlen, tname, tlen);
+        self.cg_trackTempBuf(mbuf, mlen + 1);
+        if (rr >= 0) { r := rr; cur := 0 - 1; }
+      }
+      if (cur >= 0) {
+        cur := peek64(self.classLayouts + cur * CG_CLASS_SZ + CG_CLASS_OFF_PARENTIDX);
+        tiefe := tiefe + 1;
+      }
+    }
     free(lcell, 8);
-    var r: int64 := self.cg_funcRetTypeIs(mbuf as pchar, mlen, tname, tlen);
-    self.cg_trackTempBuf(mbuf, mlen + 1);
     return r;
   }
 
@@ -4335,12 +4358,21 @@ pub type Codegen = class {
       if (self.cg_nival(ni) == 1) {
         var recvCi: int64 := self.cg_exprClassName(self.cg_nc0(ni));
         if (recvCi < 0) { return 0 - 1; }
+        // #1621: auch hier die Vererbungskette hoch — die Registry kennt die
+        // Methode unter der Klasse, die sie deklariert.
         var lc: int64 := alloc(8);
-        var mb: int64 := self.cg_buildMethodMangled(recvCi, self.cg_nsval(ni), self.cg_nslen(ni), lc);
-        var mbLen: int64 := peek64(lc);
+        var res: int64 := 0 - 1;
+        var rc: int64 := recvCi;
+        var rt: int64 := 0;
+        while (rc >= 0 && rt < 32 && res < 0) {
+          var mb: int64 := self.cg_buildMethodMangled(rc, self.cg_nsval(ni), self.cg_nslen(ni), lc);
+          var mbLen: int64 := peek64(lc);
+          res := self.cg_funcRetClassIdx(mb as pchar, mbLen);
+          self.cg_trackTempBuf(mb, mbLen + 1);
+          rc := peek64(self.classLayouts + rc * CG_CLASS_SZ + CG_CLASS_OFF_PARENTIDX);
+          rt := rt + 1;
+        }
         free(lc, 8);
-        var res: int64 := self.cg_funcRetClassIdx(mb as pchar, mbLen);
-        self.cg_trackTempBuf(mb, mbLen + 1);
         return res;
       }
     }
@@ -4369,6 +4401,29 @@ pub type Codegen = class {
     var cln: pchar := peek64(cbase) as pchar;
     var clnLen: int64 := peek64(cbase + CG_CLASS_OFF_NAMELEN);
     return self.cg_mangleInto(cln, clnLen, mname, mlen, lenCell);
+  }
+
+  // #1624: Der gemangelte Name der Methode, die fuer diese Klasse WIRKLICH
+  // gilt — die eigene oder die der naechsten Basisklasse, die sie definiert.
+  // `Create` und `Destroy` wurden nur unter dem eigenen Klassennamen gesucht;
+  // fehlte das Label, unterblieb der Aufruf stillschweigend. Genau das machte
+  // eine Ableitung ohne eigenen Konstruktor zu einem Objekt aus lauter Nullen.
+  //
+  // Liefert den Puffer (Aufrufer gibt ihn frei bzw. haengt ihn an einen Patch)
+  // und die Laenge in lenCell, oder 0, wenn keine Klasse der Kette sie hat.
+  fn cg_findInheritedMangled(ci: int64, mname: pchar, mlen: int64, lenCell: int64): int64 {
+    var cur: int64 := ci;
+    var tiefe: int64 := 0;
+    while (cur >= 0 && tiefe < 32) {
+      var buf: int64 := self.cg_buildMethodMangled(cur, mname, mlen, lenCell);
+      var bl: int64 := peek64(lenCell);
+      if (self.cg_findLabel(buf as pchar, bl) >= 0) { return buf; }
+      free(buf, bl + 1);
+      cur := peek64(self.classLayouts + cur * CG_CLASS_SZ + CG_CLASS_OFF_PARENTIDX);
+      tiefe := tiefe + 1;
+    }
+    poke64(lenCell, 0);
+    return 0;
   }
 
   // Emit a direct 1-arg method call `recv.Method(arg)`: receiver→rdi (self),
@@ -7493,6 +7548,9 @@ pub type Codegen = class {
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == CGN_FN_PTR_NODE) {
         poke8(self.localIsFnPtr + self.localCount - 1, 1);
         // #1565: Rueckgabetyp mitfuehren — sonst gilt `f(x)` als Ganzzahl.
+        // #1622: hier stand `ptypeNode` — den Namen gibt es nicht. Der
+        // Rumpf einer Methode wurde nie geprueft, der Bezeichner wurde still
+        // zu 0, und diese der vier Stellen aus #1565 war damit tot.
         if (self.cg_fnPtrRetIstF64(ptypeNode) != 0) {
           poke8(self.localFnPtrF64 + self.localCount - 1, 1);
         }
@@ -8112,17 +8170,13 @@ pub type Codegen = class {
         self.cg_addVmtPatch(vmtPatchPos, tname, tlen);
       }
       // #683: Call ClassName_Create(self, args...) if defined
-      var ctorCreate: pchar := "Create";
-      var ctorCreateLen: int64 := 6;
-      var ctorMangLen: int64 := tlen + 1 + ctorCreateLen;
-      var ctorMangBuf: int64 := alloc(ctorMangLen + 1);
-      var ctorCI: int64 := 0;
-      while (ctorCI < tlen) { poke8(ctorMangBuf + ctorCI, StrCharAt(tname, ctorCI)); ctorCI := ctorCI + 1; }
-      StrSetChar(ctorMangBuf as pchar, tlen, 95);
-      var ctorCJ: int64 := 0;
-      while (ctorCJ < ctorCreateLen) { poke8(ctorMangBuf + tlen + 1 + ctorCJ, StrCharAt(ctorCreate, ctorCJ)); ctorCJ := ctorCJ + 1; }
-      poke8(ctorMangBuf + ctorMangLen, 0);
-      if (self.cg_findLabel(ctorMangBuf as pchar, ctorMangLen) >= 0) {
+      // #1624: der Konstruktor darf aus einer Basisklasse stammen.
+      var ctorLC: int64 := alloc(8);
+      var ctorMangBuf: int64 := 0;
+      if (ciNew >= 0) { ctorMangBuf := self.cg_findInheritedMangled(ciNew, "Create"c, 6, ctorLC); }
+      var ctorMangLen: int64 := peek64(ctorLC);
+      free(ctorLC, 8);
+      if (ctorMangBuf != 0) {
         self.cg_pushRax();                 // save obj ptr
         self.cg_pushRax();                 // push self (first arg)
         var ctorArg: int64 := self.cg_nc0(ni);
@@ -8143,8 +8197,6 @@ pub type Codegen = class {
         self.cg_addPatch(ctorPP, ctorMangBuf, ctorMangLen, CG_PATCH_CALL);
         self.cg_trackTempBuf(ctorMangBuf, ctorMangLen + 1);
         self.cg_popRax();                  // restore obj ptr
-      } else {
-        free(ctorMangBuf, ctorMangLen + 1);
       }
 
     } else if (k == CGN_FIELD) {
@@ -13665,18 +13717,18 @@ pub type Codegen = class {
       var dispCi: int64 := 0 - 1;
       if (self.cg_nival(ni) == 1) { dispCi := self.cg_exprClassName(self.cg_nc0(ni)); }
       if (dispCi >= 0) {
+        // #1624: auch hier darf der Destruktor aus einer Basisklasse stammen.
         var dlc: int64 := alloc(8);
-        var dmb: int64 := self.cg_buildMethodMangled(dispCi, "Destroy"c, 7, dlc);
+        var dmb: int64 := self.cg_findInheritedMangled(dispCi, "Destroy"c, 7, dlc);
         var dmbLen: int64 := peek64(dlc);
         free(dlc, 8);
-        if (1 == 1) {
+        if (dmb != 0) {
           self.cg_genExpr(self.cg_nc0(ni));   // Empfaenger → rax
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);  // mov rdi, rax
           var dpp: int64 := self.cg_emitCall();
           self.cg_addPatch(dpp, dmb, dmbLen, CG_PATCH_CALL);
           self.cg_trackTempBuf(dmb, dmbLen + 1);
         } else {
-          self.cg_trackTempBuf(dmb, dmbLen + 1);
           self.cg_genExpr(self.cg_nc0(ni));
         }
       } else {
@@ -13984,6 +14036,9 @@ pub type Codegen = class {
         poke8(self.localIsFnPtr + self.localCount - 1, 1);
         // #1565: auch hier den Rueckgabetyp mitfuehren — dies ist die Stelle
         // fuer Parameter der obersten Ebene (`fn Apply(f: fn(f64): f64, …)`).
+        // #1622: hier stand `ptypeNode` — den Namen gibt es nicht. Der
+        // Rumpf einer Methode wurde nie geprueft, der Bezeichner wurde still
+        // zu 0, und diese der vier Stellen aus #1565 war damit tot.
         if (self.cg_fnPtrRetIstF64(ptypeNode) != 0) {
           poke8(self.localFnPtrF64 + self.localCount - 1, 1);
         }
@@ -14327,7 +14382,10 @@ pub type Codegen = class {
         // Stellen (Methode, verschachtelte fn, Closure, freie Funktion) — die
         // Auskunft muss an jeder davon entstehen, sonst gilt `f(x)` je nach
         // Aufrufort mal als f64 und mal als Ganzzahl.
-        if (self.cg_fnPtrRetIstF64(ptypeNode) != 0) {
+        // #1622: hier stand `ptypeNode` — den Namen gibt es nicht. Der
+        // Rumpf einer Methode wurde nie geprueft, der Bezeichner wurde still
+        // zu 0, und diese der vier Stellen aus #1565 war damit tot.
+        if (self.cg_fnPtrRetIstF64(nfpType) != 0) {
           poke8(self.localFnPtrF64 + self.localCount - 1, 1);
         }
       }
@@ -15988,6 +16046,9 @@ pub type Codegen = class {
         // Stellen (Methode, verschachtelte fn, Closure, freie Funktion) — die
         // Auskunft muss an jeder davon entstehen, sonst gilt `f(x)` je nach
         // Aufrufort mal als f64 und mal als Ganzzahl.
+        // #1622: hier stand `ptypeNode` — den Namen gibt es nicht. Der
+        // Rumpf einer Methode wurde nie geprueft, der Bezeichner wurde still
+        // zu 0, und diese der vier Stellen aus #1565 war damit tot.
         if (self.cg_fnPtrRetIstF64(ptypeNode) != 0) {
           poke8(self.localFnPtrF64 + self.localCount - 1, 1);
         }
@@ -17528,7 +17589,7 @@ pub type Codegen = class {
       PrintStr(path);
       PrintStr("\n");
       free(pathBuf, nameLen + 8);
-      free(src, srcSize);
+      free(src as int64, srcSize);   // #1622
       dispose p;
       self.cgAlias := cgaSaved; self.cgAliasLen := cgaSavedLen;   // #1262
       return;
@@ -17974,7 +18035,22 @@ pub type Codegen = class {
           poke64(self.globalArraySize + gIdx * 8, gN);
           aggKind := 2; aggElems := gN;
         } else if (gtNode >= 0 && self.cg_nkind(gtNode) == 60) {
-          var gsci: int64 := self.cg_ensureStructLayout(self.cg_nsval(gtNode), self.cg_nslen(gtNode));
+          // #1619: `var g: T := null;` ist eine REFERENZ, die bei 0 beginnt —
+          // kein Objekt. Bisher bekam jede Globale mit Klassen- oder
+          // Struct-Layout hier eigenen Speicher, und der Slot wurde auf dessen
+          // Adresse gepatcht; die 0 aus dem Startwert wurde davon ueberschrieben.
+          // `g == 0` war deshalb immer falsch, und weil #1519 die blosse
+          // Deklaration abweist und `:= 0` am Typ scheitert, gab es GAR KEINEN
+          // Weg zu einer nullwertigen globalen Klassenvariablen: das
+          // Lazy-Init-Muster war unschreibbar.
+          //
+          // Ohne Startwert bleibt es beim eigenen Speicher — dort ist die
+          // Globale ein Wert, und daran haengt der Bestand.
+          var gInitNi: int64 := self.cg_nc1(cur);
+          var gIstNull: int64 := 0;
+          if (gInitNi >= 0 && self.cg_nkind(gInitNi) == CGN_LIT_NULL) { gIstNull := 1; }
+          var gsci: int64 := 0 - 1;
+          if (gIstNull == 0) { gsci := self.cg_ensureStructLayout(self.cg_nsval(gtNode), self.cg_nslen(gtNode)); }
           if (gsci >= 0 && gRedundant == 0) {
             var gssz: int64 := self.cg_classStructSize(gsci);
             aggBlock := self.cg_reserveData(gssz);
