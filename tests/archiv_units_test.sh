@@ -51,7 +51,7 @@ fn main(): int64 {
   var t: int64 := TarWriterNew();
   var lang: pchar := "ein/sehr/tiefer/pfad/der/ueber/hundert/zeichen/lang/ist/damit/das/ustar/format/an/seine/grenze/kommt/datei.txt"c;
   PrintLn(StrConcat("Laenge:   ", IntToStr(StrLen(lang))));
-  PrintLn(StrConcat("Add rc:   ", IntToStr(TarWriterAdd(t, lang as int64, "x"c as int64, 1))));
+  PrintLn(StrConcat("Add rc:   ", IntToStr(TarWriterAdd(t, lang as pchar, "x"c as int64, 1))));
   PrintLn(StrConcat("Save rc:  ", IntToStr(TarWriterSave(t, "lang.tar"c))));
   TarWriterFree(t);
   var h: int64 := TarOpen("lang.tar"c);
@@ -88,7 +88,7 @@ fn main(): int64 {
   var i: int64 := 0;
   while (i < 130) { poke8(n + i, 120); i := i + 1; }
   poke8(n + 130, 0);
-  PrintStr(IntToStr(TarWriterAdd(t, n, "x"c as int64, 1))); PrintStr(" ");
+  PrintStr(IntToStr(TarWriterAdd(t, n as pchar, "x"c as int64, 1))); PrintStr(" ");
   PrintLn(IntToStr(TarCount(0)));
   return 0;
 }' "5 0"
@@ -100,7 +100,7 @@ import std.tar;
 import std.string;
 fn main(): int64 {
   var t: int64 := TarWriterNew();
-  TarWriterAdd(t, "kurz/datei.txt"c as int64, "abc"c as int64, 3);
+  TarWriterAdd(t, "kurz/datei.txt"c, "abc"c as int64, 3);
   TarWriterSave(t, "kurz.tar"c);
   TarWriterFree(t);
   var h: int64 := TarOpen("kurz.tar"c);
@@ -122,9 +122,9 @@ fn main(): int64 {
   while (i < 100) { poke8(a + i, 97); i := i + 1; }
   poke8(a + 50, 47);
   poke8(a + 100, 0);
-  PrintStr(IntToStr(TarWriterAdd(t, a, "x"c as int64, 1))); PrintStr(" ");
+  PrintStr(IntToStr(TarWriterAdd(t, a as pchar, "x"c as int64, 1))); PrintStr(" ");
   poke8(a + 100, 97); poke8(a + 101, 0);
-  PrintLn(IntToStr(TarWriterAdd(t, a, "x"c as int64, 1)));
+  PrintLn(IntToStr(TarWriterAdd(t, a as pchar, "x"c as int64, 1)));
   return 0;
 }' "0 0"
 
@@ -139,9 +139,9 @@ import std.iso;
 import std.string;
 fn main(): int64 {
   var w: int64 := IsoWriterNew();
-  PrintStr(IntToStr(IsoWriterAdd(w, "EinLangerName.txt"c as int64, "abc"c as int64, 3))); PrintStr(" ");
-  PrintStr(IntToStr(IsoWriterAdd(w, "unterordner/a.txt"c as int64, "def"c as int64, 3))); PrintStr(" ");
-  PrintLn(IntToStr(IsoWriterAdd(w, "OK.TXT"c as int64, "ghi"c as int64, 3)));
+  PrintStr(IntToStr(IsoWriterAdd(w, "EinLangerName.txt"c, "abc"c as int64, 3))); PrintStr(" ");
+  PrintStr(IntToStr(IsoWriterAdd(w, "unterordner/a.txt"c, "def"c as int64, 3))); PrintStr(" ");
+  PrintLn(IntToStr(IsoWriterAdd(w, "OK.TXT"c, "ghi"c as int64, 3)));
   return 0;
 }' "5 6 0"
 
@@ -151,7 +151,7 @@ import std.iso;
 import std.string;
 fn main(): int64 {
   var w: int64 := IsoWriterNew();
-  IsoWriterAdd(w, "DATEI.TXT"c as int64, "abc"c as int64, 3);
+  IsoWriterAdd(w, "DATEI.TXT"c, "abc"c as int64, 3);
   PrintStr(IntToStr(IsoWriterSave(w, "t.iso"c))); PrintStr(" ");
   IsoWriterFree(w);
   var h: int64 := IsoOpen("t.iso"c);
@@ -194,13 +194,13 @@ import std.zip;
 import std.string;
 fn main(): int64 {
   var w: int64 := ZipWriterNew();
-  ZipWriterAdd(w, "a.txt"c as int64, "hallo"c as int64, 5);
+  ZipWriterAdd(w, "a.txt"c, "hallo"c as int64, 5);
   PrintStr(IntToStr(ZipWriterSave(w, "a.zip"c))); PrintStr(" ");
   ZipWriterFree(w);
   var h: int64 := ZipOpen("a.zip"c);
   PrintStr(IntToStr(ZipCount(h))); PrintStr(" ");
   PrintStr(ZipName(h, 0) as pchar); PrintStr(" ");
-  PrintLn(IntToStr(ZipFind(h, "a.txt"c as int64)));
+  PrintLn(IntToStr(ZipFind(h, "a.txt"c)));
   ZipClose(h);
   return 0;
 }' "0 1 a.txt 0"
@@ -213,9 +213,9 @@ import std.tar;
 import std.iso;
 import std.rar;
 fn main(): int64 {
-  var z: int64 := ZipWriterNew(); ZipWriterAdd(z, "x"c as int64, "a"c as int64, 1);
-  var t: int64 := TarWriterNew(); TarWriterAdd(t, "x"c as int64, "a"c as int64, 1);
-  var i: int64 := IsoWriterNew(); IsoWriterAdd(i, "X.TXT"c as int64, "a"c as int64, 1);
+  var z: int64 := ZipWriterNew(); ZipWriterAdd(z, "x"c, "a"c as int64, 1);
+  var t: int64 := TarWriterNew(); TarWriterAdd(t, "x"c, "a"c as int64, 1);
+  var i: int64 := IsoWriterNew(); IsoWriterAdd(i, "X.TXT"c, "a"c as int64, 1);
   PrintStr(IntToStr(ZipWriterSave(z, "v.zip"c))); PrintStr(" ");
   PrintStr(IntToStr(TarWriterSave(t, "v.tar"c))); PrintStr(" ");
   PrintStr(IntToStr(IsoWriterSave(i, "v.iso"c))); PrintStr(" ");
@@ -229,7 +229,7 @@ fn main(): int64 {
 
 # Geprueft wird gegen unzip(1), also gegen ein fremdes Werkzeug, und gegen das
 # heutige Datum. Ein Festwert faellt damit auf, egal welcher.
-printf 'import std.io;\nimport std.zip;\nfn main(): int64 { var w: int64 := ZipWriterNew(); ZipWriterAdd(w, "n.txt"c as int64, "hallo"c as int64, 5); ZipWriterSave(w, "n.zip"c); return 0; }\n' > "$TMP/n.lyx"
+printf 'import std.io;\nimport std.zip;\nfn main(): int64 { var w: int64 := ZipWriterNew(); ZipWriterAdd(w, "n.txt"c, "hallo"c as int64, 5); ZipWriterSave(w, "n.zip"c); return 0; }\n' > "$TMP/n.lyx"
 if "$LYXC" --std-path="$ROOT" "$TMP/n.lyx" -o "$TMP/n" >/dev/null 2>&1 && (cd "$TMP" && ./n); then
   datum="$(cd "$TMP" && unzip -l n.zip 2>/dev/null | awk '/n\.txt/{print $2}')"
   heute="$(date -u +%Y-%m-%d)"
@@ -241,7 +241,7 @@ fi
 
 # Der Festwert bleibt erreichbar — reproduzierbare Archive muessen moeglich
 # bleiben, sonst waere der Fix ein neuer Mangel.
-printf 'import std.io;\nimport std.zip;\nfn main(): int64 { var w: int64 := ZipWriterNew(); ZipWriterAddAt(w, "f.txt"c as int64, "hallo"c as int64, 5, ZIP_TIME_2017); ZipWriterSaveStore(w, "f.zip"c); return 0; }\n' > "$TMP/f.lyx"
+printf 'import std.io;\nimport std.zip;\nfn main(): int64 { var w: int64 := ZipWriterNew(); ZipWriterAddAt(w, "f.txt"c, "hallo"c as int64, 5, ZIP_TIME_2017); ZipWriterSaveStore(w, "f.zip"c); return 0; }\n' > "$TMP/f.lyx"
 if "$LYXC" --std-path="$ROOT" "$TMP/f.lyx" -o "$TMP/f" >/dev/null 2>&1 && (cd "$TMP" && ./f); then
   d2="$(cd "$TMP" && unzip -l f.zip 2>/dev/null | awk '/f\.txt/{print $2}')"
   if [ "$d2" = "2017-01-01" ]; then ok "#1404: ZipWriterAddAt setzt den Zeitstempel fest"
