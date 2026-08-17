@@ -47,7 +47,68 @@ pub type NTPTime = struct {
   precision: int64;      // Server precision
   delay: int64;          // Round-trip delay in milliseconds
   offset: int64;         // Clock offset in milliseconds
+  status: int64;         // #1609: NTP_ERR_* — 0 heisst "Antwort ist brauchbar"
 };
+
+// ── Zeitstempel, Zuordnung, Rechnung (#1609) ────────────────────────────────
+//
+// Bis 1.1.1C blieben `offset` und `delay` IMMER 0: die Formeln standen als
+// Kommentar da, gerechnet wurde nicht, und `NTPParseResponse` bekam ueberhaupt
+// nur zwei der vier Zeitpunkte. Der rohe Sendezeitstempel des Servers ist beim
+// Eintreffen aber schon um die halbe Laufzeit veraltet — wer ihn ungerechnet
+// uebernimmt, stellt seine Uhr systematisch zurueck, und ein Feld, das dazu 0
+// meldet, sagt "alles in Ordnung".
+//
+// Schwerer wog die fehlende ZUORDNUNG: der Server spiegelt den Sendezeitstempel
+// des Kunden (Bytes 24-31). Wer ihn nicht prueft, nimmt jede Antwort an, die
+// rechtzeitig eintrifft — ueber UDP genuegt einem Angreifer ein Paket mit der
+// richtigen Absenderadresse, er muss die Anfrage nicht einmal gesehen haben.
+// Zeit traegt Zertifikatsgueltigkeit, Einmalkennwoerter und Protokolle.
+pub con NTP_ERR_OK:        int64 := 0;
+pub con NTP_ERR_NETZ:      int64 := 0 - 1;   // Aufloesung, Senden, Empfangen
+pub con NTP_ERR_MODE:      int64 := 0 - 2;   // Antwort traegt nicht Mode 4
+pub con NTP_ERR_ORIGIN:    int64 := 0 - 3;   // Origin != eigener Sendestempel
+pub con NTP_ERR_KOD:       int64 := 0 - 4;   // Stratum 0: Kiss-o'-Death
+pub con NTP_ERR_UNSYNC:    int64 := 0 - 5;   // LI=3 oder Stratum >= 16
+
+// NTP-Zeitstempel: 32 Bit Sekunden seit 1900, 32 Bit Bruchteil. Beides passt
+// zusammen in ein int64 und laesst sich so ohne Gleitkomma verrechnen.
+pub fn NTPJetzt(): int64 {
+  var puf: int64 := mmap(0, 16, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (puf == 0) { return 0; }
+  poke64(puf, 0); poke64(puf + 8, 0);
+  sys_clock_gettime(0, puf);                 // CLOCK_REALTIME
+  var sek:  int64 := peek64(puf);
+  var nsek: int64 := peek64(puf + 8);
+  munmap(puf, 16);
+  // Bruchteil: nsek / 1e9 * 2^32, ohne Ueberlauf gerechnet.
+  var frac: int64 := (nsek * 4294967296) / 1000000000;
+  return ((sek + NTP_EPOCH_OFFSET) << 32) | (frac & 4294967295);
+}
+
+// 64-Bit-Zeitstempel aus dem Paket (Sekunden UND Bruchteil).
+pub fn NTPReadTS64(buf: int64, offset: int64): int64 {
+  var sek:  int64 := NTPReadU32BE(buf, offset);
+  var frac: int64 := NTPReadU32BE(buf, offset + 4);
+  return (sek << 32) | (frac & 4294967295);
+}
+
+pub fn NTPWriteTS64(buf: int64, offset: int64, ts: int64): void {
+  var sek:  int64 := (ts >> 32) & 4294967295;
+  var frac: int64 := ts & 4294967295;
+  poke8(buf + offset,     (sek >> 24) & 255);
+  poke8(buf + offset + 1, (sek >> 16) & 255);
+  poke8(buf + offset + 2, (sek >> 8) & 255);
+  poke8(buf + offset + 3, sek & 255);
+  poke8(buf + offset + 4, (frac >> 24) & 255);
+  poke8(buf + offset + 5, (frac >> 16) & 255);
+  poke8(buf + offset + 6, (frac >> 8) & 255);
+  poke8(buf + offset + 7, frac & 255);
+}
+
+// Ein Zeitunterschied in Millisekunden. Der Wert ist ein 32.32-Festkommawert;
+// 1 ms sind 2^32/1000 Schritte.
+fn ntpZuMs(d: int64): int64 { return (d * 1000) >> 32; }
 
 // Build NTP client request packet
 // Returns pointer to 48-byte NTP packet (caller must free)
@@ -104,8 +165,12 @@ pub fn NTPBuildRequest(): int64 {
   // Bytes 16-23: Reference Timestamp (0 for client)
   // Bytes 24-31: Originate Timestamp (0 for client, will be set by server)
   // Bytes 32-39: Receive Timestamp (0 for client)
-  // Bytes 40-47: Transmit Timestamp (set to current time)
-  // For now, we leave transmit timestamp as 0 - some implementations use T1 here
+  // Bytes 40-47: Transmit Timestamp = T1
+  //
+  // #1609: Der Stempel blieb 0. Genau ihn spiegelt der Server zurueck, und nur
+  // daran erkennt der Kunde SEINE Antwort — ohne ihn ist jede Zuordnung
+  // unmoeglich.
+  NTPWriteTS64(buf, 40, NTPJetzt());
   
   return buf;
 }
@@ -140,82 +205,60 @@ pub fn NTPReadTimestamp(buf: int64, offset: int64): int64 {
 }
 
 // Parse NTP response packet
-// Returns NTPTime with parsed time information
-pub fn NTPParseResponse(buf: int64, T1: int64, T2: int64): NTPTime {
+//
+// T1 = eigener Sendestempel, T4 = eigener Empfangsstempel (beide als
+// 64-Bit-NTP-Zeitstempel). Beide werden GEBRAUCHT: ohne T1 laesst sich die
+// Antwort nicht zuordnen, ohne T4 nicht rechnen.
+//
+// Geprueft wird, was RFC 5905 dem Kunden vorschreibt: Betriebsart 4,
+// Schaltsekundenanzeige != 3, Stratum weder 0 (Kiss-o'-Death, der Server weist
+// ausdruecklich ab) noch >= 16 (Server kennt die Zeit selbst nicht), und der
+// gespiegelte Origin-Stempel muss der eigene sein.
+pub fn NTPParseResponse(buf: int64, T1: int64, T4: int64): NTPTime {
   var time: NTPTime;
-  var liVnMode: int64;
-  var T3: int64;
-  var T4: int64;
-  
   time.unixTime := 0;
   time.fractional := 0;
   time.stratum := 0;
   time.precision := 0;
   time.delay := 0;
   time.offset := 0;
+  time.status := NTP_ERR_NETZ;
   
-  if (buf == 0) {
-    return time;
-  }
+  if (buf == 0) { return time; }
   
-  // Parse header
-  liVnMode := peek8(buf);
-  
-  // Extract stratum (byte 1)
+  var liVnMode: int64 := peek8(buf);
+  var li:   int64 := (liVnMode >> 6) & 3;
+  var mode: int64 := liVnMode & 7;
   time.stratum := peek8(buf + 1);
   
-  // Extract precision (byte 3, signed)
   var prec: int64 := peek8(buf + 3);
-  if (prec >= 128) {
-    prec -= 256;
-  }
+  if (prec >= 128) { prec -= 256; }
   time.precision := prec;
   
-  // Extract timestamps
-  // Reference Timestamp (bytes 16-23)
-  // Originate Timestamp (bytes 24-31) = T1 (client send time)
-  // Receive Timestamp (bytes 32-39) = T2 (server receive time)
-  // Transmit Timestamp (bytes 40-47) = T3 (server transmit time)
+  if (mode != NTP_MODE_SERVER) { time.status := NTP_ERR_MODE; return time; }
+  if (time.stratum == NTP_STRATUM_KOD) { time.status := NTP_ERR_KOD; return time; }
+  if (li == 3 || time.stratum >= 16) { time.status := NTP_ERR_UNSYNC; return time; }
   
-  T3 := NTPReadTimestamp(buf, 40);  // Server transmit time
+  var origin: int64 := NTPReadTS64(buf, 24);   // gespiegeltes T1
+  var T2: int64 := NTPReadTS64(buf, 32);       // Empfang beim Server
+  var T3: int64 := NTPReadTS64(buf, 40);       // Senden durch den Server
   
-  // Convert NTP timestamp to Unix timestamp
-  // NTP epoch is 1900-01-01, Unix epoch is 1970-01-01
-  // Offset is 2208988800 seconds
-  if (T3 >= NTP_EPOCH_OFFSET) {
-    time.unixTime := T3 - NTP_EPOCH_OFFSET;
-  }
+  if (T1 != 0 && origin != T1) { time.status := NTP_ERR_ORIGIN; return time; }
   
-  // Calculate round-trip delay and clock offset
-  // T1 = client send time (originate)
-  // T2 = server receive time
-  // T3 = server transmit time
-  // T4 = client receive time (we use T2 for now)
-  //
-  // delay = (T4 - T1) - (T3 - T2)
+  var sek: int64 := (T3 >> 32) & 4294967295;
+  if (sek >= NTP_EPOCH_OFFSET) { time.unixTime := sek - NTP_EPOCH_OFFSET; }
+  time.fractional := T3 & 4294967295;
+  
+  // delay  = (T4 - T1) - (T3 - T2)
   // offset = ((T2 - T1) + (T3 - T4)) / 2
-  //
-  // Simplified: we use T2 as T4 approximation
-  // This gives us a basic time estimate
-  
-  // For accurate delay calculation, we'd need the actual T4
-  // For now, use T3 as the primary time source
-  time.unixTime := T3 - NTP_EPOCH_OFFSET;
-  
-  // Estimate delay (simplified)
-  if (T1 > 0 && T2 > 0 && T3 > 0) {
-    // delay = (T3 - T1) - (T3 - T2) = T2 - T1
-    // This is half the round trip
-    var halfTrip: int64 := T2 - T1;
-    if (halfTrip < 0) {
-      halfTrip := -halfTrip;
-    }
-    time.delay := halfTrip * 2;
-    
-    // offset = (T2 - T1 + T3 - T2) / 2 = (T3 - T1) / 2
-    time.offset := (T3 - T1) / 2;
+  // Gerechnet wird, sobald der eigene Empfangsstempel vorliegt. T1 darf 0
+  // sein — dann ist es eben der Nullpunkt der Rechnung, nicht "unbekannt".
+  if (T4 != 0) {
+    time.delay  := ntpZuMs((T4 - T1) - (T3 - T2));
+    time.offset := ntpZuMs(((T2 - T1) + (T3 - T4)) / 2);
   }
   
+  time.status := NTP_ERR_OK;
   return time;
 }
 
@@ -257,9 +300,9 @@ pub fn NTPGetTime(host: int64): NTPTime {
     return time;
   }
   
-  // Record send time (T1) - simplified: use 0 for now
-  // In a real implementation, we'd read the system clock here
-  T1 := 0;
+  // #1609: T1 ist der Stempel, den NTPBuildRequest ins Paket geschrieben hat —
+  // genau den spiegelt der Server, und nur daran ist die Antwort zuzuordnen.
+  T1 := NTPReadTS64(reqBuf, 40);
   
   // Send request to NTP server
   var ret: int64 := UDPSocketSendToAddr(sock, reqBuf, NTP_PACKET_SIZE, ip, NTP_PORT);
@@ -286,7 +329,7 @@ pub fn NTPGetTime(host: int64): NTPTime {
   }
   
   // Parse response
-  time := NTPParseResponse(respBuf, T1, 0);
+  time := NTPParseResponse(respBuf, T1, NTPJetzt());
   
   munmap(respBuf, 1024);
   UDPSocketClose(sock);
@@ -322,6 +365,7 @@ pub fn NTPGetTimeFromIP(ip: int64): NTPTime {
     return time;
   }
   
+  var T1b: int64 := NTPReadTS64(reqBuf, 40);   // #1609
   var ret: int64 := UDPSocketSendToAddr(sock, reqBuf, NTP_PACKET_SIZE, ip, NTP_PORT);
   munmap(reqBuf, NTP_PACKET_SIZE);
   
@@ -344,7 +388,7 @@ pub fn NTPGetTimeFromIP(ip: int64): NTPTime {
     return time;
   }
   
-  time := NTPParseResponse(respBuf, 0, 0);
+  time := NTPParseResponse(respBuf, T1b, NTPJetzt());
   
   munmap(respBuf, 1024);
   UDPSocketClose(sock);
