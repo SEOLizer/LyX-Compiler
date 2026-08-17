@@ -263,138 +263,122 @@ pub fn SMTPBuildRcptTo(recipient: int64): int64 {
 }
 
 // Build complete email message with headers
-// Returns pointer to allocated message (caller must free)
+// Returns pointer to allocated message (caller must free), or 0 bei Ablehnung.
+//
+// #1610: Zwei Fehler, die zusammen dafuer sorgten, dass Inhalte nicht aus
+// fremder Eingabe stammen durften.
+//
+//   1. HEAP-UEBERLAUF. Der Puffer fasst 8192 Byte, die Schleife zaehlte aber
+//      die EINGABE (`i < 7000`) und schrieb `pos` — und Dot-Stuffing
+//      verdoppelt jeden Zeilenanfang mit Punkt. Gemessen wurden 1305 Bytes
+//      jenseits des Puffers. Das Programm stuerzte dabei NICHT ab: die
+//      Folgeseiten waren gemappt, es wurden also fremde Daten ueberschrieben,
+//      statt dass der Fehler auffiel.
+//
+//   2. HEADER-INJECTION. from, toAddr und subject wurden ungeprueft kopiert;
+//      ein CR oder LF darin erzeugt eine zusaetzliche Kopfzeile (nachgewiesen
+//      mit einer eingeschleusten Bcc-Zeile).
+//
+// Jetzt: jede einzelne Schreibstelle prueft die Grenze, und CR/LF in einer
+// Kopfzeile fuehrt zur Ablehnung der ganzen Nachricht (0). Fail-closed — eine
+// halb gebaute Nachricht waere schlimmer als keine.
+con SMTP_MSG_CAP: int64 := 8192;
+
+// Schreibt ein Byte, wenn Platz ist. Liefert die neue Position oder -1.
+fn smtpPut(buf: int64, pos: int64, c: int64): int64 {
+  if (pos < 0) { return 0 - 1; }
+  if (pos >= SMTP_MSG_CAP - 1) { return 0 - 1; }   // ein Byte fuer die 0
+  poke8(buf + pos, c);
+  return pos + 1;
+}
+
+// Schreibt eine nullterminierte Zeichenkette (hoechstens maxLen Zeichen).
+fn smtpPutStr(buf: int64, pos: int64, s: int64, maxLen: int64): int64 {
+  if (s == 0) { return pos; }
+  var p: int64 := pos;
+  var i: int64 := 0;
+  while (i < maxLen) {
+    var c: int64 := peek8(s + i);
+    if (c == 0) { return p; }
+    p := smtpPut(buf, p, c);
+    if (p < 0) { return 0 - 1; }
+    i := i + 1;
+  }
+  return p;
+}
+
+// 1 = die Zeichenkette enthaelt CR oder LF und taugt nicht als Kopfzeilenwert.
+fn smtpHatCrLf(s: int64, maxLen: int64): int64 {
+  if (s == 0) { return 0; }
+  var i: int64 := 0;
+  while (i < maxLen) {
+    var c: int64 := peek8(s + i);
+    if (c == 0) { return 0; }
+    if (c == 13 || c == 10) { return 1; }
+    i := i + 1;
+  }
+  return 0;
+}
+
 pub fn SMTPBuildMessage(email: SMTPEmail): int64 {
-  var buf: int64;
-  var pos: int64;
-  var i: int64;
-  var c: int64;
-  
-  // Allocate 8KB for message
-  buf := mmap(0, 8192, PROT_RW, MAP_ANON, FD_NONE, 0);
-  if (buf == 0) {
-    return 0;
-  }
-  
-  pos := 0;
-  
-  // "From: "
-  i := 0;
-  while (i < 6) {
-    c := peek8("From: " + i);
-    poke8(buf + pos, c);
-    pos += 1;
-    i += 1;
-  }
-  
-  // from address
-  if (email.from != 0) {
-    i := 0;
-    while (i < 256) {
-      c := peek8(email.from + i);
-      if (c == 0) {
-        break;
+  // Kopfzeilen zuerst pruefen — vor jeder Allokation.
+  if (smtpHatCrLf(email.from, 256) != 0)    { return 0; }
+  if (smtpHatCrLf(email.toAddr, 256) != 0)  { return 0; }
+  if (smtpHatCrLf(email.subject, 256) != 0) { return 0; }
+
+  var buf: int64 := mmap(0, SMTP_MSG_CAP, PROT_RW, MAP_ANON, FD_NONE, 0);
+  if (buf == 0) { return 0; }
+
+  var pos: int64 := 0;
+  pos := smtpPutStr(buf, pos, "From: "c as int64, 6);
+  pos := smtpPutStr(buf, pos, email.from, 256);
+  pos := smtpPut(buf, pos, 13); pos := smtpPut(buf, pos, 10);
+
+  pos := smtpPutStr(buf, pos, "To: "c as int64, 4);
+  pos := smtpPutStr(buf, pos, email.toAddr, 256);
+  pos := smtpPut(buf, pos, 13); pos := smtpPut(buf, pos, 10);
+
+  pos := smtpPutStr(buf, pos, "Subject: "c as int64, 9);
+  pos := smtpPutStr(buf, pos, email.subject, 256);
+  pos := smtpPut(buf, pos, 13); pos := smtpPut(buf, pos, 10);
+
+  // Leerzeile: Ende der Kopfzeilen
+  pos := smtpPut(buf, pos, 13); pos := smtpPut(buf, pos, 10);
+
+  // Rumpf mit Dot-Stuffing. Die Grenze zaehlt jetzt das GESCHRIEBENE.
+  if (pos >= 0 && email.body != 0) {
+    var i: int64 := 0;
+    var prevC: int64 := 10;      // Zeilenanfang: das erste Zeichen zaehlt als
+                                 // Beginn einer Zeile. Frueher wurde dafuer
+                                 // peek8(body - 1) gelesen — ein Byte VOR dem
+                                 // Puffer.
+    while (i < 7000 && pos >= 0) {
+      var c: int64 := peek8(email.body + i);
+      if (c == 0) { i := 7000; }
+      else {
+        if (c == 46 && prevC == 10) {
+          pos := smtpPut(buf, pos, 46);
+        }
+        if (pos >= 0) { pos := smtpPut(buf, pos, c); }
+        prevC := c;
+        i := i + 1;
       }
-      poke8(buf + pos, c);
-      pos += 1;
-      i += 1;
     }
   }
-  
-  // CRLF
-  poke8(buf + pos, 13); pos := pos + 1;
-  poke8(buf + pos, 10); pos := pos + 1;
-  
-  // "To: "
-  i := 0;
-  while (i < 4) {
-    c := peek8("To: " + i);
-    poke8(buf + pos, c);
-    pos += 1;
-    i += 1;
+
+  // Abschluss CRLF.CRLF — er muss hineinpassen, sonst ist die Nachricht
+  // unbrauchbar und wird verworfen statt abgeschnitten verschickt.
+  if (pos >= 0) { pos := smtpPut(buf, pos, 13); }
+  if (pos >= 0) { pos := smtpPut(buf, pos, 10); }
+  if (pos >= 0) { pos := smtpPut(buf, pos, 46); }
+  if (pos >= 0) { pos := smtpPut(buf, pos, 13); }
+  if (pos >= 0) { pos := smtpPut(buf, pos, 10); }
+
+  if (pos < 0) {
+    munmap(buf, SMTP_MSG_CAP);
+    return 0;                    // zu lang: melden statt ueberlaufen
   }
-  
-  // to address
-  if (email.toAddr != 0) {
-    i := 0;
-    while (i < 256) {
-      c := peek8(email.toAddr + i);
-      if (c == 0) {
-        break;
-      }
-      poke8(buf + pos, c);
-      pos += 1;
-      i += 1;
-    }
-  }
-  
-  // CRLF
-  poke8(buf + pos, 13); pos := pos + 1;
-  poke8(buf + pos, 10); pos := pos + 1;
-  
-  // "Subject: "
-  i := 0;
-  while (i < 9) {
-    c := peek8("Subject: " + i);
-    poke8(buf + pos, c);
-    pos += 1;
-    i += 1;
-  }
-  
-  // subject
-  if (email.subject != 0) {
-    i := 0;
-    while (i < 256) {
-      c := peek8(email.subject + i);
-      if (c == 0) {
-        break;
-      }
-      poke8(buf + pos, c);
-      pos += 1;
-      i += 1;
-    }
-  }
-  
-  // CRLF
-  poke8(buf + pos, 13); pos := pos + 1;
-  poke8(buf + pos, 10); pos := pos + 1;
-  
-  // Empty line (end of headers)
-  poke8(buf + pos, 13); pos := pos + 1;
-  poke8(buf + pos, 10); pos := pos + 1;
-  
-  // Body
-  if (email.body != 0) {
-    i := 0;
-    while (i < 7000) {
-      c := peek8(email.body + i);
-      if (c == 0) {
-        break;
-      }
-      // Dot-stuffing: lines starting with . need an extra .
-      var bodyI: int64 := email.body + i;
-      var bodyI1: int64 := bodyI - 1;
-      var prevC: int64 := peek8(bodyI1);
-      if (c == 46 && (i == 0 || prevC == 10)) {
-        poke8(buf + pos, 46);
-        pos += 1;
-      }
-      poke8(buf + pos, c);
-      pos += 1;
-      i += 1;
-    }
-  }
-  
-  // End of message (CRLF.CRLF)
-  poke8(buf + pos, 13); pos := pos + 1;
-  poke8(buf + pos, 10); pos := pos + 1;
-  poke8(buf + pos, 46); pos := pos + 1;  // .
-  poke8(buf + pos, 13); pos := pos + 1;
-  poke8(buf + pos, 10); pos := pos + 1;
-  
-  // Null-terminate (for debugging)
   poke8(buf + pos, 0);
-  
   return buf;
 }
 
