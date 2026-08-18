@@ -936,6 +936,47 @@ pub type Sema = class {
     var bl: int64 := self.sn_sLen(baseNi);
     if (bn == 0) { return; }
     if (bl <= 0) { return; }
+    // #1628: `self.gibtsNicht` im eigenen Methodenrumpf. Von aussen wird
+    // `t.gibtsNicht` seit jeher gemeldet, am eigenen `self` nicht — der Zugriff
+    // lieferte still 0. Das ist dieselbe Sorte stiller Default wie #1622: ein
+    // Tippfehler verhaelt sich wie ein Messwert. Schlimmer noch beim
+    // SCHREIBEN: Offset 0 trifft bei einer Klasse den VMT-Zeiger, ein
+    // vertipptes Feld beschaedigt also die Dispatch-Tabelle.
+    if (self.curClassNi >= 0 && self._strNEq(bn, bl, "self"c, 4) != 0) {
+      var sfName: pchar := self.sn_sVal(ni);
+      var sfLen:  int64 := self.sn_sLen(ni);
+      if (sfName == 0 || sfLen <= 0) { return; }
+      var kette: int64 := self.curClassNi;
+      var tiefe: int64 := 0;
+      while (kette >= 0 && tiefe < 32) {
+        var fld: int64 := self.sn_c0(kette);
+        while (fld >= 0) {
+          if (self._strNEq(sfName, sfLen, self.sn_sVal(fld), self.sn_sLen(fld)) != 0) { return; }
+          fld := self.sn_next(fld);
+        }
+        // Auch eine Methode darf so heissen (Methodenzeiger als Wert).
+        var mth: int64 := self.sn_c1(kette);
+        while (mth >= 0) {
+          if (self._strNEq(sfName, sfLen, self.sn_sVal(mth), self.sn_sLen(mth)) != 0) { return; }
+          mth := self.sn_next(mth);
+        }
+        var elt: int64 := self.sn_c2(kette);
+        if (elt < 0) { kette := 0 - 1; }
+        else {
+          var eSym: int64 := self.Lookup(self.sn_sVal(elt), self.sn_sLen(elt));
+          // Fail-open: eine Basisklasse aus einer anderen Unit ist hier nicht
+          // entscheidbar. `SymNodeIdx == -1` heisst "unbekannt", nicht
+          // "existiert nicht" — sonst gaelte jedes geerbte Feld als Tippfehler.
+          if (eSym < 0) { return; }
+          var eNi: int64 := self.SymNodeIdx(eSym);
+          if (eNi < 0 || self.sn_kind(eNi) != SNK_TYPE_DECL) { return; }
+          kette := eNi;
+        }
+        tiefe := tiefe + 1;
+      }
+      self._errorNodeName("unknown field", ni, sfName, sfLen);
+      return;
+    }
     var sym: int64 := self.Lookup(bn, bl);
     if (sym < 0) { return; }
     var sk: int64 := self.SymKind(sym);
@@ -3850,6 +3891,7 @@ pub type Sema = class {
       // greift die Zaehlung seit WP-ARITY laengst — der Konstruktor war die
       // Luecke.
       if (newSym >= 0) {
+        var gefunden: int64 := 0;      // #1633
         var cNi: int64 := self.SymNodeIdx(newSym);
         if (cNi >= 0) {
           // #1624: der Konstruktor darf aus einer Basisklasse stammen; dann
@@ -3878,8 +3920,39 @@ pub type Sema = class {
                 }
               }
               cm := 0 - 1;
+              gefunden := 1;
             } else {
               cm := self.sn_next(cm);
+            }
+          }
+        }
+        // #1633: Ueber eine Unit-Grenze hinweg zeigt SymNodeIdx auf einen
+        // fremden Baum — weder die Knotenart noch die Methodenliste sind dort
+        // verlaesslich zu lesen, die Schleife oben findet also nichts. Genau
+        // dieselbe Lage wie bei den METHODEN in #1626; dort steht die Antwort
+        // seither unter "Klasse_Methode" in der Signaturtabelle, und der
+        // Konstruktor ist eine Methode namens Create. Ohne diesen Weg wurde
+        // JEDER `new` einer importierten Klasse ungezaehlt angenommen, und
+        // fehlende Argumente kamen als Speicherrest im Konstruktor an.
+        if (gefunden == 0) {
+          var klc: int64 := alloc(8);
+          if (klc != 0) {
+            var kMang: pchar := self._mangleMethode(newName, newLen, "Create"c, 6, klc);
+            var kMangLen: int64 := peek64(klc);
+            free(klc, 8);
+            if (kMang != 0 as pchar) {
+              var ksgi: int64 := self._fnFindSig(kMang, kMangLen);
+              if (ksgi >= 0) {
+                var kBase: int64 := self.fnSigTab + ksgi * 48;
+                if ((peek64(kBase + 32) & 1) == 0) {          // nicht variadisch
+                  var kac: int64 := 0;
+                  var ka: int64 := self.sn_c0(ni);
+                  while (ka >= 0) { kac := kac + 1; ka := self.sn_next(ka); }
+                  if (kac < peek64(kBase + 16) || kac > peek64(kBase + 24)) {
+                    self._errorNodeName("falsche Argument-Anzahl fuer den Konstruktor von", ni, newName, newLen);
+                  }
+                }
+              }
             }
           }
         }
