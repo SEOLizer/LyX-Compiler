@@ -463,6 +463,22 @@ pub type Codegen = class {
   // Units ein zweites Mal, unabhaengig davon.
   cgAlias:         int64;
   cgAliasLen:      int64;
+  // #1655: Name der Unit, die gerade uebersetzt wird (0 = die Hauptdatei).
+  // Marken NICHT-oeffentlicher Funktionen tragen ihn als Praefix, damit zwei
+  // Units je ein eigenes privates `_fail` haben duerfen. Ohne das trug der
+  // Codestrom zweimal dieselbe Marke, und cg_findLabel nimmt die erste —
+  // welche Fassung ein Aufruf trifft, entschied die Import-Reihenfolge.
+  cgUnitTag:       int64;
+  cgUnitTagLen:    int64;
+  // #1655: Namen der privaten Funktionen DIESER Unit — einschliesslich der
+  // geschachtelten. Die Tabelle entsteht in einem Vorlauf ueber den Baum,
+  // bevor Code erzeugt wird; Deklaration und Aufruf fragen danach dieselbe
+  // Quelle. Ein Vorlauf ist noetig, weil ein Aufruf vor der Deklaration
+  // stehen darf — wer stattdessen "schon gesehen?" fragt, entscheidet je
+  // nach Reihenfolge anders.
+  cgUnitPrivTab:   int64;   // Paare (namePtr, nameLen)
+  cgUnitPrivCnt:   int64;
+  cgUnitPrivCap:   int64;
   // #1262: bekannte Import-Aliase (Name/Laenge paarweise), fuer die
   // Aufrufstelle `m.Wert()`.
   cgAliasTab:      int64;
@@ -1565,6 +1581,17 @@ pub type Codegen = class {
       if (cidx >= 0) {
         if (peek8(self.conIsPchar + cidx) != 0) { return 1; }
       }
+      // #1652: Eine Variable auf MODULEBENE (`let`/`var`) wurde hier nie
+      // gefragt. Sie ist kein Local, steht nicht in der con-Tabelle — also
+      // galt sie als Zahl, und `"[" + G + "]"` addierte Adressen statt zu
+      // verketten. Das Ergebnis war keine Zeichenkette; PrintLn lief in den
+      // Speicherzugriffsfehler. Ob sie pchar ist, steht in globalIsPchar und
+      // wurde an dieser Stelle nur nicht herangezogen — dieselbe Bauart wie
+      // #1286 (Rueckgabetyp) und #1328 (Feld).
+      var gidx: int64 := self.cg_findGlobalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (gidx >= 0) {
+        if (peek8(self.globalIsPchar + gidx) != 0) { return 1; }
+      }
       return 0;
     }
     if (k == CGN_CALL) {
@@ -2188,6 +2215,17 @@ pub type Codegen = class {
       var nl: int64 := self.cg_nslen(ni);
       if (self.cg_findLocal(nm, nl) != 0) { return 0; }  // local var, not foldable
       if (self.cg_hasConVal(nm, nl) == 0) { return 0; }  // not in con-table
+      // #1652: Eine ZEICHENKETTEN-Konstante hat hier keinen Wert zu holen.
+      // Die Faltung rechnet ganzzahlig; auf `con C: pchar := "CON"` gab sie
+      // die Zahl aus der con-Tabelle zurueck, und der Schnellpfad in
+      // cg_genBinop emittierte daraufhin eine Addition, bevor der Zweig fuer
+      // `pchar + pchar` ueberhaupt geprueft wurde. `"B[" + C + "]"` verlor so
+      // den vorderen Teil. Dieselbe Ueberholung wie bei f64 (#1499) — dort
+      // steht die Sperre oben schon.
+      var cfi: int64 := self.cg_findConIdx(nm, nl);
+      if (cfi >= 0) {
+        if (peek8(self.conIsPchar + cfi) != 0) { return 0; }
+      }
       self.foldBuf := self.cg_findConVal(nm, nl);        // value may be -1, valid
       return 1;
     }
@@ -3962,8 +4000,23 @@ pub type Codegen = class {
     return 0;
   }
   // A1: Fn-Adresse laden — lea rax, [rip+disp32]; disp via CG_PATCH_CALL (= target-(pos+4), wie call).
+  //
+  // #1655: Auch hier gilt die unit-eigene Marke. Beim ersten Anlauf stand die
+  // Umsetzung nur an den beiden Aufrufstellen — eine private Funktion, deren
+  // ADRESSE genommen wird (`_thrTrampoline` in std/thread.lyx), wurde damit
+  // unter ihrem Unit-Namen erzeugt und unter dem schlichten Namen gesucht:
+  // "undefined function '_thrTrampoline'". Wer eine Marke umbenennt, muss
+  // JEDE Stelle mitnehmen, die auf sie verweist.
   fn cg_emitFuncAddr(name: pchar, nlen: int64) {
     self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);
+    if (self.cg_unitPrivHat(name, nlen) != 0) {
+      var upl: int64 := alloc(8);
+      var upm: int64 := self.cg_unitPrivMangle(name, nlen, upl);
+      name := upm as pchar;
+      nlen := peek64(upl);
+      self.cg_trackTempBuf(upm, nlen + 1);
+      free(upl, 8);
+    }
     var pos: int64 := self.codeLen;
     self.cg_e32(0);
     self.cg_addPatch(pos, name as int64, nlen, CG_PATCH_CALL);
@@ -9569,6 +9622,102 @@ pub type Codegen = class {
     return 0;
   }
 
+  // #1637: Den Deklarationsknoten einer METHODE finden — fuer die
+  // Vorgabewerte. Fuer freie Funktionen steht der Knoten direkt in der
+  // Modulkette; eine Methode haengt dagegen unter ihrer Klasse (c1 des
+  // TYPE_DECL). Weil es diese Suche nicht gab, blieb der Aufruf mit
+  // weggelassenem Argument ohne Wert: `t.M(1)` uebergab nur ein Argument an
+  // eine Methode mit zwei Parametern, der zweite trug, was im Register stand.
+  // Gesucht wird bei der Klasse, die die Methode DEKLARIERT — bei einer
+  // geerbten Methode steht der Rumpf und damit die Vorgabe in der Basisklasse.
+  fn cg_findMethodDeclNi(classIdx: int64, mname: pchar, mlen: int64): int64 {
+    if (classIdx < 0 || self.topLevelHead < 0) { return 0 - 1; }
+    var ownIdx: int64 := self.cg_findMethodOwner(classIdx, mname, mlen);
+    if (ownIdx < 0) { ownIdx := classIdx; }
+    var cBase: int64 := self.classLayouts + ownIdx * CG_CLASS_SZ;
+    var cName: pchar := peek64(cBase) as pchar;
+    var cLen:  int64 := peek64(cBase + CG_CLASS_OFF_NAMELEN);
+    var scan: int64 := self.topLevelHead;
+    while (scan >= 0) {
+      if (self.cg_nkind(scan) == CGN_TYPE_DECL) {
+        if (self.cg_seq(self.cg_nsval(scan), self.cg_nslen(scan), cName, cLen) != 0) {
+          var m: int64 := self.cg_nc1(scan);
+          while (m >= 0) {
+            if (self.cg_seq(self.cg_nsval(m), self.cg_nslen(m), mname, mlen) != 0) {
+              return m;
+            }
+            m := self.cg_nnext(m);
+          }
+          return 0 - 1;
+        }
+      }
+      scan := self.cg_nnext(scan);
+    }
+    return 0 - 1;
+  }
+
+  // #1655: Einen privaten Funktionsnamen der laufenden Unit vormerken.
+  fn cg_unitPrivAdd(nm: pchar, nl: int64) {
+    if (self.cgUnitPrivCnt >= self.cgUnitPrivCap) {
+      var nc: int64 := self.cgUnitPrivCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.cgUnitPrivTab, self.cgUnitPrivCnt * 16);
+      self.cgUnitPrivTab := nb;
+      self.cgUnitPrivCap := nc;
+    }
+    var b: int64 := self.cgUnitPrivTab + self.cgUnitPrivCnt * 16;
+    poke64(b, nm as int64);
+    poke64(b + 8, nl);
+    self.cgUnitPrivCnt := self.cgUnitPrivCnt + 1;
+  }
+
+  // #1655: Vorlauf ueber eine Anweisungs-/Deklarationskette. Sammelt jede
+  // nicht-oeffentliche Funktion, auch die im Rumpf einer anderen deklarierte
+  // (`fn w4(...)` in std/cloud/aws/sigv4.lyx). KLASSEN bleiben aussen vor:
+  // ihre Methoden tragen ohnehin die Marke "Klasse_Methode", und ein
+  // gleichnamiger freier Aufruf duerfte davon nicht umgelenkt werden.
+  fn cg_unitPrivCollect(head: int64, tiefe: int64) {
+    if (tiefe > 32) { return; }
+    var cur: int64 := head;
+    while (cur >= 0) {
+      var k: int64 := self.cg_nkind(cur);
+      if (k == CGN_FUNC_DECL) {
+        if (peek64(self.cg_noff(cur) + CG_OFF_ISPUB) == 0) {
+          self.cg_unitPrivAdd(self.cg_nsval(cur), self.cg_nslen(cur));
+        }
+        self.cg_unitPrivCollect(self.cg_nc2(cur), tiefe + 1);   // Rumpf
+      } else if (k != CGN_TYPE_DECL) {
+        self.cg_unitPrivCollect(self.cg_nc0(cur), tiefe + 1);
+        self.cg_unitPrivCollect(self.cg_nc1(cur), tiefe + 1);
+        self.cg_unitPrivCollect(self.cg_nc2(cur), tiefe + 1);
+      }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
+  // #1655: Traegt die gerade uebersetzte Unit eine NICHT-oeffentliche Funktion
+  // dieses Namens? Nur dann gehoert der Aufruf an die unit-eigene Marke.
+  // Findet sich nichts, bleibt der schlichte Name — dann meint der Aufruf eine
+  // oeffentliche Funktion aus einer anderen Unit, und der bisherige Weg stimmt.
+  fn cg_unitPrivHat(fname: pchar, fnlen: int64): int64 {
+    if (self.cgUnitTag == 0) { return 0; }
+    var i: int64 := 0;
+    while (i < self.cgUnitPrivCnt) {
+      var b: int64 := self.cgUnitPrivTab + i * 16;
+      if (self.cg_seq(peek64(b) as pchar, peek64(b + 8), fname, fnlen) != 0) { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // #1655: "unit.name#fn" als Marke. Der Trenner ist derselbe wie beim
+  // Namensraum-Alias (cg_mangleInto), der Unit-Name enthaelt Punkte und kann
+  // deshalb mit keinem Bezeichner der Sprache zusammenfallen.
+  fn cg_unitPrivMangle(fname: pchar, fnlen: int64, lenCell: int64): int64 {
+    return self.cg_mangleInto(self.cgUnitTag as pchar, self.cgUnitTagLen,
+                              fname, fnlen, lenCell);
+  }
+
   fn cg_genCall(ni: int64) {
     var fname: pchar := self.cg_nsval(ni);
     var fnlen: int64 := self.cg_nslen(ni);
@@ -9909,6 +10058,25 @@ pub type Codegen = class {
     // and emit default expressions for trailing params not covered by explicit args.
     // Only applies to user-defined functions (isMethod == 0, not a builtin).
     var cgDefFuncNi: int64 := -1;
+    if (isMethod == 1) {
+      // #1637: Auch eine Methode kann Vorgabewerte haben. Bis hierher galt die
+      // Suche nur fuer freie Funktionen (`isMethod == 0`) — die Ebene fuer
+      // Methoden fehlte im Entwurf, also blieb die Luecke im Aufruf offen.
+      // Der Empfaenger steht in c0; bei `super.M()` ist es die Elternklasse
+      // der gerade uebersetzten Klasse.
+      var cgMcls: int64 := 0 - 1;
+      if (isSuperCall != 0) {
+        var cgCur: int64 := self.cg_curClassIdx();
+        if (cgCur >= 0) {
+          cgMcls := peek64(self.classLayouts + cgCur * CG_CLASS_SZ + CG_CLASS_OFF_PARENTIDX);
+        }
+      } else {
+        cgMcls := self.cg_objClassIdx(self.cg_nc0(ni));
+      }
+      if (cgMcls >= 0) {
+        cgDefFuncNi := self.cg_findMethodDeclNi(cgMcls, fname, fnlen);
+      }
+    }
     if (isMethod == 0 && self.topLevelHead >= 0) {
       var cgScan: int64 := self.topLevelHead;
       while (cgScan >= 0) {
@@ -10235,7 +10403,16 @@ pub type Codegen = class {
       var wantArgc: int64 := self.cg_builtinArity(fname, fnlen);
       if (wantArgc >= 0 && argc != wantArgc) {
         var uPp: int64 := self.cg_emitCall();
+        // #1655: auch hier die unit-eigene Marke, wenn es sie gibt.
+        if (self.cg_unitPrivHat(fname, fnlen) != 0) {
+          var uac: int64 := alloc(8);
+          var uab: int64 := self.cg_unitPrivMangle(fname, fnlen, uac);
+          self.cg_addPatch(uPp, uab, peek64(uac), CG_PATCH_CALL);
+          self.cg_trackTempBuf(uab, peek64(uac) + 1);
+          free(uac, 8);
+        } else {
         self.cg_addPatch(uPp, fname as int64, fnlen, CG_PATCH_CALL);
+        }
         self.cg_popStackArgs(nTotal);
         return;
       }
@@ -12949,7 +13126,17 @@ pub type Codegen = class {
     } else {
       // User-defined function call: emit call + patch
       var pp: int64 := self.cg_emitCall();
-      self.cg_addPatch(pp, fname as int64, fnlen, CG_PATCH_CALL);
+      // #1655: Steht in DIESER Unit eine private Funktion des Namens, meint der
+      // Aufruf sie — und keine gleichnamige aus einer anderen Unit.
+      if (self.cg_unitPrivHat(fname, fnlen) != 0) {
+        var upc: int64 := alloc(8);
+        var upb: int64 := self.cg_unitPrivMangle(fname, fnlen, upc);
+        self.cg_addPatch(pp, upb, peek64(upc), CG_PATCH_CALL);
+        self.cg_trackTempBuf(upb, peek64(upc) + 1);
+        free(upc, 8);
+      } else {
+        self.cg_addPatch(pp, fname as int64, fnlen, CG_PATCH_CALL);
+      }
       self.cg_popStackArgs(nTotal);
     }
   }
@@ -16318,6 +16505,24 @@ pub type Codegen = class {
                                            fname, fnlen, mlc);
       fname := mb as pchar;
       fnlen := peek64(mlc);
+    } else if (self.cgUnitTag != 0 &&
+               peek64(self.cg_noff(ni) + CG_OFF_ISPUB) == 0 &&
+               self.cg_unitPrivHat(fname, fnlen) != 0) {
+      // #1655: private Funktion einer importierten Unit — Marke unit-lokal.
+      //
+      // Die Bedingung fragt DENSELBEN Helfer wie die Aufrufstelle, und zwar
+      // auf Knotengleichheit. Ohne das liefen die beiden Enden auseinander:
+      // eine GESCHACHTELTE Funktion (`fn w4(...)` im Rumpf einer anderen,
+      // std/cloud/aws/sigv4.lyx) steht nicht in der Top-Level-Kette, also
+      // fand die Aufrufstelle sie nicht und blieb beim schlichten Namen —
+      // waehrend die Deklaration hier mangelte. Zwoelf std.cloud-Units und
+      // zwei std.hardware-Units liessen sich daraufhin nicht mehr
+      // importieren. Wer eine Marke umbenennt, muss beide Enden an
+      // dieselbe Bedingung binden, nicht an zwei aehnliche.
+      var ulc: int64 := alloc(8);
+      var ub:  int64 := self.cg_unitPrivMangle(fname, fnlen, ulc);
+      fname := ub as pchar;
+      fnlen := peek64(ulc);
     }
     self.cg_addLabel(fname, fnlen, self.cg_lineOf(ni));
 
@@ -17982,6 +18187,19 @@ pub type Codegen = class {
     self.pSrc   := p.src;
     self.pNodes := p.nodes;
 
+    // #1655: Waehrend dieser Unit tragen private Marken ihren Namen.
+    var utSaved:    int64 := self.cgUnitTag;
+    var utSavedLen: int64 := self.cgUnitTagLen;
+    var utSavedTab: int64 := self.cgUnitPrivTab;
+    var utSavedCnt: int64 := self.cgUnitPrivCnt;
+    var utSavedCap: int64 := self.cgUnitPrivCap;
+    self.cgUnitTag    := modName as int64;
+    self.cgUnitTagLen := nameLen;
+    self.cgUnitPrivCap := 128;
+    self.cgUnitPrivTab := alloc(self.cgUnitPrivCap * 16);
+    self.cgUnitPrivCnt := 0;
+    self.cg_unitPrivCollect(head, 0);
+
     // Recursively generate code for the imported file
     self.cg_genFile(head);
     
@@ -17990,6 +18208,12 @@ pub type Codegen = class {
     // IMPORTANT: Do this WHILE still switched to import pNodes!
     self.cg_collectImportLabels(head);
     self.cg_collectImportDefaults(head);   // #1342: konstante Vorgabewerte abschreiben
+
+    self.cgUnitTag     := utSaved;      // #1655
+    self.cgUnitTagLen  := utSavedLen;
+    self.cgUnitPrivTab := utSavedTab;
+    self.cgUnitPrivCnt := utSavedCnt;
+    self.cgUnitPrivCap := utSavedCap;
 
     // Restore main file's source and nodes
     self.pSrc   := savedSrc;
@@ -18014,7 +18238,18 @@ pub type Codegen = class {
       if (k == CGN_FUNC_DECL) {
         var fname: pchar := self.cg_nsval(cur);
         var fnlen: int64 := self.cg_nslen(cur);
-        self.cg_addLabel(fname, fnlen, 0);  // imported: no source line
+        // #1655: dieselbe Marke wie bei der Erzeugung — sonst stuende der
+        // schlichte Name doch wieder im Verzeichnis und faenge Aufrufe aus
+        // fremden Units ein.
+        if (self.cgUnitTag != 0 && peek64(self.cg_noff(cur) + CG_OFF_ISPUB) == 0 &&
+            self.cg_unitPrivHat(fname, fnlen) != 0) {
+          var clc: int64 := alloc(8);
+          var cb:  int64 := self.cg_unitPrivMangle(fname, fnlen, clc);
+          self.cg_addLabel(cb as pchar, peek64(clc), 0);
+          free(clc, 8);
+        } else {
+          self.cg_addLabel(fname, fnlen, 0);  // imported: no source line
+        }
       }
       cur := self.cg_nnext(cur);
     }
@@ -18933,6 +19168,11 @@ pub type Codegen = class {
     // #1262: Aliastabelle (Platz fuer 256 Eintraege: Zeiger + Laenge).
     self.cgAliasTab      := alloc(256 * 16);
     self.cgAliasTabCount := 0;
+    self.cgUnitTag    := 0;   // #1655
+    self.cgUnitTagLen := 0;
+    self.cgUnitPrivCap := 128;
+    self.cgUnitPrivTab := alloc(self.cgUnitPrivCap * 16);
+    self.cgUnitPrivCnt := 0;
 
     // #1389: kernelMode wird hier NICHT genullt. `new` liefert das Feld bereits
     // als 0, und cg_emitHelpers() laeuft am Ende dieses Init — der Aufrufer

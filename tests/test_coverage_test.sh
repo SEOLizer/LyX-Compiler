@@ -46,6 +46,15 @@ is_exempt() {
                                           # importiert — allein uebersetzt
                                           # haetten sie kein main und nichts
                                           # zu melden.
+    data/runde12/m/a.lyx)    return 0 ;;  # #1655: Pruefdaten, kein Test. Vier
+    data/runde12/m/b.lyx)    return 0 ;;  # Units mit je einer gleichnamigen
+    data/runde12/n/a.lyx)    return 0 ;;  # PRIVATEN Funktion, die
+    data/runde12/n/b.lyx)    return 0 ;;  # stille_fehlfunktion_runde12_test.sh
+                                          # in beiden Import-Reihenfolgen
+                                          # einbindet — allein uebersetzt haben
+                                          # sie kein main.
+    data/runde12/q/a.lyx)    return 0 ;;  # #1655: dasselbe eine Ebene tiefer —
+    data/runde12/q/b.lyx)    return 0 ;;  # geschachtelte private Funktionen.
     lib/lyxc_guard.sh)       return 0 ;;  # #1294: Bibliothek, kein Test — wird
                                           # von den Scripts eingebunden und vom
                                           # Waechter lyxc_guard_coverage_test.sh
