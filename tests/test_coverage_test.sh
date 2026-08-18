@@ -55,6 +55,8 @@ is_exempt() {
                                           # sie kein main.
     data/runde12/q/a.lyx)    return 0 ;;  # #1655: dasselbe eine Ebene tiefer —
     data/runde12/q/b.lyx)    return 0 ;;  # geschachtelte private Funktionen.
+    data/runde13/enums.lyx)  return 0 ;;  # #1647: Pruefdaten — eine importierte
+                                          # Unit mit Enum, kein Test.
     lib/lyxc_guard.sh)       return 0 ;;  # #1294: Bibliothek, kein Test — wird
                                           # von den Scripts eingebunden und vom
                                           # Waechter lyxc_guard_coverage_test.sh
