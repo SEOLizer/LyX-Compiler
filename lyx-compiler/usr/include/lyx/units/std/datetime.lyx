@@ -194,6 +194,8 @@ fn _dt_sod(ts: int64): int64 {
 
 // Emit 2-digit zero-padded integer at pos; return new pos
 fn _dt_emit2(output: pchar, pos: int64, val: int64): int64 {
+    // #1605: ausserhalb 0..99 gibt es keine zweistellige Darstellung.
+    if (val < 0 || val > 99) { return _dt_emitNum(output, pos, val); }
     StrSetChar(output, pos,     (val / 10) + 48);
     StrSetChar(output, pos + 1, (val % 10) + 48);
     return pos + 2;
@@ -201,6 +203,9 @@ fn _dt_emit2(output: pchar, pos: int64, val: int64): int64 {
 
 // Emit 4-digit zero-padded integer at pos; return new pos
 fn _dt_emit4(output: pchar, pos: int64, val: int64): int64 {
+    // #1605: Jahre ausserhalb 1000..9999 (auch negative) erzeugten Muell —
+    // vollstaendig ausgeben ist die einzige ehrliche Antwort.
+    if (val < 0 || val > 9999) { return _dt_emitNum(output, pos, val); }
     StrSetChar(output, pos,     (val / 1000) + 48);
     StrSetChar(output, pos + 1, ((val / 100) % 10) + 48);
     StrSetChar(output, pos + 2, ((val / 10) % 10) + 48);
@@ -220,32 +225,46 @@ fn _dt_emitStr(output: pchar, pos: int64, s: pchar): int64 {
 }
 
 // Emit decimal integer (variable digit count) at pos; return new pos
+//
+// #1605: Die Funktion hoerte bei vier Stellen auf — ein groesserer Wert verlor
+// alles darueber, und die verbleibenden Stellen sahen aus wie ein Ergebnis.
+// Jetzt wird die Zahl gezaehlt statt geraten. Der Kalenderkern selbst rechnet
+// richtig (7236 Datensaetze gegen Pythons datetime, null Abweichungen); falsch
+// war allein die Zeichenausgabe.
 fn _dt_emitNum(output: pchar, pos: int64, val: int64): int64 {
-    if (val < 0) {
-        StrSetChar(output, pos, 45);
+    var w: int64 := val;
+    if (w < 0) {
+        StrSetChar(output, pos, 45);      // '-'
         pos += 1;
-        val := -val;
+        w := 0 - w;
     }
-    if (val < 10) {
-        StrSetChar(output, pos, val + 48);
+    if (w == 0) {
+        StrSetChar(output, pos, 48);
         return pos + 1;
     }
-    if (val < 100) {
-        StrSetChar(output, pos,     (val / 10) + 48);
-        StrSetChar(output, pos + 1, (val % 10) + 48);
-        return pos + 2;
+    // Stellenzahl bestimmen, dann von hinten fuellen.
+    var stellen: int64 := 0;
+    var rest: int64 := w;
+    while (rest > 0) { stellen := stellen + 1; rest := rest / 10; }
+    var i: int64 := stellen - 1;
+    rest := w;
+    while (i >= 0) {
+        StrSetChar(output, pos + i, (rest % 10) + 48);
+        rest := rest / 10;
+        i := i - 1;
     }
-    if (val < 1000) {
-        StrSetChar(output, pos,     (val / 100) + 48);
-        StrSetChar(output, pos + 1, ((val / 10) % 10) + 48);
-        StrSetChar(output, pos + 2, (val % 10) + 48);
-        return pos + 3;
-    }
-    StrSetChar(output, pos,     (val / 1000) + 48);
-    StrSetChar(output, pos + 1, ((val / 100) % 10) + 48);
-    StrSetChar(output, pos + 2, ((val / 10) % 10) + 48);
-    StrSetChar(output, pos + 3, (val % 10) + 48);
-    return pos + 4;
+    return pos + stellen;
+}
+
+// #1605: zweistellig mit fuehrender Null — aber nur, wenn der Wert auch
+// zweistellig IST. Ausserhalb von 0..99 wuerde die Stellenrechnung Zeichen
+// unterhalb von '0' erzeugen (aus -45 wurde ",+"); dann lieber die Zahl
+// vollstaendig ausgeben als etwas Falsches in der richtigen Breite.
+fn _dt_emit2s(output: pchar, pos: int64, val: int64): int64 {
+    if (val < 0 || val > 99) { return _dt_emitNum(output, pos, val); }
+    StrSetChar(output, pos,     (val / 10) + 48);
+    StrSetChar(output, pos + 1, (val % 10) + 48);
+    return pos + 2;
 }
 
 // ============================================================================
@@ -318,6 +337,7 @@ pub fn Format(datetime: int64, fmt: pchar, output: pchar): int64 {
     var dow: int64 := dow_raw;  // 0=Sunday
     var fmt_len: int64 := StrLen(fmt);
     var out_pos: int64 := 0;
+    var unbekannt: int64 := 0;      // #1602
     var i: int64 := 0;
     while (i < fmt_len) {
         var c: int64 := StrCharAt(fmt, i);
@@ -369,7 +389,34 @@ pub fn Format(datetime: int64, fmt: pchar, output: pchar): int64 {
                 out_pos := _dt_emit2(output, out_pos, (tz_abs % 3600) / 60);
             } else if (spec == 90) {                     // %Z - timezone name
                 out_pos := _dt_emitStr(output, out_pos, "UTC");
+            } else if (spec == 73) {                     // %I - Stunde 01-12
+                // #1602: `%p` gab AM/PM aus, die 12-Stunden-Zahl gab es nicht —
+                // damit war %p fuer sich genommen nutzlos ("14:30 PM"). Die
+                // Umrechnung stand schon in FormatLocale fuer en_US.
+                var h12: int64 := hour % 12;
+                if (h12 == 0) { h12 := 12; }
+                out_pos := _dt_emit2(output, out_pos, h12);
+            } else if (spec == 106) {                    // %j - Tag im Jahr 001-366
+                // #1602: DayOfYear ist in dieser Unit oeffentlich und rechnet
+                // richtig; es fehlte allein die Anbindung.
+                var doy: int64 := DayOfYear(year, month, day);
+                out_pos := _dt_emit2(output, out_pos, doy / 10);
+                StrSetChar(output, out_pos, (doy % 10) + 48);
+                out_pos += 1;
+            } else if (spec == 37) {                     // %% - ein Prozentzeichen
+                // #1602: Ohne Escape liess sich ein Prozentzeichen ueberhaupt
+                // nicht ausgeben.
+                StrSetChar(output, out_pos, 37);
+                out_pos += 1;
             } else {
+                // #1602: Ein unbekannter Spezifizierer landete WOERTLICH in der
+                // Ausgabe — der Aufruf meldete Erfolg, die Zeichenkette sah
+                // plausibel aus, und ein Tippfehler im Formatstring fiel erst
+                // beim Lesen auf. Er wird weiterhin durchgereicht (eine
+                // Formatierung soll nicht mitten im Text abbrechen), aber der
+                // Rueckgabewert sagt es jetzt: negativ heisst "es standen
+                // unbekannte Spezifizierer darin".
+                unbekannt := unbekannt + 1;
                 StrSetChar(output, out_pos, 37);
                 out_pos += 1;
                 StrSetChar(output, out_pos, spec);
@@ -382,6 +429,11 @@ pub fn Format(datetime: int64, fmt: pchar, output: pchar): int64 {
         i += 1;
     }
     StrSetChar(output, out_pos, 0);
+    // #1602: Die Ausgabe steht vollstaendig im Puffer; der Rueckgabewert
+    // unterscheidet jetzt zwischen "alles verstanden" (Laenge) und "es waren
+    // unbekannte Spezifizierer dabei" (negative Laenge). Wer ihn wie bisher
+    // ignoriert, bekommt dieselbe Zeichenkette wie zuvor.
+    if (unbekannt > 0) { return 0 - out_pos; }
     return out_pos;
 }
 
@@ -598,6 +650,7 @@ pub fn FormatLocale(datetime: int64, locale: pchar, output: pchar): int64 {
 // Parse YYYY-MM-DD. year/month/day are int64 pointers (poke64 targets).
 // Returns 1 on success, 0 on error.
 pub fn ParseDate(input: pchar, year: int64, month: int64, day: int64): int64 {
+    poke64(year, 0); poke64(month, 0); poke64(day, 0);   // #1603
     if (input == 0) { return 0; }
     var len: int64 := StrLen(input);
     if (len < 10) { return 0; }
@@ -616,6 +669,7 @@ pub fn ParseDate(input: pchar, year: int64, month: int64, day: int64): int64 {
 // Parse HH:MM:SS or HH:MM. hour/minute/second are int64 pointers.
 // Returns 1 on success, 0 on error.
 pub fn ParseTime(input: pchar, hour: int64, minute: int64, second: int64): int64 {
+    poke64(hour, 0); poke64(minute, 0); poke64(second, 0);   // #1603
     if (input == 0) { return 0; }
     var len: int64 := StrLen(input);
     if (len < 5) { return 0; }
@@ -636,6 +690,7 @@ pub fn ParseTime(input: pchar, hour: int64, minute: int64, second: int64): int64
 // Parse ISO 8601 (YYYY-MM-DDTHH:MM:SSZ). result is int64 pointer.
 // Returns 1 on success, 0 on error.
 pub fn ParseIso(input: pchar, result: int64): int64 {
+    poke64(result, 0);            // #1603: definierter Wert bei Misserfolg
     if (input == 0) { return 0; }
     var len: int64 := StrLen(input);
     if (len < 19) { return 0; }
@@ -661,6 +716,7 @@ pub fn ParseIso(input: pchar, result: int64): int64 {
 // Parse RFC 2822 (Www, DD Mon YYYY HH:MM:SS +ZZZZ). result is int64 pointer.
 // Returns 1 on success, 0 on error.
 pub fn ParseRfc2822(input: pchar, result: int64): int64 {
+    poke64(result, 0);            // #1603
     if (input == 0) { return 0; }
     var len: int64 := StrLen(input);
     if (len < 25) { return 0; }
@@ -704,8 +760,55 @@ pub fn ParseRfc2822(input: pchar, result: int64): int64 {
 
 // Try ISO 8601 first, then RFC 2822. result is int64 pointer.
 pub fn ParseFlexible(input: pchar, result: int64): int64 {
+    // #1603: "Flexible" versuchte genau ZWEI Formate — ausgerechnet das
+    // haeufigste Eingabeformat, ein reines Datum ohne Uhrzeit, scheiterte.
+    // Und der Zielpuffer blieb bei Misserfolg UNBERUEHRT: wer den
+    // Rueckgabewert nicht prueft, liest beim Einlesen in einer Schleife den
+    // zuletzt erfolgreich gelesenen Wert weiter — eine unlesbare Zeile in der
+    // Mitte ergibt dann zwei gleiche Zeitstempel statt eines Fehlers.
+    //
+    // Deshalb: erst den Puffer auf einen offensichtlich falschen Wert setzen
+    // (0 = 1970-01-01), dann der Reihe nach probieren.
+    poke64(result, 0);
+    if (input == 0 as pchar) { return 0; }
     if (ParseIso(input, result) == 1) { return 1; }
-    return ParseRfc2822(input, result);
+    if (ParseRfc2822(input, result) == 1) { return 1; }
+
+    var len: int64 := StrLen(input);
+
+    // ISO-Datum ohne Zeitanteil: 2026-08-17 → Mitternacht.
+    if (len >= 10 && StrCharAt(input, 4) == 45 && StrCharAt(input, 7) == 45) {
+        var jy: int64 := _dt_parse4(input, 0);
+        var jm: int64 := _dt_parse2(input, 5);
+        var jd: int64 := _dt_parse2(input, 8);
+        if (jm >= 1 && jm <= 12 && jd >= 1 && jd <= 31) {
+            poke64(result, _dt_days_from_civil(jy, jm, jd) * 86400);
+            return 1;
+        }
+    }
+
+    // Deutsche Schreibweise: 17.08.2026, optional mit " 14:30" oder
+    // " 14:30:00". FormatLocale ERZEUGT dieses Format seit #1415 — bis hierher
+    // gab es kein Gegenstueck zum Einlesen.
+    if (len >= 10 && StrCharAt(input, 2) == 46 && StrCharAt(input, 5) == 46) {
+        var dd: int64 := _dt_parse2(input, 0);
+        var dm: int64 := _dt_parse2(input, 3);
+        var dy: int64 := _dt_parse4(input, 6);
+        if (dm >= 1 && dm <= 12 && dd >= 1 && dd <= 31) {
+            var sek: int64 := 0;
+            if (len >= 16 && StrCharAt(input, 10) == 32 && StrCharAt(input, 13) == 58) {
+                var dh: int64 := _dt_parse2(input, 11);
+                var dmin: int64 := _dt_parse2(input, 14);
+                var dsec: int64 := 0;
+                if (len >= 19 && StrCharAt(input, 16) == 58) { dsec := _dt_parse2(input, 17); }
+                if (dh <= 23 && dmin <= 59 && dsec <= 59) { sek := dh * 3600 + dmin * 60 + dsec; }
+            }
+            poke64(result, _dt_days_from_civil(dy, dm, dd) * 86400 + sek);
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 // ============================================================================
@@ -843,36 +946,41 @@ pub fn FormatRelative(datetime: int64, output: pchar): int64 {
 
 // Format duration (e.g., "1h 30m 45s")
 pub fn FormatDuration(seconds: int64, output: pchar): int64 {
-    var hours: int64 := seconds / 3600;
-    var mins: int64 := (seconds % 3600) / 60;
-    var secs: int64 := seconds % 60;
+    // #1605: Eine negative Dauer ergab Leerstring oder Muell — alle drei
+    // Ausgabezweige haengen an `> 0`, und aus -45 wurde ",+s" ((-45/10)+48
+    // = ',' ). Negativ ist kein exotischer Fall: DiffSeconds(a, b) rechnet
+    // b - a, und wer "spaeter, frueher" uebergibt, bekommt genau das.
+    // Deshalb Vorzeichen abspalten und mit dem Betrag weiterrechnen.
     var out_pos: int64 := 0;
+    var rest: int64 := seconds;
+    if (rest < 0) {
+        StrSetChar(output, out_pos, 45);      // '-'
+        out_pos := out_pos + 1;
+        rest := 0 - rest;
+    }
+    var hours: int64 := rest / 3600;
+    var mins: int64 := (rest % 3600) / 60;
+    var secs: int64 := rest % 60;
     if (hours > 0) {
-        if (hours >= 100) {
-            StrSetChar(output, out_pos, (hours / 100) + 48); out_pos := out_pos + 1;
-            StrSetChar(output, out_pos, ((hours / 10) % 10) + 48); out_pos := out_pos + 1;
-            StrSetChar(output, out_pos, (hours % 10) + 48); out_pos := out_pos + 1;
-        } else if (hours >= 10) {
-            StrSetChar(output, out_pos, (hours / 10) + 48); out_pos := out_pos + 1;
-            StrSetChar(output, out_pos, (hours % 10) + 48); out_pos := out_pos + 1;
-        } else {
-            StrSetChar(output, out_pos, hours + 48); out_pos := out_pos + 1;
-        }
-        StrSetChar(output, out_pos, 104); out_pos := out_pos + 1;
-        StrSetChar(output, out_pos, 32); out_pos := out_pos + 1;
+        // #1605: die Stundenzahl ist nach oben offen (1000 h sind 41 Tage).
+        // Frueher endete die Handschrift bei drei Stellen, ab 1000 h stand
+        // dort ein Zeichen unterhalb von '0'.
+        out_pos := _dt_emitNum(output, out_pos, hours);
+        StrSetChar(output, out_pos, 104); out_pos := out_pos + 1;   // 'h'
+        // Das Leerzeichen nur, wenn wirklich etwas folgt — sonst endete die
+        // Ausgabe auf einem Leerzeichen ("1h ").
+        if (mins > 0 || secs > 0) { StrSetChar(output, out_pos, 32); out_pos := out_pos + 1; }
     }
     if (mins > 0 || (hours > 0 && secs > 0)) {
-        StrSetChar(output, out_pos, (mins / 10) + 48); out_pos := out_pos + 1;
-        StrSetChar(output, out_pos, (mins % 10) + 48); out_pos := out_pos + 1;
-        StrSetChar(output, out_pos, 109); out_pos := out_pos + 1;
+        out_pos := _dt_emit2s(output, out_pos, mins);
+        StrSetChar(output, out_pos, 109); out_pos := out_pos + 1;   // 'm'
         if (secs > 0) {
             StrSetChar(output, out_pos, 32); out_pos := out_pos + 1;
         }
     }
     if (secs > 0 || (hours == 0 && mins == 0)) {
-        StrSetChar(output, out_pos, (secs / 10) + 48); out_pos := out_pos + 1;
-        StrSetChar(output, out_pos, (secs % 10) + 48); out_pos := out_pos + 1;
-        StrSetChar(output, out_pos, 115); out_pos := out_pos + 1;
+        out_pos := _dt_emit2s(output, out_pos, secs);
+        StrSetChar(output, out_pos, 115); out_pos := out_pos + 1;   // 's'
     }
     StrSetChar(output, out_pos, 0);
     return out_pos;
@@ -880,28 +988,23 @@ pub fn FormatDuration(seconds: int64, output: pchar): int64 {
 
 // Format short duration (e.g., "1:30:45" or "30:45")
 pub fn FormatDurationShort(seconds: int64, output: pchar): int64 {
-    var hours: int64 := seconds / 3600;
-    var mins: int64 := (seconds % 3600) / 60;
-    var secs: int64 := seconds % 60;
     var out_pos: int64 := 0;
-    if (hours > 0) {
-        if (hours >= 100) {
-            StrSetChar(output, out_pos, (hours / 100) + 48); out_pos := out_pos + 1;
-            StrSetChar(output, out_pos, ((hours / 10) % 10) + 48); out_pos := out_pos + 1;
-            StrSetChar(output, out_pos, (hours % 10) + 48); out_pos := out_pos + 1;
-        } else if (hours >= 10) {
-            StrSetChar(output, out_pos, (hours / 10) + 48); out_pos := out_pos + 1;
-            StrSetChar(output, out_pos, (hours % 10) + 48); out_pos := out_pos + 1;
-        } else {
-            StrSetChar(output, out_pos, hours + 48); out_pos := out_pos + 1;
-        }
-        StrSetChar(output, out_pos, 58); out_pos := out_pos + 1;
+    var rest: int64 := seconds;
+    if (rest < 0) {                            // #1605
+        StrSetChar(output, out_pos, 45);
+        out_pos := out_pos + 1;
+        rest := 0 - rest;
     }
-    StrSetChar(output, out_pos, (mins / 10) + 48); out_pos := out_pos + 1;
-    StrSetChar(output, out_pos, (mins % 10) + 48); out_pos := out_pos + 1;
+    var hours: int64 := rest / 3600;
+    var mins: int64 := (rest % 3600) / 60;
+    var secs: int64 := rest % 60;
+    if (hours > 0) {
+        out_pos := _dt_emitNum(output, out_pos, hours);    // #1605: unbegrenzt
+        StrSetChar(output, out_pos, 58); out_pos := out_pos + 1;   // ':'
+    }
+    out_pos := _dt_emit2s(output, out_pos, mins);
     StrSetChar(output, out_pos, 58); out_pos := out_pos + 1;
-    StrSetChar(output, out_pos, (secs / 10) + 48); out_pos := out_pos + 1;
-    StrSetChar(output, out_pos, (secs % 10) + 48); out_pos := out_pos + 1;
+    out_pos := _dt_emit2s(output, out_pos, secs);
     StrSetChar(output, out_pos, 0);
     return out_pos;
 }
@@ -1117,6 +1220,96 @@ pub fn WeekNumber(year: int64, month: int64, day: int64): int64 {
         if (d >= week1_start) { return 1; }
     }
     return w;
+}
+
+// ============================================================================
+// #1601: Kalenderwerte <-> Zeitstempel
+//
+// Die Unit rechnete durchgehend auf Unix-Sekunden, bot aber keinen Weg, so
+// einen Wert aus Jahr/Monat/Tag zu BAUEN oder ihn wieder zu ZERLEGEN. Die
+// Helfer dafuer lagen seit jeher da, nur privat; der einzige Weg fuehrte ueber
+// eine Zeichenkette (ISO-String zusammensetzen, ParseIso) beziehungsweise ueber
+// Format("%Y") und Zurueckwandeln. Fuer eine Unit, die den Wert intern in
+// Einzelteilen vorliegen hat, ist das ein Umweg ueber Textformatierung.
+//
+// std.time hat passende Funktionen, ist aber wegen DaysInMonth nicht gemeinsam
+// mit std.datetime importierbar (#1262) — der Ausweg faellt also aus.
+// ============================================================================
+
+// Zeitstempel aus Kalenderwerten. Ohne Gueltigkeitspruefung: wer sie will,
+// ruft vorher IsValidDateTime.
+pub fn DatetimeFromYmdHms(year: int64, month: int64, day: int64,
+                          hour: int64, minute: int64, second: int64): int64 {
+    return _dt_days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
+}
+
+pub fn DatetimeFromYmd(year: int64, month: int64, day: int64): int64 {
+    return _dt_days_from_civil(year, month, day) * 86400;
+}
+
+pub fn YearOf(dt: int64): int64   { return _dt_year_from_days(_dt_days(dt)); }
+pub fn MonthOf(dt: int64): int64  { return _dt_month_from_days(_dt_days(dt)); }
+pub fn DayOf(dt: int64): int64    { return _dt_day_from_days(_dt_days(dt)); }
+pub fn HourOf(dt: int64): int64   { return _dt_sod(dt) / 3600; }
+pub fn MinuteOf(dt: int64): int64 { return (_dt_sod(dt) % 3600) / 60; }
+pub fn SecondOf(dt: int64): int64 { return _dt_sod(dt) % 60; }
+
+// Wochentag als ZAHL. WeekdayShort/WeekdayLong erwarten genau diese Zahl
+// (0 = Sonntag), es gab in dieser Unit aber nichts, was sie liefert — die
+// Namensfunktionen waren damit ohne Fremdhilfe nicht benutzbar.
+pub fn DayOfWeek(dt: int64): int64 {
+    var r: int64 := (_dt_days(dt) + 4) % 7;
+    if (r < 0) { r := r + 7; }
+    return r;
+}
+
+pub fn DayOfWeekYmd(year: int64, month: int64, day: int64): int64 {
+    var r: int64 := (_dt_days_from_civil(year, month, day) + 4) % 7;
+    if (r < 0) { r := r + 7; }
+    return r;
+}
+
+// ISO-Wochenjahr. WeekNumber(2025, 12, 29) liefert 1 — das ist KW 1 von 2026.
+// Ohne diese Funktion setzt der Aufrufer "2025-W01" zusammen und liegt um ein
+// Jahr daneben.
+pub fn WeekYear(year: int64, month: int64, day: int64): int64 {
+    var w: int64 := WeekNumber(year, month, day);
+    if (w >= 52 && month == 1)  { return year - 1; }
+    if (w == 1  && month == 12) { return year + 1; }
+    return year;
+}
+
+// #1601: die Einheiten zwischen Sekunde und Monat fehlten.
+pub fn AddMinutes(datetime: int64, minutes: int64): int64 { return datetime + minutes * 60; }
+pub fn AddHours(datetime: int64, hours: int64): int64     { return datetime + hours * 3600; }
+pub fn AddWeeks(datetime: int64, weeks: int64): int64     { return datetime + weeks * 604800; }
+
+// Vollstaendige Monate bzw. Jahre zwischen zwei Zeitpunkten — angefangene
+// zaehlen nicht. Genau das braucht die haeufigste Anwendung ueberhaupt, das
+// Alter aus einem Geburtsdatum; mit DiffDays und Division durch 365 wird es
+// falsch.
+pub fn DiffMonths(von: int64, bis: int64): int64 {
+    var m: int64 := (YearOf(bis) - YearOf(von)) * 12 + (MonthOf(bis) - MonthOf(von));
+    var tagRest: int64 := DayOf(bis) - DayOf(von);
+    if (tagRest < 0) { m := m - 1; }
+    else if (tagRest == 0 && _dt_sod(bis) < _dt_sod(von)) { m := m - 1; }
+    return m;
+}
+
+pub fn DiffYears(von: int64, bis: int64): int64 { return DiffMonths(von, bis) / 12; }
+
+// Tages- und Monatsgrenzen — der Normalfall jeder Auswertung.
+pub fn StartOfDay(dt: int64): int64 { return _dt_days(dt) * 86400; }
+pub fn EndOfDay(dt: int64): int64   { return _dt_days(dt) * 86400 + 86399; }
+
+pub fn StartOfMonth(dt: int64): int64 {
+    return _dt_days_from_civil(YearOf(dt), MonthOf(dt), 1) * 86400;
+}
+
+pub fn EndOfMonth(dt: int64): int64 {
+    var j: int64 := YearOf(dt);
+    var mo: int64 := MonthOf(dt);
+    return _dt_days_from_civil(j, mo, DaysInMonth(j, mo)) * 86400 + 86399;
 }
 
 // Day of year (1–366)
