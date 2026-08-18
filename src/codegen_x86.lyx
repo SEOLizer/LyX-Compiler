@@ -12624,10 +12624,56 @@ pub type Codegen = class {
         free(fpos, 8 * 8); free(fcls, 8 * 8); free(ipos, 8 * 8);
       }
 
-      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xE3);            // mov r11, rsp
-      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE4); self.cg_e8(0xF0);  // and rsp, -16
-      self.cg_e8(0x41); self.cg_e8(0x53);                              // push r11
-      self.cg_e8(0x41); self.cg_e8(0x53);                              // push r11 (keep 16-align)
+      // #1620: Ab dem SIEBTEN Argument laufen die Werte ueber den Stapel. Sie
+      // liegen an dieser Stelle bereits dort (arg6 bei [rsp+0], arg7 bei
+      // [rsp+8], …) — und genau das machte die Ausrichtung darunter kaputt:
+      // `and rsp, -16` plus zwei `push r11` verschieben den Stapel um 0..24
+      // Byte, und der Callee las an [rsp+8] nicht arg7, sondern einen Rest.
+      // Sechs Argumente gingen gut, weil sie in Registern liegen; native
+      // Lyx-Aufrufe ebenso, weil sie ohne Ausrichtung auskommen. Der Fehler
+      // war teilweise still: XCreateSimpleWindow lieferte ein Fenster, nur
+      // mit falschen Werten.
+      //
+      // Deshalb bei Stapelargumenten: alten Stapelzeiger in rbx sichern (das
+      // Register muss der Callee erhalten), ausgerichteten Platz schaffen, die
+      // Argumente dorthin KOPIEREN und danach alles zurueckdrehen.
+      var stackN: int64 := 0;
+      if (argc > 6) { stackN := argc - 6; }
+      if (stackN > 0) {
+        var kopieSz: int64 := stackN * 8;
+        while ((kopieSz & 15) != 0) { kopieSz := kopieSz + 8; }   // auf 16 aufrunden
+        self.cg_e8(0x53);                                                // push rbx
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE3);            // mov rbx, rsp
+        self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE4); self.cg_e8(0xF0);  // and rsp, -16
+        if (kopieSz <= 127) {
+          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(kopieSz);   // sub rsp, imm8
+        } else {
+          self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xEC); self.cg_e32(kopieSz);  // sub rsp, imm32
+        }
+        // Die Argumente an ihren neuen, ausgerichteten Platz kopieren.
+        // Quelle: [rbx + 8 + i*8] (die 8 ueberspringt das gesicherte rbx).
+        var ci: int64 := 0;
+        while (ci < stackN) {
+          var qOff: int64 := 8 + ci * 8;
+          var zOff: int64 := ci * 8;
+          if (qOff <= 127) {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x43); self.cg_e8(qOff);          // mov rax, [rbx+qOff]
+          } else {
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x83); self.cg_e32(qOff);         // mov rax, [rbx+qOff32]
+          }
+          if (zOff <= 127) {
+            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(zOff);   // mov [rsp+zOff], rax
+          } else {
+            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x84); self.cg_e8(0x24); self.cg_e32(zOff);  // mov [rsp+zOff32], rax
+          }
+          ci := ci + 1;
+        }
+      } else {
+        self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xE3);            // mov r11, rsp
+        self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE4); self.cg_e8(0xF0);  // and rsp, -16
+        self.cg_e8(0x41); self.cg_e8(0x53);                              // push r11
+        self.cg_e8(0x41); self.cg_e8(0x53);                              // push r11 (keep 16-align)
+      }
       // #1486: al traegt die Zahl der benutzten xmm-Register. Variadische
       // C-Funktionen (printf und Verwandte) lesen sie; mit 0 speichern sie
       // keine Gleitkommaargumente.
@@ -12636,8 +12682,16 @@ pub type Codegen = class {
       var ppx: int64 := self.codeLen;
       self.cg_e32(0);
       self.cg_addPatch(ppx, exIdx, 0, CG_PATCH_EXTERN);
-      self.cg_e8(0x41); self.cg_e8(0x5B);                              // pop r11
-      self.cg_e8(0x5C);                                                 // pop rsp (restore)
+      if (stackN > 0) {
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xDC);            // mov rsp, rbx
+        self.cg_e8(0x5B);                                                // pop rbx
+        // Die urspruenglich gepushten Stapelargumente wieder abraeumen —
+        // dieselbe Aufgabe, die cg_popStackArgs fuer Lyx-Aufrufe erledigt.
+        self.cg_popStackArgs(argc);
+      } else {
+        self.cg_e8(0x41); self.cg_e8(0x5B);                              // pop r11
+        self.cg_e8(0x5C);                                                 // pop rsp (restore)
+      }
 
       // #1486: Gleitkomma-Rueckgaben kommen in xmm0, gelesen wurde rax.
       if (declNi >= 0) {
@@ -12647,6 +12701,25 @@ pub type Codegen = class {
         }
         if (rcls != 0) {
           self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);  // movq rax, xmm0
+        }
+        // #1607: Eine C-Funktion, die `int` liefert, schreibt nur eax. Die
+        // oberen 32 Bit von rax tragen dann, was zufaellig darin lag — aus -1
+        // wurde 4294967295, und `if (n < 0)` erkannte den Fehler NIE. Steht in
+        // der Deklaration eine schmalere Breite, wird sie jetzt richtig
+        // erweitert: vorzeichenbehaftet mit movsx, vorzeichenlos mit movzx.
+        var iw: int64 := (self.cg_nival(declNi) >> 50) & 7;
+        if (iw == 1) {
+          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBE); self.cg_e8(0xC0);  // movsx rax, al
+        } else if (iw == 2) {
+          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBF); self.cg_e8(0xC0);  // movsx rax, ax
+        } else if (iw == 3) {
+          self.cg_e8(0x48); self.cg_e8(0x63); self.cg_e8(0xC0);                    // movsxd rax, eax
+        } else if (iw == 4) {
+          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);  // movzx rax, al
+        } else if (iw == 5) {
+          self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB7); self.cg_e8(0xC0);  // movzx rax, ax
+        } else if (iw == 6) {
+          self.cg_e8(0x89); self.cg_e8(0xC0);                                      // mov eax, eax
         }
       }
 
