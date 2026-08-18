@@ -4333,12 +4333,27 @@ pub type Codegen = class {
     }
     if (k == CGN_IDENT) {
       var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
-      if (idx < 0) { return 0 - 1; }
-      var tb: int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
-      var cln: pchar := peek64(tb) as pchar;
-      var clnLen: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
-      if (cln == 0 as pchar || clnLen <= 0) { return 0 - 1; }
-      return self.cg_findClass(cln, clnLen);
+      if (idx >= 0) {
+        var tb: int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
+        var cln: pchar := peek64(tb) as pchar;
+        var clnLen: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+        if (cln == 0 as pchar || clnLen <= 0) { return 0 - 1; }
+        return self.cg_findClass(cln, clnLen);
+      }
+      // #1631: Kein Local dieses Namens — dann kann es eine GLOBALE Variable
+      // sein. Ihr Typname steht seit #1094 in globalTypeNames; hier wurde er
+      // nie gelesen, und damit blieb der Klassenindex -1. Ein verketteter
+      // Aufruf `g.Item(0).SetS(...)` fand deshalb keinen Empfaengertyp und
+      // brach mit "no codegen implementation found" ab — dieselbe Zeile mit
+      // einer lokalen Variablen uebersetzte. Dieselbe Auskunft holt sich der
+      // Schreibpfad seit #1256 an genau dieser Stelle.
+      var gidxC: int64 := self.cg_findGlobalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (gidxC >= 0) {
+        var gpC: pchar := peek64(self.globalTypeNames + gidxC * 16) as pchar;
+        var glC: int64 := peek64(self.globalTypeNames + gidxC * 16 + 8);
+        if (gpC != 0 as pchar && glC > 0) { return self.cg_findClass(gpC, glC); }
+      }
+      return 0 - 1;
     }
     if (k == CGN_BINOP) {
       var bop: int64 := self.cg_nival(ni);
@@ -5695,7 +5710,26 @@ pub type Codegen = class {
     // stay valid because every class reserves offset 0 for the VMT pointer.
     if (parentFieldCnt > 0) { memcpy(flds, parentFldsPtr, parentFieldCnt * CG_CFIELD_SZ); }
     // WP-10a: offset 0 = VMT ptr; own fields continue after the base fields.
-    var offset: int64 := 8 + parentFieldCnt * 8;
+    //
+    // #1630: Hier stand `8 + parentFieldCnt * 8` — die Rechnung unterstellte,
+    // dass JEDES Feld der Basisklasse acht Byte belegt. Ein inline liegendes
+    // `[64]int64` belegt aber 512. Das erste eigene Feld der Ableitung landete
+    // damit MITTEN im Array der Basisklasse und ueberschrieb es samt der
+    // dahinter liegenden Basisfelder — ohne Warnung, der Code lief.
+    //
+    // Die Basisfelder wurden gerade eben mitsamt ihren Offsets und Breiten
+    // hierher kopiert; das Ende ergibt sich also aus ihnen selbst.
+    var offset: int64 := 8;
+    var pf: int64 := 0;
+    while (pf < parentFieldCnt) {
+      var pfb: int64 := flds + pf * CG_CFIELD_SZ;
+      var pfBytes: int64 := peek64(pfb + CG_CFIELD_OFF_BYTES);
+      if (pfBytes <= 0) { pfBytes := 8; }
+      var pfEnde: int64 := peek64(pfb + CG_CFIELD_OFF_OFFSET) + pfBytes;
+      if (pfEnde > offset) { offset := pfEnde; }
+      pf := pf + 1;
+    }
+    while ((offset & 7) != 0) { offset := offset + 1; }   // 8er-Ausrichtung
     var i: int64 := parentFieldCnt;
     tmp := fieldNode;
     while (tmp != -1) {
@@ -5987,7 +6021,21 @@ pub type Codegen = class {
     var natAlign: int64 := 0;
     if (istStruct != 0 && isPacked == 0) { natAlign := 1; }
     // Structs: fields start at offset 0 (no VMT slot); derived continue after base.
-    var offset: int64 := parentFieldCnt * 8;
+    // #1630: auch hier galt "jedes Basisfeld ist acht Byte breit". Dieselbe
+    // Rechnung wie im Klassen-Layout: das Ende ergibt sich aus den gerade
+    // kopierten Feldern selbst. Ein Typ OHNE Methoden laeuft ueber diesen
+    // Bauweg — die Ableitung im Bericht ist genau so einer.
+    var offset: int64 := 0;
+    var pfS: int64 := 0;
+    while (pfS < parentFieldCnt) {
+      var pfbS: int64 := flds + pfS * CG_CFIELD_SZ;
+      var pfBytesS: int64 := peek64(pfbS + CG_CFIELD_OFF_BYTES);
+      if (pfBytesS <= 0) { pfBytesS := 8; }
+      var pfEndeS: int64 := peek64(pfbS + CG_CFIELD_OFF_OFFSET) + pfBytesS;
+      if (pfEndeS > offset) { offset := pfEndeS; }
+      pfS := pfS + 1;
+    }
+    while ((offset & 7) != 0) { offset := offset + 1; }
     var i: int64 := parentFieldCnt;
     tmp := fieldNode;
     while (tmp != -1) {
