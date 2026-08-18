@@ -12,7 +12,10 @@
 
 unit std.crypto.ecc;
 import std.alloc;
-import std.crypto.rand;
+// std.crypto.rand wird seit #1532 nicht mehr gebraucht: der Nonce kommt
+// deterministisch nach RFC 6979 aus std.crypto.ec, die Schluesselerzeugung
+// zieht ihren Zufall ebenfalls dort.
+import std.crypto.ec;      // #1532
 
 // ============================================================================
 // Section 1 — 256-bit integer utilities
@@ -675,65 +678,86 @@ fn ecAffAdd(rx: int64, ry: int64, px: int64, py: int64, qx: int64, qy: int64): v
 // ============================================================================
 
 // Compute public key from private key: pubkey = privk * G.
+// #1532: Auch hier ist der Skalar der PRIVATE Schluessel selbst — dieselbe
+// Signalquelle wie beim Signieren, deshalb dieselbe Antwort.
 pub fn ECCPubFromPriv(privk: int64, pubx: int64, puby: int64): void {
-    var gx:  int64 := alloc(32);
-    var gy:  int64 := alloc(32);
-    var jac: int64 := alloc(96);
-    eccGx(gx); eccGy(gy);
-    jacMul(jac, privk, gx, gy);
-    jacToAff(pubx, puby, jac);
-    free(gx, 32); free(gy, 32); free(jac, 96);
+    var pb: int64 := alloc(32);
+    var xb: int64 := alloc(32);
+    var yb: int64 := alloc(32);
+    eccRev32(pb, privk);
+    EcPublicFromPrivate(EC_SECP256K1, pb, xb, yb);
+    eccRev32(pubx, xb);
+    eccRev32(puby, yb);
+    var i: int64 := 0;
+    while (i < 32) { poke8(pb + i, 0); i := i + 1; }
+    free(pb, 32); free(xb, 32); free(yb, 32);
 }
 
 // Generate a random key pair.
 pub fn ECCGenKey(privk: int64, pubx: int64, puby: int64): void {
-    var n: int64 := alloc(32);
-    eccN(n);
-    var valid: int64 := 0;
-    while (valid == 0) {
-        RandBytesExact(privk, 32);
-        poke8(privk + 31, peek8(privk + 31) & 0x7F);
-        if (eccU256IsZero(privk) == 0 && eccU256GE(privk, n) == 0) { valid := 1; }
-    }
-    free(n, 32);
-    ECCPubFromPriv(privk, pubx, puby);
+    // #1532: Die alte Schleife maskierte das oberste Bit des Schluessels weg
+    // und verschenkte damit ein Bit Schluesselraum. EcGenerateKey zieht
+    // gleichverteilt aus [1, n-1].
+    var pb: int64 := alloc(32);
+    var xb: int64 := alloc(32);
+    var yb: int64 := alloc(32);
+    EcGenerateKey(EC_SECP256K1, pb, xb, yb);
+    eccRev32(privk, pb);
+    eccRev32(pubx, xb);
+    eccRev32(puby, yb);
+    var i: int64 := 0;
+    while (i < 32) { poke8(pb + i, 0); i := i + 1; }
+    free(pb, 32); free(xb, 32); free(yb, 32);
 }
 
 // Sign a 32-byte hash with privk. Returns 1.
-pub fn ECDSASign(hash: int64, privk: int64, r_out: int64, s_out: int64): int64 {
-    var n:   int64 := alloc(32);
-    var gx:  int64 := alloc(32);
-    var gy:  int64 := alloc(32);
-    var k:   int64 := alloc(32);
-    var ki:  int64 := alloc(32);
-    var jac: int64 := alloc(96);
-    var rx:  int64 := alloc(32);
-    var ry:  int64 := alloc(32);
-    var t1:  int64 := alloc(32);
-    var t2:  int64 := alloc(32);
-    eccN(n); eccGx(gx); eccGy(gy);
-
-    var ok: int64 := 0;
-    while (ok == 0) {
-        RandBytesExact(k, 32);
-        poke8(k + 31, peek8(k + 31) & 0x7F);
-        if (eccU256IsZero(k) == 0 && eccU256GE(k, n) == 0) {
-            jacMul(jac, k, gx, gy);
-            jacToAff(rx, ry, jac);
-            scReduce32(r_out, rx);
-            if (eccU256IsZero(r_out) == 0) {
-                scInv(ki, k);
-                scMul(t1, r_out, privk);
-                scAdd(t2, hash, t1);
-                scMul(s_out, ki, t2);
-                if (eccU256IsZero(s_out) == 0) { ok := 1; }
-            }
-        }
+// #1532: Das SIGNIEREN rechnet mit einem geheimen Skalar — dem Nonce, an dem
+// der private Schluessel haengt. Die Rechnung hier unten (jacMul) ist ein
+// Double-and-Add mit datenabhaengiger Verzweigung: Laufzeit, Cache-Muster und
+// Stromaufnahme haengen unmittelbar am Skalar. Fuer ECDSA genuegen einem
+// Angreifer wenige Bits je Nonce — mit einigen hundert Signaturen
+// rekonstruiert ein Gitterangriff den Schluessel vollstaendig. Dazu kam der
+// Nonce aus dem RNG: wiederholt er sich, folgt der Schluessel aus zwei
+// Signaturen in einer Zeile.
+//
+// std.crypto.ec loest beides — Montgomery-Leiter ueber alle Bits mit Tausch
+// per Maske, vollstaendige Additionsformeln ohne Sonderfaelle, und ein
+// deterministischer Nonce nach RFC 6979. Der Signaturpfad gibt deshalb dorthin
+// ab. Er ist langsamer (rund 230 ms je Signatur); fuer eine Rechnung mit
+// geheimem Skalar ist das der richtige Tausch.
+//
+// Die VERIFIKATION unten bleibt bei der schnellen Rechnung: dort ist kein Wert
+// geheim, es gibt also nichts zu verraten.
+// #1532: Die beiden Einheiten fuehren ihre 32-Byte-Skalare in
+// entgegengesetzter Byteordnung — std.crypto.ec gross-endian (Byte 0 = MSB,
+// daher `be32` als Parametername), diese Einheit klein-endian (Byte 0 = LSB).
+// Ohne den Dreher an der Grenze erzeugt die Delegation eine Signatur, die die
+// Verifikation hier als ungueltig verwirft.
+fn eccRev32(dst: int64, src: int64): void {
+    var i: int64 := 0;
+    while (i < 32) {
+        poke8(dst + i, peek8(src + 31 - i));
+        i := i + 1;
     }
+}
 
-    free(n,32); free(gx,32); free(gy,32); free(k,32); free(ki,32);
-    free(jac,96); free(rx,32); free(ry,32); free(t1,32); free(t2,32);
-    return 1;
+pub fn ECDSASign(hash: int64, privk: int64, r_out: int64, s_out: int64): int64 {
+    var hb: int64 := alloc(32);
+    var pb: int64 := alloc(32);
+    var rb: int64 := alloc(32);
+    var sb: int64 := alloc(32);
+    eccRev32(hb, hash);
+    eccRev32(pb, privk);
+    var ok: int64 := 0;
+    if (EcdsaSign(EC_SECP256K1, hb, pb, rb, sb)) {
+        eccRev32(r_out, rb);
+        eccRev32(s_out, sb);
+        ok := 1;
+    }
+    var i: int64 := 0;
+    while (i < 32) { poke8(pb + i, 0); i := i + 1; }
+    free(hb, 32); free(pb, 32); free(rb, 32); free(sb, 32);
+    return ok;
 }
 
 // Verify ECDSA signature. Returns 1 if valid, 0 otherwise.

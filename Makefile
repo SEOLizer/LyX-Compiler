@@ -234,6 +234,7 @@ test: lyxc
 	@bash tests/sema_runde9_test.sh
 	@bash tests/klassenarray_1646_test.sh
 	@bash tests/laute_abbrueche_runde10_test.sh
+	@bash tests/krypto_runde11_test.sh
 	@bash tests/stdlib_z20_test.sh
 	@bash tests/sprache_z16_test.sh
 	@bash tests/codegen_ausdruecke_test.sh
