@@ -7544,6 +7544,73 @@ pub type Codegen = class {
   }
 
   // Generate a method declaration (with implicit self as first param)
+  // #1643: Rumpf fuer eine ABSTRAKTE Methode.
+  //
+  // Bisher wurde sie uebersprungen — kein Code, kein Label, und ihr VMT-Slot
+  // blieb 0. Der Aufruf sprang damit nach Adresse 0: ein Segfault, der weder
+  // die Klasse noch die Methode nennt. Wer eine Basisklasse erweitert und eine
+  // Methode zu ueberschreiben vergisst, stand vor einem Absturz ohne Hinweis.
+  //
+  // Der Slot bekommt jetzt einen Rumpf, der genau das sagt und definiert
+  // abbricht — dieselbe Bauart wie die lauten Defaults aus #1339.
+  fn cg_genAbstractStub(ni: int64, className: pchar, classNameLen: int64) {
+    var mname: pchar := self.cg_nsval(ni);
+    var mlen:  int64 := self.cg_nslen(ni);
+    var methodCodeStart: int64 := self.codeLen;
+
+    // Label unter dem gemangelten Namen, damit auch der DIREKTE Aufruf hier
+    // landet und nicht auf ein fehlendes Symbol laeuft.
+    var mangLen: int64 := classNameLen + 1 + mlen;
+    var mangBuf: int64 := alloc(mangLen + 1);
+    var ii: int64 := 0;
+    while (ii < classNameLen) { poke8(mangBuf + ii, StrCharAt(className, ii)); ii := ii + 1; }
+    StrSetChar(mangBuf as pchar, classNameLen, 95);
+    var jj: int64 := 0;
+    while (jj < mlen) { poke8(mangBuf + classNameLen + 1 + jj, StrCharAt(mname, jj)); jj := jj + 1; }
+    poke8(mangBuf + mangLen, 0);
+    self.cg_addLabel(mangBuf as pchar, mangLen, self.cg_lineOf(ni));
+    self.cg_trackTempBuf(mangBuf, mangLen + 1);
+
+    // Meldung: "lyxc: abstrakte Methode Klasse.Methode ohne Implementierung
+    // aufgerufen\n" — mit den Namen, sonst waere der Abbruch so wortkarg wie
+    // der Segfault davor.
+    var msgOff: int64 := self.dataLen;
+    var vorspann: pchar := "lyxc: abstrakte Methode "c;
+    var vI: int64 := 0;
+    while (vI < 24) { self.cg_edata(StrCharAt(vorspann, vI)); vI := vI + 1; }
+    var cI: int64 := 0;
+    while (cI < classNameLen) { self.cg_edata(StrCharAt(className, cI)); cI := cI + 1; }
+    self.cg_edata(46);                                    // '.'
+    var mI: int64 := 0;
+    while (mI < mlen) { self.cg_edata(StrCharAt(mname, mI)); mI := mI + 1; }
+    var nachspann: pchar := " ohne Implementierung aufgerufen"c;
+    var nI: int64 := 0;
+    while (nI < 32) { self.cg_edata(StrCharAt(nachspann, nI)); nI := nI + 1; }
+    self.cg_edata(10); self.cg_edata(0);                  // "\n\0"
+
+    self.cg_emitLeaRdiData(msgOff);
+    self.cg_emitPanicBody();
+
+    // Der VMT-Slot zeigt jetzt auf diesen Rumpf statt auf 0.
+    var classIdx: int64 := self.cg_findClass(className, classNameLen);
+    if (classIdx >= 0) {
+      var slotCount: int64   := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTSLOTS);
+      var methodList2: int64 := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTLIST);
+      var vmtDataOff2: int64 := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTOFF);
+      var si: int64 := 0;
+      while (si < slotCount) {
+        var sName: pchar := peek64(methodList2 + si * 16) as pchar;
+        var sLen:  int64 := peek64(methodList2 + si * CG_VMTMETH_SZ + CG_VMTMETH_OFF_NAMELEN);
+        if (self.cg_seq(sName, sLen, mname, mlen) != 0) {
+          self.cg_addVmtMethodPatch(vmtDataOff2 + si * 8, methodCodeStart);
+          si := slotCount;
+        } else {
+          si := si + 1;
+        }
+      }
+    }
+  }
+
   fn cg_genMethodDecl(ni: int64, className: pchar, classNameLen: int64) {
     var mname: pchar := self.cg_nsval(ni);
     var mlen:  int64 := self.cg_nslen(ni);
@@ -9031,7 +9098,15 @@ pub type Codegen = class {
         // rax = rsp (pointer to header)
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE0);
       } else {
-        self.cg_zeroRax();
+        // #1642: Das LEERE Literal lieferte eine 0 — und eine 0 sieht aus wie
+        // ein Array, bis jemand hineingreift. `var a: array := [];` legte
+        // damit nichts an, `len(a)` las an Adresse 8 und stuerzte ab. Nach dem
+        // ersten `push` lief es, weil push seinen Allokationszweig nachholt —
+        // deshalb der irrefuehrende Eindruck, nur `len` sei kaputt.
+        //
+        // Die Form ohne Initialisierer (`var a: array;`) bekommt seit #1177
+        // dieselbe Struktur; hier fehlte sie.
+        self.cg_emitEmptyDynArray();
       }
 
     } else {
@@ -10308,8 +10383,16 @@ pub type Codegen = class {
           if (sz > 0) {
             self.cg_movRaxImm(sz);
           } else if (peek8(self.localIsArray + lidx) != 0) {
-            // mov rax, [rdi+8]  (len field of dynamic array fat-pointer)
-            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x47); self.cg_e8(0x08);
+            // #1642: Hier stand `mov rax, [rdi+8]` — gelesen wurde also aus
+            // RDI, nicht aus dem Array. Der Zeiger stand dort nur zufaellig:
+            // nach einem `push` uebergibt der Aufruf ihn in rdi, und genau
+            // deshalb lief `len` NACH dem ersten push und stuerzte davor ab.
+            // Bei einem frisch angelegten `[]` trug rdi noch irgendetwas.
+            //
+            // Der Zeiger wird jetzt geladen wie ueberall sonst — der Map-Zweig
+            // ein paar Zeilen darueber macht es seit #1152 genau so.
+            self.cg_genExpr(lenArgNi);                                          // rax = Array
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(0x08); // mov rax,[rax+8]
           } else {
             self.cg_zeroRax();
           }
@@ -18209,6 +18292,9 @@ pub type Codegen = class {
             var isAbstM: int64 := (self.cg_nival(method) >> 3) & 1;
             if (isAbstM == 0) {
               self.cg_genMethodDecl(method, clsName, clsLen);
+            } else {
+              // #1643: statt zu ueberspringen einen Rumpf, der sich meldet.
+              self.cg_genAbstractStub(method, clsName, clsLen);
             }
             method := nextM;
           }
