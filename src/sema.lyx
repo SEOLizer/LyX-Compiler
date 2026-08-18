@@ -1145,6 +1145,14 @@ pub type Sema = class {
     // Und die Null als Zeiger: `var p: pchar := 0;` ist der uebliche
     // Nullzeiger, kein Tippfehler.
     if (cw == 2 && cg == 1 && valueNi >= 0 && self.sn_kind(valueNi) == 40 && self.sn_iVal(valueNi) == 0) { return 0; }
+    // #1629: Dasselbe fuer einen Klassen- oder Structtyp. Die 0 war dort nur an
+    // MANCHEN Stellen erlaubt — Feldzuweisung und `return` aus einer Methode
+    // gingen, `return` aus einer freien Funktion, Zuweisung an eine Variable
+    // und die Initialisierung nicht. Der Vergleich `x == 0` war erlaubt, die
+    // Zuweisung `x := 0` nicht: die 0 war also als Nullwert vorgesehen, liess
+    // sich nur nicht ueberall hinschreiben. Ein Verweis loszulassen ist der
+    // Normalfall, kein Sonderfall.
+    if (cw == 4 && cg == 1 && valueNi >= 0 && self.sn_kind(valueNi) == 40 && self.sn_iVal(valueNi) == 0) { return 0; }
     return 1;
   }
 
@@ -2286,6 +2294,25 @@ pub type Sema = class {
     return 0;
   }
 
+  // #1626: Methoden werden unter "Klasse_Methode" in derselben Tabelle gefuehrt
+  // wie freie Funktionen. Ueber eine Unit-Grenze hinweg zeigt SymNodeIdx auf
+  // einen fremden Baum — die Methodenliste der Klasse ist dort nicht
+  // verlaesslich zu lesen, genau wie bei den Signaturen in #1343. Der Name
+  // muss die Umstellung ueberleben, deshalb eine eigene Kopie.
+  fn _mangleMethode(cls: pchar, clsLen: int64, m: pchar, mLen: int64, lenCell: int64): pchar {
+    var n: int64 := clsLen + 1 + mLen;
+    var buf: int64 := alloc(n + 1);
+    if (buf == 0) { poke64(lenCell, 0); return 0 as pchar; }
+    var i: int64 := 0;
+    while (i < clsLen) { poke8(buf + i, StrCharAt(cls, i)); i := i + 1; }
+    poke8(buf + clsLen, 95);            // '_'
+    var j: int64 := 0;
+    while (j < mLen) { poke8(buf + clsLen + 1 + j, StrCharAt(m, j)); j := j + 1; }
+    poke8(buf + n, 0);
+    poke64(lenCell, n);
+    return buf as pchar;
+  }
+
   fn _fnRecordSig(fname: pchar, fnameLen: int64, declNi: int64) {
     if (declNi < 0) { return; }
     var pc: int64 := 0;
@@ -3374,6 +3401,24 @@ pub type Sema = class {
         if (atid != TY_UNKNOWN && atid != TY_USER) { aliasTid := atid; }
       }
       self._pushSym(name, nlen, SYM_TYPE, aliasTid, ni);
+      // #1626: die Methoden gleich mit, unter "Klasse_Methode". Ohne sie wird
+      // ein Aufruf ueber die Unit-Grenze gar nicht gezaehlt — `t.Plain3(1, 2)`
+      // auf einer Methode mit drei Parametern uebersetzte klaglos, und das
+      // fehlende Argument kam vom Stack. In DERSELBEN Datei wurde es seit
+      // #1264 gemeldet.
+      var mth1: int64 := self.sn_c1(ni);
+      while (mth1 >= 0) {
+        if (self.sn_kind(mth1) == SNK_FUNC_DECL) {
+          var mlc: int64 := alloc(8);
+          if (mlc != 0) {
+            var mnm: pchar := self._mangleMethode(name, nlen,
+                                                  self.sn_sVal(mth1), self.sn_sLen(mth1), mlc);
+            if (mnm != 0 as pchar) { self._fnRecordSig(mnm, peek64(mlc), mth1); }
+            free(mlc, 8);
+          }
+        }
+        mth1 := self.sn_next(mth1);
+      }
     } else if (k == SNK_ENUM_DECL) {
       self._pushSym(name, nlen, SYM_ENUM, TY_USER, ni);
       // Register enum members as int64 constants
@@ -6000,39 +6045,63 @@ pub type Sema = class {
     var tNode: int64 := self.sn_c0(vDecl);
     if (tNode < 0) { return; }
     if (self.sn_kind(tNode) != SNK_TYPE_NAME) { return; }
-    var tsi: int64 := self.Lookup(self.sn_sVal(tNode), self.sn_sLen(tNode));
-    if (tsi < 0) { return; }
-    var cDecl: int64 := self.SymNodeIdx(tsi);
-    if (cDecl < 0) { return; }
-    if (self.sn_kind(cDecl) != SNK_TYPE_DECL) { return; }
 
     var mname: pchar := self.sn_sVal(callNi);
     var mlen:  int64 := self.sn_sLen(callNi);
-    var mth: int64 := self.sn_c1(cDecl);
-    while (mth >= 0) {
-      if (self.sn_kind(mth) == SNK_FUNC_DECL
-          && self._strNEq(self.sn_sVal(mth), self.sn_sLen(mth), mname, mlen)) {
-        // Variadisch: nicht zaehlbar.
-        if (((self.sn_iVal(mth) >> 24) & 1) != 0) { return; }
-        var pc: int64 := 0;
-        var pcMin: int64 := 0;
-        var sawDefault: int64 := 0;
-        var pp: int64 := self.sn_c0(mth);
-        while (pp >= 0) {
-          pc := pc + 1;
-          if (self.sn_c1(pp) >= 0) { sawDefault := 1; }
-          else { if (sawDefault == 0) { pcMin := pcMin + 1; } else { pcMin := pc; } }
-          pp := self.sn_next(pp);
+    var ac: int64 := 0;
+    var aa: int64 := self.sn_c1(callNi);
+    while (aa >= 0) { ac := ac + 1; aa := self.sn_next(aa); }
+
+    // Weg 1: die Klasse steht in DIESER Datei — dann liegt ihre Methodenliste
+    // vor und ist die genauere Auskunft (Vorgabewerte, variadisch).
+    var tsi: int64 := self.Lookup(self.sn_sVal(tNode), self.sn_sLen(tNode));
+    if (tsi >= 0) {
+      var cDecl: int64 := self.SymNodeIdx(tsi);
+      if (cDecl >= 0 && self.sn_kind(cDecl) == SNK_TYPE_DECL) {
+        var mth: int64 := self.sn_c1(cDecl);
+        while (mth >= 0) {
+          if (self.sn_kind(mth) == SNK_FUNC_DECL
+              && self._strNEq(self.sn_sVal(mth), self.sn_sLen(mth), mname, mlen)) {
+            if (((self.sn_iVal(mth) >> 24) & 1) != 0) { return; }   // variadisch
+            var pc: int64 := 0;
+            var pcMin: int64 := 0;
+            var sawDefault: int64 := 0;
+            var pp: int64 := self.sn_c0(mth);
+            while (pp >= 0) {
+              pc := pc + 1;
+              if (self.sn_c1(pp) >= 0) { sawDefault := 1; }
+              else { if (sawDefault == 0) { pcMin := pcMin + 1; } else { pcMin := pc; } }
+              pp := self.sn_next(pp);
+            }
+            if (ac < pcMin || ac > pc) {
+              self._errorNodeName("falsche Argument-Anzahl im Methodenaufruf von", callNi, mname, mlen);
+            }
+            return;
+          }
+          mth := self.sn_next(mth);
         }
-        var ac: int64 := 0;
-        var aa: int64 := self.sn_c1(callNi);
-        while (aa >= 0) { ac := ac + 1; aa := self.sn_next(aa); }
-        if (ac < pcMin || ac > pc) {
-          self._errorNodeName("falsche Argument-Anzahl im Methodenaufruf von", callNi, mname, mlen);
-        }
-        return;
       }
-      mth := self.sn_next(mth);
+    }
+
+    // Weg 2: #1626 — ueber eine Unit-Grenze hinweg zeigt SymNodeIdx auf einen
+    // fremden Baum; weder die Knotenart noch die Methodenliste sind dort
+    // verlaesslich zu lesen. Genau die Lage, die #1343 fuer freie Funktionen
+    // ueber eine Nebentabelle geloest hat: die Methode steht dort unter
+    // "Klasse_Methode". Ohne diesen Weg blieb JEDER Methodenaufruf ueber eine
+    // Bibliotheksgrenze ungezaehlt, und fehlende Argumente kamen vom Stack.
+    var mlc: int64 := alloc(8);
+    if (mlc == 0) { return; }
+    var mangled: pchar := self._mangleMethode(self.sn_sVal(tNode), self.sn_sLen(tNode),
+                                              mname, mlen, mlc);
+    var mangLen: int64 := peek64(mlc);
+    free(mlc, 8);
+    if (mangled == 0 as pchar) { return; }
+    var sgi: int64 := self._fnFindSig(mangled, mangLen);
+    if (sgi < 0) { return; }
+    var sgBase: int64 := self.fnSigTab + sgi * 48;
+    if ((peek64(sgBase + 32) & 1) != 0) { return; }     // variadisch
+    if (ac < peek64(sgBase + 16) || ac > peek64(sgBase + 24)) {
+      self._errorNodeName("falsche Argument-Anzahl im Methodenaufruf von", callNi, mname, mlen);
     }
   }
 
