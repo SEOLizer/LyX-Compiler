@@ -5059,7 +5059,17 @@ pub type Codegen = class {
       return;
     }
     if (pk != 101) { return; }
-    poke8(self.localIsArray + localIdx, 1);
+    // #1597: Ein `[N]T`-PARAMETER wurde mit 1 vermerkt, eine gleichnamige
+    // lokale Variable seit #1155 mit 2 ("feste Groesse"). An dieser einen
+    // Ziffer haengt mehr als eine Schranke: der Lesepfad entscheidet an
+    // `arrFixedSize == 0`, OB die Elemente inline liegen (dann liefert er die
+    // Elementadresse) oder ob die Slots Zeiger tragen (dann laedt er den
+    // Zeiger). Ein `[3]Struct` legt Zeiger-Slots an — im Rumpf der Funktion
+    // wurde daraus die Adresse des Slots, und `a[0].x` las den Zeiger selbst
+    // als Zahl. Zwei Wege, die dasselbe meinen und einander nicht kannten;
+    // mit skalaren Elementen fiel es nicht auf, weil dort beide Formen
+    // dieselbe Adresse ergeben.
+    poke8(self.localIsArray + localIdx, 2);
     var szNode: int64 := self.cg_nc1(ptypeNode);
     if (szNode >= 0 && self.cg_nkind(szNode) == CGN_LIT_INT) {
       poke64(self.localArraySize + localIdx * 8, self.cg_nival(szNode));
@@ -8217,6 +8227,73 @@ pub type Codegen = class {
         // Record patch: fill in VMT address for this class at vmtPatchPos
         self.cg_addVmtPatch(vmtPatchPos, tname, tlen);
       }
+
+      // #1636: Ein inline liegendes `[N]Struct`-FELD hat Zeiger-Slots — so
+      // legt der Deklarationspfad ein `[N]Struct` seit #1109 an, und der
+      // Lesepfad laedt entsprechend den Zeiger. Fuer ein FELD hat sie nie
+      // jemand gefuellt: die Slots blieben 0, und `c.items[0].x := 10`
+      // schrieb nach Adresse 0. Eine LOKALE Variable desselben Typs
+      // funktionierte, weil sie ihre Objekte bekommt — dieselbe Sorte Luecke
+      // wie #1109 selbst, nur eine Ebene weiter.
+      //
+      // Die Objekte entstehen hier, unmittelbar nach dem VMT-Zeiger und VOR
+      // dem Konstruktor: der darf die Felder bereits benutzen.
+      if (ciNew >= 0) {
+        var fBase: int64 := self.classLayouts + ciNew * CG_CLASS_SZ;
+        var fFlds: int64 := peek64(fBase + CG_CLASS_OFF_FIELDSPTR);
+        var fCnt:  int64 := peek64(fBase + CG_CLASS_OFF_FIELDCNT);
+        var fI: int64 := 0;
+        while (fI < fCnt && fFlds != 0) {
+          var ffb: int64 := fFlds + fI * CG_CFIELD_SZ;
+          var ffl: int64 := peek64(ffb + CG_CFIELD_OFF_FLAGS);
+          // Bit3 = inline `[N]T`; Elementtyp seit #1493 im Feldeintrag.
+          if (((ffl >> 3) & 1) != 0) {
+            var epP: pchar := peek64(ffb + CG_CFIELD_OFF_ELEMTYPEPTR) as pchar;
+            var epL: int64 := peek64(ffb + CG_CFIELD_OFF_ELEMTYPELEN);
+            if (epP != 0 as pchar && epL > 0) {
+              var eci: int64 := self.cg_findClass(epP, epL);
+              if (eci >= 0) {
+                var fOff: int64 := peek64(ffb + CG_CFIELD_OFF_OFFSET);
+                var fBytes: int64 := peek64(ffb + CG_CFIELD_OFF_BYTES);
+                var nSlots: int64 := fBytes / 8;
+                if (nSlots > 0) {
+                  // Schleife zur LAUFZEIT, nicht entrollt — ein [1000]S haette
+                  // sonst tausend Kopien derselben Befehlsfolge im Code.
+                  // [rsp+8] = Objektzeiger, [rsp] = i
+                  self.cg_pushRax();
+                  self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);   // xor rax, rax
+                  self.cg_pushRax();
+                  var slotTop: int64 := self.codeLen;
+                  self.cg_movRaxImm(0);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);
+                  self.cg_movRaxImm(4096); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);
+                  self.cg_movRaxImm(3);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);
+                  self.cg_movRaxImm(34);
+                  self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);   // mov r10, rax
+                  self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);   // xor r8, r8
+                  self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);   // dec r8 → -1
+                  self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);   // xor r9, r9
+                  self.cg_movRaxImm(9);
+                  self.cg_e8(0x0F); self.cg_e8(0x05);                     // syscall
+                  // rbx = Objekt, rcx = i, Ziel = [rbx + fOff + rcx*8]
+                  self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x5C); self.cg_e8(0x24); self.cg_e8(0x08);
+                  self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x0C); self.cg_e8(0x24);
+                  self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x84); self.cg_e8(0xCB); self.cg_e32(fOff);
+                  // i := i + 1; solange i < nSlots
+                  self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC1);
+                  self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0C); self.cg_e8(0x24);
+                  self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xF9); self.cg_e32(nSlots);
+                  self.cg_e8(0x0F); self.cg_e8(0x8C);                     // jl slotTop
+                  self.cg_e32(slotTop - (self.codeLen + 4));
+                  self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x08);  // add rsp, 8 (i)
+                  self.cg_popRax();                                        // Objektzeiger zurueck
+                }
+              }
+            }
+          }
+          fI := fI + 1;
+        }
+      }
+
       // #683: Call ClassName_Create(self, args...) if defined
       // #1624: der Konstruktor darf aus einer Basisklasse stammen.
       var ctorLC: int64 := alloc(8);
@@ -13625,6 +13702,38 @@ pub type Codegen = class {
         self.cg_popRbx();                  // rbx = index
         if (wrInlW > 0) {
           self.cg_e8(0x5E);                // pop rsi (Wert)
+          // #1612/#1636: Bei einem Feld mit Struct-Elementen halten die Slots
+          // Zeiger (seit #1636 auch wirklich gefuellte). `c.items[i] := s`
+          // darf den Zeiger nicht ueberschreiben, sonst teilen Element und
+          // Quelle dasselbe Objekt.
+          var wLc: int64 := alloc(8);
+          var wEp: pchar := self.cg_fieldElemTypeNameOf(self.cg_nc0(lhs), wLc);
+          var wEl: int64 := peek64(wLc);
+          free(wLc, 8);
+          var wBytes: int64 := 0;
+          if (wEp != 0 as pchar && wEl > 0) {
+            var wCi: int64 := self.cg_findClass(wEp, wEl);
+            if (wCi >= 0) { wBytes := self.cg_classStructSize(wCi); }
+          }
+          if (wBytes > 8) {
+            // rax = Feldadresse, rbx = Index, rsi = Quelle
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3C); self.cg_e8(0xD8);  // mov rdi, [rax+rbx*8]
+            self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);                    // test rdi, rdi
+            self.cg_e8(0x74);
+            var wJz: int64 := self.codeLen; self.cg_e8(0);
+            var wKopie: int64 := self.codeLen;
+            self.cg_e8(0x51);                                                        // push rcx
+            self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1); self.cg_e32(wBytes);
+            self.cg_e8(0xF3); self.cg_e8(0xA4);                                      // rep movsb
+            self.cg_e8(0x59);                                                        // pop rcx
+            self.cg_e8(0xEB);
+            var wJmp: int64 := self.codeLen; self.cg_e8(0);
+            var wZeiger: int64 := self.codeLen;
+            poke8(self.code + wJz, wZeiger - wKopie);
+            self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD8);  // mov [rax+rbx*8], rsi
+            poke8(self.code + wJmp, self.codeLen - wZeiger);
+            return;
+          }
           self.cg_emitScaledStore(wrInlW);
           return;
         }
@@ -13633,6 +13742,7 @@ pub type Codegen = class {
         var lhsIsSimd:  int64 := 0;
         var lhsIsPchar: int64 := 0;     // #1266
         var lhsFixedSize: int64 := 0;   // #1156
+        var lhsElemBytes: int64 := 0;   // #1612: >0 = Struct-Element, so viele Byte
         // #1230: `m[i][j] := v` — die Basis ist die Zeilenadresse aus dem
         // Lesepfad. Kein Kopf, Schrittweite 8, Schranke ist die Zeilenlaenge.
         var lhsRowInner: int64 := 0;
@@ -13662,6 +13772,21 @@ pub type Codegen = class {
             lhsRowOuter := peek64(self.localArrayRow + llidx * 8);   // #1230
           }
           if (llidx >= 0 && peek8(self.localIsArray + llidx) != 0) { lhsIsArray := 1; }
+          // #1612: Traegt das Array Struct-Elemente? Dann halten die Slots
+          // Zeiger auf je ein eigenes Objekt (so legt der Deklarationspfad sie
+          // seit #1109 an), und `arr[i] := s` darf den Zeiger NICHT
+          // ueberschreiben — sonst teilen Element und Quelle dasselbe Objekt,
+          // und eine spaetere Aenderung an der Quelle veraendert scheinbar das
+          // Array. Kopiert wird in das vorhandene Element.
+          if (llidx >= 0 && lhsIsArray == 1) {
+            var wtb: int64 := self.localTypes + llidx * CG_LOCTYPE_SZ;
+            var wtp: pchar := peek64(wtb) as pchar;
+            var wtn: int64 := peek64(wtb + CG_LOCTYPE_OFF_LEN);
+            if (wtp != 0 as pchar && wtn > 0) {
+              var wci: int64 := self.cg_findClass(wtp, wtn);
+              if (wci >= 0) { lhsElemBytes := self.cg_classStructSize(wci); }
+            }
+          }
           // WP-GPU-01: SIMD array store check
           if (llidx >= 0 && peek8(self.localIsSimd + llidx) != 0) { lhsIsSimd := 1; }
           // #1266: `p[i] := x` auf einem pchar schrieb 8 Byte an Offset i*8 —
@@ -13714,6 +13839,29 @@ pub type Codegen = class {
           self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC1);
           // movss [rax+rbx*4], xmm0  (F3 0F 11 04 98)
           self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x98);
+        } else if (lhsIsArray == 1 && lhsElemBytes > 8 && lhsFixedSize > 0) {
+          // #1612: Struct-Element — den INHALT in das vorhandene Objekt
+          // kopieren. Ist der Slot noch leer (kein Objekt angelegt), bleibt es
+          // beim Zeiger; das ist besser, als nach Adresse 0 zu schreiben.
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x48); self.cg_e8(0x10);   // lea rcx, [rax+16]
+          self.cg_e8(0x5E);                                                          // pop rsi (Quelle)
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3C); self.cg_e8(0xD9);   // mov rdi, [rcx+rbx*8]
+          self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);                     // test rdi, rdi
+          // jz .zeiger  (Sprungweite unten eingesetzt)
+          self.cg_e8(0x74);
+          var jzPos: int64 := self.codeLen; self.cg_e8(0);
+          var kopieStart: int64 := self.codeLen;
+          self.cg_e8(0x51);                                                          // push rcx
+          self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1); self.cg_e32(lhsElemBytes);  // mov rcx, n
+          self.cg_e8(0xF3); self.cg_e8(0xA4);                                        // rep movsb
+          self.cg_e8(0x59);                                                          // pop rcx
+          // jmp .fertig
+          self.cg_e8(0xEB);
+          var jmpPos: int64 := self.codeLen; self.cg_e8(0);
+          var zeigerStart: int64 := self.codeLen;
+          poke8(self.code + jzPos, zeigerStart - kopieStart);
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD9);   // mov [rcx+rbx*8], rsi
+          poke8(self.code + jmpPos, self.codeLen - zeigerStart);
         } else if (lhsIsArray == 1) {
           // array<T> local: skip 16-byte header
           // lea rcx, [rax+16]
