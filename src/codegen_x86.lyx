@@ -83,6 +83,8 @@ con CGN_UNOP:        int64 := 48;
 con CGN_CALL:        int64 := 49;
 con CGN_INDEX:       int64 := 50;
 con CGN_FIELD:       int64 := 51;
+// #1595: Eintrag der Fn-Zeiger-Aliasliste: Name (ptr,len) + Rueckgabetyp (ptr,len)
+con CG_FNALIAS_SZ:   int64 := 32;
 con CGN_NEW:         int64 := 52;
 con CGN_CAST:        int64 := 53;  // WP-11: x as Type
 con CGN_CLOSURE:     int64 := 54;  // WP-13: closure { fn ptr, captured env }
@@ -429,6 +431,7 @@ pub type Codegen = class {
   localCount: int64;
   localCap:   int64;
   frameSize:  int64;   // bytes allocated below rbp (grows with each local)
+  structArenaOff:  int64;   // #1580/#1595: Datenoffset des Bump-Bereichs, -1 = ungenutzt
 
   // Function label table
   labels:     int64;
@@ -737,7 +740,6 @@ pub type Codegen = class {
   lastAnonName:    int64;
   lastAnonNameLen: int64;
   // #1580: Bump-Bereich fuer Wert-Kopien von Structs. -1 = noch nicht angelegt.
-  structArenaOff:  int64;   // Datenoffset: [+0] naechste freie Adresse, [+8] Ende
   // #1256/#1299: Ein globales AGGREGAT — `[N]T` oder ein Struct — passt nicht
   // in den 8-Byte-Slot. Der Slot traegt deshalb einen ZEIGER auf einen eigenen
   // Block im Datenbereich, genau wie ein Local auf seinen mmap-Block zeigt.
@@ -858,6 +860,18 @@ pub type Codegen = class {
 
   // WP-04: set to 1 when current function has a [T, T] tuple return type
   funcHasTupleReturn: int64;
+  // #1595: Rueckgabe eines STRUCTS by value. Bis 1.1.3H holte der Aufgerufene
+  // seinen Platz aus einem Bump-Bereich, der nie zurueckgegeben wurde: 200 000
+  // Rueckgaben belegten 6 MB, zwei Millionen 62 MB — linear, ohne Ende.
+  //
+  // Jetzt stellt der AUFRUFER den Platz und reicht die Adresse als verdecktes
+  // erstes Argument durch; der Aufgerufene schreibt hinein. Damit gibt es
+  // keine Belegung mehr, die freigegeben werden muesste.
+  //
+  // Groesse der Struct-Rueckgabe der gerade uebersetzten Funktion (0 = keine),
+  // und der Rahmenplatz, in dem der verdeckte Zeiger liegt.
+  fnRetStructBytes: int64;
+  fnRetSlotOff:     int64;
 
   // #1140: @flight_crit — SSE-Ausnahmen fuer *invalid* und *divide-by-zero*
   // sind in der annotierten Funktion freigeschaltet. fcSeen sagt, ob das
@@ -1072,6 +1086,62 @@ pub type Codegen = class {
   // ------------------------------------------------------------------
   // Local variable table  (name, nameLen, rbpOff) × CG_LOCAL_SZ bytes
   // ------------------------------------------------------------------
+
+  // #1595: `bytes` Byte im Rahmen belegen und den rbp-relativen Offset melden.
+  // Anders als cg_addLocal entsteht dabei KEIN benanntes Local — der Platz
+  // gehoert einem Zwischenergebnis (Rueckgabepuffer, Struct-Kopie).
+  // #1595: Wurde dieser Typ als `struct` DEKLARIERT? Nur dann ist er ein
+  // Wert, der by value zurueckgegeben wird.
+  //
+  // cg_istStructTyp fragt das LAYOUT (keine VMT) und taugt hier nicht: eine
+  // Klasse OHNE Methoden bekommt ebenfalls struct-Layout, ist aber eine
+  // REFERENZ. Genau daran ist der erste Anlauf gescheitert — `fn Frei(): T {
+  // return 0; }` mit `type T = class { v: int64; }` kopierte 8 Byte von
+  // Adresse 0 und stuerzte ab (tests/klassen_runde4_test.sh, #1629).
+  // #1595: Liegt dieses Struct vollstaendig in seinem eigenen Speicher — also
+  // ohne ein verschachteltes Struct-Feld, das nur als ZEIGER darin steht?
+  // Nur dann darf sein Platz aus dem Rahmen kommen: eine flache Kopie traegt
+  // sonst einen Zeiger auf Speicher, der mit dem Rahmen faellt.
+  fn cg_structSelbstEnthalten(classIdx: int64, tiefe: int64): int64 {
+    if (classIdx < 0) { return 0; }
+    var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+    if (cnt <= 0) { return 0; }
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var tp: pchar := peek64(fb + CG_CFIELD_OFF_TYPENAMEPTR) as pchar;
+      var tl: int64 := peek64(fb + CG_CFIELD_OFF_TYPENAMELEN);
+      // Bewusst streng: NUR eingebaute Grundtypen. Jedes Feld mit einem
+      // benannten Typ — Struct, Klasse, Alias — faellt durch.
+      //
+      // Die Layouttabelle taugt fuer eine feinere Regel nicht: bei `Circle`
+      // aus std.circle meldet die Feldbreite von `center` 16 Byte, waehrend
+      // Groesse (16) und der Offset von `radius` (8) sagen, dass dort nur ein
+      // ZEIGER steht. Drei Versuche, das ueber Breite, Summe oder
+      // Registrierung zu entscheiden, haben genau diesen Widerspruch nicht
+      // aufgeloest; die strenge Regel ist nachpruefbar und faellt im
+      // Zweifel auf den alten Weg zurueck.
+      if (tp == 0 as pchar || tl <= 0) { return 0; }
+      if (self.cg_builtinTypeId(tp, tl) == 0) { return 0; }
+      i := i + 1;
+    }
+    return 1;
+  }
+
+  fn cg_istWertStruct(classIdx: int64): int64 {
+    if (classIdx < 0) { return 0; }
+    if (peek64(self.classLayouts + classIdx * CG_CLASS_SZ + CG_CLASS_OFF_ISSTRUCT) == 0) { return 0; }
+    return 1;
+  }
+
+  fn cg_reserveFrame(bytes: int64): int64 {
+    var b: int64 := (bytes + 7) / 8 * 8;
+    if (b <= 0) { b := 8; }
+    self.frameSize += b;
+    return 0 - self.frameSize;
+  }
 
   fn cg_addLocal(name: pchar, nlen: int64): int64 {
     if (self.localCount >= self.localCap) {
@@ -3982,6 +4052,99 @@ pub type Codegen = class {
   // haelt das Ergebnis fuer eine Ganzzahl. Genau daran gab
   // `PrintLn(sb.ToString())` die Adresse aus statt der Zeichenkette.
   // Rueckgabe: 1 = ja, 0 = nein (Typ bekannt), -1 = unbekannt.
+  // #1595: Struct-Rueckgabegroesse eines AUFRUFS — freie Funktion oder
+  // Methode. Fuer Methoden dieselbe Kette wie in cg_callRetTypeIs: die
+  // Registry fuehrt sie unter der Klasse, die sie DEKLARIERT (#1621).
+  // #1595: Ruft die Stelle ueber einen FUNKTIONSZEIGER, steht unter dem Namen
+  // keine Funktion, sondern eine Variable. Ihr Typ ist ein Zeigertyp-Alias,
+  // und der nennt den Rueckgabetyp — nur fragt hier bisher niemand danach.
+  // `ResultInt64AndThen` stuerzte deshalb ab: der Gerufene erwartete das
+  // verdeckte erste Argument, die indirekte Aufrufstelle gab keines mit.
+  // #1595: Verdecktes erstes Argument fuer einen INDIREKTEN Aufruf. Der
+  // Gerufene ist eine ganz normale Funktion mit Struct-Rueckgabe und erwartet
+  // die Zieladresse in rdi — ob er direkt oder ueber einen Zeiger gerufen
+  // wird, sieht er nicht. Fehlt sie, schreibt er in einen Zeiger, den ihm
+  // niemand gegeben hat: `ResultInt64AndThen` stuerzte genau so ab.
+  //
+  // Die Adresse wird VOR den Argumenten geschoben, damit sie beim
+  // spiegelbildlichen Auspacken zuletzt nach rdi geht.
+  fn cg_indirektSretVorschub(bytes: int64): int64 {
+    if (bytes <= 0) { return 0; }
+    var off: int64 := self.cg_reserveFrame((bytes + 7) / 8 * 8);
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x85); self.cg_e32(off);  // lea rax,[rbp+off]
+    self.cg_pushRax();
+    return 1;
+  }
+
+  // #1595: dasselbe fuer eine GLOBALE Variable vom Funktionstyp.
+  fn cg_globalRetStructBytes(fp: pchar, fl: int64): int64 {
+    var gi: int64 := self.cg_findGlobalIdx(fp, fl);
+    if (gi < 0) { return 0; }
+    var tb: int64 := self.globalTypeNames + gi * 16;
+    var tp: pchar := peek64(tb) as pchar;
+    var tl: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+    if (tp == 0 as pchar || tl <= 0) { return 0; }
+    return self.cg_fnAliasRetStructBytes(tp, tl);
+  }
+
+  // #1595: Der duenne indirekte Aufruf kennt nur Registerargumente. Mit dem
+  // verdeckten Zeiger passt ein siebtes nicht mehr hinein. Das laut melden,
+  // statt still ein Argument fallen zu lassen.
+  fn cg_zuVieleIndirekt(fp: pchar, fl: int64) {
+    EPrintStr("error: codegen: indirekter Aufruf von '"c);
+    var zc: int64 := 0;
+    while (zc < fl) { PrintChar(StrCharAt(fp, zc)); zc := zc + 1; }
+    EPrintStrLn("' mit Struct-Rueckgabe und mehr als fuenf Argumenten"c);
+    exit(70);
+  }
+
+  fn cg_indirektRetStructBytes(fp: pchar, fl: int64): int64 {
+    var li: int64 := self.cg_findLocalIdx(fp, fl);
+    if (li >= 0) {
+      var tb: int64 := self.localTypes + li * CG_LOCTYPE_SZ;
+      var tp: pchar := peek64(tb) as pchar;
+      var tl: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
+      if (tp != 0 as pchar && tl > 0) {
+        return self.cg_fnAliasRetStructBytes(tp, tl);
+      }
+    }
+    return 0;
+  }
+
+  fn cg_callRetStructBytes(ni: int64): int64 {
+    var fp: pchar := self.cg_nsval(ni);
+    var fl: int64 := self.cg_nslen(ni);
+    if (self.cg_nival(ni) == 0) {
+      var direkt: int64 := self.cg_fnRetStructBytes(fp, fl);
+      if (direkt > 0) { return direkt; }
+      return self.cg_indirektRetStructBytes(fp, fl);
+    }
+    var clsIdx: int64 := self.cg_exprClassName(self.cg_nc0(ni));
+    if (clsIdx < 0) { return 0; }
+    var lcell: int64 := alloc(8);
+    var erg: int64 := 0;
+    var cur: int64 := clsIdx;
+    var tiefe: int64 := 0;
+    while (cur >= 0 && tiefe < 32) {
+      var cbase: int64 := self.classLayouts + cur * CG_CLASS_SZ;
+      var cnp: pchar := peek64(cbase) as pchar;
+      var cnl: int64 := peek64(cbase + CG_PATCH_OFF_NAMEPTR);
+      if (cnp != 0 as pchar && cnl > 0) {
+        var mbuf: int64 := self.cg_mangleInto(cnp, cnl, fp, fl, lcell);
+        var mlen: int64 := peek64(lcell);
+        var rr: int64 := self.cg_fnRetStructBytes(mbuf as pchar, mlen);
+        self.cg_trackTempBuf(mbuf, mlen + 1);
+        if (rr > 0) { erg := rr; cur := 0 - 1; tiefe := 99; }
+      }
+      if (tiefe < 99) {
+        cur := peek64(self.classLayouts + cur * CG_CLASS_SZ + CG_CLASS_OFF_PARENTIDX);
+        tiefe := tiefe + 1;
+      }
+    }
+    free(lcell, 8);
+    return erg;
+  }
+
   fn cg_callRetTypeIs(ni: int64, tname: pchar, tlen: int64): int64 {
     var fp: pchar := self.cg_nsval(ni);
     var fl: int64 := self.cg_nslen(ni);
@@ -4073,6 +4236,26 @@ pub type Codegen = class {
   // type, or -1 if the function is unknown or doesn't return a class.
   // #1058: Traegt die Funktion `name` den deklarierten Rueckgabetyp `tname`?
   // Greift auf dieselbe Registry wie cg_funcRetClassIdx zu (Name, Rueckgabetypname).
+  // #1595: Liefert die Groesse, wenn diese Funktion ein STRUCT by value
+  // zurueckgibt, sonst 0. Klassen zaehlen nicht — sie sind Referenzen und
+  // werden weiterhin als Zeiger zurueckgegeben.
+  fn cg_fnRetStructBytes(name: pchar, nameLen: int64): int64 {
+    var lb: int64 := alloc(8);
+    var rn: pchar := self.cg_funcRetTypeName(name, nameLen, lb);
+    var rl: int64 := peek64(lb);
+    free(lb, 8);
+    if (rn == 0 as pchar || rl <= 0) { return 0; }
+    var ci: int64 := self.cg_findClass(rn, rl);
+    if (ci < 0) { return 0; }
+    if (self.cg_istWertStruct(ci) == 0) { return 0; }
+    // #1595: Nicht selbstenthaltene Structs behalten den alten Weg — sonst
+    // traegt die flache Kopie einen Zeiger in einen gefallenen Rahmen.
+    if (self.cg_structSelbstEnthalten(ci, 0) == 0) { return 0; }
+    var sz: int64 := self.cg_classStructSize(ci);
+    if (sz <= 0) { return 0; }
+    return sz;
+  }
+
   fn cg_funcRetTypeIs(name: pchar, nameLen: int64, tname: pchar, tlen: int64): int64 {
     var i: int64 := 0;
     while (i < self.fnRetCount) {
@@ -4198,7 +4381,8 @@ pub type Codegen = class {
         if (body >= 0 && self.cg_nkind(body) == CGN_METHOD_PTR) {
           self.cg_registerMethodAlias(self.cg_nsval(cur), self.cg_nslen(cur));
         } else if (body >= 0 && self.cg_nkind(body) == CGN_FN_PTR_NODE) {
-          self.cg_registerFnAlias(self.cg_nsval(cur), self.cg_nslen(cur));
+          self.cg_registerFnAliasR(self.cg_nsval(cur), self.cg_nslen(cur),
+                                   self.cg_nc1(body));   // #1595: Rueckgabetyp
         }
       }
       cur := self.cg_nnext(cur);
@@ -4284,24 +4468,58 @@ pub type Codegen = class {
     }
   }
 
-  fn cg_registerFnAlias(name: pchar, nameLen: int64) {
+  // #1595: Der Eintrag traegt jetzt auch den RUECKGABETYP des Zeigertyps.
+  // Ohne ihn kann eine indirekte Aufrufstelle nicht wissen, dass der Gerufene
+  // ein Struct by value liefert und deshalb das verdeckte erste Argument
+  // erwartet — und genau daran ist `ResultInt64AndThen` abgestuerzt: der
+  // Gerufene schrieb in einen Zeiger, den ihm niemand gegeben hatte.
+  fn cg_registerFnAliasR(name: pchar, nameLen: int64, retNode: int64) {
     if (self.fnAliasCount >= self.fnAliasCap) {
       var nc: int64 := self.fnAliasCap * 2;
-      var nb: int64 := alloc(nc * 16);
-      memcpy(nb, self.fnAliasList, self.fnAliasCount * 16);
+      var nb: int64 := alloc(nc * CG_FNALIAS_SZ);
+      memcpy(nb, self.fnAliasList, self.fnAliasCount * CG_FNALIAS_SZ);
       self.fnAliasList := nb;
       self.fnAliasCap  := nc;
     }
-    var base: int64 := self.fnAliasList + self.fnAliasCount * 16;
-    poke64(base,     name as int64);
-    poke64(base + 8, nameLen);
+    var base: int64 := self.fnAliasList + self.fnAliasCount * CG_FNALIAS_SZ;
+    poke64(base,      name as int64);
+    poke64(base + 8,  nameLen);
+    poke64(base + 16, 0);
+    poke64(base + 24, 0);
+    if (retNode >= 0 && self.cg_nkind(retNode) == 60) {
+      poke64(base + 16, self.cg_nsval(retNode) as int64);
+      poke64(base + 24, self.cg_nslen(retNode));
+    }
     self.fnAliasCount += 1;
+  }
+  fn cg_registerFnAlias(name: pchar, nameLen: int64) {
+    self.cg_registerFnAliasR(name, nameLen, 0 - 1);
   }
   fn cg_isFnPtrAlias(name: pchar, nameLen: int64): int64 {
     var i: int64 := 0;
     while (i < self.fnAliasCount) {
-      var base: int64 := self.fnAliasList + i * 16;
+      var base: int64 := self.fnAliasList + i * CG_FNALIAS_SZ;
       if (self.cg_seq(peek64(base) as pchar, peek64(base + 8), name, nameLen) != 0) { return 1; }
+      i += 1;
+    }
+    return 0;
+  }
+
+  // #1595: Liefert ein Zeigertyp dieses Namens ein Struct by value zurueck?
+  // 0 = nein oder unbekannt.
+  fn cg_fnAliasRetStructBytes(name: pchar, nameLen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.fnAliasCount) {
+      var base: int64 := self.fnAliasList + i * CG_FNALIAS_SZ;
+      if (self.cg_seq(peek64(base) as pchar, peek64(base + 8), name, nameLen) != 0) {
+        var rp: pchar := peek64(base + 16) as pchar;
+        var rl: int64 := peek64(base + 24);
+        if (rp == 0 as pchar || rl <= 0) { return 0; }
+        var rci: int64 := self.cg_findClass(rp, rl);
+        if (rci < 0) { return 0; }
+        if (self.cg_istWertStruct(rci) == 0) { return 0; }
+        return self.cg_classStructSize(rci);
+      }
       i += 1;
     }
     return 0;
@@ -5615,6 +5833,21 @@ pub type Codegen = class {
   // Parameteruebergabe reichten denselben Zeiger weiter, ein Schreiben auf die
   // "Kopie" traf das Original. Still, ohne Warnung.
   //
+  // #1595: Der Bump-Bereich aus #1580 wird nur noch fuer Structs gebraucht,
+  // die NICHT selbstenthalten sind — also solche mit einem verschachtelten
+  // Struct-Feld, das als ZEIGER liegt statt inline. Bei denen kopiert eine
+  // flache Kopie nur den Zeiger; laege das Ziel im Rahmen, waere es nach der
+  // Rueckkehr tot. Fuer alle uebrigen kommt der Platz aus dem Rahmen, und
+  // dort waechst nichts mehr.
+  //
+  // Wann ein Feld zum Zeiger wird, entscheidet sich beim Bau des Layouts:
+  // stammt der Feldtyp aus einer anderen Unit, ist seine Groesse dort noch
+  // nicht bekannt und das Feld bekommt acht Byte. `Circle` aus std.circle ist
+  // genau so ein Fall (`center: Vec2` aus std.vector) — sizeof(Circle) ist 16,
+  // nicht 24. Das ist eine eigene Schwaeche und aelter als diese Aenderung:
+  // derselbe Aufbau stuerzt auch mit 1.1.3H ab, wenn der verschachtelte Typ
+  // aus einer dritten Unit kommt.
+
   // Kopiert `bytes` Byte von der Adresse in rax in frischen Speicher und
   // laesst dessen Adresse in rax zurueck. Alles, was hier benutzt wird, wird
   // vorher gesichert: der Aufrufer sieht nur rax veraendert.
@@ -5693,9 +5926,19 @@ pub type Codegen = class {
     self.cg_e8(0x5A);                                          // pop rdx
   }
 
-  fn cg_emitStructKopie(bytes: int64) {
+  // #1595: `ci` ist der Klassenindex des kopierten Typs (-1 = unbekannt). Nur
+  // ein selbstenthaltenes Struct darf seine Kopie im Rahmen halten; bei einem
+  // verschachtelten Struct-Feld, das als Zeiger liegt, muss der Speicher die
+  // Rueckkehr ueberleben.
+  fn cg_emitStructKopieVon(bytes: int64, ci: int64) {
     if (bytes <= 0) { return; }
     var worte: int64 := (bytes + 7) / 8;
+    var imRahmen: int64 := 0;
+    var kopieOff: int64 := 0;
+    if (ci >= 0 && self.cg_structSelbstEnthalten(ci, 0) != 0) {
+      imRahmen := 1;
+      kopieOff := self.cg_reserveFrame(worte * 8);
+    }
     self.cg_e8(0x50);                                        // push rax (Quelle)
     // #1580: Bis 1.1.0A stand hier ein mmap JE KOPIE — zwei je Rueckgabe eines
     // Structs, und nie ein munmap. Das kostete rund 32 Mikrosekunden statt
@@ -5706,7 +5949,11 @@ pub type Codegen = class {
     // Jetzt kommt der Platz aus einem Bump-Bereich: die naechste freie Adresse
     // steht im Datensegment, die Belegung ist eine Addition. Nachgelegt wird
     // seitenweise (1 MiB), also einmal je 65 536 Paaren statt einmal je Kopie.
-    self.cg_emitStructArenaAlloc(worte * 8);
+    if (imRahmen != 0) {
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x85); self.cg_e32(kopieOff);  // lea rax,[rbp+off]
+    } else {
+      self.cg_emitStructArenaAlloc(worte * 8);
+    }
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);    // mov rdi, rax (Ziel)
     self.cg_e8(0x5E);                                        // pop rsi (Quelle)
     self.cg_e8(0x57);                                        // push rdi
@@ -5715,6 +5962,10 @@ pub type Codegen = class {
     self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0xA5);    // rep movsq
     self.cg_e8(0x58);                                        // pop rax (Ziel)
   }
+
+  // #1595: alte Form ohne Klassenindex — sie kann die Frage nicht beantworten
+  // und bleibt deshalb beim Bump-Bereich.
+  fn cg_emitStructKopie(bytes: int64) { self.cg_emitStructKopieVon(bytes, 0 - 1); }
 
   // #1351: Inhalt kopieren, statt den Zeiger zu tauschen. `b := a` schreibt in
   // den Speicher, den b schon hat — eine Neubindung waere bei einem Wertetyp
@@ -5793,6 +6044,30 @@ pub type Codegen = class {
       i += 1;
     }
     return 8;
+  }
+
+  // #1595: Klassenindex des FELDTYPS — gebraucht, um zu erkennen, ob in ein
+  // Feld ein Struct-WERT geschrieben wird, das Feld den Wert aber nur als
+  // Zeiger aufnimmt.
+  fn cg_feldTypKlasse(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
+    if (classIdx < 0) { return -1; }
+    var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var p: pchar := peek64(fb) as pchar;
+      var n: int64 := peek64(fb + CG_CFIELD_OFF_FIELDLEN);
+      if (n == fieldLen && self.cg_seq(p, n, fieldName, fieldLen)) {
+        var tp: pchar := peek64(fb + CG_CFIELD_OFF_TYPENAMEPTR) as pchar;
+        var tl: int64 := peek64(fb + CG_CFIELD_OFF_TYPENAMELEN);
+        if (tp == 0 as pchar || tl <= 0) { return -1; }
+        return self.cg_findClass(tp, tl);
+      }
+      i += 1;
+    }
+    return -1;
   }
 
   // Returns class index of the element type of an Array<T> field, or -1
@@ -8047,13 +8322,37 @@ pub type Codegen = class {
       self.cg_fcArm(self.cg_nsval(ni), self.cg_nslen(ni));
       self.fcActive := 1;
     }
-    // Implicit self parameter at register 0 (rdi)
+    // #1595: Gibt die Methode ein STRUCT by value zurueck, liegt in rdi die
+    // Zieladresse des Aufrufers und `self` rueckt nach rsi; die echten
+    // Parameter beginnen dann bei rdx. Ohne diese Behandlung zeigte der
+    // Rueckgabewert in den Rahmen der Methode — der beim Zuruecksetzen faellt,
+    // und dass der Aufrufer dort noch die richtigen Bytes vorfand, war Glueck
+    // und keine Zusicherung.
+    self.fnRetStructBytes := 0;
+    self.fnRetSlotOff     := 0;
+    var mRetTyN: int64 := self.cg_nc1(ni);
+    if (mRetTyN >= 0 && self.cg_nkind(mRetTyN) == 60) {
+      var mrci: int64 := self.cg_findClass(self.cg_nsval(mRetTyN), self.cg_nslen(mRetTyN));
+      if (mrci >= 0 && self.cg_istWertStruct(mrci) != 0
+          && self.cg_structSelbstEnthalten(mrci, 0) != 0) {
+        var mrsz: int64 := self.cg_classStructSize(mrci);
+        if (mrsz > 0) {
+          self.fnRetStructBytes := mrsz;
+          self.fnRetSlotOff := self.cg_reserveFrame(8);
+          self.cg_spillRdi(self.fnRetSlotOff);
+        }
+      }
+    }
+
+    // Implicit self parameter at register 0 (rdi) — bei Struct-Rueckgabe rsi.
     var selfOff: int64 := self.cg_addLocal("self", 4);
     self.cg_setLocalType(self.localCount - 1, className, classNameLen);
-    self.cg_spillRdi(selfOff);
+    if (self.fnRetStructBytes > 0) { self.cg_spillRsi(selfOff); }
+    else { self.cg_spillRdi(selfOff); }
     // Regular params start at register index 1
     var param: int64 := self.cg_nc0(ni);
     var paramIdx: int64 := 1;
+    if (self.fnRetStructBytes > 0) { paramIdx := 2; }
     while (param != -1 && paramIdx < 6) {
       var pname: pchar := self.cg_nsval(param);
       var pnlen: int64 := self.cg_nslen(param);
@@ -10188,9 +10487,13 @@ pub type Codegen = class {
       if (self.cg_findLocal(fname, fnlen) == 0) {
         var gfIdx: int64 := self.cg_findGlobalIdx(fname, fnlen);
         if (gfIdx >= 0 && peek8(self.globalIsFnPtr + gfIdx) != 0) {
+          var gfSret: int64 := self.cg_fnAliasRetStructBytes(fname, fnlen);
+          if (gfSret <= 0) { gfSret := self.cg_globalRetStructBytes(fname, fnlen); }
           var gfCur: int64 := argNode;
           var gfArgc: int64 := 0;
+          gfArgc := gfArgc + self.cg_indirektSretVorschub(gfSret);
           while (gfCur >= 0) { self.cg_genExpr(gfCur); self.cg_pushRax(); gfArgc := gfArgc + 1; gfCur := self.cg_nnext(gfCur); }
+          if (gfArgc > 6) { self.cg_zuVieleIndirekt(fname, fnlen); }
           self.cg_loadRaxGlobal(self.cg_findGlobal(fname, fnlen));   // rax = Codeadresse
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);      // mov rbx, rax
           if (gfArgc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }   // pop r9
@@ -10218,9 +10521,12 @@ pub type Codegen = class {
           if (peek8(self.localIsFnPtr + clIdx) != 0) { isThinFn := 1; }
         }
         if (isThinFn != 0) {
+          var tfSret: int64 := self.cg_indirektRetStructBytes(fname, fnlen);
           var tfCur: int64 := argNode;
           var tfArgc: int64 := 0;
+          tfArgc := tfArgc + self.cg_indirektSretVorschub(tfSret);
           while (tfCur >= 0) { self.cg_genExpr(tfCur); self.cg_pushRax(); tfArgc := tfArgc + 1; tfCur := self.cg_nnext(tfCur); }
+          if (tfArgc > 6) { self.cg_zuVieleIndirekt(fname, fnlen); }
           self.cg_loadRax(clOff);                                 // rax = fn-Adresse (plain)
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);   // mov rbx, rax
           if (tfArgc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9
@@ -10499,7 +10805,25 @@ pub type Codegen = class {
     var nTotal: int64 := argc;
     if (isMethod == 1) { nTotal := argc + 1; }
 
+    // #1595: Gibt der Gerufene ein STRUCT by value zurueck, stellt DIESER
+    // Rahmen den Platz und reicht die Adresse als verdecktes erstes Argument
+    // durch. Bei einer Methode liegen dann ZWEI verdeckte Werte vorn:
+    // rdi = Zieladresse, rsi = self, die echten Parameter ab rdx.
+    var sretBytes: int64 := 0;
+    var sretOff:   int64 := 0;
+    if (isSuperCall == 0) { sretBytes := self.cg_callRetStructBytes(ni); }
+    if (sretBytes > 0) {
+      nTotal := nTotal + 1;
+      sretOff := self.cg_reserveFrame(sretBytes);
+    }
+
     if (nTotal <= 6) {
+      // #1595: der verdeckte Zeiger zuerst — die Pops unten fuellen rueckwaerts,
+      // das erste Gepushte landet also in rdi.
+      if (sretBytes > 0) {
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x85); self.cg_e32(sretOff);  // lea rax,[rbp+off]
+        self.cg_pushRax();
+      }
       // Simple path: all fit in registers — push self first (method), then args, then defaults
       if (isMethod == 1) {
         if (isSuperCall != 0) { self.cg_loadLocalByName("self"c, 4); }
@@ -10583,7 +10907,44 @@ pub type Codegen = class {
         acur := self.cg_nnext(acur);
       }
       }
-      if (isMethod == 1) {
+      // #1595: Der verdeckte Rueckgabezeiger belegt ein Register wie `self`.
+      // Damit verschiebt sich die Grenze zwischen Register- und Stapelargumenten
+      // um eins — genau so, wie sie sich bei einer Methode schon verschiebt.
+      // Drei Tests im Bestand (quat_test, rest00_test, do_test_transport)
+      // rufen struct-rueckgebende Funktionen mit sechs und mehr Argumenten;
+      // eine "benannte Luecke" waere hier also keine Grenze, sondern ein
+      // Rueckschritt gewesen.
+      var regPlaetze: int64 := 6;
+      if (sretBytes > 0) { regPlaetze := regPlaetze - 1; }
+      if (isMethod == 1) { regPlaetze := regPlaetze - 1; }
+
+      if (sretBytes > 0) {
+        // Zuerst die Stapelargumente (tiefste zuerst) — sie muessen unter den
+        // Registerargumenten liegen, deshalb vor allen Pushes fuer Register.
+        var sis: int64 := nExpl - 1;
+        while (sis >= regPlaetze) {
+          self.cg_genExpr(peek64(argBuf + sis * 8));
+          self.cg_pushRax();
+          sis -= 1;
+        }
+        // Dann der verdeckte Zeiger …
+        self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x85); self.cg_e32(sretOff);
+        self.cg_pushRax();
+        // … bei einer Methode danach self …
+        if (isMethod == 1) {
+          if (isSuperCall != 0) { self.cg_loadLocalByName("self"c, 4); }
+          else { if (isStaticCall == 0) { self.cg_genExpr(smObj); } else { self.cg_zeroRax(); } }
+          self.cg_pushRax();
+          argc += 1;
+        }
+        // … und zuletzt die Argumente, die in Register gehen.
+        var ris: int64 := 0;
+        while (ris < regPlaetze && ris < nExpl) {
+          self.cg_genExpr(peek64(argBuf + ris * 8));
+          self.cg_pushRax();
+          ris += 1;
+        }
+      } else if (isMethod == 1) {
         argc += 1;
         // Push stack explicit args in reverse: arg[nExpl-1] deepest, arg[5] shallowest
         var si: int64 := nExpl - 1;
@@ -10623,6 +10984,11 @@ pub type Codegen = class {
       }
       free(argBuf, nExpl * 8);
     }
+
+    // #1595: Jetzt erst mitzaehlen — vorher haette es die Nachlauflogik fuer
+    // Vorgabewerte verschoben, die `argc` als Zahl der schon belegten
+    // Parameter liest.
+    if (sretBytes > 0) { argc += 1; }
 
     // Pop args into registers
     if (argc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9  (arg5)
@@ -14119,7 +14485,8 @@ pub type Codegen = class {
           var initKind: int64 := self.cg_nkind(init);
           if (self.cg_typeIstWertStruct(typeNode) != 0
               && initKind != CGN_CAST && initKind != CGN_NEW) {
-            self.cg_emitStructKopie(self.cg_inlineStructBytes(typeNode));
+            self.cg_emitStructKopieVon(self.cg_inlineStructBytes(typeNode),
+                                       self.cg_findClass(self.cg_nsval(typeNode), self.cg_nslen(typeNode)));
           }
           // #1502: `var x: f64 := 1;` — die rechte Seite ist eine GANZZAHL, die
           // Variable ein Gleitkommawert. Bis hierher landete die 1 als
@@ -14252,7 +14619,27 @@ pub type Codegen = class {
           // Durchlaeufen. Jetzt kommt der Platz aus demselben Bump-Bereich wie
           // die Kopien, und zwar in der WIRKLICHEN Groesse des Structs.
           if (sdoBytes <= 0) { sdoBytes := 64; }
-          self.cg_emitStructArenaAlloc((sdoBytes + 7) / 8 * 8);
+          // #1595: Der Platz kommt jetzt aus dem RAHMEN, nicht mehr aus dem
+          // Bump-Bereich. Ein Struct-Local lebt genau so lange wie sein
+          // Rahmen; mit dem Rahmen faellt es weg, und nichts waechst mehr.
+          // Moeglich wurde das erst, seit die Rueckgabe in den Platz des
+          // AUFRUFERS schreibt (verdecktes erstes Argument) — vorher zeigte
+          // der Rueckgabewert in den gerade gefallenen Rahmen des Gerufenen.
+          // sdoIdx steht im Block darueber; hier neu bestimmen.
+          var sdoCi: int64 := 0 - 1;
+          if (typeNode >= 0 && self.cg_nkind(typeNode) == 60) {
+            sdoCi := self.cg_findClass(self.cg_nsval(typeNode), self.cg_nslen(typeNode));
+          }
+          if (sdoCi >= 0 && self.cg_structSelbstEnthalten(sdoCi, 0) != 0) {
+            var sdoFrameOff: int64 := self.cg_reserveFrame((sdoBytes + 7) / 8 * 8);
+            self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x85); self.cg_e32(sdoFrameOff);  // lea rax,[rbp+off]
+          } else {
+            // Nicht selbstenthalten (verschachteltes Struct als Zeiger): der
+            // Platz muss die Rueckkehr ueberleben, also weiterhin aus dem
+            // Bump-Bereich. Hier waechst der Speicher wie bisher — siehe den
+            // Kommentar bei cg_emitStructArenaAlloc.
+            self.cg_emitStructArenaAlloc((sdoBytes + 7) / 8 * 8);
+          }
         } else {
           self.cg_zeroRax();
         }
@@ -14409,6 +14796,31 @@ pub type Codegen = class {
         var stInline: int64 := 0;
         if (foff >= 0 && classIdx >= 0) {
           stInline := (self.cg_getFieldBigEndian(classIdx, fieldName, fieldLen) >> 4) & 1;
+        }
+        // #1595: Liegt das Feld NICHT inline, nimmt es nur die Adresse der
+        // Quelle auf. Dann muss die Quelle den Rahmen ueberleben, in dem sie
+        // entstanden ist — also eine Kopie aus dem Bump-Bereich.
+        //
+        // Die Frage laesst sich NICHT am Typ der Quelle beantworten: ob ein
+        // Typ irgendwo als Feldtyp auftaucht, weiss der Codegen beim
+        // Uebersetzen seiner Unit noch gar nicht, weil die Importe erst der
+        // Hauptdurchlauf einliest. Ein erster Anlauf hat genau daran
+        // gescheitert — `V` sah in seiner eigenen Unit unbenutzt aus, wanderte
+        // in den Rahmen, und `K.c` hielt danach einen Zeiger in einen
+        // gefallenen Rahmen. Hier dagegen ist die Frage lokal entscheidbar:
+        // an DIESER Zuweisung steht fest, dass ein Zeiger gespeichert wird.
+        if (stInline == 0 && classIdx >= 0 && foff >= 0) {
+          var zfk: int64 := self.cg_feldTypKlasse(classIdx, fieldName, fieldLen);
+          if (zfk >= 0 && self.cg_istWertStruct(zfk) != 0) {
+            var zfb: int64 := self.cg_classStructSize(zfk);
+            if (zfb > 0) {
+              self.cg_e8(0x50);                                     // push rax (Zielobjekt)
+              self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF0); // mov rax, rsi (Quelle)
+              self.cg_emitStructKopie(zfb);                         // Kopie ausserhalb des Rahmens
+              self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6); // mov rsi, rax (Kopie)
+              self.cg_e8(0x58);                                     // pop rax (Zielobjekt)
+            }
+          }
         }
         if (stInline != 0) {
           var stBytes: int64 := self.cg_fieldBytes(classIdx, fieldName, fieldLen);
@@ -14662,6 +15074,26 @@ pub type Codegen = class {
 
     } else if (k == CGN_RETURN) {
       var expr: int64 := self.cg_nc0(ni);
+      // #1595: Struct-Rueckgabe — der Wert wird in den Platz des Aufrufers
+      // kopiert, dessen Adresse im Prolog gerettet wurde. Zurueck kommt diese
+      // Adresse; damit sieht die Aufrufstelle dasselbe wie vorher, nur ohne
+      // Belegung, die nie zurueckgegeben wird.
+      if (self.fnRetStructBytes > 0 && expr >= 0) {
+        self.cg_genExpr(expr);                                   // rax = Quelle
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);    // mov rsi, rax
+        self.cg_loadRax(self.fnRetSlotOff);                      // rax = Ziel
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);    // mov rdi, rax
+        self.cg_pushRax();
+        var worte: int64 := (self.fnRetStructBytes + 7) / 8;
+        self.cg_movRaxImm(worte);
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);    // mov rcx, rax
+        self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0xA5);    // rep movsq
+        self.cg_popRax();                                         // rax = Ziel
+        if (self.deferCount > 0) { self.cg_pushRax(); self.cg_emitDefers(); self.cg_popRax(); }
+        if (self.tryDepth > 0) { self.cg_pushRax(); self.cg_emitTryUnwindDownTo(0); self.cg_popRax(); }
+        self.cg_emitEpilogue();
+        return;
+      }
       // WP-04: tuple return [a, b] → rax=first, rdx=second (SysV ABI)
       if (self.funcHasTupleReturn != 0 && expr >= 0 && self.cg_nkind(expr) == 100) {
         var elem0: int64 := self.cg_nc0(expr);
@@ -17068,6 +17500,25 @@ pub type Codegen = class {
     // Emit prologue, capture patch position for sub rsp imm32
     var prologuePatch: int64 := self.cg_emitPrologue();
 
+    // #1595: Gibt diese Funktion ein STRUCT by value zurueck, dann steht in
+    // rdi die vom Aufrufer bereitgestellte Zieladresse — ein verdecktes
+    // erstes Argument. Es wird als erstes in den Rahmen gerettet, danach
+    // ruecken alle echten Parameter um ein Register weiter.
+    self.fnRetStructBytes := 0;
+    self.fnRetSlotOff     := 0;
+    if (retTyNode >= 0 && self.cg_nkind(retTyNode) == 60) {
+      var rci: int64 := self.cg_findClass(self.cg_nsval(retTyNode), self.cg_nslen(retTyNode));
+      if (rci >= 0 && self.cg_istWertStruct(rci) != 0
+          && self.cg_structSelbstEnthalten(rci, 0) != 0) {
+        var rsz: int64 := self.cg_classStructSize(rci);
+        if (rsz > 0) {
+          self.fnRetStructBytes := rsz;
+          self.fnRetSlotOff := self.cg_reserveFrame(8);
+          self.cg_spillRdi(self.fnRetSlotOff);
+        }
+      }
+    }
+
     // #1140: @flight_crit — SSE-Ausnahmen freischalten. Der Zustand wird
     // gerettet und wiederhergestellt, damit eine geschachtelt erzeugte
     // Funktion die aeussere nicht umschaltet.
@@ -17116,12 +17567,15 @@ pub type Codegen = class {
           poke8(self.localFnPtrF64 + self.localCount - 1, 1);
         }
       }
-      if (paramIdx == 0) { self.cg_spillRdi(off); }
-      else if (paramIdx == 1) { self.cg_spillRsi(off); }
-      else if (paramIdx == 2) { self.cg_spillRdx(off); }
-      else if (paramIdx == 3) { self.cg_spillRcx(off); }
-      else if (paramIdx == 4) { self.cg_spillR8(off); }
-      else if (paramIdx == 5) { self.cg_spillR9(off); }
+      // #1595: Bei Struct-Rueckgabe belegt der verdeckte Zeiger rdi.
+      var regIdx: int64 := paramIdx;
+      if (self.fnRetStructBytes > 0) { regIdx := paramIdx + 1; }
+      if (regIdx == 0) { self.cg_spillRdi(off); }
+      else if (regIdx == 1) { self.cg_spillRsi(off); }
+      else if (regIdx == 2) { self.cg_spillRdx(off); }
+      else if (regIdx == 3) { self.cg_spillRcx(off); }
+      else if (regIdx == 4) { self.cg_spillR8(off); }
+      else if (regIdx == 5) { self.cg_spillR9(off); }
       paramIdx += 1;
       param := self.cg_nnext(param);
     }
@@ -17165,7 +17619,8 @@ pub type Codegen = class {
         var kopOff: int64 := self.cg_findLocal(self.cg_nsval(kopP), self.cg_nslen(kopP));
         if (kopOff != 0) {
           self.cg_loadRax(kopOff);
-          self.cg_emitStructKopie(self.cg_inlineStructBytes(kopTy));
+          self.cg_emitStructKopieVon(self.cg_inlineStructBytes(kopTy),
+                                     self.cg_findClass(self.cg_nsval(kopTy), self.cg_nslen(kopTy)));
           self.cg_storeRax(kopOff);
         }
       }
@@ -19151,7 +19606,10 @@ pub type Codegen = class {
           // `:= null` es schon konnte. Ein STRUCT dagegen ist ein Wert und
           // behaelt seinen Speicher; daran haengt der Bestand (dt_root in
           // std/ml.lyx ist genau so gemeint).
-          if (gsci >= 0 && self.cg_istStructTyp(gsci) == 0) { gsci := 0 - 1; }
+          // #1595: hier stand cg_istStructTyp — dieselbe Verwechslung von
+          // Layout und Wertsemantik. Eine Klasse ohne Methoden ist eine
+          // Referenz und bekommt keinen eigenen Speicher.
+          if (gsci >= 0 && self.cg_istWertStruct(gsci) == 0) { gsci := 0 - 1; }
           if (gsci >= 0 && gRedundant == 0) {
             var gssz: int64 := self.cg_classStructSize(gsci);
             aggBlock := self.cg_reserveData(gssz);
@@ -19476,7 +19934,7 @@ pub type Codegen = class {
     self.methodAliasList  := alloc(self.methodAliasCap * 16);
     self.methodAliasCount := 0;
     self.fnAliasCap   := 64;
-    self.fnAliasList  := alloc(self.fnAliasCap * 16);
+    self.fnAliasList  := alloc(self.fnAliasCap * CG_FNALIAS_SZ);
     self.fnAliasCount := 0;
     self.cg_registerF64Func("fAdd"c,  4);
     self.cg_registerF64Func("fSub"c,  4);
@@ -19515,6 +19973,7 @@ pub type Codegen = class {
     // WP-AS-04/05: directive flags
     self.boundsCheckEnabled := 1;  // on by default
     self.boundsCheckForced  := 0;  // #1124: nicht angefordert
+    self.structArenaOff     := 0 - 1;   // #1580/#1595
     self.msAbi              := 0;  // #1674: SysV, sofern nicht win64
     self.debugInfoEnabled   := 0;
     self.optLevel           := 2;
@@ -19587,7 +20046,6 @@ pub type Codegen = class {
     self.conFnCount  := 0;
     self.lastAnonName    := 0;
     self.lastAnonNameLen := 0;
-    self.structArenaOff  := 0 - 1;
     self.unitCheckMode   := 0;
     self.globalTypeNames := alloc(self.globalVarCap * 16);
     self.globalIsArray  := alloc(self.globalVarCap);          // #1256
