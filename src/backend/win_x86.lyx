@@ -162,6 +162,7 @@ pub type WinX86Backend = class {
   rdIatOff:        int64;   // Offset der IAT der ERSTEN DLL (dort liegen die fuenf der Laufzeit)
   rdSize:          int64;   // belegte Bytes in .rdata
   rdExternSlot:    int64;   // Offset der IAT-Zelle je Extern (8 Byte je Eintrag), 0 = keine
+  rdExternName:    int64;   // #1676: Offset des hint+Name-Blocks je Extern
   impDllPtr:       int64;   // #1671: Zwischenergebnisse von wxb_planImports
   impDllLen:       int64;
   impDllCnt:       int64;
@@ -173,6 +174,8 @@ pub type WinX86Backend = class {
   vallocCallOff:   int64;   // code offset of the helper's `call [VirtualAlloc]` (-1 = none)
   argcStoreOff:    int64;   // WP-WINARGV: disp32-Offset von `mov [rip+d],rax` (argc→CG_ARGC), Patch
   argvStoreOff:    int64;   // WP-WINARGV: disp32-Offset von `mov [rip+d],rdx` (argv→CG_ARGV), Patch
+  envStoreOff:     int64;   // #1677: disp32-Offset des Stores in CG_ENVBLOCK
+  envCallOff:      int64;   // #1677: Offset des `call [GetEnvironmentStringsA]`
 
   // ------------------------------------------------------------------
   // Code buffer primitives
@@ -665,9 +668,21 @@ pub type WinX86Backend = class {
     // mov [rip+disp32], rdx  (argv → CG_ARGV)  7 bytes [22..28]
     self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0x15);
     self.argvStoreOff := self.codeLen; self.wxb_ce32(0);
-    // 19 NOPs [29..47] (33 - 14 = 19; _start bleibt 79 Bytes)
+    // #1677: Unter Windows liegt envp NICHT hinter argv — diese Anordnung gibt
+    // es nur bei SysV. std.env rechnete sie sich aus und lief mit peek64 durch
+    // fremden Speicher, bis es fiel. Die Laufzeit holt den Block deshalb hier
+    // von GetEnvironmentStringsA und legt ihn in CG_ENVBLOCK ab; std.env
+    // fragt ihn ueber GetEnvBlock() ab und geht auf Linux weiter den alten Weg.
+    // call [GetEnvironmentStringsA_IAT]  6 Bytes
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15);
+    self.envCallOff := self.codeLen - 2;
+    self.wxb_ce32(0);
+    // mov [rip+disp32], rax  (Block → CG_ENVBLOCK)  7 Bytes
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0x05);
+    self.envStoreOff := self.codeLen; self.wxb_ce32(0);
+    // 6 NOPs — _start bleibt 79 Bytes (19 - 13 = 6)
     var i: int64 := 0;
-    while (i < 19) { self.wxb_ce8(0x90); i := i + 1; }
+    while (i < 6) { self.wxb_ce8(0x90); i := i + 1; }
     // call main  E8 rel32  [48..52]
     self.wxb_ce8(0xE8); self.wxb_ce32(relMain);
     // mov ecx, eax  (exit code = main() return value)  2 bytes [53..54]
@@ -814,6 +829,10 @@ pub type WinX86Backend = class {
     var vaRVA:  int64 := rdataRVA + iat0 + 16;  // VirtualAlloc
     var gclRVA: int64 := rdataRVA + iat0 + 24;  // GetCommandLineA
     var ghRVA:  int64 := rdataRVA + iat0 + 32;  // GetStdHandle
+    var gesRVA: int64 := rdataRVA + iat0 + 40;  // GetEnvironmentStringsA (#1677)
+    if (self.envCallOff >= 0) {
+      self.wxb_patch32(self.envCallOff + 2, gesRVA - (WIN_TEXT_RVA + self.envCallOff + 6));
+    }
 
     // #1671: die Aufrufstellen der eigenen Externs. Der Codegen hat dort
     // `call *disp32(%rip)` erzeugt und den disp32 offen gelassen (Patchart 3,
@@ -975,6 +994,9 @@ pub type WinX86Backend = class {
     if self.argcStoreOff >= 0 {
       self.wxb_patch32(self.argcStoreOff, (dataTextOff + 32) - (self.argcStoreOff + 4));
       self.wxb_patch32(self.argvStoreOff, (dataTextOff + 40) - (self.argvStoreOff + 4));
+    }
+    if self.envStoreOff >= 0 {   // #1677: CG_ENVBLOCK liegt bei 96
+      self.wxb_patch32(self.envStoreOff, (dataTextOff + 96) - (self.envStoreOff + 4));
     }
 
     // WP-A2.2: rebase absolute VMT pointers in the appended user/data zone and
@@ -1142,24 +1164,30 @@ pub type WinX86Backend = class {
     while (dn < nDll) { runtimeNames := runtimeNames + peek64(self.impDllLen + dn * 8) + 1; dn := dn + 1; }
     // Reihenfolge der Laufzeitnamen: WriteFile, ExitProcess, VirtualAlloc,
     // GetCommandLineA, GetStdHandle.
-    var rtOff: int64 := alloc(5 * 8);
+    var rtOff: int64 := alloc(6 * 8);
     poke64(rtOff,      runtimeNames);
     poke64(rtOff + 8,  runtimeNames + 12);
     poke64(rtOff + 16, runtimeNames + 12 + 14);
     poke64(rtOff + 24, runtimeNames + 12 + 14 + 15);
     poke64(rtOff + 32, runtimeNames + 12 + 14 + 15 + 18);
-    var externNamesBase: int64 := runtimeNames + 12 + 14 + 15 + 18 + 15;
+    poke64(rtOff + 40, runtimeNames + 12 + 14 + 15 + 18 + 15);   // #1677
 
-    var durchgang: int64 := 0;
-    while (durchgang < 2) {          // 0 = INT, 1 = IAT — bitgleich
-      var d2: int64 := 0;
-      while (d2 < nDll) {
+    // #1676: Die Reihenfolge muss der aus wxb_planImports entsprechen: je DLL
+    // erst INT, dann IAT. Geschrieben wurden zuvor ERST alle INTs und DANACH
+    // alle IATs — bei einer einzigen DLL faellt das zusammen, ab der zweiten
+    // liegt jede Gruppe an der Stelle der vorigen. Der Deskriptor der zweiten
+    // DLL zeigte damit auf den Inhalt der ersten. Mein Nachweis zu #1671 hatte
+    // nur eine DLL geprueft und konnte das nicht sehen.
+    var d2: int64 := 0;
+    while (d2 < nDll) {
+      var durchgang: int64 := 0;
+      while (durchgang < 2) {          // 0 = INT, 1 = IAT — bitgleich
         if (d2 == 0) {
           var r: int64 := 0;
-          while (r < 5) { self.wxb_oe64(rdataRVA + peek64(rtOff + r * 8)); r := r + 1; }
+          while (r < 6) { self.wxb_oe64(rdataRVA + peek64(rtOff + r * 8)); r := r + 1; }
         }
-        // eigene Externs dieser DLL, in derselben Reihenfolge wie im Plan
-        var nOff: int64 := externNamesBase;
+        // #1676: eigene Externs dieser DLL — der Namensoffset kommt aus der
+        // Tabelle aus wxb_planImports, nicht aus einer zweiten Rechnung.
         var e: int64 := 0;
         while (e < self.externCount) {
           var eb: int64 := self.externBuf + e * WIN_EXTERN_SZ;
@@ -1167,15 +1195,14 @@ pub type WinX86Backend = class {
           var ll: int64 := peek64(eb + WIN_EXTERN_OFF_LIBLEN);
           if (lp == 0 || ll <= 0) { lp := "kernel32.dll"c as int64; ll := 12; }
           if (self.wxb_dllGleich(peek64(self.impDllPtr + d2 * 8), peek64(self.impDllLen + d2 * 8), lp, ll) != 0) {
-            self.wxb_oe64(rdataRVA + nOff);
+            self.wxb_oe64(rdataRVA + peek64(self.rdExternName + e * 8));
           }
-          nOff := nOff + self.wxb_nameBlobLen(peek64(eb + WIN_EXTERN_OFF_NAMELEN));
           e := e + 1;
         }
         self.wxb_oe64(0);            // Nullabschluss je Gruppe
-        d2 := d2 + 1;
+        durchgang := durchgang + 1;
       }
-      durchgang := durchgang + 1;
+      d2 := d2 + 1;
     }
 
     // ---- DLL-Namen ----
@@ -1195,6 +1222,7 @@ pub type WinX86Backend = class {
     self.wxb_oName("VirtualAlloc"c, 12);
     self.wxb_oName("GetCommandLineA"c, 15);
     self.wxb_oName("GetStdHandle"c, 12);
+    self.wxb_oName("GetEnvironmentStringsA"c, 22);   // #1677: hint+22+NUL = 25
 
     // ---- hint + Name je eigenem Extern ----
     var e2: int64 := 0;
@@ -1332,7 +1360,7 @@ pub type WinX86Backend = class {
     var dllCnt: int64 := alloc(64 * 8);      // Zahl der Funktionen je DLL
     poke64(dllPtr, "kernel32.dll"c as int64);
     poke64(dllLen, 12);
-    poke64(dllCnt, 5);                        // die fuenf der Laufzeit
+    poke64(dllCnt, 6);                        // die sechs der Laufzeit (#1677)
     var nDll: int64 := 1;
 
     var e: int64 := 0;
@@ -1379,7 +1407,7 @@ pub type WinX86Backend = class {
     var used: int64 := alloc(64 * 8);
     var u: int64 := 0;
     while (u < nDll) { poke64(used + u * 8, 0); u := u + 1; }
-    poke64(used, 5);                         // DLL 0: fuenf sind vergeben
+    poke64(used, 6);                         // DLL 0: sechs sind vergeben (#1677)
     e := 0;
     while (e < self.externCount) {
       var eb2: int64 := self.externBuf + e * WIN_EXTERN_SZ;
@@ -1402,9 +1430,19 @@ pub type WinX86Backend = class {
     var namesOff: int64 := off;
     var d4: int64 := 0;
     while (d4 < nDll) { off := off + peek64(dllLen + d4 * 8) + 1; d4 := d4 + 1; }
-    off := off + 12 + 14 + 15 + 18 + 15;     // die fuenf Namen der Laufzeit
+    off := off + 12 + 14 + 15 + 18 + 15 + 25;  // die sechs Namen der Laufzeit (#1677)
+    // #1676: Den Offset seines Namensblocks bekommt JEDER Extern hier fest
+    // zugewiesen. Zuvor rechnete ihn jede Schreibstelle fuer sich nach — INT,
+    // IAT und die Namensablage also dreimal —, und die Rechnungen liefen
+    // auseinander: die zweite DLL-Gruppe trug den Namen der ersten, ihre IAT
+    // einen dritten Wert, und sie lief ueber ihren Platz hinaus. Dieselbe
+    // Sorte Fehler wie #1655 und #1663, nur eine Ebene tiefer.
+    if (self.rdExternName == 0 && self.externCount > 0) {
+      self.rdExternName := alloc(self.externCount * 8);
+    }
     e := 0;
     while (e < self.externCount) {
+      poke64(self.rdExternName + e * 8, off);
       off := off + self.wxb_nameBlobLen(peek64(self.externBuf + e * WIN_EXTERN_SZ + WIN_EXTERN_OFF_NAMELEN));
       e := e + 1;
     }
@@ -1508,7 +1546,7 @@ pub type WinX86Backend = class {
     self.wxb_oe32(0); self.wxb_oe32(0);  // [9] TLS
     self.wxb_oe32(0); self.wxb_oe32(0);  // [10] LoadConfig
     self.wxb_oe32(0); self.wxb_oe32(0);  // [11] BoundImport
-    self.wxb_oe32(rdataRVA + self.rdIatOff); self.wxb_oe32((5 + self.externCount + 1) * 8);  // [12] IAT, #1671
+    self.wxb_oe32(rdataRVA + self.rdIatOff); self.wxb_oe32((6 + self.externCount + 1) * 8);  // [12] IAT, #1671/#1677
     self.wxb_oe32(0); self.wxb_oe32(0);  // [13] DelayImport
     self.wxb_oe32(0); self.wxb_oe32(0);  // [14] CLR
     self.wxb_oe32(0); self.wxb_oe32(0);  // [15] Reserved
@@ -1622,6 +1660,10 @@ pub type WinX86Backend = class {
     self.vallocCallOff   := 0 - 1;
     self.argcStoreOff    := 0 - 1;
     self.argvStoreOff    := 0 - 1;
+    self.envStoreOff     := 0 - 1;   // #1677
+    self.envCallOff      := 0 - 1;
+    self.envStoreOff     := 0 - 1;   // #1677
+    self.envCallOff      := 0 - 1;
     self.externBuf       := 0;      // #1671
     self.externCount     := 0;
     self.patchBuf        := 0;
@@ -1629,6 +1671,7 @@ pub type WinX86Backend = class {
     self.rdIatOff        := WIN_RDATA_IAT_OFF;
     self.rdSize          := WIN_RDATA_SIZE;
     self.rdExternSlot    := 0;
+    self.rdExternName    := 0;   // #1676
   }
 
   // #1671: Externs und Patch-Tabelle des Codegens VOR Build() uebergeben.
