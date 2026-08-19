@@ -57,6 +57,8 @@ is_exempt() {
     data/runde12/q/b.lyx)    return 0 ;;  # geschachtelte private Funktionen.
     data/runde13/enums.lyx)  return 0 ;;  # #1647: Pruefdaten — eine importierte
                                           # Unit mit Enum, kein Test.
+    data/runde14/argsum.c)   return 0 ;;  # #1640: C-Quelle der Testbibliothek
+                                          # fuer den FFI-Nachweis, kein Test.
     lib/lyxc_guard.sh)       return 0 ;;  # #1294: Bibliothek, kein Test — wird
                                           # von den Scripts eingebunden und vom
                                           # Waechter lyxc_guard_coverage_test.sh

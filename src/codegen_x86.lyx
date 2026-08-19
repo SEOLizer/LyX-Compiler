@@ -2325,6 +2325,32 @@ pub type Codegen = class {
     return 9;                       // r9
   }
 
+  // #1640: movsd xmm_k, [rsp+off]  (F2 0F 10 /r, mod=01, rm=100 → SIB 0x24)
+  // Fuer ein Gleitkommaargument, das der allgemeine Aufrufpfad auf den Stapel
+  // gelegt hat (Position >= 6). Der Umweg ueber ein GP-Register geht dort
+  // nicht — in den GP-Registern liegen nur die ersten sechs Argumente.
+  fn cg_ffiMovsdXmmFromRsp(k: int64, off: int64) {
+    self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x10);
+    if (off <= 127) {
+      self.cg_e8(0x44 + k * 8); self.cg_e8(0x24); self.cg_e8(off);
+    } else {
+      self.cg_e8(0x84 + k * 8); self.cg_e8(0x24); self.cg_e32(off);
+    }
+  }
+
+  // #1640: mov gpr, [rsp+off]  (REX.W 8B /r)
+  fn cg_ffiMovGprFromRsp(gpr: int64, off: int64) {
+    var rex: int64 := 0x48;
+    var reg: int64 := gpr;
+    if (gpr >= 8) { rex := 0x4C; reg := gpr - 8; }
+    self.cg_e8(rex); self.cg_e8(0x8B);
+    if (off <= 127) {
+      self.cg_e8(0x44 + reg * 8); self.cg_e8(0x24); self.cg_e8(off);
+    } else {
+      self.cg_e8(0x84 + reg * 8); self.cg_e8(0x24); self.cg_e32(off);
+    }
+  }
+
   // movq xmm_k, gpr   (66 REX.W 0F 6E /r)
   fn cg_ffiMovqXmmFromGpr(k: int64, gpr: int64) {
     var rex: int64 := 0x48;
@@ -3399,12 +3425,33 @@ pub type Codegen = class {
     while ((n % 10) == 0 && (d % 10) == 0 && d > 1) { n := n / 10; d := d / 10; }
     var binExp: int64 := 0;
     if (expNeg == 0) {
+      // #1657: Hier wurde `n` per Ganzzahldivision halbiert — und dabei jedes
+      // Mal ABGESCHNITTEN. Bei einem grossen Exponenten summieren sich die
+      // Abschnitte, und zwar einseitig: das Ergebnis lag systematisch zu
+      // niedrig (1.0e300 um 2 ULP, 1.0e308 um 1 ULP, beide nach unten).
+      // Zwei Aenderungen:
+      //   * Beim Halbieren wird zur naechsten Zahl gerundet statt abgeschnitten
+      //     — damit ist der Fehler nicht mehr einseitig.
+      //   * Multipliziert wird mit 5 statt mit 10; der Faktor 2 wandert in den
+      //     Binaerexponenten. Der Zaehler waechst dadurch langsamer, es muss
+      //     seltener halbiert werden, und jede vermiedene Halbierung ist ein
+      //     nicht verlorenes Bit. Denselben Kniff nutzt der Zweig fuer
+      //     negative Exponenten unten schon (#1569).
       while (ej < expVal) {
-        while (n > 922337203685477580) {
-          n := n / 2;
+        while (n > 1844674407370955161) {   // n*5 bleibt in int64
+          // Zur GERADEN Zahl runden, nicht auf. Ein blosses Aufrunden
+          // ((n+1)/2) verschiebt den Fehler nur auf die andere Seite: damit
+          // lief 1.7976931348623157e308 (der groesste darstellbare double)
+          // ueber und kam als +Inf heraus. Bei genau der Haelfte entscheidet
+          // die Paritaet, sodass sich die Fehler ueber die vielen
+          // Halbierungen gegenseitig aufheben statt sich zu summieren.
+          var q: int64 := n / 2;
+          if ((n % 2) != 0 && (q % 2) != 0) { q := q + 1; }
+          n := q;
           binExp += 1;
         }
-        n := n * 10;
+        n := n * 5;
+        binExp += 1;                        // der Faktor 2 aus 10 = 5 * 2
         ej += 1;
       }
     } else {
@@ -3426,7 +3473,13 @@ pub type Codegen = class {
           n := n * 2;
           binExp := binExp - 1;
         }
+        // #1657: Auch hier wurde abgeschnitten, und auch hier einseitig nach
+        // unten — 1.0e-300 kam um ein ULP zu klein an. Ein Rest von mehr als
+        // 5/2 gehoert aufgerundet; genau die Haelfte kann bei einem ungeraden
+        // Teiler nicht auftreten, ein Sonderfall entfaellt also.
+        var rest: int64 := n % 5;
         n := n / 5;
+        if (rest * 2 > 5) { n := n + 1; }
         binExp := binExp - 1;      // der Faktor 2 aus 10 = 5 * 2
         if (n == 0) { return 0; }  // wirklich unter dem Wertebereich
         ej += 1;
@@ -12935,6 +12988,11 @@ pub type Codegen = class {
       // float-Signatur (praktisch das gesamte OpenGL) war unbenutzbar.
       var declNi: int64 := peek64(edb + CG_EXTERN_OFF_NODE);
       var nFloat: int64 := 0;
+      // #1640: 1 = alle Argumente passen in die Registerreihen, der Callee
+      // bekommt also gar keine Stapelargumente — auch wenn der allgemeine
+      // Aufrufpfad welche abgelegt hat. Ohne Deklarationswissen bleibt es 0
+      // und alles laeuft wie bisher.
+      var ffiRegOnly: int64 := 0;
       if (declNi >= 0) {
         var fpos: int64 := alloc(8 * 8);      // Positionen der Gleitkommaargumente
         var fcls: int64 := alloc(8 * 8);      // 1 = f64, 2 = f32
@@ -12947,31 +13005,47 @@ pub type Codegen = class {
         // Bits 32-47 zwei je Parameter, Bits 48-49 die Rueckgabe.
         var fiv: int64 := self.cg_nival(declNi);
         var fmask: int64 := (fiv >> 32) & 65535;
+        // #1640: Bis hierher lag die Schranke bei Position 6 — ein siebtes
+        // oder achtes Gleitkommaargument wurde abgewiesen, obwohl die SysV-ABI
+        // die ersten ACHT in xmm0..xmm7 uebergibt und dafuer gar keinen Stapel
+        // braucht. Damit war praktisch das gesamte OpenGL mit
+        // Matrix-Signaturen nicht ansprechbar.
+        //
+        // Entscheidend sind nicht die Positionen, sondern die beiden getrennt
+        // gezaehlten Reihen: bis zu 6 Ganzzahlen in GP-Registern, bis zu 8
+        // Gleitkommawerte in xmm. Passen alle Argumente in diese Reihen,
+        // braucht der Callee keinen Stapel — auch bei acht Argumenten.
         var pi: int64 := 0;
-        var zuViele: int64 := 0;
-        while (pi < 8) {
+        var nStackDst: int64 := 0;
+        var grenze: int64 := argc;
+        if (grenze > 8) { grenze := 8; }
+        while (pi < grenze) {
           var cls: int64 := (fmask >> (pi * 2)) & 3;
           if (cls != 0) {
-            if (pi >= 6) { zuViele := 1; }
-            if (pi < 6) {
+            if (nFloat < 8) {
               poke64(fpos + nFloat * 8, pi);
               poke64(fcls + nFloat * 8, cls);
               nFloat := nFloat + 1;
-            }
-          }
-          if (cls == 0 && pi < 6) {
-            poke64(ipos + nInt * 8, pi); nInt := nInt + 1;
+            } else { nStackDst := nStackDst + 1; }
+          } else {
+            if (nInt < 6) {
+              poke64(ipos + nInt * 8, pi); nInt := nInt + 1;
+            } else { nStackDst := nStackDst + 1; }
           }
           pi := pi + 1;
         }
+        // Jenseits der Maske (mehr als acht Parameter) ist die Klasse nicht
+        // bekannt — solche Argumente zaehlen als Stapelziel.
+        if (argc > 8) { nStackDst := nStackDst + (argc - 8); }
+        if (nStackDst == 0) { ffiRegOnly := 1; }
 
-        // Mehr als sechs Argumente heisst: der Rest geht ueber den Stapel, und
-        // das kann diese Stelle nicht. Vorher wurde stillschweigend falsch
-        // uebergeben; jetzt wird es gemeldet.
-        if (zuViele != 0 && nFloat > 0) {
+        // Erst ab dem NEUNTEN Gleitkommawert geht es wirklich ueber den
+        // Stapel, und das kann diese Stelle weiterhin nicht. Kein stiller
+        // Default: lieber melden als falsch uebergeben.
+        if (ffiRegOnly == 0 && nFloat > 0) {
           EPrintStr("codegen error: extern fn '"c);
           sys_write(2, fname as int64, fnlen);
-          EPrintStrLn("': mehr als sechs Argumente mit Gleitkomma sind nicht umgesetzt (#1486)"c);
+          EPrintStrLn("': Gleitkommaargumente ueber den Stapel (mehr als acht) sind nicht umgesetzt (#1486, #1640)"c);
           exit(1);
         }
 
@@ -12979,8 +13053,14 @@ pub type Codegen = class {
         // Ganzzahlen darin verschoben werden.
         var k: int64 := 0;
         while (k < nFloat) {
-          var srcReg: int64 := self.cg_ffiIntReg(peek64(fpos + k * 8));
-          self.cg_ffiMovqXmmFromGpr(k, srcReg);
+          var fp: int64 := peek64(fpos + k * 8);
+          if (fp < 6) {
+            self.cg_ffiMovqXmmFromGpr(k, self.cg_ffiIntReg(fp));
+          } else {
+            // #1640: Der allgemeine Aufrufpfad hat dieses Argument auf den
+            // Stapel gelegt; von dort geht es direkt ins xmm-Register.
+            self.cg_ffiMovsdXmmFromRsp(k, (fp - 6) * 8);
+          }
           if (peek64(fcls + k * 8) == 2) {
             // cvtsd2ss xmm_k, xmm_k — aus dem intern gefuehrten double ein
             // echtes single machen.
@@ -12995,7 +13075,12 @@ pub type Codegen = class {
         var t: int64 := 0;
         while (t < nInt) {
           var from: int64 := peek64(ipos + t * 8);
-          if (from != t) { self.cg_ffiMovGpr(self.cg_ffiIntReg(t), self.cg_ffiIntReg(from)); }
+          if (from >= 6) {
+            // #1640: dieselbe Lage wie oben, nur fuer eine Ganzzahl.
+            self.cg_ffiMovGprFromRsp(self.cg_ffiIntReg(t), (from - 6) * 8);
+          } else if (from != t) {
+            self.cg_ffiMovGpr(self.cg_ffiIntReg(t), self.cg_ffiIntReg(from));
+          }
           t := t + 1;
         }
 
@@ -13016,7 +13101,7 @@ pub type Codegen = class {
       // Register muss der Callee erhalten), ausgerichteten Platz schaffen, die
       // Argumente dorthin KOPIEREN und danach alles zurueckdrehen.
       var stackN: int64 := 0;
-      if (argc > 6) { stackN := argc - 6; }
+      if (argc > 6 && ffiRegOnly == 0) { stackN := argc - 6; }
       if (stackN > 0) {
         var kopieSz: int64 := stackN * 8;
         while ((kopieSz & 15) != 0) { kopieSz := kopieSz + 8; }   // auf 16 aufrunden
@@ -13069,6 +13154,10 @@ pub type Codegen = class {
       } else {
         self.cg_e8(0x41); self.cg_e8(0x5B);                              // pop r11
         self.cg_e8(0x5C);                                                 // pop rsp (restore)
+        // #1640: Der Callee brauchte keinen Stapel, der allgemeine Aufrufpfad
+        // hat aber trotzdem Werte abgelegt (Position >= 6). Sie sind jetzt
+        // gelesen und muessen weg — sonst waechst der Stapel bei jedem Aufruf.
+        if (argc > 6) { self.cg_popStackArgs(argc); }
       }
 
       // #1486: Gleitkomma-Rueckgaben kommen in xmm0, gelesen wurde rax.
