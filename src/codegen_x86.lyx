@@ -1321,7 +1321,18 @@ pub type Codegen = class {
   }
 
   // Global variable table helpers
+  //
+  // #1665: Ist der Name schon eingetragen, wird KEIN zweiter Slot angelegt,
+  // sondern der vorhandene gemeldet. Der Vorlauf unten registriert alle
+  // Modulvariablen, bevor irgendein Rumpf uebersetzt wird; der Hauptdurchlauf
+  // kommt spaeter an derselben Deklaration vorbei und muss dann denselben
+  // Speicher meinen — sonst gaebe es die Variable zweimal, und genau das war
+  // der Defekt.
   fn cg_addGlobal(name: pchar, nlen: int64): int64 {
+    var vorhanden: int64 := self.cg_findGlobalIdx(name, nlen);
+    if (vorhanden >= 0) {
+      return peek64(self.globalVars + vorhanden * 24 + CG_GLOBAL_OFF_DOFF);
+    }
     if (self.globalVarCount >= self.globalVarCap) {
       var nc: int64 := self.globalVarCap * 2;
       var nb: int64 := alloc(nc * 24);
@@ -1522,6 +1533,72 @@ pub type Codegen = class {
   //
   // In Runden wie bei den Structs, denn eine Klasse kann von einer erben, die
   // weiter unten steht: gebaut wird nur, wessen Elternklasse schon steht.
+  // #1665: Typangaben einer Modulvariablen vermerken. Steht in einer eigenen
+  // Funktion, weil Vorlauf und Hauptdurchlauf dieselbe Auskunft brauchen —
+  // zwei getrennte Fassungen laufen frueher oder spaeter auseinander (#1655).
+  fn cg_recordGlobalType(gIdx: int64, gtNode: int64) {
+    if (gIdx < 0) { return; }
+    if (gtNode >= 0 && self.cg_nkind(gtNode) == 60) {
+      var gtp: pchar := self.cg_nsval(gtNode);
+      var gtn: int64 := self.cg_nslen(gtNode);
+      if (gtn == 5 && self.cg_seq(gtp, gtn, "pchar", 5)) {
+        poke8(self.globalIsPchar + gIdx, 1);
+      }
+      // #1094: Typname merken (siehe cg_staticTypeName).
+      poke64(self.globalTypeNames + gIdx * 16,     gtp as int64);
+      poke64(self.globalTypeNames + gIdx * 16 + 8, gtn);
+      // #1574: benannter fn-Typ (`type Cb = fn(int64): int64`).
+      if (self.cg_isFnPtrAlias(gtp, gtn) != 0) { poke8(self.globalIsFnPtr + gIdx, 1); }
+    }
+    // #1574: inline geschriebener Zeigertyp `var gFn: fn(f64): f64`.
+    if (gtNode >= 0 && self.cg_nkind(gtNode) == CGN_FN_PTR_NODE) {
+      poke8(self.globalIsFnPtr + gIdx, 1);
+      if (self.cg_fnPtrRetIstF64(gtNode) != 0) {
+        poke8(self.globalFnPtrF64 + gIdx, 1);
+      }
+    }
+  }
+
+  // #1665: Alle Modulvariablen registrieren, bevor ein Rumpf uebersetzt wird.
+  // Bis hierher entstand der Slot erst, wenn der Hauptdurchlauf die
+  // Deklaration erreichte. Eine Funktion, die WEITER OBEN steht und die
+  // Variable schreibt, fand sie deshalb nicht — und der Schreibzugriff wurde
+  // still verworfen (`if (goff >= 0)` in der Zuweisung). Das Programm hatte
+  // damit faktisch zwei Variablen: die Schreibstelle oberhalb traf keine, die
+  // Lesestelle unterhalb die deklarierte, die nie beschrieben wurde.
+  //
+  // Funktionen sind in dieser Sprache reihenfolgeunabhaengig; Modulvariablen
+  // sind es jetzt auch. Reserviert wird hier nur der Slot samt Typangabe —
+  // Startwerte, Aggregate und Patches macht der Hauptdurchlauf wie bisher,
+  // und dank des Nachschlags in cg_addGlobal auf demselben Slot.
+  fn cg_prebuildGlobals(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      if (self.cg_nkind(cur) == CGN_VAR_DECL) {
+        var nm: pchar := self.cg_nsval(cur);
+        var nl: int64 := self.cg_nslen(cur);
+        if (self.cg_findGlobalIdx(nm, nl) < 0) {
+          self.cg_addGlobal(nm, nl);
+          var pgi: int64 := self.cg_findGlobalIdx(nm, nl);
+          self.cg_recordGlobalType(pgi, self.cg_nc0(cur));
+          // #1141/#1665: Eine @redundant-Globale belegt DREI Zellen direkt
+          // hintereinander (A = doff, B, C). Die beiden zusaetzlichen muessen
+          // hier fallen, unmittelbar nach dem Slot — reservierte sie erst der
+          // Hauptdurchlauf, laege inzwischen der naechste Slot dazwischen und
+          // der Voter laese fremde Zellen. Genau daran sind beim ersten Anlauf
+          // zwei Faelle in tmr_test.sh gescheitert.
+          if ((self.cg_nival(cur) & 4) != 0) {
+            poke8(self.globalIsRedundant + pgi, 1);
+            var pz: int64 := 0;
+            while (pz < 16) { self.cg_edata(0); pz := pz + 1; }
+            self.tmrVarCount += 1;
+          }
+        }
+      }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
   fn cg_prebuildClassLayouts(head: int64) {
     var fortschritt: int64 := 1;
     while (fortschritt != 0) {
@@ -18648,6 +18725,7 @@ pub type Codegen = class {
     self.cg_collectIfaceSelectors(head);  // #1133: Interface-Selektoren (vor den Layouts!)
     self.cg_prebuildStructLayouts(head);  // #1451: Layouts vor jedem Rumpf
     self.cg_prebuildClassLayouts(head);   // #1663: dasselbe fuer Klassen
+    self.cg_prebuildGlobals(head);        // #1665: und fuer Modulvariablen
     self.cg_collectFlightCrit(head);      // #1140: gibt es @flight_crit im Programm?
     // #1338/#1507: Konstanten und Enums verweisen wechselseitig aufeinander —
     // `enum R { CTRL = BASE }` braucht die Konstante, `con MASK := P.Read as
@@ -18799,35 +18877,20 @@ pub type Codegen = class {
         }
       } else if (k == CGN_VAR_DECL) {
         // Global variable: allocate 8 bytes in data section, register in global table
-        var gIdx: int64 := self.globalVarCount;
+        // #1665: Der Vorlauf hat den Slot bereits angelegt — gIdx ist deshalb
+        // der GEFUNDENE Eintrag, nicht der naechste freie.
         var doff: int64 := self.cg_addGlobal(self.cg_nsval(cur), self.cg_nslen(cur));
+        var gIdx: int64 := self.cg_findGlobalIdx(self.cg_nsval(cur), self.cg_nslen(cur));
         var gtNode: int64 := self.cg_nc0(cur);
-        if (gtNode >= 0 && self.cg_nkind(gtNode) == 60) {
-          var gtp: pchar := self.cg_nsval(gtNode);
-          var gtn: int64 := self.cg_nslen(gtNode);
-          if (gtn == 5 && self.cg_seq(gtp, gtn, "pchar", 5)) {
-            poke8(self.globalIsPchar + gIdx, 1);
-          }
-          // #1094: Typname merken (siehe cg_staticTypeName).
-          poke64(self.globalTypeNames + gIdx * 16,     gtp as int64);
-          poke64(self.globalTypeNames + gIdx * 16 + 8, gtn);
-          // #1574: benannter fn-Typ (`type Cb = fn(int64): int64`) — dieselbe
-          // Auskunft wie bei einem Local ueber cg_isFnPtrAlias.
-          if (self.cg_isFnPtrAlias(gtp, gtn) != 0) { poke8(self.globalIsFnPtr + gIdx, 1); }
-        }
-        // #1574: inline geschriebener Zeigertyp `var gFn: fn(f64): f64`.
-        if (gtNode >= 0 && self.cg_nkind(gtNode) == CGN_FN_PTR_NODE) {
-          poke8(self.globalIsFnPtr + gIdx, 1);
-          if (self.cg_fnPtrRetIstF64(gtNode) != 0) {
-            poke8(self.globalFnPtrF64 + gIdx, 1);
-          }
-        }
+        self.cg_recordGlobalType(gIdx, gtNode);   // #1665: eine Quelle
         // #1141: @redundant an einer GLOBALEN Variablen. Bis 1.0.14M bekam sie
         // 8 Byte und keinen Voter — das Attribut war hier ein stiller Default.
         // Jetzt liegen drei Zellen hintereinander (A = doff, B, C), genau wie
         // im Rahmen bei einem Local.
         var gRedundant: int64 := (self.cg_nival(cur) & 4) != 0;
-        if (gRedundant != 0) {
+        // #1665: Der Vorlauf hat die drei Zellen bereits angelegt; ein zweites
+        // Mal wuerde nur Datenbereich verschwenden und den Zaehler verfaelschen.
+        if (gRedundant != 0 && peek8(self.globalIsRedundant + gIdx) == 0) {
           poke8(self.globalIsRedundant + gIdx, 1);
           var gz: int64 := 0;
           while (gz < 16) { self.cg_edata(0); gz := gz + 1; }
@@ -18912,6 +18975,17 @@ pub type Codegen = class {
           if (gInitNi >= 0 && self.cg_nkind(gInitNi) == CGN_LIT_NULL) { gIstNull := 1; }
           var gsci: int64 := 0 - 1;
           if (gIstNull == 0) { gsci := self.cg_ensureStructLayout(self.cg_nsval(gtNode), self.cg_nslen(gtNode)); }
+          // #1619: Ohne Startwert bekam auch eine KLASSE eigenen Speicher, und
+          // der Slot zeigte darauf. `g == null` war damit immer falsch, das
+          // Lazy-Init-Muster lief nie in seinen Zweig und lieferte eine
+          // Referenz auf ein Objekt, das nie ein Konstruktor gesehen hat —
+          // still, mit Feldern voller Nullen oder Schlimmerem.
+          //
+          // Eine Klasse ist eine REFERENZ: ohne Zuweisung ist sie null, so wie
+          // `:= null` es schon konnte. Ein STRUCT dagegen ist ein Wert und
+          // behaelt seinen Speicher; daran haengt der Bestand (dt_root in
+          // std/ml.lyx ist genau so gemeint).
+          if (gsci >= 0 && self.cg_istStructTyp(gsci) == 0) { gsci := 0 - 1; }
           if (gsci >= 0 && gRedundant == 0) {
             var gssz: int64 := self.cg_classStructSize(gsci);
             aggBlock := self.cg_reserveData(gssz);
