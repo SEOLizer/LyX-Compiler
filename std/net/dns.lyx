@@ -46,6 +46,12 @@ pub con DNS_RCODE_REFUSED: int64 := 5;  // Query refused
 
 // Default DNS servers
 pub con DNS_PORT: int64 := 53;
+// #1641: Zeitgrenze und Zahl der Versuche fuer eine Anfrage. Bleibt die
+// Antwort aus — verworfene Anfrage, Paketverlust, unerreichbarer Server —,
+// war der Aufrufer vorher fuer immer blockiert. Zwei Sekunden je Versuch,
+// dreimal, danach false: das ist das Verhalten eines System-Resolvers.
+pub con DNS_TIMEOUT_SEK: int64 := 2;
+pub con DNS_VERSUCHE: int64 := 3;
 pub con DNS_DOH_PORT: int64 := 443;
 
 // Cache settings
@@ -679,7 +685,6 @@ pub fn DNSResolve(hostname: int64, hostnameLen: int64, dnsServerIP: int64, resul
   var buf: int64;
   var queryLen: int64;
   var nread: int64;
-  var sendRet: int64;
 
   // Initialize result
   poke8(resultPtr + 0, 0);
@@ -701,14 +706,7 @@ pub fn DNSResolve(hostname: int64, hostnameLen: int64, dnsServerIP: int64, resul
 
   queryLen := dns_build_query(buf, hostname, hostnameLen, DNS_TYPE_A);
 
-  sendRet := UDPSocketSendToAddr(sock, buf, queryLen, dnsServerIP, DNS_PORT);
-  if (sendRet < 0) {
-    BufferFree(buf, 512);
-    UDPSocketClose(sock);
-    return false;
-  }
-
-  nread := UDPSocketRecv(sock, buf, 512, 0, 0);
+  nread := dns_frage_mit_zeitlimit(sock, buf, queryLen, dnsServerIP);
   if (nread < 12) {
     BufferFree(buf, 512);
     UDPSocketClose(sock);
@@ -722,6 +720,31 @@ pub fn DNSResolve(hostname: int64, hostnameLen: int64, dnsServerIP: int64, resul
 // Generic DNS Resolve (supports any record type)
 // ============================================================================
 
+// #1641: Anfrage senden und mit Zeitgrenze auf die Antwort warten. Kommt keine,
+// wird wiederholt; nach DNS_VERSUCHE Anlaeufen gibt die Funktion auf und
+// liefert eine Laenge < 0. Vorher stand hier ein blockierendes
+// UDPSocketRecv ohne jede Grenze.
+fn dns_frage_mit_zeitlimit(sock: UDPSocket, buf: int64, queryLen: int64,
+                           dnsServerIP: int64): int64 {
+  // Ein Fehlschlag beim Setzen der Grenze ist kein Grund aufzugeben — dann
+  // verhaelt sich der Aufruf wie bisher, statt gar nicht zu fragen. Gemeldet
+  // wird er ueber den Rueckgabewert von UDPSocketSetRecvTimeout, den der
+  // Aufrufer hier nicht braucht.
+  UDPSocketSetRecvTimeout(sock, DNS_TIMEOUT_SEK, 0);
+  var versuch: int64 := 0;
+  while (versuch < DNS_VERSUCHE) {
+    var sendRet: int64 := UDPSocketSendToAddr(sock, buf, queryLen, dnsServerIP, DNS_PORT);
+    if (sendRet < 0) { return 0 - 1; }
+    var nread: int64 := UDPSocketRecv(sock, buf, 512, 0, 0);
+    if (nread >= 12) { return nread; }
+    // nread < 0 heisst hier in aller Regel EAGAIN/EWOULDBLOCK: die Zeit ist
+    // abgelaufen. Ein zu kurzer Kopf ist ebenso unbrauchbar — beides fuehrt
+    // zum naechsten Versuch.
+    versuch := versuch + 1;
+  }
+  return 0 - 1;
+}
+
 // Resolve hostname using specified DNS server and record type
 // queryType: DNS_TYPE_A, DNS_TYPE_AAAA, DNS_TYPE_MX, DNS_TYPE_CNAME
 // resultPtr: pointer to a 128-byte result buffer (NICHT 64 — siehe dns_parse_response_ex)
@@ -731,7 +754,6 @@ pub fn DNSResolveEx(hostname: int64, hostnameLen: int64, dnsServerIP: int64, que
   var buf: int64;
   var queryLen: int64;
   var nread: int64;
-  var sendRet2: int64;
 
   // Initialize result
   poke8(resultPtr + 0, 0);
@@ -754,14 +776,7 @@ pub fn DNSResolveEx(hostname: int64, hostnameLen: int64, dnsServerIP: int64, que
 
   queryLen := dns_build_query(buf, hostname, hostnameLen, queryType);
 
-  sendRet2 := UDPSocketSendToAddr(sock, buf, queryLen, dnsServerIP, DNS_PORT);
-  if (sendRet2 < 0) {
-    BufferFree(buf, 512);
-    UDPSocketClose(sock);
-    return false;
-  }
-
-  nread := UDPSocketRecv(sock, buf, 512, 0, 0);
+  nread := dns_frage_mit_zeitlimit(sock, buf, queryLen, dnsServerIP);
   if (nread < 12) {
     BufferFree(buf, 512);
     UDPSocketClose(sock);

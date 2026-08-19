@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.2J
-VERSION_DATE := 2026-08-18
+VERSION   := 1.1.3A
+VERSION_DATE := 2026-08-19
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -237,6 +237,7 @@ test: lyxc
 	@bash tests/krypto_runde11_test.sh
 	@bash tests/stille_fehlfunktion_runde12_test.sh
 	@bash tests/aufloesung_runde13_test.sh
+	@bash tests/stdlib_runde14_test.sh
 	@bash tests/stdlib_z20_test.sh
 	@bash tests/sprache_z16_test.sh
 	@bash tests/codegen_ausdruecke_test.sh
