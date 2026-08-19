@@ -107,7 +107,49 @@ lauf "$TMP/d.lyx" "42/43 " "override: der Dispatch findet die Methode der Ableit
 sed '/pub type IGeber = interface {/,/^}/d' "$TMP/a.lyx" > "$TMP/e.lyx"
 lauf "$TMP/e.lyx" "7/1 " "ohne Interface: statischer Aufruf unveraendert"
 
-# 6) Der Dispatch muss das Objekt aus rsi lesen, sobald sret im Spiel ist.
+# 6) #1694 zweiter Anlauf: der Empfaenger ist ein FELD, nicht eine lokale
+#    Variable. Der erste Fix hat das nicht erwischt, weil dieser Test nur
+#    lokale Empfaenger kannte — und genau daran ist es liegengeblieben.
+#
+#    `cg_callRetStructBytes` entschied ueber `cg_exprClassName`, und die kannte
+#    keinen Feldausdruck. Die Aufrufstelle gab deshalb KEIN verdecktes Argument
+#    mit, waehrend der Gerufene eines erwartete: er fand in rdi den EMPFAENGER
+#    und schrieb sein Ergebnis ueber das Objekt.
+#
+#    Der Test prueft deshalb nicht nur, dass es laeuft, sondern dass das Objekt
+#    HINTERHER noch heil ist — der Absturz kam ja erst beim naechsten Zugriff.
+cat > "$TMP/feld.lyx" <<'EOF'
+unit Main;
+import std.io;
+pub type TVier = struct { A: int64; B: int64; C: int64; D: int64; }
+pub type IGeber = interface { fn Hol(i: int64): TVier; }
+pub type TQuelle = class implements IGeber {
+  Kennung: int64;
+  fn Create(): void { self.Kennung := 4242; }
+  fn Hol(i: int64): TVier { var v: TVier; v.A := 10; v.B := 20; v.C := 30; v.D := 40; return v; }
+}
+pub type THalter = class {
+  Geber: IGeber;
+  Quelle: TQuelle;
+  fn Create(g: IGeber, q: TQuelle): void { self.Geber := g; self.Quelle := q; }
+  fn UeberFeld(): int64 { var v: TVier := self.Geber.Hol(0); return v.A + v.D; }
+}
+fn main(): int64 {
+  var q: TQuelle := new TQuelle();
+  var h: THalter := new THalter(q as IGeber, q);
+  PrintLn(IntToStr(h.UeberFeld()));
+  PrintLn(IntToStr(h.UeberFeld()));
+  var v: TVier := h.Geber.Hol(0);
+  PrintLn(IntToStr(v.A + v.D));
+  var w: TVier := h.Quelle.Hol(0);
+  PrintLn(IntToStr(w.A + w.D));
+  PrintLn(IntToStr(q.Kennung));
+  return 0;
+}
+EOF
+lauf "$TMP/feld.lyx" "50 50 50 50 4242 " "Feld als Empfaenger: Ergebnis stimmt und das Objekt bleibt heil"
+
+# 7) Der Dispatch muss das Objekt aus rsi lesen, sobald sret im Spiel ist.
 #    Ohne diese Sperre kaeme derselbe Fehler beim naechsten Umbau zurueck.
 if grep -q "mov rax,\[rsi\]" src/codegen_x86.lyx; then
   ok "VMT-Dispatch kennt den sret-Fall (liest aus rsi)"
