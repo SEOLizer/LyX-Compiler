@@ -7356,10 +7356,120 @@ pub type Sema = class {
     self.Pass2(head);
     self.privEnforce := 0;
     self._checkDuplicateFuncs(head);         // #1135
+    self._checkDuplicateMembers(head);       // #1668
     self._checkCapabilityInheritance(head);  // WP-L3
     self._buildCapGraph(head, "<root>"c, 6); // WP-L4
     self.capStripper.PrintReport();          // WP-L6: Pruning-Report
     return self.hadError;
+  }
+
+  // #1668: Zwei gleichnamige MITGLIEDER in derselben Klasse — zwei Methoden,
+  // zwei Felder, oder ein Feld und eine Methode. Lyx kennt keine Ueberladung,
+  // es kann also nur eines gelten; welches, war dem Quelltext nicht anzusehen.
+  // Der Bau lief durch, die Tests waren gruen, und ein halber Kopierunfall
+  // blieb monatelang unbemerkt (TComboBox in Vega trug `Add` und `SetSorted`
+  // je zweimal).
+  //
+  // #1135 prueft dasselbe fuer freie Funktionen auf Modulebene; Klassen fehlten
+  // in dieser Prüfung. Felder und die Mischform sind hier mit erledigt, weil
+  // sie dieselbe Frage stellen und beim Messen ebenso still durchgingen.
+  //
+  // Die Meldung nennt beide Zeilen: ohne die erste sucht man die zweite
+  // Deklaration in einer grossen Klasse von Hand.
+  fn _meldeDoppelt(art: pchar, klasse: int64, zweit: int64, erst: int64,
+                   nm: pchar, nl: int64) {
+    var zeileErst: int64 := self._nodeLineOf(erst);
+    var kn: pchar := self.sn_sVal(klasse);
+    var kl: int64 := self.sn_sLen(klasse);
+    // "<art> '<name>' ist in <Klasse> bereits deklariert (zuerst in Zeile N)"
+    var puf: int64 := alloc(StrLen(art) + nl + kl + 64);
+    var w: int64 := 0;
+    w := self._anhaengen(puf, w, art, StrLen(art));
+    w := self._anhaengen(puf, w, " '"c, 2);
+    w := self._anhaengen(puf, w, nm, nl);
+    w := self._anhaengen(puf, w, "' ist in "c, 9);
+    w := self._anhaengen(puf, w, kn, kl);
+    w := self._anhaengen(puf, w, " bereits deklariert (zuerst in Zeile "c, 37);
+    w := self._anhaengenZahl(puf, w, zeileErst);
+    w := self._anhaengen(puf, w, ")"c, 1);
+    poke8(puf + w, 0);
+    self._errorNode(puf as pchar, zweit);
+  }
+
+  fn _anhaengen(puf: int64, w: int64, txt: pchar, len: int64): int64 {
+    var i: int64 := 0;
+    while (i < len) { poke8(puf + w + i, StrCharAt(txt, i)); i := i + 1; }
+    return w + len;
+  }
+
+  fn _anhaengenZahl(puf: int64, w: int64, z: int64): int64 {
+    if (z < 0) { return self._anhaengen(puf, w, "?"c, 1); }
+    if (z == 0) { poke8(puf + w, 48); return w + 1; }
+    var ziffern: int64 := alloc(24);
+    var n: int64 := 0;
+    var v: int64 := z;
+    while (v > 0) { poke8(ziffern + n, 48 + (v % 10)); v := v / 10; n := n + 1; }
+    var k: int64 := 0;
+    while (k < n) { poke8(puf + w + k, peek8(ziffern + n - 1 - k)); k := k + 1; }
+    free(ziffern, 24);
+    return w + n;
+  }
+
+  // Ein Mitglied gegen eine Kette pruefen. `bis` begrenzt auf die Vorgaenger,
+  // damit jede Doppelung genau EINMAL gemeldet wird — sonst meldet ein
+  // dreifacher Name drei Paare.
+  fn _findeFrueheres(kette: int64, bis: int64, nm: pchar, nl: int64,
+                     nurFelder: int64): int64 {
+    var c: int64 := kette;
+    while (c >= 0 && c != bis) {
+      var passt: int64 := 1;
+      if (nurFelder != 0 && self.sn_kind(c) != 7) { passt := 0; }
+      if (passt != 0) {
+        if (self._strNEq(nm, nl, self.sn_sVal(c), self.sn_sLen(c)) != 0) { return c; }
+      }
+      c := self.sn_next(c);
+    }
+    return 0 - 1;
+  }
+
+  fn _checkDuplicateMembers(head: int64) {
+    var t: int64 := head;
+    while (t >= 0) {
+      if (self.sn_kind(t) == SNK_TYPE_DECL) {
+        var felder: int64 := self.sn_c0(t);
+        var methoden: int64 := self.sn_c1(t);
+
+        // Felder gegen Felder
+        var f: int64 := felder;
+        while (f >= 0) {
+          if (self.sn_kind(f) == 7) {
+            var fn0: pchar := self.sn_sVal(f);
+            var fl0: int64 := self.sn_sLen(f);
+            var vorher: int64 := self._findeFrueheres(felder, f, fn0, fl0, 1);
+            if (vorher >= 0) { self._meldeDoppelt("Feld"c, t, f, vorher, fn0, fl0); }
+          }
+          f := self.sn_next(f);
+        }
+
+        // Methoden gegen Methoden und gegen Felder
+        var m: int64 := methoden;
+        while (m >= 0) {
+          var mn: pchar := self.sn_sVal(m);
+          var ml: int64 := self.sn_sLen(m);
+          var vorherM: int64 := self._findeFrueheres(methoden, m, mn, ml, 0);
+          if (vorherM >= 0) {
+            self._meldeDoppelt("Methode"c, t, m, vorherM, mn, ml);
+          } else {
+            var vorherF: int64 := self._findeFrueheres(felder, 0 - 1, mn, ml, 1);
+            if (vorherF >= 0) {
+              self._meldeDoppelt("Methode"c, t, m, vorherF, mn, ml);
+            }
+          }
+          m := self.sn_next(m);
+        }
+      }
+      t := self.sn_next(t);
+    }
   }
 
   // #1135: Zwei Funktionen gleichen Namens im SELBEN Modul. Bisher gewann
