@@ -805,6 +805,18 @@ pub type Codegen = class {
   // die Direktive konnte nur abschalten. Wer sie setzte, bekam ohne
   // --runtime-checks dieselbe Binary wie ohne sie.
   boundsCheckForced: int64;   // 1 = @bounds_check(true) gesehen
+  // #1674: 1 = Ziel win64. Die Microsoft-x64-Konvention uebergibt in
+  // rcx/rdx/r8/r9 statt rdi/rsi/rdx/rcx und verlangt vom Aufrufer 32 Byte
+  // Schattenspeicher. Bis 1.1.3D erzeugte der FFI-Pfad auch fuer win64 die
+  // SysV-Form: ein Aufruf OHNE Argumente ging gut, jeder MIT Argumenten kam
+  // falsch an (lstrlenA("abc") lieferte 7 statt 3).
+  msAbi:             int64;
+  // #1674: 1 = Ziel win64. Die Microsoft-x64-Konvention uebergibt in
+  // rcx/rdx/r8/r9 statt rdi/rsi/rdx/rcx und verlangt vom Aufrufer 32 Byte
+  // Schattenspeicher. Bis 1.1.3D erzeugte der FFI-Pfad auch fuer win64 die
+  // SysV-Form: ein Aufruf OHNE Argumente ging gut, jeder mit Argumenten kam
+  // falsch an (lstrlenA("abc") lieferte 7 statt 3).
+  msAbi:             int64;
   debugInfoEnabled:   int64;  // set by @debug_info(true) — aliases debugMode
   optLevel:           int64;  // 0=none, 1=min, 2=default, 3=aggressive
 
@@ -2486,6 +2498,28 @@ pub type Codegen = class {
 
   // Das n-te Argumentregister der Ganzzahlreihe als (REX-Bit, ModRM-Nummer).
   // 0=rdi(7) 1=rsi(6) 2=rdx(2) 3=rcx(1) 4=r8(0,REX) 5=r9(1,REX)
+  // #1674: Zielregister der Microsoft-Konvention: rcx, rdx, r8, r9.
+  fn cg_msIntReg(idx: int64): int64 {
+    if (idx == 0) { return 1; }    // rcx
+    if (idx == 1) { return 2; }    // rdx
+    if (idx == 2) { return 8; }    // r8
+    return 9;                      // r9
+  }
+
+  // #1674: `push <SysV-Argumentregister idx>` — der Opcode-Zusatz zu 0x50.
+  fn cg_ffiPushOp(idx: int64): int64 {
+    var r: int64 := self.cg_ffiIntReg(idx);
+    if (r >= 8) { self.cg_e8(0x41); return r - 8; }   // REX.B fuer r8/r9
+    return r;
+  }
+
+  // #1674: `pop <MS-Zielregister idx>`.
+  fn cg_ffiPopMs(idx: int64) {
+    var r: int64 := self.cg_msIntReg(idx);
+    if (r >= 8) { self.cg_e8(0x41); self.cg_e8(0x58 + r - 8); }
+    else { self.cg_e8(0x58 + r); }
+  }
+
   fn cg_ffiIntReg(idx: int64): int64 {
     if (idx == 0) { return 7; }
     if (idx == 1) { return 6; }
@@ -6749,6 +6783,13 @@ pub type Codegen = class {
   fn cg_getPatchCount(): int64 { return self.patchCount; }
   fn cg_getLabelBuf(): int64   { return self.labels; }
   fn cg_getLabelCount(): int64 { return self.labelCount; }
+
+  // #1671: Die tatsaechlich AUFGERUFENEN Externs (Reihenfolge = Index in den
+  // CG_PATCH_EXTERN-Patches). Das PE-Backend baut daraus die Import-Tabelle;
+  // bis 1.1.3D stand dort eine fest verdrahtete Liste mit fuenf
+  // kernel32-Funktionen, und jede eigene `extern fn ... link "x.dll"` fehlte.
+  fn cg_getExternSymBuf(): int64   { return self.externSyms; }
+  fn cg_getExternSymCount(): int64 { return self.externCount; }
 
   fn cg_getBaseRelocBuf(): int64 { return self.baseRelocBuf; }
   fn cg_getBaseRelocCount(): int64 { return self.baseRelocCount; }
@@ -13244,13 +13285,62 @@ pub type Codegen = class {
       // `fabs(-2.5)` lieferte 0.00 statt 2.50, und jede C-Bibliothek mit
       // float-Signatur (praktisch das gesamte OpenGL) war unbenutzbar.
       var declNi: int64 := peek64(edb + CG_EXTERN_OFF_NODE);
+
+      // #1674: Microsoft-x64. Die Argumente liegen an dieser Stelle in der
+      // SysV-Reihe (rdi, rsi, rdx, rcx, r8, r9); gebraucht werden rcx, rdx,
+      // r8, r9 — und Gleitkommawerte in xmm0..xmm3, dort nach der POSITION
+      // des Arguments, nicht nach einer eigenen Zaehlung wie bei SysV.
+      //
+      // Umgeschichtet wird ueber den Stapel, weil sich die beiden Reihen
+      // ueberschneiden: rcx ist Ziel von Argument 0 und zugleich Quelle von
+      // Argument 3. Ein direktes Kopieren in der falschen Reihenfolge
+      // zerstoert die Quelle, bevor sie gelesen ist.
+      if (self.msAbi != 0) {
+        var msN: int64 := argc;
+        if (msN > 4) {
+          EPrintStr("codegen error: extern fn '"c);
+          sys_write(2, fname as int64, fnlen);
+          EPrintStrLn("': mehr als vier Argumente sind auf win64 nicht umgesetzt (#1674)"c);
+          EPrintStrLn("  Die Microsoft-Konvention legt ab dem fuenften Argument auf den Stapel."c);
+          exit(1);
+        }
+        // Argumente sichern (Reihenfolge 0..n-1) …
+        var msI: int64 := 0;
+        while (msI < msN) {
+          self.cg_e8(0x50 + self.cg_ffiPushOp(msI));
+          msI := msI + 1;
+        }
+        // … und rueckwaerts in die Zielregister holen.
+        msI := msN - 1;
+        while (msI >= 0) {
+          self.cg_ffiPopMs(msI);
+          msI := msI - 1;
+        }
+        // Gleitkommawerte zusaetzlich nach xmm_position.
+        if (declNi >= 0) {
+          var msMask: int64 := (self.cg_nival(declNi) >> 32) & 65535;
+          var msK: int64 := 0;
+          while (msK < msN) {
+            var msCls: int64 := (msMask >> (msK * 2)) & 3;
+            if (msCls != 0) {
+              self.cg_ffiMovqXmmFromGpr(msK, self.cg_msIntReg(msK));
+              if (msCls == 2) {
+                self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5A);
+                self.cg_e8(0xC0 + msK * 8 + msK);   // cvtsd2ss xmm_k, xmm_k
+              }
+            }
+            msK := msK + 1;
+          }
+        }
+      }
+
       var nFloat: int64 := 0;
       // #1640: 1 = alle Argumente passen in die Registerreihen, der Callee
       // bekommt also gar keine Stapelargumente — auch wenn der allgemeine
       // Aufrufpfad welche abgelegt hat. Ohne Deklarationswissen bleibt es 0
       // und alles laeuft wie bisher.
       var ffiRegOnly: int64 := 0;
-      if (declNi >= 0) {
+      if (declNi >= 0 && self.msAbi == 0) {
         var fpos: int64 := alloc(8 * 8);      // Positionen der Gleitkommaargumente
         var fcls: int64 := alloc(8 * 8);      // 1 = f64, 2 = f32
         var ipos: int64 := alloc(8 * 8);      // Positionen der Ganzzahlargumente
@@ -13393,6 +13483,13 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE4); self.cg_e8(0xF0);  // and rsp, -16
         self.cg_e8(0x41); self.cg_e8(0x53);                              // push r11
         self.cg_e8(0x41); self.cg_e8(0x53);                              // push r11 (keep 16-align)
+        // #1674: Die Microsoft-Konvention verlangt vom AUFRUFER 32 Byte
+        // Schattenspeicher unterhalb der Rueckkehradresse; der Callee darf
+        // dort seine vier Registerargumente ablegen. Fehlt er, schreibt die
+        // Funktion in den Rahmen des Aufrufers.
+        if (self.msAbi != 0) {
+          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(32);  // sub rsp, 32
+        }
       }
       // #1486: al traegt die Zahl der benutzten xmm-Register. Variadische
       // C-Funktionen (printf und Verwandte) lesen sie; mit 0 speichern sie
@@ -13409,6 +13506,9 @@ pub type Codegen = class {
         // dieselbe Aufgabe, die cg_popStackArgs fuer Lyx-Aufrufe erledigt.
         self.cg_popStackArgs(argc);
       } else {
+        if (self.msAbi != 0) {
+          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(32);  // add rsp, 32 (#1674)
+        }
         self.cg_e8(0x41); self.cg_e8(0x5B);                              // pop r11
         self.cg_e8(0x5C);                                                 // pop rsp (restore)
         // #1640: Der Callee brauchte keinen Stapel, der allgemeine Aufrufpfad
@@ -19404,6 +19504,7 @@ pub type Codegen = class {
     // WP-AS-04/05: directive flags
     self.boundsCheckEnabled := 1;  // on by default
     self.boundsCheckForced  := 0;  // #1124: nicht angefordert
+    self.msAbi              := 0;  // #1674: SysV, sofern nicht win64
     self.debugInfoEnabled   := 0;
     self.optLevel           := 2;
 
