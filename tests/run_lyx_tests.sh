@@ -160,7 +160,17 @@ run_test() {
         | head -10 | sed 's/^/       /'
     fi
   else
-    if [[ $actual_exit -eq 0 ]]; then
+    # #1696: Die Erfolgskonvention im Bestand ist uneinheitlich — manche Tests
+    # enden mit 0, manche mit 42. `run_lyx_suite.sh` traegt das seit jeher
+    # (Zeile 79: `rc -eq 0 || rc -eq 42`), dieser Runner nicht. Damit urteilten
+    # zwei Runner ueber dieselben Dateien verschieden.
+    #
+    # Aufgefallen an tests/lyx/as/test_defer_early_return.lyx: der Eintrag
+    # wurde aus tests/known-red.txt gestrichen, ausdruecklich mit der
+    # Begruendung "42 ist im Bestand die Erfolgskonvention — der Runner wertet
+    # sie inzwischen als gruen". Fuer den anderen Runner galt das nie, und
+    # seither war der Test hier rot.
+    if [[ $actual_exit -eq 0 || $actual_exit -eq 42 ]]; then
       verdict pass "$rel"
     else
       verdict fail "$rel" "[exit=$actual_exit]"
