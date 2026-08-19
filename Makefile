@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.3J
+VERSION   := 1.1.3K
 VERSION_DATE := 2026-08-19
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -246,6 +246,7 @@ test: lyxc
 	@bash tests/schluesselwoerter_test.sh
 	@bash tests/struct_rueckgabe_test.sh
 	@bash tests/schreibfehler_test.sh
+	@bash tests/svg_ausgabe_test.sh
 	@bash tests/stdlib_z20_test.sh
 	@bash tests/sprache_z16_test.sh
 	@bash tests/codegen_ausdruecke_test.sh

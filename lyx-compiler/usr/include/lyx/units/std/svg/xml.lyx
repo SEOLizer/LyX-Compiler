@@ -86,6 +86,13 @@ pub con SVG_ANIM_BUF:  int64 := 2176;  // 1020 bytes inline pending animation bu
 pub con SVG_ANIM_LEN:  int64 := 3196;  // int64: current fill length of ANIM_BUF
 pub con SVG_ID_CNT:      int64 := 3204;  // int64: auto-ID counter for animation targets
 pub con SVG_ANIM_REPEAT: int64 := 3212;  // int64: animation repeat count (0=indefinite)
+// #1685: Waehrend eine Definition offen ist (symbol/clipPath/marker), gehen
+// AUCH die Formfunktionen in den defs-Puffer. Vorher schrieben die Begin/End-
+// Paare ueber _svgD... in die Definition, die Formen aus std.svg.elements
+// aber ueber _svgW... in den Rumpf — dazwischen gab es keine Umleitung. Die
+// Definition blieb leer und die Form erschien sichtbar im Bild. Symbole,
+// Clip-Pfade und Marker waren damit ueberhaupt nicht befuellbar.
+pub con SVG_DEFS_MODE:   int64 := 3220;  // int64: 1 = Ausgabe geht in <defs>
 pub con SVG_DOC_SIZE:    int64 := 4096;
 
 // ============================================================================
@@ -206,6 +213,10 @@ fn _svgEnsurePath(doc: int64, needed: int64): void {
 // ============================================================================
 
 pub fn _svgWc(doc: int64, c: int64): void {
+  // #1685: Die Umleitung sitzt hier, in der EINEN Senke des Rumpf-Puffers —
+  // damit folgt ihr jede Formfunktion von selbst, ohne dass eine einzelne
+  // davon etwas davon wissen muss.
+  if (peek64(doc + SVG_DEFS_MODE) != 0) { _svgDc(doc, c); return; }
   var len: int64 := peek64(doc + SVG_BUF_LEN);
   if (len >= peek64(doc + SVG_BUF_CAP) - 1) { _svgEnsureMain(doc, 256); }
   poke8(peek64(doc + SVG_BUF_PTR) + len, c);
@@ -226,32 +237,65 @@ pub fn _svgWi(doc: int64, v: int64): void {
   _svgW(doc, IntToStr(v));
 }
 
+// #1686: EINE Stelle, die eine f64 als SVG-Zahl formatiert. Vorher stand
+// derselbe Rumpf VIERMAL da (_svgWf, _svgDf, _svgPf, _svgAf), ein fuenftes
+// Mal halb in svgBufF64 — und alle trugen dieselben drei Fehler:
+//
+//   1. Das Minus wurde zweimal geschrieben: einmal von Hand, einmal von
+//      IntToStr(ip), das sein eigenes mitbringt. Aus -10 wurde `--10`.
+//   2. `frac` war bei negativen Werten negativ, also ergab `48 + d1` ein
+//      Zeichen VOR '0': aus -0.1 wurde `0./`, aus -1.5 wurde `--1.+`.
+//   3. Das Vorzeichen kam aus `v as int64`, und das schneidet ab. Fuer -0.5
+//      ist es 0, das Minus fiel damit ganz weg: `cx="0.+"`.
+//
+// Die Fassung, die es richtig macht, stand die ganze Zeit daneben:
+// svgBufF64r2x100 trennt das Vorzeichen ab und rechnet mit dem Betrag
+// weiter. Statt sie ein fuenftes Mal nachzubauen, laufen jetzt alle
+// Schreiber durch sie hindurch.
+//
+// Negative Koordinaten sind in SVG der Normalfall, nicht der Randfall:
+// Filterbereiche, ViewBox-Ursprung, Marker-Referenzpunkte, jede Zeichnung mit
+// Ursprung in der Mitte. Der Fehler war still — die Ausgabe blieb
+// wohlgeformtes XML, der Betrachter zeichnete nur nichts oder etwas Falsches.
+//
+// Schreibt nullterminiert nach `tmp` (mindestens 32 Byte) und liefert die
+// Laenge ohne die Null.
+pub fn _svgFmtF64(tmp: int64, v: f64): int64 {
+  var pos: int64 := svgBufF64r2x100(tmp, 0, svgF64x100(v));
+  poke8(tmp + pos, 0);
+  return pos;
+}
+
 pub fn _svgWf(doc: int64, v: f64): void {
   var tmp: int64 := alloc(32);
   if (tmp == 0) { return; }
-  var bits: int64 := v as int64;
-  var pos: int64 := 0;
-  if (bits < 0) { poke8(tmp, 45); pos := 1; }
-  var v100: int64 := svgF64x100(v);
-  var ip: int64 := v100 / 100;
-  var frac: int64 := v100 - ip * 100;
-  var s: pchar := IntToStr(ip);
-  var si: int64 := 0;
-  while (true) {
-    var c: int64 := StrCharAt(s, si);
-    if (c == 0) { break; }
-    poke8(tmp + pos, c); pos := pos + 1; si := si + 1;
-  }
-  if (frac != 0) {
-    poke8(tmp + pos, 46); pos := pos + 1;
-    var d1: int64 := frac / 10;
-    var d2: int64 := frac - d1 * 10;
-    poke8(tmp + pos, 48 + d1); pos := pos + 1;
-    if (d2 != 0) { poke8(tmp + pos, 48 + d2); pos := pos + 1; }
-  }
-  poke8(tmp + pos, 0);
+  _svgFmtF64(tmp, v);   // #1686
   _svgW(doc, tmp as pchar);   // #1272
   free(tmp, 32);
+}
+
+// #1684: Ein bereits als Hundertstel gespeicherter Wert wird direkt
+// geschrieben. Der Umweg ueber f64 war die Fehlerquelle: die Aufrufer
+// schickten den int64 aus svgF64x100 ein ZWEITES Mal durch svgF64x100 und
+// gaben das Ergebnis als f64 aus — ein Bitmuster, das als Zahl 0 ergab.
+pub fn _svgWi100(doc: int64, v100: int64): void {
+  var tmp: int64 := alloc(32);
+  if (tmp == 0) { return; }
+  var pos: int64 := svgBufF64r2x100(tmp, 0, v100);
+  poke8(tmp + pos, 0);
+  _svgW(doc, tmp as pchar);
+  free(tmp, 32);
+}
+
+
+// #1685: Von den Begin/End-Paaren in std.svg.defs gesetzt.
+pub fn _svgDefsModeSet(doc: int64, an: int64): void {
+  if (doc == 0) { return; }
+  poke64(doc + SVG_DEFS_MODE, an);
+}
+pub fn _svgDefsModeAn(doc: int64): int64 {
+  if (doc == 0) { return 0; }
+  return peek64(doc + SVG_DEFS_MODE);
 }
 
 pub fn _svgWbytes(doc: int64, src: int64, n: int64): void {
@@ -304,27 +348,7 @@ pub fn _svgDi(doc: int64, v: int64): void {
 pub fn _svgDf(doc: int64, v: f64): void {
   var tmp: int64 := alloc(32);
   if (tmp == 0) { return; }
-  var bits: int64 := v as int64;
-  var pos: int64 := 0;
-  if (bits < 0) { poke8(tmp, 45); pos := 1; }
-  var v100: int64 := svgF64x100(v);
-  var ip: int64 := v100 / 100;
-  var frac: int64 := v100 - ip * 100;
-  var s: pchar := IntToStr(ip);
-  var si: int64 := 0;
-  while (true) {
-    var c: int64 := StrCharAt(s, si);
-    if (c == 0) { break; }
-    poke8(tmp + pos, c); pos := pos + 1; si := si + 1;
-  }
-  if (frac != 0) {
-    poke8(tmp + pos, 46); pos := pos + 1;
-    var d1: int64 := frac / 10;
-    var d2: int64 := frac - d1 * 10;
-    poke8(tmp + pos, 48 + d1); pos := pos + 1;
-    if (d2 != 0) { poke8(tmp + pos, 48 + d2); pos := pos + 1; }
-  }
-  poke8(tmp + pos, 0);
+  _svgFmtF64(tmp, v);   // #1686
   _svgD(doc, tmp as pchar);   // #1272
   free(tmp, 32);
 }
@@ -375,27 +399,7 @@ pub fn _svgP(doc: int64, s: pchar): void {
 pub fn _svgPf(doc: int64, v: f64): void {
   var tmp: int64 := alloc(32);
   if (tmp == 0) { return; }
-  var bits: int64 := v as int64;
-  var pos: int64 := 0;
-  if (bits < 0) { poke8(tmp, 45); pos := 1; }
-  var v100: int64 := svgF64x100(v);
-  var ip: int64 := v100 / 100;
-  var frac: int64 := v100 - ip * 100;
-  var s: pchar := IntToStr(ip);
-  var si: int64 := 0;
-  while (true) {
-    var c: int64 := StrCharAt(s, si);
-    if (c == 0) { break; }
-    poke8(tmp + pos, c); pos := pos + 1; si := si + 1;
-  }
-  if (frac != 0) {
-    poke8(tmp + pos, 46); pos := pos + 1;
-    var d1: int64 := frac / 10;
-    var d2: int64 := frac - d1 * 10;
-    poke8(tmp + pos, 48 + d1); pos := pos + 1;
-    if (d2 != 0) { poke8(tmp + pos, 48 + d2); pos := pos + 1; }
-  }
-  poke8(tmp + pos, 0);
+  _svgFmtF64(tmp, v);   // #1686
   _svgP(doc, tmp as pchar);   // #1272
   free(tmp, 32);
 }
@@ -544,8 +548,9 @@ pub fn svgBufStr(buf: int64, pos: int64, s: pchar): int64 {
 
 // Write f64 (2 decimal places) to buffer at pos, return new pos
 pub fn svgBufF64(buf: int64, pos: int64, v: f64): int64 {
-  var bits: int64 := v as int64;
-  if (bits < 0) { poke8(buf + pos, 45); pos := pos + 1; }
+  // #1686: Das Minus kam hier ein zweites Mal dazu — svgBufF64r2x100 schreibt
+  // es laengst selbst, und zwar richtig. `v as int64` als Vorzeichenprobe war
+  // ausserdem falsch: fuer -0.5 ist das 0.
   return svgBufF64r2x100(buf, pos, svgF64x100(v));
 }
 
@@ -608,27 +613,7 @@ pub fn _svgAi(doc: int64, v: int64): void {
 pub fn _svgAf(doc: int64, v: f64): void {
   var tmp: int64 := alloc(32);
   if (tmp == 0) { return; }
-  var bits: int64 := v as int64;
-  var pos: int64 := 0;
-  if (bits < 0) { poke8(tmp, 45); pos := 1; }
-  var v100: int64 := svgF64x100(v);
-  var ip: int64 := v100 / 100;
-  var frac: int64 := v100 - ip * 100;
-  var s: pchar := IntToStr(ip);
-  var si: int64 := 0;
-  while (true) {
-    var c: int64 := StrCharAt(s, si);
-    if (c == 0) { break; }
-    poke8(tmp + pos, c); pos := pos + 1; si := si + 1;
-  }
-  if (frac != 0) {
-    poke8(tmp + pos, 46); pos := pos + 1;
-    var d1: int64 := frac / 10;
-    var d2: int64 := frac - d1 * 10;
-    poke8(tmp + pos, 48 + d1); pos := pos + 1;
-    if (d2 != 0) { poke8(tmp + pos, 48 + d2); pos := pos + 1; }
-  }
-  poke8(tmp + pos, 0);
+  _svgFmtF64(tmp, v);   // #1686
   _svgA(doc, tmp as pchar);   // #1272
   free(tmp, 32);
 }
@@ -682,5 +667,15 @@ pub fn svgInt100ToF64(v100: int64): f64 {
   var hi: int64 := (sign << 31) | (biasedExp << 20) | (mant >> 32);
   var lo: int64 := mant & 0xFFFFFFFF;
   var bits: int64 := (hi << 32) | lo;
-  return bits as f64;
+  // #1687: `bits as f64` RECHNET den Zahlenwert um; gebraucht wird die
+  // UMDEUTUNG derselben Bits. Vorher lieferten SvgReadWidth, SvgReadHeight
+  // und SvgAttrF64 das Bitmuster als Zahl — fuer 400.0 also
+  // 4645744490609377280: positiv, endlich und um achtzehn Groessenordnungen
+  // daneben. Der Umweg ueber den Speicher deutet um, statt zu rechnen.
+  var zelle: int64 := alloc(8);
+  if (zelle == 0) { return 0 as f64; }
+  poke64(zelle, bits);
+  var r: f64 := peekf64(zelle);
+  free(zelle, 8);
+  return r;
 }
