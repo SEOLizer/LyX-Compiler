@@ -1385,6 +1385,18 @@ pub type Codegen = class {
     return doff;
   }
 
+  // #1670: Einen Namen als NUL-terminierte Zeichenkette in den Datenbereich
+  // legen und den Offset melden. cg_addStr arbeitet mit einem Offset in den
+  // Quelltext; hier liegt der Name als Zeiger vor (Klassenname aus der
+  // Layouttabelle), deshalb byteweise.
+  fn cg_addNameData(nm: pchar, nlen: int64): int64 {
+    var off: int64 := self.dataLen;
+    var i: int64 := 0;
+    while (i < nlen) { self.cg_edata(StrCharAt(nm, i) & 255); i := i + 1; }
+    self.cg_edata(0);
+    return off;
+  }
+
   // #1256: n genullte Bytes im Datenbereich belegen, Offset zurueckgeben.
   fn cg_reserveData(nbytes: int64): int64 {
     var off: int64 := self.dataLen;
@@ -1764,6 +1776,7 @@ pub type Codegen = class {
       if (self.cg_funcRetTypeIs(fp, fl, "pchar"c, 5) == 1) { return 1; }
       // #1381: dasselbe fuer Methodenaufrufe (gemangelter Name in der Registry).
       if (self.cg_callRetTypeIs(ni, "pchar"c, 5) == 1) { return 1; }
+      if (self.cg_seq(fp, fl, "ClassName",   9))  { return 1; }   // #1670
       if (self.cg_seq(fp, fl, "IntToStr",    8))  { return 1; }
       if (self.cg_seq(fp, fl, "StrFromInt",  10)) { return 1; }
       if (self.cg_seq(fp, fl, "StrConcat",   9))  { return 1; }
@@ -6225,6 +6238,15 @@ pub type Codegen = class {
       }
       mthTmp3 := self.cg_nnext(mthTmp3);
     }
+    // #1670: Unmittelbar VOR der VMT steht ein Zeiger auf den Klassennamen.
+    // Er liegt bei [vmt-8], damit die Slot-Nummern unveraendert bleiben und
+    // `is` weiterhin die VMT-Basis vergleicht — beides haengt an dieser Lage.
+    // Damit traegt jedes Objekt mit VMT seinen Namen bei sich: obj[0] ist die
+    // VMT, [vmt-8] der Name.
+    var nameStrOff: int64 := self.cg_addNameData(self.cg_nsval(ni), self.cg_nslen(ni));
+    var nameCell:   int64 := self.cg_reserveData(8);
+    self.cg_addPatch(nameCell, nameStrOff, 0, CG_PATCH_DATA_PTR);
+
     // Emit VMT data: totalSlots * 8 bytes (each slot = one method pointer)
     var vmtDataOff: int64 := self.dataLen;
     var di: int64 := 0;
@@ -9996,6 +10018,39 @@ pub type Codegen = class {
     // Die Argumente stehen bei einem Methodenaufruf in c1, bei einem
     // gewoehnlichen in c0. Nach der Umdeutung auf isMethod=0 muessen sie
     // weiterhin aus c1 kommen — dafuer dieser Merker.
+    // #1670: `obj.ClassName()` liefert den Namen der Klasse als pchar.
+    //
+    // Bei einer Klasse MIT Methoden ist es der DYNAMISCHE Name: gelesen wird
+    // ueber den Typzeiger im Objekt, eine Basisklassen-Variable meldet also
+    // die tatsaechliche Klasse. Eine Klasse ohne Methoden bekommt
+    // struct-Layout und traegt keinen Typzeiger; dort ist der statische Name
+    // die einzige und richtige Antwort — dieselbe Grenze, die `is` schon zieht
+    // (ebnf.md 20.1).
+    if (isMethod == 1 && self.cg_seq(fname, fnlen, "ClassName", 9) != 0
+        && self.cg_nc1(ni) == -1) {
+      var cnObj: int64 := self.cg_nc0(ni);
+      var cnIdx: int64 := self.cg_objClassIdx(cnObj);
+      if (cnIdx >= 0) {
+        if (self.cg_classHasVmt(cnIdx) != 0) {
+          self.cg_genExpr(cnObj);                                  // rax = Objekt
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x00);    // mov rax,[rax]      (VMT)
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(0xF8);  // mov rax,[rax-8]
+        } else {
+          // Der Empfaenger wird trotzdem ausgewertet — er kann Wirkung haben.
+          self.cg_genExpr(cnObj);
+          var cnBase: int64 := self.classLayouts + cnIdx * CG_CLASS_SZ;
+          var cnOff:  int64 := self.cg_addNameData(peek64(cnBase) as pchar,
+                                                   peek64(cnBase + CG_CLASS_OFF_NAMELEN));
+          self.cg_emitLeaRaxData(cnOff);
+        }
+        return;
+      }
+      // Kein bestimmbarer Klassentyp: nicht still etwas erfinden.
+      EPrintStrLn("error: ClassName() braucht einen Empfaenger mit bestimmbarem Klassentyp"c);
+      EPrintStrLn("  Den Ausdruck zuerst einer Variablen mit deklariertem Typ zuweisen."c);
+      exit(1);
+    }
+
     var aliasArgs: int64 := 0 - 1;
     if (isMethod == 1) {
       var arecv: int64 := self.cg_nc0(ni);

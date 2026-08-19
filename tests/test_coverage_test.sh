@@ -61,6 +61,8 @@ is_exempt() {
                                           # fuer den FFI-Nachweis, kein Test.
     data/runde16/basis.lyx)  return 0 ;;  # #1666: importierte Basisklasse als
                                           # Pruefdaten, kein Test.
+    data/runde17/ctrl.lyx)   return 0 ;;  # #1670: importierte Klassen als
+                                          # Pruefdaten, kein Test.
     lib/lyxc_guard.sh)       return 0 ;;  # #1294: Bibliothek, kein Test — wird
                                           # von den Scripts eingebunden und vom
                                           # Waechter lyxc_guard_coverage_test.sh
