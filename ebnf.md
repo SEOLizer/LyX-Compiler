@@ -1,6 +1,6 @@
-# Lyx 1.1.3L — Canonical EBNF Grammar
+# Lyx 1.1.3M — Canonical EBNF Grammar
 
-> Stand 2026-08-19, gegen lyxc 1.1.3L geprueft. Die Keyword-Liste in
+> Stand 2026-08-19, gegen lyxc 1.1.3M geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -34,7 +34,16 @@ Ident               = ( Letter | "_" ) { Letter | Digit | "_" } ;
 
 (* Der Unterstrich fehlte hier, obwohl er ueberall verwendet wird -- auch
    fuehrend (`_thrCtl`, `cg_genCall`). Geprueft: `my_var`, `_x` und `x1` sind
-   gueltig, `1x` nicht. *)
+   gueltig, `1x` nicht.
+
+   Ein ALLEINSTEHENDER Unterstrich ist dagegen kein gewoehnlicher Ident: der
+   Lexer fuehrt ihn als eigenes Token. Er steht nur an zwei Stellen, und
+   beide Male als VERWURF -- im Wildcard-Muster eines `match` (Abschnitt 14)
+   und in der Zerlegung einer Mehrfachrueckgabe (`var a, _ := f()`, siehe
+   VarDecl). `var _: int64 := 5;` wird abgewiesen; dafuer gibt es keine
+   Bedeutung. Bis 1.1.3L war er auch in der Zerlegung abgewiesen -- vier
+   Testdateien im Bestand benutzten die Schreibweise und uebersetzten
+   deshalb nie (#1697). *)
 
 DecimalLiteral      = Digit { Digit | "_" } ;
 
@@ -296,6 +305,15 @@ VarDecl             = [ Visibility ]
                       ";" ;
 
 VarKind             = "var" | "let" | "co" ;
+
+TupleVarDecl        = VarKind ( Ident | "_" ) "," ( Ident | "_" )
+                      ":=" Expr ";" ;
+
+(* Zerlegung einer Mehrfachrueckgabe. Genau zwei Namen -- die
+   Aufrufkonvention traegt zwei Rueckgabewerte (rax, rdx), siehe Abschnitt 7.
+   An jeder der beiden Stellen darf `_` stehen und verwirft den Wert; beide
+   zugleich sind erlaubt, aber sinnlos. Ein Typ wird nicht angegeben, er
+   kommt aus dem Rueckgabetyp des Aufgerufenen. *)
 
 (* `let` und `co` binden einmal: eine Zuweisung nach der Initialisierung
    wird abgewiesen. `var` bleibt beschreibbar. Bis 1.0.11D trug `let` den
