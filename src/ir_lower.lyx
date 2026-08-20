@@ -203,10 +203,20 @@ fn _irLeseImport(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar):
   if ((src as int64) != 0) { free(rel, modLen + 8); return src; }
 
   // Unter einem Praefix nachsehen: "<praefix>/<rel>"
+  //
+  // #1723: Hier standen nur incPath und stdPath. Der Hauptaufloeser kennt
+  // seit 1.0.18D eine vierte Stufe — den Installationspfad des Pakets — und
+  // ohne sie fand die IR-Strecke die mitgelieferte Bibliothek nie. Wer ohne
+  // --std-path uebersetzte, bekam "Import nicht lesbar, seine Funktionen
+  // fehlen: std.fs" und zwei Zeilen spaeter "unbekannter Builtin/Funktion:
+  // FileExists" — eine Meldung, die auf einen fehlenden Builtin zeigt,
+  // obwohl bloss die Unit nicht gefunden wurde. Dieselbe Reihenfolge wie in
+  // sema._leseDatei, damit beide Seiten dieselbe Antwort geben.
   var vers: int64 := 0;
-  while (vers < 2) {
+  while (vers < 3) {
     var pre: pchar := incPath;
     if (vers == 1) { pre := stdPath; }
+    if (vers == 2) { pre := "/usr/include/lyx/units"; }
     if ((pre as int64) != 0) {
       var pl: int64 := StrLen(pre);
       if (pl > 0) {
@@ -2138,6 +2148,50 @@ pub type IRLower = class {
     // WP-D2: mmap(addr, size, ...) → IRO_ALLOC(size) for ARM64 backends.
     // The ARM64 IR backend (emit_arm64.lyx) maps IRO_ALLOC to mmap on Linux
     // and to VirtualAlloc on Windows, so this translation is correct for both.
+    // #1720 Block B: IntToStr/StrFromInt(n) — ID 16. Anders als die uebrigen
+    // Namen dieser Runde ist das kein Alias: es braucht einen Puffer und eine
+    // Ziffernschleife, also einen eigenen Emitter je Backend. Umgesetzt ist
+    // bislang nur lyxos; die anderen IR-Ziele melden die ID als unbehandelt,
+    // was laut und richtig ist.
+    if ((self.seq(fname, fnlen, "IntToStr", 8) || self.seq(fname, fnlen, "StrFromInt", 10))
+        && arg0 >= 0) {
+      var itsN: int64 := self.lowerExpr(arg0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 0, itsN, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 16);
+      return dest;
+    }
+
+    // #1720 Block B: StrFree(s) ist auf dem x86-Weg ein ausdrueckliches
+    // No-op — der Speicher stammt aus mmap, und der Bootstrap raeumt nicht
+    // auf. Auf der IR-Strecke gilt dasselbe; ein irFree waere hier eine
+    // andere Semantik als auf x86 und damit schlimmer als nichts.
+    if (self.seq(fname, fnlen, "StrFree", 7)) {
+      self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, 0);
+      return dest;
+    }
+
+    // #1720 Block B: panic(msg) — Meldung nach stderr, dann Abbruch mit 1.
+    // Moeglich geworden durch #1715: ID 13 schreibt nach stderr und rechnet
+    // die Laenge selbst, 14 haengt den Umbruch an, 3 beendet.
+    //
+    // Abweichung vom x86-Weg, bewusst: dort legt panic die Meldung
+    // zusaetzlich in CG_EXN_VAL ab, damit ein catch sie lesen kann. Die
+    // IR-Strecke hat diese Ablage nicht — hier endet das Programm. Wer
+    // Ausnahmen auf einem IR-Ziel braucht, braucht zuerst die Ablage.
+    if (self.seq(fname, fnlen, "panic", 5)) {
+      if arg0 >= 0 {
+        var pkMsg: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pkMsg, -1, 0);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 13);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 14);
+      }
+      var pkRc: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, pkRc, -1, -1, 1);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pkRc, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 3);
+      return dest;
+    }
+
     // #1720 Block A: die Gleitkomma-Builtins. Sie sind in sema registriert
     // und wurden bislang nur auf dem x86-Schnellweg erzeugt — auf JEDEM
     // IR-Ziel fehlten sie. Die passenden IR-Opcodes gibt es laengst, und die
@@ -2540,7 +2594,8 @@ pub type IRLower = class {
       if swtA >= 0 { var swtT: int64 := self.lowerExpr(swtA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, swtT, -1, 0); }
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 64); return dest;
     }
-    if (self.seq(fname, fnlen, "sys_getpid", 10)) {
+    // #1720: die stdlib ruft `getpid`, gelistet war nur `sys_getpid`.
+    if (self.seq(fname, fnlen, "sys_getpid", 10) || self.seq(fname, fnlen, "getpid", 6)) {
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 65); return dest;
     }
     if (self.seq(fname, fnlen, "sys_gettid", 10)) {
@@ -3428,7 +3483,8 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, syB, -1, 230); return dest;
     }
     // nanosleep(ts, rem) → sys_sleep_ns (timespec→ns). rem ignoriert — id 233.
-    if (self.seq(fname, fnlen, "nanosleep", 9)) {
+    // #1720: die stdlib ruft `sys_nanosleep`, gelistet war nur `nanosleep`.
+    if (self.seq(fname, fnlen, "nanosleep", 9) || self.seq(fname, fnlen, "sys_nanosleep", 13)) {
       var nsB: int64 := self.tempCount; var nsR: int64 := 0; while nsR < 4 { self.allocTemp(); nsR := nsR + 1; }
       if arg0 >= 0 { var t: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, nsB, t, -1, 0); }
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, nsB, -1, 233); return dest;

@@ -24,7 +24,7 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 |---:|---|---|---|
 | 1 | `write(1, ptr, len)` | `PrintStr`, `PrintLn`, `Print` | Länge −1 = „strlen zur Laufzeit"; **nur das lyxos-Backend wertet den Sentinel aus** |
 | 2 | Ganzzahl nach stdout | `PrintInt`, `PrintLn`, `Print` | ohne Zeilenumbruch; `Print`/`PrintLn` seit #1716 auch mit Zahl-Argument, `PrintLn` haengt den Umbruch als eigenen ID-1-Aufruf an |
-| 3 | Prozessende | `Exit` | |
+| 3 | Prozessende | `Exit`, `panic` | `panic` beendet mit 1 (#1720) |
 | 6 | Teilzeichenkette | `StrSub` | |
 | 7 | Verkettung | `StrConcat` | |
 | 8 | Kopie | `StrCopy` | |
@@ -32,11 +32,12 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 | 10 | Datenbarriere (DMB SY) | `mem_barrier` | |
 | 11 | Befehlsbarriere (ISB SY) | `inst_barrier` | |
 | 12 | Formatierte Ausgabe | `Printf` | war bis 1.0.11C fälschlich 10 |
-| 13 | `write(2, ptr, strlen(ptr))` | `EPrintStr`, `EPrintStrLn`, `EPrint` | #1388; Länge rechnet das Backend selbst |
-| 14 | Zeilenumbruch nach stderr | `EPrintStrLn`, `EPrintLn` | #1388 |
+| 13 | `write(2, ptr, strlen(ptr))` | `EPrintStr`, `EPrintStrLn`, `EPrint`, `panic` | #1388; Länge rechnet das Backend selbst |
+| 14 | Zeilenumbruch nach stderr | `EPrintStrLn`, `EPrintLn`, `panic` | #1388 |
 | 15 | Länge einer Zeichenkette | `StrLen`, `StrLength` | #1388 |
+| 16 | Ganzzahl als Dezimaltext, Zeiger zurück | `IntToStr`, `StrFromInt` | #1720; der Puffer stammt aus mmap, nicht vom Stapel — er muss den Aufruf überleben |
 
-Frei: 4, 5, 16–19.
+Frei: 4, 5, 17–19.
 
 ## Backend-Abdeckung der allgemeinen IDs
 
@@ -48,7 +49,7 @@ Frei: 4, 5, 16–19.
 | RISC-V Linux | 1, 2, 3, **13, 15, 200–205, 208, 209** | Rest meldet Fehler (#1388) |
 | ARM Cortex-M | **200–205, 208, 209**; 1, 2, 3, 9, 12, 13, 14 als ausdrücklicher No-op bzw. BKPT | alles Übrige meldet Fehler |
 | Xtensa | 1, 2 | Rest meldet Fehler (#1388, Kodierungen fehlen — vgl. #1281) |
-| lyxos (LBF) | 1, 2, **3**, **13, 14, 15** + 20 … 256 | 6–12 — meldet Fehler (#1715) |
+| lyxos (LBF) | 1, 2, **3**, **13, 14, 15, 16** + 20 … 256 | 6–12 — meldet Fehler (#1715) |
 
 **Speicherzugriffe (200–205, 208, 209)** sind seit #1388 auf ARM64, RISC-V und
 Cortex-M umgesetzt. Sie brauchen kein Betriebssystem und gelten deshalb auch
