@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.4B
+VERSION   := 1.1.4C
 VERSION_DATE := 2026-08-20
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -339,6 +339,7 @@ test: lyxc
 	@bash tests/test_coverage_test.sh
 	@bash tests/lyxc_umgebung_test.sh
 	@bash tests/struct_param_ref_test.sh
+	@bash tests/pruefziffern_test.sh
 	@echo "OK"
 	@echo "--- ebnf.md Keyword-Liste gegen den Compiler ---"
 	@bash tests/ebnf_keywords_test.sh
