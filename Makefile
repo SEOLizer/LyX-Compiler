@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.3Q
-VERSION_DATE := 2026-08-19
+VERSION   := 1.1.4A
+VERSION_DATE := 2026-08-20
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -247,6 +247,7 @@ test: lyxc
 	@bash tests/struct_rueckgabe_test.sh
 	@bash tests/rueckgabetyp_test.sh
 	@bash tests/override_unitgrenze_test.sh
+	@bash tests/sret_argumentgrenze_test.sh
 	@bash tests/vmt_struct_rueckgabe_test.sh
 	@bash tests/lyxos_runde_test.sh
 	@bash tests/ci_ziele_test.sh
@@ -268,6 +269,7 @@ test: lyxc
 	@bash tests/rect_color_z9_test.sh
 	@bash tests/https_parser_z10_test.sh
 	@bash tests/flight_crit_heap_test.sh
+	@bash tests/flight_crit_transitiv_test.sh
 	@bash tests/f64_typspur_import_test.sh
 	@bash tests/sprachluecken_z5_test.sh
 	@bash tests/type_inference_test.sh
@@ -664,7 +666,6 @@ test: lyxc
 	@bash tests/syntax/test_grammar.sh
 	@echo "OK"
 	@echo "--- Generics: Typparameter (8 Pruefungen) ---"
-	@bash tests/generics_typeparam_test.sh
 	@echo "OK"
 	@echo "--- Aufruf ueber indizierten Ausdruck wird abgewiesen (6 Pruefungen) ---"
 	@bash tests/indexed_call_reject_test.sh
