@@ -1651,6 +1651,157 @@ pub type IRLower = class {
       return dest;
     }
 
+    // #1716: Print/PrintLn mit einem Argument, das KEIN String-Literal ist.
+    //
+    // Bis hierher fiel jede Variable, Zahl und jeder Ausdruck durch die ganze
+    // Kette und endete in der Abbruchmeldung ganz unten, die dann "PrintLn"
+    // als unbekannt nannte — obwohl der Name zwei Zeilen weiter oben
+    // behandelt wird. Das schickte die Fehlersuche in die falsche Richtung.
+    //
+    // Die Zielpfade gibt es laengst: PrintStr ohne Literal-Bedingung und
+    // PrintInt weiter unten. Hier wird nur nach dem Typ dorthin verzweigt.
+    // Der Zeilenumbruch laeuft ueber ID 1 mit einem "\n"-Literal und nicht
+    // ueber ID 14: die schreibt nach stderr, PrintLn gehoert nach stdout.
+    //
+    // Inline, kein Helfer: eine zusaetzliche Methode an IRLower verschiebt
+    // die VMT und bricht den Selbstbau (siehe Vermerk beim Funktionsaufruf
+    // weiter unten).
+    if ((self.seq(fname, fnlen, "PrintLn", 7) || self.seq(fname, fnlen, "Print", 5)) && arg0 >= 0) {
+      var pnAddNl: int64 := 0;
+      if self.seq(fname, fnlen, "PrintLn", 7) { pnAddNl := 1; }
+
+      // 1 = Zeichenkette, 0 = Ganzzahl, -1 = nicht entscheidbar.
+      var pnArt: int64 := 0 - 1;
+      var pnK: int64 := self.nodeKind(arg0);
+      if (pnK == NK_LIT_INT || pnK == NK_LIT_BOOL || pnK == NK_LIT_CHAR) { pnArt := 0; }
+      else if (pnK == NK_BINOP || pnK == NK_UNOP) {
+        // Auch hier nicht raten: ein f64-Ausdruck saehe sonst wie eine
+        // Ganzzahl aus und wuerde als solche ausgegeben. Entschieden wird
+        // am linken Operanden — bei gemischten Typen greift ohnehin die
+        // Typpruefung vor dieser Stelle.
+        var pnL: int64 := self.nodeC0(arg0);
+        if pnL >= 0 {
+          var pnLk: int64 := self.nodeKind(pnL);
+          if (pnLk == NK_LIT_INT || pnLk == NK_LIT_BOOL || pnLk == NK_LIT_CHAR) { pnArt := 0; }
+          else if (pnLk == NK_IDENT) {
+            var pnLt: int64 := self._localTypeNode(self.nodeSVal(pnL), self.nodeSLen(pnL));
+            if pnLt >= 0 {
+              var pnLp: pchar := self.nodeSVal(pnLt);
+              var pnLl: int64 := self.nodeSLen(pnLt);
+              if (self.seq(pnLp, pnLl, "int64", 5) || self.seq(pnLp, pnLl, "int32", 5)
+               || self.seq(pnLp, pnLl, "int16", 5) || self.seq(pnLp, pnLl, "int8", 4)
+               || self.seq(pnLp, pnLl, "uint64", 6) || self.seq(pnLp, pnLl, "uint32", 6)
+               || self.seq(pnLp, pnLl, "uint16", 6) || self.seq(pnLp, pnLl, "uint8", 5)
+               || self.seq(pnLp, pnLl, "bool", 4) || self.seq(pnLp, pnLl, "byte", 4)
+               || self.seq(pnLp, pnLl, "char", 4)) { pnArt := 0; }
+            }
+          }
+        }
+      }
+      else if (pnK == NK_IDENT) {
+        var pnTn: int64 := self._localTypeNode(self.nodeSVal(arg0), self.nodeSLen(arg0));
+        if pnTn >= 0 {
+          var pnTp: pchar := self.nodeSVal(pnTn);
+          var pnTl: int64 := self.nodeSLen(pnTn);
+          if self.seq(pnTp, pnTl, "pchar", 5) { pnArt := 1; }
+          // Ganzzahltypen AUSDRUECKLICH aufzaehlen. Die Umkehrung ("alles,
+          // was nicht pchar ist, ist eine Zahl") machte aus einem f64 still
+          // eine Integer-Ausgabe — ein falsches Ergebnis ohne Meldung.
+          else if (self.seq(pnTp, pnTl, "int64", 5) || self.seq(pnTp, pnTl, "int32", 5)
+                || self.seq(pnTp, pnTl, "int16", 5) || self.seq(pnTp, pnTl, "int8", 4)
+                || self.seq(pnTp, pnTl, "uint64", 6) || self.seq(pnTp, pnTl, "uint32", 6)
+                || self.seq(pnTp, pnTl, "uint16", 6) || self.seq(pnTp, pnTl, "uint8", 5)
+                || self.seq(pnTp, pnTl, "bool", 4) || self.seq(pnTp, pnTl, "byte", 4)
+                || self.seq(pnTp, pnTl, "char", 4)) { pnArt := 0; }
+        }
+      }
+      else if (pnK == NK_CALL) {
+        // stdlib-Funktionen, die eine Zeichenkette liefern.
+        var pnCn: pchar := self.nodeSVal(arg0);
+        var pnCl: int64 := self.nodeSLen(arg0);
+        if (self.seq(pnCn, pnCl, "IntToStr", 8) || self.seq(pnCn, pnCl, "StrFromInt", 10)
+            || self.seq(pnCn, pnCl, "FloatToStr", 10) || self.seq(pnCn, pnCl, "StrConcat", 9)
+            || self.seq(pnCn, pnCl, "StrCopy", 7) || self.seq(pnCn, pnCl, "StrSub", 6)
+            || self.seq(pnCn, pnCl, "StrTrim", 7) || self.seq(pnCn, pnCl, "StrNew", 6)) {
+          pnArt := 1;
+        } else {
+          // Nutzerfunktion: Rueckgabetyp steht in c1 des NK_FUNC_DECL.
+          var pnFd: int64 := 0;
+          while pnFd < self.nodeCount {
+            if self.nodeKind(pnFd) == NK_FUNC_DECL {
+              if self.nodeSLen(pnFd) == pnCl {
+                var pnM: int64 := 1;
+                var pnJ: int64 := 0;
+                while pnJ < pnCl {
+                  if pnM != 0 {
+                    if peek8((self.nodeSVal(pnFd) as int64) + pnJ) != peek8((pnCn as int64) + pnJ) { pnM := 0; }
+                  }
+                  pnJ += 1;
+                }
+                if pnM != 0 {
+                  var pnRt: int64 := self.nodeC1(pnFd);
+                  if pnRt >= 0 {
+                    var pnRp: pchar := self.nodeSVal(pnRt);
+                    var pnRl: int64 := self.nodeSLen(pnRt);
+                    if self.seq(pnRp, pnRl, "pchar", 5) { pnArt := 1; }
+                    else if (self.seq(pnRp, pnRl, "int64", 5) || self.seq(pnRp, pnRl, "int32", 5)
+                          || self.seq(pnRp, pnRl, "int16", 5) || self.seq(pnRp, pnRl, "int8", 4)
+                          || self.seq(pnRp, pnRl, "uint64", 6) || self.seq(pnRp, pnRl, "uint32", 6)
+                          || self.seq(pnRp, pnRl, "uint16", 6) || self.seq(pnRp, pnRl, "uint8", 5)
+                          || self.seq(pnRp, pnRl, "bool", 4) || self.seq(pnRp, pnRl, "byte", 4)
+                          || self.seq(pnRp, pnRl, "char", 4)) { pnArt := 0; }
+                  }
+                  pnFd := self.nodeCount;
+                }
+              }
+            }
+            pnFd := pnFd + 1;
+          }
+        }
+      }
+
+      if pnArt == 1 {
+        var pnPtr: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pnPtr, -1, 0);
+        var pnLen: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_CONST_INT, pnLen, -1, -1, 0 - 1);  // Sentinel: strlen zur Laufzeit
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 1, pnLen, -1, 0);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 1);
+      } else if pnArt == 0 {
+        var pnVal: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pnVal, -1, 0);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 2);
+      }
+
+      if pnArt >= 0 {
+        if pnAddNl != 0 {
+          var pnNlBuf: int64 := alloc(2);
+          poke8(pnNlBuf, 10);
+          poke8(pnNlBuf + 1, 0);
+          var pnNlOff: int64 := self.irAddString(pnNlBuf as pchar, 1);
+          var pnNlA: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_CONST_STR, pnNlA, -1, -1, pnNlOff);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pnNlA, -1, 0);
+          var pnNlL: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_CONST_INT, pnNlL, -1, -1, 1);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, 1, pnNlL, -1, 0);
+          self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 1);
+        }
+        return dest;
+      }
+
+      // Nicht entscheidbar: laut scheitern, aber mit der richtigen Auskunft.
+      // Frueher hiess es hier "unbekannter Builtin/Funktion: PrintLn" — das
+      // ist die falsche Faehrte, denn der Name ist bekannt.
+      Print("lyxc: --target="c);
+      Print(self._targetName());
+      PrintLn(": Print/PrintLn kann den Typ des Arguments nicht bestimmen."c);
+      PrintLn("  Behandelt sind: String-Literal, pchar-Variable, Ganzzahl-Ausdruck"c);
+      PrintLn("  und die zeichenkettenliefernden stdlib-Aufrufe (IntToStr u. a.)."c);
+      PrintLn("  Behelf: das Argument einer Variablen mit ausdruecklichem Typ zuweisen."c);
+      exit(1);
+    }
+
     // PrintStr("literal"): the arm64/IR builtin path needs the string ADDRESS
     // in slot 0 and its LENGTH in slot 1 (emitBuiltinCall id 1 does
     // write(1, slot0, slot1)). Extract the literal, process escapes at compile
@@ -1987,6 +2138,18 @@ pub type IRLower = class {
     // WP-D2: mmap(addr, size, ...) → IRO_ALLOC(size) for ARM64 backends.
     // The ARM64 IR backend (emit_arm64.lyx) maps IRO_ALLOC to mmap on Linux
     // and to VirtualAlloc on Windows, so this translation is correct for both.
+    // #1717: StrNew(n) ist ein Compiler-Builtin (sema._regBuiltin) und wurde
+    // bislang nur auf dem x86-Schnellweg erzeugt — auf JEDEM IR-Ziel fehlte
+    // es. Dort belegt es mmap(0, n, PROT_RW, MAP_ANON, -1, 0); auf der
+    // IR-Strecke ist das dieselbe Anweisung, die auch `mmap` erzeugt.
+    if (self.seq(fname, fnlen, "StrNew", 6)) {
+      if arg0 >= 0 {
+        var snSize: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_ALLOC, dest, snSize, -1, 0);
+      }
+      return dest;
+    }
+
     if (self.seq(fname, fnlen, "mmap", 4)) {
       if arg0 >= 0 {
         var mmapSizeNode: int64 := self.nodeNext(arg0);  // second arg = size
@@ -2144,7 +2307,10 @@ pub type IRLower = class {
       if sslA >= 0 { var sslT: int64 := self.lowerExpr(sslA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, sslT, -1, 0); }
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 39); return dest;
     }
-    if (self.seq(fname, fnlen, "sys_readlink", 12)) {
+    // #1717: Die stdlib ruft `readlink`, gelistet war nur `sys_readlink`.
+    // Ein Alias, keine zweite Umsetzung — zwei Fassungen desselben Aufrufs
+    // waeren genau die Divergenz, die diese Klasse erzeugt hat.
+    if (self.seq(fname, fnlen, "sys_readlink", 12) || self.seq(fname, fnlen, "readlink", 8)) {
       var srlA: int64 := arg0;
       if srlA >= 0 { var srlT: int64 := self.lowerExpr(srlA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, srlT, -1, 0); srlA := self.nodeNext(srlA); }
       if srlA >= 0 { var srlT: int64 := self.lowerExpr(srlA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, srlT, -1, 0); srlA := self.nodeNext(srlA); }
@@ -3124,7 +3290,9 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, gdB, -1, 222); return dest;
     }
     // lyxc→LyxOS Kat-B: clock_gettime(clk_id, ts) → sys_time_ns + timespec-Split (id 211).
-    if (self.seq(fname, fnlen, "clock_gettime", 13)) {
+    // #1717: Die stdlib ruft `sys_clock_gettime`, gelistet waren nur
+    // `clock_gettime` und `sys_clock_get`. Alias auf den vorhandenen Zweig.
+    if (self.seq(fname, fnlen, "clock_gettime", 13) || self.seq(fname, fnlen, "sys_clock_gettime", 17)) {
       var cgB: int64 := self.tempCount; var cgR: int64 := 0; while cgR < 4 { self.allocTemp(); cgR := cgR + 1; }
       var cgA: int64 := arg0;
       if cgA >= 0 { var t: int64 := self.lowerExpr(cgA); self.irAddInstrDirect(IRO_STORE_LOCAL, cgB, t, -1, 0); cgA := self.nodeNext(cgA); }

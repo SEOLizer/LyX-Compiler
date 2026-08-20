@@ -22,8 +22,8 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 
 | ID | Operation | Lowering von | Anmerkung |
 |---:|---|---|---|
-| 1 | `write(1, ptr, len)` | `PrintStr`, `PrintLn` | Länge −1 = „strlen zur Laufzeit"; **nur das lyxos-Backend wertet den Sentinel aus** |
-| 2 | Ganzzahl nach stdout | `PrintInt` | ohne Zeilenumbruch |
+| 1 | `write(1, ptr, len)` | `PrintStr`, `PrintLn`, `Print` | Länge −1 = „strlen zur Laufzeit"; **nur das lyxos-Backend wertet den Sentinel aus** |
+| 2 | Ganzzahl nach stdout | `PrintInt`, `PrintLn`, `Print` | ohne Zeilenumbruch; `Print`/`PrintLn` seit #1716 auch mit Zahl-Argument, `PrintLn` haengt den Umbruch als eigenen ID-1-Aufruf an |
 | 3 | Prozessende | `Exit` | |
 | 6 | Teilzeichenkette | `StrSub` | |
 | 7 | Verkettung | `StrConcat` | |
@@ -48,7 +48,7 @@ Frei: 4, 5, 16–19.
 | RISC-V Linux | 1, 2, 3, **13, 15, 200–205, 208, 209** | Rest meldet Fehler (#1388) |
 | ARM Cortex-M | **200–205, 208, 209**; 1, 2, 3, 9, 12, 13, 14 als ausdrücklicher No-op bzw. BKPT | alles Übrige meldet Fehler |
 | Xtensa | 1, 2 | Rest meldet Fehler (#1388, Kodierungen fehlen — vgl. #1281) |
-| lyxos (LBF) | 1, 2 + 20 … 256 | 3, 6–15 |
+| lyxos (LBF) | 1, 2, **3**, **13, 14, 15** + 20 … 256 | 6–12 — meldet Fehler (#1715) |
 
 **Speicherzugriffe (200–205, 208, 209)** sind seit #1388 auf ARM64, RISC-V und
 Cortex-M umgesetzt. Sie brauchen kein Betriebssystem und gelten deshalb auch

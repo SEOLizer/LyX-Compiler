@@ -1033,6 +1033,17 @@ pub type EmitLyxOS = class {
             self.emitPrintStr();
         } else if id == 2 {
             self.emitPrintInt();
+        // #1715: allgemeine IDs. 6-9 und 12 (StrSub/StrConcat/StrCopy/
+        // PrintFloat/Printf) bleiben bewusst offen und melden weiterhin
+        // Fehler — halb umgesetzt waeren sie schlimmer als gar nicht.
+        } else if id == 3 {
+            self.emitExitFromSlot();
+        } else if id == 13 {
+            self.emitEPrintStr();
+        } else if id == 14 {
+            self.emitEPrintNewline();
+        } else if id == 15 {
+            self.emitStrLen(dest);
         // ABI: kanonische Nummern aus syscalls.md §10.4 "implementiert" (dezimal).
         // Builtins ohne §10.4-Äquivalent behalten ihre Hex-Design-Nummer (Kernel kennt sie nicht).
         } else if id == 20 { self.emitVfsSyscall(2, 4, dest); }  // sys_open §10.4=2
@@ -1756,6 +1767,70 @@ pub type EmitLyxOS = class {
     pub fn getTextLen(): int64   { return self.rodataBase; }
     pub fn getRodataLen(): int64 { return self.globalsBase - self.rodataBase; }
     pub fn getDataLen(): int64   { return self.codeLen - self.globalsBase; }
+
+    // ------------------------------------------------------------------
+    // #1715: allgemeine Builtin-IDs 3, 13, 14, 15.
+    //
+    // Die IDs sind ein globaler Namensraum ueber alle Backends
+    // (src/backend/_builtin_ids.md). Bis hierher kannte dieses Backend nur
+    // 1, 2 und den Syscall-Bereich 20 … 256; alles dazwischen lief in die
+    // Bremse am Ende von emitBuiltinCall. Damit brach jeder stdlib-Import,
+    // denn schon std/alloc.lyx meldet seine Fehler mit EPrintStr (ID 13).
+    //
+    // Die Methoden stehen am ENDE der Klasse, weil neue Eintraege sonst die
+    // VMT verschieben und der Seed bricht — dieselbe Falle wie bei IRLower.
+    // ------------------------------------------------------------------
+
+    // ID 3: Exit(code) — Code steht in Slot 0. emitSysExitGroup nimmt ein
+    // Immediate und passt hier deshalb nicht.
+    fn emitExitFromSlot(): void {
+        self.emitMovRaxImm(60);              // rax = 60 (sys_exit, Linux-kompatibel)
+        self.emitMovRdiFromSlot(0);          // rdi = Exit-Code aus Slot 0
+        self.emitSyscall();
+    }
+
+    // ID 13: write(2, slot0, strlen(slot0)) fuer EPrintStr/EPrintStrLn/EPrint.
+    // Laut _builtin_ids.md rechnet das Backend die Laenge selbst — es gibt
+    // hier also keinen Laengen-Slot, anders als bei ID 1.
+    fn emitEPrintStr(): void {
+        self.emitMovRsiFromSlot(0);                              // rsi = ptr
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);    // XOR rdx, rdx
+        // strlen: bis zum Nullbyte zaehlen (wie im Sentinel-Zweig von emitPrintStr)
+        self.emit8(0x80); self.emit8(0x3C); self.emit8(0x16); self.emit8(0x00);  // loop: CMP byte[rsi+rdx],0
+        self.emit8(0x74); self.emit8(0x05);                      // JE fertig (+5)
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC2);    // INC rdx
+        self.emit8(0xEB); self.emit8(0xF5);                      // JMP loop (-11)
+        // fertig:
+        self.emit8(0xBF); self.emit32(2);                        // mov edi, 2 (stderr)
+        self.emitMovRaxImm(0x0203);
+        self.emitSyscall();
+    }
+
+    // ID 14: einzelner Zeilenumbruch nach stderr. Das Byte liegt auf dem
+    // Stapel — der Codepuffer hat keine Stelle, auf die zur Laufzeit gezeigt
+    // werden koennte, ohne eine Relokation zu erfinden.
+    fn emitEPrintNewline(): void {
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xEC); self.emit8(0x08);  // SUB rsp, 8
+        self.emit8(0xC6); self.emit8(0x04); self.emit8(0x24); self.emit8(10);    // MOV byte [rsp], 10
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xE6);                    // MOV rsi, rsp
+        self.emit8(0xBA); self.emit32(1);                                        // mov edx, 1
+        self.emit8(0xBF); self.emit32(2);                                        // mov edi, 2 (stderr)
+        self.emitMovRaxImm(0x0203);
+        self.emitSyscall();
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC4); self.emit8(0x08);  // ADD rsp, 8
+    }
+
+    // ID 15: StrLen/StrLength — Laenge von Slot 0 nach dest.
+    fn emitStrLen(dest: int64): void {
+        self.emitMovRsiFromSlot(0);                              // rsi = ptr
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xC0);    // XOR rax, rax
+        self.emit8(0x80); self.emit8(0x3C); self.emit8(0x06); self.emit8(0x00);  // loop: CMP byte[rsi+rax],0
+        self.emit8(0x74); self.emit8(0x05);                      // JE fertig (+5)
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC0);    // INC rax
+        self.emit8(0xEB); self.emit8(0xF5);                      // JMP loop (-11)
+        // fertig:
+        self.emitMovSlotFromRax(dest);
+    }
 };
 
 // ---------------------------------------------------------------------------
