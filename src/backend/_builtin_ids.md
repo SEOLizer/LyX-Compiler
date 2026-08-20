@@ -65,24 +65,35 @@ verwandelt jede Lücke in stille Fehlfunktion — dieselbe Klasse wie der
 LyxOS-Builtin-Misdispatch (PR #839) und der verworfene Opcode-Catch-all
 (PR #867).
 
-## Bereich ab 300 — allgemeine IDs, die im Block 1…19 keinen Platz mehr fanden
+## Bereich ab 400 — allgemeine IDs, die im Block 1…19 keinen Platz mehr fanden
 
 | ID | Operation | Lowering von | Anmerkung |
 |---:|---|---|---|
-| 300 | abrunden (`roundsd`, Modus 1) | `fFloor` | #1720; SSE4.1, wie auf dem x86-Weg |
-| 301 | aufrunden (`roundsd`, Modus 2) | `fCeil` | #1720 |
-| 302 | kaufmaennisch runden (`roundsd`, Modus 0) | `fRound` | #1720; zur geraden Zahl |
-| 303 | f64 als Text, Zeiger zurück | `FloatToStr` | #1720; derselbe Formatierer wie ID 9, ohne Ausgabe |
-| 304 | Zeichenketten auf Gleichheit | `StrEq`, `StrEquals` | #1720 |
-| 305 | Anfang einer Zeichenkette prüfen | `StrStartsWith` | #1720 |
-| 306 | Dateigröße oder −1 | `FileSize` | #1720; open + seek(ENDE) + close |
-| 307 | Leerraum vorn/hinten entfernen | `StrTrim` | #1720; ändert an Ort und Stelle, gibt Zeiger zurück |
-| 308 | Teilkette suchen, Index oder −1 | `StrFind` | #1720; leere Nadel → 0 |
-| 309 | Datei ganz lesen, nullterminiert | `FileReadAll` | #1720; 0 bei Fehler |
+| 400 | abrunden (`roundsd`, Modus 1) | `fFloor` | #1720; SSE4.1, wie auf dem x86-Weg |
+| 401 | aufrunden (`roundsd`, Modus 2) | `fCeil` | #1720 |
+| 402 | kaufmaennisch runden (`roundsd`, Modus 0) | `fRound` | #1720; zur geraden Zahl |
+| 403 | f64 als Text, Zeiger zurück | `FloatToStr` | #1720; derselbe Formatierer wie ID 9, ohne Ausgabe |
+| 404 | Zeichenketten auf Gleichheit | `StrEq`, `StrEquals` | #1720 |
+| 405 | Anfang einer Zeichenkette prüfen | `StrStartsWith` | #1720 |
+| 406 | Dateigröße oder −1 | `FileSize` | #1720; open + seek(ENDE) + close |
+| 407 | Leerraum vorn/hinten entfernen | `StrTrim` | #1720; ändert an Ort und Stelle, gibt Zeiger zurück |
+| 408 | Teilkette suchen, Index oder −1 | `StrFind` | #1720; leere Nadel → 0 |
+| 409 | Datei ganz lesen, nullterminiert | `FileReadAll` | #1720; 0 bei Fehler |
 
 Warum oberhalb des Syscall-Bereichs und nicht darin: das sind keine Syscalls,
 sondern Rechenoperationen, die jedes Backend umsetzen kann. Sie im
 lyxos-Block zu vergeben haette den Namensraum belogen.
+
+**Warum 400 und nicht mehr 300.** Diese IDs lagen zuerst auf 300…309. Seit dem
+2026-08-20 belegt LyxOS die *Syscall-Nummern* 300…326 (§10.9/§10.10). Das sind
+zwei getrennte Namensräume — eine Kollision im Wortsinn war es nicht, und nichts
+war dadurch kaputt. Verschoben wurde trotzdem: in `emit_lyxos.emitBuiltinCall`
+stehen Builtin-ID und Syscall-Nummer in derselben Zeile nebeneinander
+(`else if id == 172 { self.emitVfsSyscall(300, …) }`). Zwei gleiche Zahlen mit
+verschiedener Bedeutung nebeneinander sind eine Falle für den nächsten Leser,
+und die Zuordnungstabelle ist genau die Stelle, an der ein Zahlendreher
+unbemerkt bliebe. Der Bereich 300…399 ist damit **den LyxOS-Nummern
+vorbehalten** und wird für allgemeine IDs nicht mehr vergeben.
 
 ## Bereich 20 … 256 — lyxos-Syscalls
 
@@ -105,3 +116,73 @@ Vergeben in `src/ir_lower.lyx` (Abschnitt „VFS syscalls"), ausgewertet in
 `src/backend/lyxos/emit_lyxos.lyx`. Eine LyxOS-Syscall-ID ist an **drei**
 Stellen konsistent zu halten: `sema._regBuiltin`, das Lowering in `ir_lower`
 und `emit_lyxos.emitBuiltinCall`.
+
+## Bereich 172 … 198 — LyxOS-Nummern 300 … 326 (§10.9/§10.10, Stand 2026-08-20)
+
+Auf das Anforderungsdokument `work/lyxos/anforderungen-compiler.md` hin vom
+LyxOS-Team umgesetzt und mit `/bin/systest.elf` bzw. gegen eine echte
+Gegenstelle geprüft — nicht nur übersetzt.
+
+| ID | LyxOS-Nr | Name | Argumente |
+|---:|---:|---|---:|
+| 172 | 300 | `sys_access` | 2 |
+| 173 | 301 | `sys_fcntl` | 3 |
+| 174 | 302 | `sys_dup2` | 2 |
+| 175 | 303 | `sys_dup3` | 3 |
+| 176 | 304 | `sys_ftruncate` | 2 |
+| 177 | 305 | `sys_fsync` | 1 |
+| 178 | 306 | `sys_fdatasync` | 1 |
+| 179 | 307 | `sys_uname` | 1 |
+| 180 | 308 | `sys_getcpu` | 2 |
+| 181 | 309 | `sys_readv` | 3 |
+| 182 | 310 | `sys_writev` | 3 |
+| 183 | 311 | `sys_statfs` | 2 |
+| 184 | 312 | `sys_sched_getaffinity` | 3 |
+| 185 | 313 | `sys_sched_setaffinity` | 3 |
+| 186 | 314 | `sys_getpriority` | 2 |
+| 187 | 315 | `sys_setpriority` | 3 |
+| 188 | 316 | `sys_futex_wait` | 2 |
+| 189 | 317 | `sys_futex_wake` | 2 |
+| 190 | 318 | `sys_futex_requeue` | 3 |
+| 191 | 319 | `sys_kill` | 2 |
+| 192 | 320 | `sys_pipe2` | 2 |
+| 193 | 321 | `sys_udp_open` | 1 |
+| 194 | 322 | `sys_udp_close` | 1 |
+| 195 | 323 | `sys_sendto` | 4 |
+| 196 | 324 | `sys_recvfrom` | 4 |
+| 197 | 325 | `sys_getsockname` | 3 |
+| 198 | 326 | `sys_getpeername` | 2 |
+
+**Keine Formel, sondern Zeile für Zeile.** Andere Blöcke rechnen die Nummer aus
+der ID (`0x0400 + (id - 72)`). Hier nicht: der Bereich hat zwei Quellen
+(§10.9 und die nachgereichte §10.10) und keine Garantie, dass er lückenlos
+bleibt. Eine Formel würde eine künftige Lücke stillschweigend überbrücken und
+auf einen fremden Handler zeigen.
+
+**Die Nummern sind nicht die von Linux.** Nur 0–3, 8, 9 und 24 stimmen zufällig
+überein. Laut LyxOS-Team hätten **19 der 21** angefragten Aufrufe unter
+Linux-Nummerierung einen bestehenden fremden Handler getroffen — Linux 158
+(`arch_prctl`) etwa das dortige `sys_iofs_write_lpid`, das eine 4-KB-Seite ins
+Dateisystem schreibt. Das ist #795 in schlimmer: dort war das Ergebnis falsches
+Verhalten, hier wären es überschriebene Dateien.
+
+### Abweichungen vom POSIX-Verhalten — hier, nicht nur im Kommentar
+
+Wer eine dieser Funktionen benutzt, liest diese Tabelle, nicht den Kernel-Quelltext:
+
+| Name | Weicht ab |
+|---|---|
+| `sys_dup2` | Der Dateizeiger wird **nicht geteilt** (Slot-Kopie). Zwei fds auf dieselbe Datei laufen unabhängig. |
+| `sys_ftruncate` | **Nur Länge 0.** Jede andere Länge meldet −1, statt still etwas anderes zu tun. |
+| `sys_statfs` | Freie Blöcke sind **−1 = unbekannt**, nicht 0. Wer 0 als „voll" liest, irrt. |
+| `sys_getpriority`/`sys_setpriority` | **LyxOS-Skala 0…255** (0 = HARD_RT, 128 = NORMAL, 255 = IDLE), bewusst nicht auf nice −20…19 abgebildet. |
+| `sys_kill` | **Kein Signalmodell.** `sig=0` prüft Existenz, sonst wird der Thread als DEAD markiert. Sich selbst zu töten wird abgelehnt. |
+| `sys_pipe2` | **Blockiert nie** — leer liefert 0, voll nimmt 0 an. Ein 4096-Byte-Ring. |
+| `sys_sendto`/`sys_recvfrom` | **Ein Socket zur Zeit.** Der Aufruf pollt die Karte selbst und verwirft Fremdpakete; währenddessen gehen Pakete für andere Ports verloren. Adressformat `{ip, port}`, kein `sockaddr_in`. Bei `recvfrom` steht bei +16 das Zeitlimit in ms als **Eingabe**. |
+| `sys_access` | `mode` wird ignoriert — FAT32 kennt keine Rechte. |
+| `sys_fcntl` | `O_NONBLOCK` wird gespeichert, aber noch nicht ausgewertet. |
+| `sys_fsync`/`sys_fdatasync` | Erfolg ist hier die Wahrheit, keine Notlüge: FAT32 schreibt write-through. |
+
+Dass das LyxOS-Team diese Punkte benennt statt sie zu verschweigen, ist der
+Grund, warum sie hier stehen können. Eine Abweichung, die nur im Kernel steht,
+ist beim Aufrufer ein Fehler ohne Absender.
