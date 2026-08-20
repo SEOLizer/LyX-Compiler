@@ -102,8 +102,18 @@ if [ -f "$MAN_PKG" ]; then
   if gzip -t "$MAN_PKG" 2>/dev/null; then ok "gepackte Seite ist gueltiges gzip"
   else no "gepackte Seite ist gueltiges gzip" "gzip -t schlaegt fehl"; fi
 
-  m="$(stat -c '%a' "$MAN_PKG")"
-  if [ "$m" = "644" ]; then ok "Modus 644"; else no "Modus 644" "ist $m"; fi
+  # Der Modus der Datei IM REPOSITORY sagt nichts: git speichert nur das
+  # Ausfuehrbar-Bit und legt beim Auschecken `0666 & ~umask` an — bei
+  # `umask 002` also 664. Dieser Test war deshalb auf jedem Rechner mit dieser
+  # Voreinstellung rot, ohne dass irgendetwas kaputt war.
+  #
+  # Zaehlbar ist, was im PAKET landet: dort braucht die Seite 644, und dafuer
+  # sorgt tools/make_deb.sh. Genau das wird hier geprueft.
+  if grep -qE 'chmod 644 "\$MAN_DST/lyxc\.1\.gz"' "$ROOT/tools/make_deb.sh"; then
+    ok "Paketbau setzt Modus 644"
+  else
+    no "Paketbau setzt Modus 644" "chmod fehlt in tools/make_deb.sh — die Seite landet mit der umask des Bauenden im .deb"
+  fi
 
   if zcat "$MAN_PKG" | diff -q - "$MAN_SRC" >/dev/null; then
     ok "Paketkopie ist inhaltsgleich mit man/lyxc.1"
