@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.4D
+VERSION   := 1.1.4E
 VERSION_DATE := 2026-08-20
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -252,6 +252,7 @@ test: lyxc
 	@bash tests/lyxos_runde_test.sh
 	@bash tests/lyxos_builtin_ids_test.sh
 	@bash tests/builtin_drift_test.sh
+	@bash tests/gleitkomma_builtins_test.sh
 	@bash tests/ci_ziele_test.sh
 	@bash tests/schreibfehler_test.sh
 	@bash tests/svg_ausgabe_test.sh
@@ -670,7 +671,8 @@ test: lyxc
 	@echo "--- TextMate-Grammatik: Schluesselwoerter und Typen vollstaendig ---"
 	@bash tests/syntax/test_grammar.sh
 	@echo "OK"
-	@echo "--- Generics: Typparameter (8 Pruefungen) ---"
+	@echo "--- Generics: Typparameter (15 Pruefungen) ---"
+	@bash tests/generics_typeparam_test.sh
 	@echo "OK"
 	@echo "--- Aufruf ueber indizierten Ausdruck wird abgewiesen (6 Pruefungen) ---"
 	@bash tests/indexed_call_reject_test.sh
