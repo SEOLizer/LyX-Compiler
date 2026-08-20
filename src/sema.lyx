@@ -362,6 +362,13 @@ pub type Sema = class {
   fnSigCount: int64;
   fnSigCap:   int64;
   symCount: int64;
+  // #1701: Besuchsliste fuer die transitive @flight_crit-Pruefung. Ohne sie
+  // laeuft eine gegenseitige Rekursion (A ruft B, B ruft A) endlos.
+  fcSeen:      int64;
+  fcSeenCount: int64;
+  fcTiefe:     int64;
+  fcBody:      int64;
+
   symCap:   int64;
 
   // Scope stack (each entry = int64 = symCount at scope start)
@@ -5344,13 +5351,126 @@ pub type Sema = class {
     if (self._strNEq(name, nlen, "realloc"c, 7)) { return 1; }
     if (self._strNEq(name, nlen, "malloc"c, 6)) { return 1; }
     if (self._strNEq(name, nlen, "mmap"c, 4)) { return 1; }
+    // #1701: Auch Zeichenketten-Builtins fordern Speicher an — sie geben einen
+    // frisch belegten Puffer zurueck. Bis 1.1.3N standen sie nicht hier, und
+    // `IntToStr(x)` im Regelzyklus ging unbeanstandet durch, obwohl es genau
+    // das tut, was das Attribut verhindern soll.
+    if (self._strNEq(name, nlen, "IntToStr"c, 8)) { return 1; }
+    if (self._strNEq(name, nlen, "StrFromInt"c, 10)) { return 1; }
+    if (self._strNEq(name, nlen, "FloatToStr"c, 10)) { return 1; }
+    if (self._strNEq(name, nlen, "StrConcat"c, 9)) { return 1; }
+    if (self._strNEq(name, nlen, "StrNew"c, 6)) { return 1; }
+    if (self._strNEq(name, nlen, "StrCopy"c, 7)) { return 1; }
+    if (self._strNEq(name, nlen, "StrSub"c, 6)) { return 1; }
+    if (self._strNEq(name, nlen, "StrTrim"c, 7)) { return 1; }
     return 0;
   }
 
-  // Laeuft ueber den Rumpf und meldet jede Speicheranforderung. Geht bewusst
-  // NUR ueber die Knoten dieser Funktion — ein Aufruf einer anderen Funktion,
-  // die selbst allokiert, ist von hier aus nicht zu sehen und bleibt
-  // unbeanstandet; das waere eine Analyse ueber Aufrufgrenzen hinweg.
+  // #1701: Der Aufrufgraph unter einer @flight_crit-Funktion muss dieselben
+  // Regeln erfuellen. Bis 1.1.3N sah die Pruefung NUR den eigenen Rumpf —
+  // eine Allokation eine Aufrufebene tiefer ist dieselbe Allokation, sie wird
+  // nur nicht mehr gesehen. Und das ist der haeufigere Fall: kaum jemand
+  // schreibt `alloc` direkt in die Regelschleife, aber fast jeder ruft dort
+  // einen Helfer.
+  //
+  // Die Grenze war in #1529 bewusst gesetzt und stand so im Quelltext; sie
+  // faellt hier absichtlich. Eine Zusicherung, die man ohne Absicht umgeht,
+  // ist schlechter als keine.
+  //
+  // Drei Faelle:
+  //   - Ziel steht in DIESER Unit  -> Rumpf mitpruefen (rekursiv, mit Schutz
+  //     gegen Zyklen ueber die Besuchsliste).
+  //   - Ziel ist ein Builtin       -> nur die Heap-Liste zaehlt; peek/poke und
+  //     Rechnen sind unbedenklich.
+  //   - Ziel ist importiert        -> von hier aus nicht nachweisbar. Gemeldet
+  //     mit dem Ausweg: das Ziel selbst mit @flight_crit auszeichnen.
+  // #1701: Traegt der Rumpf eine lokale Bindung dieses Namens? Gebraucht, um
+  // einen Sprung ueber einen Funktionszeiger von einem blossen Tippfehler zu
+  // unterscheiden — Locals stehen in diesem Durchlauf nicht mehr in der
+  // Symboltabelle.
+  fn _fcIstLokalerName(ni: int64, nm: pchar, nl: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (self.sn_kind(ni) == SNK_VAR_DECL || self.sn_kind(ni) == SNK_PARAM) {
+      if (self.sn_sLen(ni) == nl && self._strNEq(self.sn_sVal(ni), self.sn_sLen(ni), nm, nl)) {
+        return 1;
+      }
+    }
+    if (self._fcIstLokalerNameKette(self.sn_c0(ni), nm, nl) != 0) { return 1; }
+    if (self._fcIstLokalerNameKette(self.sn_c1(ni), nm, nl) != 0) { return 1; }
+    if (self._fcIstLokalerNameKette(self.sn_c2(ni), nm, nl) != 0) { return 1; }
+    if (self._fcIstLokalerNameKette(self.sn_c3(ni), nm, nl) != 0) { return 1; }
+    return 0;
+  }
+
+  fn _fcIstLokalerNameKette(ni: int64, nm: pchar, nl: int64): int64 {
+    var g: int64 := ni;
+    while (g >= 0) {
+      if (self._fcIstLokalerName(g, nm, nl) != 0) { return 1; }
+      g := self.sn_next(g);
+    }
+    return 0;
+  }
+
+  fn _fcBesucht(ni: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.fcSeenCount) {
+      if (peek64(self.fcSeen + i * 8) == ni) { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  fn _fcMerke(ni: int64) {
+    if (self.fcSeenCount >= 512) { return; }
+    poke64(self.fcSeen + self.fcSeenCount * 8, ni);
+    self.fcSeenCount := self.fcSeenCount + 1;
+  }
+
+  // Ein Aufruf aus einer @flight_crit-Funktion heraus.
+  fn _pruefeFlightCritZiel(rufNi: int64, nm: pchar, nl: int64) {
+    if (nl <= 0) { return; }
+    if (self._istHeapRuf(nm, nl) != 0) { return; }   // schon gemeldet
+    var sym: int64 := self.Lookup(nm, nl);
+    if (sym < 0) {
+      // Der Name steht nicht in der Symboltabelle. Zwei Moeglichkeiten: eine
+      // LOKALE Variable dieser Funktion (Locals sind in diesem Durchlauf nicht
+      // mehr sichtbar) — dann ist es ein Sprung ueber einen Funktionszeiger —
+      // oder ein Tippfehler, den sema an anderer Stelle meldet. Nur im ersten
+      // Fall gehoert hier eine Meldung hin; sonst stuende sie doppelt.
+      if (self._fcIstLokalerName(self.fcBody, nm, nl) != 0) {
+        self._errorNodeName("indirekter Aufruf unter @flight_crit nicht erlaubt — das Sprungziel steht erst zur Laufzeit fest und laesst sich nicht nachweisen"c,
+                            rufNi, nm, nl);
+      }
+      return;
+    }
+    var sk: int64 := self.SymKind(sym);
+    if (sk == SYM_BUILTIN) { return; }                // unbedenklich, siehe oben
+    // Der Name gehoert zu einer VARIABLEN, nicht zu einer Funktion: der Aufruf
+    // geht ueber einen Funktionszeiger. Das Sprungziel steht zur
+    // Uebersetzungszeit nicht fest, die Laufzeit also auch nicht.
+    if (sk == SYM_VAR || sk == SYM_PARAM) {
+      self._errorNodeName("indirekter Aufruf unter @flight_crit nicht erlaubt — das Sprungziel steht erst zur Laufzeit fest und laesst sich nicht nachweisen"c,
+                          rufNi, nm, nl);
+      return;
+    }
+    if (sk != SYM_FUNC) { return; }
+    var declNi: int64 := self.SymNodeIdx(sym);
+    if (declNi >= 0) {
+      if (self._fcBesucht(declNi) != 0) { return; }   // Zyklus
+      self._fcMerke(declNi);
+      // #1701: Die Meldung soll sagen, dass sie ueber eine Aufrufkette kommt —
+      // sonst steht sie an einer Funktion, die selbst gar kein @flight_crit
+      // traegt, und der Leser sucht dort vergeblich nach dem Attribut.
+      self.fcTiefe := self.fcTiefe + 1;
+      self._pruefeFlightCrit(self.sn_c2(declNi));     // c2 = Rumpf
+      self.fcTiefe := self.fcTiefe - 1;
+      return;
+    }
+    // declNi < 0: importiert oder vorkompiliert — der Rumpf liegt nicht vor.
+    self._errorNodeName("Aufruf unter @flight_crit ist nicht nachweisbar: die gerufene Funktion liegt in einer anderen Unit. Zeichne sie selbst mit @flight_crit aus, dann gilt die Zusage auch dort"c,
+                        rufNi, nm, nl);
+  }
+
   fn _pruefeFlightCrit(ni: int64) {
     if (ni < 0) { return; }
     var k: int64 := self.sn_kind(ni);
@@ -5363,12 +5483,35 @@ pub type Sema = class {
       var callee: int64 := self.sn_c0(ni);
       if (callee >= 0 && self.sn_kind(callee) == SNK_IDENT
           && self._istHeapRuf(self.sn_sVal(callee), self.sn_sLen(callee)) != 0) {
+        if (self.fcTiefe > 0) {
+          self._errorNodeName("Speicheranforderung in einer Funktion, die aus einer @flight_crit-Funktion gerufen wird"c, ni,
+                              self.sn_sVal(callee), self.sn_sLen(callee));
+        } else {
         self._errorNodeName("Speicheranforderung unter @flight_crit nicht erlaubt"c, ni,
                             self.sn_sVal(callee), self.sn_sLen(callee));
+        }
       }
       if (self.sn_sLen(ni) > 0 && self._istHeapRuf(self.sn_sVal(ni), self.sn_sLen(ni)) != 0) {
+        if (self.fcTiefe > 0) {
+          self._errorNodeName("Speicheranforderung in einer Funktion, die aus einer @flight_crit-Funktion gerufen wird"c, ni,
+                              self.sn_sVal(ni), self.sn_sLen(ni));
+        } else {
         self._errorNodeName("Speicheranforderung unter @flight_crit nicht erlaubt"c, ni,
                             self.sn_sVal(ni), self.sn_sLen(ni));
+        }
+      }
+      // #1701: dem Aufruf FOLGEN.
+      //
+      // Der Name des Ziels steht am AUFRUFKNOTEN selbst. c0 ist NICHT
+      // zuverlaessig das Ziel — bei `poke64(p, s)` haengt dort das erste
+      // ARGUMENT. Die Pruefungen darueber kommen damit durch, weil sie nur
+      // Namen gegen eine feste Liste halten; wer c0 als Ziel AUFLOEST, meldet
+      // dagegen das Argument. Genau das ist beim ersten Anlauf passiert:
+      // `poke64(p, s)` wurde als indirekter Aufruf von `p` beanstandet.
+      if (self.sn_sLen(ni) > 0) {
+        self._pruefeFlightCritZiel(ni, self.sn_sVal(ni), self.sn_sLen(ni));
+      } else if (callee >= 0 && self.sn_kind(callee) == SNK_IDENT) {
+        self._pruefeFlightCritZiel(ni, self.sn_sVal(callee), self.sn_sLen(callee));
       }
     }
 
@@ -5519,7 +5662,16 @@ pub type Sema = class {
       // WP-13: Analyze body for nested function captures
       self._analyzeCaptures(body, funcName, funcNameLen);
       // #1529: Heap-Verbot durchsetzen, bevor der Rumpf geprueft wird.
-      if ((self.sn_iVal(ni) & 2048) != 0) { self._pruefeFlightCritKette(body); }
+      if ((self.sn_iVal(ni) & 2048) != 0) {
+        // #1701: Zustand je gepruefter Funktion zuruecksetzen — sonst wuerde
+        // ein Helfer nur beim ERSTEN Aufrufer geprueft, und die Tiefe
+        // (fuer den Meldungstext) liefe ueber.
+        self.fcSeenCount := 0;
+        self.fcTiefe     := 0;
+        self.fcBody      := body;
+        self._fcMerke(ni);
+        self._pruefeFlightCritKette(body);
+      }
       self._checkStmt(body);
       // WP-AS-15: DAA — check after body so locals are known
       if (self.daaEnabled != 0) { self._daaBlock(body, 0); }
@@ -7349,6 +7501,10 @@ pub type Sema = class {
     poke64(self.syms, self.symCap);  // Array header: cap
     poke64(self.syms + 8, 0);        // Array header: len
     self.symCount := 0;
+    self.fcSeen      := alloc(512 * 8);   // #1701
+    self.fcSeenCount := 0;
+    self.fcTiefe     := 0;
+    self.fcBody      := 0 - 1;
 
     // #1295: Dimensionstabelle fuer utype-Symbole (auch importierte).
     self.utDimCap   := 16;

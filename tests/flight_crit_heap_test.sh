@@ -172,10 +172,24 @@ fn F(): int64 {
 }
 fn main(): int64 { PrintLn(IntToStr(F())); return 0; }' "5"
 
-# Eine andere Funktion darf weiterhin allokieren, auch wenn sie von einer
-# @flight_crit-Funktion gerufen wird: die Pruefung sieht nur diesen Rumpf.
-# Das ist eine bewusste Grenze und steht so im Quelltext.
-laeuft "#1529: Aufruf einer fremden Funktion bleibt unbeanstandet" 'import std.io;
+# #1701: DIESER FALL HAT SICH UMGEKEHRT.
+#
+# Bis 1.1.3P galt: eine gerufene Funktion darf allokieren, die Pruefung sieht
+# nur den eigenen Rumpf. Das war eine bewusste Grenze aus #1529 und stand so
+# im Quelltext — dieser Test hat sie festgehalten.
+#
+# Sie faellt jetzt, und zwar mit Absicht. Die Zusage von @flight_crit lautet,
+# dass im Regelzyklus nichts passiert, dessen Laufzeit sich nicht nachweisen
+# laesst. Eine Allokation eine Aufrufebene tiefer ist dieselbe Allokation — sie
+# wird nur nicht mehr gesehen. Und das ist der HAEUFIGERE Fall: kaum jemand
+# schreibt `alloc` direkt in die Regelschleife, aber fast jeder ruft dort einen
+# Helfer. Eine Zusicherung, die man ohne Absicht umgeht, ist schlechter als
+# keine.
+#
+# Vor der Verschaerfung geprueft: ausserhalb von sema/parser nutzt kein
+# Produktivcode @flight_crit; der Bestand stuetzt sich also nicht auf das alte
+# Verhalten.
+meldet "#1701: Allokation in einer gerufenen Funktion wird gemeldet" 'import std.io;
 import std.alloc;
 fn Hilf(): int64 {
   var p: int64 := alloc(8);
@@ -184,7 +198,7 @@ fn Hilf(): int64 {
 }
 @flight_crit
 fn Regel(): int64 { return Hilf(); }
-fn main(): int64 { PrintLn(IntToStr(Regel())); return 0; }' "9"
+fn main(): int64 { PrintLn(IntToStr(Regel())); return 0; }' "Speicheranforderung in einer Funktion, die aus einer @flight_crit-Funktion gerufen wird"
 
 echo "--- $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
