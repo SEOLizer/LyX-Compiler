@@ -332,6 +332,16 @@ pub type Sema = class {
   // blob: Folge von {namePtr, nameLen} je 16 Byte, Namen KOPIERT (die fremde
   // Arena ist danach fort).
   fldTab:     int64;
+  // #1710: dasselbe fuer METHODEN importierter Typen. Ohne diese Tabelle
+  // konnte die override-Pruefung ueber die Unit-Grenze nichts sagen: der
+  // Deklarationsknoten der Basisklasse ist dann fort (SymNodeIdx == -2), und
+  // der ganze Zweig entfiel. Eine Ableitung, die eine virtuelle Methode ohne
+  // `override` gleich benennt, uebersetzte damit schweigend — und rief zur
+  // Laufzeit die BASISFASSUNG. Eintrag: Name (ptr,len) + Blob + Anzahl,
+  // Blobeintrag: Name (ptr,len) + virtuell-Kennung, je 24 Byte.
+  mthTab:     int64;
+  mthCount:   int64;
+  mthCap:     int64;
   fldCount:   int64;
   fldCap:     int64;
   // #1264: Signatur je FUNKTIONSsymbol. Die Stelligkeits- und Typpruefung am
@@ -2076,6 +2086,7 @@ pub type Sema = class {
           // Frage "Klasse mit Methoden?" von aussen nicht mehr zu beantworten.
           self._klsRecord(self.SymName(si), self.SymNameLen(si), importNi);
           self._fldRecord(self.SymName(si), self.SymNameLen(si), importNi);   // #1573
+          self._mthRecord(self.SymName(si), self.SymNameLen(si), importNi);   // #1710
           self.SetSymNodeIdx(si, -2);
         }
       }
@@ -2604,6 +2615,114 @@ pub type Sema = class {
     poke64(base + 16, blob);
     poke64(base + 24, w);
     self.fldCount := self.fldCount + 1;
+  }
+
+  // #1710: Methoden eines importierten Typs abschreiben, solange sein Knoten
+  // noch gilt — danach ist die Frage "ist das da oben virtuell?" von aussen
+  // nicht mehr zu beantworten. Aufgebaut wie _fldRecord, einschliesslich der
+  // Regel fuer Unvollstaendigkeit: laesst sich die Kette nicht ganz aufloesen,
+  // wird der Typ mit Anzahl -1 vermerkt und die Pruefung schweigt fuer ihn.
+  // Etwas anderes waere schlimmer als die Luecke — eine Meldung, die auf
+  // fehlendem Wissen beruht, kostet den Leser mehr Zeit als keine.
+  fn _mthRecord(nm: pchar, nmLen: int64, declNi: int64) {
+    if (declNi < 0 || nmLen <= 0) { return; }
+    if (self.sn_kind(declNi) != SNK_TYPE_DECL) { return; }
+    var iv: int64 := self.sn_iVal(declNi);
+    if ((iv & 2) != 0) { return; }    // reiner Typalias
+    var anz: int64 := self._mthZaehle(declNi);
+    if (anz == 0) { return; }
+    if (self.mthCount >= self.mthCap) {
+      var nc: int64 := self.mthCap * 2;
+      if (nc < 16) { nc := 16; }
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.mthTab, self.mthCount * 32);
+      self.mthTab := nb;
+      self.mthCap := nc;
+    }
+    var base: int64 := self.mthTab + self.mthCount * 32;
+    poke64(base,     self._fldKopie(nm, nmLen));
+    poke64(base + 8, nmLen);
+    if (anz < 0) {
+      poke64(base + 16, 0);
+      poke64(base + 24, 0 - 1);
+      self.mthCount := self.mthCount + 1;
+      return;
+    }
+    var blob: int64 := alloc(anz * 24);
+    var w: int64 := 0;
+    var cur: int64 := declNi;
+    var depth: int64 := 0;
+    while (cur >= 0 && depth <= 16 && w < anz) {
+      var m: int64 := self.sn_c1(cur);
+      while (m >= 0 && w < anz) {
+        if (self.sn_kind(m) == SNK_FUNC_DECL) {
+          poke64(blob + w * 24,      self._fldKopie(self.sn_sVal(m), self.sn_sLen(m)));
+          poke64(blob + w * 24 + 8,  self.sn_sLen(m));
+          // Bit 1 heisst "bekommt einen VMT-Platz" (vgl. die Zaehlung der
+          // VMT-Slots) — also virtuell oder abstrakt. Genau das ist die
+          // Eigenschaft, um die es bei `override` geht.
+          poke64(blob + w * 24 + 16, (self.sn_iVal(m) >> 1) & 1);
+          w := w + 1;
+        }
+        m := self.sn_next(m);
+      }
+      var parentNi: int64 := self.sn_c2(cur);
+      if (parentNi < 0) { cur := 0 - 1; }
+      else {
+        var pSym: int64 := self.Lookup(self.sn_sVal(parentNi), self.sn_sLen(parentNi));
+        if (pSym < 0) { cur := 0 - 1; } else { cur := self.SymNodeIdx(pSym); }
+      }
+      depth := depth + 1;
+    }
+    poke64(base + 16, blob);
+    poke64(base + 24, w);
+    self.mthCount := self.mthCount + 1;
+  }
+
+  fn _mthZaehle(startNi: int64): int64 {
+    var declNi: int64 := startNi;
+    var n: int64 := 0;
+    var depth: int64 := 0;
+    while (declNi >= 0) {
+      if (depth > 16) { return 0 - 1; }
+      var m: int64 := self.sn_c1(declNi);
+      while (m >= 0) {
+        if (self.sn_kind(m) == SNK_FUNC_DECL) { n := n + 1; }
+        m := self.sn_next(m);
+      }
+      var parentNi: int64 := self.sn_c2(declNi);
+      if (parentNi < 0) { return n; }
+      var pSym: int64 := self.Lookup(self.sn_sVal(parentNi), self.sn_sLen(parentNi));
+      if (pSym < 0) { return 0 - 1; }
+      declNi := self.SymNodeIdx(pSym);
+      if (declNi < 0) { return 0 - 1; }
+      depth := depth + 1;
+    }
+    return n;
+  }
+
+  // 1 = der importierte Typ hat eine VIRTUELLE Methode dieses Namens.
+  // 0 = er hat sie nicht (oder nicht virtuell). -1 = unbekannt, nichts sagen.
+  fn _mthIstVirtuell(nm: pchar, nmLen: int64, mName: pchar, mLen: int64): int64 {
+    var i: int64 := self.mthCount - 1;
+    while (i >= 0) {
+      var b: int64 := self.mthTab + i * 32;
+      if (self._strNEq(peek64(b) as pchar, peek64(b + 8), nm, nmLen)) {
+        var anz: int64 := peek64(b + 24);
+        if (anz <= 0) { return 0 - 1; }        // unvollstaendig: nichts behaupten
+        var blob: int64 := peek64(b + 16);
+        var k: int64 := 0;
+        while (k < anz) {
+          if (self._strNEq(peek64(blob + k * 24) as pchar, peek64(blob + k * 24 + 8), mName, mLen)) {
+            return peek64(blob + k * 24 + 16);
+          }
+          k := k + 1;
+        }
+        return 0;
+      }
+      i := i - 1;
+    }
+    return 0 - 1;
   }
 
   // Index in fldTab zu einem Typnamen, oder -1.
@@ -6427,6 +6546,26 @@ pub type Sema = class {
             var isOverride: int64 := (flags >> 2) & 1;
             if (isOverride == 0 && parentSym >= 0) {
               var pNi: int64 := self.SymNodeIdx(parentSym);
+              // #1710: Steht die Basisklasse in einer IMPORTIERTEN Unit, ist
+              // ihr Knoten fort (SymNodeIdx == -2) und der Zweig unten entfiel
+              // ersatzlos. Die Pruefung fehlte damit genau dort, wo man sie
+              // braucht: eine Basisklasse bekommt eine neue virtuelle Methode,
+              // die Ableitungen in anderen Units haben eine gleichnamige ohne
+              // `override` — und hoeren still auf zu wirken. In der Vega VCL
+              // war TImage.AutoSize auf diesem Weg wochenlang wirkungslos.
+              //
+              // Die Antwort steht seit dem Import in mthTab. Sie kann drei
+              // Dinge sagen: virtuell (melden), nicht virtuell (schweigen) und
+              // UNBEKANNT — dann wird weiter geschwiegen, so wie es die Regel
+              // fuer importierte Typen verlangt.
+              if (pNi < 0 && parentName != 0 as pchar && parentLen > 0) {
+                var mNameI: pchar := self.sn_sVal(mth);
+                var mLenI:  int64 := self.sn_sLen(mth);
+                if (self._mthIstVirtuell(parentName, parentLen, mNameI, mLenI) == 1) {
+                  self._errorNodeName("ueberschreibt eine virtuelle Methode der importierten Basisklasse, braucht dafuer aber 'override' — sonst laeuft zur Laufzeit die Basisfassung"c,
+                                      mth, mNameI, mLenI);
+                }
+              }
               if (pNi >= 0) {
                 var mName: pchar := self.sn_sVal(mth);
                 var mLen:  int64 := self.sn_sLen(mth);
@@ -7219,6 +7358,9 @@ pub type Sema = class {
     self.fldCount   := 0;
     self.fldCap     := 16;
     self.fldTab     := alloc(self.fldCap * 32);
+    self.mthCap     := 16;                      // #1710
+    self.mthTab     := alloc(self.mthCap * 32);
+    self.mthCount   := 0;
     self.klsCount   := 0;
     self.utDimCount := 0;
 
