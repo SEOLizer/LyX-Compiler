@@ -19,10 +19,10 @@ P=0; F=0
 ok()  { echo "PASS: $1"; P=$((P+1)); }
 bad() { echo "FAIL: $1${2:+ — $2}"; F=$((F+1)); }
 
-BAUT="std.fs std.alloc"
+BAUT="std.fs std.io std.alloc std.string std.env std.time"
 # Unit:blockierender Name — der Name gehoert dazu, sonst sagt der Eintrag
 # nicht, worauf man wartet.
-BLOCKIERT="std.io:Builtin-ID_9 std.string:Builtin-ID_6 std.math:Random std.conv:Random std.time:sys_clock_nanosleep"
+BLOCKIERT="std.math:Random std.conv:Random"
 
 pruefe() {   # pruefe <unit> ; setzt $rc und $msg
   printf 'import %s;\nfn main(): int64 { return 0; }\n' "$1" > "$TMP/t.lyx"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# #1723 — die IR-Strecke muss Importe dort finden, wo der Hauptaufloeser sie
+# #1724 — die IR-Strecke muss Importe dort finden, wo der Hauptaufloeser sie
 # findet.
 #
 # `_irLeseImport` kannte nur drei Stufen: Arbeitsverzeichnis, -I und

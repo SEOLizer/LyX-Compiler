@@ -36,8 +36,11 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 | 14 | Zeilenumbruch nach stderr | `EPrintStrLn`, `EPrintLn`, `panic` | #1388 |
 | 15 | Länge einer Zeichenkette | `StrLen`, `StrLength` | #1388 |
 | 16 | Ganzzahl als Dezimaltext, Zeiger zurück | `IntToStr`, `StrFromInt` | #1720; der Puffer stammt aus mmap, nicht vom Stapel — er muss den Aufruf überleben |
+| 17 | Anzahl der Programmargumente | `GetArgC` | #1720; auf lyxos 0 — `_start` liest keinen argv |
+| 18 | Zeiger auf den Argumentvektor | `GetArgV`, `GetArg` | #1720; `GetArg(i)` ist ID 18 plus ein Lesezugriff, keine eigene ID |
+| 19 | Zeiger auf den Umgebungsblock | `GetEnvBlock` | #1720; auf lyxos und Linux 0 — nur die win64-Laufzeit setzt ihn (#1677) |
 
-Frei: 4, 5, 17–19.
+Frei: 4, 5. **Der Bereich ist damit fast ausgeschöpft** — wer eine weitere allgemeine ID braucht, erweitert den Bereich, statt eine bestehende doppelt zu belegen.
 
 ## Backend-Abdeckung der allgemeinen IDs
 
@@ -49,7 +52,7 @@ Frei: 4, 5, 17–19.
 | RISC-V Linux | 1, 2, 3, **13, 15, 200–205, 208, 209** | Rest meldet Fehler (#1388) |
 | ARM Cortex-M | **200–205, 208, 209**; 1, 2, 3, 9, 12, 13, 14 als ausdrücklicher No-op bzw. BKPT | alles Übrige meldet Fehler |
 | Xtensa | 1, 2 | Rest meldet Fehler (#1388, Kodierungen fehlen — vgl. #1281) |
-| lyxos (LBF) | 1, 2, **3**, **13, 14, 15, 16** + 20 … 256 | 6–12 — meldet Fehler (#1715) |
+| lyxos (LBF) | 1, 2, **3**, **6**, **9**, **13, 14, 15, 16, 17, 18, 19** + 20 … 256 | 7, 8, 10–12 — melden Fehler (#1715) |
 
 **Speicherzugriffe (200–205, 208, 209)** sind seit #1388 auf ARM64, RISC-V und
 Cortex-M umgesetzt. Sie brauchen kein Betriebssystem und gelten deshalb auch
@@ -61,6 +64,21 @@ LyxOS-Builtin-Misdispatch (PR #839) und der verworfene Opcode-Catch-all
 (PR #867).
 
 ## Bereich 20 … 256 — lyxos-Syscalls
+
+`237` ist `sys_clock_nanosleep` (#1720): eigene Nummer statt Alias auf
+`nanosleep` (233), weil der timespec dort am dritten Argument steht und
+`TIMER_ABSTIME` einen Zeitpunkt meint, keine Dauer — die Flagge zu ignorieren
+hiesse, den absoluten Zeitstempel als Dauer zu verschlafen.
+
+`238` ist `sys_gettimeofday` (#1720): das Ziel liefert die Zeit als
+Nanosekunden aus `sys_time_ns` (117), nicht als gefuelltes `timeval` — die
+Umrechnung in Sekunden und Mikrosekunden macht das Backend.
+
+`239` meldet **-ENOSYS** (#1720) und wird von `sys_timerfd_create`,
+`sys_timerfd_settime` und `sys_timerfd_gettime` geteilt. LyxOS hat ein anderes
+Timer-Modell als Linux; eine Abbildung waere eine Behauptung ueber die
+Wartesemantik, und fuer `gettime` gibt es gar keine Entsprechung. Eine ehrliche
+Fehlermeldung ist besser als eine plausible Fehluebersetzung.
 
 Vergeben in `src/ir_lower.lyx` (Abschnitt „VFS syscalls"), ausgewertet in
 `src/backend/lyxos/emit_lyxos.lyx`. Eine LyxOS-Syscall-ID ist an **drei**
