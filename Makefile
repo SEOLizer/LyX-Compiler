@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.4I
+VERSION   := 1.1.4J
 VERSION_DATE := 2026-08-20
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -73,7 +73,20 @@ ULIMIT_VM := ulimit -v $$(( 8 * 1024 * 1024 )) &&
 build: lic_build_flags lic_secret
 	$(ULIMIT_VM) $(SEED) $(SRC) -o lyxc
 
-# Selbstkompilierung: lyxc kompiliert sich selbst (erfordert vorhandenes lyxc)
+# #1726: `bootstrap` haengt von `lyxc` ab, aber es gab keine Regel dieses
+# Namens — das Ziel war schlicht die gebaute Binary im Wurzelverzeichnis, und
+# die ist git-ignoriert. In einem frischen Checkout oder Worktree endete
+# `make bootstrap` deshalb mit "Keine Regel vorhanden, um das Ziel 'lyxc' zu
+# erstellen", obwohl der Seed versioniert danebenliegt und genau dafuer da ist.
+#
+# Die Regel hat BEWUSST keine Voraussetzungen: so laeuft sie nur, wenn die
+# Datei fehlt. Mit `lyxc: $(SEED)` wuerde make sie jedes Mal ueberschreiben,
+# sobald der Seed neuer ist — also direkt nach jedem Verankern, und der
+# gerade gebaute Compiler waere weg.
+lyxc:
+	@test -f $@ || { echo "  [kein ./lyxc — Seed $(SEED) wird uebernommen]"; cp $(SEED) $@; chmod +x $@; }
+
+# Selbstkompilierung: lyxc kompiliert sich selbst (nimmt den Seed, wenn keins da ist)
 bootstrap: lyxc lic_build_flags lic_secret
 	$(ULIMIT_VM) ./lyxc $(SRC) -o lyxc.new
 	mv lyxc.new lyxc
@@ -343,6 +356,7 @@ test: lyxc
 	@echo "OK"
 	@echo "--- Testabdeckung: jede Datei einem Ziel zugeordnet ---"
 	@bash tests/test_coverage_test.sh
+	@bash tests/frischer_checkout_test.sh
 	@bash tests/lyxc_umgebung_test.sh
 	@bash tests/struct_param_ref_test.sh
 	@bash tests/pruefziffern_test.sh

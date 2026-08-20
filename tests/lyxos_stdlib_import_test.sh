@@ -19,10 +19,10 @@ P=0; F=0
 ok()  { echo "PASS: $1"; P=$((P+1)); }
 bad() { echo "FAIL: $1${2:+ — $2}"; F=$((F+1)); }
 
-BAUT="std.fs std.io std.alloc std.string std.env std.time"
+BAUT="std.fs std.io std.alloc std.string std.env std.time std.conv std.math"
 # Unit:blockierender Name — der Name gehoert dazu, sonst sagt der Eintrag
 # nicht, worauf man wartet.
-BLOCKIERT="std.math:Random std.conv:Random"
+BLOCKIERT=""
 
 pruefe() {   # pruefe <unit> ; setzt $rc und $msg
   printf 'import %s;\nfn main(): int64 { return 0; }\n' "$1" > "$TMP/t.lyx"
@@ -43,7 +43,7 @@ for u in $BAUT; do
   if [ "$rc" -eq 0 ]; then ok "$u baut"; else bad "$u baut nicht mehr" "$msg"; fi
 done
 
-for eintrag in $BLOCKIERT; do
+for eintrag in ${BLOCKIERT:-}; do
   u="${eintrag%%:*}"; erwartet="${eintrag##*:}"
   pruefe "$u"
   if [ "$rc" -eq 0 ]; then
