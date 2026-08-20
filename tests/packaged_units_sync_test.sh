@@ -16,7 +16,7 @@
 # dass die Kernunits des Paketbaums für sich übersetzen.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LYXC="$ROOT/lyxc"
+LYXC="${LYXC:-$ROOT/lyxc}"
 PKG="$ROOT/lyx-compiler/usr/include/lyx/units"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 PASS=0; FAIL=0

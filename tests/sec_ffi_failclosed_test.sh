@@ -6,7 +6,7 @@
 # in vertrauenswürdigen std.*/src.*-Units erlaubt.
 # Verhaltenstest: kompiliert echte Programme und prüft Akzeptanz/Ablehnung.
 
-LYXC="$(cd "$(dirname "$0")/.." && pwd)/lyxc"
+LYXC="${LYXC:-$(cd "$(dirname "$0")/.." && pwd)/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
