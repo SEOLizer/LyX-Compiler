@@ -1044,6 +1044,18 @@ pub type EmitLyxOS = class {
             self.emitEPrintNewline();
         } else if id == 15 {
             self.emitStrLen(dest);
+        } else if id == 6 {
+            self.emitStrSub(dest);
+        } else if id == 9 {
+            self.emitPrintFloat();
+        } else if id == 17 {
+            self.emitNullArg(dest);
+        } else if id == 18 {
+            self.emitNullArg(dest);
+        } else if id == 19 {
+            self.emitNullArg(dest);
+        } else if id == 16 {
+            self.emitIntToStr(dest);
         // ABI: kanonische Nummern aus syscalls.md §10.4 "implementiert" (dezimal).
         // Builtins ohne §10.4-Äquivalent behalten ihre Hex-Design-Nummer (Kernel kennt sie nicht).
         } else if id == 20 { self.emitVfsSyscall(2, 4, dest); }  // sys_open §10.4=2
@@ -1378,6 +1390,85 @@ pub type EmitLyxOS = class {
             self.emitMovRaxImm(10);                                        // sys_sleep_ns = 0x000A
             self.emitSyscall();
             self.emit8(0x31); self.emit8(0xC0);                            // xor eax, eax (return 0)
+            self.emitMovSlotFromRax(dest);
+        }
+        // #1720: sys_clock_nanosleep(clockid, flags, ts, rem).
+        //
+        // Anders als bei nanosleep (233) steht der timespec am DRITTEN
+        // Argument, und TIMER_ABSTIME (Flagge 1) bedeutet "bis zu diesem
+        // Zeitpunkt" statt "so lange". Die Flagge zu ignorieren hiesse, den
+        // absoluten Zeitstempel als Dauer zu verschlafen — ein Programm
+        // bliebe fuer Jahrzehnte stehen. Deshalb wird bei ABSTIME die
+        // aktuelle Zeit (sys_time_ns, 117) abgezogen; ein bereits
+        // vergangener Zeitpunkt schlaeft gar nicht.
+        //
+        // clockid wird nicht ausgewertet: LyxOS kennt genau eine Zeitquelle.
+        else if id == 237 {
+            self.emitMovRdiFromSlot(argBase + 2);                          // rdi = ts
+            self.emit8(0x48); self.emit8(0x8B); self.emit8(0x07);          // MOV rax, [rdi]      (tv_sec)
+            self.emit8(0xB9); self.emit32(1000000000);                     // MOV ecx, 1e9
+            self.emit8(0x48); self.emit8(0x0F); self.emit8(0xAF); self.emit8(0xC1);  // IMUL rax, rcx
+            self.emit8(0x48); self.emit8(0x03); self.emit8(0x47); self.emit8(0x08);  // ADD rax, [rdi+8] (tv_nsec)
+            self.emit8(0x49); self.emit8(0x89); self.emit8(0xC4);          // MOV r12, rax        (Zielwert)
+            self.emitMovRaxFromSlot(argBase + 1);                          // rax = flags
+            self.emit8(0x48); self.emit8(0x83); self.emit8(0xE0); self.emit8(0x01);  // AND rax, 1 (TIMER_ABSTIME)
+            self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);          // TEST rax, rax
+            self.emit8(0x74); self.emit8(0x0F);                            // JZ relativ (+15)
+            // absolut: r12 := r12 - jetzt
+            self.emitMovRaxImm(117);                                       // sys_time_ns
+            self.emitSyscall();
+            self.emit8(0x49); self.emit8(0x29); self.emit8(0xD4);          // SUB r12, rdx
+            // relativ:
+            self.emit8(0x4D); self.emit8(0x85); self.emit8(0xE4);          // TEST r12, r12
+            self.emit8(0x7E); self.emit8(0x0F);                            // JLE fertig (+15) — Zeitpunkt vorbei
+            self.emit8(0x4C); self.emit8(0x89); self.emit8(0xE7);          // MOV rdi, r12
+            self.emitMovRaxImm(10);                                        // sys_sleep_ns
+            self.emitSyscall();
+            // fertig:
+            self.emit8(0x31); self.emit8(0xC0);                            // XOR eax, eax
+            self.emitMovSlotFromRax(dest);
+        }
+        // #1720: sys_gettimeofday(tv, tz) — timeval {tv_sec, tv_usec} fuellen.
+        // Quelle ist dieselbe wie bei clock_gettime (211): sys_time_ns (117)
+        // liefert Nanosekunden in rdx. tz wird nicht ausgewertet; Zeitzonen
+        // kennt der Kernel nicht, und Linux liefert dort seit langem 0.
+        // Ohne Spruenge — deshalb keine Weiten nachzurechnen.
+        else if id == 238 {
+            self.emitMovRaxImm(117);                                       // sys_time_ns
+            self.emitSyscall();
+            self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);          // MOV rax, rdx   (ns)
+            self.emitMovRdiFromSlot(argBase);                              // rdi = tv       (nach dem Syscall)
+            self.emit8(0x48); self.emit8(0xC7); self.emit8(0xC1); self.emit32(1000000000);  // MOV rcx, 1e9
+            self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);          // XOR rdx, rdx
+            self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF1);          // DIV rcx        (rax=sec, rdx=Rest-ns)
+            self.emit8(0x48); self.emit8(0x89); self.emit8(0x07);          // MOV [rdi], rax
+            self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);          // MOV rax, rdx
+            self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);          // XOR rdx, rdx
+            self.emit8(0x48); self.emit8(0xC7); self.emit8(0xC1); self.emit32(1000);        // MOV rcx, 1000
+            self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF1);          // DIV rcx        (rax=usec)
+            self.emit8(0x48); self.emit8(0x89); self.emit8(0x47); self.emit8(0x08);         // MOV [rdi+8], rax
+            self.emit8(0x31); self.emit8(0xC0);                            // XOR eax, eax
+            self.emitMovSlotFromRax(dest);
+        }
+        // #1720: ID 239 — "diese Plattform kennt den Aufruf nicht", -ENOSYS.
+        //
+        // Benutzt von der timerfd-Familie. LyxOS hat ein ANDERES Timer-Modell
+        // (sys_timer_create/sys_timer_set mit Handle und eigener Wartesemantik)
+        // als Linux' timerfd. Eine Abbildung waere keine Uebersetzung, sondern
+        // eine Behauptung: dass sich ein LyxOS-Timer-Handle beim Lesen wie ein
+        // timerfd verhaelt. Fuer sys_timerfd_gettime gibt es ueberhaupt keine
+        // Entsprechung.
+        //
+        // Eine plausibel aussehende Fehluebersetzung waere schlimmer als eine
+        // ehrliche Fehlermeldung — genau der stille Default, den #839 und
+        // #1339 gekostet haben. -ENOSYS sagt dem Aufrufer die Wahrheit, und
+        // die Unit uebersetzt, statt an einer nie gerufenen Funktion zu
+        // scheitern.
+        //
+        // Bekommt LyxOS timerfd oder wird die Abbildung vom Kernel-Team
+        // bestaetigt, tritt hier eine echte Umsetzung an diese Stelle.
+        else if id == 239 {
+            self.emitMovRaxImm(0 - 38);                                    // -ENOSYS
             self.emitMovSlotFromRax(dest);
         }
         // lyxc→LyxOS: EPrintInt → stderr (fd 2; Arg in Slot 0 wie PrintInt id 2).
@@ -1818,6 +1909,447 @@ pub type EmitLyxOS = class {
         self.emitMovRaxImm(0x0203);
         self.emitSyscall();
         self.emit8(0x48); self.emit8(0x83); self.emit8(0xC4); self.emit8(0x08);  // ADD rsp, 8
+    }
+
+    // ID 9 (#1720): PrintFloat — f64 nach stdout.
+    //
+    // Der Ziffernpfad ist aus dem x86-Formatierer portiert (_lyx_f64_to_str,
+    // WP-BI-04). Format: [-]<ganzzahliger Teil>.<sechs Nachkommastellen>.
+    //
+    // Zwei Abweichungen vom Original, beide notwendig:
+    //   * Der Puffer kommt aus mmap statt aus CG_FLOAT_BUF. Dieses Backend
+    //     hat keinen RIP-relativen Datenbereich fuer Kratzpuffer, und ein
+    //     Stapelpuffer wuerde den Aufruf nicht ueberleben.
+    //   * Der `ret` entfaellt — hier wird eingebettet, nicht gerufen.
+    // Ausgetauscht sind NUR die erste und die letzte Anweisung des Rumpfes.
+    // Alles dazwischen bleibt unveraendert, damit die fest kodierten
+    // Sprungweiten des Originals gueltig bleiben; eine andere Befehlslaenge
+    // im Rumpf haette jeden Sprung darin verschoben.
+    //
+    // #1284: Vorschalter gegen NaN, unendlich und Werte, die `cvttsd2si`
+    // nicht traegt. Ohne ihn druckt der Ziffernpfad dafuer
+    // 9223372036854775808.<Muell> — eine Zahl, die nie gerechnet wurde.
+    //
+    // Alle Spruenge des Vorschalters sind rel32 und werden NACHGETRAGEN.
+    // Von Hand gerechnete Weiten waeren hier die dritte Auflage derselben
+    // Fehlerquelle: die Ziele liegen hinter einem Rumpf, dessen Laenge man
+    // nicht im Kopf hat.
+    fn emitF64ToStrPtr(): void {
+        self.emit8(0x41); self.emit8(0x54);                    // PUSH r12
+        // Puffer aus mmap(0, 48, PROT_RW=3, MAP_PRIVATE|ANON=5)
+        self.emitMovRaxImm(9);
+        self.emit8(0x31); self.emit8(0xFF);                    // XOR edi, edi
+        self.emit8(0xBE); self.emit32(48);                     // MOV esi, 48
+        self.emit8(0xBA); self.emit32(3);                      // MOV edx, 3
+        self.emit8(0x41); self.emit8(0xBA); self.emit32(5);    // MOV r10d, 5
+        self.emitSyscall();
+        self.emit8(0x49); self.emit8(0x89); self.emit8(0xD4);  // MOV r12, rdx
+
+        self.emitMovRdiFromSlot(0);                            // rdi = IEEE-754-Bits
+
+        // Sonderfaelle an den Bits erkennen: nach dem Verdoppeln faellt das
+        // Vorzeichen heraus; unendlich liegt bei 0xFFE0000000000000, alles
+        // darueber ist NaN.
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xF8);  // MOV rax, rdi
+        self.emit8(0x48); self.emit8(0x01); self.emit8(0xC0);  // ADD rax, rax
+        self.emit8(0x48); self.emit8(0xB9);                    // MOVABS rcx, 0xFFE0000000000000
+        self.emit8(0x00); self.emit8(0x00); self.emit8(0x00); self.emit8(0x00);
+        self.emit8(0x00); self.emit8(0x00); self.emit8(0xE0); self.emit8(0xFF);
+        self.emit8(0x48); self.emit8(0x39); self.emit8(0xC8);  // CMP rax, rcx
+        self.emit8(0x0F); self.emit8(0x87);                    // JA rel32 -> nan
+        var jNan: int64 := self.codeLen; self.emit32(0);
+        self.emit8(0x0F); self.emit8(0x84);                    // JE rel32 -> inf
+        var jInf: int64 := self.codeLen; self.emit32(0);
+
+        // Endlich, aber traegt cvttsd2si den Wert? 0x8000000000000000 ist die
+        // Kennzeichnung "passt nicht".
+        self.emit8(0x66); self.emit8(0x48); self.emit8(0x0F); self.emit8(0x6E); self.emit8(0xC7);  // MOVQ xmm0, rdi
+        self.emit8(0xF2); self.emit8(0x48); self.emit8(0x0F); self.emit8(0x2C); self.emit8(0xF0);  // CVTTSD2SI rsi, xmm0
+        self.emit8(0x48); self.emit8(0xB9);                    // MOVABS rcx, 0x8000000000000000
+        self.emit8(0x00); self.emit8(0x00); self.emit8(0x00); self.emit8(0x00);
+        self.emit8(0x00); self.emit8(0x00); self.emit8(0x00); self.emit8(0x80);
+        self.emit8(0x48); self.emit8(0x39); self.emit8(0xCE);  // CMP rsi, rcx
+        self.emit8(0x0F); self.emit8(0x84);                    // JE rel32 -> gross
+        var jBig: int64 := self.codeLen; self.emit32(0);
+        self.emit8(0xE9);                                      // JMP rel32 -> ziffern
+        var jZif: int64 := self.codeLen; self.emit32(0);
+
+        // nan:
+        var lNan: int64 := self.codeLen;
+        self.emit8(0x41); self.emit8(0xC7); self.emit8(0x04); self.emit8(0x24);
+        self.emit8(0x6E); self.emit8(0x61); self.emit8(0x6E); self.emit8(0x00);   // MOV dword [r12], 'nan',0
+        self.emit8(0xE9); var eNan: int64 := self.codeLen; self.emit32(0);        // JMP -> ende
+
+        // inf:
+        var lInf: int64 := self.codeLen;
+        self.emit8(0x41); self.emit8(0xC7); self.emit8(0x04); self.emit8(0x24);
+        self.emit8(0x69); self.emit8(0x6E); self.emit8(0x66); self.emit8(0x00);   // MOV dword [r12], 'inf',0
+        self.emit8(0xE9); var eInf: int64 := self.codeLen; self.emit32(0);        // JMP -> ende
+
+        // gross: "overflow". Eine erfundene Zahl waere das Schlechtere; wer
+        // grosse Werte braucht, nimmt FloatToStr(v, prec) mit Exponent.
+        var lBig: int64 := self.codeLen;
+        self.emit8(0x41); self.emit8(0xC7); self.emit8(0x04); self.emit8(0x24);
+        self.emit8(0x6F); self.emit8(0x76); self.emit8(0x65); self.emit8(0x72);   // "over"
+        self.emit8(0x41); self.emit8(0xC7); self.emit8(0x44); self.emit8(0x24); self.emit8(0x04);
+        self.emit8(0x66); self.emit8(0x6C); self.emit8(0x6F); self.emit8(0x77);   // "flow"
+        self.emit8(0x41); self.emit8(0xC6); self.emit8(0x44); self.emit8(0x24); self.emit8(0x08); self.emit8(0x00);  // 0
+        self.emit8(0xE9); var eBig: int64 := self.codeLen; self.emit32(0);        // JMP -> ende
+
+        // ziffern:
+        var lZif: int64 := self.codeLen;
+        self.emit8(0x66); self.emit8(0x48); self.emit8(0x0F); self.emit8(0x6E); self.emit8(0xC7);
+        // push rbx                53
+        self.emit8(0x53);
+        // sub rsp, 24             48 83 EC 18
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xEC); self.emit8(0x18);
+        // lea rdi, [rip+CG_FLOAT_BUF]   48 8D 3D disp32
+        self.emit8(0x4C); self.emit8(0x89); self.emit8(0xE7);  // MOV rdi, r12 — Puffer statt RIP-relativem CG_FLOAT_BUF
+        // pxor xmm1, xmm1         66 0F EF C9
+        self.emit8(0x66); self.emit8(0x0F); self.emit8(0xEF); self.emit8(0xC9);
+        // ucomisd xmm0, xmm1      66 0F 2E C1
+        self.emit8(0x66); self.emit8(0x0F); self.emit8(0x2E); self.emit8(0xC1);
+        // jae .pos (+18)          73 12
+        self.emit8(0x73); self.emit8(0x12);
+        // [negative branch: 18 bytes]
+        // mov byte [rdi], '-'     C6 07 2D
+        self.emit8(0xC6); self.emit8(0x07); self.emit8(0x2D);
+        // inc rdi                 48 FF C7
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC7);
+        // pxor xmm1, xmm1         66 0F EF C9
+        self.emit8(0x66); self.emit8(0x0F); self.emit8(0xEF); self.emit8(0xC9);
+        // subsd xmm1, xmm0        F2 0F 5C C8   (xmm1 = 0.0 - xmm0)
+        self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x5C); self.emit8(0xC8);
+        // movsd xmm0, xmm1        F2 0F 10 C1
+        self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x10); self.emit8(0xC1);
+        // [.pos: jae target — 40 bytes from start]
+        // cvttsd2si rsi, xmm0     F2 48 0F 2C F0
+        self.emit8(0xF2); self.emit8(0x48); self.emit8(0x0F); self.emit8(0x2C); self.emit8(0xF0);
+        // cvtsi2sd xmm1, rsi      F2 48 0F 2A CE
+        self.emit8(0xF2); self.emit8(0x48); self.emit8(0x0F); self.emit8(0x2A); self.emit8(0xCE);
+        // subsd xmm0, xmm1        F2 0F 5C C1   (frac = f - intpart)
+        self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x5C); self.emit8(0xC1);
+        // lea rbx, [rsp+23]       48 8D 5C 24 17
+        self.emit8(0x48); self.emit8(0x8D); self.emit8(0x5C); self.emit8(0x24); self.emit8(0x17);
+        // test rsi, rsi           48 85 F6
+        self.emit8(0x48); self.emit8(0x85); self.emit8(0xF6);
+        // jnz .intloop (+8)       75 08
+        self.emit8(0x75); self.emit8(0x08);
+        // [zero case: write '0']
+        // mov byte [rbx], '0'     C6 03 30
+        self.emit8(0xC6); self.emit8(0x03); self.emit8(0x30);
+        // dec rbx                 48 FF CB
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xCB);
+        // jmp .intdone (+35)      EB 23
+        self.emit8(0xEB); self.emit8(0x23);
+        // [.intloop: — 72 bytes from start]
+        // test rsi, rsi           48 85 F6
+        self.emit8(0x48); self.emit8(0x85); self.emit8(0xF6);
+        // jz .intdone (+30)       74 1E
+        self.emit8(0x74); self.emit8(0x1E);
+        // mov rax, rsi            48 89 F0
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xF0);
+        // xor rdx, rdx            48 31 D2
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);
+        // mov rcx, 10             48 C7 C1 0A 00 00 00
+        self.emit8(0x48); self.emit8(0xC7); self.emit8(0xC1);
+        self.emit8(0x0A); self.emit8(0x00); self.emit8(0x00); self.emit8(0x00);
+        // idiv rcx                48 F7 F9
+        self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF9);
+        // mov rsi, rax            48 89 C6
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xC6);
+        // add rdx, 48             48 83 C2 30
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC2); self.emit8(0x30);
+        // mov [rbx], dl           88 13
+        self.emit8(0x88); self.emit8(0x13);
+        // dec rbx                 48 FF CB
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xCB);
+        // jmp .intloop (-37)      EB DD
+        self.emit8(0xEB); self.emit8(0xDD);
+        // [.intdone: — 107 bytes from start]
+        // inc rbx                 48 FF C3
+        // lea rcx, [rsp+24]       48 8D 4C 24 18  (one past end of stack buf)
+        self.emit8(0x48); self.emit8(0x8D); self.emit8(0x4C); self.emit8(0x24); self.emit8(0x18);
+        // [.copyint: — 115 bytes from start]
+        // cmp rbx, rcx            48 39 CB
+        self.emit8(0x48); self.emit8(0x39); self.emit8(0xCB);
+        // jge .copyidone (+12)    7D 0C
+        self.emit8(0x7D); self.emit8(0x0C);
+        // mov al, [rbx]           8A 03
+        self.emit8(0x8A); self.emit8(0x03);
+        // mov [rdi], al           88 07
+        self.emit8(0x88); self.emit8(0x07);
+        // inc rbx                 48 FF C3
+        // inc rdi                 48 FF C7
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC7);
+        // jmp .copyint (-17)      EB EF
+        self.emit8(0xEB); self.emit8(0xEF);
+        // [.copyidone: — 132 bytes from start]
+        // mov byte [rdi], '.'     C6 07 2E
+        self.emit8(0xC6); self.emit8(0x07); self.emit8(0x2E);
+        // inc rdi                 48 FF C7
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC7);
+        // movabs rax, 1000000.0   48 B8 00 00 00 00 80 84 2E 41  (0x412E848000000000)
+        self.emit8(0x48); self.emit8(0xB8);
+        self.emit8(0x00); self.emit8(0x00); self.emit8(0x00); self.emit8(0x00);
+        self.emit8(0x80); self.emit8(0x84); self.emit8(0x2E); self.emit8(0x41);
+        // movq xmm1, rax          66 48 0F 6E C8
+        self.emit8(0x66); self.emit8(0x48); self.emit8(0x0F); self.emit8(0x6E); self.emit8(0xC8);
+        // mulsd xmm0, xmm1        F2 0F 59 C1
+        self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x59); self.emit8(0xC1);
+        // cvttsd2si rsi, xmm0     F2 48 0F 2C F0  (6-digit integer)
+        self.emit8(0xF2); self.emit8(0x48); self.emit8(0x0F); self.emit8(0x2C); self.emit8(0xF0);
+        // --- fraction digit 1: power=100000 ---
+        // mov rcx, 100000         48 C7 C1 A0 86 01 00
+        self.emit8(0x48); self.emit8(0xC7); self.emit8(0xC1);
+        self.emit8(0xA0); self.emit8(0x86); self.emit8(0x01); self.emit8(0x00);
+        // mov rax, rsi            48 89 F0
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xF0);
+        // xor rdx, rdx            48 31 D2
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);
+        // idiv rcx                48 F7 F9
+        self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF9);
+        // mov rsi, rdx            48 89 D6
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD6);
+        // add rax, 48             48 83 C0 30
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x30);
+        // mov [rdi], al           88 07
+        self.emit8(0x88); self.emit8(0x07);
+        // inc rdi                 48 FF C7
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC7);
+        // --- fraction digit 2: power=10000 ---
+        // mov rcx, 10000          48 C7 C1 10 27 00 00
+        self.emit8(0x48); self.emit8(0xC7); self.emit8(0xC1);
+        self.emit8(0x10); self.emit8(0x27); self.emit8(0x00); self.emit8(0x00);
+        // mov rax, rsi            48 89 F0
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xF0);
+        // xor rdx, rdx            48 31 D2
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);
+        // idiv rcx                48 F7 F9
+        self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF9);
+        // mov rsi, rdx            48 89 D6
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD6);
+        // add rax, 48             48 83 C0 30
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x30);
+        // mov [rdi], al           88 07
+        self.emit8(0x88); self.emit8(0x07);
+        // inc rdi                 48 FF C7
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC7);
+        // --- fraction digit 3: power=1000 ---
+        // mov rcx, 1000           48 C7 C1 E8 03 00 00
+        self.emit8(0x48); self.emit8(0xC7); self.emit8(0xC1);
+        self.emit8(0xE8); self.emit8(0x03); self.emit8(0x00); self.emit8(0x00);
+        // mov rax, rsi            48 89 F0
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xF0);
+        // xor rdx, rdx            48 31 D2
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);
+        // idiv rcx                48 F7 F9
+        self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF9);
+        // mov rsi, rdx            48 89 D6
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD6);
+        // add rax, 48             48 83 C0 30
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x30);
+        // mov [rdi], al           88 07
+        self.emit8(0x88); self.emit8(0x07);
+        // inc rdi                 48 FF C7
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC7);
+        // --- fraction digit 4: power=100 ---
+        // mov rcx, 100            48 C7 C1 64 00 00 00
+        self.emit8(0x48); self.emit8(0xC7); self.emit8(0xC1);
+        self.emit8(0x64); self.emit8(0x00); self.emit8(0x00); self.emit8(0x00);
+        // mov rax, rsi            48 89 F0
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xF0);
+        // xor rdx, rdx            48 31 D2
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);
+        // idiv rcx                48 F7 F9
+        self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF9);
+        // mov rsi, rdx            48 89 D6
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD6);
+        // add rax, 48             48 83 C0 30
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x30);
+        // mov [rdi], al           88 07
+        self.emit8(0x88); self.emit8(0x07);
+        // inc rdi                 48 FF C7
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC7);
+        // --- fraction digit 5: power=10 ---
+        // mov rcx, 10             48 C7 C1 0A 00 00 00
+        self.emit8(0x48); self.emit8(0xC7); self.emit8(0xC1);
+        self.emit8(0x0A); self.emit8(0x00); self.emit8(0x00); self.emit8(0x00);
+        // mov rax, rsi            48 89 F0
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xF0);
+        // xor rdx, rdx            48 31 D2
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);
+        // idiv rcx                48 F7 F9
+        self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF9);
+        // mov rsi, rdx            48 89 D6
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD6);
+        // add rax, 48             48 83 C0 30
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x30);
+        // mov [rdi], al           88 07
+        self.emit8(0x88); self.emit8(0x07);
+        // inc rdi                 48 FF C7
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC7);
+        // --- fraction digit 6: rsi has last digit (no division needed) ---
+        // mov rax, rsi            48 89 F0
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xF0);
+        // add rax, 48             48 83 C0 30
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x30);
+        // mov [rdi], al           88 07
+        self.emit8(0x88); self.emit8(0x07);
+        // inc rdi                 48 FF C7
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC7);
+        // null terminate
+        // mov byte [rdi], 0       C6 07 00
+        self.emit8(0xC6); self.emit8(0x07); self.emit8(0x00);
+        // lea rax, [rip+CG_FLOAT_BUF]   48 8D 05 disp32
+        self.emit8(0x4C); self.emit8(0x89); self.emit8(0xE0);  // MOV rax, r12 — Ergebniszeiger
+        // add rsp, 24             48 83 C4 18
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC4); self.emit8(0x18);
+        // pop rbx                 5B
+        self.emit8(0x5B);
+        // ret                     C3
+        // ende:
+        var lEnde: int64 := self.codeLen;
+        self.emit8(0x41); self.emit8(0x5C);                    // POP r12
+
+        // Spruenge nachtragen — Ziel minus Ende des jeweiligen Sprungfeldes.
+        self.patch32(jNan, lNan - (jNan + 4));
+        self.patch32(jInf, lInf - (jInf + 4));
+        self.patch32(jBig, lBig - (jBig + 4));
+        self.patch32(jZif, lZif - (jZif + 4));
+        self.patch32(eNan, lEnde - (eNan + 4));
+        self.patch32(eInf, lEnde - (eInf + 4));
+        self.patch32(eBig, lEnde - (eBig + 4));
+    }
+
+    // ID 9: PrintFloat — Text erzeugen, dann nach stdout schreiben.
+    fn emitPrintFloat(): void {
+        self.emitF64ToStrPtr();                                // rax = Zeiger
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xC6);  // MOV rsi, rax
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);  // XOR rdx, rdx
+        self.emit8(0x80); self.emit8(0x3C); self.emit8(0x16); self.emit8(0x00);  // schleife: CMP byte[rsi+rdx],0
+        self.emit8(0x74); self.emit8(0x05);                    // JE fertig (+5)
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC2);  // INC rdx
+        self.emit8(0xEB); self.emit8(0xF5);                    // JMP schleife (-11)
+        // fertig:
+        self.emit8(0xBF); self.emit32(1);                      // MOV edi, 1 (stdout)
+        self.emitMovRaxImm(0x0203);
+        self.emitSyscall();
+    }
+
+    // ID 17/18 (#1720): GetArgC / GetArgV.
+    //
+    // Auf diesem Ziel gibt es keine Programmargumente: `_start` ruft main und
+    // beendet, es liest keinen Stapel-argv. Beide liefern deshalb 0 — dieselbe
+    // Aussage, die die Handbuchseite fuer das freistehende Ziel trifft
+    // ("GetArgC und GetArgV liefern 0 — argc und argv gibt es auf blankem
+    // Blech nicht").
+    //
+    // Das steht hier im BACKEND und nicht im Lowerer, weil es eine Aussage
+    // ueber dieses Ziel ist. Auf arm64-Linux gibt es sehr wohl Argumente; ein
+    // festes 0 im Lowerer waere dort schlicht falsch. Reicht der LBF-Loader
+    // spaeter Argumente durch, aendert sich genau diese Stelle.
+    fn emitNullArg(dest: int64): void {
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xC0);  // XOR rax, rax
+        self.emitMovSlotFromRax(dest);
+    }
+
+    // ID 6 (#1720): StrSub(s, start, len) — Teilzeichenkette in einen frischen
+    // Puffer, Zeiger nach dest. Slots 0=s, 1=start, 2=len.
+    //
+    // Kopiert wird zeichenweise mit Abbruch am Nullbyte, nicht blind ueber
+    // `len` Bytes: steht `start+len` hinter dem Ende, laese ein `rep movsb`
+    // ueber die Zeichenkette hinaus und schriebe fremden Speicher in das
+    // Ergebnis.
+    fn emitStrSub(dest: int64): void {
+        self.emit8(0x41); self.emit8(0x54);                    // PUSH r12
+        self.emit8(0x41); self.emit8(0x55);                    // PUSH r13
+        // Puffer: len + 1 Byte. mmap(0, r13+1, PROT_RW=3, MAP_PRIVATE|ANON=5)
+        self.emitMovRaxFromSlot(2);                            // rax = len
+        self.emit8(0x49); self.emit8(0x89); self.emit8(0xC5);  // MOV r13, rax   (len merken)
+        self.emitMovRaxImm(9);
+        self.emit8(0x31); self.emit8(0xFF);                    // XOR edi, edi
+        self.emit8(0x4C); self.emit8(0x89); self.emit8(0xEE);  // MOV rsi, r13
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC6);  // INC rsi        (len+1)
+        self.emit8(0xBA); self.emit32(3);                      // MOV edx, 3
+        self.emit8(0x41); self.emit8(0xBA); self.emit32(5);    // MOV r10d, 5
+        self.emitSyscall();
+        self.emit8(0x49); self.emit8(0x89); self.emit8(0xD4);  // MOV r12, rdx   (Puffer)
+
+        // rsi = s + start, rdi = Puffer, rcx = 0 (Zaehler)
+        self.emitMovRsiFromSlot(0);                            // rsi = s
+        self.emitMovRaxFromSlot(1);                            // rax = start
+        self.emit8(0x48); self.emit8(0x01); self.emit8(0xC6);  // ADD rsi, rax
+        self.emit8(0x4C); self.emit8(0x89); self.emit8(0xE7);  // MOV rdi, r12
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xC9);  // XOR rcx, rcx
+
+        // schleife: while (rcx < len && *rsi != 0) *rdi++ = *rsi++
+        self.emit8(0x4C); self.emit8(0x39); self.emit8(0xE9);  // CMP rcx, r13
+        self.emit8(0x7D); self.emit8(0x0F);                    // JGE fertig (+15)
+        self.emit8(0x8A); self.emit8(0x04); self.emit8(0x0E);  // MOV al, [rsi+rcx]
+        self.emit8(0x84); self.emit8(0xC0);                    // TEST al, al
+        self.emit8(0x74); self.emit8(0x08);                    // JZ fertig (+8)
+        self.emit8(0x88); self.emit8(0x04); self.emit8(0x0F);  // MOV [rdi+rcx], al
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC1);  // INC rcx
+        self.emit8(0xEB); self.emit8(0xEC);                    // JMP schleife (-20)
+        // fertig:
+        self.emit8(0xC6); self.emit8(0x04); self.emit8(0x0F); self.emit8(0x00);  // MOV byte [rdi+rcx], 0
+        self.emit8(0x4C); self.emit8(0x89); self.emit8(0xE0);  // MOV rax, r12
+        self.emit8(0x41); self.emit8(0x5D);                    // POP r13
+        self.emit8(0x41); self.emit8(0x5C);                    // POP r12
+        self.emitMovSlotFromRax(dest);
+    }
+
+    // ID 16 (#1720): IntToStr/StrFromInt — Zahl aus Slot 0 als Dezimaltext,
+    // Zeiger nach dest.
+    //
+    // Der Puffer muss den Aufruf ueberleben, kommt also aus mmap und nicht
+    // vom Stapel — sonst zeigte das Ergebnis auf einen Rahmen, den der
+    // naechste Aufruf ueberschreibt. Die Ziffernschleife ist dieselbe wie in
+    // emitPrintIntFd, nur schreibt sie in den Puffer statt ihn auszugeben.
+    //
+    // LyxOS liefert das Ergebnis eines Syscalls in rdx, nicht in rax
+    // (siehe emitVfsSyscall und emitAlloc).
+    fn emitIntToStr(dest: int64): void {
+        self.emit8(0x41); self.emit8(0x54);                    // PUSH r12 (Puffer, muss erhalten bleiben)
+        // mmap(0, 24, PROT_RW=3, MAP_PRIVATE|MAP_ANON=5) — wie emitAlloc
+        self.emitMovRaxImm(9);
+        self.emit8(0x31); self.emit8(0xFF);                    // XOR edi, edi
+        self.emit8(0xBE); self.emit32(24);                     // MOV esi, 24
+        self.emit8(0xBA); self.emit32(3);                      // MOV edx, 3
+        self.emit8(0x41); self.emit8(0xBA); self.emit32(5);    // MOV r10d, 5
+        self.emitSyscall();
+        self.emit8(0x49); self.emit8(0x89); self.emit8(0xD4);  // MOV r12, rdx  (Puffer)
+
+        self.emit8(0x41); self.emit8(0xBB); self.emit32(22);   // MOV r11d, 22  (Schreibindex)
+        self.emit8(0x43); self.emit8(0xC6); self.emit8(0x04); self.emit8(0x1C); self.emit8(0x00);  // MOV byte [r12+r11], 0
+        self.emit8(0x49); self.emit8(0xFF); self.emit8(0xCB);  // DEC r11
+
+        self.emitMovRaxFromSlot(0);                            // rax = n
+        self.emit8(0x4D); self.emit8(0x31); self.emit8(0xC0);  // XOR r8, r8   (Vorzeichenmerker)
+        self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);  // TEST rax, rax
+        self.emit8(0x79); self.emit8(0x09);                    // JNS +9 (nicht negativ)
+        self.emit8(0x41); self.emit8(0xB8); self.emit32(1);    // MOV r8d, 1
+        self.emit8(0x48); self.emit8(0xF7); self.emit8(0xD8);  // NEG rax
+        self.emit8(0x41); self.emit8(0xB9); self.emit32(10);   // MOV r9d, 10
+
+        // schleife: Ziffer von hinten schreiben
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xD2);  // XOR rdx, rdx
+        self.emit8(0x49); self.emit8(0xF7); self.emit8(0xF1);  // DIV r9
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC2); self.emit8(0x30);  // ADD rdx, 48
+        self.emit8(0x43); self.emit8(0x88); self.emit8(0x14); self.emit8(0x1C);  // MOV [r12+r11], dl
+        self.emit8(0x49); self.emit8(0xFF); self.emit8(0xCB);  // DEC r11
+        self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);  // TEST rax, rax
+        self.emit8(0x75); self.emit8(0xEC);                    // JNZ schleife (-20)
+
+        self.emit8(0x4D); self.emit8(0x85); self.emit8(0xC0);  // TEST r8, r8
+        self.emit8(0x74); self.emit8(0x08);                    // JZ +8 (kein Minuszeichen)
+        self.emit8(0x43); self.emit8(0xC6); self.emit8(0x04); self.emit8(0x1C); self.emit8(0x2D);  // MOV byte [r12+r11], '-'
+        self.emit8(0x49); self.emit8(0xFF); self.emit8(0xCB);  // DEC r11
+
+        self.emit8(0x4B); self.emit8(0x8D); self.emit8(0x44); self.emit8(0x1C); self.emit8(0x01);  // LEA rax, [r12+r11+1]
+        self.emit8(0x41); self.emit8(0x5C);                    // POP r12
+        self.emitMovSlotFromRax(dest);
     }
 
     // ID 15: StrLen/StrLength — Laenge von Slot 0 nach dest.

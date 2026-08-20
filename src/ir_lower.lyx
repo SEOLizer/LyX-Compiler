@@ -203,10 +203,20 @@ fn _irLeseImport(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar):
   if ((src as int64) != 0) { free(rel, modLen + 8); return src; }
 
   // Unter einem Praefix nachsehen: "<praefix>/<rel>"
+  //
+  // #1724: Hier standen nur incPath und stdPath. Der Hauptaufloeser kennt
+  // seit 1.0.18D eine vierte Stufe — den Installationspfad des Pakets — und
+  // ohne sie fand die IR-Strecke die mitgelieferte Bibliothek nie. Wer ohne
+  // --std-path uebersetzte, bekam "Import nicht lesbar, seine Funktionen
+  // fehlen: std.fs" und zwei Zeilen spaeter "unbekannter Builtin/Funktion:
+  // FileExists" — eine Meldung, die auf einen fehlenden Builtin zeigt,
+  // obwohl bloss die Unit nicht gefunden wurde. Dieselbe Reihenfolge wie in
+  // sema._leseDatei, damit beide Seiten dieselbe Antwort geben.
   var vers: int64 := 0;
-  while (vers < 2) {
+  while (vers < 3) {
     var pre: pchar := incPath;
     if (vers == 1) { pre := stdPath; }
+    if (vers == 2) { pre := "/usr/include/lyx/units"; }
     if ((pre as int64) != 0) {
       var pl: int64 := StrLen(pre);
       if (pl > 0) {
@@ -2138,6 +2148,91 @@ pub type IRLower = class {
     // WP-D2: mmap(addr, size, ...) → IRO_ALLOC(size) for ARM64 backends.
     // The ARM64 IR backend (emit_arm64.lyx) maps IRO_ALLOC to mmap on Linux
     // and to VirtualAlloc on Windows, so this translation is correct for both.
+    // #1720 Block B: IntToStr/StrFromInt(n) — ID 16. Anders als die uebrigen
+    // Namen dieser Runde ist das kein Alias: es braucht einen Puffer und eine
+    // Ziffernschleife, also einen eigenen Emitter je Backend. Umgesetzt ist
+    // bislang nur lyxos; die anderen IR-Ziele melden die ID als unbehandelt,
+    // was laut und richtig ist.
+    if ((self.seq(fname, fnlen, "IntToStr", 8) || self.seq(fname, fnlen, "StrFromInt", 10))
+        && arg0 >= 0) {
+      var itsN: int64 := self.lowerExpr(arg0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 0, itsN, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 16);
+      return dest;
+    }
+
+    // #1720 Block B: Programmargumente. GetArgC und GetArgV bekommen eigene
+    // IDs, weil die Antwort vom Ziel abhaengt — auf arm64-Linux gibt es
+    // Argumente, auf lyxos (heute) nicht. GetArg(i) braucht keine eigene ID:
+    // es ist argv[i], also ID 18 plus ein Lesezugriff.
+    if (self.seq(fname, fnlen, "GetArgC", 7)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 17);
+      return dest;
+    }
+    if (self.seq(fname, fnlen, "GetArgV", 7)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 18);
+      return dest;
+    }
+    // GetEnvBlock: auf x86 setzt ihn nur die win64-Laufzeit, unter Linux
+    // bleibt er 0 und std.env nimmt den SysV-Weg (#1677). Dieselbe Frage ans
+    // Ziel wie bei den Argumenten, also dieselbe Bauart: eigene ID, Antwort
+    // im Backend.
+    if (self.seq(fname, fnlen, "GetEnvBlock", 11)) {
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 19);
+      return dest;
+    }
+    if (self.seq(fname, fnlen, "GetArg", 6) && arg0 >= 0) {
+      var gaIdx: int64 := self.lowerExpr(arg0);
+      var gaV: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, gaV, -1, -1, 18);   // argv
+      var gaAcht: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, gaAcht, -1, -1, 8);
+      var gaOff: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_MUL, gaOff, gaIdx, gaAcht, 0);
+      var gaAdr: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, gaAdr, gaV, gaOff, 0);
+      // peek64 erwartet die Adresse in einem Temp-Block und traegt dessen
+      // Basis in src1 — nicht in Slot 0. Dieselbe Form wie der peek64-Zweig
+      // weiter unten; eine abweichende Uebergabe laese an falscher Stelle.
+      var gaB: int64 := self.tempCount;
+      var gaR: int64 := 0;
+      while gaR < 4 { self.allocTemp(); gaR := gaR + 1; }
+      self.irAddInstrDirect(IRO_STORE_LOCAL, gaB, gaAdr, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, gaB, -1, 202);  // peek64
+      return dest;
+    }
+
+    // #1720 Block B: StrFree(s) ist auf dem x86-Weg ein ausdrueckliches
+    // No-op — der Speicher stammt aus mmap, und der Bootstrap raeumt nicht
+    // auf. Auf der IR-Strecke gilt dasselbe; ein irFree waere hier eine
+    // andere Semantik als auf x86 und damit schlimmer als nichts.
+    if (self.seq(fname, fnlen, "StrFree", 7)) {
+      self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, 0);
+      return dest;
+    }
+
+    // #1720 Block B: panic(msg) — Meldung nach stderr, dann Abbruch mit 1.
+    // Moeglich geworden durch #1715: ID 13 schreibt nach stderr und rechnet
+    // die Laenge selbst, 14 haengt den Umbruch an, 3 beendet.
+    //
+    // Abweichung vom x86-Weg, bewusst: dort legt panic die Meldung
+    // zusaetzlich in CG_EXN_VAL ab, damit ein catch sie lesen kann. Die
+    // IR-Strecke hat diese Ablage nicht — hier endet das Programm. Wer
+    // Ausnahmen auf einem IR-Ziel braucht, braucht zuerst die Ablage.
+    if (self.seq(fname, fnlen, "panic", 5)) {
+      if arg0 >= 0 {
+        var pkMsg: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pkMsg, -1, 0);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 13);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 14);
+      }
+      var pkRc: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, pkRc, -1, -1, 1);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pkRc, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 3);
+      return dest;
+    }
+
     // #1720 Block A: die Gleitkomma-Builtins. Sie sind in sema registriert
     // und wurden bislang nur auf dem x86-Schnellweg erzeugt — auf JEDEM
     // IR-Ziel fehlten sie. Die passenden IR-Opcodes gibt es laengst, und die
@@ -2540,7 +2635,8 @@ pub type IRLower = class {
       if swtA >= 0 { var swtT: int64 := self.lowerExpr(swtA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, swtT, -1, 0); }
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 64); return dest;
     }
-    if (self.seq(fname, fnlen, "sys_getpid", 10)) {
+    // #1720: die stdlib ruft `getpid`, gelistet war nur `sys_getpid`.
+    if (self.seq(fname, fnlen, "sys_getpid", 10) || self.seq(fname, fnlen, "getpid", 6)) {
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 65); return dest;
     }
     if (self.seq(fname, fnlen, "sys_gettid", 10)) {
@@ -3343,6 +3439,55 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, gdB, -1, 222); return dest;
     }
     // lyxc→LyxOS Kat-B: clock_gettime(clk_id, ts) → sys_time_ns + timespec-Split (id 211).
+    // #1720: die timerfd-Familie. Sie bekommt KEINE erfundene Abbildung auf
+    // das LyxOS-Timer-Modell, sondern eine gemeinsame ID, deren Backend
+    // -ENOSYS meldet. Der Aufrufer erfaehrt damit die Wahrheit, und die Unit
+    // uebersetzt — sie scheiterte bisher an drei Funktionen, die kaum ein
+    // Programm ruft.
+    if (self.seq(fname, fnlen, "sys_timerfd_create", 18)
+        || self.seq(fname, fnlen, "sys_timerfd_settime", 19)
+        || self.seq(fname, fnlen, "sys_timerfd_gettime", 19)) {
+      var tfA: int64 := arg0;
+      while (tfA >= 0) { self.lowerExpr(tfA); tfA := self.nodeNext(tfA); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 239); return dest;
+    }
+
+    // #1720: sys_gettimeofday(tv, tz) — eigene ID, weil das Ziel die Zeit
+    // anders liefert als Linux (Nanosekunden aus einem Syscall statt eines
+    // gefuellten timeval).
+    if (self.seq(fname, fnlen, "sys_gettimeofday", 16)) {
+      var gtB: int64 := self.tempCount;
+      var gtR: int64 := 0;
+      while gtR < 4 { self.allocTemp(); gtR := gtR + 1; }
+      var gtA: int64 := arg0;
+      var gtI: int64 := 0;
+      while (gtA >= 0 && gtI < 2) {
+        var gtT: int64 := self.lowerExpr(gtA);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, gtB + gtI, gtT, -1, 0);
+        gtA := self.nodeNext(gtA);
+        gtI := gtI + 1;
+      }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, gtB, -1, 238); return dest;
+    }
+
+    // #1720: sys_clock_nanosleep(clockid, flags, ts, rem). Eigene ID statt
+    // Alias auf nanosleep: der timespec steht am dritten Argument, und
+    // TIMER_ABSTIME meint einen Zeitpunkt, keine Dauer.
+    if (self.seq(fname, fnlen, "sys_clock_nanosleep", 19)) {
+      var cnB: int64 := self.tempCount;
+      var cnR: int64 := 0;
+      while cnR < 4 { self.allocTemp(); cnR := cnR + 1; }
+      var cnA: int64 := arg0;
+      var cnI: int64 := 0;
+      while (cnA >= 0 && cnI < 4) {
+        var cnT: int64 := self.lowerExpr(cnA);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, cnB + cnI, cnT, -1, 0);
+        cnA := self.nodeNext(cnA);
+        cnI := cnI + 1;
+      }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, cnB, -1, 237); return dest;
+    }
+
     // #1717: Die stdlib ruft `sys_clock_gettime`, gelistet waren nur
     // `clock_gettime` und `sys_clock_get`. Alias auf den vorhandenen Zweig.
     if (self.seq(fname, fnlen, "clock_gettime", 13) || self.seq(fname, fnlen, "sys_clock_gettime", 17)) {
@@ -3428,7 +3573,8 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, syB, -1, 230); return dest;
     }
     // nanosleep(ts, rem) → sys_sleep_ns (timespec→ns). rem ignoriert — id 233.
-    if (self.seq(fname, fnlen, "nanosleep", 9)) {
+    // #1720: die stdlib ruft `sys_nanosleep`, gelistet war nur `nanosleep`.
+    if (self.seq(fname, fnlen, "nanosleep", 9) || self.seq(fname, fnlen, "sys_nanosleep", 13)) {
       var nsB: int64 := self.tempCount; var nsR: int64 := 0; while nsR < 4 { self.allocTemp(); nsR := nsR + 1; }
       if arg0 >= 0 { var t: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, nsB, t, -1, 0); }
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, nsB, -1, 233); return dest;
@@ -3496,6 +3642,58 @@ pub type IRLower = class {
       }
       self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, lfFn, -1, lfI);
       return dest;
+    }
+
+    // #1723: Aufruf ueber eine MODULVARIABLE vom Funktionstyp.
+    //
+    // Der Zweig darueber kennt das Local, die Feld-Faelle stehen weiter oben —
+    // die Modulvariable fehlte. Sie LESEN kann der Lowerer laengst
+    // (globalNameBuf, benutzt wenn eine globale Variable als Wert auftritt);
+    // beim AUFRUF wurde nur nicht danach gefragt, und der Name fiel bis zur
+    // Abbruchmeldung durch: "unbekannter Builtin/Funktion: g_cb". Zuweisung
+    // und Vergleich derselben Variablen gingen deshalb, nur der Aufruf nicht.
+    //
+    // Auf dem x86-Weg war das #1574 ("Aufruf ueber eine GLOBALE Variable vom
+    // Funktionstyp ... endete in 'undefined function gFn'"). Dieselbe Frage,
+    // zwei Stellen, eine davon nachgezogen.
+    //
+    // Bewusst NACH der Local-Frage: ein gleichnamiges Local verdeckt die
+    // globale Variable, wie ueberall sonst auch.
+    var gvStrBuf: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
+    var gvI: int64 := 0;
+    while gvI < self.globalNameCnt {
+      var gvRec:  int64 := self.globalNameBuf + gvI * 32;
+      var gvOff:  int64 := peek64(gvRec + 0);
+      var gvLen:  int64 := peek64(gvRec + GLOBAL_REC_OFF_NAMELEN);
+      var gvIdx:  int64 := peek64(gvRec + GLOBAL_REC_OFF_IDX);
+      if gvLen == fnlen {
+        var gvPtr:   int64 := gvStrBuf + gvOff;
+        var gvMatch: int64 := 1;
+        var gvJ:     int64 := 0;
+        while gvJ < fnlen {
+          if gvMatch != 0 {
+            if peek8(gvPtr + gvJ) != peek8((fname as int64) + gvJ) { gvMatch := 0; }
+          }
+          gvJ += 1;
+        }
+        if gvMatch != 0 {
+          // Adresse VOR den Argumenten laden — die Arg-Stores belegen die
+          // Slots 0..N-1, die Fn-Adresse darf davon nicht getroffen werden.
+          var gvFn: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_LOAD_GLOBAL, gvFn, gvIdx, -1, 0);
+          var gvArg: int64 := arg0;
+          var gvN:   int64 := 0;
+          while gvArg >= 0 {
+            var gvAT: int64 := self.lowerExpr(gvArg);
+            self.irAddInstrDirect(IRO_STORE_LOCAL, gvN, gvAT, -1, 0);
+            gvN += 1;
+            gvArg := self.nodeNext(gvArg);
+          }
+          self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, gvFn, -1, gvN);
+          return dest;
+        }
+      }
+      gvI += 1;
     }
 
     // fix/lyxos-builtin-misdispatch: KEIN stiller id=1=PrintStr-Default mehr.
