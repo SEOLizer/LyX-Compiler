@@ -72,6 +72,13 @@ LyxOS-Builtin-Misdispatch (PR #839) und der verworfene Opcode-Catch-all
 | 300 | abrunden (`roundsd`, Modus 1) | `fFloor` | #1720; SSE4.1, wie auf dem x86-Weg |
 | 301 | aufrunden (`roundsd`, Modus 2) | `fCeil` | #1720 |
 | 302 | kaufmaennisch runden (`roundsd`, Modus 0) | `fRound` | #1720; zur geraden Zahl |
+| 303 | f64 als Text, Zeiger zurück | `FloatToStr` | #1720; derselbe Formatierer wie ID 9, ohne Ausgabe |
+| 304 | Zeichenketten auf Gleichheit | `StrEq`, `StrEquals` | #1720 |
+| 305 | Anfang einer Zeichenkette prüfen | `StrStartsWith` | #1720 |
+| 306 | Dateigröße oder −1 | `FileSize` | #1720; open + seek(ENDE) + close |
+| 307 | Leerraum vorn/hinten entfernen | `StrTrim` | #1720; ändert an Ort und Stelle, gibt Zeiger zurück |
+| 308 | Teilkette suchen, Index oder −1 | `StrFind` | #1720; leere Nadel → 0 |
+| 309 | Datei ganz lesen, nullterminiert | `FileReadAll` | #1720; 0 bei Fehler |
 
 Warum oberhalb des Syscall-Bereichs und nicht darin: das sind keine Syscalls,
 sondern Rechenoperationen, die jedes Backend umsetzen kann. Sie im
