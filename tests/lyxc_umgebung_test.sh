@@ -35,13 +35,19 @@ else
 fi
 
 # 2: kein Compiler-Aufruf am Namen vorbei
-vorbei=$(grep -rnE '"\$ROOT/lyxc"|"\$REPO_ROOT/lyxc"|(^|[^a-zA-Z_.])\./lyxc[[:space:]]' \
+# Gesucht sind AUFRUFE, nicht Vorkommen des Wortes. Der Pfad muss also an
+# einer Befehlsstelle stehen: Zeilenanfang, nach ; & | ( oder in $( ).
+# Frueher genuegte das blosse Vorkommen, mit `echo` als einziger Ausnahme —
+# damit schlug der Waechter bei einer Textmeldung an
+# (`ok "vorhandenes ./lyxc bleibt unangetastet"`), die gar nichts aufruft.
+# Ein Waechter, der falsch anschlaegt, wird irgendwann entschaerft; deshalb
+# lieber die Regel schaerfen als die Meldung umschreiben.
+vorbei=$(grep -rnE '(^|[;&|(]|\$\()[[:space:]]*("?\$ROOT/lyxc"?|"?\$REPO_ROOT/lyxc"?|\./lyxc)[[:space:]]' \
          tests/ --include='*.sh' \
          | grep -v "^$AUSNAHME:" \
          | grep -v "^tests/lyxc_umgebung_test.sh:" \
          | grep -v 'LYXC:-' \
-         | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
-         | grep -v 'echo ')
+         | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#')
 if [ -z "$vorbei" ]; then
   _pass "2 kein Aufruf am Namen LYXC vorbei"
 else

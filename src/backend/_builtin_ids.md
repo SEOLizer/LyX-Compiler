@@ -25,6 +25,8 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 | 1 | `write(1, ptr, len)` | `PrintStr`, `PrintLn`, `Print` | Länge −1 = „strlen zur Laufzeit"; **nur das lyxos-Backend wertet den Sentinel aus** |
 | 2 | Ganzzahl nach stdout | `PrintInt`, `PrintLn`, `Print` | ohne Zeilenumbruch; `Print`/`PrintLn` seit #1716 auch mit Zahl-Argument, `PrintLn` haengt den Umbruch als eigenen ID-1-Aufruf an |
 | 3 | Prozessende | `Exit`, `panic` | `panic` beendet mit 1 (#1720) |
+| 4 | Pseudozufallszahl (xorshift64) | `Random` | #1728; der Zustand liegt im Wort hinter den Programm-Globalen |
+| 5 | Zustand des Zufallsgenerators setzen | `RandomSeed` | #1728 |
 | 6 | Teilzeichenkette | `StrSub` | |
 | 7 | Verkettung | `StrConcat` | |
 | 8 | Kopie | `StrCopy` | |
@@ -40,7 +42,7 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 | 18 | Zeiger auf den Argumentvektor | `GetArgV`, `GetArg` | #1720; `GetArg(i)` ist ID 18 plus ein Lesezugriff, keine eigene ID |
 | 19 | Zeiger auf den Umgebungsblock | `GetEnvBlock` | #1720; auf lyxos und Linux 0 — nur die win64-Laufzeit setzt ihn (#1677) |
 
-Frei: 4, 5. **Der Bereich ist damit fast ausgeschöpft** — wer eine weitere allgemeine ID braucht, erweitert den Bereich, statt eine bestehende doppelt zu belegen.
+**Der allgemeine Bereich ist ausgeschöpft** (mit #1728 auch 4 und 5) — wer eine weitere allgemeine ID braucht, erweitert den Bereich, statt eine bestehende doppelt zu belegen.
 
 ## Backend-Abdeckung der allgemeinen IDs
 
@@ -52,7 +54,7 @@ Frei: 4, 5. **Der Bereich ist damit fast ausgeschöpft** — wer eine weitere al
 | RISC-V Linux | 1, 2, 3, **13, 15, 200–205, 208, 209** | Rest meldet Fehler (#1388) |
 | ARM Cortex-M | **200–205, 208, 209**; 1, 2, 3, 9, 12, 13, 14 als ausdrücklicher No-op bzw. BKPT | alles Übrige meldet Fehler |
 | Xtensa | 1, 2 | Rest meldet Fehler (#1388, Kodierungen fehlen — vgl. #1281) |
-| lyxos (LBF) | 1, 2, **3**, **6**, **9**, **13, 14, 15, 16, 17, 18, 19** + 20 … 256 | 7, 8, 10–12 — melden Fehler (#1715) |
+| lyxos (LBF) | 1, 2, **3**, **4**, **5**, **6**, **9**, **13, 14, 15, 16, 17, 18, 19** + 20 … 256 | 7, 8, 10–12 — melden Fehler (#1715) |
 
 **Speicherzugriffe (200–205, 208, 209)** sind seit #1388 auf ARM64, RISC-V und
 Cortex-M umgesetzt. Sie brauchen kein Betriebssystem und gelten deshalb auch
@@ -62,6 +64,18 @@ Eine nicht behandelte ID **muss laut scheitern**. Ein stiller Default-Zweig
 verwandelt jede Lücke in stille Fehlfunktion — dieselbe Klasse wie der
 LyxOS-Builtin-Misdispatch (PR #839) und der verworfene Opcode-Catch-all
 (PR #867).
+
+## Bereich ab 300 — allgemeine IDs, die im Block 1…19 keinen Platz mehr fanden
+
+| ID | Operation | Lowering von | Anmerkung |
+|---:|---|---|---|
+| 300 | abrunden (`roundsd`, Modus 1) | `fFloor` | #1720; SSE4.1, wie auf dem x86-Weg |
+| 301 | aufrunden (`roundsd`, Modus 2) | `fCeil` | #1720 |
+| 302 | kaufmaennisch runden (`roundsd`, Modus 0) | `fRound` | #1720; zur geraden Zahl |
+
+Warum oberhalb des Syscall-Bereichs und nicht darin: das sind keine Syscalls,
+sondern Rechenoperationen, die jedes Backend umsetzen kann. Sie im
+lyxos-Block zu vergeben haette den Namensraum belogen.
 
 ## Bereich 20 … 256 — lyxos-Syscalls
 

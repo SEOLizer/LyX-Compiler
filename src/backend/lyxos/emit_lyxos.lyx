@@ -743,13 +743,25 @@ pub type EmitLyxOS = class {
             self.emit64(peek64(gBuf + i * 8));   // Init-Wert (oder 0)
             i := i + 1;
         }
-        // RIP-relative Disp32 patchen: disp = (globalsBase + gIdx*8) - (dispOff + 4)
+        // #1728: ein Wort HINTER den Programm-Globalen fuer den Zustand des
+        // Zufallsgenerators. xorshift64 traegt seinen Zustand zwischen den
+        // Aufrufen; auf x86 liegt er in CG_RAND_STATE im Datenbereich, hier
+        // bekommt er einen eigenen Platz am Ende des Pools.
+        //
+        // 0 ist der Startwert und bedeutet "noch nicht gesetzt" — xorshift64
+        // darf nicht mit 0 laufen, sonst bleibt es fuer immer 0. Der Emitter
+        // faengt das ab, genau wie der x86-Weg.
+        self.emit64(0);
+        // RIP-relative Disp32 patchen: disp = (globalsBase + gIdx*8) - (dispOff + 4).
+        // gIdx < 0 kennzeichnet das Zustandswort; es liegt bei Index gCount.
         var p: int64 := 0;
         while p < self.globalPatchCount {
             var rec:     int64 := self.globalPatchBuf + p * 16;
             var dispOff: int64 := peek64(rec + 0);
             var gIdx:    int64 := peek64(rec + 8);
-            self.patch32(dispOff, (self.globalsBase + gIdx * 8) - (dispOff + 4));
+            var gEff:    int64 := gIdx;
+            if gIdx < 0 { gEff := gCount; }
+            self.patch32(dispOff, (self.globalsBase + gEff * 8) - (dispOff + 4));
             p := p + 1;
         }
     }
@@ -1044,6 +1056,16 @@ pub type EmitLyxOS = class {
             self.emitEPrintNewline();
         } else if id == 15 {
             self.emitStrLen(dest);
+        } else if id == 300 {
+            self.emitRoundSd(dest, 1);
+        } else if id == 301 {
+            self.emitRoundSd(dest, 2);
+        } else if id == 302 {
+            self.emitRoundSd(dest, 0);
+        } else if id == 4 {
+            self.emitRandom(dest);
+        } else if id == 5 {
+            self.emitRandomSeed(dest);
         } else if id == 6 {
             self.emitStrSub(dest);
         } else if id == 9 {
@@ -2251,6 +2273,70 @@ pub type EmitLyxOS = class {
     // spaeter Argumente durch, aendert sich genau diese Stelle.
     fn emitNullArg(dest: int64): void {
         self.emit8(0x48); self.emit8(0x31); self.emit8(0xC0);  // XOR rax, rax
+        self.emitMovSlotFromRax(dest);
+    }
+
+    // ID 300/301/302 (#1720): fFloor / fCeil / fRound.
+    //
+    // Sie brauchen `roundsd` (SSE4.1) und liessen sich deshalb nicht wie die
+    // uebrigen zwoelf Gleitkomma-Namen auf vorhandene IR-Opcodes abbilden.
+    // Der x86-Weg benutzt denselben Befehl, die Voraussetzung ist also nicht
+    // neu.
+    //
+    // Die Nummern liegen OBERHALB des Syscall-Bereichs: der allgemeine
+    // Bereich 1…19 ist seit #1728 voll, und eine bestehende ID doppelt zu
+    // belegen war 2026 der Printf/mem_barrier-Fall (#1037) — dort emittierte
+    // Printf auf ARM64 stumm eine Speicherbarriere.
+    //
+    // modus: 1 = abrunden, 2 = aufrunden, 0 = kaufmaennisch zur geraden Zahl.
+    fn emitRoundSd(dest: int64, modus: int64): void {
+        self.emitMovRaxFromSlot(0);
+        self.emit8(0x66); self.emit8(0x48); self.emit8(0x0F); self.emit8(0x6E); self.emit8(0xC0);  // MOVQ xmm0, rax
+        self.emit8(0x66); self.emit8(0x0F); self.emit8(0x3A); self.emit8(0x0B); self.emit8(0xC0);
+        self.emit8(modus);                                                                          // ROUNDSD xmm0, xmm0, modus
+        self.emit8(0x66); self.emit8(0x48); self.emit8(0x0F); self.emit8(0x7E); self.emit8(0xC0);  // MOVQ rax, xmm0
+        self.emitMovSlotFromRax(dest);
+    }
+
+    // ID 4/5 (#1728): Random() und RandomSeed(seed).
+    //
+    // xorshift64, wie auf dem x86-Weg. Der Zustand liegt im Wort hinter den
+    // Programm-Globalen (siehe emitGlobalsPool); erreicht wird er
+    // RIP-relativ ueber dieselbe Patch-Maschinerie wie jede Globale, mit
+    // gIdx < 0 als Kennzeichnung.
+    //
+    // Der Nullzustand wird abgefangen: xorshift64 bleibt bei 0 stehen, ein
+    // Generator der immer 0 liefert waere ein stiller Fehler.
+    fn emitRandom(dest: int64): void {
+        // MOV rax, [rip+zustand]
+        self.emit8(0x48); self.emit8(0x8B); self.emit8(0x05);
+        self.recordGlobalPatch(self.codeLen, 0 - 1); self.emit32(0);
+        self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);          // TEST rax, rax
+        self.emit8(0x75); self.emit8(0x07);                            // JNZ +7 (Zustand gesetzt)
+        self.emit8(0x48); self.emit8(0xC7); self.emit8(0xC0); self.emit32(1);  // MOV rax, 1
+        // x ^= x << 13
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xC1);          // MOV rcx, rax
+        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE1); self.emit8(0x0D);  // SHL rcx, 13
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xC8);          // XOR rax, rcx
+        // x ^= x >> 7
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xC1);          // MOV rcx, rax
+        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE9); self.emit8(0x07);  // SHR rcx, 7
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xC8);          // XOR rax, rcx
+        // x ^= x << 17
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xC1);          // MOV rcx, rax
+        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE1); self.emit8(0x11);  // SHL rcx, 17
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xC8);          // XOR rax, rcx
+        // MOV [rip+zustand], rax
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0x05);
+        self.recordGlobalPatch(self.codeLen, 0 - 1); self.emit32(0);
+        self.emitMovSlotFromRax(dest);
+    }
+
+    fn emitRandomSeed(dest: int64): void {
+        self.emitMovRaxFromSlot(0);                                    // rax = seed
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0x05);          // MOV [rip+zustand], rax
+        self.recordGlobalPatch(self.codeLen, 0 - 1); self.emit32(0);
+        self.emit8(0x31); self.emit8(0xC0);                            // XOR eax, eax
         self.emitMovSlotFromRax(dest);
     }
 

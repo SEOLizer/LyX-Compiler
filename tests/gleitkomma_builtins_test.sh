@@ -33,15 +33,40 @@ for fn in "fToInt(3.9)" "fLt(1.0, 2.0)" "fGe(2.0, 2.0)"; do
   then ok "lyxos: $fn"; else bad "lyxos: $fn" "$(grep -iE 'unbekannt|error' "$TMP/l" | head -1)"; fi
 done
 
-# --- 2: fFloor/fCeil/fRound muessen WEITER scheitern --------------------------
-# Sie brauchen roundsd (SSE4.1) und damit einen eigenen Opcode. Halb umgesetzt
-# waeren sie schlimmer als gar nicht — der Test haelt das Offene sichtbar.
+# --- 2: fFloor/fCeil/fRound ---------------------------------------------------
+# Sie brauchen `roundsd` (SSE4.1) und liessen sich deshalb nicht wie die
+# uebrigen zwoelf auf vorhandene IR-Opcodes abbilden. Bis 1.1.4I standen sie
+# hier als "muss weiterhin laut scheitern"; mit den IDs 300-302 sind sie
+# umgesetzt, und genau dieser Eintrag hat die Aenderung eingefordert — der
+# Test wurde rot, weil sie ploetzlich bauten.
 for fn in fFloor fCeil fRound; do
   printf 'fn main(): int64 { var f: f64 := %s(1.7); return 0; }\n' "$fn" > "$TMP/t.lyx"
   if timeout 200 "$LYXC" --std-path="$ROOT" --target=lyxos "$TMP/t.lyx" -o "$TMP/t.out" >"$TMP/l" 2>&1
-  then bad "$fn meldet keinen Fehler mehr" "umgesetzt? dann Test und #1720 nachziehen"
-  else ok "$fn scheitert weiterhin laut (#1720)"; fi
+  then ok "lyxos: $fn(1.7)"
+  else bad "lyxos: $fn" "$(grep -iE 'unbekannt|Builtin-ID' "$TMP/l" | head -1)"; fi
 done
+
+# --- 2b: und sie muessen richtig RUNDEN --------------------------------------
+# floor(1.7)=1, ceil(1.2)=2, round(2.5)=2 (kaufmaennisch zur geraden Zahl, wie
+# roundsd Modus 0 und wie der x86-Weg). Ein vertauschter Modus baut klaglos.
+cat > "$TMP/rd.lyx" <<'EOF'
+fn main(): int64 {
+  var s: int64 := 0;
+  if (fToInt(fFloor(1.7)) == 1) { s := s + 1; }
+  if (fToInt(fCeil(1.2)) == 2)  { s := s + 2; }
+  if (fToInt(fRound(2.5)) == 2) { s := s + 4; }
+  if (fToInt(fRound(3.5)) == 4) { s := s + 8; }
+  PrintInt(s); PrintStr("\n");
+  return 0;
+}
+EOF
+if timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/rd.lyx" -o "$TMP/rd.out" >"$TMP/l" 2>&1; then
+  got="$("$TMP/rd.out" 2>&1 | tr -d '\r\n')"
+  if [ "$got" = "15" ]; then ok "Rundung stimmt (floor/ceil/round, auch 3.5 -> 4)"
+  else bad "Rundung" "Summe $got statt 15"; fi
+else
+  bad "Rundung" "uebersetzt nicht: $(grep -i error "$TMP/l" | head -1)"
+fi
 
 # --- 3: die Rechnung stimmt ---------------------------------------------------
 # Bewusst ueber die AUSGABE, nicht ueber den Exit-Code: der ist 8 Bit breit,
