@@ -3,7 +3,7 @@
 # Vorher fehlte JEDE Arity-Prüfung → zu wenige/viele Args wurden akzeptiert → fehlende Args
 # = Garbage/Crash (z.B. DNSResolve(1 statt 4 Args) → Core-Dump). Nur same-module reguläre
 # Lyx-Funktionen werden geprüft; extern/FFI + cross-module (modul-relative declNi) bleiben außen.
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="$ROOT/lyxc"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0

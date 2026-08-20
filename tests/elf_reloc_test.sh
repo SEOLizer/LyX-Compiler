@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/elf_reloc_test.sh — LyxOS-Reloc Step 1: WriteELF emittiert PT_LYXRELOC (0x6FFFAA00)
 # für Release-Builds mit Base-Relocs (Klassen/VMT). Linux ignoriert das Segment → läuft normal.
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="$ROOT/lyxc"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0

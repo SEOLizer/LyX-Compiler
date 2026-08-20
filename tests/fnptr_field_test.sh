@@ -2,7 +2,7 @@
 # tests/fnptr_field_test.sh — A1: Fn-Typ-Alias als Klassen-Feld (ELF).
 # fn-Name als Wert (Adresse), Zuweisung in Feld, Null-Check, direkter Feld-Call.
 # Vorher: `b.on_click(...)` → Methoden-Mangle TButton_on_click (undefined); fn-Name → 0.
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="$ROOT/lyxc"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0

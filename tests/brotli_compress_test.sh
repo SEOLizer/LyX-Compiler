@@ -24,7 +24,7 @@
 # Kopfes überschreiten (4, 5 und 6 Nibbles für MLEN).
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LYXC="$ROOT/lyxc"
+LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0

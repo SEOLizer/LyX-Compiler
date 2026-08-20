@@ -18,7 +18,7 @@
 # falsche Marke patcht, weil dort beide Funktionen schlicht `Wert` heißen.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LYXC="$ROOT/lyxc"
+LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 cp "$ROOT/tests/data/ns/eins.lyx" "$ROOT/tests/data/ns/zwei.lyx" "$TMP/" 2>/dev/null

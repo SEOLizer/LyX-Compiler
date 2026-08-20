@@ -12,7 +12,7 @@
 # sie dieselben Schalter, die der Compiler heute annimmt?
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LYXC="$ROOT/lyxc"
+LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 MAN_SRC="$ROOT/man/lyxc.1"
 MAN_PKG="$ROOT/lyx-compiler/usr/share/man/man1/lyxc.1.gz"

@@ -12,13 +12,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SRC="$ROOT/tests/regression/misc/int_widths.lyx"
 OUT=/tmp/int_widths_test
+LYXC="${LYXC:-$ROOT/lyxc}"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 
-if [ ! -x "$ROOT/lyxc" ]; then
+if [ ! -x "$LYXC" ]; then
   echo "FAIL lyxc fehlt — vorher 'make bootstrap'"
   exit 1
 fi
 
-"$ROOT/lyxc" --std-path="$ROOT" "$SRC" -o "$OUT" >/dev/null 2>&1
+"$LYXC" --std-path="$ROOT" "$SRC" -o "$OUT" >/dev/null 2>&1
 OUTPUT=$("$OUT" | tr -d '\r')
 if [ "$OUTPUT" = "124" ]; then
   echo "PASS int_widths: $OUTPUT"

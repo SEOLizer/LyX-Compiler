@@ -73,16 +73,18 @@ check ebnf.md "Standvermerk" \
 
 # Das gebaute Binary, falls vorhanden: es ist die einzige Stelle, die zaehlt,
 # wenn jemand `lyxc --version` aufruft.
-if [ -x "$ROOT/lyxc" ]; then
-  got=$("$ROOT/lyxc" --version 2>/dev/null | head -1 | sed 's/^lyxc //')
+LYXC="${LYXC:-$ROOT/lyxc}"
+_g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
+if [ -x "$LYXC" ]; then
+  got=$("$LYXC" --version 2>/dev/null | head -1 | sed 's/^lyxc //')
   if [ "$got" = "$want" ]; then
-    echo "PASS ./lyxc --version"
+    echo "PASS Binary --version"
   else
-    echo "FAIL ./lyxc --version: '$got' erwartet '$want' — Binary ist aelter als die Quelle"
+    echo "FAIL Binary --version: '$got' erwartet '$want' — Binary ist aelter als die Quelle"
     fail=$((fail+1))
   fi
 else
-  echo "SKIP ./lyxc --version (kein Binary gebaut)"
+  echo "SKIP Binary --version (kein Binary gebaut)"
 fi
 
 echo

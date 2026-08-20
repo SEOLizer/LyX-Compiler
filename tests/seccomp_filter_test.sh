@@ -22,7 +22,7 @@
 # soll nicht stillschweigend Rechte umschreiben duerfen.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LYXC="$ROOT/lyxc"
+LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"; rm -rf /tmp/lyx_sc_probe_* 2>/dev/null' EXIT
 PASS=0; FAIL=0

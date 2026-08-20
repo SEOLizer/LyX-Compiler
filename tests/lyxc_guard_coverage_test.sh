@@ -56,7 +56,7 @@ fi
 # obigen Pruefungen bestehen.
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 cat > "$TMP/probe.sh" <<PROBEEOF
-LYXC="$ROOT/lyxc"
+LYXC="${LYXC:-$ROOT/lyxc}"
 LYXC_TIMEOUT=1
 . "$ROOT/tests/lib/lyxc_guard.sh"
 "\$LYXC" --std-path="$ROOT" "$ROOT/src/lyxc.lyx" -o "$TMP/out" >/dev/null 2>&1
@@ -70,7 +70,7 @@ else
 fi
 
 cat > "$TMP/probe2.sh" <<PROBEEOF
-LYXC="$ROOT/lyxc"
+LYXC="${LYXC:-$ROOT/lyxc}"
 LYXC_VM_KB=20000
 . "$ROOT/tests/lib/lyxc_guard.sh"
 "\$LYXC" --std-path="$ROOT" "$ROOT/src/lyxc.lyx" -o "$TMP/out2" >/dev/null 2>&1
@@ -89,7 +89,7 @@ cat > "$TMP/ok.lyx" <<'LYXEOF'
 fn main(): int64 { return 0; }
 LYXEOF
 cat > "$TMP/probe3.sh" <<PROBEEOF
-LYXC="$ROOT/lyxc"
+LYXC="${LYXC:-$ROOT/lyxc}"
 . "$ROOT/tests/lib/lyxc_guard.sh"
 "\$LYXC" --std-path="$ROOT" "$TMP/ok.lyx" -o "$TMP/ok" >/dev/null 2>&1
 echo \$?

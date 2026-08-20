@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/asm_block_test.sh — WSP-05: asm { "mnemonic" } Inline-Assembly (ELF).
 # Feste Mnemonic-Tabelle → echte x86-Bytes; `asm` als Soft-Keyword; unbekannt → Fehler.
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="$ROOT/lyxc"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"; LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0

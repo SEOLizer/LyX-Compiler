@@ -14,7 +14,7 @@
 #
 # Verwendung — EINE Zeile, direkt nach der LYXC-Zuweisung:
 #
-#     LYXC="$ROOT/lyxc"
+#     LYXC="${LYXC:-$ROOT/lyxc}"
 #     . "$ROOT/tests/lib/lyxc_guard.sh"
 #
 # Stellschrauben (vor dem Einbinden setzen):

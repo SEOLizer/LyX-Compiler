@@ -14,7 +14,7 @@
 # den Lauf rot — das ist der Verfallsschutz.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-LYXC="$ROOT/lyxc"
+LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 LIST="$ROOT/tests/suite-external.txt"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
