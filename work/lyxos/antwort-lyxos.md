@@ -82,6 +82,45 @@ Vollständige Liste im Anhang.
 
 ## 3. Zusagen
 
+> **NACHTRAG 2026-08-20, wenige Stunden spaeter: alles unter „Ja" ist gebaut.**
+> Nummern 300–320 vergeben, implementiert und mit `/bin/systest.elf` geprueft —
+> 25 von 25 Pruefungen bestanden. Die Argumentfolgen stehen unten und sind
+> verbindlich. `systest.lyx` im lyx-os-Baum ist zugleich die Vorlage, wie die
+> Aufrufe zu bedienen sind.
+>
+> | Nr | Aufruf | Nr | Aufruf |
+> |---:|---|---:|---|
+> | 300 | `sys_access` | 311 | `sys_statfs` |
+> | 301 | `sys_fcntl` | 312 | `sys_sched_getaffinity` |
+> | 302 | `sys_dup2` | 313 | `sys_sched_setaffinity` |
+> | 303 | `sys_dup3` | 314 | `sys_getpriority` |
+> | 304 | `sys_ftruncate` | 315 | `sys_setpriority` |
+> | 305 | `sys_fsync` | 316 | `sys_futex_wait` |
+> | 306 | `sys_fdatasync` | 317 | `sys_futex_wake` |
+> | 307 | `sys_uname` | 318 | `sys_futex_requeue` |
+> | 308 | `sys_getcpu` | 319 | `sys_kill` |
+> | 309 | `sys_readv` | 320 | `sys_pipe2` |
+> | 310 | `sys_writev` | | |
+>
+> **Sechs Abweichungen, die ihr kennen muesst — keine davon ist ein Bug:**
+> 1. `dup2`/`dup3` teilen den **Dateizeiger nicht**. Slot-Kopie, danach laufen
+>    beide Deskriptoren unabhaengig. Fuer Umleiten vor einem exec reicht das.
+> 2. `ftruncate` kann **nur auf 0**. Andere Laengen liefern -1, statt still
+>    etwas anderes zu tun.
+> 3. `statfs` meldet **freie Bloecke als -1 (unbekannt)**. Eine Zaehlung
+>    braeuchte einen vollstaendigen FAT-Durchlauf; eine erfundene Zahl waere
+>    schlechter als ein erkennbares „weiss ich nicht".
+> 4. `get`/`setpriority` benutzen die **LyxOS-Skala 0–255** (0 = HARD_RT,
+>    128 = NORMAL, 255 = IDLE), nicht nice. Eine Abbildung auf -20..19 waere
+>    verlustbehaftet und wuerde Rueckschreiben kaputtmachen.
+> 5. `pipe2` **blockiert nicht**. Leer liefert 0, voll nimmt 0 Byte an.
+> 6. `kill` ist **kein Signalmodell**: keine Handler, keine Nummern. `sig=0`
+>    prueft Existenz, sonst wird der Thread beendet.
+>
+> `fcntl` speichert `O_NONBLOCK`, wertet es aber noch nicht aus — `read` auf
+> fd=0 blockiert weiterhin. Bewusst so, statt das Flag zu schlucken und Erfolg
+> zu melden.
+
 ### Ja, und billig — vergebt Nummern ab 300
 
 `sys_access`, `sys_fcntl` (mindestens `F_GETFL`/`F_SETFL` für `O_NONBLOCK`),
@@ -109,12 +148,11 @@ Hypervisor-Erkennung bedienen.
 
 ### Nein — und zwar begründet, nicht aus Bequemlichkeit
 
-- **`sys_recvfrom`/`sys_sendto` (29 Stellen)** — der mit Abstand größte Posten
-  eurer Liste, aber: **LyxOS hat keinen Bluetooth-Treiber.** Kein HCI, kein
-  L2CAP, nichts. Die vier `hardware.bluetooth*`-Units laufen hier nicht, egal
-  welche Syscalls existieren. Für `net.socket` fehlt uns UDP auf Nutzerebene
-  (wir haben TCP und rohe Frames); das wäre der ehrliche Weg, nicht eine
-  BSD-Socket-Fassade.
+- **`sys_recvfrom`/`sys_sendto` (29 Stellen)** — **KORREKTUR, siehe unten: die
+  UDP-Hälfte dieser Absage war falsch und ist inzwischen gebaut.** Was bleibt:
+  **LyxOS hat keinen Bluetooth-Treiber.** Kein HCI, kein L2CAP, nichts. Die vier
+  `hardware.bluetooth*`-Units laufen hier nicht, egal welche Syscalls
+  existieren.
 - **xattr-Familie (8 Aufrufe)** — FAT32 kennt keine erweiterten Attribute. Auf
   IOFS wären sie über Graph-Kanten darstellbar, aber das wäre etwas anderes als
   POSIX-xattr. Tragt sie als `-ENOSYS` ein.
@@ -133,6 +171,42 @@ Hypervisor-Erkennung bedienen.
   Vergleichbares.
 
 ---
+
+## 3b. Korrektur: UDP ist doch da — `sendto`/`recvfrom` sind gebaut
+
+Die Absage oben stützte sich zur Hälfte auf einen Irrtum. Wir schrieben, für
+`net.socket` fehle UDP auf Nutzerebene. Das stimmt nicht: Der Stack kann UDP
+seit jeher — `udp_build`, IP-Bau mit Prüfsummen und ein Empfangs-Demux nach
+Zielport, benutzt von DHCP (Port 68) und DNS (Port 53). Gefehlt hat nur der
+Durchgang nach Ring 3. Wir hatten nach `sys_udp`-Wrappern gesucht, keine
+gefunden und daraus auf die fehlende Fähigkeit geschlossen.
+
+Inzwischen implementiert und gegen eine echte Gegenstelle geprüft (30 von 30):
+
+| Nr | Aufruf | Argumente | Rückgabe |
+|---:|---|---|---|
+| 321 | `sys_udp_open` | `lport` (0 = ephemer) | sock_idx 0–7 / -1 |
+| 322 | `sys_udp_close` | `sock_idx` | 0 / -1 |
+| 323 | `sys_sendto` | `sock, buf, len, dst` | gesendete Bytes / -1 / -2 (ARP) |
+| 324 | `sys_recvfrom` | `sock, buf, maxlen, out` | Bytes, **0 = Zeitablauf** |
+| 325 | `sys_getsockname` | `sock, out, kind` (0=TCP, 1=UDP) | 0 / -1 |
+| 326 | `sys_getpeername` | `sock, out` | 0 / -1 (nur TCP) |
+
+**Adressformat:** `{ip: int64, port: int64}` — kein `sockaddr_in`. Wir haben
+kein BSD-Socket-Modell, und eine Fassade würde nur Erwartungen wecken, die der
+Unterbau nicht einlöst. Bei `recvfrom` steht zusätzlich bei `out+16` das
+Zeitlimit in Millisekunden als **Eingabe**.
+
+**Die Grenze, die ihr kennen müsst:** Alle Netzoperationen pollen die Karte
+*innerhalb* des Aufrufs und verwerfen Fremdpakete — genau wie DHCP und DNS es
+seit jeher tun. Praktisch heißt das: **ein Socket zur Zeit**, und während des
+Wartens gehen Pakete für andere Ports verloren. Beim Testen wurde das konkret
+sichtbar: ein Paketstrom vom Host ließ die ARP-Auflösung scheitern, weil deren
+Warteschleife die Antwort verpasste. Echtes Multiplexing bräuchte einen
+Hintergrund-Thread mit Socket-Tabelle und Ringpuffer je Socket — das ist ein
+eigenes Paket und bewusst nicht enthalten.
+
+Für Bluetooth ändert das nichts. Die Units laufen hier nicht.
 
 ## 4. Zu eurer offenen Frage: das Ereignismodell
 

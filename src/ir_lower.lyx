@@ -354,6 +354,31 @@ pub type IRLower = class {
   pendingGenCount: int64;
   pendingGenCap:   int64;
 
+  // #1727: Erreichbarkeit. Der Vorpass sammelt ohnehin ALLE transitiv
+  // importierten Module in einer Arbeitsliste und wirft sie danach weg —
+  // hier wird sie behalten. Damit lassen sich die Importe spaeter mehrfach
+  // durchlaufen, OHNE sie erneut zu lesen und zu parsen; genau das waere
+  // beim Selbstbau von lyxc die teure Variante.
+  impLstSrc:   int64;
+  impLstNodes: int64;
+  impLstCnt:   int64;
+  impLstHead:  int64;
+  impLstN:     int64;
+  // Ein Byte je funcBuffer-Index: 1 = wird gebraucht. Gesetzt beim Lowern
+  // eines Aufrufs, gelesen beim Entscheiden, ob ein importierter Rumpf
+  // ueberhaupt entstehen muss.
+  wantBuf:     int64;
+  wantCap:     int64;
+  // Ein Byte je funcBuffer-Index: 1 = Rumpf ist bereits erzeugt. Ohne diese
+  // Buchfuehrung wuerde der Nachlauf ueber die Importliste Funktionen ein
+  // zweites Mal erzeugen — doppelte Symbole statt fehlender.
+  doneBuf:     int64;
+  doneCap:     int64;
+  // 0 = Hauptmodul (alles lowern), 1 = Import (nur Erreichbares).
+  nurErreichbar: int64;
+  // Merker fuer den Nachlauf: hat der letzte Durchgang etwas erzeugt?
+  _nochGelowert: int64;
+
   // #1693: Suchpfade fuer Importe. Die IR-Strecke hat sie bisher nicht
   // gekannt und jeden Import stur relativ zum ARBEITSVERZEICHNIS gelesen —
   // `-I` und `--std-path` blieben wirkungslos. Schlug das Lesen fehl, wurde
@@ -410,6 +435,17 @@ pub type IRLower = class {
     self.genFuncBuf   := alloc(16 * 24);
     self.genFuncCount := 0;
     self._importsDone := 0;
+    // #1727
+    self.impLstSrc := 0; self.impLstNodes := 0; self.impLstCnt := 0;
+    self.impLstHead := 0; self.impLstN := 0;
+    self.wantCap := 1024;
+    self.wantBuf := alloc(self.wantCap);
+    self.doneCap := 1024;
+    self.doneBuf := alloc(self.doneCap);
+    self.nurErreichbar := 0;
+    self._nochGelowert := 0;
+    var wbI: int64 := 0;
+    while wbI < self.wantCap { poke8(self.wantBuf + wbI, 0); poke8(self.doneBuf + wbI, 0); wbI := wbI + 1; }
     self._tregCap := 1024;
     self._tregN := 0;
     self._tregSrc   := alloc(self._tregCap * 8);
@@ -1991,6 +2027,20 @@ pub type IRLower = class {
         }
       }
       // src2 = argBase (Slot-Basis des Arg-Blocks) für emitCall
+      // #1727: dieser Aufruf braucht die Funktion — Index vormerken. Die
+      // Markierung entscheidet spaeter, ob ihr Rumpf ueberhaupt entsteht.
+      if fbUserIdx >= 0 {
+        if fbUserIdx >= self.wantCap {
+          var nwc: int64 := self.wantCap * 2;
+          while nwc <= fbUserIdx { nwc := nwc * 2; }
+          var nwb: int64 := alloc(nwc);
+          var cpI: int64 := 0;
+          while cpI < self.wantCap { poke8(nwb + cpI, peek8(self.wantBuf + cpI)); cpI := cpI + 1; }
+          while cpI < nwc { poke8(nwb + cpI, 0); cpI := cpI + 1; }
+          self.wantBuf := nwb; self.wantCap := nwc;
+        }
+        poke8(self.wantBuf + fbUserIdx, 1);
+      }
       self.irAddInstrDirect(IRO_CALL, dest, fbUserIdx, fbArgBase, fbArgCnt);
       return dest;
     }
@@ -5671,7 +5721,11 @@ pub type IRLower = class {
     // error_collector → StrLen aus std.string; lyxc importiert std.string nur transitiv).
     // Iterativ (Work-Queue, KEINE neue IRLower-Methode — Seed-vtable-Schutz, vgl. v3-Kommentar)
     // mit Pfad-Dedup gegen Mehrfach-Parse bei Diamond-Imports.
+    // #1727: Nur der oberste Aufruf macht Vorpass und Nachlauf; die
+    // Rekursion fuer einzelne Importe darf beides nicht wiederholen.
+    var binTop: int64 := 0;
     if self._importsDone == 0 {
+      binTop := 1;
       self._importsDone := 1;
       var WLCAP: int64 := 4096;
       var wlSrc:   int64 := alloc(WLCAP * 8);
@@ -5796,6 +5850,11 @@ pub type IRLower = class {
         }
         self.src := svSrc; self.nodes := svNodes; self.nodeCount := svCnt;
       }
+      // #1727: Liste behalten statt verwerfen. Eintrag 0 ist das Hauptmodul,
+      // 1..N-1 sind die transitiv importierten.
+      self.impLstSrc := wlSrc; self.impLstNodes := wlNodes;
+      self.impLstCnt := wlCnt; self.impLstHead := wlHead;
+      self.impLstN   := wlW;
     }
 
     var cur: int64 := decls;
@@ -5805,8 +5864,46 @@ pub type IRLower = class {
         // Skip extern (FFI) decls — no body to lower; calls become IRO_CALL_EXTERN.
         var bodyIsExtern: int64 := 0;
         if self.nodeC2(cur) == -1 && self.nodeC3(cur) != -1 { bodyIsExtern := 1; }
+        // #1727: Bei einem IMPORT nur erzeugen, was auch gerufen wird. Das
+        // Hauptmodul bleibt unangetastet — dort ist alles ein Einstiegspunkt.
+        //
+        // Die Registrierung im funcBuffer bleibt in jedem Fall bestehen (sie
+        // loest Vorwaertsreferenzen auf), nur der Rumpf entfaellt. Ein
+        // uebersehener Aufruf scheitert deshalb LAUT mit "undefined function"
+        // und nicht still mit einem falschen Ergebnis.
+        var fdIdx: int64 := 0 - 1;
         if bodyIsExtern == 0 {
+          fdIdx := self._findFuncByName(self.nodeSVal(cur), self.nodeSLen(cur));
+        }
+        var fdLowern: int64 := 0;
+        if bodyIsExtern == 0 {
+          if self.nurErreichbar == 0 {
+            fdLowern := 1;                       // Hauptmodul: immer
+          } else if fdIdx < 0 {
+            fdLowern := 1;                       // unbekannter Index: nicht raten, erzeugen
+          } else if fdIdx < self.wantCap {
+            if peek8(self.wantBuf + fdIdx) != 0 { fdLowern := 1; }
+          }
+          // schon erzeugt? dann nicht noch einmal
+          if fdLowern != 0 && fdIdx >= 0 && fdIdx < self.doneCap {
+            if peek8(self.doneBuf + fdIdx) != 0 { fdLowern := 0; }
+          }
+        }
+        if fdLowern != 0 {
+          if fdIdx >= 0 {
+            if fdIdx >= self.doneCap {
+              var ndc: int64 := self.doneCap * 2;
+              while ndc <= fdIdx { ndc := ndc * 2; }
+              var ndb: int64 := alloc(ndc);
+              var dcI: int64 := 0;
+              while dcI < self.doneCap { poke8(ndb + dcI, peek8(self.doneBuf + dcI)); dcI := dcI + 1; }
+              while dcI < ndc { poke8(ndb + dcI, 0); dcI := dcI + 1; }
+              self.doneBuf := ndb; self.doneCap := ndc;
+            }
+            poke8(self.doneBuf + fdIdx, 1);
+          }
           self.lowerFunc(cur);
+          self._nochGelowert := 1;
         }
       } else if (kind == NK_TYPE_DECL) {
         // ARM64-OOP: Methoden (c1-Chain) als Funktionen mit mangled Namen + impliziten
@@ -5858,7 +5955,11 @@ pub type IRLower = class {
             self.src       := impP.src;
             self.nodes     := impP.nodes;
             self.nodeCount := impP.nodeCount;
+            // #1727: ab hier gilt der Erreichbarkeitsfilter.
+            var impSavedModus: int64 := self.nurErreichbar;
+            self.nurErreichbar := 1;
             self.lowerModule(impHead);
+            self.nurErreichbar := impSavedModus;
             self.src       := impSavedSrc;
             self.nodes     := impSavedNodes;
             self.nodeCount := impSavedCount;
@@ -5866,6 +5967,43 @@ pub type IRLower = class {
         }
       }
       cur := self.nodeNext(cur);
+    }
+
+    // #1727: Nachlauf. Bis hierher ist jeder Import genau einmal durchlaufen
+    // worden — in Quelltextreihenfolge. Ruft eine importierte Funktion etwas
+    // in einem Modul, das VORHER abgearbeitet wurde, kam die Markierung zu
+    // spaet und der Rumpf fehlt.
+    //
+    // Der Nachlauf geht die behaltene Importliste erneut durch, bis ein
+    // vollstaendiger Durchgang nichts Neues mehr erzeugt. Gelesen und
+    // geparst wird dabei NICHTS: die Liste haelt Quelltext, Knoten und Kopf
+    // jedes Moduls aus dem Vorpass fest. Genau dafuer wird sie behalten.
+    if binTop != 0 && self.impLstN > 1 {
+      var nlSavedSrc:   pchar := self.src;
+      var nlSavedNodes: int64 := self.nodes;
+      var nlSavedCnt:   int64 := self.nodeCount;
+      var nlSavedModus: int64 := self.nurErreichbar;
+      self.nurErreichbar := 1;
+      var nlRunde: int64 := 0;
+      var nlWeiter: int64 := 1;
+      while nlWeiter != 0 && nlRunde < 16 {
+        self._nochGelowert := 0;
+        var nlI: int64 := 1;                       // 0 ist das Hauptmodul
+        while nlI < self.impLstN {
+          self.src       := peek64(self.impLstSrc + nlI * 8) as pchar;
+          self.nodes     := peek64(self.impLstNodes + nlI * 8);
+          self.nodeCount := peek64(self.impLstCnt + nlI * 8);
+          var nlHead: int64 := peek64(self.impLstHead + nlI * 8);
+          self.lowerModule(nlHead);
+          nlI := nlI + 1;
+        }
+        nlWeiter := self._nochGelowert;
+        nlRunde := nlRunde + 1;
+      }
+      self.nurErreichbar := nlSavedModus;
+      self.src       := nlSavedSrc;
+      self.nodes     := nlSavedNodes;
+      self.nodeCount := nlSavedCnt;
     }
 
     // WP-2.1: emit pending generic specializations collected during this module.
