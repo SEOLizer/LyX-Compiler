@@ -279,7 +279,8 @@ pub type EmitARM64 = class {
     var pSpillI: int64 := 0;
     while pSpillI < pSpillCount {
       if pSpillI < 8 {
-        self.emitStur(pSpillI, ARM64_X29, self.slotOff(pSpillI));
+        // #1388: Die Parameter liegen hinter dem Kratzstreifen, nicht ab Slot 0.
+        self.emitStur(pSpillI, ARM64_X29, self.slotOff(IR_BARG_SLOTS + pSpillI));
       }
       pSpillI := pSpillI + 1;
     }
@@ -481,7 +482,7 @@ pub type EmitARM64 = class {
 
     // --- Calls ---
     if op == IRO_CALL         { self.emitCall(src1, src2, imm, dest); }
-    if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, dest); }
+    if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, src1, dest); }
     if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, imm, dest); }
     if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest); }
     if op == IRO_CONST_STR    { self.emitConstStr(imm, dest); }
@@ -978,7 +979,7 @@ pub type EmitARM64 = class {
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
-  fn emitBuiltinCall(id: int64, dest: int64) {
+  fn emitBuiltinCall(id: int64, argBase: int64, dest: int64) {
     // WP-D2: Windows mode — emit BL placeholder to helper stubs instead of syscalls
     if self.winMode != 0 {
       if id == 1 {
@@ -1117,7 +1118,24 @@ pub type EmitARM64 = class {
       self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
     } else if id == 200 || id == 208 || id == 201 || id == 202
            || id == 203 || id == 209 || id == 204 || id == 205 {
-      self._emitPeekPoke(id);      // #1388
+      self._emitPeekPoke(id, argBase);      // #1388
+    } else if id == 206 {
+      // #1388: StrCharAt(s, i) — Byte an Position i, ohne Vorzeichen.
+      // Dieselbe argBase-Ablage wie peek/poke.
+      var b6: int64 := argBase;
+      if (b6 < 0) { b6 := 0; }
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(b6));      // x1 = s
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(b6 + 1));  // x2 = i
+      self.emit32(0x38626820);  // LDRB w0, [x1, x2]
+    } else if id == 207 {
+      // #1388: StrSetChar(s, i, c) — Byte an Position i setzen.
+      var b7: int64 := argBase;
+      if (b7 < 0) { b7 := 0; }
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(b7));      // x1 = s
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(b7 + 1));  // x2 = i
+      self.emitLdur(ARM64_X3, ARM64_X29, self.slotOff(b7 + 2));  // x3 = c
+      self.emit32(0x38226823);  // STRB w3, [x1, x2]
+      self.emit32(0xD2800000);  // MOVZ x0, #0
     } else if id == 13 {
       // #1388: EPrintStr — write(2, buf, strlen(buf)). Die Laenge rechnet der
       // Code selbst aus; die Aufrufkonvention reicht fuer Zeichenketten nur
@@ -1141,6 +1159,54 @@ pub type EmitARM64 = class {
       self.emit32(0x34000063);  // CBZ w3, +3 (→ ENDE)
       self.emit32(0x91000400);  // ADD x0,x0,#1
       self.emit32(0x17FFFFFD);  // B -3 (→ LOOP)
+    } else if id == 16 {
+      // #1388: IntToStr(n) — Dezimaltext, Zeiger nach x0.
+      //
+      // Der Puffer kommt aus mmap, nicht vom Stapel: der Zeiger muss den
+      // Aufruf ueberleben (dieselbe Ueberlegung wie im lyxos-Backend).
+      // Gerechnet wird von hinten nach vorn, weil die niedrigste Stelle
+      // zuerst herausfaellt; zurueck kommt ein Zeiger auf die erste Ziffer,
+      // nicht auf den Pufferanfang.
+      //
+      // Benutzt werden nur x0-x6, x8, x9 und x10 — die Register, die dieses
+      // Backend ohnehin als fluechtig behandelt. Ein erster Anlauf rechnete in
+      // x11-x15 und brachte laengere Programme zum Absturz.
+      self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(0));      // x9 = n
+      self.emitMovImmReg(ARM64_X0, 0);
+      self.emitMovImmReg(ARM64_X1, 64);
+      self.emitMovImmReg(ARM64_X2, 3);                          // PROT_READ|WRITE
+      self.emitMovImmReg(ARM64_X3, 0x22);                       // MAP_PRIVATE|ANON
+      self.emit32(0x92800004);                                  // MOVN x4, #0   (fd = -1)
+      self.emitMovImmReg(ARM64_X5, 0);
+      self.emitMovImmReg(ARM64_X8, SYS_MMAP);
+      self.emit32(0xD4000001);                                  // SVC #0 -> x0 = Puffer
+      self.emit32(0xAA0003EA);                                  // MOV x10, x0
+      self.emit32(0x9100FD42);                                  // ADD x2, x10, #63   (Schreibmarke)
+      self.emit32(0x3900005F);                                  // STRB wzr, [x2]     (Nullbyte)
+      // Vorzeichen merken, dann mit dem Betrag rechnen.
+      self.emitMovImmReg(ARM64_X3, 0);                          // x3 = Vorzeichenmerker
+      self.emit32(0xF100013F);                                  // CMP x9, #0
+      self.emit32(0x5400006A);                                  // B.GE +3
+      self.emit32(0xCB0903E9);                                  // NEG x9, x9
+      self.emitMovImmReg(ARM64_X3, 1);
+      self.emitMovImmReg(ARM64_X5, 10);                         // x5 = Teiler
+      // Ziffernschleife. Sie laeuft mindestens einmal, damit aus der 0 eine
+      // "0" wird und nicht eine leere Zeichenkette.
+      var itsLoop: int64 := self.codeLen;
+      self.emit32(0x9AC50924);                                  // UDIV x4, x9, x5
+      self.emit32(0x9B05A486);                                  // MSUB x6, x4, x5, x9  (Bit 15 unterscheidet MSUB von MADD)
+      self.emit32(0x9100C0C6);                                  // ADD x6, x6, #48
+      self.emit32(0xD1000442);                                  // SUB x2, x2, #1
+      self.emit32(0x39000046);                                  // STRB w6, [x2]
+      self.emit32(0xAA0403E9);                                  // MOV x9, x4
+      var itsRel: int64 := (itsLoop - self.codeLen) / 4;
+      self.emit32(0xB5000009 | ((itsRel & 0x7FFFF) << 5));      // CBNZ x9, Schleifenanfang
+      // Minuszeichen, falls es eins gab.
+      self.emit32(0xB4000083);                                  // CBZ x3, +4
+      self.emit32(0xD1000442);                                  // SUB x2, x2, #1
+      self.emit32(0x528005A6);                                  // MOVZ w6, #45  ('-')
+      self.emit32(0x39000046);                                  // STRB w6, [x2]
+      self.emit32(0xAA0203E0);                                  // MOV x0, x2
     } else if id == 14 {
       // #1388: Zeilenumbruch auf stderr (EPrintStrLn/EPrintLn).
       self.emit32(0xD10043FF);  // SUB sp,sp,#16
@@ -1169,13 +1235,23 @@ pub type EmitARM64 = class {
   // jede Unit unbrauchbar, die Speicher direkt anfasst (also fast die ganze
   // Standardbibliothek). Adresse steht in Slot 0, der Wert (beim Schreiben) in
   // Slot 1; das Ergebnis geht wie ueberall ueber x0 zurueck.
-  fn _emitPeekPoke(id: int64) {
-    self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(0));    // x1 = Adresse
+  fn _emitPeekPoke(id: int64, argBase: int64) {
+    // #1388: Die Adresse steht NICHT in Slot 0, sondern in einem hohen Block,
+    // dessen erster Slot als src1 mitkommt (argBase). ir_lower spillt seit dem
+    // Misdispatch-Fix (#839) absichtlich dorthin, weil die festen Slots 0..2
+    // die Locals des Aufrufers ueberschreiben. Bis 1.1.5C lasen die drei
+    // IR-Backends trotzdem Slot 0 und 1 — sie bekamen also irgendeinen Wert
+    // des Aufrufers als Adresse. Auf arm64 war das ein Segfault bei jedem
+    // peek8; gemessen wurde damals nur, ob die BYTES entstehen, nicht, ob das
+    // Programm laeuft.
+    var sBase: int64 := argBase;
+    if (sBase < 0) { sBase := 0; }
+    self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(sBase));    // x1 = Adresse
     if (id == 200) { self.emitLdrb0(ARM64_X0, ARM64_X1); return; }
     if (id == 208) { self.emitLdrh0(ARM64_X0, ARM64_X1); return; }
     if (id == 201) { self.emitLdrw0(ARM64_X0, ARM64_X1); return; }
     if (id == 202) { self.emitLdrx0(ARM64_X0, ARM64_X1); return; }
-    self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(1));    // x2 = Wert
+    self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(sBase + 1));    // x2 = Wert
     if (id == 203) { self.emitStrb0(ARM64_X2, ARM64_X1); }
     if (id == 209) { self.emitStrh0(ARM64_X2, ARM64_X1); }
     if (id == 204) { self.emitStrw0(ARM64_X2, ARM64_X1); }
@@ -1390,23 +1466,72 @@ pub type EmitARM64 = class {
   }
 
   fn emitLdur(rt: int64, rn: int64, off: int64) {
-    // LDUR Xt, [Xn, #simm9]
-    // 1111 1000 010 imm9 00 Rn Rt
-    self.emit32(0xF8400000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+    // LDUR Xt, [Xn, #simm9] — Bereichsgrenze wie bei emitStur (#1388).
+    if (off >= (0 - 256) && off <= 255) {
+      self.emit32(0xF8400000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+      return;
+    }
+    self._emitFarAddr(rn, off);
+    self.emit32(0xF9400000 | (16 << 5) | rt);          // LDR Xt, [x16]
   }
 
   fn emitStur(rt: int64, rn: int64, off: int64) {
     // STUR Xt, [Xn, #simm9]
-    self.emit32(0xF8000000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+    //
+    // #1388: simm9 reicht von -256 bis 255. Ein groesserer Offset wurde bis
+    // 1.1.5C stillschweigend auf neun Bit gekuerzt: Slot 32 liegt bei -264 und
+    // landete damit bei +248 — ein Schreibzugriff mitten in fremde Daten. Das
+    // fiel nicht auf, solange Funktionen klein blieben; der Kratzstreifen aus
+    // diesem Ticket schiebt jede Funktion um acht Slots weiter, und damit
+    // wurde aus der Enge ein Absturz.
+    //
+    // Passt es nicht, wird die Adresse erst gerechnet: x16 ist nach AAPCS64
+    // Kratzregister (IP0) und wird von diesem Backend sonst nicht benutzt.
+    if (off >= (0 - 256) && off <= 255) {
+      self.emit32(0xF8000000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+      return;
+    }
+    self._emitFarAddr(rn, off);
+    self.emit32(0xF9000000 | (16 << 5) | rt);          // STR Xt, [x16]
+  }
+
+  // #1388: x16 := Xn + off, fuer Offsets ausserhalb von simm9. off ist hier
+  // immer negativ (Slots liegen unter dem Rahmenzeiger); der Betrag passt in
+  // die 12 Bit von SUB, solange eine Funktion unter 512 Slots bleibt. Darueber
+  // wird laut gemeldet statt erneut still gekuerzt.
+  fn _emitFarAddr(rn: int64, off: int64) {
+    var betrag: int64 := 0 - off;
+    if (off > 0) {
+      EPrintStrLn("error: arm64: positiver Rahmen-Offset ausserhalb simm9 (#1388)"c);
+      exit(1);
+    }
+    if (betrag > 4095) {
+      EPrintStr("error: arm64: Rahmen zu gross — Slot-Offset "c);
+      EPrintInt(betrag);
+      EPrintStrLn(" passt weder in simm9 noch in SUB-imm12 (#1388)."c);
+      EPrintStrLn("  Die Funktion braucht mehr als 512 Slots; das Backend kann das nicht adressieren."c);
+      exit(1);
+    }
+    self.emit32(0xD1000000 | (betrag << 10) | (rn << 5) | 16);   // SUB x16, Xn, #betrag
   }
 
   fn emitFLdur(rt: int64, rn: int64, off: int64) {
-    // LDUR Dt, [Xn, #simm9]  (64-bit FP/SIMD)
-    self.emit32(0xFC400000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+    // LDUR Dt, [Xn, #simm9]  (64-bit FP/SIMD) — Bereichsgrenze wie oben (#1388).
+    if (off >= (0 - 256) && off <= 255) {
+      self.emit32(0xFC400000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+      return;
+    }
+    self._emitFarAddr(rn, off);
+    self.emit32(0xFD400000 | (16 << 5) | rt);          // LDR Dt, [x16]
   }
 
   fn emitFStur(rt: int64, rn: int64, off: int64) {
-    // STUR Dt, [Xn, #simm9]
+    // STUR Dt, [Xn, #simm9] — Bereichsgrenze wie oben (#1388).
+    if (off < (0 - 256) || off > 255) {
+      self._emitFarAddr(rn, off);
+      self.emit32(0xFD000000 | (16 << 5) | rt);        // STR Dt, [x16]
+      return;
+    }
     self.emit32(0xFC000000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
   }
 
