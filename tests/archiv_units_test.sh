@@ -129,12 +129,19 @@ fn main(): int64 {
 }' "0 0"
 
 # ===========================================================================
-# #1401 — iso: Schraegstrich melden statt umbenennen
+# #1401/#1413 — iso: Level-1-Grenze melden, Unterverzeichnisse anlegen
 # ===========================================================================
 
-# Reproduktion aus dem Issue: beide Namen wurden bisher angenommen und still
-# veraendert. Jetzt: 6 = ISO_ERR_NODIRS, 5 = ISO_ERR_NAMETOOLONG.
-out "#1401: Schraegstrich und Level-1-Grenze werden gemeldet" 'import std.io;
+# Der Schraegstrich wurde bis #1413 mit 6 (ISO_ERR_NODIRS) abgewiesen: der
+# Reader konnte Unterverzeichnisse, der Writer nicht, und eine Meldung war
+# ehrlicher als ein stilles Umbenennen. Seit #1413 legt der Writer sie an, der
+# Aufruf gelingt also. Die Level-1-Grenze bleibt eine Meldung (5).
+#
+# Der Verzeichnisname selbst wird auf 8 Zeichen gekuerzt — "unterordner" wird
+# UNTERORD. Das ist Level 1 und keine stille Umbenennung im Sinne von #1401:
+# die Struktur bleibt eine Struktur, nur der Name wird normalisiert, genau wie
+# bei Dateinamen.
+out "#1401: Level-1-Grenze wird gemeldet, Verzeichnis wird angenommen" 'import std.io;
 import std.iso;
 import std.string;
 fn main(): int64 {
@@ -143,7 +150,7 @@ fn main(): int64 {
   PrintStr(IntToStr(IsoWriterAdd(w, "unterordner/a.txt"c, "def"c as int64, 3))); PrintStr(" ");
   PrintLn(IntToStr(IsoWriterAdd(w, "OK.TXT"c, "ghi"c as int64, 3)));
   return 0;
-}' "5 6 0"
+}' "5 0 0"
 
 # Was Level 1 erlaubt, muss weiterhin durchgehen und lesbar sein.
 out "#1401: gueltiger 8.3-Name wird geschrieben und gelesen" 'import std.io;
