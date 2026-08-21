@@ -22,7 +22,6 @@ bad() { echo "FAIL: $1${2:+ — $2}"; F=$((F+1)); }
 for fall in \
   'var v: int64 := 0; var s: pchar := ArgvGetStr(v, 0); return 0;|ArgvGetStr' \
   'IMPORTALLOC|var b: int64 := alloc(8); buf_put_byte(b,0,65); return buf_get_byte(b,0);|buf_put/get_byte' \
-  'return ioctl(1, 0, 0);|ioctl' \
   'var s: pchar := FloatToStr(1.5); return 0;|FloatToStr' \
   'return StrEq("a","a");|StrEq' \
   'return StrStartsWith("abc","ab");|StrStartsWith' \
@@ -44,6 +43,19 @@ for fall in \
   then ok "lyxos: $name"
   else bad "lyxos: $name" "$(grep -oE 'unbekannter Builtin.*|Builtin-ID [0-9]+ .*' "$TMP/l" | head -1)"; fi
 done
+
+# ioctl stand bis 1.1.4M in der Liste oben, als baue es. Es baute auch — nur
+# emittierte es 0x0301, eine Nummer aus der Entwurfs-ABI, die es im LyxOS-Kernel
+# nicht gibt (implementiert: 0-228 und 300-326). Der erzeugte Aufruf ging ins
+# Leere. Seit #1734 meldet der Bau das, und das ist hier die Erwartung.
+printf 'fn main(): int64 { return ioctl(1, 0, 0); }\n' > "$TMP/i.lyx"
+if timeout 300 "$LYXC" --std-path="$ROOT" --target=lyxos "$TMP/i.lyx" -o "$TMP/i.out" >"$TMP/li" 2>&1; then
+  bad "lyxos: ioctl meldet" "baut durch, obwohl 0x0301 im Kernel fehlt"
+elif grep -q "gibt es in LyxOS nicht" "$TMP/li"; then
+  ok "lyxos: ioctl meldet die fehlende Nummer (#1734)"
+else
+  bad "lyxos: ioctl meldet" "scheitert, aber nicht an der Nummernpruefung"
+fi
 
 # --- 2: und sie rechnen richtig ----------------------------------------------
 cat > "$TMP/r.lyx" <<'EOF'
