@@ -3,16 +3,20 @@
 // Unterstützt:
 //   Reader: ISO 9660 Volumes, BFS-Verzeichnisbaum, max. 256 Verzeichnisse.
 //           Liest Dateien und Unterverzeichnisse, baut vollständige Pfade.
-//   Writer: Flat-Root-Verzeichnis (keine Unterverzeichnisse), ISO 9660 Level 1
-//           (Großbuchstaben, 8.3-Dateinamen + ";1"-Version).
+//   Writer: Verzeichnisbaum bis acht Ebenen (#1413), ISO 9660 Level 1
+//           (Großbuchstaben, 8.3-Dateinamen + ";1"-Version, Verzeichnisnamen
+//           bis 8 Zeichen ohne Punkt).
 //
 // Sektorgröße: 2048 Bytes
 // System Area: Sektoren 0–15 (leer)
 // PVD (Primary Volume Descriptor): Sektor 16
 // VDST (Volume Descriptor Set Terminator): Sektor 17
-// Path Table (L + M): Sektoren 18–19
-// Root Dir: Sektor 20
-// Dateidaten: ab Sektor 21
+// Path Table (L, dann M): ab Sektor 18, je so viele Sektoren wie nötig
+// Verzeichnisse: direkt danach, Wurzel zuerst
+// Dateidaten: nach den Verzeichnissen
+//
+// Ohne Unterverzeichnisse ergibt das dieselbe Aufteilung wie früher —
+// L=18, M=19, Wurzel=20, Daten ab 21.
 //
 // Both-Byte-Order (BOF) Integers: 4 Bytes LE + 4 Bytes BE (uint32)
 //                                 2 Bytes LE + 2 Bytes BE (uint16)
@@ -45,6 +49,11 @@ pub con ISO_ERR_NAMETOOLONG: int64 := 5;
 // ohne Hinweis. Wer eine Verzeichnisstruktur anlegen wollte, bekam
 // umbenannte Dateien.
 pub con ISO_ERR_NODIRS:      int64 := 6;
+// #1413: Die Hierarchie ist nach ECMA-119 6.8.2.1 auf acht Ebenen begrenzt.
+// Das ist etwas anderes als "voll" und bekommt deshalb eine eigene Nummer —
+// ISO_ERR_FULL haette den Aufrufer auf die Suche nach einem Platzproblem
+// geschickt.
+pub con ISO_ERR_TOODEEP:     int64 := 7;
 
 // ============================================================================
 // Struct-Offsets (Kommentare als Dokumentation)
@@ -436,12 +445,121 @@ pub fn IsoFind(handle: int64, name: pchar): int64 {
 // ISO 9660 Writer
 // ============================================================================
 
+// ============================================================================
+// Writer
+// ============================================================================
+//
+// #1413: Der Writer legt jetzt Verzeichnisse an. Vorher wies er jeden Namen
+// mit Schraegstrich ab (ISO_ERR_NODIRS, #1401) — das war ehrlich, aber der
+// Reader konnte Unterverzeichnisse laengst, die Unit war unsymmetrisch.
+//
+// Struct-Offsets:
+//   IsoWriter (48): entries:0  entryCount:8  dirs:16  dirCount:24  (frei):32,40
+//   IsoWEntry (32): name:0  data:8  dataLen:16  parent:24
+//   IsoWDir   (48): name:0  nameLen:8  parent:16  lba:24  lenBytes:32  ptIdx:40
+//
+// dirs[0] ist immer das Wurzelverzeichnis (nameLen 0, parent 0).
+
+pub con ISO_MAX_DEPTH:       int64 := 8;
+
+// Vergleich zweier Datei-Bezeichner nach ISO 9660: zeichenweise, der kuerzere
+// wird mit 0x20 aufgefuellt. Rueckgabe <0, 0, >0.
+fn isoRecCmp(aP: int64, aLen: int64, bP: int64, bLen: int64): int64 {
+    var n: int64 := aLen;
+    if (bLen > n) { n := bLen; }
+    var i: int64 := 0;
+    while (i < n) {
+        var ca: int64 := 0x20;
+        var cb: int64 := 0x20;
+        if (i < aLen) { ca := peek8(aP + i); }
+        if (i < bLen) { cb := peek8(bP + i); }
+        if (ca != cb) { return ca - cb; }
+        i += 1;
+    }
+    return 0;
+}
+
+// Verzeichnisnamen nach Level 1: Grossbuchstaben, d-characters, hoechstens 8
+// Zeichen, KEIN Punkt. Der Punkt ist im Dateinamen der Trenner zur Erweiterung
+// und in einem Verzeichnisnamen nach Level 1 nicht zulaessig.
+fn isoDirNameNorm(dst: int64, src: int64, slen: int64): int64 {
+    var n: int64 := slen;
+    if (n > 8) { n := 8; }
+    var i: int64 := 0;
+    while (i < n) {
+        var c: int64 := isoToUpper(peek8(src + i));
+        if (c == 0x2E) { c := 0x5F; }
+        if (isoIsValidChar(c) == 0) { c := 0x5F; }
+        poke8(dst + i, c);
+        i += 1;
+    }
+    poke8(dst + n, 0);
+    return n;
+}
+
+// Ebene eines Verzeichnisses: Wurzel = 0.
+fn isoDirLevel(w: int64, idx: int64): int64 {
+    var dirs: int64 := peek64(w + 16);
+    var lvl:  int64 := 0;
+    var cur:  int64 := idx;
+    while ((cur != 0) && (lvl <= ISO_MAX_DEPTH)) {
+        cur := peek64(dirs + cur * 48 + 16);
+        lvl += 1;
+    }
+    return lvl;
+}
+
+// Kind-Verzeichnis suchen oder anlegen. -1 = kein Platz oder zu tief.
+fn isoFindOrAddDir(w: int64, parent: int64, namePtr: int64, nameLen: int64): int64 {
+    var dirs:  int64 := peek64(w + 16);
+    var count: int64 := peek64(w + 24);
+    var i: int64 := 1;
+    while (i < count) {
+        if (peek64(dirs + i * 48 + 16) == parent) {
+            var nl: int64 := peek64(dirs + i * 48 + 8);
+            if (nl == nameLen) {
+                if (isoRecCmp(peek64(dirs + i * 48), nl, namePtr, nameLen) == 0) {
+                    return i;
+                }
+            }
+        }
+        i += 1;
+    }
+    if (count >= ISO_MAX_DIRS) { return 0 - 1; }
+    // ECMA-119 6.8.2.1 begrenzt die Hierarchie auf acht Ebenen, und die Wurzel
+    // ist Ebene 1. isoDirLevel zaehlt die Wurzel als 0, ein neues Verzeichnis
+    // darf also hoechstens Ebene 7 bekommen. Ohne das -1 waere "b1/.../b8/x"
+    // durchgegangen und haette neun Ebenen erzeugt.
+    if (isoDirLevel(w, parent) >= (ISO_MAX_DEPTH - 1)) { return 0 - 1; }
+    var buf: int64 := alloc(nameLen + 1);
+    isoCopy(buf, namePtr, nameLen);
+    poke8(buf + nameLen, 0);
+    var d: int64 := dirs + count * 48;
+    poke64(d,      buf);
+    poke64(d + 8,  nameLen);
+    poke64(d + 16, parent);
+    poke64(d + 24, 0);
+    poke64(d + 32, 0);
+    poke64(d + 40, 0);
+    poke64(w + 24, count + 1);
+    return count;
+}
+
 pub fn IsoWriterNew(): int64 {
-    var w: int64 := alloc(32);
-    poke64(w,      alloc(ISO_MAX_ENTRIES * 24));
+    var w: int64 := alloc(48);
+    poke64(w,      alloc(ISO_MAX_ENTRIES * 32));
     poke64(w + 8,  0);
-    poke64(w + 16, 0);
-    poke64(w + 24, 0);
+    poke64(w + 16, alloc(ISO_MAX_DIRS * 48));
+    poke64(w + 24, 1);            // dirs[0] = Wurzel
+    poke64(w + 32, 0);
+    poke64(w + 40, 0);
+    var root: int64 := peek64(w + 16);
+    poke64(root,      0);
+    poke64(root + 8,  0);
+    poke64(root + 16, 0);
+    poke64(root + 24, 0);
+    poke64(root + 32, 0);
+    poke64(root + 40, 1);         // Wurzel ist Path-Table-Nummer 1
     return w;
 }
 
@@ -454,46 +572,79 @@ pub fn IsoWriterAdd(w: int64, name: pchar, data: int64, dataLen: int64): int64 {
     var slen: int64 := StrLen(nameAdr as pchar);
     if (slen == 0) { return ISO_ERR_NAMETOOLONG; }
 
-    // #1401: Schraegstrich melden statt still umbenennen. Der Reader kann
-    // Unterverzeichnisse (er durchlaeuft sie beim Oeffnen), der Writer legt
-    // nur flache Abbilder an — bis der das auch kann, ist eine Meldung die
-    // ehrliche Antwort. Siehe das eigene Issue zum Writer.
-    var k: int64 := 0;
+    // #1413: Pfad an '/' zerlegen. Jeder Abschnitt vor dem letzten ist ein
+    // Verzeichnis und wird angelegt, wenn es noch keins gibt. Ein leerer
+    // Abschnitt ("a//b", fuehrender Schraegstrich) wird uebersprungen, statt
+    // ein Verzeichnis ohne Namen zu erzeugen.
+    // Erst zaehlen, dann anlegen. Wer die Tiefe waehrend des Anlegens prueft,
+    // laesst bei einem zu tiefen Pfad die ersten sieben Verzeichnisse im
+    // Abbild zurueck — Verzeichnisse, die der Aufrufer nie bekommen hat, weil
+    // sein Aufruf ja fehlschlug.
+    var tiefe: int64 := 0;
+    var tk:    int64 := 0;
+    var tstart: int64 := 0;
+    while (tk < slen) {
+        if (peek8(nameAdr + tk) == 0x2F) {
+            if ((tk - tstart) > 0) { tiefe += 1; }
+            tstart := tk + 1;
+        }
+        tk += 1;
+    }
+    if (tiefe > (ISO_MAX_DEPTH - 1)) { return ISO_ERR_TOODEEP; }
+
+    var parent: int64 := 0;
+    var start:  int64 := 0;
+    var k:      int64 := 0;
     while (k < slen) {
-        if (peek8(nameAdr + k) == 0x2F) { return ISO_ERR_NODIRS; }
-        k := k + 1;
+        if (peek8(nameAdr + k) == 0x2F) {
+            var segLen: int64 := k - start;
+            if (segLen > 0) {
+                var dnBuf: int64 := alloc(segLen + 1);
+                var dnLen: int64 := isoDirNameNorm(dnBuf, nameAdr + start, segLen);
+                if (dnLen == 0) {
+                    free(dnBuf, segLen + 1);
+                    return ISO_ERR_NAMETOOLONG;
+                }
+                var di: int64 := isoFindOrAddDir(w, parent, dnBuf, dnLen);
+                free(dnBuf, segLen + 1);
+                if (di < 0) { return ISO_ERR_FULL; }
+                parent := di;
+            }
+            start := k + 1;
+        }
+        k += 1;
     }
 
-    // #1401: Level 1 erlaubt 8 Zeichen Name, 3 Zeichen Erweiterung. Die
-    // Konstante ISO_ERR_NAMETOOLONG stand da und griff bei 36 Zeichen — also
-    // nie fuer die Grenze, die das Format wirklich setzt. Streng nach Level 1
-    // arbeitende Lesegeraete weisen laengere Namen ab; Linux und 7z lesen sie.
-    // Deshalb wird hier die Level-1-Grenze durchgesetzt und nicht bloss
-    // angestrebt.
+    var baseAdr: int64 := nameAdr + start;
+    var baseLen: int64 := slen - start;
+    if (baseLen == 0) { return ISO_ERR_NAMETOOLONG; }
+
+    // Level 1 erlaubt 8 Zeichen Name, 3 Zeichen Erweiterung (#1401).
     var punkt: int64 := 0 - 1;
     k := 0;
-    while (k < slen) {
-        if (peek8(nameAdr + k) == 0x2E) { punkt := k; }
-        k := k + 1;
+    while (k < baseLen) {
+        if (peek8(baseAdr + k) == 0x2E) { punkt := k; }
+        k += 1;
     }
-    var stammLen: int64 := slen;
+    var stammLen: int64 := baseLen;
     var extLen:   int64 := 0;
     if (punkt >= 0) {
         stammLen := punkt;
-        extLen   := slen - punkt - 1;
+        extLen   := baseLen - punkt - 1;
     }
     if (stammLen < 1)  { return ISO_ERR_NAMETOOLONG; }
     if (stammLen > 8)  { return ISO_ERR_NAMETOOLONG; }
     if (extLen > 3)    { return ISO_ERR_NAMETOOLONG; }
 
-    var nameBuf: int64 := alloc(slen + 1);
-    isoNormalizeName(nameBuf, nameAdr, slen);
+    var nameBuf: int64 := alloc(baseLen + 1);
+    isoNormalizeName(nameBuf, baseAdr, baseLen);
 
     var entries: int64 := peek64(w);
-    var entry:   int64 := entries + count * 24;
+    var entry:   int64 := entries + count * 32;
     poke64(entry,      nameBuf);
     poke64(entry + 8,  data);
     poke64(entry + 16, dataLen);
+    poke64(entry + 24, parent);
     poke64(w + 8, count + 1);
     return ISO_ERR_OK;
 }
@@ -512,87 +663,302 @@ fn isoWriteRootEntry(rootSector: int64, recOff: int64, lba: int64, dlen: int64, 
     poke8(rootSector + recOff + 33, nameByte);
 }
 
-pub fn IsoWriterSave(w: int64, path: pchar): int64 {
-    if (w == 0) { return ISO_ERR_IO; }
-    var count:   int64 := peek64(w + 8);
+// Laenge des Bezeichners eines Kindes, so wie er im Directory Record steht:
+// Dateien tragen ";1", Verzeichnisse nicht.
+fn isoChildIdLen(w: int64, kind: int64, idx: int64): int64 {
+    if (kind == 1) {
+        var dirs: int64 := peek64(w + 16);
+        return peek64(dirs + idx * 48 + 8);
+    }
     var entries: int64 := peek64(w);
+    return StrLen(peek64(entries + idx * 32)) + 2;
+}
 
-    var firstDataSector: int64 := 21;
-    var totalSectors:    int64 := firstDataSector;
-    var i: int64 := 0;
-    while (i < count) {
-        var dl: int64 := peek64(entries + i * 24 + 16);
-        var sc: int64 := (dl + ISO_SECTOR - 1);
-        sc := sc / ISO_SECTOR;
-        if (sc == 0) { sc := 1; }
-        totalSectors += sc;
+// Kinder eines Verzeichnisses in der Reihenfolge sammeln, die ISO 9660
+// verlangt: aufsteigend nach Bezeichner. `order` nimmt je Kind zwei Woerter
+// auf (kind, idx) — kind 1 = Verzeichnis, 0 = Datei. Rueckgabe: Anzahl.
+//
+// Sortiert wird mit Einfuegen. Die Zahl der Kinder eines Verzeichnisses ist
+// klein; ein besseres Verfahren waere hier mehr Code als Nutzen.
+fn isoCollectChildren(w: int64, dir: int64, order: int64): int64 {
+    var dirs:     int64 := peek64(w + 16);
+    var dirCount: int64 := peek64(w + 24);
+    var entries:  int64 := peek64(w);
+    var entCount: int64 := peek64(w + 8);
+    var n: int64 := 0;
+
+    var i: int64 := 1;
+    while (i < dirCount) {
+        if (peek64(dirs + i * 48 + 16) == dir) {
+            poke64(order + n * 16,     1);
+            poke64(order + n * 16 + 8, i);
+            n += 1;
+        }
         i += 1;
     }
+    i := 0;
+    while (i < entCount) {
+        if (peek64(entries + i * 32 + 24) == dir) {
+            poke64(order + n * 16,     0);
+            poke64(order + n * 16 + 8, i);
+            n += 1;
+        }
+        i += 1;
+    }
+
+    i := 1;
+    while (i < n) {
+        var kKind: int64 := peek64(order + i * 16);
+        var kIdx:  int64 := peek64(order + i * 16 + 8);
+        var kPtr:  int64 := 0;
+        var kLen:  int64 := 0;
+        if (kKind == 1) { kPtr := peek64(dirs + kIdx * 48); }
+        else            { kPtr := peek64(entries + kIdx * 32); }
+        kLen := isoChildIdLen(w, kKind, kIdx);
+        var j: int64 := i - 1;
+        var weiter: int64 := 1;
+        while ((j >= 0) && (weiter == 1)) {
+            var jKind: int64 := peek64(order + j * 16);
+            var jIdx:  int64 := peek64(order + j * 16 + 8);
+            var jPtr:  int64 := 0;
+            if (jKind == 1) { jPtr := peek64(dirs + jIdx * 48); }
+            else            { jPtr := peek64(entries + jIdx * 32); }
+            var jLen: int64 := isoChildIdLen(w, jKind, jIdx);
+            if (isoRecCmp(jPtr, jLen, kPtr, kLen) > 0) {
+                poke64(order + (j + 1) * 16,     jKind);
+                poke64(order + (j + 1) * 16 + 8, jIdx);
+                j -= 1;
+            } else {
+                weiter := 0;
+            }
+        }
+        poke64(order + (j + 1) * 16,     kKind);
+        poke64(order + (j + 1) * 16 + 8, kIdx);
+        i += 1;
+    }
+    return n;
+}
+
+// Groesse eines Verzeichnisses in Bytes. Ein Directory Record darf keine
+// Sektorgrenze ueberschreiten — passt er nicht mehr, beginnt er im naechsten
+// Sektor, und der Rest davor bleibt Null. Wer das uebersieht, baut ein
+// Abbild, das der eigene Reader liest und ein fremdes Werkzeug abweist.
+fn isoDirSize(w: int64, dir: int64, order: int64): int64 {
+    var n:   int64 := isoCollectChildren(w, dir, order);
+    var off: int64 := 68;                 // "." und ".." je 34 Byte
+    var i:   int64 := 0;
+    while (i < n) {
+        var kind: int64 := peek64(order + i * 16);
+        var idx:  int64 := peek64(order + i * 16 + 8);
+        var idLen: int64 := isoChildIdLen(w, kind, idx);
+        var recLen: int64 := 33 + idLen;
+        if ((recLen % 2) != 0) { recLen += 1; }
+        var inSec: int64 := off % ISO_SECTOR;
+        if ((inSec + recLen) > ISO_SECTOR) { off += ISO_SECTOR - inSec; }
+        off += recLen;
+        i += 1;
+    }
+    return off;
+}
+
+// Ein Directory Record schreiben. Rueckgabe: neuer Offset im Verzeichnis.
+fn isoWriteRec(secBase: int64, off: int64, lba: int64, dlen: int64,
+               flags: int64, idPtr: int64, idLen: int64, mitVersion: int64): int64 {
+    var recLen: int64 := 33 + idLen;
+    if ((recLen % 2) != 0) { recLen += 1; }
+    var inSec: int64 := off % ISO_SECTOR;
+    if ((inSec + recLen) > ISO_SECTOR) { off += ISO_SECTOR - inSec; }
+
+    poke8(secBase + off,     recLen);
+    poke8(secBase + off + 1, 0);
+    isoPutU32BOF(secBase, off + 2,  lba);
+    isoPutU32BOF(secBase, off + 10, dlen);
+    poke8(secBase + off + 25, flags);
+    poke8(secBase + off + 26, 0);
+    poke8(secBase + off + 27, 0);
+    isoPutU16BOF(secBase, off + 28, 1);
+    poke8(secBase + off + 32, idLen);
+    var nlen: int64 := idLen;
+    if (mitVersion == 1) { nlen := idLen - 2; }
+    var j: int64 := 0;
+    while (j < nlen) {
+        poke8(secBase + off + 33 + j, peek8(idPtr + j));
+        j += 1;
+    }
+    if (mitVersion == 1) {
+        poke8(secBase + off + 33 + nlen,     0x3B);
+        poke8(secBase + off + 33 + nlen + 1, 0x31);
+    }
+    return off + recLen;
+}
+
+pub fn IsoWriterSave(w: int64, path: pchar): int64 {
+    if (w == 0) { return ISO_ERR_IO; }
+    var count:    int64 := peek64(w + 8);
+    var entries:  int64 := peek64(w);
+    var dirs:     int64 := peek64(w + 16);
+    var dirCount: int64 := peek64(w + 24);
+
+    var order: int64 := alloc((ISO_MAX_ENTRIES + ISO_MAX_DIRS) * 16);
+
+    // ---- Durchgang 1: Path-Table-Nummern vergeben ---------------------------
+    // Die Norm verlangt: nach Ebene, innerhalb einer Ebene nach der Nummer des
+    // Elternverzeichnisses, dann nach Namen. Deshalb Ebene fuer Ebene, und
+    // erst wenn die Eltern ihre Nummer haben.
+    var ptOrder: int64 := alloc(ISO_MAX_DIRS * 8);
+    poke64(ptOrder, 0);
+    poke64(dirs + 40, 1);
+    var vergeben: int64 := 1;
+    var lvl: int64 := 1;
+    while ((lvl <= ISO_MAX_DEPTH) && (vergeben < dirCount)) {
+        var rundeStart: int64 := vergeben;
+        var d: int64 := 1;
+        while (d < dirCount) {
+            if (isoDirLevel(w, d) == lvl) {
+                poke64(ptOrder + vergeben * 8, d);
+                vergeben += 1;
+            }
+            d += 1;
+        }
+        // Innerhalb der Ebene sortieren: erst Elternnummer, dann Name.
+        var a: int64 := rundeStart + 1;
+        while (a < vergeben) {
+            var kd: int64 := peek64(ptOrder + a * 8);
+            var kp: int64 := peek64(dirs + peek64(dirs + kd * 48 + 16) * 48 + 40);
+            var b: int64 := a - 1;
+            var lauf: int64 := 1;
+            while ((b >= rundeStart) && (lauf == 1)) {
+                var jd: int64 := peek64(ptOrder + b * 8);
+                var jp: int64 := peek64(dirs + peek64(dirs + jd * 48 + 16) * 48 + 40);
+                var groesser: int64 := 0;
+                if (jp > kp) { groesser := 1; }
+                if (jp == kp) {
+                    if (isoRecCmp(peek64(dirs + jd * 48), peek64(dirs + jd * 48 + 8),
+                                  peek64(dirs + kd * 48), peek64(dirs + kd * 48 + 8)) > 0) {
+                        groesser := 1;
+                    }
+                }
+                if (groesser == 1) {
+                    poke64(ptOrder + (b + 1) * 8, jd);
+                    b -= 1;
+                } else {
+                    lauf := 0;
+                }
+            }
+            poke64(ptOrder + (b + 1) * 8, kd);
+            a += 1;
+        }
+        a := rundeStart;
+        while (a < vergeben) {
+            poke64(dirs + peek64(ptOrder + a * 8) * 48 + 40, a + 1);
+            a += 1;
+        }
+        lvl += 1;
+    }
+
+    // ---- Durchgang 2: Groessen und Sektoren --------------------------------
+    var ptSize: int64 := 10;              // Wurzeleintrag: 8 + 1 Byte Name + Fuellbyte
+    var pi: int64 := 1;
+    while (pi < dirCount) {
+        var dn: int64 := peek64(dirs + peek64(ptOrder + pi * 8) * 48 + 8);
+        var pe: int64 := 8 + dn;
+        if ((pe % 2) != 0) { pe += 1; }
+        ptSize += pe;
+        pi += 1;
+    }
+    var ptSec: int64 := (ptSize + ISO_SECTOR - 1) / ISO_SECTOR;
+    if (ptSec == 0) { ptSec := 1; }
+
+    var lptLBA:  int64 := 18;
+    var mptLBA:  int64 := lptLBA + ptSec;
+    var dirLBA:  int64 := mptLBA + ptSec;
+
+    var cur: int64 := dirLBA;
+    pi := 0;
+    while (pi < dirCount) {
+        var d2:   int64 := peek64(ptOrder + pi * 8);
+        var size: int64 := isoDirSize(w, d2, order);
+        var sec:  int64 := (size + ISO_SECTOR - 1) / ISO_SECTOR;
+        if (sec == 0) { sec := 1; }
+        poke64(dirs + d2 * 48 + 24, cur);
+        poke64(dirs + d2 * 48 + 32, sec * ISO_SECTOR);
+        cur += sec;
+        pi += 1;
+    }
+
+    var firstDataSector: int64 := cur;
+    var lbaArr: int64 := alloc(count * 8);
+    var i: int64 := 0;
+    while (i < count) {
+        var dl: int64 := peek64(entries + i * 32 + 16);
+        poke64(lbaArr + i * 8, cur);
+        var sc: int64 := (dl + ISO_SECTOR - 1) / ISO_SECTOR;
+        if (sc == 0) { sc := 1; }
+        cur += sc;
+        i += 1;
+    }
+    var totalSectors: int64 := cur;
+    if (totalSectors < firstDataSector) { totalSectors := firstDataSector; }
 
     var imageSize: int64 := totalSectors * ISO_SECTOR;
     var image:     int64 := alloc(imageSize);
     isoFill(image, imageSize, 0);
 
-    var lbaArr: int64 := alloc(count * 8);
-    var curLBA: int64 := firstDataSector;
+    // ---- Dateidaten --------------------------------------------------------
     i := 0;
     while (i < count) {
-        var data:    int64 := peek64(entries + i * 24 + 8);
-        var dataLen: int64 := peek64(entries + i * 24 + 16);
-        poke64(lbaArr + i * 8, curLBA);
+        var data:    int64 := peek64(entries + i * 32 + 8);
+        var dataLen: int64 := peek64(entries + i * 32 + 16);
         if (dataLen > 0) {
-            isoCopy(image + curLBA * ISO_SECTOR, data, dataLen);
+            isoCopy(image + peek64(lbaArr + i * 8) * ISO_SECTOR, data, dataLen);
         }
-        var sc: int64 := (dataLen + ISO_SECTOR - 1);
-        sc := sc / ISO_SECTOR;
-        if (sc == 0) { sc := 1; }
-        curLBA += sc;
         i += 1;
     }
 
-    // Root-Verzeichnis in Sektor 20
-    var rootSector: int64 := image + 20 * ISO_SECTOR;
-    var rootDirLen: int64 := 0;
+    // ---- Verzeichnisse -----------------------------------------------------
+    pi := 0;
+    while (pi < dirCount) {
+        var dd:      int64 := peek64(ptOrder + pi * 8);
+        var secBase: int64 := image + peek64(dirs + dd * 48 + 24) * ISO_SECTOR;
+        var selfLBA: int64 := peek64(dirs + dd * 48 + 24);
+        var selfLen: int64 := peek64(dirs + dd * 48 + 32);
+        var par:     int64 := peek64(dirs + dd * 48 + 16);
+        var parLBA:  int64 := peek64(dirs + par * 48 + 24);
+        var parLen:  int64 := peek64(dirs + par * 48 + 32);
 
-    isoWriteRootEntry(rootSector, 0,  20, ISO_SECTOR, 0x02, 0x00);
-    rootDirLen += 34;
-    isoWriteRootEntry(rootSector, rootDirLen, 20, ISO_SECTOR, 0x02, 0x01);
-    rootDirLen += 34;
+        isoWriteRootEntry(secBase, 0,  selfLBA, selfLen, 0x02, 0x00);
+        isoWriteRootEntry(secBase, 34, parLBA,  parLen,  0x02, 0x01);
+        var off: int64 := 68;
 
-    i := 0;
-    while (i < count) {
-        var nameBuf: int64 := peek64(entries + i * 24);
-        var dataLen: int64 := peek64(entries + i * 24 + 16);
-        var fileLBA: int64 := peek64(lbaArr + i * 8);
-        var nlen:    int64 := StrLen(nameBuf);
-        var fullLen: int64 := nlen + 2;
-        var recLen:  int64 := 33 + fullLen;
-        if ((recLen % 2) != 0) { recLen := recLen + 1; }
-        var recOff: int64 := rootDirLen;
-
-        if ((recOff + recLen) <= ISO_SECTOR) {
-            poke8(rootSector + recOff,      recLen);
-            poke8(rootSector + recOff + 1,  0);
-            isoPutU32BOF(rootSector, recOff + 2,  fileLBA);
-            isoPutU32BOF(rootSector, recOff + 10, dataLen);
-            poke8(rootSector + recOff + 25, 0x00);
-            poke8(rootSector + recOff + 26, 0);
-            poke8(rootSector + recOff + 27, 0);
-            isoPutU16BOF(rootSector, recOff + 28, 1);
-            poke8(rootSector + recOff + 32, fullLen);
-            var j: int64 := 0;
-            while (j < nlen) {
-                poke8(rootSector + recOff + 33 + j, peek8(nameBuf + j));
-                j += 1;
+        var n: int64 := isoCollectChildren(w, dd, order);
+        var ci: int64 := 0;
+        while (ci < n) {
+            var kind: int64 := peek64(order + ci * 16);
+            var idx:  int64 := peek64(order + ci * 16 + 8);
+            if (kind == 1) {
+                off := isoWriteRec(secBase, off,
+                                   peek64(dirs + idx * 48 + 24),
+                                   peek64(dirs + idx * 48 + 32),
+                                   0x02,
+                                   peek64(dirs + idx * 48),
+                                   peek64(dirs + idx * 48 + 8), 0);
+            } else {
+                var nb: int64 := peek64(entries + idx * 32);
+                off := isoWriteRec(secBase, off,
+                                   peek64(lbaArr + idx * 8),
+                                   peek64(entries + idx * 32 + 16),
+                                   0x00,
+                                   nb, StrLen(nb) + 2, 1);
             }
-            poke8(rootSector + recOff + 33 + nlen,     0x3B);
-            poke8(rootSector + recOff + 33 + nlen + 1, 0x31);
-            rootDirLen += recLen;
+            ci += 1;
         }
-        i += 1;
+        pi += 1;
     }
 
-    // PVD in Sektor 16
+    var rootLBA: int64 := peek64(dirs + 24);
+    var rootLen: int64 := peek64(dirs + 32);
+
+    // ---- PVD in Sektor 16 --------------------------------------------------
     var pvd: int64 := image + 16 * ISO_SECTOR;
     poke8(pvd,     1);
     poke8(pvd + 1, 0x43);
@@ -616,15 +982,15 @@ pub fn IsoWriterSave(w: int64, path: pchar): int64 {
     isoPutU16BOF(pvd, 120, 1);
     isoPutU16BOF(pvd, 124, 1);
     isoPutU16BOF(pvd, 128, ISO_SECTOR);
-    isoPutU32BOF(pvd, 132, 10);
-    isoPutU32LE(pvd, 140, 18);
-    isoPutU32BE(pvd, 148, 19);
+    isoPutU32BOF(pvd, 132, ptSize);
+    isoPutU32LE(pvd, 140, lptLBA);
+    isoPutU32BE(pvd, 148, mptLBA);
 
     var rootRec: int64 := pvd + 156;
     poke8(rootRec,      34);
     poke8(rootRec + 1,  0);
-    isoPutU32BOF(rootRec, 2, 20);
-    isoPutU32BOF(rootRec, 10, ISO_SECTOR);
+    isoPutU32BOF(rootRec, 2, rootLBA);
+    isoPutU32BOF(rootRec, 10, rootLen);
     poke8(rootRec + 25, 0x02);
     poke8(rootRec + 26, 0);
     poke8(rootRec + 27, 0);
@@ -640,14 +1006,22 @@ pub fn IsoWriterSave(w: int64, path: pchar): int64 {
     isoFill(pvd + 739, 36,  0x20);
     isoFill(pvd + 775, 37,  0x20);
 
-    isoFill(pvd + 812, 16, 0x30); poke8(pvd + 828, 0);
-    isoFill(pvd + 829, 16, 0x30); poke8(pvd + 845, 0);
-    isoFill(pvd + 846, 16, 0x30); poke8(pvd + 862, 0);
-    isoFill(pvd + 863, 16, 0x30); poke8(pvd + 879, 0);
+    // #1413: Die vier Datumsfelder standen ein Byte zu frueh. ECMA-119 zaehlt
+    // ab 1: Erstellungsdatum ist Byte 814-830, also Offset 813-829. Hier stand
+    // 812, und damit rutschten alle vier Felder und die File Structure Version
+    // um eins nach vorn — die Version landete auf 880 statt 881, wo ein Leser
+    // sie sucht. xorriso hat das Abbild deshalb komplett abgewiesen
+    // ("Wrong or damaged Primary Volume Descriptor"), obwohl isoinfo und 7z es
+    // klaglos lasen. Der Fehler steckte schon im flachen Writer; er faellt erst
+    // auf, seit gegen ein fremdes Werkzeug geprueft wird.
+    isoFill(pvd + 813, 16, 0x30); poke8(pvd + 829, 0);
+    isoFill(pvd + 830, 16, 0x30); poke8(pvd + 846, 0);
+    isoFill(pvd + 847, 16, 0x30); poke8(pvd + 863, 0);
+    isoFill(pvd + 864, 16, 0x30); poke8(pvd + 880, 0);
 
-    poke8(pvd + 880, 1);
+    poke8(pvd + 881, 1);          // File Structure Version (Byte 882)
 
-    // VDST in Sektor 17
+    // ---- VDST in Sektor 17 -------------------------------------------------
     var vdst: int64 := image + 17 * ISO_SECTOR;
     poke8(vdst,     0xFF);
     poke8(vdst + 1, 0x43);
@@ -657,27 +1031,54 @@ pub fn IsoWriterSave(w: int64, path: pchar): int64 {
     poke8(vdst + 5, 0x31);
     poke8(vdst + 6, 1);
 
-    // L-Path Table in Sektor 18
-    var lpt: int64 := image + 18 * ISO_SECTOR;
-    poke8(lpt,     1);
-    poke8(lpt + 1, 0);
-    isoPutU32LE(lpt, 2, 20);
-    isoPutU16LE(lpt, 6, 1);
-    poke8(lpt + 8, 0x00);
-    poke8(lpt + 9, 0x00);
+    // ---- Path Tables -------------------------------------------------------
+    // Ohne sie liest der eigene Reader das Abbild trotzdem — er folgt den
+    // Directory Records. Fremde Lesegeraete nehmen die Path Table, und ein
+    // Abbild mit nur dem Wurzeleintrag sieht dort leer aus.
+    var lpt: int64 := image + lptLBA * ISO_SECTOR;
+    var mpt: int64 := image + mptLBA * ISO_SECTOR;
+    var lOff: int64 := 0;
+    pi := 0;
+    while (pi < dirCount) {
+        var pd:   int64 := peek64(ptOrder + pi * 8);
+        var pLBA: int64 := peek64(dirs + pd * 48 + 24);
+        var pNr:  int64 := 1;
+        if (pd != 0) { pNr := peek64(dirs + peek64(dirs + pd * 48 + 16) * 48 + 40); }
+        var idPtr: int64 := peek64(dirs + pd * 48);
+        var idLen: int64 := peek64(dirs + pd * 48 + 8);
+        if (pd == 0) { idLen := 1; }
 
-    // M-Path Table in Sektor 19
-    var mpt: int64 := image + 19 * ISO_SECTOR;
-    poke8(mpt,     1);
-    poke8(mpt + 1, 0);
-    isoPutU32BE(mpt, 2, 20);
-    isoPutU16BE(mpt, 6, 1);
-    poke8(mpt + 8, 0x00);
-    poke8(mpt + 9, 0x00);
+        poke8(lpt + lOff,     idLen);
+        poke8(lpt + lOff + 1, 0);
+        isoPutU32LE(lpt, lOff + 2, pLBA);
+        isoPutU16LE(lpt, lOff + 6, pNr);
+        poke8(mpt + lOff,     idLen);
+        poke8(mpt + lOff + 1, 0);
+        isoPutU32BE(mpt, lOff + 2, pLBA);
+        isoPutU16BE(mpt, lOff + 6, pNr);
+
+        if (pd == 0) {
+            poke8(lpt + lOff + 8, 0x00);
+            poke8(mpt + lOff + 8, 0x00);
+        } else {
+            var q: int64 := 0;
+            while (q < idLen) {
+                poke8(lpt + lOff + 8 + q, peek8(idPtr + q));
+                poke8(mpt + lOff + 8 + q, peek8(idPtr + q));
+                q += 1;
+            }
+        }
+        var eLen: int64 := 8 + idLen;
+        if ((eLen % 2) != 0) { eLen += 1; }
+        lOff += eLen;
+        pi += 1;
+    }
 
     var written: int64 := WriteFile(path, image as pchar, imageSize);   // #1264
     free(image, imageSize);
     free(lbaArr, count * 8);
+    free(order, (ISO_MAX_ENTRIES + ISO_MAX_DIRS) * 16);
+    free(ptOrder, ISO_MAX_DIRS * 8);
 
     if (written != imageSize) { return ISO_ERR_IO; }
     return ISO_ERR_OK;
@@ -689,10 +1090,19 @@ pub fn IsoWriterFree(w: int64): void {
     var count:   int64 := peek64(w + 8);
     var i: int64 := 0;
     while (i < count) {
-        var name: int64 := peek64(entries + i * 24);
+        var name: int64 := peek64(entries + i * 32);
         if (name != 0) { free(name, StrLen(name) + 1); }
         i += 1;
     }
-    free(entries, ISO_MAX_ENTRIES * 24);
-    free(w, 32);
+    var dirs:     int64 := peek64(w + 16);
+    var dirCount: int64 := peek64(w + 24);
+    i := 1;
+    while (i < dirCount) {
+        var dn: int64 := peek64(dirs + i * 48);
+        if (dn != 0) { free(dn, peek64(dirs + i * 48 + 8) + 1); }
+        i += 1;
+    }
+    free(entries, ISO_MAX_ENTRIES * 32);
+    free(dirs, ISO_MAX_DIRS * 48);
+    free(w, 48);
 }
