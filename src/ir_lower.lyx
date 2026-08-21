@@ -236,6 +236,28 @@ fn _irLeseImport(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar):
   return 0 as pchar;
 }
 
+// #1388: Nutzlaenge eines Zeichenkettenliterals im Quelltext.
+//
+// `nodeSLen(...) - 2` rechnete mit genau zwei Anfuehrungszeichen und nichts
+// dahinter. Ein pchar-Literal traegt aber ein `c` hinter dem schliessenden
+// Zeichen: aus `"abc"c` (6 Zeichen) wurden so 4 — und das vierte war das
+// Anfuehrungszeichen selbst. `StrLen("abc"c)` lieferte auf jedem IR-Ziel 4
+// statt 3, und wer die Kette ausgab, bekam ein `"` mitgeliefert.
+//
+// Gezaehlt wird deshalb bis zum LETZTEN Anfuehrungszeichen. Ein maskiertes
+// Anfuehrungszeichen im Text stoert nicht: das Literal endet immer mit einem
+// unmaskierten, und das ist das letzte im Quelltext.
+fn _irLitLen(sval: int64, slen: int64): int64 {
+  var i: int64 := slen - 1;
+  while (i > 0) {
+    if (peek8(sval + i) == 34) { return i - 1; }
+    i := i - 1;
+  }
+  var fallback: int64 := slen - 2;
+  if (fallback < 0) { fallback := 0; }
+  return fallback;
+}
+
 pub type IRLower = class {
   // Global function count workaround (since IRModule access is broken across S1/S2)
   // Initialized in init() method
@@ -753,7 +775,7 @@ pub type IRLower = class {
       // (z. B. "main"). String aus nodeSVal extrahieren, Escapes verarbeiten, in den
       // IR-strBuf internieren (irAddString null-terminiert → strlen-tauglich).
       var lsStart:  int64 := (self.nodeSVal(expr) as int64) + 1;  // opening quote überspringen
-      var lsSrcLen: int64 := self.nodeSLen(expr) - 2;             // beide quotes weg
+      var lsSrcLen: int64 := _irLitLen(self.nodeSVal(expr) as int64, self.nodeSLen(expr));   // #1388
       if (lsSrcLen < 0) { lsSrcLen := 0; }
       var lsBuf: int64 := alloc(lsSrcLen + 8);
       var lsOut: int64 := 0;
@@ -866,7 +888,8 @@ pub type IRLower = class {
               }
               if pmatch != 0 {
                 // ARM64-OOP: in Methoden ist self Slot 0 → explizite Params +methodParamBase.
-                self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, pidx + self.methodParamBase, -1, 0);
+                // #1388: Parameter liegen hinter dem Kratzstreifen.
+                self.irAddInstrDirect(IRO_LOAD_LOCAL, dest, IR_BARG_SLOTS + pidx + self.methodParamBase, -1, 0);
                 return dest;
               }
             }
@@ -1328,7 +1351,7 @@ pub type IRLower = class {
             var pnPtr: int64 := (self.nodeSVal(pnode)) as int64;
             var m: int64 := 1; var j: int64 := 0;
             while j < idLen { if m != 0 { if peek8(pnPtr + j) != peek8(idPtrL + j) { m := 0; } } j := j + 1; }
-            if m != 0 { return pidx + self.methodParamBase; }
+            if m != 0 { return IR_BARG_SLOTS + pidx + self.methodParamBase; }   // #1388
           }
           pidx += 1;
         }
@@ -1665,7 +1688,7 @@ pub type IRLower = class {
       var plAddNl: int64 := 0;
       if self.seq(fname, fnlen, "PrintLn", 7) { plAddNl := 1; }
       var plStart: int64 := (self.nodeSVal(arg0) as int64) + 1;
-      var plSrcLen: int64 := self.nodeSLen(arg0) - 2;
+      var plSrcLen: int64 := _irLitLen(self.nodeSVal(arg0) as int64, self.nodeSLen(arg0));   // #1388
       if (plSrcLen < 0) { plSrcLen := 0; }
       var plBuf: int64 := alloc(plSrcLen + 9);
       var plOut: int64 := 0;
@@ -1855,7 +1878,7 @@ pub type IRLower = class {
     // Inline (no IRLower helper method — that shifts the vtable, breaks seed).
     if (self.seq(fname, fnlen, "PrintStr", 8) && arg0 >= 0 && self.nodeKind(arg0) == NK_LIT_STR) {
       var psStart: int64 := (self.nodeSVal(arg0) as int64) + 1;   // skip opening quote
-      var psSrcLen: int64 := self.nodeSLen(arg0) - 2;             // drop both quotes
+      var psSrcLen: int64 := _irLitLen(self.nodeSVal(arg0) as int64, self.nodeSLen(arg0));   // #1388
       if (psSrcLen < 0) { psSrcLen := 0; }
       var psBuf: int64 := alloc(psSrcLen + 8);
       var psOut: int64 := 0;
@@ -5758,7 +5781,7 @@ pub type IRLower = class {
                       }
                       pj += 1;
                     }
-                    if pmatch != 0 { slot := pidx; }
+                    if pmatch != 0 { slot := IR_BARG_SLOTS + pidx; }   // #1388
                   }
                 }
                 pidx += 1;
@@ -5972,7 +5995,16 @@ pub type IRLower = class {
     // so they line up with the AAPCS64 spill the prologue performs and with
     // NK_IDENT's pidx-based loads. retValTemp moves AFTER params so it
     // doesn't share a slot with the first spilled parameter.
-    // ARM64-OOP: bei Methoden belegt das implizite self Slot 0 (= erstes Arg x0).
+    // #1388: Zuerst den Kratzstreifen belegen, dann erst die Parameter. Damit
+    // beginnen die Parameter bei IR_BARG_SLOTS statt bei 0, und die Konvention
+    // "Aufrufargumente liegen in Slot 0..N-1" trifft keine lebende Variable
+    // mehr. Die Reihenfolge ist der ganze Trick: allocParam vergibt fortlaufend,
+    // also muss der Streifen davor liegen.
+    var bargRsv: int64 := 0;
+    while bargRsv < IR_BARG_SLOTS { self.allocTemp(); bargRsv := bargRsv + 1; }
+
+    // ARM64-OOP: bei Methoden belegt das implizite self den ersten Param-Slot
+    // (= erstes Arg x0).
     if self.methodParamBase != 0 { self.allocParam(); }
     var param: int64 := self.nodeC0(funcNode);
     while (param >= 0) {

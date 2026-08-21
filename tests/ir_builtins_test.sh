@@ -31,6 +31,13 @@ no() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
 
 printf 'fn main(): int64 { var p: int64 := 4096; poke8(p, 65); return peek8(p); }\n' > "$TMP/mem.lyx"
 printf 'fn main(): int64 { return StrCharAt("abc"c, 1); }\n' > "$TMP/sc.lyx"
+# #1388: StrCharAt (ID 206) ist seit 1.1.5D auf riscv und Cortex-M umgesetzt und
+# taugt damit nicht mehr als Beispiel fuer eine LUECKE. Fuer die Gegenprobe zum
+# stillen Default braucht es einen Namen, den die beiden noch nicht koennen:
+# IntToStr (ID 16) auf riscv, StrLen (ID 15) auf Cortex-M. Die Pruefung selbst
+# bleibt dieselbe — eine unbehandelte ID muss BENANNT werden.
+printf 'fn main(): int64 { var s: pchar := IntToStr(7); return 0; }\n' > "$TMP/luecke_riscv64.lyx"
+printf 'fn main(): int64 { return StrLen("abc"c); }\n' > "$TMP/luecke_arm-cm4.lyx"
 printf 'fn main(): int64 { var a: int64 := 2; var b: int64 := a * 3 + 1; if b > 5 { return b; } return 0; }\n' > "$TMP/rechnen.lyx"
 
 hex() { od -An -tx1 "$1" | tr -d ' \n'; }
@@ -70,10 +77,23 @@ fi
 # Deshalb oben der Bytetest auf arm64 — er ist der eigentliche Beleg.
 
 # ===========================================================================
+# #1388: StrCharAt/StrSetChar sind auf riscv und Cortex-M umgesetzt
+# ===========================================================================
+# Die Ergaenzung gehoert geprueft, nicht nur die Luecke daneben: sonst faellt
+# nicht auf, wenn sie wieder verschwindet.
+for t in riscv64 arm-cm4; do
+  if timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/sc.lyx" --target=$t -o "$TMP/sc_ok_$t" >"$TMP/sc_ok.log" 2>&1; then
+    ok "$t: StrCharAt uebersetzt"
+  else
+    no "$t: StrCharAt uebersetzt" "$(grep -m1 -iE 'error|Builtin-ID' "$TMP/sc_ok.log")"
+  fi
+done
+
+# ===========================================================================
 # Eine unbehandelte ID wird BENANNT, nicht verschluckt
 # ===========================================================================
 for t in riscv64 arm-cm4; do
-  msg="$(timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/sc.lyx" --target=$t -o "$TMP/sc_$t" 2>&1)"; rc=$?
+  msg="$(timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/luecke_$t.lyx" --target=$t -o "$TMP/sc_$t" 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ] && echo "$msg" | grep -qE "Builtin-ID [0-9]+"; then
     ok "$t: unbehandelte Builtin-ID wird gemeldet"
   else
