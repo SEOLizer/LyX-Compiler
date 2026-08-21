@@ -239,10 +239,17 @@ con CG_LABEL_OFF_NAMELEN: int64 := 8;
 con CG_LABEL_OFF_CODEOFF: int64 := 16;
 con CG_LABEL_OFF_LINENUM: int64 := 24;
 
-con CG_PATCH_SZ:          int64 := 32;
+con CG_PATCH_SZ:          int64 := 64;
 con CG_PATCH_OFF_NAMEPTR: int64 := 8;
 con CG_PATCH_OFF_NAMELEN: int64 := 16;
 con CG_PATCH_OFF_KIND:    int64 := 24;
+// #1661: Herkunft des Patches, damit ein unaufgeloester Name sagen kann, WO
+// er steht. Der Quelltext-Offset statt der Zeilennummer, weil cg_lineOf die
+// Quelle linear absucht — das darf nur im Fehlerfall geschehen, nicht bei
+// jedem der zehntausend Patches.
+con CG_PATCH_OFF_SRCOFF:  int64 := 32;
+con CG_PATCH_OFF_CLSPTR:  int64 := 40;
+con CG_PATCH_OFF_CLSLEN:  int64 := 48;
 
 con CGN_TYPE_DECL:  int64 := 10;
 con CGN_METHOD_PTR: int64 := 129;  // B2: method(...): R fat-pointer-Typ-Node
@@ -525,6 +532,11 @@ pub type Codegen = class {
   // Current method class context (set while generating a method body)
   curClassName:    pchar;
   curClassNameLen: int64;
+
+  // #1661: Quelltext-Offset des zuletzt uebersetzten Knotens. cg_addPatch
+  // legt ihn im Patch ab; erst wenn ein Name unaufgeloest bleibt, wird
+  // daraus eine Zeilennummer.
+  curNodeSrcOff: int64;
 
   // Module-level constant table {namePtr:8, nameLen:8, value:8} = 24 bytes per entry
   conTable:   int64;
@@ -2555,6 +2567,10 @@ pub type Codegen = class {
     poke64(base + CG_PATCH_OFF_NAMEPTR,  namePtr);
     poke64(base + CG_PATCH_OFF_NAMELEN, nlen);
     poke64(base + CG_PATCH_OFF_KIND, kind);
+    // #1661: Herkunft festhalten — Klasse und Stelle im Quelltext.
+    poke64(base + CG_PATCH_OFF_SRCOFF, self.curNodeSrcOff);
+    poke64(base + CG_PATCH_OFF_CLSPTR, self.curClassName as int64);
+    poke64(base + CG_PATCH_OFF_CLSLEN, self.curClassNameLen);
     self.patchCount += 1;
   }
 
@@ -2927,7 +2943,29 @@ pub type Codegen = class {
         } else {
           EPrintStr("error: undefined function '"c);
           sys_write(2, namePtr, nlen);
-          EPrintStr("' — no codegen implementation found\n"c);
+          EPrintStr("' — no codegen implementation found"c);
+          // #1661: sagen, WO der Name steht. Ohne diese Angabe zeigte die
+          // Meldung frueher auf die einzige Klasse, die den Namen sonst
+          // kannte — und damit an der Ursache vorbei.
+          var clsPtr: int64 := peek64(base + CG_PATCH_OFF_CLSPTR);
+          var clsLen: int64 := peek64(base + CG_PATCH_OFF_CLSLEN);
+          if (clsLen > 0) {
+            EPrintStr("\n  in Klasse "c);
+            sys_write(2, clsPtr, clsLen);
+          }
+          var srcOff: int64 := peek64(base + CG_PATCH_OFF_SRCOFF);
+          if (srcOff > 0) {
+            var ln: int64 := 1;
+            var q: int64 := 0;
+            while (q < srcOff) {
+              if (StrCharAt(self.pSrc, q) == 10) { ln := ln + 1; }
+              q += 1;
+            }
+            if (clsLen > 0) { EPrintStr(", Zeile "c); }
+            else { EPrintStr("\n  Zeile "c); }
+            EPrintInt(ln);
+          }
+          EPrintStr("\n"c);
           exit(1);
         }
       } else if (kind == CG_PATCH_EXTERN) {
@@ -8541,6 +8579,10 @@ pub type Codegen = class {
 
   fn cg_genExpr(ni: int64) {
     if (ni < 0) { self.cg_zeroRax(); return; }
+    // #1661: Stelle merken (O(1)), damit ein unaufgeloester Name spaeter
+    // sagen kann, wo er stand.
+    var soExpr: int64 := self.cg_nsoff(ni);
+    if (soExpr > 0) { self.curNodeSrcOff := soExpr; }
     // #1030: Beim Emittieren eines aufgeschobenen Aufrufs liefern die
     // Argumentknoten den bei der Vormerkung gesicherten Wert.
     if (self.dfReplay != 0) {
@@ -14227,6 +14269,8 @@ pub type Codegen = class {
 
   fn cg_genStmt(ni: int64) {
     if (ni < 0) { return; }
+    var soStmt: int64 := self.cg_nsoff(ni);
+    if (soStmt > 0) { self.curNodeSrcOff := soStmt; }   // #1661
     var k: int64 := self.cg_nkind(ni);
 
     if (k == CGN_BLOCK) {
