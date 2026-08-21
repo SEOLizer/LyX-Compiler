@@ -131,15 +131,28 @@ compile_ok "mkdir_compiles"  'fn main(): int64 { mkdir("d", 0); return 0; }'
 compile_ok "exit_compiles"   'fn main(): int64 { exit(0); return 0; }'
 
 # --- Gehärteter Catch-all: sema-bekannter aber nicht gelowerter Builtin → harter Fehler ---
-# --- 0x0200-Block-Builtins (kernel-adoptiert): compile-only (LyxOS-Nrn ≠ Linux) ---
-compile_ok "lseek_compiles"    'fn main(): int64 { return lseek(3, 0, 2); }'
-compile_ok "stat_compiles"     'fn main(): int64 { var s: int64 := 0; return stat("f", s); }'
-compile_ok "lstat_compiles"    'fn main(): int64 { var s: int64 := 0; return lstat("f", s); }'
-compile_ok "symlink_compiles"  'fn main(): int64 { return symlink("a", "b"); }'
+# --- 0x0200-Block-Builtins: melden jetzt, statt zu bauen (#1734) ---
+#
+# Diese Faelle standen bis 1.1.4M als compile_ok in der Liste, mit dem Vermerk
+# "kernel-adoptiert". Das war eine Annahme, keine Messung: die Nummern stammen
+# aus der hex-gruppierten Entwurfs-ABI (0x0204 lseek, 0x0205 stat, 0x0213
+# symlink, 0x020C pipe, 0x020D truncate), und im Kernel gibt es sie nicht.
+# Implementiert sind flach 0-228 und 300-326 (LyxOS-Team gegen kernel/ring3.lyx,
+# work/lyxos/antwort-lyxos.md).
+#
+# "Baut durch" war also die falsche Erwartung -- der erzeugte Aufruf ging ins
+# Leere. Seit 1.1.5A bricht der Bau mit Builtin-ID und Nummer ab, und genau das
+# wird hier geprueft. Wo es eine echte Nummer gibt (lseek waere 8, pipe waere
+# 320 pipe2), ist das Folgearbeit unter #1734; sie wird nicht hier per Annahme
+# entschieden, denn dieselbe Sorte Annahme steht ja am Anfang dieses Absatzes.
+compile_fail "lseek_meldet"    'fn main(): int64 { return lseek(3, 0, 2); }' "gibt es in LyxOS nicht"
+compile_fail "stat_meldet"     'fn main(): int64 { var s: int64 := 0; return stat("f", s); }' "gibt es in LyxOS nicht"
+compile_fail "lstat_meldet"    'fn main(): int64 { var s: int64 := 0; return lstat("f", s); }' "gibt es in LyxOS nicht"
+compile_fail "symlink_meldet"  'fn main(): int64 { return symlink("a", "b"); }' "gibt es in LyxOS nicht"
 compile_ok "nanosleep_compiles" 'fn main(): int64 { var ts: int64 := 0; return nanosleep(ts, 0); }'
-compile_ok "pipe_compiles"     'fn main(): int64 { var a: int64 := 0; var b: int64 := 0; return pipe(a, b, 0); }'
-compile_ok "truncate_compiles" 'fn main(): int64 { return truncate(3, 100); }'
-compile_ok "rmdir_compiles"    'fn main(): int64 { return rmdir("d"); }'
+compile_fail "pipe_meldet"     'fn main(): int64 { var a: int64 := 0; var b: int64 := 0; return pipe(a, b, 0); }' "gibt es in LyxOS nicht"
+compile_fail "truncate_meldet" 'fn main(): int64 { return truncate(3, 100); }' "gibt es in LyxOS nicht"
+compile_fail "rmdir_meldet"    'fn main(): int64 { return rmdir("d"); }' "gibt es in LyxOS nicht"
 compile_ok "eprintint_compiles" 'fn main(): int64 { EPrintInt(42); return 0; }'
 compile_ok "argvget_compiles"  'fn main(): int64 { var av: int64 := 0; var p: pchar := ArgvGet(av, 0); return 0; }'
 compile_ok "fork_compiles"     'fn main(): int64 { return sys_fork(); }'

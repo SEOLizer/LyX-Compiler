@@ -186,3 +186,59 @@ Wer eine dieser Funktionen benutzt, liest diese Tabelle, nicht den Kernel-Quellt
 Dass das LyxOS-Team diese Punkte benennt statt sie zu verschweigen, ist der
 Grund, warum sie hier stehen können. Eine Abweichung, die nur im Kernel steht,
 ist beim Aufrufer ein Fehler ohne Absender.
+
+## Die Entwurfs-ABI ist keine ABI (#1734)
+
+`emitVfsSyscall` prüft seit 1.1.4N jede Nummer gegen den **tatsächlich
+implementierten** Raum: flach **0…228** und **300…326**, dazu der Wissensgraph
+**2063…2066** und die Zeitleiste **2315**. Eine Nummer ausserhalb wird nicht
+emittiert — der Bau bricht mit Builtin-ID, Nummer und Fundstelle ab.
+
+Betroffen sind **106** Zuordnungen, die aus der hex-gruppierten Entwurfs-ABI
+stammen und im Kernel nie gebaut wurden:
+
+| Gruppe | Builtin-IDs | emittierte Entwurfsnummer |
+|---|---|---|
+| IPC/Sync | 72–84 | 0x0400 … 0x040C |
+| Zeit | 85–89 | 0x0500 … 0x0504 |
+| Capabilities | 90–98 | 0x0700 … 0x0708 |
+| Tasks | 99–108 | 0x0B00 … 0x0B09 |
+| KI | 109–115 | 0x0800 … 0x0806 |
+| Embedding | 116–121 | 0x0807 … 0x080C |
+| Sem/Graph | 122–127 | 0x080D … 0x0812 |
+| Lyra | 128–139 | 0x0900 … 0x090B |
+| IOFS | 140–144 | 0x0C00 … 0x0C04 |
+| Debug | 145–150 | 0x0A00 … 0x0A05 |
+| einzeln | 24, 25, 30–34, 36, 39–47, 48–57 | 0x0204, 0x0205, 0x020A–0x0215, 0x0300–0x0305, 0x0600–0x0609 |
+
+Zwei Zufallstreffer bleiben gültig: **0x080F…0x0812** und **0x090B** sind
+dezimal 2063…2066 und 2315 und damit echte Handler. Die Gruppe Sem/Graph trifft
+also teils ins Leere und teils genau richtig — kein Verdienst des Entwurfs,
+sondern der Grund, warum die Prüfung Zahlen vergleicht und keine Gruppen.
+
+**Warum abbrechen und nicht `-ENOSYS`.** Heute trifft eine Entwurfsnummer
+nichts, weil 229…399 im Kernel frei ist; ein Laufzeitfehler wäre also formal
+ausreichend. Nur ist „heute frei" keine Eigenschaft, auf die man baut: wächst
+die flache Tabelle, wandert eine Phantasienummer nach der anderen in belegtes
+Gebiet, und der Tag kündigt sich nicht an. Das LyxOS-Team beziffert, was dann
+passiert — Linux 158 träfe dort `sys_iofs_write_lpid`, das eine 4-KB-Seite ins
+Dateisystem **schreibt**.
+
+**Der Abbruch kostet nichts, was vorher funktioniert hätte.** Alle acht
+stdlib-Units bauen weiter und `make test-lyxos` bleibt grün, weil der
+Erreichbarkeitsfilter (#1727) ungenutzte Rümpfe gar nicht erst lowert. Getroffen
+wird nur, wer eine dieser Funktionen **wirklich aufruft** — und dessen Programm
+hätte vorher einen Syscall ins Nichts abgesetzt.
+
+**Wo es eine echte Nummer gibt, gehört sie angebunden** statt der Entwurfszahl.
+Aus `work/lyxos/antwort-lyxos.md`: Ereignisschleife mit Frist **218**, Ereignisse
+**121/122/132**, TCP **180–184**, rohe Frames **146/147**, Netz/DNS/Ping
+**141–145, 211–214**, IOFS mit Graph **155–188**, Statistik **202/203/205**,
+Neustart **210**, RAM-Disks **153/154**, Audio **219–228**, Fenster **148–152**,
+TSC **228**. Das ist Folgearbeit, kein Teil dieser Prüfung.
+
+**Zwei ungeklärte Punkte, bewusst nicht überschrieben:** `sys_seek` emittierte
+0x0204, die Antwort nennt `sys_lseek` = 8; unser eigener Stand führte 0x0204
+als QEMU-verifiziert. Dasselbe bei `sys_stat` 0x0205 gegen `sys_fstat` 135.
+Beide melden jetzt, statt eine der beiden Lesarten zur Tatsache zu erklären.
+
