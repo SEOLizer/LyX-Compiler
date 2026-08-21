@@ -178,6 +178,9 @@ pub type WinX86Backend = class {
   envStoreOff:     int64;   // #1677: disp32-Offset des Stores in CG_ENVBLOCK
   envCallOff:      int64;   // #1677: Offset des `call [GetEnvironmentStringsA]`
 
+  // #1678: Offset des `call [VirtualFree]` im Freigabe-Helfer (-1 = keiner).
+  vfreeCallOff:    int64;
+
   // ------------------------------------------------------------------
   // Code buffer primitives
   // ------------------------------------------------------------------
@@ -831,6 +834,7 @@ pub type WinX86Backend = class {
     var gclRVA: int64 := rdataRVA + iat0 + 24;  // GetCommandLineA
     var ghRVA:  int64 := rdataRVA + iat0 + 32;  // GetStdHandle
     var gesRVA: int64 := rdataRVA + iat0 + 40;  // GetEnvironmentStringsA (#1677)
+    var vfRVA:  int64 := rdataRVA + iat0 + 48;  // VirtualFree (#1678)
     if (self.envCallOff >= 0) {
       self.wxb_patch32(self.envCallOff + 2, gesRVA - (WIN_TEXT_RVA + self.envCallOff + 6));
     }
@@ -898,6 +902,12 @@ pub type WinX86Backend = class {
     if (self.vallocCallOff >= 0) {
       var rva: int64 := vaRVA - (textBase + self.vallocCallOff + 6);
       self.wxb_patch32(self.vallocCallOff + 2, rva);
+    }
+
+    // #1678: VirtualFree-Aufruf im Freigabe-Helfer.
+    if (self.vfreeCallOff >= 0) {
+      var rvaF: int64 := vfRVA - (textBase + self.vfreeCallOff + 6);
+      self.wxb_patch32(self.vfreeCallOff + 2, rvaF);
     }
   }
 
@@ -1009,7 +1019,14 @@ pub type WinX86Backend = class {
     var userEnd: int64 := self.codeLen;
     var vallocOff: int64 := self.codeLen;
     self.wxb_emitVAlloc();
+    // #1678: derselbe Handgriff fuer die Freigabe. Ohne ihn blieb in jeder
+    // erzeugten Datei ein rohes `mov rax, 11; syscall` stehen — auf Windows
+    // ein beliebiger NT-Dienst mit den Argumenten in den falschen Registern.
+    var vfreeOff: int64 := self.codeLen;
+    self.wxb_emitVFree();
     self.wxb_replaceMmap(vallocOff, userEnd);
+    self.wxb_replaceMunmap(vfreeOff, userEnd);
+    self.wxb_pruefeSyscalls(userEnd);
 
     // Patch IAT indirect call rel32 fields now that codeLen is final
     self.wxb_patchIAT();
@@ -1041,8 +1058,9 @@ pub type WinX86Backend = class {
   // `call vallocOff` (E8 rel32) + NOP padding. Size is already in rsi.
   fn wxb_replaceMmap(vallocOff: int64, endOff: int64) {
     var i: int64 := WIN_USER_OFF;
-    while (i + 12 <= endOff) {
-      if (peek8(self.code + i) == 0x48 && peek8(self.code + i + 1) == 0xB8 &&
+    while (i + 7 <= endOff) {
+      if ((i + 12) <= endOff &&
+          peek8(self.code + i) == 0x48 && peek8(self.code + i + 1) == 0xB8 &&
           peek8(self.code + i + 2) == 0x09 && peek8(self.code + i + 3) == 0x00 &&
           peek8(self.code + i + 4) == 0x00 && peek8(self.code + i + 5) == 0x00 &&
           peek8(self.code + i + 6) == 0x00 && peek8(self.code + i + 7) == 0x00 &&
@@ -1057,9 +1075,125 @@ pub type WinX86Backend = class {
         var p: int64 := 5;
         while (p < 12) { poke8(self.code + i + p, 0x90); p := p + 1; }
         i := i + 12;
+      } else if (peek8(self.code + i) == 0xB8 && peek8(self.code + i + 1) == 0x09 &&
+                 peek8(self.code + i + 2) == 0x00 && peek8(self.code + i + 3) == 0x00 &&
+                 peek8(self.code + i + 4) == 0x00 &&
+                 peek8(self.code + i + 5) == 0x0F && peek8(self.code + i + 6) == 0x05) {
+        // #1678: Die KURZFORM `mov eax, nr` (7 Byte statt 12). Der Ersetzer
+        // kannte bis hierher nur die movabs-Form und ging an jeder Stelle
+        // vorbei, die den Wert schmal laedt — das waren die Aufrufe aus dem
+        // Array-Wachstum, in einer erzeugten Datei zwei Dutzend.
+        var relK: int64 := vallocOff - (i + 5);
+        poke8(self.code + i, 0xE8);
+        poke8(self.code + i + 1, relK & 0xFF);
+        poke8(self.code + i + 2, (relK >> 8) & 0xFF);
+        poke8(self.code + i + 3, (relK >> 16) & 0xFF);
+        poke8(self.code + i + 4, (relK >> 24) & 0xFF);
+        poke8(self.code + i + 5, 0x90);
+        poke8(self.code + i + 6, 0x90);
+        i := i + 7;
       } else {
         i := i + 1;
       }
+    }
+  }
+
+  // #1678: VirtualFree-basierter Freigabe-Helfer. Eintritt wie beim Linux-
+  // munmap: rdi = Adresse, rsi = Laenge. Windows braucht die Laenge NICHT —
+  // MEM_RELEASE (0x8000) verlangt dwSize = 0 und die Basisadresse der
+  // Belegung. Beides passt: `alloc` gibt Bloecke ueber APOOL_MAX ein eigenes
+  // Mapping, und `free` bekommt genau diesen Zeiger zurueck.
+  fn wxb_emitVFree() {
+    self.wxb_ce8(0x55);                                          // push rbp
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xE5); // mov rbp, rsp
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xE4); self.wxb_ce8(0xF0); // and rsp, -16
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x20); // sub rsp, 0x20
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xF9); // mov rcx, rdi  (lpAddress)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x31); self.wxb_ce8(0xD2); // xor rdx, rdx  (dwSize = 0)
+    self.wxb_ce8(0x41); self.wxb_ce8(0xB8); self.wxb_ce8(0x00); self.wxb_ce8(0x80); self.wxb_ce8(0x00); self.wxb_ce8(0x00); // mov r8d, MEM_RELEASE
+    self.vfreeCallOff := self.codeLen;
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);    // call [VirtualFree_IAT]
+    // VirtualFree liefert BOOL; munmap liefert 0 bei Erfolg. Umdrehen, damit
+    // der Aufrufer dieselbe Antwort bekommt wie unter Linux.
+    self.wxb_ce8(0x48); self.wxb_ce8(0x85); self.wxb_ce8(0xC0); // test rax, rax
+    self.wxb_ce8(0x0F); self.wxb_ce8(0x94); self.wxb_ce8(0xC0); // sete al
+    self.wxb_ce8(0x48); self.wxb_ce8(0x0F); self.wxb_ce8(0xB6); self.wxb_ce8(0xC0); // movzx rax, al
+    self.wxb_ce8(0x48); self.wxb_ce8(0xF7); self.wxb_ce8(0xD8); // neg rax  (0 = ok, -1 = Fehler)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xEC); // mov rsp, rbp
+    self.wxb_ce8(0x5D);                                          // pop rbp
+    self.wxb_ce8(0xC3);                                          // ret
+  }
+
+  // #1678: dieselbe Ersetzung wie wxb_replaceMmap, fuer munmap (Nummer 11).
+  fn wxb_replaceMunmap(vfreeOff: int64, endOff: int64) {
+    var i: int64 := WIN_USER_OFF;
+    while (i + 7 <= endOff) {
+      if ((i + 12) <= endOff &&
+          peek8(self.code + i) == 0x48 && peek8(self.code + i + 1) == 0xB8 &&
+          peek8(self.code + i + 2) == 0x0B && peek8(self.code + i + 3) == 0x00 &&
+          peek8(self.code + i + 4) == 0x00 && peek8(self.code + i + 5) == 0x00 &&
+          peek8(self.code + i + 6) == 0x00 && peek8(self.code + i + 7) == 0x00 &&
+          peek8(self.code + i + 8) == 0x00 && peek8(self.code + i + 9) == 0x00 &&
+          peek8(self.code + i + 10) == 0x0F && peek8(self.code + i + 11) == 0x05) {
+        var rel: int64 := vfreeOff - (i + 5);
+        poke8(self.code + i, 0xE8);
+        poke8(self.code + i + 1, rel & 0xFF);
+        poke8(self.code + i + 2, (rel >> 8) & 0xFF);
+        poke8(self.code + i + 3, (rel >> 16) & 0xFF);
+        poke8(self.code + i + 4, (rel >> 24) & 0xFF);
+        var p: int64 := 5;
+        while (p < 12) { poke8(self.code + i + p, 0x90); p := p + 1; }
+        i := i + 12;
+      } else if (peek8(self.code + i) == 0xB8 && peek8(self.code + i + 1) == 0x0B &&
+                 peek8(self.code + i + 2) == 0x00 && peek8(self.code + i + 3) == 0x00 &&
+                 peek8(self.code + i + 4) == 0x00 &&
+                 peek8(self.code + i + 5) == 0x0F && peek8(self.code + i + 6) == 0x05) {
+        // #1678: Die KURZFORM `mov eax, nr` (7 Byte statt 12). Der Ersetzer
+        // kannte bis hierher nur die movabs-Form und ging an jeder Stelle
+        // vorbei, die den Wert schmal laedt — das waren die Aufrufe aus dem
+        // Array-Wachstum, in einer erzeugten Datei zwei Dutzend.
+        var relK: int64 := vfreeOff - (i + 5);
+        poke8(self.code + i, 0xE8);
+        poke8(self.code + i + 1, relK & 0xFF);
+        poke8(self.code + i + 2, (relK >> 8) & 0xFF);
+        poke8(self.code + i + 3, (relK >> 16) & 0xFF);
+        poke8(self.code + i + 4, (relK >> 24) & 0xFF);
+        poke8(self.code + i + 5, 0x90);
+        poke8(self.code + i + 6, 0x90);
+        i := i + 7;
+      } else {
+        i := i + 1;
+      }
+    }
+  }
+
+  // #1678: Nach dem Ersetzen nachsehen, ob noch ein rohes `syscall` im
+  // Benutzercode steht.
+  //
+  // Ein Linux-Syscall in einer PE-Datei ruft auf Windows einen NT-Dienst mit
+  // ganz anderer Bedeutung — und die Argumente stehen in den falschen
+  // Registern, weil Windows r10 statt rdi nimmt. Beim Freigeben hat genau das
+  // Wines Buchfuehrung ueber die Speicherbereiche zerstoert (#1678).
+  //
+  // Gemeldet wird, nicht abgebrochen: der Bestand traegt weitere Nummern
+  // (Datei- und Prozessaufrufe), fuer die es hier noch keinen Ersatz gibt.
+  // Ein Abbruch machte jede win64-Uebersetzung unmoeglich; das Schweigen
+  // darueber war aber der Grund, warum #1678 so lange unentdeckt blieb.
+  // tests/win64_syscalls_test.sh haelt die Zahl fest, damit keine neue
+  // dazukommt.
+  fn wxb_pruefeSyscalls(endOff: int64) {
+    var n: int64 := 0;
+    var i: int64 := WIN_USER_OFF;
+    while (i + 2 <= endOff) {
+      if (peek8(self.code + i) == 0x0F && peek8(self.code + i + 1) == 0x05) { n := n + 1; }
+      i := i + 1;
+    }
+    if (n > 0) {
+      EPrintStr("warning: win64: "c);
+      EPrintInt(n);
+      EPrintStrLn(" rohe Linux-Syscalls im erzeugten Code (#1678)."c);
+      EPrintStrLn("  Auf Windows trifft jeder davon einen fremden NT-Dienst."c);
+      EPrintStrLn("  mmap und munmap sind ersetzt; der Rest hat noch keinen Ersatz."c);
     }
   }
 
@@ -1164,14 +1298,15 @@ pub type WinX86Backend = class {
     var dn: int64 := 0;
     while (dn < nDll) { runtimeNames := runtimeNames + peek64(self.impDllLen + dn * 8) + 1; dn := dn + 1; }
     // Reihenfolge der Laufzeitnamen: WriteFile, ExitProcess, VirtualAlloc,
-    // GetCommandLineA, GetStdHandle.
-    var rtOff: int64 := alloc(6 * 8);
+    // GetCommandLineA, GetStdHandle, GetEnvironmentStringsA, VirtualFree.
+    var rtOff: int64 := alloc(7 * 8);
     poke64(rtOff,      runtimeNames);
     poke64(rtOff + 8,  runtimeNames + 12);
     poke64(rtOff + 16, runtimeNames + 12 + 14);
     poke64(rtOff + 24, runtimeNames + 12 + 14 + 15);
     poke64(rtOff + 32, runtimeNames + 12 + 14 + 15 + 18);
     poke64(rtOff + 40, runtimeNames + 12 + 14 + 15 + 18 + 15);   // #1677
+    poke64(rtOff + 48, runtimeNames + 12 + 14 + 15 + 18 + 15 + 25);   // #1678 VirtualFree
 
     // #1676: Die Reihenfolge muss der aus wxb_planImports entsprechen: je DLL
     // erst INT, dann IAT. Geschrieben wurden zuvor ERST alle INTs und DANACH
@@ -1185,7 +1320,7 @@ pub type WinX86Backend = class {
       while (durchgang < 2) {          // 0 = INT, 1 = IAT — bitgleich
         if (d2 == 0) {
           var r: int64 := 0;
-          while (r < 6) { self.wxb_oe64(rdataRVA + peek64(rtOff + r * 8)); r := r + 1; }
+          while (r < 7) { self.wxb_oe64(rdataRVA + peek64(rtOff + r * 8)); r := r + 1; }
         }
         // #1676: eigene Externs dieser DLL — der Namensoffset kommt aus der
         // Tabelle aus wxb_planImports, nicht aus einer zweiten Rechnung.
@@ -1224,6 +1359,7 @@ pub type WinX86Backend = class {
     self.wxb_oName("GetCommandLineA"c, 15);
     self.wxb_oName("GetStdHandle"c, 12);
     self.wxb_oName("GetEnvironmentStringsA"c, 22);   // #1677: hint+22+NUL = 25
+    self.wxb_oName("VirtualFree"c, 11);              // #1678: hint+11+NUL = 14
 
     // ---- hint + Name je eigenem Extern ----
     var e2: int64 := 0;
@@ -1361,7 +1497,7 @@ pub type WinX86Backend = class {
     var dllCnt: int64 := alloc(64 * 8);      // Zahl der Funktionen je DLL
     poke64(dllPtr, "kernel32.dll"c as int64);
     poke64(dllLen, 12);
-    poke64(dllCnt, 6);                        // die sechs der Laufzeit (#1677)
+    poke64(dllCnt, 7);                        // die sieben der Laufzeit (#1677, #1678)
     var nDll: int64 := 1;
 
     var e: int64 := 0;
@@ -1408,7 +1544,7 @@ pub type WinX86Backend = class {
     var used: int64 := alloc(64 * 8);
     var u: int64 := 0;
     while (u < nDll) { poke64(used + u * 8, 0); u := u + 1; }
-    poke64(used, 6);                         // DLL 0: sechs sind vergeben (#1677)
+    poke64(used, 7);                         // DLL 0: sieben sind vergeben (#1677, #1678)
     e := 0;
     while (e < self.externCount) {
       var eb2: int64 := self.externBuf + e * WIN_EXTERN_SZ;
@@ -1431,7 +1567,7 @@ pub type WinX86Backend = class {
     var namesOff: int64 := off;
     var d4: int64 := 0;
     while (d4 < nDll) { off := off + peek64(dllLen + d4 * 8) + 1; d4 := d4 + 1; }
-    off := off + 12 + 14 + 15 + 18 + 15 + 25;  // die sechs Namen der Laufzeit (#1677)
+    off := off + 12 + 14 + 15 + 18 + 15 + 25 + 14;  // die sieben Namen der Laufzeit (#1677, #1678)
     // #1676: Den Offset seines Namensblocks bekommt JEDER Extern hier fest
     // zugewiesen. Zuvor rechnete ihn jede Schreibstelle fuer sich nach — INT,
     // IAT und die Namensablage also dreimal —, und die Rechnungen liefen
@@ -1652,6 +1788,7 @@ pub type WinX86Backend = class {
     self.relocContent    := 0;
     self.relocContentLen := 0;
     self.vallocCallOff   := 0 - 1;
+    self.vfreeCallOff    := 0 - 1;
     self.argcStoreOff    := 0 - 1;
     self.argvStoreOff    := 0 - 1;
     self.envStoreOff     := 0 - 1;   // #1677
