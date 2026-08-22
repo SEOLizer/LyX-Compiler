@@ -884,6 +884,14 @@ pub type Codegen = class {
   fcMxSlot:    int64;   // rbp-Offset: gesicherter MXCSR (+4: der entschaerfte)
   fcNameSlot:  int64;   // rbp-Offset: vorheriger Wert von _lyx_fc_name
 
+  // #1370: --profile — jede Funktion bekommt Eintritts- und Austrittsmessung,
+  // und `main` ruft beim Verlassen den Bericht. profCurName/-Len tragen den
+  // Namen der gerade uebersetzten Funktion; ohne ihn wuesste der Prolog nicht,
+  // welchen Eintrag er zaehlen soll.
+  profileAll:  int64;
+  profCurName: pchar;
+  profCurLen:  int64;
+
   // Import search paths (mirrors sema's includePath/stdPath)
   // Set by lyxc after CLI parsing / env-var reading
   includePath: int64;  // pchar to extra include dir, 0 = not set
@@ -3916,6 +3924,14 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x45); self.cg_e8(0xF8);
     // xor rax, rax  (clear canary from register)
     self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
+    // #1370: --profile misst jede Funktion. Hier, nach dem Rahmenaufbau, sind
+    // rax/rdx frei — die Argumentregister sind noch unberuehrt, weil sie erst
+    // danach in den Rahmen gerettet werden.
+    if (self.profileAll != 0 && self.profCurLen > 0) {
+      var pdo: int64 := self.cg_findOrAllocProfEntry(self.profCurName, self.profCurLen);
+      self.cg_profEnterBytes(pdo);
+      self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);   // xor rax, rax
+    }
     return patchPos;
   }
 
@@ -3923,6 +3939,24 @@ pub type Codegen = class {
   // WP-18: Uses r10/r11 (scratch) to compare [rbp-8] with _lyx_canary global.
   //        Does NOT touch rax (return value).
   fn cg_emitEpilogue() {
+    // #1370: --profile. Der Rueckgabewert steht in rax, und die Messung
+    // benutzt rax/rcx/rdx — deshalb wird er ueber den Stapel gerettet. Diese
+    // Stelle ist der einzige Trichter: alle sechs Rueckgabewege im Codegen
+    // rufen sie, auch die vorzeitigen `return`.
+    if (self.profileAll != 0 && self.profCurLen > 0) {
+      self.cg_e8(0x50);                                        // push rax
+      var pdoE: int64 := self.cg_findOrAllocProfEntry(self.profCurName, self.profCurLen);
+      self.cg_profLeaveBytes(pdoE);
+      // In `main` folgt der Bericht — nach der eigenen Messung, damit main
+      // selbst mit in der Tabelle steht. Die Helferfunktion liegt hinter
+      // allen uebrigen Funktionen; ihre Adresse traegt der Patch nach.
+      if (self.cg_seq(self.profCurName, self.profCurLen, "main"c, 4)) {
+        self.cg_e8(0xE8);
+        var ppRep: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(ppRep, "__lyx_profile_report" as int64, 20, CG_PATCH_CALL);
+      }
+      self.cg_e8(0x58);                                        // pop rax
+    }
     // #1140: @flight_crit — alten MXCSR und Namenszeiger zurueck, BEVOR der
     // Rahmen faellt (beide liegen darin). Jede Rueckkehr kommt hier vorbei,
     // deshalb genuegt diese eine Stelle.
@@ -8375,6 +8409,11 @@ pub type Codegen = class {
     // Set class context for self.field access
     self.curClassName    := className;
     self.curClassNameLen := classNameLen;
+    // #1370: Methoden werden ebenso gemessen, unter ihrem verketteten Namen
+    // (Klasse_Methode) — sonst faenden sich zwei gleichnamige Methoden
+    // verschiedener Klassen in einem Eintrag wieder.
+    self.profCurName := mangBuf as pchar;
+    self.profCurLen  := mangLen;
     // Emit prologue
     var prologuePatch: int64 := self.cg_emitPrologue();
     // #1140: @flight_crit an einer METHODE. Ohne diese Stelle gaelte die
@@ -12630,14 +12669,7 @@ pub type Codegen = class {
         peNLen := self.cg_nslen(peArgNd);
       }
       var peDOff: int64 := self.cg_findOrAllocProfEntry(peName, peNLen);
-      // rdtsc → rax (full 64-bit TSC)
-      self.cg_e8(0x0F); self.cg_e8(0x31);                                      // rdtsc
-      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x20); // shl rdx, 32
-      self.cg_e8(0x48); self.cg_e8(0x09); self.cg_e8(0xD0);                   // or rax, rdx
-      // mov [rip+rel32], rax → tsc_start at peDOff+0
-      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
-      var pePP1: int64 := self.codeLen; self.cg_e32(0);
-      self.cg_addPatch(pePP1, peDOff, 0, CG_PATCH_STR);
+      self.cg_profEnterBytes(peDOff);   // #1370: dieselbe Folge wie bei --profile
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "profile_leave", 13)) {
@@ -12657,160 +12689,13 @@ pub type Codegen = class {
         plNLen := self.cg_nslen(plArgNd);
       }
       var plDOff: int64 := self.cg_findOrAllocProfEntry(plName, plNLen);
-      // rdtsc → rax (current TSC)
-      self.cg_e8(0x0F); self.cg_e8(0x31);
-      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x20);
-      self.cg_e8(0x48); self.cg_e8(0x09); self.cg_e8(0xD0);
-      // mov rcx, [rip+rel32] → tsc_start at plDOff+0
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x0D);
-      var plPP1: int64 := self.codeLen; self.cg_e32(0);
-      self.cg_addPatch(plPP1, plDOff, 0, CG_PATCH_STR);
-      // delta = rax - rcx (elapsed cycles)
-      self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xC8);  // sub rax, rcx
-      // mov rdx, [rip+rel32] → total_cycles at plDOff+16
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x15);
-      var plPP2: int64 := self.codeLen; self.cg_e32(0);
-      self.cg_addPatch(plPP2, plDOff + 16, 0, CG_PATCH_STR);
-      // add rdx, rax (total_cycles += delta)
-      self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xC2);  // add rdx, rax
-      // mov [rip+rel32], rdx → total_cycles at plDOff+16
-      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x15);
-      var plPP3: int64 := self.codeLen; self.cg_e32(0);
-      self.cg_addPatch(plPP3, plDOff + 16, 0, CG_PATCH_STR);
-      // mov rax, [rip+rel32] → call_count at plDOff+8
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
-      var plPP4: int64 := self.codeLen; self.cg_e32(0);
-      self.cg_addPatch(plPP4, plDOff + 8, 0, CG_PATCH_STR);
-      // inc rax; store back
-      self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);  // inc rax
-      // mov [rip+rel32], rax → call_count at plDOff+8
-      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
-      var plPP5: int64 := self.codeLen; self.cg_e32(0);
-      self.cg_addPatch(plPP5, plDOff + 8, 0, CG_PATCH_STR);
+      self.cg_profLeaveBytes(plDOff);   // #1370: dieselbe Folge wie bei --profile
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "profile_report", 14)) {
-      // WP-BC-40: profile_report() — print stats for all registered profiling entries.
-      // Compile-time unroll: emit print code for each entry known at this point.
-      if (self.profEntryCount > 0) {
-        // Pre-allocate label strings in data section once
-        var prHdrOff: int64 := self.dataLen;
-        // "[PROFILE] " (10 bytes)
-        self.cg_edata(91);  self.cg_edata(80);  self.cg_edata(82);  // "[PR"
-        self.cg_edata(79);  self.cg_edata(70);  self.cg_edata(73);  // "OFI"
-        self.cg_edata(76);  self.cg_edata(69);  self.cg_edata(93);  // "LE]"
-        self.cg_edata(32);                                           // " "
-        var prColOff: int64 := self.dataLen;
-        // ": " (2 bytes)
-        self.cg_edata(58); self.cg_edata(32);
-        var prCallsOff: int64 := self.dataLen;
-        // " calls, " (8 bytes)
-        self.cg_edata(32);  self.cg_edata(99);  self.cg_edata(97);  // " ca"
-        self.cg_edata(108); self.cg_edata(108); self.cg_edata(115); // "lls"
-        self.cg_edata(44);  self.cg_edata(32);                      // ", "
-        var prTotalOff: int64 := self.dataLen;
-        // " cycles total, " (15 bytes)
-        self.cg_edata(32);  self.cg_edata(99);  self.cg_edata(121); // " cy"
-        self.cg_edata(99);  self.cg_edata(108); self.cg_edata(101); // "cle"
-        self.cg_edata(115); self.cg_edata(32);  self.cg_edata(116); // "s t"
-        self.cg_edata(111); self.cg_edata(116); self.cg_edata(97);  // "ota"
-        self.cg_edata(108); self.cg_edata(44);  self.cg_edata(32);  // "l, "
-        var prAvgOff: int64 := self.dataLen;
-        // " cycles avg\n" (12 bytes)
-        self.cg_edata(32);  self.cg_edata(99);  self.cg_edata(121); // " cy"
-        self.cg_edata(99);  self.cg_edata(108); self.cg_edata(101); // "cle"
-        self.cg_edata(115); self.cg_edata(32);  self.cg_edata(97);  // "s a"
-        self.cg_edata(118); self.cg_edata(103); self.cg_edata(10);  // "vg\n"
-        var prIdx: int64 := 0;
-        while (prIdx < self.profEntryCount) {
-          var prEBase: int64 := self.profEntries + prIdx * 32;
-          var prNLen:  int64 := peek64(prEBase + CG_PR_OFF_NAMELEN);
-          var prDOff:  int64 := peek64(prEBase + CG_PR_OFF_DOFF);
-          var prNDOff: int64 := peek64(prEBase + CG_PR_OFF_NDOFF);
-          // Write "[PROFILE] " to stderr
-          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
-          var prPH: int64 := self.codeLen; self.cg_e32(0);
-          self.cg_addPatch(prPH, prHdrOff, 0, CG_PATCH_STR);
-          self.cg_e8(0xBA); self.cg_e32(10);                                                  // mov edx, 10
-          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
-          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
-          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
-          // Write name
-          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
-          var prPN: int64 := self.codeLen; self.cg_e32(0);
-          self.cg_addPatch(prPN, prNDOff, 0, CG_PATCH_STR);
-          self.cg_e8(0xBA); self.cg_e32(prNLen);                                              // mov edx, nameLen
-          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
-          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
-          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
-          // Write ": "
-          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
-          var prPC: int64 := self.codeLen; self.cg_e32(0);
-          self.cg_addPatch(prPC, prColOff, 0, CG_PATCH_STR);
-          self.cg_e8(0xBA); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edx, 2
-          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
-          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
-          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
-          // Load call_count → rdi; print decimal
-          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3D);
-          var prPCnt: int64 := self.codeLen; self.cg_e32(0);
-          self.cg_addPatch(prPCnt, prDOff + 8, 0, CG_PATCH_STR);
-          self.cg_emitStderrInt();
-          // Write " calls, "
-          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
-          var prPCa: int64 := self.codeLen; self.cg_e32(0);
-          self.cg_addPatch(prPCa, prCallsOff, 0, CG_PATCH_STR);
-          self.cg_e8(0xBA); self.cg_e8(8); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edx, 8
-          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
-          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
-          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
-          // Load total_cycles → rdi; print decimal
-          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3D);
-          var prPTot: int64 := self.codeLen; self.cg_e32(0);
-          self.cg_addPatch(prPTot, prDOff + 16, 0, CG_PATCH_STR);
-          self.cg_emitStderrInt();
-          // Write " cycles total, "
-          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
-          var prPTo: int64 := self.codeLen; self.cg_e32(0);
-          self.cg_addPatch(prPTo, prTotalOff, 0, CG_PATCH_STR);
-          self.cg_e8(0xBA); self.cg_e8(15); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);   // mov edx, 15
-          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
-          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
-          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
-          // Compute avg = total_cycles / call_count (0 if count==0)
-          // Load total_cycles → rax
-          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
-          var prPTA: int64 := self.codeLen; self.cg_e32(0);
-          self.cg_addPatch(prPTA, prDOff + 16, 0, CG_PATCH_STR);
-          // Load call_count → rcx
-          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x0D);
-          var prPCA: int64 := self.codeLen; self.cg_e32(0);
-          self.cg_addPatch(prPCA, prDOff + 8, 0, CG_PATCH_STR);
-          // test rcx,rcx; jnz +5 .do_div; xor rdi,rdi; jmp +9 .after_div; .do_div: xor rdx,rdx; idiv rcx; mov rdi,rax; .after_div:
-          // Layout: [0..2]=test [3..4]=jnz [5..7]=xor_rdi [8..9]=jmp [10..12]=xor_rdx [13..15]=idiv [16..18]=mov_rdi .after_div=[19]
-          self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC9);  // test rcx, rcx
-          self.cg_e8(0x75); self.cg_e8(0x05);                     // jnz +5 (.do_div at [10])
-          self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);  // xor rdi, rdi
-          self.cg_e8(0xEB); self.cg_e8(0x09);                     // jmp +9 (.after_div at [19])
-          // .do_div: [10]
-          self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);  // xor rdx, rdx
-          self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);  // idiv rcx
-          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);  // mov rdi, rax
-          // .after_div: print avg
-          self.cg_emitStderrInt();
-          // Write " cycles avg\n"
-          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
-          var prPAv: int64 := self.codeLen; self.cg_e32(0);
-          self.cg_addPatch(prPAv, prAvgOff, 0, CG_PATCH_STR);
-          self.cg_e8(0xBA); self.cg_e8(12); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);   // mov edx, 12
-          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
-          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
-          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
-          prIdx += 1;
-        }
-      }
-      self.cg_zeroRax();
-
+      // #1370: derselbe Bericht wird auch von --profile erzeugt, dort aus
+      // einer Helferfunktion hinter allen Rueckgabepunkten.
+      self.cg_profReportBytes();
     } else if (self.cg_seq(fname, fnlen, "exit", 4)) {
       // exit(code): rdi=code
       // #1487: exit_group (231), nicht exit (60). SYS_exit beendet nur den
@@ -17588,6 +17473,10 @@ pub type Codegen = class {
       }
     }
 
+    // #1370: Name fuer die Messung merken (siehe cg_emitPrologue).
+    self.profCurName := fname;
+    self.profCurLen  := fnlen;
+
     // Emit prologue, capture patch position for sub rsp imm32
     var prologuePatch: int64 := self.cg_emitPrologue();
 
@@ -20126,6 +20015,12 @@ pub type Codegen = class {
     self.loopTryMark := 0;
 
     self.includePath := 0;
+
+    self.profileAll  := 0;
+
+    self.profCurName := ""c;
+
+    self.profCurLen  := 0;
     self.stdPath     := 0;
     self.licenseKey    := 0;
     self.licenseKeyLen := 0;
@@ -21180,6 +21075,17 @@ pub type Codegen = class {
     self.cg_genFile(head);
     // #1141: die Bilanz erst hier — cg_genFile laeuft je importierter Einheit
     // erneut, dort gedruckt gaebe es eine Zeile je Import.
+    // #1370: --profile — die Berichtsfunktion ganz am Ende, hinter allen
+    // uebersetzten Funktionen. Frueher emittiert kaeme sie nur an die bis
+    // dahin bekannten Eintraege; der Bericht wird zur Uebersetzungszeit
+    // ausgerollt. `main` ruft sie beim Verlassen ueber die Marke.
+    if (self.profileAll != 0) {
+      self.cg_addLabel("__lyx_profile_report"c, 20, 0);
+      self.profCurLen := 0;          // die Berichtsfunktion misst sich nicht selbst
+      self.cg_profReportBytes();
+      self.cg_e8(0xC3);              // ret
+    }
+
     self.cg_tmrReport();
     // WP-6: Pad code to 4096-byte boundary so data starts on a page boundary.
     // This allows two PT_LOAD segments: RX (code) and RW (data), no overlap.
@@ -21994,6 +21900,183 @@ pub type Codegen = class {
     EmitWriteFile(path, buf, fileSize);   // #1682: schreibt oder scheitert laut
   }
 
+
+  // #1370: Die Bytefolgen fuer profile_enter/profile_leave. Sie standen bis
+  // 1.1.6D nur im Builtin-Zweig; `--profile` braucht dieselbe Folge an
+  // Funktionseintritt und -austritt. Zweimal nebeneinander waere genau die
+  // Doppelung, die in dieser Codebasis schon oft auseinandergelaufen ist.
+  //
+  // dOff = Datenoffset des Eintrags {tsc_start(8), call_count(8), total(8)}.
+  fn cg_profEnterBytes(dOff: int64) {
+    self.cg_e8(0x0F); self.cg_e8(0x31);                                      // rdtsc
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x20); // shl rdx, 32
+    self.cg_e8(0x48); self.cg_e8(0x09); self.cg_e8(0xD0);                   // or rax, rdx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);                   // mov [rip+d], rax
+    var pp: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pp, dOff, 0, CG_PATCH_STR);
+  }
+
+  fn cg_profLeaveBytes(dOff: int64) {
+        // rdtsc → rax (current TSC)
+        self.cg_e8(0x0F); self.cg_e8(0x31);
+        self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x20);
+        self.cg_e8(0x48); self.cg_e8(0x09); self.cg_e8(0xD0);
+        // mov rcx, [rip+rel32] → tsc_start at dOff+0
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x0D);
+        var plP1: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(plP1, dOff, 0, CG_PATCH_STR);
+        // delta = rax - rcx (elapsed cycles)
+        self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xC8);  // sub rax, rcx
+        // mov rdx, [rip+rel32] → total_cycles at dOff+16
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x15);
+        var plP2: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(plP2, dOff + 16, 0, CG_PATCH_STR);
+        // add rdx, rax (total_cycles += delta)
+        self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xC2);  // add rdx, rax
+        // mov [rip+rel32], rdx → total_cycles at dOff+16
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x15);
+        var plP3: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(plP3, dOff + 16, 0, CG_PATCH_STR);
+        // mov rax, [rip+rel32] → call_count at dOff+8
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+        var plP4: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(plP4, dOff + 8, 0, CG_PATCH_STR);
+        // inc rax; store back
+        self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);  // inc rax
+        // mov [rip+rel32], rax → call_count at dOff+8
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
+        var plP5: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(plP5, dOff + 8, 0, CG_PATCH_STR);
+  }
+
+  // #1370: Der Bericht. Er wird zur UEBERSETZUNGSZEIT ausgerollt — je Eintrag
+  // eine feste Folge Druckbefehle. Deshalb muss er nach allen Funktionen
+  // stehen: wer ihn frueher emittiert, druckt nur die bis dahin bekannten
+  // Eintraege. Bei `--profile` liegt er darum in einer eigenen Helferfunktion
+  // am Ende des Codes, die `main` beim Verlassen ruft.
+  fn cg_profReportBytes() {
+      // WP-BC-40: profile_report() — print stats for all registered profiling entries.
+      // Compile-time unroll: emit print code for each entry known at this point.
+      if (self.profEntryCount > 0) {
+        // Pre-allocate label strings in data section once
+        var prHdrOff: int64 := self.dataLen;
+        // "[PROFILE] " (10 bytes)
+        self.cg_edata(91);  self.cg_edata(80);  self.cg_edata(82);  // "[PR"
+        self.cg_edata(79);  self.cg_edata(70);  self.cg_edata(73);  // "OFI"
+        self.cg_edata(76);  self.cg_edata(69);  self.cg_edata(93);  // "LE]"
+        self.cg_edata(32);                                           // " "
+        var prColOff: int64 := self.dataLen;
+        // ": " (2 bytes)
+        self.cg_edata(58); self.cg_edata(32);
+        var prCallsOff: int64 := self.dataLen;
+        // " calls, " (8 bytes)
+        self.cg_edata(32);  self.cg_edata(99);  self.cg_edata(97);  // " ca"
+        self.cg_edata(108); self.cg_edata(108); self.cg_edata(115); // "lls"
+        self.cg_edata(44);  self.cg_edata(32);                      // ", "
+        var prTotalOff: int64 := self.dataLen;
+        // " cycles total, " (15 bytes)
+        self.cg_edata(32);  self.cg_edata(99);  self.cg_edata(121); // " cy"
+        self.cg_edata(99);  self.cg_edata(108); self.cg_edata(101); // "cle"
+        self.cg_edata(115); self.cg_edata(32);  self.cg_edata(116); // "s t"
+        self.cg_edata(111); self.cg_edata(116); self.cg_edata(97);  // "ota"
+        self.cg_edata(108); self.cg_edata(44);  self.cg_edata(32);  // "l, "
+        var prAvgOff: int64 := self.dataLen;
+        // " cycles avg\n" (12 bytes)
+        self.cg_edata(32);  self.cg_edata(99);  self.cg_edata(121); // " cy"
+        self.cg_edata(99);  self.cg_edata(108); self.cg_edata(101); // "cle"
+        self.cg_edata(115); self.cg_edata(32);  self.cg_edata(97);  // "s a"
+        self.cg_edata(118); self.cg_edata(103); self.cg_edata(10);  // "vg\n"
+        var prIdx: int64 := 0;
+        while (prIdx < self.profEntryCount) {
+          var prEBase: int64 := self.profEntries + prIdx * 32;
+          var prNLen:  int64 := peek64(prEBase + CG_PR_OFF_NAMELEN);
+          var prDOff:  int64 := peek64(prEBase + CG_PR_OFF_DOFF);
+          var prNDOff: int64 := peek64(prEBase + CG_PR_OFF_NDOFF);
+          // Write "[PROFILE] " to stderr
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPH: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPH, prHdrOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e32(10);                                                  // mov edx, 10
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          // Write name
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPN: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPN, prNDOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e32(prNLen);                                              // mov edx, nameLen
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          // Write ": "
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPC: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPC, prColOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edx, 2
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          // Load call_count → rdi; print decimal
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3D);
+          var prPCnt: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPCnt, prDOff + 8, 0, CG_PATCH_STR);
+          self.cg_emitStderrInt();
+          // Write " calls, "
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPCa: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPCa, prCallsOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e8(8); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edx, 8
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          // Load total_cycles → rdi; print decimal
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3D);
+          var prPTot: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPTot, prDOff + 16, 0, CG_PATCH_STR);
+          self.cg_emitStderrInt();
+          // Write " cycles total, "
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPTo: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPTo, prTotalOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e8(15); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);   // mov edx, 15
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          // Compute avg = total_cycles / call_count (0 if count==0)
+          // Load total_cycles → rax
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+          var prPTA: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPTA, prDOff + 16, 0, CG_PATCH_STR);
+          // Load call_count → rcx
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x0D);
+          var prPCA: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPCA, prDOff + 8, 0, CG_PATCH_STR);
+          // test rcx,rcx; jnz +5 .do_div; xor rdi,rdi; jmp +9 .after_div; .do_div: xor rdx,rdx; idiv rcx; mov rdi,rax; .after_div:
+          // Layout: [0..2]=test [3..4]=jnz [5..7]=xor_rdi [8..9]=jmp [10..12]=xor_rdx [13..15]=idiv [16..18]=mov_rdi .after_div=[19]
+          self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC9);  // test rcx, rcx
+          self.cg_e8(0x75); self.cg_e8(0x05);                     // jnz +5 (.do_div at [10])
+          self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);  // xor rdi, rdi
+          self.cg_e8(0xEB); self.cg_e8(0x09);                     // jmp +9 (.after_div at [19])
+          // .do_div: [10]
+          self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);  // xor rdx, rdx
+          self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);  // idiv rcx
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);  // mov rdi, rax
+          // .after_div: print avg
+          self.cg_emitStderrInt();
+          // Write " cycles avg\n"
+          self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+          var prPAv: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPAv, prAvgOff, 0, CG_PATCH_STR);
+          self.cg_e8(0xBA); self.cg_e8(12); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);   // mov edx, 12
+          self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
+          self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
+          self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          prIdx += 1;
+        }
+      }
+      self.cg_zeroRax();
+
+  }
 };
 
 // ============================================================================

@@ -169,17 +169,18 @@ if [ -x "$TMP/o_x86" ]; then
   else no "mit --no-opt rechnet das Programm richtig" "rc=$rc statt 0"; fi
 fi
 
-# #1370: die noch offenen VIER sagen es, statt zu schweigen. --dump-relocs und
-# --map-file sind umgesetzt und muessen angenommen werden; geprueft wird ihr
-# INHALT in tests/diagnose_schalter_test.sh.
-for f in --emit-asm --dump-asm --asm-listing --profile; do
+# #1370: die noch offenen DREI sagen es, statt zu schweigen. --dump-relocs,
+# --map-file und seit 1.1.6E auch --profile sind umgesetzt und muessen
+# angenommen werden; geprueft wird ihr INHALT in
+# tests/diagnose_schalter_test.sh bzw. tests/profile_schalter_test.sh.
+for f in --emit-asm --dump-asm --asm-listing; do
   out="$("$LYXC" "$TMP/rek.lyx" "$f" -o "$TMP/r" 2>&1)"
   case "$out" in
     *"nicht umgesetzt"*"#1370"*) ok "$f wird als nicht umgesetzt gemeldet" ;;
     *) no "$f wird als nicht umgesetzt gemeldet" "$(echo "$out" | head -1)" ;;
   esac
 done
-for f in --dump-relocs --map-file; do
+for f in --dump-relocs --map-file --profile; do
   if "$LYXC" "$TMP/rek.lyx" "$f" -o "$TMP/r" >/dev/null 2>&1; then
     ok "$f wird angenommen (umgesetzt)"
   else
