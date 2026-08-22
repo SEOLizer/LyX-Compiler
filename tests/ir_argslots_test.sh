@@ -143,6 +143,93 @@ lauf "Funktion mit 40 lebenden Werten" 'fn main(): int64 {
   return v01 + v20 + v33 + v40;
 }' 94
 
+# ---------------------------------------------------------------------------
+# #1388 Abschluss: dieselben Rechnungen auf riscv, und die Zeichenketten-
+# Builtins, an denen std.io haengen geblieben ist.
+QEMURV=""
+command -v qemu-riscv64-static >/dev/null 2>&1 && QEMURV=qemu-riscv64-static
+command -v qemu-riscv64 >/dev/null 2>&1 && [ -z "$QEMURV" ] && QEMURV=qemu-riscv64
+
+laufRV() {   # Name, Quelle, erwarteter Rueckgabewert
+  [ -z "$QEMURV" ] && return
+  printf '%s' "$2" > "$TMP/r.lyx"
+  if ! "$LYXC" --std-path="$ROOT" "$TMP/r.lyx" --target=riscv -o "$TMP/r" >"$TMP/r.log" 2>&1; then
+    no "$1 uebersetzt (riscv)" "$(grep -iE 'error|unbekannt|nicht behandelt' "$TMP/r.log" | head -1)"
+    return
+  fi
+  "$QEMURV" "$TMP/r" >/dev/null 2>&1
+  local rc=$?
+  if [ "$rc" = "$3" ]; then ok "$1 (riscv, = $3)"
+  else no "$1 (riscv)" "erwartet $3, erhalten $rc$( [ $rc -ge 128 ] && echo ' (Signal)' )"; fi
+}
+[ -z "$QEMURV" ] && echo "SKIP qemu-riscv64 nicht vorhanden"
+
+# StrSub — der letzte Name, an dem std.io auf arm64 scheiterte.
+STRSUB='fn main(): int64 {
+  var s: pchar := StrSub("abcdef"c, 2, 3);
+  if (StrLen(s) != 3) { return 1; }
+  if (StrCharAt(s, 0) != 99) { return 2; }
+  if (StrCharAt(s, 2) != 101) { return 3; }
+  return 42;
+}'
+lauf   "StrSub kopiert die Teilkette" "$STRSUB" 42
+laufRV "StrSub kopiert die Teilkette" "$STRSUB" 42
+
+# Ein zu grosses `len` darf nicht ueber das Ende der Kette hinaus lesen.
+STRSUB2='fn main(): int64 { return StrLen(StrSub("ab"c, 0, 99)); }'
+lauf   "StrSub bleibt in der Kette" "$STRSUB2" 2
+laufRV "StrSub bleibt in der Kette" "$STRSUB2" 2
+
+ITS='fn main(): int64 {
+  var a: pchar := IntToStr(0);
+  if (StrLen(a) != 1) { return 1; }
+  if (StrCharAt(a, 0) != 48) { return 2; }
+  var b: pchar := IntToStr(0 - 42);
+  if (StrLen(b) != 3) { return 3; }
+  if (StrCharAt(b, 0) != 45) { return 4; }
+  if (StrCharAt(b, 2) != 50) { return 5; }
+  return 42;
+}'
+laufRV "IntToStr rechnet richtig" "$ITS" 42
+
+# Der Fall aus dem Ticket selbst: import std.io + PrintLn. Geprueft wird die
+# AUSGABE, nicht nur der Rueckgabewert — ein Programm, das nichts druckt,
+# kaeme sonst als gruen durch.
+IO='import std.io;
+fn main(): int64 { PrintLn("hallo"); return 0; }'
+printf '%s' "$IO" > "$TMP/io.lyx"
+for ziel in arm64 riscv; do
+  em=$QEMU; [ "$ziel" = riscv ] && em=$QEMURV
+  [ -z "$em" ] && continue
+  if ! "$LYXC" --std-path="$ROOT" "$TMP/io.lyx" --target=$ziel -o "$TMP/io_$ziel" >"$TMP/io.log" 2>&1; then
+    no "std.io uebersetzt ($ziel)" "$(grep -iE 'unbekannt|nicht behandelt' "$TMP/io.log" | head -1)"
+    continue
+  fi
+  AUS=$("$em" "$TMP/io_$ziel" 2>/dev/null)
+  if [ "$AUS" = "hallo" ]; then ok "std.io druckt auf $ziel"
+  else no "std.io druckt auf $ziel" "erhalten '$AUS'"; fi
+done
+
+# Cortex-M: StrLen geht (rechnet ohne Betriebssystem), StrSub und IntToStr
+# nicht — sie brauchen einen Puffer, der den Aufruf ueberlebt. Geprueft wird,
+# dass die Grenze GEMELDET wird statt still zu wirken. Ausfuehren laesst sich
+# das Ziel hier nicht; das ist der Unterschied zu den Faellen oben und der
+# Grund, warum hier nur der Bau geprueft wird.
+printf 'fn main(): int64 { return StrLen("abc"c); }\n' > "$TMP/cm.lyx"
+if "$LYXC" --std-path="$ROOT" "$TMP/cm.lyx" --target=arm-cm4 -o "$TMP/cm" >"$TMP/cm.log" 2>&1; then
+  ok "StrLen uebersetzt auf Cortex-M"
+else
+  no "StrLen uebersetzt auf Cortex-M" "$(grep -m1 -iE 'error' "$TMP/cm.log")"
+fi
+printf 'fn main(): int64 { var s: pchar := IntToStr(7); return 0; }\n' > "$TMP/cm2.lyx"
+if "$LYXC" --std-path="$ROOT" "$TMP/cm2.lyx" --target=arm-cm4 -o "$TMP/cm2" >"$TMP/cm2.log" 2>&1; then
+  no "IntToStr meldet auf Cortex-M" "baut durch, obwohl es keinen Puffer gibt"
+elif grep -q "braucht einen Puffer" "$TMP/cm2.log"; then
+  ok "IntToStr meldet die fehlende Puffer-Quelle auf Cortex-M"
+else
+  no "IntToStr meldet auf Cortex-M" "scheitert, aber ohne die Begruendung"
+fi
+
 echo "----"
 echo "$PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
