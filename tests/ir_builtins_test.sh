@@ -36,8 +36,14 @@ printf 'fn main(): int64 { return StrCharAt("abc"c, 1); }\n' > "$TMP/sc.lyx"
 # stillen Default braucht es einen Namen, den die beiden noch nicht koennen:
 # IntToStr (ID 16) auf riscv, StrLen (ID 15) auf Cortex-M. Die Pruefung selbst
 # bleibt dieselbe — eine unbehandelte ID muss BENANNT werden.
-printf 'fn main(): int64 { var s: pchar := IntToStr(7); return 0; }\n' > "$TMP/luecke_riscv64.lyx"
-printf 'fn main(): int64 { return StrLen("abc"c); }\n' > "$TMP/luecke_arm-cm4.lyx"
+# #1388 (Abschluss): IntToStr und StrLen sind auf beiden Zielen umgesetzt und
+# taugen nicht mehr als Beispiel fuer eine Luecke — zum zweiten Mal an dieser
+# Stelle. Genommen werden jetzt Namen, die wirklich offen sind: StrConcat (7)
+# auf riscv, und auf Cortex-M IntToStr (16), das dort aus einem BENANNTEN
+# Grund scheitert (kein Puffer, der den Aufruf ueberlebt — es gibt weder mmap
+# noch einen Allokator). Beides muss gemeldet werden, nicht still durchgehen.
+printf 'fn main(): int64 { var s: pchar := StrConcat("a"c, "b"c); return 0; }\n' > "$TMP/luecke_riscv64.lyx"
+printf 'fn main(): int64 { var s: pchar := IntToStr(7); return 0; }\n' > "$TMP/luecke_arm-cm4.lyx"
 printf 'fn main(): int64 { var a: int64 := 2; var b: int64 := a * 3 + 1; if b > 5 { return b; } return 0; }\n' > "$TMP/rechnen.lyx"
 
 hex() { od -An -tx1 "$1" | tr -d ' \n'; }
@@ -86,6 +92,27 @@ for t in riscv64 arm-cm4; do
     ok "$t: StrCharAt uebersetzt"
   else
     no "$t: StrCharAt uebersetzt" "$(grep -m1 -iE 'error|Builtin-ID' "$TMP/sc_ok.log")"
+  fi
+done
+
+# #1388: StrLen gehoert auf JEDES Ziel — es rechnet ohne Betriebssystem.
+printf 'fn main(): int64 { return StrLen("abc"c); }\n' > "$TMP/sl.lyx"
+for t in arm64 riscv64 arm-cm4; do
+  if timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/sl.lyx" --target=$t -o "$TMP/sl_$t" >"$TMP/sl.log" 2>&1; then
+    ok "$t: StrLen uebersetzt"
+  else
+    no "$t: StrLen uebersetzt" "$(grep -m1 -iE 'error|Builtin-ID' "$TMP/sl.log")"
+  fi
+done
+
+# #1388: IntToStr und StrSub brauchen einen Puffer — auf den Linux-Zielen aus
+# mmap, und dort muessen sie uebersetzen.
+printf 'fn main(): int64 { var a: pchar := IntToStr(7); var b: pchar := StrSub("abc"c, 1, 2); return 0; }\n' > "$TMP/buf.lyx"
+for t in arm64 riscv64; do
+  if timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/buf.lyx" --target=$t -o "$TMP/buf_$t" >"$TMP/buf.log" 2>&1; then
+    ok "$t: IntToStr und StrSub uebersetzen"
+  else
+    no "$t: IntToStr und StrSub uebersetzen" "$(grep -m1 -iE 'error|Builtin-ID' "$TMP/buf.log")"
   fi
 done
 

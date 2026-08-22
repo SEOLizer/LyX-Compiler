@@ -145,9 +145,13 @@ compile_ok "exit_compiles"   'fn main(): int64 { exit(0); return 0; }'
 # wird hier geprueft. Wo es eine echte Nummer gibt (lseek waere 8, pipe waere
 # 320 pipe2), ist das Folgearbeit unter #1734; sie wird nicht hier per Annahme
 # entschieden, denn dieselbe Sorte Annahme steht ja am Anfang dieses Absatzes.
-compile_fail "lseek_meldet"    'fn main(): int64 { return lseek(3, 0, 2); }' "gibt es in LyxOS nicht"
-compile_fail "stat_meldet"     'fn main(): int64 { var s: int64 := 0; return stat("f", s); }' "gibt es in LyxOS nicht"
-compile_fail "lstat_meldet"    'fn main(): int64 { var s: int64 := 0; return lstat("f", s); }' "gibt es in LyxOS nicht"
+# lseek/stat/lstat sind seit #1734 Punkt 3 geklaert und gehen wieder durch —
+# lseek auf die echte Nummer 8, stat/lstat zusammengesetzt aus open + fstat
+# (135) + close. Sie standen hier eine Version lang als "muss melden"; das war
+# fuer 1.1.5A richtig und ist es jetzt nicht mehr.
+compile_ok "lseek_compiles"    'fn main(): int64 { return lseek(3, 0, 2); }'
+compile_ok "stat_compiles"     'fn main(): int64 { var s: int64 := 0; return stat("f", s); }'
+compile_ok "lstat_compiles"    'fn main(): int64 { var s: int64 := 0; return lstat("f", s); }'
 compile_fail "symlink_meldet"  'fn main(): int64 { return symlink("a", "b"); }' "gibt es in LyxOS nicht"
 compile_ok "nanosleep_compiles" 'fn main(): int64 { var ts: int64 := 0; return nanosleep(ts, 0); }'
 compile_fail "pipe_meldet"     'fn main(): int64 { var a: int64 := 0; var b: int64 := 0; return pipe(a, b, 0); }' "gibt es in LyxOS nicht"
