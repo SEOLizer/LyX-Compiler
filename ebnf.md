@@ -1,6 +1,6 @@
-# Lyx 1.1.6C — Canonical EBNF Grammar
+# Lyx 1.1.6D — Canonical EBNF Grammar
 
-> Stand 2026-08-22, gegen lyxc 1.1.6C geprueft. Die Keyword-Liste in
+> Stand 2026-08-22, gegen lyxc 1.1.6D geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -127,14 +127,14 @@ con continue default dim dispose
 do downto else enum extends
 extern false finally fn for
 if implements import in interface
-is layout let Map match
+is let Map match
 new not null or override
 panic parallel pool private protected
 pub public repeat return RingBuffer
 self Set signal static struct
 super switch throw to true
 try type unit until utype
-var virtual where while widget
+var virtual where while
 ```
 
 Zwei Sonderfaelle:
@@ -151,8 +151,13 @@ Bezeichner verwendbar.
 ## 2.2 Soft Keywords
 
 ```text
-range wraps defer limit
+range wraps defer limit layout widget
 ```
+
+`layout` und `widget` bedeuten nur innerhalb eines LFD-Formulars etwas und
+werden dort am Text erkannt, wie `form` es immer schon wurde. Bis 1.1.6C waren
+sie harte Schluesselwoerter und sperrten damit zwei Bezeichner, die in einer
+Oberflaechenbibliothek naheliegen (#1745).
 
 Soft keywords are tokenized as identifiers and interpreted contextually by the parser.
 
@@ -1682,20 +1687,20 @@ Keyword           = "abstract" | "and" | "array" | "as" | "assert" | "break"
                   | "default" | "dim" | "dispose" | "do" | "downto" | "else"
                   | "enum" | "extends" | "extern" | "false" | "finally" | "fn"
                   | "for" | "if" | "implements" | "import" | "in" | "interface"
-                  | "is" | "layout" | "let" | "match" | "new" | "not"
+                  | "is" | "let" | "match" | "new" | "not"
                   | "null" | "or" | "override" | "panic" | "parallel" | "pool"
                   | "private" | "protected" | "pub" | "public" | "repeat" | "return"
                   | "signal" | "static" | "struct" | "super" | "switch" | "throw"
                   | "to" | "true" | "try" | "type" | "unit" | "until"
-                  | "utype" | "var" | "virtual" | "where" | "while" | "widget" ;
+                  | "utype" | "var" | "virtual" | "where" | "while" ;
 
 (* WEICHE Schluesselwoerter: der Lexer kennt sie, sie sind aber als Bezeichner
    zulaessig — sie wirken nur an ihrer Stelle im Satzbau. Nachgemessen:
    `fn f(defer: int64, range: int64, limit: int64, char: int64)` uebersetzt,
    und ein `defer { … }` im selben Programm laeuft weiterhin.
 
-     asm char defer end exit form from key limit loop next of range
-     start step then value wraps
+     asm char defer end exit form from key layout limit loop next of range
+     start step then value widget wraps
 
    `asm` ist in 12.2 bereits so beschrieben. Fuer die uebrigen galt bisher
    nichts Schriftliches; sie sind hier festgehalten, damit die Unterscheidung
