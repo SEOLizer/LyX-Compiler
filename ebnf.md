@@ -1,6 +1,6 @@
-# Lyx 1.1.6D — Canonical EBNF Grammar
+# Lyx 1.1.6E — Canonical EBNF Grammar
 
-> Stand 2026-08-22, gegen lyxc 1.1.6D geprueft. Die Keyword-Liste in
+> Stand 2026-08-22, gegen lyxc 1.1.6E geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -1553,6 +1553,7 @@ Einzelbefunde sind dort verlinkt.
 | Bindendes Muster | 14 | `case x =>` (jeden Wert annehmen und an den Namen binden) ist **nicht umgesetzt und auch nicht vorgesehen**. Ein blanker Bezeichner ist ein VERWEIS auf eine Konstante, ein Enum-Mitglied oder eine lokale Variable; beide Lesarten zugleich gehen nicht, und auf der Verweis-Lesart beruhen die Enum-Muster. Wer jeden Wert annehmen will, schreibt `case _`. (#1024) |
 | `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
 | `Map<K,V>` | 14 | Benutzbar seit 1.0.15A (#1152/#1205): Literal, `m[k]` lesen und schreiben, `k in m`, `len(m)`, Deklaration ohne Initialisierung. Schluessel nur ganzzahlig — ein `pchar`-Schluessel wuerde ueber die Adresse verglichen und wird abgewiesen (#1291). Ein fehlender Schluessel liefert 0. `delete m[k]` und `for k, v in m` gibt es nicht. |
+| `new T[n]` (Heap-Array) | 15 | Der Compiler kann es, die Grammatik nennt es nicht: `NewExpr` fuehrt nur die Klammerform. Nachgemessen mit 1.1.6E — `new uint8[n]` und `new int64[4]` belegen Speicher, auch mit zur Laufzeit bestimmter Groesse, und die Zellen sind les- und schreibbar. Die Meldung "expected (, got [" aus der Erhebung zu #1254 (Stand 1.0.14J) trifft nicht mehr zu. Hier steht die Abweichung in der anderen Richtung als sonst in dieser Tabelle: nicht der Parser verspricht zu viel, sondern die Grammatik zu wenig. Die Produktion gehoert nachgezogen. |
 | `&x` (Adress-Operator) | 15 | Gibt es nicht. Ein Ausgabeparameter wird als Zelle uebergeben (`alloc(8)`, danach `peek64`). (#1061) |
 | Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
 | Nullable-Suffix, Pruefung | 7 | `T?` wird geparst und am Typknoten vermerkt, loest aber KEINE zusaetzliche Pruefung aus: ein nicht-nullbarer Typ nimmt weiterhin `null` an, und ein nullbarer wird ohne `?.` ungeprueft dereferenziert. Das Suffix dokumentiert die Absicht, es erzwingt sie nicht. `?.` dagegen prueft zur Laufzeit. (#1092) |

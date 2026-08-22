@@ -132,22 +132,27 @@ if [ -s "$TMP/p.map" ]; then
 fi
 
 # ===========================================================================
-# Gegenprobe: die vier noch offenen Schalter weisen weiterhin laut ab
+# Gegenprobe: die drei noch offenen Schalter weisen weiterhin laut ab
 # ===========================================================================
 # Ein still angenommener Schalter ist schlimmer als ein abgewiesener (#1098).
 # Solange sie nichts tun, muessen sie das sagen.
+#
+# `--profile` stand hier bis 1.1.6D mit in der Liste und ist seither umgesetzt
+# (eigene Suite: tests/profile_schalter_test.sh). Uebrig sind die drei
+# asm-Schalter; sie brauchen einen Disassembler oder die Mnemonik zur
+# Emissionszeit und bleiben deshalb offen.
 
 offen_ok=1
-for sch in --emit-asm --dump-asm --asm-listing --profile; do
+for sch in --emit-asm --dump-asm --asm-listing; do
   if "$LYXC" --std-path="$ROOT" "$TMP/p.lyx" -o "$TMP/p2" "$sch" >/dev/null 2>&1; then
     offen_ok=0
     echo "  ($sch wird angenommen, obwohl nicht umgesetzt)"
   fi
 done
 if [ "$offen_ok" -eq 1 ]; then
-  ok "#1370: die vier offenen Schalter weisen weiterhin ab"
+  ok "#1370: die drei offenen Schalter weisen weiterhin ab"
 else
-  no "#1370: die vier offenen Schalter weisen weiterhin ab" "siehe oben"
+  no "#1370: die drei offenen Schalter weisen weiterhin ab" "siehe oben"
 fi
 
 # Und ohne Schalter darf nichts davon erscheinen.
