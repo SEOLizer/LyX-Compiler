@@ -382,6 +382,18 @@ pub type Sema = class {
   // Symboltabelle unvollstaendig, und jede Meldung ueber "unbekannten Typ"
   // oder "undefinierte Funktion" waere geraten statt gemessen.
   importParseFehler: int64;
+  // #1340: Traegt das WURZELMODUL ueberhaupt ein @capabilities? Ohne diese
+  // Unterscheidung ist "keine Annotation" dasselbe wie "@capabilities([])" —
+  // und beides zieht dieselben Folgen nach sich: das LCBS-Pruning wirft jede
+  // Unit weg, deren Bedarf sich nicht mit der (leeren) Wurzelmenge schneidet,
+  // und Regel 1 meldet jede deklarierte Capability als im Parent fehlend.
+  //
+  // README.md:179 und capabilities.md:21 sagen etwas anderes zu: ohne
+  // @capabilities laeuft ein Programm ohne jede Einschraenkung. Solange keine
+  // Unit deklariert, faellt der Widerspruch nicht auf; mit der ersten
+  // Deklaration in std/ waere JEDES Programm ohne Annotation betroffen —
+  // einschliesslich src/lyxc.lyx.
+  hasCapAttr: int64;
   errorCount: int64;
 
   // WP-BC-22: current class node index (-1 = global scope)
@@ -833,6 +845,16 @@ pub type Sema = class {
       PrintStr(" '");
       sys_write(1, name as int64, nameLen);
       PrintStr("'\n");
+      // #1340: Wurden Module wegen fehlender Capabilities entfernt, fehlen
+      // ihre Symbole — und der Fehler erscheint als "undefined function", also
+      // an der Nutzung statt an der Ursache. Der Hinweis nennt die Ursache,
+      // wo sie sonst erst im Bericht am Ende auftaucht.
+      if (self.capStripper.StrippedCount() > 0) {
+        PrintStr("  Hinweis: "c);
+        PrintInt(self.capStripper.StrippedCount());
+        PrintStrLn(" Modul(e) wurden wegen fehlender Capabilities entfernt (LCBS-Pruning);"c);
+        PrintStrLn("  ihre Symbole stehen dadurch nicht zur Verfuegung. Siehe den Bericht unten."c);
+      }
     }
     self.hadError   := 1;
     self.errorCount += 1;
@@ -4967,9 +4989,14 @@ pub type Sema = class {
   // WP-L3: Füllt currModuleCaps aus allen NK_CAPABILITY_ATTR-Knoten im AST.
   fn _collectParentCaps(head: int64): void {
     self.currModuleCaps.Clear();
+    self.hasCapAttr := 0;               // #1340
     var ni: int64 := head;
     while ni >= 0 {
       if self.sn_kind(ni) == SNK_CAPABILITY_ATTR && self.sn_iVal(ni) == 0 {
+        // #1340: Auch ein leeres @capabilities([]) zaehlt als Annotation. Wer
+        // es hinschreibt, sagt "nichts erlaubt" — das ist eine Aussage, kein
+        // Schweigen, und muss von "gar nicht annotiert" unterscheidbar sein.
+        self.hasCapAttr := 1;
         self._fillCapSet(self.sn_c0(ni), self.currModuleCaps);
       }
       ni := self.sn_next(ni);
@@ -5011,6 +5038,11 @@ pub type Sema = class {
   // Nutzt direkte peek64-Zugriffe auf den CapSet-Puffer (kein VMT-Dispatch).
   // importedEntries: CapSet.entries-Puffer, importedCount: Anzahl Einträge.
   fn _shouldStripModule(importedEntries: int64, importedCount: int64): bool {
+    // #1340: Ohne @capabilities am Wurzelmodul wird nichts weggeworfen. Sonst
+    // verschwindet jede Unit, die etwas deklariert, aus einem Programm, das
+    // gar keine Meinung dazu geaeussert hat — und der Ausfall erscheint als
+    // `undefined function`, nicht als Capability-Meldung.
+    if (self.hasCapAttr == 0) { return false; }
     return cap_shouldStrip(
       importedEntries, importedCount,
       self.currModuleCaps.entries, self.currModuleCaps.count);
@@ -5073,8 +5105,14 @@ pub type Sema = class {
           }
 
           dispose grantSet;
-        } else if moduleDecl != 0 as CapSet {
-          // Regel 1: kein grant, aber C(M_decl) bekannt
+        } else if moduleDecl != 0 as CapSet && self.hasCapAttr != 0 {
+          // Regel 1: kein grant, aber C(M_decl) bekannt.
+          //
+          // #1340: Nur wenn das Wurzelmodul selbst annotiert ist. Ein Programm
+          // ohne @capabilities trifft keine Aussage; ihm eine leere Menge zu
+          // unterstellen und daran jede Deklaration einer importierten Unit
+          // scheitern zu lassen, waere das Gegenteil der dokumentierten
+          // Zusage.
           var missingId: int64 := resolver.ComputeNoGrant(self.currModuleCaps, moduleDecl, effectiveCaps);
           if missingId >= 0 {
             self._errorNode("importiertes Modul deklariert Capability die im Parent fehlt"c, ni);
@@ -6993,6 +7031,12 @@ pub type Sema = class {
     self._regBuiltin("sys_set_mouse_bounds");
     self._regBuiltin("sys_win_get_table_phys");
     self._regBuiltin("sys_kbd_poll");
+    // #1750: Zeit — Nummern 134/138/228/140 aus kernel/ring3.lyx, IDs 212-215.
+    // Der Blockweg macht sie erreichbar; ueber Register kamen sie als 0 zurueck.
+    self._regBuiltin("sys_rtc_read");
+    self._regBuiltin("sys_rtc_datetime");
+    self._regBuiltin("sys_rdtsc");
+    self._regBuiltin("sys_utime_fd");
     // LX-18: IOFS (0x0C00–0x0C04) — IDs 140–144
     self._regBuiltin("sys_iofs_mount");
     self._regBuiltin("sys_iofs_compact");
@@ -7553,6 +7597,7 @@ pub type Sema = class {
 
     self.hadError   := 0;
     self.importParseFehler := 0;
+    self.hasCapAttr := 0;
     self.errorCount := 0;
     self.curClassNi  := -1;
     self.classCapNode := -1;
