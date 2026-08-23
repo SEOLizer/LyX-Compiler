@@ -187,6 +187,51 @@ Dass das LyxOS-Team diese Punkte benennt statt sie zu verschweigen, ist der
 Grund, warum sie hier stehen können. Eine Abweichung, die nur im Kernel steht,
 ist beim Aufrufer ein Fehler ohne Absender.
 
+## Bereich 212 … 215 — Zeit über den r3_sc_block (#1750)
+
+| ID | LyxOS-Nr | Name | Argumente | Rückgabe |
+|---:|---:|---|---:|---|
+| 212 | 134 | `sys_rtc_read` | 0 | `(Stunden << 8) \| Minuten` |
+| 213 | 138 | `sys_rtc_datetime` | 0 | `(FAT32-Datum << 16) \| FAT32-Zeit` |
+| 214 | 228 | `sys_rdtsc` | 0 | roher TSC-Zählerstand |
+| 215 | 140 | `sys_utime_fd` | 2 | 0 oder −1; setzt mtime auf einem offenen fd |
+
+Dazu wandern **157** (`sys_vsync_wait`, Nr. 116) und **158** (`sys_time_ns`,
+Nr. 117) aus dem WP17-Bereichszweig auf denselben Weg. Ihre IDs bleiben, nur
+der Emitter wechselt.
+
+**Warum ein zweiter Weg.** `emitVfsSyscall` legt die Nummer in `rax` und
+emittiert `SYSCALL`. Der Ring-3-Einstieg `.ring3_dispatch`
+(`bootloader/boot.asm:1519`) kennt aber nur eine Whitelist — 0, 1, 2, 3, 8, 9,
+11, 12, 60, 79, 80, 231, 0x100, 0x203, 0x204…0x020F, 0x999. Alles andere landet
+auf `.r3_unknown` und wird mit `xor eax,eax` beantwortet: **ein unbekannter
+Syscall sieht aus wie Erfolg**. Keine der sechs Zeitnummern steht in dieser
+Liste. Ein Builtin auf dem Registerweg hätte also von der ersten Zeile an still
+0 geliefert — dieselbe Klasse wie #839 und #1741, nur eine Ebene tiefer.
+
+`emitBlockSyscall` geht stattdessen den Weg, den der `/bin`-Werkzeugkasten seit
+jeher nimmt (`bin/bsys.lyx`, `Sys1`…`Sys4`): Blockadresse per `mmap(0, -5, …)`
+holen, `nr` und `a0…a3` hineinschreiben, mit `mmap(0, -6, …)` auslösen. Die
+Nummer steht damit nicht in `rax`, und ausgelöst wird über die **9**, die in
+der Whitelist steht. Über diesen Weg sind alle 184 Kernel-Nummern erreichbar.
+
+**Das Ergebnis kommt aus `rax`, nicht aus `rdx`.** `emitVfsSyscall` schliesst
+mit `MOV rax, rdx` ab — die Zwei-Register-Konvention der Entwurfs-ABI, die im
+Kernel nirgends umgesetzt ist. `.ring3_r3_deferred` lässt den int-0x44-Handler
+das gesicherte `rax` setzen und sysret'et; `rdx` trägt zu dem Zeitpunkt das
+`prot`-Argument des mmap-Aufrufs. `emitBlockSyscall` liest deshalb `rax`.
+Der Registerweg behält sein `MOV rax, rdx` — das ist ein eigener Defekt mit
+eigenem Nachweis und wird hier nicht nebenbei mitgeändert.
+
+**Vier Argumente, nicht mehr.** Der Block trägt `nr` und `a0…a3`
+(`kernel/ring3.lyx:43-52`). Ein fünftes Argument bricht den Bau ab, statt
+still zu verschwinden.
+
+**Die Blockadresse wird je Aufruf neu geholt.** Das kostet einen zusätzlichen
+Sprung in den Kernel. Der Gegenwert wäre ein globaler Zustand samt Frage, wann
+er gültig wird und was bei `sys_spawn` damit passiert — bei einem Aufruf, der
+ohnehin in den Kernel geht, kein guter Tausch.
+
 ## Die Entwurfs-ABI ist keine ABI (#1734)
 
 `emitVfsSyscall` prüft seit 1.1.4N jede Nummer gegen den **tatsächlich

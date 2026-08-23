@@ -1358,6 +1358,13 @@ pub type EmitLyxOS = class {
             else if id == 150 { lx22ac := 1; } // sys_watchpoint_clear(addr)
             self.emitVfsSyscall(lx22nr, lx22ac, dest);
         }
+        // #1750: Zwei Nummern aus dem WP17-Block gehen ueber den r3_sc_block statt
+        // ueber Register — 116 und 117 stehen nicht in der SYSCALL-Whitelist von
+        // .ring3_dispatch und kamen ueber den Registerweg als 0 zurueck, ohne
+        // Fehler. Sie stehen VOR dem Bereichszweig, sonst rechnet die Formel sie
+        // wieder auf den Registerweg.
+        else if id == 157 { self.emitBlockSyscall(116, 0, dest); }   // sys_vsync_wait()
+        else if id == 158 { self.emitBlockSyscall(117, 0, dest); }   // sys_time_ns()
         // LX-WP17: Vega Window System — §10.4 dezimal 110–131 (Lücke bei 123: kein Kernel-Syscall).
         // id 151→110 (sys_win_create) … 163→122 (sys_event_recv), dann id 164+→124+ (Lücke übersprungen).
         else if id >= 151 && id <= 171 {
@@ -1418,6 +1425,13 @@ pub type EmitLyxOS = class {
         else if id == 196 { self.emitVfsSyscall(324, 4, dest); }    // sys_recvfrom
         else if id == 197 { self.emitVfsSyscall(325, 3, dest); }    // sys_getsockname
         else if id == 198 { self.emitVfsSyscall(326, 2, dest); }    // sys_getpeername
+        // #1750: Zeit-Aufrufe. Alle vier ueber den Blockweg — keine ihrer Nummern
+        // steht in der SYSCALL-Whitelist. Nummern aus kernel/ring3.lyx, nicht aus
+        // der Entwurfs-ABI: die fuehrt Zeit unter 0x0500 und hat dort nichts.
+        else if id == 212 { self.emitBlockSyscall(134, 0, dest); }   // sys_rtc_read → (h<<8)|m
+        else if id == 213 { self.emitBlockSyscall(138, 0, dest); }   // sys_rtc_datetime → (fat32_date<<16)|fat32_time
+        else if id == 214 { self.emitBlockSyscall(228, 0, dest); }   // sys_rdtsc → roher TSC
+        else if id == 215 { self.emitBlockSyscall(140, 2, dest); }   // sys_utime_fd(r3fd, mtime)
         // fix/lyxos-builtin-misdispatch: Memory-Intrinsics + Str-Char als echte
         // load/store-Emission (ids 200-207). Vorher fielen peek/poke/StrCharAt/StrSetChar
         // in ir_lower.lowerCall auf den stillen id=1=PrintStr-Catch-all → write()-Syscall
@@ -3022,6 +3036,72 @@ pub type EmitLyxOS = class {
         self.emit8(0x31); self.emit8(0xD2);                              // XOR edx, edx
         self.emit8(0x48); self.emit8(0xF7); self.emit8(0xF1);            // DIV rcx
         self.emit8(0x48); self.emit8(0x89); self.emit8(0xC7);            // MOV rdi, rax
+    }
+
+    // #1750: Syscall ueber den r3_sc_block statt ueber die SYSCALL-Whitelist.
+    //
+    // Der Registerweg (emitVfsSyscall) taugt nur fuer die Nummern, die
+    // .ring3_dispatch in bootloader/boot.asm namentlich kennt:
+    // 0,1,2,3,8,9,11,12,60,79,80,231,0x100,0x203,0x204-0x020F,0x999.
+    // Alles andere faellt dort auf .r3_unknown und wird mit "xor eax,eax"
+    // beantwortet — ein unbekannter Syscall sieht damit aus wie Erfolg.
+    // Die Zeitaufrufe 116,117,134,138,140,228 stehen NICHT in der Whitelist.
+    //
+    // Der Blockweg umgeht das: die Nummer landet nicht in rax, sondern im
+    // r3_sc_block, und ausgeloest wird mit mmap — und die 9 IST whitelisted.
+    // Genau so arbeitet der /bin-Werkzeugkasten (bin/bsys.lyx, Sys1..Sys4).
+    //
+    //   mmap(0, -5, 0, 0) → rax = Adresse des r3_sc_block
+    //   [blk+0] := nr, [blk+8+8i] := Argument i   (hoechstens vier)
+    //   mmap(0, -6, 0, 0) → rax = Ergebnis
+    //
+    // Das Ergebnis kommt hier aus rax, nicht aus rdx: .ring3_r3_deferred
+    // laesst den int-0x44-Handler das gesicherte rax setzen und sysret'et.
+    // rdx traegt zu dem Zeitpunkt das prot-Argument des mmap-Aufrufs.
+    //
+    // Die Blockadresse wird bei jedem Aufruf neu geholt statt zwischenge-
+    // speichert. Das kostet einen zusaetzlichen Sprung in den Kernel, spart
+    // aber einen versteckten globalen Zustand samt Frage, wann er gueltig
+    // wird — bei einem Aufruf, der ohnehin in den Kernel geht, ein Preis,
+    // der die Ersparnis nicht wert waere.
+    fn emitBlockSyscall(nr: int64, argc: int64, dest: int64): void {
+        if argc > 4 {
+            // Der Block hat vier Argumentfelder (kernel/ring3.lyx:43-52).
+            // Ein fuenftes stillschweigend fallen zu lassen waere genau der
+            // Default-Zweig, den #1734 und #1741 hier ausgeraeumt haben.
+            EPrintStr("error: lyxos: Blockweg-Syscall "c);
+            EPrintInt(nr);
+            EPrintStrLn(" hat mehr als vier Argumente."c);
+            EPrintStrLn("  Der r3_sc_block traegt nr + a0..a3; ein fuenftes Feld gibt es nicht."c);
+            exit(1);
+        }
+        // --- 1. Blockadresse holen: mmap(0, -5, 0, 0) -----------------------
+        self.emitMovRaxImm(9);                                  // MOV rax, 9 (sys_mmap)
+        self.emit8(0x31); self.emit8(0xFF);                     // XOR edi, edi     (hint = 0)
+        self.emit8(0x48); self.emit8(0xBE); self.emit64(-5);    // MOV rsi, -5      (Sentinel)
+        self.emit8(0x31); self.emit8(0xD2);                     // XOR edx, edx     (prot = 0)
+        self.emit8(0x45); self.emit8(0x31); self.emit8(0xD2);   // XOR r10d, r10d   (flags = 0)
+        self.emitSyscall();                                     // → rax = &r3_sc_block
+        // --- 2. Nummer und Argumente in den Block ---------------------------
+        // rax haelt ab hier die Blockadresse; zwischen den beiden Sprungen in
+        // den Kernel wird sie nicht angetastet.
+        self.emit8(0x48); self.emit8(0xB9); self.emit64(nr);    // MOV rcx, nr
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0x48); self.emit8(0x00);   // MOV [rax+0], rcx
+        var bi: int64 := 0;
+        while bi < argc {
+            self.emitMovRcxFromSlot(bi);                        // MOV rcx, [rbp+slot]
+            self.emit8(0x48); self.emit8(0x89); self.emit8(0x48);
+            self.emit8((8 + bi * 8) & 0xFF);                    // MOV [rax+8+8i], rcx
+            bi := bi + 1;
+        }
+        // --- 3. Ausloesen: mmap(0, -6, 0, 0) --------------------------------
+        self.emitMovRaxImm(9);                                  // MOV rax, 9 (sys_mmap)
+        self.emit8(0x31); self.emit8(0xFF);                     // XOR edi, edi
+        self.emit8(0x48); self.emit8(0xBE); self.emit64(-6);    // MOV rsi, -6      (Sentinel)
+        self.emit8(0x31); self.emit8(0xD2);                     // XOR edx, edx
+        self.emit8(0x45); self.emit8(0x31); self.emit8(0xD2);   // XOR r10d, r10d
+        self.emitSyscall();                                     // → rax = Ergebnis
+        self.emitMovSlotFromRax(dest);
     }
 };
 
