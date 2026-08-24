@@ -33,5 +33,18 @@ run "CALL_return_last_param" 'fn f(a: int64, b: int64, c: int64, d: int64, e: in
 # Regression: getInstrCount() divided instrLen by IR_INSTR_SIZE; cross-fn reg collision
 run "CALL_add5_150" 'fn add5(a: int64, b: int64, c: int64, d: int64, e: int64): int64 { return a + b + c + d + e; } var gw: int64 := 0; fn main(): int64 { gw := add5(10, 20, 30, 40, 50); return gw; }' 150
 
+# #1761: Argumente ab dem siebten liefen ueber den Stapel — Aufrufseite verwarf sie
+# still, der Callee las sie nie und rechnete mit dem letzten Registerwert weiter.
+run "CALL_7arg_last"  'fn f(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64, g: int64): int64 { return g; } fn main(): int64 { return f(1,2,3,4,5,6,77); }' 77
+run "CALL_8arg_last"  'fn f(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64, g: int64, h: int64): int64 { return h; } fn main(): int64 { return f(1,2,3,4,5,6,7,88); }' 88
+run "CALL_8arg_sum"   'fn f(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64, g: int64, h: int64): int64 { return a+b+c+d+e+f+g+h; } fn main(): int64 { return f(1,2,3,4,5,6,7,8); }' 36
+run "CALL_9arg_sum"   'fn f(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64, g: int64, h: int64, i: int64): int64 { return a+b+c+d+e+f+g+h+i; } fn main(): int64 { return f(1,2,3,4,5,6,7,8,9); }' 45
+# Stapelausrichtung: ungerade Zahl Stapelargumente braucht ein Fuellwort, sonst laeuft der
+# Callee mit rsp%16==0 weiter. Verschachtelt, damit ein Versatz den zweiten Aufruf trifft.
+run "CALL_7arg_nested" 'fn f(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64, g: int64): int64 { return a+g; } fn main(): int64 { return f(1,2,3,4,5,6, f(1,2,3,4,5,6,20)); }' 22
+# #1761: emitCallIndirect kannte nur fuenf Register — arg6 (r9) fehlte, arg7+ fielen weg.
+run "CALLIND_6arg"    'fn f(a: int64, b: int64, c: int64, d: int64, e: int64, x: int64): int64 { return x; } fn main(): int64 { var p: fn(int64,int64,int64,int64,int64,int64): int64 := f; return p(1,2,3,4,5,66); }' 66
+run "CALLIND_7arg"    'fn f(a: int64, b: int64, c: int64, d: int64, e: int64, x: int64, g: int64): int64 { return g; } fn main(): int64 { var p: fn(int64,int64,int64,int64,int64,int64,int64): int64 := f; return p(1,2,3,4,5,6,70); }' 70
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]

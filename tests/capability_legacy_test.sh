@@ -49,18 +49,48 @@ fn main(): int64 { return Wert(); }
 EOF
 baut_und_rechnet "unannotiertes Programm nutzt annotierte Unit" ohne.lyx 33
 
-# --- Die Durchsetzung darf dabei nicht verlorengehen ------------------------
-# Wer @capabilities schreibt, trifft eine Aussage — auch mit leerer Liste.
+# --- Wo die Durchsetzung greift: am `grant` -------------------------------
+#
+# GEAENDERT mit dem #1340-Pilot: das Pruning greift nur noch, wenn der Import
+# ein `grant` traegt. Vorher genuegte ein @capabilities am Programm, und jede
+# Unit, die etwas deklarierte, verschwand daraus.
+#
+# Der Grund steht in tests/ffi_link_caps_test.sh: ein Programm darf sich eng
+# annotieren (`@capabilities([system.exit])`) und trotzdem std.fs importieren —
+# die Eindaemmung macht dann seccomp zur Laufzeit (SIGSYS). Wuerde schon der
+# Bau scheitern, koennte man dieses Programm nicht mehr uebersetzen, sobald
+# std.fs seinen Bedarf deklariert. Annotationen an stdlib-Units waeren damit
+# keine Ergaenzung, sondern ein Bruch.
+#
+# Ohne grant: die Unit bleibt, das Programm rechnet.
 cat > "$TMP/p/leer.lyx" <<'EOF'
 @capabilities([])
 import paket.mituc;
 fn main(): int64 { return Wert(); }
 EOF
-AUS=$(cd "$TMP/p" && "$LYXC" -I . leer.lyx -o "$TMP/p/leer.out" 2>&1)
-if [ -x "$TMP/p/leer.out" ] && "$TMP/p/leer.out" >/dev/null 2>&1; then
-  no "@capabilities([]) wirkt weiterhin" "die Unit kommt durch, obwohl nichts gewaehrt ist"
+(cd "$TMP/p" && "$LYXC" -I . leer.lyx -o "$TMP/p/leer.out" >/dev/null 2>&1)
+if [ -x "$TMP/p/leer.out" ]; then
+  "$TMP/p/leer.out" >/dev/null 2>&1
+  if [ $? -eq 33 ]; then
+    ok "@capabilities([]) ohne grant: Unit bleibt, Eindaemmung ist Sache der Laufzeit"
+  else
+    no "@capabilities([]) ohne grant" "Programm laeuft, liefert aber nicht 33"
+  fi
 else
-  ok "@capabilities([]) wirkt weiterhin"
+  no "@capabilities([]) ohne grant" "uebersetzt nicht — das Pruning greift ohne grant"
+fi
+
+# Mit `grant []`: hier hat der Aufrufer eine Schranke gezogen, hier wird geprueft.
+cat > "$TMP/p/grant.lyx" <<'EOF'
+@capabilities([])
+import paket.mituc grant [];
+fn main(): int64 { return Wert(); }
+EOF
+AUS=$(cd "$TMP/p" && "$LYXC" -I . grant.lyx -o "$TMP/p/grant.out" 2>&1)
+if [ -x "$TMP/p/grant.out" ] && "$TMP/p/grant.out" >/dev/null 2>&1; then
+  no "grant [] zieht die Schranke" "die Unit kommt durch, obwohl nichts gewaehrt ist"
+else
+  ok "grant [] zieht die Schranke"
 fi
 # Und der Ausfall muss die URSACHE nennen, nicht nur die Folge.
 if echo "$AUS" | grep -q "wegen fehlender Capabilities entfernt"; then
@@ -68,6 +98,46 @@ if echo "$AUS" | grep -q "wegen fehlender Capabilities entfernt"; then
 else
   no "der Ausfall nennt das Pruning als Ursache" "nur '$(echo "$AUS" | grep -m1 -i 'sema error')'"
 fi
+
+# --- Die Meldung muss die fehlende Capability NENNEN ----------------------
+#
+# #1340: DetectBreakingChange vergleicht nur die Parameter von Capabilities,
+# die in BEIDEN Mengen stehen — ob das grant den deklarierten Bedarf ueberhaupt
+# abdeckt, prueft es nicht. Ein `grant []` ging damit durch, das Modul flog
+# still aus dem Programm, und beim Aufrufer kam `undefined function` an der
+# NUTZUNG an. Die Ursache stand zwei Ebenen tiefer.
+#
+# ComputeGrantGap schliesst die Luecke: die Meldung steht am grant und sagt,
+# welche Capability fehlt.
+AUS=$(cd "$TMP/p" && "$LYXC" -I . grant.lyx -o "$TMP/p/gap.out" 2>&1)
+case "$AUS" in
+  *"grant fuehrt nicht, was das Modul deklariert"*"fs.read"*)
+    ok "die Meldung nennt die fehlende Capability" ;;
+  *"undefined function"*)
+    no "die Meldung nennt die fehlende Capability" \
+       "meldet nur das fehlende Symbol — die Ursache steht woanders" ;;
+  *)
+    no "die Meldung nennt die fehlende Capability" "$(echo "$AUS" | grep -m1 -i 'sema error')" ;;
+esac
+
+# Und ein unvollstaendiges grant faellt genauso auf wie ein leeres.
+cat > "$TMP/p/teil.lyx" <<'EOF'
+@capabilities([fs.read, fs.write])
+import paket.zwei grant [fs.read];
+fn main(): int64 { return Zwei(); }
+EOF
+mkdir -p "$TMP/p/paket"
+cat > "$TMP/p/paket/zwei.lyx" <<'EOF'
+@capabilities([fs.read, fs.write])
+unit paket.zwei;
+pub fn Zwei(): int64 { return 7; }
+EOF
+AUS=$(cd "$TMP/p" && "$LYXC" -I . teil.lyx -o "$TMP/p/teil.out" 2>&1)
+case "$AUS" in
+  *"grant fuehrt nicht, was das Modul deklariert"*"fs.write"*)
+    ok "unvollstaendiges grant nennt die fehlende Capability" ;;
+  *) no "unvollstaendiges grant" "$(echo "$AUS" | grep -m1 -i 'sema error')" ;;
+esac
 
 # --- Mit passender Capability geht es --------------------------------------
 cat > "$TMP/p/passend.lyx" <<'EOF'

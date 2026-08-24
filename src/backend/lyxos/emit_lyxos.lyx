@@ -749,13 +749,17 @@ pub type EmitLyxOS = class {
     // WP-STUB: indirekter Call (Funktions-Pointer). fnPtrSlot=Slot mit Adresse, argCount Args
     // in Slots 0..argCount-1 (System-V), Result rax→dest. (CALL_INDIRECT aus _indirect_call_N.)
     fn emitCallIndirect(fnPtrSlot: int64, argCount: int64, dest: int64): void {
-        if argCount >= 1 { self.emitMovRdiFromSlot(0); }
-        if argCount >= 2 { self.emitMovRsiFromSlot(1); }
-        if argCount >= 3 { self.emitMovRdxFromSlot(2); }
-        if argCount >= 4 { self.emitMovRcxFromSlot(3); }
-        if argCount >= 5 { self.emitMovR8FromSlot(4); }
+        // #1761: sechstes Argument (r9) fehlte hier komplett, alles ab dem
+        // siebten wurde still verworfen — beides jetzt wie beim direkten Call.
+        var cleanup: int64 := self.emitPushStackArgs(0, argCount);
+        var ai: int64 := 0;
+        while ai < argCount {
+            if ai < 6 { self.emitMovRegFromSlot(ai, ai); }
+            ai := ai + 1;
+        }
         self.emitMovRaxFromSlot(fnPtrSlot);  // rax = Funktions-Pointer
         self.emit8(0xFF); self.emit8(0xD0);  // call rax
+        self.emitAddRspImm(cleanup);         // #1761: Stapelargumente abraeumen
         self.emitMovSlotFromRax(dest);
     }
 
@@ -889,8 +893,49 @@ pub type EmitLyxOS = class {
         }
     }
 
+    // #1761: PUSH qword [rbp + slotOff(slot)] — Stapelargument ab dem siebten.
+    // FF /6 mit mod=10 (disp32), rm=101 (rbp); kein REX noetig.
+    fn emitPushSlot(slot: int64): void {
+        self.emit8(0xFF); self.emit8(0xB5);
+        self.emit32(self.slotOff(slot));
+    }
+    // #1761: SUB rsp, imm  (nur imm8/imm32, imm >= 0)
+    fn emitSubRspImm(n: int64): void {
+        if n == 0 { return; }
+        if n <= 127 { self.emit8(0x48); self.emit8(0x83); self.emit8(0xEC); self.emit8(n); }
+        else        { self.emit8(0x48); self.emit8(0x81); self.emit8(0xEC); self.emit32(n); }
+    }
+    // #1761: ADD rsp, imm  (Stapelargumente nach dem Call wieder abraeumen)
+    fn emitAddRspImm(n: int64): void {
+        if n == 0 { return; }
+        if n <= 127 { self.emit8(0x48); self.emit8(0x83); self.emit8(0xC4); self.emit8(n); }
+        else        { self.emit8(0x48); self.emit8(0x81); self.emit8(0xC4); self.emit32(n); }
+    }
+
+    // #1761: Argumente 7..N-1 in umgekehrter Reihenfolge auf den Stapel legen
+    // (System-V: arg6 liegt beim Callee auf [rbp+16], arg7 auf [rbp+24], ...).
+    // rsp ist an der Aufrufstelle 16-ausgerichtet (Prologue rundet auf); bei
+    // ungerader Anzahl Stapelargumente wird deshalb ein Fuellwort ergaenzt.
+    // Rueckgabe: Bytes, die nach dem CALL wieder freigegeben werden muessen.
+    fn emitPushStackArgs(argBase: int64, argCount: int64): int64 {
+        if argCount <= 6 { return 0; }
+        var nStack: int64 := argCount - 6;
+        var pad:    int64 := 0;
+        if (nStack % 2) != 0 { pad := 8; }
+        self.emitSubRspImm(pad);
+        var ai: int64 := argCount - 1;
+        while ai >= 6 {
+            self.emitPushSlot(argBase + ai);
+            ai := ai - 1;
+        }
+        return nStack * 8 + pad;
+    }
+
     // dest = funcId(args at argBase..argBase+argCount-1)
     fn emitCall(funcId: int64, argBase: int64, argCount: int64, dest: int64): void {
+        // #1761: erst die Stapelargumente (rbp-relativ gelesen, von rsp unabhaengig),
+        // dann die Registerargumente — sonst wuerden die Pushes sie nicht mehr sehen.
+        var cleanup: int64 := self.emitPushStackArgs(argBase, argCount);
         var ai: int64 := 0;
         while ai < argCount {
             if ai < 6 { self.emitMovRegFromSlot(ai, argBase + ai); }
@@ -900,6 +945,7 @@ pub type EmitLyxOS = class {
         var relOff: int64 := self.codeLen;
         self.emit32(0);
         self.recordCallPatch(relOff, funcId);
+        self.emitAddRspImm(cleanup);            // #1761: Stapelargumente abraeumen
         self.emitMovSlotFromRax(dest);          // Resultat rax → dest
     }
 
@@ -2084,6 +2130,15 @@ pub type EmitLyxOS = class {
                 // #1388: Ziel ist der Param-Slot HINTER dem Kratzstreifen; das
                 // Quellregister bleibt das i-te Argumentregister.
                 if psp < 6 { self.emitMovSlotFromReg(psp, IR_BARG_SLOTS + psp); }
+                else {
+                    // #1761: Argumente ab dem siebten liegen beim Callee auf dem
+                    // Stapel: [rbp+16] ist arg6, [rbp+24] arg7, ... (rbp+0 = alter
+                    // rbp, rbp+8 = Ruecksprungadresse). Bis hierher wurden sie nie
+                    // gelesen, die Funktion rechnete mit dem Registerrest weiter.
+                    self.emit8(0x48); self.emit8(0x8B); self.emit8(0x85);   // MOV rax, [rbp+disp32]
+                    self.emit32(16 + (psp - 6) * 8);
+                    self.emitMovSlotFromRax(IR_BARG_SLOTS + psp);
+                }
                 psp := psp + 1;
             }
             var ii: int64 := 0;
