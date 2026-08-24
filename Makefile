@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.7A
-VERSION_DATE := 2026-08-23
+VERSION   := 1.1.8A
+VERSION_DATE := 2026-08-24
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -274,6 +274,7 @@ test: lyxc
 	@bash tests/lyxos_posix_syscalls_test.sh
 	@bash tests/lyxos_nummernraum_test.sh
 	@bash tests/lyxos_zeit_builtins_test.sh
+	@bash tests/con_globals_test.sh
 	@bash tests/iso_verzeichnisse_test.sh
 	@bash tests/win64_syscalls_test.sh
 	@bash tests/ir_argslots_test.sh
