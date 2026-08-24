@@ -168,7 +168,13 @@ fn main(): int64 {
 # #1231 — der Score behauptet keine Eindaemmung mehr
 # ===========================================================================
 
-printf '@capabilities([system.exit, system.memory.heap, fs.read])\nimport std.io;\nimport std.fs grant [];\nfn main(): int64 { return 0; }\n' > "$TMP/gr.lyx"
+# #1340: Die Vorlage trug hier `import std.fs grant []`. Seit std.fs seinen
+# Bedarf deklariert, ist das ein Fehler — ein grant muss fuehren, was das Modul
+# braucht. Geprueft wird hier aber der SCORE-Text, nicht die Deckung; dafuer
+# genuegt ein Import MIT grant neben einem OHNE — nur dann nennt der Bericht
+# beide Haelften. std.time deklariert system.time, das grant fuehrt es; std.io
+# deklariert nichts (sein Bedarf ist implizit) und bleibt ohne grant.
+printf '@capabilities([system.exit, system.memory.heap, fs.read, system.time])\nimport std.io;\nimport std.time grant [system.time];\nfn main(): int64 { return 0; }\n' > "$TMP/gr.lyx"
 msg="$("$LYXC" --std-path="$ROOT" "$TMP/gr.lyx" -o "$TMP/gr" 2>&1)"
 case "$msg" in
   *"Grant-Modell"*"nicht erzwungen"*|*"grant wird ohnehin nicht erzwungen"*)

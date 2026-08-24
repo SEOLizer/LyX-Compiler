@@ -1905,6 +1905,26 @@ pub type Sema = class {
     // bezeichnet dort einen voellig anderen Knoten. Genau daran ist der erste
     // Versuch gescheitert: gelesen wurde ein Typknoten, und "int64" galt als
     // Namensraum.
+    //
+    // #1340: Dasselbe gilt fuer die grant-Klausel — auch sie gehoert HIER
+    // gelesen. Der erste Versuch stand weiter unten bei der
+    // Pruning-Entscheidung und las damit einen Knoten des importierten
+    // Moduls; hatGrant war immer falsch, und das Pruning fiel ganz aus.
+    var hatGrant: bool := false;
+    var grantCaps: CapSet := new CapSet();
+    grantCaps.Init();
+    var grantZeile: int64 := 0;
+    if (importNi >= 0) {
+      var gNi: int64 := self.sn_c1(importNi);
+      if (gNi >= 0 && self.sn_kind(gNi) == SNK_GRANT_CLAUSE) {
+        hatGrant := true;
+        // Auch die gewaehrte Menge und die Zeile gehoeren HIER gelesen — beide
+        // stammen aus dem aeusseren Knotenbaum (#1262).
+        self._fillCapSet(self.sn_c0(gNi), grantCaps);
+        var gTok: int64 := self.sn_tokIdx(gNi);
+        if (gTok >= 0 && gTok < self.pTokCount) { grantZeile := self.sn_tokLine(gTok); }
+      }
+    }
     var myAlias:    int64 := 0;
     var myAliasLen: int64 := 0;
     if (importNi >= 0) {
@@ -2063,9 +2083,53 @@ pub type Sema = class {
     }
 
     // WP-L6: Pruning-Entscheidung — prune wenn WEDER @capabilities NOCH @uses_caller_cap
-    // eine Überschneidung mit C(root) haben
-    var stripByDecl: bool := self._shouldStripModule(importedCaps.entries, importedCaps.count);
-    var stripByUcc:  bool := self._shouldStripModule(ucCaps.entries, ucCaps.count);
+    // eine Überschneidung mit C(root) haben.
+    //
+    // #1340: Nur bei einem ausdruecklichen `grant` an DIESER Importstelle.
+    //
+    // Ohne grant sagt der Aufrufer nichts ueber die Rechte des Moduls — dann
+    // bleibt es wie bisher stehen und die Eindaemmung passiert zur Laufzeit
+    // (seccomp bricht den verbotenen Zugriff mit SIGSYS ab; genau das prueft
+    // tests/ffi_link_caps_test.sh). Wuerde hier trotzdem geprunt, koennte ein
+    // Programm, das bewusst eingedaemmt laufen will, nicht einmal gebaut
+    // werden — der Ausfall waere ein `undefined function` an der Nutzung.
+    //
+    // Damit werden Annotationen an stdlib-Units additiv: sie aendern nichts
+    // an bestehenden Programmen und wirken dort, wo der Autor mit `grant`
+    // ausdruecklich eine Schranke gezogen hat.
+    // #1340: Deckt das grant, was das Modul deklariert? Diese Pruefung steht
+    // VOR dem Pruning, weil sonst zwei Meldungswege entstuenden: schneidet
+    // C(root) sich gar nicht mit dem Bedarf, wirft das Pruning das Modul weg
+    // und der Aufrufer sieht `undefined function` an der Nutzung; schneidet es
+    // sich teilweise, meldet die Deckungspruefung. Hier gemeldet, sagt in
+    // beiden Faellen dieselbe Zeile, welche Capability fehlt.
+    if hatGrant && importedCaps.count > 0 {
+      var luecke: int64 := 0;
+      var lueckeId: int64 := 0 - 1;
+      while luecke < importedCaps.count {
+        var wantId: int64 := importedCaps.GetCapId(luecke);
+        if lueckeId < 0 && !grantCaps.ContainsId(wantId) { lueckeId := wantId; }
+        luecke := luecke + 1;
+      }
+      if lueckeId >= 0 {
+        var lName: pchar := cap_nameOf(lueckeId);
+        var lMsg: int64 := alloc(96);
+        var lPre: pchar := "grant fuehrt nicht, was das Modul deklariert: "c;
+        var lPreLen: int64 := StrLen(lPre);
+        memcpy(lMsg, lPre as int64, lPreLen);
+        var lNameLen: int64 := StrLen(lName);
+        memcpy(lMsg + lPreLen, lName as int64, lNameLen);
+        poke8(lMsg + lPreLen + lNameLen, 0);
+        self._error(lMsg as pchar, grantZeile);
+        free(lMsg, 96);
+      }
+    }
+    var stripByDecl: bool := false;
+    var stripByUcc:  bool := false;
+    if hatGrant {
+      stripByDecl := self._shouldStripModule(importedCaps.entries, importedCaps.count);
+      stripByUcc  := self._shouldStripModule(ucCaps.entries, ucCaps.count);
+    }
     // Modul nur prunen wenn beide Mengen keine Überschneidung haben
     // (importedCaps.count == 0 bedeutet "keine deklarativen Caps" → nur ucCaps entscheidet)
     var doStrip: bool := false;
@@ -5108,14 +5172,23 @@ pub type Sema = class {
         } else if moduleDecl != 0 as CapSet && self.hasCapAttr != 0 {
           // Regel 1: kein grant, aber C(M_decl) bekannt.
           //
-          // #1340: Nur wenn das Wurzelmodul selbst annotiert ist. Ein Programm
-          // ohne @capabilities trifft keine Aussage; ihm eine leere Menge zu
-          // unterstellen und daran jede Deklaration einer importierten Unit
-          // scheitern zu lassen, waere das Gegenteil der dokumentierten
-          // Zusage.
+          // #1340: Ohne `grant` sagt der Aufrufer nichts ueber die Rechte
+          // dieses Imports — deshalb ist das eine WARNUNG und kein Fehler.
+          //
+          // Als Fehler waere die Regel ein Hindernis fuer genau die Programme,
+          // die sich bewusst eng annotieren und die Eindaemmung der Laufzeit
+          // ueberlassen: `@capabilities([system.exit])` plus `import std.fs`
+          // heisst "ich will nichts duerfen", und seccomp bricht den Zugriff
+          // dann mit SIGSYS ab (tests/ffi_link_caps_test.sh). Ein
+          // Uebersetzungsfehler wuerde dieses Programm unbaubar machen,
+          // sobald std.fs seinen Bedarf deklariert — die Annotation einer
+          // stdlib-Unit wuerde bestehende Programme brechen.
+          //
+          // Wer die Pruefung scharf will, schreibt ein `grant` hin: dann
+          // greift Regel 2 mit DetectBreakingChange, und zwar als Fehler.
           var missingId: int64 := resolver.ComputeNoGrant(self.currModuleCaps, moduleDecl, effectiveCaps);
           if missingId >= 0 {
-            self._errorNode("importiertes Modul deklariert Capability die im Parent fehlt"c, ni);
+            self._warnNode("importiertes Modul deklariert Capability, die das Programm nicht fuehrt — zur Laufzeit greift seccomp; mit `grant` wird daraus eine Pruefung"c, ni);
           }
         }
 
