@@ -1,6 +1,6 @@
-# Lyx 1.1.8A — Canonical EBNF Grammar
+# Lyx 1.1.8B — Canonical EBNF Grammar
 
-> Stand 2026-08-24, gegen lyxc 1.1.8A geprueft. Die Keyword-Liste in
+> Stand 2026-08-24, gegen lyxc 1.1.8B geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -1732,7 +1732,13 @@ PortSpec          = "*"
    `hardware.spi`; `vendor` und `product` fuer `hardware.usb`. Alle uebrigen
    Capabilities nehmen keine Argumente. Ein anderer Name wird abgewiesen.
 
-   Der WERT wird nicht durchgesetzt — siehe 20.1. *)
+   Der WERT wird nicht durchgesetzt — siehe 20.1.
+
+   `hardware.block` (#1755) nimmt keine Argumente und meint den Rohzugriff auf
+   Blockgeraete. Es ist die einzige `hardware.*`-Capability, die im LBF-Ziel
+   ein Bit in der CAPS-TLV setzt (0x40); gpio, i2c, spi und usb sind dort
+   gueltig, aber wirkungslos — der Compiler warnt darauf. Welche Capability
+   welches Bit setzt, steht in capabilities.md. *)
 
 ## 22.1 ImportItem with grant/restrict (amended from Section 3)
 

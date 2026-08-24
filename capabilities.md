@@ -154,6 +154,33 @@ es `system.time`.
 | `hardware.i2c` | `bus: N` | `/dev/i2c-N` | I2C-Bus |
 | `hardware.spi` | `bus: N, cs: M` | `/dev/spidevN.M` | SPI-Bus |
 | `hardware.usb` | *(keine)* | `/dev/bus/usb` | USB-Gerät |
+| `hardware.block` | *(keine)* | *(nur LyxOS)* | Rohzugriff auf Blockgeräte |
+
+##### Was davon im LBF-Ziel ankommt (#1755)
+
+`--target=lyxos` schreibt die Capabilities als Bitmaske in die CAPS-TLV des
+Programms; der Kernel wertet sie beim Syscall aus. **Abgebildet sind nur diese:**
+
+| Capability | Bit |
+|---|---|
+| `fs.read` | `0x1` |
+| `fs.write` | `0x2` |
+| `network.*` | `0x4` |
+| `process.*` | `0x8` |
+| `ki.embed` | `0x10` |
+| `ki.graph` | `0x20` |
+| `hardware.block` | `0x40` |
+| `audio.*` | `0x80` |
+
+`hardware.gpio`, `hardware.i2c`, `hardware.spi` und `hardware.usb` setzen **kein
+Bit**: LyxOS führt für sie keine eigene Rechteklasse. Sie sind für das Ziel
+gültig, aber wirkungslos — der Compiler warnt beim Übersetzen darauf.
+`system.*` sind die impliziten Rechte (Programmende, Heap, Zufall, Zeit); sie
+brauchen kein Bit und werden nicht gemeldet.
+
+Ein Programm, dessen sämtliche Capabilities kein Bit setzen, kommt beim
+Ladeprogramm an wie eines ohne Manifest und bekommt den Vorgabewert „nur
+Standardausgabe".
 
 #### Prozess
 
@@ -466,6 +493,7 @@ Der Score bewertet die Qualität des Sicherheitsmodells (aktuell max. 40, mit op
 | 22 | `hardware.i2c` | Hardware |
 | 23 | `hardware.spi` | Hardware |
 | 24 | `hardware.usb` | Hardware |
+| 31 | `hardware.block` | Hardware |
 | 25 | `process.fork` | Prozess |
 | 26 | `process.exec` | Prozess |
 | 27 | `process.signal` | Prozess |

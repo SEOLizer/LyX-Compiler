@@ -57,6 +57,14 @@ pub type EmitLyxOS = class {
     // Seed.
     aktBuiltinId: int64;
 
+    // #1754: Wo im _start-Rumpf das CALL-rel32 steht und welche Adresse danach
+    // folgt. Bis 1.1.8A standen beide Zahlen als Literale in lyxc.lyx (46/50
+    // bzw. 68/72) — wer den Rumpf aenderte, musste sie dort mitziehen, und ein
+    // vergessener Abgleich haette den Sprung nach main um genau die Differenz
+    // verfehlt. Jetzt sagt der Rumpf selbst, wo er sie hingeschrieben hat.
+    startRelOff:  int64;
+    startNextIP:  int64;
+
     pub fn init(ir: int64): void {
         self.irMod         := ir;
         self.codeCap       := 65536;
@@ -261,9 +269,13 @@ pub type EmitLyxOS = class {
     pub fn emitStartStub(): void {
         // XOR rbp, rbp
         self.emit8(0x48); self.emit8(0x31); self.emit8(0xED);
+        self.emitArgcArgv();                                   // #1754: argc/argv vom Stapel
         self.emitCanarySeed();                                 // RTC-Seed → [rsp-8]
-        // CALL main (placeholder, patched at +46)
-        self.emit8(0xE8); self.emit32(0);
+        // CALL main — Position wird gemerkt, nicht gezaehlt (#1754)
+        self.emit8(0xE8);
+        self.startRelOff := self.codeLen;
+        self.emit32(0);
+        self.startNextIP := self.codeLen;
         // sys_exit(rax) — Kernel .ring3_exit erwartet rax=60, rdi=Exit-Code
         self.emit8(0x89); self.emit8(0xC7);                     // MOV edi, eax
         self.emitMovRaxImm(60);                                 // MOV rax, 60 (sys_exit)
@@ -284,21 +296,56 @@ pub type EmitLyxOS = class {
         self.emit8(0x4C); self.emit8(0x89); self.emit8(0x44); self.emit8(0x24); self.emit8(0xF8); // MOV [rsp-8], r8
     }
 
-    // LX-36: _start for EVENT_LOOP lifecycle (86 bytes).
+    // #1754: argc und argv aus dem Startstapel in den Datenbereich retten.
+    //
+    // Lyx OS baut den Stapel nach AMD64-SysV auf, fuer ELF- und LBF-Kinder
+    // gleich (kernel/lbf_exec.lyx LbfPrepare, kernel/sched_ring3.lyx
+    // LoadElfSched): beim Sprung nach `entry` zeigt rsp auf argc, dahinter
+    // stehen die argv-Zeiger und ein NULL, dann envp.
+    //
+    //   [rsp]      argc
+    //   [rsp+8]    argv[0] … argv[argc-1], NULL
+    //
+    // Der Startrumpf fasste rsp bisher nicht an, weshalb GetArgC() auf diesem
+    // Ziel fest 0 lieferte und jedes Kommandozeilenwerkzeug als LBF in seine
+    // Usage-Meldung lief. Gelesen wird VOR dem Canary-Seed: der mischt zwar
+    // nur rsp ein und veraendert ihn nicht, aber die Reihenfolge "erst das
+    // Ererbte sichern, dann eigenen Zustand aufbauen" haelt die Abhaengigkeit
+    // in eine Richtung.
+    //
+    // Ziel sind zwei Woerter hinter dem Globals-Pool, angesprochen ueber die
+    // Kennungen -2 und -3 (wie -1 fuer den Zufallszustand, #1728).
+    fn emitArgcArgv(): void {
+        self.emit8(0x48); self.emit8(0x8B); self.emit8(0x04); self.emit8(0x24);  // MOV rax, [rsp]
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0x05);                    // MOV [rip+d32], rax
+        self.recordGlobalPatch(self.codeLen, 0 - 2); self.emit32(0);             // → argc
+        self.emit8(0x48); self.emit8(0x8D); self.emit8(0x44); self.emit8(0x24); self.emit8(0x08);  // LEA rax, [rsp+8]
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0x05);                    // MOV [rip+d32], rax
+        self.recordGlobalPatch(self.codeLen, 0 - 3); self.emit32(0);             // → argv
+    }
+
+    pub fn startCallRel32Off(): int64 { return self.startRelOff; }
+    pub fn startCallNextIP():  int64 { return self.startNextIP; }
+
+    // LX-36: _start for EVENT_LOOP lifecycle.
     // RTC-Canary-Seed (wie ONE_SHOT), dann sys_event_loop_init (0x0020) vor CALL main.
     // CALL rel32 is at byte offset 68; callNextIP = 72.
     // Caller must use: patchCallRel32(68, mainOff - 72)
     pub fn emitStartStubEventLoop(): void {
         // XOR rbp, rbp
         self.emit8(0x48); self.emit8(0x31); self.emit8(0xED);
-        self.emitCanarySeed();                               // +3:  RTC-Seed → [rsp-8], endet +45
+        self.emitArgcArgv();                                 // #1754: argc/argv vom Stapel
+        self.emitCanarySeed();                               // RTC-Seed → [rsp-8]
         // sys_event_loop_init (0x0020): kernel registers lifecycle sources
         // MOV rdi, imm64 (0 = kernel reads TLV 0x08 from loaded binary)
         self.emit8(0x48); self.emit8(0xBF); self.emit64(0);  // +45: MOV rdi, 0
         self.emitMovRaxImm(0x0020);                           // +55: MOV rax, 0x0020
         self.emitSyscall();                                   // +65: SYSCALL
-        // CALL main placeholder: rel32 at byte 68, callNextIP = 72
-        self.emit8(0xE8); self.emit32(0);                     // +67: CALL rel32
+        // CALL main — Position wird gemerkt, nicht gezaehlt (#1754)
+        self.emit8(0xE8);
+        self.startRelOff := self.codeLen;
+        self.emit32(0);
+        self.startNextIP := self.codeLen;
         // sys_exit(rax) — Kernel .ring3_exit erwartet rax=60, rdi=Exit-Code
         self.emit8(0x89); self.emit8(0xC7);                   // +72: MOV edi, eax
         self.emitMovRaxImm(60);                               // +74: MOV rax, 60 (sys_exit)
@@ -760,15 +807,25 @@ pub type EmitLyxOS = class {
         // darf nicht mit 0 laufen, sonst bleibt es fuer immer 0. Der Emitter
         // faengt das ab, genau wie der x86-Weg.
         self.emit64(0);
+        // #1754: zwei weitere Woerter fuer argc und argv. Sie stehen hier und
+        // nicht im Programm-Namensraum, weil sie keine Programm-Globalen sind:
+        // der Startrumpf schreibt sie, bevor main laeuft, und kein Lyx-Name
+        // zeigt darauf. 0 ist der richtige Anfangswert — ein Programm, das
+        // ohne Argumente startet, hat argc 0.
+        self.emit64(0);   // gCount+1: argc
+        self.emit64(0);   // gCount+2: argv
         // RIP-relative Disp32 patchen: disp = (globalsBase + gIdx*8) - (dispOff + 4).
-        // gIdx < 0 kennzeichnet das Zustandswort; es liegt bei Index gCount.
+        // Negative Kennungen liegen hinter den Programm-Globalen:
+        //   -1 Zufallszustand (#1728) · -2 argc · -3 argv (#1754)
         var p: int64 := 0;
         while p < self.globalPatchCount {
             var rec:     int64 := self.globalPatchBuf + p * 16;
             var dispOff: int64 := peek64(rec + 0);
             var gIdx:    int64 := peek64(rec + 8);
             var gEff:    int64 := gIdx;
-            if gIdx < 0 { gEff := gCount; }
+            if gIdx == 0 - 1 { gEff := gCount; }
+            if gIdx == 0 - 2 { gEff := gCount + 1; }
+            if gIdx == 0 - 3 { gEff := gCount + 2; }
             self.patch32(dispOff, (self.globalsBase + gEff * 8) - (dispOff + 4));
             p := p + 1;
         }
@@ -1172,9 +1229,9 @@ pub type EmitLyxOS = class {
         } else if id == 9 {
             self.emitPrintFloat();
         } else if id == 17 {
-            self.emitNullArg(dest);
+            self.emitLoadStartWord(dest, 0 - 2);   // #1754: GetArgC
         } else if id == 18 {
-            self.emitNullArg(dest);
+            self.emitLoadStartWord(dest, 0 - 3);   // #1754: GetArgV
         } else if id == 19 {
             self.emitNullArg(dest);
         } else if id == 16 {
@@ -2432,18 +2489,23 @@ pub type EmitLyxOS = class {
         self.emitSyscall();
     }
 
-    // ID 17/18 (#1720): GetArgC / GetArgV.
-    //
-    // Auf diesem Ziel gibt es keine Programmargumente: `_start` ruft main und
-    // beendet, es liest keinen Stapel-argv. Beide liefern deshalb 0 — dieselbe
-    // Aussage, die die Handbuchseite fuer das freistehende Ziel trifft
-    // ("GetArgC und GetArgV liefern 0 — argc und argv gibt es auf blankem
-    // Blech nicht").
-    //
-    // Das steht hier im BACKEND und nicht im Lowerer, weil es eine Aussage
-    // ueber dieses Ziel ist. Auf arm64-Linux gibt es sehr wohl Argumente; ein
-    // festes 0 im Lowerer waere dort schlicht falsch. Reicht der LBF-Loader
-    // spaeter Argumente durch, aendert sich genau diese Stelle.
+    // ID 17/18 (#1754): GetArgC / GetArgV lesen, was der Startrumpf vom Stapel
+    // gerettet hat (emitArgcArgv). Bis 1.1.8A stand hier ein festes 0 mit der
+    // Begruendung, dieses Ziel habe keine Programmargumente — das stimmte fuer
+    // den Startrumpf, nicht fuer das Betriebssystem: Lyx OS legt argc und argv
+    // seit jeher nach AMD64-SysV auf den Startstapel, der ELF-Pfad holt sie
+    // ab. Der Kommentar von damals sagte selbst, wo es zu aendern waere.
+    fn emitLoadStartWord(dest: int64, kennung: int64): void {
+        self.emit8(0x48); self.emit8(0x8B); self.emit8(0x05);   // MOV rax, [rip+d32]
+        self.recordGlobalPatch(self.codeLen, kennung); self.emit32(0);
+        self.emitMovSlotFromRax(dest);
+    }
+
+    // ID 19 (#1720): GetEnvBlock. Der Startstapel traegt envp hinter dem
+    // NULL nach argv — abgeholt wird es nicht, weil dafuer argc zur Laufzeit
+    // durchlaufen werden muesste und bisher niemand danach gefragt hat. 0
+    // heisst hier "kein Block", nicht "leerer Block"; #1754 hat argc/argv
+    // geholt und diese Stelle bewusst gelassen.
     fn emitNullArg(dest: int64): void {
         self.emit8(0x48); self.emit8(0x31); self.emit8(0xC0);  // XOR rax, rax
         self.emitMovSlotFromRax(dest);
