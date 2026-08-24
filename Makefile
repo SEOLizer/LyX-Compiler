@@ -275,6 +275,7 @@ test: lyxc
 	@bash tests/lyxos_nummernraum_test.sh
 	@bash tests/lyxos_zeit_builtins_test.sh
 	@bash tests/con_globals_test.sh
+	@bash tests/lyxos_argv_test.sh
 	@bash tests/iso_verzeichnisse_test.sh
 	@bash tests/win64_syscalls_test.sh
 	@bash tests/ir_argslots_test.sh
