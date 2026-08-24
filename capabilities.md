@@ -170,13 +170,20 @@ Programms; der Kernel wertet sie beim Syscall aus. **Abgebildet sind nur diese:*
 | `ki.embed` | `0x10` |
 | `ki.graph` | `0x20` |
 | `hardware.block` | `0x40` |
-| `audio.*` | `0x80` |
+| `audio.*` | `0x80` (reserviert — es gibt derzeit keine `audio`-Capability) |
+| `hardware.i2c`, `hardware.usb`, `hardware.gpio`, `hardware.spi` | `0x100` |
 
-`hardware.gpio`, `hardware.i2c`, `hardware.spi` und `hardware.usb` setzen **kein
-Bit**: LyxOS führt für sie keine eigene Rechteklasse. Sie sind für das Ziel
-gültig, aber wirkungslos — der Compiler warnt beim Übersetzen darauf.
-`system.*` sind die impliziten Rechte (Programmende, Heap, Zufall, Zeit); sie
-brauchen kein Bit und werden nicht gemeldet.
+`hardware.i2c`, `hardware.usb`, `hardware.gpio` und `hardware.spi` teilen sich
+`0x100` (#1759). Das ist Absicht: LyxOS kennt für den direkten Gerätezugriff
+genau eine Klasse (`PLEDGE_DEVICE`), und feiner getrennte Bits wären eine
+Zusage, die niemand durchsetzen könnte. Aufteilen lässt sich das später, ohne
+die bestehenden Bedeutungen zu verschieben. `hardware.block` bleibt davon
+getrennt — Blockgeräte sind im Kernel eine eigene Klasse (`PLEDGE_BLOCK`).
+
+Capabilities, die **kein Bit setzen** — etwa `fs.create`, `fs.meta`,
+`memory.mmap` —, sind für das Ziel gültig, aber wirkungslos; der Compiler warnt
+beim Übersetzen darauf. `system.*` sind die impliziten Rechte (Programmende,
+Heap, Zufall, Zeit); sie brauchen kein Bit und werden nicht gemeldet.
 
 Ein Programm, dessen sämtliche Capabilities kein Bit setzen, kommt beim
 Ladeprogramm an wie eines ohne Manifest und bekommt den Vorgabewert „nur

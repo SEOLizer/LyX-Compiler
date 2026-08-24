@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/lyxos_caps_block_test.sh — hardware.block in der CAPS-TLV (#1755).
+# tests/lyxos_caps_geraete_test.sh — Geraete-Bits in der CAPS-TLV (#1755, #1759).
 #
 # Lyx OS erzwingt das Manifest zur Syscall-Zeit und fuehrt eine eigene Klasse
 # fuer Rohzugriff auf Blockgeraete (PLEDGE_BLOCK, Syscalls 98-102). Dafuer gab
@@ -36,7 +36,7 @@ while i < 4096:
     if i < 0: break
     if int.from_bytes(b[i+1:i+3], 'little') == 8:
         v = int.from_bytes(b[i+3:i+11], 'little')
-        if v in (0, 1, 2, 4, 8, 16, 32, 64, 128):
+        if v in (0, 1, 2, 4, 8, 16, 32, 64, 128, 256):
             print(v); sys.exit()
     i += 1
 print(-1)
@@ -75,17 +75,54 @@ fn main(): int64 { return 0; }'
 v="$(caps "$TMP/fs.lbf")"
 [ "$v" = "1" ] && ok "fs.read weiterhin 0x1" || no "fs.read" "caps=$v erwartet 1"
 
-# --- 4. Capability ohne Bit meldet sich ---------------------------------
-bau i2c '@capabilities([hardware.i2c])
-fn main(): int64 { return 0; }'
-if grep -q "setzt kein Bit in der CAPS-TLV" "$TMP/i2c.log"; then
-  ok "hardware.i2c meldet, dass es im LBF-Ziel nichts bewirkt"
+# --- 3b. hardware.i2c/usb/gpio/spi → 0x100 (#1759) ----------------------
+# Ein gemeinsames Bit fuer alle vier: der Kernel kennt genau eine Klasse
+# (PLEDGE_DEVICE). Feiner getrennte Bits waeren eine Zusage, die niemand
+# einloesen koennte; aufteilen laesst sich das spaeter, ohne bestehende
+# Bedeutungen zu verschieben.
+#
+# ABWEICHUNG VOM VORSCHLAG: das Issue nannte 0x80 — die ist LBF_CAP_AUDIO_MIC.
+# Zweite Meldung in Folge, deren Zahl aus einer Messung stammt, die nur die
+# selbst gesetzten Bits sieht (bei #1755 war es 0x10 gegen KI_EMBED).
+for hw in hardware.i2c hardware.usb hardware.gpio hardware.spi; do
+  bau "dev_${hw#hardware.}" "@capabilities([$hw])
+fn main(): int64 { return 0; }"
+  v="$(caps "$TMP/dev_${hw#hardware.}.lbf")"
+  [ "$v" = "256" ] && ok "$hw setzt 0x100 (PLEDGE_DEVICE)" \
+                   || no "$hw" "caps=$v erwartet 256 (0x100)"
+  if grep -q "setzt kein Bit in der CAPS-TLV" "$TMP/dev_${hw#hardware.}.log"; then
+    no "$hw warnt noch" "die Warnung gehoert weg, sobald das Bit gesetzt wird"
+  else
+    ok "$hw warnt nicht mehr"
+  fi
+done
+
+# 0x80 bleibt bei audio — sonst traefen sich zwei Bedeutungen in einer Zahl.
+if grep -q "LBF_CAP_AUDIO_MIC *: *int64 *:= *128" "$ROOT/src/std/lyxos/lbf_layout.lyx"; then
+  ok "0x80 bleibt LBF_CAP_AUDIO_MIC (keine Doppelbelegung)"
 else
-  no "stille Capability" "hardware.i2c geht wortlos durch"
+  no "Doppelbelegung" "0x80 traegt nicht mehr audio"
 fi
-v="$(caps "$TMP/i2c.lbf")"
-[ "$v" = "0" ] && ok "hardware.i2c setzt weiterhin kein Bit (nur die Meldung ist neu)" \
-               || no "i2c-Bit" "caps=$v erwartet 0"
+
+# Blockgeraete bleiben eine eigene Klasse, nicht DEVICE.
+v="$(caps "$TMP/blk.lbf")"
+[ "$v" = "64" ] && ok "hardware.block bleibt 0x40, faellt nicht in DEVICE" \
+                || no "block vs device" "caps=$v erwartet 64"
+
+# --- 4. Capability ohne Bit meldet sich ---------------------------------
+# Beispiel ist jetzt fs.meta: seit #1759 bilden die vier hardware.*-Busse ab,
+# taugen als "stille Capability" also nicht mehr. fs.meta ist registriert und
+# setzt kein Bit — der Fall, den die Warnung sichtbar machen soll.
+bau meta '@capabilities([fs.meta])
+fn main(): int64 { return 0; }'
+if grep -q "setzt kein Bit in der CAPS-TLV" "$TMP/meta.log"; then
+  ok "fs.meta meldet, dass es im LBF-Ziel nichts bewirkt"
+else
+  no "stille Capability" "fs.meta geht wortlos durch"
+fi
+v="$(caps "$TMP/meta.lbf")"
+[ "$v" = "0" ] && ok "fs.meta setzt weiterhin kein Bit (nur die Meldung ist neu)" \
+               || no "meta-Bit" "caps=$v erwartet 0"
 
 # --- 5. system.* meldet sich NICHT --------------------------------------
 # Das sind die impliziten Rechte (exit, Heap, Zufall, Zeit); sie brauchen kein
@@ -100,10 +137,10 @@ else
 fi
 
 # --- 6. Andere Ziele bleiben still --------------------------------------
-# Auf Linux ist hardware.i2c eine gueltige Zusage; die Meldung gilt nur fuer
-# das LBF-Ziel.
-LYX_STD_PATH="$ROOT/std" "$LYXC" "$TMP/i2c.lyx" -o "$TMP/i2c.elf" > "$TMP/i2c_elf.log" 2>&1
-if grep -q "setzt kein Bit in der CAPS-TLV" "$TMP/i2c_elf.log"; then
+# Auf Linux ist fs.meta eine gueltige Zusage; die Meldung gilt nur fuer das
+# LBF-Ziel.
+LYX_STD_PATH="$ROOT/std" "$LYXC" "$TMP/meta.lyx" -o "$TMP/meta.elf" > "$TMP/meta_elf.log" 2>&1
+if grep -q "setzt kein Bit in der CAPS-TLV" "$TMP/meta_elf.log"; then
   no "ELF-Ziel warnt" "die Meldung gehoert nur zu --target=lyxos"
 else
   ok "ELF-Ziel meldet nicht"
