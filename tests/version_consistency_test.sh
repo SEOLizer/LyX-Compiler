@@ -2,10 +2,12 @@
 # tests/version_consistency_test.sh — alle lebenden Versionsangaben nennen
 # dieselbe Version.
 #
-# Die Version steht an vier Stellen, und keine davon leitet sich aus einer
+# Die Version steht an fuenf Stellen, und keine davon leitet sich aus einer
 # anderen ab: Makefile (traegt auch den .deb-Namen), README-Badge, vier Strings
-# in src/lyxc.lyx (--version, --help, Bootstrap-Zeile, Copyright-Banner) und der
-# Kopf von ebnf.md. Von Hand gepflegt laufen die auseinander — ebnf.md stand
+# in src/lyxc.lyx (--version, --help, Bootstrap-Zeile, Copyright-Banner), der
+# Kopf von ebnf.md und die .TH-Kopfzeile von man/lyxc.1 (#1766 — sie fehlte
+# hier, und tools/next_version.sh zog sie nicht mit; gemerkt hat es erst
+# tests/manpage_test.sh, also `make test` nach jedem Bump). Von Hand gepflegt laufen die auseinander — ebnf.md stand
 # beim Bump auf 1.0.12A noch auf 1.0.11C, zwei Versionen hinter dem Compiler.
 #
 # Der Compiler selbst kann das nicht melden: er kennt nur die Strings, die in
@@ -14,8 +16,9 @@
 #
 # HISTORISCHE Angaben sind ausdruecklich nicht gemeint. Saetze wie „bis 1.0.11D
 # war das so" beschreiben einen Zeitpunkt; sie bleiben stehen und werden hier
-# nicht geprueft. Deshalb wird an den vier BEKANNTEN Stellen nachgesehen und
-# nicht nach jedem Vorkommen der Zeichenkette gesucht.
+# nicht geprueft. Deshalb wird an den fuenf BEKANNTEN Stellen nachgesehen und
+# nicht nach jedem Vorkommen der Zeichenkette gesucht — in man/lyxc.1 also nur
+# in der .TH-Zeile, nicht im Kommentar darueber, der den Pruefstand nennt.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fail=0
@@ -70,6 +73,24 @@ check ebnf.md "Titel" \
 
 check ebnf.md "Standvermerk" \
   "$(sed -n 's/.*gegen lyxc \([0-9A-Za-z.]*\) geprueft.*/\1/p' "$ROOT/ebnf.md" | head -1)"
+
+# #1766: die .TH-Kopfzeile der Handbuchseite.
+check man/lyxc.1 ".TH-Kopfzeile" \
+  "$(sed -n 's/^\.TH LYXC 1 "[0-9-]*" "lyxc \([0-9A-Za-z.]*\)".*/\1/p' "$ROOT/man/lyxc.1" | head -1)"
+
+# #1766: die gepackte Paketkopie muss dieselbe Seite enthalten — sonst traegt
+# das .deb eine andere Version als das Repository.
+MANPKG="$ROOT/lyx-compiler/usr/share/man/man1/lyxc.1.gz"
+if [ -f "$MANPKG" ]; then
+  if zcat "$MANPKG" | diff -q - "$ROOT/man/lyxc.1" >/dev/null; then
+    echo "PASS Paketkopie der Handbuchseite ist inhaltsgleich"
+  else
+    echo "FAIL Paketkopie der Handbuchseite weicht ab — tools/next_version.sh oder tools/make_deb.sh laufen lassen"
+    fail=$((fail+1))
+  fi
+else
+  echo "SKIP Paketkopie der Handbuchseite (nicht vorhanden)"
+fi
 
 # Das gebaute Binary, falls vorhanden: es ist die einzige Stelle, die zaehlt,
 # wenn jemand `lyxc --version` aufruft.

@@ -13,15 +13,18 @@
 #   1.0.12B  = derselbe Tag, zweites Kompilat
 #   1.0.13A  = naechster Tag mit einem Build, erstes Kompilat
 #
-# Warum ueberhaupt ein Skript: die Version steht an VIER lebenden Stellen
-# (Makefile, README-Badge, vier Strings in src/lyxc.lyx, Kopf von ebnf.md).
+# Warum ueberhaupt ein Skript: die Version steht an FUENF lebenden Stellen
+# (Makefile, README-Badge, vier Strings in src/lyxc.lyx, Kopf von ebnf.md und
+# die .TH-Kopfzeile von man/lyxc.1 samt gepackter Paketkopie).
 # Von Hand gepflegt laufen die auseinander; `tests/version_consistency_test.sh`
 # faengt das ab, aber besser gar nicht erst entstehen lassen.
 #
 # HISTORISCHE Angaben bleiben unberuehrt. Saetze wie „bis 1.0.11D war das so"
 # in sema.lyx, ebnf.md §20.1 oder unter work/ beschreiben einen Zeitpunkt;
-# mitzuziehen wuerde sie falsch machen. Das Skript fasst deshalb nur die vier
-# bekannten Stellen an, nicht jedes Vorkommen der Zeichenkette.
+# mitzuziehen wuerde sie falsch machen. Das Skript fasst deshalb nur die fuenf
+# bekannten Stellen an, nicht jedes Vorkommen der Zeichenkette. In man/lyxc.1
+# heisst das: nur die .TH-Kopfzeile, nicht der Kommentar darueber, der den
+# Stand nennt, gegen den die OPTIONEN-Liste geprueft wurde (#1766).
 #
 # Aufruf:
 #   tools/next_version.sh            # naechste Version berechnen und setzen
@@ -38,6 +41,8 @@ MAKEFILE="$ROOT/Makefile"
 README="$ROOT/README.md"
 LYXC="$ROOT/src/lyxc.lyx"
 EBNF="$ROOT/ebnf.md"
+MAN="$ROOT/man/lyxc.1"                                    # #1766
+MANPKG="$ROOT/lyx-compiler/usr/share/man/man1/lyxc.1.gz"  # #1766
 
 DRY=0
 WANT=""
@@ -105,7 +110,7 @@ echo "naechste: $next  (heute $today)"
 [ "$DRY" -eq 1 ] && exit 0
 if [ "$cur" = "$next" ]; then echo "nichts zu tun"; exit 0; fi
 
-# Die vier lebenden Stellen.
+# Die fuenf lebenden Stellen.
 sed -i "s/^VERSION   := .*/VERSION   := $next/"                              "$MAKEFILE"
 sed -i "s/^VERSION_DATE := .*/VERSION_DATE := $today/"                       "$MAKEFILE"
 grep -q '^VERSION_DATE' "$MAKEFILE" || sed -i "/^VERSION   := /a VERSION_DATE := $today" "$MAKEFILE"
@@ -114,6 +119,26 @@ sed -i "s/\"$cur\"c/\"$next\"c/g; s/lyxc $cur (bootstrap)/lyxc $next (bootstrap)
 sed -i "1s/^# Lyx $cur /# Lyx $next /"                                       "$EBNF"
 sed -i "3s/gegen lyxc $cur geprueft/gegen lyxc $next geprueft/"              "$EBNF"
 sed -i "3s/^> Stand [0-9-]*,/> Stand $today,/"                               "$EBNF"
+
+# #1766: Die Handbuchseite traegt die Version in ihrer .TH-Kopfzeile, und
+# tests/manpage_test.sh haelt sie gegen `lyxc --version`. Bis hierher zog das
+# Skript sie nicht mit — `make test` wurde damit nach JEDEM Bump rot, bis
+# jemand die Zeile von Hand nachtrug. Ersetzt wird ausschliesslich die
+# .TH-Zeile; die Kommentarzeile darueber nennt den Stand, gegen den die
+# OPTIONEN-Liste geprueft wurde, und ist eine historische Angabe.
+if [ -f "$MAN" ]; then
+  sed -i "s/^\.TH LYXC 1 \"[0-9-]*\" \"lyxc [0-9A-Za-z.]*\"/.TH LYXC 1 \"$today\" \"lyxc $next\"/" "$MAN"
+  # Die Paketkopie muss inhaltsgleich bleiben, sonst meldet manpage_test.sh sie
+  # als veraltet. gzip -9n laesst Zeitstempel und Namen weg, damit zwei
+  # Baulaeufe dieselbe Pruefsumme ergeben — dieselben Schalter wie in
+  # tools/make_deb.sh.
+  if [ -f "$MANPKG" ]; then
+    gzip -9nc "$MAN" > "$MANPKG"
+    chmod 644 "$MANPKG"
+  fi
+else
+  echo "WARNUNG man/lyxc.1 fehlt — Kopfzeile nicht nachgezogen" >&2
+fi
 
 echo
 bash "$ROOT/tests/version_consistency_test.sh"
