@@ -71,5 +71,46 @@ run "alloc_nicht_null"  'import std.alloc; fn main(): int64 { var p: int64 := al
 run "alloc_schreiben"   'import std.alloc; fn main(): int64 { var p: int64 := alloc(64); poke64(p, 41); return peek64(p) + 1; }' 42
 run "alloc_bytes"       'import std.alloc; fn main(): int64 { var p: int64 := alloc(16); poke8(p, 65); poke8(p+1, 66); return peek8(p) + peek8(p+1); }' 131
 
+# ---------------------------------------------------------------------------
+# #1764: Gleitkomma, weite Konstanten, Feldzugriff, Ausgabe.
+#
+# Vorher scheiterte all das LAUT beim Uebersetzen (Opcode 21 = IRO_FSUB,
+# Opcode 86 = IRO_LOAD_IDX, Builtin 210 = memcpy) oder lieferte still falsche
+# Werte (ITOF/FTOI kopierten den Slot, rv_LI64 schnitt auf 32 Bit ab, der
+# Laengen-Sentinel von PrintLn ging roh an write).
+#
+# Die Erwartungen bleiben unter 256: der Exit-Code ist ein Byte, 375 kaeme als
+# 119 zurueck und der Test wuerde etwas anderes messen als er behauptet.
+# ---------------------------------------------------------------------------
+run "f64_addition"    'fn main(): int64 { var a: f64 := 1.5; var b: f64 := 2.25; return ((a + b) * 10.0) as int64; }' 37
+run "f64_subtraktion" 'fn main(): int64 { var a: f64 := 5.5; var b: f64 := 2.25; return ((a - b) * 10.0) as int64; }' 32
+run "f64_mal_geteilt" 'fn main(): int64 { var a: f64 := 7.0; var b: f64 := 2.0; return ((a * b) + (a / b)) as int64; }' 17
+run "f64_negation"    'fn main(): int64 { var a: f64 := 3.5; var b: f64 := 0.0 - a; return (0.0 - b) as int64; }' 3
+run "f64_vergleiche"  'fn main(): int64 { var a: f64 := 1.5; var b: f64 := 2.5; var r: int64 := 0; if a < b { r := r + 1; } if b > a { r := r + 2; } if a <= a { r := r + 4; } if a == a { r := r + 8; } if a != b { r := r + 16; } return r; }' 31
+# ITOF/FTOI: `7 as f64` muss 7.0 ergeben, nicht das Bitmuster der Sieben.
+run "f64_aus_ganzzahl" 'fn main(): int64 { var a: f64 := 7 as f64; var b: f64 := a / 2.0; return (b * 10.0) as int64; }' 35
+# rv_LI64 deckte nur 32 Bit ab — genau daran starb auch jedes f64-Literal.
+run "weite_konstante" 'fn main(): int64 { var a: int64 := 1099511627776; return a / 137438953472; }' 8
+run "feld_index"      'fn main(): int64 { var a: [4]int64; a[0] := 5; a[3] := 9; return a[0] + a[3]; }' 14
+
+# Ausgabe: der Sentinel-Fall (pchar-Variable) schwieg, das Literal schrieb.
+ausgabe() { # name, quelltext, erwartete ausgabe
+  printf "%s" "$2" > "$TMP/o.lyx"
+  if ! (cd "$ROOT" && timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/o.lyx" --target=riscv -o "$TMP/o" >"$TMP/o.log" 2>&1); then
+    echo "FAIL $1: uebersetzt nicht: $(grep -m1 -iE 'error|Builtin-ID|Opcode' "$TMP/o.log")"
+    FAIL=$((FAIL+1)); return
+  fi
+  if [ -z "$QEMU" ]; then echo "PASS $1 (nur uebersetzt)"; PASS=$((PASS+1)); return; fi
+  local got; got="$(timeout 10 "$QEMU" "$TMP/o" 2>/dev/null)"
+  if [ "$got" = "$3" ]; then
+    echo "PASS $1 (Ausgabe '$got')"; PASS=$((PASS+1))
+  else
+    echo "FAIL $1: Ausgabe '$got' erwartet '$3'"; FAIL=$((FAIL+1))
+  fi
+}
+ausgabe "println_literal"  'import src.std.io; fn main(): int64 { PrintLn("hallo riscv"c); return 0; }' "hallo riscv"
+ausgabe "println_variable" 'import src.std.io; fn main(): int64 { var s: pchar := "abc"c; PrintLn(s); return 0; }' "abc"
+ausgabe "println_zahl"     'import src.std.io; fn main(): int64 { PrintLn(IntToStr(1234)); return 0; }' "1234"
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
