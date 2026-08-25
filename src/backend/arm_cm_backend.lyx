@@ -843,24 +843,164 @@ pub type EmitARMCM = class {
       self.cm_storeSlot(dest);
       return;
     }
-    if (id == 1 || id == 2 || id == 9 || id == 12 || id == 13 || id == 14) {
-      // Ausgabe auf einem freistehenden Ziel: es gibt keine Konsole und keinen
-      // Systemaufruf dorthin. Das ist ein AUSDRUECKLICHER No-op — dieselbe
-      // Linie wie bei den Barrieren im Windows-Zweig von arm64 (#1037): lieber
-      // eine benannte Entscheidung als ein Durchfallen in den Fehlerzweig.
-      // Wer auf Cortex-M etwas ausgeben will, schreibt in ein Peripherieregister
-      // (poke8/poke32 sind umgesetzt) oder benutzt semihosting.
+    // #1744: Ausgabe ueber ARM-Semihosting.
+    //
+    // Bis hierher waren 1, 2, 9, 12, 13 und 14 ein ausdruecklicher No-op: das
+    // Programm uebersetzte, `PrintLn` tat nichts, und niemand sah es. Der
+    // Kommentar von damals nannte selbst den Ausweg — semihosting. Genau der
+    // ist jetzt umgesetzt: BKPT 0xAB mit SYS_WRITEC (0x03) je Zeichen. Das ist
+    // der uebliche Weg, von einem Cortex-M Text herauszubekommen, und er
+    // funktioniert unter qemu-system-arm ebenso wie an einem echten Debugger.
+    //
+    // Zeichenweise statt ueber SYS_WRITE, weil SYS_WRITE einen Parameterblock
+    // im RAM braucht — den muesste das Backend erst anlegen, und einen festen
+    // haette dieselbe Falle wie der feste Zeichenkettenpuffer weiter oben.
+    if (id == 1 || id == 13 || id == 14 || id == 223) {
+      // id 1: write(stdout, buf, len) — Puffer und Laenge ab argBase.
+      // id 13/14: EPrintStr — Puffer ab argBase, Laenge zaehlt der Code.
+      // id 223: write(fd, buf, len) — fd wird verworfen, es gibt nur einen
+      //         Ausgabeweg; das steht so auch in der Meldung unten.
+      var wBuf: int64 := sBase;
+      var wLen: int64 := sBase + 1;
+      if (id == 223) { wBuf := sBase + 1; wLen := sBase + 2; }
+      self.cm_loadSlot(wBuf);                   // r4 = Puffer
+      if (id == 13 || id == 14) {
+        self.cm_MOVS_imm(CM_R5, 0);
+        self.cm_MOVS_imm(CM_R6, 1);
+        self.cm_SUB(CM_R5, CM_R5, CM_R6);       // r5 = -1 (Sentinel: bis zum Nullbyte)
+      } else {
+        self.cm_loadSlot2(wLen);                // r5 = Laenge
+      }
+      self.emitSemihostWrite();
       self.cm_MOVS_imm(CM_R4, 0);
       self.cm_storeSlot(dest);
       return;
     }
-    if (id == 3) {
-      // Exit: auf Cortex-M gibt es keinen Prozess, den man beenden koennte.
-      // BKPT #0 haelt im Debugger an — dieselbe Sequenz wie bei IRO_PANIC.
-      self.cm_e16(0xBE00);   // bkpt #0
+    if (id == 2) {
+      // PrintInt(n): Ziffern in einen Stapelpuffer, dann zeichenweise
+      // ausgeben. Der Puffer lebt nur waehrend des Aufrufs — das genuegt hier,
+      // weil die Ausgabe im selben Aufruf passiert. Genau darin unterscheidet
+      // sich der Fall von IntToStr, das einen Zeiger ZURUECKGIBT (#1744).
+      self.cm_loadSlot(sBase);                  // r4 = Zahl
+      self.emitSemihostInt();
+      self.cm_MOVS_imm(CM_R4, 0);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 3 || id == 227) {
+      // Exit: SYS_EXIT (0x18) mit ADP_Stopped_ApplicationExit.
+      // 3 ist der allgemeine Exit-Builtin, 227 der aus der Syscall-Familie
+      // (`exit(code)` im Quelltext laeuft ueber diesen). Der Wert steht
+      // im erweiterten Block {Grund, Code}, damit der Rueckgabewert des
+      // Programms sichtbar wird — sonst liesse sich ein Lauf nicht pruefen.
+      // Ohne Semihosting-Wirt bleibt BKPT stehen, wie bisher.
+      self.cm_loadSlot(sBase);                  // r4 = Code
+      self.emitSemihostExit();
       return;
     }
     self._builtinUnsupportedCM(id);
+  }
+
+  // #1744: r4 = Puffer, r5 = Laenge (negativ heisst "bis zum Nullbyte").
+  // Gibt zeichenweise ueber SYS_WRITEC aus.
+  //
+  // Benutzt werden r0..r3 und r6. NICHT r7 — das ist in diesem Backend der
+  // Rahmenzeiger. Ein erster Anlauf nahm ihn als Kratzregister: die Ausgabe
+  // kam, danach sprang das Programm beim Ruecksprung aus main ins Leere und
+  // qemu meldete "Lockup: can't escalate 3 to HardFault". Die Vektortabelle
+  // hat nur zwei Eintraege, ein Fehler endet dort also immer im Stillstand.
+  //
+  // Alle Spruenge werden nachgetragen statt gezaehlt.
+  fn emitSemihostWrite() {
+    self.cm_MOVS_imm(CM_R6, 0);                 // r6 = Index
+    var lLoop: int64 := self.codeLen;
+    self.cm_CMP0(CM_R5);
+    var bSentinel: int64 := self.codeLen; self.cm_e16(0);   // BLT -> Nullbyte-Pruefung
+    self.cm_CMP(CM_R6, CM_R5);
+    var bEndeFest: int64 := self.codeLen; self.cm_e16(0);   // BGE -> fertig
+    var jSchreib: int64 := self.codeLen; self.cm_e16(0);    // B   -> schreiben
+    var lSentinel: int64 := self.codeLen;
+    self.cm_ADD(CM_R3, CM_R4, CM_R6);
+    self.cm_LDRB(CM_R2, CM_R3, 0);
+    self.cm_CMP0(CM_R2);
+    var bEndeNull: int64 := self.codeLen; self.cm_e16(0);   // BEQ -> fertig
+    var lSchreib: int64 := self.codeLen;
+    self.cm_ADD(CM_R3, CM_R4, CM_R6);
+    self.cm_MOVS_imm(CM_R0, 3);                 // SYS_WRITEC
+    self.cm_MOV(CM_R1, CM_R3);
+    self.cm_e16(0xBEAB);                        // BKPT 0xAB
+    self.cm_MOVS_imm(CM_R2, 1);
+    self.cm_ADD(CM_R6, CM_R6, CM_R2);
+    self.cm_e16(0xE000 | (((lLoop - (self.codeLen + 4)) / 2) & 0x7FF));
+    var lEnde: int64 := self.codeLen;
+    self.cm_poke16at(bSentinel, 0xDB00 | (((lSentinel - (bSentinel + 4)) / 2) & 0xFF));  // BLT
+    self.cm_poke16at(bEndeFest, 0xDA00 | (((lEnde     - (bEndeFest + 4)) / 2) & 0xFF));  // BGE
+    self.cm_poke16at(jSchreib,  0xE000 | (((lSchreib  - (jSchreib  + 4)) / 2) & 0x7FF)); // B
+    self.cm_poke16at(bEndeNull, 0xD000 | (((lEnde     - (bEndeNull + 4)) / 2) & 0xFF));  // BEQ
+  }
+
+  // #1744: r4 = Zahl, zeichenweise ausgegeben. Ein ganzer Ziffernpuffer waere
+  // unnoetig: jede Ziffer geht sofort raus, es muss also nur EIN Byte
+  // irgendwo liegen. Dafuer dient ein Stapelwort, dessen Adresse in r6 steht.
+  fn emitSemihostInt() {
+    self.cm_e16(0xB081);                        // SUB sp, #4
+    self.cm_MOV(CM_R6, 13);                     // r6 = sp
+    self.cm_CMP0(CM_R4);
+    var bNichtNeg: int64 := self.codeLen; self.cm_e16(0);   // BGE
+    self.cm_MOVS_imm(CM_R2, 45);                // '-'
+    self.cm_STRB(CM_R2, CM_R6, 0);
+    self.cm_MOVS_imm(CM_R0, 3);
+    self.cm_MOV(CM_R1, CM_R6);
+    self.cm_e16(0xBEAB);
+    self.cm_MOVS_imm(CM_R2, 0);
+    self.cm_SUB(CM_R4, CM_R2, CM_R4);           // r4 = -r4
+    var lPositiv: int64 := self.codeLen;
+    self.cm_MOVS_imm(CM_R5, 1);                 // Teiler
+    var gLoop: int64 := self.codeLen;
+    self.cm_MOVS_imm(CM_R2, 10);
+    self.cm_SDIV(CM_R0, CM_R4, CM_R5);
+    self.cm_CMP(CM_R0, CM_R2);
+    var bTeilerFertig: int64 := self.codeLen; self.cm_e16(0);   // BLT
+    self.cm_MUL(CM_R5, CM_R5, CM_R2);
+    self.cm_e16(0xE000 | (((gLoop - (self.codeLen + 4)) / 2) & 0x7FF));
+    var lZiffern: int64 := self.codeLen;
+    var zLoop: int64 := self.codeLen;
+    self.cm_MOVS_imm(CM_R2, 10);
+    self.cm_SDIV(CM_R0, CM_R4, CM_R5);          // r0 = Zahl / Teiler
+    self.cm_SDIV(CM_R1, CM_R0, CM_R2);
+    self.cm_MLS(CM_R0, CM_R1, CM_R2, CM_R0);    // r0 = r0 - (r0/10)*10
+    self.cm_MOVS_imm(CM_R1, 48);
+    self.cm_ADD(CM_R0, CM_R0, CM_R1);           // '0' + Ziffer
+    self.cm_STRB(CM_R0, CM_R6, 0);
+    self.cm_MOVS_imm(CM_R0, 3);
+    self.cm_MOV(CM_R1, CM_R6);
+    self.cm_e16(0xBEAB);                        // SYS_WRITEC
+    self.cm_MOVS_imm(CM_R2, 10);
+    self.cm_SDIV(CM_R5, CM_R5, CM_R2);          // Teiler /= 10
+    self.cm_CMP0(CM_R5);
+    var bEndeZ: int64 := self.codeLen; self.cm_e16(0);          // BEQ
+    self.cm_e16(0xE000 | (((zLoop - (self.codeLen + 4)) / 2) & 0x7FF));
+    var lEndeZ: int64 := self.codeLen;
+    self.cm_e16(0xB001);                        // ADD sp, #4
+    self.cm_poke16at(bNichtNeg,     0xDA00 | (((lPositiv - (bNichtNeg + 4)) / 2) & 0xFF));
+    self.cm_poke16at(bTeilerFertig, 0xDB00 | (((lZiffern - (bTeilerFertig + 4)) / 2) & 0xFF));
+    self.cm_poke16at(bEndeZ,        0xD000 | (((lEndeZ   - (bEndeZ + 4)) / 2) & 0xFF));
+  }
+
+  // #1744: SYS_EXIT (0x18) mit erweitertem Block {Grund, Code} auf dem Stapel.
+  // r4 = Code, ADP_Stopped_ApplicationExit = 0x20026. Ohne Semihosting-Wirt
+  // bleibt das BKPT stehen — wie das bisherige BKPT #0, nur mit Bedeutung.
+  fn emitSemihostExit() {
+    self.cm_e16(0xB082);                        // SUB sp, #8
+    self.cm_MOV(CM_R6, 13);                     // r6 = sp
+    self.cm_MOVW(CM_R2, 0x0026);
+    self.cm_MOVT(CM_R2, 0x0002);                // r2 = 0x00020026
+    self.cm_STR_pos(CM_R2, CM_R6, 0);
+    self.cm_STR_pos(CM_R4, CM_R6, 1);           // Wortindex 1 = Byte 4
+    self.cm_MOVS_imm(CM_R0, 0x18);              // SYS_EXIT
+    self.cm_MOV(CM_R1, CM_R6);
+    self.cm_e16(0xBEAB);
+    self.cm_e16(0xB002);                        // ADD sp, #8
   }
 
   fn _builtinUnsupportedCM(id: int64) {
@@ -1051,7 +1191,11 @@ pub type ARMCMBackend = class {
     poke16(elfBuf + 16, 2);           // e_type: ET_EXEC
     poke16(elfBuf + 18, 0x28);        // e_machine: EM_ARM = 40
     poke32(elfBuf + 20, 1);           // e_version: EV_CURRENT
-    poke32(elfBuf + 24, 0x08000008);  // e_entry: reset handler VA
+    // #1744: Das Thumb-Bit gehoert auch an den Einstiegspunkt. Die
+    // Vektortabelle setzt es (0x08000009), e_entry stand ohne — ein Lader, der
+    // dorthin springt statt ueber die Tabelle zu booten, startete damit im
+    // ARM-Zustand und lief sofort in den Graben.
+    poke32(elfBuf + 24, 0x08000009);  // e_entry: reset handler VA | Thumb
     poke32(elfBuf + 28, 52);          // e_phoff: program header after ELF header
     poke32(elfBuf + 32, 0);           // e_shoff: no section headers
     poke32(elfBuf + 36, 0x05000200);  // e_flags: EABI5 | Thumb-interwork
@@ -1063,12 +1207,20 @@ pub type ARMCMBackend = class {
     poke16(elfBuf + 50, 0);           // e_shstrndx
 
     // PT_LOAD segment header (32 bytes at offset 52)
-    poke32(elfBuf + 52, 1);               // p_type: PT_LOAD
-    poke32(elfBuf + 56, 0);              // p_offset: load from file start
-    poke32(elfBuf + 60, 0x08000000);     // p_vaddr: FLASH_BASE
-    poke32(elfBuf + 64, 0x08000000);     // p_paddr
-    poke32(elfBuf + 68, elfSize);        // p_filesz (32-bit truncation)
-    poke32(elfBuf + 72, elfSize);        // p_memsz
+    //
+    // #1744: Hier stand p_offset = 0 und p_filesz = elfSize — geladen wurde
+    // also die Datei AB IHREM ANFANG, mitsamt ELF-Header und Auffuellung. Die
+    // Vektortabelle landete damit auf 0x08001000 statt 0x08000000, und der
+    // Kern las seinen Startstapelzeiger aus dem ELF-Magic. Das Erzeugnis war
+    // nie lauffaehig: qemu blieb mit „can't escalate 3 to HardFault" stehen,
+    // ein echter Flasher haette dasselbe Bild ergeben. Gemessen wurde bis
+    // hierher nur, dass die Datei entsteht.
+    poke32(elfBuf + 52, 1);                    // p_type: PT_LOAD
+    poke32(elfBuf + 56, codeFileOffset);       // p_offset: der Code, nicht der Header
+    poke32(elfBuf + 60, 0x08000000);           // p_vaddr: FLASH_BASE
+    poke32(elfBuf + 64, 0x08000000);           // p_paddr
+    poke32(elfBuf + 68, codeSize);             // p_filesz
+    poke32(elfBuf + 72, codeSize);             // p_memsz
     poke32(elfBuf + 76, 5);              // p_flags: PF_R | PF_X
     poke32(elfBuf + 80, 0x1000);         // p_align: 4096
 
