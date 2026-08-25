@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.9C
+VERSION   := 1.1.9D
 VERSION_DATE := 2026-08-25
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -296,6 +296,8 @@ test: lyxc
 	@bash tests/ir_builtins_test.sh
 	@echo "--- riscv: Erzeugnisse ausfuehren, nicht nur uebersetzen (#1740) ---"
 	@bash tests/riscv_laufzeit_test.sh
+	@echo "--- Klassen auf den IR-Zielen ausfuehren (#1767) ---"
+	@bash tests/oop_laufzeit_test.sh
 	@bash tests/compile_unit_codegen_test.sh
 	@bash tests/skalierung_z2b_test.sh
 	@bash tests/lfd_grammatik_test.sh
