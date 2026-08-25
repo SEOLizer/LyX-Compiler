@@ -121,48 +121,65 @@ pub type EmitXtensa = class {
   fn xt_MOV(ar: int64, as_: int64) {
     self.xt_OR(ar, as_, as_);                       // OR ar, as, as
   }
+  // #1786: MULL ist op2=2, op1=8 — im Backend stand 8/8, was auf einem Kern
+  // mit FPU als `ldx` dekodiert. NICHT gegen den Emulator geprueft: keiner der
+  // verfuegbaren qemu-Kerne (dc232b, dc233c, de212, de233_fpu, dsp3400, lx106,
+  // sample_controller) hat die Mul32-Option, ESP32s LX6 dagegen schon. Diese
+  // eine Kodierung steht also nach Konstruktion da, nicht nach Ausfuehrung.
   fn xt_MULL(ar: int64, as_: int64, at: int64) {
-    self.xt_e3(at << 4, (ar << 4) | as_, 0x88);   // op2=8, op1=8 (MUL32)
+    self.xt_e3(at << 4, (ar << 4) | as_, 0x28);   // op2=2, op1=8 (MUL32)
   }
 
-  // Shift-amount setup: SSL as → SAR:=32-as (for SLL), SSR as → SAR:=as (for SRL)
-  fn xt_SSL(as_: int64) { self.xt_e3(0x00, as_, 0x03); }  // op2=0, op1=3
-  fn xt_SSR(as_: int64) { self.xt_e3(0x00, as_, 0x13); }  // op2=1, op1=3
+  // #1786: SSL/SSR sind op2=4, op1=0 und unterscheiden sich im r-Feld (1 bzw.
+  // 0). Im Backend standen op1=3 mit op2 0/1 — das ist etwas anderes.
+  // Gegengelesen mit qemus Disassembler.
+  fn xt_SSL(as_: int64) { self.xt_e3(0x00, 0x10 | as_, 0x40); }  // op2=4, r=1
+  fn xt_SSR(as_: int64) { self.xt_e3(0x00, as_, 0x40); }         // op2=4, r=0
 
-  // Shift using SAR register
+  // Schieben ueber SAR. SLL nimmt die Quelle im s-Feld, SRL/SRA im t-Feld.
   fn xt_SLL(ar: int64, as_: int64) { self.xt_e3(0x00, (ar << 4) | as_, 0xA1); }  // op2=0xA, op1=1
-  fn xt_SRL(ar: int64, as_: int64) { self.xt_e3(0x00, (ar << 4) | as_, 0x91); }  // op2=9, op1=1
+  fn xt_SRL(ar: int64, at: int64) { self.xt_e3(at << 4, ar << 4, 0x91); }        // op2=9, op1=1
+  fn xt_SRA(ar: int64, at: int64) { self.xt_e3(at << 4, ar << 4, 0xB1); }        // op2=0xB, op1=1
 
   // --------------------------------------------------------------------------
-  // RRI8-format: b0=(t<<4)|2, b1=((im&0xF)<<4)|s, b2=(op1<<4)|(im>>4)
+  // #1786: RRI8 ist b0=(t<<4)|2, b1=(r<<4)|s, b2=imm8 — im Backend waren b1
+  // und b2 vertauscht: der Unteropcode landete in den oberen Bits des
+  // Immediates und umgekehrt. Nichts davon war ein gueltiger Befehl.
+  //
+  // r waehlt die Form: L8UI=0, L32I=2, S8I=4, S32I=6, ADDI=0xC, ADDMI=0xD.
+  // Bei L32I/S32I zaehlt b2 in WORTEN (Byte-Versatz / 4), bei L8UI/S8I in Byte.
+  // Alle Formen gegen qemus Disassembler gegengelesen.
   // --------------------------------------------------------------------------
+
+  fn xt_RRI8(r: int64, at: int64, as_: int64, imm8: int64) {
+    self.xt_e3((at << 4) | 2, (r << 4) | as_, imm8 & 0xFF);
+  }
 
   fn xt_ADDI(ar: int64, as_: int64, imm: int64) {
-    var im: int64 := imm & 0xFF;
-    self.xt_e3((ar << 4) | 2, ((im & 0xF) << 4) | as_, 0xC0 | (im >> 4));
+    self.xt_RRI8(0xC, ar, as_, imm);
   }
   fn xt_ADDMI(ar: int64, as_: int64, imm: int64) {
-    var im: int64 := imm & 0xFF;
-    self.xt_e3((ar << 4) | 2, ((im & 0xF) << 4) | as_, 0xD0 | (im >> 4));
+    self.xt_RRI8(0xD, ar, as_, imm);
   }
 
-  // L32I ar, as, woff  (woff = byte_offset/4, range 0..255)
+  // L32I ar, as, woff  (woff = Byte-Versatz / 4, Bereich 0..255)
   fn xt_L32I(ar: int64, as_: int64, woff: int64) {
-    self.xt_e3((ar << 4) | 2, ((woff & 0xF) << 4) | as_, 0x20 | (woff >> 4));
+    self.xt_RRI8(0x2, ar, as_, woff);
   }
   // S32I at, as, woff
   fn xt_S32I(at: int64, as_: int64, woff: int64) {
-    self.xt_e3((at << 4) | 2, ((woff & 0xF) << 4) | as_, 0x60 | (woff >> 4));
+    self.xt_RRI8(0x6, at, as_, woff);
   }
 
   // --------------------------------------------------------------------------
-  // MOVI ar, simm12  (RI12 format, op0=6, op1=0xA)
-  // b0=(ar<<4)|6, b1=im12[7:0], b2=0xA0|(im12[11:8])
+  // #1786: MOVI ist eine RRI8-Form mit op0=2 und r=0xA — im Backend stand
+  // op0=6, und b1/b2 waren vertauscht. Die oberen vier Bit des Immediates
+  // stehen im s-Feld, die unteren acht in b2.
   // --------------------------------------------------------------------------
 
   fn xt_MOVI(ar: int64, imm: int64) {
     var im12: int64 := imm & 0xFFF;
-    self.xt_e3((ar << 4) | 6, im12 & 0xFF, 0xA0 | ((im12 >> 8) & 0xF));
+    self.xt_e3((ar << 4) | 2, 0xA0 | ((im12 >> 8) & 0xF), im12 & 0xFF);
   }
 
   // Load any immediate: MOVI for 12-bit, MOVI+ADDMI for 20-bit, fallback to 0
@@ -188,8 +205,9 @@ pub type EmitXtensa = class {
 
   // --------------------------------------------------------------------------
   // CALL format: b0=((off18&3)<<6)|(n<<4)|op0
-  // CALL0 (op0=5, n=0): off18 = (target - ((callPC+4)&~3)) / 4
-  // J     (op0=6):      same offset formula, 4-byte aligned target
+  // #1786, beide gegen den Disassembler gegengelesen:
+  //   CALL0 (op0=5): Ziel = ((PC & ~3) + 4) + off18 * 4   — off18 zaehlt WORTE
+  //   J     (op0=6): Ziel = PC + 4 + off18                — off18 zaehlt BYTE
   // --------------------------------------------------------------------------
 
   fn xt_CALL0(off18: int64) {
@@ -199,18 +217,31 @@ pub type EmitXtensa = class {
     self.xt_e3(((off18 & 3) << 6) | 6, (off18 >> 2) & 0xFF, (off18 >> 10) & 0xFF);
   }
 
-  // JX a0: return from CALL0 function (RRR, op2=0xD, s=a0, r=0, t=0, op0=0)
-  fn xt_JX_A0() { self.xt_e3(0x00, 0x00, 0xD0); }
+  // #1786: Der Ruecksprung stand als (0x00,0x00,0xD0) da — das ist `subx2`.
+  // RET ist t=8 im CALLX-Raum (op0=0, op1=0, op2=0, r=0, s=0); JX as waere
+  // t=10 mit s=as. Beide gegen den Disassembler gegengelesen.
+  fn xt_JX_A0() { self.xt_e3(0x80, 0x00, 0x00); }   // RET (= JX a0)
 
   // --------------------------------------------------------------------------
-  // BRI12 format: b0=(m<<4)|7, b1=((im12&0xF)<<4)|s, b2=(im12>>4)&0xFF
-  // target = PC + 3 + sign_extend(offset12)   (PC_next = PC+3 for 3-byte instr)
-  // BEQZ(m=1), BNEZ(m=5), BLTZ(m=9), BGEZ(m=13=0xD)
+  // #1786: BRI12 hat op0 = 6, nicht 7. Die m-Werte (1/5/9/13) stimmten, b1 und
+  // b2 ebenfalls — nur der Opcode war falsch, und damit der ganze Befehl.
+  //
+  // Und das Ziel liegt bei PC + 4, nicht PC + 3: der Kommentar rechnete mit
+  // der Befehlslaenge, die Hardware rechnet mit einem festen Versatz.
+  // Gegengelesen: BEQZ(1), BNEZ(5), BLTZ(9), BGEZ(13).
   // --------------------------------------------------------------------------
 
-  fn xt_BRI12(m: int64, as_: int64, imm12: int64) {
-    var im12: int64 := imm12 & 0xFFF;
-    self.xt_e3((m << 4) | 7, ((im12 & 0xF) << 4) | as_, (im12 >> 4) & 0xFF);
+  // `weite` zaehlt ab dem ENDE dieses Befehls — so, wie die Aufrufstellen es
+  // lesen („+3 ueberspringt das folgende MOVI"). Die Hardware rechnet ab
+  // PC + 4, also ein Byte weiter; die Differenz zieht diese Stelle ab, damit
+  // sie nicht an siebzehn Aufrufstellen einzeln stehen muss.
+  //
+  // #1786: Vorher rechnete der Emitter mit PC + 3 und traf damit die MITTE des
+  // naechsten Drei-Byte-Befehls. Im Trace sah man den Sprung auf 0x4010f7,
+  // waehrend der Befehl bei 0x4010f6 beginnt.
+  fn xt_BRI12(m: int64, as_: int64, weite: int64) {
+    var im12: int64 := (weite - 1) & 0xFFF;
+    self.xt_e3((m << 4) | 6, ((im12 & 0xF) << 4) | as_, (im12 >> 4) & 0xFF);
   }
   fn xt_BEQZ(as_: int64, imm12: int64) { self.xt_BRI12(1,  as_, imm12); }
   fn xt_BNEZ(as_: int64, imm12: int64) { self.xt_BRI12(5,  as_, imm12); }
@@ -291,20 +322,27 @@ pub type EmitXtensa = class {
         if labelId < 1024 { target := peek64(self.labelAddrs + labelId * 8); }
       }
       if target >= 0 {
-        if ptype == XT_PATCH_CALL0 || ptype == XT_PATCH_J {
-          var op0: int64 := 5;
-          if ptype == XT_PATCH_J { op0 := 6; }
-          var aligned: int64 := (codeOff + 4) & -4;
-          var off18: int64 := (target - aligned) >> 2;
-          self.xt_poke3(codeOff, ((off18 & 3) << 6) | op0, (off18 >> 2) & 0xFF, (off18 >> 10) & 0xFF);
+        if ptype == XT_PATCH_CALL0 {
+          // #1786: CALL0 zaehlt in WORTEN und rechnet ab (PC & ~3) + 4 — nicht
+          // ab (PC + 4) & ~3. Weil ein Xtensa-Befehl drei Byte lang ist, steht
+          // der Zaehler meistens SCHIEF, und dann sind die beiden Ausdruecke
+          // verschieden. Gegengelesen: off18 = 4 landet 16 Byte weiter.
+          var alignedC: int64 := (codeOff & -4) + 4;
+          var off18C:   int64 := (target - alignedC) >> 2;
+          self.xt_poke3(codeOff, ((off18C & 3) << 6) | 5, (off18C >> 2) & 0xFF, (off18C >> 10) & 0xFF);
+        } else if ptype == XT_PATCH_J {
+          // #1786: J zaehlt dagegen in BYTE und rechnet ab PC + 4.
+          var off18J: int64 := target - (codeOff + 4);
+          self.xt_poke3(codeOff, ((off18J & 3) << 6) | 6, (off18J >> 2) & 0xFF, (off18J >> 10) & 0xFF);
         } else {
-          // BRI12: extract original register from placeholder byte[1] lower nibble
+          // BRI12: das Register steckt im unteren Nibble des Platzhalters.
+          // #1786: op0 ist 6, und das Ziel liegt bei PC + 4.
           var orig_b1: int64 := peek8(self.codeBuf + codeOff + 1);
           var as_: int64 := orig_b1 & 0xF;
-          var im12: int64 := (target - (codeOff + 3)) & 0xFFF;
+          var im12: int64 := (target - (codeOff + 4)) & 0xFFF;
           var m: int64 := 1;
           if ptype == XT_PATCH_BNEZ { m := 5; }
-          self.xt_poke3(codeOff, (m << 4) | 7, ((im12 & 0xF) << 4) | as_, (im12 >> 4) & 0xFF);
+          self.xt_poke3(codeOff, (m << 4) | 6, ((im12 & 0xF) << 4) | as_, (im12 >> 4) & 0xFF);
         }
       }
       i := i + 1;
@@ -642,14 +680,13 @@ pub type EmitXtensa = class {
   // Placed here (after BRI12 etc.) so forward-ref issues are avoided.
   // --------------------------------------------------------------------------
 
+  // #1786: dieselbe vertauschte RRI8-Form wie oben. r = 0 fuer L8UI, 4 fuer S8I.
   fn xt_L8UI(ar: int64, as_: int64, off: int64) {
-    var im: int64 := off & 0xFF;
-    self.xt_e3((ar << 4) | 2, ((im & 0xF) << 4) | as_, im >> 4);
+    self.xt_RRI8(0x0, ar, as_, off);
   }
 
   fn xt_S8I(at: int64, as_: int64, off: int64) {
-    var im: int64 := off & 0xFF;
-    self.xt_e3((at << 4) | 2, ((im & 0xF) << 4) | as_, 0x40 | (im >> 4));
+    self.xt_RRI8(0x4, at, as_, off);
   }
 
   // --------------------------------------------------------------------------
