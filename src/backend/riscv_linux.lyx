@@ -45,10 +45,16 @@ con RV_T2:   int64 := 7;
 // Linux RISC-V syscall numbers
 con RV_SYS_EXIT:   int64 := 93;
 con RV_SYS_WRITE:  int64 := 64;
+con RV_SYS_READ:   int64 := 63;   // #1740: riscv64 zaehlt anders als x86-64 (dort 0)
 con RV_SYS_MMAP:   int64 := 222;
 con RV_SYS_MUNMAP: int64 := 215;
 con RV_SYS_OPEN:   int64 := 56;
 con RV_SYS_CLOSE:  int64 := 57;
+
+// #1740: Laenge des _start-Rumpfs (RiscvLinuxBackend.rlb_emitStart). Der Rumpf
+// wird VOR den Code kopiert; der Datenbereich muss deshalb um genau diese
+// Laenge versetzt auf eine Seitengrenze fallen.
+con RV_START_STUB_LEN: int64 := 12;
 
 // Branch patch types
 con RV_PATCH_J:   int64 := 0;   // JAL x0, label  (unconditional)
@@ -68,10 +74,18 @@ pub type EmitRISCV64 = class {
   stackSize:  int64;
   labelAddrs: int64;   // labelId → code offset  (1024 × 8 bytes)
   labelCount: int64;
-  patchBuf:   int64;   // {codeOff,labelId,type,reg} × 1024  (1024 × 32 bytes)
+  patchBuf:   int64;   // {codeOff,labelId,type,reg} je 32 Bytes, waechst (#1740)
   patchCount: int64;
+  patchCap:   int64;   // #1740: Kapazitaet in Eintraegen
   funcAddrs:  int64;   // funcId → start offset  (256 × 8 bytes)
   funcCount:  int64;
+  // #1740: globale Variablen. Der Zugriff entsteht PC-relativ (AUIPC+ADDI) und
+  // wird aufgeloest, sobald der Datenbereich hinter dem Code steht.
+  globRelocBuf:   int64;   // {codeOff, globalIdx} je 16 Bytes
+  globRelocCount: int64;
+  globRelocCap:   int64;
+  globalsOff:     int64;   // Code-Offset des Datenbereichs (-1 = noch nicht gesetzt)
+  mainOff:        int64;   // #1740: Code-Offset von main (-1 = nicht gefunden)
 
   // --------------------------------------------------------------------------
   // Code emission primitives
@@ -344,15 +358,28 @@ pub type EmitRISCV64 = class {
   // Patch management
   // --------------------------------------------------------------------------
 
+  // #1740: Die Liste wuchs frueher nicht — jenseits von 1024 Eintraegen fiel
+  // jeder weitere Patch still weg und der zugehoerige Sprung blieb auf seinem
+  // Platzhalter stehen. Seit die Aufruf-Patches ueber alle Funktionen hinweg
+  // stehenbleiben (siehe emitFunc), ist die Grenze schnell erreicht.
   fn addPatch(codeOff: int64, labelId: int64, ptype: int64, reg: int64) {
-    if self.patchCount < 1024 {
-      var base: int64 := self.patchBuf + self.patchCount * 32;
-      poke64(base,      codeOff);
-      poke64(base + 8,  labelId);
-      poke64(base + 16, ptype);
-      poke64(base + 24, reg);
-      self.patchCount := self.patchCount + 1;
+    if self.patchCount >= self.patchCap {
+      var nc: int64 := self.patchCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      var ci: int64 := 0;
+      while ci < self.patchCount * 4 {
+        poke64(nb + ci * 8, peek64(self.patchBuf + ci * 8));
+        ci := ci + 1;
+      }
+      self.patchBuf := nb;
+      self.patchCap := nc;
     }
+    var base: int64 := self.patchBuf + self.patchCount * 32;
+    poke64(base,      codeOff);
+    poke64(base + 8,  labelId);
+    poke64(base + 16, ptype);
+    poke64(base + 24, reg);
+    self.patchCount := self.patchCount + 1;
   }
 
   fn applyPatches() {
@@ -362,9 +389,21 @@ pub type EmitRISCV64 = class {
       var codeOff: int64 := peek64(base);
       var labelId: int64 := peek64(base + 8);
       var ptype:   int64 := peek64(base + 16);
+      // #1740: -2 heisst „schon gepatcht" — der Durchlauf am Ende von emit()
+      // sieht dieselbe Liste noch einmal.
+      if labelId != -2 {
       var target:  int64 := -1;
       if ptype == RV_PATCH_BL {
-        if labelId < 256 { target := peek64(self.funcAddrs + labelId * 8); }
+        // #1740: funcAddrs kommt aus alloc und ist null. Ein Ziel 0 ist nur
+        // fuer die ZUERST erzeugte Funktion echt; fuer jede andere heisst es
+        // „noch nicht erzeugt". Vorher wurde jeder Vorwaertsaufruf auf
+        // Code-Offset 0 gepatcht und sprang damit in die erste Funktion —
+        // aus `alloc(64)` wurde ein Selbstaufruf von main bis zum
+        // Stapelueberlauf (#1740).
+        if labelId < 256 {
+          target := peek64(self.funcAddrs + labelId * 8);
+          if target == 0 { if labelId != 0 { target := -1; } }
+        }
       } else {
         if labelId < 1024 { target := peek64(self.labelAddrs + labelId * 8); }
       }
@@ -378,6 +417,8 @@ pub type EmitRISCV64 = class {
         } else if ptype == RV_PATCH_BNE {
           self.rv_poke32at(codeOff, self.rv_buildBtype(1, RV_T0, RV_ZERO, delta));
         }
+        poke64(base + 8, -2);
+      }
       }
       i := i + 1;
     }
@@ -536,12 +577,22 @@ pub type EmitRISCV64 = class {
     if op == IRO_LOAD_LOCAL || op == IRO_STORE_LOCAL {
       self.rv_loadSlot(src1); self.rv_storeSlot(dest);
     }
+    // #1740: src1 bzw. src2 tragen einen globalIdx, KEINE Adresse. riscv lud
+    // ihn bis hierher als Zahl in ein Register und griff darauf zu — der
+    // Zugriff auf die erste globale Variable landete also auf Adresse 0, der
+    // auf die zweite auf 8. Genau daran starb `alloc`, dessen Zustand in
+    // globalen Variablen steht. Jetzt zeigt AUIPC+ADDI PC-relativ in den
+    // Datenbereich hinter dem Code; die Distanz traegt applyGlobalRelocs nach.
     if op == IRO_LOAD_GLOBAL {
-      self.rv_LI64(RV_T2, src1);
+      self.emitGlobalAddr(src1);
       self.rv_LD(RV_T0, RV_T2, 0); self.rv_storeSlot(dest);
     }
+    // ir_lower legt bei STORE_GLOBAL den globalIdx ins DEST-Feld und den Slot
+    // mit dem Wert nach src1 (irAddInstrDirect(op, gIdx, valTemp, -1, 0)).
+    // riscv las den Index aus src2 — dort steht -1, geschrieben wurde also
+    // acht Byte VOR den Datenbereich, mitten in den Code (#1740).
     if op == IRO_STORE_GLOBAL {
-      self.rv_LI64(RV_T2, src2);
+      self.emitGlobalAddr(dest);
       self.rv_loadSlot(src1);
       self.rv_SD(RV_T0, RV_T2, 0);
     }
@@ -560,10 +611,16 @@ pub type EmitRISCV64 = class {
 
     // --- Function calls ---
     if op == IRO_CALL {
+      // #1740: Die Argumente liegen im reservierten Block ab src2 (argBase),
+      // nicht in den Slots 0..N-1 — die gehoeren den Locals des Aufrufers.
+      // riscv las sie bis hierher aus Slot 0 und uebergab damit irgendeinen
+      // fremden Wert; arm64 und lyxos rechnen laengst ab argBase.
       var argCount: int64 := imm;
+      var argBase:  int64 := src2;
+      if argBase < 0 { argBase := 0; }
       var ai: int64 := 0;
       while ai < argCount && ai < 8 {
-        self.rv_loadSlot(ai);
+        self.rv_loadSlot(argBase + ai);
         self.rv_MV(RV_A0 + ai, RV_T0);
         ai := ai + 1;
       }
@@ -744,14 +801,14 @@ pub type EmitRISCV64 = class {
       self.rv_LI(RV_A7, RV_SYS_WRITE);
       self.rv_ECALL();
     } else if id == 2 || id == 3 {
-      // exit(code)
-      self.rv_LD(RV_A0, RV_FP, self.slotOff(0));
+      // exit(code)  — #1740: Code steht im Argumentblock, nicht in Slot 0.
+      self.rv_LD(RV_A0, RV_FP, self.slotOff(sBase));
       self.rv_LI(RV_A7, RV_SYS_EXIT);
       self.rv_ECALL();
     } else if id == 13 {
       // #1388: EPrintStr — write(2, buf, strlen(buf)); die Laenge rechnet der
       // Code selbst aus (die Konvention reicht nur einen Sentinel durch).
-      self.rv_LD(RV_A1, RV_FP, self.slotOff(0));   // a1 = buf
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));   // a1 = buf (#1740)
       self.rv_LI(RV_A2, 0);                        // a2 = Laenge
       var epLoop: int64 := self.codeLen;
       self.rv_ADD(RV_T1, RV_A1, RV_A2);
@@ -765,7 +822,7 @@ pub type EmitRISCV64 = class {
       self.rv_ECALL();
     } else if id == 15 {
       // #1388: StrLen — Zeichen bis zur Null zaehlen, Ergebnis nach a0.
-      self.rv_LD(RV_A1, RV_FP, self.slotOff(0));   // a1 = buf
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));   // a1 = buf (#1740)
       self.rv_LI(RV_A0, 0);
       var slLoop: int64 := self.codeLen;
       self.rv_ADD(RV_T1, RV_A1, RV_A0);
@@ -872,10 +929,27 @@ pub type EmitRISCV64 = class {
       self.rv_ADD(RV_A1, RV_A1, RV_A2);
       self.rv_SB(RV_T1, RV_A1, 0);
       self.rv_LI(RV_A0, 0);
+    } else if id == 222 || id == 223 {
+      // #1740: read(fd, buf, len) / write(fd, buf, len). Ohne sie scheiterte
+      // schon `PrintLn` — laut immerhin, aber eben ohne Ausgabe. Die drei
+      // Argumente stehen ab argBase (ir_lower legt sie dort ab), das Ergebnis
+      // kommt wie ueberall ueber a0 zurueck. `open` bleibt bewusst offen: auf
+      // riscv64 gibt es nur openat(56) mit vier Argumenten, das braucht eine
+      // eigene Umsetzung statt einer geratenen Nummer.
+      self.rv_LD(RV_A0, RV_FP, self.slotOff(sBase));
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase + 1));
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 2));
+      if (id == 222) { self.rv_LI(RV_A7, RV_SYS_READ); }
+      if (id == 223) { self.rv_LI(RV_A7, RV_SYS_WRITE); }
+      self.rv_ECALL();
     } else if id == 203 || id == 209 || id == 204 || id == 205 {
-      // #1388: poke8/16/32/64 — Adresse aus Slot 0, Wert aus Slot 1.
-      self.rv_LD(RV_A1, RV_FP, self.slotOff(0));
-      self.rv_LD(RV_A2, RV_FP, self.slotOff(1));
+      // #1388: poke8/16/32/64 — Adresse und Wert stehen im Argumentblock.
+      // #1740: Hier standen weiterhin die festen Slots 0 und 1, obwohl der
+      // Kommentar am Kopf dieser Methode genau davor warnt und der peek-Zweig
+      // daneben laengst ab argBase liest. poke64 schrieb damit auf die Adresse
+      // aus einem fremden Slot — bei `poke64(alloc(64), x)` auf die 0.
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
+      self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1));
       if (id == 203) { self.rv_SB(RV_A2, RV_A1, 0); }
       if (id == 209) { self.rv_SH(RV_A2, RV_A1, 0); }
       if (id == 204) { self.rv_SW(RV_A2, RV_A1, 0); }
@@ -910,13 +984,32 @@ pub type EmitRISCV64 = class {
       poke64(self.funcAddrs + funcId * 8, self.codeLen);
       self.funcCount := self.funcCount + 1;
     }
+    // #1740: Anfang von main merken. Der _start-Rumpf sprang fest auf die
+    // ZUERST erzeugte Funktion; stand main nicht an erster Stelle, lief das
+    // Programm in eine fremde Funktion und lieferte deren Wert.
+    if self.isMainFunc(funcId) != 0 { self.mainOff := self.codeLen; }
     self.stackSize  := 0;
     self.labelCount := 0;
-    self.patchCount := 0;
+    // #1740: patchCount wird NICHT zurueckgesetzt. Aufruf-Patches muessen die
+    // Funktion ueberleben, sonst kann der Durchlauf am Ende von emit() die
+    // Vorwaertsaufrufe nicht mehr aufloesen. Aufgeloeste Eintraege sind mit
+    // labelId = -2 markiert und werden uebersprungen.
     var li: int64 := 0;
     while li < 1024 { poke64(self.labelAddrs + li * 8, -1); li := li + 1; }
     self.calcStackFrame(funcId);
     self.emitPrologue();
+    // #1740: eingehende Argumentregister a0..a7 in die Param-Slots spillen.
+    // Ohne das las ein LOAD_LOCAL eines Parameters uninitialisierten Stapel —
+    // `alloc(size)` bekam seine Groesse also nie zu sehen. Die Parameter
+    // liegen hinter dem Kratzstreifen (IR_BARG_SLOTS), wie bei arm64 (#1388).
+    var pSpillCount: int64 := peek64(peek64(self.ir + 80) + funcId * 80 + 40);
+    var pSpillI: int64 := 0;
+    while pSpillI < pSpillCount {
+      if pSpillI < 8 {
+        self.rv_SD(RV_A0 + pSpillI, RV_FP, self.slotOff(IR_BARG_SLOTS + pSpillI));
+      }
+      pSpillI := pSpillI + 1;
+    }
     var instrStart: int64 := self.getFuncInstrStart(funcId);
     var instrCount: int64 := self.getFuncInstrCount(funcId);
     var i: int64 := 0;
@@ -938,15 +1031,26 @@ pub type EmitRISCV64 = class {
     self.labelAddrs := alloc(1024 * 8);
     self.labelCount := 0;
     self.patchBuf   := alloc(1024 * 32);
+    self.patchCap   := 1024;
     self.patchCount := 0;
     self.funcAddrs  := alloc(256 * 8);
     self.funcCount  := 0;
+    self.globRelocBuf   := alloc(256 * 16);
+    self.globRelocCap   := 256;
+    self.globRelocCount := 0;
+    self.globalsOff     := -1;
+    self.mainOff        := -1;
   }
 
   pub fn emit(): int64 {
     var n: int64 := self.getFuncCount();
     var i: int64 := 0;
     while i < n { self.emitFunc(i); i := i + 1; }
+    // #1740: jetzt steht jede Funktionsadresse fest — offene Vorwaertsaufrufe
+    // aufloesen.
+    self.applyPatches();
+    self.emitGlobalsPool();
+    self.applyGlobalRelocs();
     return self.codeLen;
   }
 
@@ -992,6 +1096,101 @@ pub type EmitRISCV64 = class {
   fn getInstrSrc1(absIdx: int64): int64  { return self.getInstrField(absIdx, 16); }
   fn getInstrSrc2(absIdx: int64): int64  { return self.getInstrField(absIdx, 24); }
   fn getInstrImmInt(absIdx: int64): int64 { return self.getInstrField(absIdx, 40); }
+
+  // --------------------------------------------------------------------------
+  // #1740: globale Variablen
+  //
+  // Die Methoden stehen am ENDE der Klasse: neue Eintraege weiter oben wuerden
+  // die VMT verschieben und den Seed brechen (dieselbe Falle wie im
+  // lyxos-Backend).
+  // --------------------------------------------------------------------------
+
+  // t2 := Adresse von global[gIdx]  —  AUIPC t2, 0 / ADDI t2, t2, 0, beide
+  // Haelften spaeter von applyGlobalRelocs nachgetragen.
+  fn emitGlobalAddr(gIdx: int64) {
+    self.recordGlobalReloc(self.codeLen, gIdx);
+    self.rv_e32(0x17 | (RV_T2 << 7));                 // AUIPC t2, 0
+    self.rv_ADDI(RV_T2, RV_T2, 0);                     // ADDI  t2, t2, 0
+  }
+
+  fn recordGlobalReloc(codeOff: int64, gIdx: int64) {
+    if self.globRelocCount >= self.globRelocCap {
+      var nc: int64 := self.globRelocCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      var ci: int64 := 0;
+      while ci < self.globRelocCount * 2 {
+        poke64(nb + ci * 8, peek64(self.globRelocBuf + ci * 8));
+        ci := ci + 1;
+      }
+      self.globRelocBuf := nb;
+      self.globRelocCap := nc;
+    }
+    var rec: int64 := self.globRelocBuf + self.globRelocCount * 16;
+    poke64(rec + 0, codeOff);
+    poke64(rec + 8, gIdx);
+    self.globRelocCount := self.globRelocCount + 1;
+  }
+
+  // Haengt den Datenbereich hinter den Code: acht Byte je globaler Variable,
+  // vorbelegt mit ihrem Initialwert. Davor wird so weit aufgefuellt, dass der
+  // Bereich im fertigen Abbild auf einer Seitengrenze beginnt — nur dann
+  // koennen Code (r-x) und Daten (rw-) getrennte Segmente werden.
+  fn emitGlobalsPool() {
+    while ((self.codeLen + RV_START_STUB_LEN) % 4096) != 0 { self.rv_e8(0); }
+    self.globalsOff := self.codeLen;
+    var gCount: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALLEN);
+    var gBuf:   int64 := peek64(self.ir + IR_MOD_OFF_GLOBALBUF);
+    var gi: int64 := 0;
+    while gi < gCount {
+      var v: int64 := 0;
+      if gBuf != 0 { v := peek64(gBuf + gi * 8); }
+      self.rv_e32(v & 0xFFFFFFFF);
+      self.rv_e32((v >> 32) & 0xFFFFFFFF);
+      gi := gi + 1;
+    }
+  }
+
+  // AUIPC traegt die oberen 20 Bit, ADDI die unteren 12 — und weil ADDI sein
+  // Immediate vorzeichenbehaftet addiert, muss der obere Teil aufgerundet
+  // werden, sobald Bit 11 gesetzt ist.
+  fn applyGlobalRelocs() {
+    var i: int64 := 0;
+    while i < self.globRelocCount {
+      var rec:     int64 := self.globRelocBuf + i * 16;
+      var codeOff: int64 := peek64(rec + 0);
+      var gIdx:    int64 := peek64(rec + 8);
+      var target:  int64 := self.globalsOff + gIdx * 8;
+      var delta:   int64 := target - codeOff;
+      var hi:      int64 := (delta + 0x800) >> 12;
+      var lo:      int64 := delta - (hi << 12);
+      self.rv_poke32at(codeOff, 0x17 | (RV_T2 << 7) | ((hi & 0xFFFFF) << 12));
+      self.rv_poke32at(codeOff + 4, 0x13 | (RV_T2 << 7) | (RV_T2 << 15) | ((lo & 0xFFF) << 20));
+      i := i + 1;
+    }
+  }
+
+  // Code-Offset des Datenbereichs — der ELF-Schreiber trennt daran die
+  // Segmente. -1, solange emit() nicht gelaufen ist.
+  pub fn getGlobalsOff(): int64 { return self.globalsOff; }
+
+  // #1740: heisst die Funktion "main"? Der Name steht als Offset in den
+  // String-Pool des IR-Moduls (Feldpaar nameOff/nameLen im Funktionssatz).
+  fn isMainFunc(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    var rec:     int64 := funcBuf + funcId * IR_FUNC_SIZE;
+    var nameLen: int64 := peek64(rec + IR_FUNC_OFF_NAMELEN);
+    if nameLen != 4 { return 0; }
+    var strBufR: int64 := peek64(self.ir + 32);
+    var p:       int64 := strBufR + peek64(rec + 0);
+    if peek8(p + 0) != 109 { return 0; }   // 'm'
+    if peek8(p + 1) != 97  { return 0; }   // 'a'
+    if peek8(p + 2) != 105 { return 0; }   // 'i'
+    if peek8(p + 3) != 110 { return 0; }   // 'n'
+    return 1;
+  }
+
+  // Code-Offset von main; -1, wenn das Modul keines hat.
+  pub fn getMainOff(): int64 { return self.mainOff; }
 };
 
 // ============================================================================
@@ -1002,6 +1201,8 @@ pub type RiscvLinuxBackend = class {
   code:    int64;
   codeLen: int64;
   codeCap: int64;
+  dataOff: int64;   // #1740: Offset des Datenbereichs in self.code (0 = keiner)
+  mainOff: int64;   // #1740: Code-Offset von main (0 = erste Funktion)
 
   fn rlb_ce8(v: int64) {
     poke8(self.code + self.codeLen, v & 0xFF);
@@ -1016,11 +1217,19 @@ pub type RiscvLinuxBackend = class {
   }
 
   // _start stub (12 bytes):
-  //   JAL ra, 12          = 0x00C000EF  (call main at offset 12)
+  //   JAL ra, RV_START_STUB_LEN + mainOff   (call main)
   //   ADDI a7, x0, 93     = 0x05D00893  (exit syscall)
   //   ECALL               = 0x00000073
-  fn rlb_emitStart() {
-    self.rlb_ce32(0x00C000EF);  // JAL ra, 12
+  //
+  // #1740: Der Sprung ging fest auf Offset 12, also auf die zuerst erzeugte
+  // Funktion. Das ist nur dann main, wenn main auch als erste dasteht.
+  fn rlb_emitStart(mainOff: int64) {
+    var off: int64 := RV_START_STUB_LEN + mainOff;
+    var b20:    int64 := (off >> 20) & 0x1;
+    var b10_1:  int64 := (off >> 1)  & 0x3FF;
+    var b11:    int64 := (off >> 11) & 0x1;
+    var b19_12: int64 := (off >> 12) & 0xFF;
+    self.rlb_ce32(0xEF | (b19_12 << 12) | (b11 << 20) | (b10_1 << 21) | (b20 << 31));
     self.rlb_ce32(0x05D00893);  // ADDI a7, x0, 93
     self.rlb_ce32(0x00000073);  // ECALL
   }
@@ -1029,10 +1238,12 @@ pub type RiscvLinuxBackend = class {
     self.codeCap := 65536;
     self.code    := alloc(self.codeCap);
     self.codeLen := 0;
+    self.dataOff := 0;
+    self.mainOff := 0;
   }
 
   pub fn Build(irBuf: int64, irLen: int64) {
-    self.rlb_emitStart();
+    self.rlb_emitStart(self.mainOff);
     var i: int64 := 0;
     while i < irLen { self.rlb_ce8(peek8(irBuf + i)); i := i + 1; }
   }
@@ -1043,6 +1254,14 @@ pub type RiscvLinuxBackend = class {
     var codeFileOffset: int64 := 4096;
     var codeSize:       int64 := self.codeLen;
     var elfSize:        int64 := codeFileOffset + codeSize;
+    // #1740: Grenze zwischen Code (r-x) und Daten (rw-). dataOff zaehlt ab
+    // self.code, also einschliesslich _start-Rumpf; der Emitter hat davor so
+    // weit aufgefuellt, dass die Grenze auf einer Seite liegt.
+    var dataStart: int64 := self.dataOff;
+    var dataSize:  int64 := 0;
+    if dataStart > 0 { dataSize := codeSize - dataStart; }
+    var phnum: int64 := 1;
+    if dataSize > 0 { phnum := 2; }
 
     var elfBuf: int64 := alloc(elfSize);
     if elfBuf == -1 { return; }
@@ -1073,22 +1292,47 @@ pub type RiscvLinuxBackend = class {
     poke32(elfBuf + 48, 0x05);       // e_flags: EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE
     poke16(elfBuf + 52, 64);         // e_ehsize
     poke16(elfBuf + 54, 56);         // e_phentsize
-    poke16(elfBuf + 56, 1);          // e_phnum
+    poke16(elfBuf + 56, phnum);      // e_phnum (#1740: 2 mit Datensegment)
     poke16(elfBuf + 58, 64);         // e_shentsize
     poke16(elfBuf + 60, 0);          // e_shnum
     poke16(elfBuf + 62, 0);          // e_shstrndx
 
     // PT_LOAD segment header (56 bytes at offset 64)
+    // #1740: Ohne Datenbereich laedt wie bisher ein einziges r-x-Segment die
+    // ganze Datei. Mit Datenbereich wird bei dataStart getrennt, damit die
+    // globalen Variablen beschreibbar sind, ohne dass der Code es wird.
+    var codeSegSize: int64 := elfSize;
+    if dataSize > 0 { codeSegSize := codeFileOffset + dataStart; }
     poke32(elfBuf + 64, 1);              // p_type: PT_LOAD
     poke32(elfBuf + 68, 5);             // p_flags: PF_R | PF_X
     poke64(elfBuf + 72, 0);             // p_offset: 0 (load whole file)
     poke64(elfBuf + 80, 0x400000);      // p_vaddr
     poke64(elfBuf + 88, 0x400000);      // p_paddr
-    poke64(elfBuf + 96, elfSize);       // p_filesz
-    poke64(elfBuf + 104, elfSize);      // p_memsz
+    poke64(elfBuf + 96, codeSegSize);   // p_filesz
+    poke64(elfBuf + 104, codeSegSize);  // p_memsz
     poke64(elfBuf + 112, 0x1000);       // p_align: 4096
+
+    if dataSize > 0 {
+      var dOff: int64 := codeFileOffset + dataStart;
+      poke32(elfBuf + 120, 1);                    // p_type: PT_LOAD
+      poke32(elfBuf + 124, 6);                    // p_flags: PF_R | PF_W
+      poke64(elfBuf + 128, dOff);                 // p_offset
+      poke64(elfBuf + 136, 0x400000 + dOff);      // p_vaddr
+      poke64(elfBuf + 144, 0x400000 + dOff);      // p_paddr
+      poke64(elfBuf + 152, dataSize);             // p_filesz
+      poke64(elfBuf + 160, dataSize);             // p_memsz
+      poke64(elfBuf + 168, 0x1000);               // p_align
+    }
 
     EmitWriteFile(path, elfBuf, elfSize);   // #1682
     free(elfBuf, elfSize);
   }
+
+  // #1740: Offset des Datenbereichs (ab self.code, also mit _start-Rumpf).
+  // Steht am Klassenende, damit die VMT sich nicht verschiebt.
+  pub fn SetDataOff(off: int64) { self.dataOff := off; }
+
+  // #1740: Code-Offset von main. Muss VOR Build gesetzt werden — der
+  // _start-Rumpf entsteht dort.
+  pub fn SetMainOff(off: int64) { self.mainOff := off; }
 };
