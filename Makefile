@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.9L
+VERSION   := 1.1.9M
 VERSION_DATE := 2026-08-25
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -302,6 +302,8 @@ test: lyxc
 	@bash tests/arm64_laufzeit_test.sh
 	@echo "--- Cortex-M: Abbild starten und ueber Semihosting ausgeben (#1744) ---"
 	@bash tests/arm_cm_laufzeit_test.sh
+	@echo "--- xtensa: Erzeugnisse ausfuehren (#1786) ---"
+	@bash tests/xtensa_laufzeit_test.sh
 	@bash tests/compile_unit_codegen_test.sh
 	@bash tests/skalierung_z2b_test.sh
 	@bash tests/lfd_grammatik_test.sh
