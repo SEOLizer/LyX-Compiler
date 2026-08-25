@@ -70,6 +70,7 @@ pub type EmitXtensa = class {
   patchBuf:   int64;
   patchCount: int64;
   funcAddrs:  int64;
+  xtMainOff:  int64;   // #1782: Code-Offset von main (-1 = nicht gefunden)
   funcCount:  int64;
 
   // WP-D3: offsets of helper subroutines in codeBuf (prepended before user code)
@@ -316,8 +317,18 @@ pub type EmitXtensa = class {
       var labelId: int64 := peek64(base + 8);
       var ptype:   int64 := peek64(base + 16);
       var target:  int64 := -1;
+      // #1782: -2 heisst „schon gepatcht" — der Schlussdurchlauf in emit()
+      // sieht dieselbe Liste noch einmal.
+      if labelId != -2 {
       if ptype == XT_PATCH_CALL0 {
-        if labelId < 256 { target := peek64(self.funcAddrs + labelId * 8); }
+        // #1782: funcAddrs kommt aus alloc und ist null. Ein Ziel 0 ist nur
+        // fuer die ZUERST erzeugte Funktion echt; sonst heisst es „noch nicht
+        // erzeugt". Hier stehen ausserdem Hilfsroutinen vor dem Nutzercode,
+        // Offset 0 gehoert also ohnehin keiner Funktion.
+        if labelId < 256 {
+          target := peek64(self.funcAddrs + labelId * 8);
+          if target == 0 { target := -1; }
+        }
       } else {
         if labelId < 1024 { target := peek64(self.labelAddrs + labelId * 8); }
       }
@@ -344,6 +355,8 @@ pub type EmitXtensa = class {
           if ptype == XT_PATCH_BNEZ { m := 5; }
           self.xt_poke3(codeOff, (m << 4) | 6, ((im12 & 0xF) << 4) | as_, (im12 >> 4) & 0xFF);
         }
+        poke64(base + 8, -2);   // #1782: aufgeloest
+      }
       }
       i := i + 1;
     }
@@ -525,16 +538,30 @@ pub type EmitXtensa = class {
     if op == IRO_LOAD_LOCAL || op == IRO_STORE_LOCAL {
       self.xt_loadSlot(src1); self.xt_storeSlot(dest);
     }
-    if op == IRO_LOAD_GLOBAL {
-      // Stub: 32-bit absolute addressing not implemented
-      self.xt_MOVI(XT_T0, 0); self.xt_storeSlot(dest);
+    // #1782: Hier standen zwei stille Stummel — Lesen lieferte 0, Schreiben tat
+    // gar nichts, beides ohne ein Wort. Ein Programm mit globalen Variablen
+    // rechnete damit stillschweigend falsch.
+    //
+    // Die Adressierung ist auf diesem Ziel eine eigene Frage: xtensa erreicht
+    // eine feste Adresse nur ueber einen L32R-Literal-Pool, und der muss VOR
+    // dem Befehl liegen (#1786). Solange die Bauform nicht steht, wird die
+    // Luecke gemeldet statt geraten.
+    if op == IRO_LOAD_GLOBAL || op == IRO_STORE_GLOBAL {
+      EPrintStrLn("error: xtensa: globale Variablen sind nicht umgesetzt (#1782)."c);
+      EPrintStrLn("  Sie brauchen eine feste Adresse, und die erreicht xtensa nur ueber"c);
+      EPrintStrLn("  einen L32R-Literal-Pool — der steht mit #1786 noch aus."c);
+      EPrintStrLn("  Bis 1.1.9M lieferte diese Stelle still 0 bzw. tat nichts."c);
+      exit(1);
     }
-    if op == IRO_STORE_GLOBAL { }  // no-op stub
 
     // --- Struct field access ---
+    // #1782: Der Feld-Offset steht bei LOAD_FIELD in src2 und bei STORE_FIELD
+    // im DEST-Feld — nicht in imm. ir_lower erzeugt (dest, src1 = Basis,
+    // src2 = Offset) bzw. (dest = Offset, src1 = Wert, src2 = Basis), so wie
+    // lyxos, arm64 und riscv es lesen. Aus imm kam hier immer 0.
     if op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP {
       self.xt_loadSlot(src1);
-      var woff: int64 := imm >> 2;
+      var woff: int64 := src2 >> 2;
       if woff >= 0 && woff <= 255 {
         self.xt_L32I(XT_T0, XT_T0, woff);
       } else {
@@ -546,7 +573,7 @@ pub type EmitXtensa = class {
       self.xt_loadSlot2(src2);              // T1 = base pointer
       self.xt_MOV(XT_T2, XT_T1);           // T2 = base (preserved across loadSlot)
       self.xt_loadSlot(src1);               // T0 = value
-      var woff: int64 := imm >> 2;
+      var woff: int64 := dest >> 2;
       if woff >= 0 && woff <= 255 {
         self.xt_S32I(XT_T0, XT_T2, woff);
       }
@@ -554,11 +581,31 @@ pub type EmitXtensa = class {
 
     // --- Function calls (CALL0: a2-a5 for args 0-3) ---
     if op == IRO_CALL {
+      // #1782: Die Argumente liegen im reservierten Block ab src2 (argBase),
+      // nicht in den Slots 0..N-1 — die gehoeren den Locals des Aufrufers.
+      // xtensa las sie bis hierher aus Slot 0 und uebergab damit irgendeinen
+      // fremden Wert; arm64, lyxos, riscv und arm-cm rechnen laengst ab
+      // argBase.
+      //
+      // Die CALL0-Konvention haelt sechs Argumente in a2..a7. Mehr davon
+      // gingen ueber den Stapel; bis das umgesetzt ist, wird es GEMELDET
+      // statt still verworfen (`while ai < 4` war genau so ein stiller
+      // Verlust, vgl. #1761 auf lyxos).
       var argCount: int64 := imm;
+      var argBase:  int64 := src2;
+      if argBase < 0 { argBase := 0; }
+      if argCount > 6 {
+        EPrintStr("error: xtensa: Aufruf mit "c);
+        EPrintInt(argCount);
+        EPrintStrLn(" Argumenten — mehr als sechs gehen ueber den Stapel (#1782)."c);
+        EPrintStrLn("  Der Stapelweg ist auf diesem Ziel noch nicht umgesetzt; bis dahin"c);
+        EPrintStrLn("  wird das gemeldet statt die ueberzaehligen still zu verwerfen."c);
+        exit(1);
+      }
       var ai: int64 := 0;
-      while ai < argCount && ai < 4 {
-        self.xt_loadSlot(ai);
-        self.xt_MOV(XT_RV + ai, XT_T0);   // move to a2..a5
+      while ai < argCount && ai < 6 {
+        self.xt_loadSlot(argBase + ai);
+        self.xt_MOV(XT_RV + ai, XT_T0);   // a2..a7
         ai := ai + 1;
       }
       var patchOff: int64 := self.codeLen;
@@ -814,12 +861,33 @@ pub type EmitXtensa = class {
       poke64(self.funcAddrs + funcId * 8, self.codeLen);
       self.funcCount := self.funcCount + 1;
     }
+    // #1782: Anfang von main merken. Der Einstiegspunkt im ELF stand auf der
+    // ZUERST erzeugten Funktion (lyxc reichte getFuncAddr(0) durch). Stand main
+    // nicht vorn, startete das Programm in einer fremden Funktion — dieselbe
+    // Falle wie auf riscv (#1740) und Cortex-M (#1765).
+    if self.xtIsMain(funcId) != 0 { self.xtMainOff := self.codeLen; }
     self.stackSize  := 0;
-    self.patchCount := 0;
+    // #1782: patchCount wird NICHT zurueckgesetzt. Aufruf-Patches muessen die
+    // Funktion ueberleben, sonst bleibt ein Vorwaertsaufruf auf seinem
+    // Platzhalter stehen. Aufgeloeste Eintraege sind mit labelId = -2
+    // markiert; der Schlussdurchlauf in emit() holt den Rest.
     var li: int64 := 0;
     while li < 1024 { poke64(self.labelAddrs + li * 8, -1); li := li + 1; }
     self.calcStackFrame(funcId);
     self.emitPrologue();
+    // #1782: eingehende Argumentregister a2..a7 in die Param-Slots spillen.
+    // Ohne das las ein LOAD_LOCAL eines Parameters uninitialisierten Stapel.
+    // Die Parameter liegen hinter dem Kratzstreifen (IR_BARG_SLOTS), wie bei
+    // arm64 (#1388), riscv (#1740) und arm-cm (#1765).
+    var pSpill: int64 := peek64(peek64(self.ir + 80) + funcId * 80 + 40);
+    var pi: int64 := 0;
+    while pi < pSpill {
+      if pi < 6 {
+        self.xt_MOV(XT_T0, XT_RV + pi);
+        self.xt_storeSlot(IR_BARG_SLOTS + pi);
+      }
+      pi := pi + 1;
+    }
     var instrStart: int64 := self.getFuncInstrStart(funcId);
     var instrCount: int64 := self.getFuncInstrCount(funcId);
     var i: int64 := 0;
@@ -833,6 +901,7 @@ pub type EmitXtensa = class {
   // --------------------------------------------------------------------------
 
   pub fn init(irMod: int64) {
+    self.xtMainOff  := 0 - 1;
     self.ir              := irMod;
     self.codeBuf         := alloc(131072);
     self.codeCap         := 131072;
@@ -847,12 +916,33 @@ pub type EmitXtensa = class {
     self.xt_printintOff  := 0;
   }
 
+  // #1782: heisst die Funktion "main"? Der Name steht als Offset im
+  // String-Pool des IR-Moduls.
+  fn xtIsMain(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    var rec:     int64 := funcBuf + funcId * 80;
+    if peek64(rec + 8) != 4 { return 0; }
+    var strBufX: int64 := peek64(self.ir + 32);
+    var p:       int64 := strBufX + peek64(rec + 0);
+    if peek8(p + 0) != 109 { return 0; }
+    if peek8(p + 1) != 97  { return 0; }
+    if peek8(p + 2) != 105 { return 0; }
+    if peek8(p + 3) != 110 { return 0; }
+    return 1;
+  }
+
+  // #1782: Code-Offset von main; -1, wenn das Modul keines hat.
+  pub fn getMainOff(): int64 { return self.xtMainOff; }
+
   pub fn emit(): int64 {
     // WP-D3: prepend PrintStr + PrintInt helper subroutines before user code
     self.xt_emitHelpers();
     var n: int64 := self.getFuncCount();
     var i: int64 := 0;
     while i < n { self.emitFunc(i); i := i + 1; }
+    // #1782: jetzt steht jede Funktionsadresse fest — offene Vorwaertsaufrufe
+    // aufloesen.
+    self.applyPatches();
     return self.codeLen;
   }
 

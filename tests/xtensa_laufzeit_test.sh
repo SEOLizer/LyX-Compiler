@@ -26,8 +26,9 @@
 #     sample_controller) hat sie, ESP32s LX6 dagegen schon. Die Kodierung steht
 #     nach Konstruktion da, nicht nach Ausfuehrung — ein Testfall hier wuerde
 #     nur den fehlenden Kern messen.
-#   * Argumente, globale Variablen, Vorwaertsaufrufe: die Defektkette aus
-#     #1782, noch offen.
+#   * Globale Variablen: sie brauchen eine feste Adresse, und die erreicht
+#     xtensa nur ueber einen L32R-Literal-Pool (#1786). Bis dahin MELDET das
+#     Backend die Luecke, statt wie bisher still 0 zu liefern.
 #   * Zeichenkettenliterale: brauchen einen L32R-Literal-Pool, ebenfalls offen.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -85,6 +86,24 @@ run "ret"          'fn main(): int64 { return 42; }' 42
 # verschiedenen Feldern.
 run "schieben"     'fn main(): int64 { var a: int64 := 5; return (a << 3) + (a >> 1); }' 42
 run "bitweise"     'fn main(): int64 { var a: int64 := 12; var b: int64 := 10; return (a & b) + (a | b) + (a ^ b); }' 28
+
+# ---------------------------------------------------------------------------
+# #1782: die Defektkette. Dieselbe wie auf riscv (#1740) und Cortex-M (#1765).
+# ---------------------------------------------------------------------------
+# Der Einstiegspunkt im ELF stand auf der ZUERST erzeugten Funktion — lyxc
+# reichte getFuncAddr(0) durch. Stand main nicht vorn, startete das Programm
+# in einer fremden Funktion.
+run "main_nicht_zuerst" 'fn vorher(): int64 { return 1; } fn main(): int64 { return 42; }' 42
+# Argumente kamen aus den Slots 0..N-1 statt aus dem Argumentblock, und der
+# Callee spillte seine Argumentregister gar nicht erst.
+run "ein_argument"  'fn f(a: int64): int64 { return a; } fn main(): int64 { return f(42); }' 42
+run "zwei_argumente" 'fn add(a: int64, b: int64): int64 { return a + b; } fn main(): int64 { return add(40, 2); }' 42
+# CALL0 haelt sechs Argumente in a2..a7; der Emitter reichte nur vier durch
+# und verwarf den Rest still.
+run "sechs_argumente" 'fn f(a: int64, b: int64, c: int64, d: int64, e: int64, g: int64): int64 { return a + b + c + d + e + g; } fn main(): int64 { return f(1,2,3,4,5,27); }' 42
+run "rekursion"     'fn zaehl(n: int64): int64 { if n <= 0 { return 0; } return 1 + zaehl(n - 1); } fn main(): int64 { return zaehl(42); }' 42
+# Vorwaertsaufruf: applyPatches lief je Funktion und setzte patchCount zurueck.
+run "vorwaertsaufruf" 'fn main(): int64 { return spaeter(); } fn spaeter(): int64 { return 42; }' 42
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
