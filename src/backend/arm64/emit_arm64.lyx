@@ -33,6 +33,17 @@ pub con ARM64_X7:  int64 := 7;
 pub con ARM64_X8:  int64 := 8;   // indirect result / syscall number
 pub con ARM64_X9:  int64 := 9;   // scratch
 pub con ARM64_X10: int64 := 10;  // scratch
+pub con ARM64_X11: int64 := 11;  // #1776: scratch
+// #1776: x19..x24 sind nach AAPCS64 callee-saved. Der erzeugte Code benutzt
+// sonst nur x0..x11, haelt also nie einen Wert in ihnen — der Formatierer darf
+// sie deshalb frei verwenden, ohne sie zu retten. Wer das aendert und dort
+// etwas ueber einen Aufruf hinweg haelt, muss sie im Prolog sichern.
+pub con ARM64_X19: int64 := 19;
+pub con ARM64_X20: int64 := 20;
+pub con ARM64_X21: int64 := 21;
+pub con ARM64_X22: int64 := 22;
+pub con ARM64_X23: int64 := 23;
+pub con ARM64_X24: int64 := 24;
 pub con ARM64_X29: int64 := 29;  // frame pointer (FP)
 pub con ARM64_X30: int64 := 30;  // link register (LR)
 pub con ARM64_XZR: int64 := 31;  // zero register / SP
@@ -1184,9 +1195,27 @@ pub type EmitARM64 = class {
       // WP-GPIO-1: inst_barrier() → ISB SY
       // Encoding: D5 03 3F DF (little-endian uint32 = 0xDF3F03D5)
       self.emit32(0xDF3F03D5);
+    } else if id == 403 {
+      // #1776: FloatToStr(v) — Zeiger auf den Text.
+      var fsB: int64 := argBase;
+      if (fsB < 0) { fsB := 0; }
+      self.a64FloatToStr(fsB);
     } else if id == 9 {
-      // WP-08: PrintFloat — Linux ARM64 fallback (load float bits, no-op print)
-      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
+      // #1776: PrintFloat(v). Hier stand ein No-op — der Wert wurde geladen
+      // und nichts damit getan. Jetzt derselbe Formatierer wie bei 403,
+      // danach write(1, ptr, len); die Laenge zaehlt der Code bis zum Nullbyte.
+      var pfB: int64 := argBase;
+      if (pfB < 0) { pfB := 0; }
+      self.a64FloatToStr(pfB);
+      self.emit32(0xAA0003E1);                   // MOV x1, x0   (Puffer)
+      self.emit32(0xD2800002);                   // MOVZ x2, #0  (Laenge)
+      self.emit32(0x38626823);                   // [LOOP] LDRB w3,[x1,x2]
+      self.emit32(0x34000063);                   // CBZ w3, +3
+      self.emit32(0x91000442);                   // ADD x2,x2,#1
+      self.emit32(0x17FFFFFD);                   // B -3
+      self.emitMovImmReg(ARM64_X0, 1);           // fd = stdout
+      self.emitMovImmReg(ARM64_X8, SYS_WRITE);
+      self.emit32(0xD4000001);                   // SVC #0
     } else if id == 200 || id == 208 || id == 201 || id == 202
            || id == 203 || id == 209 || id == 204 || id == 205 {
       self._emitPeekPoke(id, argBase);      // #1388
@@ -1723,6 +1752,139 @@ pub type EmitARM64 = class {
 
   fn getCodeBuf(): int64 { return self.codeBuf; }
   fn getCodeLen(): int64 { return self.codeLen; }
+  // ==================================================================
+  // #1776: Gleitkomma als Text (Builtin 403 FloatToStr, Builtin 9 PrintFloat).
+  //
+  // Bis 1.1.9G war ID 9 auf dem Linux-Zweig ein No-op („load float bits, no-op
+  // print") und ID 403 fehlte ganz. Ausgegeben hat stattdessen eine
+  // gleichnamige Lyx-Funktion aus std/io — die auf x86 vom Builtin verdeckt
+  // wurde. Derselbe Quelltext gab damit je nach Ziel etwas anderes aus.
+  //
+  // Umgesetzt wie im riscv-Backend (#1770) und zeichengleich mit dem x86-Weg:
+  // Vorzeichen, ganzer Teil, Punkt, GENAU sechs Nachkommastellen,
+  // abgeschnitten statt gerundet. nan und inf werden an den Bits erkannt, ein
+  // zu grosser Wert meldet sich als "overflow" statt eine Zahl zu erfinden.
+  //
+  // Alle Spruenge werden NACHGETRAGEN. Gezaehlte Weiten waren in #1770 zweimal
+  // falsch, weil emitMovImmReg je nach Wert unterschiedlich viele Befehle
+  // erzeugt — auf arm64 gilt dasselbe.
+  // ==================================================================
+
+  // Ziffern einer nichtnegativen Zahl schreiben. x19 = Wert, x20 = Schreibmarke.
+  // stellen > 0: feste Stellenzahl mit fuehrenden Nullen; 0: so viele wie noetig.
+  fn a64Ziffern(stellen: int64) {
+    if stellen > 0 {
+      var teiler: int64 := 1;
+      var si: int64 := 1;
+      while si < stellen { teiler := teiler * 10; si := si + 1; }
+      self.emitMovImmReg(ARM64_X21, teiler);
+    } else {
+      self.emitMovImmReg(ARM64_X21, 1);
+      self.emitMovImmReg(ARM64_X22, 10);
+      var gLoop: int64 := self.codeLen;
+      self.emit32(0x9AD50E77);                 // SDIV x23, x19, x21
+      self.emit32(0xEB1602FF);                 // CMP  x23, x22
+      var gRaus: int64 := self.codeLen; self.emit32(0);   // B.LT -> fertig
+      self.emit32(0x9B167EB5);                 // MUL  x21, x21, x22
+      self.emit32(0x14000000 | (((gLoop - self.codeLen) / 4) & 0x3FFFFFF));
+      self.poke32at(gRaus, 0x5400000B | ((((self.codeLen - gRaus) / 4) & 0x7FFFF) << 5));
+    }
+    self.emitMovImmReg(ARM64_X22, 10);
+    var zLoop: int64 := self.codeLen;
+    self.emit32(0x9AD50E77);                   // SDIV x23, x19, x21
+    self.emit32(0x9AD60EF8);                   // SDIV x24, x23, x22
+    self.emit32(0x9B16DF17);                   // MSUB x23, x24, x22, x23   (x23 %= 10)
+    self.emit32(0x9100C2F7);                   // ADD  x23, x23, #48  ('0')
+    self.emit32(0x39000297);                   // STRB w23, [x20]
+    self.emit32(0x91000694);                   // ADD  x20, x20, #1
+    self.emit32(0x9AD60EB5);                   // SDIV x21, x21, x22
+    self.emit32(0xF10002BF);                   // CMP  x21, #0
+    var zRaus: int64 := self.codeLen; self.emit32(0);   // B.EQ -> fertig
+    self.emit32(0x14000000 | (((zLoop - self.codeLen) / 4) & 0x3FFFFFF));
+    self.poke32at(zRaus, 0x54000000 | ((((self.codeLen - zRaus) / 4) & 0x7FFFF) << 5));
+  }
+
+  // f64 als Text in einen frischen Puffer; Zeiger nach x0.
+  fn a64FloatToStr(bitsSlot: int64) {
+    // Puffer aus mmap(0, 48, PROT_RW, MAP_PRIVATE|ANON)
+    self.emitMovImmReg(ARM64_X0, 0);
+    self.emitMovImmReg(ARM64_X1, 48);
+    self.emitMovImmReg(ARM64_X2, 3);
+    self.emitMovImmReg(ARM64_X3, 0x22);
+    self.emit32(0x92800004);                   // MOVN x4, #0   (fd = -1)
+    self.emitMovImmReg(ARM64_X5, 0);
+    self.emitMovImmReg(ARM64_X8, SYS_MMAP);
+    self.emit32(0xD4000001);                   // SVC #0 → x0 = Puffer
+    self.emit32(0xAA0003F4);                   // MOV x20, x0   (Schreibmarke)
+    self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(bitsSlot));   // x9 = Bitmuster
+
+    // Sonderfaelle: nach dem Verdoppeln faellt das Vorzeichen heraus.
+    self.emit32(0x8B090129);                   // ADD  x9, x9, x9
+    self.emitMovImmReg(ARM64_X10, 0 - 9007199254740992);          // 0xFFE0000000000000
+    self.emit32(0xEB0A013F);                   // CMP  x9, x10
+    var bKeinNan: int64 := self.codeLen; self.emit32(0);          // B.LS -> kein NaN
+    self.emitMovImmReg(ARM64_X11, 7233902);    // 'n','a','n',0
+    self.emit32(0xB900028B);                   // STR  w11, [x20]
+    self.emit32(0x91000E94);                   // ADD  x20, x20, #3
+    var jNan: int64 := self.codeLen; self.emit32(0);
+    var lKeinNan: int64 := self.codeLen;
+    self.emit32(0xEB0A013F);                   // CMP  x9, x10
+    var bKeinInf: int64 := self.codeLen; self.emit32(0);          // B.NE -> Zahl
+    self.emitMovImmReg(ARM64_X11, 6712937);    // 'i','n','f',0
+    self.emit32(0xB900028B);                   // STR  w11, [x20]
+    self.emit32(0x91000E94);                   // ADD  x20, x20, #3
+    var jInf: int64 := self.codeLen; self.emit32(0);
+
+    // Endlicher Wert: d0 = Zahl, d1 = 0.0
+    var lZahl: int64 := self.codeLen;
+    self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(bitsSlot));
+    self.emit32(0x9E670120);                   // FMOV d0, x9
+    self.emit32(0x9E6703E1);                   // FMOV d1, xzr
+    self.emit32(0x1E612000);                   // FCMP d0, d1
+    var bNichtNeg: int64 := self.codeLen; self.emit32(0);         // B.GE
+    self.emitMovImmReg(ARM64_X11, 45);         // '-'
+    self.emit32(0x3900028B);                   // STRB w11, [x20]
+    self.emit32(0x91000694);                   // ADD  x20, x20, #1
+    self.emit32(0x1E614000);                   // FNEG d0, d0
+
+    // Passt der ganze Teil in eine 64-Bit-Zahl?
+    var lPositiv: int64 := self.codeLen;
+    self.emit32(0x9E780013);                   // FCVTZS x19, d0
+    self.emitMovImmReg(ARM64_X10, 0 - 9223372036854775807 - 1);
+    self.emit32(0xEB0A027F);                   // CMP  x19, x10
+    var bPasst: int64 := self.codeLen; self.emit32(0);            // B.NE -> Ziffern
+    self.emitMovImmReg(ARM64_X11, 1919252079); // 'o','v','e','r'
+    self.emit32(0xB900028B);                   // STR  w11, [x20]
+    self.emitMovImmReg(ARM64_X11, 2003790950); // 'f','l','o','w'
+    self.emit32(0xB900068B);                   // STR  w11, [x20, #4]
+    self.emit32(0x91002294);                   // ADD  x20, x20, #8
+    var jBig: int64 := self.codeLen; self.emit32(0);
+
+    var lZiffern: int64 := self.codeLen;
+    self.a64Ziffern(0);
+    self.emitMovImmReg(ARM64_X11, 46);         // '.'
+    self.emit32(0x3900028B);                   // STRB w11, [x20]
+    self.emit32(0x91000694);                   // ADD  x20, x20, #1
+    self.emit32(0x9E620261);                   // SCVTF d1, x19
+    self.emit32(0x1E613800);                   // FSUB d0, d0, d1
+    self.emitMovImmReg(ARM64_X11, 4696837146684686336);   // 1e6
+    self.emit32(0x9E670161);                   // FMOV d1, x11
+    self.emit32(0x1E610800);                   // FMUL d0, d0, d1
+    self.emit32(0x9E780013);                   // FCVTZS x19, d0
+    self.a64Ziffern(6);
+
+    var lEnde: int64 := self.codeLen;
+    self.emit32(0x3900029F);                   // STRB wzr, [x20]
+
+    self.poke32at(bKeinNan,  0x54000009 | ((((lKeinNan - bKeinNan) / 4) & 0x7FFFF) << 5));   // B.LS
+    self.poke32at(bKeinInf,  0x54000001 | ((((lZahl - bKeinInf) / 4) & 0x7FFFF) << 5));      // B.NE
+    self.poke32at(bNichtNeg, 0x5400000A | ((((lPositiv - bNichtNeg) / 4) & 0x7FFFF) << 5));  // B.GE
+    self.poke32at(bPasst,    0x54000001 | ((((lZiffern - bPasst) / 4) & 0x7FFFF) << 5));     // B.NE
+    self.poke32at(jNan, 0x14000000 | ((((lEnde - jNan) / 4) & 0x3FFFFFF)));
+    self.poke32at(jInf, 0x14000000 | ((((lEnde - jInf) / 4) & 0x3FFFFFF)));
+    self.poke32at(jBig, 0x14000000 | ((((lEnde - jBig) / 4) & 0x3FFFFFF)));
+  }
+
   fn getFuncAddrs(): int64 { return self.funcAddrs; }   // WP-AND-02 Phase B: expose for export-table
 
   // -------------------------------------------------------------------------

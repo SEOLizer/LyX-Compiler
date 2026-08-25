@@ -128,12 +128,14 @@ ausgabe "floattostr_abschnitt" 'import src.std.io; fn main(): int64 { PrintLn(Fl
 # Sonderfaelle an den Bits erkannt, nicht gerechnet.
 ausgabe "floattostr_inf"      'import src.std.io; fn main(): int64 { var e: f64 := 1.0; var n: f64 := 0.0; PrintLn(FloatToStr(e/n)); return 0; }' "inf"
 ausgabe "floattostr_nan"      'import src.std.io; fn main(): int64 { var n: f64 := 0.0; PrintLn(FloatToStr(n/n)); return 0; }' "nan"
-# PrintFloat schreibt direkt, ohne den Umweg ueber den Zeiger. OHNE
-# std.io-Import, denn dort steht eine gleichnamige Lyx-Funktion, die auf den
-# IR-Zielen das Builtin ueberdeckt und mit drei Nachkommastellen rechnet — auf
-# x86 gewinnt dagegen das Builtin. Diese Abweichung ist ein eigener Befund und
-# nicht Gegenstand dieses Tests.
+# PrintFloat schreibt direkt, ohne den Umweg ueber den Zeiger — einmal ohne
+# und einmal mit std.io-Import. Der zweite Fall ist der aus #1776: dort stand
+# eine gleichnamige Lyx-Funktion, die auf den IR-Zielen das Builtin verdeckte.
 ausgabe "printfloat"          'fn main(): int64 { PrintFloat(1.25); return 0; }' "1.250000"
+# #1776: MIT std.io-Import gab riscv frueher "1.0" aus — dort gewann die
+# gleichnamige Lyx-Funktion, waehrend auf x86 das Builtin zog. Die Fassung ist
+# entfernt, jetzt entscheidet ueberall das Builtin.
+ausgabe "printfloat_mit_import" 'import src.std.io; fn main(): int64 { PrintFloat(1.25); return 0; }' "1.250000"
 # fRound rundet zur naechsten GERADEN Zahl, wie roundsd-Modus 0 auf x86.
 ausgabe "runden"              'import src.std.io; fn main(): int64 { var a: f64 := 2.7; PrintLn(FloatToStr(fFloor(a))); return 0; }' "2.000000"
 ausgabe "aufrunden"           'import src.std.io; fn main(): int64 { var a: f64 := 2.7; PrintLn(FloatToStr(fCeil(a))); return 0; }' "3.000000"
