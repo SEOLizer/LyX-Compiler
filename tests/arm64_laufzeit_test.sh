@@ -76,5 +76,25 @@ ausgabe "println_literal"  'import src.std.io; fn main(): int64 { PrintLn("hallo
 ausgabe "println_variable" 'import src.std.io; fn main(): int64 { var s: pchar := "abc"c; PrintLn(s); return 0; }' "abc"
 ausgabe "println_zahl"     'import src.std.io; fn main(): int64 { PrintLn(IntToStr(1234)); return 0; }' "1234"
 
+# ---------------------------------------------------------------------------
+# #1776: Gleitkomma als Text. Builtin 9 (PrintFloat) war auf dem Linux-Zweig
+# ein No-op — geladen wurde der Wert, getan nichts —, Builtin 403
+# (FloatToStr) fehlte ganz. Ausgegeben hat stattdessen eine gleichnamige
+# Lyx-Funktion aus std/io, die auf x86 vom Builtin verdeckt wurde: derselbe
+# Quelltext gab je nach Ziel etwas anderes aus. Verglichen wird deshalb mit
+# den Werten des x86-Wegs, MIT std.io-Import — genau die Stellung, in der die
+# Verdeckung auffiel.
+# ---------------------------------------------------------------------------
+ausgabe "floattostr_einfach"   'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(2.5)); return 0; }' "2.500000"
+ausgabe "floattostr_negativ"   'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(0.0-3.25)); return 0; }' "-3.250000"
+ausgabe "floattostr_null"      'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(0.0)); return 0; }' "0.000000"
+ausgabe "floattostr_stellen"   'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(123.456)); return 0; }' "123.456000"
+ausgabe "floattostr_abschnitt" 'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(2.675)); return 0; }' "2.674999"
+ausgabe "floattostr_inf"       'import src.std.io; fn main(): int64 { var e: f64 := 1.0; var n: f64 := 0.0; PrintLn(FloatToStr(e/n)); return 0; }' "inf"
+ausgabe "floattostr_nan"       'import src.std.io; fn main(): int64 { var n: f64 := 0.0; PrintLn(FloatToStr(n/n)); return 0; }' "nan"
+# Der gemeldete Fall aus #1776: MIT Import gab arm64/riscv "1.0" aus, x86
+# "1.250000". Jetzt entscheidet ueberall das Builtin.
+ausgabe "printfloat_mit_import" 'import src.std.io; fn main(): int64 { PrintFloat(1.25); return 0; }' "1.250000"
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]

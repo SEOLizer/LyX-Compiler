@@ -38,7 +38,10 @@ root = sys.argv[1]
 EXPECTED_FN = {
     # Ein-/Ausgabe: Builtin emittiert inline, src/std/io.lyx ist die
     # Lyx-Fassung fuer den Selbstbau und den lyxos-Pfad.
-    "EPrintStr", "EPrintStrLn", "Print", "PrintBool", "PrintChar", "PrintFloat",
+    # PrintFloat steht hier NICHT mehr: die Lyx-Fassung ist mit #1776
+    # entfernt worden, weil sie auf den IR-Zielen das Builtin verdeckte und
+    # dabei ein anderes Format lieferte als auf dem x86-Weg.
+    "EPrintStr", "EPrintStrLn", "Print", "PrintBool", "PrintChar",
     "PrintInt", "PrintLn", "PrintStr", "Printf", "FloatToStr",
     "FileReadAll", "FileSize", "FileWriteAll",
     # Zeichenketten: dito.
