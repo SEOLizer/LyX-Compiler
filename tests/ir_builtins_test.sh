@@ -87,7 +87,7 @@ fi
 # ===========================================================================
 # Die Ergaenzung gehoert geprueft, nicht nur die Luecke daneben: sonst faellt
 # nicht auf, wenn sie wieder verschwindet.
-for t in riscv64 arm-cm4; do
+for t in riscv64 arm-cm4 esp32; do
   if timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/sc.lyx" --target=$t -o "$TMP/sc_ok_$t" >"$TMP/sc_ok.log" 2>&1; then
     ok "$t: StrCharAt uebersetzt"
   else
@@ -97,7 +97,9 @@ done
 
 # #1388: StrLen gehoert auf JEDES Ziel — es rechnet ohne Betriebssystem.
 printf 'fn main(): int64 { return StrLen("abc"c); }\n' > "$TMP/sl.lyx"
-for t in arm64 riscv64 arm-cm4; do
+# esp32 seit #1786 mit dabei — dort liegen Zeichenkettenliterale inline im
+# Codestrom und werden PC-relativ adressiert.
+for t in arm64 riscv64 arm-cm4 esp32; do
   if timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/sl.lyx" --target=$t -o "$TMP/sl_$t" >"$TMP/sl.log" 2>&1; then
     ok "$t: StrLen uebersetzt"
   else
@@ -128,18 +130,16 @@ for t in riscv64 arm-cm4; do
   fi
 done
 
-# xtensa scheitert an diesem Programm schon FRUEHER, an der Zeichenkette
-# (#1339) — ebenfalls laut und mit Issue-Nummer. Welche der beiden Luecken
-# zuerst meldet, ist nebensaechlich; dass keine still durchgeht, nicht.
-msgx="$(timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/sc.lyx" --target=esp32 -o "$TMP/sc_xt" 2>&1)"; rcx=$?
-if [ "$rcx" -ne 0 ] && echo "$msgx" | grep -qE "Builtin-ID [0-9]+|nicht umgesetzt"; then
-  ok "esp32: die Luecke wird benannt statt verschluckt"
-else
-  no "esp32: Luecke benannt" "rc=$rcx — $(echo "$msgx" | grep -v Copyright | head -1)"
-fi
+# #1786: Hier stand ein Fall, der xtensa an StrCharAt scheitern sah — die
+# Meldung war der Nachweis, dass die Luecke nicht still durchgeht. StrCharAt
+# ist jetzt umgesetzt (siehe Schleife oben), der Nachweis fuer den lauten
+# Default steht darunter an IntToStr.
 
-# Und der Builtin-Default selbst, an einem Programm OHNE Zeichenkette:
-printf 'fn main(): int64 { var p: int64 := 4096; return peek8(p); }\n' > "$TMP/pk.lyx"
+# Und der Builtin-Default selbst, an einem Programm OHNE Zeichenkette.
+# #1786: peek8 ist auf xtensa umgesetzt, taugt hier also nicht mehr als
+# Nachweis — IntToStr (ID 16) braucht einen Puffer und ist auf diesem
+# freistehenden Ziel weiterhin offen.
+printf 'fn main(): int64 { var a: pchar := IntToStr(7); return 0; }\n' > "$TMP/pk.lyx"
 msgp="$(timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/pk.lyx" --target=esp32 -o "$TMP/pk_xt" 2>&1)"; rcp=$?
 if [ "$rcp" -ne 0 ] && echo "$msgp" | grep -qE "Builtin-ID [0-9]+"; then
   ok "esp32: unbehandelte Builtin-ID wird gemeldet"
