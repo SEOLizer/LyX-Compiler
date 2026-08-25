@@ -4828,7 +4828,18 @@ pub type IRLower = class {
         var m: int64 := 1;
         var j: int64 := 0;
         while j < nl { if m != 0 { if peek8(sb + off + j) != peek8(npI + j) { m := 0; } } j := j + 1; }
-        if m != 0 { return i; }
+        if m != 0 {
+          // #1783: Wer einen Namen aufloest, braucht auch den Rumpf. Der
+          // Erreichbarkeitsfilter (#1727) merkte das bisher nur im Zweig fuer
+          // freie Funktionen; Methodenaufrufe laufen aber ueber diese Stelle.
+          // Hier zu markieren deckt alle Wege ab — statische Dispatch,
+          // virtuelle, ueber ein Interface und den Konstruktor.
+          //
+          // Zu VIEL zu markieren waere hoechstens ein groesseres Erzeugnis, zu
+          // wenig dagegen ein fehlender Rumpf. Das ist die sichere Richtung.
+          if i < self.wantCap { poke8(self.wantBuf + i, 1); }
+          return i;
+        }
       }
       i += 1;
     }
@@ -6496,7 +6507,7 @@ pub type IRLower = class {
         // und nicht still mit einem falschen Ergebnis.
         var fdIdx: int64 := 0 - 1;
         if bodyIsExtern == 0 {
-          fdIdx := self._findFuncByName(self.nodeSVal(cur), self.nodeSLen(cur));
+          fdIdx := self._findFuncIdxStill(self.nodeSVal(cur), self.nodeSLen(cur));   // #1783: fragt nur, markiert nicht
         }
         var fdLowern: int64 := 0;
         if bodyIsExtern == 0 {
@@ -6532,12 +6543,30 @@ pub type IRLower = class {
         // ARM64-OOP: Methoden (c1-Chain) als Funktionen mit mangled Namen + impliziten
         // self-Param (Slot 0) lowern. methodParamBase=1 verschiebt explizite Params,
         // curMethodClassType erlaubt `self.field`-Auflösung.
+        //
+        // #1783: Der Erreichbarkeitsfilter (#1727) stand nur am Zweig fuer freie
+        // Funktionen — Methoden importierter Klassen wurden ALLE erzeugt, auch
+        // nie gerufene. Das kostete nicht nur Platz: std/io importiert
+        // std/string, und die StringBuilder-Methode AppendFloat rechnet mit
+        // f64. Auf einem freistehenden Ziel ohne Gleitkomma scheiterte damit
+        // schon `import std.io`, obwohl kein Programm die Methode ruft.
         var mtM: int64 := self.nodeC1(cur);
         while mtM >= 0 {
           if self.nodeKind(mtM) == NK_FUNC_DECL {
             if self.nodeC2(mtM) >= 0 {   // nur mit Body
               var mtMang: int64 := self._methodMangle(self.nodeSVal(cur), self.nodeSLen(cur),
                                                       self.nodeSVal(mtM), self.nodeSLen(mtM));
+              var mtLen: int64 := self.nodeSLen(cur) + 1 + self.nodeSLen(mtM);
+              var mtLowern: int64 := 1;
+              if self.nurErreichbar != 0 {
+                var mtIdx: int64 := self._findFuncIdxStill(mtMang as pchar, mtLen);   // #1783
+                mtLowern := 0;
+                if mtIdx < 0 { mtLowern := 1; }            // unbekannt: nicht raten
+                else if mtIdx < self.wantCap {
+                  if peek8(self.wantBuf + mtIdx) != 0 { mtLowern := 1; }
+                }
+              }
+              if mtLowern != 0 {
               self.overrideFuncName    := mtMang as pchar;
               self.overrideFuncNameLen := self.nodeSLen(cur) + 1 + self.nodeSLen(mtM);
               self.methodParamBase     := 1;
@@ -6547,6 +6576,7 @@ pub type IRLower = class {
               self.overrideFuncNameLen := 0;
               self.methodParamBase     := 0;
               self.curMethodClassType  := 0 - 1;
+              }
             }
           }
           mtM := self.nodeNext(mtM);
@@ -7746,6 +7776,31 @@ pub type IRLower = class {
     var r: int64 := self._classImplements(peek64(self._tregIdx + g * 8), ifp, ifl);
     self.src := sS; self.nodes := sN; self.nodeCount := sC;
     return r;
+  }
+
+  // #1783: Dieselbe Suche OHNE Markierung. Der Erreichbarkeitsfilter fragt
+  // selbst nach dem Index, um zu entscheiden, ob ein Rumpf entstehen muss —
+  // wuerde diese Abfrage markieren, waere jede importierte Funktion sofort
+  // „gebraucht" und der Filter wirkungslos. Genau das ist beim ersten Anlauf
+  // passiert: std/io kam mitsamt Printf durch.
+  fn _findFuncIdxStill(np: pchar, nl: int64): int64 {
+    var fb: int64 := peek64(self.ir + IR_MOD_OFF_FUNCBUF);
+    var sb: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
+    var fc: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);
+    var npI: int64 := (np) as int64;
+    var i: int64 := 0;
+    while i < fc {
+      var off: int64 := peek64(fb + i * IR_FUNC_SIZE);
+      var ln:  int64 := peek64(fb + i * IR_FUNC_SIZE + IR_FUNC_OFF_NAMELEN);
+      if ln == nl {
+        var m: int64 := 1;
+        var j: int64 := 0;
+        while j < nl { if m != 0 { if peek8(sb + off + j) != peek8(npI + j) { m := 0; } } j := j + 1; }
+        if m != 0 { return i; }
+      }
+      i += 1;
+    }
+    return 0 - 1;
   }
 
   // Ist die registrierte Deklaration selbst ein Interface (iVal-Bit 32)?
