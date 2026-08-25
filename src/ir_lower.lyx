@@ -1541,6 +1541,52 @@ pub type IRLower = class {
           mcCnt += 1;
           mcArg := self.nodeNext(mcArg);
         }
+        // #1773: Steht links eine Variable vom INTERFACE-Typ, gibt es keine
+        // Klasse zum Mangeln — der Aufruf landete bis hierher in der
+        // rumpflosen Methode der Interface-Deklaration, also in einer leeren
+        // Funktion, die zurueckgab, was zufaellig im Rueckgaberegister stand.
+        //
+        // Aufgeloest wird wie beim virtuellen Aufruf: ueber die type-id in
+        // obj[0] und einen Vergleich gegen jede registrierte Klasse, die
+        // dieses Interface fuehrt. Ein eigenes VMT- oder Selektorlayout
+        // braucht es dafuer nicht — der Weg ist derselbe, den die virtuelle
+        // Dispatch hier seit WP-XMOD-OOP geht.
+        var mcIsIface: int64 := 0;
+        if mcLocal >= 0 { if (self.nodeIVal(mcLocal) & 32) != 0 { mcIsIface := 1; } }
+        else { mcIsIface := self._tregIsIfaceG(self._tregFind(mcCName, mcCNameL)); }
+        if mcIsIface != 0 {
+          var iTid: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_LOAD_FIELD, iTid, mcSelf, 0, 0);   // tid = obj[0]
+          var iEnd: int64 := self.genLabel();
+          var ii: int64 := 0;
+          var iTraf: int64 := 0;
+          while ii < self._tregN {
+            if self._tregImplementsG(ii, mcCName, mcCNameL) != 0 {
+              var iIdx: int64 := self._tregResolveMethodIdxG(ii, mNameP, mNameL);
+              if iIdx >= 0 {
+                var iCT: int64 := self.allocTemp();
+                self.irAddInstrDirect(IRO_CONST_INT, iCT, -1, -1, ii);
+                var iCmp: int64 := self.allocTemp();
+                self.irAddInstrDirect(IRO_CMP_EQ, iCmp, iTid, iCT, 0);
+                var iNext: int64 := self.genLabel();
+                self.irEmitBrFalse(iCmp, iNext);
+                self.irAddInstrDirect(IRO_CALL, mcDest, iIdx, mcArgBase, mcCnt);
+                self.irEmitJmp(iEnd);
+                self.irEmitLabel(iNext);
+                iTraf := 1;
+              }
+            }
+            ii += 1;
+          }
+          // Keine passende Klasse: LAUT scheitern. Ein stilles 0 waere genau
+          // der Zustand, den #1767 gemeldet hat — nur ohne Absturz und damit
+          // noch schwerer zu finden.
+          var iMsg: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_CONST_INT, iMsg, -1, -1, 0);
+          self.irAddInstrDirect(IRO_PANIC, -1, iMsg, -1, 0);
+          self.irEmitLabel(iEnd);
+          return mcDest;
+        }
         if mcVirt == 0 {
           // STATISCHE Dispatch: nächste Definition ab decl (Mangle by-name, cross-module via funcBuffer).
           var mcIdx: int64 := 0 - 1;
@@ -4626,6 +4672,13 @@ pub type IRLower = class {
   fn _hasVmt(typeDecl: int64): int64 {
     var tc: int64 := typeDecl;
     while tc >= 0 {
+      // #1773: Eine Klasse mit `implements` braucht die type-id genauso — der
+      // Aufruf ueber den Interface-Typ kennt die wirkliche Klasse nur daraus.
+      // Die Methoden brauchen dafuer KEIN `virtual`; die Zusage steckt im
+      // `implements` (so steht es auch in ebnf.md). Ohne diese Zeile trug ein
+      // solches Objekt keine type-id, und der Aufruf hatte nichts, woran er
+      // die Klasse haette erkennen koennen.
+      if self.nodeC3(tc) >= 0 { return 1; }
       var m: int64 := self.nodeC1(tc);
       while m >= 0 {
         if self.nodeKind(m) == NK_FUNC_DECL { if (self.nodeIVal(m) & 14) != 0 { return 1; } }
@@ -7658,5 +7711,51 @@ pub type IRLower = class {
     
     // Delegate to base expression lowering
     return self.lowerExpr(expr);
+  }
+
+  // ==================================================================
+  // #1773: Interfaces. Die Methoden stehen am ENDE der Klasse — ein
+  // Eintrag weiter oben verschiebt die VMT von IRLower und bricht den
+  // Selbstbau (dieselbe Falle, vor der die Vermerke im Aufrufpfad warnen).
+  // ==================================================================
+
+  // Fuehrt `typeDecl` (oder ein Vorfahr) das Interface (ifp,ifl)?
+  // c3 des NK_TYPE_DECL ist die `implements`-Liste als NK_TYPE_NAME-Kette.
+  fn _classImplements(typeDecl: int64, ifp: pchar, ifl: int64): int64 {
+    var tc: int64 := typeDecl;
+    while tc >= 0 {
+      var it: int64 := self.nodeC3(tc);
+      while it >= 0 {
+        if self.nodeSLen(it) == ifl {
+          if self.seq(self.nodeSVal(it), ifl, ifp, ifl) != 0 { return 1; }
+        }
+        it := self.nodeNext(it);
+      }
+      var pn: int64 := self.nodeC2(tc);
+      if pn >= 0 { tc := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn)); } else { tc := 0 - 1; }
+    }
+    return 0;
+  }
+
+  // Kontext-Swap-Wrapper wie die uebrigen _treg*G: fuehrt _classImplements im
+  // Modul-Kontext der type-id g aus.
+  fn _tregImplementsG(g: int64, ifp: pchar, ifl: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._classImplements(peek64(self._tregIdx + g * 8), ifp, ifl);
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+
+  // Ist die registrierte Deklaration selbst ein Interface (iVal-Bit 32)?
+  fn _tregIsIfaceG(g: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := 0;
+    if (self.nodeIVal(peek64(self._tregIdx + g * 8)) & 32) != 0 { r := 1; }
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
   }
 }

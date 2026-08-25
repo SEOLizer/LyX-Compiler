@@ -14,9 +14,11 @@
 # STORE_FIELD nahm den Feld-Offset aus imm statt aus dem DEST-Feld, jedes Feld
 # landete also auf Offset 0.
 #
-# Nicht abgedeckt, weil noch offen: virtueller Dispatch (extends + override)
-# und Interface-Dispatch. Beide fehlen im IR-Pfad ganz; sie stehen als eigenes
-# Issue und gehoeren hier hinein, sobald sie da sind.
+# Seit #1773 deckt der Test auch den Dispatch ab: virtuell (extends +
+# override) und ueber den Interface-Typ. Der Interface-Aufruf hatte bis dahin
+# keine Aufloesung — er landete in der rumpflosen Methode der
+# Interface-Deklaration, also in einer LEEREN Funktion, und lieferte, was
+# zufaellig im Rueckgaberegister stand.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
@@ -75,6 +77,35 @@ run "drei_felder" \
 # Feld schreiben, nachdem das Objekt steht — derselbe Weg, andere Richtung.
 run "feld_nachtraeglich" \
   'pub type TS = class { v: int64; fn Create() { self.v := 5; } fn Setze(n: int64) { self.v := n; } fn Wert(): int64 { return self.v; } } fn main(): int64 { var s: TS := new TS(); s.Setze(23); return s.Wert(); }' 23
+
+# ---------------------------------------------------------------------------
+# Dispatch (#1773)
+# ---------------------------------------------------------------------------
+# Virtuell: ohne `virtual`/`override` ist der statische Aufruf richtig, mit
+# ihnen muss die Methode der WIRKLICHEN Klasse laufen.
+run "statisch_ohne_virtual" \
+  'pub type TB = class { fn Create() {} fn W(): int64 { return 1; } } pub type TA = class extends TB { fn Create() {} fn W(): int64 { return 2; } } fn main(): int64 { var o: TB := new TA(); return o.W(); }' 1
+run "virtuell_mit_override" \
+  'pub type TB = class { fn Create() {} virtual fn W(): int64 { return 1; } } pub type TA = class extends TB { fn Create() {} override fn W(): int64 { return 2; } } fn main(): int64 { var o: TB := new TA(); return o.W(); }' 2
+
+# Interface: die implementierende Methode braucht KEIN `virtual` — die Zusage
+# steckt im `implements` (ebnf.md §Interfaces).
+run "interface_einfach" \
+  'pub type IWert = interface { fn Hole(): int64; } pub type TWert = class implements IWert { a: int64; b: int64; fn Create() { self.a := 42; self.b := 7; } fn Hole(): int64 { return self.a + self.b; } } fn Mach(): IWert { return new TWert() as IWert; } fn main(): int64 { var w: IWert := Mach(); return w.Hole(); }' 49
+# Zwei Klassen an einem Interface: der Aufruf muss die richtige treffen.
+run "interface_zwei_klassen" \
+  'pub type IF = interface { fn W(): int64; } pub type TA = class implements IF { fn Create() {} fn W(): int64 { return 10; } } pub type TB = class implements IF { fn Create() {} fn W(): int64 { return 20; } } fn hol(n: int64): IF { if n == 0 { return new TA() as IF; } return new TB() as IF; } fn main(): int64 { var a: IF := hol(0); var b: IF := hol(1); return a.W() + b.W(); }' 30
+# Felder: die type-id belegt Offset 0, die Felder ruecken um acht Byte nach
+# hinten. Vor #1773 trugen Klassen mit `implements` keine type-id.
+run "interface_mit_feldern" \
+  'pub type IF = interface { fn W(): int64; } pub type TA = class implements IF { x: int64; y: int64; fn Create() { self.x := 3; self.y := 4; } fn W(): int64 { return self.x * self.y; } } fn main(): int64 { var a: IF := new TA() as IF; return a.W(); }' 12
+run "interface_mit_argument" \
+  'pub type IF = interface { fn Add(d: int64): int64; } pub type TA = class implements IF { x: int64; fn Create() { self.x := 30; } fn Add(d: int64): int64 { return self.x + d; } } fn main(): int64 { var a: IF := new TA() as IF; return a.Add(12); }' 42
+run "zwei_interfaces" \
+  'pub type I1 = interface { fn A(): int64; } pub type I2 = interface { fn B(): int64; } pub type T = class implements I1, I2 { fn Create() {} fn A(): int64 { return 5; } fn B(): int64 { return 7; } } fn main(): int64 { var x: I1 := new T() as I1; var y: I2 := new T() as I2; return x.A() + y.B(); }' 12
+# Erbe: die Ableitung ueberschreibt, das Interface fuehrt die Basis.
+run "interface_ueber_erbe" \
+  'pub type IF = interface { fn W(): int64; } pub type TBase = class implements IF { fn Create() {} fn W(): int64 { return 1; } } pub type TAbl = class extends TBase { fn Create() {} override fn W(): int64 { return 9; } } fn main(): int64 { var a: IF := new TAbl() as IF; return a.W(); }' 9
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
