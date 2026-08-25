@@ -141,5 +141,22 @@ ausgabe "runden"              'import src.std.io; fn main(): int64 { var a: f64 
 ausgabe "aufrunden"           'import src.std.io; fn main(): int64 { var a: f64 := 2.7; PrintLn(FloatToStr(fCeil(a))); return 0; }' "3.000000"
 ausgabe "kaufmaennisch"       'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(fRound(2.5))); return 0; }' "2.000000"
 
+# ---------------------------------------------------------------------------
+# #1784: `x + 0` wurde als "IRO_ADD mit src2 = -1" gefaltet und sollte eine
+# Kopie bedeuten — kein Backend liest das so. Sie rechnen slotOff(-1) aus,
+# also [fp + 0], und addieren, was dort liegt. Auf lyxos war das eine Null
+# (`peek64(p + 0)` lieferte still 0), hier ein Segfault.
+#
+# Der Fall trifft ausgerechnet den Versatz 0, also das ERSTE Feld einer
+# Struktur — und nur, wenn der Zeiger ein Funktionsparameter ist.
+# ---------------------------------------------------------------------------
+run "peek_param_versatz_null" \
+  'import src.std.alloc; fn lies(q: int64): int64 { return peek64(q + 0); } fn main(): int64 { var p: int64 := alloc(64); poke64(p, 7); return lies(p); }' 7
+run "peek_param_versatz_acht" \
+  'import src.std.alloc; fn lies(q: int64): int64 { return peek64(q + 8); } fn main(): int64 { var p: int64 := alloc(64); poke64(p + 8, 9); return lies(p); }' 9
+# Dieselbe Faltung steckte in SUB-mit-0, OR-mit-0 und AND-mit-lauter-Einsen.
+run "identitaeten" \
+  'fn f(x: int64): int64 { return (x + 0) * 10 + (x - 0) + (x | 0) + (x & (0-1)); } fn main(): int64 { return f(3); }' 39
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
