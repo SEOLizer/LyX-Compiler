@@ -112,5 +112,32 @@ ausgabe "println_literal"  'import src.std.io; fn main(): int64 { PrintLn("hallo
 ausgabe "println_variable" 'import src.std.io; fn main(): int64 { var s: pchar := "abc"c; PrintLn(s); return 0; }' "abc"
 ausgabe "println_zahl"     'import src.std.io; fn main(): int64 { PrintLn(IntToStr(1234)); return 0; }' "1234"
 
+# ---------------------------------------------------------------------------
+# #1770: Gleitkomma als Text. Bis 1.1.9E meldeten sich FloatToStr (Builtin 403)
+# und PrintFloat (ID 9) laut als unbehandelt, ebenso fFloor/fCeil/fRound
+# (400/401/402). Verglichen wird gegen den x86-Weg: Vorzeichen, ganzer Teil,
+# Punkt, GENAU sechs Nachkommastellen, abgeschnitten statt gerundet — deshalb
+# wird aus 2.675 dort wie hier 2.674999.
+# ---------------------------------------------------------------------------
+ausgabe "floattostr_einfach"  'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(2.5)); return 0; }' "2.500000"
+ausgabe "floattostr_negativ"  'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(0.0-3.25)); return 0; }' "-3.250000"
+ausgabe "floattostr_null"     'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(0.0)); return 0; }' "0.000000"
+ausgabe "floattostr_stellen"  'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(123.456)); return 0; }' "123.456000"
+# Abschneiden, nicht runden — dieselbe Ziffernfolge wie auf x86.
+ausgabe "floattostr_abschnitt" 'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(2.675)); return 0; }' "2.674999"
+# Sonderfaelle an den Bits erkannt, nicht gerechnet.
+ausgabe "floattostr_inf"      'import src.std.io; fn main(): int64 { var e: f64 := 1.0; var n: f64 := 0.0; PrintLn(FloatToStr(e/n)); return 0; }' "inf"
+ausgabe "floattostr_nan"      'import src.std.io; fn main(): int64 { var n: f64 := 0.0; PrintLn(FloatToStr(n/n)); return 0; }' "nan"
+# PrintFloat schreibt direkt, ohne den Umweg ueber den Zeiger. OHNE
+# std.io-Import, denn dort steht eine gleichnamige Lyx-Funktion, die auf den
+# IR-Zielen das Builtin ueberdeckt und mit drei Nachkommastellen rechnet — auf
+# x86 gewinnt dagegen das Builtin. Diese Abweichung ist ein eigener Befund und
+# nicht Gegenstand dieses Tests.
+ausgabe "printfloat"          'fn main(): int64 { PrintFloat(1.25); return 0; }' "1.250000"
+# fRound rundet zur naechsten GERADEN Zahl, wie roundsd-Modus 0 auf x86.
+ausgabe "runden"              'import src.std.io; fn main(): int64 { var a: f64 := 2.7; PrintLn(FloatToStr(fFloor(a))); return 0; }' "2.000000"
+ausgabe "aufrunden"           'import src.std.io; fn main(): int64 { var a: f64 := 2.7; PrintLn(FloatToStr(fCeil(a))); return 0; }' "3.000000"
+ausgabe "kaufmaennisch"       'import src.std.io; fn main(): int64 { PrintLn(FloatToStr(fRound(2.5))); return 0; }' "2.000000"
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
