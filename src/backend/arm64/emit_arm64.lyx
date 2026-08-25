@@ -42,6 +42,7 @@ pub con ARM64_D7:  int64 := 7;
 
 // Linux ARM64 syscall numbers
 pub con SYS_WRITE:  int64 := 64;
+pub con SYS_READ:   int64 := 63;   // #1769: arm64 zaehlt wie riscv64, nicht wie x86-64 (dort 0/1)
 pub con SYS_EXIT:   int64 := 93;
 pub con SYS_MMAP:   int64 := 222;
 pub con SYS_MUNMAP: int64 := 215;
@@ -396,6 +397,15 @@ pub type EmitARM64 = class {
     if (op == IRO_JMP || op == IRO_LABEL || op == IRO_LOAD_FIELD || op == IRO_LOAD_GLOBAL) { return 1; }
     if (op == IRO_LOAD_IDX || op == IRO_LOAD_LOCAL || op == IRO_MOD || op == IRO_MUL) { return 1; }
     if (op == IRO_NEG || op == IRO_OR || op == IRO_PANIC || op == IRO_SHL) { return 1; }
+    // #1769: NOT und die BIT-Familie fehlten. std/io rechnet damit, also
+    // scheiterte `PrintLn` auf arm64 an IRO_NOT (Opcode 50), bevor es
+    // ueberhaupt zur Ausgabe kam. IRO_AND/OR/XOR waren da, ihre BIT-Zwillinge
+    // nicht — ir_lower erzeugt beide Formen.
+    if (op == IRO_NOT || op == IRO_BITNOT || op == IRO_BITAND) { return 1; }
+    if (op == IRO_BITOR || op == IRO_BITXOR) { return 1; }
+    // #1769: Breitenwechsel. riscv behandelt sie als reine Kopie — die Slots
+    // sind ohnehin 64 Bit breit —, arm64 kannte sie gar nicht.
+    if (op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC) { return 1; }
     if (op == IRO_SHR || op == IRO_SIMD_ADD || op == IRO_SIMD_DIV || op == IRO_SIMD_MUL) { return 1; }
     if (op == IRO_SIMD_SUB || op == IRO_STORE_FIELD || op == IRO_STORE_GLOBAL || op == IRO_STORE_IDX) { return 1; }
     if (op == IRO_STORE_LOCAL || op == IRO_SUB || op == IRO_THROW || op == IRO_XOR) { return 1; }
@@ -440,9 +450,22 @@ pub type EmitARM64 = class {
     if op == IRO_NEG { self.emitNeg(src1, dest); }
 
     // --- Bitwise ---
-    if op == IRO_AND { self.emitBinopRR(0x8A000000, src1, src2, dest); }
-    if op == IRO_OR  { self.emitBinopRR(0xAA000000, src1, src2, dest); }
-    if op == IRO_XOR { self.emitBinopRR(0xCA000000, src1, src2, dest); }
+    if op == IRO_AND || op == IRO_BITAND { self.emitBinopRR(0x8A000000, src1, src2, dest); }
+    if op == IRO_OR  || op == IRO_BITOR  { self.emitBinopRR(0xAA000000, src1, src2, dest); }
+    if op == IRO_XOR || op == IRO_BITXOR { self.emitBinopRR(0xCA000000, src1, src2, dest); }
+    // #1769: MVN x0, x0 (= ORN x0, xzr, x0). Dieselbe Lesart wie im
+    // riscv-Backend, das NOT und BITNOT beide als bitweises Komplement
+    // ausfuehrt.
+    if op == IRO_NOT || op == IRO_BITNOT {
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src1));
+      self.emit32(0xAA2003E0);
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+    }
+    // #1769: Breitenwechsel — die Slots sind 64 Bit, also genuegt die Kopie.
+    if op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC {
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src1));
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+    }
     if op == IRO_SHL { self.emitShift(0, src1, src2, dest); }
     if op == IRO_SHR { self.emitShift(1, src1, src2, dest); }
 
@@ -1049,11 +1072,26 @@ pub type EmitARM64 = class {
     }
     // Linux path — emit inline syscalls
     if id == 1 {
-      // PrintStr: write(1, x0, x1)  — args already in x0,x1 by convention
-      self.emitMovImmReg(ARM64_X0, 1);   // fd=stdout
-      // x1=buf, x2=len come from caller convention — load from slots 0,1
-      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(0));
-      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(1));
+      // PrintStr: write(1, buf, len) — buf und len stehen in den Slots 0 und 1.
+      //
+      // #1769: Eine NEGATIVE Laenge ist ein Sentinel und heisst „bis zum
+      // Nullbyte zaehlen". ir_lower setzt ihn fuer `Print`/`PrintLn` mit einer
+      // pchar-VARIABLEN, weil die Laenge erst zur Laufzeit feststeht (dort
+      // steht -1 im Laengen-Slot). arm64 reichte den Wert roh an write weiter:
+      // der Aufruf scheiterte, und `PrintLn(s)` schwieg, waehrend
+      // `PrintLn("literal")` schrieb. Das lyxos-Backend kennt den Sentinel
+      // laengst, riscv seit #1764 — hier ist er nachgezogen.
+      //
+      // Der Zaehlblock ist derselbe wie bei ID 13 (EPrintStr) darunter.
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(0));   // x1 = buf
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(1));   // x2 = len
+      self.emit32(0xB6F800C2);  // TBZ x2, #63, +6  → Laenge >= 0: Zaehlblock ueberspringen
+      self.emit32(0xD2800002);  // MOVZ x2, #0            (Laenge)
+      self.emit32(0x38626823);  // [LOOP] LDRB w3,[x1,x2]
+      self.emit32(0x34000063);  // CBZ w3, +3  (→ WRITE)
+      self.emit32(0x91000442);  // ADD x2,x2,#1
+      self.emit32(0x17FFFFFD);  // B -3        (→ LOOP)
+      self.emitMovImmReg(ARM64_X0, 1);   // [WRITE] fd = stdout
       self.emitMovImmReg(ARM64_X8, SYS_WRITE);
       self.emit32(0xD4000001);  // SVC #0
     } else if id == 2 {
@@ -1100,6 +1138,39 @@ pub type EmitARM64 = class {
       self.emit32(0xD2800808);  // instr32: MOVZ x8,#64 (SYS_WRITE)
       self.emit32(0xD4000001);  // instr33: SVC #0
       self.emit32(0x910083FF);  // instr34: ADD sp,sp,#32
+    } else if id == 210 {
+      // #1769: memcpy(dst, src, len) — byteweise, Rueckgabe ist dst (bleibt in
+      // x0 stehen). std/io setzt damit seine Ausgabepuffer zusammen; ohne die
+      // ID kommt `PrintLn` nicht durch. Wortweise zu kopieren braeuchte eine
+      // Ausrichtungspruefung und brachte hier nichts — die Puffer sind kurz.
+      var mcB: int64 := argBase;
+      if (mcB < 0) { mcB := 0; }
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(mcB));      // x0 = dst
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(mcB + 1));  // x1 = src
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(mcB + 2));  // x2 = len
+      self.emit32(0xD2800003);  // MOVZ x3, #0        (Zaehler)
+      self.emit32(0xEB02007F);  // [LOOP] CMP x3, x2
+      self.emit32(0x540000A0);  // B.EQ +5            (fertig)
+      self.emit32(0x38636824);  // LDRB w4,[x1,x3]
+      self.emit32(0x38236804);  // STRB w4,[x0,x3]
+      self.emit32(0x91000463);  // ADD x3,x3,#1
+      self.emit32(0x17FFFFFB);  // B -5               (→ LOOP)
+    } else if id == 222 || id == 223 {
+      // #1769: read(fd, buf, len) / write(fd, buf, len). Beide fehlten im
+      // Linux-Zweig, und weil std/io seine Ausgabe darueber schickt, scheiterte
+      // `PrintLn` auf arm64 schon beim Uebersetzen — laut immerhin. Die drei
+      // Argumente stehen ab argBase, das Ergebnis kommt ueber x0 zurueck.
+      // `open` bleibt bewusst offen: arm64 kennt wie riscv64 nur openat(56)
+      // mit vier Argumenten, eine geratene Nummer waere der naechste stille
+      // Fehler (dieselbe Ueberlegung wie in #1740/#1764).
+      var rwB: int64 := argBase;
+      if (rwB < 0) { rwB := 0; }
+      self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(rwB));      // fd
+      self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(rwB + 1));  // buf
+      self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(rwB + 2));  // len
+      if (id == 222) { self.emitMovImmReg(ARM64_X8, SYS_READ); }
+      if (id == 223) { self.emitMovImmReg(ARM64_X8, SYS_WRITE); }
+      self.emit32(0xD4000001);  // SVC #0
     } else if id == 3 {
       // Exit
       self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(0));
