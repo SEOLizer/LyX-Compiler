@@ -1067,6 +1067,30 @@ pub type EmitRISCV64 = class {
       self.rv_ADD(RV_A1, RV_A1, RV_A2);
       self.rv_SB(RV_T1, RV_A1, 0);
       self.rv_LI(RV_A0, 0);
+    } else if id == 400 || id == 401 || id == 402 {
+      // #1770: fFloor / fCeil / fRound.
+      var rmR: int64 := 0;
+      if (id == 400) { rmR := 2; }
+      if (id == 401) { rmR := 3; }
+      self.emitRundeRV(sBase, rmR);
+    } else if id == 403 {
+      // #1770: FloatToStr(v) — Zeiger auf den Text.
+      self.emitF64ToStrRV(sBase);
+    } else if id == 9 {
+      // #1770: PrintFloat(v) — derselbe Formatierer, danach write(1, ptr, len).
+      // Die Laenge zaehlt der Code selbst bis zum Nullbyte.
+      self.emitF64ToStrRV(sBase);
+      self.rv_MV(RV_A1, RV_A0);
+      self.rv_LI(RV_A2, 0);
+      var pfLoop: int64 := self.codeLen;
+      self.rv_ADD(RV_T1, RV_A1, RV_A2);
+      self.rv_LBU(RV_T2, RV_T1, 0);
+      self.rv_BEQZ_fwd(RV_T2, 12);
+      self.rv_ADDI(RV_A2, RV_A2, 1);
+      self.rv_JAL_x0(pfLoop - self.codeLen);
+      self.rv_LI(RV_A0, 1);
+      self.rv_LI(RV_A7, RV_SYS_WRITE);
+      self.rv_ECALL();
     } else if id == 210 {
       // #1764: memcpy(dst, src, len) — byteweise, Rueckgabe ist dst. std/io
       // baut damit seine Ausgabepuffer zusammen; ohne die ID scheitert schon
@@ -1405,6 +1429,200 @@ pub type EmitRISCV64 = class {
   // der Uebersetzer starb an einer Stelle, die mit der Ursache nichts zu tun
   // hatte. Aufgefallen ist es, als `PrintLn` samt std/io endlich uebersetzte
   // und das Erzeugnis die Grenze riss.
+  // #1770: FMV.D.X frd, rs1 — Bitmuster aus einem Ganzzahlregister in ein
+  // Gleitkommaregister, ohne Umrechnung (funct7 = 0x79, rs2 = 0).
+  fn rv_FMV_D_X(frd: int64, rs1: int64) {
+    self.rv_e32(0x53 | (frd<<7) | (0<<12) | (rs1<<15) | (0<<20) | (0x79<<25));
+  }
+
+  // #1770: FMV.X.D rd, frs1 — Bitmuster aus einem Gleitkommaregister zurueck
+  // in ein Ganzzahlregister (funct7 = 0x71, rs2 = 0).
+  fn rv_FMV_X_D(rd: int64, frs1: int64) {
+    self.rv_e32(0x53 | (rd<<7) | (0<<12) | (frs1<<15) | (0<<20) | (0x71<<25));
+  }
+
+  // #1770: FCVT.L.D mit waehlbarer Rundungsart (0 = zur naechsten geraden,
+  // 1 = abschneiden, 2 = abwaerts, 3 = aufwaerts).
+  fn rv_FCVT_L_D_rm(rd: int64, frs1: int64, rm: int64) {
+    self.rv_e32(0x53 | (rd<<7) | (rm<<12) | (frs1<<15) | (2<<20) | (0x61<<25));
+  }
+
+  // #1770: fFloor / fCeil / fRound. x86 hat dafuer `roundsd`; RV64GC hat
+  // keinen Befehl, der einen double auf einen ganzen double rundet, also geht
+  // der Weg ueber die Ganzzahl: FCVT.L.D mit der passenden Rundungsart und
+  // zurueck mit FCVT.D.L.
+  //
+  // Werte jenseits von 2^63 passen in keine Ganzzahl — FCVT.L.D liefert dann
+  // 0x8000000000000000. Solche Werte sind ohnehin ganzzahlig, also kommt das
+  // Bitmuster unveraendert zurueck. Ohne diese Abfrage waere aus einer sehr
+  // grossen Zahl still die kleinste negative geworden.
+  //
+  // rm: 2 = abwaerts (fFloor), 3 = aufwaerts (fCeil), 0 = zur naechsten
+  // geraden Zahl (fRound — dasselbe wie roundsd-Modus 0 auf dem x86-Weg,
+  // 2.5 wird dort zu 2.0 und -2.5 zu -2.0).
+  fn emitRundeRV(bitsSlot: int64, rm: int64) {
+    self.rv_LD(28, RV_FP, self.slotOff(bitsSlot));   // t3 = Bitmuster
+    self.rv_FMV_D_X(0, 28);
+    self.rv_FCVT_L_D_rm(30, 0, rm);                  // t5 = gerundete Ganzzahl
+    self.rv_LI64(31, 0 - 9223372036854775807 - 1);   // 0x8000000000000000
+    self.rv_XOR(RV_T2, 30, 31);
+    var bPasst: int64 := self.codeLen; self.rv_e32(0);
+    self.rv_MV(RV_A0, 28);                           // passt nicht → unveraendert
+    var jEnde: int64 := self.codeLen; self.rv_e32(0);
+    var lPasst: int64 := self.codeLen;
+    self.rv_FCVT_D_L(1, 30);
+    self.rv_FMV_X_D(RV_A0, 1);
+    var lEnde: int64 := self.codeLen;
+    self.rv_poke32at(bPasst, self.rv_buildBtype(1, RV_T2, RV_ZERO, lPasst - bPasst));
+    self.rv_poke32at(jEnde,  self.rv_buildJAL(0, lEnde - jEnde));
+  }
+
+  // #1770: Ziffern einer nichtnegativen Zahl in den Puffer schreiben.
+  // reg = Wert, ptrReg = Schreibmarke (wird weitergezaehlt), stellen = feste
+  // Stellenzahl mit fuehrenden Nullen, oder 0 fuer „so viele wie noetig".
+  // Gerechnet wird ueber einen absteigenden Teiler; das kommt ohne zweiten
+  // Puffer aus, in den man rueckwaerts schreiben muesste.
+  fn emitZiffern(reg: int64, ptrReg: int64, stellen: int64) {
+    // t1 = Teiler
+    if stellen > 0 {
+      var teiler: int64 := 1;
+      var si: int64 := 1;
+      while si < stellen { teiler := teiler * 10; si := si + 1; }
+      self.rv_LI64(RV_T1, teiler);
+    } else {
+      self.rv_ADDI(RV_T1, RV_ZERO, 1);
+      // solange Wert / Teiler >= 10: Teiler mal zehn
+      var gLoop: int64 := self.codeLen;
+      self.rv_DIV(RV_T2, reg, RV_T1);
+      self.rv_ADDI(RV_T0, RV_ZERO, 10);
+      self.rv_SLT(RV_T2, RV_T2, RV_T0);      // t2 = (Wert/Teiler < 10)
+      self.rv_BEQZ_fwd(RV_T2, 8);            // noch zu gross → weiter vergroessern
+      // Ausstieg: das Ziel wird NACHGETRAGEN. Von Hand gezaehlt stand hier 12,
+      // also der Ruecksprung selbst statt der Befehl dahinter — die Schleife
+      // lief endlos. Gezaehlte Sprungweiten sind in diesem Backend generell
+      // die falsche Technik (rv_LI64 allein erzeugt zwei oder elf Befehle).
+      var gRaus: int64 := self.codeLen; self.rv_e32(0);
+      self.rv_ADDI(RV_T0, RV_ZERO, 10);
+      self.rv_MUL(RV_T1, RV_T1, RV_T0);
+      self.rv_JAL_x0(gLoop - self.codeLen);
+      self.rv_poke32at(gRaus, self.rv_buildJAL(0, self.codeLen - gRaus));
+    }
+    // Ausgabeschleife: Ziffer = (Wert / Teiler) % 10
+    var zLoop: int64 := self.codeLen;
+    self.rv_DIV(RV_T2, reg, RV_T1);
+    self.rv_ADDI(RV_T0, RV_ZERO, 10);
+    self.rv_REM(RV_T2, RV_T2, RV_T0);
+    self.rv_ADDI(RV_T2, RV_T2, 48);          // '0'
+    self.rv_SB(RV_T2, ptrReg, 0);
+    self.rv_ADDI(ptrReg, ptrReg, 1);
+    self.rv_ADDI(RV_T0, RV_ZERO, 10);
+    self.rv_DIV(RV_T1, RV_T1, RV_T0);        // Teiler /= 10
+    self.rv_BEQZ_fwd(RV_T1, 8);              // Teiler 0 → fertig
+    self.rv_JAL_x0(zLoop - self.codeLen);
+  }
+
+  // #1770: f64 als Text in einen frischen Puffer; Zeiger nach a0.
+  //
+  // Format wie auf dem x86-Weg: Vorzeichen, ganzer Teil, Punkt, GENAU sechs
+  // Nachkommastellen, abgeschnitten statt gerundet (2.675 wird dort zu
+  // 2.674999, weil die Zahl selbst schon darunter liegt). nan und inf werden
+  // an den Bits erkannt, ein zu grosser Wert meldet sich als "overflow" statt
+  // eine Zahl zu erfinden — dieselbe Entscheidung wie im lyxos-Backend.
+  //
+  // Alle Spruenge werden NACHGETRAGEN statt mit gezaehlten Weiten emittiert:
+  // rv_LI64 erzeugt je nach Wert zwei oder elf Befehle, eine von Hand
+  // gezaehlte Weite ist also von vornherein falsch.
+  //
+  // Register: a0 = Puffer, t3 = Bits, t4 = Schreibmarke, t5/t6 = Rechenwerte.
+  fn emitF64ToStrRV(bitsSlot: int64) {
+    // Puffer aus mmap(0, 48, PROT_RW, MAP_PRIVATE|ANON)
+    self.rv_LI(RV_A0, 0);
+    self.rv_LI(RV_A1, 48);
+    self.rv_LI(RV_A2, 3);
+    self.rv_LI(RV_A3, 34);
+    self.rv_LI(RV_A4, 0 - 1);
+    self.rv_LI(RV_A5, 0);
+    self.rv_LI(RV_A7, RV_SYS_MMAP);
+    self.rv_ECALL();
+    self.rv_MV(29, RV_A0);                       // t4 = Schreibmarke
+    self.rv_LD(28, RV_FP, self.slotOff(bitsSlot));   // t3 = Bitmuster
+
+    // Sonderfaelle: nach dem Verdoppeln faellt das Vorzeichen heraus.
+    // 0xFFE0000000000000 ist unendlich, alles darueber ist NaN.
+    self.rv_ADD(30, 28, 28);                     // t5 = Bits * 2
+    self.rv_LI64(31, 0 - 9007199254740992);      // t6 = 0xFFE0000000000000
+    self.rv_SLTU(RV_T2, 31, 30);                 // t2 = (t6 < t5) → NaN
+    var bKeinNan: int64 := self.codeLen; self.rv_e32(0);
+    self.rv_LI64(RV_T0, 7233902);                // 'n','a','n',0
+    self.rv_SW(RV_T0, 29, 0);
+    self.rv_ADDI(29, 29, 3);
+    var jNanEnde: int64 := self.codeLen; self.rv_e32(0);
+
+    var lKeinNan: int64 := self.codeLen;
+    self.rv_XOR(RV_T2, 30, 31);                  // gleich → unendlich
+    var bKeinInf: int64 := self.codeLen; self.rv_e32(0);   // BNE waere umgekehrt: hier BEQ auf t2
+    self.rv_LI64(RV_T0, 6712937);                // 'i','n','f',0
+    self.rv_SW(RV_T0, 29, 0);
+    self.rv_ADDI(29, 29, 3);
+    var jInfEnde: int64 := self.codeLen; self.rv_e32(0);
+
+    // Endlicher Wert. f0 = Zahl, f1 = 0.0
+    var lZahl: int64 := self.codeLen;
+    self.rv_FMV_D_X(0, 28);
+    self.rv_FMV_D_X(1, RV_ZERO);
+    self.rv_FCMP_D(1, RV_T2, 0, 1);              // t2 = (f0 < 0.0)
+    var bNichtNeg: int64 := self.codeLen; self.rv_e32(0);
+    self.rv_ADDI(RV_T0, RV_ZERO, 45);            // '-'
+    self.rv_SB(RV_T0, 29, 0);
+    self.rv_ADDI(29, 29, 1);
+    self.rv_e32(0x53 | (0 << 7) | (1 << 12) | (0 << 15) | (0 << 20) | (0x11 << 25));  // FSGNJN.D f0,f0,f0
+
+    // Traegt eine 64-Bit-Zahl den ganzen Teil? 0x8000000000000000 heisst nein.
+    var lPositiv: int64 := self.codeLen;
+    self.rv_FCVT_L_D(30, 0);                     // t5 = (int64) f0, abgeschnitten
+    self.rv_LI64(31, 0 - 9223372036854775807 - 1);
+    self.rv_XOR(RV_T2, 30, 31);
+    var bPasst: int64 := self.codeLen; self.rv_e32(0);   // t2 == 0 → passt NICHT
+    self.rv_LI64(RV_T0, 1919252079);             // 'o','v','e','r'
+    self.rv_SW(RV_T0, 29, 0);
+    self.rv_LI64(RV_T0, 2003790950);             // 'f','l','o','w'
+    self.rv_SW(RV_T0, 29, 4);
+    self.rv_ADDI(29, 29, 8);
+    var jBigEnde: int64 := self.codeLen; self.rv_e32(0);
+
+    // Ganzer Teil, Punkt, sechs Nachkommastellen.
+    var lZiffern: int64 := self.codeLen;
+    self.emitZiffern(30, 29, 0);
+    self.rv_ADDI(RV_T0, RV_ZERO, 46);            // '.'
+    self.rv_SB(RV_T0, 29, 0);
+    self.rv_ADDI(29, 29, 1);
+    self.rv_FCVT_D_L(1, 30);                     // f1 = (double) ganzer Teil
+    self.rv_FOP_D(0x05, 0, 0, 1);                // f0 = f0 - f1
+    self.rv_LI64(RV_T0, 4696837146684686336);    // 1e6 als IEEE-754
+    self.rv_FMV_D_X(1, RV_T0);
+    self.rv_FOP_D(0x09, 0, 0, 1);                // f0 = f0 * 1e6
+    self.rv_FCVT_L_D(30, 0);                     // t5 = Nachkommastellen
+    self.emitZiffern(30, 29, 6);
+
+    // ende: Nullbyte. a0 zeigt noch auf den Pufferanfang.
+    var lEnde: int64 := self.codeLen;
+    self.rv_SB(RV_ZERO, 29, 0);
+
+    // Spruenge nachtragen. BEQ t2, x0 springt, wenn die Bedingung NICHT gilt.
+    self.rv_poke32at(bKeinNan,  self.rv_buildBtype(0, RV_T2, RV_ZERO, lKeinNan - bKeinNan));
+    self.rv_poke32at(bKeinInf,  self.rv_buildBtype(1, RV_T2, RV_ZERO, lZahl - bKeinInf));
+    self.rv_poke32at(bNichtNeg, self.rv_buildBtype(0, RV_T2, RV_ZERO, lPositiv - bNichtNeg));
+    self.rv_poke32at(bPasst,    self.rv_buildBtype(1, RV_T2, RV_ZERO, lZiffern - bPasst));
+    self.rv_poke32at(jNanEnde,  self.rv_buildJAL(0, lEnde - jNanEnde));
+    self.rv_poke32at(jInfEnde,  self.rv_buildJAL(0, lEnde - jInfEnde));
+    self.rv_poke32at(jBigEnde,  self.rv_buildJAL(0, lEnde - jBigEnde));
+  }
+
+  // SLTU rd, rs1, rs2 — vorzeichenloser Vergleich (funct3 = 3)
+  fn rv_SLTU(rd: int64, rs1: int64, rs2: int64) {
+    self.rv_e32(0x33 | (rd<<7) | (3<<12) | (rs1<<15) | (rs2<<20));
+  }
+
   fn growCode(need: int64) {
     if (self.codeLen + need) <= self.codeCap { return; }
     var nc: int64 := self.codeCap * 2;
