@@ -404,6 +404,36 @@ case "$msgfr" in
     echo "FAIL futex: Laufzeit-Operation nennt den Grund nicht: $(echo "$msgfr"|sed -n 2p)"; FAIL=$((FAIL + 1)) ;;
 esac
 
+echo "-- #1810: Notification-Queues NICHT angebunden, aber praezise gemeldet --"
+# Der Kernel HAT 237/238/239 — mit anderer Gestalt. Eine 1:1-Zuordnung wuerde
+# still Angaben verwerfen:
+#
+#   sys_notify_create(flags)     gegen 237 ohne Flags
+#   sys_notify_send(nq, event)   gegen 238 ohne Nutzlast  -> event waere weg
+#   sys_notify_recv(nq, timeout) gegen 239 ohne Frist     -> timeout waere weg
+#
+# 239 steht ausserdem NUR in SchedVfsStep, nicht in handle_r3_syscall: aus
+# einem Ring-3-Programm gar nicht erreichbar.
+#
+# Geprueft wird deshalb, dass die Meldung den Grund NENNT — eine blosse
+# "gibt es nicht"-Meldung schickte den Leser auf die falsche Faehrte, weil die
+# Nummern ja existieren.
+pruefe_meldet "sys_notify_create meldet"  "sys_notify_create(0)"
+pruefe_meldet "sys_notify_send meldet"    "sys_notify_send(1, 7)"
+pruefe_meldet "sys_notify_recv meldet"    "sys_notify_recv(1, 1000)"
+
+for paar in "sys_notify_send(1, 7):Nutzlast" "sys_notify_recv(1, 1000):nicht erreichbar"; do
+    aufruf="${paar%%:*}"; erwartet="${paar##*:}"
+    printf 'fn main(): int64 { return %s; }\n' "$aufruf" > "$TMP/nq.lyx"
+    msgnq="$($LYXC "$TMP/nq.lyx" --target=lyxos -o "$TMP/nq.lbf" 2>&1)"
+    case "$msgnq" in
+      *"$erwartet"*)
+        echo "PASS notify: Meldung nennt '$erwartet'"; PASS=$((PASS + 1)) ;;
+      *)
+        echo "FAIL notify: Meldung nennt '$erwartet' nicht: $(echo "$msgnq"|sed -n 5p)"; FAIL=$((FAIL + 1)) ;;
+    esac
+done
+
 echo "----"
 echo "$PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
