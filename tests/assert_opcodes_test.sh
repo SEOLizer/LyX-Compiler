@@ -31,7 +31,10 @@ printf 'fn main(): int64 { var a: int64 := 10; var b: int64 := 2; return a / b; 
 # Division uebersetzt wieder — auf den Zielen, die eine gepruefte Kodierung haben
 # ===========================================================================
 
-for t in arm64 riscv arm-cm4; do
+# esp32 seit #1789 mit dabei: die Basis-ISA hat keinen Divisionsbefehl, also
+# eine Softwareroutine — damit auf JEDEM Xtensa-Kern richtig und nicht nur auf
+# denen mit der optionalen DIV32-Erweiterung.
+for t in arm64 riscv arm-cm4 esp32; do
   rm -f "$TMP/d_$t"
   if "$LYXC" --std-path="$ROOT" "$TMP/div.lyx" --target=$t -o "$TMP/d_$t" >/dev/null 2>&1; then
     ok "Division uebersetzt fuer $t"
@@ -40,16 +43,30 @@ for t in arm64 riscv arm-cm4; do
   fi
 done
 
-# xtensa hat ausser `nop` keine gegen die eigene Byte-Konvention gepruefte
-# Kodierung. Eine erfundene Sprungweite waere hier besonders teuer: eine
-# Zusicherung, die falsch springt, laesst das Programm genau dort weiterlaufen,
-# wo es abbrechen sollte. Deshalb Abbruch beim Uebersetzen — und die Meldung
-# muss den Grund nennen.
-msg="$("$LYXC" --std-path="$ROOT" "$TMP/div.lyx" --target=esp32 -o "$TMP/d_xt" 2>&1)"
-case "$msg" in
-  *"Zusicherungen"*"xtensa"*"#1339"*) ok "xtensa weist die Zusicherung laut ab" ;;
-  *) no "xtensa weist die Zusicherung laut ab" "$(echo "$msg" | head -1)" ;;
-esac
+# #1789: Hier stand die Gegenprobe, dass xtensa die Zusicherung LAUT ablehnt.
+# Die Begruendung ("ausser `nop` keine gegen die eigene Byte-Konvention
+# gepruefte Kodierung") ist mit #1786 hinfaellig geworden: BRI12 und J sind
+# gegen den Disassembler belegt, und ILL ist im Lauf nachgewiesen (SIGILL).
+#
+# Geprueft wird deshalb jetzt die WIRKUNG statt der Ablehnung: die Zusicherung
+# muss ausloesen. Das ist der tragfaehigere Nachweis — ein Test, dessen gruener
+# Zustand eine fehlende Faehigkeit voraussetzt, verrottet mit dem naechsten
+# Ausbau (in dieser Sitzung viermal passiert).
+QEMU_XT="$(command -v qemu-xtensa-static || true)"
+HUELLE_XT="$ROOT/tests/lib/xtensa_huelle.py"
+printf 'fn main(): int64 { var a: int64 := 10; var b: int64 := 0; return a / b; }\n' > "$TMP/div0.lyx"
+if ! "$LYXC" --std-path="$ROOT" "$TMP/div0.lyx" --target=esp32 -o "$TMP/d0_xt" >/dev/null 2>&1; then
+  no "xtensa: Division durch 0 loest die Zusicherung aus" "uebersetzt nicht"
+elif [ -z "$QEMU_XT" ]; then
+  ok "xtensa: Division durch 0 uebersetzt (qemu fehlt, nicht ausgefuehrt)"
+elif ! python3 "$HUELLE_XT" "$TMP/d0_xt" "$TMP/d0.run" >/dev/null 2>&1; then
+  no "xtensa: Division durch 0 loest die Zusicherung aus" "Huelle scheiterte"
+else
+  timeout 10 "$QEMU_XT" "$TMP/d0.run" >/dev/null 2>&1; rc0=$?
+  # 132 = SIGILL: ILL hat ausgeloest, das Programm ist NICHT weitergelaufen.
+  if [ "$rc0" -eq 132 ]; then ok "xtensa: Division durch 0 loest die Zusicherung aus"
+  else no "xtensa: Division durch 0 loest die Zusicherung aus" "rc=$rc0, erwartet 132"; fi
+fi
 
 # ===========================================================================
 # Die Pruefbefehle stehen wirklich im Code

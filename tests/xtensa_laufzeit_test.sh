@@ -26,7 +26,7 @@
 #     sample_controller) hat sie, ESP32s LX6 dagegen schon. Die Kodierung steht
 #     nach Konstruktion da, nicht nach Ausfuehrung — ein Testfall hier wuerde
 #     nur den fehlenden Kern messen.
-#   * Division (#1789): die Basis-ISA hat keine.
+#   * Multiplikation (#1790): kein verfuegbarer qemu-Kern hat Mul32.
 #   * Ausgabe: der PrintStr-Helfer schreibt in das UART-Register 0x60000000.
 #     Das ist auf dem ESP32 richtig, im User-Mode-Emulator aber unabgebildet —
 #     gemessen wird hier deshalb ueber den Rueckgabewert.
@@ -132,6 +132,36 @@ run "global_ueber_fn"  'var zaehler: int64 := 0; fn tick(): int64 { zaehler := z
 # #1786: peek/poke und StrLen/StrCharAt. Bis 1.1.9M brach das Backend bei
 # jedem dieser Builtins ab; bis 1.1.5C lieferte es still 0.
 run "peek_poke"        'fn main(): int64 { var s: pchar := "0000"c; var p: int64 := s as int64; poke8(p, 42); poke8(p+1, 0); return peek8(p) + StrLen(s); }' 43
+
+# ---------------------------------------------------------------------------
+# #1789: Division, Rest und die Zusicherungen
+#
+# Bis 1.1.10F stand bei IRO_DIV und IRO_MOD `MOVI T0, 0` — JEDE Division lieferte
+# still 0. Der laute Opcode-Waechter griff nicht, weil beide als „behandelt"
+# gefuehrt waren; behandelt wurden sie ja, nur falsch. Verdeckt hat es allein,
+# dass die Zusicherung davor den Uebersetzer abbrechen liess.
+#
+# Die Basis-ISA hat keinen Divisionsbefehl (DIV32 ist eine Option und hier
+# ebenso wenig pruefbar wie Mul32). Also eine Softwareroutine — die ist damit
+# auf JEDEM Xtensa-Kern richtig, nicht nur auf denen mit der Option.
+run "division"        'fn main(): int64 { var a: int64 := 84; var b: int64 := 2; return a / b; }' 42
+run "rest"            'fn main(): int64 { var a: int64 := 84; return (a % 5) + 38; }' 42
+# Vorzeichen in beide Richtungen. Der Rest folgt dem Dividenden — wie bei / und %
+# ueblich und wie der x86-Pfad es tut; die beiden muessen uebereinstimmen.
+run "division_negativ" 'fn main(): int64 { var a: int64 := 0-84; var b: int64 := 2; return (a / b) + 84; }' 42
+run "division_divneg"  'fn main(): int64 { var a: int64 := 84; var b: int64 := 0-2; return (a / b) + 84; }' 42
+run "rest_negativ"     'fn main(): int64 { var a: int64 := 0-20; return (a % 3) + 44; }' 42
+# Gegen x86 und riscv gemessen: alle drei liefern 42.
+run "division_kette"   'fn main(): int64 { var s: int64 := 0; var i: int64 := 1; while i <= 10 { s := s + (100 / i); i := i + 1; } return s - 249; }' 42
+
+# Die Zusicherungen. ir_lower stellt vor JEDE Division ein IRO_ASSERT_NOT_ZERO;
+# ohne sie waere eine Division durch 0 eine Endlosschleife in der Routine.
+# Der Abbruch ist ILL (0x00,0x00,0x00) — gegen den Disassembler geprueft und im
+# Lauf belegt: SIGILL, also rc 132. Auf dem ESP32 loest er eine Ausnahme aus und
+# landet im Panik-Handler, statt weiterzulaufen.
+run "division_durch_null" 'fn main(): int64 { var a: int64 := 84; var b: int64 := 0; return a / b; }' 132
+# Der gute Fall darf NICHT ausloesen — sonst waere die Zusicherung wertlos.
+run "assert_haelt"     'fn main(): int64 { var a: int64 := 84; var b: int64 := 2; assert(b != 0); return a / b; }' 42
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
