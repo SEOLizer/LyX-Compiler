@@ -113,5 +113,34 @@ run "peek_param_versatz_acht" \
 run "identitaeten" \
   'fn f(x: int64): int64 { return (x + 0) * 10 + (x - 0) + (x | 0) + (x & (0-1)); } fn main(): int64 { return f(3); }' 39
 
+# ---------------------------------------------------------------------------
+# #1798: Anfangswerte von Modul-Konstanten
+#
+# Gemeldet fuer --target=lyxos: eine `con` mit NEGATIVEM Wert kam beim Aufrufer
+# als 0 an, still. Tatsaechlich betraf es alle IR-Backends -- der Anfangswert
+# wurde in ir_lower nur uebernommen, wenn der Knoten ein NK_LIT_INT war. `-1`
+# ist aber kein Literal, sondern ein unaeres Minus um eines; alles andere fiel
+# auf 0. Der Kommentar an der Stelle sagte das sogar ("everything else
+# defaults to 0").
+#
+# Aufgefallen ist es nicht am Wert, sondern an einem Vergleich: `st == BAD`
+# war falsch, obwohl `st == -1` stimmte -- und das sieht nach einem Fehler im
+# Syscall aus, nicht nach einem im Uebersetzer.
+#
+# Alle Faelle unten waren vorher rot (die Konstante war 0).
+run "con_negativ"        'con A: int64 := -1; fn main(): int64 { return 43 + A; }' 42
+run "con_null_minus_eins" 'con A: int64 := 0 - 1; fn main(): int64 { return 43 + A; }' 42
+run "con_geklammert"     'con A: int64 := (-1); fn main(): int64 { return 43 + A; }' 42
+run "con_produkt"        'con A: int64 := 1 * -1; fn main(): int64 { return 43 + A; }' 42
+run "con_gross_negativ"  'con A: int64 := -1000000; fn main(): int64 { return 42 + (A + 1000000); }' 42
+run "con_ausdruck"       'con A: int64 := (2 + 3) * 4 - 20; fn main(): int64 { return 42 + A; }' 42
+run "con_bitnicht"       'con A: int64 := ~5; fn main(): int64 { return 42 + (A + 6); }' 42
+run "con_schieben"       'con A: int64 := 1 << 5; fn main(): int64 { return 10 + A; }' 42
+# Gegenprobe: was schon immer ging, muss weiter gehen.
+run "con_hex_zweierkompl" 'con A: int64 := 0xFFFFFFFFFFFFFFFF; fn main(): int64 { return 43 + A; }' 42
+run "con_positiv"        'con A: int64 := 7; fn main(): int64 { return 35 + A; }' 42
+# Konstante aus einer Vergleichskette -- der gemeldete Fall.
+run "con_vergleich"      'con BAD: int64 := -1; fn hol(): int64 { return 0 - 1; } fn main(): int64 { if hol() == BAD { return 42; } return 9; }' 42
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]

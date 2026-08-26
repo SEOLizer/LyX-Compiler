@@ -6301,13 +6301,41 @@ pub type IRLower = class {
           self.globalNameBuf := ggNb;
           self.globalNameCap := ggNewCap;
         }
-        // Extract init value if it's a simple int literal; everything else
-        // defaults to 0 (runtime init via constructors etc. is future work).
+        // #1798: Der Anfangswert wurde nur uebernommen, wenn der Knoten ein
+        // NK_LIT_INT war. `-1` ist aber KEIN Literal, sondern ein unaeres
+        // Minus um eines — jede negative Konstante kam damit als 0 an, still.
+        // Ebenso `0 - 1`, `(-1)` und `1 * -1`.
+        //
+        // Jetzt wird der Ausdruck gefaltet. Laesst er sich nicht falten, ist
+        // das bei einer `con` ein Fehler und keine 0: eine Konstante MUSS zur
+        // Uebersetzungszeit einen Wert haben. Bei `var` bleibt es bei 0 —
+        // dort ist die Vorbelegung zur Laufzeit vorgesehen (Konstruktoren),
+        // und ein Abbruch wuerde Bestehendes brechen.
         var ggInit: int64 := 0;
         var ggInitNode: int64 := self.nodeC1(ggCur);
         if ggInitNode >= 0 {
-          if self.nodeKind(ggInitNode) == NK_LIT_INT {
-            ggInit := self.nodeIVal(ggInitNode);
+          if self._constFaltbar(ggInitNode) != 0 {
+            ggInit := self._constWert(ggInitNode);
+          } else {
+            // Gleitkomma gehoert NICHT in diesen Falter — er rechnet
+            // ganzzahlig, und auf ein IEEE-Bitmuster losgelassen kaeme Unsinn
+            // heraus (dieselbe Sperre wie im x86-Pfad, #1499). Eine
+            // f64-Konstante ist also nicht „nicht faltbar", sondern hier gar
+            // nicht zustaendig: es bleibt bei 0, wie bisher.
+            //
+            // Dass eine f64-Modulkonstante auf den IR-Backends damit 0 ist,
+            // steht als eigener Punkt in #1801 — es ist ein Bestandsdefekt,
+            // kein Ergebnis dieser Aenderung.
+            var ggIstF64: int64 := 0;
+            if self.nodeKind(ggInitNode) == NK_LIT_FLOAT { ggIstF64 := 1; }
+            var ggTy: int64 := self.nodeC0(ggCur);
+            if ggTy >= 0 {
+              if self.nodeKind(ggTy) == NK_TYPE_NAME {
+                if self.seq(self.nodeSVal(ggTy), self.nodeSLen(ggTy), "f64", 3) { ggIstF64 := 1; }
+                if self.seq(self.nodeSVal(ggTy), self.nodeSLen(ggTy), "f32", 3) { ggIstF64 := 1; }
+              }
+            }
+            if ggKind == NK_CON_DECL && ggIstF64 == 0 { self._constNichtFaltbar(ggCur); }
           }
         }
         // WP-AND-upstream-fix v5/cross-module: copy the name into the IR
@@ -7942,6 +7970,102 @@ pub type IRLower = class {
       i += 1;
     }
     return 0 - 1;
+  }
+
+  // ====================================================================
+  // #1798: Anfangswerte von Modul-Konstanten falten
+  //
+  // Der Anfangswert wurde nur uebernommen, wenn der Knoten ein NK_LIT_INT
+  // war — alles andere fiel auf 0. `con A: int64 := -1;` ist aber KEIN
+  // Literal, sondern ein unaeres Minus um eines. Damit war jede negative
+  // Konstante auf den IR-Backends still 0, ebenso `0 - 1`, `(-1)` und
+  // `1 * -1`. Aufgefallen ist es nicht am Wert, sondern an einem Vergleich:
+  // `st == TCP_BAD_SOCK` war falsch, obwohl `st == -1` stimmte — und das
+  // sieht nach einem Fehler im Syscall aus, nicht nach einem im Uebersetzer.
+  //
+  // x86 ist nicht betroffen, dort werden Konstanten frueher gefaltet.
+  //
+  // Zwei Methoden statt einer mit Ausgabeparameter: `_constFaltbar` sagt, OB
+  // sich der Ausdruck zur Uebersetzungszeit ausrechnen laesst, `_constWert`
+  // rechnet ihn aus. Getrennt, weil 0 ein gueltiges Ergebnis ist und damit
+  // kein Kennwert fuer „nicht faltbar" zur Verfuegung steht — genau die
+  // Verwechslung, aus der dieser Defekt entstanden ist.
+  // ====================================================================
+
+  fn _constFaltbar(nd: int64): int64 {
+    if nd < 0 { return 0; }
+    var k: int64 := self.nodeKind(nd);
+    if k == NK_LIT_INT || k == NK_LIT_BOOL || k == NK_LIT_CHAR { return 1; }
+    if k == NK_UNOP {
+      var uo: int64 := self.nodeIVal(nd);
+      if uo == 71 || uo == 87 || uo == 92 { return self._constFaltbar(self.nodeC0(nd)); }
+      return 0;
+    }
+    if k == NK_BINOP {
+      var bo: int64 := self.nodeIVal(nd);
+      var erlaubt: int64 := 0;
+      if bo >= 70 && bo <= 74 { erlaubt := 1; }        // + - * / %
+      if bo == 89 || bo == 90 || bo == 91 { erlaubt := 1; }  // ^ & |
+      if bo == 93 || bo == 94 { erlaubt := 1; }        // << >>
+      if erlaubt == 0 { return 0; }
+      if self._constFaltbar(self.nodeC0(nd)) == 0 { return 0; }
+      return self._constFaltbar(self.nodeC1(nd));
+    }
+    return 0;
+  }
+
+  fn _constWert(nd: int64): int64 {
+    var k: int64 := self.nodeKind(nd);
+    if k == NK_LIT_INT || k == NK_LIT_BOOL || k == NK_LIT_CHAR { return self.nodeIVal(nd); }
+    if k == NK_UNOP {
+      var uo: int64 := self.nodeIVal(nd);
+      var v:  int64 := self._constWert(self.nodeC0(nd));
+      if uo == 71 { return 0 - v; }
+      if uo == 92 { return 0 - v - 1; }        // ~v als Zweierkomplement
+      if uo == 87 { if v == 0 { return 1; } return 0; }
+      return 0;
+    }
+    if k == NK_BINOP {
+      var bo: int64 := self.nodeIVal(nd);
+      var a:  int64 := self._constWert(self.nodeC0(nd));
+      var b:  int64 := self._constWert(self.nodeC1(nd));
+      if bo == 70 { return a + b; }
+      if bo == 71 { return a - b; }
+      if bo == 72 { return a * b; }
+      // Division durch 0 wird NICHT gefaltet — _constFaltbar hat das nicht
+      // gesehen, also faellt es hier auf, statt still 0 zu liefern.
+      if bo == 73 { if b == 0 { self._constDiv0(); } return a / b; }
+      if bo == 74 { if b == 0 { self._constDiv0(); } return a % b; }
+      if bo == 89 { return a ^ b; }
+      if bo == 90 { return a & b; }
+      if bo == 91 { return a | b; }
+      if bo == 93 { return a << b; }
+      if bo == 94 { return a >> b; }
+      return 0;
+    }
+    return 0;
+  }
+
+  // #1798: Eine `con`, deren Anfangswert sich nicht ausrechnen laesst. Vorher
+  // wurde daraus still 0 — der Aufrufer verglich dann gegen den falschen Wert
+  // und suchte den Fehler an ganz anderer Stelle.
+  fn _constNichtFaltbar(decl: int64) {
+    var nl: int64 := self.nodeSLen(decl);
+    var nb: int64 := alloc(nl + 1);
+    var i:  int64 := 0;
+    while i < nl { poke8(nb + i, peek8((self.nodeSVal(decl) as int64) + i)); i := i + 1; }
+    poke8(nb + nl, 0);
+    EPrintStr("error: Anfangswert der Konstanten '"c);
+    EPrintStr(nb as pchar);
+    EPrintStrLn("' laesst sich nicht zur Uebersetzungszeit ausrechnen (#1798)."c);
+    EPrintStrLn("  Gefaltet werden Literale, unaeres -/~/! und die Rechen-, Bit- und"c);
+    EPrintStrLn("  Schiebeoperatoren darauf. Bis 1.1.10B wurde daraus still 0."c);
+    exit(1);
+  }
+
+  fn _constDiv0() {
+    EPrintStrLn("error: Division durch 0 im Anfangswert einer Konstanten (#1798)."c);
+    exit(1);
   }
 
   // Der statische Typ eines Ausdrucks. Rekursiv, weil die Basis selbst wieder

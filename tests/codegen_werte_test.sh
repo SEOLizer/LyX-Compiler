@@ -163,5 +163,35 @@ dim Length;
 utype m: Length = 1.0;
 fn main(): int64 { var a: m := 5; var b: m := a; PrintLn(IntToStr(b as int64)); return 0; }' "5"
 
+# ===========================================================================
+# #1799 — bitweises Komplement im Anfangswert einer Konstanten
+# ===========================================================================
+#
+# cg_evalConExpr behandelte im unaeren Zweig nur `!` und `-`; darunter stand
+# ein `return 0`. `~` fiel damit still durch: `con MASKE := ~0` war 0 statt -1.
+# Eine Maske, die still 0 wird, macht jede Und-Verknuepfung damit zu 0 — und
+# das faellt erst weit weg von der Deklaration auf.
+#
+# Bemerkenswert: cg_foldConst rechnete dieselbe Sache eine Zeile weiter
+# richtig (-1 - v). Nur diese Stelle nicht.
+out "#1799: ~0 in einer con" 'import std.io;
+con X: int64 := ~0;
+fn main(): int64 { PrintLn(IntToStr(X)); return 0; }' "-1"
+out "#1799: ~5 in einer con" 'import std.io;
+con Y: int64 := ~5;
+fn main(): int64 { PrintLn(IntToStr(Y)); return 0; }' "-6"
+# Als Maske gebraucht — der Fall, um den es wirklich geht.
+out "#1799: ~0 als Maske" 'import std.io;
+con M: int64 := ~0 & 0xFF;
+fn main(): int64 { PrintLn(IntToStr(M)); return 0; }' "255"
+# Gegenprobe: als lokale Variable ging es immer schon.
+out "#1799: ~0 als var (Gegenprobe)" 'import std.io;
+fn main(): int64 { var v: int64 := ~0; PrintLn(IntToStr(v)); return 0; }' "-1"
+# Die uebrigen unaeren Faelle duerfen sich nicht veraendert haben.
+out "#1799: - und ! unveraendert" 'import std.io;
+con A: int64 := -7;
+con B: int64 := !0;
+fn main(): int64 { PrintLn(IntToStr(A + B)); return 0; }' "-6"
+
 echo "--- $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
