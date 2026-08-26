@@ -44,6 +44,18 @@ die kaputte Stelle von vorn zu durchdenken. Wer eine zweite Stelle anlegt,
 verweist im Kommentar auf die erste („dieselbe Rechnung wie X — die beiden
 müssen übereinstimmen"), wie es `cg_parseFloat`/`_parseFloatBits` vormachen.
 
+**Eine Aufzählung ist unvollständig** — die Schwester der vorigen Ursache: nicht
+eine zweite Stelle fehlt, sondern *ein Fall* in einer Liste. Die Auflösung zählt
+auf, woher ein Name kommen kann, und vergisst eine Herkunft. Dreimal belegt,
+jedes Mal mit derselben Speicherart-Frage: `_localTypeNode` kannte Feld und
+Aufrufergebnis nicht (#1787), `_findLocalSlot` keine Parameter (#1806),
+`_localTypeNode` keine Modulvariablen (#1812).
+→ Im Bericht klingt es immer gleich: **„X geht, Y nicht — bei identischem
+Objekt."** Dann nicht nach einem Rechenfehler suchen, sondern fragen, welche
+*Herkunft* Y hat, die X nicht hat. `_localTypeNode` und `_findLocalSlot` sind
+zwei getrennte Aufzählungen derselben Sache; eine neue Speicherart muss in
+**beide**.
+
 ## Tests
 
 - **Den Weg prüfen, nicht das Ergebnis**, wenn der Defekt in der Ausführung

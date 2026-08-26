@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.10L
+VERSION   := 1.1.10M
 VERSION_DATE := 2026-08-26
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
