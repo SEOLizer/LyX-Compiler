@@ -43,6 +43,8 @@ con XT_RV: int64 := 2;    // a2 = return value / arg0
 con XT_A3: int64 := 3;
 con XT_A4: int64 := 4;
 con XT_A5: int64 := 5;
+con XT_A6: int64 := 6;    // #1789: Dividend rein / Quotient raus
+con XT_A7: int64 := 7;    // #1789: Divisor rein / Rest raus
 con XT_T0: int64 := 8;    // a8 = primary scratch temp
 con XT_T1: int64 := 9;    // a9 = secondary scratch temp
 con XT_T2: int64 := 10;   // a10 = tertiary scratch temp
@@ -84,6 +86,7 @@ pub type EmitXtensa = class {
   poolFix:    int64;   // je Eintrag: {poolIdx, Bezugsadresse, Zielart, Zielnummer} a 32 Byte
   poolFixN:   int64;
   getpcOff:   int64;   // Code-Offset der Rueckspring-Marke
+  xt_divOff:  int64;   // #1789: Code-Offset der Divisionsroutine
   strDatBuf:  int64;   // gesammelte Zeichenketten-Bytes
   strDatLen:  int64;
   strDatCap:  int64;
@@ -468,12 +471,25 @@ pub type EmitXtensa = class {
       self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
       self.xt_MULL(XT_T0, XT_T0, XT_T1); self.xt_storeSlot(dest);
     }
-    if op == IRO_DIV {
-      // No hardware div in Xtensa base ISA — stub
-      self.xt_MOVI(XT_T0, 0); self.xt_storeSlot(dest);
-    }
-    if op == IRO_MOD {
-      self.xt_MOVI(XT_T0, 0); self.xt_storeSlot(dest);
+    // #1789: Division und Rest. Die Basis-ISA hat KEINEN Divisionsbefehl —
+    // DIV32 (QUOS/REMS) ist eine Option, die hier ebenso wenig pruefbar ist wie
+    // Mul32 (#1790). Also eine Softwareroutine, und die ist damit auf jedem
+    // Xtensa-Kern richtig, nicht nur auf denen mit der Option.
+    //
+    // Bis 1.1.10F stand hier `MOVI T0, 0`: JEDE Division lieferte still 0. Der
+    // laute Opcode-Waechter griff nicht, weil IRO_DIV als „behandelt" gefuehrt
+    // war — behandelt wurde er ja, nur falsch. Verdeckt hat es allein, dass die
+    // Zusicherung davor den Uebersetzer abbrechen liess.
+    if op == IRO_DIV || op == IRO_MOD {
+      self.xt_loadSlot(src1);
+      self.xt_MOV(XT_A6, XT_T0);              // a6 = Dividend
+      self.xt_loadSlot2(src2);
+      self.xt_MOV(XT_A7, XT_T1);              // a7 = Divisor
+      var dPC:  int64 := self.codeLen;
+      var dOff: int64 := (self.xt_divOff - ((dPC & -4) + 4)) >> 2;
+      self.xt_CALL0(dOff);                    // a6 = Quotient, a7 = Rest
+      if op == IRO_DIV { self.xt_MOV(XT_T0, XT_A6); } else { self.xt_MOV(XT_T0, XT_A7); }
+      self.xt_storeSlot(dest);
     }
     if op == IRO_NEG {
       self.xt_loadSlot(src1);
@@ -751,19 +767,40 @@ pub type EmitXtensa = class {
       self.xt_storeSlot(dest);
     }
 
-    // #1339: Die Zusicherungen. Sie brauchen einen Vergleich, einen Sprung und
-    // einen Abbruch — von alldem hat dieses Backend keine gegen die eigene
-    // Byte-Konvention gepruefte Kodierung (ausser `nop`). Erfundene Bytes
-    // waeren hier besonders gefaehrlich: eine Zusicherung, die falsch springt,
-    // laesst das Programm genau dort weiterlaufen, wo es abbrechen sollte.
-    // Deshalb der Abbruch beim UEBERSETZEN, wie bei THROW und PANIC.
-    if op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO ||
-       op == IRO_ASSERT_TRUE || op == IRO_ASSERT_BOUNDS {
-      EPrintStrLn("error: Laufzeit-Zusicherungen sind fuer xtensa nicht umgesetzt (#1339)"c);
-      EPrintStrLn("  Betrifft auch die Null-Pruefung vor jeder Division. Das Backend hat keine"c);
-      EPrintStrLn("  gepruefte Sprung- und Trap-Kodierung; ein falscher Sprung waere schlimmer"c);
-      EPrintStrLn("  als der Abbruch."c);
-      exit(1);
+    // #1789: Die Zusicherungen. Sie brauchen einen Vergleich, einen Sprung und
+    // einen Abbruch. Bis 1.1.10F fehlte dafuer die gepruefte Kodierung und der
+    // Uebersetzer brach ab — die Begruendung ist mit #1786 hinfaellig geworden:
+    // BRI12 und J sind seither gegen den Disassembler belegt und tragen die
+    // StrLen-Schleife, und ILL ist als Falle im Lauf nachgewiesen (SIGILL).
+    //
+    // Aufbau: Wert laden, im GUTEN Fall ueber die Falle springen. Die Weite
+    // wird nachgetragen, nicht gezaehlt.
+    if op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO || op == IRO_ASSERT_TRUE {
+      self.xt_loadSlot(src1);
+      var aOff: int64 := self.codeLen;
+      self.xt_BNEZ(XT_T0, 0);          // != 0 → weiter
+      self.xt_ILL();
+      self.xt_patchBRI12(aOff, 5, self.codeLen);
+      return;
+    }
+    // ASSERT_BOUNDS: src1 = Index, src2 = Laenge. Geprueft wird BEIDES —
+    // Index >= 0 und Index < Laenge. Ein einzelner vorzeichenbehafteter
+    // Vergleich gegen die Laenge wuerde einen negativen Index durchlassen,
+    // weil er kleiner ist; genau dafuer ist die Pruefung ja da.
+    if op == IRO_ASSERT_BOUNDS {
+      self.xt_loadSlot(src1);
+      self.xt_MOV(XT_T2, XT_T0);                 // T2 = Index
+      var bNeg: int64 := self.codeLen;
+      self.xt_BGEZ(XT_T2, 0);                    // >= 0 → zweite Pruefung
+      self.xt_ILL();
+      self.xt_patchBRI12(bNeg, 13, self.codeLen);
+      self.xt_loadSlot2(src2);                   // T1 = Laenge
+      self.xt_SUB(XT_T0, XT_T2, XT_T1);          // Index - Laenge
+      var bLen: int64 := self.codeLen;
+      self.xt_BLTZ(XT_T0, 0);                    // < 0 → im Bereich
+      self.xt_ILL();
+      self.xt_patchBRI12(bLen, 9, self.codeLen);
+      return;
     }
 
     // #1339: IRO_PANIC. Dieselbe Lage wie bei IRO_THROW darunter — dieses
@@ -820,6 +857,24 @@ pub type EmitXtensa = class {
 
   // #1786: eine BEQZ-Weite nachtragen, statt sie zu zaehlen. Die Hardware
   // rechnet ab PC + 4; das Register steckt im unteren Nibble des Platzhalters.
+  // #1789: ILL — der kontrollierte Abbruch. Gegen qemus Disassembler geprueft
+  // (dekodiert als `ill`) und im Lauf belegt (SIGILL, rc=132). Auf dem ESP32
+  // loest er eine Ausnahme aus und landet im Panik-Handler, statt weiterzulaufen.
+  // Eine erfundene Trap-Kodierung waere hier besonders gefaehrlich: eine
+  // Zusicherung, die nicht ausloest, laesst das Programm genau dort weiterlaufen,
+  // wo es abbrechen sollte.
+  fn xt_ILL() { self.xt_e3(0x00, 0x00, 0x00); }
+
+  // #1789: Weite einer BRI12-Form nachtragen. m waehlt die Form
+  // (BEQZ 1, BNEZ 5, BLTZ 9, BGEZ 13); das Register steckt im unteren Nibble
+  // des Platzhalters. Gezaehlt wird nicht — dreimal in dieser Sitzung war eine
+  // handgezaehlte Weite falsch.
+  fn xt_patchBRI12(off: int64, m: int64, ziel: int64) {
+    var as2: int64 := peek8(self.codeBuf + off + 1) & 0xF;
+    var im12: int64 := (ziel - (off + 4)) & 0xFFF;
+    self.xt_poke3(off, (m << 4) | 6, ((im12 & 0xF) << 4) | as2, (im12 >> 4) & 0xFF);
+  }
+
   fn xt_patchBEQZ(off: int64, ziel: int64) {
     var as2: int64 := peek8(self.codeBuf + off + 1) & 0xF;
     var im12: int64 := (ziel - (off + 4)) & 0xFFF;
@@ -889,6 +944,90 @@ pub type EmitXtensa = class {
     // 37 × 3 = 111 bytes ✓
   }
 
+  // #1789: vorzeichenbehaftete Division durch wiederholtes Abziehen mit
+  // Verdopplung (restoring division), 32 Schritte.
+  //
+  //   a6 = Dividend rein, Quotient raus
+  //   a7 = Divisor rein, Rest raus
+  //
+  // Benutzt a2..a5 als Kratzregister und rettet a0 auf den Stapel, weil CALL0
+  // die Rueckkehradresse dort ablegt und die Schleife selbst nicht ruft.
+  //
+  // Vorzeichen: es wird MIT BETRAEGEN gerechnet und am Ende korrigiert. Das
+  // Vorzeichen des Restes folgt dem Dividenden, wie bei / und % ueblich (und
+  // wie es der x86-Pfad tut — die beiden muessen uebereinstimmen, sonst rechnet
+  // dasselbe Programm je nach Ziel anders).
+  //
+  // Division durch 0 kommt hier nicht an: ir_lower stellt vor jede Division
+  // ein IRO_ASSERT_NOT_ZERO, und das ist seit #1789 umgesetzt.
+  fn xt_emitDivHelper() {
+    self.xt_ADDI(XT_SP, XT_SP, -16);
+    self.xt_S32I(XT_A0, XT_SP, 0);
+    // a2 = Vorzeichen des Quotienten, a3 = Vorzeichen des Restes
+    self.xt_MOVI(XT_RV, 0);
+    self.xt_MOVI(XT_A3, 0);
+    // Dividend negativ? → Betrag, beide Vorzeichen merken
+    var vD: int64 := self.codeLen;
+    self.xt_BGEZ(XT_A6, 0);
+    self.xt_NEG(XT_A6, XT_A6);
+    self.xt_MOVI(XT_RV, 1);
+    self.xt_MOVI(XT_A3, 1);
+    self.xt_patchBRI12(vD, 13, self.codeLen);
+    // Divisor negativ? → Betrag, Quotientenvorzeichen kippen
+    var vS: int64 := self.codeLen;
+    self.xt_BGEZ(XT_A7, 0);
+    self.xt_NEG(XT_A7, XT_A7);
+    self.xt_MOVI(XT_A4, 1);
+    self.xt_XOR(XT_RV, XT_RV, XT_A4);
+    self.xt_patchBRI12(vS, 13, self.codeLen);
+    // a4 = Quotient, a5 = Rest, Schleifenzaehler in a8 (T0)
+    self.xt_MOVI(XT_A4, 0);
+    self.xt_MOVI(XT_A5, 0);
+    self.xt_MOVI(XT_T0, 32);
+    var lTop: int64 := self.codeLen;
+    // Rest << 1 | oberstes Bit des Dividenden
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_SSL(XT_T1);
+    self.xt_SLL(XT_A5, XT_A5);
+    self.xt_SLL(XT_A4, XT_A4);
+    self.xt_MOVI(XT_T1, 31);
+    self.xt_SSR(XT_T1);
+    self.xt_SRL(XT_T2, XT_A6);            // T2 = Dividend >> 31 (oberstes Bit)
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_AND(XT_T2, XT_T2, XT_T1);
+    self.xt_OR(XT_A5, XT_A5, XT_T2);
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_SSL(XT_T1);
+    self.xt_SLL(XT_A6, XT_A6);
+    // Rest >= Divisor? → abziehen, Quotientenbit setzen
+    self.xt_SUB(XT_T2, XT_A5, XT_A7);
+    var lKein: int64 := self.codeLen;
+    self.xt_BLTZ(XT_T2, 0);
+    self.xt_MOV(XT_A5, XT_T2);
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_OR(XT_A4, XT_A4, XT_T1);
+    self.xt_patchBRI12(lKein, 9, self.codeLen);
+    self.xt_ADDI(XT_T0, XT_T0, -1);
+    var lEnde: int64 := self.codeLen;
+    self.xt_BEQZ(XT_T0, 0);
+    self.xt_J(lTop - (self.codeLen + 4));
+    self.xt_patchBEQZ(lEnde, self.codeLen);
+    // Vorzeichen setzen
+    var vQ: int64 := self.codeLen;
+    self.xt_BEQZ(XT_RV, 0);
+    self.xt_NEG(XT_A4, XT_A4);
+    self.xt_patchBEQZ(vQ, self.codeLen);
+    var vR: int64 := self.codeLen;
+    self.xt_BEQZ(XT_A3, 0);
+    self.xt_NEG(XT_A5, XT_A5);
+    self.xt_patchBEQZ(vR, self.codeLen);
+    self.xt_MOV(XT_A6, XT_A4);
+    self.xt_MOV(XT_A7, XT_A5);
+    self.xt_L32I(XT_A0, XT_SP, 0);
+    self.xt_ADDI(XT_SP, XT_SP, 16);
+    self.xt_JX_A0();
+  }
+
   fn xt_emitHelpers() {
     while (self.codeLen & 3) != 0 { self.xt_NOP(); }
     self.xt_printstrOff := self.codeLen;
@@ -897,6 +1036,10 @@ pub type EmitXtensa = class {
     while (self.codeLen & 3) != 0 { self.xt_NOP(); }
     self.xt_printintOff := self.codeLen;
     self.xt_emitPrintIntHelper();
+
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+    self.xt_divOff := self.codeLen;
+    self.xt_emitDivHelper();
 
     while (self.codeLen & 3) != 0 { self.xt_NOP(); }
   }
@@ -1053,6 +1196,7 @@ pub type EmitXtensa = class {
     self.poolFix    := alloc(65536 * 32);
     self.poolFixN   := 0;
     self.getpcOff   := 0;
+    self.xt_divOff  := 0;
     self.strDatCap  := 4096;
     self.strDatBuf  := alloc(self.strDatCap);
     self.strDatLen  := 0;
