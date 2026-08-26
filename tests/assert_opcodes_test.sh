@@ -21,6 +21,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+
+# #1789: KEINE Speicherauszüge. Die Zusicherungen loesen ILL aus, das Programm
+# stirbt also planmaessig mit SIGILL — und der Kern-Dump laeuft hier ueber
+# `apport` (core_pattern ist ein Pipe-Handler). Unter Last dauert das laenger
+# als der Zeitdeckel, und der Testfall meldete 124 statt 132: ein Flackern, das
+# nichts ueber den Compiler aussagt. Mit Limit 0 ruft der Kern den Dumper gar
+# nicht erst auf.
+ulimit -c 0
 PASS=0; FAIL=0
 ok() { echo "PASS $1"; PASS=$((PASS+1)); }
 no() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }

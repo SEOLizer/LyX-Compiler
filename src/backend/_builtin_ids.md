@@ -83,6 +83,22 @@ LyxOS-Builtin-Misdispatch (PR #839) und der verworfene Opcode-Catch-all
 | 411 | Ereignis abholen, nicht blockierend | `sys_event_recv` | #1734; LyxOS 122 |
 | 412 | Ereignis einer bestimmten Queue abholen | `sys_event_recv_pid` | #1734; LyxOS 132 |
 | 413 | Ereignis mit Frist abholen | `sys_event_recv_timeout` | #1734; LyxOS 218 — blockiert NICHT, die Frist löst die Schleife des Aufrufers ein |
+| 414 | TCP verbinden, Sockel zurück | `sys_tcp_connect` | #1734; LyxOS 180 `(ip, port)` — der Sockel entsteht dabei, es gibt kein `socket()` davor |
+| 415 | TCP senden | `sys_tcp_send` | #1734; LyxOS 181 `(sock, buf, len)` — flacher Puffer, kein msghdr |
+| 416 | TCP empfangen | `sys_tcp_recv` | #1734; LyxOS 182 `(sock, buf, max)` |
+| 417 | TCP schließen | `sys_tcp_close` | #1734; LyxOS 183 — kein Halbschließen |
+| 418 | TCP-Zustand | `sys_tcp_status` | #1734; LyxOS 184 → 0=CLOSED 1=SYN_SENT 2=ESTABLISHED 3=FIN_WAIT |
+| 419 | Zugewiesene IP (packed BE), 0 = kein Lease | `sys_net_get_ip` | #1734; LyxOS 141 |
+| 420 | Standard-Gateway | `sys_net_get_gw` | #1734; LyxOS 142 |
+| 421 | Netzmaske | `sys_net_get_mask` | #1734; LyxOS 143 |
+| 422 | Erster DNS-Server | `sys_net_get_dns` | #1734; LyxOS 144 |
+| 423 | Sechs MAC-Bytes in den Puffer | `sys_net_get_mac` | #1734; LyxOS 145 |
+| 424 | Rohen Ethernet-Rahmen senden, max 1500 | `sys_net_send` | #1734; LyxOS 146 |
+| 425 | Einen rohen Rahmen empfangen, 0 = keiner da | `sys_net_recv` | #1734; LyxOS 147 |
+| 426 | 112-Byte-Struktur mit den Schnittstellendaten | `sys_net_get_info` | #1734; LyxOS 211 |
+| 427 | Ein Feld der Schnittstelle setzen | `sys_net_set` | #1734; LyxOS 212 |
+| 428 | ICMP-Echo; der Puffer traegt Parameter rein und Ergebnisse raus | `sys_icmp_ping` | #1734; LyxOS 213 |
+| 429 | DNS-Abfrage; buf Parameter/Ergebnis, a1 = Name | `sys_dns_query` | #1734; LyxOS 214 |
 
 Warum oberhalb des Syscall-Bereichs und nicht darin: das sind keine Syscalls,
 sondern Rechenoperationen, die jedes Backend umsetzen kann. Sie im
