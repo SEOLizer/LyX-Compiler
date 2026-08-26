@@ -4,12 +4,18 @@
 #
 # Die LyxOS-ABI hat zwei Tabellen: einen hex-gruppierten Entwurf (0x0400 IPC,
 # 0x0800 KI, 0x0C00 IOFS ...) und das, was im Kernel steht. Der Entwurf sieht
-# systematisch aus und ist zu grossen Teilen nie gebaut worden. Implementiert
-# sind flach 0-228 und 300-326, dazu 2063-2066 und 2315.
+# systematisch aus und ist zu grossen Teilen nie gebaut worden.
 #
-# Heute trifft eine erfundene Nummer nichts, weil 229-399 frei ist. Genau das
-# macht den Fehler unsichtbar -- und waechst die flache Tabelle, wandert eine
-# Phantasienummer nach der anderen in belegtes Gebiet.
+# Was es wirklich gibt, sagt die aus kernel/ring3.lyx ERZEUGTE Tabelle
+# (tools/sync_syscalls.py, 197 Nummern) plus die Abfangstellen im Bootloader.
+# Der erste Anlauf dieser Pruefung stuetzte sich auf eine Handfassung
+# ("0-228 und 300-326") und wies damit 32 BELEGTE Nummern ab, darunter drei,
+# die dieses Backend wirklich emittiert. Deshalb prueft diese Datei BEIDE
+# Richtungen: Erfundenes muss melden, Belegtes muss bauen.
+#
+# Eine erfundene Nummer stuerzt NICHT ab -- der Bootloader liefert fuer
+# Unbekanntes still 0 und meldet Erfolg (.r3_unknown). Diese Pruefung ist
+# damit die einzige Stelle, die es ueberhaupt bemerken kann.
 
 cd "$(dirname "$0")/.." || exit 1
 LYXC="${LYXC:-./lyxc}"
@@ -58,7 +64,9 @@ pruefe_meldet "sys_port_in (0x0304)"  "sys_port_in(1, 1)"
 # ist deshalb umgedreht — sie muss jetzt BAUEN, und weiter unten wird die
 # emittierte Nummer nachgesehen.
 pruefe_baut "sys_seek (8)"            "sys_seek(1, 0, 0)"
-pruefe_meldet "sys_readdir (0x020A)"  "sys_readdir(1, 1, 1)"
+# #1734: sys_readdir stand hier als Phantasienummer. Es ist keine -- die
+# erzeugte Tabelle fuehrt 522 mit echtem Handler (VfsReadDir). Umgedreht.
+pruefe_baut "sys_readdir (522)"       "sys_readdir(1, 1, 1)"
 pruefe_meldet "sys_socket (0x0600)"   "sys_socket(1, 1, 1)"
 pruefe_meldet "sys_connect (0x0604)"  "sys_connect(1, 1, 1)"
 pruefe_meldet "sys_mutex_lock (0x0401)" "sys_mutex_lock(1, 0)"
@@ -68,6 +76,30 @@ pruefe_meldet "sys_task_spawn (0x0B00)" "sys_task_spawn(1, 1, 1, 0)"
 pruefe_meldet "sys_ai_infer (0x0804)" "sys_ai_infer(1, 1, 1, 0)"
 pruefe_meldet "sys_iofs_mount (0x0C00)" "sys_iofs_mount(1, 0)"
 pruefe_meldet "sys_trace_event (0x0A00)" "sys_trace_event(1, 1)"
+
+echo "-- LX-VFS-Block: belegt, war faelschlich abgewiesen --"
+# Diese drei wurden vom ersten Anlauf des Waechters zum Uebersetzungsfehler
+# gemacht, obwohl sie funktionieren. Im Kernel nachgesehen: sys_stat macht
+# open->fstat->close, sys_dup ruft VfsDup, sys_readdir ruft VfsReadDir.
+pruefe_baut "sys_stat (517)"          "sys_stat(0, 0, 0, 0)"
+pruefe_baut "sys_dup (523)"           "sys_dup(1, 0)"
+
+echo "-- exit kommt aus dem BOOTLOADER, nicht aus der Tabelle --"
+# 60/231 stehen nicht in der erzeugten Tabelle (die kennt nur
+# Dispatcher-Eintraege), werden aber in bootloader/boot.asm abgefangen. Wer die
+# Tabelle fuer vollstaendig haelt, weist exit ab -- und damit jedes Programm.
+echo 'fn main(): int64 { exit(3); return 0; }' > "$TMP/e.lyx"
+if $LYXC "$TMP/e.lyx" --target=lyxos -o "$TMP/e.lbf" >"$TMP/e.log" 2>&1; then
+    echo "PASS exit (60) baut"; PASS=$((PASS + 1))
+else
+    echo "FAIL exit (60) baut nicht: $(grep -m1 -i error "$TMP/e.log")"; FAIL=$((FAIL + 1))
+fi
+
+echo "-- Luecken INNERHALB der Spannen muessen weiter auffallen --"
+# 204, 206-209 und 216 sind unbelegt, liegen aber mitten in einer sonst
+# belegten Spanne. Eine grobe Pruefung 0..255 wuerde sie durchlassen -- genau
+# die Grosszuegigkeit, aus der #1734 entstanden ist.
+pruefe_meldet "sys_umount (528)"      "sys_umount(1, 1, 1)"
 
 echo "-- echte Nummern muessen bleiben --"
 # #1742: drei Argumente, kein dir_fd — die Vierer-Form wird weiter unten geprueft.
