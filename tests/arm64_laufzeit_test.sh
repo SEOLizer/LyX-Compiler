@@ -190,5 +190,29 @@ run "fnptr_lokal" \
 run "fnptr_feld" \
   'pub type Op = fn(int64): int64; fn dbl(x: int64): int64 { return x * 2; } pub type TH = class { h: Op; fn Create(): void { } fn ruf(v: int64): int64 { return self.h(v); } }; fn main(): int64 { var o: TH := new TH(); o.h := dbl; return o.ruf(21); }' 42
 
+# ---------------------------------------------------------------------------
+# #1812: Feldzugriff ueber eine MODULVARIABLE vom Klassentyp
+#
+# `g_obj.feld` lieferte Muell, waehrend derselbe Zugriff ueber eine lokale
+# Kopie DESSELBEN Objekts — identische Adresse — richtig war. Genau so stand es
+# im Bericht.
+#
+# Ursache: _localTypeNode durchsuchte Locals und Parameter, aber nicht die
+# Modulvariablen. Damit hatte g_obj keinen Typ und der Feld-Offset war
+# unaufloesbar. Dritter Fall derselben Familie nach #1787 (Feld/Aufrufergebnis
+# als Basis) und #1806 (Parameter) — die Typsuche muss JEDE Speicherart kennen.
+run "global_feld_lesen" \
+  'type TB = class { zahl: int64; fn Create() { self.zahl := 42; } }; var g: TB; fn main(): int64 { g := new TB(); return g.zahl; }' 42
+run "global_feld_schreiben" \
+  'type TB = class { zahl: int64; fn Create() { self.zahl := 0; } }; var g: TB; fn main(): int64 { g := new TB(); g.zahl := 42; return g.zahl; }' 42
+run "global_methode" \
+  'type TB = class { zahl: int64; fn Create() { self.zahl := 42; } fn Hole(): int64 { return self.zahl; } }; var g: TB; fn main(): int64 { g := new TB(); return g.Hole(); }' 42
+# Verschachtelt ueber zwei Modulvariablen.
+run "global_kette" \
+  'type TB = class { zahl: int64; fn Create() { self.zahl := 42; } }; type TH = class { b: TB; fn Create() {} }; var gb: TB; var gh: TH; fn main(): int64 { gb := new TB(); gh := new TH(); gh.b := gb; return gh.b.zahl; }' 42
+# Gegenprobe aus dem Bericht: ueber eine lokale Kopie ging es schon vorher.
+run "global_lokale_kopie" \
+  'type TB = class { zahl: int64; fn Create() { self.zahl := 42; } }; var g: TB; fn main(): int64 { g := new TB(); var c: TB := g; return c.zahl; }' 42
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
