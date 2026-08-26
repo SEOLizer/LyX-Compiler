@@ -107,5 +107,40 @@ run "zwei_interfaces" \
 run "interface_ueber_erbe" \
   'pub type IF = interface { fn W(): int64; } pub type TBase = class implements IF { fn Create() {} fn W(): int64 { return 1; } } pub type TAbl = class extends TBase { fn Create() {} override fn W(): int64 { return 9; } } fn main(): int64 { var a: IF := new TAbl() as IF; return a.W(); }' 9
 
+# ---------------------------------------------------------------------------
+# #1787: der statische Typ eines BELIEBIGEN Ausdrucks
+#
+# Gemeldet war „Interface-Methodenaufruf kehrt auf --target=lyxos nicht
+# zurueck". Die Ursache liegt eine Ebene hoeher und trifft alle IR-Backends:
+# der IR-Weg konnte den Typ nur fuer einen einfachen Bezeichner und fuer `self`
+# bestimmen. Stand links etwas anderes — ein Feld, ein Aufrufergebnis, ein
+# `new`, ein Cast —, sprang der Methodenaufruf ueber seinen gesamten
+# Dispatch-Block und gab ein UNINITIALISIERTES Temp zurueck, das sich als 0
+# las. x86 rechnete jedes Mal richtig.
+#
+# Die Faelle unten waren vor dem Fix ALLE rot, die meisten still mit 0.
+run "kette_feld_methode" \
+  'pub type TP = class { x: int64; fn Create() { self.x := 42; } fn W(): int64 { return self.x; } } pub type TH = class { b: TP; fn Create() {} } fn main(): int64 { var k: TP := new TP(); var h: TH := new TH(); h.b := k; return h.b.W(); }' 42
+run "kette_feld_feld" \
+  'pub type TP = class { x: int64; fn Create() { self.x := 42; } } pub type TH = class { b: TP; fn Create() {} } fn main(): int64 { var k: TP := new TP(); var h: TH := new TH(); h.b := k; return h.b.x; }' 42
+run "kette_aufruf_methode" \
+  'pub type TP = class { x: int64; fn Create() { self.x := 42; } fn W(): int64 { return self.x; } } fn hol(): TP { return new TP(); } fn main(): int64 { return hol().W(); }' 42
+run "kette_drei_stufen" \
+  'pub type IF = interface { fn W(): int64; } pub type TP = class implements IF { x: int64; fn Create() { self.x := 42; } fn W(): int64 { return self.x; } } pub type TM = class { p: IF; fn Create() {} } pub type TA = class { m: TM; fn Create() {} } fn main(): int64 { var k: TP := new TP(); var mi: TM := new TM(); mi.p := k; var a: TA := new TA(); a.m := mi; return a.m.p.W(); }' 42
+# Der gemeldete Fall selbst: Interface-Variable, danach muss es weitergehen.
+run "interface_kehrt_zurueck" \
+  'pub type IF = interface { fn W(): int64; } pub type TP = class implements IF { x: int64; fn Create() { self.x := 42; } fn W(): int64 { return self.x; } } fn main(): int64 { var k: TP := new TP(); var a: int64 := k.W(); var i: IF := k; var b: int64 := i.W(); return a + b - 42; }' 42
+# Interface als PARAMETER — so spricht die Vega-VCL ihr Backend an.
+run "interface_als_parameter" \
+  'pub type IF = interface { fn W(): int64; } pub type TP = class implements IF { x: int64; fn Create() { self.x := 42; } fn W(): int64 { return self.x; } } fn nutze(p: IF): int64 { return p.W(); } fn main(): int64 { return nutze(new TP()); }' 42
+# Interface als FELD — lieferte still 0.
+run "interface_als_feld" \
+  'pub type IF = interface { fn W(): int64; } pub type TP = class implements IF { x: int64; fn Create() { self.x := 42; } fn W(): int64 { return self.x; } } pub type TH = class { b: IF; fn Create() {} } fn main(): int64 { var k: TP := new TP(); var h: TH := new TH(); h.b := k; return h.b.W(); }' 42
+# Ohne `implements`: x86 nimmt das an und rechnet richtig (Selektoren, #1133).
+# Der IR-Weg fand mangels Zusage keinen Kandidaten und lief in den Abbruch.
+# Bei genau einer Klasse mit dieser Methode ist der Aufruf eindeutig.
+run "interface_ohne_implements" \
+  'pub type IF = interface { fn W(): int64; } pub type TP = class { x: int64; fn Create() { self.x := 42; } fn W(): int64 { return self.x; } } fn main(): int64 { var k: TP := new TP(); var i: IF := k; return i.W(); }' 42
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
