@@ -284,6 +284,79 @@ else
     echo "FAIL Ereignismodell: uebersetzt nicht"; FAIL=$((FAIL + 1))
 fi
 
+echo "-- #1734 Punkt 2: TCP mit den ECHTEN Nummern --"
+# Der Kernel hat FUENF Aufrufe (180-184), die BSD-Seite hat zehn — und sie sind
+# anders geschnitten, nicht bloss anders nummeriert: sys_tcp_connect liefert den
+# Sockel SELBST (kein socket() davor), send/recv nehmen einen flachen Puffer
+# statt eines msghdr, und bind/listen/accept haben ueberhaupt kein Gegenstueck.
+# LyxOS kennt nur die Client-Seite.
+pruefe_baut "sys_tcp_connect (180)" "sys_tcp_connect(167772161, 80)"
+pruefe_baut "sys_tcp_send (181)"    "sys_tcp_send(3, 2097152, 16)"
+pruefe_baut "sys_tcp_recv (182)"    "sys_tcp_recv(3, 2097152, 256)"
+pruefe_baut "sys_tcp_close (183)"   "sys_tcp_close(3)"
+pruefe_baut "sys_tcp_status (184)"  "sys_tcp_status(3)"
+
+# Die BSD-Namen muessen weiter melden — und die Meldung muss den Weg nennen,
+# den es WIRKLICH gibt. Sonst sucht der naechste Leser an der falschen Stelle.
+pruefe_meldet "sys_socket bleibt gemeldet"  "sys_socket(2, 1, 0)"
+pruefe_meldet "sys_listen bleibt gemeldet"  "sys_listen(3, 5)"
+printf 'fn main(): int64 { return sys_listen(3, 5); }\n' > "$TMP/ls.lyx"
+msgls="$($LYXC "$TMP/ls.lyx" --target=lyxos -o "$TMP/ls.lbf" 2>&1)"
+case "$msgls" in
+  *"KEIN Gegenstueck"*)
+    echo "PASS sys_listen: Meldung nennt die fehlende Server-Seite"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL sys_listen: Meldung nennt die fehlende Server-Seite: $(echo "$msgls"|sed -n 2p)"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# Und die Nummern muessen wirklich im Erzeugnis stehen, nicht nur uebersetzen.
+printf 'fn main(): int64 { var b: int64 := 0x200000; var s: int64 := sys_tcp_connect(167772161, 80); sys_tcp_send(s, b, 16); sys_tcp_recv(s, b, 256); var t: int64 := sys_tcp_status(s); sys_tcp_close(s); return t; }\n' > "$TMP/tcp.lyx"
+if $LYXC "$TMP/tcp.lyx" --target=lyxos -o "$TMP/tcp.lbf" >/dev/null 2>&1; then
+    HEXT="$(od -An -tx1 -v "$TMP/tcp.lbf" | tr -d ' \n')"
+    fehltT=""
+    for paar in "180:b4" "181:b5" "182:b6" "183:b7" "184:b8"; do
+        nrT="${paar%%:*}"; byT="${paar##*:}"
+        case "$HEXT" in *"48b8${byT}00000000000000"*) : ;; *) fehltT="$fehltT $nrT" ;; esac
+    done
+    if [ -z "$fehltT" ]; then
+        echo "PASS TCP: 180-184 stehen im Erzeugnis"; PASS=$((PASS + 1))
+    else
+        echo "FAIL TCP: diese Nummern fehlen im Erzeugnis:$fehltT"; FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL TCP: uebersetzt nicht"; FAIL=$((FAIL + 1))
+fi
+
+echo "-- #1734 Punkt 2: Netz und DNS mit den ECHTEN Nummern --"
+# Anders als bei TCP ist das wirklich Tabellenarbeit: keine BSD-Namen, die
+# kollidieren, keine Gestaltunterschiede — die elf Aufrufe sind rein additiv.
+pruefe_baut "sys_net_get_ip (141)"   "sys_net_get_ip()"
+pruefe_baut "sys_net_get_mac (145)"  "sys_net_get_mac(2097152)"
+pruefe_baut "sys_net_send (146)"     "sys_net_send(2097152, 64)"
+pruefe_baut "sys_net_recv (147)"     "sys_net_recv(2097152, 1500)"
+pruefe_baut "sys_net_get_info (211)" "sys_net_get_info(2097152)"
+pruefe_baut "sys_icmp_ping (213)"    "sys_icmp_ping(2097152)"
+pruefe_baut "sys_dns_query (214)"    "sys_dns_query(2097152, 2097152)"
+
+# Auch hier: dass es baut, belegt nur, dass etwas entstand. Geprueft wird, dass
+# jede der elf Nummern wirklich im Abbild steht.
+printf 'fn main(): int64 { var b: int64 := 0x200000; var i: int64 := sys_net_get_ip(); sys_net_get_gw(); sys_net_get_mask(); sys_net_get_dns(); sys_net_get_mac(b); sys_net_send(b, 64); sys_net_recv(b, 1500); sys_net_get_info(b); sys_net_set(1, 2); sys_icmp_ping(b); sys_dns_query(b, b); return i; }\n' > "$TMP/nz.lyx"
+if $LYXC "$TMP/nz.lyx" --target=lyxos -o "$TMP/nz.lbf" >/dev/null 2>&1; then
+    HEXN="$(od -An -tx1 -v "$TMP/nz.lbf" | tr -d ' \n')"
+    fehltN=""
+    for paar in "141:8d" "142:8e" "143:8f" "144:90" "145:91" "146:92" "147:93" "211:d3" "212:d4" "213:d5" "214:d6"; do
+        nrN="${paar%%:*}"; byN="${paar##*:}"
+        case "$HEXN" in *"48b8${byN}00000000000000"*) : ;; *) fehltN="$fehltN $nrN" ;; esac
+    done
+    if [ -z "$fehltN" ]; then
+        echo "PASS Netz/DNS: alle elf Nummern stehen im Erzeugnis"; PASS=$((PASS + 1))
+    else
+        echo "FAIL Netz/DNS: diese Nummern fehlen im Erzeugnis:$fehltN"; FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL Netz/DNS: uebersetzt nicht"; FAIL=$((FAIL + 1))
+fi
+
 echo "----"
 echo "$PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
