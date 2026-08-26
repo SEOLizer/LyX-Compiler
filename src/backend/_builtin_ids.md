@@ -79,6 +79,10 @@ LyxOS-Builtin-Misdispatch (PR #839) und der verworfene Opcode-Catch-all
 | 407 | Leerraum vorn/hinten entfernen | `StrTrim` | #1720; ändert an Ort und Stelle, gibt Zeiger zurück |
 | 408 | Teilkette suchen, Index oder −1 | `StrFind` | #1720; leere Nadel → 0 |
 | 409 | Datei ganz lesen, nullterminiert | `FileReadAll` | #1720; 0 bei Fehler |
+| 410 | Ereignis an einen Prozess senden | `sys_event_send` | #1734; LyxOS 121 |
+| 411 | Ereignis abholen, nicht blockierend | `sys_event_recv` | #1734; LyxOS 122 |
+| 412 | Ereignis einer bestimmten Queue abholen | `sys_event_recv_pid` | #1734; LyxOS 132 |
+| 413 | Ereignis mit Frist abholen | `sys_event_recv_timeout` | #1734; LyxOS 218 — blockiert NICHT, die Frist löst die Schleife des Aufrufers ein |
 
 Warum oberhalb des Syscall-Bereichs und nicht darin: das sind keine Syscalls,
 sondern Rechenoperationen, die jedes Backend umsetzen kann. Sie im
