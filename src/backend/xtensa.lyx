@@ -87,6 +87,7 @@ pub type EmitXtensa = class {
   poolFixN:   int64;
   getpcOff:   int64;   // Code-Offset der Rueckspring-Marke
   xt_divOff:  int64;   // #1789: Code-Offset der Divisionsroutine
+  xt_mulOff:  int64;   // #1790: Code-Offset der Multiplikationsroutine
   strDatBuf:  int64;   // gesammelte Zeichenketten-Bytes
   strDatLen:  int64;
   strDatCap:  int64;
@@ -467,9 +468,26 @@ pub type EmitXtensa = class {
       self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
       self.xt_SUB(XT_T0, XT_T0, XT_T1); self.xt_storeSlot(dest);
     }
+    // #1790: Multiplikation. MULL gehoert zur Mul32-OPTION — die hat der ESP32,
+    // aber KEINER der hier verfuegbaren qemu-Kerne (dc232b, dc233c, de212,
+    // de233_fpu, dsp3400, lx106, sample_controller). Die Kodierung waere damit
+    // nur durch Konstruktion belegt, nicht durch Ausfuehrung.
+    //
+    // Was das wert ist, hat #1789 gezeigt: dort stand bei IRO_DIV ein
+    // `MOVI T0, 0`, das jede Pruefung ausser der Ausfuehrung ueberstanden hat.
+    // Deshalb hier dieselbe Entscheidung wie bei der Division — eine
+    // Softwareroutine. Sie ist auf JEDEM Xtensa-Kern richtig, nicht nur auf
+    // denen mit der Option, und sie ist hier nachweisbar.
     if op == IRO_MUL {
-      self.xt_loadSlot(src1); self.xt_loadSlot2(src2);
-      self.xt_MULL(XT_T0, XT_T0, XT_T1); self.xt_storeSlot(dest);
+      self.xt_loadSlot(src1);
+      self.xt_MOV(XT_A6, XT_T0);
+      self.xt_loadSlot2(src2);
+      self.xt_MOV(XT_A7, XT_T1);
+      var mPC:  int64 := self.codeLen;
+      var mOff: int64 := (self.xt_mulOff - ((mPC & -4) + 4)) >> 2;
+      self.xt_CALL0(mOff);                    // a6 = Produkt
+      self.xt_MOV(XT_T0, XT_A6);
+      self.xt_storeSlot(dest);
     }
     // #1789: Division und Rest. Die Basis-ISA hat KEINEN Divisionsbefehl —
     // DIV32 (QUOS/REMS) ist eine Option, die hier ebenso wenig pruefbar ist wie
@@ -960,6 +978,46 @@ pub type EmitXtensa = class {
   //
   // Division durch 0 kommt hier nicht an: ir_lower stellt vor jede Division
   // ein IRO_ASSERT_NOT_ZERO, und das ist seit #1789 umgesetzt.
+  // #1790: Multiplikation durch Verschieben und Addieren, 32 Schritte.
+  //
+  //   a6 = Faktor rein, Produkt raus
+  //   a7 = Faktor rein (wird verbraucht)
+  //
+  // Vorzeichen brauchen KEINE Sonderbehandlung: im Zweierkomplement ist das
+  // untere 32-Bit-Ergebnis fuer vorzeichenbehaftete und vorzeichenlose
+  // Multiplikation dasselbe. Das ist der Unterschied zur Division, wo mit
+  // Betraegen gerechnet und am Ende korrigiert werden muss.
+  fn xt_emitMulHelper() {
+    self.xt_ADDI(XT_SP, XT_SP, -16);
+    self.xt_S32I(XT_A0, XT_SP, 0);
+    self.xt_MOVI(XT_A4, 0);                  // a4 = Produkt
+    self.xt_MOVI(XT_T0, 32);                 // Zaehler
+    var mTop: int64 := self.codeLen;
+    // unterstes Bit von a7 gesetzt? → a6 aufaddieren
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_AND(XT_T2, XT_A7, XT_T1);
+    var mKein: int64 := self.codeLen;
+    self.xt_BEQZ(XT_T2, 0);
+    self.xt_ADD(XT_A4, XT_A4, XT_A6);
+    self.xt_patchBEQZ(mKein, self.codeLen);
+    // a6 <<= 1, a7 >>= 1 (logisch)
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_SSL(XT_T1);
+    self.xt_SLL(XT_A6, XT_A6);
+    self.xt_MOVI(XT_T1, 1);
+    self.xt_SSR(XT_T1);
+    self.xt_SRL(XT_A7, XT_A7);
+    self.xt_ADDI(XT_T0, XT_T0, -1);
+    var mEnde: int64 := self.codeLen;
+    self.xt_BEQZ(XT_T0, 0);
+    self.xt_J(mTop - (self.codeLen + 4));
+    self.xt_patchBEQZ(mEnde, self.codeLen);
+    self.xt_MOV(XT_A6, XT_A4);
+    self.xt_L32I(XT_A0, XT_SP, 0);
+    self.xt_ADDI(XT_SP, XT_SP, 16);
+    self.xt_JX_A0();
+  }
+
   fn xt_emitDivHelper() {
     self.xt_ADDI(XT_SP, XT_SP, -16);
     self.xt_S32I(XT_A0, XT_SP, 0);
@@ -1040,6 +1098,10 @@ pub type EmitXtensa = class {
     while (self.codeLen & 3) != 0 { self.xt_NOP(); }
     self.xt_divOff := self.codeLen;
     self.xt_emitDivHelper();
+
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+    self.xt_mulOff := self.codeLen;
+    self.xt_emitMulHelper();
 
     while (self.codeLen & 3) != 0 { self.xt_NOP(); }
   }
@@ -1197,6 +1259,7 @@ pub type EmitXtensa = class {
     self.poolFixN   := 0;
     self.getpcOff   := 0;
     self.xt_divOff  := 0;
+    self.xt_mulOff  := 0;
     self.strDatCap  := 4096;
     self.strDatBuf  := alloc(self.strDatCap);
     self.strDatLen  := 0;

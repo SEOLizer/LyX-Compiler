@@ -208,5 +208,32 @@ run "f64_con_ln2"       'con LN2: f64 := 0.6931471805599453; fn main(): int64 { 
 # Gegenprobe: ganzzahlige Konstanten bleiben ganzzahlig.
 run "f64_neben_int"     'con P: f64 := 1.5; con I: int64 := 39; fn main(): int64 { var a: f64 := P * 2.0; return I + (a as int64); }' 42
 
+# ---------------------------------------------------------------------------
+# #1806: Funktionszeiger als PARAMETER
+#
+# `fn apply(f: CmpFn, a, b) { return f(a, b); }` scheiterte mit
+# "unbekannter Builtin/Funktion: f" — der Parametername wurde als
+# FUNKTIONSNAME aufgeloest statt als Wert, der einen Zeiger haelt.
+#
+# Ursache: _findLocalSlot durchsuchte nur die Locals. Parameter stehen in der
+# NK_PARAM-Kette und liegen bei IR_BARG_SLOTS (#1388). Dieselbe Suche steht
+# eine Ebene hoeher fuer den LESEzugriff auf einen Parameter laengst da — zwei
+# Stellen, die dasselbe wissen muessen, und nur eine wusste es.
+#
+# Beim Beheben meldeten sich zwei fehlende Opcodes LAUT (so soll es sein):
+# riscv kannte IRO_CALL_INDIRECT gar nicht, arm64 fehlte IRO_FUNC_ADDR. Beide
+# ergaenzt — sonst waere der Fix nur auf lyxos belegt, das hier nicht laeuft.
+run "fnptr_parameter" \
+  'pub type CmpFn = fn(int64, int64): int64; fn add(a: int64, b: int64): int64 { return a + b; } fn apply(f: CmpFn, a: int64, b: int64): int64 { return f(a, b); } fn main(): int64 { return apply(add, 20, 22); }' 42
+# Zwei Zeiger als Parameter, beide gerufen.
+run "fnptr_zwei_parameter" \
+  'pub type Op = fn(int64): int64; fn dbl(x: int64): int64 { return x * 2; } fn inc(x: int64): int64 { return x + 1; } fn zwei(f: Op, g: Op, v: int64): int64 { return f(v) + g(v); } fn main(): int64 { return zwei(dbl, inc, 10) + 11; }' 42
+# Gegenprobe: lokale Variable und Klassenfeld gingen schon vorher und muessen
+# weiter gehen.
+run "fnptr_lokal" \
+  'pub type Op = fn(int64): int64; fn dbl(x: int64): int64 { return x * 2; } fn main(): int64 { var f: Op := dbl; return f(21); }' 42
+run "fnptr_feld" \
+  'pub type Op = fn(int64): int64; fn dbl(x: int64): int64 { return x * 2; } pub type TH = class { h: Op; fn Create(): void { } fn ruf(v: int64): int64 { return self.h(v); } }; fn main(): int64 { var o: TH := new TH(); o.h := dbl; return o.ruf(21); }' 42
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
