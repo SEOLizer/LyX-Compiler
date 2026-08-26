@@ -257,6 +257,33 @@ else
     echo "FAIL sys_open flach baut: $(grep -m1 -iE 'error|erwartet' "$TMP/o.log")"; FAIL=$((FAIL + 1))
 fi
 
+echo "-- #1734 Punkt 2: Ereignismodell mit den ECHTEN Nummern --"
+# 121/122/132/218 statt der Entwurfszahl 0x0300 (sys_poll), die es nicht gibt.
+pruefe_baut "sys_event_send (121)"          "sys_event_send(1, 7, 0, 0, 0)"
+pruefe_baut "sys_event_recv (122)"          "sys_event_recv(2097152)"
+pruefe_baut "sys_event_recv_pid (132)"      "sys_event_recv_pid(0, 2097152)"
+pruefe_baut "sys_event_recv_timeout (218)"  "sys_event_recv_timeout(0, 2097152, 50)"
+
+# Dass es baut, belegt nur, dass irgendetwas entstand. Geprueft wird deshalb,
+# dass die RICHTIGE Nummer im Erzeugnis steht: emitMovRaxImm schreibt
+# 48 B8 <imm64>, also die Nummer als acht Little-Endian-Bytes.
+printf 'fn main(): int64 { var b: int64 := 0x200000; sys_event_send(1, 7, 0, 0, 0); return sys_event_recv(b) + sys_event_recv_pid(0, b) + sys_event_recv_timeout(0, b, 50); }\n' > "$TMP/ev.lyx"
+if $LYXC "$TMP/ev.lyx" --target=lyxos -o "$TMP/ev.lbf" >/dev/null 2>&1; then
+    HEX="$(od -An -tx1 -v "$TMP/ev.lbf" | tr -d ' \n')"
+    fehlt=""
+    for paar in "121:79" "122:7a" "132:84" "218:da"; do
+        nr="${paar%%:*}"; by="${paar##*:}"
+        case "$HEX" in *"48b8${by}00000000000000"*) : ;; *) fehlt="$fehlt $nr" ;; esac
+    done
+    if [ -z "$fehlt" ]; then
+        echo "PASS Ereignismodell: 121/122/132/218 stehen im Erzeugnis"; PASS=$((PASS + 1))
+    else
+        echo "FAIL Ereignismodell: diese Nummern fehlen im Erzeugnis:$fehlt"; FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL Ereignismodell: uebersetzt nicht"; FAIL=$((FAIL + 1))
+fi
+
 echo "----"
 echo "$PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
