@@ -193,5 +193,29 @@ con A: int64 := -7;
 con B: int64 := !0;
 fn main(): int64 { PrintLn(IntToStr(A + B)); return 0; }' "-6"
 
+# ===========================================================================
+# #1803 — negative f64-Konstante
+# ===========================================================================
+#
+# Das unaere Minus vor einem Gleitkomma-Literal wurde GANZZAHLIG auf dem
+# IEEE-Bitmuster ausgefuehrt:
+#
+#   Bits von 1.5  = 0x3FF8000000000000
+#   0 - Bits      = 0xC008000000000000  -> -3.0   (was der Compiler tat)
+#   Vorzeichenbit = 0xBFF8000000000000  -> -1.5   (richtig)
+#
+# Dass daraus eine plausible Zahl wird und kein NaN, hat den Fehler getragen.
+# Dieselbe Sperre steht seit #1499 in cg_foldConst; dem unaeren Zweig fehlte sie.
+out "#1803: negative f64-con" 'import std.io;
+con N: f64 := -1.5;
+fn main(): int64 { var b: f64 := N * 2.0; PrintLn(IntToStr(b as int64)); return 0; }' "-3"
+out "#1803: positive f64-con unveraendert" 'import std.io;
+con P: f64 := 2.5;
+fn main(): int64 { var a: f64 := P * 2.0; PrintLn(IntToStr(a as int64)); return 0; }' "5"
+# Gegenprobe: das unaere Minus auf GANZZAHLEN darf sich nicht veraendert haben.
+out "#1803: negative int-con unveraendert" 'import std.io;
+con I: int64 := -7;
+fn main(): int64 { PrintLn(IntToStr(I)); return 0; }' "-7"
+
 echo "--- $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
