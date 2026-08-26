@@ -26,7 +26,6 @@
 #     sample_controller) hat sie, ESP32s LX6 dagegen schon. Die Kodierung steht
 #     nach Konstruktion da, nicht nach Ausfuehrung — ein Testfall hier wuerde
 #     nur den fehlenden Kern messen.
-#   * Multiplikation (#1790): kein verfuegbarer qemu-Kern hat Mul32.
 #   * Ausgabe: der PrintStr-Helfer schreibt in das UART-Register 0x60000000.
 #     Das ist auf dem ESP32 richtig, im User-Mode-Emulator aber unabgebildet —
 #     gemessen wird hier deshalb ueber den Rueckgabewert.
@@ -162,6 +161,29 @@ run "division_kette"   'fn main(): int64 { var s: int64 := 0; var i: int64 := 1;
 run "division_durch_null" 'fn main(): int64 { var a: int64 := 84; var b: int64 := 0; return a / b; }' 132
 # Der gute Fall darf NICHT ausloesen — sonst waere die Zusicherung wertlos.
 run "assert_haelt"     'fn main(): int64 { var a: int64 := 84; var b: int64 := 2; assert(b != 0); return a / b; }' 42
+
+# ---------------------------------------------------------------------------
+# #1790: Multiplikation als Softwareroutine
+#
+# MULL gehoert zur Mul32-OPTION. Die hat der ESP32, aber KEINER der hier
+# verfuegbaren qemu-Kerne (dc232b, dc233c, de212, de233_fpu, dsp3400, lx106,
+# sample_controller) — die Kodierung waere also nur durch Konstruktion belegt.
+#
+# Was das wert ist, hat #1789 gezeigt: dort stand bei IRO_DIV ein `MOVI T0, 0`,
+# das jede Pruefung ausser der Ausfuehrung ueberstanden hat. Deshalb dieselbe
+# Entscheidung wie bei der Division — Verschieben und Addieren, 32 Schritte.
+# Auf JEDEM Xtensa-Kern richtig und hier nachweisbar.
+#
+# Vorzeichen brauchen keine Sonderbehandlung: im Zweierkomplement ist das untere
+# 32-Bit-Ergebnis fuer vorzeichenbehaftet und vorzeichenlos dasselbe. Das ist der
+# Unterschied zur Division, wo mit Betraegen gerechnet werden muss.
+run "multiplikation"      'fn main(): int64 { var a: int64 := 6; var b: int64 := 7; return a * b; }' 42
+run "mult_negativ"        'fn main(): int64 { var a: int64 := 0-6; var b: int64 := 7; return (a * b) + 84; }' 42
+run "mult_beide_negativ"  'fn main(): int64 { var a: int64 := 0-6; var b: int64 := 0-7; return a * b; }' 42
+run "mult_null"           'fn main(): int64 { var a: int64 := 123; var b: int64 := 0; return (a * b) + 42; }' 42
+run "mult_gross"          'fn main(): int64 { var a: int64 := 1000; var b: int64 := 1000; return (a * b) / 25000 + 2; }' 42
+# Der Fall, der vor #1790 mit "Illegal instruction" am MULL abbrach.
+run "strlen_mal_sieben"   'fn main(): int64 { return StrLen("abcdef"c) * 7; }' 42
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]

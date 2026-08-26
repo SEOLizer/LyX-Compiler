@@ -69,6 +69,9 @@ pub con PATCH_B:    int64 := 0;
 pub con PATCH_CBZ:  int64 := 1;
 pub con PATCH_CBNZ: int64 := 2;
 pub con PATCH_BL:   int64 := 3;
+// #1806: Adresse einer Funktion als WERT (fn-Zeiger). ADR laedt PC-relativ,
+// Reichweite +/-1 MB — reicht fuer ein Modul; darueber meldet applyPatches.
+pub con PATCH_ADR:  int64 := 4;
 
 // ============================================================================
 // EmitARM64 Class
@@ -397,6 +400,7 @@ pub type EmitARM64 = class {
     if (op == 167 || op == IRO_ADD || op == IRO_ALLOC || op == IRO_AND) { return 1; }
     if (op == IRO_BR_FALSE || op == IRO_BR_TRUE || op == IRO_CALL || op == IRO_CALL_BUILTIN) { return 1; }
     if (op == IRO_CALL_EXTERN || op == IRO_CALL_INDIRECT || op == IRO_CMP_EQ || op == IRO_CMP_GE) { return 1; }
+    if (op == IRO_FUNC_ADDR) { return 1; }   // #1806
     if (op == IRO_CMP_GT || op == IRO_CMP_LE || op == IRO_CMP_LT || op == IRO_CMP_NEQ) { return 1; }
     if (op == IRO_CONST_FLOAT || op == IRO_CONST_INT || op == IRO_CONST_STR || op == IRO_DIV) { return 1; }
     if (op == IRO_FADD || op == IRO_FDIV || op == IRO_FMUL || op == IRO_FNEG) { return 1; }
@@ -518,6 +522,7 @@ pub type EmitARM64 = class {
     if op == IRO_CALL         { self.emitCall(src1, src2, imm, dest); }
     if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, src1, dest); }
     if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, imm, dest); }
+    if op == IRO_FUNC_ADDR { self.emitFuncAddr(src1, dest); }
     if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest); }
     if op == IRO_CONST_STR    { self.emitConstStr(imm, dest); }
 
@@ -916,6 +921,18 @@ pub type EmitARM64 = class {
   // Indirect call. Args follow the same convention as emitCall: caller stores
   // args 0..argCount-1 in stack slots 0..argCount-1, this routine loads them
   // into x0..x7 per AAPCS64 before branching through x9.
+  // #1806: IRO_FUNC_ADDR — die Adresse einer Funktion als Wert in einen Slot.
+  // Braucht jeder Aufruf ueber einen Funktionszeiger: erst muss `add` als ZAHL
+  // entstehen, bevor `f(a, b)` sie indirekt rufen kann. Bis 1.1.10G fehlte der
+  // Opcode hier; der Aufruf kam nur deshalb nie so weit, weil die
+  // Namensaufloesung vorher scheiterte (#1806).
+  fn emitFuncAddr(funcId: int64, dest: int64) {
+    var patchOff: int64 := self.codeLen;
+    self.emit32(0x10000009);        // ADR x9, #0 — Platzhalter, wird nachgetragen
+    self.addPatch(patchOff, funcId, PATCH_ADR, 9);
+    self.emitStur(9, ARM64_X29, self.slotOff(dest));
+  }
+
   fn emitCallIndirect(ptrSlot: int64, argCount: int64, dest: int64) {
     var ai: int64 := 0;
     while ai < argCount && ai < 8 {
@@ -1463,7 +1480,7 @@ pub type EmitARM64 = class {
         // on the pre-init pass in calcStackFrame for labelAddrs and on the
         // funcAddrs writes in emitFunc.
         var target: int64 := -1;
-        if ptype == PATCH_BL {
+        if ptype == PATCH_BL || ptype == PATCH_ADR {
           if labelId < 256 {
             target := peek64(self.funcAddrs + labelId * 8);
             // A funcAddrs[i] of 0 is valid only for the FIRST emitted
@@ -1485,6 +1502,13 @@ pub type EmitARM64 = class {
             if ptype == PATCH_BL { opc := 0x94000000; }
             var enc: int64 := opc | (delta & 0x3FFFFFF);
             self.poke32at(codeOff, enc);
+          } else if ptype == PATCH_ADR {
+            // #1806: ADR traegt den Abstand in BYTE (nicht in Befehlen), 21 Bit,
+            // aufgeteilt in immlo (Bits 30:29) und immhi (Bits 23:5).
+            var dByte: int64 := target - codeOff;
+            var immlo: int64 := dByte & 3;
+            var immhi: int64 := (dByte >> 2) & 0x7FFFF;
+            self.poke32at(codeOff, 0x10000000 | (immlo << 29) | (immhi << 5) | reg);
           } else if ptype == PATCH_CBZ {
             var enc: int64 := 0xB4000000 | ((delta & 0x7FFFF) << 5) | reg;
             self.poke32at(codeOff, enc);

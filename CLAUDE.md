@@ -29,7 +29,20 @@ nichts Legitimes durchfällt, und kommentiert den gewollten Durchfall.
 Falsche, lautet die Frage nicht „wo wird falsch gerechnet", sondern „wo müsste
 das Richtige entstehen — gibt es die Stelle?". Belegt: `defer` (#1006,
 Vorabpass ohne Blockbegriff), `&&`/`||` (#1023, nie eine bedingte Auswertung
-erzeugt), `ir_lower` (kannte nur das eigene Modul).
+erzeugt), `ir_lower` (kannte nur das eigene Modul), `_exprTypeNode` (#1787 —
+der Typ war nur für einen Bezeichner bestimmbar, `h.b.W()` gab still 0).
+
+**Die zweite Stelle wurde nicht nachgezogen** — geht ein Konstrukt auf einem
+Pfad und auf einem anderen nicht, ist die richtige Umsetzung meist schon da,
+wenige Zeilen entfernt. Belegt: `cg_foldConst` rechnet `~` korrekt,
+`cg_evalConExpr` kannte es nicht (#1799); die f64-Sperre aus #1499 steht in
+`cg_foldConst`, im unären Zweig daneben fehlte sie (#1803, aus `-1.5` wurde
+`-3.0`); die Parameter-Suche steht für den Lesezugriff da, `_findLocalSlot`
+hatte sie nicht (#1806).
+→ Erst nach der **funktionierenden** Umsetzung im selben Modul greppen, statt
+die kaputte Stelle von vorn zu durchdenken. Wer eine zweite Stelle anlegt,
+verweist im Kommentar auf die erste („dieselbe Rechnung wie X — die beiden
+müssen übereinstimmen"), wie es `cg_parseFloat`/`_parseFloatBits` vormachen.
 
 ## Tests
 
@@ -37,6 +50,19 @@ erzeugt), `ir_lower` (kannte nur das eigene Modul).
   liegt: Auswertungen zählen, Reihenfolgen vergleichen, Zweige über einen
   Seiteneffekt identifizieren. Prüffrage: *wäre der Test vor dem Fix rot?*
   Dreimal in Folge wäre ein Ergebnistest grün gewesen (`case _`, `&&`, `defer`).
+- **„Opcode behandelt" ist keine Aussage über „richtig behandelt".** Eine Liste,
+  die Vorhandensein prüft, meldet den *fehlenden* Opcode laut und übersieht den
+  falschen Rumpf: `xt_opBehandelt` führte `IRO_DIV`, der Rumpf war `MOVI T0, 0`
+  — jede Division lieferte still 0 (#1789). Nur Ausführung deckt das auf. Wo
+  ein Ziel nicht läuft (lyxos braucht den Kernel), auf einem gegenmessen, das
+  denselben IR-Weg geht: riscv und arm64 unter qemu. Dreimal war ein gemeldeter
+  „lyxos-Bug" in Wahrheit der gemeinsame IR-Weg (#1786, #1787, #1798).
+- **Ein Test darf nicht voraussetzen, dass eine Lücke offen bleibt.** Wer eine
+  Ablehnungsmeldung als Nachweis nimmt, macht den Test rot, sobald die Lücke
+  zugeht — in einer Sitzung viermal passiert. Vor dem Schließen einer Lücke in
+  `tests/` nach ihrer Issue-Nummer und nach „meldet", „weist ab", „laut"
+  suchen. Tragfähiger ist der Nachweis am **Erzeugnis** (`e_machine == 94`)
+  oder an der **Wirkung** (Zusicherung löst aus, rc 132).
 - **Ein Test, der nicht läuft, ist schlimmer als keiner.** Neue Suiten ins
   `test`-Target bzw. in `tests/suite-*.txt`; `test_coverage_test.sh` wacht —
   seit #1112 rekursiv, denn davor sah er nur `tests/*.sh` und übersah damit

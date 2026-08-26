@@ -61,6 +61,9 @@ con RV_PATCH_J:   int64 := 0;   // JAL x0, label  (unconditional)
 con RV_PATCH_BL:  int64 := 1;   // JAL ra, funcId  (call)
 con RV_PATCH_BEQ: int64 := 2;   // BEQ t0, x0, label  (branch if == 0)
 con RV_PATCH_BNE: int64 := 3;   // BNE t0, x0, label  (branch if != 0)
+// #1806: Adresse einer Funktion als WERT (fn-Zeiger). AUIPC+ADDI, beide
+// Haelften werden nachgetragen — dasselbe Paar wie bei den globalen Variablen.
+con RV_PATCH_FADDR: int64 := 4;
 
 // ============================================================================
 // EmitRISCV64  —  IR → RV64GC machine code
@@ -427,7 +430,7 @@ pub type EmitRISCV64 = class {
       // sieht dieselbe Liste noch einmal.
       if labelId != -2 {
       var target:  int64 := -1;
-      if ptype == RV_PATCH_BL {
+      if ptype == RV_PATCH_BL || ptype == RV_PATCH_FADDR {
         // #1740: funcAddrs kommt aus alloc und ist null. Ein Ziel 0 ist nur
         // fuer die ZUERST erzeugte Funktion echt; fuer jede andere heisst es
         // „noch nicht erzeugt". Vorher wurde jeder Vorwaertsaufruf auf
@@ -446,6 +449,15 @@ pub type EmitRISCV64 = class {
         if ptype == RV_PATCH_J || ptype == RV_PATCH_BL {
           // rd = ptype (0 = x0 for jump, 1 = ra for call)
           self.rv_poke32at(codeOff, self.rv_buildJAL(ptype, delta));
+        } else if ptype == RV_PATCH_FADDR {
+          // #1806: AUIPC traegt die oberen 20 Bit, ADDI die unteren 12. Weil
+          // ADDI sein Immediate VORZEICHENBEHAFTET addiert, muss der obere Teil
+          // aufgerundet werden, sobald Bit 11 gesetzt ist — dieselbe Rechnung
+          // wie bei applyGlobalRelocs.
+          var faHi: int64 := (delta + 0x800) >> 12;
+          var faLo: int64 := delta - (faHi << 12);
+          self.rv_poke32at(codeOff, 0x17 | (RV_T0 << 7) | ((faHi & 0xFFFFF) << 12));
+          self.rv_poke32at(codeOff + 4, 0x13 | (RV_T0 << 7) | (0 << 12) | (RV_T0 << 15) | ((faLo & 0xFFF) << 20));
         } else if ptype == RV_PATCH_BEQ {
           self.rv_poke32at(codeOff, self.rv_buildBtype(0, RV_T0, RV_ZERO, delta));
         } else if ptype == RV_PATCH_BNE {
@@ -484,6 +496,7 @@ pub type EmitRISCV64 = class {
     if (op == IRO_CAST || op == IRO_CMP_EQ || op == IRO_CMP_GE || op == IRO_CMP_GT) { return 1; }
     if (op == IRO_CMP_LE || op == IRO_CMP_LT || op == IRO_CMP_NEQ || op == IRO_CONST_FLOAT) { return 1; }
     if (op == IRO_CONST_INT || op == IRO_DIV || op == IRO_FREE || op == IRO_FTOI) { return 1; }
+    if (op == IRO_CALL_INDIRECT || op == IRO_FUNC_ADDR) { return 1; }   // #1806
     if (op == IRO_FUNC_EXIT || op == IRO_ITOF || op == IRO_JMP || op == IRO_LABEL) { return 1; }
     // #1764: die Gleitkomma-Rechnung. Sie fehlte komplett — behandelt waren nur
     // ITOF/FTOI, und die kopierten den Slot bloss. `PrintLn` scheiterte damit
@@ -701,6 +714,36 @@ pub type EmitRISCV64 = class {
     }
     if op == IRO_CALL_BUILTIN {
       self.emitBuiltinCall(imm, src1, dest);
+    }
+    // #1806: Aufruf ueber einen Funktionszeiger. Die Argumente liegen wie beim
+    // gewoehnlichen Aufruf, die Zieladresse steht in einem Slot.
+    //
+    // Bis 1.1.10G fehlte der Opcode hier ganz; der Aufruf kam nur deshalb nie
+    // so weit, weil die Namensaufloesung in ir_lower vorher scheiterte. Der
+    // laute Opcode-Waechter hat ihn beim Beheben von #1806 sofort gemeldet —
+    // so soll es sein.
+    if op == IRO_CALL_INDIRECT {
+      var ciCount: int64 := imm;
+      var ciI: int64 := 0;
+      while ciI < ciCount && ciI < 8 {
+        self.rv_loadSlot(ciI);
+        self.rv_MV(RV_A0 + ciI, RV_T0);
+        ciI := ciI + 1;
+      }
+      self.rv_loadSlot(src1);                    // t0 = Zieladresse
+      // JALR ra, t0, 0
+      self.rv_e32(0x67 | (RV_RA << 7) | (0 << 12) | (RV_T0 << 15));
+      self.rv_MV(RV_T0, RV_A0);
+      self.rv_storeSlot(dest);
+    }
+    // #1806: Adresse einer Funktion als Wert. Erst muss `add` als ZAHL
+    // entstehen, bevor `f(a, b)` sie indirekt rufen kann.
+    if op == IRO_FUNC_ADDR {
+      var faOff: int64 := self.codeLen;
+      self.rv_e32(0x17 | (RV_T0 << 7));          // AUIPC t0, 0 — nachgetragen
+      self.rv_ADDI(RV_T0, RV_T0, 0);             // ADDI  t0, t0, 0 — nachgetragen
+      self.addPatch(faOff, src1, RV_PATCH_FADDR, 0);
+      self.rv_storeSlot(dest);
     }
 
     // --- Control flow ---
