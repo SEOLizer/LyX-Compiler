@@ -3351,7 +3351,52 @@ pub type IRLower = class {
       if snrA >= 0 { var snrT: int64 := self.lowerExpr(snrA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, snrT, -1, 0); }
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 83); return dest;
     }
+    // #1810: sys_futex ist LINUX-multiplext — eine Nummer, die ueber das
+    // zweite Argument entscheidet, was sie tut. LyxOS hat stattdessen DREI
+    // Aufrufe: 316 futex_wait, 317 futex_wake, 318 futex_requeue. Die sind im
+    // Compiler laengst verdrahtet (IDs 188-190); was fehlte, war die Bruecke.
+    //
+    // std/thread.lyx ruft die Linux-Form an zwoelf Stellen (Thread-Join,
+    // Mutex lock/unlock, Bedingungsvariablen) und muss auf BEIDEN Zielen
+    // uebersetzen — deshalb wird hier aufgeloest statt die Unit zu aendern.
+    //
+    // Die Operation steht dort immer als Konstante (`FUTEX_WAIT`), laesst sich
+    // also zur Uebersetzungszeit ausrechnen. Steht dort ein LAUFZEITWERT, wird
+    // das gemeldet: welcher der drei Aufrufe gemeint ist, waere dann geraten,
+    // und ein futex, das statt zu warten aufweckt, haengt das Programm auf.
     if (self.seq(fname, fnlen, "sys_futex", 9)) {
+      var sfuOp: int64 := 0 - 1;
+      if arg0 >= 0 {
+        var sfuOpN: int64 := self.nodeNext(arg0);
+        if sfuOpN >= 0 {
+          if self._constFaltbar(sfuOpN) != 0 { sfuOp := self._constWert(sfuOpN); }
+        }
+      }
+      // FUTEX_WAIT = 0, FUTEX_WAKE = 1 (Linux). Das dritte Argument ist bei
+      // WAIT der erwartete Wert, bei WAKE die Anzahl der zu weckenden Warter —
+      // beide landen an derselben Stelle des LyxOS-Aufrufs.
+      if sfuOp == 0 || sfuOp == 1 {
+        var sfuU: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sfuU, -1, 0);
+        var sfuV: int64 := self.nodeNext(arg0);
+        if sfuV >= 0 { sfuV := self.nodeNext(sfuV); }
+        if sfuV >= 0 {
+          var sfuVT: int64 := self.lowerExpr(sfuV);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sfuVT, -1, 0);
+        }
+        var sfuId: int64 := 188;
+        if sfuOp == 1 { sfuId := 189; }
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, sfuId); return dest;
+      }
+      if sfuOp >= 0 {
+        Print("lyxc: --target="c); Print(self._targetName());
+        PrintLn(": sys_futex mit einer Operation, die LyxOS nicht hat."c);
+        PrintLn("  Aufgeloest werden FUTEX_WAIT (0) -> sys_futex_wait (316) und"c);
+        PrintLn("  FUTEX_WAKE (1) -> sys_futex_wake (317). Fuer Umhaengen gibt es"c);
+        PrintLn("  sys_futex_requeue (318) — das aber mit eigener Signatur."c);
+        exit(1);
+      }
+      // Operation erst zur Laufzeit bekannt: nicht raten.
       var sfuA: int64 := arg0;
       if sfuA >= 0 { var sfuT: int64 := self.lowerExpr(sfuA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, sfuT, -1, 0); sfuA := self.nodeNext(sfuA); }
       if sfuA >= 0 { var sfuT: int64 := self.lowerExpr(sfuA); self.irAddInstrDirect(IRO_STORE_LOCAL, 1, sfuT, -1, 0); sfuA := self.nodeNext(sfuA); }
@@ -8233,6 +8278,13 @@ pub type IRLower = class {
     if nd < 0 { return 0; }
     var k: int64 := self.nodeKind(nd);
     if k == NK_LIT_INT || k == NK_LIT_BOOL || k == NK_LIT_CHAR { return 1; }
+    // #1810: ein Bezeichner, der eine Modul-Konstante benennt. Nur `con`,
+    // niemals `var` — siehe _conIdentDecl.
+    if k == NK_IDENT {
+      var cd: int64 := self._conIdentDecl(nd);
+      if cd < 0 { return 0; }
+      return self._constFaltbar(self.nodeC1(cd));
+    }
     if k == NK_UNOP {
       var uo: int64 := self.nodeIVal(nd);
       if uo == 71 || uo == 87 || uo == 92 { return self._constFaltbar(self.nodeC0(nd)); }
@@ -8254,6 +8306,7 @@ pub type IRLower = class {
   fn _constWert(nd: int64): int64 {
     var k: int64 := self.nodeKind(nd);
     if k == NK_LIT_INT || k == NK_LIT_BOOL || k == NK_LIT_CHAR { return self.nodeIVal(nd); }
+    if k == NK_IDENT { return self._constWert(self.nodeC1(self._conIdentDecl(nd))); }
     if k == NK_UNOP {
       var uo: int64 := self.nodeIVal(nd);
       var v:  int64 := self._constWert(self.nodeC0(nd));
@@ -8298,6 +8351,30 @@ pub type IRLower = class {
     EPrintStrLn("  Gefaltet werden Literale, unaeres -/~/! und die Rechen-, Bit- und"c);
     EPrintStrLn("  Schiebeoperatoren darauf. Bis 1.1.10B wurde daraus still 0."c);
     exit(1);
+  }
+
+  // #1810: Ist `nd` ein Bezeichner, der eine Modul-KONSTANTE benennt, deren
+  // Anfangswert sich ausrechnen laesst?
+  //
+  // Bewusst ueber den Baum und NICHT ueber globalNameBuf: dort stehen `var`
+  // und `con` gemeinsam, ohne Unterscheidung. Einen `var` zu falten waere
+  // falsch — er kann sich zur Laufzeit aendern. Hier wird deshalb die
+  // Deklaration gesucht und ihre Art geprueft.
+  fn _conIdentDecl(nd: int64): int64 {
+    if nd < 0 { return 0 - 1; }
+    if self.nodeKind(nd) != NK_IDENT { return 0 - 1; }
+    // Ein gleichnamiges Local oder Parameter verdeckt die Konstante.
+    if self._findLocalSlot(self.nodeSVal(nd), self.nodeSLen(nd)) >= 0 { return 0 - 1; }
+    var ci: int64 := 0;
+    while ci < self.nodeCount {
+      if self.nodeKind(ci) == NK_CON_DECL {
+        if self.seq(self.nodeSVal(ci), self.nodeSLen(ci), self.nodeSVal(nd), self.nodeSLen(nd)) {
+          return ci;
+        }
+      }
+      ci += 1;
+    }
+    return 0 - 1;
   }
 
   fn _constDiv0() {

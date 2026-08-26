@@ -357,6 +357,53 @@ else
     echo "FAIL Netz/DNS: uebersetzt nicht"; FAIL=$((FAIL + 1))
 fi
 
+echo "-- #1810: sys_futex auf die drei LyxOS-Aufrufe aufloesen --"
+# sys_futex ist LINUX-multiplext: eine Nummer, die ueber das zweite Argument
+# entscheidet, was sie tut. LyxOS hat stattdessen DREI Aufrufe (316/317/318),
+# die im Compiler laengst verdrahtet waren — es fehlte nur die Bruecke.
+#
+# std/thread.lyx ruft die Linux-Form an zwoelf Stellen und muss auf BEIDEN
+# Zielen uebersetzen, deshalb wird hier aufgeloest statt die Unit zu aendern.
+pruefe_baut "sys_futex WAIT (316)" "sys_futex(2097152, 0, 2, 0, 0, 0)"
+pruefe_baut "sys_futex WAKE (317)" "sys_futex(2097152, 1, 1, 0, 0, 0)"
+
+# Die Operation als benannte Konstante — so steht sie in thread.lyx.
+printf 'con FUTEX_WAIT: int64 := 0;\ncon FUTEX_WAKE: int64 := 1;\nfn main(): int64 { var a: int64 := 0x200000; sys_futex(a, FUTEX_WAIT, 2, 0, 0, 0); sys_futex(a, FUTEX_WAKE, 1, 0, 0, 0); return 0; }\n' > "$TMP/fx.lyx"
+if $LYXC "$TMP/fx.lyx" --target=lyxos -o "$TMP/fx.lbf" >/dev/null 2>&1; then
+    HEXF="$(od -An -tx1 -v "$TMP/fx.lbf" | tr -d ' \n')"
+    fehltF=""
+    for paar in "316:3c01" "317:3d01"; do
+        nrF="${paar%%:*}"; byF="${paar##*:}"
+        case "$HEXF" in *"48b8${byF}000000000000"*) : ;; *) fehltF="$fehltF $nrF" ;; esac
+    done
+    if [ -z "$fehltF" ]; then
+        echo "PASS futex: benannte Konstanten werden zu 316/317 aufgeloest"; PASS=$((PASS + 1))
+    else
+        echo "FAIL futex: diese Nummern fehlen im Erzeugnis:$fehltF"; FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL futex: uebersetzt nicht"; FAIL=$((FAIL + 1))
+fi
+
+# Der eigentliche Gewinn: std/thread.lyx traegt jetzt auf lyxos.
+printf 'import std.thread;\nfn main(): int64 { var m: Mutex := MutexNew(); MutexLock(m); MutexUnlock(m); var c: Cond := CondNew(); CondSignal(c); return 0; }\n' > "$TMP/th.lyx"
+if $LYXC --std-path="$ROOT" "$TMP/th.lyx" --target=lyxos -o "$TMP/th.lbf" >/dev/null 2>&1; then
+    echo "PASS std.thread: Mutex und Cond uebersetzen fuer lyxos"; PASS=$((PASS + 1))
+else
+    echo "FAIL std.thread: Mutex und Cond uebersetzen fuer lyxos"; FAIL=$((FAIL + 1))
+fi
+
+# Steht die Operation erst zur Laufzeit fest, wird gemeldet statt geraten —
+# ein futex, das statt zu warten aufweckt, haengt das Programm auf.
+printf 'fn main(): int64 { var a: int64 := 0x200000; var op: int64 := 1; return sys_futex(a, op, 1, 0, 0, 0); }\n' > "$TMP/fr.lyx"
+msgfr="$($LYXC "$TMP/fr.lyx" --target=lyxos -o "$TMP/fr.lbf" 2>&1)"
+case "$msgfr" in
+  *"multiplext nicht"*)
+    echo "PASS futex: Laufzeit-Operation wird gemeldet, mit Begruendung"; PASS=$((PASS + 1)) ;;
+  *)
+    echo "FAIL futex: Laufzeit-Operation nennt den Grund nicht: $(echo "$msgfr"|sed -n 2p)"; FAIL=$((FAIL + 1)) ;;
+esac
+
 echo "----"
 echo "$PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
