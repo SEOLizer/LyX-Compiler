@@ -26,10 +26,10 @@
 #     sample_controller) hat sie, ESP32s LX6 dagegen schon. Die Kodierung steht
 #     nach Konstruktion da, nicht nach Ausfuehrung — ein Testfall hier wuerde
 #     nur den fehlenden Kern messen.
-#   * Globale Variablen: sie brauchen eine feste Adresse, und die erreicht
-#     xtensa nur ueber einen L32R-Literal-Pool (#1786). Bis dahin MELDET das
-#     Backend die Luecke, statt wie bisher still 0 zu liefern.
-#   * Zeichenkettenliterale: brauchen einen L32R-Literal-Pool, ebenfalls offen.
+#   * Division (#1789): die Basis-ISA hat keine.
+#   * Ausgabe: der PrintStr-Helfer schreibt in das UART-Register 0x60000000.
+#     Das ist auf dem ESP32 richtig, im User-Mode-Emulator aber unabgebildet —
+#     gemessen wird hier deshalb ueber den Rueckgabewert.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
@@ -104,6 +104,34 @@ run "sechs_argumente" 'fn f(a: int64, b: int64, c: int64, d: int64, e: int64, g:
 run "rekursion"     'fn zaehl(n: int64): int64 { if n <= 0 { return 0; } return 1 + zaehl(n - 1); } fn main(): int64 { return zaehl(42); }' 42
 # Vorwaertsaufruf: applyPatches lief je Funktion und setzte patchCount zurueck.
 run "vorwaertsaufruf" 'fn main(): int64 { return spaeter(); } fn spaeter(): int64 { return 42; }' 42
+
+# ---------------------------------------------------------------------------
+# #1786: Zeichenkettenliterale und globale Variablen, beide PC-relativ.
+#
+# Xtensa hat keinen Befehl, der den Programmzaehler liest. Die Adresse entsteht
+# deshalb ueber ein CALL0 auf eine Marke, die sofort zurueckspringt: die
+# Rueckkehradresse landet in a0. Literale liegen inline im Codestrom, der
+# Datenbereich der globalen Variablen haengt hinter dem Code und wird ueber
+# einen Literal-Pool erreicht, der ABSTAENDE haelt statt Adressen.
+#
+# Genau das macht diese Faelle ueberhaupt pruefbar: die Huelle laedt den Code an
+# eine ANDERE Adresse als das Backend annimmt (0x40080000 ist im User-Mode nicht
+# abbildbar, qemu deckelt den reservierten Adressraum bei 0x3fffffff — mit -R
+# geprueft). Ein Abbild mit absoluten Adressen waere hier nicht ausfuehrbar.
+#
+# Bis 1.1.9M meldete das Backend beide Faelle als nicht umgesetzt; davor lieferte
+# ein Lesezugriff auf eine globale Variable still 0 und ein Schreibzugriff tat
+# gar nichts.
+run "literal_strlen"   'fn main(): int64 { var s: pchar := "abcdef"c; return StrLen(s) + StrLen("xy"c) + 34; }' 42
+run "literal_zeichen"  'fn main(): int64 { var s: pchar := "Az"c; return StrCharAt(s, 0) + StrCharAt(s, 1) - 100; }' 87
+run "global_lesen"     'var g: int64 := 42; fn main(): int64 { return g; }' 42
+run "global_schreiben" 'var a: int64 := 10; var b: int64 := 3; fn main(): int64 { a := a + b; b := a - 1; return a + b + 17; }' 42
+# Ueber Funktionsgrenzen hinweg: jeder Zugriff bekommt einen eigenen
+# Pool-Eintrag, denn der Abstand haengt an der Aufrufstelle.
+run "global_ueber_fn"  'var zaehler: int64 := 0; fn tick(): int64 { zaehler := zaehler + 1; return zaehler; } fn main(): int64 { var i: int64 := 0; while i < 20 { tick(); i := i + 1; } return zaehler + 22; }' 42
+# #1786: peek/poke und StrLen/StrCharAt. Bis 1.1.9M brach das Backend bei
+# jedem dieser Builtins ab; bis 1.1.5C lieferte es still 0.
+run "peek_poke"        'fn main(): int64 { var s: pchar := "0000"c; var p: int64 := s as int64; poke8(p, 42); poke8(p+1, 0); return peek8(p) + StrLen(s); }' 43
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]

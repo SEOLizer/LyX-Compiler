@@ -71,6 +71,25 @@ pub type EmitXtensa = class {
   patchCount: int64;
   funcAddrs:  int64;
   xtMainOff:  int64;   // #1782: Code-Offset von main (-1 = nicht gefunden)
+  // #1786: PC-relative Adressierung. Xtensa hat keinen Befehl, der den
+  // Programmzaehler liest — der uebliche Weg ist ein CALL0 auf eine Marke,
+  // die sofort zurueckspringt: die Rueckkehradresse landet in a0.
+  //
+  // Der Literal-Pool haelt dann nur noch ABSTAENDE (Ziel minus dieser
+  // Adresse), keine absoluten Adressen. Damit laeuft dasselbe Abbild an
+  // jedem Ladeort — und die Pruefhuelle darf es verschieben.
+  poolOff:    int64;   // Code-Offset des Pools (er steht ganz vorn)
+  poolCount:  int64;   // belegte Eintraege
+  poolCap:    int64;   // reservierte Eintraege
+  poolFix:    int64;   // je Eintrag: {poolIdx, Bezugsadresse, Zielart, Zielnummer} a 32 Byte
+  poolFixN:   int64;
+  getpcOff:   int64;   // Code-Offset der Rueckspring-Marke
+  strDatBuf:  int64;   // gesammelte Zeichenketten-Bytes
+  strDatLen:  int64;
+  strDatCap:  int64;
+  strIdxBuf:  int64;   // je Literal: Byte-Offset in strDatBuf
+  strIdxN:    int64;
+  globDatOff: int64;   // Code-Offset des Bereichs fuer globale Variablen
   funcCount:  int64;
 
   // WP-D3: offsets of helper subroutines in codeBuf (prepended before user code)
@@ -95,6 +114,21 @@ pub type EmitXtensa = class {
   }
 
   // NOP = OR a0, a0, a0
+  // #1786: einzelne Bytes (Zeichenkettenliterale, Pool-Worte, Datenbereich).
+  fn xt_e1(v: int64) {
+    poke8(self.codeBuf + self.codeLen, v & 0xFF);
+    self.codeLen := self.codeLen + 1;
+  }
+  fn xt_e32(v: int64) {
+    self.xt_e1(v); self.xt_e1(v >> 8); self.xt_e1(v >> 16); self.xt_e1(v >> 24);
+  }
+  fn xt_poke32at(off: int64, v: int64) {
+    poke8(self.codeBuf + off,     v & 0xFF);
+    poke8(self.codeBuf + off + 1, (v >> 8) & 0xFF);
+    poke8(self.codeBuf + off + 2, (v >> 16) & 0xFF);
+    poke8(self.codeBuf + off + 3, (v >> 24) & 0xFF);
+  }
+
   fn xt_NOP() { self.xt_e3(0x00, 0x00, 0x20); }
 
   // --------------------------------------------------------------------------
@@ -546,12 +580,26 @@ pub type EmitXtensa = class {
     // eine feste Adresse nur ueber einen L32R-Literal-Pool, und der muss VOR
     // dem Befehl liegen (#1786). Solange die Bauform nicht steht, wird die
     // Luecke gemeldet statt geraten.
-    if op == IRO_LOAD_GLOBAL || op == IRO_STORE_GLOBAL {
-      EPrintStrLn("error: xtensa: globale Variablen sind nicht umgesetzt (#1782)."c);
-      EPrintStrLn("  Sie brauchen eine feste Adresse, und die erreicht xtensa nur ueber"c);
-      EPrintStrLn("  einen L32R-Literal-Pool — der steht mit #1786 noch aus."c);
-      EPrintStrLn("  Bis 1.1.9M lieferte diese Stelle still 0 bzw. tat nichts."c);
-      exit(1);
+    // #1786: Die Adresse entsteht PC-relativ wie beim Zeichenkettenliteral —
+    // nur ist der Abstand hier zu gross fuer ADDI, denn der Datenbereich haengt
+    // hinter dem gesamten Code. Deshalb der Umweg ueber den Literal-Pool:
+    // L32R liest ihn PC-relativ, und sein INHALT ist ein Abstand, keine
+    // absolute Adresse — damit bleibt das Abbild ladeortfrei.
+    //
+    // Bis 1.1.9M standen hier zwei stille Stummel: Lesen lieferte 0, Schreiben
+    // tat gar nichts, beides ohne ein Wort.
+    if op == IRO_LOAD_GLOBAL {
+      self.xt_adresseNachT0(1, src1);
+      self.xt_L32I(XT_T0, XT_T0, 0);
+      self.xt_storeSlot(dest);
+    }
+    // ir_lower legt den globalIdx bei STORE_GLOBAL ins DEST-Feld, den Slot mit
+    // dem Wert nach src1 — so wie lyxos, arm64 und riscv es lesen.
+    if op == IRO_STORE_GLOBAL {
+      self.xt_adresseNachT0(1, dest);
+      self.xt_MOV(XT_T2, XT_T0);
+      self.xt_loadSlot(src1);
+      self.xt_S32I(XT_T0, XT_T2, 0);
     }
 
     // --- Struct field access ---
@@ -615,7 +663,7 @@ pub type EmitXtensa = class {
       self.xt_storeSlot(dest);
     }
     if op == IRO_CALL_BUILTIN {
-      self.emitBuiltinCall(imm, dest);
+      self.emitBuiltinCall(imm, src1, dest);
     }
 
     // --- Control flow ---
@@ -666,15 +714,41 @@ pub type EmitXtensa = class {
     // Byte-Konvention geprueften Befehle. Eine erfundene Trap-Kodierung waere
     // schlimmer als die Meldung: sie liefe im Ernstfall irgendwohin. Bis
     // 1.0.16G erzeugte `throw` hier gar nichts und lief still weiter.
-    // #1339: IRO_CONST_STR. Wie bei den Zusicherungen fehlt die gepruefte
-    // Kodierung fuer PC-relative Adressierung und den Sprung darum herum.
-    // Ein falsch berechneter Zeiger auf eine Zeichenkette faellt nicht auf —
-    // er zeigt einfach irgendwohin. Deshalb der Abbruch beim Uebersetzen.
+    // #1786: IRO_CONST_STR — Zeichenkettenliteral, PC-relativ.
+    //
+    // Xtensa hat keinen Befehl, der den Programmzaehler liest. Der uebliche
+    // Weg ist ein CALL0 auf eine Marke, die sofort zurueckspringt: CALL0 legt
+    // die Rueckkehradresse in a0, und das ist genau die Adresse HINTER dem
+    // Aufruf. Von dort ist der Abstand zu den inline abgelegten Bytes eine
+    // beim Erzeugen bekannte kleine Zahl.
+    //
+    // a0 darf hier benutzt werden: der Prolog hat die Rueckkehradresse nach
+    // [SP+0] gelegt, der Epilog holt sie von dort zurueck.
+    //
+    // Absolute Adressen waeren auf dem ESP32 eine Zeile weniger (L32R auf
+    // einen Pool mit der IRAM-Adresse). Sie binden das Abbild aber an genau
+    // einen Ladeort — und der User-Mode-Emulator kann 0x40080000 nicht
+    // abbilden (qemu deckelt den reservierten Adressraum bei 0x3fffffff), das
+    // Erzeugnis waere also nicht ausfuehrbar pruefbar. PC-relativ ist beides:
+    // ladeortfrei und hier nachweisbar.
     if op == IRO_CONST_STR {
-      EPrintStrLn("error: Zeichenkettenliterale sind fuer xtensa nicht umgesetzt (#1339)"c);
-      EPrintStrLn("  Das Backend hat keine gepruefte PC-relative Adressierung; ein falscher"c);
-      EPrintStrLn("  Zeiger waere schlimmer als der Abbruch."c);
-      exit(1);
+      var strBufX: int64 := peek64(self.ir + 32);
+      var spX:  int64 := strBufX + imm;
+      var lenX: int64 := StrLen(spX as pchar);
+      var gesX: int64 := lenX + 1;
+      var padX: int64 := (4 - (gesX & 3)) & 3;   // Ausrichtung fuer den Code danach
+      var pcX:  int64 := self.codeLen;
+      var offX: int64 := (self.getpcOff - ((pcX & -4) + 4)) >> 2;
+      self.xt_CALL0(offX);
+      // a0 zeigt jetzt hierher; die Bytes folgen hinter ADDI und J.
+      self.xt_ADDI(XT_T0, XT_A0, 6);
+      self.xt_J(gesX + padX - 1);                // ueber die Bytes hinweg (Ziel = PC + 4 + imm)
+      var iX: int64 := 0;
+      while iX < lenX { self.xt_e1(peek8(spX + iX)); iX := iX + 1; }
+      self.xt_e1(0);
+      var pX: int64 := 0;
+      while pX < padX { self.xt_e1(0); pX := pX + 1; }
+      self.xt_storeSlot(dest);
     }
 
     // #1339: Die Zusicherungen. Sie brauchen einen Vergleich, einen Sprung und
@@ -734,6 +808,22 @@ pub type EmitXtensa = class {
 
   fn xt_S8I(at: int64, as_: int64, off: int64) {
     self.xt_RRI8(0x4, at, as_, off);
+  }
+
+  // #1786: L16UI / S16I — der Versatz zaehlt in HALBWORTEN.
+  fn xt_L16UI(ar: int64, as_: int64, off: int64) {
+    self.xt_RRI8(0x1, ar, as_, off >> 1);
+  }
+  fn xt_S16I(at: int64, as_: int64, off: int64) {
+    self.xt_RRI8(0x5, at, as_, off >> 1);
+  }
+
+  // #1786: eine BEQZ-Weite nachtragen, statt sie zu zaehlen. Die Hardware
+  // rechnet ab PC + 4; das Register steckt im unteren Nibble des Platzhalters.
+  fn xt_patchBEQZ(off: int64, ziel: int64) {
+    var as2: int64 := peek8(self.codeBuf + off + 1) & 0xF;
+    var im12: int64 := (ziel - (off + 4)) & 0xFFF;
+    self.xt_poke3(off, (1 << 4) | 6, ((im12 & 0xF) << 4) | as2, (im12 >> 4) & 0xFF);
   }
 
   // --------------------------------------------------------------------------
@@ -811,7 +901,62 @@ pub type EmitXtensa = class {
     while (self.codeLen & 3) != 0 { self.xt_NOP(); }
   }
 
-  fn emitBuiltinCall(id: int64, dest: int64) {
+  // #1786: argBase — die Argumente stehen NICHT in Slot 0, sondern in einem
+  // reservierten Block, dessen erster Slot als src1 mitkommt. Dieselbe
+  // Konvention wie bei arm-cm (#1388) und lyxos (#839).
+  fn emitBuiltinCall(id: int64, argBase: int64, dest: int64) {
+    var sB: int64 := argBase;
+    if sB < 0 { sB := 0; }
+    // Speicherzugriffe. Xtensa ist hier 32-bittig; peek64/poke64 arbeiten wie
+    // auf Cortex-M auf dem unteren Wort.
+    if id == 200 || id == 208 || id == 201 || id == 202 {
+      self.xt_loadSlot(sB);
+      if id == 200 { self.xt_L8UI(XT_T0, XT_T0, 0); }
+      if id == 208 { self.xt_L16UI(XT_T0, XT_T0, 0); }
+      if id == 201 || id == 202 { self.xt_L32I(XT_T0, XT_T0, 0); }
+      self.xt_storeSlot(dest);
+      return;
+    }
+    if id == 203 || id == 209 || id == 204 || id == 205 {
+      self.xt_loadSlot(sB);
+      self.xt_MOV(XT_T2, XT_T0);           // T2 = Adresse
+      self.xt_loadSlot(sB + 1);            // T0 = Wert
+      if id == 203 { self.xt_S8I(XT_T0, XT_T2, 0); }
+      if id == 209 { self.xt_S16I(XT_T0, XT_T2, 0); }
+      if id == 204 || id == 205 { self.xt_S32I(XT_T0, XT_T2, 0); }
+      return;
+    }
+    // StrLen: Zeichen bis zur Null zaehlen. Braucht kein Betriebssystem und
+    // gehoert deshalb auch auf ein freistehendes Ziel. Sprungweiten werden
+    // NICHT gezaehlt, sondern nachgetragen — dreimal in dieser Sitzung war
+    // eine handgezaehlte Weite falsch (riscv, Thumb-2, xtensa selbst).
+    if id == 15 {
+      self.xt_loadSlot(sB);
+      self.xt_MOV(XT_T2, XT_T0);           // T2 = Zeiger
+      self.xt_MOVI(XT_T1, 0);              // T1 = Zaehler
+      var sl: int64 := self.codeLen;
+      self.xt_L8UI(XT_T0, XT_T2, 0);
+      var bEnde: int64 := self.codeLen;
+      self.xt_BEQZ(XT_T0, 0);              // -> fertig, nachgetragen
+      self.xt_ADDI(XT_T2, XT_T2, 1);
+      self.xt_ADDI(XT_T1, XT_T1, 1);
+      self.xt_J(sl - (self.codeLen + 4));
+      var lEnde: int64 := self.codeLen;
+      self.xt_patchBEQZ(bEnde, lEnde);
+      self.xt_MOV(XT_T0, XT_T1);
+      self.xt_storeSlot(dest);
+      return;
+    }
+    // StrCharAt(s, i): ein Byte lesen.
+    if id == 206 {
+      self.xt_loadSlot(sB);
+      self.xt_MOV(XT_T2, XT_T0);
+      self.xt_loadSlot(sB + 1);
+      self.xt_ADD(XT_T2, XT_T2, XT_T0);
+      self.xt_L8UI(XT_T0, XT_T2, 0);
+      self.xt_storeSlot(dest);
+      return;
+    }
     if id == 1 {
       // PrintStr: a2 = pchar from slot 0, call printstr helper
       self.xt_loadSlot(0);                    // T0 (a8) = slot[0] = str ptr
@@ -902,6 +1047,18 @@ pub type EmitXtensa = class {
 
   pub fn init(irMod: int64) {
     self.xtMainOff  := 0 - 1;
+    self.poolOff    := 0;
+    self.poolCount  := 0;
+    self.poolCap    := 0;
+    self.poolFix    := alloc(65536 * 32);
+    self.poolFixN   := 0;
+    self.getpcOff   := 0;
+    self.strDatCap  := 4096;
+    self.strDatBuf  := alloc(self.strDatCap);
+    self.strDatLen  := 0;
+    self.strIdxBuf  := alloc(1024 * 8);
+    self.strIdxN    := 0;
+    self.globDatOff := 0;
     self.ir              := irMod;
     self.codeBuf         := alloc(131072);
     self.codeCap         := 131072;
@@ -914,6 +1071,87 @@ pub type EmitXtensa = class {
     self.funcCount       := 0;
     self.xt_printstrOff  := 0;
     self.xt_printintOff  := 0;
+  }
+
+  // ==================================================================
+  // #1786: Literal-Pool und PC-relative Adressen
+  //
+  // Der Pool steht ganz vorn im Abbild — L32R liest nur RUECKWAERTS
+  // (Ziel = ((PC+3) & ~3) + (imm16 − 65536) * 4, also bis 256 KB davor).
+  // Seine Groesse muss beim ersten Befehl schon feststehen, deshalb wird
+  // Platz reserviert und spaeter gefuellt. Ein Ueberlauf meldet sich, statt
+  // still auf einen fremden Eintrag zu zeigen.
+  // ==================================================================
+
+  // Traegt einen Eintrag ein und liefert seine Nummer.
+  fn xt_poolNeu(): int64 {
+    if self.poolCount >= self.poolCap {
+      EPrintStrLn("error: xtensa: Literal-Pool voll (#1786)."c);
+      EPrintStrLn("  Der Pool steht vor dem Code und ist deshalb in der Groesse"c);
+      EPrintStrLn("  festgelegt. Wer mehr braucht, erhoeht poolCap — geraten wird hier"c);
+      EPrintStrLn("  nicht, ein falscher Eintrag zeigte sonst auf fremde Daten."c);
+      exit(1);
+    }
+    var idx: int64 := self.poolCount;
+    self.poolCount := self.poolCount + 1;
+    return idx;
+  }
+
+  // L32R at, pool[idx] — der Abstand steht beim Erzeugen fest.
+  fn xt_L32R_pool(at: int64, idx: int64) {
+    var ziel:  int64 := self.poolOff + idx * 4;
+    var bezug: int64 := (self.codeLen + 3) & -4;
+    var wort:  int64 := (ziel - bezug) >> 2;      // negativ
+    self.xt_e3((at << 4) | 1, wort & 0xFF, (wort >> 8) & 0xFF);
+  }
+
+  // Adresse einer Stelle im Abbild nach T0 holen — PC-relativ.
+  //
+  //   CALL0 marke     ; a0 = Adresse HINTER diesem Befehl
+  //   L32R  a9, pool  ; a9 = Ziel − diese Adresse
+  //   ADD   a8, a0, a9
+  //
+  // art: 0 = Zeichenkette (nummer = Literal-Index), 1 = globale Variable
+  // (nummer = Index). Wohin es zeigt, steht erst am Ende fest; deshalb wird
+  // der Pool-Eintrag vorgemerkt und spaeter gefuellt.
+  fn xt_adresseNachT0(art: int64, nummer: int64) {
+    var idx: int64 := self.xt_poolNeu();
+    // CALL0 auf die Marke: Ziel = ((PC & ~3) + 4) + off*4
+    var pc:   int64 := self.codeLen;
+    var off:  int64 := (self.getpcOff - ((pc & -4) + 4)) >> 2;
+    self.xt_CALL0(off);
+    var bezug: int64 := self.codeLen;   // a0 traegt genau diese Adresse
+    self.xt_L32R_pool(XT_T1, idx);
+    self.xt_ADD(XT_T0, XT_A0, XT_T1);
+    var rec: int64 := self.poolFix + self.poolFixN * 32;
+    poke64(rec + 0, idx);
+    poke64(rec + 8, bezug);
+    poke64(rec + 16, art);
+    poke64(rec + 24, nummer);
+    self.poolFixN := self.poolFixN + 1;
+  }
+
+  // Legt die Bytes eines Zeichenkettenliterals ab und liefert seine Nummer.
+  fn xt_strNeu(strOff: int64): int64 {
+    var strBufX: int64 := peek64(self.ir + 32);
+    var p:   int64 := strBufX + strOff;
+    var len: int64 := StrLen(p as pchar);
+    while (self.strDatLen + len + 1) > self.strDatCap {
+      var nc: int64 := self.strDatCap * 2;
+      var nb: int64 := alloc(nc);
+      var ci: int64 := 0;
+      while ci < self.strDatLen { poke8(nb + ci, peek8(self.strDatBuf + ci)); ci := ci + 1; }
+      self.strDatBuf := nb;
+      self.strDatCap := nc;
+    }
+    var nummer: int64 := self.strIdxN;
+    poke64(self.strIdxBuf + nummer * 8, self.strDatLen);
+    var i: int64 := 0;
+    while i < len { poke8(self.strDatBuf + self.strDatLen + i, peek8(p + i)); i := i + 1; }
+    poke8(self.strDatBuf + self.strDatLen + len, 0);
+    self.strDatLen := self.strDatLen + len + 1;
+    self.strIdxN := nummer + 1;
+    return nummer;
   }
 
   // #1782: heisst die Funktion "main"? Der Name steht als Offset im
@@ -935,6 +1173,22 @@ pub type EmitXtensa = class {
   pub fn getMainOff(): int64 { return self.xtMainOff; }
 
   pub fn emit(): int64 {
+    // #1786: Der Literal-Pool steht ganz vorn, denn L32R liest nur
+    // RUECKWAERTS. Seine Groesse muss also feststehen, bevor der erste Befehl
+    // entsteht — sie wird vorher aus dem IR gezaehlt, statt sie zu schaetzen.
+    self.poolCap := self.xt_zaehleGlobalZugriffe();
+    self.poolOff := self.codeLen;
+    var pz: int64 := 0;
+    while pz < self.poolCap { self.xt_e32(0); pz := pz + 1; }
+
+    // Die Marke, die den Programmzaehler liefert: CALL0 hierher legt die
+    // Adresse des naechsten Befehls in a0, RET springt sofort zurueck. Sie
+    // muss wortausgerichtet sein — CALL0 rechnet ab (PC & ~3) + 4.
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+    self.getpcOff := self.codeLen;
+    self.xt_JX_A0();                    // RET
+    while (self.codeLen & 3) != 0 { self.xt_NOP(); }
+
     // WP-D3: prepend PrintStr + PrintInt helper subroutines before user code
     self.xt_emitHelpers();
     var n: int64 := self.getFuncCount();
@@ -943,7 +1197,54 @@ pub type EmitXtensa = class {
     // #1782: jetzt steht jede Funktionsadresse fest — offene Vorwaertsaufrufe
     // aufloesen.
     self.applyPatches();
+
+    // #1786: der Datenbereich der globalen Variablen haengt hinter dem Code,
+    // vorbelegt mit den Anfangswerten. Auf dem ESP32 liegt er im IRAM und ist
+    // damit beschreibbar; das PT_LOAD-Segment traegt deshalb PF_W.
+    while (self.codeLen & 3) != 0 { self.xt_e1(0); }
+    self.globDatOff := self.codeLen;
+    var gCount: int64 := peek64(self.ir + 120);
+    var gBuf:   int64 := peek64(self.ir + 104);
+    var gi: int64 := 0;
+    while gi < gCount {
+      var gv: int64 := 0;
+      if gBuf != 0 { gv := peek64(gBuf + gi * 8); }
+      self.xt_e32(gv);
+      gi := gi + 1;
+    }
+
+    // Jetzt steht jede Zieladresse fest: die Pool-Eintraege tragen den ABSTAND
+    // vom jeweiligen Bezugspunkt (der Adresse hinter dem CALL0) zum Ziel.
+    var fi: int64 := 0;
+    while fi < self.poolFixN {
+      var rec:   int64 := self.poolFix + fi * 32;
+      var idx:   int64 := peek64(rec + 0);
+      var bezug: int64 := peek64(rec + 8);
+      var nummer: int64 := peek64(rec + 24);
+      self.xt_poke32at(self.poolOff + idx * 4, self.globDatOff + nummer * 4 - bezug);
+      fi := fi + 1;
+    }
     return self.codeLen;
+  }
+
+  // #1786: Wie viele Pool-Eintraege braucht dieses Modul? Je Zugriff auf eine
+  // globale Variable genau einer — der Abstand haengt an der Aufrufstelle.
+  fn xt_zaehleGlobalZugriffe(): int64 {
+    var summe: int64 := 0;
+    var fn2: int64 := 0;
+    var nf:  int64 := self.getFuncCount();
+    while fn2 < nf {
+      var st: int64 := self.getFuncInstrStart(fn2);
+      var ct: int64 := self.getFuncInstrCount(fn2);
+      var k:  int64 := 0;
+      while k < ct {
+        var o: int64 := self.getInstrOp(st + k);
+        if o == IRO_LOAD_GLOBAL || o == IRO_STORE_GLOBAL { summe := summe + 1; }
+        k := k + 1;
+      }
+      fn2 := fn2 + 1;
+    }
+    return summe;
   }
 
   pub fn getCodeBuf(): int64 { return self.codeBuf; }
@@ -1057,13 +1358,19 @@ pub type XtensaBackend = class {
     poke16(elfBuf + 50, 0);            // e_shstrndx
 
     // PT_LOAD segment (32 bytes at offset 52)
+    // #1786: Das Segment trug p_offset = 0 und elfSize als Groesse — geladen
+    // wurde also die Datei MITSAMT ELF-Header, und der Code landete 4096 Byte
+    // hinter seiner eigenen Einstiegsadresse. Derselbe Fehler wie auf
+    // Cortex-M (#1744). Jetzt wird genau der Code geladen.
     poke32(elfBuf + 52, 1);               // p_type: PT_LOAD
-    poke32(elfBuf + 56, 0);              // p_offset: from file start
+    poke32(elfBuf + 56, codeFileOffset); // p_offset
     poke32(elfBuf + 60, 0x40080000);     // p_vaddr: IRAM base
     poke32(elfBuf + 64, 0x40080000);     // p_paddr
-    poke32(elfBuf + 68, elfSize);        // p_filesz
-    poke32(elfBuf + 72, elfSize);        // p_memsz
-    poke32(elfBuf + 76, 5);              // p_flags: PF_R | PF_X
+    poke32(elfBuf + 68, codeSize);       // p_filesz
+    poke32(elfBuf + 72, codeSize);       // p_memsz
+    // PF_W, weil der Datenbereich der globalen Variablen hinter dem Code liegt
+    // (#1786). Auf dem ESP32 ist IRAM beschreibbar.
+    poke32(elfBuf + 76, 7);              // p_flags: PF_R | PF_W | PF_X
     poke32(elfBuf + 80, 0x1000);         // p_align: 4096
 
     EmitWriteFile(path, elfBuf, elfSize);   // #1682

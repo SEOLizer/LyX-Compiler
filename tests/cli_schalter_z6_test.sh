@@ -114,13 +114,19 @@ fi
 # #1526 — Schalter mit Wirkung oder mit Meldung
 # ===========================================================================
 
-# --arch=xtensa muss beim Xtensa-Backend landen. Das lehnt Zeichenketten
-# derzeit ausdrücklich ab (#1339) — genau diese Meldung ist der Nachweis, dass
-# der Schalter angekommen ist. Vorher entstand still ein x86-64-ELF.
+# --arch=xtensa muss beim Xtensa-Backend landen; vorher entstand still ein
+# x86-64-ELF.
+#
+# Bis 1.1.9N war der Nachweis die Meldung, mit der das Backend
+# Zeichenkettenliterale ablehnte (#1339). Seit #1786 setzt es sie um, die
+# Meldung bleibt also aus — geprüft wird deshalb das Erzeugnis selbst:
+# e_machine muss EM_XTENSA (94) sein.
 rm -f "$TMP/x"
 msg="$(timeout 180 "$LYXC" --arch=xtensa --std-path="$ROOT" "$TMP/h.lyx" -o "$TMP/x" 2>&1)"
-if echo "$msg" | grep -qi "xtensa"; then ok "#1526: --arch=xtensa erreicht das Xtensa-Backend"
-else no "#1526: --arch=xtensa erreicht das Xtensa-Backend" "$(echo "$msg"|tail -1)"; fi
+mach=""
+[ -f "$TMP/x" ] && mach="$(od -An -tu2 -j18 -N2 "$TMP/x" | tr -d ' ')"
+if [ "$mach" = "94" ]; then ok "#1526: --arch=xtensa erreicht das Xtensa-Backend"
+else no "#1526: --arch=xtensa erreicht das Xtensa-Backend" "e_machine='$mach', Meldung: $(echo "$msg"|tail -1)"; fi
 if [ -f "$TMP/x" ] && file -b "$TMP/x" | grep -q "x86-64"; then
   no "#1526: --arch=xtensa erzeugt kein x86-64" "es entstand ein x86-64-ELF"
 else

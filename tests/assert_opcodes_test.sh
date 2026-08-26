@@ -80,7 +80,16 @@ hat_muster "arm-cm4: BNE gefolgt von BKPT"        "$TMP/d_arm-cm4" "00d100be"
 # StrLen aus der Unit nicht (eigene Luecke, hier nicht Gegenstand). Geprueft
 # wird die ZEICHENKETTE, nicht die Bibliothek.
 printf 'fn main(): int64 { PrintLn("hallo"); return 0; }\n' > "$TMP/str.lyx"
-for t in arm64 riscv arm-cm4; do
+# esp32 seit #1786 mit dabei: dort liegen die Bytes inline im Codestrom und die
+# Adresse entsteht PC-relativ ueber ein CALL0 auf eine Ruecksprungmarke —
+# xtensa hat keinen Befehl, der den Programmzaehler liest.
+#
+# Bis 1.1.9N stand hier stattdessen die Gegenprobe, dass xtensa den Opcode LAUT
+# ablehnt. Ein Test, dessen gruener Zustand eine fehlende Faehigkeit
+# voraussetzt, verrottet mit dem naechsten Ausbau; der laute Default wird
+# weiterhin in tests/ir_builtins_test.sh geprueft, dort an einer Luecke, die
+# offen ist.
+for t in arm64 riscv arm-cm4 esp32; do
   rm -f "$TMP/s_$t"
   if "$LYXC" --std-path="$ROOT" "$TMP/str.lyx" --target=$t -o "$TMP/s_$t" >/dev/null 2>&1; then
     ok "Zeichenkette uebersetzt fuer $t"
@@ -88,12 +97,6 @@ for t in arm64 riscv arm-cm4; do
     no "Zeichenkette uebersetzt fuer $t" "$("$LYXC" --std-path="$ROOT" "$TMP/str.lyx" --target=$t -o "$TMP/s_$t" 2>&1 | head -1)"
   fi
 done
-
-msgs="$("$LYXC" --std-path="$ROOT" "$TMP/str.lyx" --target=esp32 -o "$TMP/s_xt" 2>&1)"
-case "$msgs" in
-  *"Zeichenkettenliterale"*"xtensa"*"#1339"*) ok "xtensa weist Zeichenketten laut ab" ;;
-  *) no "xtensa weist Zeichenketten laut ab" "$(echo "$msgs" | head -1)" ;;
-esac
 
 # Die Bytes stehen inline im Codestrom — und der Sprung muss sie GENAU
 # ueberspringen. Das ist die eigentliche Fehlerquelle bei inline abgelegten
