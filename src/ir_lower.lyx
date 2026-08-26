@@ -1558,6 +1558,68 @@ pub type IRLower = class {
           var iTid: int64 := self.allocTemp();
           self.irAddInstrDirect(IRO_LOAD_FIELD, iTid, mcSelf, 0, 0);   // tid = obj[0]
           var iEnd: int64 := self.genLabel();
+          // #1787: Kandidaten sind die Klassen, die das Interface mit
+          // `implements` ZUSAGEN. Die tragen dann auch eine type-id
+          // (_hasVmt), und der Vergleich gegen obj[0] trifft die wirkliche
+          // Klasse.
+          //
+          // Sagt KEINE Klasse zu, hat x86 trotzdem recht: dort bekommt jede
+          // in einem Interface deklarierte Methode einen Selektor, und jede
+          // Klasse fuehrt diesen Slot an derselben Stelle (#1133) — der
+          // Aufruf trifft also auch ohne `implements`. Genau so steht es im
+          // Repro zu #1787.
+          //
+          // Dynamisch verteilen laesst sich das hier aber nicht: ohne
+          // `implements` und ohne virtuelle Methode traegt das Objekt keine
+          // type-id, obj[0] waere das erste FELD. Deshalb: genau ein
+          // struktureller Kandidat wird direkt gerufen; bei mehreren waere
+          // jede Wahl geraten, und das wird gemeldet statt getippt.
+          var iNominal: int64 := 0;
+          var iChk: int64 := 0;
+          while iChk < self._tregN {
+            if self._tregImplementsG(iChk, mcCName, mcCNameL) != 0 { iNominal := 1; }
+            iChk += 1;
+          }
+          if iNominal == 0 {
+            var sN: int64 := 0;
+            var sIdx: int64 := 0 - 1;
+            var sJ: int64 := 0;
+            while sJ < self._tregN {
+              if self._tregIsIfaceG(sJ) == 0 {
+                var sR: int64 := self._tregResolveMethodIdxG(sJ, mNameP, mNameL);
+                if sR >= 0 { sN := sN + 1; sIdx := sR; }
+              }
+              sJ += 1;
+            }
+            if sN == 1 {
+              self.irAddInstrDirect(IRO_CALL, mcDest, sIdx, mcArgBase, mcCnt);
+              return mcDest;
+            }
+            // Die Namen im Baum sind NICHT nullterminiert — kopieren, wie es
+            // die Import-Warnung weiter unten auch tut.
+            var eb: int64 := alloc(mcCNameL + mNameL + 2);
+            var eI: int64 := 0;
+            while eI < mcCNameL { poke8(eb + eI, peek8((mcCName as int64) + eI)); eI := eI + 1; }
+            poke8(eb + mcCNameL, 0);
+            var eM: int64 := eb + mcCNameL + 1;
+            var eJ: int64 := 0;
+            while eJ < mNameL { poke8(eM + eJ, peek8((mNameP as int64) + eJ)); eJ := eJ + 1; }
+            poke8(eM + mNameL, 0);
+            EPrintStr("error: Aufruf ueber den Interface-Typ '"c);
+            EPrintStr(eb as pchar);
+            EPrintStr("' ist nicht aufloesbar (#1787): "c);
+            if sN == 0 {
+              EPrintStrLn("keine Klasse hat diese Methode."c);
+            } else {
+              EPrintStr("mehrere Klassen haben eine Methode '"c);
+              EPrintStr(eM as pchar);
+              EPrintStrLn("', aber keine sagt das Interface mit `implements` zu."c);
+              EPrintStrLn("  Ohne diese Zusage traegt das Objekt keine type-id, an der sich die"c);
+              EPrintStrLn("  wirkliche Klasse zur Laufzeit erkennen liesse — die Wahl waere geraten."c);
+              EPrintStrLn("  Abhilfe: die Klasse mit `implements` versehen."c);
+            }
+            exit(1);
+          }
           var ii: int64 := 0;
           var iTraf: int64 := 0;
           while ii < self._tregN {
@@ -4636,35 +4698,29 @@ pub type IRLower = class {
 
   // ARM64-OOP: NK_TYPE_DECL der Klasse eines base-IDENT (-1 falls unauflösbar).
   fn _baseClassDecl(baseNode: int64): int64 {
-    if self.nodeKind(baseNode) != NK_IDENT { return 0 - 1; }
-    var tn: int64 := 0 - 1;
-    // `self` in einer Methode → umgebende Klasse (curMethodClassType = NK_TYPE_DECL).
-    if self.methodParamBase != 0 && self.nodeSLen(baseNode) == 4 {
+    // Schneller Weg zuerst: `self.feld` ist der haeufigste Fall ueberhaupt.
+    if self.methodParamBase != 0 && self.nodeKind(baseNode) == NK_IDENT && self.nodeSLen(baseNode) == 4 {
       var sp: int64 := (self.nodeSVal(baseNode)) as int64;
       if peek8(sp) == 115 && peek8(sp+1) == 101 && peek8(sp+2) == 108 && peek8(sp+3) == 102 {
-        tn := self.curMethodClassType;
+        return self.curMethodClassType;
       }
     }
-    if tn < 0 { tn := self._localTypeNode(self.nodeSVal(baseNode), self.nodeSLen(baseNode)); }
-    if tn < 0 { return 0 - 1; }
-    if self.nodeKind(tn) == NK_TYPE_DECL { return tn; }
-    if self.nodeKind(tn) == NK_TYPE_NAME { return self._findTypeDecl(self.nodeSVal(tn), self.nodeSLen(tn)); }
-    return 0 - 1;
+    // #1787: Sonst ueber den allgemeinen Ausdruckstyp. Vorher stand hier ein
+    // `if nodeKind != NK_IDENT { return -1 }` — damit hatte `h.b.x` keinen
+    // Typ, der Feld-Offset blieb unauflösbar und der Zugriff lieferte still 0.
+    return self._typeNodeToDecl(self._exprTypeNode(baseNode));
   }
 
   // WP-VMT-lyxos: Typ-Node (NK_TYPE_DECL ODER NK_TYPE_NAME) der Klasse von baseNode.
   // Liefert auch bei IMPORTIERTEN Klassen den Namen (sVal) — _baseClassDecl gibt dann -1,
   // weil _findTypeDecl nur das aktuelle Modul scannt; Methoden-Dispatch braucht aber nur
   // den Namen für statische Mangle "Class_method" (funcBuffer ist cross-module via _findFuncByName).
+  // #1787: Fuer JEDE Ausdrucksform, nicht nur fuer einen Bezeichner. Vorher
+  // lieferte `h.b.Wert()` oder `hol().Wert()` hier -1; der Aufruf sprang dann
+  // ueber seinen gesamten Dispatch-Block und gab ein uninitialisiertes Temp
+  // zurueck, das sich als 0 las.
   fn _baseTypeNode(baseNode: int64): int64 {
-    if self.nodeKind(baseNode) != NK_IDENT { return 0 - 1; }
-    if self.methodParamBase != 0 && self.nodeSLen(baseNode) == 4 {
-      var sp: int64 := (self.nodeSVal(baseNode)) as int64;
-      if peek8(sp) == 115 && peek8(sp+1) == 101 && peek8(sp+2) == 108 && peek8(sp+3) == 102 {
-        return self.curMethodClassType;
-      }
-    }
-    return self._localTypeNode(self.nodeSVal(baseNode), self.nodeSLen(baseNode));
+    return self._exprTypeNode(baseNode);
   }
 
   // WP-VMT-lyxos: hat die Klasse (oder ein Vorfahre) eine virtuelle Methode? Dann reserviert
@@ -7812,5 +7868,130 @@ pub type IRLower = class {
     if (self.nodeIVal(peek64(self._tregIdx + g * 8)) & 32) != 0 { r := 1; }
     self.src := sS; self.nodes := sN; self.nodeCount := sC;
     return r;
+  }
+
+  // ====================================================================
+  // #1787: der statische Typ eines BELIEBIGEN Ausdrucks
+  //
+  // Diese Ebene fehlte. _baseTypeNode und _baseClassDecl konnten den Typ nur
+  // fuer einen einfachen Bezeichner und fuer `self` bestimmen; jede andere
+  // Form — ein Feld (`h.b`), ein Aufrufergebnis (`hol()`), ein `new`, ein
+  // Cast — lieferte -1. Der Methodenaufruf sprang dann ueber seinen ganzen
+  // Dispatch-Block hinweg und gab ein UNINITIALISIERTES Temp zurueck, das
+  // sich als 0 las. Belegt fuer `h.b.Wert()`, `hol().Wert()` und `h.b.x` auf
+  // allen IR-Backends, waehrend x86 jedes Mal richtig rechnete.
+  //
+  // Die Frage lautete also nicht „wo wird falsch gerechnet", sondern „wo
+  // muesste der Typ herkommen — gibt es die Stelle?". Hier ist sie.
+  // ====================================================================
+
+  // Typ-Node (NK_TYPE_DECL oder NK_TYPE_NAME) → NK_TYPE_DECL, soweit im
+  // aktuellen Modul auffindbar. Bei importierten Klassen bleibt es bei -1;
+  // dafuer gibt es die Registry.
+  fn _typeNodeToDecl(tn: int64): int64 {
+    if tn < 0 { return 0 - 1; }
+    if self.nodeKind(tn) == NK_TYPE_DECL { return tn; }
+    if self.nodeKind(tn) == NK_TYPE_NAME {
+      return self._findTypeDecl(self.nodeSVal(tn), self.nodeSLen(tn));
+    }
+    return 0 - 1;
+  }
+
+  // Typ-Node eines Feldes in typeDecl, geerbte Felder eingeschlossen.
+  fn _fieldTypeNodeIn(typeDecl: int64, fp: pchar, fl: int64): int64 {
+    var tc: int64 := typeDecl;
+    while tc >= 0 {
+      var fd: int64 := self.nodeC0(tc);
+      while fd >= 0 {
+        if self.seq(self.nodeSVal(fd), self.nodeSLen(fd), fp, fl) { return self.nodeC0(fd); }
+        fd := self.nodeNext(fd);
+      }
+      var pn: int64 := self.nodeC2(tc);
+      if pn >= 0 { tc := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn)); }
+      else { tc := 0 - 1; }
+    }
+    return 0 - 1;
+  }
+
+  // Rueckgabetyp-Node einer Methode von typeDecl (NK_FUNC_DECL.c1), geerbte
+  // eingeschlossen.
+  fn _methodRetTypeIn(typeDecl: int64, mp: pchar, ml: int64): int64 {
+    var tc: int64 := typeDecl;
+    while tc >= 0 {
+      var m: int64 := self.nodeC1(tc);
+      while m >= 0 {
+        if self.nodeKind(m) == NK_FUNC_DECL {
+          if self.seq(self.nodeSVal(m), self.nodeSLen(m), mp, ml) { return self.nodeC1(m); }
+        }
+        m := self.nodeNext(m);
+      }
+      var pn: int64 := self.nodeC2(tc);
+      if pn >= 0 { tc := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn)); }
+      else { tc := 0 - 1; }
+    }
+    return 0 - 1;
+  }
+
+  // Rueckgabetyp-Node einer freien Funktion im aktuellen Modul.
+  fn _funcRetTypeNode(fp: pchar, fl: int64): int64 {
+    var i: int64 := 0;
+    while i < self.nodeCount {
+      if self.nodeKind(i) == NK_FUNC_DECL {
+        if self.seq(self.nodeSVal(i), self.nodeSLen(i), fp, fl) { return self.nodeC1(i); }
+      }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // Der statische Typ eines Ausdrucks. Rekursiv, weil die Basis selbst wieder
+  // eine beliebige Form haben darf (`a.b.c.methode()`).
+  fn _exprTypeNode(nd: int64): int64 {
+    if nd < 0 { return 0 - 1; }
+    var k: int64 := self.nodeKind(nd);
+
+    if k == NK_IDENT {
+      // `self` in einer Methode → umgebende Klasse.
+      if self.methodParamBase != 0 && self.nodeSLen(nd) == 4 {
+        var sp: int64 := (self.nodeSVal(nd)) as int64;
+        if peek8(sp) == 115 && peek8(sp+1) == 101 && peek8(sp+2) == 108 && peek8(sp+3) == 102 {
+          return self.curMethodClassType;
+        }
+      }
+      return self._localTypeNode(self.nodeSVal(nd), self.nodeSLen(nd));
+    }
+
+    // `new C(...)` — der Typ steht im sVal des Knotens.
+    if k == NK_NEW {
+      var nd2: int64 := self._findTypeDecl(self.nodeSVal(nd), self.nodeSLen(nd));
+      if nd2 >= 0 { return nd2; }
+      return 0 - 1;
+    }
+
+    // `x as T` — c1 traegt den Zieltyp.
+    if k == NK_CAST {
+      var ct: int64 := self.nodeC1(nd);
+      if ct >= 0 { return ct; }
+      return 0 - 1;
+    }
+
+    // `basis.feld`
+    if k == NK_FIELD {
+      var od: int64 := self._typeNodeToDecl(self._exprTypeNode(self.nodeC0(nd)));
+      if od < 0 { return 0 - 1; }
+      return self._fieldTypeNodeIn(od, self.nodeSVal(nd), self.nodeSLen(nd));
+    }
+
+    // Aufruf: Methodenaufruf (iVal == 1) oder freie Funktion.
+    if k == NK_CALL {
+      if self.nodeIVal(nd) == 1 {
+        var cd: int64 := self._typeNodeToDecl(self._exprTypeNode(self.nodeC0(nd)));
+        if cd < 0 { return 0 - 1; }
+        return self._methodRetTypeIn(cd, self.nodeSVal(nd), self.nodeSLen(nd));
+      }
+      return self._funcRetTypeNode(self.nodeSVal(nd), self.nodeSLen(nd));
+    }
+
+    return 0 - 1;
   }
 }
