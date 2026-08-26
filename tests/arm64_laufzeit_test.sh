@@ -142,5 +142,26 @@ run "con_positiv"        'con A: int64 := 7; fn main(): int64 { return 35 + A; }
 # Konstante aus einer Vergleichskette -- der gemeldete Fall.
 run "con_vergleich"      'con BAD: int64 := -1; fn hol(): int64 { return 0 - 1; } fn main(): int64 { if hol() == BAD { return 42; } return 9; }' 42
 
+# ---------------------------------------------------------------------------
+# #1801: f64-Modulkonstanten
+#
+# Sie waren 0. Der Anfangswert lief ueber einen GANZZAHLIGEN Falter, und
+# Gleitkomma gehoert da nicht hinein (#1499). Also blieb es bei 0 — `con P:
+# f64 := 2.5` kam als 0.0 an. std/math.lyx fuehrt MATH_LN2 und MATH_LN10 so;
+# `fDiv(x, MATH_LN2)` war auf diesen Zielen eine Division durch null, ohne
+# dass beim Uebersetzen etwas auffiel.
+#
+# Der Fix rechnet nicht, er legt das BITMUSTER ab — wie es der Zweig fuer
+# f64-Literale im Code seit #868 tut.
+run "f64_con"           'con P: f64 := 2.5; fn main(): int64 { var a: f64 := P * 4.0; return 32 + (a as int64); }' 42
+# Negativ: das Vorzeichenbit wird gekippt, NICHT ganzzahlig negiert. `0 - Bits`
+# ergaebe aus -1.5 die Zahl -3.0 — plausibel und falsch (vgl. #1803 im
+# x86-Pfad).
+run "f64_con_negativ"   'con N: f64 := -1.5; fn main(): int64 { var b: f64 := N * 4.0; return 48 + (b as int64); }' 42
+# Der Fall aus std/math.lyx.
+run "f64_con_ln2"       'con LN2: f64 := 0.6931471805599453; fn main(): int64 { var q: f64 := 2.0 / LN2; return (q * 10.0) as int64; }' 28
+# Gegenprobe: ganzzahlige Konstanten bleiben ganzzahlig.
+run "f64_neben_int"     'con P: f64 := 1.5; con I: int64 := 39; fn main(): int64 { var a: f64 := P * 2.0; return I + (a as int64); }' 42
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
