@@ -99,6 +99,10 @@ LyxOS-Builtin-Misdispatch (PR #839) und der verworfene Opcode-Catch-all
 | 427 | Ein Feld der Schnittstelle setzen | `sys_net_set` | #1734; LyxOS 212 |
 | 428 | ICMP-Echo; der Puffer traegt Parameter rein und Ergebnisse raus | `sys_icmp_ping` | #1734; LyxOS 213 |
 | 429 | DNS-Abfrage; buf Parameter/Ergebnis, a1 = Name | `sys_dns_query` | #1734; LyxOS 214 |
+| 430 | Umgebungsvariable setzen; Zeiger sind PHYSISCH (ELF-Literale) | `sys_setenv` | #1810; LyxOS 92 |
+| 431 | Wert in den Puffer holen, Laenge oder -1; Zeiger PHYSISCH | `sys_getenv` | #1810; LyxOS 93 |
+| 432 | Alle Variablen ueber vmm_op41 ausgeben | `sys_envlist` | #1810; LyxOS 94 |
+| 433 | Alle als KEY=VAL\n in den Puffer; hier USER-virtuell | `sys_envlistbuf` | #1810; LyxOS 133 |
 
 Warum oberhalb des Syscall-Bereichs und nicht darin: das sind keine Syscalls,
 sondern Rechenoperationen, die jedes Backend umsetzen kann. Sie im

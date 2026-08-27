@@ -434,6 +434,37 @@ for paar in "sys_notify_send(1, 7):Nutzlast" "sys_notify_recv(1, 1000):nicht err
     esac
 done
 
+echo "-- #1810: Umgebungsvariablen mit den ECHTEN Nummern --"
+# 92-94 und 133. Portabel im Sinne der Aufnahmeregel von lyx-lyxunits (POSIX
+# kennt Umgebungsvariablen), gehoeren also hinter std.* und damit in den
+# Compiler — anders als win/iofs/audio, die lyx-lyxunits ueber den generischen
+# Block (mmap -5 / -6) selbst abdeckt.
+#
+# ACHTUNG bei den Zeigern: 92/93 nehmen PHYSISCHE Adressen (Kernel-Kommentar
+# key_phys/val_phys), 133 uebersetzt selbst und will user-virtuell. Die Faelle
+# hier benutzen deshalb Zeichenkettenliterale bzw. eine feste Adresse.
+pruefe_baut "sys_setenv (92)"      'sys_setenv("A"c, "1"c)'
+pruefe_baut "sys_getenv (93)"      'sys_getenv("A"c, 2097152, 64)'
+pruefe_baut "sys_envlist (94)"     "sys_envlist()"
+pruefe_baut "sys_envlistbuf (133)" "sys_envlistbuf(2097152, 4096)"
+
+printf 'fn main(): int64 { var b: int64 := 0x200000; sys_setenv("A"c, "1"c); var n: int64 := sys_getenv("A"c, b, 64); sys_envlist(); sys_envlistbuf(b, 4096); return n; }\n' > "$TMP/ev.lyx"
+if $LYXC "$TMP/ev.lyx" --target=lyxos -o "$TMP/ev.lbf" >/dev/null 2>&1; then
+    HEXE="$(od -An -tx1 -v "$TMP/ev.lbf" | tr -d ' \n')"
+    fehltE=""
+    for paar in "92:5c" "93:5d" "94:5e" "133:85"; do
+        nrE="${paar%%:*}"; byE="${paar##*:}"
+        case "$HEXE" in *"48b8${byE}00000000000000"*) : ;; *) fehltE="$fehltE $nrE" ;; esac
+    done
+    if [ -z "$fehltE" ]; then
+        echo "PASS Umgebung: 92/93/94/133 stehen im Erzeugnis"; PASS=$((PASS + 1))
+    else
+        echo "FAIL Umgebung: diese Nummern fehlen im Erzeugnis:$fehltE"; FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL Umgebung: uebersetzt nicht"; FAIL=$((FAIL + 1))
+fi
+
 echo "----"
 echo "$PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
