@@ -46,5 +46,26 @@ fn main(): int64 { return 0; }' 4
 check "fs_read_net"    '@capabilities([fs.read, network.tcp.connect])
 fn main(): int64 { return 0; }' 5
 
+# ---------------------------------------------------------------------------
+# #1797: system.config — persistente Konfiguration schreiben
+#
+# `fs.write` reicht dafuer nicht: das hat praktisch jedes Programm, das eine
+# Datei anlegt. Duerfte dasselbe Recht auch die Netz- oder Systemkonfiguration
+# umschreiben, waere die Pruefung wirkungslos.
+#
+# Die 0x80 ist NICHT frei gewaehlt: der Kernel bildet sie bereits ab
+# (kernel/lbf_exec.lyx, lbf_map_caps -> PLEDGE_CONFIG 262144). Es fehlte allein
+# der Name auf Compiler-Seite, weshalb das Recht bisher am PROGRAMMPFAD erteilt
+# wurde (config_writer_allowed, "ifconfig.lbf") statt aus dem Manifest.
+check "system_config"      '@capabilities([system.config])
+fn main(): int64 { return 0; }' 128
+# Vereinigung: die Bits duerfen sich nicht gegenseitig verdecken.
+check "config_und_write"   '@capabilities([fs.write, system.config])
+fn main(): int64 { return 0; }' 130
+# Gegenprobe: fs.write allein darf die Konfiguration NICHT freischalten —
+# genau das ist der Zweck der Unterscheidung.
+check "write_ohne_config"  '@capabilities([fs.write])
+fn main(): int64 { return 0; }' 2
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
