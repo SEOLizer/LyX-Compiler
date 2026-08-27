@@ -246,6 +246,81 @@ pub fn realloc_mem(ptr: int64, new_size: int64): int64 {
   return libc_realloc(ptr, align_to_8(new_size));
 }
 
+// ---------------------------------------------------------------------------
+// #1820: Pool-Allokator (Arena). Bisher gab es ihn nur compilerintern in
+// src/std/alloc.lyx; wer std.alloc benutzte, hatte keinen.
+//
+// Die Namen tragen das Praefix Mem, weil std.cloud.cf.lb ein PoolCreate
+// fuer Lastverteiler-Pools exportiert — ohne Praefix waeren die beiden
+// Units nicht mehr zusammen importierbar. Genau dieselbe Kollision hat
+// in dieser Runde DaysInMonth zwischen std.time und std.datetime erzeugt.
+//
+// Ein Pool ist EIN Block, aus dem der Reihe nach herausgegeben wird. Einzelne
+// Stuecke werden nicht zurueckgegeben — freigegeben wird der ganze Pool auf
+// einmal. Genau dafuer ist er da: viele kurzlebige Stuecke ohne Buchfuehrung.
+//
+// Kopf (32 Byte) am Anfang des Blocks:
+//   +0  Gesamtgroesse des Blocks (mit Kopf)
+//   +8  naechster freier Offset
+//   +16 Kennung 0x4C595850 ("LYXP"), damit ein Fremdzeiger auffaellt
+//   +24 unbenutzt (haelt die Nutzdaten auf 32 ausgerichtet)
+// ---------------------------------------------------------------------------
+con POOL_KOPF: int64 := 32;
+con POOL_MAGIC: int64 := 1280595024;
+
+pub fn MemPoolCreate(size: int64): int64 {
+  if (size <= 0) { return 0; }
+  var gesamt: int64 := size + POOL_KOPF;
+  var blk: int64 := alloc(gesamt);
+  if (blk == 0) { return 0; }
+  poke64(blk, gesamt);
+  poke64(blk + 8, POOL_KOPF);
+  poke64(blk + 16, POOL_MAGIC);
+  poke64(blk + 24, 0);
+  return blk;
+}
+
+// Gibt 0 zurueck, wenn der Pool voll ist — NICHT den letzten Zeiger noch
+// einmal: ein stiller Doppelzeiger waere schlimmer als eine abgelehnte
+// Anforderung.
+pub fn MemPoolAlloc(pl: int64, size: int64): int64 {
+  if (pl == 0) { return 0; }
+  if (peek64(pl + 16) != POOL_MAGIC) { return 0; }
+  if (size <= 0) { return 0; }
+  // Auf 8 aufrunden, damit jeder Zeiger ausgerichtet ist.
+  var n: int64 := ((size + 7) / 8) * 8;
+  var pos: int64 := peek64(pl + 8);
+  var gesamt: int64 := peek64(pl);
+  if (pos + n > gesamt) { return 0; }
+  poke64(pl + 8, pos + n);
+  return pl + pos;
+}
+
+// Setzt den Pool zurueck, ohne den Block freizugeben — die bisher
+// ausgegebenen Zeiger sind danach ungueltig.
+pub fn MemPoolReset(pl: int64): void {
+  if (pl == 0) { return; }
+  if (peek64(pl + 16) != POOL_MAGIC) { return; }
+  poke64(pl + 8, POOL_KOPF);
+}
+
+// Wieviel noch hineinpasst.
+pub fn MemPoolAvail(pl: int64): int64 {
+  if (pl == 0) { return 0; }
+  if (peek64(pl + 16) != POOL_MAGIC) { return 0; }
+  return peek64(pl) - peek64(pl + 8);
+}
+
+// Gibt den ganzen Block frei. Die Kennung wird vorher geloescht, damit ein
+// zweites MemPoolRelease auf denselben Zeiger nicht noch einmal free() ruft.
+pub fn MemPoolRelease(pl: int64): void {
+  if (pl == 0) { return; }
+  if (peek64(pl + 16) != POOL_MAGIC) { return; }
+  var gesamt: int64 := peek64(pl);
+  poke64(pl + 16, 0);
+  free(pl, gesamt);
+}
+
 pub fn size_of_int64(): int64 { return 8; }
 pub fn size_of_ptr(): int64 { return 8; }
 
