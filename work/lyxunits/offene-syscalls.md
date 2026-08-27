@@ -11,9 +11,13 @@ Compiler emittiert, welche `lyx-lyxunits` kapselt, und welche **weder noch**.
 Grundlage ist die aus `kernel/ring3.lyx` erzeugte Tabelle (`tools/sync_syscalls.py`,
 Stand 2026-08-25, Commit `fac87bc`, 197 belegte Nummern).
 
-Das Ergebnis spricht für die Units: von den 132 Nummern, die der Compiler nicht
-emittiert, sind **123 in `lyx-lyxunits` bereits gekapselt**. Übrig bleiben neun,
-davon gehören **drei hierher** — die übrigen sind Compilerarbeit oder Absicht.
+Das Ergebnis spricht für die Units: von den 122 Nummern, die der Compiler nicht
+emittiert, sind **118 in `lyx-lyxunits` bereits gekapselt**. Übrig bleiben vier,
+davon gehören **drei hierher** — die vierte ist Absicht.
+
+(Korrigierte Zahlen, Stand 1.1.11B. Eine frühere Fassung nannte 132/123/neun;
+dabei war der dritte Emissionsweg des Compilers — `emitBlockSyscall`, für
+Nummern außerhalb der SYSCALL-Whitelist des Bootloaders — nicht mitgezählt.)
 
 ## Die drei
 
@@ -53,8 +57,10 @@ Zur Vollständigkeit, damit die Liste nicht doppelt bearbeitet wird:
 
 * **92, 93, 94, 133** (`setenv`, `getenv`, `envlist`, `envlistbuf`) — Umgebungs-
   variablen gibt es unter POSIX. Nach eurer Aufnahmeregel ausgeschlossen; sie
-  gehören hinter `std.env` und damit in den Compiler. Wird dort gerade gebaut.
-* **140** (`sys_utime_fd`) — POSIX hat `utime`. Ebenfalls Compilerseite.
+  gehören hinter `std.env` und damit in den Compiler. **Erledigt** mit 1.1.11B.
+* **140** (`sys_utime_fd`) — war in einer früheren Fassung dieser Liste als offen
+  geführt. Das war falsch: der Compiler bindet ihn längst (Builtin-ID 215 über
+  `emitBlockSyscall`).
 * **516** (`sys_seek`) — **bewusst nichts.** Der Kernel behandelt `0x0204` und
   `8` im selben Zweig (`nr == 0x0204 || nr == 8`), ausdrücklich beabsichtigt.
   Der Compiler emittiert `8`. Siehe aurum#1794.
