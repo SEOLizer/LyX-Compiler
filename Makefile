@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.11E
-VERSION_DATE := 2026-08-27
+VERSION   := 1.1.12B
+VERSION_DATE := 2026-08-28
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -280,6 +280,8 @@ test: lyxc
 	@bash tests/ir_if_kette_test.sh
 	@echo "--- match und switch auf dem IR-Weg (#1825) ---"
 	@bash tests/ir_match_test.sh
+	@echo "--- lokale Strukturen auf dem IR-Weg (#1835) ---"
+	@bash tests/ir_struct_test.sh
 	@bash tests/iso_verzeichnisse_test.sh
 	@bash tests/win64_syscalls_test.sh
 	@bash tests/ir_argslots_test.sh

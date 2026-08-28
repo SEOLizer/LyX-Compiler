@@ -146,6 +146,40 @@ else
   ok "ELF-Ziel meldet nicht"
 fi
 
+# --- #1823: process.* — nur exec und fork tragen das Spawn-Recht -----------
+# Die Zuordnung lief ueber das PRAEFIX `process` (7 Zeichen) und traf damit alle
+# fuenf Namen. Gemessen am Erzeugnis setzte `@capabilities([process.exit])`
+# Bit 8 = LBF_CAP_PROC_SPAWN, das der Kernel auf PLEDGE_EXEC abbildet: wer
+# anmeldete, sich beenden zu duerfen, bekam das Recht, PROGRAMME ZU STARTEN.
+#
+# Geprueft wird beides — dass die beiden richtigen Namen das Bit setzen UND
+# dass die drei anderen es NICHT tun. Nur die erste Haelfte zu pruefen, waere
+# auch von der alten, zu weiten Zuordnung erfuellt worden.
+for pn in exec fork; do
+  bau "pe_$pn" "@capabilities([process.$pn])
+fn main(): int64 { return 0; }"
+  v="$(caps "$TMP/pe_$pn.lbf")"
+  [ "$v" = "8" ] && ok "process.$pn setzt 0x08 (PROC_SPAWN)" \
+                 || no "process.$pn" "caps=$v erwartet 8"
+done
+
+for pn in exit signal sched; do
+  bau "px_$pn" "@capabilities([process.$pn])
+fn main(): int64 { return 0; }"
+  v="$(caps "$TMP/px_$pn.lbf")"
+  if [ "$v" = "8" ]; then
+    no "process.$pn" "setzt PROC_SPAWN (0x08) — Rechteausweitung, siehe #1823"
+  else
+    ok "process.$pn setzt kein Spawn-Bit (caps=$v)"
+  fi
+  # Und es wird gemeldet, statt still nichts zu tun.
+  if grep -q "setzt kein Bit in der CAPS-TLV" "$TMP/px_$pn.log"; then
+    ok "process.$pn wird als wirkungslos gemeldet"
+  else
+    no "process.$pn" "keine Meldung, obwohl kein Bit gesetzt wird"
+  fi
+done
+
 echo "----"
 echo "PASS: $PASS  FAIL: $FAIL"
 [ "$FAIL" -eq 0 ]
