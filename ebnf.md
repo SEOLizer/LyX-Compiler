@@ -1,6 +1,6 @@
-# Lyx 1.1.12H — Canonical EBNF Grammar
+# Lyx 1.1.12I — Canonical EBNF Grammar
 
-> Stand 2026-08-28, gegen lyxc 1.1.12H geprueft. Die Keyword-Liste in
+> Stand 2026-08-28, gegen lyxc 1.1.12I geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -1367,7 +1367,21 @@ NewExpr             = "new" Type "(" [ ArgList ] ")"
    `16 + n*8` Byte, also `{cap,len}`-Kopf und n Slots, wie ein `[N]T`. `len(a)`
    liest denselben Kopf, und die dynamische Bereichspruefung haelt den Index
    dagegen. Eine Laenge <= 0 bricht mit `panic` ab. Bis 1.0.16G gab es die Form
-   nicht -- eine gerechnete Groesse zwang zu alloc/poke64 (#1255). *)
+   nicht -- eine gerechnete Groesse zwang zu alloc/poke64 (#1255).
+
+   Der belegte Speicher ist GENULLT, beide Formen. Ein Feld, das der
+   Konstruktor nicht setzt, liest sich also als 0, und `new T[n]` beginnt mit
+   n Nullen. Bis 1.1.12H galt das nur zufaellig: alle Ziele ausser lyxos
+   bekommen frische Seiten vom Betriebssystem, und die sind genullt (Linux
+   anonymes mmap, Windows VirtualAlloc). LyxOS nullt nicht, dieselbe Quelle
+   verhielt sich dort also anders -- still, denn unter Linux besteht jedes
+   vergessene Feld die Pruefung auf 0. #1848 macht die Zusicherung
+   verbindlich; der lyxos-Zweig nullt seither selbst.
+
+   Auf freistehenden Zielen (arm-cm*, esp32*) gibt es `new` NICHT: kein
+   Betriebssystem, kein Allokator, keine Quelle fuer Speicher, der den Aufruf
+   ueberlebt. Der Uebersetzer meldet das (#1783 fuer arm-cm, #1848 fuer
+   xtensa); bis dahin lieferte er dort still einen Nullzeiger. *)
 
 DisposeExpr         = "dispose" Expr ;
 ```
