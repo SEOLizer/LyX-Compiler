@@ -221,6 +221,109 @@ else
   no "#1606: richtiger Aufruf" "$(grep -m1 -iE 'error' "$TMP/r.log")"
 fi
 
+# ===========================================================================
+# #1821 — eine Elternklasse, die es nicht gibt, wird gemeldet
+# ===========================================================================
+# Uebernommen aus regression/oop/test_tobject_explicit, der `extends TObject`
+# benutzte. TObject als implizite Basisklasse ist ersatzlos entfallen; der Test
+# dokumentierte damit eine Faehigkeit, die es nicht mehr gibt, und lag als
+# "verrottet" in suite-broken.txt.
+#
+# Uebrig bleibt die Frage, die wirklich zaehlt: wird eine unbekannte
+# Elternklasse GEMELDET? Sie war bis 1.1.11F durch keinen Test gedeckt — die
+# Meldung gab es (sema.lyx, "unknown parent class"), niemand hat sie gemessen.
+weist_ab "#1821 unbekannte Elternklasse wird gemeldet" "unknown parent class" \
+'type MeineKlasse = class extends TObject {
+  wert: int64;
+  fn Setze(v: int64) { self.wert := v; }
+};
+fn main(): int64 { var o: MeineKlasse := new MeineKlasse(); o.Setze(42); return 0; }'
+
+# Der gruene Zwilling ohne `extends` laeuft weiterhin: eine Klasse ohne
+# ausdrueckliche Basis braucht keine.
+lauf "#1821 Klasse ohne ausdrueckliche Basis laeuft" "42" \
+'type OhneBasis = class {
+  wert: int64;
+  fn Setze(v: int64) { self.wert := v; }
+  fn Hol(): int64 { return self.wert; }
+};
+fn main(): int64 { var o: OhneBasis := new OhneBasis(); o.Setze(42); PrintInt(o.Hol()); return 0; }'
+
+# ===========================================================================
+# #1748 — Feld eines Fremdtyps, dessen Methoden so heissen wie eigene
+# ===========================================================================
+# Gemeldet mit 1.1.6D: eine Klasse mit Feldern vom Typ TIntArray, die von einer
+# Klasse mit VIRTUELLEN Methoden erbt, brach im Codegen ab —
+# "undefined function 'Destroy'", also mit genau dem Namen, den die eigene
+# Klasse UND der Feldtyp tragen. Ohne `virtual` in der Basis uebersetzte
+# dieselbe Datei. vegagrid hat daraufhin die Felder durch rohe Speicherbloecke
+# ersetzt.
+#
+# Mit 1.1.11E ist der Fall nicht mehr reproduzierbar — nachgemessen an der
+# ORIGINALQUELLE (vegagrid/metrics.lyx, auf TIntArray zurueckgebaut): sie
+# uebersetzt und rechnet richtig.
+#
+# EHRLICHKEIT ZUR AUSSAGEKRAFT: dieser Fall war beim Hinzufuegen GRUEN. Ob er
+# vor dem Fix rot gewesen waere, laesst sich hier nicht zeigen — der aelteste
+# verfuegbare Uebersetzer (src/lyxc_bootstrap) ist bereits 1.1.11B. Er sichert
+# also die FORM gegen einen Rueckfall, er belegt keinen Fix.
+lauf "#1748 Fremdtyp-Feld mit gleichnamigen Methoden unter virtueller Basis" "220" \
+'import src.std.alloc;
+type TZahlen = class {
+  Data: int64;
+  Length: int64;
+  fn Create(n: int64): void {
+    self.Data := 0; self.Length := 0;
+    if (n <= 0) { return; }
+    var p: int64 := alloc(n * 8);
+    if (p == 0) { return; }
+    self.Data := p; self.Length := n;
+    var i: int64 := 0;
+    while (i < n) { poke64(p + (i * 8), 0); i := i + 1; }
+  }
+  fn Destroy(): void { if (self.Data != 0) { free(self.Data, self.Length * 8); self.Data := 0; } }
+  fn Resize(n: int64): void { self.Length := n; }
+  fn Get(i: int64): int64 { if (i < 0) { return 0; } if (i >= self.Length) { return 0; } return peek64(self.Data + (i * 8)); }
+  fn Put(i: int64, v: int64): void { if (i < 0) { return; } if (i >= self.Length) { return; } poke64(self.Data + (i * 8), v); }
+};
+type TBasis = class {
+  Vorgabe: int64;
+  Anzahl: int64;
+  fn Create(): void { self.Vorgabe := 20; self.Anzahl := 0; }
+  virtual fn Destroy(): void { }
+  virtual fn Hoehe(r: int64): int64 { return self.Vorgabe; }
+  virtual fn Gesamt(): int64 { return self.Anzahl * self.Vorgabe; }
+};
+type TAbleitung = class extends TBasis {
+  _h: TZahlen;
+  _cap: int64;
+  fn Create(): void { self.Vorgabe := 20; self.Anzahl := 0; self._h := 0 as TZahlen; self._cap := 0; }
+  override fn Destroy(): void { if (self._h != 0) { self._h.Destroy(); } }
+  fn Resize(n: int64): void {
+    if (self._h == 0) { self._h := new TZahlen(64); self._cap := 64; } else { self._h.Resize(64); }
+    self.Anzahl := n;
+  }
+  override fn Hoehe(r: int64): int64 {
+    var v: int64 := self._h.Get(r);
+    if (v <= 0) { return self.Vorgabe; }
+    return v;
+  }
+  fn SetzeHoehe(r: int64, h: int64): void { self._h.Put(r, h); }
+  override fn Gesamt(): int64 {
+    var s: int64 := 0; var i: int64 := 0;
+    while (i < self.Anzahl) { s := s + self.Hoehe(i); i := i + 1; }
+    return s;
+  }
+};
+fn main(): int64 {
+  var a: TAbleitung := new TAbleitung();
+  a.Resize(10);
+  a.SetzeHoehe(2, 40);
+  PrintInt(a.Gesamt());
+  a.Destroy();
+  return 0;
+}'
+
 echo
 echo "--- $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]

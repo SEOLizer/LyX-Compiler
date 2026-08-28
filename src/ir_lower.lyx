@@ -4870,6 +4870,38 @@ pub type IRLower = class {
   // Field Access Lowering
   // ------------------------------------------------------------------
 
+  // #1835: Gesamtgroesse einer Struktur in Byte.
+  //
+  // Gerechnet wird wie in lowerField: der laufende Offset wandert ueber die
+  // Felder, ein ausdrueckliches at(offset) setzt ihn neu. Zurueckgegeben wird
+  // das ENDE des weitesten Feldes, nicht die Summe — bei gesetzten Offsets
+  // muessen die beiden nicht uebereinstimmen.
+  //
+  // Geerbte Felder zaehlen mit: die Kette laeuft ueber c2 nach oben, wie in
+  // _fieldTypeNodeIn.
+  fn structGroesse(typeDecl: int64): int64 {
+    if typeDecl < 0 { return 0; }
+    var ende: int64 := 0;
+    var tc: int64 := typeDecl;
+    while tc >= 0 {
+      var offset: int64 := 0;
+      var fd: int64 := self.nodeC0(tc);
+      while fd >= 0 {
+        if (self.nodeIVal(fd) & 1) != 0 {
+          var offNode: int64 := self.nodeC1(fd);
+          if offNode >= 0 {
+            if self.nodeKind(offNode) == NK_LIT_INT { offset := self.nodeIVal(offNode); }
+          }
+        }
+        offset := offset + self.fieldTypeSize(self.nodeC0(fd));
+        if offset > ende { ende := offset; }
+        fd := self.nodeNext(fd);
+      }
+      tc := self.nodeC2(tc);
+    }
+    return ende;
+  }
+
   fn fieldTypeSize(typeNode: int64): int64 {
     if typeNode < 0 { return 8; }
     var tv: pchar := self.nodeSVal(typeNode);
@@ -5847,6 +5879,34 @@ pub type IRLower = class {
             // WP-ALIGN: @align(n) → Boundary aus iv-Bits 8+ (n direkt gespeichert); imm der ALLOC.
             var vdAlign: int64 := (self.nodeIVal(stmt) >> 8) & 0xFFFFFF;
             self.irAddInstrDirect(IRO_ALLOC, vdSlot, vdSzTemp, -1, vdAlign);
+          }
+        }
+        // #1835: dasselbe fuer `var r: TStruct;`. Der Array-Fall daneben bekam
+        // mit dem ARM64-FIX Speicher, der Struktur-Fall wurde nie nachgezogen —
+        // der Slot blieb uninitialisiert. `r.L := 1` lowert zu
+        // IRO_STORE_FIELD(offset, wert, BASIS), und Basis ist der WERT des
+        // Slots: bei einer Klasseninstanz der Heap-Zeiger, bei einer Struktur
+        // Muell. Auf jedem IR-Ziel (arm64, riscv, Cortex-M, lyxos) faultete
+        // deshalb schon `var r: TR; r.L := 1;` — auf x86 nicht, weil der
+        // Produktiv-Codegen dort direkt aus dem AST erzeugt.
+        //
+        // Nur STRUKTUREN (NK_TYPE_DECL, iv-Bit 4), nicht Klassen: eine
+        // Klassenvariable ohne `new` soll null bleiben und nicht stillschweigend
+        // auf einen leeren Block zeigen, sonst liefe eine fehlende
+        // Instanziierung ins Leere statt aufzufallen.
+        //
+        // mmap liefert genullte Seiten, die Felder starten also bei 0.
+        else if vdType >= 0 {
+          var vdSd: int64 := self._typeNodeToDecl(vdType);
+          if vdSd >= 0 {
+            if (self.nodeIVal(vdSd) & 16) != 0 {
+              var vdGr: int64 := self.structGroesse(vdSd);
+              if vdGr > 0 {
+                var vdStTemp: int64 := self.allocTemp();
+                self.irAddInstrDirect(IRO_CONST_INT, vdStTemp, -1, -1, vdGr);
+                self.irAddInstrDirect(IRO_ALLOC, vdSlot, vdStTemp, -1, 0);
+              }
+            }
           }
         }
       }
