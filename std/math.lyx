@@ -744,12 +744,39 @@ fn f64_cosCore(r: f64): f64 {
 // nichts mehr. Das ist eine Eigenschaft der Zahlendarstellung, keine der
 // Umsetzung; wer dort genaue Werte braucht, muss das Argument selbst klein
 // halten.
+// #1829: Die Reduktion lief ueber EIN f64-2pi. Der Abzug qi*2pi verliert bei
+// grossen Argumenten alle Stellen, die das Ergebnis tragen — bei 1e16 kam
+// sin(2) heraus statt sin(1e16), ohne jeden Hinweis.
+//
+// Jetzt dreistufig nach Cody-Waite: 2pi ist in drei Summanden zerlegt, deren
+// erster nur neun Signifikandenbits hat (6.28125 = 201/32). Das Produkt
+// qi * hi ist damit exakt, solange qi unter etwa 2^44 bleibt; die beiden
+// Restterme tragen die Stellen nach, die sonst wegfielen.
+//
+// Der dritte Summand ist rund 7.5e-20 und damit zu klein fuer ein
+// Dezimalliteral in Lyx — als Literal geschrieben parst er zu 0. Er entsteht
+// deshalb aus einer Division, die genau eine Rundung kostet.
+fn f64_zweiPi_hi(): f64 { return 6.28125; }
+fn f64_zweiPi_mid(): f64 { return 0.001935307179586477; }
+fn f64_zweiPi_lo(): f64 {
+  return fDiv(fSub((0 as f64), 7.471323344099423), 100000000000000000000.0);
+}
+
 fn f64_modZweiPi(ax: f64): f64 {
   var zweiPi: f64 := 6.283185307179586;
   if (fLt(ax, zweiPi) != 0) { return ax; }
   var q: f64 := fDiv(ax, zweiPi);
   var qi: f64 := FloorF64(q);
-  return fSub(ax, fMul(qi, zweiPi));
+
+  var r: f64 := fSub(ax, fMul(qi, f64_zweiPi_hi()));
+  r := fSub(r, fMul(qi, f64_zweiPi_mid()));
+  r := fSub(r, fMul(qi, f64_zweiPi_lo()));
+
+  // Die Zerlegung kann knapp ueber die Grenzen laufen; ein Schritt zurueck
+  // genuegt, weil der Fehler weit unter 2pi liegt.
+  if (fLt(r, (0 as f64)) != 0) { r := fAdd(r, zweiPi); }
+  if (fGe(r, zweiPi) != 0) { r := fSub(r, zweiPi); }
+  return r;
 }
 
 fn f64_quadrant(ax: f64): int64 {
@@ -777,7 +804,29 @@ fn f64_e(): f64 {
 
 // sin(x). Reduktion auf den Viertelkreis, dann je nach Quadrant sin oder cos
 // der Restgroesse. Ungerade Symmetrie: sin(-x) = -sin(x).
+// #1829: Groesster Betrag, fuer den die Argumentreduktion noch traegt.
+//
+// 2^40. Die Zahl ist gemessen, nicht gegriffen: die dreistufige Reduktion
+// (f64_modZweiPi) haelt, solange das Produkt qi * 6.28125 exakt bleibt. Bis
+// hierher liegt der Fehler in der Groessenordnung der Kernpolynome selbst
+// (rund 1e-6); darueber waechst er linear mit dem Argument — bei 1e14 sind es
+// 1e-4, bei 1e16 ist das Ergebnis voellig falsch (dort kam frueher sin(2)
+// heraus statt sin(1e16)).
+//
+// Jenseits der Grenze wird NaN geliefert. Ein falscher Wert ohne Hinweis ist
+// der schlechtere Ausgang — dieselbe Linie wie bei den Opcode-Waechtern
+// (#1339) und den Syscall-Meldungen (#1734). NaN faellt beim Aufrufer auf,
+// weil es sich mit nichts vergleicht: `if (r != r)` erkennt es.
+pub fn TrigMaxArg(): f64 { return 1099511627776.0; }
+
+fn f64_trigAusserhalb(x: f64): bool {
+  var ax: f64 := x;
+  if (fLt(x, (0 as f64)) != 0) { ax := fNeg(x); }
+  return fGt(ax, TrigMaxArg()) != 0;
+}
+
 pub fn SinF64(x: f64): f64 {
+  if (f64_trigAusserhalb(x)) { return fDiv((0 as f64), (0 as f64)); }
   var ax: f64 := x;
   var flip: bool := false;
   if (fLt(x, (0 as f64)) != 0) {
@@ -803,6 +852,7 @@ pub fn SinF64(x: f64): f64 {
 // Nicht ueber sin(x + PI/2) — das haette den Reduktionsfehler von PI/2
 // zusaetzlich eingeschleppt.
 pub fn CosF64(x: f64): f64 {
+  if (f64_trigAusserhalb(x)) { return fDiv((0 as f64), (0 as f64)); }   // #1829
   var ax: f64 := x;
   if (fLt(x, (0 as f64)) != 0) { ax := fNeg(x); }
   ax := f64_modZweiPi(ax);                       // #1537

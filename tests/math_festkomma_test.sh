@@ -184,16 +184,28 @@ fn main(): int64 {
   return 0;
 }' "inf inf 0.0 2.7183"
 
-out "#1537: SinF64 bleibt im Wertebereich" 'import std.io;
+# #1829: Dieser Fall pruefte bis 1.1.11D, dass SinF64(1e16) IM WERTEBEREICH
+# [-1,1] liegt — und war damit der Grund, warum der eigentliche Defekt so lange
+# unentdeckt blieb: herausgekommen ist sin(2) = 0.909297 statt sin(1e16) =
+# 0.779688, also ein Wert fuer einen ANDEREN Winkel, der brav im Wertebereich
+# liegt. Ein Test, der nur den Bereich prueft, kann das nicht sehen.
+#
+# Die Reduktion traegt jetzt bis TrigMaxArg() = 2^40; darueber wird NaN
+# geliefert, statt einen falschen Wert ohne Hinweis zurueckzugeben. Geprueft
+# wird deshalb beides: unterhalb der Grenze ein Wert im Bereich, oberhalb die
+# MELDUNG. NaN vergleicht sich mit nichts, `v != v` erkennt es.
+out "#1537/#1829: SinF64 im Bereich, jenseits der Grenze gemeldet" 'import std.io;
 import std.math;
 fn main(): int64 {
   var s: f64 := SinF64(1.0e16);
   var c: f64 := CosF64(1.0e16);
-  if (s >= 0.0 - 1.0 && s <= 1.0) { PrintStr("sin ok "); } else { PrintStr("sin RAUS "); }
-  if (c >= 0.0 - 1.0 && c <= 1.0) { PrintStr("cos ok "); } else { PrintStr("cos RAUS "); }
+  if (s != s) { PrintStr("sin gemeldet "); } else { PrintStr("sin STILL FALSCH "); }
+  if (c != c) { PrintStr("cos gemeldet "); } else { PrintStr("cos STILL FALSCH "); }
+  var u: f64 := SinF64(1000000.0);
+  if (u >= 0.0 - 1.0 && u <= 1.0) { PrintStr("bereich ok "); } else { PrintStr("bereich RAUS "); }
   PrintLn(FloatToStr(SinF64(3.141592653589793), 4));
   return 0;
-}' "sin ok cos ok 0.0000"
+}' "sin gemeldet cos gemeldet bereich ok 0.0000"
 
 out "#1540: TruncF64 jenseits von 2^63" 'import std.io;
 import std.math;

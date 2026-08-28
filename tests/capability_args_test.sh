@@ -130,6 +130,29 @@ rejects "erfundene Capability" \
   "@capabilities([zzz.erfunden])
 $M" "unbekannte Capability"
 
+# --- #1826: Namen, die die Warnmeldung nennt, muessen deklarierbar sein ---
+# Die lyxos-Warnung fuehrte ki.embed, ki.graph und audio als "abgebildet" auf.
+# Sie ist die einzige Stelle, an der die Zuordnung Name -> CAPS-Bit
+# nachschlagbar ist — wer daraus ablas und deklarierte, bekam
+# "unbekannte Capability" und suchte den Fehler bei sich. Die Bits gab es
+# laengst (16, 32, 512), nur die Namen fehlten: dieselbe Klasse wie #1797.
+quiet "#1826 ki.embed ist deklarierbar" \
+  "@capabilities([system.exit, ki.embed])
+$M"
+quiet "#1826 ki.graph ist deklarierbar" \
+  "@capabilities([system.exit, ki.graph])
+$M"
+quiet "#1826 audio.mic ist deklarierbar" \
+  "@capabilities([system.exit, audio.mic])
+$M"
+
+# audio.play bleibt bewusst OHNE Namen: es gibt nur EIN Bit (LBF_CAP_AUDIO_MIC).
+# Ein Name fuer die Wiedergabe, der auf dasselbe Bit abbildet, wuerde beim
+# Anmelden der Wiedergabe still das Mikrofon miterlauben.
+rejects "#1826 audio.play bleibt abgewiesen (nur ein Bit vorhanden)" \
+  "@capabilities([system.exit, audio.play])
+$M" "unbekannte Capability"
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 test "$FAIL" -eq 0

@@ -1280,9 +1280,10 @@ pub type EmitLyxOS = class {
             self.emitPrintStr();
         } else if id == 2 {
             self.emitPrintInt();
-        // #1715: allgemeine IDs. 6-9 und 12 (StrSub/StrConcat/StrCopy/
-        // PrintFloat/Printf) bleiben bewusst offen und melden weiterhin
-        // Fehler — halb umgesetzt waeren sie schlimmer als gar nicht.
+        // #1715: allgemeine IDs. Von den damals offenen 6-9 und 12 sind
+        // StrSub (6), StrConcat (7, #1832) und PrintFloat (9) umgesetzt;
+        // offen bleiben StrCopy (8) und Printf (12) — sie melden weiterhin
+        // Fehler, halb umgesetzt waeren sie schlimmer als gar nicht.
         } else if id == 3 {
             self.emitExitFromSlot();
         } else if id == 13 {
@@ -1322,6 +1323,8 @@ pub type EmitLyxOS = class {
             self.emitRandomSeed(dest);
         } else if id == 6 {
             self.emitStrSub(dest);
+        } else if id == 7 {
+            self.emitStrConcat(dest);   // #1832
         } else if id == 9 {
             self.emitPrintFloat();
         } else if id == 17 {
@@ -3089,6 +3092,85 @@ pub type EmitLyxOS = class {
         // fertig:
         self.emit8(0xC6); self.emit8(0x04); self.emit8(0x0F); self.emit8(0x00);  // MOV byte [rdi+rcx], 0
         self.emit8(0x4C); self.emit8(0x89); self.emit8(0xE0);  // MOV rax, r12
+        self.emit8(0x41); self.emit8(0x5D);                    // POP r13
+        self.emit8(0x41); self.emit8(0x5C);                    // POP r12
+        self.emitMovSlotFromRax(dest);
+    }
+
+    // #1832: ID 7 — StrConcat(a, b). Beide Zeiger stehen in den Slots 0 und 1,
+    // das Ergebnis geht nach dest.
+    //
+    // Bis 1.1.11D meldete das Backend hier "Builtin-ID 7 wird nicht behandelt"
+    // und brach ab. Damit war jedes Programm, das Text zusammensetzt, nicht als
+    // LBF baubar — bei einer Oberflaeche der Normalfall ("Klicks: " + Zahl).
+    //
+    // Der Puffer kommt wie bei StrSub und IntToStr aus mmap, nicht vom Stapel:
+    // das Ergebnis muss den Aufruf ueberleben. LyxOS liefert die Adresse in
+    // rdx, nicht in rax.
+    //
+    // Gezaehlt wird zuerst, dann angefordert, dann kopiert — so steht die
+    // Groesse fest, bevor etwas geschrieben wird.
+    fn emitStrConcat(dest: int64): void {
+        self.emit8(0x41); self.emit8(0x54);                    // PUSH r12 (Puffer)
+        self.emit8(0x41); self.emit8(0x55);                    // PUSH r13 (Laenge a)
+        self.emit8(0x41); self.emit8(0x56);                    // PUSH r14 (Laenge b)
+
+        // r13 = strlen(a) — dieselbe Schleife wie emitStrLen.
+        self.emitMovRsiFromSlot(0);
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xC0);  // XOR rax, rax
+        self.emit8(0x80); self.emit8(0x3C); self.emit8(0x06); self.emit8(0x00);  // CMP byte [rsi+rax], 0
+        self.emit8(0x74); self.emit8(0x05);                    // JE  +5
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC0);  // INC rax
+        self.emit8(0xEB); self.emit8(0xF5);                    // JMP -11
+        self.emit8(0x49); self.emit8(0x89); self.emit8(0xC5);  // MOV r13, rax
+
+        // r14 = strlen(b)
+        self.emitMovRsiFromSlot(1);
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xC0);  // XOR rax, rax
+        self.emit8(0x80); self.emit8(0x3C); self.emit8(0x06); self.emit8(0x00);  // CMP byte [rsi+rax], 0
+        self.emit8(0x74); self.emit8(0x05);                    // JE  +5
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC0);  // INC rax
+        self.emit8(0xEB); self.emit8(0xF5);                    // JMP -11
+        self.emit8(0x49); self.emit8(0x89); self.emit8(0xC6);  // MOV r14, rax
+
+        // mmap(0, r13 + r14 + 1, PROT_RW=3, MAP_PRIVATE|ANON=5)
+        self.emitMovRaxImm(9);
+        self.emit8(0x31); self.emit8(0xFF);                    // XOR edi, edi
+        self.emit8(0x4C); self.emit8(0x89); self.emit8(0xEE);  // MOV rsi, r13
+        self.emit8(0x4C); self.emit8(0x01); self.emit8(0xF6);  // ADD rsi, r14
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC6);  // INC rsi        (Nullbyte)
+        self.emit8(0xBA); self.emit32(3);                      // MOV edx, 3
+        self.emit8(0x41); self.emit8(0xBA); self.emit32(5);    // MOV r10d, 5
+        self.emitSyscall();
+        self.emit8(0x49); self.emit8(0x89); self.emit8(0xD4);  // MOV r12, rdx   (Puffer)
+
+        // a kopieren: rcx laeuft bis r13.
+        self.emitMovRsiFromSlot(0);
+        self.emit8(0x4C); self.emit8(0x89); self.emit8(0xE7);  // MOV rdi, r12
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xC9);  // XOR rcx, rcx
+        self.emit8(0x4C); self.emit8(0x39); self.emit8(0xE9);  // CMP rcx, r13
+        self.emit8(0x7D); self.emit8(0x0B);                    // JGE +11 (fertig)
+        self.emit8(0x8A); self.emit8(0x04); self.emit8(0x0E);  // MOV al, [rsi+rcx]
+        self.emit8(0x88); self.emit8(0x04); self.emit8(0x0F);  // MOV [rdi+rcx], al
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC1);  // INC rcx
+        self.emit8(0xEB); self.emit8(0xF0);                    // JMP -16
+
+        // b kopieren: rdi zeigt hinter a, rcx laeuft bis r14. Damit steht am
+        // Ende [rdi+rcx] genau auf Puffer + r13 + r14 — dort kommt die Null hin.
+        self.emitMovRsiFromSlot(1);
+        self.emit8(0x4C); self.emit8(0x89); self.emit8(0xE7);  // MOV rdi, r12
+        self.emit8(0x4C); self.emit8(0x01); self.emit8(0xEF);  // ADD rdi, r13
+        self.emit8(0x48); self.emit8(0x31); self.emit8(0xC9);  // XOR rcx, rcx
+        self.emit8(0x4C); self.emit8(0x39); self.emit8(0xF1);  // CMP rcx, r14
+        self.emit8(0x7D); self.emit8(0x0B);                    // JGE +11 (fertig)
+        self.emit8(0x8A); self.emit8(0x04); self.emit8(0x0E);  // MOV al, [rsi+rcx]
+        self.emit8(0x88); self.emit8(0x04); self.emit8(0x0F);  // MOV [rdi+rcx], al
+        self.emit8(0x48); self.emit8(0xFF); self.emit8(0xC1);  // INC rcx
+        self.emit8(0xEB); self.emit8(0xF0);                    // JMP -16
+
+        self.emit8(0xC6); self.emit8(0x04); self.emit8(0x0F); self.emit8(0x00);  // MOV byte [rdi+rcx], 0
+        self.emit8(0x4C); self.emit8(0x89); self.emit8(0xE0);  // MOV rax, r12
+        self.emit8(0x41); self.emit8(0x5E);                    // POP r14
         self.emit8(0x41); self.emit8(0x5D);                    // POP r13
         self.emit8(0x41); self.emit8(0x5C);                    // POP r12
         self.emitMovSlotFromRax(dest);

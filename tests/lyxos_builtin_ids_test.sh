@@ -113,5 +113,49 @@ bricht "#1716 unbestimmbarer Typ nennt nicht faelschlich den Namen" \
 fn main(): int64 { PrintLn(h()); return 0; }' \
 'kann den Typ des Arguments nicht bestimmen'
 
+# ---------------------------------------------------------------------------
+# #1832: StrConcat (ID 7) wurde nicht behandelt — "error: lyxos: Builtin-ID 7
+# wird nicht behandelt". Damit war jedes Programm, das Text zusammensetzt,
+# nicht als LBF baubar; bei einer Oberflaeche ist das der Normalfall
+# ("Klicks: " + Zahl).
+#
+# WARUM HIER NICHT AUSGEFUEHRT WIRD: der lokale Lader (src.tools.lbf.loader)
+# fuehrt das Abbild unter LINUX aus. LyxOS liefert das Ergebnis eines Syscalls
+# in rdx, Linux in rax — jedes Builtin, das Speicher anfordert, bekommt hier
+# also Muell als Pufferadresse und segfaultet. Deshalb pruefen die
+# Laderfaelle oben nur Ganzzahlen.
+#
+# Gemessen wird darum am ERZEUGNIS. "ID behandelt" allein waere zu wenig
+# (#1789: IRO_DIV stand in der Liste, der Rumpf war MOVI T0, 0) — geprueft
+# werden die Bytes, die die Arbeit tun: beide Kopierschleifen und der
+# abschliessende Nullabschluss.
+# ---------------------------------------------------------------------------
+bytes_da() {  # name, quelltext, hex-muster, klartext
+  printf '%s\n' "$2" > "$TMP/b.lyx"
+  if ! timeout 200 "$LYXC" --std-path="$ROOT" --target=lyxos "$TMP/b.lyx" -o "$TMP/b.out" >"$TMP/b.log" 2>&1; then
+    bad "$1" "$(grep -iE 'error|Builtin-ID' "$TMP/b.log" | head -1)"; return
+  fi
+  if xxd -p "$TMP/b.out" | tr -d '\n' | grep -q "$3"; then
+    echo "PASS $1"; P=$((P+1))
+  else
+    bad "$1" "$4 fehlt im Erzeugnis"
+  fi
+}
+
+SRC_CONCAT='fn main(): int64 { var r: pchar := StrConcat("ab"c, "cde"c); return StrLen(r); }'
+
+# Uebersetzt ueberhaupt wieder — das war der gemeldete Abbruch.
+baut "#1832 StrConcat uebersetzt fuer lyxos" "$SRC_CONCAT"
+# Erste Kopierschleife: CMP rcx,r13 / JGE / MOV al,[rsi+rcx] / MOV [rdi+rcx],al
+bytes_da "#1832 erste Kopierschleife steht im Erzeugnis" "$SRC_CONCAT" \
+  "4c39e97d0b8a040e88040f" "die Schleife ueber den linken Teil"
+# Zweite Schleife laeuft gegen r14 statt r13 — waere sie eine Kopie der
+# ersten, kaeme der rechte Teil nie an.
+bytes_da "#1832 zweite Kopierschleife zaehlt gegen r14" "$SRC_CONCAT" \
+  "4c39f17d0b8a040e88040f" "die Schleife ueber den rechten Teil"
+# Nullabschluss hinter beiden Teilen: ohne ihn liefe jedes StrLen weiter.
+bytes_da "#1832 Ergebnis wird null-terminiert" "$SRC_CONCAT" \
+  "c6040f004c89e0" "der Nullabschluss"
+
 echo "Ergebnis: $P PASS, $F FAIL"
 [ "$F" -eq 0 ] || exit 1
