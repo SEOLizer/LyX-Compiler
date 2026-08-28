@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.12G
+VERSION   := 1.1.12H
 VERSION_DATE := 2026-08-28
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -286,6 +286,8 @@ test: lyxc
 	@bash tests/memset_ir_test.sh
 	@echo "--- super.Methode() auf dem IR-Weg (#1841) ---"
 	@bash tests/super_ir_test.sh
+	@echo "--- Kosten des Importgraphen (#1845) ---"
+	@bash tests/import_graph_test.sh
 	@echo "--- `new` belegt die Objektgroesse, nicht eine Seite (#1836) ---"
 	@bash tests/new_speicher_test.sh
 	@echo "--- Disassemblat: Befehlsgrenzen gegen objdump (#1370) ---"

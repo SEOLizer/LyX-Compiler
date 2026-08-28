@@ -395,6 +395,17 @@ pub type IRLower = class {
   // hier wird sie behalten. Damit lassen sich die Importe spaeter mehrfach
   // durchlaufen, OHNE sie erneut zu lesen und zu parsen; genau das waere
   // beim Selbstbau von lyxc die teure Variante.
+  // #1845: Welche Module dieser Lauf schon gelowert hat. `lowerModule` ist an
+  // jedem NK_IMPORT rekursiv und las den Import dabei JEDES MAL neu ein — bei
+  // einem Diamanten im Importgraphen also einmal pro Pfad. Gemessen: eine
+  // Fibonacci-Kette wuchs um Faktor 2,6 je zwei Ebenen (Tiefe 16: 3,5 s /
+  // 382 MB), und `vega.forms` kostete 80 s / 3,6 GB bei 2023 Zeilen.
+  // Die Namen liegen aneinandergereiht in modSeenBuf, modSeenPair haelt je
+  // Eintrag (Offset, Laenge) — dieselbe Form wie die visited-Menge im Vorpass.
+  modSeenBuf:  int64;
+  modSeenPair: int64;
+  modSeenN:    int64;
+  modSeenUsed: int64;
   impLstSrc:   int64;
   impLstNodes: int64;
   impLstCnt:   int64;
@@ -472,6 +483,8 @@ pub type IRLower = class {
     self.genFuncCount := 0;
     self._importsDone := 0;
     // #1727
+    self.modSeenBuf := alloc(65536); self.modSeenPair := alloc(32768);
+    self.modSeenN := 0; self.modSeenUsed := 0;
     self.impLstSrc := 0; self.impLstNodes := 0; self.impLstCnt := 0;
     self.impLstHead := 0; self.impLstN := 0;
     self.wantCap := 1024;
@@ -7186,8 +7199,38 @@ pub type IRLower = class {
         // Arbeitsverzeichnis, dann unter -I, dann unter --std-path (#1693).
         var impModName: pchar := self.nodeSVal(cur);
         var impModLen:  int64 := self.nodeSLen(cur);
-        var impSrc: pchar := _irLeseImport(impModName, impModLen,
-                                           self.irIncludePath, self.irStdPath);
+        // #1845: Jedes Modul nur EINMAL. Ohne diese Pruefung las und lowerte
+        // der Vorlauf denselben Import einmal pro Pfad durch den Graphen —
+        // bei einem Diamanten also exponentiell. Die Arbeit ist dieselbe wie
+        // beim ersten Mal, das Ergebnis auch: derselbe Quelltext, dieselben
+        // Rumpfe. Was danach noch fehlt, holt der Nachlauf weiter unten aus
+        // der behaltenen Importliste — der lag schon vor #1845 daneben.
+        var impGesehen: int64 := 0;
+        var msI: int64 := 0;
+        while msI < self.modSeenN {
+          if peek64(self.modSeenPair + msI * 16 + 8) == impModLen {
+            var msOff: int64 := peek64(self.modSeenPair + msI * 16);
+            var msGleich: int64 := 1;
+            var msB: int64 := 0;
+            while msB < impModLen {
+              if peek8(self.modSeenBuf + msOff + msB) != peek8((impModName as int64) + msB) { msGleich := 0; msB := impModLen; }
+              msB := msB + 1;
+            }
+            if msGleich != 0 { impGesehen := 1; msI := self.modSeenN; }
+          }
+          msI += 1;
+        }
+        if impGesehen == 0 && self.modSeenUsed + impModLen < 65536 && self.modSeenN < 2048 {
+          var msC: int64 := 0;
+          while msC < impModLen { poke8(self.modSeenBuf + self.modSeenUsed + msC, peek8((impModName as int64) + msC)); msC := msC + 1; }
+          poke64(self.modSeenPair + self.modSeenN * 16, self.modSeenUsed);
+          poke64(self.modSeenPair + self.modSeenN * 16 + 8, impModLen);
+          self.modSeenN += 1;
+          self.modSeenUsed := self.modSeenUsed + impModLen;
+        }
+        var impSrc: pchar := 0 as pchar;
+        if impGesehen == 0 { impSrc := _irLeseImport(impModName, impModLen,
+                                                     self.irIncludePath, self.irStdPath); }
         if (impSrc as int64) != 0 {
           var impP: Parser := new Parser();
           impP.Init(impSrc, StrLen(impSrc));
