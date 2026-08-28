@@ -411,6 +411,19 @@ con CG_FC_NAME: int64 := 88; // data[88..95]: _lyx_fc_name (8 bytes)
 // GetEnvironmentStringsA und legt ihn hier ab.
 con CG_ENVBLOCK: int64 := 96; // data[96..103]: _lyx_envblock (8 bytes)
 
+// #1836: Bump-Allokator fuer `new`. Bis 1.1.12B belegte JEDE Instanziierung
+// eine eigene 4096-Byte-Seite per mmap — unabhaengig von der Objektgroesse.
+// 100.000 Objekte mit einem int64-Feld kosteten damit 400 MB und 1,64 s
+// (gegen 7,4 ms fuer 100.000 x alloc(16)).
+//
+// CG_HEAP_PTR zeigt auf die naechste freie Stelle, CG_HEAP_END hinter das
+// Ende des aktuellen Blocks. Reicht der Platz nicht, wird ein neuer Block
+// geholt; der Rest des alten bleibt liegen. Das ist derselbe Handel, den
+// src/std/alloc.lyx eingeht: `dispose` gibt ohnehin keinen Speicher zurueck
+// (siehe CGN_DISPOSE), eine Freiliste braeuchte also niemand.
+con CG_HEAP_PTR: int64 := 104; // data[104..111]: _lyx_heap_ptr
+con CG_HEAP_END: int64 := 112; // data[112..119]: _lyx_heap_end
+
 // ============================================================================
 // Codegen class
 // ============================================================================
@@ -5921,6 +5934,87 @@ pub type Codegen = class {
     return 0;
   }
 
+  // #1836: Speicher fuer `new T()`.
+  //
+  // Bis 1.1.12B stand hier ein mmap ueber 4096 Byte — je Objekt eine eigene
+  // Seite, unabhaengig von seiner Groesse. Ein Objekt mit einem einzigen
+  // int64-Feld kostete damit 4 KB residenten Speicher UND einen Syscall:
+  // 100.000 Stueck brauchten 400 MB und 1,64 s, waehrend 100.000 x alloc(16)
+  // in 7,4 ms und 12 KB fertig waren (Faktor 220 in der Zeit).
+  //
+  // Jetzt wird aus einem Block herausgegeben: CG_HEAP_PTR zeigt auf die
+  // naechste freie Stelle, CG_HEAP_END hinter das Blockende. Passt das Objekt
+  // nicht mehr, wird ein neuer Block geholt und der Rest des alten liegen
+  // gelassen.
+  //
+  // KEINE Freiliste, und das ist Absicht: `dispose` gibt Speicher ohnehin
+  // nicht zurueck (siehe CGN_DISPOSE), und weil nie etwas wiederverwendet
+  // wird, ist jede herausgegebene Stelle frisch aus mmap — also GENULLT. Ein
+  // Konstruktor, der ein Feld nicht setzt, findet dort weiterhin 0 vor, genau
+  // wie beim bisherigen mmap je Objekt.
+  //
+  // Die Groesse kommt aus dem Klassenlayout (cg_classStructSize: Ende des
+  // weitesten Feldes, Offset 0 ist der VMT-Zeiger, geerbte Felder sind beim
+  // Bauen des Layouts eingeflacht). Aufgerundet auf 16, damit die
+  // Ausrichtung ueber die Kette erhalten bleibt.
+  fn cg_emitNewBump(classIdx: int64) {
+    // Ohne Layout ist die Groesse unbekannt — dann bleibt es beim alten Weg
+    // mit einer ganzen Seite. Das ist verschwenderisch, aber nie zu klein.
+    var groesse: int64 := 4096;
+    if (classIdx >= 0) {
+      groesse := self.cg_classStructSize(classIdx);
+      if (groesse < 8) { groesse := 8; }
+      var rest: int64 := groesse % 16;
+      if (rest != 0) { groesse := groesse + (16 - rest); }
+    }
+    // Blockgroesse: 64 KB, oder das Objekt selbst, wenn es groesser ist
+    // (auf ganze Seiten aufgerundet).
+    var block: int64 := 65536;
+    if (groesse > block) {
+      block := groesse;
+      var pr: int64 := block % 4096;
+      if (pr != 0) { block := block + (4096 - pr); }
+    }
+
+    self.cg_loadRaxGlobal(CG_HEAP_PTR);                     // rax = naechste freie Stelle
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x88);   // lea rcx, [rax + groesse]
+    self.cg_e32(groesse);
+    self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x0D);   // cmp rcx, [rip + CG_HEAP_END]
+    var pEnd: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pEnd, CG_HEAP_END, 0, CG_PATCH_STR);
+    self.cg_e8(0x76);                                       // jbe passt
+    var pJmp: int64 := self.codeLen;
+    self.cg_e8(0);
+
+    // Langsamer Weg: neuen Block holen. mmap(0, block, PROT_RW, PRIVATE|ANON, -1, 0)
+    self.cg_e8(0x31); self.cg_e8(0xFF);                     // xor edi, edi
+    self.cg_e8(0xBE); self.cg_e32(block);                   // mov esi, block
+    self.cg_e8(0xBA); self.cg_e32(3);                       // mov edx, 3
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e32(34);    // mov r10d, 34
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0);   // mov r8, -1
+    self.cg_e32(0 - 1);
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);   // xor r9, r9
+    self.cg_e8(0xB8); self.cg_e32(9);                       // mov eax, 9
+    self.cg_e8(0x0F); self.cg_e8(0x05);                     // syscall  → rax = Blockanfang
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x88);   // lea rcx, [rax + block]
+    self.cg_e32(block);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D);   // mov [rip + CG_HEAP_END], rcx
+    var pEnd2: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pEnd2, CG_HEAP_END, 0, CG_PATCH_STR);
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x88);   // lea rcx, [rax + groesse]
+    self.cg_e32(groesse);
+
+    // passt: rax = Objekt, rcx = neue freie Stelle
+    var ziel: int64 := self.codeLen;
+    poke8(self.code + pJmp, (ziel - (pJmp + 1)) & 255);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D);   // mov [rip + CG_HEAP_PTR], rcx
+    var pPtr: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pPtr, CG_HEAP_PTR, 0, CG_PATCH_STR);
+  }
+
   fn cg_classStructSize(classIdx: int64): int64 {
     if (classIdx < 0) { return 8; }
     var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
@@ -9114,22 +9208,11 @@ pub type Codegen = class {
           return;
         }
       }
-      // new T() — allocate class instance via alloc(4096)
-      self.cg_movRaxImm(0);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7); // mov rdi,rax
-      self.cg_movRaxImm(4096); self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6); // mov rsi,rax
-      self.cg_movRaxImm(3);    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2); // mov rdx,rax
-      self.cg_movRaxImm(34);
-      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov r10, rax
-      self.cg_movRaxImm(-1);
-      self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor r8, r8
-      self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);  // dec r8 → r8=-1
-      self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
-      self.cg_movRaxImm(9);
-      self.cg_e8(0x0F); self.cg_e8(0x05);
-      // WP-10d: check if type is a struct (vmtDataOff == -1) → skip VMT setup
+      // new T() — Objekt aus dem Bump-Allokator (#1836).
       var tname: pchar := self.cg_nsval(ni);
       var tlen:  int64 := self.cg_nslen(ni);
       var ciNew: int64 := self.cg_findClass(tname, tlen);
+      self.cg_emitNewBump(ciNew);
       var isStructNew: int64 := 0;
       if (ciNew >= 0) {
         var vmtChk: int64 := peek64(self.classLayouts + ciNew * CG_CLASS_SZ + CG_CLASS_OFF_VMTOFF);
@@ -19879,7 +19962,7 @@ pub type Codegen = class {
 
     self.dataCap     := 16384;
     self.data        := alloc(self.dataCap);
-    self.dataLen     := 104; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677)
+    self.dataLen     := 120; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836)
     self.dataOverflow := 0;  // WP-34  // WP-18: pre-reserve 88 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24, ARGC@32, ARGV@40, FLOAT_BUF@48, CANARY@80)
 
     self.localCap  := 64;
