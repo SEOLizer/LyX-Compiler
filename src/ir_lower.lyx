@@ -158,6 +158,7 @@ pub con NK_MAP_ENTRY:       int64 := 82;  // WP-BC-06: key:val pair
 pub con NK_POOL:            int64 := 83;  // WP-BC-09: pool { stmt* }
 pub con NK_PANIC:           int64 := 84;  // WP-BC-10: panic(msg)
 pub con NK_PATTERN_OR:      int64 := 85;  // WP-BC-11: or-pattern p1 | p2
+pub con NK_PATTERN_RANGE:   int64 := 131; // #1113: `lo .. hi` (Wert in iVal, obere Grenze in c1)
 pub con NK_FORMAT_EXPR:     int64 := 86;  // WP-BC-13: expr:width[:decimals]
 pub con NK_NULL_COAL:       int64 := 87;  // WP-BC-14: x ?? fallback
 pub con NK_SAFE_CAST:       int64 := 88;  // WP-BC-14: x as? T optional cast
@@ -5799,6 +5800,14 @@ pub type IRLower = class {
         self.irAddInstrDirect(IRO_ASSERT_TRUE, -1, condTemp, -1, 0);
       }
     }
+    // #1825: `match` als ANWEISUNG landete hier nie — lowerStmt kannte die
+    // Knotenart nicht und hat keinen Auffangzweig, der Knoten fiel also
+    // vollstaendig weg. Der Parser gibt fuer eine match-Anweisung direkt einen
+    // NK_MATCH zurueck (ParseStatement -> _parseMatch), nicht in NK_EXPR_STMT
+    // eingepackt. Der Rueckgabewert wird als Anweisung nicht gebraucht.
+    else if (k == NK_MATCH) {
+      self.lowerMatch(stmt);
+    }
     // WP-BC-09: pool { stmt* }
     else if (k == NK_POOL) {
       self.lowerPool(stmt);
@@ -7938,120 +7947,212 @@ pub type IRLower = class {
   // WP-20: Match / Pattern Lowering
   // ============================================================================
   
-  // Match expression
+  // Match expression.
+  //
+  // #1825: Hier stand eine Huelle. Der Subjektausdruck wurde ausgewertet, danach
+  // lief die Schleife ueber die Faelle und tat NICHTS — die einzelnen Schritte
+  // standen als Kommentare da ("Emit: if matched goto nextCaseLbl", "Emit:
+  // body"). Kein Vergleich, kein Sprung, nicht einmal die Rumpfe wurden
+  // gelowert. Auf jedem Ziel, das ueber die IR geht — lyxos, arm64, riscv,
+  // Cortex-M — waehlte match deshalb keinen Zweig, auch nicht `case _`, und das
+  // ohne jede Meldung beim Uebersetzen. Der x86-Weg war nie betroffen: der
+  // Produktiv-Codegen erzeugt dort direkt aus dem AST.
+  //
+  // Aufbau wie lowerIf, nur mit einer Kette: je Fall ein Label, auf das der
+  // nicht zutreffende Vergleich springt.
   fn lowerMatch(expr: int64): int64 {
     // C0: subject expression
     // C1: cases (linked list of NK_MATCH_CASE)
     var subjectTemp: int64 := self.lowerExpr(self.nodeC0(expr));
     var cases: int64 := self.nodeC1(expr);
     var dest: int64 := self.allocTemp();
-    
+
+    // Ergebnis vorbelegen: trifft kein Fall, ist der Wert des match 0. Ohne
+    // diese Zuweisung stuende im Temp der Inhalt eines fremden Registers.
+    self.irAddInstrDirect(IRO_CONST_INT, dest, 0 - 1, 0 - 1, 0);
+
     var endLbl: int64 := self.genLabel();
-    
-    // Process each case
+
     var curCase: int64 := cases;
     while (curCase >= 0) {
       var pattern: int64 := self.nodeC0(curCase);
       var patternBody: int64 := self.nodeC1(curCase);
+      var guard: int64 := self.nodeC2(curCase);
       var nextCaseLbl: int64 := self.genLabel();
-      
-      // Check pattern match
+
+      // Trifft das Muster nicht, weiter zum naechsten Fall.
       var matched: int64 := self.lowerPatternMatch(subjectTemp, pattern);
-      
-      // Emit: if matched goto nextCaseLbl
-      // Emit: body
-      // Emit: dest = result
-      // Emit: goto endLbl
-      
-      // nextCaseLbl:
+      self.irEmitBrFalse(matched, nextCaseLbl);
+
+      // WP-BC-11: `case p if g =>` — der Waechter wird erst geprueft, wenn das
+      // Muster schon passt, und zaehlt wie ein nicht zutreffendes Muster.
+      if (guard >= 0) {
+        var gTemp: int64 := self.lowerExpr(guard);
+        self.irEmitBrFalse(gTemp, nextCaseLbl);
+      }
+
+      // #1024: der Rumpf darf ein Block sein. Als Block hat er keinen Wert, als
+      // Ausdruck wird sein Wert das Ergebnis des match.
+      if (patternBody >= 0) {
+        if (self.nodeKind(patternBody) == NK_BLOCK) {
+          self.lowerBlock(patternBody);
+        } else {
+          var bodyTemp: int64 := self.lowerExpr(patternBody);
+          // Es gibt kein IRO_MOV; die Uebernahme laeuft ueber eine Addition
+          // mit 0, die jedes Backend kennt.
+          var nullTemp: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_CONST_INT, nullTemp, 0 - 1, 0 - 1, 0);
+          self.irAddInstrDirect(IRO_ADD, dest, bodyTemp, nullTemp, 0);
+        }
+      }
+
+      self.irEmitJmp(endLbl);
+      self.irEmitLabel(nextCaseLbl);
       curCase := self.nodeNext(curCase);
     }
-    
-    // If no match found - handle default/wildcard
-    
-    // endLbl:
+
+    self.irEmitLabel(endLbl);
     return dest;
   }
-  
-  // Pattern match helper
+
+  // Liefert ein Temp, das 1 enthaelt, wenn das Muster trifft, sonst 0.
+  //
+  // #1825: auch hier stand nur die Absicht als Kommentar; zurueckgegeben wurde
+  // ein frisch belegtes, nie beschriebenes Temp. Umgesetzt sind jetzt die
+  // Muster, die sich ohne neue Bindungsinfrastruktur ausdruecken lassen:
+  // Literal, Auffangfall, Bereich und Oder-Muster.
+  //
+  // Bindende Muster (`case x`, `Ok(v)`, Struktur-Zerlegung) brauchen einen
+  // lokalen Slot fuer den gebundenen Namen — den legt diese Ebene nicht an.
+  // Sie MELDEN deshalb und brechen ab, statt wie bisher stillschweigend 0 zu
+  // liefern: ein Programm, das nicht uebersetzt, ist der bessere Ausgang als
+  // eines, das durchlaeuft und keinen Zweig waehlt (#1734, #1810 gehen denselben
+  // Weg fuer nicht anbindbare Syscalls).
   fn lowerPatternMatch(subjectTemp: int64, pattern: int64): int64 {
     var patKind: int64 := self.nodeKind(pattern);
     var dest: int64 := self.allocTemp();
-    
+
     if (patKind == NK_PATTERN_LIT) {
-      // Literal pattern: subjectTemp == pattern.value
-      var patVal: int64 := self.nodeIVal(pattern);
-      // Emit: dest = (subjectTemp == patVal)
+      // subject == Literalwert
+      var patTemp: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, patTemp, 0 - 1, 0 - 1, self.nodeIVal(pattern));
+      self.irAddInstrDirect(IRO_CMP_EQ, dest, subjectTemp, patTemp, 0);
+      return dest;
     }
-    else if (patKind == NK_PATTERN_WILD) {
-      // Wildcard pattern: always matches
-      // Emit: dest = 1
+    if (patKind == NK_PATTERN_WILD) {
+      self.irAddInstrDirect(IRO_CONST_INT, dest, 0 - 1, 0 - 1, 1);
+      return dest;
     }
-    else if (patKind == NK_PATTERN_BIND) {
-      // Binding pattern: bind subject to new variable
-      // Emit: store subjectTemp to newVar
-      // Emit: dest = 1
+    if (patKind == NK_PATTERN_RANGE) {
+      // #1113: `lo .. hi`, obere Grenze optional (c1 == -1 heisst offen).
+      var loTemp: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, loTemp, 0 - 1, 0 - 1, self.nodeIVal(pattern));
+      var geTemp: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_GE, geTemp, subjectTemp, loTemp, 0);
+      var hiNode: int64 := self.nodeC1(pattern);
+      if (hiNode < 0) {
+        return geTemp;
+      }
+      var hiTemp: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, hiTemp, 0 - 1, 0 - 1, self.nodeIVal(hiNode));
+      var leTemp: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_LE, leTemp, subjectTemp, hiTemp, 0);
+      self.irAddInstrDirect(IRO_AND, dest, geTemp, leTemp, 0);
+      return dest;
     }
-    else if (patKind == NK_PATTERN_ENUM) {
-      // Enum pattern: check tag and extract payload
-      var enumName: pchar := self.nodeSVal(pattern);
-      var payloadNode: int64 := self.nodeC0(pattern);
-      // Emit: tag = subjectTemp.tag
-      // Emit: if tag == enumTag then match payload
+    if (patKind == NK_PATTERN_OR) {
+      var lTemp: int64 := self.lowerPatternMatch(subjectTemp, self.nodeC0(pattern));
+      var rTemp: int64 := self.lowerPatternMatch(subjectTemp, self.nodeC1(pattern));
+      self.irAddInstrDirect(IRO_OR, dest, lTemp, rTemp, 0);
+      return dest;
     }
-    else if (patKind == NK_PATTERN_STRUCT) {
-      // Struct pattern: destructure and match fields
-      var structName: pchar := self.nodeSVal(pattern);
-      var fields: int64 := self.nodeC0(pattern);
-      // Emit: for each field, check field value
+
+    EPrintStr("error: match: dieses Muster kann fuer dieses Ziel nicht uebersetzt werden (#1825)."c);
+    EPrintStrLn(""c);
+    if (patKind == NK_PATTERN_BIND) {
+      EPrintStrLn("  Ein bindendes Muster (`case name`) braucht einen lokalen Slot fuer den"c);
+      EPrintStrLn("  gebundenen Namen; den legt die IR-Ebene nicht an."c);
+    } else {
+      EPrintStrLn("  Enum- und Strukturmuster brauchen Zugriff auf Kennung und Nutzlast des"c);
+      EPrintStrLn("  Objekts; das ist auf dieser Ebene nicht umgesetzt."c);
     }
-    
+    EPrintStrLn("  Umsetzbar sind Literal, Bereich, Oder-Muster und der Auffangfall `case _`."c);
+    EPrintStrLn("  Auf --target=linux (x86-64) laeuft das Muster, dort erzeugt der Codegen"c);
+    EPrintStrLn("  direkt aus dem AST und geht nicht ueber diese Ebene."c);
+    exit(1);
     return dest;
   }
-  
+
   // ============================================================================
   // WP-20: Switch Statement Lowering
   // ============================================================================
   
   // Switch statement (lowered to match or series of comparisons)
+  // #1825: beim Beheben von lowerMatch nebenan aufgefallen — hier war es nicht
+  // nur unvollstaendig, sondern falsch herum. Der Vergleich fehlte ("Emit: if
+  // subjectTemp != caseVal goto nextCaseLbl" stand als Kommentar da), der
+  // Fallrumpf wurde aber UNBEDINGT gelowert, und der Standardfall danach
+  // ebenfalls. Auf jedem IR-Ziel lief ein `switch` also ALLE Zweige
+  // nacheinander durch, statt einen auszuwaehlen.
   fn lowerSwitch(stmt: int64): int64 {
     // C0: subject expression
-    // C1: cases (linked list of NK_CASE)
+    // C1: Kette aus NK_CASE. Der Standardfall haengt MIT DARIN und ist am
+    // iVal des Fallknotens erkennbar (parser._parseSwitch setzt 1); sein c0
+    // ist -1, weil er keinen Wert vergleicht. Ein frueherer Versuch las ihn
+    // aus c2 des switch-Knotens — dort steht nichts, der Standardfall lief
+    // deshalb nie.
     var subjectTemp: int64 := self.lowerExpr(self.nodeC0(stmt));
     var cases: int64 := self.nodeC1(stmt);
-    var defaultCase: int64 := self.nodeC2(stmt);  // may be -1
-    
+
     var endLbl: int64 := self.genLabel();
-    
-    // Generate jump table or series of comparisons
-    // For small number of cases: if/else chain
-    // For many cases: jump table (switch on index)
-    
+
+    // `break` in einem Fallrumpf beendet den SWITCH, nicht eine umgebende
+    // Schleife. lowerBreak springt auf loopExitLabel — das wird deshalb fuer
+    // die Dauer des switch umgehaengt und danach zurueckgesetzt. `continue`
+    // bleibt unangetastet und trifft weiterhin die Schleife.
+    var vorherExit: int64 := self.loopExitLabel;
+    self.loopExitLabel := endLbl;
+
+    // Erst die vergleichenden Faelle, dann der Standardfall — unabhaengig
+    // davon, an welcher Stelle er geschrieben steht.
+    var defaultBody: int64 := 0 - 1;
+
     var curCase: int64 := cases;
     while (curCase >= 0) {
-      var caseVal: int64 := self.nodeIVal(self.nodeC0(curCase));
-      var caseBody: int64 := self.nodeC1(curCase);
-      var nextCaseLbl: int64 := self.genLabel();
-      
-      // Emit: if subjectTemp != caseVal goto nextCaseLbl
-      if (caseBody >= 0) {
-        self.lowerBlock(caseBody);
+      if (self.nodeIVal(curCase) == 1) {
+        defaultBody := self.nodeC1(curCase);
+      } else {
+        var caseBody: int64 := self.nodeC1(curCase);
+        var nextCaseLbl: int64 := self.genLabel();
+
+        // Der Fallwert wird als Ausdruck gelowert, nicht als Literal
+        // angenommen: `case KONSTANTE:` ist genauso gueltig wie `case 3:`.
+        var valTemp: int64 := self.lowerExpr(self.nodeC0(curCase));
+        var cmpTemp: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_CMP_EQ, cmpTemp, subjectTemp, valTemp, 0);
+        self.irEmitBrFalse(cmpTemp, nextCaseLbl);
+
+        if (caseBody >= 0) {
+          self.lowerBlock(caseBody);
+        }
+        // Kein Durchfallen: Lyx trennt die Faelle, wie match auch.
+        self.irEmitJmp(endLbl);
+        self.irEmitLabel(nextCaseLbl);
       }
-      // Emit: goto endLbl
-      
-      // nextCaseLbl:
       curCase := self.nodeNext(curCase);
     }
-    
-    // Default case
-    if (defaultCase >= 0) {
-      self.lowerBlock(defaultCase);
+
+    // Der Standardfall steht hinter der Kette und wird nur erreicht, wenn
+    // keiner der Vergleiche zutraf.
+    if (defaultBody >= 0) {
+      self.lowerBlock(defaultBody);
     }
-    
-    // endLbl:
+
+    self.irEmitLabel(endLbl);
+    self.loopExitLabel := vorherExit;
     return 0;
   }
-  
+
   // ============================================================================
   // WP-20: Additional Expression Types
   // ============================================================================

@@ -222,6 +222,61 @@ fn main(): int64 {
   return 0;
 }"
 
+# --- #1830: pwrite64 unter fs.write ---------------------------------------
+# std.db.sqlite starb unter @capabilities weiterhin mit SIGSYS, obwohl #1276
+# fcntl ergaenzt hatte — das hatte den Abbruch nur VERSCHOBEN: die Sperre ging
+# danach durch, das Schreiben nicht. SQLite schreibt ausschliesslich
+# positioniert (pwrite64, Nummer 18). Erlaubt war unter WP-24.3 nur die
+# Leseseite (pread64, 17); die Schreibseite daneben wurde nicht nachgezogen.
+#
+# Im strace sah es aus wie ein geglueckter Aufruf mit dem seltsamen Ergebnis
+# 18 — das war nicht der Rueckgabewert, sondern die Nummer des verworfenen
+# Syscalls. Sichtbar wird sie erst mit --seccomp-trap (#1348).
+runs "#1830 pwrite64 mit fs.write" "@capabilities([system.exit, system.memory.heap, fs.read, fs.write, fs.create])
+$IO
+fn main(): int64 {
+  // open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644) = 1|64|512
+  var fd: int64 := open(\"/tmp/lyx_1830.bin\"c, 577, 420);
+  if (fd < 0) { return 1; }
+  var buf: int64 := alloc(16);
+  poke8(buf, 65);
+  var n: int64 := sys_pwrite64(fd, buf, 1, 0);
+  close(fd);
+  if (n != 1) { return 1; }
+  return 0;
+}"
+
+# Ohne fs.write bleibt es verboten — sonst wuerde der Test auch von einem
+# Filter erfuellt, der alles durchlaesst.
+blocked "#1830 pwrite64 ohne fs.write bleibt verboten" "@capabilities([system.exit, system.memory.heap, fs.read])
+$IO
+fn main(): int64 {
+  var fd: int64 := open(\"/tmp/lyx_1830.bin\"c, 0, 0);
+  if (fd < 0) { return 1; }
+  var buf: int64 := alloc(16);
+  poke8(buf, 66);
+  sys_pwrite64(fd, buf, 1, 0);
+  return 0;
+}"
+
+# Der Melderfall selbst: std.db.sqlite von OEFFNEN bis SCHLIESSEN. fs.delete
+# gehoert dazu und ist keine Luecke — SQLite raeumt am Ende der Transaktion
+# die Journaldatei weg, und Loeschen ist genau das Recht, das fs.delete
+# beschreibt. Ohne fs.delete stirbt der Lauf zu Recht an unlink (87).
+# Hier NICHT $IO (src.std.io): std.db.sqlite zieht std.alloc und std.string
+# nach, und beide Baeume zusammen ergeben "mehrdeutiges Symbol" (die stdlib
+# liegt doppelt, siehe CLAUDE.md).
+runs "#1830 std.db.sqlite unter @capabilities" "@capabilities([system.exit, system.memory.heap, system.rand, fs.read, fs.write, fs.create, fs.meta, fs.delete])
+import std.io;
+import std.db.sqlite;
+fn main(): int64 {
+  var db: int64 := SQLiteOpen(\"/tmp/lyx_1830.db\"c);
+  if (db == 0) { return 1; }
+  SQLiteExec(db, \"CREATE TABLE IF NOT EXISTS t(a INTEGER); INSERT INTO t VALUES(42);\"c);
+  SQLiteClose(db);
+  return 0;
+}"
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 test "$FAIL" -eq 0

@@ -173,7 +173,15 @@ fn main(): int64 {
   SvgPolygon(doc, "50,5 61,35 95,35");
   SvgApply(doc);
   SvgSymbolEnd(doc);
-  SvgUseId(doc, sym, 150.0, 150.0, 40.0, 40.0);
+  // #1828: Ein benanntes Symbol traegt den Namen als id und wird per Namen
+  // referenziert. Der Id-Umweg bleibt fuer das unbenannte Symbol darunter.
+  SvgUse(doc, "stern", 150.0, 150.0, 40.0, 40.0);
+  // Bewusst KEIN circle: der Test darunter prueft, dass nach SvgSymbolEnd
+  // wieder in den Rumpf geschrieben wird, und nimmt den circle als Merkmal.
+  var ohne: int64 := SvgSymbolBegin(doc, "", 50.0, 50.0);
+  SvgRect(doc, 5.0, 5.0, 40.0, 40.0); SvgApply(doc);
+  SvgSymbolEnd(doc);
+  SvgUseId(doc, ohne, 250.0, 150.0, 40.0, 40.0);
   SvgCircle(doc, 200.0, 200.0, 30.0); SvgApply(doc);
   Print(SvgToString(doc)); Print("\n");
   return 0;
@@ -195,15 +203,74 @@ if bauen "$TMP/defs.lyx"; then
   else
     bad "circle steht noch in <defs> — die Umleitung wird nicht zurueckgenommen"
   fi
-  # href muss die vergebene id treffen.
+  # #1828: Der uebergebene Name IST die id. Vorher vergab die Funktion immer
+  # "sym<N>" und legte den Namen in `class` ab — SvgUse(doc, "stern") schrieb
+  # dann href="#stern" und traf nichts. Das SVG war wohlgeformt, das <use>
+  # blieb leer: eine stille Abweichung, die erst im Bild auffaellt.
+  #
+  # ACHTUNG bei kuenftigen Aenderungen: dieser Test hat bis 1.1.11D das
+  # DEFEKTE Verhalten festgeschrieben (er erwartete id="sym0" trotz Namen).
+  if grep -q 'id="stern"' "$TMP/aus"; then
+    ok "#1828 der angegebene Name wird die id"
+  else
+    bad "#1828 id ist nicht der Name (gefunden: $(grep -o 'id="[^"]*"' "$TMP/aus" | head -1))"
+  fi
+  if grep -q 'href="#stern"' "$TMP/aus"; then
+    ok "#1828 SvgUse trifft das benannte Symbol"
+  else
+    bad "#1828 href trifft den Namen nicht"
+  fi
+  if grep -q 'class="stern"' "$TMP/aus"; then
+    bad "#1828 der Name steht immer noch in class"
+  else
+    ok "#1828 der Name landet nicht mehr in class"
+  fi
+  # Ohne Namen bleibt es bei der Nummer, und der Id-Umweg trifft weiterhin.
   id=$(grep -o 'id="sym[0-9]*"' "$TMP/aus" | head -1 | sed 's/id="//; s/"//')
   if [ -n "$id" ] && grep -q "href=\"#$id\"" "$TMP/aus"; then
-    ok "SvgUseId trifft die vergebene id ($id)"
+    ok "#1828 ohne Namen bleibt die Nummer, SvgUseId trifft sie ($id)"
   else
-    bad "href trifft die id nicht (id=$id, href=$(grep -o 'href="[^"]*"' "$TMP/aus" | head -1))"
+    bad "namenloses Symbol: href trifft die id nicht (id=$id)"
   fi
 else
   bad "Definitionen: Programm laeuft nicht"
+fi
+
+# ---------------------------------------------------------------------------
+# #1828 — Clip-Pfad und Marker: dort verschwand der Name ganz
+# ---------------------------------------------------------------------------
+# Schwerer als beim Symbol: die vergebene Nummer wurde nirgends herausgereicht,
+# `clip-path="url(#c1)"` war aus dem Programm heraus also gar nicht
+# herstellbar.
+cat > "$TMP/defs2.lyx" <<'EOF'
+import std.io;
+import std.svg.builder;
+import std.svg.defs;
+import std.svg.elements;
+fn main(): int64 {
+  var doc: int64 := SvgNew(200.0, 200.0);
+  var c: int64 := SvgClipPathBegin(doc, "c1");
+  SvgCircle(doc, 50.0, 50.0, 40.0);
+  SvgClipPathEnd(doc);
+  var m: int64 := SvgMarkerBegin(doc, "m1", 6.0, 6.0, 3.0, 3.0);
+  SvgClipPathEnd(doc);
+  Print(SvgToString(doc)); Print("\n");
+  return 0;
+}
+EOF
+if bauen "$TMP/defs2.lyx"; then
+  if grep -q 'clipPath id="c1"' "$TMP/aus"; then
+    ok "#1828 Clip-Pfad traegt den angegebenen Namen"
+  else
+    bad "#1828 Clip-Pfad: $(grep -o '<clipPath id="[^"]*"' "$TMP/aus" | head -1)"
+  fi
+  if grep -q 'marker id="m1"' "$TMP/aus"; then
+    ok "#1828 Marker traegt den angegebenen Namen"
+  else
+    bad "#1828 Marker: $(grep -o '<marker id="[^"]*"' "$TMP/aus" | head -1)"
+  fi
+else
+  bad "#1828 Clip/Marker: Programm laeuft nicht"
 fi
 
 echo "----"

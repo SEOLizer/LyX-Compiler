@@ -61,7 +61,12 @@ run() { # name, quelltext, erwarteter exit-code
     echo "FAIL $1: Huelle konnte das Abbild nicht umpacken"
     FAIL=$((FAIL+1)); return
   fi
-  timeout 10 "$QEMU" "$TMP/c.run" >/dev/null 2>&1; local rc=$?
+  # Zeitdeckel 60, nicht 10: im vollen `make test` laufen viele qemu-Instanzen
+  # nebeneinander, und `division_durch_null` fiel dort mit 124 (Deckel) statt
+  # 132 (SIGILL) durch — isoliert liefert derselbe Fall reproduzierbar 132.
+  # Der Deckel darf die Aussage nicht bestimmen: gemessen wird weiterhin der
+  # genaue Rueckgabewert, ein Haenger faellt als 124 weiterhin auf.
+  timeout 60 "$QEMU" "$TMP/c.run" >/dev/null 2>&1; local rc=$?
   if [ "$rc" -eq "$3" ]; then echo "PASS $1 (=$rc)"; PASS=$((PASS+1))
   else echo "FAIL $1: exit=$rc erwartet $3"; FAIL=$((FAIL+1)); fi
 }

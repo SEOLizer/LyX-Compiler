@@ -179,5 +179,42 @@ PY
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# #1829: grosse Argumente — melden statt raten
+# ---------------------------------------------------------------------------
+# SinF64(1e16) lieferte 0.909297. Das ist sin(2): die Reduktion hatte bei
+# dieser Groesse keine Stellen mehr uebrig, und das Ergebnis gehoerte zu einem
+# ANDEREN Winkel — ohne jeden Hinweis.
+#
+# Die Reduktion ist jetzt dreistufig (Cody-Waite) und traegt bis TrigMaxArg()
+# = 2^40; darueber wird NaN geliefert. Geprueft wird beides, denn eine
+# Reduktion allein waere hier nicht zu haben: fuer 1e16 braeuchte es
+# Payne-Hanek mit vielen Stellen von pi.
+grenze() { # name, lyx-ausdruck, erwartung: NAN oder ZAHL
+  { echo 'import std.math;'
+    echo 'fn main(): int64 {'
+    echo "  var v: f64 := $2;"
+    echo '  if (v != v) { PrintLn("NAN"c); } else { PrintLn("ZAHL"c); }'
+    echo '  return 0;'
+    echo '}'
+  } > "$TMP/g.lyx"
+  if ! "$LYXC" --std-path="$ROOT" "$TMP/g.lyx" -o "$TMP/g" >/dev/null 2>&1; then
+    no "$1" "uebersetzt nicht"; return
+  fi
+  got="$(timeout 60 "$TMP/g" 2>&1)"
+  if [ "$got" = "$3" ]; then ok "$1 ($got)"; else no "$1" "$got, erwartet $3"; fi
+}
+
+grenze "sin(1e16) meldet statt sin(2) zu liefern"  "SinF64(10000000000000000.0)"  "NAN"
+grenze "cos(1e16) meldet ebenso"                   "CosF64(10000000000000000.0)"  "NAN"
+grenze "tan(1e16) erbt die Meldung"                "TanF64(10000000000000000.0)"  "NAN"
+grenze "sin an der Grenze 2^40 rechnet noch"       "SinF64(1099511627776.0)"      "ZAHL"
+grenze "sin knapp darueber meldet"                 "SinF64(1099511627777.0)"      "NAN"
+grenze "negative Argumente ebenso"                 "SinF64(0.0 - 10000000000000000.0)" "NAN"
+
+# Der uebliche Bereich darf davon nichts merken.
+check_point "#1829: sin(1e9) bleibt genau"  "SinF64(1000000000.0)"  "math.sin(1e9)"
+check_point "#1829: sin(1e11) bleibt genau" "SinF64(100000000000.0)" "math.sin(1e11)"
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
