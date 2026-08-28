@@ -177,22 +177,45 @@ fn main(): int64 {
 printf '@capabilities([system.exit, system.memory.heap, fs.read, system.time])\nimport std.io;\nimport std.time grant [system.time];\nfn main(): int64 { return 0; }\n' > "$TMP/gr.lyx"
 msg="$("$LYXC" --std-path="$ROOT" "$TMP/gr.lyx" -o "$TMP/gr" 2>&1)"
 case "$msg" in
-  *"Grant-Modell"*"nicht erzwungen"*|*"grant wird ohnehin nicht erzwungen"*)
-    ok "Score weist das Grant-Modell als nicht erzwungen aus" ;;
-  *) no "Score weist das Grant-Modell als nicht erzwungen aus" "Zeile fehlt: $(echo "$msg" | grep -i grant)" ;;
+  *"+ 0: Grant-Modell"*"ohne grant"*)
+    ok "Score benennt die Importe ohne grant" ;;
+  *) no "Score benennt die Importe ohne grant" "Zeile fehlt: $(echo "$msg" | grep -i grant)" ;;
 esac
 
+# #1340: Punkte gibt es wieder — aber nur, wenn JEDER Import ein grant traegt.
+# Oben fehlt es bei std.io, also darf hier nichts vergeben werden.
 case "$msg" in
-  *"+10: Grant-Modell"*) no "keine Punkte mehr fuer blosse grant-Angaben" "vergibt weiterhin +10" ;;
-  *) ok "keine Punkte mehr fuer blosse grant-Angaben" ;;
+  *"+10: Grant-Modell"*) no "kein Punkt, solange ein Import ohne grant bleibt" "vergibt +10 trotz fehlendem grant" ;;
+  *) ok "kein Punkt, solange ein Import ohne grant bleibt" ;;
 esac
 
-# Die Obergrenze muss mitwandern — sonst waere der Wert gegen eine Summe
-# gemessen, die niemand mehr erreichen kann.
-case "$msg" in
-  *"/35"*) ok "Obergrenze auf 35 gesenkt" ;;
-  *) no "Obergrenze auf 35 gesenkt" "$(echo "$msg" | grep -i 'Sicherheits-Score')" ;;
+# Vollstaendig annotiert: alle Importe mit grant -> +10 und /45.
+printf '@capabilities([system.exit, system.memory.heap, system.time])\nimport std.time grant [system.time];\nfn main(): int64 { return 0; }\n' > "$TMP/gr2.lyx"
+msg2="$("$LYXC" --std-path="$ROOT" "$TMP/gr2.lyx" -o "$TMP/gr2" 2>&1)"
+case "$msg2" in
+  *"+10: Grant-Modell"*) ok "alle Importe mit grant: +10" ;;
+  *) no "alle Importe mit grant: +10" "$(echo "$msg2" | grep -i grant)" ;;
 esac
+
+# Die Obergrenze wandert mit — sonst waere der Wert gegen eine Summe gemessen,
+# die niemand mehr erreichen kann.
+case "$msg2" in
+  *"/45"*) ok "Obergrenze wieder 45" ;;
+  *) no "Obergrenze wieder 45" "$(echo "$msg2" | grep -i 'Sicherheits-Score')" ;;
+esac
+
+# Der Punkt steht fuer eine PRUEFUNG, die abweist — sonst waere er wieder
+# geschenkt wie vor #1231. Nachweis an der Wirkung: ein grant, das weniger
+# fuehrt als die Unit deklariert, macht die Uebersetzung rot.
+printf '@capabilities([system.exit, system.memory.heap, fs.read, fs.write, fs.create, fs.delete, fs.meta, fs.perm, system.time])\nimport std.fs grant [fs.read];\nfn main(): int64 { return 0; }\n' > "$TMP/gr3.lyx"
+if "$LYXC" --std-path="$ROOT" "$TMP/gr3.lyx" -o "$TMP/gr3" >"$TMP/gr3.log" 2>&1; then
+  no "zu knappes grant wird abgewiesen" "Uebersetzung lief durch"
+else
+  case "$(cat "$TMP/gr3.log")" in
+    *"grant fuehrt nicht, was das Modul deklariert"*) ok "zu knappes grant wird abgewiesen" ;;
+    *) no "zu knappes grant wird abgewiesen" "$(tail -3 "$TMP/gr3.log")" ;;
+  esac
+fi
 
 # Gegenprobe: die Modulebene wirkt weiterhin. Ohne fs.read bricht seccomp den
 # Zugriff ab (SIGSYS = 159) — DAS ist die Eindaemmung, die es wirklich gibt.
