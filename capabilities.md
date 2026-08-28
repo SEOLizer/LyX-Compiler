@@ -276,13 +276,48 @@ import
 
 ### 5.3 Fehlende Grants
 
-Ein Import ohne explizites `grant` erzeugt eine Compiler-Warnung und reduziert den Security-Score:
+Ein Import ohne explizites `grant` erzeugt eine Compiler-Warnung:
 
 ```
-warning: Import ohne explizites grant — Security-Score -2
+warning: Import ohne explizites grant — mit `grant` wird die Deklaration des Moduls geprüft (#1340)
 ```
 
-Das Programm kompiliert trotzdem. Für maximalen Score alle Imports mit `grant` versehen.
+Das Programm kompiliert trotzdem. Die +10 des Score gibt es aber nur, wenn
+**jeder** Import ein `grant` trägt — der Posten ist ganz oder gar nicht, nicht
+anteilig.
+
+### 5.4 Transitivität: das Grant gilt für die ganze Hülle
+
+Ein `grant` bindet den Import **und alles, was dieser Import seinerseits
+importiert**. Die Deklaration einer Unit nennt deshalb nicht nur ihren eigenen
+Bedarf, sondern die transitive Hülle über ihre `import std.*`-Kanten:
+
+```
+std.cloud.gcp.compute → std.cloud.gcp.transport → std.cloud.gcp.credentials → std.fs
+```
+
+`std.cloud.gcp.compute` deklariert damit `fs.read`, obwohl in seiner eigenen
+Quelle kein Dateizugriff steht — über drei Kanten kann einer stattfinden. Die
+Alternative wäre gewesen, nur den eigenen Bedarf zu deklarieren; dann wäre die
+Eindämmung bei der ersten Weiterreichung zu Ende, und `grant [network.tcp.connect]`
+auf `std.cloud.gcp.compute` hätte eine Zusicherung ausgewiesen, die der Code
+nicht hält (#1340, Punkt 4).
+
+Der Preis ist Weite: wer über vier Ecken `std.fs` erreicht, führt dessen
+Rechte. Wer enger will, importiert enger — die Hülle ist eine Aussage über den
+Import-Graphen, nicht über den Stil der Unit.
+
+Die Deklarationen in `std/` sind **gemessen, nicht geschätzt**: abgeleitet aus
+den OS-Builtins, die eine Unit aufruft, dann transitiv fortgeschrieben. Zwei
+Feinheiten, die eine grobe Ableitung falsch macht:
+
+- `read`/`write`/`lseek` sagen nichts über das Dateisystem — auf einem
+  Socket-Deskriptor sind sie Netzverkehr, auf stdout Ausgabe. Sie zählen nur
+  als `fs.*`, wenn die Unit selbst einen Datei-Deskriptor öffnet.
+- `memory.mmap` meint die datei- oder speichergestützte *geteilte* Abbildung.
+  Die anonyme Heap-Abbildung fällt unter `system.memory.heap`; wer die
+  Deklaration der Konstante `MMAP_SHARED` schon als Nutzung zählt, vererbt
+  `memory.mmap` über `std.alloc` an praktisch jede Unit.
 
 ---
 
@@ -463,7 +498,7 @@ Der Score bewertet die Qualität des Sicherheitsmodells (aktuell max. 40, mit op
 | W^X | +5 | Immer aktiv im generierten ELF |
 | RELRO | +5 | Immer aktiv (kein GOT im statischen ELF) |
 | PIE | +0 | Nicht implementiert (geplant) |
-| Grant-Vollständigkeit | +10 | Alle Imports mit explizitem `grant` (–2 pro fehlendem) |
+| Grant-Vollständigkeit | +10 | Nur wenn ALLE Imports ein `grant` tragen — sonst 0 (#1340) |
 | seccomp | +5 | Bei aktivem LCBS (nicht `--capabilities=compat`) |
 | landlock | +5 | Bei aktivem LCBS (Kernel ≥ 5.13) |
 | Stack Canaries | +5 Bonus | Geplant |
