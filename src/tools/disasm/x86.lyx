@@ -1,0 +1,1016 @@
+// src/tools/disasm/x86.lyx — Disassembler fuer den x86-64-Vorrat des Codegens (#1370)
+//
+// Drei Schalter haengen daran: --dump-asm (nach stdout), --emit-asm (in eine
+// Datei) und --asm-listing (dasselbe mit Quellzeilen). Bis 1.1.12C wiesen alle
+// drei laut ab; das Issue nannte als billigeren Weg, die Mnemonics waehrend der
+// Emission mitzuschreiben. Dagegen sprach, dass das JEDE der rund zweitausend
+// Emissionsstellen im Codegen beruehrt haette — ein Disassembler liest
+// stattdessen das fertige Erzeugnis und bleibt eine Datei.
+//
+// UMFANG: der Codegen erzeugt 55 verschiedene Mnemonics (gemessen mit objdump
+// ueber ein uebersetztes Programm). Nur die werden hier gedeutet. Alles andere
+// erscheint als `db` mit dem rohen Byte.
+//
+// DIE LAENGE IST DAS EIGENTLICHE. Ein falsch bemessener Befehl verschiebt
+// ALLES danach, und die Auflistung waere dann nicht bloss unvollstaendig,
+// sondern irrefuehrend. Deshalb:
+//   * die Laengenrechnung deckt den ganzen Vorrat ab, auch wo der Text nur
+//     grob ist;
+//   * ein unbekanntes Byte wird gezaehlt und am Ende ausdruecklich gemeldet,
+//     zusammen mit dem Hinweis, dass die Auflistung ab dort verschoben sein
+//     kann. Stilles Weiterlaufen waere hier der schlechtere Ausgang;
+//   * der Test misst die Befehlsgrenzen gegen objdump, nicht den Text.
+
+unit src.tools.disasm.x86;
+
+import src.std.io;
+import src.std.alloc;
+import src.std.string;
+
+// ---------------------------------------------------------------------------
+// Ausgabepuffer
+// ---------------------------------------------------------------------------
+
+pub type DisAus = class {
+  puf: int64;
+  len: int64;
+  cap: int64;
+  unbekannt: int64;   // Zahl der nicht gedeuteten Bytes
+
+  fn Create(): void {
+    self.cap := 1048576;
+    self.puf := alloc(self.cap);
+    self.len := 0;
+    self.unbekannt := 0;
+  }
+
+  fn Wachse(bedarf: int64): void {
+    if (self.len + bedarf < self.cap) { return; }
+    var nc: int64 := self.cap * 2;
+    while (self.len + bedarf >= nc) { nc := nc * 2; }
+    var nb: int64 := alloc(nc);
+    memcpy(nb, self.puf, self.len);
+    self.puf := nb;
+    self.cap := nc;
+  }
+
+  fn Zeichen(c: int64): void {
+    self.Wachse(2);
+    poke8(self.puf + self.len, c);
+    self.len := self.len + 1;
+  }
+
+  fn Text(s: pchar): void {
+    var i: int64 := 0;
+    var n: int64 := StrLen(s);
+    self.Wachse(n + 2);
+    while (i < n) {
+      poke8(self.puf + self.len + i, StrCharAt(s, i));
+      i := i + 1;
+    }
+    self.len := self.len + n;
+  }
+
+  fn Zeile(): void { self.Zeichen(10); }
+
+  // Dezimal mit Vorzeichen.
+  //
+  // Der kleinstmoegliche int64 hat kein positives Gegenstueck: `0 - n` liefert
+  // dort wieder denselben Wert, und ein `Zahl(0 - n)` wuerde sich endlos
+  // selbst aufrufen. Genau das ist beim ersten Lauf passiert — der Codegen
+  // emittiert 0x8000000000000000 als Vorzeichenmaske fuer die f64-Negation,
+  // und der Disassembler lief in eine unbegrenzte Rekursion, bis der Rechner
+  // keinen Speicher mehr hatte. Der Fall wird deshalb ausdruecklich behandelt,
+  // statt sich auf die Umkehrung zu verlassen.
+  fn Zahl(n: int64): void {
+    if (n == 0 - 9223372036854775807 - 1) {
+      self.Text("-9223372036854775808"c);
+      return;
+    }
+    if (n < 0) { self.Zeichen(45); self.Zahl(0 - n); return; }
+    if (n >= 10) { self.Zahl(n / 10); }
+    self.Zeichen(48 + (n % 10));
+  }
+
+  // Hexadezimal mit fester Stellenzahl, damit die Spalten stehen.
+  fn Hex(n: int64, stellen: int64): void {
+    var i: int64 := stellen - 1;
+    while (i >= 0) {
+      var nib: int64 := (n >> (i * 4)) & 15;
+      if (nib < 10) { self.Zeichen(48 + nib); } else { self.Zeichen(87 + nib); }
+      i := i - 1;
+    }
+  }
+
+  fn HexPraefix(n: int64, stellen: int64): void {
+    self.Text("0x"c);
+    self.Hex(n, stellen);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Registernamen
+// ---------------------------------------------------------------------------
+// Der Codegen rechnet ausschliesslich in 64 Bit; 32-Bit-Formen entstehen nur,
+// wo das Praefix fehlt (etwa `xor edi, edi`). Beides wird unterschieden, weil
+// eine Auflistung sonst luegt: `mov eax, 9` und `mov rax, 9` sind verschiedene
+// Befehle mit verschiedener Wirkung auf die oberen 32 Bit.
+
+fn dis_reg64(r: int64): pchar {
+  if (r == 0)  { return "rax"c; }
+  if (r == 1)  { return "rcx"c; }
+  if (r == 2)  { return "rdx"c; }
+  if (r == 3)  { return "rbx"c; }
+  if (r == 4)  { return "rsp"c; }
+  if (r == 5)  { return "rbp"c; }
+  if (r == 6)  { return "rsi"c; }
+  if (r == 7)  { return "rdi"c; }
+  if (r == 8)  { return "r8"c; }
+  if (r == 9)  { return "r9"c; }
+  if (r == 10) { return "r10"c; }
+  if (r == 11) { return "r11"c; }
+  if (r == 12) { return "r12"c; }
+  if (r == 13) { return "r13"c; }
+  if (r == 14) { return "r14"c; }
+  return "r15"c;
+}
+
+fn dis_reg32(r: int64): pchar {
+  if (r == 0)  { return "eax"c; }
+  if (r == 1)  { return "ecx"c; }
+  if (r == 2)  { return "edx"c; }
+  if (r == 3)  { return "ebx"c; }
+  if (r == 4)  { return "esp"c; }
+  if (r == 5)  { return "ebp"c; }
+  if (r == 6)  { return "esi"c; }
+  if (r == 7)  { return "edi"c; }
+  if (r == 8)  { return "r8d"c; }
+  if (r == 9)  { return "r9d"c; }
+  if (r == 10) { return "r10d"c; }
+  if (r == 11) { return "r11d"c; }
+  if (r == 12) { return "r12d"c; }
+  if (r == 13) { return "r13d"c; }
+  if (r == 14) { return "r14d"c; }
+  return "r15d"c;
+}
+
+fn dis_reg8(r: int64): pchar {
+  if (r == 0)  { return "al"c; }
+  if (r == 1)  { return "cl"c; }
+  if (r == 2)  { return "dl"c; }
+  if (r == 3)  { return "bl"c; }
+  if (r == 4)  { return "spl"c; }
+  if (r == 5)  { return "bpl"c; }
+  if (r == 6)  { return "sil"c; }
+  if (r == 7)  { return "dil"c; }
+  if (r == 8)  { return "r8b"c; }
+  if (r == 9)  { return "r9b"c; }
+  if (r == 10) { return "r10b"c; }
+  if (r == 11) { return "r11b"c; }
+  if (r == 12) { return "r12b"c; }
+  if (r == 13) { return "r13b"c; }
+  if (r == 14) { return "r14b"c; }
+  return "r15b"c;
+}
+
+fn dis_regXmm(r: int64): pchar {
+  if (r == 0)  { return "xmm0"c; }
+  if (r == 1)  { return "xmm1"c; }
+  if (r == 2)  { return "xmm2"c; }
+  if (r == 3)  { return "xmm3"c; }
+  if (r == 4)  { return "xmm4"c; }
+  if (r == 5)  { return "xmm5"c; }
+  if (r == 6)  { return "xmm6"c; }
+  if (r == 7)  { return "xmm7"c; }
+  if (r == 8)  { return "xmm8"c; }
+  if (r == 9)  { return "xmm9"c; }
+  if (r == 10) { return "xmm10"c; }
+  if (r == 11) { return "xmm11"c; }
+  if (r == 12) { return "xmm12"c; }
+  if (r == 13) { return "xmm13"c; }
+  if (r == 14) { return "xmm14"c; }
+  return "xmm15"c;
+}
+
+// ---------------------------------------------------------------------------
+// ModRM / SIB
+// ---------------------------------------------------------------------------
+// Hier entscheidet sich die Laenge jedes Befehls mit Speicheroperand. Die
+// Faelle, die der Codegen erzeugt, sind alle vertreten; die Rechnung folgt
+// dem Handbuch und nicht dem, was gerade gebraucht wird — ein Sonderfall
+// weniger heisst hier eine verschobene Auflistung.
+//
+//   mod=00  [reg]            rm=100 -> SIB,  rm=101 -> RIP+disp32
+//   mod=01  [reg+disp8]      rm=100 -> SIB+disp8
+//   mod=10  [reg+disp32]     rm=100 -> SIB+disp32
+//   mod=11  Register direkt
+//
+// SIB: scale(2) index(3) base(3); base=101 bei mod=00 heisst disp32 ohne Basis.
+
+fn dis_modrmLen(code: int64, p: int64): int64 {
+  var modrm: int64 := peek8(code + p);
+  var md: int64 := (modrm >> 6) & 3;
+  var rm: int64 := modrm & 7;
+  var n: int64 := 1;
+  if (md == 3) { return n; }
+  if (rm == 4) {
+    var sib: int64 := peek8(code + p + 1);
+    n := n + 1;
+    var basis: int64 := sib & 7;
+    if (md == 0) {
+      if (basis == 5) { return n + 4; }
+      return n;
+    }
+  } else {
+    if (md == 0) {
+      if (rm == 5) { return n + 4; }   // RIP-relativ
+      return n;
+    }
+  }
+  if (md == 1) { return n + 1; }
+  return n + 4;
+}
+
+// disp8 kommt vorzeichenbehaftet daher.
+fn dis_disp8(code: int64, p: int64): int64 {
+  var b: int64 := peek8(code + p);
+  if (b > 127) { return b - 256; }
+  return b;
+}
+
+fn dis_disp32(code: int64, p: int64): int64 {
+  var v: int64 := peek8(code + p) | (peek8(code + p + 1) << 8)
+                | (peek8(code + p + 2) << 16) | (peek8(code + p + 3) << 24);
+  if (v > 2147483647) { return v - 4294967296; }
+  return v;
+}
+
+fn dis_imm32(code: int64, p: int64): int64 { return dis_disp32(code, p); }
+
+fn dis_imm64(code: int64, p: int64): int64 {
+  var lo: int64 := peek8(code + p) | (peek8(code + p + 1) << 8)
+                 | (peek8(code + p + 2) << 16) | (peek8(code + p + 3) << 24);
+  var hi: int64 := peek8(code + p + 4) | (peek8(code + p + 5) << 8)
+                 | (peek8(code + p + 6) << 16) | (peek8(code + p + 7) << 24);
+  return (hi << 32) | (lo & 4294967295);
+}
+
+// Schreibt den ModRM-Operanden. breite: 0 = 64 Bit, 1 = 32 Bit, 2 = 8 Bit,
+// 3 = XMM. Bei Speicherzugriffen spielt die Registerbreite keine Rolle — die
+// Adresse ist immer 64 Bit.
+fn dis_modrmText(aus: DisAus, code: int64, p: int64, rexB: int64, rexX: int64, breite: int64): void {
+  var modrm: int64 := peek8(code + p);
+  var md: int64 := (modrm >> 6) & 3;
+  var rm: int64 := modrm & 7;
+
+  if (md == 3) {
+    var r: int64 := rm | (rexB << 3);
+    if (breite == 3) { aus.Text(dis_regXmm(r)); return; }
+    if (breite == 2) { aus.Text(dis_reg8(r)); return; }
+    if (breite == 1) { aus.Text(dis_reg32(r)); return; }
+    aus.Text(dis_reg64(r));
+    return;
+  }
+
+  aus.Text("["c);
+
+  if (rm == 4) {
+    // SIB
+    var sib: int64 := peek8(code + p + 1);
+    var sc: int64 := (sib >> 6) & 3;
+    var idx: int64 := ((sib >> 3) & 7) | (rexX << 3);
+    var basis: int64 := (sib & 7) | (rexB << 3);
+    var hatBasis: int64 := 1;
+    if (md == 0) {
+      if ((sib & 7) == 5) { hatBasis := 0; }
+    }
+    if (hatBasis == 1) { aus.Text(dis_reg64(basis)); }
+    if (idx != 4) {                     // 100 heisst "kein Index"
+      if (hatBasis == 1) { aus.Text("+"c); }
+      aus.Text(dis_reg64(idx));
+      if (sc > 0) { aus.Text("*"c); aus.Zahl(1 << sc); }
+    }
+    var dp: int64 := p + 2;
+    if (md == 1) {
+      var d8: int64 := dis_disp8(code, dp);
+      if (d8 < 0) { aus.Text("-"c); aus.Zahl(0 - d8); } else { aus.Text("+"c); aus.Zahl(d8); }
+    }
+    if (md == 2 || hatBasis == 0) {
+      var d32: int64 := dis_disp32(code, dp);
+      if (d32 < 0) { aus.Text("-"c); aus.Zahl(0 - d32); } else { aus.Text("+"c); aus.Zahl(d32); }
+    }
+    aus.Text("]"c);
+    return;
+  }
+
+  if (md == 0) {
+    if (rm == 5) {
+      // RIP-relativ: der Zielwert steht erst nach der Befehlslaenge fest,
+      // deshalb hier nur der Abstand.
+      aus.Text("rip"c);
+      var dr: int64 := dis_disp32(code, p + 1);
+      if (dr < 0) { aus.Text("-"c); aus.Zahl(0 - dr); } else { aus.Text("+"c); aus.Zahl(dr); }
+      aus.Text("]"c);
+      return;
+    }
+    aus.Text(dis_reg64(rm | (rexB << 3)));
+    aus.Text("]"c);
+    return;
+  }
+
+  aus.Text(dis_reg64(rm | (rexB << 3)));
+  if (md == 1) {
+    var e8: int64 := dis_disp8(code, p + 1);
+    if (e8 < 0) { aus.Text("-"c); aus.Zahl(0 - e8); } else { aus.Text("+"c); aus.Zahl(e8); }
+  } else {
+    var e32: int64 := dis_disp32(code, p + 1);
+    if (e32 < 0) { aus.Text("-"c); aus.Zahl(0 - e32); } else { aus.Text("+"c); aus.Zahl(e32); }
+  }
+  aus.Text("]"c);
+}
+
+// Registeroperand aus dem reg-Feld des ModRM.
+fn dis_regText(aus: DisAus, code: int64, p: int64, rexR: int64, breite: int64): void {
+  var r: int64 := ((peek8(code + p) >> 3) & 7) | (rexR << 3);
+  if (breite == 3) { aus.Text(dis_regXmm(r)); return; }
+  if (breite == 2) { aus.Text(dis_reg8(r)); return; }
+  if (breite == 1) { aus.Text(dis_reg32(r)); return; }
+  aus.Text(dis_reg64(r));
+}
+
+// ---------------------------------------------------------------------------
+// Bedingungscodes (jcc, setcc, cmovcc)
+// ---------------------------------------------------------------------------
+
+fn dis_cc(c: int64): pchar {
+  if (c == 0)  { return "o"c; }
+  if (c == 1)  { return "no"c; }
+  if (c == 2)  { return "b"c; }
+  if (c == 3)  { return "ae"c; }
+  if (c == 4)  { return "e"c; }
+  if (c == 5)  { return "ne"c; }
+  if (c == 6)  { return "be"c; }
+  if (c == 7)  { return "a"c; }
+  if (c == 8)  { return "s"c; }
+  if (c == 9)  { return "ns"c; }
+  if (c == 10) { return "p"c; }
+  if (c == 11) { return "np"c; }
+  if (c == 12) { return "l"c; }
+  if (c == 13) { return "ge"c; }
+  if (c == 14) { return "le"c; }
+  return "g"c;
+}
+
+// Die acht Rechenbefehle, die sich Opcodebereich und /r-Feld teilen.
+fn dis_arith(i: int64): pchar {
+  if (i == 0) { return "add"c; }
+  if (i == 1) { return "or"c; }
+  if (i == 2) { return "adc"c; }
+  if (i == 3) { return "sbb"c; }
+  if (i == 4) { return "and"c; }
+  if (i == 5) { return "sub"c; }
+  if (i == 6) { return "xor"c; }
+  return "cmp"c;
+}
+
+fn dis_schiebe(i: int64): pchar {
+  if (i == 0) { return "rol"c; }
+  if (i == 1) { return "ror"c; }
+  if (i == 2) { return "rcl"c; }
+  if (i == 3) { return "rcr"c; }
+  if (i == 4) { return "shl"c; }
+  if (i == 5) { return "shr"c; }
+  if (i == 6) { return "shl"c; }
+  return "sar"c;
+}
+
+// F6/F7-Gruppe
+fn dis_gruppe3(i: int64): pchar {
+  if (i == 0) { return "test"c; }
+  if (i == 1) { return "test"c; }
+  if (i == 2) { return "not"c; }
+  if (i == 3) { return "neg"c; }
+  if (i == 4) { return "mul"c; }
+  if (i == 5) { return "imul"c; }
+  if (i == 6) { return "div"c; }
+  return "idiv"c;
+}
+
+// ---------------------------------------------------------------------------
+// Ein Befehl
+// ---------------------------------------------------------------------------
+// Liest bei `pos` einen Befehl, schreibt seinen Text nach `aus` und liefert
+// seine LAENGE in Byte. `adr` ist die virtuelle Adresse von `pos` — sie wird
+// fuer die Sprungziele gebraucht, die relativ kodiert sind.
+//
+// Ein unbekannter Opcode liefert Laenge 1 und erhoeht aus.unbekannt. Das ist
+// die einzige Stelle, an der die Auflistung verrutschen kann; sie wird deshalb
+// gezaehlt und am Ende genannt.
+pub fn dis_befehl(aus: DisAus, code: int64, pos: int64, codeLen: int64, adr: int64): int64 {
+  var p: int64 := pos;
+
+  // --- Praefixe ---
+  var rexW: int64 := 0;
+  var rexR: int64 := 0;
+  var rexX: int64 := 0;
+  var rexB: int64 := 0;
+  var pref66: int64 := 0;
+  var prefF2: int64 := 0;
+  var prefF3: int64 := 0;
+  var weiter: int64 := 1;
+  while (weiter == 1) {
+    if (p >= codeLen) { return 1; }
+    var b: int64 := peek8(code + p);
+    if (b == 0x66) { pref66 := 1; p := p + 1; }
+    else if (b == 0xF2) { prefF2 := 1; p := p + 1; }
+    else if (b == 0xF3) { prefF3 := 1; p := p + 1; }
+    else if (b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 || b == 0x64 || b == 0x65) { p := p + 1; }
+    else if (b >= 0x40 && b <= 0x4F) {
+      rexW := (b >> 3) & 1; rexR := (b >> 2) & 1; rexX := (b >> 1) & 1; rexB := b & 1;
+      p := p + 1;
+    }
+    else { weiter := 0; }
+  }
+
+  var op: int64 := peek8(code + p);
+  // Operandenbreite: 0 = 64 Bit (REX.W), 1 = 32 Bit
+  var br: int64 := 1;
+  if (rexW == 1) { br := 0; }
+
+  // --- Zwei-Byte-Opcodes ---
+  if (op == 0x0F) {
+    var op2: int64 := peek8(code + p + 1);
+
+    if (op2 == 0x05) { aus.Text("syscall"c); return (p + 2) - pos; }
+    if (op2 == 0x0B) { aus.Text("ud2"c); return (p + 2) - pos; }
+    if (op2 == 0x09) { aus.Text("wbinvd"c); return (p + 2) - pos; }
+    if (op2 == 0x31) { aus.Text("rdtsc"c); return (p + 2) - pos; }
+    if (op2 == 0xA2) { aus.Text("cpuid"c); return (p + 2) - pos; }
+
+    // Drei-Byte-Opcodes. 0F 3A traegt zusaetzlich einen Direktwert, 0F 38
+    // nicht — wer das uebersieht, verschiebt die Auflistung um genau ein Byte.
+    // Der Codegen erzeugt daraus roundsd (Runden zur naechsten Ganzzahl).
+    if (op2 == 0x3A || op2 == 0x38) {
+      var op3: int64 := peek8(code + p + 2);
+      var l3: int64 := dis_modrmLen(code, p + 3);
+      var nm3: pchar := "?"c;
+      var bekannt3: int64 := 1;
+      if (op2 == 0x3A) {
+        if (op3 == 0x08) { nm3 := "roundps"c; }
+        else if (op3 == 0x09) { nm3 := "roundpd"c; }
+        else if (op3 == 0x0A) { nm3 := "roundss"c; }
+        else if (op3 == 0x0B) { nm3 := "roundsd"c; }
+        else { bekannt3 := 0; }
+      } else {
+        bekannt3 := 0;
+      }
+      if (bekannt3 == 1) {
+        aus.Text(nm3); aus.Text(" "c);
+        dis_regText(aus, code, p + 3, rexR, 3); aus.Text(", "c);
+        dis_modrmText(aus, code, p + 3, rexB, rexX, 3);
+      } else {
+        aus.Text("(0f "c); aus.Hex(op2, 2); aus.Text(" "c); aus.Hex(op3, 2); aus.Text(")"c);
+        aus.unbekannt := aus.unbekannt + 1;
+      }
+      if (op2 == 0x3A) { return (p + 4 + l3) - pos; }
+      return (p + 3 + l3) - pos;
+    }
+
+    if (op2 == 0x1F) {   // mehrbyte-nop
+      var lnop: int64 := dis_modrmLen(code, p + 2);
+      aus.Text("nop "c);
+      dis_modrmText(aus, code, p + 2, rexB, rexX, br);
+      return (p + 2 + lnop) - pos;
+    }
+
+    if (op2 == 0xAE) {   // Zaeune und MXCSR
+      var mrAe: int64 := peek8(code + p + 2);
+      var lAe: int64 := dis_modrmLen(code, p + 2);
+      var subAe: int64 := (mrAe >> 3) & 7;
+      if ((mrAe >> 6) == 3) {
+        if (subAe == 5) { aus.Text("lfence"c); }
+        else if (subAe == 6) { aus.Text("mfence"c); }
+        else if (subAe == 7) { aus.Text("sfence"c); }
+        else { aus.Text("(0f ae)"c); }
+        return (p + 2 + lAe) - pos;
+      }
+      if (subAe == 2) { aus.Text("ldmxcsr "c); } else { aus.Text("stmxcsr "c); }
+      dis_modrmText(aus, code, p + 2, rexB, rexX, 1);
+      return (p + 2 + lAe) - pos;
+    }
+
+    // jcc rel32
+    if (op2 >= 0x80 && op2 <= 0x8F) {
+      aus.Text("j"c); aus.Text(dis_cc(op2 - 0x80)); aus.Text(" "c);
+      var relJ: int64 := dis_disp32(code, p + 2);
+      var lJ: int64 := (p + 6) - pos;
+      aus.HexPraefix(adr + lJ + relJ, 16);
+      return lJ;
+    }
+
+    // setcc r/m8
+    if (op2 >= 0x90 && op2 <= 0x9F) {
+      var lS: int64 := dis_modrmLen(code, p + 2);
+      aus.Text("set"c); aus.Text(dis_cc(op2 - 0x90)); aus.Text(" "c);
+      dis_modrmText(aus, code, p + 2, rexB, rexX, 2);
+      return (p + 2 + lS) - pos;
+    }
+
+    // cmovcc r, r/m
+    if (op2 >= 0x40 && op2 <= 0x4F) {
+      var lC: int64 := dis_modrmLen(code, p + 2);
+      aus.Text("cmov"c); aus.Text(dis_cc(op2 - 0x40)); aus.Text(" "c);
+      dis_regText(aus, code, p + 2, rexR, br); aus.Text(", "c);
+      dis_modrmText(aus, code, p + 2, rexB, rexX, br);
+      return (p + 2 + lC) - pos;
+    }
+
+    // movzx / movsx
+    if (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF) {
+      var lM: int64 := dis_modrmLen(code, p + 2);
+      if (op2 == 0xB6 || op2 == 0xB7) { aus.Text("movzx "c); } else { aus.Text("movsx "c); }
+      dis_regText(aus, code, p + 2, rexR, br); aus.Text(", "c);
+      var qb: int64 := 2;
+      if (op2 == 0xB7 || op2 == 0xBF) { qb := 1; }   // 16 Bit; als 32 dargestellt
+      dis_modrmText(aus, code, p + 2, rexB, rexX, qb);
+      return (p + 2 + lM) - pos;
+    }
+
+    if (op2 == 0xAF) {   // imul r, r/m
+      var lI: int64 := dis_modrmLen(code, p + 2);
+      aus.Text("imul "c);
+      dis_regText(aus, code, p + 2, rexR, br); aus.Text(", "c);
+      dis_modrmText(aus, code, p + 2, rexB, rexX, br);
+      return (p + 2 + lI) - pos;
+    }
+
+    // SSE: die Gleitkommabefehle des Codegens. Alle haben ModRM, die
+    // Mnemonik haengt am Praefix (F2 = skalar double, F3 = skalar single,
+    // 66 = gepackt double, ohne = gepackt single).
+    var sse: int64 := 0;
+    var nm: pchar := "?"c;
+    if (op2 == 0x10) { sse := 1; nm := "movups"c; if (prefF2 == 1) { nm := "movsd"c; } if (prefF3 == 1) { nm := "movss"c; } if (pref66 == 1) { nm := "movupd"c; } }
+    if (op2 == 0x11) { sse := 2; nm := "movups"c; if (prefF2 == 1) { nm := "movsd"c; } if (prefF3 == 1) { nm := "movss"c; } if (pref66 == 1) { nm := "movupd"c; } }
+    if (op2 == 0x28) { sse := 1; nm := "movaps"c; if (pref66 == 1) { nm := "movapd"c; } }
+    if (op2 == 0x29) { sse := 2; nm := "movaps"c; if (pref66 == 1) { nm := "movapd"c; } }
+    if (op2 == 0x2E) { sse := 1; nm := "ucomiss"c; if (pref66 == 1) { nm := "ucomisd"c; } }
+    if (op2 == 0x2F) { sse := 1; nm := "comiss"c;  if (pref66 == 1) { nm := "comisd"c; } }
+    if (op2 == 0x51) { sse := 1; nm := "sqrtps"c;  if (prefF2 == 1) { nm := "sqrtsd"c; } if (prefF3 == 1) { nm := "sqrtss"c; } }
+    if (op2 == 0x54) { sse := 1; nm := "andps"c;   if (pref66 == 1) { nm := "andpd"c; } }
+    if (op2 == 0x57) { sse := 1; nm := "xorps"c;   if (pref66 == 1) { nm := "xorpd"c; } }
+    if (op2 == 0x58) { sse := 1; nm := "addps"c;   if (prefF2 == 1) { nm := "addsd"c; } if (prefF3 == 1) { nm := "addss"c; } }
+    if (op2 == 0x59) { sse := 1; nm := "mulps"c;   if (prefF2 == 1) { nm := "mulsd"c; } if (prefF3 == 1) { nm := "mulss"c; } }
+    if (op2 == 0x5C) { sse := 1; nm := "subps"c;   if (prefF2 == 1) { nm := "subsd"c; } if (prefF3 == 1) { nm := "subss"c; } }
+    if (op2 == 0x5E) { sse := 1; nm := "divps"c;   if (prefF2 == 1) { nm := "divsd"c; } if (prefF3 == 1) { nm := "divss"c; } }
+    if (op2 == 0x5A) { sse := 1; nm := "cvtps2pd"c; if (prefF2 == 1) { nm := "cvtsd2ss"c; } if (prefF3 == 1) { nm := "cvtss2sd"c; } }
+    if (op2 == 0x6E) { sse := 3; nm := "movd"c; if (rexW == 1) { nm := "movq"c; } }
+    if (op2 == 0x7E) { sse := 4; nm := "movd"c; if (rexW == 1) { nm := "movq"c; } if (prefF3 == 1) { sse := 1; nm := "movq"c; } }
+    if (op2 == 0xD6) { sse := 2; nm := "movq"c; }
+    // Ganzzahlige SSE-Formen. pxor erzeugt der Codegen zum Nullen eines
+    // xmm-Registers vor einem Vergleich — es fehlte im ersten Anlauf und hat
+    // die Auflistung ab dort um ein Byte verschoben, weil der Auffangzweig
+    // das ModRM-Byte nicht mitgezaehlt hat.
+    if (op2 == 0xEF) { sse := 1; nm := "pxor"c; }
+    if (op2 == 0x6F) { sse := 1; nm := "movdqa"c; if (prefF3 == 1) { nm := "movdqu"c; } }
+    if (op2 == 0x7F) { sse := 2; nm := "movdqa"c; if (prefF3 == 1) { nm := "movdqu"c; } }
+    if (op2 == 0xD4) { sse := 1; nm := "paddq"c; }
+    if (op2 == 0xFB) { sse := 1; nm := "psubq"c; }
+    if (op2 == 0x76) { sse := 1; nm := "pcmpeqd"c; }
+    if (op2 == 0xC6) { sse := 1; nm := "shufps"c; if (pref66 == 1) { nm := "shufpd"c; } }
+    if (sse > 0) {
+      var lSse: int64 := dis_modrmLen(code, p + 2);
+      // shufps/shufpd tragen zusaetzlich einen Direktwert.
+      var immSse: int64 := 0;
+      if (op2 == 0xC6) { immSse := 1; }
+      aus.Text(nm); aus.Text(" "c);
+      if (sse == 1) {            // xmm, xmm/m
+        dis_regText(aus, code, p + 2, rexR, 3); aus.Text(", "c);
+        dis_modrmText(aus, code, p + 2, rexB, rexX, 3);
+      } else if (sse == 2) {     // xmm/m, xmm
+        dis_modrmText(aus, code, p + 2, rexB, rexX, 3); aus.Text(", "c);
+        dis_regText(aus, code, p + 2, rexR, 3);
+      } else if (sse == 3) {     // xmm, r/m (movd/movq hinein)
+        dis_regText(aus, code, p + 2, rexR, 3); aus.Text(", "c);
+        dis_modrmText(aus, code, p + 2, rexB, rexX, br);
+      } else {                   // r/m, xmm (movd/movq heraus)
+        dis_modrmText(aus, code, p + 2, rexB, rexX, br); aus.Text(", "c);
+        dis_regText(aus, code, p + 2, rexR, 3);
+      }
+      if (immSse == 1) {
+        aus.Text(", "c); aus.Zahl(peek8(code + p + 2 + lSse));
+        return (p + 3 + lSse) - pos;
+      }
+      return (p + 2 + lSse) - pos;
+    }
+
+    // cvtsi2sd / cvttsd2si — Ganzzahl und Gleitkomma treffen aufeinander,
+    // deshalb gemischte Operandenbreiten.
+    if (op2 == 0x2A) {
+      var l2a: int64 := dis_modrmLen(code, p + 2);
+      if (prefF2 == 1) { aus.Text("cvtsi2sd "c); } else { aus.Text("cvtsi2ss "c); }
+      dis_regText(aus, code, p + 2, rexR, 3); aus.Text(", "c);
+      dis_modrmText(aus, code, p + 2, rexB, rexX, br);
+      return (p + 2 + l2a) - pos;
+    }
+    if (op2 == 0x2C || op2 == 0x2D) {
+      var l2c: int64 := dis_modrmLen(code, p + 2);
+      if (op2 == 0x2C) { aus.Text("cvtt"c); } else { aus.Text("cvt"c); }
+      if (prefF2 == 1) { aus.Text("sd2si "c); } else { aus.Text("ss2si "c); }
+      dis_regText(aus, code, p + 2, rexR, br); aus.Text(", "c);
+      dis_modrmText(aus, code, p + 2, rexB, rexX, 3);
+      return (p + 2 + l2c) - pos;
+    }
+
+    // Unbekannter Zwei-Byte-Opcode. Die allermeisten tragen ein ModRM-Byte,
+    // und es MITZUZAEHLEN ist die bessere Annahme: zaehlt man es nicht mit,
+    // verschiebt sich alles danach garantiert; zaehlt man es mit, stimmt die
+    // Laenge in der Regel. Gemeldet wird der Fall trotzdem — die Annahme darf
+    // nicht unsichtbar bleiben.
+    var lUnb: int64 := dis_modrmLen(code, p + 2);
+    aus.Text("(0f "c); aus.Hex(op2, 2); aus.Text(", Laenge geraten)"c);
+    aus.unbekannt := aus.unbekannt + 1;
+    return (p + 2 + lUnb) - pos;
+  }
+
+  // --- Ein-Byte-Opcodes ---
+
+  // Rechenfamilie 00..3D: acht Befehle in Bloecken zu acht Opcodes.
+  if (op < 0x40) {
+    var zeile: int64 := op >> 3;          // 0..7 = add,or,adc,sbb,and,sub,xor,cmp
+    var spalte: int64 := op & 7;          // 0..5 = die sechs Formen
+    if (spalte <= 5) {
+      var nmA: pchar := dis_arith(zeile);
+      if (spalte == 0 || spalte == 1) {   // r/m, r
+        var lA: int64 := dis_modrmLen(code, p + 1);
+        var brA: int64 := br; if (spalte == 0) { brA := 2; }
+        aus.Text(nmA); aus.Text(" "c);
+        dis_modrmText(aus, code, p + 1, rexB, rexX, brA); aus.Text(", "c);
+        dis_regText(aus, code, p + 1, rexR, brA);
+        return (p + 1 + lA) - pos;
+      }
+      if (spalte == 2 || spalte == 3) {   // r, r/m
+        var lB: int64 := dis_modrmLen(code, p + 1);
+        var brB: int64 := br; if (spalte == 2) { brB := 2; }
+        aus.Text(nmA); aus.Text(" "c);
+        dis_regText(aus, code, p + 1, rexR, brB); aus.Text(", "c);
+        dis_modrmText(aus, code, p + 1, rexB, rexX, brB);
+        return (p + 1 + lB) - pos;
+      }
+      if (spalte == 4) {                  // al, imm8
+        aus.Text(nmA); aus.Text(" al, "c); aus.Zahl(peek8(code + p + 1));
+        return (p + 2) - pos;
+      }
+      // eax/rax, imm32
+      aus.Text(nmA); aus.Text(" "c);
+      if (br == 0) { aus.Text("rax, "c); } else { aus.Text("eax, "c); }
+      aus.Zahl(dis_imm32(code, p + 1));
+      return (p + 5) - pos;
+    }
+  }
+
+  if (op >= 0x50 && op <= 0x57) {
+    aus.Text("push "c); aus.Text(dis_reg64((op - 0x50) | (rexB << 3)));
+    return (p + 1) - pos;
+  }
+  if (op >= 0x58 && op <= 0x5F) {
+    aus.Text("pop "c); aus.Text(dis_reg64((op - 0x58) | (rexB << 3)));
+    return (p + 1) - pos;
+  }
+
+  if (op == 0x63) {   // movsxd r64, r/m32
+    var l63: int64 := dis_modrmLen(code, p + 1);
+    aus.Text("movsxd "c);
+    dis_regText(aus, code, p + 1, rexR, br); aus.Text(", "c);
+    dis_modrmText(aus, code, p + 1, rexB, rexX, 1);
+    return (p + 1 + l63) - pos;
+  }
+
+  if (op == 0x68) { aus.Text("push "c); aus.Zahl(dis_imm32(code, p + 1)); return (p + 5) - pos; }
+  if (op == 0x6A) { aus.Text("push "c); aus.Zahl(dis_disp8(code, p + 1)); return (p + 2) - pos; }
+
+  if (op == 0x69 || op == 0x6B) {   // imul r, r/m, imm
+    var l69: int64 := dis_modrmLen(code, p + 1);
+    aus.Text("imul "c);
+    dis_regText(aus, code, p + 1, rexR, br); aus.Text(", "c);
+    dis_modrmText(aus, code, p + 1, rexB, rexX, br); aus.Text(", "c);
+    if (op == 0x6B) { aus.Zahl(dis_disp8(code, p + 1 + l69)); return (p + 2 + l69) - pos; }
+    aus.Zahl(dis_imm32(code, p + 1 + l69));
+    return (p + 5 + l69) - pos;
+  }
+
+  if (op >= 0x70 && op <= 0x7F) {   // jcc rel8
+    aus.Text("j"c); aus.Text(dis_cc(op - 0x70)); aus.Text(" "c);
+    var rel8: int64 := dis_disp8(code, p + 1);
+    var l70: int64 := (p + 2) - pos;
+    aus.HexPraefix(adr + l70 + rel8, 16);
+    return l70;
+  }
+
+  if (op == 0x80 || op == 0x81 || op == 0x83) {   // Rechengruppe mit Direktwert
+    var l8: int64 := dis_modrmLen(code, p + 1);
+    var sub8: int64 := (peek8(code + p + 1) >> 3) & 7;
+    var br8: int64 := br; if (op == 0x80) { br8 := 2; }
+    aus.Text(dis_arith(sub8)); aus.Text(" "c);
+    dis_modrmText(aus, code, p + 1, rexB, rexX, br8); aus.Text(", "c);
+    if (op == 0x81) { aus.Zahl(dis_imm32(code, p + 1 + l8)); return (p + 5 + l8) - pos; }
+    aus.Zahl(dis_disp8(code, p + 1 + l8));
+    return (p + 2 + l8) - pos;
+  }
+
+  if (op == 0x84 || op == 0x85) {   // test r/m, r
+    var lT: int64 := dis_modrmLen(code, p + 1);
+    var brT: int64 := br; if (op == 0x84) { brT := 2; }
+    aus.Text("test "c);
+    dis_modrmText(aus, code, p + 1, rexB, rexX, brT); aus.Text(", "c);
+    dis_regText(aus, code, p + 1, rexR, brT);
+    return (p + 1 + lT) - pos;
+  }
+
+  if (op == 0x86 || op == 0x87) {   // xchg
+    var lX: int64 := dis_modrmLen(code, p + 1);
+    var brX: int64 := br; if (op == 0x86) { brX := 2; }
+    aus.Text("xchg "c);
+    dis_modrmText(aus, code, p + 1, rexB, rexX, brX); aus.Text(", "c);
+    dis_regText(aus, code, p + 1, rexR, brX);
+    return (p + 1 + lX) - pos;
+  }
+
+  if (op >= 0x88 && op <= 0x8B) {   // mov
+    var lMv: int64 := dis_modrmLen(code, p + 1);
+    var brM: int64 := br;
+    if (op == 0x88 || op == 0x8A) { brM := 2; }
+    aus.Text("mov "c);
+    if (op == 0x88 || op == 0x89) {
+      dis_modrmText(aus, code, p + 1, rexB, rexX, brM); aus.Text(", "c);
+      dis_regText(aus, code, p + 1, rexR, brM);
+    } else {
+      dis_regText(aus, code, p + 1, rexR, brM); aus.Text(", "c);
+      dis_modrmText(aus, code, p + 1, rexB, rexX, brM);
+    }
+    return (p + 1 + lMv) - pos;
+  }
+
+  if (op == 0x8D) {   // lea
+    var lL: int64 := dis_modrmLen(code, p + 1);
+    aus.Text("lea "c);
+    dis_regText(aus, code, p + 1, rexR, br); aus.Text(", "c);
+    dis_modrmText(aus, code, p + 1, rexB, rexX, br);
+    return (p + 1 + lL) - pos;
+  }
+
+  // Zeichenkettenbefehle. Der Codegen erzeugt `rep movsb` zum Kopieren.
+  if (op == 0xA4 || op == 0xA5 || op == 0xAA || op == 0xAB) {
+    if (prefF3 == 1) { aus.Text("rep "c); }
+    if (op == 0xA4) { aus.Text("movsb"c); }
+    else if (op == 0xA5) { if (br == 0) { aus.Text("movsq"c); } else { aus.Text("movsd"c); } }
+    else if (op == 0xAA) { aus.Text("stosb"c); }
+    else { if (br == 0) { aus.Text("stosq"c); } else { aus.Text("stosd"c); } }
+    return (p + 1) - pos;
+  }
+
+  if (op == 0x90) { aus.Text("nop"c); return (p + 1) - pos; }
+  if (op == 0x98) { if (br == 0) { aus.Text("cdqe"c); } else { aus.Text("cwde"c); } return (p + 1) - pos; }
+  if (op == 0x99) { if (br == 0) { aus.Text("cqo"c); } else { aus.Text("cdq"c); } return (p + 1) - pos; }
+
+  if (op == 0xA8) { aus.Text("test al, "c); aus.Zahl(peek8(code + p + 1)); return (p + 2) - pos; }
+  if (op == 0xA9) {
+    aus.Text("test "c);
+    if (br == 0) { aus.Text("rax, "c); } else { aus.Text("eax, "c); }
+    aus.Zahl(dis_imm32(code, p + 1));
+    return (p + 5) - pos;
+  }
+
+  if (op >= 0xB0 && op <= 0xB7) {   // mov r8, imm8
+    aus.Text("mov "c); aus.Text(dis_reg8((op - 0xB0) | (rexB << 3)));
+    aus.Text(", "c); aus.Zahl(peek8(code + p + 1));
+    return (p + 2) - pos;
+  }
+
+  if (op >= 0xB8 && op <= 0xBF) {   // mov r, imm — mit REX.W acht Byte
+    var rB: int64 := (op - 0xB8) | (rexB << 3);
+    if (rexW == 1) {
+      // Hexadezimal: ein 64-Bit-Direktwert ist beim Lesen fast immer eine
+      // Adresse oder ein Bitmuster (etwa die Vorzeichenmaske 0x8000...), und
+      // als Dezimalzahl sagt er dort nichts.
+      aus.Text("movabs "c); aus.Text(dis_reg64(rB)); aus.Text(", "c);
+      aus.HexPraefix(dis_imm64(code, p + 1), 16);
+      return (p + 9) - pos;
+    }
+    aus.Text("mov "c); aus.Text(dis_reg32(rB)); aus.Text(", "c);
+    aus.Zahl(dis_imm32(code, p + 1));
+    return (p + 5) - pos;
+  }
+
+  if (op == 0xC0 || op == 0xC1) {   // Schiebebefehl mit Direktwert
+    var lSh: int64 := dis_modrmLen(code, p + 1);
+    var subS: int64 := (peek8(code + p + 1) >> 3) & 7;
+    var brS: int64 := br; if (op == 0xC0) { brS := 2; }
+    aus.Text(dis_schiebe(subS)); aus.Text(" "c);
+    dis_modrmText(aus, code, p + 1, rexB, rexX, brS); aus.Text(", "c);
+    aus.Zahl(peek8(code + p + 1 + lSh));
+    return (p + 2 + lSh) - pos;
+  }
+  if (op == 0xD0 || op == 0xD1 || op == 0xD2 || op == 0xD3) {
+    var lSh2: int64 := dis_modrmLen(code, p + 1);
+    var subS2: int64 := (peek8(code + p + 1) >> 3) & 7;
+    var brS2: int64 := br; if (op == 0xD0 || op == 0xD2) { brS2 := 2; }
+    aus.Text(dis_schiebe(subS2)); aus.Text(" "c);
+    dis_modrmText(aus, code, p + 1, rexB, rexX, brS2);
+    if (op == 0xD2 || op == 0xD3) { aus.Text(", cl"c); } else { aus.Text(", 1"c); }
+    return (p + 1 + lSh2) - pos;
+  }
+
+  if (op == 0xC3) { aus.Text("ret"c); return (p + 1) - pos; }
+  if (op == 0xC9) { aus.Text("leave"c); return (p + 1) - pos; }
+  if (op == 0xCC) { aus.Text("int3"c); return (p + 1) - pos; }
+
+  if (op == 0xC6 || op == 0xC7) {   // mov r/m, imm
+    var lCi: int64 := dis_modrmLen(code, p + 1);
+    var brC: int64 := br; if (op == 0xC6) { brC := 2; }
+    aus.Text("mov "c);
+    dis_modrmText(aus, code, p + 1, rexB, rexX, brC); aus.Text(", "c);
+    if (op == 0xC6) { aus.Zahl(peek8(code + p + 1 + lCi)); return (p + 2 + lCi) - pos; }
+    aus.Zahl(dis_imm32(code, p + 1 + lCi));
+    return (p + 5 + lCi) - pos;
+  }
+
+  if (op == 0xE8) {   // call rel32
+    var relC: int64 := dis_disp32(code, p + 1);
+    var lCa: int64 := (p + 5) - pos;
+    aus.Text("call "c); aus.HexPraefix(adr + lCa + relC, 16);
+    return lCa;
+  }
+  if (op == 0xE9) {   // jmp rel32
+    var relJ2: int64 := dis_disp32(code, p + 1);
+    var lJ2: int64 := (p + 5) - pos;
+    aus.Text("jmp "c); aus.HexPraefix(adr + lJ2 + relJ2, 16);
+    return lJ2;
+  }
+  if (op == 0xEB) {   // jmp rel8
+    var relJ3: int64 := dis_disp8(code, p + 1);
+    var lJ3: int64 := (p + 2) - pos;
+    aus.Text("jmp "c); aus.HexPraefix(adr + lJ3 + relJ3, 16);
+    return lJ3;
+  }
+
+  if (op == 0xF6 || op == 0xF7) {   // test/not/neg/mul/imul/div/idiv
+    var lG3: int64 := dis_modrmLen(code, p + 1);
+    var subG: int64 := (peek8(code + p + 1) >> 3) & 7;
+    var brG: int64 := br; if (op == 0xF6) { brG := 2; }
+    aus.Text(dis_gruppe3(subG)); aus.Text(" "c);
+    dis_modrmText(aus, code, p + 1, rexB, rexX, brG);
+    if (subG <= 1) {   // test hat einen Direktwert
+      aus.Text(", "c);
+      if (op == 0xF6) { aus.Zahl(peek8(code + p + 1 + lG3)); return (p + 2 + lG3) - pos; }
+      aus.Zahl(dis_imm32(code, p + 1 + lG3));
+      return (p + 5 + lG3) - pos;
+    }
+    return (p + 1 + lG3) - pos;
+  }
+
+  if (op == 0xFE || op == 0xFF) {
+    var lG5: int64 := dis_modrmLen(code, p + 1);
+    var subF: int64 := (peek8(code + p + 1) >> 3) & 7;
+    var brF: int64 := br; if (op == 0xFE) { brF := 2; }
+    if (subF == 0) { aus.Text("inc "c); }
+    else if (subF == 1) { aus.Text("dec "c); }
+    else if (subF == 2) { aus.Text("call "c); }
+    else if (subF == 3) { aus.Text("callf "c); }
+    else if (subF == 4) { aus.Text("jmp "c); }
+    else if (subF == 5) { aus.Text("jmpf "c); }
+    else { aus.Text("push "c); }
+    dis_modrmText(aus, code, p + 1, rexB, rexX, brF);
+    return (p + 1 + lG5) - pos;
+  }
+
+  aus.Text("db "c); aus.HexPraefix(op, 2);
+  aus.unbekannt := aus.unbekannt + 1;
+  return (p + 1) - pos;
+}
+
+// ---------------------------------------------------------------------------
+// Treiber
+// ---------------------------------------------------------------------------
+
+con DIS_LABEL_SZ:      int64 := 32;
+con DIS_LABEL_NAMELEN: int64 := 8;
+con DIS_LABEL_CODEOFF: int64 := 16;
+con DIS_LABEL_LINENUM: int64 := 24;
+
+// Marke, die genau bei diesem Codeoffset beginnt (-1, wenn keine).
+fn dis_labelAn(labelBuf: int64, labelCount: int64, off: int64): int64 {
+  var i: int64 := 0;
+  while (i < labelCount) {
+    if (peek64(labelBuf + i * DIS_LABEL_SZ + DIS_LABEL_CODEOFF) == off) { return i; }
+    i := i + 1;
+  }
+  return 0 - 1;
+}
+
+// Disassembliert `code` und gibt das Ergebnis aus.
+//
+//   pfad == 0        -> auf die Standardausgabe (--dump-asm)
+//   pfad != 0        -> in diese Datei (--emit-asm)
+//   mitZeilen != 0   -> Quellzeilen an den Funktionsanfaengen (--asm-listing)
+//
+// Rueckgabe: Zahl der nicht gedeuteten Bytes. 0 heisst, dass jede Stelle
+// gedeutet wurde und die Auflistung damit lueckenlos ist.
+pub fn disasm_x86(code: int64, codeLen: int64, basisAdr: int64,
+                  labelBuf: int64, labelCount: int64,
+                  mitZeilen: int64, pfad: pchar): int64 {
+  var aus: DisAus := new DisAus();
+
+  aus.Text("; Lyx-Disassemblat, "c); aus.Zahl(codeLen); aus.Text(" Byte ab "c);
+  aus.HexPraefix(basisAdr, 16); aus.Zeile();
+  aus.Text("; Nur der vom Codegen erzeugte Befehlsvorrat wird gedeutet."c); aus.Zeile();
+  aus.Zeile();
+
+  var pos: int64 := 0;
+  while (pos < codeLen) {
+    var li: int64 := dis_labelAn(labelBuf, labelCount, pos);
+    if (li >= 0) {
+      aus.Zeile();
+      var np: pchar := peek64(labelBuf + li * DIS_LABEL_SZ) as pchar;
+      var nl: int64 := peek64(labelBuf + li * DIS_LABEL_SZ + DIS_LABEL_NAMELEN);
+      var k: int64 := 0;
+      while (k < nl) { aus.Zeichen(StrCharAt(np, k)); k := k + 1; }
+      aus.Text(":"c);
+      if (mitZeilen != 0) {
+        var ln: int64 := peek64(labelBuf + li * DIS_LABEL_SZ + DIS_LABEL_LINENUM);
+        if (ln > 0) { aus.Text("                  ; Quelle Zeile "c); aus.Zahl(ln); }
+      }
+      aus.Zeile();
+    }
+
+    var adr: int64 := basisAdr + pos;
+    aus.Text("  "c); aus.Hex(adr, 16); aus.Text("  "c);
+
+    // Der Text entsteht erst nach der Laenge — deshalb wird die Stelle
+    // gemerkt, der Befehl gedeutet und der Bytesatz danach eingefuegt. Damit
+    // die Spalten stehen, kommen die Bytes VOR den Text: also erst deuten,
+    // dann in einen zweiten Puffer, dann zusammensetzen. Einfacher: die Bytes
+    // aus der ermittelten Laenge im zweiten Durchgang schreiben.
+    var textAb: int64 := aus.len;
+    var laenge: int64 := dis_befehl(aus, code, pos, codeLen, adr);
+    if (laenge <= 0) { laenge := 1; }
+
+    // Bytes vor den Text schieben: der Text steht ab textAb, also wird er
+    // nach hinten geruecht und die Bytesspalte davor gesetzt.
+    var textLen: int64 := aus.len - textAb;
+    var bytesSpalte: int64 := 24;          // 8 Byte je 3 Zeichen
+    aus.Wachse(textLen + bytesSpalte + 8);
+    var q: int64 := textLen - 1;
+    while (q >= 0) {
+      poke8(aus.puf + textAb + bytesSpalte + q, peek8(aus.puf + textAb + q));
+      q := q - 1;
+    }
+    var s: int64 := 0;
+    var geschrieben: int64 := 0;
+    while (s < laenge) {
+      if (s < 8) {
+        var by: int64 := peek8(code + pos + s);
+        var hi: int64 := (by >> 4) & 15;
+        var lo: int64 := by & 15;
+        if (hi < 10) { poke8(aus.puf + textAb + geschrieben, 48 + hi); } else { poke8(aus.puf + textAb + geschrieben, 87 + hi); }
+        if (lo < 10) { poke8(aus.puf + textAb + geschrieben + 1, 48 + lo); } else { poke8(aus.puf + textAb + geschrieben + 1, 87 + lo); }
+        poke8(aus.puf + textAb + geschrieben + 2, 32);
+        geschrieben := geschrieben + 3;
+      }
+      s := s + 1;
+    }
+    while (geschrieben < bytesSpalte) {
+      poke8(aus.puf + textAb + geschrieben, 32);
+      geschrieben := geschrieben + 1;
+    }
+    aus.len := aus.len + bytesSpalte;
+    aus.Zeile();
+
+    pos := pos + laenge;
+  }
+
+  if (aus.unbekannt > 0) {
+    aus.Zeile();
+    aus.Text("; ACHTUNG: "c); aus.Zahl(aus.unbekannt);
+    aus.Text(" Byte konnten nicht gedeutet werden."c); aus.Zeile();
+    aus.Text("; Ab der ersten solchen Stelle kann die Auflistung verschoben sein,"c); aus.Zeile();
+    aus.Text("; weil die Laenge des Befehls dort nicht feststand."c); aus.Zeile();
+  }
+
+  if (pfad == 0 as pchar) {
+    write(1, aus.puf, aus.len);
+  } else {
+    var fd: int64 := open(pfad, 577, 420);   // O_WRONLY|O_CREAT|O_TRUNC, 0644
+    if (fd < 0) {
+      EPrintStr("lyxc: Disassemblat: kann '"c); EPrintStr(pfad);
+      EPrintStrLn("' nicht schreiben"c);
+      return aus.unbekannt;
+    }
+    var ab: int64 := 0;
+    while (ab < aus.len) {
+      var n: int64 := write(fd, aus.puf + ab, aus.len - ab);
+      if (n <= 0) { ab := aus.len; } else { ab := ab + n; }
+    }
+    close(fd);
+  }
+  return aus.unbekannt;
+}

@@ -417,8 +417,11 @@ fn main(): int64 {
 # Enable linter warnings
 ./lyxc program.lyx --lint
 
-# Dump IR as pseudo-assembler
+# Disassemble the generated x86-64 code (to <output>.asm)
 ./lyxc program.lyx --emit-asm
+
+# Same, to standard output; with --asm-listing also the source lines
+./lyxc program.lyx --dump-asm
 
 # Show relocations and symbols
 ./lyxc program.lyx --dump-relocs

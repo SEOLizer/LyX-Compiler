@@ -292,7 +292,9 @@ fn hotLoop(data: pchar, len: int64): void { ... }
 | `--target=TARGET` | Target platform (linux, win64, arm64, macosx64, macos-arm64, esp32, riscv) |
 | `--arch=ARCH` | Architecture (x86_64, arm64, xtensa, riscv) |
 | `--target-energy=<1-5>` | Energy level (1=minimal, 5=extreme) |
-| `--emit-asm` | Output IR as pseudo-assembler |
+| `--emit-asm` | Write x86-64 disassembly of the generated code to `<output>.asm` |
+| `--dump-asm` | Same disassembly, to standard output |
+| `--asm-listing` | Disassembly annotated with source line numbers at function entries |
 | `--dump-relocs` | Show relocations and external symbols |
 | `--trace-imports` | Debug import resolution |
 | `--lint` | Enable linter warnings |

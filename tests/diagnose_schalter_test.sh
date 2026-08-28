@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/diagnose_schalter_test.sh — #1370 (zwei von sechs Schaltern).
+# tests/diagnose_schalter_test.sh — #1370 (--dump-relocs und --map-file).
 #
 # `--dump-relocs` und `--map-file` setzten ein Feld, das anschliessend niemand
 # las. Seit #1098 wurden sie laut abgewiesen statt still angenommen; jetzt
@@ -132,27 +132,41 @@ if [ -s "$TMP/p.map" ]; then
 fi
 
 # ===========================================================================
-# Gegenprobe: die drei noch offenen Schalter weisen weiterhin laut ab
+# Ein Schalter, der nichts tut, muss das sagen
 # ===========================================================================
 # Ein still angenommener Schalter ist schlimmer als ein abgewiesener (#1098).
-# Solange sie nichts tun, muessen sie das sagen.
 #
-# `--profile` stand hier bis 1.1.6D mit in der Liste und ist seither umgesetzt
-# (eigene Suite: tests/profile_schalter_test.sh). Uebrig sind die drei
-# asm-Schalter; sie brauchen einen Disassembler oder die Mnemonik zur
-# Emissionszeit und bleiben deshalb offen.
+# Hier stand die Gegenprobe fuer `--emit-asm`, `--dump-asm` und `--asm-listing`:
+# solange sie nichts taten, mussten sie abweisen. Mit 1.1.12D sind sie umgesetzt
+# (Disassembler in src/tools/disasm/x86.lyx, eigene Suite
+# tests/disasm_test.sh), und der Fall waere durch den Fix rot geworden — ein
+# Test, der voraussetzt, dass eine Luecke offen bleibt.
+#
+# `--profile` ist denselben Weg gegangen und stand bis 1.1.6D hier
+# (tests/profile_schalter_test.sh).
+#
+# Die REGEL bleibt und braucht nur einen Schalter, der noch offen ist:
+# `--trace` (#1526). Die trace-Builtins arbeiten ohnehin ohne Schalter, er
+# versprach eine Umschaltung, die es nicht gibt.
+if "$LYXC" --std-path="$ROOT" "$TMP/p.lyx" -o "$TMP/p2" --trace >/dev/null 2>&1; then
+  no "#1526: --trace weist ab, statt still angenommen zu werden" "wird angenommen"
+else
+  ok "#1526: --trace weist ab, statt still angenommen zu werden"
+fi
 
-offen_ok=1
+# Und die drei asm-Schalter werden jetzt angenommen. Was sie AUSGEBEN, misst
+# tests/disasm_test.sh gegen objdump; hier geht es nur um die Annahme.
+asm_ok=1
 for sch in --emit-asm --dump-asm --asm-listing; do
-  if "$LYXC" --std-path="$ROOT" "$TMP/p.lyx" -o "$TMP/p2" "$sch" >/dev/null 2>&1; then
-    offen_ok=0
-    echo "  ($sch wird angenommen, obwohl nicht umgesetzt)"
+  if ! "$LYXC" --std-path="$ROOT" "$TMP/p.lyx" -o "$TMP/p2" "$sch" >/dev/null 2>&1; then
+    asm_ok=0
+    echo "  ($sch wird abgewiesen, obwohl umgesetzt)"
   fi
 done
-if [ "$offen_ok" -eq 1 ]; then
-  ok "#1370: die drei offenen Schalter weisen weiterhin ab"
+if [ "$asm_ok" -eq 1 ]; then
+  ok "#1370: die drei asm-Schalter werden angenommen"
 else
-  no "#1370: die drei offenen Schalter weisen weiterhin ab" "siehe oben"
+  no "#1370: die drei asm-Schalter werden angenommen" "siehe oben"
 fi
 
 # Und ohne Schalter darf nichts davon erscheinen.

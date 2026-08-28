@@ -169,18 +169,17 @@ if [ -x "$TMP/o_x86" ]; then
   else no "mit --no-opt rechnet das Programm richtig" "rc=$rc statt 0"; fi
 fi
 
-# #1370: die noch offenen DREI sagen es, statt zu schweigen. --dump-relocs,
-# --map-file und seit 1.1.6E auch --profile sind umgesetzt und muessen
-# angenommen werden; geprueft wird ihr INHALT in
-# tests/diagnose_schalter_test.sh bzw. tests/profile_schalter_test.sh.
-for f in --emit-asm --dump-asm --asm-listing; do
-  out="$("$LYXC" "$TMP/rek.lyx" "$f" -o "$TMP/r" 2>&1)"
-  case "$out" in
-    *"nicht umgesetzt"*"#1370"*) ok "$f wird als nicht umgesetzt gemeldet" ;;
-    *) no "$f wird als nicht umgesetzt gemeldet" "$(echo "$out" | head -1)" ;;
-  esac
-done
-for f in --dump-relocs --map-file --profile; do
+# #1370: mit 1.1.12D sind ALLE SECHS umgesetzt. Bis dahin standen die drei
+# asm-Schalter hier als "muss abweisen" — der Fix haette diesen Fall rot
+# gemacht, ein Test, der voraussetzt, dass eine Luecke offen bleibt.
+#
+# Geprueft wird hier nur die Annahme; den INHALT messen
+# tests/disasm_test.sh (Befehlsgrenzen gegen objdump),
+# tests/diagnose_schalter_test.sh und tests/profile_schalter_test.sh.
+#
+# Die Regel "ein Schalter, der nichts tut, sagt es" bleibt gueltig und wird
+# an --trace gemessen (#1526), siehe tests/diagnose_schalter_test.sh.
+for f in --emit-asm --dump-asm --asm-listing --dump-relocs --map-file --profile; do
   if "$LYXC" "$TMP/rek.lyx" "$f" -o "$TMP/r" >/dev/null 2>&1; then
     ok "$f wird angenommen (umgesetzt)"
   else

@@ -72,10 +72,22 @@ cli_accepts "-wa und -we"           "-wa"
 cli_accepts "--target-energy=3"     "--target-energy=3"
 cli_accepts "--lint"                "--lint"
 
-# --emit-asm stand hier als Beispiel fuer "gueltig". Das war es nie: der
-# Schalter setzte ein Feld, das niemand liest (#1098). Seit 1.0.17F wird er
-# abgewiesen statt still geschluckt; die Umsetzung fuehrt #1370.
-cli_rejects "angenommener, aber nicht umgesetzter Schalter" "--emit-asm" "nicht umgesetzt"
+# --emit-asm stand hier zuerst als Beispiel fuer "gueltig". Das war es nicht:
+# der Schalter setzte ein Feld, das niemand liest (#1098). Ab 1.0.17F wurde er
+# deshalb abgewiesen — und dieser Test hielt genau diesen Zwischenzustand fest.
+#
+# Seit 1.1.12D ist er UMGESETZT (#1370, Disassembler in src/tools/disasm/x86.lyx),
+# und der Fall waere durch den Fix rot geworden: ein Test, der voraussetzt, dass
+# eine Luecke offen bleibt. Er prueft jetzt das Gegenteil.
+cli_accepts "--emit-asm"            "--emit-asm"
+cli_accepts "--dump-asm"            "--dump-asm"
+cli_accepts "--asm-listing"         "--asm-listing"
+
+# Die ABSICHT der alten Zeile bleibt gueltig und braucht nur ein Beispiel, das
+# noch offen ist: ein Schalter, der ein Feld setzt, das niemand liest, muss
+# abweisen statt Erfolg zu melden. `--trace` ist dieser Fall (#1526) — die
+# trace-Builtins arbeiten ohnehin ohne Schalter.
+cli_rejects "angenommener, aber nicht umgesetzter Schalter" "--trace" "nicht umgesetzt"
 
 # ===========================================================================
 # #1164 — globale Startwerte

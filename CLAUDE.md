@@ -15,8 +15,22 @@ Korrektheit gekostet. Ausführliche Belege im Bug-Store — hier nur der Auslös
 - **Patch bricht den Selbstbau:** erst `git stash` + beiseitegelegte
   Compiler-Kopie (Flakiness vs. Regress trennen), dann halbieren
   (Aufrufstelle aus → Rumpf tot → Rumpf in Hälften).
+- **Ältere Meldung erst nachmessen, Prämisse eingeschlossen.** Von fünf Issues
+  einer Runde war genau eines ein offener Defekt in der beschriebenen Form:
+  #1815 war kernelseitig behoben, #1748 nicht mehr reproduzierbar, #1823 nannte
+  einen Namen, den es gibt (`process.exec`), #1820 zwölf „fehlende" Funktionen,
+  von denen acht nur anders heißen. Stimmt die Prämisse nicht, im Issue
+  richtigstellen — wer später sucht, liest den Titel.
+- **Fremdmeldung an der ORIGINALQUELLE prüfen**, mit zurückgedrehter Umgehung.
+  Eine nachgebaute Minimalfassung mit denselben Zutaten übersetzte fehlerfrei;
+  erst `vegagrid/metrics.lyx` selbst, von rohen Blöcken zurück auf `TIntArray`,
+  war aussagekräftig (#1748). Fremdes Projekt nur lesen, Kopie ins Scratchpad.
+- **Neuer Code beim ERSTEN Lauf unter `ulimit -v`.** Ohne Deckel trifft ein
+  Fehler nicht nur den eigenen Prozess: der OOM-Killer sucht sich den größten
+  Verbraucher im System. Der Disassembler aus #1370 lief in eine endlose
+  Rekursion und hat dabei eine fremde Konsole mitgerissen.
 
-## Die zwei häufigsten Ursachen
+## Die häufigsten Ursachen
 
 **Stiller Default** — ein Catch-all, der etwas Plausibles tut statt zu melden,
 macht aus jeder Lücke stille Fehlfunktion. Belegt: 16 verworfene Opcodes samt
@@ -56,12 +70,32 @@ Objekt."** Dann nicht nach einem Rechenfehler suchen, sondern fragen, welche
 zwei getrennte Aufzählungen derselben Sache; eine neue Speicherart muss in
 **beide**.
 
+**Eine Präfixprüfung vergibt Rechte zu weit** — sie trifft auch jeden Namen,
+den es noch gar nicht gibt, und die Wirkung fällt erst am Gerät auf. Dreimal
+belegt: `audio` (5 Zeichen) hätte jedem künftigen `audio.*` still das
+Mikrofonbit gegeben (#1826); `process` (7 Zeichen) traf alle fünf Namen, sodass
+`@capabilities([process.exit])` `LBF_CAP_PROC_SPAWN` und damit `PLEDGE_EXEC`
+setzte — „darf sich beenden" wurde zu „darf Programme starten" (#1823). Dazu
+zwei tote Zweige `net.`/`proc.` ohne jeden deklarierbaren Namen.
+→ In Rechtezuordnungen exakte Namen. Zum Prüfen jeden deklarierbaren Namen
+EINZELN übersetzen und das Bit am Erzeugnis lesen, statt der Tabelle zu glauben.
+
 ## Tests
 
 - **Den Weg prüfen, nicht das Ergebnis**, wenn der Defekt in der Ausführung
   liegt: Auswertungen zählen, Reihenfolgen vergleichen, Zweige über einen
   Seiteneffekt identifizieren. Prüffrage: *wäre der Test vor dem Fix rot?*
   Dreimal in Folge wäre ein Ergebnistest grün gewesen (`case _`, `&&`, `defer`).
+- **Ein Test, der nur eine INVARIANTE prüft, ist blind für das falsche Ergebnis
+  darin.** „Wert liegt in [-1,1]", „Opcode steht in der Liste", „Datei
+  entsteht", „Rückgabewert plausibel" — jede dieser vier Prüfungen hat einen
+  echten Defekt jahrelang verdeckt: `SinF64(1e16)` lieferte `sin(2)` und lag
+  brav im Wertebereich (#1829); `WriteString` schrieb einen Beispieltext und
+  meldete dessen Länge (#1827). Den WERT messen, die WIRKUNG, nicht das
+  Vorhandensein.
+- **Beide Seiten messen.** Ein Test, der belegt, dass die richtigen Namen ein
+  Recht setzen, wäre auch von einer viel zu weiten Zuordnung erfüllt; er muss
+  zusätzlich zeigen, dass die anderen es NICHT setzen (#1823).
 - **„Opcode behandelt" ist keine Aussage über „richtig behandelt".** Eine Liste,
   die Vorhandensein prüft, meldet den *fehlenden* Opcode laut und übersieht den
   falschen Rumpf: `xt_opBehandelt` führte `IRO_DIV`, der Rumpf war `MOVI T0, 0`
@@ -97,6 +131,13 @@ zwei getrennte Aufzählungen derselben Sache; eine neue Speicherart muss in
 
 - **Fixpunkt gen2 == gen3** (SHA-256), `make test` 0 FAIL, `make test-lyx`
   0 unerwartet rot; bei Codegen-Änderungen zusätzlich der Beispiel-Sweep.
+- **Den Lauf abkoppeln, nicht als Hintergrundaufgabe starten:**
+  `setsid nohup bash -c 'ulimit -c 0; make test; echo "RC=$?"' > lauf.log 2>&1 &`,
+  am Werkzeug bleibt nur ein Beobachter. Zweimal wurde ein `make test` ohne
+  jede Ausgabe getötet — je rund 40 Minuten verloren. Filter eng fassen
+  (`[1-9][0-9]* FAIL`), sonst meldet jede „0 FAIL"-Zeile.
+- **Während eines Laufs NICHT bauen.** `make bootstrap` tauscht `./lyxc` mitten
+  in der Messung aus; genau so ist einmal ein ganzer Nachweis wertlos geworden.
 - **Codegen-Änderung heißt Seed neu verankern.** `make singularity` (S3 == S4)
   wird sonst rot: S3 trägt die Bytes des alten Seeds. Fixpunkt nach
   `src/lyxc_bootstrap` kopieren, `make singularity` muss SINGULAR melden.
@@ -126,6 +167,12 @@ Suffix auf `A`. Der **Suffix** zählt die Kompilate innerhalb des Tages —
 
 - **Nie `&`/`|` in Vergleichsketten** — `a >= 265 & a <= 284` parst C-artig als
   `a >= (265 & a) <= 284`.
+- **`0 - n` ist keine Betragsfunktion.** Für den kleinstmöglichen int64 liefert
+  sie denselben Wert; `if (n < 0) { … 0 - n … }` rekursiert dort endlos. Genau
+  dieses Bitmuster emittiert der Codegen als f64-Vorzeichenmaske, es steht also
+  in fast jedem Erzeugnis — der Disassembler aus #1370 ist daran in eine
+  unbegrenzte Speicherbelegung gelaufen. 64-Bit-Werte ohnehin hexadezimal
+  ausgeben: es sind fast immer Adressen oder Bitmuster.
 - **String-Literale sind keine Schreibpuffer** (Speicherkorruption); `alloc()`.
 - **Zwei Allokatoren:** `std/alloc.lyx` (mmap je Allokation, `free` muss
   munmappen) vs. `src/std/alloc.lyx` (Arena, `free` korrekt No-op, vom Compiler
@@ -141,6 +188,26 @@ Suffix auf `A`. Der **Suffix** zählt die Kompilate innerhalb des Tages —
   Bug-Report beschreibt die Absicht des Melders, nicht die Sprache.
 - **Ein Workaround, der einen Fehler anderswo kompensiert, wird nach dem echten
   Fix selbst zum Bug** (`totalSlots`-Parität nach dem `_start`-Alignment).
+
+## Messsonden und ihre Grenzen
+
+- **Der lokale LBF-Lader** (`src.tools.lbf.loader`) führt lyxos-Abbilder unter
+  LINUX aus. LyxOS liefert Syscall-Ergebnisse in `rdx`, Linux in `rax` — alles,
+  was Speicher anfordert (allokierende Builtins, lokale Strukturen), bekommt
+  darüber eine Mülladresse und faultet, obwohl es auf dem Gerät läuft. Nur
+  Ganzzahlfälle so messen; sonst am Erzeugnis prüfen (Bytemuster, siehe
+  `tests/lyxos_builtin_ids_test.sh`) oder arm64/riscv nehmen — gemeinsamer
+  IR-Weg. Beim Vorbereiten von #1834 fiel die Sonde in beiden Formen aus.
+- **`--seccomp-trap` (#1348) ist der erste Griff bei SIGSYS** unter
+  `@capabilities`. Von außen ist die verworfene Nummer nicht bestimmbar: KILL
+  tötet vor dem ptrace-Stop, gdb bekommt keinen Stop, `dmesg` ist restricted.
+  Mit TRAP steht sie als `si_syscall` im strace (#1830). Nicht bisektieren.
+- **Ein Vergleich gegen `objdump`** braucht `-z` (sonst werden lange Nullfolgen
+  mit `...` abgekürzt und der Rest gar nicht disassembliert) und
+  `--no-show-raw-insn` (sonst zählen die Byte-Folgezeilen langer Befehle als
+  eigene Befehle). Ohne beides sah ein korrekter Dekodierer nach 947
+  Abweichungen aus (#1370). Verglichen werden die BEFEHLSGRENZEN, nicht der
+  Text: eine falsche Länge verschiebt alles danach.
 
 ## Git und Issues
 
