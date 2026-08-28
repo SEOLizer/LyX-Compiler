@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.12C
+VERSION   := 1.1.12D
 VERSION_DATE := 2026-08-28
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -284,6 +284,8 @@ test: lyxc
 	@bash tests/ir_struct_test.sh
 	@echo "--- `new` belegt die Objektgroesse, nicht eine Seite (#1836) ---"
 	@bash tests/new_speicher_test.sh
+	@echo "--- Disassemblat: Befehlsgrenzen gegen objdump (#1370) ---"
+	@bash tests/disasm_test.sh
 	@bash tests/iso_verzeichnisse_test.sh
 	@bash tests/win64_syscalls_test.sh
 	@bash tests/ir_argslots_test.sh

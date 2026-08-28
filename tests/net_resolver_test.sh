@@ -28,6 +28,18 @@ no() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
 cat > "$TMP/r.lyx" <<'EOF'
 import std.io;
 import std.net.dns;
+// ACHTUNG bei den Negativfaellen: was NICHT als Literal durchgeht, faellt in
+// GetHostByName bis zur echten Namensanfrage durch — und misst dann den
+// Resolver der Maschine, nicht unseren Parser.
+//
+// `1.2.3` stand hier und hat den Test wandern lassen: systemd-resolved
+// (127.0.0.53) beantwortet die Kurzform selbst mit 1.2.0.3 (inet_aton-Auslegung),
+// waehrend der Test 0.0.0.0 erwartete. Je nach Zustand des Stub-Resolvers war
+// derselbe Test gruen oder rot, ohne dass sich am Compiler etwas geaendert
+// haette. Der Fall ist deshalb raus.
+//
+// Uebrig bleiben zwei Negativfaelle, die kein Resolver beantwortet: ein
+// ungueltiges Oktett (999) und fuenf Teile.
 fn Z(h: pchar): void {
   var ip: int64 := GetHostByName(h as int64);
   PrintStr(IntToStr((ip >> 24) & 255)); PrintStr(".");
@@ -40,7 +52,6 @@ fn main(): int64 {
   Z("10.20.30.40"c);
   Z("255.255.255.255"c);
   Z("999.1.1.1"c);
-  Z("1.2.3"c);
   Z("1.2.3.4.5"c);
   PrintLn("");
   return 0;
@@ -49,7 +60,7 @@ EOF
 
 if "$LYXC" --std-path="$ROOT" "$TMP/r.lyx" -o "$TMP/r" >/dev/null 2>&1; then
   got="$(timeout 30 "$TMP/r" 2>&1)"
-  soll="127.0.0.1 10.20.30.40 255.255.255.255 0.0.0.0 0.0.0.0 0.0.0.0 "
+  soll="127.0.0.1 10.20.30.40 255.255.255.255 0.0.0.0 0.0.0.0 "
   if [ "$got" = "$soll" ]; then ok "#1330: literale IPv4 ohne Namensanfrage"
   else no "#1330: literale IPv4 ohne Namensanfrage" "'$got' erwartet '$soll'"; fi
 else
