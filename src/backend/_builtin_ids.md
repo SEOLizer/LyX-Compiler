@@ -60,6 +60,17 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 Cortex-M umgesetzt. Sie brauchen kein Betriebssystem und gelten deshalb auch
 im Windows- und im freistehenden Zweig.
 
+**Blockoperationen (210 `memcpy`/`MemCopy`, 216 `memset`/`MemSet`)** liegen
+daneben: drei Argumente ab `argBase`, Rückgabe ist der Zielzeiger (C-Semantik).
+Umgesetzt in lyxos (`rep movsb`/`rep stosb`), ARM64 und RISC-V (byteweise
+Schleife — wortweise bräuchte eine Ausrichtungsprüfung und brächte bei kurzen
+Puffern nichts). Xtensa und Cortex-M melden beide als Fehler.
+
+216 kam mit #1842 dazu: 210 war da, 216 nicht. Gemeldet wurde das als
+lyxos-Lücke, es traf aber jedes Ziel am gemeinsamen IR-Weg — ARM64 und RISC-V
+brachen mit derselben Meldung ab. **Wer eine Blockoperation ergänzt, zieht alle
+drei Backends nach**; die IDs sind eine Aufzählung, keine Einzelfälle.
+
 Eine nicht behandelte ID **muss laut scheitern**. Ein stiller Default-Zweig
 verwandelt jede Lücke in stille Fehlfunktion — dieselbe Klasse wie der
 LyxOS-Builtin-Misdispatch (PR #839) und der verworfene Opcode-Catch-all

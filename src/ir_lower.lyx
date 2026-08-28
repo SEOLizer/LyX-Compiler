@@ -1465,6 +1465,75 @@ pub type IRLower = class {
     if (self.nodeIVal(expr) == 2) {
       return self.lowerGenericCall(expr);
     }
+    // #1841: `super.M(args)` — der Parser baut daraus einen NK_CALL mit der
+    // Marke 3 und OHNE Empfaengerknoten (parser.lyx, #1091): der Name steht in
+    // sVal, `self` ist implizit. Ohne diesen Zweig fiel der Aufruf bis in die
+    // Builtin-Aufloesung durch und wurde als `unbekannter Builtin/Funktion: M`
+    // abgewiesen — auf JEDEM IR-Ziel, waehrend x86 (direkt aus dem AST) lief.
+    //
+    // Gerufen wird DIREKT die naechste Definition ab der ELTERNKLASSE, nie
+    // ueber die VMT: sonst riefe `super.F()` in einem `override fn F()` sich
+    // selbst, endlos. Dieselbe Zusicherung wie im x86-Codegen bei Marke 3.
+    //
+    // NK_SUPER_CALL (71) samt `lowerSuperCall` ist toter Altbestand — die
+    // Huelle emittierte nichts und wurde nie erreicht, weil der Parser den
+    // Knoten gar nicht erzeugt.
+    if (self.nodeIVal(expr) == 3) {
+      var spDest: int64 := self.allocTemp();
+      var spCls:  int64 := self._typeNodeToDecl(self.curMethodClassType);
+      if spCls < 0 {
+        EPrintStrLn("lyxc: super.: Methodenkontext unbekannt — der Aufruf steht ausserhalb einer Klasse."c);
+        exit(1);
+      }
+      // Elternklasse ueber `extends` (c2 = NK_TYPE_NAME), wie _resolveMethodIdx
+      // und _fieldOffsetIn es auch tun — die drei muessen uebereinstimmen.
+      var spPn: int64 := self.nodeC2(spCls);
+      if spPn < 0 {
+        EPrintStrLn("lyxc: super.: die Klasse hat keine Basisklasse."c);
+        exit(1);
+      }
+      var spBase: int64 := self._findTypeDecl(self.nodeSVal(spPn), self.nodeSLen(spPn));
+      var spNameP: pchar := self.nodeSVal(expr);
+      var spNameL: int64 := self.nodeSLen(expr);
+      var spIdx: int64 := 0 - 1;
+      if spBase >= 0 { spIdx := self._resolveMethodIdx(spBase, spNameP, spNameL); }
+      else {
+        // Importierte Basisklasse: ueber die globale Registry, denselben Weg
+        // wie die statische Dispatch weiter unten.
+        var spG: int64 := self._tregFind(self.nodeSVal(spPn), self.nodeSLen(spPn));
+        if spG >= 0 { spIdx := self._tregResolveMethodIdxG(spG, spNameP, spNameL); }
+      }
+      if spIdx < 0 {
+        // Die Namen im Baum sind NICHT nullterminiert — kopieren, wie es die
+        // Interface-Meldung weiter unten auch tut.
+        var spNb: int64 := alloc(spNameL + 1);
+        var spNi: int64 := 0;
+        while spNi < spNameL { poke8(spNb + spNi, peek8((spNameP as int64) + spNi)); spNi := spNi + 1; }
+        poke8(spNb + spNameL, 0);
+        EPrintStr("lyxc: super."c);
+        EPrintStr(spNb as pchar);
+        EPrintStrLn(": die Basisklasse hat diese Methode nicht."c);
+        exit(1);
+      }
+      // Arg-Block: self @ argBase, dann die expliziten Args — dieselbe
+      // Konvention wie beim Methodenaufruf darunter.
+      var spArgBase: int64 := self.tempCount;
+      var spRsv: int64 := 0;
+      while spRsv < 8 { self.allocTemp(); spRsv := spRsv + 1; }
+      var spSelf: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_LOCAL, spSelf, IR_BARG_SLOTS, -1, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, spArgBase, spSelf, -1, 0);
+      var spCnt: int64 := 1;
+      var spArg: int64 := self.nodeC1(expr);
+      while spArg >= 0 {
+        var spAT: int64 := self.lowerExpr(spArg);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, spArgBase + spCnt, spAT, -1, 0);
+        spCnt += 1;
+        spArg := self.nodeNext(spArg);
+      }
+      self.irAddInstrDirect(IRO_CALL, spDest, spIdx, spArgBase, spCnt);
+      return spDest;
+    }
     // ARM64-OOP: Methoden-Call (iVal=1): c0=Objekt, sVal=Methode, c1=Args.
     // Statische Dispatch: Klasse von c0 auflösen → mangled "Class_method" → IRO_CALL
     // mit self=Objekt als arg0, dann explizite Args (im argBase-Block, vgl. nested-call).
@@ -4527,6 +4596,19 @@ pub type IRLower = class {
       if mcA >= 0 { var t: int64 := self.lowerExpr(mcA); self.irAddInstrDirect(IRO_STORE_LOCAL, mcB + 1, t, -1, 0); mcA := self.nodeNext(mcA); }
       if mcA >= 0 { var t: int64 := self.lowerExpr(mcA); self.irAddInstrDirect(IRO_STORE_LOCAL, mcB + 2, t, -1, 0); }
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, mcB, -1, 210); return dest;
+    }
+    // #1842: memset(ptr, byte, len) — dieselbe Rechnung wie memcpy daneben, die
+    // beiden muessen uebereinstimmen (argBase-Konvention, Rueckgabe ist ptr).
+    // MemCopy war da, MemSet nicht: gemeldet wurde das als lyxos-Luecke, es
+    // trifft aber jedes Ziel ueber diesen Weg — arm64 und riscv brachen mit
+    // derselben Meldung ab.
+    if (self.seq(fname, fnlen, "memset", 6) || self.seq(fname, fnlen, "MemSet", 6)) {
+      var msB: int64 := self.tempCount; var msR: int64 := 0; while msR < 4 { self.allocTemp(); msR := msR + 1; }
+      var msA: int64 := arg0;
+      if msA >= 0 { var t: int64 := self.lowerExpr(msA); self.irAddInstrDirect(IRO_STORE_LOCAL, msB, t, -1, 0); msA := self.nodeNext(msA); }
+      if msA >= 0 { var t: int64 := self.lowerExpr(msA); self.irAddInstrDirect(IRO_STORE_LOCAL, msB + 1, t, -1, 0); msA := self.nodeNext(msA); }
+      if msA >= 0 { var t: int64 := self.lowerExpr(msA); self.irAddInstrDirect(IRO_STORE_LOCAL, msB + 2, t, -1, 0); }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, msB, -1, 216); return dest;
     }
     // lyxc→LyxOS Gruppe A: POSIX-File-Builtins → flache §10.4-Syscalls (KEIN dir_fd;
     // implementierter Kernel ist flach). Args in hohen argBase-Block, src1=argBase.
