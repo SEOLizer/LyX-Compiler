@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.12I
-VERSION_DATE := 2026-08-28
+VERSION   := 1.1.13A
+VERSION_DATE := 2026-08-29
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -284,6 +284,8 @@ test: lyxc
 	@bash tests/ir_struct_test.sh
 	@echo "--- Schreibweisen, die es nicht gibt (#1819) ---"
 	@bash tests/verrottete_syntax_test.sh
+	@echo "--- Projektdatei *.lpf ---"
+	@bash tests/lpf_projekt_test.sh
 	@echo "--- MemSet auf dem IR-Weg (#1842) ---"
 	@bash tests/memset_ir_test.sh
 	@echo "--- super.Methode() auf dem IR-Weg (#1841) ---"

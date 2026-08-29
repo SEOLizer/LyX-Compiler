@@ -58,6 +58,7 @@ import src.lic_build_flags;
 import src.std.alloc;
 import src.tooling.migrate_caps;
 import src.tooling.self_test;
+import src.projekt_lpf;   // Projektdatei *.lpf
 
 // ============================================================================
 // Compiler Constants
@@ -368,6 +369,8 @@ pub type CompilerConfig = class {
   // Positionsargument der Pfad ist. Frueher diente dafuer includePath selbst
   // mit dem Wert 1 — das ging nur, solange es genau EINEN Pfad gab.
   includePathWartet: int64;
+  envpPtr: int64;             // Umgebung des eigenen Prozesses (fuer `lpm`)
+  paketPfade: int64;          // Projektdatei: "name=pfad:name=pfad" (0 = keine)
 
   stdPath: int64;
   arch: int64;
@@ -619,6 +622,12 @@ pub type CompilerConfig = class {
   // ---------------------------------------------------------------------------
   
   fn parseCLI(argc: int64, argv: pchar): bool {
+    // envp liegt auf Linux x86_64 direkt hinter argv (argv + (argc+1)*8) —
+    // dieselbe Rechnung wie in lyx_getEnvVar. Gebraucht wird sie fuer den
+    // Aufruf von `lpm` aus einer Projektdatei: ohne PATH findet die Shell das
+    // Werkzeug nicht.
+    self.envpPtr := argv as int64 + (argc + 1) * 8;
+    self.paketPfade := 0;
     // Initialize ALL fields to known values (opts is embedded, not a pointer)
     // Memory from alloc may contain garbage
     self.inputFile := 0;
@@ -713,6 +722,19 @@ pub type CompilerConfig = class {
       i += 1;
     }
 
+    // Projektdatei (*.lpf): steht als Eingabe eine Projektdatei, wird sie
+    // JETZT gelesen — nach der Kommandozeile, damit ein Schalter dort die
+    // Datei ueberstimmt, und vor jeder Pruefung, damit `quelle` als Eingabe
+    // gilt.
+    if self.inputFile != 0 {
+      if self._istLpf(self.inputFile as pchar) {
+        if !self._lpfAnwenden(self.inputFile as pchar) {
+          self.exitCode := 2;
+          return false;
+        }
+      }
+    }
+
     // #1163: Ein beanstandetes Argument beendet den Lauf, statt etwas
     // anderes zu bauen als gemeint. Vor earlyExit geprueft, damit ein
     // Tippfehler neben --help nicht doch noch als Erfolg endet.
@@ -790,6 +812,172 @@ pub type CompilerConfig = class {
     while (j2 < nLen) { poke8(buf + aLen + 1 + j2, peek8((neu as int64) + j2)); j2 := j2 + 1; }
     poke8(buf + aLen + 1 + nLen, 0);
     return buf;
+  }
+
+  // Endet der Pfad auf ".lpf"? Grossschreibung wird mitgenommen.
+  fn _istLpf(pfad: pchar): bool {
+    var n: int64 := StrLen(pfad);
+    if n < 4 { return false; }
+    var b: int64 := pfad as int64;
+    if peek8(b + n - 4) != 46 { return false; }                       // '.'
+    var c1: int64 := peek8(b + n - 3);
+    var c2: int64 := peek8(b + n - 2);
+    var c3: int64 := peek8(b + n - 1);
+    if c1 >= 65 && c1 <= 90 { c1 := c1 + 32; }
+    if c2 >= 65 && c2 <= 90 { c2 := c2 + 32; }
+    if c3 >= 65 && c3 <= 90 { c3 := c3 + 32; }
+    if c1 != 108 { return false; }   // 'l'
+    if c2 != 112 { return false; }   // 'p'
+    if c3 != 102 { return false; }   // 'f'
+    return true;
+  }
+
+  // Haengt `basis` vor einen relativen Pfad. Absolute Pfade bleiben, wie sie
+  // sind. Relative Angaben in einer Projektdatei zaehlen vom Verzeichnis DER
+  // DATEI, nicht vom Arbeitsverzeichnis — sonst uebersetzt dieselbe Datei je
+  // nach Aufrufort etwas anderes.
+  fn _lpfPfad(basis: pchar, rel: pchar): pchar {
+    if (rel as int64) == 0 { return rel; }
+    if StrLen(rel) == 0 { return rel; }
+    if peek8(rel as int64) == 47 { return rel; }                      // '/'
+    var bLen: int64 := StrLen(basis);
+    if bLen == 1 { if peek8(basis as int64) == 46 { return rel; } }    // "."
+    var rLen: int64 := StrLen(rel);
+    var buf: int64 := alloc(bLen + 1 + rLen + 1);
+    var i: int64 := 0;
+    while i < bLen { poke8(buf + i, peek8((basis as int64) + i)); i := i + 1; }
+    poke8(buf + bLen, 47);
+    var j: int64 := 0;
+    while j < rLen { poke8(buf + bLen + 1 + j, peek8((rel as int64) + j)); j := j + 1; }
+    poke8(buf + bLen + 1 + rLen, 0);
+    return buf as pchar;
+  }
+
+  // Liest die Projektdatei und traegt ihren Inhalt ein. false = Abbruch.
+  //
+  // Reihenfolge und Vorrang: die Kommandozeile ist schon geparst, wenn das
+  // hier laeuft. Was dort gesetzt wurde (Ziel, Ausgabe), bleibt stehen — ein
+  // Schalter am Aufruf soll die Datei ueberstimmen koennen, sonst waere ein
+  // schneller Gegenversuch (`--target=linux`) nicht moeglich, ohne die Datei
+  // zu aendern. Include-Pfade und Schalter aus der Datei kommen HINZU.
+  fn _lpfAnwenden(lpfPfad: pchar): bool {
+    var pr: LpfProjekt := LpfLesen(lpfPfad);
+    if pr.gueltig == 0 {
+      EPrintStr("lyxc: Projektdatei nicht verwendbar: "c);
+      EPrintStrLn(lpfPfad);
+      return false;
+    }
+    var basis: pchar := pr.basis as pchar;
+
+    // Schalter zuerst — durch DENSELBEN Parser wie die Kommandozeile. Eine
+    // zweite Tabelle waere sofort veraltet; so gilt jeder Schalter, den lyxc
+    // kennt, ohne ihn hier noch einmal aufzuzaehlen.
+    var si: int64 := 0;
+    while si < pr.schalterN {
+      var sw: pchar := pr.SchalterAt(si);
+      var swLen: int64 := StrLen(sw);
+      if swLen >= 2 {
+        if peek8(sw as int64) == 45 {
+          if peek8((sw as int64) + 1) == 45 {
+            self.parseLongFlag(sw, swLen);
+          } else if peek8((sw as int64) + 1) == 73 {          // -I<pfad>
+            if swLen > 2 {
+              self.includePath := self._pfadAnhaengen(self.includePath,
+                                    self._lpfPfad(basis, (sw as int64 + 2) as pchar));
+            }
+          } else {
+            self.parseShortFlags(sw, swLen);
+          }
+        } else {
+          EPrintStr("lyxc: "c); EPrintStr(lpfPfad);
+          EPrintStr(": kein Schalter: "c); EPrintStrLn(sw);
+          EPrintStrLn("  In [schalter] stehen Schalter, wie sie auf der Kommandozeile stuenden."c);
+          return false;
+        }
+      }
+      si := si + 1;
+    }
+    if self.badArg {
+      EPrintStr("lyxc: "c); EPrintStr(lpfPfad);
+      EPrintStrLn(": ein Schalter aus [schalter] wurde abgewiesen (siehe Meldung darueber)."c);
+      return false;
+    }
+
+    // Include-Pfade
+    var pi: int64 := 0;
+    while pi < pr.pfadeN {
+      self.includePath := self._pfadAnhaengen(self.includePath,
+                            self._lpfPfad(basis, pr.PfadAt(pi)));
+      pi := pi + 1;
+    }
+
+    // Pakete ueber lpm aufloesen. Der Cache-Pfad wandert an den Include-Pfad.
+    // Fehlt ein Paket, wird das HIER gemeldet — spaeter erscheint es als
+    // "Modul nicht gefunden", ohne Bezug zur Projektdatei.
+    var qi: int64 := 0;
+    while qi < pr.paketeN {
+      var pn: pchar := pr.PaketNameAt(qi);
+      var pv: pchar := pr.PaketVerAt(qi);
+      var cache: pchar := LpfPaketAufloesen(pn, pv, self.envpPtr);
+      if (cache as int64) == 0 {
+        EPrintStr("lyxc: "c); EPrintStr(lpfPfad);
+        EPrintStr(": Paket nicht aufloesbar: "c); EPrintStr(pn);
+        EPrintStr(" "c); EPrintStrLn(pv);
+        EPrintStrLn("  `lpm resolve <name> <version>` hat keinen Pfad geliefert."c);
+        EPrintStrLn("  Fehlt das Paket im Cache, holt `lpm install` es; fehlt lpm selbst,"c);
+        EPrintStrLn("  gehoert der Pfad stattdessen unter [include]."c);
+        return false;
+      }
+      // Nicht als Include-Pfad: ein Paket liegt im Cache FLACH (`vega.types`
+      // ist dort `<cache>/types.lyx`, nicht `<cache>/vega/types.lyx`). Es
+      // wird deshalb als ZUORDNUNG gefuehrt, die beide Aufloeser kennen.
+      var pnLen: int64 := StrLen(pn);
+      var cLen:  int64 := StrLen(cache);
+      var eintrag: int64 := alloc(pnLen + 1 + cLen + 1);
+      var ei: int64 := 0;
+      while ei < pnLen { poke8(eintrag + ei, peek8((pn as int64) + ei)); ei := ei + 1; }
+      poke8(eintrag + pnLen, 61);                       // '='
+      var ej: int64 := 0;
+      while ej < cLen { poke8(eintrag + pnLen + 1 + ej, peek8((cache as int64) + ej)); ej := ej + 1; }
+      poke8(eintrag + pnLen + 1 + cLen, 0);
+      self.paketPfade := self._pfadAnhaengen(self.paketPfade, eintrag as pchar);
+      qi := qi + 1;
+    }
+
+    // Ziel und Ausgabe nur, wenn die Kommandozeile nichts gesagt hat.
+    if pr.ziel != 0 {
+      if self.target == 0 {
+        var zLen: int64 := StrLen(pr.ziel as pchar);
+        var zArg: int64 := alloc(9 + zLen + 1);
+        var zi: int64 := 0;
+        var zLit: pchar := "--target="c;
+        while zi < 9 { poke8(zArg + zi, peek8((zLit as int64) + zi)); zi := zi + 1; }
+        var zj: int64 := 0;
+        while zj < zLen { poke8(zArg + 9 + zj, peek8(pr.ziel + zj)); zj := zj + 1; }
+        poke8(zArg + 9 + zLen, 0);
+        self.parseLongFlag(zArg as pchar, 9 + zLen);
+        if self.badArg {
+          EPrintStr("lyxc: "c); EPrintStr(lpfPfad);
+          EPrintStr(": unbekanntes Ziel: "c); EPrintStrLn(pr.ziel as pchar);
+          return false;
+        }
+      }
+    }
+    if pr.ausgabe != 0 {
+      if self.outputFile == 0 {
+        self.outputFile := self._lpfPfad(basis, pr.ausgabe as pchar) as int64;
+      }
+    }
+
+    // Und zuletzt die Quelle: sie ersetzt die Projektdatei als Eingabe.
+    self.inputFile := self._lpfPfad(basis, pr.quelle as pchar) as int64;
+    if !FileExists(self.inputFile as pchar) {
+      EPrintStr("lyxc: "c); EPrintStr(lpfPfad);
+      EPrintStr(": `quelle` zeigt auf eine Datei, die es nicht gibt: "c);
+      EPrintStrLn(self.inputFile as pchar);
+      return false;
+    }
+    return true;
   }
 
   fn parseLongFlag(arg: pchar, argLen: int64): void {   // #1622
@@ -1312,7 +1500,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.1.12I"c);
+      PrintStrLn("1.1.13A"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1334,7 +1522,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.1.12I"c);
+      PrintStrLn("1.1.13A"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1563,10 +1751,11 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.1.12I (bootstrap)");
+    PrintStrLn("lyxc 1.1.13A (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
+    PrintStrLn("            lyxc <projekt.lpf>          (Projektdatei, siehe unten)");
     PrintStrLn("");
     PrintStrLn("Optionen:");
     PrintStrLn("  -o <datei>             Ausgabedatei (Standard: a.out)");
@@ -1582,9 +1771,9 @@ pub type CompilerConfig = class {
     PrintStrLn("  --shared               Kurzform fuer --output-type=shared-lib (ELF .so)");
     PrintStrLn("  --android-api=N        Android API-Level (21..34+, Default 26)");
     PrintStrLn("  --target-energy=<1-5>  Energy-Ziel (1=Minimal, 5=Extreme)");
-    PrintStrLn("  --emit-asm             NICHT UMGESETZT (#1370) — wird abgewiesen");
+    PrintStrLn("  --emit-asm             Assembler-Listing nach <ausgabe>.asm schreiben");
     PrintStrLn("  --emit=lbf             IR als .lbf-Bytecode ausgeben (nur --target=lyxos)");
-    PrintStrLn("  --asm-listing          NICHT UMGESETZT (#1370) — wird abgewiesen");
+    PrintStrLn("  --asm-listing          Listing mit Adressen und Bytes nach <ausgabe>.asm");
     PrintStrLn("  --dump-relocs          Relokationstabelle nach stdout");
     PrintStrLn("  --trace-imports        Import-Aufloesung debuggen");
     PrintStrLn("  --lint                 Linter-Warnungen aktivieren");
@@ -1617,6 +1806,25 @@ pub type CompilerConfig = class {
     PrintStrLn("  --debug-symbols        Debug-Info einbetten (Programm und .lyu)");
     PrintStrLn("  --unit-info <datei>    Info ueber .lyu-Datei anzeigen");
     PrintStrLn("  --include <hdr.h>      C-Header einlesen und extern-Deklarationen ausgeben");
+    PrintStrLn("");
+    PrintStrLn("Projektdatei (*.lpf):");
+    PrintStrLn("  lyxc projekt.lpf       Quelle, Schalter, Include-Pfade und Pakete stehen");
+    PrintStrLn("                         in der Datei. Ein Schalter am Aufruf ueberstimmt sie;");
+    PrintStrLn("                         relative Pfade zaehlen vom Verzeichnis der .lpf.");
+    PrintStrLn("");
+    PrintStrLn("    [projekt]");
+    PrintStrLn("    quelle  = \"apps/demo.lyx\"       # Pflicht");
+    PrintStrLn("    ziel    = \"lyxos\"               # wie --target=");
+    PrintStrLn("    ausgabe = \"build/demo.lbf\"      # wie -o");
+    PrintStrLn("");
+    PrintStrLn("    [include]");
+    PrintStrLn("    pfade = [\".\", \"platform/lyxos\"]");
+    PrintStrLn("");
+    PrintStrLn("    [schalter]");
+    PrintStrLn("    liste = [\"--emit=lbf\", \"-O2\"]");
+    PrintStrLn("");
+    PrintStrLn("    [pakete]");
+    PrintStrLn("    vega = \"0.3.1\"                 # via `lpm resolve` aufgeloest");
     PrintStrLn("");
     PrintStrLn("TOR-Optionen (DO-178C Tool Qualification):");
     PrintStrLn("  --version              Versionsnummer ausgeben (TOR-001)");
@@ -1763,6 +1971,7 @@ pub type CompilerConfig = class {
     var _srcLen: int64 := StrLen(source);
     sema.Init(source, _srcLen, parser.nodes, parser.nodeCount, parser.toks);
     sema.includePath    := self.includePath;   // WP-BC-42: -I search path
+    sema.paketPfade     := self.paketPfade;    // Projektdatei: Paketwurzeln
     sema.stdPath        := self.stdPath;       // WP-BC-42: --std-path override
     sema.typeReasoning  := self.typeReasoning; // WP-BC-46
     if self.traceImports { sema.traceImports := 1; } else { sema.traceImports := 0; }  // #1098
@@ -2241,6 +2450,7 @@ pub type CompilerConfig = class {
     // Arbeitsverzeichnis — mit `-I` uebersetzte dieselbe Datei fuer Linux
     // fehlerfrei und fuer lyxos gar nicht.
     lower.irIncludePath := self.includePath;
+    _irPaketPfade       := self.paketPfade as pchar;   // Projektdatei: Paketwurzeln
     lower.irStdPath     := self.stdPath;
     // #1845: Die IR-Strecke hatte keine Pass-Marken — bei einem 80-Sekunden-Lauf
     // waren 78 davon unbeobachtet, weil `--trace-passes` nach `analysis` endete.
@@ -5362,7 +5572,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.1.12I — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.1.13A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit

@@ -2,6 +2,52 @@
 
 ## Unveröffentlicht (develop)
 
+### NEU — Projektdatei `*.lpf`
+
+`lyxc projekt.lpf` liest Quelle, Ziel, Ausgabe, Include-Pfade, Schalter und
+benötigte LPM-Pakete aus einer Datei, statt sie an der Kommandozeile zu
+wiederholen. Format ist eine kleine TOML-Teilmenge; deutsche und englische
+Schlüssel sind gleichwertig.
+
+```toml
+[projekt]
+quelle  = "apps/vcldemo.lyx"
+ziel    = "lyxos"
+ausgabe = "build/vcldemo.lbf"
+
+[include]
+pfade = [".", "platform/lyxos"]
+
+[schalter]
+liste = ["--emit=lbf", "-O2"]
+
+[pakete]
+vega = "0.3.1"
+```
+
+- **Die Kommandozeile überstimmt die Datei** — `lyxc demo.lpf --target=linux`
+  ist ein Gegenversuch ohne Änderung an der Datei.
+- **Relative Pfade zählen vom Verzeichnis der `.lpf`**, nicht vom
+  Arbeitsverzeichnis; dieselbe Datei baut damit von überall dasselbe.
+- **Schalter laufen durch denselben Parser wie die Kommandozeile**, es gibt
+  also keine zweite, veraltende Schaltertabelle.
+- **Unbekannte Abschnitte und Schlüssel werden gemeldet**, nicht übergangen:
+  ein Tippfehler `[incldue]` verschlänge sonst alle Pfade darin und fiele erst
+  als „Modul nicht gefunden" auf.
+- **Pakete löst `lpm resolve <name> <version>` auf.** Damit ruft der Compiler
+  den Paketmanager erstmals selbst; entwickelt wird lpm im eigenständigen
+  Projekt `SEOLizer/lyx-lpm`, lyxc hängt nur am Programm. Ein Paket liegt im Cache
+  flach (`~/.lpm/cache/vega/0.3.1/types.lyx`), während seine Unit `vega.types`
+  heißt; die Zuordnung erfolgt deshalb über den Paketnamen und nicht über einen
+  Include-Pfad. Sie steht in `src/paket_pfade.lyx` einmal und wird von **beiden**
+  Auflösern benutzt (`sema` und `ir_lower`), die dieselbe Antwort geben müssen
+  (#1724).
+
+### Korrigiert — Hilfetext zu `--emit-asm` / `--asm-listing`
+
+Beide wurden dort weiterhin als „NICHT UMGESETZT (#1370) — wird abgewiesen"
+geführt, obwohl #1370 sie umgesetzt hat. Sie schreiben ein Listing nach
+`<ausgabe>.asm`.
 ### Entfernt — der Paketmanager `lpm/` aus diesem Repo
 
 Die Entwicklung von lpm findet im eigenständigen Projekt **`SEOLizer/lyx-lpm`**

@@ -280,6 +280,9 @@ fn hotLoop(data: pchar, len: int64): void { ... }
 ./lyxc program.lyx -o program.exe --target=win64
 ./lyxc program.lyx -o program --target=arm64
 ./lyxc program.lyx -o program --target=riscv
+
+# Or keep it all in a project file (see 3.3)
+./lyxc project.lpf
 ```
 
 ### 3.2 Command-Line Options
@@ -308,7 +311,50 @@ fn hotLoop(data: pchar, len: int64): void { ... }
 | `--build-info` | Show build identification (TOR-002) |
 | `--config` | Show configuration (TOR-003) |
 
-### 3.3 Target Platforms
+### 3.3 Project Files (`*.lpf`)
+
+A project file replaces a long command line. `lyxc project.lpf` reads the source
+to compile, the switches, the include paths and the required LPM packages from
+one place — reproducible and reviewable in Git.
+
+```toml
+[projekt]                            # or [project]
+quelle  = "apps/vcldemo.lyx"         # required — the .lyx to compile
+ziel    = "lyxos"                    # like --target=
+ausgabe = "build/vcldemo.lbf"        # like -o
+
+[include]
+pfade = [".", "platform/lyxos"]      # like -I, in order
+
+[schalter]                           # or [flags]
+liste = ["--emit=lbf", "-O2"]        # exactly as they would appear on the command line
+
+[pakete]                             # or [packages]
+vega = "0.3.1"                       # resolved through `lpm resolve`
+```
+
+German and English key names are both accepted (`quelle`/`source`,
+`ziel`/`target`, `ausgabe`/`output`, `pfade`/`paths`, `liste`/`flags`).
+Comments start with `#` or `//`.
+
+**Rules that matter in practice:**
+
+| Rule | Why |
+|---|---|
+| A switch on the command line **overrides** the project file | `lyxc demo.lpf --target=linux` gives a quick counter-check without editing the file |
+| Relative paths count from the **directory of the `.lpf`**, not the working directory | otherwise the same file would compile differently depending on where it is invoked |
+| Include paths and switches from the file are **added**, not replaced | `-I` on the command line stays in effect |
+| Unknown sections and keys are **reported**, not skipped | a typo in `[incldue]` would otherwise swallow every path in it and surface later as "Modul nicht gefunden" |
+| A package that cannot be resolved **fails the build** | with the package name and version, instead of a missing-module error further downstream |
+
+**Packages.** Each entry under `[pakete]` is resolved by running
+`lpm resolve <name> <version>`; the cache path it prints becomes a *package
+root*. A package is stored flat in the cache
+(`~/.lpm/cache/vega/0.3.1/types.lyx`) while its unit is called `vega.types`, so
+the mapping is by package name — a plain include path would not find it. If
+`lpm` is not installed, list the directory under `[include]` instead.
+
+### 3.4 Target Platforms
 
 | Target | Architecture | Format | ABI | Status |
 |--------|-------------|--------|-----|--------|

@@ -2,7 +2,7 @@
 
 > A self-hosting systems programming language focused on native code generation, predictable performance, minimal runtime dependencies, and built-in capability-based security.
 
-![Version](https://img.shields.io/badge/version-v1.1.12I-blue)
+![Version](https://img.shields.io/badge/version-v1.1.13A-blue)
 ![Status](https://img.shields.io/badge/status-self--hosting-success)
 ![Platform](https://img.shields.io/badge/linux-x86__64-success)
 ![Platform](https://img.shields.io/badge/linux-arm64-success)
@@ -372,6 +372,36 @@ The standard library is written entirely in Lyx. All modules are available as so
 | `std.android.apk_builder` | Android APK builder |
 | `std.android.zip_writer` | ZIP writer |
 | `std.qt5_core` | Qt5 Core bindings (Linux) |
+
+---
+
+## Project Files
+
+Longer builds go into a `*.lpf` project file instead of the command line:
+
+```toml
+[projekt]
+quelle  = "apps/demo.lyx"
+ziel    = "lyxos"
+ausgabe = "build/demo.lbf"
+
+[include]
+pfade = [".", "platform/lyxos"]
+
+[schalter]
+liste = ["--emit=lbf", "-O2"]
+
+[pakete]
+vega = "0.3.1"          # resolved through `lpm resolve`
+```
+
+```bash
+lyxc demo.lpf                     # everything from the file
+lyxc demo.lpf --target=linux      # a switch on the command line wins
+```
+
+Relative paths count from the directory of the `.lpf`, so the same project
+builds the same thing from anywhere. See COMPILER_MANUAL.md §3.3.
 
 ---
 
