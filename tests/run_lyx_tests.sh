@@ -8,10 +8,17 @@
 #   ./tests/run_lyx_tests.sh --timeout 30   # custom timeout in seconds (default: 60)
 #
 # A test passes when:
+#   - It has a .expected-error file → the COMPILE must fail and its message must
+#     contain the text from that file (#1153)
+#   - It has a .expected-exit file  → the exit code must be exactly that number
+#     (#1153; fuer Tests, die ihr Ergebnis ueber den Rueckgabewert melden)
 #   - It has a .expected file  → stdout must match (trailing newlines normalised)
-#   - It has no .expected file → exit code must be 0
+#   - It has no .expected file → exit code must be 0 (or 42, s.u.)
 #
 # Library units (no "fn main" in source) are skipped automatically.
+#
+# tests/lyx-geraet.txt fuehrt Tests, die ein GERAET oder einen DIENST brauchen
+# (Soundkarte, MySQL-Server): sie werden UEBERSETZT, aber nicht ausgefuehrt.
 #
 # Exit code: 0 if all tests pass, 1 if any fail.
 
@@ -70,6 +77,27 @@ if [[ -f "$KNOWN_RED_FILE" ]]; then
   done < "$KNOWN_RED_FILE"
 fi
 
+# #1153: Tests, die ein GERAET oder einen DIENST auf dem Rechner brauchen.
+# Sie werden uebersetzt, aber nicht ausgefuehrt — "uebersetzen ja, ausfuehren
+# nein".
+#
+# Warum nicht einfach in known-red.txt lassen: dort stehen DEFEKTE. Ein Test,
+# der eine Soundkarte braucht und keine findet, ist keiner — er misst nur, dass
+# dieser Rechner keine hat. In einer Liste mit echten Defekten verwaessert er
+# die Aussage, und niemand raeumt sie je ab.
+#
+# Das Uebersetzen bleibt scharf: bricht es ab, ist das ein FEHLSCHLAG. Genau
+# das haelt die Tests am Leben, waehrend ihr Lauf hier nichts messen kann.
+declare -A NUR_UEBERSETZEN=()
+GERAET_FILE="$REPO_ROOT/tests/lyx-geraet.txt"
+if [[ -f "$GERAET_FILE" ]]; then
+  while read -r line; do
+    line="${line%%#*}"; line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    NUR_UEBERSETZEN["$line"]=1
+  done < "$GERAET_FILE"
+fi
+
 # Ergebnis einer Pruefung verbuchen. Erst hier faellt die Entscheidung, damit
 # die KNOWN_RED-Behandlung an genau einer Stelle sitzt.
 verdict() {
@@ -118,6 +146,30 @@ run_test() {
     return
   fi
 
+  # #1153: Negativtest. Liegt neben der Datei ein .expected-error, MUSS die
+  # Uebersetzung scheitern und ihre Meldung den dort hinterlegten Text
+  # enthalten. Ohne diese Form sah ein Test, der eine Ablehnung prueft, wie ein
+  # kaputter Test aus — und landete in known-red.txt, wo er nichts zu suchen
+  # hat.
+  #
+  # Geprueft wird ein TEILSTRING, nicht der ganze Wortlaut: die Meldung darf
+  # sich weiterentwickeln, die Aussage nicht.
+  local error_file="${lyx_file%.lyx}.expected-error"
+  if [[ -f "$error_file" ]]; then
+    local want_err neg_out
+    want_err="$(cat "$error_file")"
+    want_err="${want_err#"${want_err%%[![:space:]]*}"}"
+    want_err="${want_err%"${want_err##*[![:space:]]}"}"
+    if neg_out=$(timeout "$TIMEOUT" "$LYXC" "$lyx_file" -o "$BIN" 2>&1); then
+      verdict fail "$rel" "[negativtest] uebersetzte klaglos, erwartet war: ${want_err}"
+    elif [[ "$neg_out" == *"$want_err"* ]]; then
+      verdict pass "$rel"
+    else
+      verdict fail "$rel" "[negativtest] andere Meldung als erwartet (${want_err})"
+    fi
+    return
+  fi
+
   # Compile
   local compile_err
   if ! compile_err=$(timeout "$TIMEOUT" "$LYXC" "$lyx_file" -o "$BIN" 2>&1); then
@@ -129,6 +181,14 @@ run_test() {
     else
       verdict fail "$rel" "[compile] ${msg}"
     fi
+    return
+  fi
+
+  # #1153: Geraet oder Dienst noetig — uebersetzt ist er, ausgefuehrt wird er
+  # nicht. Das Uebersetzen war die scharfe Haelfte und ist gerade gelungen.
+  if [[ -n "${NUR_UEBERSETZEN[$rel]+x}" ]]; then
+    echo -e "${YELLOW}GERAET${RESET} $rel  (uebersetzt; Ausfuehrung braucht Geraet/Dienst)"
+    KNOWN=$((KNOWN+1))
     return
   fi
 
@@ -145,6 +205,28 @@ run_test() {
     printf '%s' "$actual_stdout" > "$expected_file"
     echo -e "${GREEN}UPD  ${RESET} $rel  (exit:$actual_exit)"
     PASS=$((PASS+1))
+    return
+  fi
+
+  # #1153: Erwarteter Rueckgabewert. Manche Tests melden ihr Ergebnis ueber
+  # exit(), nicht ueber die Ausgabe — `as/test_defer_lifo` etwa rechnet die
+  # LIFO-Reihenfolge zu 2*16+1 = 33 aus und uebergibt sie an exit(). Der Runner
+  # kannte nur 0 (und seit #1696 die 42), also war ein solcher Test rot,
+  # obwohl er das Richtige tat.
+  #
+  # Die Zahl steht in einer eigenen Datei, NICHT im Quelltext-Kommentar: sie
+  # gehoert zur Pruefung, nicht zur Erklaerung. Und sie wird nur dort angelegt,
+  # wo der Test seinen Erwartungswert selbst herleitet — einen beobachteten
+  # Wert festzuschreiben hiesse, den Ist-Zustand zum Soll zu erklaeren.
+  local exit_file="${lyx_file%.lyx}.expected-exit"
+  if [[ -f "$exit_file" ]]; then
+    local want_exit
+    want_exit="$(tr -d '[:space:]' < "$exit_file")"
+    if [[ "$actual_exit" == "$want_exit" ]]; then
+      verdict pass "$rel"
+    else
+      verdict fail "$rel" "[exit=$actual_exit erwartet $want_exit]"
+    fi
     return
   fi
 
@@ -187,7 +269,7 @@ while IFS= read -r -d '' f; do
 done < <(find "$TEST_DIR" -name "*.lyx" -print0 | sort -z)
 
 echo ""
-echo "=== Results: $PASS passed, $KNOWN known red, $FAIL failed, $SKIP skipped ==="
+echo "=== Results: $PASS passed, $KNOWN known red/geraet, $FAIL failed, $SKIP skipped ==="
 if [[ -n "$UNEXPECTED_GREEN" ]]; then
   echo "Wieder gruen, Eintrag in tests/known-red.txt streichen:$UNEXPECTED_GREEN"
 fi
