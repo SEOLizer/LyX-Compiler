@@ -1142,6 +1142,18 @@ LogicalAndExpr      = BitwiseOrExpr
 BitwiseOrExpr       = BitwiseXorExpr
                       { ( "|" | "|~" ) BitwiseXorExpr } ;
 
+(* `|~` ist BITWEISES NOR: `a |~ b` entspricht `~(a | b)`. Auf Ganzzahlen ist
+   das nachrechenbar -- `12 |~ 10` = `~14` = `-15`.
+
+   Auf WAHRHEITSWERTEN ist es KEIN logisches NOR, und das ist die Falle:
+   `true |~ false` rechnet `~1` = `-2`, und alles ungleich 0 ist wahr. Wer
+   logisches NOR meint, schreibt `not (a or b)`. Ein Test in
+   `regression/operators/` hat sich genau daran verrechnet und war jahrelang
+   gruen, weil sein Fall `false |~ false` = `-1` zufaellig ebenfalls wahr ist
+   (#1819). Bis 1.0.x emittierte der Codegen fuer `|~` ausserdem gar nichts und
+   lieferte still 0 -- der Operator stand in Lexer und Parser, aber in keinem
+   Emit-Zweig. *)
+
 BitwiseXorExpr      = BitwiseAndExpr
                       { "^" BitwiseAndExpr } ;
 
@@ -1567,7 +1579,7 @@ Einzelbefunde sind dort verlinkt.
 | Bindendes Muster | 14 | `case x =>` (jeden Wert annehmen und an den Namen binden) ist **nicht umgesetzt und auch nicht vorgesehen**. Ein blanker Bezeichner ist ein VERWEIS auf eine Konstante, ein Enum-Mitglied oder eine lokale Variable; beide Lesarten zugleich gehen nicht, und auf der Verweis-Lesart beruhen die Enum-Muster. Wer jeden Wert annehmen will, schreibt `case _`. (#1024) |
 | `Set<T>` | 7 | Als Wort reserviert, von der Semantikpruefung nicht aufgeloest (`unknown type in var decl`). |
 | `Map<K,V>` | 14 | Benutzbar seit 1.0.15A (#1152/#1205): Literal, `m[k]` lesen und schreiben, `k in m`, `len(m)`, Deklaration ohne Initialisierung. Schluessel nur ganzzahlig — ein `pchar`-Schluessel wuerde ueber die Adresse verglichen und wird abgewiesen (#1291). Ein fehlender Schluessel liefert 0. `delete m[k]` und `for k, v in m` gibt es nicht. |
-| `new T[n]` (Heap-Array) | 15 | Der Compiler kann es, die Grammatik nennt es nicht: `NewExpr` fuehrt nur die Klammerform. Nachgemessen mit 1.1.6E — `new uint8[n]` und `new int64[4]` belegen Speicher, auch mit zur Laufzeit bestimmter Groesse, und die Zellen sind les- und schreibbar. Die Meldung "expected (, got [" aus der Erhebung zu #1254 (Stand 1.0.14J) trifft nicht mehr zu. Hier steht die Abweichung in der anderen Richtung als sonst in dieser Tabelle: nicht der Parser verspricht zu viel, sondern die Grammatik zu wenig. Die Produktion gehoert nachgezogen. |
+| `new T[n]` (Heap-Array) | 15 | **Erledigt** -- die Produktion ist nachgezogen: `NewExpr` fuehrt seit 1.0.16G beide Formen. Die Zeile stand hier, solange der Parser mehr konnte als die Grammatik nannte (nachgemessen mit 1.1.6E: `new uint8[n]` und `new int64[4]` belegen Speicher, auch mit zur Laufzeit bestimmter Groesse). Sie bleibt als Standvermerk stehen; eine Abweichung ist es nicht mehr. |
 | `&x` (Adress-Operator) | 15 | Gibt es nicht. Ein Ausgabeparameter wird als Zelle uebergeben (`alloc(8)`, danach `peek64`). (#1061) |
 | Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
 | Nullable-Suffix, Pruefung | 7 | `T?` wird geparst und am Typknoten vermerkt, loest aber KEINE zusaetzliche Pruefung aus: ein nicht-nullbarer Typ nimmt weiterhin `null` an, und ein nullbarer wird ohne `?.` ungeprueft dereferenziert. Das Suffix dokumentiert die Absicht, es erzwingt sie nicht. `?.` dagegen prueft zur Laufzeit. (#1092) |
