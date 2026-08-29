@@ -34,9 +34,9 @@ vega = "0.3.1"
 - **Unbekannte Abschnitte und Schlüssel werden gemeldet**, nicht übergangen:
   ein Tippfehler `[incldue]` verschlänge sonst alle Pfade darin und fiele erst
   als „Modul nicht gefunden" auf.
-- **Pakete löst `lpm resolve <name> <version>` auf.** Damit ist die
-  Compiler-Seite des Hooks aus WP-PM-07 geschlossen, die bis dahin fehlte — die
-  lpm-Seite wartete seit jeher auf einen Aufrufer. Ein Paket liegt im Cache
+- **Pakete löst `lpm resolve <name> <version>` auf.** Damit ruft der Compiler
+  den Paketmanager erstmals selbst; entwickelt wird lpm im eigenständigen
+  Projekt `SEOLizer/lyx-lpm`, lyxc hängt nur am Programm. Ein Paket liegt im Cache
   flach (`~/.lpm/cache/vega/0.3.1/types.lyx`), während seine Unit `vega.types`
   heißt; die Zuordnung erfolgt deshalb über den Paketnamen und nicht über einen
   Include-Pfad. Sie steht in `src/paket_pfade.lyx` einmal und wird von **beiden**
@@ -48,6 +48,22 @@ vega = "0.3.1"
 Beide wurden dort weiterhin als „NICHT UMGESETZT (#1370) — wird abgewiesen"
 geführt, obwohl #1370 sie umgesetzt hat. Sie schreiben ein Listing nach
 `<ausgabe>.asm`.
+### Entfernt — der Paketmanager `lpm/` aus diesem Repo
+
+Die Entwicklung von lpm findet im eigenständigen Projekt **`SEOLizer/lyx-lpm`**
+statt. Die Kopie hier war seit Längerem abgehängt und **übersetzte nicht mehr**:
+497 sema-Fehler, überwiegend veraltete Signaturen (`ReadFile`, `WriteFile`,
+`free`). Sie hing an keinem Make-Ziel und wurde von keinem Test berührt — also
+genau die Sorte Verfall, die #1819 in `tests/` abgetragen hat, nur außerhalb
+davon.
+
+Aufgefallen ist sie beim Anbinden der Projektdatei `*.lpf`: deren Kommentare
+verwiesen zunächst auf `lpm/compiler/hook.lyx` als Vertragsquelle, während
+gemessen wurde — richtigerweise — gegen das **installierte** Werkzeug. Wer den
+Vertrag nachlesen will, findet ihn im eigenständigen Projekt.
+
+Der Compiler selbst ruft `lpm` als Programm auf (`lpm resolve <name> <version>`)
+und hängt nicht an dessen Quelltext.
 
 ### BRUCH seit 1.0.x — Aufrufkonvention für `fn`-Zeiger (#1274)
 

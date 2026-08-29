@@ -131,16 +131,18 @@ else
 fi
 
 # --- #1571: lpm prueft wieder echte Signaturen ---------------------------
-if grep -q "immer OK" lpm/core/verify.lyx; then
-  bad "lpm ohne Stub-Signaturpruefung"
-else
-  ok "lpm ohne Stub-Signaturpruefung"
-fi
-if grep -q "^import std.crypto.ecc" lpm/core/verify.lyx; then
-  ok "lpm bindet std.crypto.ecc ein"
-else
-  bad "lpm bindet std.crypto.ecc ein"
-fi
+#
+# ENTFERNT: die beiden Pruefungen lasen `lpm/core/verify.lyx`. Der Baum ist aus
+# diesem Repo raus — die Entwicklung von lpm liegt im eigenstaendigen Projekt
+# SEOLizer/lyx-lpm, und die Kopie hier uebersetzte seit Langem nicht mehr.
+#
+# Stehen lassen ging nicht: `grep -q ... fehlende_datei` schlaegt fehl, der
+# else-Zweig meldet "ok", und die Pruefung waere GRUEN, ohne noch irgendetwas
+# zu messen — genau die Sorte Test, die #1819 abgetragen hat. Die Zusicherung
+# aus #1571 gehoert jetzt in die Testsuite von lyx-lpm.
+#
+# Was hier bleibt, misst weiterhin die Kryptobausteine SELBST (oben in dieser
+# Datei) — die liegen in std/crypto und sind von der Entfernung unberuehrt.
 
 echo "----"
 echo "$PASS PASS, $FAIL FAIL"
