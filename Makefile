@@ -282,6 +282,8 @@ test: lyxc
 	@bash tests/ir_match_test.sh
 	@echo "--- lokale Strukturen auf dem IR-Weg (#1835) ---"
 	@bash tests/ir_struct_test.sh
+	@echo "--- Schreibweisen, die es nicht gibt (#1819) ---"
+	@bash tests/verrottete_syntax_test.sh
 	@echo "--- MemSet auf dem IR-Weg (#1842) ---"
 	@bash tests/memset_ir_test.sh
 	@echo "--- super.Methode() auf dem IR-Weg (#1841) ---"
