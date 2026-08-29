@@ -2,6 +2,23 @@
 
 ## Unveröffentlicht (develop)
 
+### Entfernt — der Paketmanager `lpm/` aus diesem Repo
+
+Die Entwicklung von lpm findet im eigenständigen Projekt **`SEOLizer/lyx-lpm`**
+statt. Die Kopie hier war seit Längerem abgehängt und **übersetzte nicht mehr**:
+497 sema-Fehler, überwiegend veraltete Signaturen (`ReadFile`, `WriteFile`,
+`free`). Sie hing an keinem Make-Ziel und wurde von keinem Test berührt — also
+genau die Sorte Verfall, die #1819 in `tests/` abgetragen hat, nur außerhalb
+davon.
+
+Aufgefallen ist sie beim Anbinden der Projektdatei `*.lpf`: deren Kommentare
+verwiesen zunächst auf `lpm/compiler/hook.lyx` als Vertragsquelle, während
+gemessen wurde — richtigerweise — gegen das **installierte** Werkzeug. Wer den
+Vertrag nachlesen will, findet ihn im eigenständigen Projekt.
+
+Der Compiler selbst ruft `lpm` als Programm auf (`lpm resolve <name> <version>`)
+und hängt nicht an dessen Quelltext.
+
 ### BRUCH seit 1.0.x — Aufrufkonvention für `fn`-Zeiger (#1274)
 
 **Wer `fn`-Zeiger aus roher Maschinencode-Adresse baut, muss seinen Code
