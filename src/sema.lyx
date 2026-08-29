@@ -445,6 +445,17 @@ pub type Sema = class {
   // Geaendert wird stattdessen die SICHTBARKEIT beim Nachschlagen.
   symAliasPtr: int64;
   symAliasLen: int64;
+  // #1858: Ist das Symbol eine einmal bindende Deklaration (`let`, `co`, `con`)?
+  // Die Auskunft stand bisher nur im DEKLARATIONSKNOTEN, und den gibt es fuer
+  // ein importiertes Symbol im aktuellen Baum nicht — seit #1857 traegt es
+  // dort -2, und die Pruefung uebersprang es kommentarlos. Die Zuweisung an
+  // eine importierte `let`-Bindung ging deshalb durch; ueber Unit-Grenzen hat
+  // die Regel NIE gewirkt (auch vor #1857 nicht — dort traf sie nur zufaellig
+  // einen fremden Knoten und meldete Falsches).
+  //
+  // Wie symAliasPtr ein PARALLELES Feld: SEMA_SYM_SIZE haengt an mehreren
+  // Rechnungen und bleibt unangetastet.
+  symReadonly: int64;
   curAlias:    int64;   // Alias des gerade verarbeiteten Imports, 0 = keiner
   curAliasLen: int64;
 
@@ -655,12 +666,26 @@ pub type Sema = class {
     self.syms[self.symCount].typeId     := typeId;
     self.syms[self.symCount].nodeIdx    := nodeIdx;
     self.syms[self.symCount].isVolatile := 0;
+    if (self.symCount < self.privCap) { poke8(self.symReadonly + self.symCount, 0); }   // #1858
     if (self.symCount < self.privCap) {   // #1262
       poke64(self.symAliasPtr + self.symCount * 8, self.curAlias);
       poke64(self.symAliasLen + self.symCount * 8, self.curAliasLen);
     }
     poke64(self.syms + 8, self.symCount + 1);
     self.symCount += 1;
+  }
+
+  // #1858: Das zuletzt eingetragene Symbol als einmal bindend vermerken
+  // (`let`, `co`, `con`, Enum-Mitglied). Getrennt von _pushSym, damit dessen
+  // Signatur unveraendert bleibt — sie hat 27 Aufrufer.
+  fn _markReadonly() {
+    var i: int64 := self.symCount - 1;
+    if (i >= 0 && i < self.privCap) { poke8(self.symReadonly + i, 1); }
+  }
+
+  pub fn SymReadonly(i: int64): int64 {
+    if (i < 0 || i >= self.privCap) { return 0; }
+    return peek8(self.symReadonly + i);
   }
 
   // Register a builtin function (name = string literal pointer)
@@ -3760,6 +3785,7 @@ pub type Sema = class {
           }
         }
         self._pushSym(mName, mLen, SYM_CON, TY_INT64, mem);
+        self._markReadonly();                                 // #1858
         mem := self.sn_next(mem);
       }
     } else if (k == SNK_GENERIC_DECL) {
@@ -3767,10 +3793,16 @@ pub type Sema = class {
       self._pushSym(name, nlen, SYM_GENERIC_FUNC, TY_VOID, ni);
     } else if (k == SNK_CON_DECL) {
       self._pushSym(name, nlen, SYM_CON, TY_INT64, ni);
+      self._markReadonly();                                   // #1858
     } else if (k == SNK_VAR_DECL) {
       var typeNi: int64 := self.sn_c0(ni);
       var tid:    int64 := self.ResolveType(typeNi);
       self._pushSym(name, nlen, SYM_VAR, tid, ni);
+      // #1858: `let`/`co` binden einmal. Die Auskunft steht im Knoten und wird
+      // HIER abgeschrieben, solange er gilt — beim Import ist er spaeter nicht
+      // mehr erreichbar. Dieselbe Aufloesung wie bei _fnRecordSig (Signaturen)
+      // und _klsRecord (Klassen).
+      if ((self.sn_iVal(ni) & SEMA_VAR_FLAG_READONLY) != 0) { self._markReadonly(); }
     } else if (k == SNK_EXTERN_DATA) {
       // WSP-07: externes Daten-Symbol — als adress-typisierte Variable ohne
       // Initializer registrieren; IDENT-Auflösung + Typecheck laufen normal.
@@ -4492,6 +4524,11 @@ pub type Sema = class {
       }
       var varSi: int64 := self.symCount;
       self._pushSym(self.sn_sVal(ni), self.sn_sLen(ni), SYM_VAR, tid, ni);
+      // #1858: LOKALE `let`/`co`-Bindungen ebenso vermerken. Der erste Anlauf
+      // setzte den Vermerk nur im Top-Level-Pass; damit fielen genau die Faelle
+      // durch, die tests/*_test.sh seit #1083 bewachen — vier Pruefungen wurden
+      // rot. Die Auskunft steht auch hier im Knoten und wird hier abgeschrieben.
+      if ((self.sn_iVal(ni) & SEMA_VAR_FLAG_READONLY) != 0) { self._markReadonly(); }
       // WP-AS-18: propagate @volatile flag into symbol entry
       if ((self.sn_iVal(ni) & SEMA_VAR_FLAG_VOLATILE) != 0) {
         self.SetSymVolatile(varSi, 1);
@@ -4524,8 +4561,12 @@ pub type Sema = class {
       if (self.sn_kind(lval) == SNK_IDENT) {
         var rosi: int64 := self.Lookup(self.sn_sVal(lval), self.sn_sLen(lval));
         if (rosi >= 0 && self.SymKind(rosi) == SYM_VAR) {
-          var rodecl: int64 := self.SymNodeIdx(rosi);
-          if (rodecl >= 0 && (self.sn_iVal(rodecl) & SEMA_VAR_FLAG_READONLY) != 0) {
+          // #1858: Am SYMBOL gefuehrt, nicht am Knoten. Fuer ein importiertes
+          // Symbol gibt es den Deklarationsknoten hier nicht (seit #1857 -2),
+          // und die Pruefung lief ins Leere: `FREMD_FEST := 6` auf eine
+          // importierte `let`-Bindung uebersetzte fehlerfrei. Ueber
+          // Unit-Grenzen hat die Regel damit nie gewirkt.
+          if (self.SymReadonly(rosi) != 0) {
             self._errorNodeName("assignment to let/co binding not allowed", ni, self.sn_sVal(lval), self.sn_sLen(lval));
           }
         }
@@ -7773,6 +7814,9 @@ pub type Sema = class {
     self.symAliasLen := alloc(self.privCap * 8);
     var az: int64 := 0;
     while (az < self.privCap) { poke64(self.symAliasPtr + az * 8, 0); az := az + 1; }
+    self.symReadonly := alloc(self.privCap);        // #1858
+    var rz: int64 := 0;
+    while (rz < self.privCap) { poke8(self.symReadonly + rz, 0); rz := rz + 1; }
     self.privFlags  := alloc(self.privCap);
     self.privModPtr := alloc(self.privCap * 8);
     self.privModLen := alloc(self.privCap * 8);

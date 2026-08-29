@@ -87,5 +87,40 @@ else
   ok "eigene_con_wird_gemeldet"
 fi
 
+# ── #1858: ueber Unit-Grenzen muss die Regel WIRKEN ───────────────────────
+#
+# Die Gegenrichtung zu oben. Bis 1.1.13D stand die Auskunft "einmal bindend"
+# nur im Deklarationsknoten — den es fuer ein importiertes Symbol im aktuellen
+# Baum nicht gibt. Die Zuweisung an eine importierte `let`-Bindung ging
+# deshalb durch; gemessen auch mit dem Compiler VOR #1857, die Regel hat ueber
+# Unit-Grenzen also nie gewirkt. Seit #1858 wird sie am SYMBOL gefuehrt.
+printf 'unit fremd_fest;\npub let FREMD_FEST: int64 := 5;\npub con FREMD_KON: int64 := 9;\n' > "$TMP/fremd_fest.lyx"
+
+printf 'import fremd_fest;\nfn main(): int64 { FREMD_FEST := 6; return FREMD_FEST; }\n' > "$TMP/i1.lyx"
+if (cd "$TMP" && timeout 120 "$LYXC" --std-path="$ROOT" -I . i1.lyx -o i1 >"$TMP/i1.log" 2>&1); then
+  no "importierte_let_bindung_wird_gemeldet" "uebersetzte klaglos"
+else
+  grep -qi "let/co binding" "$TMP/i1.log" \
+    && ok "importierte_let_bindung_wird_gemeldet" \
+    || no "importierte_let_bindung_wird_gemeldet" "andere Meldung: $(grep -im1 error "$TMP/i1.log")"
+fi
+
+printf 'import fremd_fest;\nfn main(): int64 { FREMD_KON := 6; return FREMD_KON; }\n' > "$TMP/i2.lyx"
+if (cd "$TMP" && timeout 120 "$LYXC" --std-path="$ROOT" -I . i2.lyx -o i2 >"$TMP/i2.log" 2>&1); then
+  no "importierte_con_wird_gemeldet" "uebersetzte klaglos"
+else
+  ok "importierte_con_wird_gemeldet"
+fi
+
+# Und LESEN muss weiterhin gehen — sonst waere die Sperre zu weit.
+printf 'import fremd_fest;\nfn main(): int64 { return FREMD_FEST + FREMD_KON; }\n' > "$TMP/i3.lyx"
+if (cd "$TMP" && timeout 120 "$LYXC" --std-path="$ROOT" -I . i3.lyx -o i3 >"$TMP/i3.log" 2>&1); then
+  "$TMP/i3" >/dev/null 2>&1
+  [ $? -eq 14 ] && ok "importierte_bindungen_bleiben_lesbar" \
+                || no "importierte_bindungen_bleiben_lesbar" "falscher Rueckgabewert"
+else
+  no "importierte_bindungen_bleiben_lesbar" "$(grep -im1 error "$TMP/i3.log")"
+fi
+
 echo "== importierte_symbole_test: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
