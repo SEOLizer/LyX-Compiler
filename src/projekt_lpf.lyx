@@ -1,0 +1,492 @@
+// ===========================================================================
+// src/projekt_lpf.lyx — Projektdatei (*.lpf, LyxProjectFile)
+// ===========================================================================
+//
+// `lyxc projekt.lpf` statt einer Kommandozeile aus zehn Schaltern und vier
+// Include-Pfaden. Die Datei nennt die zu uebersetzende Quelle, die Schalter,
+// die Include-Verzeichnisse und die benoetigten LPM-Pakete samt Version.
+//
+// Format (TOML-Teilmenge, absichtlich klein):
+//
+//   [projekt]
+//   quelle  = "apps/vcldemo.lyx"
+//   ziel    = "lyxos"
+//   ausgabe = "build/vcldemo.lbf"
+//
+//   [include]
+//   pfade = ["." , "platform/lyxos"]
+//
+//   [schalter]
+//   liste = ["--emit=lbf", "-O2"]
+//
+//   [pakete]
+//   vega = "0.3.1"
+//
+// Die englischen Schluessel `project`/`source`/`target`/`output`/`paths`/
+// `flags`/`packages` werden ebenso angenommen — die Doku und die bestehenden
+// Werkzeuge sind englisch, die Fehlermeldungen deutsch, und beides soll hier
+// nicht gegeneinander stehen.
+//
+// ZWEITE STELLE, ABSICHTLICH: `lpm/core/manifest.lyx` liest ebenfalls eine
+// TOML-Teilmenge (fuer `lyx.toml`). Der Leser dort ist nicht exportiert und
+// traegt ein anderes Schema ([package]/[dependencies] eines PAKETS, nicht die
+// Bauanweisung eines PROJEKTS). Deshalb steht hier ein eigener, bewusst
+// winziger Leser: Abschnitte, Zeichenketten, Listen von Zeichenketten. Wer
+// eines der beiden Formate erweitert, sieht im anderen nach — sie sollen sich
+// nicht auseinanderentwickeln.
+//
+// Die Pakete loest `lpm resolve <name> <version>` auf; der Cache-Pfad von
+// dessen Standardausgabe wandert an den Include-Pfad. Genau darauf wartet
+// `lpm/compiler/hook.lyx` seit WP-PM-07 — die Compiler-Seite fehlte bis hier.
+
+unit src.projekt_lpf;
+
+import src.std.alloc;
+import src.std.fs;
+import src.std.string;
+import src.std.io;
+
+// ---------------------------------------------------------------------------
+// Grenzen. Ueberschreitungen melden, statt still abzuschneiden.
+// ---------------------------------------------------------------------------
+pub con LPF_MAX_EINTRAEGE: int64 := 128;   // je Liste (Pfade, Schalter, Pakete)
+pub con LPF_MAX_GROESSE:   int64 := 262144;
+
+// Abschnitts-Kennungen
+con ABS_KEINER:   int64 := 0;
+con ABS_PROJEKT:  int64 := 1;
+con ABS_INCLUDE:  int64 := 2;
+con ABS_SCHALTER: int64 := 3;
+con ABS_PAKETE:   int64 := 4;
+
+pub type LpfProjekt = class {
+  quelle:      int64;   // pchar — zu uebersetzende .lyx-Datei (Pflicht)
+  ziel:        int64;   // pchar — --target=..., 0 wenn nicht gesetzt
+  ausgabe:     int64;   // pchar — -o ..., 0 wenn nicht gesetzt
+
+  pfade:       int64;   // Feld aus pchar (Include-Verzeichnisse)
+  pfadeN:      int64;
+  schalter:    int64;   // Feld aus pchar (roh, wie auf der Kommandozeile)
+  schalterN:   int64;
+  paketName:   int64;   // Feld aus pchar
+  paketVer:    int64;   // Feld aus pchar (gleiche Laenge wie paketName)
+  paketeN:     int64;
+
+  gueltig:     int64;   // 1 = gelesen und vollstaendig
+  basis:       int64;   // pchar — Verzeichnis der .lpf, relative Pfade zaehlen von hier
+
+  fn Create(): void {
+    self.quelle := 0; self.ziel := 0; self.ausgabe := 0;
+    self.pfade := alloc(LPF_MAX_EINTRAEGE * 8); self.pfadeN := 0;
+    self.schalter := alloc(LPF_MAX_EINTRAEGE * 8); self.schalterN := 0;
+    self.paketName := alloc(LPF_MAX_EINTRAEGE * 8);
+    self.paketVer := alloc(LPF_MAX_EINTRAEGE * 8);
+    self.paketeN := 0;
+    self.gueltig := 0;
+    self.basis := 0;
+  }
+
+  fn PfadAt(i: int64): pchar    { return peek64(self.pfade + i * 8) as pchar; }
+  fn SchalterAt(i: int64): pchar { return peek64(self.schalter + i * 8) as pchar; }
+  fn PaketNameAt(i: int64): pchar { return peek64(self.paketName + i * 8) as pchar; }
+  fn PaketVerAt(i: int64): pchar  { return peek64(self.paketVer + i * 8) as pchar; }
+};
+
+// ---------------------------------------------------------------------------
+// Kleine Lesehilfen. Alle arbeiten auf einem Puffer mit Laenge, nicht auf
+// nullterminierten Zeigern: die Datei wird am Stueck gelesen.
+// ---------------------------------------------------------------------------
+
+// Gibt die Position des naechsten Zeilenendes ab `von` (oder `len`).
+fn lpfZeilenende(buf: int64, len: int64, von: int64): int64 {
+  var i: int64 := von;
+  while i < len {
+    if peek8(buf + i) == 10 { return i; }
+    i := i + 1;
+  }
+  return len;
+}
+
+fn lpfIstLeer(c: int64): int64 {
+  if c == 32 { return 1; }
+  if c == 9  { return 1; }
+  if c == 13 { return 1; }
+  return 0;
+}
+
+// Erste Nicht-Leerstelle ab `von`, hoechstens bis `bis`.
+fn lpfVorn(buf: int64, von: int64, bis: int64): int64 {
+  var i: int64 := von;
+  while i < bis {
+    if lpfIstLeer(peek8(buf + i)) == 0 { return i; }
+    i := i + 1;
+  }
+  return bis;
+}
+
+// Letzte Nicht-Leerstelle vor `bis` (exklusiv), mindestens `von`.
+fn lpfHinten(buf: int64, von: int64, bis: int64): int64 {
+  var i: int64 := bis;
+  while i > von {
+    if lpfIstLeer(peek8(buf + i - 1)) == 0 { return i; }
+    i := i - 1;
+  }
+  return von;
+}
+
+// Kopiert buf[von..bis) nullterminiert heraus.
+fn lpfAusschnitt(buf: int64, von: int64, bis: int64): pchar {
+  var n: int64 := bis - von;
+  if n < 0 { n := 0; }
+  var z: int64 := alloc(n + 1);
+  var i: int64 := 0;
+  while i < n { poke8(z + i, peek8(buf + von + i)); i := i + 1; }
+  poke8(z + n, 0);
+  return z as pchar;
+}
+
+// Vergleicht buf[von..bis) gegen ein Literal (nullterminiert).
+fn lpfGleich(buf: int64, von: int64, bis: int64, lit: pchar): int64 {
+  var n: int64 := bis - von;
+  var m: int64 := StrLen(lit);
+  if n != m { return 0; }
+  var i: int64 := 0;
+  while i < n {
+    if peek8(buf + von + i) != peek8((lit as int64) + i) { return 0; }
+    i := i + 1;
+  }
+  return 1;
+}
+
+// Schaelt Anfuehrungszeichen ab, falls vorhanden. Ohne sie bleibt der Wert
+// stehen — `ziel = lyxos` soll genauso gehen wie `ziel = "lyxos"`.
+fn lpfEntquoten(buf: int64, vonP: int64, bisP: int64, ausVon: int64, ausBis: int64): void {
+  var von: int64 := vonP;
+  var bis: int64 := bisP;
+  if bis - von >= 2 {
+    var a: int64 := peek8(buf + von);
+    var b: int64 := peek8(buf + bis - 1);
+    if (a == 34 && b == 34) || (a == 39 && b == 39) { von := von + 1; bis := bis - 1; }
+  }
+  poke64(ausVon, von);
+  poke64(ausBis, bis);
+}
+
+// Haengt einen Zeiger an ein Feld an. Gibt 0 zurueck, wenn die Liste voll ist —
+// der Aufrufer meldet das. Ein stilles Abschneiden waere hier besonders
+// unangenehm: ein fehlender Include-Pfad erscheint spaeter als
+// "Modul nicht gefunden", weit weg von der Ursache.
+fn lpfAnhaengen(feld: int64, nP: int64, wert: int64): int64 {
+  var n: int64 := peek64(nP);
+  if n >= LPF_MAX_EINTRAEGE { return 0; }
+  poke64(feld + n * 8, wert);
+  poke64(nP, n + 1);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Der Leser
+// ---------------------------------------------------------------------------
+
+fn lpfMeldung(pfad: pchar, zeile: int64, text: pchar): void {
+  EPrintStr(pfad); EPrintStr(":"c); EPrintInt(zeile);
+  EPrintStr(": "c); EPrintStrLn(text);
+}
+
+// Verzeichnisanteil eines Pfades (ohne Schrägstrich am Ende); "." wenn keiner.
+pub fn LpfVerzeichnis(pfad: pchar): pchar {
+  var n: int64 := StrLen(pfad);
+  var i: int64 := n;
+  while i > 0 {
+    if peek8((pfad as int64) + i - 1) == 47 {
+      return lpfAusschnitt(pfad as int64, 0, i - 1);
+    }
+    i := i - 1;
+  }
+  return "."c;
+}
+
+// Liest die Projektdatei. Gibt das Projekt zurueck; `gueltig` sagt, ob es
+// benutzbar ist. Jede Abweichung wird GEMELDET, nicht uebergangen: eine
+// Projektdatei, die zur Haelfte gelesen wurde, uebersetzt sonst etwas
+// anderes als das, was dasteht.
+pub fn LpfLesen(pfad: pchar): LpfProjekt {
+  var p: LpfProjekt := new LpfProjekt();
+  p.basis := LpfVerzeichnis(pfad) as int64;
+
+  if !FileExists(pfad) {
+    lpfMeldung(pfad, 0, "Projektdatei nicht gefunden."c);
+    return p;
+  }
+  var src: pchar := FileReadAll(pfad);
+  if (src as int64) == 0 {
+    lpfMeldung(pfad, 0, "Projektdatei nicht lesbar."c);
+    return p;
+  }
+  var buf: int64 := src as int64;
+  var len: int64 := StrLen(src);
+  if len > LPF_MAX_GROESSE {
+    lpfMeldung(pfad, 0, "Projektdatei zu gross (Grenze 256 KB)."c);
+    return p;
+  }
+
+  var abschnitt: int64 := ABS_KEINER;
+  var zeile: int64 := 0;
+  var pos: int64 := 0;
+  var fehler: int64 := 0;
+
+  while pos < len {
+    zeile := zeile + 1;
+    var ende: int64 := lpfZeilenende(buf, len, pos);
+    var a: int64 := lpfVorn(buf, pos, ende);
+    var b: int64 := lpfHinten(buf, a, ende);
+
+    // Leerzeile oder Kommentar (# und //)
+    var leer: int64 := 0;
+    if a >= b { leer := 1; }
+    if leer == 0 {
+      if peek8(buf + a) == 35 { leer := 1; }
+      if b - a >= 2 { if peek8(buf + a) == 47 && peek8(buf + a + 1) == 47 { leer := 1; } }
+    }
+
+    if leer == 0 {
+      if peek8(buf + a) == 91 {          // '[' — Abschnitt
+        if peek8(buf + b - 1) != 93 {    // ']'
+          lpfMeldung(pfad, zeile, "Abschnitt ohne schliessende Klammer."c); fehler := 1;
+        } else {
+          var na: int64 := a + 1;
+          var nb: int64 := b - 1;
+          if lpfGleich(buf, na, nb, "projekt"c) == 1 || lpfGleich(buf, na, nb, "project"c) == 1 {
+            abschnitt := ABS_PROJEKT;
+          } else if lpfGleich(buf, na, nb, "include"c) == 1 {
+            abschnitt := ABS_INCLUDE;
+          } else if lpfGleich(buf, na, nb, "schalter"c) == 1 || lpfGleich(buf, na, nb, "flags"c) == 1 {
+            abschnitt := ABS_SCHALTER;
+          } else if lpfGleich(buf, na, nb, "pakete"c) == 1 || lpfGleich(buf, na, nb, "packages"c) == 1 {
+            abschnitt := ABS_PAKETE;
+          } else {
+            // Unbekannter Abschnitt: melden statt ueberlesen. Ein Tippfehler
+            // in `[incldue]` wuerde sonst alle Pfade darin verschlucken und
+            // spaeter als "Modul nicht gefunden" auftauchen.
+            EPrintStr(pfad); EPrintStr(":"c); EPrintInt(zeile);
+            EPrintStr(": unbekannter Abschnitt ["c);
+            EPrintStr(lpfAusschnitt(buf, na, nb));
+            EPrintStrLn("]. Bekannt: [projekt] [include] [schalter] [pakete]."c);
+            fehler := 1;
+          }
+        }
+      } else {
+        // Schluessel = Wert
+        var eq: int64 := a;
+        while eq < b { if peek8(buf + eq) == 61 { eq := b; } else { eq := eq + 1; } }
+        // eq zeigt jetzt entweder auf b (nicht gefunden) oder wurde gesetzt;
+        // deshalb noch einmal genau suchen.
+        var gl: int64 := 0 - 1;
+        var q: int64 := a;
+        while q < b {
+          if peek8(buf + q) == 61 { gl := q; q := b; } else { q := q + 1; }
+        }
+        if gl < 0 {
+          lpfMeldung(pfad, zeile, "Zeile ist weder Abschnitt noch `schluessel = wert`."c);
+          fehler := 1;
+        } else {
+          var kA: int64 := lpfVorn(buf, a, gl);
+          var kB: int64 := lpfHinten(buf, kA, gl);
+          var wA: int64 := lpfVorn(buf, gl + 1, b);
+          var wB: int64 := lpfHinten(buf, wA, b);
+
+          if abschnitt == ABS_KEINER {
+            lpfMeldung(pfad, zeile, "Eintrag vor dem ersten Abschnitt."c);
+            fehler := 1;
+          } else if abschnitt == ABS_PROJEKT {
+            var vA: int64 := alloc(8); var vB: int64 := alloc(8);
+            lpfEntquoten(buf, wA, wB, vA, vB);
+            var w: pchar := lpfAusschnitt(buf, peek64(vA), peek64(vB));
+            free(vA, 8); free(vB, 8);
+            if lpfGleich(buf, kA, kB, "quelle"c) == 1 || lpfGleich(buf, kA, kB, "source"c) == 1 {
+              p.quelle := w as int64;
+            } else if lpfGleich(buf, kA, kB, "ziel"c) == 1 || lpfGleich(buf, kA, kB, "target"c) == 1 {
+              p.ziel := w as int64;
+            } else if lpfGleich(buf, kA, kB, "ausgabe"c) == 1 || lpfGleich(buf, kA, kB, "output"c) == 1 {
+              p.ausgabe := w as int64;
+            } else {
+              EPrintStr(pfad); EPrintStr(":"c); EPrintInt(zeile);
+              EPrintStr(": unbekannter Schluessel `"c);
+              EPrintStr(lpfAusschnitt(buf, kA, kB));
+              EPrintStrLn("` in [projekt]. Bekannt: quelle, ziel, ausgabe."c);
+              fehler := 1;
+            }
+          } else if abschnitt == ABS_PAKETE {
+            var pvA: int64 := alloc(8); var pvB: int64 := alloc(8);
+            lpfEntquoten(buf, wA, wB, pvA, pvB);
+            var ver: pchar := lpfAusschnitt(buf, peek64(pvA), peek64(pvB));
+            free(pvA, 8); free(pvB, 8);
+            var nam: pchar := lpfAusschnitt(buf, kA, kB);
+            var nP: int64 := alloc(8); poke64(nP, p.paketeN);
+            if lpfAnhaengen(p.paketName, nP, nam as int64) == 0 {
+              lpfMeldung(pfad, zeile, "zu viele Pakete (Grenze 128)."c); fehler := 1;
+            } else {
+              poke64(p.paketVer + p.paketeN * 8, ver as int64);
+              p.paketeN := peek64(nP);
+            }
+            free(nP, 8);
+          } else {
+            // [include] pfade = [...]  /  [schalter] liste = [...]
+            //
+            // Der Schluesselname wird GEPRUEFT. Ohne die Pruefung ginge jeder
+            // Name durch, und die zugesagte Meldung bei Tippfehlern gaebe es
+            // nur fuer [projekt] — die Doku verspricht sie fuer die ganze
+            // Datei.
+            var schlOk: int64 := 0;
+            if abschnitt == ABS_INCLUDE {
+              if lpfGleich(buf, kA, kB, "pfade"c) == 1 { schlOk := 1; }
+              if lpfGleich(buf, kA, kB, "paths"c) == 1 { schlOk := 1; }
+            } else {
+              if lpfGleich(buf, kA, kB, "liste"c) == 1 { schlOk := 1; }
+              if lpfGleich(buf, kA, kB, "flags"c) == 1 { schlOk := 1; }
+              if lpfGleich(buf, kA, kB, "schalter"c) == 1 { schlOk := 1; }
+            }
+            if schlOk == 0 {
+              EPrintStr(pfad); EPrintStr(":"c); EPrintInt(zeile);
+              EPrintStr(": unbekannter Schluessel `"c);
+              EPrintStr(lpfAusschnitt(buf, kA, kB));
+              if abschnitt == ABS_INCLUDE {
+                EPrintStrLn("` in [include]. Bekannt: pfade (paths)."c);
+              } else {
+                EPrintStrLn("` in [schalter]. Bekannt: liste (flags, schalter)."c);
+              }
+              fehler := 1;
+            }
+            var istListe: int64 := 0;
+            if wB - wA >= 2 { if peek8(buf + wA) == 91 && peek8(buf + wB - 1) == 93 { istListe := 1; } }
+            if istListe == 0 {
+              lpfMeldung(pfad, zeile, "hier wird eine Liste erwartet: `schluessel = [\"a\", \"b\"]`."c);
+              fehler := 1;
+            } else {
+              var i: int64 := wA + 1;
+              var stop: int64 := wB - 1;
+              while i < stop {
+                var eA: int64 := lpfVorn(buf, i, stop);
+                if eA >= stop { i := stop; } else {
+                  // bis zum naechsten Komma
+                  var eE: int64 := eA;
+                  while eE < stop { if peek8(buf + eE) == 44 { eE := stop + 1; } else { eE := eE + 1; } }
+                  var komma: int64 := 0 - 1;
+                  var r: int64 := eA;
+                  while r < stop { if peek8(buf + r) == 44 { komma := r; r := stop; } else { r := r + 1; } }
+                  var eB: int64 := stop;
+                  if komma >= 0 { eB := komma; }
+                  var tB: int64 := lpfHinten(buf, eA, eB);
+                  var qA: int64 := alloc(8); var qB: int64 := alloc(8);
+                  lpfEntquoten(buf, eA, tB, qA, qB);
+                  var wert: pchar := lpfAusschnitt(buf, peek64(qA), peek64(qB));
+                  free(qA, 8); free(qB, 8);
+                  if StrLen(wert) > 0 {
+                    var zP: int64 := alloc(8);
+                    if abschnitt == ABS_INCLUDE {
+                      poke64(zP, p.pfadeN);
+                      if lpfAnhaengen(p.pfade, zP, wert as int64) == 0 {
+                        lpfMeldung(pfad, zeile, "zu viele Include-Pfade (Grenze 128)."c); fehler := 1;
+                      } else { p.pfadeN := peek64(zP); }
+                    } else {
+                      poke64(zP, p.schalterN);
+                      if lpfAnhaengen(p.schalter, zP, wert as int64) == 0 {
+                        lpfMeldung(pfad, zeile, "zu viele Schalter (Grenze 128)."c); fehler := 1;
+                      } else { p.schalterN := peek64(zP); }
+                    }
+                    free(zP, 8);
+                  }
+                  if komma < 0 { i := stop; } else { i := komma + 1; }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    pos := ende + 1;
+  }
+
+  if p.quelle == 0 {
+    lpfMeldung(pfad, 0, "kein `quelle = \"...\"` in [projekt] — ohne Quelle gibt es nichts zu uebersetzen."c);
+    fehler := 1;
+  }
+  if fehler == 0 { p.gueltig := 1; }
+  return p;
+}
+
+// ---------------------------------------------------------------------------
+// Paketaufloesung ueber lpm
+// ---------------------------------------------------------------------------
+//
+// `lpm resolve <name> <version>` schreibt den Cache-Pfad auf die
+// Standardausgabe und meldet 0; 1 heisst "nicht gefunden" (lpm/compiler/hook.lyx).
+// Umgeleitet wird ueber `/bin/sh -c`, weil dieser Compiler kein dup2-Builtin
+// kennt — fork/execve/wait4 gibt es (Vorbild: src/tooling/self_test.lyx).
+
+fn lpfExecShell(befehl: pchar, envp: int64): int64 {
+  var argv: int64 := alloc(4 * 8);
+  poke64(argv + 0, ("/bin/sh"c) as int64);
+  poke64(argv + 8, ("-c"c) as int64);
+  poke64(argv + 16, befehl as int64);
+  poke64(argv + 24, 0);
+  var pid: int64 := sys_fork();
+  if pid < 0 { free(argv, 4 * 8); return 0 - 1; }
+  if pid == 0 {
+    // Umgebung DURCHREICHEN. Mit envp=0 hat die Shell kein PATH und findet
+    // `lpm` nicht — der erste Versuch scheiterte genau daran und sah aus wie
+    // "Paket nicht im Cache".
+    sys_execve("/bin/sh"c, argv, envp);
+    exit(127);
+    return 0;
+  }
+  free(argv, 4 * 8);
+  var st: int64 := alloc(8);
+  poke64(st, 0);
+  sys_wait4(pid, st, 0);
+  var code: int64 := (peek64(st) >> 8) & 0xFF;
+  free(st, 8);
+  return code;
+}
+
+// Loest ein Paket auf und gibt den Cache-Pfad zurueck (0 = nicht aufloesbar).
+pub fn LpfPaketAufloesen(name: pchar, version: pchar, envp: int64): pchar {
+  var tmp: pchar := "/tmp/.lyxc_lpm_resolve"c;
+  // `lpm resolve NAME VERSION > /tmp/... 2>/dev/null`
+  var cmd: pchar := StrConcat("lpm resolve "c, name) as pchar;
+  cmd := StrConcat(cmd, " "c) as pchar;
+  cmd := StrConcat(cmd, version) as pchar;
+  cmd := StrConcat(cmd, " > "c) as pchar;
+  cmd := StrConcat(cmd, tmp) as pchar;
+  cmd := StrConcat(cmd, " 2>/dev/null"c) as pchar;
+
+  var rc: int64 := lpfExecShell(cmd, envp);
+  if rc != 0 { return 0 as pchar; }
+  if !FileExists(tmp) { return 0 as pchar; }
+  var aus: pchar := FileReadAll(tmp);
+  Remove(tmp);
+  if (aus as int64) == 0 { return 0 as pchar; }
+  // Gesucht ist die letzte Zeile, die mit '/' beginnt. `lpm` schreibt vor den
+  // Pfad noch eine Statuszeile ("1 Paket(e) aufgeloest, lyx.lock geschrieben"),
+  // und die duerfte hier nicht als Include-Pfad landen — ein Verzeichnis, das
+  // es nicht gibt, faellt sonst erst spaeter als "Modul nicht gefunden" auf.
+  var b: int64 := aus as int64;
+  var n: int64 := StrLen(aus);
+  var treffer: int64 := 0 - 1;
+  var treffEnde: int64 := 0;
+  var zs: int64 := 0;
+  while zs <= n {
+    var ze: int64 := zs;
+    while ze < n { if peek8(b + ze) == 10 { ze := n + 1; } else { ze := ze + 1; } }
+    var zEnd: int64 := zs;
+    var k: int64 := zs;
+    while k < n { if peek8(b + k) == 10 { zEnd := k; k := n; } else { k := k + 1; zEnd := k; } }
+    var vA: int64 := lpfVorn(b, zs, zEnd);
+    var vB: int64 := lpfHinten(b, vA, zEnd);
+    if vB > vA { if peek8(b + vA) == 47 { treffer := vA; treffEnde := vB; } }
+    if zEnd >= n { zs := n + 1; } else { zs := zEnd + 1; }
+  }
+  if treffer < 0 { return 0 as pchar; }
+  return lpfAusschnitt(b, treffer, treffEnde);
+}

@@ -76,6 +76,51 @@ Hello, Lyx!
 ./lyxc hello.lyx -o hello.elf --target=riscv
 ```
 
+### 1.4 Project Files (`*.lpf`)
+
+Once a program needs more than a switch or two, put the build into a project
+file and compile it with `lyxc project.lpf`:
+
+```toml
+[projekt]
+quelle  = "apps/vcldemo.lyx"      # the .lyx to compile (required)
+ziel    = "lyxos"                 # like --target=
+ausgabe = "build/vcldemo.lbf"     # like -o
+
+[include]
+pfade = [".", "platform/lyxos"]   # like -I, in order
+
+[schalter]
+liste = ["--emit=lbf", "-O2"]     # written exactly as on the command line
+
+[pakete]
+vega = "0.3.1"                    # fetched from the LPM cache via `lpm resolve`
+```
+
+```bash
+# Instead of:
+./lyxc apps/vcldemo.lyx --target=lyxos -I . -I platform/lyxos \
+       --emit=lbf -O2 -o build/vcldemo.lbf
+
+# Just:
+./lyxc vcldemo.lpf
+```
+
+Two things worth knowing before you rely on it:
+
+- **The command line wins.** `./lyxc vcldemo.lpf --target=linux` compiles the
+  same project for another target without touching the file — handy for a quick
+  counter-check.
+- **Relative paths are relative to the `.lpf`**, not to your shell. The same
+  project file therefore builds the same thing no matter where you invoke it
+  from.
+
+German and English keys are interchangeable (`quelle`/`source`, `ziel`/`target`,
+`ausgabe`/`output`, `pfade`/`paths`, `liste`/`flags`, `[pakete]`/`[packages]`).
+A misspelled section or key is reported rather than ignored — a silent
+`[incldue]` would swallow every path in it and turn up much later as a missing
+module.
+
 ---
 
 ## 2. Language Basics

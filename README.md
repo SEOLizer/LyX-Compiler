@@ -375,6 +375,36 @@ The standard library is written entirely in Lyx. All modules are available as so
 
 ---
 
+## Project Files
+
+Longer builds go into a `*.lpf` project file instead of the command line:
+
+```toml
+[projekt]
+quelle  = "apps/demo.lyx"
+ziel    = "lyxos"
+ausgabe = "build/demo.lbf"
+
+[include]
+pfade = [".", "platform/lyxos"]
+
+[schalter]
+liste = ["--emit=lbf", "-O2"]
+
+[pakete]
+vega = "0.3.1"          # resolved through `lpm resolve`
+```
+
+```bash
+lyxc demo.lpf                     # everything from the file
+lyxc demo.lpf --target=linux      # a switch on the command line wins
+```
+
+Relative paths count from the directory of the `.lpf`, so the same project
+builds the same thing from anywhere. See COMPILER_MANUAL.md §3.3.
+
+---
+
 ## Precompiled Units
 
 ```bash
