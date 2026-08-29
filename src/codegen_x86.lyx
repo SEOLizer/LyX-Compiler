@@ -428,6 +428,77 @@ con CG_HEAP_END: int64 := 112; // data[112..119]: _lyx_heap_end
 // Codegen class
 // ============================================================================
 
+
+// #1853: Freie Funktionen, KEINE Methoden. Eine zusaetzliche Methode
+// verschiebt die Vtable der Klasse, und der Seed stolpert darueber —
+// derselbe Hinweis steht in ir_lower.lyx. Beim ersten Anlauf kamen aus
+// der Faltung plausible, aber falsche Zahlen (2.0/4.0 = 0.999024).
+// #1853: Bits <-> f64. Der Compiler traegt Gleitkommakonstanten als IEEE-
+// Bitmuster in einem int64; zum RECHNEN muessen sie kurz wieder Zahlen sein.
+// Der Umweg ueber acht Byte Speicher ist der einzige Weg dorthin — einen
+// Cast gibt es nicht, und `as f64` wuerde den Wert umwandeln statt die Bits
+// umzudeuten.
+fn cg_bitsAlsF64(bits: int64): f64 {
+  var p: int64 := alloc(8);
+  poke64(p, bits);
+  var v: f64 := peekf64(p);
+  free(p, 8);
+  return v;
+  }
+
+fn cg_f64AlsBits(v: f64): int64 {
+  var p: int64 := alloc(8);
+  pokef64(p, v);
+  var b: int64 := peek64(p);
+  free(p, 8);
+  return b;
+  }
+
+// #1853: Ein Rechenschritt zwischen zwei Gleitkommakonstanten. Gibt die
+// IEEE-Bits des Ergebnisses zurueck.
+//
+// Division durch 0 wird NICHT abgefangen: fuer Gleitkomma ist sie definiert
+// und liefert inf bzw. NaN. Die ganzzahlige Fassung darunter faengt sie ab,
+// weil dort eine Division durch 0 die Uebersetzung abbraeche — hier waere
+// dasselbe Verhalten falsch und wuerde `1.0 / 0.0` still zu 0 machen.
+fn cg_faltF64(bop: int64, lb: int64, rb: int64): int64 {
+  var a: f64 := cg_bitsAlsF64(lb);
+  var b: f64 := cg_bitsAlsF64(rb);
+  if (bop == 70) { return cg_f64AlsBits(a + b); }   // TK_PLUS
+  if (bop == 71) { return cg_f64AlsBits(a - b); }   // TK_MINUS
+  if (bop == 72) { return cg_f64AlsBits(a * b); }   // TK_STAR
+  if (bop == 73) { return cg_f64AlsBits(a / b); }   // TK_SLASH
+// Vergleiche liefern 0/1, keine Bits.
+  if (bop == 79) { if (a == b) { return 1; } return 0; }  // ==
+  if (bop == 80) { if (a != b) { return 1; } return 0; }  // !=
+  if (bop == 81) { if (a <  b) { return 1; } return 0; }  // <
+  if (bop == 82) { if (a >  b) { return 1; } return 0; }  // >
+  if (bop == 83) { if (a <= b) { return 1; } return 0; }  // <=
+  if (bop == 84) { if (a >= b) { return 1; } return 0; }  // >=
+// Alles Uebrige gibt es fuer Gleitkomma nicht: %, Schiebeoperationen und
+// die Bitverknuepfungen wuerden auf dem Bitmuster arbeiten und etwas
+// liefern, das wie eine Zahl aussieht. Melden statt rechnen.
+  EPrintStr("error: Operator (Token "c);
+  EPrintInt(bop);
+  EPrintStrLn(") ist fuer Gleitkomma-Konstanten nicht definiert (#1853)."c);
+  EPrintStrLn("  Behandelt werden + - * / und die Vergleiche. Bis 1.1.13A rechnete"c);
+  EPrintStrLn("  diese Stelle ganzzahlig auf den IEEE-Bits und lieferte still"c);
+  EPrintStrLn("  eine plausible, aber falsche Zahl."c);
+  exit(1);
+  return 0;
+  }
+
+// #1799: Ein unaerer Operator im Anfangswert einer Konstanten, den
+// cg_evalConExpr nicht kennt. Vorher wurde daraus still 0.
+fn cg_konstOpUnbekannt(uop: int64) {
+  EPrintStr("error: unbekannter unaerer Operator (Token "c);
+  EPrintInt(uop);
+  EPrintStrLn(") im Anfangswert einer Konstanten (#1799)."c);
+  EPrintStrLn("  Behandelt werden - (71), ! (87) und ~ (92). Bis 1.1.10C wurde"c);
+  EPrintStrLn("  daraus still 0, und der Fehler zeigte sich erst bei der Benutzung."c);
+  exit(1);
+  }
+
 pub type Codegen = class {
 
   // Code emission buffer
@@ -2355,18 +2426,17 @@ pub type Codegen = class {
       var ci: int64 := self.cg_findConIdx(self.cg_nsval(node), self.cg_nslen(node));
       if (ci >= 0) { if (peek8(self.conIsF64 + ci) != 0) { return 1; } }
     }
+    // #1853: Auch ein zusammengesetzter Ausdruck ist Gleitkomma, sobald es
+    // einer seiner Operanden ist. Ohne die Rekursion sah `(1.0 / 2.0) * 3.0`
+    // ganzzahlig aus, und die Faltung rechnete auf den IEEE-Bits weiter.
+    if (self.cg_nkind(node) == CGN_UNOP) {
+      return self.cg_istF64Konstante(self.cg_nc0(node));
+    }
+    if (self.cg_nkind(node) == CGN_BINOP) {
+      if (self.cg_istF64Konstante(self.cg_nc0(node)) != 0) { return 1; }
+      return self.cg_istF64Konstante(self.cg_nc1(node));
+    }
     return 0;
-  }
-
-  // #1799: Ein unaerer Operator im Anfangswert einer Konstanten, den
-  // cg_evalConExpr nicht kennt. Vorher wurde daraus still 0.
-  fn cg_konstOpUnbekannt(uop: int64) {
-    EPrintStr("error: unbekannter unaerer Operator (Token "c);
-    EPrintInt(uop);
-    EPrintStrLn(") im Anfangswert einer Konstanten (#1799)."c);
-    EPrintStrLn("  Behandelt werden - (71), ! (87) und ~ (92). Bis 1.1.10C wurde"c);
-    EPrintStrLn("  daraus still 0, und der Fehler zeigte sich erst bei der Benutzung."c);
-    exit(1);
   }
 
   fn cg_evalConExpr(node: int64): int64 {
@@ -2407,7 +2477,7 @@ pub type Codegen = class {
       // wird gemeldet. Geprueft, dass der Bestand keinen solchen Anfangswert
       // benutzt (@ und & kommen in keiner con-Deklaration vor) — sonst waere
       // das Entschaerfen dieser Meldung faellig gewesen, nicht ihr Einbau.
-      self.cg_konstOpUnbekannt(uop);
+      cg_konstOpUnbekannt(uop);
       return 0;
     }
     if (k == CGN_BINOP) {
@@ -2416,6 +2486,18 @@ pub type Codegen = class {
       if (bop == 85) { if (lv == 0) { return 0; } return self.cg_evalConExpr(self.cg_nc1(node)); }  // TK_AND
       if (bop == 86) { if (lv != 0) { return 1; } return self.cg_evalConExpr(self.cg_nc1(node)); }  // TK_OR
       var rv: int64 := self.cg_evalConExpr(self.cg_nc1(node));
+      // #1853: Sind die Operanden Gleitkomma, tragen lv und rv IEEE-BITS.
+      // `lv + rv` darauf ist keine Addition, sondern Unsinn, der wie eine Zahl
+      // aussieht: `con H: f64 := 0.0 - 0.5` ergab -8.0, `2.0 * 3.0` ergab 0.0
+      // und `0.25 + 0.25` einen Wert, den die Ausgabe als "overflow" meldete.
+      //
+      // Dieselbe Sperre steht seit #1499 in cg_foldConst und seit #1803 im
+      // unaeren Zweig darueber — dem binaeren hat sie gefehlt. Das ist der
+      // sechste Fall dieser Familie (#1373, #1499, #1512, #1801, #1803).
+      if (self.cg_istF64Konstante(self.cg_nc0(node)) != 0 ||
+          self.cg_istF64Konstante(self.cg_nc1(node)) != 0) {
+        return cg_faltF64(bop, lv, rv);
+      }
       if (bop == 70) { return lv + rv; }                                  // TK_PLUS
       if (bop == 71) { return lv - rv; }                                  // TK_MINUS
       if (bop == 72) { return lv * rv; }                                  // TK_STAR
