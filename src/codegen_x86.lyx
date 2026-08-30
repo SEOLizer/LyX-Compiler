@@ -840,7 +840,8 @@ pub type Codegen = class {
   globalTypeNames: int64;
   // #1094: Laenge des zuletzt von cg_staticTypeName gelieferten Typnamens.
   stnLen:         int64;
-  // #1097: Bereichstypen {namePtr:8, nameLen:8, lo:8, hi:8} = 32 Byte je Eintrag.
+  // #1097: Bereichstypen {namePtr:8, nameLen:8, lo:8, hi:8, flags:8} = 40 Byte.
+  // #1882: flags Bit0 = `wraps` statt `range` — melden oder umrechnen.
   rangeTypes:      int64;
   rangeTypeCount:  int64;
   rangeTypeCap:    int64;
@@ -4583,8 +4584,11 @@ pub type Codegen = class {
           var loN: int64 := self.cg_nc0(rn);
           var hiN: int64 := self.cg_nc1(rn);
           if (loN >= 0 && hiN >= 0) {
+            // #1882: iv-Bit 3 am Typknoten heisst `wraps`.
+            var rFlags: int64 := 0;
+            if ((self.cg_nival(cur) & 8) != 0) { rFlags := 1; }
             self.cg_addRangeType(self.cg_nsval(cur), self.cg_nslen(cur),
-                                 self.cg_nival(loN), self.cg_nival(hiN));
+                                 self.cg_nival(loN), self.cg_nival(hiN), rFlags);
           }
         }
       }
@@ -7627,19 +7631,20 @@ pub type Codegen = class {
     return self.cg_utypeOfLocal(self.cg_nsval(ni), self.cg_nslen(ni));
   }
 
-  fn cg_addRangeType(name: pchar, nameLen: int64, lo: int64, hi: int64) {
+  fn cg_addRangeType(name: pchar, nameLen: int64, lo: int64, hi: int64, flags: int64) {
     if (self.rangeTypeCount >= self.rangeTypeCap) {
       var nc: int64 := self.rangeTypeCap * 2;
-      var nb: int64 := alloc(nc * 32);
-      memcpy(nb, self.rangeTypes, self.rangeTypeCount * 32);
+      var nb: int64 := alloc(nc * 40);
+      memcpy(nb, self.rangeTypes, self.rangeTypeCount * 40);
       self.rangeTypes := nb;
       self.rangeTypeCap := nc;
     }
-    var base: int64 := self.rangeTypes + self.rangeTypeCount * 32;
+    var base: int64 := self.rangeTypes + self.rangeTypeCount * 40;
     poke64(base,      name as int64);
     poke64(base + 8,  nameLen);
     poke64(base + 16, lo);
     poke64(base + 24, hi);
+    poke64(base + 32, flags);     // #1882: Bit0 = wraps
     self.rangeTypeCount += 1;
   }
 
@@ -7647,7 +7652,7 @@ pub type Codegen = class {
     if (nameLen <= 0) { return 0 - 1; }
     var i: int64 := 0;
     while (i < self.rangeTypeCount) {
-      var base: int64 := self.rangeTypes + i * 32;
+      var base: int64 := self.rangeTypes + i * 40;
       var p: pchar := peek64(base) as pchar;
       var n: int64 := peek64(base + 8);
       if (self.cg_seq(p, n, name, nameLen)) { return i; }
@@ -7882,11 +7887,35 @@ pub type Codegen = class {
   // einzige Inhalt dieses Typs.
   fn cg_emitRangeCheck(idx: int64, ctx: pchar) {
     if (idx < 0) { return; }
-    var base: int64 := self.rangeTypes + idx * 32;
+    var base: int64 := self.rangeTypes + idx * 40;
     var tnp: pchar := peek64(base) as pchar;
     var tnl: int64 := peek64(base + 8);
     var lo: int64 := peek64(base + 16);
     var hi: int64 := peek64(base + 24);
+    // #1882: `wraps` rechnet um, statt zu melden. Dieselbe Rechnung wie in
+    // cg_emitUtypeRange — die beiden muessen uebereinstimmen:
+    //   rax := ((rax - lo) mod span + span) mod span + lo,  span = hi - lo + 1
+    // Die Grenzen sind EINSCHLIESSLICH, `wraps 0..360` rechnet also modulo
+    // 361. Das ist beim Einheitentyp seit jeher so und bleibt hier gleich.
+    if ((peek64(base + 32) & 1) != 0) {
+      var span: int64 := hi - lo + 1;
+      if (span <= 0) { return; }
+      if (lo != 0) {
+        self.cg_e8(0x48); self.cg_e8(0x2D); self.cg_e32(lo);                     // sub rax, lo
+      }
+      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1); self.cg_e32(span);   // mov rcx, span
+      self.cg_e8(0x48); self.cg_e8(0x99);                                        // cqo
+      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);                      // idiv rcx
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                      // mov rax, rdx
+      self.cg_e8(0x48); self.cg_e8(0x05); self.cg_e32(span);                     // add rax, span
+      self.cg_e8(0x48); self.cg_e8(0x99);                                        // cqo
+      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);                      // idiv rcx
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                      // mov rax, rdx
+      if (lo != 0) {
+        self.cg_e8(0x48); self.cg_e8(0x05); self.cg_e32(lo);                     // add rax, lo
+      }
+      return;
+    }
     // Meldung zur Uebersetzungszeit bauen: sie nennt den Typ, die Grenzen und
     // die Stelle — "ausserhalb des Bereichs" allein liesse offen, welcher.
     var msg: pchar := StrConcat("Bereichstyp "c, StrSub(tnp, 0, tnl));
@@ -20355,7 +20384,7 @@ pub type Codegen = class {
 
     // #1097: Bereichstyp-Registry
     self.rangeTypeCap   := 16;
-    self.rangeTypes     := alloc(self.rangeTypeCap * 32);
+    self.rangeTypes     := alloc(self.rangeTypeCap * 40);
     self.rangeTypeCount := 0;
     self.curFnRetRange  := 0 - 1;
     self.curFnRetNarrow := 0;
