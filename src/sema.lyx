@@ -4021,6 +4021,20 @@ pub type Sema = class {
                     if (self._typeMismatch(wantP, gotA, apA) != 0) {
                       self._errType("Argument"c, apA, wantP, gotA);
                     }
+                    // #1886: `nimmA(b)` mit einem fremden Struct kam bis hier
+                    // durch — beide sind TY_USER. Gemessen gab nimmA(c) mit
+                    // `c: struct { s: pchar }` den ZEIGER als Zahl aus.
+                    else if (self._userIdentMismatch(self.sn_c0(apP), apA) != 0) {
+                      self._errorNode("Argument: anderer benannter Typ", apA);
+                    }
+                    // #1880: Bereichstyp am PARAMETER. Die Pruefung gab es
+                    // schon — aber nur fuer die Deklaration und die Zuweisung
+                    // (_checkRangeAssign, aufgerufen bei var-decl und assign).
+                    // Ein konstantes Argument fiel durch und wurde erst zur
+                    // Laufzeit gefangen. Dieselbe Form wie so oft hier: die
+                    // richtige Umsetzung stand schon da, nur die zweite
+                    // Aufrufstelle fehlte.
+                    self._checkRangeAssign(self.sn_c0(apP), apA, apA);
                     apP := self.sn_next(apP);
                     apA := self.sn_next(apA);
                   }
@@ -4509,6 +4523,12 @@ pub type Sema = class {
         if (self._typeMismatch(tid, initT, initNi) != 0) {
           self._errType("Initialisierung"c, ni, tid, initT);
         }
+        // #1883/#1886: Die Typklasse allein trennt benannte Typen NICHT —
+        // Structs, Enums und Klassen sind alle TY_USER. Ohne diese Pruefung
+        // uebersetzte `var a: A := B.Q` und jeder Struct war jedem zuweisbar.
+        else if (self._userIdentMismatch(typeNi, initNi) != 0) {
+          self._errorNode("Initialisierung: anderer benannter Typ", initNi);
+        }
         self._logConstraint(tid, TY_UNKNOWN, "var-init"c, ni);
         // #1082: Bereichstyp -- konstante Initialisierung sofort pruefen.
         self._checkRangeAssign(typeNi, initNi, initNi);
@@ -4593,6 +4613,17 @@ pub type Sema = class {
             var gotT:  int64 := self._inferExprType(self.sn_c1(ni));
             if (self._typeMismatch(wantT, gotT, self.sn_c1(ni)) != 0) {
               self._errType("Zuweisung"c, ni, wantT, gotT);
+            }
+            // #1883/#1886: dieselbe Identitaetspruefung wie bei der
+            // Initialisierung. Der verlangte Typknoten haengt an der
+            // Deklaration der linken Seite.
+            else {
+              var lDecl: int64 := self.SymNodeIdx(tsi);
+              if (lDecl >= 0) {
+                if (self._userIdentMismatch(self.sn_c0(lDecl), self.sn_c1(ni)) != 0) {
+                  self._errorNode("Zuweisung: anderer benannter Typ", ni);
+                }
+              }
             }
           }
         }
@@ -8182,6 +8213,119 @@ pub type Sema = class {
     PrintStr(" user, "c);
     PrintInt(builtinCount);
     PrintStr(" builtins)\n"c);
+  }
+
+  // ------------------------------------------------------------------
+  // #1883/#1884/#1886: Typ-IDENTITAET benannter Typen
+  // ------------------------------------------------------------------
+  //
+  // ResolveType liefert fuer Structs, Enums und Klassen einheitlich TY_USER
+  // (siehe dort). Jeder Vergleich weiter unten sieht danach nur
+  // "TY_USER == TY_USER" — und damit galt jeder Struct als jedem zuweisbar,
+  // jedes Enum als jedem gleich, und `var a: A := B.Q` uebersetzte klaglos.
+  //
+  // Das ist nicht drei Mal derselbe Rechenfehler, sondern EINE fehlende
+  // Ebene: die Identitaet wird schon bei der Bestimmung weggeworfen. Statt
+  // die Typkennung umzubauen — sie steckt in Groessentabellen, Meldungen und
+  // Dutzenden Vergleichen — wird sie hier um den Symbolindex ERGAENZT. Die
+  // Pruefstellen fragen beides ab: erst die Klasse, dann bei TY_USER die
+  // Identitaet.
+  //
+  // Angehaengt am Ende der Klasse und nicht neben ResolveType: eine Methode
+  // mitten in eine Klasse einzufuegen verschiebt die VMT, und der Seed
+  // stolpert darueber. Anhaengen laesst die vorhandenen Plaetze in Ruhe.
+  fn UserTypeSym(typeNi: int64): int64 {
+    if (typeNi < 0) { return -1; }
+    if (self.sn_kind(typeNi) != SNK_TYPE_NAME) { return -1; }
+    var nm: pchar := self.sn_sVal(typeNi);
+    var nl: int64 := self.sn_sLen(typeNi);
+    if (nl <= 0) { return -1; }
+    var si: int64 := self.Lookup(nm, nl);
+    if (si < 0) { return -1; }
+    var sk: int64 := self.SymKind(si);
+    if (sk == SYM_STRUCT || sk == SYM_ENUM) { return si; }
+    // `type A = struct { ... }` und `type K = class { ... }` kommen als
+    // SYM_TYPE herein — SYM_STRUCT vergibt nur die nackte Form `struct X {}`.
+    // Ein ALIAS auf einen Grundtyp (`type date = int64`) ist ebenfalls
+    // SYM_TYPE und darf hier NICHT mitzaehlen: er IST der Grundtyp, und zwei
+    // Aliase desselben Grundtyps gegeneinander abzuweisen waere eine
+    // Verschaerfung, die dieses Issue nicht verlangt (std/time.lyx nutzt
+    // `date` durchgehend wie ein int64).
+    //
+    // Unterschieden wird an der Typkennung: ein Alias uebernimmt den Grundtyp
+    // (#1238), ein Struct oder eine Klasse bleibt TY_USER.
+    if (sk == SYM_TYPE && self.SymTypeId(si) == TY_USER) { return si; }
+    return -1;
+  }
+
+  // Welchen benannten Typ traegt ein AUSDRUCK?
+  //
+  // Zurueck kommt der Symbolindex des Structs oder Enums, sonst -1 fuer
+  // "nicht bestimmbar". Abgedeckt sind die Herkuenfte, aus denen in der Praxis
+  // eine Verwechslung entsteht:
+  //
+  //   IDENT          eine Variable oder ein Parameter — ueber ihre Deklaration
+  //   E.X            ein Enum-Mitglied — der Empfaenger IST das Enum
+  //
+  // Alles andere (Feldzugriff, Aufrufergebnis, Indexausdruck) liefert -1 und
+  // gilt damit als vertraeglich. Das ist Absicht und die Regel dieses Moduls:
+  // sema-Pruefungen ueber Typdeklarationen sind fail-open, weil "unentscheidbar"
+  // nicht "falsch" heisst. Wer eine Herkunft ergaenzt, gewinnt Schaerfe — und
+  // muss damit rechnen, dass im Bestand Stellen auffallen, die heute
+  // stillschweigend durchgehen.
+  fn _exprUserSym(ni: int64): int64 {
+    if (ni < 0) { return -1; }
+    var k: int64 := self.sn_kind(ni);
+    if (k == SNK_IDENT) {
+      var sym: int64 := self.Lookup(self.sn_sVal(ni), self.sn_sLen(ni));
+      if (sym < 0) { return -1; }
+      var sk: int64 := self.SymKind(sym);
+      // Der Name kann selbst ein Typ sein (`A.Y`): dann ist ER die Antwort.
+      if (sk == SYM_ENUM || sk == SYM_STRUCT) { return sym; }
+      if (sk == SYM_TYPE && self.SymTypeId(sym) == TY_USER) { return sym; }
+      if (sk != SYM_VAR && sk != SYM_PARAM) { return -1; }
+      var declNi: int64 := self.SymNodeIdx(sym);
+      if (declNi < 0) { return -1; }        // importiert: unentscheidbar
+      return self.UserTypeSym(self.sn_c0(declNi));
+    }
+    // Enum-Mitglied `E.X`: der Empfaenger nennt das Enum.
+    if (k == SNK_FIELD) {
+      var recv: int64 := self.sn_c0(ni);
+      if (recv < 0) { return -1; }
+      if (self.sn_kind(recv) != SNK_IDENT) { return -1; }
+      var rsym: int64 := self.Lookup(self.sn_sVal(recv), self.sn_sLen(recv));
+      if (rsym < 0) { return -1; }
+      if (self.SymKind(rsym) == SYM_ENUM) { return rsym; }
+      return -1;
+    }
+    return -1;
+  }
+
+  // Meldet 1, wenn der Ausdruck NACHWEISLICH einen anderen benannten Typ
+  // traegt als verlangt. Beide Seiten muessen bestimmbar sein.
+  fn _userIdentMismatch(wantTypeNi: int64, valueNi: int64): int64 {
+    // Ein `as`-Cast ist die ausdrueckliche Umwandlung — wie in _typeMismatch.
+    if (valueNi >= 0 && self.sn_kind(valueNi) == SNK_CAST) { return 0; }
+    var w: int64 := self.UserTypeSym(wantTypeNi);
+    if (w < 0) { return 0; }
+    var g: int64 := self._exprUserSym(valueNi);
+    if (g < 0) { return 0; }
+    if (w == g) { return 0; }
+    return 1;
+  }
+
+  // Sind zwei benannte Typen derselbe?
+  //
+  // -1 heisst "nicht bestimmbar" und gilt als VERTRAeGLICH — dieselbe
+  // fail-open-Regel wie bei den uebrigen sema-Pruefungen ueber
+  // Typdeklarationen: ein importierter Typ, dessen Symbol hier nicht steht,
+  // darf nicht als Fehler durchgehen (sonst gilt jedes geerbte Feld als
+  // unbekannt). Gemeldet wird nur, was NACHWEISLICH verschieden ist.
+  fn UserTypesPassen(aNi: int64, bNi: int64): bool {
+    var a: int64 := self.UserTypeSym(aNi);
+    var b: int64 := self.UserTypeSym(bNi);
+    if (a < 0 || b < 0) { return true; }
+    return a == b;
   }
 
 };
