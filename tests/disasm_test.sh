@@ -100,10 +100,15 @@ else
   no "--emit-asm" "uebersetzt nicht"
 fi
 
-if timeout 300 "$LYXC" --std-path="$ROOT" --asm-listing "$TMP/s.lyx" -o "$TMP/s2" 2>/dev/null | grep -q "Quelle Zeile"; then
-  ok "--asm-listing nennt die Quellzeile"
+# #1862: Die Auflistung steht seit 1.1.14B in <ausgabe>.asm, nicht auf stdout.
+# Bis dahin las diese Pruefung den Strom — und haette damit rot gemeldet, sobald
+# der Schalter tut, was der Hilfetext sagt.
+rm -f "$TMP/s2.asm"
+if timeout 300 "$LYXC" --std-path="$ROOT" --asm-listing "$TMP/s.lyx" -o "$TMP/s2" >/dev/null 2>&1 \
+   && grep -q "Quelle Zeile" "$TMP/s2.asm" 2>/dev/null; then
+  ok "--asm-listing nennt die Quellzeile in <ziel>.asm"
 else
-  no "--asm-listing" "keine Quellzeile in der Auflistung"
+  no "--asm-listing" "keine Quellzeile in $TMP/s2.asm"
 fi
 
 # Und der Schalter darf nicht mehr als "nicht umgesetzt" abweisen — genau das
