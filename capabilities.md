@@ -131,12 +131,49 @@ abdeckt: wer die Uhr lesen darf, darf auch warten, und ohne das Recht laesst
 sich ueber `nanosleep` auch keine Zeit messen.
 | `fs.exec` | Ausführbare Dateien starten |
 
+#### Prozessrechte und Namensräume
+
+| Capability | Beschreibung |
+|-----------|-------------|
+| `process.privileges` | Eigene Kennung wechseln: `setuid`, `setgid`, `setsid`, `setpgid`, `capget`/`capset`, `pidfd_*` |
+| `system.namespace` | `unshare`, `setns`, `chroot`, `mount`, `umount2` |
+| `system.admin` | `reboot`, `sethostname` — verändert die Maschine, nicht den eigenen Prozess |
+
+Drei Namen statt einem, weil die Vertrauensfragen verschieden sind. Rechte
+**abzugeben** (nach dem Start auf einen unprivilegierten Nutzer wechseln) ist
+das gewünschte Muster — genau das ließ sich vorher nicht deklarieren, und wer
+es brauchte, baute ohne `@capabilities` und verlor damit den ganzen Filter.
+
+#### IPC
+
+| Capability | Beschreibung |
+|-----------|-------------|
+| `ipc.shm` | System-V-Shared-Memory: `shmget`, `shmat`, `shmdt`, `shmctl` |
+| `ipc.queue` | Nachrichtenschlangen: `msg*` (System V) und `mq_*` (POSIX) |
+| `ipc.sem` | Semaphoren: `semget`, `semop`, `semctl` |
+
+Getrennt von `memory.mmap`: gemeinsamer Speicher **zwischen Prozessen** ist
+eine andere Zusage als eine anonyme Abbildung im eigenen Adressraum.
+
+#### Beobachtung
+
+| Capability | Beschreibung |
+|-----------|-------------|
+| `debug.trace` | `ptrace`, `perf_event_open` — liest fremde Prozesse |
+| `kernel.bpf` | `bpf`, `io_uring_*` — lädt Code in den Kernel |
+
+Diese beiden hängen ausdrücklich an eigenen Namen und nicht an einer
+bestehenden Capability: an `process.fork` gehängt wären sie unsichtbar.
+
 #### Ein- und Ausgabe
 
 | Capability | Beschreibung |
 |-----------|-------------|
 | `io.wait` | Auf Deskriptoren warten: `poll`, `ppoll`, `select`, `epoll_*`, `eventfd2`, `signalfd4`, `timerfd_*` |
 | `io.fd` | Deskriptoren erzeugen und verdoppeln: `pipe`, `pipe2`, `dup`, `dup2`, `dup3` |
+| `fs.xattr` | Erweiterte Attribute: `getxattr`/`setxattr`/`listxattr`/`removexattr` (+ `f`-Varianten) |
+| `fs.watch` | Dateiänderungen beobachten: `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch` |
+| `fs.cwd` | `chdir` — `getcwd` war immer erlaubt, `chdir` nicht: man durfte fragen, wo man ist, aber nicht woanders hingehen |
 
 `io.wait` macht kein neues Objekt erreichbar — gewartet wird auf das, was das
 Programm ohnehin schon hat. `eventfd`, `signalfd` und `timerfd` erzeugen
@@ -569,6 +606,17 @@ Der Score bewertet die Qualität des Sicherheitsmodells (aktuell max. 40, mit op
 | 37 | `io.wait` | Ein-/Ausgabe |
 | 38 | `io.fd` | Ein-/Ausgabe |
 | 39 | `system.tty` | System |
+| 40 | `process.privileges` | Prozess |
+| 41 | `system.namespace` | System |
+| 42 | `system.admin` | System |
+| 43 | `ipc.shm` | IPC |
+| 44 | `ipc.queue` | IPC |
+| 45 | `ipc.sem` | IPC |
+| 46 | `fs.xattr` | Dateisystem |
+| 47 | `fs.watch` | Dateisystem |
+| 48 | `fs.cwd` | Dateisystem |
+| 49 | `debug.trace` | Beobachtung |
+| 50 | `kernel.bpf` | Beobachtung |
 
 ---
 
