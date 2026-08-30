@@ -1,0 +1,205 @@
+// std/astro/state.lyx
+// Zustandsvektoren im Inertialsystem: Ort, Geschwindigkeit, begleitendes
+// Dreibein.
+//
+// ZUSCHNITT: Der Rechenkern besteht aus FREIEN FUNKTIONEN ueber Zustaenden,
+// nicht aus Methoden. Das ist die sachlich richtige Form — fast jede Groesse
+// der Bahnmechanik braucht zwei Zustaende (Abstand, Annaeherungsrate) oder
+// einen Zustand und eine Zielbahn, und eine Methode muesste sich willkuerlich
+// fuer einen der beiden als Empfaenger entscheiden.
+//
+// Es gibt daneben einen zweiten Grund, der aber ausdruecklich NICHT die
+// Grundlage des Entwurfs ist: #1887 — eine Methode mit f64-Rueckgabe liefert
+// das BITMUSTER statt der Zahl, sobald das Ergebnis in eine Variable oder
+// einen Ausdruck geht. Diese Unit umgeht das, weil sie ohnehin keine
+// f64-Methoden hat. Sie darf sich aber nicht darauf stuetzen, dass der Fehler
+// offen bleibt: nach seinem Fix bleibt der Zuschnitt richtig, weil die
+// Begruendung oben von ihm unabhaengig ist.
+//
+// Einheiten durchgehend SI: Meter, Meter je Sekunde, Sekunden, m^3/s^2.
+// Ein Zahlenwert ohne Einheit ist in der Bahnmechanik wertlos — die Unit
+// mischt sie deshalb nirgends.
+
+@description("Zustandsvektoren, Rahmen und begleitendes Dreibein")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.astro.state;
+
+import std.math;
+
+// ── Typen ─────────────────────────────────────────────────────────────────
+
+pub type AVec3 = struct {
+  x: f64;
+  y: f64;
+  z: f64;
+}
+
+// Ort und Geschwindigkeit in EINEM Inertialsystem. Welches, sagt der Typ
+// nicht — das ist Sache des Aufrufers und gehoert in seine Benennung.
+// Ein Zustand ohne zugehoerigen Rahmen ist eine haeufige Fehlerquelle;
+// AstroRahmenPasst() unten ist die Stelle, an der ein Programm das
+// festhalten kann.
+pub type AState = struct {
+  rx: f64;  ry: f64;  rz: f64;     // Ort [m]
+  vx: f64;  vy: f64;  vTarget: f64;     // Geschwindigkeit [m/s]
+}
+
+// Rahmenkennungen. Sie rechnen nichts — sie erlauben, eine Verwechslung
+// AUSZUSPRECHEN, statt sie im Kommentar zu lassen.
+pub con AFRAME_UNKNOWN: int64 := 0;
+pub con AFRAME_ECI:       int64 := 1;   // erdzentriert inertial
+pub con AFRAME_ECEF:      int64 := 2;   // erdzentriert mitrotierend
+pub con AFRAME_LVLH:      int64 := 3;   // lokal horizontal, lokal vertikal
+pub con AFRAME_RIC:       int64 := 4;   // radial / in-track / cross-track
+
+// ── Fehlerwert ────────────────────────────────────────────────────────────
+//
+// Jede Funktion, die eine unmoegliche Eingabe bekommt, gibt NaN zurueck statt
+// eines plausiblen Ersatzwerts. Bei Bahnrechnungen ist das besonders wichtig:
+// 0 und 1 sehen beide nach einem gueltigen Ergebnis aus, und ein stiller
+// Ersatzwert wandert unbemerkt in die naechste Rechnung.
+
+pub fn AError(): f64 {
+  var zero: f64 := 0.0;
+  return zero / zero;
+}
+
+// NaN ist der einzige Wert, der sich selbst ungleich ist.
+pub fn AIsError(x: f64): bool { return x != x; }
+
+// ── Vektorrechnung ────────────────────────────────────────────────────────
+
+pub fn AVec(x: f64, y: f64, z: f64): AVec3 {
+  var v: AVec3;
+  v.x := x; v.y := y; v.z := z;
+  return v;
+}
+
+pub fn AAdd(a: AVec3, b: AVec3): AVec3 {
+  return AVec(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+
+pub fn ASub(a: AVec3, b: AVec3): AVec3 {
+  return AVec(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+pub fn AScale(a: AVec3, s: f64): AVec3 {
+  return AVec(a.x * s, a.y * s, a.z * s);
+}
+
+pub fn ADot(a: AVec3, b: AVec3): f64 {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+pub fn ACross(a: AVec3, b: AVec3): AVec3 {
+  return AVec(a.y * b.z - a.z * b.y,
+              a.z * b.x - a.x * b.z,
+              a.x * b.y - a.y * b.x);
+}
+
+pub fn AMagnitude(a: AVec3): f64 {
+  return SqrtF64(a.x * a.x + a.y * a.y + a.z * a.z);
+}
+
+// Einheitsvektor. Der Nullvektor hat keine Richtung — das ist keine
+// Ausnahme, die man mit (0,0,0) beantworten darf, denn dieser Rueckgabewert
+// ist selbst ein gueltiger Vektor und wandert unbemerkt weiter.
+pub fn AUnitVec(a: AVec3): AVec3 {
+  var n: f64 := AMagnitude(a);
+  if (n <= 0.0) { return AVec(AError(), AError(), AError()); }
+  return AScale(a, 1.0 / n);
+}
+
+pub fn AVecIsError(a: AVec3): bool {
+  return AIsError(a.x) || AIsError(a.y) || AIsError(a.z);
+}
+
+// Winkel zwischen zwei Vektoren [rad], 0..pi.
+//
+// Gerechnet wird ueber atan2(|a x b|, a.b) und nicht ueber acos(a.b/(|a||b|)):
+// die acos-Form verliert bei fast parallelen Vektoren jede Genauigkeit, weil
+// der Kosinus dort flach ist. Genau dieser Fall — zwei fast gleiche
+// Lagevektoren — ist in der Bahnmechanik der haeufige.
+pub fn AAngle(a: AVec3, b: AVec3): f64 {
+  var na: f64 := AMagnitude(a);
+  var nb: f64 := AMagnitude(b);
+  if (na <= 0.0 || nb <= 0.0) { return AError(); }
+  var k: AVec3 := ACross(a, b);
+  return Atan2F64(AMagnitude(k), ADot(a, b));
+}
+
+// ── Zustaende ─────────────────────────────────────────────────────────────
+
+pub fn AMakeState(rx: f64, ry: f64, rz: f64, vx: f64, vy: f64, vTarget: f64): AState {
+  var s: AState;
+  s.rx := rx; s.ry := ry; s.rz := rz;
+  s.vx := vx; s.vy := vy; s.vTarget := vTarget;
+  return s;
+}
+
+pub fn APosition(s: AState): AVec3  { return AVec(s.rx, s.ry, s.rz); }
+pub fn AVelocity(s: AState): AVec3 { return AVec(s.vx, s.vy, s.vTarget); }
+
+pub fn ARadius(s: AState): f64 { return AMagnitude(APosition(s)); }
+pub fn ASpeed(s: AState): f64 { return AMagnitude(AVelocity(s)); }
+
+// Ist der Zustand ueberhaupt rechenbar?
+//
+// Geprueft wird auf NaN in jeder Komponente und auf einen Ort im Ursprung.
+// Der Ursprung ist kein Randfall, den man mitrechnen koennte: dort ist die
+// Gravitationsbeschleunigung nicht definiert, und jede Bahnrechnung teilt
+// durch den Abstand.
+pub fn AStateValid(s: AState): bool {
+  if (AIsError(s.rx) || AIsError(s.ry) || AIsError(s.rz)) { return false; }
+  if (AIsError(s.vx) || AIsError(s.vy) || AIsError(s.vTarget)) { return false; }
+  if (ARadius(s) <= 0.0) { return false; }
+  return true;
+}
+
+// Zwei Zustaende sind nur dann miteinander verrechenbar, wenn sie im selben
+// Rahmen stehen. Die Funktion rechnet nichts — sie gibt dem Aufrufer eine
+// Stelle, an der er die Frage stellt, statt sie im Kopf zu haben.
+pub fn AFrameMatches(a: int64, b: int64): bool {
+  if (a == AFRAME_UNKNOWN || b == AFRAME_UNKNOWN) { return false; }
+  return a == b;
+}
+
+// ── Begleitendes Dreibein (Frenet, TNB) ───────────────────────────────────
+//
+// T zeigt in Bewegungsrichtung, B senkrecht auf der Bahnebene (entlang des
+// Drehimpulses), N vervollstaendigt das Rechtssystem: N = B x T.
+//
+// Bei einer GERADEN Bahn — Ort und Geschwindigkeit parallel, etwa im
+// senkrechten Auf- oder Abstieg — spannt sich keine Ebene auf. Dann ist B
+// nicht bestimmt, und die Funktionen geben NaN zurueck statt einer beliebigen
+// senkrechten Richtung. Eine gewaehlte Richtung waere hier besonders
+// gefaehrlich: sie sieht wie eine Bahnebene aus.
+
+pub fn ATangent(s: AState): AVec3 { return AUnitVec(AVelocity(s)); }
+
+pub fn ABinormal(s: AState): AVec3 {
+  var h: AVec3 := ACross(APosition(s), AVelocity(s));
+  return AUnitVec(h);
+}
+
+pub fn ANormal(s: AState): AVec3 {
+  var b: AVec3 := ABinormal(s);
+  var t: AVec3 := ATangent(s);
+  if (AVecIsError(b) || AVecIsError(t)) {
+    return AVec(AError(), AError(), AError());
+  }
+  return ACross(b, t);
+}
+
+// Spezifischer Drehimpuls r x v [m^2/s]. Er steht in fast jeder Formel der
+// Bahnmechanik und ist auf einer Keplerbahn erhalten — deshalb taugt er als
+// Probe fuer die Guete einer Integration.
+pub fn AAngularMomentum(s: AState): AVec3 { return ACross(APosition(s), AVelocity(s)); }
+
+// Radiale Komponente der Geschwindigkeit [m/s]: positiv beim Entfernen.
+pub fn ARadialSpeed(s: AState): f64 {
+  var er: AVec3 := AUnitVec(APosition(s));
+  if (AVecIsError(er)) { return AError(); }
+  return ADot(AVelocity(s), er);
+}

@@ -1,0 +1,282 @@
+// std/astro/entry.lyx
+// Eintritt in eine Atmosphaere: Korridor, Verzoegerung, Waermestrom.
+//
+// Die beiden Grenzen, zwischen denen ein Eintritt liegen muss:
+//
+//   ZU FLACH  — der Koerper taucht nicht tief genug ein, wird nicht genug
+//               gebremst und verlaesst die Atmosphaere wieder. Bei einem
+//               Anflug von aussen heisst das: vorbei, ohne Wiederkehr.
+//   ZU STEIL  — Verzoegerung und Waermestrom ueberschreiten, was Struktur
+//               und Hitzeschild aushalten.
+//
+// Der Bereich dazwischen ist der EINTRITTSKORRIDOR. Er ist bei einer Rueckkehr
+// vom Mond wenige Zehntelgrad breit; deshalb ist das keine Rechnung, die man
+// ueberschlaegt.
+//
+// GRENZEN DIESER UNIT — sie stehen hier und nicht nur in der Doku, weil eine
+// Zahl aus einer Naeherung, deren Voraussetzungen man nicht kennt, schlimmer
+// ist als keine Zahl:
+//
+//   * Exponentielle Atmosphaere mit EINER Skalenhoehe. Real aendert sich die
+//     Skalenhoehe mit der Hoehe; ueber den Bereich, in dem gebremst wird, ist
+//     die Naeherung brauchbar, darueber nicht.
+//   * BALLISTISCH, also ohne Auftrieb. Apollo und jede Kapsel mit Anstellwinkel
+//     fliegen mit Auftrieb und erreichen deshalb viel kleinere Spitzenwerte —
+//     die Zahlen hier sind fuer sie eine obere Schranke, keine Vorhersage.
+//   * Konstanter Bahnwinkel waehrend des Bremsens (Allen-Eggers).
+//   * Keine Rotation der Atmosphaere, keine Winde, keine Ablation.
+//
+// Einheiten SI: Meter, m/s, kg, kg/m^3, W/m^2.
+
+@description("Eintrittskorridor, Verzoegerung und Waermestrom")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.astro.entry;
+
+import std.math;
+import std.astro.state;
+import std.astro.orbit;
+
+// ── Atmosphaere als Parametersatz ─────────────────────────────────────────
+//
+// Alles, was die Unit ueber einen Koerper wissen muss. Ein anderer Planet ist
+// ein anderer Satz Zahlen, keine andere Funktion.
+
+pub type AAtmos = struct {
+  rho0:      f64;   // Dichte an der Bezugshoehe [kg/m^3]
+  H:         f64;   // Skalenhoehe [m]
+  hRef:      f64;   // Bezugshoehe ueber dem Radius [m]
+  hLimit:   f64;   // Eintrittsgrenze: ab hier zaehlt die Atmosphaere [m]
+  kHeat:   f64;   // Sutton-Graves-Beiwert [SI], gasabhaengig
+}
+
+pub fn AAtmosNew(rho0: f64, H: f64, hRef: f64, hLimit: f64, kHeat: f64): AAtmos {
+  var a: AAtmos;
+  a.rho0 := rho0; a.H := H; a.hRef := hRef;
+  a.hLimit := hLimit; a.kHeat := kHeat;
+  return a;
+}
+
+// Erde: 1.225 kg/m^3 am Boden, Skalenhoehe 7200 m, Eintrittsgrenze 122 km
+// (die Hoehe, ab der die Aerodynamik der Ruecckehr gerechnet wird).
+// Sutton-Graves-Beiwert fuer Luft: 1.7415e-4.
+pub fn AAtmosEarth(): AAtmos {
+  return AAtmosNew(1.225, 7200.0, 0.0, 122000.0, 0.00017415);
+}
+
+// Mars: duenn (0.020 kg/m^3), aber mit grosser Skalenhoehe (11100 m).
+// CO2 leitet Waerme anders als Luft — Beiwert 1.898e-4.
+pub fn AAtmosMars(): AAtmos {
+  return AAtmosNew(0.020, 11100.0, 0.0, 125000.0, 0.00018980);
+}
+
+// Venus: 65 kg/m^3 am Boden, Skalenhoehe 15900 m. Der Eintritt ist deshalb
+// sanfter verteilt als auf der Erde, aber viel heisser.
+pub fn AAtmosVenus(): AAtmos {
+  return AAtmosNew(65.0, 15900.0, 0.0, 250000.0, 0.00018980);
+}
+
+// Titan: dichter als die Erdatmosphaere in Bodennaehe und mit sehr grosser
+// Skalenhoehe — der Eintritt der Huygens-Sonde dauerte deshalb Stunden.
+pub fn AAtmosTitan(): AAtmos {
+  return AAtmosNew(5.4, 40000.0, 0.0, 1270000.0, 0.00018980);
+}
+
+// Dichte in der Hoehe h ueber der Bezugshoehe [kg/m^3].
+pub fn ADensity(at: AAtmos, h: f64): f64 {
+  if (at.H <= 0.0 || at.rho0 <= 0.0) { return AError(); }
+  return at.rho0 * ExpF64(0.0 - (h - at.hRef) / at.H);
+}
+
+// ── Ballistischer Koeffizient ─────────────────────────────────────────────
+//
+//   beta = m / (C_D * A)   [kg/m^2]
+//
+// Die eine Zahl, die einen Koerper aerodynamisch beschreibt. Gross heisst
+// schwer und schlank: dringt tief ein, wird spaet und hart gebremst. Klein
+// heisst leicht und breit: bremst hoch und sanft — der Grund, warum
+// Marslander so gross und leicht gebaut sind.
+pub fn ABallisticCoeff(mass: f64, cd: f64, flaeche: f64): f64 {
+  if (mass <= 0.0 || cd <= 0.0 || flaeche <= 0.0) { return AError(); }
+  return mass / (cd * flaeche);
+}
+
+// ── Allen-Eggers: der ballistische Eintritt ───────────────────────────────
+
+// Spitzenverzoegerung [m/s^2]:
+//
+//   a_max = v_e^2 * sin(gamma) / (2 * e * H)
+//
+// Das Bemerkenswerte an dieser Loesung: der ballistische Koeffizient kommt
+// NICHT vor. Wie schwer oder wie breit der Koerper ist, aendert nur, in
+// welcher HOEHE die Spitze auftritt — nicht, wie gross sie ist. Nur Tempo,
+// Winkel und Skalenhoehe entscheiden.
+//
+// gamma ist der Bahnwinkel gegen die Horizontale beim Eintritt, positiv nach
+// unten [rad].
+pub fn APeakDecel(at: AAtmos, vE: f64, gamma: f64): f64 {
+  if (at.H <= 0.0 || vE <= 0.0) { return AError(); }
+  if (gamma <= 0.0) { return AError(); }   // steigt oder streift: kein Eintritt
+  var e: f64 := ExpF64(1.0);
+  return vE * vE * SinF64(gamma) / (2.0 * e * at.H);
+}
+
+// Dieselbe Groesse in Vielfachen der ERDbeschleunigung — so wird sie
+// ausgeschrieben ("8 g"), und so steht sie in jeder Belastungsgrenze.
+pub fn APeakDecelG(at: AAtmos, vE: f64, gamma: f64): f64 {
+  var a: f64 := APeakDecel(at, vE, gamma);
+  if (AIsError(a)) { return AError(); }
+  return a / 9.80665;
+}
+
+// Hoehe der Spitzenverzoegerung [m]:
+//
+//   h = H * ln( rho0 * H / (beta * sin(gamma)) )
+//
+// Hier steht beta: ein leichter, breiter Koerper erreicht die Spitze hoch,
+// ein schwerer schlanker tief.
+pub fn APeakAltitude(at: AAtmos, beta: f64, gamma: f64): f64 {
+  if (at.H <= 0.0 || at.rho0 <= 0.0 || beta <= 0.0) { return AError(); }
+  if (gamma <= 0.0) { return AError(); }
+  var q: f64 := at.rho0 * at.H / (beta * SinF64(gamma));
+  if (q <= 0.0) { return AError(); }
+  return at.hRef + at.H * LogF64(q);
+}
+
+// Tempo an der Stelle der Spitzenverzoegerung [m/s]: immer v_e / sqrt(e),
+// also rund 61 % des Eintrittstempos — unabhaengig von allem anderen.
+pub fn APeakSpeed(vE: f64): f64 {
+  if (vE <= 0.0) { return AError(); }
+  return vE / SqrtF64(ExpF64(1.0));
+}
+
+// ── Waermestrom (Sutton-Graves) ───────────────────────────────────────────
+
+// Waermestrom am Staupunkt [W/m^2]:
+//
+//   q = k * sqrt(rho / R_n) * v^3
+//
+// Die dritte Potenz ist die ganze Aussage: doppeltes Tempo heisst achtfacher
+// Waermestrom. Deshalb ist die Rueckkehr vom Mond (11 km/s) kein bisschen
+// schwieriger als die aus dem Erdorbit (7.8 km/s), sondern rund dreimal so
+// heiss.
+//
+// R_n ist der Nasenradius — ein STUMPFER Koerper ist kuehler als ein
+// spitzer, entgegen der Anschauung. Genau deshalb sehen Kapseln aus wie
+// Kuchenformen.
+pub fn AHeatFlux(at: AAtmos, rho: f64, v: f64, rNose: f64): f64 {
+  if (rho < 0.0 || v < 0.0 || rNose <= 0.0) { return AError(); }
+  return at.kHeat * SqrtF64(rho / rNose) * v * v * v;
+}
+
+// Waermestrom in der Spitze eines ballistischen Eintritts [W/m^2].
+// Zusammengesetzt aus Spitzenhoehe, dortiger Dichte und dortigem Tempo.
+pub fn APeakHeatFlux(at: AAtmos, beta: f64, vE: f64, gamma: f64, rNose: f64): f64 {
+  var h: f64 := APeakAltitude(at, beta, gamma);
+  if (AIsError(h)) { return AError(); }
+  var rho: f64 := ADensity(at, h);
+  var v:   f64 := APeakSpeed(vE);
+  if (AIsError(rho) || AIsError(v)) { return AError(); }
+  return AHeatFlux(at, rho, v, rNose);
+}
+
+// ── Eintrittskorridor ─────────────────────────────────────────────────────
+
+// Bahnwinkel beim Eintritt [rad], positiv nach unten.
+//
+// Aus dem Zustand an der Eintrittsgrenze: der Winkel zwischen der
+// Geschwindigkeit und der oertlichen Horizontalen. Radial nach innen heisst
+// +pi/2, waagerecht heisst 0.
+pub fn AEntryAngle(s: AState): f64 {
+  if (!AStateValid(s)) { return AError(); }
+  var v: f64 := ASpeed(s);
+  if (v <= 0.0) { return AError(); }
+  var vr: f64 := ARadialSpeed(s);
+  if (AIsError(vr)) { return AError(); }
+  return AsinF64((0.0 - vr) / v);
+}
+
+// FLACHE Grenze: der kleinste Bahnwinkel, bei dem der Koerper noch
+// eingefangen wird statt wieder hinauszufliegen.
+//
+// Gerechnet wird sie GEOMETRISCH und nicht ueber die Bremswirkung: solange
+// das Perizentrum der ungestoerten Kegelschnittbahn OBERHALB der wirksamen
+// Atmosphaere bleibt, wird der Koerper nicht genug gebremst und geht wieder
+// hinaus. Das ist die konservative, nachrechenbare Fassung — die echte
+// Grenze liegt etwas flacher, weil auch eine duenne Schicht bremst.
+//
+// rZiel ist der Radius, bis zu dem der Koerper eintauchen MUSS (ueblich:
+// Grenzhoehe minus ein paar Skalenhoehen).
+pub fn AShallowLimit(mu: f64, rLimit: f64, vLimit: f64, rTarget: f64): f64 {
+  if (mu <= 0.0 || rLimit <= 0.0 || vLimit <= 0.0) { return AError(); }
+  if (rTarget <= 0.0 || rTarget > rLimit) { return AError(); }
+  // Drehimpuls, der genau rZiel als Perizentrum ergibt:
+  //   h = r_ziel * v(r_ziel),  v aus Vis-Viva mit der Energie an der Grenze.
+  var a: f64 := ASemiMajorAxis(mu, rLimit, vLimit);
+  if (AIsError(a)) { return AError(); }
+  var vZiel: f64 := AVisViva(mu, rTarget, a);
+  if (AIsError(vZiel)) { return AError(); }
+  var h: f64 := rTarget * vZiel;
+  // h = r * v * cos(gamma)  ->  cos(gamma) = h / (r * v)
+  var c: f64 := h / (rLimit * vLimit);
+  if (c > 1.0) { return AError(); }     // rZiel gar nicht erreichbar
+  if (c < 0.0 - 1.0) { return AError(); }
+  return AcosF64(c);
+}
+
+// STEILE Grenze: der groesste Bahnwinkel, bei dem eine Verzoegerungsschranke
+// noch eingehalten wird. Umkehrung von APeakDecel.
+//
+//   sin(gamma) = a_max * 2 * e * H / v_e^2
+//
+// Liegt der Wert ueber 1, ist die Schranke bei diesem Tempo gar nicht zu
+// verletzen — dann gibt es keine steile Grenze, und die Funktion sagt das
+// mit pi/2 (senkrecht) statt mit einem Fehler.
+pub fn ASteepLimit(at: AAtmos, vE: f64, aMax: f64): f64 {
+  if (at.H <= 0.0 || vE <= 0.0 || aMax <= 0.0) { return AError(); }
+  var e: f64 := ExpF64(1.0);
+  var s: f64 := aMax * 2.0 * e * at.H / (vE * vE);
+  if (s >= 1.0) { return Pi() / 2.0; }
+  return AsinF64(s);
+}
+
+// Dasselbe mit einer Schranke in g.
+pub fn ASteepLimitG(at: AAtmos, vE: f64, gMax: f64): f64 {
+  if (gMax <= 0.0) { return AError(); }
+  return ASteepLimit(at, vE, gMax * 9.80665);
+}
+
+// Breite des Korridors [rad]. Negativ heisst: es gibt keinen — bei diesem
+// Anflugtempo laesst sich die Belastungsgrenze nicht einhalten UND zugleich
+// tief genug eintauchen. Das ist die Aussage, wegen der man rechnet, und
+// deshalb wird sie NICHT auf 0 abgeschnitten.
+pub fn ACorridorWidth(at: AAtmos, mu: f64, rLimit: f64, vLimit: f64,
+                       rTarget: f64, gMax: f64): f64 {
+  var shallow: f64 := AShallowLimit(mu, rLimit, vLimit, rTarget);
+  var steep: f64 := ASteepLimitG(at, vLimit, gMax);
+  if (AIsError(shallow) || AIsError(steep)) { return AError(); }
+  return steep - shallow;
+}
+
+// Liegt ein Eintritt im Korridor?
+pub fn AInCorridor(at: AAtmos, mu: f64, rLimit: f64, vLimit: f64,
+                   rTarget: f64, gMax: f64, gamma: f64): bool {
+  var shallow: f64 := AShallowLimit(mu, rLimit, vLimit, rTarget);
+  var steep: f64 := ASteepLimitG(at, vLimit, gMax);
+  if (AIsError(shallow) || AIsError(steep)) { return false; }
+  return gamma >= shallow && gamma <= steep;
+}
+
+// Prallt der Koerper ab? Genau die Gegenfrage zur flachen Grenze.
+pub fn ASkipsOut(mu: f64, rLimit: f64, vLimit: f64, rTarget: f64, gamma: f64): bool {
+  var shallow: f64 := AShallowLimit(mu, rLimit, vLimit, rTarget);
+  if (AIsError(shallow)) { return false; }
+  return gamma < shallow;
+}
+
+// Ueberschreitet der Eintritt die Belastungsgrenze?
+pub fn AOverloads(at: AAtmos, vE: f64, gamma: f64, gMax: f64): bool {
+  var g: f64 := APeakDecelG(at, vE, gamma);
+  if (AIsError(g)) { return false; }
+  return g > gMax;
+}

@@ -2,6 +2,53 @@
 
 ## Unveröffentlicht (develop)
 
+### NEU — `std.astro`: Bahnmechanik in fünf Units
+
+Es gab in `std/` nichts dergleichen — kein Kepler, kein Hohmann, keine
+Vis-Viva, keine Raketengleichung. Neu sind fünf Units mit zusammen 189
+Prüfungen:
+
+| Unit | Inhalt |
+|---|---|
+| `std.astro.state` | Vektoren, Zustandsvektoren, Rahmenkennungen, begleitendes Dreibein |
+| `std.astro.orbit` | Vis-Viva, Energie, Bahnelemente, Hohmann, Flucht und Hyperbelbahn |
+| `std.astro.insertion` | Einfangschub, Zirkularisierung, Deorbit, Korrekturschübe |
+| `std.astro.entry` | Atmosphärenmodell, Eintrittskorridor, Verzögerung, Wärmestrom |
+| `std.astro.launch` | Ziolkowski, Stufung, Schub-Gewicht, Verluste, Startazimut |
+
+**Zuschnitt: freie Funktionen über Zuständen, keine Methoden.** Fast jede
+Größe der Bahnmechanik braucht zwei Zustände oder einen Zustand und eine
+Zielbahn; eine Methode müsste sich willkürlich für einen Empfänger
+entscheiden. Der Zuschnitt umgeht zusätzlich #1887 (eine `f64`-Methode
+liefert das Bitmuster, sobald das Ergebnis in eine Variable geht), stützt
+sich aber ausdrücklich nicht darauf.
+
+Sollwerte kommen aus geschlossenen Beziehungen, aus Literaturwerten und aus
+Handrechnung — nie aus der geprüften Formel selbst. Die stärkste Einzelprüfung
+ist die GEO-Umlaufzeit: sie fällt aus µ und dem dritten Keplerschen Gesetz und
+trifft mit 23,9345 h den Sterntag, der unabhängig davon aus der Erdrotation
+bekannt ist.
+
+Drei Ergebnisse spricht die Bibliothek aus, statt sie zu glätten:
+
+* Für eine **ballistische Mondrückkehr gibt es keinen Eintrittskorridor** —
+  die Breite ist negativ. Tief genug eintauchen und unter 10 g bleiben geht
+  nicht zugleich; genau deshalb flog Apollo mit Auftrieb.
+* **Von Baikonur ist eine 28,5°-Bahn nicht erreichbar.** `ALaunchAzimuth`
+  meldet das, statt einen Azimut zu liefern, der in eine andere Bahn führt.
+* **Einstufig mit Kerosin reicht nicht für den Orbit** (8669 m/s Grenze bei
+  ~9400 m/s Bedarf).
+
+Fehlerfälle geben NaN zurück, nie einen plausiblen Ersatzwert: bei
+Bahnrechnungen sehen 0 und 1 beide nach einem gültigen Ergebnis aus. Eine
+rechnerisch exakte Kreisbahn gibt es nicht — dort hat der
+Exzentrizitätsvektor Betrag 1e-16 bei beliebiger Richtung, weshalb
+`ACircularThreshold()` diese Entscheidung sichtbar macht.
+
+Die Grenzen jeder Näherung stehen im Kopf der jeweiligen Unit: Zwei-Körper
+ohne Störungen, exponentielle Atmosphäre mit einer Skalenhöhe, ballistischer
+Eintritt ohne Auftrieb, Ziolkowski ohne Schwerkraft und Luftwiderstand.
+
 ### BEHOBEN — `@little_endian` am Feld (#1864) und `std.crt_raw` (#1874)
 
 **`@little_endian`** stand in der Attributliste des Parsers und im Hilfetext,

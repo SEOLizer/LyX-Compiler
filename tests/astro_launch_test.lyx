@@ -1,0 +1,221 @@
+// tests/astro_launch_test.lyx
+// Aufstieg und Verlassen der Umlaufbahn — std.astro.launch, Deorbit aus
+// std.astro.insertion.
+//
+// Sollwerte aus vier Quellen, keine davon die geprueften Formeln:
+//
+//   1. Handrechnung (450 * 9.80665 * ln(10) = 10161 m/s);
+//   2. bekannte Startplaetze — von Cape Canaveral (28.5 Grad) fuehrt eine
+//      28.5-Grad-Bahn genau nach Osten, von Baikonur (45.6 Grad) liegt der
+//      Sojus-Azimut fuer 51.6 Grad bei 62.6 Grad;
+//   3. gemessene Werte (Erddrehung am Aequator 465 m/s, Deorbit aus 400 km
+//      rund 100 m/s);
+//   4. Ordnungsbeziehungen, die immer gelten muessen.
+//
+// Die wichtigste Pruefung ist eine VERNEINUNG: von Baikonur aus ist eine
+// 28.5-Grad-Bahn nicht erreichbar, und die Unit sagt das, statt einen Azimut
+// zu liefern, der in eine andere Bahn fuehrt.
+
+unit main;
+
+import std.io;
+import std.math;
+import std.astro.state;
+import std.astro.orbit;
+import std.astro.launch;
+import std.astro.insertion;
+
+var _fails: int64 := 0;
+var _checks: int64 := 0;
+
+fn CheckRel(name: pchar, got: f64, want: f64, tol: f64): void {
+  _checks := _checks + 1;
+  var d: f64 := AbsF64(got - want);
+  var s: f64 := AbsF64(want);
+  if (s < 1.0) { s := 1.0; }
+  if (d / s <= tol) { PrintStr("PASS "c); PrintStrLn(name); }
+  else {
+    PrintStr("FAIL "c); PrintStr(name);
+    PrintStr(": erhalten "c); PrintF64(got);
+    PrintStr(" erwartet "c); PrintF64(want); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+}
+
+fn CheckWahr(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: wahr)"c); _fails := _fails + 1; }
+}
+
+fn CheckFalsch(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (!got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: falsch)"c); _fails := _fails + 1; }
+}
+
+fn main(): int64 {
+  var grad: f64 := Pi() / 180.0;
+  var mu:   f64 := AMuEarth();
+  var r400: f64 := ARadiusEarth() + 400000.0;
+
+  // ── Raketengleichung ────────────────────────────────────────────────────
+  // Von Hand: 450 * 9.80665 * ln(10).
+  CheckRel("Isp 450, Verhaeltnis 10 = 10161 m/s"c,
+           ADvTsiolkovsky(450.0, 10.0, 1.0), 10161.29, 0.00001);
+  // Kein Treibstoff, kein dv — und das ist kein Sonderfall, sondern ln(1)=0.
+  CheckRel("gleiche Massen geben 0"c, ADvTsiolkovsky(450.0, 5.0, 5.0), 0.0, 0.000000001);
+  // Linear in Isp, logarithmisch im Verhaeltnis: doppelter Isp verdoppelt dv,
+  // doppeltes Verhaeltnis nicht.
+  CheckRel("doppelter Isp verdoppelt dv"c,
+           ADvTsiolkovsky(900.0, 10.0, 1.0), 2.0 * ADvTsiolkovsky(450.0, 10.0, 1.0), 0.000000001);
+  CheckWahr("doppeltes Verhaeltnis verdoppelt dv NICHT"c,
+            ADvTsiolkovsky(450.0, 20.0, 1.0) < 2.0 * ADvTsiolkovsky(450.0, 10.0, 1.0));
+  // Umkehrprobe: das Verhaeltnis fuer ein dv muss dieses dv ergeben.
+  var q: f64 := AMassRatio(350.0, 9400.0);
+  CheckRel("Umkehrprobe Massenverhaeltnis"c,
+           ADvTsiolkovsky(350.0, q, 1.0), 9400.0, 0.000001);
+  // Treibstoffmasse und Verhaeltnis muessen zueinander passen.
+  CheckRel("Treibstoffmasse passt zum Verhaeltnis"c,
+           APropellantMass(350.0, 9400.0, 1000.0), 1000.0 * (q - 1.0), 0.000000001);
+  // Leer schwerer als voll ist keine Rakete.
+  CheckWahr("Leermasse ueber Startmasse meldet"c, AIsError(ADvTsiolkovsky(450.0, 1.0, 10.0)));
+
+  // Schub, Massenstrom und Brenndauer haengen zusammen: der Treibstoff einer
+  // Brenndauer muss bei diesem Schub genau aufgebraucht sein.
+  var mdot: f64 := AMassFlow(7600000.0, 263.0);      // F-1-Stufe, grob
+  CheckRel("Brenndauer aus Massenstrom"c,
+           ABurnTime(mdot * 165.0, mdot), 165.0, 0.000000001);
+
+  // ── Stufung ─────────────────────────────────────────────────────────────
+  // Die Nutzlast steht in BEIDEN Massen und verkleinert das Verhaeltnis —
+  // deshalb bringt dieselbe Stufe mit Nutzlast weniger dv.
+  CheckWahr("Nutzlast kostet dv"c,
+            ADvStage(350.0, 10.0, 90.0, 50.0) < ADvStage(350.0, 10.0, 90.0, 0.0));
+  CheckRel("Strukturanteil"c, AStructuralRatio(10.0, 90.0), 0.1, 0.000000001);
+  // Die Schranke, an der Einstufigkeit scheitert: mit 8 Prozent Struktur und
+  // Isp 350 sind hoechstens 8669 m/s erreichbar — der Aufstieg braucht mehr.
+  CheckRel("dv-Grenze bei 8 Prozent und Isp 350"c,
+           ADvStageLimit(350.0, 0.08), 8669.13, 0.00001);
+  CheckWahr("einstufig mit Kerosin reicht nicht fuer den Orbit"c,
+            ADvStageLimit(350.0, 0.08) < 9400.0);
+  // Mit Wasserstoff und 5 Prozent Struktur reicht es rechnerisch — der Grund,
+  // warum ueber Einstufigkeit ueberhaupt geredet wird.
+  CheckWahr("einstufig mit Wasserstoff reichte rechnerisch"c,
+            ADvStageLimit(450.0, 0.05) > 9400.0);
+  // Und die Grenze gilt OHNE Nutzlast: mit Nutzlast bleibt weniger.
+  CheckWahr("Grenze gilt nur ohne Nutzlast"c,
+            ADvStage(350.0, 8.0, 92.0, 5.0) < ADvStageLimit(350.0, 0.08));
+  // Zwei Stufen schlagen eine einzelne mit derselben Gesamtmasse.
+  CheckWahr("zwei Stufen bringen mehr als eine"c,
+            ADvTwoStages(300.0, 10.0, 90.0, 350.0, 2.0, 18.0, 1.0)
+              > ADvStage(300.0, 12.0, 108.0, 1.0));
+
+  // ── Abheben ─────────────────────────────────────────────────────────────
+  var g0: f64 := ASurfaceGravity(mu, ARadiusEarth());
+  CheckWahr("Schub groesser als Gewicht hebt ab"c, ALiftsOff(15000000.0, 1000000.0, g0));
+  CheckFalsch("Schub gleich Gewicht hebt NICHT ab"c,
+              ALiftsOff(1000000.0 * g0, 1000000.0, g0));
+  CheckRel("Schub-Gewicht-Verhaeltnis"c,
+           AThrustToWeight(2.0 * 1000000.0 * g0, 1000000.0, g0), 2.0, 0.000000001);
+  // Was ankommt, ist Schub minus Gewicht — bei Verhaeltnis 2 also genau g.
+  CheckRel("Startbeschleunigung bei TWR 2"c,
+           ALiftoffAccel(2.0 * 1000000.0 * g0, 1000000.0, g0), g0, 0.000000001);
+
+  // ── Verluste und Erddrehung ─────────────────────────────────────────────
+  // Senkrecht kostet die volle Schwere, waagerecht nichts.
+  CheckRel("senkrecht: voller Verlust"c,
+           AGravityLoss(9.80665, Pi() / 2.0, 100.0), 980.665, 0.000000001);
+  CheckRel("waagerecht: kein Verlust"c,
+           AGravityLoss(9.80665, 0.0, 100.0), 0.0, 0.000000001);
+  // Erddrehung: am Aequator nach Osten 465 m/s.
+  CheckRel("Aequator nach Osten = 465 m/s"c,
+           ARotationGain(AEarthRotation(), ARadiusEarth(), 0.0, Pi() / 2.0), 465.1, 0.001);
+  // Von Cape Canaveral bleiben 409 m/s.
+  CheckRel("Cape nach Osten = 409 m/s"c,
+           ARotationGain(AEarthRotation(), ARadiusEarth(), 28.5 * grad, Pi() / 2.0), 408.74, 0.0001);
+  // Nach Westen ist der Gewinn NEGATIV — ein rueckläufiger Orbit kostet
+  // denselben Betrag zusaetzlich. Ein Betrag waere hier ein Vorzeichenfehler
+  // mit 800 m/s Wirkung.
+  CheckRel("nach Westen kostet es"c,
+           ARotationGain(AEarthRotation(), ARadiusEarth(), 28.5 * grad, 0.0 - Pi() / 2.0),
+           0.0 - 408.74, 0.0001);
+  // An den Polen dreht sich nichts.
+  CheckRel("am Pol kein Gewinn"c,
+           ARotationGain(AEarthRotation(), ARadiusEarth(), Pi() / 2.0, Pi() / 2.0), 0.0, 0.0000001);
+
+  // dv-Bilanz: Bahngeschwindigkeit plus Verluste minus Drehgewinn.
+  CheckRel("Aufstiegsbilanz 400 km"c,
+           ADvAscent(mu, r400, 1600.0, 408.74),
+           ACircularSpeed(mu, r400) + 1600.0 - 408.74, 0.000000001);
+  CheckWahr("Aufstieg kostet mehr als die Bahngeschwindigkeit"c,
+            ADvAscent(mu, r400, 1600.0, 408.74) > ACircularSpeed(mu, r400));
+
+  // ── Startazimut ─────────────────────────────────────────────────────────
+  // Von Cape Canaveral fuehrt eine 28.5-Grad-Bahn genau nach Osten.
+  CheckRel("Cape 28.5 -> Azimut 90 Grad"c,
+           ALaunchAzimuth(28.5 * grad, 28.5 * grad), Pi() / 2.0, 0.000001);
+  // Von Baikonur liegt der Sojus-Azimut fuer 51.6 Grad bei 62.6 Grad.
+  CheckRel("Baikonur -> 62.6 Grad"c,
+           ALaunchAzimuth(45.6 * grad, 51.6 * grad) / grad, 62.596, 0.0001);
+  // Umkehrprobe: der Azimut muss die Inklination wieder ergeben.
+  CheckRel("Umkehrprobe Azimut/Inklination"c,
+           AInclinationFromAzimuth(45.6 * grad, ALaunchAzimuth(45.6 * grad, 51.6 * grad)),
+           51.6 * grad, 0.000001);
+
+  // DIE Einschraenkung des Startorts: unterhalb der Breite geht es nicht.
+  CheckFalsch("Baikonur erreicht 28.5 Grad NICHT"c,
+              AInclinationReachable(45.6 * grad, 28.5 * grad));
+  CheckWahr("Baikonur erreicht 51.6 Grad"c, AInclinationReachable(45.6 * grad, 51.6 * grad));
+  CheckWahr("nicht erreichbare Inklination meldet"c,
+            AIsError(ALaunchAzimuth(45.6 * grad, 28.5 * grad)));
+  // Genau die Breite ist die kleinste erreichbare Inklination.
+  CheckRel("kleinste Inklination = Breite"c,
+           AMinInclination(45.6 * grad), 45.6 * grad, 0.000000001);
+  CheckWahr("die Breite selbst ist erreichbar"c,
+            AInclinationReachable(45.6 * grad, 45.6 * grad));
+  // Und die Strafe dafuer, es trotzdem zu wollen: 17.1 Grad Ebenenaenderung.
+  CheckRel("Strafe fuer 28.5 von Baikonur"c,
+           AAzimuthPenalty(7670.0, 45.6 * grad, 28.5 * grad),
+           APlaneChangeDv(7670.0, 17.1 * grad), 0.000001);
+  // Wer die Inklination erreichen kann, zahlt nichts.
+  CheckRel("keine Strafe bei erreichbarer Inklination"c,
+           AAzimuthPenalty(7670.0, 28.5 * grad, 51.6 * grad), 0.0, 0.000000001);
+  // Vom Aequator aus ist alles erreichbar — der Grund fuer Kourou.
+  CheckWahr("vom Aequator ist 0 Grad erreichbar"c, AInclinationReachable(0.0, 0.0));
+
+  // ── Verlassen der Umlaufbahn ────────────────────────────────────────────
+  var rE50: f64 := ARadiusEarth() + 50000.0;
+  var dvD: f64 := ADeorbitDvCircular(mu, r400, rE50);
+  // Praxis: aus 400 km rund 100 m/s.
+  CheckRel("Deorbit 400 -> 50 km = 102 m/s"c, dvD, 102.3, 0.001);
+  // Umkehrprobe: der Schub muss genau dieses Perizentrum erzeugen.
+  CheckRel("Umkehrprobe Deorbit"c, APeriapsisAfterBraking(mu, r400, dvD), rE50, 0.0000001);
+  // Mehr bremsen heisst tiefer eintauchen.
+  CheckWahr("mehr Schub, tieferes Perizentrum"c,
+            APeriapsisAfterBraking(mu, r400, 150.0) < APeriapsisAfterBraking(mu, r400, 100.0));
+  CheckWahr("100 m/s erreichen die Atmosphaere"c,
+            ADeorbitSufficient(mu, r400, 100.0, ARadiusEarth() + 122000.0));
+  CheckFalsch("10 m/s erreichen sie nicht"c,
+              ADeorbitSufficient(mu, r400, 10.0, ARadiusEarth() + 122000.0));
+  // Ein Ziel oberhalb der Bahn ist kein Deorbit.
+  CheckWahr("Ziel ueber der Bahn meldet"c,
+            AIsError(ADeorbitDvCircular(mu, r400, r400 + 1000.0)));
+  // Aus der Ellipse gebremst wird im Apozentrum — billiger als aus der
+  // Kreisbahn mit demselben Apozentrum? Nein: dieselbe Rechnung, und aus
+  // einer Ellipse mit tieferem Perizentrum ist es weniger.
+  CheckWahr("aus der Ellipse ist es billiger"c,
+            ADeorbitDv(mu, ARadiusEarth() + 200000.0, r400, rE50) < dvD);
+
+  // Hinaus statt hinunter: der Fluchtschub aus derselben Bahn.
+  CheckRel("Flucht aus 400 km"c,
+           AEscapeDv(mu, r400, 0.0),
+           (SqrtF64(2.0) - 1.0) * ACircularSpeed(mu, r400), 0.000001);
+  CheckWahr("hinaus kostet viel mehr als hinunter"c, AEscapeDv(mu, r400, 0.0) > 20.0 * dvD);
+
+  PrintStr("\n"c);
+  PrintInt(_checks); PrintStr(" Pruefungen, "c);
+  PrintInt(_fails); PrintStrLn(" FAIL"c);
+  if (_fails == 0) { PrintStrLn("OK: std.astro.launch + Deorbit"c); return 0; }
+  return 1;
+}
