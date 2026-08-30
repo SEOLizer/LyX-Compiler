@@ -328,19 +328,24 @@ pub type EmitLyxOS = class {
     pub fn startCallNextIP():  int64 { return self.startNextIP; }
 
     // LX-36: _start for EVENT_LOOP lifecycle.
-    // RTC-Canary-Seed (wie ONE_SHOT), dann sys_event_loop_init (0x0020) vor CALL main.
-    // CALL rel32 is at byte offset 68; callNextIP = 72.
-    // Caller must use: patchCallRel32(68, mainOff - 72)
+    // RTC-Canary-Seed (wie ONE_SHOT), dann CALL main.
+    //
+    // #1795: hier stand `MOV rax, 0x0020; SYSCALL` — sys_event_loop_init, mit
+    // dem der Kernel die TLV-0x08-Quellen registrieren sollte. Diesen Syscall
+    // gibt es nicht: 32 steht weder im Dispatcher noch unter den
+    // Bootloader-Abfaengen, der Aufruf landete in `.r3_unknown` und bekam
+    // still 0 samt Erfolgsmeldung. Die Anforderung an das LyxOS-Team steht in
+    // work/lyxos.md; solange sie offen ist, wird hier NICHTS emittiert statt
+    // etwas, das nach Registrierung aussieht und keine ist. Das Verhalten
+    // aendert sich dadurch nicht — der Aufruf tat schon vorher nichts.
     pub fn emitStartStubEventLoop(): void {
+        EPrintStrLn("warnung: lyxos: EVENT_LOOP — der Kernel hat keine Lebenszyklus-Registrierung"c);
+        EPrintStrLn("  (sys_event_loop_init/0x0020 ist nicht gebaut, siehe work/lyxos.md und #1795)."c);
+        EPrintStrLn("  Das Programm laeuft wie ONE_SHOT: main wird gerufen, danach exit."c);
         // XOR rbp, rbp
         self.emit8(0x48); self.emit8(0x31); self.emit8(0xED);
         self.emitArgcArgv();                                 // #1754: argc/argv vom Stapel
         self.emitCanarySeed();                               // RTC-Seed → [rsp-8]
-        // sys_event_loop_init (0x0020): kernel registers lifecycle sources
-        // MOV rdi, imm64 (0 = kernel reads TLV 0x08 from loaded binary)
-        self.emit8(0x48); self.emit8(0xBF); self.emit64(0);  // +45: MOV rdi, 0
-        self.emitMovRaxImm(0x0020);                           // +55: MOV rax, 0x0020
-        self.emitSyscall();                                   // +65: SYSCALL
         // CALL main — Position wird gemerkt, nicht gezaehlt (#1754)
         self.emit8(0xE8);
         self.startRelOff := self.codeLen;
@@ -1126,8 +1131,10 @@ pub type EmitLyxOS = class {
             EPrintStr(" wuerde Syscall-Nummer "c);
             EPrintInt(nr);
             EPrintStrLn(" emittieren — die gibt es in LyxOS nicht."c);
-            EPrintStrLn("  Belegt sind 0-3, 8-9, 24-25, 60, 79-102, 110-122, 124-188, 200-203, 205,"c);
-            EPrintStrLn("  210-215, 217-230, 231, 232-255, 300-328, 516-517, 522-523, 2063-2066, 2315."c);
+            EPrintStrLn("  Belegt sind 0-3, 8-9, 11-12, 24-25, 60, 79-122, 124-188, 200-203, 205-207,"c);
+            EPrintStrLn("  210-215, 217-230, 231-255, 256, 300-341, 515-517, 522-523, 2063-2066, 2315."c);
+            EPrintStrLn("  Massgeblich ist work/lyxos/syscall-ist.txt; erneuern mit"c);
+            EPrintStrLn("  tools/lyxos_syscall_abgleich.sh --schreiben (#1795)."c);
             EPrintStrLn("  Diese Nummer stammt aus der Entwurfs-ABI (hex-Gruppen), nicht aus dem Kernel."c);
             // #1734: Wo es ein Gegenstueck MIT ANDERER Signatur gibt, gehoert
             // das in die Meldung. Sonst sucht der naechste Leser nach einer
@@ -1245,8 +1252,10 @@ pub type EmitLyxOS = class {
             EPrintStr(" wuerde Syscall-Nummer "c);
             EPrintInt(nr);
             EPrintStrLn(" emittieren — die gibt es in LyxOS nicht."c);
-            EPrintStrLn("  Belegt sind 0-3, 8-9, 24-25, 60, 79-102, 110-122, 124-188, 200-203, 205,"c);
-            EPrintStrLn("  210-215, 217-230, 231, 232-255, 300-328, 516-517, 522-523, 2063-2066, 2315."c);
+            EPrintStrLn("  Belegt sind 0-3, 8-9, 11-12, 24-25, 60, 79-122, 124-188, 200-203, 205-207,"c);
+            EPrintStrLn("  210-215, 217-230, 231-255, 256, 300-341, 515-517, 522-523, 2063-2066, 2315."c);
+            EPrintStrLn("  Massgeblich ist work/lyxos/syscall-ist.txt; erneuern mit"c);
+            EPrintStrLn("  tools/lyxos_syscall_abgleich.sh --schreiben (#1795)."c);
             EPrintStrLn("  Diese Nummer stammt aus der Entwurfs-ABI (hex-Gruppen), nicht aus dem Kernel."c);
             EPrintStrLn("  Massgeblich ist die aus kernel/ring3.lyx ERZEUGTE Tabelle (tools/sync_syscalls.py),"c);
             EPrintStrLn("  nicht work/lyxos/antwort-lyxos.md — das ist eine Handfassung und unvollstaendig (#1734)."c);
@@ -1946,6 +1955,31 @@ pub type EmitLyxOS = class {
     // WP-ALIGN: alignN>0 → über-allozieren (size+alignN) + Ergebnis auf alignN aufrunden
     // (Bump-Allokator liefert unaligned). alignN=0 → Standard.
     fn emitAlloc(sizeSlot: int64, dest: int64, alignN: int64): void {
+        // #1861: Groesse pruefen, BEVOR mmap gerufen wird.
+        //
+        // `.ring3_mmap` im Bootloader liest NEGATIVE Groessen als interne
+        // Befehle: -1 = No-Op, -5 = Adresse des r3_sc_block, -6 = Ausloeser,
+        // -7 = Bildspeicher. Ein `alloc(n)` mit negativem n ruft damit keine
+        // Speicheranforderung auf, sondern bekommt einen KERNELZEIGER zurueck
+        // — und die Nullung unten schrieb ihn mit `rep stosb` und rcx = n als
+        // vorzeichenlose Zahl voll. Genau das hat in lyx-os#… den Kernel
+        // zerschrieben, bis der naechste Timer-Tick auf ein zerstoertes
+        // IDT-Gate traf (#GP e=0102 -> #DF -> Triple Fault).
+        //
+        // Eine Groesse <= 0 ist keine gueltige Anforderung. Sie liefert 0,
+        // ohne den Kernel zu fragen — dasselbe, was eine gescheiterte
+        // Anforderung liefert.
+        self.emitMovRcxFromSlot(sizeSlot);
+        self.emit8(0x48); self.emit8(0x85); self.emit8(0xC9);   // TEST rcx, rcx
+        self.emit8(0x7F); self.emit8(0x00);                     // JG weiter (rel8, gepatcht)
+        var jgOff: int64 := self.codeLen - 1;
+        self.emit8(0x31); self.emit8(0xC0);                     // XOR eax, eax → Zeiger 0
+        self.emit8(0xE9); self.emit32(0);                       // JMP ende (rel32, gepatcht)
+        var jmpOff:  int64 := self.codeLen - 4;
+        var nachJmp: int64 := self.codeLen;
+        // weiter:
+        poke8(self.codeBuf + jgOff, (self.codeLen - (jgOff + 1)) & 0xFF);
+
         self.emitMovRaxImm(9);
         self.emit8(0x31); self.emit8(0xFF);
         self.emitMovRsiFromSlot(sizeSlot);
@@ -1974,6 +2008,13 @@ pub type EmitLyxOS = class {
         // Zusicherung selbst herstellen muss; ein IRO_CALL_BUILTIN 216 im
         // Lowerer traefe auch xtensa und arm-cm, die keine Blockoperation
         // kennen.
+        //
+        // #1861: nur nullen, wenn die Anforderung ueberhaupt einen Zeiger
+        // geliefert hat. Ohne diese Pruefung schreibt `rep stosb` ab Adresse 0
+        // los, sobald der Kernel die Anforderung ablehnt.
+        self.emit8(0x48); self.emit8(0x85); self.emit8(0xC0);                            // TEST rax, rax
+        self.emit8(0x74); self.emit8(0x00);                                              // JZ ohneNullung (gepatcht)
+        var jzOff: int64 := self.codeLen - 1;
         self.emit8(0x50);                                                                // push rax (Zeiger retten)
         self.emit8(0x48); self.emit8(0x89); self.emit8(0xC7);                            // mov rdi, rax
         self.emitMovRcxFromSlot(sizeSlot);                                               // rcx = Groesse
@@ -1984,13 +2025,25 @@ pub type EmitLyxOS = class {
         self.emit8(0xFC);                                                                // cld
         self.emit8(0xF3); self.emit8(0xAA);                                              // rep stosb
         self.emit8(0x58);                                                                // pop rax
+        // ohneNullung:
+        poke8(self.codeBuf + jzOff, (self.codeLen - (jzOff + 1)) & 0xFF);
+        // ende:
+        self.patch32(jmpOff, self.codeLen - nachJmp);
         self.emitMovSlotFromRax(dest);
     }
 
-    // sys_munmap(addr, size=0) — KEIN §10.4-Äquivalent (Bump-Allokator kennt kein Free).
-    // Nummer 0x0101 bleibt als Design-Platzhalter; Kernel liefert -1 (No-Op-Semantik).
+    // sys_munmap(addr, size=0).
+    //
+    // #1795: hier stand 0x0101 mit dem Vermerk „Kernel liefert -1". Das stimmt
+    // nicht — 257 behandelt WEDER Bootloader NOCH Dispatcher, der Aufruf lief
+    // in `.r3_unknown` und bekam still 0 samt Erfolgsmeldung. Aufgefallen ist
+    // es nie, weil diese Stelle die Nummer roh emittiert und damit an der
+    // Pruefung in emitVfsSyscall vorbeilaeuft.
+    //
+    // Die gewollte No-Op-Semantik gibt es wirklich: der Bootloader faengt 11
+    // ab und schickt sie nach `.ring3_noop`.
     fn emitFree(ptrSlot: int64): void {
-        self.emitMovRaxImm(0x0101);
+        self.emitMovRaxImm(11);
         var off: int64 := self.slotOff(ptrSlot);
         if ptrSlot < 16 {
             self.emit8(0x48); self.emit8(0x8B); self.emit8(0x7D);
@@ -3456,15 +3509,23 @@ pub type EmitLyxOS = class {
         // jedes Programm. Siehe #1795.
         if nr == 60  { return 1; }                // sys_exit
         if nr == 231 { return 1; }                // sys_exit_group
-        if nr >= 79  && nr <= 102 { return 1; }
-        if nr >= 110 && nr <= 122 { return 1; }
+        // Ebenfalls nur im Bootloader, beim ersten Abgleich uebersehen: 11
+        // endet in `.ring3_noop`, 12 in `.ring3_brk_user`. Auch 256 (0x0100,
+        // `.ring3_mmap`) und 515 (0x0203, `.ring3_write`) stehen nur dort —
+        // dieses Backend emittiert 515 fuer JEDE Ausgabe, ohne dass die
+        // Nummer je durch diese Pruefung lief. Siehe #1795.
+        if nr == 11  { return 1; }                // sys_munmap → .ring3_noop
+        if nr == 12  { return 1; }                // sys_brk    → .ring3_brk_user
+        if nr == 256 { return 1; }                // 0x0100 lyxc-mmap
+        if nr == 515 { return 1; }                // 0x0203 lyxc-write
+        if nr >= 79  && nr <= 122 { return 1; }   // 103-109 seit b3fad13 (Grafik, Disk)
         if nr >= 124 && nr <= 188 { return 1; }
         if nr >= 200 && nr <= 203 { return 1; }
-        if nr == 205 { return 1; }
+        if nr >= 205 && nr <= 207 { return 1; }   // 206/207 seit b3fad13 (thread_count/info)
         if nr >= 210 && nr <= 215 { return 1; }
         if nr >= 217 && nr <= 230 { return 1; }
         if nr >= 232 && nr <= 255 { return 1; }
-        if nr >= 300 && nr <= 328 { return 1; }
+        if nr >= 300 && nr <= 341 { return 1; }   // 329-341 seit b3fad13 (PCI, NIC)
         if nr >= 516 && nr <= 517 { return 1; }   // sys_seek, sys_stat
         if nr >= 522 && nr <= 523 { return 1; }   // sys_readdir, sys_dup
         if nr >= 2063 && nr <= 2066 { return 1; } // Wissensgraph

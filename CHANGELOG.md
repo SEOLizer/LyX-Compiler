@@ -2,6 +2,36 @@
 
 ## Unveröffentlicht (develop)
 
+### BEHOBEN — zwei Syscalls ins Nichts, und der Abgleich, der sie findet (#1795)
+
+Der lyxos-Nummernwächter aus #1734 prüft, was `emitVfsSyscall` emittiert. Zwei
+Stellen emittieren die Nummer **roh** und liefen an ihm vorbei:
+
+* `free()` schickte `0x0101` (257). Diese Nummer behandelt weder Dispatcher
+  noch Bootloader — der Aufruf landete in `.r3_unknown` und bekam **still 0
+  samt Erfolgsmeldung**. Der Quelltext behauptete „Kernel liefert -1". Jetzt
+  `11` (`sys_munmap`), das der Bootloader nach `.ring3_noop` schickt — genau
+  die gewollte No-Op-Semantik.
+* Der `EVENT_LOOP`-Startcode rief `sys_event_loop_init` (`0x0020` = 32). Den
+  Syscall gibt es nicht; er ist beim LyxOS-Team angefordert und nie gebaut
+  worden. Emittiert wird jetzt nichts, dafür meldet der Bau, dass EVENT_LOOP
+  wie ONE_SHOT läuft.
+
+Beides war unsichtbar, weil ein unbekannter Syscall in LyxOS nicht scheitert.
+
+Der erlaubte Raum stand außerdem vier Tage nach dem Abgleich schon daneben:
+der Kernel hat seither 103-109, 206-207 und 329-341 dazubekommen, und die
+Bootloader-Abfänge 11, 12, 256 und 515 fehlten von Anfang an — `515` (0x0203)
+emittiert dieses Backend für **jede Ausgabe**.
+
+Damit sich das nicht wiederholt:
+
+* `tools/lyxos_syscall_abgleich.sh` erzeugt den Ist-Stand aus **beiden**
+  Quellen (Dispatcher-Tabelle *und* `bootloader/boot.asm`) und legt ihn als
+  `work/lyxos/syscall-ist.txt` ab.
+* `tests/lyxos_syscall_ist_test.sh` hält `lyxosNummerBelegt()`, den abgelegten
+  Stand und die rohen Emissionsstellen zusammen — auch ohne das LyxOS-Repo.
+
 ### NEU — Projektdatei `*.lpf`
 
 `lyxc projekt.lpf` liest Quelle, Ziel, Ausgabe, Include-Pfade, Schalter und

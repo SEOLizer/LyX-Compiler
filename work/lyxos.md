@@ -1089,12 +1089,21 @@ Ohne Annotation: `ONE_SHOT` implizit — identisch mit aktuellem LX-03 `_start`.
 
 **_start-Varianten:**
 - `ONE_SHOT`: aktueller LX-03-Stub (unverändert)
-- `EVENT_LOOP`: zusätzlich `MOV rdi, <tlv_08_va>; MOV rax, 0x0020; SYSCALL` vor CALL main
+- `EVENT_LOOP`: wie ONE_SHOT, solange der Kernel keine Registrierung hat (siehe unten)
 - `DAEMON`: wie ONE_SHOT, aber Kernel behandelt Prozess als Service-Knoten
 - `REACTIVE`: kein `_start` — Kernel startet erst beim ersten Event direkt in `on_event_va`
 
-**Neuer LyxOS-Syscall:** `sys_event_loop_init` (0x0020) — registriert alle TLV-0x08-Quellen
-vor dem ersten `_start`-Aufruf.
+**Neuer LyxOS-Syscall — ANGEFORDERT, NICHT GEBAUT:** `sys_event_loop_init` (0x0020)
+sollte alle TLV-0x08-Quellen vor dem ersten `_start`-Aufruf registrieren. Die
+Nummer 32 steht weder im Dispatcher (`kernel/ring3.lyx`) noch unter den
+Bootloader-Abfängen; ein Aufruf landet in `.r3_unknown` und bekommt **still 0
+samt Erfolgsmeldung**.
+
+Der Startcode hat sie bis 1.1.13E trotzdem emittiert — sichtbar wurde das nie,
+weil ein unbekannter Syscall in LyxOS nicht scheitert. Seit #1795 emittiert
+`emitStartStubEventLoop` nichts mehr und meldet beim Übersetzen, dass
+EVENT_LOOP wie ONE_SHOT läuft. Sobald der Kernel 32 baut, kommt der Aufruf
+zurück — dann über `emitVfsSyscall`, damit die Nummernprüfung ihn sieht.
 
 **Abnahme**
 - `@lifecycle(one_shot)`: TLV 0x08 mit `kind=0x00`, `count=0`; `_start` identisch zu LX-03
