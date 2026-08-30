@@ -146,12 +146,19 @@ quiet "#1826 audio.mic ist deklarierbar" \
   "@capabilities([system.exit, audio.mic])
 $M"
 
-# audio.play bleibt bewusst OHNE Namen: es gibt nur EIN Bit (LBF_CAP_AUDIO_MIC).
-# Ein Name fuer die Wiedergabe, der auf dasselbe Bit abbildet, wuerde beim
-# Anmelden der Wiedergabe still das Mikrofon miterlauben.
-rejects "#1826 audio.play bleibt abgewiesen (nur ein Bit vorhanden)" \
+# #1873: audio.play GIBT es jetzt — mit einem EIGENEN Bit
+# (LBF_CAP_AUDIO_PLAY = 1024). Bis dahin stand hier die Gegenprobe, dass der
+# Name abgewiesen wird; die Begruendung dafuer war nie "Wiedergabe ist
+# gefaehrlich", sondern "es gibt nur ein Bit, und ein zweiter Name darauf
+# wuerde beim Anmelden der Wiedergabe still das Mikrofon miterlauben".
+#
+# Diese Pruefung setzte damit voraus, dass die Luecke offen bleibt — sie waere
+# rot geworden, sobald jemand das Bit anlegt. Geblieben ist die Aussage, auf
+# die es ankommt: die beiden Namen duerfen NICHT dasselbe Recht bedeuten. Das
+# misst tests/capability_io_tty_test.sh am Erzeugnis (verschiedene Abbilder).
+quiet "#1873 audio.play ist deklarierbar" \
   "@capabilities([system.exit, audio.play])
-$M" "unbekannte Capability"
+$M"
 
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"

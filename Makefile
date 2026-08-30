@@ -278,6 +278,7 @@ test: lyxc
 	@bash tests/asm_listing_datei_test.sh
 	@bash tests/feld_endian_test.sh
 	@bash tests/crt_raw_test.sh
+	@bash tests/capability_io_tty_test.sh
 	@bash tests/lyxos_zeit_builtins_test.sh
 	@bash tests/con_globals_test.sh
 	@bash tests/lyxos_argv_test.sh
