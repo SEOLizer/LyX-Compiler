@@ -66,6 +66,38 @@ con SC_SYS_WRITE:         int64 := 1;
 con SC_SYS_CLOSE:         int64 := 3;
 con SC_SYS_FSTAT:         int64 := 5;
 con SC_SYS_FCNTL:         int64 := 72;   // #1276
+// #1866: Warten. nanosleep und clock_nanosleep haengen an system.time.
+con SC_SYS_NANOSLEEP:       int64 := 35;
+con SC_SYS_CLOCK_NANOSLEEP: int64 := 230;
+// #1868: auf Deskriptoren warten (io.wait).
+con SC_SYS_POLL:            int64 := 7;
+con SC_SYS_SELECT:          int64 := 23;
+con SC_SYS_EPOLL_WAIT:      int64 := 232;
+con SC_SYS_EPOLL_CTL:       int64 := 233;
+con SC_SYS_PPOLL:           int64 := 271;
+con SC_SYS_EPOLL_PWAIT:     int64 := 281;
+con SC_SYS_TIMERFD_CREATE:  int64 := 283;
+con SC_SYS_TIMERFD_SETTIME: int64 := 286;
+con SC_SYS_TIMERFD_GETTIME: int64 := 287;
+con SC_SYS_SIGNALFD4:       int64 := 289;
+con SC_SYS_EVENTFD2:        int64 := 290;
+con SC_SYS_EPOLL_CREATE1:   int64 := 291;
+// #1869: Deskriptoren erzeugen und verdoppeln (io.fd).
+con SC_SYS_PIPE:            int64 := 22;
+con SC_SYS_DUP:             int64 := 32;
+con SC_SYS_DUP2:            int64 := 33;
+con SC_SYS_DUP3:            int64 := 292;
+con SC_SYS_PIPE2:           int64 := 293;
+// #1867: Terminal (system.tty). ioctl selbst ist Nummer 16; erlaubt werden
+// nicht ALLE Kommandos, sondern genau diese sechs — das Kommando steht in
+// args[1], also im Argumentfilter.
+con SC_SYS_IOCTL:         int64 := 16;
+con SC_TCGETS:            int64 := 0x5401;
+con SC_TCSETS:            int64 := 0x5402;
+con SC_TCSETSW:           int64 := 0x5403;
+con SC_TCSETSF:           int64 := 0x5404;
+con SC_TIOCGWINSZ:        int64 := 0x5413;
+con SC_TIOCSWINSZ:        int64 := 0x5414;
 con SC_BPF_CAP:           int64 := 1024;  // #1276: Kapazitaet des BPF-Puffers in Befehlen
 // fcntl-Kommandos, die Dateizugriff begleiten (F_DUPFD und alles rund um
 // Deskriptor-Vererbung, Statusflags und Datei-Sperren). Bewusst NICHT
@@ -196,6 +228,13 @@ con SC_CAP_PROCESS_SIGNAL:      int64 := 27;
 con SC_CAP_PROCESS_SCHED:       int64 := 28;
 con SC_CAP_PROCESS_EXIT:        int64 := 29;
 con SC_CAP_FS_PERM:             int64 := 30;   // #1188
+// Die Nummern muessen mit src/security/capabilities.lyx uebereinstimmen —
+// zwei getrennte Aufzaehlungen derselben Sache. Wer hier eine ergaenzt,
+// ergaenzt sie dort auch.
+con SC_CAP_AUDIO_PLAY:          int64 := 36;   // #1873
+con SC_CAP_IO_WAIT:             int64 := 37;   // #1868
+con SC_CAP_IO_FD:               int64 := 38;   // #1869
+con SC_CAP_SYSTEM_TTY:          int64 := 39;   // #1867
 
 // O_WRONLY=1, O_RDWR=2 — Maskierung für openat-Argument-Filter
 con SC_O_WRITE_MASK: int64 := 3;
@@ -233,6 +272,10 @@ pub fn seccomp_cap_id_from_path(path: pchar, len: int64): int64 {
   if sc_path_eq("fs.delete"c,                   path, len) { return SC_CAP_FS_DELETE; }
   if sc_path_eq("fs.meta"c,                     path, len) { return SC_CAP_FS_META; }
   if sc_path_eq("fs.perm"c,                     path, len) { return SC_CAP_FS_PERM; }   // #1188
+  if sc_path_eq("audio.play"c,                  path, len) { return SC_CAP_AUDIO_PLAY; }  // #1873
+  if sc_path_eq("io.wait"c,                     path, len) { return SC_CAP_IO_WAIT; }     // #1868
+  if sc_path_eq("io.fd"c,                       path, len) { return SC_CAP_IO_FD; }       // #1869
+  if sc_path_eq("system.tty"c,                  path, len) { return SC_CAP_SYSTEM_TTY; }  // #1867
   if sc_path_eq("fs.exec"c,                     path, len) { return SC_CAP_FS_EXEC; }
   if sc_path_eq("memory.mmap"c,                 path, len) { return SC_CAP_MEMORY_MMAP; }
   if sc_path_eq("memory.lock"c,                 path, len) { return SC_CAP_MEMORY_LOCK; }
@@ -509,8 +552,63 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
     n := sc_allow_nr(bpfBuf, n, SC_SYS_EXECVEAT);
   }
 
+  // #1866: `system.time` erlaubte nur clock_gettime — sleep() starb damit an
+  // SIGSYS, und es gab keine andere Capability, die es freigegeben haette.
+  // Warten ist keine eigene Vertrauensfrage: wer die Uhr lesen darf, darf auch
+  // warten, und ohne system.time laesst sich ueber nanosleep auch keine Zeit
+  // messen.
   if sc_has_cap(capBuf, capCount, SC_CAP_SYSTEM_TIME) {
     n := sc_allow_nr(bpfBuf, n, SC_SYS_CLOCK_GETTIME);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_NANOSLEEP);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_CLOCK_NANOSLEEP);
+  }
+
+  // #1868: auf Deskriptoren warten. Die Capability macht kein neues Objekt
+  // erreichbar — gewartet wird auf das, was das Programm ohnehin schon hat.
+  // eventfd, signalfd und timerfd ERZEUGEN allerdings Deskriptoren; sie
+  // gehoeren deshalb an dieselbe ausdrueckliche Zusage und nicht in den
+  // impliziten Basissatz.
+  if sc_has_cap(capBuf, capCount, SC_CAP_IO_WAIT) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_POLL);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_PPOLL);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_SELECT);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_EPOLL_CREATE1);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_EPOLL_CTL);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_EPOLL_WAIT);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_EPOLL_PWAIT);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_EVENTFD2);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_SIGNALFD4);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_TIMERFD_CREATE);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_TIMERFD_SETTIME);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_TIMERFD_GETTIME);
+  }
+
+  // #1869: Deskriptoren erzeugen und verdoppeln. Ohne pipe+dup2 kann ein
+  // Kindprozess nichts zurueckgeben — process.fork/exec waren deklarierbar,
+  // die Weiterleitung der Ausgabe nicht.
+  //
+  // fcntl steht bewusst NICHT hier: es ist seit #1276 unter fs.read/fs.write
+  // mit Argumentfilter freigegeben. Es ein zweites Mal zu erlauben waere eine
+  // stille Ausweitung fuer jeden, der nur eine Roehre braucht.
+  if sc_has_cap(capBuf, capCount, SC_CAP_IO_FD) {
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_PIPE);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_PIPE2);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_DUP);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_DUP2);
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_DUP3);
+  }
+
+  // #1867: Terminalarbeit. Bisher hing sie an hardware.gpio — einem Recht auf
+  // Universal-I/O-Pins, das mit dem Terminal nichts zu tun hat. Hier NUR die
+  // sechs termios- und Fenstergroessen-Kommandos, ueber den Argumentfilter:
+  // `system.tty` erlaubt kein Netz-, Block- oder Geraete-ioctl.
+  if sc_has_cap(capBuf, capCount, SC_CAP_SYSTEM_TTY) {
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_IOCTL, SC_TCGETS);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_IOCTL, SC_TCSETS);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_IOCTL, SC_TCSETSW);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_IOCTL, SC_TCSETSF);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_IOCTL, SC_TIOCGWINSZ);
+    n := sc_allow_nr_arg1(bpfBuf, n, SC_SYS_IOCTL, SC_TIOCSWINSZ);
   }
 
   if sc_has_cap(capBuf, capCount, SC_CAP_SYSTEM_RAND) {
@@ -628,7 +726,13 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
                      sc_has_cap(capBuf, capCount, SC_CAP_HARDWARE_SPI)  ||
                      sc_has_cap(capBuf, capCount, SC_CAP_HARDWARE_USB);
   if hasHw {
-    n := sc_allow_nr(bpfBuf, n, 16);  // ioctl
+    // #1867: Hier steht ioctl weiterhin OHNE Argumentfilter — ein
+    // GPIO-Programm bekommt damit auch Terminal-, Netz- und
+    // Blockgeraet-ioctls. Das ist zu weit und in #1867 benannt; eingegrenzt
+    // wird es erst, wenn die Kommandolisten je Hardware-Klasse erhoben sind.
+    // Was dieses Issue loest, ist die andere Richtung: Terminalarbeit braucht
+    // hardware.gpio nicht mehr, dafuer gibt es system.tty.
+    n := sc_allow_nr(bpfBuf, n, SC_SYS_IOCTL);
   }
 
   // ---- Standard-Aktion: Kill ----------------------------------------

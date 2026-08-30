@@ -82,7 +82,8 @@ Diese Capabilities sind in jedem Lyx-Programm automatisch aktiv:
 
 | Capability | Beschreibung |
 |-----------|-------------|
-| `system.time` | Systemzeit lesen |
+| `system.time` | Systemzeit lesen **und warten** (`clock_gettime`, `nanosleep`, `clock_nanosleep`) |
+| `system.tty` | Terminal einstellen — `ioctl` nur mit `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF`/`TIOCGWINSZ`/`TIOCSWINSZ` |
 | `system.env` | Umgebungsvariablen lesen (Compile-Zeit-Filter) |
 | `system.rand` | Kryptographisch sichere Zufallszahlen |
 | `system.unsafe.format_string` | Format-String-Funktionen (printf etc.) |
@@ -125,8 +126,26 @@ Immer erlaubt, ohne Capability: `exit_group`, `exit`, `brk`, `mmap(anon)`,
 geben Auskunft ueber den eigenen Prozess und beruehren nichts ausserhalb davon;
 ohne sie ist eine extern gelinkte Bibliothek nicht benutzbar (OpenSSL ruft
 `getpid` beim Init). `clock_gettime` gehoert bewusst NICHT dazu — dafuer gibt
-es `system.time`.
+es `system.time`, das seit #1866 auch `nanosleep` und `clock_nanosleep`
+abdeckt: wer die Uhr lesen darf, darf auch warten, und ohne das Recht laesst
+sich ueber `nanosleep` auch keine Zeit messen.
 | `fs.exec` | Ausführbare Dateien starten |
+
+#### Ein- und Ausgabe
+
+| Capability | Beschreibung |
+|-----------|-------------|
+| `io.wait` | Auf Deskriptoren warten: `poll`, `ppoll`, `select`, `epoll_*`, `eventfd2`, `signalfd4`, `timerfd_*` |
+| `io.fd` | Deskriptoren erzeugen und verdoppeln: `pipe`, `pipe2`, `dup`, `dup2`, `dup3` |
+
+`io.wait` macht kein neues Objekt erreichbar — gewartet wird auf das, was das
+Programm ohnehin schon hat. `eventfd`, `signalfd` und `timerfd` erzeugen
+allerdings Deskriptoren, weshalb die Zusage ausdrücklich bleibt und nicht in
+den impliziten Basissatz wandert.
+
+`fcntl` gehört **nicht** zu `io.fd`: es ist seit #1276 unter `fs.read` und
+`fs.write` mit Argumentfilter freigegeben (`F_GETFD`, `F_SETFD`, `F_GETFL`,
+`F_SETFL` und die Sperren).
 
 #### Memory
 
@@ -541,6 +560,15 @@ Der Score bewertet die Qualität des Sicherheitsmodells (aktuell max. 40, mit op
 | 27 | `process.signal` | Prozess |
 | 28 | `process.sched` | Prozess |
 | 29 | `process.exit` | Prozess |
+| 30 | `fs.perm` | Dateisystem |
+| 32 | `system.config` | System |
+| 33 | `ki.embed` | KI |
+| 34 | `ki.graph` | KI |
+| 35 | `audio.mic` | Audio |
+| 36 | `audio.play` | Audio |
+| 37 | `io.wait` | Ein-/Ausgabe |
+| 38 | `io.fd` | Ein-/Ausgabe |
+| 39 | `system.tty` | System |
 
 ---
 
