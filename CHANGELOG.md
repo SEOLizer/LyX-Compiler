@@ -2,6 +2,27 @@
 
 ## Unveröffentlicht (develop)
 
+### BEHOBEN — `--asm-listing` schreibt die Datei, die der Hilfetext nennt (#1862)
+
+`--asm-listing` schrieb nach stdout, obwohl Hilfetext und Changelog
+`<ausgabe>.asm` versprachen: den Pfad setzte nur `--emit-asm`. Für den Nachweis
+nach DO-178C 6.1 ist die Datei die brauchbarere Form — ein Listing, das man
+erst aus der Compilerausgabe herausfiltern muss, steht neben dem
+Sicherheits-Audit auf demselben Strom.
+
+Die drei Schalter sind jetzt sauber getrennt, und der Hilfetext nennt alle drei
+(`--dump-asm` fehlte darin ganz):
+
+| Schalter | Ziel |
+|---|---|
+| `--dump-asm` | stdout |
+| `--emit-asm` | `<ausgabe>.asm` |
+| `--asm-listing` | `<ausgabe>.asm`, zusätzlich mit Quellzeilen |
+
+Wird `--dump-asm` mit einem der Dateischalter kombiniert, gewinnt die Datei —
+und der Lauf sagt wohin, statt die erwartete Ausgabe wortlos ausbleiben zu
+lassen.
+
 ### BEHOBEN — zwei Syscalls ins Nichts, und der Abgleich, der sie findet (#1795)
 
 Der lyxos-Nummernwächter aus #1734 prüft, was `emitVfsSyscall` emittiert. Zwei
