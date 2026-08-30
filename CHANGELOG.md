@@ -2,6 +2,33 @@
 
 ## Unveröffentlicht (develop)
 
+### BEHOBEN — `ParseDMS` rechnet exakt und meldet, `HaversineDistanceM` heißt jetzt ehrlich (#1888)
+
+**Punkt 3:** `ParseDMS` nutzte die gerundeten Festkommafaktoren `16667` je
+Minute und `278` je Sekunde. `0°60'00"` ergab damit 1 000 020 statt exakt
+1 000 000 Mikrograd — rund 2 m daneben, systematisch und mit dem Winkel
+wachsend. Jetzt wird ganzzahlig exakt über den gemeinsamen Nenner 3600
+gerechnet.
+
+Schwerer wog der stille Default: eine **unbekannte Himmelsrichtung** wurde
+angenommen und der Wert positiv zurückgegeben, als wäre `N` gemeint — nur `S`
+und `W` kehrten das Vorzeichen um, alles andere fiel durch. Ein Tippfehler im
+Richtungsbuchstaben spiegelte damit eine Position auf die andere Erdhalbkugel.
+Jetzt melden unbekannte Richtungen und Minuten/Sekunden ab 60 den Fehlerwert
+`GEO_DMS_FEHLER` (999 000 000 Mikrograd = 999°, außerhalb jedes gültigen
+Bereichs — 0 wäre die gefährlichste Antwort gewesen, denn das ist eine gültige
+Koordinate).
+
+**Punkt 2:** `HaversineDistanceM` heißt jetzt `DistanceMApprox`. Es ist keine
+Haversine, sondern Pythagoras auf der flachen Erde mit Kosinus-Korrektur; der
+Gültigkeitsbereich (bis ~100 km, nicht über die Datumsgrenze) steht mit den
+gemessenen Abweichungen im Kopf der Funktion. Der alte Name bleibt als
+Weiterleitung stehen, damit vorhandener Code läuft — mit dem Vermerk, dass er
+falsch ist und verschwinden wird. `Bearing` hat denselben ehrlichen Kopf
+bekommen (34° Abweichung auf Hamburg–New York).
+
+Für weltweite Werte: `std.geo.sphere`.
+
 ### NEU — `std.astro`: Bahnmechanik in fünf Units
 
 Es gab in `std/` nichts dergleichen — kein Kepler, kein Hohmann, keine

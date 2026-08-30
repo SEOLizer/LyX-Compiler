@@ -323,6 +323,16 @@ pub fn BoundingBoxCenter(min: GeoPoint, max: GeoPoint): GeoPoint {
 // Gezaehlt wird im Uhrzeigersinn ab Nord: atan2(Ost, Nord). Die Ostkomponente
 // braucht die Kosinus-Korrektur, sonst zeigt jeder Kurs zu weit nach Osten, je
 // naeher man dem Pol kommt.
+// #1888: Auch dieser Kurs ist eine NAHBEREICHS-Naeherung. Sie rechnet in der
+// Ebene mit einer Kosinus-Korrektur auf der Mittelbreite; auf dem Grosskreis
+// ist der Kurs weder konstant noch der hier gelieferte. Gemessen:
+// Hamburg -> New York gibt 257.3 statt 293.2 Grad — 34 Grad daneben, der
+// Unterschied zwischen West-Suedwest und West-Nordwest.
+//
+// Die Datumsgrenze wird auch hier nicht behandelt.
+//
+// Fuer einen Kurs, den man steuern kann: GeoKurs (Anfangskurs) oder
+// GeoLoxodromKurs (fester Kurs) aus std.geo.sphere.
 pub fn Bearing(p1: GeoPoint, p2: GeoPoint): int64 {
   var dLon: int64 := p2.x - p1.x;
   var dLat: int64 := p2.y - p1.y;
@@ -369,12 +379,34 @@ fn CosLatTable(latDeg: int64): int64 {
 }
 
 // ============================================================================
-// Haversine Distance (Präzise Distanzberechnung)
+// Naeherungsweise Entfernung im NAHBEREICH
 // ============================================================================
-
-// Haversine-Formel für präzise Distanzberechnung auf der Erdkugel
-// Verwendet Fixed-Point Arithmetik ohne Floats
-pub fn HaversineDistanceM(p1: GeoPoint, p2: GeoPoint): int64 {
+//
+// #1888: Diese Funktion hiess HaversineDistanceM und war als "Praezise
+// Distanzberechnung" ueberschrieben. Beides stimmte nicht — gerechnet wird
+// Pythagoras auf der flachen Erde mit einer Kosinus-Korrektur aus einer
+// Tabelle, und der Name war die Zusicherung, die niemand nachprueft.
+//
+// GEMESSEN (1.1.14C), damit der Gueltigkeitsbereich hier steht und nicht in
+// der Doku:
+//
+//     Hamburg -> Bremen (95 km)      95 579 m   statt     95 000 m   +0.6 %
+//     Hamburg -> New York         6 535 376 m   statt  6 134 000 m   +6.5 %
+//     Sydney -> Buenos Aires     19 342 830 m   statt 11 800 000 m   +64 %
+//     179 Ost -> 179 West        39 852 202 m   statt    222 000 m   Faktor 180
+//
+// Die Datumsgrenze wird gar nicht behandelt: aus 179 Ost und 179 West werden
+// 358 Grad Laengendifferenz statt 2.
+//
+// BRAUCHBAR bis rund 100 km, wenn die Strecke die Datumsgrenze nicht kreuzt.
+// Fuer alles andere: std.geo.sphere, das in f64 auf der Kugel rechnet, echte
+// Haversine benutzt und weltweit gilt.
+//
+// Warum die Naeherung bleibt: diese Unit ist bewusst ohne Fliesskomma gebaut
+// (Bounding-Boxen, Rechteckschnitte, Nahbereichsvergleiche in Mikrograd).
+// Sie durch die f64-Fassung zu ersetzen waere eine andere Entscheidung als
+// die, die dieses Issue verlangt — hier geht es um den NAMEN.
+pub fn DistanceMApprox(p1: GeoPoint, p2: GeoPoint): int64 {
   // Umrechnung zu Radiant-ähnlichen Werten (Fixed-Point)
   // Wir nutzen eine vereinfachte Näherung
   
@@ -436,25 +468,63 @@ pub fn HaversineDistanceM(p1: GeoPoint, p2: GeoPoint): int64 {
   return guess;
 }
 
+// #1888: Der alte Name bleibt als Weiterleitung stehen, damit vorhandener
+// Code weiterlaeuft — aber er ist FALSCH und wird verschwinden. Es ist keine
+// Haversine, und "praezise" ist sie nur im Nahbereich. Wer weltweite Werte
+// braucht, nimmt std.geo.sphere; wer die Naeherung will, ruft
+// DistanceMApprox und sieht am Namen, was er bekommt.
+pub fn HaversineDistanceM(p1: GeoPoint, p2: GeoPoint): int64 {
+  return DistanceMApprox(p1, p2);
+}
+
 // ============================================================================
 // DMS Parsing & Formatting (Grad, Minuten, Sekunden)
 // ============================================================================
 
-// Konvertiert DMS zu Microdegrees
-// degrees: Grad, minutes: Bogenminuten (0-59), seconds: Bogensekunden (0-59)
-// direction: 'N', 'S', 'E', 'W'
+// Fehlerwert fuer die Ganzzahl-Schnittstelle.
+//
+// Sie kann kein NaN fuehren, und 0 waere die gefaehrlichste Antwort — es ist
+// eine gueltige Koordinate (Nullmeridian am Aequator). 999000000 Mikrograd
+// sind 999 Grad und damit ausserhalb jedes Bereichs, den es gibt; wer den
+// Wert ungeprueft weiterreicht, bekommt an der naechsten Bereichspruefung
+// einen Fehler statt einer stillen Fehlposition.
+pub con GEO_DMS_FEHLER: int64 := 999000000;
+
+pub fn GeoIstDmsFehler(v: int64): bool { return v == GEO_DMS_FEHLER; }
+
+// Konvertiert Grad/Minuten/Sekunden zu Mikrograd.
+// direction: 'N' (78), 'S' (83), 'E' (69), 'W' (87).
+//
+// #1888: Zwei Fehler waren hier drin.
+//
+// 1. Die Umrechnung nutzte die gerundeten Festkommafaktoren 16667 und 278
+//    statt 1000000/60 und 1000000/3600. Damit ergaben 0 Grad 60 Minuten
+//    1000020 statt exakt 1000000 — rund 2 m daneben, systematisch und mit dem
+//    Winkel wachsend. Jetzt wird ganzzahlig exakt gerechnet: Minuten und
+//    Sekunden gehen ueber einen gemeinsamen Nenner, damit nichts zweimal
+//    gerundet wird.
+//
+// 2. Eine UNBEKANNTE Himmelsrichtung wurde still angenommen und der Wert
+//    positiv zurueckgegeben, als waere Nord gemeint — nur 'S' und 'W' kehrten
+//    das Vorzeichen um, alles andere fiel durch. Ein Tippfehler im
+//    Richtungsbuchstaben spiegelte damit eine Position auf die andere
+//    Erdhalbkugel, ohne dass es auffiel.
+//
+// Ebenfalls abgewiesen werden Minuten oder Sekunden ab 60: das ist keine
+// Schreibweise, sondern ein Tippfehler, und 0 Grad 61 Minuten liegen 1.85 km
+// neben der gemeinten Stelle.
 pub fn ParseDMS(degrees: int64, minutes: int64, seconds: int64, direction: int64): int64 {
-  // Total microdegrees = degrees * 1.000.000 + minutes * 1.000.000/60 + seconds * 1.000.000/3600
-  // Vereinfacht: minutes * 16667 + seconds * 278
-  var result: int64 := degrees * 1000000;
-  result := result + minutes * 16667;
-  result := result + seconds * 278;
-  
-  // Südlich oder westlich = negativ
-  if (direction == 83) { result := -result; }  // 'S'
-  if (direction == 87) { result := -result; } // 'W'
-  
-  return result;
+  if (degrees < 0 || minutes < 0 || seconds < 0) { return GEO_DMS_FEHLER; }
+  if (minutes > 59 || seconds > 59) { return GEO_DMS_FEHLER; }
+
+  // Exakt und ohne Zwischenrundung: alles ueber den Nenner 3600.
+  //   mikro = (grad * 3600 + minuten * 60 + sekunden) * 1000000 / 3600
+  var bogensekunden: int64 := degrees * 3600 + minutes * 60 + seconds;
+  var result: int64 := (bogensekunden * 1000000) / 3600;
+
+  if (direction == 78 || direction == 69) { return result; }          // 'N', 'E'
+  if (direction == 83 || direction == 87) { return 0 - result; }      // 'S', 'W'
+  return GEO_DMS_FEHLER;                                              // unbekannt: melden
 }
 
 // Formatiert Koordinate als DMS-String
