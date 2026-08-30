@@ -892,7 +892,8 @@ All coordinates are stored as **microdegrees** (int64):
 - `DistanceKm(p1, p2: GeoPoint): int64` - Distance in kilometers
 - `DistanceSq(p1, p2: GeoPoint): int64` - Squared distance (for comparisons)
 - `IsWithinDistanceM(p1, p2: GeoPoint, thresholdM: int64): bool` - Distance threshold
-- `HaversineDistanceM(p1, p2: GeoPoint): int64` - Precise great-circle distance
+- `DistanceMApprox(p1, p2: GeoPoint): int64` - Näherung für den **Nahbereich** (bis ~100 km, +0,6 %); weltweit falsch (+64 % auf der Südhalbkugel, Faktor 180 an der Datumsgrenze, #1888). Für weltweite Werte `std.geo.sphere`
+- `HaversineDistanceM(p1, p2: GeoPoint): int64` - **veralteter Name** für `DistanceMApprox`; es ist keine Haversine
 - `DistanceMCorrected(p1, p2: GeoPoint): int64` - With cosine correction
 
 ### GeoPoint Helpers
