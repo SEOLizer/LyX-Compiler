@@ -2,6 +2,35 @@
 
 ## Unveröffentlicht (develop)
 
+### BEHOBEN — `@little_endian` am Feld (#1864) und `std.crt_raw` (#1874)
+
+**`@little_endian`** stand in der Attributliste des Parsers und im Hilfetext,
+wurde am Feld aber nie angenommen — `@little_endian a: int32;` gab
+`Parse error: expected IDENT, got @`. Ein Feld ausdrücklich auf Little-Endian
+zu setzen war damit nicht schreibbar, auch nicht als Gegenangabe neben
+`@big_endian`-Feldern im selben Protokollkopf.
+
+Angenommen wird es jetzt an **beiden** Fundstellen — Struct-Feld und
+Klassen-Eigenschaft sind zwei getrennte Aufzählungen derselben Sache, und
+genau daran ist die Lücke entstanden. Auf allen heutigen Zielen ist
+Little-Endian ohnehin die Speicherordnung; das neue Bit
+`FIELD_FLAG_LITTLE_ENDIAN` hält die ausdrückliche Angabe trotzdem fest und
+macht die Gegenprobe möglich: `@big_endian @little_endian` am selben Feld wird
+abgewiesen statt still nach der letzten Angabe entschieden.
+
+**`std.crt_raw`** hatte zwei Platzhalter: `SetRawMode` gab immer `-1`,
+`KeyPressed` immer `false`. Beide sind umgesetzt — `SetRawMode` schaltet
+`ICANON`/`ECHO`/`ISIG` und `ICRNL`/`IXON` ab, setzt `VMIN`/`VTIME` und merkt
+sich den vorherigen Zustand, damit das Terminal beim Zurücknehmen wieder so
+dasteht wie vorher. `KeyPressed` fragt `poll` mit Zeitlimit 0.
+
+Dabei fiel ein dritter Fehler auf: `ReadKeyRaw` las in ein **String-Literal**
+(`var buf: pchar := "\0";`). Literale liegen im schreibgeschützten Teil des
+Erzeugnisses — `read` schrieb also in den Literalpool. Jetzt `alloc`.
+
+Unter LCBS bleiben beide Funktionen vorerst auf eine Hardware-Capability
+angewiesen (`ioctl`, #1867) bzw. gar nicht deklarierbar (`poll`, #1868).
+
 ### BEHOBEN — `--asm-listing` schreibt die Datei, die der Hilfetext nennt (#1862)
 
 `--asm-listing` schrieb nach stdout, obwohl Hilfetext und Changelog

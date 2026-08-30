@@ -132,7 +132,7 @@ RC=0
 if [ ! -f "$STAND" ]; then
     echo "FEHLT: $STAND — mit --schreiben anlegen"
     RC=1
-elif ! diff -u "$STAND" "$TMP/neu.txt" > "$TMP/d.txt"; then
+elif ! diff -u <(grep -v '^#' "$STAND") <(grep -v '^#' "$TMP/neu.txt") > "$TMP/d.txt"; then
     echo
     echo "ABWEICHUNG zum abgelegten Stand ($STAND):"
     sed -n '3,$p' "$TMP/d.txt"
@@ -141,6 +141,17 @@ elif ! diff -u "$STAND" "$TMP/neu.txt" > "$TMP/d.txt"; then
     echo "und lyxosNummerBelegt in src/backend/lyxos/emit_lyxos.lyx nachziehen."
     RC=1
 else
-    echo "Stand im Repo ist aktuell."
+    # Verglichen werden die LAEUFE, nicht der Kopf. Sonst faerbt jeder
+    # LyxOS-Commit die Pruefung rot, auch wenn er an den Syscalls nichts
+    # aendert — und ein Test, der aus fremden Gruenden rot wird, wird als
+    # erstes ignoriert.
+    STAND_HER=$(sed -n 's/^# NICHT von Hand pflegen. Quellen (nur gelesen), Stand \(.*\):$/\1/p' "$STAND")
+    if [ "$STAND_HER" != "$HERKUNFT" ]; then
+        echo "Stand im Repo ist aktuell (Nummern unveraendert)."
+        echo "  abgelegt gegen $STAND_HER, jetzt gemessen gegen $HERKUNFT —"
+        echo "  die Herkunftszeile zieht der naechste --schreiben-Lauf nach."
+    else
+        echo "Stand im Repo ist aktuell."
+    fi
 fi
 exit $RC
