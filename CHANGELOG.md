@@ -48,6 +48,36 @@ Exzentrizitätsvektor Betrag 1e-16 bei beliebiger Richtung, weshalb
 Die Grenzen jeder Näherung stehen im Kopf der jeweiligen Unit: Zwei-Körper
 ohne Störungen, exponentielle Atmosphäre mit einer Skalenhöhe, ballistischer
 Eintritt ohne Auftrieb, Ziolkowski ohne Schwerkraft und Luftwiderstand.
+### NEU — `std.geo.sphere`: Entfernungen und Kurse auf der Erdkugel (#1888)
+
+`std.geo` rechnet in ganzzahligen Mikrograd und ist für Rechtecke,
+Bounding-Boxen und den Nahbereich gebaut — dort ist es richtig. Seine
+Entfernungs- und Kursfunktionen sind flache Näherungen, und der Name
+`HaversineDistanceM` verspricht mehr, als der Rumpf hält: gemessen fehlen auf
+Hamburg–New York 6,5 %, auf Sydney–Buenos Aires 64 %, und an der Datumsgrenze
+werden aus 222 km 39 852 km (#1888).
+
+Die neue Unit rechnet in `f64` auf der Kugel und gilt weltweit:
+
+* echte Haversine-Entfernung (m, km, Seemeilen, Winkelabstand)
+* Anfangs- und Endkurs — auf einem Großkreis sind sie **verschieden**
+* Zielpunkt aus Kurs und Entfernung, Mittelpunkt der Strecke
+* Quer- und Längsabweichung mit Vorzeichen (rechts positiv)
+* Loxodrome: fester Kurs und Länge
+* Grad/Minuten/Sekunden mit N/S/E/W, Kompasssektor, Horizontentfernung
+
+Alles datumsgrenzenfest: `GeoNormDelta` holt jede Längendifferenz auf
+−180…+180, bevor gerechnet wird.
+
+Vorzeichen durchgehend: Breite positiv = Nord, Länge positiv = Ost, Kurs
+0…360 mit 0 = Nord. Eine unbekannte Himmelsrichtung wird **gemeldet**, nicht
+als Nord angenommen; `0°60'00"` gilt als Tippfehler und nicht als eine
+Winkelminute mehr.
+
+Die Grenze steht im Kopf der Unit: gegen das WGS84-Ellipsoid weicht die Kugel
+um bis zu 0,5 % ab. Für Navigation und Reichweiten genügt das, für Vermessung
+nicht — Vincenty steht bewusst nicht darin, damit niemand die Kugel dafür
+hält.
 
 ### BEHOBEN — `@little_endian` am Feld (#1864) und `std.crt_raw` (#1874)
 
