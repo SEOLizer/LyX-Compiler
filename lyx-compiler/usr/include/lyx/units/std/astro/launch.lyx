@@ -1,0 +1,244 @@
+// std/astro/launch.lyx
+// Aufstieg: Raketengleichung, Stufung, Startazimut, dv-Bilanz.
+//
+// Die Unit beantwortet vier Fragen, die vor jedem Start stehen:
+//
+//   Was kann die Rakete?      Ziolkowski, Stufung
+//   Kommt sie ueberhaupt hoch? Schub-Gewicht-Verhaeltnis
+//   Wohin darf sie fliegen?   Startazimut aus der Zielinklination
+//   Was kostet der Aufstieg?  dv-Bilanz mit Verlusten und Erddrehung
+//
+// GRENZEN — hier und nicht in der Doku, weil eine Zahl ohne ihre
+// Voraussetzungen gefaehrlicher ist als keine:
+//
+//   * Ziolkowski gilt fuer den ANTRIEB IM LEEREN, ohne Schwerkraft und ohne
+//     Luftwiderstand. Die Verluste stehen deshalb als eigene Groessen daneben
+//     und werden NICHT stillschweigend eingerechnet.
+//   * Der Gravitationsverlust ist eine Naeherung fuer konstanten Bahnwinkel.
+//     Ein wirklicher Aufstieg dreht sich kontinuierlich; die geschlossene
+//     Formel taugt zur Auslegung, nicht zur Flugbahnrechnung.
+//   * Kein Luftwiderstandsmodell. Der Widerstandsverlust ist ein
+//     ERFAHRUNGSWERT, den der Aufrufer setzt — die Unit rechnet ihn nicht aus.
+//   * Keine Steuerungsverluste durch Anstellwinkel.
+//
+// Einheiten SI: Meter, m/s, kg, Newton, Sekunden, Radiant.
+
+@description("Raketengleichung, Stufung, Startazimut und dv-Bilanz")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.astro.launch;
+
+import std.math;
+import std.astro.state;
+import std.astro.orbit;
+
+// Normfallbeschleunigung. Sie ist eine DEFINITION (genau 9.80665) und nicht
+// die oertliche Schwere — der spezifische Impuls ist ueber sie festgelegt,
+// weltweit gleich, unabhaengig vom Startort.
+pub fn AStandardGravity(): f64 { return 9.80665; }
+
+// ── Raketengleichung ──────────────────────────────────────────────────────
+
+// Ausstroemgeschwindigkeit aus dem spezifischen Impuls [m/s]: v_e = Isp * g0.
+pub fn AExhaustSpeed(isp: f64): f64 {
+  if (isp <= 0.0) { return AError(); }
+  return isp * AStandardGravity();
+}
+
+// Ziolkowski: dv = Isp * g0 * ln(m_start / m_leer).
+//
+// Die Formel sagt drei Dinge, die man beim Auslegen immer wieder braucht:
+// dv waechst nur LOGARITHMISCH mit dem Massenverhaeltnis (doppelt so viel
+// Treibstoff bringt nicht doppelt so viel), aber LINEAR mit Isp — deshalb
+// lohnt ein besseres Triebwerk mehr als ein groesserer Tank.
+pub fn ADvTsiolkovsky(isp: f64, mWet: f64, mDry: f64): f64 {
+  if (isp <= 0.0 || mWet <= 0.0 || mDry <= 0.0) { return AError(); }
+  if (mDry > mWet) { return AError(); }        // leer schwerer als voll
+  return AExhaustSpeed(isp) * LogF64(mWet / mDry);
+}
+
+// Umkehrung: welches Massenverhaeltnis braucht ein gefordertes dv?
+//   m_start / m_leer = exp(dv / (Isp * g0))
+pub fn AMassRatio(isp: f64, dv: f64): f64 {
+  if (isp <= 0.0 || dv < 0.0) { return AError(); }
+  return ExpF64(dv / AExhaustSpeed(isp));
+}
+
+// Treibstoffmasse fuer ein gefordertes dv bei gegebener Endmasse [kg].
+pub fn APropellantMass(isp: f64, dv: f64, mDry: f64): f64 {
+  if (mDry <= 0.0) { return AError(); }
+  var q: f64 := AMassRatio(isp, dv);
+  if (AIsError(q)) { return AError(); }
+  return mDry * (q - 1.0);
+}
+
+// Brenndauer [s] bei konstantem Massenstrom.
+pub fn ABurnTime(mProp: f64, massFlow: f64): f64 {
+  if (mProp < 0.0 || massFlow <= 0.0) { return AError(); }
+  return mProp / massFlow;
+}
+
+// Massenstrom aus Schub und Isp [kg/s]: mdot = F / (Isp * g0).
+pub fn AMassFlow(thrust: f64, isp: f64): f64 {
+  if (thrust <= 0.0 || isp <= 0.0) { return AError(); }
+  return thrust / AExhaustSpeed(isp);
+}
+
+// ── Stufung ───────────────────────────────────────────────────────────────
+
+// dv einer Stufe, die eine NUTZLAST mitschleppt.
+//
+// Der Unterschied zur einfachen Fassung ist der ganze Grund fuer Stufung: die
+// Nutzlast steht in BEIDEN Massen, oben wie unten, und verkleinert damit das
+// wirksame Verhaeltnis. Eine leere Stufe weiterzutragen kostet dv, das keiner
+// Nutzlast zugutekommt — deshalb wird sie abgeworfen.
+pub fn ADvStage(isp: f64, mStructure: f64, mProp: f64, mPayload: f64): f64 {
+  if (mStructure <= 0.0 || mProp < 0.0 || mPayload < 0.0) { return AError(); }
+  var voll: f64 := mStructure + mProp + mPayload;
+  var dry: f64 := mStructure + mPayload;
+  return ADvTsiolkovsky(isp, voll, dry);
+}
+
+// Strukturanteil einer Stufe: m_struktur / (m_struktur + m_treib).
+// Bei heutigen Traegern 0.05 bis 0.12; darunter wird es sehr schwierig.
+pub fn AStructuralRatio(mStructure: f64, mProp: f64): f64 {
+  if (mStructure <= 0.0 || mProp <= 0.0) { return AError(); }
+  return mStructure / (mStructure + mProp);
+}
+
+// Die Schranke, an der jede einstufige Auslegung scheitert:
+//
+//   dv_max = Isp * g0 * ln(1 / strukturanteil)
+//
+// Das ist das dv einer Stufe OHNE jede Nutzlast. Liegt der Bedarf darueber,
+// hilft kein groesserer Tank mehr — nur eine weitere Stufe oder ein besseres
+// Triebwerk. Genau diese Zahl entscheidet, ob eine Einstufigkeit moeglich ist.
+pub fn ADvStageLimit(isp: f64, structuralRatio: f64): f64 {
+  if (isp <= 0.0 || structuralRatio <= 0.0 || structuralRatio >= 1.0) { return AError(); }
+  return AExhaustSpeed(isp) * LogF64(1.0 / structuralRatio);
+}
+
+// dv zweier Stufen. Die zweite Stufe traegt nur die Nutzlast, die erste traegt
+// die zweite Stufe MIT Nutzlast — deshalb sind die Reihenfolge und das
+// Aufaddieren nicht beliebig.
+pub fn ADvTwoStages(isp1: f64, mStructure1: f64, mProp1: f64,
+                     isp2: f64, mStructure2: f64, mProp2: f64,
+                     mPayload: f64): f64 {
+  var upper: f64 := mStructure2 + mProp2 + mPayload;
+  var d1: f64 := ADvStage(isp1, mStructure1, mProp1, upper);
+  var d2: f64 := ADvStage(isp2, mStructure2, mProp2, mPayload);
+  if (AIsError(d1) || AIsError(d2)) { return AError(); }
+  return d1 + d2;
+}
+
+// ── Schub und Beschleunigung ──────────────────────────────────────────────
+
+// Schub-Gewicht-Verhaeltnis am Startort. Unter 1 hebt die Rakete NICHT ab —
+// das ist keine Ungenauigkeit, sondern die Bedingung.
+pub fn AThrustToWeight(thrust: f64, mass: f64, gLocal: f64): f64 {
+  if (thrust < 0.0 || mass <= 0.0 || gLocal <= 0.0) { return AError(); }
+  return thrust / (mass * gLocal);
+}
+
+pub fn ALiftsOff(thrust: f64, mass: f64, gLocal: f64): bool {
+  var t: f64 := AThrustToWeight(thrust, mass, gLocal);
+  if (AIsError(t)) { return false; }
+  return t > 1.0;
+}
+
+// Beschleunigung, die tatsaechlich ankommt [m/s^2]: Schub minus Gewicht.
+pub fn ALiftoffAccel(thrust: f64, mass: f64, gLocal: f64): f64 {
+  if (mass <= 0.0) { return AError(); }
+  return thrust / mass - gLocal;
+}
+
+// ── Verluste ──────────────────────────────────────────────────────────────
+
+// Gravitationsverlust [m/s] bei konstantem Bahnwinkel gegen die Horizontale:
+//
+//   dv_g = g * sin(gamma) * t
+//
+// Er ist der Grund fuer die Neigeprogramme: senkrecht steigen kostet die
+// volle Schwere, waagerecht fliegen nichts. Deshalb kippt jede Rakete so
+// frueh wie moeglich — und so spaet wie noetig, um die dichte Luft schnell
+// hinter sich zu bringen.
+pub fn AGravityLoss(gLocal: f64, gamma: f64, duration: f64): f64 {
+  if (gLocal < 0.0 || duration < 0.0) { return AError(); }
+  return gLocal * SinF64(gamma) * duration;
+}
+
+// Gewinn aus der Erddrehung [m/s]:
+//
+//   v_rot = omega * R * cos(breite) * sin(azimut)
+//
+// Nach Osten (Azimut 90 Grad) ist er am groessten, am Aequator 465 m/s. Nach
+// Westen ist er NEGATIV — ein rueckläufiger Orbit kostet denselben Betrag
+// zusaetzlich. Das Vorzeichen ist deshalb Teil der Aussage und wird nicht
+// weggerechnet.
+pub fn AEarthRotation(): f64 { return 0.00007292115; }   // rad/s, siderisch
+
+pub fn ARotationGain(omega: f64, R: f64, latitude: f64, azimuth: f64): f64 {
+  if (R <= 0.0) { return AError(); }
+  return omega * R * CosF64(latitude) * SinF64(azimuth);
+}
+
+// dv-Bilanz fuer den Aufstieg in eine Kreisbahn [m/s]:
+//
+//   dv = v_kreis + verluste - drehgewinn
+//
+// Fuer die Erde und einen niedrigen Orbit ergibt das rund 9.3 bis 9.5 km/s
+// bei 7.8 km/s Bahngeschwindigkeit — die Differenz sind die Verluste, und
+// genau deshalb stehen sie hier als eigenes Argument statt als eingebauter
+// Zuschlag.
+pub fn ADvAscent(mu: f64, rOrbit: f64, losses: f64, rotationGain: f64): f64 {
+  var vCirc: f64 := ACircularSpeed(mu, rOrbit);
+  if (AIsError(vCirc) || losses < 0.0) { return AError(); }
+  return vCirc + losses - rotationGain;
+}
+
+// ── Startazimut ───────────────────────────────────────────────────────────
+//
+// Der Zusammenhang zwischen Startbreite, Azimut und erreichter Inklination:
+//
+//   cos(i) = cos(breite) * sin(azimut)
+//
+// Daraus folgt die haerteste Einschraenkung des Startorts ueberhaupt:
+// EINE INKLINATION UNTERHALB DER STARTBREITE IST DIREKT NICHT ERREICHBAR.
+// Von Baikonur (45.6 Grad) gibt es keinen Azimut, der in eine 28-Grad-Bahn
+// fuehrt; das kostet spaeter eine Ebenenaenderung, und die ist teuer.
+
+// Erreichbare Inklination aus Breite und Azimut [rad].
+pub fn AInclinationFromAzimuth(latitude: f64, azimuth: f64): f64 {
+  var c: f64 := CosF64(latitude) * SinF64(azimuth);
+  if (c > 1.0 || c < 0.0 - 1.0) { return AError(); }
+  return AcosF64(c);
+}
+
+// Startazimut fuer eine Zielinklination [rad], gemessen von Nord ueber Ost.
+//
+// Meldet, wenn die Inklination von dieser Breite aus nicht zu erreichen ist —
+// statt einen Azimut zurueckzugeben, der eine andere Bahn ergibt.
+pub fn ALaunchAzimuth(latitude: f64, inclination: f64): f64 {
+  var cb: f64 := CosF64(latitude);
+  if (cb <= 0.0) { return AError(); }              // Pol
+  var s: f64 := CosF64(inclination) / cb;
+  if (s > 1.0 || s < 0.0 - 1.0) { return AError(); }   // nicht erreichbar
+  return AsinF64(s);
+}
+
+pub fn AInclinationReachable(latitude: f64, inclination: f64): bool {
+  return !AIsError(ALaunchAzimuth(latitude, inclination));
+}
+
+// Die kleinste Inklination, die von dieser Breite aus direkt erreichbar ist:
+// genau die Breite selbst (Azimut 90 Grad, nach Osten).
+pub fn AMinInclination(latitude: f64): f64 { return AbsF64(latitude); }
+
+// Was eine spaetere Ebenenaenderung kostet, wenn der Startort die
+// Zielinklination nicht hergibt [m/s]. Bei 7.8 km/s sind das rund 134 m/s je
+// Grad — der Grund, warum Startplaetze moeglichst aequatornah liegen.
+pub fn AAzimuthPenalty(v: f64, latitude: f64, inclination: f64): f64 {
+  var imin: f64 := AMinInclination(latitude);
+  if (inclination >= imin) { return 0.0; }
+  return APlaneChangeDv(v, imin - inclination);
+}
