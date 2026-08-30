@@ -2,6 +2,47 @@
 
 ## Unveröffentlicht (develop)
 
+### BEHOBEN — Typidentität, Enum-Cast, Bereichstyp am Parameter, `wraps` (#1880, #1882, #1883, #1884, #1886, #1895)
+
+`sema.lyx` gab Structs, Enums und Klassen einheitlich die Kennung `TY_USER` und
+warf die Identität damit schon bei der Bestimmung weg. Jeder Vergleich sah
+danach nur `TY_USER == TY_USER` — drei gemeldete Fehler mit **einer** Wurzel:
+
+* **#1883**: `var a: A := B.Q` übersetzte, `A.Y == B.Q` war wahr
+* **#1886**: jeder Struct war jedem zuweisbar; `nimmA(c)` mit einem fremden
+  Struct gab den **Zeiger** als Zahl aus
+* **#1884**: `99 as Status` fiel still durch ein vollständiges `match`
+
+Statt die Typkennung umzubauen — sie steckt in Größentabellen, Meldungen und
+Dutzenden Vergleichen — wurde sie um den **Symbolindex** ergänzt und an den
+drei vorhandenen Prüfstellen abgefragt (Initialisierung, Zuweisung, Argument).
+
+Dazu zwei Nachbarn, bei denen die richtige Umsetzung schon dastand und nur die
+zweite Stelle fehlte:
+
+* **#1880**: die Bereichsprüfung gab es für Deklaration und Zuweisung, nicht
+  für das **Argument** — `setze(500)` fiel erst zur Laufzeit auf.
+* **#1882**: `wraps LO..HI` gab es nur am Einheitentyp. Parser, Umlaufrechnung
+  (`cg_emitUtypeRange`) und Registry waren vorhanden, nur nicht verbunden;
+  der Registry fehlte ein `flags`-Feld. Jetzt gilt
+  `type Kurs = int64 wraps 0..359` — 350 + 20 = 10, 0 − 1 = 359. Die Grenzen
+  sind **einschließlich**, `wraps 0..360` rechnet also modulo 361.
+
+**Was weiterhin erlaubt bleibt** — die Verschärfung urteilt nur über
+nachweislich Verschiedenes:
+
+* Vererbung: ein Kind gilt überall dort, wo der Elternteil verlangt ist
+  (**#1895**, vom Kernel-Team gemeldet). Die Gegenrichtung nicht.
+* Interfaces: eine Klasse erfüllt sie **strukturell**, auch ohne `implements`
+  (#1133) — darüber wird gar nicht geurteilt.
+* Aliase auf Grundtypen (`type datum = int64`) bleiben verträglich.
+
+Der erste Bau mit der neuen Prüfung fand sofort einen echten Fehler im
+Bestand: `std/net/imap.lyx:439` übergab eine `TCPConn` an
+`IMAPReadLine(conn: IMAPConn)`. Unsichtbar, weil `TCPConn` das erste Feld von
+`IMAPConn` ist — `conn.conn` traf bei Offset 0 zufällig den richtigen
+Deskriptor.
+
 ### BEHOBEN — `ParseDMS` rechnet exakt und meldet, `HaversineDistanceM` heißt jetzt ehrlich (#1888)
 
 **Punkt 3:** `ParseDMS` nutzte die gerundeten Festkommafaktoren `16667` je
