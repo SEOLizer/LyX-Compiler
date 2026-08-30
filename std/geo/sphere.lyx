@@ -1,0 +1,384 @@
+// std/geo/sphere.lyx
+// Entfernungen und Kurse auf der Erdkugel.
+//
+// Abgrenzung zu std.geo: jene Unit rechnet in GANZZAHLIGEN Mikrograd und ist
+// fuer Rechtecke, Bounding-Boxen und den Nahbereich gebaut — dort ist sie
+// richtig und schnell. Ihre Entfernungs- und Kursfunktionen sind flache
+// Naeherungen: auf 95 km stimmen sie auf 0.6 Prozent, auf 6000 km fehlen 6.5
+// Prozent, auf der Suedhalbkugel 64 Prozent, und an der Datumsgrenze
+// verrechnen sie sich um den Faktor 180 (#1888).
+//
+// Diese Unit rechnet in f64 und auf der KUGEL. Sie gilt weltweit, ueber die
+// Datumsgrenze und ueber die Pole.
+//
+// GRENZE — die Erde ist keine Kugel. Gegen das WGS84-Ellipsoid weicht die
+// Kugelrechnung um bis zu 0.5 Prozent ab (rund 20 km auf einer Aequatorlaenge,
+// wenige Meter auf 100 km). Fuer Navigation, Funkstrecken, Reichweiten und
+// Entfernungstabellen genuegt das; fuer Vermessung nicht. Wer die letzten
+// Promille braucht, braucht Vincenty auf dem Ellipsoid — das steht hier
+// bewusst NICHT drin, damit niemand die Kugel dafuer haelt.
+//
+// VORZEICHEN, durchgehend und ohne Ausnahme:
+//   Breite  positiv = NORD, negativ = SUED   (-90 .. +90)
+//   Laenge  positiv = OST,  negativ = WEST   (-180 .. +180)
+//   Kurs    0 = Nord, 90 = Ost, 180 = Sued, 270 = West (0 .. 360)
+// Alle Winkel in GRAD an der Schnittstelle, Radiant nur im Inneren. Grad ist,
+// was auf Karten und in Meldungen steht; eine Einheit, die man beim Aufruf
+// umrechnen muss, wird irgendwann falsch umgerechnet.
+
+@description("Entfernungen, Kurse und Zielpunkte auf der Erdkugel")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.geo.sphere;
+
+import std.math;
+
+// ── Erdradius ─────────────────────────────────────────────────────────────
+//
+// Der mittlere Radius nach IUGG: 6371008.8 m. Er ist so gewaehlt, dass eine
+// Kugel dieses Radius dasselbe Volumen hat wie das WGS84-Ellipsoid — die
+// uebliche Wahl, wenn man EINEN Radius braucht.
+pub fn GeoErdradius(): f64 { return 6371008.8; }
+
+// Fuer Rechnungen auf anderen Koerpern.
+pub fn GeoRadiusMond(): f64 { return 1737400.0; }
+pub fn GeoRadiusMars(): f64 { return 3389500.0; }
+
+// ── Punkt ─────────────────────────────────────────────────────────────────
+
+pub type GeoPos = struct {
+  lat: f64;    // Breite  [Grad], + = Nord
+  lon: f64;    // Laenge  [Grad], + = Ost
+}
+
+// Der Konstruktor heisst NICHT wie der Typ: eine Funktion GeoPos haette den
+// Typnamen verdeckt, und `var p: GeoPos` waere mit "unknown type" gescheitert.
+// Dieselbe Namensgebung wie GeoPointNew in std.geo.
+pub fn GeoPosNew(lat: f64, lon: f64): GeoPos {
+  var p: GeoPos;
+  p.lat := lat; p.lon := lon;
+  return p;
+}
+
+// ── Fehlerwert ────────────────────────────────────────────────────────────
+
+pub fn GeoFehler(): f64 {
+  var zero: f64 := 0.0;
+  return zero / zero;
+}
+
+pub fn GeoIstFehler(x: f64): bool { return x != x; }
+
+// ── Gueltigkeit ───────────────────────────────────────────────────────────
+
+pub fn GeoBreiteGueltig(lat: f64): bool {
+  if (GeoIstFehler(lat)) { return false; }
+  return lat >= 0.0 - 90.0 && lat <= 90.0;
+}
+
+pub fn GeoLaengeGueltig(lon: f64): bool {
+  if (GeoIstFehler(lon)) { return false; }
+  return lon >= 0.0 - 180.0 && lon <= 180.0;
+}
+
+pub fn GeoPosGueltig(p: GeoPos): bool {
+  return GeoBreiteGueltig(p.lat) && GeoLaengeGueltig(p.lon);
+}
+
+// ── Winkelhilfen ──────────────────────────────────────────────────────────
+
+pub fn GeoZuBogen(grad: f64): f64 { return grad * Pi() / 180.0; }
+pub fn GeoZuGrad(bogen: f64): f64 { return bogen * 180.0 / Pi(); }
+
+// Auf 0..360 bringen. Wird fuer jeden Kurs gebraucht: atan2 liefert -pi..pi,
+// ein Kurs von -69 Grad ist aber keiner, den man steuert.
+pub fn GeoNormKurs(grad: f64): f64 {
+  if (GeoIstFehler(grad)) { return GeoFehler(); }
+  var w: f64 := grad;
+  while (w < 0.0) { w := w + 360.0; }
+  while (w >= 360.0) { w := w - 360.0; }
+  return w;
+}
+
+// Laengendifferenz auf -180..+180 bringen — DIE Stelle, an der die
+// Datumsgrenze entschieden wird. Ohne sie werden aus 179 Ost und 179 West
+// 358 Grad statt 2, und jede Strecke ueber den Pazifik ist unbrauchbar
+// (#1888).
+pub fn GeoNormDelta(grad: f64): f64 {
+  if (GeoIstFehler(grad)) { return GeoFehler(); }
+  var w: f64 := grad;
+  while (w < 0.0 - 180.0) { w := w + 360.0; }
+  while (w > 180.0)       { w := w - 360.0; }
+  return w;
+}
+
+// ── Entfernung ────────────────────────────────────────────────────────────
+
+// Grosskreisentfernung nach der Haversine-Formel [m]:
+//
+//   a = sin^2(dLat/2) + cos(lat1) * cos(lat2) * sin^2(dLon/2)
+//   d = 2 * R * atan2(sqrt(a), sqrt(1-a))
+//
+// Die Haversine wird der einfacheren Kosinusformel vorgezogen, weil letztere
+// bei KLEINEN Entfernungen zusammenbricht: dort geht der Kosinus gegen 1, und
+// acos verliert genau da seine Stellen. Die Haversine ist ueber den ganzen
+// Bereich gleich gut — deshalb heisst sie so und deshalb steht sie hier
+// wirklich drin.
+pub fn GeoEntfernungR(a: GeoPos, b: GeoPos, radius: f64): f64 {
+  if (!GeoPosGueltig(a) || !GeoPosGueltig(b) || radius <= 0.0) { return GeoFehler(); }
+  var lat1: f64 := GeoZuBogen(a.lat);
+  var lat2: f64 := GeoZuBogen(b.lat);
+  var dLat: f64 := lat2 - lat1;
+  var dLon: f64 := GeoZuBogen(GeoNormDelta(b.lon - a.lon));
+  var s1: f64 := SinF64(dLat / 2.0);
+  var s2: f64 := SinF64(dLon / 2.0);
+  var h: f64 := s1 * s1 + CosF64(lat1) * CosF64(lat2) * s2 * s2;
+  if (h < 0.0) { h := 0.0; }
+  if (h > 1.0) { h := 1.0; }
+  return 2.0 * radius * Atan2F64(SqrtF64(h), SqrtF64(1.0 - h));
+}
+
+pub fn GeoEntfernung(a: GeoPos, b: GeoPos): f64 {
+  return GeoEntfernungR(a, b, GeoErdradius());
+}
+
+pub fn GeoEntfernungKm(a: GeoPos, b: GeoPos): f64 {
+  var d: f64 := GeoEntfernung(a, b);
+  if (GeoIstFehler(d)) { return GeoFehler(); }
+  return d / 1000.0;
+}
+
+// Seemeilen — in der Navigation die uebliche Einheit, 1852 m nach Definition.
+pub fn GeoEntfernungSm(a: GeoPos, b: GeoPos): f64 {
+  var d: f64 := GeoEntfernung(a, b);
+  if (GeoIstFehler(d)) { return GeoFehler(); }
+  return d / 1852.0;
+}
+
+// Winkelabstand [Grad] — die Entfernung ohne Radius, gebraucht fuer
+// Sichtbarkeit und Funkstrecken.
+pub fn GeoWinkelabstand(a: GeoPos, b: GeoPos): f64 {
+  var d: f64 := GeoEntfernungR(a, b, 1.0);
+  if (GeoIstFehler(d)) { return GeoFehler(); }
+  return GeoZuGrad(d);
+}
+
+// ── Kurs ──────────────────────────────────────────────────────────────────
+
+// Anfangskurs [Grad], 0 = Nord, im Uhrzeigersinn:
+//
+//   theta = atan2( sin(dLon) * cos(lat2),
+//                  cos(lat1)*sin(lat2) - sin(lat1)*cos(lat2)*cos(dLon) )
+//
+// Auf einem Grosskreis AENDERT SICH DER KURS unterwegs — der Weg von Hamburg
+// nach New York beginnt mit 291 Grad und endet mit 249. Wer einen festen Kurs
+// steuern will, braucht die Loxodrome weiter unten.
+pub fn GeoKurs(a: GeoPos, b: GeoPos): f64 {
+  if (!GeoPosGueltig(a) || !GeoPosGueltig(b)) { return GeoFehler(); }
+  var lat1: f64 := GeoZuBogen(a.lat);
+  var lat2: f64 := GeoZuBogen(b.lat);
+  var dLon: f64 := GeoZuBogen(GeoNormDelta(b.lon - a.lon));
+  var y: f64 := SinF64(dLon) * CosF64(lat2);
+  var x: f64 := CosF64(lat1) * SinF64(lat2) - SinF64(lat1) * CosF64(lat2) * CosF64(dLon);
+  if (y == 0.0 && x == 0.0) { return GeoFehler(); }   // derselbe Punkt
+  return GeoNormKurs(GeoZuGrad(Atan2F64(y, x)));
+}
+
+// Endkurs [Grad]: der Kurs bei der Ankunft. Der Rueckkurs vom Ziel zum Start,
+// um 180 Grad gedreht.
+pub fn GeoEndkurs(a: GeoPos, b: GeoPos): f64 {
+  var k: f64 := GeoKurs(b, a);
+  if (GeoIstFehler(k)) { return GeoFehler(); }
+  return GeoNormKurs(k + 180.0);
+}
+
+// ── Zielpunkt (direktes Problem) ──────────────────────────────────────────
+
+// Wohin fuehrt ein Kurs ueber eine Entfernung?
+//
+//   lat2 = asin( sin(lat1)*cos(d/R) + cos(lat1)*sin(d/R)*cos(kurs) )
+//   lon2 = lon1 + atan2( sin(kurs)*sin(d/R)*cos(lat1),
+//                        cos(d/R) - sin(lat1)*sin(lat2) )
+//
+// Die Laenge wird auf -180..+180 zurueckgeholt, damit ein Weg ueber den
+// Pazifik nicht in 200 Grad Ost endet.
+pub fn GeoZielpunktR(start: GeoPos, kurs: f64, strecke: f64, radius: f64): GeoPos {
+  if (!GeoPosGueltig(start) || GeoIstFehler(kurs) || radius <= 0.0) {
+    return GeoPosNew(GeoFehler(), GeoFehler());
+  }
+  var lat1: f64 := GeoZuBogen(start.lat);
+  var lon1: f64 := GeoZuBogen(start.lon);
+  var k:    f64 := GeoZuBogen(kurs);
+  var dr:   f64 := strecke / radius;
+  var sinLat2: f64 := SinF64(lat1) * CosF64(dr) + CosF64(lat1) * SinF64(dr) * CosF64(k);
+  if (sinLat2 > 1.0)  { sinLat2 := 1.0; }
+  if (sinLat2 < 0.0 - 1.0) { sinLat2 := 0.0 - 1.0; }
+  var lat2: f64 := AsinF64(sinLat2);
+  var y: f64 := SinF64(k) * SinF64(dr) * CosF64(lat1);
+  var x: f64 := CosF64(dr) - SinF64(lat1) * sinLat2;
+  var lon2: f64 := lon1 + Atan2F64(y, x);
+  return GeoPosNew(GeoZuGrad(lat2), GeoNormDelta(GeoZuGrad(lon2)));
+}
+
+pub fn GeoZielpunkt(start: GeoPos, kurs: f64, strecke: f64): GeoPos {
+  return GeoZielpunktR(start, kurs, strecke, GeoErdradius());
+}
+
+pub fn GeoPosIstFehler(p: GeoPos): bool {
+  return GeoIstFehler(p.lat) || GeoIstFehler(p.lon);
+}
+
+// Mittelpunkt der Grosskreisstrecke. NICHT der Mittelwert der Koordinaten —
+// der liegt bei Strecken ueber die Datumsgrenze auf der falschen Erdhaelfte.
+pub fn GeoMittelpunkt(a: GeoPos, b: GeoPos): GeoPos {
+  var d: f64 := GeoEntfernung(a, b);
+  var k: f64 := GeoKurs(a, b);
+  if (GeoIstFehler(d)) { return GeoPosNew(GeoFehler(), GeoFehler()); }
+  if (GeoIstFehler(k)) { return a; }        // derselbe Punkt
+  return GeoZielpunkt(a, k, d / 2.0);
+}
+
+// ── Abstand von einer Strecke ─────────────────────────────────────────────
+
+// Querabweichung [m]: der Abstand eines Punktes von der Grosskreisstrecke
+// durch zwei andere. Positiv RECHTS des Kurses, negativ links.
+//
+//   d_xt = asin( sin(d13/R) * sin(kurs13 - kurs12) ) * R
+//
+// Das Vorzeichen ist die halbe Aussage — ohne es weiss man, wie weit man
+// abgekommen ist, aber nicht, wohin man steuern muss.
+pub fn GeoQuerabweichung(punkt: GeoPos, von: GeoPos, nach: GeoPos): f64 {
+  var d13: f64 := GeoEntfernungR(von, punkt, 1.0);
+  var k13: f64 := GeoKurs(von, punkt);
+  var k12: f64 := GeoKurs(von, nach);
+  if (GeoIstFehler(d13) || GeoIstFehler(k13) || GeoIstFehler(k12)) { return GeoFehler(); }
+  var s: f64 := SinF64(d13) * SinF64(GeoZuBogen(k13 - k12));
+  if (s > 1.0) { s := 1.0; }
+  if (s < 0.0 - 1.0) { s := 0.0 - 1.0; }
+  return AsinF64(s) * GeoErdradius();
+}
+
+// Laengsabweichung [m]: wie weit entlang der Strecke der Fusspunkt liegt.
+// Negativ heisst: noch vor dem Startpunkt.
+pub fn GeoLaengsabweichung(punkt: GeoPos, von: GeoPos, nach: GeoPos): f64 {
+  var d13: f64 := GeoEntfernungR(von, punkt, 1.0);
+  var xt:  f64 := GeoQuerabweichung(punkt, von, nach);
+  if (GeoIstFehler(d13) || GeoIstFehler(xt)) { return GeoFehler(); }
+  var R: f64 := GeoErdradius();
+  var c: f64 := CosF64(d13) / CosF64(xt / R);
+  if (c > 1.0) { c := 1.0; }
+  if (c < 0.0 - 1.0) { c := 0.0 - 1.0; }
+  return AcosF64(c) * R;
+}
+
+// ── Loxodrome ─────────────────────────────────────────────────────────────
+//
+// Die Linie festen Kurses. Sie ist LAENGER als der Grosskreis, dafuer kann man
+// sie mit einer Kompasseinstellung fahren — der Grund, warum die Seefahrt sie
+// jahrhundertelang benutzt hat und warum sie auf der Mercatorkarte gerade ist.
+
+// Fester Kurs von a nach b [Grad].
+pub fn GeoLoxodromKurs(a: GeoPos, b: GeoPos): f64 {
+  if (!GeoPosGueltig(a) || !GeoPosGueltig(b)) { return GeoFehler(); }
+  var lat1: f64 := GeoZuBogen(a.lat);
+  var lat2: f64 := GeoZuBogen(b.lat);
+  var dLon: f64 := GeoZuBogen(GeoNormDelta(b.lon - a.lon));
+  // Vergroesserte Breitendifferenz (Mercator).
+  var t1: f64 := TanF64(Pi() / 4.0 + lat1 / 2.0);
+  var t2: f64 := TanF64(Pi() / 4.0 + lat2 / 2.0);
+  if (t1 <= 0.0 || t2 <= 0.0) { return GeoFehler(); }   // Pol
+  var dPhi: f64 := LogF64(t2 / t1);
+  return GeoNormKurs(GeoZuGrad(Atan2F64(dLon, dPhi)));
+}
+
+// Laenge der Loxodrome [m].
+pub fn GeoLoxodromStrecke(a: GeoPos, b: GeoPos): f64 {
+  if (!GeoPosGueltig(a) || !GeoPosGueltig(b)) { return GeoFehler(); }
+  var lat1: f64 := GeoZuBogen(a.lat);
+  var lat2: f64 := GeoZuBogen(b.lat);
+  var dLat: f64 := lat2 - lat1;
+  var dLon: f64 := GeoZuBogen(GeoNormDelta(b.lon - a.lon));
+  var t1: f64 := TanF64(Pi() / 4.0 + lat1 / 2.0);
+  var t2: f64 := TanF64(Pi() / 4.0 + lat2 / 2.0);
+  if (t1 <= 0.0 || t2 <= 0.0) { return GeoFehler(); }
+  var dPhi: f64 := LogF64(t2 / t1);
+  // q ist der Streckfaktor; bei einem Ost-West-Kurs geht dPhi gegen 0 und
+  // die Division waere unbestimmt — dann gilt q = cos(lat).
+  var q: f64 := CosF64(lat1);
+  if (AbsF64(dPhi) > 0.00000001) { q := dLat / dPhi; }
+  var s: f64 := SqrtF64(dLat * dLat + q * q * dLon * dLon);
+  return s * GeoErdradius();
+}
+
+// ── Himmelsrichtungen in Text und Zahl ────────────────────────────────────
+//
+// #1888: In std.geo nimmt ParseDMS eine unbekannte Richtung STILL an und gibt
+// den Wert positiv zurueck, als waere Nord gemeint. Hier wird sie gemeldet.
+
+pub con GEO_NORD: int64 := 78;   // 'N'
+pub con GEO_SUED: int64 := 83;   // 'S'
+pub con GEO_OST:  int64 := 69;   // 'E'
+pub con GEO_WEST: int64 := 87;   // 'W'
+
+// Grad, Minuten, Sekunden und Himmelsrichtung zu einem Wert in Grad.
+//
+// Die Umrechnung ist exakt (/60 und /3600), nicht ueber gerundete
+// Festkommafaktoren: 0 Grad 60 Minuten sind genau 1 Grad.
+pub fn GeoAusGMS(grad: f64, minuten: f64, sekunden: f64, richtung: int64): f64 {
+  if (grad < 0.0 || minuten < 0.0 || sekunden < 0.0) { return GeoFehler(); }
+  if (minuten >= 60.0 || sekunden >= 60.0) {
+    // 61 Minuten sind keine Schreibweise, sondern ein Tippfehler. Sie
+    // stillschweigend zu uebernehmen macht aus 0 Grad 61 Minuten eine Position
+    // 1.85 km neben der gemeinten.
+    return GeoFehler();
+  }
+  var w: f64 := grad + minuten / 60.0 + sekunden / 3600.0;
+  if (richtung == GEO_NORD || richtung == GEO_OST) { return w; }
+  if (richtung == GEO_SUED || richtung == GEO_WEST) { return 0.0 - w; }
+  return GeoFehler();     // unbekannte Richtung: melden, nicht raten
+}
+
+// Welche Himmelsrichtung gehoert zu einem Breitenwert?
+pub fn GeoRichtungBreite(lat: f64): int64 {
+  if (lat < 0.0) { return GEO_SUED; }
+  return GEO_NORD;
+}
+
+pub fn GeoRichtungLaenge(lon: f64): int64 {
+  if (lon < 0.0) { return GEO_WEST; }
+  return GEO_OST;
+}
+
+// Kompassrichtung als Sektor: 0 = N, 1 = NNO, 2 = NO, ... 15 = NNW.
+// Jeder Sektor ist 22.5 Grad breit, der Nordsektor liegt symmetrisch um 0.
+pub fn GeoKompassSektor(kurs: f64): int64 {
+  var k: f64 := GeoNormKurs(kurs);
+  if (GeoIstFehler(k)) { return 0 - 1; }
+  var s: f64 := (k + 11.25) / 22.5;
+  var i: int64 := FloorF64(s) as int64;
+  if (i >= 16) { i := i - 16; }
+  return i;
+}
+
+// ── Sichtbarkeit ──────────────────────────────────────────────────────────
+
+// Entfernung zum Horizont [m] fuer eine Augenhoehe [m]:
+//   d = R * acos( R / (R + h) )
+//
+// Fuer 1.7 m Augenhoehe sind das 4.7 km — die Zahl, die erklaert, warum ein
+// Schiff am Horizont verschwindet und nicht kleiner wird.
+pub fn GeoHorizont(hoehe: f64): f64 {
+  if (hoehe < 0.0) { return GeoFehler(); }
+  var R: f64 := GeoErdradius();
+  return R * AcosF64(R / (R + hoehe));
+}
+
+// Sehen sich zwei Punkte ueber die Erdkruemmung hinweg?
+// Die Summe beider Horizontentfernungen muss die Strecke erreichen.
+pub fn GeoSichtverbindung(a: GeoPos, hoeheA: f64, b: GeoPos, hoeheB: f64): bool {
+  var d: f64 := GeoEntfernung(a, b);
+  var h1: f64 := GeoHorizont(hoeheA);
+  var h2: f64 := GeoHorizont(hoeheB);
+  if (GeoIstFehler(d) || GeoIstFehler(h1) || GeoIstFehler(h2)) { return false; }
+  return d <= h1 + h2;
+}
