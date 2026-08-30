@@ -1,0 +1,147 @@
+// tests/f64_methoden_test.lyx
+// #1887: Eine Methode mit f64-Rueckgabe lieferte das BITMUSTER, sobald das
+// Ergebnis in eine Variable oder einen Ausdruck ging.
+//
+//     return self.M();          10.0                  richtig
+//     var e: f64 := self.M();   4621819117588971520   = 0x4024000000000000
+//     self.M() * 2.0            "overflow"
+//
+// Nur der unmittelbare return stimmte, weil dieser Pfad den Typ aus der
+// Signatur kennt. Ueberall sonst fragt der Codegen cg_isF64Expr, und dort
+// fehlte der Methodenaufruf in der Aufzaehlung.
+//
+// GEPRUEFT WIRD DER WERT, nicht die Uebersetzbarkeit. Ein Test, der nur
+// "baut durch" prueft, waere vor dem Fix gruen gewesen — der Fehler war
+// stillschweigend richtig uebersetzter, falsch rechnender Code.
+//
+// Die Sollwerte sind so gewaehlt, dass das Bitmuster NICHT zufaellig passt:
+// 10.0 hat die Bits 4621819117588971520, 1.5 hat 4609434218613702656. Beide
+// liegen um Groessenordnungen neben dem richtigen Wert, ein Vergleich mit
+// Toleranz faellt also sicher auseinander.
+
+unit main;
+
+import std.io;
+import std.math;
+
+type Basis = class {
+  pub fn Wert(): f64  { return 10.0; }
+  pub fn Ganz(): int64 { return 7; }
+  pub fn Direkt(): f64 { return self.Wert(); }
+  pub fn UeberVar(): f64 { var e: f64 := self.Wert(); return e; }
+  pub fn MalZwei(): f64 { return self.Wert() * 2.0; }
+};
+
+// Geerbte Methode: der Rueckgabetyp liegt beim Elternteil (#1120).
+type Kind = class extends Basis {
+  pub fn Doppelt(): f64 { return self.Wert() * 2.0; }
+};
+
+// Zwei Klassen, dieselbe Methodenbezeichnung, VERSCHIEDENE Rueckgabetypen.
+// Das ist die Gegenprobe gegen die bequeme Abkuerzung: haette der Fix nach
+// dem nackten Namen gesucht statt nach "Klasse_Methode", wuerde B.W hier als
+// f64 gelten und 42 als Bitmuster gelesen.
+type A = class { pub fn W(): f64 { return 1.5; } };
+type B = class { pub fn W(): int64 { return 42; } };
+
+type P = struct {
+  x: f64;
+  fn Betrag(): f64 { return self.x * 2.0; }
+}
+
+fn frei(): f64 { return 3.5; }
+
+var _fails: int64 := 0;
+var _checks: int64 := 0;
+
+fn Check(name: pchar, got: f64, want: f64): void {
+  _checks := _checks + 1;
+  if (AbsF64(got - want) <= 0.000000001) { PrintStr("PASS "c); PrintStrLn(name); }
+  else {
+    PrintStr("FAIL "c); PrintStr(name);
+    PrintStr(": erhalten "c); PrintF64(got);
+    PrintStr(" erwartet "c); PrintF64(want); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+}
+
+fn CheckInt(name: pchar, got: int64, want: int64): void {
+  _checks := _checks + 1;
+  if (got == want) { PrintStr("PASS "c); PrintStrLn(name); }
+  else {
+    PrintStr("FAIL "c); PrintStr(name);
+    PrintStr(": erhalten "c); PrintInt(got);
+    PrintStr(" erwartet "c); PrintInt(want); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+}
+
+fn CheckWahr(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: wahr)"c); _fails := _fails + 1; }
+}
+
+fn main(): int64 {
+  var k: Basis := new Basis();
+
+  // ── Der Weg, der immer stimmte ──────────────────────────────────────────
+  // Gegenprobe: der Fix darf ihn nicht mitnehmen.
+  Check("unmittelbares return"c, k.Direkt(), 10.0);
+
+  // ── Die drei Wege, die falsch rechneten ─────────────────────────────────
+  var e: f64 := k.Wert();
+  Check("Ergebnis in einer Variablen"c, e, 10.0);
+  Check("Ergebnis in einem Ausdruck"c, k.Wert() * 2.0, 20.0);
+  Check("Variable INNERHALB der Klasse"c, k.UeberVar(), 10.0);
+  Check("Ausdruck INNERHALB der Klasse"c, k.MalZwei(), 20.0);
+
+  // Gemischt mit einer freien Funktion — die ging schon vorher.
+  Check("Methode plus freie Funktion"c, k.Wert() + frei(), 13.5);
+  // Und mit einem Literal.
+  Check("Methode plus Literal"c, k.Wert() + 0.5, 10.5);
+  Check("Methode geteilt"c, k.Wert() / 4.0, 2.5);
+  Check("Methode minus sich selbst"c, k.Wert() - k.Wert(), 0.0);
+
+  // Vergleiche: auf dem Bitmuster waere 10.0 > 5.0 zwar zufaellig auch wahr,
+  // aber 0.5 > 1.0 nicht — deshalb beide Richtungen.
+  CheckWahr("Vergleich groesser"c, k.Wert() > 5.0);
+  CheckWahr("Vergleich kleiner ist falsch"c, !(k.Wert() < 5.0));
+
+  // Cast: aus 10.0 muss 10 werden, nicht das Bitmuster.
+  CheckInt("Cast nach int64"c, k.Wert() as int64, 10);
+
+  // ── Geerbte Methode ─────────────────────────────────────────────────────
+  var kd: Kind := new Kind();
+  Check("geerbte Methode im Ausdruck"c, kd.Doppelt(), 20.0);
+  Check("geerbte Methode direkt"c, kd.Wert(), 10.0);
+
+  // ── Struct-Methode ──────────────────────────────────────────────────────
+  var p: P;
+  p.x := 5.0;
+  var pv: f64 := p.Betrag();
+  Check("Struct-Methode in einer Variablen"c, pv, 10.0);
+  Check("Struct-Methode im Ausdruck"c, p.Betrag() + 1.0, 11.0);
+
+  // ── Die Gegenprobe: gleiche Bezeichnung, anderer Typ ────────────────────
+  // Nach dem nackten Namen gesucht, wuerde B.W als f64 gelten — und 42 als
+  // Bitmuster gelesen. Genau davor schuetzt der gemangelte Name.
+  var a: A := new A();
+  var b: B := new B();
+  var va: f64 := a.W();
+  var vb: int64 := b.W();
+  Check("A.W liefert f64"c, va, 1.5);
+  CheckInt("B.W liefert int64, unveraendert"c, vb, 42);
+  Check("A.W im Ausdruck"c, a.W() + 1.0, 2.5);
+  CheckInt("B.W im Ausdruck"c, b.W() + 1, 43);
+
+  // ── int64-Methoden bleiben unberuehrt ───────────────────────────────────
+  CheckInt("int64-Methode direkt"c, k.Ganz(), 7);
+  CheckInt("int64-Methode im Ausdruck"c, k.Ganz() * 3, 21);
+
+  PrintStr("\n"c);
+  PrintInt(_checks); PrintStr(" Pruefungen, "c);
+  PrintInt(_fails); PrintStrLn(" FAIL"c);
+  if (_fails == 0) { PrintStrLn("OK: f64-Methoden (#1887)"c); return 0; }
+  return 1;
+}
