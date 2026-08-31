@@ -1,0 +1,186 @@
+// std/astro/attitude.lyx
+// Lage: Fehlerquaternion, Winkelgeschwindigkeit aus zwei Lagen, Slew-Grenzen.
+//
+// ZUSCHNITT: freie Funktionen ueber Quaternionen, wie in std.astro.state
+// begruendet — eine Lagedifferenz braucht ZWEI Lagen, und eine Methode
+// muesste sich willkuerlich fuer eine davon als Empfaenger entscheiden.
+//
+// PRUEFBARKEIT: alles hier ist analytisch pruefbar. Eine Drehung um einen
+// bekannten Winkel um eine bekannte Achse hat ein bekanntes Ergebnis, und
+// die Slew-Zeit faellt aus zwei Gleichungen der gleichfoermig beschleunigten
+// Bewegung. Das ist eine andere Vertrauensstufe als std.astro.guidance, wo
+// nur Szenarien mit bekanntem Ausgang bleiben — deshalb sind es zwei Units
+// und nicht eine (#1900).
+//
+// RAHMEN: Eine Lage ist immer die Drehung VON einem Rahmen IN einen anderen.
+// Welche, sagt der Typ nicht; das gehoert in die Benennung beim Aufrufer.
+// `qBodyFromEci` sagt es, `q` sagt es nicht.
+//
+// Einheiten durchgehend SI: Radiant, Radiant je Sekunde, Radiant je
+// Sekunde im Quadrat, Sekunden. Grad kommen hier nicht vor.
+
+@description("Lagefehler, Winkelgeschwindigkeit und Slew-Grenzen")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.astro.attitude;
+
+import std.math;
+import std.quat;
+import std.astro.state;
+
+// Schwelle, unterhalb derer eine Drehung als "keine Drehung" gilt und ihre
+// ACHSE damit unbestimmt ist. Wie ACircularThreshold() in std.astro.orbit:
+// die Entscheidung steht sichtbar an einer Stelle, statt in jeder Funktion
+// als Zahl aufzutauchen.
+pub fn AAttThreshold(): f64 { return 0.000000000001; }   // 1e-12
+
+// ── Gueltigkeit ───────────────────────────────────────────────────────────
+
+// Eine Lage muss ein EINHEITSquaternion sein. Ein Quaternion mit Betrag 2
+// dreht nicht doppelt so weit — es skaliert den gedrehten Vektor, und der
+// Fehler faellt erst weit spaeter als falsche Bahn auf.
+pub fn AAttValid(q: Quat, eps: f64): bool {
+  if (AIsError(q.w) || AIsError(q.x) || AIsError(q.y) || AIsError(q.z)) { return false; }
+  return QuatIsUnit(q, eps);
+}
+
+fn _attFehlerQuat(): Quat {
+  return QuatNew(AError(), AError(), AError(), AError());
+}
+
+pub fn AAttIsError(q: Quat): bool { return AIsError(q.w); }
+
+// ── Fehlerquaternion ──────────────────────────────────────────────────────
+//
+// q_err dreht die IST-Lage in die SOLL-Lage:  q_soll = q_err * q_ist.
+// Also q_err = q_soll * conj(q_ist).
+//
+// Das Vorzeichen wird festgelegt: q und -q beschreiben DIESELBE Lage, aber
+// die eine Darstellung fuehrt ueber den kurzen, die andere ueber den langen
+// Weg (Winkel > pi). Ein Regler, der das nicht festlegt, dreht gelegentlich
+// 330 Grad statt 30 — das ist der klassische "unwinding"-Fehler. Hier gilt
+// immer w >= 0, also der kurze Weg.
+pub fn AAttError(qIst: Quat, qSoll: Quat): Quat {
+  if (QuatIsZero(qIst) || QuatIsZero(qSoll)) { return _attFehlerQuat(); }
+  var e: Quat := QuatNormalize(QuatMul(qSoll, QuatConj(qIst)));
+  if (e.w < 0.0) { return QuatNeg(e); }
+  return e;
+}
+
+// Betrag des Lagefehlers [rad], immer in [0, pi].
+pub fn AAttErrorAngle(qIst: Quat, qSoll: Quat): f64 {
+  var e: Quat := AAttError(qIst, qSoll);
+  if (AAttIsError(e)) { return AError(); }
+  return QuatAngle(e);
+}
+
+// Drehachse des Lagefehlers als Einheitsvektor.
+//
+// Bei verschwindendem Fehler gibt es KEINE Achse — jede waere richtig. Das
+// wird gemeldet und nicht mit (0,0,0) oder (1,0,0) beantwortet: beide sind
+// gueltige Rueckgabewerte und wandern unbemerkt in den Regler.
+pub fn AAttErrorAxis(qIst: Quat, qSoll: Quat): AVec3 {
+  var e: Quat := AAttError(qIst, qSoll);
+  if (AAttIsError(e)) { return AVec(AError(), AError(), AError()); }
+  var s: f64 := SqrtF64(e.x * e.x + e.y * e.y + e.z * e.z);
+  if (s < AAttThreshold()) { return AVec(AError(), AError(), AError()); }
+  return AVec(e.x / s, e.y / s, e.z / s);
+}
+
+// Der Fehler als DREHVEKTOR [rad]: Achse mal Winkel. Das ist die Form, die
+// ein Regler braucht — eine Groesse, die bei verschwindendem Fehler stetig
+// gegen null geht, statt eine unbestimmte Achse zu haben.
+pub fn AAttErrorVector(qIst: Quat, qSoll: Quat): AVec3 {
+  var e: Quat := AAttError(qIst, qSoll);
+  if (AAttIsError(e)) { return AVec(AError(), AError(), AError()); }
+  var s: f64 := SqrtF64(e.x * e.x + e.y * e.y + e.z * e.z);
+  if (s < AAttThreshold()) { return AVec(0.0, 0.0, 0.0); }
+  var winkel: f64 := QuatAngle(e);
+  return AVec(e.x / s * winkel, e.y / s * winkel, e.z / s * winkel);
+}
+
+// ── Winkelgeschwindigkeit ─────────────────────────────────────────────────
+
+// Mittlere Winkelgeschwindigkeit [rad/s], die qVon in dt in qNach ueberfuehrt.
+//
+// Es ist ausdruecklich die MITTLERE: aus zwei Lagen laesst sich der Verlauf
+// dazwischen nicht bestimmen. Wer eine Momentanrate braucht, muss messen.
+pub fn AAngularVelocity(qVon: Quat, qNach: Quat, dt: f64): AVec3 {
+  if (dt <= 0.0) { return AVec(AError(), AError(), AError()); }
+  var d: AVec3 := AAttErrorVector(qVon, qNach);
+  if (AVecIsError(d)) { return d; }
+  return AScale(d, 1.0 / dt);
+}
+
+// Eine Lage um w * dt weiterdrehen (Drehvektor-Integration, ein Schritt).
+//
+// NORMALISIERT am Ende. Ohne das treibt der Betrag ueber viele Schritte weg,
+// und die Lage skaliert still — der Grund, warum die Meldung zu #1900
+// ausdruecklich "Quaternionen nach jeder Verkettung normalisieren" nennt.
+pub fn AAttPropagate(q: Quat, w: AVec3, dt: f64): Quat {
+  if (QuatIsZero(q)) { return _attFehlerQuat(); }
+  if (AIsError(dt) || AVecIsError(w)) { return _attFehlerQuat(); }
+  var rate: f64 := AMagnitude(w);
+  var winkel: f64 := rate * dt;
+  if (winkel < AAttThreshold()) { return QuatNormalize(q); }
+  var achse: AVec3 := AScale(w, 1.0 / rate);
+  var dq: Quat := QuatFromAxisAngle(achse.x, achse.y, achse.z, winkel);
+  return QuatNormalize(QuatMul(dq, q));
+}
+
+// ── Slew ──────────────────────────────────────────────────────────────────
+//
+// Bang-Bang: beschleunigen bis wMax, halten, bremsen. Zwei Faelle, und die
+// Grenze zwischen ihnen ist der Winkel, bei dem wMax genau im Umkehrpunkt
+// erreicht wird:
+//
+//   dreieckig  (wMax wird nie erreicht):  angle <= wMax^2 / aMax
+//              t = 2 * sqrt(angle / aMax)
+//   trapezfoermig:
+//              t = angle / wMax + wMax / aMax
+//
+// Beide Formeln treffen sich an der Grenze — das ist die staerkste Pruefung
+// der Umsetzung, denn ein Fehler in einem der beiden Zweige bricht die
+// Stetigkeit dort.
+pub fn ASlewTime(winkel: f64, wMax: f64, aMax: f64): f64 {
+  if (AIsError(winkel) || winkel < 0.0) { return AError(); }
+  if (wMax <= 0.0 || aMax <= 0.0) { return AError(); }
+  if (winkel == 0.0) { return 0.0; }
+  var grenze: f64 := wMax * wMax / aMax;
+  if (winkel <= grenze) { return 2.0 * SqrtF64(winkel / aMax); }
+  return winkel / wMax + wMax / aMax;
+}
+
+// Der Winkel, bis zu dem das Manoever dreieckig bleibt [rad].
+pub fn ASlewTriangleLimit(wMax: f64, aMax: f64): f64 {
+  if (wMax <= 0.0 || aMax <= 0.0) { return AError(); }
+  return wMax * wMax / aMax;
+}
+
+// Hoechste erreichte Drehrate waehrend des Manoevers [rad/s]. Im dreieckigen
+// Fall ist sie KLEINER als wMax — wer dort wMax meldet, ueberschaetzt die
+// Belastung der Aktorik.
+pub fn ASlewPeakRate(winkel: f64, wMax: f64, aMax: f64): f64 {
+  if (AIsError(winkel) || winkel < 0.0) { return AError(); }
+  if (wMax <= 0.0 || aMax <= 0.0) { return AError(); }
+  var grenze: f64 := wMax * wMax / aMax;
+  if (winkel <= grenze) { return SqrtF64(winkel * aMax); }
+  return wMax;
+}
+
+// Haelt die Rate die Grenze ein?
+pub fn AAttRateWithin(w: AVec3, wMax: f64): bool {
+  if (AVecIsError(w) || AIsError(wMax) || wMax < 0.0) { return false; }
+  return AMagnitude(w) <= wMax;
+}
+
+// Rate auf wMax begrenzen, RICHTUNG erhalten. Komponentenweise zu klemmen
+// waere falsch: das dreht die Achse und damit das Ziel.
+pub fn AAttClampRate(w: AVec3, wMax: f64): AVec3 {
+  if (AVecIsError(w)) { return w; }
+  if (AIsError(wMax) || wMax < 0.0) { return AVec(AError(), AError(), AError()); }
+  var n: f64 := AMagnitude(w);
+  if (n <= wMax) { return w; }
+  if (n <= 0.0) { return w; }
+  return AScale(w, wMax / n);
+}
