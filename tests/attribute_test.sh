@@ -14,7 +14,7 @@
 #    ebenso grün — und die stdlib benutzt @description/@author/@copyright
 #    340-fach.
 #
-# 2. Attribute, deren Zusicherung der Compiler NICHT nachweist (@integrity,
+# 2. Attribute, deren Zusicherung der Compiler NICHT nachweist (@dal,
 #    @dal, @critical), melden das. @stack_limit (#1138) und
 #    @wcet (#1139) gehoeren nicht mehr dazu — sie werden geprueft.
 #    Sie bleiben gültig — abweisen hieße, sie aus der Sprache zu nehmen —,
@@ -170,10 +170,10 @@ warns "@dal meldet den fehlenden Nachweis" 'import std.io;
 fn F(): int64 { return 1; }
 fn main(): int64 { return F(); }' "NICHT nachgewiesen"
 
-warns "@integrity meldet den fehlenden Nachweis" 'import std.io;
-@integrity(mode: software_lockstep)
-fn F(): int64 { return 1; }
-fn main(): int64 { return F(); }' "NICHT nachgewiesen"
+# @integrity stand hier bis 1.1.14G. Seit #1878 wird die Zusicherung
+# nachgewiesen: `software_lockstep` rechnet den Rueckgabeausdruck zweimal und
+# vergleicht, `scrubbed` haengt einen periodischen CRC32-Sweep ein. Die
+# Gegenprobe dazu steht unten bei den wirksamen Attributen.
 
 # Gegenprobe: ein Attribut, das WIRKT, meldet nichts — sonst waere die
 # Unterscheidung zwischen "wirkt" und "nur vermerkt" wertlos.
@@ -188,6 +188,16 @@ quiet() { # name, quelltext
 
 quiet "@energy meldet nichts" 'import std.io;
 @energy(3)
+fn F(): int64 { return 1; }
+fn main(): int64 { return F(); }'
+
+quiet "@integrity(software_lockstep) meldet nichts (#1878)" 'import std.io;
+@integrity(mode: software_lockstep)
+fn F(): int64 { return 1; }
+fn main(): int64 { return F(); }'
+
+quiet "@integrity(scrubbed) meldet nichts (#1878)" 'import std.io;
+@integrity(mode: scrubbed, interval: 500)
 fn F(): int64 { return 1; }
 fn main(): int64 { return F(); }'
 

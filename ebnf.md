@@ -1,6 +1,6 @@
-# Lyx 1.1.14G — Canonical EBNF Grammar
+# Lyx 1.1.15A — Canonical EBNF Grammar
 
-> Stand 2026-08-30, gegen lyxc 1.1.14G geprueft. Die Keyword-Liste in
+> Stand 2026-08-31, gegen lyxc 1.1.15A geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -264,7 +264,16 @@ IntegrityMode       = "mode" ":"
                       | "scrubbed"
                       | "hardware_ecc" ) ;
 
-IntegrityInterval   = "interval" ":" IntLiteral ;
+IntegrityInterval   = "interval" ":" IntLiteral ;   (* ms, 1..3600000 *)
+
+(* #1878, seit 1.1.15A: `mode` ist PFLICHT -- `@integrity()` ohne Modus wird
+   abgewiesen. `software_lockstep` rechnet den Rueckgabeausdruck zweimal und
+   vergleicht vor dem `ret`; `interval` ist dort ein Widerspruch und wird
+   abgewiesen. `scrubbed` haengt einen periodischen CRC32-Sweep ueber den
+   geladenen Code ein (SIGALRM, Standardintervall 1000 ms).
+   `hardware_ecc` nennt die Grammatik, umgesetzt ist es NICHT: es braucht
+   ECC-Speicher und einen Weg an dessen Fehlerzaehler. Der Compiler weist den
+   Modus mit dieser Begruendung ab, statt ihn anzunehmen und nichts zu tun. *)
 
 VarAttr             = "@redundant"   (* TMR: drei Kopien + Mehrheitsentscheid, §20.1 *)
                     | "@volatile"
@@ -1584,7 +1593,7 @@ Einzelbefunde sind dort verlinkt.
 | Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
 | Nullable-Suffix, Pruefung | 7 | `T?` wird geparst und am Typknoten vermerkt, loest aber KEINE zusaetzliche Pruefung aus: ein nicht-nullbarer Typ nimmt weiterhin `null` an, und ein nullbarer wird ohne `?.` ungeprueft dereferenziert. Das Suffix dokumentiert die Absicht, es erzwingt sie nicht. `?.` dagegen prueft zur Laufzeit. (#1092) |
 | Struktur-Literal als Wert | 15 | `P { t: 1, f: 0 }` gibt es nur als MUSTER (§14, StructPattern), nicht als Ausdruck: `var p: P := P { t: 1 };` wird mit "expected expression" abgewiesen. Ein struct-Local wird ohne Initialisierer angelegt und feldweise gefuellt. Die Asymmetrie ist festgehalten, nicht behoben. (#1104) |
-| Attribute ohne Nachweis | 4 | `@integrity`, `@dal` und `@critical` werden geparst, in ihrer Argumentform geprueft und am Knoten vermerkt -- der Compiler weist die Zusicherung aber **nicht** nach. Keine TMR-Verifikation. `@stack_limit` (seit 1.0.14K, #1138), `@wcet` (seit 1.0.14L, #1139) und `@flight_crit` (seit 1.0.14M, #1140) sind NICHT mehr darunter. Sie sind seit #1099 nicht mehr stumm: jedes Vorkommen meldet den fehlenden Nachweis. Wer die Annotation setzt, bekommt sie also als Vermerk, nicht als Beweis. Unbekannte Attributnamen und falsche Argumentformen werden abgewiesen. |
+| Attribute ohne Nachweis | 4 | `@dal` und `@critical` werden geparst, in ihrer Argumentform geprueft und am Knoten vermerkt -- der Compiler weist die Zusicherung aber **nicht** nach. Keine TMR-Verifikation. `@stack_limit` (seit 1.0.14K, #1138), `@wcet` (seit 1.0.14L, #1139), `@flight_crit` (seit 1.0.14M, #1140) und `@integrity` (seit 1.1.15A, #1878) sind NICHT mehr darunter. Sie sind seit #1099 nicht mehr stumm: jedes Vorkommen meldet den fehlenden Nachweis. Wer die Annotation setzt, bekommt sie also als Vermerk, nicht als Beweis. Unbekannte Attributnamen und falsche Argumentformen werden abgewiesen. |
 | Typtest `is`, Reichweite | 15 | Zur LAUFZEIT geprueft wird nur gegen eine Klasse MIT Methoden -- nur die traegt einen Typzeiger. Eine Klasse OHNE Methode bekommt struct-Layout und damit keine VMT; dort ist die Antwort der statisch bekannte Vererbungsweg (plus `null`-Probe), und ein zur Laufzeit eingelagerter anderer Typ waere nicht zu sehen. Wo der statische Typ des Empfaengers nicht bestimmbar ist oder der genannte Typ weder Klasse noch eingebauter Typ ist (Alias, Generik), MELDET der Compiler das, statt `false` zu liefern. (#1094) |
 | Doppelte Mitglieder | 9 | Seit 1.1.3G (#1668): zwei gleichnamige Mitglieder in DERSELBEN Klasse werden abgewiesen — zwei Methoden, zwei Felder, oder ein Feld und eine Methode. Lyx kennt keine Ueberladung, es koennte also nur eines gelten. Die Meldung nennt beide Zeilen. In verschiedenen Klassen ist derselbe Name erlaubt, ebenso `override` in einer Ableitung. Fuer freie Funktionen auf Modulebene gilt dasselbe seit #1135. |
 | `ClassName()` | 15 | Seit 1.1.3D (#1670): `obj.ClassName()` liefert den Klassennamen als `pchar`. Bei einer Klasse MIT Methoden dynamisch ueber den Typzeiger — eine als Basisklasse deklarierte Variable meldet die tatsaechliche Klasse. Eine Klasse OHNE Methoden traegt keinen Typzeiger; dort ist es der statische Name. Ein Empfaenger ohne bestimmbaren Klassentyp wird gemeldet. Weitergehende Typinformation zur Laufzeit (Feld- und Methodennamen) gibt es NICHT. |
