@@ -1,7 +1,27 @@
-// std/meta_safe.lyx — WP-3.2: Secure Post-Patching runtime verifier
+// std/meta_safe.lyx — WP-3.2 / #1877 / #1879: Integritaetspruefung
 //
-// Reads the .meta_safe section from /proc/self/exe, re-computes CRC32
-// for each code page, and reports whether the binary is intact.
+// ZWEI verschiedene Fragen, und sie duerfen nicht verwechselt werden:
+//
+//   MetaSafeVerify()        liest /proc/self/exe und rechnet ueber den
+//                           DATEIINHALT. Das erkennt eine Manipulation der
+//                           Datei nach dem Uebersetzen — Post-Patching. Es
+//                           erkennt KEINEN Kipper in einer bereits geladenen,
+//                           privaten Codeseite: die Datei ist dann noch heil.
+//
+//   MetaSafeVerifyMemory()  rechnet ueber die GELADENEN Seiten zwischen
+//                           code_start_va und code_end_va. Das ist die Frage,
+//                           die der Strahlenschutz stellt (#1879).
+//
+// Beide holen die Referenzhashes aus der `.meta_safe`-Sektion. Im Format v2
+// (#1877) liegt die Hashtabelle DREIFACH vor, je `stride` Byte auseinander;
+// gelesen wird per Mehrheitsentscheid. Stimmen alle drei Kopien nicht
+// ueberein, wird das als EIGENER Fall gemeldet (-3) und nicht still auf die
+// erste Kopie zurueckgefallen — sonst waere ein Defekt in der Tabelle von
+// einem Defekt im Code nicht zu unterscheiden.
+//
+// Keine der beiden Funktionen laeuft von selbst. Der periodische Sweep
+// entsteht im Compiler aus `@integrity(mode: scrubbed)` (#1878); er traegt
+// seine eigene Tabelle im Datenbereich und braucht diese Unit nicht.
 @capabilities([fs.meta, fs.read])
 
 unit std.meta_safe;
@@ -84,102 +104,213 @@ fn _ms_findSection(binBuf: int64, binSize: int64, outOff: int64, outSize: int64)
 }
 
 // ============================================================================
+// Kopf lesen — v1 ("META") und v2 ("METASAF2")
+// ============================================================================
+
+// Version des Formats: 2, 1, oder 0 wenn die Kennung nicht stimmt.
+fn _ms_version(payload: int64): int64 {
+  if (peek8(payload + 0) != 77 || peek8(payload + 1) != 69 ||
+      peek8(payload + 2) != 84 || peek8(payload + 3) != 65) { return 0; }
+  if (peek8(payload + 4) == 83 && peek8(payload + 5) == 65 &&
+      peek8(payload + 6) == 70 && peek8(payload + 7) == 50) { return 2; }
+  return 1;
+}
+
+fn _ms_pageCount(payload: int64, ver: int64): int64 {
+  if (ver == 2) { return peek32(payload + 8) & 0xFFFFFFFF; }
+  return peek32(payload + 4) & 0xFFFFFFFF;
+}
+
+fn _ms_codeLen(payload: int64, ver: int64): int64 {
+  if (ver == 2) { return peek64(payload + 16); }
+  return peek64(payload + 8);
+}
+
+// Startadresse des geladenen Codes. v1 kannte sie nicht — dort ist die Frage
+// nach dem SPEICHER nicht beantwortbar, und genau das meldet der Aufrufer.
+fn _ms_codeStartVa(payload: int64, ver: int64): int64 {
+  if (ver == 2) { return peek64(payload + 24); }
+  return 0;
+}
+
+fn _ms_stride(payload: int64, ver: int64): int64 {
+  if (ver == 2) { return peek32(payload + 44) & 0xFFFFFFFF; }
+  return 0;
+}
+
+fn _ms_tableOff(ver: int64): int64 {
+  if (ver == 2) { return 64; }
+  return 16;
+}
+
+// Mehrheitsentscheid ueber die drei Kopien. Rueckgabe: der Hash, oder
+// MS_KEINE_MEHRHEIT, wenn alle drei verschieden sind.
+pub con MS_KEINE_MEHRHEIT: int64 := 0 - 3;
+
+fn _ms_hashMehrheit(payload: int64, ver: int64, idx: int64): int64 {
+  var basis: int64 := payload + _ms_tableOff(ver) + idx * 8;
+  if (ver != 2) { return peek32(basis + 4) & 0xFFFFFFFF; }
+  var stride: int64 := _ms_stride(payload, ver);
+  var a: int64 := peek32(basis + 4) & 0xFFFFFFFF;
+  var b: int64 := peek32(basis + stride + 4) & 0xFFFFFFFF;
+  var c: int64 := peek32(basis + stride + stride + 4) & 0xFFFFFFFF;
+  if (a == b) { return a; }
+  if (a == c) { return a; }
+  if (b == c) { return b; }
+  return MS_KEINE_MEHRHEIT;
+}
+
+// ============================================================================
+// Sektion samt Abbild holen. Rueckgabe: Zeiger auf die Nutzlast, oder 0.
+// Der Aufrufer bekommt ueber outBin/outSize den Puffer zum Freigeben.
+// ============================================================================
+fn _ms_lade(outBin: int64, outSize: int64): int64 {
+  var selfExe: pchar := "/proc/self/exe"c;
+  var fd: int64 := open(selfExe, 0, 0);
+  if (fd < 0) { return 0; }
+  var binSize: int64 := lseek(fd, 0, 2);
+  lseek(fd, 0, 0);
+  var binBuf: int64 := alloc(binSize + 1);
+  if (read(fd, binBuf as pchar, binSize) != binSize) {
+    close(fd); free(binBuf, binSize + 1); return 0;
+  }
+  close(fd);
+
+  var secOffBuf:  int64 := alloc(16);
+  var secSizeBuf: int64 := secOffBuf + 8;
+  var found: int64 := _ms_findSection(binBuf, binSize, secOffBuf, secSizeBuf);
+  var secOff: int64 := peek64(secOffBuf);
+  free(secOffBuf, 16);
+  if (found == 0) { free(binBuf, binSize + 1); return 0; }
+
+  poke64(outBin, binBuf);
+  poke64(outSize, binSize + 1);
+  return binBuf + secOff;
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
-// MetaSafeVerify: reads /proc/self/exe, finds .meta_safe, re-checks CRC32s.
-// Returns 0 if all pages match, -1 if any page is corrupted or section missing.
+// Fassung der Sektion: 2, 1, oder -1 wenn keine da ist.
+pub fn MetaSafeFormatVersion(): int64 {
+  var hb: int64 := alloc(16);
+  var payload: int64 := _ms_lade(hb, hb + 8);
+  if (payload == 0) { free(hb, 16); return 0 - 1; }
+  var ver: int64 := _ms_version(payload);
+  free(peek64(hb), peek64(hb + 8));
+  free(hb, 16);
+  if (ver == 0) { return 0 - 1; }
+  return ver;
+}
+
+// MetaSafeVerify: prueft die DATEI (/proc/self/exe) gegen die Referenzhashes.
+// 0 = heil, -1 = veraendert oder keine Sektion, -3 = Tabelle ohne Mehrheit.
+//
+// Das ist eine Aussage ueber die Datei, NICHT ueber den laufenden Code. Fuer
+// die zweite Frage gibt es MetaSafeVerifyMemory.
 pub fn MetaSafeVerify(): int64 {
-  var selfExe: pchar := "/proc/self/exe"c;
-  var fd: int64 := open(selfExe, 0, 0);
-  if (fd < 0) { return -1; }
-  var binSize: int64 := lseek(fd, 0, 2);
-  lseek(fd, 0, 0);
-  var binBuf: int64 := alloc(binSize + 1);
-  read(fd, binBuf as pchar, binSize);
-  close(fd);
+  var hb: int64 := alloc(16);
+  var payload: int64 := _ms_lade(hb, hb + 8);
+  if (payload == 0) { free(hb, 16); return 0 - 1; }
+  var binBuf:  int64 := peek64(hb);
+  var binLen:  int64 := peek64(hb + 8);
 
-  // Scratch space for _ms_findSection output
-  var secOffBuf:  int64 := alloc(16);
-  var secSizeBuf: int64 := secOffBuf + 8;
+  var ver: int64 := _ms_version(payload);
+  if (ver == 0) { free(binBuf, binLen); free(hb, 16); return 0 - 1; }
 
-  var found: int64 := _ms_findSection(binBuf, binSize, secOffBuf, secSizeBuf);
-  if (found == 0) {
-    free(binBuf, binSize + 1);
-    free(secOffBuf, 16);
-    return -1;
-  }
-
-  var secOff:  int64 := peek64(secOffBuf);
-  var payload: int64 := binBuf + secOff;
-
-  // Validate magic
-  if (peek8(payload + 0) != 0x4D || peek8(payload + 1) != 0x45 ||
-      peek8(payload + 2) != 0x54 || peek8(payload + 3) != 0x41) {
-    free(binBuf, binSize + 1);
-    free(secOffBuf, 16);
-    return -1;
-  }
-
-  var pageCount: int64 := peek32(payload + 4) & 0xFFFFFFFF;
-  var codeLen:   int64 := peek64(payload + 8);  // stored actual .text byte count
-  var codeOff:   int64 := 176;  // static x86-64 ELF: .text starts at offset 176 (64-byte hdr + 2×56-byte phdr)
-  var pageSize:  int64 := 4096;
-
+  var pageCount: int64 := _ms_pageCount(payload, ver);
+  var codeLen:   int64 := _ms_codeLen(payload, ver);
+  var codeOff:   int64 := 176;   // statisches x86-64-ELF: .text bei 176
   var result: int64 := 0;
   var pi: int64 := 0;
   while (pi < pageCount) {
-    var entry:     int64 := payload + 16 + pi * 8;
-    var pageOff:   int64 := peek32(entry) & 0xFFFFFFFF;
-    var storedCrc: int64 := peek32(entry + 4) & 0xFFFFFFFF;
-
-    var fileOff:   int64 := codeOff + pageOff;
+    var storedCrc: int64 := _ms_hashMehrheit(payload, ver, pi);
+    if (storedCrc == MS_KEINE_MEHRHEIT) { result := MS_KEINE_MEHRHEIT; break; }
+    var pageOff:   int64 := pi * 4096;
     var remaining: int64 := codeLen - pageOff;
-    var len:       int64 := pageSize;
-    if (remaining < pageSize) { len := remaining; }
-    if (len <= 0) { result := -1; break; }
-
-    var computed: int64 := _ms_crc32(binBuf + fileOff, len);
-    if (computed != storedCrc) { result := -1; break; }
-    pi += 1;
+    var len:       int64 := 4096;
+    if (remaining < 4096) { len := remaining; }
+    if (len <= 0) { result := 0 - 1; break; }
+    if (_ms_crc32(binBuf + codeOff + pageOff, len) != storedCrc) { result := 0 - 1; break; }
+    pi := pi + 1;
   }
-
-  free(binBuf, binSize + 1);
-  free(secOffBuf, 16);
+  free(binBuf, binLen);
+  free(hb, 16);
   return result;
 }
 
-// MetaSafeGetPageHash: returns the stored CRC32 for page `pageIdx`, or -1.
+// MetaSafeVerifyMemory: prueft den GELADENEN Code zwischen code_start_va und
+// code_end_va gegen dieselben Referenzhashes.
+//   0  = heil
+//  -1  = eine Seite weicht ab
+//  -2  = keine Sektion, oder v1 (dort fehlt code_start_va — die Frage ist mit
+//        dieser Sektion nicht beantwortbar, und "0" waere gelogen)
+//  -3  = die drei Hashkopien haben keine Mehrheit
+pub fn MetaSafeVerifyMemory(): int64 {
+  var hb: int64 := alloc(16);
+  var payload: int64 := _ms_lade(hb, hb + 8);
+  if (payload == 0) { free(hb, 16); return 0 - 2; }
+  var binBuf: int64 := peek64(hb);
+  var binLen: int64 := peek64(hb + 8);
+
+  var ver: int64 := _ms_version(payload);
+  if (ver != 2) { free(binBuf, binLen); free(hb, 16); return 0 - 2; }
+  var startVa: int64 := _ms_codeStartVa(payload, ver);
+  if (startVa == 0) { free(binBuf, binLen); free(hb, 16); return 0 - 2; }
+
+  var pageCount: int64 := _ms_pageCount(payload, ver);
+  var codeLen:   int64 := _ms_codeLen(payload, ver);
+  var result: int64 := 0;
+  var pi: int64 := 0;
+  while (pi < pageCount) {
+    var storedCrc: int64 := _ms_hashMehrheit(payload, ver, pi);
+    if (storedCrc == MS_KEINE_MEHRHEIT) { result := MS_KEINE_MEHRHEIT; break; }
+    var pageOff:   int64 := pi * 4096;
+    var remaining: int64 := codeLen - pageOff;
+    var len:       int64 := 4096;
+    if (remaining < 4096) { len := remaining; }
+    if (len <= 0) { result := 0 - 1; break; }
+    if (_ms_crc32(startVa + pageOff, len) != storedCrc) { result := 0 - 1; break; }
+    pi := pi + 1;
+  }
+  free(binBuf, binLen);
+  free(hb, 16);
+  return result;
+}
+
+// MetaSafeGetPageHash: der abgelegte CRC32 der Seite `pageIdx` — im Format v2
+// per Mehrheit aus den drei Kopien. -1 wenn es die Seite nicht gibt.
 pub fn MetaSafeGetPageHash(pageIdx: int64): int64 {
-  var selfExe: pchar := "/proc/self/exe"c;
-  var fd: int64 := open(selfExe, 0, 0);
-  if (fd < 0) { return -1; }
-  var binSize: int64 := lseek(fd, 0, 2);
-  lseek(fd, 0, 0);
-  var binBuf: int64 := alloc(binSize + 1);
-  read(fd, binBuf as pchar, binSize);
-  close(fd);
-
-  var secOffBuf:  int64 := alloc(16);
-  var secSizeBuf: int64 := secOffBuf + 8;
-
-  var found: int64 := _ms_findSection(binBuf, binSize, secOffBuf, secSizeBuf);
-  if (found == 0) {
-    free(binBuf, binSize + 1);
-    free(secOffBuf, 16);
-    return -1;
+  var hb: int64 := alloc(16);
+  var payload: int64 := _ms_lade(hb, hb + 8);
+  if (payload == 0) { free(hb, 16); return 0 - 1; }
+  var binBuf: int64 := peek64(hb);
+  var binLen: int64 := peek64(hb + 8);
+  var ver: int64 := _ms_version(payload);
+  var result: int64 := 0 - 1;
+  if (ver != 0) {
+    var pageCount: int64 := _ms_pageCount(payload, ver);
+    if (pageIdx >= 0 && pageIdx < pageCount) {
+      result := _ms_hashMehrheit(payload, ver, pageIdx);
+    }
   }
+  free(binBuf, binLen);
+  free(hb, 16);
+  return result;
+}
 
-  var payload:    int64 := binBuf + peek64(secOffBuf);
-  var pageCount:  int64 := peek32(payload + 4) & 0xFFFFFFFF;
-
-  var result: int64 := -1;
-  if (pageIdx >= 0 && pageIdx < pageCount) {
-    var entry: int64 := payload + 16 + pageIdx * 8;
-    result := peek32(entry + 4) & 0xFFFFFFFF;
-  }
-
-  free(binBuf, binSize + 1);
-  free(secOffBuf, 16);
+// Anzahl der abgedeckten Codeseiten, oder -1.
+pub fn MetaSafePageCount(): int64 {
+  var hb: int64 := alloc(16);
+  var payload: int64 := _ms_lade(hb, hb + 8);
+  if (payload == 0) { free(hb, 16); return 0 - 1; }
+  var binBuf: int64 := peek64(hb);
+  var binLen: int64 := peek64(hb + 8);
+  var ver: int64 := _ms_version(payload);
+  var result: int64 := 0 - 1;
+  if (ver != 0) { result := _ms_pageCount(payload, ver); }
+  free(binBuf, binLen);
+  free(hb, 16);
   return result;
 }

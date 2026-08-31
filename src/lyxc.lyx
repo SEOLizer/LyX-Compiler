@@ -73,7 +73,9 @@ con EXPBUF_OFF_ADDR:    int64 := 16;
 con GRELOCBUF_SZ:       int64 := 16;
 con GRELOCBUF_OFF_GIDX: int64 := 8;
 
-// LYU metadata header (custom format, poke64 at +8 = codeLen)
+// #1877: .meta_safe v2 — Kopf 64 Byte, danach drei Kopien der Hashtabelle.
+// Der alte Wert (codeLen bei +8) galt fuer das v1-Format mit "META"-Kennung;
+// er bleibt hier stehen, weil std/meta_safe.lyx beide Fassungen liest.
 con LYU_META_OFF_CODELEN: int64 := 8;
 
 // ELF reloc buffer entry in emit_arm64 (24 bytes: offset + info + addend)
@@ -221,21 +223,43 @@ fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64
     PrintStr("meta-safe: read incomplete\n"); close(fd); return;
   }
 
-  // Compute CRC32 per 4096-byte page of .text
+  // #1877: Format v2. Bis 1.1.14G stand hier EIN CRC32 je Seite und sonst
+  // nichts — kein code_start_va, kein Modus, kein Intervall, vor allem: die
+  // Referenzhashes selbst waren nicht redundant. Ein Kipper im Hashfeld war
+  // damit von einem Kipper im Code nicht zu unterscheiden; die Pruefung meldete
+  // in beiden Faellen "korrupt", und es gab keine Mehrheit, die sagt, welche
+  // Seite recht hat. Fuer den Zweck (SEU-Erkennung) ist das der Unterschied
+  // zwischen Erkennen und Verwechseln.
+  //
+  // Kopf (64 Byte), dann DREI Kopien der Tabelle im Abstand `stride` (ein
+  // Vielfaches von 4096, damit ein lokaler Speicherdefekt nicht zwei Kopien
+  // zugleich trifft). Dieselbe Anordnung wie die Tabelle im Datenbereich, die
+  // der Codegen fuer `@integrity(mode: scrubbed)` anlegt (#1878) — die beiden
+  // muessen uebereinstimmen, std/meta_safe.lyx liest beide.
+  //
+  // Die Kennung ist neu: "METASAF2" statt "META". "META" + pageCount waere von
+  // einem v2-Kopf nicht sicher zu unterscheiden — ein altes Erzeugnis mit
+  // genau zwei Seiten haette dieselben acht Bytes wie "META" + Version 2.
   var pageSize: int64 := 4096;
   var pageCount: int64 := (codeLen + pageSize - 1) / pageSize;
-  // .meta_safe payload: Magic(4) + PageCount(4) + CodeLen(8) + pageCount×{pageOffset:4, crc32:4}
-  // Total header: 16 bytes; entries at offset 16
-  var payloadSize: int64 := 16 + pageCount * 8;
+  var eintraege: int64 := pageCount * 8;
+  var stride: int64 := ((eintraege + pageSize - 1) / pageSize) * pageSize;
+  if (stride < pageSize) { stride := pageSize; }
+  var payloadSize: int64 := 64 + 3 * stride;
   var payload: int64 := alloc(payloadSize);
 
-  // Magic: "META" = bytes 0x4D 0x45 0x54 0x41
-  poke8(payload + 0, 0x4D);  // M
-  poke8(payload + 1, 0x45);  // E
-  poke8(payload + 2, 0x54);  // T
-  poke8(payload + 3, 0x41);  // A
-  poke32(payload + 4, pageCount);
-  poke64(payload + LYU_META_OFF_CODELEN, codeLen);  // actual .text byte count for verifier
+  poke8(payload + 0, 77); poke8(payload + 1, 69);   // M E
+  poke8(payload + 2, 84); poke8(payload + 3, 65);   // T A
+  poke8(payload + 4, 83); poke8(payload + 5, 65);   // S A
+  poke8(payload + 6, 70); poke8(payload + 7, 50);   // F 2
+  poke32(payload + 8,  pageCount);
+  poke32(payload + 12, 0);                          // mode: 0 = nur Datei-Pruefung
+  poke64(payload + 16, codeLen);
+  poke64(payload + 24, 4194304 + codeOff);          // code_start_va
+  poke64(payload + 32, 4194304 + codeOff + codeLen);// code_end_va
+  poke32(payload + 40, 0);                          // interval_ms: kein Sweep
+  poke32(payload + 44, stride);
+  poke64(payload + 48, 0);                          // recovery_ptr
 
   var pi: int64 := 0;
   while (pi < pageCount) {
@@ -245,9 +269,13 @@ fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64
     var len:        int64 := pageSize;
     if (remaining < pageSize) { len := remaining; }
     var crc: int64 := ms_crc32(buf + fileOff, len);
-    var entry: int64 := payload + 16 + pi * 8;
-    poke32(entry,     pageOff);  // pageOffset (relative to .text start)
-    poke32(entry + 4, crc);      // crc32
+    var k: int64 := 0;
+    while (k < 3) {
+      var entry: int64 := payload + 64 + k * stride + pi * 8;
+      poke32(entry,     pageOff);  // pageOffset (relative to .text start)
+      poke32(entry + 4, crc);      // crc32
+      k += 1;
+    }
     pi += 1;
   }
 
@@ -1500,7 +1528,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.1.14G"c);
+      PrintStrLn("1.1.15A"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1522,7 +1550,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.1.14G"c);
+      PrintStrLn("1.1.15A"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1751,7 +1779,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.1.14G (bootstrap)");
+    PrintStrLn("lyxc 1.1.15A (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -2267,6 +2295,10 @@ pub type CompilerConfig = class {
         cg.srcFileLen  := StrLen(inputFile);
       }
       if self.verifyTmr { cg.verifyTmr := 1; }   // #1141
+      // #1878: Das Sweep-Intervall aus `@integrity(mode: scrubbed, interval: N)`.
+      // Es gilt programmweit — ein Zeitgeber je Prozess kann nur eine Frist
+      // tragen —, deshalb steht es am Parser und nicht am Funktionsknoten.
+      cg.integrityIntervalMs := parser.integrityIntervalMs;
       if self.runtimeChecks {
         cg.runtimeChecks := 1;
       }
@@ -5596,7 +5628,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.1.14G — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.1.15A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit

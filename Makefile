@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.14G
-VERSION_DATE := 2026-08-30
+VERSION   := 1.1.15A
+VERSION_DATE := 2026-08-31
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -362,6 +362,8 @@ test: lyxc
 	@bash tests/is_type_test.sh
 	@bash tests/range_runtime_test.sh
 	@bash tests/attribute_test.sh
+	@echo "--- @integrity: Lockstep + Scrub-Sweep (#1878/#1877/#1879) ---"
+	@bash tests/integrity_test.sh
 	@bash tests/while_limit_test.sh
 	@bash tests/grammar_gaps_test.sh
 	@echo "OK"

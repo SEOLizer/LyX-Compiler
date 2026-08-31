@@ -424,6 +424,35 @@ con CG_ENVBLOCK: int64 := 96; // data[96..103]: _lyx_envblock (8 bytes)
 con CG_HEAP_PTR: int64 := 104; // data[104..111]: _lyx_heap_ptr
 con CG_HEAP_END: int64 := 112; // data[112..119]: _lyx_heap_end
 
+// #1878: Kopfgroesse der Scrub-Tabelle (siehe cg_scrubBuildTable).
+con CG_SCRUB_HDR: int64 := 64;
+
+// #1878: CRC32 (IEEE 802.3) ueber einen Speicherbereich. Dieselbe Rechnung wie
+// `ms_crc32` in src/lyxc.lyx und `_ms_crc32` in std/meta_safe.lyx — die drei
+// muessen uebereinstimmen, sonst meldet der Sweep eine heile Seite als
+// beschaedigt. Der Handler im Erzeugnis rechnet sie ein viertes Mal in
+// Maschinencode nach (cg_scrubEmitHandler); auch der gehoert dazu.
+// Freie Funktion, KEINE Methode: eine zusaetzliche Methode verschiebt die
+// Vtable der Klasse (#1853).
+fn cg_crc32(data: int64, len: int64): int64 {
+  var crc: int64 := 0xFFFFFFFF;
+  var i: int64 := 0;
+  while (i < len) {
+    crc := crc ^ (peek8(data + i) & 0xFF);
+    var b: int64 := 0;
+    while (b < 8) {
+      if ((crc & 1) != 0) {
+        crc := ((crc >> 1) & 0x7FFFFFFF) ^ (0 - 306674912);
+      } else {
+        crc := (crc >> 1) & 0x7FFFFFFF;
+      }
+      b += 1;
+    }
+    i += 1;
+  }
+  return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
 // ============================================================================
 // Codegen class
 // ============================================================================
@@ -966,6 +995,22 @@ pub type Codegen = class {
   // und laesst den Epilog den alten MXCSR zurueckschreiben.
   fcSeen:      int64;
   fcActive:    int64;
+  // #1878: @integrity. `scrubSeen` sagt, ob das Programm ueberhaupt einen
+  // periodischen Sweep braucht; `lockstepActive` gilt je Funktion und schaltet
+  // die doppelte Berechnung des Rueckgabeausdrucks ein.
+  scrubSeen:        int64;
+  lcbsBpfDone:      int64;   // #1878: BPF steht schon — ein spaeter Sweep waere ungedeckt
+  scrubEmitted:     int64;   // Handler nur EINMAL — cg_genFile laeuft je Import erneut
+  scrubPtrCell:     int64;   // Datenzelle mit der Adresse der Hashtabelle (0 = keine)
+  scrubTableOff:    int64;   // Offset der Tabelle im Datenbereich
+  scrubPageCount:   int64;
+  scrubStride:      int64;   // Abstand der drei Kopien, Vielfaches von 4096
+  integrityIntervalMs: int64;
+  lockstepActive:   int64;
+  lockstepSeen:     int64;   // irgendwo im Programm: Abbruchpfad wird gebraucht
+  lockstepFailEmitted: int64;
+  lockstepName:     pchar;   // Funktionsname fuer die Meldung
+  lockstepNameLen:  int64;
   fcMxSlot:    int64;   // rbp-Offset: gesicherter MXCSR (+4: der entschaerfte)
   fcNameSlot:  int64;   // rbp-Offset: vorheriger Wert von _lyx_fc_name
 
@@ -8834,9 +8879,24 @@ pub type Codegen = class {
     self.curFnRetRange := self.cg_rangeOfTypeNode(self.cg_nc1(ni));
     var savedMRetNarrow: int64 := self.curFnRetNarrow;          // #1151
     self.curFnRetNarrow := self.cg_narrowKindOfTypeNode(self.cg_nc1(ni));
+    // #1878: Lockstep an einer METHODE. Zweite Stelle derselben Aufzaehlung —
+    // die freie Funktion steht in cg_genFuncDecl, die beiden muessen
+    // uebereinstimmen.
+    var savedMLs:     int64 := self.lockstepActive;
+    var savedMLsName: pchar := self.lockstepName;
+    var savedMLsLen:  int64 := self.lockstepNameLen;
+    self.lockstepActive := 0;
+    if (self.cg_integrityMode(ni) == INTEGRITY_LOCKSTEP) {
+      self.lockstepActive  := 1;
+      self.lockstepName    := self.cg_nsval(ni);
+      self.lockstepNameLen := self.cg_nslen(ni);
+    }
     // Generate body
     var body: int64 := self.cg_nc2(ni);
     self.cg_genBlock(body);
+    self.lockstepActive  := savedMLs;
+    self.lockstepName    := savedMLsName;
+    self.lockstepNameLen := savedMLsLen;
     self.curFnRetRange := savedMRetRange;
     self.curFnRetNarrow := savedMRetNarrow;                     // #1151
     // Implicit return
@@ -15366,6 +15426,15 @@ pub type Codegen = class {
       // Adresse; damit sieht die Aufrufstelle dasselbe wie vorher, nur ohne
       // Belegung, die nie zurueckgegeben wird.
       if (self.fnRetStructBytes > 0 && expr >= 0) {
+        // #1878: Lockstep vergleicht EINEN Wert in rax. Eine Struct-Rueckgabe
+        // kopiert ein Feld nach dem anderen an den Platz des Aufrufers; dort
+        // gaebe es nichts zu vergleichen, und stillschweigend nichts zu tun
+        // waere genau der Zustand, den dieses Attribut hatte.
+        if (self.lockstepActive != 0) {
+          EPrintStrLn("error: @integrity(mode: software_lockstep): Struct-Rueckgabe wird nicht abgedeckt"c);
+          EPrintStrLn("  Der Vergleich sitzt auf dem Rueckgabewert in einem Register; eine Struktur hat keinen."c);
+          exit(1);
+        }
         self.cg_genExpr(expr);                                   // rax = Quelle
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);    // mov rsi, rax
         self.cg_loadRax(self.fnRetSlotOff);                      // rax = Ziel
@@ -15383,6 +15452,11 @@ pub type Codegen = class {
       }
       // WP-04: tuple return [a, b] → rax=first, rdx=second (SysV ABI)
       if (self.funcHasTupleReturn != 0 && expr >= 0 && self.cg_nkind(expr) == 100) {
+        if (self.lockstepActive != 0) {
+          EPrintStrLn("error: @integrity(mode: software_lockstep): Tupel-Rueckgabe wird nicht abgedeckt"c);
+          EPrintStrLn("  Der Vergleich sitzt auf rax; das zweite Element liegt in rdx."c);
+          exit(1);
+        }
         var elem0: int64 := self.cg_nc0(expr);
         var elem1: int64 := self.cg_nnext(elem0);
         self.cg_genExpr(elem0);
@@ -15394,6 +15468,7 @@ pub type Codegen = class {
         // WP-AS-10: save return value around defer emission
         if (expr >= 0) {
           self.cg_genExpr(expr);
+          if (self.lockstepActive != 0) { self.cg_lockstepPruefe(expr); }   // #1878
           self.cg_pushRax();
           self.cg_emitDefers();
           self.cg_popRax();
@@ -15404,6 +15479,10 @@ pub type Codegen = class {
       } else {
         if (expr >= 0) {
           self.cg_genExpr(expr);
+          // #1878: derselbe Vergleich wie im defer-Zweig darueber — die
+          // beiden muessen uebereinstimmen, sonst haengt der Nachweis am
+          // Vorhandensein eines `defer`.
+          if (self.lockstepActive != 0) { self.cg_lockstepPruefe(expr); }
         } else {
           self.cg_zeroRax();
         }
@@ -17527,6 +17606,374 @@ pub type Codegen = class {
     }
   }
 
+  // #1878: Kommt `@integrity(mode: scrubbed)` vor? Dieselbe Aufzaehlung wie
+  // oben — freie Funktion UND Methode. Eine Aufzaehlung, die nur den einen
+  // Fall kennt, ist der Fehler, der in #1787/#1806/#1812 dreimal auftrat.
+  fn cg_collectIntegrity(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      var k: int64 := self.cg_nkind(cur);
+      if (k == CGN_FUNC_DECL) {
+        if (self.cg_integrityMode(cur) == INTEGRITY_SCRUBBED) { self.scrubSeen := 1; }
+        if (self.cg_integrityMode(cur) == INTEGRITY_LOCKSTEP) { self.lockstepSeen := 1; }
+      } else if (k == CGN_TYPE_DECL) {
+        var m: int64 := self.cg_nc1(cur);
+        while (m != -1) {
+          if (self.cg_nkind(m) == CGN_FUNC_DECL) {
+            if (self.cg_integrityMode(m) == INTEGRITY_SCRUBBED) { self.scrubSeen := 1; }
+            if (self.cg_integrityMode(m) == INTEGRITY_LOCKSTEP) { self.lockstepSeen := 1; }
+          }
+          m := self.cg_nnext(m);
+        }
+      }
+      cur := self.cg_nnext(cur);
+    }
+    // Die Zelle mit dem Tabellenzeiger muss VOR dem Handler stehen — der
+    // Handler laedt sie ueber [rip+Zelle]. Die Tabelle selbst entsteht erst,
+    // wenn der Code fertig ist (ihre Groesse haengt an der Codelaenge).
+    // Ein `@integrity(mode: scrubbed)` in einer importierten Einheit wird erst
+    // hier sichtbar — da steht der seccomp-Filter schon. Der Sweep liefe dann
+    // in ein SIGSYS statt zu pruefen; das wird GEMELDET, nicht abgewartet.
+    if (self.scrubSeen != 0 && self.lcbsBpfDone != 0 && self.lcbsCapCount > 0
+        && self.scrubPtrCell == 0) {
+      EPrintStrLn("error: @integrity(mode: scrubbed) in einer importierten Einheit zusammen mit @capabilities"c);
+      EPrintStrLn("  Der seccomp-Filter steht zu diesem Zeitpunkt bereits; `setitimer` waere darin nicht freigegeben."c);
+      EPrintStrLn("  Das Attribut gehoert an eine Funktion der Haupteinheit."c);
+      exit(1);
+    }
+    if (self.scrubSeen != 0 && self.scrubPtrCell == 0) {
+      self.scrubPtrCell := self.cg_reserveData(8);
+      if (self.integrityIntervalMs == 0) {
+        self.integrityIntervalMs := INTEGRITY_INTERVAL_DEFAULT;
+      }
+    }
+  }
+
+  fn cg_integrityMode(ni: int64): int64 {
+    return (self.cg_nival(ni) >> ANNO_INTEGRITY_SHIFT) & ANNO_INTEGRITY_MASK;
+  }
+
+  // ------------------------------------------------------------------
+  // #1878: software_lockstep — den Rueckgabeausdruck zweimal rechnen und die
+  // beiden Ergebnisse vergleichen. Das ist Lockstep auf Registerebene: ein
+  // Kipper waehrend einer der beiden Auswertungen faellt auf, weil die zweite
+  // ihn nicht wiederholt. Was es NICHT sieht, steht in der Doku und im Test:
+  // einen Kipper im gespeicherten Eingabewert, den beide Laeufe gleich lesen.
+  //
+  // Deshalb darf der Ausdruck keine Wirkung haben. Ein Aufruf wuerde zweimal
+  // laufen (und zweimal schreiben, zweimal belegen); statt das stillschweigend
+  // zu tun, wird es GEMELDET.
+  // ------------------------------------------------------------------
+  fn cg_lockstepDuplizierbar(ni: int64): int64 {
+    if (ni < 0) { return 1; }
+    var k: int64 := self.cg_nkind(ni);
+    var ok: int64 := 0;
+    if (k == CGN_LIT_INT)   { ok := 1; }
+    if (k == CGN_LIT_FLOAT) { ok := 1; }
+    if (k == CGN_LIT_CHAR)  { ok := 1; }
+    if (k == CGN_LIT_BOOL)  { ok := 1; }
+    if (k == CGN_LIT_NULL)  { ok := 1; }
+    if (k == CGN_IDENT)     { ok := 1; }
+    if (k == CGN_BINOP)     { ok := 1; }
+    if (k == CGN_UNOP)      { ok := 1; }
+    if (k == CGN_INDEX)     { ok := 1; }
+    if (k == CGN_FIELD)     { ok := 1; }
+    if (k == CGN_CAST)      { ok := 1; }
+    if (ok == 0) { return 0; }
+    if (self.cg_lockstepDuplizierbar(self.cg_nc0(ni)) == 0) { return 0; }
+    if (self.cg_lockstepDuplizierbar(self.cg_nc1(ni)) == 0) { return 0; }
+    if (self.cg_lockstepDuplizierbar(self.cg_nc2(ni)) == 0) { return 0; }
+    return 1;
+  }
+
+  // rax traegt das Ergebnis des ERSTEN Laufs. Danach steht dort das Ergebnis
+  // des zweiten — beide sind gleich, sonst wurde vorher abgebrochen.
+  fn cg_lockstepPruefe(expr: int64) {
+    if (self.cg_lockstepDuplizierbar(expr) == 0) {
+      EPrintStr("error: @integrity(mode: software_lockstep) in `"c);
+      sys_write(2, self.lockstepName as int64, self.lockstepNameLen);
+      EPrintStrLn("`: der Rueckgabeausdruck hat eine Wirkung (Aufruf, `new`, Zuweisung) und laesst sich nicht zweimal rechnen"c);
+      EPrintStrLn("  Zwischenergebnis in eine Variable legen und diese zurueckgeben."c);
+      exit(1);
+    }
+    self.cg_pushRax();
+    self.cg_genExpr(expr);
+    // pop rcx; cmp rax, rcx; je weiter
+    self.cg_e8(0x59);
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);
+    self.cg_e8(0x74); self.cg_e8(0x05);
+    // call __lyx_lockstep_fail  (kehrt nicht zurueck)
+    self.cg_e8(0xE8);
+    self.cg_addPatch(self.codeLen, "__lyx_lockstep_fail" as int64, 19, CG_PATCH_CALL);
+    self.cg_e32(0);
+  }
+
+  // Der Abbruchpfad. Steht einmal im Erzeugnis, gerufen von jeder
+  // lockstep-Rueckgabe. rcx traegt den ersten, rax den zweiten Wert — beide
+  // werden gemeldet, sonst ist die Meldung nicht nachvollziehbar.
+  fn cg_lockstepEmitFail() {
+    var m1: pchar := "panic: @integrity(mode: software_lockstep): die beiden Berechnungen des Rueckgabewerts stimmen nicht ueberein\n"c;
+    var m1len: int64 := StrLen(m1);
+    var m1off: int64 := self.cg_fcDataStr(m1, m1len);
+    self.cg_addLabel("__lyx_lockstep_fail"c, 19, 0);
+    // write(2, m1, m1len)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(1);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e32(2);
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+    var p1: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(p1, m1off, 0, CG_PATCH_STR);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(m1len);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // exit_group(133)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(231);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e32(133);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+  }
+
+  // ==================================================================
+  // #1878/#1877/#1879: mode: scrubbed — periodischer CRC32-Sweep ueber den
+  // GELADENEN Code.
+  //
+  // Geprueft wird der Speicher, nicht die Datei: `MetaSafeVerify` liest
+  // /proc/self/exe und erkennt damit eine Manipulation des Abbilds, aber
+  // keinen Kipper in einer laengst geladenen, privaten Codeseite (#1879).
+  // Der Sweep hier rechnet ueber code_start_va..code_end_va.
+  //
+  // Die Referenzhashes liegen DREIFACH im Datenbereich, je 4096 Byte
+  // auseinander (#1877). Ohne diese Redundanz waere ein Kipper im Hashfeld von
+  // einem Kipper im Code nicht zu unterscheiden — die Pruefung meldete in
+  // beiden Faellen "korrupt", und es gaebe keine Mehrheit, die sagt, welche
+  // Seite recht hat. Stimmen alle drei Kopien nicht ueberein, wird das als
+  // eigener Fall gemeldet; still auf die erste Kopie zu fallen waere der
+  // stille Default in neuer Form.
+  //
+  // Tabellenkopf (64 Byte), dann drei Kopien im Abstand `stride`:
+  //    +0  "METASAF2"      +8  pageCount(u32)   +12 mode(u32)
+  //   +16  codeLen(u64)   +24  code_start_va    +32 code_end_va
+  //   +40  interval_ms(u32) +44 stride(u32)     +48 recovery_ptr(u64)
+  //   +56  sweepCount(u64) — zur Laufzeit hochgezaehlt, damit ein Test die
+  //        WIRKUNG messen kann und nicht nur das Vorhandensein des Handlers.
+  // ==================================================================
+  // In `main`, vor jedem Benutzercode: Handler einhaengen und Zeitgeber
+  // stellen. Ohne den Zeitgeber liefe der Sweep nur auf Zuruf — genau die
+  // Einschraenkung aus #1879.
+  fn cg_scrubInstall() {
+    var ms:  int64 := self.integrityIntervalMs;
+    var sek: int64 := ms / 1000;
+    var usek: int64 := (ms - sek * 1000) * 1000;
+    // sub rsp, 64
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x40);
+    // lea rax, [rip+__lyx_scrub_handler]; mov [rsp], rax
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);
+    var pH: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pH, "__lyx_scrub_handler" as int64, 19, CG_PATCH_CALL);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);
+    // mov rax, SA_RESTORER; mov [rsp+8], rax
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(67108864);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x08);
+    // lea rax, [rip+__lyx_scrub_restorer]; mov [rsp+16], rax
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x05);
+    var pR: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pR, "__lyx_scrub_restorer" as int64, 20, CG_PATCH_CALL);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x10);
+    // xor rax, rax; mov [rsp+24], rax   (leere sa_mask)
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x18);
+    // rt_sigaction(SIGALRM=14, rsp, 0, 8)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(13);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e32(14);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE6);
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(8);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // itimerval bei [rsp+32]: it_interval{sek,usek}, it_value{sek,usek}
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(sek);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x20);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x30);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(usek);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x28);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x44); self.cg_e8(0x24); self.cg_e8(0x38);
+    // setitimer(ITIMER_REAL=0, rsp+32, 0)
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(38);
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x20);
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xD2);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    // add rsp, 64
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x40);
+  }
+
+  fn cg_scrubEmitHandler() {
+    // ---- __lyx_scrub_restorer: rt_sigreturn ----
+    self.cg_addLabel("__lyx_scrub_restorer"c, 20, 0);
+    self.cg_e8(0xB8); self.cg_e32(15);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    var mBad: pchar := "panic: @integrity(mode: scrubbed): Codeseite im Speicher stimmt nicht mit dem Referenzhash ueberein\n"c;
+    var mMaj: pchar := "panic: @integrity(mode: scrubbed): keine Mehrheit unter den drei Referenzhashes — auch die Tabelle ist beschaedigt\n"c;
+    var mBadLen: int64 := StrLen(mBad);
+    var mMajLen: int64 := StrLen(mMaj);
+    var mBadOff: int64 := self.cg_fcDataStr(mBad, mBadLen);
+    var mMajOff: int64 := self.cg_fcDataStr(mMaj, mMajLen);
+
+    self.cg_addLabel("__lyx_scrub_handler"c, 19, 0);
+    // mov rdi, [rip+scrubPtrCell]      — Adresse der Tabelle
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3D);
+    var pT: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pT, self.scrubPtrCell, 0, CG_PATCH_STR);
+    // inc qword [rdi+56]               — Sweep-Zaehler
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0x47); self.cg_e8(0x38);
+    // xor r8, r8                       — Seitenindex
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC0);
+    // mov r9d, [rdi+8]                 — pageCount
+    self.cg_e8(0x44); self.cg_e8(0x8B); self.cg_e8(0x4F); self.cg_e8(0x08);
+
+    var seitenSchleife: int64 := self.codeLen;
+    // cmp r8, r9; jge fertig
+    self.cg_e8(0x4D); self.cg_e8(0x39); self.cg_e8(0xC8);
+    self.cg_e8(0x0F); self.cg_e8(0x8D);
+    var pFertig: int64 := self.codeLen; self.cg_e32(0);
+    // rsi = code_start_va + index*4096
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x77); self.cg_e8(0x18);
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xC0);          // mov rax, r8
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(0x0C);  // shl rax, 12
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xC6);          // add rsi, rax
+    // rdx = min(4096, codeLen - index*4096)
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x57); self.cg_e8(0x10);
+    self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xC2);          // sub rdx, rax
+    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xFA); self.cg_e32(4096);
+    self.cg_e8(0x7E); self.cg_e8(0x07);                            // jle +7
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(4096);
+    // ---- CRC32 ueber [rsi, rdx) nach eax ----
+    self.cg_e8(0xB8); self.cg_e32(4294967295);                     // mov eax, 0xFFFFFFFF
+    self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC9);          // xor rcx, rcx
+    var byteSchleife: int64 := self.codeLen;
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xD1);          // cmp rcx, rdx
+    self.cg_e8(0x0F); self.cg_e8(0x8D);
+    var pCrcFertig: int64 := self.codeLen; self.cg_e32(0);         // jge crcFertig
+    self.cg_e8(0x44); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x14); self.cg_e8(0x0E); // movzx r10d,[rsi+rcx]
+    self.cg_e8(0x44); self.cg_e8(0x31); self.cg_e8(0xD0);          // xor eax, r10d
+    self.cg_e8(0x41); self.cg_e8(0xBB); self.cg_e32(8);            // mov r11d, 8
+    var bitSchleife: int64 := self.codeLen;
+    self.cg_e8(0xD1); self.cg_e8(0xE8);                            // shr eax, 1
+    self.cg_e8(0x73); self.cg_e8(0x05);                            // jnc +5
+    self.cg_e8(0x35); self.cg_e32(3988292384);                     // xor eax, 0xEDB88320
+    self.cg_e8(0x41); self.cg_e8(0xFF); self.cg_e8(0xCB);          // dec r11d
+    self.cg_e8(0x75);
+    self.cg_e8((bitSchleife - self.codeLen - 1) & 255);            // jnz bitSchleife
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC1);          // inc rcx
+    self.cg_e8(0xE9);
+    self.cg_e32(byteSchleife - self.codeLen - 4);                  // jmp byteSchleife
+    poke32(self.code + pCrcFertig, self.codeLen - pCrcFertig - 4);
+    self.cg_e8(0xF7); self.cg_e8(0xD0);                            // not eax
+
+    // ---- Mehrheitsentscheid ueber die drei Kopien ----
+    self.cg_e8(0x44); self.cg_e8(0x8B); self.cg_e8(0x5F); self.cg_e8(0x2C);  // mov r11d,[rdi+44] (stride)
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xC2);          // mov r10, r8
+    self.cg_e8(0x49); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x03);  // shl r10, 3
+    self.cg_e8(0x49); self.cg_e8(0x01); self.cg_e8(0xFA);          // add r10, rdi
+    self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0xC2); self.cg_e8(0x40);  // add r10, 64
+    self.cg_e8(0x41); self.cg_e8(0x8B); self.cg_e8(0x4A); self.cg_e8(0x04);  // mov ecx,[r10+4]
+    self.cg_e8(0x4D); self.cg_e8(0x01); self.cg_e8(0xDA);          // add r10, r11
+    self.cg_e8(0x41); self.cg_e8(0x8B); self.cg_e8(0x72); self.cg_e8(0x04);  // mov esi,[r10+4]
+    self.cg_e8(0x4D); self.cg_e8(0x01); self.cg_e8(0xDA);          // add r10, r11
+    self.cg_e8(0x41); self.cg_e8(0x8B); self.cg_e8(0x52); self.cg_e8(0x04);  // mov edx,[r10+4]
+    // c0 == c1 ? -> ecx gilt
+    self.cg_e8(0x39); self.cg_e8(0xF1);                            // cmp ecx, esi
+    self.cg_e8(0x74); self.cg_e8(0x0A);                            // je +10 (auf den Vergleich)
+    self.cg_e8(0x39); self.cg_e8(0xD1);                            // cmp ecx, edx
+    self.cg_e8(0x74); self.cg_e8(0x06);                            // je +6
+    self.cg_e8(0x39); self.cg_e8(0xD6);                            // cmp esi, edx
+    self.cg_e8(0x75);
+    var pKeineMehrheit: int64 := self.codeLen; self.cg_e8(0);      // jne keineMehrheit
+    self.cg_e8(0x89); self.cg_e8(0xF1);                            // mov ecx, esi
+    // cmp eax, ecx; jne beschaedigt
+    self.cg_e8(0x39); self.cg_e8(0xC8);
+    self.cg_e8(0x0F); self.cg_e8(0x85);
+    var pBeschaedigt: int64 := self.codeLen; self.cg_e32(0);
+    // naechste Seite
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC0);          // inc r8
+    self.cg_e8(0xE9);
+    self.cg_e32(seitenSchleife - self.codeLen - 4);
+    poke32(self.code + pFertig, self.codeLen - pFertig - 4);
+    self.cg_e8(0xC3);                                              // ret
+
+    poke8(self.code + pKeineMehrheit, (self.codeLen - pKeineMehrheit - 1) & 255);
+    self.cg_scrubEmitAbbruch(mMajOff, mMajLen, 136);
+    poke32(self.code + pBeschaedigt, self.codeLen - pBeschaedigt - 4);
+    self.cg_scrubEmitAbbruch(mBadOff, mBadLen, 135);
+  }
+
+  fn cg_scrubEmitAbbruch(msgOff: int64, msgLen: int64, code: int64) {
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(1);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e32(2);
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
+    var p1: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(p1, msgOff, 0, CG_PATCH_STR);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e32(msgLen);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(231);
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e32(code);
+    self.cg_e8(0x0F); self.cg_e8(0x05);
+  }
+
+  // Nach dem Code, VOR cg_patchAll: Tabelle im Datenbereich anlegen und den
+  // Zeiger darauf eintragen. Die Hashes bleiben hier 0 — sie werden erst
+  // gefuellt, wenn die Sprungziele im Code stehen (cg_scrubFillHashes).
+  fn cg_scrubBuildTable() {
+    if (self.scrubSeen == 0) { return; }
+    var codeLen: int64 := self.codeLen;
+    var pages:   int64 := (codeLen + 4095) / 4096;
+    var eintraege: int64 := pages * 8;
+    var stride: int64 := ((eintraege + 4095) / 4096) * 4096;
+    if (stride < 4096) { stride := 4096; }
+    // Auf 8 ausrichten, damit die 64-Bit-Felder im Kopf gerade liegen.
+    while ((self.dataLen & 7) != 0) { self.cg_edata(0); }
+    var off: int64 := self.dataLen;
+    var gesamt: int64 := CG_SCRUB_HDR + 3 * stride;
+    var i: int64 := 0;
+    while (i < gesamt) { self.cg_edata(0); i := i + 1; }
+    poke8(self.data + off + 0, 77); poke8(self.data + off + 1, 69);   // ME
+    poke8(self.data + off + 2, 84); poke8(self.data + off + 3, 65);   // TA
+    poke8(self.data + off + 4, 83); poke8(self.data + off + 5, 65);   // SA
+    poke8(self.data + off + 6, 70); poke8(self.data + off + 7, 50);   // F2
+    poke32(self.data + off + 8,  pages);
+    poke32(self.data + off + 12, INTEGRITY_SCRUBBED);
+    poke64(self.data + off + 16, codeLen);
+    poke64(self.data + off + 24, CG_ELF_BASE + CG_CODE_OFF);
+    poke64(self.data + off + 32, CG_ELF_BASE + CG_CODE_OFF + codeLen);
+    poke32(self.data + off + 40, self.integrityIntervalMs);
+    poke32(self.data + off + 44, stride);
+    self.scrubTableOff  := off;
+    self.scrubPageCount := pages;
+    self.scrubStride    := stride;
+    // Die Zelle bekommt die geladene Adresse der Tabelle — dieselbe Mechanik
+    // wie ein globaler Zeiger mit Startwert (#1164/#1298), samt Basis-Reloc.
+    self.cg_addPatch(self.scrubPtrCell, off, 0, CG_PATCH_DATA_PTR);
+  }
+
+  // Nach cg_patchAll: jetzt stehen alle disp32 im Code, die Bytes sind final.
+  fn cg_scrubFillHashes() {
+    if (self.scrubSeen == 0) { return; }
+    var off: int64 := self.scrubTableOff;
+    var pi: int64 := 0;
+    while (pi < self.scrubPageCount) {
+      var seitenOff: int64 := pi * 4096;
+      var len: int64 := 4096;
+      if (self.codeLen - seitenOff < 4096) { len := self.codeLen - seitenOff; }
+      var crc: int64 := cg_crc32(self.code + seitenOff, len);
+      var k: int64 := 0;
+      while (k < 3) {
+        var eintrag: int64 := self.data + off + CG_SCRUB_HDR + k * self.scrubStride + pi * 8;
+        poke32(eintrag, seitenOff);
+        poke32(eintrag + 4, crc);
+        k := k + 1;
+      }
+      pi := pi + 1;
+    }
+  }
+
   // Prolog: MXCSR sichern, Masken 7 und 9 loeschen, Namenszeiger setzen.
   fn cg_fcArm(fname: pchar, fnlen: int64) {
     self.fcMxSlot   := self.cg_addLocal("__fc_mxcsr"c, 10);
@@ -17821,12 +18268,31 @@ pub type Codegen = class {
       self.cg_fcArm(fname, fnlen);
       self.fcActive := 1;
     }
+    // #1878: @integrity(mode: software_lockstep) an einer freien Funktion.
+    var savedLs:     int64 := self.lockstepActive;
+    var savedLsName: pchar := self.lockstepName;
+    var savedLsLen:  int64 := self.lockstepNameLen;
+    self.lockstepActive := 0;
+    if (self.cg_integrityMode(ni) == INTEGRITY_LOCKSTEP) {
+      self.lockstepActive  := 1;
+      self.lockstepName    := fname;
+      self.lockstepNameLen := fnlen;
+    }
     // Der SIGFPE-Handler wird einmal in main eingehaengt — vor jedem
     // Benutzercode, damit auch ein Trap in der ersten Anweisung ankommt.
     if (self.fcSeen != 0 && fnlen == 4) {
       if StrCharAt(fname, 0) == 109 && StrCharAt(fname, 1) == 97 &&
          StrCharAt(fname, 2) == 105 && StrCharAt(fname, 3) == 110 {
         self.cg_fcInstallHandler();
+      }
+    }
+    // #1878: derselbe Ort fuer den Sweep — Handler und Zeitgeber stehen vor
+    // dem ersten Benutzerbefehl, damit auch eine lange erste Berechnung schon
+    // ueberwacht ist.
+    if (self.scrubSeen != 0 && fnlen == 4) {
+      if StrCharAt(fname, 0) == 109 && StrCharAt(fname, 1) == 97 &&
+         StrCharAt(fname, 2) == 105 && StrCharAt(fname, 3) == 110 {
+        self.cg_scrubInstall();
       }
     }
 
@@ -18025,6 +18491,9 @@ pub type Codegen = class {
     // WP-EN-04: restore energy level for enclosing scope
     self.fnEnergyLevel := savedEnergy;
     self.fcActive   := savedFcActive;   // #1140
+    self.lockstepActive  := savedLs;         // #1878
+    self.lockstepName    := savedLsName;
+    self.lockstepNameLen := savedLsLen;
     self.fcMxSlot   := savedFcMx;
     self.fcNameSlot := savedFcName;
     self.curFnRetRange := savedRetRange;   // #1097
@@ -19423,6 +19892,15 @@ pub type Codegen = class {
     var p: Parser := new Parser();
     p.Init(src, srcSize);
     var head: int64 := p.Parse();
+    // #1878: Ein `@integrity(mode: scrubbed, interval: N)` in einer
+    // IMPORTIERTEN Einheit bringt sein Intervall mit. Ohne diese Zeile bekaeme
+    // der Sweep dort still den Standardwert — die gesetzte Zahl waere
+    // wirkungslos, je nachdem, in welcher Datei sie steht.
+    if (p.integrityIntervalMs != 0) {
+      if (self.integrityIntervalMs == 0 || p.integrityIntervalMs < self.integrityIntervalMs) {
+        self.integrityIntervalMs := p.integrityIntervalMs;
+      }
+    }
 
     if (p.hadError != 0) {
       PrintStr("codegen: parse error in import: ");
@@ -19670,6 +20148,7 @@ pub type Codegen = class {
     self.cg_prebuildClassLayouts(head);   // #1663: dasselbe fuer Klassen
     self.cg_prebuildGlobals(head);        // #1665: und fuer Modulvariablen
     self.cg_collectFlightCrit(head);      // #1140: gibt es @flight_crit im Programm?
+    self.cg_collectIntegrity(head);       // #1878: gibt es @integrity im Programm?
     // #1338/#1507: Konstanten und Enums verweisen wechselseitig aufeinander —
     // `enum R { CTRL = BASE }` braucht die Konstante, `con MASK := P.Read as
     // int64` das Enum. Deshalb dreimal: erst die Konstanten aus Literalen,
@@ -20127,6 +20606,17 @@ pub type Codegen = class {
     // #1140: Restorer und SIGFPE-Handler ans Ende des Codes — nur wenn das
     // Programm ueberhaupt eine @flight_crit-Funktion hat.
     if (self.fcSeen != 0) { self.cg_fcEmitHandler(); }
+    // #1878: Abbruchpfad und Sweep-Handler — je EINMAL. cg_genFile laeuft je
+    // importierter Einheit erneut; ohne die Marke stuenden die Marken doppelt
+    // im Erzeugnis.
+    if (self.lockstepSeen != 0 && self.lockstepFailEmitted == 0) {
+      self.lockstepFailEmitted := 1;
+      self.cg_lockstepEmitFail();
+    }
+    if (self.scrubSeen != 0 && self.scrubEmitted == 0) {
+      self.scrubEmitted := 1;
+      self.cg_scrubEmitHandler();
+    }
   }
 
   // ------------------------------------------------------------------
@@ -21380,7 +21870,12 @@ pub type Codegen = class {
     self.cg_computeLandlock();     // WP-R10: Landlock-Bitmasks
     self.cg_genCompatWarnSection(); // WP-25.2: Compat-Warnung in Datensektion
     self.cg_genProxyBpfSection();  // WP-R11: Proxy-BPF + proxy_fd-Slot in Datensektion
+    // #1878: VOR dem BPF — der Filter muss wissen, ob ein Sweep kommt, sonst
+    // faellt dessen `setitimer` in den KILL-Zweig.
+    self.cg_collectIntegrity(head);
+    if (self.scrubSeen != 0) { seccomp_set_scrub(1); }
     self.cg_genBpfSection();       // WP-R9: Haupt-BPF in Datensektion
+    self.lcbsBpfDone := 1;
     self.cg_genHwDevPathSection(); // WP-H12: Gerätepfad-Strings in Datensektion
     self.cg_genFsPathSection();    // #1173: fs-Pfad-Strings in Datensektion
     self.cg_emitProxyLoop();       // WP-R11: Proxy-Kind-Loop-Code in Codesektion (vor main)
@@ -21411,7 +21906,13 @@ pub type Codegen = class {
       pi += 1;
     }
     self.cg_bindConFns();   // #1589: con-Namen an ihre Funktionsmarke haengen
+    // #1878: Die Tabelle braucht die endgueltige Codelaenge (samt Auffuellung)
+    // und muss VOR cg_patchAll stehen — der Zeiger auf sie wird dort gesetzt.
+    self.cg_scrubBuildTable();
     self.cg_patchAll();
+    // Und die Hashes erst DANACH: vorher stehen die Sprungziele noch nicht im
+    // Code, die Pruefsumme waere die einer Zwischenfassung.
+    self.cg_scrubFillHashes();
     // BUG-02: Free all temporary mmap buffers after patching is complete
     self.cg_freeAllTempBufs();
     // WP-6/6b: both static and dynamic ELFs emit two PT_LOADs (RX+RW)

@@ -294,6 +294,16 @@ pub con ANNO_LIFECYCLE:      int64 := 128; // LX-36: @lifecycle(kind)
 // #1140: @flight_crit — Bit 11 von iVal. Die Bits 0-7 sind belegt, 8-10 traegt
 // @energy, ab 16 @stack_limit und ab 40 @wcet; 11-15 sind frei.
 pub con ANNO_FLIGHTCRIT:     int64 := 2048; // @flight_crit
+// #1878: @integrity(mode: ...) — Bits 12-13 von iVal. Der MODUS steht am
+// Knoten, weil er je Funktion gilt; das INTERVALL ist programmweit (ein
+// Zeitgeber je Prozess) und liegt deshalb in `integrityIntervalMs` am Parser.
+// Bits 14-15 bleiben frei.
+pub con ANNO_INTEGRITY_SHIFT: int64 := 12;
+pub con ANNO_INTEGRITY_MASK:  int64 := 3;
+pub con INTEGRITY_SCRUBBED:   int64 := 1;   // periodischer CRC32-Sweep ueber den geladenen Code
+pub con INTEGRITY_LOCKSTEP:   int64 := 2;   // Rueckgabeausdruck doppelt rechnen und vergleichen
+pub con INTEGRITY_INTERVAL_DEFAULT: int64 := 1000;  // ms, wenn `interval:` fehlt
+pub con INTEGRITY_INTERVAL_MAX:     int64 := 3600000;
 pub con CAP_FLAG_FASTPATH:   int64 := 1;   // WP-L1: NK_CAPABILITY_DECL.iVal bit0 = @fastpath
 // Bits 8..63 reserved for future annotations.
 
@@ -353,6 +363,12 @@ pub type Parser = class {
 
   // LX-36: pending @lifecycle annotation
   _pendingLifecycleKind: int64; // -1=not set, 0=one_shot, 1=event_loop, 2=daemon, 3=reactive
+
+  // #1878: Sweep-Intervall aus `@integrity(mode: scrubbed, interval: N)`.
+  // 0 = kein `@integrity(mode: scrubbed)` gesehen. Mehrere Angaben: die
+  // KLEINSTE gewinnt — wer haeufiger prueft, hat die schaerfere Zusicherung,
+  // und ein Zeitgeber je Prozess kann nur eine Frist tragen.
+  integrityIntervalMs: int64;
 
   // Recursion depth guard — prevents stack-overflow DoS via deeply nested expressions
   parseDepth: int64;
@@ -678,7 +694,11 @@ pub type Parser = class {
     // Rahmengroesse gegen die Schranke, und eine rekursive Funktion mit dem
     // Attribut wird abgewiesen (unbeschraenkte Aufruftiefe). Damit ist es
     // kein blosser Vermerk mehr und gehoert nicht in diese Liste.
-    if self._tokTextEq(tokIdx, "integrity"c)   != 0 { return 1; }
+    // #1878: `@integrity` wird nachgewiesen — `mode: software_lockstep` laesst
+    // den Rueckgabeausdruck zweimal rechnen und vergleicht vor dem `ret`,
+    // `mode: scrubbed` haengt einen periodischen CRC32-Sweep ueber den
+    // GELADENEN Code ein. Damit ist es kein blosser Vermerk mehr und gehoert
+    // nicht in diese Liste.
     // #1140: `@flight_crit` schaltet die SSE-Ausnahmen fuer *invalid* und
     // *divide-by-zero* frei (MXCSR) und installiert den SIGFPE-Handler. Damit
     // ist es kein blosser Vermerk mehr.
@@ -877,6 +897,8 @@ pub type Parser = class {
 
     // LX-36: pending lifecycle annotation (-1 = not set, 0 = one_shot default)
     self._pendingLifecycleKind := 0 - 1;
+
+    self.integrityIntervalMs := 0;   // #1878
 
     self._tokenize();
   }
@@ -2477,13 +2499,17 @@ pub type Parser = class {
       var isEnergy:     int64 := self._tokTextEq(self.cur, "energy"c);
       var isStackLimit: int64 := self._tokTextEq(self.cur, "stack_limit"c);
       var isWcet:       int64 := self._tokTextEq(self.cur, "wcet"c);
+      var isIntegrity:  int64 := self._tokTextEq(self.cur, "integrity"c);   // #1878
       var flag:         int64 := self._annoNameToFlag(self.cur);
-      if (flag == 0 && isEnergy == 0 && isStackLimit == 0 && isWcet == 0) {
+      if (flag == 0 && isEnergy == 0 && isStackLimit == 0 && isWcet == 0 && isIntegrity == 0) {
         self._err("unbekanntes Attribut an einer geschachtelten Funktion"c);
       }
       flags := flags | flag;
       self.Advance();                       // Attributname
-      if (self.Check(TK_LPAREN) != 0) {
+      if (isIntegrity != 0 && self.Check(TK_LPAREN) != 0) {
+        self.Advance();                     // (
+        flags := flags | self._parseIntegrityArgs();
+      } else if (self.Check(TK_LPAREN) != 0) {
         self.Advance();
         if (self.Check(TK_INT) != 0) {
           var v: int64 := self.TokIVal(self.cur);
@@ -3565,12 +3591,18 @@ pub type Parser = class {
             // _annoNameToFlag landet in annoFlags, das der Methodenknoten gar
             // nicht bekommt.
             var cMthFc: int64 := 0;
+            // #1878: und dasselbe fuer @integrity. Ohne diesen Zweig traege
+            // eine Methode das Attribut, ohne dass der Codegen es je saehe —
+            // dritte Stelle derselben Aufzaehlung (frei, `pub`, Methode).
+            var cMthIntegrity: int64 := 0;
             while self.Check(TK_AT) != 0 {
               self.Advance();
               var mFlag: int64 := 0;
               var mIsWcet: int64 := 0;
+              var mIsIntegrity: int64 := 0;
               if self.Check(TK_IDENT) != 0 {
                 mIsWcet := self._tokTextEq(self.cur, "wcet"c);
+                mIsIntegrity := self._tokTextEq(self.cur, "integrity"c);
                 mFlag := self._annoNameToFlag(self.cur);
                 if (mFlag == ANNO_FLIGHTCRIT) { cMthFc := ANNO_FLIGHTCRIT; }
                 self.Advance();
@@ -3585,6 +3617,9 @@ pub type Parser = class {
                     self.Advance();
                   } else { self._err("@wcet: erwartet eine ganze Zahl (Iterationen)"); }
                   self.Expect(TK_RPAREN);
+                } else if mIsIntegrity != 0 {
+                  self.Advance();  // consume (
+                  cMthIntegrity := self._parseIntegrityArgs();
                 } else if mFlag == ANNO_CAPABILITIES {
                   cMthCapAttr := self._parseCapabilityAttr();
                 } else if mFlag == ANNO_USES_CAP {
@@ -3615,7 +3650,7 @@ pub type Parser = class {
                 self.Match(TK_SEMI);
               }
               // bit0=isPub, bit1=isVirtual, bit2=isOverride, bit3=isAbstract, bits4-5=visibility
-              self._siv(cm, cPub | (cVirtual << 1) | (cOverride << 2) | (cAbstract << 3) | (cVis << 4) | (cStatic << 6) | (cMthWcet << ANNO_WCET_SHIFT) | cMthFc);
+              self._siv(cm, cPub | (cVirtual << 1) | (cOverride << 2) | (cAbstract << 3) | (cVis << 4) | (cStatic << 6) | (cMthWcet << ANNO_WCET_SHIFT) | cMthFc | cMthIntegrity);
               // WP-L8: chain method cap/ucc annotation nodes BEFORE method in c1 list
               var mHead: int64 := cm;
               if cMthUccAttr >= 0 {
@@ -4592,6 +4627,89 @@ pub type Parser = class {
     if self.Check(TK_RPAREN) != 0 { self.Advance(); }
   }
 
+  // #1878: `@integrity(mode: scrubbed|software_lockstep [, interval: N])`.
+  // Der Aufrufer hat die oeffnende Klammer bereits verbraucht; zurueck kommen
+  // die MODUS-Bits fuer die iVal des Funktionsknotens (0 = Fehler gemeldet).
+  //
+  // Es gibt bewusst KEINEN stillen Standardmodus: `@integrity()` ohne `mode`
+  // waere sonst ein Attribut, das nach Zusicherung aussieht und nichts tut —
+  // genau der Zustand, den dieses Attribut bis 1.1.14G hatte.
+  fn _parseIntegrityArgs(): int64 {
+    var mode:     int64 := 0;
+    var interval: int64 := 0;
+    var sawMode:  int64 := 0;
+    while (self.Check(TK_RPAREN) == 0 && self.Peek() != TK_EOF) {
+      if (self.Check(TK_IDENT) == 0) { self.Advance(); }
+      else {
+        var isMode:     int64 := self._tokTextEq(self.cur, "mode"c);
+        var isInterval: int64 := self._tokTextEq(self.cur, "interval"c);
+        if (isMode == 0 && isInterval == 0) {
+          self._err("@integrity: unbekannter Schluessel — erwartet `mode` oder `interval`"c);
+          return 0;
+        }
+        self.Advance();
+        if (self.Match(TK_COLON) == 0) {
+          self._err("@integrity: nach dem Schluessel fehlt der Doppelpunkt"c);
+          return 0;
+        }
+        if (isMode != 0) {
+          sawMode := 1;
+          if (self.Check(TK_IDENT) == 0) {
+            self._err("@integrity: `mode` erwartet `scrubbed` oder `software_lockstep`"c);
+            return 0;
+          }
+          if (self._tokTextEq(self.cur, "scrubbed"c) != 0) { mode := INTEGRITY_SCRUBBED; }
+          else if (self._tokTextEq(self.cur, "software_lockstep"c) != 0) { mode := INTEGRITY_LOCKSTEP; }
+          else if (self._tokTextEq(self.cur, "hardware_ecc"c) != 0) {
+            // Die Grammatik nennt diesen Modus, umgesetzt ist er nicht: er
+            // braucht ECC-Speicher und einen Weg, dessen Fehlerzaehler zu
+            // lesen — beides gibt es auf keinem der Ziele. Ihn anzunehmen und
+            // nichts zu tun waere genau der Zustand, aus dem #1878 kommt.
+            self._err("@integrity: `mode: hardware_ecc` ist nicht umgesetzt — es gibt keinen Traeger dafuer"c);
+            self._err("  Verfuegbar sind `scrubbed` (periodischer CRC32-Sweep) und `software_lockstep`."c);
+            return 0;
+          }
+          else {
+            self._err("@integrity: `mode` muss `scrubbed` oder `software_lockstep` sein"c);
+            return 0;
+          }
+          self.Advance();
+        } else {
+          if (self.Check(TK_INT) == 0) {
+            self._err("@integrity: `interval` erwartet eine ganze Zahl (Millisekunden)"c);
+            return 0;
+          }
+          interval := self.TokIVal(self.cur);
+          if (interval < 1 || interval > INTEGRITY_INTERVAL_MAX) {
+            self._err("@integrity: `interval` muss zwischen 1 und 3600000 ms liegen"c);
+            return 0;
+          }
+          self.Advance();
+        }
+      }
+      if (self.Check(TK_COMMA) != 0) { self.Advance(); }
+    }
+    if (self.Check(TK_RPAREN) != 0) { self.Advance(); }
+    if (sawMode == 0) {
+      self._err("@integrity: `mode` fehlt — erwartet `mode: scrubbed` oder `mode: software_lockstep`"c);
+      return 0;
+    }
+    // Ein Intervall an `software_lockstep` ist ein Widerspruch: der Vergleich
+    // sitzt vor dem `ret`, es gibt dort keine Frist. Ihn stillschweigend zu
+    // verwerfen hiesse, eine gesetzte Zahl wirkungslos zu lassen.
+    if (mode == INTEGRITY_LOCKSTEP && interval != 0) {
+      self._err("@integrity: `interval` gilt nur fuer `mode: scrubbed` — `software_lockstep` prueft vor jedem `return`"c);
+      return 0;
+    }
+    if (mode == INTEGRITY_SCRUBBED) {
+      if (interval == 0) { interval := INTEGRITY_INTERVAL_DEFAULT; }
+      if (self.integrityIntervalMs == 0 || interval < self.integrityIntervalMs) {
+        self.integrityIntervalMs := interval;
+      }
+    }
+    return mode << ANNO_INTEGRITY_SHIFT;
+  }
+
   // ==================================================================
   // Top-level parse -- returns head of declaration list (via NNext)
   // ==================================================================
@@ -4689,10 +4807,12 @@ pub type Parser = class {
         var isEnergy: int64 := 0;
         var isStackLimit: int64 := 0;   // #1138
         var isWcet: int64 := 0;         // #1139
+        var isIntegrity: int64 := 0;    // #1878
         if (self.Check(TK_IDENT) != 0) {
           isEnergy := self._tokTextEq(self.cur, "energy"c);
           isStackLimit := self._tokTextEq(self.cur, "stack_limit"c);   // #1138
           isWcet := self._tokTextEq(self.cur, "wcet"c);                // #1139
+          isIntegrity := self._tokTextEq(self.cur, "integrity"c);      // #1878
           if (self._tokTextEq(self.cur, "volatile"c)  != 0) { isVolatile := 1; }   // WP-AS-17
           if (self._tokTextEq(self.cur, "redundant"c) != 0) { isRedundant := 1; }  // WP-3.1
           flag := self._annoNameToFlag(self.cur);
@@ -4740,6 +4860,10 @@ pub type Parser = class {
               self.Advance();
             } else { self._err("@wcet: erwartet eine ganze Zahl (Iterationen)"); }
             self.Expect(TK_RPAREN);
+          } else if (isIntegrity != 0) {
+            // #1878: @integrity(mode: ..., interval: N)
+            self.Advance();  // consume (
+            annoFlags := annoFlags | self._parseIntegrityArgs();
           } else if (flag == ANNO_CAPABILITIES) {  // WP-L1: @capabilities([...])
             self._pendingCapAttr := self._parseCapabilityAttr();
           } else if (flag == ANNO_USES_CAP) {       // WP-L1: @uses_caller_cap([...])
@@ -4773,8 +4897,10 @@ pub type Parser = class {
         self.Advance();
         var flag2: int64 := 0;
         var isEnergy2: int64 := 0;
+        var isIntegrity2: int64 := 0;   // #1878
         if (self.Check(TK_IDENT) != 0) {
           isEnergy2 := self._tokTextEq(self.cur, "energy"c);
+          isIntegrity2 := self._tokTextEq(self.cur, "integrity"c);
           if (self._tokTextEq(self.cur, "volatile"c)  != 0) { isVolatile := 1; }   // WP-AS-17
           if (self._tokTextEq(self.cur, "redundant"c) != 0) { isRedundant := 1; }  // WP-3.1
           flag2 := self._annoNameToFlag(self.cur);
@@ -4794,6 +4920,11 @@ pub type Parser = class {
               self.Advance();
             } else { self._err("@energy: expected integer level"); }
             self.Expect(TK_RPAREN);
+          } else if (isIntegrity2 != 0) {
+            // #1878: dieselbe Auswertung wie vor `pub` — beide Schreibweisen
+            // sind zulaessig, also muss der Modus an BEIDEN Stellen entstehen.
+            self.Advance();  // consume (
+            annoFlags := annoFlags | self._parseIntegrityArgs();
           } else if (flag2 == ANNO_CAPABILITIES) {  // WP-L1
             self._pendingCapAttr := self._parseCapabilityAttr();
           } else if (flag2 == ANNO_USES_CAP) {       // WP-L1

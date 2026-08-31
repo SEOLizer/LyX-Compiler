@@ -234,15 +234,27 @@ case "$wmsg" in
   *) echo "PASS Vermerk 'nicht nachgewiesen' ist weg"; PASS=$((PASS+1)) ;;
 esac
 
-# Die uebrigen unbewiesenen Attribute melden weiterhin.
+# @integrity meldet seit 1.1.15A (#1878) NICHT mehr — es wird nachgewiesen.
+# `@dal` bleibt als Vertreter der unbewiesenen Attribute stehen, sonst pruefte
+# der Block nur noch eine leere Menge.
 printf '%s\n' "$K
-@integrity(crc32)
+@dal(A)
 fn F(): int64 { return 1; }
 fn main(): int64 { return F(); }" > "$TMP/v.lyx"
 vmsg="$("$LYXC" --std-path="$ROOT" "$TMP/v.lyx" -o "$TMP/v" 2>&1)"
 case "$vmsg" in
-  *"NICHT nachgewiesen"*) echo "PASS @integrity meldet weiterhin"; PASS=$((PASS+1)) ;;
-  *) echo "FAIL @integrity meldet weiterhin: Meldung fehlt"; FAIL=$((FAIL+1)) ;;
+  *"NICHT nachgewiesen"*) echo "PASS @dal meldet weiterhin"; PASS=$((PASS+1)) ;;
+  *) echo "FAIL @dal meldet weiterhin: Meldung fehlt"; FAIL=$((FAIL+1)) ;;
+esac
+
+printf '%s\n' "$K
+@integrity(mode: software_lockstep)
+fn F(): int64 { return 1; }
+fn main(): int64 { return F(); }" > "$TMP/w.lyx"
+wmsg="$("$LYXC" --std-path="$ROOT" "$TMP/w.lyx" -o "$TMP/w" 2>&1)"
+case "$wmsg" in
+  *"NICHT nachgewiesen"*) echo "FAIL @integrity meldet nicht mehr: Meldung steht noch da"; FAIL=$((FAIL+1)) ;;
+  *) echo "PASS @integrity meldet nicht mehr (#1878)"; PASS=$((PASS+1)) ;;
 esac
 
 # --- Geschachtelte Funktionen (#1261) ------------------------------------
