@@ -2,6 +2,52 @@
 
 ## Unveröffentlicht (develop)
 
+### BEHOBEN — elf neue Capabilities; die LCBS-Lücke schrumpft von 83 auf 1 (#1865, #1870, #1871, #1872, #1875)
+
+Der Rest der Runde aus #1865. Alle Meldungen hatten dieselbe Form wie die
+erste Hälfte: das Recht war nicht zu weit gefasst, es gab schlicht **keinen
+Namen** dafür — ein Programm mit `@capabilities([…])` starb beim ersten Aufruf,
+und keine Schreibweise hätte es freigeben können.
+
+| | vorher | jetzt |
+|---|---|---|
+| emittierbare Syscall-Nummern | 149 | 149 |
+| mit Filtereintrag | 103 | **185** |
+| **ungedeckt** | **83** | **1** |
+
+Die eine verbliebene ist `gettimeofday` — und das ist Absicht: `clock_gettime`
+ist *die* Zeitquelle unter `system.time` (#1179), ein zweiter immer erlaubter
+Zeitzugriff entwertete die Capability.
+
+**#1870** — drei Namen statt einem, weil die Vertrauensfragen verschieden
+sind: `process.privileges` (eigene Kennung wechseln), `system.namespace`
+(`unshare`/`chroot`/`mount`), `system.admin` (`reboot`/`sethostname` —
+verändert die Maschine, nicht den eigenen Prozess). Rechte **abzugeben** ist
+das gewünschte Muster und ließ sich vorher nicht deklarieren.
+
+**#1871** — `ipc.shm`, `ipc.queue` (System V und POSIX), `ipc.sem`. Getrennt
+von `memory.mmap`: geteilter Speicher **zwischen Prozessen** ist eine andere
+Zusage als eine anonyme Abbildung im eigenen Adressraum.
+
+**#1872** — `fs.xattr`, `fs.watch`, `fs.cwd`, `debug.trace`, `kernel.bpf`,
+dazu Erweiterungen an vorhandenen Rechten (`readv`/`sendfile` an `fs.read`,
+`writev`/`fallocate`/`sync` an `fs.write`, `mremap`/`madvise`/`msync`/
+`mincore` an `memory.mmap`, `statfs` an `fs.meta`). `ptrace` und `bpf` hängen
+ausdrücklich an eigenen Namen — an eine bestehende Capability gehängt wären
+sie unsichtbar.
+
+**#1875** — `hardware.block` gab auf Linux **gar nichts** frei: Rohzugriff auf
+ein Blockgerät heißt `ioctl`, und das hing nur an den vier
+`hardware.*`-Rechten, zu denen `block` nicht zählte. Die Capability war
+deklarierbar und wirkungslos. Jetzt mit Argumentfilter auf drei Kommandos.
+
+**#1865** — `tests/lcbs_abdeckung_test.sh` misst die Differenz dauerhaft und
+prüft **drei** Richtungen: nichts Emittierbares fällt durch, jede Ausnahme ist
+wirklich noch ungedeckt (sonst ist sie Altlast), und beide Erhebungen liefern
+plausible Mengen. Die dritte Prüfung gibt es, weil ein ins Leere greifender
+Regex die beiden anderen grün macht — genau der Fehler des ursprünglichen
+Erhebungsbefehls, aus dem die falsche Behauptung in #1869 entstand.
+
 ### BEHOBEN — Typidentität, Enum-Cast, Bereichstyp am Parameter, `wraps` (#1880, #1882, #1883, #1884, #1886, #1895)
 
 `sema.lyx` gab Structs, Enums und Klassen einheitlich die Kennung `TY_USER` und
