@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.15A
+VERSION   := 1.1.15B
 VERSION_DATE := 2026-08-31
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -364,6 +364,8 @@ test: lyxc
 	@bash tests/attribute_test.sh
 	@echo "--- @integrity: Lockstep + Scrub-Sweep (#1878/#1877/#1879) ---"
 	@bash tests/integrity_test.sh
+	@echo "--- grant-Warnung meldet nur, wo sie etwas sagt (#1899) ---"
+	@bash tests/grant_warnung_test.sh
 	@bash tests/while_limit_test.sh
 	@bash tests/grammar_gaps_test.sh
 	@echo "OK"

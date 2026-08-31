@@ -95,7 +95,19 @@ esac
 # --- `--lint` unterdrueckt keine anderen Warnungen -----------------------
 # Der Issue-Text vermutete das; tatsaechlich stand die Grant-Warnung immer auf
 # stdout und die Lint-Meldungen auf stderr.
-case "$out" in
+#
+# #1899: Die Vorlage oben taugt dafuer nicht mehr — sie hat kein
+# `@capabilities`, und dort meldet der Compiler das fehlende grant seit 1.1.15B
+# nicht mehr (es waere folgenlos). Geprueft wird deshalb an einem Programm, in
+# dem ein `grant` tatsaechlich etwas aendern wuerde.
+cat > "$TMP/g.lyx" <<'EOF'
+@capabilities([system.exit, fs.read, fs.create, fs.delete, fs.meta, fs.perm, fs.write, system.time])
+import std.fs;
+fn beta(): int64 { var u: int64 := 1; return 0; }
+fn main(): int64 { return beta(); }
+EOF
+gout="$(cd "$TMP" && "$LYXC" --std-path="$ROOT" --lint g.lyx -o "$TMP/g" 2>/dev/null)"
+case "$gout" in
   *"Import ohne explizites grant"*) ok "Grant-Warnung bleibt bei --lint" ;;
   *) no "Grant-Warnung bleibt bei --lint" "fehlt" ;;
 esac
