@@ -1389,101 +1389,121 @@ lyxc examples/esp32_hello.lyx -o esp32_hello.elf --target=esp32
 
 ---
 
-## @integrity – Integritäts-Management (v0.8.8A ✅ ABGESCHLOSSEN – aerospace-todo P0 #43/#44)
+## @integrity – Integritäts-Management
 
-Einheit- und Funktions-Level-Annotationen für strahlungstolerante und sicherheitskritische Code-Segmente.
-Implementiert **aerospace.pdf v2 Sections 2.5.1–2.5.2**.
+Annotation für strahlungstolerante und sicherheitskritische Funktionen.
+
+> **Stand 1.1.15B (nachgemessen 2026-09-01).** Dieser Abschnitt beschrieb bis dahin
+> den PASCAL-SEED (`lyxc.lpr`, `sema.pas`, `elf64_writer.pas`) — nicht den
+> produktiven, selbstgehosteten Compiler. Im Seed gab es Unit-Level-Annotationen,
+> `hardware_ecc` und ein 8232-Byte-`.meta_safe`; im ausgelieferten Compiler gab es
+> davon bis 1.1.14G **nichts** (#1878: das Erzeugnis war byte-gleich mit dem ohne
+> Attribut). Seit 1.1.15A wird `@integrity` nachgewiesen — aber anders, als der
+> Seed es beschrieb. Unten steht, was der ausgelieferte Compiler tut.
 
 ### Syntax
 
 ```lyx
-// Unit-Level: gilt für die gesamte Einheit
-@integrity(mode: software_lockstep, interval: 50)
-unit flight.ctrl;
+// Nur FUNKTIONS-Level. Freie Funktion, Methode und geschachtelte Funktion.
+@integrity(mode: software_lockstep)
+fn ComputeHeading(imu: int64): f64 { return 0.0; }
 
 @integrity(mode: scrubbed, interval: 100)
-unit nav.core;
-
-@integrity(mode: hardware_ecc, interval: 250)
-unit sensor.fusion;
-
-// Funktions-Level: gilt nur für diese Funktion
-@integrity(mode: scrubbed, interval: 100)
-fn critical_update(): int64 { return 0; }
+fn CriticalUpdate(): int64 { return 0; }
 ```
 
 ### Parameter
 
 | Parameter | Werte | Bedeutung |
 |-----------|-------|-----------|
-| `mode` | `software_lockstep` | Redundante Ausführung mit Ergebnisvergleich |
-| `mode` | `scrubbed` | Periodischer Hintergrund-CRC-Memory-Sweep |
-| `mode` | `hardware_ecc` | Vertraut auf Hardware-ECC-Speicherkorrektur |
-| `interval` | ms > 0 | Integritätsprüf-/Scrub-Intervall in Millisekunden |
+| `mode` | `software_lockstep` | Der Rückgabeausdruck wird zweimal gerechnet und vor dem `ret` verglichen; bei Abweichung Abbruch mit **133** |
+| `mode` | `scrubbed` | SIGALRM-Zeitgeber prüft periodisch die **geladenen** Codeseiten gegen dreifach abgelegte CRC32-Referenzhashes; Abbruch **135** (Codeseite) bzw. **136** (keine Mehrheit unter den drei Kopien) |
+| `interval` | 1…3600000 ms | Sweep-Intervall, nur bei `scrubbed`. Fehlt es, gilt **1000 ms** |
 
 ### Semantische Regeln
 
-- `@integrity` auf `extern fn` → Fehler (nicht erlaubt)
-- `mode: scrubbed` ohne `interval` → Warnung (Intervall empfohlen)
-- `mode: software_lockstep` ohne `interval` → Warnung
-- Unit-Level `@integrity` steht vor der `unit`-Deklaration (erste Zeile der Datei)
-- Funktion-Level `@integrity` steht zusammen mit anderen `@`-Attributen vor `fn`
+- `mode` ist **Pflicht**. `@integrity()` ohne Modus wird abgewiesen — ein Attribut,
+  das nach Zusicherung aussieht und nichts tut, ist der Zustand aus #1878.
+- `interval` an `software_lockstep` wird **abgewiesen**: der Vergleich sitzt vor
+  dem `ret`, dort gibt es keine Frist. Eine gesetzte Zahl wirkungslos liegen zu
+  lassen wäre derselbe Fehler in klein.
+- `mode: hardware_ecc` wird **abgewiesen** — die Grammatik nennt den Modus, umgesetzt
+  ist er nicht: er bräuchte ECC-Speicher und einen Weg an dessen Fehlerzähler.
+- Unter `software_lockstep` wird ein Rückgabeausdruck **mit Wirkung** (Aufruf, `new`,
+  Zuweisung) abgewiesen — er ließe sich nicht zweimal rechnen, ohne zweimal zu
+  wirken. Ebenso Struct- und Tupel-Rückgaben: dort gibt es kein einzelnes Register
+  zu vergleichen.
+- Mehrere `scrubbed`-Angaben in einem Programm: das **kleinste** Intervall gewinnt.
+  Ein Zeitgeber je Prozess kann nur eine Frist tragen.
+- `scrubbed` gibt `setitimer` im seccomp-Filter frei — nur dann, nicht im Basissatz.
+  Steht das Attribut in einer IMPORTIERTEN Einheit und führt das Programm
+  `@capabilities`, wird das gemeldet: der Filter steht zu diesem Zeitpunkt schon.
 
-### .meta_safe ELF-Sektion (aerospace.pdf Section 2.5.2)
+**Nicht umgesetzt:** `@integrity` VOR einer `unit`-Deklaration. Der Parser nimmt es
+an, der Codegen sieht es nie — es entsteht weder Sweep noch Meldung. Bis das
+entschieden ist, gehört die Annotation an die Funktion.
 
-Wenn `@integrity` auf einer `unit`-Deklaration steht, erzeugt der Compiler eine
-benutzerdefinierte `.meta_safe` ELF-Sektion. Diese enthält Integritätsmetadaten
-und einen dreifachen CRC32-Hash-Store für Strahlungstoleranz.
+### Träger der Referenzhashes
 
-**Sektion-Layout (8232 Bytes = 0x2028):**
+Zwei getrennte Wege, weil sie verschiedene Fragen beantworten:
+
+| Träger | Entsteht durch | Prüft |
+|--------|----------------|-------|
+| Tabelle im **Datenbereich** | `@integrity(mode: scrubbed)` | den **geladenen** Code zur Laufzeit, ohne Dateizugriff |
+| `.meta_safe`-Sektion | `--meta-safe` | die **Datei** (Post-Patching-Erkennung), gelesen von `std.meta_safe` |
+
+Beide benutzen dasselbe Format v2 (#1877), damit es nur eine Beschreibung gibt.
+
+**Kopf (64 Byte), danach DREI Kopien der Hashtabelle im Abstand `stride`:**
 
 | Offset | Feld | Typ | Beschreibung |
 |--------|------|-----|-------------|
-| 0..7 | `code_start_va` | uint64 LE | Start-VA des Code-Segments |
-| 8..15 | `code_end_va` | uint64 LE | End-VA des Code-Segments |
-| 16..19 | `mode` | uint32 LE | 1=lockstep, 2=scrubbed, 3=hardware_ecc |
-| 20..23 | `interval_ms` | uint32 LE | Intervall in Millisekunden |
-| 24..31 | `recovery_ptr` | uint64 LE | Recovery-Funktionszeiger (0 = nicht gesetzt) |
-| 32..35 | `hash_copy_1` | uint32 LE | CRC32 IEEE 802.3 des Code-Segments |
-| 36..4127 | — | 4092 Bytes | Padding (4096-Byte-Separation) |
-| 4128..4131 | `hash_copy_2` | uint32 LE | Identische CRC32-Kopie 2 |
-| 4132..8223 | — | 4092 Bytes | Padding (4096-Byte-Separation) |
-| 8224..8227 | `hash_copy_3` | uint32 LE | Identische CRC32-Kopie 3 |
-| 8228..8231 | — | 4 Bytes | Abschluss-Padding |
+| 0..7 | Kennung | 8 Byte | `METASAF2` |
+| 8..11 | `pageCount` | uint32 LE | Anzahl der 4096-Byte-Codeseiten |
+| 12..15 | `mode` | uint32 LE | 0 = nur Dateiprüfung, 1 = scrubbed |
+| 16..23 | `codeLen` | uint64 LE | Länge des Codes in Bytes |
+| 24..31 | `code_start_va` | uint64 LE | Start-VA des Code-Segments |
+| 32..39 | `code_end_va` | uint64 LE | End-VA des Code-Segments |
+| 40..43 | `interval_ms` | uint32 LE | 0 = kein Sweep |
+| 44..47 | `stride` | uint32 LE | Abstand der Kopien, Vielfaches von 4096 |
+| 48..55 | `recovery_ptr` | uint64 LE | belegt, wird NICHT angesprungen (siehe unten) |
+| 56..63 | `sweepCount` | uint64 LE | zur Laufzeit hochgezählt (nur Datenbereich-Tabelle) |
+| 64.. | Kopie 0 | `pageCount × {pageOffset:u32, crc32:u32}` | |
+| 64+stride.. | Kopie 1 | dieselbe Tabelle | |
+| 64+2·stride.. | Kopie 2 | dieselbe Tabelle | |
 
-**Strahlungstoleranz:** Drei identische CRC32-Kopien mit je 4096-Byte-Abstand.
-Ein Single-Event-Upset (SEU) verfälscht höchstens eine Kopie — erkennbar durch Mehrheitsabstimmung.
+Die Kennung ist `METASAF2` und nicht `META` + Versionsfeld: ein v1-Erzeugnis mit
+genau zwei Codeseiten hätte dieselben acht Bytes wie `META` + Version 2.
 
-**CRC32-Algorithmus:** IEEE 802.3, Polynom `0xEDB88320` (reflected).
+**Strahlungstoleranz:** drei Kopien mit seitenweisem Abstand. Ein Single-Event-Upset
+verfälscht höchstens eine — die Mehrheit entscheidet. Stimmen alle drei nicht
+überein, ist das ein **eigener** Fall (Abbruch 136, in `std.meta_safe` der Wert −3)
+und kein stiller Rückfall auf die erste Kopie.
 
-**ELF Section Headers:** `NULL` + `.text` + `.shstrtab` + `.meta_safe`
-- `.meta_safe` hat `sh_flags = 0` (kein `SHF_ALLOC` — reine Metadaten, nicht im Adressraum geladen)
+**CRC32:** IEEE 802.3, Polynom `0xEDB88320` (reflected). Dieselbe Rechnung an vier
+Stellen: `cg_crc32` (Tabellenbau), `ms_crc32` (`.meta_safe`), `_ms_crc32`
+(`std/meta_safe.lyx`) und der Handler im Erzeugnis. Die vier müssen übereinstimmen.
 
-**Unterstützte Backends:** x86_64 (`elf64_writer.pas`), ARM64 (`elf64_arm64_writer.pas`), RISC-V (`elf64_riscv_writer.pas`)
+**`recovery_ptr`** steht im Format und wird nicht angesprungen: ein
+Wiederherstellungspfad bräuchte eine zweite Codekopie, die es nicht gibt. Der Sweep
+**erkennt**, er korrigiert nicht.
 
-### IR-Repräsentation
+**`.meta_safe`** hat `sh_flags = SHF_ALLOC`, liegt aber nicht in einem PT_LOAD —
+gelesen wird sie über `/proc/self/exe`, nicht über eine Adresse.
 
-```pascal
-// backend_types.pas
-TIntegrityMode = (imNone, imSoftwareLockstep, imScrubbed, imHardwareEcc);
-TIntegrityAttr = record
-  Mode:     TIntegrityMode;
-  Interval: Int64;          // ms; 0 = nicht gesetzt
-end;
+### Umsetzung im selbstgehosteten Compiler
 
-// TIRModule
-UnitIntegrity: TIntegrityAttr;  // gesetzt wenn @integrity vor unit steht
+- **Parser** (`src/parser.lyx`): `_parseIntegrityArgs`; der Modus steht in den Bits
+  12–13 der `iVal` des Funktionsknotens, das Intervall programmweit in
+  `Parser.integrityIntervalMs`. Vier Aufrufstellen — freie Funktion vor und nach
+  `pub`, Methode, geschachtelte Funktion.
+- **Codegen** (`src/codegen_x86.lyx`): `cg_lockstepPruefe` /
+  `cg_lockstepEmitFail` für den Vergleich, `cg_scrubInstall` /
+  `cg_scrubEmitHandler` für Zeitgeber und Sweep, `cg_scrubBuildTable` /
+  `cg_scrubFillHashes` für die Tabelle. Die Hashes werden **nach** `cg_patchAll`
+  gefüllt — vorher stehen die Sprungziele noch nicht im Code.
+- **Tests**: `tests/integrity_test.sh` (37 Prüfungen), `tests/meta_safe_test.lyx`.
 
-// TIRFunction.SafetyPragmas
-Integrity: TIntegrityAttr;      // gesetzt wenn @integrity vor fn steht
-```
-
-### Implementierungsdetails
-
-- **Lexer/Parser**: `@integrity(mode: ..., interval: N)` – Pending-Feld-Ansatz:
-  `ParseProgram` liest `@integrity` vorab in `FPendingIntegrity`; `ParseUnitDecl`
-  übernimmt es für die Unit, `ParseFuncAttrs` für Funktionen.
-- **Sema**: `sema.pas` prüft extern-fn-Fehler und scrubbed-ohne-interval-Warnung.
-- **IR-Lowering**: `lower_ast_to_ir.pas` kopiert `IntegrityAttr` → `TIRModule.UnitIntegrity`.
-- **Backend**: `lyxc.lpr` wählt `WriteElf64WithMetaSafe` wenn `UnitIntegrity.Mode <> imNone`.
-- **Tests**: `test_integrity_blocks.pas` (28/28), `test_meta_safe.pas` (39/39)
+**Nur x86-64.** Die IR-Backends (lyxos, arm64, riscv, arm-cm4, xtensa) tragen weder
+Lockstep noch Sweep; dort ist `@integrity` weiterhin wirkungslos — und das ist die
+nächste Lücke derselben Art.
