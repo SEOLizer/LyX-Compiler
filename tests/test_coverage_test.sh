@@ -63,6 +63,13 @@ is_exempt() {
                                           # Pruefdaten, kein Test.
     data/runde17/ctrl.lyx)   return 0 ;;  # #1670: importierte Klassen als
                                           # Pruefdaten, kein Test.
+    fat_test.lyx)            return 0 ;;  # std.fs.fat: braucht ein Abbild-
+                                          # verzeichnis als Argument und wird
+                                          # deshalb von tests/fat_test.sh
+                                          # aufgerufen, das die Abbilder erst
+                                          # mit mkfs.vfat erzeugt. Allein
+                                          # gestartet haette es nichts zu lesen.
+                                          # Der Runner haengt am `test`-Ziel.
     lib/lyxc_guard.sh)       return 0 ;;  # #1294: Bibliothek, kein Test — wird
                                           # von den Scripts eingebunden und vom
                                           # Waechter lyxc_guard_coverage_test.sh
