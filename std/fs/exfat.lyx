@@ -1,0 +1,544 @@
+// std/fs/exfat.lyx — exFAT LESEN
+//
+// Zweite Unit der Dateisystem-Sammlung. exFAT teilt mit FAT32 den Namen und
+// die Grundidee (Cluster, eine Zuordnungstabelle), aber kaum ein Strukturfeld
+// — deshalb eine EIGENE Unit und kein Zweig in std.fs.fat:
+//
+//   * Der Bootsektor hat ein voellig anderes Feld-Layout; Sektor- und
+//     Clustergroesse stehen als ZWEIERPOTENZ-EXPONENT da, nicht als Zahl.
+//   * Es gibt keine feste Wurzel und keine 8.3-Namen. Namen sind UTF-16 und
+//     stehen in eigenen Eintraegen zu je 15 Zeichen.
+//   * Ein Verzeichniseintrag ist ein SATZ aus mehreren 32-Byte-Eintraegen mit
+//     einer Pruefsumme darueber.
+//   * Zusammenhaengende Dateien tragen `NoFatChain` und stehen GAR NICHT in
+//     der FAT. Wer die Kette blind verfolgt, liest dort Nullen.
+//   * Belegt wird ueber eine BITMAP, nicht ueber die FAT.
+//
+// ZUGANG wie bei std.fs.fat: Deskriptor und sektorweise Lesezugriffe, mit
+// einem Byte-Versatz fuer den Anfang des Volumes.
+//
+// NUR LESEN, aus denselben Gruenden wie dort — und hier noch etwas mehr:
+// exFAT verlangt beim Schreiben zusaetzlich die Pflege der Belegungsbitmap
+// und Pruefsummen ueber jeden Eintragssatz.
+//
+// NICHT enthalten: TexFAT (die Transaktionsschicht), Zeitzonenfelder,
+// Zugriffsrechte. Namen werden nach ASCII gelesen; alles darueber wird zu '?'
+// — dieselbe Angabe wie in std.fs.fat, und aus demselben Grund.
+
+@description("exFAT lesen: Bootsektor, Bitmap, Upcase-Tabelle, Verzeichnisse, Dateien")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([fs.read, fs.meta, system.memory.heap])
+
+unit std.fs.exfat;
+
+import std.alloc;
+import std.io;
+
+pub con EXFAT_ERR:  int64 := 0 - 1;
+pub con EXFAT_EOC:  int64 := 0 - 2;
+pub con EXFAT_FREI: int64 := 0;
+
+// Eintragsarten im Verzeichnis. Das oberste Bit sagt "in Gebrauch": ein
+// geloeschter Eintrag traegt dieselbe Art mit geloeschtem Bit 7 — 0x05 statt
+// 0x85. Wer nur auf Gleichheit prueft, uebersieht geloeschte Eintraege nicht,
+// sondern LIEST sie mit.
+pub con EXFAT_ET_BITMAP: int64 := 0x81;
+pub con EXFAT_ET_UPCASE: int64 := 0x82;
+pub con EXFAT_ET_LABEL:  int64 := 0x83;
+pub con EXFAT_ET_FILE:   int64 := 0x85;
+pub con EXFAT_ET_STREAM: int64 := 0xC0;
+pub con EXFAT_ET_NAME:   int64 := 0xC1;
+
+pub con EXFAT_ATTR_READ_ONLY: int64 := 1;
+pub con EXFAT_ATTR_HIDDEN:    int64 := 2;
+pub con EXFAT_ATTR_SYSTEM:    int64 := 4;
+pub con EXFAT_ATTR_DIRECTORY: int64 := 16;
+pub con EXFAT_ATTR_ARCHIVE:   int64 := 32;
+
+pub type ExfatVolume = struct {
+  fd:            int64;
+  partOffset:    int64;   // Byte-Versatz des Volumes im Deskriptor
+  bytesPerSector: int64;
+  sectorsPerClus: int64;
+  fatOffset:     int64;   // Sektoren
+  fatLength:     int64;   // Sektoren
+  heapOffset:    int64;   // Sektoren
+  clusterCount:  int64;
+  rootCluster:   int64;
+  numFats:       int64;
+  gueltig:       bool;
+}
+
+pub type ExfatEntry = struct {
+  attr:       int64;
+  cluster:    int64;
+  size:       int64;
+  isDir:      bool;
+  noFatChain: bool;   // Strom liegt zusammenhaengend, die FAT ist unbeteiligt
+}
+
+pub type ExfatDir = struct {
+  cluster:    int64;
+  sectorInCl: int64;
+  entryInSec: int64;
+  fertig:     bool;
+  sekPuffer:  int64;
+}
+
+// ── Kleine Helfer ─────────────────────────────────────────────────────────
+
+fn _u8(p: int64, off: int64): int64 { return peek8(p + off) & 255; }
+
+fn _u16(p: int64, off: int64): int64 {
+  return (peek8(p + off) & 255) | ((peek8(p + off + 1) & 255) << 8);
+}
+
+fn _u32(p: int64, off: int64): int64 {
+  return (peek8(p + off)     & 255)
+       | ((peek8(p + off + 1) & 255) << 8)
+       | ((peek8(p + off + 2) & 255) << 16)
+       | ((peek8(p + off + 3) & 255) << 24);
+}
+
+fn _u64(p: int64, off: int64): int64 {
+  var lo: int64 := _u32(p, off);
+  var hi: int64 := _u32(p, off + 4);
+  return lo | (hi << 32);
+}
+
+fn _leseSektor(vol: ExfatVolume, sektor: int64, puffer: int64): int64 {
+  var pos: int64 := vol.partOffset + sektor * vol.bytesPerSector;
+  if (lseek(vol.fd, pos, 0) != pos) { return 0; }
+  if (read(vol.fd, puffer as pchar, vol.bytesPerSector) != vol.bytesPerSector) { return 0; }
+  return 1;
+}
+
+pub fn ExfatValid(vol: ExfatVolume): bool { return vol.gueltig; }
+
+pub fn ExfatBytesPerCluster(vol: ExfatVolume): int64 {
+  return vol.bytesPerSector * vol.sectorsPerClus;
+}
+
+pub fn ExfatClusterSector(vol: ExfatVolume, cluster: int64): int64 {
+  if (cluster < 2) { return EXFAT_ERR; }
+  return vol.heapOffset + (cluster - 2) * vol.sectorsPerClus;
+}
+
+// Zwei hoch n, fuer die beiden Exponentenfelder im Bootsektor.
+fn _zweiHoch(n: int64): int64 {
+  if (n < 0 || n > 40) { return 0; }
+  var r: int64 := 1;
+  var i: int64 := 0;
+  while (i < n) { r := r * 2; i := i + 1; }
+  return r;
+}
+
+// ── Einhaengen ────────────────────────────────────────────────────────────
+//
+// Der Bootsektor traegt Sektor- und Clustergroesse als EXPONENTEN: 9 heisst
+// 512 Byte, 3 heisst 8 Sektoren je Cluster. Wer die Zahlen direkt liest,
+// bekommt eine Sektorgroesse von 9 Byte und rechnet ab da alles falsch —
+// unauffaellig, denn die Adressen bleiben plausibel.
+pub fn ExfatMount(fd: int64, byteOffset: int64): ExfatVolume {
+  var vol: ExfatVolume;
+  vol.fd := fd;
+  vol.partOffset := byteOffset;
+  vol.gueltig := false;
+  vol.bytesPerSector := 0;
+  vol.sectorsPerClus := 0;
+
+  var bs: int64 := alloc(512);
+  if (lseek(fd, byteOffset, 0) != byteOffset) { free(bs, 512); return vol; }
+  if (read(fd, bs as pchar, 512) != 512) { free(bs, 512); return vol; }
+
+  // Kennung "EXFAT   " bei Offset 3, acht Zeichen mit Leerzeichen aufgefuellt.
+  if (_u8(bs, 3) != 69 || _u8(bs, 4) != 88 || _u8(bs, 5) != 70
+      || _u8(bs, 6) != 65 || _u8(bs, 7) != 84) { free(bs, 512); return vol; }
+  if (_u8(bs, 8) != 32 || _u8(bs, 9) != 32 || _u8(bs, 10) != 32) { free(bs, 512); return vol; }
+  if (_u8(bs, 510) != 0x55 || _u8(bs, 511) != 0xAA) { free(bs, 512); return vol; }
+
+  var bpsShift: int64 := _u8(bs, 108);
+  var spcShift: int64 := _u8(bs, 109);
+  // Die Spezifikation laesst 512 bis 4096 Byte je Sektor zu und hoechstens
+  // 32 MiB je Cluster. Ausserhalb davon ist der Bootsektor nicht auswertbar.
+  if (bpsShift < 9 || bpsShift > 12) { free(bs, 512); return vol; }
+  if (spcShift < 0 || spcShift > 25 - bpsShift) { free(bs, 512); return vol; }
+
+  vol.bytesPerSector := _zweiHoch(bpsShift);
+  vol.sectorsPerClus := _zweiHoch(spcShift);
+  vol.fatOffset      := _u32(bs, 80);
+  vol.fatLength      := _u32(bs, 84);
+  vol.heapOffset     := _u32(bs, 88);
+  vol.clusterCount   := _u32(bs, 92);
+  vol.rootCluster    := _u32(bs, 96);
+  vol.numFats        := _u8(bs, 110);
+
+  free(bs, 512);
+
+  if (vol.fatOffset == 0 || vol.fatLength == 0) { return vol; }
+  if (vol.heapOffset <= vol.fatOffset) { return vol; }
+  if (vol.clusterCount == 0) { return vol; }
+  if (vol.rootCluster < 2 || vol.rootCluster > vol.clusterCount + 1) { return vol; }
+  if (vol.numFats < 1 || vol.numFats > 2) { return vol; }
+
+  vol.gueltig := true;
+  return vol;
+}
+
+// ── Zuordnungstabelle ─────────────────────────────────────────────────────
+
+pub fn ExfatNextCluster(vol: ExfatVolume, cluster: int64): int64 {
+  if (!vol.gueltig) { return EXFAT_ERR; }
+  if (cluster < 2 || cluster > vol.clusterCount + 1) { return EXFAT_ERR; }
+  var bps: int64 := vol.bytesPerSector;
+  var byteOff: int64 := cluster * 4;
+  var sek: int64 := vol.fatOffset + byteOff / bps;
+  var inSek: int64 := byteOff - (byteOff / bps) * bps;
+  var puf: int64 := alloc(bps);
+  if (_leseSektor(vol, sek, puf) == 0) { free(puf, bps); return EXFAT_ERR; }
+  var wert: int64 := _u32(puf, inSek);
+  free(puf, bps);
+  if (wert == 0) { return EXFAT_FREI; }
+  // exFAT kennt nur 0xFFFFFFFF als Ende und 0xFFFFFFF7 als schadhaft; die
+  // Spanne dazwischen, die FAT32 fuehrt, gibt es hier nicht.
+  if (wert == 0xFFFFFFFF) { return EXFAT_EOC; }
+  if (wert == 0xFFFFFFF7) { return EXFAT_ERR; }
+  return wert;
+}
+
+// ── Verzeichnisse ─────────────────────────────────────────────────────────
+
+pub fn ExfatDirOpen(vol: ExfatVolume, cluster: int64): ExfatDir {
+  var d: ExfatDir;
+  d.sectorInCl := 0;
+  d.entryInSec := 0;
+  d.fertig := false;
+  d.sekPuffer := 0;
+  if (cluster == 0) { d.cluster := vol.rootCluster; } else { d.cluster := cluster; }
+  if (!vol.gueltig) { d.fertig := true; d.cluster := 0; return d; }
+  d.sekPuffer := alloc(vol.bytesPerSector);
+  return d;
+}
+
+pub fn ExfatDirClose(vol: ExfatVolume, ref d: ExfatDir): void {
+  if (d.sekPuffer != 0) { free(d.sekPuffer, vol.bytesPerSector); }
+}
+
+fn _ucs2Zeichen(hi: int64, lo: int64): int64 {
+  if (hi != 0) { return 63; }
+  return lo;
+}
+
+// Naechsten DATEI-Satz holen. Rueckgabe: 1 = geliefert, 0 = Ende,
+// EXFAT_ERR = Lesefehler.
+//
+// Ein Satz besteht aus dem Dateieintrag (0x85), dem Stromeintrag (0xC0) und
+// so vielen Namenseintraegen (0xC1), wie der Name braucht. Bitmap, Upcase und
+// Datentraegerkennung werden hier UEBERGANGEN — sie sind keine Dateien, und
+// wer sie mitliefert, hat in jedem Verzeichnislisting drei Geistereintraege.
+pub fn ExfatDirNext(vol: ExfatVolume, ref d: ExfatDir, ref e: ExfatEntry,
+                    nameBuf: int64, nameMax: int64): int64 {
+  if (!vol.gueltig) { return EXFAT_ERR; }
+  if (d.fertig) { return 0; }
+  if (nameMax < 16) { return EXFAT_ERR; }
+
+  var bps: int64 := vol.bytesPerSector;
+  var proSektor: int64 := bps / 32;
+
+  var imSatz: bool := false;      // 0x85 gesehen, warte auf 0xC0/0xC1
+  var restNamen: int64 := 0;
+  var nameLen: int64 := 0;
+  var geschrieben: int64 := 0;
+
+  while (true) {
+    if (d.cluster < 2) { d.fertig := true; return 0; }
+    var basis: int64 := ExfatClusterSector(vol, d.cluster);
+    if (basis == EXFAT_ERR) { d.fertig := true; return EXFAT_ERR; }
+    if (_leseSektor(vol, basis + d.sectorInCl, d.sekPuffer) == 0) { return EXFAT_ERR; }
+
+    while (d.entryInSec < proSektor) {
+      var ep: int64 := d.sekPuffer + d.entryInSec * 32;
+      var typ: int64 := _u8(ep, 0);
+      d.entryInSec := d.entryInSec + 1;
+
+      if (typ == 0) { d.fertig := true; return 0; }
+
+      // Bit 7 = in Gebrauch. Ein geloeschter Satz traegt dieselbe Art ohne
+      // dieses Bit; er wird uebersprungen, und ein angefangener Satz gilt
+      // damit als abgebrochen.
+      if ((typ & 128) == 0) { imSatz := false; restNamen := 0; geschrieben := 0; }
+      else if (typ == EXFAT_ET_FILE) {
+        e.attr := _u16(ep, 4);
+        e.isDir := (e.attr & EXFAT_ATTR_DIRECTORY) != 0;
+        imSatz := true;
+        restNamen := 0;
+        geschrieben := 0;
+        nameLen := 0;
+      }
+      else if (typ == EXFAT_ET_STREAM && imSatz) {
+        var flags: int64 := _u8(ep, 1);
+        e.noFatChain := (flags & 2) != 0;
+        nameLen := _u8(ep, 3);
+        e.cluster := _u32(ep, 20);
+        e.size := _u64(ep, 24);
+        restNamen := (nameLen + 14) / 15;
+      }
+      else if (typ == EXFAT_ET_NAME && imSatz) {
+        var k: int64 := 0;
+        while (k < 15 && geschrieben < nameLen && geschrieben < nameMax - 1) {
+          poke8(nameBuf + geschrieben,
+                _ucs2Zeichen(_u8(ep, 3 + k*2), _u8(ep, 2 + k*2)));
+          geschrieben := geschrieben + 1;
+          k := k + 1;
+        }
+        restNamen := restNamen - 1;
+        if (restNamen <= 0) {
+          poke8(nameBuf + geschrieben, 0);
+          return 1;
+        }
+      }
+      // Alles andere (Bitmap, Upcase, Kennung, unbekannte Arten) uebergehen.
+    }
+
+    d.entryInSec := 0;
+    d.sectorInCl := d.sectorInCl + 1;
+    if (d.sectorInCl >= vol.sectorsPerClus) {
+      d.sectorInCl := 0;
+      var nx: int64 := ExfatNextCluster(vol, d.cluster);
+      if (nx == EXFAT_EOC) { d.fertig := true; return 0; }
+      if (nx == EXFAT_ERR) { d.fertig := true; return EXFAT_ERR; }
+      // Ein Verzeichnis, das zusammenhaengend liegt, steht nicht in der FAT:
+      // dort steht 0. Der naechste Cluster ist dann schlicht der folgende.
+      if (nx == EXFAT_FREI) { d.cluster := d.cluster + 1; }
+      else { d.cluster := nx; }
+      if (d.cluster > vol.clusterCount + 1) { d.fertig := true; return 0; }
+    }
+  }
+  return 0;
+}
+
+// ── Kennung, Bitmap, Upcase ───────────────────────────────────────────────
+
+// Datentraegerkennung in `buf`. Rueckgabe: Zeichenzahl, 0 = keine, oder
+// EXFAT_ERR.
+pub fn ExfatVolumeLabel(vol: ExfatVolume, buf: int64, max: int64): int64 {
+  if (!vol.gueltig) { return EXFAT_ERR; }
+  var bps: int64 := vol.bytesPerSector;
+  var puf: int64 := alloc(bps);
+  var basis: int64 := ExfatClusterSector(vol, vol.rootCluster);
+  if (_leseSektor(vol, basis, puf) == 0) { free(puf, bps); return EXFAT_ERR; }
+  var i: int64 := 0;
+  var n: int64 := 0;
+  var proSektor: int64 := bps / 32;
+  while (i < proSektor) {
+    var ep: int64 := puf + i * 32;
+    var typ: int64 := _u8(ep, 0);
+    if (typ == 0) { i := proSektor; }
+    else {
+      if (typ == EXFAT_ET_LABEL) {
+        var cnt: int64 := _u8(ep, 1);
+        var k: int64 := 0;
+        while (k < cnt && k < 11 && n < max - 1) {
+          poke8(buf + n, _ucs2Zeichen(_u8(ep, 3 + k*2), _u8(ep, 2 + k*2)));
+          n := n + 1; k := k + 1;
+        }
+        i := proSektor;
+      } else { i := i + 1; }
+    }
+  }
+  poke8(buf + n, 0);
+  free(puf, bps);
+  return n;
+}
+
+// Ersten Cluster und Laenge eines der beiden Systemstroeme holen.
+// `art` ist EXFAT_ET_BITMAP oder EXFAT_ET_UPCASE.
+pub fn ExfatSystemStream(vol: ExfatVolume, art: int64, ref e: ExfatEntry): int64 {
+  if (!vol.gueltig) { return EXFAT_ERR; }
+  var bps: int64 := vol.bytesPerSector;
+  var puf: int64 := alloc(bps);
+  var basis: int64 := ExfatClusterSector(vol, vol.rootCluster);
+  if (_leseSektor(vol, basis, puf) == 0) { free(puf, bps); return EXFAT_ERR; }
+  var proSektor: int64 := bps / 32;
+  var i: int64 := 0;
+  var r: int64 := 0;
+  while (i < proSektor) {
+    var ep: int64 := puf + i * 32;
+    var typ: int64 := _u8(ep, 0);
+    if (typ == 0) { i := proSektor; }
+    else {
+      if (typ == art) {
+        e.attr := 0;
+        e.isDir := false;
+        e.cluster := _u32(ep, 20);
+        e.size := _u64(ep, 24);
+        // Bitmap und Upcase liegen immer zusammenhaengend.
+        e.noFatChain := true;
+        r := 1;
+        i := proSektor;
+      } else { i := i + 1; }
+    }
+  }
+  free(puf, bps);
+  return r;
+}
+
+// Die im Verzeichnis abgelegte Pruefsumme der Upcase-Tabelle.
+pub fn ExfatUpcaseStoredChecksum(vol: ExfatVolume): int64 {
+  if (!vol.gueltig) { return EXFAT_ERR; }
+  var bps: int64 := vol.bytesPerSector;
+  var puf: int64 := alloc(bps);
+  var basis: int64 := ExfatClusterSector(vol, vol.rootCluster);
+  if (_leseSektor(vol, basis, puf) == 0) { free(puf, bps); return EXFAT_ERR; }
+  var proSektor: int64 := bps / 32;
+  var i: int64 := 0;
+  var r: int64 := EXFAT_ERR;
+  while (i < proSektor) {
+    var ep: int64 := puf + i * 32;
+    var typ: int64 := _u8(ep, 0);
+    if (typ == 0) { i := proSektor; }
+    else {
+      if (typ == EXFAT_ET_UPCASE) { r := _u32(ep, 4); i := proSektor; }
+      else { i := i + 1; }
+    }
+  }
+  free(puf, bps);
+  return r;
+}
+
+// Pruefsumme ueber einen Speicherbereich, nach der Vorschrift von exFAT:
+// Rechtsrotation um ein Bit, dann das Byte addieren.
+pub fn ExfatChecksum32(daten: int64, len: int64): int64 {
+  var s: int64 := 0;
+  var i: int64 := 0;
+  while (i < len) {
+    var bit0: int64 := s & 1;
+    s := ((s >> 1) & 0x7FFFFFFF) | (bit0 << 31);
+    s := (s + (peek8(daten + i) & 255)) & 0xFFFFFFFF;
+    i := i + 1;
+  }
+  return s;
+}
+
+// ── Lesen ─────────────────────────────────────────────────────────────────
+
+pub fn ExfatReadFile(vol: ExfatVolume, e: ExfatEntry, buf: int64, max: int64): int64 {
+  if (!vol.gueltig) { return EXFAT_ERR; }
+  if (e.isDir) { return EXFAT_ERR; }
+  if (e.size == 0) { return 0; }
+  if (e.cluster < 2) { return EXFAT_ERR; }
+
+  var wollen: int64 := e.size;
+  if (wollen > max) { wollen := max; }
+
+  var sekPuf: int64 := alloc(vol.bytesPerSector);
+  var geschrieben: int64 := 0;
+  var c: int64 := e.cluster;
+  var runden: int64 := 0;
+  var grenze: int64 := vol.clusterCount + 2;
+
+  while (geschrieben < wollen && c >= 2) {
+    runden := runden + 1;
+    if (runden > grenze) { free(sekPuf, vol.bytesPerSector); return EXFAT_ERR; }
+    var basis: int64 := ExfatClusterSector(vol, c);
+    if (basis == EXFAT_ERR) { free(sekPuf, vol.bytesPerSector); return EXFAT_ERR; }
+    var s: int64 := 0;
+    while (s < vol.sectorsPerClus && geschrieben < wollen) {
+      if (_leseSektor(vol, basis + s, sekPuf) == 0) {
+        free(sekPuf, vol.bytesPerSector); return EXFAT_ERR;
+      }
+      var k: int64 := 0;
+      while (k < vol.bytesPerSector && geschrieben < wollen) {
+        poke8(buf + geschrieben, peek8(sekPuf + k));
+        geschrieben := geschrieben + 1;
+        k := k + 1;
+      }
+      s := s + 1;
+    }
+    if (geschrieben < wollen) {
+      // DER Unterschied zu FAT: liegt der Strom zusammenhaengend, steht er
+      // nicht in der Tabelle. Wer dort trotzdem nachschlaegt, liest 0 und
+      // haelt die Datei fuer zu Ende — bei jeder unfragmentierten Datei.
+      if (e.noFatChain) {
+        c := c + 1;
+        if (c > vol.clusterCount + 1) { free(sekPuf, vol.bytesPerSector); return EXFAT_ERR; }
+      } else {
+        var nx: int64 := ExfatNextCluster(vol, c);
+        if (nx == EXFAT_EOC || nx == EXFAT_ERR || nx == EXFAT_FREI) {
+          free(sekPuf, vol.bytesPerSector); return EXFAT_ERR;
+        }
+        c := nx;
+      }
+    }
+  }
+  free(sekPuf, vol.bytesPerSector);
+  return geschrieben;
+}
+
+// ── Suchen ────────────────────────────────────────────────────────────────
+
+fn _nameGleich(a: int64, b: pchar): bool {
+  var i: int64 := 0;
+  while (i < 300) {
+    var ca: int64 := peek8(a + i) & 255;
+    var cb: int64 := StrCharAt(b, i) & 255;
+    if (ca >= 97 && ca <= 122) { ca := ca - 32; }
+    if (cb >= 97 && cb <= 122) { cb := cb - 32; }
+    if (ca != cb) { return false; }
+    if (ca == 0) { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+pub fn ExfatFindInDir(vol: ExfatVolume, dirCluster: int64, name: pchar,
+                      ref e: ExfatEntry): int64 {
+  var d: ExfatDir := ExfatDirOpen(vol, dirCluster);
+  var buf: int64 := alloc(300);
+  var r: int64 := 0;
+  while (true) {
+    var got: int64 := ExfatDirNext(vol, d, e, buf, 300);
+    if (got == EXFAT_ERR) { r := EXFAT_ERR; break; }
+    if (got == 0) { r := 0; break; }
+    if (_nameGleich(buf, name)) { r := 1; break; }
+  }
+  free(buf, 300);
+  ExfatDirClose(vol, d);
+  return r;
+}
+
+pub fn ExfatFindPath(vol: ExfatVolume, path: pchar, ref e: ExfatEntry): int64 {
+  if (!vol.gueltig) { return EXFAT_ERR; }
+  var len: int64 := StrLen(path);
+  var teil: int64 := alloc(300);
+  var akt: int64 := 0;
+  var i: int64 := 0;
+  var gefunden: int64 := 0;
+  var ergebnis: int64 := 0;
+  var abbruch: bool := false;
+
+  while (i < len && !abbruch) {
+    var c: int64 := StrCharAt(path, i) & 255;
+    if (c == 47 || c == 92) { i := i + 1; }
+    else {
+      var n: int64 := 0;
+      var imTeil: bool := true;
+      while (i < len && imTeil) {
+        var c2: int64 := StrCharAt(path, i) & 255;
+        if (c2 == 47 || c2 == 92) { imTeil := false; }
+        else {
+          if (n < 299) { poke8(teil + n, c2); n := n + 1; }
+          i := i + 1;
+        }
+      }
+      poke8(teil + n, 0);
+      var r: int64 := ExfatFindInDir(vol, akt, teil as pchar, e);
+      if (r != 1) { ergebnis := r; abbruch := true; }
+      else { gefunden := 1; akt := e.cluster; }
+    }
+  }
+  free(teil, 300);
+  if (abbruch) { return ergebnis; }
+  return gefunden;
+}
