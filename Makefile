@@ -368,6 +368,8 @@ test: lyxc
 	@bash tests/grant_warnung_test.sh
 	@echo "--- Runde F: ui.notify, @integrity an Unit und IR-Zielen (#1912/#1916/#1917) ---"
 	@bash tests/runde_f_test.sh
+	@echo "--- std.fs.fat: FAT12/16/32 lesen (94 Pruefungen gegen mkfs.vfat-Abbilder) ---"
+	@bash tests/fat_test.sh
 	@bash tests/while_limit_test.sh
 	@bash tests/grammar_gaps_test.sh
 	@echo "OK"
