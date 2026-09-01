@@ -57,18 +57,42 @@ cat > "$TMP/lauf.lyx" <<'EOF'
 import std.io;
 fn main(): int64 { var i: int64 := 0; while (i < 900000000) { i := i + 1; } return 0; }
 EOF
+#
+#    #1911: Diese Pruefung setzte voraus, dass die Umgebung ETXTBSY ueberhaupt
+#    erzeugt. Auf dem CI-Runner tut sie das nicht — dort ist das Ziel seit
+#    sechs Mergen rot, jedes Mal an diesen beiden Zeilen, und ein roter Lauf,
+#    der immer rot ist, wird ueberlesen. Genau deshalb musste #1910 mit
+#    `--admin` an der Pruefung vorbei gemergt werden.
+#
+#    Die Voraussetzung wird jetzt GEMESSEN, statt sie anzunehmen: eine
+#    Sonde schreibt selbst in die laufende Datei. Scheitert sie, gilt die
+#    Sperre und die eigentliche Pruefung laeuft. Scheitert sie NICHT, sagt der
+#    Test das laut und ueberspringt — die Sonde veraendert dabei nichts,
+#    denn sie schlaegt im interessanten Fall fehl.
 if "$LYXC" --std-path=. "$TMP/lauf.lyx" -o "$TMP/laeuft" > /dev/null 2>&1; then
   chmod +x "$TMP/laeuft"
   "$TMP/laeuft" & busy=$!
   sleep 1
-  "$LYXC" --std-path=. "$TMP/q.lyx" -o "$TMP/laeuft" > "$TMP/c.out" 2> "$TMP/c.err"
-  rc=$?
-  kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
-  if [ "$rc" -ne 0 ]; then ok "laufende Zieldatei: Status $rc"; else bad "laufende Zieldatei, endet aber mit 0"; fi
-  if grep -q "ETXTBSY" "$TMP/c.err"; then
-    ok "Meldung nennt ETXTBSY als Anlass"
+  if ! kill -0 "$busy" 2>/dev/null; then
+    echo "UEBERSPRUNGEN ETXTBSY: das Hilfsprogramm lief nicht lange genug (#1911)"
+  elif ( printf '' >> "$TMP/laeuft" ) 2>/dev/null; then
+    # Die Umgebung laesst das Schreiben in eine laufende Datei zu. Dann kann
+    # der Compiler ETXTBSY nicht melden, und die Pruefung misst hier nichts.
+    kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
+    echo "UEBERSPRUNGEN ETXTBSY: diese Umgebung sperrt laufende Dateien nicht (#1911)"
+    echo "  Ein Schreibzugriff auf die laufende Datei ist durchgegangen — der Fall"
+    echo "  ist hier nicht messbar. Auf einem gewoehnlichen Linux-Dateisystem laeuft"
+    echo "  die Pruefung; in Containern mit overlayfs greift die Sperre oft nicht."
   else
-    bad "Meldung nennt ETXTBSY nicht: $(head -1 "$TMP/c.err")"
+    "$LYXC" --std-path=. "$TMP/q.lyx" -o "$TMP/laeuft" > "$TMP/c.out" 2> "$TMP/c.err"
+    rc=$?
+    kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
+    if [ "$rc" -ne 0 ]; then ok "laufende Zieldatei: Status $rc"; else bad "laufende Zieldatei, endet aber mit 0"; fi
+    if grep -q "ETXTBSY" "$TMP/c.err"; then
+      ok "Meldung nennt ETXTBSY als Anlass"
+    else
+      bad "Meldung nennt ETXTBSY nicht: $(head -1 "$TMP/c.err")"
+    fi
   fi
 else
   bad "Hilfsprogramm fuer den ETXTBSY-Fall uebersetzt nicht"
