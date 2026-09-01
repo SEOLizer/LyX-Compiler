@@ -36,7 +36,15 @@ while i < 4096:
     if i < 0: break
     if int.from_bytes(b[i+1:i+3], 'little') == 8:
         v = int.from_bytes(b[i+3:i+11], 'little')
-        if v in (0, 1, 2, 4, 8, 16, 32, 64, 128, 256):
+        # #1912: Hier stand eine feste Liste bis 256. Sie sollte Zufallstreffer
+        # ausschliessen, schloss aber zugleich jedes Bit aus, das spaeter
+        # dazukam — audio.mic (512), audio.play (1024), ui.notify (2048)
+        # lasen dadurch -1, also "nicht gefunden" statt ihres Werts. Eine
+        # Filterliste, die mit dem Bestand nicht mitwaechst, macht aus einem
+        # richtigen Wert ein stilles Nichts.
+        # Geprueft wird jetzt die EIGENSCHAFT: 0 oder genau ein gesetztes Bit
+        # bis 0x800.
+        if v == 0 or (v <= 2048 and (v & (v - 1)) == 0):
             print(v); sys.exit()
     i += 1
 print(-1)
@@ -81,7 +89,8 @@ v="$(caps "$TMP/fs.lbf")"
 # einloesen koennte; aufteilen laesst sich das spaeter, ohne bestehende
 # Bedeutungen zu verschieben.
 #
-# ABWEICHUNG VOM VORSCHLAG: das Issue nannte 0x80 — die ist LBF_CAP_AUDIO_MIC.
+# ABWEICHUNG VOM VORSCHLAG: das Issue nannte 0x80 — die ist system.config
+# (bis #1912 stand hier faelschlich LBF_CAP_AUDIO_MIC).
 # Zweite Meldung in Folge, deren Zahl aus einer Messung stammt, die nur die
 # selbst gesetzten Bits sieht (bei #1755 war es 0x10 gegen KI_EMBED).
 for hw in hardware.i2c hardware.usb hardware.gpio hardware.spi; do
@@ -97,12 +106,34 @@ fn main(): int64 { return 0; }"
   fi
 done
 
-# 0x80 bleibt bei audio — sonst traefen sich zwei Bedeutungen in einer Zahl.
-if grep -q "LBF_CAP_AUDIO_MIC *: *int64 *:= *128" "$ROOT/src/std/lyxos/lbf_layout.lyx"; then
-  ok "0x80 bleibt LBF_CAP_AUDIO_MIC (keine Doppelbelegung)"
-else
-  no "Doppelbelegung" "0x80 traegt nicht mehr audio"
-fi
+# 0x80 bleibt EINDEUTIG belegt — sonst traefen sich zwei Bedeutungen in einer
+# Zahl.
+#
+# #1912: Hier stand bis 1.1.15B ein `grep` auf `LBF_CAP_AUDIO_MIC := 128` in
+# der TABELLE. Genau die war falsch: der Emitter setzt fuer `audio.mic` seit
+# #1797 die 512, weil 128 dort an `system.config` ging. Der Test hat also die
+# stale Seite der Divergenz festgenagelt und die Abweichung dadurch
+# konserviert — die Tabelle ist jetzt nachgezogen.
+#
+# Gemessen wird deshalb am ERZEUGNIS, wie es die Regel aus #1823 verlangt:
+# jeden Namen einzeln uebersetzen und das Bit lesen, statt der Tabelle zu
+# glauben.
+bau cfg '@capabilities([system.config])
+fn main(): int64 { return 0; }'
+vcfg="$(caps "$TMP/cfg.lbf")"
+[ "$vcfg" = "128" ] && ok "0x80 gehoert system.config (am Erzeugnis gemessen)" \
+                    || no "0x80 gehoert system.config" "caps=$vcfg erwartet 128"
+
+bau mic '@capabilities([audio.mic])
+fn main(): int64 { return 0; }'
+vmic="$(caps "$TMP/mic.lbf")"
+[ "$vmic" = "512" ] && ok "audio.mic haelt 0x200, nicht 0x80" \
+                    || no "audio.mic haelt 0x200" "caps=$vmic erwartet 512"
+
+# Und die beiden sind verschieden — ohne diese Zeile waere der Test auch von
+# zwei gleichen Rueckgaben erfuellt.
+[ "$vcfg" != "$vmic" ] && ok "system.config und audio.mic sind verschiedene Bits" \
+                       || no "system.config und audio.mic" "beide $vcfg"
 
 # Blockgeraete bleiben eine eigene Klasse, nicht DEVICE.
 v="$(caps "$TMP/blk.lbf")"
