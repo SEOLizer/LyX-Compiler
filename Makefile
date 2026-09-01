@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.15B
-VERSION_DATE := 2026-08-31
+VERSION   := 1.1.16A
+VERSION_DATE := 2026-09-01
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -366,6 +366,8 @@ test: lyxc
 	@bash tests/integrity_test.sh
 	@echo "--- grant-Warnung meldet nur, wo sie etwas sagt (#1899) ---"
 	@bash tests/grant_warnung_test.sh
+	@echo "--- Runde F: ui.notify, @integrity an Unit und IR-Zielen (#1912/#1916/#1917) ---"
+	@bash tests/runde_f_test.sh
 	@bash tests/while_limit_test.sh
 	@bash tests/grammar_gaps_test.sh
 	@echo "OK"

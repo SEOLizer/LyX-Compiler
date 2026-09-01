@@ -617,6 +617,16 @@ Der Score bewertet die Qualität des Sicherheitsmodells (aktuell max. 40, mit op
 | 48 | `fs.cwd` | Dateisystem |
 | 49 | `debug.trace` | Beobachtung |
 | 50 | `kernel.bpf` | Beobachtung |
+| 51 | `ui.notify` | Oberfläche |
+
+**`ui.notify` gilt nur auf LyxOS** (#1912). Es setzt Bit `0x800` im CAPS-TLV des
+LBF-Manifests, das der Kernel auf `PLEDGE_NOTIFY` abbildet; damit ist
+`sys_toast_post` (344) erreichbar. Unter Linux gibt der Name **keinen** Syscall
+frei — es gibt dort keinen für systemweite Meldungen. Er ist trotzdem
+deklarierbar, damit dasselbe Programm auf beiden Zielen übersetzt.
+
+Das **Lesen** fremder Meldungen (`sys_toast_fetch` 345, `sys_toast_seq` 346) ist
+ausdrücklich **nicht** enthalten: wer melden darf, darf deshalb nicht mitlesen.
 
 ---
 
