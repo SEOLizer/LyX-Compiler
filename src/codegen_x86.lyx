@@ -424,6 +424,46 @@ con CG_ENVBLOCK: int64 := 96; // data[96..103]: _lyx_envblock (8 bytes)
 con CG_HEAP_PTR: int64 := 104; // data[104..111]: _lyx_heap_ptr
 con CG_HEAP_END: int64 := 112; // data[112..119]: _lyx_heap_end
 
+// #1915: Einen KURZSPRUNG (rel8) nachtragen — mit Pruefung statt mit Abschnitt.
+//
+// `poke8` nimmt jeden Wert und verwirft die oberen Bits. Aus einer Distanz von
+// 130 wird damit das Byte 130, und das liest die CPU als -126: der Sprung geht
+// RUECKWAERTS mitten in den uebersprungenen Block. Genau so ist #1915
+// entstanden — `push` auf ein Array, dessen Local jenseits von rbp-128 liegt,
+// sprang in den eigenen Wachstumspfad zurueck und lief in einen
+// Speicherzugriffsfehler.
+//
+// Der Fehler ist von aussen nicht zu sehen: dasselbe Programm mit einer
+// Variablen weniger uebersetzt zu einem tadellosen Erzeugnis. Deshalb scheitert
+// diese Stelle jetzt LAUT. Wer einen Zweig verlaengert, bis er nicht mehr in
+// einen Kurzsprung passt, erfaehrt es beim Uebersetzen und nicht beim Absturz
+// eines fremden Programms.
+//
+// Freie Funktion, KEINE Methode — eine zusaetzliche Methode verschiebt die
+// Vtable der Klasse (#1853).
+// Dieselbe Pruefung fuer eine bereits ausgerechnete Distanz — etwa dort, wo
+// der Abstand zwischen zwei Marken eingetragen wird.
+fn cg_patchRel8Wert(code: int64, pos: int64, dist: int64): void {
+  if (dist < 0 || dist > 127) {
+    EPrintStr("error: codegen: Kurzsprung ueberschreitet 127 Byte (Distanz "c);
+    EPrintStr(IntToStr(dist));
+    EPrintStrLn(") — dieser Zweig braucht einen langen Sprung (rel32). Siehe #1915."c);
+    exit(1);
+  }
+  poke8(code + pos, dist);
+}
+
+fn cg_patchRel8(code: int64, pos: int64, codeLen: int64): void {
+  var dist: int64 := codeLen - pos - 1;
+  if (dist < 0 || dist > 127) {
+    EPrintStr("error: codegen: Kurzsprung ueberschreitet 127 Byte (Distanz "c);
+    EPrintStr(IntToStr(dist));
+    EPrintStrLn(") — dieser Zweig braucht einen langen Sprung (rel32). Siehe #1915."c);
+    exit(1);
+  }
+  poke8(code + pos, dist);
+}
+
 // #1878: Kopfgroesse der Scrub-Tabelle (siehe cg_scrubBuildTable).
 con CG_SCRUB_HDR: int64 := 64;
 
@@ -3488,7 +3528,7 @@ pub type Codegen = class {
     self.cg_emitLeaRdiData(self.ioCheckMsgOff);
     self.cg_emitPanicBody();
     // .ok:
-    poke8(self.code + pSkip, (self.codeLen - pSkip - 1) & 255);
+    cg_patchRel8(self.code, pSkip, self.codeLen);
   }
 
   // WP-CS-10: if OF is set (signed overflow): panic with overflow message
@@ -3513,7 +3553,7 @@ pub type Codegen = class {
     self.cg_emitLeaRdiData(self.overflowMsgOff);
     self.cg_emitPanicBody();
     // .ok:
-    poke8(self.code + pSkip, (self.codeLen - pSkip - 1) & 255);
+    cg_patchRel8(self.code, pSkip, self.codeLen);
   }
 
   // WP-12: Emit longjmp code. rax must hold jmp_buf base pointer.
@@ -5586,7 +5626,7 @@ pub type Codegen = class {
         self.cg_edata(111); self.cg_edata(10);  self.cg_edata(0);   // o\n\0
         self.cg_emitLeaRdiData(msgOffD);
         self.cg_emitPanicBody();
-        poke8(self.code + pSkipD, self.codeLen - pSkipD - 1);
+        cg_patchRel8(self.code, pSkipD, self.codeLen);
       }
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);  // mov rcx, rax (divisor)
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);  // mov rax, rbx (dividend)
@@ -5617,7 +5657,7 @@ pub type Codegen = class {
         self.cg_edata(0);                                            // \0
         self.cg_emitLeaRdiData(msgOffM);
         self.cg_emitPanicBody();
-        poke8(self.code + pSkipM, self.codeLen - pSkipM - 1);
+        cg_patchRel8(self.code, pSkipM, self.codeLen);
       }
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);  // mov rcx, rax
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);  // mov rax, rbx
@@ -6194,7 +6234,7 @@ pub type Codegen = class {
 
     // passt: rax = Objekt, rcx = neue freie Stelle
     var ziel: int64 := self.codeLen;
-    poke8(self.code + pJmp, (ziel - (pJmp + 1)) & 255);
+    cg_patchRel8Wert(self.code, pJmp, ziel - pJmp - 1);
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D);   // mov [rip + CG_HEAP_PTR], rcx
     var pPtr: int64 := self.codeLen;
     self.cg_e32(0);
@@ -6325,7 +6365,7 @@ pub type Codegen = class {
     self.cg_e8(0xEB);                                          // jmp retry
     self.cg_e8((retry - self.codeLen - 1) & 255);
     // --- .nachlegen: eigener Block per mmap(1 MiB) ---
-    poke8(self.code + jaPos, self.codeLen - jaPos - 1);
+    cg_patchRel8(self.code, jaPos, self.codeLen);
     self.cg_e8(0x57); self.cg_e8(0x56); self.cg_e8(0x51);      // push rdi, rsi, rcx
     self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);      // xor rdi, rdi
     self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6); self.cg_e32(1048576);
@@ -6347,7 +6387,7 @@ pub type Codegen = class {
     var p5: int64 := self.codeLen; self.cg_e32(0);
     self.cg_addPatch(p5, aOff, 0, CG_PATCH_STR);
     // .fertig
-    poke8(self.code + jzPos, self.codeLen - jzPos - 1);
+    cg_patchRel8(self.code, jzPos, self.codeLen);
     self.cg_e8(0x5A);                                          // pop rdx
   }
 
@@ -6557,7 +6597,7 @@ pub type Codegen = class {
     self.cg_edata(0);
     self.cg_emitLeaRdiData(msgOff);
     self.cg_emitPanicBody();
-    poke8(self.code + pSkip, self.codeLen - pSkip - 1);
+    cg_patchRel8(self.code, pSkip, self.codeLen);
   }
 
   // #1255: `new T[n]` — Belegung mit einer erst zur Laufzeit bekannten Laenge.
@@ -6602,7 +6642,7 @@ pub type Codegen = class {
     self.cg_edata(0);
     self.cg_emitLeaRdiData(msgOff);
     self.cg_emitPanicBody();
-    poke8(self.code + pSkip, self.codeLen - pSkip - 1);
+    cg_patchRel8(self.code, pSkip, self.codeLen);
     self.cg_pushRax();                                                        // n retten
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);                     // mov rsi, rax
     self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE6); self.cg_e8(0x03);   // shl rsi, 3
@@ -7655,7 +7695,7 @@ pub type Codegen = class {
     self.cg_e8(0x7C); var pLo: int64 := self.codeLen; self.cg_e8(0);    // jl -> panic
     self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e32(hi);                // cmp rax, hi
     self.cg_e8(0x7E); var pOk: int64 := self.codeLen; self.cg_e8(0);    // jle -> ok
-    poke8(self.code + pLo, self.codeLen - pLo - 1);
+    cg_patchRel8(self.code, pLo, self.codeLen);
     self.cg_pushRax();
     var msgOff: int64 := self.dataLen;
     var msg: pchar := "unit value out of range\n"c;
@@ -7665,7 +7705,7 @@ pub type Codegen = class {
     self.cg_emitLeaRdiData(msgOff);
     self.cg_emitPanicBody();
     self.cg_popRax();
-    poke8(self.code + pOk, self.codeLen - pOk - 1);
+    cg_patchRel8(self.code, pOk, self.codeLen);
   }
 
   // #1110: Einheit des Ausdrucks, soweit der Codegen sie kennt. Nur der Fall,
@@ -8319,8 +8359,19 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x51); self.cg_e8(0x08);
     // cmp rdx, rax          (len vs cap)
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC2);
-    // jl .no_grow  (short — signed compare, both values non-negative)
-    self.cg_e8(0x7C); var jlNoGrow: int64 := self.codeLen; self.cg_e8(0);
+    // jl .no_grow
+    //
+    // #1915: Hier stand ein KURZSPRUNG. Der Wachstumspfad darunter ist rund
+    // 127 Byte lang — plus `cg_storeRax`, das drei Byte mehr braucht, sobald
+    // der Rahmenversatz des Arrays jenseits von rbp-128 liegt. Ab der
+    // sechzehnten vorangehenden lokalen Variablen kippte die Distanz damit
+    // auf 130, `poke8` schnitt sie auf ein Byte, und die CPU las -126: der
+    // Sprung ging RUECKWAERTS in den Pfad, den er ueberspringen sollte.
+    //
+    // Nachgemessen am Erzeugnis: 14 Locals davor -> rel8 = 127 (die Grenze
+    // exakt ausgereizt), 16 Locals -> 130 = -126 und Speicherzugriffsfehler.
+    // Ein langer Sprung kostet drei Byte und nimmt der Stelle die Grenze.
+    self.cg_e8(0x0F); self.cg_e8(0x8C); var jlNoGrow: int64 := self.codeLen; self.cg_e32(0);
 
     // ---- GROW PATH ---- stack entering: [rsp+0]=value
     // push rcx  (save old_ptr)
@@ -8409,7 +8460,7 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x08);
 
     // Patch jl .no_grow to here
-    poke8(self.code + jlNoGrow, self.codeLen - jlNoGrow - 1);
+    poke32(self.code + jlNoGrow, self.codeLen - jlNoGrow - 4);
 
     // ---- APPEND (both paths join here) ----
     // Stack: [rsp+0]=value, rcx=array_ptr
@@ -8983,7 +9034,7 @@ pub type Codegen = class {
       var pSkip: int64 := self.codeLen;
       self.cg_e8(0);
       self.cg_genExpr(self.cg_nc1(ni));          // rax = fallback (only if lhs was null)
-      poke8(self.code + pSkip, self.codeLen - pSkip - 1);
+      cg_patchRel8(self.code, pSkip, self.codeLen);
 
     // WP-BC-14: safe cast x as? T — pass-through in bootstrap (nullable = same repr)
     } else if (k == CGN_SAFE_CAST) {
@@ -10422,11 +10473,11 @@ pub type Codegen = class {
         poke32(self.code + ppbT, hStr - ppbT - 4);
         self.cg_e8(0xEB);                                        // jmp .pbEnd
         var pbEJ: int64 := self.codeLen; self.cg_e8(0);
-        poke8(self.code + pbFJ, self.codeLen - pbFJ - 1);
+        cg_patchRel8(self.code, pbFJ, self.codeLen);
         self.cg_emitLeaRdiData(pbFOff);
         var ppbF: int64 := self.cg_emitCall();
         poke32(self.code + ppbF, hStr - ppbF - 4);
-        poke8(self.code + pbEJ, self.codeLen - pbEJ - 1);
+        cg_patchRel8(self.code, pbEJ, self.codeLen);
       } else {
         var pp: int64 := self.cg_emitCall();
         poke32(self.code + pp, hInt - pp - 4);
@@ -11696,11 +11747,11 @@ pub type Codegen = class {
       var ppepbT: int64 := self.cg_emitCall();
       poke32(self.code + ppepbT, CG_H_EPRINTSTR - ppepbT - 4);
       self.cg_e8(0xEB); var epbEJ: int64 := self.codeLen; self.cg_e8(0);
-      poke8(self.code + epbFJ, self.codeLen - epbFJ - 1);
+      cg_patchRel8(self.code, epbFJ, self.codeLen);
       self.cg_emitLeaRdiData(epbFOff);
       var ppepbF: int64 := self.cg_emitCall();
       poke32(self.code + ppepbF, CG_H_EPRINTSTR - ppepbF - 4);
-      poke8(self.code + epbEJ, self.codeLen - epbEJ - 1);
+      cg_patchRel8(self.code, epbEJ, self.codeLen);
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, slen, 6)) {
@@ -11831,7 +11882,7 @@ pub type Codegen = class {
         self.cg_edata(10);  self.cg_edata(0);                         // \n\0
         self.cg_emitLeaRdiData(msgP8);
         self.cg_emitPanicBody();
-        poke8(self.code + pSkipP8, self.codeLen - pSkipP8 - 1);
+        cg_patchRel8(self.code, pSkipP8, self.codeLen);
       }
       self.cg_e8(0x40); self.cg_e8(0x88); self.cg_e8(0x37);  // mov [rdi], sil
       self.cg_zeroRax();
@@ -11851,7 +11902,7 @@ pub type Codegen = class {
         self.cg_edata(10);  self.cg_edata(0);                         // \n\0
         self.cg_emitLeaRdiData(msgG8);
         self.cg_emitPanicBody();
-        poke8(self.code + pSkipG8, self.codeLen - pSkipG8 - 1);
+        cg_patchRel8(self.code, pSkipG8, self.codeLen);
       }
       self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x07);
 
@@ -11870,7 +11921,7 @@ pub type Codegen = class {
         self.cg_edata(10);  self.cg_edata(0);                         // \n\0
         self.cg_emitLeaRdiData(msgP64);
         self.cg_emitPanicBody();
-        poke8(self.code + pSkipP64, self.codeLen - pSkipP64 - 1);
+        cg_patchRel8(self.code, pSkipP64, self.codeLen);
       }
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x37);
       self.cg_zeroRax();
@@ -11890,7 +11941,7 @@ pub type Codegen = class {
         self.cg_edata(10);  self.cg_edata(0);                         // \n\0
         self.cg_emitLeaRdiData(msgG64);
         self.cg_emitPanicBody();
-        poke8(self.code + pSkipG64, self.codeLen - pSkipG64 - 1);
+        cg_patchRel8(self.code, pSkipG64, self.codeLen);
       }
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x07);
 
@@ -12803,7 +12854,7 @@ pub type Codegen = class {
       self.cg_edata(100); self.cg_edata(10);  self.cg_edata(0);   // d\n\0
       self.cg_emitLeaRdiData(msgOff);
       self.cg_emitPanicBody();
-      poke8(self.code + pSkip, self.codeLen - pSkip - 1);      // patch jnz offset
+      cg_patchRel8(self.code, pSkip, self.codeLen);      // patch jnz offset
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "assertTrue", 10)) {
@@ -12821,7 +12872,7 @@ pub type Codegen = class {
       self.cg_edata(100); self.cg_edata(10);  self.cg_edata(0);   // d\n\0
       self.cg_emitLeaRdiData(msgOffT);
       self.cg_emitPanicBody();
-      poke8(self.code + pSkipT, self.codeLen - pSkipT - 1);
+      cg_patchRel8(self.code, pSkipT, self.codeLen);
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "assertNotNull", 13)) {
@@ -12838,7 +12889,7 @@ pub type Codegen = class {
       self.cg_edata(10);  self.cg_edata(0);                        // \n\0
       self.cg_emitLeaRdiData(msgOffNN);
       self.cg_emitPanicBody();
-      poke8(self.code + pSkipNN, self.codeLen - pSkipNN - 1);
+      cg_patchRel8(self.code, pSkipNN, self.codeLen);
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "assertNotZero", 13)) {
@@ -12854,7 +12905,7 @@ pub type Codegen = class {
       self.cg_edata(101); self.cg_edata(10);  self.cg_edata(0);   // e\n\0
       self.cg_emitLeaRdiData(msgOffNZ);
       self.cg_emitPanicBody();
-      poke8(self.code + pSkipNZ, self.codeLen - pSkipNZ - 1);
+      cg_patchRel8(self.code, pSkipNZ, self.codeLen);
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "assertBounds", 12)) {
@@ -12874,7 +12925,7 @@ pub type Codegen = class {
       self.cg_edata(100); self.cg_edata(10);  self.cg_edata(0);   // d\n\0
       self.cg_emitLeaRdiData(msgOffB);
       self.cg_emitPanicBody();
-      poke8(self.code + pSkipB, self.codeLen - pSkipB - 1);
+      cg_patchRel8(self.code, pSkipB, self.codeLen);
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "Inspect", 7)) {
@@ -13137,7 +13188,7 @@ pub type Codegen = class {
       self.cg_edata(0);
       self.cg_emitLeaRdiData(dvMsgOff);
       self.cg_emitPanicBody();
-      poke8(self.code + dvEnd, self.codeLen - dvEnd - 1);
+      cg_patchRel8(self.code, dvEnd, self.codeLen);
 
     } else if (self.cg_seq(fname, fnlen, "getdents64", 10)) {
       // getdents64(fd, buf, count): syscall 217 — rdi=fd, rsi=buf, rdx=count
@@ -13308,13 +13359,13 @@ pub type Codegen = class {
       self.cg_e8(0x3C); self.cg_e8(0x0A);                             // cmp al, 0x0A
       self.cg_e8(0x75); var jneLD: int64 := self.codeLen; self.cg_e8(0); // jne lead_done
       // lead_inc:
-      poke8(self.code + jeL1, self.codeLen - jeL1 - 1);
-      poke8(self.code + jeL2, self.codeLen - jeL2 - 1);
-      poke8(self.code + jeL3, self.codeLen - jeL3 - 1);
+      cg_patchRel8(self.code, jeL1, self.codeLen);
+      cg_patchRel8(self.code, jeL2, self.codeLen);
+      cg_patchRel8(self.code, jeL3, self.codeLen);
       self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);           // inc rdi
       self.cg_e8(0xEB); self.cg_e8(trimStart - self.codeLen - 1);     // jmp trimStart
       // lead_done:
-      poke8(self.code + jneLD, self.codeLen - jneLD - 1);
+      cg_patchRel8(self.code, jneLD, self.codeLen);
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);           // mov rax, rdi  (result start)
       //
       // Phase 2: find null terminator — rcx walks forward to '\0'
@@ -13326,7 +13377,7 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC1);            // inc rcx
       self.cg_e8(0xEB); self.cg_e8(endLoop - self.codeLen - 1);        // jmp endLoop
       // end_found:
-      poke8(self.code + jzEF, self.codeLen - jzEF - 1);
+      cg_patchRel8(self.code, jzEF, self.codeLen);
       //
       // Phase 3: strip trailing whitespace — walk rcx back, null-terminate
       var trailTop: int64 := self.codeLen;
@@ -13345,15 +13396,15 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC1);            // inc rcx  (not ws — restore)
       self.cg_e8(0xEB); var jmpTD: int64 := self.codeLen; self.cg_e8(0); // jmp trail_done
       // trail_ws:
-      poke8(self.code + jeTW1, self.codeLen - jeTW1 - 1);
-      poke8(self.code + jeTW2, self.codeLen - jeTW2 - 1);
-      poke8(self.code + jeTW3, self.codeLen - jeTW3 - 1);
-      poke8(self.code + jeTW4, self.codeLen - jeTW4 - 1);
+      cg_patchRel8(self.code, jeTW1, self.codeLen);
+      cg_patchRel8(self.code, jeTW2, self.codeLen);
+      cg_patchRel8(self.code, jeTW3, self.codeLen);
+      cg_patchRel8(self.code, jeTW4, self.codeLen);
       self.cg_e8(0xC6); self.cg_e8(0x01); self.cg_e8(0x00);            // mov byte [rcx], 0
       self.cg_e8(0xEB); self.cg_e8(trailTop - self.codeLen - 1);       // jmp trailTop
       // trail_done:
-      poke8(self.code + jeTD,  self.codeLen - jeTD  - 1);
-      poke8(self.code + jmpTD, self.codeLen - jmpTD - 1);
+      cg_patchRel8(self.code, jeTD, self.codeLen);
+      cg_patchRel8(self.code, jmpTD, self.codeLen);
 
     } else if (self.cg_seq(fname, fnlen, "StrSplit", 8)) {
       // StrSplit(s,delim): call _lyx_strsplit → rax = pchar[] DynArray
@@ -13507,11 +13558,11 @@ pub type Codegen = class {
       self.cg_e8(0xEB);  // jmp .pbend
       var pbEndJ: int64 := self.codeLen;
       self.cg_e8(0);
-      poke8(self.code + pbFalseJ, self.codeLen - pbFalseJ - 1);
+      cg_patchRel8(self.code, pbFalseJ, self.codeLen);
       self.cg_emitLeaRdiData(pbFalseOff);
       var ppbF: int64 := self.cg_emitCall();
       poke32(self.code + ppbF, CG_H_PRINTSTR - ppbF - 4);
-      poke8(self.code + pbEndJ, self.codeLen - pbEndJ - 1);
+      cg_patchRel8(self.code, pbEndJ, self.codeLen);
       self.cg_zeroRax();
 
     } else if (self.cg_seq(fname, fnlen, "PrintFloat", 10)) {
@@ -13568,14 +13619,14 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);  // inc rsi
       self.cg_e8(0xEB);  // jmp .seloop
       self.cg_e8(seLoop - self.codeLen - 1);
-      poke8(self.code + seNE, self.codeLen - seNE - 1);
+      cg_patchRel8(self.code, seNE, self.codeLen);
       self.cg_e8(0x31); self.cg_e8(0xC0);  // xor eax, eax (return 0)
       self.cg_e8(0xEB);  // jmp .sedone
       var seDone: int64 := self.codeLen;
       self.cg_e8(0);
-      poke8(self.code + seEQ, self.codeLen - seEQ - 1);
+      cg_patchRel8(self.code, seEQ, self.codeLen);
       self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax, 1
-      poke8(self.code + seDone, self.codeLen - seDone - 1);
+      cg_patchRel8(self.code, seDone, self.codeLen);
 
     } else if (self.cg_seq(fname, fnlen, "StrStartsWith", 13)) {
       // StrStartsWith(s,prefix): rdi=s, rsi=prefix
@@ -13593,14 +13644,14 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);  // inc rdi
       self.cg_e8(0xEB);  // jmp .ssloop
       self.cg_e8(ssLoop - self.codeLen - 1);
-      poke8(self.code + ssYes, self.codeLen - ssYes - 1);
+      cg_patchRel8(self.code, ssYes, self.codeLen);
       self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax, 1
       self.cg_e8(0xEB);  // jmp .ssdone
       var ssDone: int64 := self.codeLen;
       self.cg_e8(0);
-      poke8(self.code + ssNo, self.codeLen - ssNo - 1);
+      cg_patchRel8(self.code, ssNo, self.codeLen);
       self.cg_e8(0x31); self.cg_e8(0xC0);  // xor eax, eax
-      poke8(self.code + ssDone, self.codeLen - ssDone - 1);
+      cg_patchRel8(self.code, ssDone, self.codeLen);
 
     } else if (self.cg_seq(fname, fnlen, "StrEndsWith", 11)) {
       // StrEndsWith(s,suffix): rdi=s, rsi=suffix
@@ -13644,19 +13695,19 @@ pub type Codegen = class {
       var sewDone: int64 := self.codeLen;
       self.cg_e8(0);
       // .sewno: cleanup 3 items (len_s, suffix, s), return 0
-      poke8(self.code + sewNo, self.codeLen - sewNo - 1);
+      cg_patchRel8(self.code, sewNo, self.codeLen);
       self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x18);  // add rsp, 24
       self.cg_e8(0x31); self.cg_e8(0xC0);  // xor eax, eax
       self.cg_e8(0xEB);  // jmp .sewdone
       var sewDone2: int64 := self.codeLen;
       self.cg_e8(0);
       // .sewzero: empty suffix → always true; cleanup 4 items, return 1
-      poke8(self.code + sewZero, self.codeLen - sewZero - 1);
+      cg_patchRel8(self.code, sewZero, self.codeLen);
       self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x20);  // add rsp, 32
       self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax, 1
       // .sewdone:
-      poke8(self.code + sewDone, self.codeLen - sewDone - 1);
-      poke8(self.code + sewDone2, self.codeLen - sewDone2 - 1);
+      cg_patchRel8(self.code, sewDone, self.codeLen);
+      cg_patchRel8(self.code, sewDone2, self.codeLen);
 
     } else if (self.cg_seq(fname, fnlen, "StrFindChar", 11)) {
       // StrFindChar(s,c): rdi=s, rsi=c → rax=index or -1
@@ -13674,9 +13725,9 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);  // inc rax
       self.cg_e8(0xEB);  // jmp .sfcloop
       self.cg_e8(sfcLoop - self.codeLen - 1);
-      poke8(self.code + sfcNF, self.codeLen - sfcNF - 1);
+      cg_patchRel8(self.code, sfcNF, self.codeLen);
       self.cg_movRaxImm(-1);
-      poke8(self.code + sfcFound, self.codeLen - sfcFound - 1);
+      cg_patchRel8(self.code, sfcFound, self.codeLen);
 
     } else if (self.cg_seq(fname, fnlen, "StrFind", 7)) {
       // StrFind(haystack: pchar, needle: pchar): int64
@@ -13712,12 +13763,12 @@ pub type Codegen = class {
       self.cg_e8(0xFF); self.cg_e8(0xC0);                                        // inc eax
       self.cg_e8(0xEB); self.cg_e8(sfOuter - self.codeLen - 1);                  // jmp outer_top
       // not_found: rax = -1
-      poke8(self.code + sfNotF, self.codeLen - sfNotF - 1);
+      cg_patchRel8(self.code, sfNotF, self.codeLen);
       self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0);
       self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);    // mov rax, -1
       // found / sf_done: rax holds i or -1
-      poke8(self.code + sfFound, self.codeLen - sfFound - 1);
-      poke8(self.code + sfDone1, self.codeLen - sfDone1 - 1);
+      cg_patchRel8(self.code, sfFound, self.codeLen);
+      cg_patchRel8(self.code, sfDone1, self.codeLen);
       self.cg_e8(0x5B);                                                           // pop rbx
 
     } else if (self.cg_seq(fname, fnlen, "StrConcat", 9)) {
@@ -13808,7 +13859,7 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);  // add rsp, 16
       self.cg_e8(0xEB); var itsDoneZ: int64 := self.codeLen; self.cg_e8(0);  // jmp .itsdone
       // .itsnonzero: push neg_flag=0
-      poke8(self.code + itsNZ, self.codeLen - itsNZ - 1);
+      cg_patchRel8(self.code, itsNZ, self.codeLen);
       self.cg_e8(0x6A); self.cg_e8(0x00);  // push 0 (neg flag)
       // [rsp]=neg [rsp+8]=buf [rsp+16]=n
       // if n<0: neg rax; set [rsp]=1
@@ -13818,7 +13869,7 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0x04); self.cg_e8(0x24);
       self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov [rsp], 1
       // .itspos: push rbx; mov rbx, 10
-      poke8(self.code + itsPos, self.codeLen - itsPos - 1);
+      cg_patchRel8(self.code, itsPos, self.codeLen);
       self.cg_e8(0x53);  // push rbx
       // [rsp]=rbx [rsp+8]=neg [rsp+16]=buf [rsp+24]=n
       self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC3); self.cg_e8(0x0A); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov rbx, 10
@@ -13833,19 +13884,19 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCE);  // dec rsi
       self.cg_e8(0xEB); self.cg_e8(itsDigLoop - self.codeLen - 1);  // jmp .itsdigloop
       // .itssign:
-      poke8(self.code + itsSign, self.codeLen - itsSign - 1);
+      cg_patchRel8(self.code, itsSign, self.codeLen);
       self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x08); self.cg_e8(0x00);  // cmp [rsp+8], 0
       self.cg_e8(0x74); var itsNoNeg: int64 := self.codeLen; self.cg_e8(0);  // jz .itsnoneg
       self.cg_e8(0xC6); self.cg_e8(0x06); self.cg_e8(0x2D);  // mov byte [rsi], '-'
       self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xCE);  // dec rsi
-      poke8(self.code + itsNoNeg, self.codeLen - itsNoNeg - 1);
+      cg_patchRel8(self.code, itsNoNeg, self.codeLen);
       // rax = rsi+1 (first written digit)
       self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x46); self.cg_e8(0x01);  // lea rax, [rsi+1]
       // restore rbx; add rsp, 32
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x1C); self.cg_e8(0x24);  // mov rbx, [rsp]
       self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x20);  // add rsp, 32
       // .itsdone:
-      poke8(self.code + itsDoneZ, self.codeLen - itsDoneZ - 1);
+      cg_patchRel8(self.code, itsDoneZ, self.codeLen);
 
     } else if (self.cg_seq(fname, fnlen, "FileSize", 8)) {
       // FileSize(path): rdi=path → rax=size or -1
@@ -13873,9 +13924,9 @@ pub type Codegen = class {
       self.cg_e8(0x58);  // pop rax (size)
       self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);  // add rsp, 16
       self.cg_e8(0xEB); var fsDone: int64 := self.codeLen; self.cg_e8(0);  // jmp .fsdone
-      poke8(self.code + fsErr, self.codeLen - fsErr - 1);
+      cg_patchRel8(self.code, fsErr, self.codeLen);
       self.cg_movRaxImm(-1);
-      poke8(self.code + fsDone, self.codeLen - fsDone - 1);
+      cg_patchRel8(self.code, fsDone, self.codeLen);
 
     } else if (self.cg_seq(fname, fnlen, "FileReadAll", 11)) {
       // FileReadAll(path): rdi=path → rax=null-terminated buffer or null
@@ -13890,7 +13941,7 @@ pub type Codegen = class {
       self.cg_zeroRax();                    // error: return null
       // near jmp .fraDone (E9 + 4-byte disp) — success path is >127 bytes
       self.cg_e8(0xE9); var fraDone: int64 := self.codeLen; poke32(self.code + fraDone, 0); self.codeLen := self.codeLen + 4;
-      poke8(self.code + fraOk, self.codeLen - fraOk - 1);
+      cg_patchRel8(self.code, fraOk, self.codeLen);
       self.cg_e8(0x50);  // .fraOk: push rax (fd)
       // lseek(fd, 0, SEEK_END=2) → size
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x3C); self.cg_e8(0x24);  // mov rdi, [rsp] = fd
@@ -15260,9 +15311,9 @@ pub type Codegen = class {
             self.cg_e8(0xEB);
             var wJmp: int64 := self.codeLen; self.cg_e8(0);
             var wZeiger: int64 := self.codeLen;
-            poke8(self.code + wJz, wZeiger - wKopie);
+            cg_patchRel8Wert(self.code, wJz, wZeiger - wKopie);
             self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD8);  // mov [rax+rbx*8], rsi
-            poke8(self.code + wJmp, self.codeLen - wZeiger);
+            cg_patchRel8Wert(self.code, wJmp, self.codeLen - wZeiger);
             return;
           }
           self.cg_emitScaledStore(wrInlW);
@@ -15395,9 +15446,9 @@ pub type Codegen = class {
           self.cg_e8(0xEB);
           var jmpPos: int64 := self.codeLen; self.cg_e8(0);
           var zeigerStart: int64 := self.codeLen;
-          poke8(self.code + jzPos, zeigerStart - kopieStart);
+          cg_patchRel8Wert(self.code, jzPos, zeigerStart - kopieStart);
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x34); self.cg_e8(0xD9);   // mov [rcx+rbx*8], rsi
-          poke8(self.code + jmpPos, self.codeLen - zeigerStart);
+          cg_patchRel8Wert(self.code, jmpPos, self.codeLen - zeigerStart);
         } else if (lhsIsArray == 1) {
           // array<T> local: skip 16-byte header
           // lea rcx, [rax+16]
@@ -15800,7 +15851,7 @@ pub type Codegen = class {
         self.cg_e8(0xBF); self.cg_e8(1);   self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);  // mov edi, 1 (exit code)
         self.cg_movRaxImm(231);                                                             // #1487: exit_group
         self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
-        poke8(self.code + pSkip, self.codeLen - pSkip - 1);  // patch jnz offset
+        cg_patchRel8(self.code, pSkip, self.codeLen);  // patch jnz offset
       }
 
     // WP-BC-10: panic(msg) — evaluate msg → rdi, emit inline panic body
@@ -17456,7 +17507,7 @@ pub type Codegen = class {
         var bpDefG: int64 := self.codeLen;
         self.cg_e32(self.curBreakHead);
         self.curBreakHead := bpDefG;
-        poke8(self.code + defSkip, self.codeLen - defSkip - 1);
+        cg_patchRel8(self.code, defSkip, self.codeLen);
       } else {
         self.cg_genMatchBody(bodyNode);
         self.cg_e8(0xE9);
@@ -17904,7 +17955,7 @@ pub type Codegen = class {
     poke32(self.code + pFertig, self.codeLen - pFertig - 4);
     self.cg_e8(0xC3);                                              // ret
 
-    poke8(self.code + pKeineMehrheit, (self.codeLen - pKeineMehrheit - 1) & 255);
+    cg_patchRel8(self.code, pKeineMehrheit, self.codeLen);
     self.cg_scrubEmitAbbruch(mMajOff, mMajLen, 136);
     poke32(self.code + pBeschaedigt, self.codeLen - pBeschaedigt - 4);
     self.cg_scrubEmitAbbruch(mBadOff, mBadLen, 135);
@@ -18124,7 +18175,7 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
     self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC7); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
     self.cg_e8(0x0F); self.cg_e8(0x05);
-    poke8(self.code + pJz, (self.codeLen - afterJz) & 255);
+    cg_patchRel8(self.code, pJz, self.codeLen);
 
     // write(2, m2, m2len)
     self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
@@ -21296,7 +21347,7 @@ pub type Codegen = class {
     self.cg_e8((loopPos - (self.codeLen + 1)) & 0xFF);
 
     // .exit — patch jle
-    poke8(self.code + jlePos, (self.codeLen - jlePos - 1) & 255);
+    cg_patchRel8(self.code, jlePos, self.codeLen);
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x08);  // add rsp, 8
     self.cg_e8(0x5B);                    // pop rbx
     self.cg_e8(0x41); self.cg_e8(0x5E);  // pop r14

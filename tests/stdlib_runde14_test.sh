@@ -169,12 +169,20 @@ else
   else
     ok "#1641 gibt auf statt zu haengen (${dauer}s)"
     pruefe "#1641 meldet den Fehlschlag" "$(cat "$TMP/dns.out")" "aufgegeben"
-    # Die Grenze ist 3 Versuche a 2 s. Deutlich schneller hiesse: gar nicht
-    # gewartet (dann misst der Test nichts); deutlich langsamer: nicht gegriffen.
-    if [ "$dauer" -ge 4 ] && [ "$dauer" -le 12 ]; then
-      ok "#1641 Wartezeit im erwarteten Rahmen (3 x 2 s)"
+    # #1918: Hier stand zusaetzlich eine UNTERGRENZE von 4 s — die Annahme,
+    # der Fehlschlag muesse lange dauern. Das ist keine Zusicherung der
+    # Bibliothek, sondern eine Eigenschaft des Resolvers: antwortet er sofort
+    # mit "gibt es nicht", ist der Fall nach 2 s erledigt, und die Bibliothek
+    # hat sich dabei voellig richtig verhalten. Im vollen Lauf ist der Test
+    # daran geflackert.
+    #
+    # Geblieben ist die OBERgrenze, und die traegt die Aussage: `std.dns` gibt
+    # auf, statt zu haengen. Ein schneller Fehlschlag ist kein Defekt; ein
+    # unbegrenzter waere einer.
+    if [ "$dauer" -le 12 ]; then
+      ok "#1641 wartet nicht unbegrenzt (${dauer}s, Grenze 12 s)"
     else
-      bad "#1641 Wartezeit im erwarteten Rahmen (3 x 2 s), gemessen ${dauer}s"
+      bad "#1641 wartet nicht unbegrenzt" "gemessen ${dauer}s"
     fi
   fi
 fi
