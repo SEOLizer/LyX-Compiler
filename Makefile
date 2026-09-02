@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.16A
-VERSION_DATE := 2026-09-01
+VERSION   := 1.1.17A
+VERSION_DATE := 2026-09-02
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -378,6 +378,8 @@ test: lyxc
 	@bash tests/ntfs_test.sh
 	@echo "--- std.fs.part: MBR und GPT (47 Pruefungen, Kette bis ins Dateisystem) ---"
 	@bash tests/part_test.sh
+	@echo "--- Kurzsprung darf nicht still ueberlaufen (#1915) ---"
+	@bash tests/kurzsprung_test.sh
 	@bash tests/while_limit_test.sh
 	@bash tests/grammar_gaps_test.sh
 	@echo "OK"
