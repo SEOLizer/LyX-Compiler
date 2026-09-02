@@ -63,6 +63,10 @@ is_exempt() {
                                           # Pruefdaten, kein Test.
     data/runde17/ctrl.lyx)   return 0 ;;  # #1670: importierte Klassen als
                                           # Pruefdaten, kein Test.
+    ntfs_test.lyx)           return 0 ;;  # std.fs.ntfs: braucht Abbild UND
+                                          # Namensliste als Argumente, beide
+                                          # von tests/ntfs_test.sh erzeugt
+                                          # (mkntfs/ntfscp/ntfsls).
     ext4_test.lyx)           return 0 ;;  # std.fs.ext4: wie fat_test.lyx —
                                           # braucht ein Abbild als Argument,
                                           # das tests/ext4_test.sh mit
