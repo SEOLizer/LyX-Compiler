@@ -23,7 +23,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-PASS=0; FAIL=0
+PASS=0; FAIL=0; DIAG=0
 ok() { echo "PASS $1"; PASS=$((PASS+1)); }
 no() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
 
@@ -45,6 +45,30 @@ for n in 0 8 14 15 16 17 24 40; do
   got="$( ulimit -v 262144; timeout 20 "$TMP/k" 2>/dev/null )"; rc=$?
   if [ "$rc" -ne 0 ]; then
     no "$n Locals davor: push waechst korrekt" "rc=$rc (139 = Speicherzugriffsfehler)"
+    # #1915-Nachtrag: auf dem CI-Runner scheitert dies ab 14 Locals, hier erst
+    # gar nicht. Compiler und Erzeugnis sind byte-gleich — also ist entweder
+    # der Deckel zu knapp oder es liegt ein zweiter Defekt vor. Die Diagnose
+    # steht hier, damit ein einziger Lauf die Frage beantwortet, statt sie
+    # ueber mehrere Runden zu erraten.
+    if [ "$DIAG" -eq 0 ]; then
+      DIAG=1
+      echo "  ---- Diagnose (einmalig) ----"
+      echo "  ulimit -v: $(ulimit -v)   ulimit -s: $(ulimit -s)   ulimit -m: $(ulimit -m)"
+      echo "  Erzeugnis: $(stat -c%s "$TMP/k") Byte, sha256 $(sha256sum "$TMP/k" | cut -c1-16)"
+      echo "  lyxc:      $(sha256sum "$LYXC" | cut -c1-16)   $("$LYXC" --version 2>/dev/null | head -1)"
+      python3 - "$TMP/k" <<'PYEOF'
+import sys
+d=open(sys.argv[1],'rb').read()
+print("  Sprungart nach cmp rdx,rax: kurz=%d lang=%d"
+      % (d.count(bytes([0x48,0x39,0xC2,0x7C])), d.count(bytes([0x48,0x39,0xC2,0x0F,0x8C]))))
+PYEOF
+      ( ulimit -v 1048576; timeout 20 "$TMP/k" >/dev/null 2>&1 )
+      echo "  mit 1-GB-Deckel: rc=$?"
+      ( ulimit -v 4194304; timeout 20 "$TMP/k" >/dev/null 2>&1 )
+      echo "  mit 4-GB-Deckel: rc=$?"
+      echo "  overcommit_memory: $(cat /proc/sys/vm/overcommit_memory 2>/dev/null)"
+      echo "  ----------------------------"
+    fi
   elif [ "$got" != "1030" ]; then
     no "$n Locals davor: push waechst korrekt" "Laenge $got statt 1030"
   else
