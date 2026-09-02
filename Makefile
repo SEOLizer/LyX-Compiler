@@ -370,6 +370,8 @@ test: lyxc
 	@bash tests/runde_f_test.sh
 	@echo "--- std.fs.fat: FAT12/16/32 lesen (94 Pruefungen gegen mkfs.vfat-Abbilder) ---"
 	@bash tests/fat_test.sh
+	@echo "--- std.fs.exfat: exFAT lesen (42 Pruefungen, Vorlage von fsck.exfat bestaetigt) ---"
+	@bash tests/exfat_test.sh
 	@bash tests/while_limit_test.sh
 	@bash tests/grammar_gaps_test.sh
 	@echo "OK"

@@ -63,6 +63,14 @@ is_exempt() {
                                           # Pruefdaten, kein Test.
     data/runde17/ctrl.lyx)   return 0 ;;  # #1670: importierte Klassen als
                                           # Pruefdaten, kein Test.
+    exfat_test.lyx)          return 0 ;;  # std.fs.exfat: wie fat_test.lyx —
+                                          # braucht ein Abbild als Argument,
+                                          # das tests/exfat_test.sh erst mit
+                                          # mkfs.exfat anlegt, befuellt und von
+                                          # fsck.exfat pruefen laesst.
+    lib/exfat_fuellen.py)    return 0 ;;  # Befuellskript fuer exfat_test.sh,
+                                          # kein Test — es gibt fuer exFAT kein
+                                          # mtools-Gegenstueck.
     fat_test.lyx)            return 0 ;;  # std.fs.fat: braucht ein Abbild-
                                           # verzeichnis als Argument und wird
                                           # deshalb von tests/fat_test.sh
