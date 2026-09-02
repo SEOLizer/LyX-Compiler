@@ -1,0 +1,255 @@
+// tests/ext4_test.lyx — std.fs.ext4 gegen ein von e2fsck bestaetigtes Abbild
+//
+// Das Abbild erzeugt `mkfs.ext4`, befuellt wird es mit `debugfs` — beides aus
+// e2fsprogs, beides ohne Wurzelrechte. Anders als bei exFAT gibt es hier
+// also einen fremden SCHREIBER; zusaetzlich urteilt `e2fsck` ueber das
+// fertige Abbild, bevor dieser Test es liest.
+//
+// Drei Faelle tragen die Batterie, und alle drei gibt es bei FAT und exFAT
+// nicht:
+//
+//   1. Der EXTENT-BAUM mit Tiefe > 0. Der Runner erzwingt ihn, indem er das
+//      Abbild zuerst mit Fuellern belegt und jeden zweiten wieder loescht;
+//      die grosse Datei zerfaellt dadurch in mehrere Extents, deren Wurzel
+//      nicht mehr in den Inode passt und in einen eigenen Block wandert.
+//      Wer nur Tiefe 0 kann, liest hier Muell — und zwar erst ab dem
+//      zweiten Extent, also nicht am Anfang der Datei.
+//   2. Die INODE-Ebene. Der Verzeichniseintrag traegt nur Name und Nummer;
+//      Groesse, Art und Bloecke stehen im Inode. Ein Leser, der die Nummer
+//      falsch in Gruppe und Index zerlegt, findet trotzdem einen Inode —
+//      nur den falschen, und der sieht gueltig aus.
+//   3. KURZE SYMLINKS stehen direkt in i_block, nicht in einem Block. Wer
+//      immer ueber die Bloecke geht, liest dort eine Blocknummer als Text.
+
+unit main;
+
+import std.io;
+import std.env;
+import std.alloc;
+import std.string;
+import std.fs.ext4;
+
+var _fails: int64 := 0;
+var _checks: int64 := 0;
+
+fn Check(name: pchar, got: int64, want: int64): void {
+  _checks := _checks + 1;
+  if (got == want) { PrintStr("PASS "c); PrintStrLn(name); }
+  else {
+    PrintStr("FAIL "c); PrintStr(name);
+    PrintStr(": erhalten "c); PrintInt(got);
+    PrintStr(" erwartet "c); PrintInt(want); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+}
+
+fn CheckWahr(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: wahr)"c); _fails := _fails + 1; }
+}
+
+fn CheckFalsch(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (!got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: falsch)"c); _fails := _fails + 1; }
+}
+
+fn NameGleich(buf: int64, s: pchar): bool {
+  var i: int64 := 0;
+  while (i < 300) {
+    var a: int64 := peek8(buf + i) & 255;
+    var b: int64 := StrCharAt(s, i) & 255;
+    if (a != b) { return false; }
+    if (a == 0) { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+fn main(): int64 {
+  if (GetArgC() < 2) {
+    PrintStrLn("FAIL: Abbildpfad fehlt (Aufruf: ext4_test <abbild>)"c);
+    return 1;
+  }
+  var pfad: pchar := ArgvGet(GetArgV(), 1);
+
+  var fd: int64 := open(pfad, 0, 0);
+  _checks := _checks + 1;
+  if (fd < 0) { PrintStrLn("FAIL: Abbild nicht zu oeffnen"c); return 1; }
+  PrintStrLn("PASS Abbild geoeffnet"c);
+
+  var vol: Ext4Volume := Ext4Mount(fd, 0);
+  CheckWahr("Volume ist gueltig"c, Ext4Valid(vol));
+  Check("Blockgroesse"c, vol.blockSize, 1024);
+  // Bei 1024-Byte-Bloecken ist der Superblock Block 1 — deshalb faengt der
+  // Datenbereich dort bei 1 an und nicht bei 0.
+  Check("erster Datenblock"c, vol.firstDataBlock, 1);
+  CheckWahr("Inodegroesse ist mindestens 128"c, vol.inodeSize >= 128);
+  // Mit der Eigenschaft 64bit sind die Gruppendeskriptoren groesser als 32
+  // Byte. Wer das uebersieht, liest jeden zweiten Deskriptor versetzt.
+  CheckWahr("Deskriptorgroesse passt zur 64bit-Eigenschaft"c,
+            ((vol.featIncompat & 0x80) == 0 && vol.descSize == 32)
+            || ((vol.featIncompat & 0x80) != 0 && vol.descSize >= 64));
+
+  var lbuf: int64 := alloc(64);
+  Check("Kennung hat sieben Zeichen"c, Ext4VolumeLabel(vol, lbuf, 64), 7);
+  CheckWahr("Kennung lautet PRUEFE4"c, NameGleich(lbuf, "PRUEFE4"c));
+  free(lbuf, 64);
+
+  // ── Wurzelverzeichnis ────────────────────────────────────────────────
+  var root: Ext4Inode;
+  Check("Wurzel-Inode gelesen"c, Ext4ReadInode(vol, EXT4_ROOT_INO, root), 1);
+  CheckWahr("Wurzel ist ein Verzeichnis"c, root.isDir);
+  CheckWahr("Wurzel hat mehrere Verweise"c, root.links >= 2);
+
+  var d: Ext4Dir := Ext4DirOpen(vol, root);
+  var e: Ext4Entry;
+  var nb: int64 := alloc(320);
+  var zHallo: int64 := 0; var zGross: int64 := 0; var zOrdner: int64 := 0;
+  var zLang: int64 := 0; var zLink: int64 := 0; var zPunkt: int64 := 0;
+  var zAll: int64 := 0;
+  var laufend: bool := true;
+  while (laufend) {
+    var r: int64 := Ext4DirNext(vol, d, e, nb, 320);
+    if (r != 1) { laufend := false; }
+    else {
+      zAll := zAll + 1;
+      if (NameGleich(nb, "HALLO.TXT"c)) { zHallo := zHallo + 1; }
+      if (NameGleich(nb, "GROSS.BIN"c)) { zGross := zGross + 1; }
+      if (NameGleich(nb, "ORDNER"c)) { zOrdner := zOrdner + 1; CheckWahr("ORDNER ist ein Verzeichnis"c, e.isDir); }
+      if (NameGleich(nb, "Ein-sehr-langer-Dateiname-mit-vielen-Zeichen-zum-Pruefen.txt"c)) { zLang := zLang + 1; }
+      if (NameGleich(nb, "ZIEL.LNK"c)) { zLink := zLink + 1; }
+      if (NameGleich(nb, "."c) || NameGleich(nb, ".."c)) { zPunkt := zPunkt + 1; }
+    }
+  }
+  Ext4DirClose(vol, d);
+
+  Check("HALLO.TXT im Wurzelverzeichnis"c, zHallo, 1);
+  Check("GROSS.BIN im Wurzelverzeichnis"c, zGross, 1);
+  Check("ORDNER im Wurzelverzeichnis"c, zOrdner, 1);
+  Check("langer Name vollstaendig"c, zLang, 1);
+  Check("ZIEL.LNK im Wurzelverzeichnis"c, zLink, 1);
+  // `.` und `..` sind die Verankerung des Verzeichnisses, nicht sein Inhalt.
+  // Wer sie mitliefert, laeuft bei jedem rekursiven Durchlauf im Kreis.
+  Check("weder . noch .. im Durchlauf"c, zPunkt, 0);
+  CheckWahr("der Durchlauf endet"c, zAll < 1000);
+
+  // ── Kleine Datei ─────────────────────────────────────────────────────
+  var hIno: int64 := Ext4FindInDir(vol, root, "HALLO.TXT"c);
+  CheckWahr("HALLO.TXT gefunden"c, hIno > 0);
+  var h: Ext4Inode;
+  Check("HALLO.TXT-Inode gelesen"c, Ext4ReadInode(vol, hIno, h), 1);
+  CheckWahr("HALLO.TXT ist eine Datei"c, h.isFile);
+  Check("HALLO.TXT Groesse"c, h.size, 11);
+  var buf: int64 := alloc(64);
+  Check("HALLO.TXT gelesen"c, Ext4ReadFile(vol, h, buf, 64), 11);
+  poke8(buf + 11, 0);
+  CheckWahr("HALLO.TXT Inhalt"c, NameGleich(buf, "Hallo ext4\n"c));
+  free(buf, 64);
+  Ext4InodeFree(h);
+
+  // Gross und klein werden UNTERSCHIEDEN — anders als bei FAT.
+  Check("hallo.txt in Kleinschreibung gibt es nicht"c,
+        Ext4FindInDir(vol, root, "hallo.txt"c), 0);
+
+  // ── Grosse Datei ueber einen Extent-Baum mit Tiefe > 0 ───────────────
+  var gIno: int64 := Ext4FindInDir(vol, root, "GROSS.BIN"c);
+  CheckWahr("GROSS.BIN gefunden"c, gIno > 0);
+  var g: Ext4Inode;
+  Check("GROSS.BIN-Inode gelesen"c, Ext4ReadInode(vol, gIno, g), 1);
+  Check("GROSS.BIN Groesse"c, g.size, 200000);
+  CheckWahr("GROSS.BIN benutzt Extents"c, (g.flags & EXT4_FL_EXTENTS) != 0);
+
+  var gb: int64 := alloc(200000);
+  Check("GROSS.BIN vollstaendig gelesen"c, Ext4ReadFile(vol, g, gb, 200000), 200000);
+  var falsch: int64 := 0;
+  var ersterFehler: int64 := 0 - 1;
+  var i2: int64 := 0;
+  while (i2 < 200000) {
+    if ((peek8(gb + i2) & 255) != ((i2 * 7 + 3) & 255)) {
+      falsch := falsch + 1;
+      if (ersterFehler < 0) { ersterFehler := i2; }
+    }
+    i2 := i2 + 1;
+  }
+  _checks := _checks + 1;
+  if (falsch == 0) { PrintStrLn("PASS GROSS.BIN Inhalt Byte fuer Byte"c); }
+  else {
+    PrintStr("FAIL GROSS.BIN Inhalt: "c); PrintInt(falsch);
+    PrintStr(" Abweichungen, erste bei "c); PrintInt(ersterFehler); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+  free(gb, 200000);
+
+  // Der erste und der letzte logische Block muessen an VERSCHIEDENEN Stellen
+  // liegen und beide bestimmbar sein — bei einer fragmentierten Datei ist das
+  // die Probe darauf, dass der Baum wirklich durchlaufen wurde.
+  var b0: int64 := Ext4BlockOf(vol, g, 0);
+  var bN: int64 := Ext4BlockOf(vol, g, 195);
+  CheckWahr("erster Block bestimmbar"c, b0 > 0);
+  CheckWahr("letzter Block bestimmbar"c, bN > 0);
+  CheckWahr("erster und letzter Block sind verschieden"c, b0 != bN);
+  Ext4InodeFree(g);
+
+  // ── Symbolische Verknuepfung ─────────────────────────────────────────
+  var lIno: int64 := Ext4FindInDir(vol, root, "ZIEL.LNK"c);
+  CheckWahr("ZIEL.LNK gefunden"c, lIno > 0);
+  var l: Ext4Inode;
+  Check("ZIEL.LNK-Inode gelesen"c, Ext4ReadInode(vol, lIno, l), 1);
+  CheckWahr("ZIEL.LNK ist eine Verknuepfung"c, l.isLink);
+  CheckFalsch("und keine gewoehnliche Datei"c, l.isFile);
+  var lb: int64 := alloc(128);
+  // Kurze Ziele stehen DIREKT in i_block. Wer ueber die Bloecke geht, liest
+  // hier eine Blocknummer als Text.
+  Check("Ziel gelesen"c, Ext4ReadLink(vol, l, lb, 128), 9);
+  CheckWahr("Ziel lautet HALLO.TXT"c, NameGleich(lb, "HALLO.TXT"c));
+  free(lb, 128);
+  Ext4InodeFree(l);
+
+  // ── Pfade ueber zwei Ebenen ──────────────────────────────────────────
+  var uIno: int64 := Ext4FindPath(vol, "/ORDNER/TIEF/UNTEN.TXT"c);
+  CheckWahr("ORDNER/TIEF/UNTEN.TXT gefunden"c, uIno > 0);
+  var u: Ext4Inode;
+  Check("UNTEN.TXT-Inode gelesen"c, Ext4ReadInode(vol, uIno, u), 1);
+  var ub: int64 := alloc(64);
+  Check("UNTEN.TXT gelesen"c, Ext4ReadFile(vol, u, ub, 64), 11);
+  free(ub, 64);
+  Ext4InodeFree(u);
+  Check("derselbe Pfad mit doppelten Schraegstrichen"c,
+        Ext4FindPath(vol, "//ORDNER//TIEF//UNTEN.TXT"c), uIno);
+  Check("ohne fuehrenden Schraegstrich"c,
+        Ext4FindPath(vol, "ORDNER/TIEF/UNTEN.TXT"c), uIno);
+
+  // ── Was es nicht gibt ────────────────────────────────────────────────
+  Check("fehlende Datei"c, Ext4FindInDir(vol, root, "GIBTESNICHT.XYZ"c), 0);
+  Check("fehlender Pfad"c, Ext4FindPath(vol, "/ORDNER/TIEF/NICHTDA.TXT"c), 0);
+  Check("Inode 0 gibt es nicht"c, Ext4ReadInode(vol, 0, u), EXT4_ERR);
+  Check("Inode hinter dem Ende"c, Ext4ReadInode(vol, vol.inodeCount + 5, u), EXT4_ERR);
+  // Ein Verzeichnis ist keine Datei.
+  var ordIno: int64 := Ext4FindInDir(vol, root, "ORDNER"c);
+  var ord: Ext4Inode;
+  Check("ORDNER-Inode gelesen"c, Ext4ReadInode(vol, ordIno, ord), 1);
+  var ob: int64 := alloc(64);
+  Check("Verzeichnis lesen wird abgewiesen"c, Ext4ReadFile(vol, ord, ob, 64), EXT4_ERR);
+  free(ob, 64);
+  Ext4InodeFree(ord);
+
+  Ext4InodeFree(root);
+  free(nb, 320);
+  close(fd);
+
+  // Gegenprobe: ein ELF ist kein ext4.
+  var selbst: int64 := open("/proc/self/exe"c, 0, 0);
+  if (selbst >= 0) {
+    var v2: Ext4Volume := Ext4Mount(selbst, 0);
+    CheckFalsch("ein ELF ist kein ext4-Volume"c, Ext4Valid(v2));
+    close(selbst);
+  }
+
+  PrintStr("\n"c);
+  PrintInt(_checks); PrintStr(" Pruefungen, "c);
+  PrintInt(_fails); PrintStrLn(" FAIL"c);
+  if (_fails == 0) { PrintStrLn("OK: std.fs.ext4"c); return 0; }
+  return 1;
+}

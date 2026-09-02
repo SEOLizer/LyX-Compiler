@@ -372,6 +372,8 @@ test: lyxc
 	@bash tests/fat_test.sh
 	@echo "--- std.fs.exfat: exFAT lesen (42 Pruefungen, Vorlage von fsck.exfat bestaetigt) ---"
 	@bash tests/exfat_test.sh
+	@echo "--- std.fs.ext4: ext2/3/4 lesen (53 Pruefungen, Vorlage von e2fsck bestaetigt) ---"
+	@bash tests/ext4_test.sh
 	@bash tests/while_limit_test.sh
 	@bash tests/grammar_gaps_test.sh
 	@echo "OK"

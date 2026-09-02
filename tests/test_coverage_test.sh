@@ -63,6 +63,12 @@ is_exempt() {
                                           # Pruefdaten, kein Test.
     data/runde17/ctrl.lyx)   return 0 ;;  # #1670: importierte Klassen als
                                           # Pruefdaten, kein Test.
+    ext4_test.lyx)           return 0 ;;  # std.fs.ext4: wie fat_test.lyx —
+                                          # braucht ein Abbild als Argument,
+                                          # das tests/ext4_test.sh mit
+                                          # mkfs.ext4 anlegt, mit debugfs
+                                          # befuellt und von e2fsck pruefen
+                                          # laesst.
     exfat_test.lyx)          return 0 ;;  # std.fs.exfat: wie fat_test.lyx —
                                           # braucht ein Abbild als Argument,
                                           # das tests/exfat_test.sh erst mit
