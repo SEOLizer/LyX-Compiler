@@ -376,6 +376,8 @@ test: lyxc
 	@bash tests/ext4_test.sh
 	@echo "--- std.fs.ntfs: NTFS lesen (33 Pruefungen, gegen ntfsls abgeglichen) ---"
 	@bash tests/ntfs_test.sh
+	@echo "--- std.fs.part: MBR und GPT (47 Pruefungen, Kette bis ins Dateisystem) ---"
+	@bash tests/part_test.sh
 	@bash tests/while_limit_test.sh
 	@bash tests/grammar_gaps_test.sh
 	@echo "OK"

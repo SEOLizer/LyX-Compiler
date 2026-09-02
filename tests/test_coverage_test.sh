@@ -63,6 +63,11 @@ is_exempt() {
                                           # Pruefdaten, kein Test.
     data/runde17/ctrl.lyx)   return 0 ;;  # #1670: importierte Klassen als
                                           # Pruefdaten, kein Test.
+    part_test.lyx)           return 0 ;;  # std.fs.part: braucht zwei Abbilder
+                                          # (GPT und MBR) als Argumente, die
+                                          # tests/part_test.sh mit sgdisk und
+                                          # sfdisk anlegt und mit echten
+                                          # Dateisystemen bestueckt.
     ntfs_test.lyx)           return 0 ;;  # std.fs.ntfs: braucht Abbild UND
                                           # Namensliste als Argumente, beide
                                           # von tests/ntfs_test.sh erzeugt
