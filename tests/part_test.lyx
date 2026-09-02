@@ -1,0 +1,225 @@
+// tests/part_test.lyx — std.fs.part, und der Nachweis, wozu es die Unit gibt
+//
+// Die Vorlagen legen `sgdisk` und `sfdisk` an, die Dateisysteme darin
+// `mkfs.vfat`, `mkfs.ext4` und `mkfs.exfat` — alles fremde Werkzeuge. Der
+// Runner haelt zusaetzlich die Ausgabe von `partx` daneben.
+//
+// DER EIGENTLICHE NACHWEIS ist aber keiner ueber Zahlen: die drei
+// Dateisystem-Units werden mit dem Versatz aufgerufen, den diese Unit
+// ausrechnet, und muessen ihre Dateien finden. Stimmt der Versatz um einen
+// Sektor nicht, findet FatMount keine Kennung und Ext4Mount keinen
+// Superblock — die Kette prueft sich damit selbst.
+//
+// Zwei Faelle tragen den Test darueber hinaus:
+//
+//   1. Der SCHUTZ-MBR. Eine GPT-Platte traegt bei Sektor 0 einen MBR mit
+//      EINEM Eintrag ueber die ganze Platte (Typ 0xEE). Wer zuerst den MBR
+//      liest, sieht genau diesen — und haelt eine Platte mit drei
+//      Partitionen fuer eine einzige riesige. Der Test verlangt deshalb
+//      ausdruecklich das GPT-Schema und drei Eintraege.
+//   2. Die EBR-KETTE. In einem EBR ist der Versatz des ERSTEN Eintrags
+//      relativ zu diesem EBR, der des ZWEITEN aber relativ zum Anfang der
+//      erweiterten Partition. Wer beide gleich behandelt, findet die zweite
+//      logische Partition an der falschen Stelle. Deshalb liegen zwei
+//      logische Partitionen im Abbild, nicht eine.
+
+unit main;
+
+import std.io;
+import std.env;
+import std.alloc;
+import std.string;
+import std.fs.part;
+import std.fs.fat;
+import std.fs.ext4;
+import std.fs.exfat;
+
+var _fails: int64 := 0;
+var _checks: int64 := 0;
+
+fn Check(name: pchar, got: int64, want: int64): void {
+  _checks := _checks + 1;
+  if (got == want) { PrintStr("PASS "c); PrintStrLn(name); }
+  else {
+    PrintStr("FAIL "c); PrintStr(name);
+    PrintStr(": erhalten "c); PrintInt(got);
+    PrintStr(" erwartet "c); PrintInt(want); PrintLn(""c);
+    _fails := _fails + 1;
+  }
+}
+
+fn CheckWahr(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: wahr)"c); _fails := _fails + 1; }
+}
+
+fn CheckFalsch(name: pchar, got: bool): void {
+  _checks := _checks + 1;
+  if (!got) { PrintStr("PASS "c); PrintStrLn(name); }
+  else { PrintStr("FAIL "c); PrintStr(name); PrintStrLn(" (erwartet: falsch)"c); _fails := _fails + 1; }
+}
+
+fn NameGleich(buf: int64, s: pchar): bool {
+  var i: int64 := 0;
+  while (i < 300) {
+    var a: int64 := peek8(buf + i) & 255;
+    var b: int64 := StrCharAt(s, i) & 255;
+    if (a != b) { return false; }
+    if (a == 0) { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+fn main(): int64 {
+  if (GetArgC() < 3) {
+    PrintStrLn("FAIL: Aufruf: part_test <gpt.img> <mbr.img>"c);
+    return 1;
+  }
+  var gptPfad: pchar := ArgvGet(GetArgV(), 1);
+  var mbrPfad: pchar := ArgvGet(GetArgV(), 2);
+
+  // ═══ GPT ═══════════════════════════════════════════════════════════
+  PrintStrLn("--- GPT"c);
+  var fd: int64 := open(gptPfad, 0, 0);
+  _checks := _checks + 1;
+  if (fd < 0) { PrintStrLn("FAIL: GPT-Abbild nicht zu oeffnen"c); return 1; }
+  PrintStrLn("PASS GPT-Abbild geoeffnet"c);
+
+  var t: PartTable := PartScan(fd, 512);
+  CheckWahr("Tabelle ist gueltig"c, PartValid(t));
+  // Der Schutz-MBR darf NICHT gewinnen.
+  Check("Schema ist GPT, nicht MBR"c, PartSchema(t), PART_SCHEMA_GPT);
+  Check("drei Partitionen, nicht die eine des Schutz-MBR"c, PartCount(t), 3);
+  // Beide Pruefsummen werden gerechnet, nicht geglaubt.
+  CheckWahr("Kopf-CRC32 stimmt"c, t.kopfCrcOk);
+  CheckWahr("Eintragsfeld-CRC32 stimmt"c, t.feldCrcOk);
+
+  var e0: PartEntry;
+  var e1: PartEntry;
+  var e2: PartEntry;
+  Check("Eintrag 0 gelesen"c, PartGet(t, 0, e0), 1);
+  Check("Eintrag 1 gelesen"c, PartGet(t, 1, e1), 1);
+  Check("Eintrag 2 gelesen"c, PartGet(t, 2, e2), 1);
+  Check("Teil 1 beginnt bei Sektor 2048"c, e0.startLba, 2048);
+  Check("Teil 2 beginnt bei Sektor 34816"c, e1.startLba, 34816);
+  Check("Teil 3 beginnt bei Sektor 83968"c, e2.startLba, 83968);
+  CheckWahr("alle drei sind GPT-Eintraege"c, e0.istGpt && e1.istGpt && e2.istGpt);
+  CheckFalsch("keiner ist logisch"c, e0.istLogisch || e1.istLogisch || e2.istLogisch);
+
+  // Der Versatz in BYTE ist das, wofuer es die Unit gibt.
+  Check("Byte-Versatz von Teil 1"c, PartByteOffset(t, 0), 2048 * 512);
+  Check("Byte-Groesse von Teil 1"c, PartByteSize(t, 0), 32768 * 512);
+
+  var nb: int64 := alloc(128);
+  Check("Name von Teil 1"c, PartName(t, 0, nb, 128), 8);
+  CheckWahr("Teil 1 heisst EFI-Teil"c, NameGleich(nb, "EFI-Teil"c));
+  PartName(t, 1, nb, 128);
+  CheckWahr("Teil 2 heisst Linux-Teil"c, NameGleich(nb, "Linux-Teil"c));
+  PartName(t, 2, nb, 128);
+  CheckWahr("Teil 3 heisst Daten-Teil"c, NameGleich(nb, "Daten-Teil"c));
+  free(nb, 128);
+
+  var guid: int64 := alloc(32);
+  Check("Typ-GUID hat 16 Byte"c, PartTypeGuid(t, 0, guid), 16);
+  // Ein GUID aus lauter Nullen waere ein unbenutzter Eintrag — die haben wir
+  // beim Einlesen uebersprungen, hier darf keiner ankommen.
+  var nurNull: bool := true;
+  var q: int64 := 0;
+  while (q < 16) { if (peek8(guid + q) != 0) { nurNull := false; q := 16; } else { q := q + 1; } }
+  CheckFalsch("Typ-GUID ist nicht leer"c, nurNull);
+  free(guid, 32);
+
+  // ═══ Die Kette: Versatz → Dateisystem ══════════════════════════════
+  //
+  // Hier zahlt sich die Unit aus. Stimmt der Versatz um EINEN Sektor nicht,
+  // findet keiner der drei Leser seine Kennung.
+  PrintStrLn("--- durch die Partitionen hindurch"c);
+
+  var vol1: FatVolume := FatMount(fd, PartByteOffset(t, 0));
+  CheckWahr("Teil 1 ist ein gueltiges FAT-Volume"c, FatVolumeValid(vol1));
+  var fe: FatEntry;
+  Check("EINS.TXT in Teil 1 gefunden"c, FatFindInDir(vol1, 0, "EINS.TXT"c, fe), 1);
+  var b1: int64 := alloc(64);
+  Check("EINS.TXT gelesen"c, FatReadFile(vol1, fe, b1, 64), 16);
+  poke8(b1 + 16, 0);
+  CheckWahr("EINS.TXT Inhalt"c, NameGleich(b1, "Hallo Partition\n"c));
+  free(b1, 64);
+
+  var vol2: Ext4Volume := Ext4Mount(fd, PartByteOffset(t, 1));
+  CheckWahr("Teil 2 ist ein gueltiges ext4-Volume"c, Ext4Valid(vol2));
+  var root2: Ext4Inode;
+  Check("Wurzel-Inode in Teil 2"c, Ext4ReadInode(vol2, EXT4_ROOT_INO, root2), 1);
+  var ino2: int64 := Ext4FindInDir(vol2, root2, "ZWEI.TXT"c);
+  CheckWahr("ZWEI.TXT in Teil 2 gefunden"c, ino2 > 0);
+  var f2: Ext4Inode;
+  Ext4ReadInode(vol2, ino2, f2);
+  var b2: int64 := alloc(64);
+  Check("ZWEI.TXT gelesen"c, Ext4ReadFile(vol2, f2, b2, 64), 16);
+  free(b2, 64);
+  Ext4InodeFree(f2);
+  Ext4InodeFree(root2);
+
+  var vol3: ExfatVolume := ExfatMount(fd, PartByteOffset(t, 2));
+  CheckWahr("Teil 3 ist ein gueltiges exFAT-Volume"c, ExfatValid(vol3));
+  var xe: ExfatEntry;
+  Check("HALLO.TXT in Teil 3 gefunden"c, ExfatFindInDir(vol3, 0, "HALLO.TXT"c, xe), 1);
+
+  // Gegenprobe, ohne die alles davon auch von einem Zufallstreffer erfuellt
+  // waere: mit dem Versatz der FALSCHEN Partition findet FAT nichts.
+  var volFalsch: FatVolume := FatMount(fd, PartByteOffset(t, 1));
+  CheckFalsch("Teil 2 ist KEIN FAT-Volume"c, FatVolumeValid(volFalsch));
+
+  PartFree(t);
+  close(fd);
+
+  // ═══ MBR mit erweiterter Partition ═════════════════════════════════
+  PrintStrLn("--- MBR"c);
+  var mfd: int64 := open(mbrPfad, 0, 0);
+  _checks := _checks + 1;
+  if (mfd < 0) { PrintStrLn("FAIL: MBR-Abbild nicht zu oeffnen"c); return 1; }
+  PrintStrLn("PASS MBR-Abbild geoeffnet"c);
+
+  var m: PartTable := PartScan(mfd, 512);
+  CheckWahr("MBR-Tabelle ist gueltig"c, PartValid(m));
+  Check("Schema ist MBR"c, PartSchema(m), PART_SCHEMA_MBR);
+  // Zwei primaere, ein Behaelter, zwei logische.
+  Check("fuenf Eintraege"c, PartCount(m), 5);
+
+  var p1: PartEntry; var p3: PartEntry; var p5: PartEntry; var p6: PartEntry;
+  PartGet(m, 0, p1); PartGet(m, 2, p3); PartGet(m, 3, p5); PartGet(m, 4, p6);
+  Check("Nummer 1 ist FAT16 (Typ 6)"c, p1.typ, 6);
+  CheckWahr("Nummer 3 ist der erweiterte Behaelter"c, p3.istErweitert);
+  Check("und traegt Typ 5"c, p3.typ, 5);
+  // Die Nummerierung springt: logische Partitionen zaehlen ab 5.
+  Check("erste logische heisst 5"c, p5.nummer, 5);
+  Check("zweite logische heisst 6"c, p6.nummer, 6);
+  CheckWahr("beide sind als logisch gekennzeichnet"c, p5.istLogisch && p6.istLogisch);
+  // DIE Probe auf die EBR-Kette: der zweite Versatz ist relativ zum Anfang
+  // der ERWEITERTEN Partition, nicht zum vorigen EBR.
+  Check("erste logische beginnt bei 36864"c, p5.startLba, 36864);
+  Check("zweite logische beginnt bei 55296"c, p6.startLba, 55296);
+  // Und der Behaelter selbst traegt kein Dateisystem — wer ihn einhaengt,
+  // liest den EBR statt eines Bootsektors.
+  var volErw: FatVolume := FatMount(mfd, PartByteOffset(m, 2));
+  CheckFalsch("der erweiterte Behaelter ist kein FAT-Volume"c, FatVolumeValid(volErw));
+
+  PartFree(m);
+  close(mfd);
+
+  // ═══ Was keine Tabelle ist ═════════════════════════════════════════
+  var selbst: int64 := open("/proc/self/exe"c, 0, 0);
+  if (selbst >= 0) {
+    var t2: PartTable := PartScan(selbst, 512);
+    CheckFalsch("ein ELF ist keine Partitionstabelle"c, PartValid(t2));
+    PartFree(t2);
+    close(selbst);
+  }
+
+  PrintStr("\n"c);
+  PrintInt(_checks); PrintStr(" Pruefungen, "c);
+  PrintInt(_fails); PrintStrLn(" FAIL"c);
+  if (_fails == 0) { PrintStrLn("OK: std.fs.part"c); return 0; }
+  return 1;
+}
