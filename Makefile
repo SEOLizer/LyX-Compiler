@@ -376,6 +376,8 @@ test: lyxc
 	@bash tests/ext4_test.sh
 	@echo "--- std.fs.ntfs: NTFS lesen (33 Pruefungen, gegen ntfsls abgeglichen) ---"
 	@bash tests/ntfs_test.sh
+	@echo "--- std.fs.squashfs: SquashFS 4.0 lesen (37 Pruefungen, gegen unsquashfs) ---"
+	@bash tests/squashfs_test.sh
 	@echo "--- std.fs.part: MBR und GPT (47 Pruefungen, Kette bis ins Dateisystem) ---"
 	@bash tests/part_test.sh
 	@echo "--- Geraeteliste: Eintraege existieren und sind begruendet (#1937) ---"
