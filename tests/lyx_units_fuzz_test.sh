@@ -66,12 +66,31 @@ for u in $UNITS; do
     continue
   fi
 
+  # Voraussetzung der Referenz VOR dem Vergleich messen (#1933). Bis hierher
+  # meldete ein fehlendes python3-Modul "Referenz meldet Abweichungen" — der
+  # Absturz der Referenz sah aus wie ein Rechenfehler in der Unit. numpy fehlte
+  # auf dem CI-Runner, gemeldet wurde ein Defekt in std.sparse.
+  fehlt=""
+  for m in $(sed -n 's/^import \([a-zA-Z_][a-zA-Z0-9_]*\).*/\1/p' "$ref"); do
+    python3 -c "import $m" >/dev/null 2>&1 || fehlt="$fehlt $m"
+  done
+  if [ -n "$fehlt" ]; then
+    echo "UEBERSPRUNGEN $u: python3-Modul fehlt —$fehlt"
+    continue
+  fi
+
   if out=$(timeout 120 python3 "$ref" "$TMP/$u.out" 2>&1); then
     lines=$(wc -l <"$TMP/$u.out")
     echo "PASS $u ($lines Zeilen abgeglichen)"
     pass=$((pass + 1))
   else
-    echo "FAIL $u: Referenz meldet Abweichungen"
+    # Auch hier trennen: bricht die Referenz selbst ab, ist das KEINE
+    # Abweichung in der Unit (#1933).
+    if printf '%s' "$out" | grep -q "Traceback (most recent call last)"; then
+      echo "FAIL $u: die Referenz selbst bricht ab (kein Befund ueber die Unit)"
+    else
+      echo "FAIL $u: Referenz meldet Abweichungen"
+    fi
     printf '%s\n' "$out" | sed -n '1,5p'
     fail=$((fail + 1))
   fi
