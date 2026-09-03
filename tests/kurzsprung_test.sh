@@ -19,6 +19,14 @@
 # ALLE Laeufe stehen unter `ulimit -v`: ein Sprung ins Leere kann in eine
 # unbegrenzte Speicherbelegung laufen, und ohne Deckel sucht sich der
 # OOM-Killer den groessten Verbraucher im System — nicht den Schuldigen.
+#
+# Der Deckel stand zuerst auf 256 MB und war damit FLACKERND: auf dem
+# CI-Runner scheiterten dieselben Faelle mal mit rc=139, mal gar nicht — ein
+# Wiederholungslauf desselben Commits war gruen (11 PASS, 0 FAIL), lokal war
+# der Test nie rot. Ein Deckel, der knapp ueber dem legitimen Bedarf liegt,
+# misst die Maschine mit, nicht den Compiler. 1 GB liegt weit ueber allem, was
+# ein korrektes Programm hier braucht, und weit unter dem, was einen fremden
+# Prozess gefaehrdet — der Zweck des Deckels bleibt erhalten.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
@@ -42,7 +50,7 @@ bau() { # anzahl-locals
 # Ueber den Kipppunkt hinweg. 15/16 ist die Grenze, 40 liegt weit dahinter.
 for n in 0 8 14 15 16 17 24 40; do
   if ! bau "$n"; then no "$n Locals: uebersetzt" "Uebersetzung schlug fehl"; continue; fi
-  got="$( ulimit -v 262144; timeout 20 "$TMP/k" 2>/dev/null )"; rc=$?
+  got="$( ulimit -v 1048576; timeout 20 "$TMP/k" 2>/dev/null )"; rc=$?
   if [ "$rc" -ne 0 ]; then
     no "$n Locals davor: push waechst korrekt" "rc=$rc (139 = Speicherzugriffsfehler)"
   elif [ "$got" != "1030" ]; then
