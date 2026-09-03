@@ -1069,13 +1069,28 @@ test-known-red: lyxc
 # Nur uebersetzen, der erzeugte Code laeuft nicht auf dem Buildhost.
 .PHONY: test-lyxos-units
 test-lyxos-units: lyxc
-	@fail=0; n=0; \
+	@fail=0; n=0; rot=0; auferstanden=""; \
 	while read -r t; do \
 	  case "$$t" in ''|\#*) continue ;; esac; \
 	  n=$$((n+1)); \
-	  if ! ./lyxc --std-path=. --target=lyxos tests/$$t.lyx -o /tmp/lyxos_$$t >/dev/null 2>&1; then \
-	    echo "FAIL $$t"; fail=$$((fail+1)); \
+	  bekannt=0; \
+	  if [ -f tests/lyxos-known-red.txt ] && \
+	     sed 's/#.*//' tests/lyxos-known-red.txt | grep -qx "[[:space:]]*$$t[[:space:]]*"; then bekannt=1; fi; \
+	  if ./lyxc --std-path=. --target=lyxos tests/$$t.lyx -o /tmp/lyxos_$$t >/dev/null 2>&1; then \
+	    if [ $$bekannt -eq 1 ]; then \
+	      echo "UNERWARTET GRUEN $$t — Eintrag in tests/lyxos-known-red.txt entfernen"; \
+	      auferstanden="$$auferstanden $$t"; \
+	    fi; \
+	  else \
+	    if [ $$bekannt -eq 1 ]; then \
+	      rot=$$((rot+1)); \
+	    else \
+	      echo "FAIL $$t"; fail=$$((fail+1)); \
+	    fi; \
 	  fi; \
 	done < tests/suite-lyxos.txt; \
-	echo "LyxOS-Suite: $$((n-fail))/$$n uebersetzen"; \
+	echo "LyxOS-Suite: $$((n-fail-rot))/$$n uebersetzen, $$rot bekannt rot (#1939), $$fail unerwartet rot"; \
+	if [ -n "$$auferstanden" ]; then \
+	  echo "Diese Eintraege sind ueberholt:$$auferstanden"; exit 1; \
+	fi; \
 	test $$fail -eq 0
