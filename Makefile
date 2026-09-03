@@ -378,6 +378,8 @@ test: lyxc
 	@bash tests/ntfs_test.sh
 	@echo "--- std.fs.part: MBR und GPT (47 Pruefungen, Kette bis ins Dateisystem) ---"
 	@bash tests/part_test.sh
+	@echo "--- Geraeteliste: Eintraege existieren und sind begruendet (#1937) ---"
+	@bash tests/geraet_liste_test.sh
 	@echo "--- std.audio.alsa: Fehlerkonvention und Formatwahl (#1930) ---"
 	@bash tests/alsa_format_test.sh
 	@echo "--- Kurzsprung darf nicht still ueberlaufen (#1915) ---"
