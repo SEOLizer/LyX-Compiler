@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.1.19B
+VERSION   := 1.1.19D
 VERSION_DATE := 2026-09-04
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -384,6 +384,8 @@ test: lyxc
 	@bash tests/geraet_liste_test.sh
 	@echo "--- std.audio.alsa: Fehlerkonvention und Formatwahl (#1930) ---"
 	@bash tests/alsa_format_test.sh
+	@echo "--- Fehlgeschlagene Speicheranforderung meldet (#1947) ---"
+	@bash tests/mmap_geprueft_test.sh
 	@echo "--- Kurzsprung darf nicht still ueberlaufen (#1915) ---"
 	@bash tests/kurzsprung_test.sh
 	@bash tests/while_limit_test.sh
