@@ -14,6 +14,18 @@
 # --std-path — genau die Bedingung, unter der es brach. Aus dem Repo heraus
 # gemessen faellt der Fehler nicht auf, weil dort schon die erste Stufe
 # greift.
+#
+# GEPRUEFT WIRD DIE AUFLOESUNG, NICHT DIE UEBERSETZUNG (#1943). Bis 1.1.19D
+# verlangte dieser Test, dass das Programm durchlaeuft — und uebersetzte damit
+# die INSTALLIERTE Unit unter /usr/include/lyx/units. Die gehoert nicht zum
+# Repo und ist per Definition aelter als das, was hier bearbeitet wird: jede
+# Verschaerfung im Compiler machte den Test rot, bis jemand neu installiert.
+# Gemessen wurde damit die Ausstattung des Rechners, nicht der Compiler.
+#
+# Die Frage des Tests ist aber eine andere: FINDET die IR-Strecke den Import
+# ueber die vierte Stufe? Das beantwortet `--trace-imports` mit der
+# Aufloesungszeile, unabhaengig davon, ob die dort liegende Fassung unter den
+# heutigen Regeln noch uebersetzt.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
@@ -38,16 +50,22 @@ EOF
 # kann std.fs noch liefern.
 cd "$TMP" || exit 1
 log="$TMP/l"
-if timeout 300 "$LYXC" --target=lyxos "$TMP/t.lyx" -o "$TMP/t.out" >"$log" 2>&1; then
-  if grep -q 'Import nicht lesbar' "$log"; then
-    bad "Import ohne --std-path" "uebersetzt, meldet aber weiterhin 'Import nicht lesbar'"
-  elif [ "$(head -c4 "$TMP/t.out")" = "LYX!" ]; then
-    ok "std.fs wird ohne --std-path gefunden (LYX!-Container)"
-  else
-    bad "Import ohne --std-path" "kein LYX!-Container"
-  fi
+timeout 300 "$LYXC" --target=lyxos --trace-imports "$TMP/t.lyx" -o "$TMP/t.out" >"$log" 2>&1
+
+# 1. Der Import wird ueberhaupt aufgeloest — und zwar ueber den
+#    INSTALLATIONSPFAD, denn die drei Stufen davor koennen hier nicht greifen.
+if grep -q '^\[import\] std\.fs -> /usr/include/lyx/units/' "$log"; then
+  ok "std.fs wird ohne --std-path ueber den Installationspfad gefunden"
 else
-  bad "Import ohne --std-path" "$(grep -iE 'nicht lesbar|unbekannt|error' "$log" | head -1)"
+  bad "Import ohne --std-path" "$(grep -E '^\[import\] std\.fs' "$log" | head -1)"
+fi
+
+# 2. Und die Meldung aus #1724 darf nicht wiederkommen. Sie zeigte auf einen
+#    fehlenden Builtin, obwohl bloss die Unit nicht gefunden wurde.
+if grep -q 'Import nicht lesbar' "$log"; then
+  bad "Import ohne --std-path" "meldet weiterhin 'Import nicht lesbar'"
+else
+  ok "keine Meldung 'Import nicht lesbar'"
 fi
 
 echo "Ergebnis: $P PASS, $F FAIL"
