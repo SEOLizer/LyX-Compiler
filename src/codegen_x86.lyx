@@ -8311,6 +8311,12 @@ pub type Codegen = class {
     self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);                      // xor r9d, r9d
     self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax, SYS_mmap
     self.cg_e8(0x0F); self.cg_e8(0x05);                                        // syscall
+    // #1947: erst pruefen, dann als Adresse benutzen. Ohne das schrieb das
+    // folgende `mov [rax], rcx` bei fehlgeschlagener Anforderung nach
+    // 0xFFFFFFFFFFFFFFF4 — ein Segfault statt einer Meldung. Dies ist die
+    // Stelle, die schon beim ERSTEN Anlegen greift; deshalb scheiterte
+    // tests/kurzsprung_test.sh auf knappem Adressraum auch ohne jedes Local.
+    self.cg_emitMmapGeprueft();
     self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1);
     self.cg_e8(0x00); self.cg_e8(0x04); self.cg_e8(0x00); self.cg_e8(0x00);   // mov rcx, 1024
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x08);                      // mov [rax], rcx   (cap)
@@ -8404,6 +8410,10 @@ pub type Codegen = class {
     self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
     // syscall  → rax=new_ptr (rcx, r11 trashed by syscall)
     self.cg_e8(0x0F); self.cg_e8(0x05);
+    // #1947: dieselbe Pruefung wie in cg_emitEmptyDynArray — die beiden
+    // muessen uebereinstimmen. Ohne sie lief `-ENOMEM` als Zeiger in das
+    // `rep movsb` weiter, das gleich darunter kopiert.
+    self.cg_emitMmapGeprueft();
     // push rax (save new_ptr) — stack: [rsp+0]=new_ptr [rsp+8]=new_cap [rsp+16]=old_ptr [rsp+24]=value
     self.cg_e8(0x50);
 
@@ -22945,6 +22955,62 @@ pub type Codegen = class {
       }
       self.cg_zeroRax();
 
+  }
+
+  // #1947: Rueckgabewert von mmap pruefen, statt ihn als Adresse zu benutzen.
+  //
+  // Erwartet rax unmittelbar nach dem `syscall`. Der Fehlerbereich von mmap
+  // ist [-4095, -1]; unsigned verglichen liegen genau diese Werte oberhalb
+  // von -4095. Im Erfolgsfall bleibt rax unveraendert, der Aufrufer rechnet
+  // wie bisher weiter.
+  //
+  // Bis 1.1.19B stand hier nichts. Schlug die Anforderung fehl — etwa weil
+  // RLIMIT_AS erschoepft war —, lief `-ENOMEM` (0xFFFFFFFFFFFFFFF4) als
+  // Zeiger weiter, und der naechste Schreibzugriff traf ihn: SIGSEGV, rc 139.
+  // Aus "kein Speicher" wurde ein Absturz ohne Aussage. Genau daran sind die
+  // Fehlschlaege in tests/kurzsprung_test.sh gehangen, die lange als
+  // flackernd und als zu knapper Deckel galten (#1915) — der Deckel loeste es
+  // aus, die fehlende Pruefung war die Ursache.
+  //
+  // Der Sprung ist ein LANGER (rel32): der uebersprungene Block traegt die
+  // Meldung und den Panic-Rumpf und liegt weit ueber 127 Byte (#1915).
+  fn cg_emitMmapGeprueft() {
+    // NUR auf dem SysV-Pfad. Der Meldeweg unten benutzt rohe Linux-Syscalls
+    // (write, exit_group); in einer PE-Datei riefe derselbe Befehl einen
+    // NT-Dienst mit ganz anderer Bedeutung auf, und die Argumente stuenden in
+    // den falschen Registern (#1678). tests/win64_syscalls_test.sh zaehlt
+    // genau das und hat diese Fassung beim ersten Lauf abgewiesen — zu Recht.
+    //
+    // Fuer win64 bleibt damit alles wie bisher: dort steht der mmap-Aufruf
+    // ohnehin als nachweislich unerreichbarer Rest im Erzeugnis, den derselbe
+    // Test als Schranke fuehrt. Eine Pruefung davor waere kein Gewinn,
+    // sondern zwei weitere Syscalls in einer Datei, die keine haben darf.
+    if (self.msAbi != 0) { return; }
+
+    // cmp rax, -4095   (imm32 wird vorzeichenerweitert)
+    self.cg_e8(0x48); self.cg_e8(0x3D);
+    self.cg_e8(0x01); self.cg_e8(0xF0); self.cg_e8(0xFF); self.cg_e8(0xFF);
+    // jb .ok — unterhalb des Fehlerbereichs, also eine gueltige Adresse
+    self.cg_e8(0x0F); self.cg_e8(0x82);
+    var pOk: int64 := self.codeLen; self.cg_e32(0);
+
+    var msgOff: int64 := self.dataLen;
+    // "Speicheranforderung fehlgeschlagen (mmap)\n\0"
+    self.cg_edata(83);  self.cg_edata(112); self.cg_edata(101); self.cg_edata(105);
+    self.cg_edata(99);  self.cg_edata(104); self.cg_edata(101); self.cg_edata(114);
+    self.cg_edata(97);  self.cg_edata(110); self.cg_edata(102); self.cg_edata(111);
+    self.cg_edata(114); self.cg_edata(100); self.cg_edata(101); self.cg_edata(114);
+    self.cg_edata(117); self.cg_edata(110); self.cg_edata(103); self.cg_edata(32);
+    self.cg_edata(102); self.cg_edata(101); self.cg_edata(104); self.cg_edata(108);
+    self.cg_edata(103); self.cg_edata(101); self.cg_edata(115); self.cg_edata(99);
+    self.cg_edata(104); self.cg_edata(108); self.cg_edata(97);  self.cg_edata(103);
+    self.cg_edata(101); self.cg_edata(110); self.cg_edata(32);  self.cg_edata(40);
+    self.cg_edata(109); self.cg_edata(109); self.cg_edata(97);  self.cg_edata(112);
+    self.cg_edata(41);  self.cg_edata(10);  self.cg_edata(0);
+    self.cg_emitLeaRdiData(msgOff);
+    self.cg_emitPanicBody();
+
+    poke32(self.code + pOk, self.codeLen - pOk - 4);
   }
 };
 
