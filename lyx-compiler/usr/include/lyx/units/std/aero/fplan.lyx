@@ -1,0 +1,208 @@
+// std/aero/fplan.lyx — Vorhersage entlang der Route: Zeit, Strecke, Treibstoff
+//
+// Das ist die Seite, die ein Pilot am häufigsten ansieht: für jeden Wegpunkt
+// die voraussichtliche Ankunftszeit und den Treibstoff, der dann noch an Bord
+// ist. Alles andere im Flugführungsrechner dient dieser Anzeige zu.
+//
+// DIE VORHERSAGE IST EINE KETTE, keine Formel. Jeder Abschnitt verbraucht
+// Zeit und Treibstoff, und der Zustand am Ende ist der Anfang des nächsten.
+// Deshalb steht hier ein FORTSCHREIBBARER Zustand (`AvVorhersage`) und keine
+// Funktion, die "die Ankunftszeit" ausrechnet — die gibt es nicht ohne den
+// Weg dorthin.
+//
+// WAS DABEI SCHIEFGEHT, wenn man es als Formel baut: die Grundgeschwindigkeit
+// ist auf jedem Abschnitt eine andere (Wind dreht, Höhe ändert sich), und der
+// Verbrauch je Stunde ebenso. Eine Mittelung über die ganze Strecke ist bei
+// Gegenwind auf der zweiten Hälfte gutmütig falsch — sie sagt zu wenig
+// Verbrauch voraus, und zwar in die gefährliche Richtung.
+//
+// RESERVEN sind kein Zuschlag am Ende, sondern eine eigene Rechnung mit
+// eigenen Regeln. Diese Unit rechnet die europäische Aufteilung: Rollen,
+// Strecke, Zuschlag, Ausweichflug, Endreserve, Zusatz. Die ZAHLEN dazu
+// (wie viele Minuten Endreserve, wie viel Prozent Zuschlag) kommen vom
+// Aufrufer — sie stehen im Betriebshandbuch und unterscheiden sich je nach
+// Betreiber und Flugart. Ein eingebauter Wert wäre für die Hälfte der Nutzer
+// falsch und würde nirgends auffallen.
+
+@description("Flugplanvorhersage: Zeit, Strecke und Treibstoff je Abschnitt, Reserven, EFOB")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([])
+
+unit std.aero.fplan;
+
+import std.math;
+import std.aero.atmos;
+import std.aero.perf;
+
+// ── Fortschreibbarer Zustand ──────────────────────────────────────────────
+//
+// `restKg` ist der Treibstoff an Bord — die Größe, die auf der Anzeige EFOB
+// heißt (estimated fuel on board). Sie darf negativ werden: das ist die
+// Aussage "so weit reicht es nicht", und sie zu verschweigen wäre genau der
+// stille Ersatzwert, den es hier nicht geben soll.
+
+pub type AvVorhersage = struct {
+  zeitMin:      f64;   // seit Beginn der Kette
+  streckeNm:    f64;
+  verbrauchtKg: f64;
+  restKg:       f64;   // EFOB
+  gueltig:      bool;  // false, sobald ein Abschnitt unsinnig war
+}
+
+pub fn AvVorhersageStart(startKraftstoffKg: f64): AvVorhersage {
+  var v: AvVorhersage;
+  v.zeitMin := 0.0;
+  v.streckeNm := 0.0;
+  v.verbrauchtKg := 0.0;
+  v.restKg := startKraftstoffKg;
+  v.gueltig := startKraftstoffKg == startKraftstoffKg && startKraftstoffKg >= 0.0;
+  return v;
+}
+
+// Ein Abschnitt mit eigener Grundgeschwindigkeit und eigenem Verbrauch.
+//
+// Beides je Abschnitt und nicht einmal für die ganze Strecke: siehe der
+// Hinweis im Kopf. Ein Abschnitt mit Grundgeschwindigkeit 0 ist kein
+// Sonderfall, sondern ein Fehler — das Flugzeug käme nie an.
+pub fn AvVorhersageAbschnitt(ref v: AvVorhersage, streckeNm: f64,
+                              grundgeschwKt: f64, verbrauchKgProH: f64): bool {
+  if (v.gueltig == false) { return false; }
+  if (streckeNm != streckeNm || streckeNm < 0.0) { v.gueltig := false; return false; }
+  if (grundgeschwKt != grundgeschwKt || grundgeschwKt <= 0.0) { v.gueltig := false; return false; }
+  if (verbrauchKgProH != verbrauchKgProH || verbrauchKgProH < 0.0) { v.gueltig := false; return false; }
+  var stunden: f64 := streckeNm / grundgeschwKt;
+  var kg: f64 := verbrauchKgProH * stunden;
+  v.zeitMin := v.zeitMin + stunden * 60.0;
+  v.streckeNm := v.streckeNm + streckeNm;
+  v.verbrauchtKg := v.verbrauchtKg + kg;
+  v.restKg := v.restKg - kg;
+  return true;
+}
+
+// Ein Abschnitt, der Zeit kostet, aber keine Strecke bringt: Warteschleife,
+// Rollen, Verzögerung. Ohne eigene Funktion würde man ihn mit Strecke 0 und
+// irgendeiner Geschwindigkeit einsetzen — und die Division wäre eine Lüge.
+pub fn AvVorhersageZeitabschnitt(ref v: AvVorhersage, minuten: f64,
+                                  verbrauchKgProH: f64): bool {
+  if (v.gueltig == false) { return false; }
+  if (minuten != minuten || minuten < 0.0) { v.gueltig := false; return false; }
+  if (verbrauchKgProH != verbrauchKgProH || verbrauchKgProH < 0.0) { v.gueltig := false; return false; }
+  var kg: f64 := verbrauchKgProH * minuten / 60.0;
+  v.zeitMin := v.zeitMin + minuten;
+  v.verbrauchtKg := v.verbrauchtKg + kg;
+  v.restKg := v.restKg - kg;
+  return true;
+}
+
+pub fn AvVorhersageGueltig(v: AvVorhersage): bool { return v.gueltig; }
+pub fn AvVorhersageZeitMin(v: AvVorhersage): f64 {
+  if (v.gueltig == false) { return AvError(); }
+  return v.zeitMin;
+}
+pub fn AvVorhersageStreckeNm(v: AvVorhersage): f64 {
+  if (v.gueltig == false) { return AvError(); }
+  return v.streckeNm;
+}
+pub fn AvVorhersageVerbrauchKg(v: AvVorhersage): f64 {
+  if (v.gueltig == false) { return AvError(); }
+  return v.verbrauchtKg;
+}
+// EFOB — der Wert, der auf der Anzeige steht. Negativ heißt: reicht nicht.
+pub fn AvVorhersageEfobKg(v: AvVorhersage): f64 {
+  if (v.gueltig == false) { return AvError(); }
+  return v.restKg;
+}
+
+// ── Ankunftszeit ──────────────────────────────────────────────────────────
+//
+// Minuten seit Mitternacht, damit keine Zeitzonenlogik in diese Unit gerät.
+// Der Überlauf über Mitternacht wird ausdrücklich behandelt: ein Flug, der um
+// 23:40 startet und 50 Minuten dauert, landet um 00:30 — und nicht um 24:30.
+
+pub fn AvAnkunftMinuten(abflugMinuten: f64, flugdauerMin: f64): f64 {
+  if (abflugMinuten != abflugMinuten || abflugMinuten < 0.0) { return AvError(); }
+  if (flugdauerMin != flugdauerMin || flugdauerMin < 0.0) { return AvError(); }
+  var summe: f64 := abflugMinuten + flugdauerMin;
+  var tag: f64 := 24.0 * 60.0;
+  while (summe >= tag) { summe := summe - tag; }
+  return summe;
+}
+
+pub fn AvStundeAus(minuten: f64): int64 {
+  if (minuten != minuten || minuten < 0.0) { return 0 - 1; }
+  return FloorF64(minuten / 60.0) as int64;
+}
+
+pub fn AvMinuteAus(minuten: f64): int64 {
+  if (minuten != minuten || minuten < 0.0) { return 0 - 1; }
+  var h: f64 := FloorF64(minuten / 60.0);
+  return FloorF64(minuten - h * 60.0) as int64;
+}
+
+// ── Reserven ──────────────────────────────────────────────────────────────
+//
+// Die Aufteilung nach europäischer Regel. Jede Größe hat ihren eigenen Namen,
+// weil sie eigenen Vorschriften folgt — ein einzelner "Reserve"-Wert würde
+// verdecken, welcher Anteil wofür da ist.
+
+// Endreserve: die Menge, die am Ausweichflughafen noch für eine bestimmte
+// Zeit reichen muss (üblich 30 Minuten Warteflug für Strahlflugzeuge).
+pub fn AvEndreserveKg(verbrauchImWartefluKgProH: f64, minuten: f64): f64 {
+  if (verbrauchImWartefluKgProH != verbrauchImWartefluKgProH) { return AvError(); }
+  if (verbrauchImWartefluKgProH < 0.0) { return AvError(); }
+  if (minuten != minuten || minuten < 0.0) { return AvError(); }
+  return verbrauchImWartefluKgProH * minuten / 60.0;
+}
+
+// Streckenzuschlag: ein Anteil des Streckenverbrauchs für Unvorhergesehenes
+// (üblich 5 %). Der Anteil kommt vom Aufrufer.
+pub fn AvZuschlagKg(streckenverbrauchKg: f64, prozent: f64): f64 {
+  if (streckenverbrauchKg != streckenverbrauchKg || streckenverbrauchKg < 0.0) { return AvError(); }
+  if (prozent != prozent || prozent < 0.0) { return AvError(); }
+  return streckenverbrauchKg * prozent / 100.0;
+}
+
+// Mindestmenge beim Abflug. Die Summe ist bewusst ausgeschrieben und nicht in
+// einem Faktor versteckt: wer eine Position weglässt, sieht es hier.
+pub fn AvMindestkraftstoffKg(rollenKg: f64, streckeKg: f64, zuschlagKg: f64,
+                              ausweichKg: f64, endreserveKg: f64,
+                              zusatzKg: f64): f64 {
+  if (rollenKg != rollenKg || rollenKg < 0.0) { return AvError(); }
+  if (streckeKg != streckeKg || streckeKg < 0.0) { return AvError(); }
+  if (zuschlagKg != zuschlagKg || zuschlagKg < 0.0) { return AvError(); }
+  if (ausweichKg != ausweichKg || ausweichKg < 0.0) { return AvError(); }
+  if (endreserveKg != endreserveKg || endreserveKg < 0.0) { return AvError(); }
+  if (zusatzKg != zusatzKg || zusatzKg < 0.0) { return AvError(); }
+  return rollenKg + streckeKg + zuschlagKg + ausweichKg + endreserveKg + zusatzKg;
+}
+
+// Reicht die getankte Menge? Beide Seiten sind hier ausdrücklich getrennt:
+// die Antwort ist ein Ja/Nein, die Differenz eine eigene Funktion. Wer nur
+// die Differenz hat, muss das Vorzeichen richtig deuten — eine Fehlerquelle,
+// die es nicht geben muss.
+pub fn AvKraftstoffReicht(getanktKg: f64, mindestKg: f64): bool {
+  if (getanktKg != getanktKg || mindestKg != mindestKg) { return false; }
+  return getanktKg >= mindestKg;
+}
+
+pub fn AvKraftstoffUeberschussKg(getanktKg: f64, mindestKg: f64): f64 {
+  if (getanktKg != getanktKg || mindestKg != mindestKg) { return AvError(); }
+  return getanktKg - mindestKg;
+}
+
+// ── Umkehrpunkt bei Treibstoffmangel ──────────────────────────────────────
+//
+// Wie weit reicht der Treibstoff über die geplante Strecke hinaus, bis nur
+// noch die Reserve übrig ist? Das ist die Zahl hinter der Frage "können wir
+// noch eine Platzrunde fliegen".
+pub fn AvReichweiteBisReserveNm(efobKg: f64, reserveKg: f64,
+                                 verbrauchKgProH: f64, grundgeschwKt: f64): f64 {
+  if (efobKg != efobKg || reserveKg != reserveKg) { return AvError(); }
+  if (verbrauchKgProH != verbrauchKgProH || verbrauchKgProH <= 0.0) { return AvError(); }
+  if (grundgeschwKt != grundgeschwKt || grundgeschwKt <= 0.0) { return AvError(); }
+  var verfuegbar: f64 := efobKg - reserveKg;
+  if (verfuegbar < 0.0) { return 0.0; }   // schon jetzt in der Reserve
+  var stunden: f64 := verfuegbar / verbrauchKgProH;
+  return stunden * grundgeschwKt;
+}

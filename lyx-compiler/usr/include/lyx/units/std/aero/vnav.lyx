@@ -1,0 +1,293 @@
+// std/aero/vnav.lyx — Steig- und Sinkprofile über Schichten, Drift-Down,
+//                     Notabstieg
+//
+// std.aero.perf rechnet einen Steig- oder Sinkflug mit EINER mittleren Rate
+// über die ganze Höhe. Das ist für die Faustformel richtig und für ein
+// Flugprofil zu grob: Steigrate und Verbrauch ändern sich mit der Höhe
+// erheblich — ein Verkehrsflugzeug steigt unten mit 2500 ft/min und oben mit
+// 500, und der Verbrauch je Stunde fällt dabei um ein Drittel. Wer mit dem
+// Mittelwert rechnet, bekommt Zeit und Treibstoff systematisch falsch, und
+// zwar umso mehr, je größer der Höhenbereich ist.
+//
+// DESHALB WIRD HIER INTEGRIERT: in Schritten über die Höhe, mit linear
+// veränderlicher Rate und linear veränderlichem Verbrauch, und mit der TAS
+// aus der Standardatmosphäre — die allein wächst zwischen Boden und FL350 um
+// mehr als die Hälfte.
+//
+// DER GESCHWINDIGKEITSPLAN gehört dazu: unten wird mit fester angezeigter
+// Geschwindigkeit geflogen, oben mit fester Machzahl. Genau an der
+// Übergangshöhe wechselt es, und std.aero.atmos rechnet sie aus. Wer
+// durchgehend mit CAS rechnet, bekommt oben eine zu kleine TAS und damit eine
+// zu kurze Strecke.
+//
+// DRIFT-DOWN UND NOTABSTIEG stehen hier, weil beide dasselbe sind wie ein
+// Sinkprofil, nur mit anderem Anlass: nach einem Triebwerksausfall sinkt das
+// Flugzeug auf die Höhe, die es mit dem verbliebenen Schub noch halten kann;
+// bei Druckverlust sinkt es so schnell wie möglich auf eine atembare Höhe.
+// Die erste Rechnung sucht eine Höhe, die zweite eine Zeit.
+
+@description("Segmentierte Steig-/Sinkprofile mit Geschwindigkeitsplan, Drift-Down, Notabstieg")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([])
+
+unit std.aero.vnav;
+
+import std.math;
+import std.aero.atmos;
+import std.aero.perf;
+
+// ── Ergebnis eines Profils ────────────────────────────────────────────────
+
+pub type AvProfil = struct {
+  zeitMin:      f64;
+  streckeNm:    f64;
+  kraftstoffKg: f64;
+  endhoeheFt:   f64;   // erreichte Höhe — kann unter dem Ziel liegen
+  gueltig:      bool;
+}
+
+pub fn AvProfilZeitMin(p: AvProfil): f64 {
+  if (p.gueltig == false) { return AvError(); }
+  return p.zeitMin;
+}
+pub fn AvProfilStreckeNm(p: AvProfil): f64 {
+  if (p.gueltig == false) { return AvError(); }
+  return p.streckeNm;
+}
+pub fn AvProfilKraftstoffKg(p: AvProfil): f64 {
+  if (p.gueltig == false) { return AvError(); }
+  return p.kraftstoffKg;
+}
+pub fn AvProfilEndhoeheFt(p: AvProfil): f64 {
+  if (p.gueltig == false) { return AvError(); }
+  return p.endhoeheFt;
+}
+pub fn AvProfilGueltig(p: AvProfil): bool { return p.gueltig; }
+
+// Linear zwischen zwei Stützwerten, nach dem Anteil `t` in [0,1].
+fn _lin(a: f64, b: f64, t: f64): f64 { return a + (b - a) * t; }
+
+// TAS in dieser Höhe nach dem Geschwindigkeitsplan: unterhalb der
+// Übergangshöhe mit fester CAS, oberhalb mit fester Machzahl.
+//
+// `isaAbwK` verschiebt die Temperatur gegenüber der Standardatmosphäre und
+// geht damit in die Schallgeschwindigkeit ein — an einem warmen Tag ist die
+// TAS bei gleicher Machzahl größer.
+fn _tasKt(hFt: f64, casKt: f64, mach: f64, isaAbwK: f64): f64 {
+  var hM: f64 := AvFtToM(hFt);
+  var tStd: f64 := AvIsaTemperaturK(hM);
+  if (AvIsError(tStd)) { return AvError(); }
+  var oatC: f64 := AvKToC(tStd + isaAbwK);
+  var xoverM: f64 := AvUebergangshoeheM(casKt, mach);
+  if (AvIsError(xoverM)) {
+    // Kein Übergang im Gültigkeitsbereich: dann gilt durchgehend die CAS.
+    return AvTasKtAusCasKt(casKt, hM, oatC);
+  }
+  if (hM < xoverM) { return AvTasKtAusCasKt(casKt, hM, oatC); }
+  return AvTasKtAusMach(mach, oatC);
+}
+
+pub fn AvTasImProfilKt(hFt: f64, casKt: f64, mach: f64, isaAbwK: f64): f64 {
+  return _tasKt(hFt, casKt, mach, isaAbwK);
+}
+
+// ── Steigprofil ───────────────────────────────────────────────────────────
+//
+// Integriert von `vonFt` bis `bisFt` in Schritten von `schrittFt`. Steigrate
+// und Verbrauch werden zwischen den beiden Stützwerten linear über die Höhe
+// interpoliert — die einfachste Annahme, die die Richtung richtig trifft.
+// Wer eine gemessene Kurve hat, ruft die Funktion abschnittsweise auf.
+//
+// Erreicht die Rate null oder darunter, bricht das Profil ab und `endhoeheFt`
+// sagt, wie weit es gekommen ist. Das ist die ehrliche Antwort auf "das
+// Flugzeug schafft die Höhe nicht" — ein Ergebnis mit der Zielhöhe wäre eine
+// Lüge.
+pub fn AvSteigprofil(vonFt: f64, bisFt: f64, schrittFt: f64,
+                      casKt: f64, mach: f64, isaAbwK: f64,
+                      rocUntenFpm: f64, rocObenFpm: f64,
+                      ffUntenKgProH: f64, ffObenKgProH: f64,
+                      windKomponenteKt: f64): AvProfil {
+  var p: AvProfil;
+  p.zeitMin := 0.0; p.streckeNm := 0.0; p.kraftstoffKg := 0.0;
+  p.endhoeheFt := vonFt; p.gueltig := false;
+
+  if (vonFt != vonFt || bisFt != bisFt || bisFt < vonFt) { return p; }
+  if (schrittFt != schrittFt || schrittFt <= 0.0) { return p; }
+  if (casKt != casKt || casKt <= 0.0) { return p; }
+  if (mach != mach || mach <= 0.0) { return p; }
+  if (isaAbwK != isaAbwK || windKomponenteKt != windKomponenteKt) { return p; }
+  if (rocUntenFpm != rocUntenFpm || rocObenFpm != rocObenFpm) { return p; }
+  if (ffUntenKgProH != ffUntenKgProH || ffObenKgProH != ffObenKgProH) { return p; }
+
+  var spanne: f64 := bisFt - vonFt;
+  if (spanne == 0.0) { p.gueltig := true; return p; }
+
+  var h: f64 := vonFt;
+  var runden: int64 := 0;
+  while (h < bisFt) {
+    if (runden > 100000) { return p; }   // Deckel gegen einen unsinnigen Schritt
+    var hOben: f64 := h + schrittFt;
+    if (hOben > bisFt) { hOben := bisFt; }
+    var hMitte: f64 := (h + hOben) / 2.0;
+    var t: f64 := (hMitte - vonFt) / spanne;
+
+    var roc: f64 := _lin(rocUntenFpm, rocObenFpm, t);
+    if (roc <= 0.0) { p.endhoeheFt := h; p.gueltig := true; return p; }
+
+    var tas: f64 := _tasKt(hMitte, casKt, mach, isaAbwK);
+    if (AvIsError(tas)) { return p; }
+    var grund: f64 := tas + windKomponenteKt;
+    if (grund < 0.0) { grund := 0.0; }
+
+    var dh: f64 := hOben - h;
+    var min: f64 := dh / roc;
+    var ff: f64 := _lin(ffUntenKgProH, ffObenKgProH, t);
+
+    p.zeitMin := p.zeitMin + min;
+    p.streckeNm := p.streckeNm + grund * min / 60.0;
+    p.kraftstoffKg := p.kraftstoffKg + ff * min / 60.0;
+    p.endhoeheFt := hOben;
+    h := hOben;
+    runden := runden + 1;
+  }
+  p.gueltig := true;
+  return p;
+}
+
+// ── Sinkprofil ────────────────────────────────────────────────────────────
+//
+// Dasselbe abwärts. `rodObenFpm` und `rodUntenFpm` sind Sinkraten als
+// POSITIVE Zahlen — die Richtung steckt im Namen der Funktion, nicht im
+// Vorzeichen. Ein Vorzeichenfehler an dieser Stelle wäre nicht zu bemerken:
+// die Zahlen sähen weiterhin plausibel aus.
+pub fn AvSinkprofil(vonFt: f64, bisFt: f64, schrittFt: f64,
+                     casKt: f64, mach: f64, isaAbwK: f64,
+                     rodObenFpm: f64, rodUntenFpm: f64,
+                     ffObenKgProH: f64, ffUntenKgProH: f64,
+                     windKomponenteKt: f64): AvProfil {
+  var p: AvProfil;
+  p.zeitMin := 0.0; p.streckeNm := 0.0; p.kraftstoffKg := 0.0;
+  p.endhoeheFt := vonFt; p.gueltig := false;
+
+  if (vonFt != vonFt || bisFt != bisFt || bisFt > vonFt) { return p; }
+  if (schrittFt != schrittFt || schrittFt <= 0.0) { return p; }
+  if (casKt != casKt || casKt <= 0.0) { return p; }
+  if (mach != mach || mach <= 0.0) { return p; }
+  if (rodObenFpm != rodObenFpm || rodObenFpm <= 0.0) { return p; }
+  if (rodUntenFpm != rodUntenFpm || rodUntenFpm <= 0.0) { return p; }
+  if (isaAbwK != isaAbwK || windKomponenteKt != windKomponenteKt) { return p; }
+  if (ffObenKgProH != ffObenKgProH || ffUntenKgProH != ffUntenKgProH) { return p; }
+
+  var spanne: f64 := vonFt - bisFt;
+  if (spanne == 0.0) { p.gueltig := true; return p; }
+
+  var h: f64 := vonFt;
+  var runden: int64 := 0;
+  while (h > bisFt) {
+    if (runden > 100000) { return p; }
+    var hUnten: f64 := h - schrittFt;
+    if (hUnten < bisFt) { hUnten := bisFt; }
+    var hMitte: f64 := (h + hUnten) / 2.0;
+    var t: f64 := (vonFt - hMitte) / spanne;
+
+    var rod: f64 := _lin(rodObenFpm, rodUntenFpm, t);
+    if (rod <= 0.0) { return p; }
+
+    var tas: f64 := _tasKt(hMitte, casKt, mach, isaAbwK);
+    if (AvIsError(tas)) { return p; }
+    var grund: f64 := tas + windKomponenteKt;
+    if (grund < 0.0) { grund := 0.0; }
+
+    var dh: f64 := h - hUnten;
+    var min: f64 := dh / rod;
+    var ff: f64 := _lin(ffObenKgProH, ffUntenKgProH, t);
+
+    p.zeitMin := p.zeitMin + min;
+    p.streckeNm := p.streckeNm + grund * min / 60.0;
+    p.kraftstoffKg := p.kraftstoffKg + ff * min / 60.0;
+    p.endhoeheFt := hUnten;
+    h := hUnten;
+    runden := runden + 1;
+  }
+  p.gueltig := true;
+  return p;
+}
+
+// SINKFLUGBEGINN AUS DEM PROFIL. Die ehrliche Fassung von
+// AvTodStreckeNm: statt einer Gleitzahl über 32000 ft wird das Profil
+// gerechnet, und die Strecke ist das Ergebnis der Integration.
+pub fn AvTodStreckeAusProfilNm(vonFt: f64, bisFt: f64, schrittFt: f64,
+                                casKt: f64, mach: f64, isaAbwK: f64,
+                                rodObenFpm: f64, rodUntenFpm: f64,
+                                windKomponenteKt: f64): f64 {
+  var p: AvProfil := AvSinkprofil(vonFt, bisFt, schrittFt, casKt, mach, isaAbwK,
+                                  rodObenFpm, rodUntenFpm, 0.0, 0.0,
+                                  windKomponenteKt);
+  if (p.gueltig == false) { return AvError(); }
+  return p.streckeNm;
+}
+
+// ── Drift-Down ────────────────────────────────────────────────────────────
+//
+// Fällt ein Triebwerk aus, reicht der verbliebene Schub in großer Höhe nicht
+// mehr, um die Höhe zu halten. Das Flugzeug sinkt auf die Höhe, in der Schub
+// und Widerstand wieder ins Gleichgewicht kommen — das ist die
+// Drift-Down-Höhe, und sie entscheidet über die Streckenführung im Gebirge.
+//
+// Gesucht wird die Höhe, in der die Steigrate null wird. Der Schub wird
+// proportional zum Druckverhältnis angesetzt; wer eine bessere Schubkurve
+// hat, rechnet abschnittsweise.
+pub fn AvDriftDownHoeheM(schubSlEinTriebwerkN: f64, widerstandN: f64,
+                          tasKt: f64, masseKg: f64): f64 {
+  return AvDienstgipfelhoeheM(schubSlEinTriebwerkN, widerstandN, tasKt,
+                              masseKg, 0.0);
+}
+
+pub fn AvDriftDownHoeheFt(schubSlEinTriebwerkN: f64, widerstandN: f64,
+                           tasKt: f64, masseKg: f64): f64 {
+  var h: f64 := AvDriftDownHoeheM(schubSlEinTriebwerkN, widerstandN, tasKt, masseKg);
+  if (AvIsError(h)) { return AvError(); }
+  return AvMToFt(h);
+}
+
+// Reicht die Drift-Down-Höhe über die höchste Erhebung der Strecke?
+// Zwei Seiten: die erreichbare Höhe UND der geforderte Abstand darüber.
+pub fn AvDriftDownFreigaengig(driftDownFt: f64, hoechsteErhebungFt: f64,
+                               mindestabstandFt: f64): bool {
+  if (driftDownFt != driftDownFt || hoechsteErhebungFt != hoechsteErhebungFt) { return false; }
+  if (mindestabstandFt != mindestabstandFt || mindestabstandFt < 0.0) { return false; }
+  return driftDownFt >= hoechsteErhebungFt + mindestabstandFt;
+}
+
+// ── Notabstieg ────────────────────────────────────────────────────────────
+//
+// Bei Druckverlust zählt die Zeit bis zu einer atembaren Höhe. Der Abstieg
+// wird mit hoher Sinkrate geflogen; gefragt sind Dauer und Strecke, weil
+// beide über die Wahl des Ausweichplatzes entscheiden.
+pub fn AvNotabstiegZeitMin(vonFt: f64, aufFt: f64, sinkrateFpm: f64): f64 {
+  if (vonFt != vonFt || aufFt != aufFt || aufFt > vonFt) { return AvError(); }
+  if (sinkrateFpm != sinkrateFpm || sinkrateFpm <= 0.0) { return AvError(); }
+  return (vonFt - aufFt) / sinkrateFpm;
+}
+
+pub fn AvNotabstiegStreckeNm(vonFt: f64, aufFt: f64, sinkrateFpm: f64,
+                              mittlereGrundgeschwKt: f64): f64 {
+  var min: f64 := AvNotabstiegZeitMin(vonFt, aufFt, sinkrateFpm);
+  if (AvIsError(min)) { return AvError(); }
+  if (mittlereGrundgeschwKt != mittlereGrundgeschwKt) { return AvError(); }
+  if (mittlereGrundgeschwKt < 0.0) { return AvError(); }
+  return mittlereGrundgeschwKt * min / 60.0;
+}
+
+// Sauerstoffvorrat: reicht er für den Abstieg plus den anschließenden Flug in
+// der Zwischenhöhe? Die Frage, die über die zulässige Streckenführung
+// entscheidet.
+pub fn AvSauerstoffReicht(vorratMin: f64, abstiegMin: f64,
+                           flugInZwischenhoeheMin: f64): bool {
+  if (vorratMin != vorratMin || vorratMin < 0.0) { return false; }
+  if (abstiegMin != abstiegMin || abstiegMin < 0.0) { return false; }
+  if (flugInZwischenhoeheMin != flugInZwischenhoeheMin) { return false; }
+  if (flugInZwischenhoeheMin < 0.0) { return false; }
+  return vorratMin >= abstiegMin + flugInZwischenhoeheMin;
+}
