@@ -2,13 +2,23 @@
 # tests/version_consistency_test.sh — alle lebenden Versionsangaben nennen
 # dieselbe Version.
 #
-# Die Version steht an fuenf Stellen, und keine davon leitet sich aus einer
+# Die Version steht an SECHS Stellen, und keine davon leitet sich aus einer
 # anderen ab: Makefile (traegt auch den .deb-Namen), README-Badge, vier Strings
 # in src/lyxc.lyx (--version, --help, Bootstrap-Zeile, Copyright-Banner), der
-# Kopf von ebnf.md und die .TH-Kopfzeile von man/lyxc.1 (#1766 — sie fehlte
+# Kopf von ebnf.md, die .TH-Kopfzeile von man/lyxc.1 (#1766 — sie fehlte
 # hier, und tools/next_version.sh zog sie nicht mit; gemerkt hat es erst
-# tests/manpage_test.sh, also `make test` nach jedem Bump). Von Hand gepflegt laufen die auseinander — ebnf.md stand
-# beim Bump auf 1.0.12A noch auf 1.0.11C, zwei Versionen hinter dem Compiler.
+# tests/manpage_test.sh, also `make test` nach jedem Bump) und das Feld
+# `Version:` in lyx-compiler/DEBIAN/control. Von Hand gepflegt laufen die
+# auseinander — ebnf.md stand beim Bump auf 1.0.12A noch auf 1.0.11C, zwei
+# Versionen hinter dem Compiler.
+#
+# DEBIAN/control kam als sechste dazu, weil es die einzige Stelle war, die
+# WEDER tools/next_version.sh bumpt NOCH hier geprueft wurde: es wird von
+# tools/make_deb.sh beim Paketbau gesetzt und driftet deshalb zwischen zwei
+# Paketbauten still weg. Gemessen am 2026-09-04: Repo bei 1.1.18A, control
+# noch bei 1.1.15A — drei Versionen zurueck, ohne dass irgendetwas rot wurde.
+# Eine Stelle, die niemand prueft, ist derselbe Verfall wie ein Test, der an
+# keinem Ziel haengt.
 #
 # Der Compiler selbst kann das nicht melden: er kennt nur die Strings, die in
 # ihm stecken. Ein Badge, der eine andere Version zeigt als das Binary, faellt
@@ -48,6 +58,9 @@ check() { # datei, beschreibung, gefundene version
 
 check README.md "Badge" \
   "$(sed -n 's/.*version-v\([0-9A-Za-z.]*\)-blue.*/\1/p' "$ROOT/README.md" | head -1)"
+
+check lyx-compiler/DEBIAN/control "Version-Feld" \
+  "$(sed -n 's/^Version:[[:space:]]*\([0-9A-Za-z.]*\).*/\1/p' "$ROOT/lyx-compiler/DEBIAN/control" | head -1)"
 
 check src/lyxc.lyx "--version" \
   "$(sed -n 's/.*PrintStrLn("\([0-9]\+\.[0-9]\+\.[0-9A-Z]\+\)"c);.*/\1/p' "$ROOT/src/lyxc.lyx" | head -1)"
