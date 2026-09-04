@@ -1,0 +1,777 @@
+// std/fs/squashfs.lyx — SquashFS 4.0 LESEN
+//
+// Sechste Unit der Dateisystem-Sammlung und die erste, die mit einem
+// KOMPRIMIERTEN Dateisystem umgeht. Damit unterscheidet sie sich grundlegend
+// von FAT, exFAT, ext4 und NTFS:
+//
+//   * Es gibt keine Cluster und keine Zuordnungstabelle. Alles liegt in
+//     METADATENBLOECKEN zu hoechstens 8192 Byte, jeder mit einem 2-Byte-Kopf
+//     davor. Bit 15 dieses Kopfes sagt "unkomprimiert"; die unteren 15 Bit
+//     sind die Groesse AUF DER PLATTE, nicht die entpackte.
+//   * Eine Inode-Referenz ist keine Nummer, sondern ein Paar: obere 32 Bit =
+//     Versatz des Metadatenblocks relativ zum Tabellenanfang, untere 16 Bit =
+//     Versatz IM entpackten Block. Wer sie als Zahl behandelt, liest Muell.
+//   * Verzeichniseintraege nennen die Inode-Nummer als VORZEICHENBEHAFTETE
+//     Differenz zu einer Basis im Kopf. Ein Eintrag kann also rueckwaerts
+//     zeigen; als vorzeichenlos gelesen ergibt das eine Riesenzahl.
+//   * Laengenfelder sind durchweg "minus eins" gespeichert: `count` im
+//     Verzeichniskopf meint count+1 Eintraege, `name_size` meint name_size+1
+//     Zeichen. Wer das uebersieht, verliert genau einen Eintrag und das letzte
+//     Zeichen jedes Namens.
+//   * Kleine Dateireste liegen nicht in eigenen Bloecken, sondern zusammen mit
+//     anderen in einem FRAGMENT.
+//
+// ALLE Feldversaetze in dieser Unit sind an einem mit `mksquashfs` erzeugten
+// Abbild nachgemessen, nicht aus einer Beschreibung uebernommen.
+//
+// KOMPRESSION: unterstuetzt werden `gzip` (ueber std.zlib) und der Fall
+// "unkomprimiert" (mksquashfs -noI -noD -noF -noX). Fuer lzma, lzo, xz, lz4
+// und zstd gibt es hier keinen Entpacker; diese Abbilder werden LAUT
+// abgewiesen — ein stiller Ersatz waere Muell, den niemand als Muell erkennt.
+//
+// NUR LESEN. SquashFS ist ein Nur-Lese-Dateisystem; Schreiben hiesse, das
+// gesamte Abbild neu zu bauen, und das ist die Aufgabe von mksquashfs.
+//
+// NICHT enthalten: erweiterte Attribute (xattr), Geraetedateien, Sockets und
+// FIFOs jenseits ihrer Typkennung, sowie die Export-Tabelle fuer NFS.
+
+@description("SquashFS 4.0 lesen: Superblock, Metadatenbloecke, Inodes, Verzeichnisse, Dateien, Symlinks")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([fs.read, fs.meta, system.memory.heap])
+
+unit std.fs.squashfs;
+
+import std.alloc;
+import std.io;
+import std.zlib;
+
+pub con SQFS_ERR: int64 := 0 - 1;
+
+// "hsqs" als Little-Endian-Wort. Gemessen am Abbild: 68 73 71 73.
+pub con SQFS_MAGIC: int64 := 0x73717368;
+
+// Kompressionskennungen aus dem Superblock (Feld bei Versatz 20).
+pub con SQFS_COMP_GZIP: int64 := 1;
+pub con SQFS_COMP_LZMA: int64 := 2;
+pub con SQFS_COMP_LZO:  int64 := 3;
+pub con SQFS_COMP_XZ:   int64 := 4;
+pub con SQFS_COMP_LZ4:  int64 := 5;
+pub con SQFS_COMP_ZSTD: int64 := 6;
+
+// Inode-Arten. Die "erweiterten" Formen tragen dieselben Angaben plus
+// zusaetzliche Felder an anderer Stelle — deshalb getrennte Kennungen.
+pub con SQFS_INODE_DIR:      int64 := 1;
+pub con SQFS_INODE_FILE:     int64 := 2;
+pub con SQFS_INODE_SYMLINK:  int64 := 3;
+pub con SQFS_INODE_BLKDEV:   int64 := 4;
+pub con SQFS_INODE_CHRDEV:   int64 := 5;
+pub con SQFS_INODE_FIFO:     int64 := 6;
+pub con SQFS_INODE_SOCKET:   int64 := 7;
+pub con SQFS_INODE_XDIR:     int64 := 8;
+pub con SQFS_INODE_XFILE:    int64 := 9;
+pub con SQFS_INODE_XSYMLINK: int64 := 10;
+
+// Groesse eines entpackten Metadatenblocks. Fest im Format, nicht im
+// Superblock: 8192 Byte.
+pub con SQFS_META_SIZE: int64 := 8192;
+
+pub type SquashVolume = struct {
+  fd:          int64;
+  partOffset:  int64;   // Byte-Versatz des Abbilds im Deskriptor
+  inodeCount:  int64;
+  blockSize:   int64;
+  fragCount:   int64;
+  compression: int64;
+  flags:       int64;
+  idCount:     int64;
+  rootRef:     int64;
+  bytesUsed:   int64;
+  idTable:     int64;
+  inodeTable:  int64;
+  dirTable:    int64;
+  fragTable:   int64;
+  gueltig:     bool;
+}
+
+pub type SquashEntry = struct {
+  art:         int64;   // SQFS_INODE_*
+  mode:        int64;
+  uid:         int64;
+  gid:         int64;
+  inodeNr:     int64;
+  groesse:     int64;   // Datei: Bytes; Verzeichnis: Bytes der Eintragsliste
+  istDir:      bool;
+  istDatei:    bool;
+  istSymlink:  bool;
+  dirStart:    int64;   // Verzeichnis: Versatz des Metadatenblocks
+  dirOffset:   int64;   // Verzeichnis: Versatz im entpackten Block
+  blocksStart: int64;   // Datei: Beginn der Datenbloecke im Abbild
+  fragIndex:   int64;   // Datei: Fragmentnummer, 0xFFFFFFFF = keins
+  fragOffset:  int64;   // Datei: Versatz im entpackten Fragment
+  blockListe:  int64;   // Datei: Adresse der Blockgroessenliste (im Metapuffer)
+  blockAnzahl: int64;
+  symlinkRef:  int64;   // Symlink: Adresse des Ziels (im Metapuffer)
+  symlinkLen:  int64;
+}
+
+// Rueckgabe mehrerer Werte geht in Lyx ueber ein Struct: `ref` wirkt nur bei
+// Struct-Parametern, skalare Ausgabeparameter gibt es nicht.
+pub type SquashDirEntry = struct {
+  kindRef: int64;
+  art:     int64;
+  inodeNr: int64;
+}
+
+type SquashMetaLage = struct {
+  naechste: int64;
+  laenge:   int64;
+}
+
+type SquashFragLage = struct {
+  start:   int64;
+  groesse: int64;
+}
+
+pub type SquashDir = struct {
+  puffer:    int64;   // entpackter Verzeichnisbereich
+  laenge:    int64;
+  pos:       int64;   // Lesezeiger
+  restKopf:  int64;   // verbleibende Eintraege des aktuellen Kopfes
+  basisIno:  int64;
+  basisBlk:  int64;
+  fertig:    bool;
+}
+
+// ── Kleine Helfer ─────────────────────────────────────────────────────────
+
+fn _u8(p: int64, off: int64): int64 { return peek8(p + off) & 255; }
+
+fn _u16(p: int64, off: int64): int64 {
+  return (peek8(p + off) & 255) | ((peek8(p + off + 1) & 255) << 8);
+}
+
+// Vorzeichenbehaftet, fuer die Inode-Differenz im Verzeichniseintrag. Ein
+// Eintrag darf RUECKWAERTS zeigen; als vorzeichenlos gelesen waere daraus
+// eine Zahl nahe 65536 und die Inode-Nummer falsch.
+fn _i16(p: int64, off: int64): int64 {
+  var v: int64 := _u16(p, off);
+  if (v >= 32768) { return v - 65536; }
+  return v;
+}
+
+fn _u32(p: int64, off: int64): int64 {
+  return (peek8(p + off)     & 255)
+       | ((peek8(p + off + 1) & 255) << 8)
+       | ((peek8(p + off + 2) & 255) << 16)
+       | ((peek8(p + off + 3) & 255) << 24);
+}
+
+fn _u64(p: int64, off: int64): int64 {
+  var lo: int64 := _u32(p, off);
+  var hi: int64 := _u32(p, off + 4);
+  return lo | (hi << 32);
+}
+
+fn _lese(vol: SquashVolume, pos: int64, puffer: int64, anzahl: int64): int64 {
+  var abs: int64 := vol.partOffset + pos;
+  if (lseek(vol.fd, abs, 0) != abs) { return 0; }
+  if (read(vol.fd, puffer as pchar, anzahl) != anzahl) { return 0; }
+  return 1;
+}
+
+// ── Superblock ────────────────────────────────────────────────────────────
+
+// Feldversaetze am Abbild nachgemessen:
+//   0 magic  4 inodes  8 mtime  12 block_size  16 frags  20 comp
+//  22 block_log  24 flags  26 ids  28 vmaj  30 vmin  32 root_ref
+//  40 bytes_used  48 id_table  56 xattr_table  64 inode_table
+//  72 dir_table  80 frag_table  88 export_table
+pub fn SquashMount(fd: int64, versatz: int64, ref vol: SquashVolume): bool {
+  vol.fd := fd;
+  vol.partOffset := versatz;
+  vol.gueltig := false;
+
+  var sb: int64 := alloc(96);
+  if (sb == 0) { return false; }
+  if (_lese(vol, 0, sb, 96) == 0) { free(sb, 96); return false; }
+
+  if (_u32(sb, 0) != SQFS_MAGIC) { free(sb, 96); return false; }
+
+  // Version 4.0. Aeltere Fassungen haben ein anderes Superblock-Layout —
+  // sie hier mitzulesen hiesse, falsche Felder zu deuten.
+  if (_u16(sb, 28) != 4) { free(sb, 96); return false; }
+
+  vol.inodeCount  := _u32(sb, 4);
+  vol.blockSize   := _u32(sb, 12);
+  vol.fragCount   := _u32(sb, 16);
+  vol.compression := _u16(sb, 20);
+  vol.flags       := _u16(sb, 24);
+  vol.idCount     := _u16(sb, 26);
+  vol.rootRef     := _u64(sb, 32);
+  vol.bytesUsed   := _u64(sb, 40);
+  vol.idTable     := _u64(sb, 48);
+  vol.inodeTable  := _u64(sb, 64);
+  vol.dirTable    := _u64(sb, 72);
+  vol.fragTable   := _u64(sb, 80);
+
+  // block_log muss zur Blockgroesse passen. Stimmen die beiden nicht
+  // ueberein, ist der Superblock beschaedigt — und zwar auf eine Weise, die
+  // sonst erst beim Lesen eines Datenblocks auffiele.
+  var log: int64 := _u16(sb, 22);
+  var probe: int64 := 1;
+  var i: int64 := 0;
+  while (i < log) { probe := probe * 2; i := i + 1; }
+  if (probe != vol.blockSize) { free(sb, 96); return false; }
+
+  free(sb, 96);
+  vol.gueltig := true;
+  return true;
+}
+
+pub fn SquashValid(vol: SquashVolume): bool { return vol.gueltig; }
+
+pub fn SquashBlockSize(vol: SquashVolume): int64 { return vol.blockSize; }
+
+pub fn SquashInodeCount(vol: SquashVolume): int64 { return vol.inodeCount; }
+
+pub fn SquashCompression(vol: SquashVolume): int64 { return vol.compression; }
+
+// Wird ein Entpacker gebraucht, den es hier nicht gibt? Die Antwort haengt
+// nicht allein von der Kennung ab: ein Abbild mit `-noI -noD -noF -noX` traegt
+// weiterhin `gzip` im Superblock, enthaelt aber keinen komprimierten Block.
+// Deshalb entscheidet erst der einzelne Blockkopf — diese Auskunft ist eine
+// VORAB-Warnung, keine Sperre.
+pub fn SquashCompressionUnterstuetzt(vol: SquashVolume): bool {
+  return vol.compression == SQFS_COMP_GZIP;
+}
+
+pub fn SquashCompressionName(vol: SquashVolume): pchar {
+  if (vol.compression == SQFS_COMP_GZIP) { return "gzip"c; }
+  if (vol.compression == SQFS_COMP_LZMA) { return "lzma"c; }
+  if (vol.compression == SQFS_COMP_LZO)  { return "lzo"c; }
+  if (vol.compression == SQFS_COMP_XZ)   { return "xz"c; }
+  if (vol.compression == SQFS_COMP_LZ4)  { return "lz4"c; }
+  if (vol.compression == SQFS_COMP_ZSTD) { return "zstd"c; }
+  return "unbekannt"c;
+}
+
+// ── Metadatenbloecke ──────────────────────────────────────────────────────
+
+// Liest EINEN Metadatenblock ab `pos`. Gibt die Zahl der entpackten Bytes
+// zurueck oder SQFS_ERR. `naechste` bekommt den Versatz des Folgeblocks —
+// der ergibt sich aus der Groesse AUF DER PLATTE, nicht aus der entpackten.
+//
+// Der Kopf ist 2 Byte: Bit 15 gesetzt heisst "liegt unkomprimiert da", die
+// unteren 15 Bit sind die Plattengroesse. Am Abbild gemessen: 0x80c1 = 193
+// Byte unkomprimiert.
+fn _metaBlock(vol: SquashVolume, pos: int64, ziel: int64, zielMax: int64,
+              ref lage: SquashMetaLage): int64 {
+  var kopf: int64 := alloc(2);
+  if (kopf == 0) { return SQFS_ERR; }
+  if (_lese(vol, pos, kopf, 2) == 0) { free(kopf, 2); return SQFS_ERR; }
+  var h: int64 := _u16(kopf, 0);
+  free(kopf, 2);
+
+  var groesse: int64 := h & 0x7FFF;
+  var unkomprimiert: bool := (h & 0x8000) != 0;
+  if (groesse == 0) { return SQFS_ERR; }
+
+  lage.naechste := pos + 2 + groesse;
+  lage.laenge   := groesse;
+
+  if (unkomprimiert) {
+    if (groesse > zielMax) { return SQFS_ERR; }
+    if (_lese(vol, pos + 2, ziel, groesse) == 0) { return SQFS_ERR; }
+    return groesse;
+  }
+
+  // Komprimiert: nur gzip. Alles andere wird LAUT abgewiesen — ein stiller
+  // Ersatz (etwa: Rohdaten durchreichen) ergaebe Muell, den kein Aufrufer als
+  // Muell erkennen kann.
+  if (vol.compression != SQFS_COMP_GZIP) {
+    EPrintStr("std.fs.squashfs: Kompression "c);
+    EPrintStr(SquashCompressionName(vol));
+    EPrintStrLn(" wird von dieser Unit nicht entpackt."c);
+    return SQFS_ERR;
+  }
+
+  var roh: int64 := alloc(groesse);
+  if (roh == 0) { return SQFS_ERR; }
+  if (_lese(vol, pos + 2, roh, groesse) == 0) { free(roh, groesse); return SQFS_ERR; }
+  var n: int64 := ZlibDecompressToBuffer(roh as pchar, groesse, ziel as pchar, zielMax);
+  free(roh, groesse);
+  if (n < 0) { return SQFS_ERR; }
+  return n;
+}
+
+// Liest ab `startPos` so viele Metadatenbloecke, bis mindestens `brauche`
+// Bytes ab `startOffset` im entpackten Strom vorliegen. Gibt die Gesamtzahl
+// entpackter Bytes zurueck.
+fn _metaStrom(vol: SquashVolume, startPos: int64, ziel: int64, zielMax: int64,
+              brauche: int64): int64 {
+  var geschrieben: int64 := 0;
+  var pos: int64 := startPos;
+  var lage: SquashMetaLage;
+  var runden: int64 := 0;
+  while (geschrieben < brauche) {
+    // Deckel gegen ein beschaedigtes Abbild: ohne ihn liefe die Schleife bei
+    // einer Kette, die nie genug Bytes liefert, unbegrenzt weiter.
+    if (runden > 4096) { return SQFS_ERR; }
+    var n: int64 := _metaBlock(vol, pos, ziel + geschrieben, zielMax - geschrieben,
+                               lage);
+    if (n == SQFS_ERR) { return SQFS_ERR; }
+    geschrieben := geschrieben + n;
+    pos := lage.naechste;
+    runden := runden + 1;
+  }
+  return geschrieben;
+}
+
+// ── Inodes ────────────────────────────────────────────────────────────────
+
+// Eine Inode-Referenz: obere 32 Bit = Versatz des Metadatenblocks relativ zum
+// Anfang der Inode-Tabelle, untere 16 Bit = Versatz im entpackten Block.
+pub fn SquashRefBlock(ref_: int64): int64 { return (ref_ >> 16) & 0xFFFFFFFF; }
+pub fn SquashRefOffset(ref_: int64): int64 { return ref_ & 0xFFFF; }
+
+pub fn SquashRootRef(vol: SquashVolume): int64 { return vol.rootRef; }
+
+// Der gemeinsame Kopf jeder Inode ist 16 Byte:
+//   0 art  2 mode  4 uid  6 gid  8 mtime  12 inode_nr
+// Danach folgt je nach Art ein anderer Rumpf.
+pub fn SquashInode(vol: SquashVolume, ref_: int64, ref e: SquashEntry): bool {
+  e.art := 0; e.istDir := false; e.istDatei := false; e.istSymlink := false;
+  e.groesse := 0; e.blockAnzahl := 0; e.symlinkLen := 0;
+  e.blockListe := 0; e.symlinkRef := 0;
+  e.fragIndex := 0 - 1; e.fragOffset := 0;
+
+  var blk: int64 := SquashRefBlock(ref_);
+  var off: int64 := SquashRefOffset(ref_);
+
+  // Zwei Metadatenbloecke Reserve: eine Inode darf ueber die Blockgrenze
+  // hinausreichen, und die Blockgroessenliste einer grossen Datei ebenso.
+  var kap: int64 := SQFS_META_SIZE * 4;
+  var puf: int64 := alloc(kap);
+  if (puf == 0) { return false; }
+  var n: int64 := _metaStrom(vol, vol.inodeTable + blk, puf, kap, off + 64);
+  if (n == SQFS_ERR || n <= off) { free(puf, kap); return false; }
+
+  e.art     := _u16(puf, off + 0);
+  e.mode    := _u16(puf, off + 2);
+  e.uid     := _u16(puf, off + 4);
+  e.gid     := _u16(puf, off + 6);
+  e.inodeNr := _u32(puf, off + 12);
+
+  var p: int64 := off + 16;
+
+  if (e.art == SQFS_INODE_DIR) {
+    // start_block(4) nlink(4) file_size(2) offset(2) parent(4)
+    e.dirStart  := _u32(puf, p + 0);
+    e.groesse   := _u16(puf, p + 8);
+    e.dirOffset := _u16(puf, p + 10);
+    e.istDir    := true;
+    free(puf, kap);
+    return true;
+  }
+
+  if (e.art == SQFS_INODE_XDIR) {
+    // nlink(4) file_size(4) start_block(4) parent(4) i_count(2) offset(2) ...
+    e.groesse   := _u32(puf, p + 4);
+    e.dirStart  := _u32(puf, p + 8);
+    e.dirOffset := _u16(puf, p + 18);
+    e.istDir    := true;
+    free(puf, kap);
+    return true;
+  }
+
+  if (e.art == SQFS_INODE_FILE) {
+    // blocks_start(4) frag_index(4) block_offset(4) file_size(4) sizes[]
+    e.blocksStart := _u32(puf, p + 0);
+    e.fragIndex   := _u32(puf, p + 4);
+    e.fragOffset  := _u32(puf, p + 8);
+    e.groesse     := _u32(puf, p + 12);
+    e.istDatei    := true;
+    _blockListeUebernehmen(vol, e, puf, p + 16);
+    free(puf, kap);
+    return true;
+  }
+
+  if (e.art == SQFS_INODE_XFILE) {
+    // blocks_start(8) file_size(8) sparse(8) nlink(4) frag_index(4)
+    // block_offset(4) xattr(4) sizes[]
+    e.blocksStart := _u64(puf, p + 0);
+    e.groesse     := _u64(puf, p + 8);
+    e.fragIndex   := _u32(puf, p + 28);
+    e.fragOffset  := _u32(puf, p + 32);
+    e.istDatei    := true;
+    _blockListeUebernehmen(vol, e, puf, p + 40);
+    free(puf, kap);
+    return true;
+  }
+
+  if (e.art == SQFS_INODE_SYMLINK || e.art == SQFS_INODE_XSYMLINK) {
+    // nlink(4) target_size(4) target[]
+    var laenge: int64 := _u32(puf, p + 4);
+    if (laenge < 0 || laenge > 4096) { free(puf, kap); return false; }
+    var ziel: int64 := alloc(laenge + 1);
+    if (ziel == 0) { free(puf, kap); return false; }
+    var i: int64 := 0;
+    while (i < laenge) { poke8(ziel + i, _u8(puf, p + 8 + i)); i := i + 1; }
+    poke8(ziel + laenge, 0);
+    e.symlinkRef := ziel;
+    e.symlinkLen := laenge;
+    e.istSymlink := true;
+    free(puf, kap);
+    return true;
+  }
+
+  // Geraetedateien, FIFOs, Sockets: Art ist gesetzt, mehr wird nicht gedeutet.
+  free(puf, kap);
+  return true;
+}
+
+// Die Blockgroessenliste steht unmittelbar hinter dem Inode-Rumpf, ein u32 je
+// vollem Datenblock. Sie wird KOPIERT, weil der Metadatenpuffer gleich wieder
+// freigegeben wird — ein Zeiger dorthin waere nach `free` eine Falle.
+fn _blockListeUebernehmen(vol: SquashVolume, ref e: SquashEntry,
+                          puf: int64, ab: int64): void {
+  var voll: int64 := 0;
+  if (e.fragIndex == 0xFFFFFFFF || e.fragIndex < 0) {
+    // Kein Fragment: auch der Rest liegt in einem eigenen Block.
+    voll := (e.groesse + vol.blockSize - 1) / vol.blockSize;
+  } else {
+    voll := e.groesse / vol.blockSize;
+  }
+  if (voll < 0 || voll > 65536) { voll := 0; }
+  e.blockAnzahl := voll;
+  if (voll == 0) { e.blockListe := 0; return; }
+  var liste: int64 := alloc(voll * 8);
+  if (liste == 0) { e.blockAnzahl := 0; return; }
+  var i: int64 := 0;
+  while (i < voll) {
+    poke64(liste + i * 8, _u32(puf, ab + i * 4));
+    i := i + 1;
+  }
+  e.blockListe := liste;
+}
+
+pub fn SquashEntryFreigeben(ref e: SquashEntry): void {
+  if (e.blockListe != 0) { free(e.blockListe, e.blockAnzahl * 8); e.blockListe := 0; }
+  if (e.symlinkRef != 0) { free(e.symlinkRef, e.symlinkLen + 1); e.symlinkRef := 0; }
+}
+
+// ── Verzeichnisse ─────────────────────────────────────────────────────────
+
+// Ein Verzeichnis ist eine Folge von Koepfen, jeder mit bis zu 256 Eintraegen:
+//   Kopf:    count(4)  start_block(4)  base_inode(4)     — count meint count+1
+//   Eintrag: offset(2)  inode_delta(2, VORZEICHEN)  typ(2)  name_size(2)
+//            name[name_size + 1]
+pub fn SquashDirOpen(vol: SquashVolume, e: SquashEntry, ref d: SquashDir): bool {
+  d.puffer := 0; d.laenge := 0; d.pos := 0; d.restKopf := 0;
+  d.basisIno := 0; d.basisBlk := 0; d.fertig := true;
+  if (e.istDir == false) { return false; }
+
+  // Die Groesse im Inode zaehlt drei Byte mit, die nicht zum Eintragsstrom
+  // gehoeren; ein leeres Verzeichnis traegt genau diese 3.
+  if (e.groesse <= 3) { d.fertig := true; return true; }
+  var nutz: int64 := e.groesse - 3;
+
+  var kap: int64 := e.dirOffset + nutz + SQFS_META_SIZE;
+  var puf: int64 := alloc(kap);
+  if (puf == 0) { return false; }
+  var n: int64 := _metaStrom(vol, vol.dirTable + e.dirStart, puf, kap,
+                             e.dirOffset + nutz);
+  if (n == SQFS_ERR) { free(puf, kap); return false; }
+
+  d.puffer := puf;
+  d.laenge := e.dirOffset + nutz;
+  d.pos    := e.dirOffset;
+  d.fertig := false;
+  return true;
+}
+
+pub fn SquashDirClose(ref d: SquashDir): void {
+  if (d.puffer != 0) {
+    // Die Kapazitaet ist beim Oeffnen groesser gewaehlt worden als `laenge`;
+    // fuer den Allokator dieser Unit ist die genaue Zahl unerheblich, der
+    // Block wird als Ganzes zurueckgegeben.
+    free(d.puffer, d.laenge);
+    d.puffer := 0;
+  }
+  d.fertig := true;
+}
+
+// Liefert den naechsten Eintrag. `name` muss mindestens 256 Byte fassen.
+// Rueckgabe: true, solange ein Eintrag geliefert wurde.
+pub fn SquashDirNext(ref d: SquashDir, ref de: SquashDirEntry,
+                     name: int64): bool {
+  if (d.fertig) { return false; }
+  if (d.puffer == 0) { d.fertig := true; return false; }
+
+  if (d.restKopf <= 0) {
+    if (d.pos + 12 > d.laenge) { d.fertig := true; return false; }
+    var anzahl: int64 := _u32(d.puffer, d.pos + 0);
+    d.basisBlk := _u32(d.puffer, d.pos + 4);
+    d.basisIno := _u32(d.puffer, d.pos + 8);
+    d.pos := d.pos + 12;
+    // count ist "minus eins" gespeichert. Wer das uebersieht, verliert je
+    // Kopf genau einen Eintrag — und zwar den letzten, was beim Auflisten
+    // kleiner Verzeichnisse leicht als "gibt es eben nicht" durchgeht.
+    d.restKopf := anzahl + 1;
+    if (d.restKopf <= 0 || d.restKopf > 256) { d.fertig := true; return false; }
+  }
+
+  if (d.pos + 8 > d.laenge) { d.fertig := true; return false; }
+  var off:   int64 := _u16(d.puffer, d.pos + 0);
+  var delta: int64 := _i16(d.puffer, d.pos + 2);
+  var typ:   int64 := _u16(d.puffer, d.pos + 4);
+  var nlen:  int64 := _u16(d.puffer, d.pos + 6) + 1;   // ebenfalls "minus eins"
+  d.pos := d.pos + 8;
+
+  if (nlen <= 0 || nlen > 255 || d.pos + nlen > d.laenge) {
+    d.fertig := true; return false;
+  }
+  var i: int64 := 0;
+  while (i < nlen) { poke8(name + i, _u8(d.puffer, d.pos + i)); i := i + 1; }
+  poke8(name + nlen, 0);
+  d.pos := d.pos + nlen;
+
+  de.kindRef := (d.basisBlk << 16) | off;
+  de.art     := typ;
+  de.inodeNr := d.basisIno + delta;
+  d.restKopf := d.restKopf - 1;
+  return true;
+}
+
+// ── Dateien lesen ─────────────────────────────────────────────────────────
+
+// Ein Eintrag der Blockgroessenliste: Bit 24 gesetzt heisst "unkomprimiert",
+// die unteren 24 Bit sind die Groesse auf der Platte. Groesse 0 bedeutet einen
+// LOECHRIGEN Block — er belegt nichts und liest sich als Nullen.
+fn _datenBlock(vol: SquashVolume, pos: int64, roh: int64, ziel: int64,
+               zielMax: int64): int64 {
+  var unkomprimiert: bool := (roh & 0x1000000) != 0;
+  var groesse: int64 := roh & 0xFFFFFF;
+
+  if (groesse == 0) {
+    var i: int64 := 0;
+    var n: int64 := vol.blockSize;
+    if (n > zielMax) { n := zielMax; }
+    while (i < n) { poke8(ziel + i, 0); i := i + 1; }
+    return n;
+  }
+
+  if (unkomprimiert) {
+    if (groesse > zielMax) { return SQFS_ERR; }
+    if (_lese(vol, pos, ziel, groesse) == 0) { return SQFS_ERR; }
+    return groesse;
+  }
+
+  if (vol.compression != SQFS_COMP_GZIP) {
+    EPrintStr("std.fs.squashfs: Datenblock mit Kompression "c);
+    EPrintStr(SquashCompressionName(vol));
+    EPrintStrLn(" — kein Entpacker vorhanden."c);
+    return SQFS_ERR;
+  }
+
+  var puf: int64 := alloc(groesse);
+  if (puf == 0) { return SQFS_ERR; }
+  if (_lese(vol, pos, puf, groesse) == 0) { free(puf, groesse); return SQFS_ERR; }
+  var n2: int64 := ZlibDecompressToBuffer(puf as pchar, groesse, ziel as pchar, zielMax);
+  free(puf, groesse);
+  if (n2 < 0) { return SQFS_ERR; }
+  return n2;
+}
+
+// Fragmenttabelle: `fragTable` zeigt auf eine Liste von u64-Zeigern, je einer
+// auf einen Metadatenblock mit Fragmenteintraegen zu 16 Byte
+// (start(8) size(4) ungenutzt(4)). 512 Eintraege je Block.
+fn _fragment(vol: SquashVolume, index: int64, ref f: SquashFragLage): bool {
+  if (index < 0 || index >= vol.fragCount) { return false; }
+  var blockNr: int64 := index / 512;
+  var imBlock: int64 := index - blockNr * 512;
+
+  var zeiger: int64 := alloc(8);
+  if (zeiger == 0) { return false; }
+  if (_lese(vol, vol.fragTable + blockNr * 8, zeiger, 8) == 0) {
+    free(zeiger, 8); return false;
+  }
+  var metaPos: int64 := _u64(zeiger, 0);
+  free(zeiger, 8);
+
+  var kap: int64 := SQFS_META_SIZE + 64;
+  var puf: int64 := alloc(kap);
+  if (puf == 0) { return false; }
+  var lage: SquashMetaLage;
+  var n: int64 := _metaBlock(vol, metaPos, puf, kap, lage);
+  if (n == SQFS_ERR || imBlock * 16 + 12 > n) { free(puf, kap); return false; }
+
+  f.start   := _u64(puf, imBlock * 16 + 0);
+  f.groesse := _u32(puf, imBlock * 16 + 8);
+  free(puf, kap);
+  return true;
+}
+
+// Liest die Datei in `ziel`. Gibt die Zahl gelesener Bytes zurueck oder
+// SQFS_ERR. Es wird hoechstens `zielMax` geschrieben.
+pub fn SquashReadFile(vol: SquashVolume, e: SquashEntry, ziel: int64,
+                      zielMax: int64): int64 {
+  if (e.istDatei == false) { return SQFS_ERR; }
+  if (e.groesse == 0) { return 0; }
+
+  var gesamt: int64 := e.groesse;
+  if (gesamt > zielMax) { gesamt := zielMax; }
+
+  var geschrieben: int64 := 0;
+  var pos: int64 := e.blocksStart;
+  var i: int64 := 0;
+
+  // Zwischenpuffer fuer einen entpackten Block. Grosszuegig bemessen:
+  // ZlibDecompressToBuffer schreibt erst und prueft die Schranke danach.
+  var kap: int64 := vol.blockSize + 4096;
+  var puf: int64 := alloc(kap);
+  if (puf == 0) { return SQFS_ERR; }
+
+  while (i < e.blockAnzahl) {
+    var roh: int64 := peek64(e.blockListe + i * 8);
+    var n: int64 := _datenBlock(vol, pos, roh, puf, kap);
+    if (n == SQFS_ERR) { free(puf, kap); return SQFS_ERR; }
+
+    var nehmen: int64 := n;
+    if (geschrieben + nehmen > gesamt) { nehmen := gesamt - geschrieben; }
+    var k: int64 := 0;
+    while (k < nehmen) { poke8(ziel + geschrieben + k, _u8(puf, k)); k := k + 1; }
+    geschrieben := geschrieben + nehmen;
+
+    // Der Vorschub folgt der PLATTENGROESSE, nicht der entpackten; ein
+    // loechriger Block (Groesse 0) schiebt gar nicht vor.
+    pos := pos + (roh & 0xFFFFFF);
+    i := i + 1;
+    if (geschrieben >= gesamt) { free(puf, kap); return geschrieben; }
+  }
+
+  // Rest im Fragment.
+  if (e.fragIndex != 0xFFFFFFFF && e.fragIndex >= 0 && geschrieben < gesamt) {
+    var f: SquashFragLage;
+    if (_fragment(vol, e.fragIndex, f) == false) {
+      free(puf, kap); return SQFS_ERR;
+    }
+    var fn_: int64 := _datenBlock(vol, f.start, f.groesse, puf, kap);
+    if (fn_ == SQFS_ERR) { free(puf, kap); return SQFS_ERR; }
+    var rest: int64 := gesamt - geschrieben;
+    if (e.fragOffset + rest > fn_) { rest := fn_ - e.fragOffset; }
+    if (rest < 0) { rest := 0; }
+    var m: int64 := 0;
+    while (m < rest) {
+      poke8(ziel + geschrieben + m, _u8(puf, e.fragOffset + m));
+      m := m + 1;
+    }
+    geschrieben := geschrieben + rest;
+  }
+
+  free(puf, kap);
+  return geschrieben;
+}
+
+// Ziel eines Symlinks. `ziel` muss `SquashSymlinkLen(e)+1` Byte fassen.
+pub fn SquashReadLink(e: SquashEntry, ziel: int64, zielMax: int64): int64 {
+  if (e.istSymlink == false) { return SQFS_ERR; }
+  if (e.symlinkRef == 0) { return SQFS_ERR; }
+  var n: int64 := e.symlinkLen;
+  if (n > zielMax) { n := zielMax; }
+  var i: int64 := 0;
+  while (i < n) { poke8(ziel + i, peek8(e.symlinkRef + i) & 255); i := i + 1; }
+  poke8(ziel + n, 0);
+  return n;
+}
+
+pub fn SquashSymlinkLen(e: SquashEntry): int64 { return e.symlinkLen; }
+
+// ── Suchen ────────────────────────────────────────────────────────────────
+
+fn _namenGleich(a: int64, b: int64, laenge: int64): bool {
+  var i: int64 := 0;
+  while (i < laenge) {
+    if ((peek8(a + i) & 255) != (peek8(b + i) & 255)) { return false; }
+    i := i + 1;
+  }
+  return true;
+}
+
+fn _strLaenge(s: int64): int64 {
+  var i: int64 := 0;
+  while ((peek8(s + i) & 255) != 0) { i := i + 1; }
+  return i;
+}
+
+// Sucht einen Namen im Verzeichnis `e`. Liefert die Inode-Referenz oder
+// SQFS_ERR.
+pub fn SquashFindInDir(vol: SquashVolume, e: SquashEntry, name: int64): int64 {
+  var d: SquashDir;
+  if (SquashDirOpen(vol, e, d) == false) { return SQFS_ERR; }
+
+  var puffer: int64 := alloc(300);
+  if (puffer == 0) { SquashDirClose(d); return SQFS_ERR; }
+  var suchLaenge: int64 := _strLaenge(name);
+
+  var de: SquashDirEntry;
+  var treffer: int64 := SQFS_ERR;
+  var gefunden: bool := false;
+
+  while (gefunden == false && SquashDirNext(d, de, puffer)) {
+    if (_strLaenge(puffer) == suchLaenge) {
+      if (_namenGleich(puffer, name, suchLaenge)) {
+        treffer := de.kindRef;
+        gefunden := true;
+      }
+    }
+  }
+
+  free(puffer, 300);
+  SquashDirClose(d);
+  return treffer;
+}
+
+// Loest einen Pfad ab der Wurzel auf ("/a/b/c" oder "a/b/c"). Liefert die
+// Inode-Referenz oder SQFS_ERR.
+pub fn SquashFindPath(vol: SquashVolume, pfad: int64): int64 {
+  var aktuell: int64 := vol.rootRef;
+  var e: SquashEntry;
+  if (SquashInode(vol, aktuell, e) == false) { return SQFS_ERR; }
+
+  var teil: int64 := alloc(300);
+  if (teil == 0) { return SQFS_ERR; }
+
+  var i: int64 := 0;
+  var laenge: int64 := _strLaenge(pfad);
+  var fehler: bool := false;
+
+  while (i < laenge && fehler == false) {
+    // Trennzeichen ueberspringen
+    while (i < laenge && (peek8(pfad + i) & 255) == 47) { i := i + 1; }
+    if (i >= laenge) { i := laenge; }
+    else {
+      var j: int64 := 0;
+      while (i < laenge && (peek8(pfad + i) & 255) != 47) {
+        if (j < 255) { poke8(teil + j, peek8(pfad + i) & 255); j := j + 1; }
+        i := i + 1;
+      }
+      poke8(teil + j, 0);
+      if (j > 0) {
+        var naechsteRef: int64 := SquashFindInDir(vol, e, teil);
+        if (naechsteRef == SQFS_ERR) { fehler := true; }
+        else {
+          SquashEntryFreigeben(e);
+          if (SquashInode(vol, naechsteRef, e) == false) { fehler := true; }
+          else { aktuell := naechsteRef; }
+        }
+      }
+    }
+  }
+
+  SquashEntryFreigeben(e);
+  free(teil, 300);
+  if (fehler) { return SQFS_ERR; }
+  return aktuell;
+}
