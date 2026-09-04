@@ -384,6 +384,8 @@ test: lyxc
 	@bash tests/geraet_liste_test.sh
 	@echo "--- std.audio.alsa: Fehlerkonvention und Formatwahl (#1930) ---"
 	@bash tests/alsa_format_test.sh
+	@echo "--- std.aero: Atmosphaere, Flugleistung, Vorhersage, Profile, Warteschleifen ---"
+	@bash tests/aero_test.sh
 	@echo "--- Fehlgeschlagene Speicheranforderung meldet (#1947) ---"
 	@bash tests/mmap_geprueft_test.sh
 	@echo "--- Kurzsprung darf nicht still ueberlaufen (#1915) ---"
