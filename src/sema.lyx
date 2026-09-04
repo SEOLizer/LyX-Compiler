@@ -1219,6 +1219,41 @@ pub type Sema = class {
     return TY_UNKNOWN;
   }
 
+  // #1903: ZWEITE HERKUNFT fuer den Typ eines Aufrufergebnisses — NUR fuer die
+  // Argumentpruefung.
+  //
+  // Der Weg oben fuehrt ueber SymNodeIdx in den Knotenbaum. Der Index ist
+  // modul-relativ: ueber eine Einheitsgrenze zeigt er in einen fremden Baum,
+  // und der abgeleitete Typ gehoerte zu irgendeiner anderen Funktion. Seit
+  // #1221 wird das abgefangen — richtig so, aber das Ergebnis war TY_UNKNOWN,
+  // und damit fiel die Typpruefung des ARGUMENTS still aus. Gemessen: ein
+  // Struct als f64-Argument wurde in der eigenen Einheit abgewiesen, ueber die
+  // Grenze nicht; `NimmInt(AError())` (f64 in einen int64-Parameter) gab still
+  // das Bitmuster -2251799813685247 aus.
+  //
+  // Die Signaturtabelle wird ueber den NAMEN gefunden und ist damit
+  // modulunabhaengig. Sie gilt hier unter denselben Vorbehalten wie fuer die
+  // Stelligkeit: ein mehrdeutiger Name und jeder Name, den es auch als
+  // Builtin gibt, bleiben unbeurteilt (_fnFindSig gibt dann -1).
+  //
+  // Dieselbe Auskunft wie in _inferExprType — die beiden muessen
+  // uebereinstimmen: dort ResolveType(sn_c1(declNi)) am Knoten, hier derselbe
+  // Wert, beim Eintragen in _fnRecordSig einmal gerechnet.
+  //
+  // ABSICHTLICH NICHT in _inferExprType selbst: dieselbe Auskunft wuerde dort
+  // auch die INITIALISIERUNGS-Pruefung erreichen, und die weist
+  // `var p: pchar := alloc(n)` ab — ein Muster, das die eigene Standard-
+  // bibliothek durchgehend nutzt. Gemessen: 64 von 614 uebersetzbaren Dateien
+  // fielen damit aus, angefuehrt von std/fs.lyx und std/regex.lyx. Der alte
+  // Compiler weist dasselbe INNERHALB einer Einheit laengst ab; der Bestand
+  // haelt sich also nur ueber die Modulgrenze. Das ist ein eigener Befund und
+  // ein eigenes Paket — hier wird die Luecke aus #1903 geschlossen, nicht mehr.
+  fn _callTypeAusSig(ni: int64): int64 {
+    var sgi: int64 := self._fnFindSig(self.sn_sVal(ni), self.sn_sLen(ni));
+    if (sgi < 0) { return TY_UNKNOWN; }
+    return peek64(self.fnSigTab + sgi * 56 + 48);
+  }
+
   // #1135: Grobklasse eines Typs. 1 = Zahl (ganzzahlig, bool, char),
   // 2 = Zeichenkette (pchar), 3 = Gleitkomma. 0 = unbestimmt oder
   // zusammengesetzt — dort wird nicht geurteilt.
@@ -2587,18 +2622,30 @@ pub type Sema = class {
     if (self.fnSigCount >= self.fnSigCap) {
       var nc: int64 := self.fnSigCap * 2;
       if (nc < 64) { nc := 64; }
-      var nb: int64 := alloc(nc * 48);
-      memcpy(nb, self.fnSigTab, self.fnSigCount * 48);
+      var nb: int64 := alloc(nc * 56);
+      memcpy(nb, self.fnSigTab, self.fnSigCount * 56);
       self.fnSigTab := nb;
       self.fnSigCap := nc;
     }
-    var base: int64 := self.fnSigTab + self.fnSigCount * 48;
+    var base: int64 := self.fnSigTab + self.fnSigCount * 56;
     poke64(base,      fname as int64);
     poke64(base + 8,  fnameLen);
     poke64(base + 16, pcMin);
     poke64(base + 24, pc);
     poke64(base + 32, flags);
     poke64(base + 40, tcls);
+    // #1903: der RUECKGABETYP. Bis hierher hielt diese Tabelle alles ueber
+    // eine Funktion fest, nur ihn nicht — und er ist die einzige Angabe, die
+    // ueber eine Modulgrenze hinweg gebraucht wird. `_inferExprType` konnte
+    // den Typ eines Aufrufergebnisses deshalb nur fuer Funktionen der EIGENEN
+    // Einheit bestimmen: der Weg dorthin fuehrt ueber SymNodeIdx, und der
+    // Index ist modul-relativ. Ueber die Grenze zeigt er in einen fremden
+    // Baum, was seit #1221 (zu Recht) abgefangen wird — das Ergebnis war
+    // TY_UNKNOWN, und die Typpruefung des Arguments fiel still aus.
+    //
+    // Diese Tabelle wird ueber den NAMEN gefunden und ist damit
+    // modulunabhaengig; genau dafuer ist sie 1264 angelegt worden.
+    poke64(base + 48, self.ResolveType(self.sn_c1(declNi)));
     self.fnSigCount := self.fnSigCount + 1;
   }
 
@@ -2629,11 +2676,11 @@ pub type Sema = class {
     var found: int64 := 0 - 1;
     var i: int64 := self.fnSigCount - 1;
     while (i >= 0) {
-      var b: int64 := self.fnSigTab + i * 48;
+      var b: int64 := self.fnSigTab + i * 56;
       if (self._strNEq(peek64(b) as pchar, peek64(b + 8), fname, fnameLen)) {
         if (found < 0) { found := i; }
         else {
-          var bf: int64 := self.fnSigTab + found * 48;
+          var bf: int64 := self.fnSigTab + found * 56;
           if (peek64(b + 16) != peek64(bf + 16) || peek64(b + 24) != peek64(bf + 24)) {
             return 0 - 1;
           }
@@ -4022,6 +4069,17 @@ pub type Sema = class {
                   while (apP >= 0 && apA >= 0) {
                     var wantP: int64 := self.ResolveType(self.sn_c0(apP));
                     var gotA:  int64 := self._inferExprType(apA);
+                    // #1903: Kommt das Argument aus einer IMPORTIERTEN
+                    // Funktion, bleibt _inferExprType unbestimmt — der Weg
+                    // dorthin fuehrt ueber SymNodeIdx, und der Index ist
+                    // modul-relativ (seit #1221 zu Recht abgefangen). Die
+                    // Signaturtabelle wird ueber den NAMEN gefunden und weiss
+                    // es trotzdem. Ohne diese zweite Herkunft fiel die
+                    // Pruefung still aus: ein Struct als f64-Argument wurde in
+                    // der eigenen Einheit abgewiesen, ueber die Grenze nicht.
+                    if (gotA == TY_UNKNOWN && self.sn_kind(apA) == SNK_CALL) {
+                      gotA := self._callTypeAusSig(apA);
+                    }
                     if (self._typeMismatch(wantP, gotA, apA) != 0) {
                       self._errType("Argument"c, apA, wantP, gotA);
                     }
@@ -4053,7 +4111,7 @@ pub type Sema = class {
               // Die Signatur steht in fnSigTab, abgeschrieben beim Import.
               var sgi: int64 := self._fnFindSig(nm, nl);
               if (sgi >= 0) {
-                var sgBase: int64 := self.fnSigTab + sgi * 48;
+                var sgBase: int64 := self.fnSigTab + sgi * 56;
                 var sgFlags: int64 := peek64(sgBase + 32);
                 if ((sgFlags & 3) == 0) {          // nicht variadisch, nicht extern
                   var sgMin: int64 := peek64(sgBase + 16);
@@ -4271,7 +4329,7 @@ pub type Sema = class {
             if (kMang != 0 as pchar) {
               var ksgi: int64 := self._fnFindSig(kMang, kMangLen);
               if (ksgi >= 0) {
-                var kBase: int64 := self.fnSigTab + ksgi * 48;
+                var kBase: int64 := self.fnSigTab + ksgi * 56;
                 if ((peek64(kBase + 32) & 1) == 0) {          // nicht variadisch
                   var kac: int64 := 0;
                   var ka: int64 := self.sn_c0(ni);
@@ -6732,7 +6790,7 @@ pub type Sema = class {
     if (mangled == 0 as pchar) { return; }
     var sgi: int64 := self._fnFindSig(mangled, mangLen);
     if (sgi < 0) { return; }
-    var sgBase: int64 := self.fnSigTab + sgi * 48;
+    var sgBase: int64 := self.fnSigTab + sgi * 56;
     if ((peek64(sgBase + 32) & 1) != 0) { return; }     // variadisch
     if (ac < peek64(sgBase + 16) || ac > peek64(sgBase + 24)) {
       self._errorNodeName("falsche Argument-Anzahl im Methodenaufruf von", callNi, mname, mlen);
@@ -7844,7 +7902,7 @@ pub type Sema = class {
 
     // #1264: Signaturtabelle (auch fuer importierte Funktionen).
     self.fnSigCap   := 64;
-    self.fnSigTab   := alloc(self.fnSigCap * 48);
+    self.fnSigTab   := alloc(self.fnSigCap * 56);
     self.fnSigCount := 0;
 
     self.scopeCap   := 64;
