@@ -132,6 +132,117 @@ else
     echo "HINWEIS qemu-aarch64-static fehlt — der IR-Weg bleibt hier ungemessen"
 fi
 
+# ===========================================================================
+# Stufe 2: benannte Ressourcen (@resource + std.res)
+# ===========================================================================
+#
+# Unterschied zu Stufe 1: der Zugriff laeuft ueber den NAMEN und wird zur
+# LAUFZEIT aufgeloest. Damit ist er auch dann moeglich, wenn der Name erst
+# zur Laufzeit feststeht — und Werkzeuge koennen die Tabelle auflisten.
+
+cp "$ROOT/tests/data/embed_binaer.bin" "$TMP/binaer.bin"
+printf 'zweite Datei' > "$TMP/zweite.txt"
+
+pruefe "Tabelle: Anzahl und Name" 'unit main;
+import std.io;
+import std.res;
+@resource("vorlage", "text.txt");
+@resource("zweite", "zweite.txt");
+fn main(): int64 {
+  PrintStr(IntToStr(ResCount())); PrintStr(" ");
+  PrintStr(ResName(0)); PrintStr(" ");
+  PrintLn(ResName(1));
+  return 0;
+}' '2 vorlage zweite'
+
+# Der INHALT muss ueber den Namen auffindbar sein, nicht nur die Groesse.
+pruefe "Suche nach Namen liefert den Inhalt" 'unit main;
+import std.io;
+import std.res;
+@resource("vorlage", "text.txt");
+fn main(): int64 {
+  PrintStr(IntToStr(ResLen("vorlage"))); PrintStr(" ");
+  PrintLn(ResFind("vorlage"));
+  return 0;
+}' '28 Hallo Welt aus einer Vorlage'
+
+# BINAER: die Tabelle fuehrt eine eigene Laenge, ist also nicht auf die
+# Nullterminierung angewiesen. Genau das ist der Vorteil gegenueber einem
+# blossen Zeiger.
+pruefe "binaere Ressource samt Nullbyte" 'unit main;
+import std.io;
+import std.res;
+@resource("bild", "binaer.bin");
+fn main(): int64 {
+  var p: pchar := ResFind("bild");
+  var n: int64 := ResLen("bild");
+  PrintStr(IntToStr(n));
+  var i: int64 := 0;
+  while (i < n) { PrintStr(" "); PrintStr(IntToStr(peek8((p as int64) + i) as int64)); i := i + 1; }
+  PrintLn("");
+  return 0;
+}' '5 65 66 0 67 68'
+
+# GEGENPROBE: ein Name, den es nicht gibt, muss als "gibt es nicht" ankommen.
+# ResFind liefert den Nullzeiger, ResLen -1 — und NICHT 0: eine Ressource darf
+# leer sein, dann waere 0 von "fehlt" nicht zu unterscheiden.
+pruefe "unbekannter Name meldet sich als fehlend" 'unit main;
+import std.io;
+import std.res;
+@resource("vorlage", "text.txt");
+fn main(): int64 {
+  PrintStr(IntToStr(ResLen("gibtesnicht"))); PrintStr(" ");
+  if (ResFind("gibtesnicht") == 0 as pchar) { PrintLn("null"); } else { PrintLn("ZEIGER"); }
+  return 0;
+}' '-1 null'
+
+# Ein Programm OHNE jede Ressource darf nicht abstuerzen: die Tabelle fehlt,
+# GetResTable liefert 0, und jede Funktion muss das abfangen.
+pruefe "ohne Ressourcen bleibt std.res benutzbar" 'unit main;
+import std.io;
+import std.res;
+fn main(): int64 {
+  PrintStr(IntToStr(ResCount())); PrintStr(" ");
+  PrintStr(IntToStr(ResLen("x"))); PrintStr(" ");
+  if (ResName(0) == 0 as pchar) { PrintLn("null"); } else { PrintLn("ZEIGER"); }
+  return 0;
+}' '0 -1 null'
+
+# Doppelter Name: FEHLER, nicht "letzter gewinnt". Ein stiller Austausch waere
+# erst am laufenden Programm zu bemerken.
+printf 'unit main;\nimport std.io;\nimport std.res;\n@resource("a", "text.txt");\n@resource("a", "zweite.txt");\nfn main(): int64 { PrintLn(IntToStr(ResCount())); return 0; }' > "$TMP/d.lyx"
+if ( cd / && timeout 120 "$LYXC" --std-path="$ROOT" "$TMP/d.lyx" -o "$TMP/d" ) >"$TMP/d.log" 2>&1; then
+    nok "doppelter Name wird gemeldet: uebersetzt durch"
+elif grep -q "zweimal vor" "$TMP/d.log"; then
+    ok "doppelter Name wird gemeldet"
+else
+    nok "doppelter Name: falsche Meldung ($(grep -v Copyright "$TMP/d.log" | head -1))"
+fi
+
+# Fehlende Ressourcendatei: LAUT, mit Pfad.
+printf 'unit main;\nimport std.io;\nimport std.res;\n@resource("x", "fehlt.bin");\nfn main(): int64 { PrintLn(IntToStr(ResCount())); return 0; }' > "$TMP/rf.lyx"
+if ( cd / && timeout 120 "$LYXC" --std-path="$ROOT" "$TMP/rf.lyx" -o "$TMP/rf" ) >"$TMP/rf.log" 2>&1; then
+    nok "fehlende Ressourcendatei wird gemeldet: uebersetzt durch"
+elif grep -q "Datei nicht lesbar" "$TMP/rf.log"; then
+    ok "fehlende Ressourcendatei wird gemeldet"
+else
+    nok "fehlende Ressourcendatei: falsche Meldung ($(grep -v Copyright "$TMP/rf.log" | head -1))"
+fi
+
+# Auf dem IR-Weg gibt es die Tabelle noch nicht. Das MUSS an der Deklaration
+# gemeldet werden — und zwar auch dann, wenn das Programm die Ressource gar
+# nicht liest, sonst uebersetzte es klanglos ohne sie durch.
+if command -v qemu-aarch64-static >/dev/null 2>&1; then
+    printf 'unit main;\nimport std.io;\n@resource("x", "text.txt");\nfn main(): int64 { PrintLn("nichts"); return 0; }' > "$TMP/ri.lyx"
+    if ( cd / && timeout 180 "$LYXC" --target=arm64 --std-path="$ROOT" "$TMP/ri.lyx" -o "$TMP/ri" ) >"$TMP/ri.log" 2>&1; then
+        nok "arm64 mit @resource: uebersetzt durch, statt zu melden"
+    elif grep -q "nur mit --target=x86_64" "$TMP/ri.log"; then
+        ok "arm64 meldet @resource, statt still ohne Tabelle zu bauen"
+    else
+        nok "arm64 mit @resource: falsche Meldung ($(grep -v Copyright "$TMP/ri.log" | head -1))"
+    fi
+fi
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
