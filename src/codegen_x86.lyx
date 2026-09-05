@@ -99,6 +99,7 @@ con CGN_NAMED_ARG:   int64 := 108; // WP-MEM-05: named call arg; nc0=value
 con CGN_MATCH_CASE:  int64 := 65;  // WP-15: case pattern => expr
 con CGN_RANGE:        int64 := 73;  // WP-17: range expression: 1..100
 con CGN_WHERE:        int64 := 74;  // WP-17: where clause: type X where constraint
+con CGN_EMBED:        int64 := 134;  // #1961: @embed / @embed_len
 con CGN_EXTERN_DATA:  int64 := 75;  // WSP-07: extern "asm" name: Type;
 con CGN_IS_EXPR:      int64 := 72;  // WP-16: x is Type
 
@@ -578,6 +579,9 @@ pub type Codegen = class {
   // String literal data buffer
   data:    int64;
   dataLen: int64;
+  embeds:     int64;   // #1961: {pfad, pfadLen, dataOff} je 24 Byte
+  embedCount: int64;
+  embedCap:   int64;
   dataCap: int64;
 
   // Local variable table
@@ -1665,6 +1669,124 @@ pub type Codegen = class {
     return off;
   }
 
+  // ---------------------------------------------------------------------
+  // #1961: `@embed("pfad")` — Dateiinhalt zur Uebersetzungszeit einbetten.
+  // ---------------------------------------------------------------------
+  //
+  // Die Bytes gehen DIREKT in den Datenbereich (cg_edata), nicht ueber
+  // erzeugten Quelltext. Eine Daten-Unit mit poke-Initialisierung bringt
+  // lyxc jenseits von rund 1 MB zum Absturz — der Weg ueber Parser und sema
+  // waere fuer eingebettete Dateien also von vornherein untauglich.
+  //
+  // Der Pfad wird RELATIV ZUR QUELLDATEI aufgeloest, wie beim Import. Relativ
+  // zum Arbeitsverzeichnis haette das Erzeugnis davon abgehangen, aus welchem
+  // Verzeichnis der Compiler gerufen wurde.
+  fn cg_embedPfad(rel: pchar, relLen: int64, lenBox: int64): pchar {
+    poke64(lenBox, 0);
+    // Ein absoluter Pfad bleibt, wie er ist.
+    if (relLen > 0 && StrCharAt(rel, 0) == 47) {
+      var abuf: int64 := alloc(relLen + 1);
+      var ai: int64 := 0;
+      while (ai < relLen) { poke8(abuf + ai, StrCharAt(rel, ai)); ai := ai + 1; }
+      poke8(abuf + relLen, 0);
+      poke64(lenBox, relLen);
+      return abuf as pchar;
+    }
+    // Verzeichnis der Quelldatei bestimmen: alles bis zum letzten '/'.
+    var dirLen: int64 := 0;
+    if (self.srcFilePath != 0 as pchar) {
+      var si: int64 := 0;
+      while (si < self.srcFileLen) {
+        if (StrCharAt(self.srcFilePath, si) == 47) { dirLen := si + 1; }
+        si := si + 1;
+      }
+    }
+    var tot: int64 := dirLen + relLen;
+    var buf: int64 := alloc(tot + 1);
+    var i: int64 := 0;
+    while (i < dirLen) { poke8(buf + i, StrCharAt(self.srcFilePath, i)); i := i + 1; }
+    var j: int64 := 0;
+    while (j < relLen) { poke8(buf + dirLen + j, StrCharAt(rel, j)); j := j + 1; }
+    poke8(buf + tot, 0);
+    poke64(lenBox, tot);
+    return buf as pchar;
+  }
+
+  // Groesse der Datei, oder -1. Getrennt von cg_embedBytes, weil
+  // `@embed_len` nur die Zahl braucht und die Datei dafuer nicht gelesen
+  // werden muss.
+  fn cg_embedGroesse(pfad: pchar): int64 {
+    var fd: int64 := open(pfad, 0, 0);
+    if (fd < 0) { return 0 - 1; }
+    var sz: int64 := lseek(fd, 0, 2);
+    close(fd);
+    if (sz < 0) { return 0 - 1; }
+    return sz;
+  }
+
+  // Fehlende Datei ist ein HARTER Fehler mit Pfad in der Meldung. Ein stiller
+  // Ersatz (leere Ressource, Offset 0) waere die schlimmste Antwort: das
+  // Programm liefe und zeigte nichts, und die Ursache stuende nirgends.
+  fn cg_embedFehlt(pfad: pchar, was: pchar) {
+    EPrintStr("error: "c);
+    EPrintStr(was);
+    EPrintStr(": Datei nicht lesbar: "c);
+    EPrintStrLn(pfad);
+    exit(1);
+  }
+
+  // Bytes einbetten und den Datenoffset melden. Gleiche Pfade werden
+  // WIEDERVERWENDET — sonst laege dieselbe Datei mehrfach im Erzeugnis, und
+  // `@embed` neben `@embed_len` auf denselben Pfad ist der Normalfall.
+  fn cg_embedBytes(pfad: pchar, pfadLen: int64): int64 {
+    var e: int64 := 0;
+    while (e < self.embedCount) {
+      var eb: int64 := self.embeds + e * 24;
+      var ep: pchar := peek64(eb) as pchar;
+      var el: int64 := peek64(eb + 8);
+      if (el == pfadLen && self.cg_seq(ep, el, pfad, pfadLen) != 0) {
+        return peek64(eb + 16);
+      }
+      e := e + 1;
+    }
+    var fd: int64 := open(pfad, 0, 0);
+    if (fd < 0) { self.cg_embedFehlt(pfad, "@embed"c); }
+    var sz: int64 := lseek(fd, 0, 2);
+    lseek(fd, 0, 0);
+    if (sz < 0) { close(fd); self.cg_embedFehlt(pfad, "@embed"c); }
+    var off: int64 := self.dataLen;
+    if (sz > 0) {
+      var tmp: int64 := alloc(sz);
+      var gelesen: int64 := 0;
+      while (gelesen < sz) {
+        var n: int64 := read(fd, (tmp + gelesen) as pchar, sz - gelesen);
+        if (n <= 0) { close(fd); self.cg_embedFehlt(pfad, "@embed"c); }
+        gelesen := gelesen + n;
+      }
+      var bi: int64 := 0;
+      while (bi < sz) { self.cg_edata(peek8(tmp + bi)); bi := bi + 1; }
+    }
+    close(fd);
+    // Abschliessende Null: eingebettete TEXTdateien lassen sich damit direkt
+    // als pchar benutzen. Sie zaehlt NICHT zur gemeldeten Groesse — binaere
+    // Daten duerfen davon nichts merken.
+    self.cg_edata(0);
+    if (self.embedCount >= self.embedCap) {
+      var nc: int64 := self.embedCap * 2;
+      if (nc < 8) { nc := 8; }
+      var nb: int64 := alloc(nc * 24);
+      memcpy(nb, self.embeds, self.embedCount * 24);
+      self.embeds := nb;
+      self.embedCap := nc;
+    }
+    var nbase: int64 := self.embeds + self.embedCount * 24;
+    poke64(nbase, pfad as int64);
+    poke64(nbase + 8, pfadLen);
+    poke64(nbase + 16, off);
+    self.embedCount := self.embedCount + 1;
+    return off;
+  }
+
   // #1256: n genullte Bytes im Datenbereich belegen, Offset zurueckgeben.
   fn cg_reserveData(nbytes: int64): int64 {
     var off: int64 := self.dataLen;
@@ -2005,6 +2127,12 @@ pub type Codegen = class {
     if (ni < 0) { return 0; }
     var k: int64 := self.cg_nkind(ni);
     if (k == CGN_LIT_STR) { return 1; }
+    // #1961: `@embed(...)` ist die Adresse der eingebetteten Bytes, also ein
+    // pchar; `@embed_len(...)` (iVal != 0) ist eine Zahl. Ohne diese Zeile gab
+    // `PrintLn(@embed("vorlage.txt"))` die ADRESSE als Zahl aus — dieselbe
+    // Bauart wie #1286 (Rueckgabetyp), #1328 (Feld) und #1652 (Modulvariable),
+    // die weiter unten schon aufgezaehlt sind.
+    if (k == CGN_EMBED && self.cg_nival(ni) == 0) { return 1; }
     if (k == CGN_IDENT) {
       var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
       if (idx >= 0) {
@@ -10430,6 +10558,22 @@ pub type Codegen = class {
         poke32(self.code + ppMH, CG_H_MAP_HAS - ppMH - 4);
       }
 
+    } else if (k == CGN_EMBED) {
+      // #1961: `@embed(...)` liefert die ADRESSE der gepackten Bytes,
+      // `@embed_len(...)` ihre Anzahl. Beide stehen zur Uebersetzungszeit
+      // fest; zur Laufzeit bleibt ein lea bzw. ein mov.
+      var pbox: int64 := alloc(8);
+      var epfad: pchar := self.cg_embedPfad(self.cg_nsval(ni), self.cg_nslen(ni), pbox);
+      var epfadLen: int64 := peek64(pbox);
+      free(pbox, 8);
+      if (self.cg_nival(ni) != 0) {
+        var gr: int64 := self.cg_embedGroesse(epfad);
+        if (gr < 0) { self.cg_embedFehlt(epfad, "@embed_len"c); }
+        self.cg_movRaxImm(gr);
+      } else {
+        self.cg_emitLeaRaxData(self.cg_embedBytes(epfad, epfadLen));
+      }
+
     } else if (k == 100) {
       // WP-BC-51: NK_ARRAY_LIT — [e1, e2, ...] stack-allocated array with {cap,len} header
       // Layout: [rsp+0]=cap, [rsp+8]=len, [rsp+16]=elem0, [rsp+24]=elem1, ...
@@ -10487,6 +10631,14 @@ pub type Codegen = class {
   fn cg_inferPrintType(argNi: int64): int64 {
     var k: int64 := self.cg_nkind(argNi);
     if (k == CGN_LIT_STR)  { return 1; }
+    // #1961: `@embed(...)` ist eine Zeichenkette, `@embed_len(...)` eine Zahl.
+    // Dritte Stelle, die dieselbe Frage beantwortet — neben cg_isPcharExpr
+    // hier und _lowerPrint im IR-Weg. Fehlte sie, gab
+    // `PrintLn(@embed("vorlage.txt"))` die ADRESSE als Zahl aus.
+    if (k == CGN_EMBED) {
+      if (self.cg_nival(argNi) != 0) { return 0; }
+      return 1;
+    }
     if (k == CGN_LIT_FLOAT) { return 2; }
     if (k == CGN_LIT_BOOL)  { return 3; }
     // #1497: ein RECHENAUSDRUCK. Diese Funktion kannte Literale, Bezeichner,
@@ -20888,6 +21040,9 @@ pub type Codegen = class {
 
     self.dataCap     := 16384;
     self.data        := alloc(self.dataCap);
+    self.embeds      := 0;   // #1961: erst bei Bedarf angelegt
+    self.embedCount  := 0;
+    self.embedCap    := 0;
     self.dataLen     := 120; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836)
     self.dataOverflow := 0;  // WP-34  // WP-18: pre-reserve 88 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24, ARGC@32, ARGV@40, FLOAT_BUF@48, CANARY@80)
 
