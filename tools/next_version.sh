@@ -14,8 +14,9 @@
 #   1.0.13A  = naechster Tag mit einem Build, erstes Kompilat
 #
 # Warum ueberhaupt ein Skript: die Version steht an FUENF lebenden Stellen
-# (Makefile, README-Badge, vier Strings in src/lyxc.lyx, Kopf von ebnf.md und
-# die .TH-Kopfzeile von man/lyxc.1 samt gepackter Paketkopie).
+# (Makefile, README-Badge, vier Strings in src/lyxc.lyx, Kopf von ebnf.md, die
+# .TH-Kopfzeile von man/lyxc.1 samt gepackter Paketkopie und das Version-Feld
+# in lyx-compiler/DEBIAN/control).
 # Von Hand gepflegt laufen die auseinander; `tests/version_consistency_test.sh`
 # faengt das ab, aber besser gar nicht erst entstehen lassen.
 #
@@ -42,6 +43,7 @@ README="$ROOT/README.md"
 LYXC="$ROOT/src/lyxc.lyx"
 EBNF="$ROOT/ebnf.md"
 MAN="$ROOT/man/lyxc.1"                                    # #1766
+CONTROL="$ROOT/lyx-compiler/DEBIAN/control"               # #1955
 MANPKG="$ROOT/lyx-compiler/usr/share/man/man1/lyxc.1.gz"  # #1766
 
 DRY=0
@@ -116,6 +118,16 @@ sed -i "s/^VERSION_DATE := .*/VERSION_DATE := $today/"                       "$M
 grep -q '^VERSION_DATE' "$MAKEFILE" || sed -i "/^VERSION   := /a VERSION_DATE := $today" "$MAKEFILE"
 sed -i "s/version-v$cur-blue/version-v$next-blue/"                           "$README"
 sed -i "s/\"$cur\"c/\"$next\"c/g; s/lyxc $cur (bootstrap)/lyxc $next (bootstrap)/; s/lyxc $cur — Copyright/lyxc $next — Copyright/" "$LYXC"
+# #1955: Das Debian-Paket traegt die Version ein siebtes Mal. Die Pruefung in
+# tests/version_consistency_test.sh kannte die Stelle schon, das SETZEN hier
+# nicht — also meldete der Bump jedes Mal einen Fehlschlag, den jemand von Hand
+# nachziehen musste. Pruefung und Setzung sind zwei Aufzaehlungen derselben
+# Sache; eine neue Stelle gehoert in BEIDE.
+if [ -f "$CONTROL" ]; then
+  sed -i "s/^Version:[[:space:]]*.*/Version: $next/" "$CONTROL"
+else
+  echo "WARNUNG lyx-compiler/DEBIAN/control fehlt — Version nicht nachgezogen" >&2
+fi
 sed -i "1s/^# Lyx $cur /# Lyx $next /"                                       "$EBNF"
 sed -i "3s/gegen lyxc $cur geprueft/gegen lyxc $next geprueft/"              "$EBNF"
 sed -i "3s/^> Stand [0-9-]*,/> Stand $today,/"                               "$EBNF"

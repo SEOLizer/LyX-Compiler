@@ -229,6 +229,110 @@ fn main(): int64 {
     return 0;
 }' '12'
 
+# ===========================================================================
+# #1955 Befund 2 — die Umrechnung verlor die Nachkommastellen
+# ===========================================================================
+#
+# Bis 1.2.1A rechneten Einheitenwerte ganzzahlig (#1358). Damit war nicht nur
+# `1250.5 m` unschreibbar, sondern die UMRECHNUNG selbst verlustbehaftet:
+# 2500 m nach km ergab 2 statt 2.5, weil `wert * zaehler / nenner` als
+# Ganzzahldivision lief. Fuer eine Einheitenbibliothek ist das der Kern —
+# genau die Umrechnung, wegen der man Einheitentypen ueberhaupt benutzt.
+#
+# Gemessen wird deshalb der WERT nach der Umrechnung, in beide Richtungen.
+# Ein Test, der nur "uebersetzt" prueft, waere auch von der alten,
+# abschneidenden Rechnung erfuellt gewesen.
+out "Umrechnung nach oben behaelt die Nachkommastellen" 'import std.io;
+dim Length;
+utype M: Length = 1.0;
+utype Km: Length = 1000.0;
+fn main(): int64 {
+    var a: M := 2500;
+    var b: Km := a;
+    PrintLn(FloatToStr(b as f64, 4));
+    return 0;
+}' '2.5000'
+
+out "Umrechnung nach unten rechnet ebenso" 'import std.io;
+dim Length;
+utype M: Length = 1.0;
+utype Km: Length = 1000.0;
+fn main(): int64 {
+    var c: Km := 1;
+    var d: M := c;
+    PrintLn(FloatToStr(d as f64, 1));
+    return 0;
+}' '1000.0'
+
+out "gebrochener Wert ueberlebt die Umrechnung" 'import std.io;
+dim Length;
+utype M: Length = 1.0;
+utype Km: Length = 1000.0;
+fn main(): int64 {
+    var a: M := 1250.5;
+    var b: Km := a;
+    PrintLn(FloatToStr(b as f64, 4));
+    return 0;
+}' '1.2505'
+
+# Der Faktor bleibt ein BRUCH (#1158). Bei 0.017453 ist das nachweisbar:
+# 1000 deg sind 17.453 rad — ein eingefrorener, gerundeter Gleitkommafaktor
+# traefe die vierte Stelle nicht mehr.
+out "Bruchfaktor rechnet exakt weiter" 'import std.io;
+dim Winkel;
+utype Rad: Winkel = 1.0;
+utype Deg: Winkel = 0.017453;
+fn main(): int64 {
+    var w: Deg := 1000;
+    var r: Rad := w;
+    PrintLn(FloatToStr(r as f64, 4));
+    return 0;
+}' '17.4530'
+
+# Und die Grenzen muessen auf GEBROCHENEN Werten weiter greifen. Sie werden im
+# Codegen unmittelbar neben der Umrechnung durchgesetzt; bliebe dort der
+# ganzzahlige Vergleich stehen, verglichen sie ab jetzt IEEE-Bitmuster statt
+# Zahlen und liessen stillschweigend alles durch.
+panics "range greift auch bei gebrochenem Wert" 'import std.io;
+dim G;
+utype Pct: G = 1 range 0..100;
+fn calc(): f64 { return 100.5; }
+fn main(): int64 {
+    var p: Pct := calc();
+    PrintLn("weiter");
+    return 0;
+}'
+
+out "range laesst den gebrochenen Wert INNERHALB durch" 'import std.io;
+dim G;
+utype Pct: G = 1 range 0..100;
+fn calc(): f64 { return 99.5; }
+fn main(): int64 {
+    var p: Pct := calc();
+    PrintLn(FloatToStr(p as f64, 1));
+    return 0;
+}' '99.5'
+
+out "wraps rechnet einen gebrochenen Wert in den Bereich" 'import std.io;
+dim G;
+utype Deg: G = 1 wraps 0..359;
+fn calc(): f64 { return 400.5; }
+fn main(): int64 {
+    var w: Deg := calc();
+    PrintLn(FloatToStr(w as f64, 1));
+    return 0;
+}' '40.5'
+
+out "wraps auch nach unten mit Nachkomma" 'import std.io;
+dim G;
+utype Deg: G = 1 wraps 0..359;
+fn calc(): f64 { return 0.0 - 0.5; }
+fn main(): int64 {
+    var w: Deg := calc();
+    PrintLn(FloatToStr(w as f64, 1));
+    return 0;
+}' '359.5'
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 test "$FAIL" -eq 0
