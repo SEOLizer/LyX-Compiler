@@ -131,12 +131,39 @@ fn main(): int64 { PrintLn(IntToStr(f())); return 0; }' "undefined symbol"
 # #1358 — Einheitentypen werden beurteilt
 # ===========================================================================
 
-# Einheitentypen rechnen ganzzahlig; ein Gleitkomma-Startwert ist derselbe
-# Fehler wie bei int64 und wird jetzt genauso gemeldet.
-weist_ab "f64-Startwert fuer einen Einheitentyp wird gemeldet" 'import std.io;
+# #1955: Einheitentypen rechnen seit 1.2.2A in GLEITKOMMA, ein gebrochener
+# Startwert ist also erlaubt — und muss ANKOMMEN.
+#
+# Diese Pruefung stand hier bis dahin umgekehrt: sie nahm die Ablehnung
+# "Einheitentyp erwartet, f64 gegeben" als Nachweis fuer #1358. Das war der
+# Nachweis fuer den damaligen Codegen (ganzzahlige Slots, in denen ein
+# IEEE-Bitmuster nichts verloren hatte), aber er setzte die Luecke voraus:
+# sobald sie zugeht, wird der Test rot, ohne dass etwas kaputt ist.
+#
+# Was von #1358 zu halten bleibt, misst der Test darunter mit: der Wert darf
+# nicht als BITMUSTER im Slot landen. Deshalb wird hier der Wert gelesen und
+# nicht bloss "uebersetzt durch" geprueft — 100.5 muss 100.5 sein, nicht
+# 4,9e-322 und nicht die abgeschnittene 100.
+out "gebrochener Startwert fuer einen Einheitentyp kommt an" 'import std.io;
 dim Length;
 utype m: Length = 1.0;
-fn main(): int64 { var d: m := 100.0; return d as int64; }' "Einheitentyp erwartet, f64 gegeben"
+fn main(): int64 {
+  var d: m := 100.5;
+  PrintLn(FloatToStr(d as f64, 2));
+  return 0;
+}' "100.50"
+
+# Gegenprobe zu #1358: der Wert steht als ZAHL im Slot, nicht als Bitmuster.
+# Waere er ein Bitmuster, ergaebe die Verdopplung Unsinn statt 201.
+out "gebrochener Einheitenwert rechnet weiter" 'import std.io;
+dim Length;
+utype m: Length = 1.0;
+fn main(): int64 {
+  var d: m := 100.5;
+  var e: m := d * 2;
+  PrintLn(FloatToStr(e as f64, 2));
+  return 0;
+}' "201.00"
 
 out "Einheitentyp mit Ganzzahl rechnet richtig" 'import std.io;
 dim Length;

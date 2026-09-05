@@ -4988,6 +4988,23 @@ pub type Codegen = class {
   fn cg_isFloatTypeName(tp: pchar, tln: int64): int64 {
     if (self.cg_seq(tp, tln, "f64"c, 3) != 0) { return 1; }
     if (self.cg_seq(tp, tln, "f32"c, 3) != 0) { return 1; }
+    // #1955: Einheitentypen rechnen ab 1.2.1A in Gleitkomma.
+    //
+    // Bis dahin lagen sie in ganzzahligen Slots (#1358), und damit war jede
+    // physikalische Groesse gesperrt: 12,5 V, 4,7 kOhm, 10 nF liessen sich
+    // nicht ausdruecken. Fuer Laengen in Metern reichte das, fuer alles
+    // Technische nicht — also ausgerechnet dort nicht, wo eine
+    // Einheitenverwechslung am teuersten ist.
+    //
+    // Der Umrechnungsfaktor bleibt ein BRUCH (cg_utypeFactor/-Den, #1158):
+    // gerechnet wird `wert * zaehler / nenner` in Gleitkomma, `deg` also
+    // weiterhin exakt als 17453.../1000000 und nicht als eingefrorener,
+    // abgeschnittener Gleitkommafaktor.
+    //
+    // Diese eine Zeile lenkt den gesamten Wertepfad um: Speicher, Arithmetik
+    // und Ausgabe entscheiden sich im Codegen am TYPNAMEN, nicht an einer
+    // eigenen Fallunterscheidung.
+    if (self.cg_findUtype(tp, tln) >= 0) { return 1; }
     return 0;
   }
 
@@ -7622,14 +7639,31 @@ pub type Codegen = class {
   // multiplizieren, dann teilen — die andere Reihenfolge verschenkte bei
   // ganzzahliger Rechnung unnoetig Stellen. Km -> M ist exakt, M -> Km
   // schneidet ab, wie die Ganzzahldivision sonst auch (ebnf.md §20.1).
+  // Hilfsbefehle fuer die Einheitenrechnung (#1955). Der Wert liegt in rax als
+  // IEEE-754-Bitmuster, genau wie bei jedem anderen f64 im Codegen.
+  fn cg_uMovXmm0Rax()   { self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC0); }
+  fn cg_uMovRaxXmm0()   { self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0); }
+  // movabs rcx, v; cvtsi2sd <xmmReg>, rcx  — Ganzzahl v als f64 laden.
+  fn cg_uLoadConst(xmmReg: int64, v: int64) {
+    self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(v);
+    self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A);
+    self.cg_e8(0xC1 + xmmReg * 8);
+  }
+
   fn cg_emitUtypeConv(dstIdx: int64, srcIdx: int64) {
     if (dstIdx < 0 || srcIdx < 0) { return; }
     if (dstIdx == srcIdx) { return; }
     // #1158: Die Faktoren sind Brueche (sn/sd bzw. dn/dd). Umgerechnet wird
-    // mit  wert * (sn*dd) / (sd*dn)  — erst multiplizieren, dann teilen, wie
-    // schon bei den ganzzahligen Faktoren, damit moeglichst wenig Stellen
-    // verloren gehen. Gekuerzt wird vorher, sonst laufen die Zwischenprodukte
-    // bei Faktoren wie 0.017453 unnoetig gross.
+    // mit  wert * (sn*dd) / (sd*dn)  — erst multiplizieren, dann teilen.
+    // Gekuerzt wird vorher, sonst laufen die Zwischenprodukte bei Faktoren wie
+    // 0.017453 unnoetig gross.
+    //
+    // #1955: Gerechnet wird seit 1.2.2A in GLEITKOMMA. Der Faktor bleibt aber
+    // ein BRUCH — er wird erst hier, im letzten Moment, zu zwei f64-Werten
+    // erweitert und nie als abgeschnittene Dezimalzahl gespeichert. `deg` ist
+    // damit weiterhin exakt 17453.../1000000. Vorher lief dieselbe Rechnung
+    // ganzzahlig auf rax, und `2500 M as Km` ergab 2 statt 2.5: die
+    // Umrechnung selbst warf die Nachkommastellen weg.
     var sn: int64 := self.cg_utypeFactor(srcIdx);
     var sd: int64 := self.cg_utypeFactorDen(srcIdx);
     var dn: int64 := self.cg_utypeFactor(dstIdx);
@@ -7640,19 +7674,18 @@ pub type Codegen = class {
     mul := mul / g;
     div := div / g;
     if (mul == div) { return; }
+    self.cg_uMovXmm0Rax();
     if (mul != 1) {
-      // movabs rcx, mul; imul rax, rcx  — imm64, weil der gekuerzte Zaehler
-      // nicht in 32 Bit passen muss.
-      self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(mul);
-      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xAF); self.cg_e8(0xC1);
+      self.cg_uLoadConst(1, mul);
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x59); self.cg_e8(0xC1);  // mulsd xmm0, xmm1
     }
     if (div != 1) {
-      // movabs rcx, div; cqo; idiv rcx
-      self.cg_e8(0x48); self.cg_e8(0xB9); self.cg_e64(div);
-      self.cg_e8(0x48); self.cg_e8(0x99);
-      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
+      self.cg_uLoadConst(1, div);
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5E); self.cg_e8(0xC1);  // divsd xmm0, xmm1
     }
+    self.cg_uMovRaxXmm0();
   }
+
 
   // #1110: Grenzen eines Einheitentyps durchsetzen (§11 UtypeRangeModifier).
   // `range` bricht ausserhalb mit panic ab — wie der Bereichstyp aus #1097.
@@ -7668,33 +7701,52 @@ pub type Codegen = class {
     if ((flags & 1) == 0) { return; }
     var lo: int64 := peek64(base + 40);
     var hi: int64 := peek64(base + 48);
+    // #1955: Seit Einheitenwerte in Gleitkomma liegen, MUSS auch hier in
+    // Gleitkomma verglichen werden. Ein ganzzahliger `cmp rax, lo` auf einem
+    // IEEE-Bitmuster vergleicht nicht den Wert, sondern die Bits — die Grenzen
+    // pruefen dann stillschweigend gar nichts mehr (jede positive Zahl haette
+    // ein riesiges Bitmuster). Das ist die Klasse "zweite Stelle nicht
+    // nachgezogen": die Rechnung wurde umgestellt, die Pruefung daneben nicht.
     if ((flags & 2) != 0) {
-      // wraps: rax := ((rax - lo) mod span + span) mod span + lo
+      // wraps: wert := (t - floor(t)) * span + lo,  mit t = (wert - lo)/span.
       var span: int64 := hi - lo + 1;
       if (span <= 0) { return; }
+      self.cg_uMovXmm0Rax();
       if (lo != 0) {
-        self.cg_e8(0x48); self.cg_e8(0x2D); self.cg_e32(lo);           // sub rax, lo
+        self.cg_uLoadConst(1, lo);
+        self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5C); self.cg_e8(0xC1);  // subsd xmm0, xmm1
       }
-      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1); self.cg_e32(span); // mov rcx, span
-      self.cg_e8(0x48); self.cg_e8(0x99);                               // cqo
-      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);            // idiv rcx
-      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);            // mov rax, rdx (Rest)
-      // Rest kann negativ sein: + span, dann erneut mod
-      self.cg_e8(0x48); self.cg_e8(0x05); self.cg_e32(span);            // add rax, span
-      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC1); self.cg_e32(span);
-      self.cg_e8(0x48); self.cg_e8(0x99);
-      self.cg_e8(0x48); self.cg_e8(0xF7); self.cg_e8(0xF9);
-      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);
+      self.cg_uLoadConst(3, span);                                              // xmm3 = span
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5E); self.cg_e8(0xC3);    // divsd xmm0, xmm3
+      // floor(t): abschneiden, und bei negativem t um 1 zurueck. `roundsd`
+      // waere kuerzer, verlangt aber SSE4.1 — der Codegen setzt nur den
+      // x86-64-Grundbefehlssatz voraus.
+      self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2C); self.cg_e8(0xC8); // cvttsd2si rcx, xmm0
+      self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xD1); // cvtsi2sd xmm2, rcx
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x2E); self.cg_e8(0xD0);   // ucomisd xmm2, xmm0
+      self.cg_e8(0x76); var pSkip: int64 := self.codeLen; self.cg_e8(0);        // jbe skip
+      self.cg_uLoadConst(1, 1);
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5C); self.cg_e8(0xD1);   // subsd xmm2, xmm1
+      cg_patchRel8(self.code, pSkip, self.codeLen);
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5C); self.cg_e8(0xC2);   // subsd xmm0, xmm2 (Nachkommateil)
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x59); self.cg_e8(0xC3);   // mulsd xmm0, xmm3
       if (lo != 0) {
-        self.cg_e8(0x48); self.cg_e8(0x05); self.cg_e32(lo);            // add rax, lo
+        self.cg_uLoadConst(1, lo);
+        self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x58); self.cg_e8(0xC1); // addsd xmm0, xmm1
       }
+      self.cg_uMovRaxXmm0();
       return;
     }
-    // range: unter lo oder ueber hi -> panic
-    self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e32(lo);                // cmp rax, lo
-    self.cg_e8(0x7C); var pLo: int64 := self.codeLen; self.cg_e8(0);    // jl -> panic
-    self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e32(hi);                // cmp rax, hi
-    self.cg_e8(0x7E); var pOk: int64 := self.codeLen; self.cg_e8(0);    // jle -> ok
+    // range: unter lo oder ueber hi -> panic. `jb` faengt zugleich NaN ab:
+    // ucomisd setzt bei einem NaN-Operanden CF=1 (#1128), der Wert gilt damit
+    // als ausserhalb — richtig, ein NaN liegt in keinem Bereich.
+    self.cg_uMovXmm0Rax();
+    self.cg_uLoadConst(1, lo);
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x2E); self.cg_e8(0xC1);     // ucomisd xmm0, xmm1
+    self.cg_e8(0x72); var pLo: int64 := self.codeLen; self.cg_e8(0);            // jb -> panic
+    self.cg_uLoadConst(1, hi);
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x2E); self.cg_e8(0xC1);     // ucomisd xmm0, xmm1
+    self.cg_e8(0x76); var pOk: int64 := self.codeLen; self.cg_e8(0);            // jbe -> ok
     cg_patchRel8(self.code, pLo, self.codeLen);
     self.cg_pushRax();
     var msgOff: int64 := self.dataLen;
@@ -7707,6 +7759,7 @@ pub type Codegen = class {
     self.cg_popRax();
     cg_patchRel8(self.code, pOk, self.codeLen);
   }
+
 
   // #1110: Einheit des Ausdrucks, soweit der Codegen sie kennt. Nur der Fall,
   // der zaehlt: eine Variable mit deklariertem Einheitentyp. Alles andere
@@ -15108,6 +15161,14 @@ pub type Codegen = class {
         self.cg_emitNarrowRax(self.cg_narrowKindOfVar(name, nlen));
         // #1110: in die Einheit der Zielvariablen umrechnen, dann die Grenzen.
         var utDst2: int64 := self.cg_utypeOfLocal(name, nlen);
+        // #1955: dieselbe Angleichung wie bei der Deklaration (#1502, Zeile
+        // oberhalb): steht rechts eine GANZZAHL und links ein Einheitentyp,
+        // muss sie erst nach double gewandelt werden — sonst laege ihr
+        // Bitmuster im Slot, und Faktor wie Grenzen rechneten auf Unsinn.
+        // Die beiden Stellen muessen uebereinstimmen.
+        if (utDst2 >= 0 && self.cg_isF64Expr(rhs) == 0) {
+          self.cg_emitRaxIntToF64();
+        }
         self.cg_emitUtypeConv(utDst2, self.cg_utypeOfExpr(rhs));
         self.cg_emitUtypeRange(utDst2);
         var off: int64 := self.cg_findLocal(name, nlen);
