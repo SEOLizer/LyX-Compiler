@@ -5954,6 +5954,32 @@ pub type Codegen = class {
     return 0 as pchar;
   }
 
+  // #1963: Der Typname eines Feldes, gesucht ueber den KLASSENINDEX statt
+  // ueber den Ausdrucksknoten. Der Schreibpfad hat den Knoten nicht zur Hand,
+  // nur Klasse und Feldname. cg_fieldTypeNameOf oben macht dieselbe Suche mit
+  // dem Knoten und ruft jetzt hierher durch — zwei Abschriften derselben
+  // Schleife waeren genau die Sorte Doppelung, aus der spaeter eine Divergenz
+  // wird.
+  fn cg_fieldTypeNameIn(classIdx: int64, fieldName: pchar, fieldLen: int64, lenBox: int64): pchar {
+    poke64(lenBox, 0);
+    if (classIdx < 0) { return 0 as pchar; }
+    var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var p: pchar := peek64(fb) as pchar;
+      var n: int64 := peek64(fb + CG_CFIELD_OFF_FIELDLEN);
+      if (n == fieldLen && self.cg_seq(p, n, fieldName, fieldLen)) {
+        poke64(lenBox, peek64(fb + CG_CFIELD_OFF_TYPENAMELEN));
+        return peek64(fb + CG_CFIELD_OFF_TYPENAMEPTR) as pchar;
+      }
+      i += 1;
+    }
+    return 0 as pchar;
+  }
+
   fn cg_getFieldClassIdx(classIdx: int64, fieldName: pchar, fieldLen: int64): int64 {
     if (classIdx < 0) { return -1; }
     var base: int64 := self.classLayouts + classIdx * CG_CLASS_SZ;
@@ -7764,10 +7790,72 @@ pub type Codegen = class {
   // #1110: Einheit des Ausdrucks, soweit der Codegen sie kennt. Nur der Fall,
   // der zaehlt: eine Variable mit deklariertem Einheitentyp. Alles andere
   // liefert -1 und loest keine Umrechnung aus.
+  // #1963: Woher kann ein Einheitenwert kommen?
+  //
+  // Diese Funktion kannte NUR den Bezeichner. Alles andere lieferte -1, und
+  // cg_emitUtypeConv kehrt bei -1 sofort zurueck — die Umrechnung entfiel
+  // damit STUMM. `var b: Km := a;` ergab 2.5, `var b: Km := a as Km;` dagegen
+  // 2500. Kein Fehler, keine Meldung, nur eine falsche Zahl, die wie eine
+  // gueltige Groesse aussieht.
+  //
+  // Es ist die im Projekt mehrfach belegte Klasse "eine Aufzaehlung ist
+  // unvollstaendig" — dieselbe Form wie _localTypeNode (#1787, #1812) und
+  // _findLocalSlot (#1806). Die Herkuenfte sind deshalb hier dieselben wie in
+  // cg_isF64Expr; die beiden Aufzaehlungen beantworten verschiedene Fragen
+  // ueber DENSELBEN Ausdruck und muessen zusammen wachsen. Wer eine neue
+  // Herkunft anlegt, traegt sie in BEIDE ein.
   fn cg_utypeOfExpr(ni: int64): int64 {
     if (ni < 0) { return 0 - 1; }
-    if (self.cg_nkind(ni) != CGN_IDENT) { return 0 - 1; }
-    return self.cg_utypeOfLocal(self.cg_nsval(ni), self.cg_nslen(ni));
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_IDENT) {
+      var uLoc: int64 := self.cg_utypeOfLocal(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (uLoc >= 0) { return uLoc; }
+      // Eine GLOBALE Variable mit Einheitentyp. Ein Local gleichen Namens
+      // verdeckt sie, darum erst hier — wie in cg_isF64Expr (#1373).
+      var gi: int64 := self.cg_findGlobalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (gi >= 0) {
+        var gp: pchar := peek64(self.globalTypeNames + gi * 16) as pchar;
+        var gl: int64 := peek64(self.globalTypeNames + gi * 16 + 8);
+        if (gp != 0 as pchar && gl > 0) { return self.cg_findUtype(gp, gl); }
+      }
+      return 0 - 1;
+    }
+    // Der `as`-Cast zwischen zwei Einheiten DERSELBEN Dimension ist eine
+    // Umrechnung, keine Umdeutung: `a as Km` meint dieselbe Strecke in einer
+    // anderen Einheit. Die Quelleinheit steht am Ausdruck darunter, die
+    // Zieleinheit am Typknoten — massgeblich ist hier das ZIEL, denn der
+    // Cast-Ausdruck traegt die Einheit, in die er umwandelt.
+    if (k == CGN_CAST) {
+      var tn: int64 := self.cg_nc1(ni);
+      if (tn >= 0) { return self.cg_utypeOfTypeNode(tn); }
+      return 0 - 1;
+    }
+    // Das AUFRUFERGEBNIS. `var b: Km := hoehe();` mit `hoehe(): M` rechnete
+    // nicht um. Methodenaufrufe (iVal == 1) bleiben aussen vor: ihr
+    // Rueckgabetyp steht unter dem gemangelten Namen "Klasse_Methode", und
+    // nach dem nackten Namen zu suchen waere eine Zuordnung zu weit — eine
+    // gleichnamige Methode einer anderen Klasse wuerde dann die Einheit
+    // stellen. Der Fall gehoert nachgezogen, sobald er gebraucht wird; bis
+    // dahin gilt hier "unbekannt" (-1) und nicht "irgendeine Einheit".
+    if (k == CGN_CALL) {
+      if (self.cg_nival(ni) == 1) { return 0 - 1; }
+      var rbox: int64 := alloc(8);
+      var rtp: pchar := self.cg_funcRetTypeName(self.cg_nsval(ni), self.cg_nslen(ni), rbox);
+      var rtl: int64 := peek64(rbox);
+      free(rbox, 8);
+      if (rtp != 0 as pchar && rtl > 0) { return self.cg_findUtype(rtp, rtl); }
+      return 0 - 1;
+    }
+    // Der FELDZUGRIFF: `var b: Km := s.strecke;` mit `strecke: M`.
+    if (k == CGN_FIELD) {
+      var fbox: int64 := alloc(8);
+      var ftp: pchar := self.cg_fieldTypeNameOf(ni, fbox);
+      var ftl: int64 := peek64(fbox);
+      free(fbox, 8);
+      if (ftp != 0 as pchar && ftl > 0) { return self.cg_findUtype(ftp, ftl); }
+      return 0 - 1;
+    }
+    return 0 - 1;
   }
 
   fn cg_addRangeType(name: pchar, nameLen: int64, lo: int64, hi: int64, flags: int64) {
@@ -9896,6 +9984,25 @@ pub type Codegen = class {
           self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xC0);
           // movq rax, xmm0      (66 48 0F 7E C0)
           self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);
+        }
+        // #1963: Ein Cast zwischen zwei EINHEITEN derselben Dimension ist eine
+        // UMRECHNUNG, keine Umdeutung — `a as Km` meint dieselbe Strecke in
+        // einer anderen Einheit. Ohne diese Stelle blieb der Zahlenwert
+        // unveraendert stehen: aus 2500 m wurden 2500 km, und weil der Cast
+        // ausdruecklich dasteht, sah es wie eine gewollte Umwandlung aus.
+        //
+        // Die Zuweisung konnte das nicht auffangen. Sie vergleicht Quell- und
+        // Zieleinheit, und die Quelle IST hier schon Km (der Cast-Ausdruck
+        // traegt die Einheit, in die er umwandelt) — beide gleich, also nichts
+        // zu tun. Umgerechnet werden muss deshalb genau hier, zwischen dem
+        // Ausdruck darunter und dem Zieltyp.
+        var utCastDst: int64 := self.cg_utypeOfTypeNode(typeNode);
+        if (utCastDst >= 0) {
+          var utCastSrc: int64 := self.cg_utypeOfExpr(self.cg_nc0(ni));
+          if (utCastSrc >= 0) {
+            self.cg_emitUtypeConv(utCastDst, utCastSrc);
+            self.cg_emitUtypeRange(utCastDst);
+          }
         }
         // R5: f64 → int64: cvttsd2si (truncate-towards-zero)
         if (self.cg_seq(tname, tlen, "int64", 5) || self.cg_seq(tname, tlen, "i64", 3)) {
@@ -15238,6 +15345,25 @@ pub type Codegen = class {
         // #1097: Feld vom Bereichstyp — der Wert steht in rax, bevor er in das
         // Feld geht.
         self.cg_emitRangeCheck(self.cg_rangeOfField(classIdx, fieldName, fieldLen), "Feld"c);
+        // #1963: Ein Feld mit EINHEITENTYP bekam den Wert roh. `st.s := 2500`
+        // legte die Ganzzahl 2500 in einen Slot, der seit #1955 als double
+        // gelesen wird — herausgelesen kam 1,2e-320, formatiert 0.00. Dieselbe
+        // Angleichung wie bei Deklaration (#1502) und Zuweisung an ein Local;
+        // die drei Stellen muessen uebereinstimmen. Danach die Umrechnung, wie
+        // ueberall: die Einheit des Feldes ist das Ziel.
+        var utFld: int64 := 0 - 1;
+        if (classIdx >= 0) {
+          var fbx: int64 := alloc(8);
+          var ftn: pchar := self.cg_fieldTypeNameIn(classIdx, fieldName, fieldLen, fbx);
+          var ftnL: int64 := peek64(fbx);
+          free(fbx, 8);
+          if (ftn != 0 as pchar && ftnL > 0) { utFld := self.cg_findUtype(ftn, ftnL); }
+        }
+        if (utFld >= 0) {
+          if (self.cg_isF64Expr(rhs) == 0) { self.cg_emitRaxIntToF64(); }
+          self.cg_emitUtypeConv(utFld, self.cg_utypeOfExpr(rhs));
+          self.cg_emitUtypeRange(utFld);
+        }
         self.cg_pushRax();
         self.cg_genExpr(obj);
         var foff: int64 := -1;

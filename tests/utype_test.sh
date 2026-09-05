@@ -333,6 +333,93 @@ fn main(): int64 {
     return 0;
 }' '359.5'
 
+# ===========================================================================
+# #1963 — die Umrechnung kannte nur EINE Herkunft
+# ===========================================================================
+#
+# cg_utypeOfExpr sah nur den Bezeichner; bei Cast, Aufrufergebnis und
+# Feldzugriff lieferte sie -1, und cg_emitUtypeConv kehrte daraufhin STUMM
+# zurueck. `var b: Km := a;` ergab 2.5, `var b: Km := a as Km;` dagegen 2500 —
+# kein Fehler, keine Meldung, nur eine falsche Zahl, die wie eine gueltige
+# Groesse aussieht.
+#
+# Geprueft wird jede Herkunft EINZELN und am WERT. Ein Test, der nur eine
+# davon misst, waere von genau dem Zustand erfuellt gewesen, der hier behoben
+# wird.
+out "Umrechnung aus einem Bezeichner" 'import std.io;
+dim Length;
+utype M: Length = 1.0;
+utype Km: Length = 1000.0;
+fn main(): int64 {
+    var a: M := 2500;
+    var b: Km := a;
+    PrintLn(FloatToStr(b as f64, 4));
+    return 0;
+}' '2.5000'
+
+out "Umrechnung im as-Cast" 'import std.io;
+dim Length;
+utype M: Length = 1.0;
+utype Km: Length = 1000.0;
+fn main(): int64 {
+    var a: M := 2500;
+    var b: Km := a as Km;
+    PrintLn(FloatToStr(b as f64, 4));
+    return 0;
+}' '2.5000'
+
+out "Umrechnung aus einem Aufrufergebnis" 'import std.io;
+dim Length;
+utype M: Length = 1.0;
+utype Km: Length = 1000.0;
+fn hoehe(): M { return 2500; }
+fn main(): int64 {
+    var b: Km := hoehe();
+    PrintLn(FloatToStr(b as f64, 4));
+    return 0;
+}' '2.5000'
+
+out "Umrechnung aus einem Feldzugriff" 'import std.io;
+dim Length;
+utype M: Length = 1.0;
+utype Km: Length = 1000.0;
+type Strecke = struct { s: M; };
+fn main(): int64 {
+    var st: Strecke;
+    st.s := 2500;
+    var b: Km := st.s;
+    PrintLn(FloatToStr(b as f64, 4));
+    return 0;
+}' '2.5000'
+
+# Ein Feld mit Einheitentyp muss den Wert auch als ZAHL halten. Stuende dort
+# das rohe Bitmuster der Ganzzahl, lieferte das Lesen 1,2e-320 — formatiert
+# 0.00, also eine Null, die nach einem Rechenfehler aussieht statt nach einem
+# Speicherfehler.
+out "Feld mit Einheitentyp haelt den Wert" 'import std.io;
+dim Length;
+utype M: Length = 1.0;
+type Strecke = struct { s: M; };
+fn main(): int64 {
+    var st: Strecke;
+    st.s := 1250.5;
+    PrintLn(FloatToStr(st.s as f64, 1));
+    return 0;
+}' '1250.5'
+
+# GEGENPROBE: gleiche Einheit heisst KEINE Rechnung. Ohne diese Pruefung waere
+# der Test auch von einer Fassung erfuellt, die bei jedem Cast irgendeinen
+# Faktor anwendet.
+out "gleiche Einheit bleibt unveraendert" 'import std.io;
+dim Length;
+utype M: Length = 1.0;
+fn main(): int64 {
+    var a: M := 2500;
+    var b: M := a as M;
+    PrintLn(FloatToStr(b as f64, 1));
+    return 0;
+}' '2500.0'
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 test "$FAIL" -eq 0
