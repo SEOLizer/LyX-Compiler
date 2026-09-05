@@ -154,7 +154,13 @@ compile_ok "stat_compiles"     'fn main(): int64 { var s: int64 := 0; return sta
 compile_ok "lstat_compiles"    'fn main(): int64 { var s: int64 := 0; return lstat("f", s); }'
 compile_fail "symlink_meldet"  'fn main(): int64 { return symlink("a", "b"); }' "gibt es in LyxOS nicht"
 compile_ok "nanosleep_compiles" 'fn main(): int64 { var ts: int64 := 0; return nanosleep(ts, 0); }'
-compile_fail "pipe_meldet"     'fn main(): int64 { var a: int64 := 0; var b: int64 := 0; return pipe(a, b, 0); }' "gibt es in LyxOS nicht"
+# #1958: Bis LyxOS 564aa74 wurde `pipe` abgelehnt, weil es die NUMMER nicht
+# gab. Seither gibt es sie (sys_pipe 524) — die GESTALT passt aber weiterhin
+# nicht: der Kernel nimmt (fds_uva, flags), unsere Form drei Argumente. Die
+# Ablehnung bleibt also richtig, ihre Begruendung hat sich geaendert, und die
+# Meldung sagt das jetzt. Geprueft wird deshalb auf die neue Begruendung: auf
+# die alte zu pruefen hiesse verlangen, dass der Compiler etwas Unwahres sagt.
+compile_fail "pipe_meldet"     'fn main(): int64 { var a: int64 := 0; var b: int64 := 0; return pipe(a, b, 0); }' "nicht in dieser Aufrufform"
 compile_fail "truncate_meldet" 'fn main(): int64 { return truncate(3, 100); }' "gibt es in LyxOS nicht"
 compile_fail "rmdir_meldet"    'fn main(): int64 { return rmdir("d"); }' "gibt es in LyxOS nicht"
 compile_ok "eprintint_compiles" 'fn main(): int64 { EPrintInt(42); return 0; }'
