@@ -100,6 +100,7 @@ con CGN_MATCH_CASE:  int64 := 65;  // WP-15: case pattern => expr
 con CGN_RANGE:        int64 := 73;  // WP-17: range expression: 1..100
 con CGN_WHERE:        int64 := 74;  // WP-17: where clause: type X where constraint
 con CGN_EMBED:        int64 := 134;  // #1961: @embed / @embed_len
+con CGN_RESOURCE:     int64 := 135;  // #1961 Stufe 2: @resource("name","pfad")
 con CGN_EXTERN_DATA:  int64 := 75;  // WSP-07: extern "asm" name: Type;
 con CGN_IS_EXPR:      int64 := 72;  // WP-16: x is Type
 
@@ -425,6 +426,21 @@ con CG_ENVBLOCK: int64 := 96; // data[96..103]: _lyx_envblock (8 bytes)
 con CG_HEAP_PTR: int64 := 104; // data[104..111]: _lyx_heap_ptr
 con CG_HEAP_END: int64 := 112; // data[112..119]: _lyx_heap_end
 
+// #1961 Stufe 2: Zeiger auf die RESSOURCENTABELLE, oder 0, wenn das Programm
+// keine `@resource`-Angabe traegt. Der Aufbau der Tabelle (alles int64, damit
+// std.res sie mit peek64 lesen kann):
+//
+//   [0]              Anzahl der Eintraege
+//   [1 + i*4 + 0]    Zeiger auf den Namen (NUL-terminiert)
+//   [1 + i*4 + 1]    Laenge des Namens
+//   [1 + i*4 + 2]    Zeiger auf die Bytes
+//   [1 + i*4 + 3]    Anzahl der Bytes
+//
+// Gelesen wird sie ueber das Builtin `GetResTable()` — dasselbe Muster wie
+// CG_ENVBLOCK/GetEnvBlock (#1677): der Codegen kennt die Adresse, die
+// Bibliothek rechnet in Lyx weiter.
+con CG_RESTAB: int64 := 120;   // data[120..127]: _lyx_restab
+
 // #1915: Einen KURZSPRUNG (rel8) nachtragen — mit Pruefung statt mit Abschnitt.
 //
 // `poke8` nimmt jeden Wert und verwirft die oberen Bits. Aus einer Distanz von
@@ -582,6 +598,14 @@ pub type Codegen = class {
   embeds:     int64;   // #1961: {pfad, pfadLen, dataOff} je 24 Byte
   embedCount: int64;
   embedCap:   int64;
+  // #1961 Stufe 2: gesammelte @resource-Angaben, je 32 Byte
+  // {namePtr, nameLen, pfadPtr, pfadLen}. Ausgelegt wird die Tabelle erst
+  // NACH dem Durchlauf (cg_emitResTable) — vorher steht nicht fest, wie viele
+  // es sind.
+  ress:      int64;
+  resCount:  int64;
+  resCap:    int64;
+  resTabOff: int64;   // Datenoffset der fertigen Tabelle, -1 solange keine da
   dataCap: int64;
 
   // Local variable table
@@ -1785,6 +1809,109 @@ pub type Codegen = class {
     poke64(nbase + 16, off);
     self.embedCount := self.embedCount + 1;
     return off;
+  }
+
+  // #1961 Stufe 2: eine `@resource`-Angabe merken. Der Name muss EINDEUTIG
+  // sein — "letzter gewinnt" waere ein stiller Austausch, und welche Datei
+  // dann im Erzeugnis landet, saehe man erst am laufenden Programm.
+  fn cg_addResource(nm: pchar, nmLen: int64, pf: pchar, pfLen: int64) {
+    var i: int64 := 0;
+    while (i < self.resCount) {
+      var rb: int64 := self.ress + i * 32;
+      if (peek64(rb + 8) == nmLen && self.cg_seq(peek64(rb) as pchar, nmLen, nm, nmLen) != 0) {
+        EPrintStr("error: @resource: der Name kommt zweimal vor: "c);
+        EPrintStrLn(nm);
+        exit(1);
+      }
+      i := i + 1;
+    }
+    if (self.resCount >= self.resCap) {
+      var nc: int64 := self.resCap * 2;
+      if (nc < 8) { nc := 8; }
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.ress, self.resCount * 32);
+      self.ress := nb;
+      self.resCap := nc;
+    }
+    var base: int64 := self.ress + self.resCount * 32;
+    poke64(base,      nm as int64);
+    poke64(base + 8,  nmLen);
+    poke64(base + 16, pf as int64);
+    poke64(base + 24, pfLen);
+    self.resCount := self.resCount + 1;
+  }
+
+  // Die Tabelle auslegen: erst die Bytes und die Namen, dann die Tabelle
+  // selbst. Die Datenoffsets stehen erst danach fest, deshalb werden sie
+  // zwischengespeichert. Alle Felder sind int64 — std.res liest sie mit
+  // peek64, ohne Kenntnis des Speicherlayouts des Compilers.
+  fn cg_emitResTable() {
+    if (self.resCount <= 0) { return; }
+    var offs: int64 := alloc(self.resCount * 32);
+    var i: int64 := 0;
+    while (i < self.resCount) {
+      var rb: int64 := self.ress + i * 32;
+      var nm: pchar := peek64(rb) as pchar;
+      var nmLen: int64 := peek64(rb + 8);
+      var pf: pchar := peek64(rb + 16) as pchar;
+      var pfLen: int64 := peek64(rb + 24);
+      var pbox: int64 := alloc(8);
+      var voll: pchar := self.cg_embedPfad(pf, pfLen, pbox);
+      var vollLen: int64 := peek64(pbox);
+      free(pbox, 8);
+      var gr: int64 := self.cg_embedGroesse(voll);
+      if (gr < 0) { self.cg_embedFehlt(voll, "@resource"c); }
+      // Die Bytes teilen sich die Ablage mit `@embed`: derselbe Pfad liegt
+      // einmal im Erzeugnis, gleich ueber welche der beiden Formen er kam.
+      var dOff: int64 := self.cg_embedBytes(voll, vollLen);
+      var nOff: int64 := self.cg_addNameData(nm, nmLen);
+      var ob: int64 := offs + i * 32;
+      poke64(ob,      nOff);
+      poke64(ob + 8,  nmLen);
+      poke64(ob + 16, dOff);
+      poke64(ob + 24, gr);
+      i := i + 1;
+    }
+    // Auf 8 ausrichten, damit peek64 auf der Tabelle definiert ist.
+    while ((self.dataLen & 7) != 0) { self.cg_edata(0); }
+    var tab: int64 := self.dataLen;
+    self.cg_edata8Zahl(self.resCount);
+    i := 0;
+    while (i < self.resCount) {
+      var ob2: int64 := offs + i * 32;
+      // Die drei Zeiger sind DATENOFFSETS und muessen beim Schreiben des ELF
+      // zu Adressen werden — dafuer sorgt der Nachtrag unten in cg_writeELF,
+      // wo die Datenbasis feststeht. Hier steht der reine Offset.
+      self.cg_edata8Zahl(peek64(ob2));
+      self.cg_edata8Zahl(peek64(ob2 + 8));
+      self.cg_edata8Zahl(peek64(ob2 + 16));
+      self.cg_edata8Zahl(peek64(ob2 + 24));
+      i := i + 1;
+    }
+    self.resTabOff := tab;
+  }
+
+  // #1961: Ein 8-Byte-Feld im Datenbereich, das bisher einen OFFSET traegt,
+  // auf die endgueltige Adresse heben.
+  fn cg_datenOffsetZuAdresse(feldOff: int64, basis: int64) {
+    var alt: int64 := 0;
+    var i: int64 := 0;
+    while (i < 8) {
+      alt := alt | ((peek8(self.data + feldOff + i) & 255) << (i * 8));
+      i := i + 1;
+    }
+    var neu: int64 := basis + alt;
+    i := 0;
+    while (i < 8) {
+      poke8(self.data + feldOff + i, (neu >> (i * 8)) & 255);
+      i := i + 1;
+    }
+  }
+
+  // Acht Byte little-endian in den Datenbereich.
+  fn cg_edata8Zahl(v: int64) {
+    var i: int64 := 0;
+    while (i < 8) { self.cg_edata((v >> (i * 8)) & 255); i := i + 1; }
   }
 
   // #1256: n genullte Bytes im Datenbereich belegen, Offset zurueckgeben.
@@ -3338,6 +3465,33 @@ pub type Codegen = class {
         poke32(self.code + codeOff, disp32);
       }
       i += 1;
+    }
+    // #1961 Stufe 2: Die Ressourcentabelle entsteht HIER, nicht waehrend des
+    // Durchlaufs: erst jetzt steht fest, welche Angaben es gibt, und erst hier
+    // ist die Codelaenge endgueltig, aus der sich die Datenadresse ergibt.
+    //
+    // In der Tabelle stehen bis dahin DATENOFFSETS. Ein Offset ist zur
+    // Laufzeit keine gueltige Adresse — ohne den Nachtrag unten zeigte jeder
+    // Eintrag an den Anfang des Adressraums, und der erste Zugriff faultete.
+    var datenBasis: int64 := CG_ELF_BASE + CG_CODE_OFF + self.codeLen;
+    self.cg_emitResTable();
+    if (self.resTabOff >= 0) {
+      // Der Zeiger auf die Tabelle in den reservierten Platz, den
+      // GetResTable() liest.
+      var rtAdr: int64 := datenBasis + self.resTabOff;
+      var rb2: int64 := 0;
+      while (rb2 < 8) {
+        poke8(self.data + CG_RESTAB + rb2, (rtAdr >> (rb2 * 8)) & 255);
+        rb2 := rb2 + 1;
+      }
+      // Namens- und Datenzeiger jedes Eintrags von Offset auf Adresse heben.
+      var ri: int64 := 0;
+      while (ri < self.resCount) {
+        var ez: int64 := self.resTabOff + 8 + ri * 32;
+        self.cg_datenOffsetZuAdresse(ez,     datenBasis);   // Name
+        self.cg_datenOffsetZuAdresse(ez + 16, datenBasis);  // Bytes
+        ri := ri + 1;
+      }
     }
     // WP-10a: patch VMT address placeholders
     // vmtVaddr = CG_ELF_BASE + CG_CODE_OFF + codeLen + vmtDataOff
@@ -13820,6 +13974,13 @@ pub type Codegen = class {
       // GetArgC(): return argc saved by _start
       self.cg_loadRaxGlobal(CG_ARGC);
 
+    } else if (self.cg_seq(fname, fnlen, "GetResTable", 11)) {
+      // #1961 Stufe 2: Zeiger auf die Ressourcentabelle, oder 0, wenn das
+      // Programm keine `@resource`-Angabe traegt. Dasselbe Muster wie
+      // GetEnvBlock (#1677): der Codegen kennt die Adresse, std.res rechnet
+      // in Lyx weiter.
+      self.cg_loadRaxGlobal(CG_RESTAB);
+
     } else if (self.cg_seq(fname, fnlen, "GetEnvBlock", 11)) {
       // #1677: Zeiger auf den Umgebungsblock, oder 0. Nur die win64-Laufzeit
       // setzt ihn; auf Linux bleibt er 0 und std.env nimmt den SysV-Weg.
@@ -20595,6 +20756,13 @@ pub type Codegen = class {
         } else {
           self.cg_genFuncDecl(cur);
         }
+      } else if (k == CGN_RESOURCE) {
+        // #1961 Stufe 2: nur MERKEN. Ausgelegt wird die Tabelle am Ende
+        // (cg_patchAll → cg_emitResTable), wenn feststeht, wie viele es sind
+        // und wo die Daten liegen.
+        var rPfadN: int64 := self.cg_nc0(cur);
+        self.cg_addResource(self.cg_nsval(cur), self.cg_nslen(cur),
+                            self.cg_nsval(rPfadN), self.cg_nslen(rPfadN));
       } else if (k == CGN_EXTERN_DATA) {
         // WSP-07: externes Daten-Symbol registrieren (Name → UNDEF-Symbol in cg_writeELFObj).
         self.cg_addExternData(self.cg_nsval(cur), self.cg_nslen(cur));
@@ -21043,7 +21211,11 @@ pub type Codegen = class {
     self.embeds      := 0;   // #1961: erst bei Bedarf angelegt
     self.embedCount  := 0;
     self.embedCap    := 0;
-    self.dataLen     := 120; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836)
+    self.ress        := 0;   // #1961 Stufe 2
+    self.resCount    := 0;
+    self.resCap      := 0;
+    self.resTabOff   := 0 - 1;
+    self.dataLen     := 128; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836), +8 CG_RESTAB (#1961)
     self.dataOverflow := 0;  // WP-34  // WP-18: pre-reserve 88 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24, ARGC@32, ARGV@40, FLOAT_BUF@48, CANARY@80)
 
     self.localCap  := 64;
