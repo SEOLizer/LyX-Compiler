@@ -81,6 +81,7 @@ pub con NK_LIT_INT:     int64 := 40;
 pub con NK_TYPE_ARRAY_FIXED: int64 := 101;  // [N]T fixed-size array type (c0=elemType, c1=sizeExpr)
 pub con NK_LIT_FLOAT:   int64 := 41;
 pub con NK_LIT_STR:     int64 := 42;
+pub con NK_EMBED:       int64 := 134; // #1961: @embed / @embed_len
 pub con NK_LIT_CHAR:    int64 := 43;
 pub con NK_LIT_BOOL:    int64 := 44;
 pub con NK_LIT_NULL:    int64 := 45;
@@ -306,6 +307,13 @@ pub type IRLower = class {
   nodes: int64;
   nodeCount: int64;
   src: pchar;
+
+  // #1961: Pfad der QUELLDATEI, von lyxc gesetzt. `@embed` loest seinen Pfad
+  // relativ dazu auf — wie der Import und wie der x86-Codegen. Ohne die
+  // Angabe haenge das Erzeugnis davon ab, aus welchem Verzeichnis uebersetzt
+  // wurde.
+  irSrcPath: pchar;
+  irSrcLen:  int64;
 
   // WSP-05: Ziel-Architektur (LYX_TC_*, von lyxc nach init() gesetzt). Steuert die
   // arch-spezifische asm-Mnemonic→Id-Tabelle in _asmMnemonicId. 0 = x86-Default.
@@ -704,6 +712,68 @@ pub type IRLower = class {
   }
 
   // WP-BC-39: Add a string to the IR module's string table; return byte offset
+  // #1961: Pfad aus dem Knoten, aufgeloest relativ zur Quelldatei.
+  fn _embedPfad(expr: int64): int64 {
+    var rel: int64 := self.nodeSVal(expr) as int64;
+    var relLen: int64 := self.nodeSLen(expr);
+    if (relLen > 0 && peek8(rel) == 47) {          // absolut
+      var ab: int64 := alloc(relLen + 1);
+      memcpy(ab, rel, relLen);
+      poke8(ab + relLen, 0);
+      return ab;
+    }
+    var dirLen: int64 := 0;
+    if (self.irSrcPath != 0 as pchar) {
+      var si: int64 := 0;
+      while (si < self.irSrcLen) {
+        if (peek8((self.irSrcPath as int64) + si) == 47) { dirLen := si + 1; }
+        si := si + 1;
+      }
+    }
+    var buf: int64 := alloc(dirLen + relLen + 1);
+    memcpy(buf, self.irSrcPath as int64, dirLen);
+    memcpy(buf + dirLen, rel, relLen);
+    poke8(buf + dirLen + relLen, 0);
+    return buf;
+  }
+
+  // Fehlende Datei ist ein HARTER Fehler mit Pfad. Ein stiller Ersatz waere
+  // die schlimmste Antwort: das Programm liefe und zeigte nichts.
+  fn _embedFehlt(pfad: int64) {
+    EPrintStr("error: @embed: Datei nicht lesbar: "c);
+    EPrintStrLn(pfad as pchar);
+    exit(1);
+  }
+
+  fn _embedGroesse(pfad: int64): int64 {
+    var fd: int64 := open(pfad as pchar, 0, 0);
+    if (fd < 0) { self._embedFehlt(pfad); }
+    var sz: int64 := lseek(fd, 0, 2);
+    close(fd);
+    if (sz < 0) { self._embedFehlt(pfad); }
+    return sz;
+  }
+
+  fn _embedLesen(pfad: int64, lenBox: int64): int64 {
+    poke64(lenBox, 0);
+    var fd: int64 := open(pfad as pchar, 0, 0);
+    if (fd < 0) { self._embedFehlt(pfad); }
+    var sz: int64 := lseek(fd, 0, 2);
+    lseek(fd, 0, 0);
+    if (sz < 0) { close(fd); self._embedFehlt(pfad); }
+    var buf: int64 := alloc(sz + 1);
+    var gelesen: int64 := 0;
+    while (gelesen < sz) {
+      var n: int64 := read(fd, (buf + gelesen) as pchar, sz - gelesen);
+      if (n <= 0) { close(fd); self._embedFehlt(pfad); }
+      gelesen := gelesen + n;
+    }
+    close(fd);
+    poke8(buf + sz, 0);
+    poke64(lenBox, sz);
+    return buf;
+  }
+
   fn irAddString(s: pchar, slen: int64): int64 {
     var strBuf: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
     var strCap: int64 := peek64(self.ir + IR_MOD_OFF_STRCAP);
@@ -813,6 +883,58 @@ pub type IRLower = class {
       return dest;
     }
     
+    // #1961: `@embed("pfad")` / `@embed_len("pfad")`.
+    //
+    // Die Bytes gehen in denselben Zeichenketten-Puffer wie jedes Literal
+    // (irAddString kopiert LAENGENBASIERT und haengt nur eine Null an,
+    // Nullbytes im Inhalt ueberleben also). Damit tragen ALLE IR-Backends —
+    // lyxos, arm64, riscv, arm-cm4, xtensa — die Einbettung ueber EINE
+    // Stelle. Waere sie nur im x86-Codegen, uebersetzten die anderen Ziele
+    // klanglos durch und lieferten eine 0: genau die Sorte stiller Ausfall,
+    // an der eine unvollstaendige Aufzaehlung im Projekt schon mehrfach
+    // aufgefallen ist.
+    if (k == NK_EMBED) {
+      var eDest: int64 := self.allocTemp();
+      var ePfad: int64 := self._embedPfad(expr);
+      if (self.nodeIVal(expr) != 0) {
+        self.irAddInstrDirect(IRO_CONST_INT, eDest, -1, -1, self._embedGroesse(ePfad));
+        return eDest;
+      }
+      var eLenBox: int64 := alloc(8);
+      var eBuf: int64 := self._embedLesen(ePfad, eLenBox);
+      var eLen: int64 := peek64(eLenBox);
+      free(eLenBox, 8);
+      // Der IR-Zeichenkettenspeicher ist NULLTERMINIERT: die Backends messen
+      // die Laenge beim Ausgeben mit StrLen (emit_arm64.emitConstStr und die
+      // gleichlautenden Stellen in riscv, lyxos, arm-cm4, xtensa). Ein
+      // Nullbyte im Inhalt schneidet dort alles Weitere ab — gemessen unter
+      // qemu-aarch64: aus `AB\0CD` wurden `AB\0` plus Fremdbytes.
+      //
+      // Das MUSS gemeldet werden, statt still ein halbes Erzeugnis zu bauen.
+      // Textdateien (Vorlagen, Shader, Konfigurationen) enthalten keine
+      // Nullbytes und gehen auf allen Zielen; fuer binaere Daten braucht der
+      // IR-Weg eine laengenbehaftete Zeichenkettentabelle — als eigenes
+      // Paket geführt.
+      var nzI: int64 := 0;
+      while (nzI < eLen) {
+        if (peek8(eBuf + nzI) == 0) {
+          EPrintStr("error: @embed: die Datei enthaelt ein Nullbyte (Versatz "c);
+          EPrintInt(nzI);
+          EPrintStrLn(") —"c);
+          EPrintStrLn("  auf diesem Ziel werden eingebettete Bytes ueber die nullterminierte"c);
+          EPrintStrLn("  IR-Zeichenkettentabelle abgelegt; alles ab dem Nullbyte ginge verloren."c);
+          EPrintStrLn("  Textdateien gehen hier, binaere Daten bisher nur mit --target=x86_64."c);
+          EPrintStr("  Datei: "c);
+          EPrintStrLn(ePfad as pchar);
+          exit(1);
+        }
+        nzI := nzI + 1;
+      }
+      var eOff: int64 := self.irAddString(eBuf as pchar, eLen);
+      self.irAddInstrDirect(IRO_CONST_STR, eDest, -1, -1, eOff);
+      return eDest;
+    }
+
     // Literal: string constant
     if (k == NK_LIT_STR) {
       var dest: int64 := self.allocTemp();
@@ -1977,6 +2099,12 @@ pub type IRLower = class {
       var pnArt: int64 := 0 - 1;
       var pnK: int64 := self.nodeKind(arg0);
       if (pnK == NK_LIT_INT || pnK == NK_LIT_BOOL || pnK == NK_LIT_CHAR) { pnArt := 0; }
+      // #1961: `@embed(...)` ist eine ZEICHENKETTE (Adresse der eingebetteten
+      // Bytes), `@embed_len(...)` eine Zahl. Dieselbe Unterscheidung wie im
+      // x86-Codegen in cg_isPcharExpr — die beiden muessen uebereinstimmen.
+      else if (pnK == NK_EMBED) {
+        if (self.nodeIVal(arg0) != 0) { pnArt := 0; } else { pnArt := 1; }
+      }
       else if (pnK == NK_BINOP || pnK == NK_UNOP) {
         // Auch hier nicht raten: ein f64-Ausdruck saehe sonst wie eine
         // Ganzzahl aus und wuerde als solche ausgegeben. Entschieden wird

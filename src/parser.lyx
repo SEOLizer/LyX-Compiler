@@ -218,6 +218,17 @@ pub con NK_IS_EXPR:      int64 := 72;  // x is Type expression
 // WP-17: Range types and constraints
 pub con NK_RANGE:        int64 := 73;  // range expression: 1..100
 pub con NK_WHERE:        int64 := 74;  // where clause: type X where constraint
+// #1961: `@embed("pfad")` bettet den INHALT einer Datei zur Uebersetzungszeit
+// ein; `@embed_len("pfad")` liefert ihre Groesse als Konstante.
+//
+// Warum ein Zeiger und keine `[N]uint8`-Feld: Lyx legt Felder mit ACHT Byte je
+// Element ab, auch bei uint8 (gemessen: Wert 0 bei +1, das zweite Element erst
+// bei +8). Ein eingebettetes 1-MB-Bild braeuchte damit 8 MB im Erzeugnis. Die
+// Bytes liegen deshalb GEPACKT im Datensegment, und `@embed` liefert die
+// Adresse. Gelesen wird mit `peek8`, wie bei jedem anderen Bytepuffer.
+//
+// iVal: 0 = Inhalt (pchar), 1 = Groesse (int64). sVal = Pfad aus dem Literal.
+pub con NK_EMBED:        int64 := 134;
 pub con NK_EXTERN_DATA:  int64 := 75;  // WSP-07: extern "asm" name: Type; — externes Daten-Symbol (Linker-aufgelöst); sVal=name, c0=Typ
 
 // Type nodes
@@ -1427,7 +1438,16 @@ pub type Parser = class {
       self._sc0(n, self.ParseUnary());
       return n;
     }
-    if (self.Check(TK_AT) != 0) {
+    // #1961: `@embed(...)` / `@embed_len(...)` sind KEINE Adressoperatoren.
+    // Sie werden in ParsePrimary erzeugt, damit die Nachbehandlung sie
+    // erreicht — sonst scheitert `@embed("x") as int64` am `as`, weil dieser
+    // Zweig hier vorher zurueckkehrt.
+    var istEmbedName: int64 := 0;
+    if (self.Check(TK_AT) != 0 && self.TokKind(self.cur + 1) == TK_IDENT) {
+      if (self._tokTextEq(self.cur + 1, "embed"c) != 0)     { istEmbedName := 1; }
+      if (self._tokTextEq(self.cur + 1, "embed_len"c) != 0) { istEmbedName := 1; }
+    }
+    if (self.Check(TK_AT) != 0 && istEmbedName == 0) {
       var ti: int64 := self.cur;
       self.Advance();
       var n: int64 := self._alloc(NK_UNOP, ti);
@@ -1565,6 +1585,45 @@ pub type Parser = class {
     // Ausdrucksposition liefert es den Wert des getroffenen Fallrumpfes:
     //     var r: int64 := match c { case 1 => 10; case _ => 0; };
     if (k == TK_MATCH) { return self._parseMatch(); }
+    // #1961: `@embed("pfad")` bettet den Dateiinhalt ein, `@embed_len("pfad")`
+    // liefert die Groesse. Beides sind Ausdruecke; sie stehen hier und nicht
+    // beim Adressoperator in ParseUnary, damit die Nachbehandlung greift —
+    // `@embed("x") as int64` braucht sie.
+    if (k == TK_AT && self.TokKind(self.cur + 1) == TK_IDENT) {
+      var atName: int64 := self.cur + 1;
+      var istEmbed: int64 := 0;
+      var istLen:   int64 := 0;
+      if (self._tokTextEq(atName, "embed"c) != 0)     { istEmbed := 1; }
+      if (self._tokTextEq(atName, "embed_len"c) != 0) { istEmbed := 1; istLen := 1; }
+      if (istEmbed != 0) {
+        self.Advance();           // @
+        self.Advance();           // embed / embed_len
+        if (self.Check(TK_LPAREN) == 0) {
+          self._err("@embed: erwartet ( nach dem Namen"c); return -1;
+        }
+        self.Advance();
+        if (self.Check(TK_STRING) == 0) {
+          // Der Pfad MUSS ein Literal sein: die Datei wird zur
+          // Uebersetzungszeit gelesen, ein erst zur Laufzeit berechneter Name
+          // waere zu diesem Zeitpunkt nicht bekannt.
+          self._err("@embed: erwartet ein Zeichenketten-Literal als Pfad"c); return -1;
+        }
+        var pTok: int64 := self.cur;
+        self.Advance();
+        if (self.Check(TK_RPAREN) == 0) {
+          self._err("@embed: erwartet ) nach dem Pfad"c); return -1;
+        }
+        self.Advance();
+        var en: int64 := self._alloc(NK_EMBED, ti);
+        // Die Tokenspanne umfasst die ANFUEHRUNGSZEICHEN; hier wird der Pfad
+        // direkt als Dateiname benutzt, also muessen beide weg — sonst sucht
+        // der Compiler eine Datei namens `"logo.png"` samt Zeichen (#1378 war
+        // derselbe Fehler beim Regex-Literal).
+        self._ssv(en, self._tokOff(pTok) + 1, self._tokLen(pTok) - 2);
+        self._siv(en, istLen);
+        return en;
+      }
+    }
     if (k == 3) {  // TK_INT=3
       self.Advance();
       var n: int64 := self._alloc(NK_LIT_INT, ti);
