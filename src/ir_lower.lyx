@@ -197,6 +197,273 @@ pub con NK_FOR_RANGE:       int64 := 107; // WP-1.1-A: for i in range([start,] s
 // sperrige Name.
 pub var _irPaketPfade: pchar := 0 as pchar;
 
+// ===========================================================================
+// #1977: IR aus einer .lyu uebernehmen
+// ===========================================================================
+//
+// #1974 legt das IR einer Unit in den `IRCodeOffset`-Abschnitt der .lyu. Hier
+// wird es gelesen und an das IR-Modul des importierenden Programms angehaengt.
+//
+// FREIE Funktionen, keine Methoden: der Kommentar an der Import-Stelle warnt,
+// dass neue Methoden an IRLower deren VMT verschieben und der Seed-Compiler
+// daran stolpert. Gebraucht wird ohnehin nur der Modulzeiger.
+//
+// ---------------------------------------------------------------------------
+// DIE RELOKATIONSTABELLE — abgelesen an den BACKENDS, nicht an den Kommentaren
+// ---------------------------------------------------------------------------
+//
+// Beim Anhaengen verschieben sich alle Puffer. Jedes Feld, das in einen
+// modulweiten Puffer zeigt, muss deshalb um dessen Basis erhoeht werden.
+// WELCHES Feld das ist, haengt am Opcode — und die Belegung ist NICHT
+// regelmaessig:
+//
+//   IRO_CALL, IRO_FUNC_ADDR      src1 = Index in funcBuffer
+//   IRO_CALL_EXTERN              src2 = strBuf-Offset (Bibliothek)
+//                                imm  = strBuf-Offset (Name)
+//   IRO_CONST_STR                imm  = strBuf-Offset
+//   IRO_LOAD_GLOBAL              src1 = Index in globalBuffer
+//   IRO_STORE_GLOBAL             DEST = Index in globalBuffer   (!)
+//   IRO_LOAD_GLOBAL_ADDR         src1 = Index in globalBuffer
+//   IRO_JMP, IRO_BR_TRUE,        imm  = Labelnummer — muss UMNUMMERIERT
+//   IRO_BR_FALSE, IRO_LABEL             werden, sonst kollidiert sie
+//
+// Alles andere sind Slotnummern innerhalb einer Funktion oder reine Werte.
+//
+// Das `(!)` bei STORE_GLOBAL ist kein Tippfehler: ir_lower emittiert
+// `irAddInstrDirect(IRO_STORE_GLOBAL, gIdx, valTemp, -1, 0)`, der Index steht
+// also im DEST-Feld und der Wert in src1. riscv hat das einmal aus src2
+// gelesen und dorthin geschrieben, wo -1 stand — der Kommentar dazu steht
+// heute noch in riscv_linux.lyx. Genau solche Unregelmaessigkeiten sind der
+// Grund, warum diese Tabelle am Backend abgelesen und nicht geraten wurde.
+
+// Einen Puffer des IR-Moduls um `nBytes` aus `srcPtr` verlaengern. Gibt den
+// (moeglicherweise neuen) Pufferzeiger zurueck; die Laengenfelder setzt der
+// Aufrufer, weil sie je Puffer verschieden zaehlen (siehe lyu_writer).
+fn _irPufferAnhaengen(irMod: int64, bufOff: int64, capOff: int64,
+                      aktBytes: int64, srcPtr: int64, nBytes: int64): int64 {
+  var buf: int64 := peek64(irMod + bufOff);
+  var cap: int64 := peek64(irMod + capOff);
+  if (aktBytes + nBytes > cap) {
+    var neu: int64 := cap * 2;
+    if (neu < aktBytes + nBytes) { neu := aktBytes + nBytes + 4096; }
+    var nb: int64 := alloc(neu);
+    memcpy(nb, buf, aktBytes);
+    buf := nb;
+    poke64(irMod + bufOff, buf);
+    poke64(irMod + capOff, neu);
+  }
+  if (nBytes > 0) { memcpy(buf + aktBytes, srcPtr, nBytes); }
+  return buf;
+}
+
+// Ein 32-Bit-Feld little-endian aus einem Puffer lesen.
+fn _irU32(d: int64, p: int64): int64 {
+  return (peek8(d + p) & 255) | ((peek8(d + p + 1) & 255) << 8)
+       | ((peek8(d + p + 2) & 255) << 16) | ((peek8(d + p + 3) & 255) << 24);
+}
+
+// Versatz des LYIR-Abschnitts in einer .lyu, oder -1.
+//
+// Der Kopf ist: Magic(4) Fassung(2) arch(1) flags(1), Unitname (2+n), drei
+// weitere Zeichenketten (je 2+n), symCount(4), TypeInfoOffset(4),
+// IRCodeOffset(4), DebugOffset(4), Reserved(4). Gelesen wird nur bis zum
+// IRCodeOffset — dieselbe Reihenfolge wie in lyu_reader.LyrInit.
+fn _irLyuIrVersatz(d: int64, size: int64): int64 {
+  if (size < 24) { return 0 - 1; }
+  if ((peek8(d) & 255) != 76) { return 0 - 1; }        // 'L'
+  if ((peek8(d + 1) & 255) != 89) { return 0 - 1; }    // 'Y'
+  if ((peek8(d + 2) & 255) != 85) { return 0 - 1; }    // 'U'
+  var p: int64 := 4;
+  var ver: int64 := (peek8(d + p) & 255) | ((peek8(d + p + 1) & 255) << 8);
+  p := p + 2 + 1 + 1;                                   // Fassung, arch, flags
+  var i: int64 := 0;
+  var felder: int64 := 1;
+  if (ver >= 2) { felder := 4; }                        // + description/author/copyright
+  while (i < felder) {
+    if (p + 2 > size) { return 0 - 1; }
+    var l: int64 := (peek8(d + p) & 255) | ((peek8(d + p + 1) & 255) << 8);
+    p := p + 2 + l;
+    i := i + 1;
+  }
+  if (p + 20 > size) { return 0 - 1; }
+  p := p + 4;                                           // symCount
+  p := p + 4;                                           // TypeInfoOffset
+  var irOff: int64 := _irU32(d, p);
+  if (irOff <= 0 || irOff + 12 > size) { return 0 - 1; }
+  // Magic des Abschnitts pruefen — ohne sie waere jede Zahl im Feld ein
+  // Versatz, und der Leser liefe irgendwohin.
+  if ((peek8(d + irOff) & 255) != 76) { return 0 - 1; }      // 'L'
+  if ((peek8(d + irOff + 1) & 255) != 89) { return 0 - 1; }  // 'Y'
+  if ((peek8(d + irOff + 2) & 255) != 73) { return 0 - 1; }  // 'I'
+  if ((peek8(d + irOff + 3) & 255) != 82) { return 0 - 1; }  // 'R'
+  return irOff;
+}
+
+// Das IR aus `d` (Inhalt einer .lyu) an `irMod` anhaengen und dabei alle
+// Verweise umrechnen. `labelBase` ist die erste freie Labelnummer des
+// Zielmoduls; zurueckgegeben wird, wie viele Nummern belegt wurden — der
+// Aufrufer stellt seinen Zaehler entsprechend weiter. -1 heisst "kein
+// IR-Abschnitt".
+// Die .lyu zu einem Modulnamen suchen und VOLLSTAENDIG lesen. Anders als
+// FileReadAll wird die GROESSE gebraucht: der IR-Abschnitt enthaelt Nullbytes,
+// eine Laenge ueber StrLen waere sinnlos. Gibt 0 zurueck, wenn es keine gibt;
+// die Groesse landet in groesseBox.
+//
+// Gesucht wird in derselben Reihenfolge wie bei der .lyx (_irLeseImport):
+// Arbeitsverzeichnis, dann Praefixe.
+pub fn _irLeseLyu(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar,
+                  groesseBox: int64): int64 {
+  poke64(groesseBox, 0);
+  var rel: int64 := alloc(modLen + 8);
+  var i: int64 := 0;
+  while (i < modLen) {
+    var ch: int64 := peek8((modName as int64) + i);
+    if (ch == 46) { ch := 47; }
+    poke8(rel + i, ch);
+    i := i + 1;
+  }
+  poke8(rel + modLen, 46); poke8(rel + modLen + 1, 108);   // ".l"
+  poke8(rel + modLen + 2, 121); poke8(rel + modLen + 3, 117);  // "yu"
+  poke8(rel + modLen + 4, 0);
+  var relLen: int64 := modLen + 4;
+
+  var basen: int64 := alloc(2 * 8);
+  var nb: int64 := 0;
+  if ((incPath as int64) != 0) { poke64(basen + nb * 8, incPath as int64); nb := nb + 1; }
+  if ((stdPath as int64) != 0) { poke64(basen + nb * 8, stdPath as int64); nb := nb + 1; }
+
+  var versuch: int64 := 0 - 1;      // -1 = ohne Praefix, dann 0..nb-1
+  while (versuch < nb) {
+    var pfad: int64 := 0;
+    if (versuch < 0) { pfad := rel; }
+    else {
+      var b: pchar := peek64(basen + versuch * 8) as pchar;
+      var bl: int64 := StrLen(b);
+      pfad := alloc(bl + 1 + relLen + 1);
+      memcpy(pfad, b as int64, bl);
+      poke8(pfad + bl, 47);
+      memcpy(pfad + bl + 1, rel, relLen);
+      poke8(pfad + bl + 1 + relLen, 0);
+    }
+    var fd: int64 := open(pfad as pchar, 0, 0);
+    if (fd >= 0) {
+      var sz: int64 := lseek(fd, 0, 2);
+      lseek(fd, 0, 0);
+      if (sz > 0) {
+        var buf: int64 := alloc(sz);
+        var gel: int64 := 0;
+        var fehler: int64 := 0;
+        while (gel < sz && fehler == 0) {
+          var n: int64 := read(fd, (buf + gel) as pchar, sz - gel);
+          if (n <= 0) { fehler := 1; } else { gel := gel + n; }
+        }
+        close(fd);
+        if (fehler == 0) {
+          free(basen, 16);
+          poke64(groesseBox, sz);
+          return buf;
+        }
+      } else { close(fd); }
+    }
+    versuch := versuch + 1;
+  }
+  free(basen, 16);
+  return 0;
+}
+
+pub fn _irUebernehmeLyu(irMod: int64, d: int64, size: int64, labelBase: int64): int64 {
+  var irOff: int64 := _irLyuIrVersatz(d, size);
+  if (irOff < 0) { return 0 - 1; }
+  var p: int64 := irOff + 4;
+  var abschnittVer: int64 := _irU32(d, p); p := p + 4;
+  if (abschnittVer != 1) {
+    // Eine Fassung, die dieser Compiler nicht kennt, wird NICHT geraten.
+    EPrintStr("lyxc: .lyu: unbekannte Fassung des IR-Abschnitts: "c);
+    EPrintInt(abschnittVer);
+    EPrintStrLn(""c);
+    exit(1);
+  }
+  var nInstr: int64 := _irU32(d, p); p := p + 4;
+  var nFunc:  int64 := _irU32(d, p); p := p + 4;
+  var nGlob:  int64 := _irU32(d, p); p := p + 4;
+
+  // Sechs Puffer in der Reihenfolge, die lyu_writer schreibt.
+  var lInstr: int64 := _irU32(d, p); p := p + 4; var pInstr: int64 := d + p; p := p + lInstr;
+  var lStr:   int64 := _irU32(d, p); p := p + 4; var pStr:   int64 := d + p; p := p + lStr;
+  var lLabel: int64 := _irU32(d, p); p := p + 4; var pLabel: int64 := d + p; p := p + lLabel;
+  var lFunc:  int64 := _irU32(d, p); p := p + 4; var pFunc:  int64 := d + p; p := p + lFunc;
+  var lGlob:  int64 := _irU32(d, p); p := p + 4; var pGlob:  int64 := d + p; p := p + lGlob;
+  var lCap:   int64 := _irU32(d, p); p := p + 4; var pCap:   int64 := d + p; p := p + lCap;
+  if (p > size) {
+    EPrintStrLn("lyxc: .lyu: der IR-Abschnitt reicht ueber das Dateiende hinaus."c);
+    exit(1);
+  }
+
+  // Basen VOR dem Anhaengen merken — danach sind die Laengen schon gewachsen.
+  var instrBase:  int64 := peek64(irMod + IR_MOD_OFF_INSTRLEN);    // Saetze
+  var strBase:    int64 := peek64(irMod + IR_MOD_OFF_STRLEN);      // Bytes
+  var labelBBase: int64 := peek64(irMod + IR_MOD_OFF_LABELLEN);    // Bytes
+  var funcBase:   int64 := peek64(irMod + IR_MOD_OFF_FUNCLEN);     // Saetze
+  var globBase:   int64 := peek64(irMod + IR_MOD_OFF_GLOBALLEN);   // Saetze
+  var capBase:    int64 := peek64(irMod + IR_MOD_OFF_CAPTURELEN);  // Saetze
+
+  var instrBuf: int64 := _irPufferAnhaengen(irMod, IR_MOD_OFF_INSTRBUF, IR_MOD_OFF_INSTRCAP,
+                                            instrBase * IR_INSTR_SIZE, pInstr, lInstr);
+  _irPufferAnhaengen(irMod, IR_MOD_OFF_STRBUF, IR_MOD_OFF_STRCAP, strBase, pStr, lStr);
+  _irPufferAnhaengen(irMod, IR_MOD_OFF_LABELBUF, IR_MOD_OFF_LABELCAP, labelBBase, pLabel, lLabel);
+  var funcBuf: int64 := _irPufferAnhaengen(irMod, IR_MOD_OFF_FUNCBUF, IR_MOD_OFF_FUNCCAP,
+                                           funcBase * IR_FUNC_SIZE, pFunc, lFunc);
+  _irPufferAnhaengen(irMod, IR_MOD_OFF_GLOBALBUF, IR_MOD_OFF_GLOBALCAP, globBase * 8, pGlob, lGlob);
+  _irPufferAnhaengen(irMod, IR_MOD_OFF_CAPTUREBUF, IR_MOD_OFF_CAPTURECAP, capBase * 8, pCap, lCap);
+
+  poke64(irMod + IR_MOD_OFF_INSTRLEN,   instrBase + nInstr);
+  poke64(irMod + IR_MOD_OFF_STRLEN,     strBase + lStr);
+  poke64(irMod + IR_MOD_OFF_LABELLEN,   labelBBase + lLabel);
+  poke64(irMod + IR_MOD_OFF_FUNCLEN,    funcBase + nFunc);
+  poke64(irMod + IR_MOD_OFF_GLOBALLEN,  globBase + nGlob);
+  poke64(irMod + IR_MOD_OFF_CAPTURELEN, capBase + (lCap / 8));
+
+  // --- Relokation der uebernommenen Instruktionen -------------------------
+  var maxLabel: int64 := 0 - 1;
+  var k: int64 := 0;
+  while (k < nInstr) {
+    var b: int64 := instrBuf + (instrBase + k) * IR_INSTR_SIZE;
+    var op: int64 := peek64(b);
+    if (op == IRO_CALL || op == IRO_FUNC_ADDR) {
+      poke64(b + IR_INSTR_OFF_SRC1, peek64(b + IR_INSTR_OFF_SRC1) + funcBase);
+    } else if (op == IRO_CALL_EXTERN) {
+      poke64(b + IR_INSTR_OFF_SRC2,   peek64(b + IR_INSTR_OFF_SRC2) + strBase);
+      poke64(b + IR_INSTR_OFF_IMMINT, peek64(b + IR_INSTR_OFF_IMMINT) + strBase);
+    } else if (op == IRO_CONST_STR) {
+      poke64(b + IR_INSTR_OFF_IMMINT, peek64(b + IR_INSTR_OFF_IMMINT) + strBase);
+    } else if (op == IRO_LOAD_GLOBAL || op == IRO_LOAD_GLOBAL_ADDR) {
+      poke64(b + IR_INSTR_OFF_SRC1, peek64(b + IR_INSTR_OFF_SRC1) + globBase);
+    } else if (op == IRO_STORE_GLOBAL) {
+      // Index im DEST-Feld — siehe Tabelle oben.
+      poke64(b + IR_INSTR_OFF_DEST, peek64(b + IR_INSTR_OFF_DEST) + globBase);
+    } else if (op == IRO_JMP || op == IRO_BR_TRUE || op == IRO_BR_FALSE || op == IRO_LABEL) {
+      var alt: int64 := peek64(b + IR_INSTR_OFF_IMMINT);
+      if (alt > maxLabel) { maxLabel := alt; }
+      poke64(b + IR_INSTR_OFF_IMMINT, alt + labelBase);
+    }
+    k := k + 1;
+  }
+
+  // --- Relokation der uebernommenen Funktionssaetze -----------------------
+  var f: int64 := 0;
+  while (f < nFunc) {
+    var fb: int64 := funcBuf + (funcBase + f) * IR_FUNC_SIZE;
+    poke64(fb, peek64(fb) + strBase);                                              // nameOff
+    poke64(fb + IR_FUNC_OFF_INSTRSOFF, peek64(fb + IR_FUNC_OFF_INSTRSOFF) + instrBase);
+    if (peek64(fb + IR_FUNC_OFF_CAPTUREDCOUNT) > 0) {
+      poke64(fb + IR_FUNC_OFF_CAPTUREDOFF, peek64(fb + IR_FUNC_OFF_CAPTUREDOFF) + capBase);
+    }
+    f := f + 1;
+  }
+
+  return maxLabel + 1;
+}
+
 fn _irLeseImport(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar): pchar {
   // "a.b.c" -> "a/b/c.lyx"
   var rel: int64 := alloc(modLen + 8);
@@ -7266,13 +7533,34 @@ pub type IRLower = class {
               // Ein hartes Scheitern wuerde Uebersetzungen abwuergen, die in
               // Ordnung sind.
               if (isrc as int64) == 0 {
-                var wb: int64 := alloc(nmL + 1);
-                var wI: int64 := 0;
-                while wI < nmL { poke8(wb + wI, peek8((nmP as int64) + wI)); wI := wI + 1; }
-                poke8(wb + nmL, 0);
-                EPrintStr("warning: IR-Strecke: Import nicht lesbar, seine Funktionen fehlen: "c);
-                EPrintStrLn(wb as pchar);
-                free(wb, nmL + 1);
+                // #1977: Erst den .lyu-Weg versuchen — seit #1974 kann eine
+                // vorkompilierte Unit ihr IR mitbringen. Diese Stelle ist der
+                // NACHLAUF und muss dieselbe Antwort geben wie der Vorlauf
+                // oben; haette nur eine der beiden den Weg, haenge es davon
+                // ab, ueber welchen Pfad im Importgraphen die Unit erreicht
+                // wird — und das faellt erst am fehlenden Rumpf auf.
+                var nlBox: int64 := alloc(8);
+                var nlBuf: int64 := _irLeseLyu(nmP, nmL, self.irIncludePath,
+                                               self.irStdPath, nlBox);
+                var nlSz: int64 := peek64(nlBox);
+                free(nlBox, 8);
+                var nlOk: int64 := 0;
+                if (nlBuf != 0 && nlSz > 0) {
+                  var nlBelegt: int64 := _irUebernehmeLyu(self.ir, nlBuf, nlSz, self.labelCount);
+                  if (nlBelegt >= 0) {
+                    nlOk := 1;
+                    if (nlBelegt > 0) { self.labelCount := self.labelCount + nlBelegt; }
+                  }
+                }
+                if (nlOk == 0) {
+                  var wb: int64 := alloc(nmL + 1);
+                  var wI: int64 := 0;
+                  while wI < nmL { poke8(wb + wI, peek8((nmP as int64) + wI)); wI := wI + 1; }
+                  poke8(wb + nmL, 0);
+                  EPrintStr("warning: IR-Strecke: Import nicht lesbar, seine Funktionen fehlen: "c);
+                  EPrintStrLn(wb as pchar);
+                  free(wb, nmL + 1);
+                }
               }
               if (isrc as int64) != 0 {
                 var ip: Parser := new Parser();
@@ -7488,6 +7776,27 @@ pub type IRLower = class {
             self.src       := impSavedSrc;
             self.nodes     := impSavedNodes;
             self.nodeCount := impSavedCount;
+          }
+        } else {
+          if impGesehen == 0 {
+            // #1977: Keine Quelle — aber vielleicht eine `.lyu` MIT IR.
+            //
+            // Bis 1.2.3D wurde hier schlicht nichts getan: die Unit fiel aus,
+            // ihre Funktionen fehlten im Erzeugnis. Seit #1974 kann eine .lyu
+            // das IR mitbringen; dann wird es hier uebernommen, samt
+            // Umrechnung aller Verweise.
+            var lyuBox: int64 := alloc(8);
+            var lyuBuf: int64 := _irLeseLyu(impModName, impModLen,
+                                            self.irIncludePath, self.irStdPath, lyuBox);
+            var lyuSz: int64 := peek64(lyuBox);
+            free(lyuBox, 8);
+            if (lyuBuf != 0 && lyuSz > 0) {
+              var belegt: int64 := _irUebernehmeLyu(self.ir, lyuBuf, lyuSz, self.labelCount);
+              // Labelnummern weiterstellen, sonst vergibt genLabel() Nummern,
+              // die die uebernommenen Sprungziele schon benutzen — der
+              // naechste `if` spraenge dann mitten in die importierte Unit.
+              if (belegt > 0) { self.labelCount := self.labelCount + belegt; }
+            }
           }
         }
       }
