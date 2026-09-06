@@ -1,0 +1,206 @@
+// std/ee/ac.lyx — Wechselstrom: komplexe Rechnung, Impedanz, Resonanz, Leistung
+//
+// WAS HIER DIE FALLEN SIND — jede hat schon Messungen und Auslegungen
+// verdorben:
+//
+//   * SCHEITELWERT DURCH √2 GILT NUR FÜR DEN SINUS. Der Effektivwert eines
+//     Rechtecks ist der Scheitelwert selbst, der eines Dreiecks Uss/(2√3).
+//     Wer die Sinusformel auf eine geschaltete Endstufe anwendet, unterschätzt
+//     die Verlustleistung erheblich. Deshalb heißen die Funktionen hier
+//     ausdrücklich `AcRmsFromPeakSine` und nicht `AcRms`.
+//
+//   * LEISTUNGSFAKTOR IST NICHT cos φ. Gleich sind sie NUR bei rein
+//     sinusförmigem Strom. An Schaltnetzteilen, Dimmern und Frequenzumrichtern
+//     verzerrt der Strom, und dann ist λ = P/S deutlich kleiner als cos φ der
+//     Grundschwingung. Beide Größen stehen hier getrennt, und `AcPowerFactor`
+//     verlangt S und P — nicht den Winkel.
+//
+//   * DIE BLINDWIDERSTÄNDE HABEN VERSCHIEDENE VORZEICHEN. Induktiv ist +jωL,
+//     kapazitiv −j/(ωC). Wer beide positiv einsetzt, bekommt bei der
+//     Reihenschaltung eine Impedanz, die mit der Frequenz steigt statt ein
+//     Minimum zu durchlaufen — die Resonanz verschwindet spurlos aus der
+//     Rechnung.
+//
+//   * DIE RESONANZFREQUENZ HÄNGT NICHT VON R AB, DIE GÜTE SCHON. f0 = 1/(2π√LC)
+//     gilt für Reihen- UND Parallelkreis; was sich unterscheidet, ist das
+//     Verhalten drumherum. Beim Reihenkreis wird die Impedanz im Resonanzfall
+//     MINIMAL (= R), beim Parallelkreis MAXIMAL. Wer das verwechselt, baut
+//     einen Saugkreis, wo ein Sperrkreis hingehört.
+//
+//   * BEI PARALLELSCHALTUNG KOMPLEXER GRÖSSEN DARF MAN NICHT DIE BETRÄGE
+//     ADDIEREN. |Z1| und |Z2| parallel zu rechnen ist falsch, sobald die
+//     Phasen verschieden sind — und genau dann rechnet man ja. Deshalb gibt es
+//     hier komplexe Zusammenschaltungen und keine Betragsformeln.
+
+unit std.ee.ac;
+
+import std.ee.const;
+import std.math;
+import std.complex;
+
+// ── Komplexe Rechnung: std.complex ─────────────────────────────────────────
+//
+// Diese Sammlung bringt KEINEN eigenen komplexen Zahlentyp mit. `std/complex`
+// hat ihn längst — samt Polarform, überlaufsicherem Betrag (DistHypot statt
+// naivem √(re²+im²)) und richtig gelegten Verzweigungsschnitten. Ein zweiter
+// Typ daneben wäre die schlechtere Zweitfassung und genau die Doppelung, aus
+// der später Divergenz wird: zwei Stellen, die dasselbe rechnen, und eine von
+// beiden wird eines Tages verbessert.
+//
+// Die Impedanz IST eine komplexe Zahl. Sie heißt hier deshalb `Cx` und nicht
+// anders, und alle Rechenoperationen kommen aus `std.complex`:
+//
+//     CxAdd, CxSub, CxMul, CxDiv    Grundrechenarten
+//     CxAbs                          Betrag  |Z|  in Ohm
+//     CxArg                          Phasenwinkel in Bogenmaß
+//     CxNew(re, im)                  aus Real- und Imaginärteil
+//
+// Was diese Unit beisteuert, ist die ELEKTROTECHNIK darauf: welche Größe in
+// welchen Teil gehört, mit welchem Vorzeichen, und was dabei schiefgeht.
+
+// Phasenwinkel in Grad — die Einheit, in der Messgeräte ihn anzeigen.
+pub fn AcPhaseDeg(z: Cx): f64 {
+  return CxArg(z) * 180.0 / EePi();
+}
+
+// Ist die Impedanz ein Fehlerwert?
+pub fn AcIsError(z: Cx): bool {
+  return EeIsError(CxRe(z)) || EeIsError(CxIm(z));
+}
+
+// ── Blindwiderstände ───────────────────────────────────────────────────────
+
+// Induktiver Blindwiderstand XL = ωL. Positiv.
+pub fn AcReactanceL(fHz: f64, lH: f64): f64 {
+  return EeOmega(fHz) * lH;
+}
+
+// Kapazitiver Blindwiderstand XC = 1/(ωC), als BETRAG (positiv).
+// In der komplexen Impedanz steht er mit MINUS — siehe AcImpedanceC.
+pub fn AcReactanceC(fHz: f64, cF: f64): f64 {
+  var w: f64 := EeOmega(fHz);
+  if (w == 0.0 || cF == 0.0) { return EeError(); }
+  return 1.0 / (w * cF);
+}
+
+// ── Impedanzen ─────────────────────────────────────────────────────────────
+
+pub fn AcImpedanceR(rOhm: f64): Cx { return CxNew(rOhm, 0.0); }
+
+pub fn AcImpedanceL(fHz: f64, lH: f64): Cx {
+  return CxNew(0.0, AcReactanceL(fHz, lH));
+}
+
+// Das Minus ist der Punkt: kapazitiv eilt der Strom der Spannung VOR.
+pub fn AcImpedanceC(fHz: f64, cF: f64): Cx {
+  var x: f64 := AcReactanceC(fHz, cF);
+  if (EeIsError(x)) { return CxNew(EeError(), EeError()); }
+  return CxNew(0.0, 0.0 - x);
+}
+
+// Reihenschaltung: Impedanzen addieren sich.
+pub fn AcSeries(a: Cx, b: Cx): Cx { return CxAdd(a, b); }
+
+// Parallelschaltung: Produkt durch Summe, komplex gerechnet. Beträge zu
+// addieren wäre hier falsch, sobald die Phasen verschieden sind.
+pub fn AcParallel(a: Cx, b: Cx): Cx {
+  var s: Cx := CxAdd(a, b);
+  if (CxIsZero(s)) { return CxNew(EeError(), EeError()); }
+  return CxDiv(CxMul(a, b), s);
+}
+
+// Reihenschwingkreis R-L-C als eine Impedanz.
+pub fn AcSeriesRLC(rOhm: f64, lH: f64, cF: f64, fHz: f64): Cx {
+  var xl: f64 := AcReactanceL(fHz, lH);
+  var xc: f64 := AcReactanceC(fHz, cF);
+  if (EeIsError(xc)) { return CxNew(EeError(), EeError()); }
+  return CxNew(rOhm, xl - xc);
+}
+
+// ── Resonanz und Güte ──────────────────────────────────────────────────────
+
+// Thomsonsche Schwingungsformel. Gilt für Reihen- UND Parallelkreis; der
+// Unterschied liegt im Verhalten drumherum, nicht in der Frequenz.
+pub fn AcResonanceHz(lH: f64, cF: f64): f64 {
+  if (lH <= 0.0 || cF <= 0.0) { return EeError(); }
+  return 1.0 / (2.0 * EePi() * SqrtF64(lH * cF));
+}
+
+// Güte des REIHENkreises: Q = (1/R)·√(L/C).
+pub fn AcQSeries(rOhm: f64, lH: f64, cF: f64): f64 {
+  if (rOhm <= 0.0 || cF <= 0.0 || lH <= 0.0) { return EeError(); }
+  return SqrtF64(lH / cF) / rOhm;
+}
+
+// Güte des PARALLELkreises: Q = R·√(C/L) — der Kehrwert der Abhängigkeit von R.
+// Ein großer Widerstand verschlechtert den Reihenkreis und verbessert den
+// Parallelkreis; wer die Formeln vertauscht, bekommt das Gegenteil heraus.
+pub fn AcQParallel(rOhm: f64, lH: f64, cF: f64): f64 {
+  if (lH <= 0.0 || cF <= 0.0) { return EeError(); }
+  return rOhm * SqrtF64(cF / lH);
+}
+
+// Bandbreite aus Resonanzfrequenz und Güte.
+pub fn AcBandwidthHz(f0Hz: f64, q: f64): f64 {
+  if (q <= 0.0) { return EeError(); }
+  return f0Hz / q;
+}
+
+// ── Effektiv- und Scheitelwerte ────────────────────────────────────────────
+//
+// Die Formen tragen die KURVENFORM im Namen. Ein blosses `AcRms` wäre die
+// Einladung, die Sinusformel auf ein Rechteck anzuwenden.
+
+pub fn AcRmsFromPeakSine(peak: f64): f64 { return peak / SqrtF64(2.0); }
+pub fn AcPeakFromRmsSine(rms: f64): f64 { return rms * SqrtF64(2.0); }
+
+// Rechteck (symmetrisch): Effektivwert = Scheitelwert.
+pub fn AcRmsFromPeakSquare(peak: f64): f64 { return peak; }
+
+// Dreieck und Sägezahn: Scheitelwert durch √3.
+pub fn AcRmsFromPeakTriangle(peak: f64): f64 { return peak / SqrtF64(3.0); }
+
+// Spitze-Spitze aus Scheitelwert und zurück — bei Oszilloskopmessungen die
+// Größe, die man abliest, und die häufigste Verwechslung mit dem Scheitelwert.
+pub fn AcPeakToPeak(peak: f64): f64 { return 2.0 * peak; }
+pub fn AcPeakFromPeakToPeak(pp: f64): f64 { return pp / 2.0; }
+
+// ── Leistung ───────────────────────────────────────────────────────────────
+
+// Scheinleistung S = U·I (beides Effektivwerte).
+pub fn AcApparentPower(uRms: f64, iRms: f64): f64 { return uRms * iRms; }
+
+// Wirkleistung aus Scheinleistung und Phasenwinkel (Bogenmaß).
+pub fn AcActivePower(sVA: f64, phiRad: f64): f64 { return sVA * CosF64(phiRad); }
+
+// Blindleistung.
+pub fn AcReactivePower(sVA: f64, phiRad: f64): f64 { return sVA * SinF64(phiRad); }
+
+// LEISTUNGSFAKTOR λ = P/S. Bewusst aus P und S und NICHT aus dem Winkel:
+// bei verzerrtem Strom ist λ kleiner als cos φ der Grundschwingung, und die
+// Verwechslung führt zu unterdimensionierten Zuleitungen.
+pub fn AcPowerFactor(pW: f64, sVA: f64): f64 {
+  if (sVA == 0.0) { return EeError(); }
+  return pW / sVA;
+}
+
+// Der Klirrfaktor-Anteil, um den λ hinter cos φ zurückbleibt:
+// λ = cos φ / √(1 + THD²). Damit lässt sich der Unterschied beziffern statt
+// ihn zu ignorieren.
+pub fn AcPowerFactorWithThd(cosPhi: f64, thd: f64): f64 {
+  if (thd < 0.0) { return EeError(); }
+  return cosPhi / SqrtF64(1.0 + thd * thd);
+}
+
+// Die Kapazität, die einen Leistungsfaktor auf einen Zielwert hebt
+// (Blindleistungskompensation).
+pub fn AcCompensationFarad(pW: f64, uRms: f64, fHz: f64,
+                           cosPhiIst: f64, cosPhiSoll: f64): f64 {
+  if (uRms <= 0.0 || fHz <= 0.0) { return EeError(); }
+  if (cosPhiIst <= 0.0 || cosPhiIst > 1.0) { return EeError(); }
+  if (cosPhiSoll <= 0.0 || cosPhiSoll > 1.0) { return EeError(); }
+  var tanIst:  f64 := TanF64(AcosF64(cosPhiIst));
+  var tanSoll: f64 := TanF64(AcosF64(cosPhiSoll));
+  var qC: f64 := pW * (tanIst - tanSoll);
+  return qC / (EeOmega(fHz) * uRms * uRms);
+}
