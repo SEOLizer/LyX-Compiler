@@ -5,6 +5,7 @@
 // WP-09 addition: import resolution (reads/parses/codegens imported .lyx files)
 
 import src.emit_write;
+import src.lyu_reader;   // #1966: symCount einer .lyu pruefen
 import src.parser;
 import src.dwarf_gen;
 import src.crypto.lic_hmac;
@@ -20361,6 +20362,44 @@ pub type Codegen = class {
     return src;
   }
 
+  // #1966: Zu einem `.lyx`-Pfad die danebenliegende `.lyu` finden — in
+  // derselben Reihenfolge, in der auch die Quelle gesucht wurde: erst neben
+  // der uebersetzten Datei, dann includePath, dann stdPath. Liefert 0, wenn
+  // es keine gibt. Der Puffer bleibt stehen; er lebt nur bis zum Abbruch.
+  fn cg_lyuPfadZu(relLyx: pchar): int64 {
+    var rl: int64 := StrLen(relLyx);
+    if (rl < 4) { return 0; }
+    // ".lyx" gegen ".lyu" tauschen.
+    var rel: int64 := alloc(rl + 1);
+    memcpy(rel, relLyx as int64, rl);
+    poke8(rel + rl - 1, 117);       // 'u'
+    poke8(rel + rl, 0);
+    var basen: int64 := alloc(3 * 8);
+    var n: int64 := 0;
+    if (self.includePath != 0) { poke64(basen + n * 8, self.includePath); n := n + 1; }
+    if (self.stdPath != 0)     { poke64(basen + n * 8, self.stdPath);     n := n + 1; }
+    var i: int64 := 0;
+    while (i < n) {
+      var b: pchar := peek64(basen + i * 8) as pchar;
+      var bl: int64 := StrLen(b);
+      var voll: int64 := alloc(bl + 1 + rl + 1);
+      memcpy(voll, b as int64, bl);
+      poke8(voll + bl, 47);
+      memcpy(voll + bl + 1, rel, rl);
+      poke8(voll + bl + 1 + rl, 0);
+      var fd: int64 := open(voll as pchar, 0, 0);
+      if (fd >= 0) { close(fd); free(basen, 24); return voll; }
+      free(voll, bl + 1 + rl + 1);
+      i := i + 1;
+    }
+    free(basen, 24);
+    // Zuletzt der Pfad, wie er dasteht (relativ zum Arbeitsverzeichnis).
+    var fd2: int64 := open(rel as pchar, 0, 0);
+    if (fd2 >= 0) { close(fd2); return rel; }
+    free(rel, rl + 1);
+    return 0;
+  }
+
   // Process an import: find the .lyx file, parse it, codegen it.
   // Temporarily swaps pSrc/pNodes to the imported file's data.
   fn cg_processImport(modName: pchar, nameLen: int64) {
@@ -20446,12 +20485,62 @@ pub type Codegen = class {
     if (src != 0 as pchar) { srcSize := StrLen(src); }
 
     if (src == 0 as pchar) {
-      PrintStr("codegen: cannot read import: ");
-      PrintStr(path);
-      PrintStr("\n");
-      free(pathBuf, nameLen + 8);
-      self.cgAlias := cgaSaved; self.cgAliasLen := cgaSavedLen;   // #1262
-      return;
+      // #1966: Hier wurde bis 1.2.3A nur GEMELDET und weitergemacht. Die
+      // Auswirkung war still und gefaehrlich: sema hatte die Unit ueber die
+      // `.lyu` aufgeloest, der Codegen ueberging sie — und jede Konstante
+      // daraus kam als 0 an. Kein Fehler, kein Abbruch, das Programm lief und
+      // rechnete falsch. Ein Schwellwert, eine Puffergroesse oder ein
+      // Zeitlimit aus einer solchen Konstante faellt genau so aus, wie es
+      // nicht auffaellt.
+      //
+      // Eine `.lyu` traegt NAMEN und TYPEN, aber weder Werte noch Code. Sie
+      // kann eine Uebersetzung deshalb nicht allein tragen; fehlt die Quelle,
+      // ist das ein Fehler und keine Randnotiz.
+      // #1966: Erst nachsehen, ob die Unit ueberhaupt ETWAS beitraegt.
+      //
+      // Eine `.lyu` mit symCount = 0 deklariert nichts — dann fehlt auch
+      // nichts, und der Import ist folgenlos. Genau diesen Fall fuehrt
+      // tests/sec_wp35_lyu_symcount_test.sh (Pruefung 5) als GUELTIG. Ein
+      // pauschaler Abbruch waere hier eine Verschaerfung ueber den Defekt
+      // hinaus: gemeldet werden muss, wo etwas VERLOREN geht.
+      var lyuPfad: int64 := self.cg_lyuPfadZu(path);
+      var traegtSymbole: int64 := 1;
+      if (lyuPfad != 0) {
+        var lfd: int64 := open(lyuPfad as pchar, 0, 0);
+        if (lfd >= 0) {
+          var lsz: int64 := lseek(lfd, 0, 2);
+          lseek(lfd, 0, 0);
+          if (lsz > 0) {
+            var lbuf: int64 := alloc(lsz);
+            var gel: int64 := 0;
+            var abbruch: int64 := 0;
+            while (gel < lsz && abbruch == 0) {
+              var rn: int64 := read(lfd, (lbuf + gel) as pchar, lsz - gel);
+              if (rn <= 0) { abbruch := 1; } else { gel := gel + rn; }
+            }
+            if (abbruch == 0) {
+              var lr: LyuReader := new LyuReader();
+              if (lr.LyrInit(lbuf, lsz)) {
+                if (lr.symCount == 0) { traegtSymbole := 0; }
+              }
+            }
+          }
+          close(lfd);
+        }
+      }
+      if (traegtSymbole == 0) {
+        // Nichts deklariert, nichts verloren — weiter wie bisher.
+        free(pathBuf, nameLen + 8);
+        self.cgAlias := cgaSaved; self.cgAliasLen := cgaSavedLen;   // #1262
+        return;
+      }
+      EPrintStr("error: codegen: Quelle der importierten Unit nicht lesbar: "c);
+      EPrintStrLn(path);
+      EPrintStrLn("  sema hat die Unit aufgeloest (womoeglich ueber eine .lyu), der Codegen"c);
+      EPrintStrLn("  braucht aber die .lyx: eine .lyu enthaelt Namen und Typen, weder die"c);
+      EPrintStrLn("  Werte der Konstanten noch den Code der Funktionen."c);
+      EPrintStrLn("  Ohne diesen Abbruch kaeme jede Konstante daraus still als 0 an."c);
+      exit(1);
     }
 
     // Parse the imported file
