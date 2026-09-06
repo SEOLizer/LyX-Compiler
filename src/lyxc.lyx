@@ -1528,7 +1528,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.2.3E"c);
+      PrintStrLn("1.2.3F"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1550,7 +1550,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.2.3E"c);
+      PrintStrLn("1.2.3F"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1779,7 +1779,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.2.3E (bootstrap)");
+    PrintStrLn("lyxc 1.2.3F (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -2087,29 +2087,48 @@ pub type CompilerConfig = class {
       cuCg.unitCheckMode        := 1;   // #1587: kein main erwartet
       cuCg.Generate(astRoot);
 
-      // #1974: Das IR fuer den Abschnitt erzeugen. `--compile-unit` lief
-      // bisher ueber sema und (seit #1587) den Codegen — ein IR-Modul entstand
-      // dabei nie, denn fuer x86 nimmt lyxc den Schnellweg direkt vom AST.
+      // #1974: Das IR fuer den Abschnitt erzeugen — aber NUR fuer ein Ziel,
+      // das den IR-Weg auch geht.
       //
-      // Ohne IR traegt die .lyu keinen Code, und eine allein ausgelieferte
-      // Unit liefert keine Funktion (#1974). Erzeugt wird es deshalb hier,
-      // einmal, ausschliesslich fuer die Ablage.
-      var cuIr: IRModule := new IRModule();
-      cuIr.init();
-      var cuLower: IRLower := new IRLower();
-      cuLower.init(cuIr as int64, parser.nodes, parser.nodeCount, source, cuIr);
-      cuLower.target        := self.target;
-      cuLower.irIncludePath := self.includePath;
-      cuLower.irStdPath     := self.stdPath;
-      cuLower.irSrcPath     := inputFile;      // #1961
-      cuLower.irSrcLen      := StrLen(inputFile);
-      cuLower.lowerModule(astRoot);
+      // #1982: Die erste Fassung baute es IMMER, auch fuer das voreingestellte
+      // x86_64. Das war aus zwei Gruenden falsch:
+      //
+      //   * x86 nimmt den Schnellweg direkt vom AST. Ein IR wird dort nie
+      //     gebraucht — wohl aber gebaut, und dabei stolperte `ir_lower` ueber
+      //     Builtins, die nur der x86-Codegen kennt (118 Namen laut dem
+      //     Drift-Waechter). `make precompile-units` brach an std/bpf.lyx ab:
+      //     "unbekannter Builtin/Funktion: sys_bpf".
+      //   * Das Lowering ist ZIELABHAENGIG (self.target steuert dort die
+      //     arch-spezifischen Tabellen). Ein fuer x86 gebautes IR waere fuer
+      //     arm64 gar nicht das richtige gewesen.
+      //
+      // Wer eine Unit fuer einen IR-Consumer vorkompilieren will, gibt das
+      // Ziel an: `--compile-unit --target=arm64`. Ohne Zielangabe entsteht
+      // eine .lyu wie vor #1974 — Namen und Typen, kein Code.
+      var cuIrPtr: int64 := 0;
+      if self.target != LYX_TC_X86_64 {
+        var cuIr: IRModule := new IRModule();
+        cuIr.init();
+        var cuLower: IRLower := new IRLower();
+        cuLower.init(cuIr as int64, parser.nodes, parser.nodeCount, source, cuIr);
+        cuLower.target        := self.target;
+        cuLower.irIncludePath := self.includePath;
+        cuLower.irStdPath     := self.stdPath;
+        cuLower.irSrcPath     := inputFile;      // #1961
+        cuLower.irSrcLen      := StrLen(inputFile);
+        cuLower.lowerModule(astRoot);
+        cuIrPtr := cuIr as int64;
+      }
 
       var lyw: LyuWriter := new LyuWriter();
       lyw.LywInit();
       if self.debugSymbols { lyw.LywSetDebug(1); }
-      lyw.LywSetIR(cuIr as int64);   // #1974
-      lyw.Serialize(inputFile, sema, LYU_ARCH_X86_64);
+      if cuIrPtr != 0 { lyw.LywSetIR(cuIrPtr); }   // #1974
+      // #1982: Das arch-Feld stand fest auf x86_64, auch wenn fuer ein anderes
+      // Ziel uebersetzt wurde. Solange die .lyu nur Namen trug, war das
+      // folgenlos; mit IM CONTAINER LIEGENDEM CODE ist es das nicht mehr —
+      // der Consumer muss erkennen koennen, wofuer das IR gebaut wurde.
+      lyw.Serialize(inputFile, sema, self._lyuArchFuerZiel());
       var lyuPath: pchar;
       if outputFile != 0 as pchar {
         lyuPath := outputFile;
@@ -4998,6 +5017,27 @@ pub type CompilerConfig = class {
     return StrConcat(base, ".lyu"c);
   }
 
+  // #1982: Ziel-Kennung -> LYU_ARCH_*. Vorher stand im Kopf jeder .lyu fest
+  // x86_64, gleich fuer welches Ziel sie gebaut wurde. Mit dem IR-Abschnitt
+  // (#1974) muss die Angabe stimmen: das Lowering ist zielabhaengig, und ein
+  // Consumer, der arm64-IR fuer riscv einsetzt, erzeugt Unsinn.
+  fn _lyuArchFuerZiel(): int64 {
+    if self.target == LYX_TC_ARM64        { return LYU_ARCH_ARM64; }
+    if self.target == LYX_TC_MACOS_ARM64  { return LYU_ARCH_ARM64; }
+    if self.target == LYX_TC_ANDROID_ARM64 { return LYU_ARCH_ARM64; }
+    if self.target == LYX_TC_WINDOWS_ARM64 { return LYU_ARCH_WIN_ARM64; }
+    if self.target == LYX_TC_RISCV64      { return LYU_ARCH_RISCV64; }
+    if self.target == LYX_TC_LINUX_RISCV64 { return LYU_ARCH_RISCV64; }
+    if self.target == LYX_TC_XTENSA       { return LYU_ARCH_XTENSA; }
+    if self.target == LYX_TC_ARM_CM       { return LYU_ARCH_ARM_CM; }
+    if self.target == LYX_TC_ARM_CM4      { return LYU_ARCH_ARM_CM; }
+    if self.target == LYX_TC_MACOS_X86_64 { return LYU_ARCH_MACOSX64; }
+    if self.target == LYX_TC_WINDOWS_X86_64 { return LYU_ARCH_X86_64_WIN; }
+    // lyxos und android-x86 laufen auf x86-64-Code; eine eigene Kennung gibt
+    // das Format nicht her.
+    return LYU_ARCH_X86_64;
+  }
+
   fn _passStart(name: pchar): int64 {
     if !self.tracePasses { return 0; }
     PrintStr("[pass] "c);
@@ -5687,7 +5727,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.2.3E — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.2.3F — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
