@@ -779,24 +779,54 @@ pub type IRLower = class {
     var strBuf: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
     var strCap: int64 := peek64(self.ir + IR_MOD_OFF_STRCAP);
     var strLen: int64 := peek64(self.ir + IR_MOD_OFF_STRLEN);
-    if (strLen + slen + 1 > strCap) {
+    // #1968: Vor jeder Zeichenkette stehen acht Byte mit ihrer LAENGE.
+    //
+    // Bis 1.2.2D war die Nullterminierung das einzige Laengenmass, und die
+    // Backends massen beim Ausgeben mit StrLen. Alles ab dem ersten Nullbyte
+    // ging damit verloren — unter qemu-aarch64 wurden aus `AB\0CD` die drei
+    // Bytes `AB\0` plus zwei FREMDE aus dem anschliessenden Speicher. Das traf
+    // jedes Literal mit `\0`, nicht nur eingebettete Dateien (#1961).
+    //
+    // Ein Vorspann statt einer zweiten Tabelle: der zurueckgegebene Offset
+    // zeigt weiterhin auf das erste ZEICHEN, alle bestehenden Leser rechnen
+    // also unveraendert weiter, und die Nullterminierung bleibt ebenfalls
+    // (die Laufzeit erwartet sie bei pchar) — sie ist nur nicht mehr das Mass.
+    // Die Laenge steht bei `off - 8` und wird mit peek64 gelesen, deshalb muss
+    // der Vorspann auf acht ausgerichtet sein.
+    // Erst den Platz sichern — mit den bis zu sieben Fuellbytes der
+    // Ausrichtung, dem Vorspann, den Zeichen und der Null.
+    if (strLen + 7 + 8 + slen + 1 > strCap) {
       var newCap: int64 := strCap * 2;
+      while (newCap < strLen + 7 + 8 + slen + 1) { newCap := newCap * 2; }
       var nb: int64 := alloc(newCap);
-      var ci: int64 := 0;
       memcpy(nb, strBuf, strLen);
       strBuf := nb;
       strCap := newCap;
       poke64(self.ir + IR_MOD_OFF_STRBUF, strBuf);
       poke64(self.ir + IR_MOD_OFF_STRCAP, strCap);
     }
-    var off: int64 := strLen;
+    // Dann ausrichten: der Vorspann wird mit peek64 gelesen.
+    while ((strLen & 7) != 0) { poke8(strBuf + strLen, 0); strLen := strLen + 1; }
+    var li: int64 := 0;
+    while (li < 8) { poke8(strBuf + strLen + li, (slen >> (li * 8)) & 255); li := li + 1; }
+    var off: int64 := strLen + 8;
     var src: int64 := s as int64;
-    var si: int64 := 0;
     memcpy(strBuf + off, src, slen);
     poke8(strBuf + off + slen, 0);
-    strLen := strLen + slen + 1;
+    strLen := off + slen + 1;
     poke64(self.ir + IR_MOD_OFF_STRLEN, strLen);
     return off;
+  }
+
+  // #1968: Die Laenge der Zeichenkette an diesem Offset. Sie steht im
+  // Vorspann, den irAddString davorlegt — NICHT ueber StrLen bestimmen, sonst
+  // schneidet ein Nullbyte im Inhalt ab.
+  pub fn irStringLen(strBuf: int64, off: int64): int64 {
+    if (off < 8) { return 0; }
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < 8) { v := v | ((peek8(strBuf + off - 8 + i) & 255) << (i * 8)); i := i + 1; }
+    return v;
   }
 
   // WP-BC-39: Set strOff field of instruction at index idx
@@ -905,32 +935,10 @@ pub type IRLower = class {
       var eBuf: int64 := self._embedLesen(ePfad, eLenBox);
       var eLen: int64 := peek64(eLenBox);
       free(eLenBox, 8);
-      // Der IR-Zeichenkettenspeicher ist NULLTERMINIERT: die Backends messen
-      // die Laenge beim Ausgeben mit StrLen (emit_arm64.emitConstStr und die
-      // gleichlautenden Stellen in riscv, lyxos, arm-cm4, xtensa). Ein
-      // Nullbyte im Inhalt schneidet dort alles Weitere ab — gemessen unter
-      // qemu-aarch64: aus `AB\0CD` wurden `AB\0` plus Fremdbytes.
-      //
-      // Das MUSS gemeldet werden, statt still ein halbes Erzeugnis zu bauen.
-      // Textdateien (Vorlagen, Shader, Konfigurationen) enthalten keine
-      // Nullbytes und gehen auf allen Zielen; fuer binaere Daten braucht der
-      // IR-Weg eine laengenbehaftete Zeichenkettentabelle — als eigenes
-      // Paket geführt.
-      var nzI: int64 := 0;
-      while (nzI < eLen) {
-        if (peek8(eBuf + nzI) == 0) {
-          EPrintStr("error: @embed: die Datei enthaelt ein Nullbyte (Versatz "c);
-          EPrintInt(nzI);
-          EPrintStrLn(") —"c);
-          EPrintStrLn("  auf diesem Ziel werden eingebettete Bytes ueber die nullterminierte"c);
-          EPrintStrLn("  IR-Zeichenkettentabelle abgelegt; alles ab dem Nullbyte ginge verloren."c);
-          EPrintStrLn("  Textdateien gehen hier, binaere Daten bisher nur mit --target=x86_64."c);
-          EPrintStr("  Datei: "c);
-          EPrintStrLn(ePfad as pchar);
-          exit(1);
-        }
-        nzI := nzI + 1;
-      }
+      // #1968: Frueher stand hier eine Sperre — ein Nullbyte im Inhalt wurde
+      // gemeldet, weil die Backends die Laenge mit StrLen bestimmten und alles
+      // Weitere verloren ging. Seit die Laenge im Vorspann steht
+      // (irAddString), traegt der IR-Weg binaere Daten wie der x86-Codegen.
       var eOff: int64 := self.irAddString(eBuf as pchar, eLen);
       self.irAddInstrDirect(IRO_CONST_STR, eDest, -1, -1, eOff);
       return eDest;

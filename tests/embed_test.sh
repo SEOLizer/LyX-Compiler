@@ -117,16 +117,27 @@ Hallo Welt aus einer Vorlage" ]; then
         nok "arm64: uebersetzt nicht"; sed -n '1,4p' "$TMP/a.log"
     fi
 
-    # Binaerdaten auf dem IR-Weg: die Zeichenkettentabelle dort ist
-    # NULLTERMINIERT, alles ab dem ersten Nullbyte ginge verloren. Das MUSS
-    # gemeldet werden — ein halbes Bild ist schlimmer als ein Fehlschlag.
-    printf 'unit main;\nimport std.io;\nfn main(): int64 { PrintLn(IntToStr(peek8(@embed("binaer.bin") as int64) as int64)); return 0; }' > "$TMP/ab.lyx"
+    # #1968: Binaerdaten auf dem IR-Weg.
+    #
+    # Bis 1.2.2D stand hier das Gegenteil: geprueft wurde, dass der Compiler
+    # ein Nullbyte MELDET. Das war richtig, solange die Backends die Laenge mit
+    # StrLen bestimmten — und es war ein Test, der die LUECKE VORAUSSETZTE:
+    # sobald sie zugeht, waere er rot geworden, ohne dass etwas kaputt ist.
+    #
+    # Seit die Laenge im Vorspann der Zeichenkette steht, traegt der IR-Weg
+    # dieselben Bytes wie der x86-Codegen. Gemessen wird deshalb der WERT,
+    # ausgefuehrt, Byte fuer Byte — und zwar derselbe Erwartungswert wie oben
+    # fuer x86. Genau das ist die Aussage: BEIDE Wege liefern dasselbe.
+    printf 'unit main;\nimport std.io;\nfn main(): int64 {\n  var p: pchar := @embed("binaer.bin");\n  var n: int64 := @embed_len("binaer.bin");\n  PrintStr(IntToStr(n));\n  var i: int64 := 0;\n  while (i < n) { PrintStr(" "); PrintStr(IntToStr(peek8((p as int64) + i) as int64)); i := i + 1; }\n  PrintLn("");\n  return 0;\n}' > "$TMP/ab.lyx"
     if ( cd / && timeout 180 "$LYXC" --target=arm64 --std-path="$ROOT" "$TMP/ab.lyx" -o "$TMP/ab" ) >"$TMP/ab.log" 2>&1; then
-        nok "arm64 mit Nullbyte: uebersetzt durch, statt zu melden"
-    elif grep -q "Nullbyte" "$TMP/ab.log"; then
-        ok "arm64 meldet das Nullbyte, statt still abzuschneiden"
+        abAus="$( ulimit -v 4000000; timeout 60 qemu-aarch64-static "$TMP/ab" 2>&1 )"
+        if [ "$abAus" = "5 65 66 0 67 68" ]; then
+            ok "arm64 traegt binaere Daten samt Nullbyte (#1968)"
+        else
+            nok "arm64 binaer: bekommen '$abAus', erwartet '5 65 66 0 67 68'"
+        fi
     else
-        nok "arm64 mit Nullbyte: falsche Meldung ($(head -1 "$TMP/ab.log"))"
+        nok "arm64 binaer: uebersetzt nicht"; sed -n '1,4p' "$TMP/ab.log"
     fi
 else
     echo "HINWEIS qemu-aarch64-static fehlt — der IR-Weg bleibt hier ungemessen"
@@ -240,6 +251,42 @@ if command -v qemu-aarch64-static >/dev/null 2>&1; then
         ok "arm64 meldet @resource, statt still ohne Tabelle zu bauen"
     else
         nok "arm64 mit @resource: falsche Meldung ($(grep -v Copyright "$TMP/ri.log" | head -1))"
+    fi
+fi
+
+# ===========================================================================
+# #1968 — die IR-Zeichenkettentabelle fuehrt jetzt eine eigene Laenge
+# ===========================================================================
+#
+# Der Befund haengt NICHT an @embed: er trifft jedes Literal mit einem `\0`
+# darin. Bis 1.2.2D bestimmten die IR-Backends die Laenge mit StrLen, und
+# damit ging alles ab dem ersten Nullbyte verloren — nachgemessen unter
+# qemu-aarch64: aus `AB\0CD` wurden `AB\0` plus zwei FREMDE Bytes aus dem
+# anschliessenden Speicher.
+#
+# Gemessen wird deshalb das LITERAL selbst, ohne Datei, auf beiden
+# Uebersetzungswegen — und mit demselben Erwartungswert.
+pruefe "Literal mit Nullbyte, x86" 'unit main;
+import std.io;
+fn main(): int64 {
+  var s: pchar := "AB\0CD";
+  var i: int64 := 0;
+  while (i < 5) { PrintStr(IntToStr(peek8((s as int64) + i) as int64)); PrintStr(" "); i := i + 1; }
+  PrintLn("");
+  return 0;
+}' '65 66 0 67 68 '
+
+if command -v qemu-aarch64-static >/dev/null 2>&1; then
+    printf 'unit main;\nimport std.io;\nfn main(): int64 {\n  var s: pchar := "AB\\0CD";\n  var i: int64 := 0;\n  while (i < 5) { PrintStr(IntToStr(peek8((s as int64) + i) as int64)); PrintStr(" "); i := i + 1; }\n  PrintLn("");\n  return 0;\n}' > "$TMP/lit.lyx"
+    if ( cd / && timeout 180 "$LYXC" --target=arm64 --std-path="$ROOT" "$TMP/lit.lyx" -o "$TMP/lit" ) >"$TMP/lit.log" 2>&1; then
+        litAus="$( ulimit -v 4000000; timeout 60 qemu-aarch64-static "$TMP/lit" 2>&1 )"
+        if [ "$litAus" = "65 66 0 67 68 " ]; then
+            ok "Literal mit Nullbyte, arm64 (#1968)"
+        else
+            nok "Literal mit Nullbyte auf arm64: bekommen '$litAus'"
+        fi
+    else
+        nok "Literal mit Nullbyte auf arm64: uebersetzt nicht"; sed -n '1,4p' "$TMP/lit.log"
     fi
 fi
 
