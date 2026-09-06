@@ -3,6 +3,7 @@
 // Format matches S0 unit_format.pas / TLyuxSerializer::Serialize.
 
 import src.sema;
+import src.ir;          // #1974: IR_MOD_OFF_* fuer den IR-Abschnitt
 import src.std.alloc;
 
 // Magic 'LYU\0'
@@ -11,6 +12,11 @@ con LYU_W_M1: int64 := 89;
 con LYU_W_M2: int64 := 85;
 con LYU_W_M3: int64 := 0;
 con LYU_W_VER: int64 := 2;
+
+// #1974: Fassung des IR-Abschnitts. Eigenstaendig gezaehlt, damit sich das IR
+// weiterentwickeln kann, ohne die Fassung der .lyu selbst anzufassen — ein
+// Leser, der die Zahl nicht kennt, ueberspringt den Abschnitt.
+pub con LYU_IR_VER: int64 := 1;
 
 // TLyuxArch codes (must match S0 unit_format.pas)
 pub con LYU_ARCH_X86_64:     int64 := 0;
@@ -39,6 +45,11 @@ pub type LyuWriter = class {
   // --debug-symbols` eine byte-identische Datei.
   includeDebug: int64;
   dbgOffPos:    int64;   // Position des DebugOffset-Feldes im Puffer
+  // #1974: IR-Abschnitt. Das Feld `IRCodeOffset` steht seit jeher im Kopf und
+  // wurde immer als 0 geschrieben — die .lyu trug damit Namen und Typen, aber
+  // keinen Code. `irModulPtr` ist das zu schreibende IRModule (0 = keines).
+  irOffPos:   int64;
+  irModulPtr: int64;
 
   pub fn LywInit() {
     self.cap := 4096;
@@ -46,10 +57,16 @@ pub type LyuWriter = class {
     self.len := 0;
     self.includeDebug := 0;
     self.dbgOffPos    := 0;
+    self.irOffPos     := 0;   // #1974
+    self.irModulPtr   := 0;
   }
 
   // #1555: vor Serialize aufrufen.
   pub fn LywSetDebug(on: int64) { self.includeDebug := on; }
+
+  // #1974: vor Serialize aufrufen. Ohne IR-Modul bleibt der Abschnitt weg und
+  // die Datei ist byte-identisch zu einer ohne diese Erweiterung.
+  pub fn LywSetIR(irMod: int64) { self.irModulPtr := irMod; }
 
   fn _grow() {
     var nc: int64 := self.cap * 2;
@@ -157,6 +174,32 @@ pub type LyuWriter = class {
     return StrSub(srcPath, nameStart, nameLen);
   }
 
+  // #1974: einen Puffer des IR-Moduls anhaengen — erst die Anzahl BYTES, dann
+  // die Bytes selbst.
+  //
+  // ACHTUNG, die Laengenfelder des IR-Moduls zaehlen NICHT einheitlich:
+  //
+  //   instrLen, funcLen, globalLen, captureLen  → Anzahl der SAETZE
+  //   strLen, labelLen                          → Anzahl der BYTES
+  //
+  // Beide Formen stehen unkommentiert nebeneinander in ir.lyx (nur die
+  // Kopfkommentare bei +112/+136 sagen "count"), und lbf_writer.lyx rechnet
+  // es entsprechend um (`instrBuf + ii * IR_INSTR_SIZE` bei `ii < instrLen`).
+  // Wer alles fuer Bytes haelt, schreibt einen Abschnitt, der uebersetzt und
+  // beim Lesen Unsinn ergibt — genau das war der erste Wurf hier: `instr 7
+  // Byte`, `func 1 Byte`.
+  //
+  // `satzGroesse` ist deshalb 1 fuer die byteweise gefuehrten Puffer und die
+  // Satzgroesse fuer die anderen.
+  fn _eIrPuffer(bufOff: int64, lenOff: int64, satzGroesse: int64) {
+    var b: int64 := peek64(self.irModulPtr + bufOff);
+    var n: int64 := peek64(self.irModulPtr + lenOff) * satzGroesse;
+    if (b == 0 || n <= 0) { self._e32le(0); return; }
+    self._e32le(n);
+    var i: int64 := 0;
+    while (i < n) { self._e8(peek8(b + i)); i := i + 1; }
+  }
+
   // Serialize sema symbol table into the internal buffer.
   // arch: one of LYU_ARCH_* constants.
   pub fn Serialize(inputPath: pchar, sema: Sema, arch: int64) {
@@ -196,6 +239,7 @@ pub type LyuWriter = class {
     // Symbol count + offset placeholders
     self._e32le(symCount);
     self._e32le(0);  // TypeInfoOffset
+    self.irOffPos := self.len;   // #1974: hierhin kommt der Offset am Ende
     self._e32le(0);  // IRCodeOffset
     self.dbgOffPos := self.len;   // #1555: hierhin kommt der Offset am Ende
     self._e32le(0);  // DebugOffset
@@ -229,6 +273,39 @@ pub type LyuWriter = class {
     self._e32le(0);          // strings count = 0
     self._e32le(funcCount);  // function count
     self._e32le(0);          // globals count = 0
+
+    // ── IR-Abschnitt (#1974) ───────────────────────────────────────────
+    //
+    // Bis 1.2.3B trug eine `.lyu` NAMEN und TYPEN, aber keinen Code: das Feld
+    // `IRCodeOffset` stand im Kopf und wurde immer als 0 geschrieben. Eine
+    // allein ausgelieferte Unit lieferte deshalb keine einzige Funktion.
+    //
+    // Geschrieben werden die fuenf Puffer des IR-Moduls roh. Das geht, WEIL
+    // die Saetze untereinander mit OFFSETS verweisen und nicht mit Zeigern
+    // (IR_INSTR_OFF_STROFF, IR_FUNC_OFF_INSTRSOFF …) — nachgesehen in
+    // src/ir.lyx. Ein einziger absoluter Zeiger darin, und diese Uebertragung
+    // waere still falsch: sie uebersetzte fehlerfrei und liefe beim ersten
+    // Zugriff in eine fremde Adresse.
+    //
+    // Aufbau: Magic "LYIR", Fassung, dann je Puffer die LAENGE und die Bytes.
+    // Die Laenge steht VOR den Bytes, damit ein Leser den Abschnitt auch dann
+    // ueberspringen kann, wenn er eine spaetere Fassung nicht kennt.
+    if (self.irModulPtr != 0) {
+      var irStart: int64 := self.len;
+      self._p32le(self.irOffPos, irStart);
+      self._e8(76); self._e8(89); self._e8(73); self._e8(82);   // "LYIR"
+      self._e32le(LYU_IR_VER);
+      // Zaehlweise je Puffer — siehe _eIrPuffer.
+      self._e32le(peek64(self.irModulPtr + IR_MOD_OFF_INSTRLEN));    // Saetze
+      self._e32le(peek64(self.irModulPtr + IR_MOD_OFF_FUNCLEN));     // Saetze
+      self._e32le(peek64(self.irModulPtr + IR_MOD_OFF_GLOBALLEN));   // Saetze
+      self._eIrPuffer(IR_MOD_OFF_INSTRBUF,   IR_MOD_OFF_INSTRLEN,   IR_INSTR_SIZE);
+      self._eIrPuffer(IR_MOD_OFF_STRBUF,     IR_MOD_OFF_STRLEN,     1);
+      self._eIrPuffer(IR_MOD_OFF_LABELBUF,   IR_MOD_OFF_LABELLEN,   1);
+      self._eIrPuffer(IR_MOD_OFF_FUNCBUF,    IR_MOD_OFF_FUNCLEN,    IR_FUNC_SIZE);
+      self._eIrPuffer(IR_MOD_OFF_GLOBALBUF,  IR_MOD_OFF_GLOBALLEN,  8);
+      self._eIrPuffer(IR_MOD_OFF_CAPTUREBUF, IR_MOD_OFF_CAPTURELEN, 8);
+    }
 
     // ── Debug-Abschnitt (#1555) ────────────────────────────────────────
     // Optional und am ENDE, mit Offset und Laenge im Kopf: ein Leser, der ihn
