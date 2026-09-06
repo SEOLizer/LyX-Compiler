@@ -22,7 +22,6 @@ PASS=0; FAIL=0
 ok()  { echo "PASS $1"; PASS=$((PASS+1)); }
 nok() { echo "FAIL $1"; FAIL=$((FAIL+1)); }
 
-mkdir -p "$TMP/demo"
 cat > "$TMP/eins.lyx" <<'EOF'
 unit demo.eins;
 pub fn Verdoppeln(x: int64): int64 { return x * 2; }
@@ -48,47 +47,71 @@ EOF
 SOLL="42 15 1 40"
 # Wahl(20)=1 und Wahl2(1)=40 kommen aus VERZWEIGUNGEN: sie belegen, dass die
 # Labelnummern beider Units umnummeriert wurden. Ohne das spraenge der zweite
-# Test ins Sprungziel des ersten — und zwar in ein Programm, das laeuft.
+# Test ins Sprungziel des ersten — und zwar in einem Programm, das laeuft.
 
-for u in eins zwei; do
-    if ! ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --std-path="$ROOT" \
-            "$TMP/$u.lyx" -o "$TMP/demo/$u.lyu" ) >"$TMP/cu.log" 2>&1; then
-        nok "--compile-unit fuer $u schlaegt fehl"; sed -n '1,4p' "$TMP/cu.log"
-        echo; echo "Ergebnis: $PASS PASS, $FAIL FAIL"; exit 1
-    fi
-done
-ok "beide Units als .lyu uebersetzt"
-
-# Die QUELLEN verschwinden — genau darum geht es.
-rm -f "$TMP/eins.lyx" "$TMP/zwei.lyx"
-
-pruefe_ziel() {   # Name, lyxc-Argumente, Ausfuehrer
-    local name="$1" args="$2" run="$3"
-    if ! ( cd / && timeout 180 "$LYXC" $args --std-path="$ROOT" -I "$TMP" \
-            "$TMP/prog.lyx" -o "$TMP/p" ) >"$TMP/b.log" 2>&1; then
-        nok "$name: uebersetzt nicht"; grep -v Copyright "$TMP/b.log" | sed -n '1,4p'; return
+pruefe_ziel() {   # Name, --target-Wert, Ausfuehrer
+    local name="$1" ziel="$2" run="$3"
+    local dir="$TMP/$name"
+    mkdir -p "$dir/demo"
+    # #1982: Die .lyu wird FUER DIESES ZIEL gebaut — das IR-Lowering ist
+    # zielabhaengig, und der Consumer weist eine fremde Architektur ab.
+    local u
+    for u in eins zwei; do
+        if ! ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --target="$ziel" \
+                --std-path="$ROOT" "$TMP/$u.lyx" -o "$dir/demo/$u.lyu" ) >"$dir/cu.log" 2>&1; then
+            nok "$name: --compile-unit fuer $u schlaegt fehl"
+            grep -v Copyright "$dir/cu.log" | sed -n '1,3p'
+            return
+        fi
+    done
+    # Die QUELLEN liegen NICHT im Suchpfad dieses Ziels — nur die .lyu.
+    if ! ( cd / && timeout 180 "$LYXC" --target="$ziel" --std-path="$ROOT" -I "$dir" \
+            "$TMP/prog.lyx" -o "$dir/p" ) >"$dir/b.log" 2>&1; then
+        nok "$name: uebersetzt nicht"; grep -v Copyright "$dir/b.log" | sed -n '1,4p'; return
     fi
     # Die Warnung der alten Fassung darf NICHT mehr kommen: sie hiesse, dass
     # der Rumpf fehlt und das Erzeugnis unvollstaendig ist.
-    if grep -q "Import nicht lesbar" "$TMP/b.log"; then
+    if grep -q "Import nicht lesbar" "$dir/b.log"; then
         nok "$name: warnt weiterhin ueber den unlesbaren Import"; return
     fi
     local ist
-    ist="$( ulimit -v 4000000; timeout 60 $run "$TMP/p" 2>&1 )"
-    if [ "$ist" = "$SOLL" ]; then ok "$name (nur .lyu, Quellen geloescht)"
+    ist="$( ulimit -v 4000000; timeout 60 $run "$dir/p" 2>&1 )"
+    if [ "$ist" = "$SOLL" ]; then ok "$name (nur .lyu, Quellen ausserhalb des Suchpfads)"
     else nok "$name: erwartet '$SOLL', bekommen '$ist'"; fi
 }
 
 echo "--- .lyu-only auf dem IR-Weg (#1977) ---"
 if command -v qemu-aarch64-static >/dev/null 2>&1; then
-    pruefe_ziel "arm64" "--target=arm64" "qemu-aarch64-static"
+    pruefe_ziel "arm64" "arm64" "qemu-aarch64-static"
 else
     echo "HINWEIS qemu-aarch64-static fehlt — arm64 ungemessen"
 fi
 if command -v qemu-riscv64-static >/dev/null 2>&1; then
-    pruefe_ziel "riscv" "--target=riscv" "qemu-riscv64-static"
+    pruefe_ziel "riscv" "riscv" "qemu-riscv64-static"
 else
     echo "HINWEIS qemu-riscv64-static fehlt — riscv ungemessen"
+fi
+
+# #1982: Eine .lyu fuer ein FREMDES Ziel darf nicht benutzt werden. Das IR ist
+# zielabhaengig; arm64-IR auf riscv waere stiller Unsinn. Erwartet wird die
+# Meldung UND das Ausbleiben eines brauchbaren Erzeugnisses.
+if command -v qemu-riscv64-static >/dev/null 2>&1 && [ -d "$TMP/arm64/demo" ]; then
+    if ( cd / && timeout 180 "$LYXC" --target=riscv --std-path="$ROOT" -I "$TMP/arm64" \
+          "$TMP/prog.lyx" -o "$TMP/fremd" ) >"$TMP/fremd.log" 2>&1; then
+        if grep -q "andere Architektur" "$TMP/fremd.log"; then
+            ok "eine .lyu fuer ein fremdes Ziel wird gemeldet und ihr IR nicht benutzt"
+        else
+            nok "fremde Architektur: keine Meldung ($(grep -v Copyright "$TMP/fremd.log" | head -1))"
+        fi
+    else
+        # Auch ein Abbruch ist in Ordnung — Hauptsache nicht stillschweigend
+        # falsches IR.
+        if grep -q "andere Architektur" "$TMP/fremd.log"; then
+            ok "eine .lyu fuer ein fremdes Ziel wird gemeldet und ihr IR nicht benutzt"
+        else
+            nok "fremde Architektur: unerwarteter Abbruch ($(grep -v Copyright "$TMP/fremd.log" | head -1))"
+        fi
+    fi
 fi
 
 # --- Waechter: jeder Opcode ist klassifiziert -------------------------------

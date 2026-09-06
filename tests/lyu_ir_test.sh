@@ -29,7 +29,10 @@ pub fn Dreifach(x: int64): int64 { return x * 3; }
 pub con ZWEI: int64 := 2;
 EOF
 
-if ! ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --std-path="$ROOT" \
+# #1982: Das IR entsteht nur fuer ein Ziel, das den IR-Weg auch geht. Ohne
+# --target liefert --compile-unit eine .lyu wie vor #1974 (Namen und Typen,
+# kein Code) — siehe die Gegenprobe unten.
+if ! ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --target=arm64 --std-path="$ROOT" \
         "$TMP/demo/mathe.lyx" -o "$TMP/demo/mathe.lyu" ) >"$TMP/cu.log" 2>&1; then
     nok "--compile-unit schlaegt fehl"; sed -n '1,4p' "$TMP/cu.log"
     echo; echo "Ergebnis: $PASS PASS, $FAIL FAIL"; exit 1
@@ -112,6 +115,43 @@ if ( cd / && timeout 120 "$LYXC" --std-path="$ROOT" --include-path="$TMP" \
     ok "die Unit bleibt als Import brauchbar"
 else
     nok "Import gestoert"; sed -n '1,4p' "$TMP/b.log"
+fi
+
+# --- #1982: ohne Zielangabe KEIN IR-Abschnitt -------------------------------
+#
+# Die erste Fassung von #1974 baute das IR immer, auch fuer das voreingestellte
+# x86_64. Zwei Gruende, warum das falsch war:
+#
+#   * x86 nimmt den Schnellweg direkt vom AST, ein IR wird dort nie gebraucht —
+#     wohl aber gebaut, und dabei stolperte ir_lower ueber Builtins, die nur
+#     der x86-Codegen kennt (118 Namen laut Drift-Waechter). `make
+#     precompile-units` brach an std/bpf.lyx ab.
+#   * Das Lowering ist ZIELABHAENGIG; ein fuer x86 gebautes IR waere fuer arm64
+#     gar nicht das richtige gewesen.
+#
+# Geprueft wird deshalb BEIDES: mit Ziel ist der Abschnitt da (oben), ohne Ziel
+# nicht. Ein Test nur auf "Abschnitt vorhanden" haette die Regression nicht
+# bemerkt.
+if ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --std-path="$ROOT" \
+      "$TMP/demo/mathe.lyx" -o "$TMP/ohneziel.lyu" ) >"$TMP/oz.log" 2>&1; then
+    if python3 -c "import sys; sys.exit(0 if open('$TMP/ohneziel.lyu','rb').read().find(b'LYIR') < 0 else 1)"; then
+        ok "ohne --target entsteht kein IR-Abschnitt"
+    else
+        nok "ohne --target entsteht doch ein IR-Abschnitt (#1982)"
+    fi
+else
+    nok "--compile-unit ohne Ziel schlaegt fehl"; grep -v Copyright "$TMP/oz.log" | sed -n '1,3p'
+fi
+
+# Und eine Unit, die einen NUR-x86-Builtin benutzt, muss sich weiterhin
+# vorkompilieren lassen — das ist der Fall, an dem precompile-units brach.
+if [ -f "$ROOT/std/bpf.lyx" ]; then
+    if ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --std-path="$ROOT" \
+          "$ROOT/std/bpf.lyx" -o "$TMP/bpf.lyu" ) >"$TMP/bpf.log" 2>&1; then
+        ok "std/bpf.lyx (nutzt sys_bpf, nur x86) laesst sich vorkompilieren"
+    else
+        nok "std/bpf.lyx bricht ab: $(grep -viE 'copyright' "$TMP/bpf.log" | grep -iE 'lyxc:|error' | head -1)"
+    fi
 fi
 
 echo
