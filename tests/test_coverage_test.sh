@@ -63,6 +63,13 @@ is_exempt() {
                                           # Pruefdaten, kein Test.
     data/runde17/ctrl.lyx)   return 0 ;;  # #1670: importierte Klassen als
                                           # Pruefdaten, kein Test.
+    data/erbe/main.lyx)      return 0 ;;  # #1976: Pruefdaten, kein Test. Eine
+    data/erbe/rp/basis.lyx)  return 0 ;;  # zweistufige Vererbung ueber ZWEI
+    data/erbe/rp/mitte.lyx)  return 0 ;;  # Modulgrenzen, die erbe_ir_test.sh
+                                          # auf drei Zielen uebersetzt und
+                                          # ausfuehrt. basis/mitte haben kein
+                                          # main; main.lyx allein uebersetzt
+                                          # braucht die beiden ueber -I.
     part_test.lyx)           return 0 ;;  # std.fs.part: braucht zwei Abbilder
                                           # (GPT und MBR) als Argumente, die
                                           # tests/part_test.sh mit sgdisk und
