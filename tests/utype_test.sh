@@ -749,6 +749,165 @@ fn main(): int64 {
     return 0;
 }" '15.0'
 
+# ── #2004: Einheitenwert aus einer FUNKTION, und wraps rechnet genau ──────
+#
+# Zwei getrennte Ursachen, die zusammen wie ein einziger wraps-Fehler aussahen.
+#
+# 1. Eine Funktion mit Einheiten-Rueckgabetyp lieferte das rohe IEEE-Bitmuster:
+#    aus 358 wurde 4645005618795511808. Grund war die REIHENFOLGE der
+#    Vorlaeufe — cg_collectF64Funcs lief VOR cg_collectUtypes und fragte eine
+#    noch leere Tabelle, ob der Rueckgabetyp Gleitkomma ist. `wraps` war daran
+#    unbeteiligt: eine Einheit OHNE wraps traf es genauso.
+#
+# 2. Die Wrap-Rechnung war um eins daneben. `(t - floor(t)) * span` skaliert
+#    den Bruchteil zurueck und verliert dabei die letzte Stelle.
+W1='import std.io;
+dim Winkel;
+utype Grad: Winkel = 1.0;
+utype W: Winkel = 1 wraps 0..360;
+fn ohneWraps(n: int64): Grad { var v: Grad := n; return v; }
+fn mitWraps(n: int64): W { var v: W := n; return v; }'
+
+# Der Wert muss eine ZAHL sein. Ein Test auf "laeuft durch" waere gruen
+# gewesen — das Bitmuster ist eine voellig gueltige int64.
+out "#2004: Rueckgabe eines Einheitentyps ist eine Zahl" "$W1
+fn main(): int64 {
+    PrintLn(IntToStr(ohneWraps(5) as int64));
+    return 0;
+}" '5'
+
+out "#2004: dasselbe mit wraps" "$W1
+fn main(): int64 {
+    PrintLn(IntToStr(mitWraps(5) as int64));
+    return 0;
+}" '5'
+
+# GEGENPROBE: in einer lokalen Variablen ging es schon vorher. Ohne diese
+# Zeile bliebe unklar, ob der Fix den Weg ueber die Funktion trifft.
+out "#2004: der lokale Weg bleibt richtig" "$W1
+fn main(): int64 {
+    var lokal: W := 5;
+    PrintLn(IntToStr(lokal as int64));
+    return 0;
+}" '5'
+
+# Die Wrap-Rechnung ueber die Grenze hinweg, zur LAUFZEIT. 361 ist der erste
+# Wert hinter dem Zyklus (0..360 sind 361 Werte).
+out "#2004: wraps zur Laufzeit rechnet genau" "$W1
+fn main(): int64 {
+    var i: int64 := 359;
+    while (i <= 363) {
+        PrintLn(IntToStr(mitWraps(i) as int64));
+        i := i + 1;
+    }
+    return 0;
+}" '359
+360
+0
+1
+2'
+
+# Dieselben Zahlen als KONSTANTEN. Vorher wichen 362 und 370 um eins ab,
+# waehrend 361 und 720 stimmten — ein Test an einer einzelnen Zahl haette den
+# Fehler nicht gefunden.
+out "#2004: wraps rechnet auch bei Konstanten genau" "$W1
+fn main(): int64 {
+    var a: W := 362;
+    var b: W := 370;
+    var c: W := 720;
+    PrintLn(IntToStr(a as int64));
+    PrintLn(IntToStr(b as int64));
+    PrintLn(IntToStr(c as int64));
+    return 0;
+}" '1
+9
+359'
+
+# Und die beiden Wege muessen UEBEREINSTIMMEN. Vorher taten sie es nicht.
+out "#2004: Laufzeit und Konstante liefern dasselbe" "$W1
+fn main(): int64 {
+    var k: W := 370;
+    if ((mitWraps(370) as int64) == (k as int64)) { PrintLn(\"gleich\"); }
+    else { PrintLn(\"verschieden\"); }
+    return 0;
+}" 'gleich'
+
+# GEGENPROBE: ein Wert INNERHALB des Bereichs wird nicht angefasst.
+out "#2004: innerhalb des Bereichs bleibt der Wert stehen" "$W1
+fn main(): int64 {
+    var a: W := 180;
+    PrintLn(IntToStr(a as int64));
+    return 0;
+}" '180'
+
+# ── #2007: `return <Ganzzahl>` in einer Gleitkomma-Funktion ───────────────
+#
+# Vorbestehend, gegen 1.2.4D belegt. Der return-Zweig legte den Ausdruck
+# unveraendert in rax; bei einer Ganzzahl in einer f64-Funktion las der
+# Aufrufer sie als IEEE-Bitmuster — 2500 ist dort eine denormale Zahl nahe
+# null, also 0.0000.
+#
+# Unauffaellig blieb es, weil sich bei Einheitentypen ZWEI Fehler aufhoben:
+# solange die Einheiten-Rueckgabe faelschlich als Ganzzahl galt (#2004), passte
+# die falsche Rueckgabe zur falschen Erwartung.
+out "#2007: f64-Funktion gibt ein Ganzzahlliteral zurueck" 'import std.io;
+fn hoehe(): f64 { return 2500; }
+fn main(): int64 {
+    PrintLn(FloatToStr(hoehe(), 4));
+    return 0;
+}' '2500.0000'
+
+out "#2007: dasselbe mit einem Einheitentyp" 'import std.io;
+dim Length;
+utype M: Length = 1.0;
+fn hoehe(): M { return 2500; }
+fn main(): int64 {
+    PrintLn(FloatToStr(hoehe() as f64, 4));
+    return 0;
+}' '2500.0000'
+
+# Die Umrechnung beim Aufrufer muss zusaetzlich greifen.
+out "#2007: und die Einheit wird beim Zuweisen umgerechnet" 'import std.io;
+dim Length;
+utype M: Length = 1.0;
+utype Km: Length = 1000.0;
+fn hoehe(): M { return 2500; }
+fn main(): int64 {
+    var b: Km := hoehe();
+    PrintLn(FloatToStr(b as f64, 4));
+    return 0;
+}' '2.5000'
+
+# GEGENPROBE 1: ein Gleitkommawert wird NICHT ein zweites Mal umgewandelt.
+out "#2007: ein f64-Rueckgabewert bleibt unberuehrt" 'import std.io;
+fn h(): f64 { return 2.5; }
+fn main(): int64 {
+    PrintLn(FloatToStr(h(), 4));
+    return 0;
+}' '2.5000'
+
+# GEGENPROBE 2: eine Ganzzahlfunktion bleibt ganzzahlig. Ohne sie waere der
+# Test auch von einer Fassung erfuellt, die JEDEN Rueckgabewert umwandelt.
+out "#2007: eine int64-Funktion bleibt ganzzahlig" 'import std.io;
+fn h(): int64 { return 2500; }
+fn main(): int64 {
+    PrintLn(IntToStr(h()));
+    return 0;
+}' '2500'
+
+# Die Umwandlung steht an ZWEI Stellen im return-Zweig — mit und ohne defer.
+# Haengt sie nur an einer, ist das Verhalten davon abhaengig, ob die Funktion
+# ein `defer` enthaelt; dieselbe Falle wie bei #1878.
+out "#2007: auch mit defer im Rumpf" 'import std.io;
+fn h(): f64 {
+    defer { }
+    return 2500;
+}
+fn main(): int64 {
+    PrintLn(FloatToStr(h(), 4));
+    return 0;
+}' '2500.0000'
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 test "$FAIL" -eq 0
