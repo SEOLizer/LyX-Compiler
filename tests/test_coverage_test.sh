@@ -63,6 +63,11 @@ is_exempt() {
                                           # Pruefdaten, kein Test.
     data/runde17/ctrl.lyx)   return 0 ;;  # #1670: importierte Klassen als
                                           # Pruefdaten, kein Test.
+    data/erbfeld/main.lyx)      return 0 ;;  # #1985: Pruefdaten, kein Test. Eine
+    data/erbfeld/rp/basis.lyx)  return 0 ;;  # Basisklasse in eigener Unit und
+                                          # zwei Ableitungen, die
+                                          # erbfeld_ir_test.sh auf drei Zielen
+                                          # ausfuehrt. basis hat kein main.
     data/erbe/main.lyx)      return 0 ;;  # #1976: Pruefdaten, kein Test. Eine
     data/erbe/rp/basis.lyx)  return 0 ;;  # zweistufige Vererbung ueber ZWEI
     data/erbe/rp/mitte.lyx)  return 0 ;;  # Modulgrenzen, die erbe_ir_test.sh

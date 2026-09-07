@@ -6735,6 +6735,79 @@ pub type Sema = class {
                         self.sn_sVal(typeNi), self.sn_sLen(typeNi));
   }
 
+  // #1973: Namensvergleich fuer die Create-Pruefung. Die Namen im Baum sind
+  // NICHT nullterminiert, deshalb laengenbehaftet.
+  fn _semaNameEq(p: pchar, l: int64, was: pchar, wl: int64): int64 {
+    if (l != wl) { return 0; }
+    var i: int64 := 0;
+    while (i < l) {
+      if (StrCharAt(p, i) != StrCharAt(was, i)) { return 0; }
+      i := i + 1;
+    }
+    return 1;
+  }
+
+  // #1973: Schreibt der Rumpf IRGENDEIN Feld der Basisklasse (oder deren
+  // Basis)? Dann uebernimmt die Ableitung die Initialisierung selbst, und das
+  // fehlende `super.Create()` ist Absicht statt Versehen.
+  //
+  // Gesucht wird nach `self.X := …` mit X aus der Basiskette. Ein Feld, das
+  // nur GELESEN wird, zaehlt nicht — es geht darum, ob etwas ungesetzt bleibt.
+  fn _schreibtBasisFeld(rumpf: int64, basisNi: int64): int64 {
+    if (rumpf < 0 || basisNi < 0) { return 0; }
+    return self._sucheFeldSchreiben(rumpf, basisNi);
+  }
+
+  fn _sucheFeldSchreiben(ni: int64, basisNi: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (self.sn_kind(ni) == SNK_ASSIGN) {
+      var lhs: int64 := self.sn_c0(ni);
+      if (lhs >= 0 && self.sn_kind(lhs) == SNK_FIELD) {
+        // #1973: NICHT selbst suchen — `_fieldExistsInDecl` laeuft die
+        // Vererbungskette bereits richtig (Felder stehen in c0 mit Knotenart 7,
+        // nicht bei den Methoden in c1) und faengt Zyklen ab. Eine zweite
+        // Fassung daneben waere die Doppelung, aus der Divergenz wird.
+        if (self._fieldExistsInDecl(basisNi, self.sn_sVal(lhs), self.sn_sLen(lhs)) != 0) {
+          return 1;
+        }
+      }
+    }
+    if (self._sucheFeldSchreiben(self.sn_c0(ni), basisNi) != 0) { return 1; }
+    if (self._sucheFeldSchreiben(self.sn_c1(ni), basisNi) != 0) { return 1; }
+    if (self._sucheFeldSchreiben(self.sn_c2(ni), basisNi) != 0) { return 1; }
+    var n: int64 := self.sn_next(ni);
+    while (n >= 0) {
+      if (self._sucheFeldSchreiben(n, basisNi) != 0) { return 1; }
+      n := self.sn_next(n);
+    }
+    return 0;
+  }
+
+  // #1973: Kommt irgendwo im Rumpf ein `super.Create()` vor?
+  //
+  // Gesucht wird REKURSIV, nicht nur in der ersten Anweisung: der Aufruf darf
+  // in einem `if` stehen (etwa hinter einer Fallunterscheidung), und ihn dort
+  // zu verlangen waere eine Vorschrift ueber den Aufbau des Rumpfes, nicht
+  // ueber seine Wirkung. Geprueft wird das VORHANDENSEIN — dass er auf jedem
+  // Pfad laeuft, kann sema nicht entscheiden, und eine halbe Zusicherung waere
+  // schlechter als eine klar begrenzte.
+  fn _rufTSuperCreate(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (self.sn_kind(ni) == SNK_CALL && self.sn_iVal(ni) == 3
+        && self._semaNameEq(self.sn_sVal(ni), self.sn_sLen(ni), "Create"c, 6)) {
+      return 1;
+    }
+    if (self._rufTSuperCreate(self.sn_c0(ni)) != 0) { return 1; }
+    if (self._rufTSuperCreate(self.sn_c1(ni)) != 0) { return 1; }
+    if (self._rufTSuperCreate(self.sn_c2(ni)) != 0) { return 1; }
+    var n: int64 := self.sn_next(ni);
+    while (n >= 0) {
+      if (self._rufTSuperCreate(n) != 0) { return 1; }
+      n := self.sn_next(n);
+    }
+    return 0;
+  }
+
   fn _pruefeKlasseOhneNew(typeNi: int64, initNi: int64, ni: int64) {
     if (initNi >= 0) { return; }
     if (typeNi < 0) { return; }
@@ -7053,6 +7126,77 @@ pub type Sema = class {
         if (parentSym < 0) {
           self._errorNodeName("unknown parent class", ni, parentName, parentLen);
         }
+        // #1973: Definiert die Ableitung ein EIGENES `Create` und hat die
+        // Basis auch eines, muss `super.Create()` darin vorkommen.
+        //
+        // Bis 1.2.3F lief der Basiskonstruktor in diesem Fall NICHT mit, und
+        // zwar ohne jede Meldung: die Felder der Basis blieben auf 0. Ein
+        // Konstruktor, der die halbe Aufgabe erledigt und schweigt, ist die
+        // teuerste Form — der Fehler faellt erst weit spaeter auf, an einem
+        // Feld, das niemand gesetzt zu haben glaubt. In Vega VCL wurde er mit
+        // eigenen Init*-Methoden umgangen, statt ihn zu melden.
+        //
+        // Lyx bleibt bei der DELPHI-Semantik: der Basiskonstruktor wird nicht
+        // heimlich untergeschoben, sondern ausdruecklich gerufen. Neu ist nur,
+        // dass sein FEHLEN auffaellt — aber NUR DORT, WO ETWAS VERLOREN GEHT.
+        //
+        // Die erste Fassung dieser Pruefung verlangte `super.Create()`
+        // ausnahmslos. Sie fiel im Bestand auf: drei Tests setzen im eigenen
+        // Create die Felder der Basis SELBST und ersetzen deren Konstruktor
+        // damit vollstaendig. Das ist kein Fehler, sondern ein gaengiges
+        // Muster — und in einem Fall verdeckte die neue Meldung sogar die
+        // erwartete Meldung eines anderen Tests, der damit etwas anderes mass
+        // als gedacht.
+        //
+        // Gemeldet wird deshalb nur die Verbindung, bei der wirklich etwas
+        // ungesetzt bleibt: kein `super.Create()` UND kein einziges Feld der
+        // Basis geschrieben. Genau das war der gemeldete Fall (#1973): eine
+        // Ableitung, die nur ihre eigenen Felder setzt und die geerbten auf 0
+        // stehen laesst.
+        //
+        // Wer die Basisfelder selbst setzt, sagt damit, dass er ihre
+        // Initialisierung bewusst uebernimmt — das braucht keine Meldung.
+        if (parentSym >= 0) {
+          // Massgeblich ist nicht, OB die Basis ein Create hat, sondern ob es
+          // etwas TUT. Ein leeres `Create` — oder eines an einer Klasse ganz
+          // ohne Felder — kann nichts hinterlassen, was ungesetzt bliebe; es
+          // zu verlangen waere eine Vorschrift ohne Wirkung.
+          //
+          // Genau daran ist die zweite Fassung dieser Pruefung aufgefallen:
+          // `type Basis = class { fn Create(): void { } … }` in
+          // doppelte_mitglieder_test.sh wurde gemeldet, obwohl dort nichts zu
+          // verlieren ist.
+          var basisHatCreate: int64 := 0;
+          var pNiC: int64 := self.SymNodeIdx(parentSym);
+          if (pNiC >= 0) {
+            var pm: int64 := self.sn_c1(pNiC);
+            while (pm >= 0) {
+              if (self.sn_kind(pm) == SNK_FUNC_DECL
+                  && self._semaNameEq(self.sn_sVal(pm), self.sn_sLen(pm), "Create"c, 6)) {
+                // Setzt dieses Create ein Feld der Basiskette? Nur dann geht
+                // beim Auslassen wirklich etwas verloren.
+                if (self._schreibtBasisFeld(self.sn_c2(pm), pNiC) != 0) {
+                  basisHatCreate := 1;
+                }
+              }
+              pm := self.sn_next(pm);
+            }
+          }
+          if (basisHatCreate != 0) {
+            var em: int64 := self.sn_c1(ni);
+            while (em >= 0) {
+              if (self.sn_kind(em) == SNK_FUNC_DECL
+                  && self._semaNameEq(self.sn_sVal(em), self.sn_sLen(em), "Create"c, 6)) {
+                if (self._rufTSuperCreate(self.sn_c2(em)) == 0
+                    && self._schreibtBasisFeld(self.sn_c2(em), pNiC) == 0) {
+                  self._errorNodeName("Create ruft weder super.Create() noch setzt es ein Feld der Basisklasse — die dort gesetzten Felder bleiben damit 0", em, self.sn_sVal(ni), self.sn_sLen(ni));
+                }
+              }
+              em := self.sn_next(em);
+            }
+          }
+        }
+
         // Check that methods marked override exist in parent (name check only)
         //
         // #1288: Hier stand ein leerer Zweig ("full method signature check

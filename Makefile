@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.3F
-VERSION_DATE := 2026-09-06
+VERSION   := 1.2.4A
+VERSION_DATE := 2026-09-07
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -559,6 +559,9 @@ test: lyxc
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_ir_test.sh
 	@bash tests/erbe_ir_test.sh
+	@bash tests/erbfeld_ir_test.sh
+	@bash tests/ctor_super_test.sh
+	@bash tests/strconcat_speicher_test.sh
 	@bash tests/lyu_ir_consumer_test.sh
 	@echo "OK"
 	@echo "--- Arrays mit Struct-/Klassen-Elementtyp (12 Pruefungen) ---"

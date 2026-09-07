@@ -2353,13 +2353,11 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x00);  // mov rsi,[rsp]=len_b
     self.cg_e8(0x48); self.cg_e8(0x03); self.cg_e8(0x74); self.cg_e8(0x24); self.cg_e8(0x08);  // add rsi,[rsp+8]=len_a
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x11);  // add rsi,17
-    self.cg_e8(0x31); self.cg_e8(0xFF);  // xor edi,edi
-    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov edx,3
-    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
-    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d,r9d
-    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,9
-    self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall mmap → rax=buf
+    // #1980: aus dem Bump-Block herausgeben statt je Verkettung ein eigenes
+    // mmap. Der Syscall belegte mindestens eine SEITE — 4096 Byte fuer ein
+    // Ergebnis von elf Zeichen — und gab nie etwas zurueck; 100.000
+    // Verkettungen kosteten 400 MB. Dieselbe Rechnung wie bei `new` vor #1836.
+    self.cg_emitBumpAllocRsi();  // rsi = Groesse → rax = Puffer
     self.cg_e8(0x50);  // push rax (buf)
     // [rsp]=buf [rsp+8]=len_b [rsp+16]=len_a [rsp+24]=b [rsp+32]=a
     self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x7C); self.cg_e8(0x24); self.cg_e8(0x00);  // mov rdi,[rsp]=buf
@@ -6509,6 +6507,77 @@ pub type Codegen = class {
   // weitesten Feldes, Offset 0 ist der VMT-Zeiger, geerbte Felder sind beim
   // Bauen des Layouts eingeflacht). Aufgerundet auf 16, damit die
   // Ausrichtung ueber die Kette erhalten bleibt.
+  // #1980: Bump-Belegung mit einer erst zur LAUFZEIT bekannten Groesse.
+  //
+  // cg_emitNewBump daneben kennt die Groesse beim Uebersetzen (Klassenlayout)
+  // und kann sie als Sofortwert einsetzen. Fuer StrConcat steht sie erst zur
+  // Laufzeit fest — Laenge a plus Laenge b plus Kopf. Die Rechnung ist
+  // dieselbe, nur kommt die Groesse aus einem REGISTER.
+  //
+  // Erwartet die Groesse in rsi. Liefert den Puffer in rax. rcx wird
+  // ueberschrieben.
+  //
+  // Warum das ueberhaupt sein muss: bis 1.2.3F machte jede Verkettung einen
+  // eigenen mmap-Syscall. Der belegt mindestens eine SEITE, also 4096 Byte —
+  // gleich, ob das Ergebnis elf Zeichen lang ist oder tausend. Und weil nichts
+  // freigegeben wird, wuchs der Speicher linear mit der Zahl der Aufrufe:
+  // 100.000 Verkettungen kosteten 400 MB. Genau derselbe Befund wie bei `new`
+  // vor #1836.
+  fn cg_emitBumpAllocRsi() {
+    // Auf 16 aufrunden, damit die Ausrichtung ueber die Kette erhalten bleibt:
+    // rsi := (rsi + 15) & ~15
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x0F);   // add rsi, 15
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE6); self.cg_e8(0xF0);   // and rsi, -16
+
+    self.cg_loadRaxGlobal(CG_HEAP_PTR);                     // rax = naechste freie Stelle
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);   // lea rcx, [rax + rsi]
+    self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x0D);   // cmp rcx, [rip + CG_HEAP_END]
+    var pEnd: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pEnd, CG_HEAP_END, 0, CG_PATCH_STR);
+    self.cg_e8(0x76);                                       // jbe passt
+    var pJmp: int64 := self.codeLen;
+    self.cg_e8(0);
+
+    // Langsamer Weg: neuen Block holen. 64 KB, oder die Anforderung selbst,
+    // wenn sie groesser ist — auf ganze Seiten aufgerundet. Die Groesse steht
+    // in rsi und muss ueber den Syscall gerettet werden.
+    self.cg_e8(0x56);                                       // push rsi (Groesse)
+    // rdx := (rsi + 4095) & ~4095   — Anforderung auf Seiten aufgerundet
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF2);   // mov rdx, rsi
+    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xC2); self.cg_e32(4095);  // add rdx, 4095
+    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xE2); self.cg_e32(0 - 4096); // and rdx, -4096
+    // rsi := 65536; ist rdx groesser, nimm rdx
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6); self.cg_e32(65536); // mov rsi, 65536
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xF2);   // cmp rdx, rsi
+    self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x47); self.cg_e8(0xF2);   // cmova rsi, rdx
+    self.cg_e8(0x56);                                       // push rsi (Blockgroesse)
+    self.cg_e8(0x31); self.cg_e8(0xFF);                     // xor edi, edi
+    self.cg_e8(0xBA); self.cg_e32(3);                       // mov edx, 3
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e32(34);    // mov r10d, 34
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0);   // mov r8, -1
+    self.cg_e32(0 - 1);
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);   // xor r9, r9
+    self.cg_e8(0xB8); self.cg_e32(9);                       // mov eax, 9
+    self.cg_e8(0x0F); self.cg_e8(0x05);                     // syscall → rax = Blockanfang
+    self.cg_e8(0x5E);                                       // pop rsi (Blockgroesse)
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);   // lea rcx, [rax + rsi]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D);   // mov [rip + CG_HEAP_END], rcx
+    var pEnd2: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pEnd2, CG_HEAP_END, 0, CG_PATCH_STR);
+    self.cg_e8(0x5E);                                       // pop rsi (Groesse)
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);   // lea rcx, [rax + rsi]
+
+    // passt: rax = Puffer, rcx = neue freie Stelle
+    var ziel: int64 := self.codeLen;
+    cg_patchRel8Wert(self.code, pJmp, ziel - pJmp - 1);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D);   // mov [rip + CG_HEAP_PTR], rcx
+    var pPtr: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(pPtr, CG_HEAP_PTR, 0, CG_PATCH_STR);
+  }
+
   fn cg_emitNewBump(classIdx: int64) {
     // Ohne Layout ist die Groesse unbekannt — dann bleibt es beim alten Weg
     // mit einer ganzen Seite. Das ist verschwenderisch, aber nie zu klein.
