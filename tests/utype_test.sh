@@ -13,8 +13,16 @@
 # auf Uebersetzbarkeit waere bei jedem Punkt gruen gewesen.
 #
 # Die Gegenproben gehoeren dazu: ein Literal muss sich einer Einheit zuweisen
-# lassen, `a * 3` muss erlaubt bleiben, und der `as`-Cast muss aus der Pruefung
-# herausfuehren. Ohne sie waere eine Pruefung, die alles abweist, ebenso gruen.
+# lassen, `a * 3` muss erlaubt bleiben, und der `as`-Cast auf einen Typ OHNE
+# Einheit (`as int64`, `as f64`) muss weiter herausfuehren. Ohne sie waere eine
+# Pruefung, die alles abweist, ebenso gruen.
+#
+# #1964 hat diesen Fluchtweg VERENGT: ein `as` zwischen zwei Einheiten
+# verschiedener Dimension wird jetzt gemeldet. Es sah aus wie eine Umwandlung
+# und war eine Umdeutung — zwischen zwei Dimensionen gibt es keinen Faktor,
+# `t as M` behielt den Zahlenwert bei und machte aus 5 Sekunden 5 Meter. Damit
+# war die schuetzende Haelfte des Systems einen Tastendruck entfernt. Der Weg
+# ueber einen dimensionslosen Typ bleibt offen: sichtbar und nachlesbar.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
@@ -208,7 +216,8 @@ fn main(): int64 {
     return 0;
 }" '6'
 
-# Der as-Cast fuehrt aus der Pruefung heraus — der bewusste Fluchtweg.
+# Der as-Cast auf einen Typ OHNE Einheit fuehrt weiter heraus — der bewusste
+# Fluchtweg. #1964 hat nur den Cast ZWISCHEN Dimensionen geschlossen.
 out "as-Cast fuehrt heraus" "$K
 fn main(): int64 {
     var a: Km := 2;
@@ -419,6 +428,65 @@ fn main(): int64 {
     PrintLn(FloatToStr(b as f64, 1));
     return 0;
 }' '2500.0'
+
+# ── #1964: `as` ueber eine Dimensionsgrenze ───────────────────────────────
+#
+# Die Zuweisung ueber Dimensionsgrenzen wurde zuverlaessig gemeldet; der Cast
+# umging die Pruefung vollstaendig, weil _typeMismatch bei SNK_CAST sofort
+# aussteigt. Fuer Breiten und Zeiger ist diese Begruendung richtig — bei
+# Einheiten nicht: zwischen zwei Dimensionen gibt es keinen Faktor, den der
+# Cast anwenden koennte.
+#
+# GEMESSEN WIRD BEIDES. Ein Test, der nur die Ablehnung prueft, waere auch von
+# einer Fassung erfuellt, die JEDEN Einheiten-Cast verbietet — und die haette
+# die Umrechnung aus #1963 mit erschlagen.
+D2='import std.io;
+dim Length;
+dim Zeit;
+utype M: Length = 1.0;
+utype KM: Length = 1000.0;
+utype Sek: Zeit = 1.0;'
+
+rejects "#1964: Cast ueber die Dimensionsgrenze wird gemeldet" "$D2
+fn main(): int64 {
+    var t: Sek := 5;
+    var falsch: M := t as M;
+    return falsch as int64;
+}" "Cast ueber Dimensionsgrenzen"
+
+# Die Meldung muss den Ausweg NENNEN, sonst steht der Nutzer davor.
+rejects "#1964: die Meldung nennt den Weg ueber f64" "$D2
+fn main(): int64 {
+    var t: Sek := 5;
+    var falsch: M := t as M;
+    return falsch as int64;
+}" "as f64"
+
+# GEGENPROBE 1: gleiche Dimension geht durch UND rechnet um (seit #1963).
+out "#1964: gleiche Dimension rechnet weiter um" "$D2
+fn main(): int64 {
+    var a: KM := 2;
+    var b: M := a as M;
+    PrintLn(FloatToStr(b as f64, 1));
+    return 0;
+}" '2000.0'
+
+# GEGENPROBE 2: der Weg ueber einen dimensionslosen Typ bleibt offen.
+out "#1964: der Fluchtweg ueber f64 bleibt offen" "$D2
+fn main(): int64 {
+    var a: M := 2500;
+    var roh: f64 := a as f64;
+    var b: M := roh as M;
+    PrintLn(FloatToStr(b as f64, 1));
+    return 0;
+}" '2500.0'
+
+# GEGENPROBE 3: ein Ziel ohne Einheit wird nicht bemaengelt.
+out "#1964: Cast auf int64 bleibt unberuehrt" "$D2
+fn main(): int64 {
+    var t: Sek := 7;
+    return t as int64;
+}" ''
 
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
