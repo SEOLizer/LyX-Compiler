@@ -211,3 +211,337 @@ pub fn AEffectivePotential(mu: f64, pos: AVec3): f64 {
   return (pos.x * pos.x + pos.y * pos.y) / 2.0
        + (1.0 - mu) / r1 + mu / r2;
 }
+
+// ── Bewegungsgleichungen (#2001, Stufe 2) ─────────────────────────────────
+//
+// Im mitrotierenden System, dimensionslos:
+//
+//   x'' =  2y' + x - (1-mu)(x+mu)/r1^3 - mu(x-1+mu)/r2^3
+//   y'' = -2x' + y - (1-mu)y/r1^3      - mu*y/r2^3
+//   z'' =            -(1-mu)z/r1^3     - mu*z/r2^3
+//
+// Die Glieder mit x' und y' sind die Corioliskraft, die mit x, y die
+// Zentrifugalkraft. Ein Vorzeichenfehler in einem der beiden faellt an der
+// Jacobi-Konstante auf und sonst nirgends — deshalb wurde sie in Stufe 1
+// mitgebaut, obwohl sie dort noch nichts zu tun hatte.
+pub fn ACr3bpAccel(mu: f64, pos: AVec3, vel: AVec3): AVec3 {
+  if (mu <= 0.0 || mu >= 1.0) { return AVec(AError(), AError(), AError()); }
+  var dx1: f64 := pos.x + mu;
+  var dx2: f64 := pos.x - 1.0 + mu;
+  var r1: f64 := SqrtF64(dx1 * dx1 + pos.y * pos.y + pos.z * pos.z);
+  var r2: f64 := SqrtF64(dx2 * dx2 + pos.y * pos.y + pos.z * pos.z);
+  if (r1 == 0.0 || r2 == 0.0) { return AVec(AError(), AError(), AError()); }
+  var a1: f64 := (1.0 - mu) / (r1 * r1 * r1);
+  var a2: f64 := mu / (r2 * r2 * r2);
+  return AVec(2.0 * vel.y + pos.x - a1 * dx1 - a2 * dx2,
+              0.0 - 2.0 * vel.x + pos.y - a1 * pos.y - a2 * pos.y,
+              0.0 - a1 * pos.z - a2 * pos.z);
+}
+
+// EIN Schritt Runge-Kutta vierter Ordnung.
+//
+// Vierte Ordnung und nicht Euler: die Jacobi-Konstante ist die einzige
+// Pruefgroesse, die hier zur Verfuegung steht, und ein Verfahren erster
+// Ordnung laesst sie so schnell wegdriften, dass die Pruefung nichts mehr
+// ueber die Bewegungsgleichungen aussagt, sondern nur noch ueber den
+// Integrator.
+pub fn ACr3bpStep(mu: f64, s: AState, dt: f64): AState {
+  var p0: AVec3 := AVec(s.rx, s.ry, s.rz);
+  var v0: AVec3 := AVec(s.vx, s.vy, s.vz);
+
+  var k1v: AVec3 := ACr3bpAccel(mu, p0, v0);
+  if (AVecIsError(k1v)) { return AMakeState(AError(), 0.0, 0.0, 0.0, 0.0, 0.0); }
+  var k1p: AVec3 := v0;
+
+  var p1: AVec3 := AAdd(p0, AScale(k1p, dt / 2.0));
+  var v1: AVec3 := AAdd(v0, AScale(k1v, dt / 2.0));
+  var k2v: AVec3 := ACr3bpAccel(mu, p1, v1);
+  var k2p: AVec3 := v1;
+
+  var p2: AVec3 := AAdd(p0, AScale(k2p, dt / 2.0));
+  var v2: AVec3 := AAdd(v0, AScale(k2v, dt / 2.0));
+  var k3v: AVec3 := ACr3bpAccel(mu, p2, v2);
+  var k3p: AVec3 := v2;
+
+  var p3: AVec3 := AAdd(p0, AScale(k3p, dt));
+  var v3: AVec3 := AAdd(v0, AScale(k3v, dt));
+  var k4v: AVec3 := ACr3bpAccel(mu, p3, v3);
+  var k4p: AVec3 := v3;
+
+  var sp: AVec3 := AAdd(AAdd(k1p, AScale(k2p, 2.0)), AAdd(AScale(k3p, 2.0), k4p));
+  var sv: AVec3 := AAdd(AAdd(k1v, AScale(k2v, 2.0)), AAdd(AScale(k3v, 2.0), k4v));
+  var pn: AVec3 := AAdd(p0, AScale(sp, dt / 6.0));
+  var vn: AVec3 := AAdd(v0, AScale(sv, dt / 6.0));
+  return AMakeState(pn.x, pn.y, pn.z, vn.x, vn.y, vn.z);
+}
+
+// Ueber mehrere Schritte fortschreiben.
+pub fn ACr3bpPropagate(mu: f64, s: AState, dt: f64, schritte: int64): AState {
+  if (schritte < 0) { return AMakeState(AError(), 0.0, 0.0, 0.0, 0.0, 0.0); }
+  var cur: AState := s;
+  var i: int64 := 0;
+  while (i < schritte) {
+    cur := ACr3bpStep(mu, cur, dt);
+    if (AIsError(cur.rx)) { return cur; }
+    i := i + 1;
+  }
+  return cur;
+}
+
+// ── Halo-Bahnen (#2001) ───────────────────────────────────────────────────
+//
+// Eine Halo-Bahn ist eine periodische dreidimensionale Bahn um einen
+// kollinearen Librationspunkt. Sie ist der eigentliche Gebrauchswert der
+// Punkte: JWST fliegt keine Bahn AUF Sonne-Erde L2, sondern eine Halo-Bahn UM
+// ihn — auf dem Punkt selbst staende es im Erdschatten.
+//
+// ZUM VERFAHREN. Gebaut ist der Weg, der sich HIER nachweisen laesst:
+// linearisierter Startwert plus Differentialkorrektur. Richardsons Reihe
+// dritter Ordnung liefert einen besseren Startwert, aber keine periodische
+// Bahn — periodisch wird sie erst durch die Korrektur, und die traegt den
+// Nachweis. Ein besserer Startwert spart Schritte und aendert das Ergebnis
+// nicht; er waere Bequemlichkeit, nicht Richtigkeit.
+//
+// Die Korrektur nutzt einen NUMERISCH gebildeten Jacobi statt der
+// Zustandsuebergangsmatrix. Das kostet drei Integrationen je Schritt statt
+// einer, spart aber einen Integrator ueber 42 Zustaende — und ein Fehler in
+// dessen 36 Zusatzgleichungen waere von aussen kaum zu sehen. Die Genauigkeit
+// des Ergebnisses haengt nicht daran: gemessen wird die PERIODIZITAET der
+// fertigen Bahn, nicht der Weg dorthin.
+
+// Der Koeffizient c2 der Reihenentwicklung am kollinearen Punkt. Er bestimmt
+// die beiden Eigenfrequenzen und damit den Startwert.
+//
+//   L1: c2 = (1/g^3) * [ mu + (1-mu) g^3 / (1-g)^3 ]
+//   L2: c2 = (1/g^3) * [ mu + (1-mu) g^3 / (1+g)^3 ]
+pub fn ACr3bpC2(mu: f64, gamma: f64, istL2: bool): f64 {
+  if (mu <= 0.0 || mu >= 1.0 || gamma <= 0.0) { return AError(); }
+  var n: f64 := 1.0 - gamma;
+  if (istL2) { n := 1.0 + gamma; }
+  if (n == 0.0) { return AError(); }
+  return (mu + (1.0 - mu) * gamma * gamma * gamma / (n * n * n))
+         / (gamma * gamma * gamma);
+}
+
+// Die Eigenfrequenz der ebenen Schwingung: die positive Wurzel von
+//   lambda^4 + (c2-2) lambda^2 - (c2-1)(1+2c2) = 0.
+pub fn ACr3bpLambda(c2: f64): f64 {
+  if (AIsError(c2)) { return c2; }
+  var b: f64 := c2 - 2.0;
+  var c: f64 := 0.0 - (c2 - 1.0) * (1.0 + 2.0 * c2);
+  var disk: f64 := b * b - 4.0 * c;
+  if (disk < 0.0) { return AError(); }
+  var u: f64 := (0.0 - b + SqrtF64(disk)) / 2.0;
+  if (u <= 0.0) { return AError(); }
+  return SqrtF64(u);
+}
+
+// Das Verhaeltnis der Auslenkungen in y und x der linearen Loesung.
+pub fn ACr3bpKappa(c2: f64, lambda: f64): f64 {
+  if (lambda == 0.0) { return AError(); }
+  return (lambda * lambda + 1.0 + 2.0 * c2) / (2.0 * lambda);
+}
+
+// Startwert im BARYZENTRISCHEN mitrotierenden System, an der Kreuzung der
+// xz-Ebene. Dort ist y = 0 und die Bahn steht senkrecht auf der Ebene:
+// x' = z' = 0. Genau diese Bedingung stellt die Korrektur unten wieder her,
+// nachdem eine halbe Periode gerechnet wurde.
+//
+// nordSued: +1 fuer die Nordfamilie, -1 fuer die Suedfamilie.
+pub fn AHaloGuess(mu: f64, gamma: f64, istL2: bool,
+                  ax: f64, az: f64, nordSued: f64): AState {
+  var c2: f64 := ACr3bpC2(mu, gamma, istL2);
+  var lam: f64 := ACr3bpLambda(c2);
+  var kap: f64 := ACr3bpKappa(c2, lam);
+  if (AIsError(kap)) { return AMakeState(AError(), 0.0, 0.0, 0.0, 0.0, 0.0); }
+  // Der Punkt selbst, baryzentrisch.
+  var xL: f64 := 1.0 - mu - gamma;
+  if (istL2) { xL := 1.0 - mu + gamma; }
+  // Die Amplituden sind in Einheiten von gamma angegeben.
+  var x0: f64 := xL - gamma * ax;
+  var z0: f64 := nordSued * gamma * az;
+  var vy0: f64 := kap * lam * gamma * ax;
+  return AMakeState(x0, 0.0, z0, 0.0, vy0, 0.0);
+}
+
+// Bis zur naechsten Kreuzung der xz-Ebene (y = 0) fortschreiben. Der letzte
+// Schritt wird linear auf die Nullstelle interpoliert, sonst haengt das
+// Ergebnis an der Schrittweite statt an der Bahn.
+//
+// Gibt nur den ZUSTAND zurueck; wer die Zeit braucht, nimmt AHaloPeriod.
+//
+// Die Unit kommt bewusst OHNE std.alloc aus: ein Ausgabeparameter fuer die
+// Zeit haette eine Belegung gebraucht, und damit haenge eine reine Rechenunit
+// am Allokator. Aufgefallen ist das am Waechter, der jede Unit EINZELN
+// importiert — im Pruefprogramm zog std.io die Belegung stillschweigend mit
+// herein, allein stehend fehlte sie.
+pub fn ACr3bpBisEbene(mu: f64, s: AState, dt: f64,
+                      maxSchritte: int64): AState {
+  var cur: AState := s;
+  var t: f64 := 0.0;
+  var i: int64 := 0;
+  // Erst ein Stueck weg von der Ebene, sonst greift die Nullstelle sofort.
+  while (i < maxSchritte) {
+    var nxt: AState := ACr3bpStep(mu, cur, dt);
+    if (AIsError(nxt.rx)) { return nxt; }
+    t := t + dt;
+    if (i > 4 && cur.ry * nxt.ry < 0.0) {
+      // Lineare Interpolation auf y = 0.
+      var f: f64 := cur.ry / (cur.ry - nxt.ry);
+      return ACr3bpStep(mu, cur, dt * f);
+    }
+    cur := nxt;
+    i := i + 1;
+  }
+  return AMakeState(AError(), 0.0, 0.0, 0.0, 0.0, 0.0);
+}
+
+// DIFFERENTIALKORREKTUR auf eine periodische Bahn.
+//
+// Gesucht ist ein Startzustand (x0, 0, z0, 0, vy0, 0), der nach einer halben
+// Umrundung wieder senkrecht durch die xz-Ebene laeuft: x' = z' = 0 bei
+// y = 0. Zwei Bedingungen, zwei Stellschrauben — x0 und vy0; z0 bleibt fest
+// und waehlt damit die Bahn aus der Schar aus.
+//
+// Der Jacobi wird numerisch gebildet: je Schritt drei Integrationen (einmal
+// unveraendert, zweimal mit gestoertem Startwert). Das ist der Preis dafuer,
+// keinen Integrator ueber 42 Zustaende zu brauchen.
+//
+// Rueckgabe: der korrigierte Startzustand, oder ein Fehlerzustand, wenn die
+// Korrektur nicht konvergiert. NICHT der zuletzt erreichte Naeherungswert —
+// der saehe wie ein Ergebnis aus und waere keines.
+pub fn AHaloCorrect(mu: f64, s: AState, dt: f64, maxIter: int64): AState {
+  var fehler: AState := AMakeState(AError(), 0.0, 0.0, 0.0, 0.0, 0.0);
+  if (mu <= 0.0 || mu >= 1.0 || dt <= 0.0) { return fehler; }
+  var x0: f64 := s.rx;
+  var z0: f64 := s.rz;
+  var vy0: f64 := s.vy;
+  var xStart: f64 := s.rx;
+  var h: f64 := 0.000001;                 // Stoerung fuer den Jacobi
+  var it: int64 := 0;
+  while (it < maxIter) {
+    var a: AState := AMakeState(x0, 0.0, z0, 0.0, vy0, 0.0);
+    var e: AState := ACr3bpBisEbene(mu, a, dt, 200000);
+    if (AIsError(e.rx)) { return fehler; }
+    var f1: f64 := e.vx;
+    var f2: f64 := e.vz;
+    if (AbsF64(f1) < 0.00000000001 && AbsF64(f2) < 0.00000000001) {
+      return AMakeState(x0, 0.0, z0, 0.0, vy0, 0.0);
+    }
+    // Spalte 1: x0 stoeren.
+    var ax2: AState := AMakeState(x0 + h, 0.0, z0, 0.0, vy0, 0.0);
+    var ex2: AState := ACr3bpBisEbene(mu, ax2, dt, 200000);
+    if (AIsError(ex2.rx)) { return fehler; }
+    var j11: f64 := (ex2.vx - f1) / h;
+    var j21: f64 := (ex2.vz - f2) / h;
+    // Spalte 2: vy0 stoeren.
+    var av2: AState := AMakeState(x0, 0.0, z0, 0.0, vy0 + h, 0.0);
+    var ev2: AState := ACr3bpBisEbene(mu, av2, dt, 200000);
+    if (AIsError(ev2.rx)) { return fehler; }
+    var j12: f64 := (ev2.vx - f1) / h;
+    var j22: f64 := (ev2.vz - f2) / h;
+    var det: f64 := j11 * j22 - j12 * j21;
+    if (det == 0.0) { return fehler; }
+    // 2x2 nach Cramer aufloesen und den Schritt abziehen.
+    var dx: f64 := (f1 * j22 - f2 * j12) / det;
+    var dv: f64 := (j11 * f2 - j21 * f1) / det;
+    // GEDAEMPFT und BESCHRAENKT. Ungedaempft sprang der Newton aus der
+    // Umgebung des Librationspunktes heraus und lief in die triviale Loesung:
+    // x0 = 1.697 mit einer Periode von genau einem Jahr — eine Sonnenbahn,
+    // keine Halo-Bahn. Sie erfuellt die Abbruchbedingung (senkrechte Kreuzung)
+    // vollkommen und ist trotzdem nicht das Gesuchte.
+    //
+    // Die Schranke haengt an der Bahn selbst: weiter als das Zehnfache der
+    // z-Auslenkung darf der Startpunkt sich nicht vom Ausgangswert entfernen.
+    // Wer die Umgebung verlaesst, sucht eine andere Bahn.
+    // VERTRAUENSBEREICH statt pauschaler Daempfung. Eine feste Daempfung
+    // halbiert auch dort die Schrittweite, wo der Newton schon quadratisch
+    // konvergiert — das kostet nur Rechenzeit. Begrenzt wird deshalb die
+    // LAENGE des Schritts, nicht seine Richtung: nahe der Loesung bleibt er
+    // unangetastet, weit weg wird er auf ein Viertel der z-Auslenkung
+    // gestutzt. Beides zusammen (Stutzen + Schranke unten) haelt den Newton
+    // in der Umgebung des Librationspunktes.
+    var grenze: f64 := 0.25 * AbsF64(z0);
+    if (grenze <= 0.0) { grenze := 0.01; }
+    if (AbsF64(dx) > grenze) {
+      var f: f64 := grenze / AbsF64(dx);
+      dx := dx * f;
+      dv := dv * f;
+    }
+    x0 := x0 - dx;
+    vy0 := vy0 - dv;
+    var weg: f64 := AbsF64(x0 - xStart);
+    var schranke: f64 := 10.0 * AbsF64(z0);
+    if (schranke <= 0.0) { schranke := 1.0; }
+    if (weg > schranke) { return fehler; }
+    it := it + 1;
+  }
+  return fehler;                          // keine Konvergenz: melden
+}
+
+// Volle Umlaufzeit einer korrigierten Bahn, dimensionslos. Sie ist das
+// Doppelte der Zeit bis zur ersten Kreuzung der xz-Ebene.
+pub fn AHaloPeriod(mu: f64, s: AState, dt: f64): f64 {
+  var cur: AState := s;
+  var t: f64 := 0.0;
+  var i: int64 := 0;
+  while (i < 200000) {
+    var nxt: AState := ACr3bpStep(mu, cur, dt);
+    if (AIsError(nxt.rx)) { return AError(); }
+    t := t + dt;
+    if (i > 4 && cur.ry * nxt.ry < 0.0) {
+      var f: f64 := cur.ry / (cur.ry - nxt.ry);
+      return 2.0 * (t - dt + dt * f);
+    }
+    cur := nxt;
+    i := i + 1;
+  }
+  return AError();
+}
+
+// Die z-Auslenkung einer Bahn in Metern — die Groesse, in der Halo-Bahnen
+// angegeben werden ("JWST fliegt mit rund 800000 km Amplitude").
+pub fn AHaloAmplitudeZ(s: AState, separation: f64): f64 {
+  if (separation <= 0.0) { return AError(); }
+  var z: f64 := s.rz;
+  if (z < 0.0) { z := 0.0 - z; }
+  return z * separation;
+}
+
+// HALO-BAHN ZU GEGEBENER z-AMPLITUDE, per Fortsetzung.
+//
+// Der linearisierte Startwert traegt nur bei kleiner Auslenkung; oberhalb von
+// rund 0.15 gamma konvergiert die Korrektur nicht mehr. Genau dafuer gibt es
+// die FORTSETZUNG: man loest zuerst eine kleine Bahn, hebt die Amplitude in
+// Schritten an und nimmt jedes Mal die vorige Loesung als Startwert. Die
+// Bahnschar aendert sich stetig, also ist der Vorgaenger immer ein guter
+// Startwert — auch dort, wo die Linearisierung laengst nichts mehr taugt.
+//
+// Das ersetzt Richardsons Reihe dritter Ordnung vollstaendig und ist
+// nachpruefbar: jede Zwischenloesung ist selbst eine periodische Bahn.
+//
+// azZiel ist in Einheiten von gamma. schritte bestimmt die Feinheit der
+// Fortsetzung; zu grob heisst, dass ein Schritt aus dem Einzugsbereich faellt
+// und die Funktion meldet, statt eine falsche Bahn zu liefern.
+pub fn AHaloFromAmplitudeZ(mu: f64, gamma: f64, istL2: bool, azZiel: f64,
+                           nordSued: f64, dt: f64, schritte: int64): AState {
+  var fehler: AState := AMakeState(AError(), 0.0, 0.0, 0.0, 0.0, 0.0);
+  if (azZiel <= 0.0 || schritte < 1) { return fehler; }
+  var azStart: f64 := 0.05;
+  if (azZiel < azStart) { azStart := azZiel; }
+  var cur: AState := AHaloCorrect(mu, AHaloGuess(mu, gamma, istL2, azStart, azStart, nordSued),
+                                  dt, 60);
+  if (AIsError(cur.rx)) { return fehler; }
+  if (azZiel <= azStart) { return cur; }
+  var i: int64 := 1;
+  while (i <= schritte) {
+    var az: f64 := azStart + (azZiel - azStart) * (i as f64) / (schritte as f64);
+    // Vorige Loesung, nur mit angehobener z-Auslenkung.
+    var start: AState := AMakeState(cur.rx, 0.0, nordSued * gamma * az, 0.0, cur.vy, 0.0);
+    var next: AState := AHaloCorrect(mu, start, dt, 60);
+    if (AIsError(next.rx)) { return fehler; }
+    cur := next;
+    i := i + 1;
+  }
+  return cur;
+}
