@@ -164,6 +164,12 @@ con SNK_NULL_COAL:       int64 := 87;  // WP-BC-14: x ?? fallback
 con SNK_SAFE_CAST:       int64 := 88;  // WP-BC-14: x as? T optional cast
 con SNK_REGEX_LIT:       int64 := 89;  // WP-BC-15: r"pattern" regex literal
 con SNK_DIM_DECL:        int64 := 90;  // WP-BC-16: dim dimension declaration
+// #1962: Wieviele BASISdimensionen ein Programm haben darf. std/units.lyx
+// fuehrt neun (Length, Time, Mass, Temperature, Angle, Data, ElectricCurrent,
+// Voltage, Power); 16 laesst Luft. Die Grenze wird gemeldet, nicht still
+// ueberschritten — sonst faende die Algebra zwei verschiedene Dimensionen
+// gleich, und das waere schlimmer als eine fehlende Moeglichkeit.
+con DIM_MAXBASE: int64 := 16;
 con SNK_UTYPE_DECL:      int64 := 91;  // WP-BC-16: utype unit-type declaration
 con SNK_TYPE_RINGBUF:    int64 := 92;  // WP-BC-17: RingBuffer<T> type node
 con SNK_TYPE_PARALLEL:   int64 := 93;  // WP-BC-18: parallel Array<T> type node
@@ -310,6 +316,24 @@ pub type Sema = class {
   utDimTab:   int64;
   utDimCount: int64;
   utDimCap:   int64;
+  // #1962: Die DIMENSIONSALGEBRA. utDimTab beantwortet "welche Dimension hat
+  // dieser Einheitentyp" ueber einen NAMEN — das genuegt, solange nur
+  // Gleichheit gefragt ist. Sobald gerechnet wird, genuegt es nicht mehr:
+  // `Voltage / ElectricCurrent` muss dieselbe Dimension ergeben wie das
+  // deklarierte `Resistance`, und Namen lassen sich nicht dividieren.
+  //
+  // Deshalb traegt jede Dimension einen EXPONENTENVEKTOR ueber den
+  // BASISdimensionen. Multiplikation addiert ihn, Division subtrahiert ihn.
+  // Eine abgeleitete Dimension ist damit keine eigene Groesse mehr, sondern
+  // eine Rechnung — und genau das behauptet die Deklaration ja.
+  //
+  // dimTab: {namePtr, nameLen, bekannt} = 24 Byte je Dimension.
+  // dimVec: DIM_MAXBASE Exponenten je Dimension, flach hintereinander.
+  dimTab:       int64;
+  dimVec:       int64;
+  dimCount:     int64;
+  dimCap:       int64;
+  dimBaseCount: int64;
   // #1570: Ist ein importierter Typ eine KLASSE MIT METHODEN, also ein
   // Referenztyp? Dieselbe Lage wie bei utDimTab: nach dem Import zeigt der
   // Knotenindex ins Leere (-2), und die Pruefung aus #1519 ("Klasse ohne
@@ -3065,6 +3089,224 @@ pub type Sema = class {
     return 0;
   }
 
+  // ── #1962: Dimensionsalgebra ────────────────────────────────────────────
+  //
+  // `pub dim Resistance = Voltage / ElectricCurrent;` wurde geparst,
+  // angenommen — und nie gerechnet. ebnf.md sagte es woertlich: "NICHT
+  // gerechnet werden abgeleitete Dimensionen ... das Ergebnis gilt als
+  // dimensionslos". Die Zeile sah nach einer Zusicherung aus und lieferte
+  // keine; das ist die im Projekt gefuehrte Klasse "stiller Default", nur
+  // umgekehrt — nicht ein Catch-all, der etwas Plausibles TUT, sondern eine
+  // Deklaration, die nichts tut und trotzdem angenommen wird.
+  //
+  // Die Wirkung war beidseitig: `var i: A := u / r;` ging durch, `var x: V :=
+  // u / r;` aber AUCH — das Ergebnis einer Division trug gar keine Dimension
+  // und passte deshalb ueberall hin.
+
+  fn _dimEnsure(): void {
+    if (self.dimTab != 0) { return; }
+    self.dimCap := 32;
+    self.dimTab := alloc(self.dimCap * 24);
+    self.dimVec := alloc(self.dimCap * DIM_MAXBASE * 8);
+    self.dimCount := 0;
+    self.dimBaseCount := 0;
+  }
+
+  fn _dimIndexOf(nm: pchar, nl: int64): int64 {
+    if (self.dimTab == 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < self.dimCount) {
+      var b: int64 := self.dimTab + i * 24;
+      if (self._strNEq(nm, nl, peek64(b) as pchar, peek64(b + 8)) != 0) { return i; }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  fn _dimIsKnown(idx: int64): int64 {
+    if (idx < 0 || idx >= self.dimCount) { return 0; }
+    return peek64(self.dimTab + idx * 24 + 16);
+  }
+
+  fn _dimVecAt(idx: int64): int64 {
+    return self.dimVec + idx * DIM_MAXBASE * 8;
+  }
+
+  // Vektor eines DIMENSIONSAUSDRUCKS (`Voltage / ElectricCurrent`) auf `vec`
+  // aufaddieren. `vz` ist +1 oder -1 und dreht sich unter jedem Nenner um.
+  // Rueckgabe 0 heisst "nicht aufloesbar" — dann bleibt die Dimension
+  // unbekannt, statt faelschlich als dimensionslos zu gelten.
+  fn _dimAddExpr(ni: int64, vec: int64, vz: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.sn_kind(ni);
+    // Eine Zahl im Dimensionsausdruck traegt nichts bei — sie ist das
+    // neutrale Element. Das ist kein Zugestaendnis, sondern der einzige Weg,
+    // einen KEHRWERT hinzuschreiben: `dim Frequency = 1 / Time`. Ohne diesen
+    // Fall bleibt die Frequenz unentscheidbar, und std/units.lyx behilft sich
+    // seit jeher mit `dim Frequency = Time` — womit eine Frequenz als
+    // dimensionsgleich mit einer Dauer gilt (#1953).
+    if (k == 40 || k == 41) { return 1; }
+    if (k == SNK_IDENT) {
+      var di: int64 := self._dimIndexOf(self.sn_sVal(ni), self.sn_sLen(ni));
+      if (di < 0) { return 0; }
+      if (self._dimIsKnown(di) == 0) { return 0; }
+      var src: int64 := self._dimVecAt(di);
+      var j: int64 := 0;
+      while (j < DIM_MAXBASE) {
+        poke64(vec + j * 8, peek64(vec + j * 8) + vz * peek64(src + j * 8));
+        j := j + 1;
+      }
+      return 1;
+    }
+    if (k == SNK_BINOP) {
+      var bop: int64 := self.sn_iVal(ni);
+      if (bop == 72) {                                   // *
+        if (self._dimAddExpr(self.sn_c0(ni), vec, vz) == 0) { return 0; }
+        return self._dimAddExpr(self.sn_c1(ni), vec, vz);
+      }
+      if (bop == 73) {                                   // /
+        if (self._dimAddExpr(self.sn_c0(ni), vec, vz) == 0) { return 0; }
+        return self._dimAddExpr(self.sn_c1(ni), vec, 0 - vz);
+      }
+      return 0;
+    }
+    return 0;
+  }
+
+  // Eine `dim`-Deklaration eintragen. OHNE `= Ausdruck` ist sie eine
+  // BASISdimension und bekommt eine eigene Achse; MIT Ausdruck faellt ihr
+  // Vektor aus den bereits eingetragenen. Die Reihenfolge stimmt, weil
+  // _p1Decl die Deklarationen der Reihe nach durchgeht.
+  fn _dimRecord(nm: pchar, nl: int64, declNi: int64): void {
+    self._dimEnsure();
+    if (self._dimIndexOf(nm, nl) >= 0) { return; }      // schon bekannt
+    if (self.dimCount >= self.dimCap) {
+      var nc: int64 := self.dimCap * 2;
+      var nt: int64 := alloc(nc * 24);
+      var nv: int64 := alloc(nc * DIM_MAXBASE * 8);
+      memcpy(nt, self.dimTab, self.dimCount * 24);
+      memcpy(nv, self.dimVec, self.dimCount * DIM_MAXBASE * 8);
+      free(self.dimTab, self.dimCap * 24);
+      free(self.dimVec, self.dimCap * DIM_MAXBASE * 8);
+      self.dimTab := nt; self.dimVec := nv; self.dimCap := nc;
+    }
+    var idx: int64 := self.dimCount;
+    var b: int64 := self.dimTab + idx * 24;
+    poke64(b, nm as int64); poke64(b + 8, nl); poke64(b + 16, 0);
+    var v: int64 := self._dimVecAt(idx);
+    var j: int64 := 0;
+    while (j < DIM_MAXBASE) { poke64(v + j * 8, 0); j := j + 1; }
+    self.dimCount := idx + 1;
+
+    var ex: int64 := self.sn_c0(declNi);
+    if (ex < 0) {
+      // Basisdimension: eigene Achse.
+      if (self.dimBaseCount >= DIM_MAXBASE) {
+        // NICHT still weiterlaufen: ohne eigene Achse waere diese Dimension
+        // gleich der dimensionslosen, und die Algebra faende sie mit jeder
+        // anderen vertraeglich. Lieber melden.
+        self._errorNodeName("zu viele Basisdimensionen (Grenze 16) fuer", declNi, nm, nl);
+        return;
+      }
+      poke64(v + self.dimBaseCount * 8, 1);
+      self.dimBaseCount := self.dimBaseCount + 1;
+      poke64(b + 16, 1);
+      return;
+    }
+    if (self._dimAddExpr(ex, v, 1) != 0) { poke64(b + 16, 1); }
+    // Sonst bleibt "bekannt" auf 0: die Dimension ist unentscheidbar und
+    // wird von der Pruefung ausgelassen, statt als dimensionslos zu gelten.
+  }
+
+  // Vektor der Dimension, die ein Einheitentyp traegt.
+  fn _dimVecOfUtype(utDeclNi: int64, vec: int64): int64 {
+    var lb: int64 := alloc(8);
+    var dn: pchar := self._utypeDimName(utDeclNi, lb);
+    var dl: int64 := peek64(lb);
+    free(lb, 8);
+    if (dn == 0 as pchar || dl <= 0) { return 0; }
+    var di: int64 := self._dimIndexOf(dn, dl);
+    if (di < 0 || self._dimIsKnown(di) == 0) { return 0; }
+    var src: int64 := self._dimVecAt(di);
+    var j: int64 := 0;
+    while (j < DIM_MAXBASE) { poke64(vec + j * 8, peek64(src + j * 8)); j := j + 1; }
+    return 1;
+  }
+
+  // Vektor eines WERTAUSDRUCKS. Das Gegenstueck zu _utypeOfExpr: die eine
+  // beantwortet "welcher Einheitentyp", diese "welche Dimension" — und nur
+  // die zweite laesst sich rechnen.
+  //
+  // Ein Literal ist dimensionslos, also ein NULLvektor, und das ist kein
+  // Sonderfall, sondern das neutrale Element: `laenge * 3` behaelt die
+  // Laenge, weil 3 nichts beitraegt.
+  fn _dimVecOfExpr(ni: int64, vec: int64): int64 {
+    if (ni < 0) { return 0; }
+    var j: int64 := 0;
+    while (j < DIM_MAXBASE) { poke64(vec + j * 8, 0); j := j + 1; }
+    var k: int64 := self.sn_kind(ni);
+    if (k == 40 || k == 41) { return 1; }               // Zahl: dimensionslos
+    if (k == SNK_IDENT || k == SNK_CAST || k == SNK_CALL || k == SNK_FIELD) {
+      var ut: int64 := self._utypeOfExpr(ni);
+      if (self._utypeHandleKnown(ut) == 0) { return 0; }
+      if (ut < 0) { return 0; }                          // importiert: hier nicht
+      return self._dimVecOfUtype(ut, vec);
+    }
+    if (k == SNK_BINOP) {
+      var bop: int64 := self.sn_iVal(ni);
+      var lv: int64 := alloc(DIM_MAXBASE * 8);
+      var rv: int64 := alloc(DIM_MAXBASE * 8);
+      var okL: int64 := self._dimVecOfExpr(self.sn_c0(ni), lv);
+      var okR: int64 := self._dimVecOfExpr(self.sn_c1(ni), rv);
+      var res: int64 := 0;
+      if (okL != 0 && okR != 0) {
+        if (bop == 72 || bop == 73) {
+          var vz: int64 := 1;
+          if (bop == 73) { vz := 0 - 1; }
+          var i2: int64 := 0;
+          while (i2 < DIM_MAXBASE) {
+            poke64(vec + i2 * 8, peek64(lv + i2 * 8) + vz * peek64(rv + i2 * 8));
+            i2 := i2 + 1;
+          }
+          res := 1;
+        } else if (bop == 70 || bop == 71) {
+          // Addition: beide Seiten muessen ohnehin uebereinstimmen, das
+          // prueft _checkUtypeBinop. Hier zaehlt die linke.
+          var i3: int64 := 0;
+          while (i3 < DIM_MAXBASE) { poke64(vec + i3 * 8, peek64(lv + i3 * 8)); i3 := i3 + 1; }
+          res := 1;
+        }
+      }
+      free(lv, DIM_MAXBASE * 8);
+      free(rv, DIM_MAXBASE * 8);
+      return res;
+    }
+    return 0;
+  }
+
+  // Ist der Vektor durchweg null? Das ist die DIMENSIONSLOSE Groesse — und
+  // sie bleibt jeder Einheit zuweisbar, genau wie bisher das Literal: `var a:
+  // Km := 2` muss gehen. Ohne diese Unterscheidung weist die Algebra jede
+  // Zuweisung einer nackten Zahl ab, weil deren Nullvektor natuerlich mit
+  // keiner Einheit uebereinstimmt.
+  fn _dimVecIsZero(a: int64): int64 {
+    var j: int64 := 0;
+    while (j < DIM_MAXBASE) {
+      if (peek64(a + j * 8) != 0) { return 0; }
+      j := j + 1;
+    }
+    return 1;
+  }
+
+  fn _dimVecEqual(a: int64, b: int64): int64 {
+    var j: int64 := 0;
+    while (j < DIM_MAXBASE) {
+      if (peek64(a + j * 8) != peek64(b + j * 8)) { return 0; }
+      j := j + 1;
+    }
+    return 1;
+  }
+
   // Index in utDimTab zu einem Einheitentyp-NAMEN, oder -1.
   fn _utFindDim(utName: pchar, utNameLen: int64): int64 {
     var i: int64 := self.utDimCount - 1;
@@ -3170,9 +3412,17 @@ pub type Sema = class {
       // ABGELEITETE Dimension (m/s); die rechnet der Compiler nicht aus, also
       // liefert dieser Fall "unbekannt" statt einer falschen Behauptung.
       if (bop == 72 || bop == 73) {
-        if (lu >= 0 && ru >= 0) { return 0 - 1; }
-        if (lu >= 0) { return lu; }
-        return ru;
+        if (lu >= 0 && ru >= 0) { return 0 - 1; }   // abgeleitet, s. _dimVecOfExpr
+        if (lu >= 0) { return lu; }                 // Einheit * bzw. / Skalar
+        // #1962: Hier stand `return ru;` fuer BEIDE Operatoren. Bei der
+        // Multiplikation stimmt das — `3 * laenge` ist eine Laenge. Bei der
+        // DIVISION nicht: `1 / t` ist keine Zeit, sondern ihr Kehrwert, und
+        // die Einheit der rechten Seite zu behaupten war schlicht falsch.
+        // Die Folge war nicht nur eine schiefe Auskunft: weil damit ein
+        // Einheitentyp gemeldet wurde, lief die Dimensionsalgebra unten gar
+        // nicht erst an, und `var f: Hz := 1 / t;` wurde abgewiesen.
+        if (bop == 72) { return ru; }
+        return 0 - 1;
       }
       // Alles andere (+, -, Vergleiche): die Seiten muessen zusammenpassen,
       // geprueft wird das in _checkUtypeBinop. Hier zaehlt die linke Seite.
@@ -3388,6 +3638,33 @@ pub type Sema = class {
         self._errorNode("Zuweisung ueber Dimensionsgrenzen hinweg"c, atNi);
       }
       return;
+    }
+    // #1962: Der Wert traegt KEINEN einzelnen Einheitentyp — er kann trotzdem
+    // eine Dimension haben. `u / r` ist weder eine Spannung noch ein
+    // Widerstand, sondern ein Strom, und genau das sagt die Deklaration
+    // `dim Resistance = Voltage / ElectricCurrent` zu.
+    //
+    // Bis 1.2.4C fiel dieser Fall durch: das Ergebnis galt als dimensionslos
+    // und passte deshalb ueberall hin — `var i: A := u / r;` ging durch, aber
+    // `var x: V := u / r;` AUCH. Die Zeile war eine Behauptung ohne Deckung.
+    //
+    // Geprueft wird nur, wenn BEIDE Seiten aufloesbar sind; sonst bleibt es
+    // beim bisherigen Verhalten. Unentscheidbar heisst nicht falsch.
+    if (tu >= 0) {
+      var tv: int64 := alloc(DIM_MAXBASE * 8);
+      var vv: int64 := alloc(DIM_MAXBASE * 8);
+      var okT: int64 := self._dimVecOfUtype(tu, tv);
+      var okV: int64 := self._dimVecOfExpr(valNi, vv);
+      var passt: int64 := 1;
+      if (okT != 0 && okV != 0 && self._dimVecIsZero(vv) == 0) {
+        passt := self._dimVecEqual(tv, vv);
+      }
+      free(tv, DIM_MAXBASE * 8);
+      free(vv, DIM_MAXBASE * 8);
+      if (passt == 0) {
+        self._errorNode("Zuweisung ueber Dimensionsgrenzen hinweg"c, atNi);
+        return;
+      }
     }
     // #1110: dimensionsloser Wert an eine Einheit — erlaubt (ein Literal muss
     // sich zuweisen lassen). Steht der Wert aber FEST und der Typ traegt
@@ -3955,6 +4232,7 @@ pub type Sema = class {
       }
     } else if (k == SNK_DIM_DECL) {
       self._pushSym(name, nlen, SYM_TYPE, TY_USER, ni);
+      self._dimRecord(name, nlen, ni);     // #1962: Exponentenvektor eintragen
     } else if (k == SNK_UTYPE_DECL) {
       self._pushSym(name, nlen, SYM_TYPE, TY_FLOAT64, ni);   // #1622
       self._utRecordDim(name, nlen, ni);   // #1295

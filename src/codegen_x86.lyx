@@ -8063,6 +8063,64 @@ pub type Codegen = class {
     return 1;
   }
 
+  // #1962: Der FAKTOR eines Ausdrucks, als Bruch. Rueckgabe:
+  //   0 = traegt keine Einheit und ist auch kein Skalar (nicht behandelbar),
+  //   1 = traegt eine Einheit, Faktor steht in den Boxen,
+  //   2 = dimensionsloser Skalar (neutrales Element, Faktor 1/1).
+  //
+  // Die Unterscheidung 1 gegen 2 ist tragend: ein Literal darf NICHT
+  // umgerechnet werden. `var a: Km := 2` muss 2 bleiben — wer hier den
+  // Zielfaktor anbraechte, machte aus jeder Startbelegung eine Umrechnung.
+  fn cg_utypeFracOfExpr(ni: int64, numBox: int64, denBox: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_LIT_INT || k == CGN_LIT_FLOAT) {
+      poke64(numBox, 1); poke64(denBox, 1);
+      return 2;
+    }
+    if (k == CGN_BINOP) {
+      var op: int64 := self.cg_nival(ni);
+      if (op != CGT_STAR && op != CGT_SLASH) { return 0; }
+      var ln: int64 := alloc(8); var ld: int64 := alloc(8);
+      var rn: int64 := alloc(8); var rd: int64 := alloc(8);
+      var lo: int64 := self.cg_utypeFracOfExpr(self.cg_nc0(ni), ln, ld);
+      var ro: int64 := self.cg_utypeFracOfExpr(self.cg_nc1(ni), rn, rd);
+      var erg: int64 := 0;
+      if (lo != 0 && ro != 0) {
+        var a: int64 := peek64(ln); var b: int64 := peek64(ld);
+        var c: int64 := peek64(rn); var d: int64 := peek64(rd);
+        if (op == CGT_STAR) { poke64(numBox, a * c); poke64(denBox, b * d); }
+        else                { poke64(numBox, a * d); poke64(denBox, b * c); }
+        if (lo == 2 && ro == 2) { erg := 2; } else { erg := 1; }
+      }
+      free(ln, 8); free(ld, 8); free(rn, 8); free(rd, 8);
+      return erg;
+    }
+    var u: int64 := self.cg_utypeOfExpr(ni);
+    if (u < 0) { return 0; }
+    poke64(numBox, self.cg_utypeFactor(u));
+    poke64(denBox, self.cg_utypeFactorDen(u));
+    return 1;
+  }
+
+  // #1962: Umrechnung eines beliebigen AUSDRUCKS auf den Zieltyp. Erst der
+  // bisherige Weg ueber den Index — er deckt jeden einfachen Fall und bleibt
+  // Bit fuer Bit wie zuvor. Nur wenn der Ausdruck keinem deklarierten
+  // Einheitentyp entspricht (also eine ABGELEITETE Groesse ist), wird der
+  // Faktor als Bruch bestimmt.
+  fn cg_emitUtypeConvExpr(dstIdx: int64, srcNi: int64) {
+    if (dstIdx < 0 || srcNi < 0) { return; }
+    var src: int64 := self.cg_utypeOfExpr(srcNi);
+    if (src >= 0) { self.cg_emitUtypeConv(dstIdx, src); return; }
+    var nb: int64 := alloc(8); var db: int64 := alloc(8);
+    var art: int64 := self.cg_utypeFracOfExpr(srcNi, nb, db);
+    if (art == 1) {
+      self.cg_emitConvFrac(peek64(nb), peek64(db),
+                           self.cg_utypeFactor(dstIdx), self.cg_utypeFactorDen(dstIdx));
+    }
+    free(nb, 8); free(db, 8);
+  }
+
   fn cg_emitUtypeConv(dstIdx: int64, srcIdx: int64) {
     if (dstIdx < 0 || srcIdx < 0) { return; }
     if (dstIdx == srcIdx) { return; }
@@ -8081,6 +8139,16 @@ pub type Codegen = class {
     var sd: int64 := self.cg_utypeFactorDen(srcIdx);
     var dn: int64 := self.cg_utypeFactor(dstIdx);
     var dd: int64 := self.cg_utypeFactorDen(dstIdx);
+    self.cg_emitConvFrac(sn, sd, dn, dd);
+  }
+
+  // Derselbe Rumpf, aber mit dem Quellfaktor als BRUCH statt als Index. Das
+  // braucht #1962: das Ergebnis von `s / t` ist kein DEKLARIERTER
+  // Einheitentyp, es hat aber sehr wohl einen Faktor — bei km durch h eben
+  // 1000/3600. Ohne diesen Weg stimmte die Dimensionspruefung, aber die Zahl
+  // nicht: 36 km/h ergaben 36 statt 10 m/s.
+  fn cg_emitConvFrac(sn: int64, sd: int64, dn: int64, dd: int64) {
+    if (sd == 0 || dn == 0) { return; }
     var mul: int64 := sn * dd;
     var div: int64 := sd * dn;
     var g: int64 := self.cg_gcd(mul, div);
@@ -15687,7 +15755,7 @@ pub type Codegen = class {
         self.cg_emitNarrowRax(self.cg_narrowKindOfTypeNode(typeNode));
         // #1110: in die Zieleinheit umrechnen, dann die Grenzen durchsetzen.
         var utDst1: int64 := self.cg_utypeOfTypeNode(typeNode);
-        self.cg_emitUtypeConv(utDst1, self.cg_utypeOfExpr(init));
+        self.cg_emitUtypeConvExpr(utDst1, init);
         self.cg_emitUtypeRange(utDst1);
       }
       // WP-B1: @redundant vars need 3 slots; mark + write all copies
@@ -15739,7 +15807,7 @@ pub type Codegen = class {
         if (utDst2 >= 0 && self.cg_isF64Expr(rhs) == 0) {
           self.cg_emitRaxIntToF64();
         }
-        self.cg_emitUtypeConv(utDst2, self.cg_utypeOfExpr(rhs));
+        self.cg_emitUtypeConvExpr(utDst2, rhs);
         self.cg_emitUtypeRange(utDst2);
         var off: int64 := self.cg_findLocal(name, nlen);
         // #1351: `b := a` bei einem Struct kopiert den INHALT. Bis hierher
@@ -15824,7 +15892,7 @@ pub type Codegen = class {
         }
         if (utFld >= 0) {
           if (self.cg_isF64Expr(rhs) == 0) { self.cg_emitRaxIntToF64(); }
-          self.cg_emitUtypeConv(utFld, self.cg_utypeOfExpr(rhs));
+          self.cg_emitUtypeConvExpr(utFld, rhs);
           self.cg_emitUtypeRange(utFld);
         }
         self.cg_pushRax();
