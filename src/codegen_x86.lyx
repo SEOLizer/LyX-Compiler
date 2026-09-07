@@ -8028,6 +8028,41 @@ pub type Codegen = class {
     self.cg_e8(0xC1 + xmmReg * 8);
   }
 
+  // #1956: Treffen in EINER Rechnung zwei Einheiten DERSELBEN Dimension mit
+  // verschiedenem Faktor aufeinander, muss vor der Operation umgerechnet
+  // werden.
+  //
+  // Bis 1.2.4B geschah das nur bei der ZUWEISUNG. `500 m + 1 km` addierte die
+  // rohen Zahlen zu 501 — unabhaengig vom Zieltyp, weil beide Seiten so
+  // behandelt wurden, als truegen sie denselben Faktor. Der Fall faellt nicht
+  // auf: das Ergebnis ist eine plausible Zahl, und der Typ stimmt sogar. Es
+  // ist genau die Fehlerklasse, gegen die Einheitentypen antreten.
+  //
+  // Ebenso der Vergleich: `500 m > 1 km` verglich 500 mit 1 und war wahr.
+  //
+  // Massgeblich ist die LINKE Seite — dieselbe Festlegung wie in
+  // _utypeOfExpr (sema), wo der Ergebnistyp eines `+` die linke Einheit ist.
+  // Die beiden muessen uebereinstimmen, sonst rechnet der Codegen in eine
+  // andere Einheit, als die Typpruefung annimmt.
+  //
+  // Dass beide Seiten DIESELBE Dimension tragen, ist hier bereits sicher:
+  // _checkUtypeBinop weist Rechnungen und Vergleiche ueber Dimensionsgrenzen
+  // ab, bevor der Codegen laeuft. Deshalb genuegt der Vergleich der Indizes.
+  fn cg_utypeBinopConvNeeded(ni: int64): int64 {
+    var op: int64 := self.cg_nival(ni);
+    var passt: int64 := 0;
+    if (op == CGT_PLUS || op == CGT_MINUS) { passt := 1; }
+    if (op == CGT_GT || op == CGT_LT || op == CGT_GE || op == CGT_LE ||
+        op == CGT_EQ2 || op == CGT_NEQ) { passt := 1; }
+    if (passt == 0) { return 0; }
+    var lu: int64 := self.cg_utypeOfExpr(self.cg_nc0(ni));
+    if (lu < 0) { return 0; }
+    var ru: int64 := self.cg_utypeOfExpr(self.cg_nc1(ni));
+    if (ru < 0) { return 0; }
+    if (lu == ru) { return 0; }
+    return 1;
+  }
+
   fn cg_emitUtypeConv(dstIdx: int64, srcIdx: int64) {
     if (dstIdx < 0 || srcIdx < 0) { return; }
     if (dstIdx == srcIdx) { return; }
@@ -8180,6 +8215,36 @@ pub type Codegen = class {
     if (k == CGN_CAST) {
       var tn: int64 := self.cg_nc1(ni);
       if (tn >= 0) { return self.cg_utypeOfTypeNode(tn); }
+      return 0 - 1;
+    }
+    // #1956: die RECHNUNG selbst. Ohne diesen Fall gab cg_utypeOfExpr fuer
+    // `a + b` still -1 zurueck, und die Zuweisung des Ergebnisses rechnete
+    // deshalb nicht um: `var s: KM := a + b;` lieferte 1500 statt 1.5, obwohl
+    // die Summe in Metern bereits richtig war. Wieder die Klasse "eine
+    // Aufzaehlung ist unvollstaendig" — dieselbe, vor der der Kommentar oben
+    // warnt, nur eine Herkunft weiter.
+    //
+    // Massgeblich ist die LINKE Seite; das deckt sich mit _utypeOfExpr in
+    // sema, wo der Ergebnistyp eines `+` die linke Einheit ist. Traegt nur
+    // die rechte eine Einheit (`3 * laenge`), gilt deren.
+    //
+    // NUR fuer + und -. Bei * und / ergaeben zwei Einheiten eine ABGELEITETE
+    // Dimension, und die rechnet der Compiler bis heute nicht aus (#1962);
+    // hier "unbekannt" zu liefern ist die ehrliche Antwort. Skalierung mit
+    // einer dimensionslosen Zahl behaelt dagegen die Einheit.
+    if (k == CGN_BINOP) {
+      var bop: int64 := self.cg_nival(ni);
+      var lb: int64 := self.cg_utypeOfExpr(self.cg_nc0(ni));
+      var rb: int64 := self.cg_utypeOfExpr(self.cg_nc1(ni));
+      if (bop == CGT_PLUS || bop == CGT_MINUS) {
+        if (lb >= 0) { return lb; }
+        return rb;
+      }
+      if (bop == CGT_STAR || bop == CGT_SLASH) {
+        if (lb >= 0 && rb >= 0) { return 0 - 1; }   // abgeleitet: #1962
+        if (bop == CGT_STAR && rb >= 0) { return rb; }
+        return lb;
+      }
       return 0 - 1;
     }
     // Das AUFRUFERGEBNIS. `var b: Km := hoehe();` mit `hoehe(): M` rechnete
@@ -9737,6 +9802,21 @@ pub type Codegen = class {
         poke32(self.code + scoT2, self.codeLen - scoT2 - 4);
         self.cg_movRaxImm(1);
         poke32(self.code + scoEnd, self.codeLen - scoEnd - 4);
+
+      } else if (self.cg_utypeBinopConvNeeded(ni) != 0) {
+        // #1956: zwei Einheiten derselben Dimension mit verschiedenem Faktor.
+        // Die rechte Seite wird auf die Einheit der linken gebracht, DANN
+        // gerechnet. Der Zweig steht bewusst vor den Konstanten-Schnellpfaden:
+        // die emittieren die Operation direkt und haetten keine Stelle, an der
+        // sich der Faktor noch anbringen liesse.
+        var uLhs: int64 := self.cg_utypeOfExpr(lhsNi);
+        var uRhs: int64 := self.cg_utypeOfExpr(rhsNi);
+        self.cg_genExpr(lhsNi);
+        self.cg_pushRax();
+        self.cg_genExpr(rhsNi);
+        self.cg_emitUtypeConv(uLhs, uRhs);      // rechte Seite in die linke Einheit
+        self.cg_popRbx();
+        self.cg_emitF64BinOp(op);
 
       } else if (op != CGT_AND && op != CGT_OR && self.cg_tryFold(lhsNi) != 0) {
         // LHS is constant: push it so the RHS function call can't clobber rbx
