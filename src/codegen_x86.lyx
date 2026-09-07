@@ -786,6 +786,10 @@ pub type Codegen = class {
   baseRelocCap:    int64;
 
   // f64-returning user-defined functions: {namePtr:8, nameLen:8} = 16 bytes per entry
+  // #2004 (Folgebefund): Gibt die GERADE erzeugte Funktion Gleitkomma zurueck?
+  // `return 2500;` in einer Funktion mit f64- oder Einheiten-Rueckgabetyp gab
+  // die rohe Ganzzahl zurueck, statt sie umzuwandeln.
+  fnRetIsFloat: int64;
   f64FuncList:  int64;
   f64FuncCount: int64;
   f64FuncCap:   int64;
@@ -4986,17 +4990,27 @@ pub type Codegen = class {
           facVal := self.cg_parseFactorRatio(self.pSrc, self.cg_nsoff(utFac),
                                              self.cg_nslen(utFac), facDenBox);
           if (facVal <= 0) {
-            // Nicht lesbar heisst melden, nicht heimlich 1 rechnen.
+            // #2006: Der Kommentar hier sagte "melden, nicht heimlich 1
+            // rechnen" — und die zwei Zeilen darunter rechneten heimlich 1.
+            // Die Absicht war da, die Durchsetzung fehlte: der Bau lief mit
+            // rc=0 weiter, und aus 360 Grad wurden 360 Radiant. Stiller
+            // Default in seiner unangenehmsten Form, weil der Fehler sogar
+            // AUSGEGEBEN und dann uebergangen wurde — im Protokoll sichtbar,
+            // am Rueckgabewert nicht, also fuer jede CI unsichtbar.
+            //
+            // Die Grenze wird mitgenannt: sie ist nicht offensichtlich und
+            // steht sonst nirgends, wo ein Nutzer sie liest.
             EPrintStr("codegen error: utype '"c);
             sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
             EPrintStrLn("': Umrechnungsfaktor ist kein lesbares Zahlliteral"c);
-            facVal := 1;
-            poke64(facDenBox, 1);
+            EPrintStrLn("  Hoechstens 14 Nachkommastellen; der Faktor wird als Bruch aus int64 gefuehrt."c);
+            exit(1);
           }
         } else if (utFac >= 0) {
           EPrintStr("codegen error: utype '"c);
           sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
           EPrintStrLn("': Umrechnungsfaktor muss ein Zahlliteral sein"c);
+          exit(1);   // #2006: dieselbe Luecke, eine Zeile weiter
         }
         var dimP: pchar := 0 as pchar;
         var dimL: int64 := 0;
@@ -5511,6 +5525,48 @@ pub type Codegen = class {
   // #1212: Ganzzahl in rax nach IEEE-754 double wandeln (cvtsi2sd + movq
   // zurueck). Dieselbe Folge wie im Cast-Pfad `x as f64` — hier als eigene
   // Funktion, weil die gemischte Arithmetik sie an zwei Stellen braucht.
+  // #2004 (Folgebefund): `return 2500;` in einer Funktion mit f64- oder
+  // Einheiten-Rueckgabetyp gab die rohe Ganzzahl zurueck. Der Aufrufer las sie
+  // als IEEE-Bitmuster — 2500 ist dort eine denormale Zahl nahe null, und
+  // `hoehe(): M { return 2500; }` lieferte 0.0000 statt 2500.
+  //
+  // Vorbestehend und gegen 1.2.4D belegt; er fiel nur nicht auf, weil sich
+  // zwei Fehler aufhoben: solange eine Einheiten-Rueckgabe faelschlich als
+  // GANZZAHL galt, passte die falsche Rueckgabe zur falschen Erwartung. Mit
+  // der berichtigten Reihenfolge oben passt sie nicht mehr — der Fix hat den
+  // Fehler nicht erzeugt, sondern aufgedeckt.
+  // Umgewandelt wird nur, wenn der Ausdruck NACHWEISLICH eine Ganzzahl ist —
+  // nicht schon dann, wenn cg_isF64Expr ihn nicht als f64 erkennt.
+  //
+  // Die Unterscheidung ist tragend. cg_isF64Expr ist eine Aufzaehlung, und
+  // Aufzaehlungen sind in diesem Modul mehrfach unvollstaendig gewesen (#1787,
+  // #1806, #1812, zuletzt #1956). Ein "nein" von ihr heisst deshalb "nicht
+  // erkannt", nicht "ist keine". Wer daraufhin umwandelt, zerstoert jeden
+  // Wert, den sie nicht kennt.
+  //
+  // Genau das ist beim ersten Anlauf passiert: `FloorF64` gibt `fFloor(x)`
+  // zurueck, und `fFloor` steht nicht in der Liste der eingebauten
+  // Gleitkommaquellen (dort stehen nur fAdd, fSub, fMul, fDiv, fNeg, fAbs,
+  // sqrt). Der Rueckgabewert bekam eine cvtsi2sd auf sein Bitmuster, und weil
+  // FloorF64 in der Argumentreduktion von SinF64 sitzt, lieferte der Sinus
+  // ausserhalb von 2pi `inf` — 550 Ausreisser in stdlib_z20_test.
+  //
+  // Der Zweifel muss also zur sicheren Seite fallen: keine Umwandlung.
+  // Erfasst werden das Ganzzahlliteral und jeder Ausdruck, den cg_tryFold zu
+  // einer ganzzahligen Konstanten zusammenrechnet — `return 2500;` und
+  // `return 2500 * 2;`. Das deckt den gemeldeten Fall (#2007) ab und laesst
+  // alles Unsichere unberuehrt.
+  fn cg_retToF64(expr: int64) {
+    if (self.fnRetIsFloat == 0) { return; }
+    if (expr < 0) { return; }
+    if (self.cg_isF64Expr(expr) != 0) { return; }   // liegt schon als f64 vor
+    var sicherGanz: int64 := 0;
+    if (self.cg_nkind(expr) == CGN_LIT_INT) { sicherGanz := 1; }
+    else if (self.cg_tryFold(expr) != 0) { sicherGanz := 1; }
+    if (sicherGanz == 0) { return; }
+    self.cg_emitRaxIntToF64();
+  }
+
   fn cg_emitRaxIntToF64() {
     self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xC0); // cvtsi2sd xmm0, rax
     self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0); // movq rax, xmm0
@@ -8071,6 +8127,13 @@ pub type Codegen = class {
   // Die Unterscheidung 1 gegen 2 ist tragend: ein Literal darf NICHT
   // umgerechnet werden. `var a: Km := 2` muss 2 bleiben — wer hier den
   // Zielfaktor anbraechte, machte aus jeder Startbelegung eine Umrechnung.
+  fn cg_convOverflow() {
+    EPrintStrLn("codegen error: Umrechnungsfaktor laesst sich nicht als int64-Bruch fuehren"c);
+    EPrintStrLn("  Die beiden Einheiten sind zu fein gegeneinander aufgeloest. Weniger"c);
+    EPrintStrLn("  Nachkommastellen waehlen oder eine groebere Basiseinheit nehmen."c);
+    exit(1);
+  }
+
   fn cg_utypeFracOfExpr(ni: int64, numBox: int64, denBox: int64): int64 {
     if (ni < 0) { return 0; }
     var k: int64 := self.cg_nkind(ni);
@@ -8149,6 +8212,31 @@ pub type Codegen = class {
   // nicht: 36 km/h ergaben 36 statt 10 m/s.
   fn cg_emitConvFrac(sn: int64, sd: int64, dn: int64, dd: int64) {
     if (sd == 0 || dn == 0) { return; }
+    // #1953: ERST KUERZEN, DANN MULTIPLIZIEREN. Vorher wurde `sn * dd` und
+    // `sd * dn` roh gerechnet und das Ergebnis hinterher gekuerzt — bei zwei
+    // genauen Faktoren lief das ueber:
+    //
+    //   oz = 0.028349523125 (28349523125/1e12), lb = 0.45359237 (45359237/1e8)
+    //   div = 1e12 * 45359237 = 4.5e19  >  int64-Grenze 9.2e18
+    //
+    // 16 oz ergaben damit 5.357971 lb statt 1. Der Waechter in
+    // cg_parseFactorRatio (`den > 1e14`) begrenzt jeden Faktor EINZELN und
+    // sagt nichts ueber das Produkt zweier Faktoren — die zweite Stelle war
+    // nicht nachgezogen.
+    //
+    // Gekuerzt wird ueber Kreuz, weil genau die Paare gemeinsame Teiler
+    // haben, die miteinander multipliziert werden: im Beispiel ist
+    // gcd(28349523125, 45359237) = 45359237, uebrig bleibt 625/10000 = 1/16.
+    var gk1: int64 := self.cg_gcd(sn, dn);
+    if (gk1 > 1) { sn := sn / gk1; dn := dn / gk1; }
+    var gk2: int64 := self.cg_gcd(sd, dd);
+    if (gk2 > 1) { sd := sd / gk2; dd := dd / gk2; }
+    // Nach dem Kuerzen darf das Produkt immer noch nicht passen. Dann wird
+    // gemeldet statt gerechnet: ein uebergelaufener Faktor ist keine
+    // Umrechnung, sondern eine Zufallszahl (#2006, dieselbe Haltung).
+    var grenze: int64 := 4611686018427387904;      // 2^62, mit Luft
+    if (sn != 0 && dd > grenze / sn) { self.cg_convOverflow(); }
+    if (sd != 0 && dn > grenze / sd) { self.cg_convOverflow(); }
     var mul: int64 := sn * dd;
     var div: int64 := sd * dn;
     var g: int64 := self.cg_gcd(mul, div);
@@ -8189,7 +8277,19 @@ pub type Codegen = class {
     // ein riesiges Bitmuster). Das ist die Klasse "zweite Stelle nicht
     // nachgezogen": die Rechnung wurde umgestellt, die Pruefung daneben nicht.
     if ((flags & 2) != 0) {
-      // wraps: wert := (t - floor(t)) * span + lo,  mit t = (wert - lo)/span.
+      // wraps: wert := x - floor(x/span) * span + lo,  mit x = wert - lo.
+      //
+      // #2004: Hier stand `(t - floor(t)) * span + lo`. Mathematisch dasselbe,
+      // in Gleitkomma aber nicht: der Nachkommateil wird ausgerechnet und mit
+      // span zurueckmultipliziert, und dabei geht die letzte Stelle verloren.
+      // Aus 362 wurde 0 statt 1, aus 370 wurde 8 statt 9 — waehrend 361 und
+      // 720 stimmten, weil dort der Nachkommateil exakt null bzw. exakt
+      // darstellbar war. Ein Ergebnistest an einer einzelnen Zahl haette den
+      // Fehler nicht gefunden.
+      //
+      // Die stabile Form subtrahiert das VIELFACHE vom Ausgangswert, statt
+      // den Bruchteil zurueckzuskalieren: floor(t) ist eine ganze Zahl,
+      // floor(t)*span damit exakt, und die Subtraktion verliert nichts.
       var span: int64 := hi - lo + 1;
       if (span <= 0) { return; }
       self.cg_uMovXmm0Rax();
@@ -8197,6 +8297,7 @@ pub type Codegen = class {
         self.cg_uLoadConst(1, lo);
         self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5C); self.cg_e8(0xC1);  // subsd xmm0, xmm1
       }
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0xE0);    // movapd xmm4, xmm0 (x sichern)
       self.cg_uLoadConst(3, span);                                              // xmm3 = span
       self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5E); self.cg_e8(0xC3);    // divsd xmm0, xmm3
       // floor(t): abschneiden, und bei negativem t um 1 zurueck. `roundsd`
@@ -8209,8 +8310,9 @@ pub type Codegen = class {
       self.cg_uLoadConst(1, 1);
       self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5C); self.cg_e8(0xD1);   // subsd xmm2, xmm1
       cg_patchRel8(self.code, pSkip, self.codeLen);
-      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5C); self.cg_e8(0xC2);   // subsd xmm0, xmm2 (Nachkommateil)
-      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x59); self.cg_e8(0xC3);   // mulsd xmm0, xmm3
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x59); self.cg_e8(0xD3);   // mulsd xmm2, xmm3 (floor(t)*span)
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0xC4);   // movapd xmm0, xmm4 (x zurueck)
+      self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5C); self.cg_e8(0xC2);   // subsd xmm0, xmm2
       if (lo != 0) {
         self.cg_uLoadConst(1, lo);
         self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x58); self.cg_e8(0xC1); // addsd xmm0, xmm1
@@ -9473,6 +9575,12 @@ pub type Codegen = class {
     self.fnRetStructBytes := 0;
     self.fnRetSlotOff     := 0;
     var mRetTyN: int64 := self.cg_nc1(ni);
+    self.fnRetIsFloat := 0;
+    if (mRetTyN >= 0) {
+      if (self.cg_isFloatTypeName(self.cg_nsval(mRetTyN), self.cg_nslen(mRetTyN)) != 0) {
+        self.fnRetIsFloat := 1;
+      }
+    }
     if (mRetTyN >= 0 && self.cg_nkind(mRetTyN) == 60) {
       var mrci: int64 := self.cg_findClass(self.cg_nsval(mRetTyN), self.cg_nslen(mRetTyN));
       if (mrci >= 0 && self.cg_istWertStruct(mrci) != 0
@@ -16248,6 +16356,7 @@ pub type Codegen = class {
         // WP-AS-10: save return value around defer emission
         if (expr >= 0) {
           self.cg_genExpr(expr);
+          self.cg_retToF64(expr);                                            // #2004
           if (self.lockstepActive != 0) { self.cg_lockstepPruefe(expr); }   // #1878
           self.cg_pushRax();
           self.cg_emitDefers();
@@ -16259,6 +16368,7 @@ pub type Codegen = class {
       } else {
         if (expr >= 0) {
           self.cg_genExpr(expr);
+          self.cg_retToF64(expr);                                            // #2004
           // #1878: derselbe Vergleich wie im defer-Zweig darueber — die
           // beiden muessen uebereinstimmen, sonst haengt der Nachweis am
           // Vorhandensein eines `defer`.
@@ -19028,6 +19138,12 @@ pub type Codegen = class {
     // ruecken alle echten Parameter um ein Register weiter.
     self.fnRetStructBytes := 0;
     self.fnRetSlotOff     := 0;
+    self.fnRetIsFloat     := 0;
+    if (retTyNode >= 0) {
+      if (self.cg_isFloatTypeName(self.cg_nsval(retTyNode), self.cg_nslen(retTyNode)) != 0) {
+        self.fnRetIsFloat := 1;
+      }
+    }
     if (retTyNode >= 0 && self.cg_nkind(retTyNode) == 60) {
       var rci: int64 := self.cg_findClass(self.cg_nsval(retTyNode), self.cg_nslen(retTyNode));
       if (rci >= 0 && self.cg_istWertStruct(rci) != 0
@@ -21010,11 +21126,24 @@ pub type Codegen = class {
 
   fn cg_genFile(head: int64) {
     self.topLevelHead := head;   // A1: früh setzen (für cg_isDeclaredFunc beim Fn-Name-als-Wert)
+    // #2004: Die EINHEITENTYPEN muessen VOR den f64-Funktionen gesammelt
+    // werden. cg_collectF64Funcs entscheidet ueber cg_isFloatTypeName, ob eine
+    // Funktion Gleitkomma zurueckgibt — und diese Frage beantwortet seit #1955
+    // auch cg_findUtype: ein Einheitentyp rechnet in Gleitkomma.
+    //
+    // Stand cg_collectUtypes danach, war die Tabelle beim Fragen noch LEER.
+    // Jede Funktion mit Einheiten-Rueckgabetyp galt deshalb als ganzzahlig,
+    // und `machW(i) as int64` lieferte statt der Zahl das rohe IEEE-Bitmuster:
+    // aus 358 wurde 4645005618795511808. Kein Abbruch, keine Meldung.
+    //
+    // Der Fehler sah nach einem `wraps`-Problem aus und war keines — eine
+    // Einheit OHNE wraps traf es genauso. Das Verhalten hing allein daran, ob
+    // der Wert durch eine FUNKTION lief oder in einer lokalen Variablen blieb.
+    self.cg_collectUtypes(head);          // #1110: Einheitentypen samt Faktor
     // Pre-pass: collect all user-defined functions returning f64 for cg_isF64Expr.
     self.cg_collectF64Funcs(head);
     self.cg_collectMethodAliases(head);   // B2: method-Typ-Aliase registrieren
     self.cg_collectRangeTypes(head);      // #1097: Bereichstypen samt Grenzen
-    self.cg_collectUtypes(head);          // #1110: Einheitentypen samt Faktor
     self.cg_collectIfaceSelectors(head);  // #1133: Interface-Selektoren (vor den Layouts!)
     self.cg_prebuildStructLayouts(head);  // #1451: Layouts vor jedem Rumpf
     self.cg_prebuildClassLayouts(head);   // #1663: dasselbe fuer Klassen
