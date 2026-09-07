@@ -556,6 +556,7 @@ test: lyxc
 	@echo "--- Einheitentypen: Faktor, Dimension, range/wraps (18 Pruefungen) ---"
 	@bash tests/utype_test.sh
 	@bash tests/units_test.sh
+	@bash tests/std_unit_deklaration_test.sh
 	@bash tests/embed_test.sh
 	@bash tests/lyu_import_test.sh
 	@bash tests/lyu_ir_test.sh
