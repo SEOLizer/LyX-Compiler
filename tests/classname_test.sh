@@ -29,8 +29,13 @@ type TBasis = class {
   fn Create(): void { self.a := 1; }
   virtual fn Tu(): void { }
 }
-type TAbl = class extends TBasis { b: int64; fn Create(): void { self.b := 2; } }
-type TTiefer = class extends TAbl { fn Create(): void { } }
+// #1973: Die beiden Ableitungen rufen jetzt super.Create(). Vorher liessen
+// sie die Felder der Basis auf 0 stehen — hier folgenlos, weil dieser Test
+// ClassName misst und nicht die Feldwerte, aber genau die Form, die seit
+// 1.2.4A gemeldet wird. Die Klassen sind Beiwerk; der Aufruf aendert nichts
+// an dem, was hier geprueft wird.
+type TAbl = class extends TBasis { b: int64; fn Create(): void { super.Create(); self.b := 2; } }
+type TTiefer = class extends TAbl { fn Create(): void { super.Create(); } }
 type TOhneMethoden = class { c: int64; }
 
 fn main(): int64 {
