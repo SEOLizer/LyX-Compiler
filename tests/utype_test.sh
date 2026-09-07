@@ -597,6 +597,158 @@ fn main(): int64 {
     return 0;
 }" '6.0'
 
+# ── #1962: abgeleitete Dimensionen werden GERECHNET ───────────────────────
+#
+# `dim Resistance = Voltage / ElectricCurrent;` wurde geparst, angenommen —
+# und nie ausgewertet. ebnf.md sagte es woertlich: "NICHT gerechnet werden
+# abgeleitete Dimensionen ... das Ergebnis gilt als dimensionslos". Die Zeile
+# sah nach einer Zusicherung aus und lieferte keine.
+#
+# Die Wirkung war BEIDSEITIG, und nur die Gegenprobe zeigt es: `var i: A :=
+# u / r;` ging durch — aber `var x: V := u / r;` AUCH, weil das Ergebnis
+# einer Division gar keine Dimension trug und deshalb ueberall hin passte.
+# Ein Test, der nur die erste Haelfte misst, waere schon vor dem Fix gruen
+# gewesen.
+E1='import std.io;
+dim Spannung;
+dim Strom;
+dim Widerstand = Spannung / Strom;
+utype V: Spannung = 1.0;
+utype A: Strom = 1.0;
+utype Ohm: Widerstand = 1.0;'
+
+out "#1962: U/R ergibt einen Strom" "$E1
+fn main(): int64 {
+    var u: V := 12;
+    var r: Ohm := 4;
+    var i: A := u / r;
+    PrintLn(FloatToStr(i as f64, 1));
+    return 0;
+}" '3.0'
+
+rejects "#1962: U/R ist KEINE Spannung" "$E1
+fn main(): int64 {
+    var u: V := 12;
+    var r: Ohm := 4;
+    var x: V := u / r;
+    return x as int64;
+}" "Dimensionsgrenzen"
+
+# Die Beispiele aus #1956 Befund 3: `*` und `/` trugen keine Dimension, also
+# uebersetzte JEDES Ziel.
+E2='import std.io;
+dim L;
+dim Z;
+dim Tempo = L / Z;
+dim Flaeche = L * L;
+utype M: L = 1.0;
+utype S: Z = 1.0;
+utype Mps: Tempo = 1.0;
+utype Qm: Flaeche = 1.0;'
+
+out "#1962: m/s ist ein Tempo" "$E2
+fn main(): int64 {
+    var m: M := 10;
+    var s: S := 2;
+    var v: Mps := m / s;
+    PrintLn(FloatToStr(v as f64, 1));
+    return 0;
+}" '5.0'
+
+rejects "#1962: m/s ist keine Laenge" "$E2
+fn main(): int64 {
+    var m: M := 10;
+    var s: S := 2;
+    var x: M := m / s;
+    return x as int64;
+}" "Dimensionsgrenzen"
+
+rejects "#1962: m/s ist keine Zeit" "$E2
+fn main(): int64 {
+    var m: M := 10;
+    var s: S := 2;
+    var y: S := m / s;
+    return y as int64;
+}" "Dimensionsgrenzen"
+
+# "Meter mal Meter ist eine Laenge?" — die Frage aus dem Issue.
+rejects "#1962: m*m ist keine Laenge" "$E2
+fn main(): int64 {
+    var m: M := 10;
+    var f: M := m * m;
+    return f as int64;
+}" "Dimensionsgrenzen"
+
+out "#1962: m*m ist eine Flaeche" "$E2
+fn main(): int64 {
+    var m: M := 10;
+    var f: Qm := m * m;
+    PrintLn(FloatToStr(f as f64, 1));
+    return 0;
+}" '100.0'
+
+# KEHRWERT. Ohne ihn behilft sich std/units.lyx mit `dim Frequency = Time` —
+# womit eine Frequenz als dimensionsgleich mit einer Dauer gilt (#1953).
+E3='import std.io;
+dim Zeit;
+dim Frequenz = 1 / Zeit;
+utype Sek: Zeit = 1.0;
+utype Hz: Frequenz = 1.0;'
+
+out "#1962: 1/t ist eine Frequenz" "$E3
+fn main(): int64 {
+    var t: Sek := 4;
+    var f: Hz := 1 / t;
+    PrintLn(FloatToStr(f as f64, 3));
+    return 0;
+}" '0.250'
+
+rejects "#1962: eine Dauer ist keine Frequenz" "$E3
+fn main(): int64 {
+    var t: Sek := 4;
+    var f: Hz := t;
+    return f as int64;
+}" "Dimensionsgrenzen"
+
+# DER FAKTOR der abgeleiteten Groesse. Die Dimensionspruefung allein genuegt
+# nicht: 36 km/h sind 10 m/s, nicht 36. Ohne diese Pruefung waere der Fix
+# gruen und die Zahl falsch — dieselbe Klasse wie ein Invariantentest.
+E4='import std.io;
+dim L;
+dim Z;
+dim Tempo = L / Z;
+utype KM: L = 1000.0;
+utype H: Z = 3600.0;
+utype Mps: Tempo = 1.0;'
+
+out "#1962: 36 km/h sind 10 m/s" "$E4
+fn main(): int64 {
+    var s: KM := 36;
+    var t: H := 1;
+    var v: Mps := s / t;
+    PrintLn(FloatToStr(v as f64, 4));
+    return 0;
+}" '10.0000'
+
+# GEGENPROBE: eine nackte Zahl bleibt jeder Einheit zuweisbar. Der Nullvektor
+# der dimensionslosen Groesse stimmt mit KEINER Einheit ueberein — wer das
+# nicht ausnimmt, weist jede Startbelegung ab.
+out "#1962: ein Literal bleibt zuweisbar" "$E2
+fn main(): int64 {
+    var m: M := 42;
+    PrintLn(FloatToStr(m as f64, 1));
+    return 0;
+}" '42.0'
+
+# GEGENPROBE: Skalierung bringt KEINEN Faktor an.
+out "#1962: Skalierung bleibt unberuehrt" "$E4
+fn main(): int64 {
+    var s: KM := 5;
+    var d: KM := s * 3;
+    PrintLn(FloatToStr(d as f64, 1));
+    return 0;
+}" '15.0'
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 test "$FAIL" -eq 0
