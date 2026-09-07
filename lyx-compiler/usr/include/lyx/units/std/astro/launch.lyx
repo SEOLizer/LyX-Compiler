@@ -182,6 +182,56 @@ pub fn ARotationGain(omega: f64, R: f64, latitude: f64, azimuth: f64): f64 {
   return omega * R * CosF64(latitude) * SinF64(azimuth);
 }
 
+// #1987: Drehgewinn aus der ZIELNEIGUNG statt aus einem Azimut.
+//
+// `ARotationGain` verlangt den Azimut, und der Aufrufer hat ihn meistens
+// nicht — er kennt die Zielneigung. In der Doku und in Beispielen stand
+// deshalb durchgehend `Pi()/2` (Osten), und damit bekam auch eine
+// RUECKLAEUFIGE Bahn den vollen Gewinn nach Osten gutgeschrieben, obwohl sie
+// nach Westen fliegt.
+//
+// Die Folge war kein kleiner Fehler, sondern ein umgedrehtes Ergebnis: eine
+// sonnensynchrone Bahn (i = 97.5 Grad) erschien BILLIGER als eine prograde von
+// derselben Rampe, und Kourou als guenstigster SSO-Startplatz. Richtig
+// gerechnet wird SSO nach Norden hin billiger — was der tatsaechlichen
+// Verteilung der SSO-Rampen entspricht (Plessezk, Andoeya, Taiyuan,
+// Vandenberg).
+//
+// Die Maschinerie war dabei in Ordnung: `ALaunchAzimuth` liefert fuer i > 90
+// Grad einen Azimut jenseits von 180 Grad, dessen Sinus negativ ist — der
+// Gewinn kaeme also von selbst mit dem richtigen Vorzeichen heraus. Was
+// fehlte, war die Verbindung zwischen den beiden Funktionen. Sie steht jetzt
+// hier, damit der richtige Weg auch der bequeme ist.
+//
+// Gemessen fuer Kourou (5.2 Grad Breite) und i = 97.5 Grad: ueber den Azimut
+// aus der Neigung -60.71 m/s, mit fest eingesetztem Osten +463.19 m/s.
+//
+// UND EIN ERGEBNIS, DAS UEBERRASCHT: der nutzbare Gewinn haengt gar nicht von
+// der Startbreite ab. Setzt man den Azimut ein, kuerzt sie sich heraus:
+//
+//   gewinn = omega*R * cos(breite) * sin(azimut)
+//   sin(azimut) = cos(i) / cos(breite)          (Azimutbeziehung)
+//   ------------------------------------------------------------
+//   gewinn = omega*R * cos(i)
+//
+// Nachgerechnet: Ostschuss von Cape Canaveral (i = Breite = 28.56 Grad) ergibt
+// 408.50 m/s — den Lehrbuchwert. SSO mit i = 97.5 Grad ergibt -60.71 m/s, und
+// zwar von JEDER Rampe gleich.
+//
+// Das heisst auch: eine Ersatzrechnung, die den Ostgewinn einfach umdreht
+// (`gewinn := 0.0 - gewinn`), ist ebenfalls falsch — sie liefert
+// breitenabhaengige Werte fuer eine Bahn, die man so gar nicht erreicht. Der
+// Grund, warum sonnensynchrone Starts von noerdlichen Rampen aus erfolgen,
+// liegt nicht im dv-Bedarf, sondern in der Ueberflugfreiheit: von Kourou aus
+// fuehrt ein Schuss nach Nordwesten ueber bewohntes Gebiet. Diese Bibliothek
+// rechnet Physik, keine Startgenehmigungen.
+pub fn ARotationGainForInclination(omega: f64, R: f64,
+                                   latitude: f64, inclination: f64): f64 {
+  var az: f64 := ALaunchAzimuth(latitude, inclination);
+  if (AIsError(az)) { return AError(); }
+  return ARotationGain(omega, R, latitude, az);
+}
+
 // dv-Bilanz fuer den Aufstieg in eine Kreisbahn [m/s]:
 //
 //   dv = v_kreis + verluste - drehgewinn
@@ -190,10 +240,43 @@ pub fn ARotationGain(omega: f64, R: f64, latitude: f64, azimuth: f64): f64 {
 // bei 7.8 km/s Bahngeschwindigkeit — die Differenz sind die Verluste, und
 // genau deshalb stehen sie hier als eigenes Argument statt als eingebauter
 // Zuschlag.
+// #1989: `rOrbit` ist die EINSCHUSSBAHN, nicht das Ziel.
+//
+// Der Name legt das Gegenteil nahe, und genau daran ist die Funktion
+// aufgefallen: sie liefert fuer eine HOEHERE Bahn ein KLEINERES Ergebnis
+// (400 km 8760 m/s, 700 km 8596 m/s), weil sie der Kreisbahngeschwindigkeit
+// folgt und die mit der Hoehe sinkt. Die Energie, die das Anheben der Bahn
+// kostet, kommt in dieser Bilanz nicht vor.
+//
+// Das ist kein Rechenfehler — fuer den Einschuss IN diese Bahn stimmt der
+// Wert. Es ist ein Modellfehler beim Aufrufer, sobald er `rOrbit` fuer die
+// Zielbahn haelt. Wer ueber mehrere Zielhoehen vergleicht, nimmt deshalb
+// `ADvAscentToOrbit` daneben.
 pub fn ADvAscent(mu: f64, rOrbit: f64, losses: f64, rotationGain: f64): f64 {
   var vCirc: f64 := ACircularSpeed(mu, rOrbit);
   if (AIsError(vCirc) || losses < 0.0) { return AError(); }
   return vCirc + losses - rotationGain;
+}
+
+// #1989: Der VOLLSTAENDIGE Aufstieg auf eine Zielhoehe — Einschuss in eine
+// Parkbahn, dann Hohmann-Transfer hinauf.
+//
+// Damit stimmt die Reihenfolge wieder: ueber 200 km Parkbahn und 1500 m/s
+// Verlusten kostet 400 km rund 9000 m/s, 510 km rund 9065 m/s und 700 km rund
+// 9179 m/s — hoeher ist teurer, wie es sein muss.
+//
+// Liegt das Ziel UNTER der Parkbahn, ist die Rechnung sinnlos statt bloss
+// ungenau: ein Abstieg ist kein Aufstieg, und der Hohmann-Anteil waere ein
+// Bremsmanoever, das hier nichts zu suchen hat. Deshalb ein Fehlerwert.
+pub fn ADvAscentToOrbit(mu: f64, rPark: f64, rTarget: f64,
+                        losses: f64, rotationGain: f64): f64 {
+  if (rTarget < rPark) { return AError(); }
+  var dvPark: f64 := ADvAscent(mu, rPark, losses, rotationGain);
+  if (AIsError(dvPark)) { return dvPark; }
+  if (rTarget == rPark) { return dvPark; }
+  var dvHoh: f64 := AHohmannDv(mu, rPark, rTarget);
+  if (AIsError(dvHoh)) { return dvHoh; }
+  return dvPark + dvHoh;
 }
 
 // ── Startazimut ───────────────────────────────────────────────────────────
