@@ -387,6 +387,8 @@ test: lyxc
 	@echo "--- std.aero: Atmosphaere, Flugleistung, Vorhersage, Profile, Warteschleifen ---"
 	@bash tests/aero_test.sh
 	@bash tests/ee_test.sh
+	@bash tests/coordinates_test.sh
+	@bash tests/geodesy_test.sh
 	@echo "--- std.zlib: entpacken schreibt nie ueber den Puffer (#1951) ---"
 	@bash tests/zlib_schranke_test.sh
 	@echo "--- Fehlgeschlagene Speicheranforderung meldet (#1947) ---"

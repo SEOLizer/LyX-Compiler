@@ -1,0 +1,199 @@
+// std/geodesy/frames.lyx — geodätisch, ECEF, ENU und NED
+//
+// Der Übergang zwischen der Kugelfläche und einem kartesischen Rahmen, in dem
+// man Vektoren addieren darf. Ohne ihn gibt es keinen Weg von Breite/Länge/Höhe
+// zu einer Rechnung mit Geschwindigkeiten, Sichtlinien oder Abständen.
+//
+// WAS HIER DIE FALLEN SIND — jede einzelne ist schon teuer geworden:
+//
+//   * HÖHE ÜBER DEM ELLIPSOID IST NICHT HÖHE ÜBER NN. GPS liefert die
+//     ellipsoidische Höhe; Karten und Höhenmesser nennen die orthometrische
+//     über dem Geoid. In Mitteleuropa liegen dazwischen rund 45 Meter, in
+//     Teilen des Indischen Ozeans über 100. Wer beides gleichsetzt, ist im
+//     Landeanflug entsprechend daneben. Diese Unit rechnet AUSSCHLIESSLICH
+//     mit der ellipsoidischen Höhe — der Name jeder Funktion sagt `hEll`.
+//
+//   * ENU UND NED SIND NICHT DASSELBE MIT ANDERER REIHENFOLGE. ENU ist
+//     Ost-Nord-Oben, NED ist Nord-Ost-UNTEN: die dritte Achse zeigt in die
+//     GEGENRICHTUNG. Ein Steigflug hat in ENU ein positives u und in NED ein
+//     negatives d. Wer die beiden vertauscht, fliegt in der Rechnung nach
+//     unten. Deshalb gibt es hier beide, ausdrücklich benannt, und keine
+//     Funktion, die "das lokale System" liefert.
+//
+//   * DIE RÜCKRECHNUNG ECEF → GEODÄTISCH IST ITERATIV. Es gibt keine
+//     geschlossene Formel für die Breite. Verwendet wird hier Bowrings
+//     Verfahren mit anschliessender Nachbesserung; das Abbruchkriterium ist
+//     eine SCHRANKE, keine feste Rundenzahl — eine feste Zahl ist entweder
+//     verschwenderisch oder in Polnähe zu knapp.
+//
+//   * AUF DER POLACHSE IST DIE LÄNGE UNBESTIMMT. Genau wie beim Azimut in
+//     Kugelkoordinaten: dort liefert die Rückrechnung 0 als Vereinbarung.
+
+unit std.geodesy.frames;
+
+import std.math;
+import std.coordinates.vec3;
+import std.geodesy.ellipsoid;
+
+// Geodätische Koordinaten: Breite und Länge im BOGENMASS, Höhe über dem
+// Ellipsoid in Metern.
+pub type Geodetic = struct {
+  latRad: f64;
+  lonRad: f64;
+  hEll:   f64;
+}
+
+pub fn GeodNew(latRad: f64, lonRad: f64, hEll: f64): Geodetic {
+  var g: Geodetic;
+  g.latRad := latRad;
+  g.lonRad := lonRad;
+  g.hEll := hEll;
+  return g;
+}
+
+// Bequemlichkeit: aus Grad. Die Umrechnung an EINER Stelle, statt sie an jeder
+// Aufrufstelle hinzuschreiben.
+pub fn GeodFromDeg(latDeg: f64, lonDeg: f64, hEll: f64): Geodetic {
+  return GeodNew(latDeg * Pi() / 180.0, lonDeg * Pi() / 180.0, hEll);
+}
+
+pub fn GeodLatDeg(g: Geodetic): f64 { return g.latRad * 180.0 / Pi(); }
+pub fn GeodLonDeg(g: Geodetic): f64 { return g.lonRad * 180.0 / Pi(); }
+
+// ── Geodätisch → ECEF ──────────────────────────────────────────────────────
+//
+// Geschlossen, ohne Iteration. Der Erdmittelpunkt ist der Ursprung, x zeigt
+// zum Schnittpunkt von Nullmeridian und Äquator, z zum Nordpol.
+pub fn GeodToEcef(e: Ellipsoid, g: Geodetic): V3 {
+  var sLat: f64 := SinF64(g.latRad);
+  var cLat: f64 := CosF64(g.latRad);
+  var n: f64 := EllN(e, g.latRad);
+  var e2: f64 := EllE2(e);
+  return V3New((n + g.hEll) * cLat * CosF64(g.lonRad),
+               (n + g.hEll) * cLat * SinF64(g.lonRad),
+               (n * (1.0 - e2) + g.hEll) * sLat);
+}
+
+// ── ECEF → geodätisch ──────────────────────────────────────────────────────
+//
+// Bowrings Verfahren: eine gute Startnäherung über die parametrische Breite,
+// dann Nachbesserung bis zur Schranke. Für Punkte nahe der Erdoberfläche
+// genügt in der Regel EIN Durchgang; die Schleife fängt die Fälle ab, in denen
+// das nicht reicht (grosse Höhen, Polnähe).
+pub fn EcefToGeod(e: Ellipsoid, p: V3): Geodetic {
+  var a: f64 := e.a;
+  var b: f64 := EllB(e);
+  var e2: f64 := EllE2(e);
+  var ep2: f64 := EllEp2(e);          // ZWEITE Exzentrizität — nicht die erste
+  var rho: f64 := SqrtF64(p.x * p.x + p.y * p.y);
+
+  // Auf der Polachse ist die Länge unbestimmt; 0 ist Vereinbarung.
+  var lon: f64 := 0.0;
+  if (rho != 0.0) { lon := Atan2F64(p.y, p.x); }
+
+  // Sonderfall Pol: die allgemeine Formel teilt dort durch rho.
+  if (rho < 1.0e-12) {
+    var vorz: f64 := 1.0;
+    if (p.z < 0.0) { vorz := 0.0 - 1.0; }
+    return GeodNew(vorz * Pi() / 2.0, lon, AbsF64(p.z) - b);
+  }
+
+  // Startnäherung nach Bowring über die parametrische Breite.
+  var beta: f64 := Atan2F64(a * p.z, b * rho);
+  var lat: f64 := Atan2F64(p.z + ep2 * b * SinF64(beta) * SinF64(beta) * SinF64(beta),
+                           rho - e2 * a * CosF64(beta) * CosF64(beta) * CosF64(beta));
+
+  // Nachbessern, bis sich die Breite nicht mehr merklich ändert. Die Schranke
+  // entspricht rund einem Millimeter auf der Erdoberfläche.
+  var i: int64 := 0;
+  var fertig: int64 := 0;
+  while (i < 8 && fertig == 0) {
+    var sLat: f64 := SinF64(lat);
+    var n: f64 := a / SqrtF64(1.0 - e2 * sLat * sLat);
+    var h: f64 := rho / CosF64(lat) - n;
+    var neu: f64 := Atan2F64(p.z, rho * (1.0 - e2 * n / (n + h)));
+    var d: f64 := neu - lat;
+    if (d < 0.0) { d := 0.0 - d; }
+    lat := neu;
+    if (d < 1.0e-12) { fertig := 1; }
+    i := i + 1;
+  }
+
+  var sLat2: f64 := SinF64(lat);
+  var n2: f64 := a / SqrtF64(1.0 - e2 * sLat2 * sLat2);
+  var hEll: f64 := rho / CosF64(lat) - n2;
+  return GeodNew(lat, lon, hEll);
+}
+
+// ── Lokale Horizontsysteme ─────────────────────────────────────────────────
+//
+// Bezugspunkt ist ein Ursprung auf der Erdoberfläche. Der Vektor vom Ursprung
+// zum Zielpunkt wird in die lokalen Achsen zerlegt.
+
+// ENU: x = Ost, y = Nord, z = OBEN.
+pub fn EcefToEnu(e: Ellipsoid, origin: Geodetic, p: V3): V3 {
+  var o: V3 := GeodToEcef(e, origin);
+  var d: V3 := V3Sub(p, o);
+  var sLat: f64 := SinF64(origin.latRad);
+  var cLat: f64 := CosF64(origin.latRad);
+  var sLon: f64 := SinF64(origin.lonRad);
+  var cLon: f64 := CosF64(origin.lonRad);
+  return V3New(0.0 - sLon * d.x + cLon * d.y,
+               0.0 - sLat * cLon * d.x - sLat * sLon * d.y + cLat * d.z,
+               cLat * cLon * d.x + cLat * sLon * d.y + sLat * d.z);
+}
+
+pub fn EnuToEcef(e: Ellipsoid, origin: Geodetic, enu: V3): V3 {
+  var sLat: f64 := SinF64(origin.latRad);
+  var cLat: f64 := CosF64(origin.latRad);
+  var sLon: f64 := SinF64(origin.lonRad);
+  var cLon: f64 := CosF64(origin.lonRad);
+  var d: V3 := V3New(0.0 - sLon * enu.x - sLat * cLon * enu.y + cLat * cLon * enu.z,
+                     cLon * enu.x - sLat * sLon * enu.y + cLat * sLon * enu.z,
+                     cLat * enu.y + sLat * enu.z);
+  return V3Add(GeodToEcef(e, origin), d);
+}
+
+// NED: x = Nord, y = Ost, z = UNTEN. Die dritte Achse zeigt in die
+// GEGENRICHTUNG zu ENU — ein Steigflug hat hier ein NEGATIVES z.
+pub fn EcefToNed(e: Ellipsoid, origin: Geodetic, p: V3): V3 {
+  var enu: V3 := EcefToEnu(e, origin, p);
+  return V3New(enu.y, enu.x, 0.0 - enu.z);
+}
+
+pub fn NedToEcef(e: Ellipsoid, origin: Geodetic, ned: V3): V3 {
+  return EnuToEcef(e, origin, V3New(ned.y, ned.x, 0.0 - ned.z));
+}
+
+// Umrechnung zwischen den beiden lokalen Systemen — der Vorzeichenwechsel an
+// EINER Stelle statt an jeder Aufrufstelle.
+pub fn EnuToNed(enu: V3): V3 { return V3New(enu.y, enu.x, 0.0 - enu.z); }
+pub fn NedToEnu(ned: V3): V3 { return V3New(ned.y, ned.x, 0.0 - ned.z); }
+
+// ── Sichtlinie ─────────────────────────────────────────────────────────────
+
+// Azimut eines ENU-Vektors: von Nord über Ost, im Bogenmaß, in [0, 2π).
+//
+// ACHTUNG bei GENAU Nord: die Ost-Komponente wird durch die Drehung nicht
+// exakt null, sondern etwa −1e-13. `atan2` liefert dafür einen winzig
+// negativen Winkel, und das Umwickeln macht daraus 2π — also 359,999…° statt
+// 0°. Das ist derselbe Kurs, sieht aber nicht danach aus.
+//
+// Bewusst NICHT weggerundet: eine Schranke, ab der ein Azimut "eigentlich
+// null" ist, wäre willkürlich und würde bei einem echten Kurs von 359,9999°
+// falsch zuschlagen. Wer auf Nordkurs prüft, vergleicht den Kurs als WINKEL
+// (etwa über cos/sin oder eine Differenz modulo 2π) und nicht die Zahl.
+pub fn EnuAzimuth(enu: V3): f64 {
+  var a: f64 := Atan2F64(enu.x, enu.y);      // Ost über Nord
+  if (a < 0.0) { a := a + 2.0 * Pi(); }
+  return a;
+}
+
+// Elevation über der lokalen Horizontebene, im Bogenmaß.
+pub fn EnuElevation(enu: V3): f64 {
+  var rho: f64 := SqrtF64(enu.x * enu.x + enu.y * enu.y);
+  return Atan2F64(enu.z, rho);
+}
+
+// Schrägentfernung — der schlichte Betrag.
+pub fn EnuSlantRange(enu: V3): f64 { return V3Norm(enu); }
