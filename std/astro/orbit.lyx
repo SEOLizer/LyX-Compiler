@@ -524,3 +524,245 @@ pub fn AApsidalDrift(mu: f64, j2: f64, rBody: f64,
   var c: f64 := CosF64(inc);
   return 0.75 * n * j2 * q * q * (5.0 * c * c - 1.0);
 }
+
+// ── Wiederholbahnen (#1993) ───────────────────────────────────────────────
+//
+// Eine Wiederholbahn erfuellt: nach k Umlaeufen und m Tagen liegt die
+// Bodenspur wieder gleich. Das ist die Auslegungsgrundlage jedes
+// Erdbeobachters mit festem Wiederbesuchszyklus — Sentinel-2 fliegt 143
+// Umlaeufe in 10 Tagen, Landsat-8 233 in 16.
+//
+// Der Bestand konnte die Bedingung schon PRUEFEN: zu gegebener Halbachse
+// fielen Umlaufzeit und Knotendrift heraus. Er konnte sie nicht AUFLOESEN —
+// zu gegebenem Zyklus die Halbachse. Genau dieser Unterschied ist es, der
+// eine Bahn auslegbar macht statt nur nachrechenbar.
+
+// DRAKONITISCHE UMLAUFZEIT [s] — von Knoten zu Knoten, nicht von Punkt zu
+// Punkt im Raum.
+//
+//   T_nodal = 2*pi / (n + domega/dt + dM/dt)
+//
+// Sie unterscheidet sich von APeriod, weil der aufsteigende Knoten selbst
+// wandert. Fuer die Bodenspur ist SIE die richtige Groesse, nicht die
+// keplersche Periode: eine Bodenspur wiederholt sich relativ zum Knoten.
+// Bei der ISS sind es rund 6 Sekunden Unterschied — klein, aber ueber 143
+// Umlaeufe wird daraus mehr als ein halbes Grad Laenge.
+pub fn ANodalPeriod(mu: f64, j2: f64, rBody: f64,
+                    a: f64, e: f64, inc: f64): f64 {
+  if (a <= 0.0 || rBody <= 0.0 || mu <= 0.0) { return AError(); }
+  if (e < 0.0 || e >= 1.0) { return AError(); }
+  var n: f64 := SqrtF64(mu / (a * a * a));
+  var p: f64 := a * (1.0 - e * e);
+  if (p <= 0.0) { return AError(); }
+  var q: f64 := rBody / p;
+  var c: f64 := CosF64(inc);
+  // Apsidendrift plus die J2-Korrektur der mittleren Anomalie. Beide zusammen
+  // ergeben die Rate, mit der der Satellit zum Knoten zurueckkehrt.
+  var dArg: f64 := 0.75 * n * j2 * q * q * (5.0 * c * c - 1.0);
+  var dM:   f64 := 0.75 * n * j2 * q * q * SqrtF64(1.0 - e * e)
+                   * (3.0 * c * c - 1.0);
+  var rate: f64 := n + dArg + dM;
+  if (rate <= 0.0) { return AError(); }
+  return 2.0 * Pi() / rate;
+}
+
+// WIEDERHOLZYKLUS zu gegebener Bahn — die leichte Richtung.
+//
+//   k/m = 2*pi / (T_nodal * (omega_erde - dRAAN/dt))
+//
+// Liefert das Verhaeltnis Umlaeufe je Knotentag als Bruchzahl. Ganzzahlig
+// ist es nur fuer eine echte Wiederholbahn; der Abstand zur naechsten
+// ganzen Zahl sagt, wie weit die Bahn danebenliegt.
+//
+// Diese Funktion steht nicht der Vollstaendigkeit halber da: sie ist die
+// GEGENPROBE zur auf loesenden Richtung unten. Eine der beiden allein waere
+// blind fuer einen Faktorfehler, der in beide Formeln gleich eingeht.
+pub fn ARepeatCycleFromSma(mu: f64, j2: f64, rBody: f64, omegaBody: f64,
+                           a: f64, e: f64, inc: f64): f64 {
+  var tn: f64 := ANodalPeriod(mu, j2, rBody, a, e, inc);
+  if (AIsError(tn)) { return tn; }
+  var dr: f64 := ANodalDrift(mu, j2, rBody, a, e, inc);
+  if (AIsError(dr)) { return dr; }
+  var rel: f64 := omegaBody - dr;
+  if (rel == 0.0) { return AError(); }
+  return 2.0 * Pi() / (tn * rel);
+}
+
+// HALBACHSE zu gegebenem Zyklus — die aufloesende Richtung, die fehlte.
+//
+// Die Gleichung laesst sich nicht nach a umstellen: a steckt in der
+// Umlaufzeit UND in der Knotendrift, und beide mit verschiedenen Potenzen.
+// Geloest wird deshalb per Fixpunkt ueber die keplersche Naeherung:
+//
+//   T_soll = 2*pi / (k/m * (omega - dRAAN/dt))   →   a aus dem 3. Gesetz
+//
+// Der Startwert kommt aus derselben Rechnung ohne Drift. Die Iteration
+// konvergiert schnell, weil die Drift einen Beitrag von unter einem Prozent
+// leistet; 60 Schritte sind reichlich, und der Abbruch geschieht ueber die
+// Aenderung, nicht ueber die Schrittzahl.
+pub fn ASmaFromRepeatCycle(mu: f64, j2: f64, rBody: f64, omegaBody: f64,
+                           k: f64, m: f64, e: f64, inc: f64): f64 {
+  if (k <= 0.0 || m <= 0.0) { return AError(); }
+  if (mu <= 0.0 || rBody <= 0.0) { return AError(); }
+  if (e < 0.0 || e >= 1.0) { return AError(); }
+  var q: f64 := k / m;                       // Umlaeufe je Knotentag
+  // Startwert ohne Drift: die Erde dreht, die Bahnebene steht.
+  if (omegaBody <= 0.0) { return AError(); }
+  var t0: f64 := 2.0 * Pi() / (q * omegaBody);
+  var a: f64 := ASemiMajorFromPeriod(mu, t0);
+  if (AIsError(a)) { return a; }
+  var i: int64 := 0;
+  while (i < 60) {
+    var dr: f64 := ANodalDrift(mu, j2, rBody, a, e, inc);
+    if (AIsError(dr)) { return dr; }
+    var rel: f64 := omegaBody - dr;
+    if (rel <= 0.0) { return AError(); }
+    // Gesuchte drakonitische Umlaufzeit bei dieser Drift.
+    var tn: f64 := 2.0 * Pi() / (q * rel);
+    // Aus ihr die Halbachse. ANodalPeriod ist gegenueber APeriod um den
+    // J2-Anteil verschoben; dieser Faktor traegt ihn nach.
+    var aNeu: f64 := ASemiMajorFromPeriod(mu, tn);
+    if (AIsError(aNeu)) { return aNeu; }
+    var kepler: f64 := APeriod(mu, aNeu);
+    var nodal:  f64 := ANodalPeriod(mu, j2, rBody, aNeu, e, inc);
+    if (AIsError(nodal) || nodal <= 0.0) { return AError(); }
+    aNeu := ASemiMajorFromPeriod(mu, tn * kepler / nodal);
+    if (AIsError(aNeu)) { return aNeu; }
+    var d: f64 := aNeu - a;
+    if (d < 0.0) { d := 0.0 - d; }
+    a := aNeu;
+    if (d < 0.000001) { return a; }          // unter einem Mikrometer
+    i := i + 1;
+  }
+  return a;
+}
+
+// ── Bahnverfall durch Restatmosphaere (#1994) ─────────────────────────────
+//
+// Wie lange bleibt ein Satellit oben? Die Frage hinter jeder LEO-Auslegung
+// und hinter der Entsorgungsregel von 25 Jahren.
+//
+// ZUSCHNITT: die Dichte kommt als PARAMETER herein, nicht als Modell. Der
+// Grund ist die Abhaengigkeitsrichtung — std.astro.entry traegt mit
+// AAtmosEarth und ADensity bereits Atmosphaerenmodelle, aber orbit soll nicht
+// auf entry zeigen. Wer ein Modell hat, wertet es aus und reicht die Zahl
+// durch; die Rechnung hier ist dieselbe.
+
+// ABNAHME DER HALBACHSE JE UMLAUF [m], nahezu kreisfoermige Bahn:
+//
+//   da = -2*pi * a^2 * rho / beta        mit beta = m / (C_D * A)
+//
+// Das Ergebnis ist NEGATIV — die Bahn sinkt. Ein positiver Rueckgabewert
+// waere hier ein Fehler und keine Auslegungsfrage.
+pub fn ADecayPerRev(rho: f64, ballisticCoeff: f64, a: f64): f64 {
+  if (a <= 0.0 || ballisticCoeff <= 0.0) { return AError(); }
+  if (rho < 0.0) { return AError(); }
+  return 0.0 - 2.0 * Pi() * a * a * rho / ballisticCoeff;
+}
+
+// Dieselbe Groesse als Rate [m/s] — die Abnahme je Umlauf, geteilt durch die
+// Umlaufzeit.
+pub fn ADecayRate(mu: f64, rho: f64, ballisticCoeff: f64, a: f64): f64 {
+  var d: f64 := ADecayPerRev(rho, ballisticCoeff, a);
+  if (AIsError(d)) { return d; }
+  var t: f64 := APeriod(mu, a);
+  if (AIsError(t) || t <= 0.0) { return AError(); }
+  return d / t;
+}
+
+// RESTLEBENSDAUER [s] bis zur Zielhoehe, mit exponentieller Atmosphaere.
+//
+// Die Dichte faellt mit der Skalenhoehe H:  rho(h) = rho0 * exp(-(h-h0)/H).
+// Integriert wird schrittweise ueber die Halbachse, weil die Dichte selbst
+// von ihr abhaengt und der Verfall sich dadurch beschleunigt — eine
+// geschlossene Loesung gibt es nur fuer konstante Dichte, und die ist hier
+// gerade falsch.
+//
+// FEHLERWERT: 0 ist eine GUELTIGE Lebensdauer — die Bahn liegt schon auf oder
+// unter der Zielhoehe. Der Sentinel muss deshalb ausserhalb des Wertebereichs
+// liegen und ist AError(), nicht 0.
+pub fn AOrbitalLifetime(mu: f64, rBody: f64, ballisticCoeff: f64,
+                        rho0: f64, h0: f64, scaleHeight: f64,
+                        a0: f64, aEnd: f64): f64 {
+  if (mu <= 0.0 || rBody <= 0.0 || ballisticCoeff <= 0.0) { return AError(); }
+  if (rho0 <= 0.0 || scaleHeight <= 0.0) { return AError(); }
+  if (a0 <= 0.0 || aEnd <= 0.0) { return AError(); }
+  if (aEnd > a0) { return AError(); }          // Ziel ueber der Bahn
+  if (a0 == aEnd) { return 0.0; }              // gueltig, nicht Fehler
+  var a: f64 := a0;
+  var t: f64 := 0.0;
+  var schritte: int64 := 0;
+  // Schrittweite: ein Tausendstel der zu durchlaufenden Strecke, nach unten
+  // auf einen Meter begrenzt. Die Zahl der Schritte ist gedeckelt, damit eine
+  // sehr hohe Bahn nicht in eine unbegrenzte Schleife laeuft.
+  var spanne: f64 := a0 - aEnd;
+  var dz: f64 := spanne / 1000.0;
+  if (dz < 1.0) { dz := 1.0; }
+  while (a > aEnd && schritte < 2000000) {
+    var h: f64 := a - rBody;
+    var rho: f64 := rho0 * ExpF64(0.0 - (h - h0) / scaleHeight);
+    var rate: f64 := ADecayRate(mu, rho, ballisticCoeff, a);
+    if (AIsError(rate)) { return rate; }
+    if (rate >= 0.0) { return AError(); }      // keine Bremsung, kein Verfall
+    var schritt: f64 := dz;
+    if (a - schritt < aEnd) { schritt := a - aEnd; }
+    t := t + schritt / (0.0 - rate);
+    a := a - schritt;
+    schritte := schritte + 1;
+  }
+  if (a > aEnd) { return AError(); }           // Deckel erreicht, kein Ergebnis
+  return t;
+}
+
+// ── Frozen Orbits (#1996) ─────────────────────────────────────────────────
+//
+// Eine eingefrorene Bahn haelt Exzentrizitaet und Perigaeumsargument
+// gegenseitig fest, sodass die Flughoehe ueber einer gegebenen Breite ueber
+// Jahre konstant bleibt — die Voraussetzung fuer vergleichbare Messreihen.
+// Jede Altimetriemission fliegt so.
+//
+// J2 allein reicht dafuer NICHT: es erzeugt die Apsidendrift, aber nichts,
+// was sie zum Stehen bringt. Das Gleichgewicht kommt aus dem ungeraden Glied
+// J3, der leichten Birnenform der Erde.
+
+// J3 der Erde (EGM96). Das VORZEICHEN ist hier tragend, nicht kosmetisch: es
+// entscheidet, ueber welchem Pol das Perigaeum steht. Negativ heisst Norden.
+pub fn AJ3Earth(): f64 { return 0.0 - 0.000002532; }
+
+// Das Perigaeumsargument einer eingefrorenen Bahn: 90 Grad, das Perigaeum
+// steht ueber dem Nordpol. Als benannte Groesse und nicht als Kommentar,
+// damit ein Programm die Bedingung aussprechen kann.
+pub fn AFrozenArgPerigee(): f64 { return Pi() / 2.0; }
+
+// EINGEFRORENE EXZENTRIZITAET:
+//
+//   e = -(J3 / (2*J2)) * (R/a) * sin(i)
+//
+// Mit negativem J3 wird sie positiv. Fuer eine sonnensynchrone Bahn in rund
+// 800 km Hoehe kommen gut 0.001 heraus — die Groessenordnung, in der ERS,
+// Envisat und Sentinel-3 fliegen.
+pub fn AFrozenEccentricity(j2: f64, j3: f64, rBody: f64,
+                           a: f64, inc: f64): f64 {
+  if (a <= 0.0 || rBody <= 0.0) { return AError(); }
+  if (j2 == 0.0) { return AError(); }
+  return 0.0 - (j3 / (2.0 * j2)) * (rBody / a) * SinF64(inc);
+}
+
+// Liegt eine gegebene Bahn innerhalb der Toleranz eingefroren?
+//
+// Geprueft werden BEIDE Bedingungen — die Exzentrizitaet und das
+// Perigaeumsargument. Nur eine von beiden zu pruefen waere auch von einer
+// Bahn erfuellt, deren Perigaeum am Aequator steht und die deshalb gerade
+// nicht eingefroren ist.
+pub fn AIsFrozen(j2: f64, j3: f64, rBody: f64, a: f64, e: f64,
+                 inc: f64, argP: f64, toleranz: f64): bool {
+  if (toleranz < 0.0) { return false; }
+  var eSoll: f64 := AFrozenEccentricity(j2, j3, rBody, a, inc);
+  if (AIsError(eSoll)) { return false; }
+  var de: f64 := e - eSoll;
+  if (de < 0.0) { de := 0.0 - de; }
+  if (de > toleranz) { return false; }
+  var dw: f64 := argP - AFrozenArgPerigee();
+  if (dw < 0.0) { dw := 0.0 - dw; }
+  return dw <= toleranz;
+}
