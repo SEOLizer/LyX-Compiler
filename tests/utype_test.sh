@@ -488,6 +488,115 @@ fn main(): int64 {
     return t as int64;
 }" ''
 
+# ── #1956: der Umrechnungsfaktor wirkte nur bei der Zuweisung ─────────────
+#
+# `500 m + 1 km` ergab 501: die Werte wurden roh addiert, als truegen beide
+# denselben Faktor — unabhaengig vom Zieltyp. Der Fall faellt nicht auf, weil
+# das Ergebnis eine plausible Zahl ist und der Typ sogar stimmt. Genau die
+# Fehlerklasse, gegen die Einheitentypen antreten.
+#
+# Vergleiche waren noch weiter offen: sie wurden von _checkUtypeBinop gar
+# nicht erfasst (nur + und -), also weder umgerechnet NOCH dimensionsgeprueft.
+D3='import std.io;
+dim L;
+dim Z;
+utype M: L = 1.0;
+utype KM: L = 1000.0;
+utype Sek: Z = 1.0;'
+
+# Der WERT wird gemessen, nicht die Uebersetzbarkeit: 500 m + 1 km sind
+# 1500 m, und in Kilometern 1.5 — nicht 501.
+out "#1956: Addition rechnet den Faktor um (in m)" "$D3
+fn main(): int64 {
+    var a: M := 500;
+    var b: KM := 1;
+    var s: M := a + b;
+    PrintLn(FloatToStr(s as f64, 1));
+    return 0;
+}" '1500.0'
+
+# Und das Ergebnis traegt die Einheit der LINKEN Seite, sodass die ZUWEISUNG
+# es weiterrechnet. Ohne diese Haelfte blieb die Summe bei 1500 stehen, obwohl
+# das Ziel Kilometer waren.
+out "#1956: das Ergebnis wird beim Zuweisen weiter umgerechnet" "$D3
+fn main(): int64 {
+    var a: M := 500;
+    var b: KM := 1;
+    var s: KM := a + b;
+    PrintLn(FloatToStr(s as f64, 3));
+    return 0;
+}" '1.500'
+
+out "#1956: Subtraktion ebenso" "$D3
+fn main(): int64 {
+    var a: M := 500;
+    var b: KM := 1;
+    var d: M := b - a;
+    PrintLn(FloatToStr(d as f64, 1));
+    return 0;
+}" '500.0'
+
+# Der Vergleich. Die Probe des Issues: mit rohen Zahlen kann er gar nicht
+# anders ausgehen, solange der Faktor fehlt.
+out "#1956: Vergleich rechnet den Faktor um" "$D3
+fn main(): int64 {
+    var a: M := 500;
+    var b: KM := 1;
+    if (a > b) { PrintLn(\"500m > 1km\"); } else { PrintLn(\"500m <= 1km\"); }
+    return 0;
+}" '500m <= 1km'
+
+# Gleichheit ueber verschiedene Faktoren: 1000 m sind 1 km. Ein roher
+# Vergleich haette hier "ungleich" gesagt.
+out "#1956: 1000 m und 1 km sind gleich" "$D3
+fn main(): int64 {
+    var a: M := 1000;
+    var b: KM := 1;
+    if (a == b) { PrintLn(\"gleich\"); } else { PrintLn(\"ungleich\"); }
+    return 0;
+}" 'gleich'
+
+# Der Vergleich ueber DIMENSIONSGRENZEN war bis 1.2.4B ueberhaupt nicht
+# geprueft — _checkUtypeBinop sah nur + und -.
+rejects "#1956: Vergleich ueber die Dimensionsgrenze wird gemeldet" "$D3
+fn main(): int64 {
+    var a: M := 5;
+    var t: Sek := 3;
+    if (a > t) { return 1; }
+    return 0;
+}" "verschiedener Dimension verglichen"
+
+# GEGENPROBE 1: der Vorzeichentest gegen eine nackte Zahl bleibt erlaubt.
+# Ihn abzuweisen waere eine Verschaerfung ohne Befund — `a > 0` ist im
+# Bestand ueberall ueblich und sagt nichts Falsches.
+out "#1956: Vergleich gegen eine nackte Zahl bleibt erlaubt" "$D3
+fn main(): int64 {
+    var a: M := 5;
+    if (a > 0) { PrintLn(\"positiv\"); }
+    return 0;
+}" 'positiv'
+
+# GEGENPROBE 2: gleiche Einheit heisst KEINE Rechnung. Ohne sie waere der
+# Test auch von einer Fassung erfuellt, die irgendeinen Faktor anbringt.
+out "#1956: gleiche Einheit bleibt unveraendert" "$D3
+fn main(): int64 {
+    var a: M := 300;
+    var b: M := 200;
+    var s: M := a + b;
+    PrintLn(FloatToStr(s as f64, 1));
+    return 0;
+}" '500.0'
+
+# GEGENPROBE 3: Skalierung mit einer dimensionslosen Zahl behaelt die Einheit
+# und bringt keinen Faktor an.
+out "#1956: Skalierung bleibt unberuehrt" "$D3
+fn main(): int64 {
+    var a: KM := 2;
+    var e: KM := a * 3;
+    PrintLn(FloatToStr(e as f64, 1));
+    return 0;
+}" '6.0'
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 test "$FAIL" -eq 0
