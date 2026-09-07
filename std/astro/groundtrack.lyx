@@ -1,0 +1,151 @@
+// std/astro/groundtrack.lyx
+// Bodenspur: vom Inertialsystem auf die drehende Erde.
+//
+// Diese Unit schliesst ein einzelnes Glied. Vorne liegt std.astro.state mit
+// dem Ortsvektor im ECI, hinten liegt std.geodesy.frames mit EcefToGeod und
+// EcefToEnu — dazwischen fehlte die Drehung um den Greenwich-Stundenwinkel
+// (#1995). Sie ist der ganze Unterschied zwischen den beiden Rahmen.
+//
+// ZUSCHNITT: eigene Unit, nicht ein Anbau an std.astro.orbit. Der Grund ist
+// die ZEITACHSE. Alles in orbit.lyx rechnet zeitlos — eine Bahn hat eine
+// Periode, aber keinen Zeitpunkt. Sobald ein Datum ins Spiel kommt, ist das
+// eine andere Art von Rechnung, und sie gehoert nicht in dieselbe Unit.
+//
+// ABHAENGIGKEITSRICHTUNG: diese Unit zeigt NICHT auf std.geodesy. Sie liefert
+// den Unterpunkt geozentrisch (Kugel) und den ECEF-Vektor; wer die
+// geodaetische Breite auf dem Ellipsoid braucht, verkettet selbst mit
+// EcefToGeod. Der Unterschied ist nicht klein — bis zu 0.19 Grad in mittleren
+// Breiten —, aber die Wahl gehoert dem Aufrufer, und eine Abhaengigkeit von
+// std.astro auf std.geodesy waere fuer eine Drehung um die z-Achse zu teuer.
+//
+// Einheiten SI: Meter, Sekunden, Radiant. Zeitpunkte als julianisches Datum.
+
+@description("Bodenspur: ECI/ECEF-Drehung, Unterpunkt, Laengenversatz")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.astro.groundtrack;
+
+import std.math;
+import std.astro.state;
+import std.astro.orbit;
+import std.astro.launch;
+
+// ── Zeit ──────────────────────────────────────────────────────────────────
+
+// Julianisches Datum der Epoche J2000.0 — 1. Januar 2000, 12:00 TT.
+pub fn AJ2000(): f64 { return 2451545.0; }
+
+// Julianische Jahrhunderte seit J2000.0.
+pub fn AJulianCenturies(jd: f64): f64 { return (jd - AJ2000()) / 36525.0; }
+
+// GREENWICH MEAN SIDEREAL TIME [rad].
+//
+//   GMST = 280.46061837 + 360.98564736629 * (JD - J2000)
+//                       + 0.000387933 * T^2  -  T^3 / 38710000     [Grad]
+//
+// Die Reihe stammt aus IAU 1982, nicht aus einem eigenen Fit. Der lineare
+// Term traegt fast alles; die beiden hinteren fangen die Verlangsamung der
+// Erddrehung ueber Jahrhunderte auf.
+//
+// Der Wert wird auf [0, 2*pi) gefaltet. Ohne das Falten waechst er
+// unbeschraenkt und verliert bei fernen Daten seine hinteren Stellen —
+// f64 traegt rund 16, und 360.98 * 40000 Tage sind schon 7 davon.
+pub fn AGmst(jd: f64): f64 {
+  var d: f64 := jd - AJ2000();
+  var t: f64 := AJulianCenturies(jd);
+  var g: f64 := 280.46061837 + 360.98564736629 * d
+              + 0.000387933 * t * t
+              - t * t * t / 38710000.0;
+  // Auf [0,360) falten. Ueber FloorF64 und nicht ueber einen Cast nach
+  // int64: der rundet bei negativen Werten zur Null hin, und genau die
+  // treten vor J2000 auf.
+  var u: f64 := g / 360.0;
+  return (u - FloorF64(u)) * 2.0 * Pi();
+}
+
+// ── Die Drehung ───────────────────────────────────────────────────────────
+//
+// ECI und ECEF unterscheiden sich um EINE Drehung um die gemeinsame z-Achse
+// mit dem Winkel GMST. Praezession, Nutation und Polbewegung bleiben aussen
+// vor; fuer eine Bodenspur liegen sie unter der Strichbreite.
+//
+//   x_ecef =  x_eci*cos(g) + y_eci*sin(g)
+//   y_ecef = -x_eci*sin(g) + y_eci*cos(g)
+//   z_ecef =  z_eci
+pub fn AEciToEcef(v: AVec3, gmst: f64): AVec3 {
+  var c: f64 := CosF64(gmst);
+  var s: f64 := SinF64(gmst);
+  return AVec(v.x * c + v.y * s, 0.0 - v.x * s + v.y * c, v.z);
+}
+
+// Die Rueckdrehung — dasselbe mit umgekehrtem Vorzeichen des Winkels.
+// Sie steht hier nicht der Vollstaendigkeit halber: der Rundlauf durch beide
+// ist die Pruefung, die einen Vorzeichenfehler in der Drehung faengt.
+pub fn AEcefToEci(v: AVec3, gmst: f64): AVec3 {
+  var c: f64 := CosF64(gmst);
+  var s: f64 := SinF64(gmst);
+  return AVec(v.x * c - v.y * s, v.x * s + v.y * c, v.z);
+}
+
+// ── Unterpunkt ────────────────────────────────────────────────────────────
+
+// GEOZENTRISCHE BREITE des Unterpunkts [rad], aus einem ECI-Vektor.
+//
+// Geozentrisch heisst: der Winkel am Erdmittelpunkt, die Erde als Kugel.
+// Die geodaetische Breite auf dem Ellipsoid weicht davon ab — in 45 Grad
+// Breite um rund 0.19 Grad, das sind gut 21 km auf dem Boden. Wer sie
+// braucht, nimmt EcefToGeod aus std.geodesy.frames auf das Ergebnis von
+// AEciToEcef; siehe der Kopf dieser Unit.
+pub fn ASubPointLatitude(v: AVec3): f64 {
+  var xy: f64 := SqrtF64(v.x * v.x + v.y * v.y);
+  if (xy == 0.0 && v.z == 0.0) { return AError(); }
+  return Atan2F64(v.z, xy);
+}
+
+// LAENGE des Unterpunkts [rad], gefaltet auf (-pi, pi].
+// Die Drehung muss hier passieren, nicht beim Aufrufer: die Laenge ist die
+// einzige der drei Groessen, die ueberhaupt vom Zeitpunkt abhaengt.
+pub fn ASubPointLongitude(v: AVec3, gmst: f64): f64 {
+  var e: AVec3 := AEciToEcef(v, gmst);
+  if (e.x == 0.0 && e.y == 0.0) { return AError(); }
+  return Atan2F64(e.y, e.x);
+}
+
+// HOEHE ueber der Kugel mit dem gegebenen Radius [m].
+pub fn ASubPointAltitude(v: AVec3, rBody: f64): f64 {
+  if (rBody <= 0.0) { return AError(); }
+  return AMagnitude(v) - rBody;
+}
+
+// ── Laengenversatz je Umlauf ──────────────────────────────────────────────
+
+// Wieviel weiter westlich liegt die Bodenspur nach einem Umlauf? [rad]
+//
+//   dLambda = -(omega_erde - dRAAN/dt) * T_nodal
+//
+// Waehrend der Satellit einen Umlauf braucht, dreht sich die Erde unter ihm
+// weg — abzueglich dessen, was die Bahnebene selbst mitwandert. Das Ergebnis
+// ist negativ: die Spur wandert nach WESTEN. Bei einer Bahn, die schneller
+// nach Osten wandert als die Erde dreht, kehrt sich das um; deshalb steht
+// hier kein Betrag.
+//
+// Diese Groesse ist zugleich die Bruecke zu den Wiederholbahnen (#1993):
+// eine Bahn wiederholt sich genau dann, wenn ein ganzzahliges Vielfaches
+// dieses Versatzes ein ganzzahliges Vielfaches des Vollkreises ist.
+pub fn AGroundTrackShift(mu: f64, j2: f64, rBody: f64, omegaBody: f64,
+                         a: f64, e: f64, inc: f64): f64 {
+  var tn: f64 := ANodalPeriod(mu, j2, rBody, a, e, inc);
+  if (AIsError(tn)) { return tn; }
+  var dr: f64 := ANodalDrift(mu, j2, rBody, a, e, inc);
+  if (AIsError(dr)) { return dr; }
+  return 0.0 - (omegaBody - dr) * tn;
+}
+
+// Derselbe Versatz in Metern auf dem Aequator — die Groesse, in der
+// Streifenbreiten von Erdbeobachtern angegeben werden.
+pub fn AGroundTrackShiftEquator(mu: f64, j2: f64, rBody: f64, omegaBody: f64,
+                                a: f64, e: f64, inc: f64): f64 {
+  var d: f64 := AGroundTrackShift(mu, j2, rBody, omegaBody, a, e, inc);
+  if (AIsError(d)) { return d; }
+  return d * rBody;
+}
