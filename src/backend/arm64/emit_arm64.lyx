@@ -1299,6 +1299,73 @@ pub type EmitARM64 = class {
       self.emit32(0x34000063);  // CBZ w3, +3 (→ ENDE)
       self.emit32(0x91000400);  // ADD x0,x0,#1
       self.emit32(0x17FFFFFD);  // B -3 (→ LOOP)
+    } else if id == 7 {
+      // #2028: StrConcat(a, b) — beide Ketten in frischen Speicher kopieren.
+      //
+      // Fehlte im LINUX-Zweig ganz; der Windows-Zweig daneben hat sie seit
+      // WP-01 (wab_strconcat). Jedes Programm mit Zeichenkettenverkettung war
+      // damit fuer arm64 unbaubar — nach PrintLn das meistbenutzte Builtin.
+      //
+      // Der Puffer kommt aus mmap: der Zeiger muss den Aufruf ueberleben, und
+      // einen Allokator hat das Backend nicht. Dieselbe Ueberlegung wie bei
+      // StrSub (6) und IntToStr (16) daneben.
+      //
+      // Der x86-Weg gibt seit #1980 aus einem Bump-Block aus, weil ein mmap je
+      // Verkettung mindestens eine SEITE belegt — 4096 Byte fuer elf Zeichen,
+      // und nie zurueckgegeben. Das gilt hier genauso; ein Bump-Block fuer die
+      // IR-Backends beträfe aber StrSub und IntToStr mit und ist deshalb ein
+      // eigenes Paket, kein Nebenher-Umbau in diesem.
+      // #2028: aus dem HOHEN Argumentblock lesen (argBase), nicht aus den
+      // festen Slots 0/1. Mit festen Slots ueberschrieb ein verschachtelter
+      // Aufruf die Argumente des aeusseren — `StrConcat(StrConcat("a","b"),
+      // StrConcat("c","d"))` ergab "ccd" statt "abcd".
+      var cnB: int64 := argBase;
+      if (cnB < 0) { cnB := 0; }
+      self.emitLdur(ARM64_X9,  ARM64_X29, self.slotOff(cnB));       // x9  = a
+      self.emitLdur(ARM64_X10, ARM64_X29, self.slotOff(cnB + 1));   // x10 = b
+      // Laenge von a → x11
+      self.emit32(0xD280000B);  // MOVZ x11, #0
+      self.emit32(0x386B6923);  // [L1] LDRB w3,[x9,x11]
+      self.emit32(0x34000063);  // CBZ w3, +3 (→ L1ENDE)
+      self.emit32(0x9100056B);  // ADD x11,x11,#1
+      self.emit32(0x17FFFFFD);  // B -3 (→ L1)
+      // Laenge von b → x12
+      self.emit32(0xD280000C);  // [L1ENDE] MOVZ x12, #0
+      self.emit32(0x386C6943);  // [L2] LDRB w3,[x10,x12]
+      self.emit32(0x34000063);  // CBZ w3, +3 (→ L2ENDE)
+      self.emit32(0x9100058C);  // ADD x12,x12,#1
+      self.emit32(0x17FFFFFD);  // B -3 (→ L2)
+      // Groesse = la + lb + 16 (Reserve wie bei StrSub) → x1
+      self.emit32(0x8B0C0161);  // [L2ENDE] ADD x1, x11, x12
+      self.emit32(0x91004021);  // ADD x1, x1, #16
+      self.emitMovImmReg(ARM64_X0, 0);
+      self.emitMovImmReg(ARM64_X2, 3);      // PROT_READ|PROT_WRITE
+      self.emitMovImmReg(ARM64_X3, 0x22);   // MAP_PRIVATE|MAP_ANON
+      self.emit32(0x92800004);              // MOVN x4, #0   (fd = -1)
+      self.emitMovImmReg(ARM64_X5, 0);
+      self.emitMovImmReg(ARM64_X8, SYS_MMAP);
+      self.emit32(0xD4000001);              // SVC #0 → x0 = Puffer
+      // a kopieren: bis zum Nullbyte, Ziel = Puffer + i
+      self.emit32(0xD280000D);  // MOVZ x13, #0
+      self.emit32(0x386D6923);  // [L3] LDRB w3,[x9,x13]
+      self.emit32(0x340000A3);  // CBZ w3, +5 (→ L3ENDE)
+      self.emit32(0x8B0D0002);  // ADD x2, x0, x13
+      self.emit32(0x39000043);  // STRB w3,[x2]
+      self.emit32(0x910005AD);  // ADD x13,x13,#1
+      self.emit32(0x17FFFFFB);  // B -5 (→ L3)
+      // b kopieren: Ziel = Puffer + la + j
+      self.emit32(0xD280000E);  // [L3ENDE] MOVZ x14, #0
+      self.emit32(0x386E6943);  // [L4] LDRB w3,[x10,x14]
+      self.emit32(0x340000C3);  // CBZ w3, +6 (→ L4ENDE)
+      self.emit32(0x8B0B0002);  // ADD x2, x0, x11
+      self.emit32(0x8B0E0042);  // ADD x2, x2, x14
+      self.emit32(0x39000043);  // STRB w3,[x2]
+      self.emit32(0x910005CE);  // ADD x14,x14,#1
+      self.emit32(0x17FFFFFA);  // B -6 (→ L4)
+      // Nullbyte hinter das Ergebnis
+      self.emit32(0x8B0B0002);  // [L4ENDE] ADD x2, x0, x11
+      self.emit32(0x8B0C0042);  // ADD x2, x2, x12
+      self.emit32(0x3900005F);  // STRB wzr,[x2]
     } else if id == 6 {
       // #1388: StrSub(s, start, len) — Teilkette in frischen Speicher kopieren.
       //
