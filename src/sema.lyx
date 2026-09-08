@@ -519,6 +519,9 @@ pub type Sema = class {
   includePath: int64;   // extra include dirs (pchar, ':'-getrennt), 0 = nicht gesetzt
   paketPfade:  int64;   // Projektdatei (*.lpf): "name=pfad:name=pfad", 0 = keine
   stdPath:     int64;  // stdlib root override (pchar), 0 = not set
+  // #2014: Verzeichnisname der Zielarchitektur (pchar), 0 = nicht gesetzt.
+  // Wird der .lyu-Suche vorangestellt; siehe die Stelle im Import.
+  lyuArch:     int64;
 
   // WP-35: actual byte count of the last file read by _sema_readFile (binary-safe, no StrLen)
   lastReadSize: int64;
@@ -2144,7 +2147,59 @@ pub type Sema = class {
       // WP-BC-50b: .lyx not found — try .lyu fallback (pre-compiled unit)
       StrSetChar(pathBuf as pchar, modLen + 3, 117);  // 'x' → 'u' → ".lyu"
       var lyuPath: pchar := pathBuf as pchar;
-      var lyuSrc: pchar := self._sema_readFile(lyuPath);
+      // #2014: ZUERST die architekturspezifische Ablage, dann die alte.
+      //
+      // Sobald eine .lyu Maschinencode traegt (Weg C), gilt sie je
+      // Architektur, und der Paketbaum bekommt eine Ebene dafuer:
+      // `units/<arch>/std/io.lyu`. Gesucht wird deshalb mit einem
+      // vorangestellten Architekturnamen.
+      //
+      // Der Griff ist bewusst klein: _sema_readFile stellt JEDEM seiner
+      // Suchwege die Basis voran (relativ, Paketwurzeln, -I, --std-path,
+      // Installationspfad). Ein architekturpraefigierter RELATIVER Pfad wird
+      // damit in jedem dieser Wege zu `<basis>/<arch>/<pfad>` — eine
+      // Aenderung an einer Stelle deckt alle ab.
+      //
+      // Der Rueckfall auf den alten Pfad ist keine Bequemlichkeit, sondern
+      // Vertraeglichkeit: bestehende Baeume und selbst gebaute .lyu liegen
+      // dort, und solange die .lyu nur BESCHREIBEND ist, ist sie ohnehin
+      // architekturunabhaengig.
+      //
+      // ZUR ARCHITEKTURPRUEFUNG, und das ist die Regel fuer spaeter: der PFAD
+      // ordnet, der KOPF entscheidet. Die Architektur steht seit #1982 im Kopf
+      // der .lyu, und _irUebernehmeLyu prueft sie bereits — stimmt sie nicht,
+      // bleibt das IR unbenutzt.
+      //
+      // Hier wird sie bewusst NICHT geprueft: was sema aus der .lyu liest,
+      // sind Namen und Typen, und die sind architekturunabhaengig. Eine
+      // Ablehnung waere eine Verschaerfung ohne Befund — der Paketbaum traegt
+      // heute ausschliesslich x86_64-Dateien, und ein arm64-Bau, der auf sie
+      // zurueckfaellt, rechnet damit vollkommen richtig.
+      //
+      // Das aendert sich mit dem Objektcode (#2014, Stufe 5). Die Regel lautet
+      // dann, und sie ist aus der DATEI ablesbar statt aus dem Pfad:
+      //
+      //   .lyu OHNE Objektabschnitt -> architekturunabhaengig, Rueckfall gilt
+      //   .lyu MIT  Objektabschnitt -> an die Architektur gebunden, bei
+      //                                Abweichung MELDEN statt zu nehmen
+      //
+      // Wer das umsetzt, prueft das Flagbit des Objektabschnitts und nicht das
+      // Verzeichnis: eine Datei kann am falschen Platz liegen, ihr Kopf luegt
+      // nicht.
+      var lyuSrc: pchar := 0 as pchar;
+      if (self.lyuArch != 0) {
+        var aLen: int64 := StrLen(self.lyuArch as pchar);
+        var pLen: int64 := modLen + 4;
+        var ab: int64 := alloc(aLen + 1 + pLen + 1);
+        var ai: int64 := 0;
+        while (ai < aLen) { poke8(ab + ai, StrCharAt(self.lyuArch as pchar, ai) & 255); ai := ai + 1; }
+        poke8(ab + aLen, 47);                       // '/'
+        var pj: int64 := 0;
+        while (pj < pLen) { poke8(ab + aLen + 1 + pj, StrCharAt(lyuPath, pj) & 255); pj := pj + 1; }
+        poke8(ab + aLen + 1 + pLen, 0);
+        lyuSrc := self._sema_readFile(ab as pchar);
+      }
+      if (lyuSrc == 0 as pchar) { lyuSrc := self._sema_readFile(lyuPath); }
       if (lyuSrc != 0 as pchar) {
         // WP-35: use actual file size (not StrLen) — .lyu is binary and contains null bytes
         if (self.traceImports != 0) {
@@ -8613,6 +8668,7 @@ pub type Sema = class {
     self.includePath := 0;
     self.paketPfade := 0;
     self.stdPath     := 0;
+    self.lyuArch     := 0;   // #2014
     self.lastReadSize := 0;  // WP-35: binary-safe file size
     self.lastReadPath := 0;
     self.traceImports := 0;
