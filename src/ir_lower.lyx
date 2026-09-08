@@ -680,7 +680,14 @@ pub type IRLower = class {
   globalNameBuf: int64;
   globalNameCnt: int64;
   globalNameCap: int64;
-  
+
+  // #2019: Modulkonstanten mit String-Anfangswert. Sie stehen NICHT in
+  // globalNameBuf — ihr Wert ist eine Adresse, kein roher 8-Byte-Wert.
+  // Records: 24 Byte {nameOff (in IR-strBuf), nameLen, strOff}.
+  conStrBuf: int64;
+  conStrCnt: int64;
+  conStrCap: int64;
+
   // Label and temp counters
   labelCount: int64;
   tempCount: int64;
@@ -823,6 +830,9 @@ pub type IRLower = class {
     self.globalNameCap := 32;
     self.globalNameBuf := alloc(32 * 32);
     self.globalNameCnt := 0;
+    self.conStrCap := 16;                 // #2019
+    self.conStrBuf := alloc(16 * 24);
+    self.conStrCnt := 0;
     self.loopExitLabel := -1;
     self.loopContLabel := -1;
     self.curFunc := -1;
@@ -1281,32 +1291,7 @@ pub type IRLower = class {
     // Literal: string constant
     if (k == NK_LIT_STR) {
       var dest: int64 := self.allocTemp();
-      // LYXOS-pchar-fix2: IR-Backends brauchen den Offset im IR-strBuf, NICHT nodeIVal
-      // (= Parser-/Quell-Offset). Sonst zeigt CONST_STR in die Symbol-/Namen-Tabelle
-      // (z. B. "main"). String aus nodeSVal extrahieren, Escapes verarbeiten, in den
-      // IR-strBuf internieren (irAddString null-terminiert → strlen-tauglich).
-      var lsStart:  int64 := (self.nodeSVal(expr) as int64) + 1;  // opening quote überspringen
-      var lsSrcLen: int64 := _irLitLen(self.nodeSVal(expr) as int64, self.nodeSLen(expr));   // #1388
-      if (lsSrcLen < 0) { lsSrcLen := 0; }
-      var lsBuf: int64 := alloc(lsSrcLen + 8);
-      var lsOut: int64 := 0;
-      var lsI:   int64 := 0;
-      while lsI < lsSrcLen {
-        var lsC: int64 := peek8(lsStart + lsI);
-        if lsC == 92 && lsI + 1 < lsSrcLen {       // backslash-Escape
-          var lsN: int64 := peek8(lsStart + lsI + 1);
-          if lsN == 110      { lsC := 10; lsI := lsI + 1; }   // \n
-          else if lsN == 116 { lsC := 9;  lsI := lsI + 1; }   // \t
-          else if lsN == 114 { lsC := 13; lsI := lsI + 1; }   // \r
-          else if lsN == 92  { lsC := 92; lsI := lsI + 1; }   // \\
-          else if lsN == 34  { lsC := 34; lsI := lsI + 1; }   // \"
-          else if lsN == 48  { lsC := 0;  lsI := lsI + 1; }   // \0
-        }
-        poke8(lsBuf + lsOut, lsC);
-        lsOut += 1;
-        lsI += 1;
-      }
-      var strOff: int64 := self.irAddString(lsBuf as pchar, lsOut);
+      var strOff: int64 := self._strLitInternieren(expr);
       self.irAddInstrDirect(IRO_CONST_STR, dest, -1, -1, strOff);
       return dest;
     }
@@ -1418,6 +1403,20 @@ pub type IRLower = class {
             pidx += 1;
           }
           pnode := self.nodeNext(pnode);
+        }
+        // #2019: String-Konstante der Modulebene → ADRESSE der Zeichenkette.
+        //
+        // Vor der Global-Suche: fuer denselben Namen steht dort ein Eintrag
+        // mit Init 0 (siehe die Stelle, die _conStrAdd ruft). Griffe die
+        // Global-Suche zuerst, laege statt der Adresse eine 0 im Temp — ein
+        // Nullzeiger, den erst der Zugriff darauf auffliegen liesse.
+        //
+        // Nach Locals und Params: ein gleichnamiges Local verdeckt die
+        // Konstante, wie ueberall sonst auch.
+        var csOff: int64 := self._conStrFind(idName, idLen);
+        if csOff >= 0 {
+          self.irAddInstrDirect(IRO_CONST_STR, dest, -1, -1, csOff);
+          return dest;
         }
         // WP-AND-upstream-fix v4: globals fallback. The src nameOff stored
         // in globalNameBuf points into the main file's src — which is what
@@ -2403,6 +2402,29 @@ pub type IRLower = class {
       return dest;
     }
 
+    // #2025: Print/PrintLn mit MEHREREN Argumenten kann der IR-Weg nicht —
+    // saemtliche Zweige darunter lesen ausschliesslich arg0.
+    //
+    // Bis 1.2.5C wurde der Rest STILL verschluckt: `Print(a, ".", b)` gab auf
+    // arm64 nur `7` aus statt `7.9`, auf riscv gar nichts, waehrend x86 richtig
+    // lieferte. In std/crt.lyx steht `Print("\x1b[", row, ";", col, "H")` —
+    // dort wurde daraus die halbe Steuersequenz, also eine kaputte
+    // Cursorposition ohne jede Meldung. Gemessen auch mit dem Compiler VOR
+    // dieser Aenderung: derselbe Ausfall, es ist kein Ergebnis von #2022.
+    //
+    // Bis die Mehrfachausgabe wirklich gebaut ist (#2025), wird sie LAUT
+    // abgewiesen. Ein halb ausgegebener Text ist schlimmer als ein Abbruch:
+    // er sieht wie eine Ausgabe aus.
+    if ((self.seq(fname, fnlen, "PrintLn", 7) || self.seq(fname, fnlen, "Print", 5)) &&
+        arg0 >= 0 && self.nodeNext(arg0) >= 0) {
+      Print("lyxc: --target="c); Print(self._targetName());
+      PrintLn(": Print/PrintLn mit mehreren Argumenten wird auf diesem Ziel"c);
+      PrintLn("  noch nicht unterstuetzt (#2025) — bisher wurde alles ab dem"c);
+      PrintLn("  ZWEITEN Argument stillschweigend verworfen."c);
+      PrintLn("  Behelf: je Argument ein eigener Aufruf."c);
+      exit(1);
+    }
+
     // PrintLn("literal") / Print("literal"): same mechanism as PrintStr below,
     // but PrintLn appends '\n'. Inline — adding helper methods shifts vtable.
     if ((self.seq(fname, fnlen, "PrintLn", 7) || self.seq(fname, fnlen, "Print", 5)) &&
@@ -2476,7 +2498,34 @@ pub type IRLower = class {
         // Ganzzahl aus und wuerde als solche ausgegeben. Entschieden wird
         // am linken Operanden — bei gemischten Typen greift ohnehin die
         // Typpruefung vor dieser Stelle.
+        //
+        // #2022: Der linke Operand kann SELBST wieder ein Binop sein. Bis
+        // 1.2.5C wurden hier nur Literal und Bezeichner geprueft, also genau
+        // EINE Ebene; `(ip >> 24) & 0xFF` fiel durch und wurde abgewiesen,
+        // obwohl `ip >> 24` und `ip & 0xFF` einzeln gingen. Stand die
+        // Verschachtelung rechts (`ip * (ip + 1)`), ging es — der Fehler war
+        // also nicht die Klammer und nicht die Argumentzahl, sondern die
+        // fehlende Tiefe. std/net/dns.lyx gab jede IP-Adresse so aus.
+        //
+        // Deshalb erst zum linken BLATT absteigen und DORT den Typ bestimmen.
+        // An der Aufzaehlung darunter aendert das nichts: was sie nicht
+        // kennt, bleibt unentscheidbar und scheitert laut.
         var pnL: int64 := self.nodeC0(arg0);
+        var pnTiefer: int64 := 1;
+        while pnTiefer != 0 {
+          pnTiefer := 0;
+          if pnL >= 0 {
+            var pnLw: int64 := self.nodeKind(pnL);
+            if (pnLw == NK_BINOP || pnLw == NK_UNOP) {
+              var pnLn: int64 := self.nodeC0(pnL);
+              // Ein Binop OHNE linken Operanden gibt es nicht; sollte er
+              // fehlen, bleibt pnL stehen und der Fall wird unentscheidbar —
+              // besser als ein Abstieg nach -1, der hier stillschweigend als
+              // "kein Ganzzahltyp" durchginge.
+              if pnLn >= 0 { pnL := pnLn; pnTiefer := 1; }
+            }
+          }
+        }
         if pnL >= 0 {
           var pnLk: int64 := self.nodeKind(pnL);
           if (pnLk == NK_LIT_INT || pnLk == NK_LIT_BOOL || pnLk == NK_LIT_CHAR) { pnArt := 0; }
@@ -7508,7 +7557,33 @@ pub type IRLower = class {
                 if ggNeg != 0 { ggInit := ggInit ^ (1 << 63); }
               }
             }
-            if ggKind == NK_CON_DECL && ggIstF64 == 0 { self._constNichtFaltbar(ggCur); }
+            // #2019: `con S: pchar := "…"` — eine Konstante mit ZEICHENKETTE
+            // als Anfangswert. Der Falter rechnet ganzzahlig; eine
+            // Zeichenkette ist fuer ihn nicht ausrechenbar, und bis 1.2.5C
+            // endete das hier in _constNichtFaltbar. Damit liessen sich 41
+            // stdlib-Units fuer KEIN IR-Ziel uebersetzen (Pfad- und
+            // Host-Konstanten in std/cloud/**, std/hardware/pci_*,
+            // std/net/whois) — auf dem x86-Schnellweg gingen dieselben Zeilen
+            // immer. Dieselbe Bauart wie die f64-Behandlung darueber (#1801):
+            // nicht RECHNEN, sondern ablegen.
+            //
+            // Der Wert wird NICHT als Global-Init eingetragen: das sind rohe
+            // 8 Byte in .data, die Adresse der Zeichenkette steht dort aber
+            // erst beim Erzeugen fest und brauchte eine Relokation. Der
+            // x86-Weg loest es seit #1338 anders und richtig
+            // (cg_collectCons → cg_addConStr): Name und Datenoffset merken,
+            // beim Zugriff die ADRESSE laden. _conStrFind im NK_IDENT-Zweig
+            // fragt VOR der Global-Suche, gewinnt also gegen den hier
+            // stehenbleibenden Eintrag mit Wert 0.
+            var ggIstStr: int64 := 0;
+            if self.nodeKind(ggInitNode) == NK_LIT_STR {
+              ggIstStr := 1;
+              if ggKind == NK_CON_DECL {
+                self._conStrAdd(self.nodeSVal(ggCur), self.nodeSLen(ggCur),
+                                self._strLitInternieren(ggInitNode));
+              }
+            }
+            if ggKind == NK_CON_DECL && ggIstF64 == 0 && ggIstStr == 0 { self._constNichtFaltbar(ggCur); }
           }
         }
         // WP-AND-upstream-fix v5/cross-module: copy the name into the IR
@@ -9342,6 +9417,99 @@ pub type IRLower = class {
   // kein Kennwert fuer „nicht faltbar" zur Verfuegung steht — genau die
   // Verwechslung, aus der dieser Defekt entstanden ist.
   // ====================================================================
+
+  // #2019: Ein String-Literal aus dem Baum in die IR-Stringtabelle legen und
+  // deren Offset liefern.
+  //
+  // LYXOS-pchar-fix2: IR-Backends brauchen den Offset im IR-strBuf, NICHT
+  // nodeIVal (= Parser-/Quell-Offset). Sonst zeigt CONST_STR in die Symbol-/
+  // Namen-Tabelle (z. B. "main"). String aus nodeSVal extrahieren, Escapes
+  // verarbeiten, in den IR-strBuf internieren (irAddString null-terminiert →
+  // strlen-tauglich).
+  //
+  // Bis 1.2.5C stand diese Rechnung NUR im NK_LIT_STR-Zweig von lowerExpr.
+  // Fuer #2019 wird sie ein zweites Mal gebraucht (String-Konstante auf
+  // Modulebene) — deshalb hier EINMAL, statt den Escape-Block zu kopieren.
+  // Zwei Fassungen davon wuerden frueher oder spaeter auseinanderlaufen, und
+  // der Unterschied faellt erst am ausgegebenen Text auf.
+  fn _strLitInternieren(nd: int64): int64 {
+    var lsStart:  int64 := (self.nodeSVal(nd) as int64) + 1;  // opening quote überspringen
+    var lsSrcLen: int64 := _irLitLen(self.nodeSVal(nd) as int64, self.nodeSLen(nd));   // #1388
+    if (lsSrcLen < 0) { lsSrcLen := 0; }
+    var lsBuf: int64 := alloc(lsSrcLen + 8);
+    var lsOut: int64 := 0;
+    var lsI:   int64 := 0;
+    while lsI < lsSrcLen {
+      var lsC: int64 := peek8(lsStart + lsI);
+      if lsC == 92 && lsI + 1 < lsSrcLen {       // backslash-Escape
+        var lsN: int64 := peek8(lsStart + lsI + 1);
+        if lsN == 110      { lsC := 10; lsI := lsI + 1; }   // \n
+        else if lsN == 116 { lsC := 9;  lsI := lsI + 1; }   // \t
+        else if lsN == 114 { lsC := 13; lsI := lsI + 1; }   // \r
+        else if lsN == 92  { lsC := 92; lsI := lsI + 1; }   // \\
+        else if lsN == 34  { lsC := 34; lsI := lsI + 1; }   // \"
+        else if lsN == 48  { lsC := 0;  lsI := lsI + 1; }   // \0
+      }
+      poke8(lsBuf + lsOut, lsC);
+      lsOut += 1;
+      lsI += 1;
+    }
+    return self.irAddString(lsBuf as pchar, lsOut);
+  }
+
+  // #2019: Eine Modulkonstante mit String-Anfangswert eintragen.
+  //
+  // Sie wird BEWUSST NICHT als globale Variable angelegt. Der Init-Wert eines
+  // Globals ist ein roher 8-Byte-Wert in .data; die Adresse einer Zeichenkette
+  // steht dort aber erst beim Erzeugen fest und brauchte eine Relokation.
+  // Der x86-Weg loest das seit #1338 anders und richtig (cg_collectCons →
+  // cg_addConStr): Name und Datenoffset werden gemerkt, und beim Zugriff wird
+  // die ADRESSE geladen. Hier dieselbe Rechnung — die beiden muessen
+  // uebereinstimmen.
+  //
+  // Record: 24 Byte {nameOff (in IR-strBuf), nameLen, strOff}.
+  fn _conStrAdd(namePtr: pchar, nameLen: int64, strOff: int64) {
+    if self.conStrCnt >= self.conStrCap {
+      var csNewCap: int64 := self.conStrCap * 2;
+      if csNewCap < 16 { csNewCap := 16; }
+      var csNb: int64 := alloc(csNewCap * 24);
+      memcpy(csNb, self.conStrBuf, self.conStrCnt * 24);
+      self.conStrBuf := csNb;
+      self.conStrCap := csNewCap;
+    }
+    // Den Namen in die IR-Stringtabelle kopieren, nicht auf self.src zeigen:
+    // beim Lowern importierter Einheiten wird self.src ausgetauscht, und ein
+    // Zeiger dorthin vergliche spaeter gegen den falschen Puffer. Dieselbe
+    // Vorsichtsmassnahme wie bei globalNameBuf.
+    var csRec: int64 := self.conStrBuf + self.conStrCnt * 24;
+    poke64(csRec +  0, self.irAddString(namePtr, nameLen));
+    poke64(csRec +  8, nameLen);
+    poke64(csRec + 16, strOff);
+    self.conStrCnt += 1;
+  }
+
+  // #2019: Offset der Zeichenkette zu einer String-Konstanten, sonst -1.
+  fn _conStrFind(namePtr: pchar, nameLen: int64): int64 {
+    var csStrBuf: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
+    var csI: int64 := 0;
+    while csI < self.conStrCnt {
+      var csRec: int64 := self.conStrBuf + csI * 24;
+      if peek64(csRec + 8) == nameLen {
+        var csPtr:   int64 := csStrBuf + peek64(csRec + 0);
+        var csMatch: int64 := 1;
+        var csJ:     int64 := 0;
+        while csJ < nameLen {
+          if csMatch != 0 {
+            if peek8(csPtr + csJ) != peek8((namePtr as int64) + csJ) { csMatch := 0; }
+          }
+          csJ += 1;
+        }
+        if csMatch != 0 { return peek64(csRec + 16); }
+      }
+      csI += 1;
+    }
+    return 0 - 1;
+  }
 
   fn _constFaltbar(nd: int64): int64 {
     if nd < 0 { return 0; }
