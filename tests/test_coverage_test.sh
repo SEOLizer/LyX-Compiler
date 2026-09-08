@@ -68,6 +68,13 @@ is_exempt() {
                                           # zwei Ableitungen, die
                                           # erbfeld_ir_test.sh auf drei Zielen
                                           # ausfuehrt. basis hat kein main.
+    data/erbevmt/main.lyx)   return 0 ;;  # #1998: Pruefdaten, kein Test. Eine
+                                          # Basis mit VIRTUELLER Methode in
+                                          # eigener Unit; erst die VMT und die
+                                          # Modulgrenze zusammen erzeugten den
+                                          # Layoutversatz. erbe_vmt_ir_test.sh
+                                          # uebersetzt und fuehrt sie auf drei
+                                          # Zielen aus (rp/a.lyx hat kein main).
     data/erbe/main.lyx)      return 0 ;;  # #1976: Pruefdaten, kein Test. Eine
     data/erbe/rp/basis.lyx)  return 0 ;;  # zweistufige Vererbung ueber ZWEI
     data/erbe/rp/mitte.lyx)  return 0 ;;  # Modulgrenzen, die erbe_ir_test.sh
