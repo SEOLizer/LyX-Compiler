@@ -219,5 +219,88 @@ else
 fi
 
 echo
+echo "--- #2026: String-Konstante mit CAST (\"…\"c as int64) ---"
+#
+# `con H: int64 := "…"c as int64` war auf dem x86-SCHNELLWEG STILL 0 —
+# cg_collectCons prueft auf das Literal, nicht auf den Cast DARUM, und
+# cg_evalConExpr rechnet ganzzahlig. In std/cloud/cf/transport.lyx steht so
+# CF_API_HOST, der Zielhost jedes Cloudflare-Aufrufs: er war 0. 15 Units.
+#
+# Der Fix trennt zwei Dinge, die conIsPchar zusammen steuerte: die LADEART
+# (Wert ist ein Datenoffset → LEA) und die TYPFRAGE (gilt als pchar). Bei
+# `int64` gilt nur die erste — `PrintLn(H)` muss die ZAHL ausgeben.
+cat > "$TMP/cast.lyx" <<'EOF'
+unit main;
+import std.io;
+con S: pchar := "text-als-pchar";
+con H: int64 := "adresse"c as int64;
+con Z: int64 := 42;
+fn main(): int64 {
+  PrintLn(S);
+  PrintLn(IntToStr(StrLen(S)));
+  PrintLn(IntToStr(Z));
+  PrintLn(H as pchar);
+  PrintLn(IntToStr(StrLen(H as pchar)));
+  return 0;
+}
+EOF
+ERW="text-als-pchar|14|42|adresse|7|"
+if lauf x86_64 "$TMP/cast.lyx" "$TMP/cast.x86"; then
+  IST="$(tr '\n' '|' < "$TMP/cast.x86")"
+  if [ "$IST" = "$ERW" ]; then
+    ok "x86_64: Cast-Konstante traegt die Adresse, pchar-con bleibt Text, Zahl bleibt Zahl"
+  else
+    nok "x86_64: erwartet [$ERW], bekommen [$IST]"
+  fi
+  for ziel in arm64 riscv; do
+    lauf "$ziel" "$TMP/cast.lyx" "$TMP/cast.$ziel"; rc=$?
+    if [ "$rc" = 2 ]; then
+      nok "$ziel: qemu fehlt — die Wirkung wurde NICHT gemessen"
+    elif [ "$rc" != 0 ]; then
+      nok "$ziel: Cast-Konstante uebersetzt nicht ($(grep -m1 -E 'error|kann den Typ' "$TMP/build_$ziel.log"))"
+    elif diff -q "$TMP/cast.x86" "$TMP/cast.$ziel" >/dev/null; then
+      ok "$ziel: gleiches Ergebnis wie x86_64 — die beiden Wege stimmen ueberein"
+    else
+      nok "$ziel: weicht ab: [$(tr '\n' '|' < "$TMP/cast.$ziel")]"
+    fi
+  done
+else
+  nok "das Cast-Pruefprogramm uebersetzt nicht fuer x86_64"
+fi
+
+# An der ECHTEN Quelle messen, nicht nur am Nachbau: CF_API_HOST war der
+# Auesloeser. Ein Test am eigenen Minimalbeispiel haette den Fix belegt,
+# ohne zu zeigen, dass die stdlib-Konstante wirklich stimmt.
+cat > "$TMP/cf.lyx" <<'EOF'
+unit main;
+import std.io;
+import std.cloud.cf.transport;
+fn main(): int64 {
+  PrintLn(CF_API_HOST as pchar);
+  PrintLn(IntToStr(StrLen(CF_API_HOST as pchar)));
+  return 0;
+}
+EOF
+if lauf x86_64 "$TMP/cf.lyx" "$TMP/cf.x86"; then
+  if [ "$(sed -n '1p' "$TMP/cf.x86")" = "api.cloudflare.com" ] && [ "$(sed -n '2p' "$TMP/cf.x86")" = "18" ]; then
+    ok "CF_API_HOST aus der stdlib ist api.cloudflare.com (war 0)"
+  else
+    nok "CF_API_HOST falsch: [$(tr '\n' '|' < "$TMP/cf.x86")]"
+  fi
+else
+  nok "std.cloud.cf.transport laesst sich nicht einbinden"
+fi
+
+# GEGENPROBE: ein Cast auf f64 als Print-Argument darf NICHT als Ganzzahl
+# durchgehen. Der neue NK_CAST-Zweig liest den Zieltyp — er darf daraus nicht
+# "alles, was ich nicht als pchar erkenne, ist eine Zahl" machen.
+printf 'unit fc;\nimport std.io;\npub fn f(x: int64) { Print(x as f64); }\n' > "$TMP/fc.lyx"
+if ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --target=arm64 "$TMP/fc.lyx" -o /dev/null ) >"$TMP/fc.log" 2>&1; then
+  nok "Print(x as f64) ging als Ganzzahl durch — der Cast-Zweig raet"
+else
+  ok "Cast auf f64 wird weiterhin abgewiesen"
+fi
+
+echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
