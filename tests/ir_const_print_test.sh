@@ -181,41 +181,85 @@ else
 fi
 
 echo
-echo "--- #2025: Print mit mehreren Argumenten faellt LAUT aus, nicht still ---"
+echo "--- #2025/#2031: Print mit mehreren Argumenten, und Zahlen auf riscv ---"
 #
-# Saemtliche Print-Zweige des IR-Wegs lesen nur arg0. `Print(a, ".", b)` gab
-# auf arm64 nur `7` aus, auf riscv gar nichts — ohne Meldung. In std/crt.lyx
-# steht `Print("\x1b[", row, ";", col, "H")`; daraus wurde die halbe
-# Steuersequenz. Das ist noch nicht behoben (#2025), aber es faellt nicht mehr
-# still aus: ein halb ausgegebener Text sieht wie eine Ausgabe aus.
+# #2025: saemtliche Print-Zweige des IR-Wegs lasen nur arg0. `Print(a, ".", b)`
+# gab auf arm64 nur `7` aus, auf riscv gar nichts — ohne Meldung. In
+# std/crt.lyx steht `Print("\x1b[", row, ";", col, "H")`; daraus wurde die halbe
+# Steuersequenz. Seit 1.2.5G laeuft eine Schleife ueber die Argumentkette, das
+# Zeilenende kommt EINMAL am Schluss.
+#
+# #2031: dabei fiel auf, dass riscv `id == 2 || id == 3` BEIDE als exit
+# behandelte. `PrintLn(7)` gab dort nichts aus und beendete das Programm mit
+# rc=7 — vorbestehend, gegen den Vorgaengerstand belegt.
 cat > "$TMP/multi.lyx" <<'EOF'
 unit main;
 import std.io;
 fn main(): int64 {
   var a: int64 := 7;
   var b: int64 := 9;
-  Print(a, ".", b);
-  PrintLn("");
+  var s: pchar := "text";
+  Print(a, ".", b); PrintLn("");
+  PrintLn(a, ".", b);
+  PrintLn("x=", a, " s=", s);
+  var ip: int64 := 0xC0A80105;
+  PrintLn((ip >> 24) & 0xFF, ".", (ip >> 16) & 0xFF, ".", (ip >> 8) & 0xFF, ".", ip & 0xFF);
+  PrintLn(0);
+  PrintLn(0 - 42);
+  PrintLn(9223372036854775807);
   return 0;
 }
 EOF
-if ( cd "$ROOT" && timeout 120 "$LYXC" --target=arm64 "$TMP/multi.lyx" -o "$TMP/multi.bin" ) >"$TMP/multi.log" 2>&1; then
-  nok "Print(a, \".\", b) uebersetzte fuer arm64 — gibt es die Mehrfachausgabe jetzt wirklich? Dann #2025 schliessen und diesen Test auf den TEXT umstellen"
-else
-  if grep -q "mehreren Argumenten" "$TMP/multi.log"; then
-    ok "Mehrfachargumente werden benannt abgewiesen (#2025), statt still zu verschwinden"
+# Die Referenz nachrechnen, nicht nur vergleichen: 0xC0A80105 = 192.168.1.5.
+ERW="7.9|7.9|x=7 s=text|192.168.1.5|0|-42|9223372036854775807|"
+if lauf x86_64 "$TMP/multi.lyx" "$TMP/multi.x86"; then
+  IST="$(tr '\n' '|' < "$TMP/multi.x86")"
+  if [ "$IST" = "$ERW" ]; then
+    ok "x86_64 liefert die nachgerechneten Werte (Referenz belastbar)"
   else
-    nok "abgewiesen, aber ohne den Grund zu nennen: $(grep -m1 -E 'error|lyxc:' "$TMP/multi.log")"
+    nok "x86_64: erwartet [$ERW], bekommen [$IST]"
   fi
+  for ziel in arm64 riscv; do
+    lauf "$ziel" "$TMP/multi.lyx" "$TMP/multi.$ziel"; rc=$?
+    if [ "$rc" = 2 ]; then
+      nok "$ziel: qemu fehlt — die Wirkung wurde NICHT gemessen"
+    elif [ "$rc" != 0 ]; then
+      nok "$ziel: uebersetzt nicht ($(grep -m1 -E 'error|kann den Typ' "$TMP/build_$ziel.log"))"
+    elif diff -q "$TMP/multi.x86" "$TMP/multi.$ziel" >/dev/null; then
+      ok "$ziel: Mehrfachausgabe zeichengleich mit x86_64 (inkl. 0, negativ, INT64_MAX)"
+    else
+      nok "$ziel: weicht ab: [$(tr '\n' '|' < "$TMP/multi.$ziel")]"
+    fi
+  done
+else
+  nok "das Mehrfach-Pruefprogramm uebersetzt nicht fuer x86_64"
 fi
 
-# x86_64 ist von der Sperre NICHT betroffen — dort war die Mehrfachausgabe
-# immer richtig, und eine Verschaerfung, die den Schnellweg mitnimmt, waere
-# eine Regression fuer bestehende Programme.
-if lauf x86_64 "$TMP/multi.lyx" "$TMP/multi.x86" && [ "$(sed -n '1p' "$TMP/multi.x86")" = "7.9" ]; then
-  ok "x86_64 gibt weiterhin alle Argumente aus (7.9)"
+# #2031 EINZELN: eine Zahl allein, auf riscv. Das war der stille Fall — keine
+# Ausgabe, und der WERT wurde zum Exit-Code. Ein Sammelvergleich zeigt zwar die
+# fehlende Zeile, aber nicht, dass das Programm gar nicht zu Ende lief.
+printf 'unit main;\nimport std.io;\nfn main(): int64 { PrintLn(7); return 0; }\n' > "$TMP/eins.lyx"
+if lauf riscv "$TMP/eins.lyx" "$TMP/eins.rv"; then
+  rcv=$?
+  if [ "$(cat "$TMP/eins.rv")" = "7" ]; then
+    ok "riscv: PrintLn(7) gibt 7 aus und das Programm laeuft zu Ende (war: rc=7, keine Ausgabe)"
+  else
+    nok "riscv: PrintLn(7) ergab [$(cat "$TMP/eins.rv")]"
+  fi
 else
-  nok "x86_64 Mehrfachausgabe beschaedigt: $(tr '\n' '|' < "$TMP/multi.x86" 2>/dev/null)"
+  nok "riscv: das Zahl-Programm laeuft nicht"
+fi
+
+# GEGENPROBE zum Auftrennen von ID 2 und ID 3: das Prozessende muss weiterhin
+# das Prozessende sein. Ohne diese Haelfte waere der Test auch von einer
+# Fassung erfuellt, die exit kaputtgemacht hat.
+printf 'unit main;\nimport std.io;\nfn main(): int64 { PrintLn("vorher"); panic("weg"); return 0; }\n' > "$TMP/pa.lyx"
+( cd "$ROOT" && timeout 180 "$LYXC" --target=riscv "$TMP/pa.lyx" -o "$TMP/pa.rv" ) >/dev/null 2>&1
+pao="$(timeout 60 qemu-riscv64-static "$TMP/pa.rv" 2>&1)"; parc=$?
+if [ "$parc" = "1" ] && printf '%s' "$pao" | grep -q "vorher"; then
+  ok "riscv: panic beendet weiterhin mit 1, die Ausgabe davor kommt an"
+else
+  nok "riscv: panic ergab rc=$parc, Ausgabe [$pao]"
 fi
 
 echo
