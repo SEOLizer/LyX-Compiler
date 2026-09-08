@@ -4,6 +4,7 @@
 
 import src.sema;
 import src.ir;          // #1974: IR_MOD_OFF_* fuer den IR-Abschnitt
+import src.parser;      // #1971: NODE_OFF_* / PARSER_NODE_SIZE fuer den AST-Lauf
 import src.std.alloc;
 
 // Magic 'LYU\0'
@@ -50,6 +51,20 @@ pub type LyuWriter = class {
   // keinen Code. `irModulPtr` ist das zu schreibende IRModule (0 = keines).
   irOffPos:   int64;
   irModulPtr: int64;
+  // #1971: RESSOURCEN. Bisher trug nur das Erzeugnis Dateien; eine Bibliothek
+  // konnte keine mitbringen — wer `std.icons` importierte, bekam deren
+  // Symbole, aber keine Icons. Der Abschnitt liegt wie der Debug- und der
+  // IR-Abschnitt am ENDE, sein Offset im bisher reservierten U32 des Kopfes.
+  // Ein Leser, der ihn nicht kennt, hoert nach der Symboltabelle auf und
+  // liest die Datei unveraendert; die Version bleibt 2.
+  //
+  // Eintraege: {namePtr, nameLen, pfadPtr, pfadLen} zu je 32 Byte. Die BYTES
+  // liest der Schreiber selbst — im Erzeugnis des Nutzers gibt es den Pfad
+  // nicht mehr, also muss der Inhalt in die Datei.
+  resOffPos:  int64;
+  resList:    int64;
+  resCount:   int64;
+  resCap:     int64;
 
   pub fn LywInit() {
     self.cap := 4096;
@@ -59,6 +74,87 @@ pub type LyuWriter = class {
     self.dbgOffPos    := 0;
     self.irOffPos     := 0;   // #1974
     self.irModulPtr   := 0;
+    self.resOffPos    := 0;   // #1971
+    self.resList      := 0;
+    self.resCount     := 0;
+    self.resCap       := 0;
+  }
+
+  // #1971: vor Serialize aufrufen, je `@resource` der Unit einmal. Ohne
+  // Ressourcen bleibt der Abschnitt weg und die Datei ist byte-identisch zu
+  // einer ohne diese Erweiterung.
+  // #1971: Die `@resource`-Angaben der Unit aus dem AST einsammeln.
+  //
+  // Der Schreiber laeuft die Knoten selbst, statt den Aufrufer eine Liste
+  // bauen zu lassen: die Versaetze sind in src/parser.lyx oeffentlich, und so
+  // bleibt die Kenntnis des Knotenformats an EINER Stelle statt an zweien.
+  //
+  // Nur die OBERSTE Ebene — `@resource` steht dort, wie `@embed` in einem
+  // Ausdruck steht. Ein Knoten tiefer waere keine Unit-Ressource mehr.
+  // #1971: relativen Pfad auf die Quelldatei beziehen und nullterminieren.
+  // Dieselbe Rechnung wie cg_embedPfad im Codegen — die beiden muessen
+  // uebereinstimmen, sonst findet der eine eine Datei, die der andere nicht
+  // findet, und dieselbe Bibliothek traegt je nach Weg andere Bytes.
+  fn _pfadAufloesen(rel: pchar, relLen: int64, quelle: pchar): pchar {
+    // Ein absoluter Pfad bleibt, wie er ist.
+    if (relLen > 0 && StrCharAt(rel, 0) == 47) {
+      var abuf: int64 := alloc(relLen + 1);
+      var ai: int64 := 0;
+      while (ai < relLen) { poke8(abuf + ai, StrCharAt(rel, ai)); ai := ai + 1; }
+      poke8(abuf + relLen, 0);
+      return abuf as pchar;
+    }
+    var qLen: int64 := 0;
+    if (quelle != 0 as pchar) { qLen := StrLen(quelle); }
+    var dirLen: int64 := 0;
+    var si: int64 := 0;
+    while (si < qLen) {
+      if (StrCharAt(quelle, si) == 47) { dirLen := si + 1; }
+      si := si + 1;
+    }
+    var tot: int64 := dirLen + relLen;
+    var buf: int64 := alloc(tot + 1);
+    var i: int64 := 0;
+    while (i < dirLen) { poke8(buf + i, StrCharAt(quelle, i)); i := i + 1; }
+    var j: int64 := 0;
+    while (j < relLen) { poke8(buf + dirLen + j, StrCharAt(rel, j)); j := j + 1; }
+    poke8(buf + tot, 0);
+    return buf as pchar;
+  }
+
+  pub fn LywSammleRessourcen(nodes: int64, astRoot: int64, src: pchar) {
+    var cur: int64 := astRoot;
+    while (cur >= 0) {
+      var off: int64 := nodes + cur * PARSER_NODE_SIZE;
+      if (peek64(off) == NK_RESOURCE) {
+        var pfN: int64 := peek64(off + NODE_OFF_C0);
+        if (pfN >= 0) {
+          var pOff: int64 := nodes + pfN * PARSER_NODE_SIZE;
+          self.LywAddResource(src + peek64(off + NODE_OFF_SVAL),
+                              peek64(off + NODE_OFF_SLEN),
+                              src + peek64(pOff + NODE_OFF_SVAL),
+                              peek64(pOff + NODE_OFF_SLEN));
+        }
+      }
+      cur := peek64(off + NODE_OFF_NEXT);
+    }
+  }
+
+  pub fn LywAddResource(nm: pchar, nmLen: int64, pf: pchar, pfLen: int64) {
+    if (self.resCount >= self.resCap) {
+      var nc: int64 := self.resCap * 2;
+      if (nc < 8) { nc := 8; }
+      var nb: int64 := alloc(nc * 32);
+      if (self.resCount > 0) { memcpy(nb, self.resList, self.resCount * 32); }
+      self.resList := nb;
+      self.resCap  := nc;
+    }
+    var b: int64 := self.resList + self.resCount * 32;
+    poke64(b,      nm as int64);
+    poke64(b + 8,  nmLen);
+    poke64(b + 16, pf as int64);
+    poke64(b + 24, pfLen);
+    self.resCount := self.resCount + 1;
   }
 
   // #1555: vor Serialize aufrufen.
@@ -226,7 +322,10 @@ pub type LyuWriter = class {
     self._e8(LYU_W_M2); self._e8(LYU_W_M3);
     self._e16le(LYU_W_VER);
     self._e8(arch);
-    self._e8(self.includeDebug & 1);  // flags, bit0 = Debug-Abschnitt vorhanden (#1555)
+    // flags: bit0 = Debug-Abschnitt (#1555), bit1 = Ressourcen (#1971)
+    var flags: int64 := self.includeDebug & 1;
+    if (self.resCount > 0) { flags := flags | 2; }
+    self._e8(flags);
 
     // Unit name
     self._eStr(unPtr, unLenV);
@@ -243,7 +342,8 @@ pub type LyuWriter = class {
     self._e32le(0);  // IRCodeOffset
     self.dbgOffPos := self.len;   // #1555: hierhin kommt der Offset am Ende
     self._e32le(0);  // DebugOffset
-    self._e32le(0);  // Reserved
+    self.resOffPos := self.len;   // #1971: das bisher reservierte U32
+    self._e32le(0);  // ResourceOffset (0 = keine Ressourcen)
 
     // ── Symbol table ──
     si := 0;
@@ -331,6 +431,65 @@ pub type LyuWriter = class {
         si += 1;
       }
       self._p32le(lenPos, written);
+    }
+
+    // ── Ressourcen-Abschnitt (#1971) ───────────────────────────────────
+    // Wie der Debug-Abschnitt: optional, am ENDE, Offset im Kopf. Neu ist,
+    // dass hier NUTZDATEN liegen und nicht nur Metadaten — die Bytes muessen
+    // mit, weil es den Pfad auf dem Rechner des Nutzers nicht mehr gibt.
+    //
+    // Aufbau: Anzahl (u32), dann je Eintrag Name (_eStr), Laenge (u32),
+    // Bytes. Die Laenge steht ausdruecklich da und nicht als
+    // Nullterminierung: eine Ressource ist eine BINAERdatei und darf
+    // Nullbytes tragen — genau daran ist die IR-Zeichenkettentabelle vor
+    // #1968 gescheitert.
+    if (self.resCount > 0) {
+      var resStart: int64 := self.len;
+      self._p32le(self.resOffPos, resStart);
+      self._e32le(self.resCount);
+      var ri: int64 := 0;
+      while (ri < self.resCount) {
+        var rb: int64 := self.resList + ri * 32;
+        var rnm: pchar := peek64(rb) as pchar;
+        var rnl: int64 := peek64(rb + 8);
+        var rpfRel: pchar := peek64(rb + 16) as pchar;
+        var rpfLen: int64 := peek64(rb + 24);
+        self._eStr(rnm, rnl);
+        // Der Pfad steht als AUSSCHNITT im Quelltextpuffer: nicht
+        // nullterminiert und relativ zur Quelldatei. `open` braucht beides
+        // anders — also auflösen wie cg_embedPfad, mit demselben Ergebnis.
+        var rpf: pchar := self._pfadAufloesen(rpfRel, rpfLen, inputPath);
+        // Datei lesen. FEHLT sie, ist das ein harter Fehler mit Pfad in der
+        // Meldung — ein stiller Ersatz (Laenge 0) waere die schlimmste
+        // Antwort: die Bibliothek liesse sich bauen, und erst beim Nutzer
+        // faende sich eine leere Ressource ohne jeden Hinweis.
+        var fd: int64 := open(rpf, 0, 0);
+        if (fd < 0) {
+          EPrintStr("error: @resource: Datei nicht lesbar: "c);
+          EPrintStrLn(rpf);
+          exit(1);
+        }
+        var gr: int64 := lseek(fd, 0, 2);
+        lseek(fd, 0, 0);
+        if (gr < 0) { close(fd); EPrintStrLn("error: @resource: Groesse nicht bestimmbar"c); exit(1); }
+        self._e32le(gr);
+        if (gr > 0) {
+          var bufp: int64 := alloc(gr);
+          var gelesen: int64 := read(fd, bufp as pchar, gr);
+          close(fd);
+          if (gelesen != gr) {
+            EPrintStr("error: @resource: unvollstaendig gelesen: "c);
+            EPrintStrLn(rpf);
+            exit(1);
+          }
+          var bi: int64 := 0;
+          while (bi < gr) { self._e8(peek8(bufp + bi)); bi := bi + 1; }
+          free(bufp, gr);
+        } else {
+          close(fd);
+        }
+        ri := ri + 1;
+      }
     }
   }
 

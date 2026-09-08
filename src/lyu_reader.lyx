@@ -20,6 +20,9 @@ pub type LyuReader = class {
   pub unitNameLen: int64;
   pub symCount:    int64;
   pub debugOffset: int64;   // #1555: 0 = kein Debug-Abschnitt
+  // #1971: Ressourcen. 0 = keine. Das Feld lag bisher als `Reserved` im Kopf
+  // und wurde gelesen und verworfen — genau dafuer war es da.
+  pub resOffset:   int64;
   pub valid:       bool;
 
   fn _u8(): int64 {
@@ -87,7 +90,7 @@ pub type LyuReader = class {
     // Offsets: TypeInfoOffset, IRCodeOffset, DebugOffset (#1555), Reserved
     self._u32le(); self._u32le();
     self.debugOffset := self._u32le();
-    self._u32le();
+    self.resOffset := self._u32le();   // #1971: war Reserved
 
     self.valid := true;
     return true;
@@ -121,6 +124,61 @@ pub type LyuReader = class {
 
   // Print unit metadata and symbol list to stdout.
   // Call site should print the file path before calling this.
+  // ── #1971: Ressourcen lesen ───────────────────────────────────────────
+  //
+  // Der Abschnitt liegt am Ende: Anzahl (u32), dann je Eintrag Name (u16-Laenge
+  // + Zeichen), Laenge (u32), Bytes. Gelesen wird ueber einen Zeiger IN den
+  // Dateipuffer — kopiert wird nichts, der Aufrufer entscheidet, was er
+  // uebernimmt.
+  //
+  // Die Laenge steht ausdruecklich da. Eine Ressource ist eine BINAERdatei;
+  // wer hier mit StrLen maesse, verlöre alles ab dem ersten Nullbyte — genau
+  // der Fehler, den #1968 auf dem IR-Weg behoben hat.
+
+  pub fn LyrResCount(): int64 {
+    if (!self.valid) { return 0; }
+    if ((self.flags & 2) == 0) { return 0; }
+    if (self.resOffset <= 0 || self.resOffset >= self.size) { return 0; }
+    var merk: int64 := self.pos;
+    self.pos := self.resOffset;
+    var n: int64 := self._u32le();
+    self.pos := merk;
+    return n;
+  }
+
+  // Zum i-ten Eintrag springen und die drei Angaben in die Boxen legen:
+  // Namenszeiger, Namenslaenge, Byteszeiger, Bytelaenge. Rueckgabe false,
+  // wenn es den Eintrag nicht gibt.
+  pub fn LyrResAt(idx: int64, nmBox: int64, nmLenBox: int64,
+                  datBox: int64, datLenBox: int64): bool {
+    poke64(nmBox, 0); poke64(nmLenBox, 0);
+    poke64(datBox, 0); poke64(datLenBox, 0);
+    var n: int64 := self.LyrResCount();
+    if (idx < 0 || idx >= n) { return false; }
+    var merk: int64 := self.pos;
+    self.pos := self.resOffset + 4;
+    var i: int64 := 0;
+    while (i < n) {
+      var nl: int64 := self._u16le();
+      var nOff: int64 := self.pos;
+      self.pos := self.pos + nl;
+      var dl: int64 := self._u32le();
+      var dOff: int64 := self.pos;
+      self.pos := self.pos + dl;
+      if (i == idx) {
+        poke64(nmBox, self.data + nOff);
+        poke64(nmLenBox, nl);
+        poke64(datBox, self.data + dOff);
+        poke64(datLenBox, dl);
+        self.pos := merk;
+        return true;
+      }
+      i := i + 1;
+    }
+    self.pos := merk;
+    return false;
+  }
+
   pub fn PrintInfo() {
     if (!self.valid) { return; }
     PrintStr("  Version: "c); PrintInt(self.version); PrintStr("\n"c);
@@ -177,6 +235,26 @@ pub type LyuReader = class {
         PrintStr("\tZeile "c); PrintInt(line); PrintStr("\n"c);
         d += 1;
       }
+    }
+
+    // #1971: Ressourcen auflisten. Das ist der Punkt, an dem sich ohne
+    // Uebersetzen nachsehen laesst, WAS eine Bibliothek mitbringt — und der
+    // erste Ort, an dem eine fehlende Ressource auffaellt.
+    var rn: int64 := self.LyrResCount();
+    if (rn > 0) {
+      PrintStr("  Ressourcen: "c); PrintInt(rn); PrintStr("\n"c);
+      var nb: int64 := alloc(8); var nlb: int64 := alloc(8);
+      var db: int64 := alloc(8); var dlb: int64 := alloc(8);
+      var r: int64 := 0;
+      while (r < rn) {
+        if (self.LyrResAt(r, nb, nlb, db, dlb)) {
+          PrintStr("    "c);
+          PrintStr(StrSub(peek64(nb) as pchar, 0, peek64(nlb)));
+          PrintStr("\t"c); PrintInt(peek64(dlb)); PrintStr(" Byte\n"c);
+        }
+        r := r + 1;
+      }
+      free(nb, 8); free(nlb, 8); free(db, 8); free(dlb, 8);
     }
   }
 
