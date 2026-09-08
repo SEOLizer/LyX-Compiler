@@ -713,6 +713,16 @@ pub type Codegen = class {
   conCount:   int64;
   conCap:     int64;
   conIsPchar: int64;  // byte buffer parallel to conTable: 1 = pchar string constant
+  // #2026: 1 = der Wert ist ein DATENOFFSET und muss als Adresse geladen
+  // werden (LEA), nicht als Zahl (MOV imm64).
+  //
+  // Bewusst GETRENNT von conIsPchar: das steuerte bis 1.2.5D beides zugleich,
+  // die Ladeart UND ob der Ausdruck als pchar gilt. Bei
+  // `con H: int64 := "…"c as int64` faellt das auseinander — der Wert ist eine
+  // Adresse, der deklarierte Typ aber int64, und `PrintLn(H)` muss die ZAHL
+  // ausgeben. Wer hier nur conIsPchar setzte, tauschte einen stillen Fehler
+  // gegen einen anderen.
+  conIsStrAddr: int64;
   // #1499: dasselbe fuer Gleitkomma. Eine `con PI: f64 := 3.14159` steht in
   // derselben Tabelle wie jede andere Konstante — mit den IEEE-Bits als Wert.
   // Ohne diese Merkung galt sie als Ganzzahl, und `p * PI` multiplizierte zwei
@@ -2605,9 +2615,12 @@ pub type Codegen = class {
       var np: int64 := alloc(nc);
       memcpy(nb, self.conTable, self.conCount * CG_CON_SZ);
       var nf: int64 := alloc(nc);
+      var na: int64 := alloc(nc);                       // #2026
       memcpy(np, self.conIsPchar, self.conCount);
       memcpy(nf, self.conIsF64, self.conCount);
+      memcpy(na, self.conIsStrAddr, self.conCount);     // #2026
       self.conTable := nb; self.conCap := nc; self.conIsPchar := np; self.conIsF64 := nf;
+      self.conIsStrAddr := na;
     }
     var base: int64 := self.conTable + self.conCount * CG_CON_SZ;
     poke64(base,                       name as int64);
@@ -2615,6 +2628,7 @@ pub type Codegen = class {
     poke64(base + CG_CON_OFF_VAL,      val);
     poke8(self.conIsPchar + self.conCount, 0);
     poke8(self.conIsF64 + self.conCount, 0);
+    poke8(self.conIsStrAddr + self.conCount, 0);   // #2026
     self.conCount += 1;
   }
 
@@ -2657,13 +2671,22 @@ pub type Codegen = class {
   }
 
   // Add a pchar string constant: stores data offset in conTable and marks conIsPchar.
-  fn cg_addConStr(name: pchar, nlen: int64, dataOff: int64) {
+  // #2026: Nur die LADEART merken — der Wert ist ein Datenoffset und wird per
+  // LEA geladen. Ob die Konstante als pchar GILT, entscheidet ihr deklarierter
+  // Typ und wird getrennt gesetzt (cg_addConStr).
+  fn cg_addConStrAddr(name: pchar, nlen: int64, dataOff: int64) {
     self.cg_addCon(name, nlen, dataOff);
     // #1338: seit cg_addCon einen vorhandenen Eintrag ERSETZT, ist der neue
     // nicht mehr zwingend der letzte. Die Markierung gehoert an den Eintrag,
     // der eben geschrieben wurde — sonst traegt bei einem gleichnamigen
-    // zweiten Eintrag eine fremde Konstante das pchar-Kennzeichen und wird als
+    // zweiten Eintrag eine fremde Konstante das Kennzeichen und wird als
     // Adresse geladen.
+    var idx: int64 := self.cg_findConIdx(name, nlen);
+    if (idx >= 0) { poke8(self.conIsStrAddr + idx, 1); }
+  }
+
+  fn cg_addConStr(name: pchar, nlen: int64, dataOff: int64) {
+    self.cg_addConStrAddr(name, nlen, dataOff);
     var idx: int64 := self.cg_findConIdx(name, nlen);
     if (idx >= 0) { poke8(self.conIsPchar + idx, 1); }
   }
@@ -2675,7 +2698,10 @@ pub type Codegen = class {
     var idx: int64 := self.cg_findConIdx(name, nlen);
     if (idx < 0) { self.cg_zeroRax(); return; }
     var val: int64 := peek64(self.conTable + idx * CG_CON_SZ + CG_CON_OFF_VAL);
-    if (peek8(self.conIsPchar + idx) != 0) {
+    // #2026: Die LADEART haengt daran, ob der Wert ein Datenoffset ist — nicht
+    // daran, ob die Konstante als pchar gilt. Bei `con H: int64 := "…"c as
+    // int64` ist beides verschieden: Adresse laden, aber int64 bleiben.
+    if (peek8(self.conIsStrAddr + idx) != 0) {
       var pp: int64 := self.cg_emitLeaStr();
       self.cg_addPatch(pp, val, 0, CG_PATCH_STR);
     } else {
@@ -21070,11 +21096,43 @@ pub type Codegen = class {
         if (k == CGN_CON_DECL) {
           var initNode: int64 := self.cg_nc1(cur);
           if (initNode >= 0) {
-            if (self.cg_nkind(initNode) == CGN_LIT_STR) {
+            // #2026: Durch CASTS hindurchgreifen. `con H: int64 := "…"c as
+            // int64` ist ein CGN_CAST UM das Literal; die Pruefung sah nur den
+            // direkten Fall, der Wert fiel durch zu cg_evalConExpr — und das
+            // rechnet ganzzahlig und lieferte fuer eine Zeichenkette STILL 0.
+            // In std/cloud/cf/transport.lyx steht so CF_API_HOST, der Zielhost
+            // JEDES Cloudflare-Aufrufs: er war 0. 15 Units betroffen.
+            //
+            // Dass derselbe Anfangswert an ein `var` auf Modulebene LAUT
+            // abgelehnt wurde, machte es noch schwerer zu sehen: zwei
+            // Entscheidungen fuer dieselbe Zuweisung.
+            var conStrN: int64 := initNode;
+            var conStrTiefer: int64 := 1;
+            while (conStrTiefer != 0) {
+              conStrTiefer := 0;
+              if (self.cg_nkind(conStrN) == CGN_CAST) {
+                var conStrInner: int64 := self.cg_nc0(conStrN);
+                if (conStrInner >= 0) { conStrN := conStrInner; conStrTiefer := 1; }
+              }
+            }
+            if (self.cg_nkind(conStrN) == CGN_LIT_STR) {
               // Die Zeichenkette darf nur EINMAL in den Datenbereich.
               if (runde == 0) {
-                var dataOff: int64 := self.cg_addStr(self.cg_nsoff(initNode), self.cg_nslen(initNode));
-                self.cg_addConStr(self.cg_nsval(cur), self.cg_nslen(cur), dataOff);
+                var dataOff: int64 := self.cg_addStr(self.cg_nsoff(conStrN), self.cg_nslen(conStrN));
+                // Die LADEART gilt immer (der Wert IST ein Datenoffset). Ob die
+                // Konstante als pchar GILT, entscheidet der deklarierte Typ:
+                // bei `int64` muss `PrintLn(H)` die ZAHL ausgeben, nicht den
+                // Text. Ohne Typangabe bleibt es wie bisher bei pchar.
+                self.cg_addConStrAddr(self.cg_nsval(cur), self.cg_nslen(cur), dataOff);
+                var conStrTy: int64 := self.cg_nc0(cur);
+                var conStrIstPchar: int64 := 1;
+                if (conStrTy >= 0 && self.cg_nkind(conStrTy) == 60) {
+                  conStrIstPchar := self.cg_seq(self.cg_nsval(conStrTy), self.cg_nslen(conStrTy), "pchar"c, 5);
+                }
+                if (conStrIstPchar != 0) {
+                  var conStrIdx: int64 := self.cg_findConIdx(self.cg_nsval(cur), self.cg_nslen(cur));
+                  if (conStrIdx >= 0) { poke8(self.conIsPchar + conStrIdx, 1); }
+                }
               }
             } else if (self.cg_nkind(initNode) == CGN_IDENT
                        && self.cg_isDeclaredFunc(self.cg_nsval(initNode), self.cg_nslen(initNode)) != 0) {
@@ -21724,6 +21782,7 @@ pub type Codegen = class {
     self.conCount   := 0;
     self.conIsPchar := alloc(self.conCap);
     self.conIsF64   := alloc(self.conCap);   // #1499
+    self.conIsStrAddr := alloc(self.conCap); // #2026
 
     // Break linked list: no pending breaks initially
     self.curBreakHead := -1;
