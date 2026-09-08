@@ -40,6 +40,8 @@ pub type LyuReader = class {
   // #1971: Ressourcen. 0 = keine. Das Feld lag bisher als `Reserved` im Kopf
   // und wurde gelesen und verworfen — genau dafuer war es da.
   pub resOffset:   int64;
+  pub konOffset:   int64;   // #2014 Stufe 1: Konstantenwerte
+  pub symStart:    int64;   // #2014: Beginn der Symboltabelle
   pub valid:       bool;
 
   fn _u8(): int64 {
@@ -60,6 +62,13 @@ pub type LyuReader = class {
     var b2: int64 := self._u8();
     var b3: int64 := self._u8();
     return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+  }
+
+  // #2014: voller int64 — ein u32 schnitte jeden Wert ab 2^31 still ab.
+  fn _u64le(): int64 {
+    var lo: int64 := self._u32le();
+    var hi: int64 := self._u32le();
+    return (lo & 0xFFFFFFFF) | (hi << 32);
   }
 
   // Skip a u16-length-prefixed string; returns pointer into data and length
@@ -104,10 +113,16 @@ pub type LyuReader = class {
     }
 
     self.symCount := self._u32le();
-    // Offsets: TypeInfoOffset, IRCodeOffset, DebugOffset (#1555), Reserved
-    self._u32le(); self._u32le();
+    // Offsets: Konstanten (#2014, hiess TypeInfoOffset und war immer 0),
+    // IRCodeOffset, DebugOffset (#1555), Ressourcen (#1971, war Reserved)
+    self.konOffset := self._u32le();
+    self._u32le();
     self.debugOffset := self._u32le();
     self.resOffset := self._u32le();   // #1971: war Reserved
+    // #2014: PrintInfo lief bisher einfach weiter, weil es direkt nach dem
+    // Kopf liest. Wer die Tabelle SPAETER noch einmal braucht, muss wissen,
+    // wo sie anfaengt.
+    self.symStart := self.pos;
 
     self.valid := true;
     return true;
@@ -185,6 +200,133 @@ pub type LyuReader = class {
     }
     self.pos := merk;
     return false;
+  }
+
+  // #2014 Stufe 1: Anzahl der Konstanten mit Wert.
+  //
+  // Anders als bei den Ressourcen gibt es KEIN Flagbit — der Offset selbst
+  // sagt alles: 0 heisst "kein Abschnitt". Ein zusaetzliches Bit waere eine
+  // zweite Stelle, die dasselbe behauptet, und die beiden koennten
+  // auseinanderlaufen.
+  pub fn LyrKonCount(): int64 {
+    if (!self.valid) { return 0; }
+    if (self.konOffset <= 0 || self.konOffset >= self.size) { return 0; }
+    var merk: int64 := self.pos;
+    self.pos := self.konOffset;
+    var n: int64 := self._u32le();
+    self.pos := merk;
+    return n;
+  }
+
+  // Zum i-ten Eintrag springen: Namenszeiger, Namenslaenge, Art (0 = Ganzzahl,
+  // 1 = Zeichenkette), Wert. Bei Art 1 ist `wert` der Zeiger auf den Text und
+  // `txtLen` seine Laenge; bei Art 0 ist `wert` die Zahl und txtLen 0.
+  pub fn LyrKonAt(idx: int64, nmBox: int64, nmLenBox: int64,
+                  artBox: int64, wertBox: int64, txtLenBox: int64): bool {
+    poke64(nmBox, 0); poke64(nmLenBox, 0);
+    poke64(artBox, 0); poke64(wertBox, 0); poke64(txtLenBox, 0);
+    var n: int64 := self.LyrKonCount();
+    if (idx < 0 || idx >= n) { return false; }
+    var merk: int64 := self.pos;
+    self.pos := self.konOffset + 4;
+    var i: int64 := 0;
+    while (i < n) {
+      var nl: int64 := self._u16le();
+      var nOff: int64 := self.pos;
+      self.pos := self.pos + nl;
+      var art: int64 := self._u8();
+      var wert: int64 := 0;
+      var tlen: int64 := 0;
+      if (art == 0) {
+        wert := self._u64le();
+      } else {
+        tlen := self._u16le();
+        wert := self.data + self.pos;
+        self.pos := self.pos + tlen;
+      }
+      if (i == idx) {
+        poke64(nmBox, self.data + nOff);
+        poke64(nmLenBox, nl);
+        poke64(artBox, art);
+        poke64(wertBox, wert);
+        poke64(txtLenBox, tlen);
+        self.pos := merk;
+        return true;
+      }
+      i := i + 1;
+    }
+    self.pos := merk;
+    return false;
+  }
+
+  // #2014 Stufe 1: das i-te Symbol der Tabelle — Name, Laenge, Art.
+  //
+  // Gebraucht, um zu beantworten, ob beim Import OHNE Quelle etwas VERLOREN
+  // geht. Die blosse Anzahl taugt dafuer nicht: eine `.lyu` fuehrt auch
+  // Symbole, die der Konsument ohnehin kennt (Prelude-Konstanten wie PROT_RW
+  // stehen in JEDER Datei), und die gehen nicht verloren.
+  pub fn LyrSymAt(idx: int64, nmBox: int64, nmLenBox: int64, lskBox: int64): bool {
+    poke64(nmBox, 0); poke64(nmLenBox, 0); poke64(lskBox, 0);
+    if (!self.valid) { return false; }
+    if (idx < 0 || idx >= self.symCount) { return false; }
+    var merk: int64 := self.pos;
+    self.pos := self.symStart;
+    var i: int64 := 0;
+    var gefunden: bool := false;
+    while (i < self.symCount && self.pos < self.size) {
+      var nameLen: int64 := self._u16le();
+      var nOff: int64 := self.pos;
+      self.pos += nameLen;
+      var lsk: int64 := self._u8();
+      self._u32le();
+      var tiLen: int64 := self._u16le();
+      self.pos += tiLen;
+      if (i == idx) {
+        poke64(nmBox, self.data + nOff);
+        poke64(nmLenBox, nameLen);
+        poke64(lskBox, lsk);
+        gefunden := true;
+        i := self.symCount;
+      } else {
+        i += 1;
+      }
+    }
+    self.pos := merk;
+    return gefunden;
+  }
+
+  // #2014 Stufe 1: Traegt diese `.lyu` AUSSCHLIESSLICH Konstanten, deren Werte
+  // im Konstantenabschnitt stehen?
+  //
+  // Genau das ist die Bedingung, unter der ein Konsument ohne die `.lyx`
+  // weiterarbeiten darf: dann geht nichts verloren. Eine Funktion braucht
+  // Code (Stufe 5), ein Struct sein Layout (Stufe 3) — beides steht noch
+  // nicht in der Datei, und wer trotzdem weitermacht, bekommt still 0.
+  //
+  // Gezaehlt wird ueber die SYMBOLTABELLE, nicht ueber den
+  // Konstantenabschnitt: der sagt nur, was DA ist, nicht, was FEHLT. Eine
+  // Unit mit einer Konstanten und einer Funktion haette sonst einen
+  // vollstaendigen Abschnitt und trotzdem eine Luecke.
+  pub fn LyrNurKonstanten(): bool {
+    if (!self.valid) { return false; }
+    if (self.symCount == 0) { return false; }
+    if (self.LyrKonCount() != self.symCount) { return false; }
+    var merk: int64 := self.pos;
+    self.pos := self.symStart;
+    var i: int64 := 0;
+    var alle: bool := true;
+    while (i < self.symCount && self.pos < self.size) {
+      var nameLen: int64 := self._u16le();
+      self.pos += nameLen;
+      var lsk: int64 := self._u8();
+      self._u32le();
+      var tiLen: int64 := self._u16le();
+      self.pos += tiLen;
+      if (lsk != 3) { alle := false; }   // 3 = LSK_CON
+      i += 1;
+    }
+    self.pos := merk;
+    return alle;
   }
 
   pub fn PrintInfo() {

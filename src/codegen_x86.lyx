@@ -2937,12 +2937,19 @@ pub type Codegen = class {
     self.cg_addCon("PROT_NONE"c,    9,  0);
     self.cg_addCon("MAP_SHARED"c,   10, 1);
     self.cg_addCon("MAP_PRIVATE"c,  11, 2);
-    self.cg_addCon("MAP_ANONYMOUS"c,12, 32);
+    // #2033: stand auf 12 — der Name hat 13 Zeichen, die Konstante war
+    // damit als "MAP_ANONYMOU" abgelegt und `MAP_ANONYMOUS` lieferte still 0.
+    // sema kennt den Namen (_regBuiltinCon), liess ihn also durch.
+    self.cg_addCon("MAP_ANONYMOUS"c,13, 32);
     self.cg_addCon("MAP_ANON"c,     8,  34);  // MAP_PRIVATE|MAP_ANONYMOUS
     self.cg_addCon("FD_NONE"c,      7,  -1);
     // O_* flags (file open modes)
-    self.cg_addCon("O_RDONLY"c,  7, 0);
-    self.cg_addCon("O_WRONLY"c,  7, 1);
+    // #2033: 8 Zeichen, nicht 7. Heute folgenlos, weil sema den Namen gar
+    // nicht fuehrt — aber sobald er dort nachgetragen wird, waere es derselbe
+    // stille Fehler wie bei MAP_ANONYMOUS, bei O_WRONLY sogar "schreiben"
+    // als "lesen".
+    self.cg_addCon("O_RDONLY"c,  8, 0);
+    self.cg_addCon("O_WRONLY"c,  8, 1);
     self.cg_addCon("O_RDWR"c,    6, 2);
     self.cg_addCon("O_CREAT"c,   7, 64);
     self.cg_addCon("O_TRUNC"c,   7, 512);
@@ -3615,6 +3622,18 @@ pub type Codegen = class {
       self.cg_edata(StrCharAt(self.pSrc, i) & 255);
       i := i + 1;
     }
+    self.cg_edata(0);
+    return doff;
+  }
+
+  // #2014: Bytes, die NICHT aus dem Quelltextpuffer stammen, in den
+  // Datenbereich legen. cg_addStr liest aus self.pSrc und loest dabei
+  // Anfuehrungszeichen und Escapes auf; ein Konstantenwert aus einer `.lyu`
+  // ist bereits aufgeloest und liegt woanders.
+  fn cg_addStrRoh(ptr: int64, len: int64): int64 {
+    var doff: int64 := self.dataLen;
+    var i: int64 := 0;
+    while (i < len) { self.cg_edata(peek8(ptr + i)); i += 1; }
     self.cg_edata(0);
     return doff;
   }
@@ -20881,6 +20900,66 @@ pub type Codegen = class {
               var lr: LyuReader := new LyuReader();
               if (lr.LyrInit(lbuf, lsz)) {
                 if (lr.symCount == 0) { traegtSymbole := 0; }
+                // #2014 Stufe 1: Traegt die `.lyu` NUR Konstanten und stehen
+                // deren Werte darin, dann geht ohne die Quelle nichts
+                // verloren — die Werte werden hier eingetragen, und der
+                // Abbruch entfaellt.
+                //
+                // Die Bedingung ist bewusst eng: sobald EIN Symbol kein
+                // `con` ist (eine Funktion braucht Code, ein Struct sein
+                // Layout — Stufen 3 und 5), bleibt es beim Abbruch. Wer sie
+                // aufweicht, bekommt genau das zurueck, wovor die Meldung
+                // darunter warnt: still eine 0.
+                else {
+                  // Zuerst die Werte eintragen, DANN pruefen, ob noch etwas
+                  // fehlt: ein Symbol, das der Abschnitt liefert, ist danach
+                  // bekannt und geht nicht verloren.
+                  var kn: int64 := lr.LyrKonCount();
+                  var kNm:  int64 := alloc(8); var kNmL: int64 := alloc(8);
+                  var kArt: int64 := alloc(8); var kWert: int64 := alloc(8);
+                  var kTxtL: int64 := alloc(8);
+                  var ki: int64 := 0;
+                  while (ki < kn) {
+                    if (lr.LyrKonAt(ki, kNm, kNmL, kArt, kWert, kTxtL)) {
+                      var knp: pchar := peek64(kNm) as pchar;
+                      var knl: int64 := peek64(kNmL);
+                      if (peek64(kArt) == 0) {
+                        self.cg_addCon(knp, knl, peek64(kWert));
+                      } else {
+                        // Der Text liegt im .lyu-Puffer; cg_addStr legt ihn
+                        // in den Datenbereich des Erzeugnisses.
+                        var kdo: int64 := self.cg_addStrRoh(peek64(kWert), peek64(kTxtL));
+                        self.cg_addConStr(knp, knl, kdo);
+                      }
+                    }
+                    ki += 1;
+                  }
+                  // Geht noch etwas VERLOREN? Gezaehlt wird ueber die
+                  // Symboltabelle, nicht ueber den Abschnitt — der sagt nur,
+                  // was DA ist.
+                  //
+                  // Ein Symbol, das der Konsument ohnehin kennt, geht nicht
+                  // verloren: eine `.lyu` fuehrt auch die Prelude-Konstanten
+                  // (PROT_RW, MAP_ANON, ARCH_* — 26 Stueck stehen in JEDER
+                  // Datei), und die sind hier laengst definiert. Deshalb wird
+                  // je Symbol gefragt, ob es JETZT bekannt ist, statt die
+                  // Anzahlen zu vergleichen.
+                  var sNm: int64 := alloc(8); var sNmL: int64 := alloc(8);
+                  var sLsk: int64 := alloc(8);
+                  var fehlt: int64 := 0;
+                  var sIdx: int64 := 0;
+                  while (sIdx < lr.symCount) {
+                    if (lr.LyrSymAt(sIdx, sNm, sNmL, sLsk)) {
+                      var snp: pchar := peek64(sNm) as pchar;
+                      var snl: int64 := peek64(sNmL);
+                      if (self.cg_findConIdx(snp, snl) < 0) {
+                        if (self.cg_isDeclaredFunc(snp, snl) == 0) { fehlt := fehlt + 1; }
+                      }
+                    }
+                    sIdx += 1;
+                  }
+                  if (fehlt == 0) { traegtSymbole := 0; }
+                }
               }
             }
           }
