@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.4G
-VERSION_DATE := 2026-09-07
+VERSION   := 1.2.5A
+VERSION_DATE := 2026-09-08
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -743,6 +743,7 @@ test: lyxc
 	@echo "OK"
 	@echo "--- sema-Pruefungen ueber Unit-Grenzen, Methoden, Aliase, Attribute (21 Pruefungen) ---"
 	@bash tests/sema_checks_test.sh
+	@bash tests/sema_luecken_test.sh
 	@echo "OK"
 	@echo "--- Wert statt Adresse: Feldzugriff, Verkettung, Array-Parameter, FloatToStr (19 Pruefungen) ---"
 	@bash tests/value_vs_address_test.sh

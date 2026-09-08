@@ -1439,9 +1439,29 @@ fn CriticalUpdate(): int64 { return 0; }
   Steht das Attribut in einer IMPORTIERTEN Einheit und führt das Programm
   `@capabilities`, wird das gemeldet: der Filter steht zu diesem Zeitpunkt schon.
 
-**Nicht umgesetzt:** `@integrity` VOR einer `unit`-Deklaration. Der Parser nimmt es
-an, der Codegen sieht es nie — es entsteht weder Sweep noch Meldung. Bis das
-entschieden ist, gehört die Annotation an die Funktion.
+**Vor einer `unit`-Deklaration** verhalten sich die beiden Modi verschieden, und
+das ist beabsichtigt (#1952). Der Satz an dieser Stelle — *"der Parser nimmt es
+an, der Codegen sieht es nie"* — stammte vom Stand 1.1.15B und traf auf keinen
+der beiden Modi zu; nachgemessen mit 1.2.4G:
+
+| Vor `unit` | Verhalten |
+|---|---|
+| `@integrity(mode: scrubbed, interval: N)` | **wirkt.** Erzeugnis 17016 statt 4246 Byte, `METASAF2` vorhanden — Hashtabelle und Sweep entstehen |
+| `@integrity(mode: software_lockstep)` | **wird abgewiesen:** *"gilt nur an einer FUNKTION, nicht an der Unit"* |
+
+Der Unterschied folgt aus dem, was die Modi tun, nicht aus einer Lücke:
+
+- `scrubbed` ist ein **Sweep über das geladene Programm**, getaktet von einem
+  Zeitgeber je Prozess. Eine Angabe an der Unit ist dafür die natürliche
+  Stelle — es gibt nichts, worauf sie sich sonst beziehen könnte.
+- `software_lockstep` rechnet **dieselbe Funktion zweimal** und vergleicht die
+  beiden Ergebnisse in einem Register. Eine Unit hat kein Ergebnis; die
+  Annotation wäre dort ohne Gegenstand. Deshalb die Meldung statt eines
+  stillen Durchfalls — und aus demselben Grund weist der Codegen sie auch an
+  einer Funktion mit Struct- oder Tupel-Rückgabe ab.
+
+Wer eine einzelne Funktion doppelt rechnen lassen will, annotiert die Funktion.
+Wer das ganze Programm überwachen will, annotiert die Unit.
 
 ### Träger der Referenzhashes
 
