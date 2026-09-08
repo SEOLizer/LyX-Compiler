@@ -42,7 +42,15 @@ printf 'fn main(): int64 { return StrCharAt("abc"c, 1); }\n' > "$TMP/sc.lyx"
 # auf riscv, und auf Cortex-M IntToStr (16), das dort aus einem BENANNTEN
 # Grund scheitert (kein Puffer, der den Aufruf ueberlebt — es gibt weder mmap
 # noch einen Allokator). Beides muss gemeldet werden, nicht still durchgehen.
-printf 'fn main(): int64 { var s: pchar := StrConcat("a"c, "b"c); return 0; }\n' > "$TMP/luecke_riscv64.lyx"
+# #2028: hier stand StrConcat — bis 1.2.5F fehlte es im riscv-Backend, und
+# seine Ablehnung war der Nachweis fuer den lauten Default. Mit dem Schliessen
+# der Luecke wurde dieser Test rot: ein Test darf nicht VORAUSSETZEN, dass eine
+# Luecke offen bleibt. Jetzt StrCopy (ID 8), das riscv weiterhin nicht kennt.
+#
+# WER ID 8 UMSETZT, ZIEHT DIESE ZEILE MIT NACH — auf ein dann noch offenes
+# Builtin, oder der Nachweis wandert ganz woandershin. Dieselbe Stelle traf es
+# schon einmal (#1786, damals StrCharAt auf xtensa; siehe Kommentar unten).
+printf 'fn main(): int64 { var s: pchar := StrCopy("a"c); return 0; }\n' > "$TMP/luecke_riscv64.lyx"
 printf 'fn main(): int64 { var s: pchar := IntToStr(7); return 0; }\n' > "$TMP/luecke_arm-cm4.lyx"
 printf 'fn main(): int64 { var a: int64 := 2; var b: int64 := a * 3 + 1; if b > 5 { return b; } return 0; }\n' > "$TMP/rechnen.lyx"
 
