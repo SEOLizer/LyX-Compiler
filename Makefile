@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.5H
-VERSION_DATE := 2026-09-08
+VERSION   := 1.2.6A
+VERSION_DATE := 2026-09-09
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -39,7 +39,7 @@ DATA_LYU  := $(patsubst data/%.lyx, $(DATA_DST)/%.lyu,  $(DATA_SRC))
 
 # Build-Flag-Datei schreiben (immer vor der Kompilierung)
 lic_build_flags:
-	@printf 'con LYXC_LICENSE_REQUIRED: int64 := %s;\n' $(LYXC_LICENSE_REQUIRED) > src/lic_build_flags.lyx
+	@printf 'pub con LYXC_LICENSE_REQUIRED: int64 := %s;\n' $(LYXC_LICENSE_REQUIRED) > src/lic_build_flags.lyx
 
 # #1170: src/crypto/lic_secret.lyx ist gitignoriert, wird zum Uebersetzen der
 # Compilerquelle aber gebraucht. Ein frischer Checkout scheiterte deshalb mit
@@ -563,6 +563,7 @@ test: lyxc
 	@bash tests/ir_const_print_test.sh
 	@bash tests/strconcat_ir_test.sh
 	@bash tests/lyu_konstanten_test.sh
+	@bash tests/lyu_exporte_test.sh
 	@bash tests/lyu_ir_test.sh
 	@bash tests/erbe_ir_test.sh
 	@bash tests/erbe_vmt_ir_test.sh
