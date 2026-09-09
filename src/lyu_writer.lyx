@@ -81,6 +81,16 @@ pub type LyuWriter = class {
   konCount:   int64;
   konCap:     int64;
 
+  // #2035: Namen, die DIESE Unit selbst und OEFFENTLICH deklariert.
+  //
+  // Records: 16 Byte {namePtr, nameLen}. Ist die Liste leer (kein AST
+  // uebergeben), wird NICHT gefiltert — eine `.lyu` ohne Exportliste sieht
+  // dann aus wie vor dieser Aenderung.
+  expList:    int64;
+  expCount:   int64;
+  expCap:     int64;
+  expAktiv:   int64;
+
   pub fn LywInit() {
     self.cap := 4096;
     self.buf := alloc(self.cap);
@@ -90,6 +100,10 @@ pub type LyuWriter = class {
     self.irOffPos     := 0;   // #1974
     self.irModulPtr   := 0;
     self.resOffPos    := 0;   // #1971
+    self.expList      := 0;   // #2035
+    self.expCount     := 0;
+    self.expCap       := 0;
+    self.expAktiv     := 0;
     self.konOffPos    := 0;   // #2014
     self.konList      := 0;
     self.konCount     := 0;
@@ -186,6 +200,95 @@ pub type LyuWriter = class {
   // bleibt DRAUSSEN, statt geraten zu werden: eine Konstante, die mit einem
   // falschen Wert in der Bibliothek steht, ist schlimmer als eine, die fehlt
   // (der Leser merkt das Fehlen, den falschen Wert nicht).
+  // #2035: Die Namen einsammeln, die diese Unit selbst und OEFFENTLICH
+  // deklariert — die Schnittstelle also.
+  //
+  // Bis 1.2.5H trug eine `.lyu` ALLE Symbole, die sema beim Uebersetzen sah:
+  // eine Unit mit fuenf eigenen Konstanten hatte 31 Eintraege, std/math.lyu
+  // hatte 112. Darunter waren
+  //
+  //   * FREMDE Namen (PROT_RW, MAP_ANON, ARCH_* — die Prelude-Konstanten
+  //     stehen in JEDER Datei, gehoeren aber keiner Unit), und
+  //   * UNIT-INTERNE Namen (in std/math.lyx etwa f64_pi, f64_pi2_hi,
+  //     _sinTabelle — Zwischenwerte einer Implementierung).
+  //
+  // Beides ist kein Angebot an den Aufrufer. Mit den Konstantenwerten aus
+  // #2014 waere das interne sogar BENUTZBAR geworden, sobald die Quelle fehlt.
+  //
+  // `extern fn` ist ausgenommen: eine FFI-Bindung ist eine Link-Zeit-Zusage
+  // und der eigentliche Zweck solcher Units — std/audio/alsa.lyx traegt an
+  // keiner ihrer snd_pcm_*-Deklarationen ein pub, bietet sie aber genau dafuer
+  // an. Dieselbe Ausnahme wie in sema._checkAndRecordExports.
+  pub fn LywSammleExporte(nodes: int64, astRoot: int64, src: pchar) {
+    self.expAktiv := 1;
+    var cur: int64 := astRoot;
+    while (cur >= 0) {
+      var off: int64 := nodes + cur * PARSER_NODE_SIZE;
+      var k:   int64 := peek64(off);
+      var nimm: int64 := 0;
+      if (peek64(off + NODE_OFF_ISPUB) != 0) { nimm := 1; }
+      if (k == NK_FUNC_DECL) {
+        if ((peek64(off + NODE_OFF_IVAL) & 1) != 0) { nimm := 1; }   // extern fn
+      }
+      if (nimm != 0) {
+        var nl: int64 := peek64(off + NODE_OFF_SLEN);
+        if (nl > 0) { self._expAdd(src + peek64(off + NODE_OFF_SVAL), nl); }
+        // #2035: Die Mitglieder eines oeffentlichen Enums gehoeren zur
+        // Schnittstelle — `pub enum TAlign { AL_NONE, … }` bietet AL_NONE an.
+        // Sie sind KINDknoten und stehen nicht in der Kette darueber; ohne
+        // diese Schleife fehlten sie in der .lyu, obwohl der Enum pub ist.
+        if (k == NK_ENUM_DECL) {
+          var mem: int64 := peek64(off + NODE_OFF_C0);
+          while (mem >= 0) {
+            var mOff: int64 := nodes + mem * PARSER_NODE_SIZE;
+            var mLen: int64 := peek64(mOff + NODE_OFF_SLEN);
+            if (mLen > 0) { self._expAdd(src + peek64(mOff + NODE_OFF_SVAL), mLen); }
+            mem := peek64(mOff + NODE_OFF_NEXT);
+          }
+        }
+      }
+      cur := peek64(off + NODE_OFF_NEXT);
+    }
+  }
+
+  fn _expAdd(nm: pchar, nmLen: int64) {
+    if (self.expCount >= self.expCap) {
+      var nc: int64 := self.expCap * 2;
+      if (nc < 16) { nc := 16; }
+      var nb: int64 := alloc(nc * 16);
+      if (self.expCount > 0) { memcpy(nb, self.expList, self.expCount * 16); }
+      self.expList := nb;
+      self.expCap  := nc;
+    }
+    var b: int64 := self.expList + self.expCount * 16;
+    poke64(b,     nm as int64);
+    poke64(b + 8, nmLen);
+    self.expCount := self.expCount + 1;
+  }
+
+  // Gehoert der Name zur Schnittstelle? Ohne Exportliste: ja (nicht filtern).
+  fn _istExport(nm: pchar, nmLen: int64): int64 {
+    if (self.expAktiv == 0) { return 1; }
+    var i: int64 := 0;
+    while (i < self.expCount) {
+      var b: int64 := self.expList + i * 16;
+      if (peek64(b + 8) == nmLen) {
+        var q: int64 := peek64(b);
+        var gleich: int64 := 1;
+        var j: int64 := 0;
+        while (j < nmLen) {
+          if (gleich != 0) {
+            if (peek8(q + j) != peek8((nm as int64) + j)) { gleich := 0; }
+          }
+          j := j + 1;
+        }
+        if (gleich != 0) { return 1; }
+      }
+      i := i + 1;
+    }
+    return 0;
+  }
+
   // #2014: Ganzzahlausdruck zur Uebersetzungszeit ausrechnen.
   //
   // `0 - 7` ist in Lyx die uebliche Schreibweise fuer eine negative Zahl (ein
@@ -239,7 +342,9 @@ pub type LyuWriter = class {
     var cur: int64 := astRoot;
     while (cur >= 0) {
       var off: int64 := nodes + cur * PARSER_NODE_SIZE;
-      if (peek64(off) == NK_CON_DECL) {
+      // #2035: nur OEFFENTLICHE Konstanten. Eine unit-interne war mit den
+      // Werten aus #2014 sonst von aussen lesbar, sobald die Quelle fehlt.
+      if (peek64(off) == NK_CON_DECL && peek64(off + NODE_OFF_ISPUB) != 0) {
         var initN: int64 := peek64(off + NODE_OFF_C1);
         if (initN >= 0) {
           var iOff: int64 := nodes + initN * PARSER_NODE_SIZE;
@@ -466,8 +571,11 @@ pub type LyuWriter = class {
     while (si < total) {
       var kind: int64 := sema.SymKind(si);
       if (kind != SYM_BUILTIN && kind != SYM_PARAM && kind != SYM_FIELD) {
-        symCount += 1;
-        if (kind == SYM_FUNC) { funcCount := funcCount + 1; }
+        // #2035: nur die eigene, oeffentliche Schnittstelle
+        if (self._istExport(sema.SymName(si), sema.SymNameLen(si)) != 0) {
+          symCount += 1;
+          if (kind == SYM_FUNC) { funcCount := funcCount + 1; }
+        }
       }
       si += 1;
     }
@@ -512,7 +620,8 @@ pub type LyuWriter = class {
     si := 0;
     while (si < total) {
       var kind: int64 := sema.SymKind(si);
-      if (kind != SYM_BUILTIN && kind != SYM_PARAM && kind != SYM_FIELD) {
+      if (kind != SYM_BUILTIN && kind != SYM_PARAM && kind != SYM_FIELD
+          && self._istExport(sema.SymName(si), sema.SymNameLen(si)) != 0) {
         var symName:    pchar := sema.SymName(si);
         var symNameLen: int64 := sema.SymNameLen(si);
         // #1966: Fuer eine FUNKTION ist der Rueckgabetyp gemeint. SymTypeId
