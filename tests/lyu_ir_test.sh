@@ -54,11 +54,34 @@ for name in ("instr", "str", "label", "func", "global", "capture"):
     ln, = struct.unpack_from("<I", d, p); p += 4
     laengen[name] = ln
     p += ln
-# Der Abschnitt muss GENAU bis ans Dateiende reichen: bleibt etwas uebrig oder
-# laeuft er darueber hinaus, stimmen die Laengen nicht.
+
+# Der Abschnitt muss GENAU dort enden, wo der naechste anfaengt — bleibt etwas
+# uebrig oder laeuft er darueber hinaus, stimmen die Laengen nicht.
+#
+# Bis 1.2.5H stand hier "genau am Dateiende". Das war nur richtig, solange der
+# IR-Abschnitt der LETZTE war; mit dem Konstantenabschnitt (#2014) liegen 19
+# Byte dahinter, und mit Ressourcen (#1971) waere der Test genauso gefallen.
+# Die Reihenfolge der Abschnitte ist nicht zugesichert, ihre LAGE steht im
+# Kopf — also von dort lesen.
+#
+# Kopf: magic(4) ver(2) arch(1) flags(1) ulen(2)+name, dann bei v2 drei
+# Leerstrings, dann symCount(4) und VIER Offsets.
+q = 4
+kver, = struct.unpack_from("<H", d, q); q += 2
+q += 2                                   # arch + flags
+ul, = struct.unpack_from("<H", d, q); q += 2 + ul
+if kver >= 2:
+    for _ in range(3):
+        ln, = struct.unpack_from("<H", d, q); q += 2 + ln
+q += 4                                   # symCount
+offs = struct.unpack_from("<IIII", d, q) # konstanten, ir, debug, ressourcen
+# Der naechste Abschnitt hinter dem IR — oder das Dateiende, wenn keiner folgt.
+spaeter = [o for o in offs if 0 < o and o > i]
+grenze = min(spaeter) if spaeter else len(d)
+
 print(f"ver={ver} nInstr={nInstr} nFunc={nFunc} nGlob={nGlob} "
       f"instr={laengen['instr']} func={laengen['func']} str={laengen['str']} "
-      f"ende={p} datei={len(d)}")
+      f"ende={p} grenze={grenze} datei={len(d)}")
 PY
 )"
 
@@ -84,11 +107,12 @@ else
     nok "Funktionen passen nicht: $lyu_nFunc Saetze, $lyu_func Byte"
 fi
 
-# Der Abschnitt endet GENAU am Dateiende.
-if [ "$lyu_ende" -eq "$lyu_datei" ]; then
-    ok "der Abschnitt endet genau am Dateiende"
+# Der Abschnitt endet GENAU dort, wo der naechste anfaengt (oder am Dateiende,
+# wenn keiner folgt).
+if [ "$lyu_ende" -eq "$lyu_grenze" ]; then
+    ok "der IR-Abschnitt endet genau an der naechsten Abschnittsgrenze ($lyu_grenze)"
 else
-    nok "Abschnitt endet bei $lyu_ende, Datei ist $lyu_datei Byte"
+    nok "IR-Abschnitt endet bei $lyu_ende, Grenze ist $lyu_grenze (Datei $lyu_datei Byte)"
 fi
 
 # GEGENPROBE: ein aelterer Leser darf die Datei unveraendert lesen. Der

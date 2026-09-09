@@ -66,6 +66,21 @@ pub type LyuWriter = class {
   resCount:   int64;
   resCap:     int64;
 
+  // #2014 Stufe 1: Werte der Modulkonstanten.
+  //
+  // Bis 1.2.5G trug eine `.lyu` Namen und Typen, aber KEINE Werte — der
+  // Codegen brach beim Import ohne Quelle ausdruecklich ab ("Ohne diesen
+  // Abbruch kaeme jede Konstante daraus still als 0 an"). Genau diese Luecke
+  // schliesst der Abschnitt.
+  //
+  // Records: 32 Byte {namePtr, nameLen, art, wert}. art 0 = Ganzzahl (wert ist
+  // der Zahlenwert), 1 = Zeichenkette (wert ist Zeiger auf den Text,
+  // Laenge im folgenden Feld).
+  konOffPos:  int64;
+  konList:    int64;
+  konCount:   int64;
+  konCap:     int64;
+
   pub fn LywInit() {
     self.cap := 4096;
     self.buf := alloc(self.cap);
@@ -75,6 +90,10 @@ pub type LyuWriter = class {
     self.irOffPos     := 0;   // #1974
     self.irModulPtr   := 0;
     self.resOffPos    := 0;   // #1971
+    self.konOffPos    := 0;   // #2014
+    self.konList      := 0;
+    self.konCount     := 0;
+    self.konCap       := 0;
     self.resList      := 0;
     self.resCount     := 0;
     self.resCap       := 0;
@@ -157,6 +176,139 @@ pub type LyuWriter = class {
     self.resCount := self.resCount + 1;
   }
 
+  // #2014 Stufe 1: Werte der Modulkonstanten aus dem AST einsammeln.
+  //
+  // Wie LywSammleRessourcen selbst ueber den Baum, statt eine neue sema-API
+  // zu verlangen: sema fuehrt die Konstanten als Symbole, aber ohne Wert.
+  //
+  // Gefaltet wird NUR, was sich sicher ausrechnen laesst — Ganzzahlliterale
+  // mit optionalem unaerem Minus und Zeichenkettenliterale. Alles andere
+  // bleibt DRAUSSEN, statt geraten zu werden: eine Konstante, die mit einem
+  // falschen Wert in der Bibliothek steht, ist schlimmer als eine, die fehlt
+  // (der Leser merkt das Fehlen, den falschen Wert nicht).
+  // #2014: Ganzzahlausdruck zur Uebersetzungszeit ausrechnen.
+  //
+  // `0 - 7` ist in Lyx die uebliche Schreibweise fuer eine negative Zahl (ein
+  // Minusliteral gibt es nicht) — ohne diese Faltung fiele jede negative
+  // Konstante aus der Bibliothek heraus. Dieselbe Aufzaehlung wie
+  // _constFaltbar/_constWert in ir_lower; die beiden muessen uebereinstimmen.
+  //
+  // Rueckgabe ueber `okBox`: 0 = nicht ausrechenbar. Ein Rueckgabewert allein
+  // taugt nicht, weil 0 ein GUELTIGES Ergebnis ist (#1798 lief genau darauf
+  // hinaus).
+  fn _konWert(nodes: int64, n: int64, okBox: int64): int64 {
+    poke64(okBox, 0);
+    if (n < 0) { return 0; }
+    var off: int64 := nodes + n * PARSER_NODE_SIZE;
+    var k:   int64 := peek64(off);
+    if (k == NK_LIT_INT) { poke64(okBox, 1); return peek64(off + NODE_OFF_IVAL); }
+    if (k == NK_UNOP) {
+      var uo: int64 := peek64(off + NODE_OFF_IVAL);
+      var uOk: int64 := alloc(8);
+      var uv: int64 := self._konWert(nodes, peek64(off + NODE_OFF_C0), uOk);
+      if (peek64(uOk) == 0) { return 0; }
+      if (uo == 71) { poke64(okBox, 1); return 0 - uv; }
+      if (uo == 92) { poke64(okBox, 1); return 0 - uv - 1; }   // ~v
+      return 0;
+    }
+    if (k == NK_BINOP) {
+      var bo: int64 := peek64(off + NODE_OFF_IVAL);
+      var aOk: int64 := alloc(8);
+      var bOk: int64 := alloc(8);
+      var av: int64 := self._konWert(nodes, peek64(off + NODE_OFF_C0), aOk);
+      var bv: int64 := self._konWert(nodes, peek64(off + NODE_OFF_C1), bOk);
+      if (peek64(aOk) == 0 || peek64(bOk) == 0) { return 0; }
+      if (bo == 70) { poke64(okBox, 1); return av + bv; }
+      if (bo == 71) { poke64(okBox, 1); return av - bv; }
+      if (bo == 72) { poke64(okBox, 1); return av * bv; }
+      // Division durch null wird NICHT gefaltet: der Wert bleibt draussen,
+      // statt hier still 0 zu werden.
+      if (bo == 73) { if (bv == 0) { return 0; } poke64(okBox, 1); return av / bv; }
+      if (bo == 74) { if (bv == 0) { return 0; } poke64(okBox, 1); return av % bv; }
+      if (bo == 89) { poke64(okBox, 1); return av ^ bv; }
+      if (bo == 90) { poke64(okBox, 1); return av & bv; }
+      if (bo == 91) { poke64(okBox, 1); return av | bv; }
+      if (bo == 93) { poke64(okBox, 1); return av << bv; }
+      if (bo == 94) { poke64(okBox, 1); return av >> bv; }
+      return 0;
+    }
+    return 0;
+  }
+
+  pub fn LywSammleKonstanten(nodes: int64, astRoot: int64, src: pchar) {
+    var cur: int64 := astRoot;
+    while (cur >= 0) {
+      var off: int64 := nodes + cur * PARSER_NODE_SIZE;
+      if (peek64(off) == NK_CON_DECL) {
+        var initN: int64 := peek64(off + NODE_OFF_C1);
+        if (initN >= 0) {
+          var iOff: int64 := nodes + initN * PARSER_NODE_SIZE;
+          var iK:   int64 := peek64(iOff);
+          var kOk:  int64 := alloc(8);
+          var kv:   int64 := self._konWert(nodes, initN, kOk);
+          if (peek64(kOk) != 0) {
+            self.LywAddKonstante(src + peek64(off + NODE_OFF_SVAL),
+                                 peek64(off + NODE_OFF_SLEN),
+                                 0, kv, 0);
+          } else if (iK == NK_LIT_STR) {
+            // In die Bibliothek gehoert der WERT, nicht die Schreibweise:
+            // Anfuehrungszeichen weg, `c`-Suffix weg, Escapes aufgeloest.
+            // Sonst muesste jeder Leser die Quelltextregeln noch einmal
+            // kennen — und die beiden liefen auseinander.
+            var roh: int64 := (src as int64) + peek64(iOff + NODE_OFF_SVAL);
+            var rlen: int64 := peek64(iOff + NODE_OFF_SLEN);
+            var tEnd: int64 := rlen - 1;                 // schliessendes "
+            if (rlen >= 2) {
+              if (peek8(roh + rlen - 1) == 99) { tEnd := rlen - 2; }   // c-Suffix
+            }
+            var tBuf: int64 := alloc(rlen + 2);
+            var tOut: int64 := 0;
+            var ti:   int64 := 1;                        // oeffnendes " ueberspringen
+            while (ti < tEnd) {
+              var tc: int64 := peek8(roh + ti);
+              if (tc == 92 && ti + 1 < tEnd) {
+                var tn: int64 := peek8(roh + ti + 1);
+                if (tn == 110)      { tc := 10; ti := ti + 1; }
+                else if (tn == 116) { tc := 9;  ti := ti + 1; }
+                else if (tn == 114) { tc := 13; ti := ti + 1; }
+                else if (tn == 92)  { tc := 92; ti := ti + 1; }
+                else if (tn == 34)  { tc := 34; ti := ti + 1; }
+                else if (tn == 48)  { tc := 0;  ti := ti + 1; }
+              }
+              poke8(tBuf + tOut, tc);
+              tOut := tOut + 1;
+              ti := ti + 1;
+            }
+            self.LywAddKonstante(src + peek64(off + NODE_OFF_SVAL),
+                                 peek64(off + NODE_OFF_SLEN),
+                                 1, tBuf, tOut);
+          }
+        }
+      }
+      cur := peek64(off + NODE_OFF_NEXT);
+    }
+  }
+
+  // Records: 32 Byte {namePtr, nameLen, art, wert} + Textlaenge im vierten
+  // Feld, wenn art == 1.
+  pub fn LywAddKonstante(nm: pchar, nmLen: int64, art: int64, wert: int64, txtLen: int64) {
+    if (self.konCount >= self.konCap) {
+      var nc: int64 := self.konCap * 2;
+      if (nc < 8) { nc := 8; }
+      var nb: int64 := alloc(nc * 40);
+      if (self.konCount > 0) { memcpy(nb, self.konList, self.konCount * 40); }
+      self.konList := nb;
+      self.konCap  := nc;
+    }
+    var b: int64 := self.konList + self.konCount * 40;
+    poke64(b,      nm as int64);
+    poke64(b + 8,  nmLen);
+    poke64(b + 16, art);
+    poke64(b + 24, wert);
+    poke64(b + 32, txtLen);
+    self.konCount := self.konCount + 1;
+  }
+
   // #1555: vor Serialize aufrufen.
   pub fn LywSetDebug(on: int64) { self.includeDebug := on; }
 
@@ -185,6 +337,13 @@ pub type LyuWriter = class {
 
   fn _e32le(v: int64) {
     self._e8(v); self._e8(v >> 8); self._e8(v >> 16); self._e8(v >> 24);
+  }
+
+  // #2014: ein Konstantenwert ist ein voller int64 — ein u32 wuerde jede Zahl
+  // ab 2^31 still abschneiden.
+  fn _e64le(v: int64) {
+    self._e8(v);       self._e8(v >> 8);  self._e8(v >> 16); self._e8(v >> 24);
+    self._e8(v >> 32); self._e8(v >> 40); self._e8(v >> 48); self._e8(v >> 56);
   }
 
   // #1555: ein bereits geschriebenes u32 nachtragen (Offset-Feld im Kopf, das
@@ -337,7 +496,11 @@ pub type LyuWriter = class {
 
     // Symbol count + offset placeholders
     self._e32le(symCount);
-    self._e32le(0);  // TypeInfoOffset
+    // #2014 Stufe 1: das Feld hiess TypeInfoOffset und stand seit jeher auf 0.
+    // Es traegt jetzt den Konstantenabschnitt — Konstantenwerte sind der erste
+    // Teil der Strukturinformationen, fuer die es vorgesehen war.
+    self.konOffPos := self.len;
+    self._e32le(0);  // KonstantenOffset (0 = keine)
     self.irOffPos := self.len;   // #1974: hierhin kommt der Offset am Ende
     self._e32le(0);  // IRCodeOffset
     self.dbgOffPos := self.len;   // #1555: hierhin kommt der Offset am Ende
@@ -431,6 +594,36 @@ pub type LyuWriter = class {
         si += 1;
       }
       self._p32le(lenPos, written);
+    }
+
+    // ── Konstanten-Abschnitt (#2014 Stufe 1) ───────────────────────────
+    //
+    // Aufbau: Anzahl (u32), dann je Eintrag Name (_eStr), Art (u8) und
+    // entweder der Zahlenwert (i64, little endian) oder der Text (_eStr).
+    //
+    // Ohne diesen Abschnitt bleibt der Offset 0 und die Datei ist
+    // byte-identisch zu einer ohne die Erweiterung — dasselbe Versprechen wie
+    // beim Debug- (#1555), IR- (#1974) und Ressourcenabschnitt (#1971).
+    if (self.konCount > 0) {
+      var konStart: int64 := self.len;
+      self._p32le(self.konOffPos, konStart);
+      self._e32le(self.konCount);
+      var ki: int64 := 0;
+      while (ki < self.konCount) {
+        var kb:  int64 := self.konList + ki * 40;
+        var knm: pchar := peek64(kb) as pchar;
+        var knl: int64 := peek64(kb + 8);
+        var kart: int64 := peek64(kb + 16);
+        self._eStr(knm, knl);
+        self._e8(kart);
+        if (kart == 0) {
+          self._e64le(peek64(kb + 24));
+        } else {
+          // Der Text ist beim Einsammeln bereits aufgeloest worden.
+          self._eStr(peek64(kb + 24) as pchar, peek64(kb + 32));
+        }
+        ki += 1;
+      }
     }
 
     // ── Ressourcen-Abschnitt (#1971) ───────────────────────────────────
