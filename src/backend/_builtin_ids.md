@@ -322,3 +322,57 @@ TSC **228**. Das ist Folgearbeit, kein Teil dieser Prüfung.
 als QEMU-verifiziert. Dasselbe bei `sys_stat` 0x0205 gegen `sys_fstat` 135.
 Beide melden jetzt, statt eine der beiden Lesarten zur Tatsache zu erklären.
 
+
+
+## Linux-Syscalls der IR-Backends (#2021)
+
+Diese IDs bilden **einen** generischen Zweig in `emit_arm64` und
+`riscv_linux`: die Nummer und die Argumentzahl stehen in
+`src/backend/linux_syscalls.lyx`, beide Backends lesen dieselbe Tabelle. Vor
+#2021 wurde jeder Syscall je Backend als eigener Block geschrieben — bei
+diesen zweiunddreissig wären das vierundsechzig handgeschriebene Blöcke
+geworden, die übereinstimmen müssen.
+
+Die Nummern gelten für die **generische** Linux-ABI (`asm-generic/unistd.h`),
+also für arm64 **und** riscv. x86-64 zählt anders und emittiert seine Nummern
+im Codegen selbst.
+
+Nicht vergeben, weil es sie in dieser ABI nicht gibt: `select` (nur
+`pselect6`, mit einem sechsten Argument) und `arch_prctl` (x86-eigen). Beide
+werden von `ir_lower` benannt abgewiesen, statt auf etwas Ähnliches
+abgebildet zu werden.
+
+| ID | Operation | Lowering von | Anmerkung |
+|---:|---|---|---|
+| 440 | Linux-Syscall getuid (Nr. 0) | `sys_getuid` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 441 | Linux-Syscall chroot (Nr. 1) | `sys_chroot` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 442 | Linux-Syscall clone (Nr. 5) | `sys_clone` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 443 | Linux-Syscall epoll_create1 (Nr. 1) | `sys_epoll_create1` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 444 | Linux-Syscall inotify_init1 (Nr. 1) | `sys_inotify_init1` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 445 | Linux-Syscall io_uring_setup (Nr. 2) | `sys_io_uring_setup` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 446 | Linux-Syscall mq_open (Nr. 4) | `sys_mq_open` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 447 | Linux-Syscall mremap (Nr. 5) | `sys_mremap` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 448 | Linux-Syscall pidfd_open (Nr. 2) | `sys_pidfd_open` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 449 | Linux-Syscall prctl (Nr. 5) | `sys_prctl` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 450 | Linux-Syscall pread64 (Nr. 4) | `sys_pread64` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 451 | Linux-Syscall ptrace (Nr. 4) | `sys_ptrace` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 452 | Linux-Syscall rt_sigaction (Nr. 4) | `sys_rt_sigaction` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 453 | Linux-Syscall sched_yield (Nr. 0) | `sys_sched_yield` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 454 | Linux-Syscall shmget (Nr. 3) | `sys_shmget` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 455 | Linux-Syscall setxattr (Nr. 5) | `sys_setxattr` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 456 | Linux-Syscall bpf (Nr. 3) | `sys_bpf` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 457 | Linux-Syscall epoll_ctl (Nr. 4) | `sys_epoll_ctl` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 458 | Linux-Syscall eventfd2 (Nr. 2) | `sys_eventfd2` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 459 | Linux-Syscall getgid (Nr. 0) | `sys_getgid` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 460 | Linux-Syscall getppid (Nr. 0) | `sys_getppid` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 461 | Linux-Syscall getxattr (Nr. 4) | `sys_getxattr` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 462 | Linux-Syscall inotify_add_watch (Nr. 3) | `sys_inotify_add_watch` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 463 | Linux-Syscall io_uring_enter (Nr. 6) | `sys_io_uring_enter` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 464 | Linux-Syscall madvise (Nr. 3) | `sys_madvise` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 465 | Linux-Syscall mq_unlink (Nr. 1) | `sys_mq_unlink` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 466 | Linux-Syscall perf_event_open (Nr. 5) | `sys_perf_event_open` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 467 | Linux-Syscall pidfd_send_signal (Nr. 4) | `sys_pidfd_send_signal` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 468 | Linux-Syscall pwrite64 (Nr. 4) | `sys_pwrite64` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 469 | Linux-Syscall rt_sigprocmask (Nr. 4) | `sys_rt_sigprocmask` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 470 | Linux-Syscall sethostname (Nr. 2) | `sys_sethostname` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+| 471 | Linux-Syscall shmat (Nr. 3) | `sys_shmat` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
