@@ -376,3 +376,46 @@ abgebildet zu werden.
 | 469 | Linux-Syscall rt_sigprocmask (Nr. 4) | `sys_rt_sigprocmask` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
 | 470 | Linux-Syscall sethostname (Nr. 2) | `sys_sethostname` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
 | 471 | Linux-Syscall shmat (Nr. 3) | `sys_shmat` | #2021; Nummer und Stelligkeit in `src/backend/linux_syscalls.lyx` |
+
+
+## Linux-Formen der lyxos-IDs 172…198 (#2024)
+
+Die IDs 172…198 tragen die **LyxOS**-Formen. Ihre Stelligkeit weicht teils ab —
+`sendto` nimmt dort vier Argumente, unter Linux sechs —, und **dieselbe ID kann
+nicht zwei Stelligkeiten tragen**. Die Linux-Formen bekommen deshalb eigene
+IDs; `ir_lower` wählt nach Ziel.
+
+Fünf Namen haben unter Linux keine 1:1-Entsprechung und werden umgeschrieben.
+Das ist kein Raten, weil der eingesetzte Wert jeweils **feststeht**:
+`access(p,m)` → `faccessat(AT_FDCWD,p,m)`, `dup2(a,n)` → `dup3(a,n,0)`,
+`futex_wait`/`wake`/`requeue` → `futex(uaddr, OP, …)` mit OP aus
+`linux/futex.h`.
+
+Nicht vergeben: `sys_udp_open`/`sys_udp_close`. Sie sind LyxOS-eigen (dort ein
+einziger Aufruf, unter Linux `socket`+`bind` bzw. `close`) und werden in der
+gesamten stdlib von niemandem benutzt — `ir_lower` weist sie benannt ab.
+
+| ID | Operation | Lowering von | Anmerkung |
+|---:|---|---|---|
+| 472 | Linux-Syscall fcntl (Nr. 3) | `sys_fcntl` | #2024; Linux-Form der ID aus 172…198 |
+| 473 | Linux-Syscall dup3 (Nr. 3) | `sys_dup3` | #2024; Linux-Form der ID aus 172…198 |
+| 474 | Linux-Syscall ftruncate (Nr. 2) | `sys_ftruncate` | #2024; Linux-Form der ID aus 172…198 |
+| 475 | Linux-Syscall fsync (Nr. 1) | `sys_fsync` | #2024; Linux-Form der ID aus 172…198 |
+| 476 | Linux-Syscall fdatasync (Nr. 1) | `sys_fdatasync` | #2024; Linux-Form der ID aus 172…198 |
+| 477 | Linux-Syscall uname (Nr. 1) | `sys_uname` | #2024; Linux-Form der ID aus 172…198 |
+| 478 | Linux-Syscall getcpu (Nr. 3) | `sys_getcpu` | #2024; Linux-Form der ID aus 172…198 |
+| 479 | Linux-Syscall readv (Nr. 3) | `sys_readv` | #2024; Linux-Form der ID aus 172…198 |
+| 480 | Linux-Syscall writev (Nr. 3) | `sys_writev` | #2024; Linux-Form der ID aus 172…198 |
+| 481 | Linux-Syscall statfs (Nr. 2) | `sys_statfs` | #2024; Linux-Form der ID aus 172…198 |
+| 482 | Linux-Syscall sched_getaffinity (Nr. 3) | `sys_sched_getaffinity` | #2024; Linux-Form der ID aus 172…198 |
+| 483 | Linux-Syscall sched_setaffinity (Nr. 3) | `sys_sched_setaffinity` | #2024; Linux-Form der ID aus 172…198 |
+| 484 | Linux-Syscall getpriority (Nr. 2) | `sys_getpriority` | #2024; Linux-Form der ID aus 172…198 |
+| 485 | Linux-Syscall setpriority (Nr. 3) | `sys_setpriority` | #2024; Linux-Form der ID aus 172…198 |
+| 486 | Linux-Syscall kill (Nr. 2) | `sys_kill` | #2024; Linux-Form der ID aus 172…198 |
+| 487 | Linux-Syscall pipe2 (Nr. 2) | `sys_pipe2` | #2024; Linux-Form der ID aus 172…198 |
+| 488 | Linux-Syscall sendto (Nr. 6) | `sys_sendto` | #2024; Linux-Form der ID aus 172…198 |
+| 489 | Linux-Syscall recvfrom (Nr. 6) | `sys_recvfrom` | #2024; Linux-Form der ID aus 172…198 |
+| 490 | Linux-Syscall getsockname (Nr. 3) | `sys_getsockname` | #2024; Linux-Form der ID aus 172…198 |
+| 491 | Linux-Syscall getpeername (Nr. 3) | `sys_getpeername` | #2024; Linux-Form der ID aus 172…198 |
+| 492 | Linux-Syscall faccessat (Nr. 3) | `sys_faccessat` | #2024; Linux-Form der ID aus 172…198 |
+| 493 | Linux-Syscall futex (Nr. 6) | `sys_futex` | #2024; Linux-Form der ID aus 172…198 |
