@@ -419,3 +419,60 @@ gesamten stdlib von niemandem benutzt — `ir_lower` weist sie benannt ab.
 | 491 | Linux-Syscall getpeername (Nr. 3) | `sys_getpeername` | #2024; Linux-Form der ID aus 172…198 |
 | 492 | Linux-Syscall faccessat (Nr. 3) | `sys_faccessat` | #2024; Linux-Form der ID aus 172…198 |
 | 493 | Linux-Syscall futex (Nr. 6) | `sys_futex` | #2024; Linux-Form der ID aus 172…198 |
+
+
+## Weitere Linux-Syscalls (#2021, dritte Runde)
+
+Nummern aus `asm-generic/unistd.h`. `epoll_wait` und `getpgrp` gibt es dort
+nicht; sie werden auf `epoll_pwait(…, 0, 0)` bzw. `getpgid(0)` umgeschrieben —
+der eingesetzte Wert steht jeweils fest.
+
+| ID | Operation | Lowering von | Anmerkung |
+|---:|---|---|---|
+| 494 | Linux-Syscall accept4 (Nr. 4) | `sys_accept4` | #2021 |
+| 495 | Linux-Syscall capget (Nr. 2) | `sys_capget` | #2021 |
+| 496 | Linux-Syscall capset (Nr. 2) | `sys_capset` | #2021 |
+| 497 | Linux-Syscall fallocate (Nr. 4) | `sys_fallocate` | #2021 |
+| 498 | Linux-Syscall fgetxattr (Nr. 4) | `sys_fgetxattr` | #2021 |
+| 499 | Linux-Syscall flistxattr (Nr. 3) | `sys_flistxattr` | #2021 |
+| 500 | Linux-Syscall fremovexattr (Nr. 2) | `sys_fremovexattr` | #2021 |
+| 501 | Linux-Syscall fsetxattr (Nr. 5) | `sys_fsetxattr` | #2021 |
+| 502 | Linux-Syscall futex_waitv (Nr. 5) | `sys_futex_waitv` | #2021 |
+| 503 | Linux-Syscall getegid (Nr. 0) | `sys_getegid` | #2021 |
+| 504 | Linux-Syscall geteuid (Nr. 0) | `sys_geteuid` | #2021 |
+| 505 | Linux-Syscall inotify_rm_watch (Nr. 2) | `sys_inotify_rm_watch` | #2021 |
+| 506 | Linux-Syscall io_uring_register (Nr. 4) | `sys_io_uring_register` | #2021 |
+| 507 | Linux-Syscall listxattr (Nr. 3) | `sys_listxattr` | #2021 |
+| 508 | Linux-Syscall memfd_create (Nr. 2) | `sys_memfd_create` | #2021 |
+| 509 | Linux-Syscall mincore (Nr. 3) | `sys_mincore` | #2021 |
+| 510 | Linux-Syscall mlock (Nr. 2) | `sys_mlock` | #2021 |
+| 512 | Linux-Syscall mq_getsetattr (Nr. 3) | `sys_mq_getsetattr` | #2021 |
+| 513 | Linux-Syscall mq_timedreceive (Nr. 5) | `sys_mq_timedreceive` | #2021 |
+| 514 | Linux-Syscall mq_timedsend (Nr. 5) | `sys_mq_timedsend` | #2021 |
+| 515 | Linux-Syscall msgctl (Nr. 3) | `sys_msgctl` | #2021 |
+| 516 | Linux-Syscall msgget (Nr. 2) | `sys_msgget` | #2021 |
+| 517 | Linux-Syscall msgrcv (Nr. 5) | `sys_msgrcv` | #2021 |
+| 518 | Linux-Syscall msgsnd (Nr. 4) | `sys_msgsnd` | #2021 |
+| 519 | Linux-Syscall msync (Nr. 3) | `sys_msync` | #2021 |
+| 520 | Linux-Syscall munlock (Nr. 2) | `sys_munlock` | #2021 |
+| 523 | Linux-Syscall pidfd_getfd (Nr. 3) | `sys_pidfd_getfd` | #2021 |
+| 524 | Linux-Syscall reboot (Nr. 4) | `sys_reboot` | #2021 |
+| 525 | Linux-Syscall recvmmsg (Nr. 5) | `sys_recvmmsg` | #2021 |
+| 526 | Linux-Syscall removexattr (Nr. 2) | `sys_removexattr` | #2021 |
+| 527 | Linux-Syscall semctl (Nr. 4) | `sys_semctl` | #2021 |
+| 528 | Linux-Syscall semget (Nr. 3) | `sys_semget` | #2021 |
+| 529 | Linux-Syscall semop (Nr. 3) | `sys_semop` | #2021 |
+| 530 | Linux-Syscall sendfile (Nr. 4) | `sys_sendfile` | #2021 |
+| 531 | Linux-Syscall sendmmsg (Nr. 4) | `sys_sendmmsg` | #2021 |
+| 532 | Linux-Syscall setgid (Nr. 1) | `sys_setgid` | #2021 |
+| 533 | Linux-Syscall setns (Nr. 2) | `sys_setns` | #2021 |
+| 534 | Linux-Syscall setpgid (Nr. 2) | `sys_setpgid` | #2021 |
+| 535 | Linux-Syscall setsid (Nr. 0) | `sys_setsid` | #2021 |
+| 536 | Linux-Syscall shmctl (Nr. 3) | `sys_shmctl` | #2021 |
+| 537 | Linux-Syscall shmdt (Nr. 1) | `sys_shmdt` | #2021 |
+| 538 | Linux-Syscall signalfd4 (Nr. 4) | `sys_signalfd4` | #2021 |
+| 539 | Linux-Syscall tgkill (Nr. 3) | `sys_tgkill` | #2021 |
+| 540 | Linux-Syscall umount2 (Nr. 2) | `sys_umount2` | #2021 |
+| 541 | Linux-Syscall unshare (Nr. 1) | `sys_unshare` | #2021 |
+| 542 | Linux-Syscall epoll_pwait (Nr. 6) | `sys_epoll_pwait` | #2021 |
+| 543 | Linux-Syscall getpgid (Nr. 1) | `sys_getpgid` | #2021 |
