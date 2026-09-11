@@ -42,15 +42,19 @@ printf 'fn main(): int64 { return StrCharAt("abc"c, 1); }\n' > "$TMP/sc.lyx"
 # auf riscv, und auf Cortex-M IntToStr (16), das dort aus einem BENANNTEN
 # Grund scheitert (kein Puffer, der den Aufruf ueberlebt — es gibt weder mmap
 # noch einen Allokator). Beides muss gemeldet werden, nicht still durchgehen.
-# #2028: hier stand StrConcat — bis 1.2.5F fehlte es im riscv-Backend, und
-# seine Ablehnung war der Nachweis fuer den lauten Default. Mit dem Schliessen
-# der Luecke wurde dieser Test rot: ein Test darf nicht VORAUSSETZEN, dass eine
-# Luecke offen bleibt. Jetzt StrCopy (ID 8), das riscv weiterhin nicht kennt.
+# Diese Zeile wandert: sie braucht ein Builtin, das riscv NOCH NICHT kennt,
+# und genau die werden ja nach und nach umgesetzt. Bisherige Stationen:
 #
-# WER ID 8 UMSETZT, ZIEHT DIESE ZEILE MIT NACH — auf ein dann noch offenes
-# Builtin, oder der Nachweis wandert ganz woandershin. Dieselbe Stelle traf es
-# schon einmal (#1786, damals StrCharAt auf xtensa; siehe Kommentar unten).
-printf 'fn main(): int64 { var s: pchar := StrCopy("a"c); return 0; }\n' > "$TMP/luecke_riscv64.lyx"
+#   StrCharAt auf xtensa  (#1786) → umgesetzt
+#   StrConcat             (#2028) → umgesetzt
+#   StrCopy (ID 8)        (#2037) → umgesetzt
+#   Printf  (ID 12)       ← hier
+#
+# WER ID 12 UMSETZT, ZIEHT DIESE ZEILE MIT NACH. Der Test darf nicht
+# VORAUSSETZEN, dass eine bestimmte Luecke offen bleibt — er prueft nur, dass
+# eine unbehandelte ID LAUT gemeldet wird. Der Vermerk hat beim letzten Mal
+# funktioniert: er stand hier, als ID 8 drankam.
+printf 'fn main(): int64 { Printf("%%d"c, 1); return 0; }\n' > "$TMP/luecke_riscv64.lyx"
 printf 'fn main(): int64 { var s: pchar := IntToStr(7); return 0; }\n' > "$TMP/luecke_arm-cm4.lyx"
 printf 'fn main(): int64 { var a: int64 := 2; var b: int64 := a * 3 + 1; if b > 5 { return b; } return 0; }\n' > "$TMP/rechnen.lyx"
 
