@@ -41,7 +41,7 @@ for fall in \
   if timeout 300 "$LYXC" --std-path="$ROOT" --target=lyxos "$TMP/t.lyx" -o "$TMP/t.out" >"$TMP/l" 2>&1 \
      && [ "$(head -c4 "$TMP/t.out")" = "LYX!" ]
   then ok "lyxos: $name"
-  else bad "lyxos: $name" "$(grep -oE 'unbekannter Builtin.*|Builtin-ID [0-9]+ .*' "$TMP/l" | head -1)"; fi
+  else bad "lyxos: $name" "$(grep -oE 'unbekannter Name im Aufruf.*|unbekannter Builtin.*|Builtin-ID [0-9]+ .*' "$TMP/l" | head -1)"; fi
 done
 
 # ioctl stand bis 1.1.4M in der Liste oben, als baue es. Es baute auch — nur

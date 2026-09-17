@@ -28,7 +28,7 @@ baut() {
   if timeout 300 "$LYXC" --std-path="$ROOT" --target=lyxos "$TMP/t.lyx" -o "$TMP/t.out" >"$TMP/l" 2>&1; then
     if [ "$(head -c4 "$TMP/t.out")" = "LYX!" ]; then ok "$1"; else bad "$1" "kein LYX!-Container"; fi
   else
-    bad "$1" "$(grep -oE 'unbekannter Builtin.*|sema error.*' "$TMP/l" | head -1)"
+    bad "$1" "$(grep -oE 'unbekannter Name im Aufruf.*|unbekannter Builtin.*|sema error.*' "$TMP/l" | head -1)"
   fi
 }
 

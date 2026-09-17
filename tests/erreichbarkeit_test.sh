@@ -42,7 +42,7 @@ for u in std.fs std.io std.alloc std.string std.env std.time std.conv std.math; 
   printf 'import %s;\nfn main(): int64 { return 0; }\n' "$u" > "$TMP/u.lyx"
   if timeout 300 "$LYXC" --std-path="$ROOT" --target=lyxos "$TMP/u.lyx" -o "$TMP/u.out" >"$TMP/l" 2>&1
   then ok "$u baut weiterhin"
-  else bad "$u baut weiterhin" "$(grep -oE 'unbekannter Builtin.*|undefined function.*' "$TMP/l"|head -1)"; fi
+  else bad "$u baut weiterhin" "$(grep -oE 'unbekannter Name im Aufruf.*|unbekannter Builtin.*|undefined function.*' "$TMP/l"|head -1)"; fi
 done
 
 # --- 3: ueber Modulgrenzen hinweg ---------------------------------------------
