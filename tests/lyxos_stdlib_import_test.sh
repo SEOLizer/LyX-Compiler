@@ -32,9 +32,12 @@ pruefe() {   # pruefe <unit> ; setzt $rc und $msg
     rc=1
     # Es gibt ZWEI Fehlerformen, und nur eine zu greifen hat schon einmal
     # einen fehlgeschlagenen Bau als Erfolg gemeldet:
-    #   "unbekannter Builtin/Funktion: X"  (Name im Lowerer unbekannt)
+    #   "unbekannter Name im Aufruf: X"   (Name im Lowerer unbekannt)
     #   "Builtin-ID N wird nicht behandelt" (Backend kennt die ID nicht)
-    msg="$(grep -oE 'unbekannter Builtin/Funktion: .*|Builtin-ID [0-9]+ wird nicht behandelt' "$TMP/l" | head -1)"
+    # Die erste Form hiess bis 1.2.8A "unbekannter Builtin/Funktion: X"; sie
+    # wird mitgegriffen, damit dieser Test auch einen aelteren Compiler
+    # auswerten kann (#2020).
+    msg="$(grep -oE 'unbekannter Name im Aufruf: .*|unbekannter Builtin/Funktion: .*|Builtin-ID [0-9]+ wird nicht behandelt' "$TMP/l" | head -1)"
   fi
 }
 

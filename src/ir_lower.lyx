@@ -716,6 +716,28 @@ pub type IRLower = class {
   // Merker fuer den Nachlauf: hat der letzte Durchgang etwas erzeugt?
   _nochGelowert: int64;
 
+  // #2020: verschachtelte Funktionen (`fn` INNERHALB eines Rumpfes). Der
+  // Vorabpass laeuft nur die Deklarationskette auf Modulebene ab, und
+  // lowerStmt hatte fuer NK_FUNC_DECL keinen Zweig — die Deklaration fiel
+  // durch die if-Kette und wurde STILL verworfen. Der Rumpf entstand nie,
+  // und der Aufruf endete in "unbekannter Builtin/Funktion: w4".
+  //
+  // sema verbietet den Zugriff auf die Umgebung ("verschachtelte Funktion
+  // darf keine lokale Variable der umgebenden Funktion verwenden", sema.lyx:4483)
+  // — GEMESSEN fuer lokale Variablen UND Parameter. Eine verschachtelte
+  // Funktion ist deshalb nichts als eine Modulfunktion, die weiter innen
+  // steht: Hochziehen genuegt, ein Static Link ist nicht noetig.
+  // Je Eintrag 24 Byte: {Knotenindex, Zeiger auf den eindeutigen Namen, Laenge}.
+  nestBuf:     int64;
+  nestCnt:     int64;
+  nestCap:     int64;
+  // Der eindeutige Name der gerade erzeugten Funktion ("aussen" bzw.
+  // "aussen@innen"). Er ist zugleich der Gueltigkeitsbereich fuer die
+  // Namensaufloesung: ein Aufruf sucht erst "<hier>@name", dann eine Ebene
+  // weiter aussen, zuletzt den blanken Namen auf Modulebene.
+  nestPfx:     int64;
+  nestPfxLen:  int64;
+
   // #1693: Suchpfade fuer Importe. Die IR-Strecke hat sie bisher nicht
   // gekannt und jeden Import stur relativ zum ARBEITSVERZEICHNIS gelesen —
   // `-I` und `--std-path` blieben wirkungslos. Schlug das Lesen fehl, wurde
@@ -790,6 +812,11 @@ pub type IRLower = class {
     self.doneBuf := alloc(self.doneCap);
     self.nurErreichbar := 0;
     self._nochGelowert := 0;
+    self.nestCap := 64;
+    self.nestBuf := alloc(self.nestCap * 24);
+    self.nestCnt := 0;
+    self.nestPfx := 0;
+    self.nestPfxLen := 0;
     var wbI: int64 := 0;
     while wbI < self.wantCap { poke8(self.wantBuf + wbI, 0); poke8(self.doneBuf + wbI, 0); wbI := wbI + 1; }
     self._tregCap := 1024;
@@ -2510,11 +2537,50 @@ pub type IRLower = class {
     // not supported: caller defined before callee in source order hits this
     // path; callee defined LATER falls through to the IRO_CALL_BUILTIN
     // legacy fallback below.
+    // #2020: erst im eigenen Gueltigkeitsbereich suchen, dann weiter aussen.
+    // Steht die Ausfuehrung in "SigV4DateNow", so meint `w4` die dort innen
+    // stehende Funktion, die als "SigV4DateNow@w4" erzeugt wurde.
+    //
+    // Von innen nach aussen, eine Ebene je Durchgang: eine verschachtelte
+    // Funktion darf ihre Geschwister rufen (auf dem x86-Weg gemessen), und
+    // die stehen eine Ebene ueber ihr. Erst wenn kein Weg mehr uebrig ist,
+    // gilt der blanke Name auf Modulebene — die Suche unten bleibt also die
+    // letzte Station und ist unveraendert.
+    // Kostenwaechter: nestCnt zaehlt die verschachtelten Funktionen, die fuer
+    // dieses Modul eingesammelt und noch nicht abgeraeumt sind. Ist sie 0,
+    // gibt es hier keine, und die Suche unten waere reine Arbeit — ein
+    // zusaetzlicher Durchlauf durch den funcBuffer JE AUFRUFSTELLE. In der
+    // stdlib haben 3 von 452 Units ueberhaupt eine verschachtelte Funktion;
+    // ohne diesen Riegel zahlten die anderen 449 fuer nichts, und die Bauzeit
+    // auf dem IR-Weg ist ohnehin schon ein offener Posten (#2023).
+    var nlPfxLen: int64 := 0;
+    if self.nestCnt > 0 { nlPfxLen := self.nestPfxLen; }
+    var nlTreffer: int64 := -1;
+    while nlPfxLen > 0 && nlTreffer < 0 {
+      var nlKand: int64 := self._nestMangle(self.nestPfx, nlPfxLen, fname, fnlen);
+      nlTreffer := self._findFuncIdxStill(nlKand as pchar, nlPfxLen + 1 + fnlen);
+      free(nlKand, nlPfxLen + 1 + fnlen + 1);
+      if nlTreffer < 0 {
+        // eine Ebene nach aussen: bis zum letzten '@' zuruecknehmen
+        var nlNeu: int64 := 0;
+        var nlS: int64 := 0;
+        while nlS < nlPfxLen {
+          if peek8(self.nestPfx + nlS) == 64 { nlNeu := nlS; }
+          nlS := nlS + 1;
+        }
+        nlPfxLen := nlNeu;
+      }
+    }
+    // Gefunden wird hier nur der INDEX. Den Aufruf selbst schreibt die
+    // vorhandene Stelle unten — sie fuellt auch die nicht genannten
+    // Vorgabewerte (WP-MEM-05). Ein eigener Aufrufzweig daneben waere die
+    // zweite Stelle, die man beim naechsten Mal vergisst nachzuziehen.
     var fbUserBuf: int64 := peek64(self.ir + IR_MOD_OFF_FUNCBUF);
     var fbUserStr: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
     var fbUserCnt: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);
-    var fbUserIdx: int64 := -1;
+    var fbUserIdx: int64 := nlTreffer;
     var fbI: int64 := 0;
+    if fbUserIdx >= 0 { fbI := fbUserCnt; }
     while fbI < fbUserCnt {
       var fbNOff: int64 := peek64(fbUserBuf + fbI * 80);
       var fbNLen: int64 := peek64(fbUserBuf + fbI * IR_FUNC_SIZE + IR_FUNC_OFF_NAMELEN);
@@ -5467,12 +5533,27 @@ pub type IRLower = class {
     // #1388: Das Ziel im Text war festverdrahtet ("lyxos"), obwohl diese
     // Stelle fuer JEDES IR-Ziel gilt. Wer mit --target=arm64 uebersetzte,
     // bekam die Meldung fuer ein anderes Backend genannt und suchte dort.
+    //
+    // #2020, zweiter Teil: die Meldung nannte nur "unbekannter
+    // Builtin/Funktion: w4". Das liest sich wie eine Luecke in der
+    // Builtin-Tabelle, und genau so wurde es auch einsortiert — `w4` war in
+    // Wahrheit eine verschachtelte Funktion, die drei Zeilen ueber dem Aufruf
+    // steht. Die falsche Faehrte hat Zeit gekostet.
+    //
+    // Deshalb wird jetzt gesagt, WAS geprueft wurde und was der Name NICHT
+    // ist. Wer den Namen im Modul sieht, soll nicht nach einem Builtin suchen.
     Print("lyxc: --target="c);
     Print(self._targetName());
-    Print(": unbekannter Builtin/Funktion: "c);
+    Print(": unbekannter Name im Aufruf: "c);
     var ucI: int64 := 0;
     while (ucI < fnlen) { PrintChar(StrCharAt(fname, ucI)); ucI := ucI + 1; }
     PrintLn(""c);
+    EPrintStrLn("  Er ist hier weder eine Funktion dieses Moduls oder eines Imports,"c);
+    EPrintStrLn("  noch eine `extern fn ... link`, noch ein Builtin, das dieses Ziel"c);
+    EPrintStrLn("  kennt. Steht der Name sichtbar im Quelltext, fehlt nicht die"c);
+    EPrintStrLn("  Tabelle, sondern die Aufloesung — dann ist die Herkunft die Frage"c);
+    EPrintStrLn("  (Modulebene? Import? verschachtelt?), nicht der Builtin."c);
+    EPrintStrLn("  Uebersetzt er mit --target=x86_64, ist es eine Luecke des IR-Wegs."c);
     exit(1);
 
     return dest;
@@ -6665,6 +6746,18 @@ pub type IRLower = class {
       poke64(self.localTypeBuf + self.localNameCnt * 8, self.nodeC0(stmt));
       self.localNameCnt += 1;
     }
+    // #2020: eine verschachtelte `fn` als Anweisung. Hier entsteht NICHTS —
+    // ihr Rumpf wird nach der umgebenden Funktion erzeugt (sonst laege er
+    // mitten im Befehlsstrom der aeusseren, die anschliessend hineinfiele;
+    // derselbe Grund, aus dem der x86-Weg sie vormerkt statt sie an Ort und
+    // Stelle zu emittieren).
+    //
+    // Der Zweig steht ausdruecklich da, obwohl er leer ist: vorher fiel
+    // NK_FUNC_DECL durch die ganze if-Kette und wurde STILL verworfen. Wer
+    // hier einen Knoten nicht behandelt, soll es sehen koennen.
+    else if (k == NK_FUNC_DECL) {
+      // absichtlich leer — siehe oben
+    }
     // Try/Catch/Finally handled in lowering blocks
   }
   
@@ -7368,6 +7461,20 @@ pub type IRLower = class {
     self._volSlotN := 0;   // WP-VOLATILE: volatile-Slot-Liste pro Funktion zurücksetzen
     self.curFunc := funcNode;
 
+    // #2020: Der eigene eindeutige Name ist zugleich der Gueltigkeitsbereich,
+    // in dem ein Aufruf zuerst gesucht wird. Er kommt aus derselben Quelle,
+    // aus der _addFunc den Namen nimmt — sonst suchte die Aufloesung unter
+    // einem anderen Namen, als die Funktion traegt.
+    var nfSavePfx: int64 := self.nestPfx;
+    var nfSaveLen: int64 := self.nestPfxLen;
+    if self.overrideFuncName != 0 {
+      self.nestPfx    := self.overrideFuncName as int64;
+      self.nestPfxLen := self.overrideFuncNameLen;
+    } else {
+      self.nestPfx    := self.nodeSVal(funcNode) as int64;
+      self.nestPfxLen := self.nodeSLen(funcNode);
+    }
+
     // WP-AND-upstream-fix v8: allocate params FIRST (slots 0..paramCount-1)
     // so they line up with the AAPCS64 spill the prologue performs and with
     // NK_IDENT's pidx-based loads. retValTemp moves AFTER params so it
@@ -7408,6 +7515,8 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
     }
     self._addFunc();
+    self.nestPfx    := nfSavePfx;
+    self.nestPfxLen := nfSaveLen;
   }
    
   // ------------------------------------------------------------------
@@ -7606,6 +7715,14 @@ pub type IRLower = class {
     // import, which performs its own pre-pass. Convention: imports
     // appear before function bodies in source order, so the chain
     // resolves correctly.
+    // #2020: WASSERMARKE. lowerModule ruft sich fuer jeden Import SELBST auf,
+    // und nestBuf ist ein Feld — also geteilt. Ohne diese Marke erzeugte der
+    // innere Aufruf am Ende auch die verschachtelten Funktionen des AEUSSEREN
+    // Moduls, und zwar mit den Knotentabellen des Imports: die Rumpfe kamen
+    // aus einer fremden Datei. Sichtbar wurde es als falscher Wert, nicht als
+    // Fehler — der Aufruf fand eine Funktion, nur die falsche.
+    var nsBase: int64 := self.nestCnt;
+
     var pfCur: int64 := decls;
     while pfCur >= 0 {
       var pfKind: int64 := self.nodeKind(pfCur);
@@ -7621,6 +7738,12 @@ pub type IRLower = class {
           var pfNameLen: int64 := self.nodeSLen(pfCur);
           var pfNameOff: int64 := self.irAddString(pfNamePtr, pfNameLen);
           self.irAddFunc(pfNameOff, pfNameLen, 0, 0);
+          // #2020: Dieser Durchgang lief bisher NUR die Deklarationskette auf
+          // Modulebene ab. Eine `fn` im Rumpf einer anderen `fn` stand nie
+          // darin, wurde also nie registriert — und der Aufruf endete in
+          // "unbekannter Builtin/Funktion". Der Rumpf wird hier nur
+          // eingesammelt; erzeugt wird er unten, nach der aeusseren Funktion.
+          self._nestSammle(self.nodeC2(pfCur), pfNamePtr as int64, pfNameLen, 0);
         }
       } else if pfKind == NK_TYPE_DECL {
         // ARM64-OOP: Methoden (c1-Chain) unter mangled Namen "Class_method" registrieren.
@@ -8003,6 +8126,49 @@ pub type IRLower = class {
       }
       cur := self.nodeNext(cur);
     }
+
+    // #2020: die eingesammelten verschachtelten Funktionen erzeugen — NACH
+    // den aeusseren, als waeren es gewoehnliche Modulfunktionen. Genau das
+    // sind sie ja auch: sema verbietet ihnen den Zugriff auf die Umgebung,
+    // also fehlt ihnen nichts, was nur innen zu haben waere.
+    //
+    // Die Erreichbarkeitspruefung ist dieselbe wie oben. Ohne sie traege
+    // jeder Import die Rumpfe seiner inneren Helfer mit, auch die niemand
+    // ruft — bei `--compile-unit` faellt das nicht auf, beim Binden schon.
+    var nsI: int64 := nsBase;
+    while nsI < self.nestCnt {
+      var nsRec:  int64 := self.nestBuf + nsI * 24;
+      var nsNode: int64 := peek64(nsRec);
+      var nsName: int64 := peek64(nsRec + 8);
+      var nsLen:  int64 := peek64(nsRec + 16);
+      var nsIdx:  int64 := self._findFuncIdxStill(nsName as pchar, nsLen);
+      var nsTun:  int64 := 0;
+      if self.nurErreichbar == 0 {
+        nsTun := 1;
+      } else if nsIdx < 0 {
+        nsTun := 1;
+      } else if nsIdx < self.wantCap {
+        if peek8(self.wantBuf + nsIdx) != 0 { nsTun := 1; }
+      }
+      if nsTun != 0 && nsIdx >= 0 && nsIdx < self.doneCap {
+        if peek8(self.doneBuf + nsIdx) != 0 { nsTun := 0; }
+      }
+      if nsTun != 0 {
+        if nsIdx >= 0 && nsIdx < self.doneCap { poke8(self.doneBuf + nsIdx, 1); }
+        // Unter dem eindeutigen Namen erzeugen. overrideFuncName ist der
+        // Weg, den schon die Generika nehmen (_addFunc liest ihn aus).
+        var nsSaveN: pchar := self.overrideFuncName;
+        var nsSaveL: int64 := self.overrideFuncNameLen;
+        self.overrideFuncName    := nsName as pchar;
+        self.overrideFuncNameLen := nsLen;
+        self.lowerFunc(nsNode);
+        self.overrideFuncName    := nsSaveN;
+        self.overrideFuncNameLen := nsSaveL;
+        self._nochGelowert := 1;
+      }
+      nsI := nsI + 1;
+    }
+    self.nestCnt := nsBase;
 
     // #1727: Nachlauf. Bis hierher ist jeder Import genau einmal durchlaufen
     // worden — in Quelltextreihenfolge. Ruft eine importierte Funktion etwas
@@ -9670,6 +9836,89 @@ pub type IRLower = class {
     }
     self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, basis, -1, id);
     return dest;
+  }
+
+  // ====================================================================
+  // #2020: verschachtelte Funktionen
+  //
+  // Warum ueberhaupt umbenannt wird: zwei aeussere Funktionen duerfen je eine
+  // `nib` enthalten, und eine verschachtelte darf eine gleichnamige auf
+  // Modulebene verdecken. Wuerde die innere unter ihrem blanken Namen in den
+  // funcBuffer wandern, entschiede die Reihenfolge, welche gilt — dieselbe
+  // stille Verwechslung wie bei den gleichnamigen Konstanten aus #2035.
+  // Deshalb traegt jede den Weg dorthin im Namen: "SigV4DateNow@w4".
+  //
+  // Das "@" kann in keinem Bezeichner vorkommen (der Lexer laesst es nicht
+  // zu), die erzeugten Namen koennen also mit keinem geschriebenen kollidieren.
+  fn _nestMangle(pfx: int64, pfxLen: int64, np: pchar, nl: int64): int64 {
+    var g: int64 := pfxLen + 1 + nl;
+    var b: int64 := alloc(g + 1);
+    var i: int64 := 0;
+    while i < pfxLen { poke8(b + i, peek8(pfx + i)); i := i + 1; }
+    poke8(b + pfxLen, 64);                     // '@'
+    var j: int64 := 0;
+    while j < nl { poke8(b + pfxLen + 1 + j, peek8((np as int64) + j)); j := j + 1; }
+    poke8(b + g, 0);
+    return b;
+  }
+
+  fn _nestRecord(ni: int64, namePtr: int64, nameLen: int64) {
+    if self.nestCnt >= self.nestCap {
+      var nc: int64 := self.nestCap * 2;
+      var nb: int64 := alloc(nc * 24);
+      memcpy(nb, self.nestBuf, self.nestCnt * 24);
+      free(self.nestBuf, self.nestCap * 24);
+      self.nestBuf := nb; self.nestCap := nc;
+    }
+    var r: int64 := self.nestBuf + self.nestCnt * 24;
+    poke64(r,      ni);
+    poke64(r + 8,  namePtr);
+    poke64(r + 16, nameLen);
+    self.nestCnt := self.nestCnt + 1;
+  }
+
+  // Den Teilbaum einer Funktion nach verschachtelten Deklarationen absuchen.
+  //
+  // Gelaufen wird ueber ALLE Kindkanten, nicht nur ueber Bloecke: eine `fn`
+  // darf auch im Rumpf eines `if` oder einer Schleife stehen, und der x86-Weg
+  // nimmt sie dort ebenfalls an (cg_genBlock wird rekursiv betreten). Wer hier
+  // nur die oberste Anweisungskette abliefe, haette genau die halbe Loesung.
+  //
+  // Die Tiefenschranke ist kein Schmuck: eine unbegrenzte Rekursion ueber
+  // einen Knotengraphen hat in #1370 eine fremde Konsole mitgerissen.
+  fn _nestSammle(n: int64, pfx: int64, pfxLen: int64, tiefe: int64) {
+    if n < 0 { return; }
+    // 4096, nicht 64: gezaehlt wird die Tiefe des SYNTAXBAUMS, und ein
+    // langer Ausdruck (a+b+c+...) ist linksseitig genauso tief wie er Glieder
+    // hat. Eine knappe Schranke wuerde hier gueltigen Code abweisen. Sie ist
+    // nur der Deckel gegen einen Zyklus — der Baum hat keinen, aber eine
+    // unbegrenzte Rekursion hat in #1370 eine fremde Konsole mitgerissen.
+    if tiefe > 4096 {
+      EPrintStrLn("lyxc: #2020: Syntaxbaum tiefer als 4096 Ebenen — abgebrochen."c);
+      exit(1);
+    }
+    var cur: int64 := n;
+    while cur >= 0 {
+      var k: int64 := self.nodeKind(cur);
+      if k == NK_FUNC_DECL && self.nodeC2(cur) >= 0 {
+        // Eine `extern fn ... link` hat keinen Rumpf (c2 == -1) und faellt
+        // damit schon durch die Bedingung — sie bleibt FFI und darf hier
+        // nicht als Nutzerfunktion registriert werden.
+        var mp: int64 := self._nestMangle(pfx, pfxLen, self.nodeSVal(cur), self.nodeSLen(cur));
+        var ml: int64 := pfxLen + 1 + self.nodeSLen(cur);
+        var mo: int64 := self.irAddString(mp as pchar, ml);
+        self.irAddFunc(mo, ml, 0, 0);
+        self._nestRecord(cur, mp, ml);
+        // Weiter nach innen — mit dem neuen Weg als Praefix.
+        self._nestSammle(self.nodeC2(cur), mp, ml, tiefe + 1);
+      } else {
+        self._nestSammle(self.nodeC0(cur), pfx, pfxLen, tiefe + 1);
+        self._nestSammle(self.nodeC1(cur), pfx, pfxLen, tiefe + 1);
+        self._nestSammle(self.nodeC2(cur), pfx, pfxLen, tiefe + 1);
+        self._nestSammle(self.nodeC3(cur), pfx, pfxLen, tiefe + 1);
+      }
+      cur := self.nodeNext(cur);
+    }
   }
 
   // #2024: Ist das Ziel LyxOS? Nur dort gilt die LyxOS-ABI mit ihrer eigenen

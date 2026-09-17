@@ -196,7 +196,18 @@ compile_ok "pokef64_compiles" 'fn main(): int64 { var b: int64 := mmap(0, 4096, 
 compile_ok "poke32f_compiles" 'fn main(): int64 { var b: int64 := mmap(0, 4096, 3, 34, 0-1, 0); poke32f(b, 1.5); return 0; }'
 
 # (EPrintFloat ist sema-bekannt aber nicht für lyxos gelowert → muss laut scheitern)
-compile_fail "hardened_catchall" 'fn main(): int64 { EPrintFloat(1.0); return 0; }' "unbekannter Builtin"
+#
+# Geprueft wird die HAERTUNG, nicht die Luecke: ein Name, den der Lowerer
+# nicht kennt, muss abbrechen statt still etwas Plausibles zu tun (der
+# Misdispatch aus #839). Dass gerade EPrintFloat fehlt, ist #2042 — wird es
+# umgesetzt, gehoert hier ein anderer unbekannter Name hin, nicht die
+# Erwartung geloescht.
+#
+# Wortlaut seit 1.2.9A (#2020): "unbekannter Name im Aufruf". Davor hiess es
+# "unbekannter Builtin/Funktion" — die Meldung klang nach einer Luecke in der
+# Builtin-Tabelle und hat die Fehlersuche bei einer verschachtelten Funktion
+# in die falsche Richtung geschickt.
+compile_fail "hardened_catchall" 'fn main(): int64 { EPrintFloat(1.0); return 0; }' "unbekannter Name im Aufruf"
 
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]

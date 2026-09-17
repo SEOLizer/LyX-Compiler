@@ -50,13 +50,13 @@ if "$LYXC" "$TMP/e1.lyx" -I "$TMP/u" --target=lyxos -o "$TMP/e1.lbf" > "$TMP/a.l
     bad "lyxos: uebersetzt, aber keine LBF entstanden"
   fi
 else
-  bad "lyxos: importierte Funktion ($(grep -oE 'unbekannter Builtin.*|error.*' "$TMP/a.log" | head -1))"
+  bad "lyxos: importierte Funktion ($(grep -oE 'unbekannter Name im Aufruf.*|unbekannter Builtin.*|error.*' "$TMP/a.log" | head -1))"
 fi
 
 if "$LYXC" "$TMP/e2.lyx" -I "$TMP/u" --target=lyxos -o "$TMP/e2.lbf" > "$TMP/b.log" 2>&1 && [ -s "$TMP/e2.lbf" ]; then
   ok "lyxos: transitiver Import (Main -> Mittel -> Basis)"
 else
-  bad "lyxos: transitiver Import ($(grep -oE 'unbekannter Builtin.*|error.*' "$TMP/b.log" | head -1))"
+  bad "lyxos: transitiver Import ($(grep -oE 'unbekannter Name im Aufruf.*|unbekannter Builtin.*|error.*' "$TMP/b.log" | head -1))"
 fi
 
 # Gegenprobe Linux: derselbe Quelltext muss auch rechnen, nicht nur uebersetzen.

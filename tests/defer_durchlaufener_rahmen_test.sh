@@ -137,10 +137,15 @@ c" 0
 
 # ===========================================================================
 # #1388 — die Meldung nennt das Ziel, mit dem uebersetzt wurde
+#
+# Der Wortlaut heisst seit 1.2.9A "unbekannter Name im Aufruf" (#2020), davor
+# "unbekannter Builtin/Funktion". BEIDE werden gegriffen — sonst liefe dieser
+# Test bei leerem Treffer in den Zweig "uebersetzt inzwischen ohne Meldung"
+# und waere gruen, ohne noch irgendetwas zu pruefen.
 # ===========================================================================
 
 printf 'import std.io;\nfn main(): int64 { PrintLn("hallo"); return 0; }\n' > "$TMP/ir.lyx"
-meldung="$("$LYXC" --std-path="$ROOT" "$TMP/ir.lyx" --target=arm64 -o "$TMP/ir" 2>&1 | grep -i "unbekannter Builtin" | head -1)"
+meldung="$("$LYXC" --std-path="$ROOT" "$TMP/ir.lyx" --target=arm64 -o "$TMP/ir" 2>&1 | grep -iE "unbekannter (Name im Aufruf|Builtin)" | head -1)"
 if [ -z "$meldung" ]; then
   # Kein Fehler mehr? Dann ist das Backend inzwischen vollstaendig — der Test
   # sagt das, statt stumm gruen zu sein.
@@ -152,7 +157,7 @@ else
 fi
 
 # Und fuer ein zweites Ziel, damit nicht bloss ein anderer fester Text steht.
-meldung2="$("$LYXC" --std-path="$ROOT" "$TMP/ir.lyx" --target=riscv -o "$TMP/ir2" 2>&1 | grep -i "unbekannter Builtin" | head -1)"
+meldung2="$("$LYXC" --std-path="$ROOT" "$TMP/ir.lyx" --target=riscv -o "$TMP/ir2" 2>&1 | grep -iE "unbekannter (Name im Aufruf|Builtin)" | head -1)"
 if [ -z "$meldung2" ]; then
   ok "#1388: --target=riscv uebersetzt std.io inzwischen ohne Meldung"
 elif printf '%s' "$meldung2" | grep -q -- "--target=riscv"; then
