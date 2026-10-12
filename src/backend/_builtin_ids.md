@@ -31,6 +31,7 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 | 7 | Verkettung | `StrConcat` | |
 | 8 | Kopie | `StrCopy` | |
 | 9 | Gleitkomma nach stdout | `PrintFloat` | Linux-ARM64 bislang No-op |
+| 545 | Gleitkomma nach **stderr** | `EPrintFloat` | #2042; derselbe Rumpf wie 9, nur fd = 2 — arm64 und riscv teilen sich den Zweig |
 | 10 | Datenbarriere (DMB SY) | `mem_barrier` | |
 | 11 | Befehlsbarriere (ISB SY) | `inst_barrier` | |
 | 12 | Formatierte Ausgabe | `Printf` | war bis 1.0.11C fälschlich 10 |

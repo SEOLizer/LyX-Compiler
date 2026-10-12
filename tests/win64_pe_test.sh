@@ -114,7 +114,11 @@ else
     else
       bad "#1676 Name der zweiten DLL steht in der Datei"
     fi
-    doppelt=$(objdump -p "$TMP/zwei.exe" 2>/dev/null | grep -cE "^\s+[0-9a-f]+\s+0\s+lstrlenA")
+    # Nur Adresse vorn und Name hinten festlegen, nicht die Spalten dazwischen:
+    # bis binutils 2.45 stand dort "Hint/Ord" (eine Spalte), ab 2.46 "Ordinal
+    # Hint" (zwei, `<none>  0000`). Das alte Muster zaehlte danach 0 und der
+    # Test wurde rot, obwohl die Importtabelle stimmte.
+    doppelt=$(objdump -p "$TMP/zwei.exe" 2>/dev/null | grep -cE "^\s+[0-9a-f]+\s.*\slstrlenA\s*$")
     pruefe "#1676 lstrlenA steht genau einmal in den Gruppen" "$doppelt" "1"
   fi
   lauf zwei

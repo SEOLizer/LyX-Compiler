@@ -2675,14 +2675,30 @@ pub type IRLower = class {
 
     // FFI: is fname a declared `extern fn ... link "lib"`? Such a decl is a
     // bodyless NK_FUNC_DECL (c2 == -1) carrying the packed library span in c3
-    // (set by the parser). Scan the node table for a name match. (Inline, no
-    // helper method — adding methods to IRLower shifts its vtable and breaks
-    // the seed compiler.) Imports are handled because lowerModule swaps
-    // self.src/self.nodes while lowering each import's bodies.
+    // (set by the parser). Scan the node table for a name match.
+    //
+    // #2043, RICHTIGSTELLUNG: hier stand, Importe seien abgedeckt, "because
+    // lowerModule swaps self.src/self.nodes while lowering each import's
+    // bodies". Das gilt fuer die RUMPFE der importierten Unit — nicht fuer
+    // einen Aufruf AUS der importierenden. Waehrend mongos eigener Rumpf
+    // abgesenkt wird, ist self.nodes mongos Tabelle, und die enthaelt keine
+    // extern-Deklaration fuer SSL_shutdown. Die Aufzaehlung deckte damit
+    // genau eine der zwei moeglichen Herkuenfte ab, und der Kommentar
+    // beschrieb die Luecke als geschlossen.
+    //
+    // Messbar war es daran, dass std/net/tls.lyx (deklariert selbst)
+    // uebersetzte und std/net/mongo.lyx (ruft ueber den Import) nicht —
+    // gleiche Funktion, andere Herkunft.
+    //
+    // Der Nachtrag unten durchsucht deshalb die behaltene Importliste (#1727).
+    // Die Bibliotheksspanne c3 zeigt in self.src der DEKLARIERENDEN Unit; der
+    // Text wird darum interniert, WAEHREND deren Tabellen eingesetzt sind.
+    // Mit der eigenen Quelle gelesen ergaebe sich ein plausibler, aber
+    // falscher Bibliotheksname — ein stiller Default.
     var exNi: int64 := -1;
     var exScan: int64 := 0;
     while exScan < self.nodeCount {
-      if self.nodeKind(exScan) == NK_FUNC_DECL && self.nodeC2(exScan) == -1 && self.nodeC3(exScan) != -1 {
+      if self.nodeKind(exScan) == NK_FUNC_DECL && self._istExternDecl(exScan) != 0 {
         if self.nodeSLen(exScan) == fnlen {
           var exNamePtr: pchar := self.nodeSVal(exScan);
           var exMatch: int64 := 1;
@@ -2698,12 +2714,72 @@ pub type IRLower = class {
       }
       exScan += 1;
     }
+    // #2043: im eigenen Modul nicht gefunden — dann in den Importen nachsehen.
+    // Gefunden wird hier nicht nur der Knoten, sondern gleich der internierte
+    // Bibliotheksname: er muss aus der Quelle der DEKLARIERENDEN Unit gelesen
+    // werden, und nur an dieser Stelle sind deren Tabellen eingesetzt.
+    var exLibVorab: int64 := 0 - 1;
+    var exLibVorabLen: int64 := 0;
+    if exNi < 0 && self.impLstN > 0 {
+      var exSaveS: pchar := self.src;
+      var exSaveN: int64 := self.nodes;
+      var exSaveC: int64 := self.nodeCount;
+      var exM: int64 := 0;
+      while exM < self.impLstN {
+        self.src       := peek64(self.impLstSrc + exM * 8) as pchar;
+        self.nodes     := peek64(self.impLstNodes + exM * 8);
+        self.nodeCount := peek64(self.impLstCnt + exM * 8);
+        var exS2: int64 := 0;
+        while exS2 < self.nodeCount {
+          if self.nodeKind(exS2) == NK_FUNC_DECL && self._istExternDecl(exS2) != 0 {
+            if self.nodeSLen(exS2) == fnlen {
+              var exP2: pchar := self.nodeSVal(exS2);
+              var exOk: int64 := 1;
+              var exJ2: int64 := 0;
+              while exJ2 < fnlen {
+                if exOk != 0 {
+                  if peek8((exP2 as int64) + exJ2) != peek8((fname as int64) + exJ2) { exOk := 0; }
+                }
+                exJ2 += 1;
+              }
+              if exOk != 0 {
+                var exPk: int64 := self.nodeC3(exS2);
+                var exLo: int64 := exPk & 0xFFFFFFFF;
+                var exLl: int64 := (exPk >> 32) & 0xFFFFFFFF;
+                // JETZT internieren, solange self.src die Quelle der
+                // deklarierenden Unit ist.
+                exLibVorab    := self.irAddString((self.src as int64 + exLo) as pchar, exLl);
+                exLibVorabLen := exLl;
+                exNi := exS2;
+                exS2 := self.nodeCount;
+                exM  := self.impLstN;
+              }
+            }
+          }
+          exS2 += 1;
+        }
+        exM += 1;
+      }
+      self.src := exSaveS; self.nodes := exSaveN; self.nodeCount := exSaveC;
+    }
+
     if exNi >= 0 {
-      var exLibPacked: int64 := self.nodeC3(exNi);
-      var exLibOff: int64 := exLibPacked & 0xFFFFFFFF;
-      var exLibLen: int64 := (exLibPacked >> 32) & 0xFFFFFFFF;
       var exNameStrOff: int64 := self.irAddString(fname, fnlen);
-      var exLibStrOff: int64 := self.irAddString((self.src as int64 + exLibOff) as pchar, exLibLen);
+      var exLibStrOff: int64 := 0;
+      var exLibLen: int64 := 0;
+      if exLibVorab >= 0 {
+        // Aus einem Import. exNi ist ein Index in DESSEN Knotentabelle und
+        // darf hier nicht mehr gelesen werden — self.nodes ist laengst wieder
+        // die eigene, und der Index kann ueber deren Ende hinausweisen.
+        // Bibliotheksname und Laenge stehen deshalb schon fest.
+        exLibStrOff := exLibVorab;
+        exLibLen    := exLibVorabLen;
+      } else {
+        var exLibPacked: int64 := self.nodeC3(exNi);
+        var exLibOff: int64 := exLibPacked & 0xFFFFFFFF;
+        exLibLen    := (exLibPacked >> 32) & 0xFFFFFFFF;
+        exLibStrOff := self.irAddString((self.src as int64 + exLibOff) as pchar, exLibLen);
+      }
       var exArgCnt: int64 := 0;
       var exArg: int64 := arg0;
       while exArg >= 0 {
@@ -2723,6 +2799,25 @@ pub type IRLower = class {
         var pfTemp: int64 := self.lowerExpr(arg0);
         self.irAddInstrDirect(IRO_STORE_LOCAL, 0, pfTemp, -1, 0);
         self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 9);
+      }
+      return dest;
+    }
+
+    // #2042: EPrintFloat(f) — dieselbe Ausgabe wie PrintFloat, nur nach
+    // stderr. sema kennt den Namen seit jeher (sema.lyx), der x86-Weg
+    // emittiert ihn (codegen_x86.lyx), nur der IR-Weg nicht: "unbekannter
+    // Name im Aufruf: EPrintFloat". Die zweite Stelle wurde nicht nachgezogen
+    // — dieselbe Klasse wie #1799 und #1803.
+    //
+    // Eigene ID statt "id 9 mit fd-Argument": die Aufrufkonvention der
+    // Builtins reicht die Argumente in Slots durch, und id 9 nimmt dort den
+    // WERT entgegen. Ein zusaetzlicher fd-Slot haette jeden vorhandenen
+    // Aufrufer mit verschoben.
+    if (self.seq(fname, fnlen, "EPrintFloat", 11)) {
+      if arg0 >= 0 {
+        var epTemp: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, epTemp, -1, 0);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 545);
       }
       return dest;
     }
@@ -5322,6 +5417,15 @@ pub type IRLower = class {
     // #1717: Die stdlib ruft `sys_clock_gettime`, gelistet waren nur
     // `clock_gettime` und `sys_clock_get`. Alias auf den vorhandenen Zweig.
     if (self.seq(fname, fnlen, "clock_gettime", 13) || self.seq(fname, fnlen, "sys_clock_gettime", 17)) {
+      // #2045: Die ID 211 ist die LyxOS-Form und galt hier UNBEDINGT — auch
+      // fuer arm64 und riscv, wo sie kein Backend kennt ("Builtin-ID 211 wird
+      // im Linux-Zweig nicht behandelt"). Dieselbe Klasse wie #2024, nur
+      // ausserhalb des Nummernbereichs 172...198 und deshalb dort nicht
+      // miterfasst — eine unvollstaendige Aufzaehlung.
+      //
+      // Unter Linux ist es ein gewoehnlicher Syscall (Nr. 113, zwei
+      // Argumente) und geht ueber dieselbe Tabelle wie die uebrigen.
+      if (self._zielIstLyxos() == 0) { return self._lscRuf(LSC_CLOCK_GETTIME, arg0, dest); }
       var cgB: int64 := self.tempCount; var cgR: int64 := 0; while cgR < 4 { self.allocTemp(); cgR := cgR + 1; }
       var cgA: int64 := arg0;
       if cgA >= 0 { var t: int64 := self.lowerExpr(cgA); self.irAddInstrDirect(IRO_STORE_LOCAL, cgB, t, -1, 0); cgA := self.nodeNext(cgA); }
@@ -7732,7 +7836,7 @@ pub type IRLower = class {
         // functions. Registering them in funcBuffer would make lowerCall
         // resolve them as user calls instead of emitting IRO_CALL_EXTERN.
         var pfIsExtern: int64 := 0;
-        if self.nodeC2(pfCur) == -1 && self.nodeC3(pfCur) != -1 { pfIsExtern := 1; }
+        if self._istExternDecl(pfCur) != 0 { pfIsExtern := 1; }
         if pfIsExtern == 0 {
           var pfNamePtr: pchar := self.nodeSVal(pfCur);
           var pfNameLen: int64 := self.nodeSLen(pfCur);
@@ -7896,7 +8000,7 @@ pub type IRLower = class {
                   while fd2 >= 0 {
                     if self.nodeKind(fd2) == NK_FUNC_DECL {
                       var ext2: int64 := 0;
-                      if self.nodeC2(fd2) == -1 && self.nodeC3(fd2) != -1 { ext2 := 1; }
+                      if self._istExternDecl(fd2) != 0 { ext2 := 1; }
                       if ext2 == 0 {
                         var noff: int64 := self.irAddString(self.nodeSVal(fd2), self.nodeSLen(fd2));
                         self.irAddFunc(noff, self.nodeSLen(fd2), 0, 0);
@@ -7949,7 +8053,7 @@ pub type IRLower = class {
       if (kind == NK_FUNC_DECL) {
         // Skip extern (FFI) decls — no body to lower; calls become IRO_CALL_EXTERN.
         var bodyIsExtern: int64 := 0;
-        if self.nodeC2(cur) == -1 && self.nodeC3(cur) != -1 { bodyIsExtern := 1; }
+        if self._istExternDecl(cur) != 0 { bodyIsExtern := 1; }
         // #1727: Bei einem IMPORT nur erzeugen, was auch gerufen wird. Das
         // Hauptmodul bleibt unangetastet — dort ist alles ein Einstiegspunkt.
         //
@@ -9690,16 +9794,7 @@ pub type IRLower = class {
         if pnCt >= 0 {
           var pnCp: pchar := self.nodeSVal(pnCt);
           var pnCl: int64 := self.nodeSLen(pnCt);
-          if self.seq(pnCp, pnCl, "pchar", 5) { pnArt := 1; }
-          // Ganzzahltypen AUSDRUECKLICH aufzaehlen, wie in den Zweigen
-          // daneben: die Umkehrung ("alles, was nicht pchar ist, ist eine
-          // Zahl") machte aus einem f64 still eine Integer-Ausgabe.
-          else if (self.seq(pnCp, pnCl, "int64", 5) || self.seq(pnCp, pnCl, "int32", 5)
-                || self.seq(pnCp, pnCl, "int16", 5) || self.seq(pnCp, pnCl, "int8", 4)
-                || self.seq(pnCp, pnCl, "uint64", 6) || self.seq(pnCp, pnCl, "uint32", 6)
-                || self.seq(pnCp, pnCl, "uint16", 6) || self.seq(pnCp, pnCl, "uint8", 5)
-                || self.seq(pnCp, pnCl, "bool", 4) || self.seq(pnCp, pnCl, "byte", 4)
-                || self.seq(pnCp, pnCl, "char", 4)) { pnArt := 0; }
+          pnArt := self._artVonTypname(pnCp, pnCl);
         }
       }
       else if (pnK == NK_BINOP || pnK == NK_UNOP) {
@@ -9741,14 +9836,13 @@ pub type IRLower = class {
           else if (pnLk == NK_IDENT) {
             var pnLt: int64 := self._localTypeNode(self.nodeSVal(pnL), self.nodeSLen(pnL));
             if pnLt >= 0 {
-              var pnLp: pchar := self.nodeSVal(pnLt);
-              var pnLl: int64 := self.nodeSLen(pnLt);
-              if (self.seq(pnLp, pnLl, "int64", 5) || self.seq(pnLp, pnLl, "int32", 5)
-               || self.seq(pnLp, pnLl, "int16", 5) || self.seq(pnLp, pnLl, "int8", 4)
-               || self.seq(pnLp, pnLl, "uint64", 6) || self.seq(pnLp, pnLl, "uint32", 6)
-               || self.seq(pnLp, pnLl, "uint16", 6) || self.seq(pnLp, pnLl, "uint8", 5)
-               || self.seq(pnLp, pnLl, "bool", 4) || self.seq(pnLp, pnLl, "byte", 4)
-               || self.seq(pnLp, pnLl, "char", 4)) { pnArt := 0; }
+              // ABWEICHUNG, und zwar gewollt: hier zaehlt NUR der Ganzzahlfall.
+              // Ein Binop, dessen linkes Blatt ein pchar ist, ist keine
+              // Zeichenkettenausgabe — `s + 1` ist Zeigerrechnung, und was
+              // dabei herauskommt, entscheidet diese Stelle nicht. Deshalb
+              // wird ein pchar hier ausdruecklich wieder unentscheidbar.
+              var pnLa: int64 := self._artVonTypname(self.nodeSVal(pnLt), self.nodeSLen(pnLt));
+              if pnLa == 0 { pnArt := 0; }
             }
           }
         }
@@ -9758,17 +9852,20 @@ pub type IRLower = class {
         if pnTn >= 0 {
           var pnTp: pchar := self.nodeSVal(pnTn);
           var pnTl: int64 := self.nodeSLen(pnTn);
-          if self.seq(pnTp, pnTl, "pchar", 5) { pnArt := 1; }
-          // Ganzzahltypen AUSDRUECKLICH aufzaehlen. Die Umkehrung ("alles,
-          // was nicht pchar ist, ist eine Zahl") machte aus einem f64 still
-          // eine Integer-Ausgabe — ein falsches Ergebnis ohne Meldung.
-          else if (self.seq(pnTp, pnTl, "int64", 5) || self.seq(pnTp, pnTl, "int32", 5)
-                || self.seq(pnTp, pnTl, "int16", 5) || self.seq(pnTp, pnTl, "int8", 4)
-                || self.seq(pnTp, pnTl, "uint64", 6) || self.seq(pnTp, pnTl, "uint32", 6)
-                || self.seq(pnTp, pnTl, "uint16", 6) || self.seq(pnTp, pnTl, "uint8", 5)
-                || self.seq(pnTp, pnTl, "bool", 4) || self.seq(pnTp, pnTl, "byte", 4)
-                || self.seq(pnTp, pnTl, "char", 4)) { pnArt := 0; }
+          pnArt := self._artVonTypname(pnTp, pnTl);
         }
+      }
+      // #2039: `Print(r.s)` — ein FELD. Die Aufzaehlung kannte diese Herkunft
+      // nicht, obwohl der Typ in der Struktdeklaration steht und der x86-Weg
+      // ihn liest (cg_isPcharExpr, dort als #1328 vermerkt).
+      //
+      // Gefragt wird _exprTypeNode: die Ebene aus #1787, die den Typ eines
+      // BELIEBIGEN Ausdrucks bestimmt. Sie loest auch `a.b.c` auf und laeuft
+      // die Vererbungskette mit (_fieldTypeNodeIn) — beides waere hier von
+      // Hand nachgebaut worden, also eine zweite Stelle.
+      else if (pnK == NK_FIELD) {
+        var pnFt: int64 := self._exprTypeNode(nd);
+        if pnFt >= 0 { pnArt := self._artVonTypname(self.nodeSVal(pnFt), self.nodeSLen(pnFt)); }
       }
       else if (pnK == NK_CALL) {
         // stdlib-Funktionen, die eine Zeichenkette liefern.
@@ -9798,13 +9895,7 @@ pub type IRLower = class {
                   if pnRt >= 0 {
                     var pnRp: pchar := self.nodeSVal(pnRt);
                     var pnRl: int64 := self.nodeSLen(pnRt);
-                    if self.seq(pnRp, pnRl, "pchar", 5) { pnArt := 1; }
-                    else if (self.seq(pnRp, pnRl, "int64", 5) || self.seq(pnRp, pnRl, "int32", 5)
-                          || self.seq(pnRp, pnRl, "int16", 5) || self.seq(pnRp, pnRl, "int8", 4)
-                          || self.seq(pnRp, pnRl, "uint64", 6) || self.seq(pnRp, pnRl, "uint32", 6)
-                          || self.seq(pnRp, pnRl, "uint16", 6) || self.seq(pnRp, pnRl, "uint8", 5)
-                          || self.seq(pnRp, pnRl, "bool", 4) || self.seq(pnRp, pnRl, "byte", 4)
-                          || self.seq(pnRp, pnRl, "char", 4)) { pnArt := 0; }
+                    pnArt := self._artVonTypname(pnRp, pnRl);
                   }
                   pnFd := self.nodeCount;
                 }
@@ -9900,10 +9991,11 @@ pub type IRLower = class {
     var cur: int64 := n;
     while cur >= 0 {
       var k: int64 := self.nodeKind(cur);
-      if k == NK_FUNC_DECL && self.nodeC2(cur) >= 0 {
-        // Eine `extern fn ... link` hat keinen Rumpf (c2 == -1) und faellt
-        // damit schon durch die Bedingung — sie bleibt FFI und darf hier
-        // nicht als Nutzerfunktion registriert werden.
+      if k == NK_FUNC_DECL && self.nodeC2(cur) >= 0 && self._istExternDecl(cur) == 0 {
+        // Eine `extern fn ... link` bleibt FFI und darf hier nicht als
+        // Nutzerfunktion registriert werden. "c2 == -1" allein genuegt dafuer
+        // nicht: eine annotierte Deklaration traegt dort ihr `@cap` — siehe
+        // _istExternDecl.
         var mp: int64 := self._nestMangle(pfx, pfxLen, self.nodeSVal(cur), self.nodeSLen(cur));
         var ml: int64 := pfxLen + 1 + self.nodeSLen(cur);
         var mo: int64 := self.irAddString(mp as pchar, ml);
@@ -9919,6 +10011,53 @@ pub type IRLower = class {
       }
       cur := self.nodeNext(cur);
     }
+  }
+
+  // #2047: Ist der Knoten eine `extern fn ... link "lib"`? 1 = ja, 0 = nein.
+  // Die Knotenart prueft der Aufrufer; gelesen wird aus self.nodes, der Index
+  // muss also zur GERADE eingesetzten Tabelle gehoeren.
+  //
+  // Dieselbe Entscheidung wie in codegen_x86.lyx (dort #1287, Schleife ueber
+  // die Deklarationen) — die beiden muessen uebereinstimmen.
+  //
+  // "Kein Rumpf" heisst NICHT einfach c2 == -1: steht `@cap(...)` oder
+  // `@capabilities([...])` an der Deklaration, legt der Parser die Annotation
+  // genau dort ab (NK_CAPABILITY_ATTR). Der IR-Weg pruefte an fuenf Stellen
+  // nur auf -1; eine annotierte Deklaration galt damit als Funktion MIT Rumpf,
+  // wurde als leere Funktion erzeugt, und der Aufruf traf sie: kein DT_NEEDED,
+  // kein Symbol, das Erzeugnis blieb statisch und lieferte den Inhalt eines
+  // unbeschriebenen Slots. Ausgerechnet die Angabe, die die FFI-Sandbox
+  // verlangt, schaltete den FFI-Aufruf ab. x86 hat das seit #1287 richtig,
+  // hier wurde es nicht nachgezogen.
+  fn _istExternDecl(ni: int64): int64 {
+    if self.nodeC3(ni) == -1 { return 0; }
+    var ieRumpf: int64 := self.nodeC2(ni);
+    if ieRumpf == -1 { return 1; }
+    if self.nodeKind(ieRumpf) == NK_CAPABILITY_ATTR { return 1; }
+    return 0;
+  }
+
+  // #2039: Typname -> Ausgabeart. 1 = Zeichenkette, 0 = Ganzzahl,
+  // -1 = unentscheidbar.
+  //
+  // Diese Liste stand in _printArt VIERMAL wortgleich (Cast, linkes Blatt
+  // eines Binops, Bezeichner, Rueckgabetyp eines Aufrufs). Mit dem Feldzugriff
+  // waere sie zum fuenften Mal abgeschrieben worden — und eine Aufzaehlung,
+  // die an fuenf Stellen gepflegt wird, geht irgendwo auseinander. Genau
+  // diese Klasse hat #1799, #1803 und #1806 verursacht.
+  //
+  // NICHT RATEN: was hier nicht steht, bleibt -1 und scheitert laut. Die
+  // Umkehrung ("alles, was nicht pchar ist, ist eine Zahl") machte aus einem
+  // f64 still eine Integer-Ausgabe — ein falsches Ergebnis ohne Meldung.
+  fn _artVonTypname(tp: pchar, tl: int64): int64 {
+    if self.seq(tp, tl, "pchar", 5) { return 1; }
+    if (self.seq(tp, tl, "int64", 5) || self.seq(tp, tl, "int32", 5)
+     || self.seq(tp, tl, "int16", 5) || self.seq(tp, tl, "int8", 4)
+     || self.seq(tp, tl, "uint64", 6) || self.seq(tp, tl, "uint32", 6)
+     || self.seq(tp, tl, "uint16", 6) || self.seq(tp, tl, "uint8", 5)
+     || self.seq(tp, tl, "bool", 4) || self.seq(tp, tl, "byte", 4)
+     || self.seq(tp, tl, "char", 4)) { return 0; }
+    return 0 - 1;
   }
 
   // #2024: Ist das Ziel LyxOS? Nur dort gilt die LyxOS-ABI mit ihrer eigenen
