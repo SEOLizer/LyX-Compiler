@@ -1,6 +1,6 @@
-# Lyx 1.2.11F — Canonical EBNF Grammar
+# Lyx 1.2.11G — Canonical EBNF Grammar
 
-> Stand 2026-10-13, gegen lyxc 1.2.11F geprueft. Die Keyword-Liste in
+> Stand 2026-10-13, gegen lyxc 1.2.11G geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -1342,8 +1342,9 @@ Resolution rules:
     another arithmetic operator overload (its result class is the left
     operand's class), or a call to a free function with a class return type.
   - The class must define the operator's method (a defined ClassName_Method
-    label); otherwise the operator keeps its normal built-in meaning. So
-    int/f64/pchar operators and normal array/pchar indexing are unaffected.
+    label) or inherit it from a base class; otherwise the operator keeps its
+    normal built-in meaning. So int/f64/pchar operators and normal array/pchar
+    indexing are unaffected. (Inherited operator methods: since 1.2.11G.)
   - `!=` additionally falls back to negating `.Eq` when no `.Ne` is defined.
 
 A method call is also a valid left operand and a valid receiver: its class is
@@ -1353,7 +1354,12 @@ work. Chains resolve recursively, so the receiver may itself be a method call
 or a free function returning a class.
 
 An operand whose class cannot be determined statically keeps the operator's
-built-in meaning; there is no runtime fallback.
+built-in meaning; there is no runtime fallback. The call is bound statically,
+to the method of the operand's static class.
+
+The rule holds on every target. Until 1.2.11F it was implemented only on the
+x86-64 fast path; on the IR targets (arm64, riscv, lyxos) every operator kept
+its built-in meaning even on class operands.
 ```
 
 ---
