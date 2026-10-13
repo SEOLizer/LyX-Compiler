@@ -42,6 +42,11 @@ con RV_A7:   int64 := 17;
 con RV_T0:   int64 := 5;
 con RV_T1:   int64 := 6;
 con RV_T2:   int64 := 7;
+// #2061: Hilfsregister fuer Adressen, deren Versatz nicht in zwoelf Bit passt
+// (s11). Sonst benutzt dieses Backend es nirgends, und es lebt nie ueber einen
+// einzelnen Zugriff hinaus — es kann also mit nichts kollidieren, auch nicht
+// mit t3 … t6, die die Builtin-Folgen als Laufvariablen nehmen.
+con RV_WEIT: int64 := 27;
 
 // Linux RISC-V syscall numbers
 con RV_SYS_EXIT:   int64 := 93;
@@ -145,13 +150,29 @@ pub type EmitRISCV64 = class {
   // RISC-V instruction encoders
   // --------------------------------------------------------------------------
 
+  // #2061: Alle Speicherbefehle unten tragen ihren Versatz in ZWOELF Bit,
+  // vorzeichenbehaftet (-2048 … 2047). Bis 1.2.11E wurde ein groesserer Wert
+  // mit `& 0xFFF` passend gemacht — still. Ein Slot jenseits von -2048 landete
+  // an einer anderen Adresse, und die Rahmenanlage im Prolog lief in die
+  // falsche Richtung: 2672 Byte Rahmen wurden zu `addi sp, sp, +1424`.
+  //
+  // Passt der Versatz nicht, wird die Adresse jetzt im Hilfsregister
+  // aufgebaut (_rvWeit) und mit Versatz 0 zugegriffen. Der Normalfall bleibt
+  // ein einzelner Befehl; nur der weite Zugriff wird laenger. Das ist
+  // unbedenklich fuer die handkodierten Vorwaertsspruenge dieses Backends
+  // (rv_BEQZ_fwd mit fester Bytezahl): keiner von ihnen ueberspringt einen
+  // Slot-Zugriff — nachgezaehlt fuer alle 26 Stellen. Wer einen neuen
+  // schreibt, muss das mit bedenken.
+
   // LD rd, off(rs1)  — 64-bit load, I-type, funct3=3, opcode=3
   fn rv_LD(rd: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_LD(rd, RV_WEIT, 0); return; }   // #2061
     self.rv_e32(0x3 | (rd<<7) | (3<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
   }
 
   // SD rs2, off(rs1)  — 64-bit store, S-type, funct3=3, opcode=0x23
   fn rv_SD(rs2: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_SD(rs2, RV_WEIT, 0); return; }   // #2061
     var imm5: int64 := off & 0x1F;
     var imm7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
     self.rv_e32(0x23 | (imm5<<7) | (3<<12) | (rs1<<15) | (rs2<<20) | (imm7<<25));
@@ -163,37 +184,54 @@ pub type EmitRISCV64 = class {
   // zufaellig in a0 stand.
   // LBU rd, off(rs1) — funct3=4, opcode=3
   fn rv_LBU(rd: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_LBU(rd, RV_WEIT, 0); return; }   // #2061
     self.rv_e32(0x3 | (rd<<7) | (4<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
   }
   // LHU rd, off(rs1) — funct3=5
   fn rv_LHU(rd: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_LHU(rd, RV_WEIT, 0); return; }   // #2061
     self.rv_e32(0x3 | (rd<<7) | (5<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
   }
   // LWU rd, off(rs1) — funct3=6
   fn rv_LWU(rd: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_LWU(rd, RV_WEIT, 0); return; }   // #2061
     self.rv_e32(0x3 | (rd<<7) | (6<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
   }
   // SB rs2, off(rs1) — funct3=0, opcode=0x23
   fn rv_SB(rs2: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_SB(rs2, RV_WEIT, 0); return; }   // #2061
     var sbI5: int64 := off & 0x1F;
     var sbI7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
     self.rv_e32(0x23 | (sbI5<<7) | (0<<12) | (rs1<<15) | (rs2<<20) | (sbI7<<25));
   }
   // SH rs2, off(rs1) — funct3=1
   fn rv_SH(rs2: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_SH(rs2, RV_WEIT, 0); return; }   // #2061
     var shI5: int64 := off & 0x1F;
     var shI7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
     self.rv_e32(0x23 | (shI5<<7) | (1<<12) | (rs1<<15) | (rs2<<20) | (shI7<<25));
   }
   // SW rs2, off(rs1) — funct3=2
   fn rv_SW(rs2: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_SW(rs2, RV_WEIT, 0); return; }   // #2061
     var swI5: int64 := off & 0x1F;
     var swI7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
     self.rv_e32(0x23 | (swI5<<7) | (2<<12) | (rs1<<15) | (rs2<<20) | (swI7<<25));
   }
 
   // ADDI rd, rs1, imm  — I-type, funct3=0, opcode=0x13
+  //
+  // #2061: Ein Direktwert ausserhalb von zwoelf Bit scheitert hier LAUT. Es
+  // gibt keinen Aufrufer, der das braucht — die Rahmenanlage geht seit #2061
+  // ueber rv_LI64 —, und ein stilles Abschneiden hat genau den Fehler
+  // verursacht, den das Issue beschreibt.
   fn rv_ADDI(rd: int64, rs1: int64, imm: int64) {
+    if self._rvPasst12(imm) == 0 {
+      EPrintStr("error: riscv: ADDI-Direktwert "c);
+      EPrintInt(imm);
+      EPrintStrLn(" passt nicht in zwoelf Bit (#2061) — rv_LI64 benutzen."c);
+      exit(1);
+    }
     self.rv_e32(0x13 | (rd<<7) | (0<<12) | (rs1<<15) | ((imm & 0xFFF)<<20));
   }
 
@@ -379,7 +417,15 @@ pub type EmitRISCV64 = class {
     self.rv_SD(RV_RA, RV_SP, 8);      // save ra
     self.rv_MV(RV_FP, RV_SP);         // s0 = sp (frame pointer)
     if self.stackSize > 0 {
-      self.rv_ADDI(RV_SP, RV_SP, -self.stackSize);  // alloc locals
+      // #2061: ein Rahmen ueber 2048 Byte passt nicht in den Direktwert von
+      // ADDI. Vorher wurde er abgeschnitten und der Stapelzeiger wanderte
+      // nach OBEN.
+      if self._rvPasst12(0 - self.stackSize) != 0 {
+        self.rv_ADDI(RV_SP, RV_SP, -self.stackSize);  // alloc locals
+      } else {
+        self.rv_LI64(RV_WEIT, self.stackSize);
+        self.rv_SUB(RV_SP, RV_SP, RV_WEIT);
+      }
     }
   }
 
@@ -1683,11 +1729,13 @@ pub type EmitRISCV64 = class {
 
   // FLD frd, off(rs1)  — 64-Bit-Ladebefehl, I-Type, funct3=3, opcode=0x07
   fn rv_FLD(frd: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_FLD(frd, RV_WEIT, 0); return; }   // #2061
     self.rv_e32(0x07 | (frd<<7) | (3<<12) | (rs1<<15) | ((off & 0xFFF)<<20));
   }
 
   // FSD frs2, off(rs1) — 64-Bit-Speicherbefehl, S-Type, funct3=3, opcode=0x27
   fn rv_FSD(frs2: int64, rs1: int64, off: int64) {
+    if self._rvPasst12(off) == 0 { self._rvWeit(rs1, off); self.rv_FSD(frs2, RV_WEIT, 0); return; }   // #2061
     var imm5: int64 := off & 0x1F;
     var imm7: int64 := ((off & 0xFFF) >> 5) & 0x7F;
     self.rv_e32(0x27 | (imm5<<7) | (3<<12) | (rs1<<15) | (frs2<<20) | (imm7<<25));
@@ -1926,6 +1974,22 @@ pub type EmitRISCV64 = class {
     self.codeBuf := nb;
     self.codeCap := nc;
   }
+
+  // #2061: 1, wenn v in einen vorzeichenbehafteten Zwoelf-Bit-Direktwert passt.
+  fn _rvPasst12(v: int64): int64 {
+    if v >= 0 - 2048 && v <= 2047 { return 1; }
+    return 0;
+  }
+
+  // #2061: RV_WEIT := rs1 + off, fuer Versaetze ausserhalb von zwoelf Bit.
+  // Danach wird mit `…, 0(RV_WEIT)` zugegriffen. Das Gegenstueck auf arm64 ist
+  // _emitFarAddr (#1388) — dort endet die Reichweite bei 4095, hier nicht:
+  // rv_LI64 baut jeden 64-Bit-Wert.
+  fn _rvWeit(rs1: int64, off: int64) {
+    self.rv_LI64(RV_WEIT, off);
+    self.rv_ADD(RV_WEIT, rs1, RV_WEIT);
+  }
+
 };
 
 // ============================================================================
