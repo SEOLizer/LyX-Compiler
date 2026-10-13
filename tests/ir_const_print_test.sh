@@ -25,8 +25,9 @@ nok() { echo "FAIL $1"; FAIL=$((FAIL+1)); }
 # qemu ist Voraussetzung fuer die Wirkungsmessung. Fehlt es, wird der Test
 # NICHT still gruen: dann misst er nichts und muss das sagen.
 QEMU_ARM=""; QEMU_RV=""
-command -v qemu-aarch64-static >/dev/null 2>&1 && QEMU_ARM="qemu-aarch64-static"
-command -v qemu-riscv64-static >/dev/null 2>&1 && QEMU_RV="qemu-riscv64-static"
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
+[ -n "$QEMU_ARM64" ] && QEMU_ARM="$QEMU_ARM64"
+[ -n "$QEMU_RISCV64" ] && QEMU_RV="$QEMU_RISCV64"
 
 # lauf <ziel> <quelle> <ausgabe-datei> → 0 = gebaut und gelaufen
 lauf() {
@@ -255,7 +256,7 @@ fi
 # Fassung erfuellt, die exit kaputtgemacht hat.
 printf 'unit main;\nimport std.io;\nfn main(): int64 { PrintLn("vorher"); panic("weg"); return 0; }\n' > "$TMP/pa.lyx"
 ( cd "$ROOT" && timeout 180 "$LYXC" --target=riscv "$TMP/pa.lyx" -o "$TMP/pa.rv" ) >/dev/null 2>&1
-pao="$(timeout 60 qemu-riscv64-static "$TMP/pa.rv" 2>&1)"; parc=$?
+pao="$(timeout 60 "$QEMU_RISCV64" "$TMP/pa.rv" 2>&1)"; parc=$?
 if [ "$parc" = "1" ] && printf '%s' "$pao" | grep -q "vorher"; then
   ok "riscv: panic beendet weiterhin mit 1, die Ausgabe davor kommt an"
 else

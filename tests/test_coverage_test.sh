@@ -112,6 +112,9 @@ is_exempt() {
                                           # mit mkfs.vfat erzeugt. Allein
                                           # gestartet haette es nichts zu lesen.
                                           # Der Runner haengt am `test`-Ziel.
+    lib/qemu.sh)             return 0 ;;  # #2048: Bibliothek, kein Test — sucht
+                                          # den Emulator unter beiden Paketnamen;
+                                          # geprueft von qemu_name_test.sh
     lib/lyxc_guard.sh)       return 0 ;;  # #1294: Bibliothek, kein Test — wird
                                           # von den Scripts eingebunden und vom
                                           # Waechter lyxc_guard_coverage_test.sh

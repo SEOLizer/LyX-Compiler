@@ -29,6 +29,7 @@ ulimit -c 0 2>/dev/null
 
 S='pub type TR = struct { L: int64; R: int64; };'
 
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
 fall() {  # name, rumpf, erwarteter Rueckgabewert
   printf '%s\n%s\n' "$S" "$2" > "$TMP/s.lyx"
   # x86 als Gegenprobe: dort war es immer richtig, und wenn eine Aenderung an
@@ -36,12 +37,10 @@ fall() {  # name, rumpf, erwarteter Rueckgabewert
   for ziel in linux arm64 riscv; do
     local q=""
     if [ "$ziel" = "arm64" ]; then
-      command -v qemu-aarch64-static >/dev/null 2>&1 && q=qemu-aarch64-static
-      [ -z "$q" ] && command -v qemu-aarch64 >/dev/null 2>&1 && q=qemu-aarch64
+      [ -n "$QEMU_ARM64" ] && q="$QEMU_ARM64"
       if [ -z "$q" ]; then echo "SKIP arm64/$1: qemu fehlt — ohne Laufzeit misst das nichts"; continue; fi
     elif [ "$ziel" = "riscv" ]; then
-      command -v qemu-riscv64-static >/dev/null 2>&1 && q=qemu-riscv64-static
-      [ -z "$q" ] && command -v qemu-riscv64 >/dev/null 2>&1 && q=qemu-riscv64
+      [ -n "$QEMU_RISCV64" ] && q="$QEMU_RISCV64"
       if [ -z "$q" ]; then echo "SKIP riscv/$1: qemu fehlt — ohne Laufzeit misst das nichts"; continue; fi
     fi
     if ! timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/s.lyx" --target="$ziel" -o "$TMP/s.out" >"$TMP/s.log" 2>&1; then

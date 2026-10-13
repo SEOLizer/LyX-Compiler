@@ -567,6 +567,7 @@ test: lyxc
 	@bash tests/backend_abdeckung_test.sh
 	@bash tests/nested_fn_ir_test.sh
 	@bash tests/ir_rest_arm64_test.sh
+	@bash tests/qemu_name_test.sh
 	@bash tests/lyu_konstanten_test.sh
 	@bash tests/lyu_exporte_test.sh
 	@bash tests/lyu_ir_test.sh

@@ -38,15 +38,14 @@ fn main(): int64 {
 }
 L
 
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
 for ziel in linux arm64 riscv; do
   q=""
   if [ "$ziel" = "arm64" ]; then
-    command -v qemu-aarch64-static >/dev/null 2>&1 && q=qemu-aarch64-static
-    [ -z "$q" ] && command -v qemu-aarch64 >/dev/null 2>&1 && q=qemu-aarch64
+    [ -n "$QEMU_ARM64" ] && q="$QEMU_ARM64"
     if [ -z "$q" ]; then echo "SKIP arm64: qemu fehlt — ohne Laufzeit misst das nichts"; continue; fi
   elif [ "$ziel" = "riscv" ]; then
-    command -v qemu-riscv64-static >/dev/null 2>&1 && q=qemu-riscv64-static
-    [ -z "$q" ] && command -v qemu-riscv64 >/dev/null 2>&1 && q=qemu-riscv64
+    [ -n "$QEMU_RISCV64" ] && q="$QEMU_RISCV64"
     if [ -z "$q" ]; then echo "SKIP riscv: qemu fehlt — ohne Laufzeit misst das nichts"; continue; fi
   fi
   if ! timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/n.lyx" --target="$ziel" -o "$TMP/n.out" >"$TMP/n.log" 2>&1; then

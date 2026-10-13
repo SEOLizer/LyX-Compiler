@@ -53,8 +53,8 @@ run "C_spaet"    'fn main(): int64 { return L; } con L: int64 := 9;' 9
 # eine zweite Messung waere das eine Behauptung: gemessen mit dem Seed von
 # vor dem Fix lieferte `con K := 7` auch unter qemu-aarch64 eine 0.
 QEMU=""
-command -v qemu-aarch64-static >/dev/null 2>&1 && QEMU=qemu-aarch64-static
-command -v qemu-aarch64 >/dev/null 2>&1 && [ -z "$QEMU" ] && QEMU=qemu-aarch64
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
+[ -n "$QEMU_ARM64" ] && QEMU="$QEMU_ARM64"
 if [ -z "$QEMU" ]; then
   echo "SKIP arm64: qemu-aarch64 nicht vorhanden — ohne Laufzeit misst das nichts"
 else

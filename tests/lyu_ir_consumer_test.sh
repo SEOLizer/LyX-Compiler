@@ -81,13 +81,14 @@ pruefe_ziel() {   # Name, --target-Wert, Ausfuehrer
 }
 
 echo "--- .lyu-only auf dem IR-Weg (#1977) ---"
-if command -v qemu-aarch64-static >/dev/null 2>&1; then
-    pruefe_ziel "arm64" "arm64" "qemu-aarch64-static"
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
+if [ -n "$QEMU_ARM64" ]; then
+    pruefe_ziel "arm64" "arm64" "$QEMU_ARM64"
 else
     echo "HINWEIS qemu-aarch64-static fehlt — arm64 ungemessen"
 fi
-if command -v qemu-riscv64-static >/dev/null 2>&1; then
-    pruefe_ziel "riscv" "riscv" "qemu-riscv64-static"
+if [ -n "$QEMU_RISCV64" ]; then
+    pruefe_ziel "riscv" "riscv" "$QEMU_RISCV64"
 else
     echo "HINWEIS qemu-riscv64-static fehlt — riscv ungemessen"
 fi
@@ -95,7 +96,7 @@ fi
 # #1982: Eine .lyu fuer ein FREMDES Ziel darf nicht benutzt werden. Das IR ist
 # zielabhaengig; arm64-IR auf riscv waere stiller Unsinn. Erwartet wird die
 # Meldung UND das Ausbleiben eines brauchbaren Erzeugnisses.
-if command -v qemu-riscv64-static >/dev/null 2>&1 && [ -d "$TMP/arm64/demo" ]; then
+if [ -n "$QEMU_RISCV64" ] && [ -d "$TMP/arm64/demo" ]; then
     if ( cd / && timeout 180 "$LYXC" --target=riscv --std-path="$ROOT" -I "$TMP/arm64" \
           "$TMP/prog.lyx" -o "$TMP/fremd" ) >"$TMP/fremd.log" 2>&1; then
         if grep -q "andere Architektur" "$TMP/fremd.log"; then

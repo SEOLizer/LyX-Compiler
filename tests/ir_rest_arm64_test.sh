@@ -23,15 +23,8 @@ PASS=0; FAIL=0
 ok()  { echo "PASS $1"; PASS=$((PASS+1)); }
 nok() { echo "FAIL $1"; FAIL=$((FAIL+1)); }
 
-QEMU_ARM=""; QEMU_RV=""
-# Beide Namen: `qemu-user-static` (…-static) gibt es ab qemu 10 nicht mehr als
-# Paket, `qemu-user` liefert dieselben Emulatoren ohne die Endung.
-for _q in qemu-aarch64-static qemu-aarch64; do
-  [ -z "$QEMU_ARM" ] && command -v "$_q" >/dev/null 2>&1 && QEMU_ARM="$_q"
-done
-for _q in qemu-riscv64-static qemu-riscv64; do
-  [ -z "$QEMU_RV" ] && command -v "$_q" >/dev/null 2>&1 && QEMU_RV="$_q"
-done
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
+QEMU_ARM="$QEMU_ARM64"; QEMU_RV="$QEMU_RISCV64"
 
 # $1 Beschreibung, $2 Quelle, $3 Erwartung (| statt Zeilenende), $4 Strom: out|err
 alle_ziele() {

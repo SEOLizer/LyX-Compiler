@@ -103,10 +103,11 @@ fi
 # Einbettung, die nur auf einem der beiden Wege ankommt, ist genau die
 # unvollstaendige Aufzaehlung, an der hier schon mehrfach etwas still
 # ausgefallen ist. Gemessen wird deshalb AUSGEFUEHRT, nicht uebersetzt.
-if command -v qemu-aarch64-static >/dev/null 2>&1; then
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
+if [ -n "$QEMU_ARM64" ]; then
     printf 'unit main;\nimport std.io;\nfn main(): int64 { PrintLn(IntToStr(@embed_len("text.txt"))); PrintLn(@embed("text.txt")); return 0; }' > "$TMP/a.lyx"
     if ( cd / && timeout 180 "$LYXC" --target=arm64 --std-path="$ROOT" "$TMP/a.lyx" -o "$TMP/a" ) >"$TMP/a.log" 2>&1; then
-        aus="$( ulimit -v 4000000; timeout 60 qemu-aarch64-static "$TMP/a" 2>&1 )"
+        aus="$( ulimit -v 4000000; timeout 60 "$QEMU_ARM64" "$TMP/a" 2>&1 )"
         if [ "$aus" = "28
 Hallo Welt aus einer Vorlage" ]; then
             ok "arm64 (IR-Weg) bettet denselben Inhalt ein"
@@ -130,7 +131,7 @@ Hallo Welt aus einer Vorlage" ]; then
     # fuer x86. Genau das ist die Aussage: BEIDE Wege liefern dasselbe.
     printf 'unit main;\nimport std.io;\nfn main(): int64 {\n  var p: pchar := @embed("binaer.bin");\n  var n: int64 := @embed_len("binaer.bin");\n  PrintStr(IntToStr(n));\n  var i: int64 := 0;\n  while (i < n) { PrintStr(" "); PrintStr(IntToStr(peek8((p as int64) + i) as int64)); i := i + 1; }\n  PrintLn("");\n  return 0;\n}' > "$TMP/ab.lyx"
     if ( cd / && timeout 180 "$LYXC" --target=arm64 --std-path="$ROOT" "$TMP/ab.lyx" -o "$TMP/ab" ) >"$TMP/ab.log" 2>&1; then
-        abAus="$( ulimit -v 4000000; timeout 60 qemu-aarch64-static "$TMP/ab" 2>&1 )"
+        abAus="$( ulimit -v 4000000; timeout 60 "$QEMU_ARM64" "$TMP/ab" 2>&1 )"
         if [ "$abAus" = "5 65 66 0 67 68" ]; then
             ok "arm64 traegt binaere Daten samt Nullbyte (#1968)"
         else
@@ -243,7 +244,7 @@ fi
 # Auf dem IR-Weg gibt es die Tabelle noch nicht. Das MUSS an der Deklaration
 # gemeldet werden — und zwar auch dann, wenn das Programm die Ressource gar
 # nicht liest, sonst uebersetzte es klanglos ohne sie durch.
-if command -v qemu-aarch64-static >/dev/null 2>&1; then
+if [ -n "$QEMU_ARM64" ]; then
     printf 'unit main;\nimport std.io;\n@resource("x", "text.txt");\nfn main(): int64 { PrintLn("nichts"); return 0; }' > "$TMP/ri.lyx"
     if ( cd / && timeout 180 "$LYXC" --target=arm64 --std-path="$ROOT" "$TMP/ri.lyx" -o "$TMP/ri" ) >"$TMP/ri.log" 2>&1; then
         nok "arm64 mit @resource: uebersetzt durch, statt zu melden"
@@ -276,10 +277,10 @@ fn main(): int64 {
   return 0;
 }' '65 66 0 67 68 '
 
-if command -v qemu-aarch64-static >/dev/null 2>&1; then
+if [ -n "$QEMU_ARM64" ]; then
     printf 'unit main;\nimport std.io;\nfn main(): int64 {\n  var s: pchar := "AB\\0CD";\n  var i: int64 := 0;\n  while (i < 5) { PrintStr(IntToStr(peek8((s as int64) + i) as int64)); PrintStr(" "); i := i + 1; }\n  PrintLn("");\n  return 0;\n}' > "$TMP/lit.lyx"
     if ( cd / && timeout 180 "$LYXC" --target=arm64 --std-path="$ROOT" "$TMP/lit.lyx" -o "$TMP/lit" ) >"$TMP/lit.log" 2>&1; then
-        litAus="$( ulimit -v 4000000; timeout 60 qemu-aarch64-static "$TMP/lit" 2>&1 )"
+        litAus="$( ulimit -v 4000000; timeout 60 "$QEMU_ARM64" "$TMP/lit" 2>&1 )"
         if [ "$litAus" = "65 66 0 67 68 " ]; then
             ok "Literal mit Nullbyte, arm64 (#1968)"
         else

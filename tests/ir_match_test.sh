@@ -50,10 +50,8 @@ lyxos() {  # name, quelltext, erwarteter Rueckgabewert
 # der Backend-Wahl, ein Nachweis auf nur einem waere zu wenig (#1786, #1787,
 # #1798 waren dreimal als "lyxos-Bug" gemeldet und lagen im gemeinsamen Weg).
 ziel() {  # name, ziel, qemu, quelltext, erwarteter Rueckgabewert
-  local q=""
-  command -v "$3-static" >/dev/null 2>&1 && q="$3-static"
-  [ -z "$q" ] && command -v "$3" >/dev/null 2>&1 && q="$3"
-  if [ -z "$q" ]; then echo "SKIP $2/$1: $3 fehlt — ohne Laufzeit misst das nichts"; return; fi
+  local q="$3"
+  if [ -z "$q" ]; then echo "SKIP $2/$1: qemu fehlt — ohne Laufzeit misst das nichts"; return; fi
   printf '%s' "$4" > "$TMP/t.lyx"
   if ! timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/t.lyx" --target="$2" -o "$TMP/t" >"$TMP/t.log" 2>&1; then
     echo "FAIL $2/$1: uebersetzt nicht: $(grep -im1 error "$TMP/t.log")"; FAIL=$((FAIL+1)); return
@@ -63,10 +61,11 @@ ziel() {  # name, ziel, qemu, quelltext, erwarteter Rueckgabewert
   else echo "FAIL $2/$1: exit=$rc erwartet $5"; FAIL=$((FAIL+1)); fi
 }
 
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
 alle() {  # name, quelltext, erwarteter Rueckgabewert
   lyxos "$1" "$2" "$3"
-  ziel "$1" arm64 qemu-aarch64 "$2" "$3"
-  ziel "$1" riscv qemu-riscv64 "$2" "$3"
+  ziel "$1" arm64 "$QEMU_ARM64" "$2" "$3"
+  ziel "$1" riscv "$QEMU_RISCV64" "$2" "$3"
 }
 
 # --- match: der zutreffende Fall wird gewaehlt ---------------------------

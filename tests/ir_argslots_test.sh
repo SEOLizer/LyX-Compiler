@@ -28,8 +28,8 @@ ok() { echo "PASS $1"; PASS=$((PASS+1)); }
 no() { echo "FAIL $1${2:+: $2}"; FAIL=$((FAIL+1)); }
 
 QEMU=""
-command -v qemu-aarch64-static >/dev/null 2>&1 && QEMU=qemu-aarch64-static
-command -v qemu-aarch64 >/dev/null 2>&1 && [ -z "$QEMU" ] && QEMU=qemu-aarch64
+. "$ROOT/tests/lib/qemu.sh"   # #2048: beide Paketnamen
+[ -n "$QEMU_ARM64" ] && QEMU="$QEMU_ARM64"
 if [ -z "$QEMU" ]; then
   echo "SKIP qemu-aarch64 nicht vorhanden — ohne Laufzeit misst dieser Test nichts"
   echo "----"; echo "0 PASS, 0 FAIL"; exit 0
@@ -147,8 +147,7 @@ lauf "Funktion mit 40 lebenden Werten" 'fn main(): int64 {
 # #1388 Abschluss: dieselben Rechnungen auf riscv, und die Zeichenketten-
 # Builtins, an denen std.io haengen geblieben ist.
 QEMURV=""
-command -v qemu-riscv64-static >/dev/null 2>&1 && QEMURV=qemu-riscv64-static
-command -v qemu-riscv64 >/dev/null 2>&1 && [ -z "$QEMURV" ] && QEMURV=qemu-riscv64
+[ -n "$QEMU_RISCV64" ] && QEMURV="$QEMU_RISCV64"
 
 laufRV() {   # Name, Quelle, erwarteter Rueckgabewert
   [ -z "$QEMURV" ] && return

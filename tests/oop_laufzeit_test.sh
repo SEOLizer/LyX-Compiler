@@ -26,12 +26,13 @@ _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../l
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
 lauf() { # ziel, binary  → Exit-Code oder 255 wenn kein Emulator
   case "$1" in
-    riscv) command -v qemu-riscv64-static >/dev/null || return 255
-           timeout 10 qemu-riscv64-static "$2" >/dev/null 2>&1; return $? ;;
-    arm64) command -v qemu-aarch64-static >/dev/null || return 255
-           timeout 10 qemu-aarch64-static "$2" >/dev/null 2>&1; return $? ;;
+    riscv) [ -n "$QEMU_RISCV64" ] || return 255
+           timeout 10 "$QEMU_RISCV64" "$2" >/dev/null 2>&1; return $? ;;
+    arm64) [ -n "$QEMU_ARM64" ] || return 255
+           timeout 10 "$QEMU_ARM64" "$2" >/dev/null 2>&1; return $? ;;
   esac
   return 255
 }

@@ -64,8 +64,8 @@ lyxos "L_char"       "fn main(): int64 { var c: int64 := 'A' as int64; if c == 6
 
 # --- arm64: derselbe Fehler sass vor der Backend-Wahl -------------------
 QEMU=""
-command -v qemu-aarch64-static >/dev/null 2>&1 && QEMU=qemu-aarch64-static
-command -v qemu-aarch64 >/dev/null 2>&1 && [ -z "$QEMU" ] && QEMU=qemu-aarch64
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
+[ -n "$QEMU_ARM64" ] && QEMU="$QEMU_ARM64"
 if [ -z "$QEMU" ]; then
   echo "SKIP arm64: qemu-aarch64 nicht vorhanden — ohne Laufzeit misst das nichts"
 else
