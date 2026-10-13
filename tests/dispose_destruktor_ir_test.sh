@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tests/dispose_destruktor_ir_test.sh — #2054: `dispose` ruft den Destruktor
-# auch auf den IR-Zielen.
+# auch auf den IR-Zielen; #2056: und auch dann, wenn er in einem anderen
+# Modul steht (das fehlte auf ALLEN Zielen).
 #
 # Der x86-Weg ruft `Destroy` seit #1235. `lowerDispose` in ir_lower erzeugte
 # bis 1.2.11B nur IRO_FREE — auf arm64 und riscv lief der Destruktor nie,
@@ -167,13 +168,81 @@ fn main(): int64 {
 EOF
 alle_ziele "dispose ohne Destruktor laeuft durch" "$TMP/ohne.lyx" 9
 
-# NICHT GEPRUEFT, und zwar mit Absicht: ein Destruktor, der in einem ANDEREN
-# MODUL steht (importierte Klasse, oder lokale Ableitung einer importierten
-# Basis). Der laeuft derzeit auf KEINEM Ziel, auch nicht auf x86 — sema
-# vermerkt ihn nicht (`_exprClassDeclNi` sieht nur Deklarationen des eigenen
-# Moduls), und beide Codewege lesen genau diesen Vermerk. Das ist ein eigener
-# Defekt mit eigener Ursache. Ein Fall dazu waere hier dauerhaft rot und
-# wuerde verdecken, was dieser Test misst.
+echo
+echo "--- #2056: der Destruktor steht in einem ANDEREN MODUL ---"
+#
+# Bis 1.2.11C lief er dann auf KEINEM Ziel, auch nicht auf x86. sema vermerkt,
+# ob eine Klasse einen Destruktor hat, und beide Codewege richten sich allein
+# danach; fuer einen importierten Typ liegt sema die Deklaration aber nicht
+# vor (SymNodeIdx == -1), und "nicht entscheidbar" wurde wie "hat keinen"
+# gelesen. Seitdem gibt es den dritten Vermerk (2), bei dem der Codeweg selbst
+# aufloest.
+#
+# Vier Lagen, weil jede einen anderen Zweig trifft:
+#   importierte Klasse mit Destruktor      -> Vermerk 2, gefunden
+#   lokale Ableitung, Basis importiert     -> Vermerk 2 ueber die Kette
+#   lokale Ableitung MIT eigenem           -> Vermerk 1, die Basis bleibt aus
+#   importierte Klasse OHNE Destruktor     -> Vermerk 2, nichts zu rufen
+mkdir -p "$TMP/m/bib"
+cat > "$TMP/m/bib/ding.lyx" <<'EOF'
+unit bib.ding;
+pub var gDingSpur: int64 := 0;
+pub type Ding = class { v: int64;
+  pub fn Destroy() { gDingSpur := gDingSpur + 31; } };
+pub type Leer = class { v: int64; };
+EOF
+
+cat > "$TMP/m/imp.lyx" <<'EOF'
+unit main;
+import bib.ding;
+fn main(): int64 {
+  var d: Ding := new Ding();
+  dispose d;
+  return gDingSpur;
+}
+EOF
+alle_ziele "Destroy einer importierten Klasse wird gerufen" "imp.lyx" 31 "$TMP/m"
+
+cat > "$TMP/m/basis.lyx" <<'EOF'
+unit main;
+import bib.ding;
+type Abl = class extends Ding { w: int64; };
+fn main(): int64 {
+  var a: Abl := new Abl();
+  dispose a;
+  return gDingSpur;
+}
+EOF
+alle_ziele "Destroy aus einer importierten Basisklasse wird gerufen" "basis.lyx" 31 "$TMP/m"
+
+# 5 = nur der eigene; 31 = nur der geerbte; 36 = beide.
+cat > "$TMP/m/eigen.lyx" <<'EOF'
+unit main;
+import bib.ding;
+type Abl = class extends Ding { w: int64;
+  pub fn Destroy() { gDingSpur := gDingSpur + 5; } };
+fn main(): int64 {
+  var a: Abl := new Abl();
+  dispose a;
+  return gDingSpur;
+}
+EOF
+alle_ziele "der eigene Destruktor gewinnt gegen den importierten" "eigen.lyx" 5 "$TMP/m"
+
+# Die andere Seite: "nicht entscheidbar" darf nicht heissen "es MUSS einen
+# geben". Eine importierte Klasse ohne Destruktor uebersetzt und laeuft — die
+# laute Meldung des Lowerers gilt nur fuer den Vermerk 1.
+cat > "$TMP/m/leer.lyx" <<'EOF'
+unit main;
+import bib.ding;
+fn main(): int64 {
+  var l: Leer := new Leer();
+  l.v := 9;
+  dispose l;
+  return l.v + gDingSpur;
+}
+EOF
+alle_ziele "importierte Klasse ohne Destruktor laeuft durch, nichts wird gerufen" "leer.lyx" 9 "$TMP/m"
 
 echo
 echo "--- alle Ziele binden GLEICH (virtueller Destruktor ueber Basisreferenz) ---"

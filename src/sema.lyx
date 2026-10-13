@@ -1654,25 +1654,66 @@ pub type Sema = class {
     self.expScanned := self.symCount;
   }
 
-  // #1235: Deklarationsknoten der Klasse eines Ausdrucks, oder -1.
-  // Bewusst nur fuer einen Bezeichner — `dispose` steht in der Praxis auf einer
-  // Variablen, und eine breitere Aufloesung waere hier ungeprueftes Gelaende.
-  fn _exprClassDeclNi(ni: int64): int64 {
-    if (ni < 0) { return 0 - 1; }
-    if (self.sn_kind(ni) != SNK_IDENT) { return 0 - 1; }
+  // #2056: Hat die Klasse des Ausdrucks einen Destruktor?
+  //
+  //   0 = nein (oder der Ausdruck ist kein Bezeichner einer Klassenvariablen)
+  //   1 = ja — in der Klasse selbst oder einer Basisklasse DIESES Moduls
+  //   2 = hier nicht entscheidbar: die Klasse oder eine ihrer Basisklassen
+  //       steht in einem ANDEREN MODUL
+  //
+  // Bis 1.2.11C gab es nur 0 und 1, und "nicht entscheidbar" fiel auf 0. Fuer
+  // einen importierten Typ ist SymNodeIdx == -1; das heisst "die Deklaration
+  // liegt mir nicht vor", wurde hier aber wie "hat keinen Destruktor" gelesen.
+  // Beide Codewege (CGN_DISPOSE in codegen_x86, lowerDispose in ir_lower)
+  // richten sich allein nach diesem Vermerk — `dispose` lief am Destruktor
+  // jeder importierten Klasse vorbei, auf allen Zielen, ohne Meldung.
+  //
+  // Bei 2 loesen die Codewege selbst auf: ihre Registries kennen die Methoden
+  // der importierten Units, sema an dieser Stelle nicht.
+  //
+  // Bewusst weiterhin nur fuer einen Bezeichner — `dispose` steht in der
+  // Praxis auf einer Variablen, und eine breitere Aufloesung waere hier
+  // ungeprueftes Gelaende (#1235).
+  fn _dtorVermerk(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (self.sn_kind(ni) != SNK_IDENT) { return 0; }
     var si: int64 := self.Lookup(self.sn_sVal(ni), self.sn_sLen(ni));
-    if (si < 0) { return 0 - 1; }
-    if (self.SymKind(si) != SYM_VAR) { return 0 - 1; }
+    if (si < 0) { return 0; }
+    if (self.SymKind(si) != SYM_VAR) { return 0; }
     var declNi: int64 := self.SymNodeIdx(si);
-    if (declNi < 0) { return 0 - 1; }
-    if (self.sn_kind(declNi) != SNK_VAR_DECL) { return 0 - 1; }
+    if (declNi < 0) { return 0; }
+    if (self.sn_kind(declNi) != SNK_VAR_DECL) { return 0; }
     var typeNi: int64 := self.sn_c0(declNi);
-    if (typeNi < 0) { return 0 - 1; }
+    if (typeNi < 0) { return 0; }
     var tlen: int64 := self.sn_sLen(typeNi);
-    if (tlen <= 0) { return 0 - 1; }
+    if (tlen <= 0) { return 0; }
     var cs: int64 := self.Lookup(self.sn_sVal(typeNi), tlen);
-    if (cs < 0) { return 0 - 1; }
-    return self.SymNodeIdx(cs);
+    if (cs < 0) { return 0; }
+    var cur: int64 := self.SymNodeIdx(cs);
+    if (cur < 0) { return 2; }                 // die Klasse selbst ist importiert
+
+    // Dieselbe Kette wie _methodOwnerNi (#1624) — die beiden muessen
+    // uebereinstimmen. Der Unterschied: verlaesst die Kette das Modul, endet
+    // _methodOwnerNi mit -1 ("nicht gefunden"); hier ist das der dritte Fall.
+    var tiefe: int64 := 0;
+    while (cur >= 0 && tiefe < 32) {
+      var m: int64 := self.sn_c1(cur);
+      while (m >= 0) {
+        if (self.sn_kind(m) == SNK_FUNC_DECL &&
+            self._strNEq(self.sn_sVal(m), self.sn_sLen(m), "Destroy"c, 7) != 0) {
+          return 1;
+        }
+        m := self.sn_next(m);
+      }
+      var pNi: int64 := self.sn_c2(cur);
+      if (pNi < 0) { return 0; }               // Wurzel erreicht, kein Destruktor
+      var pSym: int64 := self.Lookup(self.sn_sVal(pNi), self.sn_sLen(pNi));
+      if (pSym < 0) { return 0; }
+      cur := self.SymNodeIdx(pSym);
+      if (cur < 0) { return 2; }               // die Basisklasse ist importiert
+      tiefe := tiefe + 1;
+    }
+    return 0;
   }
 
   fn _reportSymbolCollision(symName: pchar, symLen: int64,
@@ -5401,11 +5442,11 @@ pub type Sema = class {
       // und im iVal des Knotens hinterlegt (1 = Destroy vorhanden).
       // #1624: auch der geerbte Destruktor zaehlt — sonst laeuft `dispose` an
       // ihm vorbei, sobald die Ableitung keinen eigenen mitbringt.
-      var dTypeName: int64 := self._exprClassDeclNi(self.sn_c0(ni));
-      if (dTypeName >= 0) {
-        if (self._methodOwnerNi(dTypeName, "Destroy"c, 7) >= 0) {
-          poke64(self.sn_off(ni) + NODE_OFF_IVAL, 1);
-        }
+      // #2056: 2 = hier nicht entscheidbar (Klasse oder Basis in einem anderen
+      // Modul) — dann loest der Codeweg selbst auf. Siehe _dtorVermerk.
+      var dVerm: int64 := self._dtorVermerk(self.sn_c0(ni));
+      if (dVerm != 0) {
+        poke64(self.sn_off(ni) + NODE_OFF_IVAL, dVerm);
       }
 
     // WP-BC-07: assert(cond)
