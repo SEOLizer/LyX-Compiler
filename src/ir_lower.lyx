@@ -715,6 +715,9 @@ pub type IRLower = class {
   nurErreichbar: int64;
   // Merker fuer den Nachlauf: hat der letzte Durchgang etwas erzeugt?
   _nochGelowert: int64;
+  // #2063: 1, solange der Nachlauf laeuft. Der Vorpass von lowerModule
+  // registriert dann NICHT noch einmal — siehe dort.
+  _imNachlauf: int64;
 
   // #2020: verschachtelte Funktionen (`fn` INNERHALB eines Rumpfes). Der
   // Vorabpass laeuft nur die Deklarationskette auf Modulebene ab, und
@@ -812,6 +815,7 @@ pub type IRLower = class {
     self.doneBuf := alloc(self.doneCap);
     self.nurErreichbar := 0;
     self._nochGelowert := 0;
+    self._imNachlauf := 0;
     self.nestCap := 64;
     self.nestBuf := alloc(self.nestCap * 24);
     self.nestCnt := 0;
@@ -7936,8 +7940,20 @@ pub type IRLower = class {
         if pfIsExtern == 0 {
           var pfNamePtr: pchar := self.nodeSVal(pfCur);
           var pfNameLen: int64 := self.nodeSLen(pfCur);
-          var pfNameOff: int64 := self.irAddString(pfNamePtr, pfNameLen);
-          self.irAddFunc(pfNameOff, pfNameLen, 0, 0);
+          // #2063: Im Nachlauf nicht noch einmal registrieren. irAddFunc
+          // haengt ohne Dublettenpruefung an; jeder weitere Durchgang durch
+          // dasselbe Modul legte fuer JEDE Funktion einen zweiten, dritten,
+          // … Eintrag an. Aufgeloest wird immer der erste, die uebrigen
+          // bleiben ohne Rumpf — und jedes Backend erzeugt fuer einen
+          // Eintrag ohne Rumpf eine leere Huelle. Ein Import mit hundert
+          // Funktionen und vier Runden hinterliess so vierhundert Huellen im
+          // Erzeugnis. Dasselbe gilt fuer die beiden Stellen darunter
+          // (Methoden) und fuer _nestSammle — die vier muessen
+          // uebereinstimmen.
+          if self._imNachlauf == 0 {
+            var pfNameOff: int64 := self.irAddString(pfNamePtr, pfNameLen);
+            self.irAddFunc(pfNameOff, pfNameLen, 0, 0);
+          }
           // #2020: Dieser Durchgang lief bisher NUR die Deklarationskette auf
           // Modulebene ab. Eine `fn` im Rumpf einer anderen `fn` stand nie
           // darin, wurde also nie registriert — und der Aufruf endete in
@@ -7953,8 +7969,10 @@ pub type IRLower = class {
             var pmMang: int64 := self._methodMangle(self.nodeSVal(pfCur), self.nodeSLen(pfCur),
                                                     self.nodeSVal(pmM), self.nodeSLen(pmM));
             var pmLen:  int64 := self.nodeSLen(pfCur) + 1 + self.nodeSLen(pmM);
-            var pmOff:  int64 := self.irAddString(pmMang as pchar, pmLen);
-            self.irAddFunc(pmOff, pmLen, 0, 0);
+            if self._imNachlauf == 0 {                 // #2063, siehe oben
+              var pmOff:  int64 := self.irAddString(pmMang as pchar, pmLen);
+              self.irAddFunc(pmOff, pmLen, 0, 0);
+            }
           }
           pmM := self.nodeNext(pmM);
         }
@@ -8210,15 +8228,49 @@ pub type IRLower = class {
                                                       self.nodeSVal(mtM), self.nodeSLen(mtM));
               var mtLen: int64 := self.nodeSLen(cur) + 1 + self.nodeSLen(mtM);
               var mtLowern: int64 := 1;
+              var mtIdx: int64 := 0 - 1;
               if self.nurErreichbar != 0 {
-                var mtIdx: int64 := self._findFuncIdxStill(mtMang as pchar, mtLen);   // #1783
+                mtIdx := self._findFuncIdxStill(mtMang as pchar, mtLen);   // #1783
                 mtLowern := 0;
                 if mtIdx < 0 { mtLowern := 1; }            // unbekannt: nicht raten
                 else if mtIdx < self.wantCap {
                   if peek8(self.wantBuf + mtIdx) != 0 { mtLowern := 1; }
                 }
+                // #2063: schon erzeugt? dann nicht noch einmal. Dieselbe
+                // Buchfuehrung wie im Zweig fuer freie Funktionen weiter oben
+                // — die beiden muessen uebereinstimmen. Als #1783 den Filter
+                // auf Methoden ausdehnte, kam nur die Frage "wird sie
+                // gebraucht?" mit, nicht "ist sie schon da?" und nicht die
+                // Fortschrittsmeldung an den Nachlauf.
+                //
+                // Die Folge war ein stilles falsches Ergebnis: der Nachlauf
+                // wiederholt, "bis ein vollstaendiger Durchgang nichts Neues
+                // mehr erzeugt", und nur freie Funktionen meldeten Neues.
+                // Entstand in einer Runde allein eine METHODE, endete er —
+                // und die freie Funktion, die erst diese Methode ruft und die
+                // im Quelltext VOR der Klasse steht, bekam nie einen Rumpf.
+                // Der Aufruf lief ins Leere: uebersetzt fehlerfrei, Ergebnis 0
+                // oder der Inhalt eines Registers.
+                if mtLowern != 0 && mtIdx >= 0 && mtIdx < self.doneCap {
+                  if peek8(self.doneBuf + mtIdx) != 0 { mtLowern := 0; }
+                }
               }
               if mtLowern != 0 {
+              if mtIdx >= 0 {
+                if mtIdx >= self.doneCap {
+                  var mdc: int64 := self.doneCap * 2;
+                  while mdc <= mtIdx { mdc := mdc * 2; }
+                  var mdb: int64 := alloc(mdc);
+                  var mdI: int64 := 0;
+                  while mdI < self.doneCap { poke8(mdb + mdI, peek8(self.doneBuf + mdI)); mdI := mdI + 1; }
+                  while mdI < mdc { poke8(mdb + mdI, 0); mdI := mdI + 1; }
+                  self.doneBuf := mdb; self.doneCap := mdc;
+                }
+                poke8(self.doneBuf + mtIdx, 1);
+                // Fortschritt nur melden, wenn er verbucht ist — sonst liefe
+                // der Nachlauf seine sechzehn Runden jedes Mal voll aus.
+                self._nochGelowert := 1;
+              }
               self.overrideFuncName    := mtMang as pchar;
               self.overrideFuncNameLen := self.nodeSLen(cur) + 1 + self.nodeSLen(mtM);
               self.methodParamBase     := 1;
@@ -8385,6 +8437,7 @@ pub type IRLower = class {
       var nlSavedCnt:   int64 := self.nodeCount;
       var nlSavedModus: int64 := self.nurErreichbar;
       self.nurErreichbar := 1;
+      self._imNachlauf := 1;                         // #2063
       var nlRunde: int64 := 0;
       var nlWeiter: int64 := 1;
       while nlWeiter != 0 && nlRunde < 16 {
@@ -8402,6 +8455,7 @@ pub type IRLower = class {
         nlRunde := nlRunde + 1;
       }
       self.nurErreichbar := nlSavedModus;
+      self._imNachlauf := 0;
       self.src       := nlSavedSrc;
       self.nodes     := nlSavedNodes;
       self.nodeCount := nlSavedCnt;
@@ -10094,8 +10148,10 @@ pub type IRLower = class {
         // _istExternDecl.
         var mp: int64 := self._nestMangle(pfx, pfxLen, self.nodeSVal(cur), self.nodeSLen(cur));
         var ml: int64 := pfxLen + 1 + self.nodeSLen(cur);
-        var mo: int64 := self.irAddString(mp as pchar, ml);
-        self.irAddFunc(mo, ml, 0, 0);
+        if self._imNachlauf == 0 {                     // #2063: nur einmal registrieren
+          var mo: int64 := self.irAddString(mp as pchar, ml);
+          self.irAddFunc(mo, ml, 0, 0);
+        }
         self._nestRecord(cur, mp, ml);
         // Weiter nach innen — mit dem neuen Weg als Praefix.
         self._nestSammle(self.nodeC2(cur), mp, ml, tiefe + 1);
