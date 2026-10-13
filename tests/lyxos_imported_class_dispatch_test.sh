@@ -40,14 +40,13 @@ fn main(): int64 { var w: Panel := new Panel(); return w.Answer(); }
 LYX
 
 # Ausfuehrung auf den IR-Zielen, die laufen.
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
 for ziel in arm64 riscv; do
   q=""
   if [ "$ziel" = "arm64" ]; then
-    command -v qemu-aarch64-static >/dev/null 2>&1 && q=qemu-aarch64-static
-    [ -z "$q" ] && command -v qemu-aarch64 >/dev/null 2>&1 && q=qemu-aarch64
+    [ -n "$QEMU_ARM64" ] && q="$QEMU_ARM64"
   else
-    command -v qemu-riscv64-static >/dev/null 2>&1 && q=qemu-riscv64-static
-    [ -z "$q" ] && command -v qemu-riscv64 >/dev/null 2>&1 && q=qemu-riscv64
+    [ -n "$QEMU_RISCV64" ] && q="$QEMU_RISCV64"
   fi
   if [ -z "$q" ]; then echo "SKIP $ziel/imported_method_dispatch: qemu fehlt — ohne Laufzeit misst das nichts"; continue; fi
   if ! LYX_STD_PATH="$ROOT/std" timeout 200 "$LYXC" --target="$ziel" "$ROOT/_impapp_test.lyx" -o "$TMP/app.$ziel" >"$TMP/c.log" 2>&1; then

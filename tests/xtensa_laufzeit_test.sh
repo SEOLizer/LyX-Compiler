@@ -44,7 +44,8 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 ulimit -c 0
 PASS=0; FAIL=0
 
-QEMU="$(command -v qemu-xtensa-static || true)"
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
+QEMU="$QEMU_XTENSA"
 HUELLE="$ROOT/tests/lib/xtensa_huelle.py"
 if [ -z "$QEMU" ]; then
   echo "HINWEIS: qemu-xtensa-static fehlt — es wird nur uebersetzt, nicht ausgefuehrt."

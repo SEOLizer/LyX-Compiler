@@ -20,8 +20,9 @@ ok()  { echo "PASS $1"; PASS=$((PASS+1)); }
 nok() { echo "FAIL $1"; FAIL=$((FAIL+1)); }
 
 QEMU_ARM=""; QEMU_RV=""
-command -v qemu-aarch64-static >/dev/null 2>&1 && QEMU_ARM="qemu-aarch64-static"
-command -v qemu-riscv64-static >/dev/null 2>&1 && QEMU_RV="qemu-riscv64-static"
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
+[ -n "$QEMU_ARM64" ] && QEMU_ARM="$QEMU_ARM64"
+[ -n "$QEMU_RISCV64" ] && QEMU_RV="$QEMU_RISCV64"
 
 lauf() {
   local ziel="$1"

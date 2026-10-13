@@ -60,7 +60,8 @@ done
 # muss ausloesen. Das ist der tragfaehigere Nachweis — ein Test, dessen gruener
 # Zustand eine fehlende Faehigkeit voraussetzt, verrottet mit dem naechsten
 # Ausbau (in dieser Sitzung viermal passiert).
-QEMU_XT="$(command -v qemu-xtensa-static || true)"
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
+QEMU_XT="$QEMU_XTENSA"
 HUELLE_XT="$ROOT/tests/lib/xtensa_huelle.py"
 printf 'fn main(): int64 { var a: int64 := 10; var b: int64 := 0; return a / b; }\n' > "$TMP/div0.lyx"
 if ! "$LYXC" --std-path="$ROOT" "$TMP/div0.lyx" --target=esp32 -o "$TMP/d0_xt" >/dev/null 2>&1; then

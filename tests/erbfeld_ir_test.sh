@@ -50,14 +50,15 @@ echo "--- geerbtes Feld ueber Unit-Grenze (#1985) ---"
 # x86 geht direkt vom AST und war nie betroffen — misst den Bestand mit.
 pruefe_ziel "x86 (direkt vom AST)" "" ""
 
-if command -v qemu-aarch64-static >/dev/null 2>&1; then
-    pruefe_ziel "arm64 (IR-Weg)" "--target=arm64" "qemu-aarch64-static"
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
+if [ -n "$QEMU_ARM64" ]; then
+    pruefe_ziel "arm64 (IR-Weg)" "--target=arm64" "$QEMU_ARM64"
 else
     echo "HINWEIS qemu-aarch64-static fehlt — arm64 ungemessen"
 fi
 
-if command -v qemu-riscv64-static >/dev/null 2>&1; then
-    pruefe_ziel "riscv (IR-Weg)" "--target=riscv" "qemu-riscv64-static"
+if [ -n "$QEMU_RISCV64" ]; then
+    pruefe_ziel "riscv (IR-Weg)" "--target=riscv" "$QEMU_RISCV64"
 else
     echo "HINWEIS qemu-riscv64-static fehlt — riscv ungemessen"
 fi

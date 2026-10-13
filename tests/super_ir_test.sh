@@ -24,17 +24,16 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 ulimit -c 0 2>/dev/null
 
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
 fall() {  # name, quelle, erwarteter Rueckgabewert
   printf '%s\n' "$2" > "$TMP/s.lyx"
   for ziel in linux arm64 riscv; do
     local q=""
     if [ "$ziel" = "arm64" ]; then
-      command -v qemu-aarch64-static >/dev/null 2>&1 && q=qemu-aarch64-static
-      [ -z "$q" ] && command -v qemu-aarch64 >/dev/null 2>&1 && q=qemu-aarch64
+      [ -n "$QEMU_ARM64" ] && q="$QEMU_ARM64"
       if [ -z "$q" ]; then echo "SKIP arm64/$1: qemu fehlt — ohne Laufzeit misst das nichts"; continue; fi
     elif [ "$ziel" = "riscv" ]; then
-      command -v qemu-riscv64-static >/dev/null 2>&1 && q=qemu-riscv64-static
-      [ -z "$q" ] && command -v qemu-riscv64 >/dev/null 2>&1 && q=qemu-riscv64
+      [ -n "$QEMU_RISCV64" ] && q="$QEMU_RISCV64"
       if [ -z "$q" ]; then echo "SKIP riscv/$1: qemu fehlt — ohne Laufzeit misst das nichts"; continue; fi
     fi
     if ! timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/s.lyx" --target="$ziel" -o "$TMP/s.out" >"$TMP/s.log" 2>&1; then

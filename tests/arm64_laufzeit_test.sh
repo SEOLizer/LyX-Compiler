@@ -18,7 +18,8 @@ _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../l
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 
-QEMU="$(command -v qemu-aarch64-static || true)"
+. "$(dirname "$0")/lib/qemu.sh"   # #2048: beide Paketnamen
+QEMU="$QEMU_ARM64"
 if [ -z "$QEMU" ]; then
   echo "HINWEIS: qemu-aarch64-static fehlt — es wird nur uebersetzt, nicht ausgefuehrt."
 fi
