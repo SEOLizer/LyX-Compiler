@@ -363,10 +363,27 @@ pub type EmitARM64 = class {
       if self.stackSize <= 4095 {
         self.emit32(0xD10003FF | (self.stackSize << 10));
       } else {
-        // Large frame: MOVZ x9, #sz; SUB sp, sp, x9
-        self.emitMovImmReg(ARM64_X9, self.stackSize);
-        // SUB sp, sp, x9
-        self.emit32(0xCB09C3FF);  // SUB sp, sp, x9
+        // #2062: grosser Rahmen in zwei Schritten — erst die oberen zwoelf Bit
+        // (SUB mit LSL #12), dann der Rest. Reicht bis 16 MB.
+        //
+        // Hier stand `MOVZ x9, #sz; SUB sp, sp, x9` mit dem Befehlswort
+        // 0xCB09C3FF. Das ist die Form mit GESCHOBENEM Register, und in der
+        // heisst Register 31 nicht SP, sondern XZR: der Befehl schrieb ins
+        // Nullregister und legte keinen Rahmen an. Aufgefallen ist es nie,
+        // weil _emitFarAddr jede Funktion mit so grossem Rahmen vorher
+        // abwies — mit dem Wegfall jener Grenze waere es der naechste stille
+        // Fehler gewesen. In der Direktwert-Form unten ist 31 der
+        // Stapelzeiger.
+        if self.stackSize > 0xFFFFFF {
+          EPrintStr("error: arm64: Rahmen von "c);
+          EPrintInt(self.stackSize);
+          EPrintStrLn(" Byte ueberschreitet 16 MB (#2062)."c);
+          exit(1);
+        }
+        var rhHoch: int64 := (self.stackSize >> 12) & 0xFFF;
+        var rhTief: int64 := self.stackSize & 0xFFF;
+        self.emit32(0xD14003FF | (rhHoch << 10));                  // SUB sp, sp, #hoch, LSL #12
+        if rhTief != 0 { self.emit32(0xD10003FF | (rhTief << 10)); }  // SUB sp, sp, #tief
       }
     }
   }
@@ -1850,23 +1867,37 @@ pub type EmitARM64 = class {
   }
 
   // #1388: x16 := Xn + off, fuer Offsets ausserhalb von simm9. off ist hier
-  // immer negativ (Slots liegen unter dem Rahmenzeiger); der Betrag passt in
-  // die 12 Bit von SUB, solange eine Funktion unter 512 Slots bleibt. Darueber
-  // wird laut gemeldet statt erneut still gekuerzt.
+  // immer negativ (Slots liegen unter dem Rahmenzeiger).
+  //
+  // #2062: Bis 1.2.11G endete die Reichweite bei 4095 — der Direktwert von SUB
+  // fasst zwoelf Bit —, und darueber wurde gemeldet: eine Funktion mit mehr als
+  // 512 Slots war fuer arm64 nicht uebersetzbar (examples/test_zlib.lyx). SUB
+  // kennt dieselben zwoelf Bit auch um zwoelf geschoben; in zwei Schritten
+  // reicht es damit bis 16 MB. Der haeufige Fall bleibt ein Befehl.
+  //
+  // Das Gegenstueck auf riscv ist _rvWeit (#2061).
   fn _emitFarAddr(rn: int64, off: int64) {
     var betrag: int64 := 0 - off;
     if (off > 0) {
       EPrintStrLn("error: arm64: positiver Rahmen-Offset ausserhalb simm9 (#1388)"c);
       exit(1);
     }
-    if (betrag > 4095) {
+    if (betrag > 0xFFFFFF) {
       EPrintStr("error: arm64: Rahmen zu gross — Slot-Offset "c);
       EPrintInt(betrag);
-      EPrintStrLn(" passt weder in simm9 noch in SUB-imm12 (#1388)."c);
-      EPrintStrLn("  Die Funktion braucht mehr als 512 Slots; das Backend kann das nicht adressieren."c);
+      EPrintStrLn(" ueberschreitet 16 MB (#2062)."c);
       exit(1);
     }
-    self.emit32(0xD1000000 | (betrag << 10) | (rn << 5) | 16);   // SUB x16, Xn, #betrag
+    if (betrag <= 4095) {
+      self.emit32(0xD1000000 | (betrag << 10) | (rn << 5) | 16);   // SUB x16, Xn, #betrag
+      return;
+    }
+    var hoch: int64 := (betrag >> 12) & 0xFFF;
+    var tief: int64 := betrag & 0xFFF;
+    self.emit32(0xD1400000 | (hoch << 10) | (rn << 5) | 16);       // SUB x16, Xn, #hoch, LSL #12
+    if (tief != 0) {
+      self.emit32(0xD1000000 | (tief << 10) | (16 << 5) | 16);     // SUB x16, x16, #tief
+    }
   }
 
   fn emitFLdur(rt: int64, rn: int64, off: int64) {
