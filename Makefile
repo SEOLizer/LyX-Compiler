@@ -573,6 +573,7 @@ test: lyxc
 	@bash tests/ir_nachlauf_methoden_test.sh
 	@bash tests/ir_rahmen_test.sh
 	@bash tests/operator_overloading_ir_test.sh
+	@bash tests/beispiel_aes_vector_test.sh
 	@bash tests/lyu_konstanten_test.sh
 	@bash tests/lyu_exporte_test.sh
 	@bash tests/lyu_ir_test.sh
