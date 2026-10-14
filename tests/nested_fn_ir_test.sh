@@ -60,24 +60,6 @@ alle_ziele() {
   done
 }
 
-# Wie alle_ziele, aber ohne x86_64 — fuer den einen Fall, den der
-# x86-Schnellweg noch falsch rechnet (#2044).
-ir_ziele() {
-  local was="$1" src="$2" erw="$3"
-  for ziel in arm64 riscv; do
-    lauf "$ziel" "$src" "$TMP/aus.$ziel"; local rc=$?
-    if [ "$rc" = 2 ]; then
-      nok "$was [$ziel]: qemu fehlt — die Wirkung wurde NICHT gemessen"
-    elif [ "$rc" != 0 ]; then
-      nok "$was [$ziel]: uebersetzt nicht ($(grep -m1 -E '^lyxc:|error' "$TMP/build_$ziel.log"))"
-    else
-      local ist; ist="$(tr '\n' '|' < "$TMP/aus.$ziel")"
-      if [ "$ist" = "$erw" ]; then ok "$was [$ziel] = $erw"
-      else nok "$was [$ziel]: [$ist] statt [$erw]"; fi
-    fi
-  done
-}
-
 echo "--- #2020: eine verschachtelte Funktion rechnet richtig ---"
 #
 # Die Ziffernzerlegung ist mit Absicht keine Rundung: 2026 muss als 2/0/2/6
@@ -130,11 +112,11 @@ echo "--- #2020: zwei aeussere Funktionen mit GLEICHNAMIGEN inneren ---"
 # eine `nib` — allerdings in VERSCHIEDENEN Units, dort stossen sie nicht
 # zusammen. Der Fall ist heute also latent, nicht akut.
 #
-# x86_64 ist hier AUSGESPART: dort tragen innere Funktionen ihren blanken
-# Namen als Marke, die zweite `nib` trifft die erste, und das Programm
-# liefert 11|11 statt 11|21 — fehlerfrei uebersetzt, falsches Ergebnis.
-# Das ist #2044 und gehoert nicht zu #2020. Sobald es behoben ist, gehoert
-# x86_64 in diese Pruefung (dann `alle_ziele` statt `ir_ziele`).
+# x86_64 war hier bis 1.2.12A AUSGESPART: dort trugen innere Funktionen ihren
+# blanken Namen als Marke, die zweite `nib` traf die erste, und das Programm
+# lieferte 11|11 statt 11|21. Seit #2044 heisst die Marke "Aussen@nib" auch
+# dort; weitere Faelle (Verdeckung, Bloecke, Methoden) misst
+# tests/verschachtelte_namen_test.sh.
 cat > "$TMP/gleichnamig.lyx" <<'EOF'
 unit main;
 import std.io;
@@ -148,7 +130,7 @@ fn zweiteR(): int64 {
 }
 fn main(): int64 { PrintLn(IntToStr(ersteR())); PrintLn(IntToStr(zweiteR())); return 0; }
 EOF
-ir_ziele "gleichnamige innere bleiben getrennt" "$TMP/gleichnamig.lyx" "11|21|"
+alle_ziele "gleichnamige innere bleiben getrennt" "$TMP/gleichnamig.lyx" "11|21|"
 
 echo
 echo "--- #2020: die Sperre gegen den Zugriff auf die Umgebung HAELT ---"
