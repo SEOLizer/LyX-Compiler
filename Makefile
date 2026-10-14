@@ -575,6 +575,7 @@ test: lyxc
 	@bash tests/operator_overloading_ir_test.sh
 	@bash tests/beispiel_aes_vector_test.sh
 	@bash tests/beispiel_ldap_einheiten_test.sh
+	@bash tests/ldap_rdn_test.sh
 	@bash tests/lyu_konstanten_test.sh
 	@bash tests/lyu_exporte_test.sh
 	@bash tests/lyu_ir_test.sh

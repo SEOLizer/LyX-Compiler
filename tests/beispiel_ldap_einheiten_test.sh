@@ -54,6 +54,7 @@ done
 }
 [ -f "$TMP/ldap_test.aus" ] && {
   hat ldap_test "LDAPErrorToStr: Success"
+  hat ldap_test "LDAPGetRDNAt: cn=admin"   # #2071: bis 1.2.12A dc=example
   hat ldap_test "Tests passed (of 7): 7"
 }
 
