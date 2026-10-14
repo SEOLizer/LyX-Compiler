@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # tests/dispose_destruktor_ir_test.sh — #2054: `dispose` ruft den Destruktor
 # auch auf den IR-Zielen; #2056: und auch dann, wenn er in einem anderen
-# Modul steht (das fehlte auf ALLEN Zielen).
+# Modul steht (das fehlte auf ALLEN Zielen); #2059: und fuer jeden Operanden,
+# nicht nur fuer eine lokal deklarierte Variable.
 #
 # Der x86-Weg ruft `Destroy` seit #1235. `lowerDispose` in ir_lower erzeugte
 # bis 1.2.11B nur IRO_FREE — auf arm64 und riscv lief der Destruktor nie,
@@ -243,6 +244,66 @@ fn main(): int64 {
 }
 EOF
 alle_ziele "importierte Klasse ohne Destruktor laeuft durch, nichts wird gerufen" "leer.lyx" 9 "$TMP/m"
+
+echo
+echo "--- #2059: der Operand ist kein lokal deklarierter Bezeichner ---"
+#
+# sema vermerkte einen Destruktor nur fuer einen Bezeichner mit einer
+# `var`-Deklaration. Alles andere fiel auf 0 = "hat keinen", und der
+# Destruktor lief auf KEINEM Ziel. Seit #2059 ist das "nicht entscheidbar" (2),
+# und die Codewege bestimmen die Klasse selbst.
+#
+# Jeder Fall gibt `gSpur + 40` zurueck: 41 = der Destruktor lief genau einmal.
+KD='var gSpur: int64 := 0;
+var gMach: int64 := 0;
+type K = class { v: int64;
+  pub fn Destroy() { gSpur := gSpur + 1; } };
+type H = class { k: K;
+  pub fn Raus() { dispose self.k; } };
+fn mach(): K { gMach := gMach + 1; return new K(); }
+'
+fall2059() {  # $1 Beschreibung, $2 Datei-Suffix, $3 zusaetzliche Deklarationen, $4 Rumpf von main, $5 Soll
+  printf 'unit main;\n%s%s\nfn main(): int64 {\n%s\n}\n' "$KD" "$3" "$4" > "$TMP/d2059_$2.lyx"
+  alle_ziele "$1" "$TMP/d2059_$2.lyx" "$5"
+}
+fall2059 "dispose auf einem PARAMETER" param \
+  'fn weg(k: K) { dispose k; }' \
+  '  var k: K := new K(); weg(k); return gSpur + 40;' 41
+fall2059 "dispose auf einem FELD (h.k)" feld '' \
+  '  var h: H := new H(); h.k := new K(); dispose h.k; return gSpur + 40;' 41
+fall2059 "dispose auf self.k in einer Methode" selbst '' \
+  '  var h: H := new H(); h.k := new K(); h.Raus(); return gSpur + 40;' 41
+# Der Aufruf darf dabei nur EINMAL laufen: einmal fuer das Objekt, nicht noch
+# einmal fuer die Typbestimmung. 10 * Aufrufe + Destruktorlaeufe = 11.
+fall2059 "dispose auf einem Aufrufergebnis: mach() einmal, Destroy einmal" aufruf '' \
+  '  dispose mach(); return gMach * 10 + gSpur;' 11
+fall2059 "dispose auf einer Modulvariablen (ging schon vorher)" modul \
+  'var gk: K;' \
+  '  gk := new K(); dispose gk; return gSpur + 40;' 41
+
+# GEGENPROBE: "nicht entscheidbar" darf nicht heissen "es MUSS einen geben".
+# Ein Parameter einer Klasse ohne Destruktor und ein Zahlen- bzw.
+# Zeigeroperand laufen durch, ohne dass etwas gerufen wird.
+fall2059 "Parameter einer Klasse ohne Destruktor: nichts wird gerufen" ohne \
+  'type N = class { w: int64; };
+fn weg(n: N) { dispose n; }' \
+  '  var n: N := new N(); weg(n); return gSpur + 40;' 40
+fall2059 "dispose auf int64 und pchar: nichts wird gerufen" zahl '' \
+  '  var p: int64 := 5; dispose p; var t: pchar := "x"; dispose t; return gSpur + 40;' 40
+
+# Und die Kombination mit #2056: ein Parameter, dessen Klasse in einem anderen
+# Modul steht.
+cat > "$TMP/m/par2059.lyx" <<'EOF'
+unit main;
+import bib.ding;
+fn weg(d: Ding) { dispose d; }
+fn main(): int64 {
+  var d: Ding := new Ding();
+  weg(d);
+  return gDingSpur;
+}
+EOF
+alle_ziele "Parameter einer importierten Klasse" "par2059.lyx" 31 "$TMP/m"
 
 echo
 echo "--- alle Ziele binden GLEICH (virtueller Destruktor ueber Basisreferenz) ---"
