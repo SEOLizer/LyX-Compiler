@@ -87,13 +87,14 @@ alle_ziele "rechne 1|2, als Wert 1|2, Vorwaertsaufruf 40, Vorgaben 5|70, oeffent
   "haupt.lyx" "1|2|1|2|40|5|70|300|9|"
 
 echo
-echo "--- IR-Weg: eine private Funktion mit Builtin-Namen geht vor (#1388) ---"
+echo "--- eine private Funktion mit Builtin-Namen geht vor (#1388, #2082) ---"
 # Auf dem IR-Weg hat eine eigene Definition Vorrang vor dem gleichnamigen
 # Builtin (#1388, _istBenutzerFunktion). Diese Pruefung fragte den funcBuffer
 # mit dem blanken Namen — eine private Funktion steht dort seit #2076 als
 # "unit_name", der Builtin haette gewonnen.
 #
-# Nur arm64/riscv: x86 nimmt auch im Hauptmodul den Builtin (#2082).
+# Seit 1.2.13E auf allen drei Zielen (#2082, ebnf.md §15.4): bis dahin nahm
+# x86 auch hier den Builtin.
 cat > "$TMP/m/bib/sl.lyx" <<'EOF'
 unit bib.sl;
 fn StrLen(p: pchar): int64 { return 99; }
@@ -105,7 +106,7 @@ import std.io;
 import bib.sl;
 fn main(): int64 { PrintLn(IntToStr(SlLaenge())); return 0; }
 EOF
-ziele "private StrLen 99" "sl.lyx" "99|" "arm64 riscv"
+ziele "private StrLen 99" "sl.lyx" "99|" "x86_64 arm64 riscv"
 
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
