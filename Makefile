@@ -581,6 +581,9 @@ test: lyxc
 	@bash tests/builtin_stelligkeit_test.sh
 	@bash tests/x86_aufrufe_test.sh
 	@bash tests/builtin_verdeckung_test.sh
+	@bash tests/sha512_test.sh
+	@bash tests/ir_datei_builtins_test.sh
+	@bash tests/unit_private_globals_test.sh
 	@bash tests/beispiel_aes_vector_test.sh
 	@bash tests/beispiel_ldap_einheiten_test.sh
 	@bash tests/ldap_rdn_test.sh
