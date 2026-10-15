@@ -700,6 +700,8 @@ pub type IRLower = class {
   impLstNodes: int64;
   impLstCnt:   int64;
   impLstHead:  int64;
+  impLstName:    int64;   // #2076: Importname je Eintrag (Zeiger), 0 fuer das Hauptmodul
+  impLstNameLen: int64;
   impLstN:     int64;
   // Ein Byte je funcBuffer-Index: 1 = wird gebraucht. Gesetzt beim Lowern
   // eines Aufrufs, gelesen beim Entscheiden, ob ein importierter Rumpf
@@ -742,12 +744,35 @@ pub type IRLower = class {
   nestBuf:     int64;
   nestCnt:     int64;
   nestCap:     int64;
-  // Der eindeutige Name der gerade erzeugten Funktion ("aussen" bzw.
-  // "aussen@innen"). Er ist zugleich der Gueltigkeitsbereich fuer die
-  // Namensaufloesung: ein Aufruf sucht erst "<hier>@name", dann eine Ebene
-  // weiter aussen, zuletzt den blanken Namen auf Modulebene.
-  nestPfx:     int64;
-  nestPfxLen:  int64;
+  // #2074: Welche innere Funktion ein Aufruf oder Bezeichner meint,
+  // entscheidet ein Vorpass mit der Gueltigkeit von sema (Block, Verdeckung) —
+  // dasselbe Verfahren wie cg_nestPlan in codegen_x86.lyx, die beiden muessen
+  // uebereinstimmen. Bis 1.2.12B suchte der Aufruf von der eigenen Funktion
+  // aus nach aussen ("<hier>@name"); Bloecke und Verdeckung kamen darin nicht
+  // vor, Methodenruempfe wurden gar nicht eingesammelt.
+  // nmMap   — je 40 B: Knotentabelle, Knoten, Name, Laenge, Deklarationsknoten.
+  // nmScope — Gueltigkeitsstapel des Vorpasses, je 40 B: Name, Laenge,
+  //           eindeutiger Name (0 = durch Variable/Parameter verdeckt),
+  //           Laenge, Deklarationsknoten.
+  nmMap:       int64;
+  nmCnt:       int64;
+  nmCap:       int64;
+  nmScope:     int64;
+  nmScopeCnt:  int64;
+  nmScopeCap:  int64;
+  // #2076: Die Unit, deren Deklarationen gerade gesenkt werden — ihr
+  // Importname wie auf x86 (cgUnitTag), 0 fuer das Hauptmodul —, und der Kopf
+  // ihrer Deklarationskette. Eine nicht-oeffentliche Funktion einer Unit
+  // heisst im funcBuffer "unit_name"; sonst fielen zwei gleichnamige private
+  // Funktionen zweier Units auf einen Eintrag.
+  irUnitTag:    int64;
+  irUnitTagLen: int64;
+  irModHead:    int64;
+  // Die privaten Funktionsnamen dieser Unit (je 16 B: Zeiger, Laenge), einmal
+  // je Modul gebaut — sonst liefe jede Aufrufstelle die Deklarationskette ab,
+  // und der IR-Weg ist bei grossen Units ohnehin langsam (#2023).
+  irPrivTab:    int64;
+  irPrivCnt:    int64;
 
   // #1693: Suchpfade fuer Importe. Die IR-Strecke hat sie bisher nicht
   // gekannt und jeden Import stur relativ zum ARBEITSVERZEICHNIS gelesen —
@@ -832,8 +857,19 @@ pub type IRLower = class {
     self.nestCap := 64;
     self.nestBuf := alloc(self.nestCap * 24);
     self.nestCnt := 0;
-    self.nestPfx := 0;
-    self.nestPfxLen := 0;
+    self.nmCap := 64;
+    self.nmMap := alloc(self.nmCap * 40);
+    self.nmCnt := 0;
+    self.nmScopeCap := 64;
+    self.nmScope := alloc(self.nmScopeCap * 40);
+    self.nmScopeCnt := 0;
+    self.irUnitTag := 0;
+    self.irUnitTagLen := 0;
+    self.irModHead := 0 - 1;
+    self.irPrivTab := 0;
+    self.irPrivCnt := 0;
+    self.impLstName := 0;
+    self.impLstNameLen := 0;
     var wbI: int64 := 0;
     while wbI < self.wantCap { poke8(self.wantBuf + wbI, 0); poke8(self.doneBuf + wbI, 0); wbI := wbI + 1; }
     self._tregCap := 1024;
@@ -933,6 +969,7 @@ pub type IRLower = class {
   fn nodeIVal(i: int64): int64 { return peek64(self.nodeOff(i) + NODE_OFF_IVAL); }
   fn nodeSVal(i: int64): pchar { return self.src + peek64(self.nodeOff(i) + NODE_OFF_SVAL); }
   fn nodeSLen(i: int64): int64 { return peek64(self.nodeOff(i) + NODE_OFF_SLEN); }
+  fn nodeIsPub(i: int64): int64 { return peek64(self.nodeOff(i) + NODE_OFF_ISPUB); }   // #2076
   fn nodeNext(i: int64): int64 { return peek64(self.nodeOff(i) + NODE_OFF_NEXT); }
 
   // WP-BC-44: compute 1-based source line number from AST node index
@@ -1313,6 +1350,16 @@ pub type IRLower = class {
         var idName: pchar := self.nodeSVal(expr);
         var idLen:  int64 := self.nodeSLen(expr);
         var idPtrL: int64 := (idName) as int64;
+        // #2074: eine innere Funktion als WERT (`var f := innen;`). Der
+        // Vorpass hat die Verdeckung durch Variablen schon beruecksichtigt —
+        // ein eingetragener Bezeichner IST die Funktion. Bis 1.2.12B fand
+        // _findFuncByName unter dem blanken Namen nichts (oder die
+        // gleichnamige Modulfunktion), und der Aufruf ueber f sprang ins Leere.
+        var idNm: int64 := self._nmIdx(expr);
+        if idNm >= 0 {
+          var idFn: int64 := self._findFuncByName(self._nmLbl(idNm) as pchar, self._nmLblLen(idNm));
+          if idFn >= 0 { self.irAddInstrDirect(IRO_FUNC_ADDR, dest, idFn, -1, 0); return dest; }
+        }
         // ARM64-OOP: `self` in einer Methode → impliziter Param-Slot 0 (Objekt-Pointer).
         if self.methodParamBase != 0 && idLen == 4 {
           if peek8(idPtrL) == 115 && peek8(idPtrL + 1) == 101 &&
@@ -1421,7 +1468,11 @@ pub type IRLower = class {
         }
         // WP-A1: kein Local/Param/Global → Funktions-NAME als Wert? → Funktions-Adresse laden
         // (fn-ptr-Zuweisung, z.B. `b.on_click := h`). Vorher: uninitialisierter Temp (Garbage).
-        var faFn: int64 := self._findFuncByName(idName, idLen);
+        // #2076: auch hier die private Funktion der eigenen Unit.
+        var faLc: int64 := alloc(8);
+        var faP: int64 := self._irRufName(expr, faLc);
+        var faFn: int64 := self._findFuncByName(faP as pchar, peek64(faLc));
+        free(faLc, 8);
         if faFn >= 0 { self.irAddInstrDirect(IRO_FUNC_ADDR, dest, faFn, -1, 0); return dest; }
       }
       return dest;
@@ -1910,6 +1961,10 @@ pub type IRLower = class {
   // #1388: Ist der Name im Modul als Funktion definiert? Dann hat die
   // Definition Vorrang vor jedem gleichnamigen Builtin.
   fn _istBenutzerFunktion(fname: pchar, fnlen: int64): int64 {
+    // #2076: Eine private Funktion der eigenen Unit steht als "unit_name" im
+    // funcBuffer — unter dem blanken Namen faende die Suche unten sie nicht,
+    // und der gleichnamige Builtin gewaenne.
+    if self._irPrivHat(fname as int64, fnlen) != 0 { return 1; }
     var ubBuf: int64 := peek64(self.ir + IR_MOD_OFF_FUNCBUF);
     var ubStr: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
     var ubCnt: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);
@@ -2567,38 +2622,39 @@ pub type IRLower = class {
     // not supported: caller defined before callee in source order hits this
     // path; callee defined LATER falls through to the IRO_CALL_BUILTIN
     // legacy fallback below.
-    // #2020: erst im eigenen Gueltigkeitsbereich suchen, dann weiter aussen.
-    // Steht die Ausfuehrung in "SigV4DateNow", so meint `w4` die dort innen
-    // stehende Funktion, die als "SigV4DateNow@w4" erzeugt wurde.
+    // #2074/#2076: Meint der Aufruf eine innere Funktion (Vorpass) oder eine
+    // private der eigenen Unit, steht sie unter einem anderen Namen im
+    // funcBuffer ("Aussen@innen", "unit_name"). Bis 1.2.12B suchte diese
+    // Stelle "<hier>@name" von innen nach aussen — ohne Bloecke, ohne
+    // Verdeckung, ohne Methodenruempfe — und kannte private Funktionen gar
+    // nicht.
     //
-    // Von innen nach aussen, eine Ebene je Durchgang: eine verschachtelte
-    // Funktion darf ihre Geschwister rufen (auf dem x86-Weg gemessen), und
-    // die stehen eine Ebene ueber ihr. Erst wenn kein Weg mehr uebrig ist,
-    // gilt der blanke Name auf Modulebene — die Suche unten bleibt also die
-    // letzte Station und ist unveraendert.
-    // Kostenwaechter: nestCnt zaehlt die verschachtelten Funktionen, die fuer
-    // dieses Modul eingesammelt und noch nicht abgeraeumt sind. Ist sie 0,
-    // gibt es hier keine, und die Suche unten waere reine Arbeit — ein
-    // zusaetzlicher Durchlauf durch den funcBuffer JE AUFRUFSTELLE. In der
-    // stdlib haben 3 von 452 Units ueberhaupt eine verschachtelte Funktion;
-    // ohne diesen Riegel zahlten die anderen 449 fuer nichts, und die Bauzeit
-    // auf dem IR-Weg ist ohnehin schon ein offener Posten (#2023).
-    var nlPfxLen: int64 := 0;
-    if self.nestCnt > 0 { nlPfxLen := self.nestPfxLen; }
+    // Ist der Name umgelenkt, gilt NUR er: faende er sich nicht, waere der
+    // blanke Name genau die falsche Funktion, die hier vermieden werden soll.
     var nlTreffer: int64 := -1;
-    while nlPfxLen > 0 && nlTreffer < 0 {
-      var nlKand: int64 := self._nestMangle(self.nestPfx, nlPfxLen, fname, fnlen);
-      nlTreffer := self._findFuncIdxStill(nlKand as pchar, nlPfxLen + 1 + fnlen);
-      free(nlKand, nlPfxLen + 1 + fnlen + 1);
-      if nlTreffer < 0 {
-        // eine Ebene nach aussen: bis zum letzten '@' zuruecknehmen
-        var nlNeu: int64 := 0;
-        var nlS: int64 := 0;
-        while nlS < nlPfxLen {
-          if peek8(self.nestPfx + nlS) == 64 { nlNeu := nlS; }
-          nlS := nlS + 1;
+    // Ist der Name eine lokale Variable oder ein Parameter (Funktionszeiger),
+    // meint der Aufruf DIESE — sema loest so auf, die lokale verdeckt die
+    // gleichnamige Funktion. Bis 1.2.12B kam die Suche im funcBuffer zuerst,
+    // und `var zehn: fn(int64): int64 := fuenf; zehn(1)` rief die
+    // Modulfunktion zehn statt fuenf. Dann bleibt der funcBuffer unten aussen
+    // vor, und der Aufruf geht an den Zeigerweg weiter unten (#1, "lokaler
+    // plain fn-ptr").
+    var nlLokal: int64 := 0;
+    if self.nodeIVal(expr) == 0 {
+      var rnLc: int64 := alloc(8);
+      var rnP: int64 := self._irRufName(expr, rnLc);
+      var rnL: int64 := peek64(rnLc);
+      free(rnLc, 8);
+      if rnP != (fname as int64) {
+        nlTreffer := self._findFuncIdxStill(rnP as pchar, rnL);
+        if nlTreffer < 0 {
+          EPrintStr("lyxc: #2074: Aufruf ohne Eintrag im funcBuffer: "c);
+          sys_write(2, rnP, rnL);
+          EPrintStrLn(""c);
+          exit(1);
         }
-        nlPfxLen := nlNeu;
+      } else if self._findLocalSlot(fname, fnlen) >= 0 {
+        nlLokal := 1;
       }
     }
     // Gefunden wird hier nur der INDEX. Den Aufruf selbst schreibt die
@@ -2610,7 +2666,7 @@ pub type IRLower = class {
     var fbUserCnt: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);
     var fbUserIdx: int64 := nlTreffer;
     var fbI: int64 := 0;
-    if fbUserIdx >= 0 { fbI := fbUserCnt; }
+    if fbUserIdx >= 0 || nlLokal != 0 { fbI := fbUserCnt; }
     while fbI < fbUserCnt {
       var fbNOff: int64 := peek64(fbUserBuf + fbI * 80);
       var fbNLen: int64 := peek64(fbUserBuf + fbI * IR_FUNC_SIZE + IR_FUNC_OFF_NAMELEN);
@@ -2650,23 +2706,9 @@ pub type IRLower = class {
         fbArg := self.nodeNext(fbArg);
       }
       // WP-MEM-05: fill trailing default params not covered by explicit args
-      var fbDefNi: int64 := -1;
-      var fbDefScan: int64 := 0;
-      while fbDefScan < self.nodeCount {
-        if self.nodeKind(fbDefScan) == NK_FUNC_DECL {
-          if self.nodeSLen(fbDefScan) == fnlen {
-            var fbDM: int64 := 1; var fbDJ: int64 := 0;
-            while fbDJ < fnlen {
-              if fbDM != 0 {
-                if peek8((self.nodeSVal(fbDefScan) as int64) + fbDJ) != peek8((fname as int64) + fbDJ) { fbDM := 0; }
-              }
-              fbDJ += 1;
-            }
-            if fbDM != 0 { fbDefNi := fbDefScan; fbDefScan := self.nodeCount; }
-          }
-        }
-        fbDefScan += 1;
-      }
+      // #2074: die Deklaration, die der Aufruf meint (_callDeclNi) — nicht die
+      // erste gleichnamige irgendwo im Modul.
+      var fbDefNi: int64 := self._callDeclNi(expr);
       if fbDefNi >= 0 {
         var fbDP: int64 := self.nodeC0(fbDefNi);
         var fbDSkip: int64 := 0;
@@ -7701,20 +7743,6 @@ pub type IRLower = class {
     self._volSlotN := 0;   // WP-VOLATILE: volatile-Slot-Liste pro Funktion zurücksetzen
     self.curFunc := funcNode;
 
-    // #2020: Der eigene eindeutige Name ist zugleich der Gueltigkeitsbereich,
-    // in dem ein Aufruf zuerst gesucht wird. Er kommt aus derselben Quelle,
-    // aus der _addFunc den Namen nimmt — sonst suchte die Aufloesung unter
-    // einem anderen Namen, als die Funktion traegt.
-    var nfSavePfx: int64 := self.nestPfx;
-    var nfSaveLen: int64 := self.nestPfxLen;
-    if self.overrideFuncName != 0 {
-      self.nestPfx    := self.overrideFuncName as int64;
-      self.nestPfxLen := self.overrideFuncNameLen;
-    } else {
-      self.nestPfx    := self.nodeSVal(funcNode) as int64;
-      self.nestPfxLen := self.nodeSLen(funcNode);
-    }
-
     // WP-AND-upstream-fix v8: allocate params FIRST (slots 0..paramCount-1)
     // so they line up with the AAPCS64 spill the prologue performs and with
     // NK_IDENT's pidx-based loads. retValTemp moves AFTER params so it
@@ -7755,8 +7783,6 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
     }
     self._addFunc();
-    self.nestPfx    := nfSavePfx;
-    self.nestPfxLen := nfSaveLen;
   }
    
   // ------------------------------------------------------------------
@@ -7764,6 +7790,13 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   
   fn lowerModule(decls: int64) {
+    // #2076: Kopf der Deklarationskette dieser Unit — _irPrivHat und
+    // _callDeclNi fragen ihn. Die Unit-Kennung (irUnitTag) setzt der Aufrufer.
+    var lmSavedHead: int64 := self.irModHead;
+    var lmSavedPT: int64 := self.irPrivTab;
+    var lmSavedPC: int64 := self.irPrivCnt;
+    self.irModHead := decls;
+    self._irPrivBaue(decls);
     // WP-AND-upstream-fix v4: pre-pass — register every top-level NK_VAR_DECL
     // as a global. NK_IDENT lookups in expressions later in this lowerModule
     // (and in nested lowerModule calls for imports) can then resolve them.
@@ -7974,8 +8007,11 @@ pub type IRLower = class {
         var pfIsExtern: int64 := 0;
         if self._istExternDecl(pfCur) != 0 { pfIsExtern := 1; }
         if pfIsExtern == 0 {
-          var pfNamePtr: pchar := self.nodeSVal(pfCur);
-          var pfNameLen: int64 := self.nodeSLen(pfCur);
+          // #2076: unter dem Namen, unter dem sie auch erzeugt und gerufen wird.
+          var pfLc: int64 := alloc(8);
+          var pfNamePtr: pchar := self._irFnName(pfCur, pfLc) as pchar;
+          var pfNameLen: int64 := peek64(pfLc);
+          free(pfLc, 8);
           // #2063: Im Nachlauf nicht noch einmal registrieren. irAddFunc
           // haengt ohne Dublettenpruefung an; jeder weitere Durchgang durch
           // dasselbe Modul legte fuer JEDE Funktion einen zweiten, dritten,
@@ -7984,7 +8020,7 @@ pub type IRLower = class {
           // Eintrag ohne Rumpf eine leere Huelle. Ein Import mit hundert
           // Funktionen und vier Runden hinterliess so vierhundert Huellen im
           // Erzeugnis. Dasselbe gilt fuer die beiden Stellen darunter
-          // (Methoden) und fuer _nestSammle — die vier muessen
+          // (Methoden) und fuer _nmWalkOne — die vier muessen
           // uebereinstimmen.
           if self._imNachlauf == 0 {
             var pfNameOff: int64 := self.irAddString(pfNamePtr, pfNameLen);
@@ -7995,7 +8031,8 @@ pub type IRLower = class {
           // darin, wurde also nie registriert — und der Aufruf endete in
           // "unbekannter Builtin/Funktion". Der Rumpf wird hier nur
           // eingesammelt; erzeugt wird er unten, nach der aeusseren Funktion.
-          self._nestSammle(self.nodeC2(pfCur), pfNamePtr as int64, pfNameLen, 0);
+          // #2074: mit der Gueltigkeit von sema (Bloecke, Verdeckung).
+          self._nmPlanFunc(pfCur, pfNamePtr as int64, pfNameLen, 0);
         }
       } else if pfKind == NK_TYPE_DECL {
         // ARM64-OOP: Methoden (c1-Chain) unter mangled Namen "Class_method" registrieren.
@@ -8009,6 +8046,10 @@ pub type IRLower = class {
               var pmOff:  int64 := self.irAddString(pmMang as pchar, pmLen);
               self.irAddFunc(pmOff, pmLen, 0, 0);
             }
+            // #2074: innere Funktionen einer METHODE. Bis 1.2.12B wurde ihr
+            // Rumpf nie abgesucht — die innere Funktion entstand nicht, und
+            // der Aufruf traf die gleichnamige Modulfunktion.
+            self._nmPlanFunc(pmM, pmMang, pmLen, 0);
           }
           pmM := self.nodeNext(pmM);
         }
@@ -8050,6 +8091,8 @@ pub type IRLower = class {
       var wlNodes: int64 := alloc(WLCAP * 8);
       var wlCnt:   int64 := alloc(WLCAP * 8);
       var wlHead:  int64 := alloc(WLCAP * 8);
+      var wlName:  int64 := alloc(WLCAP * 8);   // #2076: Importname je Eintrag
+      var wlNameL: int64 := alloc(WLCAP * 8);
       var wlW: int64 := 0; var wlR: int64 := 0;
       // Visited-Pfade (Dedup): Bytes + (off,len)-Paare.
       var visBuf:  int64 := alloc(256 * 1024);
@@ -8058,6 +8101,7 @@ pub type IRLower = class {
       // Seed = aktuelles (top) Modul.
       poke64(wlSrc, self.src as int64); poke64(wlNodes, self.nodes);
       poke64(wlCnt, self.nodeCount);    poke64(wlHead, decls);
+      poke64(wlName, 0); poke64(wlNameL, 0);    // das Hauptmodul hat keine Unit-Kennung
       wlW := 1;
       while wlR < wlW {
         var mSrc:   int64 := peek64(wlSrc + wlR * 8);
@@ -8146,14 +8190,24 @@ pub type IRLower = class {
                   // Top-Level-Funktionen dieses Imports registrieren (src=ip.src).
                   var rsv: pchar := self.src; var rnd: int64 := self.nodes; var rcn: int64 := self.nodeCount;
                   self.src := ip.src; self.nodes := ip.nodes; self.nodeCount := ip.nodeCount;
+                  // #2076: als diese Unit — private Funktionen unter "unit_name".
+                  var rut: int64 := self.irUnitTag; var rutL: int64 := self.irUnitTagLen;
+                  var rmh: int64 := self.irModHead;
+                  var rpt: int64 := self.irPrivTab; var rpc: int64 := self.irPrivCnt;
+                  self.irUnitTag := nmP as int64; self.irUnitTagLen := nmL; self.irModHead := ih;
+                  self._irPrivBaue(ih);
                   var fd2: int64 := ih;
                   while fd2 >= 0 {
                     if self.nodeKind(fd2) == NK_FUNC_DECL {
                       var ext2: int64 := 0;
                       if self._istExternDecl(fd2) != 0 { ext2 := 1; }
                       if ext2 == 0 {
-                        var noff: int64 := self.irAddString(self.nodeSVal(fd2), self.nodeSLen(fd2));
-                        self.irAddFunc(noff, self.nodeSLen(fd2), 0, 0);
+                        var nlc2: int64 := alloc(8);
+                        var nnp2: int64 := self._irFnName(fd2, nlc2);
+                        var nnl2: int64 := peek64(nlc2);
+                        free(nlc2, 8);
+                        var noff: int64 := self.irAddString(nnp2 as pchar, nnl2);
+                        self.irAddFunc(noff, nnl2, 0, 0);
                       }
                     } else if self.nodeKind(fd2) == NK_TYPE_DECL {
                       // WP-VMT-lyxos: Methoden importierter Klassen mangled registrieren
@@ -8175,11 +8229,14 @@ pub type IRLower = class {
                     }
                     fd2 := self.nodeNext(fd2);
                   }
+                  self.irUnitTag := rut; self.irUnitTagLen := rutL; self.irModHead := rmh;
+                  self.irPrivTab := rpt; self.irPrivCnt := rpc;
                   self.src := rsv; self.nodes := rnd; self.nodeCount := rcn;
                   // Transitiv enqueuen.
                   if wlW < WLCAP {
                     poke64(wlSrc + wlW * 8, ip.src as int64); poke64(wlNodes + wlW * 8, ip.nodes);
                     poke64(wlCnt + wlW * 8, ip.nodeCount);    poke64(wlHead + wlW * 8, ih);
+                    poke64(wlName + wlW * 8, nmP as int64);   poke64(wlNameL + wlW * 8, nmL);
                     wlW += 1;
                   }
                 }
@@ -8194,6 +8251,7 @@ pub type IRLower = class {
       // 1..N-1 sind die transitiv importierten.
       self.impLstSrc := wlSrc; self.impLstNodes := wlNodes;
       self.impLstCnt := wlCnt; self.impLstHead := wlHead;
+      self.impLstName := wlName; self.impLstNameLen := wlNameL;   // #2076
       self.impLstN   := wlW;
     }
 
@@ -8212,8 +8270,14 @@ pub type IRLower = class {
         // uebersehener Aufruf scheitert deshalb LAUT mit "undefined function"
         // und nicht still mit einem falschen Ergebnis.
         var fdIdx: int64 := 0 - 1;
+        // #2076: der Name, unter dem sie registriert ist ("unit_name" bei
+        // einer privaten Funktion eines Imports).
+        var fdLc: int64 := alloc(8);
+        var fdNP: int64 := self._irFnName(cur, fdLc);
+        var fdNL: int64 := peek64(fdLc);
+        free(fdLc, 8);
         if bodyIsExtern == 0 {
-          fdIdx := self._findFuncIdxStill(self.nodeSVal(cur), self.nodeSLen(cur));   // #1783: fragt nur, markiert nicht
+          fdIdx := self._findFuncIdxStill(fdNP as pchar, fdNL);   // #1783: fragt nur, markiert nicht
         }
         var fdLowern: int64 := 0;
         if bodyIsExtern == 0 {
@@ -8242,7 +8306,15 @@ pub type IRLower = class {
             }
             poke8(self.doneBuf + fdIdx, 1);
           }
+          // #2076: unter demselben Namen erzeugen (_addFunc liest
+          // overrideFuncName). Bei einer oeffentlichen ist fdNP der Knotenname.
+          if fdNP != (self.nodeSVal(cur) as int64) {
+            self.overrideFuncName    := fdNP as pchar;
+            self.overrideFuncNameLen := fdNL;
+          }
           self.lowerFunc(cur);
+          self.overrideFuncName    := 0 as pchar;
+          self.overrideFuncNameLen := 0;
           self._nochGelowert := 1;
         }
       } else if (kind == NK_TYPE_DECL) {
@@ -8381,7 +8453,14 @@ pub type IRLower = class {
             // #1727: ab hier gilt der Erreichbarkeitsfilter.
             var impSavedModus: int64 := self.nurErreichbar;
             self.nurErreichbar := 1;
+            // #2076: die Unit-Kennung ist der Importname, wie auf x86.
+            var impSavedTag: int64 := self.irUnitTag;
+            var impSavedTagL: int64 := self.irUnitTagLen;
+            self.irUnitTag := impModName as int64;
+            self.irUnitTagLen := impModLen;
             self.lowerModule(impHead);
+            self.irUnitTag := impSavedTag;
+            self.irUnitTagLen := impSavedTagL;
             self.nurErreichbar := impSavedModus;
             self.src       := impSavedSrc;
             self.nodes     := impSavedNodes;
@@ -8484,6 +8563,8 @@ pub type IRLower = class {
           self.nodes     := peek64(self.impLstNodes + nlI * 8);
           self.nodeCount := peek64(self.impLstCnt + nlI * 8);
           var nlHead: int64 := peek64(self.impLstHead + nlI * 8);
+          self.irUnitTag    := peek64(self.impLstName + nlI * 8);       // #2076
+          self.irUnitTagLen := peek64(self.impLstNameLen + nlI * 8);
           self.lowerModule(nlHead);
           nlI := nlI + 1;
         }
@@ -8492,6 +8573,7 @@ pub type IRLower = class {
       }
       self.nurErreichbar := nlSavedModus;
       self._imNachlauf := 0;
+      self.irUnitTag := 0; self.irUnitTagLen := 0;   // #2076: zurueck im Hauptmodul
       self.src       := nlSavedSrc;
       self.nodes     := nlSavedNodes;
       self.nodeCount := nlSavedCnt;
@@ -8522,6 +8604,9 @@ pub type IRLower = class {
       }
       pi += 1;
     }
+    self.irModHead := lmSavedHead;   // #2076
+    self.irPrivTab := lmSavedPT;
+    self.irPrivCnt := lmSavedPC;
   }
 
   // ------------------------------------------------------------------
@@ -9818,17 +9903,6 @@ pub type IRLower = class {
   }
 
   // Rueckgabetyp-Node einer freien Funktion im aktuellen Modul.
-  fn _funcRetTypeNode(fp: pchar, fl: int64): int64 {
-    var i: int64 := 0;
-    while i < self.nodeCount {
-      if self.nodeKind(i) == NK_FUNC_DECL {
-        if self.seq(self.nodeSVal(i), self.nodeSLen(i), fp, fl) { return self.nodeC1(i); }
-      }
-      i += 1;
-    }
-    return 0 - 1;
-  }
-
   // ====================================================================
   // #1798: Anfangswerte von Modul-Konstanten falten
   //
@@ -10116,29 +10190,9 @@ pub type IRLower = class {
   }
 
   // ====================================================================
-  // #2020: verschachtelte Funktionen
-  //
-  // Warum ueberhaupt umbenannt wird: zwei aeussere Funktionen duerfen je eine
-  // `nib` enthalten, und eine verschachtelte darf eine gleichnamige auf
-  // Modulebene verdecken. Wuerde die innere unter ihrem blanken Namen in den
-  // funcBuffer wandern, entschiede die Reihenfolge, welche gilt — dieselbe
-  // stille Verwechslung wie bei den gleichnamigen Konstanten aus #2035.
-  // Deshalb traegt jede den Weg dorthin im Namen: "SigV4DateNow@w4".
-  //
-  // Das "@" kann in keinem Bezeichner vorkommen (der Lexer laesst es nicht
-  // zu), die erzeugten Namen koennen also mit keinem geschriebenen kollidieren.
-  fn _nestMangle(pfx: int64, pfxLen: int64, np: pchar, nl: int64): int64 {
-    var g: int64 := pfxLen + 1 + nl;
-    var b: int64 := alloc(g + 1);
-    var i: int64 := 0;
-    while i < pfxLen { poke8(b + i, peek8(pfx + i)); i := i + 1; }
-    poke8(b + pfxLen, 64);                     // '@'
-    var j: int64 := 0;
-    while j < nl { poke8(b + pfxLen + 1 + j, peek8((np as int64) + j)); j := j + 1; }
-    poke8(b + g, 0);
-    return b;
-  }
-
+  // #2020: verschachtelte Funktionen — zur Erzeugung nach der aeusseren
+  // vormerken: {Knoten, eindeutiger Name, Laenge}. Den Namen vergibt seit
+  // #2074 der Vorpass (_nmPlanFunc).
   fn _nestRecord(ni: int64, namePtr: int64, nameLen: int64) {
     if self.nestCnt >= self.nestCap {
       var nc: int64 := self.nestCap * 2;
@@ -10154,51 +10208,391 @@ pub type IRLower = class {
     self.nestCnt := self.nestCnt + 1;
   }
 
-  // Den Teilbaum einer Funktion nach verschachtelten Deklarationen absuchen.
+  // ------------------------------------------------------------------
+  // #2074: Vorpass ueber die Ruempfe eines Moduls — eindeutige Namen der
+  // inneren Funktionen und die Zuordnung jedes Aufrufs bzw. Bezeichners, der
+  // eine meint. Dieselbe Gueltigkeit wie sema (_checkStmt, SNK_BLOCK) und wie
+  // cg_nestPlan in codegen_x86.lyx: eine innere Funktion gilt in ihrem BLOCK,
+  // dort auch vor ihrer Zeile, und verdeckt Gleichnamiges von aussen;
+  // Parameter, `var` und Laufvariablen verdecken wiederum sie.
   //
-  // Gelaufen wird ueber ALLE Kindkanten, nicht nur ueber Bloecke: eine `fn`
-  // darf auch im Rumpf eines `if` oder einer Schleife stehen, und der x86-Weg
-  // nimmt sie dort ebenfalls an (cg_genBlock wird rekursiv betreten). Wer hier
-  // nur die oberste Anweisungskette abliefe, haette genau die halbe Loesung.
-  //
-  // Die Tiefenschranke ist kein Schmuck: eine unbegrenzte Rekursion ueber
-  // einen Knotengraphen hat in #1370 eine fremde Konsole mitgerissen.
-  fn _nestSammle(n: int64, pfx: int64, pfxLen: int64, tiefe: int64) {
-    if n < 0 { return; }
-    // 4096, nicht 64: gezaehlt wird die Tiefe des SYNTAXBAUMS, und ein
-    // langer Ausdruck (a+b+c+...) ist linksseitig genauso tief wie er Glieder
-    // hat. Eine knappe Schranke wuerde hier gueltigen Code abweisen. Sie ist
-    // nur der Deckel gegen einen Zyklus — der Baum hat keinen, aber eine
-    // unbegrenzte Rekursion hat in #1370 eine fremde Konsole mitgerissen.
+  // Bis 1.2.12B sammelte _nestSammle je AEUSSERER Funktion und der Aufruf
+  // suchte "<hier>@name" von innen nach aussen. Damit galt eine Deklaration
+  // im `if` auch nach dem Block, zwei gleichnamige in `if` und `else` fielen
+  // zusammen, eine Variable verdeckte nichts, und Methodenruempfe wurden gar
+  // nicht abgesucht (der Aufruf traf die gleichnamige Modulfunktion).
+  // ------------------------------------------------------------------
+
+  // Index in nmMap fuer Knoten `ni` der gerade eingesetzten Tabelle, sonst -1.
+  fn _nmIdx(ni: int64): int64 {
+    if self.nmCnt == 0 || ni < 0 { return 0 - 1; }
+    var i: int64 := 0;
+    while i < self.nmCnt {
+      var b: int64 := self.nmMap + i * 40;
+      if peek64(b) == self.nodes && peek64(b + 8) == ni { return i; }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+  fn _nmLbl(i: int64): int64    { return peek64(self.nmMap + i * 40 + 16); }
+  fn _nmLblLen(i: int64): int64 { return peek64(self.nmMap + i * 40 + 24); }
+  fn _nmDecl(i: int64): int64   { return peek64(self.nmMap + i * 40 + 32); }
+
+  fn _nmAdd(ni: int64, lbl: int64, llen: int64, declNi: int64) {
+    if self._nmIdx(ni) >= 0 { return; }   // Vorpass laeuft je Nachlaufrunde erneut
+    if self.nmCnt >= self.nmCap {
+      var nc: int64 := self.nmCap * 2;
+      var nb: int64 := alloc(nc * 40);
+      memcpy(nb, self.nmMap, self.nmCnt * 40);
+      self.nmMap := nb; self.nmCap := nc;
+    }
+    var b: int64 := self.nmMap + self.nmCnt * 40;
+    poke64(b, self.nodes); poke64(b + 8, ni);
+    poke64(b + 16, lbl); poke64(b + 24, llen); poke64(b + 32, declNi);
+    self.nmCnt := self.nmCnt + 1;
+  }
+
+  // lbl == 0: der Name ist hier durch eine Variable oder einen Parameter verdeckt.
+  fn _nmPush(np: int64, nl: int64, lbl: int64, llen: int64, declNi: int64) {
+    if self.nmScopeCnt >= self.nmScopeCap {
+      var nc: int64 := self.nmScopeCap * 2;
+      var nb: int64 := alloc(nc * 40);
+      memcpy(nb, self.nmScope, self.nmScopeCnt * 40);
+      self.nmScope := nb; self.nmScopeCap := nc;
+    }
+    var b: int64 := self.nmScope + self.nmScopeCnt * 40;
+    poke64(b, np); poke64(b + 8, nl);
+    poke64(b + 16, lbl); poke64(b + 24, llen); poke64(b + 32, declNi);
+    self.nmScopeCnt := self.nmScopeCnt + 1;
+  }
+
+  // Innerster sichtbarer Eintrag; -1, wenn keiner da ist oder der innerste
+  // eine Variable ist — dann gilt der bisherige Weg ueber den Namen.
+  fn _nmFind(np: int64, nl: int64): int64 {
+    var i: int64 := self.nmScopeCnt - 1;
+    while i >= 0 {
+      var b: int64 := self.nmScope + i * 40;
+      if self.seq(peek64(b) as pchar, peek64(b + 8), np as pchar, nl) {
+        if peek64(b + 16) == 0 { return 0 - 1; }
+        return i;
+      }
+      i := i - 1;
+    }
+    return 0 - 1;
+  }
+
+  // Nur innerhalb DERSELBEN Knotentabelle: der IR-Weg parst eine Unit mehrfach
+  // (transitiver Vorpass, Import, Nachlauf ueber die behaltene Liste). Jede
+  // Parse muss dieselben Namen vergeben, sonst bekaeme die zweite "@2" fuer
+  // dieselbe Deklaration — und der Aufruf faende keinen Eintrag (so in
+  // std/cloud/aws/sigv4.lyx: "SigV4DateNow@w4@2"). Ueber Units hinweg sind
+  // die Namen ohnehin verschieden: der Praefix ist der eindeutige Name der
+  // aeusseren Funktion.
+  fn _nmLabelUsed(lbl: int64, llen: int64): int64 {
+    var i: int64 := 0;
+    while i < self.nmCnt {
+      var b: int64 := self.nmMap + i * 40;
+      if peek64(b) == self.nodes && peek64(b + 8) == peek64(b + 32) {   // Deklaration, diese Tabelle
+        if self.seq(peek64(b + 16) as pchar, peek64(b + 24), lbl as pchar, llen) { return 1; }
+      }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // "base@name"; derselbe Name in zwei Bloecken derselben Funktion bekommt
+  // "base@name@2" usw. — dieselbe Form wie cg_nestMakeLabel auf x86. `@` kommt
+  // in keinem Bezeichner vor, eine Ziffer beginnt keinen.
+  fn _nmMake(base: int64, blen: int64, np: int64, nl: int64, lenCell: int64): int64 {
+    var k: int64 := 1;
+    while k < 1000000 {
+      var dig: int64 := alloc(24);
+      var dl: int64 := 0;
+      if k > 1 {
+        var t: int64 := k;
+        while t > 0 { poke8(dig + dl, 48 + (t - (t / 10) * 10)); dl := dl + 1; t := t / 10; }
+      }
+      var extra: int64 := 0;
+      if dl > 0 { extra := 1 + dl; }
+      var len: int64 := blen + 1 + nl + extra;
+      var buf: int64 := alloc(len + 1);
+      var i: int64 := 0;
+      while i < blen { poke8(buf + i, peek8(base + i)); i := i + 1; }
+      poke8(buf + blen, 64);   // '@'
+      i := 0;
+      while i < nl { poke8(buf + blen + 1 + i, peek8(np + i)); i := i + 1; }
+      if dl > 0 {
+        poke8(buf + blen + 1 + nl, 64);
+        i := 0;
+        while i < dl { poke8(buf + blen + 2 + nl + i, peek8(dig + dl - 1 - i)); i := i + 1; }
+      }
+      poke8(buf + len, 0);
+      free(dig, 24);
+      if self._nmLabelUsed(buf, len) == 0 { poke64(lenCell, len); return buf; }
+      free(buf, len + 1);
+      k := k + 1;
+    }
+    EPrintStrLn("lyxc: #2074: keine freie Marke fuer eine innere Funktion"c);
+    exit(1);
+    return 0;
+  }
+
+  // Ein Rumpf ist ein Block — nicht "c2 >= 0": bei `extern fn` mit
+  // @capabilities haengt dort das Attribut (siehe _istExternDecl).
+  fn _nmHatRumpf(fni: int64): int64 {
+    var b: int64 := self.nodeC2(fni);
+    if b < 0 { return 0; }
+    if self.nodeKind(b) != NK_BLOCK { return 0; }
+    return 1;
+  }
+
+  // Der Rumpf einer Funktion mit dem eindeutigen Namen (base, blen). Die
+  // Parameter verdecken Gleichnamiges von aussen.
+  fn _nmPlanFunc(fni: int64, base: int64, blen: int64, tiefe: int64) {
     if tiefe > 4096 {
-      EPrintStrLn("lyxc: #2020: Syntaxbaum tiefer als 4096 Ebenen — abgebrochen."c);
+      EPrintStrLn("lyxc: #2074: Funktionen tiefer als 4096 Ebenen verschachtelt — abgebrochen."c);
       exit(1);
     }
-    var cur: int64 := n;
-    while cur >= 0 {
-      var k: int64 := self.nodeKind(cur);
-      if k == NK_FUNC_DECL && self.nodeC2(cur) >= 0 && self._istExternDecl(cur) == 0 {
-        // Eine `extern fn ... link` bleibt FFI und darf hier nicht als
-        // Nutzerfunktion registriert werden. "c2 == -1" allein genuegt dafuer
-        // nicht: eine annotierte Deklaration traegt dort ihr `@cap` — siehe
-        // _istExternDecl.
-        var mp: int64 := self._nestMangle(pfx, pfxLen, self.nodeSVal(cur), self.nodeSLen(cur));
-        var ml: int64 := pfxLen + 1 + self.nodeSLen(cur);
-        if self._imNachlauf == 0 {                     // #2063: nur einmal registrieren
-          var mo: int64 := self.irAddString(mp as pchar, ml);
-          self.irAddFunc(mo, ml, 0, 0);
-        }
-        self._nestRecord(cur, mp, ml);
-        // Weiter nach innen — mit dem neuen Weg als Praefix.
-        self._nestSammle(self.nodeC2(cur), mp, ml, tiefe + 1);
-      } else {
-        self._nestSammle(self.nodeC0(cur), pfx, pfxLen, tiefe + 1);
-        self._nestSammle(self.nodeC1(cur), pfx, pfxLen, tiefe + 1);
-        self._nestSammle(self.nodeC2(cur), pfx, pfxLen, tiefe + 1);
-        self._nestSammle(self.nodeC3(cur), pfx, pfxLen, tiefe + 1);
+    var saved: int64 := self.nmScopeCnt;
+    var p: int64 := self.nodeC0(fni);
+    while p >= 0 {
+      if self.nodeKind(p) == NK_PARAM {
+        self._nmPush(self.nodeSVal(p) as int64, self.nodeSLen(p), 0, 0, 0 - 1);
       }
+      p := self.nodeNext(p);
+    }
+    if self._nmHatRumpf(fni) != 0 { self._nmWalkOne(self.nodeC2(fni), base, blen, tiefe + 1); }
+    self.nmScopeCnt := saved;
+  }
+
+  fn _nmWalkList(head: int64, base: int64, blen: int64, tiefe: int64) {
+    var cur: int64 := head;
+    while cur >= 0 {
+      self._nmWalkOne(cur, base, blen, tiefe);
       cur := self.nodeNext(cur);
     }
+  }
+
+  fn _nmWalkKids(ni: int64, base: int64, blen: int64, tiefe: int64) {
+    self._nmWalkList(self.nodeC0(ni), base, blen, tiefe + 1);
+    self._nmWalkList(self.nodeC1(ni), base, blen, tiefe + 1);
+    self._nmWalkList(self.nodeC2(ni), base, blen, tiefe + 1);
+  }
+
+  fn _nmBind(ni: int64) {
+    var si: int64 := self._nmFind(self.nodeSVal(ni) as int64, self.nodeSLen(ni));
+    if si < 0 { return; }
+    var b: int64 := self.nmScope + si * 40;
+    self._nmAdd(ni, peek64(b + 16), peek64(b + 24), peek64(b + 32));
+  }
+
+  fn _nmWalkOne(ni: int64, base: int64, blen: int64, tiefe: int64) {
+    // 4096, nicht 64: gezaehlt wird die Tiefe des Syntaxbaums, ein langer
+    // Ausdruck ist linksseitig so tief, wie er Glieder hat (#2020).
+    if tiefe > 4096 {
+      EPrintStrLn("lyxc: #2074: Syntaxbaum tiefer als 4096 Ebenen — abgebrochen."c);
+      exit(1);
+    }
+    var k: int64 := self.nodeKind(ni);
+    // Nicht jede Kindkante ist ein Knoten: bei @bounds_check(true) u. a.
+    // steht in c0 der WERT (Parser: "no iv2 slot in node layout"); als Index
+    // gelesen fuehrte true = 1 auf Knoten 1. Dieselbe Ausnahme wie in
+    // cg_nestWalkOne — alle uebrigen Kanten in Ruempfen sind Knoten oder -1.
+    if k == NK_AT_DIRECTIVE { return; }
+    if k == NK_BLOCK {
+      var saved: int64 := self.nmScopeCnt;
+      // Erst alle fn-Deklarationen des Blocks eintragen, dann ablaufen.
+      var s: int64 := self.nodeC0(ni);
+      while s >= 0 {
+        if self.nodeKind(s) == NK_FUNC_DECL && self._istExternDecl(s) == 0 {
+          var vi: int64 := self._nmIdx(s);
+          if vi < 0 {
+            var lc: int64 := alloc(8);
+            var lb: int64 := self._nmMake(base, blen, self.nodeSVal(s) as int64, self.nodeSLen(s), lc);
+            var ll: int64 := peek64(lc);
+            free(lc, 8);
+            self._nmAdd(s, lb, ll, s);
+            vi := self._nmIdx(s);
+          }
+          self._nmPush(self.nodeSVal(s) as int64, self.nodeSLen(s), self._nmLbl(vi), self._nmLblLen(vi), s);
+        }
+        s := self.nodeNext(s);
+      }
+      s := self.nodeC0(ni);
+      while s >= 0 {
+        var sk: int64 := self.nodeKind(s);
+        if sk == NK_FUNC_DECL {
+          if self._istExternDecl(s) == 0 {
+            var fi: int64 := self._nmIdx(s);
+            // Registrieren und zur Erzeugung vormerken HIER, in Kettenfolge und
+            // vor den eigenen inneren — dieselbe Reihenfolge im funcBuffer wie
+            // bisher _nestSammle. Fuer die Gueltigkeit (oben) ist es egal.
+            if self._imNachlauf == 0 {                   // #2063: nur einmal registrieren
+              var mo: int64 := self.irAddString(self._nmLbl(fi) as pchar, self._nmLblLen(fi));
+              self.irAddFunc(mo, self._nmLblLen(fi), 0, 0);
+            }
+            self._nestRecord(s, self._nmLbl(fi), self._nmLblLen(fi));
+            self._nmPlanFunc(s, self._nmLbl(fi), self._nmLblLen(fi), tiefe + 1);
+          }
+        } else if sk == NK_VAR_DECL {
+          // Der Initialisierer sieht noch den alten Bereich; danach verdeckt
+          // die Variable (sema traegt sie erst an ihrer Zeile ein).
+          self._nmWalkKids(s, base, blen, tiefe);
+          self._nmPush(self.nodeSVal(s) as int64, self.nodeSLen(s), 0, 0, 0 - 1);
+        } else {
+          self._nmWalkOne(s, base, blen, tiefe + 1);
+        }
+        s := self.nodeNext(s);
+      }
+      self.nmScopeCnt := saved;
+      return;
+    }
+    if k == NK_FUNC_DECL {
+      EPrintStrLn("lyxc: #2074: fn-Deklaration ausserhalb eines Blocks"c);
+      exit(1);
+    }
+    if k == NK_FOR || k == NK_FOR_RANGE {
+      // Die Laufvariable verdeckt im Rumpf (c2).
+      var saved2: int64 := self.nmScopeCnt;
+      self._nmWalkList(self.nodeC0(ni), base, blen, tiefe + 1);
+      self._nmWalkList(self.nodeC1(ni), base, blen, tiefe + 1);
+      self._nmPush(self.nodeSVal(ni) as int64, self.nodeSLen(ni), 0, 0, 0 - 1);
+      self._nmWalkList(self.nodeC2(ni), base, blen, tiefe + 1);
+      self.nmScopeCnt := saved2;
+      return;
+    }
+    if k == NK_FOR_C {
+      // c0 = Initialisierung (gilt fuer die ganze Schleife), c3 = Rumpf.
+      var saved3: int64 := self.nmScopeCnt;
+      var ini: int64 := self.nodeC0(ni);
+      if ini >= 0 {
+        if self.nodeKind(ini) == NK_VAR_DECL {
+          self._nmWalkKids(ini, base, blen, tiefe);
+          self._nmPush(self.nodeSVal(ini) as int64, self.nodeSLen(ini), 0, 0, 0 - 1);
+        } else {
+          self._nmWalkOne(ini, base, blen, tiefe + 1);
+        }
+      }
+      self._nmWalkList(self.nodeC1(ni), base, blen, tiefe + 1);
+      self._nmWalkList(self.nodeC2(ni), base, blen, tiefe + 1);
+      self._nmWalkList(self.nodeC3(ni), base, blen, tiefe + 1);
+      self.nmScopeCnt := saved3;
+      return;
+    }
+    if k == NK_CALL && self.nodeIVal(ni) == 0 { self._nmBind(ni); }
+    else if k == NK_IDENT { self._nmBind(ni); }
+    self._nmWalkKids(ni, base, blen, tiefe);
+  }
+
+  // ------------------------------------------------------------------
+  // #2076: private Funktionen einer Unit
+  //
+  // Dieselbe Unterscheidung wie cg_unitPrivHat/cg_unitPrivMangle auf x86
+  // (#1655): eine nicht-oeffentliche Funktion einer IMPORTIERTEN Unit heisst
+  // "unit_name". Bis 1.2.12B stand sie unter dem blanken Namen im
+  // gemeinsamen funcBuffer; bei zwei gleichnamigen privaten Funktionen zweier
+  // Units gewann die zuerst registrierte, und `Eins()` rief die `rechne` aus
+  // bib.zwei. Fehlerfrei uebersetzt, falsches Ergebnis.
+  // ------------------------------------------------------------------
+
+  // Steht in der laufenden Unit eine nicht-oeffentliche Funktion des Namens?
+  fn _irPrivHat(np: int64, nl: int64): int64 {
+    if self.irUnitTag == 0 { return 0; }
+    var i: int64 := 0;
+    while i < self.irPrivCnt {
+      var b: int64 := self.irPrivTab + i * 16;
+      if self.seq(peek64(b) as pchar, peek64(b + 8), np as pchar, nl) { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // irPrivTab/irPrivCnt fuer die Deklarationskette `head` der laufenden
+  // Tabelle (self.nodes) bauen. Der Aufrufer rettet und stellt den alten
+  // Stand wieder her. Nur die oberste Ebene: innere Funktionen haben ihre
+  // eigene Marke (#2074), Methoden ihre Klassenmarke.
+  fn _irPrivBaue(head: int64) {
+    self.irPrivTab := 0;
+    self.irPrivCnt := 0;
+    if self.irUnitTag == 0 { return; }
+    var n: int64 := 0;
+    var d: int64 := head;
+    while d >= 0 {
+      if self.nodeKind(d) == NK_FUNC_DECL && self.nodeIsPub(d) == 0 && self._istExternDecl(d) == 0 { n := n + 1; }
+      d := self.nodeNext(d);
+    }
+    if n == 0 { return; }
+    self.irPrivTab := alloc(n * 16);
+    d := head;
+    while d >= 0 {
+      if self.nodeKind(d) == NK_FUNC_DECL && self.nodeIsPub(d) == 0 && self._istExternDecl(d) == 0 {
+        var b: int64 := self.irPrivTab + self.irPrivCnt * 16;
+        poke64(b, self.nodeSVal(d) as int64);
+        poke64(b + 8, self.nodeSLen(d));
+        self.irPrivCnt := self.irPrivCnt + 1;
+      }
+      d := self.nodeNext(d);
+    }
+  }
+
+  // "unit_name" — derselbe Trenner wie cg_mangleInto auf x86.
+  fn _irPrivMangle(np: int64, nl: int64, lenCell: int64): int64 {
+    var len: int64 := self.irUnitTagLen + 1 + nl;
+    var buf: int64 := alloc(len + 1);
+    var i: int64 := 0;
+    while i < self.irUnitTagLen { poke8(buf + i, peek8(self.irUnitTag + i)); i := i + 1; }
+    poke8(buf + self.irUnitTagLen, 95);   // '_'
+    i := 0;
+    while i < nl { poke8(buf + self.irUnitTagLen + 1 + i, peek8(np + i)); i := i + 1; }
+    poke8(buf + len, 0);
+    poke64(lenCell, len);
+    return buf;
+  }
+
+  // Der Name, unter dem die Funktion `fni` der obersten Ebene im funcBuffer
+  // steht. Registrierung, Erzeugung und Aufruf fragen alle hier.
+  fn _irFnName(fni: int64, lenCell: int64): int64 {
+    var np: int64 := self.nodeSVal(fni) as int64;
+    var nl: int64 := self.nodeSLen(fni);
+    if self.nodeIsPub(fni) == 0 && self._irPrivHat(np, nl) != 0 {
+      return self._irPrivMangle(np, nl, lenCell);
+    }
+    poke64(lenCell, nl);
+    return np;
+  }
+
+  // Der Name, den ein gewoehnlicher Aufruf (iVal 0) bzw. ein Bezeichner als
+  // Funktionswert meint: die innere Funktion, die der Vorpass zugeordnet
+  // hat; sonst die private der eigenen Unit; sonst der Name selbst.
+  fn _irRufName(ni: int64, lenCell: int64): int64 {
+    var mi: int64 := self._nmIdx(ni);
+    if mi >= 0 {
+      poke64(lenCell, self._nmLblLen(mi));
+      return self._nmLbl(mi);
+    }
+    var np: int64 := self.nodeSVal(ni) as int64;
+    var nl: int64 := self.nodeSLen(ni);
+    if self._irPrivHat(np, nl) != 0 { return self._irPrivMangle(np, nl, lenCell); }
+    poke64(lenCell, nl);
+    return np;
+  }
+
+  // Die Deklaration, die ein gewoehnlicher Aufruf meint — fuer Vorgabewerte
+  // und Rueckgabetyp. Erst die innere Funktion aus dem Vorpass, dann die
+  // oberste Ebene der eigenen Unit. Bis 1.2.12B lief die Suche ueber ALLE
+  // Knoten des Moduls und nahm die erste gleichnamige Deklaration, eine
+  // innere eingeschlossen — `w()` bekam den Vorgabewert der Modulfunktion.
+  fn _callDeclNi(ni: int64): int64 {
+    var mi: int64 := self._nmIdx(ni);
+    if mi >= 0 { return self._nmDecl(mi); }
+    var d: int64 := self.irModHead;
+    while d >= 0 {
+      if self.nodeKind(d) == NK_FUNC_DECL {
+        if self.seq(self.nodeSVal(d), self.nodeSLen(d), self.nodeSVal(ni), self.nodeSLen(ni)) { return d; }
+      }
+      d := self.nodeNext(d);
+    }
+    return 0 - 1;
   }
 
   // #2047: Ist der Knoten eine `extern fn ... link "lib"`? 1 = ja, 0 = nein.
@@ -10523,7 +10917,11 @@ pub type IRLower = class {
         if cd < 0 { return 0 - 1; }
         return self._methodRetTypeIn(cd, self.nodeSVal(nd), self.nodeSLen(nd));
       }
-      return self._funcRetTypeNode(self.nodeSVal(nd), self.nodeSLen(nd));
+      // #2074: die Deklaration, die der Aufruf meint. _funcRetTypeNode nahm
+      // die erste gleichnamige des Moduls, eine innere eingeschlossen.
+      var rtD: int64 := self._callDeclNi(nd);
+      if rtD < 0 { return 0 - 1; }
+      return self.nodeC1(rtD);
     }
 
     return 0 - 1;
@@ -10612,6 +11010,20 @@ pub type IRLower = class {
         var rp: pchar := self._ekP;
         var rl: int64 := self._ekL;
         return self._rtMt(rp, rl, self.nodeSVal(nd), self.nodeSLen(nd));
+      }
+      // #2074/#2076: Kennt die eigene Unit die Deklaration (innere Funktion
+      // oder eigene oberste Ebene), gilt ihr Rueckgabetyp — der Index ueber
+      // alle Module nimmt den ersten gleichnamigen Eintrag irgendeiner Unit.
+      var ekD: int64 := 0 - 1;
+      if self.nodeIVal(nd) == 0 { ekD := self._callDeclNi(nd); }
+      if ekD >= 0 {
+        var ekC: int64 := alloc(16);
+        self._rtTyp(self.nodeC1(ekD), ekC);
+        self._ekP := peek64(ekC) as pchar;
+        self._ekL := peek64(ekC + 8);
+        free(ekC, 16);
+        if self._ekL > 0 { return 1; }
+        return 0;
       }
       return self._rtFn(self.nodeSVal(nd), self.nodeSLen(nd));
     }

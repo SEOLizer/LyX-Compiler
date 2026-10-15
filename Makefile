@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.12B
-VERSION_DATE := 2026-10-14
+VERSION   := 1.2.13A
+VERSION_DATE := 2026-10-15
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -567,6 +567,7 @@ test: lyxc
 	@bash tests/backend_abdeckung_test.sh
 	@bash tests/nested_fn_ir_test.sh
 	@bash tests/verschachtelte_namen_test.sh
+	@bash tests/unit_private_namen_test.sh
 	@bash tests/ir_rest_arm64_test.sh
 	@bash tests/qemu_name_test.sh
 	@bash tests/munmap_ir_test.sh
