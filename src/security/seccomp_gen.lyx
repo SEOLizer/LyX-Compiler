@@ -359,8 +359,9 @@ con SC_CAP_SYSTEM_UNSAFE_FMT:   int64 := 6;    // #1875
 con SC_O_WRITE_MASK: int64 := 3;
 
 // AF_INET=2, AF_INET6=10, AF_UNIX=1
-con SC_AF_INET: int64 := 2;
-con SC_AF_UNIX: int64 := 1;
+con SC_AF_INET:  int64 := 2;
+con SC_AF_INET6: int64 := 10;   // #2098: fehlte — IPv6 starb mit SIGSYS
+con SC_AF_UNIX:  int64 := 1;
 
 // SOCK_STREAM=1, SOCK_DGRAM=2
 con SC_SOCK_STREAM: int64 := 1;
@@ -466,6 +467,32 @@ fn sc_emit(buf: int64, idx: int64, op: int64, jt: int64, jf: int64, k: int64): v
 }
 
 // Einfacher Allow-Block: prüft exakt eine syscall-Nummer (2 Befehle)
+// #2098: socket(fam, typ, …) erlauben. typ < 0 = jeder Typ. Ein in sich
+// geschlossener Block: passt der Aufruf nicht, wird die Syscall-Nummer neu
+// geladen und es geht mit dem naechsten Block weiter.
+//   mit Typ:  JEQ socket ?:+6 | LD arg0 | JEQ fam ?:+4 | LD arg1 | AND mask
+//             | JEQ typ ?:+1 | RET ALLOW | LD nr                    (8 Befehle)
+//   ohne Typ: JEQ socket ?:+3 | LD arg0 | JEQ fam ?:+1 | RET ALLOW | LD nr  (5)
+fn sc_allow_socket(buf: int64, n: int64, fam: int64, typ: int64): int64 {
+  if typ < 0 {
+    sc_emit(buf, n, SC_JMP_JEQ_K, 0, 3, SC_SYS_SOCKET); n := n + 1;
+    sc_emit(buf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG0);    n := n + 1;
+    sc_emit(buf, n, SC_JMP_JEQ_K, 0, 1, fam);           n := n + 1;
+    sc_emit(buf, n, SC_RET_K, 0, 0, SC_ALLOW);          n := n + 1;
+    sc_emit(buf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR);      n := n + 1;
+    return n;
+  }
+  sc_emit(buf, n, SC_JMP_JEQ_K, 0, 6, SC_SYS_SOCKET);   n := n + 1;
+  sc_emit(buf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG0);      n := n + 1;
+  sc_emit(buf, n, SC_JMP_JEQ_K, 0, 4, fam);             n := n + 1;
+  sc_emit(buf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG1);      n := n + 1;
+  sc_emit(buf, n, SC_ALU_AND_K, 0, 0, SC_SOCK_TYPE_MASK); n := n + 1;
+  sc_emit(buf, n, SC_JMP_JEQ_K, 0, 1, typ);             n := n + 1;
+  sc_emit(buf, n, SC_RET_K, 0, 0, SC_ALLOW);            n := n + 1;
+  sc_emit(buf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR);        n := n + 1;
+  return n;
+}
+
 fn sc_allow_nr(buf: int64, n: int64, nr: int64): int64 {
   sc_emit(buf, n,     SC_JMP_JEQ_K, 0, 1, nr);  // match → RET ALLOW; no match → skip
   sc_emit(buf, n + 1, SC_RET_K, 0, 0, SC_ALLOW);
@@ -787,39 +814,40 @@ pub fn seccomp_build_filter(capBuf: int64, capCount: int64, bpfBuf: int64): int6
   var hasUnix:    bool := sc_has_cap(capBuf, capCount, SC_CAP_NETWORK_UNIX);
 
   if hasTcpConn || hasUdpConn || hasTcpBind || hasUdpBind || hasUnix {
-    // socket-Aufruf: je nach vorhandenen Caps Argument-Filter generieren
-    if (hasTcpConn && hasUdpConn) || (hasTcpBind && hasUdpBind) {
-      // Alle socket-Typen erlaubt → einfacher Allow
-      n := sc_allow_nr(bpfBuf, n, SC_SYS_SOCKET);
-    } else if hasTcpConn || hasTcpBind {
-      // Nur SOCK_STREAM (TCP): 7 Befehle
-      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 6, SC_SYS_SOCKET); n := n + 1;
-      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG0); n := n + 1;  // domain
-      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 4, SC_AF_INET); n := n + 1;  // not AF_INET → skip
-      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG1); n := n + 1;  // type
-      sc_emit(bpfBuf, n, SC_ALU_AND_K, 0, 0, SC_SOCK_TYPE_MASK); n := n + 1;
-      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 1, SC_SOCK_STREAM); n := n + 1; // SOCK_STREAM → ALLOW
-      sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_ALLOW); n := n + 1;
-      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;  // Reload NR
-    } else if hasUdpConn || hasUdpBind {
-      // Nur SOCK_DGRAM (UDP): 7 Befehle
-      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 6, SC_SYS_SOCKET); n := n + 1;
-      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG0); n := n + 1;
-      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 4, SC_AF_INET); n := n + 1;
-      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG1); n := n + 1;
-      sc_emit(bpfBuf, n, SC_ALU_AND_K, 0, 0, SC_SOCK_TYPE_MASK); n := n + 1;
-      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 1, SC_SOCK_DGRAM); n := n + 1;
-      sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_ALLOW); n := n + 1;
-      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;  // Reload NR
-    } else if hasUnix {
-      // AF_UNIX socket: 5 instructions total (gate + load-arg + check + allow + reload)
-      // jf=3: if NR!=socket skip load-arg/check/allow, land on reload-NR (shared endpoint)
-      // jf=1: if domain!=AF_UNIX skip allow, land on reload-NR
-      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 3, SC_SYS_SOCKET); n := n + 1;
-      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_ARG0); n := n + 1;
-      sc_emit(bpfBuf, n, SC_JMP_JEQ_K, 0, 1, SC_AF_UNIX); n := n + 1;
-      sc_emit(bpfBuf, n, SC_RET_K, 0, 0, SC_ALLOW); n := n + 1;  // AF_UNIX match → allow
-      sc_emit(bpfBuf, n, SC_LD_ABS_W, 0, 0, SC_OFF_NR); n := n + 1;  // Reload NR
+    // #2098: socket() als VEREINIGUNG der deklarierten Familien und Typen.
+    // Bis 1.2.13F war das eine if/else-if-Kette: der erste passende Zweig
+    // gewann, und mit network.tcp.* UND network.unix blieb nur AF_INET +
+    // SOCK_STREAM erlaubt — socket(AF_UNIX) starb mit SIGSYS, ein Prozess
+    // konnte nicht zugleich TCP-Server und Unix-Client sein. AF_INET6 fehlte
+    // ganz. Jetzt ein eigener Block je (Familie, Typ); jeder laesst seinen
+    // Fall durch und laedt sonst die Nummer neu, die Bloecke reihen sich also
+    // ohne gegenseitige Spruenge. Kein Block passt: weiter wie bisher bis zum
+    // Ende des Filters (KILL).
+    //
+    // Der fruehere Sonderfall "TCP und UDP zusammen → socket() ohne
+    // Pruefung" ist damit weg: er liess jede Familie zu, auch AF_PACKET und
+    // AF_NETLINK, die keine der vier Capabilities meint.
+    var mitStream: bool := hasTcpConn || hasTcpBind;
+    var mitDgram:  bool := hasUdpConn || hasUdpBind;
+    if mitStream {
+      n := sc_allow_socket(bpfBuf, n, SC_AF_INET,  SC_SOCK_STREAM);
+      n := sc_allow_socket(bpfBuf, n, SC_AF_INET6, SC_SOCK_STREAM);
+    }
+    if mitDgram {
+      n := sc_allow_socket(bpfBuf, n, SC_AF_INET,  SC_SOCK_DGRAM);
+      n := sc_allow_socket(bpfBuf, n, SC_AF_INET6, SC_SOCK_DGRAM);
+    }
+    if hasUnix {
+      n := sc_allow_socket(bpfBuf, n, SC_AF_UNIX, 0 - 1);   // jeder Typ
+      // #2098: ein Unix-Socket ohne bind/listen/accept/connect ist nutzlos —
+      // network.unix erlaubte bisher NUR den socket()-Aufruf. Eine
+      // inet-Verbindung entsteht damit nicht: ohne network.tcp/udp laesst
+      // der Block oben kein AF_INET-socket() zu.
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_BIND);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_LISTEN);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_ACCEPT);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_ACCEPT4);
+      n := sc_allow_nr(bpfBuf, n, SC_SYS_CONNECT);
     }
     if hasTcpConn {
       n := sc_allow_nr(bpfBuf, n, SC_SYS_CONNECT);
