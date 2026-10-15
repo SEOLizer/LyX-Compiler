@@ -18,11 +18,12 @@
 # Funktion gilt in ihrem BLOCK, dort auch vor ihrer Zeile; eine Variable oder
 # ein Parameter desselben Namens verdeckt sie.
 #
-# Der IR-Weg (arm64, riscv) bindet einige Faelle noch anders — er sucht auf
-# Funktions- statt Blockebene und kennt keine Verdeckung (#2074), und zwei
-# private gleichnamige Funktionen zweier Units fallen dort zusammen (#2076).
-# Diese Faelle laufen hier nur auf x86_64 (`nur_x86`); nach dem jeweiligen Fix
-# gehoeren sie nach `alle_ziele`.
+# Auf dem IR-Weg (arm64, riscv) band #2020 auf Funktions- statt Blockebene,
+# ohne Verdeckung und ohne Methodenruempfe (#2074); zwei private gleichnamige
+# Funktionen zweier Units fielen dort zusammen (#2076). Seit beiden Fixes
+# laufen alle Faelle auf allen drei Zielen. Nur die Tupel-Rueckgabe einer
+# Nutzerfunktion kennt der IR-Weg nicht (#2080) — der Fall laeuft deshalb
+# nur auf x86_64 (`nur_x86`).
 set -uo pipefail
 ulimit -c 0   # ein Absturz unter qemu legt sonst eine .core-Datei ins Repo
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -129,10 +130,10 @@ echo
 echo "--- ueber Unit-Grenzen ---"
 # Zwei Units mit gleichnamiger PRIVATER Aussenfunktion `rechne` und darin je
 # einer `nib`: die Marke traegt den unit-lokalen Namen der Aussenfunktion
-# (#1655), die beiden bleiben getrennt. Auf den IR-Zielen fallen schon die
-# beiden `rechne` zusammen, mit oder ohne innere Funktion (#2076) — deshalb
-# nur x86_64; die Fassung mit verschieden benannten Aussenfunktionen
-# (`einsR`/`zweiR`) laeuft auf allen Zielen.
+# (#1655), die beiden bleiben getrennt. Auf den IR-Zielen fielen bis
+# 1.2.12B schon die beiden `rechne` zusammen, mit oder ohne innere Funktion
+# (#2076). Die Fassung mit verschieden benannten Aussenfunktionen
+# (`einsR`/`zweiR`) trennt die beiden Ursachen.
 #
 # Und die andere Richtung: in bib.zwei steht `helfer` nur als INNERE Funktion
 # von `nutzer`. Ein freier Aufruf `helfer()` in Zwei() meint die oeffentliche
@@ -163,7 +164,7 @@ import bib.eins;
 import bib.zwei;
 fn main(): int64 { PrintLn(IntToStr(Eins())); PrintLn(IntToStr(Zwei())); return 0; }
 EOF
-nur_x86 "Eins 1 | Zwei 2*10 + 7*100 + 300" "haupt.lyx" "1|1020|" "$TMP/m"
+alle_ziele "Eins 1 | Zwei 2*10 + 7*100 + 300" "haupt.lyx" "1|1020|" "$TMP/m"
 
 mkdir -p "$TMP/m2/bib"
 cat > "$TMP/m2/bib/eins.lyx" <<'EOF'
@@ -186,7 +187,7 @@ EOF
 alle_ziele "gleichnamige innere in zwei Units: 1 | 2" "haupt.lyx" "1|2|" "$TMP/m2"
 
 echo
-echo "--- Gueltigkeit je BLOCK (x86_64; IR-Weg: #2074) ---"
+echo "--- Gueltigkeit je BLOCK ---"
 cat > "$TMP/block.lyx" <<'EOF'
 unit main;
 import std.io;
@@ -213,10 +214,10 @@ fn main(): int64 {
   return 0;
 }
 EOF
-nur_x86 "if-Block 42 | danach 1 | if 30 | else 12" "$TMP/block.lyx" "42|1|30|12|"
+alle_ziele "if-Block 42 | danach 1 | if 30 | else 12" "$TMP/block.lyx" "42|1|30|12|"
 
 echo
-echo "--- Verdeckung durch Parameter und Variable (x86_64; IR-Weg: #2074) ---"
+echo "--- Verdeckung durch Parameter und Variable ---"
 cat > "$TMP/verdeckt.lyx" <<'EOF'
 unit main;
 import std.io;
@@ -239,10 +240,10 @@ fn aussen(): int64 {
 }
 fn main(): int64 { aussen(); return 0; }
 EOF
-nur_x86 "Parameter 7 | Zeiger fuenf(1) 6 | innere zehn(0) 20" "$TMP/verdeckt.lyx" "7|6|20|"
+alle_ziele "Parameter 7 | Zeiger fuenf(1) 6 | innere zehn(0) 20" "$TMP/verdeckt.lyx" "7|6|20|"
 
 echo
-echo "--- innere Funktion einer METHODE (x86_64; IR-Weg: #2074) ---"
+echo "--- innere Funktion einer METHODE ---"
 # Bis 1.2.12A wurde sie erst nach der NAECHSTEN freien Funktion erzeugt, unter
 # dem blanken Namen — der Aufruf traf die gleichnamige Modulfunktion (101).
 cat > "$TMP/methode.lyx" <<'EOF'
@@ -253,7 +254,7 @@ type K = class { v: int64;
 fn hilf(n: int64): int64 { return n + 100; }
 fn main(): int64 { var k: K := new K(); k.v := 1; PrintLn(IntToStr(k.Rechne())); PrintLn(IntToStr(hilf(1))); return 0; }
 EOF
-nur_x86 "Methode 6 | Modul 101" "$TMP/methode.lyx" "6|101|"
+alle_ziele "Methode 6 | Modul 101" "$TMP/methode.lyx" "6|101|"
 # Dasselbe als LETZTE Deklaration der Datei: dann folgte bis 1.2.12A keine
 # freie Funktion mehr, die die innere erzeugt haette.
 cat > "$TMP/methode_letzt.lyx" <<'EOF'
@@ -263,10 +264,10 @@ fn main(): int64 { var k: K := new K(); k.v := 2; PrintLn(IntToStr(k.Rechne()));
 type K = class { v: int64;
   pub fn Rechne(): int64 { fn hilf(n: int64): int64 { return n * 21; } return hilf(self.v); } };
 EOF
-nur_x86 "Methode als letzte Deklaration: 42" "$TMP/methode_letzt.lyx" "42|"
+alle_ziele "Methode als letzte Deklaration: 42" "$TMP/methode_letzt.lyx" "42|"
 
 echo
-echo "--- innere Funktion als WERT (x86_64; IR-Weg: #2074) ---"
+echo "--- innere Funktion als WERT ---"
 # Bis 1.2.12A fiel der Bezeichner bis auf cg_zeroRax durch: f war 0, der
 # Aufruf stuerzte ab.
 cat > "$TMP/wert.lyx" <<'EOF'
@@ -280,13 +281,14 @@ fn aussen(): int64 {
 }
 fn main(): int64 { PrintLn(IntToStr(aussen())); return 0; }
 EOF
-nur_x86 "f := innen; f(1) = 8" "$TMP/wert.lyx" "8|"
+alle_ziele "f := innen; f(1) = 8" "$TMP/wert.lyx" "8|"
 
 echo
-echo "--- Signatur der INNEREN, nicht der gleichnamigen Modulfunktion (x86_64; IR-Weg: #2074) ---"
+echo "--- Signatur der INNEREN, nicht der gleichnamigen Modulfunktion ---"
 # Vorgabewert, f64-Rueckgabe, Struct- und Tupel-Rueckgabe werden ueber den
 # Namen nachgeschlagen. Mit dem blanken Namen fanden sie die Modulfunktion:
-# 100 | 198 | 90 | 90 | 80 | 80.
+# 100 | 198 | 90 | 90 (Tupel: 80 | 80). Auf dem IR-Weg kam der Vorgabewert
+# von der Modulfunktion (3).
 cat > "$TMP/signatur.lyx" <<'EOF'
 unit main;
 import std.io;
@@ -305,13 +307,25 @@ fn aussen(): int64 {
   PrintLn(IntToStr((h * 2.0) as int64));
   var p: P := paar();
   PrintLn(IntToStr(p.x)); PrintLn(IntToStr(p.y));
+  return 0;
+}
+fn main(): int64 { return aussen(); }
+EOF
+alle_ziele "Vorgabe 4 | f64 9 | Struct 1,2" "$TMP/signatur.lyx" "4|9|1|2|"
+# Tupel-Rueckgabe: der IR-Weg kennt sie fuer Nutzerfunktionen nicht (#2080).
+cat > "$TMP/tupel.lyx" <<'EOF'
+unit main;
+import std.io;
+fn tupel(): [int64, int64] { return (80, 80); }
+fn aussen(): int64 {
+  fn tupel(): [int64, int64] { return (3, 5); }
   var t0, t1 := tupel();
   PrintLn(IntToStr(t0)); PrintLn(IntToStr(t1));
   return 0;
 }
 fn main(): int64 { return aussen(); }
 EOF
-nur_x86 "Vorgabe 4 | f64 9 | Struct 1,2 | Tupel 3,5" "$TMP/signatur.lyx" "4|9|1|2|3|5|"
+nur_x86 "Tupel 3,5 (IR-Weg: #2080)" "$TMP/tupel.lyx" "3|5|"
 
 echo
 echo "--- die stdlib-Units mit inneren Funktionen uebersetzen ZUSAMMEN ---"
