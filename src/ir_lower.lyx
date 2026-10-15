@@ -1557,6 +1557,14 @@ pub type IRLower = class {
       return self.lowerExpr(self.nodeC0(expr));
     }
 
+    // #2080: Array-Literal `[e1, e2]` und Tupelausdruck `(e1, e2)` (derselbe
+    // Knoten). Fehlte bis 1.2.13A ganz: der Knoten fiel bis hierher durch und
+    // bekam einen unbeschriebenen Temp — `var u := (7, 8); u[0]` stuerzte auf
+    // arm64 ab, auf riscv endete das Programm ohne Ausgabe.
+    if (k == NK_ARRAY_LIT) {
+      return self._lowerArrayLit(expr);
+    }
+
     // Unknown expression type - allocate temp
     var t: int64 := self.allocTemp();
     return t;
@@ -6933,26 +6941,8 @@ pub type IRLower = class {
           }
         }
       }
-      // Register name -> slot. Grow the buffer geometrically if full.
-      if self.localNameCnt >= self.localNameCap {
-        var vdNewCap: int64 := self.localNameCap * 2;
-        var vdNb: int64 := alloc(vdNewCap * 24);
-        var vdI: int64 := 0;
-        memcpy(vdNb, self.localNameBuf, self.localNameCnt * 24);
-        self.localNameBuf := vdNb;
-        // ARM64-OOP: localTypeBuf parallel mit-growen.
-        var vdTb: int64 := alloc(vdNewCap * 8);
-        memcpy(vdTb, self.localTypeBuf, self.localNameCnt * 8);
-        self.localTypeBuf := vdTb;
-        self.localNameCap := vdNewCap;
-      }
-      var vdRec: int64 := self.localNameBuf + self.localNameCnt * 24;
-      poke64(vdRec +  0, peek64(self.nodeOff(stmt) + NODE_OFF_SVAL));  // src nameOff
-      poke64(vdRec +  8, self.nodeSLen(stmt));
-      poke64(vdRec + LOCAL_REC_OFF_SLOT, vdSlot);
-      // ARM64-OOP: Typ-Node des Locals merken (nodeC0 = Typ; -1 wenn keiner).
-      poke64(self.localTypeBuf + self.localNameCnt * 8, self.nodeC0(stmt));
-      self.localNameCnt += 1;
+      // Register name -> slot (Typ-Node nodeC0, -1 wenn keiner).
+      self._regLocal(peek64(self.nodeOff(stmt) + NODE_OFF_SVAL), self.nodeSLen(stmt), vdSlot, self.nodeC0(stmt));
     }
     // #2020: eine verschachtelte `fn` als Anweisung. Hier entsteht NICHTS —
     // ihr Rumpf wird nach der umgebenden Funktion erzeugt (sonst laege er
@@ -7130,6 +7120,173 @@ pub type IRLower = class {
   // ------------------------------------------------------------------
   // var a, b := fn()  — lower init expr (call), results in rax+rdx
 
+  // #2080: Array-Literal auf dem Heap. Ablage wie auf x86 (codegen_x86,
+  // NK_ARRAY_LIT): `{cap,len}`-Kopf, dann die Elemente. Anders als dort liegt
+  // es nicht auf dem Stack — ein Tupel wird im IR-Weg als ZEIGER
+  // zurueckgegeben (siehe lowerTupleVarDecl), ein Stack-Zeiger wuerde mit dem
+  // Rahmen ungueltig. Und der Zeiger zeigt auf das ERSTE ELEMENT, der Kopf
+  // liegt davor (-16 cap, -8 len): der IR-Indexer (IRO_LOAD_IDX,
+  // `[base + idx*8]`) kennt keinen Kopf, so wie bei jedem anderen Array
+  // dieses Weges.
+  fn _lowerArrayLit(expr: int64): int64 {
+    var cnt: int64 := 0;
+    var el: int64 := self.nodeC0(expr);
+    while el >= 0 { cnt := cnt + 1; el := self.nodeNext(el); }
+    // Erst die Elemente auswerten — sie duerfen selbst allozieren und rufen.
+    var vals: int64 := alloc((cnt + 1) * 8);
+    var i: int64 := 0;
+    el := self.nodeC0(expr);
+    while el >= 0 {
+      poke64(vals + i * 8, self.lowerExpr(el));
+      i := i + 1;
+      el := self.nodeNext(el);
+    }
+    var szT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, szT, -1, -1, 16 + cnt * 8);
+    var p: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, p, szT, -1, 0);
+    var cntT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, cntT, -1, -1, cnt);
+    var ix: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, ix, -1, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_IDX, ix, cntT, p, 0);        // cap
+    var ix1: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, ix1, -1, -1, 1);
+    self.irAddInstrDirect(IRO_STORE_IDX, ix1, cntT, p, 0);       // len
+    i := 0;
+    while i < cnt {
+      var ixE: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, ixE, -1, -1, 2 + i);
+      self.irAddInstrDirect(IRO_STORE_IDX, ixE, peek64(vals + i * 8), p, 0);
+      i := i + 1;
+    }
+    free(vals, (cnt + 1) * 8);
+    var c16: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, c16, -1, -1, 16);
+    var dest: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, dest, p, c16, 0);
+    return dest;
+  }
+
+  // #2080: Ruft `call` eine Nutzerfunktion oder -methode mit Tupel-
+  // Rueckgabe? 1 = ja, 0 = nein (anderer Typ, oder ein Builtin — dann bleibt
+  // der Syscall-Weg), -1 = eine Methode, deren Deklaration sich nicht finden
+  // laesst; geraten wird dann nicht.
+  fn _tupelRuf(call: int64): int64 {
+    if call < 0 { return 0; }
+    // #2075: ein Tupel-AUSDRUCK `(x, y)` ist das Array-Literal selbst —
+    // derselbe Zeiger wie die Rueckgabe einer Tupelfunktion.
+    if self.nodeKind(call) == NK_ARRAY_LIT { return 1; }
+    if self.nodeKind(call) != NK_CALL { return 0; }
+    var iv: int64 := self.nodeIVal(call);
+    if iv == 0 {
+      var d: int64 := self._callDeclNi(call);
+      if d >= 0 { return self._tupelTyp(self.nodeC1(d)); }
+      return self._tupelSuche(0 as pchar, 0, self.nodeSVal(call), self.nodeSLen(call));
+    }
+    if iv == 1 {
+      // Methode: Klasse des Empfaengers, dann ihre Methode — auch geerbt und
+      // aus einem anderen Modul.
+      if self._exprKlasse(self.nodeC0(call)) == 0 { return 0 - 1; }
+      var r: int64 := self._tupelSuche(self._ekP, self._ekL, self.nodeSVal(call), self.nodeSLen(call));
+      if r < 0 { return 0 - 1; }
+      return r;
+    }
+    return 0;
+  }
+
+  fn _tupelTyp(rt: int64): int64 {
+    if rt < 0 { return 0; }
+    if self.nodeKind(rt) == NK_TYPE_TUPLE { return 1; }
+    return 0;
+  }
+
+  // Ueber alle Module der Importliste: die freie Funktion (cp == 0) bzw. die
+  // Methode der Klasse cp (samt Basisklassen) namens mp suchen und ihren
+  // Rueckgabetyp pruefen. 1/0 wie oben; -1 nur bei einer Methode, die
+  // nirgends steht. Eine freie Funktion, die nirgends steht, ist ein Builtin
+  // (0) — dafuer gibt es den Syscall-Weg.
+  fn _tupelSuche(cp: pchar, cl: int64, mp: pchar, ml: int64): int64 {
+    var svS: pchar := self.src;
+    var svN: int64 := self.nodes;
+    var svC: int64 := self.nodeCount;
+    var erg: int64 := 0 - 2;          // -2 = noch nichts gefunden
+    var kp: pchar := cp;
+    var kl: int64 := cl;
+    var runde: int64 := 0;
+    while erg == 0 - 2 && runde < 64 {
+      var naechste: int64 := 0;       // Basisklasse gefunden?
+      var nbP: int64 := 0;
+      var nbL: int64 := 0;
+      var m: int64 := 0;
+      while m < self.impLstN && erg == 0 - 2 {
+        self.src       := peek64(self.impLstSrc + m * 8) as pchar;
+        self.nodes     := peek64(self.impLstNodes + m * 8);
+        self.nodeCount := peek64(self.impLstCnt + m * 8);
+        var d: int64 := peek64(self.impLstHead + m * 8);
+        while d >= 0 && erg == 0 - 2 {
+          if kl == 0 {
+            if self.nodeKind(d) == NK_FUNC_DECL && self.seq(self.nodeSVal(d), self.nodeSLen(d), mp, ml) {
+              erg := self._tupelTyp(self.nodeC1(d));
+            }
+          } else if self.nodeKind(d) == NK_TYPE_DECL && self.seq(self.nodeSVal(d), self.nodeSLen(d), kp, kl) {
+            var mm: int64 := self.nodeC1(d);
+            while mm >= 0 && erg == 0 - 2 {
+              if self.nodeKind(mm) == NK_FUNC_DECL && self.seq(self.nodeSVal(mm), self.nodeSLen(mm), mp, ml) {
+                erg := self._tupelTyp(self.nodeC1(mm));
+              }
+              mm := self.nodeNext(mm);
+            }
+            if erg == 0 - 2 && self.nodeC2(d) >= 0 {
+              naechste := 1;
+              nbP := self.nodeSVal(self.nodeC2(d)) as int64;
+              nbL := self.nodeSLen(self.nodeC2(d));
+            }
+          }
+          d := self.nodeNext(d);
+        }
+        m := m + 1;
+      }
+      if erg == 0 - 2 {
+        if kl != 0 && naechste != 0 { kp := nbP as pchar; kl := nbL; }
+        else if kl != 0 { erg := 0 - 1; }   // Methode nirgends
+        else { erg := 0; }                  // freie Funktion nirgends: Builtin
+      }
+      runde := runde + 1;
+    }
+    self.src := svS; self.nodes := svN; self.nodeCount := svC;
+    if erg == 0 - 2 { return 0 - 1; }
+    return erg;
+  }
+
+  // Ein Local eintragen: Name (Versatz in self.src), Laenge, Slot, Typknoten
+  // (-1 = keiner). localNameBuf und localTypeBuf wachsen GEMEINSAM.
+  //
+  // Bis 1.2.13A stand dieser Block viermal da, und nur die Fassung fuer
+  // NK_VAR_DECL zog localTypeBuf mit: Tupel-Entpacken, `for … to` und
+  // `for … in range` vergroesserten nur den Namenspuffer und trugen keinen
+  // Typ ein. Vergroesserte eine dieser Stellen, schrieb das naechste `var`
+  // hinter das Ende des alten Typpuffers; und der Typ einer Laufvariablen war
+  // der, der zuletzt an derselben Stelle stand (#2080).
+  fn _regLocal(nameOff: int64, nameLen: int64, slot: int64, typNi: int64) {
+    if self.localNameCnt >= self.localNameCap {
+      var nc: int64 := self.localNameCap * 2;
+      var nb: int64 := alloc(nc * 24);
+      memcpy(nb, self.localNameBuf, self.localNameCnt * 24);
+      self.localNameBuf := nb;
+      var tb: int64 := alloc(nc * 8);
+      memcpy(tb, self.localTypeBuf, self.localNameCnt * 8);
+      self.localTypeBuf := tb;
+      self.localNameCap := nc;
+    }
+    var rec: int64 := self.localNameBuf + self.localNameCnt * 24;
+    poke64(rec +  0, nameOff);
+    poke64(rec +  8, nameLen);
+    poke64(rec + LOCAL_REC_OFF_SLOT, slot);
+    poke64(self.localTypeBuf + self.localNameCnt * 8, typNi);
+    self.localNameCnt += 1;
+  }
+
   fn lowerTupleVarDecl(stmt: int64) {
     // var firstName, secondName := initExpr
     // firstName = sval/slen on the node; secondName = c0 (NK_IDENT).
@@ -7138,6 +7295,8 @@ pub type IRLower = class {
     //   IRO_LOAD_ERRVAL  reads rax shadow (r15) → errSlot.
 
     var valSlot: int64 := self.allocTemp();
+    var tvTyp0: int64 := 0 - 1;   // #2080: Elementtypen (siehe unten)
+    var tvTyp1: int64 := 0 - 1;
 
     // Determine second name — is it discard ("_")?
     var secondNode: int64 := self.nodeC0(stmt);
@@ -7154,41 +7313,69 @@ pub type IRLower = class {
     // Lower init expression → temp slot (val)
     var initExpr: int64 := self.nodeC1(stmt);
     if initExpr >= 0 {
+      // #2080: Ist der Initialisierer eine NUTZERFUNKTION mit Tupel-Rueckgabe,
+      // liefert sie den Zeiger auf ein Array-Literal — ein Tupelausdruck ist
+      // in Lyx genau das (ebnf §15, TupleExpr: `{cap,len}`-Kopf, dann die
+      // Elemente). Entpackt wird also mit zwei Elementzugriffen.
+      //
+      // Bis 1.2.13A ging JEDER Initialisierer den Syscall-Weg: der erste Name
+      // bekam den Rueckgabewert (hier den Zeiger), der zweite las mit
+      // IRO_LOAD_ERRVAL den Fehlerschatten eines LyxOS-Syscalls. arm64 und
+      // riscv kennen den Opcode nicht und wiesen ab; auf lyxos liefen beide
+      // Werte still falsch.
+      var tvTupel: int64 := self._tupelRuf(initExpr);
+      // Die Elementtypen, wenn die Deklaration in DIESEM Modul steht (ein
+      // Typknoten gilt nur in seiner Tabelle): `var n, p := f(); p.x` braucht
+      // den Typ von p fuer den Feldversatz. Wie auf x86 seit #1122; steht die
+      // Funktion anderswo, bleibt der Name typlos.
+      if tvTupel > 0 {
+        var tvD: int64 := 0 - 1;
+        if self.nodeIVal(initExpr) == 0 { tvD := self._callDeclNi(initExpr); }
+        var tvRt: int64 := 0 - 1;
+        if tvD >= 0 { tvRt := self.nodeC1(tvD); }
+        else if self.nodeIVal(initExpr) == 1 {
+          var tvCd: int64 := self._typeNodeToDecl(self._exprTypeNode(self.nodeC0(initExpr)));
+          if tvCd >= 0 { tvRt := self._methodRetTypeIn(tvCd, self.nodeSVal(initExpr), self.nodeSLen(initExpr)); }
+        }
+        if tvRt >= 0 && self.nodeKind(tvRt) == NK_TYPE_TUPLE {
+          tvTyp0 := self.nodeC0(tvRt);
+          if tvTyp0 >= 0 { tvTyp1 := self.nodeNext(tvTyp0); }
+        }
+      }
+      if tvTupel < 0 {
+        EPrintStr("lyxc: #2080: Rueckgabetyp nicht bestimmbar fuer `var a, b := "c);
+        sys_write(2, self.nodeSVal(initExpr) as int64, self.nodeSLen(initExpr));
+        EPrintStrLn("(...)` — Tupel oder nicht?"c);
+        exit(1);
+      }
       var initTemp: int64 := self.lowerExpr(initExpr);
-      self.irAddInstrDirect(IRO_STORE_LOCAL, valSlot, initTemp, -1, 0);
-      if errSlot >= 0 {
-        self.irAddInstrDirect(IRO_LOAD_ERRVAL, errSlot, 0, -1, 0);
+      if tvTupel != 0 {
+        var tvI0: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_CONST_INT, tvI0, -1, -1, 0);
+        var tvE0: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_LOAD_IDX, tvE0, initTemp, tvI0, 0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, valSlot, tvE0, -1, 0);
+        if errSlot >= 0 {
+          var tvI1: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_CONST_INT, tvI1, -1, -1, 1);
+          var tvE1: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_LOAD_IDX, tvE1, initTemp, tvI1, 0);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, errSlot, tvE1, -1, 0);
+        }
+      } else {
+        self.irAddInstrDirect(IRO_STORE_LOCAL, valSlot, initTemp, -1, 0);
+        if errSlot >= 0 {
+          self.irAddInstrDirect(IRO_LOAD_ERRVAL, errSlot, 0, -1, 0);
+        }
       }
     }
 
     // Register firstName → valSlot
-    if self.localNameCnt >= self.localNameCap {
-      var tvNewCap: int64 := self.localNameCap * 2;
-      var tvNb: int64 := alloc(tvNewCap * 24);
-      memcpy(tvNb, self.localNameBuf, self.localNameCnt * 24);
-      self.localNameBuf := tvNb;
-      self.localNameCap := tvNewCap;
-    }
-    var tvRec1: int64 := self.localNameBuf + self.localNameCnt * 24;
-    poke64(tvRec1 + 0, peek64(self.nodeOff(stmt) + NODE_OFF_SVAL));
-    poke64(tvRec1 + 8, self.nodeSLen(stmt));
-    poke64(tvRec1 + LOCAL_REC_OFF_SLOT, valSlot);
-    self.localNameCnt += 1;
+    self._regLocal(peek64(self.nodeOff(stmt) + NODE_OFF_SVAL), self.nodeSLen(stmt), valSlot, tvTyp0);
 
     // Register secondName → errSlot (only if not discard)
     if errSlot >= 0 {
-      if self.localNameCnt >= self.localNameCap {
-        var tvNewCap2: int64 := self.localNameCap * 2;
-        var tvNb2: int64 := alloc(tvNewCap2 * 24);
-        memcpy(tvNb2, self.localNameBuf, self.localNameCnt * 24);
-        self.localNameBuf := tvNb2;
-        self.localNameCap := tvNewCap2;
-      }
-      var tvRec2: int64 := self.localNameBuf + self.localNameCnt * 24;
-      poke64(tvRec2 + 0, peek64(self.nodeOff(secondNode) + NODE_OFF_SVAL));
-      poke64(tvRec2 + 8, self.nodeSLen(secondNode));
-      poke64(tvRec2 + LOCAL_REC_OFF_SLOT, errSlot);
-      self.localNameCnt += 1;
+      self._regLocal(peek64(self.nodeOff(secondNode) + NODE_OFF_SVAL), self.nodeSLen(secondNode), errSlot, tvTyp1);
     }
   }
 
@@ -7201,20 +7388,8 @@ pub type IRLower = class {
     // sOff/sLen = var name, c0 = start expr, c1 = end expr, c2 = body, iVal = dir (0=to,1=downto)
     var varSlot: int64 := self.allocTemp();
 
-    // Register var name → slot in localNameBuf
-    if self.localNameCnt >= self.localNameCap {
-      var rfNewCap: int64 := self.localNameCap * 2;
-      var rfNb: int64 := alloc(rfNewCap * 24);
-      var rfI: int64 := 0;
-      memcpy(rfNb, self.localNameBuf, self.localNameCnt * 24);
-      self.localNameBuf := rfNb;
-      self.localNameCap := rfNewCap;
-    }
-    var rfRec: int64 := self.localNameBuf + self.localNameCnt * 24;
-    poke64(rfRec +  0, peek64(self.nodeOff(stmt) + NODE_OFF_SVAL));
-    poke64(rfRec +  8, self.nodeSLen(stmt));
-    poke64(rfRec + LOCAL_REC_OFF_SLOT, varSlot);
-    self.localNameCnt += 1;
+    // Register var name → slot in localNameBuf (Laufvariable: kein Typknoten)
+    self._regLocal(peek64(self.nodeOff(stmt) + NODE_OFF_SVAL), self.nodeSLen(stmt), varSlot, 0 - 1);
 
     // Init: varSlot = start
     var startTemp: int64 := self.lowerExpr(self.nodeC0(stmt));
@@ -7277,19 +7452,7 @@ pub type IRLower = class {
   // WP-1.1-A: for i in range(start, stop) — stop is exclusive (IRO_CMP_LT)
   fn lowerCallRange(stmt: int64) {
     var varSlot: int64 := self.allocTemp();
-    if self.localNameCnt >= self.localNameCap {
-      var crNewCap: int64 := self.localNameCap * 2;
-      var crNb: int64 := alloc(crNewCap * 24);
-      var crI: int64 := 0;
-      memcpy(crNb, self.localNameBuf, self.localNameCnt * 24);
-      self.localNameBuf := crNb;
-      self.localNameCap := crNewCap;
-    }
-    var crRec: int64 := self.localNameBuf + self.localNameCnt * 24;
-    poke64(crRec +  0, peek64(self.nodeOff(stmt) + NODE_OFF_SVAL));
-    poke64(crRec +  8, self.nodeSLen(stmt));
-    poke64(crRec + LOCAL_REC_OFF_SLOT, varSlot);
-    self.localNameCnt += 1;
+    self._regLocal(peek64(self.nodeOff(stmt) + NODE_OFF_SVAL), self.nodeSLen(stmt), varSlot, 0 - 1);
 
     var crStart: int64 := self.lowerExpr(self.nodeC0(stmt));
     self.irAddInstrDirect(IRO_STORE_LOCAL, varSlot, crStart, -1, 0);
@@ -7526,6 +7689,11 @@ pub type IRLower = class {
         } else {
           self.irAddInstrDirect(IRO_STORE_IDX, aiIdx, valTemp, aiBase, 0);
         }
+      }
+      else {
+        // #2075: dasselbe wie in codegen_x86.lyx — kein stilles Verschwinden.
+        EPrintStrLn("lyxc: #2075: Zuweisungsziel ist weder Name noch Feld noch Element"c);
+        exit(1);
       }
     }
   }
@@ -9902,7 +10070,6 @@ pub type IRLower = class {
     return 0 - 1;
   }
 
-  // Rueckgabetyp-Node einer freien Funktion im aktuellen Modul.
   // ====================================================================
   // #1798: Anfangswerte von Modul-Konstanten falten
   //

@@ -20,10 +20,9 @@
 #
 # Auf dem IR-Weg (arm64, riscv) band #2020 auf Funktions- statt Blockebene,
 # ohne Verdeckung und ohne Methodenruempfe (#2074); zwei private gleichnamige
-# Funktionen zweier Units fielen dort zusammen (#2076). Seit beiden Fixes
-# laufen alle Faelle auf allen drei Zielen. Nur die Tupel-Rueckgabe einer
-# Nutzerfunktion kennt der IR-Weg nicht (#2080) — der Fall laeuft deshalb
-# nur auf x86_64 (`nur_x86`).
+# Funktionen zweier Units fielen dort zusammen (#2076), und die Tupel-
+# Rueckgabe einer Nutzerfunktion kannte er nicht (#2080). Seit diesen Fixes
+# laufen alle Faelle auf allen drei Zielen.
 set -uo pipefail
 ulimit -c 0   # ein Absturz unter qemu legt sonst eine .core-Datei ins Repo
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -65,7 +64,6 @@ pruefe() {  # $1 Beschreibung, $2 Quelle, $3 Soll (Zeilen mit |), $4 Ziele, $5 A
   done
 }
 alle_ziele() { pruefe "$1" "$2" "$3" "x86_64 arm64 riscv" "${4:-$TMP}"; }
-nur_x86()    { pruefe "$1" "$2" "$3" "x86_64" "${4:-$TMP}"; }
 
 echo "--- #2044 Repro A: zwei aeussere Funktionen mit je einer gleichnamigen inneren ---"
 # Woertlich aus dem Issue.
@@ -312,7 +310,7 @@ fn aussen(): int64 {
 fn main(): int64 { return aussen(); }
 EOF
 alle_ziele "Vorgabe 4 | f64 9 | Struct 1,2" "$TMP/signatur.lyx" "4|9|1|2|"
-# Tupel-Rueckgabe: der IR-Weg kennt sie fuer Nutzerfunktionen nicht (#2080).
+# Tupel-Rueckgabe: auf dem IR-Weg erst seit #2080.
 cat > "$TMP/tupel.lyx" <<'EOF'
 unit main;
 import std.io;
@@ -325,7 +323,7 @@ fn aussen(): int64 {
 }
 fn main(): int64 { return aussen(); }
 EOF
-nur_x86 "Tupel 3,5 (IR-Weg: #2080)" "$TMP/tupel.lyx" "3|5|"
+alle_ziele "Tupel 3,5" "$TMP/tupel.lyx" "3|5|"
 
 echo
 echo "--- die stdlib-Units mit inneren Funktionen uebersetzen ZUSAMMEN ---"
