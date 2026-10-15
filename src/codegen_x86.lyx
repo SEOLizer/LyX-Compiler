@@ -4496,6 +4496,15 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x45); self.cg_e8(0xF8);
     // xor rax, rax  (clear canary from register)
     self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
+    // #2081: rbx sichern. Nach SysV muss der GERUFENE rbx erhalten; der Codegen
+    // benutzt es aber als Arbeitsregister (linker Operand jeder Binaeroperation,
+    // Zieladresse indirekter Aufrufe). Fuer Lyx→Lyx war das unschaedlich, fuer
+    // einen C-Aufrufer nicht: qsort mit einer Lyx-Vergleichsfunktion und
+    // OpenSSL-Callbacks stuerzten ab. Der Slot liegt fest unter dem Canary
+    // ([rbp-16]); cg_emitEpilogue laedt ihn zurueck — beide muessen
+    // uebereinstimmen, auch in cg_emitPrologueNested.
+    self.frameSize += 8;
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x5D); self.cg_e8(0xF0);  // mov [rbp-16], rbx
     // #1370: --profile misst jede Funktion. Hier, nach dem Rahmenaufbau, sind
     // rax/rdx frei — die Argumentregister sind noch unberuehrt, weil sie erst
     // danach in den Rahmen gerettet werden.
@@ -4548,6 +4557,8 @@ pub type Codegen = class {
     var failPatch: int64 := self.codeLen;
     self.cg_e32(0);
     self.cg_addPatch(failPatch, "__lyx_stack_fail" as int64, 16, CG_PATCH_CALL);
+    // #2081: rbx des Aufrufers zurueck (gesichert im Prolog bei [rbp-16])
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x5D); self.cg_e8(0xF0);  // mov rbx, [rbp-16]
     // Normal epilogue
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xEC);  // mov rsp, rbp
     self.cg_e8(0x5D);  // pop rbp
@@ -4694,15 +4705,49 @@ pub type Codegen = class {
     return self.cg_fnAliasRetStructBytes(tp, tl);
   }
 
-  // #1595: Der duenne indirekte Aufruf kennt nur Registerargumente. Mit dem
-  // verdeckten Zeiger passt ein siebtes nicht mehr hinein. Das laut melden,
-  // statt still ein Argument fallen zu lassen.
-  fn cg_zuVieleIndirekt(fp: pchar, fl: int64) {
-    EPrintStr("error: codegen: indirekter Aufruf von '"c);
-    var zc: int64 := 0;
-    while (zc < fl) { PrintChar(StrCharAt(fp, zc)); zc := zc + 1; }
-    EPrintStrLn("' mit Struct-Rueckgabe und mehr als fuenf Argumenten"c);
-    exit(70);
+  // #2084: Argumente eines INDIREKTEN Aufrufs (ueber einen Funktionszeiger,
+  // eine Closure, ein Feld). Bis 1.2.13C kannten diese Wege nur Register-
+  // argumente: zwei meldeten ab dem siebten Argument faelschlich "Struct-
+  // Rueckgabe", vier verloren die ueberzaehligen Argumente STILL und liessen
+  // sie auf dem Stapel liegen. Jetzt dieselbe Anordnung wie beim direkten
+  // Aufruf (cg_genCall, "7+ param path") — die beiden muessen uebereinstimmen:
+  //   1. Stapelargumente, das letzte zuerst (SysV: das 7. liegt bei [rsp]),
+  //   2. ggf. verdeckte Werte des Aufrufers (Rueckgabezeiger),
+  //   3. Registerargumente in Reihenfolge — sie werden rueckwaerts gepoppt.
+  // `regPlaetze` = Register fuer explizite Argumente (6 minus verdeckte wie
+  // Rueckgabezeiger, Umgebung oder self). Nach dem `call` raeumt
+  // cg_popStackArgs(explizit + verdeckt) den Stapel.
+  fn cg_indirektStapelArgs(argNode: int64, regPlaetze: int64): int64 {
+    var n: int64 := 0;
+    var cur: int64 := argNode;
+    while (cur >= 0) { n := n + 1; cur := self.cg_nnext(cur); }
+    if (n <= regPlaetze) { return n; }
+    var buf: int64 := alloc(n * 8);
+    var i: int64 := 0;
+    cur := argNode;
+    while (cur >= 0) { poke64(buf + i * 8, cur); i := i + 1; cur := self.cg_nnext(cur); }
+    var j: int64 := n - 1;
+    while (j >= regPlaetze) {
+      self.cg_genExpr(peek64(buf + j * 8));
+      self.cg_pushRax();
+      j := j - 1;
+    }
+    free(buf, n * 8);
+    return n;
+  }
+
+  // Teil 3: die Registerargumente (die ersten regPlaetze) in Reihenfolge pushen.
+  // Liefert, wie viele es waren.
+  fn cg_indirektRegArgs(argNode: int64, regPlaetze: int64): int64 {
+    var k: int64 := 0;
+    var cur: int64 := argNode;
+    while (cur >= 0 && k < regPlaetze) {
+      self.cg_genExpr(cur);
+      self.cg_pushRax();
+      k := k + 1;
+      cur := self.cg_nnext(cur);
+    }
+    return k;
   }
 
   fn cg_indirektRetStructBytes(fp: pchar, fl: int64): int64 {
@@ -9133,20 +9178,81 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0x08);   // mov [rax+8], rcx (len)
   }
 
+  // #2078: Den Array-Zeiger fuer push/pop nach rcx laden bzw. rax dorthin
+  // zurueckschreiben — lokal ODER global. Bis 1.2.13C kannten push und pop
+  // nur Locals: fuer eine Modulvariable lieferte cg_findLocal 0, gelesen und
+  // beschrieben wurde [rbp+0] — der gesicherte Rahmenzeiger des Aufrufers.
+  // In main verpuffte push still (len blieb 0), aus einer Hilfsfunktion
+  // stuerzte das Programm ab, und `array<F>` sprang nach Adresse 0.
+  // Jede andere Form (Feld, Ausdruck) wird abgewiesen, statt in einen fremden
+  // Rahmen zu schreiben.
+  fn cg_arrZielPruefen(objNode: int64) {
+    if (self.cg_nkind(objNode) == CGN_IDENT) {
+      if (self.cg_findLocal(self.cg_nsval(objNode), self.cg_nslen(objNode)) != 0) { return; }
+      var zg: int64 := self.cg_findGlobalIdx(self.cg_nsval(objNode), self.cg_nslen(objNode));
+      if (zg >= 0) {
+        // Ein globales `[N]T` oder ein Array mit Startwert liegt im
+        // Datenbereich. Waechst es, gibt push den alten Block per munmap frei
+        // — mitten aus dem Datenbereich des Programms. Abweisen statt
+        // fremde Globale mitzureissen.
+        if (peek8(self.globalIsArray + zg) == 2) {
+          EPrintStr("error: codegen: push/pop auf ein Array fester Groesse auf Modulebene: '"c);
+          sys_write(2, self.cg_nsval(objNode) as int64, self.cg_nslen(objNode));
+          EPrintStrLn("' (#2078)"c);
+          EPrintStrLn("  Fuer ein wachsendes Array `var g: array<T>;` ohne Startwert deklarieren."c);
+          exit(1);
+        }
+        return;
+      }
+    }
+    EPrintStrLn("error: codegen: push/pop braucht ein lokales oder globales dynamisches Array als ersten Operanden (#2078)"c);
+    exit(1);
+  }
+  fn cg_arrPtrNachRcx(objNode: int64) {
+    var an: pchar := self.cg_nsval(objNode);
+    var al: int64 := self.cg_nslen(objNode);
+    var off: int64 := self.cg_findLocal(an, al);
+    if (off != 0) {
+      if (off >= -128 && off <= 127) {
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4D); self.cg_e8(off);
+      } else {
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x8D); self.cg_e32(off);
+      }
+      return;
+    }
+    self.cg_emitGlobalRead(an, al, self.cg_findGlobal(an, al));   // rax = Zeiger
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);        // mov rcx, rax
+  }
+  fn cg_arrPtrAusRax(objNode: int64) {
+    var an: pchar := self.cg_nsval(objNode);
+    var al: int64 := self.cg_nslen(objNode);
+    var off: int64 := self.cg_findLocal(an, al);
+    if (off != 0) { self.cg_storeRax(off); return; }
+    self.cg_emitGlobalWrite(an, al, self.cg_findGlobal(an, al));
+  }
+
+  // #2078: Ist dieser Typknoten ein DYNAMISCHES Array? Dieselbe Erkennung wie
+  // in cg_markArrayParam (61 = `T[]`, 60 mit Namen Array/array) — die beiden
+  // muessen uebereinstimmen.
+  fn cg_typIstDynArray(t: int64): int64 {
+    if (t < 0) { return 0; }
+    if (self.cg_nkind(t) == 61) { return 1; }
+    if (self.cg_nkind(t) == 60) {
+      var tn: pchar := self.cg_nsval(t);
+      var tl: int64 := self.cg_nslen(t);
+      if (self.cg_seq(tn, tl, "Array", 5) || self.cg_seq(tn, tl, "array", 5)) { return 1; }
+    }
+    return 0;
+  }
+
   fn cg_genArrayPush(objNode: int64, valNode: int64) {
-    var aname: pchar := self.cg_nsval(objNode);
-    var anlen: int64 := self.cg_nslen(objNode);
-    var off: int64 := self.cg_findLocal(aname, anlen);
+    self.cg_arrZielPruefen(objNode);   // #2078
     // Evaluate value → rax
     self.cg_genExpr(valNode);
     // push rax (save value)
     self.cg_e8(0x50);
-    // mov rcx, [rbp+off]  (load array ptr)
-    if (off >= -128 && off <= 127) {
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4D); self.cg_e8(off);
-    } else {
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x8D); self.cg_e32(off);
-    }
+    // rcx = Array-Zeiger (lokal oder global, #2078)
+    self.cg_arrPtrNachRcx(objNode);
     // test rcx, rcx
     self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC9);
     // jnz skip_alloc (rel32 placeholder)
@@ -9155,8 +9261,8 @@ pub type Codegen = class {
     self.cg_e32(0);
     // ---- #1177: dieselbe Folge wie bei der Deklaration ----
     self.cg_emitEmptyDynArray();
-    // store rax back to local variable
-    self.cg_storeRax(off);
+    // store rax back to the variable (lokal oder global, #2078)
+    self.cg_arrPtrAusRax(objNode);
     // mov rcx, rax
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);
     // ---- end mmap block ----
@@ -9292,9 +9398,9 @@ pub type Codegen = class {
 
     // pop rcx  (rcx = new_ptr) — stack: [rsp+0]=old_ptr [rsp+8]=value
     self.cg_e8(0x59);
-    // store new_ptr to local variable: mov rax,rcx → storeRax → mov rcx,rax
+    // store new_ptr to the variable: mov rax,rcx → (lokal/global, #2078) → mov rcx,rax
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC8);
-    self.cg_storeRax(off);
+    self.cg_arrPtrAusRax(objNode);
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);
     // add rsp, 8  (discard old_ptr) — stack: [rsp+0]=value
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x08);
@@ -9322,15 +9428,9 @@ pub type Codegen = class {
 
   // Inline code for arr.pop(): decrement len, return last element (0 if empty)
   fn cg_genArrayPop(objNode: int64) {
-    var aname: pchar := self.cg_nsval(objNode);
-    var anlen: int64 := self.cg_nslen(objNode);
-    var off: int64 := self.cg_findLocal(aname, anlen);
-    // Load array ptr into rcx
-    if (off >= -128 && off <= 127) {
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4D); self.cg_e8(off);
-    } else {
-      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x8D); self.cg_e32(off);
-    }
+    self.cg_arrZielPruefen(objNode);   // #2078
+    // Load array ptr into rcx (lokal oder global, #2078)
+    self.cg_arrPtrNachRcx(objNode);
     // test rcx, rcx; jz empty
     self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC9);
     self.cg_e8(0x0F); self.cg_e8(0x84);
@@ -10318,14 +10418,9 @@ pub type Codegen = class {
           }
         }
       }
-      var cpArg: int64 := self.cg_nc1(ni);
-      var cpArgc: int64 := 0;
-      while (cpArg >= 0) {
-        self.cg_genExpr(cpArg);
-        self.cg_pushRax();
-        cpArgc := cpArgc + 1;
-        cpArg := self.cg_nnext(cpArg);
-      }
+      // #2084: sechs Register, Rest Stapel — wie beim direkten Aufruf.
+      var cpN: int64 := self.cg_indirektStapelArgs(self.cg_nc1(ni), 6);
+      var cpArgc: int64 := self.cg_indirektRegArgs(self.cg_nc1(ni), 6);
       self.cg_genExpr(self.cg_nc0(ni));                       // rax = Codeadresse
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);   // mov rbx, rax
       if (cpArgc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9
@@ -10335,6 +10430,7 @@ pub type Codegen = class {
       if (cpArgc >= 2) { self.cg_popRsi(); }
       if (cpArgc >= 1) { self.cg_popRdi(); }
       self.cg_e8(0xFF); self.cg_e8(0xD3);                     // call rbx
+      self.cg_popStackArgs(cpN);                              // #2084
       return;
     } else if (k == CGN_NEW) {
       // #1255: `new T[n]` — Laenge erst zur LAUFZEIT bekannt (iVal-Bit 8, die
@@ -10585,6 +10681,9 @@ pub type Codegen = class {
             arrFixedSize := peek64(self.globalArraySize + gidx * 8);
             rowOuter := peek64(self.globalArrayRow + gidx * 8);   // #1230
           }
+          // #2078: dynamisches globales Array — Kopf ueberspringen, Groesse
+          // zur Laufzeit, wie beim Local.
+          if (gidx >= 0 && peek8(self.globalIsArray + gidx) == 1) { isArray := 1; }
         }
       } else if (self.cg_nkind(baseNode) == CGN_FIELD) {
         // Class field: check if it's Array<StructType>
@@ -10907,13 +11006,27 @@ pub type Codegen = class {
       } else {
         self.closureEnvPtrOff := 0;
       }
+      // #2084: Bis 1.2.13C endete diese Schleife nach FUENF Parametern —
+      // auch ohne Umgebung, wo sechs Register frei sind. Ein sechster oder
+      // siebter Parameter wurde nie als Local angelegt; sein Name fiel im
+      // Rumpf still auf 0. Jetzt dieselbe Anordnung wie bei der freien
+      // Funktion (cg_genFuncDecl, "L-4: stack params") — die beiden muessen
+      // uebereinstimmen: die Register, so viele es gibt (5 mit Umgebung,
+      // sonst 6), der Rest ab [rbp+16] vom Stapel des Aufrufers.
+      var cRegMax: int64 := 6;
+      if (numCap > 0) { cRegMax := 5; }
       var cparam: int64 := closureParams;
       var cparamIdx: int64 := 0;
-      while (cparam >= 0 && cparamIdx < 5) {
+      var cStapelOff: int64 := 16;
+      while (cparam >= 0) {
         var pname2: pchar := self.cg_nsval(cparam);
         var pnlen2: int64 := self.cg_nslen(cparam);
         var cpoff: int64 := self.cg_addLocal(pname2, pnlen2);
-        if (numCap > 0) {
+        if (cparamIdx >= cRegMax) {
+          self.cg_loadRax(cStapelOff);
+          self.cg_storeRax(cpoff);
+          cStapelOff += 8;
+        } else if (numCap > 0) {
           if (cparamIdx == 0) { self.cg_spillRsi(cpoff); }
           else if (cparamIdx == 1) { self.cg_spillRdx(cpoff); }
           else if (cparamIdx == 2) { self.cg_spillRcx(cpoff); }
@@ -10925,6 +11038,7 @@ pub type Codegen = class {
           else if (cparamIdx == 2) { self.cg_spillRdx(cpoff); }
           else if (cparamIdx == 3) { self.cg_spillRcx(cpoff); }
           else if (cparamIdx == 4) { self.cg_spillR8(cpoff); }
+          else if (cparamIdx == 5) { self.cg_spillR9(cpoff); }
         }
         cparamIdx += 1;
         cparam := self.cg_nnext(cparam);
@@ -11945,11 +12059,12 @@ pub type Codegen = class {
         if (gfIdx >= 0 && peek8(self.globalIsFnPtr + gfIdx) != 0) {
           var gfSret: int64 := self.cg_fnAliasRetStructBytes(fname, fnlen);
           if (gfSret <= 0) { gfSret := self.cg_globalRetStructBytes(fname, fnlen); }
-          var gfCur: int64 := argNode;
-          var gfArgc: int64 := 0;
-          gfArgc := gfArgc + self.cg_indirektSretVorschub(gfSret);
-          while (gfCur >= 0) { self.cg_genExpr(gfCur); self.cg_pushRax(); gfArgc := gfArgc + 1; gfCur := self.cg_nnext(gfCur); }
-          if (gfArgc > 6) { self.cg_zuVieleIndirekt(fname, fnlen); }
+          // #2084: Stapel-, verdeckte und Registerargumente wie beim direkten Aufruf.
+          var gfVerdeckt: int64 := 0;
+          if (gfSret > 0) { gfVerdeckt := 1; }
+          var gfN: int64 := self.cg_indirektStapelArgs(argNode, 6 - gfVerdeckt);
+          var gfArgc: int64 := self.cg_indirektSretVorschub(gfSret);
+          gfArgc := gfArgc + self.cg_indirektRegArgs(argNode, 6 - gfVerdeckt);
           self.cg_loadRaxGlobal(self.cg_findGlobal(fname, fnlen));   // rax = Codeadresse
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);      // mov rbx, rax
           if (gfArgc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }   // pop r9
@@ -11959,6 +12074,7 @@ pub type Codegen = class {
           if (gfArgc >= 2) { self.cg_popRsi(); }
           if (gfArgc >= 1) { self.cg_popRdi(); }
           self.cg_e8(0xFF); self.cg_e8(0xD3);                        // call rbx
+          self.cg_popStackArgs(gfN + gfVerdeckt);                    // #2084
           return;
         }
       }
@@ -11978,11 +12094,12 @@ pub type Codegen = class {
         }
         if (isThinFn != 0) {
           var tfSret: int64 := self.cg_indirektRetStructBytes(fname, fnlen);
-          var tfCur: int64 := argNode;
-          var tfArgc: int64 := 0;
-          tfArgc := tfArgc + self.cg_indirektSretVorschub(tfSret);
-          while (tfCur >= 0) { self.cg_genExpr(tfCur); self.cg_pushRax(); tfArgc := tfArgc + 1; tfCur := self.cg_nnext(tfCur); }
-          if (tfArgc > 6) { self.cg_zuVieleIndirekt(fname, fnlen); }
+          // #2084: Stapel-, verdeckte und Registerargumente wie beim direkten Aufruf.
+          var tfVerdeckt: int64 := 0;
+          if (tfSret > 0) { tfVerdeckt := 1; }
+          var tfN: int64 := self.cg_indirektStapelArgs(argNode, 6 - tfVerdeckt);
+          var tfArgc: int64 := self.cg_indirektSretVorschub(tfSret);
+          tfArgc := tfArgc + self.cg_indirektRegArgs(argNode, 6 - tfVerdeckt);
           self.cg_loadRax(clOff);                                 // rax = fn-Adresse (plain)
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);   // mov rbx, rax
           if (tfArgc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9
@@ -11992,17 +12109,13 @@ pub type Codegen = class {
           if (tfArgc >= 2) { self.cg_popRsi(); }
           if (tfArgc >= 1) { self.cg_popRdi(); }
           self.cg_e8(0xFF); self.cg_e8(0xD3);                     // call rbx
+          self.cg_popStackArgs(tfN + tfVerdeckt);                 // #2084
           return;
         }
-        // Evaluate explicit args and push them
-        var clCur: int64 := argNode;
-        var clArgc: int64 := 0;
-        while (clCur >= 0) {
-          self.cg_genExpr(clCur);
-          self.cg_pushRax();
-          clArgc += 1;
-          clCur := self.cg_nnext(clCur);
-        }
+        // Evaluate explicit args and push them. #2084: rdi traegt die Umgebung,
+        // fuer explizite Argumente bleiben fuenf Register; der Rest auf den Stapel.
+        var clN: int64 := self.cg_indirektStapelArgs(argNode, 5);
+        var clArgc: int64 := self.cg_indirektRegArgs(argNode, 5);
         // Load closure ptr from local
         self.cg_loadRax(clOff);           // rax = closure ptr {fnPtr, envPtr}
         // Load env ptr → rdi (hidden first arg)
@@ -12017,6 +12130,7 @@ pub type Codegen = class {
         if (clArgc >= 1) { self.cg_popRsi(); }
         // call rbx (indirect)
         self.cg_e8(0xFF); self.cg_e8(0xD3);  // call rbx
+        self.cg_popStackArgs(clN + 1);       // #2084: +1 = Umgebung in rdi
         return;
       }
     }
@@ -12046,9 +12160,9 @@ pub type Codegen = class {
         if (fpOff >= 0 && self.cg_fieldIsMethodType(fpClassIdx, fname, fnlen) != 0) {
           // B2: fat-call. Feld = Pointer auf heap-{code,data}. self=data→rdi (wie Methode),
           // explizite Args→rsi,rdx,... call code. argNode = cg_nc1 (isMethod==1).
-          var mcCur: int64 := argNode;
-          var mcArgc: int64 := 0;
-          while (mcCur >= 0) { self.cg_genExpr(mcCur); self.cg_pushRax(); mcArgc := mcArgc + 1; mcCur := self.cg_nnext(mcCur); }
+          // #2084: self (data) in rdi, explizite Argumente in fuenf Registern, Rest Stapel.
+          var mcN: int64 := self.cg_indirektStapelArgs(argNode, 5);
+          var mcArgc: int64 := self.cg_indirektRegArgs(argNode, 5);
           self.cg_genExpr(fpObj);                                     // rax = obj
           self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x80);       // mov rax, [rax+disp32] = p
           self.cg_e8(fpOff & 0xFF); self.cg_e8((fpOff >> 8) & 0xFF);
@@ -12061,13 +12175,14 @@ pub type Codegen = class {
           if (mcArgc >= 2) { self.cg_popRdx(); }
           if (mcArgc >= 1) { self.cg_popRsi(); }
           self.cg_e8(0xFF); self.cg_e8(0xD3);                         // call rbx
+          self.cg_popStackArgs(mcN + 1);                              // #2084: +1 = self
           return;
         }
         if (fpOff >= 0) {
           // explizite Args auswerten + pushen (argNode = cg_nc1 für isMethod==1)
-          var fpCur: int64 := argNode;
-          var fpArgc: int64 := 0;
-          while (fpCur >= 0) { self.cg_genExpr(fpCur); self.cg_pushRax(); fpArgc := fpArgc + 1; fpCur := self.cg_nnext(fpCur); }
+          // #2084: sechs Register, Rest Stapel.
+          var fpN: int64 := self.cg_indirektStapelArgs(argNode, 6);
+          var fpArgc: int64 := self.cg_indirektRegArgs(argNode, 6);
           // Objekt → rax; Fn-Adresse aus Feld → rbx
           self.cg_genExpr(fpObj);
           self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x98);   // mov rbx, [rax+disp32]
@@ -12081,6 +12196,7 @@ pub type Codegen = class {
           if (fpArgc >= 2) { self.cg_popRsi(); }
           if (fpArgc >= 1) { self.cg_popRdi(); }
           self.cg_e8(0xFF); self.cg_e8(0xD3);   // call rbx
+          self.cg_popStackArgs(fpN);            // #2084
           return;
         }
       }
@@ -12798,6 +12914,13 @@ pub type Codegen = class {
           var glidx: int64 := self.cg_findGlobalIdx(aname, anlen);
           if (glidx >= 0 && peek8(self.globalIsArray + glidx) == 2) {
             self.cg_movRaxImm(peek64(self.globalArraySize + glidx * 8));
+          } else if (glidx >= 0 && peek8(self.globalIsArray + glidx) == 1) {
+            // #2078: dynamisches globales Array. Vor dem ersten push ist der
+            // Zeiger 0 — dann ist die Laenge 0, nicht [0+8].
+            self.cg_genExpr(lenArgNi);                                          // rax = Array
+            self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);              // test rax, rax
+            self.cg_e8(0x74); self.cg_e8(0x04);                                // jz +4
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x40); self.cg_e8(0x08); // mov rax,[rax+8]
           } else {
             self.cg_zeroRax();
           }
@@ -16371,6 +16494,7 @@ pub type Codegen = class {
               lhsFixedSize := peek64(self.globalArraySize + wgidx * 8);
               lhsRowOuter := peek64(self.globalArrayRow + wgidx * 8);   // #1230
             }
+            if (wgidx >= 0 && peek8(self.globalIsArray + wgidx) == 1) { lhsIsArray := 1; }   // #2078
           }
         } else if (self.cg_nkind(lhsBase) == CGN_FIELD) {
           var lhsInner: int64 := self.cg_nc0(lhsBase);
@@ -17244,6 +17368,15 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x45); self.cg_e8(0xF8);
     // xor rax, rax
     self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xC0);
+    // #2081: rbx sichern. Nach SysV muss der GERUFENE rbx erhalten; der Codegen
+    // benutzt es aber als Arbeitsregister (linker Operand jeder Binaeroperation,
+    // Zieladresse indirekter Aufrufe). Fuer Lyx→Lyx war das unschaedlich, fuer
+    // einen C-Aufrufer nicht: qsort mit einer Lyx-Vergleichsfunktion und
+    // OpenSSL-Callbacks stuerzten ab. Der Slot liegt fest unter dem Canary
+    // ([rbp-16]); cg_emitEpilogue laedt ihn zurueck — beide muessen
+    // uebereinstimmen, auch in cg_emitPrologueNested.
+    self.frameSize += 8;
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x5D); self.cg_e8(0xF0);  // mov [rbp-16], rbx
     // Static link is already in [rbp+16] from caller
     return patchPos;
   }
@@ -21369,6 +21502,11 @@ pub type Codegen = class {
     // Switch to imported file's source and nodes for codegen
     var savedSrc:   pchar := self.pSrc;
     var savedNodes: int64 := self.pNodes;
+    // #2079: auch der Kopf der Deklarationskette. cg_genFile setzt ihn fuer
+    // die importierte Unit neu; blieb er danach stehen, lief cg_isDeclaredFunc
+    // im einbindenden Modul eine fremde Kette ab, fand die Funktion nicht,
+    // und `f as int64` wurde still 0.
+    var savedTopHead: int64 := self.topLevelHead;
     self.pSrc   := p.src;
     self.pNodes := p.nodes;
 
@@ -21413,6 +21551,7 @@ pub type Codegen = class {
     // Restore main file's source and nodes
     self.pSrc   := savedSrc;
     self.pNodes := savedNodes;
+    self.topLevelHead := savedTopHead;   // #2079
 
     self.cgAlias := cgaSaved; self.cgAliasLen := cgaSavedLen;   // #1262
     dispose p;
@@ -21935,6 +22074,17 @@ pub type Codegen = class {
             poke8(self.globalIsArray + gIdx, 3);
             aggKind := 3;
           }
+        }
+
+        // #2078: ein DYNAMISCHES Array (`array<T>`, `Array<T>`, `T[]`) ohne
+        // Startwert. Der Slot bleibt ein Zeiger, anfangs 0; der erste `push`
+        // legt den Block per mmap an (wie beim Local, cg_emitEmptyDynArray) und
+        // schreibt die Adresse zurueck. Bis 1.2.13C trug die Globale keinerlei
+        // Merkung: `len(g)` lieferte still 0, `g[0]` las den Slot selbst — also
+        // den Zeiger — als Element. Mit Merkung 1 laufen Laenge und Index wie
+        // beim lokalen dynamischen Array.
+        if (aggKind == 0 && self.cg_nc1(cur) < 0 && self.cg_typIstDynArray(gtNode) != 0) {
+          poke8(self.globalIsArray + gIdx, 1);
         }
 
         // Write initializer directly into data section
