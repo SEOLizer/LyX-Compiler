@@ -43,6 +43,16 @@ bauen() {  # $1 Quelle, $2 Ausgabe
   ( cd "$ROOT" && timeout 300 "$LYXC" --std-path="$ROOT" "$1" -o "$2" ) >"$TMP/bau.log" 2>&1
 }
 
+echo "--- die Unit laesst sich vorkompilieren (wie in make deb) ---"
+# `--compile-unit` prueft Sichtbarkeit strenger als ein Programm, das die Unit
+# importiert: SHA256_CTX_SIZE war in std.hash nicht pub, und make deb brach an
+# std/db/postgres.lyx ab, waehrend alle Programme mit der Unit liefen.
+if ( cd "$ROOT" && timeout 300 "$LYXC" --std-path="$ROOT" --compile-unit std/db/postgres.lyx -o "$TMP/pg.lyu" ) >"$TMP/cu.log" 2>&1; then
+  ok "lyxc --compile-unit std/db/postgres.lyx"
+else
+  nok "--compile-unit std/db/postgres.lyx: $(grep -m1 -iE 'error' "$TMP/cu.log")"
+fi
+
 echo "--- #2089: SCRAM-Rechnung am Testvektor aus RFC 7677, Abschnitt 3 (offline) ---"
 cat > "$TMP/rfc.lyx" <<'EOF'
 import std.db.postgres;
@@ -75,7 +85,15 @@ if [ -z "$PGBIN" ]; then
   nok "PostgreSQL (initdb) fehlt — die Live-Faelle wurden NICHT gemessen"
   echo; echo "Ergebnis: $PASS PASS, $FAIL FAIL"; [ "$FAIL" -eq 0 ]; exit
 fi
-PORT=$(( 20000 + RANDOM % 20000 ))
+# Freie Ports vergibt der Kernel (bind auf Port 0). Gewuerfelte Ports lagen im
+# ephemeren Bereich (32768–60999) und waren dort zeitweise von fremden
+# Verbindungen belegt — der Test scheiterte dann an "keine Verbindung".
+freier_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
+if ! command -v python3 >/dev/null 2>&1; then
+  nok "python3 fehlt (freier Port, Fake-Server) — die Live-Faelle wurden NICHT gemessen"
+  echo; echo "Ergebnis: $PASS PASS, $FAIL FAIL"; [ "$FAIL" -eq 0 ]; exit
+fi
+PORT=$(freier_port)
 PW_SCRAM="s$RANDOM$RANDOM"; PW_MD5="m$RANDOM$RANDOM"; PW_HOCH="h$RANDOM$RANDOM"
 echo "$PW_SCRAM" > "$TMP/pw"
 if ! "$PGBIN/initdb" -D "$TMP/data" -U lyxtest --auth=scram-sha-256 --pwfile="$TMP/pw" -E UTF8 >"$TMP/initdb.log" 2>&1; then
@@ -193,10 +211,10 @@ echo "--- #2089: ein Server, der FALSCH antwortet, wird abgewiesen ---"
 if command -v python3 >/dev/null 2>&1; then
 cat > "$TMP/fake.py" <<'PY'
 import socket, struct, sys
-modus, port = sys.argv[1], int(sys.argv[2])
+modus = sys.argv[1]
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", port)); s.listen(1)
-print("bereit", flush=True)
+s.bind(("127.0.0.1", 0)); s.listen(1)          # Port vergibt der Kernel
+print("bereit", s.getsockname()[1], flush=True)
 c, _ = s.accept()
 def recv_exact(n):
     b = b""
@@ -222,9 +240,10 @@ try: c.recv(16)
 except Exception: pass
 PY
   for modus in falsch ohne; do
-    FPORT=$(( 40000 + RANDOM % 20000 ))
-    python3 "$TMP/fake.py" "$modus" "$FPORT" > "$TMP/fake.out" 2>&1 & FAKEPID=$!
+    python3 "$TMP/fake.py" "$modus" > "$TMP/fake.out" 2>&1 & FAKEPID=$!
     for _ in $(seq 1 50); do grep -q bereit "$TMP/fake.out" 2>/dev/null && break; sleep 0.2; done
+    FPORT="$(awk '/bereit/ {print $2}' "$TMP/fake.out")"
+    if [ -z "$FPORT" ]; then nok "Fake-Server ($modus) startet nicht: $(head -1 "$TMP/fake.out")"; kill "$FAKEPID" 2>/dev/null; continue; fi
     cat > "$TMP/fake.lyx" <<EOF
 import std.db.postgres;
 fn main(): int64 {
