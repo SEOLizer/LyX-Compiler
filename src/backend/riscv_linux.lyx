@@ -61,7 +61,8 @@ con RV_SYS_CLOSE:  int64 := 57;
 // wird VOR den Code kopiert; der Datenbereich muss deshalb um genau diese
 // Laenge versetzt auf eine Seitengrenze fallen.
 // #2035: wird ausserhalb dieser Unit gebraucht.
-pub con RV_START_STUB_LEN: int64 := 12;
+// #2110: 16 seit dem ersten Befehl, der argv fuer GetArgC/GetArgV sichert.
+pub con RV_START_STUB_LEN: int64 := 16;
 
 // Branch patch types
 con RV_PATCH_J:   int64 := 0;   // JAL x0, label  (unconditional)
@@ -1472,6 +1473,36 @@ pub type EmitRISCV64 = class {
       self.rv_LD(RV_A3, RV_FP, self.slotOff(sBase + 2));     // mode
       self.rv_LI(RV_A7, RV_SYS_OPEN);                        // 56 = openat
       self.rv_ECALL();
+    } else if id == 17 {
+      // #2110: GetArgC — die argv-Zeiger ab s10 bis zum abschliessenden NULL
+      // zaehlen (argv[argc] ist nach der Linux-ABI NULL). Dieselbe Rechnung
+      // wie im Linux-Zweig von emit_arm64.lyx, die beiden muessen
+      // uebereinstimmen.
+      self.rv_MV(RV_T0, 26);                                 // t0 = argv (s10)
+      self.rv_LI(RV_A0, 0);
+      var gaLoop: int64 := self.codeLen;
+      self.rv_LD(RV_T1, RV_T0, 0);
+      self.rv_BEQZ_fwd(RV_T1, 16);                           // NULL → hinter die Schleife
+      self.rv_ADDI(RV_A0, RV_A0, 1);
+      self.rv_ADDI(RV_T0, RV_T0, 8);
+      self.rv_JAL_x0(gaLoop - self.codeLen);
+    } else if id == 18 {
+      self.rv_MV(RV_A0, 26);                                 // #2110: GetArgV = s10
+    } else if id == 235 {
+      // #2110: ArgvGet(argv, i) — dieselbe Rechnung wie im Linux-Zweig von
+      // emit_arm64.lyx: argv[i], ein NULL vor dem Index liefert 0.
+      self.rv_LD(RV_T0, RV_FP, self.slotOff(sBase));         // argv
+      self.rv_LD(RV_T1, RV_FP, self.slotOff(sBase + 1));     // i
+      var avLoop: int64 := self.codeLen;
+      self.rv_BEQZ_fwd(RV_T1, 24);                           // i == 0 → nehmen
+      self.rv_LD(RV_T2, RV_T0, 0);
+      self.rv_BEQZ_fwd(RV_T2, 24);                           // NULL → 0
+      self.rv_ADDI(RV_T0, RV_T0, 8);
+      self.rv_ADDI(RV_T1, RV_T1, 0 - 1);
+      self.rv_JAL_x0(avLoop - self.codeLen);
+      self.rv_LD(RV_A0, RV_T0, 0);                           // nehmen
+      self.rv_JAL_x0(8);
+      self.rv_LI(RV_A0, 0);
     } else if id == 221 || id == 224 || id == 225 || id == 226 || id == 227 {
       // #2104: close / rename / unlink / mkdir / exit — dieselbe Rechnung wie
       // im Linux-Zweig von emit_arm64.lyx, die beiden muessen uebereinstimmen
@@ -2066,15 +2097,22 @@ pub type RiscvLinuxBackend = class {
     self.rlb_ce8(v >> 24);
   }
 
-  // _start stub (12 bytes):
-  //   JAL ra, RV_START_STUB_LEN + mainOff   (call main)
+  // _start stub (16 bytes):
+  //   ADDI s10, sp, 8                       (#2110: argv sichern)
+  //   JAL ra, RV_START_STUB_LEN + mainOff - 4   (call main)
   //   ADDI a7, x0, 93     = 0x05D00893  (exit syscall)
   //   ECALL               = 0x00000073
   //
   // #1740: Der Sprung ging fest auf Offset 12, also auf die zuerst erzeugte
   // Funktion. Das ist nur dann main, wenn main auch als erste dasteht.
   fn rlb_emitStart(mainOff: int64) {
-    var off: int64 := RV_START_STUB_LEN + mainOff;
+    // #2110: argv = sp + 8 nach s10 (x26). Beim Eintritt zeigt sp auf argc,
+    // dahinter die argv-Zeiger und ein NULL (Linux-ABI). s10 ist callee-saved
+    // und wird vom erzeugten Code nie benutzt (s11 ist seit #2061 das
+    // Hilfsregister); C-Code erhaelt es nach der ABI. GetArgC zaehlt bis zum
+    // NULL, GetArgV liefert s10 — dieselbe Auskunft wie emitArgcArgv auf lyxos.
+    self.rlb_ce32(0x00810D13);  // ADDI s10, sp, 8
+    var off: int64 := RV_START_STUB_LEN + mainOff - 4;   // JAL steht bei Offset 4
     var b20:    int64 := (off >> 20) & 0x1;
     var b10_1:  int64 := (off >> 1)  & 0x3FF;
     var b11:    int64 := (off >> 11) & 0x1;
