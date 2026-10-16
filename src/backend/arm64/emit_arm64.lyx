@@ -133,6 +133,15 @@ pub type EmitARM64 = class {
   externCount: int64;
   externCap:   int64;
 
+  // #2117: Aufrufstellen externer Funktionen in einer .so — 16-Byte-Saetze
+  // {instrOff, externIdx}. Statt des GOT-Platzes MITTEN IM CODE (eine
+  // Text-Relocation: bionic lehnt sie ab API 23 ab, und ohne DT_TEXTREL
+  // schreibt der Lader in ein R-X-Segment) steht hier ADRP+LDR auf einen
+  // GOT-Platz im RW-Segment; writeELFSharedLib traegt die Distanz nach.
+  gotCallBuf:   int64;
+  gotCallCount: int64;
+  gotCallCap:   int64;
+
   // WP-D2: Windows target mode — replaces Linux syscalls with BL placeholders
   // that WinARM64Backend resolves to Windows API helper stubs after emit().
   // winPatchBuf holds 16-byte records: {codeOffset:i64, helperId:i64}.
@@ -172,6 +181,9 @@ pub type EmitARM64 = class {
     self.globalRelocCap   := 32;
     self.globalRelocBuf   := alloc(self.globalRelocCap * 16);
     self.globalRelocCount := 0;
+    self.gotCallCap   := 16;                    // #2117
+    self.gotCallBuf   := alloc(self.gotCallCap * 16);
+    self.gotCallCount := 0;
 
     self.externCap   := 64;
     self.externBuf   := alloc(self.externCap * 32);
@@ -220,6 +232,8 @@ pub type EmitARM64 = class {
   }
 
   fn getRelocBuf(): int64   { return self.relocBuf; }
+  fn getGotCallBuf(): int64   { return self.gotCallBuf; }     // #2117
+  fn getGotCallCount(): int64 { return self.gotCallCount; }   // #2117
   fn getRelocCount(): int64 { return self.relocCount; }
 
   // WP-AND-02 Phase C: append an Elf64_Rela record. r_info packs (sym_idx<<32)|type.
@@ -824,18 +838,40 @@ pub type EmitARM64 = class {
   }
 
   fn emitLoadGlobal(addr: int64, dest: int64) {
-    // IRO_LOAD_GLOBAL trägt einen globalIdx (NICHT eine VA). Beide Modi (shared-lib UND
-    // static) emittieren eine literal-pool-Sequenz mit Platzhalter-Slot und merken sich
-    // (slotOff, globalIdx) in globalRelocBuf. writeELFSharedLib bäckt + R_AARCH64_RELATIVE;
-    // writeELF (static) bäckt die absolute VA direkt (file-offset==vaddr, fixer Lade-Offset).
+    // IRO_LOAD_GLOBAL trägt einen globalIdx (NICHT eine VA).
     // ARM64-FIX: vorher MOVte der static-Pfad globalIdx als VA → LDR [0] → SIGSEGV.
+    self._emitGlobalAddrX9(addr);
+    self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // x9 := Adresse der Modulvariable gIdx. Die eine Stelle fuer Lesen, Schreiben
+  // und `@g` (#2116) — die drei muessen dieselbe Adresse treffen.
+  //
+  // Statisch: Literal-Pool-Platz (LDR x9,[pc+8]; B +12; .quad), writeELF baeckt
+  // die absolute VA hinein; globalRelocBuf merkt {Platz-Offset, gIdx}.
+  //
+  // #2117, .so: ADRP x9 + ADD x9,x9,#lo12 — PC-relativ, writeELFSharedLib
+  // traegt die Distanz ein, und es bleibt KEINE Relocation. Vorher stand auch
+  // hier ein Pool-Platz im Code, den eine R_AARCH64_RELATIVE beim Laden
+  // umschreiben sollte: eine Text-Relocation im R-X-Segment, die bionic ab
+  // API 23 abweist. Der Schreibzugriff (_emitStoreGlobalPIC) gab dazu als
+  // Addend den INDEX statt der Adresse an — `g := 1` schrieb nach
+  // Ladeadresse+8*0, in den ELF-Kopf. globalRelocBuf merkt hier
+  // {ADRP-Offset, gIdx}; die Bedeutung des ersten Felds haengt am Modus.
+  fn _emitGlobalAddrX9(gIdx: int64) {
+    if self.isSharedLib != 0 {
+      var instrOff: int64 := self.codeLen;
+      self.emit32(0x90000009);         // ADRP x9, 0          (nachgetragen)
+      self.emit32(0x91000129);         // ADD  x9, x9, #0     (nachgetragen)
+      self._recordGlobalReloc(instrOff, gIdx);
+      return;
+    }
     var slotOff: int64 := self.codeLen + 8;
     self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]
     self.emit32(0x14000003);         // B +12
-    self.emit64(0);                   // placeholder slot (gebacken in writeELF*)
-    self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
-    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
-    self._recordGlobalReloc(slotOff, addr);
+    self.emit64(0);                   // placeholder slot (gebacken in writeELF)
+    self._recordGlobalReloc(slotOff, gIdx);
   }
 
   // #2116: `@x` auf ein Local/Param — die Adresse des Slots, x29 + slotOff.
@@ -847,16 +883,11 @@ pub type EmitARM64 = class {
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
-  // #2116: `@g` auf eine Modulvariable — dieselbe Literal-Pool-Folge wie
-  // emitLoadGlobal (die beiden muessen uebereinstimmen), nur ohne den Ladebefehl:
-  // x9 traegt danach die Adresse selbst.
+  // #2116: `@g` auf eine Modulvariable — dieselbe Adressfolge wie
+  // emitLoadGlobal (_emitGlobalAddrX9), nur ohne den Ladebefehl.
   fn emitLoadGlobalAddr(addr: int64, dest: int64) {
-    var slotOff: int64 := self.codeLen + 8;
-    self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]
-    self.emit32(0x14000003);         // B +12
-    self.emit64(0);                   // placeholder slot (gebacken in writeELF*)
+    self._emitGlobalAddrX9(addr);
     self.emitStur(9, ARM64_X29, self.slotOff(dest));
-    self._recordGlobalReloc(slotOff, addr);
   }
 
   // Merkt (slotCodeOff, globalIdx) für späteres Backen durch writeELF*/writeELFSharedLib.
@@ -879,53 +910,10 @@ pub type EmitARM64 = class {
   }
 
   fn emitStoreGlobal(src: int64, addr: int64) {
-    if self.isSharedLib != 0 {
-      self._emitStoreGlobalPIC(src, addr);
-      return;
-    }
-    // ARM64-FIX (static): literal-pool-Slot (gIdx-Platzhalter) → writeELF bäckt VA.
-    // Vorher MOVte addr(=gIdx) als VA → STR [0] → SIGSEGV.
-    var slotOff: int64 := self.codeLen + 8;
-    self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]  (Adresse aus Slot)
-    self.emit32(0x14000003);         // B +12  (über .quad)
-    self.emit64(0);                   // placeholder slot (gebacken in writeELF)
-    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));  // x0 = value
+    // ARM64-FIX (static): Vorher MOVte addr(=gIdx) als VA → STR [0] → SIGSEGV.
+    self._emitGlobalAddrX9(addr);
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));  // x0 = value (fern: x16, nie x9)
     self.emit32(0xF9000120);          // STR x0, [x9]
-    self._recordGlobalReloc(slotOff, addr);
-  }
-
-  // WP-AND-02 Phase C: PIC-friendly global load using an inline literal pool.
-  // Layout (24 bytes total, identical size to the MOVZ/MOVK variant):
-  //   +0  LDR x9, [pc + 8]   ; loads the 8-byte slot at +8
-  //   +4  B  +12             ; jump past the slot
-  //   +8  .quad <addr>       ; slot, patched by R_AARCH64_RELATIVE at load time
-  //  +16  LDR x0, [x9]       ; dereference
-  //  +20  STUR x0, [fp, -slot]
-  fn _emitLoadGlobalPIC(addr: int64, dest: int64) {
-    var slotOff: int64 := self.codeLen + 8;   // slot's offset within codeBuf
-    // LDR x9 (=9), literal at +8: imm19 = 2 → 2<<5 = 0x40
-    self.emit32(0x58000040 | 9);
-    // B +12 (3 instructions ahead): imm26 = 3
-    self.emit32(0x14000003);
-    // 8-byte slot for the resolved address. The dynamic loader rewrites this
-    // to (load_base + addend) via R_AARCH64_RELATIVE; we store `addr` as the
-    // addend AND as the initial slot value (the loader overwrites anyway).
-    self.emit64(addr);
-    self._recordRelocation(slotOff, 1027, addr);  // 1027 = R_AARCH64_RELATIVE
-    // LDR x0, [x9]
-    self.emit32(0xF9400120 | ARM64_X0);
-    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
-  }
-
-  fn _emitStoreGlobalPIC(src: int64, addr: int64) {
-    var slotOff: int64 := self.codeLen + 8;
-    self.emit32(0x58000040 | 9);    // LDR x9, [pc+8]
-    self.emit32(0x14000003);        // B +12
-    self.emit64(addr);
-    self._recordRelocation(slotOff, 1027, addr);
-    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
-    // STR x0, [x9]
-    self.emit32(0xF9000120);
   }
 
   fn emitLoadField(base: int64, fieldOff: int64, dest: int64) {
@@ -1055,6 +1043,26 @@ pub type EmitARM64 = class {
       poke64(nbase + 24, libLen);
       externIdx := self.externCount;
       self.externCount := self.externCount + 1;
+    }
+    // #2117, .so: ADRP x9 + LDR x9,[x9,#lo12] auf den GOT-Platz im
+    // RW-Segment; writeELFSharedLib legt ihn an, setzt R_AARCH64_GLOB_DAT
+    // darauf und traegt die Distanz hier nach. Kein Platz im Code.
+    if self.isSharedLib != 0 {
+      if self.gotCallCount >= self.gotCallCap {
+        var gnc: int64 := self.gotCallCap * 2;
+        var gnb: int64 := alloc(gnc * 16);
+        memcpy(gnb, self.gotCallBuf, self.gotCallCount * 16);
+        self.gotCallBuf := gnb; self.gotCallCap := gnc;
+      }
+      var grec: int64 := self.gotCallBuf + self.gotCallCount * 16;
+      poke64(grec + 0, self.codeLen);
+      poke64(grec + 8, externIdx);
+      self.gotCallCount := self.gotCallCount + 1;
+      self.emit32(0x90000009);        // ADRP x9, 0             (nachgetragen)
+      self.emit32(0xF9400129);        // LDR  x9, [x9, #0]      (nachgetragen)
+      self.emit32(0xD63F0120);        // BLR x9
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+      return;
     }
     // Inline GOT slot: LDR x9,[pc+8]; B +12; .quad 0; BLR x9
     // ld.so writes the resolved symbol address into the .quad (GLOB_DAT).
