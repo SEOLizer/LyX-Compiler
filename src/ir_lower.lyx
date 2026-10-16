@@ -773,6 +773,14 @@ pub type IRLower = class {
   // und der IR-Weg ist bei grossen Units ohnehin langsam (#2023).
   irPrivTab:    int64;
   irPubConTab:  int64;   // #2107
+  // #2023: extern-Deklarationen je Knotentabelle, vorab gesammelt (s. lowerCall).
+  exOwnNodes:   int64;
+  exOwnCnt:     int64;
+  exOwnList:    int64;
+  exOwnN:       int64;
+  exImpList:    int64;   // Paare (Importindex, Knoten)
+  exImpN:       int64;
+  exImpSum:     int64;   // Summe der Knotenzahlen beim Sammeln (Gueltigkeit)
   irPubConCnt:  int64;
   irPubConCap:  int64;
   irPrivCnt:    int64;
@@ -2828,24 +2836,51 @@ pub type IRLower = class {
     // Text wird darum interniert, WAEHREND deren Tabellen eingesetzt sind.
     // Mit der eigenen Quelle gelesen ergaebe sich ein plausibler, aber
     // falscher Bibliotheksname — ein stiller Default.
-    var exNi: int64 := -1;
-    var exScan: int64 := 0;
-    while exScan < self.nodeCount {
-      if self.nodeKind(exScan) == NK_FUNC_DECL && self._istExternDecl(exScan) != 0 {
-        if self.nodeSLen(exScan) == fnlen {
-          var exNamePtr: pchar := self.nodeSVal(exScan);
-          var exMatch: int64 := 1;
-          var exJ: int64 := 0;
-          while exJ < fnlen {
-            if exMatch != 0 {
-              if peek8((exNamePtr as int64) + exJ) != peek8((fname as int64) + exJ) { exMatch := 0; }
-            }
-            exJ += 1;
-          }
-          if exMatch != 0 { exNi := exScan; exScan := self.nodeCount; }
-        }
+    // #2023: Bis 1.2.14A lief diese Suche bei JEDEM Aufruf ueber die ganze
+    // Knotentabelle der Unit und darunter ueber die aller Importe — vor der
+    // Builtin-Behandlung, also auch fuer jedes poke64. Bei grossen Units
+    // (std/unicode_data.lyx: 7007 Zeilen) war das quadratisch: 400 s fuer
+    // arm64 gegen 6 s auf dem x86-Weg. Jetzt werden die extern-Deklarationen
+    // je Tabelle EINMAL gesammelt — in Tabellenreihenfolge, der erste Treffer
+    // bleibt also derselbe — und nur noch diese Liste durchsucht. Gueltig,
+    // solange Tabelle und Knotenzahl dieselben sind.
+    if self.exOwnNodes != self.nodes || self.exOwnCnt != self.nodeCount {
+      var exZ: int64 := 0;
+      var exK: int64 := 0;
+      while exK < self.nodeCount {
+        if self.nodeKind(exK) == NK_FUNC_DECL && self._istExternDecl(exK) != 0 { exZ := exZ + 1; }
+        exK := exK + 1;
       }
-      exScan += 1;
+      self.exOwnList := alloc(exZ * 8 + 8);
+      self.exOwnN := 0;
+      exK := 0;
+      while exK < self.nodeCount {
+        if self.nodeKind(exK) == NK_FUNC_DECL && self._istExternDecl(exK) != 0 {
+          poke64(self.exOwnList + self.exOwnN * 8, exK);
+          self.exOwnN := self.exOwnN + 1;
+        }
+        exK := exK + 1;
+      }
+      self.exOwnNodes := self.nodes;
+      self.exOwnCnt := self.nodeCount;
+    }
+    var exNi: int64 := -1;
+    var exLi: int64 := 0;
+    while exLi < self.exOwnN {
+      var exScan: int64 := peek64(self.exOwnList + exLi * 8);
+      exLi += 1;
+      if self.nodeSLen(exScan) == fnlen {
+        var exNamePtr: pchar := self.nodeSVal(exScan);
+        var exMatch: int64 := 1;
+        var exJ: int64 := 0;
+        while exJ < fnlen {
+          if exMatch != 0 {
+            if peek8((exNamePtr as int64) + exJ) != peek8((fname as int64) + exJ) { exMatch := 0; }
+          }
+          exJ += 1;
+        }
+        if exMatch != 0 { exNi := exScan; exLi := self.exOwnN; }
+      }
     }
     // #2043: im eigenen Modul nicht gefunden — dann in den Importen nachsehen.
     // Gefunden wird hier nicht nur der Knoten, sondern gleich der internierte
@@ -2857,41 +2892,74 @@ pub type IRLower = class {
       var exSaveS: pchar := self.src;
       var exSaveN: int64 := self.nodes;
       var exSaveC: int64 := self.nodeCount;
-      var exM: int64 := 0;
-      while exM < self.impLstN {
+      // #2023: dieselbe Vorab-Liste fuer die Importe — (Importindex, Knoten)
+      // in der Reihenfolge der alten Doppelschleife.
+      var exSumme: int64 := 0;
+      var exQ: int64 := 0;
+      while exQ < self.impLstN { exSumme := exSumme + peek64(self.impLstCnt + exQ * 8); exQ := exQ + 1; }
+      if self.exImpList == 0 || self.exImpSum != exSumme {
+        var exZ2: int64 := 0;
+        exQ := 0;
+        while exQ < self.impLstN {
+          self.nodes     := peek64(self.impLstNodes + exQ * 8);
+          self.nodeCount := peek64(self.impLstCnt + exQ * 8);
+          var exK2: int64 := 0;
+          while exK2 < self.nodeCount {
+            if self.nodeKind(exK2) == NK_FUNC_DECL && self._istExternDecl(exK2) != 0 { exZ2 := exZ2 + 1; }
+            exK2 := exK2 + 1;
+          }
+          exQ := exQ + 1;
+        }
+        self.exImpList := alloc(exZ2 * 16 + 16);
+        self.exImpN := 0;
+        exQ := 0;
+        while exQ < self.impLstN {
+          self.nodes     := peek64(self.impLstNodes + exQ * 8);
+          self.nodeCount := peek64(self.impLstCnt + exQ * 8);
+          var exK3: int64 := 0;
+          while exK3 < self.nodeCount {
+            if self.nodeKind(exK3) == NK_FUNC_DECL && self._istExternDecl(exK3) != 0 {
+              poke64(self.exImpList + self.exImpN * 16, exQ);
+              poke64(self.exImpList + self.exImpN * 16 + 8, exK3);
+              self.exImpN := self.exImpN + 1;
+            }
+            exK3 := exK3 + 1;
+          }
+          exQ := exQ + 1;
+        }
+        self.exImpSum := exSumme;
+        self.nodes := exSaveN; self.nodeCount := exSaveC;
+      }
+      var exE: int64 := 0;
+      while exE < self.exImpN {
+        var exM: int64 := peek64(self.exImpList + exE * 16);
+        var exS2: int64 := peek64(self.exImpList + exE * 16 + 8);
+        exE += 1;
         self.src       := peek64(self.impLstSrc + exM * 8) as pchar;
         self.nodes     := peek64(self.impLstNodes + exM * 8);
         self.nodeCount := peek64(self.impLstCnt + exM * 8);
-        var exS2: int64 := 0;
-        while exS2 < self.nodeCount {
-          if self.nodeKind(exS2) == NK_FUNC_DECL && self._istExternDecl(exS2) != 0 {
-            if self.nodeSLen(exS2) == fnlen {
-              var exP2: pchar := self.nodeSVal(exS2);
-              var exOk: int64 := 1;
-              var exJ2: int64 := 0;
-              while exJ2 < fnlen {
-                if exOk != 0 {
-                  if peek8((exP2 as int64) + exJ2) != peek8((fname as int64) + exJ2) { exOk := 0; }
-                }
-                exJ2 += 1;
-              }
-              if exOk != 0 {
-                var exPk: int64 := self.nodeC3(exS2);
-                var exLo: int64 := exPk & 0xFFFFFFFF;
-                var exLl: int64 := (exPk >> 32) & 0xFFFFFFFF;
-                // JETZT internieren, solange self.src die Quelle der
-                // deklarierenden Unit ist.
-                exLibVorab    := self.irAddString((self.src as int64 + exLo) as pchar, exLl);
-                exLibVorabLen := exLl;
-                exNi := exS2;
-                exS2 := self.nodeCount;
-                exM  := self.impLstN;
-              }
+        if self.nodeSLen(exS2) == fnlen {
+          var exP2: pchar := self.nodeSVal(exS2);
+          var exOk: int64 := 1;
+          var exJ2: int64 := 0;
+          while exJ2 < fnlen {
+            if exOk != 0 {
+              if peek8((exP2 as int64) + exJ2) != peek8((fname as int64) + exJ2) { exOk := 0; }
             }
+            exJ2 += 1;
           }
-          exS2 += 1;
+          if exOk != 0 {
+            var exPk: int64 := self.nodeC3(exS2);
+            var exLo: int64 := exPk & 0xFFFFFFFF;
+            var exLl: int64 := (exPk >> 32) & 0xFFFFFFFF;
+            // JETZT internieren, solange self.src die Quelle der
+            // deklarierenden Unit ist.
+            exLibVorab    := self.irAddString((self.src as int64 + exLo) as pchar, exLl);
+            exLibVorabLen := exLl;
+            exNi := exS2;
+            exE  := self.exImpN;
+          }
         }
-        exM += 1;
       }
       self.src := exSaveS; self.nodes := exSaveN; self.nodeCount := exSaveC;
     }

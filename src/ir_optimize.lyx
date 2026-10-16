@@ -28,6 +28,14 @@ pub type IROptimize = class {
   optLevel:  int64;  // WP-AS-06: 0=none, 1=min, 2=default, 3=aggressive (mirrors CompilerConfig.optLevel)
   fnStart: int64;    // instruction index where current function starts (inclusive)
   fnEnd: int64;      // instruction index where current function ends (exclusive)
+  // #2023: je Durchlauf vorab berechnet — fuer jedes Ziel d der ERSTE Befehl
+  // der Funktion mit dest == d und op CONST_INT / CONST_FLOAT / MOVE (-1 =
+  // keiner). Ersetzt die Volldurchsuchung je Operand in isConstInt,
+  // getConstValue, getConstFloatValue, setConstDefValue und traceCopy.
+  defMax:    int64;
+  defConst:  int64;
+  defFloat:  int64;
+  defMove:   int64;
 
   fn init(irMod: IRModule) {
     self.ir := irMod;
@@ -101,6 +109,7 @@ pub type IROptimize = class {
   // Fold constant expressions: irConstInt(3) irAdd irConstInt(4) → irConstInt(7)
   
   fn constantFolding(): int64 {
+    self._defBaue();   // #2023
     var i: int64 := self.fnStart;
 
     while (i < self.fnEnd) {
@@ -119,7 +128,7 @@ pub type IROptimize = class {
           if (op == IRO_SUB) { result := c1 - c2; }
           if (op == IRO_MUL) { result := c1 * c2; }
           // Replace with constant
-          self.setInstrOp(i, IRO_CONST_INT);
+          self.setInstrOp(i, IRO_CONST_INT); self._defNeuKonst(i);
           self.setInstrImmInt(i, result);
           self.setInstrSrc1(i, -1);
           self.setInstrSrc2(i, -1);
@@ -135,7 +144,7 @@ pub type IROptimize = class {
           var result: int64 := 0;
           if (op == IRO_DIV) { result := c1 / c2; }
           if (op == IRO_MOD) { result := c1 % c2; }
-          self.setInstrOp(i, IRO_CONST_INT);
+          self.setInstrOp(i, IRO_CONST_INT); self._defNeuKonst(i);
           self.setInstrImmInt(i, result);
           self.setInstrSrc1(i, -1);
           self.setInstrSrc2(i, -1);
@@ -156,7 +165,7 @@ pub type IROptimize = class {
           if (op == IRO_CMP_LE) { if (c1 <= c2) { result := 1; } else { result := 0; } }
           if (op == IRO_CMP_GT) { if (c1 > c2) { result := 1; } else { result := 0; } }
           if (op == IRO_CMP_GE) { if (c1 >= c2) { result := 1; } else { result := 0; } }
-          self.setInstrOp(i, IRO_CONST_INT);
+          self.setInstrOp(i, IRO_CONST_INT); self._defNeuKonst(i);
           self.setInstrImmInt(i, result);
           self.setInstrSrc1(i, -1);
           self.setInstrSrc2(i, -1);
@@ -178,7 +187,7 @@ pub type IROptimize = class {
       if (op == IRO_NEG) {
         if (self.isConstInt(src1)) {
           var c1: int64 := self.getConstValue(src1);
-          self.setInstrOp(i, IRO_CONST_INT);
+          self.setInstrOp(i, IRO_CONST_INT); self._defNeuKonst(i);
           self.setInstrImmInt(i, 0 - c1);
           self.setInstrSrc1(i, -1);
           self.changed += 1;
@@ -188,7 +197,7 @@ pub type IROptimize = class {
       if (op == IRO_NOT) {
         var c1: int64 := self.getConstValue(src1);
         if (self.isConstInt(src1)) {
-          self.setInstrOp(i, IRO_CONST_INT);
+          self.setInstrOp(i, IRO_CONST_INT); self._defNeuKonst(i);
           if (c1 == 0) { self.setInstrImmInt(i, 1); } else { self.setInstrImmInt(i, 0); }
           self.setInstrSrc1(i, -1);
           self.changed += 1;
@@ -204,7 +213,7 @@ pub type IROptimize = class {
           if (op == IRO_AND)  { result := c1 & c2; }
           if (op == IRO_OR)   { result := c1 | c2; }
           if (op == IRO_XOR)  { result := c1 ^ c2; }
-          self.setInstrOp(i, IRO_CONST_INT);
+          self.setInstrOp(i, IRO_CONST_INT); self._defNeuKonst(i);
           self.setInstrImmInt(i, result);
           self.setInstrSrc1(i, -1);
           self.setInstrSrc2(i, -1);
@@ -220,7 +229,7 @@ pub type IROptimize = class {
           var result: int64 := 0;
           if (op == IRO_SHL) { result := c1 << c2; }
           if (op == IRO_SHR) { result := c1 >> c2; }
-          self.setInstrOp(i, IRO_CONST_INT);
+          self.setInstrOp(i, IRO_CONST_INT); self._defNeuKonst(i);
           self.setInstrImmInt(i, result);
           self.setInstrSrc1(i, -1);
           self.setInstrSrc2(i, -1);
@@ -235,30 +244,77 @@ pub type IROptimize = class {
   }
   
   // Get constant value from a source operand
-  fn isConstInt(src: int64): bool {
-    if (src < 0) { return false; }
+  // #2023: Bis 1.2.14A suchten isConstInt, getConstValue,
+  // getConstFloatValue, setConstDefValue und traceCopy bei JEDEM Aufruf die
+  // ganze Funktion ab — je Operand. Bei grossen Funktionen war -O2 dadurch
+  // quadratisch (2000 Zeilen poke64: 90 s auf arm64, mit -O0 0,2 s).
+  //
+  // Jetzt eine Tabelle je Durchlauf: fuer jedes Ziel der ERSTE passende
+  // Befehl. Das ist genau, was die Suchschleifen fanden — sie liefen von
+  // fnStart aufwaerts und nahmen den ersten Treffer. Die Werte (Konstante,
+  // Quelle einer Kopie) werden weiter LIVE aus dem Befehl gelesen, aendern sie
+  // sich im Durchlauf, sieht die Abfrage den neuen Stand. Wird ein Befehl zu
+  // CONST_INT, traegt _defNeuKonst ihn nach; NOP-Setzen (DCE) passiert in
+  // eigenen Durchlaeufen, vor denen die Tabelle neu entsteht.
+  fn _defBaue() {
+    var mx: int64 := 0;
     var i: int64 := self.fnStart;
     while (i < self.fnEnd) {
-      if (self.getInstrDest(i) == src) {
-        if (self.getInstrOp(i) == IRO_CONST_INT) { return true; }
+      var d: int64 := self.getInstrDest(i);
+      if (d > mx) { mx := d; }
+      var s1: int64 := self.getInstrSrc1(i);
+      if (s1 > mx) { mx := s1; }
+      var s2: int64 := self.getInstrSrc2(i);
+      if (s2 > mx) { mx := s2; }
+      i += 1;
+    }
+    self.defMax := mx;
+    var n: int64 := (mx + 1) * 8;
+    self.defConst := alloc(n);
+    self.defFloat := alloc(n);
+    self.defMove  := alloc(n);
+    var k: int64 := 0;
+    while (k <= mx) {
+      poke64(self.defConst + k * 8, -1);
+      poke64(self.defFloat + k * 8, -1);
+      poke64(self.defMove + k * 8, -1);
+      k += 1;
+    }
+    i := self.fnStart;
+    while (i < self.fnEnd) {
+      var d2: int64 := self.getInstrDest(i);
+      if (d2 >= 0) {
+        var op: int64 := self.getInstrOp(i);
+        if (op == IRO_CONST_INT   && peek64(self.defConst + d2 * 8) < 0) { poke64(self.defConst + d2 * 8, i); }
+        if (op == IRO_CONST_FLOAT && peek64(self.defFloat + d2 * 8) < 0) { poke64(self.defFloat + d2 * 8, i); }
+        if (op == IRO_MOVE        && peek64(self.defMove + d2 * 8) < 0)  { poke64(self.defMove + d2 * 8, i); }
       }
       i += 1;
     }
-    return false;
+  }
+
+  // Befehl i ist eben zu CONST_INT geworden: ist er nun der erste fuer sein Ziel?
+  fn _defNeuKonst(i: int64) {
+    var d: int64 := self.getInstrDest(i);
+    if (d < 0 || d > self.defMax) { return; }
+    var alt: int64 := peek64(self.defConst + d * 8);
+    if (alt < 0 || i < alt) { poke64(self.defConst + d * 8, i); }
+  }
+
+  fn _defKonstIdx(src: int64): int64 {
+    if (src < 0 || src > self.defMax) { return -1; }
+    return peek64(self.defConst + src * 8);
+  }
+
+  fn isConstInt(src: int64): bool {
+    if (src < 0) { return false; }
+    return self._defKonstIdx(src) >= 0;
   }
 
   fn getConstValue(src: int64): int64 {
     if (src < 0) { return -1; }
-    var i: int64 := self.fnStart;
-    while (i < self.fnEnd) {
-      if (self.getInstrDest(i) == src) {
-        var op: int64 := self.getInstrOp(i);
-        if (op == IRO_CONST_INT) {
-          return self.getInstrImmInt(i);
-        }
-      }
-      i += 1;
-    }
+    var ci: int64 := self._defKonstIdx(src);
+    if (ci >= 0) { return self.getInstrImmInt(ci); }
     return -1;
   }
 
@@ -269,31 +325,15 @@ pub type IROptimize = class {
   // referenzierten CONST_INT-Temp (so wie ein expliziter `x << 2` aussieht).
   fn setConstDefValue(src: int64, val: int64): void {
     if (src < 0) { return; }
-    var i: int64 := self.fnStart;
-    while (i < self.fnEnd) {
-      if (self.getInstrDest(i) == src) {
-        if (self.getInstrOp(i) == IRO_CONST_INT) {
-          self.setInstrImmInt(i, val);
-          return;
-        }
-      }
-      i += 1;
-    }
+    var ci: int64 := self._defKonstIdx(src);   // #2023
+    if (ci >= 0) { self.setInstrImmInt(ci, val); }
   }
 
   // Get constant float value
   fn getConstFloatValue(src: int64): int64 {
-    if (src < 0) { return 0; }
-    var i: int64 := self.fnStart;
-    while (i < self.fnEnd) {
-      if (self.getInstrDest(i) == src) {
-        var op: int64 := self.getInstrOp(i);
-        if (op == IRO_CONST_FLOAT) {
-          return self.getInstrImmFloat(i);
-        }
-      }
-      i += 1;
-    }
+    if (src < 0 || src > self.defMax) { return 0; }
+    var fi: int64 := peek64(self.defFloat + src * 8);   // #2023
+    if (fi >= 0) { return self.getInstrImmFloat(fi); }
     return 0;
   }
   
@@ -303,6 +343,7 @@ pub type IROptimize = class {
   // t1 = a; t2 = t1 + b → t2 = a + b
   
   fn copyPropagation(): int64 {
+    self._defBaue();   // #2023
     var i: int64 := self.fnStart;
 
     while (i < self.fnEnd) {
@@ -336,24 +377,18 @@ pub type IROptimize = class {
   }
 
   // Trace copy chain to find original value
+  // #2023: dieselbe Kette wie vorher (erste MOVE-Definition, von vorn), nur
+  // ueber die Tabelle. Die Schrittgrenze ist neu: eine zyklische Kette hielt
+  // die alte Schleife fuer immer fest; jetzt endet sie nach so vielen
+  // Schritten, wie die Funktion Befehle hat, beim zuletzt erreichten Wert.
   fn traceCopy(temp: int64): int64 {
-    var i: int64 := self.fnStart;
     var current: int64 := temp;
-
-    while (i < self.fnEnd) {
-      if (self.getInstrDest(i) == current) {
-        var op: int64 := self.getInstrOp(i);
-        var src1: int64 := self.getInstrSrc1(i);
-        // IRO_MOVE is a direct copy: dest = src1
-        if (op == IRO_MOVE) {
-          current := src1;
-          i := self.fnStart;  // restart from beginning with new current
-          continue;
-        }
-      }
-      i += 1;
+    var schritte: int64 := self.fnEnd - self.fnStart;
+    while (schritte > 0 && current >= 0 && current <= self.defMax) {
+      var mi: int64 := peek64(self.defMove + current * 8);
+      if (mi < 0) { schritte := 0; }
+      else { current := self.getInstrSrc1(mi); schritte := schritte - 1; }
     }
-
     return current;
   }
   
@@ -406,6 +441,16 @@ pub type IROptimize = class {
       i += 1;
     }
 
+    // #2023: Verwendungen als Merkfeld, indiziert ueber den Wert.
+    var duMax: int64 := 0;
+    var duK: int64 := 0;
+    while (duK < usedCount) { var duV: int64 := peek64(usedDests + duK * 8); if (duV > duMax) { duMax := duV; } duK += 1; }
+    var duMerk: int64 := alloc(duMax + 1);
+    duK := 0;
+    while (duK <= duMax) { poke8(duMerk + duK, 0); duK += 1; }
+    duK := 0;
+    while (duK < usedCount) { poke8(duMerk + peek64(usedDests + duK * 8), 1); duK += 1; }
+
     // Second pass: remove dead instructions
     var liveStart: int64 := -1;
     i := self.fnStart;
@@ -414,15 +459,11 @@ pub type IROptimize = class {
       var dest: int64 := self.getInstrDest(i);
 
       // Check if destination is used
+      // #2023: Merkfeld statt Suche durch die ganze Verwendungsliste (das war
+      // je Befehl O(Verwendungen), zusammen quadratisch). Dieselbe Frage:
+      // kam `dest` irgendwo als Verwendung vor?
       var isUsed: int64 := 0;
-      var j: int64 := 0;
-      while (j < usedCount) {
-        if (peek64(usedDests + j * 8) == dest) {
-          isUsed := 1;
-          j := usedCount;  // break
-        }
-        j += 1;
-      }
+      if (dest >= 0 && dest <= duMax) { isUsed := peek8(duMerk + dest); }
 
       // Control flow instructions terminate basic blocks
       if (op == IRO_JMP || op == IRO_BR_TRUE || op == IRO_BR_FALSE ||
@@ -564,6 +605,7 @@ pub type IROptimize = class {
   // x * 2 → x << 1, x * 0 → 0, x + 0 → x, etc.
   
   fn strengthReduction(): int64 {
+    self._defBaue();   // #2023
     var i: int64 := self.fnStart;
 
     while (i < self.fnEnd) {
@@ -585,7 +627,7 @@ pub type IROptimize = class {
           }
           // Multiplication by 0 → 0
           if (c2 == 0) {
-            self.setInstrOp(i, IRO_CONST_INT);
+            self.setInstrOp(i, IRO_CONST_INT); self._defNeuKonst(i);   // #2023
             self.setInstrImmInt(i, 0);
             self.setInstrSrc1(i, -1);
             self.setInstrSrc2(i, -1);
