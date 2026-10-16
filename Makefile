@@ -589,6 +589,7 @@ test: lyxc
 	@bash tests/argv_ir_test.sh
 	@bash tests/thread_join_test.sh
 	@bash tests/ir_lower_tempo_test.sh
+	@bash tests/image_freestanding_test.sh
 	@bash tests/beispiel_aes_vector_test.sh
 	@bash tests/beispiel_ldap_einheiten_test.sh
 	@bash tests/ldap_rdn_test.sh

@@ -1,0 +1,309 @@
+// std/image/png_mem.lyx — PNG-Dekoder ohne Speicherbelegung und ohne Datei-I/O
+//
+// #1954: std.image.png ist auf freistehenden Zielen nicht verwendbar. Unter
+// --target=lyxos-kernel scheitert schon der Import: std.image.png und
+// std.image.core ziehen std.fs herein, und das weist der Kernmodus als
+// POSIX-Import ab. Unter --target=lyxos uebersetzt es zwar, aber PngDecode
+// belegt jeden Puffer mit alloc(), und der Inflater aus std.zlib sich selbst
+// mit `new` — beides ein mmap-Syscall, den es in einem Kern nicht gibt.
+//
+// (Die libc-Bindungen, die das Issue nennt, gibt es nicht mehr: std.alloc
+// laeuft seit #1179 ueber mmap, std.fs seit #1191 ueber clock_gettime.)
+//
+// Diese Unit importiert nur std.inflate, das selbst nichts importiert. Der
+// Aufrufer stellt Eingabe, Ausgabe und einen Arbeitsbereich; wie gross die
+// beiden sein muessen, sagt PngMemInfo vorab aus dem Kopf der Datei.
+//
+//     var info: int64 := ...32 Byte...;
+//     if (PngMemInfo(src, len, info) < 0) { ... }
+//     dst  := ... peek64(info + 16) Bytes ...;   // RGBA8, zeilenweise
+//     work := ... peek64(info + 24) Bytes ...;
+//     n := PngDecodeFromMemory(src, len, dst, dstLen, work, workLen);
+//
+// Ergebnis ist dasselbe Format wie bei PngDecode: RGBA8, Zeilen von oben nach
+// unten, ohne Zeilenabstand. Die Zeilenrekonstruktion und Farbumsetzung unten
+// benutzt auch std.image.png — es gibt sie nur einmal.
+//
+// Unterstuetzt wie PngDecode: Farbtypen 0/2/4/6, Bittiefe 8 und 16 (16 Bit
+// wird auf das hoeherwertige Byte gekuerzt), Filter 0..4, kein Interlacing.
+// NICHT unterstuetzt: Palette (Farbtyp 3), Bittiefen 1/2/4, Adam7 — diese
+// liefern PNGM_ERR_UNSUPPORTED, nicht ein falsches Bild.
+//
+// Strenger als PngDecode, weil ein Kern keine zweite Chance hat: jeder Chunk
+// muss vollstaendig in der Eingabe liegen, der zlib-Kopf und die Adler-32-
+// Pruefsumme muessen stimmen, der entpackte Strom muss GENAU die Groesse aus
+// dem Kopf haben, und ein Filtertyp > 4 ist ein Fehler (PngDecode behandelt
+// ihn still wie 0).
+
+@description("Freestanding PNG decoder into caller-provided buffers")
+@author("Andreas Röne")
+@copyright("2025-2026 Andreas Röne")
+unit std.image.png_mem;
+
+import std.inflate;
+
+// Rueckgabewerte: > 0 = geschriebene Bytes, sonst einer von diesen.
+pub con PNGM_ERR_FORMAT:      int64 := -1;   // kein PNG / Kopf oder Chunks kaputt
+pub con PNGM_ERR_UNSUPPORTED: int64 := -2;   // gueltig, aber nicht unterstuetzt
+pub con PNGM_ERR_DST:         int64 := -3;   // Ausgabepuffer zu klein
+pub con PNGM_ERR_WORK:        int64 := -4;   // Arbeitsbereich zu klein
+pub con PNGM_ERR_DATA:        int64 := -5;   // Bilddaten (zlib/Filter) kaputt
+
+// Aufbau des Info-Blocks (4 x int64)
+pub con PNGM_INFO_WIDTH:  int64 := 0;
+pub con PNGM_INFO_HEIGHT: int64 := 8;
+pub con PNGM_INFO_DSTLEN: int64 := 16;
+pub con PNGM_INFO_WORKLEN: int64 := 24;
+pub con PNGM_INFO_SIZE:   int64 := 32;
+
+// Obergrenze je Kante. PNG erlaubt 2^31-1; bei 2^24 bleibt w*h*4 sicher im
+// int64-Bereich, und ein Bild dieser Groesse passt ohnehin in keinen Kern.
+con PNGM_MAX_EDGE: int64 := 16777216;
+
+// ============================================================================
+// Zeilenarbeit — gemeinsam mit std.image.png
+// ============================================================================
+
+pub fn pngGet32(buf: int64, off: int64): int64 {
+    var b0: int64 := peek8(buf + off);
+    var b1: int64 := peek8(buf + off + 1);
+    var b2: int64 := peek8(buf + off + 2);
+    var b3: int64 := peek8(buf + off + 3);
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+pub fn pngPaeth(a: int64, b: int64, c: int64): int64 {
+    var p:  int64 := a + b - c;
+    var pa: int64 := p - a; if (pa < 0) { pa := 0 - pa; }
+    var pb: int64 := p - b; if (pb < 0) { pb := 0 - pb; }
+    var pc: int64 := p - c; if (pc < 0) { pc := 0 - pc; }
+    if (pa <= pb && pa <= pc) { return a; }
+    if (pb <= pc) { return b; }
+    return c;
+}
+
+// Eine Zeile entfiltern.
+// ftype: Filterbyte (0-4), raw: gefilterte Bytes, prior: vorige rekonstruierte
+// Zeile (0 = keine), out: Ausgabe, rowW: Bytebreite, bpp: Bytes je Pixel.
+// raw == out ist zulaessig (Entfiltern an Ort und Stelle): Byte x wird gelesen,
+// bevor es geschrieben wird, und `left` stammt aus dem schon fertigen Teil.
+pub fn pngReconRow(ftype: int64, raw: int64, prior: int64, out: int64, rowW: int64, bpp: int64): void {
+    var x: int64 := 0;
+    while (x < rowW) {
+        var fval:   int64 := peek8(raw + x);
+        var left:   int64 := 0;
+        var up:     int64 := 0;
+        var upleft: int64 := 0;
+        if (x >= bpp) { left := peek8(out + x - bpp); }
+        if (prior != 0) {
+            up := peek8(prior + x);
+            if (x >= bpp) { upleft := peek8(prior + x - bpp); }
+        }
+        var rval: int64 := fval;
+        if (ftype == 1) { rval := (fval + left) & 255; }
+        if (ftype == 2) { rval := (fval + up) & 255; }
+        if (ftype == 3) { rval := (fval + (left + up) / 2) & 255; }
+        if (ftype == 4) { rval := (fval + pngPaeth(left, up, upleft)) & 255; }
+        poke8(out + x, rval);
+        x += 1;
+    }
+}
+
+// Eine rekonstruierte Zeile nach RGBA8 umsetzen.
+// src: rekonstruierte Bytes, dst: RGBA8 (4*w Bytes), w: Pixelzahl,
+// ctype: PNG-Farbtyp, bps: Bytes je Abtastwert (1 oder 2).
+pub fn pngConvertRow(src: int64, dst: int64, w: int64, ctype: int64, bps: int64): void {
+    var x: int64 := 0;
+    while (x < w) {
+        var r: int64 := 255;
+        var g: int64 := 255;
+        var b: int64 := 255;
+        var a: int64 := 255;
+        if (ctype == 0) {
+            var gray: int64 := peek8(src + x * bps);
+            r := gray; g := gray; b := gray;
+        }
+        if (ctype == 2) {
+            r := peek8(src + x * 3 * bps);
+            g := peek8(src + x * 3 * bps + bps);
+            b := peek8(src + x * 3 * bps + bps * 2);
+        }
+        if (ctype == 4) {
+            var gray: int64 := peek8(src + x * 2 * bps);
+            r := gray; g := gray; b := gray;
+            a := peek8(src + x * 2 * bps + bps);
+        }
+        if (ctype == 6) {
+            r := peek8(src + x * 4 * bps);
+            g := peek8(src + x * 4 * bps + bps);
+            b := peek8(src + x * 4 * bps + bps * 2);
+            a := peek8(src + x * 4 * bps + bps * 3);
+        }
+        poke8(dst + x * 4,     r);
+        poke8(dst + x * 4 + 1, g);
+        poke8(dst + x * 4 + 2, b);
+        poke8(dst + x * 4 + 3, a);
+        x += 1;
+    }
+}
+
+// ============================================================================
+// Kopf und Chunks
+// ============================================================================
+
+fn _pngmIsType(src: int64, pos: int64, t0: int64, t1: int64, t2: int64, t3: int64): int64 {
+    if (peek8(src + pos + 4) != t0) { return 0; }
+    if (peek8(src + pos + 5) != t1) { return 0; }
+    if (peek8(src + pos + 6) != t2) { return 0; }
+    if (peek8(src + pos + 7) != t3) { return 0; }
+    return 1;
+}
+
+// Byte pro Pixel aus Farbtyp und Bittiefe; negativ = Fehlercode.
+fn _pngmBpp(ctype: int64, bitDepth: int64): int64 {
+    var ch: int64 := 0;
+    if (ctype == 0) { ch := 1; }
+    if (ctype == 2) { ch := 3; }
+    if (ctype == 4) { ch := 2; }
+    if (ctype == 6) { ch := 4; }
+    if (ctype == 3) { return PNGM_ERR_UNSUPPORTED; }
+    if (ch == 0) { return PNGM_ERR_FORMAT; }
+    if (bitDepth == 8) { return ch; }
+    if (bitDepth == 16) { return ch * 2; }
+    if (bitDepth == 1 || bitDepth == 2 || bitDepth == 4) {
+        if (ctype == 0) { return PNGM_ERR_UNSUPPORTED; }
+    }
+    return PNGM_ERR_FORMAT;
+}
+
+// Alle Chunks ab Offset 33 durchgehen; liefert die Summe der IDAT-Laengen
+// oder einen Fehlercode. Ein Chunk, der ueber srcLen hinausreicht, ist ein
+// Fehler — eine abgeschnittene Datei liefert kein halbes Bild.
+fn _pngmIdatTotal(src: int64, srcLen: int64): int64 {
+    var pos: int64 := 33;
+    var total: int64 := 0;
+    while (pos + 12 <= srcLen) {
+        var cLen: int64 := pngGet32(src, pos);
+        if (cLen > srcLen) { return PNGM_ERR_FORMAT; }
+        if (pos + 12 + cLen > srcLen) { return PNGM_ERR_FORMAT; }
+        if (_pngmIsType(src, pos, 0x49, 0x44, 0x41, 0x54) != 0) { total := total + cLen; }
+        if (_pngmIsType(src, pos, 0x49, 0x45, 0x4E, 0x44) != 0) { return total; }
+        pos := pos + 12 + cLen;
+    }
+    // Ohne IEND: entweder abgeschnitten oder Muell hinter dem letzten Chunk.
+    return PNGM_ERR_FORMAT;
+}
+
+// Kopf lesen und die noetigen Puffergroessen nennen.
+// info: PNGM_INFO_SIZE Bytes des Aufrufers (Breite, Hoehe, Ausgabegroesse,
+// Arbeitsbereich). Rueckgabe 1 oder ein PNGM_ERR_*.
+pub fn PngMemInfo(src: int64, srcLen: int64, info: int64): int64 {
+    if (src == 0 || info == 0) { return PNGM_ERR_FORMAT; }
+    if (srcLen < 33) { return PNGM_ERR_FORMAT; }
+    if (peek8(src)     != 0x89) { return PNGM_ERR_FORMAT; }
+    if (peek8(src + 1) != 0x50) { return PNGM_ERR_FORMAT; }
+    if (peek8(src + 2) != 0x4E) { return PNGM_ERR_FORMAT; }
+    if (peek8(src + 3) != 0x47) { return PNGM_ERR_FORMAT; }
+    if (peek8(src + 4) != 0x0D) { return PNGM_ERR_FORMAT; }
+    if (peek8(src + 5) != 0x0A) { return PNGM_ERR_FORMAT; }
+    if (peek8(src + 6) != 0x1A) { return PNGM_ERR_FORMAT; }
+    if (peek8(src + 7) != 0x0A) { return PNGM_ERR_FORMAT; }
+    if (pngGet32(src, 8) != 13) { return PNGM_ERR_FORMAT; }
+    if (_pngmIsType(src, 8, 0x49, 0x48, 0x44, 0x52) == 0) { return PNGM_ERR_FORMAT; }
+
+    var w:         int64 := pngGet32(src, 16);
+    var h:         int64 := pngGet32(src, 20);
+    var bitDepth:  int64 := peek8(src + 24);
+    var ctype:     int64 := peek8(src + 25);
+    var interlace: int64 := peek8(src + 28);
+    if (w <= 0 || h <= 0) { return PNGM_ERR_FORMAT; }
+    if (w > PNGM_MAX_EDGE || h > PNGM_MAX_EDGE) { return PNGM_ERR_UNSUPPORTED; }
+    if (peek8(src + 26) != 0 || peek8(src + 27) != 0) { return PNGM_ERR_FORMAT; }
+    if (interlace == 1) { return PNGM_ERR_UNSUPPORTED; }
+    if (interlace != 0) { return PNGM_ERR_FORMAT; }
+    var bpp: int64 := _pngmBpp(ctype, bitDepth);
+    if (bpp < 0) { return bpp; }
+
+    var idat: int64 := _pngmIdatTotal(src, srcLen);
+    if (idat < 0) { return idat; }
+    if (idat < 6) { return PNGM_ERR_DATA; }
+
+    var filtLen: int64 := h * (w * bpp + 1);
+    poke64(info + PNGM_INFO_WIDTH,   w);
+    poke64(info + PNGM_INFO_HEIGHT,  h);
+    poke64(info + PNGM_INFO_DSTLEN,  w * h * 4);
+    poke64(info + PNGM_INFO_WORKLEN, INFLATE_WORK_SIZE + idat + filtLen);
+    return 1;
+}
+
+// ============================================================================
+// PngDecodeFromMemory
+// ============================================================================
+
+// PNG aus src[0..srcLen) nach dst als RGBA8 dekodieren.
+// work/workLen: Arbeitsbereich, mindestens peek64(info + PNGM_INFO_WORKLEN)
+// aus PngMemInfo (Inflate-Zustand + zusammengesetzte IDAT-Daten + gefilterte
+// Zeilen). Keine eigene Speicherbelegung, kein Syscall.
+// Rueckgabe: w*h*4 (geschriebene Bytes) oder ein PNGM_ERR_* (< 0).
+pub fn PngDecodeFromMemory(src: int64, srcLen: int64, dst: int64, dstLen: int64,
+                           work: int64, workLen: int64): int64 {
+    // Der Info-Block liegt am Anfang des Arbeitsbereichs; der Inflate-Zustand
+    // wird ihn danach ueberschreiben, deshalb sofort in Variablen.
+    if (work == 0 || workLen < INFLATE_WORK_SIZE) { return PNGM_ERR_WORK; }
+    var rc: int64 := PngMemInfo(src, srcLen, work);
+    if (rc < 0) { return rc; }
+    var w:       int64 := peek64(work + PNGM_INFO_WIDTH);
+    var h:       int64 := peek64(work + PNGM_INFO_HEIGHT);
+    var needDst: int64 := peek64(work + PNGM_INFO_DSTLEN);
+    var needWrk: int64 := peek64(work + PNGM_INFO_WORKLEN);
+    if (dst == 0 || dstLen < needDst) { return PNGM_ERR_DST; }
+    if (workLen < needWrk) { return PNGM_ERR_WORK; }
+
+    var bitDepth: int64 := peek8(src + 24);
+    var ctype:    int64 := peek8(src + 25);
+    var bpp:      int64 := _pngmBpp(ctype, bitDepth);
+    var bps:      int64 := 1;
+    if (bitDepth == 16) { bps := 2; }
+    var rowW:     int64 := w * bpp;
+    var filtLen:  int64 := h * (rowW + 1);
+
+    // IDAT-Daten hintereinander in den Arbeitsbereich: der zlib-Strom darf
+    // auf beliebig viele Chunks verteilt sein.
+    var idatBuf: int64 := work + INFLATE_WORK_SIZE;
+    var idatLen: int64 := 0;
+    var pos: int64 := 33;
+    var running: int64 := 1;
+    while (running != 0) {
+        var cLen: int64 := pngGet32(src, pos);
+        if (_pngmIsType(src, pos, 0x49, 0x44, 0x41, 0x54) != 0) {
+            var ci: int64 := 0;
+            while (ci < cLen) {
+                poke8(idatBuf + idatLen + ci, peek8(src + pos + 8 + ci));
+                ci += 1;
+            }
+            idatLen := idatLen + cLen;
+        }
+        if (_pngmIsType(src, pos, 0x49, 0x45, 0x4E, 0x44) != 0) { running := 0; }
+        pos := pos + 12 + cLen;
+    }
+
+    var filtBuf: int64 := idatBuf + idatLen;
+    var n: int64 := InflateZlibToBuffer(idatBuf, idatLen, filtBuf, filtLen,
+                                        work, INFLATE_WORK_SIZE);
+    if (n == INFLATE_ERR_FULL) { return PNGM_ERR_DATA; }   // mehr Daten als der Kopf sagt
+    if (n != filtLen) { return PNGM_ERR_DATA; }            // kaputt oder zu kurz
+
+    // Entfiltern an Ort und Stelle, dann umsetzen.
+    var y: int64 := 0;
+    var prior: int64 := 0;
+    while (y < h) {
+        var row: int64 := filtBuf + y * (rowW + 1);
+        var ftype: int64 := peek8(row);
+        if (ftype > 4) { return PNGM_ERR_DATA; }
+        pngReconRow(ftype, row + 1, prior, row + 1, rowW, bpp);
+        pngConvertRow(row + 1, dst + y * w * 4, w, ctype, bps);
+        prior := row + 1;
+        y += 1;
+    }
+    return needDst;
+}
