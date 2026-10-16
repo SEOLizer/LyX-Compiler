@@ -287,6 +287,12 @@ pub type EmitARM64 = class {
     self.calcStackFrame(funcId);
     var prologueStart: int64 := self.codeLen;
     self.emitPrologue();
+    // #2110: argv fuer GetArgC/GetArgV sichern. Beide Startruempfe (statisch
+    // und ueber __libc_start_main) uebergeben argv in x1 an main; x28 ist
+    // callee-saved, der erzeugte Code benutzt es nie (s. emitPrologue), und
+    // C-Code erhaelt es nach AAPCS64. Am Startrumpf selbst ginge es nicht:
+    // glibc ruft main mit eigenen Werten in x19..x28.
+    if self.isMainFunc(funcId) != 0 { self.emit32(0xAA0103FC); }   // MOV x28, x1
     // WP-AND-upstream-fix v7: spill incoming register args (x0..x7 per
     // AAPCS64) into stack slots 0..paramCount-1 so subsequent
     // IRO_LOAD_LOCAL of a parameter actually reads its value. Without
@@ -349,9 +355,22 @@ pub type EmitARM64 = class {
   //  - No MRS/MSR system-register access; TPIDR_EL0 and other system regs are
   //    untouched.
   //  - Callee-saved regs (x19..x28) are not used, so we do not need to save them.
+  //    Ausnahme #2110: x28 traegt ab dem Eingang von main argv und wird danach
+  //    nur gelesen (GetArgC/GetArgV) — gerettet werden muss es nirgends.
   //  - DWARF CFI for stack unwinding is emitted by writeELFSharedLib via the
   //    .eh_frame section using funcAddrs + funcPrologueLen records.
   // -------------------------------------------------------------------------
+
+  // #2110: heisst die Funktion "main"? Dieselbe Pruefung wie isMainFunc in
+  // riscv_linux.lyx (#1740).
+  fn isMainFunc(funcId: int64): int64 {
+    var funcBuf: int64 := peek64(self.ir + 80);
+    var rec:     int64 := funcBuf + funcId * IR_FUNC_SIZE;
+    if peek64(rec + IR_FUNC_OFF_NAMELEN) != 4 { return 0; }
+    var p: int64 := peek64(self.ir + 32) + peek64(rec + 0);
+    if peek8(p) != 109 || peek8(p + 1) != 97 || peek8(p + 2) != 105 || peek8(p + 3) != 110 { return 0; }
+    return 1;
+  }
 
   fn emitPrologue() {
     // STP x29, x30, [sp, #-16]!
@@ -1306,6 +1325,38 @@ pub type EmitARM64 = class {
       self.emitLdur(ARM64_X3, ARM64_X29, self.slotOff(opB + 2));    // mode
       self.emitMovImmReg(ARM64_X8, SYS_OPEN);                       // 56 = openat
       self.emit32(0xD4000001);                                      // SVC #0
+    } else if id == 17 {
+      // #2110: GetArgC — die argv-Zeiger ab x28 bis zum abschliessenden NULL
+      // zaehlen (argv[argc] ist NULL). Dieselbe Rechnung wie in
+      // riscv_linux.lyx, die beiden muessen uebereinstimmen.
+      self.emit32(0xAA1C03E9);   // MOV x9, x28
+      self.emit32(0xD2800000);   // MOVZ x0, #0
+      self.emit32(0xF940012A);   // [L] LDR x10, [x9]
+      self.emit32(0xB400008A);   // CBZ x10, +16 → hinter die Schleife
+      self.emit32(0x91000400);   // ADD x0, x0, #1
+      self.emit32(0x91002129);   // ADD x9, x9, #8
+      self.emit32(0x17FFFFFC);   // B L
+    } else if id == 18 {
+      self.emit32(0xAA1C03E0);   // #2110: GetArgV — MOV x0, x28
+    } else if id == 235 {
+      // #2110: ArgvGet(argv, i) — argv[i], aber nur, solange vorher kein NULL
+      // kommt: ein Index ausserhalb liefert 0 statt eines Umgebungseintrags
+      // (dieselbe Absicht wie #1460 auf x86; ein negativer Index laeuft bis
+      // zum NULL und liefert ebenfalls 0). Dieselbe Rechnung wie in
+      // riscv_linux.lyx.
+      var avB: int64 := argBase;
+      if (avB < 0) { avB := 0; }
+      self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(avB));        // argv
+      self.emitLdur(ARM64_X10, ARM64_X29, self.slotOff(avB + 1));   // i
+      self.emit32(0xB40000CA);   // [L] CBZ x10, +24 → nehmen
+      self.emit32(0xF940012B);   // LDR x11, [x9]
+      self.emit32(0xB40000CB);   // CBZ x11, +24 → 0
+      self.emit32(0x91002129);   // ADD x9, x9, #8
+      self.emit32(0xD100054A);   // SUB x10, x10, #1
+      self.emit32(0x17FFFFFB);   // B L
+      self.emit32(0xF9400120);   // nehmen: LDR x0, [x9]
+      self.emit32(0x14000002);   // B +8
+      self.emit32(0xD2800000);   // 0: MOVZ x0, #0
     } else if id == 221 || id == 224 || id == 225 || id == 226 || id == 227 {
       // #2104: close / rename / unlink / mkdir / exit. ir_lower vergibt die
       // IDs seit der LyxOS-Gruppe A fuer ALLE IR-Ziele; der Linux-Zweig kannte

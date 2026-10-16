@@ -39,7 +39,7 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 | 14 | Zeilenumbruch nach stderr | `EPrintStrLn`, `EPrintLn`, `panic` | #1388 |
 | 15 | Länge einer Zeichenkette | `StrLen`, `StrLength` | #1388 |
 | 16 | Ganzzahl als Dezimaltext, Zeiger zurück | `IntToStr`, `StrFromInt` | #1720; der Puffer stammt aus mmap, nicht vom Stapel — er muss den Aufruf überleben |
-| 17 | Anzahl der Programmargumente | `GetArgC` | #1720; auf lyxos 0 — `_start` liest keinen argv |
+| 17 | Anzahl der Programmargumente | `GetArgC` | #1720; lyxos: Startrumpf legt argc/argv ab (#1754); arm64/riscv: argv in x28/s10, GetArgC zählt bis NULL (#2110) |
 | 18 | Zeiger auf den Argumentvektor | `GetArgV`, `GetArg` | #1720; `GetArg(i)` ist ID 18 plus ein Lesezugriff, keine eigene ID |
 | 19 | Zeiger auf den Umgebungsblock | `GetEnvBlock` | #1720; auf lyxos und Linux 0 — nur die win64-Laufzeit setzt ihn (#1677) |
 

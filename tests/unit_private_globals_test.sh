@@ -111,9 +111,25 @@ import std.io;
 import rp.b;
 fn main(): int64 { PrintLn(IntToStr(B_SIZE)); PrintLn(IntToStr(BSize())); return 0; }
 EOF
-# Nur x86: der IR-Weg faltet Konstanten unit-lokal und weist den Fall LAUT ab
-# (#1798) — kein stiller Wert, aber noch nicht gleich (eigenes Issue).
-ziele "B_SIZE = A_SIZE = 536, auch in rp.b" "r.lyx" "536|536|" "x86_64"
+# #2107: seit 1.2.14B auch auf dem IR-Weg (vorher dort mit #1798 abgewiesen).
+ziele "B_SIZE = A_SIZE = 536, auch in rp.b" "r.lyx" "536|536|" "$ALLE"
+
+# Kette ueber zwei Units (rp.c nennt B_SIZE, das A_SIZE nennt) und eine
+# Konstante des HAUPTMODULS aus einer importierten.
+cat > "$TMP/m/rp/c.lyx" <<'EOF'
+unit rp.c;
+import rp.b;
+pub con C_SIZE: int64 := B_SIZE + 4;
+pub fn CSize(): int64 { return C_SIZE; }
+EOF
+cat > "$TMP/m/k.lyx" <<'EOF'
+import std.io;
+import rp.c;
+import rp.a;
+con M_SIZE: int64 := A_SIZE * 2 + 1;
+fn main(): int64 { PrintLn(IntToStr(CSize())); PrintLn(IntToStr(C_SIZE)); PrintLn(IntToStr(M_SIZE)); return 0; }
+EOF
+ziele "Kette C_SIZE = B_SIZE + 4 = 540, M_SIZE im Hauptmodul = 1073" "k.lyx" "540|540|1073|" "$ALLE"
 
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"

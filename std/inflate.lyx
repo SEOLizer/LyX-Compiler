@@ -1,0 +1,424 @@
+// std/inflate.lyx — DEFLATE/zlib-Dekoder ohne eigene Speicherbelegung
+//
+// #1954: Ein PNG-Dekoder fuer freistehende Ziele (--target=lyxos-kernel,
+// Boot-Splash, Hintergrundbilder) braucht ein Inflate, das weder `alloc` noch
+// `new` aufruft. Beides endet in einem mmap-Syscall, und den gibt es in einem
+// Kern nicht — der Kern IST die Ebene, die Speicher hergibt. Der Inflater aus
+// std.zlib belegt seine Tabellen mit alloc() und sich selbst mit `new`.
+//
+// Diese Unit importiert NICHTS. Den gesamten Zustand (Bitposition, Huffman-
+// Tabellen, Kratzfelder) traegt ein Arbeitsbereich, den der Aufrufer stellt:
+// INFLATE_WORK_SIZE Bytes, Ausrichtung auf 8 Byte empfohlen. Ausgabe nur in den
+// Puffer des Aufrufers, mit Schranke.
+//
+// Dieselbe Rechnung wie die Klasse `Inflater` in std/zlib.lyx (Canonical-
+// Huffman nach puff.c) — die beiden muessen uebereinstimmen. std.zlib bleibt
+// fuer den Linux-Weg unveraendert. Hier zusaetzlich geprueft, was dort fehlt:
+// Wiederholcodes duerfen das Code-Laengenfeld nicht ueberschreiten, NLEN muss
+// das Komplement von LEN sein, und ein abgeschnittener Strom liefert -1 statt
+// eines Teilergebnisses.
+//
+// Rueckgabewerte (alle Funktionen):
+//   >= 0  geschriebene Ausgabebytes
+//   -1    Strom kaputt oder abgeschnitten (INFLATE_ERR_DATA)
+//   -2    Ausgabepuffer zu klein (INFLATE_ERR_FULL)
+//   -3    Arbeitsbereich zu klein oder Argument ungueltig (INFLATE_ERR_ARG)
+
+@description("Freestanding DEFLATE/zlib inflate into caller-provided buffers")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit std.inflate;
+
+pub con INFLATE_ERR_DATA: int64 := -1;
+pub con INFLATE_ERR_FULL: int64 := -2;
+pub con INFLATE_ERR_ARG:  int64 := -3;
+
+// ── Aufteilung des Arbeitsbereichs (Einheit: int64-Slots) ───────────────────
+con IFS_INPUT:   int64 := 0;
+con IFS_INLEN:   int64 := 1;
+con IFS_OUTPUT:  int64 := 2;
+con IFS_BITPOS:  int64 := 3;
+con IFS_OUTPOS:  int64 := 4;
+con IFS_OUTMAX:  int64 := 5;
+con IFS_OUTFULL: int64 := 6;
+con IFT_LENBASE:   int64 := 8;              // [29]
+con IFT_LENEXTRA:  int64 := 37;             // [29]
+con IFT_DISTBASE:  int64 := 66;             // [30]
+con IFT_DISTEXTRA: int64 := 96;             // [30]
+con IFT_LITCNT:    int64 := 126;            // [16]
+con IFT_LITSYM:    int64 := 142;            // [288]
+con IFT_DISTCNT:   int64 := 430;            // [16]
+con IFT_DISTSYM:   int64 := 446;            // [32]
+con IFT_CLCNT:     int64 := 478;            // [16]
+con IFT_CLSYM:     int64 := 494;            // [19]
+con IFT_LENS:      int64 := 513;            // [320]
+con IFT_OFFS:      int64 := 833;            // [16]
+con IFT_CL:        int64 := 849;            // [19]
+con IFT_END:       int64 := 868;
+
+// Groesse des Arbeitsbereichs in Bytes (868 Slots, aufgerundet).
+pub con INFLATE_WORK_SIZE: int64 := 7168;
+
+fn _ifSlot(w: int64, s: int64): int64 { return w + s * 8; }
+fn _ifGet(w: int64, s: int64): int64 { return peek64(w + s * 8); }
+fn _ifSet(w: int64, s: int64, v: int64): void { poke64(w + s * 8, v); }
+
+// Ein Bit, LSB-first innerhalb des Bytes; -1 am Ende der Eingabe.
+fn _ifBit(w: int64): int64 {
+    var bp: int64 := _ifGet(w, IFS_BITPOS);
+    var bytePos: int64 := bp >> 3;
+    if (bytePos >= _ifGet(w, IFS_INLEN)) { return -1; }
+    var b: int64 := peek8(_ifGet(w, IFS_INPUT) + bytePos);
+    _ifSet(w, IFS_BITPOS, bp + 1);
+    return (b >> (bp & 7)) & 1;
+}
+
+// n Bits LSB-first; -1, wenn die Eingabe vorher endet.
+fn _ifBits(w: int64, n: int64): int64 {
+    var v: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+        var bit: int64 := _ifBit(w);
+        if (bit < 0) { return -1; }
+        v := v + (bit << i);
+        i := i + 1;
+    }
+    return v;
+}
+
+// Canonical-Huffman aus lens[0..n-1] (Slots) in cnt[16]/sym[n] bauen.
+fn _ifBuild(w: int64, lens: int64, n: int64, cnt: int64, sym: int64): void {
+    var i: int64 := 0;
+    while (i <= 15) { poke64(cnt + i * 8, 0); i := i + 1; }
+    i := 0;
+    while (i < n) {
+        var l: int64 := peek64(lens + i * 8);
+        poke64(cnt + l * 8, peek64(cnt + l * 8) + 1);
+        i := i + 1;
+    }
+    var offs: int64 := _ifSlot(w, IFT_OFFS);
+    poke64(offs + 8, 0);
+    var ln: int64 := 1;
+    while (ln < 15) {
+        poke64(offs + (ln + 1) * 8, peek64(offs + ln * 8) + peek64(cnt + ln * 8));
+        ln := ln + 1;
+    }
+    i := 0;
+    while (i < n) {
+        var l2: int64 := peek64(lens + i * 8);
+        if (l2 != 0) {
+            var o: int64 := peek64(offs + l2 * 8);
+            poke64(sym + o * 8, i);
+            poke64(offs + l2 * 8, o + 1);
+        }
+        i := i + 1;
+    }
+}
+
+// Ein Symbol dekodieren (MSB-first Code-Akkumulation); -1 bei Fehler.
+fn _ifDecode(w: int64, cnt: int64, sym: int64): int64 {
+    var code:  int64 := 0;
+    var first: int64 := 0;
+    var index: int64 := 0;
+    var ln:    int64 := 1;
+    while (ln <= 15) {
+        var bit: int64 := _ifBit(w);
+        if (bit < 0) { return -1; }
+        code := code | bit;
+        var count: int64 := peek64(cnt + ln * 8);
+        if ((code - first) < count) {
+            return peek64(sym + (index + (code - first)) * 8);
+        }
+        index := index + count;
+        first := (first + count) << 1;
+        code  := code << 1;
+        ln := ln + 1;
+    }
+    return -1;
+}
+
+fn _ifPut2(w: int64, bs: int64, es: int64, i: int64, b: int64, e: int64): void {
+    _ifSet(w, bs + i, b);
+    _ifSet(w, es + i, e);
+}
+
+// Laengen-/Distanz-Tabellen nach RFC 1951 §3.2.5 — dieselben Werte wie
+// Inflater.fillTables in std/zlib.lyx.
+fn _ifTables(w: int64): void {
+    var lb: int64 := IFT_LENBASE;
+    var le: int64 := IFT_LENEXTRA;
+    _ifPut2(w, lb, le, 0, 3, 0);    _ifPut2(w, lb, le, 1, 4, 0);
+    _ifPut2(w, lb, le, 2, 5, 0);    _ifPut2(w, lb, le, 3, 6, 0);
+    _ifPut2(w, lb, le, 4, 7, 0);    _ifPut2(w, lb, le, 5, 8, 0);
+    _ifPut2(w, lb, le, 6, 9, 0);    _ifPut2(w, lb, le, 7, 10, 0);
+    _ifPut2(w, lb, le, 8, 11, 1);   _ifPut2(w, lb, le, 9, 13, 1);
+    _ifPut2(w, lb, le, 10, 15, 1);  _ifPut2(w, lb, le, 11, 17, 1);
+    _ifPut2(w, lb, le, 12, 19, 2);  _ifPut2(w, lb, le, 13, 23, 2);
+    _ifPut2(w, lb, le, 14, 27, 2);  _ifPut2(w, lb, le, 15, 31, 2);
+    _ifPut2(w, lb, le, 16, 35, 3);  _ifPut2(w, lb, le, 17, 43, 3);
+    _ifPut2(w, lb, le, 18, 51, 3);  _ifPut2(w, lb, le, 19, 59, 3);
+    _ifPut2(w, lb, le, 20, 67, 4);  _ifPut2(w, lb, le, 21, 83, 4);
+    _ifPut2(w, lb, le, 22, 99, 4);  _ifPut2(w, lb, le, 23, 115, 4);
+    _ifPut2(w, lb, le, 24, 131, 5); _ifPut2(w, lb, le, 25, 163, 5);
+    _ifPut2(w, lb, le, 26, 195, 5); _ifPut2(w, lb, le, 27, 227, 5);
+    _ifPut2(w, lb, le, 28, 258, 0);
+    var db: int64 := IFT_DISTBASE;
+    var de: int64 := IFT_DISTEXTRA;
+    _ifPut2(w, db, de, 0, 1, 0);      _ifPut2(w, db, de, 1, 2, 0);
+    _ifPut2(w, db, de, 2, 3, 0);      _ifPut2(w, db, de, 3, 4, 0);
+    _ifPut2(w, db, de, 4, 5, 1);      _ifPut2(w, db, de, 5, 7, 1);
+    _ifPut2(w, db, de, 6, 9, 2);      _ifPut2(w, db, de, 7, 13, 2);
+    _ifPut2(w, db, de, 8, 17, 3);     _ifPut2(w, db, de, 9, 25, 3);
+    _ifPut2(w, db, de, 10, 33, 4);    _ifPut2(w, db, de, 11, 49, 4);
+    _ifPut2(w, db, de, 12, 65, 5);    _ifPut2(w, db, de, 13, 97, 5);
+    _ifPut2(w, db, de, 14, 129, 6);   _ifPut2(w, db, de, 15, 193, 6);
+    _ifPut2(w, db, de, 16, 257, 7);   _ifPut2(w, db, de, 17, 385, 7);
+    _ifPut2(w, db, de, 18, 513, 8);   _ifPut2(w, db, de, 19, 769, 8);
+    _ifPut2(w, db, de, 20, 1025, 9);  _ifPut2(w, db, de, 21, 1537, 9);
+    _ifPut2(w, db, de, 22, 2049, 10); _ifPut2(w, db, de, 23, 3073, 10);
+    _ifPut2(w, db, de, 24, 4097, 11); _ifPut2(w, db, de, 25, 6145, 11);
+    _ifPut2(w, db, de, 26, 8193, 12); _ifPut2(w, db, de, 27, 12289, 12);
+    _ifPut2(w, db, de, 28, 16385, 13); _ifPut2(w, db, de, 29, 24577, 13);
+}
+
+// Feste Baeume nach RFC 1951 §3.2.6.
+fn _ifFixed(w: int64): void {
+    var lens: int64 := _ifSlot(w, IFT_LENS);
+    var i: int64 := 0;
+    while (i < 144) { poke64(lens + i * 8, 8); i := i + 1; }
+    while (i < 256) { poke64(lens + i * 8, 9); i := i + 1; }
+    while (i < 280) { poke64(lens + i * 8, 7); i := i + 1; }
+    while (i < 288) { poke64(lens + i * 8, 8); i := i + 1; }
+    _ifBuild(w, lens, 288, _ifSlot(w, IFT_LITCNT), _ifSlot(w, IFT_LITSYM));
+    i := 0;
+    while (i < 30) { poke64(lens + i * 8, 5); i := i + 1; }
+    _ifBuild(w, lens, 30, _ifSlot(w, IFT_DISTCNT), _ifSlot(w, IFT_DISTSYM));
+}
+
+// Reihenfolge der Code-Laengen-Code-Laengen (RFC 1951 §3.2.7).
+fn _ifOrder(i: int64): int64 {
+    if (i == 0) { return 16; }  if (i == 1) { return 17; }  if (i == 2) { return 18; }
+    if (i == 3) { return 0; }   if (i == 4) { return 8; }   if (i == 5) { return 7; }
+    if (i == 6) { return 9; }   if (i == 7) { return 6; }   if (i == 8) { return 10; }
+    if (i == 9) { return 5; }   if (i == 10) { return 11; } if (i == 11) { return 4; }
+    if (i == 12) { return 12; } if (i == 13) { return 3; }  if (i == 14) { return 13; }
+    if (i == 15) { return 2; }  if (i == 16) { return 14; } if (i == 17) { return 1; }
+    return 15;
+}
+
+// Dynamische Baeume aus dem Blockkopf; 0 = OK, -1 = Fehler.
+fn _ifDynamic(w: int64): int64 {
+    var hlit:  int64 := _ifBits(w, 5);
+    var hdist: int64 := _ifBits(w, 5);
+    var hclen: int64 := _ifBits(w, 4);
+    if (hlit < 0 || hdist < 0 || hclen < 0) { return -1; }
+    hlit := hlit + 257;
+    hdist := hdist + 1;
+    hclen := hclen + 4;
+    if (hlit > 286 || hdist > 30) { return -1; }
+    var cl: int64 := _ifSlot(w, IFT_CL);
+    var i: int64 := 0;
+    while (i < 19) { poke64(cl + i * 8, 0); i := i + 1; }
+    i := 0;
+    while (i < hclen) {
+        var v: int64 := _ifBits(w, 3);
+        if (v < 0) { return -1; }
+        poke64(cl + _ifOrder(i) * 8, v);
+        i := i + 1;
+    }
+    var clCnt: int64 := _ifSlot(w, IFT_CLCNT);
+    var clSym: int64 := _ifSlot(w, IFT_CLSYM);
+    _ifBuild(w, cl, 19, clCnt, clSym);
+    var lens: int64 := _ifSlot(w, IFT_LENS);
+    var total: int64 := hlit + hdist;
+    var n: int64 := 0;
+    while (n < total) {
+        var s: int64 := _ifDecode(w, clCnt, clSym);
+        if (s < 0) { return -1; }
+        if (s < 16) {
+            poke64(lens + n * 8, s);
+            n := n + 1;
+        } else {
+            var val: int64 := 0;
+            var rep: int64 := 0;
+            if (s == 16) {
+                if (n == 0) { return -1; }
+                val := peek64(lens + (n - 1) * 8);
+                rep := _ifBits(w, 2);
+                if (rep < 0) { return -1; }
+                rep := rep + 3;
+            } else if (s == 17) {
+                rep := _ifBits(w, 3);
+                if (rep < 0) { return -1; }
+                rep := rep + 3;
+            } else {
+                rep := _ifBits(w, 7);
+                if (rep < 0) { return -1; }
+                rep := rep + 11;
+            }
+            // #1954: in std.zlib fehlt diese Schranke — ein Wiederholcode
+            // ueber das Feldende hinaus schreibt dort hinter lensBuf.
+            if (n + rep > total) { return -1; }
+            while (rep > 0) { poke64(lens + n * 8, val); n := n + 1; rep := rep - 1; }
+        }
+    }
+    // Ohne Code fuer das Blockende (256) ist der Block nicht dekodierbar.
+    if (peek64(lens + 256 * 8) == 0) { return -1; }
+    _ifBuild(w, lens, hlit, _ifSlot(w, IFT_LITCNT), _ifSlot(w, IFT_LITSYM));
+    var d: int64 := 0;
+    while (d < hdist) {
+        poke64(lens + d * 8, peek64(lens + (hlit + d) * 8));
+        d := d + 1;
+    }
+    _ifBuild(w, lens, hdist, _ifSlot(w, IFT_DISTCNT), _ifSlot(w, IFT_DISTSYM));
+    return 0;
+}
+
+// Ausgabebyte schreiben; 0 = OK, -2 = Puffer voll.
+fn _ifOut(w: int64, b: int64): int64 {
+    var op: int64 := _ifGet(w, IFS_OUTPOS);
+    if (op >= _ifGet(w, IFS_OUTMAX)) { _ifSet(w, IFS_OUTFULL, 1); return -2; }
+    poke8(_ifGet(w, IFS_OUTPUT) + op, b & 255);
+    _ifSet(w, IFS_OUTPOS, op + 1);
+    return 0;
+}
+
+// Komprimierter Block (fest/dynamisch); 0 = OK, <0 = Fehler.
+fn _ifBlock(w: int64): int64 {
+    var litCnt:  int64 := _ifSlot(w, IFT_LITCNT);
+    var litSym:  int64 := _ifSlot(w, IFT_LITSYM);
+    var distCnt: int64 := _ifSlot(w, IFT_DISTCNT);
+    var distSym: int64 := _ifSlot(w, IFT_DISTSYM);
+    while (1 == 1) {
+        var s: int64 := _ifDecode(w, litCnt, litSym);
+        if (s < 0) { return -1; }
+        if (s < 256) {
+            if (_ifOut(w, s) < 0) { return -2; }
+        } else if (s == 256) {
+            return 0;
+        } else {
+            var si: int64 := s - 257;
+            if (si >= 29) { return -1; }
+            var lx: int64 := _ifBits(w, _ifGet(w, IFT_LENEXTRA + si));
+            if (lx < 0) { return -1; }
+            var length: int64 := _ifGet(w, IFT_LENBASE + si) + lx;
+            var ds: int64 := _ifDecode(w, distCnt, distSym);
+            if (ds < 0 || ds >= 30) { return -1; }
+            var dx: int64 := _ifBits(w, _ifGet(w, IFT_DISTEXTRA + ds));
+            if (dx < 0) { return -1; }
+            var dist: int64 := _ifGet(w, IFT_DISTBASE + ds) + dx;
+            if (dist > _ifGet(w, IFS_OUTPOS)) { return -1; }
+            var outp: int64 := _ifGet(w, IFS_OUTPUT);
+            var k: int64 := 0;
+            while (k < length) {
+                var b: int64 := peek8(outp + _ifGet(w, IFS_OUTPOS) - dist);
+                if (_ifOut(w, b) < 0) { return -2; }
+                k := k + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+fn _ifRun(w: int64): int64 {
+    var fin: int64 := 0;
+    while (fin == 0) {
+        var bfinal: int64 := _ifBits(w, 1);
+        var btype:  int64 := _ifBits(w, 2);
+        if (bfinal < 0 || btype < 0) { return -1; }
+        if (bfinal == 1) { fin := 1; }
+        if (btype == 0) {
+            var bytePos: int64 := (_ifGet(w, IFS_BITPOS) + 7) >> 3;
+            var inp: int64 := _ifGet(w, IFS_INPUT);
+            var ilen: int64 := _ifGet(w, IFS_INLEN);
+            if (bytePos + 4 > ilen) { return -1; }
+            var slen: int64 := peek8(inp + bytePos) + peek8(inp + bytePos + 1) * 256;
+            var nlen: int64 := peek8(inp + bytePos + 2) + peek8(inp + bytePos + 3) * 256;
+            if ((slen ^ 65535) != nlen) { return -1; }
+            bytePos := bytePos + 4;
+            if (bytePos + slen > ilen) { return -1; }
+            var k: int64 := 0;
+            while (k < slen) {
+                if (_ifOut(w, peek8(inp + bytePos + k)) < 0) { return -2; }
+                k := k + 1;
+            }
+            _ifSet(w, IFS_BITPOS, (bytePos + slen) << 3);
+        } else if (btype == 1) {
+            _ifFixed(w);
+            var r1: int64 := _ifBlock(w);
+            if (r1 < 0) { return r1; }
+        } else if (btype == 2) {
+            if (_ifDynamic(w) < 0) { return -1; }
+            var r2: int64 := _ifBlock(w);
+            if (r2 < 0) { return r2; }
+        } else {
+            return -1;
+        }
+    }
+    return _ifGet(w, IFS_OUTPOS);
+}
+
+// Rohen DEFLATE-Strom (RFC 1951) nach dst entpacken, hoechstens dstMax Bytes.
+// work: INFLATE_WORK_SIZE Bytes des Aufrufers. consumedOut (oder 0) nimmt die
+// Zahl der verbrauchten Eingabebytes auf.
+pub fn InflateRawToBuffer(src: int64, srcLen: int64, dst: int64, dstMax: int64,
+                          work: int64, workLen: int64, consumedOut: int64): int64 {
+    if (work == 0 || workLen < INFLATE_WORK_SIZE) { return INFLATE_ERR_ARG; }
+    if (srcLen < 0 || dstMax < 0) { return INFLATE_ERR_ARG; }
+    if (src == 0 || (dst == 0 && dstMax > 0)) { return INFLATE_ERR_ARG; }
+    _ifSet(work, IFS_INPUT, src);
+    _ifSet(work, IFS_INLEN, srcLen);
+    _ifSet(work, IFS_OUTPUT, dst);
+    _ifSet(work, IFS_BITPOS, 0);
+    _ifSet(work, IFS_OUTPOS, 0);
+    _ifSet(work, IFS_OUTMAX, dstMax);
+    _ifSet(work, IFS_OUTFULL, 0);
+    _ifTables(work);
+    var n: int64 := _ifRun(work);
+    if (consumedOut != 0) { poke64(consumedOut, (_ifGet(work, IFS_BITPOS) + 7) >> 3); }
+    if (n < 0) {
+        if (_ifGet(work, IFS_OUTFULL) != 0) { return INFLATE_ERR_FULL; }
+        return INFLATE_ERR_DATA;
+    }
+    return n;
+}
+
+// Adler-32 (RFC 1950) ueber len Bytes ab p.
+pub fn InflateAdler32(p: int64, len: int64): int64 {
+    var a: int64 := 1;
+    var b: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) {
+        a := a + peek8(p + i);
+        if (a >= 65521) { a := a - 65521; }
+        b := b + a;
+        if (b >= 65521) { b := b - 65521; }
+        i := i + 1;
+    }
+    return (b << 16) | a;
+}
+
+// zlib-Strom (RFC 1950): Kopf pruefen, DEFLATE entpacken, Adler-32 pruefen.
+// Ein voreingestelltes Woerterbuch (FDICT) wird abgelehnt.
+pub fn InflateZlibToBuffer(src: int64, srcLen: int64, dst: int64, dstMax: int64,
+                           work: int64, workLen: int64): int64 {
+    if (src == 0 || srcLen < 0) { return INFLATE_ERR_ARG; }
+    if (srcLen < 6) { return INFLATE_ERR_DATA; }
+    var cmf: int64 := peek8(src);
+    var flg: int64 := peek8(src + 1);
+    if ((cmf & 15) != 8) { return INFLATE_ERR_DATA; }
+    if ((cmf >> 4) > 7) { return INFLATE_ERR_DATA; }
+    var sum: int64 := cmf * 256 + flg;
+    if ((sum - (sum / 31) * 31) != 0) { return INFLATE_ERR_DATA; }
+    if (((flg >> 5) & 1) != 0) { return INFLATE_ERR_DATA; }
+    var used: int64 := 0;
+    var usedPtr: int64 := work + IFT_END * 8;   // hinter dem Zustand, im Puffer
+    var n: int64 := InflateRawToBuffer(src + 2, srcLen - 2, dst, dstMax, work, workLen, usedPtr);
+    if (n < 0) { return n; }
+    used := peek64(usedPtr);
+    var tp: int64 := src + 2 + used;
+    if (2 + used + 4 > srcLen) { return INFLATE_ERR_DATA; }
+    var want: int64 := (peek8(tp) << 24) | (peek8(tp + 1) << 16) | (peek8(tp + 2) << 8) | peek8(tp + 3);
+    if (InflateAdler32(dst, n) != want) { return INFLATE_ERR_DATA; }
+    return n;
+}
