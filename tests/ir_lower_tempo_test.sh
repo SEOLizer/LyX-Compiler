@@ -57,7 +57,7 @@ else nok "4000 gegen 1000 Aufrufe: Faktor $((faktor/10)).$((faktor%10)) — waec
   echo 'fn main(): int64 { var p: int64 := alloc(4800); fill(p); var s: int64 := 0; var i: int64 := 0;'
   echo '  while (i < 600) { s := s + peek64(p + i * 8); i := i + 1; } PrintLn(IntToStr(s)); return 0; }'
 } > "$TMP/w.lyx"
-if [ -z "$QEMU_ARM64" ]; then nok "qemu-aarch64 fehlt — Wirkung NICHT gemessen"
+if [ -z "$QEMU_ARM64" ]; then nok "arm64-Emulator fehlt — Wirkung NICHT gemessen"
 elif ( cd "$ROOT" && timeout 240 "$LYXC" --std-path="$ROOT" --target=arm64 "$TMP/w.lyx" -o "$TMP/w" ) >/dev/null 2>&1; then
   ist="$(timeout 60 "$QEMU_ARM64" "$TMP/w" 2>&1)"
   if [ "$ist" = "179700" ]; then ok "arm64 -O2: 600 Werte, Summe 179700"; else nok "arm64: Summe [$ist] statt 179700"; fi
