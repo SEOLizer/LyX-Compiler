@@ -872,7 +872,7 @@ test: lyxc
 	@echo "--- Kernsprache (.lyx-Suite) ---"
 	@bash tests/run_lyx_suite.sh tests/suite-core.txt "Kernsprache"
 	@echo "OK"
-	@echo "--- Funktions- und Methodenzeiger (8 Suiten) ---"
+	@echo "--- Funktions- und Methodenzeiger (9 Suiten) ---"
 	@bash tests/arity_check_test.sh
 	@bash tests/asm_block_test.sh
 	@bash tests/elf_reloc_test.sh
@@ -881,6 +881,7 @@ test: lyxc
 	@bash tests/local_fnptr_test.sh
 	@bash tests/method_ptr_test.sh
 	@bash tests/method_ptr_xmod_test.sh
+	@bash tests/import_fn_wert_test.sh
 	@echo "OK"
 	@echo "--- Geometrie-/Result-Units (Struct-Literal-Umbau, 31 Prüfungen) ---"
 	./lyxc --std-path=std tests/geom_units_test.lyx -o /tmp/lyxc_geom_test
