@@ -220,9 +220,16 @@ for ZIEL in riscv arm64; do
   pre="$QEMU_ARM64"; [ "$ZIEL" = "riscv" ] && pre="$QEMU_RISCV64"
   if ( cd "$ROOT" && timeout 300 "$LYXC" --target="$ZIEL" examples/test_zlib.lyx -o "$TMP/zlib" ) >"$TMP/bl.log" 2>&1; then
     if [ -n "$pre" ]; then
-      letzte="$( ( timeout 60 "$pre" "$TMP/zlib" 2>/dev/null | tail -1 ) 2>/dev/null )"
+      # #2105: Ausgabe, stderr und Rueckgabewert aufheben — der Abbruch tritt
+      # nur im vollen `make test` auf, und bisher sah man nur die letzte Zeile.
+      ( timeout 60 "$pre" "$TMP/zlib" >"$TMP/zlib.out" 2>"$TMP/zlib.err" ); zrc=$?
+      letzte="$(tail -1 "$TMP/zlib.out")"
       if [ "$letzte" = "Roundtrip successful!" ]; then ok "test_zlib laeuft durch [$ZIEL]"
-      else nok "test_zlib [$ZIEL]: letzte Zeile '$letzte'"; fi
+      else
+        nok "test_zlib [$ZIEL]: letzte Zeile '$letzte', rc=$zrc"
+        echo "  stderr: $(head -c 400 "$TMP/zlib.err" | tr '\n' ' ')"
+        echo "  ulimit -v $(ulimit -v), -s $(ulimit -s); frei: $(free -m | awk '/^Mem/{print $7}') MB"
+      fi
     else
       nok "test_zlib [$ZIEL]: qemu fehlt — NICHT gemessen"
     fi
