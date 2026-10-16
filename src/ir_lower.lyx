@@ -772,6 +772,9 @@ pub type IRLower = class {
   // je Modul gebaut — sonst liefe jede Aufrufstelle die Deklarationskette ab,
   // und der IR-Weg ist bei grossen Units ohnehin langsam (#2023).
   irPrivTab:    int64;
+  irPubConTab:  int64;   // #2107
+  irPubConCnt:  int64;
+  irPubConCap:  int64;
   irPrivCnt:    int64;
 
   // #1693: Suchpfade fuer Importe. Die IR-Strecke hat sie bisher nicht
@@ -8030,198 +8033,6 @@ pub type IRLower = class {
     var lmSavedPC: int64 := self.irPrivCnt;
     self.irModHead := decls;
     self._irPrivBaue(decls);
-    // WP-AND-upstream-fix v4: pre-pass — register every top-level NK_VAR_DECL
-    // as a global. NK_IDENT lookups in expressions later in this lowerModule
-    // (and in nested lowerModule calls for imports) can then resolve them.
-    var ggCur: int64 := decls;
-    while ggCur >= 0 {
-      // #LBF-con: NK_CON_DECL gehoert hier ebenso hinein. Eine `con`-Deklaration
-      // auf Modulebene hat denselben Aufbau wie NK_VAR_DECL (Name via _ssv,
-      // Typ in c0, Anfangswert in c1) -- sie fiel nur durch, weil hier
-      // ausschliesslich auf NK_VAR_DECL geprueft wurde.
-      //
-      // Folge auf den IR-Backends: jede Modul-Konstante war 0. Auf lyxos hiess
-      // das konkret, dass `poke64(blk + B_OFF_A1, x)` nach blk+0 schrieb --
-      // sichtbar wurde es erst daran, dass LBF-Programme mit bsys nichts
-      // ausgaben, weil nur das Feld mit Offset 0 ankam. Der x86-Pfad ist nicht
-      // betroffen (dort werden Konstanten frueher gefaltet).
-      var ggKind: int64 := self.nodeKind(ggCur);
-      // #1961 Stufe 2: `@resource` traegt eine Tabelle ins Erzeugnis, die aus
-      // Zeigern in den Datenbereich besteht. Auf dem IR-Weg fehlt bisher die
-      // ABLAGE fuer eine solche Tabelle — die Bytes selbst waeren kein
-      // Problem mehr.
-      //
-      // #1971: Die Meldung nannte bis 1.2.5A die nullterminierte
-      // Zeichenkettentabelle und #1968 als Grund. Das trifft NICHT MEHR ZU:
-      // seit #1968 stehen vor jeder Zeichenkette acht Byte Laenge, binaere
-      // Daten ueberleben also. Offen ist allein die Tabelle — ein Feld aus
-      // int64 im Datenbereich, dessen Zeiger erst beim Schreiben des
-      // Erzeugnisses feststehen. Wer hier weiterbaut, braucht das und nicht
-      // mehr.
-      //
-      // Gemeldet wird HIER, an der Deklaration, und nicht erst beim Zugriff:
-      // sonst uebersetzte ein Programm, das Ressourcen nur mitfuehrt und
-      // (noch) nicht liest, klanglos durch und haette sie nicht.
-      if ggKind == NK_RESOURCE {
-        EPrintStrLn("lyxc: @resource ist bisher nur mit --target=x86_64 umgesetzt."c);
-        EPrintStrLn("  Es fehlt die Ablage fuer die Tabelle: ein Feld aus int64 im"c);
-        EPrintStrLn("  Datenbereich, dessen Zeiger erst beim Schreiben feststehen."c);
-        EPrintStrLn("  Die BYTES waeren kein Hindernis mehr — die Zeichenkettentabelle"c);
-        EPrintStrLn("  traegt seit #1968 ihre Laenge und vertraegt Nullbytes (#1971)."c);
-        EPrintStrLn("  Fuer einzelne Dateien geht @embed auch hier — bei Textdateien."c);
-        exit(1);
-      }
-      if ggKind == NK_VAR_DECL || ggKind == NK_CON_DECL {
-        if self.globalNameCnt >= self.globalNameCap {
-          var ggNewCap: int64 := self.globalNameCap * 2;
-          var ggNb: int64 := alloc(ggNewCap * 32);
-          var ggI: int64 := 0;
-          memcpy(ggNb, self.globalNameBuf, self.globalNameCnt * 32);
-          self.globalNameBuf := ggNb;
-          self.globalNameCap := ggNewCap;
-        }
-        // #1798: Der Anfangswert wurde nur uebernommen, wenn der Knoten ein
-        // NK_LIT_INT war. `-1` ist aber KEIN Literal, sondern ein unaeres
-        // Minus um eines — jede negative Konstante kam damit als 0 an, still.
-        // Ebenso `0 - 1`, `(-1)` und `1 * -1`.
-        //
-        // Jetzt wird der Ausdruck gefaltet. Laesst er sich nicht falten, ist
-        // das bei einer `con` ein Fehler und keine 0: eine Konstante MUSS zur
-        // Uebersetzungszeit einen Wert haben. Bei `var` bleibt es bei 0 —
-        // dort ist die Vorbelegung zur Laufzeit vorgesehen (Konstruktoren),
-        // und ein Abbruch wuerde Bestehendes brechen.
-        var ggInit: int64 := 0;
-        var ggInitNode: int64 := self.nodeC1(ggCur);
-        if ggInitNode >= 0 {
-          if self._constFaltbar(ggInitNode) != 0 {
-            ggInit := self._constWert(ggInitNode);
-          } else {
-            // Gleitkomma gehoert NICHT in diesen Falter — er rechnet
-            // ganzzahlig, und auf ein IEEE-Bitmuster losgelassen kaeme Unsinn
-            // heraus (dieselbe Sperre wie im x86-Pfad, #1499). Eine
-            // f64-Konstante ist also nicht „nicht faltbar", sondern hier gar
-            // nicht zustaendig: es bleibt bei 0, wie bisher.
-            //
-            // Dass eine f64-Modulkonstante auf den IR-Backends damit 0 ist,
-            // steht als eigener Punkt in #1801 — es ist ein Bestandsdefekt,
-            // kein Ergebnis dieser Aenderung.
-            var ggIstF64: int64 := 0;
-            if self.nodeKind(ggInitNode) == NK_LIT_FLOAT { ggIstF64 := 1; }
-            var ggTy: int64 := self.nodeC0(ggCur);
-            if ggTy >= 0 {
-              if self.nodeKind(ggTy) == NK_TYPE_NAME {
-                if self.seq(self.nodeSVal(ggTy), self.nodeSLen(ggTy), "f64", 3) { ggIstF64 := 1; }
-                if self.seq(self.nodeSVal(ggTy), self.nodeSLen(ggTy), "f32", 3) { ggIstF64 := 1; }
-              }
-            }
-            // #1801: Gleitkomma wird nicht GERECHNET, sondern als Bitmuster
-            // abgelegt — genau so, wie es der Zweig fuer f64-Literale IM Code
-            // seit #868 tut. Vorher blieb es bei 0, und `con P: f64 := 2.5`
-            // kam als 0.0 an. In std/math.lyx sind MATH_LN2 und MATH_LN10 so
-            // vereinbart; `fDiv(x, MATH_LN2)` war auf diesen Zielen damit eine
-            // Division durch null, ohne dass beim Uebersetzen etwas auffiel.
-            if ggIstF64 != 0 {
-              var ggFN: int64 := ggInitNode;
-              var ggNeg: int64 := 0;
-              // `con X: f64 := -2.5` ist ein unaeres Minus um das Literal.
-              if self.nodeKind(ggFN) == NK_UNOP {
-                if self.nodeIVal(ggFN) == 71 { ggNeg := 1; ggFN := self.nodeC0(ggFN); }
-              }
-              if self.nodeKind(ggFN) == NK_LIT_FLOAT {
-                ggInit := self._parseFloatBits(self.nodeSVal(ggFN), self.nodeSLen(ggFN));
-                // Vorzeichenbit setzen statt zu rechnen — die Bits sind IEEE,
-                // keine Zahl, die man negieren duerfte.
-                if ggNeg != 0 { ggInit := ggInit ^ (1 << 63); }
-              }
-            }
-            // #2019: `con S: pchar := "…"` — eine Konstante mit ZEICHENKETTE
-            // als Anfangswert. Der Falter rechnet ganzzahlig; eine
-            // Zeichenkette ist fuer ihn nicht ausrechenbar, und bis 1.2.5C
-            // endete das hier in _constNichtFaltbar. Damit liessen sich 41
-            // stdlib-Units fuer KEIN IR-Ziel uebersetzen (Pfad- und
-            // Host-Konstanten in std/cloud/**, std/hardware/pci_*,
-            // std/net/whois) — auf dem x86-Schnellweg gingen dieselben Zeilen
-            // immer. Dieselbe Bauart wie die f64-Behandlung darueber (#1801):
-            // nicht RECHNEN, sondern ablegen.
-            //
-            // Der Wert wird NICHT als Global-Init eingetragen: das sind rohe
-            // 8 Byte in .data, die Adresse der Zeichenkette steht dort aber
-            // erst beim Erzeugen fest und brauchte eine Relokation. Der
-            // x86-Weg loest es seit #1338 anders und richtig
-            // (cg_collectCons → cg_addConStr): Name und Datenoffset merken,
-            // beim Zugriff die ADRESSE laden. _conStrFind im NK_IDENT-Zweig
-            // fragt VOR der Global-Suche, gewinnt also gegen den hier
-            // stehenbleibenden Eintrag mit Wert 0.
-            // #2026: Auch durch CASTS hindurch. `con H: int64 := "…"c as
-            // int64` ist ein NK_CAST UM das Literal. Dieselbe Aufloesung wie
-            // cg_collectCons im x86-Weg — die beiden muessen uebereinstimmen;
-            // dort lieferte der Fall bis 1.2.5D STILL 0 (CF_API_HOST).
-            var ggStrN: int64 := ggInitNode;
-            var ggStrTiefer: int64 := 1;
-            while ggStrTiefer != 0 {
-              ggStrTiefer := 0;
-              if self.nodeKind(ggStrN) == NK_CAST {
-                var ggStrInner: int64 := self.nodeC0(ggStrN);
-                if ggStrInner >= 0 { ggStrN := ggStrInner; ggStrTiefer := 1; }
-              }
-            }
-            var ggIstStr: int64 := 0;
-            if self.nodeKind(ggStrN) == NK_LIT_STR {
-              ggIstStr := 1;
-              if ggKind == NK_CON_DECL {
-                self._conStrAdd(self.nodeSVal(ggCur), self.nodeSLen(ggCur),
-                                self._strLitInternieren(ggStrN));
-              }
-            }
-            if ggKind == NK_CON_DECL && ggIstF64 == 0 && ggIstStr == 0 { self._constNichtFaltbar(ggCur); }
-          }
-        }
-        // WP-AND-upstream-fix v5/cross-module: copy the name into the IR
-        // string table so subsequent NK_IDENT lookups don't depend on
-        // self.src (which gets swapped while lowering imports). The stored
-        // offset is into ir.strBuffer, not into any parser's src.
-        var ggNamePtr: pchar := self.nodeSVal(ggCur);
-        var ggNameLen: int64 := self.nodeSLen(ggCur);
-        // #2097/#2099: eine PRIVATE Modulvariable/Konstante einer Unit unter
-        // ihrer Marke eintragen. Die Suche nahm den ersten Treffer nach
-        // blankem Namen — zwei Units mit `var gX` banden beide an den Platz
-        // der zuerst uebersetzten.
-        if self.irUnitTag != 0 && self.nodeIsPub(ggCur) == 0 {
-          var ggPLc: int64 := alloc(8);
-          ggNamePtr := self._irPrivMangle(ggNamePtr as int64, ggNameLen, ggPLc) as pchar;
-          ggNameLen := peek64(ggPLc);
-          free(ggPLc, 8);
-        }
-        var ggStrOff:  int64 := self.irAddString(ggNamePtr, ggNameLen);
-        var ggRec: int64 := self.globalNameBuf + self.globalNameCnt * 32;
-        poke64(ggRec +  0, ggStrOff);                            // IR strBuf offset
-        poke64(ggRec +  8, ggNameLen);
-        poke64(ggRec + GLOBAL_REC_OFF_IDX, self.globalNameCnt);                  // globalIdx
-        poke64(ggRec + GLOBAL_REC_OFF_INIT, ggInit);                              // init value
-        // Also mirror into IR module's globalBuffer (8 bytes per global, init
-        // value at globalIdx*8). writeELFSharedLib reads from here to emit
-        // the .data section. IR module layout: globalBuffer @ +104,
-        // globalCap @ +112, globalLen @ +120 (offsets follow the class field
-        // order in ir.lyx).
-        var ggBuf: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALBUF);
-        var ggCap: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALCAP);
-        if self.globalNameCnt * 8 + 8 > ggCap {
-          var ggNewCap2: int64 := ggCap * 2;
-          if ggNewCap2 < self.globalNameCnt * 8 + 8 { ggNewCap2 := self.globalNameCnt * 8 + 64; }
-          var ggNb2: int64 := alloc(ggNewCap2);
-          var ggI2: int64 := 0;
-          memcpy(ggNb2, ggBuf, self.globalNameCnt * 8);
-          ggBuf := ggNb2;
-          poke64(self.ir + IR_MOD_OFF_GLOBALBUF, ggBuf);
-          poke64(self.ir + IR_MOD_OFF_GLOBALCAP, ggNewCap2);
-        }
-        poke64(ggBuf + self.globalNameCnt * 8, ggInit);
-        poke64(self.ir + IR_MOD_OFF_GLOBALLEN, self.globalNameCnt + 1);   // globalLen
-        self.globalNameCnt += 1;
-      }
-      ggCur := self.nodeNext(ggCur);
-    }
-
     // WP-AND-upstream-fix v9: forward-reference pre-pass.
     // Register every top-level NK_FUNC_DECL name in funcBuffer with a
     // placeholder body before any function body is lowered. _addFunc
@@ -8496,6 +8307,205 @@ pub type IRLower = class {
       self.impLstCnt := wlCnt; self.impLstHead := wlHead;
       self.impLstName := wlName; self.impLstNameLen := wlNameL;   // #2076
       self.impLstN   := wlW;
+      self._irPubConSammle();   // #2107
+    }
+
+    // #2107: Der Vorpass fuer Modulvariablen und Konstanten steht HINTER dem
+    // transitiven Import-Vorpass. Bis 1.2.14A lief er davor: eine Konstante
+    // des Hauptmoduls, deren Startwert eine oeffentliche Konstante einer
+    // importierten Unit nennt, liess sich dort noch nicht falten und wurde
+    // mit #1798 abgewiesen. Fuer importierte Units aendert sich nichts — dort
+    // laeuft der transitive Vorpass ohnehin nur einmal, oben.
+    // WP-AND-upstream-fix v4: pre-pass — register every top-level NK_VAR_DECL
+    // as a global. NK_IDENT lookups in expressions later in this lowerModule
+    // (and in nested lowerModule calls for imports) can then resolve them.
+    var ggCur: int64 := decls;
+    while ggCur >= 0 {
+      // #LBF-con: NK_CON_DECL gehoert hier ebenso hinein. Eine `con`-Deklaration
+      // auf Modulebene hat denselben Aufbau wie NK_VAR_DECL (Name via _ssv,
+      // Typ in c0, Anfangswert in c1) -- sie fiel nur durch, weil hier
+      // ausschliesslich auf NK_VAR_DECL geprueft wurde.
+      //
+      // Folge auf den IR-Backends: jede Modul-Konstante war 0. Auf lyxos hiess
+      // das konkret, dass `poke64(blk + B_OFF_A1, x)` nach blk+0 schrieb --
+      // sichtbar wurde es erst daran, dass LBF-Programme mit bsys nichts
+      // ausgaben, weil nur das Feld mit Offset 0 ankam. Der x86-Pfad ist nicht
+      // betroffen (dort werden Konstanten frueher gefaltet).
+      var ggKind: int64 := self.nodeKind(ggCur);
+      // #1961 Stufe 2: `@resource` traegt eine Tabelle ins Erzeugnis, die aus
+      // Zeigern in den Datenbereich besteht. Auf dem IR-Weg fehlt bisher die
+      // ABLAGE fuer eine solche Tabelle — die Bytes selbst waeren kein
+      // Problem mehr.
+      //
+      // #1971: Die Meldung nannte bis 1.2.5A die nullterminierte
+      // Zeichenkettentabelle und #1968 als Grund. Das trifft NICHT MEHR ZU:
+      // seit #1968 stehen vor jeder Zeichenkette acht Byte Laenge, binaere
+      // Daten ueberleben also. Offen ist allein die Tabelle — ein Feld aus
+      // int64 im Datenbereich, dessen Zeiger erst beim Schreiben des
+      // Erzeugnisses feststehen. Wer hier weiterbaut, braucht das und nicht
+      // mehr.
+      //
+      // Gemeldet wird HIER, an der Deklaration, und nicht erst beim Zugriff:
+      // sonst uebersetzte ein Programm, das Ressourcen nur mitfuehrt und
+      // (noch) nicht liest, klanglos durch und haette sie nicht.
+      if ggKind == NK_RESOURCE {
+        EPrintStrLn("lyxc: @resource ist bisher nur mit --target=x86_64 umgesetzt."c);
+        EPrintStrLn("  Es fehlt die Ablage fuer die Tabelle: ein Feld aus int64 im"c);
+        EPrintStrLn("  Datenbereich, dessen Zeiger erst beim Schreiben feststehen."c);
+        EPrintStrLn("  Die BYTES waeren kein Hindernis mehr — die Zeichenkettentabelle"c);
+        EPrintStrLn("  traegt seit #1968 ihre Laenge und vertraegt Nullbytes (#1971)."c);
+        EPrintStrLn("  Fuer einzelne Dateien geht @embed auch hier — bei Textdateien."c);
+        exit(1);
+      }
+      if ggKind == NK_VAR_DECL || ggKind == NK_CON_DECL {
+        if self.globalNameCnt >= self.globalNameCap {
+          var ggNewCap: int64 := self.globalNameCap * 2;
+          var ggNb: int64 := alloc(ggNewCap * 32);
+          var ggI: int64 := 0;
+          memcpy(ggNb, self.globalNameBuf, self.globalNameCnt * 32);
+          self.globalNameBuf := ggNb;
+          self.globalNameCap := ggNewCap;
+        }
+        // #1798: Der Anfangswert wurde nur uebernommen, wenn der Knoten ein
+        // NK_LIT_INT war. `-1` ist aber KEIN Literal, sondern ein unaeres
+        // Minus um eines — jede negative Konstante kam damit als 0 an, still.
+        // Ebenso `0 - 1`, `(-1)` und `1 * -1`.
+        //
+        // Jetzt wird der Ausdruck gefaltet. Laesst er sich nicht falten, ist
+        // das bei einer `con` ein Fehler und keine 0: eine Konstante MUSS zur
+        // Uebersetzungszeit einen Wert haben. Bei `var` bleibt es bei 0 —
+        // dort ist die Vorbelegung zur Laufzeit vorgesehen (Konstruktoren),
+        // und ein Abbruch wuerde Bestehendes brechen.
+        var ggInit: int64 := 0;
+        var ggInitNode: int64 := self.nodeC1(ggCur);
+        if ggInitNode >= 0 {
+          if self._constFaltbar(ggInitNode) != 0 {
+            ggInit := self._constWert(ggInitNode);
+          } else {
+            // Gleitkomma gehoert NICHT in diesen Falter — er rechnet
+            // ganzzahlig, und auf ein IEEE-Bitmuster losgelassen kaeme Unsinn
+            // heraus (dieselbe Sperre wie im x86-Pfad, #1499). Eine
+            // f64-Konstante ist also nicht „nicht faltbar", sondern hier gar
+            // nicht zustaendig: es bleibt bei 0, wie bisher.
+            //
+            // Dass eine f64-Modulkonstante auf den IR-Backends damit 0 ist,
+            // steht als eigener Punkt in #1801 — es ist ein Bestandsdefekt,
+            // kein Ergebnis dieser Aenderung.
+            var ggIstF64: int64 := 0;
+            if self.nodeKind(ggInitNode) == NK_LIT_FLOAT { ggIstF64 := 1; }
+            var ggTy: int64 := self.nodeC0(ggCur);
+            if ggTy >= 0 {
+              if self.nodeKind(ggTy) == NK_TYPE_NAME {
+                if self.seq(self.nodeSVal(ggTy), self.nodeSLen(ggTy), "f64", 3) { ggIstF64 := 1; }
+                if self.seq(self.nodeSVal(ggTy), self.nodeSLen(ggTy), "f32", 3) { ggIstF64 := 1; }
+              }
+            }
+            // #1801: Gleitkomma wird nicht GERECHNET, sondern als Bitmuster
+            // abgelegt — genau so, wie es der Zweig fuer f64-Literale IM Code
+            // seit #868 tut. Vorher blieb es bei 0, und `con P: f64 := 2.5`
+            // kam als 0.0 an. In std/math.lyx sind MATH_LN2 und MATH_LN10 so
+            // vereinbart; `fDiv(x, MATH_LN2)` war auf diesen Zielen damit eine
+            // Division durch null, ohne dass beim Uebersetzen etwas auffiel.
+            if ggIstF64 != 0 {
+              var ggFN: int64 := ggInitNode;
+              var ggNeg: int64 := 0;
+              // `con X: f64 := -2.5` ist ein unaeres Minus um das Literal.
+              if self.nodeKind(ggFN) == NK_UNOP {
+                if self.nodeIVal(ggFN) == 71 { ggNeg := 1; ggFN := self.nodeC0(ggFN); }
+              }
+              if self.nodeKind(ggFN) == NK_LIT_FLOAT {
+                ggInit := self._parseFloatBits(self.nodeSVal(ggFN), self.nodeSLen(ggFN));
+                // Vorzeichenbit setzen statt zu rechnen — die Bits sind IEEE,
+                // keine Zahl, die man negieren duerfte.
+                if ggNeg != 0 { ggInit := ggInit ^ (1 << 63); }
+              }
+            }
+            // #2019: `con S: pchar := "…"` — eine Konstante mit ZEICHENKETTE
+            // als Anfangswert. Der Falter rechnet ganzzahlig; eine
+            // Zeichenkette ist fuer ihn nicht ausrechenbar, und bis 1.2.5C
+            // endete das hier in _constNichtFaltbar. Damit liessen sich 41
+            // stdlib-Units fuer KEIN IR-Ziel uebersetzen (Pfad- und
+            // Host-Konstanten in std/cloud/**, std/hardware/pci_*,
+            // std/net/whois) — auf dem x86-Schnellweg gingen dieselben Zeilen
+            // immer. Dieselbe Bauart wie die f64-Behandlung darueber (#1801):
+            // nicht RECHNEN, sondern ablegen.
+            //
+            // Der Wert wird NICHT als Global-Init eingetragen: das sind rohe
+            // 8 Byte in .data, die Adresse der Zeichenkette steht dort aber
+            // erst beim Erzeugen fest und brauchte eine Relokation. Der
+            // x86-Weg loest es seit #1338 anders und richtig
+            // (cg_collectCons → cg_addConStr): Name und Datenoffset merken,
+            // beim Zugriff die ADRESSE laden. _conStrFind im NK_IDENT-Zweig
+            // fragt VOR der Global-Suche, gewinnt also gegen den hier
+            // stehenbleibenden Eintrag mit Wert 0.
+            // #2026: Auch durch CASTS hindurch. `con H: int64 := "…"c as
+            // int64` ist ein NK_CAST UM das Literal. Dieselbe Aufloesung wie
+            // cg_collectCons im x86-Weg — die beiden muessen uebereinstimmen;
+            // dort lieferte der Fall bis 1.2.5D STILL 0 (CF_API_HOST).
+            var ggStrN: int64 := ggInitNode;
+            var ggStrTiefer: int64 := 1;
+            while ggStrTiefer != 0 {
+              ggStrTiefer := 0;
+              if self.nodeKind(ggStrN) == NK_CAST {
+                var ggStrInner: int64 := self.nodeC0(ggStrN);
+                if ggStrInner >= 0 { ggStrN := ggStrInner; ggStrTiefer := 1; }
+              }
+            }
+            var ggIstStr: int64 := 0;
+            if self.nodeKind(ggStrN) == NK_LIT_STR {
+              ggIstStr := 1;
+              if ggKind == NK_CON_DECL {
+                self._conStrAdd(self.nodeSVal(ggCur), self.nodeSLen(ggCur),
+                                self._strLitInternieren(ggStrN));
+              }
+            }
+            if ggKind == NK_CON_DECL && ggIstF64 == 0 && ggIstStr == 0 { self._constNichtFaltbar(ggCur); }
+          }
+        }
+        // WP-AND-upstream-fix v5/cross-module: copy the name into the IR
+        // string table so subsequent NK_IDENT lookups don't depend on
+        // self.src (which gets swapped while lowering imports). The stored
+        // offset is into ir.strBuffer, not into any parser's src.
+        var ggNamePtr: pchar := self.nodeSVal(ggCur);
+        var ggNameLen: int64 := self.nodeSLen(ggCur);
+        // #2097/#2099: eine PRIVATE Modulvariable/Konstante einer Unit unter
+        // ihrer Marke eintragen. Die Suche nahm den ersten Treffer nach
+        // blankem Namen — zwei Units mit `var gX` banden beide an den Platz
+        // der zuerst uebersetzten.
+        if self.irUnitTag != 0 && self.nodeIsPub(ggCur) == 0 {
+          var ggPLc: int64 := alloc(8);
+          ggNamePtr := self._irPrivMangle(ggNamePtr as int64, ggNameLen, ggPLc) as pchar;
+          ggNameLen := peek64(ggPLc);
+          free(ggPLc, 8);
+        }
+        var ggStrOff:  int64 := self.irAddString(ggNamePtr, ggNameLen);
+        var ggRec: int64 := self.globalNameBuf + self.globalNameCnt * 32;
+        poke64(ggRec +  0, ggStrOff);                            // IR strBuf offset
+        poke64(ggRec +  8, ggNameLen);
+        poke64(ggRec + GLOBAL_REC_OFF_IDX, self.globalNameCnt);                  // globalIdx
+        poke64(ggRec + GLOBAL_REC_OFF_INIT, ggInit);                              // init value
+        // Also mirror into IR module's globalBuffer (8 bytes per global, init
+        // value at globalIdx*8). writeELFSharedLib reads from here to emit
+        // the .data section. IR module layout: globalBuffer @ +104,
+        // globalCap @ +112, globalLen @ +120 (offsets follow the class field
+        // order in ir.lyx).
+        var ggBuf: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALBUF);
+        var ggCap: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALCAP);
+        if self.globalNameCnt * 8 + 8 > ggCap {
+          var ggNewCap2: int64 := ggCap * 2;
+          if ggNewCap2 < self.globalNameCnt * 8 + 8 { ggNewCap2 := self.globalNameCnt * 8 + 64; }
+          var ggNb2: int64 := alloc(ggNewCap2);
+          var ggI2: int64 := 0;
+          memcpy(ggNb2, ggBuf, self.globalNameCnt * 8);
+          ggBuf := ggNb2;
+          poke64(self.ir + IR_MOD_OFF_GLOBALBUF, ggBuf);
+          poke64(self.ir + IR_MOD_OFF_GLOBALCAP, ggNewCap2);
+        }
+        poke64(ggBuf + self.globalNameCnt * 8, ggInit);
+        poke64(self.ir + IR_MOD_OFF_GLOBALLEN, self.globalNameCnt + 1);   // globalLen
+        self.globalNameCnt += 1;
+      }
+      ggCur := self.nodeNext(ggCur);
     }
 
     var cur: int64 := decls;
@@ -10777,6 +10787,72 @@ pub type IRLower = class {
     }
   }
 
+  // #2107: Verzeichnis der OEFFENTLICHEN, ganzzahlig faltbaren Konstanten aller
+  // (transitiv) importierten Units — Name, Laenge, Wert, je 24 Byte. Die
+  // Konstantenfaltung (_constFaltbar/_constWert) suchte bisher nur in der
+  // Knotentabelle der eigenen Unit; `pub con B := A_SIZE` mit A_SIZE aus einer
+  // anderen Unit wurde mit #1798 abgewiesen, auf x86 seit #2102 ausgerechnet.
+  //
+  // Gesammelt wird nach dem transitiven Vorpass, in RUNDEN: eine Konstante,
+  // die eine andere Unit nennt, geht auf, sobald deren Wert eingetragen ist.
+  // Hoechstens so viele Runden wie Units; was dann noch fehlt, ist nicht
+  // faltbar und wird am Ort seiner Verwendung gemeldet wie bisher.
+  fn _irPubConSammle() {
+    self.irPubConCap := 256;
+    self.irPubConTab := alloc(self.irPubConCap * 24);
+    self.irPubConCnt := 0;
+    var svSrc: pchar := self.src; var svNodes: int64 := self.nodes; var svCnt: int64 := self.nodeCount;
+    var runde: int64 := 0;
+    var neu: int64 := 1;
+    while neu != 0 && runde <= self.impLstN {
+      neu := 0;
+      var u: int64 := 1;
+      while u < self.impLstN {
+        self.src := peek64(self.impLstSrc + u * 8) as pchar;
+        self.nodes := peek64(self.impLstNodes + u * 8);
+        self.nodeCount := peek64(self.impLstCnt + u * 8);
+        var d: int64 := peek64(self.impLstHead + u * 8);
+        while d >= 0 {
+          if self.nodeKind(d) == NK_CON_DECL && self.nodeIsPub(d) != 0 {
+            if self._irPubConFind(self.nodeSVal(d) as int64, self.nodeSLen(d)) < 0 {
+              var iv: int64 := self.nodeC1(d);
+              if iv >= 0 && self._constFaltbar(iv) != 0 {
+                if self.irPubConCnt >= self.irPubConCap {
+                  var nc: int64 := self.irPubConCap * 2;
+                  var nb: int64 := alloc(nc * 24);
+                  memcpy(nb, self.irPubConTab, self.irPubConCnt * 24);
+                  self.irPubConTab := nb; self.irPubConCap := nc;
+                }
+                var b: int64 := self.irPubConTab + self.irPubConCnt * 24;
+                // Der Name zeigt in den Quelltext der Unit; ihr Parser lebt
+                // bis zum Ende der Uebersetzung (impLst haelt ihn fest).
+                poke64(b, self.nodeSVal(d) as int64);
+                poke64(b + 8, self.nodeSLen(d));
+                poke64(b + 16, self._constWert(iv));
+                self.irPubConCnt := self.irPubConCnt + 1;
+                neu := 1;
+              }
+            }
+          }
+          d := self.nodeNext(d);
+        }
+        u := u + 1;
+      }
+      runde := runde + 1;
+    }
+    self.src := svSrc; self.nodes := svNodes; self.nodeCount := svCnt;
+  }
+
+  fn _irPubConFind(np: int64, nl: int64): int64 {
+    var i: int64 := 0;
+    while i < self.irPubConCnt {
+      var b: int64 := self.irPubConTab + i * 24;
+      if self.seq(peek64(b) as pchar, peek64(b + 8), np as pchar, nl) { return i; }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
   // #2097/#2099: Ist `np` eine PRIVATE Modulvariable oder Konstante der
   // gerade uebersetzten Unit? Dieselbe Frage wie cg_privIdx auf x86 — die
   // beiden muessen uebereinstimmen. Nur die oberste Ebene (irModHead).
@@ -11040,7 +11116,12 @@ pub type IRLower = class {
     // niemals `var` — siehe _conIdentDecl.
     if k == NK_IDENT {
       var cd: int64 := self._conIdentDecl(nd);
-      if cd < 0 { return 0; }
+      if cd < 0 {
+        // #2107: eine oeffentliche Konstante einer importierten Unit.
+        if self._findLocalSlot(self.nodeSVal(nd), self.nodeSLen(nd)) >= 0 { return 0; }
+        if self._irPubConFind(self.nodeSVal(nd) as int64, self.nodeSLen(nd)) >= 0 { return 1; }
+        return 0;
+      }
       return self._constFaltbar(self.nodeC1(cd));
     }
     if k == NK_UNOP {
@@ -11064,7 +11145,15 @@ pub type IRLower = class {
   fn _constWert(nd: int64): int64 {
     var k: int64 := self.nodeKind(nd);
     if k == NK_LIT_INT || k == NK_LIT_BOOL || k == NK_LIT_CHAR { return self.nodeIVal(nd); }
-    if k == NK_IDENT { return self._constWert(self.nodeC1(self._conIdentDecl(nd))); }
+    if k == NK_IDENT {
+      var cwd: int64 := self._conIdentDecl(nd);
+      if cwd >= 0 { return self._constWert(self.nodeC1(cwd)); }
+      // #2107: aus dem Verzeichnis der oeffentlichen Konstanten — _constFaltbar
+      // hat vorher geprueft, dass der Name dort steht.
+      var pci: int64 := self._irPubConFind(self.nodeSVal(nd) as int64, self.nodeSLen(nd));
+      if pci >= 0 { return peek64(self.irPubConTab + pci * 24 + 16); }
+      return 0;
+    }
     if k == NK_UNOP {
       var uo: int64 := self.nodeIVal(nd);
       var v:  int64 := self._constWert(self.nodeC0(nd));
