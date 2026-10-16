@@ -92,8 +92,13 @@ hat_muster() { # name, datei, hexmuster (little endian, wie im Code)
 
 # arm64: CBNZ x0, +16 (B5000080) springt ueber MOV/MOV/SVC.
 hat_muster "arm64: CBNZ ueberspringt den Abbruch" "$TMP/d_arm64" "800000b5"
-# riscv: BNE t0, x0, +12 (00029663) springt ueber LI/LI/ecall.
-hat_muster "riscv: BNE ueberspringt den Abbruch"  "$TMP/d_riscv" "6396020"
+# riscv: BNE t0, x0, +16 (00029863), unmittelbar gefolgt von li a0,1 /
+# li a7,93 / ecall — der Sprung landet also genau HINTER dem ecall.
+# #2105: Bis 1.2.13G stand hier "BNE +12 springt ueber LI/LI/ecall" und das
+# Muster 00029663. Das stimmte nicht: +12 trifft das ecall SELBST, und der
+# Test bestaetigte genau den Fehler, weil er nur das Vorhandensein des
+# Musters pruefte. Jetzt der ganze Block — Weite und Laenge muessen passen.
+hat_muster "riscv: BNE +16 ueberspringt li/li/ecall genau" "$TMP/d_riscv" "63980200130510009308d00573000000"
 # arm-cm4: BNE +0 (D100) gefolgt von BKPT #0 (BE00).
 hat_muster "arm-cm4: BNE gefolgt von BKPT"        "$TMP/d_arm-cm4" "00d100be"
 
