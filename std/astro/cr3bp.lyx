@@ -396,6 +396,91 @@ pub fn ACr3bpBisEbene(mu: f64, s: AState, dt: f64,
   return AMakeState(AError(), 0.0, 0.0, 0.0, 0.0, 0.0);
 }
 
+// #2016: dieselbe Korrektur mit WAHLWEISE festgehaltener Groesse.
+//
+//   festX = false: z0 fest, x0 und vy0 frei   (AHaloCorrect, wie bisher)
+//   festX = true:  x0 fest, z0 und vy0 frei
+//
+// Warum die zweite Form noetig ist: z0 — die z-Auslenkung an der Kreuzung
+// mit x0 < xL (Startseite aus AHaloGuess) — waechst entlang der Schar NICHT
+// unbegrenzt, sondern hat ein Maximum (fuer Sonne-Erde L2 bei 0.4986 gamma,
+// dasselbe Maximum zeigt die JPL-Datenbank, s. _haloFortsetzung). Dort ist
+// d(Bahn)/d(z0) unendlich und der 2x2-Jacobi bei festem z0 singulaer; ueber
+// das Maximum hinaus laesst sich die Schar mit festem z0 nicht fortsetzen.
+// Mit festem x0 bleibt der Jacobi dort regulaer.
+fn _haloKorrektur(mu: f64, s: AState, dt: f64, maxIter: int64, festX: bool): AState {
+  var fehler: AState := AMakeState(AError(), 0.0, 0.0, 0.0, 0.0, 0.0);
+  if (mu <= 0.0 || mu >= 1.0 || dt <= 0.0) { return fehler; }
+  var x0: f64 := s.rx;
+  var z0: f64 := s.rz;
+  var vy0: f64 := s.vy;
+  var pStart: f64 := s.rx;                // die freie Ortsgroesse am Anfang
+  if (festX) { pStart := s.rz; }
+  var zRef: f64 := AbsF64(s.rz);          // Massstab fuer Schritt und Schranke
+  var h: f64 := 0.000001;                 // Stoerung fuer den Jacobi
+  var it: int64 := 0;
+  while (it < maxIter) {
+    var a: AState := AMakeState(x0, 0.0, z0, 0.0, vy0, 0.0);
+    var e: AState := ACr3bpBisEbene(mu, a, dt, 200000);
+    if (AIsError(e.rx)) { return fehler; }
+    var f1: f64 := e.vx;
+    var f2: f64 := e.vz;
+    if (AbsF64(f1) < 0.00000000001 && AbsF64(f2) < 0.00000000001) {
+      return AMakeState(x0, 0.0, z0, 0.0, vy0, 0.0);
+    }
+    // Spalte 1: die freie Ortsgroesse stoeren (x0, oder z0 bei festX).
+    var ap: AState := AMakeState(x0 + h, 0.0, z0, 0.0, vy0, 0.0);
+    if (festX) { ap := AMakeState(x0, 0.0, z0 + h, 0.0, vy0, 0.0); }
+    var ep: AState := ACr3bpBisEbene(mu, ap, dt, 200000);
+    if (AIsError(ep.rx)) { return fehler; }
+    var j11: f64 := (ep.vx - f1) / h;
+    var j21: f64 := (ep.vz - f2) / h;
+    // Spalte 2: vy0 stoeren.
+    var av2: AState := AMakeState(x0, 0.0, z0, 0.0, vy0 + h, 0.0);
+    var ev2: AState := ACr3bpBisEbene(mu, av2, dt, 200000);
+    if (AIsError(ev2.rx)) { return fehler; }
+    var j12: f64 := (ev2.vx - f1) / h;
+    var j22: f64 := (ev2.vz - f2) / h;
+    var det: f64 := j11 * j22 - j12 * j21;
+    if (det == 0.0) { return fehler; }
+    // 2x2 nach Cramer aufloesen und den Schritt abziehen.
+    var dp: f64 := (f1 * j22 - f2 * j12) / det;
+    var dv: f64 := (j11 * f2 - j21 * f1) / det;
+    // GEDAEMPFT und BESCHRAENKT. Ungedaempft sprang der Newton aus der
+    // Umgebung des Librationspunktes heraus und lief in die triviale Loesung:
+    // x0 = 1.697 mit einer Periode von genau einem Jahr — eine Sonnenbahn,
+    // keine Halo-Bahn. Sie erfuellt die Abbruchbedingung (senkrechte Kreuzung)
+    // vollkommen und ist trotzdem nicht das Gesuchte.
+    //
+    // VERTRAUENSBEREICH statt pauschaler Daempfung. Eine feste Daempfung
+    // halbiert auch dort die Schrittweite, wo der Newton schon quadratisch
+    // konvergiert — das kostet nur Rechenzeit. Begrenzt wird deshalb die
+    // LAENGE des Schritts, nicht seine Richtung: nahe der Loesung bleibt er
+    // unangetastet, weit weg wird er auf ein Viertel der z-Auslenkung
+    // gestutzt. Beides zusammen (Stutzen + Schranke unten) haelt den Newton
+    // in der Umgebung des Librationspunktes.
+    var grenze: f64 := 0.25 * zRef;
+    if (grenze <= 0.0) { grenze := 0.01; }
+    if (AbsF64(dp) > grenze) {
+      var f: f64 := grenze / AbsF64(dp);
+      dp := dp * f;
+      dv := dv * f;
+    }
+    var p: f64 := 0.0;
+    if (festX) { z0 := z0 - dp; p := z0; } else { x0 := x0 - dp; p := x0; }
+    vy0 := vy0 - dv;
+    // Die Schranke haengt an der Bahn selbst: weiter als das Zehnfache der
+    // z-Auslenkung darf die freie Groesse sich nicht vom Ausgangswert
+    // entfernen. Wer die Umgebung verlaesst, sucht eine andere Bahn.
+    var weg: f64 := AbsF64(p - pStart);
+    var schranke: f64 := 10.0 * zRef;
+    if (schranke <= 0.0) { schranke := 1.0; }
+    if (weg > schranke) { return fehler; }
+    it := it + 1;
+  }
+  return fehler;                          // keine Konvergenz: melden
+}
+
 // DIFFERENTIALKORREKTUR auf eine periodische Bahn.
 //
 // Gesucht ist ein Startzustand (x0, 0, z0, 0, vy0, 0), der nach einer halben
@@ -411,72 +496,7 @@ pub fn ACr3bpBisEbene(mu: f64, s: AState, dt: f64,
 // Korrektur nicht konvergiert. NICHT der zuletzt erreichte Naeherungswert —
 // der saehe wie ein Ergebnis aus und waere keines.
 pub fn AHaloCorrect(mu: f64, s: AState, dt: f64, maxIter: int64): AState {
-  var fehler: AState := AMakeState(AError(), 0.0, 0.0, 0.0, 0.0, 0.0);
-  if (mu <= 0.0 || mu >= 1.0 || dt <= 0.0) { return fehler; }
-  var x0: f64 := s.rx;
-  var z0: f64 := s.rz;
-  var vy0: f64 := s.vy;
-  var xStart: f64 := s.rx;
-  var h: f64 := 0.000001;                 // Stoerung fuer den Jacobi
-  var it: int64 := 0;
-  while (it < maxIter) {
-    var a: AState := AMakeState(x0, 0.0, z0, 0.0, vy0, 0.0);
-    var e: AState := ACr3bpBisEbene(mu, a, dt, 200000);
-    if (AIsError(e.rx)) { return fehler; }
-    var f1: f64 := e.vx;
-    var f2: f64 := e.vz;
-    if (AbsF64(f1) < 0.00000000001 && AbsF64(f2) < 0.00000000001) {
-      return AMakeState(x0, 0.0, z0, 0.0, vy0, 0.0);
-    }
-    // Spalte 1: x0 stoeren.
-    var ax2: AState := AMakeState(x0 + h, 0.0, z0, 0.0, vy0, 0.0);
-    var ex2: AState := ACr3bpBisEbene(mu, ax2, dt, 200000);
-    if (AIsError(ex2.rx)) { return fehler; }
-    var j11: f64 := (ex2.vx - f1) / h;
-    var j21: f64 := (ex2.vz - f2) / h;
-    // Spalte 2: vy0 stoeren.
-    var av2: AState := AMakeState(x0, 0.0, z0, 0.0, vy0 + h, 0.0);
-    var ev2: AState := ACr3bpBisEbene(mu, av2, dt, 200000);
-    if (AIsError(ev2.rx)) { return fehler; }
-    var j12: f64 := (ev2.vx - f1) / h;
-    var j22: f64 := (ev2.vz - f2) / h;
-    var det: f64 := j11 * j22 - j12 * j21;
-    if (det == 0.0) { return fehler; }
-    // 2x2 nach Cramer aufloesen und den Schritt abziehen.
-    var dx: f64 := (f1 * j22 - f2 * j12) / det;
-    var dv: f64 := (j11 * f2 - j21 * f1) / det;
-    // GEDAEMPFT und BESCHRAENKT. Ungedaempft sprang der Newton aus der
-    // Umgebung des Librationspunktes heraus und lief in die triviale Loesung:
-    // x0 = 1.697 mit einer Periode von genau einem Jahr — eine Sonnenbahn,
-    // keine Halo-Bahn. Sie erfuellt die Abbruchbedingung (senkrechte Kreuzung)
-    // vollkommen und ist trotzdem nicht das Gesuchte.
-    //
-    // Die Schranke haengt an der Bahn selbst: weiter als das Zehnfache der
-    // z-Auslenkung darf der Startpunkt sich nicht vom Ausgangswert entfernen.
-    // Wer die Umgebung verlaesst, sucht eine andere Bahn.
-    // VERTRAUENSBEREICH statt pauschaler Daempfung. Eine feste Daempfung
-    // halbiert auch dort die Schrittweite, wo der Newton schon quadratisch
-    // konvergiert — das kostet nur Rechenzeit. Begrenzt wird deshalb die
-    // LAENGE des Schritts, nicht seine Richtung: nahe der Loesung bleibt er
-    // unangetastet, weit weg wird er auf ein Viertel der z-Auslenkung
-    // gestutzt. Beides zusammen (Stutzen + Schranke unten) haelt den Newton
-    // in der Umgebung des Librationspunktes.
-    var grenze: f64 := 0.25 * AbsF64(z0);
-    if (grenze <= 0.0) { grenze := 0.01; }
-    if (AbsF64(dx) > grenze) {
-      var f: f64 := grenze / AbsF64(dx);
-      dx := dx * f;
-      dv := dv * f;
-    }
-    x0 := x0 - dx;
-    vy0 := vy0 - dv;
-    var weg: f64 := AbsF64(x0 - xStart);
-    var schranke: f64 := 10.0 * AbsF64(z0);
-    if (schranke <= 0.0) { schranke := 1.0; }
-    if (weg > schranke) { return fehler; }
-    it := it + 1;
-  }
-  return fehler;                          // keine Konvergenz: melden
+  return _haloKorrektur(mu, s, dt, maxIter, false);
 }
 
 // Volle Umlaufzeit einer korrigierten Bahn, dimensionslos. Sie ist das
@@ -499,8 +519,12 @@ pub fn AHaloPeriod(mu: f64, s: AState, dt: f64): f64 {
   return AError();
 }
 
-// Die z-Auslenkung einer Bahn in Metern — die Groesse, in der Halo-Bahnen
-// angegeben werden ("JWST fliegt mit rund 800000 km Amplitude").
+// Die z-Auslenkung des STARTZUSTANDS in Metern (Kreuzung mit x0 < xL).
+//
+// #2016: Das ist NICHT die groesste z-Auslenkung der Bahn. Die liegt an der
+// Gegenkreuzung und ist bei grossen Bahnen deutlich groesser (Sonne-Erde L2,
+// z0 = 0.37 gamma: dort 0.53 gamma). Angaben wie "JWST fliegt mit rund
+// 800 000 km Amplitude" meinen die groesste — dafuer AHaloAmplitudeZMax.
 pub fn AHaloAmplitudeZ(s: AState, separation: f64): f64 {
   if (separation <= 0.0) { return AError(); }
   var z: f64 := s.rz;
@@ -508,40 +532,230 @@ pub fn AHaloAmplitudeZ(s: AState, separation: f64): f64 {
   return z * separation;
 }
 
-// HALO-BAHN ZU GEGEBENER z-AMPLITUDE, per Fortsetzung.
+// Die groesste z-Auslenkung einer Bahn in Metern. Sie liegt NICHT am
+// Startzustand, sondern an der gegenueberliegenden Kreuzung der xz-Ebene
+// (der Startzustand aus AHaloGuess liegt bei x < xL, die Gegenkreuzung bei
+// x > xL) — nachgemessen an der
+// JPL-Datenbank: das Maximum von |z| ueber eine dicht abgetastete Periode
+// stimmt dort mit |z| an dieser Kreuzung auf 1e-10 ueberein. Das ist die
+// Groesse, in der Halo-Bahnen ueblicherweise angegeben werden. #2016
+pub fn AHaloAmplitudeZMax(mu: f64, s: AState, dt: f64, separation: f64): f64 {
+  if (separation <= 0.0) { return AError(); }
+  var e: AState := ACr3bpBisEbene(mu, s, dt, 200000);
+  if (AIsError(e.rx)) { return AError(); }
+  return AbsF64(e.rz) * separation;
+}
+
+// Messgroesse der Fortsetzung in Einheiten von gamma: |z| am Start
+// (fern = false, AHaloFromAmplitudeZ) oder an der Gegenkreuzung
+// (fern = true, AHaloFromAmplitudeZMax).
+fn _haloMass(mu: f64, s: AState, dt: f64, gamma: f64, fern: bool): f64 {
+  if (!fern) { return AbsF64(s.rz) / gamma; }
+  var e: AState := ACr3bpBisEbene(mu, s, dt, 200000);
+  if (AIsError(e.rx)) { return AError(); }
+  return AbsF64(e.rz) / gamma;
+}
+
+// Gilt die korrigierte Bahn als Glied DERSELBEN Schar? Bei festem x0 gibt es
+// eine zweite Loesung mit z0 = 0 — die ebene Lyapunov-Bahn. Sie hat das
+// falsche Vorzeichen oder keine z-Auslenkung und wird hier abgewiesen.
+fn _haloGleicheSchar(s: AState, nordSued: f64): bool {
+  if (AIsError(s.rx)) { return false; }
+  return s.rz * nordSued > 0.0;
+}
+
+// #2016: FORTSETZUNG entlang der Schar bis zur Zielamplitude.
 //
-// Der linearisierte Startwert traegt nur bei kleiner Auslenkung; oberhalb von
-// rund 0.15 gamma konvergiert die Korrektur nicht mehr. Genau dafuer gibt es
-// die FORTSETZUNG: man loest zuerst eine kleine Bahn, hebt die Amplitude in
-// Schritten an und nimmt jedes Mal die vorige Loesung als Startwert. Die
-// Bahnschar aendert sich stetig, also ist der Vorgaenger immer ein guter
-// Startwert — auch dort, wo die Linearisierung laengst nichts mehr taugt.
+// URSACHE der Grenze aus dem Issue: kein schrumpfender Einzugsbereich,
+// sondern ein FALTPUNKT. Gemessen wurde |z| am Startzustand (x0 < xL), und
+// diese Groesse hat entlang der Schar ein Maximum — Sonne-Erde L2: 0.4986
+// gamma bei x0 = 1.00337, rund 748 600 km. Darueber gibt es KEINE Halo-Bahn
+// mit diesem z0; "0.50 gamma" war nicht zu schwer, sondern nicht vorhanden.
+// Die NASA/JPL-Datenbank (Three-Body Periodic Orbits, Sonne-Erde, Halo, L2)
+// zeigt dasselbe Maximum, 0.4985 gamma mit deren mu = 3.0542e-6.
 //
-// Das ersetzt Richardsons Reihe dritter Ordnung vollstaendig und ist
-// nachpruefbar: jede Zwischenloesung ist selbst eine periodische Bahn.
+// Die Tabelle im Issue (0.45 nur mit 200 Schritten) war mit 1.2.14A nicht
+// nachzustellen: die alte Fortsetzung erreichte 0.45 mit 20, 0.498 mit 40
+// Schritten (dt = 0.001 und 0.005). Sie scheiterte nur jenseits des
+// Maximums — dort zu Recht.
 //
-// azZiel ist in Einheiten von gamma. schritte bestimmt die Feinheit der
-// Fortsetzung; zu grob heisst, dass ein Schritt aus dem Einzugsbereich faellt
-// und die Funktion meldet, statt eine falsche Bahn zu liefern.
-pub fn AHaloFromAmplitudeZ(mu: f64, gamma: f64, istL2: bool, azZiel: f64,
-                           nordSued: f64, dt: f64, schritte: int64): AState {
+// Die "rund 800 000 km" von JWST sind die GROESSTE z-Auslenkung; die liegt
+// an der Gegenkreuzung (x > xL), und dort waechst |z| bis rund 1.23 gamma.
+// Diese Groesse misst AHaloAmplitudeZMax, und AHaloFromAmplitudeZMax setzt
+// in ihr fort. Weil die zugehoerigen Startzustaende ueber das Maximum von z0
+// hinausreichen (ab rund 0.94 gamma an der Gegenkreuzung), traegt dort die
+// alte Fortsetzung mit festem z0 nicht mehr — daher das Verfahren unten.
+//
+// Das Verfahren jetzt (natuerliche Parameterfortsetzung mit Wechsel des
+// Parameters, wie in der Literatur ueblich):
+//   * Praediktor: lineare Extrapolation aus den LETZTEN ZWEI Loesungen
+//     (Sekante in x0, z0, vy0) statt der vorigen Loesung allein;
+//   * festgehalten wird die Groesse, die sich entlang der Sekante staerker
+//     aendert: z0 bei kleiner Amplitude, x0 in der Naehe des Faltpunkts;
+//   * Schrittweitensteuerung: scheitert die Korrektur oder laeuft der
+//     Schritt ueber das Maximum der Messgroesse, wird halbiert; nach einem
+//     Erfolg wieder verdoppelt, hoechstens bis zur Anfangsweite;
+//   * das Ziel wird zwischen den beiden einschliessenden Loesungen per
+//     Regula falsi (Illinois) getroffen; bei festem z0 und Messgroesse z0
+//     direkt — dieselbe Korrektur wie bisher, also dieselbe Bahn.
+// Liegt das Ziel jenseits des Maximums, MELDET die Funktion.
+fn _haloFortsetzung(mu: f64, gamma: f64, istL2: bool, azZiel: f64,
+                    nordSued: f64, dt: f64, schritte: int64, fern: bool): AState {
   var fehler: AState := AMakeState(AError(), 0.0, 0.0, 0.0, 0.0, 0.0);
-  if (azZiel <= 0.0 || schritte < 1) { return fehler; }
+  if (azZiel <= 0.0 || schritte < 1 || gamma <= 0.0) { return fehler; }
+  if (nordSued == 0.0) { return fehler; }   // ohne z-Seite keine Halo-Bahn
   var azStart: f64 := 0.05;
-  if (azZiel < azStart) { azStart := azZiel; }
+  if (fern) {
+    // Die Gegenkreuzung liegt immer weiter aussen: mit der halben
+    // Zielamplitude beginnen, damit der Start unter dem Ziel liegt.
+    if (azZiel * 0.5 < azStart) { azStart := azZiel * 0.5; }
+  } else {
+    if (azZiel < azStart) { azStart := azZiel; }
+  }
   var cur: AState := AHaloCorrect(mu, AHaloGuess(mu, gamma, istL2, azStart, azStart, nordSued),
                                   dt, 60);
   if (AIsError(cur.rx)) { return fehler; }
-  if (azZiel <= azStart) { return cur; }
-  var i: int64 := 1;
-  while (i <= schritte) {
-    var az: f64 := azStart + (azZiel - azStart) * (i as f64) / (schritte as f64);
-    // Vorige Loesung, nur mit angehobener z-Auslenkung.
-    var start: AState := AMakeState(cur.rx, 0.0, nordSued * gamma * az, 0.0, cur.vy, 0.0);
-    var next: AState := AHaloCorrect(mu, start, dt, 60);
-    if (AIsError(next.rx)) { return fehler; }
-    cur := next;
-    i := i + 1;
+  if (!fern && azZiel <= azStart) { return cur; }
+  var mCur: f64 := _haloMass(mu, cur, dt, gamma, fern);
+  if (AIsError(mCur) || mCur >= azZiel) { return fehler; }
+
+  // Schrittweite als Bogenlaenge in der (x0, z0)-Ebene, Anfangswert wie
+  // bisher aus schritte: (Ziel - Start) * gamma / schritte.
+  var ds0: f64 := (azZiel - azStart) * gamma / (schritte as f64);
+  var ds: f64 := ds0;
+  var dsMin: f64 := ds0 / 4096.0;
+  var prev: AState := cur;
+  var hatPrev: bool := false;
+  var festX: bool := false;
+  var runden: int64 := 0;
+  var maxRunden: int64 := 40 * schritte + 400;
+  while (runden < maxRunden) {
+    runden := runden + 1;
+    // Sekante aus den letzten zwei Loesungen; ohne Vorgaenger reine
+    // z-Anhebung (das ist der alte Schritt).
+    var tx: f64 := 0.0;
+    var tz: f64 := nordSued;
+    var tv: f64 := 0.0;
+    if (hatPrev) {
+      var sx: f64 := cur.rx - prev.rx;
+      var sz: f64 := cur.rz - prev.rz;
+      var sl: f64 := SqrtF64(sx * sx + sz * sz);
+      if (sl <= 0.0) { return fehler; }
+      tx := sx / sl;
+      tz := sz / sl;
+      tv := (cur.vy - prev.vy) / sl;
+      festX := AbsF64(tx) > AbsF64(tz);
+    }
+    var pred: AState := AMakeState(cur.rx + ds * tx, 0.0, cur.rz + ds * tz,
+                                   0.0, cur.vy + ds * tv, 0.0);
+    var next: AState := _haloKorrektur(mu, pred, dt, 25, festX);
+    var gut: bool := _haloGleicheSchar(next, nordSued);
+    var mNext: f64 := 0.0;
+    if (gut) {
+      mNext := _haloMass(mu, next, dt, gamma, fern);
+      if (AIsError(mNext)) { gut := false; }
+    }
+    // Ueber das Maximum gelaufen: der Schritt ist zu lang ODER das Ziel
+    // liegt jenseits des Faltpunkts. Halbieren klaert, welches von beiden.
+    if (gut && mNext <= mCur) { gut := false; }
+    if (!gut) {
+      ds := ds / 2.0;
+      if (ds < dsMin) { return fehler; }
+    } else if (mNext >= azZiel) {
+      return _haloTreffen(mu, gamma, cur, mCur, next, mNext, azZiel,
+                          nordSued, dt, festX, fern);
+    } else {
+      prev := cur;
+      cur := next;
+      mCur := mNext;
+      hatPrev := true;
+      ds := ds * 2.0;
+      if (ds > ds0) { ds := ds0; }
+    }
   }
-  return cur;
+  return fehler;
+}
+
+// Das Ziel zwischen zwei Loesungen a (m < Ziel) und b (m >= Ziel) treffen:
+// Regula falsi in der Verbindungsgeraden, die festgehaltene Groesse
+// interpoliert, die anderen von der Korrektur bestimmt. Illinois-Variante,
+// damit ein einseitig liegenbleibender Endpunkt die Konvergenz nicht auf
+// linear drueckt.
+fn _haloTreffen(mu: f64, gamma: f64, a0: AState, ma0: f64, b0: AState, mb0: f64,
+                azZiel: f64, nordSued: f64, dt: f64, festX: bool, fern: bool): AState {
+  var fehler: AState := AMakeState(AError(), 0.0, 0.0, 0.0, 0.0, 0.0);
+  var a: AState := a0;
+  var b: AState := b0;
+  var fa: f64 := ma0 - azZiel;          // < 0
+  var fb: f64 := mb0 - azZiel;          // >= 0
+  if (fb == 0.0) { return b; }
+  var seite: int64 := 0;
+  var k: int64 := 0;
+  while (k < 60) {
+    var lam: f64 := fa / (fa - fb);
+    var p: AState := AMakeState(a.rx + lam * (b.rx - a.rx), 0.0,
+                                a.rz + lam * (b.rz - a.rz), 0.0,
+                                a.vy + lam * (b.vy - a.vy), 0.0);
+    // Messgroesse z0 bei festem z0: das Ziel direkt setzen. Das ist genau
+    // die Korrektur der alten Fortsetzung — fuer jede Amplitude, die sie
+    // erreichte, entsteht dieselbe Bahn.
+    if (!fern && !festX) { p := AMakeState(p.rx, 0.0, nordSued * gamma * azZiel, 0.0, p.vy, 0.0); }
+    var sol: AState := _haloKorrektur(mu, p, dt, 60, festX);
+    if (!_haloGleicheSchar(sol, nordSued)) { return fehler; }
+    var m: f64 := _haloMass(mu, sol, dt, gamma, fern);
+    if (AIsError(m)) { return fehler; }
+    var fm: f64 := m - azZiel;
+    if (AbsF64(fm) < 0.000000000001) { return sol; }
+    if (fm < 0.0) {
+      a := sol; fa := fm;
+      if (seite == -1) { fb := fb / 2.0; }
+      seite := -1;
+    } else {
+      b := sol; fb := fm;
+      if (seite == 1) { fa := fa / 2.0; }
+      seite := 1;
+    }
+    k := k + 1;
+  }
+  return fehler;
+}
+
+// HALO-BAHN ZU GEGEBENER z-AMPLITUDE, per Fortsetzung.
+//
+// azZiel ist in Einheiten von gamma und meint |z| am STARTZUSTAND, also an
+// der Kreuzung der xz-Ebene mit x0 < xL, wie AHaloGuess sie waehlt (AHaloAmplitudeZ
+// misst dieselbe Groesse). Diese Groesse hat entlang der Schar ein Maximum —
+// Sonne-Erde L2: 0.4986 gamma, rund 748 600 km. Darueber MELDET die Funktion,
+// denn eine solche Bahn gibt es nicht (#2016). Wer die groesste
+// z-Auslenkung der Bahn meint — die uebliche Angabe, auch die "rund
+// 800 000 km" von JWST — nimmt AHaloFromAmplitudeZMax.
+//
+// Der linearisierte Startwert traegt nur bei kleiner Auslenkung; oberhalb von
+// rund 0.15 gamma konvergiert die Korrektur nicht mehr. Deshalb die
+// FORTSETZUNG (_haloFortsetzung): zuerst eine kleine Bahn loesen, dann
+// entlang der Schar wandern, jede Zwischenloesung selbst eine periodische
+// Bahn. Das ersetzt Richardsons Reihe dritter Ordnung und ist nachpruefbar.
+//
+// schritte bestimmt die Anfangsweite der Fortsetzung. Zu grob ist seit #2016
+// kein Fehler mehr — die Schrittweitensteuerung halbiert —, kostet aber
+// Rechenzeit.
+pub fn AHaloFromAmplitudeZ(mu: f64, gamma: f64, istL2: bool, azZiel: f64,
+                           nordSued: f64, dt: f64, schritte: int64): AState {
+  return _haloFortsetzung(mu, gamma, istL2, azZiel, nordSued, dt, schritte, false);
+}
+
+// #2016: HALO-BAHN ZU GEGEBENER GROESSTER z-AUSLENKUNG.
+//
+// azZiel in Einheiten von gamma, gemessen wie AHaloAmplitudeZMax an der
+// Gegenkreuzung. Diese Groesse waechst entlang der Schar weit ueber die
+// JWST-Bahn hinaus (Sonne-Erde L2: bis rund 1.23 gamma). Zurueck kommt wie
+// bei AHaloFromAmplitudeZ der STARTZUSTAND an der Kreuzung mit x0 < xL;
+// nordSued waehlt das Vorzeichen von z dort.
+//
+// Achtung beim Vergleich mit der JPL-Datenbank: deren Zweig "N" benennt die
+// Bahn nach der GROESSTEN Auslenkung (z > 0 an der Gegenkreuzung) — das ist
+// hier nordSued = -1.
+pub fn AHaloFromAmplitudeZMax(mu: f64, gamma: f64, istL2: bool, azZiel: f64,
+                              nordSued: f64, dt: f64, schritte: int64): AState {
+  return _haloFortsetzung(mu, gamma, istL2, azZiel, nordSued, dt, schritte, true);
 }
