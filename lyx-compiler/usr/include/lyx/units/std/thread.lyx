@@ -140,6 +140,42 @@ fn _thrTrampoline(unused: int64): int64 {
   return 0;
 }
 
+// _thrCloneSplit: trennt Eltern- und Kindweg UNMITTELBAR nach clone(2).
+//
+// #1881: Bis hierhin stand das Ergebnis von sys_clone in einem Local von
+// ThreadCreate. Der Codegen legt es dort ab und liest es fuer den Vergleich
+// gleich wieder aus dem Slot (`mov %rax,-0x88(%rbp)` / `mov -0x88(%rbp),%rax`).
+// Beide Threads haben aber DASSELBE rbp -- clone setzt nur rsp neu --, der Slot
+// ist also eine gemeinsame Speicherzelle, in die der Elternteil die TID und das
+// Kind gleichzeitig die 0 schreibt. Wer zuletzt schreibt, entscheidet fuer
+// beide. Gewinnt das Kind zwischen Speichern und Lesen des Elternteils, liest
+// auch der Elternteil 0, nimmt den Kindweg und ruft sys_exit(0) -- auf dem
+// Hauptthread. Endet danach das Kind, ist der Prozess mit 0 zu Ende, ohne dass
+// main je zurueckkehrt (strace: `<main-tid> exit(0)` direkt nach dem clone).
+// Umgekehrt kann das Kind die TID lesen und den Elternweg weiterlaufen.
+//
+// Hier kommt das Ergebnis als Argument an: es wandert von rax ueber den
+// Stack (rsp, also pro Thread getrennt) nach rdi, und der Prolog dieser
+// Funktion legt den Frame mit rbp := rsp an -- jeder Thread auf SEINEM Stack.
+// Der Parameter `r` liegt damit pro Thread getrennt, und die Weiche liest nur
+// ihn. Das Kind kehrt nie zurueck; der Elternteil bekommt `r` unveraendert
+// zurueck und schreibt es als Einziger in den Frame von ThreadCreate.
+// Voraussetzung: zwischen syscall und call liegt kein Zugriff auf den Frame
+// von ThreadCreate -- tests/thread_join_test.sh misst genau den Ausgang.
+fn _thrCloneSplit(r: int64): int64 {
+  if (r == 0) {
+    // Kind: eigener Frame auf dem Kind-Stack; func und arg holt
+    // _thrTrampoline aus dem Handoff-Block.
+    _indirect_call_1(_thrTrampoline, 0);
+    // #1487: MUSS sys_exit sein, nicht exit. `exit` emittiert seit 1.0.19B
+    // exit_group (231) und beendet damit den GANZEN Prozess — der erste
+    // fertige Arbeitsthread haette alle uebrigen mitgerissen, mitsamt main.
+    // Hier ist genau das Gegenteil gewollt: nur dieser Thread endet.
+    sys_exit(0);  // syscall 60 — beendet nur diesen Thread
+  }
+  return r;
+}
+
 // ThreadCreate: spawns a new thread that calls func(arg).
 // Returns a Thread; handle == 0 on allocation failure.
 pub fn ThreadCreate(func: int64, arg: int64): Thread {
@@ -177,19 +213,11 @@ pub fn ThreadCreate(func: int64, arg: int64): Thread {
   // sys_clone(flags, stack_top, parent_tidptr, child_tidptr, tls=0)
   // tidSlot dient beidem: PARENT_SETTID schreibt die TID synchron hinein,
   // CHILD_CLEARTID nullt ihn beim Thread-Ende und weckt den futex.
-  var tid: int64 := sys_clone(THREAD_FLAGS, stackTop, tidSlot, tidSlot, 0);
-
-  if (tid == 0) {
-    // Kind: NUR Konstanten verwenden -- kein Zugriff auf Frame-Locals, deren
-    // Lebensdauer hier nicht garantiert ist. _thrTrampoline holt func und arg
-    // aus dem Handoff-Block, sobald es einen eigenen Frame hat.
-    _indirect_call_1(_thrTrampoline, 0);
-    // #1487: MUSS sys_exit sein, nicht exit. `exit` emittiert seit 1.0.19B
-    // exit_group (231) und beendet damit den GANZEN Prozess — der erste
-    // fertige Arbeitsthread haette alle uebrigen mitgerissen, mitsamt main.
-    // Hier ist genau das Gegenteil gewollt: nur dieser Thread endet.
-    sys_exit(0);  // syscall 60 — beendet nur diesen Thread
-  }
+  // #1881: das Ergebnis NICHT erst in ein Local legen -- der Frame dieser
+  // Funktion ist nach dem clone fuer beide Threads derselbe. Die Weiche in
+  // _thrCloneSplit laeuft schon auf dem jeweils eigenen Stack; hier kommt
+  // nur noch der Elternteil an.
+  var tid: int64 := _thrCloneSplit(sys_clone(THREAD_FLAGS, stackTop, tidSlot, tidSlot, 0));
 
   if (tid < 0) {
     free(tidSlot, 8);
