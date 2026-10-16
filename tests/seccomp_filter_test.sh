@@ -277,6 +277,53 @@ fn main(): int64 {
   return 0;
 }"
 
+# --- #2098: network.unix und die Vereinigung der Socket-Familien ----------
+# network.unix erlaubte nur socket(AF_UNIX) — bind/listen/accept/connect
+# starben mit SIGSYS. Zusammen mit network.tcp.* gewann der TCP-Zweig einer
+# if/else-if-Kette, und socket(AF_UNIX) starb ebenfalls. AF_INET6 fehlte.
+UX='import std.net.socket;'
+UXPROG='fn main(): int64 {
+  unlink("/tmp/lyx_sc_probe_2098.sock"c);
+  var s: UnixConn := UnixSocketNew();
+  if (s.fd < 0) { return 1; }
+  if (UnixSocketBind(s, "/tmp/lyx_sc_probe_2098.sock"c as int64) != 0) { return 2; }
+  if (UnixSocketListen(s, 1) != 0) { return 3; }
+  UnixSocketClose(s);
+  unlink("/tmp/lyx_sc_probe_2098.sock"c);
+  ZUSATZ
+  return 0;
+}'
+unix_prog() { printf '%s' "${UXPROG/ZUSATZ/$1}"; }
+runs "#2098: network.unix — socket, bind, listen" "@capabilities([network.unix, io.wait, memory.mmap, fs.delete])
+$IO
+$UX
+$(unix_prog '')"
+runs "#2098: network.unix + network.tcp.bind — Unix-Server UND TCP-Socket" "@capabilities([network.unix, network.tcp.bind, io.wait, memory.mmap, fs.delete])
+$IO
+$UX
+$(unix_prog 'if (sys_socket(2, 1, 0) < 0) { return 4; }')"
+runs "#2098: network.tcp.bind — AF_INET6-Stream" "@capabilities([network.tcp.bind, system.exit])
+$IO
+fn main(): int64 { if (sys_socket(10, 1, 0) < 0) { return 5; } return 0; }"
+runs "#2098: network.udp.bind — AF_INET6-Datagramm" "@capabilities([network.udp.bind, system.exit])
+$IO
+fn main(): int64 { if (sys_socket(10, 2, 0) < 0) { return 6; } return 0; }"
+# Gegenseite: was nicht deklariert ist, bleibt verboten.
+blocked "#2098: nur network.unix — kein AF_INET-Socket" "@capabilities([network.unix, system.exit])
+$IO
+fn main(): int64 { var t: int64 := sys_socket(2, 1, 0); return 0; }"
+blocked "#2098: nur network.tcp.bind — kein AF_UNIX-Socket" "@capabilities([network.tcp.bind, system.exit])
+$IO
+fn main(): int64 { var t: int64 := sys_socket(1, 1, 0); return 0; }"
+blocked "#2098: nur network.tcp.bind — kein UDP-Socket" "@capabilities([network.tcp.bind, system.exit])
+$IO
+fn main(): int64 { var t: int64 := sys_socket(2, 2, 0); return 0; }"
+# Bis 1.2.13F liess TCP + UDP zusammen socket() ganz ohne Pruefung zu —
+# also auch AF_NETLINK (16), das keine der beiden Capabilities meint.
+blocked "#2098: TCP + UDP — kein AF_NETLINK-Socket" "@capabilities([network.tcp.connect, network.udp.connect, system.exit])
+$IO
+fn main(): int64 { var t: int64 := sys_socket(16, 3, 0); return 0; }"
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 test "$FAIL" -eq 0

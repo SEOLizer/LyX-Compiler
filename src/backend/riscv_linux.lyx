@@ -961,26 +961,39 @@ pub type EmitRISCV64 = class {
     //
     // Aufbau wie im lyxos-Backend: Wert laden, gegen 0 pruefen, im guten Fall
     // ueber den Abbruch springen.
+    // #2105: Die Sprungweite stand hier FEST auf +12 — der Kommentar sagte
+    // "ueberspringt die drei Abbruchbefehle", dafuer braucht es aber +16
+    // (Sprung, li, li, ecall). Das Ziel war also das ecall SELBST: im guten
+    // Fall lief ein Systemaufruf mit dem a7 und a0, die gerade in den
+    // Registern standen — nach einer Ausgabe ein write(<Wert>, ...). JEDE
+    // Division auf riscv tat das. Fiel nur auf, wenn der Wert zufaellig ein
+    // offener Deskriptor war: im vollen `make test` eine geerbte Pipe, und
+    // das Programm starb mit SIGPIPE (rc 141) mitten in examples/test_zlib.
+    // Jetzt wird die Weite wie bei xtensa NACHGETRAGEN, nicht gezaehlt.
+    // arm64 (CBNZ +16) und arm_cm (BNE +0 ueber ein BKPT) waren richtig.
     if op == IRO_ASSERT_NOT_NULL || op == IRO_ASSERT_NOT_ZERO || op == IRO_ASSERT_TRUE {
       self.rv_loadSlot(src1);
-      // BNE t0, x0, +12  → ueberspringt die drei Abbruchbefehle
-      self.rv_e32(0x00029663);
+      var anPos: int64 := self.codeLen;
+      self.rv_e32(0x00000013);   // Platzhalter, unten durch BNE t0, x0 ersetzt
       self.rv_LI(RV_A0, 1);
       self.rv_LI(RV_A7, RV_SYS_EXIT);
       self.rv_e32(0x00000073);   // ecall
+      self.rv_poke32at(anPos, self.rv_buildBtype(1, RV_T0, RV_ZERO, self.codeLen - anPos));
     }
 
     // ASSERT_BOUNDS: src1 = Index, src2 = Laenge. Verglichen wird VORZEICHENLOS
     // (bltu), damit ein negativer Index als sehr grosse Zahl erkannt wird und
     // nicht durchrutscht.
+    // #2105: dieselbe feste Weite +12 wie oben — Ziel war das ecall.
     if op == IRO_ASSERT_BOUNDS {
       self.rv_loadSlot(src1);
       self.rv_loadSlot2(src2);
-      // BLTU t0, t1, +12 → Index kleiner als Laenge: ueberspringen
-      self.rv_e32(0x0062E663);
+      var abPos: int64 := self.codeLen;
+      self.rv_e32(0x00000013);   // Platzhalter, unten durch BLTU t0, t1 ersetzt
       self.rv_LI(RV_A0, 1);
       self.rv_LI(RV_A7, RV_SYS_EXIT);
       self.rv_e32(0x00000073);   // ecall
+      self.rv_poke32at(abPos, self.rv_buildBtype(6, RV_T0, RV_T1, self.codeLen - abPos));   // funct3 6 = BLTU
     }
 
     // #1339: IRO_PANIC (121) war hier gar nicht behandelt — ein `panic("...")`
@@ -1458,6 +1471,34 @@ pub type EmitRISCV64 = class {
       self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1));     // flags
       self.rv_LD(RV_A3, RV_FP, self.slotOff(sBase + 2));     // mode
       self.rv_LI(RV_A7, RV_SYS_OPEN);                        // 56 = openat
+      self.rv_ECALL();
+    } else if id == 221 || id == 224 || id == 225 || id == 226 || id == 227 {
+      // #2104: close / rename / unlink / mkdir / exit — dieselbe Rechnung wie
+      // im Linux-Zweig von emit_arm64.lyx, die beiden muessen uebereinstimmen
+      // (generische Linux-ABI: close 57, unlinkat 35, mkdirat 34, renameat2
+      // 276 — riscv64 hat kein renameat —, exit_group 94).
+      if (id == 221 || id == 227) {
+        self.rv_LD(RV_A0, RV_FP, self.slotOff(sBase));       // fd / Code
+        if (id == 221) { self.rv_LI(RV_A7, RV_SYS_CLOSE); }
+        else           { self.rv_LI(RV_A7, 94); }            // exit_group
+      } else if (id == 224) {
+        self.rv_LI(RV_A0, 0 - 100);                          // AT_FDCWD
+        self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));       // alt
+        self.rv_LI(RV_A2, 0 - 100);                          // AT_FDCWD
+        self.rv_LD(RV_A3, RV_FP, self.slotOff(sBase + 1));   // neu
+        self.rv_LI(RV_A4, 0);                                // flags
+        self.rv_LI(RV_A7, 276);                              // renameat2
+      } else {
+        self.rv_LI(RV_A0, 0 - 100);                          // AT_FDCWD
+        self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));       // path
+        if (id == 225) {
+          self.rv_LI(RV_A2, 0);                              // flags
+          self.rv_LI(RV_A7, 35);                             // unlinkat
+        } else {
+          self.rv_LD(RV_A2, RV_FP, self.slotOff(sBase + 1)); // mode
+          self.rv_LI(RV_A7, 34);                             // mkdirat
+        }
+      }
       self.rv_ECALL();
     } else if id == 222 || id == 223 {
       // #1740: read(fd, buf, len) / write(fd, buf, len). Ohne sie scheiterte

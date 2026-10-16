@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.13F
-VERSION_DATE := 2026-10-15
+VERSION   := 1.2.14A
+VERSION_DATE := 2026-10-16
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -581,6 +581,11 @@ test: lyxc
 	@bash tests/builtin_stelligkeit_test.sh
 	@bash tests/x86_aufrufe_test.sh
 	@bash tests/builtin_verdeckung_test.sh
+	@bash tests/sha512_test.sh
+	@bash tests/ir_datei_builtins_test.sh
+	@bash tests/unit_private_globals_test.sh
+	@bash tests/ir_kein_stiller_ausdruck_test.sh
+	@bash tests/riscv_zusicherung_test.sh
 	@bash tests/beispiel_aes_vector_test.sh
 	@bash tests/beispiel_ldap_einheiten_test.sh
 	@bash tests/ldap_rdn_test.sh

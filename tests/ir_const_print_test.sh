@@ -112,7 +112,10 @@ EOF
 if ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --target=arm64 "$TMP/unfaltbar.lyx" -o /dev/null ) >"$TMP/uf.log" 2>&1; then
   nok "eine nicht ausrechenbare Konstante ging durch — die Pruefung ist weg statt erweitert"
 else
-  if grep -q "laesst sich nicht zur Uebersetzungszeit" "$TMP/uf.log"; then
+  # #2102: seit 1.2.13G meldet sich schon der strenge Konstantendurchlauf
+  # ("keine bekannte Konstante") — eine Modulvariable ist keine. Beide
+  # Begruendungen sagen dasselbe; vorher lieferte der x86-Weg hier still -1.
+  if grep -qE "laesst sich nicht zur Uebersetzungszeit|keine bekannte Konstante" "$TMP/uf.log"; then
     ok "nicht ausrechenbare Konstante wird weiterhin abgewiesen"
   else
     nok "abgewiesen, aber mit anderer Begruendung: $(grep -m1 -E 'error|lyxc:' "$TMP/uf.log")"
