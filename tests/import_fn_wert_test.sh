@@ -109,11 +109,11 @@ pruefe "x86 ueber dritte Unit"      t.lyx "" "" "$T_SOLL"
 if [ -n "$QEMU_ARM64" ]; then
   pruefe "arm64 lokal+import int/bool/cast" v.lyx arm64 "$QEMU_ARM64" "$V_SOLL"
   pruefe "arm64 ueber dritte Unit"  t.lyx arm64 "$QEMU_ARM64" "$T_SOLL"
-else nok "qemu-aarch64 fehlt — arm64 NICHT gemessen"; fi
+else nok "qemu fuer arm64 fehlt — arm64 NICHT gemessen"; fi
 if [ -n "$QEMU_RISCV64" ]; then
   pruefe "riscv lokal+import int/bool/cast" v.lyx riscv "$QEMU_RISCV64" "$V_SOLL"
   pruefe "riscv ueber dritte Unit"  t.lyx riscv "$QEMU_RISCV64" "$T_SOLL"
-else nok "qemu-riscv64 fehlt — riscv NICHT gemessen"; fi
+else nok "qemu fuer riscv fehlt — riscv NICHT gemessen"; fi
 
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"

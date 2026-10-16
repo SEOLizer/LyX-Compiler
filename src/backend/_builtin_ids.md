@@ -477,3 +477,4 @@ der eingesetzte Wert steht jeweils fest.
 | 541 | Linux-Syscall unshare (Nr. 1) | `sys_unshare` | #2021 |
 | 542 | Linux-Syscall epoll_pwait (Nr. 6) | `sys_epoll_pwait` | #2021 |
 | 543 | Linux-Syscall getpgid (Nr. 1) | `sys_getpgid` | #2021 |
+| 546 | Linux-Syscall mmap (Nr. 222, sechs Argumente) | `mmap` | #2122; nur arm64/android-arm64/riscv, LyxOS behaelt IRO_ALLOC; ausserhalb LSC_MIN..LSC_MAX, die Backends fragen `IstLinuxSys` |
