@@ -66,9 +66,17 @@ pub con RV_START_STUB_LEN: int64 := 16;
 
 // Branch patch types
 con RV_PATCH_J:   int64 := 0;   // JAL x0, label  (unconditional)
-con RV_PATCH_BL:  int64 := 1;   // JAL ra, funcId  (call)
+con RV_PATCH_BL:  int64 := 1;   // AUIPC ra + JALR ra, funcId  (call, #2112)
 con RV_PATCH_BEQ: int64 := 2;   // BEQ t0, x0, label  (branch if == 0)
 con RV_PATCH_BNE: int64 := 3;   // BNE t0, x0, label  (branch if != 0)
+// #2112: Reichweiten der Befehlsfelder. B-Typ (BEQ/BNE) traegt 13 Bit, also
+// +/-4 KiB; JAL 21 Bit, +/-1 MiB; AUIPC+ADDI/JALR 32 Bit, +/-2 GiB. Vorher
+// wurde jeder Abstand still auf die Feldbreite maskiert: ein while-Rumpf ueber
+// 4 KiB (rund 16 poke8) sprang beim Verlassen irgendwohin, ein Aufruf ueber
+// 1 MiB Code hinweg ebenso.
+con RV_REACH_B:   int64 := 0x1000;
+con RV_REACH_JAL: int64 := 0x100000;
+con RV_REACH_PC:  int64 := 0x80000000;
 // #1806: Adresse einer Funktion als WERT (fn-Zeiger). AUIPC+ADDI, beide
 // Haelften werden nachgetragen — dasselbe Paar wie bei den globalen Variablen.
 con RV_PATCH_FADDR: int64 := 4;
@@ -83,13 +91,15 @@ pub type EmitRISCV64 = class {
   codeCap:    int64;
   ir:         int64;
   stackSize:  int64;
-  labelAddrs: int64;   // labelId → code offset  (1024 × 8 bytes)
+  labelAddrs: int64;   // labelId → code offset  (labelCap × 8 bytes)
   labelCount: int64;
+  labelCap:   int64;   // #2112: waechst, war fest 1024
   patchBuf:   int64;   // {codeOff,labelId,type,reg} je 32 Bytes, waechst (#1740)
   patchCount: int64;
   patchCap:   int64;   // #1740: Kapazitaet in Eintraegen
-  funcAddrs:  int64;   // funcId → start offset  (256 × 8 bytes)
+  funcAddrs:  int64;   // funcId → start offset  (funcCap × 8 bytes)
   funcCount:  int64;
+  funcCap:    int64;   // #2112: Funktionszahl des Moduls, war fest 256
   // #1740: globale Variablen. Der Zugriff entsteht PC-relativ (AUIPC+ADDI) und
   // wird aufgeloest, sobald der Datenbereich hinter dem Code steht.
   globRelocBuf:   int64;   // {codeOff, globalIdx} je 16 Bytes
@@ -468,6 +478,44 @@ pub type EmitRISCV64 = class {
     self.patchCount := self.patchCount + 1;
   }
 
+  // #2112: Abstand passt nicht ins Befehlsfeld → laut, statt zu maskieren.
+  fn rv_checkReach(what: pchar, dist: int64, reach: int64) {
+    if dist >= (0 - reach) && dist < reach { return; }
+    EPrintStr("error: riscv: "c); EPrintStr(what);
+    EPrintStr(": Abstand "c); EPrintInt(dist);
+    EPrintStr(" Byte ueberschreitet die Reichweite von +/-"c); EPrintInt(reach);
+    EPrintStrLn(" Byte (#2112)."c);
+    exit(1);
+  }
+
+  // #2112: mode 1 = Ende einer Funktion (offene Marken-Patches sind ein
+  // Fehler — sonst loeste sie die gleichnamige Marke der naechsten Funktion
+  // auf), mode 0 = Ende von emit() (auch offene Aufrufe/Adressen). Dasselbe
+  // wie _checkNoOpenPatches in emit_arm64.lyx — die beiden muessen
+  // uebereinstimmen.
+  fn rv_checkNoOpenPatches(mode: int64) {
+    var i: int64 := 0;
+    while i < self.patchCount {
+      var base:  int64 := self.patchBuf + i * 32;
+      var lid:   int64 := peek64(base + 8);
+      var ptype: int64 := peek64(base + 16);
+      if lid != -2 {
+        var isFn: int64 := 0;
+        if ptype == RV_PATCH_BL || ptype == RV_PATCH_FADDR { isFn := 1; }
+        if mode == 0 || isFn == 0 {
+          EPrintStr("error: riscv: Sprungziel nie aufgeloest — "c);
+          if isFn != 0 { EPrintStr("Funktion "c); } else { EPrintStr("Marke "c); }
+          EPrintInt(lid);
+          EPrintStr(" (Patchtyp "c); EPrintInt(ptype);
+          EPrintStr(", Code-Offset "c); EPrintInt(peek64(base));
+          EPrintStrLn(") (#2112)."c);
+          exit(1);
+        }
+      }
+      i := i + 1;
+    }
+  }
+
   fn applyPatches() {
     var i: int64 := 0;
     while i < self.patchCount {
@@ -486,19 +534,29 @@ pub type EmitRISCV64 = class {
         // Code-Offset 0 gepatcht und sprang damit in die erste Funktion —
         // aus `alloc(64)` wurde ein Selbstaufruf von main bis zum
         // Stapelueberlauf (#1740).
-        if labelId < 256 {
+        if labelId >= 0 && labelId < self.funcCap {
           target := peek64(self.funcAddrs + labelId * 8);
           if target == 0 { if labelId != 0 { target := -1; } }
         }
       } else {
-        if labelId < 1024 { target := peek64(self.labelAddrs + labelId * 8); }
+        if labelId >= 0 && labelId < self.labelCap { target := peek64(self.labelAddrs + labelId * 8); }
       }
       if target >= 0 {
         var delta: int64 := target - codeOff;
-        if ptype == RV_PATCH_J || ptype == RV_PATCH_BL {
-          // rd = ptype (0 = x0 for jump, 1 = ra for call)
-          self.rv_poke32at(codeOff, self.rv_buildJAL(ptype, delta));
+        if ptype == RV_PATCH_J {
+          self.rv_checkReach("JAL (Sprung innerhalb der Funktion)"c, delta, RV_REACH_JAL);
+          self.rv_poke32at(codeOff, self.rv_buildJAL(0, delta));
+        } else if ptype == RV_PATCH_BL {
+          // #2112: Aufruf als AUIPC ra + JALR ra — JAL reichte nur +/-1 MiB,
+          // und ein Programm mit mehr Code ist kein Sonderfall. Hoch/tief
+          // geteilt wie bei RV_PATCH_FADDR darunter.
+          self.rv_checkReach("AUIPC+JALR (Aufruf)"c, delta, RV_REACH_PC);
+          var blHi: int64 := (delta + 0x800) >> 12;
+          var blLo: int64 := delta - (blHi << 12);
+          self.rv_poke32at(codeOff, 0x17 | (RV_RA << 7) | ((blHi & 0xFFFFF) << 12));
+          self.rv_poke32at(codeOff + 4, 0x67 | (RV_RA << 7) | (0 << 12) | (RV_RA << 15) | ((blLo & 0xFFF) << 20));
         } else if ptype == RV_PATCH_FADDR {
+          self.rv_checkReach("AUIPC+ADDI (Funktionsadresse)"c, delta, RV_REACH_PC);
           // #1806: AUIPC traegt die oberen 20 Bit, ADDI die unteren 12. Weil
           // ADDI sein Immediate VORZEICHENBEHAFTET addiert, muss der obere Teil
           // aufgerundet werden, sobald Bit 11 gesetzt ist — dieselbe Rechnung
@@ -508,9 +566,14 @@ pub type EmitRISCV64 = class {
           self.rv_poke32at(codeOff, 0x17 | (RV_T0 << 7) | ((faHi & 0xFFFFF) << 12));
           self.rv_poke32at(codeOff + 4, 0x13 | (RV_T0 << 7) | (0 << 12) | (RV_T0 << 15) | ((faLo & 0xFFF) << 20));
         } else if ptype == RV_PATCH_BEQ {
+          self.rv_checkReach("BEQ"c, delta, RV_REACH_B);
           self.rv_poke32at(codeOff, self.rv_buildBtype(0, RV_T0, RV_ZERO, delta));
         } else if ptype == RV_PATCH_BNE {
+          self.rv_checkReach("BNE"c, delta, RV_REACH_B);
           self.rv_poke32at(codeOff, self.rv_buildBtype(1, RV_T0, RV_ZERO, delta));
+        } else {
+          EPrintStr("error: riscv: unbekannter Patchtyp "c); EPrintInt(ptype); EPrintStrLn(" (#2112)."c);
+          exit(1);
         }
         poke64(base + 8, -2);
       }
@@ -769,7 +832,10 @@ pub type EmitRISCV64 = class {
         ai := ai + 1;
       }
       var patchOff: int64 := self.codeLen;
-      self.rv_e32(0x000000EF);   // JAL ra, 0 placeholder (0x6F | 1<<7 = 0xEF)
+      // #2112: AUIPC ra + JALR ra statt JAL ra (+/-1 MiB) — beide Platzhalter,
+      // applyPatches traegt hoch/tief ein.
+      self.rv_e32(0x17 | (RV_RA << 7));                       // AUIPC ra, 0
+      self.rv_e32(0x67 | (RV_RA << 7) | (RV_RA << 15));       // JALR ra, 0(ra)
       self.addPatch(patchOff, src1, RV_PATCH_BL, 0);
       self.rv_MV(RV_T0, RV_A0);
       self.rv_storeSlot(dest);
@@ -814,24 +880,45 @@ pub type EmitRISCV64 = class {
       self.rv_e32(0x0000006F);   // JAL x0, 0 placeholder
       self.addPatch(patchOff, imm, RV_PATCH_J, 0);
     }
+    // #2112: Bedingte Spruenge als umgekehrter Kurzsprung ueber ein JAL.
+    // BEQ/BNE reichen nur +/-4 KiB — ein while-Rumpf mit rund 16 poke8 lag
+    // schon darueber, und der Abstand wurde still maskiert. JAL reicht
+    // +/-1 MiB; darueber meldet applyPatches.
     if op == IRO_BR_TRUE {
       self.rv_loadSlot(src1);
+      self.rv_e32(self.rv_buildBtype(0, RV_T0, RV_ZERO, 8));  // BEQ t0, x0, +8
       var patchOff: int64 := self.codeLen;
-      // BNE t0, x0, 0 placeholder: 0x63 | (1<<12) | (RV_T0<<15) = 0x00029063
-      self.rv_e32(0x00029063);
-      self.addPatch(patchOff, imm, RV_PATCH_BNE, 0);
+      self.rv_e32(0x0000006F);                                 // JAL x0, label
+      self.addPatch(patchOff, imm, RV_PATCH_J, 0);
     }
     if op == IRO_BR_FALSE {
       self.rv_loadSlot(src1);
+      self.rv_e32(self.rv_buildBtype(1, RV_T0, RV_ZERO, 8));  // BNE t0, x0, +8
       var patchOff: int64 := self.codeLen;
-      // BEQ t0, x0, 0 placeholder: 0x63 | (0<<12) | (RV_T0<<15) = 0x00028063
-      self.rv_e32(0x00028063);
-      self.addPatch(patchOff, imm, RV_PATCH_BEQ, 0);
+      self.rv_e32(0x0000006F);                                 // JAL x0, label
+      self.addPatch(patchOff, imm, RV_PATCH_J, 0);
     }
     if op == IRO_LABEL {
-      if imm < 1024 {
-        poke64(self.labelAddrs + imm * 8, self.codeLen);
+      // #2112: Die Tabelle war fest bei 1024; eine Marke dahinter wurde
+      // still verworfen und ihr Sprung nie nachgetragen.
+      if imm < 0 {
+        EPrintStr("error: riscv: negative Marke "c); EPrintInt(imm); EPrintStrLn(" (#2112)."c);
+        exit(1);
       }
+      if imm >= self.labelCap {
+        var lnc: int64 := self.labelCap * 2;
+        while imm >= lnc { lnc := lnc * 2; }
+        var lnb: int64 := alloc(lnc * 8);
+        var lci: int64 := 0;
+        while lci < lnc {
+          if lci < self.labelCap { poke64(lnb + lci * 8, peek64(self.labelAddrs + lci * 8)); }
+          else                   { poke64(lnb + lci * 8, -1); }
+          lci := lci + 1;
+        }
+        self.labelAddrs := lnb;
+        self.labelCap   := lnc;
+      }
+      poke64(self.labelAddrs + imm * 8, self.codeLen);
     }
     if op == IRO_FUNC_EXIT {
       self.emitEpilogue();
@@ -1595,10 +1682,13 @@ pub type EmitRISCV64 = class {
   // --------------------------------------------------------------------------
 
   fn emitFunc(funcId: int64) {
-    if funcId < 256 {
-      poke64(self.funcAddrs + funcId * 8, self.codeLen);
-      self.funcCount := self.funcCount + 1;
+    if funcId >= self.funcCap {
+      EPrintStr("error: riscv: Funktion "c); EPrintInt(funcId);
+      EPrintStrLn(" liegt jenseits der Funktionstabelle (#2112)."c);
+      exit(1);
     }
+    poke64(self.funcAddrs + funcId * 8, self.codeLen);
+    self.funcCount := self.funcCount + 1;
     // #1740: Anfang von main merken. Der _start-Rumpf sprang fest auf die
     // ZUERST erzeugte Funktion; stand main nicht an erster Stelle, lief das
     // Programm in eine fremde Funktion und lieferte deren Wert.
@@ -1610,7 +1700,7 @@ pub type EmitRISCV64 = class {
     // Vorwaertsaufrufe nicht mehr aufloesen. Aufgeloeste Eintraege sind mit
     // labelId = -2 markiert und werden uebersprungen.
     var li: int64 := 0;
-    while li < 1024 { poke64(self.labelAddrs + li * 8, -1); li := li + 1; }
+    while li < self.labelCap { poke64(self.labelAddrs + li * 8, -1); li := li + 1; }
     self.calcStackFrame(funcId);
     self.emitPrologue();
     // #1740: eingehende Argumentregister a0..a7 in die Param-Slots spillen.
@@ -1631,6 +1721,7 @@ pub type EmitRISCV64 = class {
     while i < instrCount { self.emitInstr(funcId, instrStart + i); i := i + 1; }
     self.emitEpilogue();
     self.applyPatches();
+    self.rv_checkNoOpenPatches(1);   // #2112
   }
 
   // --------------------------------------------------------------------------
@@ -1643,12 +1734,17 @@ pub type EmitRISCV64 = class {
     self.codeCap    := 131072;
     self.codeLen    := 0;
     self.stackSize  := 0;
-    self.labelAddrs := alloc(1024 * 8);
+    self.labelCap   := 1024;
+    self.labelAddrs := alloc(self.labelCap * 8);
     self.labelCount := 0;
     self.patchBuf   := alloc(1024 * 32);
     self.patchCap   := 1024;
     self.patchCount := 0;
-    self.funcAddrs  := alloc(256 * 8);
+    // #2112: war fest 256 — die 257. Funktion bekam keine Adresse, jeder
+    // Aufruf dorthin blieb auf dem Platzhalter (Selbstaufruf).
+    self.funcCap    := self.getFuncCount() + 1;
+    if self.funcCap < 256 { self.funcCap := 256; }
+    self.funcAddrs  := alloc(self.funcCap * 8);
     self.funcCount  := 0;
     self.globRelocBuf   := alloc(256 * 16);
     self.globRelocCap   := 256;
@@ -1664,6 +1760,7 @@ pub type EmitRISCV64 = class {
     // #1740: jetzt steht jede Funktionsadresse fest — offene Vorwaertsaufrufe
     // aufloesen.
     self.applyPatches();
+    self.rv_checkNoOpenPatches(0);   // #2112
     self.emitGlobalsPool();
     self.applyGlobalRelocs();
     return self.codeLen;
@@ -2126,6 +2223,12 @@ pub type RiscvLinuxBackend = class {
     // NULL, GetArgV liefert s10 — dieselbe Auskunft wie emitArgcArgv auf lyxos.
     self.rlb_ce32(0x00810D13);  // ADDI s10, sp, 8
     var off: int64 := RV_START_STUB_LEN + mainOff - 4;   // JAL steht bei Offset 4
+    // #2112: JAL reicht +/-1 MiB; der Rumpf hat feste Laenge (RV_START_STUB_LEN),
+    // eine Langform passt nicht hinein. Darueber laut statt still maskiert.
+    if off >= 0x100000 {
+      EPrintStrLn("error: riscv: main liegt mehr als 1 MiB hinter _start — JAL reicht nicht (#2112)."c);
+      exit(1);
+    }
     var b20:    int64 := (off >> 20) & 0x1;
     var b10_1:  int64 := (off >> 1)  & 0x3FF;
     var b11:    int64 := (off >> 11) & 0x1;

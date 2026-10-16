@@ -2894,13 +2894,12 @@ pub type CompilerConfig = class {
       //
       // For static binaries or --no-libc-init, use the original 12-byte stub.
       if self.armExternCount > 0 && !self.noLibcInit {
-        if irCodeLen > 131016 {
-          EPrintStr("lyxc: ARM64 code section too large for dynamic stub (>131016 bytes)\n"c);
-          return;
-        }
+        // #2112: Der Puffer war fest 128 KiB gross. Hier wurde wenigstens
+        // abgewiesen (mit einem `return;` ohne Wert), im statischen Zweig
+        // darunter lief memcpy still darueber hinaus.
         self.codeStubOff := 56;
         var totalLen2: int64 := 56 + irCodeLen;
-        var dynBuf: int64 := alloc(131072);
+        var dynBuf: int64 := alloc(totalLen2);
         // ADR x0, #56 = 0x100001C0
         poke8(dynBuf +  0, 0xC0); poke8(dynBuf +  1, 0x01); poke8(dynBuf +  2, 0x00); poke8(dynBuf +  3, 0x10);
         // LDR x1, [sp] = 0xF94003E1
@@ -2943,7 +2942,12 @@ pub type CompilerConfig = class {
       // main   (offset 20): IR-emitted function code
       self.codeStubOff := 20;
       var totalLen: int64 := 20 + irCodeLen;
-      var newBuf: int64 := alloc(131072);
+      // #2112: Hier stand alloc(131072). Ab 128 KiB Code schrieb das memcpy
+      // unten ueber den Puffer hinaus in die naechsten Arena-Bloecke; was
+      // danach dort angelegt wurde, ueberschrieb das Codeende. Ein `main` mit
+      // rund 750 poke8 reichte: der erste Aufruf (alloc) zielte in Nullen —
+      // SIGILL, bei mehr Code SIGSEGV, beides vor der ersten Ausgabe.
+      var newBuf: int64 := alloc(totalLen);
 
       // LDR x0, [sp] = 0xF94003E0
       poke8(newBuf + 0, 0xE0);  poke8(newBuf + 1, 0x03);
@@ -2973,6 +2977,12 @@ pub type CompilerConfig = class {
       }
       var asMainOff: int64 := peek64(self.codeFuncAddrs + asMainId * 8);
       var asBlImm: int64 := (12 + asMainOff) / 4;   // (20 + mainOff - 8) / 4
+      // #2112: BL traegt imm26; unten werden aber nur 24 Bit eingetragen
+      // (das vierte Byte ist fest 0x94). Darueber laut, nicht still kuerzen.
+      if asBlImm >= 0x800000 {
+        EPrintStrLn("error: arm64: main liegt mehr als 32 MiB hinter _start (#2112)."c);
+        exit(1);
+      }
       poke8(newBuf + 8,  asBlImm & 0xFF);        poke8(newBuf + 9,  (asBlImm >> 8) & 0xFF);
       poke8(newBuf + 10, (asBlImm >> 16) & 0xFF); poke8(newBuf + 11, 0x94);
       // MOVZ x8, #93 = 0xD2800BA8
@@ -3068,7 +3078,7 @@ pub type CompilerConfig = class {
       var irCodeLen: int64 := emitter.getCodeLen();
       var irCodeBuf: int64 := emitter.getCodeBuf();
       var totalLen: int64 := 16 + irCodeLen;
-      var newBuf: int64 := alloc(131072);
+      var newBuf: int64 := alloc(totalLen);   // #2112: war fest 128 KiB
 
       // BL main — main at offset 16 (4 instructions forward) = 0x94000004
       poke8(newBuf + 0,  4);     poke8(newBuf + 1,  0);

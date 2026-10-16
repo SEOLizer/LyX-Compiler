@@ -590,6 +590,7 @@ test: lyxc
 	@bash tests/adresse_von_test.sh
 	@bash tests/android_shared_lib_test.sh
 	@bash tests/ir_mmap_test.sh
+	@bash tests/ir_sprungweite_test.sh
 	@bash tests/argv_ir_test.sh
 	@bash tests/thread_join_test.sh
 	@bash tests/ir_lower_tempo_test.sh
