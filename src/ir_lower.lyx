@@ -811,7 +811,24 @@ pub type IRLower = class {
   // Muss dieselbe Antwort geben wie sema.lyuArch — sonst findet der eine Weg
   // eine Datei, die der andere nicht findet.
   irLyuArch:     pchar;
-  
+
+  // #2123: Anfangswerte von Modulvariablen zur LAUFZEIT. Der Vorpass in
+  // lowerModule kann nur ablegen, was zur Uebersetzungszeit feststeht; alles
+  // andere (Aufruf, Zeichenkette, Ausdruck aus einer anderen Modulvariablen,
+  // f64-Rechnung, Speicher fuer Struktur/Array) blieb bis 1.2.14C still 0.
+  // Jetzt entsteht je Unit eine Funktion `__lyx_modinit_<n>` und eine
+  // Sammelfunktion `__lyx_modinit`, die sie in Abhaengigkeitsreihenfolge ruft.
+  //   irInitModus  — 0 Programm (main ruft __lyx_modinit), 1 Shared Library
+  //                  (DT_INIT_ARRAY, writeELFSharedLib), 2 --compile-unit
+  //                  (kein Aufrufer: laut abweisen)
+  //   modInitNoetig — 1, wenn irgendeine Unit einen Laufzeit-Anfangswert hat
+  //   modInitBuf   — je 16 B: Zeiger auf den Namen der Unit-Funktion, Laenge
+  irInitModus:   int64;
+  modInitNoetig: int64;
+  modInitBuf:    int64;
+  modInitN:      int64;
+  modInitCap:    int64;
+
   // ------------------------------------------------------------------
   // Initialization
   // ------------------------------------------------------------------
@@ -910,6 +927,11 @@ pub type IRLower = class {
     self.pendingGenCap   := 16;
     self.pendingGenBuf   := alloc(16 * 32);
     self.pendingGenCount := 0;
+    self.irInitModus := 0;     // #2123
+    self.modInitNoetig := 0;
+    self.modInitCap := 16;
+    self.modInitBuf := alloc(self.modInitCap * 16);
+    self.modInitN := 0;
   }
   
   // Helper function to call IRModule methods via vtable
@@ -8132,6 +8154,15 @@ pub type IRLower = class {
 
     self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
 
+    // #2123: `main` des Hauptmoduls ruft als Erstes die Anfangswerte aller
+    // Units (__lyx_modinit). Nur dort: eine gleichnamige Funktion eines
+    // Imports (irUnitTag), eine Methode oder eine erzeugte Funktion
+    // (overrideFuncName) ist kein Einstiegspunkt.
+    if self.modInitNoetig != 0 && self.irInitModus == 0 && self.irUnitTag == 0
+       && (self.overrideFuncName as int64) == 0 && self.methodParamBase == 0 {
+      if self.seq(self.nodeSVal(funcNode), self.nodeSLen(funcNode), "main", 4) { self._modInitRuf(); }
+    }
+
     var body: int64 := self.nodeC2(funcNode);
     if (body >= 0) { self.lowerBlock(body); }
 
@@ -8436,6 +8467,31 @@ pub type IRLower = class {
       self.impLstName := wlName; self.impLstNameLen := wlNameL;   // #2076
       self.impLstN   := wlW;
       self._irPubConSammle();   // #2107
+      // #2123: Braucht IRGENDEINE Unit einen Anfangswert zur Laufzeit? Das
+      // muss feststehen, bevor `main` entsteht — main ruft dann __lyx_modinit,
+      // dessen Rumpf erst ganz am Ende gebaut wird (deshalb hier schon
+      // registriert, wie jede Vorwaertsreferenz). Ohne Bedarf entsteht weder
+      // die Funktion noch der Aufruf: das Erzeugnis bleibt Byte fuer Byte,
+      // wie es war.
+      var miSvSrc: pchar := self.src; var miSvNodes: int64 := self.nodes; var miSvCnt: int64 := self.nodeCount;
+      var miU: int64 := 0;
+      while miU < self.impLstN {
+        self.src := peek64(self.impLstSrc + miU * 8) as pchar;
+        self.nodes := peek64(self.impLstNodes + miU * 8);
+        self.nodeCount := peek64(self.impLstCnt + miU * 8);
+        var miD: int64 := peek64(self.impLstHead + miU * 8);
+        while miD >= 0 {
+          if self._modVarLaufzeit(miD) != 0 { self.modInitNoetig := 1; }
+          miD := self.nodeNext(miD);
+        }
+        miU := miU + 1;
+      }
+      self.src := miSvSrc; self.nodes := miSvNodes; self.nodeCount := miSvCnt;
+      if self.modInitNoetig != 0 && self.irInitModus != 2 {
+        var miNm: pchar := "__lyx_modinit";
+        var miOff: int64 := self.irAddString(miNm, 13);
+        self.irAddFunc(miOff, 13, 0, 0);
+      }
     }
 
     // #2107: Der Vorpass fuer Modulvariablen und Konstanten steht HINTER dem
@@ -8918,6 +8974,14 @@ pub type IRLower = class {
     }
     self.nestCnt := nsBase;
 
+    // #2123: die Anfangswerte DIESER Unit. Hier, am Ende ihres eigenen
+    // Durchgangs, sind alle ihre Importe schon fertig (der Rumpfdurchgang
+    // oben steigt fuer jeden NK_IMPORT in lowerModule ab) — die Reihenfolge
+    // der Eintraege in modInitBuf ist damit "Importe vor dem Importeur".
+    // VOR dem Nachlauf: ruft ein Anfangswert eine importierte Funktion, ist
+    // sie damit vorgemerkt, und der Nachlauf erzeugt ihren Rumpf.
+    if self._imNachlauf == 0 { self._modInitEinheit(decls); }
+
     // #1727: Nachlauf. Bis hierher ist jeder Import genau einmal durchlaufen
     // worden — in Quelltextreihenfolge. Ruft eine importierte Funktion etwas
     // in einem Modul, das VORHER abgearbeitet wurde, kam die Markierung zu
@@ -8959,6 +9023,10 @@ pub type IRLower = class {
       self.nodes     := nlSavedNodes;
       self.nodeCount := nlSavedCnt;
     }
+
+    // #2123: die Sammelfunktion — erst jetzt, wenn alle Units ihren Eintrag
+    // in modInitBuf haben.
+    if binTop != 0 { self._modInitHaupt(); }
 
     // WP-2.1: emit pending generic specializations collected during this module.
     // Each pending record: {mangledPtr:8, mangledLen:8, genFuncNodeIdx:8, emitted:8}
@@ -9051,6 +9119,290 @@ pub type IRLower = class {
     var off: int64 := funcIdx * 80;
     poke64(funcBuf2 + off + IR_FUNC_OFF_INSTRSOFF, self.funcInstrStart);
     poke64(funcBuf2 + off + IR_FUNC_OFF_INSTRCOUNT, instrLen - self.funcInstrStart);
+  }
+
+  // ------------------------------------------------------------------
+  // #2123: Anfangswerte von Modulvariablen zur Laufzeit
+  // ------------------------------------------------------------------
+  //
+  // Bis 1.2.14C legte der Vorpass in lowerModule nur ab, was sich falten
+  // liess (Ganzzahl-Konstanten, f64-Literale); alles andere blieb STILL 0.
+  // `var s: pchar := "abc"` war ein Nullzeiger, `var r: TR;` hatte keinen
+  // Speicher, `var gF: fn(int64): int64 := Triple` sprang nach 0 — auf
+  // x86 gehen alle drei, weil der Produktiv-Codegen dort die Adressen beim
+  // Schreiben einsetzt. Auf dem IR-Weg stehen sie im Datenbereich erst fest,
+  // wenn das Backend ihn schreibt; also entsteht der Wert dort, wo er sich
+  // ohnehin ausrechnen laesst: in einer Funktion, die vor main laeuft.
+
+  // Was braucht die Modulvariable `d` zur Laufzeit?
+  //   0 — nichts (gefaltet, f64-Literal, kein Anfangswert, keine Ablage)
+  //   1 — den Anfangswert auswerten und speichern
+  //   2 — Speicher fuer ein Array fester Groesse oder eine Struktur
+  // Die Unterscheidung muss mit dem Vorpass in lowerModule uebereinstimmen:
+  // was er in den Datenbereich legt, darf hier nicht noch einmal entstehen,
+  // und was er nicht ablegen kann, MUSS hier entstehen. Der Speicherfall
+  // ist dieselbe Rechnung wie fuer ein Local in lowerStmt (NK_VAR_DECL ohne
+  // Anfangswert, #1835) — die beiden muessen uebereinstimmen.
+  fn _modVarLaufzeit(d: int64): int64 {
+    if self.nodeKind(d) != NK_VAR_DECL { return 0; }
+    var ini: int64 := self.nodeC1(d);
+    var ty: int64 := self.nodeC0(d);
+    if ini >= 0 {
+      if self._constFaltbar(ini) != 0 { return 0; }
+      // Der f64-Zweig des Vorpasses (#1801): Literal, auch mit unaerem
+      // Minus, und nur, wenn der Wert oder der Typ Gleitkomma ist.
+      var fIst: int64 := 0;
+      if self.nodeKind(ini) == NK_LIT_FLOAT { fIst := 1; }
+      if ty >= 0 {
+        if self.nodeKind(ty) == NK_TYPE_NAME {
+          if self.seq(self.nodeSVal(ty), self.nodeSLen(ty), "f64", 3) { fIst := 1; }
+          if self.seq(self.nodeSVal(ty), self.nodeSLen(ty), "f32", 3) { fIst := 1; }
+        }
+      }
+      if fIst != 0 {
+        var fN: int64 := ini;
+        if self.nodeKind(fN) == NK_UNOP {
+          if self.nodeIVal(fN) == 71 { fN := self.nodeC0(fN); }
+        }
+        if self.nodeKind(fN) == NK_LIT_FLOAT { return 0; }
+      }
+      return 1;
+    }
+    if ty < 0 { return 0; }
+    if self.nodeKind(ty) == NK_TYPE_ARRAY_FIXED {
+      var szN: int64 := self.nodeC1(ty);
+      if szN >= 0 && self.nodeKind(szN) == NK_LIT_INT {
+        if self.nodeIVal(szN) > 0 { return 2; }
+      }
+      return 0;
+    }
+    // Nur STRUKTUREN (iv-Bit 4): eine Klassenvariable ohne `new` bleibt null,
+    // wie auf x86 (#1619) und beim Local (#1835).
+    var sd: int64 := self._typeNodeToDecl(ty);
+    if sd >= 0 {
+      if (self.nodeIVal(sd) & 16) != 0 {
+        if self.structGroesse(sd) > 0 { return 2; }
+      }
+    }
+    return 0;
+  }
+
+  // Die Anfangswerte einer Unit als Funktion `__lyx_modinit_<n>`, in
+  // Deklarationsreihenfolge. Gerufen am Ende von lowerModule — mit den
+  // Knotentabellen, der Unit-Kennung und dem Privatverzeichnis DIESER Unit,
+  // die Namen loesen also auf wie in einer ihrer Funktionen.
+  fn _modInitEinheit(decls: int64) {
+    var hat: int64 := 0;
+    var d: int64 := decls;
+    while d >= 0 {
+      if self._modVarLaufzeit(d) != 0 {
+        if hat == 0 && self.irInitModus == 2 {
+          // --compile-unit: Die .lyu traegt das IR der Unit, aber niemand
+          // ruft ihre Anfangswerte — das Programm, das sie spaeter einbindet,
+          // baut seine Sammelfunktion aus SEINEN Units. Lieber kein Erzeugnis
+          // als eines mit stillen Nullen.
+          EPrintStr("lyxc: Modulvariable '"c);
+          sys_write(2, self.nodeSVal(d) as int64, self.nodeSLen(d));
+          EPrintStrLn("' braucht einen Anfangswert zur Laufzeit (#2123)."c);
+          EPrintStrLn("  In einer vorkompilierten Unit (--compile-unit) fuer ein IR-Ziel gibt es"c);
+          EPrintStrLn("  dafuer noch keinen Aufrufer. Die Unit als Quelle einbinden, oder den"c);
+          EPrintStrLn("  Wert in einer Funktion zuweisen."c);
+          exit(1);
+        }
+        hat := 1;
+      }
+      d := self.nodeNext(d);
+    }
+    if hat == 0 { return; }
+    if self.modInitNoetig == 0 {
+      // Der Vorlauf (binTop) hat diese Unit nicht gesehen oder anders
+      // beurteilt. Dann ruft niemand diese Funktion — laut, statt still 0.
+      EPrintStr("lyxc: interner Fehler (#2123): Anfangswert von '"c);
+      sys_write(2, self.nodeSVal(decls) as int64, self.nodeSLen(decls));
+      EPrintStrLn("' ohne Aufrufer — der Vorlauf hat die Unit nicht erfasst."c);
+      exit(1);
+    }
+
+    // Zustand wie in lowerFunc sichern; die Funktion entsteht mitten in
+    // lowerModule, das danach weiterlaeuft.
+    var sLocal: int64 := self.localCount;
+    var sParam: int64 := self.paramCount;
+    var sTemp:  int64 := self.tempCount;
+    var sRet:   int64 := self.retValTemp;
+    var sCur:   int64 := self.curFunc;
+    var sExit:  int64 := self.funcExitLabel;
+    var sStart: int64 := self.funcInstrStart;
+    var sLN:    int64 := self.localNameCnt;
+    var sVol:   int64 := self._volSlotN;
+    var sMPB:   int64 := self.methodParamBase;
+    var sCMC:   int64 := self.curMethodClassType;
+    var sOvN:   pchar := self.overrideFuncName;
+    var sOvL:   int64 := self.overrideFuncNameLen;
+    self.localCount := 0;
+    self.paramCount := 0;
+    self.tempCount := 0;
+    self.localNameCnt := 0;
+    self._volSlotN := 0;
+    self.methodParamBase := 0;
+    self.curMethodClassType := 0 - 1;
+    var bargRsv: int64 := 0;
+    while bargRsv < IR_BARG_SLOTS { self.allocTemp(); bargRsv := bargRsv + 1; }
+    self.retValTemp := self.allocTemp();
+    self.funcExitLabel := self.genLabel();
+    self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
+
+    d := decls;
+    while d >= 0 {
+      var art: int64 := self._modVarLaufzeit(d);
+      if art != 0 {
+        // curFunc muss ein Knoten sein: die Namensaufloesung liest seine
+        // Parameterkette (c0). Die Deklaration selbst hat keine — ihr c0 ist
+        // der Typknoten, kein NK_PARAM, also findet die Suche nichts.
+        self.curFunc := d;
+        var gIdx: int64 := self._irGlobalIdx(self.nodeSVal(d) as int64, self.nodeSLen(d));
+        if gIdx < 0 {
+          EPrintStr("lyxc: interner Fehler (#2123): Modulvariable '"c);
+          sys_write(2, self.nodeSVal(d) as int64, self.nodeSLen(d));
+          EPrintStrLn("' steht nicht im Verzeichnis."c);
+          exit(1);
+        }
+        var wert: int64 := 0 - 1;
+        if art == 1 {
+          wert := self.lowerExpr(self.nodeC1(d));
+        } else {
+          var ty: int64 := self.nodeC0(d);
+          var gr: int64 := 0;
+          var ausr: int64 := 0;
+          if self.nodeKind(ty) == NK_TYPE_ARRAY_FIXED {
+            gr := self.nodeIVal(self.nodeC1(ty)) * 8;
+            // WP-ALIGN: @align(n) wie beim Local.
+            ausr := (self.nodeIVal(d) >> 8) & 0xFFFFFF;
+          } else {
+            gr := self.structGroesse(self._typeNodeToDecl(ty));
+          }
+          var grT: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_CONST_INT, grT, -1, -1, gr);
+          wert := self.allocTemp();
+          self.irAddInstrDirect(IRO_ALLOC, wert, grT, -1, ausr);
+        }
+        self.irAddInstrDirect(IRO_STORE_GLOBAL, gIdx, wert, -1, 0);
+      }
+      d := self.nodeNext(d);
+    }
+
+    self.irEmitLabel(self.funcExitLabel);
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
+
+    // Name "__lyx_modinit_<n>"
+    var nb: int64 := alloc(40);
+    var pre: pchar := "__lyx_modinit_";
+    memcpy(nb, pre as int64, 14);
+    var nl: int64 := 14;
+    var zahl: int64 := self.modInitN;
+    var ziff: int64 := alloc(24);
+    var zn: int64 := 0;
+    if zahl == 0 { poke8(ziff, 48); zn := 1; }
+    while zahl > 0 { poke8(ziff + zn, 48 + (zahl % 10)); zahl := zahl / 10; zn := zn + 1; }
+    while zn > 0 { zn := zn - 1; poke8(nb + nl, peek8(ziff + zn)); nl := nl + 1; }
+    poke8(nb + nl, 0);
+    free(ziff, 24);
+
+    self.overrideFuncName := nb as pchar;
+    self.overrideFuncNameLen := nl;
+    self._addFunc();
+
+    if self.modInitN >= self.modInitCap {
+      var nc: int64 := self.modInitCap * 2;
+      var nbuf: int64 := alloc(nc * 16);
+      memcpy(nbuf, self.modInitBuf, self.modInitN * 16);
+      self.modInitBuf := nbuf;
+      self.modInitCap := nc;
+    }
+    poke64(self.modInitBuf + self.modInitN * 16, nb);
+    poke64(self.modInitBuf + self.modInitN * 16 + 8, nl);
+    self.modInitN := self.modInitN + 1;
+
+    self.localCount := sLocal;
+    self.paramCount := sParam;
+    self.tempCount := sTemp;
+    self.retValTemp := sRet;
+    self.curFunc := sCur;
+    self.funcExitLabel := sExit;
+    self.funcInstrStart := sStart;
+    self.localNameCnt := sLN;
+    self._volSlotN := sVol;
+    self.methodParamBase := sMPB;
+    self.curMethodClassType := sCMC;
+    self.overrideFuncName := sOvN;
+    self.overrideFuncNameLen := sOvL;
+  }
+
+  // Die Sammelfunktion `__lyx_modinit`: ruft die Unit-Funktionen in der
+  // Reihenfolge, in der sie entstanden sind — Importe vor dem Importeur.
+  // Registriert ist sie seit dem Vorlauf (main ruft sie schon).
+  fn _modInitHaupt() {
+    if self.modInitNoetig == 0 { return; }
+    if self.irInitModus == 2 { return; }
+    var sLocal: int64 := self.localCount;
+    var sParam: int64 := self.paramCount;
+    var sTemp:  int64 := self.tempCount;
+    var sRet:   int64 := self.retValTemp;
+    var sExit:  int64 := self.funcExitLabel;
+    var sStart: int64 := self.funcInstrStart;
+    var sOvN:   pchar := self.overrideFuncName;
+    var sOvL:   int64 := self.overrideFuncNameLen;
+    self.localCount := 0;
+    self.paramCount := 0;
+    self.tempCount := 0;
+    var bargRsv: int64 := 0;
+    while bargRsv < IR_BARG_SLOTS { self.allocTemp(); bargRsv := bargRsv + 1; }
+    self.retValTemp := self.allocTemp();
+    self.funcExitLabel := self.genLabel();
+    self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
+    var i: int64 := 0;
+    while i < self.modInitN {
+      var np: int64 := peek64(self.modInitBuf + i * 16);
+      var nl: int64 := peek64(self.modInitBuf + i * 16 + 8);
+      var idx: int64 := self._findFuncIdxStill(np as pchar, nl);
+      if idx < 0 {
+        EPrintStrLn("lyxc: interner Fehler (#2123): Unit-Anfangswerte nicht in der Funktionstabelle."c);
+        exit(1);
+      }
+      var argBase: int64 := self.tempCount;
+      var rsv: int64 := 0;
+      while rsv < 8 { self.allocTemp(); rsv := rsv + 1; }
+      var res: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CALL, res, idx, argBase, 0);
+      i := i + 1;
+    }
+    self.irEmitLabel(self.funcExitLabel);
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
+    self.overrideFuncName := "__lyx_modinit";
+    self.overrideFuncNameLen := 13;
+    self._addFunc();
+    self.localCount := sLocal;
+    self.paramCount := sParam;
+    self.tempCount := sTemp;
+    self.retValTemp := sRet;
+    self.funcExitLabel := sExit;
+    self.funcInstrStart := sStart;
+    self.overrideFuncName := sOvN;
+    self.overrideFuncNameLen := sOvL;
+  }
+
+  // Der Aufruf von __lyx_modinit am Anfang von main (lowerFunc).
+  fn _modInitRuf() {
+    var nm: pchar := "__lyx_modinit";
+    var idx: int64 := self._findFuncIdxStill(nm, 13);
+    if idx < 0 {
+      EPrintStrLn("lyxc: interner Fehler (#2123): __lyx_modinit ist nicht registriert."c);
+      exit(1);
+    }
+    var argBase: int64 := self.tempCount;
+    var rsv: int64 := 0;
+    while rsv < 8 { self.allocTemp(); rsv := rsv + 1; }
+    var res: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CALL, res, idx, argBase, 0);
   }
 
   fn getStringLen(off: int64): int64 {
