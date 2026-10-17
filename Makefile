@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.14B
+VERSION   := 1.2.14C
 VERSION_DATE := 2026-10-16
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -279,6 +279,7 @@ test: lyxc
 	@bash tests/feld_endian_test.sh
 	@bash tests/crt_raw_test.sh
 	@bash tests/capability_io_tty_test.sh
+	@bash tests/capability_signalfd_test.sh
 	@bash tests/typidentitaet_test.sh
 	@bash tests/capability_runde_b_test.sh
 	@bash tests/lcbs_abdeckung_test.sh
@@ -586,6 +587,10 @@ test: lyxc
 	@bash tests/unit_private_globals_test.sh
 	@bash tests/ir_kein_stiller_ausdruck_test.sh
 	@bash tests/riscv_zusicherung_test.sh
+	@bash tests/adresse_von_test.sh
+	@bash tests/android_shared_lib_test.sh
+	@bash tests/ir_mmap_test.sh
+	@bash tests/ir_sprungweite_test.sh
 	@bash tests/argv_ir_test.sh
 	@bash tests/thread_join_test.sh
 	@bash tests/ir_lower_tempo_test.sh
@@ -870,7 +875,7 @@ test: lyxc
 	@echo "--- Kernsprache (.lyx-Suite) ---"
 	@bash tests/run_lyx_suite.sh tests/suite-core.txt "Kernsprache"
 	@echo "OK"
-	@echo "--- Funktions- und Methodenzeiger (8 Suiten) ---"
+	@echo "--- Funktions- und Methodenzeiger (9 Suiten) ---"
 	@bash tests/arity_check_test.sh
 	@bash tests/asm_block_test.sh
 	@bash tests/elf_reloc_test.sh
@@ -879,6 +884,7 @@ test: lyxc
 	@bash tests/local_fnptr_test.sh
 	@bash tests/method_ptr_test.sh
 	@bash tests/method_ptr_xmod_test.sh
+	@bash tests/import_fn_wert_test.sh
 	@echo "OK"
 	@echo "--- Geometrie-/Result-Units (Struct-Literal-Umbau, 31 Prüfungen) ---"
 	./lyxc --std-path=std tests/geom_units_test.lyx -o /tmp/lyxc_geom_test

@@ -484,6 +484,8 @@ pub type CompilerConfig = class {
   // .dynsym/.dynstr/DT_NEEDED in the dynamic ET_EXEC writer.
   armExternBuf:     int64;
   armExternCount:   int64;
+  armGotCallBuf:    int64;   // #2117: externe Aufrufe einer .so (ADRP+LDR auf .got)
+  armGotCallCount:  int64;
 
 
   // WP-AND-upstream-fix v5: global-load slot tracking. globalRelocBuf records
@@ -625,6 +627,8 @@ pub type CompilerConfig = class {
     self.relocBuf         := 0;
     self.relocCount       := 0;
     self.globalRelocBuf   := 0;
+    self.armGotCallBuf    := 0;   // #2117
+    self.armGotCallCount  := 0;
     self.globalRelocCount := 0;
     self.irModulePtr      := 0;
     self.androidApiLevel  := ANDROID_API_DEFAULT;
@@ -1528,7 +1532,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.2.14B"c);
+      PrintStrLn("1.2.14C"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1550,7 +1554,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.2.14B"c);
+      PrintStrLn("1.2.14C"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1779,7 +1783,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.2.14B (bootstrap)");
+    PrintStrLn("lyxc 1.2.14C (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -2810,98 +2814,23 @@ pub type CompilerConfig = class {
   // Code Emission
   // ---------------------------------------------------------------------------
 
+  // #2118: Hier stand bis 1.2.14B ein Platzhalter — ein fest verdrahtetes
+  // `_start` und ein `main`, das 42 zurueckgibt, gleich welches Programm
+  // uebersetzt wurde. Erreicht wurde er von android-x86_64 (immer) und von
+  // x86-64 mit --shared: beide endeten mit rc 0 und einer gueltig
+  // aussehenden Datei ohne den Code des Programms (bei --shared ohne jede
+  // exportierte Funktion). Einen x86-64-Emitter fuer den IR-Weg gibt es
+  // nicht (src/backend/x86_64/emit_x86.lyx ist nirgends eingebunden), und der
+  // Schnellweg (codegen_x86) schreibt keine .so. Bis eines davon steht,
+  // bricht die Uebersetzung laut ab.
   fn emitX86_64(irMod: int64, lower: IRLower): int64 {
-    // Generate code with _start and main
-    // _start at offset 0, main at offset 19
-    var codeBuf: int64 := alloc(65536);
-    var codeLen: int64 := 0;
-    
-    // _start: standard entry point at vaddr 0x401000
-    // Layout: push rbp(1) + mov rbp,rsp(3) + call(5) + mov rdi,rax(3) + mov eax,60(5) + syscall(2) = 19 bytes
-    // main starts at offset 19; call next IP=9, rel32 = 19-9 = 10
-
-    // push rbp (offset 0)
-    poke8(codeBuf + codeLen, 85);
-    codeLen += 1;
-    // mov rbp, rsp (offset 1): 48 89 E5
-    poke8(codeBuf + codeLen, 72);   // REX.W
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 137);  // MOV r/m64, r64
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 229);  // ModRM 0xE5 = 11 100 101 = mov rbp, rsp
-    codeLen += 1;
-
-    // call main (offset 4): E8 rel32; next IP = 9; main at 19; rel32 = 10
-    poke8(codeBuf + codeLen, 232);  // E8
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 10);   // rel32 = 10
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 0);
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 0);
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 0);
-    codeLen += 1;
-    
-    // After main returns, exit with return value in rax
-    // mov rdi, rax (3 bytes at 0x40100e)
-    // x86-64: 48 89 c7 = mov rdi, rax
-    poke8(codeBuf + codeLen, 72);
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 137);
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 199);
-    codeLen += 1;
-    
-    // mov eax, 60 (offset 12): B8 3C 00 00 00 — zero-extends to rax
-    poke8(codeBuf + codeLen, 184);  // B8 = MOV EAX, imm32
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 60);   // 60 = sys_exit
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 0);
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 0);
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 0);
-    codeLen += 1;
-
-    // syscall (offset 17): 0F 05
-    poke8(codeBuf + codeLen, 15);
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 5);
-    codeLen += 1;
-    
-    // main (offset 19 = 0x401013)
-    // push rbp
-    poke8(codeBuf + codeLen, 85);   // 55
-    codeLen += 1;
-    // mov rbp, rsp: 48 89 E5
-    poke8(codeBuf + codeLen, 72);   // REX.W
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 137);  // MOV r/m64, r64
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 229);  // ModRM 0xE5 = 11 100 101 = mov rbp, rsp
-    codeLen += 1;
-    // mov eax, 42: B8 2A 00 00 00 (zero-extends to rax)
-    poke8(codeBuf + codeLen, 184);  // B8 = MOV EAX, imm32
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 42);   // 42
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 0);
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 0);
-    codeLen += 1;
-    poke8(codeBuf + codeLen, 0);
-    codeLen += 1;
-    // pop rbp
-    poke8(codeBuf + codeLen, 93);   // 5D
-    codeLen += 1;
-    // ret
-    poke8(codeBuf + codeLen, 195);  // C3
-    codeLen += 1;
-    
-    self.codeSize := codeLen;
-    return codeBuf;
+    if self.target == LYX_TC_ANDROID_X86_64 {
+      EPrintStrLn("error: --target=android-x86_64 hat keinen Codegen — bisher entstand still ein Programm, das 42 liefert (#2118, #2124)."c);
+    } else {
+      EPrintStrLn("error: x86-64 mit --shared ist nicht umgesetzt — bisher entstand still eine .so ohne Code und ohne Exporte (#2118, #2124)."c);
+    }
+    EPrintStrLn("  Fuer Android-Bibliotheken: --target=android-arm64 --shared."c);
+    return 0;
   }
 
   fn emitARM64(irMod: int64): int64 {
@@ -2929,6 +2858,8 @@ pub type CompilerConfig = class {
       self.globalRelocCount := emitter.getGlobalRelocCount();
       self.armExternBuf     := emitter.getExternBuf();
       self.armExternCount   := emitter.getExternCount();
+      self.armGotCallBuf    := emitter.getGotCallBuf();     // #2117
+      self.armGotCallCount  := emitter.getGotCallCount();
       self.irModulePtr      := irMod;
       // WP-AND-03: harvest prologue-length table + function count for DWARF CFI.
       self.codeFuncPrologueLen := emitter.getFuncPrologueLen();
@@ -2963,13 +2894,12 @@ pub type CompilerConfig = class {
       //
       // For static binaries or --no-libc-init, use the original 12-byte stub.
       if self.armExternCount > 0 && !self.noLibcInit {
-        if irCodeLen > 131016 {
-          EPrintStr("lyxc: ARM64 code section too large for dynamic stub (>131016 bytes)\n"c);
-          return;
-        }
+        // #2112: Der Puffer war fest 128 KiB gross. Hier wurde wenigstens
+        // abgewiesen (mit einem `return;` ohne Wert), im statischen Zweig
+        // darunter lief memcpy still darueber hinaus.
         self.codeStubOff := 56;
         var totalLen2: int64 := 56 + irCodeLen;
-        var dynBuf: int64 := alloc(131072);
+        var dynBuf: int64 := alloc(totalLen2);
         // ADR x0, #56 = 0x100001C0
         poke8(dynBuf +  0, 0xC0); poke8(dynBuf +  1, 0x01); poke8(dynBuf +  2, 0x00); poke8(dynBuf +  3, 0x10);
         // LDR x1, [sp] = 0xF94003E1
@@ -3012,7 +2942,12 @@ pub type CompilerConfig = class {
       // main   (offset 20): IR-emitted function code
       self.codeStubOff := 20;
       var totalLen: int64 := 20 + irCodeLen;
-      var newBuf: int64 := alloc(131072);
+      // #2112: Hier stand alloc(131072). Ab 128 KiB Code schrieb das memcpy
+      // unten ueber den Puffer hinaus in die naechsten Arena-Bloecke; was
+      // danach dort angelegt wurde, ueberschrieb das Codeende. Ein `main` mit
+      // rund 750 poke8 reichte: der erste Aufruf (alloc) zielte in Nullen —
+      // SIGILL, bei mehr Code SIGSEGV, beides vor der ersten Ausgabe.
+      var newBuf: int64 := alloc(totalLen);
 
       // LDR x0, [sp] = 0xF94003E0
       poke8(newBuf + 0, 0xE0);  poke8(newBuf + 1, 0x03);
@@ -3042,6 +2977,12 @@ pub type CompilerConfig = class {
       }
       var asMainOff: int64 := peek64(self.codeFuncAddrs + asMainId * 8);
       var asBlImm: int64 := (12 + asMainOff) / 4;   // (20 + mainOff - 8) / 4
+      // #2112: BL traegt imm26; unten werden aber nur 24 Bit eingetragen
+      // (das vierte Byte ist fest 0x94). Darueber laut, nicht still kuerzen.
+      if asBlImm >= 0x800000 {
+        EPrintStrLn("error: arm64: main liegt mehr als 32 MiB hinter _start (#2112)."c);
+        exit(1);
+      }
       poke8(newBuf + 8,  asBlImm & 0xFF);        poke8(newBuf + 9,  (asBlImm >> 8) & 0xFF);
       poke8(newBuf + 10, (asBlImm >> 16) & 0xFF); poke8(newBuf + 11, 0x94);
       // MOVZ x8, #93 = 0xD2800BA8
@@ -3137,7 +3078,7 @@ pub type CompilerConfig = class {
       var irCodeLen: int64 := emitter.getCodeLen();
       var irCodeBuf: int64 := emitter.getCodeBuf();
       var totalLen: int64 := 16 + irCodeLen;
-      var newBuf: int64 := alloc(131072);
+      var newBuf: int64 := alloc(totalLen);   // #2112: war fest 128 KiB
 
       // BL main — main at offset 16 (4 instructions forward) = 0x94000004
       poke8(newBuf + 0,  4);     poke8(newBuf + 1,  0);
@@ -3520,10 +3461,17 @@ pub type CompilerConfig = class {
   // functions into self.exportBuf (24-byte records: [namePtr, nameLen, stValue]).
   // For @export the namePtr is parser.src + nameOff; for @jni it points into
   // self.mangledNamesBuf (Java_<class>_<method>).
-  // Relies on the invariant that ir_lower's lowerModule processes top-level
-  // NK_FUNC_DECL nodes in source order, so funcId N == N-th NK_FUNC_DECL.
+  //
+  // #2117: Bis 1.2.14B nahm die Adresse die Annahme "funcId N == N-te
+  // NK_FUNC_DECL". Ein `extern fn` ist aber auch eine NK_FUNC_DECL, ohne
+  // IR-Funktion — und sein IVAL traegt keine Attributbits, sondern etwas
+  // anderes, das als @export durchging. Mit einem extern davor wurde der
+  // extern selbst exportiert, auf die Adresse der ersten Funktion, und alle
+  // folgenden Exporte rutschten eine Funktion weiter. Jetzt: extern-
+  // Deklarationen zaehlen nicht, die Adresse kommt ueber den NAMEN aus der
+  // IR-Funktionstabelle (_shlibFuncIdx).
   fn buildExportList(parser: Parser, astRoot: int64): void {
-    var EXPORT_MASK: int64 := ANNO_EXPORT | ANNO_JNI;
+    var EXPORT_MASK: int64 := ANNO_EXPORT_FN | ANNO_JNI;   // #2117: nicht Bit 0 (= extern)
 
     // Pass 1: count.
     var count: int64 := 0;
@@ -3531,7 +3479,7 @@ pub type CompilerConfig = class {
     while cur >= 0 {
       var off: int64 := parser.nodes + cur * PARSER_NODE_SIZE;
       var kind: int64 := peek64(off + 0);
-      if kind == NK_FUNC_DECL {
+      if kind == NK_FUNC_DECL && self._shlibIstExtern(parser, cur) == 0 {
         var anno: int64 := peek64(off + NODE_OFF_IVAL);
         if (anno & EXPORT_MASK) != 0 { count := count + 1; }
       }
@@ -3540,19 +3488,34 @@ pub type CompilerConfig = class {
 
     self.exportCount := count;
     if count == 0 { self.exportBuf := 0; return; }
-    if self.codeFuncAddrs == 0 { self.exportBuf := 0; self.exportCount := 0; return; }
+    // #2118: Ohne Funktionsadressen wurden die Exporte bisher still auf 0
+    // gesetzt — die .so entstand mit rc 0 und ohne ein einziges Symbol.
+    if self.codeFuncAddrs == 0 {
+      EPrintStr("error: --shared: "c);
+      EPrintInt(count);
+      EPrintStrLn(" @export/@jni-Funktion(en), aber der Codegen liefert keine Adressen — die .so haette keine Exporte (#2118)."c);
+      exit(1);
+    }
 
     // Pass 2: fill records.
     self.exportBuf := alloc(count * 24);
     var idx:    int64 := 0;
-    var funcId: int64 := 0;
     cur := astRoot;
     while cur >= 0 {
       var off2:  int64 := parser.nodes + cur * PARSER_NODE_SIZE;
       var kind2: int64 := peek64(off2 + 0);
-      if kind2 == NK_FUNC_DECL {
+      if kind2 == NK_FUNC_DECL && self._shlibIstExtern(parser, cur) == 0 {
         var anno2: int64 := peek64(off2 + NODE_OFF_IVAL);
         if (anno2 & EXPORT_MASK) != 0 {
+          var fnP: int64 := (parser.src as int64) + peek64(off2 + NODE_OFF_SVAL);
+          var fnL: int64 := peek64(off2 + NODE_OFF_SLEN);
+          var funcId: int64 := self._shlibFuncIdx(fnP, fnL);
+          if funcId < 0 {
+            EPrintStr("error: --shared: exportierte Funktion `"c);
+            sys_write(2, fnP, fnL);
+            EPrintStrLn("` steht nicht in der IR-Funktionstabelle (#2117)."c);
+            exit(1);
+          }
           var addr: int64 := peek64(self.codeFuncAddrs + funcId * 8) + self.codeStubOff;
           var namePtr: int64 := 0;
           var nameLen: int64 := 0;
@@ -3582,10 +3545,43 @@ pub type CompilerConfig = class {
           poke64(rec + EXPBUF_OFF_ADDR, addr);
           idx += 1;
         }
-        funcId += 1;
       }
       cur := peek64(off2 + NODE_OFF_NEXT);
     }
+  }
+
+  // #2117: `extern fn` — dieselbe Pruefung wie IRLower._istExternDecl (die
+  // beiden muessen uebereinstimmen): c3 traegt die link-Klausel, und es gibt
+  // keinen Rumpf (c2 leer oder nur das Capability-Attribut).
+  fn _shlibIstExtern(parser: Parser, ni: int64): int64 {
+    var o: int64 := parser.nodes + ni * PARSER_NODE_SIZE;
+    if peek64(o + NODE_OFF_C3) == -1 { return 0; }
+    var rumpf: int64 := peek64(o + NODE_OFF_C2);
+    if rumpf == -1 { return 1; }
+    if peek64(parser.nodes + rumpf * PARSER_NODE_SIZE) == NK_CAPABILITY_ATTR { return 1; }
+    return 0;
+  }
+
+  // #2117: Index der IR-Funktion mit diesem Namen, -1 wenn keine.
+  fn _shlibFuncIdx(np: int64, nl: int64): int64 {
+    if self.irModulePtr == 0 { return 0 - 1; }
+    var fb: int64 := peek64(self.irModulePtr + IR_MOD_OFF_FUNCBUF);
+    var sb: int64 := peek64(self.irModulePtr + IR_MOD_OFF_STRBUF);
+    var fc: int64 := peek64(self.irModulePtr + IR_MOD_OFF_FUNCLEN);
+    var i: int64 := 0;
+    while i < fc {
+      if peek64(fb + i * IR_FUNC_SIZE + IR_FUNC_OFF_NAMELEN) == nl {
+        var no: int64 := peek64(fb + i * IR_FUNC_SIZE);
+        var m: int64 := 1;
+        var j: int64 := 0;
+        while j < nl {
+          if peek8(sb + no + j) != peek8(np + j) { m := 0; j := nl; } else { j := j + 1; }
+        }
+        if m != 0 { return i; }
+      }
+      i := i + 1;
+    }
+    return 0 - 1;
   }
 
   fn writeBinary(path: pchar, code: int64, size: int64): bool {
@@ -3998,12 +3994,52 @@ pub type CompilerConfig = class {
     return result != 0;
   }
 
-  // WP-AND-02: ELF Shared Library writer (ET_DYN).
-  // Produces a .so with .dynamic, .dynsym, .dynstr, .hash. WP-AND-02 Phase B
-  // adds real symbol exports collected by buildExportList; .dynsym entry 0
-  // remains an UNDEF sentinel, and entries 1..N are STB_GLOBAL|STT_FUNC.
-  // R_AARCH64_* relocations are still deferred to Phase C.
+  // WP-AND-02: ELF Shared Library writer (ET_DYN), arm64 (android-arm64 und
+  // --target=arm64 --shared). Die Adressen im Abbild sind Dateioffsets
+  // (p_vaddr == p_offset), Ladebasis 0.
+  //
+  // Aufbau seit #2117/#2119 (1.2.14C):
+  //   LOAD R-X  [0, roEnd)        ELF-Kopf, Programmkoepfe, .text (ab 0x1000),
+  //                               .note.android.ident, .dynsym, .dynstr, .hash,
+  //                               .rela.dyn, .eh_frame_hdr, .eh_frame
+  //   LOAD RW   [dataOff, ...)    .dynamic, .got  — PT_GNU_RELRO bis hier —
+  //                               (naechste 16-KiB-Grenze) .data
+  //   Section-Header-Tabelle + .shstrtab am Dateiende, nicht geladen.
+  //
+  // #2117: Bis 1.2.14B gab es KEINE Section-Header (e_shnum 0). bionic
+  // (linker_phdr.cpp) weist so eine Datei immer ab ("has no section headers"),
+  // ab API 26 auch e_shentsize != 64 und e_shstrndx 0, und es verlangt eine
+  // SHT_DYNAMIC-Section, die genau auf PT_DYNAMIC liegt und deren sh_link auf
+  // eine SHT_STRTAB zeigt. Keine von lyxc erzeugte .so war auf einem Geraet
+  // ladbar. Dazu lagen die Adressplaetze fuer Modulvariablen und externe
+  // Aufrufe IM CODE und wurden per Relocation umgeschrieben — Text-
+  // Relocations ohne DT_TEXTREL, die bionic ab API 23 ablehnt. Jetzt rechnet
+  // der Code PC-relativ (ADRP), externe Aufrufe gehen ueber .got im
+  // RW-Segment; die einzigen Relocations sind die R_AARCH64_GLOB_DAT darauf.
+  //
+  // #2119: Segmente auf 16 KiB (Google Play verlangt das fuer targetSdk >= 35;
+  // bionic laedt 4-KiB-Bibliotheken auf 16-KiB-Geraeten nur im
+  // Kompatibilitaetsmodus), PT_GNU_STACK (nicht ausfuehrbar), PT_GNU_RELRO
+  // ueber .dynamic und .got. bionic rundet das RELRO-Ende AUF die Seite auf —
+  // .data beginnt deshalb erst an der naechsten 16-KiB-Grenze, sonst waere es
+  // nach dem Laden schreibgeschuetzt.
   fn writeELFSharedLib(path: pchar, code: int64, size: int64): bool {
+    if self.target != LYX_TC_ARM64 && self.target != LYX_TC_ANDROID_ARM64 {
+      // Die .eh_frame-Eintraege unten beschreiben den arm64-Rahmen (x29/x30).
+      EPrintStrLn("error: --shared ist nur fuer arm64/android-arm64 umgesetzt."c);
+      return false;
+    }
+    // Relocations aus dem Code (relocBuf) darf es in einer .so nicht geben:
+    // jede waere eine Text-Relocation. emit_arm64 erzeugt im .so-Modus keine
+    // mehr (#2117) — kommt doch eine, ist das ein neuer Weg, der nachgezogen
+    // werden muss, und kein Grund, eine nicht ladbare Datei zu schreiben.
+    if self.relocCount != 0 {
+      EPrintStr("error: --shared: "c);
+      EPrintInt(self.relocCount);
+      EPrintStrLn(" Relocation(s) im Code — Text-Relocations laedt bionic nicht (#2117)."c);
+      return false;
+    }
+
     // Derive SONAME basename from output path (after the last '/').
     var pathLen: int64 := StrLen(path);
     var baseStart: int64 := 0;
@@ -4014,12 +4050,10 @@ pub type CompilerConfig = class {
     }
     var soNameLen: int64 := pathLen - baseStart;
 
-    // ---- Export-table sizing (Phase B/B2) ----
+    // ---- Export-Tabelle (Phase B/B2) ----
     // Records: [namePtr:i64 (absolute), nameLen:i64, stValue:i64].
     var expCount: int64 := self.exportCount;
     var expBuf:   int64 := self.exportBuf;
-
-    // Sum of all export name lengths (each followed by a NUL in .dynstr).
     var expNamesBytes: int64 := 0;
     var ei: int64 := 0;
     while ei < expCount {
@@ -4027,193 +4061,150 @@ pub type CompilerConfig = class {
       ei += 1;
     }
 
-    // ---- Dynamic relocation sizing (Phase C) ----
-    // WP-AND-upstream-fix v5: also account for one R_AARCH64_RELATIVE per
-    // global-load slot before any layout depends on relaSize.
-    var globalCountEarly: int64 := 0;
-    if self.irModulePtr != 0 {
-      globalCountEarly := peek64(self.irModulePtr + IR_MOD_OFF_GLOBALLEN);
+    // ---- Externe Funktionen (#2117): je eine UNDEF-Zeile in .dynsym, ein
+    // GOT-Platz, eine R_AARCH64_GLOB_DAT; je Bibliothek ein DT_NEEDED. ----
+    var nExt: int64 := self.armExternCount;
+    var irStr: int64 := 0;
+    if self.irModulePtr != 0 { irStr := peek64(self.irModulePtr + IR_MOD_OFF_STRBUF); }
+    var extNamesBytes: int64 := 0;
+    // Bibliotheken entdoppeln: libFirst[i] = Index des ersten Externs mit
+    // derselben Bibliothek (== i, wenn sie neu ist).
+    var libFirst: int64 := alloc((nExt + 1) * 8);
+    var nLibs: int64 := 0;
+    var libBytes: int64 := 0;
+    ei := 0;
+    while ei < nExt {
+      var eb: int64 := self.armExternBuf + ei * 32;
+      extNamesBytes := extNamesBytes + peek64(eb + CG_EXTERN_OFF_NAMELEN) + 1;
+      var libOff: int64 := peek64(eb + CG_EXTERN_OFF_LIBPTR);
+      var libLen: int64 := peek64(eb + CG_EXTERN_OFF_LIBLEN);
+      var first: int64 := ei;
+      var u: int64 := 0;
+      while u < ei {
+        var ub: int64 := self.armExternBuf + u * 32;
+        if peek64(ub + CG_EXTERN_OFF_LIBLEN) == libLen && first == ei {
+          var same: int64 := 1;
+          var kk: int64 := 0;
+          var uOff: int64 := peek64(ub + CG_EXTERN_OFF_LIBPTR);
+          while kk < libLen {
+            if peek8(irStr + uOff + kk) != peek8(irStr + libOff + kk) { same := 0; kk := libLen; }
+            else { kk += 1; }
+          }
+          if same != 0 { first := u; }
+        }
+        u += 1;
+      }
+      poke64(libFirst + ei * 8, first);
+      if first == ei { nLibs += 1; libBytes := libBytes + libLen + 1; }
+      ei += 1;
     }
-    var extraGlobalRelocs: int64 := self.globalRelocCount;
-    var relCount: int64 := self.relocCount + extraGlobalRelocs;
-    var relBuf:   int64 := self.relocBuf;
-    var hasRelocs: int64 := 0;
-    if relCount > 0 { hasRelocs := 1; }
 
-    // ---- File layout planning ----
-    var ehSize:     int64 := 64;
-    var phSize:     int64 := 56;
-    var phNum:      int64 := 4;     // PT_LOAD R-X, PT_LOAD RW, PT_DYNAMIC, PT_NOTE
-    // phNum bumped to 5 below if we emit .eh_frame_hdr (PT_GNU_EH_FRAME).
-    var pageSize:   int64 := 4096;
+    var funcN: int64 := self.codeFuncTotal;
+    var hasEhFrame: int64 := 0;
+    if funcN > 0 { hasEhFrame := 1; }
+    var globalCount: int64 := 0;
+    if self.irModulePtr != 0 { globalCount := peek64(self.irModulePtr + IR_MOD_OFF_GLOBALLEN); }
+    var hasGlobals: int64 := 0;
+    if globalCount > 0 { hasGlobals := 1; }
 
-    var codeOff:    int64 := pageSize;          // .text starts at 0x1000
+    // ---- Layout ----
+    var pageSize:   int64 := 0x4000;    // #2119: 16 KiB
+    var phNum:      int64 := 6;         // LOAD RX, LOAD RW, DYNAMIC, NOTE, GNU_STACK, GNU_RELRO
+    if hasEhFrame != 0 { phNum := 7; }  // + GNU_EH_FRAME
+    var codeOff:    int64 := 4096;      // .text; Kopf + Programmkoepfe passen davor
     var codeEnd:    int64 := codeOff + size;
 
-    var dataOff:    int64 := ((codeEnd + pageSize - 1) / pageSize) * pageSize;
-
-    // WP-AND-03: .note.android.ident section sits at the very front of PT_LOAD #2
-    // so it gets a stable address near the top of the data segment. Layout:
-    //   namesz (4) | descsz (4) | type (4)  = 12 bytes header
-    //   "Android\0"                          =  8 bytes name (4-aligned)
-    //   apiLevel (4)                         =  4 bytes desc (4-aligned)
-    // Total: 24 bytes; happens to be 8-aligned so .dynamic follows immediately.
-    var noteOff:    int64 := dataOff;
+    var noteOff:    int64 := ((codeEnd + 7) / 8) * 8;
     var noteSize:   int64 := 24;
-    var dynOff:     int64 := noteOff + noteSize;
-
-    // .dynamic entry count: 7 baseline + 3 if relocations present (DT_RELA,
-    // DT_RELASZ, DT_RELAENT).
-    var dynNum:     int64 := 7;
-    if hasRelocs != 0 { dynNum := 10; }
-    var dynSize:    int64 := dynNum * 16;
-    var dynsymOff:  int64 := dynOff + dynSize;
-    // 1 UNDEF entry + 1 entry per exported function.
-    var dynsymSize: int64 := (1 + expCount) * 24;
+    var nSyms:      int64 := 1 + expCount + nExt;
+    var dynsymOff:  int64 := noteOff + noteSize;          // 8-aligned (24 ist durch 8 teilbar)
+    var dynsymSize: int64 := nSyms * 24;
     var dynstrOff:  int64 := dynsymOff + dynsymSize;
-    // \0 + soname + \0 + (export-names + \0)*
-    var dynstrSize: int64 := 1 + soNameLen + 1 + expNamesBytes;
-    var hashOffRaw: int64 := dynstrOff + dynstrSize;
-    var hashOff:    int64 := ((hashOffRaw + 7) / 8) * 8;
-    // SYSV hash: 8-byte header + 4*nbucket + 4*nchain; we use a single bucket.
-    var hashNbucket: int64 := 1;
-    var hashNchain:  int64 := 1 + expCount;
-    var hashSize:    int64 := 8 + 4 * hashNbucket + 4 * hashNchain;
-    // .rela.dyn (Phase C): 24-byte Elf64_Rela records, 8-byte aligned.
-    var relaOffRaw: int64 := hashOff + hashSize;
-    var relaOff:    int64 := ((relaOffRaw + 7) / 8) * 8;
-    var relaSize:   int64 := relCount * 24;
-    var afterReloc: int64 := relaOff + relaSize;
-    if hasRelocs == 0 { afterReloc := hashOff + hashSize; }
+    // \0 + soname\0 + Exportnamen\0 + Externnamen\0 + Bibliotheken\0
+    var dynstrSize: int64 := 1 + soNameLen + 1 + expNamesBytes + extNamesBytes + libBytes;
+    var hashOff:    int64 := ((dynstrOff + dynstrSize + 7) / 8) * 8;
+    // SYSV hash: nbucket, nchain, bucket[1], chain[nSyms]; ein Eimer.
+    var hashSize:   int64 := 8 + 4 + 4 * nSyms;
+    var relaOff:    int64 := ((hashOff + hashSize + 7) / 8) * 8;
+    var relaSize:   int64 := nExt * 24;
+    // WP-AND-03 DWARF CFI: .eh_frame_hdr (12 + 8 je Funktion), .eh_frame
+    // (24-Byte-CIE + 28-Byte-FDE je Funktion + 4 Byte Ende).
+    var ehFrameHdrOff:  int64 := ((relaOff + relaSize + 3) / 4) * 4;
+    var ehFrameHdrSize: int64 := 0;
+    var ehFrameOff:     int64 := ehFrameHdrOff;
+    var ehFrameSize:    int64 := 0;
+    if hasEhFrame != 0 {
+      ehFrameHdrSize := 12 + 8 * funcN;
+      ehFrameOff     := ((ehFrameHdrOff + ehFrameHdrSize + 7) / 8) * 8;
+      ehFrameSize    := 24 + 28 * funcN + 4;
+    }
+    var roEnd:      int64 := ehFrameOff + ehFrameSize;
 
-    // WP-AND-03 DWARF CFI: .eh_frame_hdr (12 byte header + 8 byte table entry
-    // per function) and .eh_frame (24-byte CIE + 28-byte FDE per function +
-    // 4-byte terminator). PT_GNU_EH_FRAME program header references the hdr,
-    // so the runtime unwinder can find FDEs via binary search.
-    var funcN:        int64 := self.codeFuncTotal;
-    var hasEhFrame:   int64 := 0;
-    if funcN > 0 { hasEhFrame := 1; }
-
-    var ehFrameHdrOff:  int64 := ((afterReloc + 3) / 4) * 4;
-    var ehFrameHdrSize: int64 := 12 + 8 * funcN;
-    var ehFrameOffRaw:  int64 := ehFrameHdrOff + ehFrameHdrSize;
-    var ehFrameOff:     int64 := ((ehFrameOffRaw + 7) / 8) * 8;
-    var ehFrameSize:    int64 := 24 + 28 * funcN + 4;
-    var afterEh:        int64 := ehFrameOff + ehFrameSize;
-    if hasEhFrame == 0 { afterEh := afterReloc; }
-    if hasEhFrame != 0 { phNum := 5; }
-
-    // WP-AND-upstream-fix v5: .data section for globals (after .eh_frame).
-    // Sized to globalLen*8 (read from the IR module). The slot-patching
-    // pass below rewrites every globalRelocBuf entry to point at this
-    // region and emits the matching R_AARCH64_RELATIVE entries (those
-    // slots were already accounted for via extraGlobalRelocs above, so
-    // relaSize and the layout above are correctly sized).
-    var globalCount: int64 := globalCountEarly;
-    var hasGlobals:  int64 := 0;
-    if globalCount > 0 { hasGlobals := 1; }
-    var globalsOff:  int64 := ((afterEh + 7) / 8) * 8;
+    var dataOff:    int64 := ((roEnd + pageSize - 1) / pageSize) * pageSize;
+    var dynOff:     int64 := dataOff;
+    // DT_NEEDED je Bibliothek + HASH STRTAB SYMTAB STRSZ SYMENT SONAME
+    // (+ RELA RELASZ RELAENT) + NULL.
+    var dynNum:     int64 := nLibs + 6 + 1;
+    if nExt > 0 { dynNum := dynNum + 3; }
+    var dynSize:    int64 := dynNum * 16;
+    var gotOff:     int64 := dynOff + dynSize;              // 16er-Schritte: 8-aligned
+    var gotSize:    int64 := nExt * 8;
+    var relroEnd:   int64 := gotOff + gotSize;
+    var globalsOff: int64 := relroEnd;
     var globalsSize: int64 := globalCount * 8;
-    var fileSize:    int64 := globalsOff + globalsSize;
-    if hasGlobals == 0 { fileSize := afterEh; }
+    if hasGlobals != 0 { globalsOff := ((relroEnd + pageSize - 1) / pageSize) * pageSize; }
+    var loadEnd:    int64 := globalsOff + globalsSize;
+
+    // .shstrtab und Section-Header hinter allem Geladenen.
+    var shstrOff:   int64 := loadEnd;
+    var shstrSize:  int64 := 1 + 6 + 20 + 8 + 8 + 6 + 10 + 14 + 10 + 9 + 5 + 6 + 10;
+    var shNum:      int64 := 13;
+    var shOff:      int64 := ((shstrOff + shstrSize + 7) / 8) * 8;
+    var fileSize:   int64 := shOff + shNum * 64;
 
     // ---- Allocate + zero buffer ----
     var fd: int64 := open(path, 577, 493);
     if fd == -1 { return false; }
     close(fd);
-
     var buf: int64 := alloc(fileSize);
     if buf == -1 { return false; }
     var z: int64 := 0;
     while z < fileSize { poke8(buf + z, 0); z := z + 1; }
 
-    // ---- Copy code into .text ----
-    var i: int64 := 0;
     memcpy(buf + codeOff, code, size);
 
     // ---- ELF header ----
-    poke8(buf + 0, 127);                            // 0x7F
+    poke8(buf + 0, 127);
     poke8(buf + 1, 69); poke8(buf + 2, 76); poke8(buf + 3, 70);  // 'E' 'L' 'F'
     poke8(buf + 4, 2);                              // ELFCLASS64
     poke8(buf + 5, 1);                              // ELFDATA2LSB
     poke8(buf + 6, 1);                              // EV_CURRENT
-    poke8(buf + 7, 0);                              // ELFOSABI_SYSV
-    // e_ident[8..15] already zero
-
     poke16(buf + 16, 3);                            // e_type = ET_DYN
-    var emach: int64 := 62;                         // EM_X86_64
-    if self.target == LYX_TC_ARM64 { emach := 183; }
-    if self.target == LYX_TC_ANDROID_ARM64 { emach := 183; }
-    poke16(buf + 18, emach);                        // e_machine
+    poke16(buf + 18, 183);                          // e_machine = EM_AARCH64
     poke32(buf + 20, 1);                            // e_version
     poke64(buf + ELF64_EHDR_OFF_ENTRY, 0);
     poke64(buf + ELF64_EHDR_OFF_PHOFF, 64);
-    poke64(buf + ELF64_EHDR_OFF_SHOFF, 0);
-    poke32(buf + 48, 0);                            // e_flags
+    poke64(buf + ELF64_EHDR_OFF_SHOFF, shOff);
     poke16(buf + 52, 64);                           // e_ehsize
     poke16(buf + 54, 56);                           // e_phentsize
-    poke16(buf + 56, phNum);                        // e_phnum (4 or 5: +PT_NOTE +PT_GNU_EH_FRAME)
-    poke16(buf + 58, 0);                            // e_shentsize
-    poke16(buf + 60, 0);                            // e_shnum
-    poke16(buf + 62, 0);                            // e_shstrndx
+    poke16(buf + 56, phNum);
+    poke16(buf + 58, 64);                           // e_shentsize
+    poke16(buf + 60, shNum);
+    poke16(buf + 62, shNum - 1);                    // e_shstrndx = .shstrtab (letzte)
 
-    // ---- Program headers (3 × 56 bytes) ----
+    // ---- Program headers ----
     var ph: int64 := 64;
-    // PT_LOAD #1: R-X, covers ELF header + program headers + .text
-    poke32(buf + ph,  1);          ph := ph + 4;    // p_type = PT_LOAD
-    poke32(buf + ph,  5);          ph := ph + 4;    // p_flags = PF_R|PF_X
-    poke64(buf + ph,  0);          ph := ph + 8;    // p_offset
-    poke64(buf + ph,  0);          ph := ph + 8;    // p_vaddr
-    poke64(buf + ph,  0);          ph := ph + 8;    // p_paddr
-    poke64(buf + ph,  codeEnd);    ph := ph + 8;    // p_filesz
-    poke64(buf + ph,  codeEnd);    ph := ph + 8;    // p_memsz
-    poke64(buf + ph,  pageSize);   ph := ph + 8;    // p_align
-
-    // PT_LOAD #2: RW, covers .dynamic + .dynsym + .dynstr + .hash
-    var seg2Size: int64 := fileSize - dataOff;
-    poke32(buf + ph,  1);          ph := ph + 4;    // p_type = PT_LOAD
-    poke32(buf + ph,  6);          ph := ph + 4;    // p_flags = PF_R|PF_W
-    poke64(buf + ph,  dataOff);    ph := ph + 8;    // p_offset
-    poke64(buf + ph,  dataOff);    ph := ph + 8;    // p_vaddr
-    poke64(buf + ph,  dataOff);    ph := ph + 8;    // p_paddr
-    poke64(buf + ph,  seg2Size);   ph := ph + 8;    // p_filesz
-    poke64(buf + ph,  seg2Size);   ph := ph + 8;    // p_memsz
-    poke64(buf + ph,  pageSize);   ph := ph + 8;    // p_align
-
-    // PT_DYNAMIC: points to .dynamic section
-    poke32(buf + ph,  2);          ph := ph + 4;    // p_type = PT_DYNAMIC
-    poke32(buf + ph,  6);          ph := ph + 4;    // p_flags = PF_R|PF_W
-    poke64(buf + ph,  dynOff);     ph := ph + 8;    // p_offset
-    poke64(buf + ph,  dynOff);     ph := ph + 8;    // p_vaddr
-    poke64(buf + ph,  dynOff);     ph := ph + 8;    // p_paddr
-    poke64(buf + ph,  dynSize);    ph := ph + 8;    // p_filesz
-    poke64(buf + ph,  dynSize);    ph := ph + 8;    // p_memsz
-    poke64(buf + ph,  8);          ph := ph + 8;    // p_align
-
-    // WP-AND-03 PT_NOTE: covers the .note.android.ident section.
-    poke32(buf + ph,  4);          ph := ph + 4;    // p_type = PT_NOTE
-    poke32(buf + ph,  4);          ph := ph + 4;    // p_flags = PF_R
-    poke64(buf + ph,  noteOff);    ph := ph + 8;    // p_offset
-    poke64(buf + ph,  noteOff);    ph := ph + 8;    // p_vaddr
-    poke64(buf + ph,  noteOff);    ph := ph + 8;    // p_paddr
-    poke64(buf + ph,  noteSize);   ph := ph + 8;    // p_filesz
-    poke64(buf + ph,  noteSize);   ph := ph + 8;    // p_memsz
-    poke64(buf + ph,  4);          ph := ph + 8;    // p_align
-
-    // WP-AND-03 PT_GNU_EH_FRAME: points to .eh_frame_hdr for fast unwinding.
+    self._shlibPhdr(buf, ph, 1, 5, 0, roEnd, roEnd, pageSize);                         ph := ph + 56;  // LOAD R-X
+    self._shlibPhdr(buf, ph, 1, 6, dataOff, loadEnd - dataOff, loadEnd - dataOff, pageSize); ph := ph + 56;  // LOAD RW
+    self._shlibPhdr(buf, ph, 2, 6, dynOff, dynSize, dynSize, 8);                        ph := ph + 56;  // PT_DYNAMIC
+    self._shlibPhdr(buf, ph, 4, 4, noteOff, noteSize, noteSize, 4);                     ph := ph + 56;  // PT_NOTE
+    self._shlibPhdr(buf, ph, 0x6474E551, 6, 0, 0, 0, 16);                               ph := ph + 56;  // PT_GNU_STACK (RW, nicht X)
+    self._shlibPhdr(buf, ph, 0x6474E552, 4, dataOff, relroEnd - dataOff, relroEnd - dataOff, 1); ph := ph + 56;  // PT_GNU_RELRO
     if hasEhFrame != 0 {
-      poke32(buf + ph,  0x6474E550); ph := ph + 4;  // p_type = PT_GNU_EH_FRAME
-      poke32(buf + ph,  4);          ph := ph + 4;  // p_flags = PF_R
-      poke64(buf + ph,  ehFrameHdrOff);  ph := ph + 8;  // p_offset
-      poke64(buf + ph,  ehFrameHdrOff);  ph := ph + 8;  // p_vaddr
-      poke64(buf + ph,  ehFrameHdrOff);  ph := ph + 8;  // p_paddr
-      poke64(buf + ph,  ehFrameHdrSize); ph := ph + 8;  // p_filesz
-      poke64(buf + ph,  ehFrameHdrSize); ph := ph + 8;  // p_memsz
-      poke64(buf + ph,  4);                              // p_align
+      self._shlibPhdr(buf, ph, 0x6474E550, 4, ehFrameHdrOff, ehFrameHdrSize, ehFrameHdrSize, 4);  // PT_GNU_EH_FRAME
     }
 
     // ---- .note.android.ident ----
-    // ELF note header (12 bytes) + name (8) + desc (4) = 24 bytes total.
     poke32(buf + noteOff +  0, 8);                  // namesz: strlen("Android")+1
     poke32(buf + noteOff +  4, 4);                  // descsz: one uint32
     poke32(buf + noteOff +  8, 1);                  // type = NT_VERSION (Android-conventional)
@@ -4221,141 +4212,123 @@ pub type CompilerConfig = class {
     memcpy(buf + noteOff + 12, androidName as int64, 8);
     poke32(buf + noteOff + 20, self.androidApiLevel);
 
-    // ---- .dynamic ----
-    // Tag values via Elf64_Dyn (d_tag: i64, d_un: u64).
-    var d: int64 := dynOff;
-    // DT_HASH = 4
-    poke64(buf + d, 4);         poke64(buf + d + ELF64_DYN_OFF_VAL, hashOff);    d := d + 16;
-    // DT_STRTAB = 5
-    poke64(buf + d, 5);         poke64(buf + d + ELF64_DYN_OFF_VAL, dynstrOff);  d := d + 16;
-    // DT_SYMTAB = 6
-    poke64(buf + d, 6);         poke64(buf + d + ELF64_DYN_OFF_VAL, dynsymOff);  d := d + 16;
-    // DT_STRSZ = 10
-    poke64(buf + d, 10);        poke64(buf + d + ELF64_DYN_OFF_VAL, dynstrSize); d := d + 16;
-    // DT_SYMENT = 11
-    poke64(buf + d, 11);        poke64(buf + d + ELF64_DYN_OFF_VAL, 24);         d := d + 16;
-    // DT_SONAME = 14 (string at offset 1 into .dynstr)
-    poke64(buf + d, 14);        poke64(buf + d + ELF64_DYN_OFF_VAL, 1);          d := d + 16;
-    // Phase C: DT_RELA / DT_RELASZ / DT_RELAENT if any relocations present.
-    if hasRelocs != 0 {
-      poke64(buf + d, 7);       poke64(buf + d + ELF64_DYN_OFF_VAL, relaOff);    d := d + 16;  // DT_RELA
-      poke64(buf + d, 8);       poke64(buf + d + ELF64_DYN_OFF_VAL, relaSize);   d := d + 16;  // DT_RELASZ
-      poke64(buf + d, 9);       poke64(buf + d + ELF64_DYN_OFF_VAL, 24);         d := d + 16;  // DT_RELAENT
-    }
-    // DT_NULL = 0 (terminator)
-    poke64(buf + d, 0);         poke64(buf + d + ELF64_DYN_OFF_VAL, 0);
-
     // ---- .dynstr ----
-    // Byte 0: NUL (already zero)
-    // Bytes 1..1+soNameLen: SONAME basename
-    var si: int64 := 0;
     memcpy(buf + dynstrOff + 1, path + baseStart, soNameLen);
-    // Trailing NUL after soname is already zero from the initial fill.
-
-    // Append exported function names; record each one's offset into .dynstr
-    // so the matching .dynsym entry can reference it via st_name.
-    var nextStr: int64 := 1 + soNameLen + 1;       // .dynstr cursor (relative)
+    var nextStr: int64 := 1 + soNameLen + 1;
+    // Exportnamen; der dynstr-Offset ersetzt im Satz den Namenszeiger.
     var ej: int64 := 0;
     while ej < expCount {
-      var rec: int64 := expBuf + ej * 24;
-      var nPtr: int64 := peek64(rec + 0);          // absolute name pointer
+      var rec: int64 := expBuf + ej * EXPBUF_SZ;
       var nLen: int64 := peek64(rec + EXPBUF_OFF_NAMELEN);
-      var nameStart: int64 := nextStr;             // record where this name lands
-      var ci: int64 := 0;
-      memcpy(buf + dynstrOff + nextStr, nPtr, nLen);
-      nextStr := nextStr + nLen + 1;               // +1 for NUL
-      // Stash the dynstr-relative offset back into the record's namePtr slot
-      // so the .dynsym writer below can reuse it without recomputing.
-      poke64(rec + 0, nameStart);
+      memcpy(buf + dynstrOff + nextStr, peek64(rec + 0), nLen);
+      poke64(rec + 0, nextStr);
+      nextStr := nextStr + nLen + 1;
+      ej += 1;
+    }
+    // Externnamen: Offsets in extStr[]; Bibliotheken: libStr[] je erstem Vorkommen.
+    var extStr: int64 := alloc((nExt + 1) * 8);
+    var libStr: int64 := alloc((nExt + 1) * 8);
+    ej := 0;
+    while ej < nExt {
+      var eb2: int64 := self.armExternBuf + ej * 32;
+      var enLen: int64 := peek64(eb2 + CG_EXTERN_OFF_NAMELEN);
+      memcpy(buf + dynstrOff + nextStr, irStr + peek64(eb2), enLen);
+      poke64(extStr + ej * 8, nextStr);
+      nextStr := nextStr + enLen + 1;
+      ej += 1;
+    }
+    ej := 0;
+    while ej < nExt {
+      if peek64(libFirst + ej * 8) == ej {
+        var eb3: int64 := self.armExternBuf + ej * 32;
+        var elLen: int64 := peek64(eb3 + CG_EXTERN_OFF_LIBLEN);
+        memcpy(buf + dynstrOff + nextStr, irStr + peek64(eb3 + CG_EXTERN_OFF_LIBPTR), elLen);
+        poke64(libStr + ej * 8, nextStr);
+        nextStr := nextStr + elLen + 1;
+      }
       ej += 1;
     }
 
     // ---- .dynsym ----
-    // Entry 0 is UNDEF (all zeros from the initial fill).
-    // Entries 1..1+expCount: STB_GLOBAL | STT_FUNC, st_shndx = 1 (placeholder).
+    // 0 = UNDEF; 1..expCount = Exporte (GLOBAL FUNC in .text, Section 1);
+    // danach die Externs (GLOBAL FUNC, SHN_UNDEF).
     var ek: int64 := 0;
     while ek < expCount {
-      var rec2:  int64 := expBuf + ek * 24;
-      var dnOff: int64 := peek64(rec2 + 0);        // offset into .dynstr (set above)
-      var addr:  int64 := peek64(rec2 + EXPBUF_OFF_ADDR);       // st_value
+      var rec2: int64 := expBuf + ek * EXPBUF_SZ;
       var symOff: int64 := dynsymOff + (1 + ek) * 24;
-      poke32(buf + symOff + 0,  dnOff);            // st_name
-      poke8(buf + symOff + 4,   0x12);             // st_info = (STB_GLOBAL<<4)|STT_FUNC
-      poke8(buf + symOff + 5,   0);                // st_other
-      poke16(buf + symOff + 6,  1);                // st_shndx (placeholder, any non-zero)
-      poke64(buf + symOff + ELF64_SYM_OFF_VALUE,  addr);             // st_value
-      poke64(buf + symOff + ELF64_SYM_OFF_SIZE, 0);                // st_size (unknown)
+      poke32(buf + symOff + 0, peek64(rec2 + 0));   // st_name
+      poke8(buf + symOff + 4,  0x12);                // (STB_GLOBAL<<4)|STT_FUNC
+      poke16(buf + symOff + 6, 1);                   // st_shndx = .text
+      poke64(buf + symOff + ELF64_SYM_OFF_VALUE, codeOff + peek64(rec2 + EXPBUF_OFF_ADDR));
+      ek += 1;
+    }
+    ek := 0;
+    while ek < nExt {
+      var xsOff: int64 := dynsymOff + (1 + expCount + ek) * 24;
+      poke32(buf + xsOff + 0, peek64(extStr + ek * 8));
+      poke8(buf + xsOff + 4,  0x12);
       ek += 1;
     }
 
-    // ---- .hash (DT_HASH classic SYSV format) ----
-    // Single bucket; all symbols chained linearly from there. With nbucket=1
-    // every dlsym is O(n) but for small Phase-B exports that's acceptable.
-    poke32(buf + hashOff + 0, hashNbucket);
-    poke32(buf + hashOff + 4, hashNchain);
-    // bucket[0]: index of first non-UNDEF symbol, or 0 if no exports.
-    if expCount > 0 { poke32(buf + hashOff + 8, 1); }
-    else            { poke32(buf + hashOff + 8, 0); }
-    // chain[]: chain[0] = 0 (UNDEF terminator).
-    // chain[i] for i in 1..expCount-1 → i+1; chain[expCount] → 0.
-    poke32(buf + hashOff + 12, 0);                 // chain[0]
+    // ---- .hash (SYSV, ein Eimer, alle Symbole in einer Kette) ----
+    poke32(buf + hashOff + 0, 1);
+    poke32(buf + hashOff + 4, nSyms);
+    if nSyms > 1 { poke32(buf + hashOff + 8, 1); }
     var ci2: int64 := 1;
-    while ci2 < expCount {
+    while ci2 < nSyms - 1 {
       poke32(buf + hashOff + 12 + ci2 * 4, ci2 + 1);
       ci2 += 1;
     }
-    if expCount > 0 {
-      poke32(buf + hashOff + 12 + expCount * 4, 0); // terminator
+
+    // ---- .dynamic ----
+    var d: int64 := dynOff;
+    ej := 0;
+    while ej < nExt {
+      if peek64(libFirst + ej * 8) == ej {
+        poke64(buf + d, 1); poke64(buf + d + ELF64_DYN_OFF_VAL, peek64(libStr + ej * 8)); d := d + 16;  // DT_NEEDED
+      }
+      ej += 1;
+    }
+    poke64(buf + d, 4);  poke64(buf + d + ELF64_DYN_OFF_VAL, hashOff);    d := d + 16;  // DT_HASH
+    poke64(buf + d, 5);  poke64(buf + d + ELF64_DYN_OFF_VAL, dynstrOff);  d := d + 16;  // DT_STRTAB
+    poke64(buf + d, 6);  poke64(buf + d + ELF64_DYN_OFF_VAL, dynsymOff);  d := d + 16;  // DT_SYMTAB
+    poke64(buf + d, 10); poke64(buf + d + ELF64_DYN_OFF_VAL, dynstrSize); d := d + 16;  // DT_STRSZ
+    poke64(buf + d, 11); poke64(buf + d + ELF64_DYN_OFF_VAL, 24);         d := d + 16;  // DT_SYMENT
+    poke64(buf + d, 14); poke64(buf + d + ELF64_DYN_OFF_VAL, 1);          d := d + 16;  // DT_SONAME
+    if nExt > 0 {
+      poke64(buf + d, 7); poke64(buf + d + ELF64_DYN_OFF_VAL, relaOff);   d := d + 16;  // DT_RELA
+      poke64(buf + d, 8); poke64(buf + d + ELF64_DYN_OFF_VAL, relaSize);  d := d + 16;  // DT_RELASZ
+      poke64(buf + d, 9); poke64(buf + d + ELF64_DYN_OFF_VAL, 24);        d := d + 16;  // DT_RELAENT
+    }
+    // DT_NULL steht schon da (Nullfuellung).
+
+    // ---- .rela.dyn: R_AARCH64_GLOB_DAT je GOT-Platz ----
+    ej := 0;
+    while ej < nExt {
+      var ra: int64 := relaOff + ej * 24;
+      poke64(buf + ra + 0, gotOff + ej * 8);
+      poke64(buf + ra + 8, ((1 + expCount + ej) << 32) | 1025);   // R_AARCH64_GLOB_DAT
+      ej += 1;
     }
 
-    // ---- .rela.dyn (Phase C) ----
-    // Each emit_arm64 record holds (codeBuf-relative offset, info, addend).
-    // For r_offset we add codeOff because PT_LOAD #1 maps file offsets 1:1
-    // onto vaddrs starting at vaddr 0 (so the slot's vaddr == its file offset).
-    if hasRelocs != 0 {
-      var ri: int64 := 0;
-      // Original relocs from emit_arm64.relocBuf.
-      while ri < self.relocCount {
-        var src: int64 := relBuf + ri * 24;
-        var rOffCode: int64 := peek64(src +  0);
-        var rInfo:    int64 := peek64(src +  8);
-        var rAddend:  int64 := peek64(src + ELF64_RELA_OFF_ADDEND);
-        var dst: int64 := relaOff + ri * 24;
-        poke64(buf + dst +  0, codeOff + rOffCode);
-        poke64(buf + dst +  8, rInfo);
-        poke64(buf + dst + ELF64_RELA_OFF_ADDEND, rAddend);
-        ri += 1;
-      }
-      // WP-AND-upstream-fix v5: append per-global R_AARCH64_RELATIVE entries.
-      // Each globalRelocBuf record holds (slotCodeOff, globalIdx). The slot
-      // (a .quad inside the literal pool emitted by emitLoadGlobal) goes at
-      // r_offset = codeOff + slotCodeOff, with r_addend pointing at the
-      // global's .data home (globalsOff + globalIdx*8). We also write the
-      // initial value directly into the slot in the code buffer so the
-      // .so is self-consistent even without the runtime relocation pass.
-      if hasGlobals != 0 {
-        var gi: int64 := 0;
-        while gi < self.globalRelocCount {
-          var gsrc: int64 := self.globalRelocBuf + gi * GRELOCBUF_SZ;
-          var slotCodeOff: int64 := peek64(gsrc + 0);
-          var gIdx:        int64 := peek64(gsrc + GRELOCBUF_OFF_GIDX);
-          var gAddend:     int64 := globalsOff + gIdx * 8;
-          // Bake the resolved address into the literal-pool slot.
-          poke64(buf + codeOff + slotCodeOff, gAddend);
-          // Emit the matching R_AARCH64_RELATIVE entry.
-          var gdst: int64 := relaOff + (self.relocCount + gi) * 24;
-          poke64(buf + gdst +  0, codeOff + slotCodeOff);
-          poke64(buf + gdst +  8, 1027);       // R_AARCH64_RELATIVE
-          poke64(buf + gdst + ELF64_RELA_OFF_ADDEND, gAddend);
-          gi += 1;
-        }
-      }
+    // ---- PC-relative Adressen nachtragen (#2117) ----
+    // Modulvariablen: ADRP x9 + ADD x9,x9,#lo12 auf globalsOff + 8*gIdx.
+    var gi: int64 := 0;
+    while gi < self.globalRelocCount {
+      var gsrc: int64 := self.globalRelocBuf + gi * GRELOCBUF_SZ;
+      var at: int64 := codeOff + peek64(gsrc + 0);
+      self._a64PatchAdrp(buf, at, globalsOff + peek64(gsrc + GRELOCBUF_OFF_GIDX) * 8, 0);
+      gi += 1;
+    }
+    // Externe Aufrufe: ADRP x9 + LDR x9,[x9,#lo12] auf ihren GOT-Platz.
+    gi := 0;
+    while gi < self.armGotCallCount {
+      var gcr: int64 := self.armGotCallBuf + gi * 16;
+      self._a64PatchAdrp(buf, codeOff + peek64(gcr + 0), gotOff + peek64(gcr + 8) * 8, 1);
+      gi += 1;
     }
 
-    // ---- .data (WP-AND-upstream-fix v5) ----
-    // Write each global's init value (8 bytes) at its slot in .data.
-    // Sourced from the IR module's globalBuffer, which ir_lower populated
-    // during the lowerModule pre-pass.
+    // ---- .data ----
     if hasGlobals != 0 {
       var gbuf: int64 := peek64(self.irModulePtr + IR_MOD_OFF_GLOBALBUF);
       var dgi: int64 := 0;
@@ -4366,126 +4339,166 @@ pub type CompilerConfig = class {
     }
 
     // ---- .eh_frame (WP-AND-03) ----
-    // Single CIE describing ARM64 conventions, followed by one FDE per function,
-    // terminated by a zero-length record. Layout sizes are hard-coded; all
-    // LEB128 values used here fit in single bytes so no general LEB128 encoder
-    // is needed.
+    // Ein CIE fuer die arm64-Konventionen, je Funktion ein FDE, Ende mit
+    // Laenge 0. Alle LEB128-Werte passen in ein Byte.
     if hasEhFrame != 0 {
-      // ----- CIE @ ehFrameOff -----
-      //   length        = 20  (body bytes, length field excluded)
-      //   CIE_id        = 0
-      //   version       = 1
-      //   augmentation  = "zR\0"
-      //   code_align    = 1
-      //   data_align    = -8  (sleb128 single byte 0x78)
-      //   ret_addr_reg  = 30  (LR for ARM64)
-      //   aug_data_len  = 1
-      //   aug_data      = 0x1B (DW_EH_PE_pcrel | DW_EH_PE_sdata4)
-      //   initial CFI:    DW_CFA_def_cfa(31, 0)   -> at entry: CFA = sp + 0
-      //   3 NOPs to 4-byte-align the total (length + body) to 24.
       poke32(buf + ehFrameOff +  0, 20);             // length
       poke32(buf + ehFrameOff +  4, 0);              // CIE_id
       poke8(buf + ehFrameOff +  8,  1);              // version
       poke8(buf + ehFrameOff +  9,  0x7A);           // 'z'
       poke8(buf + ehFrameOff + 10,  0x52);           // 'R'
-      poke8(buf + ehFrameOff + 11,  0);              // \0
       poke8(buf + ehFrameOff + 12,  0x01);           // code_align
       poke8(buf + ehFrameOff + 13,  0x78);           // data_align = -8 (sleb128)
       poke8(buf + ehFrameOff + 14,  0x1E);           // ret_addr_reg = 30
       poke8(buf + ehFrameOff + 15,  0x01);           // aug_data_len
-      poke8(buf + ehFrameOff + 16,  0x1B);           // FDE encoding
+      poke8(buf + ehFrameOff + 16,  0x1B);           // FDE encoding pcrel|sdata4
       poke8(buf + ehFrameOff + 17,  0x0C);           // DW_CFA_def_cfa
       poke8(buf + ehFrameOff + 18,  0x1F);           // reg 31 (sp)
       poke8(buf + ehFrameOff + 19,  0x00);           // offset 0
-      // Bytes 20..23 are already zero (DW_CFA_nop) from the initial fill.
-
-      // ----- FDEs @ ehFrameOff + 24, then every 28 bytes -----
       var fi: int64 := 0;
       while fi < funcN {
         var fdeRel: int64 := 24 + fi * 28;
         var fdeOff: int64 := ehFrameOff + fdeRel;
-
-        // Function range: vaddr and size. PT_LOAD #1 maps vaddr=fileOffset.
-        var fStart: int64 := peek64(self.codeFuncAddrs + fi * 8);   // offset in irCodeBuf
+        var fStart: int64 := peek64(self.codeFuncAddrs + fi * 8);
         var fEnd:   int64 := self.codeSize;
-        if fi + 1 < funcN {
-          fEnd := peek64(self.codeFuncAddrs + (fi + 1) * 8);
-        }
-        var fLen:   int64 := fEnd - fStart;
-        var fVaddr: int64 := codeOff + fStart;          // codeStubOff is 0 in shared-lib mode
-
-        // pc_begin field's vaddr (it lives at fdeOff + 8 in the file).
-        var pcField: int64 := fdeOff + 8;
-        var pcRel:   int64 := fVaddr - pcField;          // signed sdata4
-
-        // CIE_pointer: offset from THIS FDE back to the CIE start.
-        var ciePtr:  int64 := fdeRel;                    // CIE is at relative 0
-
-        poke32(buf + fdeOff +  0, 24);                   // length (body bytes)
-        poke32(buf + fdeOff +  4, ciePtr);               // CIE_pointer
+        if fi + 1 < funcN { fEnd := peek64(self.codeFuncAddrs + (fi + 1) * 8); }
+        var pcRel:  int64 := (codeOff + fStart) - (fdeOff + 8);
+        poke32(buf + fdeOff +  0, 24);                   // length
+        poke32(buf + fdeOff +  4, fdeRel + 4);           // CIE_pointer: von DIESEM Feld zum CIE
         poke32(buf + fdeOff +  8, pcRel & 0xFFFFFFFF);   // pc_begin (sdata4)
-        poke32(buf + fdeOff + 12, fLen);                 // pc_range
-
-        poke8(buf + fdeOff + 16, 0);                     // aug_data_len = 0
-
-        // DW_CFA_advance_loc(prologueLen): small form (0x40 | delta) for <=63 bytes.
+        poke32(buf + fdeOff + 12, fEnd - fStart);        // pc_range
+        // DW_CFA_advance_loc ueber den Prolog (code_align 1: Bytes). Die
+        // Kurzform fasst sechs Bit; darueber advance_loc1 (ein Byte mehr —
+        // die drei Fuellbytes am Ende des FDE nehmen es auf).
         var prologueLen: int64 := peek64(self.codeFuncPrologueLen + fi * 8);
-        poke8(buf + fdeOff + 17, 0x40 | (prologueLen & 0x3F));
-
-        // DW_CFA_def_cfa(29, 16): CFA = x29 + 16.
-        poke8(buf + fdeOff + 18, 0x0C);
-        poke8(buf + fdeOff + 19, 0x1D);                  // reg 29 (fp)
-        poke8(buf + fdeOff + 20, 0x10);                  // offset 16
-
-        // DW_CFA_offset(29, 2): x29 saved at CFA + 2*(-8) = CFA - 16.
-        poke8(buf + fdeOff + 21, 0x9D);                  // 0x80 | 29
-        poke8(buf + fdeOff + 22, 0x02);
-
-        // DW_CFA_offset(30, 1): x30 saved at CFA - 8.
-        poke8(buf + fdeOff + 23, 0x9E);
-        poke8(buf + fdeOff + 24, 0x01);
-
-        // Bytes 25..27 are NOP padding (zero from initial fill).
+        var cfa: int64 := fdeOff + 17;
+        if prologueLen <= 63 { poke8(buf + cfa, 0x40 | prologueLen); cfa := cfa + 1; }
+        else if prologueLen <= 255 { poke8(buf + cfa, 0x02); poke8(buf + cfa + 1, prologueLen); cfa := cfa + 2; }
+        else {
+          EPrintStrLn("error: --shared: Prolog laenger als 255 Byte — .eh_frame-Eintrag passt nicht."c);
+          exit(1);
+        }
+        poke8(buf + cfa + 0, 0x0C);                      // DW_CFA_def_cfa(29, 16)
+        poke8(buf + cfa + 1, 0x1D);
+        poke8(buf + cfa + 2, 0x10);
+        poke8(buf + cfa + 3, 0x9D);                      // DW_CFA_offset(29, 2)
+        poke8(buf + cfa + 4, 0x02);
+        poke8(buf + cfa + 5, 0x9E);                      // DW_CFA_offset(30, 1)
+        poke8(buf + cfa + 6, 0x01);
         fi += 1;
       }
-
-      // ----- Terminator (length = 0) -----
-      // Already zero from initial fill; nothing more to do.
-
-      // ----- .eh_frame_hdr -----
-      //   version=1, eh_frame_ptr_enc=0x1B (PC-rel sdata4),
-      //   fde_count_enc=0x03 (udata4), table_enc=0x3B (datarel sdata4)
-      //   eh_frame_ptr: offset from this field to start of .eh_frame
-      //   fde_count: number of FDEs
-      //   table[]: (initial_loc, fde_addr) pairs, datarel to .eh_frame_hdr start
-      poke8(buf + ehFrameHdrOff +  0, 1);
-      poke8(buf + ehFrameHdrOff +  1, 0x1B);
-      poke8(buf + ehFrameHdrOff +  2, 0x03);
-      poke8(buf + ehFrameHdrOff +  3, 0x3B);
-      var ehFrameRel: int64 := ehFrameOff - (ehFrameHdrOff + 4);
-      poke32(buf + ehFrameHdrOff +  4, ehFrameRel & 0xFFFFFFFF);
-      poke32(buf + ehFrameHdrOff +  8, funcN);
-      // Binary search table: entries sorted by initial_location.
-      // For our linear codegen, funcAddrs is already monotonically increasing.
+      poke8(buf + ehFrameHdrOff + 0, 1);
+      poke8(buf + ehFrameHdrOff + 1, 0x1B);
+      poke8(buf + ehFrameHdrOff + 2, 0x03);
+      poke8(buf + ehFrameHdrOff + 3, 0x3B);
+      poke32(buf + ehFrameHdrOff + 4, (ehFrameOff - (ehFrameHdrOff + 4)) & 0xFFFFFFFF);
+      poke32(buf + ehFrameHdrOff + 8, funcN);
       var hi: int64 := 0;
       while hi < funcN {
         var fStart2: int64 := peek64(self.codeFuncAddrs + hi * 8);
-        var fVaddr2: int64 := codeOff + fStart2;
-        var fdeAbs2: int64 := ehFrameOff + 24 + hi * 28;
-        // datarel: offsets relative to ehFrameHdrOff (per encoding 0x3B).
-        var initLoc: int64 := fVaddr2 - ehFrameHdrOff;
-        var fdeRel2: int64 := fdeAbs2 - ehFrameHdrOff;
-        poke32(buf + ehFrameHdrOff + 12 + hi * 8 + 0, initLoc & 0xFFFFFFFF);
-        poke32(buf + ehFrameHdrOff + 12 + hi * 8 + 4, fdeRel2 & 0xFFFFFFFF);
+        poke32(buf + ehFrameHdrOff + 12 + hi * 8 + 0, (codeOff + fStart2 - ehFrameHdrOff) & 0xFFFFFFFF);
+        poke32(buf + ehFrameHdrOff + 12 + hi * 8 + 4, (ehFrameOff + 24 + hi * 28 - ehFrameHdrOff) & 0xFFFFFFFF);
         hi += 1;
       }
     }
 
-    // ---- Write + cleanup ----
+    // ---- .shstrtab + Section-Header (#2117) ----
+    // Namensoffsets: Reihenfolge wie die Sections unten.
+    var sn: int64 := buf + shstrOff;
+    var nText: int64 := self._shlibName(sn, 1, ".text"c);
+    var nNote: int64 := self._shlibName(sn, nText + 6, ".note.android.ident"c);
+    var nDsym: int64 := self._shlibName(sn, nNote + 20, ".dynsym"c);
+    var nDstr: int64 := self._shlibName(sn, nDsym + 8, ".dynstr"c);
+    var nHash: int64 := self._shlibName(sn, nDstr + 8, ".hash"c);
+    var nRela: int64 := self._shlibName(sn, nHash + 6, ".rela.dyn"c);
+    var nEhh:  int64 := self._shlibName(sn, nRela + 10, ".eh_frame_hdr"c);
+    var nEh:   int64 := self._shlibName(sn, nEhh + 14, ".eh_frame"c);
+    var nDyn:  int64 := self._shlibName(sn, nEh + 10, ".dynamic"c);
+    var nGot:  int64 := self._shlibName(sn, nDyn + 9, ".got"c);
+    var nData: int64 := self._shlibName(sn, nGot + 5, ".data"c);
+    var nShs:  int64 := self._shlibName(sn, nData + 6, ".shstrtab"c);
+    //                                name   type flags addr/off        size          link info align entsize
+    var sh: int64 := buf + shOff + 64;   // [0] = SHT_NULL (Nullfuellung)
+    self._shlibShdr(sh, nText, 1,  6, codeOff,       size,           0, 0, 4, 0);  sh := sh + 64;  // [1]
+    self._shlibShdr(sh, nNote, 7,  2, noteOff,       noteSize,       0, 0, 4, 0);  sh := sh + 64;  // [2]
+    self._shlibShdr(sh, nDsym, 11, 2, dynsymOff,     dynsymSize,     4, 1, 8, 24); sh := sh + 64;  // [3]
+    self._shlibShdr(sh, nDstr, 3,  2, dynstrOff,     dynstrSize,     0, 0, 1, 0);  sh := sh + 64;  // [4]
+    self._shlibShdr(sh, nHash, 5,  2, hashOff,       hashSize,       3, 0, 8, 4);  sh := sh + 64;  // [5]
+    self._shlibShdr(sh, nRela, 4,  2, relaOff,       relaSize,       3, 0, 8, 24); sh := sh + 64;  // [6]
+    self._shlibShdr(sh, nEhh,  1,  2, ehFrameHdrOff, ehFrameHdrSize, 0, 0, 4, 0);  sh := sh + 64;  // [7]
+    self._shlibShdr(sh, nEh,   1,  2, ehFrameOff,    ehFrameSize,    0, 0, 8, 0);  sh := sh + 64;  // [8]
+    self._shlibShdr(sh, nDyn,  6,  3, dynOff,        dynSize,        4, 0, 8, 16); sh := sh + 64;  // [9]
+    self._shlibShdr(sh, nGot,  1,  3, gotOff,        gotSize,        0, 0, 8, 8);  sh := sh + 64;  // [10]
+    self._shlibShdr(sh, nData, 1,  3, globalsOff,    globalsSize,    0, 0, 8, 0);  sh := sh + 64;  // [11]
+    self._shlibShdr(sh, nShs,  3,  0, 0,             shstrSize,      0, 0, 1, 0);                  // [12]
+    poke64(sh + 24, shstrOff);   // .shstrtab: nicht geladen, sh_addr 0, nur sh_offset
+
     var result: int64 := FileWriteAll(path, buf as pchar, fileSize) as int64;
     free(buf, fileSize);
     chmod(path, 493);
     return result != 0;
+  }
+
+  // #2119: ein Programmkopf (p_vaddr == p_paddr == p_offset).
+  fn _shlibPhdr(buf: int64, ph: int64, typ: int64, flags: int64, off: int64,
+                filesz: int64, memsz: int64, align: int64) {
+    poke32(buf + ph, typ);
+    poke32(buf + ph + 4, flags);
+    poke64(buf + ph + ELF64_PHDR_OFF_OFFSET, off);
+    poke64(buf + ph + 16, off);
+    poke64(buf + ph + 24, off);
+    poke64(buf + ph + ELF64_PHDR_OFF_FILESZ, filesz);
+    poke64(buf + ph + ELF64_PHDR_OFF_MEMSZ, memsz);
+    poke64(buf + ph + ELF64_PHDR_OFF_ALIGN, align);
+  }
+
+  // #2117: ein Section-Header; sh_addr == sh_offset (Ladebasis 0).
+  fn _shlibShdr(sh: int64, name: int64, typ: int64, flags: int64, off: int64, size: int64,
+                link: int64, info: int64, align: int64, entsize: int64) {
+    poke32(sh + 0, name);
+    poke32(sh + 4, typ);
+    poke64(sh + 8, flags);
+    poke64(sh + 16, off);
+    poke64(sh + 24, off);
+    poke64(sh + 32, size);
+    poke32(sh + 40, link);
+    poke32(sh + 44, info);
+    poke64(sh + 48, align);
+    poke64(sh + 56, entsize);
+  }
+
+  // #2117: Namen nach .shstrtab (sn + at) schreiben; liefert `at` als sh_name.
+  fn _shlibName(sn: int64, at: int64, name: pchar): int64 {
+    var n: int64 := StrLen(name);
+    memcpy(sn + at, name as int64, n);
+    poke8(sn + at + n, 0);
+    return at;
+  }
+
+  // #2117: ADRP x9 (bei `at`) und den Folgebefehl (bei at+4) auf das Ziel
+  // `target` richten. zweiter == 0: ADD x9,x9,#lo12; == 1: LDR x9,[x9,#lo12]
+  // (64-Bit-Zugriff, lo12 in Achteln). Adressen sind Dateioffsets == VAs.
+  // Dieselbe Folge legt emit_arm64 an (_emitGlobalAddrX9, emitCallExtern im
+  // .so-Modus) — die Befehlsworte dort und die Masken hier gehoeren zusammen.
+  fn _a64PatchAdrp(buf: int64, at: int64, target: int64, zweiter: int64) {
+    var seiten: int64 := (target >> 12) - (at >> 12);
+    if seiten < (0 - 1048576) || seiten > 1048575 {
+      EPrintStrLn("error: --shared: ADRP-Distanz ueber 4 GiB (#2117)."c);
+      exit(1);
+    }
+    var lo: int64 := seiten & 3;
+    var hi: int64 := (seiten >> 2) & 0x7FFFF;
+    poke32(buf + at, 0x90000009 | (lo << 29) | (hi << 5));
+    var lo12: int64 := target & 0xFFF;
+    if zweiter == 0 {
+      poke32(buf + at + 4, 0x91000129 | (lo12 << 10));
+    } else {
+      if (lo12 & 7) != 0 {
+        EPrintStrLn("error: --shared: GOT-Platz nicht 8-Byte-ausgerichtet (#2117)."c);
+        exit(1);
+      }
+      poke32(buf + at + 4, 0xF9400129 | ((lo12 >> 3) << 10));
+    }
   }
 
   fn writePE(path: pchar, code: int64, size: int64): bool {
@@ -5734,7 +5747,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.2.14B — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.2.14C — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit

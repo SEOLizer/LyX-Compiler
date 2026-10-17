@@ -72,7 +72,8 @@ pub con PATCH_CBZ:  int64 := 1;
 pub con PATCH_CBNZ: int64 := 2;
 pub con PATCH_BL:   int64 := 3;
 // #1806: Adresse einer Funktion als WERT (fn-Zeiger). ADR laedt PC-relativ,
-// Reichweite +/-1 MB — reicht fuer ein Modul; darueber meldet applyPatches.
+// Reichweite +/-1 MB — reicht fuer ein Modul; darueber meldet applyPatches
+// (#2112: bis dahin behauptete das nur dieser Kommentar).
 pub con PATCH_ADR:  int64 := 4;
 
 // ============================================================================
@@ -91,14 +92,17 @@ pub type EmitARM64 = class {
   // label address table: labelId -> byte offset in codeBuf
   labelAddrs:      int64;
   labelCount:      int64;
+  labelCap:        int64;   // #2112: Eintraege in labelAddrs, waechst
 
   // pending branch patches: {codeOff, labelId, type, reg}
   patchBuf:        int64;
   patchCount:      int64;
+  patchCap:        int64;   // #2112: Kapazitaet in Eintraegen, waechst
 
   // function table: funcId -> start offset (for BL patching)
   funcAddrs:       int64;
   funcCount:       int64;
+  funcCap:         int64;   // #2112: Eintraege in funcAddrs/funcPrologueLen
 
   // WP-AND-03: per-function prologue length in bytes. The DWARF CFI generator
   // uses this to advance_loc over the prologue before declaring CFA = fp+16.
@@ -133,6 +137,15 @@ pub type EmitARM64 = class {
   externCount: int64;
   externCap:   int64;
 
+  // #2117: Aufrufstellen externer Funktionen in einer .so — 16-Byte-Saetze
+  // {instrOff, externIdx}. Statt des GOT-Platzes MITTEN IM CODE (eine
+  // Text-Relocation: bionic lehnt sie ab API 23 ab, und ohne DT_TEXTREL
+  // schreibt der Lader in ein R-X-Segment) steht hier ADRP+LDR auf einen
+  // GOT-Platz im RW-Segment; writeELFSharedLib traegt die Distanz nach.
+  gotCallBuf:   int64;
+  gotCallCount: int64;
+  gotCallCap:   int64;
+
   // WP-D2: Windows target mode — replaces Linux syscalls with BL placeholders
   // that WinARM64Backend resolves to Windows API helper stubs after emit().
   // winPatchBuf holds 16-byte records: {codeOffset:i64, helperId:i64}.
@@ -153,14 +166,23 @@ pub type EmitARM64 = class {
     self.codeCap     := 131072;
     self.codeLen     := 0;
     self.stackSize   := 0;
-    self.labelAddrs  := alloc(1024 * 8);
+    // #2112: Alle drei Tabellen waren fest (1024 Marken, 1024 Patches, 256
+    // Funktionen) und schnitten still ab: ein Patch jenseits der Grenze fiel
+    // weg und sein Sprung blieb auf dem Platzhalter stehen (BL +0 — das
+    // Programm rief sich endlos selbst), eine Funktion jenseits von 256 bekam
+    // keine Adresse. riscv hatte die Patchliste schon in #1740 wachsen lassen.
+    self.labelCap    := 1024;
+    self.labelAddrs  := alloc(self.labelCap * 8);
     self.labelCount  := 0;
-    self.patchBuf    := alloc(1024 * 32);
+    self.patchCap    := 1024;
+    self.patchBuf    := alloc(self.patchCap * 32);
     self.patchCount  := 0;
-    self.funcAddrs   := alloc(256 * 8);
+    self.funcCap     := self.getFuncCount() + 1;
+    if self.funcCap < 256 { self.funcCap := 256; }
+    self.funcAddrs   := alloc(self.funcCap * 8);
     self.funcCount   := 0;
-    // WP-AND-03: 256 slots, parallel to funcAddrs.
-    self.funcPrologueLen := alloc(256 * 8);
+    // WP-AND-03: parallel to funcAddrs.
+    self.funcPrologueLen := alloc(self.funcCap * 8);
 
     // WP-AND-02 Phase C: dynamic-reloc state. Buffer grows on demand.
     self.isSharedLib := 0;
@@ -172,6 +194,9 @@ pub type EmitARM64 = class {
     self.globalRelocCap   := 32;
     self.globalRelocBuf   := alloc(self.globalRelocCap * 16);
     self.globalRelocCount := 0;
+    self.gotCallCap   := 16;                    // #2117
+    self.gotCallBuf   := alloc(self.gotCallCap * 16);
+    self.gotCallCount := 0;
 
     self.externCap   := 64;
     self.externBuf   := alloc(self.externCap * 32);
@@ -220,6 +245,8 @@ pub type EmitARM64 = class {
   }
 
   fn getRelocBuf(): int64   { return self.relocBuf; }
+  fn getGotCallBuf(): int64   { return self.gotCallBuf; }     // #2117
+  fn getGotCallCount(): int64 { return self.gotCallCount; }   // #2117
   fn getRelocCount(): int64 { return self.relocCount; }
 
   // WP-AND-02 Phase C: append an Elf64_Rela record. r_info packs (sym_idx<<32)|type.
@@ -259,15 +286,21 @@ pub type EmitARM64 = class {
     // funcAddrs is now fully populated, so any BL patch that was skipped
     // earlier (callee not yet emitted) resolves here.
     self.applyPatches();
+    // #2112: Was jetzt noch offen ist, bleibt fuer immer auf dem Platzhalter
+    // stehen — laut scheitern statt einen Sprung auf sich selbst auszuliefern.
+    self._checkNoOpenPatches(0);
     return self.codeLen;
   }
 
   fn emitFunc(funcId: int64) {
     // Record start address
-    if funcId < 256 {
-      poke64(self.funcAddrs + funcId * 8, self.codeLen);
-      self.funcCount := self.funcCount + 1;
+    if funcId >= self.funcCap {
+      EPrintStr("error: arm64: Funktion "c); EPrintInt(funcId);
+      EPrintStrLn(" liegt jenseits der Funktionstabelle (#2112)."c);
+      exit(1);
     }
+    poke64(self.funcAddrs + funcId * 8, self.codeLen);
+    self.funcCount := self.funcCount + 1;
 
     self.stackSize   := 0;
     self.labelCount  := 0;
@@ -279,7 +312,7 @@ pub type EmitARM64 = class {
 
     // Zero out label table
     var li: int64 := 0;
-    while li < 1024 {
+    while li < self.labelCap {
       poke64(self.labelAddrs + li * 8, -1);
       li := li + 1;
     }
@@ -308,9 +341,7 @@ pub type EmitARM64 = class {
       pSpillI := pSpillI + 1;
     }
     // WP-AND-03: stash prologue length for DWARF CFI advance_loc.
-    if funcId < 256 {
-      poke64(self.funcPrologueLen + funcId * 8, self.codeLen - prologueStart);
-    }
+    poke64(self.funcPrologueLen + funcId * 8, self.codeLen - prologueStart);
 
     var instrStart: int64 := self.getFuncInstrStart(funcId);
     var instrCount: int64 := self.getFuncInstrCount(funcId);
@@ -322,6 +353,10 @@ pub type EmitARM64 = class {
 
     self.emitEpilogue();
     self.applyPatches();
+    // #2112: Marken gelten nur innerhalb der Funktion — ein hier offener
+    // Sprung wuerde sonst von der gleichnamigen Marke der NAECHSTEN Funktion
+    // aufgeloest.
+    self._checkNoOpenPatches(1);
   }
 
   // -------------------------------------------------------------------------
@@ -439,6 +474,7 @@ pub type EmitARM64 = class {
     if (op == IRO_BR_FALSE || op == IRO_BR_TRUE || op == IRO_CALL || op == IRO_CALL_BUILTIN) { return 1; }
     if (op == IRO_CALL_EXTERN || op == IRO_CALL_INDIRECT || op == IRO_CMP_EQ || op == IRO_CMP_GE) { return 1; }
     if (op == IRO_FUNC_ADDR) { return 1; }   // #1806
+    if (op == IRO_LOAD_LOCAL_ADDR || op == IRO_LOAD_GLOBAL_ADDR) { return 1; }   // #2116
     if (op == IRO_CMP_GT || op == IRO_CMP_LE || op == IRO_CMP_LT || op == IRO_CMP_NEQ) { return 1; }
     if (op == IRO_CONST_FLOAT || op == IRO_CONST_INT || op == IRO_CONST_STR || op == IRO_DIV) { return 1; }
     if (op == IRO_FADD || op == IRO_FDIV || op == IRO_FMUL || op == IRO_FNEG) { return 1; }
@@ -548,6 +584,8 @@ pub type EmitARM64 = class {
     if op == IRO_LOAD_LOCAL  { self.emitLoadLocal(src1, dest); }
     if op == IRO_STORE_LOCAL { self.emitStoreLocal(src1, dest); }
     if op == IRO_LOAD_GLOBAL  { self.emitLoadGlobal(src1, dest); }
+    if op == IRO_LOAD_LOCAL_ADDR  { self.emitLoadLocalAddr(src1, dest); }    // #2116: @x
+    if op == IRO_LOAD_GLOBAL_ADDR { self.emitLoadGlobalAddr(src1, dest); }   // #2116: @g
     if op == IRO_STORE_GLOBAL { self.emitStoreGlobal(src1, dest); }
 
     // --- Pointer / struct ---
@@ -821,18 +859,56 @@ pub type EmitARM64 = class {
   }
 
   fn emitLoadGlobal(addr: int64, dest: int64) {
-    // IRO_LOAD_GLOBAL trägt einen globalIdx (NICHT eine VA). Beide Modi (shared-lib UND
-    // static) emittieren eine literal-pool-Sequenz mit Platzhalter-Slot und merken sich
-    // (slotOff, globalIdx) in globalRelocBuf. writeELFSharedLib bäckt + R_AARCH64_RELATIVE;
-    // writeELF (static) bäckt die absolute VA direkt (file-offset==vaddr, fixer Lade-Offset).
+    // IRO_LOAD_GLOBAL trägt einen globalIdx (NICHT eine VA).
     // ARM64-FIX: vorher MOVte der static-Pfad globalIdx als VA → LDR [0] → SIGSEGV.
+    self._emitGlobalAddrX9(addr);
+    self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // x9 := Adresse der Modulvariable gIdx. Die eine Stelle fuer Lesen, Schreiben
+  // und `@g` (#2116) — die drei muessen dieselbe Adresse treffen.
+  //
+  // Statisch: Literal-Pool-Platz (LDR x9,[pc+8]; B +12; .quad), writeELF baeckt
+  // die absolute VA hinein; globalRelocBuf merkt {Platz-Offset, gIdx}.
+  //
+  // #2117, .so: ADRP x9 + ADD x9,x9,#lo12 — PC-relativ, writeELFSharedLib
+  // traegt die Distanz ein, und es bleibt KEINE Relocation. Vorher stand auch
+  // hier ein Pool-Platz im Code, den eine R_AARCH64_RELATIVE beim Laden
+  // umschreiben sollte: eine Text-Relocation im R-X-Segment, die bionic ab
+  // API 23 abweist. Der Schreibzugriff (_emitStoreGlobalPIC) gab dazu als
+  // Addend den INDEX statt der Adresse an — `g := 1` schrieb nach
+  // Ladeadresse+8*0, in den ELF-Kopf. globalRelocBuf merkt hier
+  // {ADRP-Offset, gIdx}; die Bedeutung des ersten Felds haengt am Modus.
+  fn _emitGlobalAddrX9(gIdx: int64) {
+    if self.isSharedLib != 0 {
+      var instrOff: int64 := self.codeLen;
+      self.emit32(0x90000009);         // ADRP x9, 0          (nachgetragen)
+      self.emit32(0x91000129);         // ADD  x9, x9, #0     (nachgetragen)
+      self._recordGlobalReloc(instrOff, gIdx);
+      return;
+    }
     var slotOff: int64 := self.codeLen + 8;
     self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]
     self.emit32(0x14000003);         // B +12
-    self.emit64(0);                   // placeholder slot (gebacken in writeELF*)
-    self.emit32(0xF9400120 | ARM64_X0);  // LDR x0, [x9]
+    self.emit64(0);                   // placeholder slot (gebacken in writeELF)
+    self._recordGlobalReloc(slotOff, gIdx);
+  }
+
+  // #2116: `@x` auf ein Local/Param — die Adresse des Slots, x29 + slotOff.
+  // _emitFarAddr rechnet sie in x16 (auch jenseits von simm9/#1388); vor dem
+  // Ablegen nach x0, weil emitStur bei fernem Ziel-Slot selbst x16 braucht.
+  fn emitLoadLocalAddr(slot: int64, dest: int64) {
+    self._emitFarAddr(ARM64_X29, self.slotOff(slot));
+    self.emit32(0xAA1003E0 | ARM64_X0);   // MOV x0, x16  (ORR x0, xzr, x16)
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
-    self._recordGlobalReloc(slotOff, addr);
+  }
+
+  // #2116: `@g` auf eine Modulvariable — dieselbe Adressfolge wie
+  // emitLoadGlobal (_emitGlobalAddrX9), nur ohne den Ladebefehl.
+  fn emitLoadGlobalAddr(addr: int64, dest: int64) {
+    self._emitGlobalAddrX9(addr);
+    self.emitStur(9, ARM64_X29, self.slotOff(dest));
   }
 
   // Merkt (slotCodeOff, globalIdx) für späteres Backen durch writeELF*/writeELFSharedLib.
@@ -855,53 +931,10 @@ pub type EmitARM64 = class {
   }
 
   fn emitStoreGlobal(src: int64, addr: int64) {
-    if self.isSharedLib != 0 {
-      self._emitStoreGlobalPIC(src, addr);
-      return;
-    }
-    // ARM64-FIX (static): literal-pool-Slot (gIdx-Platzhalter) → writeELF bäckt VA.
-    // Vorher MOVte addr(=gIdx) als VA → STR [0] → SIGSEGV.
-    var slotOff: int64 := self.codeLen + 8;
-    self.emit32(0x58000040 | 9);     // LDR x9, [pc+8]  (Adresse aus Slot)
-    self.emit32(0x14000003);         // B +12  (über .quad)
-    self.emit64(0);                   // placeholder slot (gebacken in writeELF)
-    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));  // x0 = value
+    // ARM64-FIX (static): Vorher MOVte addr(=gIdx) als VA → STR [0] → SIGSEGV.
+    self._emitGlobalAddrX9(addr);
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));  // x0 = value (fern: x16, nie x9)
     self.emit32(0xF9000120);          // STR x0, [x9]
-    self._recordGlobalReloc(slotOff, addr);
-  }
-
-  // WP-AND-02 Phase C: PIC-friendly global load using an inline literal pool.
-  // Layout (24 bytes total, identical size to the MOVZ/MOVK variant):
-  //   +0  LDR x9, [pc + 8]   ; loads the 8-byte slot at +8
-  //   +4  B  +12             ; jump past the slot
-  //   +8  .quad <addr>       ; slot, patched by R_AARCH64_RELATIVE at load time
-  //  +16  LDR x0, [x9]       ; dereference
-  //  +20  STUR x0, [fp, -slot]
-  fn _emitLoadGlobalPIC(addr: int64, dest: int64) {
-    var slotOff: int64 := self.codeLen + 8;   // slot's offset within codeBuf
-    // LDR x9 (=9), literal at +8: imm19 = 2 → 2<<5 = 0x40
-    self.emit32(0x58000040 | 9);
-    // B +12 (3 instructions ahead): imm26 = 3
-    self.emit32(0x14000003);
-    // 8-byte slot for the resolved address. The dynamic loader rewrites this
-    // to (load_base + addend) via R_AARCH64_RELATIVE; we store `addr` as the
-    // addend AND as the initial slot value (the loader overwrites anyway).
-    self.emit64(addr);
-    self._recordRelocation(slotOff, 1027, addr);  // 1027 = R_AARCH64_RELATIVE
-    // LDR x0, [x9]
-    self.emit32(0xF9400120 | ARM64_X0);
-    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
-  }
-
-  fn _emitStoreGlobalPIC(src: int64, addr: int64) {
-    var slotOff: int64 := self.codeLen + 8;
-    self.emit32(0x58000040 | 9);    // LDR x9, [pc+8]
-    self.emit32(0x14000003);        // B +12
-    self.emit64(addr);
-    self._recordRelocation(slotOff, 1027, addr);
-    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src));
-    // STR x0, [x9]
-    self.emit32(0xF9000120);
   }
 
   fn emitLoadField(base: int64, fieldOff: int64, dest: int64) {
@@ -1031,6 +1064,26 @@ pub type EmitARM64 = class {
       poke64(nbase + 24, libLen);
       externIdx := self.externCount;
       self.externCount := self.externCount + 1;
+    }
+    // #2117, .so: ADRP x9 + LDR x9,[x9,#lo12] auf den GOT-Platz im
+    // RW-Segment; writeELFSharedLib legt ihn an, setzt R_AARCH64_GLOB_DAT
+    // darauf und traegt die Distanz hier nach. Kein Platz im Code.
+    if self.isSharedLib != 0 {
+      if self.gotCallCount >= self.gotCallCap {
+        var gnc: int64 := self.gotCallCap * 2;
+        var gnb: int64 := alloc(gnc * 16);
+        memcpy(gnb, self.gotCallBuf, self.gotCallCount * 16);
+        self.gotCallBuf := gnb; self.gotCallCap := gnc;
+      }
+      var grec: int64 := self.gotCallBuf + self.gotCallCount * 16;
+      poke64(grec + 0, self.codeLen);
+      poke64(grec + 8, externIdx);
+      self.gotCallCount := self.gotCallCount + 1;
+      self.emit32(0x90000009);        // ADRP x9, 0             (nachgetragen)
+      self.emit32(0xF9400129);        // LDR  x9, [x9, #0]      (nachgetragen)
+      self.emit32(0xD63F0120);        // BLR x9
+      self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+      return;
     }
     // Inline GOT slot: LDR x9,[pc+8]; B +12; .quad 0; BLR x9
     // ld.so writes the resolved symbol address into the .quad (GLOB_DAT).
@@ -1404,7 +1457,7 @@ pub type EmitARM64 = class {
       if (id == 401) { self.emit32(0x1E64C000); }   // FRINTP d0, d0
       if (id == 402) { self.emit32(0x1E644000); }   // FRINTN d0, d0
       self.emit32(0x9E660000);   // FMOV x0, d0
-    } else if (id >= LSC_MIN && id <= LSC_MAX) {
+    } else if (IstLinuxSys(id) != 0) {   // #2122
       // #2021: Linux-Syscall aus der gemeinsamen Tabelle.
       //
       // EIN Zweig statt siebzehn handgeschriebener Bloecke: Nummer und
@@ -1713,9 +1766,26 @@ pub type EmitARM64 = class {
   // -------------------------------------------------------------------------
 
   fn emitLabelDef(labelId: int64) {
-    if labelId < 1024 {
-      poke64(self.labelAddrs + labelId * 8, self.codeLen);
+    // #2112: Die Tabelle war fest bei 1024; eine Marke jenseits davon wurde
+    // still verworfen und ihr Sprung nie nachgetragen.
+    if labelId < 0 {
+      EPrintStr("error: arm64: negative Marke "c); EPrintInt(labelId); EPrintStrLn(" (#2112)."c);
+      exit(1);
     }
+    if labelId >= self.labelCap {
+      var nc: int64 := self.labelCap * 2;
+      while labelId >= nc { nc := nc * 2; }
+      var nb: int64 := alloc(nc * 8);
+      var ci: int64 := 0;
+      while ci < nc {
+        if ci < self.labelCap { poke64(nb + ci * 8, peek64(self.labelAddrs + ci * 8)); }
+        else                  { poke64(nb + ci * 8, -1); }
+        ci := ci + 1;
+      }
+      self.labelAddrs := nb;
+      self.labelCap   := nc;
+    }
+    poke64(self.labelAddrs + labelId * 8, self.codeLen);
   }
 
   fn emitBranch(labelId: int64) {
@@ -1737,14 +1807,63 @@ pub type EmitARM64 = class {
     }
   }
 
+  // #2112: Die Liste wuchs nicht — jenseits von 1024 Eintraegen fiel jeder
+  // weitere Patch still weg. Weil die Aufruf-Patches ueber alle Funktionen
+  // hinweg stehenbleiben (siehe emitFunc), reichten dafuer gut tausend Aufrufe
+  // im ganzen Programm. Dieselbe Rechnung wie addPatch in riscv_linux.lyx
+  // (#1740) — die beiden muessen uebereinstimmen.
   fn addPatch(codeOff: int64, labelId: int64, ptype: int64, reg: int64) {
-    if self.patchCount < 1024 {
-      var base: int64 := self.patchBuf + self.patchCount * 32;
-      poke64(base,      codeOff);
-      poke64(base + 8,  labelId);
-      poke64(base + 16, ptype);
-      poke64(base + 24, reg);
-      self.patchCount := self.patchCount + 1;
+    if self.patchCount >= self.patchCap {
+      var nc: int64 := self.patchCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      var ci: int64 := 0;
+      while ci < self.patchCount * 4 {
+        poke64(nb + ci * 8, peek64(self.patchBuf + ci * 8));
+        ci := ci + 1;
+      }
+      self.patchBuf := nb;
+      self.patchCap := nc;
+    }
+    var base: int64 := self.patchBuf + self.patchCount * 32;
+    poke64(base,      codeOff);
+    poke64(base + 8,  labelId);
+    poke64(base + 16, ptype);
+    poke64(base + 24, reg);
+    self.patchCount := self.patchCount + 1;
+  }
+
+  // #2112: Abstand passt nicht ins Befehlsfeld — vorher wurde er still auf
+  // die Feldbreite maskiert und der Sprung landete irgendwo.
+  fn _patchRangeError(what: pchar, dist: int64, limit: int64) {
+    EPrintStr("error: arm64: "c); EPrintStr(what);
+    EPrintStr(": Abstand "c); EPrintInt(dist);
+    EPrintStr(" Byte ueberschreitet die Reichweite von +/-"c); EPrintInt(limit);
+    EPrintStrLn(" Byte (#2112)."c);
+    exit(1);
+  }
+
+  // #2112: mode 1 = Ende einer Funktion (offene Marken-Patches sind ein
+  // Fehler), mode 0 = Ende von emit() (auch offene Aufrufe/Adressen).
+  fn _checkNoOpenPatches(mode: int64) {
+    var i: int64 := 0;
+    while i < self.patchCount {
+      var base:  int64 := self.patchBuf + i * 32;
+      var lid:   int64 := peek64(base + 8);
+      var ptype: int64 := peek64(base + 16);
+      if lid != -2 {
+        var isFn: int64 := 0;
+        if ptype == PATCH_BL || ptype == PATCH_ADR { isFn := 1; }
+        if mode == 0 || isFn == 0 {
+          EPrintStr("error: arm64: Sprungziel nie aufgeloest — "c);
+          if isFn != 0 { EPrintStr("Funktion "c); } else { EPrintStr("Marke "c); }
+          EPrintInt(lid);
+          EPrintStr(" (Patchtyp "c); EPrintInt(ptype);
+          EPrintStr(", Code-Offset "c); EPrintInt(peek64(base));
+          EPrintStrLn(") (#2112)."c);
+          exit(1);
+        }
+      }
+      i := i + 1;
     }
   }
 
@@ -1765,7 +1884,7 @@ pub type EmitARM64 = class {
         // funcAddrs writes in emitFunc.
         var target: int64 := -1;
         if ptype == PATCH_BL || ptype == PATCH_ADR {
-          if labelId < 256 {
+          if labelId >= 0 && labelId < self.funcCap {
             target := peek64(self.funcAddrs + labelId * 8);
             // A funcAddrs[i] of 0 is valid only for the FIRST emitted
             // function (labelId 0). Any other 0 means "not yet emitted".
@@ -1774,13 +1893,33 @@ pub type EmitARM64 = class {
             }
           }
         } else {
-          if labelId < 1024 {
+          if labelId >= 0 && labelId < self.labelCap {
             target := peek64(self.labelAddrs + labelId * 8);
           }
         }
 
         if target >= 0 {
           var delta: int64 := (target - codeOff) >> 2;
+          // #2112: Reichweiten — B/BL imm26 (+/-128 MiB), CBZ/CBNZ imm19
+          // (+/-1 MiB), ADR imm21 in Byte (+/-1 MiB). Vorher wurde der Abstand
+          // still auf die Feldbreite maskiert.
+          var dist: int64 := target - codeOff;
+          if ptype == PATCH_B || ptype == PATCH_BL {
+            if dist < 0 - 0x8000000 || dist >= 0x8000000 {
+              self._patchRangeError("B/BL"c, dist, 0x8000000);
+            }
+          } else if ptype == PATCH_ADR {
+            if dist < 0 - 0x100000 || dist >= 0x100000 {
+              self._patchRangeError("ADR (Funktionsadresse)"c, dist, 0x100000);
+            }
+          } else if ptype == PATCH_CBZ || ptype == PATCH_CBNZ {
+            if dist < 0 - 0x100000 || dist >= 0x100000 {
+              self._patchRangeError("CBZ/CBNZ (bedingter Sprung, Funktion zu gross)"c, dist, 0x100000);
+            }
+          } else {
+            EPrintStr("error: arm64: unbekannter Patchtyp "c); EPrintInt(ptype); EPrintStrLn(" (#2112)."c);
+            exit(1);
+          }
           if ptype == PATCH_B || ptype == PATCH_BL {
             var opc: int64 := 0x14000000;
             if ptype == PATCH_BL { opc := 0x94000000; }

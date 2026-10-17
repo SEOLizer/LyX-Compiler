@@ -169,7 +169,7 @@ bestehenden Capability: an `process.fork` gehängt wären sie unsichtbar.
 
 | Capability | Beschreibung |
 |-----------|-------------|
-| `io.wait` | Auf Deskriptoren warten: `poll`, `ppoll`, `select`, `epoll_*`, `eventfd2`, `signalfd4`, `timerfd_*` |
+| `io.wait` | Auf Deskriptoren warten: `poll`, `ppoll`, `select`, `epoll_*`, `eventfd2`, `signalfd4`, `timerfd_*`; dazu `rt_sigprocmask` (eigene Maske) und `read` auf bereits offene Deskriptoren (#2111) |
 | `io.fd` | Deskriptoren erzeugen und verdoppeln: `pipe`, `pipe2`, `dup`, `dup2`, `dup3` |
 | `fs.xattr` | Erweiterte Attribute: `getxattr`/`setxattr`/`listxattr`/`removexattr` (+ `f`-Varianten) |
 | `fs.watch` | Dateiänderungen beobachten: `inotify_init1`, `inotify_add_watch`, `inotify_rm_watch` |
@@ -179,6 +179,32 @@ bestehenden Capability: an `process.fork` gehängt wären sie unsichtbar.
 Programm ohnehin schon hat. `eventfd`, `signalfd` und `timerfd` erzeugen
 allerdings Deskriptoren, weshalb die Zusage ausdrücklich bleibt und nicht in
 den impliziten Basissatz wandert.
+
+**Signale über `signalfd` empfangen** (#2111) geht mit `io.wait` allein. Bis
+1.2.14B fehlten dafür zwei Aufrufe: `rt_sigprocmask` — das Signal muss in der
+eigenen Maske blockiert sein, sonst wird es am signalfd vorbei zugestellt —
+hing an `process.signal`, das auch `kill` auf fremde Prozesse erlaubt, und das
+`read` auf den signalfd an `fs.read`. Seitdem gilt:
+
+* `rt_sigprocmask` steht unter `io.wait` (und weiter unter `process.signal`).
+  Es wirkt nur auf den aufrufenden Thread. `rt_sigaction` war schon immer
+  erlaubt (Signal-Handler, `SIG_IGN`).
+* `read` steht unter `io.wait`. seccomp kann den Deskriptortyp nicht prüfen —
+  das ist `read` auf **jeden offenen** Deskriptor: signalfd, eventfd, timerfd,
+  aber auch stdin und geerbte Deskriptoren. Vertretbar, weil **Öffnen gesperrt
+  bleibt**: `open`/`openat` gibt es nur mit `fs.read`/`fs.write`/`fs.create`,
+  ein Dateisystemobjekt wird über `io.wait` also nicht erreichbar. Es ist das
+  Gegenstück zu `write`, das auf jedem offenen Deskriptor implizit erlaubt
+  ist. `pread64`, `readv` und `lseek` bleiben bei `fs.read`.
+* `kill` und `tgkill` bleiben allein bei `process.signal`.
+
+Festgehalten in `tests/capability_signalfd_test.sh` — mit beiden Seiten:
+die Probe läuft unter `[io.wait, system.time]`, `kill`/`tgkill` auf einen
+fremden Prozess und `open` sterben dort weiterhin an `SIGSYS`.
+
+Auf `--target=lyxos` ändert sich nichts: weder `io.wait` noch
+`process.signal` setzen ein CAPS-Bit, Signalmasken sind dort nicht über das
+Manifest geregelt.
 
 `fcntl` gehört **nicht** zu `io.fd`: es ist seit #1276 unter `fs.read` und
 `fs.write` mit Argumentfilter freigegeben (`F_GETFD`, `F_SETFD`, `F_GETFL`,
@@ -251,7 +277,7 @@ Standardausgabe".
 |-----------|-------------|
 | `process.fork` | Kindprozesse erzeugen |
 | `process.exec` | Andere Programme ausführen |
-| `process.signal` | Signale an andere Prozesse senden |
+| `process.signal` | Signale an andere Prozesse senden (`kill`, `tgkill`); die eigene Signalmaske braucht es nicht, dafür reicht `io.wait` (#2111) |
 | `process.sched` | Prozess-Priorität ändern |
 
 ---

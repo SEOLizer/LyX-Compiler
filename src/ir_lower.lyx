@@ -1454,34 +1454,10 @@ pub type IRLower = class {
         // supported yet.)
         // #2097/#2099: private Modulvariable/Konstante der eigenen Unit steht
         // unter ihrer Marke im Verzeichnis (_irPrivVName).
-        var gnTrLc: int64 := alloc(8);
-        var gnTrP: int64 := self._irPrivVName(idPtrL, idLen, gnTrLc);
-        var gnTrL: int64 := peek64(gnTrLc);
-        free(gnTrLc, 8);
-        var gnI: int64 := 0;
-        // WP-AND-upstream-fix v5/cross-module: names live in IR strBuffer.
-        var gnStrBuf: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
-        while gnI < self.globalNameCnt {
-          var gnRec:     int64 := self.globalNameBuf + gnI * 32;
-          var gnNameOff: int64 := peek64(gnRec + 0);
-          var gnLen:     int64 := peek64(gnRec + GLOBAL_REC_OFF_NAMELEN);
-          var gnIdx:     int64 := peek64(gnRec + GLOBAL_REC_OFF_IDX);
-          if gnLen == gnTrL {
-            var gnPtr: int64 := gnStrBuf + gnNameOff;
-            var gnMatch: int64 := 1;
-            var gnJ: int64 := 0;
-            while gnJ < gnTrL {
-              if gnMatch != 0 {
-                if peek8(gnPtr + gnJ) != peek8(gnTrP + gnJ) { gnMatch := 0; }
-              }
-              gnJ += 1;
-            }
-            if gnMatch != 0 {
-              self.irAddInstrDirect(IRO_LOAD_GLOBAL, dest, gnIdx, -1, 0);
-              return dest;
-            }
-          }
-          gnI += 1;
+        var gnIdx: int64 := self._irGlobalIdx(idPtrL, idLen);
+        if gnIdx >= 0 {
+          self.irAddInstrDirect(IRO_LOAD_GLOBAL, dest, gnIdx, -1, 0);
+          return dest;
         }
         // WP-A1: kein Local/Param/Global → Funktions-NAME als Wert? → Funktions-Adresse laden
         // (fn-ptr-Zuweisung, z.B. `b.on_click := h`). Vorher: uninitialisierter Temp (Garbage).
@@ -1957,17 +1933,7 @@ pub type IRLower = class {
     var op: int64 := self.nodeIVal(expr);
     // WP-ADDR: @local (TK_AT, op==111, unär — kanonischer Adresse-von-Operator wie ELF) → ADRESSE
     // des Slots via IRO_LOAD_LOCAL_ADDR. Nur für lokale/Param-Identifier; sonst Fallback = Wert.
-    if op == 111 {
-      var aOperand: int64 := self.nodeC0(expr);
-      if self.nodeKind(aOperand) == NK_IDENT {
-        var aSlot: int64 := self._resolveLocalSlotForAddr(self.nodeSVal(aOperand), self.nodeSLen(aOperand));
-        if aSlot >= 0 {
-          var aDest: int64 := self.allocTemp();
-          self.irAddInstrDirect(IRO_LOAD_LOCAL_ADDR, aDest, aSlot, -1, 0);
-          return aDest;
-        }
-      }
-    }
+    if op == 111 { return self._irAdresseVon(expr); }
     var t1: int64 := self.lowerExpr(self.nodeC0(expr));
     var dest: int64 := self.allocTemp();
     // WP-AND-upstream-fix v6: emit actual ops. Map the parser's TK_*
@@ -3461,6 +3427,15 @@ pub type IRLower = class {
     }
 
     if (self.seq(fname, fnlen, "mmap", 4)) {
+      // #2122: Auf den Linux-Zielen ein ECHTES mmap mit allen sechs
+      // Argumenten. Bis 1.2.14B wurde daraus IRO_ALLOC(len): Adresse, Schutz,
+      // Flags, Deskriptor und Offset fielen still weg — `mmap(.., 7, ..)`
+      // lieferte RW statt RWX, eine Dateiabbildung lieferte Nullen.
+      // arm64/android-arm64/riscv (2, 12, 3, 9) zaehlen nach der generischen
+      // Linux-ABI; LyxOS behaelt IRO_ALLOC (eigene mmap-Semantik, #1861).
+      if self.target == 2 || self.target == 12 || self.target == 3 || self.target == 9 {
+        return self._lscRuf(LSC_MMAP, arg0, dest);
+      }
       if arg0 >= 0 {
         var mmapSizeNode: int64 := self.nodeNext(arg0);  // second arg = size
         if mmapSizeNode >= 0 {
@@ -10935,6 +10910,82 @@ pub type IRLower = class {
       d := self.nodeNext(d);
     }
     return 0;
+  }
+
+  // #2116: Index der Modulvariablen im Verzeichnis (globalNameBuf), -1 wenn
+  // der Name keine ist. Herausgeloest aus dem Lesezugriff in lowerExpr
+  // (NK_IDENT), damit die Adresse-von-Form (`@g`, _irAdresseVon) DIESELBE
+  // Suche benutzt — die beiden muessen uebereinstimmen.
+  fn _irGlobalIdx(idPtrL: int64, idLen: int64): int64 {
+    // #2097/#2099: private Modulvariable/Konstante der eigenen Unit steht
+    // unter ihrer Marke im Verzeichnis (_irPrivVName).
+    var gnTrLc: int64 := alloc(8);
+    var gnTrP: int64 := self._irPrivVName(idPtrL, idLen, gnTrLc);
+    var gnTrL: int64 := peek64(gnTrLc);
+    free(gnTrLc, 8);
+    var gnI: int64 := 0;
+    // WP-AND-upstream-fix v5/cross-module: names live in IR strBuffer.
+    var gnStrBuf: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
+    while gnI < self.globalNameCnt {
+      var gnRec:     int64 := self.globalNameBuf + gnI * 32;
+      var gnNameOff: int64 := peek64(gnRec + 0);
+      var gnLen:     int64 := peek64(gnRec + GLOBAL_REC_OFF_NAMELEN);
+      if gnLen == gnTrL {
+        var gnPtr: int64 := gnStrBuf + gnNameOff;
+        var gnMatch: int64 := 1;
+        var gnJ: int64 := 0;
+        while gnJ < gnTrL {
+          if gnMatch != 0 {
+            if peek8(gnPtr + gnJ) != peek8(gnTrP + gnJ) { gnMatch := 0; }
+          }
+          gnJ += 1;
+        }
+        if gnMatch != 0 { return peek64(gnRec + GLOBAL_REC_OFF_IDX); }
+      }
+      gnI += 1;
+    }
+    return 0 - 1;
+  }
+
+  // #2116: `@x` — die ADRESSE eines Speicherplatzes. Bis 1.2.14B kannte der
+  // IR-Weg nur Locals/Params (IRO_LOAD_LOCAL_ADDR), und das nur, wenn das
+  // Backend den Opcode kannte (arm64 und riscv taten es nicht). Fuer alles
+  // andere fiel lowerUnOp durch und gab einen UNBESCHRIEBENEN Temp zurueck:
+  // `poke64(@g, 42)` auf eine Modulvariable uebersetzte fehlerfrei und
+  // schrieb an eine zufaellige Adresse. Jetzt: Local/Param → Slotadresse,
+  // Modulvariable → IRO_LOAD_GLOBAL_ADDR, alles andere laut.
+  // Liefert den Temp mit der Adresse; bricht ab, wenn es keine gibt.
+  fn _irAdresseVon(expr: int64): int64 {
+    var aOperand: int64 := self.nodeC0(expr);
+    if self.nodeKind(aOperand) == NK_IDENT {
+      var aName: pchar := self.nodeSVal(aOperand);
+      var aLen: int64 := self.nodeSLen(aOperand);
+      var aSlot: int64 := self._resolveLocalSlotForAddr(aName, aLen);
+      if aSlot >= 0 {
+        var aDest: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_LOAD_LOCAL_ADDR, aDest, aSlot, -1, 0);
+        return aDest;
+      }
+      var aG: int64 := self._irGlobalIdx(aName as int64, aLen);
+      if aG >= 0 {
+        var gDest: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_LOAD_GLOBAL_ADDR, gDest, aG, -1, 0);
+        return gDest;
+      }
+      EPrintStr("error: Adresse-von `@"c);
+      var aBuf: int64 := alloc(aLen + 1);
+      var ai: int64 := 0;
+      while ai < aLen { poke8(aBuf + ai, StrCharAt(aName, ai)); ai := ai + 1; }
+      poke8(aBuf + aLen, 0);
+      EPrintStr(aBuf as pchar);
+      EPrintStrLn("`: kein Local, Parameter oder Modulvariable (#2116)."c);
+      exit(1);
+    }
+    EPrintStr("error: Adresse-von `@` nur auf einen Namen (Local, Parameter, Modulvariable) — Knotenart "c);
+    EPrintInt(self.nodeKind(aOperand));
+    EPrintStrLn(" (#2116)."c);
+    exit(1);
+    return 0 - 1;
   }
 
   // #2097/#2099: Schluessel fuer das Verzeichnis der Modulvariablen
