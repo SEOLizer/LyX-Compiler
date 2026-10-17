@@ -280,6 +280,7 @@ test: lyxc
 	@bash tests/crt_raw_test.sh
 	@bash tests/capability_io_tty_test.sh
 	@bash tests/capability_signalfd_test.sh
+	@bash tests/seccomp_sendto_test.sh
 	@bash tests/typidentitaet_test.sh
 	@bash tests/capability_runde_b_test.sh
 	@bash tests/lcbs_abdeckung_test.sh

@@ -228,6 +228,8 @@ Manifest geregelt.
 | `network.unix` | Unix Domain Sockets |
 | `network.raw` | Raw Sockets (erfordert `CAP_NET_RAW` des OS-Prozesses) |
 
+Jede dieser Capabilities (außer `network.raw`) gibt zusätzlich die Datenübertragung auf bestehenden Sockets frei: `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `setsockopt`/`getsockopt`, `getsockname`/`getpeername`, `close`. Welche Sockets entstehen dürfen, bestimmen `socket()`, `connect()` und `bind()` der jeweiligen Capability (#2120: `sendto`/`recvfrom` fehlten bis 1.2.14C bei `network.unix` und `network.tcp.bind`).
+
 #### Hardware
 
 | Capability | Argument | Gerät | Beschreibung |
