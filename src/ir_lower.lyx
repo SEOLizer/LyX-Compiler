@@ -1984,6 +1984,77 @@ pub type IRLower = class {
   // Function Call Lowering
   // ------------------------------------------------------------------
 
+  // #2103: Verdeckt eine Funktion dieses Namens den Builtin? Die eigene
+  // Unit immer (§15.4); eine importierte nur auf lyxos, wo die std-Fassungen
+  // Builtins ersetzen, die emit_lyxos nicht kennt (#1388). Dieselbe Frage wie
+  // die Zurueckstellung in lowerCall (fbAufgeschoben) — die beiden muessen
+  // uebereinstimmen.
+  fn _irVerdecktBuiltin(fname: pchar, fnlen: int64): int64 {
+    if self._eigeneUnitDefiniert(fname, fnlen) != 0 { return 1; }
+    if self._irPrivHat(fname as int64, fnlen) != 0 { return 1; }
+    if self._zielIstLyxos() != 0 { return self._istBenutzerFunktion(fname, fnlen); }
+    return 0;
+  }
+
+  // #2103: Aufruf der Nutzerfunktion fbUserIdx (aus lowerCall herausgeloest,
+  // weil er jetzt an zwei Stellen entsteht: sofort und zurueckgestellt).
+  fn _irRufNutzer(expr: int64, fbUserIdx: int64, arg0: int64, dest: int64): int64 {
+    // ARM64-FIX (nested-call-clobber): Argumente NICHT in Caller-Slots 0..N-1
+    // legen (die aliasen die eigenen Params/Locals des Callers!). Stattdessen einen
+    // reservierten hohen Slot-Block (argBase..argBase+7) nutzen, der über allen
+    // Live-Werten liegt. Sonst klobbert z.B. fib(n-1) den Slot0 (=Param n), und
+    // fib(n-2) liest n-1 → falsch. emitCall lädt aus argBase (IRO_CALL.src2).
+    var fbArgBase: int64 := self.tempCount;
+    var fbRsv: int64 := 0;
+    while fbRsv < 8 { self.allocTemp(); fbRsv := fbRsv + 1; }
+    var fbArgCnt: int64 := 0;
+    var fbArg: int64 := arg0;
+    while fbArg >= 0 {
+      var fbATemp: int64 := self.lowerExpr(fbArg);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgBase + fbArgCnt, fbATemp, -1, 0);
+      fbArgCnt += 1;
+      fbArg := self.nodeNext(fbArg);
+    }
+    // WP-MEM-05: fill trailing default params not covered by explicit args
+    // #2074: die Deklaration, die der Aufruf meint (_callDeclNi) — nicht die
+    // erste gleichnamige irgendwo im Modul.
+    var fbDefNi: int64 := self._callDeclNi(expr);
+    if fbDefNi >= 0 {
+      var fbDP: int64 := self.nodeC0(fbDefNi);
+      var fbDSkip: int64 := 0;
+      while fbDSkip < fbArgCnt && fbDP >= 0 {
+        fbDP := self.nodeNext(fbDP);
+        fbDSkip += 1;
+      }
+      while fbDP >= 0 {
+        var fbDExpr: int64 := self.nodeC1(fbDP);
+        if fbDExpr >= 0 {
+          var fbDTemp: int64 := self.lowerExpr(fbDExpr);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgBase + fbArgCnt, fbDTemp, -1, 0);
+          fbArgCnt += 1;
+        }
+        fbDP := self.nodeNext(fbDP);
+      }
+    }
+    // src2 = argBase (Slot-Basis des Arg-Blocks) für emitCall
+    // #1727: dieser Aufruf braucht die Funktion — Index vormerken. Die
+    // Markierung entscheidet spaeter, ob ihr Rumpf ueberhaupt entsteht.
+    if fbUserIdx >= 0 {
+      if fbUserIdx >= self.wantCap {
+        var nwc: int64 := self.wantCap * 2;
+        while nwc <= fbUserIdx { nwc := nwc * 2; }
+        var nwb: int64 := alloc(nwc);
+        var cpI: int64 := 0;
+        while cpI < self.wantCap { poke8(nwb + cpI, peek8(self.wantBuf + cpI)); cpI := cpI + 1; }
+        while cpI < nwc { poke8(nwb + cpI, 0); cpI := cpI + 1; }
+        self.wantBuf := nwb; self.wantCap := nwc;
+      }
+      poke8(self.wantBuf + fbUserIdx, 1);
+    }
+    self.irAddInstrDirect(IRO_CALL, dest, fbUserIdx, fbArgBase, fbArgCnt);
+    return dest;
+  }
+
   // #1388: Ist der Name im Modul als Funktion definiert? Dann hat die
   // Definition Vorrang vor jedem gleichnamigen Builtin.
   fn _istBenutzerFunktion(fname: pchar, fnlen: int64): int64 {
@@ -2605,7 +2676,7 @@ pub type IRLower = class {
     // Weg scheiterte `import std.io` auf JEDEM IR-Ziel.
     if ((self.seq(fname, fnlen, "EPrintStr", 9) || self.seq(fname, fnlen, "EPrintStrLn", 11)
          || self.seq(fname, fnlen, "EPrint", 6)) && arg0 >= 0
-        && self._istBenutzerFunktion(fname, fnlen) == 0) {
+        && self._irVerdecktBuiltin(fname, fnlen) == 0) {
       var epPtr: int64 := self.lowerExpr(arg0);
       self.irAddInstrDirect(IRO_STORE_LOCAL, 0, epPtr, -1, 0);
       var epLen: int64 := self.allocTemp();
@@ -2617,7 +2688,7 @@ pub type IRLower = class {
       }
       return dest;
     }
-    if (self.seq(fname, fnlen, "EPrintLn", 8) && self._istBenutzerFunktion(fname, fnlen) == 0) {
+    if (self.seq(fname, fnlen, "EPrintLn", 8) && self._irVerdecktBuiltin(fname, fnlen) == 0) {
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 14);
       return dest;
     }
@@ -2631,7 +2702,7 @@ pub type IRLower = class {
     // "Builtin-ID 15 wird nicht behandelt". Deshalb erst nachsehen, ob der
     // Name im Modul definiert ist; nur wenn nicht, ist es der Builtin.
     if ((self.seq(fname, fnlen, "StrLen", 6) || self.seq(fname, fnlen, "StrLength", 9))
-        && arg0 >= 0 && self._istBenutzerFunktion(fname, fnlen) == 0) {
+        && arg0 >= 0 && self._irVerdecktBuiltin(fname, fnlen) == 0) {
       var slPtr: int64 := self.lowerExpr(arg0);
       self.irAddInstrDirect(IRO_STORE_LOCAL, 0, slPtr, -1, 0);
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 15);
@@ -2723,62 +2794,40 @@ pub type IRLower = class {
       }
       fbI += 1;
     }
-    if fbUserIdx >= 0 {
-      // ARM64-FIX (nested-call-clobber): Argumente NICHT in Caller-Slots 0..N-1
-      // legen (die aliasen die eigenen Params/Locals des Callers!). Stattdessen einen
-      // reservierten hohen Slot-Block (argBase..argBase+7) nutzen, der über allen
-      // Live-Werten liegt. Sonst klobbert z.B. fib(n-1) den Slot0 (=Param n), und
-      // fib(n-2) liest n-1 → falsch. emitCall lädt aus argBase (IRO_CALL.src2).
-      var fbArgBase: int64 := self.tempCount;
-      var fbRsv: int64 := 0;
-      while fbRsv < 8 { self.allocTemp(); fbRsv := fbRsv + 1; }
-      var fbArgCnt: int64 := 0;
-      var fbArg: int64 := arg0;
-      while fbArg >= 0 {
-        var fbATemp: int64 := self.lowerExpr(fbArg);
-        self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgBase + fbArgCnt, fbATemp, -1, 0);
-        fbArgCnt += 1;
-        fbArg := self.nodeNext(fbArg);
+    // #2103: Eine Funktion einer IMPORTIERTEN Unit, deren Name ein Builtin
+    // traegt, verdeckt den Builtin nicht — dieselbe Regel wie auf x86
+    // (ebnf.md §15.4: nur die EIGENE Unit verdeckt). Bis 1.2.14C entschied
+    // hier die Reihenfolge in lowerCall: Builtin-Zweige VOR dieser Suche
+    // gewannen (sqrt), die dahinter verloren (peek8, StrLen) — auf arm64 und
+    // riscv lieferte `peek8` aus einer importierten Unit deren Fassung, auf
+    // x86 den Builtin. Jetzt wird der Aufruf einer importierten Funktion
+    // zurueckgestellt; faengt ihn kein Builtin ab, entsteht er am Ende von
+    // lowerCall (fbAufgeschoben). lyxos ausgenommen: dort ersetzen die
+    // std-Fassungen Builtins, die emit_lyxos nicht kennt (#1388).
+    //
+    // #1311 wie auf x86 (cg_builtinArity — die beiden Tabellen muessen
+    // uebereinstimmen): sieben Namen gibt es als Builtin UND als pub fn in
+    // std/ mit anderer Argumentzahl. Passt die Zahl nicht zur Builtin-Form,
+    // ist die Unit-Funktion gemeint und wird sofort gerufen.
+    var fbAufgeschoben: int64 := 0 - 1;
+    if fbUserIdx >= 0 && nlTreffer < 0 && self._zielIstLyxos() == 0
+        && self._eigeneUnitDefiniert(fname, fnlen) == 0 {
+      var fbWant: int64 := 0 - 1;
+      if self.seq(fname, fnlen, "StrSplit", 8)   { fbWant := 2; }
+      if self.seq(fname, fnlen, "StrFind", 7)    { fbWant := 2; }
+      if self.seq(fname, fnlen, "StrTrim", 7)    { fbWant := 1; }
+      if self.seq(fname, fnlen, "FloatToStr", 10) { fbWant := 1; }
+      if self.seq(fname, fnlen, "FileSize", 8)   { fbWant := 1; }
+      if self.seq(fname, fnlen, "ArgvGetStr", 10) { fbWant := 2; }
+      var fbArgc: int64 := 0;
+      var fbAn: int64 := arg0;
+      while fbAn >= 0 { fbArgc := fbArgc + 1; fbAn := self.nodeNext(fbAn); }
+      if fbWant < 0 || fbArgc == fbWant {
+        fbAufgeschoben := fbUserIdx;
+        fbUserIdx := 0 - 1;
       }
-      // WP-MEM-05: fill trailing default params not covered by explicit args
-      // #2074: die Deklaration, die der Aufruf meint (_callDeclNi) — nicht die
-      // erste gleichnamige irgendwo im Modul.
-      var fbDefNi: int64 := self._callDeclNi(expr);
-      if fbDefNi >= 0 {
-        var fbDP: int64 := self.nodeC0(fbDefNi);
-        var fbDSkip: int64 := 0;
-        while fbDSkip < fbArgCnt && fbDP >= 0 {
-          fbDP := self.nodeNext(fbDP);
-          fbDSkip += 1;
-        }
-        while fbDP >= 0 {
-          var fbDExpr: int64 := self.nodeC1(fbDP);
-          if fbDExpr >= 0 {
-            var fbDTemp: int64 := self.lowerExpr(fbDExpr);
-            self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgBase + fbArgCnt, fbDTemp, -1, 0);
-            fbArgCnt += 1;
-          }
-          fbDP := self.nodeNext(fbDP);
-        }
-      }
-      // src2 = argBase (Slot-Basis des Arg-Blocks) für emitCall
-      // #1727: dieser Aufruf braucht die Funktion — Index vormerken. Die
-      // Markierung entscheidet spaeter, ob ihr Rumpf ueberhaupt entsteht.
-      if fbUserIdx >= 0 {
-        if fbUserIdx >= self.wantCap {
-          var nwc: int64 := self.wantCap * 2;
-          while nwc <= fbUserIdx { nwc := nwc * 2; }
-          var nwb: int64 := alloc(nwc);
-          var cpI: int64 := 0;
-          while cpI < self.wantCap { poke8(nwb + cpI, peek8(self.wantBuf + cpI)); cpI := cpI + 1; }
-          while cpI < nwc { poke8(nwb + cpI, 0); cpI := cpI + 1; }
-          self.wantBuf := nwb; self.wantCap := nwc;
-        }
-        poke8(self.wantBuf + fbUserIdx, 1);
-      }
-      self.irAddInstrDirect(IRO_CALL, dest, fbUserIdx, fbArgBase, fbArgCnt);
-      return dest;
     }
+    if fbUserIdx >= 0 { return self._irRufNutzer(expr, fbUserIdx, arg0, dest); }
 
     // FFI: is fname a declared `extern fn ... link "lib"`? Such a decl is a
     // bodyless NK_FUNC_DECL (c2 == -1) carrying the packed library span in c3
@@ -5839,6 +5888,9 @@ pub type IRLower = class {
       }
       gvI += 1;
     }
+
+    // #2103: zurueckgestellter Aufruf einer importierten Funktion (s. oben).
+    if fbAufgeschoben >= 0 { return self._irRufNutzer(expr, fbAufgeschoben, arg0, dest); }
 
     // fix/lyxos-builtin-misdispatch: KEIN stiller id=1=PrintStr-Default mehr.
     // Unbekannter Name (kein User-Fn, kein FFI-Extern, kein bekannter Builtin) =
