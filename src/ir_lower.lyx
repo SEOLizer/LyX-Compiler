@@ -31,16 +31,32 @@ con GLOBAL_REC_OFF_NAMELEN: int64 := 8;
 con GLOBAL_REC_OFF_IDX:    int64 := 16;
 con GLOBAL_REC_OFF_INIT:   int64 := 24;
 
-// genFuncBuf entry (24 bytes): namePtr + nameLen + nodeIdx
-con GENFUNC_REC_SIZE:       int64 := 24;
-con GENFUNC_REC_OFF_NAMELEN: int64 := 8;
-con GENFUNC_REC_OFF_NODEIDX: int64 := 16;
+// #2125: genFuncBuf-Eintrag — eine generische Funktion samt dem Modul, in
+// dessen Knotentabelle sie steht. Ein Knotenindex gilt nur in SEINER Tabelle;
+// die Spezialisierung wird deshalb mit genau diesem Kontext gesenkt, auch wenn
+// der Aufruf aus einer anderen Unit kommt.
+con GENFUNC_REC_SIZE:        int64 := 104;
+con GENFUNC_REC_OFF_NAMELEN: int64 := 8;    // 0: Quellname (Zeiger), 8: Laenge
+con GENFUNC_REC_OFF_NODEIDX: int64 := 16;   // NK_FUNC_DECL in seiner Tabelle
+con GENFUNC_REC_OFF_SRC:     int64 := 24;
+con GENFUNC_REC_OFF_NODES:   int64 := 32;
+con GENFUNC_REC_OFF_CNT:     int64 := 40;
+con GENFUNC_REC_OFF_HEAD:    int64 := 48;   // Deklarationskette der Unit
+con GENFUNC_REC_OFF_TAG:     int64 := 56;   // irUnitTag (#2076)
+con GENFUNC_REC_OFF_TAGLEN:  int64 := 64;
+con GENFUNC_REC_OFF_BASE:    int64 := 72;   // Name wie _irFnName (privat: "unit_name")
+con GENFUNC_REC_OFF_BASELEN: int64 := 80;
+con GENFUNC_REC_OFF_PUB:     int64 := 88;
+con GENFUNC_REC_OFF_TPN:     int64 := 96;   // Anzahl Typparameter
 
-// pendingGenBuf entry (32 bytes): mangledPtr + mangledLen + genFuncNodeIdx + emitted
-con PENDING_REC_SIZE:         int64 := 32;
-con PENDING_REC_OFF_MANGLEN:  int64 := 8;
-con PENDING_REC_OFF_NODEIDX:  int64 := 16;
+// #2125: pendingGenBuf-Eintrag — eine Spezialisierung (Typargument-Kombination).
+con PENDING_REC_SIZE:         int64 := 56;
+con PENDING_REC_OFF_MANGLEN:  int64 := 8;    // 0: Name der Spezialisierung, 8: Laenge
+con PENDING_REC_OFF_GENREC:   int64 := 16;   // Index in genFuncBuf
 con PENDING_REC_OFF_EMITTED:  int64 := 24;
+con PENDING_REC_OFF_ARGS:     int64 := 32;   // Typargumente: je (Zeiger, Laenge)
+con PENDING_REC_OFF_ARGN:     int64 := 40;
+con PENDING_REC_OFF_FUNCIDX:  int64 := 48;   // Eintrag im funcBuffer
 
 // Vollständige IR-Lowering-Implementierung:
 // - AST-Node-Kind-Konstanten
@@ -321,6 +337,70 @@ pub fn _irLeseLyu(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar,
   }
   free(basen, 16);
   return 0;
+}
+
+fn _irNameGleich(a: pchar, al: int64, b: pchar, bl: int64): int64 {
+  if al != bl { return 0; }
+  var i: int64 := 0;
+  while i < al {
+    if peek8((a as int64) + i) != peek8((b as int64) + i) { return 0; }
+    i := i + 1;
+  }
+  return 1;
+}
+
+// #2127: Die eingebauten Konstanten, die sema ohne Deklaration durchlaesst
+// (_regBuiltinCon) — dieselbe Liste wie cg_addBuiltinCons im x86-Weg, die
+// beiden muessen uebereinstimmen. Bis 1.2.14C fehlte diese Herkunft im
+// IR-Weg: `mmap(0, n, PROT_RW, MAP_ANON, FD_NONE, 0)` im Programm selbst
+// uebergab drei unbeschriebene Temps. Liefert 1 und schreibt den Wert nach
+// zelle, wenn der Name eine ist; sonst 0.
+//
+// Die Werte sind die von Linux; arm64 und riscv benutzen die generischen
+// Nummern, die fuer diese Namen mit x86_64 uebereinstimmen.
+fn _irEingebauteKonst(np: pchar, nl: int64, zelle: int64, arch: int64, os: int64): int64 {
+  var w: int64 := 0;
+  var gef: int64 := 0;
+  if _irNameGleich(np, nl, "PROT_READ"c, 9) != 0     { w := 1; gef := 1; }
+  if _irNameGleich(np, nl, "PROT_WRITE"c, 10) != 0   { w := 2; gef := 1; }
+  if _irNameGleich(np, nl, "PROT_RW"c, 7) != 0       { w := 3; gef := 1; }
+  if _irNameGleich(np, nl, "PROT_NONE"c, 9) != 0     { w := 0; gef := 1; }
+  if _irNameGleich(np, nl, "MAP_SHARED"c, 10) != 0   { w := 1; gef := 1; }
+  if _irNameGleich(np, nl, "MAP_PRIVATE"c, 11) != 0  { w := 2; gef := 1; }
+  if _irNameGleich(np, nl, "MAP_ANONYMOUS"c, 13) != 0 { w := 32; gef := 1; }
+  if _irNameGleich(np, nl, "MAP_ANON"c, 8) != 0      { w := 34; gef := 1; }   // MAP_PRIVATE|MAP_ANONYMOUS
+  if _irNameGleich(np, nl, "FD_NONE"c, 7) != 0       { w := 0 - 1; gef := 1; }
+  if _irNameGleich(np, nl, "O_RDONLY"c, 8) != 0      { w := 0; gef := 1; }
+  if _irNameGleich(np, nl, "O_WRONLY"c, 8) != 0      { w := 1; gef := 1; }
+  if _irNameGleich(np, nl, "O_RDWR"c, 6) != 0        { w := 2; gef := 1; }
+  if _irNameGleich(np, nl, "O_CREAT"c, 7) != 0       { w := 64; gef := 1; }
+  if _irNameGleich(np, nl, "O_TRUNC"c, 7) != 0       { w := 512; gef := 1; }
+  if _irNameGleich(np, nl, "O_APPEND"c, 8) != 0      { w := 1024; gef := 1; }
+  // Systemkonstanten (injectCgSystemConstants in lyxc.lyx — dieselbe Liste).
+  if _irNameGleich(np, nl, "ARCH_X86_64"c, 11) != 0  { w := 1; gef := 1; }
+  if _irNameGleich(np, nl, "ARCH_ARM64"c, 10) != 0   { w := 2; gef := 1; }
+  if _irNameGleich(np, nl, "ARCH_RISCV64"c, 12) != 0 { w := 3; gef := 1; }
+  if _irNameGleich(np, nl, "ARCH_ARM_CM"c, 11) != 0  { w := 4; gef := 1; }
+  if _irNameGleich(np, nl, "OS_LINUX"c, 8) != 0      { w := 1; gef := 1; }
+  if _irNameGleich(np, nl, "OS_MACOS"c, 8) != 0      { w := 2; gef := 1; }
+  if _irNameGleich(np, nl, "OS_WINDOWS"c, 10) != 0   { w := 3; gef := 1; }
+  if _irNameGleich(np, nl, "OS_BARE"c, 7) != 0       { w := 4; gef := 1; }
+  // Die zielabhaengigen nur, wenn das Ziel bekannt ist — sonst laut (s. oben).
+  if arch != 0 && os != 0 {
+    if _irNameGleich(np, nl, "TARGET_ARCH"c, 11) != 0 { w := arch; gef := 1; }
+    if _irNameGleich(np, nl, "TARGET_OS"c, 9) != 0    { w := os; gef := 1; }
+    if _irNameGleich(np, nl, "TARGET_IS_X86_64"c, 16) != 0  { w := 0; if arch == 1 { w := 1; } gef := 1; }
+    if _irNameGleich(np, nl, "TARGET_IS_ARM64"c, 15) != 0   { w := 0; if arch == 2 { w := 1; } gef := 1; }
+    if _irNameGleich(np, nl, "TARGET_IS_RISCV64"c, 17) != 0 { w := 0; if arch == 3 { w := 1; } gef := 1; }
+    if _irNameGleich(np, nl, "TARGET_IS_ARM_CM"c, 16) != 0  { w := 0; if arch == 4 { w := 1; } gef := 1; }
+    if _irNameGleich(np, nl, "TARGET_LINUX"c, 12) != 0   { w := 0; if os == 1 { w := 1; } gef := 1; }
+    if _irNameGleich(np, nl, "TARGET_MACOS"c, 12) != 0   { w := 0; if os == 2 { w := 1; } gef := 1; }
+    if _irNameGleich(np, nl, "TARGET_WINDOWS"c, 14) != 0 { w := 0; if os == 3 { w := 1; } gef := 1; }
+    if _irNameGleich(np, nl, "TARGET_BARE"c, 11) != 0    { w := 0; if os == 4 { w := 1; } gef := 1; }
+  }
+  if gef == 0 { return 0; }
+  poke64(zelle, w);
+  return 1;
 }
 
 // #1982: Ziel-Kennung (LYX_TC_*) -> arch-Feld der .lyu (LYU_ARCH_*). Dieselbe
@@ -653,7 +733,7 @@ pub type IRLower = class {
   overrideFuncName:    pchar;   // non-null = use this name in _addFunc
   overrideFuncNameLen: int64;
   // Registry of generic function declarations seen in lowerModule pre-pass
-  // Records: {namePtr:8, nameLen:8, nodeIdx:8} = 24 bytes each
+  // (#2125: Layout siehe GENFUNC_REC_*)
   genFuncBuf:   int64;
   genFuncCount: int64;
   genFuncCap:   int64;
@@ -674,11 +754,15 @@ pub type IRLower = class {
   // damit DCE sie nicht entfernt (MMIO/Hardware-Register-Reads müssen erhalten bleiben).
   _volSlotList: int64;  // [] Slot-Nummern
   _volSlotN:    int64;  // Anzahl
-  // Queue of pending specializations to emit after the main lowering loop
-  // Records: {mangledPtr:8, mangledLen:8, genFuncNodeIdx:8, emitted:8} = 32 bytes each
+  // Queue of pending specializations (#2125: Layout siehe PENDING_REC_*)
   pendingGenBuf:   int64;
   pendingGenCount: int64;
   pendingGenCap:   int64;
+  // #2125: Typersetzung der gerade gesenkten Spezialisierung — je
+  // Typparameter (NamePtr, NameLen, ArgPtr, ArgLen, ArgKnoten) = 40 Byte.
+  // genSubstN == 0 ausserhalb einer Spezialisierung.
+  genSubstBuf: int64;
+  genSubstN:   int64;
 
   // #1727: Erreichbarkeit. Der Vorpass sammelt ohnehin ALLE transitiv
   // importierten Module in einer Arbeitsliste und wirft sie danach weg —
@@ -760,6 +844,20 @@ pub type IRLower = class {
   nmScope:     int64;
   nmScopeCnt:  int64;
   nmScopeCap:  int64;
+  // #2108: Closures und Lambdas (siehe lowerClosure).
+  // clQ*    — Warteschlange der noch zu erzeugenden Lambda-Ruempfe, je 48 B:
+  //           Knoten, Namenszeiger, Laenge, Erfassungsliste, deren Anzahl,
+  //           Knotentabelle.
+  // clCap*  — Erfassungen des Lambdas, dessen Rumpf gerade gesenkt wird
+  //           (je 24 B: Name, Laenge, Typknoten), clEnvSlot sein Umgebungsslot.
+  // clScan* — Arbeitsliste der Erfassungssuche (_clErfasst), gleiches Format.
+  // clFett* — Locals, die einen Heap-Satz {Code, Umgebung} halten: Paare
+  //           (Funktionsknoten, Slot).
+  clQBuf: int64; clQN: int64; clQCap: int64; clQKopf: int64; clLaeuft: int64;
+  clCapP: int64; clCapN: int64; clEnvSlot: int64;
+  clScanP: int64; clScanN: int64; clScanCap: int64;
+  clFettBuf: int64; clFettN: int64; clFettCap: int64;
+  clZaehler: int64; clLetzterKnoten: int64; clLetzteN: int64;
   // #2076: Die Unit, deren Deklarationen gerade gesenkt werden — ihr
   // Importname wie auf x86 (cgUnitTag), 0 fuer das Hauptmodul —, und der Kopf
   // ihrer Deklarationskette. Eine nicht-oeffentliche Funktion einer Unit
@@ -784,6 +882,17 @@ pub type IRLower = class {
   irPubConCnt:  int64;
   irPubConCap:  int64;
   irPrivCnt:    int64;
+  // #2127: Enum-Elemente aller Units (je 48 B: Element-Zeiger, -Laenge, Wert,
+  // Enum-Zeiger, -Laenge, Unit-Index in impLst). Gesammelt neben
+  // _irPubConSammle; gelesen von _irEnumFind.
+  irEnumTab:    int64;
+  irEnumCnt:    int64;
+  irEnumCap:    int64;
+  // #2127: TARGET_ARCH/TARGET_OS des Ziels (cfg_archCode/cfg_osCode in
+  // lyxc.lyx, dieselben Werte wie fuer sema und x86). 0 = nicht gesetzt —
+  // dann sind die Systemkonstanten unbekannt und scheitern laut.
+  irArchCode:   int64;
+  irOsCode:     int64;
 
   // #1693: Suchpfade fuer Importe. Die IR-Strecke hat sie bisher nicht
   // gekannt und jeden Import stur relativ zum ARBEITSVERZEICHNIS gelesen —
@@ -797,7 +906,24 @@ pub type IRLower = class {
   // Muss dieselbe Antwort geben wie sema.lyuArch — sonst findet der eine Weg
   // eine Datei, die der andere nicht findet.
   irLyuArch:     pchar;
-  
+
+  // #2123: Anfangswerte von Modulvariablen zur LAUFZEIT. Der Vorpass in
+  // lowerModule kann nur ablegen, was zur Uebersetzungszeit feststeht; alles
+  // andere (Aufruf, Zeichenkette, Ausdruck aus einer anderen Modulvariablen,
+  // f64-Rechnung, Speicher fuer Struktur/Array) blieb bis 1.2.14C still 0.
+  // Jetzt entsteht je Unit eine Funktion `__lyx_modinit_<n>` und eine
+  // Sammelfunktion `__lyx_modinit`, die sie in Abhaengigkeitsreihenfolge ruft.
+  //   irInitModus  — 0 Programm (main ruft __lyx_modinit), 1 Shared Library
+  //                  (DT_INIT_ARRAY, writeELFSharedLib), 2 --compile-unit
+  //                  (kein Aufrufer: laut abweisen)
+  //   modInitNoetig — 1, wenn irgendeine Unit einen Laufzeit-Anfangswert hat
+  //   modInitBuf   — je 16 B: Zeiger auf den Namen der Unit-Funktion, Laenge
+  irInitModus:   int64;
+  modInitNoetig: int64;
+  modInitBuf:    int64;
+  modInitN:      int64;
+  modInitCap:    int64;
+
   // ------------------------------------------------------------------
   // Initialization
   // ------------------------------------------------------------------
@@ -845,7 +971,9 @@ pub type IRLower = class {
     self.overrideFuncName    := 0;
     self.overrideFuncNameLen := 0;
     self.genFuncCap   := 16;
-    self.genFuncBuf   := alloc(16 * 24);
+    self.genFuncBuf   := alloc(16 * GENFUNC_REC_SIZE);
+    self.genSubstBuf  := 0;
+    self.genSubstN    := 0;
     self.genFuncCount := 0;
     self._importsDone := 0;
     // #1727
@@ -881,6 +1009,11 @@ pub type IRLower = class {
     self.irPrivCnt := 0;
     self.impLstName := 0;
     self.impLstNameLen := 0;
+    self.irEnumTab := 0;   // #2127
+    self.irEnumCnt := 0;
+    self.irEnumCap := 0;
+    self.irArchCode := 0;
+    self.irOsCode := 0;
     var wbI: int64 := 0;
     while wbI < self.wantCap { poke8(self.wantBuf + wbI, 0); poke8(self.doneBuf + wbI, 0); wbI := wbI + 1; }
     self._tregCap := 1024;
@@ -894,8 +1027,13 @@ pub type IRLower = class {
     self._volSlotList := alloc(256 * 8);
     self._volSlotN := 0;
     self.pendingGenCap   := 16;
-    self.pendingGenBuf   := alloc(16 * 32);
+    self.pendingGenBuf   := alloc(16 * PENDING_REC_SIZE);
     self.pendingGenCount := 0;
+    self.irInitModus := 0;     // #2123
+    self.modInitNoetig := 0;
+    self.modInitCap := 16;
+    self.modInitBuf := alloc(self.modInitCap * 16);
+    self.modInitN := 0;
   }
   
   // Helper function to call IRModule methods via vtable
@@ -1431,6 +1569,9 @@ pub type IRLower = class {
           }
           pnode := self.nodeNext(pnode);
         }
+        // #2108: im Rumpf eines Lambdas eine Erfassung — nach Locals und
+        // Parametern des Lambdas (die verdecken sie), vor allem Modulweiten.
+        if self._clCapLaden(idName, idLen, dest) != 0 { return dest; }
         // #2019: String-Konstante der Modulebene → ADRESSE der Zeichenkette.
         //
         // Vor der Global-Suche: fuer denselben Namen steht dort ein Eintrag
@@ -1459,6 +1600,25 @@ pub type IRLower = class {
           self.irAddInstrDirect(IRO_LOAD_GLOBAL, dest, gnIdx, -1, 0);
           return dest;
         }
+        // #2127: Enum-Element ohne Typpraefix (`Rot`, `tkEof`). Auf x86 steht
+        // es als Konstante in conTable (cg_genFile, CGN_ENUM_DECL) — gleiche
+        // Stelle in der Reihenfolge: nach den Modulvariablen.
+        var enIdx: int64 := self._irEnumFind(0, 0, idPtrL, idLen);
+        if enIdx >= 0 {
+          self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, peek64(self.irEnumTab + enIdx * 48 + 16));
+          return dest;
+        }
+        // #2127: eingebaute Konstante (PROT_RW, MAP_ANON, FD_NONE, O_*, TARGET_*), die
+        // kein Modul deklariert — auf x86 ebenfalls in conTable
+        // (cg_addBuiltinCons). Eine gleichnamige eigene Konstante hat oben
+        // schon gewonnen, wie dort, wo cg_addCon den Eintrag ersetzt.
+        var ekZ: int64 := alloc(8);
+        if _irEingebauteKonst(idName, idLen, ekZ, self.irArchCode, self.irOsCode) != 0 {
+          self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, peek64(ekZ));
+          free(ekZ, 8);
+          return dest;
+        }
+        free(ekZ, 8);
         // WP-A1: kein Local/Param/Global → Funktions-NAME als Wert? → Funktions-Adresse laden
         // (fn-ptr-Zuweisung, z.B. `b.on_click := h`). Vorher: uninitialisierter Temp (Garbage).
         // #2076: auch hier die private Funktion der eigenen Unit.
@@ -1467,6 +1627,17 @@ pub type IRLower = class {
         var faFn: int64 := self._findFuncByName(faP as pchar, peek64(faLc));
         free(faLc, 8);
         if faFn >= 0 { self.irAddInstrDirect(IRO_FUNC_ADDR, dest, faFn, -1, 0); return dest; }
+        // #2127: Keine Herkunft. Bis 1.2.14C kam hier still der
+        // unbeschriebene Temp zurueck — derselbe stille Default wie auf x86
+        // bis #2113 (cg_identUnaufgeloest). Gewollter Durchfall wie dort:
+        // ein Name, dessen WERT nicht benutzt wird, weil er nur die Basis
+        // eines Zugriffs ist (Typ-/Klassenname, Enum-Name).
+        if self._identOhneWertErlaubt(idName, idLen) == 0 {
+          EPrintStr("error: IR: Bezeichner '"c);
+          sys_write(2, idName, idLen);
+          EPrintStrLn("' als Wert hat keine bekannte Herkunft (Local/Param/Global/Konstante/Enum-Element/Funktion) (#2127)"c);
+          exit(1);
+        }
       }
       return dest;
     }
@@ -1558,6 +1729,11 @@ pub type IRLower = class {
       return self._lowerArrayLit(expr);
     }
 
+    // #2108: Lambda `fn(params): R { ... }` — Codeadresse oder Satz {Code, Umgebung}.
+    if (k == NK_CLOSURE) {
+      return self.lowerClosure(expr);
+    }
+
     // #2092: Hier stand ein stiller Default — jede Ausdrucksart ohne eigenen
     // Zweig bekam einen UNBESCHRIEBENEN Temp, sein Inhalt war, was zuletzt in
     // dem Slot stand. So lief NK_ARRAY_LIT bis #2080 (Absturz auf arm64,
@@ -1566,15 +1742,12 @@ pub type IRLower = class {
     // Gemessen vor dem Scharfschalten: der ganze Bestand (std/, src/std/,
     // examples/, tests/; 1720 Dateien) fuer arm64 und lyxos uebersetzt. Den
     // Default erreichte genau eine Knotenart, NK_CLOSURE in
-    // tests/wp02_closures.lyx — der IR-Weg kennt Closures nicht (#2108), und
-    // das Programm stuerzte dort ab. Jetzt wird laut abgebrochen, wie die
+    // tests/wp02_closures.lyx — der IR-Weg kannte Closures nicht (#2108,
+    // seither umgesetzt: lowerClosure). Jetzt wird laut abgebrochen, wie die
     // Backends es bei unbekannten Opcodes tun (#1339).
     EPrintStr("error: IR-Weg kennt den Ausdruck nicht (Knotenart "c);
     EPrintInt(k);
     EPrintStrLn(")"c);
-    if (k == NK_CLOSURE) {
-      EPrintStrLn("  Closures und Lambdas sind im IR-Weg (arm64/riscv/lyxos) nicht umgesetzt (#2108)."c);
-    }
     exit(1);
     return 0 - 1;
   }
@@ -1984,6 +2157,77 @@ pub type IRLower = class {
   // Function Call Lowering
   // ------------------------------------------------------------------
 
+  // #2103: Verdeckt eine Funktion dieses Namens den Builtin? Die eigene
+  // Unit immer (§15.4); eine importierte nur auf lyxos, wo die std-Fassungen
+  // Builtins ersetzen, die emit_lyxos nicht kennt (#1388). Dieselbe Frage wie
+  // die Zurueckstellung in lowerCall (fbAufgeschoben) — die beiden muessen
+  // uebereinstimmen.
+  fn _irVerdecktBuiltin(fname: pchar, fnlen: int64): int64 {
+    if self._eigeneUnitDefiniert(fname, fnlen) != 0 { return 1; }
+    if self._irPrivHat(fname as int64, fnlen) != 0 { return 1; }
+    if self._zielIstLyxos() != 0 { return self._istBenutzerFunktion(fname, fnlen); }
+    return 0;
+  }
+
+  // #2103: Aufruf der Nutzerfunktion fbUserIdx (aus lowerCall herausgeloest,
+  // weil er jetzt an zwei Stellen entsteht: sofort und zurueckgestellt).
+  fn _irRufNutzer(expr: int64, fbUserIdx: int64, arg0: int64, dest: int64): int64 {
+    // ARM64-FIX (nested-call-clobber): Argumente NICHT in Caller-Slots 0..N-1
+    // legen (die aliasen die eigenen Params/Locals des Callers!). Stattdessen einen
+    // reservierten hohen Slot-Block (argBase..argBase+7) nutzen, der über allen
+    // Live-Werten liegt. Sonst klobbert z.B. fib(n-1) den Slot0 (=Param n), und
+    // fib(n-2) liest n-1 → falsch. emitCall lädt aus argBase (IRO_CALL.src2).
+    var fbArgBase: int64 := self.tempCount;
+    var fbRsv: int64 := 0;
+    while fbRsv < 8 { self.allocTemp(); fbRsv := fbRsv + 1; }
+    var fbArgCnt: int64 := 0;
+    var fbArg: int64 := arg0;
+    while fbArg >= 0 {
+      var fbATemp: int64 := self.lowerExpr(fbArg);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgBase + fbArgCnt, fbATemp, -1, 0);
+      fbArgCnt += 1;
+      fbArg := self.nodeNext(fbArg);
+    }
+    // WP-MEM-05: fill trailing default params not covered by explicit args
+    // #2074: die Deklaration, die der Aufruf meint (_callDeclNi) — nicht die
+    // erste gleichnamige irgendwo im Modul.
+    var fbDefNi: int64 := self._callDeclNi(expr);
+    if fbDefNi >= 0 {
+      var fbDP: int64 := self.nodeC0(fbDefNi);
+      var fbDSkip: int64 := 0;
+      while fbDSkip < fbArgCnt && fbDP >= 0 {
+        fbDP := self.nodeNext(fbDP);
+        fbDSkip += 1;
+      }
+      while fbDP >= 0 {
+        var fbDExpr: int64 := self.nodeC1(fbDP);
+        if fbDExpr >= 0 {
+          var fbDTemp: int64 := self.lowerExpr(fbDExpr);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgBase + fbArgCnt, fbDTemp, -1, 0);
+          fbArgCnt += 1;
+        }
+        fbDP := self.nodeNext(fbDP);
+      }
+    }
+    // src2 = argBase (Slot-Basis des Arg-Blocks) für emitCall
+    // #1727: dieser Aufruf braucht die Funktion — Index vormerken. Die
+    // Markierung entscheidet spaeter, ob ihr Rumpf ueberhaupt entsteht.
+    if fbUserIdx >= 0 {
+      if fbUserIdx >= self.wantCap {
+        var nwc: int64 := self.wantCap * 2;
+        while nwc <= fbUserIdx { nwc := nwc * 2; }
+        var nwb: int64 := alloc(nwc);
+        var cpI: int64 := 0;
+        while cpI < self.wantCap { poke8(nwb + cpI, peek8(self.wantBuf + cpI)); cpI := cpI + 1; }
+        while cpI < nwc { poke8(nwb + cpI, 0); cpI := cpI + 1; }
+        self.wantBuf := nwb; self.wantCap := nwc;
+      }
+      poke8(self.wantBuf + fbUserIdx, 1);
+    }
+    self.irAddInstrDirect(IRO_CALL, dest, fbUserIdx, fbArgBase, fbArgCnt);
+    return dest;
+  }
+
   // #1388: Ist der Name im Modul als Funktion definiert? Dann hat die
   // Definition Vorrang vor jedem gleichnamigen Builtin.
   fn _istBenutzerFunktion(fname: pchar, fnlen: int64): int64 {
@@ -2013,9 +2257,20 @@ pub type IRLower = class {
   }
 
   fn lowerCall(expr: int64): int64 {
-    // WP-2.1: generic calls (iVal=2) go through the monomorphization path
+    self._clArgsPruefen(expr);   // #2108/#1249: einfangendes Lambda als Argument
+    // #2125: Generischer Aufruf `f<T…>(…)` (iVal 2). Die Spezialisierung wird
+    // hier angefordert und unter ihrem eigenen Namen registriert; der Aufruf
+    // selbst laeuft dann ueber den gewoehnlichen Weg weiter unten (Argument-
+    // block, Vorgabewerte, Erreichbarkeit) — mit dem Namen der Spezialisierung.
+    // Bis 1.2.14C hatte er einen eigenen Zweig, der die Argumente in Slot 0..N
+    // legte (#1388) und als Funktionsindex den STRING-Offset des Namens trug.
+    var genMangP: int64 := 0;
+    var genMangL: int64 := 0;
     if (self.nodeIVal(expr) == 2) {
-      return self.lowerGenericCall(expr);
+      var genLc: int64 := alloc(8);
+      genMangP := self._genInstanz(expr, genLc);
+      genMangL := peek64(genLc);
+      free(genLc, 8);
     }
     // #1841: `super.M(args)` — der Parser baut daraus einen NK_CALL mit der
     // Marke 3 und OHNE Empfaengerknoten (parser.lyx, #1091): der Name steht in
@@ -2353,6 +2608,7 @@ pub type IRLower = class {
     var fname: pchar := self.nodeSVal(expr);
     var fnlen: int64 := self.nodeSLen(expr);
     var arg0: int64 := self.nodeC0(expr);
+    if genMangP != 0 { fname := genMangP as pchar; fnlen := genMangL; }   // #2125
 
     // WP-AND-upstream-fix: _indirect_call_N(fnPtr, ...args) — N in 0..4.
     // First user-syntax argument is the function pointer; remaining N are
@@ -2605,7 +2861,7 @@ pub type IRLower = class {
     // Weg scheiterte `import std.io` auf JEDEM IR-Ziel.
     if ((self.seq(fname, fnlen, "EPrintStr", 9) || self.seq(fname, fnlen, "EPrintStrLn", 11)
          || self.seq(fname, fnlen, "EPrint", 6)) && arg0 >= 0
-        && self._istBenutzerFunktion(fname, fnlen) == 0) {
+        && self._irVerdecktBuiltin(fname, fnlen) == 0) {
       var epPtr: int64 := self.lowerExpr(arg0);
       self.irAddInstrDirect(IRO_STORE_LOCAL, 0, epPtr, -1, 0);
       var epLen: int64 := self.allocTemp();
@@ -2617,7 +2873,7 @@ pub type IRLower = class {
       }
       return dest;
     }
-    if (self.seq(fname, fnlen, "EPrintLn", 8) && self._istBenutzerFunktion(fname, fnlen) == 0) {
+    if (self.seq(fname, fnlen, "EPrintLn", 8) && self._irVerdecktBuiltin(fname, fnlen) == 0) {
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 14);
       return dest;
     }
@@ -2631,7 +2887,7 @@ pub type IRLower = class {
     // "Builtin-ID 15 wird nicht behandelt". Deshalb erst nachsehen, ob der
     // Name im Modul definiert ist; nur wenn nicht, ist es der Builtin.
     if ((self.seq(fname, fnlen, "StrLen", 6) || self.seq(fname, fnlen, "StrLength", 9))
-        && arg0 >= 0 && self._istBenutzerFunktion(fname, fnlen) == 0) {
+        && arg0 >= 0 && self._irVerdecktBuiltin(fname, fnlen) == 0) {
       var slPtr: int64 := self.lowerExpr(arg0);
       self.irAddInstrDirect(IRO_STORE_LOCAL, 0, slPtr, -1, 0);
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 15);
@@ -2723,62 +2979,41 @@ pub type IRLower = class {
       }
       fbI += 1;
     }
-    if fbUserIdx >= 0 {
-      // ARM64-FIX (nested-call-clobber): Argumente NICHT in Caller-Slots 0..N-1
-      // legen (die aliasen die eigenen Params/Locals des Callers!). Stattdessen einen
-      // reservierten hohen Slot-Block (argBase..argBase+7) nutzen, der über allen
-      // Live-Werten liegt. Sonst klobbert z.B. fib(n-1) den Slot0 (=Param n), und
-      // fib(n-2) liest n-1 → falsch. emitCall lädt aus argBase (IRO_CALL.src2).
-      var fbArgBase: int64 := self.tempCount;
-      var fbRsv: int64 := 0;
-      while fbRsv < 8 { self.allocTemp(); fbRsv := fbRsv + 1; }
-      var fbArgCnt: int64 := 0;
-      var fbArg: int64 := arg0;
-      while fbArg >= 0 {
-        var fbATemp: int64 := self.lowerExpr(fbArg);
-        self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgBase + fbArgCnt, fbATemp, -1, 0);
-        fbArgCnt += 1;
-        fbArg := self.nodeNext(fbArg);
+    // #2103: Eine Funktion einer IMPORTIERTEN Unit, deren Name ein Builtin
+    // traegt, verdeckt den Builtin nicht — dieselbe Regel wie auf x86
+    // (ebnf.md §15.4: nur die EIGENE Unit verdeckt). Bis 1.2.14C entschied
+    // hier die Reihenfolge in lowerCall: Builtin-Zweige VOR dieser Suche
+    // gewannen (sqrt), die dahinter verloren (peek8, StrLen) — auf arm64 und
+    // riscv lieferte `peek8` aus einer importierten Unit deren Fassung, auf
+    // x86 den Builtin. Jetzt wird der Aufruf einer importierten Funktion
+    // zurueckgestellt; faengt ihn kein Builtin ab, entsteht er am Ende von
+    // lowerCall (fbAufgeschoben). lyxos ausgenommen: dort ersetzen die
+    // std-Fassungen Builtins, die emit_lyxos nicht kennt (#1388).
+    //
+    // #1311 wie auf x86 (cg_builtinArity — die beiden Tabellen muessen
+    // uebereinstimmen): sieben Namen gibt es als Builtin UND als pub fn in
+    // std/ mit anderer Argumentzahl. Passt die Zahl nicht zur Builtin-Form,
+    // ist die Unit-Funktion gemeint und wird sofort gerufen.
+    // StrSplit fehlt hier: einen StrSplit-Builtin hat der IR-Weg nicht, die
+    // Unit-Funktion gewinnt dort ohnehin (tests/builtin-drift-allow.txt).
+    var fbAufgeschoben: int64 := 0 - 1;
+    if fbUserIdx >= 0 && nlTreffer < 0 && self._zielIstLyxos() == 0
+        && self._eigeneUnitDefiniert(fname, fnlen) == 0 {
+      var fbWant: int64 := 0 - 1;
+      if self.seq(fname, fnlen, "StrFind", 7)    { fbWant := 2; }
+      if self.seq(fname, fnlen, "StrTrim", 7)    { fbWant := 1; }
+      if self.seq(fname, fnlen, "FloatToStr", 10) { fbWant := 1; }
+      if self.seq(fname, fnlen, "FileSize", 8)   { fbWant := 1; }
+      if self.seq(fname, fnlen, "ArgvGetStr", 10) { fbWant := 2; }
+      var fbArgc: int64 := 0;
+      var fbAn: int64 := arg0;
+      while fbAn >= 0 { fbArgc := fbArgc + 1; fbAn := self.nodeNext(fbAn); }
+      if fbWant < 0 || fbArgc == fbWant {
+        fbAufgeschoben := fbUserIdx;
+        fbUserIdx := 0 - 1;
       }
-      // WP-MEM-05: fill trailing default params not covered by explicit args
-      // #2074: die Deklaration, die der Aufruf meint (_callDeclNi) — nicht die
-      // erste gleichnamige irgendwo im Modul.
-      var fbDefNi: int64 := self._callDeclNi(expr);
-      if fbDefNi >= 0 {
-        var fbDP: int64 := self.nodeC0(fbDefNi);
-        var fbDSkip: int64 := 0;
-        while fbDSkip < fbArgCnt && fbDP >= 0 {
-          fbDP := self.nodeNext(fbDP);
-          fbDSkip += 1;
-        }
-        while fbDP >= 0 {
-          var fbDExpr: int64 := self.nodeC1(fbDP);
-          if fbDExpr >= 0 {
-            var fbDTemp: int64 := self.lowerExpr(fbDExpr);
-            self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgBase + fbArgCnt, fbDTemp, -1, 0);
-            fbArgCnt += 1;
-          }
-          fbDP := self.nodeNext(fbDP);
-        }
-      }
-      // src2 = argBase (Slot-Basis des Arg-Blocks) für emitCall
-      // #1727: dieser Aufruf braucht die Funktion — Index vormerken. Die
-      // Markierung entscheidet spaeter, ob ihr Rumpf ueberhaupt entsteht.
-      if fbUserIdx >= 0 {
-        if fbUserIdx >= self.wantCap {
-          var nwc: int64 := self.wantCap * 2;
-          while nwc <= fbUserIdx { nwc := nwc * 2; }
-          var nwb: int64 := alloc(nwc);
-          var cpI: int64 := 0;
-          while cpI < self.wantCap { poke8(nwb + cpI, peek8(self.wantBuf + cpI)); cpI := cpI + 1; }
-          while cpI < nwc { poke8(nwb + cpI, 0); cpI := cpI + 1; }
-          self.wantBuf := nwb; self.wantCap := nwc;
-        }
-        poke8(self.wantBuf + fbUserIdx, 1);
-      }
-      self.irAddInstrDirect(IRO_CALL, dest, fbUserIdx, fbArgBase, fbArgCnt);
-      return dest;
     }
+    if fbUserIdx >= 0 { return self._irRufNutzer(expr, fbUserIdx, arg0, dest); }
 
     // FFI: is fname a declared `extern fn ... link "lib"`? Such a decl is a
     // bodyless NK_FUNC_DECL (c2 == -1) carrying the packed library span in c3
@@ -5772,6 +6007,9 @@ pub type IRLower = class {
     // fn-Adresse zuerst laden (vor Arg-Stores in slots 0..N-1, die f's Slot überschreiben könnten).
     var lfSlot: int64 := self._findLocalSlot(fname, fnlen);
     if lfSlot >= 0 {
+      // #2108: haelt das Local einen Satz {Code, Umgebung}, dann mit Umgebung.
+      var lfCl: int64 := self._clRuf(lfSlot, arg0, dest);
+      if lfCl >= 0 { return lfCl; }
       var lfFn: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_LOAD_LOCAL, lfFn, lfSlot, -1, 0);
       var lfArg: int64 := arg0; var lfI: int64 := 0;
@@ -5839,6 +6077,9 @@ pub type IRLower = class {
       }
       gvI += 1;
     }
+
+    // #2103: zurueckgestellter Aufruf einer importierten Funktion (s. oben).
+    if fbAufgeschoben >= 0 { return self._irRufNutzer(expr, fbAufgeschoben, arg0, dest); }
 
     // fix/lyxos-builtin-misdispatch: KEIN stiller id=1=PrintStr-Default mehr.
     // Unbekannter Name (kein User-Fn, kein FFI-Extern, kein bekannter Builtin) =
@@ -6062,7 +6303,7 @@ pub type IRLower = class {
         var m: int64 := 1;
         var j: int64 := 0;
         while j < idl { if m != 0 { if peek8(nptr + j) != peek8(idPtrL + j) { m := 0; } } j := j + 1; }
-        if m != 0 { return peek64(self.localTypeBuf + li * 8); }
+        if m != 0 { return self._genSubst(peek64(self.localTypeBuf + li * 8)); }   // #2125
       }
       li -= 1;
     }
@@ -6076,12 +6317,18 @@ pub type IRLower = class {
             var pm: int64 := 1;
             var pj: int64 := 0;
             while pj < idl { if pm != 0 { if peek8(pptr + pj) != peek8(idPtrL + pj) { pm := 0; } } pj := pj + 1; }
-            if pm != 0 { return self.nodeC0(pn); }
+            if pm != 0 { return self._genSubst(self.nodeC0(pn)); }   // #2125: `a: T`
           }
         }
         pn := self.nodeNext(pn);
       }
     }
+    // #2108: im Rumpf eines Lambdas die Erfassungen — ihr Typ ist der, den
+    // der Name an der Erzeugungsstelle hatte. Vierte Speicherart neben Local,
+    // Parameter und Modulvariable; _findLocalSlot kennt sie nicht, weil eine
+    // Erfassung keinen Slot hat (Lesen/Schreiben: _clCapLaden/_clCapSpeichern).
+    var cti: int64 := self._clCapIdx(idp, idl);
+    if cti >= 0 { return peek64(self.clCapP + cti * 24 + 16); }
     // #1812: zuletzt die MODULVARIABLEN. Locals und Parameter standen hier
     // schon; die dritte Speicherart fehlte — und damit hatte `g_obj` keinen
     // Typ, der Feld-Offset war unaufloesbar und `g_obj.feld` lieferte Muell.
@@ -6628,6 +6875,18 @@ pub type IRLower = class {
         }
         ti += 1;
       }
+      // #2127: `Farbe.Rot` — Element eines Enums, zur Uebersetzungszeit
+      // bekannt (x86: cg_enumFeldWert/cg_findEnumVariant). Bis 1.2.14C fiel es
+      // in den Instanzzugriff darunter, fand kein Feld und gab den
+      // unbeschriebenen Temp zurueck. Ein gleichnamiges Local verdeckt den
+      // Enum-Namen.
+      if self._findLocalSlot(bSVal, bSLen) < 0 {
+        var efIdx: int64 := self._irEnumFind(bSVal as int64, bSLen, fSVal as int64, fSLen);
+        if efIdx >= 0 {
+          self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, peek64(self.irEnumTab + efIdx * 48 + 16));
+          return dest;
+        }
+      }
     }
 
     // ARM64-OOP: Instanz-Feldzugriff p.x — base = Objekt-Pointer, Offset aus p's Typ.
@@ -6635,6 +6894,13 @@ pub type IRLower = class {
     var ifOff: int64 := self._instanceFieldOffset(baseNode, self.nodeSVal(expr), self.nodeSLen(expr));
     if ifOff >= 0 {
       self.irAddInstrDirect(IRO_LOAD_FIELD, dest, base, ifOff, 0);
+    } else if self.genSubstN > 0 {
+      // #2125: In einer Spezialisierung bleibt ein Typparameter nur dann
+      // stehen, wenn die Unit der generischen Funktion das Typargument nicht
+      // kennt (Klasse aus der rufenden Unit). Das Feld waere dann still 0 —
+      // wie auf x86, wo der Rumpf typgeloescht ist.
+      self._genFehler("Feld ueber einen Typparameter nicht aufloesbar (Klasse aus einer anderen Unit?): "c,
+                      self.nodeSVal(expr), self.nodeSLen(expr));
     }
     return dest;
   }
@@ -6990,7 +7256,12 @@ pub type IRLower = class {
     // Allocate a slot, lower the init expression, store into the slot, and
     // record name->slot in localNameBuf so subsequent NK_IDENT lookups can
     // find it. Inline (no helper method) for vtable stability.
-    else if (k == NK_VAR_DECL) {
+    // #2127: `con` im Funktionsrumpf genauso — x86 legt sie ebenfalls als
+    // Local an (cg_genStmt, CGN_VAR_DECL || CGN_CON_DECL), der Aufbau ist
+    // derselbe (Typ c0, Wert c1). Bis 1.2.14C fiel NK_CON_DECL hier durch die
+    // ganze Kette und wurde still verworfen; jeder Lesezugriff ergab den
+    // unbeschriebenen Temp (`con PI := 314159` → 0 auf arm64/riscv).
+    else if (k == NK_VAR_DECL || k == NK_CON_DECL) {
       var vdSlot: int64 := self.allocTemp();
       // WP-VOLATILE: @volatile-Local (Parser-Flag VAR_FLAG_VOLATILE=1) → Slot vormerken,
       // damit dessen LOAD_LOCAL nicht von DCE eliminiert wird (MMIO/Hardware-Register).
@@ -7050,6 +7321,7 @@ pub type IRLower = class {
       }
       // Register name -> slot (Typ-Node nodeC0, -1 wenn keiner).
       self._regLocal(peek64(self.nodeOff(stmt) + NODE_OFF_SVAL), self.nodeSLen(stmt), vdSlot, self.nodeC0(stmt));
+      self._clVarMerken(stmt, vdSlot);   // #2108: Satz oder duenner Zeiger?
     }
     // #2020: eine verschachtelte `fn` als Anweisung. Hier entsteht NICHTS —
     // ihr Rumpf wird nach der umgebenden Funktion erzeugt (sonst laege er
@@ -7739,6 +8011,8 @@ pub type IRLower = class {
           }
           if slot >= 0 {
             self.irAddInstrDirect(IRO_STORE_LOCAL, slot, valTemp, -1, 0);
+          } else if self._clCapSpeichern(idName, idLen, valTemp) != 0 {
+            // #2108: Erfassung eines Lambdas — in dessen Umgebung geschrieben.
           } else {
             // ARM64-FIX: kein local/param → global suchen (globalNameBuf) und
             // IRO_STORE_GLOBAL(gIdx, value) emittieren. Sonst war `g := x` für
@@ -7786,6 +8060,11 @@ pub type IRLower = class {
           self.irAddInstrDirect(IRO_STORE_FIELD, afOff, afFat, afBase, 0);
         } else if (afOff >= 0) {
           self.irAddInstrDirect(IRO_STORE_FIELD, afOff, valTemp, afBase, 0);
+        } else if (self.genSubstN > 0) {
+          // #2125: dieselbe Pruefung wie beim Lesen in lowerField — die
+          // beiden muessen uebereinstimmen. Sonst entfiele die Zuweisung still.
+          self._genFehler("Feld ueber einen Typparameter nicht aufloesbar (Klasse aus einer anderen Unit?): "c,
+                          self.nodeSVal(target), self.nodeSLen(target));
         }
       }
       // Target is INDEX — store to array element. ARM64-FIX: war Stub.
@@ -8048,6 +8327,15 @@ pub type IRLower = class {
 
     self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
 
+    // #2123: `main` des Hauptmoduls ruft als Erstes die Anfangswerte aller
+    // Units (__lyx_modinit). Nur dort: eine gleichnamige Funktion eines
+    // Imports (irUnitTag), eine Methode oder eine erzeugte Funktion
+    // (overrideFuncName) ist kein Einstiegspunkt.
+    if self.modInitNoetig != 0 && self.irInitModus == 0 && self.irUnitTag == 0
+       && (self.overrideFuncName as int64) == 0 && self.methodParamBase == 0 {
+      if self.seq(self.nodeSVal(funcNode), self.nodeSLen(funcNode), "main", 4) { self._modInitRuf(); }
+    }
+
     var body: int64 := self.nodeC2(funcNode);
     if (body >= 0) { self.lowerBlock(body); }
 
@@ -8062,6 +8350,7 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
     }
     self._addFunc();
+    self._clAbarbeiten();   // #2108: Lambda-Ruempfe dieser Funktion
   }
    
   // ------------------------------------------------------------------
@@ -8130,6 +8419,12 @@ pub type IRLower = class {
           // eingesammelt; erzeugt wird er unten, nach der aeusseren Funktion.
           // #2074: mit der Gueltigkeit von sema (Bloecke, Verdeckung).
           self._nmPlanFunc(pfCur, pfNamePtr as int64, pfNameLen, 0);
+          // #2125: Generische Funktion (`fn f<T>`, Typparameter in c3) —
+          // zusaetzlich im Generika-Verzeichnis, damit `f<int64>(…)` eine
+          // Spezialisierung bekommt. Bis 1.2.14C wartete das Verzeichnis auf
+          // NK_GENERIC_DECL, eine Knotenart, die der Parser nie erzeugt: es
+          // blieb leer, und der Aufruf zielte auf eine Funktion ohne Rumpf.
+          self._genRegistriere(pfCur, pfNamePtr as int64, pfNameLen);
         }
       } else if pfKind == NK_TYPE_DECL {
         // ARM64-OOP: Methoden (c1-Chain) unter mangled Namen "Class_method" registrieren.
@@ -8150,22 +8445,6 @@ pub type IRLower = class {
           }
           pmM := self.nodeNext(pmM);
         }
-      } else if pfKind == NK_GENERIC_DECL {
-        // WP-2.1: register generic declarations in genFuncBuf, NOT funcBuffer.
-        // They are not emitted directly — only their specializations are.
-        if (self.genFuncCount >= self.genFuncCap) {
-          var gfc: int64 := self.genFuncCap * 2;
-          var gfb: int64 := alloc(gfc * 24);
-          var gfi: int64 := 0;
-          memcpy(gfb, self.genFuncBuf, self.genFuncCount * 24);
-          free(self.genFuncBuf, self.genFuncCap * 24);
-          self.genFuncBuf := gfb; self.genFuncCap := gfc;
-        }
-        var gfRec: int64 := self.genFuncBuf + self.genFuncCount * 24;
-        poke64(gfRec,      self.nodeSVal(pfCur) as int64);
-        poke64(gfRec + GENFUNC_REC_OFF_NAMELEN,  self.nodeSLen(pfCur));
-        poke64(gfRec + GENFUNC_REC_OFF_NODEIDX, pfCur);
-        self.genFuncCount += 1;
       }
       pfCur := self.nodeNext(pfCur);
     }
@@ -8351,6 +8630,32 @@ pub type IRLower = class {
       self.impLstName := wlName; self.impLstNameLen := wlNameL;   // #2076
       self.impLstN   := wlW;
       self._irPubConSammle();   // #2107
+      self._irEnumSammle();     // #2127: nach den Konstanten — ein Elementwert darf eine nennen
+      // #2123: Braucht IRGENDEINE Unit einen Anfangswert zur Laufzeit? Das
+      // muss feststehen, bevor `main` entsteht — main ruft dann __lyx_modinit,
+      // dessen Rumpf erst ganz am Ende gebaut wird (deshalb hier schon
+      // registriert, wie jede Vorwaertsreferenz). Ohne Bedarf entsteht weder
+      // die Funktion noch der Aufruf: das Erzeugnis bleibt Byte fuer Byte,
+      // wie es war.
+      var miSvSrc: pchar := self.src; var miSvNodes: int64 := self.nodes; var miSvCnt: int64 := self.nodeCount;
+      var miU: int64 := 0;
+      while miU < self.impLstN {
+        self.src := peek64(self.impLstSrc + miU * 8) as pchar;
+        self.nodes := peek64(self.impLstNodes + miU * 8);
+        self.nodeCount := peek64(self.impLstCnt + miU * 8);
+        var miD: int64 := peek64(self.impLstHead + miU * 8);
+        while miD >= 0 {
+          if self._modVarLaufzeit(miD) != 0 { self.modInitNoetig := 1; }
+          miD := self.nodeNext(miD);
+        }
+        miU := miU + 1;
+      }
+      self.src := miSvSrc; self.nodes := miSvNodes; self.nodeCount := miSvCnt;
+      if self.modInitNoetig != 0 && self.irInitModus != 2 {
+        var miNm: pchar := "__lyx_modinit";
+        var miOff: int64 := self.irAddString(miNm, 13);
+        self.irAddFunc(miOff, 13, 0, 0);
+      }
     }
 
     // #2107: Der Vorpass fuer Modulvariablen und Konstanten steht HINTER dem
@@ -8689,8 +8994,6 @@ pub type IRLower = class {
           }
           mtM := self.nodeNext(mtM);
         }
-      } else if (kind == NK_GENERIC_DECL) {
-        // WP-2.1: generic declarations are emitted only as specializations (see below)
       } else if (kind == NK_IMPORT) {
         // WP-AND-upstream-fix v3: actually lower imported function bodies.
         // Sema's _sema_processImport reads + parses imports but disposes the
@@ -8833,6 +9136,14 @@ pub type IRLower = class {
     }
     self.nestCnt := nsBase;
 
+    // #2123: die Anfangswerte DIESER Unit. Hier, am Ende ihres eigenen
+    // Durchgangs, sind alle ihre Importe schon fertig (der Rumpfdurchgang
+    // oben steigt fuer jeden NK_IMPORT in lowerModule ab) — die Reihenfolge
+    // der Eintraege in modInitBuf ist damit "Importe vor dem Importeur".
+    // VOR dem Nachlauf: ruft ein Anfangswert eine importierte Funktion, ist
+    // sie damit vorgemerkt, und der Nachlauf erzeugt ihren Rumpf.
+    if self._imNachlauf == 0 { self._modInitEinheit(decls); }
+
     // #1727: Nachlauf. Bis hierher ist jeder Import genau einmal durchlaufen
     // worden — in Quelltextreihenfolge. Ruft eine importierte Funktion etwas
     // in einem Modul, das VORHER abgearbeitet wurde, kam die Markierung zu
@@ -8842,6 +9153,11 @@ pub type IRLower = class {
     // vollstaendiger Durchgang nichts Neues mehr erzeugt. Gelesen und
     // geparst wird dabei NICHTS: die Liste haelt Quelltext, Knoten und Kopf
     // jedes Moduls aus dem Vorpass fest. Genau dafuer wird sie behalten.
+    // #2125: Spezialisierungen VOR dem Nachlauf erzeugen. Ihr Rumpf darf
+    // Funktionen einer importierten Unit rufen, die sonst niemand braucht —
+    // die Markierung dafuer entsteht erst beim Senken, und nur der Nachlauf
+    // holt solche Rumpfe noch nach.
+    self._genEmitPending();
     if binTop != 0 && self.impLstN > 1 {
       var nlSavedSrc:   pchar := self.src;
       var nlSavedNodes: int64 := self.nodes;
@@ -8864,6 +9180,9 @@ pub type IRLower = class {
           self.lowerModule(nlHead);
           nlI := nlI + 1;
         }
+        // #2125: was der Nachlauf an Spezialisierungen angefordert hat;
+        // setzt _nochGelowert, wenn etwas entstand.
+        self._genEmitPending();
         nlWeiter := self._nochGelowert;
         nlRunde := nlRunde + 1;
       }
@@ -8875,31 +9194,14 @@ pub type IRLower = class {
       self.nodeCount := nlSavedCnt;
     }
 
-    // WP-2.1: emit pending generic specializations collected during this module.
-    // Each pending record: {mangledPtr:8, mangledLen:8, genFuncNodeIdx:8, emitted:8}
-    var pi: int64 := 0;
-    while (pi < self.pendingGenCount) {
-      var pRec: int64 := self.pendingGenBuf + pi * 32;
-      var pEmitted: int64 := peek64(pRec + PENDING_REC_OFF_EMITTED);
-      if (pEmitted == 0) {
-        poke64(pRec + PENDING_REC_OFF_EMITTED, 1);  // mark as emitted
-        var mangPtr: pchar := peek64(pRec) as pchar;
-        var mangLen: int64 := peek64(pRec + PENDING_REC_OFF_MANGLEN);
-        var gNodeIdx: int64 := peek64(pRec + PENDING_REC_OFF_NODEIDX);
-        if (gNodeIdx >= 0) {
-          // Register the specialization in funcBuffer so calls resolve
-          var mangOff: int64 := self.irAddString(mangPtr, mangLen);
-          self.irAddFunc(mangOff, mangLen, 0, 0);
-          // Lower the generic body with the mangled name
-          self.overrideFuncName    := mangPtr;
-          self.overrideFuncNameLen := mangLen;
-          self.lowerFunc(gNodeIdx);
-          self.overrideFuncName    := 0;
-          self.overrideFuncNameLen := 0;
-        }
-      }
-      pi += 1;
-    }
+    // #2125: Spezialisierungen, die bis hierher angefordert wurden — jede im
+    // Kontext IHRER Unit (siehe _genEmitPending). Fuer den obersten Aufruf
+    // stehen sie schon im Nachlauf; der laeuft aber nur mit Importen.
+    self._genEmitPending();
+    // #2123: die Sammelfunktion — erst jetzt, wenn alle Units ihren Eintrag
+    // in modInitBuf haben. Danach noch einmal die Spezialisierungen: ein
+    // Anfangswert darf eine generische Funktion rufen (#2125).
+    if binTop != 0 { self._modInitHaupt(); self._genEmitPending(); }
     self.irModHead := lmSavedHead;   // #2076
     self.irPrivTab := lmSavedPT;
     self.irPrivCnt := lmSavedPC;
@@ -8966,6 +9268,290 @@ pub type IRLower = class {
     var off: int64 := funcIdx * 80;
     poke64(funcBuf2 + off + IR_FUNC_OFF_INSTRSOFF, self.funcInstrStart);
     poke64(funcBuf2 + off + IR_FUNC_OFF_INSTRCOUNT, instrLen - self.funcInstrStart);
+  }
+
+  // ------------------------------------------------------------------
+  // #2123: Anfangswerte von Modulvariablen zur Laufzeit
+  // ------------------------------------------------------------------
+  //
+  // Bis 1.2.14C legte der Vorpass in lowerModule nur ab, was sich falten
+  // liess (Ganzzahl-Konstanten, f64-Literale); alles andere blieb STILL 0.
+  // `var s: pchar := "abc"` war ein Nullzeiger, `var r: TR;` hatte keinen
+  // Speicher, `var gF: fn(int64): int64 := Triple` sprang nach 0 — auf
+  // x86 gehen alle drei, weil der Produktiv-Codegen dort die Adressen beim
+  // Schreiben einsetzt. Auf dem IR-Weg stehen sie im Datenbereich erst fest,
+  // wenn das Backend ihn schreibt; also entsteht der Wert dort, wo er sich
+  // ohnehin ausrechnen laesst: in einer Funktion, die vor main laeuft.
+
+  // Was braucht die Modulvariable `d` zur Laufzeit?
+  //   0 — nichts (gefaltet, f64-Literal, kein Anfangswert, keine Ablage)
+  //   1 — den Anfangswert auswerten und speichern
+  //   2 — Speicher fuer ein Array fester Groesse oder eine Struktur
+  // Die Unterscheidung muss mit dem Vorpass in lowerModule uebereinstimmen:
+  // was er in den Datenbereich legt, darf hier nicht noch einmal entstehen,
+  // und was er nicht ablegen kann, MUSS hier entstehen. Der Speicherfall
+  // ist dieselbe Rechnung wie fuer ein Local in lowerStmt (NK_VAR_DECL ohne
+  // Anfangswert, #1835) — die beiden muessen uebereinstimmen.
+  fn _modVarLaufzeit(d: int64): int64 {
+    if self.nodeKind(d) != NK_VAR_DECL { return 0; }
+    var ini: int64 := self.nodeC1(d);
+    var ty: int64 := self.nodeC0(d);
+    if ini >= 0 {
+      if self._constFaltbar(ini) != 0 { return 0; }
+      // Der f64-Zweig des Vorpasses (#1801): Literal, auch mit unaerem
+      // Minus, und nur, wenn der Wert oder der Typ Gleitkomma ist.
+      var fIst: int64 := 0;
+      if self.nodeKind(ini) == NK_LIT_FLOAT { fIst := 1; }
+      if ty >= 0 {
+        if self.nodeKind(ty) == NK_TYPE_NAME {
+          if self.seq(self.nodeSVal(ty), self.nodeSLen(ty), "f64", 3) { fIst := 1; }
+          if self.seq(self.nodeSVal(ty), self.nodeSLen(ty), "f32", 3) { fIst := 1; }
+        }
+      }
+      if fIst != 0 {
+        var fN: int64 := ini;
+        if self.nodeKind(fN) == NK_UNOP {
+          if self.nodeIVal(fN) == 71 { fN := self.nodeC0(fN); }
+        }
+        if self.nodeKind(fN) == NK_LIT_FLOAT { return 0; }
+      }
+      return 1;
+    }
+    if ty < 0 { return 0; }
+    if self.nodeKind(ty) == NK_TYPE_ARRAY_FIXED {
+      var szN: int64 := self.nodeC1(ty);
+      if szN >= 0 && self.nodeKind(szN) == NK_LIT_INT {
+        if self.nodeIVal(szN) > 0 { return 2; }
+      }
+      return 0;
+    }
+    // Nur STRUKTUREN (iv-Bit 4): eine Klassenvariable ohne `new` bleibt null,
+    // wie auf x86 (#1619) und beim Local (#1835).
+    var sd: int64 := self._typeNodeToDecl(ty);
+    if sd >= 0 {
+      if (self.nodeIVal(sd) & 16) != 0 {
+        if self.structGroesse(sd) > 0 { return 2; }
+      }
+    }
+    return 0;
+  }
+
+  // Die Anfangswerte einer Unit als Funktion `__lyx_modinit_<n>`, in
+  // Deklarationsreihenfolge. Gerufen am Ende von lowerModule — mit den
+  // Knotentabellen, der Unit-Kennung und dem Privatverzeichnis DIESER Unit,
+  // die Namen loesen also auf wie in einer ihrer Funktionen.
+  fn _modInitEinheit(decls: int64) {
+    var hat: int64 := 0;
+    var d: int64 := decls;
+    while d >= 0 {
+      if self._modVarLaufzeit(d) != 0 {
+        if hat == 0 && self.irInitModus == 2 {
+          // --compile-unit: Die .lyu traegt das IR der Unit, aber niemand
+          // ruft ihre Anfangswerte — das Programm, das sie spaeter einbindet,
+          // baut seine Sammelfunktion aus SEINEN Units. Lieber kein Erzeugnis
+          // als eines mit stillen Nullen.
+          EPrintStr("lyxc: Modulvariable '"c);
+          sys_write(2, self.nodeSVal(d) as int64, self.nodeSLen(d));
+          EPrintStrLn("' braucht einen Anfangswert zur Laufzeit (#2123)."c);
+          EPrintStrLn("  In einer vorkompilierten Unit (--compile-unit) fuer ein IR-Ziel gibt es"c);
+          EPrintStrLn("  dafuer noch keinen Aufrufer. Die Unit als Quelle einbinden, oder den"c);
+          EPrintStrLn("  Wert in einer Funktion zuweisen."c);
+          exit(1);
+        }
+        hat := 1;
+      }
+      d := self.nodeNext(d);
+    }
+    if hat == 0 { return; }
+    if self.modInitNoetig == 0 {
+      // Der Vorlauf (binTop) hat diese Unit nicht gesehen oder anders
+      // beurteilt. Dann ruft niemand diese Funktion — laut, statt still 0.
+      EPrintStr("lyxc: interner Fehler (#2123): Anfangswert von '"c);
+      sys_write(2, self.nodeSVal(decls) as int64, self.nodeSLen(decls));
+      EPrintStrLn("' ohne Aufrufer — der Vorlauf hat die Unit nicht erfasst."c);
+      exit(1);
+    }
+
+    // Zustand wie in lowerFunc sichern; die Funktion entsteht mitten in
+    // lowerModule, das danach weiterlaeuft.
+    var sLocal: int64 := self.localCount;
+    var sParam: int64 := self.paramCount;
+    var sTemp:  int64 := self.tempCount;
+    var sRet:   int64 := self.retValTemp;
+    var sCur:   int64 := self.curFunc;
+    var sExit:  int64 := self.funcExitLabel;
+    var sStart: int64 := self.funcInstrStart;
+    var sLN:    int64 := self.localNameCnt;
+    var sVol:   int64 := self._volSlotN;
+    var sMPB:   int64 := self.methodParamBase;
+    var sCMC:   int64 := self.curMethodClassType;
+    var sOvN:   pchar := self.overrideFuncName;
+    var sOvL:   int64 := self.overrideFuncNameLen;
+    self.localCount := 0;
+    self.paramCount := 0;
+    self.tempCount := 0;
+    self.localNameCnt := 0;
+    self._volSlotN := 0;
+    self.methodParamBase := 0;
+    self.curMethodClassType := 0 - 1;
+    var bargRsv: int64 := 0;
+    while bargRsv < IR_BARG_SLOTS { self.allocTemp(); bargRsv := bargRsv + 1; }
+    self.retValTemp := self.allocTemp();
+    self.funcExitLabel := self.genLabel();
+    self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
+
+    d := decls;
+    while d >= 0 {
+      var art: int64 := self._modVarLaufzeit(d);
+      if art != 0 {
+        // curFunc muss ein Knoten sein: die Namensaufloesung liest seine
+        // Parameterkette (c0). Die Deklaration selbst hat keine — ihr c0 ist
+        // der Typknoten, kein NK_PARAM, also findet die Suche nichts.
+        self.curFunc := d;
+        var gIdx: int64 := self._irGlobalIdx(self.nodeSVal(d) as int64, self.nodeSLen(d));
+        if gIdx < 0 {
+          EPrintStr("lyxc: interner Fehler (#2123): Modulvariable '"c);
+          sys_write(2, self.nodeSVal(d) as int64, self.nodeSLen(d));
+          EPrintStrLn("' steht nicht im Verzeichnis."c);
+          exit(1);
+        }
+        var wert: int64 := 0 - 1;
+        if art == 1 {
+          wert := self.lowerExpr(self.nodeC1(d));
+        } else {
+          var ty: int64 := self.nodeC0(d);
+          var gr: int64 := 0;
+          var ausr: int64 := 0;
+          if self.nodeKind(ty) == NK_TYPE_ARRAY_FIXED {
+            gr := self.nodeIVal(self.nodeC1(ty)) * 8;
+            // WP-ALIGN: @align(n) wie beim Local.
+            ausr := (self.nodeIVal(d) >> 8) & 0xFFFFFF;
+          } else {
+            gr := self.structGroesse(self._typeNodeToDecl(ty));
+          }
+          var grT: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_CONST_INT, grT, -1, -1, gr);
+          wert := self.allocTemp();
+          self.irAddInstrDirect(IRO_ALLOC, wert, grT, -1, ausr);
+        }
+        self.irAddInstrDirect(IRO_STORE_GLOBAL, gIdx, wert, -1, 0);
+      }
+      d := self.nodeNext(d);
+    }
+
+    self.irEmitLabel(self.funcExitLabel);
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
+
+    // Name "__lyx_modinit_<n>"
+    var nb: int64 := alloc(40);
+    var pre: pchar := "__lyx_modinit_";
+    memcpy(nb, pre as int64, 14);
+    var nl: int64 := 14;
+    var zahl: int64 := self.modInitN;
+    var ziff: int64 := alloc(24);
+    var zn: int64 := 0;
+    if zahl == 0 { poke8(ziff, 48); zn := 1; }
+    while zahl > 0 { poke8(ziff + zn, 48 + (zahl % 10)); zahl := zahl / 10; zn := zn + 1; }
+    while zn > 0 { zn := zn - 1; poke8(nb + nl, peek8(ziff + zn)); nl := nl + 1; }
+    poke8(nb + nl, 0);
+    free(ziff, 24);
+
+    self.overrideFuncName := nb as pchar;
+    self.overrideFuncNameLen := nl;
+    self._addFunc();
+
+    if self.modInitN >= self.modInitCap {
+      var nc: int64 := self.modInitCap * 2;
+      var nbuf: int64 := alloc(nc * 16);
+      memcpy(nbuf, self.modInitBuf, self.modInitN * 16);
+      self.modInitBuf := nbuf;
+      self.modInitCap := nc;
+    }
+    poke64(self.modInitBuf + self.modInitN * 16, nb);
+    poke64(self.modInitBuf + self.modInitN * 16 + 8, nl);
+    self.modInitN := self.modInitN + 1;
+
+    self.localCount := sLocal;
+    self.paramCount := sParam;
+    self.tempCount := sTemp;
+    self.retValTemp := sRet;
+    self.curFunc := sCur;
+    self.funcExitLabel := sExit;
+    self.funcInstrStart := sStart;
+    self.localNameCnt := sLN;
+    self._volSlotN := sVol;
+    self.methodParamBase := sMPB;
+    self.curMethodClassType := sCMC;
+    self.overrideFuncName := sOvN;
+    self.overrideFuncNameLen := sOvL;
+  }
+
+  // Die Sammelfunktion `__lyx_modinit`: ruft die Unit-Funktionen in der
+  // Reihenfolge, in der sie entstanden sind — Importe vor dem Importeur.
+  // Registriert ist sie seit dem Vorlauf (main ruft sie schon).
+  fn _modInitHaupt() {
+    if self.modInitNoetig == 0 { return; }
+    if self.irInitModus == 2 { return; }
+    var sLocal: int64 := self.localCount;
+    var sParam: int64 := self.paramCount;
+    var sTemp:  int64 := self.tempCount;
+    var sRet:   int64 := self.retValTemp;
+    var sExit:  int64 := self.funcExitLabel;
+    var sStart: int64 := self.funcInstrStart;
+    var sOvN:   pchar := self.overrideFuncName;
+    var sOvL:   int64 := self.overrideFuncNameLen;
+    self.localCount := 0;
+    self.paramCount := 0;
+    self.tempCount := 0;
+    var bargRsv: int64 := 0;
+    while bargRsv < IR_BARG_SLOTS { self.allocTemp(); bargRsv := bargRsv + 1; }
+    self.retValTemp := self.allocTemp();
+    self.funcExitLabel := self.genLabel();
+    self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
+    var i: int64 := 0;
+    while i < self.modInitN {
+      var np: int64 := peek64(self.modInitBuf + i * 16);
+      var nl: int64 := peek64(self.modInitBuf + i * 16 + 8);
+      var idx: int64 := self._findFuncIdxStill(np as pchar, nl);
+      if idx < 0 {
+        EPrintStrLn("lyxc: interner Fehler (#2123): Unit-Anfangswerte nicht in der Funktionstabelle."c);
+        exit(1);
+      }
+      var argBase: int64 := self.tempCount;
+      var rsv: int64 := 0;
+      while rsv < 8 { self.allocTemp(); rsv := rsv + 1; }
+      var res: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CALL, res, idx, argBase, 0);
+      i := i + 1;
+    }
+    self.irEmitLabel(self.funcExitLabel);
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
+    self.overrideFuncName := "__lyx_modinit";
+    self.overrideFuncNameLen := 13;
+    self._addFunc();
+    self.localCount := sLocal;
+    self.paramCount := sParam;
+    self.tempCount := sTemp;
+    self.retValTemp := sRet;
+    self.funcExitLabel := sExit;
+    self.funcInstrStart := sStart;
+    self.overrideFuncName := sOvN;
+    self.overrideFuncNameLen := sOvL;
+  }
+
+  // Der Aufruf von __lyx_modinit am Anfang von main (lowerFunc).
+  fn _modInitRuf() {
+    var nm: pchar := "__lyx_modinit";
+    var idx: int64 := self._findFuncIdxStill(nm, 13);
+    if idx < 0 {
+      EPrintStrLn("lyxc: interner Fehler (#2123): __lyx_modinit ist nicht registriert."c);
+      exit(1);
+    }
+    var argBase: int64 := self.tempCount;
+    var rsv: int64 := 0;
+    while rsv < 8 { self.allocTemp(); rsv := rsv + 1; }
+    var res: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CALL, res, idx, argBase, 0);
   }
 
   fn getStringLen(off: int64): int64 {
@@ -9338,190 +9924,370 @@ pub type IRLower = class {
   }
   
   // ============================================================================
-  // WP-20: Closure / Nested Function Lowering
+  // #2108: Closures und Lambdas im IR-Weg (arm64, riscv, lyxos, ...)
+  //
+  // Bis 1.2.14C standen hier fuenf Stubs (lowerClosure & Co.), die nur
+  // Kommentare der Form "Emit: ..." enthielten; erreicht wurden sie nie, weil
+  // lowerExpr NK_CLOSURE nicht kannte (seit #2092 laut, vorher ein
+  // unbeschriebener Temp — `c()` sprang an dessen zufaelligen Inhalt).
+  //
+  // Dieselbe Semantik wie codegen_x86.lyx (CGN_CLOSURE, WP-02, #1249) — die
+  // beiden muessen uebereinstimmen:
+  //  * Erfasst wird jeder Bezeichner des Rumpfes, der an der Erzeugungsstelle
+  //    ein Local oder Parameter ist und kein Parameter des Lambdas
+  //    (cg_scanClosureCaptures). Erfassung PER WERT: die Umgebung ist eine
+  //    Kopie, angelegt beim Erzeugen; spaetere Aenderungen aussen sieht das
+  //    Lambda nicht.
+  //  * Eine Zuweisung an eine Erfassung schreibt in die Umgebung. Sie bleibt
+  //    fuer weitere Aufrufe DESSELBEN Lambdas erhalten (Zaehler), aussen ist
+  //    sie unsichtbar; zwei Lambdas haben je ihre eigene Kopie.
+  //  * Ohne Erfassung ist der Wert die Codeadresse (duenner Zeiger, #1249).
+  //    Mit Erfassung ein Heap-Satz {Code, Umgebung}. Gerufen wird dann mit der
+  //    Umgebung als VERDECKTEM LETZTEM Argument — auf x86 ist es das erste
+  //    (rdi). Die Lage ist intern, kein fremder Code ruft ein Lyx-Lambda; hinten
+  //    angehaengt behalten die Parameter ihre gewohnten Slots.
+  //  * Ob ein Aufruf ueber ein Local den Satz oder die Adresse erwartet, haengt
+  //    wie auf x86 an der Deklaration des Locals (_clVarMerken). Ein
+  //    einfangendes Lambda als Argument oder in einer `fn(...)`-Variablen wird
+  //    wie dort abgewiesen.
+  // Die Ruempfe entstehen NACH der umgebenden Funktion (_clAbarbeiten am Ende
+  // von lowerFunc) — an Ort und Stelle laege fremder Code mitten im
+  // Befehlsstrom der aeusseren Funktion (derselbe Grund wie bei #2020).
   // ============================================================================
-  
-  // Create closure object
+
+  // Ein Lambda-Ausdruck an seiner Erzeugungsstelle.
   fn lowerClosure(expr: int64): int64 {
-    // C0: function to close over
-    // C1: captured variables (linked list)
-    var funcNode: int64 := self.nodeC0(expr);
-    var captures: int64 := self.nodeC1(expr);
-    var dest: int64 := self.allocTemp();
-    
-    // Allocate closure object: {funcPtr, envPtr}
-    // envPtr points to captured variables on heap
-    
-    // Process captures
-    var capOffset: int64 := 16;  // after funcPtr (8 bytes)
-    var curCap: int64 := captures;
-    while (curCap >= 0) {
-      var capTemp: int64 := self.lowerExpr(curCap);
-      // Store captured value to env buffer
-      curCap := self.nodeNext(curCap);
-      capOffset += 8;
+    var n: int64 := self._clErfasst(expr);
+    self.clLetzterKnoten := expr;
+    self.clLetzteN := n;
+    // Eindeutiger Name "__lambda_<n>", in einer Unit "__lambda_<unit>_<n>" —
+    // die Ruempfe mehrerer Units landen im selben funcBuffer.
+    var nameP: int64 := alloc(48 + self.irUnitTagLen);
+    var nameL: int64 := 0;
+    var vor: pchar := "__lambda_"c;
+    while nameL < 9 { poke8(nameP + nameL, StrCharAt(vor, nameL)); nameL := nameL + 1; }
+    if self.irUnitTag != 0 {
+      var ti: int64 := 0;
+      while ti < self.irUnitTagLen {
+        poke8(nameP + nameL, peek8(self.irUnitTag + ti));
+        nameL := nameL + 1; ti := ti + 1;
+      }
+      poke8(nameP + nameL, 95); nameL := nameL + 1;
     }
-    
-    return dest;
-  }
-  
-  // Call closure (through function pointer)
-  fn lowerClosureCall(expr: int64): int64 {
-    var clTemp: int64 := self.lowerExpr(self.nodeC0(expr));
-    
-    // Arguments in C1
-    var curArg: int64 := self.nodeC1(expr);
-    while (curArg >= 0) {
-      self.lowerExpr(curArg);
-      curArg := self.nodeNext(curArg);
+    var zahl: int64 := self.clZaehler;
+    self.clZaehler := self.clZaehler + 1;
+    var ziff: int64 := alloc(24);
+    var zn: int64 := 0;
+    if zahl == 0 { poke8(ziff, 48); zn := 1; }
+    while zahl > 0 {
+      poke8(ziff + zn, 48 + (zahl - (zahl / 10) * 10));
+      zahl := zahl / 10; zn := zn + 1;
     }
-    
-    var dest: int64 := self.allocTemp();
-    
-    // Emit: funcPtr = load clTemp[0]
-    // Emit: envPtr = load clTemp[8]
-    // Emit: call funcPtr(envPtr, args...)
-    return dest;
+    while zn > 0 {
+      zn := zn - 1;
+      poke8(nameP + nameL, peek8(ziff + zn)); nameL := nameL + 1;
+    }
+    free(ziff, 24);
+    poke8(nameP + nameL, 0);
+    var nameOff: int64 := self.irAddString(nameP as pchar, nameL);
+    var fid: int64 := self.irAddFunc(nameOff, nameL, 0, 0);
+    self.globalFuncCount += 1;
+    var capP: int64 := 0;
+    if n > 0 {
+      capP := alloc(n * 24);
+      memcpy(capP, self.clScanP, n * 24);
+    }
+    // Zur Erzeugung vormerken.
+    if self.clQCap == 0 {
+      self.clQCap := 16;
+      self.clQBuf := alloc(self.clQCap * 48);
+    }
+    if self.clQN >= self.clQCap {
+      var nc: int64 := self.clQCap * 2;
+      var nb: int64 := alloc(nc * 48);
+      memcpy(nb, self.clQBuf, self.clQN * 48);
+      self.clQBuf := nb; self.clQCap := nc;
+    }
+    var q: int64 := self.clQBuf + self.clQN * 48;
+    poke64(q, expr); poke64(q + 8, nameP); poke64(q + 16, nameL);
+    poke64(q + 24, capP); poke64(q + 32, n); poke64(q + 40, self.nodes);
+    self.clQN := self.clQN + 1;
+
+    var code: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_FUNC_ADDR, code, fid, -1, 0);
+    if n == 0 { return code; }   // #1249: duenner Zeiger
+
+    // Umgebung: Kopie der erfassten Werte, jetzt.
+    var envSz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, envSz, -1, -1, n * 8);
+    var env: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, env, envSz, -1, 0);
+    var i: int64 := 0;
+    while i < n {
+      var e: int64 := capP + i * 24;
+      var np: pchar := peek64(e) as pchar;
+      var nl: int64 := peek64(e + 8);
+      var v: int64 := self.allocTemp();
+      var s: int64 := self._findLocalSlot(np, nl);
+      if s >= 0 {
+        self.irAddInstrDirect(IRO_LOAD_LOCAL, v, s, -1, 0);
+      } else if self._clIstSelf(np, nl) != 0 {
+        self.irAddInstrDirect(IRO_LOAD_LOCAL, v, IR_BARG_SLOTS, -1, 0);
+      } else if self._clCapLaden(np, nl, v) == 0 {
+        // _clScan nimmt nur Namen auf, die eine dieser drei Herkuenfte haben.
+        EPrintStrLn("lyxc: #2108: Erfassung eines Lambdas nicht aufloesbar (interner Fehler)"c);
+        exit(1);
+      }
+      self.irAddInstrDirect(IRO_STORE_FIELD, i * 8, v, env, 0);
+      i := i + 1;
+    }
+    // Satz {Code, Umgebung}
+    var satzSz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, satzSz, -1, -1, 16);
+    var satz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, satz, satzSz, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, 0, code, satz, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, 8, env, satz, 0);
+    return satz;
   }
-  
-  // Static link parameter (for nested functions)
-  fn lowerStaticLink(): int64 {
-    // Allocate temp for static link (passed as hidden first arg)
-    var slTemp: int64 := self.allocTemp();
-    return slTemp;
+
+  // Erfassungen des Lambdas `cl` im JETZIGEN Kontext nach clScanP; Anzahl.
+  fn _clErfasst(cl: int64): int64 {
+    if self.clScanCap == 0 {
+      self.clScanCap := 16;
+      self.clScanP := alloc(self.clScanCap * 24);
+    }
+    self.clScanN := 0;
+    if cl < 0 { return 0; }
+    if self.nodeKind(cl) != NK_CLOSURE { return 0; }
+    self._clScan(self.nodeC2(cl), self.nodeC0(cl), 0);
+    return self.clScanN;
   }
-  
-  // Load captured variable from static link
-  fn lowerLoadCaptured(varOffset: int64): int64 {
-    var slTemp: int64 := self.lowerStaticLink();
-    var dest: int64 := self.allocTemp();
-    
-    // Emit: dest = load slTemp[varOffset]
-    return dest;
+
+  // Wie _scanCap in codegen_x86.lyx: jeder Bezeichner im Teilbaum, der kein
+  // Parameter des Lambdas (Kette ph) ist und aussen etwas Erfassbares meint.
+  // Verschachtelte Lambdas werden mit abgesucht — was sie brauchen, muss
+  // die Umgebung des mittleren Lambdas schon tragen.
+  fn _clScan(ni: int64, ph: int64, tiefe: int64) {
+    if tiefe > 4096 {
+      EPrintStrLn("lyxc: #2108: Syntaxbaum tiefer als 4096 Ebenen — abgebrochen."c);
+      exit(1);
+    }
+    while ni >= 0 && ni < self.nodeCount {
+      var k: int64 := self.nodeKind(ni);
+      if k == NK_IDENT {
+        var np: pchar := self.nodeSVal(ni);
+        var nl: int64 := self.nodeSLen(ni);
+        var nimm: int64 := 1;
+        var p: int64 := ph;
+        while p >= 0 {
+          if self.seq(self.nodeSVal(p), self.nodeSLen(p), np, nl) { nimm := 0; }
+          p := self.nodeNext(p);
+        }
+        var j: int64 := 0;
+        while j < self.clScanN {
+          var e: int64 := self.clScanP + j * 24;
+          if self.seq(peek64(e) as pchar, peek64(e + 8), np, nl) { nimm := 0; }
+          j := j + 1;
+        }
+        var typ: int64 := 0 - 1;
+        if nimm != 0 {
+          if self._findLocalSlot(np, nl) >= 0 {
+            typ := self._localTypeNode(np, nl);
+          } else if self._clIstSelf(np, nl) != 0 {
+            typ := self.curMethodClassType;
+          } else {
+            var ci: int64 := self._clCapIdx(np, nl);
+            if ci < 0 { nimm := 0; }
+            else { typ := peek64(self.clCapP + ci * 24 + 16); }
+          }
+        }
+        if nimm != 0 {
+          if self.clScanN >= self.clScanCap {
+            var nc: int64 := self.clScanCap * 2;
+            var nb: int64 := alloc(nc * 24);
+            memcpy(nb, self.clScanP, self.clScanN * 24);
+            self.clScanP := nb; self.clScanCap := nc;
+          }
+          var e2: int64 := self.clScanP + self.clScanN * 24;
+          poke64(e2, np as int64); poke64(e2 + 8, nl); poke64(e2 + 16, typ);
+          self.clScanN := self.clScanN + 1;
+        }
+      }
+      // Nicht jede Kindkante ist ein Knoten: bei NK_AT_DIRECTIVE steht in c0
+      // der WERT (siehe _nmWalkOne). Der Rumpf einer C-Schleife haengt an c3.
+      if k != NK_AT_DIRECTIVE {
+        self._clScan(self.nodeC0(ni), ph, tiefe + 1);
+        self._clScan(self.nodeC1(ni), ph, tiefe + 1);
+        self._clScan(self.nodeC2(ni), ph, tiefe + 1);
+        if k == NK_FOR_C { self._clScan(self.nodeC3(ni), ph, tiefe + 1); }
+      }
+      ni := self.nodeNext(ni);
+    }
   }
-  
-  // Store to captured variable
-  fn lowerStoreCaptured(varOffset: int64, srcTemp: int64): int64 {
-    var slTemp: int64 := self.lowerStaticLink();
-    
-    // Emit: store srcTemp to slTemp[varOffset]
-    return srcTemp;
+
+  // Index der Erfassung (np, nl) im Lambda, dessen Rumpf gerade entsteht; -1.
+  fn _clCapIdx(np: pchar, nl: int64): int64 {
+    var i: int64 := 0;
+    while i < self.clCapN {
+      var e: int64 := self.clCapP + i * 24;
+      if self.seq(peek64(e) as pchar, peek64(e + 8), np, nl) { return i; }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  // Lesezugriff auf eine Erfassung: dest = Umgebung[i]. 1 = erledigt, 0 = keine.
+  fn _clCapLaden(np: pchar, nl: int64, dest: int64): int64 {
+    var i: int64 := self._clCapIdx(np, nl);
+    if i < 0 { return 0; }
+    var env: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, env, self.clEnvSlot, -1, 0);
+    self.irAddInstrDirect(IRO_LOAD_FIELD, dest, env, i * 8, 0);
+    return 1;
   }
   
   // ============================================================================
   // WP-20: Generics Lowering
   // ============================================================================
   
-  // WP-2.1: Lower a generic call like max[int64](3, 7).
-  // NK_CALL with iVal=2:
-  //   sVal/sLen = generic function name ("max")
-  //   c0        = first argument (linked via nodeNext)
-  //   c2        = first type-arg AST node (NK_TYPE_NAME "int64", linked via nodeNext)
-  fn lowerGenericCall(expr: int64): int64 {
-    var dest: int64 := self.allocTemp();
+  // #2125: Spezialisierung fuer einen generischen Aufruf `f<A, B>(…)` anfordern.
+  // NK_CALL mit iVal 2: sVal = Name, c0 = Argumente, c2 = Typargumente
+  // (NK_TYPE_NAME, ueber nodeNext verkettet).
+  //
+  // Je Typargument-Kombination EINE Spezialisierung: der Name ist
+  // "<basis><A,B>" — mit Zeichen, die in keinem Bezeichner vorkommen, also
+  // ohne Kollision mit einer Benutzerfunktion. Dieselbe Kombination ein
+  // zweites Mal findet ihren Eintrag in pendingGenBuf wieder.
+  //
+  // Steht der Aufruf selbst in einer Spezialisierung (`g<T>` ruft `f<T>`),
+  // ist T schon ersetzt: genSubstBuf bildet ihn auf das Typargument ab.
+  //
+  // Rueckgabe: Zeiger auf den Namen, Laenge in lenCell. Registriert ist er
+  // dann im funcBuffer — der Aufrufer findet ihn wie jede andere Funktion.
+  fn _genInstanz(expr: int64, lenCell: int64): int64 {
     var genName: pchar := self.nodeSVal(expr);
     var genLen: int64  := self.nodeSLen(expr);
-    var typeArgNode: int64 := self.nodeC2(expr);
-    var arg0: int64 := self.nodeC0(expr);
 
-    // Build mangled name: "genName__type1__type2..."
-    var mangBuf: int64 := alloc(genLen + 512);
-    if (mangBuf == 0) { return dest; }
-    var pos: int64 := 0;
-    var i: int64 := 0;
-    while (i < genLen) {
-      poke8(mangBuf + pos, StrCharAt(genName, i)); pos := pos + 1; i := i + 1;
-    }
-    var ta: int64 := typeArgNode;
-    while (ta >= 0) {
-      StrSetChar(mangBuf as pchar, pos, 95); pos := pos + 1;  // '_'
-      StrSetChar(mangBuf as pchar, pos, 95); pos := pos + 1;  // '_'
-      var tName: pchar := self.nodeSVal(ta);
-      var tLen: int64  := self.nodeSLen(ta);
-      var j: int64 := 0;
-      while (j < tLen) {
-        poke8(mangBuf + pos, StrCharAt(tName, j)); pos := pos + 1; j := j + 1;
-      }
-      ta := self.nodeNext(ta);
-    }
-    poke8(mangBuf + pos, 0);
-
-    // Find the generic declaration node by searching genFuncBuf
-    var genFuncNodeIdx: int64 := -1;
+    // Die Deklaration: zuerst in der eigenen Unit, sonst eine oeffentliche
+    // einer anderen. Ein Knotenindex allein genuegt nicht — er gilt nur in
+    // der Tabelle, aus der er stammt (#2020).
+    var gRecIdx: int64 := 0 - 1;
     var gi: int64 := 0;
     while (gi < self.genFuncCount) {
-      var gRec: int64 := self.genFuncBuf + gi * 24;
-      var gNPtr: pchar := peek64(gRec) as pchar;
-      var gNLen: int64 := peek64(gRec + GENFUNC_REC_OFF_NAMELEN);
-      if (gNLen == genLen) {
-        var isMatch: int64 := 1;
-        var k: int64 := 0;
-        while (k < genLen) {
-          if (StrCharAt(gNPtr, k) != StrCharAt(genName, k)) { isMatch := 0; break; }
-          k += 1;
+      var gRec: int64 := self.genFuncBuf + gi * GENFUNC_REC_SIZE;
+      if (peek64(gRec + GENFUNC_REC_OFF_NAMELEN) == genLen) {
+        if (self.seq(peek64(gRec) as pchar, genLen, genName, genLen)) {
+          if (peek64(gRec + GENFUNC_REC_OFF_NODES) == self.nodes) {
+            gRecIdx := gi; gi := self.genFuncCount;
+          } else if (gRecIdx < 0 && peek64(gRec + GENFUNC_REC_OFF_PUB) != 0) {
+            gRecIdx := gi;
+          }
         }
-        if (isMatch != 0) { genFuncNodeIdx := peek64(gRec + GENFUNC_REC_OFF_NODEIDX); break; }
       }
       gi += 1;
     }
+    if (gRecIdx < 0) {
+      self._genFehler("keine generische Funktion dieses Namens (oder nur als .lyu ohne Quelltext): "c,
+                      genName, genLen);
+    }
+    var gR: int64 := self.genFuncBuf + gRecIdx * GENFUNC_REC_SIZE;
 
-    // Check if this specialization is already in the pending queue
-    var already: int64 := 0;
+    // Typargumente einsammeln — als NAMEN, denn die Spezialisierung wird in
+    // der Tabelle der Deklaration gesenkt, nicht in der des Aufrufs.
+    var taN: int64 := 0;
+    var ta: int64 := self.nodeC2(expr);
+    while (ta >= 0) { taN += 1; ta := self.nodeNext(ta); }
+    if (taN != peek64(gR + GENFUNC_REC_OFF_TPN)) {
+      self._genFehler("Anzahl der Typargumente passt nicht zu den Typparametern von "c, genName, genLen);
+    }
+    var argBuf: int64 := alloc(taN * 16 + 16);
+    var mangLen: int64 := peek64(gR + GENFUNC_REC_OFF_BASELEN) + 2;
+    var ai: int64 := 0;
+    ta := self.nodeC2(expr);
+    while (ta >= 0) {
+      // Nur ein schlichter Typname. `Array<int64>` oder ein Funktionstyp
+      // haette denselben (leeren) Namen wie jeder andere — zwei verschiedene
+      // Instanzen fielen still zusammen.
+      if (self.nodeKind(ta) != NK_TYPE_NAME || self.nodeC0(ta) >= 0 || self.nodeC1(ta) >= 0
+          || self.nodeSLen(ta) <= 0) {
+        self._genFehler("Typargument ist kein einfacher Typname (IR-Weg, wie x86) bei "c, genName, genLen);
+      }
+      var aP: int64 := self.nodeSVal(ta) as int64;
+      var aL: int64 := self.nodeSLen(ta);
+      // In einer Spezialisierung: Typparameter durch sein Argument ersetzen.
+      var si: int64 := 0;
+      while (si < self.genSubstN) {
+        var sRec: int64 := self.genSubstBuf + si * 40;
+        if (self.seq(peek64(sRec) as pchar, peek64(sRec + 8), aP as pchar, aL)) {
+          aP := peek64(sRec + 16); aL := peek64(sRec + 24); si := self.genSubstN;
+        }
+        si += 1;
+      }
+      poke64(argBuf + ai * 16, aP);
+      poke64(argBuf + ai * 16 + 8, aL);
+      mangLen := mangLen + aL + 1;
+      ai += 1;
+      ta := self.nodeNext(ta);
+    }
+
+    // Name "<basis><A,B>" bauen.
+    var mangBuf: int64 := alloc(mangLen + 8);
+    var pos: int64 := 0;
+    var bP: int64 := peek64(gR + GENFUNC_REC_OFF_BASE);
+    var bL: int64 := peek64(gR + GENFUNC_REC_OFF_BASELEN);
+    var bi: int64 := 0;
+    while (bi < bL) { poke8(mangBuf + pos, peek8(bP + bi)); pos += 1; bi += 1; }
+    poke8(mangBuf + pos, 60); pos += 1;                      // '<'
+    ai := 0;
+    while (ai < taN) {
+      if (ai > 0) { poke8(mangBuf + pos, 44); pos += 1; }    // ','
+      var cP: int64 := peek64(argBuf + ai * 16);
+      var cL: int64 := peek64(argBuf + ai * 16 + 8);
+      var ci: int64 := 0;
+      while (ci < cL) { poke8(mangBuf + pos, peek8(cP + ci)); pos += 1; ci += 1; }
+      ai += 1;
+    }
+    poke8(mangBuf + pos, 62); pos += 1;                      // '>'
+    poke8(mangBuf + pos, 0);
+
+    // Dieselbe Kombination schon angefordert? Dann deren Namen nehmen.
     var pi: int64 := 0;
     while (pi < self.pendingGenCount) {
-      var pRec: int64 := self.pendingGenBuf + pi * 32;
-      var pLen: int64 := peek64(pRec + PENDING_REC_OFF_MANGLEN);
-      if (pLen == pos) {
-        var pPtr: pchar := peek64(pRec) as pchar;
-        var m2: int64 := 1; var k2: int64 := 0;
-        while (k2 < pos) {
-          if (StrCharAt(pPtr, k2) != StrCharAt(mangBuf as pchar, k2)) { m2 := 0; break; }
-          k2 += 1;
+      var pRec: int64 := self.pendingGenBuf + pi * PENDING_REC_SIZE;
+      if (peek64(pRec + PENDING_REC_OFF_MANGLEN) == pos) {
+        if (self.seq(peek64(pRec) as pchar, pos, mangBuf as pchar, pos)) {
+          free(mangBuf, mangLen + 8);
+          free(argBuf, taN * 16 + 16);
+          poke64(lenCell, pos);
+          return peek64(pRec);
         }
-        if (m2 != 0) { already := 1; break; }
       }
       pi += 1;
     }
 
-    // Enqueue if not yet pending
-    if (already == 0 && genFuncNodeIdx >= 0) {
-      if (self.pendingGenCount >= self.pendingGenCap) {
-        var pnc: int64 := self.pendingGenCap * 2;
-        var pnb: int64 := alloc(pnc * 32);
-        var pni: int64 := 0;
-        memcpy(pnb, self.pendingGenBuf, self.pendingGenCount * 32);
-        free(self.pendingGenBuf, self.pendingGenCap * 32);
-        self.pendingGenBuf := pnb; self.pendingGenCap := pnc;
-      }
-      var pRec2: int64 := self.pendingGenBuf + self.pendingGenCount * 32;
-      poke64(pRec2,      mangBuf);           // mangledPtr
-      poke64(pRec2 + PENDING_REC_OFF_MANGLEN,  pos);               // mangledLen
-      poke64(pRec2 + PENDING_REC_OFF_NODEIDX, genFuncNodeIdx);    // genFuncNodeIdx
-      poke64(pRec2 + PENDING_REC_OFF_EMITTED, 0);                 // emitted = false
-      self.pendingGenCount += 1;
+    // Neu: im funcBuffer registrieren (Rumpf folgt in _genEmitPending,
+    // _addFunc findet den Eintrag dort wieder) und vormerken.
+    var mOff: int64 := self.irAddString(mangBuf as pchar, pos);
+    var fIdx: int64 := self.irAddFunc(mOff, pos, 0, 0);
+    if (self.pendingGenCount >= self.pendingGenCap) {
+      var pnc: int64 := self.pendingGenCap * 2;
+      var pnb: int64 := alloc(pnc * PENDING_REC_SIZE);
+      memcpy(pnb, self.pendingGenBuf, self.pendingGenCount * PENDING_REC_SIZE);
+      free(self.pendingGenBuf, self.pendingGenCap * PENDING_REC_SIZE);
+      self.pendingGenBuf := pnb; self.pendingGenCap := pnc;
     }
-
-    // Lower the actual call arguments
-    var argTemps: int64 := alloc(64 * 8);  // up to 64 args
-    var argCount: int64 := 0;
-    var argNode: int64 := arg0;
-    while (argNode >= 0 && argCount < 64) {
-      var aTemp: int64 := self.lowerExpr(argNode);
-      poke64(argTemps + argCount * 8, aTemp);
-      argCount += 1;
-      argNode := self.nodeNext(argNode);
-    }
-    // Emit: call mangled_name(arg0, arg1, ...)
-    var mangNameOff: int64 := self.irAddString(mangBuf as pchar, pos);
-    var ai: int64 := 0;
-    while (ai < argCount) {
-      self.irAddInstrDirect(IRO_STORE_LOCAL, ai, peek64(argTemps + ai * 8), -1, 0);
-      ai += 1;
-    }
-    self.irAddInstrDirect(IRO_CALL, dest, mangNameOff, -1, argCount);
-    free(argTemps, 64 * 8);
-    // Note: mangBuf is kept alive (stored in pendingGenBuf) until module lowering completes
-    return dest;
+    var pRec2: int64 := self.pendingGenBuf + self.pendingGenCount * PENDING_REC_SIZE;
+    poke64(pRec2, mangBuf);
+    poke64(pRec2 + PENDING_REC_OFF_MANGLEN, pos);
+    poke64(pRec2 + PENDING_REC_OFF_GENREC, gRecIdx);
+    poke64(pRec2 + PENDING_REC_OFF_EMITTED, 0);
+    poke64(pRec2 + PENDING_REC_OFF_ARGS, argBuf);
+    poke64(pRec2 + PENDING_REC_OFF_ARGN, taN);
+    poke64(pRec2 + PENDING_REC_OFF_FUNCIDX, fIdx);
+    self.pendingGenCount += 1;
+    poke64(lenCell, pos);
+    return mangBuf;
   }
   
   // Type argument as runtime typeid
@@ -9938,11 +10704,16 @@ pub type IRLower = class {
     return dest;
   }
   
-  // Closure expression (inline closure)
-  fn lowerClosureExpr(expr: int64): int64 {
-    // C0: captured vars
-    // C1: body (as function)
-    return self.lowerClosure(expr);
+  // #2108: Schreibzugriff auf eine Erfassung: Umgebung[i] := wert. Die
+  // Aenderung bleibt in der Umgebung DIESES Lambdas (wie cg_findClosureCap
+  // beim Zuweisen auf x86). 1 = erledigt, 0 = keine Erfassung dieses Namens.
+  fn _clCapSpeichern(np: pchar, nl: int64, wert: int64): int64 {
+    var i: int64 := self._clCapIdx(np, nl);
+    if i < 0 { return 0; }
+    var env: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, env, self.clEnvSlot, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, i * 8, wert, env, 0);
+    return 1;
   }
   
   // Type name node (for type resolution)
@@ -9974,84 +10745,38 @@ pub type IRLower = class {
     return dest;
   }
   
-  // Enum member access (compile-time constant)
-  fn lowerEnumMember(expr: int64): int64 {
-    var enumName: pchar := self.nodeSVal(expr);
-    var memberName: pchar := self.nodeSVal(self.nodeC0(expr));
-    var dest: int64 := self.allocTemp();
-    
-    // Lookup enum value at compile time
-    // Emit: dest = enumValue
-    return dest;
+  // #2127: Darf der Bezeichner ohne Herkunft als Wert durchgehen? Nur, wenn
+  // sein Wert nicht benutzt wird, weil er die Basis eines Zugriffs ist —
+  // dieselben Ausnahmen wie cg_identUnaufgeloest im x86-Weg, die beiden
+  // muessen uebereinstimmen: ein Typ-/Klassenname (Empfaenger eines
+  // statischen Aufrufs) und ein Enum-Name vor seinem Element.
+  //
+  // (Ersetzt den Rumpf lowerEnumMember: der war ein Stub fuer eine
+  // Knotenart NK_ENUM_MEMBER, die der Parser nie erzeugt, und hatte keinen
+  // Aufrufer. Enum-Elemente loesen lowerExpr (NK_IDENT) und lowerField auf.)
+  fn _identOhneWertErlaubt(np: pchar, nl: int64): int64 {
+    if self._findTypeDecl(np, nl) >= 0 { return 1; }
+    if self._tregFind(np, nl) >= 0 { return 1; }
+    if self._irEnumFind(np as int64, nl, 0, 0) >= 0 { return 1; }
+    return 0;
   }
   
-  // ============================================================================
-  // Extended Expression Lowering (handles all expression types)
-  // ============================================================================
-  
-  fn lowerExprExtended(expr: int64): int64 {
-    if (expr < 0) { 
-      return self.allocTemp();
+  // #2108: die vorgemerkten Lambda-Ruempfe erzeugen. Gerufen am Ende von
+  // lowerFunc — die umgebende Funktion ist dann vollstaendig, ihre Befehle
+  // stehen zusammenhaengend davor. Was ein Rumpf selbst an Lambdas enthaelt,
+  // haengt sich hinten an und wird in derselben Schleife erledigt.
+  //
+  // (Hier stand bis 1.2.14C `lowerExprExtended`, eine zweite Verteilung der
+  // Ausdrucksarten, die nirgends gerufen wurde.)
+  fn _clAbarbeiten() {
+    if self.clLaeuft != 0 { return; }
+    self.clLaeuft := 1;
+    while self.clQKopf < self.clQN {
+      var rec: int64 := self.clQBuf + self.clQKopf * 48;
+      self.clQKopf := self.clQKopf + 1;
+      self._clFunktion(rec);
     }
-    
-    var k: int64 := self.nodeKind(expr);
-    
-    // Extended expression types
-    if (k == NK_LOAD_FIELD) {
-      return self.lowerLoadField(expr);
-    }
-    if (k == NK_STORE_FIELD) {
-      return self.lowerStoreField(expr);
-    }
-    if (k == NK_LOAD_ELEM) {
-      return self.lowerLoadElem(expr);
-    }
-    if (k == NK_STORE_ELEM) {
-      return self.lowerStoreElem(expr);
-    }
-    if (k == NK_LOAD_FIELD_HEAP) {
-      return self.lowerLoadFieldHeap(expr);
-    }
-    if (k == NK_STORE_FIELD_HEAP) {
-      return self.lowerStoreFieldHeap(expr);
-    }
-    if (k == NK_SUPER_CALL) {
-      return self.lowerSuperCall(expr);
-    }
-    if (k == NK_IS_EXPR) {
-      return self.lowerIsType(expr);
-    }
-    if (k == NK_CLOSURE) {
-      return self.lowerClosure(expr);
-    }
-    if (k == NK_FN_PTR) {
-      return self.lowerFnPtr(expr);
-    }
-    if (k == NK_TYPE_NAME) {
-      return self.lowerTypeName(expr);
-    }
-    if (k == NK_TYPE_PARAM) {
-      return self.lowerTypeParam(expr);
-    }
-    if (k == NK_TYPE_ARRAY) {
-      return self.lowerTypeArray(expr);
-    }
-    if (k == NK_MATCH) {
-      return self.lowerMatch(expr);
-    }
-    if (k == NK_SWITCH) {
-      // Switch as expression or statement
-      return self.lowerSwitch(expr);
-    }
-    if (k == NK_TRY) {
-      return self.lowerTry(expr);
-    }
-    if (k == NK_THROW) {
-      return self.lowerThrowExpr(expr);
-    }
-    
-    // Delegate to base expression lowering
-    return self.lowerExpr(expr);
+    self.clLaeuft := 0;
   }
 
   // ==================================================================
@@ -10729,7 +11454,7 @@ pub type IRLower = class {
             self._nestRecord(s, self._nmLbl(fi), self._nmLblLen(fi));
             self._nmPlanFunc(s, self._nmLbl(fi), self._nmLblLen(fi), tiefe + 1);
           }
-        } else if sk == NK_VAR_DECL {
+        } else if sk == NK_VAR_DECL || sk == NK_CON_DECL {   // #2127: con ist ein Local wie var
           // Der Initialisierer sieht noch den alten Bereich; danach verdeckt
           // die Variable (sema traegt sie erst an ihrer Zeile ein).
           self._nmWalkKids(s, base, blen, tiefe);
@@ -10884,6 +11609,113 @@ pub type IRLower = class {
       runde := runde + 1;
     }
     self.src := svSrc; self.nodes := svNodes; self.nodeCount := svCnt;
+  }
+
+  // #2127: Die Enum-Elemente ALLER Units (Hauptmodul = impLst[0]) mit ihrem
+  // Wert. Bis 1.2.14C kannte der IR-Weg Enums gar nicht: `Rot` wie `Farbe.Rot`
+  // ergaben einen unbeschriebenen Temp. Dieselbe Rechnung wie
+  // cg_buildEnumLayout im x86-Weg — die beiden muessen uebereinstimmen:
+  // ohne Wert zaehlt ein Element vom vorigen aus weiter (`A = 5, B` → 5, 6),
+  // ein angegebener Wert wird gefaltet und muss in 0..2^32-1 liegen.
+  fn _irEnumSammle() {
+    self.irEnumCap := 64;
+    self.irEnumTab := alloc(self.irEnumCap * 48);
+    self.irEnumCnt := 0;
+    var svSrc: pchar := self.src; var svNodes: int64 := self.nodes; var svCnt: int64 := self.nodeCount;
+    var u: int64 := 0;
+    while u < self.impLstN {
+      self.src := peek64(self.impLstSrc + u * 8) as pchar;
+      self.nodes := peek64(self.impLstNodes + u * 8);
+      self.nodeCount := peek64(self.impLstCnt + u * 8);
+      var d: int64 := peek64(self.impLstHead + u * 8);
+      while d >= 0 {
+        if self.nodeKind(d) == NK_ENUM_DECL {
+          var naechster: int64 := 0;
+          var m: int64 := self.nodeC0(d);
+          while m >= 0 {
+            var wert: int64 := naechster;
+            var wn: int64 := self.nodeC0(m);
+            if wn >= 0 {
+              if self._constFaltbar(wn) == 0 {
+                EPrintStr("error: enum "c);
+                sys_write(2, self.nodeSVal(d), self.nodeSLen(d));
+                EPrintStr(": der Wert von "c);
+                sys_write(2, self.nodeSVal(m), self.nodeSLen(m));
+                EPrintStrLn(" muss zur Uebersetzungszeit feststehen"c);
+                exit(1);
+              }
+              wert := self._constWert(wn);
+              if wert < 0 || wert > 4294967295 {
+                EPrintStr("error: enum "c);
+                sys_write(2, self.nodeSVal(d), self.nodeSLen(d));
+                EPrintStr(": der Wert von "c);
+                sys_write(2, self.nodeSVal(m), self.nodeSLen(m));
+                EPrintStrLn(" liegt ausserhalb von 0..4294967295"c);
+                exit(1);
+              }
+            }
+            if self.irEnumCnt >= self.irEnumCap {
+              var nc: int64 := self.irEnumCap * 2;
+              var nb: int64 := alloc(nc * 48);
+              memcpy(nb, self.irEnumTab, self.irEnumCnt * 48);
+              self.irEnumTab := nb; self.irEnumCap := nc;
+            }
+            // Die Namen zeigen in den Quelltext der Unit; ihr Parser lebt bis
+            // zum Ende der Uebersetzung (impLst haelt ihn fest).
+            var b: int64 := self.irEnumTab + self.irEnumCnt * 48;
+            poke64(b,      self.nodeSVal(m) as int64);
+            poke64(b + 8,  self.nodeSLen(m));
+            poke64(b + 16, wert);
+            poke64(b + 24, self.nodeSVal(d) as int64);
+            poke64(b + 32, self.nodeSLen(d));
+            poke64(b + 40, u);
+            self.irEnumCnt := self.irEnumCnt + 1;
+            naechster := wert + 1;
+            m := self.nodeNext(m);
+          }
+        }
+        d := self.nodeNext(d);
+      }
+      u := u + 1;
+    }
+    self.src := svSrc; self.nodes := svNodes; self.nodeCount := svCnt;
+  }
+
+  // #2127: Eintrag in irEnumTab, -1 wenn keiner.
+  //   enumP != 0, memP != 0: `Farbe.Rot` — Element eines benannten Enums
+  //   enumP == 0, memP != 0: `Rot`       — Element ohne Typpraefix
+  //   enumP != 0, memP == 0: `Farbe`     — nur der Enum-Name (erster Eintrag)
+  // Gleichnamige Elemente zweier Units: das der gerade gesenkten Unit gewinnt
+  // (irUnitTag), sonst das zuerst gesammelte.
+  fn _irEnumFind(enumP: int64, enumL: int64, memP: int64, memL: int64): int64 {
+    var erster: int64 := 0 - 1;
+    var i: int64 := 0;
+    while i < self.irEnumCnt {
+      var b: int64 := self.irEnumTab + i * 48;
+      var passt: int64 := 1;
+      if memP != 0 {
+        passt := 0;
+        if self.seq(peek64(b) as pchar, peek64(b + 8), memP as pchar, memL) { passt := 1; }
+      }
+      if passt != 0 && enumP != 0 {
+        passt := 0;
+        if self.seq(peek64(b + 24) as pchar, peek64(b + 32), enumP as pchar, enumL) { passt := 1; }
+      }
+      if passt != 0 {
+        var u: int64 := peek64(b + 40);
+        var uP: int64 := 0; var uL: int64 := 0;
+        if self.impLstName != 0 { uP := peek64(self.impLstName + u * 8); uL := peek64(self.impLstNameLen + u * 8); }
+        var eigene: int64 := 0;
+        if self.irUnitTag == 0 { if uP == 0 { eigene := 1; } }
+        else if uP != 0 {
+          if self.seq(uP as pchar, uL, self.irUnitTag as pchar, self.irUnitTagLen) { eigene := 1; }
+        }
+        if eigene != 0 { return i; }
+        if erster < 0 { erster := i; }
+      }
+      i := i + 1;
+    }
+    return erster;
   }
 
   fn _irPubConFind(np: int64, nl: int64): int64 {
@@ -11239,7 +12071,13 @@ pub type IRLower = class {
         // #2107: eine oeffentliche Konstante einer importierten Unit.
         if self._findLocalSlot(self.nodeSVal(nd), self.nodeSLen(nd)) >= 0 { return 0; }
         if self._irPubConFind(self.nodeSVal(nd) as int64, self.nodeSLen(nd)) >= 0 { return 1; }
-        return 0;
+        // #2127: Enum-Element ohne Praefix und eingebaute Konstante — beide
+        // stehen auf x86 in conTable und sind damit faltbar (cg_isConstExpr).
+        if self._irEnumFind(0, 0, self.nodeSVal(nd) as int64, self.nodeSLen(nd)) >= 0 { return 1; }
+        var fbZ: int64 := alloc(8);
+        var fbE: int64 := _irEingebauteKonst(self.nodeSVal(nd), self.nodeSLen(nd), fbZ, self.irArchCode, self.irOsCode);
+        free(fbZ, 8);
+        return fbE;
       }
       return self._constFaltbar(self.nodeC1(cd));
     }
@@ -11271,7 +12109,15 @@ pub type IRLower = class {
       // hat vorher geprueft, dass der Name dort steht.
       var pci: int64 := self._irPubConFind(self.nodeSVal(nd) as int64, self.nodeSLen(nd));
       if pci >= 0 { return peek64(self.irPubConTab + pci * 24 + 16); }
-      return 0;
+      // #2127: dieselbe Reihenfolge wie _constFaltbar.
+      var cwE: int64 := self._irEnumFind(0, 0, self.nodeSVal(nd) as int64, self.nodeSLen(nd));
+      if cwE >= 0 { return peek64(self.irEnumTab + cwE * 48 + 16); }
+      var cwZ: int64 := alloc(8);
+      poke64(cwZ, 0);
+      _irEingebauteKonst(self.nodeSVal(nd), self.nodeSLen(nd), cwZ, self.irArchCode, self.irOsCode);
+      var cwW: int64 := peek64(cwZ);
+      free(cwZ, 8);
+      return cwW;
     }
     if k == NK_UNOP {
       var uo: int64 := self.nodeIVal(nd);
@@ -11723,5 +12569,460 @@ pub type IRLower = class {
       }
     }
     return 0 - 1;
+  }
+
+  // ==================================================================
+  // #2108: Closures, zweiter Teil (der erste steht bei lowerClosure). Am
+  // ENDE der Klasse, aus demselben Grund wie die Interfaces oben.
+  // ==================================================================
+
+  // Einen vorgemerkten Lambda-Rumpf als eigene Funktion erzeugen. Dieselben
+  // Schritte wie lowerFunc — die beiden muessen uebereinstimmen —, dazu die
+  // Umgebung als verdeckter letzter Parameter, wenn das Lambda etwas erfasst.
+  fn _clFunktion(rec: int64) {
+    var node:  int64 := peek64(rec);
+    var nameP: int64 := peek64(rec + 8);
+    var nameL: int64 := peek64(rec + 16);
+    var capP:  int64 := peek64(rec + 24);
+    var capN:  int64 := peek64(rec + 32);
+    if peek64(rec + 40) != self.nodes {
+      // Vorgemerkt und erzeugt wird in derselben lowerFunc — dazwischen
+      // wechselt die Knotentabelle nicht. Tut sie es doch, waere der Knoten
+      // ein fremder.
+      EPrintStrLn("lyxc: #2108: Lambda-Rumpf ausserhalb seiner Knotentabelle (interner Fehler)"c);
+      exit(1);
+    }
+    var sCur: int64 := self.curFunc;
+    var sLoc: int64 := self.localCount;
+    var sPar: int64 := self.paramCount;
+    var sTmp: int64 := self.tempCount;
+    var sLnc: int64 := self.localNameCnt;
+    var sRet: int64 := self.retValTemp;
+    var sExit: int64 := self.funcExitLabel;
+    var sStart: int64 := self.funcInstrStart;
+    var sMpb: int64 := self.methodParamBase;
+    var sMct: int64 := self.curMethodClassType;
+    var sOvN: pchar := self.overrideFuncName;
+    var sOvL: int64 := self.overrideFuncNameLen;
+    var sVol: int64 := self._volSlotN;
+    var sCapP: int64 := self.clCapP;
+    var sCapN: int64 := self.clCapN;
+    var sEnv: int64 := self.clEnvSlot;
+    var sDef: int64 := self.deferCount;
+    var sLx: int64 := self.loopExitLabel;
+    var sLc: int64 := self.loopContLabel;
+
+    self.curFunc := node;
+    self.localCount := 0;
+    self.paramCount := 0;
+    self.tempCount := 0;
+    self.localNameCnt := 0;
+    self._volSlotN := 0;
+    // Das Lambda ist keine Methode: ein `self` im Rumpf ist eine Erfassung.
+    self.methodParamBase := 0;
+    self.curMethodClassType := 0 - 1;
+    self.deferCount := 0;
+    self.loopExitLabel := 0 - 1;
+    self.loopContLabel := 0 - 1;
+
+    var r: int64 := 0;
+    while r < IR_BARG_SLOTS { self.allocTemp(); r := r + 1; }   // #1388
+    var np: int64 := 0;
+    var p: int64 := self.nodeC0(node);
+    while p >= 0 { self.allocParam(); np := np + 1; p := self.nodeNext(p); }
+    var env: int64 := 0 - 1;
+    var regs: int64 := np;
+    if capN > 0 { env := self.allocParam(); regs := regs + 1; }
+    if regs > 8 {
+      // Die IR-Backends uebergeben acht Registerargumente (x0..x7, a0..a7);
+      // ein neuntes ginge still verloren.
+      EPrintStr("lyxc: --target="c);
+      EPrintStr(self._targetName());
+      EPrintStr(": Lambda mit "c);
+      EPrintInt(np);
+      EPrintStr(" Parametern"c);
+      if capN > 0 { EPrintStr(" und Umgebung"c); }
+      EPrintStrLn(" — der IR-Weg uebergibt hoechstens 8 Registerargumente (#2108)."c);
+      exit(1);
+    }
+    self.retValTemp := self.allocTemp();
+    self.funcExitLabel := self.genLabel();
+    self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
+    // Wie x86 (cg_zeroRax vor dem Epilog): wer ohne `return` endet, liefert 0.
+    var nullT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, nullT, -1, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, self.retValTemp, nullT, -1, 0);
+
+    self.clCapP := capP;
+    self.clCapN := capN;
+    self.clEnvSlot := env;
+
+    var body: int64 := self.nodeC2(node);
+    if body >= 0 { self.lowerBlock(body); }
+    self.irEmitLabel(self.funcExitLabel);
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
+    self.overrideFuncName := nameP as pchar;
+    self.overrideFuncNameLen := nameL;
+    self._addFunc();
+
+    self.curFunc := sCur;
+    self.localCount := sLoc;
+    self.paramCount := sPar;
+    self.tempCount := sTmp;
+    self.localNameCnt := sLnc;
+    self.retValTemp := sRet;
+    self.funcExitLabel := sExit;
+    self.funcInstrStart := sStart;
+    self.methodParamBase := sMpb;
+    self.curMethodClassType := sMct;
+    self.overrideFuncName := sOvN;
+    self.overrideFuncNameLen := sOvL;
+    self._volSlotN := sVol;
+    self.clCapP := sCapP;
+    self.clCapN := sCapN;
+    self.clEnvSlot := sEnv;
+    self.deferCount := sDef;
+    self.loopExitLabel := sLx;
+    self.loopContLabel := sLc;
+  }
+
+  // Nach `var name [: T] := init;` (Slot `slot`): haelt das Local einen
+  // Heap-Satz {Code, Umgebung}? Dieselbe Entscheidung wie auf x86
+  // (codegen_x86.lyx, #1249 bei der Variablendeklaration) — sie haengt an der
+  // DEKLARATION, nicht am Wert:
+  //  * mit Typangabe: duenner Zeiger. Ein einfangendes Lambda in einem
+  //    `fn(...)`-Typ wird abgewiesen (cg_rejectCapturingClosure).
+  //  * ohne Typangabe: Satz, wenn der Startwert ein einfangendes Lambda ist,
+  //    ein Aufruf mit Funktionstyp als Rueckgabe (`var c := makeCounter();`)
+  //    oder die Kopie eines solchen Locals.
+  // Abweichung: x86 nimmt JEDEN untypisierten Startwert, der kein Lambda ohne
+  // Erfassung und keine Kopie eines duennen Locals ist, als Satz — auch
+  // `var h := plus;`, dessen Aufruf dort abstuerzt. Hier bleibt der
+  // Funktionsname ein duenner Zeiger, wie er es im IR-Weg seit #1806 war.
+  fn _clVarMerken(stmt: int64, slot: int64) {
+    var init: int64 := self.nodeC1(stmt);
+    if init < 0 { return; }
+    var typ: int64 := self.nodeC0(stmt);
+    var ik: int64 := self.nodeKind(init);
+    var n: int64 := 0;
+    if ik == NK_CLOSURE {
+      // Die Erfassungen, die lowerClosure eben bestimmt hat — jetzt erneut zu
+      // suchen saehe schon die eigene Variable als Local.
+      if init == self.clLetzterKnoten { n := self.clLetzteN; }
+      else { n := self._clErfasst(init); }
+    }
+    if typ >= 0 {
+      if self.nodeKind(typ) == NK_FN_PTR && n > 0 {
+        EPrintStrLn("codegen error: einfangendes Lambda als Wert einer Variablen mit `fn(...)`-Typ (#1249)"c);
+        EPrintStrLn("  Ein `fn(...)`-Typ traegt nur eine Adresse, nicht die eingefangene Umgebung."c);
+        EPrintStrLn("  Ohne Einfangen passt das Lambda; sonst die Werte als Parameter uebergeben."c);
+        exit(1);
+      }
+      return;
+    }
+    var fett: int64 := 0;
+    if ik == NK_CLOSURE && n > 0 { fett := 1; }
+    if ik == NK_CALL {
+      var rt: int64 := self._exprTypeNode(init);
+      if rt >= 0 {
+        if self.nodeKind(rt) == NK_FN_PTR { fett := 1; }
+        else if self.nodeKind(rt) == NK_TYPE_NAME {
+          // `type F = fn(...): R;` — Alias auf einen Funktionstyp (iv-Bit 1,
+          // c0 = NK_FN_PTR), wie _isMethodAlias fuer method(...).
+          var ad: int64 := self._findTypeDecl(self.nodeSVal(rt), self.nodeSLen(rt));
+          if ad >= 0 && (self.nodeIVal(ad) & 2) != 0 {
+            var ab: int64 := self.nodeC0(ad);
+            if ab >= 0 && self.nodeKind(ab) == NK_FN_PTR { fett := 1; }
+          }
+        }
+      }
+    }
+    if ik == NK_IDENT {
+      var qs: int64 := self._findLocalSlot(self.nodeSVal(init), self.nodeSLen(init));
+      if qs >= 0 && qs != slot && self._clIstFett(qs) != 0 { fett := 1; }
+    }
+    if fett == 0 { return; }
+    if self.clFettCap == 0 {
+      self.clFettCap := 16;
+      self.clFettBuf := alloc(self.clFettCap * 16);
+    }
+    if self.clFettN >= self.clFettCap {
+      var nc: int64 := self.clFettCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.clFettBuf, self.clFettN * 16);
+      self.clFettBuf := nb; self.clFettCap := nc;
+    }
+    var e: int64 := self.clFettBuf + self.clFettN * 16;
+    poke64(e, self.curFunc); poke64(e + 8, slot);
+    self.clFettN := self.clFettN + 1;
+  }
+
+  // Haelt Slot `slot` der laufenden Funktion einen Satz {Code, Umgebung}?
+  fn _clIstFett(slot: int64): int64 {
+    var i: int64 := 0;
+    while i < self.clFettN {
+      var e: int64 := self.clFettBuf + i * 16;
+      if peek64(e) == self.curFunc && peek64(e + 8) == slot { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // Aufruf ueber ein Local, das einen Satz haelt: Code und Umgebung aus dem
+  // Satz, die Umgebung als letztes Argument (siehe lowerClosure). Liefert das
+  // Ergebnis-Temp oder -1, wenn das Local keinen Satz haelt.
+  fn _clRuf(slot: int64, arg0: int64, dest: int64): int64 {
+    if self._clIstFett(slot) == 0 { return 0 - 1; }
+    var satz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, satz, slot, -1, 0);
+    // Erst ALLE Argumente auswerten: ein Aufruf darin belegt die Slots 0..N-1
+    // selbst, ein schon dort abgelegtes Argument waere danach ueberschrieben.
+    var n: int64 := 0;
+    var a: int64 := arg0;
+    while a >= 0 { n := n + 1; a := self.nodeNext(a); }
+    if n + 1 > 8 {
+      EPrintStr("lyxc: --target="c);
+      EPrintStr(self._targetName());
+      EPrintStr(": Aufruf eines Lambdas mit "c);
+      EPrintInt(n);
+      EPrintStrLn(" Argumenten und Umgebung — der IR-Weg uebergibt hoechstens 8 Registerargumente (#2108)."c);
+      exit(1);
+    }
+    var temps: int64 := alloc((n + 1) * 8);
+    var i: int64 := 0;
+    a := arg0;
+    while a >= 0 {
+      poke64(temps + i * 8, self.lowerExpr(a));
+      i := i + 1;
+      a := self.nodeNext(a);
+    }
+    var code: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, code, satz, 0, 0);
+    var env: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, env, satz, 8, 0);
+    i := 0;
+    while i < n {
+      self.irAddInstrDirect(IRO_STORE_LOCAL, i, peek64(temps + i * 8), -1, 0);
+      i := i + 1;
+    }
+    free(temps, (n + 1) * 8);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, n, env, -1, 0);
+    self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, code, -1, n + 1);
+    return dest;
+  }
+
+  // Ein einfangendes Lambda als ARGUMENT landet in einem `fn(...)`-Parameter,
+  // der nur eine Adresse traegt — abgewiesen wie auf x86 (#1249).
+  fn _clArgsPruefen(expr: int64) {
+    var a: int64 := self.nodeC0(expr);
+    if self.nodeIVal(expr) == 1 { a := self.nodeC1(expr); }
+    while a >= 0 {
+      if self.nodeKind(a) == NK_CLOSURE {
+        if self._clErfasst(a) > 0 {
+          EPrintStrLn("codegen error: einfangendes Lambda als Argument eines Aufrufs (#1249)"c);
+          EPrintStrLn("  Ein `fn(...)`-Typ traegt nur eine Adresse, nicht die eingefangene Umgebung."c);
+          EPrintStrLn("  Ohne Einfangen passt das Lambda; sonst die Werte als Parameter uebergeben."c);
+          exit(1);
+        }
+      }
+      a := self.nodeNext(a);
+    }
+  }
+
+  // `self` in einer Methode (dort ist es kein Local, sondern Param-Slot 0).
+  fn _clIstSelf(np: pchar, nl: int64): int64 {
+    if self.methodParamBase == 0 { return 0; }
+    if self.seq(np, nl, "self"c, 4) { return 1; }
+    return 0;
+  }
+
+  // ==================================================================
+  // #2125: Monomorphisierung generischer Funktionen auf dem IR-Weg.
+  // Vier Methoden — die Methodenzahl von IRLower bleibt gerade.
+  //
+  // Der x86-Weg (codegen_x86, WP-BC-24) erzeugt den generischen Rumpf
+  // EINMAL und je Instanz nur einen Sprung dorthin: die Typen sind dort
+  // geloescht, `T` rechnet wie int64. Der IR-Weg senkt je Kombination einen
+  // eigenen Rumpf, mit T durch das Argument ersetzt (_genSubst). Fuer
+  // ganzzahlige Typen und Zeiger ergibt das dasselbe; die Unterschiede
+  // stehen in tests/ir_generics_test.sh.
+  // ==================================================================
+
+  // Eine generische Funktion ins Verzeichnis eintragen — samt dem Kontext
+  // ihrer Unit, in dem ihre Spezialisierungen spaeter gesenkt werden.
+  // `base` ist ihr Name im funcBuffer (_irFnName: privat mit Unit-Praefix).
+  fn _genRegistriere(fd: int64, baseP: int64, baseL: int64) {
+    var tp: int64 := self.nodeC3(fd);
+    // Keine Typparameter: gewoehnliche Funktion, hier nichts zu tun.
+    if (tp < 0 || tp >= self.nodeCount) { return; }
+    if (self.nodeKind(tp) != NK_TYPE_PARAM) { return; }
+    // Der Vorpass laeuft je Nachlaufrunde erneut (#2063) — einmal genuegt.
+    var di: int64 := 0;
+    while (di < self.genFuncCount) {
+      var dR: int64 := self.genFuncBuf + di * GENFUNC_REC_SIZE;
+      if (peek64(dR + GENFUNC_REC_OFF_NODES) == self.nodes && peek64(dR + GENFUNC_REC_OFF_NODEIDX) == fd) {
+        return;
+      }
+      di += 1;
+    }
+    var tpN: int64 := 0;
+    while (tp >= 0) { tpN += 1; tp := self.nodeNext(tp); }
+    if (self.genFuncCount >= self.genFuncCap) {
+      var gfc: int64 := self.genFuncCap * 2;
+      var gfb: int64 := alloc(gfc * GENFUNC_REC_SIZE);
+      memcpy(gfb, self.genFuncBuf, self.genFuncCount * GENFUNC_REC_SIZE);
+      free(self.genFuncBuf, self.genFuncCap * GENFUNC_REC_SIZE);
+      self.genFuncBuf := gfb; self.genFuncCap := gfc;
+    }
+    var r: int64 := self.genFuncBuf + self.genFuncCount * GENFUNC_REC_SIZE;
+    poke64(r, self.nodeSVal(fd) as int64);
+    poke64(r + GENFUNC_REC_OFF_NAMELEN, self.nodeSLen(fd));
+    poke64(r + GENFUNC_REC_OFF_NODEIDX, fd);
+    poke64(r + GENFUNC_REC_OFF_SRC, self.src as int64);
+    poke64(r + GENFUNC_REC_OFF_NODES, self.nodes);
+    poke64(r + GENFUNC_REC_OFF_CNT, self.nodeCount);
+    poke64(r + GENFUNC_REC_OFF_HEAD, self.irModHead);
+    poke64(r + GENFUNC_REC_OFF_TAG, self.irUnitTag);
+    poke64(r + GENFUNC_REC_OFF_TAGLEN, self.irUnitTagLen);
+    poke64(r + GENFUNC_REC_OFF_BASE, baseP);
+    poke64(r + GENFUNC_REC_OFF_BASELEN, baseL);
+    poke64(r + GENFUNC_REC_OFF_PUB, self.nodeIsPub(fd));
+    poke64(r + GENFUNC_REC_OFF_TPN, tpN);
+    self.genFuncCount += 1;
+  }
+
+  // Alle angeforderten, noch nicht erzeugten Spezialisierungen senken. Jede
+  // im Kontext der Unit, in der die generische Funktion steht (Quelltext,
+  // Knotentabelle, Unit-Kennung, private Namen) — der Aufruf kann aus einer
+  // anderen kommen. Waehrend des Senkens ersetzt _genSubst jeden
+  // Typparameter durch sein Argument.
+  //
+  // Eine Spezialisierung darf weitere anfordern (`g<T>` ruft `f<T>`); die
+  // Schleife liest die Anzahl deshalb bei jedem Schritt neu.
+  fn _genEmitPending() {
+    var pi: int64 := 0;
+    while (pi < self.pendingGenCount) {
+      var pRec: int64 := self.pendingGenBuf + pi * PENDING_REC_SIZE;
+      if (peek64(pRec + PENDING_REC_OFF_EMITTED) == 0) {
+        poke64(pRec + PENDING_REC_OFF_EMITTED, 1);
+        var mangP: int64 := peek64(pRec);
+        var mangL: int64 := peek64(pRec + PENDING_REC_OFF_MANGLEN);
+        var argB:  int64 := peek64(pRec + PENDING_REC_OFF_ARGS);
+        var argN:  int64 := peek64(pRec + PENDING_REC_OFF_ARGN);
+        var gR: int64 := self.genFuncBuf + peek64(pRec + PENDING_REC_OFF_GENREC) * GENFUNC_REC_SIZE;
+        var fd: int64 := peek64(gR + GENFUNC_REC_OFF_NODEIDX);
+
+        var svSrc: pchar := self.src;
+        var svNodes: int64 := self.nodes;
+        var svCnt: int64 := self.nodeCount;
+        var svTag: int64 := self.irUnitTag;
+        var svTagL: int64 := self.irUnitTagLen;
+        var svHead: int64 := self.irModHead;
+        var svPT: int64 := self.irPrivTab;
+        var svPC: int64 := self.irPrivCnt;
+        var svSB: int64 := self.genSubstBuf;
+        var svSN: int64 := self.genSubstN;
+        var svON: pchar := self.overrideFuncName;
+        var svOL: int64 := self.overrideFuncNameLen;
+        var svMPB: int64 := self.methodParamBase;
+        var svMCT: int64 := self.curMethodClassType;
+
+        self.src := peek64(gR + GENFUNC_REC_OFF_SRC) as pchar;
+        self.nodes := peek64(gR + GENFUNC_REC_OFF_NODES);
+        self.nodeCount := peek64(gR + GENFUNC_REC_OFF_CNT);
+        self.irUnitTag := peek64(gR + GENFUNC_REC_OFF_TAG);
+        self.irUnitTagLen := peek64(gR + GENFUNC_REC_OFF_TAGLEN);
+        self.irModHead := peek64(gR + GENFUNC_REC_OFF_HEAD);
+        self._irPrivBaue(self.irModHead);
+        self.methodParamBase := 0;
+        self.curMethodClassType := 0 - 1;
+
+        // Ersetzungstabelle: Typparameter i -> Typargument i. Der Knoten des
+        // Arguments muss in DIESER Tabelle liegen; gesucht wird ein
+        // gleichnamiger schlichter Typname (oder die Klassendeklaration).
+        var sb: int64 := alloc(argN * 40 + 40);
+        var tp: int64 := self.nodeC3(fd);
+        var ti: int64 := 0;
+        while (tp >= 0 && ti < argN) {
+          var aP: int64 := peek64(argB + ti * 16);
+          var aL: int64 := peek64(argB + ti * 16 + 8);
+          var aKn: int64 := 0 - 1;
+          var k: int64 := 0;
+          while (k < self.nodeCount) {
+            if (self.nodeKind(k) == NK_TYPE_NAME && self.nodeC0(k) < 0 && self.nodeC1(k) < 0) {
+              if (self.seq(self.nodeSVal(k), self.nodeSLen(k), aP as pchar, aL)) { aKn := k; k := self.nodeCount; }
+            }
+            k += 1;
+          }
+          if (aKn < 0) { aKn := self._findTypeDecl(aP as pchar, aL); }
+          // Kein Knoten dieses Namens in der Unit der Deklaration: dann
+          // bleibt T stehen und rechnet ganzzahlig, wie auf x86. Fuer f64 waere
+          // das falsch (Bitmuster statt Gleitkomma) — laut statt still.
+          if (aKn < 0) {
+            if (self.seq(aP as pchar, aL, "f64"c, 3) || self.seq(aP as pchar, aL, "f32"c, 3)) {
+              self._genFehler("Gleitkomma-Typargument fuer eine generische Funktion einer anderen Unit, die den Typ selbst nirgends nennt: "c,
+                              mangP as pchar, mangL);
+            }
+          }
+          var sR: int64 := sb + ti * 40;
+          poke64(sR, self.nodeSVal(tp) as int64);
+          poke64(sR + 8, self.nodeSLen(tp));
+          poke64(sR + 16, aP);
+          poke64(sR + 24, aL);
+          poke64(sR + 32, aKn);
+          ti += 1;
+          tp := self.nodeNext(tp);
+        }
+        self.genSubstBuf := sb;
+        self.genSubstN := ti;
+        self.overrideFuncName := mangP as pchar;
+        self.overrideFuncNameLen := mangL;
+        self.lowerFunc(fd);
+
+        self.src := svSrc;
+        self.nodes := svNodes;
+        self.nodeCount := svCnt;
+        self.irUnitTag := svTag;
+        self.irUnitTagLen := svTagL;
+        self.irModHead := svHead;
+        self.irPrivTab := svPT;
+        self.irPrivCnt := svPC;
+        self.genSubstBuf := svSB;
+        self.genSubstN := svSN;
+        self.overrideFuncName := svON;
+        self.overrideFuncNameLen := svOL;
+        self.methodParamBase := svMPB;
+        self.curMethodClassType := svMCT;
+        self._nochGelowert := 1;
+      }
+      pi += 1;
+    }
+  }
+
+  // Typknoten durch das Typargument ersetzen, wenn er einen Typparameter
+  // der gerade gesenkten Spezialisierung nennt. Ohne passenden Knoten in der
+  // Unit (siehe _genEmitPending) bleibt er stehen.
+  fn _genSubst(tn: int64): int64 {
+    if (self.genSubstN == 0 || tn < 0) { return tn; }
+    if (self.nodeKind(tn) != NK_TYPE_NAME || self.nodeC0(tn) >= 0) { return tn; }
+    var i: int64 := 0;
+    while (i < self.genSubstN) {
+      var r: int64 := self.genSubstBuf + i * 40;
+      if (self.seq(peek64(r) as pchar, peek64(r + 8), self.nodeSVal(tn), self.nodeSLen(tn))) {
+        var an: int64 := peek64(r + 32);
+        if (an >= 0) { return an; }
+        return tn;
+      }
+      i += 1;
+    }
+    return tn;
+  }
+
+  fn _genFehler(msg: pchar, np: pchar, nl: int64) {
+    EPrintStr("error: #2125: "c);
+    EPrintStr(msg);
+    sys_write(2, np as int64, nl);
+    EPrintStrLn(""c);
+    exit(1);
   }
 }

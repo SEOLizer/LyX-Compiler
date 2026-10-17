@@ -462,6 +462,10 @@ pub type CompilerConfig = class {
   // namePtr may point into parser.src (for @export) or into mangledNamesBuf (for @jni).
   exportBuf:        int64;
   exportCount:      int64;
+  // #2124: x86-64-.so — Huellen des Codegens, je 16 Byte {Knoten, Codeoffset}
+  // (Codegen.soExpTab). Gesetzt, nimmt buildExportList die Adresse von hier.
+  x86SoExpTab:      int64;
+  x86SoExpCount:    int64;
   // Backing store for Java_*-mangled names produced by @jni (Phase B2). Grows as needed.
   mangledNamesBuf:  int64;
   mangledNamesLen:  int64;
@@ -1532,7 +1536,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.2.14C"c);
+      PrintStrLn("1.2.15A"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1554,7 +1558,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.2.14C"c);
+      PrintStrLn("1.2.15A"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1783,7 +1787,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.2.14C (bootstrap)");
+    PrintStrLn("lyxc 1.2.15A (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -2120,8 +2124,11 @@ pub type CompilerConfig = class {
         cuLower.irIncludePath := self.includePath;
         cuLower.irStdPath     := self.stdPath;
         cuLower.irLyuArch     := LyuArchName(self._lyuArchFuerZiel());   // #2014
+        cuLower.irArchCode    := cfg_archCode(self);   // #2127: TARGET_ARCH/TARGET_OS
+        cuLower.irOsCode      := cfg_osCode(self);
         cuLower.irSrcPath     := inputFile;      // #1961
         cuLower.irSrcLen      := StrLen(inputFile);
+        cuLower.irInitModus   := 2;              // #2123: kein Aufrufer fuer Anfangswerte
         cuLower.lowerModule(astRoot);
         cuIrPtr := cuIr as int64;
       }
@@ -2331,7 +2338,12 @@ pub type CompilerConfig = class {
     // Also beides: die IR wird gebaut und ausgegeben, das Programm entsteht
     // danach weiterhin auf dem bewaehrten Schnellweg. Fuer die Diagnose ist
     // die IR-Strecke gut genug, fuer das Erzeugen ist sie es auf x86-64 nicht.
-    if _irNoetig && self.target == LYX_TC_X86_64 && self.outputType != OUTPUT_TYPE_SHARED_LIB {
+    // #2124: x86-64 und android-x86_64 mit --shared laufen ueber denselben
+    // Schnellweg; nur der Schreiber am Ende ist ein anderer (cg_writeELFShared).
+    var _x86So: bool := (self.target == LYX_TC_X86_64 || self.target == LYX_TC_ANDROID_X86_64)
+                        && self.outputType == OUTPUT_TYPE_SHARED_LIB;
+    var _x86Weg: bool := (self.target == LYX_TC_X86_64 && self.outputType != OUTPUT_TYPE_SHARED_LIB) || _x86So;
+    if _irNoetig && _x86Weg {
       var dMod: IRModule := new IRModule();
       dMod.init();
       dMod.irSourceMap := self.irSourceMap;
@@ -2344,17 +2356,28 @@ pub type CompilerConfig = class {
       dLower.irSrcLen      := StrLen(inputFile);
       dLower.irStdPath     := self.stdPath;
       dLower.irLyuArch     := LyuArchName(self._lyuArchFuerZiel());   // #2014
+      dLower.irArchCode    := cfg_archCode(self);   // #2127: TARGET_ARCH/TARGET_OS
+      dLower.irOsCode      := cfg_osCode(self);
       dLower.lowerModule(astRoot);
       if self.dumpIR || self.irSourceMap { dMod.dump(); }
       if self.provenance { self.dumpProvenance(dMod, parser.nodes, source, inputFile); }
       _irNoetig := false;   // Diagnose erledigt — erzeugt wird auf dem Schnellweg
     }
 
-    if self.target == LYX_TC_X86_64 && !_irNoetig && self.outputType != OUTPUT_TYPE_SHARED_LIB {
+    if _x86Weg && !_irNoetig {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.out"c; }
       var _t5x: int64 := self._passStart("codegen-x86_64"c);
       var cg: Codegen := new Codegen();
+      // #2124: VOR Init — Init emittiert `_start`, das es in einer .so nicht gibt.
+      if _x86So {
+        if self.emitObj || self.metaSafe || self.kernelMode != 0 {
+          EPrintStrLn("error: --shared vertraegt sich nicht mit --emit=obj, --meta-safe oder --target=lyxos-kernel (#2124)."c);
+          self.exitCode := 1;
+          return self.exitCode;
+        }
+        cg.sharedLib := 1;
+      }
       // #1389: VOR Init — Init emittiert am Ende die Handler mit den festen
       // Offsets, und genau zwei davon haengen an diesem Schalter.
       if self.kernelMode != 0 { cg.kernelMode := 1; }
@@ -2451,7 +2474,15 @@ pub type CompilerConfig = class {
                    cg.cg_getLabelBuf(), cg.cg_getLabelCount(),
                    asmZeilen, asmPfad);
       }
-      if self.emitObj {
+      if _x86So {
+        // #2124: Exporte auf die Huellen des Codegens (cg_soEmitHuellen).
+        self.x86SoExpTab   := cg.soExpTab;
+        self.x86SoExpCount := cg.soExpCount;
+        self.buildExportList(parser, astRoot);
+        var soApi: int64 := 0;
+        if self.target == LYX_TC_ANDROID_X86_64 { soApi := self.androidApiLevel; }
+        cg.cg_writeELFShared(outPath, self.exportBuf, self.exportCount, soApi);
+      } else if self.emitObj {
         cg.cg_writeELFObj(outPath);   // WSP-07: ET_REL-Objekt (extern "asm" → ld-auflösbar)
       } else {
         cg.WriteELF(outPath);
@@ -2581,6 +2612,11 @@ pub type CompilerConfig = class {
     _irPaketPfade       := self.paketPfade as pchar;   // Projektdatei: Paketwurzeln
     lower.irStdPath     := self.stdPath;
     lower.irLyuArch     := LyuArchName(self._lyuArchFuerZiel());   // #2014
+    // #2123: In einer .so ruft nicht main die Anfangswerte, sondern der Lader
+    // (DT_INIT_ARRAY, writeELFSharedLib).
+    if self.outputType == OUTPUT_TYPE_SHARED_LIB { lower.irInitModus := 1; }
+    lower.irArchCode    := cfg_archCode(self);   // #2127: TARGET_ARCH/TARGET_OS
+    lower.irOsCode      := cfg_osCode(self);
     // #1845: Die IR-Strecke hatte keine Pass-Marken — bei einem 80-Sekunden-Lauf
     // waren 78 davon unbeobachtet, weil `--trace-passes` nach `analysis` endete.
     var _t5i: int64 := self._passStart("ir-lowering"c);
@@ -2821,15 +2857,21 @@ pub type CompilerConfig = class {
   // aussehenden Datei ohne den Code des Programms (bei --shared ohne jede
   // exportierte Funktion). Einen x86-64-Emitter fuer den IR-Weg gibt es
   // nicht (src/backend/x86_64/emit_x86.lyx ist nirgends eingebunden), und der
-  // Schnellweg (codegen_x86) schreibt keine .so. Bis eines davon steht,
+  // Schnellweg (codegen_x86) schrieb keine .so. Bis eines davon steht,
   // bricht die Uebersetzung laut ab.
+  //
+  // #2124: --shared (x86-64 und android-x86_64) geht jetzt ueber den
+  // Schnellweg (cg_writeELFShared) und kommt hier nicht mehr an. Uebrig ist
+  // android-x86_64 OHNE --shared — ein Android-Programm statt einer
+  // Bibliothek; dafuer gibt es weiter keinen Weg.
   fn emitX86_64(irMod: int64, lower: IRLower): int64 {
     if self.target == LYX_TC_ANDROID_X86_64 {
-      EPrintStrLn("error: --target=android-x86_64 hat keinen Codegen — bisher entstand still ein Programm, das 42 liefert (#2118, #2124)."c);
+      EPrintStrLn("error: --target=android-x86_64 ohne --shared hat keinen Codegen — bisher entstand still ein Programm, das 42 liefert (#2118, #2124)."c);
+      EPrintStrLn("  Fuer JNI-Bibliotheken: --target=android-x86_64 --shared."c);
     } else {
-      EPrintStrLn("error: x86-64 mit --shared ist nicht umgesetzt — bisher entstand still eine .so ohne Code und ohne Exporte (#2118, #2124)."c);
+      // Ein anderer Weg hierher waere neu und muss nachgezogen werden.
+      EPrintStrLn("interner fehler: emitX86_64 ohne Codegen erreicht (#2118, #2124)."c);
     }
-    EPrintStrLn("  Fuer Android-Bibliotheken: --target=android-arm64 --shared."c);
     return 0;
   }
 
@@ -3490,7 +3532,7 @@ pub type CompilerConfig = class {
     if count == 0 { self.exportBuf := 0; return; }
     // #2118: Ohne Funktionsadressen wurden die Exporte bisher still auf 0
     // gesetzt — die .so entstand mit rc 0 und ohne ein einziges Symbol.
-    if self.codeFuncAddrs == 0 {
+    if self.codeFuncAddrs == 0 && self.x86SoExpTab == 0 {
       EPrintStr("error: --shared: "c);
       EPrintInt(count);
       EPrintStrLn(" @export/@jni-Funktion(en), aber der Codegen liefert keine Adressen — die .so haette keine Exporte (#2118)."c);
@@ -3509,14 +3551,31 @@ pub type CompilerConfig = class {
         if (anno2 & EXPORT_MASK) != 0 {
           var fnP: int64 := (parser.src as int64) + peek64(off2 + NODE_OFF_SVAL);
           var fnL: int64 := peek64(off2 + NODE_OFF_SLEN);
-          var funcId: int64 := self._shlibFuncIdx(fnP, fnL);
-          if funcId < 0 {
-            EPrintStr("error: --shared: exportierte Funktion `"c);
-            sys_write(2, fnP, fnL);
-            EPrintStrLn("` steht nicht in der IR-Funktionstabelle (#2117)."c);
-            exit(1);
+          var addr: int64 := 0 - 1;
+          if self.x86SoExpTab != 0 {
+            // #2124: x86-64 — die Huelle zum KNOTEN (Codegen.cg_soEmitHuellen
+            // waehlt nach denselben Regeln aus; fehlt eine, ist das laut).
+            var hi: int64 := 0;
+            while hi < self.x86SoExpCount {
+              if peek64(self.x86SoExpTab + hi * 16) == cur { addr := peek64(self.x86SoExpTab + hi * 16 + 8); }
+              hi += 1;
+            }
+            if addr < 0 {
+              EPrintStr("error: --shared: exportierte Funktion `"c);
+              sys_write(2, fnP, fnL);
+              EPrintStrLn("` hat keine Huelle im x86-64-Codegen (#2124)."c);
+              exit(1);
+            }
+          } else {
+            var funcId: int64 := self._shlibFuncIdx(fnP, fnL);
+            if funcId < 0 {
+              EPrintStr("error: --shared: exportierte Funktion `"c);
+              sys_write(2, fnP, fnL);
+              EPrintStrLn("` steht nicht in der IR-Funktionstabelle (#2117)."c);
+              exit(1);
+            }
+            addr := peek64(self.codeFuncAddrs + funcId * 8) + self.codeStubOff;
           }
-          var addr: int64 := peek64(self.codeFuncAddrs + funcId * 8) + self.codeStubOff;
           var namePtr: int64 := 0;
           var nameLen: int64 := 0;
           if (anno2 & ANNO_JNI) != 0 {
@@ -4107,6 +4166,23 @@ pub type CompilerConfig = class {
     var hasGlobals: int64 := 0;
     if globalCount > 0 { hasGlobals := 1; }
 
+    // #2123: Anfangswerte der Modulvariablen, die erst zur Laufzeit entstehen
+    // (Aufruf, Zeichenkette, ...). In einer .so gibt es kein main, das sie
+    // ruft — der Lader tut es ueber DT_INIT_ARRAY. Der Eintrag ist eine
+    // ADRESSE und damit ladeabhaengig: R_AARCH64_RELATIVE darauf. Er liegt
+    // im RW-Segment unter RELRO (wie .got): nach dem Relozieren
+    // schreibgeschuetzt, wie es bionic fuer .init_array erwartet.
+    var initIdx: int64 := self._shlibFuncIdx("__lyx_modinit"c as int64, 13);
+    var hasInit: int64 := 0;
+    var initAddr: int64 := 0;
+    if initIdx >= 0 {
+      if self.codeFuncAddrs == 0 {
+        EPrintStrLn("error: --shared: Anfangswerte vorhanden, aber der Codegen liefert keine Funktionsadressen (#2123)."c);
+        return false;
+      }
+      hasInit := 1;
+    }
+
     // ---- Layout ----
     var pageSize:   int64 := 0x4000;    // #2119: 16 KiB
     var phNum:      int64 := 6;         // LOAD RX, LOAD RW, DYNAMIC, NOTE, GNU_STACK, GNU_RELRO
@@ -4126,7 +4202,7 @@ pub type CompilerConfig = class {
     // SYSV hash: nbucket, nchain, bucket[1], chain[nSyms]; ein Eimer.
     var hashSize:   int64 := 8 + 4 + 4 * nSyms;
     var relaOff:    int64 := ((hashOff + hashSize + 7) / 8) * 8;
-    var relaSize:   int64 := nExt * 24;
+    var relaSize:   int64 := (nExt + hasInit) * 24;   // #2123: + R_AARCH64_RELATIVE
     // WP-AND-03 DWARF CFI: .eh_frame_hdr (12 + 8 je Funktion), .eh_frame
     // (24-Byte-CIE + 28-Byte-FDE je Funktion + 4 Byte Ende).
     var ehFrameHdrOff:  int64 := ((relaOff + relaSize + 3) / 4) * 4;
@@ -4145,11 +4221,14 @@ pub type CompilerConfig = class {
     // DT_NEEDED je Bibliothek + HASH STRTAB SYMTAB STRSZ SYMENT SONAME
     // (+ RELA RELASZ RELAENT) + NULL.
     var dynNum:     int64 := nLibs + 6 + 1;
-    if nExt > 0 { dynNum := dynNum + 3; }
+    if nExt + hasInit > 0 { dynNum := dynNum + 3; }
+    if hasInit != 0 { dynNum := dynNum + 2; }         // #2123: DT_INIT_ARRAY(SZ)
     var dynSize:    int64 := dynNum * 16;
     var gotOff:     int64 := dynOff + dynSize;              // 16er-Schritte: 8-aligned
     var gotSize:    int64 := nExt * 8;
-    var relroEnd:   int64 := gotOff + gotSize;
+    var initArrOff: int64 := gotOff + gotSize;          // #2123: .init_array, 8-aligned
+    var initArrSize: int64 := hasInit * 8;
+    var relroEnd:   int64 := initArrOff + initArrSize;
     var globalsOff: int64 := relroEnd;
     var globalsSize: int64 := globalCount * 8;
     if hasGlobals != 0 { globalsOff := ((relroEnd + pageSize - 1) / pageSize) * pageSize; }
@@ -4159,6 +4238,9 @@ pub type CompilerConfig = class {
     var shstrOff:   int64 := loadEnd;
     var shstrSize:  int64 := 1 + 6 + 20 + 8 + 8 + 6 + 10 + 14 + 10 + 9 + 5 + 6 + 10;
     var shNum:      int64 := 13;
+    // #2123: .init_array nur, wenn es sie gibt — sonst bleibt jede .so ohne
+    // Anfangswerte Byte fuer Byte, wie sie war.
+    if hasInit != 0 { shstrSize := shstrSize + 12; shNum := 14; }
     var shOff:      int64 := ((shstrOff + shstrSize + 7) / 8) * 8;
     var fileSize:   int64 := shOff + shNum * 64;
 
@@ -4295,10 +4377,14 @@ pub type CompilerConfig = class {
     poke64(buf + d, 10); poke64(buf + d + ELF64_DYN_OFF_VAL, dynstrSize); d := d + 16;  // DT_STRSZ
     poke64(buf + d, 11); poke64(buf + d + ELF64_DYN_OFF_VAL, 24);         d := d + 16;  // DT_SYMENT
     poke64(buf + d, 14); poke64(buf + d + ELF64_DYN_OFF_VAL, 1);          d := d + 16;  // DT_SONAME
-    if nExt > 0 {
+    if nExt + hasInit > 0 {
       poke64(buf + d, 7); poke64(buf + d + ELF64_DYN_OFF_VAL, relaOff);   d := d + 16;  // DT_RELA
       poke64(buf + d, 8); poke64(buf + d + ELF64_DYN_OFF_VAL, relaSize);  d := d + 16;  // DT_RELASZ
       poke64(buf + d, 9); poke64(buf + d + ELF64_DYN_OFF_VAL, 24);        d := d + 16;  // DT_RELAENT
+    }
+    if hasInit != 0 {
+      poke64(buf + d, 25); poke64(buf + d + ELF64_DYN_OFF_VAL, initArrOff);  d := d + 16;  // DT_INIT_ARRAY
+      poke64(buf + d, 27); poke64(buf + d + ELF64_DYN_OFF_VAL, initArrSize); d := d + 16;  // DT_INIT_ARRAYSZ
     }
     // DT_NULL steht schon da (Nullfuellung).
 
@@ -4309,6 +4395,17 @@ pub type CompilerConfig = class {
       poke64(buf + ra + 0, gotOff + ej * 8);
       poke64(buf + ra + 8, ((1 + expCount + ej) << 32) | 1025);   // R_AARCH64_GLOB_DAT
       ej += 1;
+    }
+    // #2123: der .init_array-Eintrag. Die Adresse von __lyx_modinit wie die
+    // eines Exports (codeOff + Funktionsadresse + Stub-Versatz); RELA: der
+    // Lader schreibt Ladebasis + Addend, ohne Symbol.
+    if hasInit != 0 {
+      initAddr := codeOff + peek64(self.codeFuncAddrs + initIdx * 8) + self.codeStubOff;
+      var rr: int64 := relaOff + nExt * 24;
+      poke64(buf + rr + 0, initArrOff);
+      poke64(buf + rr + 8, 1027);                                  // R_AARCH64_RELATIVE
+      poke64(buf + rr + 16, initAddr);                             // r_addend
+      poke64(buf + initArrOff, initAddr);
     }
 
     // ---- PC-relative Adressen nachtragen (#2117) ----
@@ -4417,6 +4514,8 @@ pub type CompilerConfig = class {
     var nGot:  int64 := self._shlibName(sn, nDyn + 9, ".got"c);
     var nData: int64 := self._shlibName(sn, nGot + 5, ".data"c);
     var nShs:  int64 := self._shlibName(sn, nData + 6, ".shstrtab"c);
+    var nInit: int64 := 0;
+    if hasInit != 0 { nInit := self._shlibName(sn, nShs + 10, ".init_array"c); }   // #2123
     //                                name   type flags addr/off        size          link info align entsize
     var sh: int64 := buf + shOff + 64;   // [0] = SHT_NULL (Nullfuellung)
     self._shlibShdr(sh, nText, 1,  6, codeOff,       size,           0, 0, 4, 0);  sh := sh + 64;  // [1]
@@ -4429,6 +4528,9 @@ pub type CompilerConfig = class {
     self._shlibShdr(sh, nEh,   1,  2, ehFrameOff,    ehFrameSize,    0, 0, 8, 0);  sh := sh + 64;  // [8]
     self._shlibShdr(sh, nDyn,  6,  3, dynOff,        dynSize,        4, 0, 8, 16); sh := sh + 64;  // [9]
     self._shlibShdr(sh, nGot,  1,  3, gotOff,        gotSize,        0, 0, 8, 8);  sh := sh + 64;  // [10]
+    if hasInit != 0 {   // #2123: SHT_INIT_ARRAY (14), zwischen .got und .data wie im Speicher
+      self._shlibShdr(sh, nInit, 14, 3, initArrOff,  initArrSize,    0, 0, 8, 8);  sh := sh + 64;
+    }
     self._shlibShdr(sh, nData, 1,  3, globalsOff,    globalsSize,    0, 0, 8, 0);  sh := sh + 64;  // [11]
     self._shlibShdr(sh, nShs,  3,  0, 0,             shstrSize,      0, 0, 1, 0);                  // [12]
     poke64(sh + 24, shstrOff);   // .shstrtab: nicht geladen, sh_addr 0, nur sh_offset
@@ -5747,7 +5849,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.2.14C — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.2.15A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit

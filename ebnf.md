@@ -1,6 +1,6 @@
-# Lyx 1.2.14C — Canonical EBNF Grammar
+# Lyx 1.2.15A — Canonical EBNF Grammar
 
-> Stand 2026-10-16, gegen lyxc 1.2.14C geprueft. Die Keyword-Liste in
+> Stand 2026-10-17, gegen lyxc 1.2.15A geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -1381,13 +1381,14 @@ arm64/riscv nahmen fuer einen Teil der Namen die eigene Definition
 (`fn StrLen` ergab 3 bzw. 99), fuer `sqrt`, `Print*`, `Inspect` und
 `profile_*` dagegen den Builtin.
 
-**Noch nicht einheitlich: Funktionen IMPORTIERTER Units** mit Builtin-Namen
-(§20.1). x86 nimmt den Builtin (Ausnahme #1311: StrSplit, StrFind, StrTrim,
-FloatToStr, FileSize, ArgvGetStr mit abweichender Argumentzahl), der IR-Weg
-die Unit-Funktion -- ausser fuer `sqrt`, `Print`, `PrintLn`, `PrintStr`,
-`Inspect`, `profile_*` und `assert*`. Der IR-Weg kann davon nicht einfach
-abgehen: auf lyxos ersetzen die std-Fassungen Builtins, die das Backend
-nicht kennt (#1388). Offen als #2103.
+**Funktionen IMPORTIERTER Units** mit Builtin-Namen (§20.1) verdecken den
+Builtin nicht: der Aufruf geht an den Builtin -- seit 1.2.15A auf x86, arm64
+und riscv gleich (#2103). Ausnahme #1311: StrSplit, StrFind, StrTrim,
+FloatToStr, FileSize, ArgvGetStr mit einer anderen Argumentzahl als die
+Builtin-Form meinen die Unit-Funktion. Ausnahme lyxos: dort ersetzen die
+std-Fassungen Builtins, die das Backend nicht kennt (#1388) -- die
+importierte Funktion gewinnt. Bis 1.2.14C nahm der IR-Weg fuer einen Teil
+der Namen (peek8, StrLen, ...) die Unit-Funktion.
 
 # 16. Built-in and Special Expressions
 
@@ -1621,7 +1622,7 @@ Einzelbefunde sind dort verlinkt.
 | `Map<K,V>` | 14 | Benutzbar seit 1.0.15A (#1152/#1205): Literal, `m[k]` lesen und schreiben, `k in m`, `len(m)`, Deklaration ohne Initialisierung. Schluessel nur ganzzahlig — ein `pchar`-Schluessel wuerde ueber die Adresse verglichen und wird abgewiesen (#1291). Ein fehlender Schluessel liefert 0. `delete m[k]` und `for k, v in m` gibt es nicht. |
 | `new T[n]` (Heap-Array) | 15 | **Erledigt** -- die Produktion ist nachgezogen: `NewExpr` fuehrt seit 1.0.16G beide Formen. Die Zeile stand hier, solange der Parser mehr konnte als die Grammatik nannte (nachgemessen mit 1.1.6E: `new uint8[n]` und `new int64[4]` belegen Speicher, auch mit zur Laufzeit bestimmter Groesse). Sie bleibt als Standvermerk stehen; eine Abweichung ist es nicht mehr. |
 | `&x` (Adress-Operator) | 15 | Gibt es nicht. Ein Ausgabeparameter wird als Zelle uebergeben (`alloc(8)`, danach `peek64`). (#1061) |
-| Builtin-Name in einer IMPORTIERTEN Unit | 15.4 | Je Ziel verschieden: x86 nimmt den Builtin, arm64/riscv die Unit-Funktion (ausser `sqrt`, `Print*`, `Inspect`, `profile_*`, `assert*`). Fuer die EIGENE Unit gilt seit 1.2.13E einheitlich die Definition. (#2082, #2103) |
+| Builtin-Name in einer IMPORTIERTEN Unit | 15.4 | **Erledigt** seit 1.2.15A: auf x86, arm64 und riscv gewinnt der Builtin (Ausnahmen #1311 und lyxos, siehe 15.4). Bis 1.2.14C nahm der IR-Weg fuer einen Teil der Namen die Unit-Funktion. (#2082, #2103) |
 | Aufruf ueber indizierten Ausdruck | 15 | `handlers[0](a)` ist kein Aufruf -- ein Aufruf haengt am NAMEN. Wird abgewiesen; ein Funktionszeiger wird zuerst einer Variablen zugewiesen. (#1053) |
 | Nullable-Suffix, Pruefung | 7 | `T?` wird geparst und am Typknoten vermerkt, loest aber KEINE zusaetzliche Pruefung aus: ein nicht-nullbarer Typ nimmt weiterhin `null` an, und ein nullbarer wird ohne `?.` ungeprueft dereferenziert. Das Suffix dokumentiert die Absicht, es erzwingt sie nicht. `?.` dagegen prueft zur Laufzeit. (#1092) |
 | Struktur-Literal als Wert | 15 | `P { t: 1, f: 0 }` gibt es nur als MUSTER (§14, StructPattern), nicht als Ausdruck: `var p: P := P { t: 1 };` wird mit "expected expression" abgewiesen. Ein struct-Local wird ohne Initialisierer angelegt und feldweise gefuellt. Die Asymmetrie ist festgehalten, nicht behoben. (#1104) |

@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.14C
-VERSION_DATE := 2026-10-16
+VERSION   := 1.2.15A
+VERSION_DATE := 2026-10-17
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -280,6 +280,7 @@ test: lyxc
 	@bash tests/crt_raw_test.sh
 	@bash tests/capability_io_tty_test.sh
 	@bash tests/capability_signalfd_test.sh
+	@bash tests/seccomp_sendto_test.sh
 	@bash tests/typidentitaet_test.sh
 	@bash tests/capability_runde_b_test.sh
 	@bash tests/lcbs_abdeckung_test.sh
@@ -582,13 +583,19 @@ test: lyxc
 	@bash tests/builtin_stelligkeit_test.sh
 	@bash tests/x86_aufrufe_test.sh
 	@bash tests/builtin_verdeckung_test.sh
+	@bash tests/builtin_verdeckung_import_test.sh
 	@bash tests/sha512_test.sh
 	@bash tests/ir_datei_builtins_test.sh
 	@bash tests/unit_private_globals_test.sh
 	@bash tests/ir_kein_stiller_ausdruck_test.sh
 	@bash tests/riscv_zusicherung_test.sh
 	@bash tests/adresse_von_test.sh
+	@bash tests/ir_closures_test.sh
+	@bash tests/ir_bezeichner_herkunft_test.sh
+	@bash tests/ir_generics_test.sh
 	@bash tests/android_shared_lib_test.sh
+	@bash tests/ir_modulvar_init_test.sh
+	@bash tests/x86_shared_lib_test.sh
 	@bash tests/ir_mmap_test.sh
 	@bash tests/ir_sprungweite_test.sh
 	@bash tests/argv_ir_test.sh
