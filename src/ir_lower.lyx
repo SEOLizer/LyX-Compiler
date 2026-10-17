@@ -2169,6 +2169,46 @@ pub type IRLower = class {
     return 0;
   }
 
+  // #2132: Argumentblock fuer einen Aufruf reservieren — so viele Slots, wie
+  // der Aufruf hoechstens belegt, mindestens acht. Gezaehlt werden die
+  // Argumente der Liste ab `arg0` plus `extra` (self, Umgebung, Vorgabewerte;
+  // eine Ueberschaetzung schadet nicht).
+  //
+  // Bis 1.2.15A reservierte jede Stelle fest acht Slots. Ein neuntes Argument
+  // landete damit auf base+8 — einem Temp, das bei der Auswertung eines
+  // spaeteren Arguments schon wieder vergeben war. Der Block muss VOR der
+  // Auswertung stehen: was danach angelegt wird, liegt sicher darueber.
+  fn _irArgBlock(arg0: int64, extra: int64): int64 {
+    var n: int64 := extra;
+    var a: int64 := arg0;
+    while a >= 0 { n := n + 1; a := self.nodeNext(a); }
+    if n < 8 { n := 8; }
+    var base: int64 := self.tempCount;
+    var r: int64 := 0;
+    while r < n { self.allocTemp(); r := r + 1; }
+    return base;
+  }
+
+  // #2132: Die Argumente der Liste ab `arg0` der Reihe nach auswerten und
+  // jedes SOFORT in den Block (base + start + i) legen — dieselbe Konvention
+  // wie beim direkten Aufruf (#1388/#2028). Ein Aufruf in einem spaeteren
+  // Argument belegt seinen eigenen, hoeheren Block und laesst die frueheren
+  // stehen. Liefert start + Anzahl.
+  //
+  // Die indirekten Aufrufe legten jedes Argument bis 1.2.15A in Slot i des
+  // Kratzstreifens: `f(1, g(2))` ueberschrieb dort mit der 2 die 1.
+  fn _irArgsLegen(arg0: int64, base: int64, start: int64): int64 {
+    var i: int64 := start;
+    var a: int64 := arg0;
+    while a >= 0 {
+      var t: int64 := self.lowerExpr(a);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, base + i, t, -1, 0);
+      i := i + 1;
+      a := self.nodeNext(a);
+    }
+    return i;
+  }
+
   // #2103: Aufruf der Nutzerfunktion fbUserIdx (aus lowerCall herausgeloest,
   // weil er jetzt an zwei Stellen entsteht: sofort und zurueckgestellt).
   fn _irRufNutzer(expr: int64, fbUserIdx: int64, arg0: int64, dest: int64): int64 {
@@ -2177,9 +2217,15 @@ pub type IRLower = class {
     // reservierten hohen Slot-Block (argBase..argBase+7) nutzen, der über allen
     // Live-Werten liegt. Sonst klobbert z.B. fib(n-1) den Slot0 (=Param n), und
     // fib(n-2) liest n-1 → falsch. emitCall lädt aus argBase (IRO_CALL.src2).
-    var fbArgBase: int64 := self.tempCount;
-    var fbRsv: int64 := 0;
-    while fbRsv < 8 { self.allocTemp(); fbRsv := fbRsv + 1; }
+    // #2132: der Block fasst alle Argumente samt Vorgabewerten (die
+    // Parameterzahl der Deklaration als Obergrenze), nicht fest acht.
+    var fbVorDecl: int64 := self._callDeclNi(expr);
+    var fbVorN: int64 := 0;
+    if fbVorDecl >= 0 {
+      var fbVorP: int64 := self.nodeC0(fbVorDecl);
+      while fbVorP >= 0 { fbVorN := fbVorN + 1; fbVorP := self.nodeNext(fbVorP); }
+    }
+    var fbArgBase: int64 := self._irArgBlock(arg0, fbVorN);
     var fbArgCnt: int64 := 0;
     var fbArg: int64 := arg0;
     while fbArg >= 0 {
@@ -2324,9 +2370,7 @@ pub type IRLower = class {
       }
       // Arg-Block: self @ argBase, dann die expliziten Args — dieselbe
       // Konvention wie beim Methodenaufruf darunter.
-      var spArgBase: int64 := self.tempCount;
-      var spRsv: int64 := 0;
-      while spRsv < 8 { self.allocTemp(); spRsv := spRsv + 1; }
+      var spArgBase: int64 := self._irArgBlock(self.nodeC1(expr), 1);   // #2132
       var spSelf: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_LOAD_LOCAL, spSelf, IR_BARG_SLOTS, -1, 0);
       self.irAddInstrDirect(IRO_STORE_LOCAL, spArgBase, spSelf, -1, 0);
@@ -2362,27 +2406,21 @@ pub type IRLower = class {
         self.irAddInstrDirect(IRO_LOAD_FIELD, mfCode, mfP, 0, 0);
         var mfData: int64 := self.allocTemp();
         self.irAddInstrDirect(IRO_LOAD_FIELD, mfData, mfP, 8, 0);
-        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, mfData, -1, 0);   // self → slot 0
-        var mfArg: int64 := self.nodeC1(expr); var mfI: int64 := 1;
-        while mfArg >= 0 {
-          var mfAT: int64 := self.lowerExpr(mfArg);
-          self.irAddInstrDirect(IRO_STORE_LOCAL, mfI, mfAT, -1, 0);
-          mfI += 1; mfArg := self.nodeNext(mfArg);
-        }
-        self.irAddInstrDirect(IRO_CALL_INDIRECT, mcDest, mfCode, -1, mfI);
+        // #2132: self und Argumente in einen hohen Block (src2 = argBase),
+        // nicht in die Slots 0..N-1 — ein Aufruf im Argument ueberschrieb sie.
+        var mfB: int64 := self._irArgBlock(self.nodeC1(expr), 1);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, mfB, mfData, -1, 0);   // self → argBase[0]
+        var mfI: int64 := self._irArgsLegen(self.nodeC1(expr), mfB, 1);
+        self.irAddInstrDirect(IRO_CALL_INDIRECT, mcDest, mfCode, mfB, mfI);
         return mcDest;
       }
       if fpOff >= 0 {
         var fpBase: int64 := self.lowerExpr(mcBaseNode);
         var fpFn: int64 := self.allocTemp();
         self.irAddInstrDirect(IRO_LOAD_FIELD, fpFn, fpBase, fpOff, 0);
-        var fpArg: int64 := self.nodeC1(expr); var fpI: int64 := 0;
-        while fpArg >= 0 {
-          var fpAT: int64 := self.lowerExpr(fpArg);
-          self.irAddInstrDirect(IRO_STORE_LOCAL, fpI, fpAT, -1, 0);
-          fpI += 1; fpArg := self.nodeNext(fpArg);
-        }
-        self.irAddInstrDirect(IRO_CALL_INDIRECT, mcDest, fpFn, -1, fpI);
+        var fpB: int64 := self._irArgBlock(self.nodeC1(expr), 0);   // #2132
+        var fpI: int64 := self._irArgsLegen(self.nodeC1(expr), fpB, 0);
+        self.irAddInstrDirect(IRO_CALL_INDIRECT, mcDest, fpFn, fpB, fpI);
         return mcDest;
       }
       // WP-XMOD-OOP: Klassenname + lokales decl holen. localDecl>=0 = same-module (Fast-Path,
@@ -2412,9 +2450,7 @@ pub type IRLower = class {
         if mcLocal >= 0 { mcVirt := self._methodVirtual(mcLocal, mNameP, mNameL); }
         else { mcVirt := self._tregMethodVirtualG(self._tregFind(mcCName, mcCNameL), mNameP, mNameL); }
         // Arg-Block: self @ argBase, dann explizite Args.
-        var mcArgBase: int64 := self.tempCount;
-        var mcRsv: int64 := 0;
-        while mcRsv < 8 { self.allocTemp(); mcRsv := mcRsv + 1; }
+        var mcArgBase: int64 := self._irArgBlock(self.nodeC1(expr), 1);   // #2132
         var mcSelf: int64 := self.lowerExpr(mcBaseNode);
         self.irAddInstrDirect(IRO_STORE_LOCAL, mcArgBase, mcSelf, -1, 0);
         var mcCnt: int64 := 1;
@@ -2630,16 +2666,19 @@ pub type IRLower = class {
       if (arg0 < 0) { return dest; }
       var fnTemp: int64 := self.lowerExpr(arg0);
       var argNode: int64 := self.nodeNext(arg0);
+      // #2132: Argumente in einen hohen Block (src2 = argBase) statt in die
+      // Slots 0..N-1 — die Einschraenkung oben ("clobbers the function's own
+      // slots") gilt damit nicht mehr.
+      var icB: int64 := self._irArgBlock(argNode, 0);
       var i: int64 := 0;
       while (i < indN && argNode >= 0) {
         var aTemp: int64 := self.lowerExpr(argNode);
-        // Store argTemp into slot `i` so the AArch64 emitter loads it into x{i}.
-        self.irAddInstrDirect(IRO_STORE_LOCAL, i, aTemp, -1, 0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, icB + i, aTemp, -1, 0);
         argNode := self.nodeNext(argNode);
         i += 1;
       }
-      // src1 = slot index of fn pointer, imm = arg count.
-      self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, fnTemp, -1, indN);
+      // src1 = slot index of fn pointer, src2 = argBase, imm = arg count.
+      self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, fnTemp, icB, indN);
       return dest;
     }
 
@@ -3182,15 +3221,14 @@ pub type IRLower = class {
         exLibLen    := (exLibPacked >> 32) & 0xFFFFFFFF;
         exLibStrOff := self.irAddString((self.src as int64 + exLibOff) as pchar, exLibLen);
       }
-      var exArgCnt: int64 := 0;
-      var exArg: int64 := arg0;
-      while exArg >= 0 {
-        var exAT: int64 := self.lowerExpr(exArg);
-        self.irAddInstrDirect(IRO_STORE_LOCAL, exArgCnt, exAT, -1, 0);
-        exArgCnt += 1;
-        exArg := self.nodeNext(exArg);
-      }
-      self.irAddInstrDirect(IRO_CALL_EXTERN, dest, exArgCnt, exLibStrOff, exNameStrOff);
+      // #2132: Argumente in einen hohen Block; dessen Basis steht in src3
+      // (src1/src2/imm sind belegt). Bis 1.2.15A lag jedes Argument sofort in
+      // Slot i — `cfn(1, g(2))` ueberschrieb die 1 —, und mehr als acht
+      // gingen nicht.
+      var exB: int64 := self._irArgBlock(arg0, 0);
+      var exArgCnt: int64 := self._irArgsLegen(arg0, exB, 0);
+      var exIdx: int64 := self.irAddInstrDirect(IRO_CALL_EXTERN, dest, exArgCnt, exLibStrOff, exNameStrOff);
+      poke64(peek64(self.ir + IR_MOD_OFF_INSTRBUF) + exIdx * IR_INSTR_SIZE + IR_INSTR_OFF_SRC3, exB);
       return dest;
     }
 
@@ -6012,13 +6050,9 @@ pub type IRLower = class {
       if lfCl >= 0 { return lfCl; }
       var lfFn: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_LOAD_LOCAL, lfFn, lfSlot, -1, 0);
-      var lfArg: int64 := arg0; var lfI: int64 := 0;
-      while lfArg >= 0 {
-        var lfAT: int64 := self.lowerExpr(lfArg);
-        self.irAddInstrDirect(IRO_STORE_LOCAL, lfI, lfAT, -1, 0);
-        lfI += 1; lfArg := self.nodeNext(lfArg);
-      }
-      self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, lfFn, -1, lfI);
+      var lfB: int64 := self._irArgBlock(arg0, 0);   // #2132
+      var lfI: int64 := self._irArgsLegen(arg0, lfB, 0);
+      self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, lfFn, lfB, lfI);
       return dest;
     }
 
@@ -6063,15 +6097,9 @@ pub type IRLower = class {
           // Slots 0..N-1, die Fn-Adresse darf davon nicht getroffen werden.
           var gvFn: int64 := self.allocTemp();
           self.irAddInstrDirect(IRO_LOAD_GLOBAL, gvFn, gvIdx, -1, 0);
-          var gvArg: int64 := arg0;
-          var gvN:   int64 := 0;
-          while gvArg >= 0 {
-            var gvAT: int64 := self.lowerExpr(gvArg);
-            self.irAddInstrDirect(IRO_STORE_LOCAL, gvN, gvAT, -1, 0);
-            gvN += 1;
-            gvArg := self.nodeNext(gvArg);
-          }
-          self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, gvFn, -1, gvN);
+          var gvB: int64 := self._irArgBlock(arg0, 0);   // #2132
+          var gvN: int64 := self._irArgsLegen(arg0, gvB, 0);
+          self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, gvFn, gvB, gvN);
           return dest;
         }
       }
@@ -6973,8 +7001,7 @@ pub type IRLower = class {
     var ctorLen:  int64 := self.nodeSLen(expr) + 1 + 6;
     var ctorIdx:  int64 := self._findFuncByName(ctorMang as pchar, ctorLen);
     if ctorIdx >= 0 {
-      var cArgBase: int64 := self.tempCount;
-      var cRsv: int64 := 0; while cRsv < 8 { self.allocTemp(); cRsv := cRsv + 1; }
+      var cArgBase: int64 := self._irArgBlock(self.nodeC0(expr), 1);   // #2132
       self.irAddInstrDirect(IRO_STORE_LOCAL, cArgBase, dest, -1, 0);   // self = neues Objekt
       var cCnt: int64 := 1;
       var cArg: int64 := self.nodeC0(expr);
@@ -12631,20 +12658,9 @@ pub type IRLower = class {
     var p: int64 := self.nodeC0(node);
     while p >= 0 { self.allocParam(); np := np + 1; p := self.nodeNext(p); }
     var env: int64 := 0 - 1;
-    var regs: int64 := np;
-    if capN > 0 { env := self.allocParam(); regs := regs + 1; }
-    if regs > 8 {
-      // Die IR-Backends uebergeben acht Registerargumente (x0..x7, a0..a7);
-      // ein neuntes ginge still verloren.
-      EPrintStr("lyxc: --target="c);
-      EPrintStr(self._targetName());
-      EPrintStr(": Lambda mit "c);
-      EPrintInt(np);
-      EPrintStr(" Parametern"c);
-      if capN > 0 { EPrintStr(" und Umgebung"c); }
-      EPrintStrLn(" — der IR-Weg uebergibt hoechstens 8 Registerargumente (#2108)."c);
-      exit(1);
-    }
+    // #2132: Parameter ab dem neunten kommen ueber den Stapel (Prolog der
+    // IR-Backends); die Grenze von acht aus #2108 entfaellt.
+    if capN > 0 { env := self.allocParam(); }
     self.retValTemp := self.allocTemp();
     self.funcExitLabel := self.genLabel();
     self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
@@ -12775,39 +12791,17 @@ pub type IRLower = class {
     if self._clIstFett(slot) == 0 { return 0 - 1; }
     var satz: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_LOAD_LOCAL, satz, slot, -1, 0);
-    // Erst ALLE Argumente auswerten: ein Aufruf darin belegt die Slots 0..N-1
-    // selbst, ein schon dort abgelegtes Argument waere danach ueberschrieben.
-    var n: int64 := 0;
-    var a: int64 := arg0;
-    while a >= 0 { n := n + 1; a := self.nodeNext(a); }
-    if n + 1 > 8 {
-      EPrintStr("lyxc: --target="c);
-      EPrintStr(self._targetName());
-      EPrintStr(": Aufruf eines Lambdas mit "c);
-      EPrintInt(n);
-      EPrintStrLn(" Argumenten und Umgebung — der IR-Weg uebergibt hoechstens 8 Registerargumente (#2108)."c);
-      exit(1);
-    }
-    var temps: int64 := alloc((n + 1) * 8);
-    var i: int64 := 0;
-    a := arg0;
-    while a >= 0 {
-      poke64(temps + i * 8, self.lowerExpr(a));
-      i := i + 1;
-      a := self.nodeNext(a);
-    }
+    // #2132: Argumente in einen hohen Block (src2 = argBase) wie beim
+    // direkten Aufruf; ein Aufruf in einem Argument belegt einen eigenen,
+    // hoeheren Block. Die Umgebung folgt als letztes Argument.
+    var b: int64 := self._irArgBlock(arg0, 1);
+    var n: int64 := self._irArgsLegen(arg0, b, 0);
     var code: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_LOAD_FIELD, code, satz, 0, 0);
     var env: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_LOAD_FIELD, env, satz, 8, 0);
-    i := 0;
-    while i < n {
-      self.irAddInstrDirect(IRO_STORE_LOCAL, i, peek64(temps + i * 8), -1, 0);
-      i := i + 1;
-    }
-    free(temps, (n + 1) * 8);
-    self.irAddInstrDirect(IRO_STORE_LOCAL, n, env, -1, 0);
-    self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, code, -1, n + 1);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, b + n, env, -1, 0);
+    self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, code, b, n + 1);
     return dest;
   }
 

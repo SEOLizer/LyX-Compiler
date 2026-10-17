@@ -591,6 +591,7 @@ test: lyxc
 	@bash tests/riscv_zusicherung_test.sh
 	@bash tests/adresse_von_test.sh
 	@bash tests/ir_closures_test.sh
+	@bash tests/ir_viele_argumente_test.sh
 	@bash tests/ir_bezeichner_herkunft_test.sh
 	@bash tests/ir_generics_test.sh
 	@bash tests/android_shared_lib_test.sh
