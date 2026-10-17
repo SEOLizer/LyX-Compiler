@@ -13,10 +13,10 @@
 # Jetzt entsteht je Unit eine Funktion, und main ruft sie vorab — in
 # Abhaengigkeitsreihenfolge (importierte Unit vor dem Importeur).
 #
-# Teil 1 vergleicht mit x86_64 fuer alles, was der x86-Weg uebersetzt. Teil 2
-# misst, was x86 (noch) LAUT abweist — einen Aufruf oder eine andere
-# Modulvariable im Anfangswert ("Startwert ist zur Uebersetzungszeit nicht
-# bekannt"); dort gilt der ausgerechnete Wert. Die REIHENFOLGE wird am Weg
+# Teil 1 vergleicht mit x86_64. Teil 2 misst Aufruf und andere Modulvariable
+# im Anfangswert gegen den ausgerechneten Wert; x86 wies das bis 1.2.15A ab,
+# seit #2136 kann es das auch — der Vergleich x86 == arm64 == riscv dafuer
+# steht in tests/modulvar_init_x86_test.sh. Die REIHENFOLGE wird am Weg
 # gemessen: jeder Anfangswert haengt eine Ziffer an einen Zaehler, 123 heisst
 # "einmal, und in dieser Folge".
 set -uo pipefail
@@ -188,9 +188,9 @@ r="$(lyxos_rc "$TMP/lx2.lyx")"; [ "$r" = "69" ]  && ok "lyxos: Zeichenkette (rc 
 r="$(lyxos_rc "$TMP/lx3.lyx")"; [ "$r" = "123" ] && ok "lyxos: Importe, Reihenfolge (rc $r)" || nok "lyxos: Importe, Reihenfolge: rc $r statt 123"
 
 # --- Teil 4: --compile-unit fuer ein IR-Ziel ---------------------------------
-# Eine vorkompilierte Unit hat (noch) keinen Aufrufer fuer ihre Anfangswerte.
-# Gemessen wird, dass daraus keine STILLE Null wird: entweder die Meldung, oder
-# der Wert kommt im einbindenden Programm richtig an.
+# Gemessen wird, dass aus den Anfangswerten einer vorkompilierten Unit keine
+# STILLE Null wird. Bis 1.2.15A wurde sie laut abgewiesen; seit #2136 traegt
+# die .lyu ihre Init-Funktion, und der Wert muss im Programm ankommen.
 mkdir -p "$TMP/cu/demo"
 # Eine Zeichenkette: die nimmt auch der x86-Weg, der beim Vorkompilieren
 # mitlaeuft — die Frage landet also wirklich beim IR.
@@ -209,8 +209,7 @@ if ( cd "$ROOT" && timeout 240 "$LYXC" --compile-unit --target=arm64 --std-path=
     [ "$ist" = "42" ] && ok "--compile-unit: Wert kommt an ($ist)" || nok "--compile-unit: [$ist] statt 42 — stille Null"
   else nok "--compile-unit: Programm uebersetzt nicht ($(grep -v Copyright "$TMP/cub.log" | head -1))"; fi
 else
-  grep -q "#2123" "$TMP/cu.log" && ok "--compile-unit: laut abgewiesen" \
-    || nok "--compile-unit: Abbruch ohne Meldung ($(grep -v Copyright "$TMP/cu.log" | head -1))"
+  nok "--compile-unit: abgewiesen ($(grep -v Copyright "$TMP/cu.log" | grep -m1 -iE 'error|lyxc:'))"
 fi
 
 echo

@@ -142,17 +142,13 @@ gout "leere Zeichenkette ist ein gueltiger Zeiger" 'import src.std.io;
 var leer: pchar := "";
 fn main(): int64 { PrintLn(IntToStr(StrLen(leer))); return 0; }' "0"
 
-# Nicht ausrechenbar: melden statt still 0.
-printf '%s\n' 'import src.std.io;
-fn f(): int64 { return 1; }
+# Nicht ausrechenbar: nie still 0. Bis 1.2.15A gemeldet ("zur
+# Uebersetzungszeit nicht bekannt"), seit #2136 vor main gerechnet — gemessen
+# am WERT, der nicht 0 sein darf.
+gout "nicht konstanter Startwert wird gerechnet (#2136)" 'import src.std.io;
+fn f(): int64 { return 17; }
 var a: int64 := f();
-fn main(): int64 { PrintLn(a); return 0; }' > "$TMP/gn.lyx"
-out=$(lyxc_run --std-path="$ROOT" "$TMP/gn.lyx" -o "$TMP/gn" 2>&1)
-if echo "$out" | grep -q "zur Uebersetzungszeit nicht bekannt"; then
-  ok "nicht konstanter Startwert wird gemeldet"
-else
-  no "nicht konstanter Startwert" "keine Meldung — '$(echo "$out" | tail -1)'"
-fi
+fn main(): int64 { PrintLn(a); return 0; }' "17"
 
 # ===========================================================================
 # #1172 — Methodenzeiger ohne Typangabe

@@ -23,25 +23,29 @@ ok() { echo "PASS $1"; PASS=$((PASS+1)); }
 no() { echo "FAIL $1: $2"; FAIL=$((FAIL+1)); }
 
 # ===========================================================================
-# Der Fall aus dem Bericht: nicht konstanter globaler Startwert
+# Ein Fehler, den erst der Codegen sieht.
+#
+# Bis 1.2.15A stand hier der Fall aus dem Bericht, ein nicht konstanter
+# globaler Startwert (`var g := F() + 1`). Den rechnet seit #2136 eine
+# Init-Funktion vor main — er ist kein Fehler mehr. Gebraucht wird aber nur
+# IRGENDEIN Fehler, den sema durchlaesst und der Codegen meldet: ein
+# Array-Startwert mit mehr Elementen als das Array.
 # ===========================================================================
 cat > "$TMP/kaputt.lyx" <<'EOF'
 unit kaputt;
-fn F(): int64 { return 1; }
-var g: int64 := F() + 1;
+var q: [2]int64 := [1, 2, 3];
 EOF
 
 # Erst der Beleg, dass der Codegen das WIRKLICH beanstandet — sonst prueft der
 # Test unten nichts.
 cat > "$TMP/alsprog.lyx" <<'EOF'
-fn F(): int64 { return 1; }
-var g: int64 := F() + 1;
-fn main(): int64 { return g; }
+var q: [2]int64 := [1, 2, 3];
+fn main(): int64 { return q[0]; }
 EOF
 if timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/alsprog.lyx" -o "$TMP/alsprog" >"$TMP/p.log" 2>&1; then
   no "Vorbedingung: der Codegen beanstandet den Startwert" "als Programm klaglos uebersetzt"
 else
-  grep -q "nicht bekannt" "$TMP/p.log" \
+  grep -q "codegen error.*mehr Elemente" "$TMP/p.log" \
     && ok "Vorbedingung: als Programm meldet der Codegen den Startwert" \
     || no "Vorbedingung" "andere Meldung: $(grep -m1 -i error "$TMP/p.log")"
 fi
@@ -50,7 +54,7 @@ fi
 if timeout 200 "$LYXC" --std-path="$ROOT" --compile-unit "$TMP/kaputt.lyx" -o "$TMP/kaputt.lyu" >"$TMP/u.log" 2>&1; then
   no "#1587: --compile-unit meldet den Codegen-Fehler" "rc=0 — die .lyu wurde geschrieben"
 else
-  grep -q "nicht bekannt" "$TMP/u.log" \
+  grep -q "codegen error.*mehr Elemente" "$TMP/u.log" \
     && ok "#1587: --compile-unit meldet denselben Fehler wie der Programmbau" \
     || no "#1587: Meldung" "$(grep -m1 -i error "$TMP/u.log")"
 fi

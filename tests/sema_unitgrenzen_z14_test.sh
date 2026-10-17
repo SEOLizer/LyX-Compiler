@@ -163,12 +163,13 @@ out "#1514: globales char mit Startwert" 'import std.io;
 var c: char := 65;
 fn main(): int64 { PrintLn(IntToStr(c)); return 0; }' "65"
 
-# Die Gegenprobe: ein wirklich nicht konstanter Startwert muss weiter melden —
-# sonst waere aus dem Fix ein stiller Default geworden.
-meldet "#1514: nicht konstanter globaler Startwert bleibt ein Fehler" 'import std.io;
+# Die Gegenprobe: ein wirklich nicht konstanter Startwert darf nicht still 0
+# werden. Bis 1.2.15A wurde er gemeldet ("nicht bekannt"); seit #2136 rechnet
+# ihn die Init-Funktion vor main — gemessen am WERT.
+out "#1514/#2136: nicht konstanter globaler Startwert wird gerechnet" 'import std.io;
 fn F(): int64 { return 1; }
 var g: int64 := F() + 1;
-fn main(): int64 { PrintLn(IntToStr(g)); return 0; }' "nicht bekannt"
+fn main(): int64 { PrintLn(IntToStr(g)); return 0; }' "2"
 
 # ===========================================================================
 # #1574 — globale Variable vom Funktionstyp

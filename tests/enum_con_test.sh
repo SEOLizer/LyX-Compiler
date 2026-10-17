@@ -111,17 +111,13 @@ fn main(): int64 {
   return 0;
 }' "1 3 4"
 
-# Ein Ausdruck, der WIRKLICH nicht uebersetzungszeit-konstant ist, muss
-# weiterhin abgewiesen werden — sonst waere aus der Meldung ein stiller
-# Falschwert geworden.
-printf 'import std.io;\nfn f(): int64 { return 7; }\nvar g: int64 := f();\nfn main(): int64 { PrintLn(IntToStr(g)); return 0; }\n' > "$TMP/nk.lyx"
-if "$LYXC" --std-path="$ROOT" "$TMP/nk.lyx" -o "$TMP/nk" >/dev/null 2>&1; then
-  no "#1507: nicht-konstanter Startwert wird weiterhin abgewiesen" "uebersetzt klaglos"
-else
-  meldung="$("$LYXC" --std-path="$ROOT" "$TMP/nk.lyx" -o "$TMP/nk" 2>&1 | grep -ci "uebersetzungszeit")"
-  if [ "$meldung" -ge 1 ]; then ok "#1507: nicht-konstanter Startwert wird weiterhin abgewiesen"
-  else no "#1507: nicht-konstanter Startwert wird weiterhin abgewiesen" "andere Meldung"; fi
-fi
+# Ein Ausdruck, der WIRKLICH nicht uebersetzungszeit-konstant ist, darf kein
+# stiller Falschwert werden. Bis 1.2.15A wurde er abgewiesen; seit #2136
+# rechnet ihn die Init-Funktion vor main — gemessen am WERT.
+out "#1507/#2136: nicht-konstanter Startwert wird gerechnet" 'import std.io;
+fn f(): int64 { return 7; }
+var g: int64 := f();
+fn main(): int64 { PrintLn(IntToStr(g)); return 0; }' "7"
 
 echo "--- $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]

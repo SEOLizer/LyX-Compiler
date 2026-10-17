@@ -658,6 +658,25 @@ pub type Codegen = class {
   soExpTab:        int64;   // je Export 16 Byte: {Knoten, Codeoffset der Huelle}
   soExpCount:      int64;
   soInitOff:       int64;   // Codeoffset von __lyx_so_init
+  // #2136: Anfangswerte von Modulvariablen zur LAUFZEIT — dieselbe Form wie
+  // im IR-Weg seit #2123 (ir_lower._modInitEinheit/_modInitHaupt; die beiden
+  // muessen uebereinstimmen). Je Unit eine Funktion `__lyx_modinit_<n>`,
+  // erzeugt am Ende ihres cg_genFile (Importe also vor dem Importeur), und
+  // eine Sammelfunktion `__lyx_modinit`, die main nach der Haertung ruft
+  // bzw. in einer Bibliothek __lyx_so_init.
+  //   miPend*  — Deklarationsknoten mit Laufzeit-Anfangswert, als Stapel:
+  //              eine Unit verarbeitet nur die Eintraege ab ihrem Anfang.
+  //   miFn*    — je 16 B: Name der Unit-Funktion (Zeiger, Laenge)
+  //   miMainRuft    — 1, wenn main __lyx_modinit ruft
+  //   miMainFertig  — 1, sobald main des Hauptmoduls erzeugt ist
+  miPendBuf:       int64;
+  miPendN:         int64;
+  miPendCap:       int64;
+  miFnBuf:         int64;
+  miFnN:           int64;
+  miFnCap:         int64;
+  miMainRuft:      int64;
+  miMainFertig:    int64;
   // #1262: Namensraum der gerade eingelesenen Unit (`import M as m;`). Solange
   // gesetzt, entstehen Funktionsmarken als "m_Name" — sonst traegt der
   // Codestrom zweimal dasselbe Symbol und ein Aufruf traefe die falsche
@@ -20137,6 +20156,20 @@ pub type Codegen = class {
           self.cg_emitLandlockInit(); // WP-R10: Landlock (vor seccomp)
           self.cg_emitSeccompInit();  // WP-R9: seccomp zuletzt
         }
+        // #2136: Anfangswerte der Modulvariablen — NACH der Haertung, damit
+        // auch Code in einem Anfangswert unter seccomp/landlock laeuft, und
+        // vor dem ersten Befehl des Rumpfs. Nur main des Hauptmoduls; in
+        // einer Bibliothek ruft __lyx_so_init (cg_soEmitInit).
+        if (self.cgUnitTag == 0 && self.sharedLib == 0 && self.miMainFertig == 0) {
+          if (self.cg_miMainBraucht(ni) != 0) {
+            self.cg_e8(0xE8);                                   // call __lyx_modinit
+            var ppMi: int64 := self.codeLen;
+            self.cg_e32(0);
+            self.cg_addPatch(ppMi, "__lyx_modinit" as int64, 13, CG_PATCH_CALL);
+            self.miMainRuft := 1;
+          }
+          self.miMainFertig := 1;
+        }
       }
     }
     // Generate function body (child2 = block)
@@ -21793,10 +21826,14 @@ pub type Codegen = class {
     var nestSaved: int64 := self.nestMapCnt;
 
     // Recursively generate code for the imported file
+    var miStartImp: int64 := self.miPendN;   // #2136
     self.cg_genFile(head);
     // Was noch vorgemerkt ist, gehoert zu DIESEN Knoten — jetzt erzeugen,
     // nicht spaeter unter der Tabelle des einbindenden Moduls.
     self.cg_flushNested();
+    // #2136: die Anfangswerte dieser Unit — ebenfalls noch unter ihrer
+    // Tabelle und ihrem Privatverzeichnis.
+    self.cg_miEinheit(miStartImp);
     
     // AP-1: Collect function labels from imported module
     // This makes imported functions visible for patch resolution in main file
@@ -22413,10 +22450,13 @@ pub type Codegen = class {
             // #1299: Array-Literal als globaler Startwert. Die Elemente stehen
             // fest, wenn sie konstant sind — dann werden sie hier in den Block
             // geschrieben, statt (wie im Ausdruckspfad) zur Laufzeit auf dem
-            // Stack aufgebaut. Einen Ort, an dem eine Initialisierungssequenz
-            // vor `main` liefe, gibt es fuer Globale nicht.
+            // Stack aufgebaut.
+            // #2136: Ein Element, das erst zur Laufzeit feststeht, rechnet die
+            // Init-Funktion der Unit (cg_miEinsInit) in denselben Block; bis
+            // 1.2.15A wurde es abgewiesen.
             var aEl: int64 := self.cg_nc0(initNode);
             var aI: int64 := 0;
+            var aLauf: int64 := 0;
             while (aEl != -1) {
               if (aI >= aggElems) {
                 EPrintStr("codegen error: globales Array '"c);
@@ -22425,16 +22465,14 @@ pub type Codegen = class {
                 exit(1);
               }
               if (self.cg_isConstExpr(aEl) == 0) {
-                EPrintStr("codegen error: globales Array '"c);
-                sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
-                EPrintStrLn("': Element des Startwerts ist zur Uebersetzungszeit nicht bekannt"c);
-                EPrintStrLn("  Globale Startwerte muessen konstant sein; sonst in einer fn zuweisen."c);
-                exit(1);
+                aLauf := 1;
+              } else {
+                poke64(self.data + aggBlock + 16 + aI * 8, self.cg_evalConExpr(aEl));
               }
-              poke64(self.data + aggBlock + 16 + aI * 8, self.cg_evalConExpr(aEl));
               aI := aI + 1;
               aEl := self.cg_nnext(aEl);
             }
+            if (aLauf != 0) { self.cg_miVormerken(cur); }
           } else if (ik == CGN_LIT_STR) {
             // #1164: Der Startwert ist die ADRESSE der Zeichenkette. Sie steht
             // erst fest, wenn die Codelaenge feststeht (der Datenbereich folgt
@@ -22511,13 +22549,10 @@ pub type Codegen = class {
                                self.cg_nslen(initNode), CG_PATCH_DATA_FN);
             }
           } else {
-            // Nicht ausrechenbar: melden statt still auf 0 stehen lassen. Eine
-            // Initialisierungssequenz vor main gibt es fuer Globale nicht.
-            EPrintStr("codegen error: globale Variable '"c);
-            sys_write(2, self.cg_nsval(cur) as int64, self.cg_nslen(cur));
-            EPrintStrLn("': Startwert ist zur Uebersetzungszeit nicht bekannt"c);
-            EPrintStrLn("  Globale Startwerte muessen konstant sein; sonst in einer fn zuweisen."c);
-            exit(1);
+            // #2136: Nicht ausrechenbar — bis 1.2.15A wurde hier abgewiesen
+            // ("Startwert ist zur Uebersetzungszeit nicht bekannt"). Jetzt
+            // rechnet ihn die Init-Funktion der Unit vor main.
+            self.cg_miVormerken(cur);
           }
         }
       } else if (k == CGN_CON_DECL) {
@@ -22841,6 +22876,14 @@ pub type Codegen = class {
     self.lastAnonName    := 0;
     self.lastAnonNameLen := 0;
     self.unitCheckMode   := 0;
+    self.miPendCap := 16;                                     // #2136
+    self.miPendBuf := alloc(self.miPendCap * 8);
+    self.miPendN   := 0;
+    self.miFnCap   := 8;
+    self.miFnBuf   := alloc(self.miFnCap * 16);
+    self.miFnN     := 0;
+    self.miMainRuft   := 0;
+    self.miMainFertig := 0;
     self.globalTypeNames := alloc(self.globalVarCap * 16);
     self.globalIsArray  := alloc(self.globalVarCap);          // #1256
     self.globalArraySize := alloc(self.globalVarCap * 8);     // #1256
@@ -23857,7 +23900,12 @@ pub type Codegen = class {
     self.cg_genHwDevPathSection(); // WP-H12: Gerätepfad-Strings in Datensektion
     self.cg_genFsPathSection();    // #1173: fs-Pfad-Strings in Datensektion
     self.cg_emitProxyLoop();       // WP-R11: Proxy-Kind-Loop-Code in Codesektion (vor main)
+    var miStartHaupt: int64 := self.miPendN;   // #2136
     self.cg_genFile(head);
+    // #2136: die Anfangswerte des Hauptmoduls, danach die Sammelfunktion —
+    // alle Units sind jetzt eingelesen.
+    self.cg_miEinheit(miStartHaupt);
+    self.cg_miSammel();
     // #1141: die Bilanz erst hier — cg_genFile laeuft je importierter Einheit
     // erneut, dort gedruckt gaebe es eine Zeile je Import.
     // #1370: --profile — die Berichtsfunktion ganz am Ende, hinter allen
@@ -24379,13 +24427,290 @@ pub type Codegen = class {
     free(qu, (n + 1) * 8);
   }
 
+  // ------------------------------------------------------------------
+  // #2136: Anfangswerte von Modulvariablen zur Laufzeit
+  //
+  // Bis 1.2.15A wies der x86-Weg jeden Anfangswert ab, der sich nicht zur
+  // Uebersetzungszeit in den Datenbereich legen liess ("Startwert ist zur
+  // Uebersetzungszeit nicht bekannt") — ein Aufruf, eine andere
+  // Modulvariable, ein Laufzeit-Element in einem Array-Literal. Der IR-Weg
+  // kann es seit #2123. Hier dieselbe Form: je Unit eine Funktion
+  // `__lyx_modinit_<n>` in Deklarationsreihenfolge, erzeugt am Ende ihres
+  // cg_genFile (eine importierte Unit ist also vor dem Importeur fertig), und
+  // die Sammelfunktion `__lyx_modinit`, die sie in dieser Reihenfolge ruft.
+  // ------------------------------------------------------------------
+
+  // Eine Deklaration aus CGN_VAR_DECL (cg_genFile) vormerken.
+  fn cg_miVormerken(decl: int64) {
+    if (self.miMainFertig != 0 && self.miMainRuft == 0 && self.sharedLib == 0) {
+      // main ist schon erzeugt und ruft die Anfangswerte nicht: das geht nur,
+      // wenn die Unit erst HINTER main eingelesen wird. Laut, statt den Wert
+      // still auf 0 stehen zu lassen.
+      EPrintStr("codegen error: Modulvariable '"c);
+      sys_write(2, self.cg_nsval(decl) as int64, self.cg_nslen(decl));
+      EPrintStrLn("' braucht einen Anfangswert zur Laufzeit (#2136),"c);
+      EPrintStrLn("  aber main ist schon ohne den Aufruf der Anfangswerte erzeugt — ihre Unit"c);
+      EPrintStrLn("  wird erst hinter main importiert. Den Import vor main stellen."c);
+      exit(1);
+    }
+    if (self.miPendN >= self.miPendCap) {
+      var nc: int64 := self.miPendCap * 2;
+      var nb: int64 := alloc(nc * 8);
+      memcpy(nb, self.miPendBuf, self.miPendN * 8);
+      self.miPendBuf := nb;
+      self.miPendCap := nc;
+    }
+    poke64(self.miPendBuf + self.miPendN * 8, decl);
+    self.miPendN := self.miPendN + 1;
+  }
+
+  // Braucht die Modulvariable `d` einen Anfangswert zur Laufzeit? Die Frage
+  // stellt cg_miMainBraucht fuer Deklarationen HINTER main, bevor der
+  // Hauptdurchlauf dort ankommt. Sie folgt der Entscheidung in CGN_VAR_DECL
+  // (cg_genFile) — die beiden muessen uebereinstimmen; im Zweifel sagt sie
+  // ja (dann ruft main eine leere Sammelfunktion, falsch wird nichts).
+  fn cg_miLaufzeit(d: int64): int64 {
+    if (self.cg_nkind(d) != CGN_VAR_DECL) { return 0; }
+    var ini: int64 := self.cg_nc1(d);
+    if (ini < 0) { return 0; }
+    var ik: int64 := self.cg_nkind(ini);
+    if (ik == CGN_LIT_STR || ik == CGN_CLOSURE) { return 0; }
+    if (ik == CGN_IDENT && self.cg_isDeclaredFunc(self.cg_nsval(ini), self.cg_nslen(ini)) != 0) { return 0; }
+    if (ik == 100) {
+      var n: int64 := 0;
+      var alle: int64 := 1;
+      var el: int64 := self.cg_nc0(ini);
+      while (el != -1) {
+        n := n + 1;
+        if (self.cg_isConstExpr(el) == 0) { alle := 0; }
+        el := self.cg_nnext(el);
+      }
+      if (alle != 0 && n > 0 && (self.cg_nival(d) & 4) == 0) { return 0; }
+      return 1;
+    }
+    if (self.cg_isConstExpr(ini) != 0) { return 0; }
+    return 1;
+  }
+
+  // Deklarationen des Hauptmoduls, die HINTER main stehen (Knotennummer
+  // groesser als die von main), auch in einem eingebetteten @if-Zweig.
+  fn cg_miNachMain(head: int64, mainNi: int64): int64 {
+    var cur: int64 := head;
+    while (cur != -1) {
+      var k: int64 := self.cg_nkind(cur);
+      if (k == CGN_BLOCK) {
+        if (self.cg_miNachMain(self.cg_nc0(cur), mainNi) != 0) { return 1; }
+      } else if (k == CGN_VAR_DECL && cur > mainNi) {
+        if (self.cg_miLaufzeit(cur) != 0) { return 1; }
+      }
+      cur := self.cg_nnext(cur);
+    }
+    return 0;
+  }
+
+  // Ruft main die Anfangswerte? Ja, wenn eine Unit (Import) schon eine
+  // Funktion hat, das Hauptmodul vor main eine Deklaration vorgemerkt hat,
+  // oder hinter main eine kommt. Ohne Bedarf entsteht weder Aufruf noch
+  // Funktion — das Erzeugnis bleibt Byte fuer Byte, wie es war.
+  fn cg_miMainBraucht(mainNi: int64): int64 {
+    if (self.miFnN > 0 || self.miPendN > 0) { return 1; }
+    return self.cg_miNachMain(self.topLevelHead, mainNi);
+  }
+
+  // Einen Anfangswert rechnen und ablegen — mit derselben Angleichung wie
+  // eine Zuweisung an die Globale in einer Funktion (CGN_ASSIGN in
+  // cg_genStmt) bzw. die Deklaration eines Locals (#1351/#1502).
+  fn cg_miEinsInit(d: int64) {
+    var name: pchar := self.cg_nsval(d);
+    var nlen: int64 := self.cg_nslen(d);
+    var ini: int64 := self.cg_nc1(d);
+    var gtNode: int64 := self.cg_nc0(d);
+    var gIdx: int64 := self.cg_findGlobalIdx(name, nlen);
+    var doff: int64 := self.cg_findGlobal(name, nlen);
+    if (gIdx < 0 || doff < 0 || ini < 0) {
+      EPrintStr("interner fehler (#2136): Modulvariable '"c);
+      sys_write(2, name as int64, nlen);
+      EPrintStrLn("' steht nicht im Verzeichnis."c);
+      exit(1);
+    }
+    var art: int64 := peek8(self.globalIsArray + gIdx) as int64;
+    var ik: int64 := self.cg_nkind(ini);
+    if (ik == 100 && art == 2) {
+      // Array-Literal: die konstanten Elemente stehen schon im Block, hier
+      // nur die uebrigen — an ihren Platz hinter dem {cap,len}-Kopf.
+      var el: int64 := self.cg_nc0(ini);
+      var i: int64 := 0;
+      while (el != -1) {
+        if (self.cg_isConstExpr(el) == 0) {
+          self.cg_genExpr(el);
+          self.cg_pushRax();
+          self.cg_loadRaxGlobal(doff);                                   // Blockadresse
+          self.cg_e8(0x5E);                                              // pop rsi
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xB0);          // mov [rax+disp32], rsi
+          self.cg_e32(16 + i * 8);
+        }
+        i := i + 1;
+        el := self.cg_nnext(el);
+      }
+      return;
+    }
+    if (art == 3 && ik != CGN_CAST && ik != CGN_NEW) {
+      // Ein STRUCT hat seinen Speicher im Datenbereich; der Wert wird
+      // hineinkopiert (#1351). Den Zeiger umzubiegen hiesse, auf den Rahmen
+      // dieser Funktion zu zeigen, der gleich faellt. Cast und `new` binden
+      // dagegen um — dieselbe Ausnahme wie beim Local.
+      var sci: int64 := self.cg_findClass(self.cg_nsval(gtNode), self.cg_nslen(gtNode));
+      var sb: int64 := 0;
+      if (sci >= 0) { sb := self.cg_classStructSize(sci); }
+      if (sb <= 0) {
+        EPrintStr("interner fehler (#2136): Struct-Groesse von '"c);
+        sys_write(2, name as int64, nlen);
+        EPrintStrLn("' unbekannt."c);
+        exit(1);
+      }
+      self.cg_genExpr(ini);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);   // mov rsi, rax (Quelle)
+      self.cg_loadRaxGlobal(doff);                            // Zielblock
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+      self.cg_movRaxImm((sb + 7) / 8);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);   // mov rcx, rax
+      self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0xA5);   // rep movsq
+      return;
+    }
+    self.cg_genExpr(ini);
+    var ut: int64 := self.cg_utypeOfTypeNode(gtNode);
+    // #1502: `var x: f64 := ganzzahl` — umrechnen, nicht das Bitmuster nehmen.
+    if (ut < 0 && gtNode >= 0 && self.cg_nkind(gtNode) == 60
+        && self.cg_isFloatTypeName(self.cg_nsval(gtNode), self.cg_nslen(gtNode)) != 0
+        && self.cg_isF64Expr(ini) == 0) {
+      self.cg_emitRaxIntToF64();
+    }
+    self.cg_emitRangeCheck(self.cg_rangeOfLocal(name, nlen), "Startwert"c);
+    self.cg_emitNarrowRax(self.cg_narrowKindOfVar(name, nlen));
+    if (ut >= 0) {
+      if (self.cg_isF64Expr(ini) == 0) { self.cg_emitRaxIntToF64(); }
+      self.cg_emitUtypeConvExpr(ut, ini);
+      self.cg_emitUtypeRange(ut);
+    }
+    self.cg_emitGlobalWrite(name, nlen, doff);
+  }
+
+  // Die Funktion einer Unit: alle ab `start` vorgemerkten Anfangswerte, in
+  // Deklarationsreihenfolge. Gerufen am Ende des cg_genFile DIESER Unit, mit
+  // ihrer Knotentabelle, ihrem Kopf und ihrem Privatverzeichnis — die Namen
+  // loesen also auf wie in einer ihrer Funktionen.
+  fn cg_miEinheit(start: int64) {
+    if (self.miPendN <= start) { return; }
+    var nb: int64 := alloc(40);
+    var pre: pchar := "__lyx_modinit_";
+    memcpy(nb, pre as int64, 14);
+    var nl: int64 := 14;
+    var zahl: int64 := self.miFnN;
+    var ziff: int64 := alloc(24);
+    var zn: int64 := 0;
+    if (zahl == 0) { poke8(ziff, 48); zn := 1; }
+    while (zahl > 0) { poke8(ziff + zn, 48 + (zahl % 10)); zahl := zahl / 10; zn := zn + 1; }
+    while (zn > 0) { zn := zn - 1; poke8(nb + nl, peek8(ziff + zn)); nl := nl + 1; }
+    poke8(nb + nl, 0);
+    free(ziff, 24);
+
+    var sOuter: pchar := self.outerFuncName;
+    var sOuterL: int64 := self.outerFuncNameLen;
+    var sClass: pchar := self.curClassName;
+    var sClassL: int64 := self.curClassNameLen;
+    var sEnv: int64 := self.closureEnvPtrOff;
+    self.cg_addLabel(nb as pchar, nl, 0);
+    self.outerFuncName := nb as pchar;
+    self.outerFuncNameLen := nl;
+    self.curClassName := 0 as pchar;
+    self.curClassNameLen := 0;
+    self.closureEnvPtrOff := 0;
+    self.localCount := 0;
+    self.frameSize  := 0;
+    self.funcHasTupleReturn := 0;
+    self.profCurName := nb as pchar;
+    self.profCurLen  := 0;          // nicht messen (--profile), wie der Bericht
+    var prologuePatch: int64 := self.cg_emitPrologue();
+    self.fnRetStructBytes := 0;
+    self.fnRetSlotOff     := 0;
+    self.fnRetIsFloat     := 0;
+    self.fcActive         := 0;
+    self.lockstepActive   := 0;
+    self.curFnRetRange    := self.cg_rangeOfTypeNode(0 - 1);
+    self.curFnRetNarrow   := self.cg_narrowKindOfTypeNode(0 - 1);
+    self.deferCount    := 0;
+    self.dfCount       := 0;
+    self.loopDeferMark := -1;
+    self.tryDepth      := 0;
+    self.loopTryMark   := 0;
+    self.tryDeferMark  := -1;
+    self.deferMaxCount := 0;
+    self.localHigh     := self.localCount;
+    self.deferDepthSlot := 0;
+
+    var i: int64 := start;
+    while (i < self.miPendN) {
+      self.cg_miEinsInit(peek64(self.miPendBuf + i * 8));
+      i := i + 1;
+    }
+    self.miPendN := start;
+
+    self.cg_zeroRax();
+    self.cg_emitEpilogue();
+    var fs: int64 := self.frameSize + 15;
+    var aligned: int64 := fs - (fs & 15);
+    if (aligned == 0) { aligned := 16; }
+    poke32(self.code + prologuePatch, aligned);
+
+    self.outerFuncName := sOuter;
+    self.outerFuncNameLen := sOuterL;
+    self.curClassName := sClass;
+    self.curClassNameLen := sClassL;
+    self.closureEnvPtrOff := sEnv;
+    self.cg_flushNested();
+
+    if (self.miFnN >= self.miFnCap) {
+      var nc: int64 := self.miFnCap * 2;
+      var nf: int64 := alloc(nc * 16);
+      memcpy(nf, self.miFnBuf, self.miFnN * 16);
+      self.miFnBuf := nf;
+      self.miFnCap := nc;
+    }
+    poke64(self.miFnBuf + self.miFnN * 16, nb);
+    poke64(self.miFnBuf + self.miFnN * 16 + 8, nl);
+    self.miFnN := self.miFnN + 1;
+  }
+
+  // Die Sammelfunktion `__lyx_modinit`: ruft die Unit-Funktionen in der
+  // Reihenfolge, in der sie entstanden sind — Importe vor dem Importeur.
+  // Entsteht auch leer, wenn main sie ruft (cg_miLaufzeit sagte im Zweifel ja).
+  fn cg_miSammel() {
+    if (self.miFnN == 0 && self.miMainRuft == 0) { return; }
+    self.cg_addLabel("__lyx_modinit"c, 13, 0);
+    // push rbp: die Unit-Funktionen treten mit derselben Stapellage ein wie
+    // jede von main gerufene Funktion.
+    self.cg_e8(0x55);                                       // push rbp
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE5);   // mov rbp, rsp
+    var i: int64 := 0;
+    while (i < self.miFnN) {
+      self.cg_e8(0xE8);
+      var pp: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_addPatch(pp, peek64(self.miFnBuf + i * 16), peek64(self.miFnBuf + i * 16 + 8), CG_PATCH_CALL);
+      i := i + 1;
+    }
+    self.cg_e8(0x5D);                                       // pop rbp
+    self.cg_e8(0xC3);                                       // ret
+  }
+
   // __lyx_so_init — der Eintrag in DT_INIT_ARRAY. glibc und bionic rufen
   // ihn mit (argc, argv, envp); er uebernimmt die Aufgaben des `_start`, die
   // in eine Bibliothek gehoeren: argc/argv fuer GetArgC/GetArgV und den
-  // Canary (__lyx_canary_init, schliesst mit ret). Die Modulvariablen
-  // brauchen keinen Lauf: ihre Startwerte stehen im Datenbereich
-  // (cg_genFile), der Heap beginnt leer und holt sich seinen ersten Block
-  // selbst. prlimit und die Haertung aus main gehoeren dem Host, nicht hierher.
+  // Canary (__lyx_canary_init, schliesst mit ret). Konstante Startwerte
+  // der Modulvariablen stehen im Datenbereich (cg_genFile); die uebrigen
+  // rechnet seit #2136 __lyx_modinit, gerufen nach dem Canary. Der Heap
+  // beginnt leer und holt sich seinen ersten Block selbst. prlimit und die
+  // Haertung aus main gehoeren dem Host, nicht hierher.
   fn cg_soEmitInit() {
     self.soInitOff := self.codeLen;
     self.cg_addLabel("__lyx_so_init"c, 13, 0);
@@ -24398,6 +24723,20 @@ pub type Codegen = class {
     var pv: int64 := self.codeLen;
     self.cg_e32(0);
     self.cg_addPatch(pv, CG_ARGV, 0, CG_PATCH_STR);
+    if (self.miFnN > 0) {
+      // #2136: Anfangswerte der Modulvariablen — NACH dem Canary, denn ihre
+      // Funktionen pruefen ihn im Epilog gegen denselben Wert.
+      self.cg_e8(0xE8);                                     // call __lyx_canary_init
+      var pc: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_addPatch(pc, "__lyx_canary_init" as int64, 17, CG_PATCH_CALL);
+      self.cg_e8(0xE8);                                     // call __lyx_modinit
+      var pm: int64 := self.codeLen;
+      self.cg_e32(0);
+      self.cg_addPatch(pm, "__lyx_modinit" as int64, 13, CG_PATCH_CALL);
+      self.cg_e8(0xC3);                                     // ret
+      return;
+    }
     self.cg_e8(0xE9);                                       // jmp __lyx_canary_init
     var pj: int64 := self.codeLen;
     self.cg_e32(0);

@@ -980,7 +980,9 @@ pub type IRLower = class {
   // Sammelfunktion `__lyx_modinit`, die sie in Abhaengigkeitsreihenfolge ruft.
   //   irInitModus  — 0 Programm (main ruft __lyx_modinit), 1 Shared Library
   //                  (DT_INIT_ARRAY, writeELFSharedLib), 2 --compile-unit
-  //                  (kein Aufrufer: laut abweisen)
+  //                  (#2136: Funktion `__lyx_modinit@<unit>` in der .lyu; das
+  //                  einbindende Programm haengt sie in seine Sammelfunktion,
+  //                  _irLyuNachlese)
   //   modInitNoetig — 1, wenn irgendeine Unit einen Laufzeit-Anfangswert hat
   //   modInitBuf   — je 16 B: Zeiger auf den Namen der Unit-Funktion, Laenge
   irInitModus:   int64;
@@ -8628,11 +8630,13 @@ pub type IRLower = class {
                 free(nlBox, 8);
                 var nlOk: int64 := 0;
                 if (nlBuf != 0 && nlSz > 0) {
+                  var nlFnVor: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);   // #2136
                   var nlBelegt: int64 := _irUebernehmeLyu(self.ir, nlBuf, nlSz, self.labelCount,
                                                          _irLyuArchFuerZiel(self.target));
                   if (nlBelegt >= 0) {
                     nlOk := 1;
                     if (nlBelegt > 0) { self.labelCount := self.labelCount + nlBelegt; }
+                    self._irLyuNachlese(nlFnVor, 0);   // #2136: Anfangswerte der .lyu
                   }
                 }
                 if (nlOk == 0) {
@@ -9167,12 +9171,14 @@ pub type IRLower = class {
             var lyuSz: int64 := peek64(lyuBox);
             free(lyuBox, 8);
             if (lyuBuf != 0 && lyuSz > 0) {
+              var lyuFnVor: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);   // #2136
               var belegt: int64 := _irUebernehmeLyu(self.ir, lyuBuf, lyuSz, self.labelCount,
                                                     _irLyuArchFuerZiel(self.target));
               // Labelnummern weiterstellen, sonst vergibt genLabel() Nummern,
               // die die uebernommenen Sprungziele schon benutzen — der
               // naechste `if` spraenge dann mitten in die importierte Unit.
               if (belegt > 0) { self.labelCount := self.labelCount + belegt; }
+              if (belegt >= 0) { self._irLyuNachlese(lyuFnVor, 1); }   // #2136
             }
           }
         }
@@ -9431,22 +9437,12 @@ pub type IRLower = class {
     var hat: int64 := 0;
     var d: int64 := decls;
     while d >= 0 {
-      if self._modVarLaufzeit(d) != 0 {
-        if hat == 0 && self.irInitModus == 2 {
-          // --compile-unit: Die .lyu traegt das IR der Unit, aber niemand
-          // ruft ihre Anfangswerte — das Programm, das sie spaeter einbindet,
-          // baut seine Sammelfunktion aus SEINEN Units. Lieber kein Erzeugnis
-          // als eines mit stillen Nullen.
-          EPrintStr("lyxc: Modulvariable '"c);
-          sys_write(2, self.nodeSVal(d) as int64, self.nodeSLen(d));
-          EPrintStrLn("' braucht einen Anfangswert zur Laufzeit (#2123)."c);
-          EPrintStrLn("  In einer vorkompilierten Unit (--compile-unit) fuer ein IR-Ziel gibt es"c);
-          EPrintStrLn("  dafuer noch keinen Aufrufer. Die Unit als Quelle einbinden, oder den"c);
-          EPrintStrLn("  Wert in einer Funktion zuweisen."c);
-          exit(1);
-        }
-        hat := 1;
-      }
+      // #2136: Bis 1.2.15A wies --compile-unit (irInitModus 2) eine solche
+      // Unit hier ab — es gab keinen Aufrufer. Jetzt traegt die .lyu die
+      // Funktion unter einem Namen, an dem das einbindende Programm sie
+      // erkennt (_modInitLyuName), und haengt sie in SEINE Sammelfunktion
+      // (_irLyuNachlese).
+      if self._modVarLaufzeit(d) != 0 { hat := 1; }
       d := self.nodeNext(d);
     }
     if hat == 0 { return; }
@@ -9529,19 +9525,27 @@ pub type IRLower = class {
     self.irEmitLabel(self.funcExitLabel);
     self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
 
-    // Name "__lyx_modinit_<n>"
-    var nb: int64 := alloc(40);
-    var pre: pchar := "__lyx_modinit_";
-    memcpy(nb, pre as int64, 14);
-    var nl: int64 := 14;
-    var zahl: int64 := self.modInitN;
-    var ziff: int64 := alloc(24);
-    var zn: int64 := 0;
-    if zahl == 0 { poke8(ziff, 48); zn := 1; }
-    while zahl > 0 { poke8(ziff + zn, 48 + (zahl % 10)); zahl := zahl / 10; zn := zn + 1; }
-    while zn > 0 { zn := zn - 1; poke8(nb + nl, peek8(ziff + zn)); nl := nl + 1; }
-    poke8(nb + nl, 0);
-    free(ziff, 24);
+    // Name "__lyx_modinit_<n>" — in einer vorkompilierten Unit
+    // "__lyx_modinit@<unit>" (#2136), damit das Programm sie wiederfindet.
+    var nb: int64 := 0;
+    var nl: int64 := 0;
+    if self.irInitModus == 2 {
+      nb := self._modInitLyuName() as int64;
+      nl := StrLen(nb as pchar);
+    } else {
+      nb := alloc(40);
+      var pre: pchar := "__lyx_modinit_";
+      memcpy(nb, pre as int64, 14);
+      nl := 14;
+      var zahl: int64 := self.modInitN;
+      var ziff: int64 := alloc(24);
+      var zn: int64 := 0;
+      if zahl == 0 { poke8(ziff, 48); zn := 1; }
+      while zahl > 0 { poke8(ziff + zn, 48 + (zahl % 10)); zahl := zahl / 10; zn := zn + 1; }
+      while zn > 0 { zn := zn - 1; poke8(nb + nl, peek8(ziff + zn)); nl := nl + 1; }
+      poke8(nb + nl, 0);
+      free(ziff, 24);
+    }
 
     self.overrideFuncName := nb as pchar;
     self.overrideFuncNameLen := nl;
@@ -9624,6 +9628,153 @@ pub type IRLower = class {
     self.funcInstrStart := sStart;
     self.overrideFuncName := sOvN;
     self.overrideFuncNameLen := sOvL;
+  }
+
+  // #2136: Name der Init-Funktion einer vorkompilierten Unit (--compile-unit,
+  // irInitModus 2): "__lyx_modinit@" und dann der Importname der Unit — fuer
+  // die Wurzel, die keinen hat, der Dateiname samt Pruefsumme des ganzen
+  // Pfads, damit zwei gleichnamige Dateien aus verschiedenen Verzeichnissen
+  // nicht auf eine Funktion fallen (_addFunc nimmt einen vorhandenen Namen).
+  // Das Praefix ist der Vertrag mit _irLyuNachlese — `@` kommt in keinem
+  // Bezeichner vor.
+  fn _modInitLyuName(): pchar {
+    var pre: pchar := "__lyx_modinit@";
+    if self.irUnitTag != 0 {
+      var tb: int64 := alloc(14 + self.irUnitTagLen + 1);
+      memcpy(tb, pre as int64, 14);
+      memcpy(tb + 14, self.irUnitTag, self.irUnitTagLen);
+      poke8(tb + 14 + self.irUnitTagLen, 0);
+      return tb as pchar;
+    }
+    if (self.irSrcPath as int64) == 0 || self.irSrcLen <= 0 {
+      EPrintStrLn("lyxc: interner Fehler (#2136): vorkompilierte Unit ohne Quellpfad."c);
+      exit(1);
+    }
+    var sp: int64 := self.irSrcPath as int64;
+    var anf: int64 := 0;
+    var ende: int64 := self.irSrcLen;
+    var i: int64 := 0;
+    var h: int64 := 1469598103;
+    while i < self.irSrcLen {
+      var ch: int64 := peek8(sp + i) & 255;
+      if ch == 47 { anf := i + 1; ende := self.irSrcLen; }
+      if ch == 46 && i >= anf { ende := i; }
+      h := h * 31 + ch;
+      i := i + 1;
+    }
+    var bl: int64 := ende - anf;
+    if bl < 0 { bl := 0; }
+    var b: int64 := alloc(14 + bl + 1 + 16 + 1);
+    memcpy(b, pre as int64, 14);
+    memcpy(b + 14, sp + anf, bl);
+    var p: int64 := 14 + bl;
+    poke8(b + p, 35);                                  // '#'
+    p := p + 1;
+    var k: int64 := 15;
+    while k >= 0 {
+      var nib: int64 := (h >> (k * 4)) & 15;
+      if nib < 10 { poke8(b + p, 48 + nib); } else { poke8(b + p, 87 + nib); }
+      p := p + 1;
+      k := k - 1;
+    }
+    poke8(b + p, 0);
+    return b as pchar;
+  }
+
+  // #2136: Nach dem Uebernehmen einer .lyu (_irUebernehmeLyu).
+  //
+  // 1. Die Modulvariablen der .lyu belegen jetzt die Plaetze ab dem alten
+  //    globalLen. Das Verzeichnis (globalNameCnt) wusste davon nichts: die
+  //    naechste Modulvariable des Programms bekam denselben Platz wie die
+  //    erste der .lyu und setzte globalLen wieder zurueck — schrieb das
+  //    Programm seine Variable, aenderte sich die der Unit (bis 1.2.15A, auch
+  //    ohne Laufzeit-Anfangswerte). Die Plaetze werden hier namenlos
+  //    belegt; die .lyu traegt keine Namen zu ihnen.
+  // 2. Die Funktionen ab `vor` nach "__lyx_modinit@" durchsuchen und jede in
+  //    die Liste fuer __lyx_modinit eintragen — einmal je Name, denn eine .lyu
+  //    kann ueber zwei Wege in den Importgraphen kommen. Eine alte .lyu ohne
+  //    solche Funktion traegt nichts ein. `spaet` = 1 heisst: der Vorlauf ist
+  //    vorbei; war bis dahin nichts zu initialisieren, ist main schon ohne
+  //    Aufruf entstanden (bzw. entsteht so) — dann laut statt still 0.
+  fn _irLyuNachlese(vor: int64, spaet: int64) {
+    var gl: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALLEN);
+    while self.globalNameCnt < gl {
+      if self.globalNameCnt >= self.globalNameCap {
+        var gnc: int64 := self.globalNameCap * 2;
+        var gnb: int64 := alloc(gnc * 32);
+        memcpy(gnb, self.globalNameBuf, self.globalNameCnt * 32);
+        self.globalNameBuf := gnb;
+        self.globalNameCap := gnc;
+      }
+      var gr: int64 := self.globalNameBuf + self.globalNameCnt * 32;
+      poke64(gr + 0, 0);
+      poke64(gr + GLOBAL_REC_OFF_NAMELEN, 0);                // kein Name: findet niemand
+      poke64(gr + GLOBAL_REC_OFF_IDX, self.globalNameCnt);
+      poke64(gr + GLOBAL_REC_OFF_INIT, 0);
+      self.globalNameCnt := self.globalNameCnt + 1;
+    }
+    if self.irInitModus == 2 { return; }   // eine Unit ruft fremde Anfangswerte nicht
+    var fb: int64 := peek64(self.ir + IR_MOD_OFF_FUNCBUF);
+    var sb: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
+    var fc: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);
+    var pre: pchar := "__lyx_modinit@";
+    var f: int64 := vor;
+    while f < fc {
+      var off: int64 := peek64(fb + f * IR_FUNC_SIZE);
+      var ln:  int64 := peek64(fb + f * IR_FUNC_SIZE + IR_FUNC_OFF_NAMELEN);
+      var pass: int64 := 0;
+      if ln > 14 {
+        pass := 1;
+        var j: int64 := 0;
+        while j < 14 {
+          if peek8(sb + off + j) != peek8((pre as int64) + j) { pass := 0; j := 14; }
+          j := j + 1;
+        }
+      }
+      if pass != 0 {
+        var schon: int64 := 0;
+        var m: int64 := 0;
+        while m < self.modInitN {
+          var mp: int64 := peek64(self.modInitBuf + m * 16);
+          var ml: int64 := peek64(self.modInitBuf + m * 16 + 8);
+          if ml == ln {
+            var gl: int64 := 1;
+            var q: int64 := 0;
+            while q < ln {
+              if peek8(mp + q) != peek8(sb + off + q) { gl := 0; q := ln; }
+              q := q + 1;
+            }
+            if gl != 0 { schon := 1; m := self.modInitN; }
+          }
+          m := m + 1;
+        }
+        if schon == 0 {
+          if spaet != 0 && self.modInitNoetig == 0 {
+            EPrintStr("lyxc: Unit-Anfangswerte aus einer .lyu ("c);
+            sys_write(2, sb + off, ln);
+            EPrintStrLn(") ohne Aufrufer (#2136):"c);
+            EPrintStrLn("  der Vorlauf hat die .lyu nicht gesehen, main ruft __lyx_modinit nicht."c);
+            exit(1);
+          }
+          // Name kopieren: der Zeichenpuffer des Moduls kann noch wachsen.
+          var nb: int64 := alloc(ln + 1);
+          memcpy(nb, sb + off, ln);
+          poke8(nb + ln, 0);
+          if self.modInitN >= self.modInitCap {
+            var nc: int64 := self.modInitCap * 2;
+            var nbuf: int64 := alloc(nc * 16);
+            memcpy(nbuf, self.modInitBuf, self.modInitN * 16);
+            self.modInitBuf := nbuf;
+            self.modInitCap := nc;
+          }
+          poke64(self.modInitBuf + self.modInitN * 16, nb);
+          poke64(self.modInitBuf + self.modInitN * 16 + 8, ln);
+          self.modInitN := self.modInitN + 1;
+          self.modInitNoetig := 1;
+        }
+      }
+      f := f + 1;
+    }
   }
 
   // Der Aufruf von __lyx_modinit am Anfang von main (lowerFunc).
