@@ -595,6 +595,7 @@ test: lyxc
 	@bash tests/ir_generics_test.sh
 	@bash tests/android_shared_lib_test.sh
 	@bash tests/ir_modulvar_init_test.sh
+	@bash tests/x86_shared_lib_test.sh
 	@bash tests/ir_mmap_test.sh
 	@bash tests/ir_sprungweite_test.sh
 	@bash tests/argv_ir_test.sh

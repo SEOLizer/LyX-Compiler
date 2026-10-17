@@ -322,7 +322,11 @@ if baue "$ROOT/examples/android/jni_native_add.lyx" arm64 "$TMP/add64.so" --shar
 else nok "arm64 --shared uebersetzt nicht"; fi
 
 # --- 4. #2118: wo es keinen Codegen gibt, laut ---
-for z in "android-x86_64 --shared" "x86_64 --shared" "android-x86_64"; do
+# Seit #2124 erzeugen "android-x86_64 --shared" und "x86_64 --shared" eine
+# echte .so — gemessen in tests/x86_shared_lib_test.sh (Ladebedingungen und
+# Aufruf ueber dlopen). Ohne Codegen bleibt nur noch android-x86_64 als
+# PROGRAMM (ohne --shared).
+for z in "android-x86_64"; do
   set -- $z
   rm -f "$TMP/x.out"
   baue "$ROOT/examples/android/jni_native_add.lyx" "$1" "$TMP/x.out" "${2:-}"; rc=$?

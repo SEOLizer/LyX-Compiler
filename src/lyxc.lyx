@@ -462,6 +462,10 @@ pub type CompilerConfig = class {
   // namePtr may point into parser.src (for @export) or into mangledNamesBuf (for @jni).
   exportBuf:        int64;
   exportCount:      int64;
+  // #2124: x86-64-.so — Huellen des Codegens, je 16 Byte {Knoten, Codeoffset}
+  // (Codegen.soExpTab). Gesetzt, nimmt buildExportList die Adresse von hier.
+  x86SoExpTab:      int64;
+  x86SoExpCount:    int64;
   // Backing store for Java_*-mangled names produced by @jni (Phase B2). Grows as needed.
   mangledNamesBuf:  int64;
   mangledNamesLen:  int64;
@@ -2334,7 +2338,12 @@ pub type CompilerConfig = class {
     // Also beides: die IR wird gebaut und ausgegeben, das Programm entsteht
     // danach weiterhin auf dem bewaehrten Schnellweg. Fuer die Diagnose ist
     // die IR-Strecke gut genug, fuer das Erzeugen ist sie es auf x86-64 nicht.
-    if _irNoetig && self.target == LYX_TC_X86_64 && self.outputType != OUTPUT_TYPE_SHARED_LIB {
+    // #2124: x86-64 und android-x86_64 mit --shared laufen ueber denselben
+    // Schnellweg; nur der Schreiber am Ende ist ein anderer (cg_writeELFShared).
+    var _x86So: bool := (self.target == LYX_TC_X86_64 || self.target == LYX_TC_ANDROID_X86_64)
+                        && self.outputType == OUTPUT_TYPE_SHARED_LIB;
+    var _x86Weg: bool := (self.target == LYX_TC_X86_64 && self.outputType != OUTPUT_TYPE_SHARED_LIB) || _x86So;
+    if _irNoetig && _x86Weg {
       var dMod: IRModule := new IRModule();
       dMod.init();
       dMod.irSourceMap := self.irSourceMap;
@@ -2355,11 +2364,20 @@ pub type CompilerConfig = class {
       _irNoetig := false;   // Diagnose erledigt — erzeugt wird auf dem Schnellweg
     }
 
-    if self.target == LYX_TC_X86_64 && !_irNoetig && self.outputType != OUTPUT_TYPE_SHARED_LIB {
+    if _x86Weg && !_irNoetig {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.out"c; }
       var _t5x: int64 := self._passStart("codegen-x86_64"c);
       var cg: Codegen := new Codegen();
+      // #2124: VOR Init — Init emittiert `_start`, das es in einer .so nicht gibt.
+      if _x86So {
+        if self.emitObj || self.metaSafe || self.kernelMode != 0 {
+          EPrintStrLn("error: --shared vertraegt sich nicht mit --emit=obj, --meta-safe oder --target=lyxos-kernel (#2124)."c);
+          self.exitCode := 1;
+          return self.exitCode;
+        }
+        cg.sharedLib := 1;
+      }
       // #1389: VOR Init — Init emittiert am Ende die Handler mit den festen
       // Offsets, und genau zwei davon haengen an diesem Schalter.
       if self.kernelMode != 0 { cg.kernelMode := 1; }
@@ -2456,7 +2474,15 @@ pub type CompilerConfig = class {
                    cg.cg_getLabelBuf(), cg.cg_getLabelCount(),
                    asmZeilen, asmPfad);
       }
-      if self.emitObj {
+      if _x86So {
+        // #2124: Exporte auf die Huellen des Codegens (cg_soEmitHuellen).
+        self.x86SoExpTab   := cg.soExpTab;
+        self.x86SoExpCount := cg.soExpCount;
+        self.buildExportList(parser, astRoot);
+        var soApi: int64 := 0;
+        if self.target == LYX_TC_ANDROID_X86_64 { soApi := self.androidApiLevel; }
+        cg.cg_writeELFShared(outPath, self.exportBuf, self.exportCount, soApi);
+      } else if self.emitObj {
         cg.cg_writeELFObj(outPath);   // WSP-07: ET_REL-Objekt (extern "asm" → ld-auflösbar)
       } else {
         cg.WriteELF(outPath);
@@ -2831,15 +2857,21 @@ pub type CompilerConfig = class {
   // aussehenden Datei ohne den Code des Programms (bei --shared ohne jede
   // exportierte Funktion). Einen x86-64-Emitter fuer den IR-Weg gibt es
   // nicht (src/backend/x86_64/emit_x86.lyx ist nirgends eingebunden), und der
-  // Schnellweg (codegen_x86) schreibt keine .so. Bis eines davon steht,
+  // Schnellweg (codegen_x86) schrieb keine .so. Bis eines davon steht,
   // bricht die Uebersetzung laut ab.
+  //
+  // #2124: --shared (x86-64 und android-x86_64) geht jetzt ueber den
+  // Schnellweg (cg_writeELFShared) und kommt hier nicht mehr an. Uebrig ist
+  // android-x86_64 OHNE --shared — ein Android-Programm statt einer
+  // Bibliothek; dafuer gibt es weiter keinen Weg.
   fn emitX86_64(irMod: int64, lower: IRLower): int64 {
     if self.target == LYX_TC_ANDROID_X86_64 {
-      EPrintStrLn("error: --target=android-x86_64 hat keinen Codegen — bisher entstand still ein Programm, das 42 liefert (#2118, #2124)."c);
+      EPrintStrLn("error: --target=android-x86_64 ohne --shared hat keinen Codegen — bisher entstand still ein Programm, das 42 liefert (#2118, #2124)."c);
+      EPrintStrLn("  Fuer JNI-Bibliotheken: --target=android-x86_64 --shared."c);
     } else {
-      EPrintStrLn("error: x86-64 mit --shared ist nicht umgesetzt — bisher entstand still eine .so ohne Code und ohne Exporte (#2118, #2124)."c);
+      // Ein anderer Weg hierher waere neu und muss nachgezogen werden.
+      EPrintStrLn("interner fehler: emitX86_64 ohne Codegen erreicht (#2118, #2124)."c);
     }
-    EPrintStrLn("  Fuer Android-Bibliotheken: --target=android-arm64 --shared."c);
     return 0;
   }
 
@@ -3500,7 +3532,7 @@ pub type CompilerConfig = class {
     if count == 0 { self.exportBuf := 0; return; }
     // #2118: Ohne Funktionsadressen wurden die Exporte bisher still auf 0
     // gesetzt — die .so entstand mit rc 0 und ohne ein einziges Symbol.
-    if self.codeFuncAddrs == 0 {
+    if self.codeFuncAddrs == 0 && self.x86SoExpTab == 0 {
       EPrintStr("error: --shared: "c);
       EPrintInt(count);
       EPrintStrLn(" @export/@jni-Funktion(en), aber der Codegen liefert keine Adressen — die .so haette keine Exporte (#2118)."c);
@@ -3519,14 +3551,31 @@ pub type CompilerConfig = class {
         if (anno2 & EXPORT_MASK) != 0 {
           var fnP: int64 := (parser.src as int64) + peek64(off2 + NODE_OFF_SVAL);
           var fnL: int64 := peek64(off2 + NODE_OFF_SLEN);
-          var funcId: int64 := self._shlibFuncIdx(fnP, fnL);
-          if funcId < 0 {
-            EPrintStr("error: --shared: exportierte Funktion `"c);
-            sys_write(2, fnP, fnL);
-            EPrintStrLn("` steht nicht in der IR-Funktionstabelle (#2117)."c);
-            exit(1);
+          var addr: int64 := 0 - 1;
+          if self.x86SoExpTab != 0 {
+            // #2124: x86-64 — die Huelle zum KNOTEN (Codegen.cg_soEmitHuellen
+            // waehlt nach denselben Regeln aus; fehlt eine, ist das laut).
+            var hi: int64 := 0;
+            while hi < self.x86SoExpCount {
+              if peek64(self.x86SoExpTab + hi * 16) == cur { addr := peek64(self.x86SoExpTab + hi * 16 + 8); }
+              hi += 1;
+            }
+            if addr < 0 {
+              EPrintStr("error: --shared: exportierte Funktion `"c);
+              sys_write(2, fnP, fnL);
+              EPrintStrLn("` hat keine Huelle im x86-64-Codegen (#2124)."c);
+              exit(1);
+            }
+          } else {
+            var funcId: int64 := self._shlibFuncIdx(fnP, fnL);
+            if funcId < 0 {
+              EPrintStr("error: --shared: exportierte Funktion `"c);
+              sys_write(2, fnP, fnL);
+              EPrintStrLn("` steht nicht in der IR-Funktionstabelle (#2117)."c);
+              exit(1);
+            }
+            addr := peek64(self.codeFuncAddrs + funcId * 8) + self.codeStubOff;
           }
-          var addr: int64 := peek64(self.codeFuncAddrs + funcId * 8) + self.codeStubOff;
           var namePtr: int64 := 0;
           var nameLen: int64 := 0;
           if (anno2 & ANNO_JNI) != 0 {
