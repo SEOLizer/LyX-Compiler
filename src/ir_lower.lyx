@@ -31,16 +31,32 @@ con GLOBAL_REC_OFF_NAMELEN: int64 := 8;
 con GLOBAL_REC_OFF_IDX:    int64 := 16;
 con GLOBAL_REC_OFF_INIT:   int64 := 24;
 
-// genFuncBuf entry (24 bytes): namePtr + nameLen + nodeIdx
-con GENFUNC_REC_SIZE:       int64 := 24;
-con GENFUNC_REC_OFF_NAMELEN: int64 := 8;
-con GENFUNC_REC_OFF_NODEIDX: int64 := 16;
+// #2125: genFuncBuf-Eintrag — eine generische Funktion samt dem Modul, in
+// dessen Knotentabelle sie steht. Ein Knotenindex gilt nur in SEINER Tabelle;
+// die Spezialisierung wird deshalb mit genau diesem Kontext gesenkt, auch wenn
+// der Aufruf aus einer anderen Unit kommt.
+con GENFUNC_REC_SIZE:        int64 := 104;
+con GENFUNC_REC_OFF_NAMELEN: int64 := 8;    // 0: Quellname (Zeiger), 8: Laenge
+con GENFUNC_REC_OFF_NODEIDX: int64 := 16;   // NK_FUNC_DECL in seiner Tabelle
+con GENFUNC_REC_OFF_SRC:     int64 := 24;
+con GENFUNC_REC_OFF_NODES:   int64 := 32;
+con GENFUNC_REC_OFF_CNT:     int64 := 40;
+con GENFUNC_REC_OFF_HEAD:    int64 := 48;   // Deklarationskette der Unit
+con GENFUNC_REC_OFF_TAG:     int64 := 56;   // irUnitTag (#2076)
+con GENFUNC_REC_OFF_TAGLEN:  int64 := 64;
+con GENFUNC_REC_OFF_BASE:    int64 := 72;   // Name wie _irFnName (privat: "unit_name")
+con GENFUNC_REC_OFF_BASELEN: int64 := 80;
+con GENFUNC_REC_OFF_PUB:     int64 := 88;
+con GENFUNC_REC_OFF_TPN:     int64 := 96;   // Anzahl Typparameter
 
-// pendingGenBuf entry (32 bytes): mangledPtr + mangledLen + genFuncNodeIdx + emitted
-con PENDING_REC_SIZE:         int64 := 32;
-con PENDING_REC_OFF_MANGLEN:  int64 := 8;
-con PENDING_REC_OFF_NODEIDX:  int64 := 16;
+// #2125: pendingGenBuf-Eintrag — eine Spezialisierung (Typargument-Kombination).
+con PENDING_REC_SIZE:         int64 := 56;
+con PENDING_REC_OFF_MANGLEN:  int64 := 8;    // 0: Name der Spezialisierung, 8: Laenge
+con PENDING_REC_OFF_GENREC:   int64 := 16;   // Index in genFuncBuf
 con PENDING_REC_OFF_EMITTED:  int64 := 24;
+con PENDING_REC_OFF_ARGS:     int64 := 32;   // Typargumente: je (Zeiger, Laenge)
+con PENDING_REC_OFF_ARGN:     int64 := 40;
+con PENDING_REC_OFF_FUNCIDX:  int64 := 48;   // Eintrag im funcBuffer
 
 // Vollständige IR-Lowering-Implementierung:
 // - AST-Node-Kind-Konstanten
@@ -717,7 +733,7 @@ pub type IRLower = class {
   overrideFuncName:    pchar;   // non-null = use this name in _addFunc
   overrideFuncNameLen: int64;
   // Registry of generic function declarations seen in lowerModule pre-pass
-  // Records: {namePtr:8, nameLen:8, nodeIdx:8} = 24 bytes each
+  // (#2125: Layout siehe GENFUNC_REC_*)
   genFuncBuf:   int64;
   genFuncCount: int64;
   genFuncCap:   int64;
@@ -738,11 +754,15 @@ pub type IRLower = class {
   // damit DCE sie nicht entfernt (MMIO/Hardware-Register-Reads müssen erhalten bleiben).
   _volSlotList: int64;  // [] Slot-Nummern
   _volSlotN:    int64;  // Anzahl
-  // Queue of pending specializations to emit after the main lowering loop
-  // Records: {mangledPtr:8, mangledLen:8, genFuncNodeIdx:8, emitted:8} = 32 bytes each
+  // Queue of pending specializations (#2125: Layout siehe PENDING_REC_*)
   pendingGenBuf:   int64;
   pendingGenCount: int64;
   pendingGenCap:   int64;
+  // #2125: Typersetzung der gerade gesenkten Spezialisierung — je
+  // Typparameter (NamePtr, NameLen, ArgPtr, ArgLen, ArgKnoten) = 40 Byte.
+  // genSubstN == 0 ausserhalb einer Spezialisierung.
+  genSubstBuf: int64;
+  genSubstN:   int64;
 
   // #1727: Erreichbarkeit. Der Vorpass sammelt ohnehin ALLE transitiv
   // importierten Module in einer Arbeitsliste und wirft sie danach weg —
@@ -951,7 +971,9 @@ pub type IRLower = class {
     self.overrideFuncName    := 0;
     self.overrideFuncNameLen := 0;
     self.genFuncCap   := 16;
-    self.genFuncBuf   := alloc(16 * 24);
+    self.genFuncBuf   := alloc(16 * GENFUNC_REC_SIZE);
+    self.genSubstBuf  := 0;
+    self.genSubstN    := 0;
     self.genFuncCount := 0;
     self._importsDone := 0;
     // #1727
@@ -1005,7 +1027,7 @@ pub type IRLower = class {
     self._volSlotList := alloc(256 * 8);
     self._volSlotN := 0;
     self.pendingGenCap   := 16;
-    self.pendingGenBuf   := alloc(16 * 32);
+    self.pendingGenBuf   := alloc(16 * PENDING_REC_SIZE);
     self.pendingGenCount := 0;
     self.irInitModus := 0;     // #2123
     self.modInitNoetig := 0;
@@ -2236,9 +2258,19 @@ pub type IRLower = class {
 
   fn lowerCall(expr: int64): int64 {
     self._clArgsPruefen(expr);   // #2108/#1249: einfangendes Lambda als Argument
-    // WP-2.1: generic calls (iVal=2) go through the monomorphization path
+    // #2125: Generischer Aufruf `f<T…>(…)` (iVal 2). Die Spezialisierung wird
+    // hier angefordert und unter ihrem eigenen Namen registriert; der Aufruf
+    // selbst laeuft dann ueber den gewoehnlichen Weg weiter unten (Argument-
+    // block, Vorgabewerte, Erreichbarkeit) — mit dem Namen der Spezialisierung.
+    // Bis 1.2.14C hatte er einen eigenen Zweig, der die Argumente in Slot 0..N
+    // legte (#1388) und als Funktionsindex den STRING-Offset des Namens trug.
+    var genMangP: int64 := 0;
+    var genMangL: int64 := 0;
     if (self.nodeIVal(expr) == 2) {
-      return self.lowerGenericCall(expr);
+      var genLc: int64 := alloc(8);
+      genMangP := self._genInstanz(expr, genLc);
+      genMangL := peek64(genLc);
+      free(genLc, 8);
     }
     // #1841: `super.M(args)` — der Parser baut daraus einen NK_CALL mit der
     // Marke 3 und OHNE Empfaengerknoten (parser.lyx, #1091): der Name steht in
@@ -2576,6 +2608,7 @@ pub type IRLower = class {
     var fname: pchar := self.nodeSVal(expr);
     var fnlen: int64 := self.nodeSLen(expr);
     var arg0: int64 := self.nodeC0(expr);
+    if genMangP != 0 { fname := genMangP as pchar; fnlen := genMangL; }   // #2125
 
     // WP-AND-upstream-fix: _indirect_call_N(fnPtr, ...args) — N in 0..4.
     // First user-syntax argument is the function pointer; remaining N are
@@ -6269,7 +6302,7 @@ pub type IRLower = class {
         var m: int64 := 1;
         var j: int64 := 0;
         while j < idl { if m != 0 { if peek8(nptr + j) != peek8(idPtrL + j) { m := 0; } } j := j + 1; }
-        if m != 0 { return peek64(self.localTypeBuf + li * 8); }
+        if m != 0 { return self._genSubst(peek64(self.localTypeBuf + li * 8)); }   // #2125
       }
       li -= 1;
     }
@@ -6283,7 +6316,7 @@ pub type IRLower = class {
             var pm: int64 := 1;
             var pj: int64 := 0;
             while pj < idl { if pm != 0 { if peek8(pptr + pj) != peek8(idPtrL + pj) { pm := 0; } } pj := pj + 1; }
-            if pm != 0 { return self.nodeC0(pn); }
+            if pm != 0 { return self._genSubst(self.nodeC0(pn)); }   // #2125: `a: T`
           }
         }
         pn := self.nodeNext(pn);
@@ -6860,6 +6893,13 @@ pub type IRLower = class {
     var ifOff: int64 := self._instanceFieldOffset(baseNode, self.nodeSVal(expr), self.nodeSLen(expr));
     if ifOff >= 0 {
       self.irAddInstrDirect(IRO_LOAD_FIELD, dest, base, ifOff, 0);
+    } else if self.genSubstN > 0 {
+      // #2125: In einer Spezialisierung bleibt ein Typparameter nur dann
+      // stehen, wenn die Unit der generischen Funktion das Typargument nicht
+      // kennt (Klasse aus der rufenden Unit). Das Feld waere dann still 0 —
+      // wie auf x86, wo der Rumpf typgeloescht ist.
+      self._genFehler("Feld ueber einen Typparameter nicht aufloesbar (Klasse aus einer anderen Unit?): "c,
+                      self.nodeSVal(expr), self.nodeSLen(expr));
     }
     return dest;
   }
@@ -8019,6 +8059,11 @@ pub type IRLower = class {
           self.irAddInstrDirect(IRO_STORE_FIELD, afOff, afFat, afBase, 0);
         } else if (afOff >= 0) {
           self.irAddInstrDirect(IRO_STORE_FIELD, afOff, valTemp, afBase, 0);
+        } else if (self.genSubstN > 0) {
+          // #2125: dieselbe Pruefung wie beim Lesen in lowerField — die
+          // beiden muessen uebereinstimmen. Sonst entfiele die Zuweisung still.
+          self._genFehler("Feld ueber einen Typparameter nicht aufloesbar (Klasse aus einer anderen Unit?): "c,
+                          self.nodeSVal(target), self.nodeSLen(target));
         }
       }
       // Target is INDEX — store to array element. ARM64-FIX: war Stub.
@@ -8373,6 +8418,12 @@ pub type IRLower = class {
           // eingesammelt; erzeugt wird er unten, nach der aeusseren Funktion.
           // #2074: mit der Gueltigkeit von sema (Bloecke, Verdeckung).
           self._nmPlanFunc(pfCur, pfNamePtr as int64, pfNameLen, 0);
+          // #2125: Generische Funktion (`fn f<T>`, Typparameter in c3) —
+          // zusaetzlich im Generika-Verzeichnis, damit `f<int64>(…)` eine
+          // Spezialisierung bekommt. Bis 1.2.14C wartete das Verzeichnis auf
+          // NK_GENERIC_DECL, eine Knotenart, die der Parser nie erzeugt: es
+          // blieb leer, und der Aufruf zielte auf eine Funktion ohne Rumpf.
+          self._genRegistriere(pfCur, pfNamePtr as int64, pfNameLen);
         }
       } else if pfKind == NK_TYPE_DECL {
         // ARM64-OOP: Methoden (c1-Chain) unter mangled Namen "Class_method" registrieren.
@@ -8393,22 +8444,6 @@ pub type IRLower = class {
           }
           pmM := self.nodeNext(pmM);
         }
-      } else if pfKind == NK_GENERIC_DECL {
-        // WP-2.1: register generic declarations in genFuncBuf, NOT funcBuffer.
-        // They are not emitted directly — only their specializations are.
-        if (self.genFuncCount >= self.genFuncCap) {
-          var gfc: int64 := self.genFuncCap * 2;
-          var gfb: int64 := alloc(gfc * 24);
-          var gfi: int64 := 0;
-          memcpy(gfb, self.genFuncBuf, self.genFuncCount * 24);
-          free(self.genFuncBuf, self.genFuncCap * 24);
-          self.genFuncBuf := gfb; self.genFuncCap := gfc;
-        }
-        var gfRec: int64 := self.genFuncBuf + self.genFuncCount * 24;
-        poke64(gfRec,      self.nodeSVal(pfCur) as int64);
-        poke64(gfRec + GENFUNC_REC_OFF_NAMELEN,  self.nodeSLen(pfCur));
-        poke64(gfRec + GENFUNC_REC_OFF_NODEIDX, pfCur);
-        self.genFuncCount += 1;
       }
       pfCur := self.nodeNext(pfCur);
     }
@@ -8958,8 +8993,6 @@ pub type IRLower = class {
           }
           mtM := self.nodeNext(mtM);
         }
-      } else if (kind == NK_GENERIC_DECL) {
-        // WP-2.1: generic declarations are emitted only as specializations (see below)
       } else if (kind == NK_IMPORT) {
         // WP-AND-upstream-fix v3: actually lower imported function bodies.
         // Sema's _sema_processImport reads + parses imports but disposes the
@@ -9119,6 +9152,11 @@ pub type IRLower = class {
     // vollstaendiger Durchgang nichts Neues mehr erzeugt. Gelesen und
     // geparst wird dabei NICHTS: die Liste haelt Quelltext, Knoten und Kopf
     // jedes Moduls aus dem Vorpass fest. Genau dafuer wird sie behalten.
+    // #2125: Spezialisierungen VOR dem Nachlauf erzeugen. Ihr Rumpf darf
+    // Funktionen einer importierten Unit rufen, die sonst niemand braucht —
+    // die Markierung dafuer entsteht erst beim Senken, und nur der Nachlauf
+    // holt solche Rumpfe noch nach.
+    self._genEmitPending();
     if binTop != 0 && self.impLstN > 1 {
       var nlSavedSrc:   pchar := self.src;
       var nlSavedNodes: int64 := self.nodes;
@@ -9141,6 +9179,9 @@ pub type IRLower = class {
           self.lowerModule(nlHead);
           nlI := nlI + 1;
         }
+        // #2125: was der Nachlauf an Spezialisierungen angefordert hat;
+        // setzt _nochGelowert, wenn etwas entstand.
+        self._genEmitPending();
         nlWeiter := self._nochGelowert;
         nlRunde := nlRunde + 1;
       }
@@ -9152,35 +9193,14 @@ pub type IRLower = class {
       self.nodeCount := nlSavedCnt;
     }
 
+    // #2125: Spezialisierungen, die bis hierher angefordert wurden — jede im
+    // Kontext IHRER Unit (siehe _genEmitPending). Fuer den obersten Aufruf
+    // stehen sie schon im Nachlauf; der laeuft aber nur mit Importen.
+    self._genEmitPending();
     // #2123: die Sammelfunktion — erst jetzt, wenn alle Units ihren Eintrag
-    // in modInitBuf haben.
-    if binTop != 0 { self._modInitHaupt(); }
-
-    // WP-2.1: emit pending generic specializations collected during this module.
-    // Each pending record: {mangledPtr:8, mangledLen:8, genFuncNodeIdx:8, emitted:8}
-    var pi: int64 := 0;
-    while (pi < self.pendingGenCount) {
-      var pRec: int64 := self.pendingGenBuf + pi * 32;
-      var pEmitted: int64 := peek64(pRec + PENDING_REC_OFF_EMITTED);
-      if (pEmitted == 0) {
-        poke64(pRec + PENDING_REC_OFF_EMITTED, 1);  // mark as emitted
-        var mangPtr: pchar := peek64(pRec) as pchar;
-        var mangLen: int64 := peek64(pRec + PENDING_REC_OFF_MANGLEN);
-        var gNodeIdx: int64 := peek64(pRec + PENDING_REC_OFF_NODEIDX);
-        if (gNodeIdx >= 0) {
-          // Register the specialization in funcBuffer so calls resolve
-          var mangOff: int64 := self.irAddString(mangPtr, mangLen);
-          self.irAddFunc(mangOff, mangLen, 0, 0);
-          // Lower the generic body with the mangled name
-          self.overrideFuncName    := mangPtr;
-          self.overrideFuncNameLen := mangLen;
-          self.lowerFunc(gNodeIdx);
-          self.overrideFuncName    := 0;
-          self.overrideFuncNameLen := 0;
-        }
-      }
-      pi += 1;
-    }
+    // in modInitBuf haben. Danach noch einmal die Spezialisierungen: ein
+    // Anfangswert darf eine generische Funktion rufen (#2125).
+    if binTop != 0 { self._modInitHaupt(); self._genEmitPending(); }
     self.irModHead := lmSavedHead;   // #2076
     self.irPrivTab := lmSavedPT;
     self.irPrivCnt := lmSavedPC;
@@ -10130,116 +10150,143 @@ pub type IRLower = class {
   // WP-20: Generics Lowering
   // ============================================================================
   
-  // WP-2.1: Lower a generic call like max[int64](3, 7).
-  // NK_CALL with iVal=2:
-  //   sVal/sLen = generic function name ("max")
-  //   c0        = first argument (linked via nodeNext)
-  //   c2        = first type-arg AST node (NK_TYPE_NAME "int64", linked via nodeNext)
-  fn lowerGenericCall(expr: int64): int64 {
-    var dest: int64 := self.allocTemp();
+  // #2125: Spezialisierung fuer einen generischen Aufruf `f<A, B>(…)` anfordern.
+  // NK_CALL mit iVal 2: sVal = Name, c0 = Argumente, c2 = Typargumente
+  // (NK_TYPE_NAME, ueber nodeNext verkettet).
+  //
+  // Je Typargument-Kombination EINE Spezialisierung: der Name ist
+  // "<basis><A,B>" — mit Zeichen, die in keinem Bezeichner vorkommen, also
+  // ohne Kollision mit einer Benutzerfunktion. Dieselbe Kombination ein
+  // zweites Mal findet ihren Eintrag in pendingGenBuf wieder.
+  //
+  // Steht der Aufruf selbst in einer Spezialisierung (`g<T>` ruft `f<T>`),
+  // ist T schon ersetzt: genSubstBuf bildet ihn auf das Typargument ab.
+  //
+  // Rueckgabe: Zeiger auf den Namen, Laenge in lenCell. Registriert ist er
+  // dann im funcBuffer — der Aufrufer findet ihn wie jede andere Funktion.
+  fn _genInstanz(expr: int64, lenCell: int64): int64 {
     var genName: pchar := self.nodeSVal(expr);
     var genLen: int64  := self.nodeSLen(expr);
-    var typeArgNode: int64 := self.nodeC2(expr);
-    var arg0: int64 := self.nodeC0(expr);
 
-    // Build mangled name: "genName__type1__type2..."
-    var mangBuf: int64 := alloc(genLen + 512);
-    if (mangBuf == 0) { return dest; }
-    var pos: int64 := 0;
-    var i: int64 := 0;
-    while (i < genLen) {
-      poke8(mangBuf + pos, StrCharAt(genName, i)); pos := pos + 1; i := i + 1;
-    }
-    var ta: int64 := typeArgNode;
-    while (ta >= 0) {
-      StrSetChar(mangBuf as pchar, pos, 95); pos := pos + 1;  // '_'
-      StrSetChar(mangBuf as pchar, pos, 95); pos := pos + 1;  // '_'
-      var tName: pchar := self.nodeSVal(ta);
-      var tLen: int64  := self.nodeSLen(ta);
-      var j: int64 := 0;
-      while (j < tLen) {
-        poke8(mangBuf + pos, StrCharAt(tName, j)); pos := pos + 1; j := j + 1;
-      }
-      ta := self.nodeNext(ta);
-    }
-    poke8(mangBuf + pos, 0);
-
-    // Find the generic declaration node by searching genFuncBuf
-    var genFuncNodeIdx: int64 := -1;
+    // Die Deklaration: zuerst in der eigenen Unit, sonst eine oeffentliche
+    // einer anderen. Ein Knotenindex allein genuegt nicht — er gilt nur in
+    // der Tabelle, aus der er stammt (#2020).
+    var gRecIdx: int64 := 0 - 1;
     var gi: int64 := 0;
     while (gi < self.genFuncCount) {
-      var gRec: int64 := self.genFuncBuf + gi * 24;
-      var gNPtr: pchar := peek64(gRec) as pchar;
-      var gNLen: int64 := peek64(gRec + GENFUNC_REC_OFF_NAMELEN);
-      if (gNLen == genLen) {
-        var isMatch: int64 := 1;
-        var k: int64 := 0;
-        while (k < genLen) {
-          if (StrCharAt(gNPtr, k) != StrCharAt(genName, k)) { isMatch := 0; break; }
-          k += 1;
+      var gRec: int64 := self.genFuncBuf + gi * GENFUNC_REC_SIZE;
+      if (peek64(gRec + GENFUNC_REC_OFF_NAMELEN) == genLen) {
+        if (self.seq(peek64(gRec) as pchar, genLen, genName, genLen)) {
+          if (peek64(gRec + GENFUNC_REC_OFF_NODES) == self.nodes) {
+            gRecIdx := gi; gi := self.genFuncCount;
+          } else if (gRecIdx < 0 && peek64(gRec + GENFUNC_REC_OFF_PUB) != 0) {
+            gRecIdx := gi;
+          }
         }
-        if (isMatch != 0) { genFuncNodeIdx := peek64(gRec + GENFUNC_REC_OFF_NODEIDX); break; }
       }
       gi += 1;
     }
+    if (gRecIdx < 0) {
+      self._genFehler("keine generische Funktion dieses Namens (oder nur als .lyu ohne Quelltext): "c,
+                      genName, genLen);
+    }
+    var gR: int64 := self.genFuncBuf + gRecIdx * GENFUNC_REC_SIZE;
 
-    // Check if this specialization is already in the pending queue
-    var already: int64 := 0;
+    // Typargumente einsammeln — als NAMEN, denn die Spezialisierung wird in
+    // der Tabelle der Deklaration gesenkt, nicht in der des Aufrufs.
+    var taN: int64 := 0;
+    var ta: int64 := self.nodeC2(expr);
+    while (ta >= 0) { taN += 1; ta := self.nodeNext(ta); }
+    if (taN != peek64(gR + GENFUNC_REC_OFF_TPN)) {
+      self._genFehler("Anzahl der Typargumente passt nicht zu den Typparametern von "c, genName, genLen);
+    }
+    var argBuf: int64 := alloc(taN * 16 + 16);
+    var mangLen: int64 := peek64(gR + GENFUNC_REC_OFF_BASELEN) + 2;
+    var ai: int64 := 0;
+    ta := self.nodeC2(expr);
+    while (ta >= 0) {
+      // Nur ein schlichter Typname. `Array<int64>` oder ein Funktionstyp
+      // haette denselben (leeren) Namen wie jeder andere — zwei verschiedene
+      // Instanzen fielen still zusammen.
+      if (self.nodeKind(ta) != NK_TYPE_NAME || self.nodeC0(ta) >= 0 || self.nodeC1(ta) >= 0
+          || self.nodeSLen(ta) <= 0) {
+        self._genFehler("Typargument ist kein einfacher Typname (IR-Weg, wie x86) bei "c, genName, genLen);
+      }
+      var aP: int64 := self.nodeSVal(ta) as int64;
+      var aL: int64 := self.nodeSLen(ta);
+      // In einer Spezialisierung: Typparameter durch sein Argument ersetzen.
+      var si: int64 := 0;
+      while (si < self.genSubstN) {
+        var sRec: int64 := self.genSubstBuf + si * 40;
+        if (self.seq(peek64(sRec) as pchar, peek64(sRec + 8), aP as pchar, aL)) {
+          aP := peek64(sRec + 16); aL := peek64(sRec + 24); si := self.genSubstN;
+        }
+        si += 1;
+      }
+      poke64(argBuf + ai * 16, aP);
+      poke64(argBuf + ai * 16 + 8, aL);
+      mangLen := mangLen + aL + 1;
+      ai += 1;
+      ta := self.nodeNext(ta);
+    }
+
+    // Name "<basis><A,B>" bauen.
+    var mangBuf: int64 := alloc(mangLen + 8);
+    var pos: int64 := 0;
+    var bP: int64 := peek64(gR + GENFUNC_REC_OFF_BASE);
+    var bL: int64 := peek64(gR + GENFUNC_REC_OFF_BASELEN);
+    var bi: int64 := 0;
+    while (bi < bL) { poke8(mangBuf + pos, peek8(bP + bi)); pos += 1; bi += 1; }
+    poke8(mangBuf + pos, 60); pos += 1;                      // '<'
+    ai := 0;
+    while (ai < taN) {
+      if (ai > 0) { poke8(mangBuf + pos, 44); pos += 1; }    // ','
+      var cP: int64 := peek64(argBuf + ai * 16);
+      var cL: int64 := peek64(argBuf + ai * 16 + 8);
+      var ci: int64 := 0;
+      while (ci < cL) { poke8(mangBuf + pos, peek8(cP + ci)); pos += 1; ci += 1; }
+      ai += 1;
+    }
+    poke8(mangBuf + pos, 62); pos += 1;                      // '>'
+    poke8(mangBuf + pos, 0);
+
+    // Dieselbe Kombination schon angefordert? Dann deren Namen nehmen.
     var pi: int64 := 0;
     while (pi < self.pendingGenCount) {
-      var pRec: int64 := self.pendingGenBuf + pi * 32;
-      var pLen: int64 := peek64(pRec + PENDING_REC_OFF_MANGLEN);
-      if (pLen == pos) {
-        var pPtr: pchar := peek64(pRec) as pchar;
-        var m2: int64 := 1; var k2: int64 := 0;
-        while (k2 < pos) {
-          if (StrCharAt(pPtr, k2) != StrCharAt(mangBuf as pchar, k2)) { m2 := 0; break; }
-          k2 += 1;
+      var pRec: int64 := self.pendingGenBuf + pi * PENDING_REC_SIZE;
+      if (peek64(pRec + PENDING_REC_OFF_MANGLEN) == pos) {
+        if (self.seq(peek64(pRec) as pchar, pos, mangBuf as pchar, pos)) {
+          free(mangBuf, mangLen + 8);
+          free(argBuf, taN * 16 + 16);
+          poke64(lenCell, pos);
+          return peek64(pRec);
         }
-        if (m2 != 0) { already := 1; break; }
       }
       pi += 1;
     }
 
-    // Enqueue if not yet pending
-    if (already == 0 && genFuncNodeIdx >= 0) {
-      if (self.pendingGenCount >= self.pendingGenCap) {
-        var pnc: int64 := self.pendingGenCap * 2;
-        var pnb: int64 := alloc(pnc * 32);
-        var pni: int64 := 0;
-        memcpy(pnb, self.pendingGenBuf, self.pendingGenCount * 32);
-        free(self.pendingGenBuf, self.pendingGenCap * 32);
-        self.pendingGenBuf := pnb; self.pendingGenCap := pnc;
-      }
-      var pRec2: int64 := self.pendingGenBuf + self.pendingGenCount * 32;
-      poke64(pRec2,      mangBuf);           // mangledPtr
-      poke64(pRec2 + PENDING_REC_OFF_MANGLEN,  pos);               // mangledLen
-      poke64(pRec2 + PENDING_REC_OFF_NODEIDX, genFuncNodeIdx);    // genFuncNodeIdx
-      poke64(pRec2 + PENDING_REC_OFF_EMITTED, 0);                 // emitted = false
-      self.pendingGenCount += 1;
+    // Neu: im funcBuffer registrieren (Rumpf folgt in _genEmitPending,
+    // _addFunc findet den Eintrag dort wieder) und vormerken.
+    var mOff: int64 := self.irAddString(mangBuf as pchar, pos);
+    var fIdx: int64 := self.irAddFunc(mOff, pos, 0, 0);
+    if (self.pendingGenCount >= self.pendingGenCap) {
+      var pnc: int64 := self.pendingGenCap * 2;
+      var pnb: int64 := alloc(pnc * PENDING_REC_SIZE);
+      memcpy(pnb, self.pendingGenBuf, self.pendingGenCount * PENDING_REC_SIZE);
+      free(self.pendingGenBuf, self.pendingGenCap * PENDING_REC_SIZE);
+      self.pendingGenBuf := pnb; self.pendingGenCap := pnc;
     }
-
-    // Lower the actual call arguments
-    var argTemps: int64 := alloc(64 * 8);  // up to 64 args
-    var argCount: int64 := 0;
-    var argNode: int64 := arg0;
-    while (argNode >= 0 && argCount < 64) {
-      var aTemp: int64 := self.lowerExpr(argNode);
-      poke64(argTemps + argCount * 8, aTemp);
-      argCount += 1;
-      argNode := self.nodeNext(argNode);
-    }
-    // Emit: call mangled_name(arg0, arg1, ...)
-    var mangNameOff: int64 := self.irAddString(mangBuf as pchar, pos);
-    var ai: int64 := 0;
-    while (ai < argCount) {
-      self.irAddInstrDirect(IRO_STORE_LOCAL, ai, peek64(argTemps + ai * 8), -1, 0);
-      ai += 1;
-    }
-    self.irAddInstrDirect(IRO_CALL, dest, mangNameOff, -1, argCount);
-    free(argTemps, 64 * 8);
-    // Note: mangBuf is kept alive (stored in pendingGenBuf) until module lowering completes
-    return dest;
+    var pRec2: int64 := self.pendingGenBuf + self.pendingGenCount * PENDING_REC_SIZE;
+    poke64(pRec2, mangBuf);
+    poke64(pRec2 + PENDING_REC_OFF_MANGLEN, pos);
+    poke64(pRec2 + PENDING_REC_OFF_GENREC, gRecIdx);
+    poke64(pRec2 + PENDING_REC_OFF_EMITTED, 0);
+    poke64(pRec2 + PENDING_REC_OFF_ARGS, argBuf);
+    poke64(pRec2 + PENDING_REC_OFF_ARGN, taN);
+    poke64(pRec2 + PENDING_REC_OFF_FUNCIDX, fIdx);
+    self.pendingGenCount += 1;
+    poke64(lenCell, pos);
+    return mangBuf;
   }
   
   // Type argument as runtime typeid
@@ -12786,5 +12833,195 @@ pub type IRLower = class {
     if self.methodParamBase == 0 { return 0; }
     if self.seq(np, nl, "self"c, 4) { return 1; }
     return 0;
+  }
+
+  // ==================================================================
+  // #2125: Monomorphisierung generischer Funktionen auf dem IR-Weg.
+  // Vier Methoden — die Methodenzahl von IRLower bleibt gerade.
+  //
+  // Der x86-Weg (codegen_x86, WP-BC-24) erzeugt den generischen Rumpf
+  // EINMAL und je Instanz nur einen Sprung dorthin: die Typen sind dort
+  // geloescht, `T` rechnet wie int64. Der IR-Weg senkt je Kombination einen
+  // eigenen Rumpf, mit T durch das Argument ersetzt (_genSubst). Fuer
+  // ganzzahlige Typen und Zeiger ergibt das dasselbe; die Unterschiede
+  // stehen in tests/ir_generics_test.sh.
+  // ==================================================================
+
+  // Eine generische Funktion ins Verzeichnis eintragen — samt dem Kontext
+  // ihrer Unit, in dem ihre Spezialisierungen spaeter gesenkt werden.
+  // `base` ist ihr Name im funcBuffer (_irFnName: privat mit Unit-Praefix).
+  fn _genRegistriere(fd: int64, baseP: int64, baseL: int64) {
+    var tp: int64 := self.nodeC3(fd);
+    // Keine Typparameter: gewoehnliche Funktion, hier nichts zu tun.
+    if (tp < 0 || tp >= self.nodeCount) { return; }
+    if (self.nodeKind(tp) != NK_TYPE_PARAM) { return; }
+    // Der Vorpass laeuft je Nachlaufrunde erneut (#2063) — einmal genuegt.
+    var di: int64 := 0;
+    while (di < self.genFuncCount) {
+      var dR: int64 := self.genFuncBuf + di * GENFUNC_REC_SIZE;
+      if (peek64(dR + GENFUNC_REC_OFF_NODES) == self.nodes && peek64(dR + GENFUNC_REC_OFF_NODEIDX) == fd) {
+        return;
+      }
+      di += 1;
+    }
+    var tpN: int64 := 0;
+    while (tp >= 0) { tpN += 1; tp := self.nodeNext(tp); }
+    if (self.genFuncCount >= self.genFuncCap) {
+      var gfc: int64 := self.genFuncCap * 2;
+      var gfb: int64 := alloc(gfc * GENFUNC_REC_SIZE);
+      memcpy(gfb, self.genFuncBuf, self.genFuncCount * GENFUNC_REC_SIZE);
+      free(self.genFuncBuf, self.genFuncCap * GENFUNC_REC_SIZE);
+      self.genFuncBuf := gfb; self.genFuncCap := gfc;
+    }
+    var r: int64 := self.genFuncBuf + self.genFuncCount * GENFUNC_REC_SIZE;
+    poke64(r, self.nodeSVal(fd) as int64);
+    poke64(r + GENFUNC_REC_OFF_NAMELEN, self.nodeSLen(fd));
+    poke64(r + GENFUNC_REC_OFF_NODEIDX, fd);
+    poke64(r + GENFUNC_REC_OFF_SRC, self.src as int64);
+    poke64(r + GENFUNC_REC_OFF_NODES, self.nodes);
+    poke64(r + GENFUNC_REC_OFF_CNT, self.nodeCount);
+    poke64(r + GENFUNC_REC_OFF_HEAD, self.irModHead);
+    poke64(r + GENFUNC_REC_OFF_TAG, self.irUnitTag);
+    poke64(r + GENFUNC_REC_OFF_TAGLEN, self.irUnitTagLen);
+    poke64(r + GENFUNC_REC_OFF_BASE, baseP);
+    poke64(r + GENFUNC_REC_OFF_BASELEN, baseL);
+    poke64(r + GENFUNC_REC_OFF_PUB, self.nodeIsPub(fd));
+    poke64(r + GENFUNC_REC_OFF_TPN, tpN);
+    self.genFuncCount += 1;
+  }
+
+  // Alle angeforderten, noch nicht erzeugten Spezialisierungen senken. Jede
+  // im Kontext der Unit, in der die generische Funktion steht (Quelltext,
+  // Knotentabelle, Unit-Kennung, private Namen) — der Aufruf kann aus einer
+  // anderen kommen. Waehrend des Senkens ersetzt _genSubst jeden
+  // Typparameter durch sein Argument.
+  //
+  // Eine Spezialisierung darf weitere anfordern (`g<T>` ruft `f<T>`); die
+  // Schleife liest die Anzahl deshalb bei jedem Schritt neu.
+  fn _genEmitPending() {
+    var pi: int64 := 0;
+    while (pi < self.pendingGenCount) {
+      var pRec: int64 := self.pendingGenBuf + pi * PENDING_REC_SIZE;
+      if (peek64(pRec + PENDING_REC_OFF_EMITTED) == 0) {
+        poke64(pRec + PENDING_REC_OFF_EMITTED, 1);
+        var mangP: int64 := peek64(pRec);
+        var mangL: int64 := peek64(pRec + PENDING_REC_OFF_MANGLEN);
+        var argB:  int64 := peek64(pRec + PENDING_REC_OFF_ARGS);
+        var argN:  int64 := peek64(pRec + PENDING_REC_OFF_ARGN);
+        var gR: int64 := self.genFuncBuf + peek64(pRec + PENDING_REC_OFF_GENREC) * GENFUNC_REC_SIZE;
+        var fd: int64 := peek64(gR + GENFUNC_REC_OFF_NODEIDX);
+
+        var svSrc: pchar := self.src;
+        var svNodes: int64 := self.nodes;
+        var svCnt: int64 := self.nodeCount;
+        var svTag: int64 := self.irUnitTag;
+        var svTagL: int64 := self.irUnitTagLen;
+        var svHead: int64 := self.irModHead;
+        var svPT: int64 := self.irPrivTab;
+        var svPC: int64 := self.irPrivCnt;
+        var svSB: int64 := self.genSubstBuf;
+        var svSN: int64 := self.genSubstN;
+        var svON: pchar := self.overrideFuncName;
+        var svOL: int64 := self.overrideFuncNameLen;
+        var svMPB: int64 := self.methodParamBase;
+        var svMCT: int64 := self.curMethodClassType;
+
+        self.src := peek64(gR + GENFUNC_REC_OFF_SRC) as pchar;
+        self.nodes := peek64(gR + GENFUNC_REC_OFF_NODES);
+        self.nodeCount := peek64(gR + GENFUNC_REC_OFF_CNT);
+        self.irUnitTag := peek64(gR + GENFUNC_REC_OFF_TAG);
+        self.irUnitTagLen := peek64(gR + GENFUNC_REC_OFF_TAGLEN);
+        self.irModHead := peek64(gR + GENFUNC_REC_OFF_HEAD);
+        self._irPrivBaue(self.irModHead);
+        self.methodParamBase := 0;
+        self.curMethodClassType := 0 - 1;
+
+        // Ersetzungstabelle: Typparameter i -> Typargument i. Der Knoten des
+        // Arguments muss in DIESER Tabelle liegen; gesucht wird ein
+        // gleichnamiger schlichter Typname (oder die Klassendeklaration).
+        var sb: int64 := alloc(argN * 40 + 40);
+        var tp: int64 := self.nodeC3(fd);
+        var ti: int64 := 0;
+        while (tp >= 0 && ti < argN) {
+          var aP: int64 := peek64(argB + ti * 16);
+          var aL: int64 := peek64(argB + ti * 16 + 8);
+          var aKn: int64 := 0 - 1;
+          var k: int64 := 0;
+          while (k < self.nodeCount) {
+            if (self.nodeKind(k) == NK_TYPE_NAME && self.nodeC0(k) < 0 && self.nodeC1(k) < 0) {
+              if (self.seq(self.nodeSVal(k), self.nodeSLen(k), aP as pchar, aL)) { aKn := k; k := self.nodeCount; }
+            }
+            k += 1;
+          }
+          if (aKn < 0) { aKn := self._findTypeDecl(aP as pchar, aL); }
+          // Kein Knoten dieses Namens in der Unit der Deklaration: dann
+          // bleibt T stehen und rechnet ganzzahlig, wie auf x86. Fuer f64 waere
+          // das falsch (Bitmuster statt Gleitkomma) — laut statt still.
+          if (aKn < 0) {
+            if (self.seq(aP as pchar, aL, "f64"c, 3) || self.seq(aP as pchar, aL, "f32"c, 3)) {
+              self._genFehler("Gleitkomma-Typargument fuer eine generische Funktion einer anderen Unit, die den Typ selbst nirgends nennt: "c,
+                              mangP as pchar, mangL);
+            }
+          }
+          var sR: int64 := sb + ti * 40;
+          poke64(sR, self.nodeSVal(tp) as int64);
+          poke64(sR + 8, self.nodeSLen(tp));
+          poke64(sR + 16, aP);
+          poke64(sR + 24, aL);
+          poke64(sR + 32, aKn);
+          ti += 1;
+          tp := self.nodeNext(tp);
+        }
+        self.genSubstBuf := sb;
+        self.genSubstN := ti;
+        self.overrideFuncName := mangP as pchar;
+        self.overrideFuncNameLen := mangL;
+        self.lowerFunc(fd);
+
+        self.src := svSrc;
+        self.nodes := svNodes;
+        self.nodeCount := svCnt;
+        self.irUnitTag := svTag;
+        self.irUnitTagLen := svTagL;
+        self.irModHead := svHead;
+        self.irPrivTab := svPT;
+        self.irPrivCnt := svPC;
+        self.genSubstBuf := svSB;
+        self.genSubstN := svSN;
+        self.overrideFuncName := svON;
+        self.overrideFuncNameLen := svOL;
+        self.methodParamBase := svMPB;
+        self.curMethodClassType := svMCT;
+        self._nochGelowert := 1;
+      }
+      pi += 1;
+    }
+  }
+
+  // Typknoten durch das Typargument ersetzen, wenn er einen Typparameter
+  // der gerade gesenkten Spezialisierung nennt. Ohne passenden Knoten in der
+  // Unit (siehe _genEmitPending) bleibt er stehen.
+  fn _genSubst(tn: int64): int64 {
+    if (self.genSubstN == 0 || tn < 0) { return tn; }
+    if (self.nodeKind(tn) != NK_TYPE_NAME || self.nodeC0(tn) >= 0) { return tn; }
+    var i: int64 := 0;
+    while (i < self.genSubstN) {
+      var r: int64 := self.genSubstBuf + i * 40;
+      if (self.seq(peek64(r) as pchar, peek64(r + 8), self.nodeSVal(tn), self.nodeSLen(tn))) {
+        var an: int64 := peek64(r + 32);
+        if (an >= 0) { return an; }
+        return tn;
+      }
+      i += 1;
+    }
+    return tn;
+  }
+
+  fn _genFehler(msg: pchar, np: pchar, nl: int64) {
+    EPrintStr("error: #2125: "c);
+    EPrintStr(msg);
+    sys_write(2, np as int64, nl);
+    EPrintStrLn(""c);
+    exit(1);
   }
 }
