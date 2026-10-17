@@ -760,6 +760,20 @@ pub type IRLower = class {
   nmScope:     int64;
   nmScopeCnt:  int64;
   nmScopeCap:  int64;
+  // #2108: Closures und Lambdas (siehe lowerClosure).
+  // clQ*    — Warteschlange der noch zu erzeugenden Lambda-Ruempfe, je 48 B:
+  //           Knoten, Namenszeiger, Laenge, Erfassungsliste, deren Anzahl,
+  //           Knotentabelle.
+  // clCap*  — Erfassungen des Lambdas, dessen Rumpf gerade gesenkt wird
+  //           (je 24 B: Name, Laenge, Typknoten), clEnvSlot sein Umgebungsslot.
+  // clScan* — Arbeitsliste der Erfassungssuche (_clErfasst), gleiches Format.
+  // clFett* — Locals, die einen Heap-Satz {Code, Umgebung} halten: Paare
+  //           (Funktionsknoten, Slot).
+  clQBuf: int64; clQN: int64; clQCap: int64; clQKopf: int64; clLaeuft: int64;
+  clCapP: int64; clCapN: int64; clEnvSlot: int64;
+  clScanP: int64; clScanN: int64; clScanCap: int64;
+  clFettBuf: int64; clFettN: int64; clFettCap: int64;
+  clZaehler: int64; clLetzterKnoten: int64; clLetzteN: int64;
   // #2076: Die Unit, deren Deklarationen gerade gesenkt werden — ihr
   // Importname wie auf x86 (cgUnitTag), 0 fuer das Hauptmodul —, und der Kopf
   // ihrer Deklarationskette. Eine nicht-oeffentliche Funktion einer Unit
@@ -1431,6 +1445,9 @@ pub type IRLower = class {
           }
           pnode := self.nodeNext(pnode);
         }
+        // #2108: im Rumpf eines Lambdas eine Erfassung — nach Locals und
+        // Parametern des Lambdas (die verdecken sie), vor allem Modulweiten.
+        if self._clCapLaden(idName, idLen, dest) != 0 { return dest; }
         // #2019: String-Konstante der Modulebene → ADRESSE der Zeichenkette.
         //
         // Vor der Global-Suche: fuer denselben Namen steht dort ein Eintrag
@@ -1558,6 +1575,11 @@ pub type IRLower = class {
       return self._lowerArrayLit(expr);
     }
 
+    // #2108: Lambda `fn(params): R { ... }` — Codeadresse oder Satz {Code, Umgebung}.
+    if (k == NK_CLOSURE) {
+      return self.lowerClosure(expr);
+    }
+
     // #2092: Hier stand ein stiller Default — jede Ausdrucksart ohne eigenen
     // Zweig bekam einen UNBESCHRIEBENEN Temp, sein Inhalt war, was zuletzt in
     // dem Slot stand. So lief NK_ARRAY_LIT bis #2080 (Absturz auf arm64,
@@ -1566,15 +1588,12 @@ pub type IRLower = class {
     // Gemessen vor dem Scharfschalten: der ganze Bestand (std/, src/std/,
     // examples/, tests/; 1720 Dateien) fuer arm64 und lyxos uebersetzt. Den
     // Default erreichte genau eine Knotenart, NK_CLOSURE in
-    // tests/wp02_closures.lyx — der IR-Weg kennt Closures nicht (#2108), und
-    // das Programm stuerzte dort ab. Jetzt wird laut abgebrochen, wie die
+    // tests/wp02_closures.lyx — der IR-Weg kannte Closures nicht (#2108,
+    // seither umgesetzt: lowerClosure). Jetzt wird laut abgebrochen, wie die
     // Backends es bei unbekannten Opcodes tun (#1339).
     EPrintStr("error: IR-Weg kennt den Ausdruck nicht (Knotenart "c);
     EPrintInt(k);
     EPrintStrLn(")"c);
-    if (k == NK_CLOSURE) {
-      EPrintStrLn("  Closures und Lambdas sind im IR-Weg (arm64/riscv/lyxos) nicht umgesetzt (#2108)."c);
-    }
     exit(1);
     return 0 - 1;
   }
@@ -2084,6 +2103,7 @@ pub type IRLower = class {
   }
 
   fn lowerCall(expr: int64): int64 {
+    self._clArgsPruefen(expr);   // #2108/#1249: einfangendes Lambda als Argument
     // WP-2.1: generic calls (iVal=2) go through the monomorphization path
     if (self.nodeIVal(expr) == 2) {
       return self.lowerGenericCall(expr);
@@ -5821,6 +5841,9 @@ pub type IRLower = class {
     // fn-Adresse zuerst laden (vor Arg-Stores in slots 0..N-1, die f's Slot überschreiben könnten).
     var lfSlot: int64 := self._findLocalSlot(fname, fnlen);
     if lfSlot >= 0 {
+      // #2108: haelt das Local einen Satz {Code, Umgebung}, dann mit Umgebung.
+      var lfCl: int64 := self._clRuf(lfSlot, arg0, dest);
+      if lfCl >= 0 { return lfCl; }
       var lfFn: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_LOAD_LOCAL, lfFn, lfSlot, -1, 0);
       var lfArg: int64 := arg0; var lfI: int64 := 0;
@@ -6134,6 +6157,12 @@ pub type IRLower = class {
         pn := self.nodeNext(pn);
       }
     }
+    // #2108: im Rumpf eines Lambdas die Erfassungen — ihr Typ ist der, den
+    // der Name an der Erzeugungsstelle hatte. Vierte Speicherart neben Local,
+    // Parameter und Modulvariable; _findLocalSlot kennt sie nicht, weil eine
+    // Erfassung keinen Slot hat (Lesen/Schreiben: _clCapLaden/_clCapSpeichern).
+    var cti: int64 := self._clCapIdx(idp, idl);
+    if cti >= 0 { return peek64(self.clCapP + cti * 24 + 16); }
     // #1812: zuletzt die MODULVARIABLEN. Locals und Parameter standen hier
     // schon; die dritte Speicherart fehlte — und damit hatte `g_obj` keinen
     // Typ, der Feld-Offset war unaufloesbar und `g_obj.feld` lieferte Muell.
@@ -7102,6 +7131,7 @@ pub type IRLower = class {
       }
       // Register name -> slot (Typ-Node nodeC0, -1 wenn keiner).
       self._regLocal(peek64(self.nodeOff(stmt) + NODE_OFF_SVAL), self.nodeSLen(stmt), vdSlot, self.nodeC0(stmt));
+      self._clVarMerken(stmt, vdSlot);   // #2108: Satz oder duenner Zeiger?
     }
     // #2020: eine verschachtelte `fn` als Anweisung. Hier entsteht NICHTS —
     // ihr Rumpf wird nach der umgebenden Funktion erzeugt (sonst laege er
@@ -7791,6 +7821,8 @@ pub type IRLower = class {
           }
           if slot >= 0 {
             self.irAddInstrDirect(IRO_STORE_LOCAL, slot, valTemp, -1, 0);
+          } else if self._clCapSpeichern(idName, idLen, valTemp) != 0 {
+            // #2108: Erfassung eines Lambdas — in dessen Umgebung geschrieben.
           } else {
             // ARM64-FIX: kein local/param → global suchen (globalNameBuf) und
             // IRO_STORE_GLOBAL(gIdx, value) emittieren. Sonst war `g := x` für
@@ -8114,6 +8146,7 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
     }
     self._addFunc();
+    self._clAbarbeiten();   // #2108: Lambda-Ruempfe dieser Funktion
   }
    
   // ------------------------------------------------------------------
@@ -9390,74 +9423,227 @@ pub type IRLower = class {
   }
   
   // ============================================================================
-  // WP-20: Closure / Nested Function Lowering
+  // #2108: Closures und Lambdas im IR-Weg (arm64, riscv, lyxos, ...)
+  //
+  // Bis 1.2.14C standen hier fuenf Stubs (lowerClosure & Co.), die nur
+  // Kommentare der Form "Emit: ..." enthielten; erreicht wurden sie nie, weil
+  // lowerExpr NK_CLOSURE nicht kannte (seit #2092 laut, vorher ein
+  // unbeschriebener Temp — `c()` sprang an dessen zufaelligen Inhalt).
+  //
+  // Dieselbe Semantik wie codegen_x86.lyx (CGN_CLOSURE, WP-02, #1249) — die
+  // beiden muessen uebereinstimmen:
+  //  * Erfasst wird jeder Bezeichner des Rumpfes, der an der Erzeugungsstelle
+  //    ein Local oder Parameter ist und kein Parameter des Lambdas
+  //    (cg_scanClosureCaptures). Erfassung PER WERT: die Umgebung ist eine
+  //    Kopie, angelegt beim Erzeugen; spaetere Aenderungen aussen sieht das
+  //    Lambda nicht.
+  //  * Eine Zuweisung an eine Erfassung schreibt in die Umgebung. Sie bleibt
+  //    fuer weitere Aufrufe DESSELBEN Lambdas erhalten (Zaehler), aussen ist
+  //    sie unsichtbar; zwei Lambdas haben je ihre eigene Kopie.
+  //  * Ohne Erfassung ist der Wert die Codeadresse (duenner Zeiger, #1249).
+  //    Mit Erfassung ein Heap-Satz {Code, Umgebung}. Gerufen wird dann mit der
+  //    Umgebung als VERDECKTEM LETZTEM Argument — auf x86 ist es das erste
+  //    (rdi). Die Lage ist intern, kein fremder Code ruft ein Lyx-Lambda; hinten
+  //    angehaengt behalten die Parameter ihre gewohnten Slots.
+  //  * Ob ein Aufruf ueber ein Local den Satz oder die Adresse erwartet, haengt
+  //    wie auf x86 an der Deklaration des Locals (_clVarMerken). Ein
+  //    einfangendes Lambda als Argument oder in einer `fn(...)`-Variablen wird
+  //    wie dort abgewiesen.
+  // Die Ruempfe entstehen NACH der umgebenden Funktion (_clAbarbeiten am Ende
+  // von lowerFunc) — an Ort und Stelle laege fremder Code mitten im
+  // Befehlsstrom der aeusseren Funktion (derselbe Grund wie bei #2020).
   // ============================================================================
-  
-  // Create closure object
+
+  // Ein Lambda-Ausdruck an seiner Erzeugungsstelle.
   fn lowerClosure(expr: int64): int64 {
-    // C0: function to close over
-    // C1: captured variables (linked list)
-    var funcNode: int64 := self.nodeC0(expr);
-    var captures: int64 := self.nodeC1(expr);
-    var dest: int64 := self.allocTemp();
-    
-    // Allocate closure object: {funcPtr, envPtr}
-    // envPtr points to captured variables on heap
-    
-    // Process captures
-    var capOffset: int64 := 16;  // after funcPtr (8 bytes)
-    var curCap: int64 := captures;
-    while (curCap >= 0) {
-      var capTemp: int64 := self.lowerExpr(curCap);
-      // Store captured value to env buffer
-      curCap := self.nodeNext(curCap);
-      capOffset += 8;
+    var n: int64 := self._clErfasst(expr);
+    self.clLetzterKnoten := expr;
+    self.clLetzteN := n;
+    // Eindeutiger Name "__lambda_<n>", in einer Unit "__lambda_<unit>_<n>" —
+    // die Ruempfe mehrerer Units landen im selben funcBuffer.
+    var nameP: int64 := alloc(48 + self.irUnitTagLen);
+    var nameL: int64 := 0;
+    var vor: pchar := "__lambda_"c;
+    while nameL < 9 { poke8(nameP + nameL, StrCharAt(vor, nameL)); nameL := nameL + 1; }
+    if self.irUnitTag != 0 {
+      var ti: int64 := 0;
+      while ti < self.irUnitTagLen {
+        poke8(nameP + nameL, peek8(self.irUnitTag + ti));
+        nameL := nameL + 1; ti := ti + 1;
+      }
+      poke8(nameP + nameL, 95); nameL := nameL + 1;
     }
-    
-    return dest;
-  }
-  
-  // Call closure (through function pointer)
-  fn lowerClosureCall(expr: int64): int64 {
-    var clTemp: int64 := self.lowerExpr(self.nodeC0(expr));
-    
-    // Arguments in C1
-    var curArg: int64 := self.nodeC1(expr);
-    while (curArg >= 0) {
-      self.lowerExpr(curArg);
-      curArg := self.nodeNext(curArg);
+    var zahl: int64 := self.clZaehler;
+    self.clZaehler := self.clZaehler + 1;
+    var ziff: int64 := alloc(24);
+    var zn: int64 := 0;
+    if zahl == 0 { poke8(ziff, 48); zn := 1; }
+    while zahl > 0 {
+      poke8(ziff + zn, 48 + (zahl - (zahl / 10) * 10));
+      zahl := zahl / 10; zn := zn + 1;
     }
-    
-    var dest: int64 := self.allocTemp();
-    
-    // Emit: funcPtr = load clTemp[0]
-    // Emit: envPtr = load clTemp[8]
-    // Emit: call funcPtr(envPtr, args...)
-    return dest;
+    while zn > 0 {
+      zn := zn - 1;
+      poke8(nameP + nameL, peek8(ziff + zn)); nameL := nameL + 1;
+    }
+    free(ziff, 24);
+    poke8(nameP + nameL, 0);
+    var nameOff: int64 := self.irAddString(nameP as pchar, nameL);
+    var fid: int64 := self.irAddFunc(nameOff, nameL, 0, 0);
+    self.globalFuncCount += 1;
+    var capP: int64 := 0;
+    if n > 0 {
+      capP := alloc(n * 24);
+      memcpy(capP, self.clScanP, n * 24);
+    }
+    // Zur Erzeugung vormerken.
+    if self.clQCap == 0 {
+      self.clQCap := 16;
+      self.clQBuf := alloc(self.clQCap * 48);
+    }
+    if self.clQN >= self.clQCap {
+      var nc: int64 := self.clQCap * 2;
+      var nb: int64 := alloc(nc * 48);
+      memcpy(nb, self.clQBuf, self.clQN * 48);
+      self.clQBuf := nb; self.clQCap := nc;
+    }
+    var q: int64 := self.clQBuf + self.clQN * 48;
+    poke64(q, expr); poke64(q + 8, nameP); poke64(q + 16, nameL);
+    poke64(q + 24, capP); poke64(q + 32, n); poke64(q + 40, self.nodes);
+    self.clQN := self.clQN + 1;
+
+    var code: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_FUNC_ADDR, code, fid, -1, 0);
+    if n == 0 { return code; }   // #1249: duenner Zeiger
+
+    // Umgebung: Kopie der erfassten Werte, jetzt.
+    var envSz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, envSz, -1, -1, n * 8);
+    var env: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, env, envSz, -1, 0);
+    var i: int64 := 0;
+    while i < n {
+      var e: int64 := capP + i * 24;
+      var np: pchar := peek64(e) as pchar;
+      var nl: int64 := peek64(e + 8);
+      var v: int64 := self.allocTemp();
+      var s: int64 := self._findLocalSlot(np, nl);
+      if s >= 0 {
+        self.irAddInstrDirect(IRO_LOAD_LOCAL, v, s, -1, 0);
+      } else if self._clIstSelf(np, nl) != 0 {
+        self.irAddInstrDirect(IRO_LOAD_LOCAL, v, IR_BARG_SLOTS, -1, 0);
+      } else if self._clCapLaden(np, nl, v) == 0 {
+        // _clScan nimmt nur Namen auf, die eine dieser drei Herkuenfte haben.
+        EPrintStrLn("lyxc: #2108: Erfassung eines Lambdas nicht aufloesbar (interner Fehler)"c);
+        exit(1);
+      }
+      self.irAddInstrDirect(IRO_STORE_FIELD, i * 8, v, env, 0);
+      i := i + 1;
+    }
+    // Satz {Code, Umgebung}
+    var satzSz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, satzSz, -1, -1, 16);
+    var satz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, satz, satzSz, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, 0, code, satz, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, 8, env, satz, 0);
+    return satz;
   }
-  
-  // Static link parameter (for nested functions)
-  fn lowerStaticLink(): int64 {
-    // Allocate temp for static link (passed as hidden first arg)
-    var slTemp: int64 := self.allocTemp();
-    return slTemp;
+
+  // Erfassungen des Lambdas `cl` im JETZIGEN Kontext nach clScanP; Anzahl.
+  fn _clErfasst(cl: int64): int64 {
+    if self.clScanCap == 0 {
+      self.clScanCap := 16;
+      self.clScanP := alloc(self.clScanCap * 24);
+    }
+    self.clScanN := 0;
+    if cl < 0 { return 0; }
+    if self.nodeKind(cl) != NK_CLOSURE { return 0; }
+    self._clScan(self.nodeC2(cl), self.nodeC0(cl), 0);
+    return self.clScanN;
   }
-  
-  // Load captured variable from static link
-  fn lowerLoadCaptured(varOffset: int64): int64 {
-    var slTemp: int64 := self.lowerStaticLink();
-    var dest: int64 := self.allocTemp();
-    
-    // Emit: dest = load slTemp[varOffset]
-    return dest;
+
+  // Wie _scanCap in codegen_x86.lyx: jeder Bezeichner im Teilbaum, der kein
+  // Parameter des Lambdas (Kette ph) ist und aussen etwas Erfassbares meint.
+  // Verschachtelte Lambdas werden mit abgesucht — was sie brauchen, muss
+  // die Umgebung des mittleren Lambdas schon tragen.
+  fn _clScan(ni: int64, ph: int64, tiefe: int64) {
+    if tiefe > 4096 {
+      EPrintStrLn("lyxc: #2108: Syntaxbaum tiefer als 4096 Ebenen — abgebrochen."c);
+      exit(1);
+    }
+    while ni >= 0 && ni < self.nodeCount {
+      var k: int64 := self.nodeKind(ni);
+      if k == NK_IDENT {
+        var np: pchar := self.nodeSVal(ni);
+        var nl: int64 := self.nodeSLen(ni);
+        var nimm: int64 := 1;
+        var p: int64 := ph;
+        while p >= 0 {
+          if self.seq(self.nodeSVal(p), self.nodeSLen(p), np, nl) { nimm := 0; }
+          p := self.nodeNext(p);
+        }
+        var j: int64 := 0;
+        while j < self.clScanN {
+          var e: int64 := self.clScanP + j * 24;
+          if self.seq(peek64(e) as pchar, peek64(e + 8), np, nl) { nimm := 0; }
+          j := j + 1;
+        }
+        var typ: int64 := 0 - 1;
+        if nimm != 0 {
+          if self._findLocalSlot(np, nl) >= 0 {
+            typ := self._localTypeNode(np, nl);
+          } else if self._clIstSelf(np, nl) != 0 {
+            typ := self.curMethodClassType;
+          } else {
+            var ci: int64 := self._clCapIdx(np, nl);
+            if ci < 0 { nimm := 0; }
+            else { typ := peek64(self.clCapP + ci * 24 + 16); }
+          }
+        }
+        if nimm != 0 {
+          if self.clScanN >= self.clScanCap {
+            var nc: int64 := self.clScanCap * 2;
+            var nb: int64 := alloc(nc * 24);
+            memcpy(nb, self.clScanP, self.clScanN * 24);
+            self.clScanP := nb; self.clScanCap := nc;
+          }
+          var e2: int64 := self.clScanP + self.clScanN * 24;
+          poke64(e2, np as int64); poke64(e2 + 8, nl); poke64(e2 + 16, typ);
+          self.clScanN := self.clScanN + 1;
+        }
+      }
+      // Nicht jede Kindkante ist ein Knoten: bei NK_AT_DIRECTIVE steht in c0
+      // der WERT (siehe _nmWalkOne). Der Rumpf einer C-Schleife haengt an c3.
+      if k != NK_AT_DIRECTIVE {
+        self._clScan(self.nodeC0(ni), ph, tiefe + 1);
+        self._clScan(self.nodeC1(ni), ph, tiefe + 1);
+        self._clScan(self.nodeC2(ni), ph, tiefe + 1);
+        if k == NK_FOR_C { self._clScan(self.nodeC3(ni), ph, tiefe + 1); }
+      }
+      ni := self.nodeNext(ni);
+    }
   }
-  
-  // Store to captured variable
-  fn lowerStoreCaptured(varOffset: int64, srcTemp: int64): int64 {
-    var slTemp: int64 := self.lowerStaticLink();
-    
-    // Emit: store srcTemp to slTemp[varOffset]
-    return srcTemp;
+
+  // Index der Erfassung (np, nl) im Lambda, dessen Rumpf gerade entsteht; -1.
+  fn _clCapIdx(np: pchar, nl: int64): int64 {
+    var i: int64 := 0;
+    while i < self.clCapN {
+      var e: int64 := self.clCapP + i * 24;
+      if self.seq(peek64(e) as pchar, peek64(e + 8), np, nl) { return i; }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  // Lesezugriff auf eine Erfassung: dest = Umgebung[i]. 1 = erledigt, 0 = keine.
+  fn _clCapLaden(np: pchar, nl: int64, dest: int64): int64 {
+    var i: int64 := self._clCapIdx(np, nl);
+    if i < 0 { return 0; }
+    var env: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, env, self.clEnvSlot, -1, 0);
+    self.irAddInstrDirect(IRO_LOAD_FIELD, dest, env, i * 8, 0);
+    return 1;
   }
   
   // ============================================================================
@@ -9990,11 +10176,16 @@ pub type IRLower = class {
     return dest;
   }
   
-  // Closure expression (inline closure)
-  fn lowerClosureExpr(expr: int64): int64 {
-    // C0: captured vars
-    // C1: body (as function)
-    return self.lowerClosure(expr);
+  // #2108: Schreibzugriff auf eine Erfassung: Umgebung[i] := wert. Die
+  // Aenderung bleibt in der Umgebung DIESES Lambdas (wie cg_findClosureCap
+  // beim Zuweisen auf x86). 1 = erledigt, 0 = keine Erfassung dieses Namens.
+  fn _clCapSpeichern(np: pchar, nl: int64, wert: int64): int64 {
+    var i: int64 := self._clCapIdx(np, nl);
+    if i < 0 { return 0; }
+    var env: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, env, self.clEnvSlot, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, i * 8, wert, env, 0);
+    return 1;
   }
   
   // Type name node (for type resolution)
@@ -10037,73 +10228,22 @@ pub type IRLower = class {
     return dest;
   }
   
-  // ============================================================================
-  // Extended Expression Lowering (handles all expression types)
-  // ============================================================================
-  
-  fn lowerExprExtended(expr: int64): int64 {
-    if (expr < 0) { 
-      return self.allocTemp();
+  // #2108: die vorgemerkten Lambda-Ruempfe erzeugen. Gerufen am Ende von
+  // lowerFunc — die umgebende Funktion ist dann vollstaendig, ihre Befehle
+  // stehen zusammenhaengend davor. Was ein Rumpf selbst an Lambdas enthaelt,
+  // haengt sich hinten an und wird in derselben Schleife erledigt.
+  //
+  // (Hier stand bis 1.2.14C `lowerExprExtended`, eine zweite Verteilung der
+  // Ausdrucksarten, die nirgends gerufen wurde.)
+  fn _clAbarbeiten() {
+    if self.clLaeuft != 0 { return; }
+    self.clLaeuft := 1;
+    while self.clQKopf < self.clQN {
+      var rec: int64 := self.clQBuf + self.clQKopf * 48;
+      self.clQKopf := self.clQKopf + 1;
+      self._clFunktion(rec);
     }
-    
-    var k: int64 := self.nodeKind(expr);
-    
-    // Extended expression types
-    if (k == NK_LOAD_FIELD) {
-      return self.lowerLoadField(expr);
-    }
-    if (k == NK_STORE_FIELD) {
-      return self.lowerStoreField(expr);
-    }
-    if (k == NK_LOAD_ELEM) {
-      return self.lowerLoadElem(expr);
-    }
-    if (k == NK_STORE_ELEM) {
-      return self.lowerStoreElem(expr);
-    }
-    if (k == NK_LOAD_FIELD_HEAP) {
-      return self.lowerLoadFieldHeap(expr);
-    }
-    if (k == NK_STORE_FIELD_HEAP) {
-      return self.lowerStoreFieldHeap(expr);
-    }
-    if (k == NK_SUPER_CALL) {
-      return self.lowerSuperCall(expr);
-    }
-    if (k == NK_IS_EXPR) {
-      return self.lowerIsType(expr);
-    }
-    if (k == NK_CLOSURE) {
-      return self.lowerClosure(expr);
-    }
-    if (k == NK_FN_PTR) {
-      return self.lowerFnPtr(expr);
-    }
-    if (k == NK_TYPE_NAME) {
-      return self.lowerTypeName(expr);
-    }
-    if (k == NK_TYPE_PARAM) {
-      return self.lowerTypeParam(expr);
-    }
-    if (k == NK_TYPE_ARRAY) {
-      return self.lowerTypeArray(expr);
-    }
-    if (k == NK_MATCH) {
-      return self.lowerMatch(expr);
-    }
-    if (k == NK_SWITCH) {
-      // Switch as expression or statement
-      return self.lowerSwitch(expr);
-    }
-    if (k == NK_TRY) {
-      return self.lowerTry(expr);
-    }
-    if (k == NK_THROW) {
-      return self.lowerThrowExpr(expr);
-    }
-    
-    // Delegate to base expression lowering
-    return self.lowerExpr(expr);
+    self.clLaeuft := 0;
   }
 
   // ==================================================================
@@ -11775,5 +11915,270 @@ pub type IRLower = class {
       }
     }
     return 0 - 1;
+  }
+
+  // ==================================================================
+  // #2108: Closures, zweiter Teil (der erste steht bei lowerClosure). Am
+  // ENDE der Klasse, aus demselben Grund wie die Interfaces oben.
+  // ==================================================================
+
+  // Einen vorgemerkten Lambda-Rumpf als eigene Funktion erzeugen. Dieselben
+  // Schritte wie lowerFunc — die beiden muessen uebereinstimmen —, dazu die
+  // Umgebung als verdeckter letzter Parameter, wenn das Lambda etwas erfasst.
+  fn _clFunktion(rec: int64) {
+    var node:  int64 := peek64(rec);
+    var nameP: int64 := peek64(rec + 8);
+    var nameL: int64 := peek64(rec + 16);
+    var capP:  int64 := peek64(rec + 24);
+    var capN:  int64 := peek64(rec + 32);
+    if peek64(rec + 40) != self.nodes {
+      // Vorgemerkt und erzeugt wird in derselben lowerFunc — dazwischen
+      // wechselt die Knotentabelle nicht. Tut sie es doch, waere der Knoten
+      // ein fremder.
+      EPrintStrLn("lyxc: #2108: Lambda-Rumpf ausserhalb seiner Knotentabelle (interner Fehler)"c);
+      exit(1);
+    }
+    var sCur: int64 := self.curFunc;
+    var sLoc: int64 := self.localCount;
+    var sPar: int64 := self.paramCount;
+    var sTmp: int64 := self.tempCount;
+    var sLnc: int64 := self.localNameCnt;
+    var sRet: int64 := self.retValTemp;
+    var sExit: int64 := self.funcExitLabel;
+    var sStart: int64 := self.funcInstrStart;
+    var sMpb: int64 := self.methodParamBase;
+    var sMct: int64 := self.curMethodClassType;
+    var sOvN: pchar := self.overrideFuncName;
+    var sOvL: int64 := self.overrideFuncNameLen;
+    var sVol: int64 := self._volSlotN;
+    var sCapP: int64 := self.clCapP;
+    var sCapN: int64 := self.clCapN;
+    var sEnv: int64 := self.clEnvSlot;
+    var sDef: int64 := self.deferCount;
+    var sLx: int64 := self.loopExitLabel;
+    var sLc: int64 := self.loopContLabel;
+
+    self.curFunc := node;
+    self.localCount := 0;
+    self.paramCount := 0;
+    self.tempCount := 0;
+    self.localNameCnt := 0;
+    self._volSlotN := 0;
+    // Das Lambda ist keine Methode: ein `self` im Rumpf ist eine Erfassung.
+    self.methodParamBase := 0;
+    self.curMethodClassType := 0 - 1;
+    self.deferCount := 0;
+    self.loopExitLabel := 0 - 1;
+    self.loopContLabel := 0 - 1;
+
+    var r: int64 := 0;
+    while r < IR_BARG_SLOTS { self.allocTemp(); r := r + 1; }   // #1388
+    var np: int64 := 0;
+    var p: int64 := self.nodeC0(node);
+    while p >= 0 { self.allocParam(); np := np + 1; p := self.nodeNext(p); }
+    var env: int64 := 0 - 1;
+    var regs: int64 := np;
+    if capN > 0 { env := self.allocParam(); regs := regs + 1; }
+    if regs > 8 {
+      // Die IR-Backends uebergeben acht Registerargumente (x0..x7, a0..a7);
+      // ein neuntes ginge still verloren.
+      EPrintStr("lyxc: --target="c);
+      EPrintStr(self._targetName());
+      EPrintStr(": Lambda mit "c);
+      EPrintInt(np);
+      EPrintStr(" Parametern"c);
+      if capN > 0 { EPrintStr(" und Umgebung"c); }
+      EPrintStrLn(" — der IR-Weg uebergibt hoechstens 8 Registerargumente (#2108)."c);
+      exit(1);
+    }
+    self.retValTemp := self.allocTemp();
+    self.funcExitLabel := self.genLabel();
+    self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
+    // Wie x86 (cg_zeroRax vor dem Epilog): wer ohne `return` endet, liefert 0.
+    var nullT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, nullT, -1, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, self.retValTemp, nullT, -1, 0);
+
+    self.clCapP := capP;
+    self.clCapN := capN;
+    self.clEnvSlot := env;
+
+    var body: int64 := self.nodeC2(node);
+    if body >= 0 { self.lowerBlock(body); }
+    self.irEmitLabel(self.funcExitLabel);
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
+    self.overrideFuncName := nameP as pchar;
+    self.overrideFuncNameLen := nameL;
+    self._addFunc();
+
+    self.curFunc := sCur;
+    self.localCount := sLoc;
+    self.paramCount := sPar;
+    self.tempCount := sTmp;
+    self.localNameCnt := sLnc;
+    self.retValTemp := sRet;
+    self.funcExitLabel := sExit;
+    self.funcInstrStart := sStart;
+    self.methodParamBase := sMpb;
+    self.curMethodClassType := sMct;
+    self.overrideFuncName := sOvN;
+    self.overrideFuncNameLen := sOvL;
+    self._volSlotN := sVol;
+    self.clCapP := sCapP;
+    self.clCapN := sCapN;
+    self.clEnvSlot := sEnv;
+    self.deferCount := sDef;
+    self.loopExitLabel := sLx;
+    self.loopContLabel := sLc;
+  }
+
+  // Nach `var name [: T] := init;` (Slot `slot`): haelt das Local einen
+  // Heap-Satz {Code, Umgebung}? Dieselbe Entscheidung wie auf x86
+  // (codegen_x86.lyx, #1249 bei der Variablendeklaration) — sie haengt an der
+  // DEKLARATION, nicht am Wert:
+  //  * mit Typangabe: duenner Zeiger. Ein einfangendes Lambda in einem
+  //    `fn(...)`-Typ wird abgewiesen (cg_rejectCapturingClosure).
+  //  * ohne Typangabe: Satz, wenn der Startwert ein einfangendes Lambda ist,
+  //    ein Aufruf mit Funktionstyp als Rueckgabe (`var c := makeCounter();`)
+  //    oder die Kopie eines solchen Locals.
+  // Abweichung: x86 nimmt JEDEN untypisierten Startwert, der kein Lambda ohne
+  // Erfassung und keine Kopie eines duennen Locals ist, als Satz — auch
+  // `var h := plus;`, dessen Aufruf dort abstuerzt. Hier bleibt der
+  // Funktionsname ein duenner Zeiger, wie er es im IR-Weg seit #1806 war.
+  fn _clVarMerken(stmt: int64, slot: int64) {
+    var init: int64 := self.nodeC1(stmt);
+    if init < 0 { return; }
+    var typ: int64 := self.nodeC0(stmt);
+    var ik: int64 := self.nodeKind(init);
+    var n: int64 := 0;
+    if ik == NK_CLOSURE {
+      // Die Erfassungen, die lowerClosure eben bestimmt hat — jetzt erneut zu
+      // suchen saehe schon die eigene Variable als Local.
+      if init == self.clLetzterKnoten { n := self.clLetzteN; }
+      else { n := self._clErfasst(init); }
+    }
+    if typ >= 0 {
+      if self.nodeKind(typ) == NK_FN_PTR && n > 0 {
+        EPrintStrLn("codegen error: einfangendes Lambda als Wert einer Variablen mit `fn(...)`-Typ (#1249)"c);
+        EPrintStrLn("  Ein `fn(...)`-Typ traegt nur eine Adresse, nicht die eingefangene Umgebung."c);
+        EPrintStrLn("  Ohne Einfangen passt das Lambda; sonst die Werte als Parameter uebergeben."c);
+        exit(1);
+      }
+      return;
+    }
+    var fett: int64 := 0;
+    if ik == NK_CLOSURE && n > 0 { fett := 1; }
+    if ik == NK_CALL {
+      var rt: int64 := self._exprTypeNode(init);
+      if rt >= 0 {
+        if self.nodeKind(rt) == NK_FN_PTR { fett := 1; }
+        else if self.nodeKind(rt) == NK_TYPE_NAME {
+          // `type F = fn(...): R;` — Alias auf einen Funktionstyp (iv-Bit 1,
+          // c0 = NK_FN_PTR), wie _isMethodAlias fuer method(...).
+          var ad: int64 := self._findTypeDecl(self.nodeSVal(rt), self.nodeSLen(rt));
+          if ad >= 0 && (self.nodeIVal(ad) & 2) != 0 {
+            var ab: int64 := self.nodeC0(ad);
+            if ab >= 0 && self.nodeKind(ab) == NK_FN_PTR { fett := 1; }
+          }
+        }
+      }
+    }
+    if ik == NK_IDENT {
+      var qs: int64 := self._findLocalSlot(self.nodeSVal(init), self.nodeSLen(init));
+      if qs >= 0 && qs != slot && self._clIstFett(qs) != 0 { fett := 1; }
+    }
+    if fett == 0 { return; }
+    if self.clFettCap == 0 {
+      self.clFettCap := 16;
+      self.clFettBuf := alloc(self.clFettCap * 16);
+    }
+    if self.clFettN >= self.clFettCap {
+      var nc: int64 := self.clFettCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.clFettBuf, self.clFettN * 16);
+      self.clFettBuf := nb; self.clFettCap := nc;
+    }
+    var e: int64 := self.clFettBuf + self.clFettN * 16;
+    poke64(e, self.curFunc); poke64(e + 8, slot);
+    self.clFettN := self.clFettN + 1;
+  }
+
+  // Haelt Slot `slot` der laufenden Funktion einen Satz {Code, Umgebung}?
+  fn _clIstFett(slot: int64): int64 {
+    var i: int64 := 0;
+    while i < self.clFettN {
+      var e: int64 := self.clFettBuf + i * 16;
+      if peek64(e) == self.curFunc && peek64(e + 8) == slot { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // Aufruf ueber ein Local, das einen Satz haelt: Code und Umgebung aus dem
+  // Satz, die Umgebung als letztes Argument (siehe lowerClosure). Liefert das
+  // Ergebnis-Temp oder -1, wenn das Local keinen Satz haelt.
+  fn _clRuf(slot: int64, arg0: int64, dest: int64): int64 {
+    if self._clIstFett(slot) == 0 { return 0 - 1; }
+    var satz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, satz, slot, -1, 0);
+    // Erst ALLE Argumente auswerten: ein Aufruf darin belegt die Slots 0..N-1
+    // selbst, ein schon dort abgelegtes Argument waere danach ueberschrieben.
+    var n: int64 := 0;
+    var a: int64 := arg0;
+    while a >= 0 { n := n + 1; a := self.nodeNext(a); }
+    if n + 1 > 8 {
+      EPrintStr("lyxc: --target="c);
+      EPrintStr(self._targetName());
+      EPrintStr(": Aufruf eines Lambdas mit "c);
+      EPrintInt(n);
+      EPrintStrLn(" Argumenten und Umgebung — der IR-Weg uebergibt hoechstens 8 Registerargumente (#2108)."c);
+      exit(1);
+    }
+    var temps: int64 := alloc((n + 1) * 8);
+    var i: int64 := 0;
+    a := arg0;
+    while a >= 0 {
+      poke64(temps + i * 8, self.lowerExpr(a));
+      i := i + 1;
+      a := self.nodeNext(a);
+    }
+    var code: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, code, satz, 0, 0);
+    var env: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, env, satz, 8, 0);
+    i := 0;
+    while i < n {
+      self.irAddInstrDirect(IRO_STORE_LOCAL, i, peek64(temps + i * 8), -1, 0);
+      i := i + 1;
+    }
+    free(temps, (n + 1) * 8);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, n, env, -1, 0);
+    self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, code, -1, n + 1);
+    return dest;
+  }
+
+  // Ein einfangendes Lambda als ARGUMENT landet in einem `fn(...)`-Parameter,
+  // der nur eine Adresse traegt — abgewiesen wie auf x86 (#1249).
+  fn _clArgsPruefen(expr: int64) {
+    var a: int64 := self.nodeC0(expr);
+    if self.nodeIVal(expr) == 1 { a := self.nodeC1(expr); }
+    while a >= 0 {
+      if self.nodeKind(a) == NK_CLOSURE {
+        if self._clErfasst(a) > 0 {
+          EPrintStrLn("codegen error: einfangendes Lambda als Argument eines Aufrufs (#1249)"c);
+          EPrintStrLn("  Ein `fn(...)`-Typ traegt nur eine Adresse, nicht die eingefangene Umgebung."c);
+          EPrintStrLn("  Ohne Einfangen passt das Lambda; sonst die Werte als Parameter uebergeben."c);
+          exit(1);
+        }
+      }
+      a := self.nodeNext(a);
+    }
+  }
+
+  // `self` in einer Methode (dort ist es kein Local, sondern Param-Slot 0).
+  fn _clIstSelf(np: pchar, nl: int64): int64 {
+    if self.methodParamBase == 0 { return 0; }
+    if self.seq(np, nl, "self"c, 4) { return 1; }
+    return 0;
   }
 }

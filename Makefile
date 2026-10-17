@@ -590,6 +590,7 @@ test: lyxc
 	@bash tests/ir_kein_stiller_ausdruck_test.sh
 	@bash tests/riscv_zusicherung_test.sh
 	@bash tests/adresse_von_test.sh
+	@bash tests/ir_closures_test.sh
 	@bash tests/android_shared_lib_test.sh
 	@bash tests/ir_mmap_test.sh
 	@bash tests/ir_sprungweite_test.sh
