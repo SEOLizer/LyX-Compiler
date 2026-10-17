@@ -590,6 +590,7 @@ test: lyxc
 	@bash tests/ir_kein_stiller_ausdruck_test.sh
 	@bash tests/riscv_zusicherung_test.sh
 	@bash tests/adresse_von_test.sh
+	@bash tests/ir_f64_negativ_test.sh
 	@bash tests/ir_closures_test.sh
 	@bash tests/ir_viele_argumente_test.sh
 	@bash tests/ir_bezeichner_herkunft_test.sh
