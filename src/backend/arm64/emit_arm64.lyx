@@ -612,7 +612,7 @@ pub type EmitARM64 = class {
     if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, src1, dest); }
     if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, src2, imm, dest); }   // #2132: src2 = argBase
     if op == IRO_FUNC_ADDR { self.emitFuncAddr(src1, dest); }
-    if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest, self.getInstrField(idx, IR_INSTR_OFF_SRC3)); }   // #2132: src3 = argBase
+    if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest, self.getInstrField(idx, IR_INSTR_OFF_SRC3), self.getInstrField(idx, IR_INSTR_OFF_IMMFLOAT)); }   // #2132: src3 = argBase; #2140: immFloat = Signatur
     if op == IRO_CONST_STR    { self.emitConstStr(imm, dest); }
 
     // --- Control flow ---
@@ -1083,12 +1083,32 @@ pub type EmitARM64 = class {
   //
   // #2132: argBase (src3) ist der Argumentblock; ab dem neunten Argument
   // nach AAPCS64 ueber den Stapel, wie beim direkten Aufruf.
-  fn emitCallExtern(argCount: int64, libStrOff: int64, nameStrOff: int64, dest: int64, argBase: int64) {
-    var stBytes: int64 := self._a64StapelArgs(argBase, argCount);
-    self._a64RegArgs(argBase, argCount);
+  //
+  // #2140: sig ist das iVal der extern-Deklaration (ir_lower legt es in
+  // immFloat). Bis 1.2.16A trug IRO_CALL_EXTERN keinen Typ, und alle
+  // Argumente gingen nach x0..x7 — fuer Lyx-eigene Aufrufe richtig (sie
+  // fuehren f64 als Bitmuster in den Ganzzahlregistern), fuer AAPCS64 nicht:
+  // dort zaehlen Ganzzahlen und Gleitkommawerte getrennt, x0..x7 und d0..d7.
+  // `pow(2.0, 10.0)` bekam in d0/d1, was zufaellig darin lag, und das
+  // Ergebnis wurde aus x0 statt d0 gelesen.
+  fn emitCallExtern(argCount: int64, libStrOff: int64, nameStrOff: int64, dest: int64, argBase: int64, sig: int64) {
     var strBuf: int64 := peek64(self.ir + 32);
     var namePtr: int64 := strBuf + nameStrOff;
     var nameLen: int64 := StrLen(namePtr as pchar);
+    var stBytes: int64 := 0;
+    if ((sig >> 53) & 1) != 0 {
+      EPrintStr("error: arm64: extern fn '"c); sys_write(2, namePtr, nameLen);
+      EPrintStrLn("': Gleitkommaparameter ab dem neunten sind nicht umgesetzt (#2140)."c);
+      EPrintStrLn("  Die Signaturmaske der Deklaration reicht ueber acht Parameter; dahinter ist die Klasse unbekannt."c);
+      exit(1);
+    }
+    if ((sig >> 32) & 0xFFFF) == 0 {
+      // Nur Ganzzahlen und Zeiger: die Lyx-Reihe IST die AAPCS64-Reihe.
+      stBytes := self._a64StapelArgs(argBase, argCount);
+      self._a64RegArgs(argBase, argCount);
+    } else {
+      stBytes := self._a64FfiArgs(argBase, argCount, (sig >> 32) & 0xFFFF);
+    }
     // Dedup by name.
     var externIdx: int64 := -1;
     var ei: int64 := 0;
@@ -1143,6 +1163,7 @@ pub type EmitARM64 = class {
       self.emit32(0xF9400129);        // LDR  x9, [x9, #0]      (nachgetragen)
       self.emit32(0xD63F0120);        // BLR x9
       if stBytes > 0 { self.emit32(0x910003FF | (stBytes << 10)); }   // #2132: ADD sp, sp, #stBytes
+      self._a64FfiRueckgabe(sig);     // #2140
       self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
       return;
     }
@@ -1155,7 +1176,97 @@ pub type EmitARM64 = class {
     self._recordRelocation(slotOff, ((externIdx + 1) << 32) | 1025, 0);  // R_AARCH64_GLOB_DAT
     self.emit32(0xD63F0120);        // BLR x9
     if stBytes > 0 { self.emit32(0x910003FF | (stBytes << 10)); }   // #2132: ADD sp, sp, #stBytes
+    self._a64FfiRueckgabe(sig);     // #2140
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2140: Argumente eines FFI-Aufrufs mit Gleitkommaparametern nach AAPCS64.
+  // Zwei getrennt gezaehlte Reihen: Ganzzahlen/Zeiger in x0..x7, f64 in
+  // d0..d7, f32 in s0..s7 (Lyx fuehrt f32 intern als f64-Bits, #1127 — also
+  // FCVT auf single). Was in seiner Reihe keinen Platz mehr hat, geht in
+  // Parameterreihenfolge auf den Stapel, 8-Byte-Plaetze ab sp.
+  //
+  // Die Klasse steht in fmask (2 Bit je Parameter, die ersten acht); dass
+  // dahinter kein Gleitkommawert steht, hat emitCallExtern ueber Bit 53
+  // geprueft. Ein Gleitkommawert auf dem Stapel braeuchte also neun
+  // Gleitkommaparameter unter den ersten acht — den Fall gibt es nicht.
+  //
+  // Dieselbe Einteilung wie der SysV-Weg in codegen_x86.lyx (#1486/#1640,
+  // dort 6 GP + 8 xmm) — die beiden muessen uebereinstimmen.
+  fn _a64FfiArgs(argBase: int64, argCount: int64, fmask: int64): int64 {
+    var rb: int64 := argBase;
+    if rb < 0 { rb := 0; }
+    var nI: int64 := 0;
+    var nSt: int64 := 0;
+    var i: int64 := 0;
+    while i < argCount {
+      var c0: int64 := 0;
+      if i < 8 { c0 := (fmask >> (i * 2)) & 3; }
+      if c0 == 0 {
+        if nI < 8 { nI := nI + 1; } else { nSt := nSt + 1; }
+      }
+      i := i + 1;
+    }
+    var stBytes: int64 := nSt * 8;
+    if (stBytes & 15) != 0 { stBytes := stBytes + 8; }
+    if stBytes > 0 {
+      if argBase < 0 {
+        EPrintStrLn("error: arm64: FFI-Aufruf mit Stapelargumenten ohne Argumentblock (#2132, #2140)."c);
+        exit(1);
+      }
+      if stBytes > 4095 {
+        EPrintStrLn("error: arm64: FFI-Aufruf mit mehr als 4 KB Stapelargumenten (#2140)."c);
+        exit(1);
+      }
+      self.emit32(0xD10003FF | (stBytes << 10));                     // SUB sp, sp, #stBytes
+    }
+    nI := 0;
+    var nF: int64 := 0;
+    var si: int64 := 0;
+    i := 0;
+    while i < argCount {
+      var c: int64 := 0;
+      if i < 8 { c := (fmask >> (i * 2)) & 3; }
+      if c == 0 {
+        if nI < 8 {
+          self.emitLdur(nI, ARM64_X29, self.slotOff(rb + i));        // x_nI
+          nI := nI + 1;
+        } else {
+          self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(rb + i));
+          self.emit32(0xF9000000 | (si << 10) | (31 << 5) | ARM64_X9);   // STR x9, [sp, #si*8]
+          si := si + 1;
+        }
+      } else {
+        self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(rb + i));
+        self.emit32(0x9E670000 | (ARM64_X9 << 5) | nF);              // FMOV d_nF, x9
+        if c == 2 {
+          self.emit32(0x1E624000 | (nF << 5) | nF);                  // FCVT s_nF, d_nF
+        }
+        nF := nF + 1;
+      }
+      i := i + 1;
+    }
+    return stBytes;
+  }
+
+  // #2140: Rueckgabe eines FFI-Aufrufs in die Lyx-Form (Wert in x0).
+  //   f64  kommt in d0       -> FMOV x0, d0
+  //   f32  kommt in s0       -> FCVT d0, s0; FMOV x0, d0
+  //   int8..uint32: AAPCS64 laesst die oberen Bits von x0 offen — clang
+  //   schreibt w0, aus -1 wird also 4294967295. Dieselbe Erweiterung wie
+  //   #1607 in codegen_x86.lyx (Breite in Bits 50-52; die beiden muessen
+  //   uebereinstimmen).
+  fn _a64FfiRueckgabe(sig: int64) {
+    var fret: int64 := (sig >> 48) & 3;
+    if fret == 2 { self.emit32(0x1E22C000); }                  // FCVT d0, s0
+    if fret != 0 { self.emit32(0x9E660000); return; }          // FMOV x0, d0
+    var iw: int64 := (sig >> 50) & 7;
+    if iw == 1 { self.emit32(0x93401C00); }                    // SXTB x0, w0
+    if iw == 2 { self.emit32(0x93403C00); }                    // SXTH x0, w0
+    if iw == 3 { self.emit32(0x93407C00); }                    // SXTW x0, w0
+    if iw == 4 { self.emit32(0x53001C00); }                    // UXTB w0, w0
+    if iw == 5 { self.emit32(0x53003C00); }                    // UXTH w0, w0
+    if iw == 6 { self.emit32(0x2A0003E0); }                    // MOV  w0, w0
   }
 
   // IRO_CONST_STR: load the runtime address of a string literal into `dest`.

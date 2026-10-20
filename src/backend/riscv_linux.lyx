@@ -46,6 +46,15 @@ con RV_T2:   int64 := 7;
 // (s11). Sonst benutzt dieses Backend es nirgends, und es lebt nie ueber einen
 // einzelnen Zugriff hinaus — es kann also mit nichts kollidieren, auch nicht
 // mit t3 … t6, die die Builtin-Folgen als Laufvariablen nehmen.
+//
+// #2140: s11 ist nach dem psABI callee-saved. Bis 1.2.16A wurde es benutzt,
+// ohne es zu retten — unter Lyx-Aufrufern faellt das nicht auf (keiner haelt
+// darin etwas), ein C-Aufrufer (Rueckruf, .so) verliert aber seinen Wert.
+// Ein caller-saved Register gibt es dafuer nicht: t0..t2 tragen die Operanden
+// eines Zugriffs, t3..t6 und a0..a7 die Laufvariablen der Builtin-Folgen
+// (deren Slotzugriffe selbst ueber RV_WEIT gehen koennen). Deshalb rettet
+// emitPrologue s11 in JEDER Funktion; welche es braucht, steht beim Prolog
+// noch nicht fest (Feldversaetze grosser Strukturen kommen erst im Rumpf).
 con RV_WEIT: int64 := 27;
 
 // Linux RISC-V syscall numbers
@@ -434,13 +443,16 @@ pub type EmitRISCV64 = class {
   // Prologue layout (after execution):
   //   [s0+0]  = saved old s0
   //   [s0+8]  = saved ra
+  //   [s0+16] = saved s11 (RV_WEIT, #2140); [s0+24] frei (16-Ausrichtung)
+  //   [s0+32] = erstes Stapelargument des Aufrufers (#2132)
   //   s0      = sp (frame pointer; saved regs above it)
   //   sp      = s0 - stackSize  (locals area below s0)
   // slotOff(i) = -(i+1)*8  → within [sp .. s0-1] ✓
   fn emitPrologue() {
-    self.rv_ADDI(RV_SP, RV_SP, -16);  // alloc saved-regs area
+    self.rv_ADDI(RV_SP, RV_SP, -32);  // alloc saved-regs area
     self.rv_SD(RV_FP, RV_SP, 0);      // save old s0
     self.rv_SD(RV_RA, RV_SP, 8);      // save ra
+    self.rv_SD(RV_WEIT, RV_SP, 16);   // #2140: s11 ist callee-saved
     self.rv_MV(RV_FP, RV_SP);         // s0 = sp (frame pointer)
     if self.stackSize > 0 {
       // #2061: ein Rahmen ueber 2048 Byte passt nicht in den Direktwert von
@@ -461,7 +473,8 @@ pub type EmitRISCV64 = class {
     self.rv_MV(RV_SP, RV_FP);                    // restore sp = s0
     self.rv_LD(RV_FP, RV_SP, 0);                 // restore old s0
     self.rv_LD(RV_RA, RV_SP, 8);                 // restore ra
-    self.rv_ADDI(RV_SP, RV_SP, 16);              // pop saved area
+    self.rv_LD(RV_WEIT, RV_SP, 16);              // #2140: s11 zurueck
+    self.rv_ADDI(RV_SP, RV_SP, 32);              // pop saved area
     self.rv_RET();                                // JALR x0, ra, 0
   }
 
@@ -1802,9 +1815,9 @@ pub type EmitRISCV64 = class {
       } else {
         // #2132: Parameter ab dem neunten liegen nach dem RISC-V-psABI beim
         // Aufrufer auf dem Stapel, 8-Byte-Plaetze ab dessen sp — hier
-        // [s0+16], ueber dem geretteten s0/ra. Bis 1.2.15A blieben diese
-        // Slots unbeschrieben.
-        self.rv_LD(RV_T0, RV_FP, 16 + (pSpillI - 8) * 8);
+        // [s0+32], ueber dem geretteten s0/ra/s11 (#2140). Bis 1.2.15A
+        // blieben diese Slots unbeschrieben.
+        self.rv_LD(RV_T0, RV_FP, 32 + (pSpillI - 8) * 8);
         self.rv_SD(RV_T0, RV_FP, self.slotOff(IR_BARG_SLOTS + pSpillI));
       }
       pSpillI := pSpillI + 1;
