@@ -3464,43 +3464,92 @@ pub type CompilerConfig = class {
   // ---------------------------------------------------------------------------
   
   // WP-AND-02 Phase B/B2: append a Java_<class>_<method> mangled name into
-  // self.mangledNamesBuf. Replaces '.' with '_' in the class part. Returns
-  // an absolute pchar to the NUL-terminated mangled string. Length is the
-  // pre-mangling sum: 5 ("Java_") + classLen + 1 ("_") + methodLen.
-  // (Phase B2 keeps mangling minimal — no _1/_0XXXX escapes; revisit if a
-  // class or method name contains a literal underscore.)
+  // self.mangledNamesBuf. Returns an absolute pchar to the NUL-terminated
+  // mangled string (Laenge = Zuwachs von mangledNamesLen minus NUL).
+  //
+  // #2135: Maskierung nach der JNI-Spezifikation ("Resolving Native Method
+  // Names"), so wie der Lader der JVM den Namen bildet: Ziffern und
+  // ASCII-Buchstaben bleiben, der Paketpunkt (bei Java '/') wird '_',
+  // '_' wird "_1", ';' "_2", '[' "_3", jedes andere Zeichen "_0xxxx"
+  // (UTF-16-Codeeinheit, Kleinbuchstaben; ausserhalb der BMP zwei). Bis
+  // 1.2.15A blieb '_' stehen — `@jni(class="a.b_c", ...)` suchte die JVM als
+  // Java_a_b_1c_..., die .so exportierte Java_a_b_c_..., und der Aufruf
+  // endete in UnsatisfiedLinkError.
   fn _mangleJniName(classPtr: int64, classLen: int64, methodPtr: int64, methodLen: int64): int64 {
-    var outLen: int64 := 5 + classLen + 1 + methodLen;
-    var need:   int64 := self.mangledNamesLen + outLen + 1;
+    // Schlimmster Fall: jedes Byte ein eigenes "_0xxxx" (6 Zeichen).
+    var need: int64 := self.mangledNamesLen + 5 + 6 * (classLen + methodLen) + 2;
     if need > self.mangledNamesCap {
       var newCap: int64 := self.mangledNamesCap * 2;
       if newCap < need { newCap := need + 64; }
       if newCap < 256  { newCap := 256; }
       var nb: int64 := alloc(newCap);
-      var i: int64 := 0;
       memcpy(nb, self.mangledNamesBuf, self.mangledNamesLen);
       self.mangledNamesBuf := nb;
       self.mangledNamesCap := newCap;
     }
     var dst: int64 := self.mangledNamesBuf + self.mangledNamesLen;
-    var javaPrefix: pchar := "Java_";
-    memcpy(dst, javaPrefix as int64, 5);
+    memcpy(dst, "Java_"c as int64, 5);
     var wi: int64 := 5;
-    var ci: int64 := 0;
-    while ci < classLen {
-      var ch: int64 := peek8(classPtr + ci);
-      if ch == 46 { ch := 95; }    // '.' -> '_'
-      poke8(dst + wi, ch);
-      wi += 1;
-      ci += 1;
-    }
-    StrSetChar(dst as pchar, wi, 95);
+    wi := self._jniMangleTeil(dst, wi, classPtr, classLen, 1);
+    poke8(dst + wi, 95);
     wi += 1;
-    memcpy(dst + wi, methodPtr, methodLen);
-    wi += methodLen;
+    wi := self._jniMangleTeil(dst, wi, methodPtr, methodLen, 0);
     poke8(dst + wi, 0);             // NUL terminator
-    self.mangledNamesLen := self.mangledNamesLen + outLen + 1;
+    self.mangledNamesLen := self.mangledNamesLen + wi + 1;
     return dst;
+  }
+
+  // #2135: einen Namensteil maskiert nach dst+wi schreiben; liefert das neue wi.
+  // istKlasse: '.' trennt Pakete und wird '_' (in Java steht dort '/').
+  fn _jniMangleTeil(dst: int64, wi0: int64, src: int64, len: int64, istKlasse: int64): int64 {
+    var wi: int64 := wi0;
+    var i: int64 := 0;
+    while i < len {
+      var ch: int64 := peek8(src + i) & 255;
+      var n: int64 := 1;
+      var cp: int64 := ch;
+      if ch >= 0xC0 && ch < 0xE0 && i + 1 < len {
+        cp := ((ch & 0x1F) << 6) | (peek8(src + i + 1) & 0x3F); n := 2;
+      } else if ch >= 0xE0 && ch < 0xF0 && i + 2 < len {
+        cp := ((ch & 0x0F) << 12) | ((peek8(src + i + 1) & 0x3F) << 6) | (peek8(src + i + 2) & 0x3F); n := 3;
+      } else if ch >= 0xF0 && i + 3 < len {
+        cp := ((ch & 0x07) << 18) | ((peek8(src + i + 1) & 0x3F) << 12)
+              | ((peek8(src + i + 2) & 0x3F) << 6) | (peek8(src + i + 3) & 0x3F); n := 4;
+      }
+      var alnum: bool := (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122);
+      if alnum {
+        poke8(dst + wi, cp); wi += 1;
+      } else if cp == 46 && istKlasse != 0 {
+        poke8(dst + wi, 95); wi += 1;
+      } else if cp == 95 {
+        poke8(dst + wi, 95); poke8(dst + wi + 1, 49); wi += 2;      // _1
+      } else if cp == 59 {
+        poke8(dst + wi, 95); poke8(dst + wi + 1, 50); wi += 2;      // _2
+      } else if cp == 91 {
+        poke8(dst + wi, 95); poke8(dst + wi + 1, 51); wi += 2;      // _3
+      } else if cp > 0xFFFF {
+        var v: int64 := cp - 0x10000;
+        wi := self._jniHex(dst, wi, 0xD800 | (v >> 10));
+        wi := self._jniHex(dst, wi, 0xDC00 | (v & 0x3FF));
+      } else {
+        wi := self._jniHex(dst, wi, cp);
+      }
+      i += n;
+    }
+    return wi;
+  }
+
+  // #2135: "_0" + vier Hexziffern (klein) einer UTF-16-Codeeinheit.
+  fn _jniHex(dst: int64, wi: int64, u: int64): int64 {
+    poke8(dst + wi, 95);
+    poke8(dst + wi + 1, 48);
+    var k: int64 := 0;
+    while k < 4 {
+      var d: int64 := (u >> ((3 - k) * 4)) & 15;
+      if d < 10 { poke8(dst + wi + 2 + k, 48 + d); } else { poke8(dst + wi + 2 + k, 87 + d); }
+      k += 1;
+    }
+    return wi + 6;
   }
 
   // WP-AND-02 Phase B/B2: collect @export- and @jni-annotated top-level

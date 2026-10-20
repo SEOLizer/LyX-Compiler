@@ -469,6 +469,22 @@ con CG_HEAP_END: int64 := 112; // data[112..119]: _lyx_heap_end
 // Bibliothek rechnet in Lyx weiter.
 con CG_RESTAB: int64 := 120;   // data[120..127]: _lyx_restab
 
+// #2135: Ereignisse der Abwickelangaben (cfiBuf). Ein Bereich beginnt mit
+// CFI_FN (Zustand beim Eintritt: CFA = rsp+8) oder CFI_FN_RAHMEN (mitten im
+// Rumpf: CFA = rbp+16, rbp und rbx im Rahmen — dort geht die aeussere
+// Funktion hinter einem eingebetteten Lambda weiter) und endet am naechsten
+// Anfang oder an CFI_ENDE. Code zwischen CFI_ENDE und dem naechsten Anfang
+// (Laufzeithelfer ohne Rahmen) bekommt KEINEN Eintrag: dort bricht ein
+// Abwickler ab, statt mit falschen Regeln weiterzulaufen.
+con CFI_FN:        int64 := 1;
+con CFI_FN_RAHMEN: int64 := 2;
+con CFI_ENDE:      int64 := 3;
+con CFI_CFA_OFF:   int64 := 4;   // Argument: Abstand CFA - rsp
+con CFI_CFA_RBP:   int64 := 5;   // CFA-Register wird rbp (nach mov rbp, rsp)
+con CFI_SICHER:    int64 := 6;   // Argument: Register | (Abstand/8 << 8), gesichert bei CFA - 8*n
+con CFI_CFA_RSP8:  int64 := 7;   // nach pop rbp im Epilog: CFA = rsp+8
+con CFI_RAHMEN:    int64 := 8;   // nach dem ret im Epilog: zurueck auf CFA = rbp+16
+
 // #1915: Einen KURZSPRUNG (rel8) nachtragen — mit Pruefung statt mit Abschnitt.
 //
 // `poke8` nimmt jeden Wert und verwirft die oberen Bits. Aus einer Distanz von
@@ -856,6 +872,15 @@ pub type Codegen = class {
   baseRelocBuf:    int64;
   baseRelocCount:  int64;
   baseRelocCap:    int64;
+
+  // #2135: Abwickelangaben (DWARF CFI) — je Ereignis 16 Byte {Codeoffset,
+  // Art | Argument << 8}. Gesammelt beim Erzeugen, weil nur der Codegen
+  // weiss, wo Prolog, Epilog und Huellen liegen; cg_writeELFShared baut
+  // daraus .eh_frame und .eh_frame_hdr (Arten: CFI_*).
+  cfiBuf:          int64;
+  cfiCount:        int64;
+  cfiCap:          int64;
+  cfiInFn:         int64;   // 1 = gerade im Rumpf einer Funktion mit rbp-Rahmen
 
   // f64-returning user-defined functions: {namePtr:8, nameLen:8} = 16 bytes per entry
   // #2004 (Folgebefund): Gibt die GERADE erzeugte Funktion Gleitkomma zurueck?
@@ -3666,17 +3691,15 @@ pub type Codegen = class {
         var ez: int64 := self.resTabOff + 8 + ri * 32;
         self.cg_datenOffsetZuAdresse(ez,     datenBasis);   // Name
         self.cg_datenOffsetZuAdresse(ez + 16, datenBasis);  // Bytes
-        // #2124: In einer .so sind es absolute Zeiger wie jeder andere —
-        // ohne Basis-Relocation zeigten sie nach 0x400000.
-        if (self.sharedLib != 0) {
-          self.cg_addBaseReloc(CG_CODE_OFF + self.codeLen + ez);
-          self.cg_addBaseReloc(CG_CODE_OFF + self.codeLen + ez + 16);
-        }
+        // #2124/#2135: absolute Zeiger wie jeder andere — die .so (RELATIVE),
+        // PE (.reloc) und LyxOS (PT_LYXRELOC) muessen sie verschieben. Bis
+        // 1.2.15A nur fuer die .so; im PE und unter LyxOS zeigten sie bei
+        // abweichender Ladebasis weiter nach 0x400000.
+        self.cg_addBaseReloc(CG_CODE_OFF + self.codeLen + ez);
+        self.cg_addBaseReloc(CG_CODE_OFF + self.codeLen + ez + 16);
         ri := ri + 1;
       }
-      if (self.sharedLib != 0) {
-        self.cg_addBaseReloc(CG_CODE_OFF + self.codeLen + CG_RESTAB);
-      }
+      self.cg_addBaseReloc(CG_CODE_OFF + self.codeLen + CG_RESTAB);
     }
     // WP-10a: patch VMT address placeholders
     // vmtVaddr = CG_ELF_BASE + CG_CODE_OFF + codeLen + vmtDataOff
@@ -4621,7 +4644,10 @@ pub type Codegen = class {
   // Returns: code position of the imm32 (for later patching with final frame size)
   fn cg_emitPrologue(): int64 {
     self.cg_e8(0x55);                          // push rbp
+    self.cg_cfi(CFI_CFA_OFF, 16);              // #2135
+    self.cg_cfi(CFI_SICHER, 6 | (2 << 8));     // rbp bei CFA-16
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE5);  // mov rbp, rsp
+    self.cg_cfi(CFI_CFA_RBP, 0);
     // sub rsp, imm32 (48 81 EC xx xx xx xx)
     self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xEC);
     var patchPos: int64 := self.codeLen;
@@ -4646,6 +4672,7 @@ pub type Codegen = class {
     // uebereinstimmen, auch in cg_emitPrologueNested.
     self.frameSize += 8;
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x5D); self.cg_e8(0xF0);  // mov [rbp-16], rbx
+    self.cg_cfi(CFI_SICHER, 3 | (4 << 8));     // #2135: rbx bei rbp-16 = CFA-32
     // #1370: --profile misst jede Funktion. Hier, nach dem Rahmenaufbau, sind
     // rax/rdx frei — die Argumentregister sind noch unberuehrt, weil sie erst
     // danach in den Rahmen gerettet werden.
@@ -4703,7 +4730,9 @@ pub type Codegen = class {
     // Normal epilogue
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xEC);  // mov rsp, rbp
     self.cg_e8(0x5D);  // pop rbp
+    self.cg_cfi(CFI_CFA_RSP8, 0);   // #2135: Rahmen gefallen, CFA = rsp+8
     self.cg_e8(0xC3);  // ret
+    self.cg_cfi(CFI_RAHMEN, 0);     // dahinter (spaeteres return, Landepunkt) wieder im Rahmen
   }
 
   // push rax
@@ -6891,54 +6920,7 @@ pub type Codegen = class {
     // rsi := (rsi + 15) & ~15
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC6); self.cg_e8(0x0F);   // add rsi, 15
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE6); self.cg_e8(0xF0);   // and rsi, -16
-
-    self.cg_loadRaxGlobal(CG_HEAP_PTR);                     // rax = naechste freie Stelle
-    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);   // lea rcx, [rax + rsi]
-    self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x0D);   // cmp rcx, [rip + CG_HEAP_END]
-    var pEnd: int64 := self.codeLen;
-    self.cg_e32(0);
-    self.cg_addPatch(pEnd, CG_HEAP_END, 0, CG_PATCH_STR);
-    self.cg_e8(0x76);                                       // jbe passt
-    var pJmp: int64 := self.codeLen;
-    self.cg_e8(0);
-
-    // Langsamer Weg: neuen Block holen. 64 KB, oder die Anforderung selbst,
-    // wenn sie groesser ist — auf ganze Seiten aufgerundet. Die Groesse steht
-    // in rsi und muss ueber den Syscall gerettet werden.
-    self.cg_e8(0x56);                                       // push rsi (Groesse)
-    // rdx := (rsi + 4095) & ~4095   — Anforderung auf Seiten aufgerundet
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF2);   // mov rdx, rsi
-    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xC2); self.cg_e32(4095);  // add rdx, 4095
-    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xE2); self.cg_e32(0 - 4096); // and rdx, -4096
-    // rsi := 65536; ist rdx groesser, nimm rdx
-    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6); self.cg_e32(65536); // mov rsi, 65536
-    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xF2);   // cmp rdx, rsi
-    self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x47); self.cg_e8(0xF2);   // cmova rsi, rdx
-    self.cg_e8(0x56);                                       // push rsi (Blockgroesse)
-    self.cg_e8(0x31); self.cg_e8(0xFF);                     // xor edi, edi
-    self.cg_e8(0xBA); self.cg_e32(3);                       // mov edx, 3
-    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e32(34);    // mov r10d, 34
-    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0);   // mov r8, -1
-    self.cg_e32(0 - 1);
-    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);   // xor r9, r9
-    self.cg_e8(0xB8); self.cg_e32(9);                       // mov eax, 9
-    self.cg_e8(0x0F); self.cg_e8(0x05);                     // syscall → rax = Blockanfang
-    self.cg_e8(0x5E);                                       // pop rsi (Blockgroesse)
-    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);   // lea rcx, [rax + rsi]
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D);   // mov [rip + CG_HEAP_END], rcx
-    var pEnd2: int64 := self.codeLen;
-    self.cg_e32(0);
-    self.cg_addPatch(pEnd2, CG_HEAP_END, 0, CG_PATCH_STR);
-    self.cg_e8(0x5E);                                       // pop rsi (Groesse)
-    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);   // lea rcx, [rax + rsi]
-
-    // passt: rax = Puffer, rcx = neue freie Stelle
-    var ziel: int64 := self.codeLen;
-    cg_patchRel8Wert(self.code, pJmp, ziel - pJmp - 1);
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D);   // mov [rip + CG_HEAP_PTR], rcx
-    var pPtr: int64 := self.codeLen;
-    self.cg_e32(0);
-    self.cg_addPatch(pPtr, CG_HEAP_PTR, 0, CG_PATCH_STR);
+    self.cg_emitBumpAtomar(0, 0);
   }
 
   fn cg_emitNewBump(classIdx: int64) {
@@ -6959,44 +6941,122 @@ pub type Codegen = class {
       var pr: int64 := block % 4096;
       if (pr != 0) { block := block + (4096 - pr); }
     }
+    self.cg_emitBumpAtomar(groesse, block);
+  }
 
-    self.cg_loadRaxGlobal(CG_HEAP_PTR);                     // rax = naechste freie Stelle
-    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x88);   // lea rcx, [rax + groesse]
-    self.cg_e32(groesse);
-    self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x0D);   // cmp rcx, [rip + CG_HEAP_END]
-    var pEnd: int64 := self.codeLen;
+  // `jcc rel32` / `jmp rel32` nach vorn: Stelle des rel32 merken, spaeter
+  // cg_bumpZiel. Rueckwaerts: cg_bumpZurueck.
+  fn cg_bumpZiel(stelle: int64) { poke32(self.code + stelle, self.codeLen - stelle - 4); }
+  fn cg_bumpZurueck(op: int64, ziel: int64) {
+    if (op == 0xE9) { self.cg_e8(0xE9); } else { self.cg_e8(0x0F); self.cg_e8(op); }
+    self.cg_e32(ziel - self.codeLen - 4);
+  }
+  fn cg_bumpVor(op: int64): int64 {
+    if (op == 0xE9) { self.cg_e8(0xE9); } else { self.cg_e8(0x0F); self.cg_e8(op); }
+    var p: int64 := self.codeLen;
     self.cg_e32(0);
-    self.cg_addPatch(pEnd, CG_HEAP_END, 0, CG_PATCH_STR);
-    self.cg_e8(0x76);                                       // jbe passt
-    var pJmp: int64 := self.codeLen;
-    self.cg_e8(0);
+    return p;
+  }
+  // disp32 eines `[rip + X]`, das den Befehl abschliesst: X = datenOff im Datenbereich.
+  fn cg_bumpRip(datenOff: int64) {
+    var p: int64 := self.codeLen;
+    self.cg_e32(0);
+    self.cg_addPatch(p, datenOff, 0, CG_PATCH_STR);
+  }
 
-    // Langsamer Weg: neuen Block holen. mmap(0, block, PROT_RW, PRIVATE|ANON, -1, 0)
-    self.cg_e8(0x31); self.cg_e8(0xFF);                     // xor edi, edi
-    self.cg_e8(0xBE); self.cg_e32(block);                   // mov esi, block
+  // #2135: Belegung aus dem Bump-Block — THREADSICHER. Bis 1.2.15A lasen und
+  // schrieben zwei Threads CG_HEAP_PTR ohne jede Sperre: beide bekamen
+  // dieselbe Stelle und schrieben einander in die Objekte. In einem Programm
+  // gibt es nur einen Thread, in einer .so ruft der Host aus beliebig vielen
+  // (Java-Threads ueber JNI, pthreads).
+  //
+  // Schnellweg ohne Sperre: rax = PTR, rcx = rax + Groesse, passt rcx unter
+  // END, setzt `lock cmpxchg` PTR von rax auf rcx — nur, wenn kein anderer
+  // dazwischen kam; sonst von vorn.
+  //
+  // Neuer Block unter einer Sperre IN END: END = 1 heisst "es wird gerade ein
+  // Block geholt" (rax + Groesse > 1, der Schnellweg faellt also immer in den
+  // langsamen, und der wartet). Wer END per cmpxchg von seinem gelesenen Wert
+  // auf 1 setzt, holt den Block, schreibt ERST PTR und DANN END (x86 haelt
+  // die Reihenfolge zweier Schreibzugriffe) und gibt damit die Sperre frei.
+  // Ein Schnellweg, der PTR noch aus dem alten Block las, scheitert danach
+  // an seinem cmpxchg, weil PTR sich geaendert hat. Anfangszustand PTR = END
+  // = 0: der erste Aufruf nimmt die Sperre von 0 auf 1.
+  //
+  // groesse > 0: Sofortwert (cg_emitNewBump), block die Blockgroesse.
+  // groesse = 0: Groesse in rsi, schon auf 16 gerundet (cg_emitBumpAllocRsi);
+  // die Blockgroesse wird zur Laufzeit bestimmt. Ergebnis in rax;
+  // ueberschrieben werden rcx, rdx und im langsamen Weg die Syscall-Register.
+  fn cg_emitBumpAtomar(groesse: int64, block: int64) {
+    var oben: int64 := self.codeLen;
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05); self.cg_bumpRip(CG_HEAP_PTR);   // mov rax, [PTR]
+    if (groesse > 0) {
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x88); self.cg_e32(groesse);        // lea rcx, [rax + groesse]
+    } else {
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);            // lea rcx, [rax + rsi]
+    }
+    self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x0D); self.cg_bumpRip(CG_HEAP_END);   // cmp rcx, [END]
+    var pLangsam: int64 := self.cg_bumpVor(0x87);                                          // ja langsam
+    self.cg_e8(0xF0); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB1); self.cg_e8(0x0D);
+    self.cg_bumpRip(CG_HEAP_PTR);                                                          // lock cmpxchg [PTR], rcx
+    self.cg_bumpZurueck(0x85, oben);                                                       // jne oben
+    var pFertig1: int64 := self.cg_bumpVor(0xE9);                                          // jmp fertig
+
+    // langsam: Sperre nehmen oder warten
+    self.cg_bumpZiel(pLangsam);
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x15); self.cg_bumpRip(CG_HEAP_END);   // mov rdx, [END]
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xFA); self.cg_e8(0x01);               // cmp rdx, 1
+    var pWarten: int64 := self.cg_bumpVor(0x84);                                           // je warten
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                                 // mov rax, rdx
+    self.cg_e8(0xB9); self.cg_e32(1);                                                      // mov ecx, 1
+    self.cg_e8(0xF0); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB1); self.cg_e8(0x0D);
+    self.cg_bumpRip(CG_HEAP_END);                                                          // lock cmpxchg [END], rcx
+    self.cg_bumpZurueck(0x85, oben);                                                       // jne oben (ein anderer war schneller)
+
+    // Sperre gehalten: neuen Block holen. mmap(0, n, PROT_RW, PRIVATE|ANON, -1, 0)
+    if (groesse > 0) {
+      self.cg_e8(0x31); self.cg_e8(0xFF);                     // xor edi, edi
+      self.cg_e8(0xBE); self.cg_e32(block);                   // mov esi, block
+    } else {
+      // 64 KB, oder die Anforderung selbst, auf ganze Seiten aufgerundet.
+      self.cg_e8(0x56);                                       // push rsi (Groesse)
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF2);   // mov rdx, rsi
+      self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xC2); self.cg_e32(4095);    // add rdx, 4095
+      self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xE2); self.cg_e32(0 - 4096); // and rdx, -4096
+      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6); self.cg_e32(65536);   // mov rsi, 65536
+      self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xF2);   // cmp rdx, rsi
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x47); self.cg_e8(0xF2);     // cmova rsi, rdx
+      self.cg_e8(0x56);                                       // push rsi (Blockgroesse)
+      self.cg_e8(0x31); self.cg_e8(0xFF);                     // xor edi, edi
+    }
     self.cg_e8(0xBA); self.cg_e32(3);                       // mov edx, 3
     self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e32(34);    // mov r10d, 34
     self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0);   // mov r8, -1
     self.cg_e32(0 - 1);
     self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);   // xor r9, r9
     self.cg_e8(0xB8); self.cg_e32(9);                       // mov eax, 9
-    self.cg_e8(0x0F); self.cg_e8(0x05);                     // syscall  → rax = Blockanfang
-    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x88);   // lea rcx, [rax + block]
-    self.cg_e32(block);
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D);   // mov [rip + CG_HEAP_END], rcx
-    var pEnd2: int64 := self.codeLen;
-    self.cg_e32(0);
-    self.cg_addPatch(pEnd2, CG_HEAP_END, 0, CG_PATCH_STR);
-    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x88);   // lea rcx, [rax + groesse]
-    self.cg_e32(groesse);
+    self.cg_e8(0x0F); self.cg_e8(0x05);                     // syscall → rax = Blockanfang
+    if (groesse > 0) {
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x90); self.cg_e32(block);     // lea rdx, [rax + block]
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x88); self.cg_e32(groesse);   // lea rcx, [rax + groesse]
+    } else {
+      self.cg_e8(0x5E);                                                             // pop rsi (Blockgroesse)
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x14); self.cg_e8(0x30);       // lea rdx, [rax + rsi]
+      self.cg_e8(0x5E);                                                             // pop rsi (Groesse)
+      self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);       // lea rcx, [rax + rsi]
+    }
+    // Erst PTR, dann END — das zweite gibt die Sperre frei.
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D); self.cg_bumpRip(CG_HEAP_PTR);   // mov [PTR], rcx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x15); self.cg_bumpRip(CG_HEAP_END);   // mov [END], rdx
+    var pFertig2: int64 := self.cg_bumpVor(0xE9);                                          // jmp fertig
 
-    // passt: rax = Objekt, rcx = neue freie Stelle
-    var ziel: int64 := self.codeLen;
-    cg_patchRel8Wert(self.code, pJmp, ziel - pJmp - 1);
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D);   // mov [rip + CG_HEAP_PTR], rcx
-    var pPtr: int64 := self.codeLen;
-    self.cg_e32(0);
-    self.cg_addPatch(pPtr, CG_HEAP_PTR, 0, CG_PATCH_STR);
+    // warten: ein anderer holt gerade einen Block
+    self.cg_bumpZiel(pWarten);
+    self.cg_e8(0xF3); self.cg_e8(0x90);                                                    // pause
+    self.cg_bumpZurueck(0xE9, oben);                                                       // jmp oben
+
+    self.cg_bumpZiel(pFertig1);
+    self.cg_bumpZiel(pFertig2);
   }
 
   fn cg_classStructSize(classIdx: int64): int64 {
@@ -8280,6 +8340,19 @@ pub type Codegen = class {
     poke64(self.baseRelocBuf + self.baseRelocCount * 8, rva);
     self.baseRelocCount += 1;
   }
+  // #2135: ein Ereignis der Abwickelangaben an der aktuellen Codestelle.
+  fn cg_cfi(art: int64, arg: int64) {
+    if (self.cfiCount >= self.cfiCap) {
+      var nc: int64 := self.cfiCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.cfiBuf, self.cfiCount * 16);
+      self.cfiBuf := nb; self.cfiCap := nc;
+    }
+    poke64(self.cfiBuf + self.cfiCount * 16, self.codeLen);
+    poke64(self.cfiBuf + self.cfiCount * 16 + 8, art | (arg << 8));
+    self.cfiCount += 1;
+  }
+
   // #1370: Zugriff auf die Tabellen, aus denen --dump-relocs und --map-file
   // ihre Ausgabe bauen. Sie stehen nach Generate() fertig da; bis hierher las
   // sie nur der Patcher selbst.
@@ -9917,6 +9990,8 @@ pub type Codegen = class {
     poke8(mangBuf + mangLen, 0);
     // Register label with mangled name
     self.cg_addLabel(mangBuf as pchar, mangLen, self.cg_lineOf(ni));
+    self.cg_cfi(CFI_FN, 0);   // #2135: wie cg_genFuncDecl
+    self.cfiInFn := 1;
     // Track mangled name buffer for cleanup after patching (BUG-02)
     self.cg_trackTempBuf(mangBuf, mangLen + 1);
     // Reset locals
@@ -10120,6 +10195,8 @@ pub type Codegen = class {
         si5 += 1;
       }
     }
+    self.cg_cfi(CFI_ENDE, 0);   // #2135: wie am Ende von cg_genFuncDecl
+    self.cfiInFn := 0;
     // #2044: innere Funktionen der Methode — wie am Ende von cg_genFuncDecl.
     self.cg_flushNested();
   }
@@ -11193,6 +11270,12 @@ pub type Codegen = class {
 
       // 4. Register label at inner function start, emit prologue
       self.cg_addLabel(anonLabel, anonLabelLen, 0);
+      // #2135: Das Lambda liegt MITTEN im Code der aeusseren Funktion — es
+      // bekommt einen eigenen Abwickelbereich, und dahinter geht die aeussere
+      // mit ihrem Rahmen weiter (CFI_FN_RAHMEN unten).
+      var savedCfiInFn: int64 := self.cfiInFn;
+      self.cg_cfi(CFI_FN, 0);
+      self.cfiInFn := 1;
 
       // 5. Save outer function state
       var savedLocalCount: int64 := self.localCount;
@@ -11279,6 +11362,8 @@ pub type Codegen = class {
 
       // 12. Patch jmp-over to here
       poke32(self.code + jmpOverPatch, self.codeLen - jmpOverPatch - 4);
+      self.cfiInFn := savedCfiInFn;   // #2135
+      if (savedCfiInFn != 0) { self.cg_cfi(CFI_FN_RAHMEN, 0); } else { self.cg_cfi(CFI_ENDE, 0); }
 
       // 13. Restore outer state
       self.localBase         := savedLocalBase;
@@ -17677,7 +17762,10 @@ pub type Codegen = class {
   // WP-18: Also installs stack canary at [rbp-8], same as cg_emitPrologue.
   fn cg_emitPrologueNested(): int64 {
     self.cg_e8(0x55);                          // push rbp
+    self.cg_cfi(CFI_CFA_OFF, 16);              // #2135: wie cg_emitPrologue
+    self.cg_cfi(CFI_SICHER, 6 | (2 << 8));
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xE5);  // mov rbp, rsp
+    self.cg_cfi(CFI_CFA_RBP, 0);
     // sub rsp, imm32 (48 81 EC xx xx xx xx)
     self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xEC);
     var patchPos: int64 := self.codeLen;
@@ -17702,6 +17790,7 @@ pub type Codegen = class {
     // uebereinstimmen, auch in cg_emitPrologueNested.
     self.frameSize += 8;
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x5D); self.cg_e8(0xF0);  // mov [rbp-16], rbx
+    self.cg_cfi(CFI_SICHER, 3 | (4 << 8));     // #2135: rbx bei rbp-16 = CFA-32
     // Static link is already in [rbp+16] from caller
     return patchPos;
   }
@@ -19726,6 +19815,12 @@ pub type Codegen = class {
     poke64(self.data + off + 16, codeLen);
     poke64(self.data + off + 24, CG_ELF_BASE + CG_CODE_OFF);
     poke64(self.data + off + 32, CG_ELF_BASE + CG_CODE_OFF + codeLen);
+    // #2135: Beide sind absolute Adressen (Codeanfang/-ende) — dieselbe
+    // Basis-Relocation wie jeder Zeiger im Datenbereich, sonst prueft der
+    // Sweep bei abweichender Ladebasis (PE, LyxOS) Speicher bei 0x400000.
+    // codeLen ist hier endgueltig (Generate fuellt vorher auf).
+    self.cg_addBaseReloc(CG_CODE_OFF + codeLen + off + 24);
+    self.cg_addBaseReloc(CG_CODE_OFF + codeLen + off + 32);
     poke32(self.data + off + 40, self.integrityIntervalMs);
     poke32(self.data + off + 44, stride);
     self.scrubTableOff  := off;
@@ -19952,6 +20047,8 @@ pub type Codegen = class {
       free(tlc, 8);
     }
     self.cg_addLabel(fname, fnlen, self.cg_lineOf(ni));
+    self.cg_cfi(CFI_FN, 0);   // #2135: Abwickelbereich beginnt an der Marke
+    self.cfiInFn := 1;
 
     // Save and set outer function context for nested function capture analysis
     var savedOuterName: pchar := self.outerFuncName;
@@ -20002,14 +20099,18 @@ pub type Codegen = class {
       if StrCharAt(fname, 0) == 109 && StrCharAt(fname, 1) == 97 &&
          StrCharAt(fname, 2) == 105 && StrCharAt(fname, 3) == 110 {
         self.cg_e8(0x57);                                                    // push rdi (argc)
+        self.cg_cfi(CFI_CFA_OFF, 16);                                        // #2135
         self.cg_e8(0x56);                                                    // push rsi (argv)
+        self.cg_cfi(CFI_CFA_OFF, 24);
         // call __lyx_canary_init  (fills _lyx_canary via sys_getrandom)
         self.cg_e8(0xE8);
         var pp18: int64 := self.codeLen;
         self.cg_e32(0);
         self.cg_addPatch(pp18, "__lyx_canary_init" as int64, 17, CG_PATCH_CALL);
         self.cg_e8(0x5E);                                                    // pop rsi  (argv)
+        self.cg_cfi(CFI_CFA_OFF, 16);
         self.cg_e8(0x5F);                                                    // pop rdi  (argc)
+        self.cg_cfi(CFI_CFA_OFF, 8);
       }
     }
 
@@ -20305,6 +20406,10 @@ pub type Codegen = class {
     self.outerFuncName := savedOuterName;
     self.outerFuncNameLen := savedOuterLen;
 
+    // #2135: Ende des Abwickelbereichs — VOR den inneren Funktionen, die
+    // ihren eigenen bekommen.
+    self.cg_cfi(CFI_ENDE, 0);
+    self.cfiInFn := 0;
     // Vorgemerkte verschachtelte Funktionen jetzt emittieren (cg_flushNested).
     self.cg_flushNested();
   }
@@ -23163,6 +23268,12 @@ pub type Codegen = class {
     self.baseRelocBuf   := alloc(self.baseRelocCap * 8);
     self.baseRelocCount := 0;
 
+    // #2135: Abwickelangaben
+    self.cfiCap   := 256;
+    self.cfiBuf   := alloc(self.cfiCap * 16);
+    self.cfiCount := 0;
+    self.cfiInFn  := 0;
+
     // f64-returning function table (pre-populated with known builtins)
     self.f64FuncCap   := 64;
     self.f64FuncList  := alloc(self.f64FuncCap * 16);
@@ -24809,10 +24920,25 @@ pub type Codegen = class {
     }
 
     // push rbx; push rbp; push r12; push r13; push r14; push r15
-    self.cg_e8(0x53); self.cg_e8(0x55);
-    self.cg_e8(0x41); self.cg_e8(0x54); self.cg_e8(0x41); self.cg_e8(0x55);
-    self.cg_e8(0x41); self.cg_e8(0x56); self.cg_e8(0x41); self.cg_e8(0x57);
+    // #2135: Die Huelle hat keinen rbp-Rahmen — ihre Abwickelangaben folgen
+    // rsp Befehl fuer Befehl (DWARF-Register: rbx 3, rbp 6, r12..r15 12..15).
+    // Eigene Marke "__lyx_so_huelle_<Name>": sonst rechnete --debug die Huelle
+    // der zuletzt erzeugten Funktion zu (DWARF-Bereich bis zur naechsten Marke).
+    var hlLen: int64 := 16 + fnlen;
+    var hl: int64 := alloc(hlLen + 1);
+    memcpy(hl, "__lyx_so_huelle_"c as int64, 16);
+    memcpy(hl + 16, fname as int64, fnlen);
+    poke8(hl + hlLen, 0);
+    self.cg_addLabel(hl as pchar, hlLen, 0);
+    self.cg_cfi(CFI_FN, 0);
+    self.cg_e8(0x53); self.cg_cfi(CFI_CFA_OFF, 16); self.cg_cfi(CFI_SICHER, 3 | (2 << 8));
+    self.cg_e8(0x55); self.cg_cfi(CFI_CFA_OFF, 24); self.cg_cfi(CFI_SICHER, 6 | (3 << 8));
+    self.cg_e8(0x41); self.cg_e8(0x54); self.cg_cfi(CFI_CFA_OFF, 32); self.cg_cfi(CFI_SICHER, 12 | (4 << 8));
+    self.cg_e8(0x41); self.cg_e8(0x55); self.cg_cfi(CFI_CFA_OFF, 40); self.cg_cfi(CFI_SICHER, 13 | (5 << 8));
+    self.cg_e8(0x41); self.cg_e8(0x56); self.cg_cfi(CFI_CFA_OFF, 48); self.cg_cfi(CFI_SICHER, 14 | (6 << 8));
+    self.cg_e8(0x41); self.cg_e8(0x57); self.cg_cfi(CFI_CFA_OFF, 56); self.cg_cfi(CFI_SICHER, 15 | (7 << 8));
     self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xEC); self.cg_e32(A);   // sub rsp, A
+    self.cg_cfi(CFI_CFA_OFF, 56 + A);
     var g: int64 := 0;
     while (g < 6) {                                 // mov [rsp+S+8g], <GP g>
       var r: int64 := self.cg_ffiIntReg(g);
@@ -24855,10 +24981,16 @@ pub type Codegen = class {
       if (rk == 2) { self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5A); self.cg_e8(0xC0); }  // cvtsd2ss xmm0, xmm0
     }
     self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xC4); self.cg_e32(A);   // add rsp, A
+    self.cg_cfi(CFI_CFA_OFF, 56);
     // pop r15; pop r14; pop r13; pop r12; pop rbp; pop rbx; ret
-    self.cg_e8(0x41); self.cg_e8(0x5F); self.cg_e8(0x41); self.cg_e8(0x5E);
-    self.cg_e8(0x41); self.cg_e8(0x5D); self.cg_e8(0x41); self.cg_e8(0x5C);
-    self.cg_e8(0x5D); self.cg_e8(0x5B); self.cg_e8(0xC3);
+    self.cg_e8(0x41); self.cg_e8(0x5F); self.cg_cfi(CFI_CFA_OFF, 48);
+    self.cg_e8(0x41); self.cg_e8(0x5E); self.cg_cfi(CFI_CFA_OFF, 40);
+    self.cg_e8(0x41); self.cg_e8(0x5D); self.cg_cfi(CFI_CFA_OFF, 32);
+    self.cg_e8(0x41); self.cg_e8(0x5C); self.cg_cfi(CFI_CFA_OFF, 24);
+    self.cg_e8(0x5D); self.cg_cfi(CFI_CFA_OFF, 16);
+    self.cg_e8(0x5B); self.cg_cfi(CFI_CFA_OFF, 8);
+    self.cg_e8(0xC3);
+    self.cg_cfi(CFI_ENDE, 0);
     free(kl, (n + 1) * 8);
     free(qu, (n + 1) * 8);
   }
@@ -25150,6 +25282,7 @@ pub type Codegen = class {
   fn cg_soEmitInit() {
     self.soInitOff := self.codeLen;
     self.cg_addLabel("__lyx_so_init"c, 13, 0);
+    self.cg_cfi(CFI_FN, 0);   // #2135: kein Rahmen, rsp bleibt unberuehrt bis zum jmp
     self.cg_e8(0x89); self.cg_e8(0xFF);                     // mov edi, edi  (argc ist ein int)
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x3D);   // mov [rip+CG_ARGC], rdi
     var pa: int64 := self.codeLen;
@@ -25177,6 +25310,7 @@ pub type Codegen = class {
     var pj: int64 := self.codeLen;
     self.cg_e32(0);
     self.cg_addPatch(pj, "__lyx_canary_init" as int64, 17, CG_PATCH_CALL);
+    self.cg_cfi(CFI_ENDE, 0);
   }
 
   // `mov r64, imm64` (48 B8+r, imm bei immOff) zu `lea r64, [rip+ziel]` und
@@ -25228,6 +25362,148 @@ pub type Codegen = class {
     poke32(sh + 44, info);
     poke64(sh + 48, align);
     poke64(sh + 56, entsize);
+  }
+
+  // #2135: ULEB128 nach buf+pos, liefert die neue Position.
+  fn cg_ehUleb(buf: int64, pos: int64, v: int64): int64 {
+    var w: int64 := v;
+    var p: int64 := pos;
+    var weiter: int64 := 1;
+    while (weiter != 0) {
+      var b: int64 := w & 127;
+      w := w >> 7;
+      if (w != 0) { b := b | 128; } else { weiter := 0; }
+      poke8(buf + p, b);
+      p := p + 1;
+    }
+    return p;
+  }
+
+  // #2135: DW_CFA_advance_loc in der kuerzesten Form (code_align 1).
+  fn cg_ehAdvance(buf: int64, pos: int64, delta: int64): int64 {
+    if (delta < 64) { poke8(buf + pos, 0x40 | delta); return pos + 1; }
+    if (delta < 256) { poke8(buf + pos, 0x02); poke8(buf + pos + 1, delta); return pos + 2; }
+    if (delta < 65536) { poke8(buf + pos, 0x03); poke16(buf + pos + 1, delta); return pos + 3; }
+    poke8(buf + pos, 0x04); poke32(buf + pos + 1, delta); return pos + 5;
+  }
+
+  // #2135: Aus den Ereignissen (cfiBuf) die Bereiche und ihre CFA-Programme.
+  // Ergebnis: alloc(32) = {Bereichstabelle, Anzahl, Befehlspuffer, Laenge};
+  // je Bereich 32 Byte {Anfang, Ende, Befehlsoffset, Befehlslaenge}, Anfang
+  // und Ende als Codeoffset. Die Reihenfolge der Ereignisse ist die des
+  // Codestroms — eine Ruecklaeufigkeit waere ein Erzeugungsfehler und wird
+  // gemeldet, nicht still sortiert.
+  fn cg_ehBereiche(): int64 {
+    var n: int64 := self.cfiCount;
+    var tab: int64 := alloc((n + 1) * 32);
+    var ins: int64 := alloc(n * 12 + 64);
+    var insLen: int64 := 0;
+    var anz: int64 := 0;
+    var offen: int64 := 0;
+    var anfang: int64 := 0;
+    var insAnf: int64 := 0;
+    var zuletzt: int64 := 0;
+    var vorher: int64 := 0;
+    var k: int64 := 0;
+    while (k <= n) {
+      var pos: int64 := self.codeLen;
+      var art: int64 := CFI_ENDE;
+      var arg: int64 := 0;
+      if (k < n) {
+        pos := peek64(self.cfiBuf + k * 16);
+        var wort: int64 := peek64(self.cfiBuf + k * 16 + 8);
+        art := wort & 255;
+        arg := wort >> 8;
+      }
+      if (pos < vorher) {
+        EPrintStr("interner fehler: --shared: Abwickelangaben nicht in Codereihenfolge bei Offset "c);
+        self.cg_eprintInt(pos);
+        EPrintStrLn(" (#2135)."c);
+        exit(1);
+      }
+      vorher := pos;
+      if (art == CFI_FN || art == CFI_FN_RAHMEN || art == CFI_ENDE) {
+        if (offen != 0 && pos > anfang) {
+          var tb: int64 := tab + anz * 32;
+          poke64(tb, anfang);
+          poke64(tb + 8, pos);
+          poke64(tb + 16, insAnf);
+          poke64(tb + 24, insLen - insAnf);
+          anz := anz + 1;
+        } else if (offen != 0) {
+          insLen := insAnf;            // leerer Bereich: Befehle verwerfen
+        }
+        offen := 0;
+        if (art != CFI_ENDE) {
+          offen := 1;
+          anfang := pos;
+          zuletzt := pos;
+          insAnf := insLen;
+          if (art == CFI_FN_RAHMEN) {
+            // Mitten im Rumpf: CFA = rbp+16, rbp bei CFA-16, rbx bei CFA-32.
+            poke8(ins + insLen, 0x0C); poke8(ins + insLen + 1, 6); poke8(ins + insLen + 2, 16);
+            poke8(ins + insLen + 3, 0x86); poke8(ins + insLen + 4, 2);
+            poke8(ins + insLen + 5, 0x83); poke8(ins + insLen + 6, 4);
+            insLen := insLen + 7;
+          }
+        }
+      } else if (offen != 0) {
+        if (pos > zuletzt) {
+          insLen := self.cg_ehAdvance(ins, insLen, pos - zuletzt);
+          zuletzt := pos;
+        }
+        if (art == CFI_CFA_OFF) {
+          poke8(ins + insLen, 0x0E); insLen := self.cg_ehUleb(ins, insLen + 1, arg);
+        } else if (art == CFI_CFA_RBP) {
+          poke8(ins + insLen, 0x0D); poke8(ins + insLen + 1, 6); insLen := insLen + 2;
+        } else if (art == CFI_SICHER) {
+          poke8(ins + insLen, 0x80 | (arg & 63)); insLen := self.cg_ehUleb(ins, insLen + 1, arg >> 8);
+        } else if (art == CFI_CFA_RSP8) {
+          poke8(ins + insLen, 0x0C); poke8(ins + insLen + 1, 7); poke8(ins + insLen + 2, 8); insLen := insLen + 3;
+        } else if (art == CFI_RAHMEN) {
+          poke8(ins + insLen, 0x0C); poke8(ins + insLen + 1, 6); poke8(ins + insLen + 2, 16); insLen := insLen + 3;
+        } else {
+          EPrintStr("interner fehler: --shared: unbekannte Abwickelangabe "c);
+          self.cg_eprintInt(art);
+          EPrintStrLn(" (#2135)."c);
+          exit(1);
+        }
+      }
+      k := k + 1;
+    }
+    var erg: int64 := alloc(32);
+    poke64(erg, tab);
+    poke64(erg + 8, anz);
+    poke64(erg + 16, ins);
+    poke64(erg + 24, insLen);
+    return erg;
+  }
+
+  // #2135: Funktionen fuer DWARF. Das Ende einer Marke ist die NAECHSTE
+  // Marke im Code, nicht die naechste in der Tabelle — Aliasmarken
+  // (cg_bindConFns) stehen dort hinten, zeigen aber nach vorn.
+  fn cg_dwarfFunktionen(dg: DwarfGen, codeLen: int64) {
+    var li: int64 := 0;
+    while (li < self.labelCount) {
+      var lb: int64 := self.labels + li * CG_LABEL_SZ;
+      var anf: int64 := peek64(lb + CG_LABEL_OFF_CODEOFF);
+      var ende: int64 := codeLen;
+      var lj: int64 := 0;
+      while (lj < self.labelCount) {
+        var o: int64 := peek64(self.labels + lj * CG_LABEL_SZ + CG_LABEL_OFF_CODEOFF);
+        if (o > anf && o < ende) { ende := o; }
+        lj := lj + 1;
+      }
+      dg.dw_addFunc(peek64(lb) as pchar, peek64(lb + CG_LABEL_OFF_NAMELEN), anf, ende,
+                    peek64(lb + CG_LABEL_OFF_LINENUM));
+      li := li + 1;
+    }
+  }
+
+  // #2135: Groesse eines FDE (auf 8 aufgerundet): Laenge, CIE-Zeiger,
+  // pc_begin, pc_range, Augmentierungslaenge, Befehle.
+  fn cg_ehFdeGroesse(insLen: int64): int64 {
+    return ((4 + 4 + 4 + 4 + 1 + insLen + 7) / 8) * 8;
   }
 
   // ET_DYN fuer x86-64. Vorbild ist writeELFSharedLib (arm64, lyxc.lyx) —
@@ -25344,7 +25620,7 @@ pub type Codegen = class {
     // ---- Layout ----
     var hatNote: int64 := 0;
     if (androidApi > 0) { hatNote := 1; }
-    var phNum: int64 := 5 + hatNote;   // LOAD RX, LOAD RW, DYNAMIC, GNU_STACK, GNU_RELRO (+ NOTE)
+    var phNum: int64 := 6 + hatNote;   // LOAD RX, LOAD RW, DYNAMIC, GNU_STACK, GNU_RELRO, GNU_EH_FRAME (+ NOTE)
     var noteOff: int64 := ((64 + phNum * 56 + 7) / 8) * 8;
     var noteSize: int64 := 24 * hatNote;
     var nSyms: int64 := 1 + expCount + nExt;
@@ -25356,7 +25632,20 @@ pub type Codegen = class {
     var relaOff: int64 := ((hashOff + hashSize + 7) / 8) * 8;
     var anzRela: int64 := nBase + 1 + nExt;
     var relaSize: int64 := anzRela * 24;
-    var tabEnde: int64 := relaOff + relaSize;
+    // #2135: .eh_frame_hdr + .eh_frame — Abwickelangaben, ohne die ein
+    // Abwickler (Absturzbericht, backtrace(), C++-Ausnahmen) an der ersten
+    // Lyx-Funktion stehen bleibt. Geladen, nur lesbar, im R-X-Segment.
+    var eh: int64 := self.cg_ehBereiche();
+    var ehTab: int64 := peek64(eh);
+    var ehAnz: int64 := peek64(eh + 8);
+    var ehIns: int64 := peek64(eh + 16);
+    var ehHdrOff: int64 := ((relaOff + relaSize + 7) / 8) * 8;
+    var ehHdrSize: int64 := 12 + ehAnz * 8;
+    var ehOff: int64 := ((ehHdrOff + ehHdrSize + 7) / 8) * 8;
+    var ehSize: int64 := 24 + 4;   // CIE + Endmarke
+    var ef: int64 := 0;
+    while (ef < ehAnz) { ehSize := ehSize + self.cg_ehFdeGroesse(peek64(ehTab + ef * 32 + 24)); ef := ef + 1; }
+    var tabEnde: int64 := ehOff + ehSize;
     var codeOff: int64 := CG_CODE_OFF + ((tabEnde - CG_CODE_OFF + seite - 1) / seite) * seite;
     var dataOff: int64 := codeOff + codeLen;
     var relroOff: int64 := ((dataOff + dataLen + seite - 1) / seite) * seite;
@@ -25368,9 +25657,27 @@ pub type Codegen = class {
     var gotSize: int64 := nExt * 8;
     var relroEnd: int64 := gotOff + gotSize;
     var shstrOff: int64 := relroEnd;
-    var shstrSize: int64 := 128;
-    var shNum: int64 := 11 + hatNote;  // NULL text [note] dynsym dynstr hash rela data dynamic init_array got shstrtab
-    var shOff: int64 := ((shstrOff + shstrSize + 7) / 8) * 8;
+    var shstrSize: int64 := 256;
+    // NULL text [note] dynsym dynstr hash rela eh_frame_hdr eh_frame data dynamic init_array got shstrtab
+    var shNum: int64 := 13 + hatNote;
+    // #2135: --debug — dieselben DWARF-Abschnitte wie im statischen ELF
+    // (WriteELF), nicht geladen, hinter .shstrtab. Bis 1.2.15A fehlten sie
+    // in der .so still. Adressen ab Ladebasis 0: der Code liegt bei codeOff.
+    var dg: DwarfGen := new DwarfGen();
+    dg.Init();
+    dg.elfBase := 0;
+    dg.codeOff := codeOff;
+    var dbgOff: int64 := shstrOff + shstrSize;
+    var dbgSize: int64 := 0;
+    if (self.debugMode != 0) {
+      self.cg_dwarfFunktionen(dg, codeLen);
+      dg.dw_buildAbbrev();
+      dg.dw_buildInfo(self.srcFilePath, self.srcFileLen, codeLen);
+      dg.dw_buildLine(self.srcFilePath, self.srcFileLen);
+      dbgSize := dg.abbrevLen + dg.infoLen + dg.lineLen + dg.strLen;
+      shNum := shNum + 4;
+    }
+    var shOff: int64 := ((dbgOff + dbgSize + 7) / 8) * 8;
     var fileSize: int64 := shOff + shNum * 64;
 
     var buf: int64 := alloc(fileSize);
@@ -25389,7 +25696,7 @@ pub type Codegen = class {
     poke64(buf + ELF64_EHDR_OFF_PHOFF, 64);
     poke64(buf + ELF64_EHDR_OFF_SHOFF, shOff);
     poke16(buf + 52, 64); poke16(buf + 54, 56); poke16(buf + 56, phNum);
-    poke16(buf + 58, 64); poke16(buf + 60, shNum); poke16(buf + 62, shNum - 1);
+    poke16(buf + 58, 64); poke16(buf + 60, shNum); poke16(buf + 62, 12 + hatNote);   // .shstrtab (DWARF folgt dahinter)
 
     // ---- Programmkoepfe ----
     var ph: int64 := buf + 64;
@@ -25398,6 +25705,7 @@ pub type Codegen = class {
     self.cg_soPhdr(ph, 2, 6, dynOff, dynSize, 8);                             ph := ph + 56;  // PT_DYNAMIC
     self.cg_soPhdr(ph, 0x6474E551, 6, 0, 0, 16);                              ph := ph + 56;  // PT_GNU_STACK
     self.cg_soPhdr(ph, 0x6474E552, 4, relroOff, relroEnd - relroOff, 1);      ph := ph + 56;  // PT_GNU_RELRO
+    self.cg_soPhdr(ph, 0x6474E550, 4, ehHdrOff, ehHdrSize, 4);                ph := ph + 56;  // PT_GNU_EH_FRAME (#2135)
     if (hatNote != 0) {
       self.cg_soPhdr(ph, 4, 4, noteOff, noteSize, 4);                                         // PT_NOTE
       poke32(buf + noteOff, 8);                // namesz ("Android\0")
@@ -25485,6 +25793,63 @@ pub type Codegen = class {
       pi := pi + 1;
     }
 
+    // ---- .eh_frame (#2135) ----
+    // CIE fuer x86-64: code_align 1, data_align -8, Ruecksprungadresse =
+    // DWARF-Register 16; beim Eintritt CFA = rsp+8, Ruecksprung bei CFA-8.
+    // FDE-Adressen pc-relativ (0x1B), wie im arm64-Schreiber.
+    var ce: int64 := buf + ehOff;
+    poke32(ce + 0, 20);                  // Laenge
+    poke32(ce + 4, 0);                   // CIE-Kennung
+    poke8(ce + 8, 1);                    // Version
+    poke8(ce + 9, 0x7A); poke8(ce + 10, 0x52); poke8(ce + 11, 0);   // "zR"
+    poke8(ce + 12, 1);                   // code_align
+    poke8(ce + 13, 0x78);                // data_align = -8
+    poke8(ce + 14, 16);                  // Ruecksprungregister
+    poke8(ce + 15, 1);                   // Augmentierungsdaten: 1 Byte
+    poke8(ce + 16, 0x1B);                // FDE-Kodierung pcrel|sdata4
+    poke8(ce + 17, 0x0C); poke8(ce + 18, 7); poke8(ce + 19, 8);     // DW_CFA_def_cfa rsp, 8
+    poke8(ce + 20, 0x90); poke8(ce + 21, 1);                       // DW_CFA_offset r16, CFA-8
+    var fRel: int64 := 24;
+    ef := 0;
+    while (ef < ehAnz) {
+      var eb: int64 := ehTab + ef * 32;
+      var fAnf: int64 := peek64(eb);
+      var fEnd: int64 := peek64(eb + 8);
+      var fIns: int64 := peek64(eb + 24);
+      var fGr:  int64 := self.cg_ehFdeGroesse(fIns);
+      var fe: int64 := buf + ehOff + fRel;
+      poke32(fe, fGr - 4);
+      poke32(fe + 4, fRel + 4);                                            // zum CIE
+      poke32(fe + 8, ((codeOff + fAnf) - (ehOff + fRel + 8)) & 0xFFFFFFFF); // pc_begin
+      poke32(fe + 12, fEnd - fAnf);                                        // pc_range
+      poke8(fe + 16, 0);                                                   // keine Augmentierung
+      memcpy(fe + 17, ehIns + peek64(eb + 16), fIns);                     // Rest: DW_CFA_nop
+      // Suchtabelle in .eh_frame_hdr, datarel ab Kopfanfang, aufsteigend.
+      poke32(buf + ehHdrOff + 12 + ef * 8, (codeOff + fAnf - ehHdrOff) & 0xFFFFFFFF);
+      poke32(buf + ehHdrOff + 16 + ef * 8, (ehOff + fRel - ehHdrOff) & 0xFFFFFFFF);
+      fRel := fRel + fGr;
+      ef := ef + 1;
+    }
+    // Endmarke (Laenge 0): Nullfuellung.
+    poke8(buf + ehHdrOff, 1);                       // Version
+    poke8(buf + ehHdrOff + 1, 0x1B);                // eh_frame_ptr: pcrel|sdata4
+    poke8(buf + ehHdrOff + 2, 0x03);                // fde_count: udata4
+    poke8(buf + ehHdrOff + 3, 0x3B);                // Tabelle: datarel|sdata4
+    poke32(buf + ehHdrOff + 4, (ehOff - (ehHdrOff + 4)) & 0xFFFFFFFF);
+    poke32(buf + ehHdrOff + 8, ehAnz);
+
+    // ---- DWARF (#2135, nur --debug) ----
+    var dAbb: int64 := dbgOff;
+    var dInf: int64 := dAbb + dg.abbrevLen;
+    var dLin: int64 := dInf + dg.infoLen;
+    var dStr: int64 := dLin + dg.lineLen;
+    if (self.debugMode != 0) {
+      memcpy(buf + dAbb, dg.abbrevBuf, dg.abbrevLen);
+      memcpy(buf + dInf, dg.infoBuf, dg.infoLen);
+      memcpy(buf + dLin, dg.lineBuf, dg.lineLen);
+      memcpy(buf + dStr, dg.strBuf, dg.strLen);
+    }
+
     // ---- .dynamic ----
     var d: int64 := buf + dynOff;
     e := 0;
@@ -25516,6 +25881,12 @@ pub type Codegen = class {
     var nDstr: int64 := at; at := self.cg_objPutName(sn, at, ".dynstr"c as int64, 7);
     var nHash: int64 := at; at := self.cg_objPutName(sn, at, ".hash"c as int64, 5);
     var nRela: int64 := at; at := self.cg_objPutName(sn, at, ".rela.dyn"c as int64, 9);
+    var nEhh:  int64 := at; at := self.cg_objPutName(sn, at, ".eh_frame_hdr"c as int64, 13);
+    var nEh:   int64 := at; at := self.cg_objPutName(sn, at, ".eh_frame"c as int64, 9);
+    var nDAbb: int64 := at; at := self.cg_objPutName(sn, at, ".debug_abbrev"c as int64, 13);
+    var nDInf: int64 := at; at := self.cg_objPutName(sn, at, ".debug_info"c as int64, 11);
+    var nDLin: int64 := at; at := self.cg_objPutName(sn, at, ".debug_line"c as int64, 11);
+    var nDStr: int64 := at; at := self.cg_objPutName(sn, at, ".debug_str"c as int64, 10);
     var nData: int64 := at; at := self.cg_objPutName(sn, at, ".data"c as int64, 5);
     var nDyn:  int64 := at; at := self.cg_objPutName(sn, at, ".dynamic"c as int64, 8);
     var nInit: int64 := at; at := self.cg_objPutName(sn, at, ".init_array"c as int64, 11);
@@ -25536,12 +25907,21 @@ pub type Codegen = class {
     self.cg_soShdr(sh, nDstr, 3, 2, dynstrOff, dsLen, 0, 0, 1, 0);             sh := sh + 64;
     self.cg_soShdr(sh, nHash, 5, 2, hashOff, hashSize, iDsym, 0, 8, 4);        sh := sh + 64;
     self.cg_soShdr(sh, nRela, 4, 2, relaOff, relaSize, iDsym, 0, 8, 24);       sh := sh + 64;
+    self.cg_soShdr(sh, nEhh, 1, 2, ehHdrOff, ehHdrSize, 0, 0, 4, 0);          sh := sh + 64;
+    self.cg_soShdr(sh, nEh, 1, 2, ehOff, ehSize, 0, 0, 8, 0);                  sh := sh + 64;
     self.cg_soShdr(sh, nData, 1, 3, dataOff, dataLen, 0, 0, 16, 0);            sh := sh + 64;
     self.cg_soShdr(sh, nDyn, 6, 3, dynOff, dynSize, iDstr, 0, 8, 16);          sh := sh + 64;
     self.cg_soShdr(sh, nInit, 14, 3, initOff, 8, 0, 0, 8, 8);                  sh := sh + 64;
     self.cg_soShdr(sh, nGot, 1, 3, gotOff, gotSize, 0, 0, 8, 8);               sh := sh + 64;
     self.cg_soShdr(sh, nShs, 3, 0, 0, shstrSize, 0, 0, 1, 0);
     poke64(sh + 24, shstrOff);                 // nicht geladen: sh_addr 0, nur sh_offset
+    if (self.debugMode != 0) {
+      // Nicht geladen wie .shstrtab: sh_addr 0. .debug_str mit SHF_MERGE|SHF_STRINGS.
+      sh := sh + 64; self.cg_soShdr(sh, nDAbb, 1, 0, 0, dg.abbrevLen, 0, 0, 1, 0); poke64(sh + 24, dAbb);
+      sh := sh + 64; self.cg_soShdr(sh, nDInf, 1, 0, 0, dg.infoLen, 0, 0, 1, 0);   poke64(sh + 24, dInf);
+      sh := sh + 64; self.cg_soShdr(sh, nDLin, 1, 0, 0, dg.lineLen, 0, 0, 1, 0);   poke64(sh + 24, dLin);
+      sh := sh + 64; self.cg_soShdr(sh, nDStr, 1, 48, 0, dg.strLen, 0, 0, 1, 1);   poke64(sh + 24, dStr);
+    }
 
     EmitWriteFile(path, buf, fileSize);   // #1682: schreibt oder scheitert laut
   }
@@ -25576,6 +25956,10 @@ pub type Codegen = class {
     // WP-BC-25: allocate DwarfGen at function scope so it spans both debug blocks
     var dg: DwarfGen := new DwarfGen();
     dg.Init();
+    // #2135: DwarfGen.Init nimmt 120 an — den Codeanfang von vor WP-6 (ein
+    // Programmkopf). Seit zwei Programmkoepfen liegt er bei CG_CODE_OFF; jede
+    // Adresse in .debug_info/.debug_line lag 56 Byte zu frueh.
+    dg.codeOff := CG_CODE_OFF;
 
     var abbrevSize: int64 := 0;
     var infoSize:   int64 := 0;
