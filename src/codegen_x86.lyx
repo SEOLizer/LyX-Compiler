@@ -959,6 +959,26 @@ pub type Codegen = class {
   closureCapturedLenBuf: int64;   // int64 array[32]: captured var name lengths
   closureCapturedOutBuf: int64;   // int64 array[32]: outer rbp offsets of captured vars
   closureCapturedCount:  int64;   // number of captured variables
+  // #2133: je Erfassung der Index des aeusseren Locals (-1 = keiner) — daraus
+  // Typ (f64?) und Darstellung (Satz oder Adresse) im Rumpf des Lambdas.
+  closureCapturedIdxBuf: int64;
+  closureCapturedEnvBuf: int64;   // #2133: >= 0 = Erfassung einer Erfassung (Index in der Umgebung des Erzeugers)
+  // #2133: die Listen des ERZEUGERS waehrend der Suche (cg_capSuche) — ein
+  // Lambda im Rumpf eines Lambdas findet dessen Erfassungen dort.
+  capErzBuf:             int64;
+  capErzLenBuf:          int64;
+  capErzIdxBuf:          int64;
+  capErzCount:           int64;
+  // #2133: Funktionswerte. Ein Funktionswert ist entweder die blanke
+  // Codeadresse ("duenn") oder ein Heap-Satz {Code, Umgebung}; Umgebung 0
+  // heisst "eingepackte Adresse". satzKontext = 1: der naechste Bezeichner
+  // oder Aufruf in cg_genExpr soll einen Satz liefern (nicht auspacken).
+  satzKontext:           int64;
+  fnWertFnList:          int64;   // Funktionen mit Funktionstyp als Rueckgabe (32 B, cg_registerFnWertKandidat)
+  fnWertFnCount:         int64;
+  fnWertFnCap:           int64;
+  curFnRetFnWert:        int64;   // 1 = die gerade erzeugte Funktion gibt einen Funktionswert zurueck
+  satzLocalJe:           int64;   // 1 = irgendein Local wurde schon als Satz vermerkt (Abkuerzung)
   localBase:             int64;   // cg_findLocal searches [localBase, localCount) only
 
   // Per-local array flag (WP-10b): byte buffer parallel to locals, 1 = array type
@@ -2546,34 +2566,15 @@ pub type Codegen = class {
     if (ni < 0) { return; }
     var k: int64 := self.cg_nkind(ni);
     if (k == CGN_IDENT) {
-      var name: pchar := self.cg_nsval(ni);
-      var nlen: int64 := self.cg_nslen(ni);
-      // Check if it's one of the inner function's explicit params (skip those)
-      var isParam: int64 := 0;
-      var p: int64 := paramNi;
-      while (p >= 0) {
-        if (self.cg_seq(self.cg_nsval(p), self.cg_nslen(p), name, nlen)) { isParam := 1; }
-        p := self.cg_nnext(p);
-      }
-      if (isParam == 0) {
-        // Check if exists in OUTER locals (localBase = 0 for the lookup)
-        var savedBase: int64 := self.localBase;
-        self.localBase := 0;
-        var outerOff: int64 := self.cg_findLocal(name, nlen);
-        self.localBase := savedBase;
-        if (outerOff != 0) {
-          // Not already captured?
-          if (self.cg_findClosureCap(name, nlen) < 0) {
-            if (self.closureCapturedCount < 32) {
-              var idx: int64 := self.closureCapturedCount;
-              poke64(self.closureCapturedBuf + idx * 8, name as int64);
-              poke64(self.closureCapturedLenBuf + idx * 8, nlen);
-              poke64(self.closureCapturedOutBuf + idx * 8, outerOff);
-              self.closureCapturedCount := idx + 1;
-            }
-          }
-        }
-      }
+      self._scanCapName(self.cg_nsval(ni), self.cg_nslen(ni), paramNi);
+    }
+    // #2133: `c()` im Rumpf — c steht dort als AUFRUFNAME, nicht als
+    // Bezeichner. Ist c ein Local der Erzeugungsstelle (ein Lambda in einer
+    // Variablen), muss es ebenso in die Umgebung wie jeder gelesene Name;
+    // sonst fand der Rumpf es nicht ("undefined function 'c'"). Eine innere
+    // benannte Funktion (cg_nestIdx) ist keine Variable.
+    if (k == CGN_CALL && self.cg_nival(ni) == 0 && self.cg_nestIdx(ni) < 0) {
+      self._scanCapName(self.cg_nsval(ni), self.cg_nslen(ni), paramNi);
     }
     // Recurse into children and siblings (statement list)
     self._scanCap(self.cg_nc0(ni), paramNi);
@@ -2581,6 +2582,354 @@ pub type Codegen = class {
     self._scanCap(self.cg_nc2(ni), paramNi);
     var nxt: int64 := self.cg_nnext(ni);
     if (nxt >= 0) { self._scanCap(nxt, paramNi); }
+  }
+
+  // Ein Name des Rumpfes: erfassen, wenn er kein Parameter des Lambdas ist
+  // und an der Erzeugungsstelle ein Local meint.
+  fn _scanCapName(name: pchar, nlen: int64, paramNi: int64) {
+    var p: int64 := paramNi;
+    while (p >= 0) {
+      if (self.cg_seq(self.cg_nsval(p), self.cg_nslen(p), name, nlen)) { return; }
+      p := self.cg_nnext(p);
+    }
+    // Ein Local der ERZEUGUNGSSTELLE. #2133: bis dahin wurde mit
+    // localBase = 0 gesucht — in einem Lambda, das selbst in einem Lambda
+    // steht, fand das die Locals der aeusseren Funktion und kopierte sie aus
+    // dem falschen Rahmen (rbp gehoert dort dem mittleren Lambda).
+    var outerOff: int64 := self.cg_findLocal(name, nlen);
+    var outerIdx: int64 := self.cg_findLocalIdx(name, nlen);
+    var envIdx: int64 := 0 - 1;
+    if (outerOff == 0) {
+      // Eine Erfassung des umgebenden Lambdas: aus dessen Umgebung kopieren.
+      // Typ und Darstellung erbt sie von dort.
+      if (self.closureEnvPtrOff == 0) { return; }
+      envIdx := self.cg_findClosureCapIn(self.capErzBuf, self.capErzLenBuf, self.capErzCount, name, nlen);
+      if (envIdx < 0) { return; }
+      outerIdx := peek64(self.capErzIdxBuf + envIdx * 8);
+    }
+    if (self.cg_findClosureCap(name, nlen) >= 0) { return; }
+    if (self.closureCapturedCount >= 32) {
+      // Bis #2133 fiel die 33. Erfassung still weg — ihr Name lief im Rumpf
+      // dann in die globale Suche und wurde zu 0 oder zu einem fremden Wert.
+      EPrintStrLn("codegen error: Lambda erfasst mehr als 32 Variablen (#2133)"c);
+      exit(1);
+    }
+    var idx: int64 := self.closureCapturedCount;
+    poke64(self.closureCapturedBuf + idx * 8, name as int64);
+    poke64(self.closureCapturedLenBuf + idx * 8, nlen);
+    poke64(self.closureCapturedOutBuf + idx * 8, outerOff);
+    poke64(self.closureCapturedIdxBuf + idx * 8, outerIdx);   // #2133
+    poke64(self.closureCapturedEnvBuf + idx * 8, envIdx);     // #2133: >= 0 = aus der Umgebung
+    self.closureCapturedCount := idx + 1;
+  }
+
+  // #2133: Erfassungssuche in EIGENE Listen. Die bisherigen (die des
+  // Lambdas, in dessen Rumpf wir stehen) bleiben als Erzeuger-Listen
+  // sichtbar und unberuehrt; der Aufrufer stellt sie danach wieder her.
+  fn cg_capSuche(bodyNi: int64, paramNi: int64) {
+    self.capErzBuf    := self.closureCapturedBuf;
+    self.capErzLenBuf := self.closureCapturedLenBuf;
+    self.capErzIdxBuf := self.closureCapturedIdxBuf;
+    self.capErzCount  := self.closureCapturedCount;
+    self.closureCapturedBuf    := alloc(32 * 8);
+    self.closureCapturedLenBuf := alloc(32 * 8);
+    self.closureCapturedOutBuf := alloc(32 * 8);
+    self.closureCapturedIdxBuf := alloc(32 * 8);
+    self.closureCapturedEnvBuf := alloc(32 * 8);
+    self.cg_scanClosureCaptures(bodyNi, paramNi);
+  }
+
+  // Wie cg_findClosureCap, aber in den angegebenen Listen.
+  fn cg_findClosureCapIn(buf: int64, lenBuf: int64, n: int64, name: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < n) {
+      if (self.cg_seq(peek64(buf + i * 8) as pchar, peek64(lenBuf + i * 8), name, nlen)) { return i; }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // ==================================================================
+  // #2133: Funktionswerte — Adresse oder Satz.
+  //
+  // Ein Funktionswert ist entweder die blanke Codeadresse ("duenn": ein
+  // Funktionsname, ein Lambda ohne Erfassung, alles in einem `fn(...)`-Typ)
+  // oder ein Heap-Satz {Code, Umgebung} (ein einfangendes Lambda, eine
+  // Methodenreferenz). Dieselbe Semantik wie im IR-Weg (src/ir_lower.lyx,
+  // _clVarMerken und Nachbarn) — die beiden muessen uebereinstimmen:
+  //
+  //  * Ob ein Local einen Satz haelt, entscheidet seine DEKLARATION:
+  //    ohne Typangabe ein Satz genau dann, wenn der Startwert einer ist
+  //    (cg_istSatzWert, einfangendes Lambda, Methodenreferenz); sonst die
+  //    Adresse. Bis #2133 galt auf x86 umgekehrt JEDER untypisierte Startwert
+  //    als Satz — `var h := plus; h(2, 3)` las {Code, Umgebung} aus dem Code
+  //    von plus und stuerzte ab, der IR-Weg rechnete richtig.
+  //  * Ueber eine RUECKGABEGRENZE geht ein Funktionswert immer als Satz: eine
+  //    Funktion mit Funktionstyp als Rueckgabe packt eine Adresse in
+  //    {Adresse, 0} ein (cg_emitSatzEinpacken). Bis #2133 lieferte `mk7()`
+  //    ohne Erfassung die Adresse, `makeCounter()` mit Erfassung den Satz —
+  //    der Aufrufer konnte die beiden nicht unterscheiden und stuerzte bei
+  //    `var f := mk7(); f(1)` ab (beide Wege).
+  //  * Wo eine Adresse gebraucht wird (`fn(...)`-Variable, Argument, Rechnung),
+  //    wird ein Satz ausgepackt — nur mit Umgebung 0; sonst bricht das
+  //    Programm laut ab, denn ein `fn(...)`-Typ kann keine Umgebung tragen
+  //    (dieselbe Regel wie #1249, nur erst zur Laufzeit entscheidbar).
+  //  * Ein Aufruf ueber einen Satz mit Umgebung 0 ist ein duenner Aufruf.
+  // ==================================================================
+
+  // Wie wird ueber das Local `idx` gerufen? 1 = Adresse, 2 = Satz.
+  fn cg_localRufArt(idx: int64): int64 {
+    if (idx < 0) { return 2; }
+    if (peek8(self.localIsFnPtr + idx) == 1) { return 1; }
+    var ltb: int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
+    var ltp: pchar := peek64(ltb) as pchar;
+    var ltl: int64 := peek64(ltb + CG_LOCTYPE_OFF_LEN);
+    if (ltp != 0 as pchar && ltl > 0 && self.cg_isFnPtrAlias(ltp, ltl) != 0) { return 1; }
+    return 2;
+  }
+
+  // Der Funktionswert nach rax: quelle 0 = Local (rbp-Offset wo),
+  // 1 = Erfassung (Index wo in der Umgebung des laufenden Lambdas).
+  fn cg_ladeFnWert(quelle: int64, wo: int64) {
+    if (quelle == 0) { self.cg_loadRax(wo); return; }
+    self.cg_loadRax(self.closureEnvPtrOff);
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x80); self.cg_e32(wo * 8);   // mov rax, [rax+disp32]
+  }
+
+  // Aufruf ueber einen Funktionswert (siehe cg_ladeFnWert); art 1 = Adresse,
+  // 2 = Satz. Beim Satz entscheidet die Laufzeit: Umgebung 0 ist eine
+  // eingepackte Adresse und wird duenn gerufen. Die Argumente stehen deshalb
+  // in beiden Zweigen — ausgewertet wird nur einer.
+  fn cg_genFnWertRuf(argNode: int64, quelle: int64, wo: int64, art: int64, sret: int64) {
+    if (art == 1) { self.cg_fnWertRufDuenn(argNode, quelle, wo, 0, sret); return; }
+    self.cg_ladeFnWert(quelle, wo);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0x78); self.cg_e8(0x08); self.cg_e8(0x00);   // cmp qword [rax+8], 0
+    self.cg_e8(0x0F); self.cg_e8(0x84);                                                        // je .duenn
+    var jDuenn: int64 := self.codeLen;
+    self.cg_e32(0);
+    // Evaluate explicit args and push them. #2084: rdi traegt die Umgebung,
+    // fuer explizite Argumente bleiben fuenf Register; der Rest auf den Stapel.
+    var clN: int64 := self.cg_indirektStapelArgs(argNode, 5);
+    var clArgc: int64 := self.cg_indirektRegArgs(argNode, 5);
+    self.cg_ladeFnWert(quelle, wo);   // rax = closure ptr {fnPtr, envPtr}
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x78); self.cg_e8(0x08);  // mov rdi, [rax+8]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x18);                    // mov rbx, [rax]
+    if (clArgc >= 5) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9
+    if (clArgc >= 4) { self.cg_e8(0x41); self.cg_e8(0x58); }  // pop r8
+    if (clArgc >= 3) { self.cg_popRcx(); }
+    if (clArgc >= 2) { self.cg_popRdx(); }
+    if (clArgc >= 1) { self.cg_popRsi(); }
+    self.cg_e8(0xFF); self.cg_e8(0xD3);  // call rbx
+    self.cg_popStackArgs(clN + 1);       // #2084: +1 = Umgebung in rdi
+    self.cg_e8(0xE9);                    // jmp .ende
+    var jEnde: int64 := self.codeLen;
+    self.cg_e32(0);
+    poke32(self.code + jDuenn, self.codeLen - jDuenn - 4);
+    self.cg_fnWertRufDuenn(argNode, quelle, wo, 1, sret);
+    poke32(self.code + jEnde, self.codeLen - jEnde - 4);
+  }
+
+  // Duenner Aufruf: Args in rdi.. wie beim direkten Aufruf. ausSatz = 1: der
+  // Wert ist ein Satz mit Umgebung 0, die Adresse steht in seinem ersten Wort.
+  fn cg_fnWertRufDuenn(argNode: int64, quelle: int64, wo: int64, ausSatz: int64, sret: int64) {
+    // #2084: Stapel-, verdeckte und Registerargumente wie beim direkten Aufruf.
+    var tfVerdeckt: int64 := 0;
+    if (sret > 0) { tfVerdeckt := 1; }
+    var tfN: int64 := self.cg_indirektStapelArgs(argNode, 6 - tfVerdeckt);
+    var tfArgc: int64 := self.cg_indirektSretVorschub(sret);
+    tfArgc := tfArgc + self.cg_indirektRegArgs(argNode, 6 - tfVerdeckt);
+    self.cg_ladeFnWert(quelle, wo);
+    if (ausSatz != 0) { self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x00); }   // mov rax, [rax]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);   // mov rbx, rax
+    if (tfArgc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9
+    if (tfArgc >= 5) { self.cg_e8(0x41); self.cg_e8(0x58); }  // pop r8
+    if (tfArgc >= 4) { self.cg_popRcx(); }
+    if (tfArgc >= 3) { self.cg_popRdx(); }
+    if (tfArgc >= 2) { self.cg_popRsi(); }
+    if (tfArgc >= 1) { self.cg_popRdi(); }
+    self.cg_e8(0xFF); self.cg_e8(0xD3);                     // call rbx
+    self.cg_popStackArgs(tfN + tfVerdeckt);                 // #2084
+  }
+
+  // Ist der Typknoten ein Funktionstyp (`fn(...): R` oder ein Alias darauf)?
+  fn cg_typIstFnWert(tn: int64): int64 {
+    if (tn < 0) { return 0; }
+    var k: int64 := self.cg_nkind(tn);
+    if (k == CGN_FN_PTR_NODE) { return 1; }
+    if (k == 60 && self.cg_nslen(tn) > 0 && self.cg_isFnPtrAlias(self.cg_nsval(tn), self.cg_nslen(tn)) != 0) { return 1; }
+    return 0;
+  }
+
+  // Vormerken: die Funktion `name` hat den Rueckgabetyp `retNi`. Ein
+  // Funktionstyp wird sofort eingetragen; ein Typname erst, wenn er sich als
+  // Alias darauf herausstellt (die Aliase sind beim Vorlauf noch nicht
+  // gesammelt — cg_fnWertAliaseAufloesen nach cg_collectMethodAliases).
+  // Eintrag 32 B: Name, Laenge, Typname, Laenge (0 = sicher ein Funktionstyp).
+  fn cg_registerFnWertKandidat(name: pchar, nlen: int64, retNi: int64) {
+    if (retNi < 0) { return; }
+    var k: int64 := self.cg_nkind(retNi);
+    if (k != CGN_FN_PTR_NODE && k != 60) { return; }
+    if (k == 60 && self.cg_nslen(retNi) <= 0) { return; }
+    if (self.fnWertFnCount >= self.fnWertFnCap) {
+      var nc: int64 := self.fnWertFnCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.fnWertFnList, self.fnWertFnCount * 32);
+      self.fnWertFnList := nb;
+      self.fnWertFnCap  := nc;
+    }
+    var b: int64 := self.fnWertFnList + self.fnWertFnCount * 32;
+    poke64(b, name as int64);
+    poke64(b + 8, nlen);
+    poke64(b + 16, 0);
+    poke64(b + 24, 0);
+    if (k == 60) {
+      poke64(b + 16, self.cg_nsval(retNi) as int64);
+      poke64(b + 24, self.cg_nslen(retNi));
+    }
+    self.fnWertFnCount += 1;
+  }
+
+  // Kandidaten mit Typnamen: behalten, wenn der Name ein Funktionstyp-Alias
+  // ist, sonst streichen. Danach steht jeder Eintrag sicher (Laenge 0).
+  fn cg_fnWertAliaseAufloesen() {
+    var i: int64 := 0;
+    var j: int64 := 0;
+    while (i < self.fnWertFnCount) {
+      var b: int64 := self.fnWertFnList + i * 32;
+      var tl: int64 := peek64(b + 24);
+      var behalten: int64 := 1;
+      if (tl > 0 && self.cg_isFnPtrAlias(peek64(b + 16) as pchar, tl) == 0) { behalten := 0; }
+      if (behalten != 0) {
+        if (j != i) { memcpy(self.fnWertFnList + j * 32, b, 32); }
+        poke64(self.fnWertFnList + j * 32 + 24, 0);
+        j += 1;
+      }
+      i += 1;
+    }
+    self.fnWertFnCount := j;
+  }
+
+  fn cg_istFnWertFunc(name: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.fnWertFnCount) {
+      var b: int64 := self.fnWertFnList + i * 32;
+      if (peek64(b + 24) == 0 && self.cg_seq(peek64(b) as pchar, peek64(b + 8), name, nlen) != 0) { return 1; }
+      i += 1;
+    }
+    return 0;
+  }
+
+  // Liefert der Aufruf `ni` einen Funktionswert ueber eine Rueckgabegrenze
+  // (also einen Satz)? Freie Funktion, innere Funktion oder Methode.
+  fn cg_callLiefertFnWert(ni: int64): int64 {
+    if (self.fnWertFnCount == 0) { return 0; }
+    var lc: int64 := alloc(8);
+    var fp: pchar := self.cg_callName(ni, lc);
+    var fl: int64 := peek64(lc);
+    free(lc, 8);
+    if (self.cg_nival(ni) == 1) {
+      // Methode: wie in cg_isF64Expr (#1887) ueber den gemangelten Namen
+      // der deklarierenden Klasse.
+      var mRecv: int64 := self.cg_nc0(ni);
+      var mCls:  int64 := self.cg_exprClassName(mRecv);
+      if (mCls < 0 && mRecv >= 0 && self.cg_nkind(mRecv) == CGN_IDENT) {
+        if (self.cg_findLocalIdx(self.cg_nsval(mRecv), self.cg_nslen(mRecv)) < 0) {
+          mCls := self.cg_findClass(self.cg_nsval(mRecv), self.cg_nslen(mRecv));
+        }
+      }
+      if (mCls < 0) { return 0; }
+      var mOwn: int64 := self.cg_findMethodOwner(mCls, fp, fl);
+      if (mOwn >= 0) { mCls := mOwn; }
+      var mlcb: int64 := alloc(8);
+      var mmb:  int64 := self.cg_buildMethodMangled(mCls, fp, fl, mlcb);
+      var mmbL: int64 := peek64(mlcb);
+      free(mlcb, 8);
+      var r: int64 := self.cg_istFnWertFunc(mmb as pchar, mmbL);
+      self.cg_trackTempBuf(mmb, mmbL + 1);
+      return r;
+    }
+    if (self.cg_nival(ni) != 0) { return 0; }
+    // Ein Aufruf ueber ein Local oder eine Erfassung ruft keine Funktion
+    // dieses Namens.
+    if (self.cg_findLocal(fp, fl) != 0) { return 0; }
+    if (self.cg_capOuterIdx(fp, fl) >= 0) { return 0; }
+    return self.cg_istFnWertFunc(fp, fl);
+  }
+
+  // Liefert der Ausdruck einen Satz {Code, Umgebung}? Bezeichner eines
+  // Locals/einer Erfassung, das einen Satz haelt, oder ein Aufruf nach
+  // cg_callLiefertFnWert. (Ein einfangendes Lambda ebenfalls — das fragt
+  // der Aufrufer selbst, cg_lambdaFaengt.)
+  fn cg_istSatzWert(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_IDENT) {
+      if (self.satzLocalJe == 0) { return 0; }
+      var idx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (idx >= 0) {
+        if (peek8(self.localIsFnPtr + idx) == 2) { return 1; }
+        return 0;
+      }
+      var oi: int64 := self.cg_capOuterIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (oi >= 0 && peek8(self.localIsFnPtr + oi) == 2) { return 1; }
+      return 0;
+    }
+    if (k == CGN_CALL) { return self.cg_callLiefertFnWert(ni); }
+    return 0;
+  }
+
+  // rax = Satz → rax = Adresse. Umgebung != 0: laut abbrechen.
+  fn cg_emitSatzAuspacken() {
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x58); self.cg_e8(0x08);   // mov rbx, [rax+8]
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xDB);                     // test rbx, rbx
+    self.cg_e8(0x0F); self.cg_e8(0x84);                                       // je .ok
+    var jOk: int64 := self.codeLen;
+    self.cg_e32(0);
+    var msgOff: int64 := self.cg_emitCStrData(
+      "Laufzeitfehler: einfangendes Lambda, wo nur eine Funktionsadresse Platz hat (fn-Typ, Argument) (#2133)\n"c);
+    self.cg_emitLeaRdiData(msgOff);
+    self.cg_emitPanicBody();
+    poke32(self.code + jOk, self.codeLen - jOk - 4);
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x00);                     // mov rax, [rax]
+  }
+
+  // rax = Adresse → rax = Satz {Adresse, 0}.
+  fn cg_emitSatzEinpacken() {
+    self.cg_pushRax();
+    self.cg_e8(0x31); self.cg_e8(0xFF);  // xor edi, edi
+    self.cg_e8(0xBE); self.cg_e8(0x10); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov esi, 16
+    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov edx,3
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov r10d,34
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);  // mov r8d,-1
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d,r9d
+    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,9
+    self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall → rax = Satz
+    self.cg_popRcx();
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x08);                                       // mov [rax], rcx
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0x40); self.cg_e8(0x08); self.cg_e32(0);      // mov qword [rax+8], 0
+  }
+
+  // Den Ausdruck als Satz erzeugen (Rueckgabe einer Funktion mit
+  // Funktionstyp, Zuweisung an ein Satz-Local): ist er schon einer, nichts
+  // auspacken; sonst die Adresse einpacken.
+  fn cg_genAlsSatz(ni: int64) {
+    if (self.cg_closureCaptures(ni) > 0) { self.cg_genExpr(ni); return; }
+    if (self.cg_istSatzWert(ni) != 0) {
+      self.satzKontext := 1;
+      self.cg_genExpr(ni);
+      return;
+    }
+    self.cg_genExpr(ni);
+    self.cg_emitSatzEinpacken();
+  }
+
+  // #2133: Index des aeusseren Locals hinter der Erfassung `name` im Rumpf
+  // des gerade erzeugten Lambdas, oder -1 (kein Lambda / keine Erfassung).
+  fn cg_capOuterIdx(name: pchar, nlen: int64): int64 {
+    if (self.closureEnvPtrOff == 0) { return 0 - 1; }
+    var ci: int64 := self.cg_findClosureCap(name, nlen);
+    if (ci < 0) { return 0 - 1; }
+    return peek64(self.closureCapturedIdxBuf + ci * 8);
   }
 
   // WP-02: Build anonymous function label name: "__anon_N\0" in a heap buffer.
@@ -5452,6 +5801,7 @@ pub type Codegen = class {
   fn cg_registerSigUnter(fni: int64, name: pchar, nlen: int64) {
     var retNi: int64 := self.cg_nc1(fni);
     if (retNi < 0) { return; }
+    self.cg_registerFnWertKandidat(name, nlen, retNi);   // #2133
     var rname: pchar := self.cg_nsval(retNi);
     var rlen:  int64 := self.cg_nslen(retNi);
     if (self.cg_isFloatTypeName(rname, rlen) != 0) {   // #1127: f32 zaehlt mit
@@ -5552,6 +5902,14 @@ pub type Codegen = class {
               }
             }
           }
+          if (mRetNi >= 0 && self.cg_nkind(mRetNi) == CGN_FN_PTR_NODE) {
+            // #2133: Methode mit Funktionstyp als Rueckgabe (der Typ hat
+            // keinen Namen, die Schleife darunter saehe ihn nicht).
+            var fwl: int64 := alloc(8);
+            var fwb: int64 := self.cg_mangleInto(cln, clnLen, self.cg_nsval(method), self.cg_nslen(method), fwl);
+            self.cg_registerFnWertKandidat(fwb as pchar, peek64(fwl), mRetNi);
+            free(fwl, 8);
+          }
           if (mRetNi >= 0) {
             var mrn: pchar := self.cg_nsval(mRetNi);
             var mrl: int64 := self.cg_nslen(mRetNi);
@@ -5561,6 +5919,10 @@ pub type Codegen = class {
               var mbLen: int64 := peek64(lc);
               free(lc, 8);
               self.cg_registerFuncRet(mb as pchar, mbLen, mrn, mrl);
+              // #2133: Alias auf einen Funktionstyp? (aufgeloest nach den Aliasen)
+              var fwb2: int64 := alloc(mbLen + 1);
+              memcpy(fwb2, mb, mbLen + 1);
+              self.cg_registerFnWertKandidat(fwb2 as pchar, mbLen, mRetNi);
               // #1887: HIER fehlte das Gleitkomma-Kennzeichen. Diese Schleife
               // merkt sich fuer jede Methode den Rueckgabetyp und die
               // Tupelform — nur die f64-Registry blieb aussen vor, und die
@@ -5733,6 +6095,14 @@ pub type Codegen = class {
         var tln: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
         return self.cg_isFloatTypeName(tp, tln);
       }
+      // #2133: im Rumpf eines Lambdas eine ERFASSUNG — ihr Typ ist der des
+      // aeusseren Locals. Fehlte: `x * y` mit erfasstem `x: f64` rechnete als
+      // Ganzzahl (1.5 * 4.0 -> 0). Vor den Globalen, wie beim Lesen.
+      var capOi: int64 := self.cg_capOuterIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if capOi >= 0 {
+        var ctb:  int64 := self.localTypes + capOi * CG_LOCTYPE_SZ;
+        return self.cg_isFloatTypeName(peek64(ctb) as pchar, peek64(ctb + CG_LOCTYPE_OFF_LEN));
+      }
       // #1373: GLOBALE waren hier nicht vorgesehen — die Funktion sah nur in
       // der Liste der Locals nach und gab sonst 0 zurueck. Eine globale f64
       // galt damit als Ganzzahl: `g as int64` lieferte das rohe Bitmuster,
@@ -5819,6 +6189,11 @@ pub type Codegen = class {
       // Rueckgabetyp des Zeigertyps, der am Local vermerkt ist.
       var li: int64 := self.cg_findLocalIdx(fp, fl);
       if (li >= 0 && peek8(self.localFnPtrF64 + li) != 0) { return 1; }
+      // #2133: dasselbe ueber eine ERFASSUNG im Rumpf eines Lambdas.
+      if (li < 0) {
+        var cfi: int64 := self.cg_capOuterIdx(fp, fl);
+        if (cfi >= 0) { return peek8(self.localFnPtrF64 + cfi) as int64; }
+      }
       // #1574: derselbe Fall fuer eine GLOBALE Zeigervariable. Ein Local
       // gleichen Namens verdeckt sie, darum erst hier.
       if (li < 0) {
@@ -10138,6 +10513,8 @@ pub type Codegen = class {
     self.curFnRetRange := self.cg_rangeOfTypeNode(self.cg_nc1(ni));
     var savedMRetNarrow: int64 := self.curFnRetNarrow;          // #1151
     self.curFnRetNarrow := self.cg_narrowKindOfTypeNode(self.cg_nc1(ni));
+    var savedMRetFnWert: int64 := self.curFnRetFnWert;          // #2133
+    self.curFnRetFnWert := self.cg_typIstFnWert(self.cg_nc1(ni));
     // #1878: Lockstep an einer METHODE. Zweite Stelle derselben Aufzaehlung —
     // die freie Funktion steht in cg_genFuncDecl, die beiden muessen
     // uebereinstimmen.
@@ -10158,6 +10535,7 @@ pub type Codegen = class {
     self.lockstepNameLen := savedMLsLen;
     self.curFnRetRange := savedMRetRange;
     self.curFnRetNarrow := savedMRetNarrow;                     // #1151
+    self.curFnRetFnWert := savedMRetFnWert;                     // #2133
     // Implicit return
     self.cg_zeroRax();
     self.cg_emitEpilogue();
@@ -10214,6 +10592,19 @@ pub type Codegen = class {
       if (dfIdx >= 0) { self.cg_loadRax(peek64(self.dfSlots + dfIdx * 8)); return; }
     }
     var k: int64 := self.cg_nkind(ni);
+    // #2133: ein Satz {Code, Umgebung} an einer Stelle, die eine Adresse
+    // braucht (alles ausser den Satz-Stellen, die satzKontext setzen):
+    // auspacken. Die Markierung gilt nur fuer DIESEN Knoten.
+    if (k == CGN_IDENT || k == CGN_CALL) {
+      var satzGew: int64 := self.satzKontext;
+      self.satzKontext := 0;
+      if (satzGew == 0 && self.cg_istSatzWert(ni) != 0) {
+        self.satzKontext := 1;
+        self.cg_genExpr(ni);
+        self.cg_emitSatzAuspacken();
+        return;
+      }
+    }
 
     if (k == CGN_MATCH) {
       // match als Ausdruck: cg_genMatch laesst den Wert des getroffenen
@@ -11252,7 +11643,18 @@ pub type Codegen = class {
       var closureBody:   int64 := self.cg_nc2(ni);
 
       // 1. Scan for captured vars (uses outer locals, so do before resetting localBase)
-      self.cg_scanClosureCaptures(closureBody, closureParams);
+      // #2133: in EIGENE Listen. Bis dahin teilten sich alle Lambdas eine
+      // Liste, gerettet wurde nur die Anzahl: ein Lambda im Rumpf (oder eine
+      // `var f := fn…`-Deklaration dort, die zum Zaehlen scannt) ueberschrieb
+      // die Namen und Offsets des umgebenden — dessen spaetere Erfassungen
+      // und die Kopie in die Umgebung (Schritt 14) lasen fremde Eintraege.
+      var savedCapBuf: int64 := self.closureCapturedBuf;
+      var savedCapLenBuf: int64 := self.closureCapturedLenBuf;
+      var savedCapOutBuf: int64 := self.closureCapturedOutBuf;
+      var savedCapIdxBuf: int64 := self.closureCapturedIdxBuf;
+      var savedCapEnvBuf: int64 := self.closureCapturedEnvBuf;
+      var outerCapCount: int64 := self.closureCapturedCount;
+      self.cg_capSuche(closureBody, closureParams);
       var numCap: int64 := self.closureCapturedCount;
 
       // 2. Generate unique label for inner function
@@ -11327,6 +11729,17 @@ pub type Codegen = class {
         var pname2: pchar := self.cg_nsval(cparam);
         var pnlen2: int64 := self.cg_nslen(cparam);
         var cpoff: int64 := self.cg_addLocal(pname2, pnlen2);
+        // #2133: der TYP des Parameters. Er wurde nie vermerkt — `y: f64`
+        // galt im Rumpf als Ganzzahl, `x * y` rechnete auf den Bitmustern.
+        // Dieselben Merkungen wie beim Parameter einer freien Funktion.
+        var cptype: int64 := self.cg_nc0(cparam);
+        if (cptype >= 0 && self.cg_nkind(cptype) == 60) {
+          self.cg_setLocalType(self.localCount - 1, self.cg_nsval(cptype), self.cg_nslen(cptype));
+        }
+        if (cptype >= 0 && self.cg_nkind(cptype) == CGN_FN_PTR_NODE) {
+          poke8(self.localIsFnPtr + self.localCount - 1, 1);
+          if (self.cg_fnPtrRetIstF64(cptype) != 0) { poke8(self.localFnPtrF64 + self.localCount - 1, 1); }
+        }
         if (cparamIdx >= cRegMax) {
           self.cg_loadRax(cStapelOff);
           self.cg_storeRax(cpoff);
@@ -11350,7 +11763,32 @@ pub type Codegen = class {
       }
 
       // 10. Generate inner function body
+      // #2133: ein Lambda packt seine Rueckgabe nicht ein — wer es ruft,
+      // kennt seinen Rueckgabetyp nicht (Aufruf ueber ein Local). Ohne das
+      // Ruecksetzen erbte es die Einstellung der umgebenden Funktion.
+      // Ebenso die uebrigen Eigenschaften des Rueckgabetyps: bis #2133 galten
+      // im Lambda die der umgebenden Funktion (eine f64-Funktion wandelte
+      // `return 1` des Lambdas um, eine Struct-Rueckgabe kopierte dorthin).
+      var savedLRetFnWert: int64 := self.curFnRetFnWert;
+      var savedLRetFloat: int64 := self.fnRetIsFloat;
+      var savedLRetStruct: int64 := self.fnRetStructBytes;
+      var savedLRetRange: int64 := self.curFnRetRange;
+      var savedLRetNarrow: int64 := self.curFnRetNarrow;
+      var lRetTy: int64 := self.cg_nc1(ni);
+      self.curFnRetFnWert := 0;
+      self.fnRetIsFloat := 0;
+      if (lRetTy >= 0 && self.cg_isFloatTypeName(self.cg_nsval(lRetTy), self.cg_nslen(lRetTy)) != 0) {
+        self.fnRetIsFloat := 1;
+      }
+      self.fnRetStructBytes := 0;
+      self.curFnRetRange := self.cg_rangeOfTypeNode(lRetTy);
+      self.curFnRetNarrow := self.cg_narrowKindOfTypeNode(lRetTy);
       self.cg_genBlock(closureBody);
+      self.curFnRetFnWert := savedLRetFnWert;
+      self.fnRetIsFloat := savedLRetFloat;
+      self.fnRetStructBytes := savedLRetStruct;
+      self.curFnRetRange := savedLRetRange;
+      self.curFnRetNarrow := savedLRetNarrow;
       self.cg_zeroRax();
       self.cg_emitEpilogue();
 
@@ -11391,7 +11829,14 @@ pub type Codegen = class {
         var ci: int64 := 0;
         while (ci < numCap) {
           var outerOff2: int64 := peek64(self.closureCapturedOutBuf + ci * 8);
-          self.cg_loadRax(outerOff2);    // rax = captured var value
+          var envIdx2: int64 := peek64(self.closureCapturedEnvBuf + ci * 8);
+          if (envIdx2 >= 0) {
+            // #2133: Erfassung des Erzeugers — aus dessen Umgebung.
+            self.cg_loadRax(self.closureEnvPtrOff);
+            self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x80); self.cg_e32(envIdx2 * 8);   // mov rax, [rax+disp32]
+          } else {
+            self.cg_loadRax(outerOff2);    // rax = captured var value
+          }
           // mov rbx, [rsp]  (env ptr)
           self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x1C); self.cg_e8(0x24);
           // mov [rbx + ci*8], rax
@@ -11406,6 +11851,15 @@ pub type Codegen = class {
           ci += 1;
         }
       }
+
+      // #2133: die Listen des umgebenden Lambdas zurueck — ab hier liest
+      // dieser Zweig sie nicht mehr.
+      self.closureCapturedBuf    := savedCapBuf;
+      self.closureCapturedLenBuf := savedCapLenBuf;
+      self.closureCapturedOutBuf := savedCapOutBuf;
+      self.closureCapturedIdxBuf := savedCapIdxBuf;
+      self.closureCapturedEnvBuf := savedCapEnvBuf;
+      self.closureCapturedCount  := outerCapCount;
 
       // #1249: ohne Captures ist der WERT die Codeadresse — kein Satz auf dem
       // Heap, keine Belegung, kein zweiter Zugriff beim Aufruf.
@@ -12019,10 +12473,24 @@ pub type Codegen = class {
   fn cg_closureCaptures(ni: int64): int64 {
     if (ni < 0) { return 0; }
     if (self.cg_nkind(ni) != CGN_CLOSURE) { return 0; }
+    // #2133: in eigene Listen suchen; die des umgebenden Lambdas bleiben
+    // unberuehrt (bis dahin wurde nur die Anzahl gerettet — die Namen und
+    // Offsets des Lambdas, in dessen Rumpf diese Frage gestellt wird, waren
+    // danach ueberschrieben).
+    var sB: int64 := self.closureCapturedBuf;
+    var sL: int64 := self.closureCapturedLenBuf;
+    var sO: int64 := self.closureCapturedOutBuf;
+    var sI: int64 := self.closureCapturedIdxBuf;
+    var sE: int64 := self.closureCapturedEnvBuf;
     var saved: int64 := self.closureCapturedCount;
-    self.cg_scanClosureCaptures(self.cg_nc2(ni), self.cg_nc0(ni));
+    self.cg_capSuche(self.cg_nc2(ni), self.cg_nc0(ni));
     var cnt: int64 := self.closureCapturedCount;
-    self.closureCapturedCount := saved;
+    self.closureCapturedBuf    := sB;
+    self.closureCapturedLenBuf := sL;
+    self.closureCapturedOutBuf := sO;
+    self.closureCapturedIdxBuf := sI;
+    self.closureCapturedEnvBuf := sE;
+    self.closureCapturedCount  := saved;
     return cnt;
   }
 
@@ -12442,6 +12910,19 @@ pub type Codegen = class {
 
     // WP-02: Check if fname is a local closure variable — emit indirect call
     if (isMethod == 0) {
+      // #2133: im Rumpf eines Lambdas ein ERFASSTES Lambda (`c()`). Bis dahin
+      // fehlte der Fall: der Name war kein Local, und der Aufruf endete in
+      // "undefined function 'c'". Wie beim Local entscheidet das aeussere
+      // Local, ob Satz oder Adresse.
+      // Vor der Modulvariablen: eine Erfassung verdeckt sie, wie beim Lesen.
+      if (self.closureEnvPtrOff != 0 && self.cg_findLocal(fname, fnlen) == 0) {
+        var ccIdx: int64 := self.cg_findClosureCap(fname, fnlen);
+        if (ccIdx >= 0) {
+          var ccArt: int64 := self.cg_localRufArt(peek64(self.closureCapturedIdxBuf + ccIdx * 8));
+          self.cg_genFnWertRuf(argNode, 1, ccIdx, ccArt, 0);
+          return;
+        }
+      }
       // #1574: Aufruf ueber eine GLOBALE Variable vom Funktionstyp. Sie ist
       // kein Local, also lief der Name weiter bis zur Marken-Aufloesung und
       // endete in "undefined function 'gFn'". Derselbe duenne Aufruf wie beim
@@ -12476,55 +12957,10 @@ pub type Codegen = class {
       if (clOff != 0) {
         // #1: lokaler plain fn-ptr (fn-Typ-Alias)? → thin-call: Adresse laden, Args in normalen
         // Registern (arg0→rdi), KEIN env-Shift. Vorher: Closure-Pfad las {fnPtr,env} → Garbage/Crash.
+        // #2133: die Entscheidung steht in cg_localRufArt.
         var clIdx: int64 := self.cg_findLocalIdx(fname, fnlen);
-        var isThinFn: int64 := 0;
-        if (clIdx >= 0) {
-          var ltb: int64 := self.localTypes + clIdx * CG_LOCTYPE_SZ;
-          var ltp: pchar := peek64(ltb) as pchar;
-          var ltl: int64 := peek64(ltb + CG_LOCTYPE_OFF_LEN);
-          if (ltp != 0 as pchar && ltl > 0 && self.cg_isFnPtrAlias(ltp, ltl) != 0) { isThinFn := 1; }
-          // #1003: inline geschriebener fn-Zeigertyp — gleicher thin-call
-          if (peek8(self.localIsFnPtr + clIdx) != 0) { isThinFn := 1; }
-        }
-        if (isThinFn != 0) {
-          var tfSret: int64 := self.cg_indirektRetStructBytes(fname, fnlen);
-          // #2084: Stapel-, verdeckte und Registerargumente wie beim direkten Aufruf.
-          var tfVerdeckt: int64 := 0;
-          if (tfSret > 0) { tfVerdeckt := 1; }
-          var tfN: int64 := self.cg_indirektStapelArgs(argNode, 6 - tfVerdeckt);
-          var tfArgc: int64 := self.cg_indirektSretVorschub(tfSret);
-          tfArgc := tfArgc + self.cg_indirektRegArgs(argNode, 6 - tfVerdeckt);
-          self.cg_loadRax(clOff);                                 // rax = fn-Adresse (plain)
-          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);   // mov rbx, rax
-          if (tfArgc >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9
-          if (tfArgc >= 5) { self.cg_e8(0x41); self.cg_e8(0x58); }  // pop r8
-          if (tfArgc >= 4) { self.cg_popRcx(); }
-          if (tfArgc >= 3) { self.cg_popRdx(); }
-          if (tfArgc >= 2) { self.cg_popRsi(); }
-          if (tfArgc >= 1) { self.cg_popRdi(); }
-          self.cg_e8(0xFF); self.cg_e8(0xD3);                     // call rbx
-          self.cg_popStackArgs(tfN + tfVerdeckt);                 // #2084
-          return;
-        }
-        // Evaluate explicit args and push them. #2084: rdi traegt die Umgebung,
-        // fuer explizite Argumente bleiben fuenf Register; der Rest auf den Stapel.
-        var clN: int64 := self.cg_indirektStapelArgs(argNode, 5);
-        var clArgc: int64 := self.cg_indirektRegArgs(argNode, 5);
-        // Load closure ptr from local
-        self.cg_loadRax(clOff);           // rax = closure ptr {fnPtr, envPtr}
-        // Load env ptr → rdi (hidden first arg)
-        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x78); self.cg_e8(0x08);  // mov rdi, [rax+8]
-        // Load fn ptr → rbx
-        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x18);                    // mov rbx, [rax]
-        // Pop explicit args into rsi, rdx, rcx, r8, r9 (shifted: rdi is env ptr)
-        if (clArgc >= 5) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9
-        if (clArgc >= 4) { self.cg_e8(0x41); self.cg_e8(0x58); }  // pop r8
-        if (clArgc >= 3) { self.cg_popRcx(); }
-        if (clArgc >= 2) { self.cg_popRdx(); }
-        if (clArgc >= 1) { self.cg_popRsi(); }
-        // call rbx (indirect)
-        self.cg_e8(0xFF); self.cg_e8(0xD3);  // call rbx
-        self.cg_popStackArgs(clN + 1);       // #2084: +1 = Umgebung in rdi
+        var clArt: int64 := self.cg_localRufArt(clIdx);
+        self.cg_genFnWertRuf(argNode, 0, clOff, clArt, self.cg_indirektRetStructBytes(fname, fnlen));
         return;
       }
     }
@@ -16036,17 +16472,42 @@ pub type Codegen = class {
       }
       // #1249: `var f := fn(x: int64): int64 { … };` OHNE Typangabe. Faengt das
       // Lambda nichts ein, ist sein Wert seit 1.0.16I die blanke Codeadresse —
-      // dann muss auch der Aufruf ueber diesen Namen duenn sein. Ohne die
-      // Markierung liefe er in den Closure-Zweig und laese {fnPtr,env} aus dem
-      // Code. Ein EINFANGENDES Lambda bleibt ein Satz auf dem Heap und damit
-      // ungemarkt.
+      // dann muss auch der Aufruf ueber diesen Namen duenn sein.
+      // #2133: allgemein — ohne Typangabe haelt das Local einen Satz genau
+      // dann, wenn der Startwert einer ist (siehe "Funktionswerte" bei
+      // cg_localRufArt); sonst die Adresse. Bis dahin galt jeder andere
+      // Startwert als Satz, auch `var h := plus;`.
       var vdInit: int64 := self.cg_nc1(ni);
-      if (vdInit >= 0 && self.cg_nkind(vdInit) == CGN_CLOSURE) {
-        var vdSavedCap: int64 := self.closureCapturedCount;
-        self.cg_scanClosureCaptures(self.cg_nc2(vdInit), self.cg_nc0(vdInit));
-        var vdCap: int64 := self.closureCapturedCount;
-        self.closureCapturedCount := vdSavedCap;
-        if (vdCap == 0) { poke8(self.localIsFnPtr + localIdx, 1); }
+      var vdSatz: int64 := 0;
+      if (typeNode < 0 && vdInit >= 0) {
+        if (self.cg_closureCaptures(vdInit) > 0) { vdSatz := 1; }
+        else if (self.cg_istSatzWert(vdInit) != 0) { vdSatz := 2; }
+        // #1172: Methodenreferenz — ein Satz {Code, self}, dieselbe Form.
+        else if (self.cg_isMethodRefExpr(vdInit) != 0) { vdSatz := 1; }
+        if (vdSatz != 0) {
+          poke8(self.localIsFnPtr + localIdx, 2);
+          self.satzLocalJe := 1;
+        } else {
+          poke8(self.localIsFnPtr + localIdx, 1);
+        }
+      }
+      // #2133: der Rueckgabetyp eines Lambdas (oder der Kopie eines Locals,
+      // das eines haelt) — wie #1565 beim `fn(...)`-Typ. Ohne ihn galt
+      // `var r: f64 := m(4.0)` als Ganzzahlzuweisung und wandelte das
+      // Bitmuster um.
+      if (typeNode < 0 && vdInit >= 0) {
+        if (self.cg_nkind(vdInit) == CGN_CLOSURE) {
+          var vdLr: int64 := self.cg_nc1(vdInit);
+          if (vdLr >= 0 && self.cg_isFloatTypeName(self.cg_nsval(vdLr), self.cg_nslen(vdLr)) != 0) {
+            poke8(self.localFnPtrF64 + localIdx, 1);
+          }
+        } else if (self.cg_nkind(vdInit) == CGN_IDENT) {
+          var vdSrc: int64 := self.cg_findLocalIdx(self.cg_nsval(vdInit), self.cg_nslen(vdInit));
+          if (vdSrc < 0) { vdSrc := self.cg_capOuterIdx(self.cg_nsval(vdInit), self.cg_nslen(vdInit)); }
+          if (vdSrc >= 0 && vdSrc != localIdx) {
+            poke8(self.localFnPtrF64 + localIdx, peek8(self.localFnPtrF64 + vdSrc));
+          }
+        }
       }
       // #1355: `var a := new int64[4];` OHNE Typangabe. Der Wert IST ein Array
       // (Kopf {cap,len}, dann die Elemente) — ohne die Markierung galt das
@@ -16064,14 +16525,7 @@ pub type Codegen = class {
         poke8(self.localIsArray + localIdx, 1);
       }
       // #1249: `var g := f;` — die Konvention haengt am Wert, also muss sie
-      // mitwandern. Ohne das galt die Kopie als Closure und las {fnPtr,env}
-      // aus dem Code des Originals.
-      if (vdInit >= 0 && self.cg_nkind(vdInit) == CGN_IDENT) {
-        var srcIdx: int64 := self.cg_findLocalIdx(self.cg_nsval(vdInit), self.cg_nslen(vdInit));
-        if (srcIdx >= 0 && srcIdx != localIdx && peek8(self.localIsFnPtr + srcIdx) != 0) {
-          poke8(self.localIsFnPtr + localIdx, 1);
-        }
-      }
+      // mitwandern. #2133: steht oben (cg_istSatzWert kennt das Satz-Local).
       // Track array locals: NK_TYPE_ARRAY (=61) or NK_TYPE_NAME "Array<T>" (uppercase, =60)
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 61) {
         poke8(self.localIsArray + localIdx, 1);
@@ -16332,6 +16786,8 @@ pub type Codegen = class {
         if (declIsMethodType != 0) {
           self.cg_genMethodTypedValue(init);
         } else {
+          // #2133: ein Satz bleibt ein Satz (nicht auspacken).
+          if (vdSatz == 2) { self.satzKontext := 1; }
           self.cg_genExpr(init);
           // #1351: `var b: T := a` bei einem Struct legt eine KOPIE an. Bis
           // hierher trug b denselben Zeiger wie a, und `b.x := 5` schrieb in a.
@@ -16557,7 +17013,17 @@ pub type Codegen = class {
           var asgTl: int64 := peek64(asgTb + CG_LOCTYPE_OFF_LEN);
           if (asgTp != 0 as pchar && asgTl > 0 && self.cg_isMethodType(asgTp, asgTl) != 0) { asgIsMth := 1; }
         }
-        if (asgIsMth != 0) { self.cg_genMethodTypedValue(rhs); } else { self.cg_genExpr(rhs); }
+        // #2133: Zuweisung an ein Local (oder eine Erfassung), das einen Satz
+        // haelt — der Wert muss ein Satz sein, eine Adresse wird eingepackt.
+        // Die Darstellung haengt an der Deklaration, nicht am neuen Wert.
+        var asgSatzIdx: int64 := asgLIdx;
+        if (asgSatzIdx < 0) { asgSatzIdx := self.cg_capOuterIdx(self.cg_nsval(lhs), self.cg_nslen(lhs)); }
+        var asgSatz: int64 := 0;
+        if (asgSatzIdx >= 0 && peek8(self.localIsFnPtr + asgSatzIdx) == 2) { asgSatz := 1; }
+        if (asgIsMth != 0) { self.cg_genMethodTypedValue(rhs); }
+        else if (asgSatz != 0 && self.cg_isMethodRefExpr(rhs) != 0) { self.cg_genMethodTypedValue(rhs); }
+        else if (asgSatz != 0) { self.cg_genAlsSatz(rhs); }
+        else { self.cg_genExpr(rhs); }
         var name: pchar := self.cg_nsval(lhs);
         var nlen: int64 := self.cg_nslen(lhs);
         // #1097: Zuweisung an eine Variable vom Bereichstyp.
@@ -17034,7 +17500,8 @@ pub type Codegen = class {
       } else if (self.deferCount > 0) {
         // WP-AS-10: save return value around defer emission
         if (expr >= 0) {
-          self.cg_genExpr(expr);
+          if (self.curFnRetFnWert != 0) { self.cg_genAlsSatz(expr); }        // #2133
+          else { self.cg_genExpr(expr); }
           self.cg_retToF64(expr);                                            // #2004
           if (self.lockstepActive != 0) { self.cg_lockstepPruefe(expr); }   // #1878
           self.cg_pushRax();
@@ -17046,7 +17513,10 @@ pub type Codegen = class {
         }
       } else {
         if (expr >= 0) {
-          self.cg_genExpr(expr);
+          // #2133: ueber die Rueckgabegrenze geht ein Funktionswert als Satz
+          // (siehe "Funktionswerte" bei cg_localRufArt).
+          if (self.curFnRetFnWert != 0) { self.cg_genAlsSatz(expr); }
+          else { self.cg_genExpr(expr); }
           self.cg_retToF64(expr);                                            // #2004
           // #1878: derselbe Vergleich wie im defer-Zweig darueber — die
           // beiden muessen uebereinstimmen, sonst haengt der Nachweis am
@@ -20312,6 +20782,9 @@ pub type Codegen = class {
     // #1151: Breite des Rueckgabetyps ebenso.
     var savedRetNarrow: int64 := self.curFnRetNarrow;
     self.curFnRetNarrow := self.cg_narrowKindOfTypeNode(retTyNode);
+    // #2133: Funktionstyp als Rueckgabe — `return` liefert einen Satz.
+    var savedRetFnWert: int64 := self.curFnRetFnWert;
+    self.curFnRetFnWert := self.cg_typIstFnWert(retTyNode);
 
     // WP-25.2: Compat-Warnung + WP-R9/R10/R11: Proxy/Landlock/seccomp am Anfang von 'main'
     if fnlen == 4 {
@@ -20401,6 +20874,7 @@ pub type Codegen = class {
     self.fcNameSlot := savedFcName;
     self.curFnRetRange := savedRetRange;   // #1097
     self.curFnRetNarrow := savedRetNarrow; // #1151
+    self.curFnRetFnWert := savedRetFnWert; // #2133
 
     // Restore outer function context
     self.outerFuncName := savedOuterName;
@@ -22685,6 +23159,7 @@ pub type Codegen = class {
     // jedem Rumpf.
     self.cg_nestPlan(head);
     self.cg_collectMethodAliases(head);   // B2: method-Typ-Aliase registrieren
+    self.cg_fnWertAliaseAufloesen();      // #2133: braucht die fn-Aliase
     self.cg_collectRangeTypes(head);      // #1097: Bereichstypen samt Grenzen
     self.cg_collectIfaceSelectors(head);  // #1133: Interface-Selektoren (vor den Layouts!)
     self.cg_prebuildStructLayouts(head);  // #1451: Layouts vor jedem Rumpf
@@ -23239,7 +23714,16 @@ pub type Codegen = class {
     self.closureCapturedLenBuf := alloc(32 * 8);
     self.closureCapturedOutBuf := alloc(32 * 8);
     self.closureCapturedCount  := 0;
+    self.closureCapturedIdxBuf := alloc(32 * 8);   // #2133
+    self.closureCapturedEnvBuf := alloc(32 * 8);
+    self.capErzCount           := 0;
     self.localBase             := 0;
+    self.satzKontext           := 0;               // #2133
+    self.fnWertFnCap           := 16;
+    self.fnWertFnList          := alloc(self.fnWertFnCap * 32);   // Eintrag 32 B (cg_registerFnWertKandidat)
+    self.fnWertFnCount         := 0;
+    self.curFnRetFnWert        := 0;
+    self.satzLocalJe           := 0;
 
     // Module-level constant table (use literal 24 for slot size, avoids bootstrap issue)
     self.conCap     := 256;

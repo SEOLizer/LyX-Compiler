@@ -596,6 +596,7 @@ test: lyxc
 	@bash tests/sema_reste_2137_test.sh
 	@bash tests/ir_closures_test.sh
 	@bash tests/ir_viele_argumente_test.sh
+	@bash tests/closure_wert_test.sh
 	@bash tests/ir_bezeichner_herkunft_test.sh
 	@bash tests/ir_generics_test.sh
 	@bash tests/generics_x86_typen_test.sh

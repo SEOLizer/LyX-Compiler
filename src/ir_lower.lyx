@@ -914,7 +914,8 @@ pub type IRLower = class {
   //           Knoten, Namenszeiger, Laenge, Erfassungsliste, deren Anzahl,
   //           Knotentabelle.
   // clCap*  — Erfassungen des Lambdas, dessen Rumpf gerade gesenkt wird
-  //           (je 24 B: Name, Laenge, Typknoten), clEnvSlot sein Umgebungsslot.
+  //           (je 32 B: Name, Laenge, Typknoten, Satz? — #2133), clEnvSlot sein
+  //           Umgebungsslot.
   // clScan* — Arbeitsliste der Erfassungssuche (_clErfasst), gleiches Format.
   // clFett* — Locals, die einen Heap-Satz {Code, Umgebung} halten: Paare
   //           (Funktionsknoten, Slot).
@@ -923,6 +924,13 @@ pub type IRLower = class {
   clScanP: int64; clScanN: int64; clScanCap: int64;
   clFettBuf: int64; clFettN: int64; clFettCap: int64;
   clZaehler: int64; clLetzterKnoten: int64; clLetzteN: int64;
+  // #2133: clSatzKontext = 1: der naechste Bezeichner/Aufruf in lowerExpr soll
+  // einen Satz liefern (nicht auspacken). clVdSatz: Entscheidung der gerade
+  // gesenkten Variablendeklaration (fuer _clVarMerken).
+  clSatzKontext: int64; clVdSatz: int64;
+  // #2133: Verzeichnis der Deklarationen mit Funktionstyp-Rueckgabe ueber
+  // alle Module (_clDeclFnWert), gebaut je Importstand.
+  clFwBuf: int64; clFwN: int64; clFwCap: int64; clFwStand: int64;
   // #2076: Die Unit, deren Deklarationen gerade gesenkt werden — ihr
   // Importname wie auf x86 (cgUnitTag), 0 fuer das Hauptmodul —, und der Kopf
   // ihrer Deklarationskette. Eine nicht-oeffentliche Funktion einer Unit
@@ -1461,6 +1469,18 @@ pub type IRLower = class {
     }
     
     var k: int64 := self.nodeKind(expr);
+
+    // #2133: ein Satz {Code, Umgebung} an einer Stelle, die eine Adresse
+    // braucht (alles ausser den Satz-Stellen, die clSatzKontext setzen):
+    // auspacken. Die Markierung gilt nur fuer DIESEN Knoten.
+    if (k == NK_IDENT || k == NK_CALL) {
+      var satzGew: int64 := self.clSatzKontext;
+      self.clSatzKontext := 0;
+      if satzGew == 0 && self._clSatzWert(expr) != 0 {
+        self.clSatzKontext := 1;
+        return self._clAuspacken(self.lowerExpr(expr));
+      }
+    }
 
     // Literal: integer constant
     if (k == NK_LIT_INT) {
@@ -6112,10 +6132,17 @@ pub type IRLower = class {
       if lfCl >= 0 { return lfCl; }
       var lfFn: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_LOAD_LOCAL, lfFn, lfSlot, -1, 0);
-      var lfB: int64 := self._irArgBlock(arg0, 0);   // #2132
-      var lfI: int64 := self._irArgsLegen(arg0, lfB, 0);
-      self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, lfFn, lfB, lfI);
-      return dest;
+      return self._clRufDuenn(lfFn, arg0, dest);
+    }
+    // #2133: im Rumpf eines Lambdas ein ERFASSTES Lambda (`c()`). Fehlte —
+    // der Name war weder Local noch Funktion, die Uebersetzung brach mit
+    // "unbekannter Name im Aufruf" ab. Satz oder Adresse sagt die Erfassung.
+    var ccIdx: int64 := self._clCapIdx(fname, fnlen);
+    if ccIdx >= 0 {
+      var ccWert: int64 := self.allocTemp();
+      self._clCapLaden(fname, fnlen, ccWert);
+      if self._clCapSatz(ccIdx) != 0 { return self._clRufSatz(ccWert, arg0, dest); }
+      return self._clRufDuenn(ccWert, arg0, dest);
     }
 
     // #1723: Aufruf ueber eine MODULVARIABLE vom Funktionstyp.
@@ -6465,7 +6492,7 @@ pub type IRLower = class {
     // Parameter und Modulvariable; _findLocalSlot kennt sie nicht, weil eine
     // Erfassung keinen Slot hat (Lesen/Schreiben: _clCapLaden/_clCapSpeichern).
     var cti: int64 := self._clCapIdx(idp, idl);
-    if cti >= 0 { return peek64(self.clCapP + cti * 24 + 16); }
+    if cti >= 0 { return peek64(self.clCapP + cti * 32 + 16); }
     // #1812: zuletzt die MODULVARIABLEN. Locals und Parameter standen hier
     // schon; die dritte Speicherart fehlte — und damit hatte `g_obj` keinen
     // Typ, der Feld-Offset war unaufloesbar und `g_obj.feld` lieferte Muell.
@@ -7425,7 +7452,15 @@ pub type IRLower = class {
         if self._volSlotN < 256 { poke64(self._volSlotList + self._volSlotN * 8, vdSlot); self._volSlotN := self._volSlotN + 1; }
       }
       var vdInit: int64 := self.nodeC1(stmt);
+      // #2133: ohne Typangabe haelt die Variable einen Satz genau dann, wenn
+      // der Startwert einer ist (_clVarMerken liest die Entscheidung).
+      self.clVdSatz := 0;
+      if vdInit >= 0 && self.nodeC0(stmt) < 0 {
+        if self.nodeKind(vdInit) == NK_CLOSURE { self.clVdSatz := 0; }
+        else if self._clSatzWert(vdInit) != 0 { self.clVdSatz := 1; }
+      }
       if vdInit >= 0 {
+        if self.clVdSatz != 0 { self.clSatzKontext := 1; }
         var vdTemp: int64 := self.lowerExpr(vdInit);
         self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdTemp, -1, 0);
       } else {
@@ -8084,7 +8119,16 @@ pub type IRLower = class {
   fn lowerReturn(stmt: int64) {
     var retVal: int64 := self.nodeC0(stmt);
     if (retVal >= 0) {
-      var retTemp: int64 := self.lowerExpr(retVal);
+      // #2133: Funktion (oder Methode) mit Funktionstyp als Rueckgabe — der
+      // Wert geht als Satz ueber die Grenze. Ein Lambda (curFunc ist dann
+      // NK_CLOSURE) packt nicht ein, wie auf x86.
+      var retTemp: int64 := 0;
+      if self.curFunc >= 0 && self.nodeKind(self.curFunc) == NK_FUNC_DECL
+         && self._clTypIstFnWert(self.nodeC1(self.curFunc)) != 0 {
+        retTemp := self._clAlsSatz(retVal);
+      } else {
+        retTemp := self.lowerExpr(retVal);
+      }
       self.irAddInstrDirect(IRO_STORE_LOCAL, self.retValTemp, retTemp, -1, 0);
     }
     // WP-2.2-B: on early return, emit ALL accumulated deferred stmts (entire stack)
@@ -8107,7 +8151,18 @@ pub type IRLower = class {
     var val: int64 := self.nodeC1(stmt);
     
     if (target >= 0 && val >= 0) {
-      var valTemp: int64 := self.lowerExpr(val);
+      // #2133: Zuweisung an ein Local (oder eine Erfassung), das einen Satz
+      // haelt — der Wert muss ein Satz sein; die Darstellung haengt an der
+      // Deklaration, nicht am neuen Wert. Wie auf x86.
+      var asgSatz: int64 := 0;
+      if self.nodeKind(target) == NK_IDENT && self.curFunc >= 0 {
+        var asgSl: int64 := self._findLocalSlot(self.nodeSVal(target), self.nodeSLen(target));
+        if asgSl >= 0 { asgSatz := self._clIstFett(asgSl); }
+        else { asgSatz := self._clCapSatz(self._clCapIdx(self.nodeSVal(target), self.nodeSLen(target))); }
+      }
+      var valTemp: int64 := 0;
+      if asgSatz != 0 { valTemp := self._clAlsSatz(val); }
+      else { valTemp := self.lowerExpr(val); }
 
       // Target is IDENT — store to local variable or parameter slot.
       // ARM64-FIX: war Stub (kein Store emittiert) → Assignments waren no-ops,
@@ -10321,8 +10376,8 @@ pub type IRLower = class {
     self.globalFuncCount += 1;
     var capP: int64 := 0;
     if n > 0 {
-      capP := alloc(n * 24);
-      memcpy(capP, self.clScanP, n * 24);
+      capP := alloc(n * 32);
+      memcpy(capP, self.clScanP, n * 32);
     }
     // Zur Erzeugung vormerken.
     if self.clQCap == 0 {
@@ -10351,7 +10406,7 @@ pub type IRLower = class {
     self.irAddInstrDirect(IRO_ALLOC, env, envSz, -1, 0);
     var i: int64 := 0;
     while i < n {
-      var e: int64 := capP + i * 24;
+      var e: int64 := capP + i * 32;
       var np: pchar := peek64(e) as pchar;
       var nl: int64 := peek64(e + 8);
       var v: int64 := self.allocTemp();
@@ -10382,7 +10437,7 @@ pub type IRLower = class {
   fn _clErfasst(cl: int64): int64 {
     if self.clScanCap == 0 {
       self.clScanCap := 16;
-      self.clScanP := alloc(self.clScanCap * 24);
+      self.clScanP := alloc(self.clScanCap * 32);
     }
     self.clScanN := 0;
     if cl < 0 { return 0; }
@@ -10402,10 +10457,14 @@ pub type IRLower = class {
     }
     while ni >= 0 && ni < self.nodeCount {
       var k: int64 := self.nodeKind(ni);
-      if k == NK_IDENT {
+      // #2133: auch der AUFRUFNAME — `c()` im Rumpf meint das Lambda in der
+      // Variablen c. Er steht nicht als NK_IDENT im Baum, wurde deshalb nie
+      // erfasst, und der Rumpf fand c nicht ("unbekannter Name im Aufruf").
+      if k == NK_IDENT || (k == NK_CALL && self.nodeIVal(ni) == 0) {
         var np: pchar := self.nodeSVal(ni);
         var nl: int64 := self.nodeSLen(ni);
         var nimm: int64 := 1;
+        var satz: int64 := 0;
         var p: int64 := ph;
         while p >= 0 {
           if self.seq(self.nodeSVal(p), self.nodeSLen(p), np, nl) { nimm := 0; }
@@ -10413,31 +10472,37 @@ pub type IRLower = class {
         }
         var j: int64 := 0;
         while j < self.clScanN {
-          var e: int64 := self.clScanP + j * 24;
+          var e: int64 := self.clScanP + j * 32;
           if self.seq(peek64(e) as pchar, peek64(e + 8), np, nl) { nimm := 0; }
           j := j + 1;
         }
         var typ: int64 := 0 - 1;
         if nimm != 0 {
-          if self._findLocalSlot(np, nl) >= 0 {
+          var ls: int64 := self._findLocalSlot(np, nl);
+          if ls >= 0 {
             typ := self._localTypeNode(np, nl);
-          } else if self._clIstSelf(np, nl) != 0 {
+            satz := self._clIstFett(ls);   // #2133: Darstellung mitnehmen
+          } else if k == NK_IDENT && self._clIstSelf(np, nl) != 0 {
             typ := self.curMethodClassType;
           } else {
             var ci: int64 := self._clCapIdx(np, nl);
             if ci < 0 { nimm := 0; }
-            else { typ := peek64(self.clCapP + ci * 24 + 16); }
+            else {
+              typ := peek64(self.clCapP + ci * 32 + 16);
+              satz := self._clCapSatz(ci);
+            }
           }
         }
         if nimm != 0 {
           if self.clScanN >= self.clScanCap {
             var nc: int64 := self.clScanCap * 2;
-            var nb: int64 := alloc(nc * 24);
-            memcpy(nb, self.clScanP, self.clScanN * 24);
+            var nb: int64 := alloc(nc * 32);
+            memcpy(nb, self.clScanP, self.clScanN * 32);
             self.clScanP := nb; self.clScanCap := nc;
           }
-          var e2: int64 := self.clScanP + self.clScanN * 24;
+          var e2: int64 := self.clScanP + self.clScanN * 32;
           poke64(e2, np as int64); poke64(e2 + 8, nl); poke64(e2 + 16, typ);
+          poke64(e2 + 24, satz);   // #2133: 1 = haelt einen Satz {Code, Umgebung}
           self.clScanN := self.clScanN + 1;
         }
       }
@@ -10457,7 +10522,7 @@ pub type IRLower = class {
   fn _clCapIdx(np: pchar, nl: int64): int64 {
     var i: int64 := 0;
     while i < self.clCapN {
-      var e: int64 := self.clCapP + i * 24;
+      var e: int64 := self.clCapP + i * 32;
       if self.seq(peek64(e) as pchar, peek64(e + 8), np, nl) { return i; }
       i := i + 1;
     }
@@ -12997,11 +13062,10 @@ pub type IRLower = class {
   //    `fn(...)`-Typ wird abgewiesen (cg_rejectCapturingClosure).
   //  * ohne Typangabe: Satz, wenn der Startwert ein einfangendes Lambda ist,
   //    ein Aufruf mit Funktionstyp als Rueckgabe (`var c := makeCounter();`)
-  //    oder die Kopie eines solchen Locals.
-  // Abweichung: x86 nimmt JEDEN untypisierten Startwert, der kein Lambda ohne
-  // Erfassung und keine Kopie eines duennen Locals ist, als Satz — auch
-  // `var h := plus;`, dessen Aufruf dort abstuerzt. Hier bleibt der
-  // Funktionsname ein duenner Zeiger, wie er es im IR-Weg seit #1806 war.
+  //    oder die Kopie eines solchen Locals (oder einer solchen Erfassung).
+  //    Alles andere — `var h := plus;` — ist die Adresse. Bis #2133 nahm x86
+  //    dort jeden anderen untypisierten Startwert als Satz und stuerzte bei
+  //    `h(2, 3)` ab; seither stimmen die beiden Wege ueberein.
   fn _clVarMerken(stmt: int64, slot: int64) {
     var init: int64 := self.nodeC1(stmt);
     if init < 0 { return; }
@@ -13025,25 +13089,11 @@ pub type IRLower = class {
     }
     var fett: int64 := 0;
     if ik == NK_CLOSURE && n > 0 { fett := 1; }
-    if ik == NK_CALL {
-      var rt: int64 := self._exprTypeNode(init);
-      if rt >= 0 {
-        if self.nodeKind(rt) == NK_FN_PTR { fett := 1; }
-        else if self.nodeKind(rt) == NK_TYPE_NAME {
-          // `type F = fn(...): R;` — Alias auf einen Funktionstyp (iv-Bit 1,
-          // c0 = NK_FN_PTR), wie _isMethodAlias fuer method(...).
-          var ad: int64 := self._findTypeDecl(self.nodeSVal(rt), self.nodeSLen(rt));
-          if ad >= 0 && (self.nodeIVal(ad) & 2) != 0 {
-            var ab: int64 := self.nodeC0(ad);
-            if ab >= 0 && self.nodeKind(ab) == NK_FN_PTR { fett := 1; }
-          }
-        }
-      }
-    }
-    if ik == NK_IDENT {
-      var qs: int64 := self._findLocalSlot(self.nodeSVal(init), self.nodeSLen(init));
-      if qs >= 0 && qs != slot && self._clIstFett(qs) != 0 { fett := 1; }
-    }
+    // #2133: Aufruf mit Funktionstyp als Rueckgabe (eigene oder importierte
+    // Unit, Methode), Kopie eines Satz-Locals oder einer Satz-Erfassung —
+    // entschieden VOR dem Senken des Startwerts (clVdSatz), bevor die eigene
+    // Variable als Local sichtbar war.
+    if self.clVdSatz != 0 { fett := 1; }
     if fett == 0 { return; }
     if self.clFettCap == 0 {
       self.clFettCap := 16;
@@ -13078,9 +13128,24 @@ pub type IRLower = class {
     if self._clIstFett(slot) == 0 { return 0 - 1; }
     var satz: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_LOAD_LOCAL, satz, slot, -1, 0);
-    // #2132: Argumente in einen hohen Block (src2 = argBase) wie beim
-    // direkten Aufruf; ein Aufruf in einem Argument belegt einen eigenen,
-    // hoeheren Block. Die Umgebung folgt als letztes Argument.
+    return self._clRufSatz(satz, arg0, dest);
+  }
+
+  // #2133: duenner Aufruf ueber die Adresse im Temp `code`.
+  // #2132: Argumente in einen hohen Block (src2 = argBase) wie beim direkten
+  // Aufruf; ein Aufruf in einem Argument belegt einen eigenen, hoeheren Block
+  // und kann die schon abgelegten nicht ueberschreiben (`h(1, plus(2, 3))`).
+  fn _clRufDuenn(code: int64, arg0: int64, dest: int64): int64 {
+    var b: int64 := self._irArgBlock(arg0, 0);
+    var n: int64 := self._irArgsLegen(arg0, b, 0);
+    self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, code, b, n);
+    return dest;
+  }
+
+  // #2133: Aufruf ueber einen Satz {Code, Umgebung} im Temp `satz` (Local
+  // oder Erfassung). Die Umgebung folgt als verdecktes letztes Argument im
+  // selben hohen Block (#2132) — mehr als 8 Argumente gehen ueber den Stapel.
+  fn _clRufSatz(satz: int64, arg0: int64, dest: int64): int64 {
     var b: int64 := self._irArgBlock(arg0, 1);
     var n: int64 := self._irArgsLegen(arg0, b, 0);
     var code: int64 := self.allocTemp();
@@ -13090,6 +13155,203 @@ pub type IRLower = class {
     self.irAddInstrDirect(IRO_STORE_LOCAL, b + n, env, -1, 0);
     self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, code, b, n + 1);
     return dest;
+  }
+
+  // ==================================================================
+  // #2133: Funktionswerte — Adresse oder Satz. Dieselbe Semantik wie
+  // codegen_x86.lyx ("Funktionswerte" bei cg_localRufArt) — die beiden
+  // muessen uebereinstimmen:
+  //  * Ein Local haelt einen Satz, wenn seine Deklaration es sagt
+  //    (_clVarMerken); sonst die Adresse.
+  //  * Ueber eine RUECKGABEGRENZE geht ein Funktionswert immer als Satz:
+  //    eine Funktion mit Funktionstyp als Rueckgabe packt eine Adresse in
+  //    {Adresse, 0} ein. Bis #2133 lieferte `mk7()` (Lambda ohne Erfassung)
+  //    die Adresse, `var f := mk7()` galt aber als Satz — Absturz.
+  //  * Wo eine Adresse gebraucht wird, wird ein Satz ausgepackt — nur mit
+  //    Umgebung 0, sonst bricht das Programm laut ab.
+  //  * Ein Satz wird mit der Umgebung als VERDECKTEM LETZTEM Argument gerufen;
+  //    eine eingepackte Adresse bekommt so eine 0, die sie nicht liest.
+  // ==================================================================
+
+  // Ist der Typknoten (in der GERADE eingesetzten Tabelle) ein Funktionstyp —
+  // `fn(...): R` oder `type F = fn(...): R`?
+  fn _clTypIstFnWert(tn: int64): int64 {
+    if tn < 0 { return 0; }
+    var k: int64 := self.nodeKind(tn);
+    if k == NK_FN_PTR { return 1; }
+    if k != NK_TYPE_NAME { return 0; }
+    if self.nodeSLen(tn) <= 0 { return 0; }
+    var ad: int64 := self._findTypeDecl(self.nodeSVal(tn), self.nodeSLen(tn));
+    if ad < 0 { return 0; }
+    if (self.nodeIVal(ad) & 2) == 0 { return 0; }
+    var ab: int64 := self.nodeC0(ad);
+    if ab >= 0 && self.nodeKind(ab) == NK_FN_PTR { return 1; }
+    return 0;
+  }
+
+  // Die Deklaration (np, nl) — freie Funktion (cl == 0) oder Methode der
+  // Klasse (cp, cl) — in irgendeinem Modul der Importliste: hat sie einen
+  // Funktionstyp als Rueckgabe? Die Frage stellt lowerExpr fuer JEDEN Aufruf;
+  // deshalb einmal je Importstand ein Verzeichnis der Deklarationen mit
+  // Funktionstyp-Rueckgabe (meist leer), danach nur noch ein Vergleich je
+  // Eintrag. Der Knotenindex gilt nur in seiner Tabelle — beim Bauen wird je
+  // Modul umgeschaltet (wie _rtBaue). Eintrag 32 B: Klasse (0 = frei), Laenge,
+  // Name, Laenge.
+  fn _clDeclFnWert(cp: pchar, cl: int64, np: pchar, nl: int64): int64 {
+    if self.clFwStand != self.impLstN + 1 {
+      self.clFwStand := self.impLstN + 1;
+      self.clFwN := 0;
+      var svS: pchar := self.src;
+      var svN: int64 := self.nodes;
+      var svC: int64 := self.nodeCount;
+      var m: int64 := 0;
+      while m < self.impLstN {
+        self.src       := peek64(self.impLstSrc + m * 8) as pchar;
+        self.nodes     := peek64(self.impLstNodes + m * 8);
+        self.nodeCount := peek64(self.impLstCnt + m * 8);
+        var d: int64 := peek64(self.impLstHead + m * 8);
+        while d >= 0 {
+          var dk: int64 := self.nodeKind(d);
+          // Kandidaten: die freie Funktion selbst oder die Methoden der Klasse.
+          var kand: int64 := 0 - 1;
+          var kp: int64 := 0;
+          var kl: int64 := 0;
+          if dk == NK_FUNC_DECL { kand := d; }
+          else if dk == NK_TYPE_DECL { kand := self.nodeC1(d); kp := self.nodeSVal(d) as int64; kl := self.nodeSLen(d); }
+          while kand >= 0 {
+            if self.nodeKind(kand) == NK_FUNC_DECL && self._clTypIstFnWert(self.nodeC1(kand)) != 0 {
+              if self.clFwN >= self.clFwCap {
+                var nc: int64 := self.clFwCap * 2;
+                if nc < 16 { nc := 16; }
+                var nb: int64 := alloc(nc * 32);
+                if self.clFwN > 0 { memcpy(nb, self.clFwBuf, self.clFwN * 32); }
+                self.clFwBuf := nb; self.clFwCap := nc;
+              }
+              var e: int64 := self.clFwBuf + self.clFwN * 32;
+              poke64(e, kp); poke64(e + 8, kl);
+              poke64(e + 16, self.nodeSVal(kand) as int64); poke64(e + 24, self.nodeSLen(kand));
+              self.clFwN := self.clFwN + 1;
+            }
+            if dk == NK_FUNC_DECL { kand := 0 - 1; } else { kand := self.nodeNext(kand); }
+          }
+          d := self.nodeNext(d);
+        }
+        m := m + 1;
+      }
+      self.src := svS; self.nodes := svN; self.nodeCount := svC;
+    }
+    var i: int64 := 0;
+    while i < self.clFwN {
+      var e2: int64 := self.clFwBuf + i * 32;
+      if peek64(e2 + 8) == cl && self._rtGleich(peek64(e2 + 16), peek64(e2 + 24), np as int64, nl) != 0 {
+        if cl == 0 { return 1; }
+        if self._rtGleich(peek64(e2), cl, cp as int64, cl) != 0 { return 1; }
+      }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // Liefert der Aufruf einen Funktionswert ueber eine Rueckgabegrenze (also
+  // einen Satz)? Freie Funktion (eigene Unit, innere oder importierte) oder
+  // Methode.
+  fn _clRufLiefertFnWert(expr: int64): int64 {
+    if self.nodeKind(expr) != NK_CALL { return 0; }
+    var np: pchar := self.nodeSVal(expr);
+    var nl: int64 := self.nodeSLen(expr);
+    if self.nodeIVal(expr) == 1 {
+      var cd: int64 := self._typeNodeToDecl(self._exprTypeNode(self.nodeC0(expr)));
+      if cd >= 0 { return self._clTypIstFnWert(self._methodRetTypeIn(cd, np, nl)); }
+      if self._exprKlasse(self.nodeC0(expr)) == 0 { return 0; }
+      return self._clDeclFnWert(self._ekP, self._ekL, np, nl);
+    }
+    if self.nodeIVal(expr) != 0 { return 0; }
+    // Ein Aufruf ueber ein Local oder eine Erfassung ruft keine Funktion.
+    if self._findLocalSlot(np, nl) >= 0 { return 0; }
+    if self._clCapIdx(np, nl) >= 0 { return 0; }
+    var d: int64 := self._callDeclNi(expr);
+    if d >= 0 { return self._clTypIstFnWert(self.nodeC1(d)); }
+    return self._clDeclFnWert(0 as pchar, 0, np, nl);
+  }
+
+  // Haelt die Erfassung `ci` des Lambdas, dessen Rumpf gerade entsteht, einen
+  // Satz? (Vermerkt bei der Erzeugung, _clScan; Eintrag + 24.) Zugleich das
+  // zehnte neue Mitglied von #2133 — die Methodenzahl von IRLower muss
+  // gerade bleiben.
+  fn _clCapSatz(ci: int64): int64 {
+    if ci < 0 { return 0; }
+    return peek64(self.clCapP + ci * 32 + 24);
+  }
+
+  // Liefert der Ausdruck einen Satz? Bezeichner eines Satz-Locals oder einer
+  // Satz-Erfassung, oder ein Aufruf nach _clRufLiefertFnWert.
+  fn _clSatzWert(expr: int64): int64 {
+    if expr < 0 { return 0; }
+    var k: int64 := self.nodeKind(expr);
+    if k == NK_IDENT {
+      var np: pchar := self.nodeSVal(expr);
+      var nl: int64 := self.nodeSLen(expr);
+      var s: int64 := self._findLocalSlot(np, nl);
+      if s >= 0 { return self._clIstFett(s); }
+      var ci: int64 := self._clCapIdx(np, nl);
+      if ci >= 0 { return self._clCapSatz(ci); }
+      return 0;
+    }
+    if k == NK_CALL { return self._clRufLiefertFnWert(expr); }
+    return 0;
+  }
+
+  // Satz -> Adresse. Umgebung != 0: laut abbrechen (ein `fn(...)`-Typ kann
+  // sie nicht tragen).
+  fn _clAuspacken(satz: int64): int64 {
+    var env: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, env, satz, 8, 0);
+    var nullT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, nullT, -1, -1, 0);
+    var gleich: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CMP_EQ, gleich, env, nullT, 0);
+    var lFehl: int64 := self.genLabel();
+    var lEnde: int64 := self.genLabel();
+    self.irEmitBrFalse(gleich, lFehl);
+    var code: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, code, satz, 0, 0);
+    self.irEmitJmp(lEnde);
+    self.irEmitLabel(lFehl);
+    var txt: pchar := "Laufzeitfehler: einfangendes Lambda, wo nur eine Funktionsadresse Platz hat (fn-Typ, Argument) (#2133)"c;
+    var mOff: int64 := self.irAddString(txt, StrLen(txt));
+    var msg: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_STR, msg, -1, -1, mOff);
+    self.irAddInstrDirect(IRO_PANIC, -1, msg, -1, 0);
+    self.irEmitLabel(lEnde);
+    return code;
+  }
+
+  // Adresse -> Satz {Adresse, 0}.
+  fn _clEinpacken(code: int64): int64 {
+    var sz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, sz, -1, -1, 16);
+    var satz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, satz, sz, -1, 0);
+    var nullT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, nullT, -1, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, 0, code, satz, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, 8, nullT, satz, 0);
+    return satz;
+  }
+
+  // Den Ausdruck als Satz senken (Rueckgabe einer Funktion mit Funktionstyp,
+  // Zuweisung an ein Satz-Local): ist er schon einer, nicht auspacken; sonst
+  // die Adresse einpacken.
+  fn _clAlsSatz(expr: int64): int64 {
+    if self.nodeKind(expr) == NK_CLOSURE {
+      if self._clErfasst(expr) > 0 { return self.lowerExpr(expr); }
+      return self._clEinpacken(self.lowerExpr(expr));
+    }
+    if self._clSatzWert(expr) != 0 {
+      self.clSatzKontext := 1;
+      return self.lowerExpr(expr);
+    }
+    return self._clEinpacken(self.lowerExpr(expr));
   }
 
   // Ein einfangendes Lambda als ARGUMENT landet in einem `fn(...)`-Parameter,
