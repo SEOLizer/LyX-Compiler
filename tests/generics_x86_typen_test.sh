@@ -124,9 +124,9 @@ vergleiche "generisch->generisch, Rekursion, f64, Klasse als Ergebnis" "$TMP/gf.
 
 # --- 1c: Unit-uebergreifend: Spezialisierung im Kontext der Deklaration ----
 mkdir -p "$TMP/xm"
-# `nenn` steht nur da, damit die Unit den Typ f64 nennt: der IR-Weg ersetzt T
-# durch einen KNOTEN seiner Tabelle und weist sonst laut ab (#2125, eigener
-# Befund, nicht Gegenstand dieses Tests). x86 braucht das nicht.
+# `nenn` stand da, damit die Unit den Typ f64 nennt: bis 1.2.16A wies der
+# IR-Weg sonst laut ab. Seit #2143 nicht mehr (tests/generics_closure_reste_
+# test.sh misst den Fall ohne `nenn`); hier bleibt es die Fassung mit.
 cat > "$TMP/xm/gk.lyx" <<'EOF'
 unit gk;
 fn nenn(x: f64): f64 { return x; }
@@ -294,8 +294,11 @@ printf 'type Box<T> = class {\n  v: T;\n};\nfn main(): int64 {\n  var b: Box<int
 abgewiesen "Typ: falsche Anzahl" "$TMP/t1.lyx" "Anzahl der Typargumente"
 printf 'type Q = class {\n  v: int64;\n};\nfn main(): int64 {\n  var b: Q<int64> := new Q();\n  return 0;\n}\n' > "$TMP/t2.lyx"
 abgewiesen "Typ: Typargumente an nicht-generischem Typ" "$TMP/t2.lyx" "kein generischer Typ"
-printf 'type Box<T> = class {\n  v: T;\n};\nfn f<T>(x: T): int64 {\n  var b: Box<T> := new Box<T>();\n  return 0;\n}\nfn main(): int64 { return f<int64>(1); }\n' > "$TMP/t3.lyx"
-abgewiesen "Typ: Typparameter einer Funktion als Argument" "$TMP/t3.lyx" "#2134"
+# Bis 1.2.16A laut abgewiesen ("#2134: ... Box<T> in fn f<T>"), seit #2143
+# umgesetzt — gemessen wird der Wert (tests/generics_closure_reste_test.sh
+# misst die weiteren Formen).
+printf 'type Box<T> = class {\n  v: T;\n};\nfn f<T>(x: T): T {\n  var b: Box<T> := new Box<T>();\n  b.v := x;\n  return b.v + 1;\n}\nfn main(): int64 { PrintLn(StrFromInt(f<int64>(41))); return 0; }\n' > "$TMP/t3.lyx"
+vergleiche "Typ: Typparameter einer Funktion als Argument" "$TMP/t3.lyx" "42|"
 printf 'type I<T> = interface {\n  fn F(): T;\n};\nfn main(): int64 { return 0; }\n' > "$TMP/t4.lyx"
 abgewiesen "Typ: generisches Interface" "$TMP/t4.lyx" "nur class und struct"
 printf 'type Box<T> = class {\n  v: T;\n};\ntype K = class extends Box<int64> {\n  w: int64;\n};\nfn main(): int64 { return 0; }\n' > "$TMP/t5.lyx"
@@ -305,11 +308,10 @@ abgewiesen "Typ: Array als Typargument" "$TMP/t6.lyx" "kein einfacher Typname"
 mkdir -p "$TMP/xt"
 printf 'unit gt;\npub type Box<T> = class {\n  v: T;\n};\n' > "$TMP/xt/gt.lyx"
 printf 'import gt;\nfn main(): int64 {\n  var b: Box<int64> := new Box<int64>();\n  return 0;\n}\n' > "$TMP/xt/main.lyx"
-for t in linux arm64; do
-  if baue $t main.lyx "$TMP/r" "$TMP/xt"; then nok "Typ aus anderer Unit [$t]: uebersetzt"
-  elif grep -q "kein generischer Typ dieser Unit" "$TMP/r.log"; then ok "Typ aus anderer Unit [$t]: laut abgewiesen"
-  else nok "Typ aus anderer Unit [$t]: $(head -c 200 "$TMP/r.log")"; fi
-done
+# Bis 1.2.16A laut abgewiesen ("kein generischer Typ dieser Unit"), seit
+# #2143 legt die Unit der Deklaration die Instanz an — gemessen der Wert.
+printf 'import gt;\nfn main(): int64 {\n  var b: Box<int64> := new Box<int64>();\n  b.v := 7;\n  PrintLn(StrFromInt(b.v * 6));\n  return 0;\n}\n' > "$TMP/xt/main.lyx"
+vergleiche "Typ aus anderer Unit" main.lyx "42|" "$TMP/xt"
 
 # --- 4: IR — Feld, dessen Versatz der IR-Weg nicht bestimmen kann, AUSSERHALB
 # einer Spezialisierung. Ausloeser: `a[0].x` auf einem untypisierten `array`

@@ -443,11 +443,18 @@ TypeDecl            = [ Visibility ] "type" Ident [ TypeParamClause ] "=" TypeDe
    Nennungen derselben Kombination sind derselbe Typ; geschachtelt
    (`Box<Box<int64>>`) und selbstbezueglich (`next: Node<T>`) geht.
 
-   Laut abgewiesen (nicht umgesetzt): ein generischer Typ einer ANDEREN Unit,
-   ein Typparameter einer generischen Funktion als Typargument (`Box<T>` in
-   `fn f<T>`), Ableitung von einer Instanz (`extends Box<int64>`), ein
-   Typargument, das kein schlichter Typname ist (`Box<int64[]>`), eine
-   generische Typdeklaration in einem `@if`-Zweig. *)
+   Seit #2143 auch: ein generischer Typ einer ANDEREN Unit (`import gt;
+   Box<int64>` -- die Instanz entsteht in der Unit der Deklaration, deren
+   private Helfer gelten; ein Typ der rufenden Unit als Typargument wird
+   abgewiesen, dort waere er unbekannt) und ein Typparameter einer
+   generischen Funktion als Typargument (`Box<T>` in `fn f<T>`, je
+   Spezialisierung "Box<int64>"; der typgeloeschte Rumpf -- Aufruf ohne
+   Typargumente -- bricht dann zur Laufzeit ab). Ein Local vom Typparameter
+   (`var q: T`) ist so gueltig wie ein Parameter.
+
+   Laut abgewiesen (nicht umgesetzt): Ableitung von einer Instanz
+   (`extends Box<int64>`), ein Typargument, das kein schlichter Typname ist
+   (`Box<int64[]>`), eine generische Typdeklaration in einem `@if`-Zweig. *)
 
 TypeDef             = Type
                     | RangeTypeDef

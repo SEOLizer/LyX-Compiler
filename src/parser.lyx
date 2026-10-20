@@ -279,6 +279,26 @@ con GI_REC_SZ:        int64 := 32;
 // Mehr Instanzen deuten auf eine Rekursion im Typ (`n: L<L<T>>`).
 con GI_MAX:           int64 := 4096;
 
+// #2143: Instanzen generischer Typen EINER ANDEREN Unit. `Box<int64>` in einer
+// Unit, die Box nicht deklariert, wird hier vorgemerkt (je 32 B: Name des
+// generischen Typs, Laenge, Instanzname "Box<int64>", Laenge) und die
+// Nennung auf den Instanznamen umgestellt. Jeder Parser, der eine Unit MIT
+// einer generischen Deklaration dieses Namens liest, legt die Instanz in
+// SEINER Tabelle an (_gtFremdeAnlegen) — im Kontext der Deklaration, so dass
+// deren private Helfer gelten. Prozessweit, denn sema, x86 und der IR-Weg
+// lesen eine importierte Unit je mit einem eigenen Parser; die anfordernde
+// Unit ist dabei immer vorher gelesen (sie nennt den Import).
+var _gtFremdBuf: int64 := 0;
+var _gtFremdN:   int64 := 0;
+var _gtFremdCap: int64 := 0;
+// #2143: ebenso Aufrufe `f<A>(...)` einer generischen Funktion einer ANDEREN
+// Unit (je 32 B: Name, Laenge, Argumente je 16 B, Anzahl) — die Unit von f
+// legt damit die Instanzen an, die f ueber seinen Typparameter nennt
+// (`Box<T>` in f, _gtAbhInstanzen).
+var _gfFremdBuf: int64 := 0;
+var _gfFremdN:   int64 := 0;
+var _gfFremdCap: int64 := 0;
+
 // Token field offsets (size = 40)
 pub con TOK_OFF_START: int64 := 8;
 pub con TOK_OFF_LEN:   int64 := 16;
@@ -438,6 +458,18 @@ pub type Parser = class {
   giBuf: int64;
   giN:   int64;
   giCap: int64;
+  gtHead: int64;   // #2143: Deklarationskette waehrend _gtExpand
+  // #2143: `Box<T>` in `fn f<T>` — eine Nennung, deren Typargument von einem
+  // Typparameter der umgebenden Funktion abhaengt. Sie bleibt im Baum stehen
+  // (Name "Box", Argumente in c1/c2) und wird je Spezialisierung im Codegen
+  // auf "Box<int64>" umgestellt (cg_genPatch, _genSubst). Die Instanzen dazu
+  // legt _gtAbhInstanzen an — aus den Aufrufen `f<int64>(...)` dieser Unit.
+  //   gdBuf: abhaengige Nennungen (Knoten), 8 B je Eintrag
+  //   gfBuf: generische Funktionen (Knoten, Ende des Bereichs), 16 B
+  //   gcBuf: generische Aufrufe `f<A>(...)` (Knoten), 8 B
+  gdBuf: int64; gdN: int64; gdCap: int64;
+  gfBuf: int64; gfN: int64; gfCap: int64;
+  gcBuf: int64; gcN: int64; gcCap: int64;
   // Typparameter der generischen FUNKTION, deren Rumpf gerade gelesen wird
   // (-1 ausserhalb). `Box<T>` mit diesem T laesst sich hier nicht
   // instanziieren — T steht erst beim Aufruf fest.
@@ -975,6 +1007,10 @@ pub type Parser = class {
     self.gtBuf := 0; self.gtN := 0; self.gtCap := 0;   // #2134
     self.grBuf := 0; self.grN := 0; self.grCap := 0;
     self.giBuf := 0; self.giN := 0; self.giCap := 0;
+    self.gtHead := 0 - 1;   // #2143
+    self.gdBuf := 0; self.gdN := 0; self.gdCap := 0;
+    self.gfBuf := 0; self.gfN := 0; self.gfCap := 0;
+    self.gcBuf := 0; self.gcN := 0; self.gcCap := 0;
     self.curFnTp := 0 - 1;
 
     self._tokenize();
@@ -1906,6 +1942,9 @@ pub type Parser = class {
           self._siv(n, 2);  // iVal=2 marks generic call
           self._sc0(n, self._parseArgList());
           self._sc2(n, typeArgsN);  // type args in c2
+          self.gcBuf := self._gtPush8(self.gcBuf, self.gcN, self.gcCap, n);   // #2143
+          if (self.gcN >= self.gcCap) { self.gcCap := self._gtCap(self.gcCap); }
+          self.gcN += 1;
           self.Expect(101);  // TK_RPAREN
           return n;
         }
@@ -3292,6 +3331,19 @@ pub type Parser = class {
     self.Expect(TK_RPAREN);
     if (self.Match(TK_COLON) != 0) { self._sc1(n, self.ParseType()); }
     if (self.Check(TK_LBRACE) != 0) { self._sc2(n, self.ParseBlock()); }
+    // #2143: generische Funktion mit ihrem Knotenbereich vormerken.
+    if (self.NChild3(n) >= 0 && self.NKind(self.NChild3(n)) == NK_TYPE_PARAM) {
+      if (self.gfN >= self.gfCap) {
+        var gfc: int64 := self.gfCap * 2;
+        if (gfc < 8) { gfc := 8; }
+        var gfb: int64 := alloc(gfc * 16);
+        if (self.gfN > 0) { memcpy(gfb, self.gfBuf, self.gfN * 16); }
+        self.gfBuf := gfb; self.gfCap := gfc;
+      }
+      poke64(self.gfBuf + self.gfN * 16, n);
+      poke64(self.gfBuf + self.gfN * 16 + 8, self.nodeCount);
+      self.gfN += 1;
+    }
     self.curFnTp := svFnTp;
     return n;
   }
@@ -4968,9 +5020,10 @@ pub type Parser = class {
   // `src` (NSVal rechnet `src + Versatz`, das gilt fuer jeden Zeiger).
   //
   // Nicht umgesetzt und deshalb laut: generische Interfaces und Aliase,
-  // Ableitung von einer Instanz, ein generischer Typ einer ANDEREN Unit
-  // (die Kopie muesste in deren Knotentabelle entstehen), ein Typparameter
-  // einer generischen Funktion als Argument (`Box<T>` in `fn f<T>`).
+  // Ableitung von einer Instanz, zusammengesetzte Typargumente. Seit #2143
+  // umgesetzt: ein generischer Typ einer ANDEREN Unit (_gtFremdBuf, die
+  // Kopie entsteht in deren Tabelle) und `Box<T>` in `fn f<T>` (gdBuf,
+  // _gtAbhInstanzen; umgestellt je Spezialisierung im Codegen).
   // ==================================================================
 
   // `>` am Ende einer Typargumentliste. `Box<Box<int64>>` lext das Ende als
@@ -5083,21 +5136,335 @@ pub type Parser = class {
       self._err("#2134: leere Typargumentliste"c);
       return;
     }
+    // #2143: haengt ein Argument (auch geschachtelt) an einem Typparameter
+    // der umgebenden generischen Funktion, bleibt die Nennung stehen (bis
+    // 1.2.16A laut abgewiesen) — siehe gdBuf.
     var a: int64 := targs;
     while (a >= 0) {
-      if (self.NKind(a) == NK_TYPE_NAME && self.NChild0(a) < 0 && self.NChild1(a) < 0) {
-        var tp: int64 := self.curFnTp;
-        while (tp >= 0) {
-          if (self._gtSeq(self.NSVal(tp), self.NSLen(tp), self.NSVal(a), self.NSLen(a)) != 0) {
-            self._err("#2134: generischer Typ mit dem Typparameter einer generischen Funktion als Argument (Box<T> in fn f<T>) wird nicht unterstuetzt"c);
-            return;
-          }
-          tp := self.NNext(tp);
-        }
+      if (self._gtAbhaengig(a) != 0) {
+        self.gdBuf := self._gtPush8(self.gdBuf, self.gdN, self.gdCap, n);
+        if (self.gdN >= self.gdCap) { self.gdCap := self._gtCap(self.gdCap); }
+        self.gdN += 1;
+        return;
       }
       a := self.NNext(a);
     }
     self._gtPushRef(n);
+  }
+
+  // #2143: Nennt der Typknoten a (Typargument) einen Typparameter der
+  // umgebenden generischen Funktion — direkt oder in einem geschachtelten
+  // Typargument?
+  fn _gtAbhaengig(a: int64): int64 {
+    if (a < 0 || self.NKind(a) != NK_TYPE_NAME) { return 0; }
+    if (self.NChild0(a) < 0 && self.NChild1(a) < 0) {
+      var tp: int64 := self.curFnTp;
+      while (tp >= 0) {
+        if (self._gtSeq(self.NSVal(tp), self.NSLen(tp), self.NSVal(a), self.NSLen(a)) != 0) { return 1; }
+        tp := self.NNext(tp);
+      }
+      return 0;
+    }
+    var b: int64 := self.NChild1(a);
+    while (b >= 0) {
+      if (self._gtAbhaengig(b) != 0) { return 1; }
+      b := self.NNext(b);
+    }
+    return 0;
+  }
+
+  // 8-Byte-Eintrag v an Stelle n anhaengen; liefert den (ggf. neuen) Puffer.
+  // Die Kapazitaet zieht der Aufrufer mit _gtCap nach (n >= cap).
+  fn _gtPush8(buf: int64, n: int64, cap: int64, v: int64): int64 {
+    var b: int64 := buf;
+    if (n >= cap) {
+      var nc: int64 := self._gtCap(cap);
+      var nb: int64 := alloc(nc * 8);
+      if (n > 0) { memcpy(nb, buf, n * 8); }
+      b := nb;
+    }
+    poke64(b + n * 8, v);
+    return b;
+  }
+  fn _gtCap(cap: int64): int64 {
+    if (cap < 8) { return 16; }
+    return cap * 2;
+  }
+
+  // #2143: die Instanzen, die die abhaengigen Nennungen (gdBuf) brauchen.
+  // Ausgangspunkt sind die Aufrufe `f<A>(...)` dieser Unit mit festen
+  // Typargumenten; eine Spezialisierung ruft weitere (`g<T>(...)` in f wird
+  // fuer f<int64> zu g<int64>), die Arbeitsliste waechst also mit.
+  // Ein Aufruf in eine ANDERE Unit (deren Parser kennt die Nennungen) und
+  // umgekehrt ein Aufruf von dort hierher erreichen diese Liste nicht — dann
+  // fehlt die Instanz, und der Codegen meldet das laut.
+  // Eintrag der Arbeitsliste 24 B: Index in gfBuf, Argumente (je 16 B Name),
+  // Anzahl. Eine Kombination wird nur einmal bearbeitet.
+  fn _gtAbhInstanzen() {
+    if (self.gcN == 0 && _gfFremdN == 0) { return; }
+    var wlCap: int64 := 64;
+    var wl: int64 := alloc(wlCap * 24);
+    var wlN: int64 := 0;
+    var ci: int64 := 0;
+    while (ci < self.gcN) {
+      var c: int64 := peek64(self.gcBuf + ci * 8);
+      var g: int64 := self._gtFnIdx(self.NSVal(c), self.NSLen(c));
+      // Im Bereich einer generischen Funktion mit deren Typparametern als
+      // Argument: der Aufruf haengt an ihrer Spezialisierung (unten).
+      var innen: int64 := 0;
+      var fi: int64 := 0;
+      while (fi < self.gfN) {
+        var fd: int64 := peek64(self.gfBuf + fi * 16);
+        if (c > fd && c < peek64(self.gfBuf + fi * 16 + 8)) {
+          var svTp: int64 := self.curFnTp;
+          self.curFnTp := self.NChild3(fd);
+          var a0: int64 := self.NChild2(c);
+          while (a0 >= 0) { if (self._gtAbhaengig(a0) != 0) { innen := 1; } a0 := self.NNext(a0); }
+          self.curFnTp := svTp;
+        }
+        fi += 1;
+      }
+      if (innen == 0) {
+        var an: int64 := 0;
+        var a1: int64 := self.NChild2(c);
+        var einfach: int64 := 1;
+        while (a1 >= 0) {
+          if (self.NKind(a1) != NK_TYPE_NAME || self.NChild0(a1) >= 0 || self.NChild1(a1) >= 0) { einfach := 0; }
+          an += 1; a1 := self.NNext(a1);
+        }
+        if (einfach != 0 && an > 0) {
+          var ab: int64 := alloc(an * 16);
+          var ai: int64 := 0;
+          a1 := self.NChild2(c);
+          while (a1 >= 0) {
+            poke64(ab + ai * 16, self.NSVal(a1) as int64);
+            poke64(ab + ai * 16 + 8, self.NSLen(a1));
+            ai += 1; a1 := self.NNext(a1);
+          }
+          if (wlN >= wlCap) {
+            var wc: int64 := wlCap * 2;
+            var wb: int64 := alloc(wc * 24);
+            memcpy(wb, wl, wlN * 24);
+            wl := wb; wlCap := wc;
+          }
+          if (g < 0) {
+            self._gfFremdMerke(self.NSVal(c), self.NSLen(c), ab, an);   // andere Unit
+          } else if (self._gtWlHat(wl, wlN, g, ab, an) == 0) {
+            poke64(wl + wlN * 24, g); poke64(wl + wlN * 24 + 8, ab); poke64(wl + wlN * 24 + 16, an);
+            wlN += 1;
+          }
+        }
+      }
+      ci += 1;
+    }
+    // Aufrufe aus anderen Units, die eine generische Funktion DIESER meinen.
+    var fq: int64 := 0;
+    while (fq < _gfFremdN) {
+      var fr: int64 := _gfFremdBuf + fq * 32;
+      var gq: int64 := self._gtFnIdx(peek64(fr) as pchar, peek64(fr + 8));
+      if (gq >= 0) {
+        if (wlN >= wlCap) {
+          var wcq: int64 := wlCap * 2;
+          var wbq: int64 := alloc(wcq * 24);
+          memcpy(wbq, wl, wlN * 24);
+          wl := wbq; wlCap := wcq;
+        }
+        if (self._gtWlHat(wl, wlN, gq, peek64(fr + 16), peek64(fr + 24)) == 0) {
+          poke64(wl + wlN * 24, gq); poke64(wl + wlN * 24 + 8, peek64(fr + 16)); poke64(wl + wlN * 24 + 16, peek64(fr + 24));
+          wlN += 1;
+        }
+      }
+      fq += 1;
+    }
+    var wi: int64 := 0;
+    while (wi < wlN && self.hadError == 0) {
+      if (wi > 4096) {
+        self._err("#2143: zu viele Spezialisierungen fuer abhaengige generische Typen (Rekursion ueber wachsende Typargumente?)"c);
+        return;
+      }
+      var g2: int64 := peek64(wl + wi * 24);
+      var ab2: int64 := peek64(wl + wi * 24 + 8);
+      var an2: int64 := peek64(wl + wi * 24 + 16);
+      var fd2: int64 := peek64(self.gfBuf + g2 * 16);
+      var fe2: int64 := peek64(self.gfBuf + g2 * 16 + 8);
+      // Nennungen im Bereich -> Instanzen
+      var di: int64 := 0;
+      while (di < self.gdN) {
+        var r: int64 := peek64(self.gdBuf + di * 8);
+        if (r > fd2 && r < fe2) {
+          var lc: int64 := alloc(8);
+          self._gtAbhName(r, fd2, ab2, an2, lc);
+          free(lc, 8);
+        }
+        di += 1;
+      }
+      // Aufrufe im Bereich -> weitere Kombinationen
+      var cj: int64 := 0;
+      while (cj < self.gcN) {
+        var c2: int64 := peek64(self.gcBuf + cj * 8);
+        if (c2 > fd2 && c2 < fe2) {
+          var g3: int64 := self._gtFnIdx(self.NSVal(c2), self.NSLen(c2));
+          if (self.NChild2(c2) >= 0) {
+            var an3: int64 := 0;
+            var a3: int64 := self.NChild2(c2);
+            var einfach3: int64 := 1;
+            while (a3 >= 0) {
+              if (self.NKind(a3) != NK_TYPE_NAME || self.NChild0(a3) >= 0 || self.NChild1(a3) >= 0) { einfach3 := 0; }
+              an3 += 1; a3 := self.NNext(a3);
+            }
+            if (einfach3 != 0 && an3 > 0) {
+              var ab3: int64 := alloc(an3 * 16);
+              var ai3: int64 := 0;
+              a3 := self.NChild2(c2);
+              while (a3 >= 0) {
+                var np3: int64 := self.NSVal(a3) as int64;
+                var nl3: int64 := self.NSLen(a3);
+                // Typparameter von g2 durch das Argument ersetzen
+                var tp3: int64 := self.NChild3(fd2);
+                var ti3: int64 := 0;
+                while (tp3 >= 0 && ti3 < an2) {
+                  if (self._gtSeq(self.NSVal(tp3), self.NSLen(tp3), np3 as pchar, nl3) != 0) {
+                    np3 := peek64(ab2 + ti3 * 16); nl3 := peek64(ab2 + ti3 * 16 + 8); tp3 := 0 - 1;
+                  } else { tp3 := self.NNext(tp3); ti3 += 1; }
+                }
+                poke64(ab3 + ai3 * 16, np3); poke64(ab3 + ai3 * 16 + 8, nl3);
+                ai3 += 1; a3 := self.NNext(a3);
+              }
+              if (wlN >= wlCap) {
+                var wc2: int64 := wlCap * 2;
+                var wb2: int64 := alloc(wc2 * 24);
+                memcpy(wb2, wl, wlN * 24);
+                wl := wb2; wlCap := wc2;
+              }
+              if (g3 < 0) {
+                self._gfFremdMerke(self.NSVal(c2), self.NSLen(c2), ab3, an3);   // andere Unit
+              } else if (self._gtWlHat(wl, wlN, g3, ab3, an3) == 0) {
+                poke64(wl + wlN * 24, g3); poke64(wl + wlN * 24 + 8, ab3); poke64(wl + wlN * 24 + 16, an3);
+                wlN += 1;
+              }
+            }
+          }
+        }
+        cj += 1;
+      }
+      wi += 1;
+    }
+  }
+
+  // #2143: Aufruf einer fremden generischen Funktion vormerken (Kopien der
+  // Namen; einmal je Kombination).
+  fn _gfFremdMerke(np: pchar, nl: int64, ab: int64, an: int64) {
+    var i: int64 := 0;
+    while (i < _gfFremdN) {
+      var r: int64 := _gfFremdBuf + i * 32;
+      if (self._gtSeq(peek64(r) as pchar, peek64(r + 8), np, nl) != 0
+          && peek64(r + 24) == an) {
+        var gleich: int64 := 1;
+        var j: int64 := 0;
+        var b: int64 := peek64(r + 16);
+        while (j < an) {
+          if (self._gtSeq(peek64(b + j * 16) as pchar, peek64(b + j * 16 + 8),
+                          peek64(ab + j * 16) as pchar, peek64(ab + j * 16 + 8)) == 0) { gleich := 0; }
+          j += 1;
+        }
+        if (gleich != 0) { return; }
+      }
+      i += 1;
+    }
+    if (_gfFremdN >= _gfFremdCap) {
+      var nc: int64 := _gfFremdCap * 2;
+      if (nc < 16) { nc := 16; }
+      var nb: int64 := alloc(nc * 32);
+      if (_gfFremdN > 0) { memcpy(nb, _gfFremdBuf, _gfFremdN * 32); }
+      _gfFremdBuf := nb; _gfFremdCap := nc;
+    }
+    var nk: int64 := alloc(nl + 1);
+    memcpy(nk, np as int64, nl);
+    poke8(nk + nl, 0);
+    var ak: int64 := alloc(an * 16 + 16);
+    var k: int64 := 0;
+    while (k < an) {
+      var al: int64 := peek64(ab + k * 16 + 8);
+      var ap: int64 := alloc(al + 1);
+      memcpy(ap, peek64(ab + k * 16), al);
+      poke8(ap + al, 0);
+      poke64(ak + k * 16, ap); poke64(ak + k * 16 + 8, al);
+      k += 1;
+    }
+    var e: int64 := _gfFremdBuf + _gfFremdN * 32;
+    poke64(e, nk); poke64(e + 8, nl); poke64(e + 16, ak); poke64(e + 24, an);
+    _gfFremdN := _gfFremdN + 1;
+  }
+
+  fn _gtFnIdx(np: pchar, nl: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.gfN) {
+      var fd: int64 := peek64(self.gfBuf + i * 16);
+      if (self._gtSeq(self.NSVal(fd), self.NSLen(fd), np, nl) != 0) { return i; }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  fn _gtWlHat(wl: int64, wlN: int64, g: int64, ab: int64, an: int64): int64 {
+    var i: int64 := 0;
+    while (i < wlN) {
+      if (peek64(wl + i * 24) == g && peek64(wl + i * 24 + 16) == an) {
+        var gleich: int64 := 1;
+        var b: int64 := peek64(wl + i * 24 + 8);
+        var j: int64 := 0;
+        while (j < an) {
+          if (self._gtSeq(peek64(b + j * 16) as pchar, peek64(b + j * 16 + 8),
+                          peek64(ab + j * 16) as pchar, peek64(ab + j * 16 + 8)) == 0) { gleich := 0; }
+          j += 1;
+        }
+        if (gleich != 0) { return 1; }
+      }
+      i += 1;
+    }
+    return 0;
+  }
+
+  // Instanz fuer die abhaengige Nennung r (Typname mit Argumenten in c1 oder
+  // `new` mit Argumenten in c2) bei der Ersetzung Typparameter von fd ->
+  // Argumente ab (an Stueck) anlegen. Liefert den Instanznamen (Laenge in
+  // lc) — derselbe Name, den der Codegen bildet (cg_genAbhName).
+  fn _gtAbhName(r: int64, fd: int64, ab: int64, an: int64, lc: int64): pchar {
+    var args: int64 := self.NChild1(r);
+    if (self.NKind(r) == NK_NEW) { args := self.NChild2(r); }
+    var f: int64 := self._alloc(NK_TYPE_NAME, self.NTokIdx(r));
+    self._ssv(f, peek64(self._noff(r) + NODE_OFF_SVAL), self.NSLen(r));
+    var head: int64 := 0 - 1;
+    var tail: int64 := 0 - 1;
+    var a: int64 := args;
+    while (a >= 0) {
+      var np: int64 := self.NSVal(a) as int64;
+      var nl: int64 := self.NSLen(a);
+      if (self.NKind(a) == NK_TYPE_NAME && self.NChild1(a) >= 0) {
+        // geschachtelt: erst die innere Instanz
+        var ilc: int64 := alloc(8);
+        np := self._gtAbhName(a, fd, ab, an, ilc) as int64;
+        nl := peek64(ilc);
+        free(ilc, 8);
+      } else {
+        var tp: int64 := self.NChild3(fd);
+        var ti: int64 := 0;
+        while (tp >= 0 && ti < an) {
+          if (self._gtSeq(self.NSVal(tp), self.NSLen(tp), np as pchar, nl) != 0) {
+            np := peek64(ab + ti * 16); nl := peek64(ab + ti * 16 + 8); tp := 0 - 1;
+          } else { tp := self.NNext(tp); ti += 1; }
+        }
+      }
+      var n: int64 := self._alloc(NK_TYPE_NAME, self.NTokIdx(a));
+      self._ssv(n, np - (self.src as int64), nl);
+      if (head < 0) { head := n; } else { self._sn(tail, n); }
+      tail := n;
+      a := self.NNext(a);
+    }
+    self._sc1(f, head);
+    self._gtResolve(f);
+    poke64(lc, self.NSLen(f));
+    return self.NSVal(f);
   }
 
   fn _gtFind(np: pchar, nl: int64): int64 {
@@ -5196,11 +5563,22 @@ pub type Parser = class {
     if (args < 0) { return; }   // schon aufgeloest
     var g: int64 := self._gtFind(self.NSVal(r), self.NSLen(r));
     if (g < 0) {
-      self._gtErr(r, "#2134: kein generischer Typ dieser Unit (generische Typen einer anderen Unit werden nicht unterstuetzt): "c,
-                  self.NSVal(r), self.NSLen(r));
-      return;
+      // #2143: ein gewoehnlicher Typ DIESER Unit traegt keine Typargumente.
+      var d: int64 := self.gtHead;
+      while (d >= 0) {
+        if (self.NKind(d) == NK_TYPE_DECL
+            && self._gtSeq(self.NSVal(d), self.NSLen(d), self.NSVal(r), self.NSLen(r)) != 0) {
+          self._gtErr(r, "#2134: kein generischer Typ: "c, self.NSVal(r), self.NSLen(r));
+          return;
+        }
+        d := self.NNext(d);
+      }
+      // Sonst ein generischer Typ einer ANDEREN Unit (bis 1.2.16A laut
+      // abgewiesen): Instanz vormerken, Nennung umstellen. Gibt es den Typ
+      // dort nicht, meldet sema den unbekannten Typ "Name<...>".
     }
-    var gr: int64 := self.gtBuf + g * GT_REC_SZ;
+    var gr: int64 := 0;
+    if (g >= 0) { gr := self.gtBuf + g * GT_REC_SZ; }
     var cnt: int64 := 0;
     var mLen: int64 := self.NSLen(r) + 2;
     var a: int64 := args;
@@ -5218,7 +5596,7 @@ pub type Parser = class {
       mLen := mLen + self.NSLen(a) + 1;
       a := self.NNext(a);
     }
-    if (cnt != peek64(gr + GT_REC_OFF_TPN)) {
+    if (g >= 0 && cnt != peek64(gr + GT_REC_OFF_TPN)) {
       self._gtErr(r, "#2134: Anzahl der Typargumente passt nicht zu den Typparametern von "c,
                   self.NSVal(r), self.NSLen(r));
       return;
@@ -5239,6 +5617,65 @@ pub type Parser = class {
     }
     poke8(mb + pos, 62); pos += 1;
     poke8(mb + pos, 0);
+
+    if (g < 0) {
+      // #2143: fremde Unit. Ein Typ DIESER Unit als Typargument waere dort
+      // unbekannt (die Instanz entsteht in der Tabelle der Deklaration) —
+      // laut, statt sema dort ueber einen fremden Namen stolpern zu lassen.
+      var ea: int64 := args;
+      while (ea >= 0) {
+        var ed: int64 := self.gtHead;
+        while (ed >= 0) {
+          if (self.NKind(ed) == NK_TYPE_DECL
+              && self._gtSeq(self.NSVal(ed), self.NSLen(ed), self.NSVal(ea), self.NSLen(ea)) != 0) {
+            self._gtErr(ea, "#2143: Typargument ist ein Typ dieser Unit, der generische Typ stammt aus einer anderen (dort unbekannt): "c,
+                        self.NSVal(ea), self.NSLen(ea));
+            return;
+          }
+          ed := self.NNext(ed);
+        }
+        var ei: int64 := 0;
+        while (ei < self.giN) {
+          var eir: int64 := self.giBuf + ei * GI_REC_SZ;
+          if (self._gtSeq(peek64(eir) as pchar, peek64(eir + 8), self.NSVal(ea), self.NSLen(ea)) != 0) {
+            self._gtErr(ea, "#2143: Typargument ist ein Typ dieser Unit, der generische Typ stammt aus einer anderen (dort unbekannt): "c,
+                        self.NSVal(ea), self.NSLen(ea));
+            return;
+          }
+          ei += 1;
+        }
+        ea := self.NNext(ea);
+      }
+      // Vormerken (einmal je Instanzname) und umstellen.
+      var fi: int64 := 0;
+      var fda: int64 := 0;
+      while (fi < _gtFremdN) {
+        var fr: int64 := _gtFremdBuf + fi * 32;
+        if (self._gtSeq(peek64(fr + 16) as pchar, peek64(fr + 24), mb as pchar, pos) != 0) { fda := 1; fi := _gtFremdN; }
+        fi += 1;
+      }
+      if (fda == 0) {
+        if (_gtFremdN >= _gtFremdCap) {
+          var fc: int64 := _gtFremdCap * 2;
+          if (fc < 16) { fc := 16; }
+          var fb: int64 := alloc(fc * 32);
+          if (_gtFremdN > 0) { memcpy(fb, _gtFremdBuf, _gtFremdN * 32); }
+          _gtFremdBuf := fb; _gtFremdCap := fc;
+        }
+        var nl0: int64 := self.NSLen(r);
+        var nb0: int64 := alloc(nl0 + 1);
+        memcpy(nb0, self.NSVal(r) as int64, nl0);
+        poke8(nb0 + nl0, 0);
+        var nr0: int64 := _gtFremdBuf + _gtFremdN * 32;
+        poke64(nr0, nb0); poke64(nr0 + 8, nl0);
+        poke64(nr0 + 16, mb); poke64(nr0 + 24, pos);
+        _gtFremdN := _gtFremdN + 1;
+      }
+      poke64(self._noff(r) + NODE_OFF_SVAL, mb - (self.src as int64));
+      poke64(self._noff(r) + NODE_OFF_SLEN, pos);
+      if (istNew != 0) { self._sc2(r, 0 - 1); } else { self._sc1(r, 0 - 1); }
+      return;
+    }
 
     var found: int64 := 0 - 1;
     var i: int64 := 0;
@@ -5282,13 +5719,75 @@ pub type Parser = class {
 
   // Alle Nennungen aufloesen, dann die generischen Deklarationen in der
   // Kette durch ihre Instanzen ersetzen.
+  // #2143: die von anderen Units angeforderten Instanzen der generischen
+  // Typen DIESER Unit anlegen (siehe _gtFremdBuf). Die Typargumente stehen
+  // nur als Namen im Instanznamen "Box<A,B>" — sie werden hier wieder zu
+  // Typknoten; geschachtelte (`Box<Box<int64>>`) gehen dabei als EIN Name
+  // durch, der in dieser Unit wieder eine Instanz ist.
+  fn _gtFremdeAnlegen() {
+    var fi: int64 := 0;
+    while (fi < _gtFremdN && self.hadError == 0) {
+      var fr: int64 := _gtFremdBuf + fi * 32;
+      var g: int64 := self._gtFind(peek64(fr) as pchar, peek64(fr + 8));
+      if (g >= 0) {
+        var mp: int64 := peek64(fr + 16);
+        var ml: int64 := peek64(fr + 24);
+        var schon: int64 := 0;
+        var ii: int64 := 0;
+        while (ii < self.giN) {
+          var ir: int64 := self.giBuf + ii * GI_REC_SZ;
+          if (self._gtSeq(peek64(ir) as pchar, peek64(ir + 8), mp as pchar, ml) != 0) { schon := 1; ii := self.giN; }
+          ii += 1;
+        }
+        if (schon == 0) {
+          // Nennung nachbauen: Typname mit den Argumenten in c1.
+          var r: int64 := self._alloc(NK_TYPE_NAME, 0);
+          self._ssv(r, (peek64(fr) as int64) - (self.src as int64), peek64(fr + 8));
+          var head: int64 := 0 - 1;
+          var tail: int64 := 0 - 1;
+          var pos: int64 := peek64(fr + 8) + 1;   // hinter '<'
+          var tiefe: int64 := 0;
+          var start: int64 := pos;
+          while (pos < ml) {
+            var c: int64 := peek8(mp + pos);
+            if (c == 60) { tiefe += 1; }
+            if (c == 62) { tiefe := tiefe - 1; }
+            if ((c == 44 && tiefe == 0) || (c == 62 && tiefe < 0)) {
+              var a: int64 := self._alloc(NK_TYPE_NAME, 0);
+              self._ssv(a, (mp + start) - (self.src as int64), pos - start);
+              if (head < 0) { head := a; } else { self._sn(tail, a); }
+              tail := a;
+              start := pos + 1;
+            }
+            pos += 1;
+          }
+          self._sc1(r, head);
+          self._gtResolve(r);
+        }
+      }
+      fi += 1;
+    }
+  }
+
   fn _gtExpand(head: int64): int64 {
-    if (self.gtN == 0 && self.grN == 0) { return head; }
+    if (self.gtN == 0 && self.grN == 0 && self.gcN == 0) { return head; }   // #2143: gcN (_gtAbhInstanzen)
+    self.gtHead := head;   // #2143
     var i: int64 := 0;
     while (i < self.grN) {
       if (self.hadError != 0) { return head; }
       var r: int64 := peek64(self.grBuf + i * 8);
       if (self._gtInRange(r) == 0) { self._gtResolve(r); }
+      i += 1;
+    }
+    if (self.hadError != 0) { return head; }
+    self._gtAbhInstanzen();    // #2143: vor den fremden — sie koennen welche anfordern
+    self._gtFremdeAnlegen();   // #2143
+    // Was die neuen Instanzen selbst nennen (`next: Box<T>` im Rumpf), steht
+    // jetzt hinten in grBuf.
+    while (i < self.grN) {
+      if (self.hadError != 0) { return head; }
+      var r2: int64 := peek64(self.grBuf + i * 8);
+      if (self._gtInRange(r2) == 0) { self._gtResolve(r2); }
       i += 1;
     }
     if (self.hadError != 0) { return head; }

@@ -21,8 +21,9 @@
 #     Typargument seit #2125 ab; seit #2134 spezialisiert auch x86, gemessen
 #     wird deshalb der Wert auf allen drei Zielen (vorher: die Abweisung —
 #     ein Test darf keine Luecke voraussetzen);
-#   - Klassen-Typargument: Feldzugriff ueber T in derselben Unit richtig;
-#     aus einer Unit, die die Klasse nicht kennt, laut statt still 0;
+#   - Klassen-Typargument: Feldzugriff ueber T in derselben Unit richtig,
+#     ebenso aus einer Unit, die die Klasse nicht kennt (bis 1.2.16A dort
+#     laut abgewiesen, seit #2143 gerechnet);
 #   - lyxos ueber den lokalen Lader (nur Ganzzahlen, kein Allokieren).
 set -uo pipefail
 ulimit -c 0
@@ -203,20 +204,25 @@ cat > "$TMP/xm/gk.lyx" <<'EOF'
 unit gk;
 pub fn getx<T>(p: T): int64 { return p.x; }
 EOF
+# Bis 1.2.16A blieb T stehen, wenn die Unit der generischen Funktion das
+# Typargument nicht nennt, und der Feldzugriff wurde laut abgewiesen. Seit
+# #2143 setzt der IR-Weg einen Typknoten mit dem Namen ein; das Feld loest
+# ueber das Typverzeichnis aller Units auf. Gemessen wird der WERT — x liegt
+# hinter w, ein Versatz 0 fiele also auf.
 cat > "$TMP/xm/kl2.lyx" <<'EOF'
 import gk;
 type P = class {
+  w: int64;
   x: int64;
 };
 fn main(): int64 {
   var p: P := new P();
-  p.x := 3;
+  p.w := 1; p.x := 3;
   PrintLn(StrFromInt(getx<P>(p)));
   return 0;
 }
 EOF
-abgewiesen "Feld ueber T, Klasse der Unit unbekannt" arm64 kl2.lyx "#2125" "$TMP/xm"
-abgewiesen "Feld ueber T, Klasse der Unit unbekannt" riscv kl2.lyx "#2125" "$TMP/xm"
+vergleiche "Feld ueber T, Klasse aus der rufenden Unit" kl2.lyx "3|" "$TMP/xm"
 
 # --- 8: Rueckgabewert, dazu lyxos ueber den lokalen Lader ------------------
 # Der Lader kann nur Ganzzahlfaelle (kein Allokieren, LyxOS liefert

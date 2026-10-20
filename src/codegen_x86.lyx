@@ -86,7 +86,12 @@ con CGN_CALL:        int64 := 49;
 con CGN_INDEX:       int64 := 50;
 con CGN_FIELD:       int64 := 51;
 // #1595: Eintrag der Fn-Zeiger-Aliasliste: Name (ptr,len) + Rueckgabetyp (ptr,len)
-con CG_FNALIAS_SZ:   int64 := 32;
+// #2143: + Funktionstyp-Tiefe des Rueckgabetyps (cg_fnTiefeEintragen: +32
+// Anzahl inline geschriebener fn-Ebenen, +40/+48 Name am Ende der Kette).
+con CG_FNALIAS_SZ:   int64 := 56;
+// #2133/#2143: Eintrag von fnWertFnList (cg_registerFnWertKandidat), dieselben
+// drei Tiefenfelder ab +32.
+con CG_FW_SZ:        int64 := 56;
 con CGN_NEW:         int64 := 52;
 con CGN_CAST:        int64 := 53;  // WP-11: x as Type
 con CGN_CLOSURE:     int64 := 54;  // WP-13: closure { fn ptr, captured env }
@@ -979,7 +984,7 @@ pub type Codegen = class {
   // heisst "eingepackte Adresse". satzKontext = 1: der naechste Bezeichner
   // oder Aufruf in cg_genExpr soll einen Satz liefern (nicht auspacken).
   satzKontext:           int64;
-  fnWertFnList:          int64;   // Funktionen mit Funktionstyp als Rueckgabe (32 B, cg_registerFnWertKandidat)
+  fnWertFnList:          int64;   // Funktionen mit Funktionstyp als Rueckgabe (CG_FW_SZ, cg_registerFnWertKandidat)
   fnWertFnCount:         int64;
   fnWertFnCap:           int64;
   curFnRetFnWert:        int64;   // 1 = die gerade erzeugte Funktion gibt einen Funktionswert zurueck
@@ -1024,6 +1029,11 @@ pub type Codegen = class {
   // eines Zeiger-Aufrufs steht in keiner Funktionsregistry, also muss die
   // Auskunft am Local haengen.
   localFnPtrF64:     int64;
+  // #2143: Liefert ein Aufruf ueber dieses Local einen Funktionswert, also
+  // einen Satz {Code, Umgebung}? Ein Lambda (oder ein `fn(...)`-Typ) mit
+  // Funktionstyp als Rueckgabe — dieselbe Auskunft wie fnWertFnList fuer
+  // benannte Funktionen, nur am Local, weil der Name keine Funktion ist.
+  localFnRetSatz:    int64;
   foldBuf:          int64;  // WP-10g: scratch for cg_tryFold constant-folding results
 
   // Temporary buffer tracking (BUG-02: prevent mmap leaks)
@@ -1554,6 +1564,9 @@ pub type Codegen = class {
       var fpf: int64 := alloc(nc);            // #1565
       memcpy(fpf, self.localFnPtrF64, self.localCount);
       self.localFnPtrF64 := fpf;
+      var frs: int64 := alloc(nc);            // #2143
+      memcpy(frs, self.localFnRetSatz, self.localCount);
+      self.localFnRetSatz := frs;
       self.localCap := nc;
     }
     self.frameSize += 8;
@@ -1575,6 +1588,7 @@ pub type Codegen = class {
     poke8(self.localIsSimd       + self.localCount, 0);  // WP-GPU-01
     poke8(self.localIsFnPtr      + self.localCount, 0);  // #1003
     poke8(self.localFnPtrF64     + self.localCount, 0);  // #1565
+    poke8(self.localFnRetSatz    + self.localCount, 0);  // #2143
     self.localCount += 1;
     return 0 - self.frameSize;
   }
@@ -2777,12 +2791,12 @@ pub type Codegen = class {
     if (k == 60 && self.cg_nslen(retNi) <= 0) { return; }
     if (self.fnWertFnCount >= self.fnWertFnCap) {
       var nc: int64 := self.fnWertFnCap * 2;
-      var nb: int64 := alloc(nc * 32);
-      memcpy(nb, self.fnWertFnList, self.fnWertFnCount * 32);
+      var nb: int64 := alloc(nc * CG_FW_SZ);
+      memcpy(nb, self.fnWertFnList, self.fnWertFnCount * CG_FW_SZ);
       self.fnWertFnList := nb;
       self.fnWertFnCap  := nc;
     }
-    var b: int64 := self.fnWertFnList + self.fnWertFnCount * 32;
+    var b: int64 := self.fnWertFnList + self.fnWertFnCount * CG_FW_SZ;
     poke64(b, name as int64);
     poke64(b + 8, nlen);
     poke64(b + 16, 0);
@@ -2791,6 +2805,7 @@ pub type Codegen = class {
       poke64(b + 16, self.cg_nsval(retNi) as int64);
       poke64(b + 24, self.cg_nslen(retNi));
     }
+    self.cg_fnTiefeEintragen(b, retNi);   // #2143
     self.fnWertFnCount += 1;
   }
 
@@ -2800,13 +2815,13 @@ pub type Codegen = class {
     var i: int64 := 0;
     var j: int64 := 0;
     while (i < self.fnWertFnCount) {
-      var b: int64 := self.fnWertFnList + i * 32;
+      var b: int64 := self.fnWertFnList + i * CG_FW_SZ;
       var tl: int64 := peek64(b + 24);
       var behalten: int64 := 1;
       if (tl > 0 && self.cg_isFnPtrAlias(peek64(b + 16) as pchar, tl) == 0) { behalten := 0; }
       if (behalten != 0) {
-        if (j != i) { memcpy(self.fnWertFnList + j * 32, b, 32); }
-        poke64(self.fnWertFnList + j * 32 + 24, 0);
+        if (j != i) { memcpy(self.fnWertFnList + j * CG_FW_SZ, b, CG_FW_SZ); }
+        poke64(self.fnWertFnList + j * CG_FW_SZ + 24, 0);
         j += 1;
       }
       i += 1;
@@ -2815,19 +2830,151 @@ pub type Codegen = class {
   }
 
   fn cg_istFnWertFunc(name: pchar, nlen: int64): int64 {
+    if (self.cg_fnWertFuncEintrag(name, nlen) != 0) { return 1; }
+    return 0;
+  }
+
+  // #2143: Eintrag der Funktion in fnWertFnList (0 = keiner).
+  fn cg_fnWertFuncEintrag(name: pchar, nlen: int64): int64 {
     var i: int64 := 0;
     while (i < self.fnWertFnCount) {
-      var b: int64 := self.fnWertFnList + i * 32;
-      if (peek64(b + 24) == 0 && self.cg_seq(peek64(b) as pchar, peek64(b + 8), name, nlen) != 0) { return 1; }
+      var b: int64 := self.fnWertFnList + i * CG_FW_SZ;
+      if (peek64(b + 24) == 0 && self.cg_seq(peek64(b) as pchar, peek64(b + 8), name, nlen) != 0) { return b; }
       i += 1;
     }
     return 0;
   }
 
+  // ==================================================================
+  // #2143: Funktionstyp-TIEFE. Ein Funktionswert vom Typ `fn(...): R` liefert
+  // beim Aufruf einen Wert vom Typ R; ist R selbst ein Funktionstyp, geht
+  // dieser Wert als Satz ueber die Rueckgabegrenze (#2133), und wer ihn
+  // haelt, muss wissen, ob SEIN Aufruf wieder einen liefert. Tiefe(T) = 0 fuer
+  // jeden anderen Typ, 1 + Tiefe(R) fuer `fn(...): R` (auch ueber Aliase).
+  //
+  // Am Local steht localFnRetSatz = Tiefe(R) des gehaltenen Funktionswerts:
+  // >= 1 heisst "der Aufruf liefert einen Satz", das Ergebnis haelt dann
+  // Tiefe(R) - 1. Bis 1.2.16A gab es die Auskunft nur fuer benannte
+  // Funktionen (fnWertFnList) — `var a := mk(10); a(1)` mit einem Lambda mk
+  // nahm den Satz als Adresse. Dieselbe Rechnung wie _clRufLiefertFnWert auf
+  // dem IR-Weg, die beiden muessen uebereinstimmen.
+  //
+  // Gespeichert wird je Rueckgabetyp R nur NAMENSFEST (Knotenindizes gelten
+  // nur in ihrer Tabelle): +32 die Zahl der inline geschriebenen fn-Ebenen,
+  // +40/+48 der Typname am Ende der Kette (ein Alias zaehlt dort weiter).
+  // ==================================================================
+  fn cg_fnTiefeEintragen(b: int64, r: int64) {
+    var n: int64 := 0;
+    var cur: int64 := r;
+    while (cur >= 0 && self.cg_nkind(cur) == CGN_FN_PTR_NODE && n < 32) {
+      n += 1;
+      cur := self.cg_nc1(cur);
+    }
+    poke64(b + 32, n);
+    poke64(b + 40, 0);
+    poke64(b + 48, 0);
+    if (cur >= 0 && self.cg_nkind(cur) == 60 && self.cg_nslen(cur) > 0) {
+      poke64(b + 40, self.cg_nsval(cur) as int64);
+      poke64(b + 48, self.cg_nslen(cur));
+    }
+  }
+
+  // Tiefe eines Rueckgabetyps aus den drei Feldern ab b + 32.
+  fn cg_fnTiefeAusEintrag(b: int64, tiefe: int64): int64 {
+    var t: int64 := peek64(b + 32);
+    var el: int64 := peek64(b + 48);
+    if (el > 0) { t := t + self.cg_fnTiefeAlias(peek64(b + 40) as pchar, el, tiefe + 1); }
+    return t;
+  }
+
+  // Tiefe des Typnamens (0, wenn er kein Funktionstyp-Alias ist).
+  fn cg_fnTiefeAlias(name: pchar, nlen: int64, tiefe: int64): int64 {
+    if (tiefe > 32) { return 0; }
+    var i: int64 := 0;
+    while (i < self.fnAliasCount) {
+      var base: int64 := self.fnAliasList + i * CG_FNALIAS_SZ;
+      if (self.cg_seq(peek64(base) as pchar, peek64(base + 8), name, nlen) != 0) {
+        return 1 + self.cg_fnTiefeAusEintrag(base, tiefe);
+      }
+      i += 1;
+    }
+    return 0;
+  }
+
+  // Tiefe eines Typknotens der GERADE eingesetzten Tabelle.
+  fn cg_fnTiefeKnoten(n: int64): int64 {
+    var t: int64 := 0;
+    var cur: int64 := n;
+    while (cur >= 0 && self.cg_nkind(cur) == CGN_FN_PTR_NODE && t < 32) {
+      t += 1;
+      cur := self.cg_nc1(cur);
+    }
+    if (cur >= 0 && self.cg_nkind(cur) == 60 && self.cg_nslen(cur) > 0) {
+      t := t + self.cg_fnTiefeAlias(self.cg_nsval(cur), self.cg_nslen(cur), 0);
+    }
+    return t;
+  }
+
+  // localFnRetSatz eines Locals (Index), bei einem Alias als Typangabe aus
+  // dem Alias.
+  fn cg_localFnTiefe(idx: int64): int64 {
+    if (idx < 0) { return 0; }
+    var t: int64 := peek8(self.localFnRetSatz + idx) as int64;
+    if (t > 0) { return t; }
+    var ltb: int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
+    var ltp: pchar := peek64(ltb) as pchar;
+    var ltl: int64 := peek64(ltb + CG_LOCTYPE_OFF_LEN);
+    if (ltp != 0 as pchar && ltl > 0) {
+      var at: int64 := self.cg_fnTiefeAlias(ltp, ltl, 0);
+      if (at > 0) { return at - 1; }
+    }
+    return 0;
+  }
+
+  // Tiefe des ERGEBNISSES eines Aufrufs (Wert fuer localFnRetSatz des
+  // Locals, das es aufnimmt), 0 wenn er keinen Funktionswert liefert.
+  fn cg_callErgebnisTiefe(ni: int64): int64 {
+    if (ni < 0 || self.cg_nkind(ni) != CGN_CALL) { return 0; }
+    var lc: int64 := alloc(8);
+    var fp: pchar := self.cg_callName(ni, lc);
+    var fl: int64 := peek64(lc);
+    free(lc, 8);
+    if (self.cg_nival(ni) == 1) {
+      var mRecv: int64 := self.cg_nc0(ni);
+      var mCls:  int64 := self.cg_exprClassName(mRecv);
+      if (mCls < 0 && mRecv >= 0 && self.cg_nkind(mRecv) == CGN_IDENT) {
+        if (self.cg_findLocalIdx(self.cg_nsval(mRecv), self.cg_nslen(mRecv)) < 0) {
+          mCls := self.cg_findClass(self.cg_nsval(mRecv), self.cg_nslen(mRecv));
+        }
+      }
+      if (mCls < 0) { return 0; }
+      var mOwn: int64 := self.cg_findMethodOwner(mCls, fp, fl);
+      if (mOwn >= 0) { mCls := mOwn; }
+      var mlcb: int64 := alloc(8);
+      var mmb:  int64 := self.cg_buildMethodMangled(mCls, fp, fl, mlcb);
+      var mmbL: int64 := peek64(mlcb);
+      free(mlcb, 8);
+      var me: int64 := self.cg_fnWertFuncEintrag(mmb as pchar, mmbL);
+      self.cg_trackTempBuf(mmb, mmbL + 1);
+      if (me == 0) { return 0; }
+      return self.cg_fnTiefeAusEintrag(me, 0) - 1;
+    }
+    if (self.cg_nival(ni) != 0) { return 0; }
+    var rli: int64 := self.cg_findLocalIdx(fp, fl);
+    if (rli < 0) { rli := self.cg_capOuterIdx(fp, fl); }
+    if (rli >= 0) {
+      var lt: int64 := self.cg_localFnTiefe(rli);
+      if (lt > 0) { return lt - 1; }
+      return 0;
+    }
+    var fe: int64 := self.cg_fnWertFuncEintrag(fp, fl);
+    if (fe == 0) { return 0; }
+    return self.cg_fnTiefeAusEintrag(fe, 0) - 1;
+  }
+
   // Liefert der Aufruf `ni` einen Funktionswert ueber eine Rueckgabegrenze
   // (also einen Satz)? Freie Funktion, innere Funktion oder Methode.
   fn cg_callLiefertFnWert(ni: int64): int64 {
-    if (self.fnWertFnCount == 0) { return 0; }
     var lc: int64 := alloc(8);
     var fp: pchar := self.cg_callName(ni, lc);
     var fl: int64 := peek64(lc);
@@ -2855,9 +3002,14 @@ pub type Codegen = class {
     }
     if (self.cg_nival(ni) != 0) { return 0; }
     // Ein Aufruf ueber ein Local oder eine Erfassung ruft keine Funktion
-    // dieses Namens.
-    if (self.cg_findLocal(fp, fl) != 0) { return 0; }
-    if (self.cg_capOuterIdx(fp, fl) >= 0) { return 0; }
+    // dieses Namens. #2143: er liefert einen Satz, wenn das Lambda (der
+    // fn-Typ) dahinter einen Funktionstyp zurueckgibt — vermerkt am Local.
+    var rli: int64 := self.cg_findLocalIdx(fp, fl);
+    if (rli < 0) { rli := self.cg_capOuterIdx(fp, fl); }
+    if (rli >= 0) {
+      if (self.cg_localFnTiefe(rli) > 0) { return 1; }
+      return 0;
+    }
     return self.cg_istFnWertFunc(fp, fl);
   }
 
@@ -5690,6 +5842,7 @@ pub type Codegen = class {
       poke64(base + 16, self.cg_nsval(retNode) as int64);
       poke64(base + 24, self.cg_nslen(retNode));
     }
+    self.cg_fnTiefeEintragen(base, retNode);   // #2143
     self.fnAliasCount += 1;
   }
   fn cg_registerFnAlias(name: pchar, nameLen: int64) {
@@ -5973,6 +6126,15 @@ pub type Codegen = class {
     var r: int64 := self.cg_nc1(typeNode);
     if (r < 0) { return 0; }
     return self.cg_isFloatTypeName(self.cg_nsval(r), self.cg_nslen(r));
+  }
+
+  // #2143: Tiefe des Rueckgabetyps eines fn-Zeigertyps `fn(...): R` (siehe
+  // cg_fnTiefeEintragen) — >= 1: ein Aufruf darueber liefert einen Satz.
+  // Gegenstueck zu cg_fnPtrRetIstF64, die Merkung steht an denselben Stellen.
+  fn cg_fnPtrRetTiefe(typeNode: int64): int64 {
+    if (typeNode < 0) { return 0; }
+    if (self.cg_nkind(typeNode) != CGN_FN_PTR_NODE) { return 0; }
+    return self.cg_fnTiefeKnoten(self.cg_nc1(typeNode));
   }
 
   fn cg_isFloatTypeName(tp: pchar, tln: int64): int64 {
@@ -10483,6 +10645,7 @@ pub type Codegen = class {
         if (self.cg_fnPtrRetIstF64(ptypeNode) != 0) {
           poke8(self.localFnPtrF64 + self.localCount - 1, 1);
         }
+        poke8(self.localFnRetSatz + self.localCount - 1, self.cg_fnPtrRetTiefe(ptypeNode));   // #2143
       }
       if (paramIdx == 1) { self.cg_spillRsi(poff); }
       else if (paramIdx == 2) { self.cg_spillRdx(poff); }
@@ -11755,6 +11918,7 @@ pub type Codegen = class {
         if (cptype >= 0 && self.cg_nkind(cptype) == CGN_FN_PTR_NODE) {
           poke8(self.localIsFnPtr + self.localCount - 1, 1);
           if (self.cg_fnPtrRetIstF64(cptype) != 0) { poke8(self.localFnPtrF64 + self.localCount - 1, 1); }
+          poke8(self.localFnRetSatz + self.localCount - 1, self.cg_fnPtrRetTiefe(cptype));   // #2143
         }
         if (cparamIdx >= cRegMax) {
           self.cg_loadRax(cStapelOff);
@@ -11791,7 +11955,10 @@ pub type Codegen = class {
       var savedLRetRange: int64 := self.curFnRetRange;
       var savedLRetNarrow: int64 := self.curFnRetNarrow;
       var lRetTy: int64 := self.cg_nc1(ni);
-      self.curFnRetFnWert := 0;
+      // #2143: mit Funktionstyp als Rueckgabe packt das Lambda ein wie jede
+      // Funktion (#2133: ueber eine Rueckgabegrenze immer Satz). Wer es ueber
+      // ein Local ruft, erfaehrt das ueber localFnRetSatz.
+      self.curFnRetFnWert := self.cg_typIstFnWert(lRetTy);
       self.fnRetIsFloat := 0;
       if (lRetTy >= 0 && self.cg_isFloatTypeName(self.cg_nsval(lRetTy), self.cg_nslen(lRetTy)) != 0) {
         self.fnRetIsFloat := 1;
@@ -16514,6 +16681,7 @@ pub type Codegen = class {
         if (self.cg_fnPtrRetIstF64(typeNode) != 0) {   // #1565
           poke8(self.localFnPtrF64 + localIdx, 1);
         }
+        poke8(self.localFnRetSatz + localIdx, self.cg_fnPtrRetTiefe(typeNode));   // #2143
         self.cg_rejectCapturingClosure(self.cg_nc1(ni),
           "als Wert einer Variablen mit `fn(...)`-Typ"c);
       }
@@ -16548,12 +16716,18 @@ pub type Codegen = class {
           if (vdLr >= 0 && self.cg_isFloatTypeName(self.cg_nsval(vdLr), self.cg_nslen(vdLr)) != 0) {
             poke8(self.localFnPtrF64 + localIdx, 1);
           }
+          poke8(self.localFnRetSatz + localIdx, self.cg_fnTiefeKnoten(vdLr));   // #2143
         } else if (self.cg_nkind(vdInit) == CGN_IDENT) {
           var vdSrc: int64 := self.cg_findLocalIdx(self.cg_nsval(vdInit), self.cg_nslen(vdInit));
           if (vdSrc < 0) { vdSrc := self.cg_capOuterIdx(self.cg_nsval(vdInit), self.cg_nslen(vdInit)); }
           if (vdSrc >= 0 && vdSrc != localIdx) {
             poke8(self.localFnPtrF64 + localIdx, peek8(self.localFnPtrF64 + vdSrc));
+            poke8(self.localFnRetSatz + localIdx, peek8(self.localFnRetSatz + vdSrc));   // #2143
           }
+        } else if (self.cg_nkind(vdInit) == CGN_CALL) {
+          // #2143: das Ergebnis eines Aufrufs — haelt es einen Funktionswert,
+          // dessen Aufruf wieder einen liefert (`var d1 := dreifach(3)`)?
+          poke8(self.localFnRetSatz + localIdx, self.cg_callErgebnisTiefe(vdInit));
         }
       }
       // #1355: `var a := new int64[4];` OHNE Typangabe. Der Wert IST ein Array
@@ -17979,6 +18153,7 @@ pub type Codegen = class {
         if (self.cg_fnPtrRetIstF64(ptypeNode) != 0) {
           poke8(self.localFnPtrF64 + self.localCount - 1, 1);
         }
+        poke8(self.localFnRetSatz + self.localCount - 1, self.cg_fnPtrRetTiefe(ptypeNode));   // #2143
       }
 
     } else if (k == CGN_AT_DIRECTIVE) {  // WP-CS-07 / WP-AS-04/05
@@ -20747,6 +20922,7 @@ pub type Codegen = class {
         if (self.cg_fnPtrRetIstF64(ptypeNode) != 0) {
           poke8(self.localFnPtrF64 + self.localCount - 1, 1);
         }
+        poke8(self.localFnRetSatz + self.localCount - 1, self.cg_fnPtrRetTiefe(ptypeNode));   // #2143
       }
       // #1595: Bei Struct-Rueckgabe belegt der verdeckte Zeiger rdi.
       var regIdx: int64 := paramIdx;
@@ -20877,7 +21053,20 @@ pub type Codegen = class {
     self.deferMaxCount := 0;
     self.localHigh := self.localCount;
     self.deferDepthSlot := self.cg_emitDeferHalt(body);
-    self.cg_genBlock(body);
+    // #2143: der typgeloeschte Rumpf einer generischen Funktion, die einen
+    // generischen Typ ueber ihren Typparameter nennt (`Box<T>`), hat keine
+    // Klasse dafuer — "Box<T>" gibt es nur je Spezialisierung. Erreichbar ist
+    // er nur ueber einen Aufruf OHNE Typargumente oder die Funktion als Wert;
+    // er bricht dann laut ab (wie ein Feld ueber T, cg_genFeldOffen). Der
+    // IR-Weg ebenso (_genAbhRumpf), die beiden muessen uebereinstimmen.
+    if (self.genActN == 0 && self.cg_genHatAbh(ni) != 0) {
+      var gaOff: int64 := self.cg_emitCStrData(
+        "lyxc: generische Funktion ohne Typargumente aufgerufen, sie nennt einen generischen Typ ueber ihren Typparameter (#2143)\n"c);
+      self.cg_emitLeaRdiData(gaOff);
+      self.cg_emitPanicBody();
+    } else {
+      self.cg_genBlock(body);
+    }
 
     self.cg_zeroRax();
     self.cg_emitEpilogue();
@@ -22869,10 +23058,49 @@ pub type Codegen = class {
     var fd: int64 := peek64(gr + CG_GF_OFF_NI);
     var ende: int64 := peek64(gr + CG_GF_OFF_END);
     var argB: int64 := peek64(m + CG_GM_OFF_ARGS);
-    var buf: int64 := alloc((ende - fd + 1) * 40);
+    var buf: int64 := alloc((ende - fd + 1) * 80);
     var n: int64 := 0;
     var k: int64 := fd + 1;
     while (k < ende) {
+      // #2143: `Box<T>` / `new Box<T>()` — die Nennung traegt fuer die Dauer
+      // den Namen der Instanz ("Box<int64>"), die Argumentkette ist so lange
+      // ausgehaengt (c1 bzw. c2 = -1). Zwei Eintraege: Name, Kette.
+      var abhK: int64 := self.cg_nkind(k);
+      var abhA: int64 := 0 - 1;
+      var abhF: int64 := 0;
+      if (abhK == 60 && self.cg_nc1(k) >= 0
+          && self.cg_seq(self.cg_nsval(k), self.cg_nslen(k), "Array"c, 5) == 0) { abhA := self.cg_nc1(k); abhF := CG_OFF_C1; }
+      if (abhK == CGN_NEW && self.cg_nc2(k) >= 0) { abhA := self.cg_nc2(k); abhF := CG_OFF_C2; }
+      if (abhA >= 0) {
+        var alc: int64 := alloc(16);
+        var amp: pchar := self.cg_genAbhName(k, fd, argB, alc);
+        if (peek64(alc + 8) != 0) {
+          if (self.cg_findClass(amp, peek64(alc)) < 0) {
+            self.cg_genFehler("#2143: Instanz eines generischen Typs fehlt (Aufruf der generischen Funktion aus einer anderen Unit?): "c,
+                              amp, peek64(alc));
+          }
+          var af: int64 := self.cg_noff(k) + CG_OFF_SVAL;
+          var ae: int64 := buf + n * 40;
+          poke64(ae, af);
+          poke64(ae + 8, peek64(af));
+          poke64(ae + 16, peek64(af + 8));
+          poke64(ae + 24, (amp as int64) - (self.pSrc as int64));
+          poke64(ae + 32, peek64(alc));
+          poke64(af, peek64(ae + 24));
+          poke64(af + 8, peek64(ae + 32));
+          n += 1;
+          var cf: int64 := self.cg_noff(k) + abhF;
+          var ce: int64 := buf + n * 40;
+          poke64(ce, cf);
+          poke64(ce + 8, peek64(cf));
+          poke64(ce + 16, peek64(cf + 8));
+          poke64(ce + 24, 0 - 1);
+          poke64(ce + 32, peek64(cf + 8));
+          poke64(cf, 0 - 1);
+          n += 1;
+        }
+        free(alc, 16);
+      }
       if (self.cg_nkind(k) == 60 && self.cg_nc0(k) < 0 && self.cg_nc1(k) < 0) {
         var tp: int64 := self.cg_nc3(fd);
         var ai: int64 := 0;
@@ -22899,6 +23127,88 @@ pub type Codegen = class {
     }
     poke64(nCell, n);
     return buf;
+  }
+
+  // #2143: Nennt die generische Funktion fd (aktive Tabelle) einen
+  // generischen Typ ueber ihren Typparameter? Nach dem Parser traegt nur
+  // eine solche Nennung noch Argumente (alle anderen sind zu "Box<int64>"
+  // aufgeloest) — ausser `Array<T>`, das der Parser ausnimmt (_gtRefAdd).
+  fn cg_genHatAbh(fd: int64): int64 {
+    var tp: int64 := self.cg_nc3(fd);
+    if (tp < 0 || tp >= self.pNodeCount || self.cg_nkind(tp) != 62) { return 0; }
+    var ende: int64 := 0 - 1;
+    var i: int64 := 0;
+    while (i < self.gfN) {
+      var r: int64 := self.gfRecs + i * CG_GF_SZ;
+      if (peek64(r + CG_GF_OFF_NODES) == self.pNodes && peek64(r + CG_GF_OFF_NI) == fd) { ende := peek64(r + CG_GF_OFF_END); }
+      i += 1;
+    }
+    if (ende < 0) { return 0; }
+    var k: int64 := fd + 1;
+    while (k < ende) {
+      var kk: int64 := self.cg_nkind(k);
+      if (kk == CGN_NEW && self.cg_nc2(k) >= 0) { return 1; }
+      if (kk == 60 && self.cg_nc1(k) >= 0 && self.cg_seq(self.cg_nsval(k), self.cg_nslen(k), "Array"c, 5) == 0) { return 1; }
+      k += 1;
+    }
+    return 0;
+  }
+
+  // #2143: Name der Instanz fuer die Nennung r (Typname mit Argumenten in
+  // c1, `new` mit Argumenten in c2) unter der Ersetzung Typparameter von fd
+  // -> argB. Derselbe Name wie im Parser (_gtAbhName, _gtResolve:
+  // "Name<A,B>", geschachtelt rekursiv) — die beiden muessen
+  // uebereinstimmen. lc: +0 Laenge, +8 = 1, wenn ein Typparameter darin
+  // vorkam (sonst ist die Nennung keine abhaengige und bleibt stehen).
+  fn cg_genAbhName(r: int64, fd: int64, argB: int64, lc: int64): pchar {
+    var args: int64 := self.cg_nc1(r);
+    if (self.cg_nkind(r) == CGN_NEW) { args := self.cg_nc2(r); }
+    var cap: int64 := self.cg_nslen(r) + 2;
+    var a: int64 := args;
+    while (a >= 0) { cap := cap + 256; a := self.cg_nnext(a); }
+    var mb: int64 := alloc(cap + 1);
+    var pos: int64 := self.cg_nslen(r);
+    memcpy(mb, self.cg_nsval(r) as int64, pos);
+    poke8(mb + pos, 60); pos += 1;
+    poke64(lc + 8, 0);
+    var erst: int64 := 1;
+    a := args;
+    while (a >= 0) {
+      if (erst == 0) { poke8(mb + pos, 44); pos += 1; }
+      erst := 0;
+      var np: int64 := self.cg_nsval(a) as int64;
+      var nl: int64 := self.cg_nslen(a);
+      if (self.cg_nkind(a) == 60 && self.cg_nc1(a) >= 0) {
+        var ilc: int64 := alloc(16);
+        np := self.cg_genAbhName(a, fd, argB, ilc) as int64;
+        nl := peek64(ilc);
+        if (peek64(ilc + 8) != 0) { poke64(lc + 8, 1); }
+        free(ilc, 16);
+      } else {
+        var tp: int64 := self.cg_nc3(fd);
+        var ai: int64 := 0;
+        while (tp >= 0) {
+          if (self.cg_seq(self.cg_nsval(tp), self.cg_nslen(tp), np as pchar, nl) != 0) {
+            np := peek64(argB + ai * 16); nl := peek64(argB + ai * 16 + 8);
+            poke64(lc + 8, 1);
+            tp := 0 - 1;
+          } else { tp := self.cg_nnext(tp); ai += 1; }
+        }
+      }
+      if (pos + nl + 2 > cap) {
+        var nc: int64 := (pos + nl + 2) * 2;
+        var nb: int64 := alloc(nc + 1);
+        memcpy(nb, mb, pos);
+        mb := nb; cap := nc;
+      }
+      memcpy(mb + pos, np, nl);
+      pos := pos + nl;
+      a := self.cg_nnext(a);
+    }
+    poke8(mb + pos, 62); pos += 1;
+    poke8(mb + pos, 0);
+    poke64(lc, pos);
+    return mb as pchar;
   }
 
   // Ersetzung zuruecknehmen (rueckwaerts) bzw. erneut anwenden.
@@ -23782,7 +24092,7 @@ pub type Codegen = class {
     self.localBase             := 0;
     self.satzKontext           := 0;               // #2133
     self.fnWertFnCap           := 16;
-    self.fnWertFnList          := alloc(self.fnWertFnCap * 32);   // Eintrag 32 B (cg_registerFnWertKandidat)
+    self.fnWertFnList          := alloc(self.fnWertFnCap * CG_FW_SZ);   // cg_registerFnWertKandidat
     self.fnWertFnCount         := 0;
     self.curFnRetFnWert        := 0;
     self.satzLocalJe           := 0;
@@ -23941,6 +24251,7 @@ pub type Codegen = class {
     self.localIsSimd      := alloc(self.localCap);
     self.localIsFnPtr     := alloc(self.localCap);
     self.localFnPtrF64    := alloc(self.localCap);   // #1565
+    self.localFnRetSatz   := alloc(self.localCap);   // #2143
 
     // BUG-02: Temporary buffer tracking (prevent mmap leaks)
     self.tempBufCap   := 64;
