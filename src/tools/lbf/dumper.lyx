@@ -14,6 +14,9 @@
 //   lbf_dump_print_provenance(fbuf)        — Sektion 2
 //   lbf_dump_print_tlvs(fbuf)              — Sektion 3
 //   lbf_dump_print_blocks(fbuf, fsize)     — Sektion 4
+//   lbf_dump_print_resources(fbuf, fsize)  — Sektion 5 (#1971)
+//   lbf_dump_res_strom(fbuf, fsize, lenBox) → Ressourcenstrom oder 0
+//   lbf_dump_res_find(fbuf, fsize, name, lenBox) → Bytes oder 0
 //   lbf_dump_print_all(fbuf, fsize, fname) — vollständiger Dump
 //
 // Import: import src.tools.lbf.dumper;
@@ -435,6 +438,11 @@ pub fn lbf_dump_print_blocks(fbuf: int64, fsize: int64) {
 
         if bi == 0 {
             PrintStr("Genesis        "c);
+        } else if (peek8(block + LBF_H_PAGE_TYPE) & 0xFF) == LBF_PAGE_RESOURCE {
+            // #1971: der Seitentyp entscheidet, nicht die Position — die
+            // Abschnittszaehler im Genesis-Block sind blockgranular und
+            // ueberlappen an den Grenzen.
+            PrintStr(".res           "c);
         } else {
             // Determine section type by position
             var text_end:   int64 := 1 + text_blocks;
@@ -487,6 +495,123 @@ pub fn lbf_dump_print_blocks(fbuf: int64, fsize: int64) {
     PrintLn();
 }
 
+// ── #1971: Ressourcen ─────────────────────────────────────────────────────────
+//
+// Die Nutzlasten aller Bloecke mit page_type LBF_PAGE_RESOURCE, in
+// Dateireihenfolge aneinandergehaengt, bilden den Ressourcenstrom (Aufbau:
+// lbf_layout.lyx). Liefert ihn als neuen Puffer, oder 0, wenn die Datei keine
+// Ressourcenbloecke traegt.
+pub fn lbf_dump_res_strom(fbuf: int64, fsize: int64, lenBox: int64): int64 {
+    poke64(lenBox, 0);
+    var total: int64 := fsize / LBF_BLOCK_SIZE;
+    var anz: int64 := 0;
+    var bi: int64 := 1;
+    while bi < total {
+        if (peek8(fbuf + bi * LBF_BLOCK_SIZE + LBF_H_PAGE_TYPE) & 0xFF) == LBF_PAGE_RESOURCE { anz := anz + 1; }
+        bi := bi + 1;
+    }
+    if anz == 0 { return 0; }
+    var b: int64 := alloc(anz * LBF_PAYLOAD_SIZE);
+    var p: int64 := 0;
+    bi := 1;
+    while bi < total {
+        var blk: int64 := fbuf + bi * LBF_BLOCK_SIZE;
+        if (peek8(blk + LBF_H_PAGE_TYPE) & 0xFF) == LBF_PAGE_RESOURCE {
+            memcpy(b + p, blk + LBF_HEADER_SIZE, LBF_PAYLOAD_SIZE);
+            p := p + LBF_PAYLOAD_SIZE;
+        }
+        bi := bi + 1;
+    }
+    poke64(lenBox, p);
+    return b;
+}
+
+// Den Eintrag `name` im Strom suchen: Zeiger auf die Bytes, Laenge nach
+// lenBox; 0, wenn es ihn nicht gibt. -1 in lenBox: der Strom ist kaputt
+// (Magic, Grenzen oder CRC32C eines Eintrags stimmen nicht).
+pub fn lbf_dump_res_find(fbuf: int64, fsize: int64, name: pchar, lenBox: int64): int64 {
+    poke64(lenBox, 0);
+    var slb: int64 := alloc(8);
+    var st: int64 := lbf_dump_res_strom(fbuf, fsize, slb);
+    var sl: int64 := peek64(slb);
+    free(slb, 8);
+    if st == 0 { return 0; }
+    if sl < 8 { poke64(lenBox, 0 - 1); return 0; }
+    if peek8(st) != 76 || peek8(st + 1) != 89 || peek8(st + 2) != 82 || peek8(st + 3) != 83 {
+        poke64(lenBox, 0 - 1); return 0;
+    }
+    var n: int64 := peek32(st + 4) & 0xFFFFFFFF;
+    var gl: int64 := StrLen(name);
+    var p: int64 := 8;
+    var i: int64 := 0;
+    while i < n {
+        if p + 2 > sl { poke64(lenBox, 0 - 1); return 0; }
+        var nl: int64 := peek16(st + p) & 0xFFFF;
+        if p + 2 + nl + 8 > sl { poke64(lenBox, 0 - 1); return 0; }
+        var np: int64 := st + p + 2;
+        var dl: int64 := peek32(st + p + 2 + nl) & 0xFFFFFFFF;
+        var dc: int64 := peek32(st + p + 2 + nl + 4) & 0xFFFFFFFF;
+        var dp: int64 := st + p + 2 + nl + 8;
+        if p + 2 + nl + 8 + dl > sl { poke64(lenBox, 0 - 1); return 0; }
+        if crc32c(dp, dl) != dc { poke64(lenBox, 0 - 1); return 0; }
+        if nl == gl {
+            var gleich: int64 := 1;
+            var j: int64 := 0;
+            while j < nl {
+                if peek8(np + j) != peek8((name as int64) + j) { gleich := 0; j := nl; }
+                j := j + 1;
+            }
+            if gleich != 0 { poke64(lenBox, dl); return dp; }
+        }
+        p := p + 2 + nl + 8 + dl;
+        i := i + 1;
+    }
+    return 0;
+}
+
+// Tabelle der Ressourcen: Name, Groesse, CRC32C (geprueft).
+pub fn lbf_dump_print_resources(fbuf: int64, fsize: int64) {
+    var slb: int64 := alloc(8);
+    var st: int64 := lbf_dump_res_strom(fbuf, fsize, slb);
+    var sl: int64 := peek64(slb);
+    free(slb, 8);
+    if st == 0 { return; }
+    PrintStrLn("[Resources]"c);
+    if sl < 8 || peek8(st) != 76 || peek8(st + 1) != 89 || peek8(st + 2) != 82 || peek8(st + 3) != 83 {
+        PrintStrLn("  (Ressourcenstrom ohne gueltige Kennung LYRS)"c);
+        PrintLn();
+        return;
+    }
+    var n: int64 := peek32(st + 4) & 0xFFFFFFFF;
+    PrintStr("  Count: "c); PrintInt(n); PrintLn();
+    var p: int64 := 8;
+    var i: int64 := 0;
+    while i < n {
+        if p + 2 > sl { PrintStrLn("  (abgeschnitten)"c); i := n; }
+        else {
+            var nl: int64 := peek16(st + p) & 0xFFFF;
+            if p + 2 + nl + 8 > sl { PrintStrLn("  (abgeschnitten)"c); i := n; }
+            else {
+                var dl: int64 := peek32(st + p + 2 + nl) & 0xFFFFFFFF;
+                var dc: int64 := peek32(st + p + 2 + nl + 4) & 0xFFFFFFFF;
+                PrintStr("  "c);
+                var j: int64 := 0;
+                while j < nl { PrintChar(peek8(st + p + 2 + j) & 0xFF); j := j + 1; }
+                PrintStr("  "c); PrintInt(dl); PrintStr(" bytes  CRC32C "c); dump_hex32(dc);
+                if p + 2 + nl + 8 + dl > sl { PrintStrLn("  (abgeschnitten)"c); i := n; }
+                else {
+                    PrintStr(" "c);
+                    dump_ok_fail(crc32c(st + p + 2 + nl + 8, dl) == dc);
+                    PrintLn();
+                    p := p + 2 + nl + 8 + dl;
+                    i := i + 1;
+                }
+            }
+        }
+    }
+    PrintLn();
+}
+
 // ── lbf_dump_print_all ────────────────────────────────────────────────────────
 
 pub fn lbf_dump_print_all(fbuf: int64, fsize: int64, fname: pchar) {
@@ -498,4 +623,5 @@ pub fn lbf_dump_print_all(fbuf: int64, fsize: int64, fname: pchar) {
     lbf_dump_print_provenance(fbuf);
     lbf_dump_print_tlvs(fbuf);
     lbf_dump_print_blocks(fbuf, fsize);
+    lbf_dump_print_resources(fbuf, fsize);   // #1971
 }

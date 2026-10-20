@@ -10,6 +10,7 @@ import src.paket_pfade;   // Paketwurzeln aus *.lpf
 import src.std.alloc;
 import src.wildcard_import;   // #1384
 import src.std.io;
+import src.lyu_reader;   // #1971/#2142: LYU_MAX_BYTES, Anhangverzeichnis
 import src.error_collector;  // WP-KI-02
 import src.security.capabilities;
 import src.security.capability_resolver;
@@ -300,6 +301,7 @@ pub type Sema = class {
   srcLen:     int64;
   pNodes:     int64;   // Parser.nodes buffer
   pNodeCount: int64;
+  lyuDeklTiefe: int64;   // #2014/#1971: >0 = Importe einer .lyu-Deklaration werden verarbeitet
   pToks:      int64;   // Parser.toks buffer
   pTokCount:  int64;
 
@@ -1872,6 +1874,61 @@ pub type Sema = class {
     return buf as pchar;
   }
 
+  // #2142: Die Enum-Varianten einer .lyu (Anhang Art 1) abschreiben — in
+  // dieselbe Tabelle wie bei einem Quell-Import (_enumRecord). Bis 1.2.16A
+  // trug die .lyu sie nicht, und `E.Zzz` war fuer einen solchen Enum nicht
+  // pruefbar (fail-open, sema.lyx bei SYM_ENUM): ein Tippfehler uebersetzte.
+  fn _sema_lyuEnums(data: pchar, size: int64) {
+    var d: int64 := data as int64;
+    var lb: int64 := alloc(8);
+    var off: int64 := LyuAnhang(d, size, LYU_ANH_ENUMS, lb);
+    var ende: int64 := off + peek64(lb);
+    free(lb, 8);
+    if (off < 0) { return; }
+    if (off + 4 > ende) { return; }
+    var n: int64 := LyuU32(d, off);
+    var p: int64 := off + 4;
+    var i: int64 := 0;
+    while (i < n) {
+      var nl: int64 := LyuStrLen(d, p, ende);
+      if (nl < 0) { return; }
+      var np: int64 := d + p + 2;
+      p := p + 2 + nl;
+      if (p + 4 > ende) { return; }
+      var mn: int64 := LyuU32(d, p);
+      p := p + 4;
+      if (mn < 0 || mn > 65536) { return; }
+      var blob: int64 := alloc((mn + 1) * 16);
+      var w: int64 := 0;
+      while (w < mn) {
+        var ml: int64 := LyuStrLen(d, p, ende);
+        if (ml < 0) { return; }
+        if (p + 2 + ml + 8 > ende) { return; }
+        poke64(blob + w * 16,     self._fldKopie((d + p + 2) as pchar, ml));
+        poke64(blob + w * 16 + 8, ml);
+        p := p + 2 + ml + 8;
+        w := w + 1;
+      }
+      if (mn > 0) {
+        if (self.fldCount >= self.fldCap) {
+          var nc: int64 := self.fldCap * 2;
+          if (nc < 16) { nc := 16; }
+          var nb: int64 := alloc(nc * 32);
+          memcpy(nb, self.fldTab, self.fldCount * 32);
+          self.fldTab := nb;
+          self.fldCap := nc;
+        }
+        var base: int64 := self.fldTab + self.fldCount * 32;
+        poke64(base,      self._fldKopie(np as pchar, nl));
+        poke64(base + 8,  nl);
+        poke64(base + 16, blob);
+        poke64(base + 24, mn);
+        self.fldCount := self.fldCount + 1;
+      }
+      i := i + 1;
+    }
+  }
+
   // WP-BC-50b: inline .lyu binary parser — injects symbols without parsing source
   // #2014: nurUnbeschrieben != 0 — Symbole, die ein Deklarationseintrag der
   // .lyu beschreibt, werden hier NICHT eingetragen. Sie kommen ueber den
@@ -2285,6 +2342,8 @@ pub type Sema = class {
           EPrintStrLn(self.lastReadPath as pchar);
         }
         var lyuSize: int64 := self.lastReadSize;
+        // #1971: dieselbe Schranke wie alle anderen .lyu-Leser.
+        if (lyuSize > LYU_MAX_BYTES) { LyuZuGross(self.lastReadPath as pchar, lyuSize); }
         // #2014 Stufen 2–4: Traegt die .lyu Deklarationen, wird aus ihnen ein
         // Text in Lyx-Schreibweise, und der laeuft durch DENSELBEN Weg wie
         // eine Quelle (Pass1 traegt Signaturen, Felder, Methoden ein) — nur
@@ -2299,9 +2358,11 @@ pub type Sema = class {
         if (sdR.LyrInit(lyuSrc as int64, lyuSize)) { sdTxt := sdR.LyrDeklText(sdLB); }
         if (sdTxt == 0) {
           self._sema_parseLyuSyms(lyuSrc, lyuSize, sdR, 0);
+          self._sema_lyuEnums(lyuSrc, lyuSize);   // #2142
           return;
         }
         self._sema_parseLyuSyms(lyuSrc, lyuSize, sdR, 1);
+        self._sema_lyuEnums(lyuSrc, lyuSize);   // #2142
         src := sdTxt as pchar;
         semaAusLyu := 1;
       }
@@ -2313,6 +2374,7 @@ pub type Sema = class {
       // Tippfehler im Funktionsnamen aussieht, während die Ursache der
       // Import-Pfad ist. Genau so verlor sich `import src.std.cpu.features`
       // in std/cpu/dispatch.lyx.
+      if (self.lyuDeklTiefe > 0) { return; }   // #2014/#1971, siehe Pass1-Aufruf unten
       self._errorNodeName("Modul nicht gefunden (weder .lyx noch .lyu)", importNi, modName, modLen);
       // pathBuf wurde für den .lyu-Versuch in place umgeschrieben — für die
       // Meldung auf ".lyx" zurücksetzen, sonst steht dort zweimal ".lyu".
@@ -2468,7 +2530,18 @@ pub type Sema = class {
 
     // Nicht gepruned: Pass1 ausführen um Symbole zu registrieren
     var symsBefore: int64 := self.symCount;
+    // #2014/#1971: Die Importe im Deklarationstext einer .lyu (Art 7) nennen
+    // die Units, aus denen ihre Schnittstelle Typen nimmt. Der Code und die
+    // Ressourcen dieser Units traegt die .lyu selbst; beim Verbraucher muessen
+    // sie also nicht vorhanden sein. Fehlt eine, wird der Import uebersprungen
+    // — braucht die Schnittstelle einen Typ daraus, meldet sich das laut an
+    // der Nutzung ("unknown type"), nicht still.
+    // Nur die DIREKTEN Importe des Deklarationstexts: eine Quell-Unit darunter
+    // prueft ihre eigenen Importe wieder streng (Tiefe fuer sie auf 0).
+    var lyuTiefeVor: int64 := self.lyuDeklTiefe;
+    if (semaAusLyu != 0) { self.lyuDeklTiefe := 1; } else { self.lyuDeklTiefe := 0; }
     self.Pass1(head);
+    self.lyuDeklTiefe := lyuTiefeVor;
 
     // #1567: Dieselbe Pruefung wie fuer das Wurzelmodul (#1135) — sie lief
     // bisher NUR dort. Zwei private `fn` gleichen Namens in einer importierten
@@ -9111,6 +9184,7 @@ pub type Sema = class {
     self.srcLen     := srcLen;
     self.pNodes     := nodes;
     self.pNodeCount := nodeCount;
+    self.lyuDeklTiefe := 0;
     self.pToks      := toks;
     self.pTokCount  := 1000000;
 

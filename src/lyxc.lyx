@@ -562,6 +562,9 @@ pub type CompilerConfig = class {
 
   // CAPS-TLV: Union der @capabilities-Bits (LBF_CAP_*) für den LBF-Nativ-Output.
   lyxosCapBits: int64;
+  // #1971: Ressourcenliste des IR-Lowerings ({buf, n, cap}, Eintraege
+  // IR_RES_SZ) fuer die LBF-Ressourcenbloecke, 0 = keine.
+  lyxosResListe: int64;
 
   // WP-KM-01: --target=lyxos-kernel: reject POSIX-dependent imports
   kernelMode: int64;
@@ -645,6 +648,7 @@ pub type CompilerConfig = class {
     self.compileUnit    := false;
     self.kernelMode     := 0;
     self.unitInfoFile   := 0;
+    self.lyxosResListe  := 0;   // #1971
     self.unitInfoPath   := 0;
     self.outputType       := OUTPUT_TYPE_EXECUTABLE;
     self.exportBuf        := 0;
@@ -2123,6 +2127,12 @@ pub type CompilerConfig = class {
       cuCg.lcbsAuditSrcPath     := inputFile;
       cuCg.lcbsCompatMode       := 1;   // kein seccomp/landlock fuer eine Unit
       cuCg.unitCheckMode        := 1;   // #1587: kein main erwartet
+      // #1971: Pfade in @embed/@resource gelten relativ zur Quelldatei — wie
+      // im Programm (cg.srcFilePath) und im Schreiber (_pfadAufloesen).
+      // Ohne Angabe loeste dieser Pruefdurchlauf sie relativ zum
+      // Arbeitsverzeichnis auf und scheiterte an einer Datei, die da ist.
+      cuCg.srcFilePath          := inputFile;
+      cuCg.srcFileLen           := StrLen(inputFile);
       cuCg.Generate(astRoot);
 
       // #1974: Das IR fuer den Abschnitt erzeugen — aber NUR fuer ein Ziel,
@@ -2145,6 +2155,8 @@ pub type CompilerConfig = class {
       // eine .lyu wie vor #1974 — Namen und Typen, kein Code.
       var cuIrPtr: int64 := 0;
       var cuLowerFuerLyu: IRLower;   // #2014: Layoutquelle (nur gesetzt, wenn cuIrPtr != 0)
+      var cuGlobBuf: int64 := 0;   // #2142: {Name, Laenge, Index} je 24 Byte
+      var cuGlobN: int64 := 0;
       if self.target != LYX_TC_X86_64 {
         var cuIr: IRModule := new IRModule();
         cuIr.init();
@@ -2162,6 +2174,65 @@ pub type CompilerConfig = class {
         cuLower.lowerModule(astRoot);
         cuIrPtr := cuIr as int64;
         cuLowerFuerLyu := cuLower;
+        // #2142: Namen der Modulvariablen fuer den Anhang der .lyu. Private der
+        // Unit SELBST bleiben draussen: sie stehen unmarkiert im Verzeichnis
+        // (die Wurzel hat keine Unit-Kennung) und fielen beim Einbinden mit
+        // einer gleichnamigen Variablen des Programms zusammen. Private einer
+        // importierten Unit tragen ihre Marke und duerfen mit — dieselbe Unit
+        // kann das Programm zusaetzlich als Quelle einbinden (#2142 Punkt 1).
+        var cuGsb: int64 := peek64(cuIrPtr + IR_MOD_OFF_STRBUF);
+        cuGlobBuf := alloc((cuLower.globalNameCnt + 1) * 24);
+        var cuGk: int64 := 0;
+        while cuGk < cuLower.globalNameCnt {
+          var cuGr: int64 := cuLower.globalNameBuf + cuGk * 32;
+          var cuGnl: int64 := peek64(cuGr + 8);
+          var cuGnp: int64 := cuGsb + peek64(cuGr);
+          var cuPriv: int64 := 0;
+          if cuGnl <= 0 { cuPriv := 1; }
+          var cuD: int64 := astRoot;
+          while cuD >= 0 && cuPriv == 0 {
+            var cuDo: int64 := parser.nodes + cuD * PARSER_NODE_SIZE;
+            var cuDk: int64 := peek64(cuDo);
+            if (cuDk == NK_VAR_DECL || cuDk == NK_CON_DECL) && peek64(cuDo + NODE_OFF_ISPUB) == 0 {
+              if peek64(cuDo + NODE_OFF_SLEN) == cuGnl {
+                var cuGl: int64 := 1;
+                var cuQ: int64 := 0;
+                var cuDp: int64 := (source as int64) + peek64(cuDo + NODE_OFF_SVAL);
+                while cuQ < cuGnl {
+                  if peek8(cuDp + cuQ) != peek8(cuGnp + cuQ) { cuGl := 0; cuQ := cuGnl; }
+                  cuQ := cuQ + 1;
+                }
+                if cuGl != 0 { cuPriv := 1; }
+              }
+            }
+            cuD := peek64(cuDo + NODE_OFF_NEXT);
+          }
+          // Ein Name, der schon drinsteht, bleibt beim ERSTEN Platz: das
+          // Verzeichnis kann eine Unit mehrfach fuehren (Vor- und Nachlauf),
+          // und _irGlobalIdx nimmt beim Senken ebenfalls den ersten Treffer.
+          var cuSi: int64 := 0;
+          while cuSi < cuGlobN && cuPriv == 0 {
+            var cuSb: int64 := cuGlobBuf + cuSi * 24;
+            if peek64(cuSb + 8) == cuGnl {
+              var cuSg: int64 := 1;
+              var cuSq: int64 := 0;
+              while cuSq < cuGnl {
+                if peek8(peek64(cuSb) + cuSq) != peek8(cuGnp + cuSq) { cuSg := 0; cuSq := cuGnl; }
+                cuSq := cuSq + 1;
+              }
+              if cuSg != 0 { cuPriv := 1; }
+            }
+            cuSi := cuSi + 1;
+          }
+          if cuPriv == 0 {
+            var cuGw: int64 := cuGlobBuf + cuGlobN * 24;
+            poke64(cuGw, cuGnp);
+            poke64(cuGw + 8, cuGnl);
+            poke64(cuGw + 16, peek64(cuGr + 16));   // GLOBAL_REC_OFF_IDX (ir_lower.lyx)
+            cuGlobN := cuGlobN + 1;
+          }
+          cuGk := cuGk + 1;
+        }
       }
 
       var lyw: LyuWriter := new LyuWriter();
@@ -2169,6 +2240,28 @@ pub type CompilerConfig = class {
       if self.debugSymbols { lyw.LywSetDebug(1); }
       if cuIrPtr != 0 { lyw.LywSetIR(cuIrPtr); }   // #1974
       lyw.LywSammleRessourcen(parser.nodes, astRoot, source);   // #1971
+      // #1971: Ressourcen der Units, die DIESE Unit als Quelle importiert. Die
+      // .lyu bringt deren Code mit (IR), also auch deren Ressourcen; ihre
+      // Namen tragen den Unit-Vorsatz schon (cg_resEintragen). Die eigenen
+      // (ohne Vorsatz) kamen eben aus dem AST.
+      var cuRi: int64 := 0;
+      while cuRi < cuCg.resCount {
+        var cuRb: int64 := cuCg.ress + cuRi * CG_RES_SZ;
+        if peek64(cuRb + 48) > 0 {
+          lyw.LywAddResourceImport(peek64(cuRb) as pchar, peek64(cuRb + 8),
+                                   peek64(cuRb + 16) as pchar, peek64(cuRb + 32), peek64(cuRb + 40));
+        }
+        cuRi := cuRi + 1;
+      }
+      lyw.LywSammleEnums(parser.nodes, astRoot, source);        // #2142
+      // #2142: Namen der Modulvariablen — nur mit IR (dort sind sie Plaetze
+      // im Global-Puffer), gesammelt gleich nach dem Lowering (cuGlobBuf).
+      var cuGi: int64 := 0;
+      while cuGi < cuGlobN {
+        var cuGb: int64 := cuGlobBuf + cuGi * 24;
+        lyw.LywAddGlobal(peek64(cuGb) as pchar, peek64(cuGb + 8), peek64(cuGb + 16));
+        cuGi := cuGi + 1;
+      }
       lyw.LywSammleExporte(parser.nodes, astRoot, source);     // #2035
       lyw.LywSammleKonstanten(parser.nodes, astRoot, source);  // #2014 Stufe 1
       // #2014 Stufen 2–4: Signaturen, Struct-/Klassenlayout, Importe. Das
@@ -2675,6 +2768,7 @@ pub type CompilerConfig = class {
     var _t5i: int64 := self._passStart("ir-lowering"c);
     lower.lowerModule(astRoot);
     self._passEnd("ir-lowering"c, _t5i);
+    self.lyxosResListe := lower.irResListe;   // #1971: fuer die LBF-Ressourcenbloecke
 
     // WP-BC-44: dump IR (--dump-ir or --ir-source-map)
     if self.dumpIR || self.irSourceMap {
@@ -3497,6 +3591,9 @@ pub type CompilerConfig = class {
     var lbf: LBFNativeWriter := new LBFNativeWriter();
     lbf.setLifecycle(self.lifecycleKind, 0, 0);  // LX-36: no events at compile time (handler VAs unknown)
     lbf.setCapabilities(self.lyxosCapBits);       // CAPS-TLV aus @capabilities (sonst nur STDIO)
+    if self.lyxosResListe != 0 {                  // #1971: eigener Seitentyp fuer Ressourcen
+      lbf.setResources(peek64(self.lyxosResListe), peek64(self.lyxosResListe + 8), IR_RES_SZ);
+    }
     // LYXOS-WP-5: Sektions-Größen für Multi-Section-SECTION_MAP + Genesis-Counts.
     lbf.setSections(emitter.getTextLen(), emitter.getRodataLen(), emitter.getDataLen());
     if !lbf.writeLBF(outPath, self.inputFile as pchar, emitter.getCodeBuf(), emitter.getCodeLen()) {
@@ -5989,8 +6086,21 @@ pub fn main(argc: int64, argv: pchar): int64 {
     var uiOk: bool := false;
     uiFd := open(cfg.unitInfoPath as pchar, 0, 0);
     if uiFd >= 0 {
-      uiBuf := alloc(131072);
-      uiSz := read(uiFd, uiBuf as pchar, 131071);
+      // #1971: die GANZE Datei. Bis 1.2.16A las --unit-info hoechstens 128 KB;
+      // eine .lyu mit Ressourcen ist groesser, und alles am Ende (Ressourcen,
+      // Anhangverzeichnis #2142) blieb unsichtbar. Ueber 64 MB laut.
+      var uiGr: int64 := lseek(uiFd, 0, 2);
+      lseek(uiFd, 0, 0);
+      if uiGr > LYU_MAX_BYTES { close(uiFd); LyuZuGross(cfg.unitInfoPath as pchar, uiGr); }
+      if uiGr < 0 { uiGr := 0; }
+      uiBuf := alloc(uiGr + 1);
+      var uiGel: int64 := 0;
+      var uiFehl: int64 := 0;
+      while uiGel < uiGr && uiFehl == 0 {
+        var uiN: int64 := read(uiFd, (uiBuf + uiGel) as pchar, uiGr - uiGel);
+        if uiN <= 0 { uiFehl := 1; } else { uiGel := uiGel + uiN; }
+      }
+      uiSz := uiGel;   // WP-27: ein kurzer Read liefert nur, was da ist
       if uiSz < 0 { uiSz := 0; }   // WP-27: EINTR-Guard — verhindert poke8(buf-1)
       poke8(uiBuf + uiSz, 0);
       close(uiFd);

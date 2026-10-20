@@ -630,6 +630,8 @@ test: lyxc
 	@bash tests/ctor_super_test.sh
 	@bash tests/strconcat_speicher_test.sh
 	@bash tests/lyu_ir_consumer_test.sh
+	@bash tests/lyu_ressourcen_test.sh
+	@bash tests/lyu_reste_2142_test.sh
 	@echo "OK"
 	@echo "--- Arrays mit Struct-/Klassen-Elementtyp (12 Pruefungen) ---"
 	@bash tests/struct_array_test.sh

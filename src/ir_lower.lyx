@@ -9,7 +9,7 @@ import src.parser;
 import src.std.alloc;
 import src.wildcard_import;   // #1736: IncludePfadTeil
 import src.backend.linux_syscalls;   // #2021: LSC_* + Nummern/Stelligkeit
-import src.lyu_reader;   // #2014: Deklarationen einer .lyu (LyrDeklText, Layoutabgleich)
+import src.lyu_reader;   // #2014 Deklarationen, #1971/#2142 Ressourcen, Anhang, LYU_MAX_BYTES
 
 // AST node field offsets (node size = 88 bytes)
 con NODE_OFF_C0:     int64 := 8;
@@ -144,6 +144,172 @@ pub con NK_SIMD_BINOP:      int64 := 125;
 // sperrige Name.
 pub var _irPaketPfade: pchar := 0 as pchar;
 
+// #1971: Pfad der Datei, die _irLeseImport zuletzt GEFUNDEN hat (Kopie,
+// nullterminiert), 0 wenn keine. Der Vorlauf braucht ihn: Pfade in
+// `@resource` gelten relativ zur Datei der Unit, nicht zum Hauptprogramm.
+pub var _irLetzterPfad: int64 := 0;
+
+fn _irMerkePfad(pf: int64) {
+  var l: int64 := StrLen(pf as pchar);
+  var b: int64 := alloc(l + 1);
+  memcpy(b, pf, l + 1);
+  _irLetzterPfad := b;
+}
+
+// #1971: `rel` relativ zum Verzeichnis von `basis` aufloesen, nullterminiert.
+// Dieselbe Rechnung wie cg_embedPfad (x86) und _embedPfad / lyu_writer.
+// _pfadAufloesen — die vier muessen uebereinstimmen, sonst traegt dieselbe
+// Bibliothek je nach Weg andere Bytes.
+fn _irPfadRelativ(basis: int64, rel: int64, relLen: int64): int64 {
+  if (relLen > 0 && peek8(rel) == 47) {
+    var ab: int64 := alloc(relLen + 1);
+    memcpy(ab, rel, relLen);
+    poke8(ab + relLen, 0);
+    return ab;
+  }
+  var dirLen: int64 := 0;
+  if (basis != 0) {
+    var bl: int64 := StrLen(basis as pchar);
+    var si: int64 := 0;
+    while (si < bl) {
+      if (peek8(basis + si) == 47) { dirLen := si + 1; }
+      si := si + 1;
+    }
+  }
+  var buf: int64 := alloc(dirLen + relLen + 1);
+  if (dirLen > 0) { memcpy(buf, basis, dirLen); }
+  memcpy(buf + dirLen, rel, relLen);
+  poke8(buf + dirLen + relLen, 0);
+  return buf;
+}
+
+// #1971: Ressourcenliste des IR-Wegs. `liste` ist ein Satz {buf, n, cap};
+// je Eintrag 48 Byte {Name (voll, nullterminiert), Laenge, Bytes, Anzahl,
+// Index des Kurznamens, 0}. Dieselben Kollisionsregeln wie
+// cg_resEintragen auf x86 — die beiden muessen uebereinstimmen:
+//   * gleicher voller Name   -> laut
+//   * gleicher Kurzname aus zwei Herkuenften -> laut, mit beiden
+pub con IR_RES_SZ: int64 := 48;
+
+fn _irResHerkunft(e: int64) {
+  var ab: int64 := peek64(e + 32);
+  if (ab <= 0) { EPrintStr("das Programm selbst"c); return; }
+  EPrintStr("Unit "c);
+  sys_write(2, peek64(e), ab - 1);
+}
+
+fn _irResAdd(liste: int64, tag: int64, tagLen: int64, nm: int64, nmLen: int64,
+             daten: int64, datenLen: int64) {
+  var q: int64 := 0;
+  while (q < nmLen) {
+    if (peek8(nm + q) == 58) {
+      EPrintStr("error: @resource: ':' trennt Unit und Name und darf im Namen nicht vorkommen: "c);
+      sys_write(2, nm, nmLen);
+      EPrintStrLn(""c);
+      exit(1);
+    }
+    q := q + 1;
+  }
+  var gl: int64 := nmLen;
+  var kurzAb: int64 := 0;
+  if (tag != 0 && tagLen > 0) { gl := tagLen + 1 + nmLen; kurzAb := tagLen + 1; }
+  var gb: int64 := alloc(gl + 1);
+  if (kurzAb > 0) { memcpy(gb, tag, tagLen); poke8(gb + tagLen, 58); }
+  memcpy(gb + kurzAb, nm, nmLen);
+  poke8(gb + gl, 0);
+  var buf: int64 := peek64(liste);
+  var n: int64 := peek64(liste + 8);
+  var i: int64 := 0;
+  while (i < n) {
+    var e: int64 := buf + i * IR_RES_SZ;
+    var eLen: int64 := peek64(e + 8);
+    var eKurz: int64 := peek64(e + 32);
+    if (_irNameGleich(peek64(e) as pchar, eLen, gb as pchar, gl) != 0) {
+      EPrintStr("error: @resource: der Name kommt zweimal vor: "c);
+      EPrintStrLn(gb as pchar);
+      exit(1);
+    }
+    if (_irNameGleich((peek64(e) + eKurz) as pchar, eLen - eKurz, nm as pchar, nmLen) != 0) {
+      EPrintStr("error: @resource: der Kurzname '"c);
+      sys_write(2, nm, nmLen);
+      EPrintStr("' kommt aus zwei Herkuenften: "c);
+      _irResHerkunft(e);
+      EPrintStr(" und "c);
+      if (kurzAb > 0) { EPrintStr("Unit "c); sys_write(2, tag, tagLen); }
+      else { EPrintStr("das Programm selbst"c); }
+      EPrintStrLn(""c);
+      EPrintStrLn("  Ein Kurzname ist nur erlaubt, solange er im Programm eindeutig ist (#1971)."c);
+      EPrintStrLn("  Zur Laufzeit liefert ResFind(\"unit:name\") jede Ressource eindeutig."c);
+      exit(1);
+    }
+    i := i + 1;
+  }
+  var cap: int64 := peek64(liste + 16);
+  if (n >= cap) {
+    var nc: int64 := cap * 2;
+    if (nc < 8) { nc := 8; }
+    var nb: int64 := alloc(nc * IR_RES_SZ);
+    if (n > 0) { memcpy(nb, buf, n * IR_RES_SZ); }
+    buf := nb;
+    poke64(liste, nb);
+    poke64(liste + 16, nc);
+  }
+  var w: int64 := buf + n * IR_RES_SZ;
+  poke64(w, gb);
+  poke64(w + 8, gl);
+  poke64(w + 16, daten);
+  poke64(w + 24, datenLen);
+  poke64(w + 32, kurzAb);
+  poke64(w + 40, 0);
+  poke64(liste + 8, n + 1);
+}
+
+// #1971: Datei ganz lesen, fuer `@resource` im Vorlauf. Fehlt sie, ist das
+// ein harter Fehler mit Pfad — ein stiller Ersatz (Laenge 0) waere die
+// schlimmste Antwort (dieselbe Regel wie _embedLesen).
+fn _irResLesen(pfad: int64, lenBox: int64): int64 {
+  poke64(lenBox, 0);
+  var fd: int64 := open(pfad as pchar, 0, 0);
+  if (fd < 0) {
+    EPrintStr("error: @resource: Datei nicht lesbar: "c);
+    EPrintStrLn(pfad as pchar);
+    exit(1);
+  }
+  var sz: int64 := lseek(fd, 0, 2);
+  lseek(fd, 0, 0);
+  if (sz < 0) { close(fd); EPrintStr("error: @resource: Datei nicht lesbar: "c); EPrintStrLn(pfad as pchar); exit(1); }
+  var buf: int64 := alloc(sz + 1);
+  var gelesen: int64 := 0;
+  while (gelesen < sz) {
+    var n: int64 := read(fd, (buf + gelesen) as pchar, sz - gelesen);
+    if (n <= 0) { close(fd); EPrintStr("error: @resource: Datei nicht lesbar: "c); EPrintStrLn(pfad as pchar); exit(1); }
+    gelesen := gelesen + n;
+  }
+  close(fd);
+  poke8(buf + sz, 0);
+  poke64(lenBox, sz);
+  return buf;
+}
+
+// #2142: Index der Modulvariablen mit genau diesem Namen im Verzeichnis, oder
+// -1. Ohne die Marke privater Namen (anders als _irGlobalIdx): gefragt wird
+// nach dem Namen, wie er in der .lyu steht.
+fn _irGlobalNamensIdx(ir: int64, gbuf: int64, gcnt: int64, np: int64, nl: int64): int64 {
+  if (nl <= 0) { return 0 - 1; }
+  var sb: int64 := peek64(ir + IR_MOD_OFF_STRBUF);
+  var i: int64 := 0;
+  while (i < gcnt) {
+    var r: int64 := gbuf + i * 32;
+    if (peek64(r + GLOBAL_REC_OFF_NAMELEN) == nl) {
+      if (_irNameGleich((sb + peek64(r)) as pchar, nl, np as pchar, nl) != 0) {
+        return peek64(r + GLOBAL_REC_OFF_IDX);
+      }
+    }
+    i := i + 1;
+  }
+  return 0 - 1;
+}
+
 // ===========================================================================
 // #1977: IR aus einer .lyu uebernehmen
 // ===========================================================================
@@ -277,9 +443,18 @@ pub fn _irLeseLyu(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar,
   poke8(rel + modLen + 4, 0);
   var relLen: int64 := modLen + 4;
 
-  var basen: int64 := alloc(2 * 8);
+  // #2142: -I ist eine LISTE (':' als Trenner, #1736) — wie in _irLeseImport.
+  // Bis 1.2.16A stand hier die ganze Angabe als EIN Praefix: mit zwei -I-Pfaden
+  // fand dieser Weg keine .lyu, obwohl sema sie gefunden hatte.
+  var basen: int64 := alloc(66 * 8);
   var nb: int64 := 0;
-  if ((incPath as int64) != 0) { poke64(basen + nb * 8, incPath as int64); nb := nb + 1; }
+  var incT: int64 := 0;
+  var incWeiter: int64 := 1;
+  while (incWeiter == 1 && nb < 64) {
+    var teil: int64 := alloc(1024);
+    if (IncludePfadTeil(incPath, incT, teil, 1024) < 0) { incWeiter := 0; }
+    else { poke64(basen + nb * 8, teil); nb := nb + 1; incT := incT + 1; }
+  }
   if ((stdPath as int64) != 0) { poke64(basen + nb * 8, stdPath as int64); nb := nb + 1; }
 
   // #2014: ZUERST mit Architekturebene, dann ohne — dieselbe Reihenfolge wie
@@ -324,6 +499,8 @@ pub fn _irLeseLyu(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar,
     if (fd >= 0) {
       var sz: int64 := lseek(fd, 0, 2);
       lseek(fd, 0, 0);
+      // #1971: dieselbe Schranke wie alle .lyu-Leser — darueber laut.
+      if (sz > LYU_MAX_BYTES) { close(fd); LyuZuGross(pfad as pchar, sz); }
       if (sz > 0) {
         var buf: int64 := alloc(sz);
         var gel: int64 := 0;
@@ -334,7 +511,7 @@ pub fn _irLeseLyu(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar,
         }
         close(fd);
         if (fehler == 0) {
-          free(basen, 16);
+          free(basen, 66 * 8);
           poke64(groesseBox, sz);
           return buf;
         }
@@ -344,7 +521,7 @@ pub fn _irLeseLyu(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar,
   }
   runde := runde + 1;
   }
-  free(basen, 16);
+  free(basen, 66 * 8);
   return 0;
 }
 
@@ -569,8 +746,9 @@ fn _irLeseImport(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar):
   var ext: pchar := ".lyx";
   memcpy(rel + modLen, ext as int64, 5);
 
+  _irLetzterPfad := 0;   // #1971
   var src: pchar := FileReadAll(rel as pchar);
-  if ((src as int64) != 0) { free(rel, modLen + 8); return src; }
+  if ((src as int64) != 0) { _irMerkePfad(rel); free(rel, modLen + 8); return src; }
 
   // Paketwurzeln aus einer Projektdatei (*.lpf), vor den Praefixen: ein
   // LPM-Paket liegt im Cache flach (`vega.types` ist `<cache>/types.lyx`).
@@ -580,7 +758,7 @@ fn _irLeseImport(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar):
     var pkP: pchar := PaketPfadFuer(_irPaketPfade, rel as pchar);
     if ((pkP as int64) != 0) {
       var pkSrc: pchar := FileReadAll(pkP);
-      if ((pkSrc as int64) != 0) { free(rel, modLen + 8); return pkSrc; }
+      if ((pkSrc as int64) != 0) { _irMerkePfad(pkP as int64); free(rel, modLen + 8); return pkSrc; }
     }
   }
 
@@ -619,6 +797,7 @@ fn _irLeseImport(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar):
         if (peek8(buf + at - 1) != 47) { poke8(buf + at, 47); at := at + 1; }
         memcpy(buf + at, rel, modLen + 5);
         var s2: pchar := FileReadAll(buf as pchar);
+        if ((s2 as int64) != 0) { _irMerkePfad(buf); }   // #1971
         free(buf, pl + modLen + 16);
         if ((s2 as int64) != 0) { free(rel, modLen + 8); return s2; }
       }
@@ -1126,6 +1305,24 @@ pub type IRLower = class {
   modInitN:      int64;
   modInitCap:    int64;
 
+  // #1971: RESSOURCEN auf dem IR-Weg. Bis 1.2.16A wies ir_lower `@resource`
+  // ab ("bisher nur mit --target=x86_64"); seit #1968 traegt die
+  // Zeichenkettentabelle binaere Daten, es fehlte nur die Tabelle.
+  //   irResListe — Satz {buf, n, cap}, Eintraege siehe _irResAdd. Gefuellt im
+  //                Vorlauf (Quell-Units) und beim Anhaengen einer .lyu.
+  //   irResAktiv — 1: `__lyx_restab` entsteht, GetResTable ruft sie.
+  //   irResGlob  — Platz der verborgenen Modulvariablen mit dem Zeiger auf
+  //                die einmal gebaute Tabelle.
+  irResListe:    int64;
+  irResAktiv:    int64;
+  irResGlob:     int64;
+  // #2142: Units, deren .lyu schon angehaengt ist (je 16 B: Name, Laenge).
+  // EINE Liste fuer Vorlauf und Deklarationsdurchgang — bis 1.2.16A fuehrte
+  // jeder seine eigene, und eine .lyu kam zweimal ins IR.
+  irLyuSeen:     int64;
+  irLyuSeenN:    int64;
+  irLyuSeenCap:  int64;
+
   // ------------------------------------------------------------------
   // Initialization
   // ------------------------------------------------------------------
@@ -1239,6 +1436,13 @@ pub type IRLower = class {
     self.modInitCap := 16;
     self.modInitBuf := alloc(self.modInitCap * 16);
     self.modInitN := 0;
+    self.irResListe := alloc(24);   // #1971
+    poke64(self.irResListe, 0); poke64(self.irResListe + 8, 0); poke64(self.irResListe + 16, 0);
+    self.irResAktiv := 0;
+    self.irResGlob := 0 - 1;
+    self.irLyuSeenCap := 32;        // #2142
+    self.irLyuSeen := alloc(self.irLyuSeenCap * 16);
+    self.irLyuSeenN := 0;
   }
   
   // Helper function to call IRModule methods via vtable
@@ -3837,7 +4041,28 @@ pub type IRLower = class {
     // Die Alternative waere ein Eintrag in tests/builtin-drift-allow.txt
     // gewesen. Der haette den Waechter beruhigt und die Frage offen gelassen,
     // was der Aufruf auf diesen Zielen eigentlich tut.
+    //
+    // #1971: Seit @resource hier umgesetzt ist, ruft GetResTable die erzeugte
+    // Funktion `__lyx_restab` (_irResTabBaue), sobald es eine Tabelle gibt.
+    // In einer vorkompilierten Unit (irInitModus 2) IMMER: deren Code (etwa
+    // eine mitgenommene Kopie von std.res) laeuft spaeter in einem Programm,
+    // dessen Tabelle diese Unit nicht kennt. Registriert wird dort nur der
+    // Name; den Rumpf liefert das Programm (_addFunc nimmt den vorhandenen
+    // Eintrag).
     if (self.seq(fname, fnlen, "GetResTable", 11)) {
+      if self.irInitModus == 2 || self.irResAktiv != 0 {
+        var grNm: pchar := "__lyx_restab";
+        var grIdx: int64 := self._findFuncIdxStill(grNm, 12);
+        if grIdx < 0 {
+          var grOff: int64 := self.irAddString(grNm, 12);
+          grIdx := self.irAddFunc(grOff, 12, 0, 0);
+        }
+        var grArgs: int64 := self.tempCount;
+        var grR: int64 := 0;
+        while grR < 8 { self.allocTemp(); grR := grR + 1; }
+        self.irAddInstrDirect(IRO_CALL, dest, grIdx, grArgs, 0);
+        return dest;
+      }
       self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, 0);
       return dest;
     }
@@ -9282,6 +9507,7 @@ pub type IRLower = class {
       var wlNurDekl: int64 := alloc(WLCAP * 8);  // #2014: 1 = aus einer .lyu erzeugt
       var dkPruef:   int64 := alloc(WLCAP * 16); // #2014: (Puffer, Groesse) je .lyu mit Deklarationen
       var dkPruefN:  int64 := 0;
+      var wlPfad:  int64 := alloc(WLCAP * 8);   // #1971: Datei je Eintrag
       var wlW: int64 := 0; var wlR: int64 := 0;
       // Visited-Pfade (Dedup): Bytes + (off,len)-Paare.
       var visBuf:  int64 := alloc(256 * 1024);
@@ -9292,12 +9518,16 @@ pub type IRLower = class {
       poke64(wlCnt, self.nodeCount);    poke64(wlHead, decls);
       poke64(wlName, 0); poke64(wlNameL, 0);    // das Hauptmodul hat keine Unit-Kennung
       poke64(wlNurDekl, 0);
+      poke64(wlPfad, self.irSrcPath as int64);
       wlW := 1;
       while wlR < wlW {
         var mSrc:   int64 := peek64(wlSrc + wlR * 8);
         var mNodes: int64 := peek64(wlNodes + wlR * 8);
         var mCnt:   int64 := peek64(wlCnt + wlR * 8);
         var mHead:  int64 := peek64(wlHead + wlR * 8);
+        var mTag:   int64 := peek64(wlName + wlR * 8);    // #1971
+        var mTagL:  int64 := peek64(wlNameL + wlR * 8);
+        var mPfad:  int64 := peek64(wlPfad + wlR * 8);
         wlR += 1;
         var svSrc: pchar := self.src; var svNodes: int64 := self.nodes; var svCnt: int64 := self.nodeCount;
         self.src := mSrc as pchar; self.nodes := mNodes; self.nodeCount := mCnt;
@@ -9305,6 +9535,23 @@ pub type IRLower = class {
         while dc >= 0 {
           // WP-XMOD-OOP: jeden NK_TYPE_DECL dieses Moduls global registrieren (stabile type-id).
           if self.nodeKind(dc) == NK_TYPE_DECL { self._tregRegister(dc); }
+          // #1971: `@resource` jeder Unit, im Programm wie in jedem Import.
+          // Hier und nicht beim Senken: dieser Vorlauf sieht JEDE Unit genau
+          // einmal, und die Tabelle muss vollstaendig sein, bevor der erste
+          // Aufruf von GetResTable entsteht. Eine vorkompilierte Unit
+          // (irInitModus 2) baut keine Tabelle — ihre Ressourcen traegt die
+          // .lyu (lyu_writer), die Tabelle baut das Programm.
+          if self.nodeKind(dc) == NK_RESOURCE && self.irInitModus != 2 {
+            var rsPfN: int64 := self.nodeC0(dc);
+            if rsPfN >= 0 {
+              var rsVoll: int64 := _irPfadRelativ(mPfad, self.nodeSVal(rsPfN) as int64, self.nodeSLen(rsPfN));
+              var rsBox: int64 := alloc(8);
+              var rsDat: int64 := _irResLesen(rsVoll, rsBox);
+              _irResAdd(self.irResListe, mTag, mTagL, self.nodeSVal(dc) as int64, self.nodeSLen(dc),
+                        rsDat, peek64(rsBox));
+              free(rsBox, 8);
+            }
+          }
           if self.nodeKind(dc) == NK_IMPORT {
             var nmP: pchar := self.nodeSVal(dc); var nmL: int64 := self.nodeSLen(dc);
             // Pfad "a.b.c" -> "a/b/c.lyx"
@@ -9348,29 +9595,30 @@ pub type IRLower = class {
                 // oben; haette nur eine der beiden den Weg, haenge es davon
                 // ab, ueber welchen Pfad im Importgraphen die Unit erreicht
                 // wird — und das faellt erst am fehlenden Rumpf auf.
-                var nlBox: int64 := alloc(8);
-                var nlBuf: int64 := _irLeseLyu(nmP, nmL, self.irIncludePath,
-                                               self.irStdPath, self.irLyuArch, nlBox);
-                var nlSz: int64 := peek64(nlBox);
-                free(nlBox, 8);
-                var nlOk: int64 := 0;
-                if (nlBuf != 0 && nlSz > 0) {
-                  var nlFnVor: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);   // #2136
-                  var nlBelegt: int64 := _irUebernehmeLyu(self.ir, nlBuf, nlSz, self.labelCount,
-                                                         _irLyuArchFuerZiel(self.target));
-                  if (nlBelegt >= 0) {
-                    nlOk := 1;
-                    if (nlBelegt > 0) { self.labelCount := self.labelCount + nlBelegt; }
-                    self._irLyuNachlese(nlFnVor, 0);   // #2136: Anfangswerte der .lyu
-                  }
-                }
+                // #2142: EINE Stelle fuer beide Durchgaenge (_irLyuAnhaengen).
+                var nlOk: int64 := self._irLyuAnhaengen(nmP, nmL, 0);
                 // #2014 Stufen 2–4: Traegt die .lyu Deklarationen, werden sie
                 // als eigener Eintrag der Importliste eingereiht — ohne Rumpfe.
                 // Damit finden die Nachschlagewege (Registry, Feld-Offsets,
                 // Rueckgabetypen, Methoden) die Typen der Unit wie bei einer
                 // Quelle; den Code liefert das IR von eben. Unabhaengig davon,
                 // ob das IR genommen wurde: die Typen gelten auch ohne Code.
-                if (nlBuf != 0 && nlSz > 0 && wlW < WLCAP) {
+                // Der Puffer wird hier eigens gelesen: das Anhaengen (#2142) gibt
+                // ihn nicht heraus. Eine Unit wird nur EINMAL eingereiht.
+                var nlBox: int64 := alloc(8);
+                var nlBuf: int64 := _irLeseLyu(nmP, nmL, self.irIncludePath,
+                                               self.irStdPath, self.irLyuArch, nlBox);
+                var nlSz: int64 := peek64(nlBox);
+                free(nlBox, 8);
+                var dkSchon: int64 := 0;
+                var dkI: int64 := 0;
+                while dkI < wlW {
+                  if peek64(wlNurDekl + dkI * 8) == 1 {
+                    if _irNameGleich(peek64(wlName + dkI * 8) as pchar, peek64(wlNameL + dkI * 8), nmP, nmL) != 0 { dkSchon := 1; }
+                  }
+                  dkI := dkI + 1;
+                }
+                if (nlBuf != 0 && nlSz > 0 && wlW < WLCAP && dkSchon == 0) {
                   var dkR: LyuReader := new LyuReader();
                   if (dkR.LyrInit(nlBuf, nlSz)) {
                     var dkLB: int64 := alloc(8);
@@ -9393,6 +9641,7 @@ pub type IRLower = class {
                       poke64(wlCnt + wlW * 8, dkP.nodeCount);    poke64(wlHead + wlW * 8, dkH);
                       poke64(wlName + wlW * 8, nmP as int64);    poke64(wlNameL + wlW * 8, nmL);
                       poke64(wlNurDekl + wlW * 8, 1);
+                      poke64(wlPfad + wlW * 8, 0);   // #1971: Deklarationen tragen kein @resource
                       wlW += 1;
                       poke64(dkPruef + dkPruefN * 16, nlBuf);
                       poke64(dkPruef + dkPruefN * 16 + 8, nlSz);
@@ -9412,6 +9661,7 @@ pub type IRLower = class {
                 }
               }
               if (isrc as int64) != 0 {
+                var iPfad: int64 := _irLetzterPfad;   // #1971
                 var ip: Parser := new Parser();
                 ip.Init(isrc, StrLen(isrc));
                 var ih: int64 := ip.Parse();
@@ -9467,6 +9717,7 @@ pub type IRLower = class {
                     poke64(wlCnt + wlW * 8, ip.nodeCount);    poke64(wlHead + wlW * 8, ih);
                     poke64(wlName + wlW * 8, nmP as int64);   poke64(wlNameL + wlW * 8, nmL);
                     poke64(wlNurDekl + wlW * 8, 0);
+                    poke64(wlPfad + wlW * 8, iPfad);
                     wlW += 1;
                   }
                 }
@@ -9494,6 +9745,50 @@ pub type IRLower = class {
       }
       self._irPubConSammle();   // #2107
       self._irEnumSammle();     // #2127: nach den Konstanten — ein Elementwert darf eine nennen
+      // #1971: Ressourcentabelle. Sie entsteht, wenn das Programm (oder eine
+      // seiner Units) Ressourcen traegt ODER eine angehaengte .lyu nach ihr
+      // fragt (dort ist `__lyx_restab` registriert, aber ohne Rumpf — den
+      // liefert erst das Programm). Ohne beides bleibt GetResTable eine 0,
+      // und das Erzeugnis ist Byte fuer Byte, wie es war.
+      if self.irInitModus != 2 {
+        var rtNm: pchar := "__lyx_restab";
+        var rtIdx: int64 := self._findFuncIdxStill(rtNm, 12);
+        if peek64(self.irResListe + 8) > 0 || rtIdx >= 0 {
+          self.irResAktiv := 1;
+          if rtIdx < 0 {
+            var rtOff: int64 := self.irAddString(rtNm, 12);
+            self.irAddFunc(rtOff, 12, 0, 0);
+          }
+          // Verborgene Modulvariable: Zeiger auf die einmal gebaute Tabelle.
+          if self.globalNameCnt >= self.globalNameCap {
+            var rtGc: int64 := self.globalNameCap * 2;
+            var rtGb: int64 := alloc(rtGc * 32);
+            memcpy(rtGb, self.globalNameBuf, self.globalNameCnt * 32);
+            self.globalNameBuf := rtGb;
+            self.globalNameCap := rtGc;
+          }
+          var rtGr: int64 := self.globalNameBuf + self.globalNameCnt * 32;
+          poke64(rtGr + 0, self.irAddString("__lyx_restab_g"c, 14));
+          poke64(rtGr + GLOBAL_REC_OFF_NAMELEN, 14);
+          poke64(rtGr + GLOBAL_REC_OFF_IDX, self.globalNameCnt);
+          poke64(rtGr + GLOBAL_REC_OFF_INIT, 0);
+          var rtBuf: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALBUF);
+          var rtCap: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALCAP);
+          if self.globalNameCnt * 8 + 8 > rtCap {
+            var rtNc: int64 := rtCap * 2;
+            if rtNc < self.globalNameCnt * 8 + 8 { rtNc := self.globalNameCnt * 8 + 64; }
+            var rtNb: int64 := alloc(rtNc);
+            memcpy(rtNb, rtBuf, self.globalNameCnt * 8);
+            rtBuf := rtNb;
+            poke64(self.ir + IR_MOD_OFF_GLOBALBUF, rtBuf);
+            poke64(self.ir + IR_MOD_OFF_GLOBALCAP, rtNc);
+          }
+          poke64(rtBuf + self.globalNameCnt * 8, 0);
+          poke64(self.ir + IR_MOD_OFF_GLOBALLEN, self.globalNameCnt + 1);
+          self.irResGlob := self.globalNameCnt;
+          self.globalNameCnt += 1;
+        }
+      }
       // #2123: Braucht IRGENDEINE Unit einen Anfangswert zur Laufzeit? Das
       // muss feststehen, bevor `main` entsteht — main ruft dann __lyx_modinit,
       // dessen Rumpf erst ganz am Ende gebaut wird (deshalb hier schon
@@ -9543,31 +9838,11 @@ pub type IRLower = class {
       // ausgaben, weil nur das Feld mit Offset 0 ankam. Der x86-Pfad ist nicht
       // betroffen (dort werden Konstanten frueher gefaltet).
       var ggKind: int64 := self.nodeKind(ggCur);
-      // #1961 Stufe 2: `@resource` traegt eine Tabelle ins Erzeugnis, die aus
-      // Zeigern in den Datenbereich besteht. Auf dem IR-Weg fehlt bisher die
-      // ABLAGE fuer eine solche Tabelle — die Bytes selbst waeren kein
-      // Problem mehr.
-      //
-      // #1971: Die Meldung nannte bis 1.2.5A die nullterminierte
-      // Zeichenkettentabelle und #1968 als Grund. Das trifft NICHT MEHR ZU:
-      // seit #1968 stehen vor jeder Zeichenkette acht Byte Laenge, binaere
-      // Daten ueberleben also. Offen ist allein die Tabelle — ein Feld aus
-      // int64 im Datenbereich, dessen Zeiger erst beim Schreiben des
-      // Erzeugnisses feststehen. Wer hier weiterbaut, braucht das und nicht
-      // mehr.
-      //
-      // Gemeldet wird HIER, an der Deklaration, und nicht erst beim Zugriff:
-      // sonst uebersetzte ein Programm, das Ressourcen nur mitfuehrt und
-      // (noch) nicht liest, klanglos durch und haette sie nicht.
-      if ggKind == NK_RESOURCE {
-        EPrintStrLn("lyxc: @resource ist bisher nur mit --target=x86_64 umgesetzt."c);
-        EPrintStrLn("  Es fehlt die Ablage fuer die Tabelle: ein Feld aus int64 im"c);
-        EPrintStrLn("  Datenbereich, dessen Zeiger erst beim Schreiben feststehen."c);
-        EPrintStrLn("  Die BYTES waeren kein Hindernis mehr — die Zeichenkettentabelle"c);
-        EPrintStrLn("  traegt seit #1968 ihre Laenge und vertraegt Nullbytes (#1971)."c);
-        EPrintStrLn("  Fuer einzelne Dateien geht @embed auch hier — bei Textdateien."c);
-        exit(1);
-      }
+      // #1971: `@resource` ist auf dem IR-Weg umgesetzt. Bis 1.2.16A wurde es
+      // hier abgewiesen ("bisher nur mit --target=x86_64"). Eingesammelt wird
+      // im Vorlauf (siehe dort), die Tabelle baut _irResTabBaue — an dieser
+      // Stelle ist fuer die Deklaration nichts zu tun, der Durchfall ist
+      // gewollt.
       if ggKind == NK_VAR_DECL || ggKind == NK_CON_DECL {
         if self.globalNameCnt >= self.globalNameCap {
           var ggNewCap: int64 := self.globalNameCap * 2;
@@ -9690,6 +9965,18 @@ pub type IRLower = class {
           ggNameLen := peek64(ggPLc);
           free(ggPLc, 8);
         }
+        // #2142: Steht der Name schon im Verzeichnis, weil eine angehaengte
+        // .lyu dieselbe Unit mitbringt (sie importiert X, das Programm
+        // ebenfalls), ist es DIESELBE Variable — Modulvariablen teilen sich
+        // ueber Units einen Namensraum. Bis 1.2.16A bekam die Quell-Fassung
+        // einen zweiten Platz; die Unit las den einen, das Programm den
+        // anderen, und der Anfangswert lief fuer beide.
+        var ggSchon: int64 := _irGlobalNamensIdx(self.ir, self.globalNameBuf, self.globalNameCnt,
+                                                 ggNamePtr as int64, ggNameLen);
+        if ggSchon >= 0 && self.irLyuSeenN > 0 {
+          var ggSb: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALBUF);
+          poke64(ggSb + ggSchon * 8, ggInit);
+        } else {
         var ggStrOff:  int64 := self.irAddString(ggNamePtr, ggNameLen);
         var ggRec: int64 := self.globalNameBuf + self.globalNameCnt * 32;
         poke64(ggRec +  0, ggStrOff);                            // IR strBuf offset
@@ -9716,6 +10003,7 @@ pub type IRLower = class {
         poke64(ggBuf + self.globalNameCnt * 8, ggInit);
         poke64(self.ir + IR_MOD_OFF_GLOBALLEN, self.globalNameCnt + 1);   // globalLen
         self.globalNameCnt += 1;
+        }
       }
       ggCur := self.nodeNext(ggCur);
     }
@@ -9937,22 +10225,10 @@ pub type IRLower = class {
             // ihre Funktionen fehlten im Erzeugnis. Seit #1974 kann eine .lyu
             // das IR mitbringen; dann wird es hier uebernommen, samt
             // Umrechnung aller Verweise.
-            var lyuBox: int64 := alloc(8);
-            var lyuBuf: int64 := _irLeseLyu(impModName, impModLen,
-                                            self.irIncludePath, self.irStdPath,
-                                            self.irLyuArch, lyuBox);
-            var lyuSz: int64 := peek64(lyuBox);
-            free(lyuBox, 8);
-            if (lyuBuf != 0 && lyuSz > 0) {
-              var lyuFnVor: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);   // #2136
-              var belegt: int64 := _irUebernehmeLyu(self.ir, lyuBuf, lyuSz, self.labelCount,
-                                                    _irLyuArchFuerZiel(self.target));
-              // Labelnummern weiterstellen, sonst vergibt genLabel() Nummern,
-              // die die uebernommenen Sprungziele schon benutzen — der
-              // naechste `if` spraenge dann mitten in die importierte Unit.
-              if (belegt > 0) { self.labelCount := self.labelCount + belegt; }
-              if (belegt >= 0) { self._irLyuNachlese(lyuFnVor, 1); }   // #2136
-            }
+            // #2142: dieselbe Stelle wie im Vorlauf, mit DERSELBEN Liste der
+            // schon angehaengten .lyu — bis 1.2.16A haengte dieser Durchgang
+            // eine im Vorlauf schon uebernommene .lyu ein zweites Mal an.
+            self._irLyuAnhaengen(impModName, impModLen, 1);
           }
         }
       }
@@ -10073,6 +10349,7 @@ pub type IRLower = class {
     // #2123: die Sammelfunktion — erst jetzt, wenn alle Units ihren Eintrag
     // in modInitBuf haben. Danach noch einmal die Spezialisierungen: ein
     // Anfangswert darf eine generische Funktion rufen (#2125).
+    if binTop != 0 && self.irResAktiv != 0 { self._irResTabBaue(); }   // #1971
     if binTop != 0 { self._modInitHaupt(); self._genEmitPending(); }
     self.irModHead := lmSavedHead;   // #2076
     self.irPrivTab := lmSavedPT;
@@ -10228,6 +10505,27 @@ pub type IRLower = class {
       d := self.nodeNext(d);
     }
     if hat == 0 { return; }
+    // #2142: Bringt eine angehaengte .lyu die Anfangswerte DIESER Unit schon
+    // mit (`__lyx_modinit@<unit>`, weil sie die Unit selbst importiert), laufen
+    // sie dort — in der Reihenfolge der .lyu, vor deren eigenen. Die
+    // Modulvariablen sind dieselben (siehe Vorpass); ein zweiter Lauf hier
+    // initialisierte sie ein zweites Mal (bis 1.2.16A).
+    if self.irInitModus == 0 && self.irUnitTag != 0 {
+      var mdPre: pchar := "__lyx_modinit@";
+      var mdI: int64 := 0;
+      while mdI < self.modInitN {
+        var mdP: int64 := peek64(self.modInitBuf + mdI * 16);
+        var mdL: int64 := peek64(self.modInitBuf + mdI * 16 + 8);
+        if mdL == 14 + self.irUnitTagLen {
+          if _irNameGleich(mdP as pchar, 14, mdPre, 14) != 0 {
+            if _irNameGleich((mdP + 14) as pchar, self.irUnitTagLen, self.irUnitTag as pchar, self.irUnitTagLen) != 0 {
+              return;
+            }
+          }
+        }
+        mdI := mdI + 1;
+      }
+    }
     if self.modInitNoetig == 0 {
       // Der Vorlauf (binTop) hat diese Unit nicht gesehen oder anders
       // beurteilt. Dann ruft niemand diese Funktion — laut, statt still 0.
@@ -10404,6 +10702,313 @@ pub type IRLower = class {
     self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
     self.overrideFuncName := "__lyx_modinit";
     self.overrideFuncNameLen := 13;
+    self._addFunc();
+    self.localCount := sLocal;
+    self.paramCount := sParam;
+    self.tempCount := sTemp;
+    self.retValTemp := sRet;
+    self.funcExitLabel := sExit;
+    self.funcInstrStart := sStart;
+    self.overrideFuncName := sOvN;
+    self.overrideFuncNameLen := sOvL;
+  }
+
+  // #2142/#1971: Eine .lyu an das IR des Programms haengen — EINE Stelle fuer
+  // den Vorlauf und den Deklarationsdurchgang, mit EINER Liste der schon
+  // angehaengten (bis 1.2.16A fuehrte jeder Durchgang seine eigene, und die
+  // .lyu kam zweimal ins IR). Uebernommen wird:
+  //   * das IR (_irUebernehmeLyu), samt Anfangswerten (_irLyuNachlese);
+  //   * die NAMEN der Modulvariablen (Anhang Art 2). Steht ein Name schon im
+  //     Verzeichnis, ist es dieselbe Variable: die Zugriffe der .lyu werden
+  //     auf deren Platz umgebogen. Die uebrigen tragen ihren Namen ein — das
+  //     Programm kann sie ansprechen, und eine spaeter gesenkte Quell-Fassung
+  //     derselben Unit findet sie (Vorpass in lowerModule);
+  //   * die Ressourcen (`unit:name`, mit dem Importnamen);
+  //   * die Enum-Varianten (Anhang Art 1).
+  // Rueckgabe 1, wenn die .lyu etwas beigetragen hat; 0, wenn es keine gibt
+  // oder sie fuer dieses Ziel nichts traegt.
+  fn _irLyuAnhaengen(nmP: pchar, nmL: int64, spaet: int64): int64 {
+    var si: int64 := 0;
+    while si < self.irLyuSeenN {
+      var sb: int64 := self.irLyuSeen + si * 16;
+      if _irNameGleich(peek64(sb) as pchar, peek64(sb + 8), nmP, nmL) != 0 { return 1; }
+      si := si + 1;
+    }
+    var box: int64 := alloc(8);
+    var d: int64 := _irLeseLyu(nmP, nmL, self.irIncludePath, self.irStdPath, self.irLyuArch, box);
+    var sz: int64 := peek64(box);
+    free(box, 8);
+    if d == 0 || sz <= 0 { return 0; }
+    if self.irLyuSeenN >= self.irLyuSeenCap {
+      var snc: int64 := self.irLyuSeenCap * 2;
+      var snb: int64 := alloc(snc * 16);
+      memcpy(snb, self.irLyuSeen, self.irLyuSeenN * 16);
+      self.irLyuSeen := snb;
+      self.irLyuSeenCap := snc;
+    }
+    var nmKopie: int64 := alloc(nmL + 1);
+    memcpy(nmKopie, nmP as int64, nmL);
+    poke8(nmKopie + nmL, 0);
+    poke64(self.irLyuSeen + self.irLyuSeenN * 16, nmKopie);
+    poke64(self.irLyuSeen + self.irLyuSeenN * 16 + 8, nmL);
+    self.irLyuSeenN := self.irLyuSeenN + 1;
+
+    var ok: int64 := 0;
+    var fnVor: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);
+    var globBase: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALLEN);
+    var instrBase: int64 := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
+    var belegt: int64 := _irUebernehmeLyu(self.ir, d, sz, self.labelCount, _irLyuArchFuerZiel(self.target));
+    if belegt >= 0 {
+      ok := 1;
+      // Labelnummern weiterstellen, sonst vergibt genLabel() Nummern, die die
+      // uebernommenen Sprungziele schon benutzen.
+      if belegt > 0 { self.labelCount := self.labelCount + belegt; }
+      var nGlob: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALLEN) - globBase;
+      var nInstr: int64 := peek64(self.ir + IR_MOD_OFF_INSTRLEN) - instrBase;
+      // Namen aus dem Anhang (Art 2), je lokalem Index.
+      var namen: int64 := alloc((nGlob + 1) * 16);
+      var z: int64 := 0;
+      while z < (nGlob + 1) * 2 { poke64(namen + z * 8, 0); z := z + 1; }
+      var glb: int64 := alloc(8);
+      var gOff: int64 := LyuAnhang(d, sz, LYU_ANH_GLOBALS, glb);
+      var gEnde: int64 := gOff + peek64(glb);
+      free(glb, 8);
+      if gOff >= 0 && gOff + 4 <= gEnde {
+        var gn: int64 := LyuU32(d, gOff);
+        var gp: int64 := gOff + 4;
+        var gi: int64 := 0;
+        while gi < gn {
+          var gl: int64 := LyuStrLen(d, gp, gEnde);
+          if gl < 0 || gp + 2 + gl + 4 > gEnde { gi := gn; }
+          else {
+            var gIdx: int64 := LyuU32(d, gp + 2 + gl);
+            if gIdx >= 0 && gIdx < nGlob {
+              poke64(namen + gIdx * 16, d + gp + 2);
+              poke64(namen + gIdx * 16 + 8, gl);
+            }
+            gp := gp + 2 + gl + 4;
+            gi := gi + 1;
+          }
+        }
+      }
+      // Das Verzeichnis bis zur Basis auffuellen (namenlos, wie
+      // _irLyuNachlese), dann je Platz der .lyu einen Eintrag.
+      while self.globalNameCnt < globBase + nGlob {
+        if self.globalNameCnt >= self.globalNameCap {
+          var gnc: int64 := self.globalNameCap * 2;
+          var gnb: int64 := alloc(gnc * 32);
+          memcpy(gnb, self.globalNameBuf, self.globalNameCnt * 32);
+          self.globalNameBuf := gnb;
+          self.globalNameCap := gnc;
+        }
+        var k: int64 := self.globalNameCnt - globBase;
+        var np: int64 := 0;
+        var nl: int64 := 0;
+        if k >= 0 { np := peek64(namen + k * 16); nl := peek64(namen + k * 16 + 8); }
+        var ziel: int64 := 0 - 1;
+        if nl > 0 { ziel := _irGlobalNamensIdx(self.ir, self.globalNameBuf, self.globalNameCnt, np, nl); }
+        var gr: int64 := self.globalNameBuf + self.globalNameCnt * 32;
+        poke64(gr + GLOBAL_REC_OFF_IDX, self.globalNameCnt);
+        poke64(gr + GLOBAL_REC_OFF_INIT, 0);
+        if nl > 0 && ziel < 0 {
+          poke64(gr + 0, self.irAddString(np as pchar, nl));
+          poke64(gr + GLOBAL_REC_OFF_NAMELEN, nl);
+        } else {
+          poke64(gr + 0, 0);
+          poke64(gr + GLOBAL_REC_OFF_NAMELEN, 0);           // kein Name: findet niemand
+        }
+        if ziel >= 0 && k >= 0 {
+          // Zugriffe der .lyu auf diesen Platz umbiegen.
+          var ib: int64 := peek64(self.ir + IR_MOD_OFF_INSTRBUF);
+          var alt: int64 := self.globalNameCnt;
+          var ii: int64 := 0;
+          while ii < nInstr {
+            var b: int64 := ib + (instrBase + ii) * IR_INSTR_SIZE;
+            var op: int64 := peek64(b);
+            if op == IRO_LOAD_GLOBAL || op == IRO_LOAD_GLOBAL_ADDR {
+              if peek64(b + IR_INSTR_OFF_SRC1) == alt { poke64(b + IR_INSTR_OFF_SRC1, ziel); }
+            } else if op == IRO_STORE_GLOBAL {
+              if peek64(b + IR_INSTR_OFF_DEST) == alt { poke64(b + IR_INSTR_OFF_DEST, ziel); }
+            }
+            ii := ii + 1;
+          }
+        }
+        self.globalNameCnt := self.globalNameCnt + 1;
+      }
+      free(namen, (nGlob + 1) * 16);
+      self._irLyuNachlese(fnVor, spaet);   // #2136: Anfangswerte der .lyu
+    }
+
+    // Ressourcen und Enums haengen nicht am IR: eine .lyu, die nur sie traegt
+    // (oder deren IR fuer ein anderes Ziel ist), bringt sie trotzdem mit.
+    var rd: LyuReader := new LyuReader();
+    if rd.LyrInit(d, sz) {
+      var rn: int64 := rd.LyrResCount();
+      var nb: int64 := alloc(8); var nlb: int64 := alloc(8);
+      var db: int64 := alloc(8); var dlb: int64 := alloc(8);
+      var r: int64 := 0;
+      while r < rn {
+        if rd.LyrResAt(r, nb, nlb, db, dlb) {
+          var rnp: int64 := peek64(nb);
+          var rnl: int64 := peek64(nlb);
+          var dp: int64 := 0;
+          var q: int64 := 0;
+          while q < rnl { if peek8(rnp + q) == 58 { dp := q + 1; } q := q + 1; }
+          if dp > 0 {
+            _irResAdd(self.irResListe, rnp, dp - 1, rnp + dp, rnl - dp, peek64(db), peek64(dlb));
+          } else {
+            _irResAdd(self.irResListe, nmP as int64, nmL, rnp, rnl, peek64(db), peek64(dlb));
+          }
+          ok := 1;
+        }
+        r := r + 1;
+      }
+      free(nb, 8); free(nlb, 8); free(db, 8); free(dlb, 8);
+    }
+    var elb: int64 := alloc(8);
+    var eOff: int64 := LyuAnhang(d, sz, LYU_ANH_ENUMS, elb);
+    var eEnde: int64 := eOff + peek64(elb);
+    free(elb, 8);
+    if eOff >= 0 && eOff + 4 <= eEnde {
+      if self.irEnumCap == 0 {
+        self.irEnumCap := 64;
+        self.irEnumTab := alloc(self.irEnumCap * 48);
+        self.irEnumCnt := 0;
+      }
+      var en: int64 := LyuU32(d, eOff);
+      var ep: int64 := eOff + 4;
+      var ei: int64 := 0;
+      while ei < en {
+        var enl: int64 := LyuStrLen(d, ep, eEnde);
+        if enl < 0 || ep + 2 + enl + 4 > eEnde { ei := en; }
+        else {
+          var enp: int64 := d + ep + 2;
+          ep := ep + 2 + enl;
+          var mn: int64 := LyuU32(d, ep);
+          ep := ep + 4;
+          var mi: int64 := 0;
+          while mi < mn {
+            var ml: int64 := LyuStrLen(d, ep, eEnde);
+            if ml < 0 || ep + 2 + ml + 8 > eEnde { mi := mn; ei := en; }
+            else {
+              if self.irEnumCnt >= self.irEnumCap {
+                var enc: int64 := self.irEnumCap * 2;
+                var enb: int64 := alloc(enc * 48);
+                memcpy(enb, self.irEnumTab, self.irEnumCnt * 48);
+                self.irEnumTab := enb; self.irEnumCap := enc;
+              }
+              var b2: int64 := self.irEnumTab + self.irEnumCnt * 48;
+              poke64(b2,      d + ep + 2);
+              poke64(b2 + 8,  ml);
+              poke64(b2 + 16, LyuI64(d, ep + 2 + ml));
+              poke64(b2 + 24, enp);
+              poke64(b2 + 32, enl);
+              poke64(b2 + 40, 0 - 1);           // keine Quell-Unit (siehe _irEnumFind)
+              self.irEnumCnt := self.irEnumCnt + 1;
+              ep := ep + 2 + ml + 8;
+              mi := mi + 1;
+              ok := 1;
+            }
+          }
+          ei := ei + 1;
+        }
+      }
+    }
+    return ok;
+  }
+
+  // #1971: Die Funktion `__lyx_restab` — baut die Ressourcentabelle beim
+  // ersten Aufruf und gibt danach immer denselben Zeiger zurueck (verborgene
+  // Modulvariable irResGlob). Aufbau wie auf x86 (cg_emitResTable) und in
+  // std/res.lyx beschrieben: [0] Anzahl, je Eintrag Name, Namenslaenge,
+  // Bytes, Anzahl Bytes — alles int64.
+  //
+  // Zur LAUFZEIT gebaut statt im Datenbereich ausgelegt: die Zeiger auf Namen
+  // und Bytes stehen erst beim Schreiben des Erzeugnisses fest, und jedes
+  // IR-Backend legt seinen Datenbereich anders. IRO_CONST_STR liefert die
+  // Adresse auf JEDEM Ziel — die Tabelle braucht damit kein Backend-Wissen.
+  // Die Bytes stehen in der Zeichenkettentabelle, die seit #1968 ihre Laenge
+  // traegt und Nullbytes vertraegt.
+  fn _irResTabBaue() {
+    var sLocal: int64 := self.localCount;
+    var sParam: int64 := self.paramCount;
+    var sTemp:  int64 := self.tempCount;
+    var sRet:   int64 := self.retValTemp;
+    var sExit:  int64 := self.funcExitLabel;
+    var sStart: int64 := self.funcInstrStart;
+    var sOvN:   pchar := self.overrideFuncName;
+    var sOvL:   int64 := self.overrideFuncNameLen;
+    self.localCount := 0;
+    self.paramCount := 0;
+    self.tempCount := 0;
+    var bargRsv: int64 := 0;
+    while bargRsv < IR_BARG_SLOTS { self.allocTemp(); bargRsv := bargRsv + 1; }
+    self.retValTemp := self.allocTemp();
+    self.funcExitLabel := self.genLabel();
+    self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
+
+    var g: int64 := self.irResGlob;
+    var lBau: int64 := self.genLabel();
+    var lFertig: int64 := self.genLabel();
+    var t0: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_GLOBAL, t0, g, -1, 0);
+    self.irAddInstrDirect(IRO_BR_FALSE, -1, t0, -1, lBau);
+    self.irAddInstrDirect(IRO_JMP, -1, -1, -1, lFertig);
+    self.irAddInstrDirect(IRO_LABEL, -1, -1, -1, lBau);
+
+    var buf: int64 := peek64(self.irResListe);
+    var n: int64 := peek64(self.irResListe + 8);
+    var grT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, grT, -1, -1, 8 + n * 32);
+    var tab: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, tab, grT, -1, 0);
+    // Felder: (Versatz, Art, Wert) — Art 0 = Zahl, 1 = Zeichenkettenoffset.
+    var feld: int64 := 0;
+    var anzFelder: int64 := 1 + n * 4;
+    while feld < anzFelder {
+      var versatz: int64 := feld * 8;
+      var wertT: int64 := self.allocTemp();
+      if feld == 0 {
+        self.irAddInstrDirect(IRO_CONST_INT, wertT, -1, -1, n);
+      } else {
+        var e: int64 := buf + ((feld - 1) / 4) * IR_RES_SZ;
+        var welches: int64 := (feld - 1) % 4;
+        if welches == 0 {
+          var noff: int64 := self.irAddString(peek64(e) as pchar, peek64(e + 8));
+          self.irAddInstrDirect(IRO_CONST_STR, wertT, -1, -1, noff);
+        } else if welches == 1 {
+          self.irAddInstrDirect(IRO_CONST_INT, wertT, -1, -1, peek64(e + 8));
+        } else if welches == 2 {
+          var doff: int64 := self.irAddString(peek64(e + 16) as pchar, peek64(e + 24));
+          self.irAddInstrDirect(IRO_CONST_STR, wertT, -1, -1, doff);
+        } else {
+          self.irAddInstrDirect(IRO_CONST_INT, wertT, -1, -1, peek64(e + 24));
+        }
+      }
+      var vT: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, vT, -1, -1, versatz);
+      var adrT: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, adrT, tab, vT, 0);
+      // poke64(adr, wert) — dieselbe Uebergabe wie der poke64-Zweig in
+      // lowerCall (Block aus vier Temps, Basis in src1, Builtin 205).
+      var pkB: int64 := self.tempCount;
+      var pkR: int64 := 0;
+      while pkR < 4 { self.allocTemp(); pkR := pkR + 1; }
+      self.irAddInstrDirect(IRO_STORE_LOCAL, pkB, adrT, -1, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, pkB + 1, wertT, -1, 0);
+      var pkD: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, pkD, pkB, -1, 205);
+      feld := feld + 1;
+    }
+    self.irAddInstrDirect(IRO_STORE_GLOBAL, g, tab, -1, 0);
+    self.irAddInstrDirect(IRO_LABEL, -1, -1, -1, lFertig);
+    var r: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_GLOBAL, r, g, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, self.retValTemp, r, -1, 0);
+    self.irEmitLabel(self.funcExitLabel);
+    self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
+    self.overrideFuncName := "__lyx_restab";
+    self.overrideFuncNameLen := 12;
     self._addFunc();
     self.localCount := sLocal;
     self.paramCount := sParam;
@@ -12809,9 +13414,13 @@ pub type IRLower = class {
   // ohne Wert zaehlt ein Element vom vorigen aus weiter (`A = 5, B` → 5, 6),
   // ein angegebener Wert wird gefaltet und muss in 0..2^32-1 liegen.
   fn _irEnumSammle() {
-    self.irEnumCap := 64;
-    self.irEnumTab := alloc(self.irEnumCap * 48);
-    self.irEnumCnt := 0;
+    // #2142: Eine angehaengte .lyu hat ihre Enums womoeglich schon eingetragen
+    // (_irLyuAnhaengen) — nicht verwerfen.
+    if self.irEnumCap == 0 {
+      self.irEnumCap := 64;
+      self.irEnumTab := alloc(self.irEnumCap * 48);
+      self.irEnumCnt := 0;
+    }
     var svSrc: pchar := self.src; var svNodes: int64 := self.nodes; var svCnt: int64 := self.nodeCount;
     var u: int64 := 0;
     while u < self.impLstN {
@@ -12895,9 +13504,11 @@ pub type IRLower = class {
       if passt != 0 {
         var u: int64 := peek64(b + 40);
         var uP: int64 := 0; var uL: int64 := 0;
-        if self.impLstName != 0 { uP := peek64(self.impLstName + u * 8); uL := peek64(self.impLstNameLen + u * 8); }
+        // #2142: u < 0 — aus einer .lyu, keine Quell-Unit in impLst.
+        if self.impLstName != 0 && u >= 0 { uP := peek64(self.impLstName + u * 8); uL := peek64(self.impLstNameLen + u * 8); }
         var eigene: int64 := 0;
-        if self.irUnitTag == 0 { if uP == 0 { eigene := 1; } }
+        if u < 0 { eigene := 0; }
+        else if self.irUnitTag == 0 { if uP == 0 { eigene := 1; } }
         else if uP != 0 {
           if self.seq(uP as pchar, uL, self.irUnitTag as pchar, self.irUnitTagLen) { eigene := 1; }
         }

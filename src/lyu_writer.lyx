@@ -74,8 +74,52 @@
 // Rechnung hier. Sie sind backendabhaengig (x86 legt jede Klasse ab +8 an, der
 // IR-Weg nur Klassen mit VMT); der Verbraucher vergleicht sie mit seinem
 // eigenen Ergebnis und MELDET eine Abweichung, statt sie zu uebernehmen.
+//
+// ── Ergaenzung #1971/#2142 ──────────────────────────────────────────────
+//
+// BELEGUNG DES KOPFES (Fassung 2, kein Formatbruch — ein Leser, der ein Feld
+// nicht kennt, ueberspringt es):
+//
+//   flags  bit0 (1) Debug-Abschnitt (#1555)
+//          bit1 (2) Ressourcen-Abschnitt (#1971)
+//   u32    KonstantenOffset   (#2014 Stufe 1, hiess TypeInfoOffset)
+//   u32    IRCodeOffset       (#1974)
+//   u32    DebugOffset        (#1555)
+//   u32    ResourceOffset     (#1971, war `Reserved`) — Abschnitt am ENDE:
+//          Anzahl (u32), je Eintrag Name (u16+Zeichen), Laenge (u32), Bytes.
+//          Name OHNE Unit-Vorsatz; einheitsqualifiziert (`unit:name`) wird
+//          beim Import, mit dem Importnamen. Ausnahme: Ressourcen einer von
+//          dieser Unit importierten QUELL-Unit tragen ihren Vorsatz schon.
+//
+// #2142: ANHANGVERZEICHNIS. Der Kopf hat kein freies Feld mehr; weitere
+// Abschnitte stehen deshalb in einem Verzeichnis, das ein Nachspann am
+// DATEIENDE findet:
+//
+//   ... Abschnitte ...
+//   Verzeichnis:  je Eintrag u32 Art, u32 Offset, u32 Laenge
+//   Nachspann:    "LYUX" (4), u32 Verzeichnis-Offset, u32 Anzahl, u32 0
+//
+// Der Nachspann MUSS das Letzte in der Datei bleiben — wer einen weiteren
+// Abschnitt anhaengt, traegt ihn als neue Art ins Verzeichnis ein, statt ihn
+// dahinter zu schreiben. Vergebene Arten:
+//
+//   1  Enum-Varianten   (#2142) — Anzahl Enums (u32); je Enum Name (_eStr),
+//                       Anzahl Varianten (u32), je Variante Name (_eStr) und
+//                       Wert (i64). Nur oeffentliche Enums.
+//   2  Modulvariablen   (#2142) — Anzahl (u32); je Eintrag Name (_eStr) und
+//                       Index im Global-Puffer des IR-Abschnitts (u32). Nur
+//                       mit IR-Abschnitt. Private Variablen einer importierten
+//                       Unit stehen in ihrer gemarkten Form ("unit_name");
+//                       private der Unit selbst fehlen — niemand darf sie von
+//                       aussen ansprechen, und ihr blanker Name fiele sonst
+//                       mit einer gleichnamigen Variablen des Programms
+//                       zusammen.
+//
+// GROESSE (#1971): eine .lyu ueber 64 MB wird nicht geschrieben und nicht
+// gelesen (LYU_MAX_BYTES). Darunter liest jeder Leser sie am Stueck.
 
 import src.sema;
+import src.lyu_reader;  // #1971/#2142: LYU_MAX_BYTES, LYU_ANH_* (eine Quelle)
 import src.ir;          // #1974: IR_MOD_OFF_* fuer den IR-Abschnitt
 import src.parser;      // #1971: NODE_OFF_* / PARSER_NODE_SIZE fuer den AST-Lauf
 import src.std.alloc;
@@ -100,6 +144,9 @@ con LYU_W_VER: int64 := 2;
 // weiterentwickeln kann, ohne die Fassung der .lyu selbst anzufassen — ein
 // Leser, der die Zahl nicht kennt, ueberspringt den Abschnitt.
 pub con LYU_IR_VER: int64 := 1;
+
+// LYU_MAX_BYTES und LYU_ANH_* stehen in src/lyu_reader.lyx — Schreiber und
+// alle Leser fragen dieselbe Stelle.
 
 // TLyuxArch codes (must match S0 unit_format.pas)
 pub con LYU_ARCH_X86_64:     int64 := 0;
@@ -140,13 +187,27 @@ pub type LyuWriter = class {
   // Ein Leser, der ihn nicht kennt, hoert nach der Symboltabelle auf und
   // liest die Datei unveraendert; die Version bleibt 2.
   //
-  // Eintraege: {namePtr, nameLen, pfadPtr, pfadLen} zu je 32 Byte. Die BYTES
-  // liest der Schreiber selbst — im Erzeugnis des Nutzers gibt es den Pfad
-  // nicht mehr, also muss der Inhalt in die Datei.
+  // Eintraege: {namePtr, nameLen, pfadPtr, pfadLen, datenPtr, datenLen} zu je
+  // 48 Byte. Die BYTES liest der Schreiber selbst — im Erzeugnis des Nutzers
+  // gibt es den Pfad nicht mehr, also muss der Inhalt in die Datei.
+  // pfadLen == -1: der Pfad ist schon aufgeloest (nullterminiert, Ressource
+  // einer importierten Quell-Unit). datenPtr != 0: die Bytes liegen schon vor
+  // (Ressource einer von dieser Unit importierten .lyu).
   resOffPos:  int64;
   resList:    int64;
   resCount:   int64;
   resCap:     int64;
+
+  // #2142: Enum-Varianten (Anhang Art 1). Records 24 Byte {Knotentabelle,
+  // Knoten, Quelltext} je oeffentlichem NK_ENUM_DECL.
+  enmList:    int64;
+  enmCount:   int64;
+  enmCap:     int64;
+  // #2142: Namen der Modulvariablen (Anhang Art 2). Records 24 Byte
+  // {Namenszeiger, Laenge, Index}.
+  glbList:    int64;
+  glbCount:   int64;
+  glbCap:     int64;
 
   // #2014 Stufe 1: Werte der Modulkonstanten.
   //
@@ -224,6 +285,12 @@ pub type LyuWriter = class {
     self.resList      := 0;
     self.resCount     := 0;
     self.resCap       := 0;
+    self.enmList      := 0;   // #2142
+    self.enmCount     := 0;
+    self.enmCap       := 0;
+    self.glbList      := 0;
+    self.glbCount     := 0;
+    self.glbCap       := 0;
   }
 
   // #1971: vor Serialize aufrufen, je `@resource` der Unit einmal. Ohne
@@ -287,20 +354,99 @@ pub type LyuWriter = class {
   }
 
   pub fn LywAddResource(nm: pchar, nmLen: int64, pf: pchar, pfLen: int64) {
+    self._resAdd(nm, nmLen, pf, pfLen, 0, 0);
+  }
+
+  // #1971: Ressource einer IMPORTIERTEN Unit, mit Unit-Vorsatz im Namen.
+  // Entweder ein aufgeloester Pfad (Quell-Unit) oder die Bytes (aus einer
+  // .lyu) — daten == 0 heisst: vom Pfad lesen.
+  pub fn LywAddResourceImport(nm: pchar, nmLen: int64, pfVoll: pchar, daten: int64, datenLen: int64) {
+    self._resAdd(nm, nmLen, pfVoll, 0 - 1, daten, datenLen);
+  }
+
+  fn _resAdd(nm: pchar, nmLen: int64, pf: pchar, pfLen: int64, daten: int64, datenLen: int64) {
+    // Doppelter Name innerhalb derselben .lyu: laut, wie im Codegen.
+    var di: int64 := 0;
+    while (di < self.resCount) {
+      var db: int64 := self.resList + di * 48;
+      if (peek64(db + 8) == nmLen) {
+        var gleich: int64 := 1;
+        var dj: int64 := 0;
+        while (dj < nmLen) {
+          if (peek8(peek64(db) + dj) != peek8((nm as int64) + dj)) { gleich := 0; dj := nmLen; }
+          dj := dj + 1;
+        }
+        if (gleich != 0) {
+          EPrintStr("error: @resource: der Name kommt zweimal vor: "c);
+          sys_write(2, nm as int64, nmLen);
+          EPrintStrLn(""c);
+          exit(1);
+        }
+      }
+      di := di + 1;
+    }
     if (self.resCount >= self.resCap) {
       var nc: int64 := self.resCap * 2;
       if (nc < 8) { nc := 8; }
-      var nb: int64 := alloc(nc * 32);
-      if (self.resCount > 0) { memcpy(nb, self.resList, self.resCount * 32); }
+      var nb: int64 := alloc(nc * 48);
+      if (self.resCount > 0) { memcpy(nb, self.resList, self.resCount * 48); }
       self.resList := nb;
       self.resCap  := nc;
     }
-    var b: int64 := self.resList + self.resCount * 32;
+    var b: int64 := self.resList + self.resCount * 48;
     poke64(b,      nm as int64);
     poke64(b + 8,  nmLen);
     poke64(b + 16, pf as int64);
     poke64(b + 24, pfLen);
+    poke64(b + 32, daten);
+    poke64(b + 40, datenLen);
     self.resCount := self.resCount + 1;
+  }
+
+  // #2142: Die OEFFENTLICHEN Enums der Unit merken (Anhang Art 1). Die Werte
+  // werden beim Schreiben ausgerechnet — dieselbe Regel wie
+  // cg_buildEnumLayout und _irEnumSammle (die drei muessen uebereinstimmen):
+  // ohne Wert der Vorgaenger + 1, ein expliziter Wert setzt den Zaehler neu.
+  pub fn LywSammleEnums(nodes: int64, astRoot: int64, src: pchar) {
+    var cur: int64 := astRoot;
+    while (cur >= 0) {
+      var off: int64 := nodes + cur * PARSER_NODE_SIZE;
+      if (peek64(off) == NK_ENUM_DECL && peek64(off + NODE_OFF_ISPUB) != 0) {
+        if (self.enmCount >= self.enmCap) {
+          var nc: int64 := self.enmCap * 2;
+          if (nc < 8) { nc := 8; }
+          var nb: int64 := alloc(nc * 24);
+          if (self.enmCount > 0) { memcpy(nb, self.enmList, self.enmCount * 24); }
+          self.enmList := nb;
+          self.enmCap := nc;
+        }
+        var eb: int64 := self.enmList + self.enmCount * 24;
+        poke64(eb, nodes);
+        poke64(eb + 8, cur);
+        poke64(eb + 16, src as int64);
+        self.enmCount := self.enmCount + 1;
+      }
+      cur := peek64(off + NODE_OFF_NEXT);
+    }
+  }
+
+  // #2142: Name und Index einer Modulvariablen (Anhang Art 2). Der Aufrufer
+  // (lyxc) kennt das Verzeichnis des IR-Lowerings und entscheidet, welche
+  // Namen von aussen ansprechbar sind.
+  pub fn LywAddGlobal(nm: pchar, nmLen: int64, idx: int64) {
+    if (self.glbCount >= self.glbCap) {
+      var nc: int64 := self.glbCap * 2;
+      if (nc < 16) { nc := 16; }
+      var nb: int64 := alloc(nc * 24);
+      if (self.glbCount > 0) { memcpy(nb, self.glbList, self.glbCount * 24); }
+      self.glbList := nb;
+      self.glbCap := nc;
+    }
+    var b: int64 := self.glbList + self.glbCount * 24;
+    poke64(b, nm as int64);
+    poke64(b + 8, nmLen);
+    poke64(b + 16, idx);
+    self.glbCount := self.glbCount + 1;
   }
 
   // #2014 Stufe 1: Werte der Modulkonstanten aus dem AST einsammeln.
@@ -1263,47 +1409,160 @@ pub type LyuWriter = class {
       self._e32le(self.resCount);
       var ri: int64 := 0;
       while (ri < self.resCount) {
-        var rb: int64 := self.resList + ri * 32;
+        var rb: int64 := self.resList + ri * 48;
         var rnm: pchar := peek64(rb) as pchar;
         var rnl: int64 := peek64(rb + 8);
         var rpfRel: pchar := peek64(rb + 16) as pchar;
         var rpfLen: int64 := peek64(rb + 24);
+        var rDaten: int64 := peek64(rb + 32);
+        var rDatenLen: int64 := peek64(rb + 40);
         self._eStr(rnm, rnl);
-        // Der Pfad steht als AUSSCHNITT im Quelltextpuffer: nicht
-        // nullterminiert und relativ zur Quelldatei. `open` braucht beides
-        // anders — also auflösen wie cg_embedPfad, mit demselben Ergebnis.
-        var rpf: pchar := self._pfadAufloesen(rpfRel, rpfLen, inputPath);
-        // Datei lesen. FEHLT sie, ist das ein harter Fehler mit Pfad in der
-        // Meldung — ein stiller Ersatz (Laenge 0) waere die schlimmste
-        // Antwort: die Bibliothek liesse sich bauen, und erst beim Nutzer
-        // faende sich eine leere Ressource ohne jeden Hinweis.
-        var fd: int64 := open(rpf, 0, 0);
-        if (fd < 0) {
-          EPrintStr("error: @resource: Datei nicht lesbar: "c);
-          EPrintStrLn(rpf);
-          exit(1);
-        }
-        var gr: int64 := lseek(fd, 0, 2);
-        lseek(fd, 0, 0);
-        if (gr < 0) { close(fd); EPrintStrLn("error: @resource: Groesse nicht bestimmbar"c); exit(1); }
-        self._e32le(gr);
-        if (gr > 0) {
-          var bufp: int64 := alloc(gr);
-          var gelesen: int64 := read(fd, bufp as pchar, gr);
-          close(fd);
-          if (gelesen != gr) {
-            EPrintStr("error: @resource: unvollstaendig gelesen: "c);
+        if (rDaten != 0) {
+          // Aus einer importierten .lyu: die Bytes liegen schon vor.
+          self._e32le(rDatenLen);
+          var dbi: int64 := 0;
+          while (dbi < rDatenLen) { self._e8(peek8(rDaten + dbi)); dbi := dbi + 1; }
+        } else {
+          // Der Pfad steht als AUSSCHNITT im Quelltextpuffer: nicht
+          // nullterminiert und relativ zur Quelldatei. `open` braucht beides
+          // anders — also auflösen wie cg_embedPfad, mit demselben Ergebnis.
+          // pfadLen == -1: schon aufgeloest (importierte Quell-Unit, relativ
+          // zu DEREN Datei — das hat der Codegen erledigt).
+          var rpf: pchar := rpfRel;
+          if (rpfLen >= 0) { rpf := self._pfadAufloesen(rpfRel, rpfLen, inputPath); }
+          // Datei lesen. FEHLT sie, ist das ein harter Fehler mit Pfad in der
+          // Meldung — ein stiller Ersatz (Laenge 0) waere die schlimmste
+          // Antwort: die Bibliothek liesse sich bauen, und erst beim Nutzer
+          // faende sich eine leere Ressource ohne jeden Hinweis.
+          var fd: int64 := open(rpf, 0, 0);
+          if (fd < 0) {
+            EPrintStr("error: @resource: Datei nicht lesbar: "c);
             EPrintStrLn(rpf);
             exit(1);
           }
-          var bi: int64 := 0;
-          while (bi < gr) { self._e8(peek8(bufp + bi)); bi := bi + 1; }
-          free(bufp, gr);
-        } else {
-          close(fd);
+          var gr: int64 := lseek(fd, 0, 2);
+          lseek(fd, 0, 0);
+          if (gr < 0) { close(fd); EPrintStrLn("error: @resource: Groesse nicht bestimmbar"c); exit(1); }
+          if (gr > LYU_MAX_BYTES) {
+            close(fd);
+            EPrintStr("error: @resource: Datei groesser als 64 MB, so gross darf eine .lyu nicht werden: "c);
+            EPrintStrLn(rpf);
+            exit(1);
+          }
+          self._e32le(gr);
+          if (gr > 0) {
+            var bufp: int64 := alloc(gr);
+            var gelesen: int64 := 0;
+            var rfehl: int64 := 0;
+            while (gelesen < gr && rfehl == 0) {
+              var rn: int64 := read(fd, (bufp + gelesen) as pchar, gr - gelesen);
+              if (rn <= 0) { rfehl := 1; } else { gelesen := gelesen + rn; }
+            }
+            close(fd);
+            if (gelesen != gr) {
+              EPrintStr("error: @resource: unvollstaendig gelesen: "c);
+              EPrintStrLn(rpf);
+              exit(1);
+            }
+            var bi: int64 := 0;
+            while (bi < gr) { self._e8(peek8(bufp + bi)); bi := bi + 1; }
+            free(bufp, gr);
+          } else {
+            close(fd);
+          }
         }
         ri := ri + 1;
       }
+    }
+
+    // ── Anhangverzeichnis (#2142) ──────────────────────────────────────
+    // Siehe Kopfkommentar. Ohne Anhang entfaellt auch der Nachspann; die
+    // Datei ist dann byte-identisch zu einer ohne diese Erweiterung.
+    var anhN: int64 := 0;
+    var anhBuf: int64 := alloc(4 * 24);
+    if (self.enmCount > 0) {
+      var enStart: int64 := self.len;
+      self._e32le(self.enmCount);
+      var ei: int64 := 0;
+      while (ei < self.enmCount) {
+        var eb: int64 := self.enmList + ei * 24;
+        var eNodes: int64 := peek64(eb);
+        var eNi: int64 := peek64(eb + 8);
+        var eSrc: int64 := peek64(eb + 16);
+        var eOff: int64 := eNodes + eNi * PARSER_NODE_SIZE;
+        self._eStr((eSrc + peek64(eOff + NODE_OFF_SVAL)) as pchar, peek64(eOff + NODE_OFF_SLEN));
+        var mAnz: int64 := 0;
+        var m: int64 := peek64(eOff + NODE_OFF_C0);
+        while (m >= 0) { mAnz := mAnz + 1; m := peek64(eNodes + m * PARSER_NODE_SIZE + NODE_OFF_NEXT); }
+        self._e32le(mAnz);
+        var naechster: int64 := 0;
+        m := peek64(eOff + NODE_OFF_C0);
+        while (m >= 0) {
+          var mOff: int64 := eNodes + m * PARSER_NODE_SIZE;
+          var wert: int64 := naechster;
+          var wn: int64 := peek64(mOff + NODE_OFF_C0);
+          if (wn >= 0) {
+            var wOk: int64 := alloc(8);
+            wert := self._konWert(eNodes, wn, wOk);
+            if (peek64(wOk) == 0) {
+              // Kein stiller Default: ein Wert, den die Bibliothek nicht
+              // traegt, kaeme beim Nutzer falsch an.
+              EPrintStr("error: --compile-unit: Enum-Wert nicht ablegbar: "c);
+              sys_write(2, eSrc + peek64(mOff + NODE_OFF_SVAL), peek64(mOff + NODE_OFF_SLEN));
+              EPrintStrLn(" (nur Ganzzahl-Ausdruecke aus Literalen, #2142)"c);
+              exit(1);
+            }
+          }
+          self._eStr((eSrc + peek64(mOff + NODE_OFF_SVAL)) as pchar, peek64(mOff + NODE_OFF_SLEN));
+          self._e64le(wert);
+          naechster := wert + 1;
+          m := peek64(mOff + NODE_OFF_NEXT);
+        }
+        ei := ei + 1;
+      }
+      poke64(anhBuf + anhN * 24, LYU_ANH_ENUMS);
+      poke64(anhBuf + anhN * 24 + 8, enStart);
+      poke64(anhBuf + anhN * 24 + 16, self.len - enStart);
+      anhN := anhN + 1;
+    }
+    if (self.glbCount > 0 && self.irModulPtr != 0) {
+      var glStart: int64 := self.len;
+      self._e32le(self.glbCount);
+      var gi: int64 := 0;
+      while (gi < self.glbCount) {
+        var gb: int64 := self.glbList + gi * 24;
+        self._eStr(peek64(gb) as pchar, peek64(gb + 8));
+        self._e32le(peek64(gb + 16));
+        gi := gi + 1;
+      }
+      poke64(anhBuf + anhN * 24, LYU_ANH_GLOBALS);
+      poke64(anhBuf + anhN * 24 + 8, glStart);
+      poke64(anhBuf + anhN * 24 + 16, self.len - glStart);
+      anhN := anhN + 1;
+    }
+    if (anhN > 0) {
+      var dirStart: int64 := self.len;
+      var ai: int64 := 0;
+      while (ai < anhN) {
+        self._e32le(peek64(anhBuf + ai * 24));
+        self._e32le(peek64(anhBuf + ai * 24 + 8));
+        self._e32le(peek64(anhBuf + ai * 24 + 16));
+        ai := ai + 1;
+      }
+      self._e8(76); self._e8(89); self._e8(85); self._e8(88);   // "LYUX"
+      self._e32le(dirStart);
+      self._e32le(anhN);
+      self._e32le(0);
+    }
+    free(anhBuf, 4 * 24);
+
+    // #1971: Groessenschranke. Eine groessere Datei liesse sich zwar
+    // schreiben, aber kein Leser naehme sie an — dann lieber hier laut.
+    if (self.len > LYU_MAX_BYTES) {
+      EPrintStr("error: --compile-unit: die .lyu wuerde "c);
+      EPrintInt(self.len);
+      EPrintStrLn(" Byte gross — mehr als 64 MB nimmt kein Leser an (#1971)."c);
+      exit(1);
     }
   }
 
