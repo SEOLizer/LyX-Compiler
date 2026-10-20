@@ -701,6 +701,11 @@ pub type Codegen = class {
   soExpTab:        int64;   // je Export 16 Byte: {Knoten, Codeoffset der Huelle}
   soExpCount:      int64;
   soInitOff:       int64;   // Codeoffset von __lyx_so_init
+  // #2144: Wo der Schreiber den Code abgelegt hat — Dateioffset und
+  // virtuelle Adresse. 0 = noch kein Schreiber gelaufen. --meta-safe liest
+  // beides hier, statt 176 und 0x400000 anzunehmen (ms_appendMetaSafe).
+  codeFileOff:     int64;
+  codeStartVa:     int64;
   // #2136: Anfangswerte von Modulvariablen zur LAUFZEIT — dieselbe Form wie
   // im IR-Weg seit #2123 (ir_lower._modInitEinheit/_modInitHaupt; die beiden
   // muessen uebereinstimmen). Je Unit eine Funktion `__lyx_modinit_<n>`,
@@ -7182,6 +7187,7 @@ pub type Codegen = class {
     self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);                          // dec r8 → -1
     self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);                          // xor r9,r9
     self.cg_movRaxImm(9);    self.cg_e8(0x0F); self.cg_e8(0x05);                    // syscall mmap
+    self.cg_emitMmapGeprueft();   // #2144
     self.cg_pushRax();                                                              // [rsp] = p
     // code-Adresse: lea rax,[rip+ Klasse_Method ]
     if (rcls >= 0) {
@@ -7411,6 +7417,12 @@ pub type Codegen = class {
     self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);   // xor r9, r9
     self.cg_e8(0xB8); self.cg_e32(9);                       // mov eax, 9
     self.cg_e8(0x0F); self.cg_e8(0x05);                     // syscall → rax = Blockanfang
+    // #2144: dieselbe Pruefung wie hinter jedem anderen mmap (#1947). Bis
+    // 1.2.16A lief -ENOMEM hier als Blockanfang weiter: PTR/END zeigten in den
+    // Fehlerbereich, `new` lieferte 0xFFFF...F4 + n, der erste Feldzugriff
+    // faultete (rc 139 ohne Aussage). Die Sperre (END = 1) bleibt dabei
+    // stehen — der Prozess endet ohnehin.
+    self.cg_emitMmapGeprueft();
     if (groesse > 0) {
       self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x90); self.cg_e32(block);     // lea rdx, [rax + block]
       self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x88); self.cg_e32(groesse);   // lea rcx, [rax + groesse]
@@ -7553,8 +7565,10 @@ pub type Codegen = class {
     self.cg_e8(0xF0); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB1); self.cg_e8(0x15);
     var p3: int64 := self.codeLen; self.cg_e32(0);
     self.cg_addPatch(p3, aOff, 0, CG_PATCH_STR);
-    self.cg_e8(0x74);                                          // jz .fertig (rax = alte Adresse)
-    var jzPos: int64 := self.codeLen; self.cg_e8(0);
+    // #2144: jz rel32 statt rel8 — die mmap-Pruefung in .nachlegen
+    // (Meldung + Abbruch) macht den Weg laenger als 127 Byte.
+    self.cg_e8(0x0F); self.cg_e8(0x84);                        // jz .fertig (rax = alte Adresse)
+    var jzPos: int64 := self.codeLen; self.cg_e32(0);
     self.cg_e8(0xEB);                                          // jmp retry
     self.cg_e8((retry - self.codeLen - 1) & 255);
     // --- .nachlegen: eigener Block per mmap(1 MiB) ---
@@ -7569,6 +7583,7 @@ pub type Codegen = class {
     self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);      // xor r9, r9
     self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(9);
     self.cg_e8(0x0F); self.cg_e8(0x05);                        // syscall
+    self.cg_emitMmapGeprueft();   // #2144
     self.cg_e8(0x59); self.cg_e8(0x5E); self.cg_e8(0x5F);      // pop rcx, rsi, rdi
     // [arena+8] := rax + 1 MiB ; [arena] := rax + groesse ; rax bleibt der Block
     self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x90); self.cg_e32(1048576);  // lea rdx,[rax+1MiB]
@@ -7580,7 +7595,7 @@ pub type Codegen = class {
     var p5: int64 := self.codeLen; self.cg_e32(0);
     self.cg_addPatch(p5, aOff, 0, CG_PATCH_STR);
     // .fertig
-    cg_patchRel8(self.code, jzPos, self.codeLen);
+    poke32(self.code + jzPos, self.codeLen - jzPos - 4);
     self.cg_e8(0x5A);                                          // pop rdx
   }
 
@@ -10667,6 +10682,7 @@ pub type Codegen = class {
       self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d, r9d
       self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax, 9
       self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall → rax = mmap base
+      self.cg_emitMmapGeprueft();   // #2144
       // pop rcx (element count n)
       self.cg_e8(0x59);
       // align: rax = (rax + 23) & ~15  → guarantees rax-8 >= mmap_base
@@ -15239,6 +15255,7 @@ pub type Codegen = class {
       self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);         // dec r8 → -1
       self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);         // xor r9, r9
       self.cg_movRaxImm(9); self.cg_e8(0x0F); self.cg_e8(0x05);     // mmap syscall
+      self.cg_emitMmapGeprueft();   // #2144
 
     } else if (self.cg_seq(fname, fnlen, "StrSetChar", 10)) {
       // StrSetChar(s, i, c): poke8(s+i, c) — s=rdi, i=rsi, c=rdx
@@ -16890,6 +16907,7 @@ pub type Codegen = class {
           self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
           self.cg_movRaxImm(9);
           self.cg_e8(0x0F); self.cg_e8(0x05);
+          self.cg_emitMmapGeprueft();   // #2144
           // #1109: {cap,len}-Kopf fuellen. `len(arr)` nimmt bei fester Groesse
           // zwar den Wert aus der Uebersetzungszeit, aber jede Stelle, die den
           // Kopf liest — etwa die Bereichspruefung aus #1156 — findet ihn nun
@@ -16930,6 +16948,7 @@ pub type Codegen = class {
             self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
             self.cg_movRaxImm(9);
             self.cg_e8(0x0F); self.cg_e8(0x05);                     // syscall
+            self.cg_emitMmapGeprueft();   // #2144
             // mov rbx, [rsp+8] (base); mov rcx, [rsp] (i);
             // mov [rbx+rcx*8+16], rax — hinter dem {cap,len}-Kopf
             self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x5C); self.cg_e8(0x24); self.cg_e8(0x08);
@@ -26174,6 +26193,8 @@ pub type Codegen = class {
     while (ef < ehAnz) { ehSize := ehSize + self.cg_ehFdeGroesse(peek64(ehTab + ef * 32 + 24)); ef := ef + 1; }
     var tabEnde: int64 := ehOff + ehSize;
     var codeOff: int64 := CG_CODE_OFF + ((tabEnde - CG_CODE_OFF + seite - 1) / seite) * seite;
+    self.codeFileOff := codeOff;   // #2144: Ladebasis 0
+    self.codeStartVa := codeOff;
     var dataOff: int64 := codeOff + codeLen;
     var relroOff: int64 := ((dataOff + dataLen + seite - 1) / seite) * seite;
     var dynOff: int64 := relroOff;
@@ -26454,6 +26475,10 @@ pub type Codegen = class {
   }
 
   fn WriteELF(path: pchar) {
+    // #2144: alle drei Schreiber hinter WriteELF (statisch, PT_LYXRELOC,
+    // dynamisch/FFI) legen den Code bei CG_CODE_OFF ab.
+    self.codeFileOff := CG_CODE_OFF;
+    self.codeStartVa := CG_ELF_BASE + CG_CODE_OFF;
     // WP-34: refuse to write a binary produced by an overflowed buffer
     if (self.codeOverflow != 0 || self.dataOverflow != 0) {
       EPrintStrLn("error: codegen: WriteELF abgebrochen — Puffer-512-MB-Limit überschritten"c);
@@ -26493,22 +26518,10 @@ pub type Codegen = class {
     var lineSize:   int64 := 0;
     var strSize:    int64 := 0;
     if (self.debugMode != 0) {
-      var li: int64 := 0;
-      while (li < self.labelCount) {
-        var lbase:    int64 := self.labels + li * CG_LABEL_SZ;
-        var lname:    pchar := peek64(lbase) as pchar;
-        var lnlen:    int64 := peek64(lbase + CG_LABEL_OFF_NAMELEN);
-        var lstart:   int64 := peek64(lbase + CG_LABEL_OFF_CODEOFF);
-        var llineNum: int64 := peek64(lbase + CG_LABEL_OFF_LINENUM);
-        var lend:     int64 := 0;
-        if (li + 1 < self.labelCount) {
-          lend := peek64(self.labels + (li + 1) * CG_LABEL_SZ + CG_LABEL_OFF_CODEOFF);
-        } else {
-          lend := totalCode;
-        }
-        dg.dw_addFunc(lname, lnlen, lstart, lend, llineNum);
-        li += 1;
-      }
+      // #2144: dieselbe Funktionstabelle wie die .so (cg_dwarfFunktionen) —
+      // hier stand bis 1.2.16A noch "Ende = naechste Marke in der Tabelle",
+      // was fuer Aliasmarken (cg_bindConFns) falsche Bereiche ergab.
+      self.cg_dwarfFunktionen(dg, totalCode);
       dg.dw_buildAbbrev();
       dg.dw_buildInfo(self.srcFilePath, self.srcFileLen, totalCode);
       dg.dw_buildLine(self.srcFilePath, self.srcFileLen);
@@ -26518,10 +26531,12 @@ pub type Codegen = class {
       strSize    := dg.strLen;
     }
 
-    var shstrtabSize: int64 := 60;
+    // #2144: + ".text\0" (6 Byte) — addr2line sucht die Adresse zuerst in einem
+    // Abschnitt mit SHF_ALLOC; ohne .text fand es nichts, egal wie gut das DWARF war.
+    var shstrtabSize: int64 := 66;
     var fileSize: int64 := baseSize;
     if (self.debugMode != 0) {
-      fileSize := baseSize + abbrevSize + infoSize + lineSize + strSize + shstrtabSize + 384;
+      fileSize := baseSize + abbrevSize + infoSize + lineSize + strSize + shstrtabSize + 448;
     }
 
     // WP-LIC-10: watermark layout (only in non-debug static builds with a license key)
@@ -26597,7 +26612,7 @@ pub type Codegen = class {
     if (self.debugMode != 0) {
       var shoff: int64 := baseSize + abbrevSize + infoSize + lineSize + strSize + shstrtabSize;
       poke64(buf + ELF64_EHDR_OFF_SHOFF, shoff);
-      poke16(buf + 60, 6);      // e_shnum = 6
+      poke16(buf + 60, 7);      // e_shnum = 7 (#2144: + .text)
       poke16(buf + 62, 5);      // e_shstrndx = 5
     }
     if hasWatermark {
@@ -26683,6 +26698,7 @@ pub type Codegen = class {
       poke8(ss+49,0);
       poke8(ss+50,46);poke8(ss+51,115);poke8(ss+52,104);poke8(ss+53,115);poke8(ss+54,116);
       poke8(ss+55,114);poke8(ss+56,116);poke8(ss+57,97);poke8(ss+58,98);poke8(ss+59,0);
+      self.cg_objPutName(ss, 60, ".text"c as int64, 5);   // #2144, NUL aus dem Nullpuffer
 
       // Section header table (6 × 64 bytes; [0]=NULL, already zero from mmap)
       var sh0: int64 := buf + shstrtabOff + shstrtabSize;
@@ -26713,6 +26729,12 @@ pub type Codegen = class {
       sh := sh0 + 320;
       poke32(sh,50); poke32(sh+4,3);
       poke64(sh+24,shstrtabOff); poke64(sh+32,shstrtabSize); poke64(sh+48,1);
+
+      // [6] .text: sh_name=60, SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR (#2144)
+      sh := sh0 + 384;
+      poke32(sh,60); poke32(sh+4,1);
+      poke64(sh+8,6); poke64(sh+16,CG_ELF_BASE + CG_CODE_OFF);
+      poke64(sh+24,CG_CODE_OFF); poke64(sh+32,totalCode); poke64(sh+48,16);
     }
 
     // WP-LIC-10: embed .lyx_lic section (non-debug static builds only)

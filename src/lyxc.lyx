@@ -209,18 +209,30 @@ fn ms_crc32(data: int64, len: int64): int64 {
 }
 
 // Append a .meta_safe section to the ELF binary at `path`.
-// codeOff  = file offset of .text (176 for static x86_64 ELF: 64-byte ELF hdr + 2×56-byte phdr)
+// codeOff  = file offset of .text, codeVa = its virtual address — beide vom
+//            Schreiber (Codegen.codeFileOff/codeStartVa, #2144). Bis 1.2.16A
+//            standen hier fest 176 und 0x400000.
 // codeLen  = length of .text in bytes
 // dataLen  = length of .data in bytes (follows .text immediately)
-fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64) {
+fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeVa: int64, codeLen: int64, dataLen: int64) {
+  // #2144: Fehler laut — bis 1.2.16A meldete jeder Abbruch hier nur auf
+  // stdout und lyxc endete mit 0, das Erzeugnis ohne .meta_safe.
+  if (codeOff <= 0) {
+    EPrintStrLn("error: --meta-safe: der Schreiber hat keinen Codeoffset gemeldet (#2144)"c);
+    exit(EMIT_EX_IOERR);
+  }
   // WP-32: single O_RDWR open — no close between read and write eliminates TOCTOU window
   var fd: int64 := open(path, 2, 0);  // O_RDWR
-  if (fd < 0) { PrintStr("meta-safe: cannot open binary\n"); return; }
+  if (fd < 0) { EPrintStrLn("error: --meta-safe: Erzeugnis laesst sich nicht oeffnen"c); exit(EMIT_EX_IOERR); }
   var fileSize: int64 := lseek(fd, 0, 2);
   lseek(fd, 0, 0);
   var buf: int64 := alloc(fileSize + 4096);
   if (read(fd, buf as pchar, fileSize) != fileSize) {  // WP-27: partieller Read → Abbruch
-    PrintStr("meta-safe: read incomplete\n"); close(fd); return;
+    EPrintStrLn("error: --meta-safe: Erzeugnis unvollstaendig gelesen"c); close(fd); exit(EMIT_EX_IOERR);
+  }
+  if (codeOff + codeLen > fileSize) {
+    EPrintStrLn("error: --meta-safe: Codebereich liegt hinter dem Dateiende (#2144)"c);
+    close(fd); exit(EMIT_EX_IOERR);
   }
 
   // #1877: Format v2. Bis 1.1.14G stand hier EIN CRC32 je Seite und sonst
@@ -255,8 +267,8 @@ fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64
   poke32(payload + 8,  pageCount);
   poke32(payload + 12, 0);                          // mode: 0 = nur Datei-Pruefung
   poke64(payload + 16, codeLen);
-  poke64(payload + 24, 4194304 + codeOff);          // code_start_va
-  poke64(payload + 32, 4194304 + codeOff + codeLen);// code_end_va
+  poke64(payload + 24, codeVa);                     // code_start_va
+  poke64(payload + 32, codeVa + codeLen);           // code_end_va
   poke32(payload + 40, 0);                          // interval_ms: kein Sweep
   poke32(payload + 44, stride);
   poke64(payload + 48, 0);                          // recovery_ptr
@@ -279,77 +291,93 @@ fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64
     pi += 1;
   }
 
-  // Build .shstrtab: "\0.meta_safe\0.shstrtab\0"
-  // Offsets: 0=\0, 1=.meta_safe (10 chars), 12=\0, 13=.shstrtab (9 chars), 23=\0 → 24 bytes
-  var shstrSize:  int64 := 24;
+  // #2144: Vorhandene Abschnitte behalten. Bis 1.2.16A ersetzte die Tabelle
+  // hier jede vorhandene — mit --debug verschwanden .debug_* und .text (kein
+  // addr2line, kein gdb mehr), mit Lizenz-Wasserzeichen .lyx_lic.
+  // Jetzt: alte Abschnittskoepfe uebernehmen, .shstrtab um ".meta_safe"
+  // verlaengert hinten neu ablegen, .meta_safe als letzten Abschnitt anhaengen.
+  var oldShoff: int64 := peek64(buf + ELF64_EHDR_OFF_SHOFF);
+  var oldShnum: int64 := peek16(buf + 60);
+  var oldShstrndx: int64 := peek16(buf + 62);
+  var oldStrOff: int64 := 0;
+  var oldStrSize: int64 := 1;      // ohne Tabelle: nur das fuehrende NUL
+  if (oldShnum > 0) {
+    if (oldShoff + oldShnum * 64 > fileSize || oldShstrndx >= oldShnum) {
+      EPrintStrLn("error: --meta-safe: Abschnittstabelle des Erzeugnisses ist kaputt (#2144)"c);
+      close(fd); exit(EMIT_EX_IOERR);
+    }
+    var osh: int64 := buf + oldShoff + oldShstrndx * 64;
+    oldStrOff  := peek64(osh + ELF64_SHDR_OFF_OFFSET);
+    oldStrSize := peek64(osh + ELF64_SHDR_OFF_SIZE);
+    if (oldStrSize < 1 || oldStrOff + oldStrSize > fileSize) {
+      EPrintStrLn("error: --meta-safe: .shstrtab des Erzeugnisses ist kaputt (#2144)"c);
+      close(fd); exit(EMIT_EX_IOERR);
+    }
+  }
+  // Neue .shstrtab: alte Namen, dann ".meta_safe\0"; ohne Tabelle dazu ".shstrtab\0"
+  var nameMs: int64 := oldStrSize;
+  var nameShs: int64 := nameMs + 11;
+  var shstrSize: int64 := nameMs + 11;
+  if (oldShnum == 0) { shstrSize := shstrSize + 10; }
   var shstr: int64 := alloc(shstrSize);  // zeroed
+  if (oldShnum > 0) { memcpy(shstr, buf + oldStrOff, oldStrSize); }
   var metaSafeName: pchar := ".meta_safe";
   var shstrtabName: pchar := ".shstrtab";
-  memcpy(shstr + 1,  metaSafeName as int64, 10);
-  memcpy(shstr + 12, shstrtabName as int64, 9);
+  memcpy(shstr + nameMs, metaSafeName as int64, 10);
+  if (oldShnum == 0) { memcpy(shstr + nameShs, shstrtabName as int64, 9); }
 
   // Layout of new file:
   //   [0 .. fileSize-1]          : original ELF
   //   [fileSize .. +payloadSize]  : .meta_safe payload
-  //   [fileSize+payloadSize .. ]  : .shstrtab (24 bytes)
-  //   [fileSize+payloadSize+24..] : 3 × 64-byte section headers (aligned to 8)
-  var shoff:    int64 := fileSize + payloadSize + shstrSize;
-  var newSize:  int64 := shoff + 3 * 64;
+  //   [.. +shstrSize]             : .shstrtab (neu)
+  //   [8-aligned ..]              : Abschnittskoepfe
+  var strOff:   int64 := fileSize + payloadSize;
+  var shoff:    int64 := ((strOff + shstrSize + 7) / 8) * 8;
+  var newShnum: int64 := oldShnum + 1;
+  var strNdx:   int64 := oldShstrndx;
+  var msNdx:    int64 := oldShnum;
+  if (oldShnum == 0) { newShnum := 3; strNdx := 2; msNdx := 1; }
+  var newSize:  int64 := shoff + newShnum * 64;
 
-  // Build new ELF buffer
   var nbuf: int64 := alloc(newSize);
-  // Copy original ELF
-  var ci: int64 := 0;
   memcpy(nbuf, buf, fileSize);
-  // Append .meta_safe payload
-  ci := 0;
   memcpy(nbuf + fileSize, payload, payloadSize);
-  // Append .shstrtab
-  ci := 0;
-  memcpy(nbuf + fileSize + payloadSize, shstr, shstrSize);
+  memcpy(nbuf + strOff, shstr, shstrSize);
+  if (oldShnum > 0) { memcpy(nbuf + shoff, buf + oldShoff, oldShnum * 64); }
 
-  // Update ELF header:
-  //   e_shoff      = shoff (offset of section header table)
-  //   e_shnum      = 3 (NULL, .meta_safe, .shstrtab)
-  //   e_shstrndx   = 2 (.shstrtab is entry 2)
   poke64(nbuf + ELF64_EHDR_OFF_SHOFF, shoff);  // e_shoff
-  poke16(nbuf + 60, 3);      // e_shnum
-  poke16(nbuf + 62, 2);      // e_shstrndx
+  poke16(nbuf + 60, newShnum);                 // e_shnum
+  poke16(nbuf + 62, strNdx);                   // e_shstrndx
 
-  // Section header table (3 × 64 bytes, each Elf64_Shdr):
-  // [0] NULL section — all zeros
-  var sh0: int64 := nbuf + shoff;
-  // (already zeroed by mmap)
+  // .shstrtab — SHT_STRTAB=3, zeigt auf die neue Fassung
+  var shs: int64 := nbuf + shoff + strNdx * 64;
+  if (oldShnum == 0) { poke32(shs, nameShs); }
+  poke32(shs + 4,  3);
+  poke64(shs + ELF64_SHDR_OFF_FLAGS, 0);
+  poke64(shs + ELF64_SHDR_OFF_ADDR, 0);
+  poke64(shs + ELF64_SHDR_OFF_OFFSET, strOff);
+  poke64(shs + ELF64_SHDR_OFF_SIZE, shstrSize);
+  poke64(shs + ELF64_SHDR_OFF_ALIGN, 1);
 
-  // [1] .meta_safe — SHT_NOTE=7, SHF_ALLOC|SHF_READONLY=6
-  var sh1: int64 := nbuf + shoff + 64;
-  poke32(sh1,      1);                        // sh_name = 1 (offset in .shstrtab)
-  poke32(sh1 + 4,  7);                        // sh_type = SHT_NOTE
-  poke64(sh1 + ELF64_SHDR_OFF_FLAGS,  2);                        // sh_flags = SHF_ALLOC (read-only; no SHF_WRITE/SHF_EXECINSTR)
-  poke64(sh1 + ELF64_SHDR_OFF_ADDR, 0);                        // sh_addr = 0 (not loaded)
-  poke64(sh1 + ELF64_SHDR_OFF_OFFSET, fileSize);                 // sh_offset = right after original ELF
-  poke64(sh1 + ELF64_SHDR_OFF_SIZE, payloadSize);              // sh_size
-  poke32(sh1 + 40, 0);                        // sh_link
-  poke32(sh1 + 44, 0);                        // sh_info
-  poke64(sh1 + ELF64_SHDR_OFF_ALIGN, 4);                        // sh_addralign
-  poke64(sh1 + ELF64_SHDR_OFF_ENTSIZE, 0);                        // sh_entsize
-
-  // [2] .shstrtab — SHT_STRTAB=3
-  var sh2: int64 := nbuf + shoff + 128;
-  poke32(sh2,      12);                       // sh_name = 12 (offset of ".shstrtab" in .shstrtab)
-  poke32(sh2 + 4,  3);                        // sh_type = SHT_STRTAB
-  poke64(sh2 + ELF64_SHDR_OFF_FLAGS,  0);                        // sh_flags
-  poke64(sh2 + ELF64_SHDR_OFF_ADDR, 0);                        // sh_addr
-  poke64(sh2 + ELF64_SHDR_OFF_OFFSET, fileSize + payloadSize);   // sh_offset
-  poke64(sh2 + ELF64_SHDR_OFF_SIZE, shstrSize);                // sh_size
-  poke32(sh2 + 40, 0);                        // sh_link
-  poke32(sh2 + 44, 0);                        // sh_info
-  poke64(sh2 + ELF64_SHDR_OFF_ALIGN, 1);                        // sh_addralign
-  poke64(sh2 + ELF64_SHDR_OFF_ENTSIZE, 0);                        // sh_entsize
+  // .meta_safe — SHT_NOTE=7, SHF_ALLOC (read-only; sh_addr 0, nicht geladen)
+  var sh1: int64 := nbuf + shoff + msNdx * 64;
+  poke32(sh1,      nameMs);
+  poke32(sh1 + 4,  7);
+  poke64(sh1 + ELF64_SHDR_OFF_FLAGS, 2);
+  poke64(sh1 + ELF64_SHDR_OFF_ADDR, 0);
+  poke64(sh1 + ELF64_SHDR_OFF_OFFSET, fileSize);
+  poke64(sh1 + ELF64_SHDR_OFF_SIZE, payloadSize);
+  poke32(sh1 + 40, 0);
+  poke32(sh1 + 44, 0);
+  poke64(sh1 + ELF64_SHDR_OFF_ALIGN, 4);
+  poke64(sh1 + ELF64_SHDR_OFF_ENTSIZE, 0);
 
   // WP-32: write in-place on the same fd (no second open — TOCTOU eliminated)
   lseek(fd, 0, 0);
-  write(fd, nbuf as pchar, newSize);
+  if (write(fd, nbuf as pchar, newSize) != newSize) {
+    EPrintStrLn("error: --meta-safe: Erzeugnis unvollstaendig geschrieben"c);
+    close(fd); exit(EMIT_EX_IOERR);
+  }
   close(fd);
 
   free(buf, fileSize + 4096);
@@ -2365,6 +2393,17 @@ pub type CompilerConfig = class {
       _irNoetig := false;   // Diagnose erledigt — erzeugt wird auf dem Schnellweg
     }
 
+    // #2144: --meta-safe gibt es nur hinter WriteELF (x86-64-Programm). Auf
+    // jedem anderen Ziel und mit --emit=obj wurde der Schalter bis 1.2.16A
+    // still verworfen — das Erzeugnis hatte keine .meta_safe, rc 0. Fuer
+    // --shared weist der Schnellweg ihn schon ab (#2124): eine .so hat keine
+    // feste Ladeadresse, code_start_va im Kopf waere eine erfundene Zahl.
+    if self.metaSafe && (!_x86Weg || self.emitObj) && !_x86So {
+      EPrintStrLn("error: --meta-safe gibt es nur fuer ein x86-64-Programm (ELF), nicht fuer dieses Ziel oder --emit=obj (#2144)."c);
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+
     if _x86Weg && !_irNoetig {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.out"c; }
@@ -2491,7 +2530,7 @@ pub type CompilerConfig = class {
       }
       // WP-3.2: --meta-safe: append .meta_safe section with CRC32 page hashes
       if self.metaSafe && !self.emitObj {
-        ms_appendMetaSafe(outPath, 176, cg.codeLen, cg.dataLen);
+        ms_appendMetaSafe(outPath, cg.codeFileOff, cg.codeStartVa, cg.codeLen, cg.dataLen);
       }
       self._passEnd("codegen-x86_64"c, _t5x);
       return self.exitCode;
