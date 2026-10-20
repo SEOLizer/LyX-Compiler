@@ -693,6 +693,90 @@ fn _irLitLen(sval: int64, slen: int64): int64 {
   return fallback;
 }
 
+// #2139: Gleitkomma-Faltung fuer Modulkonstanten auf dem IR-Weg. Dieselbe
+// Rechnung wie cg_bitsAlsF64/cg_f64AlsBits/cg_faltF64 in codegen_x86.lyx
+// (#1853) — die beiden muessen uebereinstimmen. Freie Funktionen, keine
+// Methoden: sie brauchen kein self, und die Methodenzahl von IRLower bleibt
+// unberuehrt.
+//
+// Bits <-> f64: der Compiler traegt Gleitkommakonstanten als IEEE-Bitmuster
+// in einem int64; zum RECHNEN muessen sie kurz wieder Zahlen sein. `as f64`
+// wuerde den Wert umwandeln statt die Bits umzudeuten.
+fn _irBitsAlsF64(bits: int64): f64 {
+  var p: int64 := alloc(8);
+  poke64(p, bits);
+  var v: f64 := peekf64(p);
+  free(p, 8);
+  return v;
+}
+
+fn _irF64AlsBits(v: f64): int64 {
+  var p: int64 := alloc(8);
+  pokef64(p, v);
+  var b: int64 := peek64(p);
+  free(p, 8);
+  return b;
+}
+
+// Ein Rechenschritt zwischen zwei Gleitkommakonstanten; Ergebnis als Bits.
+// Nur + - * / — _f64Faltbar laesst nichts anderes durch. Division durch 0
+// wird NICHT abgefangen: fuer Gleitkomma liefert sie inf/NaN (wie x86).
+// Ein anderer Operator hier ist ein Widerspruch zu _f64Faltbar: laut.
+fn _irFaltF64(bop: int64, lb: int64, rb: int64): int64 {
+  var a: f64 := _irBitsAlsF64(lb);
+  var b: f64 := _irBitsAlsF64(rb);
+  if (bop == 70) { return _irF64AlsBits(a + b); }   // TK_PLUS
+  if (bop == 71) { return _irF64AlsBits(a - b); }   // TK_MINUS
+  if (bop == 72) { return _irF64AlsBits(a * b); }   // TK_STAR
+  if (bop == 73) { return _irF64AlsBits(a / b); }   // TK_SLASH
+  EPrintStr("lyxc: interner Fehler (#2139): Operator (Token "c);
+  EPrintInt(bop);
+  EPrintStrLn(") in der Gleitkomma-Faltung, den _f64Faltbar nicht zulaesst."c);
+  exit(1);
+  return 0;
+}
+
+// #2139: schmale Ganzzahltypen. Dieselbe Zuordnung wie cg_narrowKindOf in
+// codegen_x86.lyx (#1151) — die beiden muessen uebereinstimmen:
+//   1 int8/i8, 2 uint8/u8, 3 int16/i16, 4 uint16/u16, 5 int32/i32,
+//   6 uint32/u32, 0 kein schmaler Typ.
+fn _irSchmalArt(tp: pchar, tl: int64): int64 {
+  if (tl <= 0) { return 0; }
+  if (_irNameGleich(tp, tl, "i8"c, 2) != 0 || _irNameGleich(tp, tl, "int8"c, 4) != 0)     { return 1; }
+  if (_irNameGleich(tp, tl, "u8"c, 2) != 0 || _irNameGleich(tp, tl, "uint8"c, 5) != 0)    { return 2; }
+  if (_irNameGleich(tp, tl, "i16"c, 3) != 0 || _irNameGleich(tp, tl, "int16"c, 5) != 0)   { return 3; }
+  if (_irNameGleich(tp, tl, "u16"c, 3) != 0 || _irNameGleich(tp, tl, "uint16"c, 6) != 0)  { return 4; }
+  if (_irNameGleich(tp, tl, "i32"c, 3) != 0 || _irNameGleich(tp, tl, "int32"c, 5) != 0)   { return 5; }
+  if (_irNameGleich(tp, tl, "u32"c, 3) != 0 || _irNameGleich(tp, tl, "uint32"c, 6) != 0)  { return 6; }
+  return 0;
+}
+
+// Maske der Breite (1/2: 8 Bit, 3/4: 16 Bit, 5/6: 32 Bit).
+fn _irSchmalMaske(art: int64): int64 {
+  if (art == 1 || art == 2) { return 255; }
+  if (art == 3 || art == 4) { return 65535; }
+  return 4294967295;
+}
+
+// Vorzeichenbit der Breite — nur fuer die vorzeichenbehafteten Arten.
+fn _irSchmalVorzeichen(art: int64): int64 {
+  if (art == 1) { return 128; }
+  if (art == 3) { return 32768; }
+  return 2147483648;
+}
+
+// Dieselbe Kuerzung zur Uebersetzungszeit, fuer Startwerte, die ohne Code in
+// den Datenbereich gehen. Wie cg_narrowConst (x86): die beiden muessen
+// uebereinstimmen. Gerechnet als ((v & maske) ^ vz) - vz — dieselbe Folge,
+// die _schmalKuerzen zur Laufzeit erzeugt.
+fn _irSchmalKonst(v: int64, art: int64): int64 {
+  if (art == 0) { return v; }
+  var m: int64 := v & _irSchmalMaske(art);
+  if (art == 2 || art == 4 || art == 6) { return m; }
+  var vz: int64 := _irSchmalVorzeichen(art);
+  return (m ^ vz) - vz;
+}
+
 pub type IRLower = class {
   // Global function count workaround (since IRModule access is broken across S1/S2)
   // Initialized in init() method
@@ -2047,10 +2131,165 @@ pub type IRLower = class {
       return self._isF64Expr(self.nodeC1(expr));
     }
     if k == NK_UNOP { return self._isF64Expr(self.nodeC0(expr)); }
-    if k == NK_CALL { return self.seq(self.nodeSVal(expr), self.nodeSLen(expr), "sqrt", 4); }
+    // #2139: Feld und Aufrufergebnis. Bis 1.2.16A stand hier nur `sqrt` beim
+    // Namen; `b.v + b.v` mit `v: f64` rechnete ganzzahlig auf den IEEE-Bits
+    // (9223372036854775807), ebenso `f() + f()`, `k.Get() + 1.0` ging nur,
+    // weil der RECHTE Operand ein Literal war. Die Herkuenfte zaehlt
+    // _f64Herkunft auf.
+    if k == NK_CALL || k == NK_FIELD { return self._f64Herkunft(expr); }
     // WP-SIMD: Element einer parallel-Array<f32> wird als f64 geladen (cvtss2sd) → f64-Ausdruck.
     if k == NK_INDEX { return self._isSimdExpr(self.nodeC0(expr)); }
     return 0;
+  }
+
+  // #2139: Ist das Ergebnis eines Aufrufs oder Feldzugriffs ein f64?
+  //
+  // Eine AUFZAEHLUNG der Herkuenfte — dieselben, die die Typaufloesung kennt,
+  // und in derselben Reihenfolge (vgl. cg_isF64Expr auf x86, CGN_CALL und
+  // CGN_FIELD; die beiden muessen uebereinstimmen):
+  //   1. _exprTypeNode — Feld (auch geerbt, auch `a.b.c`, auch einer
+  //      generischen Instanz `Box<f64>`, deren Felder der Parser ersetzt hat,
+  //      #2134), Methode der eigenen Unit, freie Funktion der eigenen Unit,
+  //      generischer Aufruf `f<f64>(…)` (_genRetTyp).
+  //   2. _exprKlasse — Rueckgabetyp einer IMPORTIERTEN Funktion oder Methode
+  //      (Index ueber alle Module, Vererbung eingeschlossen, #2060).
+  //   3. Feld einer IMPORTIERTEN Klasse — ueber die Typ-Registry im Kontext
+  //      der deklarierenden Unit (wie _tregFieldIsMethodG).
+  //   4. Aufruf ueber einen Funktionszeiger (Local, Parameter, Erfassung,
+  //      Modulvariable — _localTypeNode): Rueckgabetyp des `fn(...)`-Typs,
+  //      auch ueber einen Alias `type F = fn(...)`.
+  //   5. Die eingebauten Gleitkommaquellen — nur, wenn keine
+  //      Benutzerfunktion den Namen traegt (dann gilt 1.).
+  // Was keiner dieser Wege kennt, ist hier "nicht f64" — wie bisher.
+  fn _f64Herkunft(nd: int64): int64 {
+    var k: int64 := self.nodeKind(nd);
+    var tn: int64 := self._exprTypeNode(nd);
+    if tn >= 0 {
+      if self.nodeKind(tn) != NK_TYPE_NAME { return 0; }
+      return self.seq(self.nodeSVal(tn), self.nodeSLen(tn), "f64", 3);
+    }
+    if k == NK_FIELD {
+      var fp: pchar := self.nodeSVal(nd);
+      var fl: int64 := self.nodeSLen(nd);
+      if self._exprKlasse(self.nodeC0(nd)) == 0 { return 0; }
+      var g: int64 := self._tregFind(self._ekP, self._ekL);
+      if g < 0 { return 0; }
+      var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+      self.src := peek64(self._tregSrc + g * 8) as pchar;
+      self.nodes := peek64(self._tregNodes + g * 8);
+      self.nodeCount := peek64(self._tregCnt + g * 8);
+      var r: int64 := 0;
+      var ft: int64 := self._fieldTypeNodeIn(peek64(self._tregIdx + g * 8), fp, fl);
+      if ft >= 0 && self.nodeKind(ft) == NK_TYPE_NAME {
+        r := self.seq(self.nodeSVal(ft), self.nodeSLen(ft), "f64", 3);
+      }
+      self.src := sS; self.nodes := sN; self.nodeCount := sC;
+      return r;
+    }
+    if k != NK_CALL { return 0; }
+    if self._exprKlasse(nd) != 0 { return self.seq(self._ekP, self._ekL, "f64", 3); }
+    var cp: pchar := self.nodeSVal(nd);
+    var cl: int64 := self.nodeSLen(nd);
+    if self.nodeIVal(nd) == 0 {
+      var pt: int64 := self._localTypeNode(cp, cl);
+      if pt >= 0 {
+        if self.nodeKind(pt) == NK_TYPE_NAME && self.nodeSLen(pt) > 0 {
+          var ad: int64 := self._findTypeDecl(self.nodeSVal(pt), self.nodeSLen(pt));
+          if ad >= 0 && (self.nodeIVal(ad) & 2) != 0 { pt := self.nodeC0(ad); }
+        }
+        if pt >= 0 && self.nodeKind(pt) == NK_FN_PTR {
+          var rt: int64 := self.nodeC1(pt);
+          if rt >= 0 && self.nodeKind(rt) == NK_TYPE_NAME {
+            return self.seq(self.nodeSVal(rt), self.nodeSLen(rt), "f64", 3);
+          }
+          return 0;
+        }
+      }
+      // Die eingebauten Quellen — dieselben, die lowerCall als Gleitkomma
+      // erzeugt (sqrt, fAdd…fDiv, fNeg, fAbs, peekf64). fEq/fLt/… und
+      // fToInt liefern Ganzzahlen.
+      if self.seq(cp, cl, "sqrt", 4) || self.seq(cp, cl, "peekf64", 7) { return 1; }
+      if self.seq(cp, cl, "fAdd", 4) || self.seq(cp, cl, "fSub", 4) { return 1; }
+      if self.seq(cp, cl, "fMul", 4) || self.seq(cp, cl, "fDiv", 4) { return 1; }
+      if self.seq(cp, cl, "fNeg", 4) || self.seq(cp, cl, "fAbs", 4) { return 1; }
+    }
+    return 0;
+  }
+
+  // #2139: Laesst sich der Anfangswert einer f64-Modulkonstanten/-variablen
+  // zur Uebersetzungszeit falten? Literal, f64-Konstante der eigenen Unit,
+  // unaeres Minus, + - * /. Dieselbe Abgrenzung wie cg_istF64Konstante +
+  // cg_evalConExpr auf x86 (#1853) — die beiden muessen uebereinstimmen.
+  // Alles andere (Cast, Aufruf, importierte Konstante, Modulvariable) ist
+  // NICHT faltbar und bekommt seinen Wert zur Laufzeit (#2123) — bis 1.2.16A
+  // blieb es still 0.0.
+  fn _f64Faltbar(nd: int64): int64 {
+    if nd < 0 { return 0; }
+    var k: int64 := self.nodeKind(nd);
+    if k == NK_LIT_FLOAT { return 1; }
+    if k == NK_IDENT {
+      var cd: int64 := self._conIdentDecl(nd);
+      if cd < 0 { return 0; }
+      // Nur eine GLEITKOMMA-Konstante: eine ganzzahlige traegt eine Zahl,
+      // keine Bits, und gehoert nicht in diese Rechnung.
+      var ct: int64 := self.nodeC0(cd);
+      var istF: int64 := 0;
+      if ct >= 0 && self.nodeKind(ct) == NK_TYPE_NAME {
+        if self.seq(self.nodeSVal(ct), self.nodeSLen(ct), "f64", 3) { istF := 1; }
+      }
+      if ct < 0 && self.nodeKind(self.nodeC1(cd)) == NK_LIT_FLOAT { istF := 1; }
+      if istF == 0 { return 0; }
+      return self._f64Faltbar(self.nodeC1(cd));
+    }
+    if k == NK_UNOP {
+      if self.nodeIVal(nd) != 71 { return 0; }
+      return self._f64Faltbar(self.nodeC0(nd));
+    }
+    if k == NK_BINOP {
+      var bo: int64 := self.nodeIVal(nd);
+      if bo < 70 || bo > 73 { return 0; }
+      if self._f64Faltbar(self.nodeC0(nd)) == 0 { return 0; }
+      return self._f64Faltbar(self.nodeC1(nd));
+    }
+    return 0;
+  }
+
+  // #2139: Der gefaltete Wert als IEEE-Bits. Nur nach _f64Faltbar(nd) == 1.
+  fn _f64Wert(nd: int64): int64 {
+    var k: int64 := self.nodeKind(nd);
+    if k == NK_LIT_FLOAT { return self._parseFloatBits(self.nodeSVal(nd), self.nodeSLen(nd)); }
+    if k == NK_IDENT { return self._f64Wert(self.nodeC1(self._conIdentDecl(nd))); }
+    // Vorzeichenbit kippen statt `0 - bits` (#1803/#2129).
+    if k == NK_UNOP { return self._f64Wert(self.nodeC0(nd)) ^ (1 << 63); }
+    return _irFaltF64(self.nodeIVal(nd), self._f64Wert(self.nodeC0(nd)), self._f64Wert(self.nodeC1(nd)));
+  }
+
+  // #2139: Wert `t` auf die Breite des Typs `tn` kuerzen — vorzeichenbehaftet
+  // bei intN, vorzeichenlos bei uintN; sonst `t` unveraendert. Dieselbe
+  // Wirkung wie cg_emitNarrowRax (x86, #1151) — die beiden muessen
+  // uebereinstimmen. Bis 1.2.16A kuerzte der IR-Weg NIRGENDS: kein Store in
+  // ein Local, keine Modulvariable, kein `as int8`; `var e8: int8 :=
+  // f() * 60` hielt 300 statt 44.
+  //
+  // Erzeugt wird nur AND/XOR/SUB — ((t & maske) ^ vz) - vz —, also keine
+  // Schiebung, deren Vorzeichenverhalten je Backend verschieden sein koennte.
+  fn _schmalKuerzen(t: int64, tn: int64): int64 {
+    if t < 0 || tn < 0 { return t; }
+    if self.nodeKind(tn) != NK_TYPE_NAME { return t; }
+    var art: int64 := _irSchmalArt(self.nodeSVal(tn), self.nodeSLen(tn));
+    if art == 0 { return t; }
+    var mT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, mT, -1, -1, _irSchmalMaske(art));
+    var r: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_AND, r, t, mT, 0);
+    if art == 2 || art == 4 || art == 6 { return r; }
+    var vT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, vT, -1, -1, _irSchmalVorzeichen(art));
+    var x: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_XOR, x, r, vT, 0);
+    var s: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_SUB, s, x, vT, 0);
+    return s;
   }
 
   // WP-VOLATILE: ist Slot in der volatile-Liste der aktuellen Funktion?
@@ -6609,8 +6848,15 @@ pub type IRLower = class {
     }
     // WP-XMOD-OOP: IMPORTIERTE Klasse (decl<0) → globales Registry (Offset im Definitionsmodul).
     var tn: int64 := self._baseTypeNode(baseNode);
-    if tn < 0 { return 0 - 1; }
-    var g: int64 := self._tregFind(self.nodeSVal(tn), self.nodeSLen(tn));
+    var g: int64 := 0 - 1;
+    if tn >= 0 { g := self._tregFind(self.nodeSVal(tn), self.nodeSLen(tn)); }
+    else if self._exprKlasse(baseNode) != 0 {
+      // #2139: die Basis ist das Ergebnis einer IMPORTIERTEN Funktion oder
+      // Methode (`neu(1.5).x`) — _exprTypeNode kennt nur Deklarationen der
+      // eigenen Unit, _exprKlasse den Index ueber alle (#2060). Dieselbe
+      // Aufzaehlung wie in _f64Herkunft.
+      g := self._tregFind(self._ekP, self._ekL);
+    }
     if g < 0 { return 0 - 1; }
     var offg: int64 := self._tregFieldOffG(g, fp, fl);
     if offg >= 0 { if self._tregHasVmtG(g) != 0 { offg := offg + 8; } }
@@ -7109,12 +7355,15 @@ pub type IRLower = class {
       }
       return src;   // f64 → f64
     }
+    // #2139: `x as int8` kuerzt auf die Breite — wie cg_emitNarrowRax im
+    // x86-Cast (#1151). Bis 1.2.16A reichte der IR-Weg den Wert unveraendert
+    // durch: `300 as int8` blieb 300.
     if srcF64 != 0 {
       var d2: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_FTOI, d2, src, -1, 0);     // f64 → int (Trunkierung)
-      return d2;
+      return self._schmalKuerzen(d2, self._genSubst(tt));
     }
-    return src;   // int → int / ptr-cast: gleiche Repräsentation, pass-through
+    return self._schmalKuerzen(src, self._genSubst(tt));   // int → int / ptr-cast
   }
   
   // ------------------------------------------------------------------
@@ -7462,6 +7711,9 @@ pub type IRLower = class {
       if vdInit >= 0 {
         if self.clVdSatz != 0 { self.clSatzKontext := 1; }
         var vdTemp: int64 := self.lowerExpr(vdInit);
+        // #2139: auf die deklarierte Breite kuerzen, bevor der Wert im
+        // 64-Bit-Slot landet (x86: cg_emitNarrowRax, #1151).
+        vdTemp := self._schmalKuerzen(vdTemp, self._genSubst(self.nodeC0(stmt)));
         self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdTemp, -1, 0);
       } else {
         // ARM64-FIX: `var a: [N]T` ohne Init → Heap-Storage allozieren, vdSlot = Pointer
@@ -8128,6 +8380,11 @@ pub type IRLower = class {
         retTemp := self._clAlsSatz(retVal);
       } else {
         retTemp := self.lowerExpr(retVal);
+        // #2139: Rueckgabe an einen schmalen Typ kuerzen (x86:
+        // curFnRetNarrow, #1151).
+        if self.curFunc >= 0 && self.nodeKind(self.curFunc) == NK_FUNC_DECL {
+          retTemp := self._schmalKuerzen(retTemp, self._genSubst(self.nodeC1(self.curFunc)));
+        }
       }
       self.irAddInstrDirect(IRO_STORE_LOCAL, self.retValTemp, retTemp, -1, 0);
     }
@@ -8172,6 +8429,10 @@ pub type IRLower = class {
         if self.curFunc >= 0 {
           var idName: pchar := self.nodeSVal(target);
           var idLen:  int64 := self.nodeSLen(target);
+          // #2139: Zuweisung an eine schmale Variable — Local, Parameter,
+          // Erfassung oder Modulvariable; _localTypeNode kennt alle vier
+          // (wie cg_narrowKindOfVar auf x86, #1151).
+          valTemp := self._schmalKuerzen(valTemp, self._localTypeNode(idName, idLen));
           var idPtrL: int64 := (idName) as int64;
           var slot:   int64 := 0 - 1;
           var lnI:    int64 := self.localNameCnt - 1;
@@ -8559,6 +8820,28 @@ pub type IRLower = class {
     self.funcExitLabel := self.genLabel();
 
     self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
+
+    // #2139: schmale Parameter im eigenen Slot kuerzen — wie
+    // cg_narrowLocalSlot auf x86 (#1151). Der Aufrufer reicht 64 Bit; ohne
+    // das hielt `fn f(x: int8)` mit f(300) den Wert 300. Slotrechnung wie
+    // in lowerAssign und _findLocalSlot (IR_BARG_SLOTS + pidx + self).
+    var npP: int64 := self.nodeC0(funcNode);
+    var npI: int64 := 0;
+    while npP >= 0 {
+      if self.nodeKind(npP) == NK_PARAM {
+        var npTy: int64 := self._genSubst(self.nodeC0(npP));
+        if npTy >= 0 && self.nodeKind(npTy) == NK_TYPE_NAME
+           && _irSchmalArt(self.nodeSVal(npTy), self.nodeSLen(npTy)) != 0 {
+          var npSl: int64 := IR_BARG_SLOTS + npI + self.methodParamBase;
+          var npT: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_LOAD_LOCAL, npT, npSl, -1, 0);
+          var npK: int64 := self._schmalKuerzen(npT, npTy);
+          self.irAddInstrDirect(IRO_STORE_LOCAL, npSl, npK, -1, 0);
+        }
+        npI += 1;
+      }
+      npP := self.nodeNext(npP);
+    }
 
     // #2123: `main` des Hauptmoduls ruft als Erstes die Anfangswerte aller
     // Units (__lyx_modinit). Nur dort: eine gleichnamige Funktion eines
@@ -8964,16 +9247,22 @@ pub type IRLower = class {
         if ggInitNode >= 0 {
           if self._constFaltbar(ggInitNode) != 0 {
             ggInit := self._constWert(ggInitNode);
+            // #2139: auf die deklarierte Breite kuerzen, wie cg_narrowConst
+            // beim x86-Startwert (#1151). Nur bei `var` — eine `con` wird
+            // beim Lesen gefaltet (_constWert), wie auf x86.
+            if ggKind == NK_VAR_DECL {
+              var ggSTy: int64 := self.nodeC0(ggCur);
+              if ggSTy >= 0 && self.nodeKind(ggSTy) == NK_TYPE_NAME {
+                ggInit := _irSchmalKonst(ggInit, _irSchmalArt(self.nodeSVal(ggSTy), self.nodeSLen(ggSTy)));
+              }
+            }
           } else {
             // Gleitkomma gehoert NICHT in diesen Falter — er rechnet
             // ganzzahlig, und auf ein IEEE-Bitmuster losgelassen kaeme Unsinn
             // heraus (dieselbe Sperre wie im x86-Pfad, #1499). Eine
             // f64-Konstante ist also nicht „nicht faltbar", sondern hier gar
-            // nicht zustaendig: es bleibt bei 0, wie bisher.
-            //
-            // Dass eine f64-Modulkonstante auf den IR-Backends damit 0 ist,
-            // steht als eigener Punkt in #1801 — es ist ein Bestandsdefekt,
-            // kein Ergebnis dieser Aenderung.
+            // nicht zustaendig — die Gleitkomma-Faltung steht darunter
+            // (#1801 Literal, #2139 Ausdruck).
             var ggIstF64: int64 := 0;
             if self.nodeKind(ggInitNode) == NK_LIT_FLOAT { ggIstF64 := 1; }
             var ggTy: int64 := self.nodeC0(ggCur);
@@ -8989,19 +9278,14 @@ pub type IRLower = class {
             // kam als 0.0 an. In std/math.lyx sind MATH_LN2 und MATH_LN10 so
             // vereinbart; `fDiv(x, MATH_LN2)` war auf diesen Zielen damit eine
             // Division durch null, ohne dass beim Uebersetzen etwas auffiel.
+            // #2139: nicht nur das Literal (auch mit unaerem Minus), sondern
+            // jeder faltbare Gleitkomma-Ausdruck: `0.0 - 1.5`, `2.0 * 3.5`,
+            // `A + B` mit f64-Konstanten. Bis 1.2.16A blieb das hier still 0.0
+            // (x86 faltet mit cg_faltF64; hier dieselbe Rechnung,
+            // _irFaltF64). Was sich nicht falten laesst, bekommt seinen Wert
+            // zur Laufzeit (_modVarLaufzeit, #2123) — auch bei `con`.
             if ggIstF64 != 0 {
-              var ggFN: int64 := ggInitNode;
-              var ggNeg: int64 := 0;
-              // `con X: f64 := -2.5` ist ein unaeres Minus um das Literal.
-              if self.nodeKind(ggFN) == NK_UNOP {
-                if self.nodeIVal(ggFN) == 71 { ggNeg := 1; ggFN := self.nodeC0(ggFN); }
-              }
-              if self.nodeKind(ggFN) == NK_LIT_FLOAT {
-                ggInit := self._parseFloatBits(self.nodeSVal(ggFN), self.nodeSLen(ggFN));
-                // Vorzeichenbit setzen statt zu rechnen — die Bits sind IEEE,
-                // keine Zahl, die man negieren duerfte.
-                if ggNeg != 0 { ggInit := ggInit ^ (1 << 63); }
-              }
+              if self._f64Faltbar(ggInitNode) != 0 { ggInit := self._f64Wert(ggInitNode); }
             }
             // #2019: `con S: pchar := "…"` — eine Konstante mit ZEICHENKETTE
             // als Anfangswert. Der Falter rechnet ganzzahlig; eine
@@ -9530,13 +9814,14 @@ pub type IRLower = class {
   // ist dieselbe Rechnung wie fuer ein Local in lowerStmt (NK_VAR_DECL ohne
   // Anfangswert, #1835) — die beiden muessen uebereinstimmen.
   fn _modVarLaufzeit(d: int64): int64 {
-    if self.nodeKind(d) != NK_VAR_DECL { return 0; }
+    var dk: int64 := self.nodeKind(d);
+    if dk != NK_VAR_DECL && dk != NK_CON_DECL { return 0; }
     var ini: int64 := self.nodeC1(d);
     var ty: int64 := self.nodeC0(d);
     if ini >= 0 {
       if self._constFaltbar(ini) != 0 { return 0; }
-      // Der f64-Zweig des Vorpasses (#1801): Literal, auch mit unaerem
-      // Minus, und nur, wenn der Wert oder der Typ Gleitkomma ist.
+      // Der f64-Zweig des Vorpasses (#1801, #2139): alles, was _f64Faltbar
+      // faltet, und nur, wenn der Wert oder der Typ Gleitkomma ist.
       var fIst: int64 := 0;
       if self.nodeKind(ini) == NK_LIT_FLOAT { fIst := 1; }
       if ty >= 0 {
@@ -9546,14 +9831,16 @@ pub type IRLower = class {
         }
       }
       if fIst != 0 {
-        var fN: int64 := ini;
-        if self.nodeKind(fN) == NK_UNOP {
-          if self.nodeIVal(fN) == 71 { fN := self.nodeC0(fN); }
-        }
-        if self.nodeKind(fN) == NK_LIT_FLOAT { return 0; }
+        if self._f64Faltbar(ini) != 0 { return 0; }
       }
+      // #2139: eine `con` kommt nur als GLEITKOMMA hierher — jede andere
+      // nicht faltbare hat der Vorpass laut abgewiesen (#1798), eine
+      // Zeichenkette legt er als Adresse ab (#2019). Eine f64-Konstante wie
+      // `con E: f64 := Wurzel2()` blieb bis 1.2.16A still 0.0.
+      if dk == NK_CON_DECL && fIst == 0 { return 0; }
       return 1;
     }
+    if dk == NK_CON_DECL { return 0; }
     if ty < 0 { return 0; }
     if self.nodeKind(ty) == NK_TYPE_ARRAY_FIXED {
       var szN: int64 := self.nodeC1(ty);
@@ -9645,6 +9932,9 @@ pub type IRLower = class {
         var wert: int64 := 0 - 1;
         if art == 1 {
           wert := self.lowerExpr(self.nodeC1(d));
+          // #2139: auf die deklarierte Breite — `var e8: int8 := f() * 60`
+          // hielt 300 statt 44. Dieselbe Kuerzung wie beim Local.
+          wert := self._schmalKuerzen(wert, self.nodeC0(d));
         } else {
           var ty: int64 := self.nodeC0(d);
           var gr: int64 := 0;

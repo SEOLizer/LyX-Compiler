@@ -591,6 +591,7 @@ test: lyxc
 	@bash tests/riscv_zusicherung_test.sh
 	@bash tests/adresse_von_test.sh
 	@bash tests/ir_f64_negativ_test.sh
+	@bash tests/ir_f64_reste_test.sh
 	@bash tests/ir_string_escape_test.sh
 	@bash tests/index_pchar_test.sh
 	@bash tests/sema_reste_2137_test.sh
