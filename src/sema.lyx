@@ -2561,6 +2561,10 @@ pub type Sema = class {
     // fehlenden zwei kamen als Stapelinhalt an. Bei `pub fn` griff die
     // Mehrdeutigkeitspruefung, bei privaten fiel alles durch.
     self._checkDuplicateFuncs(head);
+    // #2151: ebenso doppelte Felder/Methoden in den Typen einer importierten
+    // Unit. Bis 1.2.16C nur im Wurzelmodul (#1668) — eine zweite Methode
+    // gleichen Namens in einer stdlib-Klasse war toter Text, die erste galt.
+    self._checkDuplicateMembers(head);
 
     // #1028: exportierte Namen gegen die frueher importierten pruefen. Muss vor
     // dem nodeIdx-Fixup laufen — der macht das pub-Flag unlesbar.
@@ -5757,13 +5761,20 @@ pub type Sema = class {
       // meldet; deshalb hier abweisen statt etwas Plausibles zu tun.
       self._checkMapKeyType(typeNi);
       self._checkNestedArrayType(typeNi, ni);   // #1230
+      self._pruefeTypargumente(typeNi, ni);      // #2151
       self._pruefeKlasseOhneNew(typeNi, initNi, ni);   // #1519
       self._logReason("var-decl", ni, tid);
       if (initNi >= 0) {
         self._checkExpr(initNi);
         // #1135: der Wert muss zum deklarierten Typ passen.
         var initT: int64 := self._inferExprType(initNi);
-        if (self._typeMismatch(tid, initT, initNi) != 0) {
+        // #2151: eine void-Funktion liefert keinen Wert. Bis 1.2.16C ging
+        // `var x: int64 := nichts();` ohne Meldung durch, x hielt den Inhalt
+        // eines Registers. _typeMismatch beurteilt void nicht.
+        if (self._istVoidAufruf(initNi) != 0) {
+          self._errorNode("Initialisierung: der Ausdruck liefert keinen Wert (void) (#2151)", initNi);
+        }
+        else if (self._typeMismatch(tid, initT, initNi) != 0) {
           self._errType("Initialisierung"c, ni, tid, initT);
         }
         // #1883/#1886: Die Typklasse allein trennt benannte Typen NICHT —
@@ -5866,7 +5877,10 @@ pub type Sema = class {
           if (tk == SYM_VAR || tk == SYM_PARAM) {
             var wantT: int64 := self.SymTypeId(tsi);
             var gotT:  int64 := self._inferExprType(self.sn_c1(ni));
-            if (self._typeMismatch(wantT, gotT, self.sn_c1(ni)) != 0) {
+            if (self._istVoidAufruf(self.sn_c1(ni)) != 0) {
+              self._errorNode("Zuweisung: der Ausdruck liefert keinen Wert (void) (#2151)", self.sn_c1(ni));   // #2151
+            }
+            else if (self._typeMismatch(wantT, gotT, self.sn_c1(ni)) != 0) {
               self._errType("Zuweisung"c, ni, wantT, gotT);
             }
             // #1883/#1886: dieselbe Identitaetspruefung wie bei der
@@ -5901,7 +5915,12 @@ pub type Sema = class {
       // #1135: der zurueckgegebene Wert muss zum Rueckgabetyp passen.
       if (self.sn_c0(ni) >= 0 && self.curFnRetType != TY_UNKNOWN) {
         var retT: int64 := self._inferExprType(self.sn_c0(ni));
-        if (self._typeMismatch(self.curFnRetType, retT, self.sn_c0(ni)) != 0) {
+        // #2151: `return nichts();` in einer Funktion MIT Rueckgabewert. In
+        // einer void-Funktion bleibt es erlaubt (dort wird nichts geliefert).
+        if (self.curFnRetType != TY_VOID && self._istVoidAufruf(self.sn_c0(ni)) != 0) {
+          self._errorNode("Rueckgabe: der Ausdruck liefert keinen Wert (void) (#2151)", self.sn_c0(ni));
+        }
+        else if (self._typeMismatch(self.curFnRetType, retT, self.sn_c0(ni)) != 0) {
           self._errType("Rueckgabe"c, ni, self.curFnRetType, retT);
         }
       }
@@ -6792,6 +6811,126 @@ pub type Sema = class {
   }
 
   // #1009: Benennt dieser Typknoten einen aktiven Typparameter?
+  // #2151: Typargumente einer Instanz `Box<X, Y>` HIER pruefen, an der
+  // Stelle, die sie nennt. Gehoert der generische Typ zu einer anderen Unit,
+  // entsteht die Instanz in deren Tabelle (#2143) — ein unbekanntes X wurde
+  // bis 1.2.16C erst dort gemeldet, als "unknown return type 'X'" an einer
+  // Zeile der deklarierenden Unit, die der Schreiber nie angefasst hat.
+  // Bekannt ist: ein eingebauter Typ, ein Typ im Namensraum (Struct, Klasse,
+  // Enum, Alias), ein Typparameter der umgebenden Deklaration und der Name
+  // eines generischen Typs (gefolgt von `<`).
+  fn _pruefeTypargumente(typeNi: int64, ni: int64) {
+    if (typeNi < 0) { return; }
+    if (self.sn_kind(typeNi) != SNK_TYPE_NAME) { return; }
+    var nm: pchar := self.sn_sVal(typeNi);
+    var nl: int64 := self.sn_sLen(typeNi);
+    var i: int64 := 0;
+    while (i < nl && (StrCharAt(nm, i) & 255) != 60) { i += 1; }   // '<'
+    if (i >= nl) { return; }
+    i += 1;
+    while (i < nl) {
+      var c: int64 := StrCharAt(nm, i) & 255;
+      var istZ: int64 := 0;
+      if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) { istZ := 1; }
+      if (istZ == 0) { i += 1; continue; }
+      var a: int64 := i;
+      while (i < nl) {
+        var c2: int64 := StrCharAt(nm, i) & 255;
+        if ((c2 >= 65 && c2 <= 90) || (c2 >= 97 && c2 <= 122) || (c2 >= 48 && c2 <= 57) || c2 == 95) { i += 1; }
+        else { break; }
+      }
+      var al: int64 := i - a;
+      var ap: pchar := ((nm as int64) + a) as pchar;
+      var bekannt: int64 := 0;
+      if (i < nl && (StrCharAt(nm, i) & 255) == 60) { bekannt := 1; }   // generischer Typ
+      if (bekannt == 0 && self._typNameEingebaut(ap, al) != 0) { bekannt := 1; }
+      if (bekannt == 0) {
+        var si: int64 := self.Lookup(ap, al);
+        if (si >= 0) {
+          var sk: int64 := self.SymKind(si);
+          if (sk == SYM_TYPE || sk == SYM_STRUCT || sk == SYM_ENUM) { bekannt := 1; }
+        }
+      }
+      if (bekannt == 0) {
+        var t: int64 := 0;
+        while (t < self.tpCount) {
+          if (self._strNEq(peek64(self.tpNames + t * 8) as pchar, peek64(self.tpLens + t * 8), ap, al)) { bekannt := 1; }
+          t += 1;
+        }
+      }
+      if (bekannt == 0) {
+        self._errorNodeName("unbekannter Typ als Typargument (#2151)", ni, ap, al);
+        return;
+      }
+    }
+  }
+
+  // #2151: Ruft der Ausdruck eine Funktion, deren Deklaration AUSDRUECKLICH
+  // `: void` traegt? Nur dann ist "liefert keinen Wert" sicher. Der
+  // Typschluss (_inferExprType) liefert TY_VOID auch fuer Builtins und extern
+  // fn, deren Rueckgabe er nicht kennt (poll, getuid, crypt) und fuer
+  // Funktionsbezeichner — die erste Fassung hat damit 94 stdlib-Units
+  // abgewiesen. Gleichnamige Deklarationen einer anderen Unit zaehlen nicht
+  // (dieselbe Absicherung wie beim Rueckgabetyp eines Aufrufs).
+  fn _istVoidAufruf(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (self.sn_kind(ni) != SNK_CALL) { return 0; }
+    if (self.sn_iVal(ni) != 0) { return 0; }          // Methodenaufruf: nicht beurteilt
+    var fi: int64 := self.Lookup(self.sn_sVal(ni), self.sn_sLen(ni));
+    if (fi < 0) { return 0; }
+    if (self.SymKind(fi) != SYM_FUNC) { return 0; }
+    var fd: int64 := self.SymNodeIdx(fi);
+    if (fd < 0) { return 0; }
+    if (self.sn_kind(fd) != SNK_FUNC_DECL) { return 0; }
+    if (self._strNEq(self.sn_sVal(fd), self.sn_sLen(fd), self.sn_sVal(ni), self.sn_sLen(ni)) == 0) { return 0; }
+    var rt: int64 := self.sn_c1(fd);
+    if (rt < 0) { return 0; }
+    if (self.sn_kind(rt) != SNK_TYPE_NAME) { return 0; }
+    if (self._strNEq(self.sn_sVal(rt), self.sn_sLen(rt), "void"c, 4) != 0) { return 1; }
+    return 0;
+  }
+
+  // #2151: Steht die Pruefung in einer Instanz `Box<X>` (Klassenname mit `<`),
+  // stammt das unbekannte X aus der Unit, die die Instanz verlangt (#2143) —
+  // dort wird es auch an der Nennung gemeldet (_pruefeTypargumente). Der
+  // Hinweis erklaert, warum die Meldung in einer fremden Unit steht.
+  fn _hinweisFremdeInstanz() {
+    if (self.curClassNi < 0) { return; }
+    var cn: pchar := self.sn_sVal(self.curClassNi);
+    var cl: int64 := self.sn_sLen(self.curClassNi);
+    var i: int64 := 0;
+    while (i < cl) {
+      if ((StrCharAt(cn, i) & 255) == 60) {
+        EPrintStr("  Hinweis: in der Instanz '"c);
+        sys_write(2, cn as int64, cl);
+        EPrintStrLn("' — das Typargument nennt die Unit, die diese Instanz verlangt; dort steht die eigentliche Meldung (#2151)."c);
+        return;
+      }
+      i += 1;
+    }
+  }
+
+  // #2151: Eingebauter Typname — dieselbe Liste wie der Namensteil von
+  // ResolveType (die beiden muessen uebereinstimmen).
+  fn _typNameEingebaut(nm: pchar, nl: int64): int64 {
+    if (self._strNEq(nm, nl, "void", 4) || self._strNEq(nm, nl, "bool", 4)) { return 1; }
+    if (self._strNEq(nm, nl, "int64", 5) || self._strNEq(nm, nl, "int32", 5)) { return 1; }
+    if (self._strNEq(nm, nl, "int16", 5) || self._strNEq(nm, nl, "int8", 4)) { return 1; }
+    if (self._strNEq(nm, nl, "i64", 3) || self._strNEq(nm, nl, "i32", 3)) { return 1; }
+    if (self._strNEq(nm, nl, "i16", 3) || self._strNEq(nm, nl, "i8", 2)) { return 1; }
+    if (self._strNEq(nm, nl, "u64", 3) || self._strNEq(nm, nl, "u32", 3)) { return 1; }
+    if (self._strNEq(nm, nl, "u16", 3) || self._strNEq(nm, nl, "u8", 2)) { return 1; }
+    if (self._strNEq(nm, nl, "uint64", 6) || self._strNEq(nm, nl, "uint32", 6)) { return 1; }
+    if (self._strNEq(nm, nl, "uint16", 6) || self._strNEq(nm, nl, "uint8", 5)) { return 1; }
+    if (self._strNEq(nm, nl, "pchar", 5) || self._strNEq(nm, nl, "f64", 3)) { return 1; }
+    if (self._strNEq(nm, nl, "f32", 3) || self._strNEq(nm, nl, "char", 4)) { return 1; }
+    // Kein Typname, aber Teil einer Typschreibweise im Argument
+    // (`Box<fn(int64): int64>`, `Box<array>`).
+    if (self._strNEq(nm, nl, "fn", 2) || self._strNEq(nm, nl, "method", 6)) { return 1; }
+    if (self._strNEq(nm, nl, "array", 5)) { return 1; }
+    return 0;
+  }
+
   fn _isTypeParamRef(typeNi: int64): int64 {
     if (typeNi < 0) { return 0; }
     if (self.sn_kind(typeNi) != SNK_TYPE_NAME) { return 0; }
@@ -7151,6 +7290,7 @@ pub type Sema = class {
       var tid:    int64 := self.ResolveType(typeNi);
       if (tid == TY_UNKNOWN && self._isTypeParamRef(typeNi) == 0) {
         self._errorNode("unknown param type", param);
+        self._hinweisFremdeInstanz();   // #2151
       }
       self._logReason("param"c, param, tid);
       // #1528: `ref` unterdrueckt die Kopie beim Eintritt — kopiert werden aber
@@ -7178,6 +7318,7 @@ pub type Sema = class {
       var retTid: int64 := self.ResolveType(retNi);
       if (retTid == TY_UNKNOWN && self._isTypeParamRef(retNi) == 0) {
         self._errorNodeName("unknown return type", ni, self.sn_sVal(retNi), self.sn_sLen(retNi));
+        self._hinweisFremdeInstanz();   // #2151
       }
       self._logReason("return-type"c, ni, retTid);
     }
@@ -7780,27 +7921,10 @@ pub type Sema = class {
     return -1;
   }
 
-  // BUG-6: Rekursiv prüfen, ob ein Methodenrumpf `self` verwendet.
-  // Läuft über c0/c1/c2 und die next-Kette; verschachtelte SNK_FUNC_DECL werden
-  // nicht betreten (eigener self-Kontext).
-  fn _usesSelf(ni: int64, depth: int64): int64 {
-    if (ni < 0) { return 0; }
-    if (depth > 64) { return 1; }   // zu tief → konservativ „benutzt self"
-    var n: int64 := ni;
-    while (n >= 0) {
-      var k: int64 := self.sn_kind(n);
-      if (k == SNK_IDENT) {
-        if (self._strNEq(self.sn_sVal(n), self.sn_sLen(n), "self"c, 4)) { return 1; }
-      }
-      if (k != SNK_FUNC_DECL || n == ni) {
-        if (self._usesSelf(self.sn_c0(n), depth + 1) != 0) { return 1; }
-        if (self._usesSelf(self.sn_c1(n), depth + 1) != 0) { return 1; }
-        if (self._usesSelf(self.sn_c2(n), depth + 1) != 0) { return 1; }
-      }
-      n := self.sn_next(n);
-    }
-    return 0;
-  }
+  // #2151: Hier stand ein zweites _usesSelf(ni, depth) — anderer Rumpf,
+  // gleicher Name. Jeder Aufruf traf das erste (stapelbasiert, weiter oben);
+  // das zweite war toter Text. Die Doppelpruefung fuer importierte Units hat
+  // es gefunden.
 
   // BUG-6: `TypeName.Method(args)` — Aufruf über den Typnamen statt über eine Instanz.
   //
@@ -8080,7 +8204,7 @@ pub type Sema = class {
     while (mth >= 0) {
       if (self.sn_kind(mth) == SNK_FUNC_DECL) {
         if (self._strNEq(self.sn_sVal(mth), self.sn_sLen(mth), mname, mlen)) {
-          if (self._usesSelf(self.sn_c2(mth), 0) != 0) {
+          if (self._usesSelf(self.sn_c2(mth)) != 0) {
             self._errorNodeName("Methode benutzt 'self' und braucht eine Instanz — Aufruf ueber den Typnamen", callNi, mname, mlen);
           }
           return;
