@@ -10203,7 +10203,7 @@ pub type Codegen = class {
       return;
     }
     if (foff < 0) {
-      self.cg_genFeldOffen(fieldName, fieldLen);   // #2134
+      self.cg_genFeldOffen(fieldName, fieldLen, ni);   // #2134, #2141
       self.cg_zeroRax();
     } else if (ldW == 1 || ldW == 2 || ldW == 4) {
       self.cg_emitNarrowLoadRax(foff, ldW, ldSigned);
@@ -12233,6 +12233,27 @@ pub type Codegen = class {
     if (isStderr == 1) { hStr := CG_H_EPRINTSTR; hInt := CG_H_EPRINTINT; }
     var cur: int64 := argNode;
     while (cur >= 0) {
+      // #2141: Ein LITERAL hat eine bekannte Laenge — write(fd, text, laenge)
+      // statt _lyx_print_str, das bis zum ersten Nullbyte zaehlt. Bis 1.2.16A
+      // gab `Print("ab\0cd")` nur "ab" aus. Dieselbe Rechnung wie der
+      // Literal-Zweig von Print im IR-Weg (Laenge aus dem Vorspann, #1968) —
+      // die beiden muessen uebereinstimmen. EPrint bleibt beim Zaehlen, wie
+      // EPrint im IR-Weg (Builtin 13).
+      // NUR auf dem SysV-Pfad: in einer PE-Datei (win64, msAbi) waere der rohe
+      // write-Syscall ein NT-Dienst mit anderer Bedeutung (#1678,
+      // tests/win64_syscalls_test.sh). Dort bleibt es beim Helfer.
+      if (isStderr == 0 && self.msAbi == 0 && self.cg_nkind(cur) == CGN_LIT_STR) {
+        var plOff: int64 := self.cg_addStr(self.cg_nsoff(cur), self.cg_nslen(cur));
+        var plLen: int64 := self.dataLen - plOff - 1;              // ohne die Abschlussnull
+        self.cg_emitLeaRdiData(plOff);
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFE);      // mov rsi, rdi (Text)
+        self.cg_e8(0xBA); self.cg_e32(plLen);                      // mov edx, laenge
+        self.cg_e8(0xBF); self.cg_e32(1);                          // mov edi, 1 (stdout)
+        self.cg_e8(0xB8); self.cg_e32(1);                          // mov eax, 1 (sys_write)
+        self.cg_e8(0x0F); self.cg_e8(0x05);                        // syscall
+        cur := self.cg_nnext(cur);
+        continue;
+      }
       var pt: int64 := self.cg_inferPrintType(cur);
       self.cg_genExpr(cur);
       // mov rdi, rax
@@ -17217,7 +17238,7 @@ pub type Codegen = class {
         } else {
           // #2134: dieselbe Pruefung wie beim Lesen (cg_genFieldLoad) — die
           // beiden muessen uebereinstimmen.
-          self.cg_genFeldOffen(fieldName, fieldLen);
+          self.cg_genFeldOffen(fieldName, fieldLen, lhs);
         }
       } else if (self.cg_nkind(lhs) == CGN_INDEX && self.cg_localIsMap(self.cg_nc0(lhs)) != 0) {
         // #1152: m[k] := v schreibt ueber _lyx_map_set. Bis 1.0.15A nahm der
@@ -22653,14 +22674,27 @@ pub type Codegen = class {
   //     einen Aufruf OHNE Typargumente erreichbar (`gety(p)`). Bis 1.2.15A
   //     lieferte er still 0; jetzt bricht er an dieser Stelle laut ab;
   //   - sonst: das bisherige Verhalten (Wert 0), siehe Bericht zu #2134.
-  fn cg_genFeldOffen(fp: pchar, fl: int64) {
+  //
+  // #2141: AUSSERHALB eines typgeloeschten generischen Rumpfes kehrte die
+  // Funktion bis 1.2.16A still zurueck — der Lesezugriff lieferte 0, die
+  // Zuweisung entfiel, ohne Meldung. Jetzt bricht das Uebersetzen ab, mit
+  // derselben Meldung wie _feldOffen im IR-Weg (die beiden muessen
+  // uebereinstimmen). ni = der Feldknoten, fuer die Zeilenangabe.
+  fn cg_genFeldOffen(fp: pchar, fl: int64, ni: int64) {
     if (self.genActN > 0) {
       self.cg_genFehler("Feld ueber einen Typparameter nicht aufloesbar: "c, fp, fl);
     }
     var fd: int64 := self.genCurFd;
-    if (fd < 0) { return; }
-    var tp: int64 := self.cg_nc3(fd);
-    if (tp < 0 || tp >= self.pNodeCount || self.cg_nkind(tp) != 62) { return; }
+    var tp: int64 := 0 - 1;
+    if (fd >= 0) { tp := self.cg_nc3(fd); }
+    if (tp < 0 || tp >= self.pNodeCount || self.cg_nkind(tp) != 62) {
+      EPrintStr("error: #2134: Feld nicht aufloesbar (Typ der Basis unbekannt): "c);
+      sys_write(2, fp as int64, fl);
+      EPrintStr(" (Zeile "c);
+      EPrintInt(self.cg_lineOf(ni));
+      EPrintStrLn(")"c);
+      exit(1);
+    }
     var msgOff: int64 := self.dataLen;
     var t1: pchar := "lyxc: generische Funktion ohne Typargumente aufgerufen, Feld "c;
     var i: int64 := 0;

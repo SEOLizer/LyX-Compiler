@@ -316,7 +316,8 @@ done
 # (sema laesst es durch). Bis 1.2.15A lieferte lowerField den unbeschriebenen
 # Temp — gemessen kam still `1` heraus (0 + 1). Jetzt laut. Die
 # Gegenseite: derselbe Zugriff ueber einen typisierten Ausdruck rechnet.
-# (x86 rechnet hier weiterhin still 0 — eigener Befund, siehe Bericht #2134.)
+# (x86 rechnete hier bis 1.2.16A still 0; seit #2141 ebenfalls laut —
+# gemessen in tests/ir_platzhalter_test.sh.)
 cat > "$TMP/feld.lyx" <<'EOF'
 type P = class {
   x: int64;
