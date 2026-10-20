@@ -19,6 +19,15 @@ import src.security.ffi_validator;
 import src.security.cap_stripper;
 import src.lyu_reader;   // #2014: Deklarationen einer .lyu (LyrDeklText/LyrDeklHat)
 
+// #2148: Leise Auswertung fuer _evalConstExpr. Ist _semaKonstStill gesetzt,
+// meldet ein nicht faltbarer Ausdruck (etwa ein f64-Vergleich, den sema nicht
+// rechnet) nichts, sondern setzt _semaKonstFehl. Gebraucht von der
+// Dead-Branch-Faltung bei `if (CON)` und von _constIntOf: dort ist "nicht
+// faltbar" eine gueltige Antwort und KEIN Fehler. Bis 1.2.16B scheiterte
+// `con A: bool := X <= 2.0; ... if (A)` mit "@if: non-constant expression".
+var _semaKonstStill: int64 := 0;
+var _semaKonstFehl: int64 := 0;
+
 // ============================================================================
 // Symbol kinds
 // ============================================================================
@@ -2777,7 +2786,14 @@ pub type Sema = class {
       var si: int64 := self.Lookup(self.sn_sVal(ni), self.sn_sLen(ni));
       if (si < 0) { return 0; }
       if (self.SymKind(si) != SYM_CON) { return 0; }
-      poke64(outBox, self._lookupConst(self.sn_sVal(ni), self.sn_sLen(ni)));
+      // #2148: eine nicht faltbare Konstante (f64) ist "unbekannt", kein Fehler.
+      var ciAlt: int64 := _semaKonstStill;
+      _semaKonstStill := 1; _semaKonstFehl := 0;
+      var ciWert: int64 := self._lookupConst(self.sn_sVal(ni), self.sn_sLen(ni));
+      var ciFehl: int64 := _semaKonstFehl;
+      _semaKonstStill := ciAlt; _semaKonstFehl := 0;
+      if (ciFehl != 0) { return 0; }
+      poke64(outBox, ciWert);
       return 1;
     }
     if (k == SNK_BINOP) {
@@ -4811,10 +4827,12 @@ pub type Sema = class {
       var idNl: int64 := self.sn_sLen(ni);
       var idSi: int64 := self.Lookup(idNm, idNl);
       if (idSi < 0) {
+        if (_semaKonstStill != 0) { _semaKonstFehl := 1; return 0; }
         self._errorNodeName("@if: unbekannter Bezeichner", ni, idNm, idNl);
         return 0;
       }
       if (self.SymKind(idSi) != SYM_CON) {
+        if (_semaKonstStill != 0) { _semaKonstFehl := 1; return 0; }
         self._errorNodeName("@if: kein con", ni, idNm, idNl);
         return 0;
       }
@@ -4825,6 +4843,7 @@ pub type Sema = class {
       var cv: int64 := self._evalConstExpr(self.sn_c0(ni));
       if (uop == 87) { if (cv == 0) { return 1; } else { return 0; } }  // TK_NOT
       if (uop == 71) { return 0 - cv; }                                  // TK_MINUS (unary negation)
+      if (_semaKonstStill != 0) { _semaKonstFehl := 1; }                 // #2148
       return 0;
     }
     if (k == SNK_BINOP) {
@@ -4849,6 +4868,7 @@ pub type Sema = class {
       if (bop == 82) { if (lv <= rv) { return 1; } else { return 0; } }  // TK_LE  <=
       if (bop == 83) { if (lv > rv)  { return 1; } else { return 0; } }  // TK_GT  >
       if (bop == 84) { if (lv >= rv) { return 1; } else { return 0; } }  // TK_GE  >=
+      if (_semaKonstStill != 0) { _semaKonstFehl := 1; }                 // #2148
       return 0;
     }
     if (k == SNK_CALL) {
@@ -4859,8 +4879,10 @@ pub type Sema = class {
           return self._sizeofType(self.sn_sVal(argNi), self.sn_sLen(argNi));
         }
       }
+      if (_semaKonstStill != 0) { _semaKonstFehl := 1; }                 // #2148
       return 0;
     }
+    if (_semaKonstStill != 0) { _semaKonstFehl := 1; return 0; }   // #2148
     self._errorNode("@if: non-constant expression in condition", ni);
     return 0;
   }
@@ -5540,6 +5562,12 @@ pub type Sema = class {
     } else if (k == SNK_RANGE) {
       // Range expression: start to/downto end
       self._checkExpr(self.sn_c0(ni));
+      // #2150: Ein offenes Ende (`a..`) gibt es nur rechts von `in` — dort
+      // prueft SNK_IN_EXPR die Grenzen selbst und kommt hier nicht vorbei.
+      // An jeder anderen Stelle haette der Codegen keine obere Grenze.
+      if (self.sn_c1(ni) < 0) {
+        self._errorNode("offener Bereich `a..` ist nur rechts von `in` erlaubt (#2150)", ni);
+      }
       self._checkExpr(self.sn_c1(ni));
 
     } else if (k == SNK_MAP_LIT) {
@@ -5562,7 +5590,14 @@ pub type Sema = class {
     } else if (k == SNK_IN_EXPR) {
       // lhs in rhs — check both sides
       self._checkExpr(self.sn_c0(ni));
-      self._checkExpr(self.sn_c1(ni));
+      var inR: int64 := self.sn_c1(ni);
+      if (inR >= 0 && self.sn_kind(inR) == SNK_RANGE) {
+        // #2150: Grenzen direkt — der Bereich darf hier offen sein.
+        self._checkExpr(self.sn_c0(inR));
+        self._checkExpr(self.sn_c1(inR));
+      } else {
+        self._checkExpr(inR);
+      }
     } else if (k == SNK_SIMD_NEW) {
       // parallel Array<T>(size) — check size expression (c1); type arg in c0
       self._checkExpr(self.sn_c1(ni));
@@ -5884,13 +5919,23 @@ pub type Sema = class {
         var ifNl: int64 := self.sn_sLen(ifCondNi);
         var ifSi: int64 := self.Lookup(ifNm, ifNl);
         if ifSi >= 0 && self.SymKind(ifSi) == SYM_CON {
+          // #2148: nur falten, wenn sema den Wert AUCH rechnen kann. Ein
+          // f64-Vergleich (`con A: bool := X <= 2.0`) ist hier nicht faltbar
+          // und war bis 1.2.16B ein falscher "@if"-Fehler; jetzt werden
+          // beide Zweige geprueft, gefaltet wird im Codegen.
+          var ifAlt: int64 := _semaKonstStill;
+          _semaKonstStill := 1; _semaKonstFehl := 0;
           var ifCv: int64 := self._lookupConst(ifNm, ifNl);
-          if ifCv != 0 {
-            self._checkStmt(self.sn_c1(ni));
-          } else {
-            self._checkStmt(self.sn_c2(ni));
+          var ifFehl: int64 := _semaKonstFehl;
+          _semaKonstStill := ifAlt; _semaKonstFehl := 0;
+          if ifFehl == 0 {
+            if ifCv != 0 {
+              self._checkStmt(self.sn_c1(ni));
+            } else {
+              self._checkStmt(self.sn_c2(ni));
+            }
+            ifFolded := 1;
           }
-          ifFolded := 1;
         }
       }
       if ifFolded == 0 {

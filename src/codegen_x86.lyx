@@ -181,10 +181,10 @@ con CG_CODE_OFF:   int64 := 176;      // WP-6: code after ELF hdr (64) + 2×phdr
 //   _lyx_eprint_int:  offset 336  (104 bytes) — stderr variant
 //   _lyx_f64_to_str:  offset 440  (335 bytes) — WP-BI-04
 //   _lyx_strsplit:    offset 775  (215 bytes) — WP-BI-05
-//   _lyx_map_new:     offset 990  (47 bytes)  — WP-BI-06
-//   _lyx_map_set:     offset 1037 (93 bytes)  — WP-BI-06
-//   _lyx_map_get:     offset 1130 (72 bytes)  — WP-BI-06
-//   _lyx_map_has:     offset 1202 (73 bytes)  — WP-BI-06
+//   _lyx_map_new:     offset 990  (106 bytes) — WP-BI-06, #2150
+//   _lyx_map_set:     offset 1096 (Eintritt)  — springt in den Map-Kern
+//   _lyx_map_get:     offset 1106 (Eintritt)
+//   _lyx_map_has:     offset 1119 (Eintritt), dann oom + Text, Rest bis 1275 int3
 //   user code:        offset 1275
 con CG_H_START:      int64 := 0;
 con CG_H_STRLEN:     int64 := 79;
@@ -197,9 +197,9 @@ con CG_H_EPRINTINT:  int64 := 336;
 con CG_H_F64STR:     int64 := 440;
 con CG_H_STRSPLIT:   int64 := 775;
 con CG_H_MAP_NEW:    int64 := 990;
-con CG_H_MAP_SET:    int64 := 1037;
-con CG_H_MAP_GET:    int64 := 1130;
-con CG_H_MAP_HAS:    int64 := 1202;
+con CG_H_MAP_SET:    int64 := 1096;   // #2150: Eintritte aus GNU as, siehe cg_emitHelpers
+con CG_H_MAP_GET:    int64 := 1106;
+con CG_H_MAP_HAS:    int64 := 1119;
 con CG_H_STACK_FAIL:   int64 := 1275;  // WP-18: __lyx_stack_fail handler (70 bytes)
 con CG_H_CANARY_INIT: int64 := 1345;  // WP-18: __lyx_canary_init handler (27 bytes)
 // #1284: Vorschalter vor _lyx_f64_to_str (NaN, unendlich, nicht darstellbar).
@@ -208,8 +208,8 @@ con CG_H_CANARY_INIT: int64 := 1345;  // WP-18: __lyx_canary_init handler (27 by
 con CG_H_F64STR_CHK: int64 := 1372;
 con CG_H_F64STR_CHK_LEN: int64 := 106;
 con CG_H_MAP_STR:      int64 := 1478;  // #1291: Map mit Zeichenketten-Schluesseln
-con CG_H_MAP_STR_LEN:  int64 := 281;   // beim Erzeugen gemessen, nicht gezaehlt
-con CG_H_USER:         int64 := 1759;  // 1478 + 281 (#1291)
+con CG_H_MAP_STR_LEN:  int64 := 480;   // #2150: Map-Kern mit Wachstum, gemessen
+con CG_H_USER:         int64 := 1958;  // 1478 + 480 (#2150)
 
 // Patch kinds
 con CG_PATCH_CALL:     int64 := 0;
@@ -610,8 +610,11 @@ fn cg_faltF64(bop: int64, lb: int64, rb: int64): int64 {
   if (bop == 79) { if (a == b) { return 1; } return 0; }  // ==
   if (bop == 80) { if (a != b) { return 1; } return 0; }  // !=
   if (bop == 81) { if (a <  b) { return 1; } return 0; }  // <
-  if (bop == 82) { if (a >  b) { return 1; } return 0; }  // >
-  if (bop == 83) { if (a <= b) { return 1; } return 0; }  // <=
+  // #2148: 82 ist TK_LE, 83 TK_GT (lexer.lyx). Hier standen sie vertauscht,
+  // `X <= Y` und `X > Y` falteten auf f64 also jeweils zum Gegenteil. Die
+  // ganzzahlige Faltung in cg_evalConExpr hatte die Zuordnung richtig.
+  if (bop == 82) { if (a <= b) { return 1; } return 0; }  // <=
+  if (bop == 83) { if (a >  b) { return 1; } return 0; }  // >
   if (bop == 84) { if (a >= b) { return 1; } return 0; }  // >=
 // Alles Uebrige gibt es fuer Gleitkomma nicht: %, Schiebeoperationen und
 // die Bitverknuepfungen wuerden auf dem Bitmuster arbeiten und etwas
@@ -623,6 +626,37 @@ fn cg_faltF64(bop: int64, lb: int64, rb: int64): int64 {
   EPrintStrLn("  diese Stelle ganzzahlig auf den IEEE-Bits und lieferte still"c);
   EPrintStrLn("  eine plausible, aber falsche Zahl."c);
   exit(1);
+  return 0;
+  }
+
+// #2148: Ein eingebauter Ganzzahltyp? Fuer `<f64> as T` im Anfangswert einer
+// Konstanten: nur dorthin wird abgeschnitten. Freie Funktion aus demselben
+// Grund wie cg_faltF64 (#1853, Vtable).
+fn cg_istGanzzahlTypName(tp: pchar, tl: int64): int64 {
+  if (tl < 2 || tl > 6) { return 0; }
+  var i: int64 := 0;
+  var c0: int64 := StrCharAt(tp, 0) & 255;
+  if (c0 == 117) { i := 1; }                      // u...
+  // "int"/"uint" + Breite oder "i"/"u" + Breite
+  var rest: int64 := i;
+  if (tl - i >= 3 && (StrCharAt(tp, i) & 255) == 105 && (StrCharAt(tp, i + 1) & 255) == 110
+      && (StrCharAt(tp, i + 2) & 255) == 116) {
+    rest := i + 3;
+  } else if (i == 0 && c0 == 105) {
+    rest := 1;
+  } else if (i == 1) {
+    rest := 1;
+  } else {
+    return 0;
+  }
+  var bl: int64 := tl - rest;
+  if (bl == 1 && (StrCharAt(tp, rest) & 255) == 56) { return 1; }                                     // 8
+  if (bl != 2) { return 0; }
+  var a: int64 := StrCharAt(tp, rest) & 255;
+  var b: int64 := StrCharAt(tp, rest + 1) & 255;
+  if (a == 49 && b == 54) { return 1; }   // 16
+  if (a == 51 && b == 50) { return 1; }   // 32
+  if (a == 54 && b == 52) { return 1; }   // 64
   return 0;
   }
 
@@ -1073,6 +1107,10 @@ pub type Codegen = class {
   // localFnPtrF64 (#1565) — ohne sie faellt `var v: f64 = gFn(4.0)` still auf
   // int64 zurueck und aus 12.0 wird 4622945017495814144.
   globalFnPtrF64: int64;
+  // #2150: 1 = Modulvariable vom Typ Map<pchar, V> — Gegenstueck zu
+  // localMapStrKey (#1291). Ob eine Globale ueberhaupt eine Map ist, steht
+  // im Typnamen (globalTypeNames, "Map"); der Schluesseltyp nur hier.
+  globalMapStrKey: int64;
   // #1587: Pruefmodus fuer `--compile-unit`. Der Codegen laeuft vollstaendig
   // durch, damit seine Diagnose greift; das Erzeugnis wird verworfen. Eine
   // Unit hat aber kein `main` — der Einsprungpunkt, den Init vorsorglich
@@ -1838,12 +1876,14 @@ pub type Codegen = class {
       var ng: int64 := alloc(nc * 8);      // #1230
       var nf: int64 := alloc(nc);          // #1574
       var nff: int64 := alloc(nc);         // #1574
+      var nmk: int64 := alloc(nc);         // #2150
       var i: int64 := 0;
       memcpy(nb, self.globalVars, self.globalVarCount * 24);
       i := 0;
       memcpy(np, self.globalIsPchar, self.globalVarCount);
       memcpy(nf, self.globalIsFnPtr, self.globalVarCount);       // #1574
       memcpy(nff, self.globalFnPtrF64, self.globalVarCount);     // #1574
+      memcpy(nmk, self.globalMapStrKey, self.globalVarCount);    // #2150
       memcpy(nt, self.globalTypeNames, self.globalVarCount * 16);
       memcpy(nr, self.globalIsRedundant, self.globalVarCount);   // #1141
       memcpy(na, self.globalIsArray, self.globalVarCount);       // #1256
@@ -1857,6 +1897,7 @@ pub type Codegen = class {
       self.globalArrayRow := ng;
       self.globalIsFnPtr := nf;                                  // #1574
       self.globalFnPtrF64 := nff;                                // #1574
+      self.globalMapStrKey := nmk;                               // #2150
     }
     var doff: int64 := self.dataLen;
     // Reserve 8 zero bytes in data section (mmap is zero-initialized)
@@ -1869,6 +1910,7 @@ pub type Codegen = class {
     poke8(self.globalIsPchar + self.globalVarCount, 0);
     poke8(self.globalIsFnPtr + self.globalVarCount, 0);       // #1574
     poke8(self.globalFnPtrF64 + self.globalVarCount, 0);      // #1574
+    poke8(self.globalMapStrKey + self.globalVarCount, 0);     // #2150
     poke8(self.globalIsRedundant + self.globalVarCount, 0);   // #1141
     poke8(self.globalIsArray + self.globalVarCount, 0);       // #1256
     poke64(self.globalArraySize + self.globalVarCount * 8, 0);
@@ -2361,6 +2403,15 @@ pub type Codegen = class {
       poke64(self.globalTypeNames + gIdx * 16 + 8, gtn);
       // #1574: benannter fn-Typ (`type Cb = fn(int64): int64`).
       if (self.cg_isFnPtrAlias(gtp, gtn) != 0) { poke8(self.globalIsFnPtr + gIdx, 1); }
+      // #2150: Map<pchar, V> — Schluesseltyp im ersten Typargument, wie
+      // cg_markMapStrKey beim Local.
+      if (gtn == 3 && self.cg_seq(gtp, gtn, "Map", 3)) {
+        var gmk: int64 := self.cg_nc0(gtNode);
+        if (gmk >= 0 && self.cg_nkind(gmk) == 60
+            && self.cg_seq(self.cg_nsval(gmk), self.cg_nslen(gmk), "pchar", 5) != 0) {
+          poke8(self.globalMapStrKey + gIdx, 1);
+        }
+      }
     }
     // #1574: inline geschriebener Zeigertyp `var gFn: fn(f64): f64`.
     if (gtNode >= 0 && self.cg_nkind(gtNode) == CGN_FN_PTR_NODE) {
@@ -3574,6 +3625,17 @@ pub type Codegen = class {
       if (self.cg_istF64Konstante(self.cg_nc0(node)) != 0) { return 1; }
       return self.cg_istF64Konstante(self.cg_nc1(node));
     }
+    // #2148: `x as f64` IST Gleitkomma, `y as int64` ist es nicht — massgeblich
+    // ist der Zieltyp, nicht der Operand. Ohne diesen Fall sah
+    // `(3 as f64) * 0.5` nur ueber die 0.5 nach Gleitkomma aus, die 3 blieb
+    // aber eine rohe Ganzzahl, und die Faltung las sie als IEEE-Bits (still 0).
+    // Dieselbe Frage beantwortet cg_isF64Expr fuer den Laufzeitweg — die
+    // beiden muessen uebereinstimmen.
+    if (self.cg_nkind(node) == CGN_CAST) {
+      var ctn: int64 := self.cg_nc1(node);
+      if (ctn < 0) { return 0; }
+      return self.cg_isFloatTypeName(self.cg_nsval(ctn), self.cg_nslen(ctn));
+    }
     return 0;
   }
 
@@ -3641,8 +3703,14 @@ pub type Codegen = class {
       // Dieselbe Sperre steht seit #1499 in cg_foldConst und seit #1803 im
       // unaeren Zweig darueber — dem binaeren hat sie gefehlt. Das ist der
       // sechste Fall dieser Familie (#1373, #1499, #1512, #1801, #1803).
-      if (self.cg_istF64Konstante(self.cg_nc0(node)) != 0 ||
-          self.cg_istF64Konstante(self.cg_nc1(node)) != 0) {
+      var lF: int64 := self.cg_istF64Konstante(self.cg_nc0(node));
+      var rF: int64 := self.cg_istF64Konstante(self.cg_nc1(node));
+      if (lF != 0 || rF != 0) {
+        // #2148: Ist nur EINE Seite Gleitkomma, traegt die andere eine Zahl,
+        // keine Bits — `1.5 * 2` rechnete 1.5 mal das Bitmuster 2 (eine
+        // denormale Zahl nahe 0). Umrechnen wie zur Laufzeit (#1212).
+        if (lF == 0) { lv := cg_f64AlsBits(lv as f64); }
+        if (rF == 0) { rv := cg_f64AlsBits(rv as f64); }
         return cg_faltF64(bop, lv, rv);
       }
       if (bop == 70) { return lv + rv; }                                  // TK_PLUS
@@ -3663,7 +3731,29 @@ pub type Codegen = class {
       if (bop == 84) { if (lv >= rv) { return 1; } else { return 0; } }  // TK_GE  >=
       return 0;
     }
-    if (k == CGN_CAST) { return self.cg_evalConExpr(self.cg_nc0(node)); }   // #1507
+    if (k == CGN_CAST) {
+      // #1507: Fuer Ganzzahl und Enum aendert der Cast am WERT nichts.
+      // #2148: Zwischen Ganzzahl und Gleitkomma aendert er die DARSTELLUNG —
+      // `3 as f64` traegt die IEEE-Bits von 3.0, `2.5 as int64` die Zahl 2
+      // (abgeschnitten wie cvttsd2si). Bis 1.2.16B lief der Wert unveraendert
+      // durch, und `con W: f64 := (3 as f64) * 0.5` war still 0.
+      var cInner: int64 := self.cg_nc0(node);
+      var cv: int64 := self.cg_evalConExpr(cInner);
+      var zielF: int64 := self.cg_istF64Konstante(node);
+      var quelleF: int64 := self.cg_istF64Konstante(cInner);
+      if (zielF != 0 && quelleF == 0) { return cg_f64AlsBits(cv as f64); }
+      if (zielF == 0 && quelleF != 0) {
+        var ctn2: int64 := self.cg_nc1(node);
+        // Nur in eine Ganzzahl abschneiden; jeder andere Zieltyp (bool, pchar)
+        // aus einem Gleitkommawert wird nicht still erraten.
+        if (ctn2 >= 0 && cg_istGanzzahlTypName(self.cg_nsval(ctn2), self.cg_nslen(ctn2)) != 0) {
+          return cg_bitsAlsF64(cv) as int64;
+        }
+        EPrintStrLn("error: Cast eines Gleitkommawerts in einen Nicht-Ganzzahltyp im Anfangswert einer Konstanten (#2148)."c);
+        exit(1);
+      }
+      return cv;
+    }
     if (k == CGN_FIELD) {
       var ez: int64 := alloc(8);
       poke64(ez, 0);
@@ -6296,7 +6386,12 @@ pub type Codegen = class {
     if (ni < 0) { return 0; }
     if (self.cg_nkind(ni) != CGN_IDENT) { return 0; }
     var li: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
-    if (li < 0) { return 0; }
+    if (li < 0) {
+      // #2150: Modulvariable — dieselbe Reihenfolge wie cg_localIsMap.
+      var gi: int64 := self.cg_findGlobalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (gi < 0) { return 0; }
+      return peek8(self.globalMapStrKey + gi) as int64;
+    }
     return peek8(self.localMapStrKey + li) as int64;
   }
 
@@ -7125,7 +7220,19 @@ pub type Codegen = class {
     if (node < 0) { return 0; }
     if (self.cg_nkind(node) != CGN_IDENT) { return 0; }
     var li: int64 := self.cg_findLocalIdx(self.cg_nsval(node), self.cg_nslen(node));
-    if (li < 0) { return 0; }
+    if (li < 0) {
+      // #2150: auch eine MODULVARIABLE kann eine Map sein. Bis 1.2.16B sah
+      // der x86-Weg nur Locals, `g[3] := 30` auf `var g: Map<..>` scheiterte
+      // als "Element eines Ausdrucks ohne Elementtyp"; der IR-Weg kennt
+      // Modulvariablen seit #1812 (_localTypeNode). Ein Local verdeckt die
+      // Globale — deshalb erst hier.
+      var gi: int64 := self.cg_findGlobalIdx(self.cg_nsval(node), self.cg_nslen(node));
+      if (gi < 0) { return 0; }
+      var gtp: pchar := peek64(self.globalTypeNames + gi * 16) as pchar;
+      var gtn: int64 := peek64(self.globalTypeNames + gi * 16 + 8);
+      if (gtn == 3 && self.cg_seq(gtp, gtn, "Map", 3)) { return 1; }
+      return 0;
+    }
     var tb: int64 := self.localTypes + li * CG_LOCTYPE_SZ;
     var tp: pchar := peek64(tb) as pchar;
     var tn: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
@@ -22132,158 +22239,101 @@ pub type Codegen = class {
     self.cg_e8(0xC3);                                           // ret
     // _lyx_strsplit is 215 bytes  ✓
 
-    // ---- _lyx_map_new (47 bytes, starts at offset 990) — WP-BI-06 ----
-    // _lyx_map_new(rdi=cap) → rax=ptr
-    // Layout: [ptr+0]=cap, [ptr+8]=len=0, [ptr+16]=seed=0
-    // Slots at [ptr+24..], each 24 bytes: [+0]=key(0=empty,-1=del), [+8]=val, [+16]=hash
-    // Allocates (cap+1)*24 bytes via mmap(anon); mmap zeroes memory so all slots start empty.
-    // Block 1: save rbx, move cap to rbx (4 bytes)
-    self.cg_e8(0x53);                                                // push rbx
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);          // mov rbx, rdi
-    // Block 2: mmap(0, (cap+1)*24, PROT_R|W, MAP_PRIV|ANON, -1, 0) (38 bytes)
-    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x73); self.cg_e8(0x01); // lea rsi,[rbx+1]
-    self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xF6); self.cg_e8(0x18); // imul rsi,rsi,24
-    self.cg_e8(0x31); self.cg_e8(0xFF);                             // xor edi,edi (addr=0)
-    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov edx,3
-    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov r10d,34
-    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); // mov r8,-1
-    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);          // xor r9d,r9d
-    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax,9 (SYS_mmap)
-    self.cg_e8(0x0F); self.cg_e8(0x05);                             // syscall → rax=ptr
-    // Block 3: store cap, restore rbx, return (5 bytes)
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x18);          // mov [rax],rbx (cap)
-    self.cg_e8(0x5B);                                                // pop rbx
-    self.cg_e8(0xC3);                                                // ret
-    // _lyx_map_new is 47 bytes ✓
-
-    // ---- _lyx_map_set (93 bytes, starts at offset 1037) — WP-BI-06 ----
-    // _lyx_map_set(rdi=map, rsi=key, rdx=value) — insert or update key→value
-    // Open addressing: idx = key & (cap-1); probe until empty(0) or matching key
-    // rbx=map, r12=key, r13=value, r14=cap-1(mask)
-    // Block 1: prologue (7 bytes)
-    self.cg_e8(0x53);                                                // push rbx
-    self.cg_e8(0x41); self.cg_e8(0x54);                             // push r12
-    self.cg_e8(0x41); self.cg_e8(0x55);                             // push r13
-    self.cg_e8(0x41); self.cg_e8(0x56);                             // push r14
-    // Block 2: setup — save args, load cap-1 mask (21 bytes)
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);          // mov rbx,rdi
-    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF4);          // mov r12,rsi
-    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xD5);          // mov r13,rdx
-    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x37);          // mov r14,[rdi]  (cap)
-    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xCE);          // dec r14  (cap→mask)
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE0);          // mov rax,r12  (key)
-    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14  (initial idx)
-    // Block 3: probe loop (35 bytes) — .probe_top at abs offset 28
-    // slot_ptr = map+24+idx*24; check slot_key for empty or match
-    // REX note: r10 in reg field (REX.R=1); rcx/rbx in rm field (non-extended, REX.B=0) → REX=4C
-    //           r10 in rm field (extended, REX.B=1) → REX=4D; r12 in rm field (REX.B=1) → REX=4D
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);          // mov rcx,rax
-    self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC9); self.cg_e8(0x18); // imul rcx,rcx,24
-    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD9);          // add rcx,rbx
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x18); // add rcx,24
-    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x11);          // mov r10,[rcx]  REX.B=0 (rcx)
-    self.cg_e8(0x4D); self.cg_e8(0x85); self.cg_e8(0xD2);          // test r10,r10   REX.B=1 (r10 in rm)
-    self.cg_e8(0x74); self.cg_e8(0x0D);                             // jz .do_insert (+13)
-    self.cg_e8(0x4D); self.cg_e8(0x3B); self.cg_e8(0xD4);          // cmp r10,r12    REX.B=1 (r12 in rm)
-    self.cg_e8(0x74); self.cg_e8(0x13);                             // je .do_update (+19)
-    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);          // inc rax
-    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
-    self.cg_e8(0xEB); self.cg_e8(0xDD);                             // jmp .probe_top (-35)
-    // Block 4: .do_insert — increment len, fall through to update (11 bytes)
-    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x53); self.cg_e8(0x08); // mov r10,[rbx+8]  REX.B=0 (rbx)
-    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC2);          // inc r10
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x53); self.cg_e8(0x08); // mov [rbx+8],r10  REX.B=0 (rbx)
-    // Block 5: .do_update — store key, value, hash=key (11 bytes)
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x21);          // mov [rcx],r12    REX.B=0 (rcx)
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x69); self.cg_e8(0x08); // mov [rcx+8],r13  REX.B=0 (rcx)
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x61); self.cg_e8(0x10); // mov [rcx+16],r12 REX.B=0 (rcx)
-    // Block 6: epilogue (8 bytes)
-    self.cg_e8(0x41); self.cg_e8(0x5E);                             // pop r14
-    self.cg_e8(0x41); self.cg_e8(0x5D);                             // pop r13
-    self.cg_e8(0x41); self.cg_e8(0x5C);                             // pop r12
-    self.cg_e8(0x5B);                                                // pop rbx
-    self.cg_e8(0xC3);                                                // ret
-    // _lyx_map_set is 93 bytes ✓
-
-    // ---- _lyx_map_get (72 bytes, starts at offset 1130) — WP-BI-06 ----
-    // _lyx_map_get(rdi=map, rsi=key) → rax=value (0 if not found)
-    // rbx=map, r12=key, r14=cap-1(mask)
-    // Block 1: prologue (5 bytes)
-    self.cg_e8(0x53);                                                // push rbx
-    self.cg_e8(0x41); self.cg_e8(0x54);                             // push r12
-    self.cg_e8(0x41); self.cg_e8(0x56);                             // push r14
-    // Block 2: setup (18 bytes)
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);          // mov rbx,rdi
-    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF4);          // mov r12,rsi
-    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x37);          // mov r14,[rdi]
-    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xCE);          // dec r14
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE0);          // mov rax,r12
-    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
-    // Block 3: probe loop (35 bytes) — .probe_top at abs offset 23
-    // REX note: r10 in reg (REX.R=1); rcx/rbx non-extended (REX.B=0) → REX=4C
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);          // mov rcx,rax
-    self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC9); self.cg_e8(0x18); // imul rcx,rcx,24
-    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD9);          // add rcx,rbx
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x18); // add rcx,24
-    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x11);          // mov r10,[rcx]  REX.B=0 (rcx)
-    self.cg_e8(0x4D); self.cg_e8(0x85); self.cg_e8(0xD2);          // test r10,r10   REX.B=1 (r10)
-    self.cg_e8(0x74); self.cg_e8(0x0D);                             // jz .not_found (+13)
-    self.cg_e8(0x4D); self.cg_e8(0x3B); self.cg_e8(0xD4);          // cmp r10,r12    REX.B=1 (r12)
-    self.cg_e8(0x74); self.cg_e8(0x0C);                             // je .found (+12)
-    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);          // inc rax
-    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
-    self.cg_e8(0xEB); self.cg_e8(0xDD);                             // jmp .probe_top (-35)
-    // Block 4: .not_found → return 0 (4 bytes)
-    self.cg_e8(0x31); self.cg_e8(0xC0);                             // xor eax,eax
-    self.cg_e8(0xEB); self.cg_e8(0x04);                             // jmp .done (+4)
-    // Block 5: .found → return value (4 bytes)
-    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x41); self.cg_e8(0x08); // mov rax,[rcx+8]
-    // Block 6: .done / epilogue (6 bytes)
-    self.cg_e8(0x41); self.cg_e8(0x5E);                             // pop r14
-    self.cg_e8(0x41); self.cg_e8(0x5C);                             // pop r12
-    self.cg_e8(0x5B);                                                // pop rbx
-    self.cg_e8(0xC3);                                                // ret
-    // _lyx_map_get is 72 bytes ✓
-
-    // ---- _lyx_map_has (73 bytes, starts at offset 1202) — WP-BI-06 ----
-    // _lyx_map_has(rdi=map, rsi=key) → rax=1 if found, 0 otherwise
-    // rbx=map, r12=key, r14=cap-1(mask)
-    // Block 1: prologue (5 bytes)
-    self.cg_e8(0x53);                                                // push rbx
-    self.cg_e8(0x41); self.cg_e8(0x54);                             // push r12
-    self.cg_e8(0x41); self.cg_e8(0x56);                             // push r14
-    // Block 2: setup (18 bytes)
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);          // mov rbx,rdi
-    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF4);          // mov r12,rsi
-    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x37);          // mov r14,[rdi]
-    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xCE);          // dec r14
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE0);          // mov rax,r12
-    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
-    // Block 3: probe loop (35 bytes) — .probe_top at abs offset 23
-    // REX note: r10 in reg (REX.R=1); rcx non-extended (REX.B=0) → REX=4C
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);          // mov rcx,rax
-    self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC9); self.cg_e8(0x18); // imul rcx,rcx,24
-    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD9);          // add rcx,rbx
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x18); // add rcx,24
-    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x11);          // mov r10,[rcx]  REX.B=0 (rcx)
-    self.cg_e8(0x4D); self.cg_e8(0x85); self.cg_e8(0xD2);          // test r10,r10   REX.B=1 (r10)
-    self.cg_e8(0x74); self.cg_e8(0x0D);                             // jz .not_found (+13)
-    self.cg_e8(0x4D); self.cg_e8(0x3B); self.cg_e8(0xD4);          // cmp r10,r12    REX.B=1 (r12)
-    self.cg_e8(0x74); self.cg_e8(0x0C);                             // je .found (+12)
-    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);          // inc rax
-    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
-    self.cg_e8(0xEB); self.cg_e8(0xDD);                             // jmp .probe_top (-35)
-    // Block 4: .not_found → return 0 (4 bytes)
-    self.cg_e8(0x31); self.cg_e8(0xC0);                             // xor eax,eax
-    self.cg_e8(0xEB); self.cg_e8(0x05);                             // jmp .done (+5)
-    // Block 5: .found → return 1 (5 bytes)
-    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); // mov eax,1
-    // Block 6: .done / epilogue (6 bytes)
-    self.cg_e8(0x41); self.cg_e8(0x5E);                             // pop r14
-    self.cg_e8(0x41); self.cg_e8(0x5C);                             // pop r12
-    self.cg_e8(0x5B);                                                // pop rbx
-    self.cg_e8(0xC3);                                                // ret
-    // _lyx_map_has is 73 bytes ✓
+    // ---- Map-Laufzeit, Teil 1: Eintritte (#2150) ----------------------
+    //
+    // Bis 1.2.16B lag hier eine Map mit FESTER Kapazitaet ohne Wachstum:
+    // die siebzehnte Eintragung in eine Map mit 16 Plaetzen sondierte endlos.
+    // Und der Schluessel 0 galt als "frei": `m[0] := v` legte jedesmal einen
+    // neuen Eintrag an, `m[0]` las immer 0. Beides ist mit dem neuen Aufbau
+    // weg:
+    //
+    //   [m+0]  Kapazitaet (Zweierpotenz)    [m+8]  Anzahl
+    //   [m+16] Zeiger auf die Eintraege — je 32 Byte:
+    //          [+0] Schluessel, [+8] Wert, [+16] Hash, [+24] belegt (0/1)
+    //
+    // Die Eintraege liegen in einem EIGENEN Block, damit der Kopf beim
+    // Wachsen an seiner Adresse bleibt — die Map-Variable haelt ihn. Ab drei
+    // Viertel Fuellung verdoppelt `setzen` die Kapazitaet (kern/grow unten).
+    // Der IR-Weg (ir_lower.lyx, _mapNeu/_mapZugriff) baut genau dasselbe —
+    // die beiden muessen uebereinstimmen.
+    //
+    // Die Bytes stammen aus GNU as (Quelle: tools/map_laufzeit_x86.s; die
+    // Sprungweiten hat der Assembler gerechnet, nicht die Hand). Sie gelten
+    // nur an genau diesen Versaetzen — deshalb die Pruefungen davor und
+    // danach. _lyx_map_new legt Kopf und Eintraege per mmap an und prueft
+    // beide Aufrufe (oom im Kern); set/get/has springen mit dem Modus in rcx
+    // und r8 = 0 (Ganzzahlschluessel) in den gemeinsamen Kern.
+    if (self.codeLen != CG_H_MAP_NEW) {
+      EPrintStr("codegen error: _lyx_map_new beginnt bei "c); EPrintInt(self.codeLen);
+      EPrintStr(", erwartet "c); EPrintInt(CG_H_MAP_NEW); EPrintStrLn(" (#2150)"c);
+      exit(1);
+    }
+    // map_new:
+    self.cg_e8(0x53);  // push rbx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);  // mov rbx,rdi
+    self.cg_e8(0x31); self.cg_e8(0xFF);  // xor edi,edi
+    self.cg_e8(0xBE); self.cg_e8(0x18); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov esi,0x18
+    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov edx,0x3
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov r10d,0x22
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);  // mov r8,0xffffffffffffffff
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d,r9d
+    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,0x9
+    self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall
+    self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e8(0x01); self.cg_e8(0xF0); self.cg_e8(0xFF); self.cg_e8(0xFF);  // cmp rax,0xfffffffffffff001
+    self.cg_e8(0x73); self.cg_e8(0x5F);  // jae oom
+    self.cg_e8(0x50);  // push rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xDE);  // mov rsi,rbx
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE6); self.cg_e8(0x05);  // shl rsi,0x5
+    self.cg_e8(0x31); self.cg_e8(0xFF);  // xor edi,edi
+    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov edx,0x3
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov r10d,0x22
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);  // mov r8,0xffffffffffffffff
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d,r9d
+    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,0x9
+    self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall
+    self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e8(0x01); self.cg_e8(0xF0); self.cg_e8(0xFF); self.cg_e8(0xFF);  // cmp rax,0xfffffffffffff001
+    self.cg_e8(0x73); self.cg_e8(0x31);  // jae oom
+    self.cg_e8(0x59);  // pop rcx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x19);  // mov QWORD PTR [rcx],rbx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x41); self.cg_e8(0x10);  // mov QWORD PTR [rcx+0x10],rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC8);  // mov rax,rcx
+    self.cg_e8(0x5B);  // pop rbx
+    self.cg_e8(0xC3);  // ret
+    // map_set:
+    self.cg_e8(0x31); self.cg_e8(0xC9);  // xor ecx,ecx
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor r8d,r8d
+    self.cg_e8(0xE9); self.cg_e8(0x7A); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);  // jmp kern
+    // map_get:
+    self.cg_e8(0xB9); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov ecx,0x1
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor r8d,r8d
+    self.cg_e8(0xE9); self.cg_e8(0x6D); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);  // jmp kern
+    // map_has:
+    self.cg_e8(0xB9); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov ecx,0x2
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC0);  // xor r8d,r8d
+    self.cg_e8(0xE9); self.cg_e8(0x60); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);  // jmp kern
+    // oom:
+    // #2150: Der Text liegt im DATENbereich, nicht im Code — Text zwischen
+    // Befehlen disassembliert jeder Werkzeug anders (tests/disasm_test.sh).
+    var oomText: int64 := self.dataLen;
+    var oomI: int64 := 0;
+    var oomT: pchar := "Speicheranforderung fehlgeschlagen (mmap)\n"c;
+    while (oomI < 42) { self.cg_edata(StrCharAt(oomT, oomI) & 255); oomI += 1; }
+    self.cg_edata(0);
+    self.cg_emitLeaRdiData(oomText);                            // lea rdi,[rip+text]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFE);       // mov rsi,rdi
+    self.cg_e8(0xBA); self.cg_e8(0x2A); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov edx,0x2a
+    self.cg_e8(0xBF); self.cg_e8(0x02); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov edi,0x2
+    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,0x1
+    self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall
+    self.cg_e8(0xBF); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov edi,0x1
+    self.cg_e8(0xB8); self.cg_e8(0xE7); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,0xe7
+    self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall
+    // Rest bis __lyx_stack_fail mit int3 fuellen.
+    while (self.codeLen < CG_H_STACK_FAIL) { self.cg_e8(0xCC); }
+    if (self.codeLen != CG_H_STACK_FAIL) {
+      EPrintStrLn("codegen error: Map-Eintritte ragen ueber __lyx_stack_fail hinaus (#2150)"c);
+      exit(1);
+    }
 
     // ---- __lyx_stack_fail (70 bytes, starts at offset 1275) — WP-18 ----
     // Called when stack canary mismatch detected. Writes message to stderr, exits 1.
@@ -22470,159 +22520,218 @@ pub type Codegen = class {
       EPrintStrLn(" — CG_H_USER anpassen (#1284)"c);
       exit(1);
     }
-    // ---- _lyx_map_str (#1291) ------------------------------------------
-    // _lyx_map_str(rdi=map, rsi=key(pchar), rdx=value, rcx=modus)
+    // ---- Map-Laufzeit, Teil 2: der Kern (#2150, vorher _lyx_map_str #1291)
+    // _lyx_map_str(rdi=map, rsi=key(pchar), rdx=value, rcx=modus) setzt
+    // r8 = 1 und faellt in den Kern; set/get/has springen mit r8 = 0 hinein.
     //   modus 0 = setzen, 1 = lesen, 2 = enthalten
     //   rax: setzen → 0, lesen → Wert (0 wenn nicht da), enthalten → 0/1
     //
-    // Warum eine EINZIGE Routine statt drei: der Unterschied zwischen setzen,
-    // lesen und enthalten sind drei Zeilen am Ende; die Sondierung ist
-    // dieselbe. Drei Kopien haetten dreimal dieselben Sprungweiten von Hand
-    // gebraucht — und genau dort entstehen die Fehler, die man nicht sieht.
+    // Ganzzahlschluessel: Hash = Schluessel, verglichen wird die Zahl.
+    // pchar-Schluessel: Hash = FNV-1a ueber die Bytes bis NUL, verglichen
+    // erst der Hash, dann der Inhalt (#1291) — zwei gleich geschriebene
+    // Literale an verschiedenen Adressen finden denselben Eintrag.
+    // Frei ist ein Platz, wenn [+24] = 0 — NICHT mehr der Schluessel 0.
     //
-    // Der Unterschied zur ganzzahligen Fassung: verglichen wird der INHALT.
-    // Der Schluessel-Hash (FNV-1a ueber die Bytes bis NUL) steht im dritten
-    // Feld des Slots, das bisher eine Kopie des Schluessels trug. Beim
-    // Sondieren wird zuerst der Hash verglichen (billig) und nur bei
-    // Gleichheit Byte fuer Byte. Damit finden zwei gleich geschriebene
-    // Literale denselben Eintrag, obwohl sie an verschiedenen Adressen liegen
-    // — das war der Grund, warum pchar-Schluessel bis 1.0.17K abgewiesen
-    // wurden (#1291, #1152).
+    // grow: neue Eintraege mit doppelter Kapazitaet, alle belegten Plaetze
+    // ueber ihren gespeicherten Hash neu einsortiert, der alte Block per
+    // munmap zurueck. Ein gescheitertes mmap springt nach oom (Teil 1, hinter
+    // den Eintritten): Meldung nach stderr, exit_group(1) — derselbe Text wie
+    // cg_emitMmapGeprueft (#1947). Er liegt bewusst VOR 1372: win64 kopiert
+    // den Helferblock ab dort woertlich (win_x86.lyx, WIN_HELPERS_SZ), und
+    // write/exit_group waeren dort zwei weitere rohe Syscalls
+    // (tests/win64_syscalls_test.sh). mmap/munmap ersetzt der win64-Ruecken.
     var mapStrStart: int64 := self.codeLen;
-    // Prolog
-    self.cg_e8(0x53);                                              // push rbx
-    self.cg_e8(0x41); self.cg_e8(0x54);                            // push r12
-    self.cg_e8(0x41); self.cg_e8(0x55);                            // push r13
-    self.cg_e8(0x41); self.cg_e8(0x56);                            // push r14
-    self.cg_e8(0x41); self.cg_e8(0x57);                            // push r15
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);          // mov rbx,rdi   (map)
-    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF4);          // mov r12,rsi   (key)
-    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xD5);          // mov r13,rdx   (value)
-    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xCB);          // mov r11,rcx   (modus)
-    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x33);          // mov r14,[rbx] (cap)
-    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xCE);          // dec r14       (maske)
-    // FNV-1a: r15 = 14695981039346656037; r10 = 1099511628211
-    self.cg_e8(0x49); self.cg_e8(0xBF);
-    // 14695981039346656037 = 0xCBF29CE484222325, little endian.
-    self.cg_e8(0x25); self.cg_e8(0x23); self.cg_e8(0x22); self.cg_e8(0x84);
-    self.cg_e8(0xE4); self.cg_e8(0x9C); self.cg_e8(0xF2); self.cg_e8(0xCB);   // movabs r15, FNV-Offset
-    self.cg_e8(0x49); self.cg_e8(0xBA);
-    self.cg_e8(0xB3); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);
-    self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);   // movabs r10, FNV-Prime
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE6);          // mov rsi,r12
-    var hLoop: int64 := self.codeLen;
-    self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x06);          // movzx eax,byte [rsi]
-    self.cg_e8(0x84); self.cg_e8(0xC0);                            // test al,al
-    self.cg_e8(0x0F); self.cg_e8(0x84);                            // jz .hdone (rel32)
-    var pHDone: int64 := self.codeLen; self.cg_e32(0);
-    self.cg_e8(0x49); self.cg_e8(0x31); self.cg_e8(0xC7);          // xor r15,rax
+    if (mapStrStart != CG_H_MAP_STR) {
+      EPrintStr("codegen error: Map-Kern beginnt bei "c); EPrintInt(mapStrStart);
+      EPrintStr(", erwartet "c); EPrintInt(CG_H_MAP_STR); EPrintStrLn(" (#2150)"c);
+      exit(1);
+    }
+    // map_str:
+    self.cg_e8(0x41); self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov r8d,0x1
+    // kern:
+    self.cg_e8(0x53);  // push rbx
+    self.cg_e8(0x41); self.cg_e8(0x54);  // push r12
+    self.cg_e8(0x41); self.cg_e8(0x55);  // push r13
+    self.cg_e8(0x41); self.cg_e8(0x56);  // push r14
+    self.cg_e8(0x41); self.cg_e8(0x57);  // push r15
+    self.cg_e8(0x55);  // push rbp
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x08);  // sub rsp,0x8
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);  // mov QWORD PTR [rsp],r8
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB);  // mov rbx,rdi
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xF4);  // mov r12,rsi
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xD5);  // mov r13,rdx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xCD);  // mov rbp,rcx
+    self.cg_e8(0x4D); self.cg_e8(0x85); self.cg_e8(0xC0);  // test r8,r8
+    self.cg_e8(0x74); self.cg_e8(0x2A);  // je inthash
+    self.cg_e8(0x49); self.cg_e8(0xBF); self.cg_e8(0x25); self.cg_e8(0x23); self.cg_e8(0x22); self.cg_e8(0x84); self.cg_e8(0xE4); self.cg_e8(0x9C); self.cg_e8(0xF2); self.cg_e8(0xCB);  // movabs r15,0xcbf29ce484222325
+    self.cg_e8(0x49); self.cg_e8(0xBA); self.cg_e8(0xB3); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00);  // movabs r10,0x100000001b3
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE6);  // mov rsi,r12
+    // hloop:
+    self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x06);  // movzx eax,BYTE PTR [rsi]
+    self.cg_e8(0x84); self.cg_e8(0xC0);  // test al,al
+    self.cg_e8(0x74); self.cg_e8(0x0F);  // je hdone
+    self.cg_e8(0x49); self.cg_e8(0x31); self.cg_e8(0xC7);  // xor r15,rax
     self.cg_e8(0x4D); self.cg_e8(0x0F); self.cg_e8(0xAF); self.cg_e8(0xFA);  // imul r15,r10
-    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);          // inc rsi
-    self.cg_e8(0xE9); self.cg_e32(hLoop - self.codeLen - 4);       // jmp .hloop
-    poke32(self.code + pHDone, self.codeLen - pHDone - 4);         // .hdone:
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xF8);          // mov rax,r15
-    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14   (index)
-    // Sondierschleife
-    var pTop: int64 := self.codeLen;
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);          // mov rcx,rax
-    self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC9); self.cg_e8(0x18);  // imul rcx,rcx,24
-    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xD9);          // add rcx,rbx
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x18);  // add rcx,24
-    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x11);          // mov r10,[rcx]  (Schluessel im Slot)
-    self.cg_e8(0x4D); self.cg_e8(0x85); self.cg_e8(0xD2);          // test r10,r10
-    self.cg_e8(0x0F); self.cg_e8(0x84);                            // jz .leer
-    var pLeer: int64 := self.codeLen; self.cg_e32(0);
-    self.cg_e8(0x4C); self.cg_e8(0x3B); self.cg_e8(0x79); self.cg_e8(0x10);  // cmp r15,[rcx+16]
-    self.cg_e8(0x0F); self.cg_e8(0x85);                            // jne .weiter
-    var pW1: int64 := self.codeLen; self.cg_e32(0);
-    // Inhaltsvergleich: rdi=Slot-Schluessel, rsi=gesuchter Schluessel
-    self.cg_e8(0x50);                                              // push rax
-    self.cg_e8(0x51);                                              // push rcx
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xD7);          // mov rdi,r10
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE6);          // mov rsi,r12
-    var sTop: int64 := self.codeLen;
-    self.cg_e8(0x8A); self.cg_e8(0x07);                            // mov al,[rdi]
-    self.cg_e8(0x3A); self.cg_e8(0x06);                            // cmp al,[rsi]
-    self.cg_e8(0x0F); self.cg_e8(0x85);                            // jne .ungleich
-    var pSne: int64 := self.codeLen; self.cg_e32(0);
-    self.cg_e8(0x84); self.cg_e8(0xC0);                            // test al,al
-    self.cg_e8(0x0F); self.cg_e8(0x84);                            // jz .gleich
-    var pSeq: int64 := self.codeLen; self.cg_e32(0);
-    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);          // inc rdi
-    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);          // inc rsi
-    self.cg_e8(0xE9); self.cg_e32(sTop - self.codeLen - 4);        // jmp .stop
-    poke32(self.code + pSne, self.codeLen - pSne - 4);             // .ungleich:
-    self.cg_e8(0x59);                                              // pop rcx
-    self.cg_e8(0x58);                                              // pop rax
-    self.cg_e8(0xE9);                                              // jmp .weiter
-    var pW2: int64 := self.codeLen; self.cg_e32(0);
-    poke32(self.code + pSeq, self.codeLen - pSeq - 4);             // .gleich:
-    self.cg_e8(0x59);                                              // pop rcx
-    self.cg_e8(0x58);                                              // pop rax
-    self.cg_e8(0xE9);                                              // jmp .treffer
-    var pTreffer: int64 := self.codeLen; self.cg_e32(0);
-    // .weiter: naechster Slot
-    poke32(self.code + pW1, self.codeLen - pW1 - 4);
-    poke32(self.code + pW2, self.codeLen - pW2 - 4);
-    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);          // inc rax
-    self.cg_e8(0x49); self.cg_e8(0x23); self.cg_e8(0xC6);          // and rax,r14
-    self.cg_e8(0xE9); self.cg_e32(pTop - self.codeLen - 4);        // jmp .ptop
-    // .leer: freier Slot
-    poke32(self.code + pLeer, self.codeLen - pLeer - 4);
-    self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0xFB); self.cg_e8(0x00);  // cmp r11,0
-    self.cg_e8(0x0F); self.cg_e8(0x85);                            // jne .null
-    var pNull1: int64 := self.codeLen; self.cg_e32(0);
-    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x53); self.cg_e8(0x08);  // mov r10,[rbx+8]
-    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC2);          // inc r10
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x53); self.cg_e8(0x08);  // mov [rbx+8],r10
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x21);          // mov [rcx],r12
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x69); self.cg_e8(0x08);  // mov [rcx+8],r13
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x79); self.cg_e8(0x10);  // mov [rcx+16],r15
-    self.cg_e8(0x31); self.cg_e8(0xC0);                            // xor eax,eax
-    self.cg_e8(0xE9);                                              // jmp .ende
-    var pEnde1: int64 := self.codeLen; self.cg_e32(0);
-    // .treffer
-    poke32(self.code + pTreffer, self.codeLen - pTreffer - 4);
-    self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0xFB); self.cg_e8(0x00);  // cmp r11,0
-    self.cg_e8(0x0F); self.cg_e8(0x85);                            // jne .t_lesen
-    var pTLesen: int64 := self.codeLen; self.cg_e32(0);
-    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x69); self.cg_e8(0x08);  // mov [rcx+8],r13
-    self.cg_e8(0x31); self.cg_e8(0xC0);                            // xor eax,eax
-    self.cg_e8(0xE9);                                              // jmp .ende
-    var pEnde2: int64 := self.codeLen; self.cg_e32(0);
-    poke32(self.code + pTLesen, self.codeLen - pTLesen - 4);       // .t_lesen:
-    self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0xFB); self.cg_e8(0x01);  // cmp r11,1
-    self.cg_e8(0x0F); self.cg_e8(0x85);                            // jne .t_hat
-    var pTHat: int64 := self.codeLen; self.cg_e32(0);
-    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x41); self.cg_e8(0x08);  // mov rax,[rcx+8]
-    self.cg_e8(0xE9);                                              // jmp .ende
-    var pEnde3: int64 := self.codeLen; self.cg_e32(0);
-    poke32(self.code + pTHat, self.codeLen - pTHat - 4);           // .t_hat:
-    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,1
-    self.cg_e8(0xE9);                                              // jmp .ende
-    var pEnde4: int64 := self.codeLen; self.cg_e32(0);
-    // .null: nicht gefunden bei lesen/enthalten
-    poke32(self.code + pNull1, self.codeLen - pNull1 - 4);
-    self.cg_e8(0x31); self.cg_e8(0xC0);                            // xor eax,eax
-    // .ende
-    poke32(self.code + pEnde1, self.codeLen - pEnde1 - 4);
-    poke32(self.code + pEnde2, self.codeLen - pEnde2 - 4);
-    poke32(self.code + pEnde3, self.codeLen - pEnde3 - 4);
-    poke32(self.code + pEnde4, self.codeLen - pEnde4 - 4);
-    self.cg_e8(0x41); self.cg_e8(0x5F);                            // pop r15
-    self.cg_e8(0x41); self.cg_e8(0x5E);                            // pop r14
-    self.cg_e8(0x41); self.cg_e8(0x5D);                            // pop r13
-    self.cg_e8(0x41); self.cg_e8(0x5C);                            // pop r12
-    self.cg_e8(0x5B);                                              // pop rbx
-    self.cg_e8(0xC3);                                              // ret
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);  // inc rsi
+    self.cg_e8(0xEB); self.cg_e8(0xED);  // jmp hloop
+    // inthash:
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xE7);  // mov r15,r12
+    // hdone:
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xED);  // test rbp,rbp
+    self.cg_e8(0x75); self.cg_e8(0x1C);  // jne probe
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x43); self.cg_e8(0x08);  // mov rax,QWORD PTR [rbx+0x8]
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);  // inc rax
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(0x02);  // shl rax,0x2
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x0B);  // mov rcx,QWORD PTR [rbx]
+    self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x49);  // lea rcx,[rcx+rcx*2]
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);  // cmp rax,rcx
+    self.cg_e8(0x76); self.cg_e8(0x05);  // jbe probe
+    self.cg_e8(0xE8); self.cg_e8(0xAD); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // call grow
+    // probe:
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x33);  // mov r14,QWORD PTR [rbx]
+    self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xCE);  // dec r14
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xF8);  // mov rax,r15
+    self.cg_e8(0x4C); self.cg_e8(0x21); self.cg_e8(0xF0);  // and rax,r14
+    // ptop:
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);  // mov rcx,rax
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(0x05);  // shl rcx,0x5
+    self.cg_e8(0x48); self.cg_e8(0x03); self.cg_e8(0x4B); self.cg_e8(0x10);  // add rcx,QWORD PTR [rbx+0x10]
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0x79); self.cg_e8(0x18); self.cg_e8(0x00);  // cmp QWORD PTR [rcx+0x18],0x0
+    self.cg_e8(0x74); self.cg_e8(0x3E);  // je leer
+    self.cg_e8(0x4C); self.cg_e8(0x3B); self.cg_e8(0x79); self.cg_e8(0x10);  // cmp r15,QWORD PTR [rcx+0x10]
+    self.cg_e8(0x75); self.cg_e8(0x30);  // jne weiter
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0x3C); self.cg_e8(0x24); self.cg_e8(0x00);  // cmp QWORD PTR [rsp],0x0
+    self.cg_e8(0x75); self.cg_e8(0x07);  // jne strcmp
+    self.cg_e8(0x4C); self.cg_e8(0x3B); self.cg_e8(0x21);  // cmp r12,QWORD PTR [rcx]
+    self.cg_e8(0x74); self.cg_e8(0x4C);  // je treffer
+    self.cg_e8(0xEB); self.cg_e8(0x22);  // jmp weiter
+    // strcmp:
+    self.cg_e8(0x50);  // push rax
+    self.cg_e8(0x51);  // push rcx
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x39);  // mov rdi,QWORD PTR [rcx]
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE6);  // mov rsi,r12
+    // sloop:
+    self.cg_e8(0x8A); self.cg_e8(0x07);  // mov al,BYTE PTR [rdi]
+    self.cg_e8(0x3A); self.cg_e8(0x06);  // cmp al,BYTE PTR [rsi]
+    self.cg_e8(0x75); self.cg_e8(0x0C);  // jne ungleich
+    self.cg_e8(0x84); self.cg_e8(0xC0);  // test al,al
+    self.cg_e8(0x74); self.cg_e8(0x0C);  // je gleich
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC7);  // inc rdi
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC6);  // inc rsi
+    self.cg_e8(0xEB); self.cg_e8(0xEE);  // jmp sloop
+    // ungleich:
+    self.cg_e8(0x59);  // pop rcx
+    self.cg_e8(0x58);  // pop rax
+    self.cg_e8(0xEB); self.cg_e8(0x04);  // jmp weiter
+    // gleich:
+    self.cg_e8(0x59);  // pop rcx
+    self.cg_e8(0x58);  // pop rax
+    self.cg_e8(0xEB); self.cg_e8(0x28);  // jmp treffer
+    // weiter:
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);  // inc rax
+    self.cg_e8(0x4C); self.cg_e8(0x21); self.cg_e8(0xF0);  // and rax,r14
+    self.cg_e8(0xEB); self.cg_e8(0xB0);  // jmp ptop
+    // leer:
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xED);  // test rbp,rbp
+    self.cg_e8(0x75); self.cg_e8(0x3B);  // jne null
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0x43); self.cg_e8(0x08);  // inc QWORD PTR [rbx+0x8]
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x21);  // mov QWORD PTR [rcx],r12
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x69); self.cg_e8(0x08);  // mov QWORD PTR [rcx+0x8],r13
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x79); self.cg_e8(0x10);  // mov QWORD PTR [rcx+0x10],r15
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0x41); self.cg_e8(0x18); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov QWORD PTR [rcx+0x18],0x1
+    self.cg_e8(0x31); self.cg_e8(0xC0);  // xor eax,eax
+    self.cg_e8(0xEB); self.cg_e8(0x22);  // jmp ende
+    // treffer:
+    self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xED);  // test rbp,rbp
+    self.cg_e8(0x75); self.cg_e8(0x08);  // jne t_lesen
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x69); self.cg_e8(0x08);  // mov QWORD PTR [rcx+0x8],r13
+    self.cg_e8(0x31); self.cg_e8(0xC0);  // xor eax,eax
+    self.cg_e8(0xEB); self.cg_e8(0x15);  // jmp ende
+    // t_lesen:
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xFD); self.cg_e8(0x01);  // cmp rbp,0x1
+    self.cg_e8(0x75); self.cg_e8(0x06);  // jne t_hat
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x41); self.cg_e8(0x08);  // mov rax,QWORD PTR [rcx+0x8]
+    self.cg_e8(0xEB); self.cg_e8(0x09);  // jmp ende
+    // t_hat:
+    self.cg_e8(0xB8); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,0x1
+    self.cg_e8(0xEB); self.cg_e8(0x02);  // jmp ende
+    // null:
+    self.cg_e8(0x31); self.cg_e8(0xC0);  // xor eax,eax
+    // ende:
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x08);  // add rsp,0x8
+    self.cg_e8(0x5D);  // pop rbp
+    self.cg_e8(0x41); self.cg_e8(0x5F);  // pop r15
+    self.cg_e8(0x41); self.cg_e8(0x5E);  // pop r14
+    self.cg_e8(0x41); self.cg_e8(0x5D);  // pop r13
+    self.cg_e8(0x41); self.cg_e8(0x5C);  // pop r12
+    self.cg_e8(0x5B);  // pop rbx
+    self.cg_e8(0xC3);  // ret
+    // grow:
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x33);  // mov r14,QWORD PTR [rbx]
+    self.cg_e8(0x4B); self.cg_e8(0x8D); self.cg_e8(0x34); self.cg_e8(0x36);  // lea rsi,[r14+r14*1]
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE6); self.cg_e8(0x05);  // shl rsi,0x5
+    self.cg_e8(0x31); self.cg_e8(0xFF);  // xor edi,edi
+    self.cg_e8(0xBA); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov edx,0x3
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov r10d,0x22
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);  // mov r8,0xffffffffffffffff
+    self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d,r9d
+    self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,0x9
+    self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall
+    self.cg_e8(0x48); self.cg_e8(0x3D); self.cg_e8(0x01); self.cg_e8(0xF0); self.cg_e8(0xFF); self.cg_e8(0xFF);  // cmp rax,0xfffffffffffff001
+    self.cg_e8(0x0F); self.cg_e8(0x83); self.cg_e8(0x4D); self.cg_e8(0xFD); self.cg_e8(0xFF); self.cg_e8(0xFF);  // jae oom
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);  // mov rdi,rax
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x73); self.cg_e8(0x10);  // mov rsi,QWORD PTR [rbx+0x10]
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0xF1);  // mov r9,r14
+    self.cg_e8(0x4F); self.cg_e8(0x8D); self.cg_e8(0x44); self.cg_e8(0x36); self.cg_e8(0xFF);  // lea r8,[r14+r14*1-0x1]
+    self.cg_e8(0x31); self.cg_e8(0xD2);  // xor edx,edx
+    // gl:
+    self.cg_e8(0x4C); self.cg_e8(0x39); self.cg_e8(0xCA);  // cmp rdx,r9
+    self.cg_e8(0x73); self.cg_e8(0x54);  // jae gdone
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD1);  // mov rcx,rdx
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(0x05);  // shl rcx,0x5
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xF1);  // add rcx,rsi
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0x79); self.cg_e8(0x18); self.cg_e8(0x00);  // cmp QWORD PTR [rcx+0x18],0x0
+    self.cg_e8(0x74); self.cg_e8(0x3E);  // je gnext
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x41); self.cg_e8(0x10);  // mov rax,QWORD PTR [rcx+0x10]
+    self.cg_e8(0x4C); self.cg_e8(0x21); self.cg_e8(0xC0);  // and rax,r8
+    // gp:
+    self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov r10,rax
+    self.cg_e8(0x49); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x05);  // shl r10,0x5
+    self.cg_e8(0x49); self.cg_e8(0x01); self.cg_e8(0xFA);  // add r10,rdi
+    self.cg_e8(0x49); self.cg_e8(0x83); self.cg_e8(0x7A); self.cg_e8(0x18); self.cg_e8(0x00);  // cmp QWORD PTR [r10+0x18],0x0
+    self.cg_e8(0x74); self.cg_e8(0x08);  // je gput
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);  // inc rax
+    self.cg_e8(0x4C); self.cg_e8(0x21); self.cg_e8(0xC0);  // and rax,r8
+    self.cg_e8(0xEB); self.cg_e8(0xE7);  // jmp gp
+    // gput:
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x19);  // mov r11,QWORD PTR [rcx]
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0x1A);  // mov QWORD PTR [r10],r11
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x59); self.cg_e8(0x08);  // mov r11,QWORD PTR [rcx+0x8]
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0x5A); self.cg_e8(0x08);  // mov QWORD PTR [r10+0x8],r11
+    self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x59); self.cg_e8(0x10);  // mov r11,QWORD PTR [rcx+0x10]
+    self.cg_e8(0x4D); self.cg_e8(0x89); self.cg_e8(0x5A); self.cg_e8(0x10);  // mov QWORD PTR [r10+0x10],r11
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0x42); self.cg_e8(0x18); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov QWORD PTR [r10+0x18],0x1
+    // gnext:
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC2);  // inc rdx
+    self.cg_e8(0xEB); self.cg_e8(0xA7);  // jmp gl
+    // gdone:
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x7B); self.cg_e8(0x10);  // mov QWORD PTR [rbx+0x10],rdi
+    self.cg_e8(0x4B); self.cg_e8(0x8D); self.cg_e8(0x04); self.cg_e8(0x09);  // lea rax,[r9+r9*1]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x03);  // mov QWORD PTR [rbx],rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF7);  // mov rdi,rsi
+    self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xCE);  // mov rsi,r9
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE6); self.cg_e8(0x05);  // shl rsi,0x5
+    self.cg_e8(0xB8); self.cg_e8(0x0B); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,0xb
+    self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall
+    self.cg_e8(0xC3);  // ret
     // Auch hier gemessen statt gezaehlt (#1284): ein Versatz legte den
     // Benutzercode an die falsche Stelle, und das traefe JEDES Programm.
     if (self.codeLen - mapStrStart != CG_H_MAP_STR_LEN) {
-      EPrintStr("codegen error: _lyx_map_str hat "c);
+      EPrintStr("codegen error: Map-Kern hat "c);
       EPrintInt(self.codeLen - mapStrStart);
       EPrintStr(" Byte, erwartet "c);
       EPrintInt(CG_H_MAP_STR_LEN);
-      EPrintStrLn(" — CG_H_USER anpassen (#1291)"c);
+      EPrintStrLn(" — CG_H_USER anpassen (#2150)"c);
       exit(1);
     }
     // Total helpers: ... + CG_H_F64STR_CHK_LEN + CG_H_MAP_STR_LEN = CG_H_USER  ✓
@@ -24276,6 +24385,14 @@ pub type Codegen = class {
           poke8(self.globalIsArray + gIdx, 1);
         }
 
+        // #2150: eine MAP ohne Startwert bekommt ihre leere Map zur Laufzeit,
+        // wie das Local (mapNoInit, #1152) — sonst traf der erste Zugriff
+        // den Nullzeiger. Gerechnet in cg_miEinsInit; cg_miLaufzeit sagt
+        // dasselbe (die beiden muessen uebereinstimmen).
+        if (aggKind == 0 && self.cg_nc1(cur) < 0 && gRedundant == 0 && (gtNode >= 0 && self.cg_nkind(gtNode) == 60 && self.cg_nslen(gtNode) == 3 && self.cg_seq(self.cg_nsval(gtNode), 3, "Map", 3))) {
+          self.cg_miVormerken(cur);
+        }
+
         // Write initializer directly into data section
         //
         // #1164: Bis 1.0.15C stand hier `== CGN_LIT_INT`, und alles andere fiel
@@ -24738,6 +24855,7 @@ pub type Codegen = class {
     self.globalVars     := alloc(self.globalVarCap * 24);
     self.globalIsPchar  := alloc(self.globalVarCap);
     self.globalIsFnPtr  := alloc(self.globalVarCap);          // #1574
+    self.globalMapStrKey := alloc(self.globalVarCap);         // #2150
     self.globalFnPtrF64 := alloc(self.globalVarCap);          // #1574
     self.conFnCap    := 16;                                   // #1589
     self.conFnTab    := alloc(self.conFnCap * 32);
@@ -26366,7 +26484,13 @@ pub type Codegen = class {
   fn cg_miLaufzeit(d: int64): int64 {
     if (self.cg_nkind(d) != CGN_VAR_DECL) { return 0; }
     var ini: int64 := self.cg_nc1(d);
-    if (ini < 0) { return 0; }
+    if (ini < 0) {
+      // #2150: Map ohne Startwert (siehe cg_genFile, CGN_VAR_DECL).
+      var mtn: int64 := self.cg_nc0(d);
+      if (mtn >= 0 && self.cg_nkind(mtn) == 60 && self.cg_nslen(mtn) == 3
+          && self.cg_seq(self.cg_nsval(mtn), 3, "Map", 3)) { return 1; }
+      return 0;
+    }
     var ik: int64 := self.cg_nkind(ini);
     if (ik == CGN_LIT_STR || ik == CGN_CLOSURE) { return 0; }
     if (ik == CGN_IDENT && self.cg_isDeclaredFunc(self.cg_nsval(ini), self.cg_nslen(ini)) != 0) { return 0; }
@@ -26421,6 +26545,16 @@ pub type Codegen = class {
     var gtNode: int64 := self.cg_nc0(d);
     var gIdx: int64 := self.cg_findGlobalIdx(name, nlen);
     var doff: int64 := self.cg_findGlobal(name, nlen);
+    if (ini < 0 && gIdx >= 0 && doff >= 0 && (gtNode >= 0 && self.cg_nkind(gtNode) == 60 && self.cg_nslen(gtNode) == 3 && self.cg_seq(self.cg_nsval(gtNode), 3, "Map", 3))) {
+      // #2150: leere Map mit derselben Anfangskapazitaet wie das Local
+      // (mapNoInit, #1152).
+      self.cg_movRaxImm(16);
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);   // mov rdi, rax
+      var ppMg: int64 := self.cg_emitCall();
+      poke32(self.code + ppMg, CG_H_MAP_NEW - ppMg - 4);
+      self.cg_storeRaxGlobal(doff);
+      return;
+    }
     if (gIdx < 0 || doff < 0 || ini < 0) {
       EPrintStr("interner fehler (#2136): Modulvariable '"c);
       sys_write(2, name as int64, nlen);

@@ -939,6 +939,34 @@ fn _irFaltF64(bop: int64, lb: int64, rb: int64): int64 {
   return 0;
 }
 
+// #2148: Vergleich zweier gefalteter Gleitkommakonstanten (IEEE-Bits) —
+// 1/0. Dieselbe Zuordnung wie der Vergleichsteil von cg_faltF64 auf x86
+// (82 = <=, 83 = >, lexer.lyx) — die beiden muessen uebereinstimmen.
+fn _irVergleichF64(bop: int64, lb: int64, rb: int64): int64 {
+  var a: f64 := _irBitsAlsF64(lb);
+  var b: f64 := _irBitsAlsF64(rb);
+  if (bop == 79) { if (a == b) { return 1; } return 0; }  // ==
+  if (bop == 80) { if (a != b) { return 1; } return 0; }  // !=
+  if (bop == 81) { if (a <  b) { return 1; } return 0; }  // <
+  if (bop == 82) { if (a <= b) { return 1; } return 0; }  // <=
+  if (bop == 83) { if (a >  b) { return 1; } return 0; }  // >
+  if (bop == 84) { if (a >= b) { return 1; } return 0; }  // >=
+  EPrintStr("lyxc: interner Fehler (#2148): Vergleich (Token "c);
+  EPrintInt(bop);
+  EPrintStrLn(") in der Gleitkomma-Faltung, den _constFaltbar nicht zulaesst."c);
+  exit(1);
+  return 0;
+}
+
+// #2148: eingebauter Ganzzahltyp (64 Bit oder schmal). Gegenstueck zu
+// cg_istGanzzahlTypName auf x86.
+fn _irIstGanzzahlTyp(tp: pchar, tl: int64): int64 {
+  if (_irSchmalArt(tp, tl) != 0) { return 1; }
+  if (_irNameGleich(tp, tl, "int64"c, 5) != 0 || _irNameGleich(tp, tl, "i64"c, 3) != 0) { return 1; }
+  if (_irNameGleich(tp, tl, "uint64"c, 6) != 0 || _irNameGleich(tp, tl, "u64"c, 3) != 0) { return 1; }
+  return 0;
+}
+
 // #2139: schmale Ganzzahltypen. Dieselbe Zuordnung wie cg_narrowKindOf in
 // codegen_x86.lyx (#1151) — die beiden muessen uebereinstimmen:
 //   1 int8/i8, 2 uint8/u8, 3 int16/i16, 4 uint16/u16, 5 int32/i32,
@@ -3490,8 +3518,14 @@ pub type IRLower = class {
       var psA: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_CONST_STR, psA, -1, -1, psStrOff);
       self.irAddInstrDirect(IRO_STORE_LOCAL, 0, psA, -1, 0);
+      // #2148: PrintStr ist die pchar-Ausgabe — sie endet am ersten Nullbyte,
+      // wie PrintStr in std/io.lyx (StrLen) und _lyx_print_str auf x86. Bis
+      // 1.2.16B gab der IR-Weg bei `PrintStr("ab\0cd")` die ganze Literal-
+      // laenge aus, x86 nur "ab". Die volle Laenge gilt fuer Print (#2141).
+      var psNul: int64 := 0;
+      while (psNul < psOut && peek8(psBuf + psNul) != 0) { psNul := psNul + 1; }
       var psL: int64 := self.allocTemp();
-      self.irAddInstrDirect(IRO_CONST_INT, psL, -1, -1, psOut);
+      self.irAddInstrDirect(IRO_CONST_INT, psL, -1, -1, psNul);
       self.irAddInstrDirect(IRO_STORE_LOCAL, 1, psL, -1, 0);
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 1);
       return dest;
@@ -9217,6 +9251,11 @@ pub type IRLower = class {
     if (msgNode >= 0) {
       var msgTemp: int64 := self.lowerExpr(msgNode);
       self.irAddInstrDirect(IRO_PANIC, -1, msgTemp, -1, 0);
+    } else {
+      // #2150: Ohne Text entstand hier GAR NICHTS — das Programm lief nach
+      // dem panic weiter. Die Backends behandeln src1 < 0 als "ohne Meldung"
+      // und brechen trotzdem ab.
+      self.irAddInstrDirect(IRO_PANIC, -1, -1, -1, 0);
     }
   }
 
@@ -10436,6 +10475,7 @@ pub type IRLower = class {
   //   0 — nichts (gefaltet, f64-Literal, kein Anfangswert, keine Ablage)
   //   1 — den Anfangswert auswerten und speichern
   //   2 — Speicher fuer ein Array fester Groesse oder eine Struktur
+  //   3 — eine leere Map (#2150)
   // Die Unterscheidung muss mit dem Vorpass in lowerModule uebereinstimmen:
   // was er in den Datenbereich legt, darf hier nicht noch einmal entstehen,
   // und was er nicht ablegen kann, MUSS hier entstehen. Der Speicherfall
@@ -10470,6 +10510,12 @@ pub type IRLower = class {
     }
     if dk == NK_CON_DECL { return 0; }
     if ty < 0 { return 0; }
+    // #2150: `var g: Map<K, V>;` auf Modulebene — die leere Map entsteht zur
+    // Laufzeit wie beim Local (lowerStmt, #2141). Bis 1.2.16B blieb der Slot
+    // 0, und der erste Zugriff traf den Nullzeiger (SIGSEGV auf arm64).
+    if self.nodeKind(ty) == NK_TYPE_NAME {
+      if self.seq(self.nodeSVal(ty), self.nodeSLen(ty), "Map", 3) { return 3; }
+    }
     if self.nodeKind(ty) == NK_TYPE_ARRAY_FIXED {
       var szN: int64 := self.nodeC1(ty);
       if szN >= 0 && self.nodeKind(szN) == NK_LIT_INT {
@@ -10579,7 +10625,9 @@ pub type IRLower = class {
           exit(1);
         }
         var wert: int64 := 0 - 1;
-        if art == 1 {
+        if art == 3 {
+          wert := self._mapNeu(16);
+        } else if art == 1 {
           wert := self.lowerExpr(self.nodeC1(d));
           // #2139: auf die deklarierte Breite — `var e8: int8 := f() * 60`
           // hielt 300 statt 44. Dieselbe Kuerzung wie beim Local.
@@ -11998,14 +12046,20 @@ pub type IRLower = class {
   // eigene Laufzeit braucht.
   //
   // Bauart und Semantik sind die der x86-Laufzeit (codegen_x86.lyx,
-  // _lyx_map_new/_set/_get/_has und _lyx_map_str aus #1291) — die beiden
-  // muessen uebereinstimmen:
-  //   [m+0] Kapazitaet (Zweierpotenz, waechst nicht), [m+8] Anzahl,
-  //   ab [m+24] Eintraege zu 24 Byte: Schluessel, Wert, Hash.
-  //   Schluessel 0 heisst "frei"; sondiert wird linear ab Hash & (Kap-1).
-  //   Ganzzahlschluessel: Hash = Schluessel, verglichen wird die Zahl.
+  // Map-Laufzeit im Helferblock, Quelle tools/map_laufzeit_x86.s) — die
+  // beiden muessen uebereinstimmen:
+  //   [m+0] Kapazitaet (Zweierpotenz), [m+8] Anzahl, [m+16] Zeiger auf die
+  //   Eintraege zu 32 Byte: Schluessel, Wert, Hash, belegt (0/1).
+  //   Frei ist ein Platz mit belegt = 0; sondiert wird linear ab
+  //   Hash & (Kap-1). Ab drei Viertel Fuellung verdoppelt `setzen` die
+  //   Kapazitaet und sortiert alle Eintraege ueber ihren Hash neu ein.
+  //   Ganzzahlschluessel: Hash = Schluessel (gleicher Hash = gleicher
+  //                       Schluessel).
   //   pchar-Schluessel:   Hash = FNV-1a ueber die Bytes bis NUL, verglichen
   //                       erst der Hash, dann der Inhalt.
+  // #2150: Bis 1.2.16B wuchs die Map nicht (eine volle Map sondierte endlos)
+  // und Schluessel 0 hiess "frei" (`m[0] := v` legte jedesmal einen neuen
+  // Eintrag an); die Eintraege lagen ab [m+24] im selben Block.
 
   // Ist `nd` eine Map-Variable? 0 = nein, 1 = Ganzzahlschluessel,
   // 2 = pchar-Schluessel. Wie cg_localIsMap/cg_isStrKeyMap auf x86 nur fuer
@@ -12024,16 +12078,24 @@ pub type IRLower = class {
     return 1;
   }
 
-  // Leere Map mit fester Kapazitaet anlegen — _lyx_map_new: (cap+1)*24 Byte
-  // genullter Speicher, [m+0] = cap.
+  // Leere Map anlegen — wie _lyx_map_new: Kopf zu 24 Byte, Eintraege
+  // cap*32 Byte genullter Speicher (belegt = 0 heisst frei).
   fn _mapNeu(cap: int64): int64 {
     var szT: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_CONST_INT, szT, -1, -1, (cap + 1) * 24);
+    self.irAddInstrDirect(IRO_CONST_INT, szT, -1, -1, 24);
     var m: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_ALLOC, m, szT, -1, 0);
+    var eszT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, eszT, -1, -1, cap * 32);
+    var eT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, eT, eszT, -1, 0);
     var cT: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_CONST_INT, cT, -1, -1, cap);
     self.irAddInstrDirect(IRO_STORE_FIELD, 0, cT, m, 0);
+    var nT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, nT, -1, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, 8, nT, m, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, 16, eT, m, 0);
     return m;
   }
 
@@ -12064,12 +12126,8 @@ pub type IRLower = class {
     self.irAddInstrDirect(IRO_CONST_INT, null0, -1, -1, 0);
     var eins: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_CONST_INT, eins, -1, -1, 1);
-    var c24: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_CONST_INT, c24, -1, -1, 24);
-    var kap: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_LOAD_FIELD, kap, mapT, 0, 0);
-    var maske: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_SUB, maske, kap, eins, 0);
+    var c32: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, c32, -1, -1, 32);
     var hash: int64 := self.allocTemp();
     var idx: int64 := self.allocTemp();
     if str != 0 {
@@ -12101,6 +12159,114 @@ pub type IRLower = class {
     } else {
       self.irAddInstrDirect(IRO_STORE_LOCAL, hash, keyT, -1, 0);
     }
+
+    // Wachsen — nur beim Setzen, VOR der Sondierung: (Anzahl+1)*4 > Kap*3.
+    // Dieselbe Schwelle wie der x86-Kern (kern/grow).
+    if modus == 0 {
+      var gKap: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_FIELD, gKap, mapT, 0, 0);
+      var gAn: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_FIELD, gAn, mapT, 8, 0);
+      var c4: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, c4, -1, -1, 4);
+      var c3: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, c3, -1, -1, 3);
+      var gAn1: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, gAn1, gAn, eins, 0);
+      var gL: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_MUL, gL, gAn1, c4, 0);
+      var gR: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_MUL, gR, gKap, c3, 0);
+      var gVoll: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_GT, gVoll, gL, gR, 0);
+      var lGNicht: int64 := self.genLabel();
+      self.irEmitBrFalse(gVoll, lGNicht);
+      // neue Eintraege mit doppelter Kapazitaet
+      var gAltE: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_FIELD, gAltE, mapT, 16, 0);
+      var gNKap: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, gNKap, gKap, gKap, 0);
+      var gNMaske: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_SUB, gNMaske, gNKap, eins, 0);
+      var gNGr: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_MUL, gNGr, gNKap, c32, 0);
+      var gNE: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ALLOC, gNE, gNGr, -1, 0);
+      // i und j werden mehrfach beschrieben — nur ueber STORE_LOCAL.
+      var gi: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_STORE_LOCAL, gi, null0, -1, 0);
+      var gj: int64 := self.allocTemp();
+      var lGl: int64 := self.genLabel();
+      var lGn: int64 := self.genLabel();
+      var lGp: int64 := self.genLabel();
+      var lGput: int64 := self.genLabel();
+      var lGd: int64 := self.genLabel();
+      self.irEmitLabel(lGl);
+      var gFertig: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_GE, gFertig, gi, gKap, 0);
+      self.irAddInstrDirect(IRO_BR_TRUE, -1, gFertig, -1, lGd);
+      var gOo: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_MUL, gOo, gi, c32, 0);
+      var gOs: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, gOs, gAltE, gOo, 0);
+      var gOb: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_FIELD, gOb, gOs, 24, 0);
+      var gOfrei: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_EQ, gOfrei, gOb, null0, 0);
+      self.irAddInstrDirect(IRO_BR_TRUE, -1, gOfrei, -1, lGn);
+      var gOh: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_FIELD, gOh, gOs, 16, 0);
+      var gJ0: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_AND, gJ0, gOh, gNMaske, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, gj, gJ0, -1, 0);
+      self.irEmitLabel(lGp);
+      var gNo: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_MUL, gNo, gj, c32, 0);
+      var gNs: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, gNs, gNE, gNo, 0);
+      var gNb: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_FIELD, gNb, gNs, 24, 0);
+      var gNfrei: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_EQ, gNfrei, gNb, null0, 0);
+      self.irAddInstrDirect(IRO_BR_TRUE, -1, gNfrei, -1, lGput);
+      var gJ1: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, gJ1, gj, eins, 0);
+      var gJ2: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_AND, gJ2, gJ1, gNMaske, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, gj, gJ2, -1, 0);
+      self.irEmitJmp(lGp);
+      self.irEmitLabel(lGput);
+      var gK: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_FIELD, gK, gOs, 0, 0);
+      self.irAddInstrDirect(IRO_STORE_FIELD, 0, gK, gNs, 0);
+      var gV: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_FIELD, gV, gOs, 8, 0);
+      self.irAddInstrDirect(IRO_STORE_FIELD, 8, gV, gNs, 0);
+      self.irAddInstrDirect(IRO_STORE_FIELD, 16, gOh, gNs, 0);
+      self.irAddInstrDirect(IRO_STORE_FIELD, 24, eins, gNs, 0);
+      self.irEmitLabel(lGn);
+      var gI1: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ADD, gI1, gi, eins, 0);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, gi, gI1, -1, 0);
+      self.irEmitJmp(lGl);
+      self.irEmitLabel(lGd);
+      self.irAddInstrDirect(IRO_STORE_FIELD, 16, gNE, mapT, 0);
+      self.irAddInstrDirect(IRO_STORE_FIELD, 0, gNKap, mapT, 0);
+      // alter Block zurueck — munmap(alt, Kap*32), wie grow auf x86
+      var gAGr: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_MUL, gAGr, gKap, c32, 0);
+      var gFr: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_FREE, gFr, gAltE, gAGr, 0);
+      self.irEmitLabel(lGNicht);
+    }
+
+    // Kapazitaet und Eintraege erst HIER lesen — das Wachsen hat sie ersetzt.
+    var kap: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, kap, mapT, 0, 0);
+    var maske: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_SUB, maske, kap, eins, 0);
+    var eintr: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, eintr, mapT, 16, 0);
     var i0: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_AND, i0, hash, maske, 0);
     self.irAddInstrDirect(IRO_STORE_LOCAL, idx, i0, -1, 0);
@@ -12111,25 +12277,27 @@ pub type IRLower = class {
     var lTreffer: int64 := self.genLabel();
     var lEnde: int64 := self.genLabel();
 
-    // Eintrag = m + 24 + idx*24
+    // Eintrag = Eintraege + idx*32
     self.irEmitLabel(lTop);
     var off: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_MUL, off, idx, c24, 0);
-    var s1: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_ADD, s1, mapT, off, 0);
+    self.irAddInstrDirect(IRO_MUL, off, idx, c32, 0);
     var slot: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_ADD, slot, s1, c24, 0);
-    var sk: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_LOAD_FIELD, sk, slot, 0, 0);
+    self.irAddInstrDirect(IRO_ADD, slot, eintr, off, 0);
+    var sb: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, sb, slot, 24, 0);
     var leer: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_CMP_EQ, leer, sk, null0, 0);
+    self.irAddInstrDirect(IRO_CMP_EQ, leer, sb, null0, 0);
     self.irAddInstrDirect(IRO_BR_TRUE, -1, leer, -1, lFrei);
+    // Erst der Hash — fuer Ganzzahlschluessel ist er der Schluessel selbst,
+    // gleicher Hash heisst dann gleicher Schluessel.
+    var sh: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, sh, slot, 16, 0);
+    var hUn: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CMP_NEQ, hUn, sh, hash, 0);
+    self.irAddInstrDirect(IRO_BR_TRUE, -1, hUn, -1, lWeiter);
     if str != 0 {
-      var sh: int64 := self.allocTemp();
-      self.irAddInstrDirect(IRO_LOAD_FIELD, sh, slot, 16, 0);
-      var hUn: int64 := self.allocTemp();
-      self.irAddInstrDirect(IRO_CMP_NEQ, hUn, sh, hash, 0);
-      self.irAddInstrDirect(IRO_BR_TRUE, -1, hUn, -1, lWeiter);
+      var sk: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_FIELD, sk, slot, 0, 0);
       // Inhaltsvergleich Byte fuer Byte bis NUL
       var a: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_STORE_LOCAL, a, sk, -1, 0);
@@ -12153,9 +12321,7 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_STORE_LOCAL, b, b1, -1, 0);
       self.irEmitJmp(lS);
     } else {
-      var gl: int64 := self.allocTemp();
-      self.irAddInstrDirect(IRO_CMP_EQ, gl, sk, keyT, 0);
-      self.irAddInstrDirect(IRO_BR_TRUE, -1, gl, -1, lTreffer);
+      self.irEmitJmp(lTreffer);
     }
 
     // weiter: naechster Eintrag, ringfoermig
@@ -12178,6 +12344,7 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_STORE_FIELD, 0, keyT, slot, 0);
       self.irAddInstrDirect(IRO_STORE_FIELD, 8, valT, slot, 0);
       self.irAddInstrDirect(IRO_STORE_FIELD, 16, hash, slot, 0);
+      self.irAddInstrDirect(IRO_STORE_FIELD, 24, eins, slot, 0);
     }
     self.irAddInstrDirect(IRO_STORE_LOCAL, dest, null0, -1, 0);
     self.irEmitJmp(lEnde);
@@ -13894,9 +14061,34 @@ pub type IRLower = class {
       if bo >= 70 && bo <= 74 { erlaubt := 1; }        // + - * / %
       if bo == 89 || bo == 90 || bo == 91 { erlaubt := 1; }  // ^ & |
       if bo == 93 || bo == 94 { erlaubt := 1; }        // << >>
+      // #2148: Vergleiche und && || — `con A: bool := X <= 2.0` und
+      // `con B: bool := 1 < 2` faltet x86 (cg_evalConExpr), hier wurden sie
+      // bis 1.2.16B mit #1798 abgewiesen. Ein Vergleich darf GLEITKOMMA-
+      // Operanden haben (dann ueber _f64Faltbar/_irVergleichF64), das
+      // Ergebnis ist immer die Ganzzahl 1/0.
+      if bo >= 79 && bo <= 84 {
+        var vfL: int64 := self._f64Faltbar(self.nodeC0(nd));
+        var vfR: int64 := self._f64Faltbar(self.nodeC1(nd));
+        // Gemischt (eine Seite f64, die andere ganzzahlig faltbar): die
+        // Ganzzahl wird umgerechnet, wie in cg_evalConExpr auf x86.
+        if vfL != 0 && (vfR != 0 || self._constFaltbar(self.nodeC1(nd)) != 0) { return 1; }
+        if vfR != 0 && self._constFaltbar(self.nodeC0(nd)) != 0 { return 1; }
+        erlaubt := 1;
+      }
+      if bo == 85 || bo == 86 { erlaubt := 1; }        // && ||
       if erlaubt == 0 { return 0; }
       if self._constFaltbar(self.nodeC0(nd)) == 0 { return 0; }
       return self._constFaltbar(self.nodeC1(nd));
+    }
+    // #2148: `x as <Ganzzahltyp>` — aus einer Ganzzahl unveraendert, aus
+    // einer faltbaren Gleitkommakonstante abgeschnitten. Wie cg_evalConExpr
+    // (CGN_CAST) auf x86; die beiden muessen uebereinstimmen.
+    if k == NK_CAST {
+      var cft: int64 := self.nodeC1(nd);
+      if cft < 0 || self.nodeKind(cft) != NK_TYPE_NAME { return 0; }
+      if _irIstGanzzahlTyp(self.nodeSVal(cft), self.nodeSLen(cft)) == 0 { return 0; }
+      if self._f64Faltbar(self.nodeC0(nd)) != 0 { return 1; }
+      return self._constFaltbar(self.nodeC0(nd));
     }
     return 0;
   }
@@ -13931,8 +14123,30 @@ pub type IRLower = class {
     }
     if k == NK_BINOP {
       var bo: int64 := self.nodeIVal(nd);
+      // #2148: Vergleich auf Gleitkomma — dieselbe Entscheidung wie in
+      // _constFaltbar (die beiden muessen uebereinstimmen).
+      if bo >= 79 && bo <= 84 {
+        var wfL: int64 := self._f64Faltbar(self.nodeC0(nd));
+        var wfR: int64 := self._f64Faltbar(self.nodeC1(nd));
+        if wfL != 0 || wfR != 0 {
+          var wl: int64 := 0;
+          var wr: int64 := 0;
+          if wfL != 0 { wl := self._f64Wert(self.nodeC0(nd)); } else { wl := _irF64AlsBits(self._constWert(self.nodeC0(nd)) as f64); }
+          if wfR != 0 { wr := self._f64Wert(self.nodeC1(nd)); } else { wr := _irF64AlsBits(self._constWert(self.nodeC1(nd)) as f64); }
+          return _irVergleichF64(bo, wl, wr);
+        }
+      }
       var a:  int64 := self._constWert(self.nodeC0(nd));
+      // && || werten rechts nur aus, wenn noetig — wie cg_evalConExpr.
+      if bo == 85 { if a == 0 { return 0; } if self._constWert(self.nodeC1(nd)) != 0 { return 1; } return 0; }
+      if bo == 86 { if a != 0 { return 1; } if self._constWert(self.nodeC1(nd)) != 0 { return 1; } return 0; }
       var b:  int64 := self._constWert(self.nodeC1(nd));
+      if bo == 79 { if a == b { return 1; } return 0; }
+      if bo == 80 { if a != b { return 1; } return 0; }
+      if bo == 81 { if a <  b { return 1; } return 0; }
+      if bo == 82 { if a <= b { return 1; } return 0; }
+      if bo == 83 { if a >  b { return 1; } return 0; }
+      if bo == 84 { if a >= b { return 1; } return 0; }
       if bo == 70 { return a + b; }
       if bo == 71 { return a - b; }
       if bo == 72 { return a * b; }
@@ -13946,6 +14160,11 @@ pub type IRLower = class {
       if bo == 93 { return a << b; }
       if bo == 94 { return a >> b; }
       return 0;
+    }
+    if k == NK_CAST {
+      // #2148: siehe _constFaltbar.
+      if self._f64Faltbar(self.nodeC0(nd)) != 0 { return _irBitsAlsF64(self._f64Wert(self.nodeC0(nd))) as int64; }
+      return self._constWert(self.nodeC0(nd));
     }
     return 0;
   }
