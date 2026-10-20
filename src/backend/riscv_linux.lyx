@@ -46,6 +46,15 @@ con RV_T2:   int64 := 7;
 // (s11). Sonst benutzt dieses Backend es nirgends, und es lebt nie ueber einen
 // einzelnen Zugriff hinaus — es kann also mit nichts kollidieren, auch nicht
 // mit t3 … t6, die die Builtin-Folgen als Laufvariablen nehmen.
+//
+// #2140: s11 ist nach dem psABI callee-saved. Bis 1.2.16A wurde es benutzt,
+// ohne es zu retten — unter Lyx-Aufrufern faellt das nicht auf (keiner haelt
+// darin etwas), ein C-Aufrufer (Rueckruf, .so) verliert aber seinen Wert.
+// Ein caller-saved Register gibt es dafuer nicht: t0..t2 tragen die Operanden
+// eines Zugriffs, t3..t6 und a0..a7 die Laufvariablen der Builtin-Folgen
+// (deren Slotzugriffe selbst ueber RV_WEIT gehen koennen). Deshalb rettet
+// emitPrologue s11 in JEDER Funktion; welche es braucht, steht beim Prolog
+// noch nicht fest (Feldversaetze grosser Strukturen kommen erst im Rumpf).
 con RV_WEIT: int64 := 27;
 
 // Linux RISC-V syscall numbers
@@ -383,6 +392,31 @@ pub type EmitRISCV64 = class {
   // RET = JALR x0, ra, 0
   fn rv_RET() { self.rv_e32(0x00008067); }
 
+  // #2144: Rueckgabewert von mmap pruefen — dieselbe Pruefung wie
+  // cg_emitMmapGeprueft (x86, #1947) und emitMmapGeprueft (emit_arm64.lyx);
+  // die drei muessen uebereinstimmen. Erwartet a0 direkt nach dem ECALL.
+  // Im Gutfall wird nur a7 ueberschrieben (die Syscallnummer, die jede Stelle
+  // vor dem naechsten ECALL neu setzt) — kein Register, das ein Builtin ueber
+  // den Aufruf hinweg haelt. Die Meldung liegt im Code (wie bei #1339).
+  fn rv_mmapGeprueft() {
+    self.rv_ADDI(RV_A7, RV_ZERO, -2048);
+    self.rv_ADDI(RV_A7, RV_A7, -2047);         // a7 = -4095
+    self.rv_Bcond(6, RV_A0, RV_A7, 84);        // BLTU a0, a7 → hinter die Meldung
+    self.rv_e32(0x17 | (RV_A1 << 7));          // AUIPC a1, 0
+    self.rv_ADDI(RV_A1, RV_A1, 36);            // a1 = Meldung (9 Befehle weiter)
+    self.rv_ADDI(RV_A0, RV_ZERO, 2);           // stderr
+    self.rv_ADDI(RV_A2, RV_ZERO, 42);
+    self.rv_ADDI(RV_A7, RV_ZERO, 64);          // write
+    self.rv_ECALL();
+    self.rv_ADDI(RV_A0, RV_ZERO, 1);
+    self.rv_ADDI(RV_A7, RV_ZERO, 94);          // exit_group
+    self.rv_ECALL();
+    var m: pchar := "Speicheranforderung fehlgeschlagen (mmap)\n";
+    var i: int64 := 0;
+    while i < 42 { self.rv_e8(StrCharAt(m, i)); i := i + 1; }
+    self.rv_e8(0); self.rv_e8(0);
+  }
+
   // Build J-type JAL word: rd=0→jump, rd=1→call
   fn rv_buildJAL(rd: int64, offset: int64): int64 {
     var imm20:    int64 := (offset >> 20) & 1;
@@ -434,13 +468,16 @@ pub type EmitRISCV64 = class {
   // Prologue layout (after execution):
   //   [s0+0]  = saved old s0
   //   [s0+8]  = saved ra
+  //   [s0+16] = saved s11 (RV_WEIT, #2140); [s0+24] frei (16-Ausrichtung)
+  //   [s0+32] = erstes Stapelargument des Aufrufers (#2132)
   //   s0      = sp (frame pointer; saved regs above it)
   //   sp      = s0 - stackSize  (locals area below s0)
   // slotOff(i) = -(i+1)*8  → within [sp .. s0-1] ✓
   fn emitPrologue() {
-    self.rv_ADDI(RV_SP, RV_SP, -16);  // alloc saved-regs area
+    self.rv_ADDI(RV_SP, RV_SP, -32);  // alloc saved-regs area
     self.rv_SD(RV_FP, RV_SP, 0);      // save old s0
     self.rv_SD(RV_RA, RV_SP, 8);      // save ra
+    self.rv_SD(RV_WEIT, RV_SP, 16);   // #2140: s11 ist callee-saved
     self.rv_MV(RV_FP, RV_SP);         // s0 = sp (frame pointer)
     if self.stackSize > 0 {
       // #2061: ein Rahmen ueber 2048 Byte passt nicht in den Direktwert von
@@ -461,7 +498,8 @@ pub type EmitRISCV64 = class {
     self.rv_MV(RV_SP, RV_FP);                    // restore sp = s0
     self.rv_LD(RV_FP, RV_SP, 0);                 // restore old s0
     self.rv_LD(RV_RA, RV_SP, 8);                 // restore ra
-    self.rv_ADDI(RV_SP, RV_SP, 16);              // pop saved area
+    self.rv_LD(RV_WEIT, RV_SP, 16);              // #2140: s11 zurueck
+    self.rv_ADDI(RV_SP, RV_SP, 32);              // pop saved area
     self.rv_RET();                                // JALR x0, ra, 0
   }
 
@@ -943,6 +981,7 @@ pub type EmitRISCV64 = class {
       self.rv_LI(RV_A5, 0);
       self.rv_LI(RV_A7, RV_SYS_MMAP);
       self.rv_ECALL();
+      self.rv_mmapGeprueft();   // #2144
       self.rv_MV(RV_T0, RV_A0); self.rv_storeSlot(dest);
     }
     if op == IRO_FREE {
@@ -1110,6 +1149,28 @@ pub type EmitRISCV64 = class {
     // erzeugte NICHTS und das Programm lief an genau der Stelle weiter, an der
     // es abbrechen sollte. Bei einer erkannten Verletzung ist das die
     // gefaehrlichste Form des stillen Defaults. Verhalten wie IRO_THROW: exit(1).
+    //
+    // #2141: und zwar MIT Meldung — bis 1.2.16A endete panic stumm mit rc 1.
+    // Wie cg_emitPanicBody auf x86 und der arm64-Zweig (die drei muessen
+    // uebereinstimmen): Text bis zum Nullbyte nach stderr, ohne Zeilenende;
+    // ein Nullzeiger schreibt nichts.
+    if op == IRO_PANIC && src1 >= 0 {
+      self.rv_LD(RV_A1, RV_FP, self.slotOff(src1));   // a1 = Text
+      var pnNull: int64 := self.codeLen;
+      self.rv_e32(0x00000013);                     // Platzhalter, unten BEQ a1, x0
+      self.rv_LI(RV_A2, 0);                        // a2 = Laenge
+      var pnLoop: int64 := self.codeLen;
+      self.rv_ADD(RV_T1, RV_A1, RV_A2);
+      self.rv_LBU(RV_T2, RV_T1, 0);
+      self.rv_BEQZ_fwd(RV_T2, 12);   // Nullbyte -> hinter den Ruecksprung
+      self.rv_ADDI(RV_A2, RV_A2, 1);
+      var pnBack: int64 := pnLoop - self.codeLen;
+      self.rv_JAL_x0(pnBack);
+      self.rv_LI(RV_A0, 2);                        // fd = stderr
+      self.rv_LI(RV_A7, RV_SYS_WRITE);
+      self.rv_ECALL();
+      self.rv_poke32at(pnNull, self.rv_buildBtype(0, RV_A1, RV_ZERO, self.codeLen - pnNull));   // BEQ
+    }
     if op == IRO_PANIC {
       self.rv_LI(RV_A0, 1);
       self.rv_LI(RV_A7, RV_SYS_EXIT);
@@ -1241,6 +1302,7 @@ pub type EmitRISCV64 = class {
       self.rv_LI(RV_A5, 0);
       self.rv_LI(RV_A7, RV_SYS_MMAP);
       self.rv_ECALL();
+      self.rv_mmapGeprueft();   // #2144
       self.rv_MV(29, RV_A0);                       // t4 = Puffer
       self.rv_ADDI(30, 29, 63);                    // t5 = t4 + 63 (Ende)
       self.rv_LI(31, 0);                           // t6 = Vorzeichen
@@ -1358,6 +1420,7 @@ pub type EmitRISCV64 = class {
       self.rv_LI(RV_A5, 0);
       self.rv_LI(RV_A7, RV_SYS_MMAP);
       self.rv_ECALL();
+      self.rv_mmapGeprueft();   // #2144
       self.rv_MV(29, RV_A0);                       // t4 = Puffer
       self.rv_LI(30, 0);                           // t5 = Zaehler
       var subL: int64 := self.codeLen;
@@ -1413,6 +1476,7 @@ pub type EmitRISCV64 = class {
       self.rv_LI(RV_A5, 0);
       self.rv_LI(RV_A7, RV_SYS_MMAP);
       self.rv_ECALL();
+      self.rv_mmapGeprueft();   // #2144
       self.rv_MV(RV_A6, RV_A0);                    // a6 = Puffer
       // a kopieren: bis zum Nullbyte, Ziel = Puffer + i
       self.rv_LI(RV_T0, 0);
@@ -1459,6 +1523,7 @@ pub type EmitRISCV64 = class {
       self.rv_LI(RV_A5, 0);
       self.rv_LI(RV_A7, RV_SYS_MMAP);
       self.rv_ECALL();
+      self.rv_mmapGeprueft();   // #2144
       self.rv_MV(29, RV_A0);                       // t4 = Puffer
       self.rv_ADDI(30, 29, 63);                    // t5 = t4 + 63
       self.rv_SB(0, 30, 0);                        // Nullbyte ans Ende
@@ -1523,6 +1588,7 @@ pub type EmitRISCV64 = class {
       self.rv_LI(RV_A5, 0);
       self.rv_LI(RV_A7, RV_SYS_MMAP);
       self.rv_ECALL();
+      self.rv_mmapGeprueft();   // #2144
       self.rv_MV(29, RV_A0);                       // t4 = Puffer
       // Kopieren, Nullbyte eingeschlossen
       self.rv_LI(31, 0);
@@ -1560,6 +1626,7 @@ pub type EmitRISCV64 = class {
       self.rv_LI(RV_A5, 0);
       self.rv_LI(RV_A7, RV_SYS_MMAP);
       self.rv_ECALL();
+      self.rv_mmapGeprueft();   // #2144
       self.rv_MV(28, RV_A0);                       // t3 = Puffer
       self.rv_LI(RV_A3, 10);                       // '\n'
       self.rv_SB(RV_A3, 28, 0);
@@ -1802,9 +1869,9 @@ pub type EmitRISCV64 = class {
       } else {
         // #2132: Parameter ab dem neunten liegen nach dem RISC-V-psABI beim
         // Aufrufer auf dem Stapel, 8-Byte-Plaetze ab dessen sp — hier
-        // [s0+16], ueber dem geretteten s0/ra. Bis 1.2.15A blieben diese
-        // Slots unbeschrieben.
-        self.rv_LD(RV_T0, RV_FP, 16 + (pSpillI - 8) * 8);
+        // [s0+32], ueber dem geretteten s0/ra/s11 (#2140). Bis 1.2.15A
+        // blieben diese Slots unbeschrieben.
+        self.rv_LD(RV_T0, RV_FP, 32 + (pSpillI - 8) * 8);
         self.rv_SD(RV_T0, RV_FP, self.slotOff(IR_BARG_SLOTS + pSpillI));
       }
       pSpillI := pSpillI + 1;
@@ -2161,6 +2228,7 @@ pub type EmitRISCV64 = class {
     self.rv_LI(RV_A5, 0);
     self.rv_LI(RV_A7, RV_SYS_MMAP);
     self.rv_ECALL();
+    self.rv_mmapGeprueft();   // #2144
     self.rv_MV(29, RV_A0);                       // t4 = Schreibmarke
     self.rv_LD(28, RV_FP, self.slotOff(bitsSlot));   // t3 = Bitmuster
 

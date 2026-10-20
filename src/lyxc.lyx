@@ -209,18 +209,30 @@ fn ms_crc32(data: int64, len: int64): int64 {
 }
 
 // Append a .meta_safe section to the ELF binary at `path`.
-// codeOff  = file offset of .text (176 for static x86_64 ELF: 64-byte ELF hdr + 2×56-byte phdr)
+// codeOff  = file offset of .text, codeVa = its virtual address — beide vom
+//            Schreiber (Codegen.codeFileOff/codeStartVa, #2144). Bis 1.2.16A
+//            standen hier fest 176 und 0x400000.
 // codeLen  = length of .text in bytes
 // dataLen  = length of .data in bytes (follows .text immediately)
-fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64) {
+fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeVa: int64, codeLen: int64, dataLen: int64) {
+  // #2144: Fehler laut — bis 1.2.16A meldete jeder Abbruch hier nur auf
+  // stdout und lyxc endete mit 0, das Erzeugnis ohne .meta_safe.
+  if (codeOff <= 0) {
+    EPrintStrLn("error: --meta-safe: der Schreiber hat keinen Codeoffset gemeldet (#2144)"c);
+    exit(EMIT_EX_IOERR);
+  }
   // WP-32: single O_RDWR open — no close between read and write eliminates TOCTOU window
   var fd: int64 := open(path, 2, 0);  // O_RDWR
-  if (fd < 0) { PrintStr("meta-safe: cannot open binary\n"); return; }
+  if (fd < 0) { EPrintStrLn("error: --meta-safe: Erzeugnis laesst sich nicht oeffnen"c); exit(EMIT_EX_IOERR); }
   var fileSize: int64 := lseek(fd, 0, 2);
   lseek(fd, 0, 0);
   var buf: int64 := alloc(fileSize + 4096);
   if (read(fd, buf as pchar, fileSize) != fileSize) {  // WP-27: partieller Read → Abbruch
-    PrintStr("meta-safe: read incomplete\n"); close(fd); return;
+    EPrintStrLn("error: --meta-safe: Erzeugnis unvollstaendig gelesen"c); close(fd); exit(EMIT_EX_IOERR);
+  }
+  if (codeOff + codeLen > fileSize) {
+    EPrintStrLn("error: --meta-safe: Codebereich liegt hinter dem Dateiende (#2144)"c);
+    close(fd); exit(EMIT_EX_IOERR);
   }
 
   // #1877: Format v2. Bis 1.1.14G stand hier EIN CRC32 je Seite und sonst
@@ -255,8 +267,8 @@ fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64
   poke32(payload + 8,  pageCount);
   poke32(payload + 12, 0);                          // mode: 0 = nur Datei-Pruefung
   poke64(payload + 16, codeLen);
-  poke64(payload + 24, 4194304 + codeOff);          // code_start_va
-  poke64(payload + 32, 4194304 + codeOff + codeLen);// code_end_va
+  poke64(payload + 24, codeVa);                     // code_start_va
+  poke64(payload + 32, codeVa + codeLen);           // code_end_va
   poke32(payload + 40, 0);                          // interval_ms: kein Sweep
   poke32(payload + 44, stride);
   poke64(payload + 48, 0);                          // recovery_ptr
@@ -279,77 +291,93 @@ fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeLen: int64, dataLen: int64
     pi += 1;
   }
 
-  // Build .shstrtab: "\0.meta_safe\0.shstrtab\0"
-  // Offsets: 0=\0, 1=.meta_safe (10 chars), 12=\0, 13=.shstrtab (9 chars), 23=\0 → 24 bytes
-  var shstrSize:  int64 := 24;
+  // #2144: Vorhandene Abschnitte behalten. Bis 1.2.16A ersetzte die Tabelle
+  // hier jede vorhandene — mit --debug verschwanden .debug_* und .text (kein
+  // addr2line, kein gdb mehr), mit Lizenz-Wasserzeichen .lyx_lic.
+  // Jetzt: alte Abschnittskoepfe uebernehmen, .shstrtab um ".meta_safe"
+  // verlaengert hinten neu ablegen, .meta_safe als letzten Abschnitt anhaengen.
+  var oldShoff: int64 := peek64(buf + ELF64_EHDR_OFF_SHOFF);
+  var oldShnum: int64 := peek16(buf + 60);
+  var oldShstrndx: int64 := peek16(buf + 62);
+  var oldStrOff: int64 := 0;
+  var oldStrSize: int64 := 1;      // ohne Tabelle: nur das fuehrende NUL
+  if (oldShnum > 0) {
+    if (oldShoff + oldShnum * 64 > fileSize || oldShstrndx >= oldShnum) {
+      EPrintStrLn("error: --meta-safe: Abschnittstabelle des Erzeugnisses ist kaputt (#2144)"c);
+      close(fd); exit(EMIT_EX_IOERR);
+    }
+    var osh: int64 := buf + oldShoff + oldShstrndx * 64;
+    oldStrOff  := peek64(osh + ELF64_SHDR_OFF_OFFSET);
+    oldStrSize := peek64(osh + ELF64_SHDR_OFF_SIZE);
+    if (oldStrSize < 1 || oldStrOff + oldStrSize > fileSize) {
+      EPrintStrLn("error: --meta-safe: .shstrtab des Erzeugnisses ist kaputt (#2144)"c);
+      close(fd); exit(EMIT_EX_IOERR);
+    }
+  }
+  // Neue .shstrtab: alte Namen, dann ".meta_safe\0"; ohne Tabelle dazu ".shstrtab\0"
+  var nameMs: int64 := oldStrSize;
+  var nameShs: int64 := nameMs + 11;
+  var shstrSize: int64 := nameMs + 11;
+  if (oldShnum == 0) { shstrSize := shstrSize + 10; }
   var shstr: int64 := alloc(shstrSize);  // zeroed
+  if (oldShnum > 0) { memcpy(shstr, buf + oldStrOff, oldStrSize); }
   var metaSafeName: pchar := ".meta_safe";
   var shstrtabName: pchar := ".shstrtab";
-  memcpy(shstr + 1,  metaSafeName as int64, 10);
-  memcpy(shstr + 12, shstrtabName as int64, 9);
+  memcpy(shstr + nameMs, metaSafeName as int64, 10);
+  if (oldShnum == 0) { memcpy(shstr + nameShs, shstrtabName as int64, 9); }
 
   // Layout of new file:
   //   [0 .. fileSize-1]          : original ELF
   //   [fileSize .. +payloadSize]  : .meta_safe payload
-  //   [fileSize+payloadSize .. ]  : .shstrtab (24 bytes)
-  //   [fileSize+payloadSize+24..] : 3 × 64-byte section headers (aligned to 8)
-  var shoff:    int64 := fileSize + payloadSize + shstrSize;
-  var newSize:  int64 := shoff + 3 * 64;
+  //   [.. +shstrSize]             : .shstrtab (neu)
+  //   [8-aligned ..]              : Abschnittskoepfe
+  var strOff:   int64 := fileSize + payloadSize;
+  var shoff:    int64 := ((strOff + shstrSize + 7) / 8) * 8;
+  var newShnum: int64 := oldShnum + 1;
+  var strNdx:   int64 := oldShstrndx;
+  var msNdx:    int64 := oldShnum;
+  if (oldShnum == 0) { newShnum := 3; strNdx := 2; msNdx := 1; }
+  var newSize:  int64 := shoff + newShnum * 64;
 
-  // Build new ELF buffer
   var nbuf: int64 := alloc(newSize);
-  // Copy original ELF
-  var ci: int64 := 0;
   memcpy(nbuf, buf, fileSize);
-  // Append .meta_safe payload
-  ci := 0;
   memcpy(nbuf + fileSize, payload, payloadSize);
-  // Append .shstrtab
-  ci := 0;
-  memcpy(nbuf + fileSize + payloadSize, shstr, shstrSize);
+  memcpy(nbuf + strOff, shstr, shstrSize);
+  if (oldShnum > 0) { memcpy(nbuf + shoff, buf + oldShoff, oldShnum * 64); }
 
-  // Update ELF header:
-  //   e_shoff      = shoff (offset of section header table)
-  //   e_shnum      = 3 (NULL, .meta_safe, .shstrtab)
-  //   e_shstrndx   = 2 (.shstrtab is entry 2)
   poke64(nbuf + ELF64_EHDR_OFF_SHOFF, shoff);  // e_shoff
-  poke16(nbuf + 60, 3);      // e_shnum
-  poke16(nbuf + 62, 2);      // e_shstrndx
+  poke16(nbuf + 60, newShnum);                 // e_shnum
+  poke16(nbuf + 62, strNdx);                   // e_shstrndx
 
-  // Section header table (3 × 64 bytes, each Elf64_Shdr):
-  // [0] NULL section — all zeros
-  var sh0: int64 := nbuf + shoff;
-  // (already zeroed by mmap)
+  // .shstrtab — SHT_STRTAB=3, zeigt auf die neue Fassung
+  var shs: int64 := nbuf + shoff + strNdx * 64;
+  if (oldShnum == 0) { poke32(shs, nameShs); }
+  poke32(shs + 4,  3);
+  poke64(shs + ELF64_SHDR_OFF_FLAGS, 0);
+  poke64(shs + ELF64_SHDR_OFF_ADDR, 0);
+  poke64(shs + ELF64_SHDR_OFF_OFFSET, strOff);
+  poke64(shs + ELF64_SHDR_OFF_SIZE, shstrSize);
+  poke64(shs + ELF64_SHDR_OFF_ALIGN, 1);
 
-  // [1] .meta_safe — SHT_NOTE=7, SHF_ALLOC|SHF_READONLY=6
-  var sh1: int64 := nbuf + shoff + 64;
-  poke32(sh1,      1);                        // sh_name = 1 (offset in .shstrtab)
-  poke32(sh1 + 4,  7);                        // sh_type = SHT_NOTE
-  poke64(sh1 + ELF64_SHDR_OFF_FLAGS,  2);                        // sh_flags = SHF_ALLOC (read-only; no SHF_WRITE/SHF_EXECINSTR)
-  poke64(sh1 + ELF64_SHDR_OFF_ADDR, 0);                        // sh_addr = 0 (not loaded)
-  poke64(sh1 + ELF64_SHDR_OFF_OFFSET, fileSize);                 // sh_offset = right after original ELF
-  poke64(sh1 + ELF64_SHDR_OFF_SIZE, payloadSize);              // sh_size
-  poke32(sh1 + 40, 0);                        // sh_link
-  poke32(sh1 + 44, 0);                        // sh_info
-  poke64(sh1 + ELF64_SHDR_OFF_ALIGN, 4);                        // sh_addralign
-  poke64(sh1 + ELF64_SHDR_OFF_ENTSIZE, 0);                        // sh_entsize
-
-  // [2] .shstrtab — SHT_STRTAB=3
-  var sh2: int64 := nbuf + shoff + 128;
-  poke32(sh2,      12);                       // sh_name = 12 (offset of ".shstrtab" in .shstrtab)
-  poke32(sh2 + 4,  3);                        // sh_type = SHT_STRTAB
-  poke64(sh2 + ELF64_SHDR_OFF_FLAGS,  0);                        // sh_flags
-  poke64(sh2 + ELF64_SHDR_OFF_ADDR, 0);                        // sh_addr
-  poke64(sh2 + ELF64_SHDR_OFF_OFFSET, fileSize + payloadSize);   // sh_offset
-  poke64(sh2 + ELF64_SHDR_OFF_SIZE, shstrSize);                // sh_size
-  poke32(sh2 + 40, 0);                        // sh_link
-  poke32(sh2 + 44, 0);                        // sh_info
-  poke64(sh2 + ELF64_SHDR_OFF_ALIGN, 1);                        // sh_addralign
-  poke64(sh2 + ELF64_SHDR_OFF_ENTSIZE, 0);                        // sh_entsize
+  // .meta_safe — SHT_NOTE=7, SHF_ALLOC (read-only; sh_addr 0, nicht geladen)
+  var sh1: int64 := nbuf + shoff + msNdx * 64;
+  poke32(sh1,      nameMs);
+  poke32(sh1 + 4,  7);
+  poke64(sh1 + ELF64_SHDR_OFF_FLAGS, 2);
+  poke64(sh1 + ELF64_SHDR_OFF_ADDR, 0);
+  poke64(sh1 + ELF64_SHDR_OFF_OFFSET, fileSize);
+  poke64(sh1 + ELF64_SHDR_OFF_SIZE, payloadSize);
+  poke32(sh1 + 40, 0);
+  poke32(sh1 + 44, 0);
+  poke64(sh1 + ELF64_SHDR_OFF_ALIGN, 4);
+  poke64(sh1 + ELF64_SHDR_OFF_ENTSIZE, 0);
 
   // WP-32: write in-place on the same fd (no second open — TOCTOU eliminated)
   lseek(fd, 0, 0);
-  write(fd, nbuf as pchar, newSize);
+  if (write(fd, nbuf as pchar, newSize) != newSize) {
+    EPrintStrLn("error: --meta-safe: Erzeugnis unvollstaendig geschrieben"c);
+    close(fd); exit(EMIT_EX_IOERR);
+  }
   close(fd);
 
   free(buf, fileSize + 4096);
@@ -534,6 +562,9 @@ pub type CompilerConfig = class {
 
   // CAPS-TLV: Union der @capabilities-Bits (LBF_CAP_*) für den LBF-Nativ-Output.
   lyxosCapBits: int64;
+  // #1971: Ressourcenliste des IR-Lowerings ({buf, n, cap}, Eintraege
+  // IR_RES_SZ) fuer die LBF-Ressourcenbloecke, 0 = keine.
+  lyxosResListe: int64;
 
   // WP-KM-01: --target=lyxos-kernel: reject POSIX-dependent imports
   kernelMode: int64;
@@ -617,6 +648,7 @@ pub type CompilerConfig = class {
     self.compileUnit    := false;
     self.kernelMode     := 0;
     self.unitInfoFile   := 0;
+    self.lyxosResListe  := 0;   // #1971
     self.unitInfoPath   := 0;
     self.outputType       := OUTPUT_TYPE_EXECUTABLE;
     self.exportBuf        := 0;
@@ -1536,7 +1568,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.2.16A"c);
+      PrintStrLn("1.2.16B"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1558,7 +1590,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.2.16A"c);
+      PrintStrLn("1.2.16B"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1787,7 +1819,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.2.16A (bootstrap)");
+    PrintStrLn("lyxc 1.2.16B (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -2095,6 +2127,12 @@ pub type CompilerConfig = class {
       cuCg.lcbsAuditSrcPath     := inputFile;
       cuCg.lcbsCompatMode       := 1;   // kein seccomp/landlock fuer eine Unit
       cuCg.unitCheckMode        := 1;   // #1587: kein main erwartet
+      // #1971: Pfade in @embed/@resource gelten relativ zur Quelldatei — wie
+      // im Programm (cg.srcFilePath) und im Schreiber (_pfadAufloesen).
+      // Ohne Angabe loeste dieser Pruefdurchlauf sie relativ zum
+      // Arbeitsverzeichnis auf und scheiterte an einer Datei, die da ist.
+      cuCg.srcFilePath          := inputFile;
+      cuCg.srcFileLen           := StrLen(inputFile);
       cuCg.Generate(astRoot);
 
       // #1974: Das IR fuer den Abschnitt erzeugen — aber NUR fuer ein Ziel,
@@ -2116,6 +2154,9 @@ pub type CompilerConfig = class {
       // Ziel an: `--compile-unit --target=arm64`. Ohne Zielangabe entsteht
       // eine .lyu wie vor #1974 — Namen und Typen, kein Code.
       var cuIrPtr: int64 := 0;
+      var cuLowerFuerLyu: IRLower;   // #2014: Layoutquelle (nur gesetzt, wenn cuIrPtr != 0)
+      var cuGlobBuf: int64 := 0;   // #2142: {Name, Laenge, Index} je 24 Byte
+      var cuGlobN: int64 := 0;
       if self.target != LYX_TC_X86_64 {
         var cuIr: IRModule := new IRModule();
         cuIr.init();
@@ -2132,6 +2173,66 @@ pub type CompilerConfig = class {
         cuLower.irInitModus   := 2;              // #2123/#2136: Anfangswerte als __lyx_modinit@<unit> in die .lyu
         cuLower.lowerModule(astRoot);
         cuIrPtr := cuIr as int64;
+        cuLowerFuerLyu := cuLower;
+        // #2142: Namen der Modulvariablen fuer den Anhang der .lyu. Private der
+        // Unit SELBST bleiben draussen: sie stehen unmarkiert im Verzeichnis
+        // (die Wurzel hat keine Unit-Kennung) und fielen beim Einbinden mit
+        // einer gleichnamigen Variablen des Programms zusammen. Private einer
+        // importierten Unit tragen ihre Marke und duerfen mit — dieselbe Unit
+        // kann das Programm zusaetzlich als Quelle einbinden (#2142 Punkt 1).
+        var cuGsb: int64 := peek64(cuIrPtr + IR_MOD_OFF_STRBUF);
+        cuGlobBuf := alloc((cuLower.globalNameCnt + 1) * 24);
+        var cuGk: int64 := 0;
+        while cuGk < cuLower.globalNameCnt {
+          var cuGr: int64 := cuLower.globalNameBuf + cuGk * 32;
+          var cuGnl: int64 := peek64(cuGr + 8);
+          var cuGnp: int64 := cuGsb + peek64(cuGr);
+          var cuPriv: int64 := 0;
+          if cuGnl <= 0 { cuPriv := 1; }
+          var cuD: int64 := astRoot;
+          while cuD >= 0 && cuPriv == 0 {
+            var cuDo: int64 := parser.nodes + cuD * PARSER_NODE_SIZE;
+            var cuDk: int64 := peek64(cuDo);
+            if (cuDk == NK_VAR_DECL || cuDk == NK_CON_DECL) && peek64(cuDo + NODE_OFF_ISPUB) == 0 {
+              if peek64(cuDo + NODE_OFF_SLEN) == cuGnl {
+                var cuGl: int64 := 1;
+                var cuQ: int64 := 0;
+                var cuDp: int64 := (source as int64) + peek64(cuDo + NODE_OFF_SVAL);
+                while cuQ < cuGnl {
+                  if peek8(cuDp + cuQ) != peek8(cuGnp + cuQ) { cuGl := 0; cuQ := cuGnl; }
+                  cuQ := cuQ + 1;
+                }
+                if cuGl != 0 { cuPriv := 1; }
+              }
+            }
+            cuD := peek64(cuDo + NODE_OFF_NEXT);
+          }
+          // Ein Name, der schon drinsteht, bleibt beim ERSTEN Platz: das
+          // Verzeichnis kann eine Unit mehrfach fuehren (Vor- und Nachlauf),
+          // und _irGlobalIdx nimmt beim Senken ebenfalls den ersten Treffer.
+          var cuSi: int64 := 0;
+          while cuSi < cuGlobN && cuPriv == 0 {
+            var cuSb: int64 := cuGlobBuf + cuSi * 24;
+            if peek64(cuSb + 8) == cuGnl {
+              var cuSg: int64 := 1;
+              var cuSq: int64 := 0;
+              while cuSq < cuGnl {
+                if peek8(peek64(cuSb) + cuSq) != peek8(cuGnp + cuSq) { cuSg := 0; cuSq := cuGnl; }
+                cuSq := cuSq + 1;
+              }
+              if cuSg != 0 { cuPriv := 1; }
+            }
+            cuSi := cuSi + 1;
+          }
+          if cuPriv == 0 {
+            var cuGw: int64 := cuGlobBuf + cuGlobN * 24;
+            poke64(cuGw, cuGnp);
+            poke64(cuGw + 8, cuGnl);
+            poke64(cuGw + 16, peek64(cuGr + 16));   // GLOBAL_REC_OFF_IDX (ir_lower.lyx)
+            cuGlobN := cuGlobN + 1;
+          }
+          cuGk := cuGk + 1;
+        }
       }
 
       var lyw: LyuWriter := new LyuWriter();
@@ -2139,8 +2240,38 @@ pub type CompilerConfig = class {
       if self.debugSymbols { lyw.LywSetDebug(1); }
       if cuIrPtr != 0 { lyw.LywSetIR(cuIrPtr); }   // #1974
       lyw.LywSammleRessourcen(parser.nodes, astRoot, source);   // #1971
+      // #1971: Ressourcen der Units, die DIESE Unit als Quelle importiert. Die
+      // .lyu bringt deren Code mit (IR), also auch deren Ressourcen; ihre
+      // Namen tragen den Unit-Vorsatz schon (cg_resEintragen). Die eigenen
+      // (ohne Vorsatz) kamen eben aus dem AST.
+      var cuRi: int64 := 0;
+      while cuRi < cuCg.resCount {
+        var cuRb: int64 := cuCg.ress + cuRi * CG_RES_SZ;
+        if peek64(cuRb + 48) > 0 {
+          lyw.LywAddResourceImport(peek64(cuRb) as pchar, peek64(cuRb + 8),
+                                   peek64(cuRb + 16) as pchar, peek64(cuRb + 32), peek64(cuRb + 40));
+        }
+        cuRi := cuRi + 1;
+      }
+      lyw.LywSammleEnums(parser.nodes, astRoot, source);        // #2142
+      // #2142: Namen der Modulvariablen — nur mit IR (dort sind sie Plaetze
+      // im Global-Puffer), gesammelt gleich nach dem Lowering (cuGlobBuf).
+      var cuGi: int64 := 0;
+      while cuGi < cuGlobN {
+        var cuGb: int64 := cuGlobBuf + cuGi * 24;
+        lyw.LywAddGlobal(peek64(cuGb) as pchar, peek64(cuGb + 8), peek64(cuGb + 16));
+        cuGi := cuGi + 1;
+      }
       lyw.LywSammleExporte(parser.nodes, astRoot, source);     // #2035
       lyw.LywSammleKonstanten(parser.nodes, astRoot, source);  // #2014 Stufe 1
+      // #2014 Stufen 2–4: Signaturen, Struct-/Klassenlayout, Importe. Das
+      // Layout kommt vom Backend, das die Unit fuer DIESES Ziel uebersetzt
+      // hat — auf einem IR-Ziel vom Lowering, sonst vom x86-Codegen. Die
+      // beiden legen Klassen verschieden an (x86 jede ab +8, der IR-Weg nur
+      // mit VMT); der Verbraucher prueft deshalb gegen sein eigenes.
+      lyw.LywSammleDeklarationen(parser.nodes, astRoot, source, parser.gtBuf, parser.gtN);
+      lyw.LywLayoutX86(cuCg);
+      if cuIrPtr != 0 { lyw.LywLayoutIR(cuLowerFuerLyu); }
       // #1982: Das arch-Feld stand fest auf x86_64, auch wenn fuer ein anderes
       // Ziel uebersetzt wurde. Solange die .lyu nur Namen trug, war das
       // folgenlos; mit IM CONTAINER LIEGENDEM CODE ist es das nicht mehr —
@@ -2365,6 +2496,17 @@ pub type CompilerConfig = class {
       _irNoetig := false;   // Diagnose erledigt — erzeugt wird auf dem Schnellweg
     }
 
+    // #2144: --meta-safe gibt es nur hinter WriteELF (x86-64-Programm). Auf
+    // jedem anderen Ziel und mit --emit=obj wurde der Schalter bis 1.2.16A
+    // still verworfen — das Erzeugnis hatte keine .meta_safe, rc 0. Fuer
+    // --shared weist der Schnellweg ihn schon ab (#2124): eine .so hat keine
+    // feste Ladeadresse, code_start_va im Kopf waere eine erfundene Zahl.
+    if self.metaSafe && (!_x86Weg || self.emitObj) && !_x86So {
+      EPrintStrLn("error: --meta-safe gibt es nur fuer ein x86-64-Programm (ELF), nicht fuer dieses Ziel oder --emit=obj (#2144)."c);
+      self.exitCode := 1;
+      return self.exitCode;
+    }
+
     if _x86Weg && !_irNoetig {
       var outPath: pchar := outputFile;
       if outPath == 0 as pchar { outPath := "a.out"c; }
@@ -2491,7 +2633,7 @@ pub type CompilerConfig = class {
       }
       // WP-3.2: --meta-safe: append .meta_safe section with CRC32 page hashes
       if self.metaSafe && !self.emitObj {
-        ms_appendMetaSafe(outPath, 176, cg.codeLen, cg.dataLen);
+        ms_appendMetaSafe(outPath, cg.codeFileOff, cg.codeStartVa, cg.codeLen, cg.dataLen);
       }
       self._passEnd("codegen-x86_64"c, _t5x);
       return self.exitCode;
@@ -2626,6 +2768,7 @@ pub type CompilerConfig = class {
     var _t5i: int64 := self._passStart("ir-lowering"c);
     lower.lowerModule(astRoot);
     self._passEnd("ir-lowering"c, _t5i);
+    self.lyxosResListe := lower.irResListe;   // #1971: fuer die LBF-Ressourcenbloecke
 
     // WP-BC-44: dump IR (--dump-ir or --ir-source-map)
     if self.dumpIR || self.irSourceMap {
@@ -3448,6 +3591,9 @@ pub type CompilerConfig = class {
     var lbf: LBFNativeWriter := new LBFNativeWriter();
     lbf.setLifecycle(self.lifecycleKind, 0, 0);  // LX-36: no events at compile time (handler VAs unknown)
     lbf.setCapabilities(self.lyxosCapBits);       // CAPS-TLV aus @capabilities (sonst nur STDIO)
+    if self.lyxosResListe != 0 {                  // #1971: eigener Seitentyp fuer Ressourcen
+      lbf.setResources(peek64(self.lyxosResListe), peek64(self.lyxosResListe + 8), IR_RES_SZ);
+    }
     // LYXOS-WP-5: Sektions-Größen für Multi-Section-SECTION_MAP + Genesis-Counts.
     lbf.setSections(emitter.getTextLen(), emitter.getRodataLen(), emitter.getDataLen());
     if !lbf.writeLBF(outPath, self.inputFile as pchar, emitter.getCodeBuf(), emitter.getCodeLen()) {
@@ -3844,7 +3990,17 @@ pub type CompilerConfig = class {
     var dynOff: int64 := relaOff + relaSize;
     var dynCount: int64 := uniqCount + libcNeededExtra + 11;
     var dynSize: int64 := dynCount * 16;
-    var fileSize: int64 := dynOff + dynSize;
+    // #2140: Modulvariablen. Der Emitter laedt ihre Adresse aus einem Slot im
+    // Code (_emitGlobalAddrX9), der hier auf die absolute VA gebacken werden
+    // muss — dieselbe Rechnung wie im statischen Zweig von writeELF (die
+    // beiden muessen uebereinstimmen). Bis 1.2.16A fehlte sie hier: jedes
+    // arm64-Programm mit `extern fn` UND einer Modulvariablen (schon
+    // `import std.io` hat welche) las seine Globals ueber Adresse 0. Aufgefallen
+    // ist es erst, als ein solches Erzeugnis unter einem Binder lief.
+    var gblCountD: int64 := 0;
+    if self.irModulePtr != 0 { gblCountD := peek64(self.irModulePtr + IR_MOD_OFF_GLOBALLEN); }
+    var gblOffD: int64 := ((dynOff + dynSize + 7) >> 3) << 3;
+    var fileSize: int64 := gblOffD + gblCountD * 8;
 
     var buf: int64 := alloc(fileSize);
 
@@ -3954,6 +4110,23 @@ pub type CompilerConfig = class {
     poke64(dp, 9);  poke64(dp + ELF64_DYN_OFF_VAL, 24);                 dp := dp + 16;   // DT_RELAENT
     poke64(dp, 30); poke64(dp + ELF64_DYN_OFF_VAL, 8);                  dp := dp + 16;   // DT_FLAGS = DF_BIND_NOW
     poke64(dp, 0);  poke64(dp + ELF64_DYN_OFF_VAL, 0);                                    // DT_NULL
+
+    // #2140: Globals-Anfangswerte + Adressslots (siehe oben).
+    if gblCountD > 0 {
+      var gbufD: int64 := peek64(self.irModulePtr + IR_MOD_OFF_GLOBALBUF);
+      var dgiD: int64 := 0;
+      while dgiD < gblCountD {
+        poke64(buf + gblOffD + dgiD * 8, peek64(gbufD + dgiD * 8));
+        dgiD += 1;
+      }
+      var griD: int64 := 0;
+      while griD < self.globalRelocCount {
+        var grecD: int64 := self.globalRelocBuf + griD * GRELOCBUF_SZ;
+        var slotFileOffD: int64 := codeFileOff + self.codeStubOff + peek64(grecD + 0);
+        poke64(buf + slotFileOffD, baseVA + gblOffD + peek64(grecD + GRELOCBUF_OFF_GIDX) * 8);
+        griD += 1;
+      }
+    }
 
     var result: int64 := FileWriteAll(path, buf as pchar, fileSize) as int64;
     free(buf, fileSize);
@@ -5902,7 +6075,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.2.16A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.2.16B — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
@@ -5913,8 +6086,21 @@ pub fn main(argc: int64, argv: pchar): int64 {
     var uiOk: bool := false;
     uiFd := open(cfg.unitInfoPath as pchar, 0, 0);
     if uiFd >= 0 {
-      uiBuf := alloc(131072);
-      uiSz := read(uiFd, uiBuf as pchar, 131071);
+      // #1971: die GANZE Datei. Bis 1.2.16A las --unit-info hoechstens 128 KB;
+      // eine .lyu mit Ressourcen ist groesser, und alles am Ende (Ressourcen,
+      // Anhangverzeichnis #2142) blieb unsichtbar. Ueber 64 MB laut.
+      var uiGr: int64 := lseek(uiFd, 0, 2);
+      lseek(uiFd, 0, 0);
+      if uiGr > LYU_MAX_BYTES { close(uiFd); LyuZuGross(cfg.unitInfoPath as pchar, uiGr); }
+      if uiGr < 0 { uiGr := 0; }
+      uiBuf := alloc(uiGr + 1);
+      var uiGel: int64 := 0;
+      var uiFehl: int64 := 0;
+      while uiGel < uiGr && uiFehl == 0 {
+        var uiN: int64 := read(uiFd, (uiBuf + uiGel) as pchar, uiGr - uiGel);
+        if uiN <= 0 { uiFehl := 1; } else { uiGel := uiGel + uiN; }
+      }
+      uiSz := uiGel;   // WP-27: ein kurzer Read liefert nur, was da ist
       if uiSz < 0 { uiSz := 0; }   // WP-27: EINTR-Guard — verhindert poke8(buf-1)
       poke8(uiBuf + uiSz, 0);
       close(uiFd);

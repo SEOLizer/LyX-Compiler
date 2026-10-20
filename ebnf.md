@@ -1,6 +1,6 @@
-# Lyx 1.2.16A — Canonical EBNF Grammar
+# Lyx 1.2.16B — Canonical EBNF Grammar
 
-> Stand 2026-10-20, gegen lyxc 1.2.16A geprueft. Die Keyword-Liste in
+> Stand 2026-10-20, gegen lyxc 1.2.16B geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -443,11 +443,18 @@ TypeDecl            = [ Visibility ] "type" Ident [ TypeParamClause ] "=" TypeDe
    Nennungen derselben Kombination sind derselbe Typ; geschachtelt
    (`Box<Box<int64>>`) und selbstbezueglich (`next: Node<T>`) geht.
 
-   Laut abgewiesen (nicht umgesetzt): ein generischer Typ einer ANDEREN Unit,
-   ein Typparameter einer generischen Funktion als Typargument (`Box<T>` in
-   `fn f<T>`), Ableitung von einer Instanz (`extends Box<int64>`), ein
-   Typargument, das kein schlichter Typname ist (`Box<int64[]>`), eine
-   generische Typdeklaration in einem `@if`-Zweig. *)
+   Seit #2143 auch: ein generischer Typ einer ANDEREN Unit (`import gt;
+   Box<int64>` -- die Instanz entsteht in der Unit der Deklaration, deren
+   private Helfer gelten; ein Typ der rufenden Unit als Typargument wird
+   abgewiesen, dort waere er unbekannt) und ein Typparameter einer
+   generischen Funktion als Typargument (`Box<T>` in `fn f<T>`, je
+   Spezialisierung "Box<int64>"; der typgeloeschte Rumpf -- Aufruf ohne
+   Typargumente -- bricht dann zur Laufzeit ab). Ein Local vom Typparameter
+   (`var q: T`) ist so gueltig wie ein Parameter.
+
+   Laut abgewiesen (nicht umgesetzt): Ableitung von einer Instanz
+   (`extends Box<int64>`), ein Typargument, das kein schlichter Typname ist
+   (`Box<int64[]>`), eine generische Typdeklaration in einem `@if`-Zweig. *)
 
 TypeDef             = Type
                     | RangeTypeDef

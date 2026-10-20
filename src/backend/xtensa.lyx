@@ -669,30 +669,53 @@ pub type EmitXtensa = class {
       // fremden Wert; arm64, lyxos, riscv und arm-cm rechnen laengst ab
       // argBase.
       //
-      // Die CALL0-Konvention haelt sechs Argumente in a2..a7. Mehr davon
-      // gingen ueber den Stapel; bis das umgesetzt ist, wird es GEMELDET
-      // statt still verworfen (`while ai < 4` war genau so ein stiller
-      // Verlust, vgl. #1761 auf lyxos).
+      // Die CALL0-Konvention haelt sechs Argumente in a2..a7; ab dem
+      // siebten geht es ueber den Stapel, 4-Byte-Plaetze ab dem sp des
+      // Aufrufers zum Zeitpunkt des CALL0 (#2140; bis 1.2.16A abgewiesen,
+      // davor still verworfen — `while ai < 4`, vgl. #1761 auf lyxos).
+      // Der Platz wird am Stueck angelegt und nach dem Aufruf freigegeben.
+      // Die Slots sind sp-relativ, deshalb liest dieser Weg sie ueber a10
+      // (= sp VOR dem Anlegen). Das Gegenstueck im Callee steht in emitFunc
+      // — die beiden muessen uebereinstimmen.
       var argCount: int64 := imm;
       var argBase:  int64 := src2;
       if argBase < 0 { argBase := 0; }
+      var stBytes: int64 := 0;
       if argCount > 6 {
-        EPrintStr("error: xtensa: Aufruf mit "c);
-        EPrintInt(argCount);
-        EPrintStrLn(" Argumenten — mehr als sechs gehen ueber den Stapel (#1782)."c);
-        EPrintStrLn("  Der Stapelweg ist auf diesem Ziel noch nicht umgesetzt; bis dahin"c);
-        EPrintStrLn("  wird das gemeldet statt die ueberzaehligen still zu verwerfen."c);
-        exit(1);
+        stBytes := (argCount - 6) * 4;
+        if (stBytes & 15) != 0 { stBytes := (stBytes + 16) & -16; }
+        // ADDI traegt acht Bit Direktwert; xt_adjustSP nimmt fuer mehr a10,
+        // das hier die alte Basis haelt.
+        if stBytes > 112 {
+          EPrintStr("error: xtensa: Aufruf mit "c);
+          EPrintInt(argCount);
+          EPrintStrLn(" Argumenten — mehr als 28 Stapelargumente werden nicht erzeugt (#2140)."c);
+          exit(1);
+        }
+        if argBase + argCount + 1 > 255 {
+          EPrintStrLn("error: xtensa: Argumentblock jenseits von 255 Worten — L32I erreicht ihn nicht (#2140)."c);
+          exit(1);
+        }
+        self.xt_MOV(XT_T2, XT_SP);              // a10 = sp vor dem Anlegen
+        self.xt_ADDI(XT_SP, XT_SP, 0 - stBytes);
+        var sk: int64 := 6;
+        while sk < argCount {
+          self.xt_L32I(XT_T0, XT_T2, argBase + sk + 1);
+          self.xt_S32I(XT_T0, XT_SP, sk - 6);
+          sk := sk + 1;
+        }
       }
       var ai: int64 := 0;
       while ai < argCount && ai < 6 {
-        self.xt_loadSlot(argBase + ai);
+        if stBytes > 0 { self.xt_L32I(XT_T0, XT_T2, argBase + ai + 1); }
+        else { self.xt_loadSlot(argBase + ai); }
         self.xt_MOV(XT_RV + ai, XT_T0);   // a2..a7
         ai := ai + 1;
       }
       var patchOff: int64 := self.codeLen;
       self.xt_CALL0(0);   // placeholder
       self.addPatch(patchOff, src1, XT_PATCH_CALL0);
+      if stBytes > 0 { self.xt_ADDI(XT_SP, XT_SP, stBytes); }   // #2140: Stapelargumente abraeumen
       self.xt_MOV(XT_T0, XT_RV);          // T0 = return value from a2
       self.xt_storeSlot(dest);
     }
@@ -1252,6 +1275,18 @@ pub type EmitXtensa = class {
     while pi < pSpill {
       if pi < 6 {
         self.xt_MOV(XT_T0, XT_RV + pi);
+        self.xt_storeSlot(IR_BARG_SLOTS + pi);
+      } else {
+        // #2140: Parameter ab dem siebten liegen beim Aufrufer auf dem
+        // Stapel, 4-Byte-Plaetze ab dessen sp — hier [sp + Rahmen]. Bis
+        // 1.2.16A blieben diese Slots unbeschrieben (#1782: der Aufrufer
+        // meldete laut, der Callee verwarf still). Gegenstueck: IRO_CALL.
+        var pw: int64 := self.stackSize / 4 + (pi - 6);
+        if pw > 255 || IR_BARG_SLOTS + pi + 1 > 255 {
+          EPrintStrLn("error: xtensa: Parameter jenseits von 255 Worten — L32I/S32I erreichen ihn nicht (#2140)."c);
+          exit(1);
+        }
+        self.xt_L32I(XT_T0, XT_SP, pw);
         self.xt_storeSlot(IR_BARG_SLOTS + pi);
       }
       pi := pi + 1;

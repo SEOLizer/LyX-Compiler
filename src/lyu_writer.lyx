@@ -1,11 +1,137 @@
 // bootstrap/lyu_writer.lyx — WP-BC-50a
 // Serialises sema symbol table to .lyu pre-compiled unit format (version 2).
 // Format matches S0 unit_format.pas / TLyuxSerializer::Serialize.
+//
+// ── Belegung des Kopfes (Stand #2014 Stufe 4) ──────────────────────────────
+//
+//   4    Magic "LYU\0"
+//   u16  Version (= 2)
+//   u8   Architektur (LYU_ARCH_*)
+//   u8   Flags
+//          bit0 (1)  Debug-Abschnitt                     #1555
+//          bit1 (2)  Ressourcen-Abschnitt                #1971
+//          bit2 (4)  -- frei, NICHT von #2014 belegt (fuer #1971/#2142 freigehalten)
+//          bit3 (8)  -- frei
+//          bit4 (16) Deklarationen im TypeInfo-Abschnitt  #2014 Stufen 2–4
+//          bit5–7    -- frei
+//   str  Unit-Name, dann drei leere v2-Metadatenfelder
+//   u32  symCount
+//   u32  TypeInfoOffset  -> Konstanten (#2014 Stufe 1) und, bei Flag bit4,
+//                           direkt dahinter die Deklarationen (Stufen 2–4)
+//   u32  IRCodeOffset    (#1974)
+//   u32  DebugOffset     (#1555)
+//   u32  ResourceOffset  (#1971, war "Reserved") — von #2014 NICHT benutzt
+//
+// Die Deklarationen brauchen KEIN eigenes Kopffeld: sie haengen im selben
+// Abschnitt wie die Konstanten hinter deren letztem Eintrag. Ein Leser, der
+// bit4 nicht kennt, liest die Konstanten wie bisher und hoert dort auf.
+//
+// ── Deklarationsabschnitt (#2014 Stufen 2–4) ──────────────────────────────
+//
+//   u32  Anzahl Eintraege
+//   je Eintrag:
+//     u8   Art   (2 = Funktion, 3 = Struct, 4 = Klasse, 7 = Import)
+//     u32  Laenge des Rests in Byte — ein Leser UEBERSPRINGT unbekannte Arten
+//     str  Name  (Bindung ueber den NAMEN, nicht ueber den Symbolindex)
+//     ...  artabhaengiger Rumpf:
+//
+//   Signatur (Art 2 und je Methode in Art 4):
+//     str  Rueckgabetyp als NAME ("" = keiner), z. B. "TPunkt" statt "user"
+//     u16  Anzahl Parameter
+//     je Parameter: str Name, str Typ, u8 Flags (bit0 Vorgabewert, bit1 con,
+//                   bit2 ref), bei bit0: str Vorgabe (Quelltext eines
+//                   gefalteten Werts, z. B. "5", "(0 - 6 - 1)", "true", "2.5")
+//     u8   Flags (heute 0 — extern, generisch und variadisch werden nicht
+//               beschrieben, sondern fehlen; siehe LywSammleDeklarationen)
+//
+//   Art 3 (Struct):
+//     u32  Gesamtgroesse in Byte, u8 Flags (0)
+//     u16  Anzahl Felder, je Feld: str Name, str Typ, u32 Offset, u32 Groesse,
+//          u8 Flags (Feld-iVal & 0x36: bit1 @big_endian, bit2 @little_endian,
+//                    bits4-5 Sichtbarkeit)
+//
+//   Art 4 (Klasse):
+//     str  Basisklasse ("" = keine)
+//     u16  Anzahl Interfaces, je: str
+//     u32  Gesamtgroesse
+//     u8   Flags   bit0 = Felder beginnen hinter einem Typ-/VMT-Wort bei +8
+//                  (TRAGEND: entscheidet ueber 0 oder 8), bit1 = abstract
+//     u16  Anzahl EIGENER Felder — wie Art 3, Offsets absolut im Objekt
+//     u16  Anzahl Methoden, je: str Name, u8 Flags (Methoden-iVal & 0x7F:
+//          bit0 pub, bit1 virtual, bit2 override, bit3 abstract, bits4-5
+//          Sichtbarkeit, bit6 static), u16 VMT-Platz, Signatur
+//          VMT-Platz: 0xFFFF nicht virtuell, 0xFFFE ueberschreibt einen
+//          geerbten Platz, sonst Nummer unter den NEUEN Plaetzen dieser Klasse
+//          (in Deklarationsreihenfolge). Zusammen mit der Basisklasse ergibt
+//          das die VMT-Ordnung.
+//
+//   Art 7 (Import der Unit): Name = Modulname, u8 Flags (bit0 `.*`),
+//          str Alias ("" = keiner) — die Typen der Schnittstelle koennen aus
+//          anderen Units stammen.
+//
+// Offsets und Groessen stammen aus dem BACKEND, das die Unit gerade
+// uebersetzt hat (x86: Codegen, IR-Ziele: IRLower) — nicht aus einer zweiten
+// Rechnung hier. Sie sind backendabhaengig (x86 legt jede Klasse ab +8 an, der
+// IR-Weg nur Klassen mit VMT); der Verbraucher vergleicht sie mit seinem
+// eigenen Ergebnis und MELDET eine Abweichung, statt sie zu uebernehmen.
+//
+// ── Ergaenzung #1971/#2142 ──────────────────────────────────────────────
+//
+// BELEGUNG DES KOPFES (Fassung 2, kein Formatbruch — ein Leser, der ein Feld
+// nicht kennt, ueberspringt es):
+//
+//   flags  bit0 (1) Debug-Abschnitt (#1555)
+//          bit1 (2) Ressourcen-Abschnitt (#1971)
+//   u32    KonstantenOffset   (#2014 Stufe 1, hiess TypeInfoOffset)
+//   u32    IRCodeOffset       (#1974)
+//   u32    DebugOffset        (#1555)
+//   u32    ResourceOffset     (#1971, war `Reserved`) — Abschnitt am ENDE:
+//          Anzahl (u32), je Eintrag Name (u16+Zeichen), Laenge (u32), Bytes.
+//          Name OHNE Unit-Vorsatz; einheitsqualifiziert (`unit:name`) wird
+//          beim Import, mit dem Importnamen. Ausnahme: Ressourcen einer von
+//          dieser Unit importierten QUELL-Unit tragen ihren Vorsatz schon.
+//
+// #2142: ANHANGVERZEICHNIS. Der Kopf hat kein freies Feld mehr; weitere
+// Abschnitte stehen deshalb in einem Verzeichnis, das ein Nachspann am
+// DATEIENDE findet:
+//
+//   ... Abschnitte ...
+//   Verzeichnis:  je Eintrag u32 Art, u32 Offset, u32 Laenge
+//   Nachspann:    "LYUX" (4), u32 Verzeichnis-Offset, u32 Anzahl, u32 0
+//
+// Der Nachspann MUSS das Letzte in der Datei bleiben — wer einen weiteren
+// Abschnitt anhaengt, traegt ihn als neue Art ins Verzeichnis ein, statt ihn
+// dahinter zu schreiben. Vergebene Arten:
+//
+//   1  Enum-Varianten   (#2142) — Anzahl Enums (u32); je Enum Name (_eStr),
+//                       Anzahl Varianten (u32), je Variante Name (_eStr) und
+//                       Wert (i64). Nur oeffentliche Enums.
+//   2  Modulvariablen   (#2142) — Anzahl (u32); je Eintrag Name (_eStr) und
+//                       Index im Global-Puffer des IR-Abschnitts (u32). Nur
+//                       mit IR-Abschnitt. Private Variablen einer importierten
+//                       Unit stehen in ihrer gemarkten Form ("unit_name");
+//                       private der Unit selbst fehlen — niemand darf sie von
+//                       aussen ansprechen, und ihr blanker Name fiele sonst
+//                       mit einer gleichnamigen Variablen des Programms
+//                       zusammen.
+//
+// GROESSE (#1971): eine .lyu ueber 64 MB wird nicht geschrieben und nicht
+// gelesen (LYU_MAX_BYTES). Darunter liest jeder Leser sie am Stueck.
 
 import src.sema;
+import src.lyu_reader;  // #1971/#2142: LYU_MAX_BYTES, LYU_ANH_* (eine Quelle)
 import src.ir;          // #1974: IR_MOD_OFF_* fuer den IR-Abschnitt
 import src.parser;      // #1971: NODE_OFF_* / PARSER_NODE_SIZE fuer den AST-Lauf
 import src.std.alloc;
+import src.codegen_x86; // #2014: Layouts aus dem x86-Codegen (CgLyuTyp/CgLyuFeld)
+import src.ir_lower;    // #2014: Layouts vom IR-Weg (IrLyuTyp/IrLyuFeld)
+
+// #2014 Stufen 2–4: Flagbit des Deklarationsabschnitts (siehe Kopf oben).
+pub con LYU_FLAG_DEKL: int64 := 16;
+con LYU_DK_FN:     int64 := 2;
+con LYU_DK_STRUCT: int64 := 3;
+con LYU_DK_KLASSE: int64 := 4;
+con LYU_DK_IMPORT: int64 := 7;
 
 // Magic 'LYU\0'
 con LYU_W_M0: int64 := 76;
@@ -18,6 +144,9 @@ con LYU_W_VER: int64 := 2;
 // weiterentwickeln kann, ohne die Fassung der .lyu selbst anzufassen — ein
 // Leser, der die Zahl nicht kennt, ueberspringt den Abschnitt.
 pub con LYU_IR_VER: int64 := 1;
+
+// LYU_MAX_BYTES und LYU_ANH_* stehen in src/lyu_reader.lyx — Schreiber und
+// alle Leser fragen dieselbe Stelle.
 
 // TLyuxArch codes (must match S0 unit_format.pas)
 pub con LYU_ARCH_X86_64:     int64 := 0;
@@ -58,13 +187,27 @@ pub type LyuWriter = class {
   // Ein Leser, der ihn nicht kennt, hoert nach der Symboltabelle auf und
   // liest die Datei unveraendert; die Version bleibt 2.
   //
-  // Eintraege: {namePtr, nameLen, pfadPtr, pfadLen} zu je 32 Byte. Die BYTES
-  // liest der Schreiber selbst — im Erzeugnis des Nutzers gibt es den Pfad
-  // nicht mehr, also muss der Inhalt in die Datei.
+  // Eintraege: {namePtr, nameLen, pfadPtr, pfadLen, datenPtr, datenLen} zu je
+  // 48 Byte. Die BYTES liest der Schreiber selbst — im Erzeugnis des Nutzers
+  // gibt es den Pfad nicht mehr, also muss der Inhalt in die Datei.
+  // pfadLen == -1: der Pfad ist schon aufgeloest (nullterminiert, Ressource
+  // einer importierten Quell-Unit). datenPtr != 0: die Bytes liegen schon vor
+  // (Ressource einer von dieser Unit importierten .lyu).
   resOffPos:  int64;
   resList:    int64;
   resCount:   int64;
   resCap:     int64;
+
+  // #2142: Enum-Varianten (Anhang Art 1). Records 24 Byte {Knotentabelle,
+  // Knoten, Quelltext} je oeffentlichem NK_ENUM_DECL.
+  enmList:    int64;
+  enmCount:   int64;
+  enmCap:     int64;
+  // #2142: Namen der Modulvariablen (Anhang Art 2). Records 24 Byte
+  // {Namenszeiger, Laenge, Index}.
+  glbList:    int64;
+  glbCount:   int64;
+  glbCap:     int64;
 
   // #2014 Stufe 1: Werte der Modulkonstanten.
   //
@@ -91,6 +234,25 @@ pub type LyuWriter = class {
   expCap:     int64;
   expAktiv:   int64;
 
+  // #2014 Stufen 2–4: Deklarationen (Signaturen, Struct- und Klassenlayout,
+  // Importe). Records 16 Byte {art, knoten}; geschrieben wird erst in
+  // Serialize, wenn die Layouts des Backends feststehen.
+  dkList:   int64;
+  dkCount:  int64;
+  dkCap:    int64;
+  dkNodes:  int64;
+  dkSrc:    pchar;
+  dkGtBuf:  int64;   // generische Typdeklarationen des Parsers (#2134)
+  dkGtN:    int64;
+  dkCg:     Codegen;   // Layoutquelle x86 (dkHatCg != 0)
+  dkIr:     IRLower;   // Layoutquelle IR-Weg (dkHatIr != 0)
+  dkHatCg:  int64;
+  dkHatIr:  int64;
+  dkBox:    int64;     // 4 x 8 Byte Rueckgabefelder der Layoutabfragen
+  tb:       int64;     // Puffer fuer Typtexte
+  tbLen:    int64;
+  tbCap:    int64;
+
   pub fn LywInit() {
     self.cap := 4096;
     self.buf := alloc(self.cap);
@@ -105,12 +267,30 @@ pub type LyuWriter = class {
     self.expCap       := 0;
     self.expAktiv     := 0;
     self.konOffPos    := 0;   // #2014
+    self.dkList       := 0;   // #2014 Stufen 2–4
+    self.dkCount      := 0;
+    self.dkCap        := 0;
+    self.dkNodes      := 0;
+    self.dkGtBuf      := 0;
+    self.dkGtN        := 0;
+    self.dkHatCg      := 0;
+    self.dkHatIr      := 0;
+    self.dkBox        := alloc(32);
+    self.tbCap        := 256;
+    self.tb           := alloc(self.tbCap);
+    self.tbLen        := 0;
     self.konList      := 0;
     self.konCount     := 0;
     self.konCap       := 0;
     self.resList      := 0;
     self.resCount     := 0;
     self.resCap       := 0;
+    self.enmList      := 0;   // #2142
+    self.enmCount     := 0;
+    self.enmCap       := 0;
+    self.glbList      := 0;
+    self.glbCount     := 0;
+    self.glbCap       := 0;
   }
 
   // #1971: vor Serialize aufrufen, je `@resource` der Unit einmal. Ohne
@@ -174,20 +354,99 @@ pub type LyuWriter = class {
   }
 
   pub fn LywAddResource(nm: pchar, nmLen: int64, pf: pchar, pfLen: int64) {
+    self._resAdd(nm, nmLen, pf, pfLen, 0, 0);
+  }
+
+  // #1971: Ressource einer IMPORTIERTEN Unit, mit Unit-Vorsatz im Namen.
+  // Entweder ein aufgeloester Pfad (Quell-Unit) oder die Bytes (aus einer
+  // .lyu) — daten == 0 heisst: vom Pfad lesen.
+  pub fn LywAddResourceImport(nm: pchar, nmLen: int64, pfVoll: pchar, daten: int64, datenLen: int64) {
+    self._resAdd(nm, nmLen, pfVoll, 0 - 1, daten, datenLen);
+  }
+
+  fn _resAdd(nm: pchar, nmLen: int64, pf: pchar, pfLen: int64, daten: int64, datenLen: int64) {
+    // Doppelter Name innerhalb derselben .lyu: laut, wie im Codegen.
+    var di: int64 := 0;
+    while (di < self.resCount) {
+      var db: int64 := self.resList + di * 48;
+      if (peek64(db + 8) == nmLen) {
+        var gleich: int64 := 1;
+        var dj: int64 := 0;
+        while (dj < nmLen) {
+          if (peek8(peek64(db) + dj) != peek8((nm as int64) + dj)) { gleich := 0; dj := nmLen; }
+          dj := dj + 1;
+        }
+        if (gleich != 0) {
+          EPrintStr("error: @resource: der Name kommt zweimal vor: "c);
+          sys_write(2, nm as int64, nmLen);
+          EPrintStrLn(""c);
+          exit(1);
+        }
+      }
+      di := di + 1;
+    }
     if (self.resCount >= self.resCap) {
       var nc: int64 := self.resCap * 2;
       if (nc < 8) { nc := 8; }
-      var nb: int64 := alloc(nc * 32);
-      if (self.resCount > 0) { memcpy(nb, self.resList, self.resCount * 32); }
+      var nb: int64 := alloc(nc * 48);
+      if (self.resCount > 0) { memcpy(nb, self.resList, self.resCount * 48); }
       self.resList := nb;
       self.resCap  := nc;
     }
-    var b: int64 := self.resList + self.resCount * 32;
+    var b: int64 := self.resList + self.resCount * 48;
     poke64(b,      nm as int64);
     poke64(b + 8,  nmLen);
     poke64(b + 16, pf as int64);
     poke64(b + 24, pfLen);
+    poke64(b + 32, daten);
+    poke64(b + 40, datenLen);
     self.resCount := self.resCount + 1;
+  }
+
+  // #2142: Die OEFFENTLICHEN Enums der Unit merken (Anhang Art 1). Die Werte
+  // werden beim Schreiben ausgerechnet — dieselbe Regel wie
+  // cg_buildEnumLayout und _irEnumSammle (die drei muessen uebereinstimmen):
+  // ohne Wert der Vorgaenger + 1, ein expliziter Wert setzt den Zaehler neu.
+  pub fn LywSammleEnums(nodes: int64, astRoot: int64, src: pchar) {
+    var cur: int64 := astRoot;
+    while (cur >= 0) {
+      var off: int64 := nodes + cur * PARSER_NODE_SIZE;
+      if (peek64(off) == NK_ENUM_DECL && peek64(off + NODE_OFF_ISPUB) != 0) {
+        if (self.enmCount >= self.enmCap) {
+          var nc: int64 := self.enmCap * 2;
+          if (nc < 8) { nc := 8; }
+          var nb: int64 := alloc(nc * 24);
+          if (self.enmCount > 0) { memcpy(nb, self.enmList, self.enmCount * 24); }
+          self.enmList := nb;
+          self.enmCap := nc;
+        }
+        var eb: int64 := self.enmList + self.enmCount * 24;
+        poke64(eb, nodes);
+        poke64(eb + 8, cur);
+        poke64(eb + 16, src as int64);
+        self.enmCount := self.enmCount + 1;
+      }
+      cur := peek64(off + NODE_OFF_NEXT);
+    }
+  }
+
+  // #2142: Name und Index einer Modulvariablen (Anhang Art 2). Der Aufrufer
+  // (lyxc) kennt das Verzeichnis des IR-Lowerings und entscheidet, welche
+  // Namen von aussen ansprechbar sind.
+  pub fn LywAddGlobal(nm: pchar, nmLen: int64, idx: int64) {
+    if (self.glbCount >= self.glbCap) {
+      var nc: int64 := self.glbCap * 2;
+      if (nc < 16) { nc := 16; }
+      var nb: int64 := alloc(nc * 24);
+      if (self.glbCount > 0) { memcpy(nb, self.glbList, self.glbCount * 24); }
+      self.glbList := nb;
+      self.glbCap := nc;
+    }
+    var b: int64 := self.glbList + self.glbCount * 24;
+    poke64(b, nm as int64);
+    poke64(b + 8, nmLen);
+    poke64(b + 16, idx);
+    self.glbCount := self.glbCount + 1;
   }
 
   // #2014 Stufe 1: Werte der Modulkonstanten aus dem AST einsammeln.
@@ -414,6 +673,384 @@ pub type LyuWriter = class {
     self.konCount := self.konCount + 1;
   }
 
+  // ══ #2014 Stufen 2–4: Deklarationen ═══════════════════════════════════
+  //
+  // Die Schnittstelle der Unit BESCHREIBEND: Funktionssignaturen, Struct- und
+  // Klassenlayout, Importe. Gesammelt werden die KNOTEN; geschrieben wird in
+  // Serialize, wenn auch die Layouts des Backends feststehen.
+  //
+  // Was sich nicht vollstaendig beschreiben laesst, kommt NICHT hinein —
+  // statt mit einer geratenen Angabe: eine generische Funktion, eine extern-
+  // Bindung, ein @packed-Struct, ein Typ ausserhalb der hier bekannten
+  // Formen. Der Verbraucher merkt das Fehlen (das Symbol steht in der
+  // Symboltabelle, aber kein Eintrag beschreibt es) und bricht wie bisher ab;
+  // eine falsche Angabe merkte er nicht.
+
+  fn _nk(n: int64): int64  { return peek64(self.dkNodes + n * PARSER_NODE_SIZE); }
+  fn _nc(n: int64, c: int64): int64 { return peek64(self.dkNodes + n * PARSER_NODE_SIZE + NODE_OFF_C0 + c * 8); }
+  fn _nnx(n: int64): int64 { return peek64(self.dkNodes + n * PARSER_NODE_SIZE + NODE_OFF_NEXT); }
+  fn _niv(n: int64): int64 { return peek64(self.dkNodes + n * PARSER_NODE_SIZE + NODE_OFF_IVAL); }
+  fn _nsp(n: int64): pchar { return (self.dkSrc + peek64(self.dkNodes + n * PARSER_NODE_SIZE + NODE_OFF_SVAL)) as pchar; }
+  fn _nsl(n: int64): int64 { return peek64(self.dkNodes + n * PARSER_NODE_SIZE + NODE_OFF_SLEN); }
+  fn _npub(n: int64): int64 { return peek64(self.dkNodes + n * PARSER_NODE_SIZE + NODE_OFF_ISPUB); }
+
+  fn _nGleich(n: int64, t: pchar, tl: int64): int64 {
+    if (self._nsl(n) != tl) { return 0; }
+    var p: int64 := self._nsp(n) as int64;
+    var i: int64 := 0;
+    while (i < tl) {
+      if (peek8(p + i) != StrCharAt(t, i)) { return 0; }
+      i := i + 1;
+    }
+    return 1;
+  }
+
+  // Ist der Knoten eine generische Typdeklaration (#2134)? Die steht nicht am
+  // Knoten, sondern in der Tabelle des Parsers (GT_REC_SZ = 48, Knoten bei +0).
+  fn _istGenerisch(n: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.dkGtN) {
+      if (peek64(self.dkGtBuf + i * 48) == n) { return 1; }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // Name mit '<' — eine Instanz eines generischen Typs ("Box<int64>").
+  fn _nameHatSpitze(n: int64): int64 {
+    var p: int64 := self._nsp(n) as int64;
+    var l: int64 := self._nsl(n);
+    var i: int64 := 0;
+    while (i < l) { if (peek8(p + i) == 60) { return 1; } i := i + 1; }
+    return 0;
+  }
+
+  fn _dkAdd(art: int64, n: int64) {
+    if (self.dkCount >= self.dkCap) {
+      var nc: int64 := self.dkCap * 2;
+      if (nc < 16) { nc := 16; }
+      var nb: int64 := alloc(nc * 16);
+      if (self.dkCount > 0) { memcpy(nb, self.dkList, self.dkCount * 16); }
+      self.dkList := nb;
+      self.dkCap  := nc;
+    }
+    poke64(self.dkList + self.dkCount * 16, art);
+    poke64(self.dkList + self.dkCount * 16 + 8, n);
+    self.dkCount := self.dkCount + 1;
+  }
+
+  // gtBuf/gtN aus dem Parser (#2134), damit generische Typen erkannt werden.
+  pub fn LywSammleDeklarationen(nodes: int64, astRoot: int64, src: pchar, gtBuf: int64, gtN: int64) {
+    self.dkNodes := nodes;
+    self.dkSrc   := src;
+    self.dkGtBuf := gtBuf;
+    self.dkGtN   := gtN;
+    var cur: int64 := astRoot;
+    while (cur >= 0) {
+      var k: int64 := self._nk(cur);
+      if (k == NK_IMPORT) {
+        self._dkAdd(LYU_DK_IMPORT, cur);
+      } else if (k == NK_FUNC_DECL && self._npub(cur) != 0) {
+        // extern: eine FFI-Bindung braucht Bibliothek und Aufrufkonvention —
+        // nicht beschrieben. Generisch (c3 = Typparameter): nicht beschrieben.
+        var ext: int64 := self._niv(cur) & 1;
+        var gen: int64 := 0;
+        var tp: int64 := self._nc(cur, 3);
+        if (tp >= 0) { if (self._nk(tp) == NK_TYPE_PARAM) { gen := 1; } }
+        if (ext == 0 && gen == 0) { self._dkAdd(LYU_DK_FN, cur); }
+      } else if (k == NK_TYPE_DECL && self._npub(cur) != 0) {
+        var iv: int64 := self._niv(cur);
+        var tauglich: int64 := 1;
+        if ((iv & 2) != 0)  { tauglich := 0; }   // Alias
+        if ((iv & 32) != 0) { tauglich := 0; }   // Interface
+        if (self._istGenerisch(cur) != 0)   { tauglich := 0; }
+        if (self._nameHatSpitze(cur) != 0)  { tauglich := 0; }
+        if (tauglich != 0) {
+          if ((iv & 16) != 0) {
+            // Struct: ohne Methoden, ohne flat/packed (Bit0) und ohne at(...).
+            if (self._nc(cur, 1) < 0 && (iv & 1) == 0 && self._feldMitAt(cur) == 0) {
+              self._dkAdd(LYU_DK_STRUCT, cur);
+            }
+          } else {
+            self._dkAdd(LYU_DK_KLASSE, cur);
+          }
+        }
+      } else if (k == NK_STRUCT_DECL && self._npub(cur) != 0) {
+        if ((self._niv(cur) & 1) == 0 && self._feldMitAt(cur) == 0) {
+          self._dkAdd(LYU_DK_STRUCT, cur);
+        }
+      }
+      cur := self._nnx(cur);
+    }
+  }
+
+  fn _feldMitAt(td: int64): int64 {
+    var f: int64 := self._nc(td, 0);
+    while (f >= 0) {
+      if ((self._niv(f) & 1) != 0) { return 1; }   // FIELD_FLAG_PACKED_OFFSET
+      f := self._nnx(f);
+    }
+    return 0;
+  }
+
+  // #2014: Layoutquelle angeben — das Backend, das die Unit gerade uebersetzt
+  // hat. Ohne Quelle werden Structs und Klassen NICHT beschrieben.
+  pub fn LywLayoutX86(cg: Codegen) { self.dkCg := cg; self.dkHatCg := 1; }
+  pub fn LywLayoutIR(lw: IRLower)  { self.dkIr := lw; self.dkHatIr := 1; }
+
+  // ── Typtext ───────────────────────────────────────────────────────────
+  fn _tbPut(c: int64) {
+    if (self.tbLen >= self.tbCap) {
+      var nc: int64 := self.tbCap * 2;
+      var nb: int64 := alloc(nc);
+      memcpy(nb, self.tb, self.tbLen);
+      self.tb := nb;
+      self.tbCap := nc;
+    }
+    poke8(self.tb + self.tbLen, c);
+    self.tbLen := self.tbLen + 1;
+  }
+  fn _tbStr(p: pchar, l: int64) {
+    var i: int64 := 0;
+    while (i < l) { self._tbPut(peek8((p as int64) + i)); i := i + 1; }
+  }
+  fn _tbDez(v: int64) {
+    // Nur fuer v >= 0 gerufen (siehe _tbWert).
+    if (v >= 10) { self._tbDez(v / 10); }
+    self._tbPut(48 + (v % 10));
+  }
+  // Ganzzahl als QUELLTEXT. Ein Minusliteral gibt es in Lyx nicht; eine
+  // negative Zahl wird als `(0 - m - 1)` geschrieben, mit m = -(v+1) >= 0 —
+  // so passt auch der kleinste int64, dessen Betrag kein int64 mehr ist
+  // (`0 - n` ist keine Betragsfunktion, siehe CLAUDE.md).
+  fn _tbWert(v: int64) {
+    if (v >= 0) { self._tbDez(v); return; }
+    self._tbStr("(0 - "c, 5);
+    self._tbDez(0 - (v + 1));
+    self._tbStr(" - 1)"c, 5);
+  }
+
+  // Typknoten als Quelltext in tb anhaengen. 0 = Form nicht beschreibbar.
+  fn _typText(tn: int64): int64 {
+    if (tn < 0) { return 0; }
+    var k: int64 := self._nk(tn);
+    if (k == NK_TYPE_NAME) {
+      if (self._nc(tn, 0) >= 0) { return 0; }         // Map<K,V> u. a.
+      var ta: int64 := self._nc(tn, 1);
+      self._tbStr(self._nsp(tn), self._nsl(tn));
+      if (ta >= 0) {
+        // Nur `Array<T>` — andere Typargumente benennen eine Instanz eines
+        // generischen Typs, und die wird hier nicht beschrieben.
+        if (self._nGleich(tn, "Array"c, 5) == 0) { return 0; }
+        if (self._nnx(ta) >= 0) { return 0; }
+        self._tbPut(60);
+        if (self._typText(ta) == 0) { return 0; }
+        self._tbPut(62);
+      }
+      if ((self._niv(tn) & 1) != 0) { self._tbPut(63); }   // nullable `?`
+      return 1;
+    }
+    if (k == NK_TYPE_ARRAY) {
+      var el: int64 := self._nc(tn, 0);
+      if (el < 0) { self._tbStr("array"c, 5); return 1; }
+      if (self._typText(el) == 0) { return 0; }
+      self._tbStr("[]"c, 2);
+      if ((self._niv(tn) & 1) != 0) { self._tbPut(63); }
+      return 1;
+    }
+    if (k == NK_TYPE_ARRAY_FIXED) {
+      var okb: int64 := alloc(8);
+      var n: int64 := self._konWert(self.dkNodes, self._nc(tn, 1), okb);
+      var ok: int64 := peek64(okb);
+      free(okb, 8);
+      if (ok == 0) { return 0; }   // Groesse nicht ausrechenbar (etwa eine benannte Konstante)
+      if (self._typText(self._nc(tn, 0)) == 0) { return 0; }
+      self._tbPut(91); self._tbWert(n); self._tbPut(93);
+      if ((self._niv(tn) & 1) != 0) { self._tbPut(63); }
+      return 1;
+    }
+    return 0;
+  }
+
+  // Typ als str in die Datei. 0 = nicht beschreibbar (nichts geschrieben).
+  fn _eTyp(tn: int64): int64 {
+    self.tbLen := 0;
+    if (self._typText(tn) == 0) { return 0; }
+    self._eStr(self.tb as pchar, self.tbLen);
+    return 1;
+  }
+
+  // Vorgabewert eines Parameters als Quelltext. 0 = nicht beschreibbar.
+  fn _eVorgabe(dv: int64): int64 {
+    self.tbLen := 0;
+    var k: int64 := self._nk(dv);
+    if (k == NK_LIT_BOOL) {
+      if (self._niv(dv) != 0) { self._tbStr("true"c, 4); } else { self._tbStr("false"c, 5); }
+    } else if (k == NK_LIT_FLOAT) {
+      self._tbStr(self._nsp(dv), self._nsl(dv));
+    } else {
+      var okb: int64 := alloc(8);
+      var v: int64 := self._konWert(self.dkNodes, dv, okb);
+      var ok: int64 := peek64(okb);
+      free(okb, 8);
+      if (ok == 0) { return 0; }
+      self._tbWert(v);
+    }
+    self._eStr(self.tb as pchar, self.tbLen);
+    return 1;
+  }
+
+  // Signatur (Rueckgabetyp, Parameter, Flags). 0 = nicht beschreibbar.
+  fn _eSignatur(fnN: int64): int64 {
+    var rt: int64 := self._nc(fnN, 1);
+    if (rt < 0) { self._eStr(""c, 0); }
+    else if (self._eTyp(rt) == 0) { return 0; }
+    var np: int64 := 0;
+    var pn: int64 := self._nc(fnN, 0);
+    while (pn >= 0) { if (self._nk(pn) == NK_PARAM) { np := np + 1; } pn := self._nnx(pn); }
+    self._e16le(np);
+    pn := self._nc(fnN, 0);
+    while (pn >= 0) {
+      if (self._nk(pn) == NK_PARAM) {
+        self._eStr(self._nsp(pn), self._nsl(pn));
+        if (self._eTyp(self._nc(pn, 0)) == 0) { return 0; }
+        var pf: int64 := 0;
+        var dv: int64 := self._nc(pn, 1);
+        if (dv >= 0) { pf := pf | 1; }
+        if ((self._niv(pn) & PARAM_FLAG_CON) != 0) { pf := pf | 2; }
+        if ((self._niv(pn) & PARAM_FLAG_REF) != 0) { pf := pf | 4; }
+        self._e8(pf);
+        if (dv >= 0) { if (self._eVorgabe(dv) == 0) { return 0; } }
+      }
+      pn := self._nnx(pn);
+    }
+    self._e8(0);
+    return 1;
+  }
+
+  // Layout eines Typs vom Backend: Groesse in dkBox[0], VMT-Flag in dkBox[1].
+  // Rueckgabe 0, wenn das Backend den Typ nicht kennt.
+  fn _layoutTyp(np: pchar, nl: int64): int64 {
+    if (self.dkHatIr != 0) { return self.dkIr.IrLyuTyp(np, nl, self.dkBox); }
+    if (self.dkHatCg != 0) { return self.dkCg.CgLyuTyp(np, nl, self.dkBox); }
+    return 0;
+  }
+  // Offset eines Feldes in dkBox[0], Breite in dkBox[1]. 0 = unbekannt.
+  fn _layoutFeld(tp: pchar, tl: int64, fp: pchar, fl: int64): int64 {
+    if (self.dkHatIr != 0) { return self.dkIr.IrLyuFeld(tp, tl, fp, fl, self.dkBox); }
+    if (self.dkHatCg != 0) { return self.dkCg.CgLyuFeld(tp, tl, fp, fl, self.dkBox); }
+    return 0;
+  }
+
+  // Felder (eigene) schreiben. 0 = nicht beschreibbar.
+  fn _eFelder(td: int64): int64 {
+    var nf: int64 := 0;
+    var f: int64 := self._nc(td, 0);
+    while (f >= 0) { if (self._nk(f) == NK_FIELD_DECL) { nf := nf + 1; } f := self._nnx(f); }
+    self._e16le(nf);
+    f := self._nc(td, 0);
+    while (f >= 0) {
+      if (self._nk(f) == NK_FIELD_DECL) {
+        self._eStr(self._nsp(f), self._nsl(f));
+        if (self._eTyp(self._nc(f, 0)) == 0) { return 0; }
+        if (self._layoutFeld(self._nsp(td), self._nsl(td), self._nsp(f), self._nsl(f)) == 0) { return 0; }
+        self._e32le(peek64(self.dkBox));
+        self._e32le(peek64(self.dkBox + 8));
+        self._e8(self._niv(f) & 0x36);
+      }
+      f := self._nnx(f);
+    }
+    return 1;
+  }
+
+  // Einen Eintrag schreiben; 0 = nicht beschreibbar (der Aufrufer setzt len
+  // zurueck, es bleibt also nichts Halbes stehen).
+  fn _eDekl(art: int64, n: int64): int64 {
+    self._e8(art);
+    var lenPos: int64 := self.len;
+    self._e32le(0);
+    var rumpfStart: int64 := self.len;
+    self._eStr(self._nsp(n), self._nsl(n));
+    if (art == LYU_DK_IMPORT) {
+      self._e8(self._niv(n) & 1);
+      var al: int64 := self._nc(n, 0);
+      if (al >= 0) { self._eStr(self._nsp(al), self._nsl(al)); } else { self._eStr(""c, 0); }
+    } else if (art == LYU_DK_FN) {
+      if (self._eSignatur(n) == 0) { return 0; }
+    } else if (art == LYU_DK_STRUCT) {
+      if (self._layoutTyp(self._nsp(n), self._nsl(n)) == 0) { return 0; }
+      if (peek64(self.dkBox + 8) != 0) { return 0; }   // Struct mit Typwort: nicht diese Art
+      self._e32le(peek64(self.dkBox));
+      self._e8(0);
+      if (self._eFelder(n) == 0) { return 0; }
+    } else if (art == LYU_DK_KLASSE) {
+      var basis: int64 := self._nc(n, 2);
+      if (basis >= 0) { self._eStr(self._nsp(basis), self._nsl(basis)); } else { self._eStr(""c, 0); }
+      var ni: int64 := 0;
+      var ifc: int64 := self._nc(n, 3);
+      while (ifc >= 0) { ni := ni + 1; ifc := self._nnx(ifc); }
+      self._e16le(ni);
+      ifc := self._nc(n, 3);
+      while (ifc >= 0) { self._eStr(self._nsp(ifc), self._nsl(ifc)); ifc := self._nnx(ifc); }
+      if (self._layoutTyp(self._nsp(n), self._nsl(n)) == 0) { return 0; }
+      self._e32le(peek64(self.dkBox));
+      var kf: int64 := 0;
+      if (peek64(self.dkBox + 8) != 0) { kf := kf | 1; }
+      if ((self._niv(n) & 1) != 0)     { kf := kf | 2; }   // abstract class
+      self._e8(kf);
+      if (self._eFelder(n) == 0) { return 0; }
+      var nm: int64 := 0;
+      var m: int64 := self._nc(n, 1);
+      while (m >= 0) { if (self._nk(m) == NK_FUNC_DECL) { nm := nm + 1; } m := self._nnx(m); }
+      self._e16le(nm);
+      var neuPlatz: int64 := 0;
+      m := self._nc(n, 1);
+      while (m >= 0) {
+        if (self._nk(m) == NK_FUNC_DECL) {
+          var tp: int64 := self._nc(m, 3);
+          if (tp >= 0) { if (self._nk(tp) == NK_TYPE_PARAM) { return 0; } }   // generische Methode
+          self._eStr(self._nsp(m), self._nsl(m));
+          var mf: int64 := self._niv(m) & 0x7F;
+          self._e8(mf);
+          if ((mf & 4) != 0)      { self._e16le(0xFFFE); }
+          else if ((mf & 2) != 0) { self._e16le(neuPlatz); neuPlatz := neuPlatz + 1; }
+          else                    { self._e16le(0xFFFF); }
+          if (self._eSignatur(m) == 0) { return 0; }
+        }
+        m := self._nnx(m);
+      }
+    }
+    self._p32le(lenPos, self.len - rumpfStart);
+    return 1;
+  }
+
+  // Alle Deklarationen in einen eigenen Puffer schreiben (vor dem Kopf, damit
+  // das Flagbit feststeht). Rueckgabe: Anzahl geschriebener Eintraege; Puffer
+  // und Laenge in dkBox[2]/dkBox[3].
+  fn _dkSerialisieren(): int64 {
+    var sBuf: int64 := self.buf; var sLen: int64 := self.len; var sCap: int64 := self.cap;
+    self.cap := 4096;
+    self.buf := alloc(self.cap);
+    self.len := 0;
+    self._e32le(0);
+    var n: int64 := 0;
+    var i: int64 := 0;
+    while (i < self.dkCount) {
+      var art: int64 := peek64(self.dkList + i * 16);
+      var nd:  int64 := peek64(self.dkList + i * 16 + 8);
+      var start: int64 := self.len;
+      if (self._eDekl(art, nd) != 0) { n := n + 1; }
+      else { self.len := start; }
+      i := i + 1;
+    }
+    self._p32le(0, n);
+    var dBuf: int64 := self.buf; var dLen: int64 := self.len;
+    self.buf := sBuf; self.len := sLen; self.cap := sCap;
+    poke64(self.dkBox + 16, dBuf);
+    poke64(self.dkBox + 24, dLen);
+    return n;
+  }
+
   // #1555: vor Serialize aufrufen.
   pub fn LywSetDebug(on: int64) { self.includeDebug := on; }
 
@@ -589,9 +1226,20 @@ pub type LyuWriter = class {
     self._e8(LYU_W_M2); self._e8(LYU_W_M3);
     self._e16le(LYU_W_VER);
     self._e8(arch);
-    // flags: bit0 = Debug-Abschnitt (#1555), bit1 = Ressourcen (#1971)
+    // flags: bit0 = Debug-Abschnitt (#1555), bit1 = Ressourcen (#1971),
+    // bit4 = Deklarationen (#2014 Stufen 2–4) — Belegung siehe Dateikopf.
+    //
+    // #2014: Die Deklarationen werden VOR dem Kopf in einen eigenen Puffer
+    // geschrieben. Erst danach steht fest, ob ueberhaupt ein Eintrag
+    // beschreibbar war — und davon haengt das Flagbit ab, das hier steht.
+    var dkN: int64 := 0;
+    var dkAbschnitt: int64 := 0;
+    if (self.dkCount > 0 || self.konCount > 0) { dkN := self._dkSerialisieren(); dkAbschnitt := 1; }
     var flags: int64 := self.includeDebug & 1;
     if (self.resCount > 0) { flags := flags | 2; }
+    // Auch mit NULL Eintraegen, wenn es Konstanten gibt: der Leser bildet
+    // dann den Text mit den Konstanten fuer sema und den IR-Weg.
+    if (dkAbschnitt != 0) { flags := flags | LYU_FLAG_DEKL; }
     self._e8(flags);
 
     // Unit name
@@ -713,7 +1361,7 @@ pub type LyuWriter = class {
     // Ohne diesen Abschnitt bleibt der Offset 0 und die Datei ist
     // byte-identisch zu einer ohne die Erweiterung — dasselbe Versprechen wie
     // beim Debug- (#1555), IR- (#1974) und Ressourcenabschnitt (#1971).
-    if (self.konCount > 0) {
+    if (self.konCount > 0 || dkAbschnitt != 0) {
       var konStart: int64 := self.len;
       self._p32le(self.konOffPos, konStart);
       self._e32le(self.konCount);
@@ -733,6 +1381,16 @@ pub type LyuWriter = class {
         }
         ki += 1;
       }
+      // #2014 Stufen 2–4: die Deklarationen direkt hinter dem letzten
+      // Konstanteneintrag (Flagbit LYU_FLAG_DEKL). Ein Leser ohne Kenntnis
+      // des Bits hoert nach den Konstanten auf — ohne Konstanten steht dort
+      // eine 0, und er liest gar nichts.
+      if (dkAbschnitt != 0) {
+        var dBuf: int64 := peek64(self.dkBox + 16);
+        var dLen: int64 := peek64(self.dkBox + 24);
+        var di: int64 := 0;
+        while (di < dLen) { self._e8(peek8(dBuf + di)); di := di + 1; }
+      }
     }
 
     // ── Ressourcen-Abschnitt (#1971) ───────────────────────────────────
@@ -751,47 +1409,160 @@ pub type LyuWriter = class {
       self._e32le(self.resCount);
       var ri: int64 := 0;
       while (ri < self.resCount) {
-        var rb: int64 := self.resList + ri * 32;
+        var rb: int64 := self.resList + ri * 48;
         var rnm: pchar := peek64(rb) as pchar;
         var rnl: int64 := peek64(rb + 8);
         var rpfRel: pchar := peek64(rb + 16) as pchar;
         var rpfLen: int64 := peek64(rb + 24);
+        var rDaten: int64 := peek64(rb + 32);
+        var rDatenLen: int64 := peek64(rb + 40);
         self._eStr(rnm, rnl);
-        // Der Pfad steht als AUSSCHNITT im Quelltextpuffer: nicht
-        // nullterminiert und relativ zur Quelldatei. `open` braucht beides
-        // anders — also auflösen wie cg_embedPfad, mit demselben Ergebnis.
-        var rpf: pchar := self._pfadAufloesen(rpfRel, rpfLen, inputPath);
-        // Datei lesen. FEHLT sie, ist das ein harter Fehler mit Pfad in der
-        // Meldung — ein stiller Ersatz (Laenge 0) waere die schlimmste
-        // Antwort: die Bibliothek liesse sich bauen, und erst beim Nutzer
-        // faende sich eine leere Ressource ohne jeden Hinweis.
-        var fd: int64 := open(rpf, 0, 0);
-        if (fd < 0) {
-          EPrintStr("error: @resource: Datei nicht lesbar: "c);
-          EPrintStrLn(rpf);
-          exit(1);
-        }
-        var gr: int64 := lseek(fd, 0, 2);
-        lseek(fd, 0, 0);
-        if (gr < 0) { close(fd); EPrintStrLn("error: @resource: Groesse nicht bestimmbar"c); exit(1); }
-        self._e32le(gr);
-        if (gr > 0) {
-          var bufp: int64 := alloc(gr);
-          var gelesen: int64 := read(fd, bufp as pchar, gr);
-          close(fd);
-          if (gelesen != gr) {
-            EPrintStr("error: @resource: unvollstaendig gelesen: "c);
+        if (rDaten != 0) {
+          // Aus einer importierten .lyu: die Bytes liegen schon vor.
+          self._e32le(rDatenLen);
+          var dbi: int64 := 0;
+          while (dbi < rDatenLen) { self._e8(peek8(rDaten + dbi)); dbi := dbi + 1; }
+        } else {
+          // Der Pfad steht als AUSSCHNITT im Quelltextpuffer: nicht
+          // nullterminiert und relativ zur Quelldatei. `open` braucht beides
+          // anders — also auflösen wie cg_embedPfad, mit demselben Ergebnis.
+          // pfadLen == -1: schon aufgeloest (importierte Quell-Unit, relativ
+          // zu DEREN Datei — das hat der Codegen erledigt).
+          var rpf: pchar := rpfRel;
+          if (rpfLen >= 0) { rpf := self._pfadAufloesen(rpfRel, rpfLen, inputPath); }
+          // Datei lesen. FEHLT sie, ist das ein harter Fehler mit Pfad in der
+          // Meldung — ein stiller Ersatz (Laenge 0) waere die schlimmste
+          // Antwort: die Bibliothek liesse sich bauen, und erst beim Nutzer
+          // faende sich eine leere Ressource ohne jeden Hinweis.
+          var fd: int64 := open(rpf, 0, 0);
+          if (fd < 0) {
+            EPrintStr("error: @resource: Datei nicht lesbar: "c);
             EPrintStrLn(rpf);
             exit(1);
           }
-          var bi: int64 := 0;
-          while (bi < gr) { self._e8(peek8(bufp + bi)); bi := bi + 1; }
-          free(bufp, gr);
-        } else {
-          close(fd);
+          var gr: int64 := lseek(fd, 0, 2);
+          lseek(fd, 0, 0);
+          if (gr < 0) { close(fd); EPrintStrLn("error: @resource: Groesse nicht bestimmbar"c); exit(1); }
+          if (gr > LYU_MAX_BYTES) {
+            close(fd);
+            EPrintStr("error: @resource: Datei groesser als 64 MB, so gross darf eine .lyu nicht werden: "c);
+            EPrintStrLn(rpf);
+            exit(1);
+          }
+          self._e32le(gr);
+          if (gr > 0) {
+            var bufp: int64 := alloc(gr);
+            var gelesen: int64 := 0;
+            var rfehl: int64 := 0;
+            while (gelesen < gr && rfehl == 0) {
+              var rn: int64 := read(fd, (bufp + gelesen) as pchar, gr - gelesen);
+              if (rn <= 0) { rfehl := 1; } else { gelesen := gelesen + rn; }
+            }
+            close(fd);
+            if (gelesen != gr) {
+              EPrintStr("error: @resource: unvollstaendig gelesen: "c);
+              EPrintStrLn(rpf);
+              exit(1);
+            }
+            var bi: int64 := 0;
+            while (bi < gr) { self._e8(peek8(bufp + bi)); bi := bi + 1; }
+            free(bufp, gr);
+          } else {
+            close(fd);
+          }
         }
         ri := ri + 1;
       }
+    }
+
+    // ── Anhangverzeichnis (#2142) ──────────────────────────────────────
+    // Siehe Kopfkommentar. Ohne Anhang entfaellt auch der Nachspann; die
+    // Datei ist dann byte-identisch zu einer ohne diese Erweiterung.
+    var anhN: int64 := 0;
+    var anhBuf: int64 := alloc(4 * 24);
+    if (self.enmCount > 0) {
+      var enStart: int64 := self.len;
+      self._e32le(self.enmCount);
+      var ei: int64 := 0;
+      while (ei < self.enmCount) {
+        var eb: int64 := self.enmList + ei * 24;
+        var eNodes: int64 := peek64(eb);
+        var eNi: int64 := peek64(eb + 8);
+        var eSrc: int64 := peek64(eb + 16);
+        var eOff: int64 := eNodes + eNi * PARSER_NODE_SIZE;
+        self._eStr((eSrc + peek64(eOff + NODE_OFF_SVAL)) as pchar, peek64(eOff + NODE_OFF_SLEN));
+        var mAnz: int64 := 0;
+        var m: int64 := peek64(eOff + NODE_OFF_C0);
+        while (m >= 0) { mAnz := mAnz + 1; m := peek64(eNodes + m * PARSER_NODE_SIZE + NODE_OFF_NEXT); }
+        self._e32le(mAnz);
+        var naechster: int64 := 0;
+        m := peek64(eOff + NODE_OFF_C0);
+        while (m >= 0) {
+          var mOff: int64 := eNodes + m * PARSER_NODE_SIZE;
+          var wert: int64 := naechster;
+          var wn: int64 := peek64(mOff + NODE_OFF_C0);
+          if (wn >= 0) {
+            var wOk: int64 := alloc(8);
+            wert := self._konWert(eNodes, wn, wOk);
+            if (peek64(wOk) == 0) {
+              // Kein stiller Default: ein Wert, den die Bibliothek nicht
+              // traegt, kaeme beim Nutzer falsch an.
+              EPrintStr("error: --compile-unit: Enum-Wert nicht ablegbar: "c);
+              sys_write(2, eSrc + peek64(mOff + NODE_OFF_SVAL), peek64(mOff + NODE_OFF_SLEN));
+              EPrintStrLn(" (nur Ganzzahl-Ausdruecke aus Literalen, #2142)"c);
+              exit(1);
+            }
+          }
+          self._eStr((eSrc + peek64(mOff + NODE_OFF_SVAL)) as pchar, peek64(mOff + NODE_OFF_SLEN));
+          self._e64le(wert);
+          naechster := wert + 1;
+          m := peek64(mOff + NODE_OFF_NEXT);
+        }
+        ei := ei + 1;
+      }
+      poke64(anhBuf + anhN * 24, LYU_ANH_ENUMS);
+      poke64(anhBuf + anhN * 24 + 8, enStart);
+      poke64(anhBuf + anhN * 24 + 16, self.len - enStart);
+      anhN := anhN + 1;
+    }
+    if (self.glbCount > 0 && self.irModulPtr != 0) {
+      var glStart: int64 := self.len;
+      self._e32le(self.glbCount);
+      var gi: int64 := 0;
+      while (gi < self.glbCount) {
+        var gb: int64 := self.glbList + gi * 24;
+        self._eStr(peek64(gb) as pchar, peek64(gb + 8));
+        self._e32le(peek64(gb + 16));
+        gi := gi + 1;
+      }
+      poke64(anhBuf + anhN * 24, LYU_ANH_GLOBALS);
+      poke64(anhBuf + anhN * 24 + 8, glStart);
+      poke64(anhBuf + anhN * 24 + 16, self.len - glStart);
+      anhN := anhN + 1;
+    }
+    if (anhN > 0) {
+      var dirStart: int64 := self.len;
+      var ai: int64 := 0;
+      while (ai < anhN) {
+        self._e32le(peek64(anhBuf + ai * 24));
+        self._e32le(peek64(anhBuf + ai * 24 + 8));
+        self._e32le(peek64(anhBuf + ai * 24 + 16));
+        ai := ai + 1;
+      }
+      self._e8(76); self._e8(89); self._e8(85); self._e8(88);   // "LYUX"
+      self._e32le(dirStart);
+      self._e32le(anhN);
+      self._e32le(0);
+    }
+    free(anhBuf, 4 * 24);
+
+    // #1971: Groessenschranke. Eine groessere Datei liesse sich zwar
+    // schreiben, aber kein Leser naehme sie an — dann lieber hier laut.
+    if (self.len > LYU_MAX_BYTES) {
+      EPrintStr("error: --compile-unit: die .lyu wuerde "c);
+      EPrintInt(self.len);
+      EPrintStrLn(" Byte gross — mehr als 64 MB nimmt kein Leser an (#1971)."c);
+      exit(1);
     }
   }
 

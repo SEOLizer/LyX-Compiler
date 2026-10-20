@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.16A
+VERSION   := 1.2.16B
 VERSION_DATE := 2026-10-20
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -590,13 +590,17 @@ test: lyxc
 	@bash tests/ir_kein_stiller_ausdruck_test.sh
 	@bash tests/riscv_zusicherung_test.sh
 	@bash tests/adresse_von_test.sh
+	@bash tests/abi_reste_test.sh
 	@bash tests/ir_f64_negativ_test.sh
+	@bash tests/ir_f64_reste_test.sh
 	@bash tests/ir_string_escape_test.sh
 	@bash tests/index_pchar_test.sh
 	@bash tests/sema_reste_2137_test.sh
+	@bash tests/ir_platzhalter_test.sh
 	@bash tests/ir_closures_test.sh
 	@bash tests/ir_viele_argumente_test.sh
 	@bash tests/closure_wert_test.sh
+	@bash tests/generics_closure_reste_test.sh
 	@bash tests/ir_bezeichner_herkunft_test.sh
 	@bash tests/ir_generics_test.sh
 	@bash tests/generics_x86_typen_test.sh
@@ -605,6 +609,7 @@ test: lyxc
 	@bash tests/x86_shared_lib_test.sh
 	@bash tests/modulvar_init_x86_test.sh
 	@bash tests/so_reste_2135_test.sh
+	@bash tests/debug_tools_reste_test.sh
 	@bash tests/ir_mmap_test.sh
 	@bash tests/ir_sprungweite_test.sh
 	@bash tests/argv_ir_test.sh
@@ -616,6 +621,7 @@ test: lyxc
 	@bash tests/beispiel_ldap_einheiten_test.sh
 	@bash tests/ldap_rdn_test.sh
 	@bash tests/lyu_konstanten_test.sh
+	@bash tests/lyu_format_test.sh
 	@bash tests/lyu_exporte_test.sh
 	@bash tests/lyu_ir_test.sh
 	@bash tests/erbe_ir_test.sh
@@ -624,6 +630,8 @@ test: lyxc
 	@bash tests/ctor_super_test.sh
 	@bash tests/strconcat_speicher_test.sh
 	@bash tests/lyu_ir_consumer_test.sh
+	@bash tests/lyu_ressourcen_test.sh
+	@bash tests/lyu_reste_2142_test.sh
 	@echo "OK"
 	@echo "--- Arrays mit Struct-/Klassen-Elementtyp (12 Pruefungen) ---"
 	@bash tests/struct_array_test.sh

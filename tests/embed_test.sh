@@ -241,17 +241,18 @@ else
     nok "fehlende Ressourcendatei: falsche Meldung ($(grep -v Copyright "$TMP/rf.log" | head -1))"
 fi
 
-# Auf dem IR-Weg gibt es die Tabelle noch nicht. Das MUSS an der Deklaration
-# gemeldet werden — und zwar auch dann, wenn das Programm die Ressource gar
-# nicht liest, sonst uebersetzte es klanglos ohne sie durch.
+# #1971: Auf dem IR-Weg gibt es die Tabelle jetzt. Bis 1.2.16A wurde
+# @resource dort abgewiesen, und dieser Abschnitt nahm die Ablehnung als
+# Nachweis. Gemessen wird der WERT: Anzahl, Name, Laenge und erstes Byte.
 if [ -n "$QEMU_ARM64" ]; then
-    printf 'unit main;\nimport std.io;\n@resource("x", "text.txt");\nfn main(): int64 { PrintLn("nichts"); return 0; }' > "$TMP/ri.lyx"
+    printf 'unit main;\nimport std.io;\nimport std.res;\n@resource("x", "text.txt");\nfn main(): int64 { PrintStr(IntToStr(ResCount())); PrintStr(" "); PrintStr(ResName(0)); PrintStr(" "); PrintStr(IntToStr(ResLen("x"))); PrintStr(" "); PrintLn(IntToStr(StrCharAt(ResFind("x"), 0) & 255)); return 0; }' > "$TMP/ri.lyx"
+    riSoll="1 x $(wc -c < "$TMP/text.txt") $(od -An -tu1 -N1 "$TMP/text.txt" | tr -d ' ')"
     if ( cd / && timeout 180 "$LYXC" --target=arm64 --std-path="$ROOT" "$TMP/ri.lyx" -o "$TMP/ri" ) >"$TMP/ri.log" 2>&1; then
-        nok "arm64 mit @resource: uebersetzt durch, statt zu melden"
-    elif grep -q "nur mit --target=x86_64" "$TMP/ri.log"; then
-        ok "arm64 meldet @resource, statt still ohne Tabelle zu bauen"
+        riIst="$( ulimit -v 4000000; timeout 60 "$QEMU_ARM64" "$TMP/ri" 2>&1 )"
+        if [ "$riIst" = "$riSoll" ]; then ok "arm64: @resource traegt die Tabelle (Name, Laenge, Inhalt)"
+        else nok "arm64 mit @resource: erwartet '$riSoll', bekommen '$riIst'"; fi
     else
-        nok "arm64 mit @resource: falsche Meldung ($(grep -v Copyright "$TMP/ri.log" | head -1))"
+        nok "arm64 mit @resource: uebersetzt nicht ($(grep -v Copyright "$TMP/ri.log" | head -1))"
     fi
 fi
 

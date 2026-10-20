@@ -16,6 +16,7 @@ con DW_AT_low_pc:         int64 := 0x11;
 con DW_AT_high_pc:        int64 := 0x12;
 con DW_AT_external:       int64 := 0x3F;
 con DW_AT_decl_line:      int64 := 0x3A;
+con DW_AT_stmt_list:      int64 := 0x10;
 
 con DW_FORM_addr:         int64 := 0x01;
 con DW_FORM_data1:        int64 := 0x0B;
@@ -24,6 +25,7 @@ con DW_FORM_data4:        int64 := 0x06;
 con DW_FORM_data8:        int64 := 0x07;
 con DW_FORM_strp:         int64 := 0x0E;
 con DW_FORM_flag_present: int64 := 0x19;
+con DW_FORM_sec_offset:   int64 := 0x17;
 
 con DW_LANG_C:            int64 := 0x0001;
 con DW_CHILDREN_yes:      int64 := 1;
@@ -223,6 +225,9 @@ pub type DwarfGen = class {
     self.dw_uleb128Abbrev(DW_AT_comp_dir);  self.dw_uleb128Abbrev(DW_FORM_strp);
     self.dw_uleb128Abbrev(DW_AT_low_pc);    self.dw_uleb128Abbrev(DW_FORM_addr);
     self.dw_uleb128Abbrev(DW_AT_high_pc);   self.dw_uleb128Abbrev(DW_FORM_data8);
+    // #2144: ohne DW_AT_stmt_list gehoert die Zeilentabelle zu keiner CU —
+    // addr2line/gdb fanden weder Zeile noch (binutils) Funktion.
+    self.dw_uleb128Abbrev(DW_AT_stmt_list); self.dw_uleb128Abbrev(DW_FORM_sec_offset);
     self.dw_eAbbrev(0); self.dw_eAbbrev(0); // end attrs
 
     // Abbreviation 2: DW_TAG_subprogram, no children
@@ -265,6 +270,7 @@ pub type DwarfGen = class {
     var baseVA: int64 := self.elfBase + self.codeOff;
     self.dw_eInfo64(baseVA);       // DW_AT_low_pc (absolute VA of code start)
     self.dw_eInfo64(totalCodeLen); // DW_AT_high_pc (relative to low_pc in DWARF 4)
+    self.dw_eInfo32(0);            // DW_AT_stmt_list: die einzige Zeilentabelle steht bei 0
 
     // Emit DW_TAG_subprogram for each function
     var fi: int64 := 0;
@@ -338,36 +344,37 @@ pub type DwarfGen = class {
     self.dw_patchLine32(hdrLenPatch, self.lineLen - hdrLenPatch - 4);
 
     // ── line number program ───────────────────────────────────────────────
-    // State machine start: file=1, line=1, address=0
-    var prevLine: int64 := 1;
+    // #2144: eine Sequenz je Funktion, jede mit DW_LNE_end_sequence am
+    // Funktionsende. Bis 1.2.16A gab es eine einzige Sequenz, deren Ende auf
+    // dem ANFANG der letzten Funktion stand — die letzte war damit leer.
+    // Funktionen ohne Quellzeile (Laufzeithelfer, lineNum <= 0) bekommen
+    // keine Zeile statt einer erfundenen Zeile 1.
     var fi:       int64 := 0;
     while (fi < self.funcCount) {
       var base:     int64 := self.funcTable + fi * DW_FUNC_SZ;
       var fStart:   int64 := peek64(base + 16);
+      var fEnd:     int64 := peek64(base + 24);
       var fLineNum: int64 := peek64(base + 32);
-      if (fLineNum <= 0) { fLineNum := 1; }
+      if (fLineNum > 0 && fEnd > fStart) {
+        var va: int64 := self.elfBase + self.codeOff + fStart;
 
-      var va: int64 := self.elfBase + self.codeOff + fStart;
+        // DW_LNE_set_address to the function's entry VA
+        self.dw_emitSetAddress(va);
 
-      // DW_LNE_set_address to the function's entry VA
-      self.dw_emitSetAddress(va);
+        // DW_LNS_advance_line (opcode 3): jede Sequenz beginnt bei Zeile 1
+        self.dw_eLine(3); self.dw_sleb128Line(fLineNum - 1);
 
-      // DW_LNS_set_file (opcode 4): file index = 1
-      self.dw_eLine(4); self.dw_uleb128Line(1);
+        // DW_LNS_copy (opcode 1): emit a row
+        self.dw_eLine(1);
 
-      // DW_LNS_advance_line (opcode 3): delta from prevLine to fLineNum
-      var lineDelta: int64 := fLineNum - prevLine;
-      self.dw_eLine(3); self.dw_sleb128Line(lineDelta);
-      prevLine := fLineNum;
+        // DW_LNS_advance_pc (opcode 2) bis hinter das Funktionsende
+        self.dw_eLine(2); self.dw_uleb128Line(fEnd - fStart);
 
-      // DW_LNS_copy (opcode 1): emit a row
-      self.dw_eLine(1);
-
+        // DW_LNE_end_sequence
+        self.dw_eLine(0); self.dw_uleb128Line(1); self.dw_eLine(1);
+      }
       fi += 1;
     }
-
-    // End-of-sequence
-    self.dw_eLine(0); self.dw_uleb128Line(1); self.dw_eLine(1);
 
     // Patch unit_length
     self.dw_patchLine32(lenPatch, self.lineLen - 4);

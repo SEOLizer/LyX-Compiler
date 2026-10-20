@@ -86,7 +86,12 @@ con CGN_CALL:        int64 := 49;
 con CGN_INDEX:       int64 := 50;
 con CGN_FIELD:       int64 := 51;
 // #1595: Eintrag der Fn-Zeiger-Aliasliste: Name (ptr,len) + Rueckgabetyp (ptr,len)
-con CG_FNALIAS_SZ:   int64 := 32;
+// #2143: + Funktionstyp-Tiefe des Rueckgabetyps (cg_fnTiefeEintragen: +32
+// Anzahl inline geschriebener fn-Ebenen, +40/+48 Name am Ende der Kette).
+con CG_FNALIAS_SZ:   int64 := 56;
+// #2133/#2143: Eintrag von fnWertFnList (cg_registerFnWertKandidat), dieselben
+// drei Tiefenfelder ab +32.
+con CG_FW_SZ:        int64 := 56;
 con CGN_NEW:         int64 := 52;
 con CGN_CAST:        int64 := 53;  // WP-11: x as Type
 con CGN_CLOSURE:     int64 := 54;  // WP-13: closure { fn ptr, captured env }
@@ -469,6 +474,9 @@ con CG_HEAP_END: int64 := 112; // data[112..119]: _lyx_heap_end
 // Bibliothek rechnet in Lyx weiter.
 con CG_RESTAB: int64 := 120;   // data[120..127]: _lyx_restab
 
+// #1971: Groesse eines Eintrags in `ress` (siehe Feld).
+pub con CG_RES_SZ: int64 := 56;
+
 // #2135: Ereignisse der Abwickelangaben (cfiBuf). Ein Bereich beginnt mit
 // CFI_FN (Zustand beim Eintritt: CFA = rsp+8) oder CFI_FN_RAHMEN (mitten im
 // Rumpf: CFA = rbp+16, rbp und rbx im Rahmen — dort geht die aeussere
@@ -642,13 +650,21 @@ pub type Codegen = class {
   embeds:     int64;   // #1961: {pfad, pfadLen, dataOff} je 24 Byte
   embedCount: int64;
   embedCap:   int64;
-  // #1961 Stufe 2: gesammelte @resource-Angaben, je 32 Byte
-  // {namePtr, nameLen, pfadPtr, pfadLen}. Ausgelegt wird die Tabelle erst
-  // NACH dem Durchlauf (cg_emitResTable) — vorher steht nicht fest, wie viele
-  // es sind.
-  ress:      int64;
-  resCount:  int64;
+  // #1961 Stufe 2: gesammelte @resource-Angaben, je CG_RES_SZ Byte
+  // {namePtr, nameLen, pfadPtr, pfadLen, datenPtr, datenLen, kurzAb}.
+  // Ausgelegt wird die Tabelle erst NACH dem Durchlauf (cg_emitResTable) —
+  // vorher steht nicht fest, wie viele es sind.
+  // #1971: Der Name ist einheitsqualifiziert (`unit:name`, kurzAb = Index des
+  // Kurznamens dahinter), der Pfad schon aufgeloest — relativ zu der Datei,
+  // die ihn nennt. datenPtr != 0: die Bytes kommen aus einer .lyu, einen
+  // Pfad gibt es dann nicht.
+  pub ress:      int64;
+  pub resCount:  int64;
   resCap:    int64;
+  // #1971: Pfad der zuletzt erfolgreich gelesenen Datei (cg_readFile), damit
+  // cg_processImportAs die Datei der importierten Unit kennt — Pfade in ihren
+  // @embed/@resource gelten relativ zu IHR, nicht zum Hauptprogramm.
+  cgLesePfad: int64;
   resTabOff: int64;   // Datenoffset der fertigen Tabelle, -1 solange keine da
   dataCap: int64;
 
@@ -701,6 +717,11 @@ pub type Codegen = class {
   soExpTab:        int64;   // je Export 16 Byte: {Knoten, Codeoffset der Huelle}
   soExpCount:      int64;
   soInitOff:       int64;   // Codeoffset von __lyx_so_init
+  // #2144: Wo der Schreiber den Code abgelegt hat — Dateioffset und
+  // virtuelle Adresse. 0 = noch kein Schreiber gelaufen. --meta-safe liest
+  // beides hier, statt 176 und 0x400000 anzunehmen (ms_appendMetaSafe).
+  codeFileOff:     int64;
+  codeStartVa:     int64;
   // #2136: Anfangswerte von Modulvariablen zur LAUFZEIT — dieselbe Form wie
   // im IR-Weg seit #2123 (ir_lower._modInitEinheit/_modInitHaupt; die beiden
   // muessen uebereinstimmen). Je Unit eine Funktion `__lyx_modinit_<n>`,
@@ -974,7 +995,7 @@ pub type Codegen = class {
   // heisst "eingepackte Adresse". satzKontext = 1: der naechste Bezeichner
   // oder Aufruf in cg_genExpr soll einen Satz liefern (nicht auspacken).
   satzKontext:           int64;
-  fnWertFnList:          int64;   // Funktionen mit Funktionstyp als Rueckgabe (32 B, cg_registerFnWertKandidat)
+  fnWertFnList:          int64;   // Funktionen mit Funktionstyp als Rueckgabe (CG_FW_SZ, cg_registerFnWertKandidat)
   fnWertFnCount:         int64;
   fnWertFnCap:           int64;
   curFnRetFnWert:        int64;   // 1 = die gerade erzeugte Funktion gibt einen Funktionswert zurueck
@@ -1019,6 +1040,11 @@ pub type Codegen = class {
   // eines Zeiger-Aufrufs steht in keiner Funktionsregistry, also muss die
   // Auskunft am Local haengen.
   localFnPtrF64:     int64;
+  // #2143: Liefert ein Aufruf ueber dieses Local einen Funktionswert, also
+  // einen Satz {Code, Umgebung}? Ein Lambda (oder ein `fn(...)`-Typ) mit
+  // Funktionstyp als Rueckgabe — dieselbe Auskunft wie fnWertFnList fuer
+  // benannte Funktionen, nur am Local, weil der Name keine Funktion ist.
+  localFnRetSatz:    int64;
   foldBuf:          int64;  // WP-10g: scratch for cg_tryFold constant-folding results
 
   // Temporary buffer tracking (BUG-02: prevent mmap leaks)
@@ -1052,6 +1078,15 @@ pub type Codegen = class {
   // Unit hat aber kein `main` — der Einsprungpunkt, den Init vorsorglich
   // emittiert, bleibt hier ohne Ziel und darf deshalb nicht als Fehler gelten.
   unitCheckMode: int64;
+  // #2014 Stufen 2–4: 1, solange eine Unit aus den DEKLARATIONEN einer .lyu
+  // verarbeitet wird (LyuReader.LyrDeklText). Ihre Funktionen und Methoden
+  // haben dann keinen Rumpf — der Code fehlt auf x86 bis Stufe 5. Es entsteht
+  // nichts unter ihrem Namen: ein Aufruf bleibt unaufgeloest und wird in
+  // cg_patchAll mit Begruendung gemeldet (cgLyuNamen).
+  cgNurDekl: int64;
+  cgLyuNamen: int64;   // {ptr, len} je Name ohne Code (Funktion oder Klasse_Methode)
+  cgLyuNamenN: int64;
+  cgLyuNamenCap: int64;
   // #1589: `con f: fn(...) := Dbl;` — ein con mit Funktionsverweis. Der Wert
   // ist eine Codeadresse, die erst feststeht, wenn die Funktion emittiert ist.
   // Gemerkt wird das Paar; nach dem Emittieren bekommt der con-Name dieselbe
@@ -1549,6 +1584,9 @@ pub type Codegen = class {
       var fpf: int64 := alloc(nc);            // #1565
       memcpy(fpf, self.localFnPtrF64, self.localCount);
       self.localFnPtrF64 := fpf;
+      var frs: int64 := alloc(nc);            // #2143
+      memcpy(frs, self.localFnRetSatz, self.localCount);
+      self.localFnRetSatz := frs;
       self.localCap := nc;
     }
     self.frameSize += 8;
@@ -1570,6 +1608,7 @@ pub type Codegen = class {
     poke8(self.localIsSimd       + self.localCount, 0);  // WP-GPU-01
     poke8(self.localIsFnPtr      + self.localCount, 0);  // #1003
     poke8(self.localFnPtrF64     + self.localCount, 0);  // #1565
+    poke8(self.localFnRetSatz    + self.localCount, 0);  // #2143
     self.localCount += 1;
     return 0 - self.frameSize;
   }
@@ -1973,13 +2012,86 @@ pub type Codegen = class {
   // #1961 Stufe 2: eine `@resource`-Angabe merken. Der Name muss EINDEUTIG
   // sein — "letzter gewinnt" waere ein stiller Austausch, und welche Datei
   // dann im Erzeugnis landet, saehe man erst am laufenden Programm.
+  //
+  // #1971: In einer importierten Unit (cgUnitTag) heisst die Ressource
+  // `unit:name`. Der Pfad wird HIER aufgeloest — relativ zu der Datei, die
+  // gerade uebersetzt wird; beim Auslegen am Ende stuende die Datei der Unit
+  // nicht mehr fest.
   fn cg_addResource(nm: pchar, nmLen: int64, pf: pchar, pfLen: int64) {
+    var q: int64 := 0;
+    while (q < nmLen) {
+      if (StrCharAt(nm, q) == 58) {
+        EPrintStr("error: @resource: ':' trennt Unit und Name und darf im Namen nicht vorkommen: "c);
+        sys_write(2, nm as int64, nmLen);
+        EPrintStrLn(""c);
+        exit(1);
+      }
+      q := q + 1;
+    }
+    var pbox: int64 := alloc(8);
+    var voll: pchar := self.cg_embedPfad(pf, pfLen, pbox);
+    var vollLen: int64 := peek64(pbox);
+    free(pbox, 8);
+    self.cg_resEintragen(self.cgUnitTag, self.cgUnitTagLen, nm, nmLen, voll, vollLen, 0, 0);
+  }
+
+  // #1971: Ressource aus einer importierten .lyu — die Bytes liegen schon vor.
+  fn cg_addResourceBytes(tag: int64, tagLen: int64, nm: pchar, nmLen: int64,
+                         daten: int64, datenLen: int64) {
+    self.cg_resEintragen(tag, tagLen, nm, nmLen, 0 as pchar, 0, daten, datenLen);
+  }
+
+  // #1971: Herkunft eines Eintrags fuer Meldungen: die Unit vor dem ':' oder
+  // "das Programm selbst".
+  fn cg_resHerkunft(i: int64) {
+    var rb: int64 := self.ress + i * CG_RES_SZ;
+    var ab: int64 := peek64(rb + 48);
+    if (ab <= 0) { EPrintStr("das Programm selbst"c); return; }
+    EPrintStr("Unit "c);
+    sys_write(2, peek64(rb), ab - 1);
+  }
+
+  // Gemeinsamer Eintrag beider Wege. Name: `tag:nm` (ohne tag nur nm).
+  //
+  // Kollisionen werden HIER gemeldet, mit beiden Herkuenften:
+  //   * gleicher voller Name    — dieselbe Unit nennt ihn zweimal (#1961)
+  //   * gleicher Kurzname aus zwei verschiedenen Units (#1971): der Kurzname
+  //     ist nur erlaubt, solange er im Programm eindeutig ist. Zur Laufzeit
+  //     haette ResFind("logo") sonst zwei Treffer, und welcher gewaenne,
+  //     hinge an der Importreihenfolge.
+  fn cg_resEintragen(tag: int64, tagLen: int64, nm: pchar, nmLen: int64,
+                     voll: pchar, vollLen: int64, daten: int64, datenLen: int64) {
+    var gl: int64 := nmLen;
+    var kurzAb: int64 := 0;
+    if (tag != 0 && tagLen > 0) { gl := tagLen + 1 + nmLen; kurzAb := tagLen + 1; }
+    var gb: int64 := alloc(gl + 1);
+    if (kurzAb > 0) {
+      memcpy(gb, tag, tagLen);
+      poke8(gb + tagLen, 58);   // ':'
+    }
+    memcpy(gb + kurzAb, nm as int64, nmLen);
+    poke8(gb + gl, 0);
     var i: int64 := 0;
     while (i < self.resCount) {
-      var rb: int64 := self.ress + i * 32;
-      if (peek64(rb + 8) == nmLen && self.cg_seq(peek64(rb) as pchar, nmLen, nm, nmLen) != 0) {
+      var rb: int64 := self.ress + i * CG_RES_SZ;
+      var rKurz: int64 := peek64(rb + 48);
+      var rLen: int64 := peek64(rb + 8);
+      if (rLen == gl && self.cg_seq(peek64(rb) as pchar, rLen, gb as pchar, gl) != 0) {
         EPrintStr("error: @resource: der Name kommt zweimal vor: "c);
-        EPrintStrLn(nm);
+        EPrintStrLn(gb as pchar);
+        exit(1);
+      }
+      if (rLen - rKurz == nmLen && self.cg_seq((peek64(rb) + rKurz) as pchar, nmLen, nm, nmLen) != 0) {
+        EPrintStr("error: @resource: der Kurzname '"c);
+        sys_write(2, nm as int64, nmLen);
+        EPrintStr("' kommt aus zwei Herkuenften: "c);
+        self.cg_resHerkunft(i);
+        EPrintStr(" und "c);
+        if (kurzAb > 0) { EPrintStr("Unit "c); sys_write(2, tag, tagLen); }
+        else { EPrintStr("das Programm selbst"c); }
+        EPrintStrLn(""c);
+        EPrintStrLn("  Ein Kurzname ist nur erlaubt, solange er im Programm eindeutig ist (#1971)."c);
+        EPrintStrLn("  Zur Laufzeit liefert ResFind(\"unit:name\") jede Ressource eindeutig."c);
         exit(1);
       }
       i := i + 1;
@@ -1987,16 +2099,19 @@ pub type Codegen = class {
     if (self.resCount >= self.resCap) {
       var nc: int64 := self.resCap * 2;
       if (nc < 8) { nc := 8; }
-      var nb: int64 := alloc(nc * 32);
-      memcpy(nb, self.ress, self.resCount * 32);
+      var nb: int64 := alloc(nc * CG_RES_SZ);
+      memcpy(nb, self.ress, self.resCount * CG_RES_SZ);
       self.ress := nb;
       self.resCap := nc;
     }
-    var base: int64 := self.ress + self.resCount * 32;
-    poke64(base,      nm as int64);
-    poke64(base + 8,  nmLen);
-    poke64(base + 16, pf as int64);
-    poke64(base + 24, pfLen);
+    var base: int64 := self.ress + self.resCount * CG_RES_SZ;
+    poke64(base,      gb);
+    poke64(base + 8,  gl);
+    poke64(base + 16, voll as int64);
+    poke64(base + 24, vollLen);
+    poke64(base + 32, daten);
+    poke64(base + 40, datenLen);
+    poke64(base + 48, kurzAb);
     self.resCount := self.resCount + 1;
   }
 
@@ -2009,20 +2124,29 @@ pub type Codegen = class {
     var offs: int64 := alloc(self.resCount * 32);
     var i: int64 := 0;
     while (i < self.resCount) {
-      var rb: int64 := self.ress + i * 32;
+      var rb: int64 := self.ress + i * CG_RES_SZ;
       var nm: pchar := peek64(rb) as pchar;
       var nmLen: int64 := peek64(rb + 8);
-      var pf: pchar := peek64(rb + 16) as pchar;
-      var pfLen: int64 := peek64(rb + 24);
-      var pbox: int64 := alloc(8);
-      var voll: pchar := self.cg_embedPfad(pf, pfLen, pbox);
-      var vollLen: int64 := peek64(pbox);
-      free(pbox, 8);
-      var gr: int64 := self.cg_embedGroesse(voll);
-      if (gr < 0) { self.cg_embedFehlt(voll, "@resource"c); }
-      // Die Bytes teilen sich die Ablage mit `@embed`: derselbe Pfad liegt
-      // einmal im Erzeugnis, gleich ueber welche der beiden Formen er kam.
-      var dOff: int64 := self.cg_embedBytes(voll, vollLen);
+      var voll: pchar := peek64(rb + 16) as pchar;
+      var vollLen: int64 := peek64(rb + 24);
+      var rDaten: int64 := peek64(rb + 32);
+      var gr: int64 := 0;
+      var dOff: int64 := 0;
+      if (rDaten != 0) {
+        // #1971: aus einer .lyu — die Bytes direkt, mit derselben
+        // abschliessenden Null wie cg_embedBytes (zaehlt nicht mit).
+        gr := peek64(rb + 40);
+        dOff := self.dataLen;
+        var bi: int64 := 0;
+        while (bi < gr) { self.cg_edata(peek8(rDaten + bi)); bi := bi + 1; }
+        self.cg_edata(0);
+      } else {
+        gr := self.cg_embedGroesse(voll);
+        if (gr < 0) { self.cg_embedFehlt(voll, "@resource"c); }
+        // Die Bytes teilen sich die Ablage mit `@embed`: derselbe Pfad liegt
+        // einmal im Erzeugnis, gleich ueber welche der beiden Formen er kam.
+        dOff := self.cg_embedBytes(voll, vollLen);
+      }
       var nOff: int64 := self.cg_addNameData(nm, nmLen);
       var ob: int64 := offs + i * 32;
       poke64(ob,      nOff);
@@ -2772,12 +2896,12 @@ pub type Codegen = class {
     if (k == 60 && self.cg_nslen(retNi) <= 0) { return; }
     if (self.fnWertFnCount >= self.fnWertFnCap) {
       var nc: int64 := self.fnWertFnCap * 2;
-      var nb: int64 := alloc(nc * 32);
-      memcpy(nb, self.fnWertFnList, self.fnWertFnCount * 32);
+      var nb: int64 := alloc(nc * CG_FW_SZ);
+      memcpy(nb, self.fnWertFnList, self.fnWertFnCount * CG_FW_SZ);
       self.fnWertFnList := nb;
       self.fnWertFnCap  := nc;
     }
-    var b: int64 := self.fnWertFnList + self.fnWertFnCount * 32;
+    var b: int64 := self.fnWertFnList + self.fnWertFnCount * CG_FW_SZ;
     poke64(b, name as int64);
     poke64(b + 8, nlen);
     poke64(b + 16, 0);
@@ -2786,6 +2910,7 @@ pub type Codegen = class {
       poke64(b + 16, self.cg_nsval(retNi) as int64);
       poke64(b + 24, self.cg_nslen(retNi));
     }
+    self.cg_fnTiefeEintragen(b, retNi);   // #2143
     self.fnWertFnCount += 1;
   }
 
@@ -2795,13 +2920,13 @@ pub type Codegen = class {
     var i: int64 := 0;
     var j: int64 := 0;
     while (i < self.fnWertFnCount) {
-      var b: int64 := self.fnWertFnList + i * 32;
+      var b: int64 := self.fnWertFnList + i * CG_FW_SZ;
       var tl: int64 := peek64(b + 24);
       var behalten: int64 := 1;
       if (tl > 0 && self.cg_isFnPtrAlias(peek64(b + 16) as pchar, tl) == 0) { behalten := 0; }
       if (behalten != 0) {
-        if (j != i) { memcpy(self.fnWertFnList + j * 32, b, 32); }
-        poke64(self.fnWertFnList + j * 32 + 24, 0);
+        if (j != i) { memcpy(self.fnWertFnList + j * CG_FW_SZ, b, CG_FW_SZ); }
+        poke64(self.fnWertFnList + j * CG_FW_SZ + 24, 0);
         j += 1;
       }
       i += 1;
@@ -2810,19 +2935,151 @@ pub type Codegen = class {
   }
 
   fn cg_istFnWertFunc(name: pchar, nlen: int64): int64 {
+    if (self.cg_fnWertFuncEintrag(name, nlen) != 0) { return 1; }
+    return 0;
+  }
+
+  // #2143: Eintrag der Funktion in fnWertFnList (0 = keiner).
+  fn cg_fnWertFuncEintrag(name: pchar, nlen: int64): int64 {
     var i: int64 := 0;
     while (i < self.fnWertFnCount) {
-      var b: int64 := self.fnWertFnList + i * 32;
-      if (peek64(b + 24) == 0 && self.cg_seq(peek64(b) as pchar, peek64(b + 8), name, nlen) != 0) { return 1; }
+      var b: int64 := self.fnWertFnList + i * CG_FW_SZ;
+      if (peek64(b + 24) == 0 && self.cg_seq(peek64(b) as pchar, peek64(b + 8), name, nlen) != 0) { return b; }
       i += 1;
     }
     return 0;
   }
 
+  // ==================================================================
+  // #2143: Funktionstyp-TIEFE. Ein Funktionswert vom Typ `fn(...): R` liefert
+  // beim Aufruf einen Wert vom Typ R; ist R selbst ein Funktionstyp, geht
+  // dieser Wert als Satz ueber die Rueckgabegrenze (#2133), und wer ihn
+  // haelt, muss wissen, ob SEIN Aufruf wieder einen liefert. Tiefe(T) = 0 fuer
+  // jeden anderen Typ, 1 + Tiefe(R) fuer `fn(...): R` (auch ueber Aliase).
+  //
+  // Am Local steht localFnRetSatz = Tiefe(R) des gehaltenen Funktionswerts:
+  // >= 1 heisst "der Aufruf liefert einen Satz", das Ergebnis haelt dann
+  // Tiefe(R) - 1. Bis 1.2.16A gab es die Auskunft nur fuer benannte
+  // Funktionen (fnWertFnList) — `var a := mk(10); a(1)` mit einem Lambda mk
+  // nahm den Satz als Adresse. Dieselbe Rechnung wie _clRufLiefertFnWert auf
+  // dem IR-Weg, die beiden muessen uebereinstimmen.
+  //
+  // Gespeichert wird je Rueckgabetyp R nur NAMENSFEST (Knotenindizes gelten
+  // nur in ihrer Tabelle): +32 die Zahl der inline geschriebenen fn-Ebenen,
+  // +40/+48 der Typname am Ende der Kette (ein Alias zaehlt dort weiter).
+  // ==================================================================
+  fn cg_fnTiefeEintragen(b: int64, r: int64) {
+    var n: int64 := 0;
+    var cur: int64 := r;
+    while (cur >= 0 && self.cg_nkind(cur) == CGN_FN_PTR_NODE && n < 32) {
+      n += 1;
+      cur := self.cg_nc1(cur);
+    }
+    poke64(b + 32, n);
+    poke64(b + 40, 0);
+    poke64(b + 48, 0);
+    if (cur >= 0 && self.cg_nkind(cur) == 60 && self.cg_nslen(cur) > 0) {
+      poke64(b + 40, self.cg_nsval(cur) as int64);
+      poke64(b + 48, self.cg_nslen(cur));
+    }
+  }
+
+  // Tiefe eines Rueckgabetyps aus den drei Feldern ab b + 32.
+  fn cg_fnTiefeAusEintrag(b: int64, tiefe: int64): int64 {
+    var t: int64 := peek64(b + 32);
+    var el: int64 := peek64(b + 48);
+    if (el > 0) { t := t + self.cg_fnTiefeAlias(peek64(b + 40) as pchar, el, tiefe + 1); }
+    return t;
+  }
+
+  // Tiefe des Typnamens (0, wenn er kein Funktionstyp-Alias ist).
+  fn cg_fnTiefeAlias(name: pchar, nlen: int64, tiefe: int64): int64 {
+    if (tiefe > 32) { return 0; }
+    var i: int64 := 0;
+    while (i < self.fnAliasCount) {
+      var base: int64 := self.fnAliasList + i * CG_FNALIAS_SZ;
+      if (self.cg_seq(peek64(base) as pchar, peek64(base + 8), name, nlen) != 0) {
+        return 1 + self.cg_fnTiefeAusEintrag(base, tiefe);
+      }
+      i += 1;
+    }
+    return 0;
+  }
+
+  // Tiefe eines Typknotens der GERADE eingesetzten Tabelle.
+  fn cg_fnTiefeKnoten(n: int64): int64 {
+    var t: int64 := 0;
+    var cur: int64 := n;
+    while (cur >= 0 && self.cg_nkind(cur) == CGN_FN_PTR_NODE && t < 32) {
+      t += 1;
+      cur := self.cg_nc1(cur);
+    }
+    if (cur >= 0 && self.cg_nkind(cur) == 60 && self.cg_nslen(cur) > 0) {
+      t := t + self.cg_fnTiefeAlias(self.cg_nsval(cur), self.cg_nslen(cur), 0);
+    }
+    return t;
+  }
+
+  // localFnRetSatz eines Locals (Index), bei einem Alias als Typangabe aus
+  // dem Alias.
+  fn cg_localFnTiefe(idx: int64): int64 {
+    if (idx < 0) { return 0; }
+    var t: int64 := peek8(self.localFnRetSatz + idx) as int64;
+    if (t > 0) { return t; }
+    var ltb: int64 := self.localTypes + idx * CG_LOCTYPE_SZ;
+    var ltp: pchar := peek64(ltb) as pchar;
+    var ltl: int64 := peek64(ltb + CG_LOCTYPE_OFF_LEN);
+    if (ltp != 0 as pchar && ltl > 0) {
+      var at: int64 := self.cg_fnTiefeAlias(ltp, ltl, 0);
+      if (at > 0) { return at - 1; }
+    }
+    return 0;
+  }
+
+  // Tiefe des ERGEBNISSES eines Aufrufs (Wert fuer localFnRetSatz des
+  // Locals, das es aufnimmt), 0 wenn er keinen Funktionswert liefert.
+  fn cg_callErgebnisTiefe(ni: int64): int64 {
+    if (ni < 0 || self.cg_nkind(ni) != CGN_CALL) { return 0; }
+    var lc: int64 := alloc(8);
+    var fp: pchar := self.cg_callName(ni, lc);
+    var fl: int64 := peek64(lc);
+    free(lc, 8);
+    if (self.cg_nival(ni) == 1) {
+      var mRecv: int64 := self.cg_nc0(ni);
+      var mCls:  int64 := self.cg_exprClassName(mRecv);
+      if (mCls < 0 && mRecv >= 0 && self.cg_nkind(mRecv) == CGN_IDENT) {
+        if (self.cg_findLocalIdx(self.cg_nsval(mRecv), self.cg_nslen(mRecv)) < 0) {
+          mCls := self.cg_findClass(self.cg_nsval(mRecv), self.cg_nslen(mRecv));
+        }
+      }
+      if (mCls < 0) { return 0; }
+      var mOwn: int64 := self.cg_findMethodOwner(mCls, fp, fl);
+      if (mOwn >= 0) { mCls := mOwn; }
+      var mlcb: int64 := alloc(8);
+      var mmb:  int64 := self.cg_buildMethodMangled(mCls, fp, fl, mlcb);
+      var mmbL: int64 := peek64(mlcb);
+      free(mlcb, 8);
+      var me: int64 := self.cg_fnWertFuncEintrag(mmb as pchar, mmbL);
+      self.cg_trackTempBuf(mmb, mmbL + 1);
+      if (me == 0) { return 0; }
+      return self.cg_fnTiefeAusEintrag(me, 0) - 1;
+    }
+    if (self.cg_nival(ni) != 0) { return 0; }
+    var rli: int64 := self.cg_findLocalIdx(fp, fl);
+    if (rli < 0) { rli := self.cg_capOuterIdx(fp, fl); }
+    if (rli >= 0) {
+      var lt: int64 := self.cg_localFnTiefe(rli);
+      if (lt > 0) { return lt - 1; }
+      return 0;
+    }
+    var fe: int64 := self.cg_fnWertFuncEintrag(fp, fl);
+    if (fe == 0) { return 0; }
+    return self.cg_fnTiefeAusEintrag(fe, 0) - 1;
+  }
+
   // Liefert der Aufruf `ni` einen Funktionswert ueber eine Rueckgabegrenze
   // (also einen Satz)? Freie Funktion, innere Funktion oder Methode.
   fn cg_callLiefertFnWert(ni: int64): int64 {
-    if (self.fnWertFnCount == 0) { return 0; }
     var lc: int64 := alloc(8);
     var fp: pchar := self.cg_callName(ni, lc);
     var fl: int64 := peek64(lc);
@@ -2850,9 +3107,14 @@ pub type Codegen = class {
     }
     if (self.cg_nival(ni) != 0) { return 0; }
     // Ein Aufruf ueber ein Local oder eine Erfassung ruft keine Funktion
-    // dieses Namens.
-    if (self.cg_findLocal(fp, fl) != 0) { return 0; }
-    if (self.cg_capOuterIdx(fp, fl) >= 0) { return 0; }
+    // dieses Namens. #2143: er liefert einen Satz, wenn das Lambda (der
+    // fn-Typ) dahinter einen Funktionstyp zurueckgibt — vermerkt am Local.
+    var rli: int64 := self.cg_findLocalIdx(fp, fl);
+    if (rli < 0) { rli := self.cg_capOuterIdx(fp, fl); }
+    if (rli >= 0) {
+      if (self.cg_localFnTiefe(rli) > 0) { return 1; }
+      return 0;
+    }
     return self.cg_istFnWertFunc(fp, fl);
   }
 
@@ -3964,6 +4226,16 @@ pub type Codegen = class {
           // unaufgeloest — im Pruefmodus wird das Erzeugnis ohnehin verworfen.
           // JEDER ANDERE unaufgeloeste Name bleibt ein Fehler; sonst pruefte
           // dieser Lauf weniger, als er verspricht.
+        } else if (self.cg_lyuNameHat(namePtr, nlen) != 0) {
+          // #2014: deklariert, aber nur aus einer .lyu — ihr Code fehlt auf
+          // x86 bis Stufe 5 (Objektcode in der .lyu + eingebauter Binder).
+          EPrintStr("error: '"c);
+          sys_write(2, namePtr, nlen);
+          EPrintStrLn("' stammt aus einer .lyu ohne Objektcode und ist auf x86 noch nicht aufrufbar"c);
+          EPrintStrLn("  Die .lyu beschreibt Konstanten, Signaturen und Layouts (#2014 Stufen 1–4), traegt"c);
+          EPrintStrLn("  aber keinen x86-Code (Stufe 5). Abhilfe: die .lyx der Unit beilegen, oder ein"c);
+          EPrintStrLn("  IR-Ziel waehlen (--target=arm64/riscv) mit einer fuer dieses Ziel gebauten .lyu."c);
+          exit(1);
         } else {
           EPrintStr("error: undefined function '"c);
           sys_write(2, namePtr, nlen);
@@ -4037,7 +4309,7 @@ pub type Codegen = class {
       // Namens- und Datenzeiger jedes Eintrags von Offset auf Adresse heben.
       var ri: int64 := 0;
       while (ri < self.resCount) {
-        var ez: int64 := self.resTabOff + 8 + ri * 32;
+        var ez: int64 := self.resTabOff + 8 + ri * 32;   // Tabelle: 4 x int64 je Eintrag
         self.cg_datenOffsetZuAdresse(ez,     datenBasis);   // Name
         self.cg_datenOffsetZuAdresse(ez + 16, datenBasis);  // Bytes
         // #2124/#2135: absolute Zeiger wie jeder andere — die .so (RELATIVE),
@@ -5685,6 +5957,7 @@ pub type Codegen = class {
       poke64(base + 16, self.cg_nsval(retNode) as int64);
       poke64(base + 24, self.cg_nslen(retNode));
     }
+    self.cg_fnTiefeEintragen(base, retNode);   // #2143
     self.fnAliasCount += 1;
   }
   fn cg_registerFnAlias(name: pchar, nameLen: int64) {
@@ -5968,6 +6241,15 @@ pub type Codegen = class {
     var r: int64 := self.cg_nc1(typeNode);
     if (r < 0) { return 0; }
     return self.cg_isFloatTypeName(self.cg_nsval(r), self.cg_nslen(r));
+  }
+
+  // #2143: Tiefe des Rueckgabetyps eines fn-Zeigertyps `fn(...): R` (siehe
+  // cg_fnTiefeEintragen) — >= 1: ein Aufruf darueber liefert einen Satz.
+  // Gegenstueck zu cg_fnPtrRetIstF64, die Merkung steht an denselben Stellen.
+  fn cg_fnPtrRetTiefe(typeNode: int64): int64 {
+    if (typeNode < 0) { return 0; }
+    if (self.cg_nkind(typeNode) != CGN_FN_PTR_NODE) { return 0; }
+    return self.cg_fnTiefeKnoten(self.cg_nc1(typeNode));
   }
 
   fn cg_isFloatTypeName(tp: pchar, tln: int64): int64 {
@@ -7182,6 +7464,7 @@ pub type Codegen = class {
     self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);                          // dec r8 → -1
     self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);                          // xor r9,r9
     self.cg_movRaxImm(9);    self.cg_e8(0x0F); self.cg_e8(0x05);                    // syscall mmap
+    self.cg_emitMmapGeprueft();   // #2144
     self.cg_pushRax();                                                              // [rsp] = p
     // code-Adresse: lea rax,[rip+ Klasse_Method ]
     if (rcls >= 0) {
@@ -7411,6 +7694,12 @@ pub type Codegen = class {
     self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);   // xor r9, r9
     self.cg_e8(0xB8); self.cg_e32(9);                       // mov eax, 9
     self.cg_e8(0x0F); self.cg_e8(0x05);                     // syscall → rax = Blockanfang
+    // #2144: dieselbe Pruefung wie hinter jedem anderen mmap (#1947). Bis
+    // 1.2.16A lief -ENOMEM hier als Blockanfang weiter: PTR/END zeigten in den
+    // Fehlerbereich, `new` lieferte 0xFFFF...F4 + n, der erste Feldzugriff
+    // faultete (rc 139 ohne Aussage). Die Sperre (END = 1) bleibt dabei
+    // stehen — der Prozess endet ohnehin.
+    self.cg_emitMmapGeprueft();
     if (groesse > 0) {
       self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x90); self.cg_e32(block);     // lea rdx, [rax + block]
       self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x88); self.cg_e32(groesse);   // lea rcx, [rax + groesse]
@@ -7553,8 +7842,10 @@ pub type Codegen = class {
     self.cg_e8(0xF0); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB1); self.cg_e8(0x15);
     var p3: int64 := self.codeLen; self.cg_e32(0);
     self.cg_addPatch(p3, aOff, 0, CG_PATCH_STR);
-    self.cg_e8(0x74);                                          // jz .fertig (rax = alte Adresse)
-    var jzPos: int64 := self.codeLen; self.cg_e8(0);
+    // #2144: jz rel32 statt rel8 — die mmap-Pruefung in .nachlegen
+    // (Meldung + Abbruch) macht den Weg laenger als 127 Byte.
+    self.cg_e8(0x0F); self.cg_e8(0x84);                        // jz .fertig (rax = alte Adresse)
+    var jzPos: int64 := self.codeLen; self.cg_e32(0);
     self.cg_e8(0xEB);                                          // jmp retry
     self.cg_e8((retry - self.codeLen - 1) & 255);
     // --- .nachlegen: eigener Block per mmap(1 MiB) ---
@@ -7569,6 +7860,7 @@ pub type Codegen = class {
     self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);      // xor r9, r9
     self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(9);
     self.cg_e8(0x0F); self.cg_e8(0x05);                        // syscall
+    self.cg_emitMmapGeprueft();   // #2144
     self.cg_e8(0x59); self.cg_e8(0x5E); self.cg_e8(0x5F);      // pop rcx, rsi, rdi
     // [arena+8] := rax + 1 MiB ; [arena] := rax + groesse ; rax bleibt der Block
     self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x90); self.cg_e32(1048576);  // lea rdx,[rax+1MiB]
@@ -7580,7 +7872,7 @@ pub type Codegen = class {
     var p5: int64 := self.codeLen; self.cg_e32(0);
     self.cg_addPatch(p5, aOff, 0, CG_PATCH_STR);
     // .fertig
-    cg_patchRel8(self.code, jzPos, self.codeLen);
+    poke32(self.code + jzPos, self.codeLen - jzPos - 4);
     self.cg_e8(0x5A);                                          // pop rdx
   }
 
@@ -9698,6 +9990,43 @@ pub type Codegen = class {
     return 1;
   }
 
+  // #2014 Stufen 3/4: Layout eines Typs fuer die .lyu — und fuer den
+  // Abgleich beim Lesen. EINE Quelle: dieselben Tabellen, mit denen der
+  // Codegen Feldzugriffe uebersetzt (cg_findClass/cg_classStructSize). Wer
+  // das Layout hier neu ausrechnete, haette eine zweite Stelle, die mit der
+  // ersten auseinanderlaufen kann (#1998).
+  //   box[0] = Gesamtgroesse, box[1] = 1, wenn ein VMT-Zeiger auf Offset 0
+  //   liegt (x86: jede Klasse, kein Struct). Rueckgabe 0 = Typ unbekannt.
+  pub fn CgLyuTyp(np: pchar, nl: int64, box: int64): int64 {
+    var ci: int64 := self.cg_findClass(np, nl);
+    if (ci < 0) { return 0; }
+    poke64(box, self.cg_classStructSize(ci));
+    poke64(box + 8, self.cg_classHasVmt(ci));
+    return 1;
+  }
+  //   box[0] = Offset im Objekt, box[1] = belegte Bytes. 0 = Feld unbekannt.
+  pub fn CgLyuFeld(tp: pchar, tl: int64, fp: pchar, fl: int64, box: int64): int64 {
+    var ci: int64 := self.cg_findClass(tp, tl);
+    if (ci < 0) { return 0; }
+    var base: int64 := self.classLayouts + ci * CG_CLASS_SZ;
+    var flds: int64 := peek64(base + CG_CLASS_OFF_FIELDSPTR);
+    var cnt:  int64 := peek64(base + CG_CLASS_OFF_FIELDCNT);
+    var i: int64 := 0;
+    while (i < cnt) {
+      var fb: int64 := flds + i * CG_CFIELD_SZ;
+      var n: int64 := peek64(fb + CG_CFIELD_OFF_FIELDLEN);
+      if (n == fl && self.cg_seq(peek64(fb) as pchar, n, fp, fl)) {
+        poke64(box, peek64(fb + CG_CFIELD_OFF_OFFSET));
+        var b: int64 := peek64(fb + CG_CFIELD_OFF_BYTES);
+        if (b <= 0) { b := 8; }   // dieselbe Annahme wie cg_classStructSize
+        poke64(box + 8, b);
+        return 1;
+      }
+      i += 1;
+    }
+    return 0;
+  }
+
   fn cg_objClassIdx(objNode: int64): int64 {
     var k: int64 := self.cg_nkind(objNode);
     // #1588: `(x as Klasse)` als Empfaenger. Der Typ steht am Cast-Knoten und
@@ -10203,7 +10532,7 @@ pub type Codegen = class {
       return;
     }
     if (foff < 0) {
-      self.cg_genFeldOffen(fieldName, fieldLen);   // #2134
+      self.cg_genFeldOffen(fieldName, fieldLen, ni);   // #2134, #2141
       self.cg_zeroRax();
     } else if (ldW == 1 || ldW == 2 || ldW == 4) {
       self.cg_emitNarrowLoadRax(foff, ldW, ldSigned);
@@ -10348,6 +10677,141 @@ pub type Codegen = class {
     }
   }
 
+  // #2014: Namen ohne Code merken (aus einer .lyu, Deklarationsmodus).
+  fn cg_lyuNameMerke(p: int64, l: int64) {
+    if (self.cgLyuNamenN >= self.cgLyuNamenCap) {
+      var nc: int64 := self.cgLyuNamenCap * 2;
+      if (nc < 32) { nc := 32; }
+      var nb: int64 := alloc(nc * 16);
+      if (self.cgLyuNamenN > 0) { memcpy(nb, self.cgLyuNamen, self.cgLyuNamenN * 16); }
+      self.cgLyuNamen := nb;
+      self.cgLyuNamenCap := nc;
+    }
+    poke64(self.cgLyuNamen + self.cgLyuNamenN * 16, p);
+    poke64(self.cgLyuNamen + self.cgLyuNamenN * 16 + 8, l);
+    self.cgLyuNamenN := self.cgLyuNamenN + 1;
+  }
+  // Methode unter dem Namen, unter dem ein Aufruf sie sucht ("Klasse_Methode").
+  fn cg_lyuMethodeMerke(cp: pchar, cl: int64, mp: pchar, ml: int64) {
+    var b: int64 := alloc(cl + 1 + ml + 1);
+    memcpy(b, cp as int64, cl);
+    poke8(b + cl, 95);
+    memcpy(b + cl + 1, mp as int64, ml);
+    poke8(b + cl + 1 + ml, 0);
+    self.cg_lyuNameMerke(b, cl + 1 + ml);
+  }
+  fn cg_lyuNameHat(p: int64, l: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.cgLyuNamenN) {
+      if (peek64(self.cgLyuNamen + i * 16 + 8) == l) {
+        if (self.cg_seq(peek64(self.cgLyuNamen + i * 16) as pchar, l, p as pchar, l) != 0) { return 1; }
+      }
+      i := i + 1;
+    }
+    return 0;
+  }
+
+  // #2014: VMT-Rumpf einer virtuellen Methode, die nur als .lyu vorliegt.
+  // Dieselbe Bauart wie cg_genAbstractStub (#1643) — eine definierte, benannte
+  // Meldung statt eines Sprungs nach 0 —, aber OHNE Marke: ein direkter Aufruf
+  // soll schon beim Uebersetzen scheitern, nicht erst zur Laufzeit.
+  fn cg_genLyuStub(ni: int64, className: pchar, classNameLen: int64) {
+    var mname: pchar := self.cg_nsval(ni);
+    var mlen:  int64 := self.cg_nslen(ni);
+    var methodCodeStart: int64 := self.codeLen;
+    var msgOff: int64 := self.dataLen;
+    var vorspann: pchar := "lyxc: Methode "c;
+    var vl: int64 := StrLen(vorspann);
+    var vI: int64 := 0;
+    while (vI < vl) { self.cg_edata(StrCharAt(vorspann, vI)); vI := vI + 1; }
+    var cI: int64 := 0;
+    while (cI < classNameLen) { self.cg_edata(StrCharAt(className, cI)); cI := cI + 1; }
+    self.cg_edata(46);
+    var mI: int64 := 0;
+    while (mI < mlen) { self.cg_edata(StrCharAt(mname, mI)); mI := mI + 1; }
+    var nachspann: pchar := " liegt nur als .lyu vor, ihr Objektcode fehlt (#2014 Stufe 5)"c;
+    var nl: int64 := StrLen(nachspann);
+    var nI: int64 := 0;
+    while (nI < nl) { self.cg_edata(StrCharAt(nachspann, nI)); nI := nI + 1; }
+    self.cg_edata(10); self.cg_edata(0);
+    self.cg_emitLeaRdiData(msgOff);
+    self.cg_emitPanicBody();
+    // VMT-Platz auf diesen Rumpf — dieselbe Suche wie in cg_genAbstractStub.
+    var classIdx: int64 := self.cg_findClass(className, classNameLen);
+    if (classIdx >= 0) {
+      var slotCount: int64   := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTSLOTS);
+      var methodList2: int64 := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTLIST);
+      var vmtDataOff2: int64 := peek64(self.classLayouts + classIdx * CG_CLASS_SZ + CG_CLASS_OFF_VMTOFF);
+      var si: int64 := 0;
+      while (si < slotCount) {
+        var sName: pchar := peek64(methodList2 + si * 16) as pchar;
+        var sLen:  int64 := peek64(methodList2 + si * CG_VMTMETH_SZ + CG_VMTMETH_OFF_NAMELEN);
+        if (self.cg_seq(sName, sLen, mname, mlen) != 0) {
+          self.cg_addVmtMethodPatch(vmtDataOff2 + si * 8, methodCodeStart);
+          si := slotCount;
+        } else {
+          si := si + 1;
+        }
+      }
+    }
+  }
+
+  // #2014: Layouts einer .lyu gegen die eigenen Tabellen pruefen (nach
+  // cg_genFile auf ihren Deklarationen). Die Datei nennt Groesse, Typwort und
+  // Feld-Offsets des ERZEUGENDEN Backends; weichen sie ab, ist die .lyu fuer
+  // ein anderes gebaut (der IR-Weg legt eine Klasse ohne VMT ab 0 an, x86 ab
+  // 8) — gemeldet statt uebernommen, sonst fiele es erst am Programm auf.
+  // Dieselbe Pruefung wie IRLower._irLyuPruefe; die beiden muessen
+  // uebereinstimmen.
+  fn cg_lyuPruefeLayout(r: LyuReader) {
+    var nb: int64 := alloc(8); var nlb: int64 := alloc(8);
+    var szb: int64 := alloc(8); var vmb: int64 := alloc(8); var nfb: int64 := alloc(8);
+    var fnb: int64 := alloc(8); var fnlb: int64 := alloc(8);
+    var fob: int64 := alloc(8); var fsb: int64 := alloc(8);
+    var box: int64 := alloc(16);
+    var n: int64 := r.LyrTypN();
+    var i: int64 := 0;
+    while (i < n) {
+      if (r.LyrTypInfo(i, nb, nlb, szb, vmb, nfb)) {
+        var np: pchar := peek64(nb) as pchar;
+        var nl: int64 := peek64(nlb);
+        var fehler: int64 := 0;
+        if (self.CgLyuTyp(np, nl, box) == 0) { fehler := 1; }
+        else {
+          if (peek64(box) != peek64(szb) || peek64(box + 8) != peek64(vmb)) { fehler := 2; }
+          var fi: int64 := 0;
+          while (fi < peek64(nfb) && fehler == 0) {
+            if (r.LyrTypFeld(i, fi, fnb, fnlb, fob, fsb)) {
+              if (self.CgLyuFeld(np, nl, peek64(fnb) as pchar, peek64(fnlb), box) == 0) { fehler := 3; }
+              else if (peek64(box) != peek64(fob) || peek64(box + 8) != peek64(fsb)) { fehler := 3; }
+            }
+            fi := fi + 1;
+          }
+        }
+        if (fehler != 0) {
+          EPrintStr("error: .lyu: Layout von '"c);
+          sys_write(2, np as int64, nl);
+          if (fehler == 1) { EPrintStrLn("' ist nach dem Lesen nicht bestimmbar"c); }
+          else if (fehler == 2) {
+            EPrintStr("' weicht ab: Datei Groesse "c); EPrintStr(IntToStr(peek64(szb)));
+            EPrintStr(" Typwort "c); EPrintStr(IntToStr(peek64(vmb)));
+            EPrintStr(", dieses Ziel Groesse "c); EPrintStr(IntToStr(peek64(box)));
+            EPrintStr(" Typwort "c); EPrintStrLn(IntToStr(peek64(box + 8)));
+          } else {
+            EPrintStr("' weicht ab im Feld '"c);
+            sys_write(2, peek64(fnb), peek64(fnlb));
+            EPrintStr("': Datei Offset "c); EPrintStr(IntToStr(peek64(fob)));
+            EPrintStr(", dieses Ziel "c); EPrintStrLn(IntToStr(peek64(box)));
+          }
+          EPrintStrLn("  Die .lyu wurde fuer ein Backend mit anderem Layout gebaut — fuer dieses Ziel"c);
+          EPrintStrLn("  neu uebersetzen: lyxc --compile-unit --target=<ziel> (#2014)."c);
+          exit(1);
+        }
+      }
+      i := i + 1;
+    }
+  }
+
   fn cg_genMethodDecl(ni: int64, className: pchar, classNameLen: int64) {
     var mname: pchar := self.cg_nsval(ni);
     var mlen:  int64 := self.cg_nslen(ni);
@@ -10468,6 +10932,7 @@ pub type Codegen = class {
         if (self.cg_fnPtrRetIstF64(ptypeNode) != 0) {
           poke8(self.localFnPtrF64 + self.localCount - 1, 1);
         }
+        poke8(self.localFnRetSatz + self.localCount - 1, self.cg_fnPtrRetTiefe(ptypeNode));   // #2143
       }
       if (paramIdx == 1) { self.cg_spillRsi(poff); }
       else if (paramIdx == 2) { self.cg_spillRdx(poff); }
@@ -10667,6 +11132,7 @@ pub type Codegen = class {
       self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d, r9d
       self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax, 9
       self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall → rax = mmap base
+      self.cg_emitMmapGeprueft();   // #2144
       // pop rcx (element count n)
       self.cg_e8(0x59);
       // align: rax = (rax + 23) & ~15  → guarantees rax-8 >= mmap_base
@@ -11739,6 +12205,7 @@ pub type Codegen = class {
         if (cptype >= 0 && self.cg_nkind(cptype) == CGN_FN_PTR_NODE) {
           poke8(self.localIsFnPtr + self.localCount - 1, 1);
           if (self.cg_fnPtrRetIstF64(cptype) != 0) { poke8(self.localFnPtrF64 + self.localCount - 1, 1); }
+          poke8(self.localFnRetSatz + self.localCount - 1, self.cg_fnPtrRetTiefe(cptype));   // #2143
         }
         if (cparamIdx >= cRegMax) {
           self.cg_loadRax(cStapelOff);
@@ -11775,7 +12242,10 @@ pub type Codegen = class {
       var savedLRetRange: int64 := self.curFnRetRange;
       var savedLRetNarrow: int64 := self.curFnRetNarrow;
       var lRetTy: int64 := self.cg_nc1(ni);
-      self.curFnRetFnWert := 0;
+      // #2143: mit Funktionstyp als Rueckgabe packt das Lambda ein wie jede
+      // Funktion (#2133: ueber eine Rueckgabegrenze immer Satz). Wer es ueber
+      // ein Local ruft, erfaehrt das ueber localFnRetSatz.
+      self.curFnRetFnWert := self.cg_typIstFnWert(lRetTy);
       self.fnRetIsFloat := 0;
       if (lRetTy >= 0 && self.cg_isFloatTypeName(self.cg_nsval(lRetTy), self.cg_nslen(lRetTy)) != 0) {
         self.fnRetIsFloat := 1;
@@ -12233,6 +12703,27 @@ pub type Codegen = class {
     if (isStderr == 1) { hStr := CG_H_EPRINTSTR; hInt := CG_H_EPRINTINT; }
     var cur: int64 := argNode;
     while (cur >= 0) {
+      // #2141: Ein LITERAL hat eine bekannte Laenge — write(fd, text, laenge)
+      // statt _lyx_print_str, das bis zum ersten Nullbyte zaehlt. Bis 1.2.16A
+      // gab `Print("ab\0cd")` nur "ab" aus. Dieselbe Rechnung wie der
+      // Literal-Zweig von Print im IR-Weg (Laenge aus dem Vorspann, #1968) —
+      // die beiden muessen uebereinstimmen. EPrint bleibt beim Zaehlen, wie
+      // EPrint im IR-Weg (Builtin 13).
+      // NUR auf dem SysV-Pfad: in einer PE-Datei (win64, msAbi) waere der rohe
+      // write-Syscall ein NT-Dienst mit anderer Bedeutung (#1678,
+      // tests/win64_syscalls_test.sh). Dort bleibt es beim Helfer.
+      if (isStderr == 0 && self.msAbi == 0 && self.cg_nkind(cur) == CGN_LIT_STR) {
+        var plOff: int64 := self.cg_addStr(self.cg_nsoff(cur), self.cg_nslen(cur));
+        var plLen: int64 := self.dataLen - plOff - 1;              // ohne die Abschlussnull
+        self.cg_emitLeaRdiData(plOff);
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFE);      // mov rsi, rdi (Text)
+        self.cg_e8(0xBA); self.cg_e32(plLen);                      // mov edx, laenge
+        self.cg_e8(0xBF); self.cg_e32(1);                          // mov edi, 1 (stdout)
+        self.cg_e8(0xB8); self.cg_e32(1);                          // mov eax, 1 (sys_write)
+        self.cg_e8(0x0F); self.cg_e8(0x05);                        // syscall
+        cur := self.cg_nnext(cur);
+        continue;
+      }
       var pt: int64 := self.cg_inferPrintType(cur);
       self.cg_genExpr(cur);
       // mov rdi, rax
@@ -15218,6 +15709,7 @@ pub type Codegen = class {
       self.cg_e8(0x49); self.cg_e8(0xFF); self.cg_e8(0xC8);         // dec r8 → -1
       self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);         // xor r9, r9
       self.cg_movRaxImm(9); self.cg_e8(0x0F); self.cg_e8(0x05);     // mmap syscall
+      self.cg_emitMmapGeprueft();   // #2144
 
     } else if (self.cg_seq(fname, fnlen, "StrSetChar", 10)) {
       // StrSetChar(s, i, c): poke8(s+i, c) — s=rdi, i=rsi, c=rdx
@@ -16031,6 +16523,15 @@ pub type Codegen = class {
         // Bits 32-47 zwei je Parameter, Bits 48-49 die Rueckgabe.
         var fiv: int64 := self.cg_nival(declNi);
         var fmask: int64 := (fiv >> 32) & 65535;
+        // #2140: Die Maske reicht nur ueber acht Parameter. Ein Gleitkommawert
+        // dahinter lief bisher als Ganzzahl ueber den Stapel — die Klasse ist
+        // unbekannt, also wird es gemeldet (Bit 53, parser._parseExternFn).
+        if (((fiv >> 53) & 1) != 0) {
+          EPrintStr("codegen error: extern fn '"c);
+          sys_write(2, fname as int64, fnlen);
+          EPrintStrLn("': Gleitkommaparameter ab dem neunten sind nicht umgesetzt (#2140)"c);
+          exit(1);
+        }
         // #1640: Bis hierher lag die Schranke bei Position 6 — ein siebtes
         // oder achtes Gleitkommaargument wurde abgewiesen, obwohl die SysV-ABI
         // die ersten ACHT in xmm0..xmm7 uebergibt und dafuer gar keinen Stapel
@@ -16467,6 +16968,7 @@ pub type Codegen = class {
         if (self.cg_fnPtrRetIstF64(typeNode) != 0) {   // #1565
           poke8(self.localFnPtrF64 + localIdx, 1);
         }
+        poke8(self.localFnRetSatz + localIdx, self.cg_fnPtrRetTiefe(typeNode));   // #2143
         self.cg_rejectCapturingClosure(self.cg_nc1(ni),
           "als Wert einer Variablen mit `fn(...)`-Typ"c);
       }
@@ -16501,12 +17003,18 @@ pub type Codegen = class {
           if (vdLr >= 0 && self.cg_isFloatTypeName(self.cg_nsval(vdLr), self.cg_nslen(vdLr)) != 0) {
             poke8(self.localFnPtrF64 + localIdx, 1);
           }
+          poke8(self.localFnRetSatz + localIdx, self.cg_fnTiefeKnoten(vdLr));   // #2143
         } else if (self.cg_nkind(vdInit) == CGN_IDENT) {
           var vdSrc: int64 := self.cg_findLocalIdx(self.cg_nsval(vdInit), self.cg_nslen(vdInit));
           if (vdSrc < 0) { vdSrc := self.cg_capOuterIdx(self.cg_nsval(vdInit), self.cg_nslen(vdInit)); }
           if (vdSrc >= 0 && vdSrc != localIdx) {
             poke8(self.localFnPtrF64 + localIdx, peek8(self.localFnPtrF64 + vdSrc));
+            poke8(self.localFnRetSatz + localIdx, peek8(self.localFnRetSatz + vdSrc));   // #2143
           }
+        } else if (self.cg_nkind(vdInit) == CGN_CALL) {
+          // #2143: das Ergebnis eines Aufrufs — haelt es einen Funktionswert,
+          // dessen Aufruf wieder einen liefert (`var d1 := dreifach(3)`)?
+          poke8(self.localFnRetSatz + localIdx, self.cg_callErgebnisTiefe(vdInit));
         }
       }
       // #1355: `var a := new int64[4];` OHNE Typangabe. Der Wert IST ein Array
@@ -16860,6 +17368,7 @@ pub type Codegen = class {
           self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
           self.cg_movRaxImm(9);
           self.cg_e8(0x0F); self.cg_e8(0x05);
+          self.cg_emitMmapGeprueft();   // #2144
           // #1109: {cap,len}-Kopf fuellen. `len(arr)` nimmt bei fester Groesse
           // zwar den Wert aus der Uebersetzungszeit, aber jede Stelle, die den
           // Kopf liest — etwa die Bereichspruefung aus #1156 — findet ihn nun
@@ -16900,6 +17409,7 @@ pub type Codegen = class {
             self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9, r9
             self.cg_movRaxImm(9);
             self.cg_e8(0x0F); self.cg_e8(0x05);                     // syscall
+            self.cg_emitMmapGeprueft();   // #2144
             // mov rbx, [rsp+8] (base); mov rcx, [rsp] (i);
             // mov [rbx+rcx*8+16], rax — hinter dem {cap,len}-Kopf
             self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x5C); self.cg_e8(0x24); self.cg_e8(0x08);
@@ -17208,7 +17718,7 @@ pub type Codegen = class {
         } else {
           // #2134: dieselbe Pruefung wie beim Lesen (cg_genFieldLoad) — die
           // beiden muessen uebereinstimmen.
-          self.cg_genFeldOffen(fieldName, fieldLen);
+          self.cg_genFeldOffen(fieldName, fieldLen, lhs);
         }
       } else if (self.cg_nkind(lhs) == CGN_INDEX && self.cg_localIsMap(self.cg_nc0(lhs)) != 0) {
         // #1152: m[k] := v schreibt ueber _lyx_map_set. Bis 1.0.15A nahm der
@@ -17930,6 +18440,7 @@ pub type Codegen = class {
         if (self.cg_fnPtrRetIstF64(ptypeNode) != 0) {
           poke8(self.localFnPtrF64 + self.localCount - 1, 1);
         }
+        poke8(self.localFnRetSatz + self.localCount - 1, self.cg_fnPtrRetTiefe(ptypeNode));   // #2143
       }
 
     } else if (k == CGN_AT_DIRECTIVE) {  // WP-CS-07 / WP-AS-04/05
@@ -20698,6 +21209,7 @@ pub type Codegen = class {
         if (self.cg_fnPtrRetIstF64(ptypeNode) != 0) {
           poke8(self.localFnPtrF64 + self.localCount - 1, 1);
         }
+        poke8(self.localFnRetSatz + self.localCount - 1, self.cg_fnPtrRetTiefe(ptypeNode));   // #2143
       }
       // #1595: Bei Struct-Rueckgabe belegt der verdeckte Zeiger rdi.
       var regIdx: int64 := paramIdx;
@@ -20828,7 +21340,20 @@ pub type Codegen = class {
     self.deferMaxCount := 0;
     self.localHigh := self.localCount;
     self.deferDepthSlot := self.cg_emitDeferHalt(body);
-    self.cg_genBlock(body);
+    // #2143: der typgeloeschte Rumpf einer generischen Funktion, die einen
+    // generischen Typ ueber ihren Typparameter nennt (`Box<T>`), hat keine
+    // Klasse dafuer — "Box<T>" gibt es nur je Spezialisierung. Erreichbar ist
+    // er nur ueber einen Aufruf OHNE Typargumente oder die Funktion als Wert;
+    // er bricht dann laut ab (wie ein Feld ueber T, cg_genFeldOffen). Der
+    // IR-Weg ebenso (_genAbhRumpf), die beiden muessen uebereinstimmen.
+    if (self.genActN == 0 && self.cg_genHatAbh(ni) != 0) {
+      var gaOff: int64 := self.cg_emitCStrData(
+        "lyxc: generische Funktion ohne Typargumente aufgerufen, sie nennt einen generischen Typ ueber ihren Typparameter (#2143)\n"c);
+      self.cg_emitLeaRdiData(gaOff);
+      self.cg_emitPanicBody();
+    } else {
+      self.cg_genBlock(body);
+    }
 
     self.cg_zeroRax();
     self.cg_emitEpilogue();
@@ -22120,6 +22645,11 @@ pub type Codegen = class {
     if (bytesRead != size) { close(fd); return 0 as pchar; }
     poke8(buf + size, 0);
     close(fd);
+    // #1971: Pfad merken (Kopie — der Aufrufer gibt seinen Puffer frei).
+    var lpl: int64 := StrLen(path);
+    var lpb: int64 := alloc(lpl + 1);
+    memcpy(lpb, path as int64, lpl + 1);
+    self.cgLesePfad := lpb;
     return buf as pchar;
   }
 
@@ -22181,9 +22711,18 @@ pub type Codegen = class {
     memcpy(rel, relLyx as int64, rl);
     poke8(rel + rl - 1, 117);       // 'u'
     poke8(rel + rl, 0);
-    var basen: int64 := alloc(3 * 8);
+    // #2142: -I ist eine Liste (':' als Trenner, #1736) — jeder Teil einzeln.
+    var basen: int64 := alloc(66 * 8);
     var n: int64 := 0;
-    if (self.includePath != 0) { poke64(basen + n * 8, self.includePath); n := n + 1; }
+    if (self.includePath != 0) {
+      var incT: int64 := 0;
+      var incW: int64 := 1;
+      while (incW == 1 && n < 64) {
+        var teil: int64 := alloc(1024);
+        if (IncludePfadTeil(self.includePath as pchar, incT, teil, 1024) < 0) { incW := 0; }
+        else { poke64(basen + n * 8, teil); n := n + 1; incT := incT + 1; }
+      }
+    }
     if (self.stdPath != 0)     { poke64(basen + n * 8, self.stdPath);     n := n + 1; }
     var i: int64 := 0;
     while (i < n) {
@@ -22195,16 +22734,100 @@ pub type Codegen = class {
       memcpy(voll + bl + 1, rel, rl);
       poke8(voll + bl + 1 + rl, 0);
       var fd: int64 := open(voll as pchar, 0, 0);
-      if (fd >= 0) { close(fd); free(basen, 24); return voll; }
+      if (fd >= 0) { close(fd); free(basen, 66 * 8); return voll; }
       free(voll, bl + 1 + rl + 1);
       i := i + 1;
     }
-    free(basen, 24);
+    free(basen, 66 * 8);
     // Zuletzt der Pfad, wie er dasteht (relativ zum Arbeitsverzeichnis).
     var fd2: int64 := open(rel as pchar, 0, 0);
     if (fd2 >= 0) { close(fd2); return rel; }
     free(rel, rl + 1);
     return 0;
+  }
+
+  // #1971/#2142: Was eine .lyu ohne Quelle mitbringt, hier eintragen:
+  //   * Ressourcen (ResourceOffset) — Name `unit:name` mit dem Importnamen,
+  //     die Bytes aus dem Dateipuffer (der lebt bis zum Ende, siehe oben).
+  //   * Enum-Varianten (Anhang Art 1) — als Enum-Layout UND als Konstanten
+  //     der Mitglieder, wie es der CGN_ENUM_DECL-Zweig fuer eine Quelle tut.
+  fn cg_lyuAnhangUebernehmen(lr: LyuReader, d: int64, size: int64, modName: pchar, nameLen: int64) {
+    var rn: int64 := lr.LyrResCount();
+    if (rn > 0) {
+      var nb: int64 := alloc(8); var nlb: int64 := alloc(8);
+      var db: int64 := alloc(8); var dlb: int64 := alloc(8);
+      var r: int64 := 0;
+      while (r < rn) {
+        if (lr.LyrResAt(r, nb, nlb, db, dlb)) {
+          var rnp: pchar := peek64(nb) as pchar;
+          var rnl: int64 := peek64(nlb);
+          // Ein Name MIT ':' stammt aus einer Quell-Unit, die die .lyu selbst
+          // importiert hat — er traegt seine Herkunft schon.
+          var hatDp: int64 := 0;
+          var q: int64 := 0;
+          while (q < rnl) { if (StrCharAt(rnp, q) == 58) { hatDp := q + 1; } q := q + 1; }
+          if (hatDp > 0) {
+            self.cg_addResourceBytes(rnp as int64, hatDp - 1, (rnp as int64 + hatDp) as pchar,
+                                     rnl - hatDp, peek64(db), peek64(dlb));
+          } else {
+            self.cg_addResourceBytes(modName as int64, nameLen, rnp, rnl, peek64(db), peek64(dlb));
+          }
+        }
+        r := r + 1;
+      }
+      free(nb, 8); free(nlb, 8); free(db, 8); free(dlb, 8);
+    }
+    var lb: int64 := alloc(8);
+    var off: int64 := LyuAnhang(d, size, LYU_ANH_ENUMS, lb);
+    var ende: int64 := off + peek64(lb);
+    free(lb, 8);
+    if (off < 0) { return; }
+    var n: int64 := LyuU32(d, off);
+    var p: int64 := off + 4;
+    var i: int64 := 0;
+    while (i < n) {
+      var enl: int64 := LyuStrLen(d, p, ende);
+      if (enl < 0) { return; }
+      var enp: int64 := d + p + 2;
+      p := p + 2 + enl;
+      if (p + 4 > ende) { return; }
+      var mn: int64 := LyuU32(d, p);
+      p := p + 4;
+      if (mn < 0 || mn > 0x3FFFFFFF) { return; }
+      var vars: int64 := alloc((mn + 1) * 32);
+      var w: int64 := 0;
+      while (w < mn) {
+        var ml: int64 := LyuStrLen(d, p, ende);
+        if (ml < 0 || p + 2 + ml + 8 > ende) { return; }
+        var vb: int64 := vars + w * 32;
+        var wert: int64 := LyuI64(d, p + 2 + ml);
+        poke64(vb, d + p + 2);
+        poke64(vb + CG_EVAR_OFF_NAMELEN, ml);
+        poke64(vb + CG_EVAR_OFF_TAGVAL, wert);
+        poke64(vb + CG_EVAR_OFF_PAYLOADSZ, 0);
+        if (self.cg_findConIdx((d + p + 2) as pchar, ml) < 0) {
+          self.cg_addCon((d + p + 2) as pchar, ml, wert);
+        }
+        p := p + 2 + ml + 8;
+        w := w + 1;
+      }
+      if (self.cg_findEnum(enp as pchar, enl) < 0) {
+        if (self.enumCount >= self.enumCap) {
+          var nc: int64 := self.enumCap * 2;
+          var neu: int64 := alloc(nc * 32);
+          memcpy(neu, self.enumLayouts, self.enumCount * 32);
+          self.enumLayouts := neu;
+          self.enumCap := nc;
+        }
+        var base: int64 := self.enumLayouts + self.enumCount * 32;
+        poke64(base, enp);
+        poke64(base + CG_PATCH_OFF_NAMEPTR, enl);
+        poke64(base + CG_ENUM_OFF_VARSPTR, vars);
+        poke64(base + CG_CLASS_OFF_FIELDCNT, mn);
+        self.enumCount += 1;
+      }
+      i := i + 1;
+    }
   }
 
   // Process an import: find the .lyx file, parse it, codegen it.
@@ -22255,6 +22878,7 @@ pub type Codegen = class {
     memcpy(pathBuf + nameLen, lyxExtCG as int64, 5);
 
     var path: pchar := pathBuf as pchar;
+    self.cgLesePfad := 0;   // #1971: gleich steht hier die gefundene Datei
     var src: pchar := self.cg_readFile(path);
 
     // Fall back to includePath (LYX_PATH / -I) then stdPath (LYX_STD_PATH / --std-path)
@@ -22290,6 +22914,13 @@ pub type Codegen = class {
 
     var srcSize: int64 := 0;
     if (src != 0 as pchar) { srcSize := StrLen(src); }
+    // #2014 Stufen 2–4: Deklarationstext einer .lyu (0 = keiner) und ihr Leser
+    // fuer den Layoutabgleich nach dem Erzeugen.
+    var lyuText: int64 := 0;
+    var lyuTextLen: int64 := 0;
+    var lyuRdr: LyuReader;
+    var lyuFehltNm: int64 := 0;      // erstes Symbol, das nichts beschreibt
+    var lyuFehltNl: int64 := 0;
 
     if (src == 0 as pchar) {
       // #1966: Hier wurde bis 1.2.3A nur GEMELDET und weitergemacht. Die
@@ -22326,8 +22957,14 @@ pub type Codegen = class {
               if (rn <= 0) { abbruch := 1; } else { gel := gel + rn; }
             }
             if (abbruch == 0) {
+              // #1971: dieselbe Schranke wie alle .lyu-Leser.
+              if (lsz > LYU_MAX_BYTES) { LyuZuGross(lyuPfad as pchar, lsz); }
               var lr: LyuReader := new LyuReader();
               if (lr.LyrInit(lbuf, lsz)) {
+                // #1971/#2142: Ressourcen und Enum-Varianten der .lyu. Vor der
+                // Frage, ob etwas fehlt: eine Unit, die NUR Ressourcen (oder
+                // nur Enums) traegt, verliert ohne Quelle nichts mehr.
+                self.cg_lyuAnhangUebernehmen(lr, lbuf, lsz, modName, nameLen);
                 if (lr.symCount == 0) { traegtSymbole := 0; }
                 // #2014 Stufe 1: Traegt die `.lyu` NUR Konstanten und stehen
                 // deren Werte darin, dann geht ohne die Quelle nichts
@@ -22382,12 +23019,30 @@ pub type Codegen = class {
                       var snp: pchar := peek64(sNm) as pchar;
                       var snl: int64 := peek64(sNmL);
                       if (self.cg_findConIdx(snp, snl) < 0) {
-                        if (self.cg_isDeclaredFunc(snp, snl) == 0) { fehlt := fehlt + 1; }
+                        // #2142: ein Enum aus dem Anhang ist bekannt.
+                        if (self.cg_isDeclaredFunc(snp, snl) == 0 && self.cg_findEnum(snp, snl) < 0) {
+                          // #2014: beschreibt ein Deklarationseintrag das
+                          // Symbol (Funktion, Struct, Klasse), geht es nicht
+                          // verloren — es kommt unten als Deklaration herein.
+                          if (!lr.LyrDeklHat(snp, snl)) {
+                            if (fehlt == 0) { lyuFehltNm := snp as int64; lyuFehltNl := snl; }
+                            fehlt := fehlt + 1;
+                          }
+                        }
                       }
                     }
                     sIdx += 1;
                   }
-                  if (fehlt == 0) { traegtSymbole := 0; }
+                  if (fehlt == 0) {
+                    var dkLB: int64 := alloc(8);
+                    var dkT: int64 := lr.LyrDeklText(dkLB);
+                    if (dkT != 0) {
+                      lyuText := dkT; lyuTextLen := peek64(dkLB);
+                      lyuRdr := lr;
+                    } else {
+                      traegtSymbole := 0;
+                    }
+                  }
                 }
               }
             }
@@ -22401,18 +23056,33 @@ pub type Codegen = class {
         self.cgAlias := cgaSaved; self.cgAliasLen := cgaSavedLen;   // #1262
         return;
       }
-      EPrintStr("error: codegen: Quelle der importierten Unit nicht lesbar: "c);
-      EPrintStrLn(path);
-      EPrintStrLn("  sema hat die Unit aufgeloest (womoeglich ueber eine .lyu), der Codegen"c);
-      EPrintStrLn("  braucht aber die .lyx: eine .lyu enthaelt Namen und Typen, weder die"c);
-      EPrintStrLn("  Werte der Konstanten noch den Code der Funktionen."c);
-      EPrintStrLn("  Ohne diesen Abbruch kaeme jede Konstante daraus still als 0 an."c);
-      exit(1);
+      if (lyuText == 0) {
+        EPrintStr("error: codegen: Quelle der importierten Unit nicht lesbar: "c);
+        EPrintStrLn(path);
+        EPrintStrLn("  sema hat die Unit aufgeloest (womoeglich ueber eine .lyu), der Codegen"c);
+        EPrintStrLn("  braucht aber die .lyx: die .lyu beschreibt nicht alle ihre Symbole —"c);
+        EPrintStrLn("  weder die Werte der Konstanten noch die Deklarationen decken sie ab."c);
+        if (lyuFehltNl > 0) {
+          EPrintStr("  Nicht beschrieben: "c);
+          sys_write(2, lyuFehltNm, lyuFehltNl);
+          EPrintStrLn(""c);
+        }
+        EPrintStrLn("  Ohne diesen Abbruch kaeme jede Konstante daraus still als 0 an."c);
+        exit(1);
+      }
+      // #2014 Stufen 2–4: Die .lyu beschreibt alles — weiter wie mit einer
+      // Quelle, nur aus ihrem Deklarationstext und ohne Rumpfe (cgNurDekl).
+      src := lyuText as pchar;
+      srcSize := lyuTextLen;
     }
+
+    var impPfad: int64 := self.cgLesePfad;   // #1971
 
     // Parse the imported file
     var p: Parser := new Parser();
     p.Init(src, srcSize);
+    var cgAusLyu: int64 := 0;
+    if (lyuText != 0) { p.lyuDekl := 1; cgAusLyu := 1; }   // #2014
     var head: int64 := p.Parse();
     // #1878: Ein `@integrity(mode: scrubbed, interval: N)` in einer
     // IMPORTIERTEN Einheit bringt sein Intervall mit. Ohne diese Zeile bekaeme
@@ -22472,8 +23142,21 @@ pub type Codegen = class {
     // Adresse liegen und alte Eintraege treffen.
     var nestSaved: int64 := self.nestMapCnt;
 
+    // #1971: Waehrend dieser Unit gelten Pfade in @embed/@resource relativ zu
+    // IHRER Datei. Bis 1.2.16A blieb srcFilePath auf dem Hauptprogramm: eine
+    // Bibliothek fand ihre eigene Ressource nur, wenn das Programm zufaellig
+    // im selben Verzeichnis lag.
+    var sfpSaved: pchar := self.srcFilePath;
+    var sflSaved: int64 := self.srcFileLen;
+    if (impPfad != 0) {
+      self.srcFilePath := impPfad as pchar;
+      self.srcFileLen := StrLen(impPfad as pchar);
+    }
+
     // Recursively generate code for the imported file
     var miStartImp: int64 := self.miPendN;   // #2136
+    var nurDeklSaved: int64 := self.cgNurDekl;   // #2014
+    self.cgNurDekl := cgAusLyu;
     self.cg_genFile(head);
     // Was noch vorgemerkt ist, gehoert zu DIESEN Knoten — jetzt erzeugen,
     // nicht spaeter unter der Tabelle des einbindenden Moduls.
@@ -22481,12 +23164,18 @@ pub type Codegen = class {
     // #2136: die Anfangswerte dieser Unit — ebenfalls noch unter ihrer
     // Tabelle und ihrem Privatverzeichnis.
     self.cg_miEinheit(miStartImp);
+    self.srcFilePath := sfpSaved;   // #1971
+    self.srcFileLen := sflSaved;
     
     // AP-1: Collect function labels from imported module
     // This makes imported functions visible for patch resolution in main file
     // IMPORTANT: Do this WHILE still switched to import pNodes!
-    self.cg_collectImportLabels(head);
+    // #2014: NICHT fuer Deklarationen aus einer .lyu — eine Marke ohne Rumpf
+    // laege auf dem naechsten fremden Code, und der Aufruf traefe ihn.
+    if (cgAusLyu == 0) { self.cg_collectImportLabels(head); }
     self.cg_collectImportDefaults(head);   // #1342: konstante Vorgabewerte abschreiben
+    if (cgAusLyu != 0) { self.cg_lyuPruefeLayout(lyuRdr); }   // #2014
+    self.cgNurDekl := nurDeklSaved;
     self.nestMapCnt := nestSaved;          // #2044
 
     self.cgUnitTag     := utSaved;      // #1655
@@ -22644,14 +23333,27 @@ pub type Codegen = class {
   //     einen Aufruf OHNE Typargumente erreichbar (`gety(p)`). Bis 1.2.15A
   //     lieferte er still 0; jetzt bricht er an dieser Stelle laut ab;
   //   - sonst: das bisherige Verhalten (Wert 0), siehe Bericht zu #2134.
-  fn cg_genFeldOffen(fp: pchar, fl: int64) {
+  //
+  // #2141: AUSSERHALB eines typgeloeschten generischen Rumpfes kehrte die
+  // Funktion bis 1.2.16A still zurueck — der Lesezugriff lieferte 0, die
+  // Zuweisung entfiel, ohne Meldung. Jetzt bricht das Uebersetzen ab, mit
+  // derselben Meldung wie _feldOffen im IR-Weg (die beiden muessen
+  // uebereinstimmen). ni = der Feldknoten, fuer die Zeilenangabe.
+  fn cg_genFeldOffen(fp: pchar, fl: int64, ni: int64) {
     if (self.genActN > 0) {
       self.cg_genFehler("Feld ueber einen Typparameter nicht aufloesbar: "c, fp, fl);
     }
     var fd: int64 := self.genCurFd;
-    if (fd < 0) { return; }
-    var tp: int64 := self.cg_nc3(fd);
-    if (tp < 0 || tp >= self.pNodeCount || self.cg_nkind(tp) != 62) { return; }
+    var tp: int64 := 0 - 1;
+    if (fd >= 0) { tp := self.cg_nc3(fd); }
+    if (tp < 0 || tp >= self.pNodeCount || self.cg_nkind(tp) != 62) {
+      EPrintStr("error: #2134: Feld nicht aufloesbar (Typ der Basis unbekannt): "c);
+      sys_write(2, fp as int64, fl);
+      EPrintStr(" (Zeile "c);
+      EPrintInt(self.cg_lineOf(ni));
+      EPrintStrLn(")"c);
+      exit(1);
+    }
     var msgOff: int64 := self.dataLen;
     var t1: pchar := "lyxc: generische Funktion ohne Typargumente aufgerufen, Feld "c;
     var i: int64 := 0;
@@ -22807,10 +23509,49 @@ pub type Codegen = class {
     var fd: int64 := peek64(gr + CG_GF_OFF_NI);
     var ende: int64 := peek64(gr + CG_GF_OFF_END);
     var argB: int64 := peek64(m + CG_GM_OFF_ARGS);
-    var buf: int64 := alloc((ende - fd + 1) * 40);
+    var buf: int64 := alloc((ende - fd + 1) * 80);
     var n: int64 := 0;
     var k: int64 := fd + 1;
     while (k < ende) {
+      // #2143: `Box<T>` / `new Box<T>()` — die Nennung traegt fuer die Dauer
+      // den Namen der Instanz ("Box<int64>"), die Argumentkette ist so lange
+      // ausgehaengt (c1 bzw. c2 = -1). Zwei Eintraege: Name, Kette.
+      var abhK: int64 := self.cg_nkind(k);
+      var abhA: int64 := 0 - 1;
+      var abhF: int64 := 0;
+      if (abhK == 60 && self.cg_nc1(k) >= 0
+          && self.cg_seq(self.cg_nsval(k), self.cg_nslen(k), "Array"c, 5) == 0) { abhA := self.cg_nc1(k); abhF := CG_OFF_C1; }
+      if (abhK == CGN_NEW && self.cg_nc2(k) >= 0) { abhA := self.cg_nc2(k); abhF := CG_OFF_C2; }
+      if (abhA >= 0) {
+        var alc: int64 := alloc(16);
+        var amp: pchar := self.cg_genAbhName(k, fd, argB, alc);
+        if (peek64(alc + 8) != 0) {
+          if (self.cg_findClass(amp, peek64(alc)) < 0) {
+            self.cg_genFehler("#2143: Instanz eines generischen Typs fehlt (Aufruf der generischen Funktion aus einer anderen Unit?): "c,
+                              amp, peek64(alc));
+          }
+          var af: int64 := self.cg_noff(k) + CG_OFF_SVAL;
+          var ae: int64 := buf + n * 40;
+          poke64(ae, af);
+          poke64(ae + 8, peek64(af));
+          poke64(ae + 16, peek64(af + 8));
+          poke64(ae + 24, (amp as int64) - (self.pSrc as int64));
+          poke64(ae + 32, peek64(alc));
+          poke64(af, peek64(ae + 24));
+          poke64(af + 8, peek64(ae + 32));
+          n += 1;
+          var cf: int64 := self.cg_noff(k) + abhF;
+          var ce: int64 := buf + n * 40;
+          poke64(ce, cf);
+          poke64(ce + 8, peek64(cf));
+          poke64(ce + 16, peek64(cf + 8));
+          poke64(ce + 24, 0 - 1);
+          poke64(ce + 32, peek64(cf + 8));
+          poke64(cf, 0 - 1);
+          n += 1;
+        }
+        free(alc, 16);
+      }
       if (self.cg_nkind(k) == 60 && self.cg_nc0(k) < 0 && self.cg_nc1(k) < 0) {
         var tp: int64 := self.cg_nc3(fd);
         var ai: int64 := 0;
@@ -22837,6 +23578,88 @@ pub type Codegen = class {
     }
     poke64(nCell, n);
     return buf;
+  }
+
+  // #2143: Nennt die generische Funktion fd (aktive Tabelle) einen
+  // generischen Typ ueber ihren Typparameter? Nach dem Parser traegt nur
+  // eine solche Nennung noch Argumente (alle anderen sind zu "Box<int64>"
+  // aufgeloest) — ausser `Array<T>`, das der Parser ausnimmt (_gtRefAdd).
+  fn cg_genHatAbh(fd: int64): int64 {
+    var tp: int64 := self.cg_nc3(fd);
+    if (tp < 0 || tp >= self.pNodeCount || self.cg_nkind(tp) != 62) { return 0; }
+    var ende: int64 := 0 - 1;
+    var i: int64 := 0;
+    while (i < self.gfN) {
+      var r: int64 := self.gfRecs + i * CG_GF_SZ;
+      if (peek64(r + CG_GF_OFF_NODES) == self.pNodes && peek64(r + CG_GF_OFF_NI) == fd) { ende := peek64(r + CG_GF_OFF_END); }
+      i += 1;
+    }
+    if (ende < 0) { return 0; }
+    var k: int64 := fd + 1;
+    while (k < ende) {
+      var kk: int64 := self.cg_nkind(k);
+      if (kk == CGN_NEW && self.cg_nc2(k) >= 0) { return 1; }
+      if (kk == 60 && self.cg_nc1(k) >= 0 && self.cg_seq(self.cg_nsval(k), self.cg_nslen(k), "Array"c, 5) == 0) { return 1; }
+      k += 1;
+    }
+    return 0;
+  }
+
+  // #2143: Name der Instanz fuer die Nennung r (Typname mit Argumenten in
+  // c1, `new` mit Argumenten in c2) unter der Ersetzung Typparameter von fd
+  // -> argB. Derselbe Name wie im Parser (_gtAbhName, _gtResolve:
+  // "Name<A,B>", geschachtelt rekursiv) — die beiden muessen
+  // uebereinstimmen. lc: +0 Laenge, +8 = 1, wenn ein Typparameter darin
+  // vorkam (sonst ist die Nennung keine abhaengige und bleibt stehen).
+  fn cg_genAbhName(r: int64, fd: int64, argB: int64, lc: int64): pchar {
+    var args: int64 := self.cg_nc1(r);
+    if (self.cg_nkind(r) == CGN_NEW) { args := self.cg_nc2(r); }
+    var cap: int64 := self.cg_nslen(r) + 2;
+    var a: int64 := args;
+    while (a >= 0) { cap := cap + 256; a := self.cg_nnext(a); }
+    var mb: int64 := alloc(cap + 1);
+    var pos: int64 := self.cg_nslen(r);
+    memcpy(mb, self.cg_nsval(r) as int64, pos);
+    poke8(mb + pos, 60); pos += 1;
+    poke64(lc + 8, 0);
+    var erst: int64 := 1;
+    a := args;
+    while (a >= 0) {
+      if (erst == 0) { poke8(mb + pos, 44); pos += 1; }
+      erst := 0;
+      var np: int64 := self.cg_nsval(a) as int64;
+      var nl: int64 := self.cg_nslen(a);
+      if (self.cg_nkind(a) == 60 && self.cg_nc1(a) >= 0) {
+        var ilc: int64 := alloc(16);
+        np := self.cg_genAbhName(a, fd, argB, ilc) as int64;
+        nl := peek64(ilc);
+        if (peek64(ilc + 8) != 0) { poke64(lc + 8, 1); }
+        free(ilc, 16);
+      } else {
+        var tp: int64 := self.cg_nc3(fd);
+        var ai: int64 := 0;
+        while (tp >= 0) {
+          if (self.cg_seq(self.cg_nsval(tp), self.cg_nslen(tp), np as pchar, nl) != 0) {
+            np := peek64(argB + ai * 16); nl := peek64(argB + ai * 16 + 8);
+            poke64(lc + 8, 1);
+            tp := 0 - 1;
+          } else { tp := self.cg_nnext(tp); ai += 1; }
+        }
+      }
+      if (pos + nl + 2 > cap) {
+        var nc: int64 := (pos + nl + 2) * 2;
+        var nb: int64 := alloc(nc + 1);
+        memcpy(nb, mb, pos);
+        mb := nb; cap := nc;
+      }
+      memcpy(mb + pos, np, nl);
+      pos := pos + nl;
+      a := self.cg_nnext(a);
+    }
+    poke8(mb + pos, 62); pos += 1;
+    poke8(mb + pos, 0);
+    poke64(lc, pos);
+    return mb as pchar;
   }
 
   // Ersetzung zuruecknehmen (rueckwaerts) bzw. erneut anwenden.
@@ -23210,7 +24033,11 @@ pub type Codegen = class {
         var exHasBody: int64 := 1;
         if (exBody == -1) { exHasBody := 0; }
         else if (self.cg_nkind(exBody) == CGN_CAPABILITY_ATTR) { exHasBody := 0; }
-        if (exHasBody == 0 && libPacked != -1) {
+        if (self.cgNurDekl != 0) {
+          // #2014: aus einer .lyu — kein Rumpf, keine Marke. Nur merken, damit
+          // ein Aufruf mit dem richtigen Grund abgewiesen wird.
+          self.cg_lyuNameMerke(self.cg_nsval(cur) as int64, self.cg_nslen(cur));
+        } else if (exHasBody == 0 && libPacked != -1) {
           var libOff: int64 := libPacked & 0xFFFFFFFF;
           var libLen: int64 := (libPacked >> 32) & 0xFFFFFFFF;
           if (libLen > 0) {
@@ -23277,7 +24104,16 @@ pub type Codegen = class {
             var nextM: int64 := self.cg_nnext(method);
             // WP-BC-20: skip abstract methods (bit3 of iVal) — no code body
             var isAbstM: int64 := (self.cg_nival(method) >> 3) & 1;
-            if (isAbstM == 0) {
+            if (self.cgNurDekl != 0 && isAbstM == 0) {
+              // #2014: Methode aus einer .lyu. Eine VIRTUELLE bekommt einen
+              // Rumpf, der sich meldet — ihr VMT-Platz darf nicht 0 bleiben
+              // (Sprung nach 0, siehe #1643). Ohne Marke: ein direkter Aufruf
+              // bleibt unaufgeloest und wird beim Binden gemeldet.
+              self.cg_lyuMethodeMerke(clsName, clsLen, self.cg_nsval(method), self.cg_nslen(method));
+              if (((self.cg_nival(method) >> 1) & 1) != 0) {
+                self.cg_genLyuStub(method, clsName, clsLen);
+              }
+            } else if (isAbstM == 0) {
               self.cg_genMethodDecl(method, clsName, clsLen);
             } else {
               // #1643: statt zu ueberspringen einen Rumpf, der sich meldet.
@@ -23633,6 +24469,10 @@ pub type Codegen = class {
     self.pSrc   := src;
     self.pNodes := nodes;
     self.pToks  := toks;
+    self.cgNurDekl     := 0;   // #2014
+    self.cgLyuNamen    := 0;
+    self.cgLyuNamenN   := 0;
+    self.cgLyuNamenCap := 0;
 
     self.codeCap     := 65536;
     self.code        := alloc(self.codeCap);
@@ -23648,6 +24488,7 @@ pub type Codegen = class {
     self.resCount    := 0;
     self.resCap      := 0;
     self.resTabOff   := 0 - 1;
+    self.cgLesePfad  := 0;   // #1971
     self.dataLen     := 128; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836), +8 CG_RESTAB (#1961)
     self.dataOverflow := 0;  // WP-34  // WP-18: pre-reserve 88 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24, ARGC@32, ARGV@40, FLOAT_BUF@48, CANARY@80)
 
@@ -23720,7 +24561,7 @@ pub type Codegen = class {
     self.localBase             := 0;
     self.satzKontext           := 0;               // #2133
     self.fnWertFnCap           := 16;
-    self.fnWertFnList          := alloc(self.fnWertFnCap * 32);   // Eintrag 32 B (cg_registerFnWertKandidat)
+    self.fnWertFnList          := alloc(self.fnWertFnCap * CG_FW_SZ);   // cg_registerFnWertKandidat
     self.fnWertFnCount         := 0;
     self.curFnRetFnWert        := 0;
     self.satzLocalJe           := 0;
@@ -23879,6 +24720,7 @@ pub type Codegen = class {
     self.localIsSimd      := alloc(self.localCap);
     self.localIsFnPtr     := alloc(self.localCap);
     self.localFnPtrF64    := alloc(self.localCap);   // #1565
+    self.localFnRetSatz   := alloc(self.localCap);   // #2143
 
     // BUG-02: Temporary buffer tracking (prevent mmap leaks)
     self.tempBufCap   := 64;
@@ -26131,6 +26973,8 @@ pub type Codegen = class {
     while (ef < ehAnz) { ehSize := ehSize + self.cg_ehFdeGroesse(peek64(ehTab + ef * 32 + 24)); ef := ef + 1; }
     var tabEnde: int64 := ehOff + ehSize;
     var codeOff: int64 := CG_CODE_OFF + ((tabEnde - CG_CODE_OFF + seite - 1) / seite) * seite;
+    self.codeFileOff := codeOff;   // #2144: Ladebasis 0
+    self.codeStartVa := codeOff;
     var dataOff: int64 := codeOff + codeLen;
     var relroOff: int64 := ((dataOff + dataLen + seite - 1) / seite) * seite;
     var dynOff: int64 := relroOff;
@@ -26411,6 +27255,10 @@ pub type Codegen = class {
   }
 
   fn WriteELF(path: pchar) {
+    // #2144: alle drei Schreiber hinter WriteELF (statisch, PT_LYXRELOC,
+    // dynamisch/FFI) legen den Code bei CG_CODE_OFF ab.
+    self.codeFileOff := CG_CODE_OFF;
+    self.codeStartVa := CG_ELF_BASE + CG_CODE_OFF;
     // WP-34: refuse to write a binary produced by an overflowed buffer
     if (self.codeOverflow != 0 || self.dataOverflow != 0) {
       EPrintStrLn("error: codegen: WriteELF abgebrochen — Puffer-512-MB-Limit überschritten"c);
@@ -26450,22 +27298,10 @@ pub type Codegen = class {
     var lineSize:   int64 := 0;
     var strSize:    int64 := 0;
     if (self.debugMode != 0) {
-      var li: int64 := 0;
-      while (li < self.labelCount) {
-        var lbase:    int64 := self.labels + li * CG_LABEL_SZ;
-        var lname:    pchar := peek64(lbase) as pchar;
-        var lnlen:    int64 := peek64(lbase + CG_LABEL_OFF_NAMELEN);
-        var lstart:   int64 := peek64(lbase + CG_LABEL_OFF_CODEOFF);
-        var llineNum: int64 := peek64(lbase + CG_LABEL_OFF_LINENUM);
-        var lend:     int64 := 0;
-        if (li + 1 < self.labelCount) {
-          lend := peek64(self.labels + (li + 1) * CG_LABEL_SZ + CG_LABEL_OFF_CODEOFF);
-        } else {
-          lend := totalCode;
-        }
-        dg.dw_addFunc(lname, lnlen, lstart, lend, llineNum);
-        li += 1;
-      }
+      // #2144: dieselbe Funktionstabelle wie die .so (cg_dwarfFunktionen) —
+      // hier stand bis 1.2.16A noch "Ende = naechste Marke in der Tabelle",
+      // was fuer Aliasmarken (cg_bindConFns) falsche Bereiche ergab.
+      self.cg_dwarfFunktionen(dg, totalCode);
       dg.dw_buildAbbrev();
       dg.dw_buildInfo(self.srcFilePath, self.srcFileLen, totalCode);
       dg.dw_buildLine(self.srcFilePath, self.srcFileLen);
@@ -26475,10 +27311,12 @@ pub type Codegen = class {
       strSize    := dg.strLen;
     }
 
-    var shstrtabSize: int64 := 60;
+    // #2144: + ".text\0" (6 Byte) — addr2line sucht die Adresse zuerst in einem
+    // Abschnitt mit SHF_ALLOC; ohne .text fand es nichts, egal wie gut das DWARF war.
+    var shstrtabSize: int64 := 66;
     var fileSize: int64 := baseSize;
     if (self.debugMode != 0) {
-      fileSize := baseSize + abbrevSize + infoSize + lineSize + strSize + shstrtabSize + 384;
+      fileSize := baseSize + abbrevSize + infoSize + lineSize + strSize + shstrtabSize + 448;
     }
 
     // WP-LIC-10: watermark layout (only in non-debug static builds with a license key)
@@ -26554,7 +27392,7 @@ pub type Codegen = class {
     if (self.debugMode != 0) {
       var shoff: int64 := baseSize + abbrevSize + infoSize + lineSize + strSize + shstrtabSize;
       poke64(buf + ELF64_EHDR_OFF_SHOFF, shoff);
-      poke16(buf + 60, 6);      // e_shnum = 6
+      poke16(buf + 60, 7);      // e_shnum = 7 (#2144: + .text)
       poke16(buf + 62, 5);      // e_shstrndx = 5
     }
     if hasWatermark {
@@ -26640,6 +27478,7 @@ pub type Codegen = class {
       poke8(ss+49,0);
       poke8(ss+50,46);poke8(ss+51,115);poke8(ss+52,104);poke8(ss+53,115);poke8(ss+54,116);
       poke8(ss+55,114);poke8(ss+56,116);poke8(ss+57,97);poke8(ss+58,98);poke8(ss+59,0);
+      self.cg_objPutName(ss, 60, ".text"c as int64, 5);   // #2144, NUL aus dem Nullpuffer
 
       // Section header table (6 × 64 bytes; [0]=NULL, already zero from mmap)
       var sh0: int64 := buf + shstrtabOff + shstrtabSize;
@@ -26670,6 +27509,12 @@ pub type Codegen = class {
       sh := sh0 + 320;
       poke32(sh,50); poke32(sh+4,3);
       poke64(sh+24,shstrtabOff); poke64(sh+32,shstrtabSize); poke64(sh+48,1);
+
+      // [6] .text: sh_name=60, SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR (#2144)
+      sh := sh0 + 384;
+      poke32(sh,60); poke32(sh+4,1);
+      poke64(sh+8,6); poke64(sh+16,CG_ELF_BASE + CG_CODE_OFF);
+      poke64(sh+24,CG_CODE_OFF); poke64(sh+32,totalCode); poke64(sh+48,16);
     }
 
     // WP-LIC-10: embed .lyx_lic section (non-debug static builds only)
