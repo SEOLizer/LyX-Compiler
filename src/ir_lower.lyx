@@ -586,6 +586,8 @@ fn _irEingebauteKonst(np: pchar, nl: int64, zelle: int64, arch: int64, os: int64
   if _irNameGleich(np, nl, "OS_MACOS"c, 8) != 0      { w := 2; gef := 1; }
   if _irNameGleich(np, nl, "OS_WINDOWS"c, 10) != 0   { w := 3; gef := 1; }
   if _irNameGleich(np, nl, "OS_BARE"c, 7) != 0       { w := 4; gef := 1; }
+  if _irNameGleich(np, nl, "OS_LYXOS"c, 8) != 0      { w := 5; gef := 1; }   // #2151
+  if _irNameGleich(np, nl, "ARCH_XTENSA"c, 11) != 0  { w := 5; gef := 1; }
   // Die zielabhaengigen nur, wenn das Ziel bekannt ist — sonst laut (s. oben).
   if arch != 0 && os != 0 {
     if _irNameGleich(np, nl, "TARGET_ARCH"c, 11) != 0 { w := arch; gef := 1; }
@@ -598,6 +600,8 @@ fn _irEingebauteKonst(np: pchar, nl: int64, zelle: int64, arch: int64, os: int64
     if _irNameGleich(np, nl, "TARGET_MACOS"c, 12) != 0   { w := 0; if os == 2 { w := 1; } gef := 1; }
     if _irNameGleich(np, nl, "TARGET_WINDOWS"c, 14) != 0 { w := 0; if os == 3 { w := 1; } gef := 1; }
     if _irNameGleich(np, nl, "TARGET_BARE"c, 11) != 0    { w := 0; if os == 4 { w := 1; } gef := 1; }
+    if _irNameGleich(np, nl, "TARGET_LYXOS"c, 12) != 0   { w := 0; if os == 5 { w := 1; } gef := 1; }
+    if _irNameGleich(np, nl, "TARGET_IS_XTENSA"c, 16) != 0 { w := 0; if arch == 5 { w := 1; } gef := 1; }
   }
   if gef == 0 { return 0; }
   poke64(zelle, w);
@@ -1300,6 +1304,9 @@ pub type IRLower = class {
   // dann sind die Systemkonstanten unbekannt und scheitern laut.
   irArchCode:   int64;
   irOsCode:     int64;
+  // #2147: Zugriffsart (Breite | Vorzeichen << 8) des zuletzt ueber
+  // _instanceFieldOffset aufgeloesten Feldes; 0 = acht Byte.
+  letzteFeldArt: int64;
 
   // #1693: Suchpfade fuer Importe. Die IR-Strecke hat sie bisher nicht
   // gekannt und jeden Import stur relativ zum ARBEITSVERZEICHNIS gelesen —
@@ -1444,6 +1451,7 @@ pub type IRLower = class {
     self.irEnumCap := 0;
     self.irArchCode := 0;
     self.irOsCode := 0;
+    self.letzteFeldArt := 0;
     var wbI: int64 := 0;
     while wbI < self.wantCap { poke8(self.wantBuf + wbI, 0); poke8(self.doneBuf + wbI, 0); wbI := wbI + 1; }
     self._tregCap := 1024;
@@ -2689,6 +2697,27 @@ pub type IRLower = class {
           iro += 10;
         }
       }
+      // #2153: Gemischt — ist das Ergebnis bzw. der Vergleich Gleitkomma, eine
+      // Seite aber eine Ganzzahl, wird diese erst gewandelt. Bis 1.2.16C ging
+      // sie als rohes Bitmuster in FMUL/FADD/FCMP: `1.5 * 2` ergab 0 (2 ist
+      // als double eine denormale Zahl), `1.5 + 1` 1.5. Dieselbe Entscheidung
+      // wie cg_isF64Expr + cg_emitRaxIntToF64 auf x86 (#1212) — die beiden
+      // muessen uebereinstimmen.
+      // Gewandelt wird nur, was NACHWEISLICH eine Ganzzahl ist
+      // (_istGanzzahlAusdruck) — ein f64-Wert, den _isF64Expr nicht erkennt,
+      // waere sonst als Ganzzahl gelesen und zerstoert worden.
+      if (iro >= IRO_FADD && iro <= IRO_FDIV) || (iro >= IRO_CMP_EQ + 10 && iro <= IRO_CMP_GE + 10) {
+        if self._istGanzzahlAusdruck(self.nodeC0(expr)) != 0 {
+          var mxL: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_ITOF, mxL, t1, -1, 0);
+          t1 := mxL;
+        }
+        if self._istGanzzahlAusdruck(self.nodeC1(expr)) != 0 {
+          var mxR: int64 := self.allocTemp();
+          self.irAddInstrDirect(IRO_ITOF, mxR, t2, -1, 0);
+          t2 := mxR;
+        }
+      }
       // WP-OPCODE-REST: Integer-Div/Mod durch 0 → kontrollierter ASSERT_NOT_ZERO (Panic) statt SIGFPE.
       if iro == IRO_DIV || iro == IRO_MOD {
         self.irAddInstrDirect(IRO_ASSERT_NOT_ZERO, -1, t2, -1, 0);
@@ -2696,6 +2725,47 @@ pub type IRLower = class {
       self.irAddInstrDirect(iro, dest, t1, t2, 0);
     }
     return dest;
+  }
+
+  // #2153: Ist der Ausdruck NACHWEISLICH ganzzahlig? Literal, Bezeichner mit
+  // Ganzzahltyp, ganzzahlige Konstante, Cast in einen Ganzzahltyp, Rechnung
+  // aus solchen. Im Zweifel 0 — gewandelt wird nur, was sicher keine
+  // Gleitkommazahl ist.
+  fn _istGanzzahlAusdruck(nd: int64): int64 {
+    if nd < 0 { return 0; }
+    var k: int64 := self.nodeKind(nd);
+    if k == NK_LIT_INT || k == NK_LIT_CHAR { return 1; }
+    if k == NK_UNOP {
+      var uo: int64 := self.nodeIVal(nd);
+      if uo == 71 || uo == 92 { return self._istGanzzahlAusdruck(self.nodeC0(nd)); }
+      return 0;
+    }
+    if k == NK_CAST {
+      var ct: int64 := self.nodeC1(nd);
+      if ct >= 0 && self.nodeKind(ct) == NK_TYPE_NAME {
+        return _irIstGanzzahlTyp(self.nodeSVal(ct), self.nodeSLen(ct));
+      }
+      return 0;
+    }
+    if k == NK_IDENT {
+      var tn: int64 := self._localTypeNode(self.nodeSVal(nd), self.nodeSLen(nd));
+      if tn >= 0 {
+        if self.nodeKind(tn) == NK_TYPE_NAME { return _irIstGanzzahlTyp(self.nodeSVal(tn), self.nodeSLen(tn)); }
+        return 0;
+      }
+      // eine ganzzahlig faltbare Konstante (keine f64-Konstante)
+      if self._f64Faltbar(nd) != 0 { return 0; }
+      return self._constFaltbar(nd);
+    }
+    if k == NK_BINOP {
+      var bo: int64 := self.nodeIVal(nd);
+      if (bo >= 70 && bo <= 74) || bo == 89 || bo == 90 || bo == 91 || bo == 93 || bo == 94 {
+        if self._istGanzzahlAusdruck(self.nodeC0(nd)) == 0 { return 0; }
+        return self._istGanzzahlAusdruck(self.nodeC1(nd));
+      }
+      return 0;
+    }
+    return 0;
   }
 
   // WP-OPCODE-REST: lokalen Slot eines Namens auflösen (Locals shadowing-latest, dann Params).
@@ -2870,6 +2940,17 @@ pub type IRLower = class {
       var fbVorP: int64 := self.nodeC0(fbVorDecl);
       while fbVorP >= 0 { fbVorN := fbVorN + 1; fbVorP := self.nodeNext(fbVorP); }
     }
+    // #2147: Die Deklaration steht in einer IMPORTIERTEN Unit — Parameterzahl
+    // (Argumentblock) und Vorgabewerte kommen von dort. Bis 1.2.16C sah
+    // _callDeclNi nur die eigene Unit; `Skal(6)` mit `f: int64 = 3` aus einer
+    // anderen Unit rief mit einem unbeschriebenen Slot (arm64: 25198368).
+    var fbImpBox: int64 := alloc(8);
+    poke64(fbImpBox, 0 - 1);
+    var fbImpDecl: int64 := 0 - 1;
+    if fbVorDecl < 0 && self.nodeIVal(expr) == 0 {
+      fbImpDecl := self._importFnDecl(self.nodeSVal(expr), self.nodeSLen(expr), fbImpBox);
+      if fbImpDecl >= 0 { fbVorN := self._importParamZahl(fbImpDecl, peek64(fbImpBox)); }
+    }
     var fbArgBase: int64 := self._irArgBlock(arg0, fbVorN);
     var fbArgCnt: int64 := 0;
     var fbArg: int64 := arg0;
@@ -2899,7 +2980,10 @@ pub type IRLower = class {
         }
         fbDP := self.nodeNext(fbDP);
       }
+    } else if fbImpDecl >= 0 {
+      fbArgCnt := self._importVorgaben(fbImpDecl, peek64(fbImpBox), fbArgBase, fbArgCnt, expr);
     }
+    free(fbImpBox, 8);
     // src2 = argBase (Slot-Basis des Arg-Blocks) für emitCall
     // #1727: dieser Aufruf braucht die Funktion — Index vormerken. Die
     // Markierung entscheidet spaeter, ob ihr Rumpf ueberhaupt entsteht.
@@ -2917,6 +3001,85 @@ pub type IRLower = class {
     }
     self.irAddInstrDirect(IRO_CALL, dest, fbUserIdx, fbArgBase, fbArgCnt);
     return dest;
+  }
+
+  // #2147: Freie Funktion `np` in einer importierten Unit suchen. Liefert den
+  // Knoten (in der Tabelle der Unit) und schreibt deren Index nach box;
+  // -1, wenn keine Unit sie deklariert.
+  fn _importFnDecl(np: pchar, nl: int64, box: int64): int64 {
+    var svS: pchar := self.src; var svN: int64 := self.nodes; var svC: int64 := self.nodeCount;
+    var gef: int64 := 0 - 1;
+    var m: int64 := 0;
+    while m < self.impLstN && gef < 0 {
+      self.src       := peek64(self.impLstSrc + m * 8) as pchar;
+      self.nodes     := peek64(self.impLstNodes + m * 8);
+      self.nodeCount := peek64(self.impLstCnt + m * 8);
+      var d: int64 := peek64(self.impLstHead + m * 8);
+      while d >= 0 && gef < 0 {
+        if self.nodeKind(d) == NK_FUNC_DECL && self.seq(self.nodeSVal(d), self.nodeSLen(d), np, nl) {
+          gef := d; poke64(box, m);
+        }
+        d := self.nodeNext(d);
+      }
+      m := m + 1;
+    }
+    self.src := svS; self.nodes := svN; self.nodeCount := svC;
+    return gef;
+  }
+
+  // #2147: Parameterzahl einer Deklaration aus Unit `m`.
+  fn _importParamZahl(d: int64, m: int64): int64 {
+    var svS: pchar := self.src; var svN: int64 := self.nodes; var svC: int64 := self.nodeCount;
+    self.src       := peek64(self.impLstSrc + m * 8) as pchar;
+    self.nodes     := peek64(self.impLstNodes + m * 8);
+    self.nodeCount := peek64(self.impLstCnt + m * 8);
+    var n: int64 := 0;
+    var p: int64 := self.nodeC0(d);
+    while p >= 0 { n := n + 1; p := self.nodeNext(p); }
+    self.src := svS; self.nodes := svN; self.nodeCount := svC;
+    return n;
+  }
+
+  // #2147: Vorgabewerte einer importierten Funktion in den Argumentblock.
+  // Ausgerechnet werden sie im Kontext IHRER Unit (dort stehen Knoten und
+  // Konstanten); erlaubt ist, was sich dort zur Uebersetzungszeit falten
+  // laesst — Ganzzahl/bool/char (_constFaltbar), Gleitkomma (_f64Faltbar)
+  // und ein Zeichenkettenliteral. Alles andere ist laut: es liefe sonst im
+  // falschen Namensraum.
+  fn _importVorgaben(d: int64, m: int64, argBase: int64, argCnt: int64, ruf: int64): int64 {
+    var svS: pchar := self.src; var svN: int64 := self.nodes; var svC: int64 := self.nodeCount;
+    self.src       := peek64(self.impLstSrc + m * 8) as pchar;
+    self.nodes     := peek64(self.impLstNodes + m * 8);
+    self.nodeCount := peek64(self.impLstCnt + m * 8);
+    var n: int64 := argCnt;
+    var p: int64 := self.nodeC0(d);
+    var skip: int64 := 0;
+    while skip < argCnt && p >= 0 { p := self.nodeNext(p); skip := skip + 1; }
+    while p >= 0 {
+      var dx: int64 := self.nodeC1(p);
+      if dx >= 0 {
+        var t: int64 := self.allocTemp();
+        if self._f64Faltbar(dx) != 0 {
+          self.irAddInstrDirect(IRO_CONST_INT, t, -1, -1, self._f64Wert(dx));
+        } else if self._constFaltbar(dx) != 0 {
+          self.irAddInstrDirect(IRO_CONST_INT, t, -1, -1, self._constWert(dx));
+        } else if self.nodeKind(dx) == NK_LIT_STR {
+          self.irAddInstrDirect(IRO_CONST_STR, t, -1, -1, self._strLitInternieren(dx));
+        } else {
+          self.src := svS; self.nodes := svN; self.nodeCount := svC;
+          EPrintStr("lyxc: IR-Weg: Vorgabewert eines Parameters von '"c);
+          sys_write(2, self.nodeSVal(ruf) as int64, self.nodeSLen(ruf));
+          EPrintStrLn("' aus einer anderen Unit laesst sich nicht zur Uebersetzungszeit ausrechnen (#2147)."c);
+          EPrintStrLn("  Erlaubt sind Literale und Konstanten; sonst das Argument ausschreiben."c);
+          exit(1);
+        }
+        self.irAddInstrDirect(IRO_STORE_LOCAL, argBase + n, t, -1, 0);
+        n := n + 1;
+      }
+      p := self.nodeNext(p);
+    }
+    self.src := svS; self.nodes := svN; self.nodeCount := svC;
+    return n;
   }
 
   // #1388: Ist der Name im Modul als Funktion definiert? Dann hat die
@@ -4290,6 +4453,55 @@ pub type IRLower = class {
     if (self.seq(fname, fnlen, "len", 3) && arg0 >= 0 && self._mapArt(arg0) != 0
         && self._irVerdecktBuiltin(fname, fnlen) == 0) {
       return self._mapLen(arg0);
+    }
+    // #2147: len() auf einem Array. Bis 1.2.16C kannte der IR-Weg es nicht
+    // ("unbekannter Name im Aufruf: len"). Feste Groesse `[N]T`: N zur
+    // Uebersetzungszeit. Dynamisches Array (`T[]`, `array`, `Array<T>`) und
+    // Literal: die Laenge steht bei [p-8] (Kopf {cap,len} vor dem ersten
+    // Element, _lowerArrayLit); ein Nullzeiger (noch nicht angelegt) hat 0.
+    if (self.seq(fname, fnlen, "len", 3) && arg0 >= 0 && self._irVerdecktBuiltin(fname, fnlen) == 0) {
+      var laArt: int64 := 0;
+      var laN: int64 := 0;
+      if self.nodeKind(arg0) == NK_ARRAY_LIT {
+        var laE: int64 := self.nodeC0(arg0);
+        while laE >= 0 { laN := laN + 1; laE := self.nodeNext(laE); }
+        laArt := 1;
+      } else if self.nodeKind(arg0) == NK_IDENT {
+        var laT: int64 := self._localTypeNode(self.nodeSVal(arg0), self.nodeSLen(arg0));
+        if laT >= 0 && self.nodeKind(laT) == NK_TYPE_ARRAY_FIXED {
+          var laSz: int64 := self.nodeC1(laT);
+          if laSz >= 0 && self.nodeKind(laSz) == NK_LIT_INT { laN := self.nodeIVal(laSz); laArt := 1; }
+        } else if laT >= 0 && self.nodeKind(laT) == NK_TYPE_ARRAY {
+          laArt := 2;
+        } else if laT >= 0 && self.nodeKind(laT) == NK_TYPE_NAME {
+          if self.seq(self.nodeSVal(laT), self.nodeSLen(laT), "array", 5)
+             || self.seq(self.nodeSVal(laT), self.nodeSLen(laT), "Array", 5) { laArt := 2; }
+        }
+      }
+      if laArt == 1 {
+        self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, laN);
+        return dest;
+      }
+      if laArt == 2 {
+        var laP: int64 := self.lowerExpr(arg0);
+        var laNull: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_CONST_INT, laNull, -1, -1, 0);
+        // dest wird zweimal beschrieben — nur ueber STORE_LOCAL (siehe _mapZugriff).
+        self.irAddInstrDirect(IRO_STORE_LOCAL, dest, laNull, -1, 0);
+        var laIst0: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_CMP_EQ, laIst0, laP, laNull, 0);
+        var laAus: int64 := self.genLabel();
+        self.irAddInstrDirect(IRO_BR_TRUE, -1, laIst0, -1, laAus);
+        var la8: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_CONST_INT, la8, -1, -1, 8);
+        var laK: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_SUB, laK, laP, la8, 0);
+        var laL: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_LOAD_FIELD, laL, laK, 0, 0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, dest, laL, -1, 0);
+        self.irEmitLabel(laAus);
+        return dest;
+      }
     }
     if (self.seq(fname, fnlen, "StrFree", 7)) {
       self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, 0);
@@ -6943,25 +7155,154 @@ pub type IRLower = class {
   // _fieldTypeNodeIn.
   fn structGroesse(typeDecl: int64): int64 {
     if typeDecl < 0 { return 0; }
-    var ende: int64 := 0;
-    var tc: int64 := typeDecl;
-    while tc >= 0 {
-      var offset: int64 := 0;
-      var fd: int64 := self.nodeC0(tc);
-      while fd >= 0 {
-        if (self.nodeIVal(fd) & 1) != 0 {
-          var offNode: int64 := self.nodeC1(fd);
-          if offNode >= 0 {
-            if self.nodeKind(offNode) == NK_LIT_INT { offset := self.nodeIVal(offNode); }
-          }
+    return self._layoutKern(typeDecl, 0 as pchar, 0, 2);   // #2147
+  }
+
+  // #2147: Das Speicherbild eines Typs — EINE Rechnung fuer Feldversatz,
+  // Ende und Groesse. Dieselben Regeln wie cg_buildStructLayout und
+  // cg_classStructSize auf x86 (die muessen uebereinstimmen):
+  //   * eigene Felder beginnen hinter dem Ende der Basis, auf 8 gerundet;
+  //   * `struct` (iVal-Bit 4) ohne @packed: jedes Feld auf seine Breite
+  //     ausgerichtet (int8 1, int16 2, int32/f32 4, sonst 8), Breite =
+  //     Typbreite, die Gesamtgroesse auf die groesste Ausrichtung gerundet;
+  //   * @packed (Bit 0): Typbreite, keine Ausrichtung, keine Rundung;
+  //   * Klasse: acht Byte je Feld;
+  //   * `at(n)` setzt den Versatz ausdruecklich.
+  // Bis 1.2.16C rechnete der IR-Weg ohne Ausrichtung und mit Typbreite auch
+  // in Klassen, und das an vier Stellen (structGroesse, _fieldOffsetIn,
+  // _typeSizeOf, TypeName.feld) — `struct { a: int8; b: int32 }` lag bei 0/1
+  // statt 0/4, und i8/i16/i32 galten als acht Byte breit.
+  // Inline liegende Felder (`[N]T`, Struct-Feld) behaelt der IR-Weg als
+  // Zeiger zu acht Byte — dort weicht er weiter von x86 ab.
+  //   modus 0: Versatz des Feldes fp (-1 = nicht da)
+  //   modus 1: Ende des letzten Feldes (ungerundet, fuer die Ableitung)
+  //   modus 2: Groesse (bei struct auf die Ausrichtung gerundet)
+  fn _layoutKern(typeDecl: int64, fp: pchar, fl: int64, modus: int64): int64 {
+    var off: int64 := 0;
+    var pn: int64 := self.nodeC2(typeDecl);
+    if pn >= 0 {
+      var base: int64 := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn));
+      if base >= 0 {
+        if modus == 0 {
+          var bo: int64 := self._layoutKern(base, fp, fl, 0);
+          if bo >= 0 { return bo; }
         }
-        offset := offset + self.fieldTypeSize(self.nodeC0(fd));
-        if offset > ende { ende := offset; }
-        fd := self.nodeNext(fd);
+        off := self._layoutKern(base, 0 as pchar, 0, 1);
+      } else {
+        // #1985: Basis in einem anderen Modul — ueber das Typverzeichnis.
+        var pg: int64 := self._tregFind(self.nodeSVal(pn), self.nodeSLen(pn));
+        if pg >= 0 {
+          var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+          self.src       := peek64(self._tregSrc + pg * 8) as pchar;
+          self.nodes     := peek64(self._tregNodes + pg * 8);
+          self.nodeCount := peek64(self._tregCnt + pg * 8);
+          var gBase: int64 := peek64(self._tregIdx + pg * 8);
+          var gbo: int64 := 0 - 1;
+          if modus == 0 { gbo := self._layoutKern(gBase, fp, fl, 0); }
+          var gEnde: int64 := self._layoutKern(gBase, 0 as pchar, 0, 1);
+          self.src := sS; self.nodes := sN; self.nodeCount := sC;
+          if gbo >= 0 { return gbo; }
+          off := gEnde;
+        }
       }
-      tc := self.nodeC2(tc);
+    }
+    while (off & 7) != 0 { off := off + 1; }
+    var iv: int64 := self.nodeIVal(typeDecl);
+    var gepackt: int64 := iv & 1;
+    var natAlign: int64 := 0;
+    if ((iv >> 4) & 1) != 0 && gepackt == 0 { natAlign := 1; }
+    var ende: int64 := off;
+    var fd: int64 := self.nodeC0(typeDecl);
+    while fd >= 0 {
+      var w: int64 := 8;
+      if gepackt != 0 || natAlign != 0 { w := self.fieldTypeSize(self.nodeC0(fd)); }
+      var fo: int64 := off;
+      if natAlign != 0 {
+        var a: int64 := w;
+        if a < 1 { a := 1; }
+        if a > 8 { a := 8; }
+        var vor: int64 := fo % a;
+        if vor != 0 { fo := fo + (a - vor); }
+        if a > natAlign { natAlign := a; }
+      }
+      if (self.nodeIVal(fd) & 1) != 0 {
+        var atN: int64 := self.nodeC1(fd);
+        if atN >= 0 && self.nodeKind(atN) == NK_LIT_INT { fo := self.nodeIVal(atN); }
+      }
+      if modus == 0 && self.seq(self.nodeSVal(fd), self.nodeSLen(fd), fp, fl) { return fo; }
+      off := fo + w;
+      if off > ende { ende := off; }
+      fd := self.nodeNext(fd);
+    }
+    if modus == 0 { return 0 - 1; }
+    if modus == 2 && natAlign > 1 {
+      var rest: int64 := ende % natAlign;
+      if rest != 0 { ende := ende + (natAlign - rest); }
     }
     return ende;
+  }
+
+  // #2147: Ist der Typknoten ein WERT-Struct? Dann seine Groesse, sonst 0.
+  // Dieselbe Abgrenzung wie cg_typeIstWertStruct auf x86 (die beiden muessen
+  // uebereinstimmen): `struct` (iVal-Bit 4), keine type-id/VMT, keine Basis.
+  // Eine Klasse bleibt Referenz.
+  fn _wertStructBytes(tn: int64): int64 {
+    if tn < 0 { return 0; }
+    if self.nodeKind(tn) != NK_TYPE_NAME { return 0; }
+    var d: int64 := self._findTypeDecl(self.nodeSVal(tn), self.nodeSLen(tn));
+    if d >= 0 {
+      if (self.nodeIVal(d) & 16) == 0 { return 0; }
+      if self.nodeC2(d) >= 0 { return 0; }
+      if self._hasVmt(d) != 0 { return 0; }
+      return self.structGroesse(d);
+    }
+    var g: int64 := self._tregFind(self.nodeSVal(tn), self.nodeSLen(tn));
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var gd: int64 := peek64(self._tregIdx + g * 8);
+    var r: int64 := 0;
+    if (self.nodeIVal(gd) & 16) != 0 && self.nodeC2(gd) < 0 && self._hasVmt(gd) == 0 { r := self.structGroesse(gd); }
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+
+  // #2147: `bytes` Byte ab src wortweise nach dst kopieren (dst existiert).
+  fn _structKopieNach(dst: int64, src: int64, bytes: int64) {
+    var w: int64 := 0;
+    while w * 8 < bytes {
+      var t: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_LOAD_FIELD, t, src, w * 8, 0);
+      self.irAddInstrDirect(IRO_STORE_FIELD, w * 8, t, dst, 0);
+      w := w + 1;
+    }
+  }
+
+  // #2147: Kopie in frischen Speicher; liefert den neuen Zeiger. Der Speicher
+  // kommt wie bei `var r: TStruct;` (#1835) aus IRO_ALLOC.
+  fn _structKopie(src: int64, bytes: int64): int64 {
+    var szT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, szT, -1, -1, (bytes + 7) / 8 * 8);
+    var dst: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, dst, szT, -1, 0);
+    self._structKopieNach(dst, src, bytes);
+    return dst;
+  }
+
+  // #2147: Zugriffsart eines Feldes fuer LOAD_FIELD/STORE_FIELD (imm):
+  // Breite | (vorzeichenbehaftet << 8); 0 = acht Byte. Dieselbe Breite wie
+  // cg_typeSize, dasselbe Vorzeichen wie cg_typeIsSignedNarrow auf x86 —
+  // auch in Klassen, deren Felder acht Byte BELEGEN: x86 liest und schreibt
+  // dort ebenfalls nur die Typbreite (CG_CFIELD_OFF_FLAGS).
+  fn _feldArtVon(tn: int64): int64 {
+    if tn < 0 { return 0; }
+    if self.nodeKind(tn) != NK_TYPE_NAME { return 0; }
+    var w: int64 := self.fieldTypeSize(tn);
+    if w >= 8 { return 0; }
+    var sa: int64 := _irSchmalArt(self.nodeSVal(tn), self.nodeSLen(tn));
+    var vz: int64 := 0;
+    if sa == 1 || sa == 3 || sa == 5 { vz := 1; }
+    return w | (vz << 8);
   }
 
   fn fieldTypeSize(typeNode: int64): int64 {
@@ -6979,6 +7320,10 @@ pub type IRLower = class {
     if self.seq(tv, tl, "u32",   3) { return 4; }
     if self.seq(tv, tl, "uint32", 6) { return 4; }
     if self.seq(tv, tl, "f32",   3) { return 4; }
+    // #2147: die Kurzformen — cg_typeSize kennt sie seit #1010.
+    if self.seq(tv, tl, "i8",    2) { return 1; }
+    if self.seq(tv, tl, "i16",   3) { return 2; }
+    if self.seq(tv, tl, "i32",   3) { return 4; }
     return 8;
   }
 
@@ -6998,81 +7343,12 @@ pub type IRLower = class {
   // WP-INH-lyxos: geerbte Basis-Felder zuerst (flach vorangestellt, wie ELF cg_buildClassLayout).
   // Basis via extends (c2=NK_TYPE_NAME) inline aufgelöst (keine neue IRLower-Methode — Seed-vtable).
   fn _fieldOffsetIn(typeDecl: int64, fp: pchar, fl: int64): int64 {
-    var off: int64 := 0;
-    var pn: int64 := self.nodeC2(typeDecl);
-    if pn >= 0 {
-      var base: int64 := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn));
-      if base >= 0 {
-        var bo: int64 := self._fieldOffsetIn(base, fp, fl);   // im Basis-Layout suchen
-        if bo >= 0 { return bo; }                             // gefunden → gleicher Offset
-        off := self._typeSizeOf(base);                        // eigene Felder beginnen nach Basis
-      } else {
-        // #1985: Die Basisklasse steht in einem ANDEREN MODUL.
-        //
-        // `_findTypeDecl` sieht nur den gerade gesetzten Modulkontext. Fehlte
-        // die Basis, blieb `off` auf 0 — und damit begannen die EIGENEN Felder
-        // der Ableitung bei null und ueberlagerten die geerbten. Das war kein
-        // "liest 0": gemessen las `Hole()` den Wert des daneben deklarierten
-        // eigenen Feldes, weil beide auf derselben Stelle lagen.
-        //
-        // Weitergesucht wird im REGISTRY-Raum, genau wie _extendsClassG und
-        // seit #1976 auch _resolveMethodIdx es tun: Klasse ueber den Namen
-        // finden, deren Modulkontext setzen, dort weitersuchen. Die drei
-        // Kettenlaeufe muessen uebereinstimmen.
-        var pg: int64 := self._tregFind(self.nodeSVal(pn), self.nodeSLen(pn));
-        if pg >= 0 {
-          var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
-          self.src       := peek64(self._tregSrc + pg * 8) as pchar;
-          self.nodes     := peek64(self._tregNodes + pg * 8);
-          self.nodeCount := peek64(self._tregCnt + pg * 8);
-          var gBase: int64 := peek64(self._tregIdx + pg * 8);
-          var gbo: int64 := self._fieldOffsetIn(gBase, fp, fl);
-          var gsz: int64 := self._typeSizeOf(gBase);
-          self.src := sS; self.nodes := sN; self.nodeCount := sC;
-          if (gbo >= 0) { return gbo; }
-          off := gsz;
-        }
-      }
-    }
-    var fd: int64 := self.nodeC0(typeDecl);
-    while fd >= 0 {
-      if self.seq(self.nodeSVal(fd), self.nodeSLen(fd), fp, fl) { return off; }
-      off := off + self.fieldTypeSize(self.nodeC0(fd));
-      fd := self.nodeNext(fd);
-    }
-    return 0 - 1;
+    return self._layoutKern(typeDecl, fp, fl, 0);   // #2147
   }
 
   // ARM64-OOP: Gesamtgröße (Summe Feld-Größen inkl. geerbter Basis-Felder) eines NK_TYPE_DECL.
   fn _typeSizeOf(typeDecl: int64): int64 {
-    var sz: int64 := 0;
-    var pn: int64 := self.nodeC2(typeDecl);
-    if pn >= 0 {
-      var base: int64 := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn));
-      if base >= 0 { sz := sz + self._typeSizeOf(base); }    // WP-INH-lyxos: Basis-Felder mitzählen
-      else {
-        // #1985: dieselbe Modulgrenze wie in _fieldOffsetIn. Wurde die Basis
-        // hier nicht gezaehlt, war das Objekt ZU KLEIN — und der Versatz der
-        // eigenen Felder entsprechend falsch. Die beiden Funktionen muessen
-        // dieselbe Kette laufen, sonst rechnen sie mit verschiedenen Layouts.
-        var pg2: int64 := self._tregFind(self.nodeSVal(pn), self.nodeSLen(pn));
-        if pg2 >= 0 {
-          var sS2: pchar := self.src; var sN2: int64 := self.nodes; var sC2: int64 := self.nodeCount;
-          self.src       := peek64(self._tregSrc + pg2 * 8) as pchar;
-          self.nodes     := peek64(self._tregNodes + pg2 * 8);
-          self.nodeCount := peek64(self._tregCnt + pg2 * 8);
-          var g2: int64 := self._typeSizeOf(peek64(self._tregIdx + pg2 * 8));
-          self.src := sS2; self.nodes := sN2; self.nodeCount := sC2;
-          sz := sz + g2;
-        }
-      }
-    }
-    var fd: int64 := self.nodeC0(typeDecl);
-    while fd >= 0 {
-      sz := sz + self.fieldTypeSize(self.nodeC0(fd));
-      fd := self.nodeNext(fd);
-    }
-    return sz;
+    return self._layoutKern(typeDecl, 0 as pchar, 0, 2);   // #2147
   }
 
   // ARM64-OOP: type-name-Node eines Locals per Name (-1 wenn nicht local/kein Typ).
@@ -7220,12 +7496,16 @@ pub type IRLower = class {
   // ARM64-OOP: Feld-Offset für Instanz-Zugriff baseNode.fieldName (-1 falls unauflösbar).
   // WP-VMT-lyxos: +8 wenn die Klasse eine VMT hat (type-id @ Offset 0).
   fn _instanceFieldOffset(baseNode: int64, fp: pchar, fl: int64): int64 {
+    self.letzteFeldArt := 0;   // #2147
     // Fast-Path same-module/self: lokales decl direkt (kein Registry-Scan/ctx-Swap) — der
     // häufigste Fall (self.field). _baseClassDecl löst self→curMethodClassType O(1).
     var decl: int64 := self._baseClassDecl(baseNode);
     if decl >= 0 {
       var off: int64 := self._fieldOffsetIn(decl, fp, fl);
-      if off >= 0 { if self._hasVmt(decl) != 0 { off := off + 8; } }
+      if off >= 0 {
+        if self._hasVmt(decl) != 0 { off := off + 8; }
+        self.letzteFeldArt := self._feldArtVon(self._fieldTypeNodeIn(decl, fp, fl));
+      }
       return off;
     }
     // WP-XMOD-OOP: IMPORTIERTE Klasse (decl<0) → globales Registry (Offset im Definitionsmodul).
@@ -7241,7 +7521,15 @@ pub type IRLower = class {
     }
     if g < 0 { return 0 - 1; }
     var offg: int64 := self._tregFieldOffG(g, fp, fl);
-    if offg >= 0 { if self._tregHasVmtG(g) != 0 { offg := offg + 8; } }
+    if offg >= 0 {
+      if self._tregHasVmtG(g) != 0 { offg := offg + 8; }
+      // Zugriffsart im Kontext der deklarierenden Unit (#2147).
+      var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+      self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+      var ga: int64 := self._feldArtVon(self._fieldTypeNodeIn(peek64(self._tregIdx + g * 8), fp, fl));
+      self.src := sS; self.nodes := sN; self.nodeCount := sC;
+      self.letzteFeldArt := ga;
+    }
     return offg;
   }
 
@@ -7757,24 +8045,11 @@ pub type IRLower = class {
       while ti < self.nodeCount {
         if self.nodeKind(ti) == NK_TYPE_DECL {
           if self.seq(self.nodeSVal(ti), self.nodeSLen(ti), bSVal, bSLen) {
-            var offset: int64 := 0;
-            var fd: int64 := self.nodeC0(ti);
-            while fd >= 0 {
-              // Explicit at(offset) override (iVal bit0 = FIELD_FLAG_PACKED_OFFSET)
-              if (self.nodeIVal(fd) & 1) != 0 {
-                var offNode: int64 := self.nodeC1(fd);
-                if offNode >= 0 {
-                  if self.nodeKind(offNode) == NK_LIT_INT {
-                    offset := self.nodeIVal(offNode);
-                  }
-                }
-              }
-              if self.seq(self.nodeSVal(fd), self.nodeSLen(fd), fSVal, fSLen) {
-                self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, offset);
-                return dest;
-              }
-              offset := offset + self.fieldTypeSize(self.nodeC0(fd));
-              fd := self.nodeNext(fd);
+            // #2147: dieselbe Rechnung wie jeder andere Feldzugriff.
+            var tfOff: int64 := self._layoutKern(ti, fSVal, fSLen, 0);
+            if tfOff >= 0 {
+              self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, tfOff);
+              return dest;
             }
           }
         }
@@ -7811,9 +8086,10 @@ pub type IRLower = class {
         if self._findFuncByName(mrM as pchar, mrL) >= 0 { return self._lowerMethodRef(expr); }
       }
     }
+    var ifArt: int64 := self.letzteFeldArt;   // #2147 — vor lowerExpr, das sie ueberschreiben kann
     var base: int64 := self.lowerExpr(baseNode);
     if ifOff >= 0 {
-      self.irAddInstrDirect(IRO_LOAD_FIELD, dest, base, ifOff, 0);
+      self.irAddInstrDirect(IRO_LOAD_FIELD, dest, base, ifOff, ifArt);
     } else if self.genSubstN > 0 {
       // #2125: In einer Spezialisierung hat das Typargument kein solches
       // Feld (oder ist keine Klasse). Seit #2143 steht T immer fuer einen
@@ -8211,6 +8487,13 @@ pub type IRLower = class {
         // #2139: auf die deklarierte Breite kuerzen, bevor der Wert im
         // 64-Bit-Slot landet (x86: cg_emitNarrowRax, #1151).
         vdTemp := self._schmalKuerzen(vdTemp, self._genSubst(self.nodeC0(stmt)));
+        // #2147: `var q: Pt := p` legt eine KOPIE an (x86: #1351). Nicht bei
+        // einem Cast (`puffer as S` liest den Speicher als S) und nicht bei
+        // `new` (frischer Speicher) — dieselben Ausnahmen wie auf x86.
+        var vdWs: int64 := self._wertStructBytes(self._genSubst(self.nodeC0(stmt)));
+        if vdWs > 0 && self.nodeKind(vdInit) != NK_CAST && self.nodeKind(vdInit) != NK_NEW {
+          vdTemp := self._structKopie(vdTemp, vdWs);
+        }
         self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdTemp, -1, 0);
       } else {
         // ARM64-FIX: `var a: [N]T` ohne Init → Heap-Storage allozieren, vdSlot = Pointer
@@ -8912,7 +9195,9 @@ pub type IRLower = class {
         retTemp := self.lowerExpr(retVal);
         // #2139: Rueckgabe an einen schmalen Typ kuerzen (x86:
         // curFnRetNarrow, #1151).
-        if self.curFunc >= 0 && self.nodeKind(self.curFunc) == NK_FUNC_DECL {
+        // #2147: auch im Lambda (NK_CLOSURE, Rueckgabetyp ebenfalls in c1) —
+        // bis 1.2.16C lieferte `fn(x: int64): int8 { return x; }` 300 statt 44.
+        if self.curFunc >= 0 && (self.nodeKind(self.curFunc) == NK_FUNC_DECL || self.nodeKind(self.curFunc) == NK_CLOSURE) {
           retTemp := self._schmalKuerzen(retTemp, self._genSubst(self.nodeC1(self.curFunc)));
         }
       }
@@ -8963,6 +9248,16 @@ pub type IRLower = class {
           // Erfassung oder Modulvariable; _localTypeNode kennt alle vier
           // (wie cg_narrowKindOfVar auf x86, #1151).
           valTemp := self._schmalKuerzen(valTemp, self._localTypeNode(idName, idLen));
+          // #2147: `q := p` bei einem Wert-Struct kopiert den INHALT in den
+          // Speicher, den q schon hat (x86: cg_emitStructKopieNach, #1351) —
+          // statt q auf p umzubiegen. Ein Cast oder `new` rechts ist keine
+          // Kopie (wie bei der Deklaration).
+          var asWs: int64 := self._wertStructBytes(self._localTypeNode(idName, idLen));
+          if asWs > 0 && self.nodeKind(val) != NK_CAST && self.nodeKind(val) != NK_NEW {
+            var asDst: int64 := self.lowerExpr(target);
+            self._structKopieNach(asDst, valTemp, asWs);
+            return;
+          }
           var idPtrL: int64 := (idName) as int64;
           var slot:   int64 := 0 - 1;
           var lnI:    int64 := self.localNameCnt - 1;
@@ -9054,6 +9349,15 @@ pub type IRLower = class {
             }
             if asgFound >= 0 {
               self.irAddInstrDirect(IRO_STORE_GLOBAL, asgFound, valTemp, -1, 0);
+            } else {
+              // #2147: weder Local, Parameter, Erfassung noch Modulvariable im
+              // Verzeichnis — bis 1.2.16C entfiel der Store hier STILL, die
+              // Zuweisung hatte keine Wirkung. Laut, wie ein unbekannter Name
+              // beim Lesen.
+              EPrintStr("lyxc: IR-Weg: Zuweisung an '"c);
+              sys_write(2, idPtrL, idLen);
+              EPrintStrLn("' — der Name ist weder Local, Parameter noch Modulvariable (#2147)."c);
+              exit(1);
             }
           }
         }
@@ -9068,7 +9372,9 @@ pub type IRLower = class {
           var afFat: int64 := self._lowerMethodRef(val);
           self.irAddInstrDirect(IRO_STORE_FIELD, afOff, afFat, afBase, 0);
         } else if (afOff >= 0) {
-          self.irAddInstrDirect(IRO_STORE_FIELD, afOff, valTemp, afBase, 0);
+          // #2147: mit der Breite des Feldes — ein int8-Feld bekommt ein Byte,
+          // nicht acht (das ueberschrieb die Nachbarfelder).
+          self.irAddInstrDirect(IRO_STORE_FIELD, afOff, valTemp, afBase, self.letzteFeldArt);
         } else if (self.genSubstN > 0) {
           // #2125: dieselbe Pruefung wie beim Lesen in lowerField — die
           // beiden muessen uebereinstimmen. Sonst entfiele die Zuweisung still.
@@ -9380,6 +9686,20 @@ pub type IRLower = class {
           self.irAddInstrDirect(IRO_LOAD_LOCAL, npT, npSl, -1, 0);
           var npK: int64 := self._schmalKuerzen(npT, npTy);
           self.irAddInstrDirect(IRO_STORE_LOCAL, npSl, npK, -1, 0);
+        }
+        // #2147: Struct-Parameter sind WERTE (x86: #1528, Kopie beim Eintritt).
+        // Bis 1.2.16C reichte der IR-Weg den Zeiger des Aufrufers durch —
+        // `p.x := 50` im Rumpf aenderte p beim Aufrufer. `ref` schliesst die
+        // Kopie aus, wie auf x86.
+        if (self.nodeIVal(npP) & PARAM_FLAG_REF) == 0 {
+          var npWs: int64 := self._wertStructBytes(npTy);
+          if npWs > 0 {
+            var npWSl: int64 := IR_BARG_SLOTS + npI + self.methodParamBase;
+            var npWT: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_LOAD_LOCAL, npWT, npWSl, -1, 0);
+            var npWK: int64 := self._structKopie(npWT, npWs);
+            self.irAddInstrDirect(IRO_STORE_LOCAL, npWSl, npWK, -1, 0);
+          }
         }
         npI += 1;
       }
@@ -11590,14 +11910,9 @@ pub type IRLower = class {
     return exnTemp;
   }
   
-  // panic(msg) builtin
-  fn lowerPanic(expr: int64): int64 {
-    var msgTemp: int64 := self.lowerExpr(self.nodeC0(expr));
-    
-    // Emit: write msg to stderr
-    // Emit: exit(1)
-    return msgTemp;
-  }
+  // #2151: Hier stand ein zweites lowerPanic (Huelle mit "Emit:"-Kommentaren,
+  // nie erreicht — das erste galt). Die Anweisungsform steht in lowerPanic
+  // weiter oben, die Aufrufform in lowerCall.
   
   // ============================================================================
   // #2108: Closures und Lambdas im IR-Weg (arm64, riscv, lyxos, ...)
@@ -12855,21 +13170,10 @@ pub type IRLower = class {
     return 0 - 1;
   }
 
-  // Typ-Node eines Feldes in typeDecl, geerbte Felder eingeschlossen.
-  fn _fieldTypeNodeIn(typeDecl: int64, fp: pchar, fl: int64): int64 {
-    var tc: int64 := typeDecl;
-    while tc >= 0 {
-      var fd: int64 := self.nodeC0(tc);
-      while fd >= 0 {
-        if self.seq(self.nodeSVal(fd), self.nodeSLen(fd), fp, fl) { return self.nodeC0(fd); }
-        fd := self.nodeNext(fd);
-      }
-      var pn: int64 := self.nodeC2(tc);
-      if pn >= 0 { tc := self._findTypeDecl(self.nodeSVal(pn), self.nodeSLen(pn)); }
-      else { tc := 0 - 1; }
-    }
-    return 0 - 1;
-  }
+  // #2151: Hier stand eine zweite Methode _fieldTypeNodeIn (eigene Felder
+  // zuerst, dann die Basis) — derselbe Name wie die bei _typeNodeIsMethod
+  // (Basis zuerst). Welche ein Aufruf traf, entschied die Reihenfolge im
+  // Methodenverzeichnis. Es gibt nur noch die eine.
 
   // Rueckgabetyp-Node einer Methode von typeDecl (NK_FUNC_DECL.c1), geerbte
   // eingeschlossen.

@@ -180,7 +180,31 @@ if baue "$TMP/lib.lyx" "$TMP/w/lib.so" --target=x86_64 --shared --debug; then
   if echo "$ph" | grep -q "GNU_EH_FRAME"; then ok "PT_GNU_EH_FRAME vorhanden"; else nok "PT_GNU_EH_FRAME fehlt"; fi
   fr="$(readelf --debug-dump=frames "$TMP/w/lib.so" 2>&1)"
   nfde=$(echo "$fr" | grep -c " FDE cie=")
-  ntab=$(echo "$fr" | sed -n 's/.*Entries in search table: \(0x[0-9a-f]*\).*/\1/p')
+  # Die Zahl der Eintraege direkt aus .eh_frame_hdr lesen, nicht aus der
+  # readelf-Ausgabe: "Entries in search table" druckt erst ein neueres
+  # binutils (lokal 2.46 ja, die CI mit Ubuntu-binutils nicht) — dort war die
+  # Pruefung seit #2135 rot, obwohl die Datei stimmte.
+  ntab=$(python3 - "$TMP/w/lib.so" <<'PY'
+import sys, struct
+d = open(sys.argv[1], 'rb').read()
+shoff, = struct.unpack_from('<Q', d, 0x28)
+shentsize, shnum, shstrndx = struct.unpack_from('<HHH', d, 0x3A)
+def sh(i):
+    return struct.unpack_from('<IIQQQQIIQQ', d, shoff + i * shentsize)
+stroff = sh(shstrndx)[4]
+for i in range(shnum):
+    h = sh(i)
+    nm = d[stroff + h[0]:d.index(b'\0', stroff + h[0])]
+    if nm == b'.eh_frame_hdr':
+        o = h[4]
+        ver, pe, ce, te = d[o], d[o+1], d[o+2], d[o+3]
+        groesse = {0x03: 4, 0x0b: 4, 0x04: 8, 0x0c: 8, 0x02: 2, 0x0a: 2}
+        o += 4 + groesse[pe & 0x0f]
+        n = int.from_bytes(d[o:o + groesse[ce & 0x0f]], 'little')
+        print(n)
+        break
+PY
+)
   if [ "$nfde" -ge 8 ] && [ $((ntab)) -eq "$nfde" ] && ! echo "$fr" | grep -qiE "warn|error|fehler"; then
     ok ".eh_frame lesbar: $nfde FDE, Suchtabelle $((ntab)) Eintraege, keine Warnung"
   else nok ".eh_frame: $nfde FDE, Suchtabelle '${ntab}', Warnungen: $(echo "$fr" | grep -ciE 'warn|error')"; fi
