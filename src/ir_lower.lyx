@@ -6219,6 +6219,17 @@ pub type IRLower = class {
       return self._opKlassenAufruf(self.nodeC0(expr), self.nodeC1(expr), ixIdx);
     }
     var simd: int64 := self._isSimdExpr(self.nodeC0(expr));
+    // #2131: `s[i]` auf einem pchar ist das BYTE i — wie auf x86 (movzx aus
+    // [rax+rbx]). Bis 1.2.15A lief es durch IRO_LOAD_IDX, also 8 Byte ab
+    // s+8i: "HELLO"[1] lieferte Muell statt 69.
+    if simd == 0 && self._indexBasisArt(self.nodeC0(expr)) == 1 {
+      var pcAdr: int64 := self._pcharElemAdr(expr);
+      var pcB: int64 := self.tempCount; var pcR: int64 := 0; while pcR < 4 { self.allocTemp(); pcR := pcR + 1; }
+      var pcDest: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_STORE_LOCAL, pcB, pcAdr, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, pcDest, pcB, -1, 200);   // peek8
+      return pcDest;
+    }
     var base: int64 := self.lowerExpr(self.nodeC0(expr));
     var idx: int64 := self.lowerExpr(self.nodeC1(expr));
     var dest: int64 := self.allocTemp();
@@ -6232,7 +6243,43 @@ pub type IRLower = class {
     self.irAddInstrDirect(IRO_LOAD_IDX, dest, base, idx, 0);
     return dest;
   }
-  
+
+  // #2131: Was fuer eine Basis hat ein Indexzugriff? 1 = pchar (das
+  // Literal und alles, dessen statischer Typ `pchar` heisst: Local,
+  // Parameter, Modulvariable, Feld, Cast, Aufruf — _exprTypeNode),
+  // 2 = ein SKALAR ohne Elemente (int64, bool, char ...), 0 = sonst (Array,
+  // Klasse, unbestimmt). Dieselbe Frage stellt der x86-Weg mit
+  // cg_isPcharExpr bzw. seinem lauten Restzweig, sema mit _checkIndexBase —
+  // die drei muessen uebereinstimmen.
+  fn _indexBasisArt(nd: int64): int64 {
+    if nd < 0 { return 0; }
+    if self.nodeKind(nd) == NK_LIT_STR { return 1; }
+    var tn: int64 := self._exprTypeNode(nd);
+    if tn < 0 { return 0; }
+    if self.nodeKind(tn) != NK_TYPE_NAME { return 0; }
+    var art: int64 := self._artVonTypname(self.nodeSVal(tn), self.nodeSLen(tn));
+    if art == 1 { return 1; }
+    if art == 0 {
+      // Skalar — laut, wie sema es fuer Bezeichner schon tut. Hier kommen
+      // die Faelle an, deren Typ sema nicht kennt (Feld, Methodenaufruf).
+      EPrintStr("error: #2131: Indexzugriff auf einen Skalar ohne Elemente — Byte: peek8(p + i), Wort: peek64(p + i * 8); Typ "c);
+      sys_write(2, self.nodeSVal(tn) as int64, self.nodeSLen(tn));
+      EPrintStrLn(""c);
+      exit(1);
+    }
+    return 0;
+  }
+
+  // #2131: Adresse des Elements `s[i]` eines pchar: s + i, Schrittweite 1.
+  // Gemeinsam fuer Lesen (lowerIndex) und Schreiben (lowerAssign).
+  fn _pcharElemAdr(indexNode: int64): int64 {
+    var b: int64 := self.lowerExpr(self.nodeC0(indexNode));
+    var i: int64 := self.lowerExpr(self.nodeC1(indexNode));
+    var a: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, a, b, i, 0);
+    return a;
+  }
+
   // ------------------------------------------------------------------
   // Field Access Lowering
   // ------------------------------------------------------------------
@@ -8158,6 +8205,18 @@ pub type IRLower = class {
       }
       // Target is INDEX — store to array element. ARM64-FIX: war Stub.
       // IRO_STORE_IDX: src1=value, src2=base, dest=idx (emitStoreIdx: STR value,[base,idx,LSL#3]).
+      else if (self.nodeKind(target) == NK_INDEX
+               && self._isSimdExpr(self.nodeC0(target)) == 0
+               && self._indexBasisArt(self.nodeC0(target)) == 1) {
+        // #2131: `s[i] := b` auf einem pchar schreibt EIN Byte an s+i —
+        // spiegelbildlich zum Lesen in lowerIndex (dort peek8, hier poke8).
+        var pwAdr: int64 := self._pcharElemAdr(target);
+        var pwB: int64 := self.tempCount; var pwR: int64 := 0; while pwR < 4 { self.allocTemp(); pwR := pwR + 1; }
+        var pwDest: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_STORE_LOCAL, pwB, pwAdr, -1, 0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, pwB + 1, valTemp, -1, 0);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, pwDest, pwB, -1, 203);   // poke8
+      }
       else if (self.nodeKind(target) == NK_INDEX) {
         var aiSimd: int64 := self._isSimdExpr(self.nodeC0(target));
         var aiBase: int64 := self.lowerExpr(self.nodeC0(target));
