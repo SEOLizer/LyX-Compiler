@@ -4701,6 +4701,38 @@ pub type IRLower = class {
       if skA >= 0 { var skT: int64 := self.lowerExpr(skA); self.irAddInstrDirect(IRO_STORE_LOCAL, 2, skT, -1, 0); }
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 24); return dest;
     }
+    // #2156: Pfad-Metadaten auf den LINUX-Zielen des IR-Wegs (arm64, riscv).
+    // Die Zweige darunter (IDs 25, 26, 40, 229, 230) sind LyxOS-Aufrufe; auf
+    // arm64/riscv meldeten sie "Builtin-ID … wird im Linux-Zweig nicht
+    // behandelt". Die generische Linux-ABI hat nur die *at-Formen — dirfd =
+    // AT_FDCWD (-100) wie bei access → faccessat (#2024), lstat mit
+    // AT_SYMLINK_NOFOLLOW (0x100). x86 ruft stat/lstat/readlink direkt.
+    if (self._zielIstLyxos() == 0 && self._irVerdecktBuiltin(fname, fnlen) == 0) {
+      if (self.seq(fname, fnlen, "stat", 4) || self.seq(fname, fnlen, "sys_stat", 8)) {
+        return self._lscAt(LSC_NEWFSTATAT, arg0, dest, 2, 0);
+      }
+      if (self.seq(fname, fnlen, "lstat", 5) || self.seq(fname, fnlen, "sys_lstat", 9)) {
+        return self._lscAt(LSC_NEWFSTATAT, arg0, dest, 2, 256);
+      }
+      if (self.seq(fname, fnlen, "sys_newfstatat", 14)) { return self._lscRuf(LSC_NEWFSTATAT, arg0, dest); }
+      if (self.seq(fname, fnlen, "readlink", 8) || self.seq(fname, fnlen, "sys_readlink", 12)) {
+        return self._lscAt(LSC_READLINKAT, arg0, dest, 3, 0 - 1);
+      }
+      if (self.seq(fname, fnlen, "sys_readlinkat", 14)) { return self._lscRuf(LSC_READLINKAT, arg0, dest); }
+      if (self.seq(fname, fnlen, "sys_fstat", 9)) { return self._lscRuf(LSC_FSTAT, arg0, dest); }
+      if (self.seq(fname, fnlen, "symlink", 7)) {
+        // symlinkat(ziel, newdirfd, link) — dirfd steht in der MITTE.
+        var slB: int64 := self.tempCount;
+        var slR: int64 := 0;
+        while slR < 3 { self.allocTemp(); slR := slR + 1; }
+        var slA: int64 := arg0;
+        if slA >= 0 { var slT: int64 := self.lowerExpr(slA); self.irAddInstrDirect(IRO_STORE_LOCAL, slB, slT, -1, 0); slA := self.nodeNext(slA); }
+        self._lscKonst(slB + 1, 0 - 100);
+        if slA >= 0 { var slT2: int64 := self.lowerExpr(slA); self.irAddInstrDirect(IRO_STORE_LOCAL, slB + 2, slT2, -1, 0); }
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, slB, -1, LSC_SYMLINKAT);
+        return dest;
+      }
+    }
     if (self.seq(fname, fnlen, "sys_stat", 8)) {
       var stA: int64 := arg0;
       if stA >= 0 { var stT: int64 := self.lowerExpr(stA); self.irAddInstrDirect(IRO_STORE_LOCAL, 0, stT, -1, 0); stA := self.nodeNext(stA); }
@@ -6858,7 +6890,8 @@ pub type IRLower = class {
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, fxB, -1, fxId); return dest;
     }
     // stat(path,out) / lstat(path,out) → sys_stat(AT_CWD=-1, path, out, flags) — id 229.
-    if (self.seq(fname, fnlen, "stat", 4) || self.seq(fname, fnlen, "lstat", 5)) {
+    // #2156: sys_lstat ist auf LyxOS dasselbe wie lstat.
+    if (self.seq(fname, fnlen, "stat", 4) || self.seq(fname, fnlen, "lstat", 5) || self.seq(fname, fnlen, "sys_lstat", 9)) {
       var stB: int64 := self.tempCount; var stR: int64 := 0; while stR < 4 { self.allocTemp(); stR := stR + 1; }
       var stCwd: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_CONST_INT, stCwd, -1, -1, -1);  // AT_CWD = -1
@@ -6868,7 +6901,7 @@ pub type IRLower = class {
       if stA >= 0 { var t: int64 := self.lowerExpr(stA); self.irAddInstrDirect(IRO_STORE_LOCAL, stB + 2, t, -1, 0); }
       var stFlags: int64 := self.allocTemp();
       var stFv: int64 := 0;
-      if self.seq(fname, fnlen, "lstat", 5) { stFv := 1; }      // STAT_NOFOLLOW
+      if self.seq(fname, fnlen, "lstat", 5) || self.seq(fname, fnlen, "sys_lstat", 9) { stFv := 1; }      // STAT_NOFOLLOW
       self.irAddInstrDirect(IRO_CONST_INT, stFlags, -1, -1, stFv);
       self.irAddInstrDirect(IRO_STORE_LOCAL, stB + 3, stFlags, -1, 0);
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, stB, -1, 229); return dest;
@@ -14247,6 +14280,27 @@ pub type IRLower = class {
       i := i + 1;
     }
     self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, b, -1, LSC_FACCESSAT);
+    return dest;
+  }
+
+  // #2156: *at-Aufruf mit dirfd = AT_FDCWD vorn, dann `n` Argumente des
+  // Aufrufers, dann (falls flags >= 0) ein festes Flag — dieselbe Bauart wie
+  // _lscAccess. flags = -1: kein Flag-Argument (readlinkat hat keins).
+  fn _lscAt(id: int64, arg0: int64, dest: int64, n: int64, flags: int64): int64 {
+    var b: int64 := self.tempCount;
+    var r: int64 := 0;
+    while r < 4 { self.allocTemp(); r := r + 1; }
+    self._lscKonst(b, 0 - 100);
+    var a: int64 := arg0;
+    var i: int64 := 0;
+    while (a >= 0 && i < n) {
+      var t: int64 := self.lowerExpr(a);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, b + 1 + i, t, -1, 0);
+      a := self.nodeNext(a);
+      i := i + 1;
+    }
+    if flags >= 0 { self._lscKonst(b + 1 + n, flags); }
+    self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, b, -1, id);
     return dest;
   }
 

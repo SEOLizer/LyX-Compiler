@@ -478,3 +478,7 @@ der eingesetzte Wert steht jeweils fest.
 | 542 | Linux-Syscall epoll_pwait (Nr. 6) | `sys_epoll_pwait` | #2021 |
 | 543 | Linux-Syscall getpgid (Nr. 1) | `sys_getpgid` | #2021 |
 | 546 | Linux-Syscall mmap (Nr. 222, sechs Argumente) | `mmap` | #2122; nur arm64/android-arm64/riscv, LyxOS behaelt IRO_ALLOC; ausserhalb LSC_MIN..LSC_MAX, die Backends fragen `IstLinuxSys` |
+| 547 | Linux-Syscall newfstatat (Nr. 79) | `stat`, `sys_stat`, `lstat`, `sys_lstat`, `sys_newfstatat` | #2156; nur arm64/riscv (generische ABI ohne stat/lstat), dirfd AT_FDCWD, lstat mit AT_SYMLINK_NOFOLLOW |
+| 548 | Linux-Syscall readlinkat (Nr. 78) | `readlink`, `sys_readlink`, `sys_readlinkat` | #2156; nur arm64/riscv, dirfd AT_FDCWD |
+| 549 | Linux-Syscall symlinkat (Nr. 36) | `symlink` | #2156; nur arm64/riscv, newdirfd AT_FDCWD |
+| 550 | Linux-Syscall fstat (Nr. 80) | `sys_fstat` | #2156; nur arm64/riscv |

@@ -200,6 +200,11 @@ con CG_H_MAP_NEW:    int64 := 990;
 con CG_H_MAP_SET:    int64 := 1096;   // #2150: Eintritte aus GNU as, siehe cg_emitHelpers
 con CG_H_MAP_GET:    int64 := 1106;
 con CG_H_MAP_HAS:    int64 := 1119;
+// #2154: Nur win64 (msAbi): Ausgabe mit Laenge (rdi = Text, rsi = Laenge).
+// Liegt im int3-Rest hinter dem oom-Pfad der Map-Laufzeit; der win64-Ruecken
+// legt dort win_print_strn ab (win_x86.lyx, WIN_H_PRINTSTRN — die beiden
+// muessen uebereinstimmen). Auf Linux wird die Stelle nie gerufen.
+con CG_H_WIN_PRINTSTRN: int64 := 1210;
 con CG_H_STACK_FAIL:   int64 := 1275;  // WP-18: __lyx_stack_fail handler (70 bytes)
 con CG_H_CANARY_INIT: int64 := 1345;  // WP-18: __lyx_canary_init handler (27 bytes)
 // #1284: Vorschalter vor _lyx_f64_to_str (NaN, unendlich, nicht darstellbar).
@@ -12827,6 +12832,20 @@ pub type Codegen = class {
         cur := self.cg_nnext(cur);
         continue;
       }
+      // #2154: dasselbe fuer win64 — ueber win_print_strn (WriteFile mit der
+      // Literallaenge) statt _lyx_print_str, das am ersten Nullbyte endet.
+      // Kein roher Syscall (tests/win64_syscalls_test.sh), sondern ein Aufruf
+      // in den Helferbereich.
+      if (isStderr == 0 && self.msAbi != 0 && self.cg_nkind(cur) == CGN_LIT_STR) {
+        var wlOff: int64 := self.cg_addStr(self.cg_nsoff(cur), self.cg_nslen(cur));
+        var wlLen: int64 := self.dataLen - wlOff - 1;
+        self.cg_emitLeaRdiData(wlOff);
+        self.cg_e8(0xBE); self.cg_e32(wlLen);                      // mov esi, laenge
+        var wlPp: int64 := self.cg_emitCall();
+        poke32(self.code + wlPp, CG_H_WIN_PRINTSTRN - wlPp - 4);
+        cur := self.cg_nnext(cur);
+        continue;
+      }
       var pt: int64 := self.cg_inferPrintType(cur);
       self.cg_genExpr(cur);
       // mov rdi, rax
@@ -15691,8 +15710,10 @@ pub type Codegen = class {
       self.cg_movRaxImm(4);
       self.cg_e8(0x0F); self.cg_e8(0x05);
 
-    } else if (self.cg_seq(fname, fnlen, "lstat", 5)) {
+    } else if (self.cg_seq(fname, fnlen, "lstat", 5) ||
+               self.cg_seq(fname, fnlen, "sys_lstat", 9)) {
       // lstat(path, statbuf): syscall 6 — rdi=path, rsi=statbuf (does not follow symlinks)
+      // #2156: sys_lstat ist dieselbe Funktion (wie stat/sys_stat).
       self.cg_movRaxImm(6);
       self.cg_e8(0x0F); self.cg_e8(0x05);
 
@@ -15701,9 +15722,26 @@ pub type Codegen = class {
       self.cg_movRaxImm(88);
       self.cg_e8(0x0F); self.cg_e8(0x05);
 
-    } else if (self.cg_seq(fname, fnlen, "readlink", 8)) {
+    } else if (self.cg_seq(fname, fnlen, "readlink", 8) ||
+               self.cg_seq(fname, fnlen, "sys_readlink", 12)) {
       // readlink(path, buf, bufsiz): syscall 89 — rdi=path, rsi=buf, rdx=bufsiz
+      // #2156: sys_readlink kannte sema seit jeher, der Codegen nicht ("no
+      // codegen implementation found").
       self.cg_movRaxImm(89);
+      self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    } else if (self.cg_seq(fname, fnlen, "sys_readlinkat", 14)) {
+      // #2156: readlinkat(dirfd, path, buf, bufsiz): syscall 267. Das vierte
+      // Argument liegt in rcx, der Kernel liest r10 (wie mmap).
+      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xCA);  // mov r10, rcx
+      self.cg_movRaxImm(267);
+      self.cg_e8(0x0F); self.cg_e8(0x05);
+
+    } else if (self.cg_seq(fname, fnlen, "sys_newfstatat", 14)) {
+      // #2156: newfstatat(dirfd, path, statbuf, flags): syscall 262 —
+      // flags AT_SYMLINK_NOFOLLOW (0x100) ist lstat. Viertes Argument in r10.
+      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xCA);  // mov r10, rcx
+      self.cg_movRaxImm(262);
       self.cg_e8(0x0F); self.cg_e8(0x05);
 
     } else if (self.cg_seq(fname, fnlen, "memcpy", 6) ||
@@ -22324,6 +22362,12 @@ pub type Codegen = class {
     self.cg_e8(0xBF); self.cg_e8(0x01); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov edi,0x1
     self.cg_e8(0xB8); self.cg_e8(0xE7); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax,0xe7
     self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall
+    // #2154: ab CG_H_WIN_PRINTSTRN legt der win64-Ruecken eigenen Code ab —
+    // der Linux-Teil muss davor enden.
+    if (self.codeLen > CG_H_WIN_PRINTSTRN) {
+      EPrintStrLn("codegen error: Map-oom reicht in CG_H_WIN_PRINTSTRN hinein (#2154)"c);
+      exit(1);
+    }
     // Rest bis __lyx_stack_fail mit int3 fuellen.
     while (self.codeLen < CG_H_STACK_FAIL) { self.cg_e8(0xCC); }
     if (self.codeLen != CG_H_STACK_FAIL) {

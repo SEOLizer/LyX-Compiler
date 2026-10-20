@@ -54,6 +54,7 @@ con WIN_H_MAP_NEW:    int64 := 990;
 con WIN_H_MAP_SET:    int64 := 1037;
 con WIN_H_MAP_GET:    int64 := 1130;
 con WIN_H_MAP_HAS:    int64 := 1202;
+con WIN_H_PRINTSTRN:  int64 := 1210;   // #2154: = CG_H_WIN_PRINTSTRN, Ausgabe mit Laenge
 con WIN_H_STACK_FAIL: int64 := 1275;
 con WIN_H_CANARY_INIT: int64 := 1345;
 con WIN_H_USER:       int64 := 1372;
@@ -180,6 +181,9 @@ pub type WinX86Backend = class {
 
   // #1678: Offset des `call [VirtualFree]` im Freigabe-Helfer (-1 = keiner).
   vfreeCallOff:    int64;
+  // #2154: Offsets der beiden IAT-Aufrufe in win_print_strn (-1 = keiner).
+  psnGhCallOff:    int64;
+  psnWfCallOff:    int64;
 
   // ------------------------------------------------------------------
   // Code buffer primitives
@@ -333,6 +337,38 @@ pub type WinX86Backend = class {
     // ret                                           1 byte   [67]
     self.wxb_ce8(0xC3);
     // Total: 68 bytes (WIN_PS_OFF=0..67) ✓
+  }
+
+  // #2154: win_print_strn — wie win_print_str_impl, aber die LAENGE kommt
+  // mit (RDI = Text, RSI = Laenge) statt bis zum ersten Nullbyte gezaehlt zu
+  // werden. Gebraucht von Print("...") mit einem Literal: dort steht die
+  // Laenge zur Uebersetzungszeit fest, und `Print("ab\0cd")` gibt alle fuenf
+  // Bytes aus (wie der SysV-Weg seit #2141). rsi und rdi sind im Windows-ABI
+  // nicht fluechtig — GetStdHandle laesst beide stehen.
+  // Liegt im Trampolinbereich bei WIN_H_PRINTSTRN (frei: dort stehen auf
+  // Linux nur int3 hinter dem oom-Pfad der Map-Laufzeit).
+  fn wxb_emitPrintStrN() {
+    var start: int64 := self.codeLen;
+    self.wxb_ce8(0x57);                                                                      // push rdi
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x40);          // sub rsp, 0x40
+    self.wxb_ce8(0xB9); self.wxb_ce8(0xF5); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF); self.wxb_ce8(0xFF);  // mov ecx, -11
+    self.psnGhCallOff := self.codeLen;
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);                                // call [GetStdHandle]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC1);                              // mov rcx, rax (Handle)
+    self.wxb_ce8(0x49); self.wxb_ce8(0x89); self.wxb_ce8(0xF0);                              // mov r8, rsi  (Laenge)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xFA);                              // mov rdx, rdi (Text)
+    self.wxb_ce8(0x31); self.wxb_ce8(0xC0);                                                  // xor eax, eax
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0x44); self.wxb_ce8(0x24); self.wxb_ce8(0x20);  // mov [rsp+32], rax
+    self.wxb_ce8(0x4C); self.wxb_ce8(0x8D); self.wxb_ce8(0x4C); self.wxb_ce8(0x24); self.wxb_ce8(0x28);  // lea r9, [rsp+40]
+    self.psnWfCallOff := self.codeLen;
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);                                // call [WriteFile]
+    self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC4); self.wxb_ce8(0x40);          // add rsp, 0x40
+    self.wxb_ce8(0x5F);                                                                      // pop rdi
+    self.wxb_ce8(0xC3);                                                                      // ret
+    if (self.codeLen - start > WIN_H_STACK_FAIL - WIN_H_PRINTSTRN) {
+      EPrintStrLn("win64: win_print_strn ragt ueber den Stack-Fail-Eintritt (#2154)"c);
+      exit(1);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -905,6 +941,11 @@ pub type WinX86Backend = class {
     }
 
     // #1678: VirtualFree-Aufruf im Freigabe-Helfer.
+    // #2154: win_print_strn
+    if (self.psnGhCallOff >= 0) {
+      self.wxb_patch32(self.psnGhCallOff + 2, ghRVA - (textBase + self.psnGhCallOff + 6));
+      self.wxb_patch32(self.psnWfCallOff + 2, wfRVA - (textBase + self.psnWfCallOff + 6));
+    }
     if (self.vfreeCallOff >= 0) {
       var rvaF: int64 := vfRVA - (textBase + self.vfreeCallOff + 6);
       self.wxb_patch32(self.vfreeCallOff + 2, rvaF);
@@ -976,6 +1017,9 @@ pub type WinX86Backend = class {
     self.wxb_padTo(zoneStart, WIN_H_MAP_SET);     self.wxb_ce8(0xC3);
     self.wxb_padTo(zoneStart, WIN_H_MAP_GET);     self.wxb_ce8(0xC3);
     self.wxb_padTo(zoneStart, WIN_H_MAP_HAS);     self.wxb_ce8(0xC3);
+    // #2154: Ausgabe mit bekannter Laenge — direkt hier, nicht im Vorspann
+    // (dessen Groesse traegt die festen Offsets oben).
+    self.wxb_padTo(zoneStart, WIN_H_PRINTSTRN);   self.wxb_emitPrintStrN();
     self.wxb_padTo(zoneStart, WIN_H_STACK_FAIL);  self.wxb_ce8(0xC3);
     self.wxb_padTo(zoneStart, WIN_H_CANARY_INIT); self.wxb_ce8(0xC3);
     // Pad remainder so user code starts exactly at WIN_H_USER (= CG_H_USER).
@@ -1789,6 +1833,8 @@ pub type WinX86Backend = class {
     self.relocContentLen := 0;
     self.vallocCallOff   := 0 - 1;
     self.vfreeCallOff    := 0 - 1;
+    self.psnGhCallOff    := 0 - 1;
+    self.psnWfCallOff    := 0 - 1;
     self.argcStoreOff    := 0 - 1;
     self.argvStoreOff    := 0 - 1;
     self.envStoreOff     := 0 - 1;   // #1677
