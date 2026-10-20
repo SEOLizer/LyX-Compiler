@@ -16,6 +16,7 @@ import src.security.capability_resolver;
 import src.security.cap_graph;
 import src.security.ffi_validator;
 import src.security.cap_stripper;
+import src.lyu_reader;   // #2014: Deklarationen einer .lyu (LyrDeklText/LyrDeklHat)
 
 // ============================================================================
 // Symbol kinds
@@ -1872,7 +1873,11 @@ pub type Sema = class {
   }
 
   // WP-BC-50b: inline .lyu binary parser — injects symbols without parsing source
-  fn _sema_parseLyuSyms(data: pchar, size: int64) {
+  // #2014: nurUnbeschrieben != 0 — Symbole, die ein Deklarationseintrag der
+  // .lyu beschreibt, werden hier NICHT eingetragen. Sie kommen ueber den
+  // Deklarationstext mit Signatur bzw. Feldern herein; ein zusaetzlicher
+  // Eintrag ohne Knoten (TY_USER, -2) wuerde den richtigen verdecken.
+  fn _sema_parseLyuSyms(data: pchar, size: int64, rdr: LyuReader, nurUnbeschrieben: int64) {
     if (size < 10) { return; }
     // Validate magic 'LYU'
     if ((StrCharAt(data, 0) & 255) != 76) { return; }
@@ -1952,7 +1957,9 @@ pub type Sema = class {
       if (tiLen == 7 && (StrCharAt(tiPtr, 0) & 255) == 102 && (StrCharAt(tiPtr, 1) & 255) == 108 && (StrCharAt(tiPtr, 5) & 255) == 54) { typeId := TY_FLOAT64; }  // "float64"
       if (tiLen == 4 && (StrCharAt(tiPtr, 0) & 255) == 99)  { typeId := TY_CHAR; }   // "char"
       if (typeId == TY_UNKNOWN) { typeId := TY_USER; }
-      self._pushSym(namePtr, nameLen, symKind, typeId, -2);
+      var beschrieben: bool := false;
+      if (nurUnbeschrieben != 0) { beschrieben := rdr.LyrDeklHat(namePtr, nameLen); }
+      if (!beschrieben) { self._pushSym(namePtr, nameLen, symKind, typeId, -2); }
       si += 1;
     }
   }
@@ -2211,6 +2218,7 @@ pub type Sema = class {
       // #1237: nur fuer .lyx — eine .lyu ist binaer und traegt keine Quelle.
       self._sema_checkUnitName(src, StrLen(src), modName, modLen);
     }
+    var semaAusLyu: int64 := 0;   // #2014: 1 = Text aus den Deklarationen einer .lyu
     if (src == 0 as pchar) {
       // WP-BC-50b: .lyx not found — try .lyu fallback (pre-compiled unit)
       StrSetChar(pathBuf as pchar, modLen + 3, 117);  // 'x' → 'u' → ".lyu"
@@ -2277,9 +2285,28 @@ pub type Sema = class {
           EPrintStrLn(self.lastReadPath as pchar);
         }
         var lyuSize: int64 := self.lastReadSize;
-        self._sema_parseLyuSyms(lyuSrc, lyuSize);
-        return;
+        // #2014 Stufen 2–4: Traegt die .lyu Deklarationen, wird aus ihnen ein
+        // Text in Lyx-Schreibweise, und der laeuft durch DENSELBEN Weg wie
+        // eine Quelle (Pass1 traegt Signaturen, Felder, Methoden ein) — nur
+        // ohne Pass2, denn Rumpfe gibt es keine. Damit gelten Stelligkeit,
+        // unbekanntes Feld und Typidentitaet (TPunkt statt "user") auch ohne
+        // die .lyx. Bis 1.2.16A war genau das fail-open: jedes Symbol kam als
+        // TY_USER ohne Knoten herein, und nichts liess sich pruefen.
+        var sdR: LyuReader := new LyuReader();
+        var sdTxt: int64 := 0;
+        var sdLB: int64 := alloc(8);
+        poke64(sdLB, 0);
+        if (sdR.LyrInit(lyuSrc as int64, lyuSize)) { sdTxt := sdR.LyrDeklText(sdLB); }
+        if (sdTxt == 0) {
+          self._sema_parseLyuSyms(lyuSrc, lyuSize, sdR, 0);
+          return;
+        }
+        self._sema_parseLyuSyms(lyuSrc, lyuSize, sdR, 1);
+        src := sdTxt as pchar;
+        semaAusLyu := 1;
       }
+    }
+    if (src == 0 as pchar) {
       // Weder .lyx noch .lyu gefunden. Vorher kehrte die Funktion hier
       // kommentarlos zurück: der Import verschwand, und der Fehler tauchte erst
       // an der ERSTEN NUTZUNG als "undefined function" auf — was nach einem
@@ -2304,6 +2331,7 @@ pub type Sema = class {
 
     var p: Parser := new Parser();
     p.Init(src, StrLen(src));
+    if (semaAusLyu != 0) { p.lyuDekl := 1; }   // #2014: rumpflose Methoden erlaubt
     var head: int64 := p.Parse();
     if (p.hadError != 0) {
       PrintStr("sema error: parse error in imported module '"c);
@@ -2549,7 +2577,8 @@ pub type Sema = class {
     self.ffiTrusted := isStd;
 
     // BUG-3: type-check function bodies in imported module
-    self.Pass2(head);
+    // #2014: Deklarationen aus einer .lyu haben keine Rumpfe — nichts zu pruefen.
+    if (semaAusLyu == 0) { self.Pass2(head); }
 
     self.ffiTrusted := savedTrust;
     self.src       := savedSrc;

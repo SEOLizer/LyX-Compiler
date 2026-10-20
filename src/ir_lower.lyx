@@ -9,6 +9,7 @@ import src.parser;
 import src.std.alloc;
 import src.wildcard_import;   // #1736: IncludePfadTeil
 import src.backend.linux_syscalls;   // #2021: LSC_* + Nummern/Stelligkeit
+import src.lyu_reader;   // #2014: Deklarationen einer .lyu (LyrDeklText, Layoutabgleich)
 
 // AST node field offsets (node size = 88 bytes)
 con NODE_OFF_C0:     int64 := 8;
@@ -967,6 +968,11 @@ pub type IRLower = class {
   impLstName:    int64;   // #2076: Importname je Eintrag (Zeiger), 0 fuer das Hauptmodul
   impLstNameLen: int64;
   impLstN:     int64;
+  // #2014 Stufen 2–4: 1 je Eintrag, der aus den DEKLARATIONEN einer .lyu
+  // erzeugt wurde (LyuReader.LyrDeklText). Er traegt Typen und Signaturen fuer
+  // die Nachschlagewege (Registry, Rueckgabetypen, Felder), aber keine Rumpfe —
+  // deren Code kam als IR aus derselben .lyu. Der Nachlauf lowert ihn nicht.
+  impLstNurDekl: int64;
   // Ein Byte je funcBuffer-Index: 1 = wird gebraucht. Gesetzt beim Lowern
   // eines Aufrufs, gelesen beim Entscheiden, ob ein importierter Rumpf
   // ueberhaupt entstehen muss.
@@ -1179,6 +1185,7 @@ pub type IRLower = class {
     self.modSeenN := 0; self.modSeenUsed := 0;
     self.impLstSrc := 0; self.impLstNodes := 0; self.impLstCnt := 0;
     self.impLstHead := 0; self.impLstN := 0;
+    self.impLstNurDekl := 0;   // #2014
     self.wantCap := 1024;
     self.wantBuf := alloc(self.wantCap);
     self.doneCap := 1024;
@@ -1814,6 +1821,16 @@ pub type IRLower = class {
         var gnIdx: int64 := self._irGlobalIdx(idPtrL, idLen);
         if gnIdx >= 0 {
           self.irAddInstrDirect(IRO_LOAD_GLOBAL, dest, gnIdx, -1, 0);
+          return dest;
+        }
+        // #2014: oeffentliche Ganzzahlkonstante einer importierten Unit, die
+        // NICHT gelowert wird — die Deklarationen einer .lyu (impLstNurDekl).
+        // Eine Quell-Unit legt ihre Konstanten beim Lowern als Global an
+        // (oben gefunden); die Faltung kennt sie alle laengst ueber
+        // irPubConTab (#2107). Hier fehlte genau diese zweite Stelle.
+        var pcIdx: int64 := self._irPubConFind(idPtrL, idLen);
+        if pcIdx >= 0 {
+          self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, peek64(self.irPubConTab + pcIdx * 24 + 16));
           return dest;
         }
         // #2127: Enum-Element ohne Typpraefix (`Rot`, `tkEof`). Auf x86 steht
@@ -6448,6 +6465,12 @@ pub type IRLower = class {
       if arg0 >= 0 {
         var szDecl: int64 := self._findTypeDecl(self.nodeSVal(arg0), self.nodeSLen(arg0));
         if szDecl >= 0 { var ts: int64 := self._typeSizeOf(szDecl); if ts > 0 { szf := ts; } }
+        else {
+          // #2014: Typ aus einem anderen Modul (oder einer .lyu) — dieselbe
+          // Rechnung im Kontext seines Moduls statt still 8.
+          var szG: int64 := self._tregFind(self.nodeSVal(arg0), self.nodeSLen(arg0));
+          if szG >= 0 { var tsg: int64 := self._tregSizeG(szG); if tsg > 0 { szf := tsg; } }
+        }
       }
       self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, szf); return dest;
     }
@@ -7286,6 +7309,119 @@ pub type IRLower = class {
     self.src := sS; self.nodes := sN; self.nodeCount := sC;
     return r;
   }
+  // #2014: Groesse einer STRUKTUR aus einem anderen Modul (oder einer .lyu),
+  // wie `var r: TStruct;` sie belegt; 0, wenn g keine Struktur ist. Dieselbe
+  // Rechnung wie im eigenen Modul (structGroesse) — nur im Kontext von g.
+  fn _tregStructGroesseG(g: int64): int64 {
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+    var d: int64 := peek64(self._tregIdx + g * 8);
+    var r: int64 := 0;
+    if (self.nodeIVal(d) & 16) != 0 { r := self.structGroesse(d); }
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+
+  // #2014 Stufen 3/4: Layout eines Typs des AKTUELLEN Modulkontexts fuer die
+  // .lyu und fuer den Abgleich beim Lesen. Dieselben Rechnungen wie beim
+  // Uebersetzen — eine Struktur so gross wie `var r: T` (structGroesse), eine
+  // Klasse so gross wie `new T()` (lowerNew: Felder + 8 mit VMT), Felder wie
+  // _instanceFieldOffset (+8 mit VMT).
+  //   box[0] = Groesse, box[1] = 1 bei Typwort auf Offset 0. 0 = unbekannt.
+  pub fn IrLyuTyp(np: pchar, nl: int64, box: int64): int64 {
+    var d: int64 := self._findTypeDecl(np, nl);
+    if d < 0 { return 0; }
+    var vmt: int64 := 0;
+    var sz: int64 := 0;
+    if (self.nodeIVal(d) & 16) != 0 {
+      sz := self.structGroesse(d);
+    } else {
+      vmt := self._hasVmt(d);
+      sz := self._typeSizeOf(d);
+      if vmt != 0 { sz := sz + 8; }
+    }
+    poke64(box, sz);
+    poke64(box + 8, vmt);
+    return 1;
+  }
+  //   box[0] = Offset im Objekt, box[1] = Breite. 0 = Feld unbekannt.
+  pub fn IrLyuFeld(tp: pchar, tl: int64, fp: pchar, fl: int64, box: int64): int64 {
+    var d: int64 := self._findTypeDecl(tp, tl);
+    if d < 0 { return 0; }
+    var off: int64 := self._fieldOffsetIn(d, fp, fl);
+    if off < 0 { return 0; }
+    if (self.nodeIVal(d) & 16) == 0 { if self._hasVmt(d) != 0 { off := off + 8; } }
+    var ftn: int64 := self._fieldTypeNodeIn(d, fp, fl);
+    poke64(box, off);
+    poke64(box + 8, self.fieldTypeSize(ftn));
+    return 1;
+  }
+
+  // #2014: Layouts einer .lyu gegen die EIGENE Rechnung pruefen. Die Datei
+  // nennt Groesse, Typwort-Flag und Feld-Offsets so, wie das Backend des
+  // Erzeugers sie hatte. Weichen sie ab — eine .lyu fuer x86 auf einem IR-Ziel
+  // (x86 legt jede Klasse ab +8 an, der IR-Weg nur Klassen mit VMT), oder ein
+  // Compiler mit anderen Layoutregeln —, waere jeder Feldzugriff im IR der
+  // .lyu auf einer anderen Stelle als im Programm. Das wird gemeldet, nicht
+  // uebernommen: es fiele sonst erst am laufenden Programm auf.
+  fn _irLyuPruefe(buf: int64, sz: int64) {
+    var r: LyuReader := new LyuReader();
+    if !r.LyrInit(buf, sz) { return; }
+    var nb: int64 := alloc(8); var nlb: int64 := alloc(8);
+    var szb: int64 := alloc(8); var vmb: int64 := alloc(8); var nfb: int64 := alloc(8);
+    var fnb: int64 := alloc(8); var fnlb: int64 := alloc(8);
+    var fob: int64 := alloc(8); var fsb: int64 := alloc(8);
+    var box: int64 := alloc(16);
+    var n: int64 := r.LyrTypN();
+    var i: int64 := 0;
+    while i < n {
+      if r.LyrTypInfo(i, nb, nlb, szb, vmb, nfb) {
+        var np: pchar := peek64(nb) as pchar;
+        var nl: int64 := peek64(nlb);
+        var g: int64 := self._tregFind(np, nl);
+        var fehler: int64 := 0;
+        var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+        if g >= 0 {
+          self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
+          if self.IrLyuTyp(np, nl, box) == 0 { fehler := 1; }
+          else {
+            if peek64(box) != peek64(szb) || peek64(box + 8) != peek64(vmb) { fehler := 2; }
+            var fi: int64 := 0;
+            while fi < peek64(nfb) && fehler == 0 {
+              if r.LyrTypFeld(i, fi, fnb, fnlb, fob, fsb) {
+                if self.IrLyuFeld(np, nl, peek64(fnb) as pchar, peek64(fnlb), box) == 0 { fehler := 3; }
+                else if peek64(box) != peek64(fob) || peek64(box + 8) != peek64(fsb) { fehler := 3; }
+              }
+              fi := fi + 1;
+            }
+          }
+        } else { fehler := 1; }
+        self.src := sS; self.nodes := sN; self.nodeCount := sC;
+        if fehler != 0 {
+          EPrintStr("error: .lyu: Layout von '"c);
+          sys_write(2, np as int64, nl);
+          if fehler == 1 { EPrintStrLn("' ist nach dem Lesen nicht bestimmbar"c); }
+          else if fehler == 2 {
+            EPrintStr("' weicht ab: Datei Groesse "c); EPrintStr(IntToStr(peek64(szb)));
+            EPrintStr(" Typwort "c); EPrintStr(IntToStr(peek64(vmb)));
+            EPrintStr(", dieses Ziel Groesse "c); EPrintStr(IntToStr(peek64(box)));
+            EPrintStr(" Typwort "c); EPrintStrLn(IntToStr(peek64(box + 8)));
+          } else {
+            EPrintStr("' weicht ab im Feld '"c);
+            sys_write(2, peek64(fnb), peek64(fnlb));
+            EPrintStr("': Datei Offset "c); EPrintStr(IntToStr(peek64(fob)));
+            EPrintStr(", dieses Ziel "c); EPrintStrLn(IntToStr(peek64(box)));
+          }
+          EPrintStrLn("  Die .lyu wurde fuer ein Backend mit anderem Layout gebaut — fuer dieses Ziel"c);
+          EPrintStrLn("  neu uebersetzen: lyxc --compile-unit --target=<ziel> (#2014)."c);
+          exit(1);
+        }
+      }
+      i := i + 1;
+    }
+  }
+
   fn _tregHasVmtG(g: int64): int64 {
     if g < 0 { return 0; }
     var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
@@ -7861,15 +7997,21 @@ pub type IRLower = class {
         }
         else if vdType >= 0 {
           var vdSd: int64 := self._typeNodeToDecl(vdType);
+          var vdGr: int64 := 0;
           if vdSd >= 0 {
-            if (self.nodeIVal(vdSd) & 16) != 0 {
-              var vdGr: int64 := self.structGroesse(vdSd);
-              if vdGr > 0 {
-                var vdStTemp: int64 := self.allocTemp();
-                self.irAddInstrDirect(IRO_CONST_INT, vdStTemp, -1, -1, vdGr);
-                self.irAddInstrDirect(IRO_ALLOC, vdSlot, vdStTemp, -1, 0);
-              }
-            }
+            if (self.nodeIVal(vdSd) & 16) != 0 { vdGr := self.structGroesse(vdSd); }
+          } else if self.nodeKind(vdType) == NK_TYPE_NAME {
+            // #2014: Die Struktur steht in einem ANDEREN Modul (oder nur in
+            // einer .lyu). _typeNodeToDecl sieht nur das eigene; der Slot
+            // blieb dann ohne Speicher, und `r.x := 1` schrieb an die Adresse,
+            // die zufaellig darin stand — SIGSEGV auf arm64, auch MIT Quelle.
+            // Dieselbe Modulgrenze wie #1985/#1998, hier noch offen.
+            vdGr := self._tregStructGroesseG(self._tregFind(self.nodeSVal(vdType), self.nodeSLen(vdType)));
+          }
+          if vdGr > 0 {
+            var vdStTemp: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_CONST_INT, vdStTemp, -1, -1, vdGr);
+            self.irAddInstrDirect(IRO_ALLOC, vdSlot, vdStTemp, -1, 0);
           }
         }
       }
@@ -9137,6 +9279,9 @@ pub type IRLower = class {
       var wlHead:  int64 := alloc(WLCAP * 8);
       var wlName:  int64 := alloc(WLCAP * 8);   // #2076: Importname je Eintrag
       var wlNameL: int64 := alloc(WLCAP * 8);
+      var wlNurDekl: int64 := alloc(WLCAP * 8);  // #2014: 1 = aus einer .lyu erzeugt
+      var dkPruef:   int64 := alloc(WLCAP * 16); // #2014: (Puffer, Groesse) je .lyu mit Deklarationen
+      var dkPruefN:  int64 := 0;
       var wlW: int64 := 0; var wlR: int64 := 0;
       // Visited-Pfade (Dedup): Bytes + (off,len)-Paare.
       var visBuf:  int64 := alloc(256 * 1024);
@@ -9146,6 +9291,7 @@ pub type IRLower = class {
       poke64(wlSrc, self.src as int64); poke64(wlNodes, self.nodes);
       poke64(wlCnt, self.nodeCount);    poke64(wlHead, decls);
       poke64(wlName, 0); poke64(wlNameL, 0);    // das Hauptmodul hat keine Unit-Kennung
+      poke64(wlNurDekl, 0);
       wlW := 1;
       while wlR < wlW {
         var mSrc:   int64 := peek64(wlSrc + wlR * 8);
@@ -9218,6 +9364,43 @@ pub type IRLower = class {
                     self._irLyuNachlese(nlFnVor, 0);   // #2136: Anfangswerte der .lyu
                   }
                 }
+                // #2014 Stufen 2–4: Traegt die .lyu Deklarationen, werden sie
+                // als eigener Eintrag der Importliste eingereiht — ohne Rumpfe.
+                // Damit finden die Nachschlagewege (Registry, Feld-Offsets,
+                // Rueckgabetypen, Methoden) die Typen der Unit wie bei einer
+                // Quelle; den Code liefert das IR von eben. Unabhaengig davon,
+                // ob das IR genommen wurde: die Typen gelten auch ohne Code.
+                if (nlBuf != 0 && nlSz > 0 && wlW < WLCAP) {
+                  var dkR: LyuReader := new LyuReader();
+                  if (dkR.LyrInit(nlBuf, nlSz)) {
+                    var dkLB: int64 := alloc(8);
+                    var dkTxt: int64 := dkR.LyrDeklText(dkLB);
+                    if (dkTxt != 0) {
+                      var dkP: Parser := new Parser();
+                      dkP.Init(dkTxt as pchar, peek64(dkLB));
+                      dkP.lyuDekl := 1;
+                      var dkH: int64 := dkP.Parse();
+                      if (dkP.hadError != 0) {
+                        // Der Text stammt aus dem Leser, nicht vom Nutzer —
+                        // ein Parsefehler ist ein Defekt der Datei oder des
+                        // Lesers und wird nicht uebergangen.
+                        EPrintStr("lyxc: .lyu: Deklarationen nicht lesbar: "c);
+                        sys_write(2, nmP as int64, nmL);
+                        EPrintStrLn(""c);
+                        exit(1);
+                      }
+                      poke64(wlSrc + wlW * 8, dkP.src as int64); poke64(wlNodes + wlW * 8, dkP.nodes);
+                      poke64(wlCnt + wlW * 8, dkP.nodeCount);    poke64(wlHead + wlW * 8, dkH);
+                      poke64(wlName + wlW * 8, nmP as int64);    poke64(wlNameL + wlW * 8, nmL);
+                      poke64(wlNurDekl + wlW * 8, 1);
+                      wlW += 1;
+                      poke64(dkPruef + dkPruefN * 16, nlBuf);
+                      poke64(dkPruef + dkPruefN * 16 + 8, nlSz);
+                      dkPruefN := dkPruefN + 1;
+                    }
+                    free(dkLB, 8);
+                  }
+                }
                 if (nlOk == 0) {
                   var wb: int64 := alloc(nmL + 1);
                   var wI: int64 := 0;
@@ -9283,6 +9466,7 @@ pub type IRLower = class {
                     poke64(wlSrc + wlW * 8, ip.src as int64); poke64(wlNodes + wlW * 8, ip.nodes);
                     poke64(wlCnt + wlW * 8, ip.nodeCount);    poke64(wlHead + wlW * 8, ih);
                     poke64(wlName + wlW * 8, nmP as int64);   poke64(wlNameL + wlW * 8, nmL);
+                    poke64(wlNurDekl + wlW * 8, 0);
                     wlW += 1;
                   }
                 }
@@ -9299,6 +9483,15 @@ pub type IRLower = class {
       self.impLstCnt := wlCnt; self.impLstHead := wlHead;
       self.impLstName := wlName; self.impLstNameLen := wlNameL;   // #2076
       self.impLstN   := wlW;
+      self.impLstNurDekl := wlNurDekl;   // #2014
+      // #2014: Layouts der .lyu gegen die eigene Rechnung — erst JETZT, wenn
+      // alle Typen registriert sind (eine Basisklasse kann aus einer spaeter
+      // eingereihten Unit stammen).
+      var dkPi: int64 := 0;
+      while dkPi < dkPruefN {
+        self._irLyuPruefe(peek64(dkPruef + dkPi * 16), peek64(dkPruef + dkPi * 16 + 8));
+        dkPi := dkPi + 1;
+      }
       self._irPubConSammle();   // #2107
       self._irEnumSammle();     // #2127: nach den Konstanten — ein Elementwert darf eine nennen
       // #2123: Braucht IRGENDEINE Unit einen Anfangswert zur Laufzeit? Das
@@ -9844,13 +10037,19 @@ pub type IRLower = class {
         self._nochGelowert := 0;
         var nlI: int64 := 1;                       // 0 ist das Hauptmodul
         while nlI < self.impLstN {
-          self.src       := peek64(self.impLstSrc + nlI * 8) as pchar;
-          self.nodes     := peek64(self.impLstNodes + nlI * 8);
-          self.nodeCount := peek64(self.impLstCnt + nlI * 8);
-          var nlHead: int64 := peek64(self.impLstHead + nlI * 8);
-          self.irUnitTag    := peek64(self.impLstName + nlI * 8);       // #2076
-          self.irUnitTagLen := peek64(self.impLstNameLen + nlI * 8);
-          self.lowerModule(nlHead);
+          // #2014: ein Eintrag aus den Deklarationen einer .lyu hat keine
+          // Rumpfe, die hier entstehen koennten — ihr Code ist das IR der .lyu.
+          var nlNurDekl: int64 := 0;
+          if self.impLstNurDekl != 0 { nlNurDekl := peek64(self.impLstNurDekl + nlI * 8); }
+          if nlNurDekl == 0 {
+            self.src       := peek64(self.impLstSrc + nlI * 8) as pchar;
+            self.nodes     := peek64(self.impLstNodes + nlI * 8);
+            self.nodeCount := peek64(self.impLstCnt + nlI * 8);
+            var nlHead: int64 := peek64(self.impLstHead + nlI * 8);
+            self.irUnitTag    := peek64(self.impLstName + nlI * 8);       // #2076
+            self.irUnitTagLen := peek64(self.impLstNameLen + nlI * 8);
+            self.lowerModule(nlHead);
+          }
           nlI := nlI + 1;
         }
         // #2125: was der Nachlauf an Spezialisierungen angefordert hat;

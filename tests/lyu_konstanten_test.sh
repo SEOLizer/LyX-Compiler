@@ -150,7 +150,9 @@ mv "$TMP/f/bib/mitfn.lyx" "$TMP/mitfn.weg"
 if ( cd "$TMP/f" && timeout 120 "$LYXC" --std-path="$ROOT" haupt.lyx -o hx ) >"$TMP/hx.log" 2>&1; then
   nok "eine Unit MIT Funktion ging ohne Quelle durch — der Code fehlt, das Ergebnis waere still falsch"
 else
-  if grep -q "Quelle der importierten Unit nicht lesbar" "$TMP/hx.log"; then
+  # #2014: die Funktion ist jetzt beschrieben; abgewiesen wird ihr AUFRUF,
+  # weil der x86-Code fehlt (Stufe 5).
+  if grep -q "stammt aus einer .lyu ohne Objektcode" "$TMP/hx.log" && [ ! -f "$TMP/f/hx" ]; then
     ok "Unit mit Funktion wird ohne Quelle weiterhin abgewiesen (Code fehlt, Stufe 5)"
   else
     nok "abgewiesen, aber mit anderer Begruendung: $(grep -m1 -E 'error' "$TMP/hx.log")"

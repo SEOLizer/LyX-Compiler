@@ -85,7 +85,9 @@ fi
 rm -f "$TMP/demo/mathe.lyx" "$TMP/prog2"
 if ( cd / && timeout 120 "$LYXC" --std-path="$ROOT" --include-path="$TMP" "$TMP/prog.lyx" -o "$TMP/prog2" ) >"$TMP/b2.log" 2>&1; then
     nok "nur .lyu: uebersetzt durch, statt abzubrechen"
-elif ! grep -q "Quelle der importierten Unit nicht lesbar" "$TMP/b2.log"; then
+# #2014: Seit den Stufen 2–4 BESCHREIBT die .lyu die Funktion (Signatur), der
+# Abbruch kommt deshalb am AUFRUF — der x86-Code fehlt bis Stufe 5.
+elif ! grep -q "stammt aus einer .lyu ohne Objektcode" "$TMP/b2.log"; then
     nok "nur .lyu: falsche Meldung ($(grep -v Copyright "$TMP/b2.log" | head -1))"
 elif [ -f "$TMP/prog2" ]; then
     nok "nur .lyu: Abbruch gemeldet, aber ein Erzeugnis liegt trotzdem da"
@@ -94,7 +96,7 @@ else
 fi
 
 # Die Meldung muss den GRUND nennen, sonst sucht der naechste Leser die Unit.
-if grep -q "weder die" "$TMP/b2.log" && grep -q "still als 0" "$TMP/b2.log"; then
+if grep -q "Stufe 5" "$TMP/b2.log" && grep -q "beilegen" "$TMP/b2.log"; then
     ok "die Meldung nennt Ursache und Folge"
 else
     nok "die Meldung erklaert den Fall nicht"

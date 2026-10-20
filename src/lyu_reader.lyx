@@ -43,6 +43,10 @@ pub type LyuReader = class {
   pub konOffset:   int64;   // #2014 Stufe 1: Konstantenwerte
   pub symStart:    int64;   // #2014: Beginn der Symboltabelle
   pub valid:       bool;
+  // #2014 Stufen 2–4: Puffer fuer LyrDeklText
+  tx:    int64;
+  txLen: int64;
+  txCap: int64;
 
   fn _u8(): int64 {
     if (self.pos >= self.size) { return 0; }
@@ -329,6 +333,453 @@ pub type LyuReader = class {
     return alle;
   }
 
+  // ══ #2014 Stufen 2–4: Deklarationen ═══════════════════════════════════
+  //
+  // Aufbau siehe Kopfkommentar in src/lyu_writer.lyx. Der Abschnitt haengt
+  // hinter dem letzten Konstanteneintrag und gilt nur mit Flagbit 16 — eine
+  // aeltere .lyu hat das Bit nicht und wird unveraendert gelesen.
+
+  // Beginn des Deklarationsabschnitts (seine Anzahl), -1 = keiner.
+  fn _dkStart(): int64 {
+    if (!self.valid) { return 0 - 1; }
+    if ((self.flags & 16) == 0) { return 0 - 1; }
+    if (self.konOffset <= 0 || self.konOffset >= self.size) { return 0 - 1; }
+    var merk: int64 := self.pos;
+    self.pos := self.konOffset;
+    var n: int64 := self._u32le();
+    var i: int64 := 0;
+    while (i < n && self.pos < self.size) {
+      var nl: int64 := self._u16le();
+      self.pos := self.pos + nl;
+      var art: int64 := self._u8();
+      if (art == 0) { self.pos := self.pos + 8; }
+      else { var tl: int64 := self._u16le(); self.pos := self.pos + tl; }
+      i := i + 1;
+    }
+    var st: int64 := self.pos;
+    self.pos := merk;
+    if (st + 4 > self.size) { return 0 - 1; }
+    return st;
+  }
+
+  pub fn LyrDeklCount(): int64 {
+    var st: int64 := self._dkStart();
+    if (st < 0) { return 0; }
+    var merk: int64 := self.pos;
+    self.pos := st;
+    var n: int64 := self._u32le();
+    self.pos := merk;
+    // Wie WP-35 bei symCount: eine praeparierte Anzahl darf keine
+    // quadratische Laufzeit ausloesen. Ohne Eintraege gilt die Unit als
+    // nicht beschrieben, und der Verbraucher meldet das Fehlende.
+    if (n > 65536) { return 0; }
+    return n;
+  }
+
+  // Zum i-ten Eintrag springen: pos steht danach hinter dem Namen (am Rumpf).
+  // Liefert die Art, -1 wenn es den Eintrag nicht gibt. Name in die Boxen.
+  fn _dkGeheZu(idx: int64, nmBox: int64, nlBox: int64): int64 {
+    var st: int64 := self._dkStart();
+    if (st < 0) { return 0 - 1; }
+    self.pos := st;
+    var n: int64 := self._u32le();
+    if (idx < 0 || idx >= n) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < n && self.pos < self.size) {
+      var art: int64 := self._u8();
+      var len: int64 := self._u32le();
+      var ende: int64 := self.pos + len;
+      if (i == idx) {
+        var nl: int64 := self._u16le();
+        poke64(nmBox, self.data + self.pos);
+        poke64(nlBox, nl);
+        self.pos := self.pos + nl;
+        return art;
+      }
+      self.pos := ende;   // UEBERSPRINGEN — auch eine unbekannte Art
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  // Steht ein Funktions-, Struct- oder Klasseneintrag dieses Namens darin?
+  // Damit fragt der Verbraucher, ob ein Symbol der Tabelle BESCHRIEBEN ist —
+  // nur dann geht es ohne die Quelle nicht verloren.
+  //
+  // Die KONSTANTEN zaehlen mit, sobald es Deklarationen gibt: LyrDeklText
+  // schreibt sie dann ebenfalls in den Text (der IR-Weg und sema kennen
+  // Konstanten nur ueber Knoten).
+  pub fn LyrDeklHat(np: pchar, nl: int64): bool {
+    var n: int64 := self.LyrDeklCount();
+    if (self._dkStart() < 0) { return false; }   // ohne Flagbit: alte .lyu
+    var merk: int64 := self.pos;
+    var nb: int64 := alloc(8); var lb: int64 := alloc(8);
+    var hat: bool := false;
+    var kb: int64 := alloc(24);
+    var kn: int64 := self.LyrKonCount();
+    var ki: int64 := 0;
+    while (ki < kn && !hat) {
+      if (self.LyrKonAt(ki, nb, lb, kb, kb + 8, kb + 16)) {
+        if (peek64(lb) == nl) {
+          var kp: int64 := peek64(nb);
+          var kg: int64 := 1;
+          var kj: int64 := 0;
+          while (kj < nl) { if (peek8(kp + kj) != peek8((np as int64) + kj)) { kg := 0; } kj := kj + 1; }
+          if (kg != 0) { hat := true; }
+        }
+      }
+      ki := ki + 1;
+    }
+    free(kb, 24);
+    var i: int64 := 0;
+    while (i < n && !hat) {
+      var art: int64 := self._dkGeheZu(i, nb, lb);
+      if (art == 2 || art == 3 || art == 4) {
+        if (peek64(lb) == nl) {
+          var p: int64 := peek64(nb);
+          var gl: int64 := 1;
+          var j: int64 := 0;
+          while (j < nl) { if (peek8(p + j) != peek8((np as int64) + j)) { gl := 0; } j := j + 1; }
+          if (gl != 0) { hat := true; }
+        }
+      }
+      i := i + 1;
+    }
+    free(nb, 8); free(lb, 8);
+    self.pos := merk;
+    return hat;
+  }
+
+  // Anzahl der Struct- und Klasseneintraege (fuer den Layoutabgleich).
+  pub fn LyrTypN(): int64 {
+    var n: int64 := self.LyrDeklCount();
+    var merk: int64 := self.pos;
+    var nb: int64 := alloc(8); var lb: int64 := alloc(8);
+    var k: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+      var art: int64 := self._dkGeheZu(i, nb, lb);
+      if (art == 3 || art == 4) { k := k + 1; }
+      i := i + 1;
+    }
+    free(nb, 8); free(lb, 8);
+    self.pos := merk;
+    return k;
+  }
+
+  // Den t-ten Typeintrag aufsuchen; pos steht danach auf der Feldanzahl.
+  // Liefert die Art (3/4) oder -1.
+  fn _typGeheZu(t: int64, nmBox: int64, nlBox: int64, szBox: int64, vmBox: int64): int64 {
+    var n: int64 := self.LyrDeklCount();
+    var k: int64 := 0;
+    var i: int64 := 0;
+    while (i < n) {
+      var art: int64 := self._dkGeheZu(i, nmBox, nlBox);
+      if (art == 3 || art == 4) {
+        if (k == t) {
+          if (art == 4) {
+            var bl: int64 := self._u16le(); self.pos := self.pos + bl;   // Basis
+            var ni: int64 := self._u16le();
+            var ii: int64 := 0;
+            while (ii < ni) { var il: int64 := self._u16le(); self.pos := self.pos + il; ii := ii + 1; }
+          }
+          poke64(szBox, self._u32le());
+          var fl: int64 := self._u8();
+          if (art == 4) { poke64(vmBox, fl & 1); } else { poke64(vmBox, 0); }
+          return art;
+        }
+        k := k + 1;
+      }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  // t-ter Typ: Name, Groesse, Typwort-Flag (Felder ab +8), Anzahl eigener Felder.
+  pub fn LyrTypInfo(t: int64, nmBox: int64, nlBox: int64, szBox: int64,
+                    vmBox: int64, nfBox: int64): bool {
+    var merk: int64 := self.pos;
+    var art: int64 := self._typGeheZu(t, nmBox, nlBox, szBox, vmBox);
+    if (art < 0) { self.pos := merk; return false; }
+    poke64(nfBox, self._u16le());
+    self.pos := merk;
+    return true;
+  }
+
+  // fi-tes eigenes Feld des t-ten Typs: Name, Offset, Groesse.
+  pub fn LyrTypFeld(t: int64, fi: int64, nmBox: int64, nlBox: int64,
+                    offBox: int64, szBox: int64): bool {
+    var merk: int64 := self.pos;
+    var tmp: int64 := alloc(32);
+    var art: int64 := self._typGeheZu(t, tmp, tmp + 8, tmp + 16, tmp + 24);
+    if (art < 0) { self.pos := merk; return false; }
+    var nf: int64 := self._u16le();
+    if (fi < 0 || fi >= nf) { self.pos := merk; return false; }
+    var i: int64 := 0;
+    while (i < nf) {
+      var nl: int64 := self._u16le();
+      var nOff: int64 := self.pos;
+      self.pos := self.pos + nl;
+      var tl: int64 := self._u16le(); self.pos := self.pos + tl;
+      var off: int64 := self._u32le();
+      var sz: int64 := self._u32le();
+      self._u8();
+      if (i == fi) {
+        poke64(nmBox, self.data + nOff); poke64(nlBox, nl);
+        poke64(offBox, off); poke64(szBox, sz);
+        self.pos := merk;
+        return true;
+      }
+      i := i + 1;
+    }
+    self.pos := merk;
+    return false;
+  }
+
+  // ── Text aus den Deklarationen ───────────────────────────────────────
+  //
+  // Die Verbraucher (sema, x86-Codegen, IR-Weg) loesen Typen und Signaturen
+  // ueber KNOTEN auf. Statt jeder dieser Stellen einen zweiten Weg ueber eine
+  // Tabelle beizubringen, wird aus der Tabelle eine Deklarationsliste in
+  // Lyx-Schreibweise und daraus mit dem gewoehnlichen Parser ein Baum — ohne
+  // jeden Rumpf (Parser.lyuDekl erlaubt die rumpflose Methode). Damit gilt
+  // fuer die .lyu dieselbe Auflösung wie fuer eine Quelle, an EINER Stelle.
+  //
+  // Die Layoutangaben stehen NICHT im Text; der Verbraucher rechnet sie mit
+  // seinen eigenen Regeln aus dem Baum und vergleicht mit der Datei
+  // (LyrTypInfo/LyrTypFeld). Abweichung = Meldung, keine stille Uebernahme.
+  fn _txPut(c: int64) {
+    if (self.txLen + 1 >= self.txCap) {
+      var nc: int64 := self.txCap * 2;
+      if (nc < 1024) { nc := 1024; }
+      var nb: int64 := alloc(nc);
+      if (self.txLen > 0) { memcpy(nb, self.tx, self.txLen); }
+      self.tx := nb;
+      self.txCap := nc;
+    }
+    poke8(self.tx + self.txLen, c);
+    self.txLen := self.txLen + 1;
+  }
+  fn _txStr(p: pchar, l: int64) {
+    var i: int64 := 0;
+    while (i < l) { self._txPut(peek8((p as int64) + i)); i := i + 1; }
+  }
+  fn _txC(s: pchar) { self._txStr(s, StrLen(s)); }
+  fn _txDez(v: int64) {
+    if (v >= 10) { self._txDez(v / 10); }
+    self._txPut(48 + (v % 10));
+  }
+  // Ganzzahl als Quelltext — dieselbe Schreibweise wie LyuWriter._tbWert:
+  // negativ als `(0 - m - 1)`, damit auch der kleinste int64 passt. Die
+  // beiden muessen uebereinstimmen.
+  fn _txWert(v: int64) {
+    if (v >= 0) { self._txDez(v); return; }
+    self._txC("(0 - "c);
+    self._txDez(0 - (v + 1));
+    self._txC(" - 1)"c);
+  }
+  // str aus der Datei unmittelbar in den Text.
+  fn _txDateiStr(): int64 {
+    var l: int64 := self._u16le();
+    self._txStr((self.data + self.pos) as pchar, l);
+    self.pos := self.pos + l;
+    return l;
+  }
+
+  // Parameterliste und Rueckgabetyp ab pos (Signatur, siehe Writer).
+  fn _txSignatur() {
+    var rl: int64 := self._u16le();
+    var rOff: int64 := self.pos;
+    self.pos := self.pos + rl;
+    var np: int64 := self._u16le();
+    self._txPut(40);
+    var i: int64 := 0;
+    while (i < np) {
+      if (i > 0) { self._txC(", "c); }
+      var nl: int64 := self._u16le();
+      var nOff: int64 := self.pos;
+      self.pos := self.pos + nl;
+      var tl: int64 := self._u16le();
+      var tOff: int64 := self.pos;
+      self.pos := self.pos + tl;
+      var pf: int64 := self._u8();
+      if ((pf & 2) != 0) { self._txC("con "c); }
+      if ((pf & 4) != 0) { self._txC("ref "c); }
+      self._txStr((self.data + nOff) as pchar, nl);
+      self._txC(": "c);
+      self._txStr((self.data + tOff) as pchar, tl);
+      if ((pf & 1) != 0) { self._txC(" = "c); self._txDateiStr(); }
+      i := i + 1;
+    }
+    self._txPut(41);
+    self._u8();   // Signatur-Flags (heute 0)
+    if (rl > 0) { self._txC(": "c); self._txStr((self.data + rOff) as pchar, rl); }
+  }
+
+  fn _txSicht(v: int64) {
+    if (v == 1) { self._txC("pub "c); }
+    else if (v == 2) { self._txC("private "c); }
+    else if (v == 3) { self._txC("protected "c); }
+  }
+
+  // Felder ab pos (Anzahl + Eintraege) als Zeilen; istKlasse: Sichtbarkeit.
+  fn _txFelder(istKlasse: int64) {
+    var nf: int64 := self._u16le();
+    var i: int64 := 0;
+    while (i < nf) {
+      var nl: int64 := self._u16le();
+      var nOff: int64 := self.pos;
+      self.pos := self.pos + nl;
+      var tl: int64 := self._u16le();
+      var tOff: int64 := self.pos;
+      self.pos := self.pos + tl;
+      self._u32le(); self._u32le();
+      var ff: int64 := self._u8();
+      self._txC("  "c);
+      if (istKlasse != 0) { self._txSicht((ff >> 4) & 3); }
+      else {
+        if ((ff & 2) != 0) { self._txC("@big_endian "c); }
+        if ((ff & 4) != 0) { self._txC("@little_endian "c); }
+      }
+      self._txStr((self.data + nOff) as pchar, nl);
+      self._txC(": "c);
+      self._txStr((self.data + tOff) as pchar, tl);
+      self._txC(";\n"c);
+      i := i + 1;
+    }
+  }
+
+  // Der ganze Text, nullterminiert. Rueckgabe Zeiger (0 = keine
+  // Deklarationen), Laenge in lenBox.
+  pub fn LyrDeklText(lenBox: int64): int64 {
+    poke64(lenBox, 0);
+    var n: int64 := self.LyrDeklCount();
+    if (self._dkStart() < 0) { return 0; }   // ohne Flagbit: alte .lyu, kein Text
+    var merk: int64 := self.pos;
+    self.tx := 0; self.txLen := 0; self.txCap := 0;
+    var nb: int64 := alloc(8); var lb: int64 := alloc(8);
+    // Zuerst die Konstanten (Stufe 1). Der x86-Codegen traegt sie zwar schon
+    // aus dem Konstantenabschnitt ein, sema und der IR-Weg kennen sie aber
+    // nur ueber Knoten — ohne diese Zeilen war `BREITE` auf arm64 "ohne
+    // bekannte Herkunft".
+    var kb: int64 := alloc(24);
+    var kn: int64 := self.LyrKonCount();
+    var ki: int64 := 0;
+    while (ki < kn) {
+      if (self.LyrKonAt(ki, nb, lb, kb, kb + 8, kb + 16)) {
+        self._txC("pub con "c);
+        self._txStr(peek64(nb) as pchar, peek64(lb));
+        if (peek64(kb) == 0) {
+          self._txC(": int64 := "c);
+          self._txWert(peek64(kb + 8));
+        } else {
+          // Der Text ist aufgeloest gespeichert; hier wieder als Literal.
+          self._txC(": pchar := "c);
+          self._txPut(34);
+          var tp: int64 := peek64(kb + 8);
+          var tl: int64 := peek64(kb + 16);
+          var tj: int64 := 0;
+          while (tj < tl) {
+            var c: int64 := peek8(tp + tj);
+            if (c == 10)      { self._txPut(92); self._txPut(110); }
+            else if (c == 9)  { self._txPut(92); self._txPut(116); }
+            else if (c == 13) { self._txPut(92); self._txPut(114); }
+            else if (c == 92) { self._txPut(92); self._txPut(92); }
+            else if (c == 34) { self._txPut(92); self._txPut(34); }
+            else if (c == 0)  { self._txPut(92); self._txPut(48); }
+            else { self._txPut(c); }
+            tj := tj + 1;
+          }
+          self._txPut(34);
+        }
+        self._txC(";"c);
+        self._txPut(10);
+      }
+      ki := ki + 1;
+    }
+    free(kb, 24);
+    var i: int64 := 0;
+    while (i < n) {
+      var art: int64 := self._dkGeheZu(i, nb, lb);
+      var np: pchar := peek64(nb) as pchar;
+      var nl: int64 := peek64(lb);
+      if (art == 7) {
+        var fl: int64 := self._u8();
+        self._txC("import "c); self._txStr(np, nl);
+        if ((fl & 1) != 0) { self._txC(".*"c); }
+        var al: int64 := self._u16le();
+        if (al > 0) { self._txC(" as "c); self._txStr((self.data + self.pos) as pchar, al); }
+        self.pos := self.pos + al;
+        self._txC(";\n"c);
+      } else if (art == 2) {
+        self._txC("pub fn "c); self._txStr(np, nl);
+        self._txSignatur();
+        // Ohne `;`: auf oberster Ebene nimmt der Parser hinter einer
+        // rumpflosen Funktion kein Semikolon an, und ParseFuncDecl braucht
+        // keines (es liest einen Rumpf nur, wenn `{` folgt).
+        self._txC("\n"c);
+      } else if (art == 3) {
+        self._u32le(); self._u8();
+        self._txC("pub type "c); self._txStr(np, nl); self._txC(" = struct {\n"c);
+        self._txFelder(0);
+        self._txC("};\n"c);
+      } else if (art == 4) {
+        var bl: int64 := self._u16le();
+        var bOff: int64 := self.pos;
+        self.pos := self.pos + bl;
+        var ni: int64 := self._u16le();
+        var iOff: int64 := self.pos;
+        var ii: int64 := 0;
+        while (ii < ni) { var il: int64 := self._u16le(); self.pos := self.pos + il; ii := ii + 1; }
+        self._u32le();
+        var kf: int64 := self._u8();
+        self._txC("pub type "c); self._txStr(np, nl); self._txC(" = "c);
+        if ((kf & 2) != 0) { self._txC("abstract "c); }
+        self._txC("class"c);
+        if (bl > 0) { self._txC(" extends "c); self._txStr((self.data + bOff) as pchar, bl); }
+        if (ni > 0) {
+          self._txC(" implements "c);
+          var merkI: int64 := self.pos;
+          self.pos := iOff;
+          ii := 0;
+          while (ii < ni) { if (ii > 0) { self._txC(", "c); } self._txDateiStr(); ii := ii + 1; }
+          self.pos := merkI;
+        }
+        self._txC(" {\n"c);
+        self._txFelder(1);
+        var nm: int64 := self._u16le();
+        var mi: int64 := 0;
+        while (mi < nm) {
+          var ml: int64 := self._u16le();
+          var mOff: int64 := self.pos;
+          self.pos := self.pos + ml;
+          var mf: int64 := self._u8();
+          self._u16le();   // VMT-Platz: ergibt sich aus der Reihenfolge, s. Writer
+          self._txC("  "c);
+          self._txSicht((mf >> 4) & 3);
+          if ((mf & 64) != 0) { self._txC("static "c); }
+          if ((mf & 8) != 0)      { self._txC("abstract "c); }
+          else if ((mf & 4) != 0) { self._txC("override "c); }
+          else if ((mf & 2) != 0) { self._txC("virtual "c); }
+          self._txC("fn "c);
+          self._txStr((self.data + mOff) as pchar, ml);
+          self._txSignatur();
+          self._txC(";\n"c);
+          mi := mi + 1;
+        }
+        self._txC("};\n"c);
+      }
+      // andere Arten: uebersprungen (_dkGeheZu kennt ihre Laenge)
+      i := i + 1;
+    }
+    free(nb, 8); free(lb, 8);
+    self.pos := merk;
+    if (self.txLen == 0) { return 0; }
+    self._txPut(0);
+    poke64(lenBox, self.txLen - 1);
+    return self.tx;
+  }
+
   pub fn PrintInfo() {
     if (!self.valid) { return; }
     PrintStr("  Version: "c); PrintInt(self.version); PrintStr("\n"c);
@@ -384,6 +835,41 @@ pub type LyuReader = class {
         PrintStr(StrSub(fnPt, 0, fnLen));
         PrintStr("\tZeile "c); PrintInt(line); PrintStr("\n"c);
         d += 1;
+      }
+    }
+
+    // #2014 Stufen 2–4: die Deklarationen — als der Text, den die Verbraucher
+    // daraus erzeugen, und das Layout, gegen das sie ihn pruefen.
+    var dn: int64 := self.LyrDeklCount();
+    if (dn > 0) {
+      PrintStr("  Deklarationen: "c); PrintInt(dn); PrintStr("\n"c);
+      var dlb: int64 := alloc(8);
+      var dtx: int64 := self.LyrDeklText(dlb);
+      if (dtx != 0) { PrintStr(dtx as pchar); }
+      var tn: int64 := self.LyrTypN();
+      var tnb: int64 := alloc(8); var tlb: int64 := alloc(8);
+      var tsb: int64 := alloc(8); var tvb: int64 := alloc(8); var tfb: int64 := alloc(8);
+      var fob: int64 := alloc(8); var fsb: int64 := alloc(8);
+      var t: int64 := 0;
+      while (t < tn) {
+        if (self.LyrTypInfo(t, tnb, tlb, tsb, tvb, tfb)) {
+          PrintStr("  Layout "c);
+          PrintStr(StrSub(peek64(tnb) as pchar, 0, peek64(tlb)));
+          PrintStr(": Groesse "c); PrintInt(peek64(tsb));
+          PrintStr(", Typwort "c); PrintInt(peek64(tvb));
+          var fi: int64 := 0;
+          while (fi < peek64(tfb)) {
+            if (self.LyrTypFeld(t, fi, tnb, tlb, fob, fsb)) {
+              PrintStr(", "c);
+              PrintStr(StrSub(peek64(tnb) as pchar, 0, peek64(tlb)));
+              PrintStr("@"c); PrintInt(peek64(fob));
+              PrintStr("/"c); PrintInt(peek64(fsb));
+            }
+            fi := fi + 1;
+          }
+          PrintStr("\n"c);
+        }
+        t := t + 1;
       }
     }
 
