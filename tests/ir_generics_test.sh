@@ -17,8 +17,10 @@
 # falscher Bezug gilt), dazu:
 #   - Wiederverwendung: zweimal dieselbe Kombination erzeugt EINEN Rumpf —
 #     am Erzeugnis gemessen (Groesse gegen zwei verschiedene Kombinationen);
-#   - f64: der IR-Weg rechnet richtig; x86 ist typgeloescht und rechnete auf
-#     den IEEE-Bits — dort wird es jetzt laut abgewiesen (beide Seiten);
+#   - f64: der IR-Weg rechnet richtig. x86 war typgeloescht und wies f64 als
+#     Typargument seit #2125 ab; seit #2134 spezialisiert auch x86, gemessen
+#     wird deshalb der Wert auf allen drei Zielen (vorher: die Abweisung —
+#     ein Test darf keine Luecke voraussetzen);
 #   - Klassen-Typargument: Feldzugriff ueber T in derselben Unit richtig;
 #     aus einer Unit, die die Klasse nicht kennt, laut statt still 0;
 #   - lyxos ueber den lokalen Lader (nur Ganzzahlen, kein Allokieren).
@@ -152,8 +154,8 @@ fn main(): int64 {
   return 0;
 }
 EOF
-nur_ir "f64-Typargument" "$TMP/f64.lyx" "375|-15|4|42|"
-abgewiesen "f64-Typargument (typgeloeschter Rumpf)" linux "$TMP/f64.lyx" "#2125"
+# #2134: x86 spezialisiert jetzt ebenfalls — Wert auf allen drei Zielen.
+vergleiche "f64-Typargument" "$TMP/f64.lyx" "375|-15|4|42|"
 
 # --- 6: Unit-uebergreifend: Spezialisierung im Kontext der Deklaration -----
 mkdir -p "$TMP/xm"
@@ -178,8 +180,8 @@ EOF
 vergleiche "andere Unit (privater Helfer, generisch->generisch)" main.lyx "8|42|80|" "$TMP/xm"
 
 # --- 7: Klasse als Typargument -----------------------------------------------
-# x86 rechnet hier 0 (typgeloescht, Feld unaufloesbar) — eigener Defekt, nicht
-# Gegenstand dieses Tests; gemessen wird nur der IR-Weg gegen den Sollwert.
+# x86 rechnete hier bis 1.2.15A still 0 (typgeloescht); seit #2134 gleich —
+# die x86-Seite misst tests/generics_x86_typen_test.sh.
 cat > "$TMP/kl.lyx" <<'EOF'
 type P = class {
   x: int64;

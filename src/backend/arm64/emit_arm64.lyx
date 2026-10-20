@@ -337,6 +337,19 @@ pub type EmitARM64 = class {
       if pSpillI < 8 {
         // #1388: Die Parameter liegen hinter dem Kratzstreifen, nicht ab Slot 0.
         self.emitStur(pSpillI, ARM64_X29, self.slotOff(IR_BARG_SLOTS + pSpillI));
+      } else {
+        // #2132: Parameter ab dem neunten liegen nach AAPCS64 beim Aufrufer
+        // auf dem Stapel, in 8-Byte-Plaetzen ab dessen sp — hier [x29+16],
+        // ueber dem geretteten x29/x30. Bis 1.2.15A blieben diese Slots
+        // unbeschrieben, der Parameter las fremden Stapel.
+        var pStOff: int64 := 16 + (pSpillI - 8) * 8;
+        if pStOff > 32760 {
+          EPrintStr("error: arm64: Parameter "c); EPrintInt(pSpillI + 1);
+          EPrintStrLn(" liegt jenseits der Reichweite von LDR [x29, #imm] (#2132)."c);
+          exit(1);
+        }
+        self.emit32(0xF9400000 | ((pStOff / 8) << 10) | (ARM64_X29 << 5) | ARM64_X9);   // LDR x9, [x29, #off]
+        self.emitStur(ARM64_X9, ARM64_X29, self.slotOff(IR_BARG_SLOTS + pSpillI));
       }
       pSpillI := pSpillI + 1;
     }
@@ -597,9 +610,9 @@ pub type EmitARM64 = class {
     // --- Calls ---
     if op == IRO_CALL         { self.emitCall(src1, src2, imm, dest); }
     if op == IRO_CALL_BUILTIN { self.emitBuiltinCall(imm, src1, dest); }
-    if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, imm, dest); }
+    if op == IRO_CALL_INDIRECT { self.emitCallIndirect(src1, src2, imm, dest); }   // #2132: src2 = argBase
     if op == IRO_FUNC_ADDR { self.emitFuncAddr(src1, dest); }
-    if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest); }
+    if op == IRO_CALL_EXTERN  { self.emitCallExtern(src1, src2, imm, dest, self.getInstrField(idx, IR_INSTR_OFF_SRC3)); }   // #2132: src3 = argBase
     if op == IRO_CONST_STR    { self.emitConstStr(imm, dest); }
 
     // --- Control flow ---
@@ -976,17 +989,64 @@ pub type EmitARM64 = class {
   fn emitCall(funcId: int64, argBase: int64, argCount: int64, dest: int64) {
     // ARM64-FIX: Args liegen im reservierten Block argBase..argBase+N-1 (NICHT 0..N-1,
     // die die Caller-Params aliasen würden). Lade argBase+ai → x[ai].
-    var ai: int64 := 0;
-    while ai < argCount && ai < 8 {
-      self.emitLdur(ai, ARM64_X29, self.slotOff(argBase + ai));
-      ai := ai + 1;
-    }
+    // #2132: ab dem neunten ueber den Stapel (_a64StapelArgs).
+    var stBytes: int64 := self._a64StapelArgs(argBase, argCount);
+    self._a64RegArgs(argBase, argCount);
     // BL funcId  — record patch
     var patchOff: int64 := self.codeLen;
     self.emit32(0x94000000);  // placeholder BL
     self.addPatch(patchOff, funcId, PATCH_BL, 0);
+    if stBytes > 0 { self.emit32(0x910003FF | (stBytes << 10)); }   // ADD sp, sp, #stBytes
     // Move result from x0 to dest slot
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2132: Argumente ab dem neunten nach AAPCS64 auf den Stapel — 8-Byte-
+  // Plaetze ab sp, sp bleibt 16-ausgerichtet. Der Platz wird am Stueck
+  // unter dem Rahmen angelegt (SUB sp) und nach dem Aufruf wieder
+  // freigegeben; die Slots liest dieser Weg x29-relativ, sie sehen die
+  // Verschiebung also nicht. Liefert die Byte-Zahl fuer das ADD danach.
+  //
+  // Bis 1.2.15A wurde alles ab dem neunten Argument still verworfen
+  // (`while ai < 8`) — der Aufgerufene las in seinem Slot fremden Stapel.
+  // Dieselbe Rechnung steht in riscv_linux.lyx (IRO_CALL) — die beiden
+  // muessen uebereinstimmen.
+  fn _a64StapelArgs(argBase: int64, argCount: int64): int64 {
+    if argCount <= 8 { return 0; }
+    if argBase < 0 {
+      // Alte Konvention (Argumente im Kratzstreifen 0..7): dort ist fuer ein
+      // neuntes kein Platz. Erzeugt ir_lower seit #2132 nicht mehr.
+      EPrintStr("error: arm64: Aufruf mit "c); EPrintInt(argCount);
+      EPrintStrLn(" Argumenten ohne Argumentblock — mehr als acht gehen so nicht (#2132)."c);
+      exit(1);
+    }
+    var stBytes: int64 := (argCount - 8) * 8;
+    if (stBytes & 15) != 0 { stBytes := stBytes + 8; }
+    if stBytes > 4095 {
+      EPrintStr("error: arm64: Aufruf mit "c); EPrintInt(argCount);
+      EPrintStrLn(" Argumenten — mehr als 4 KB Stapelargumente werden nicht erzeugt (#2132)."c);
+      exit(1);
+    }
+    self.emit32(0xD10003FF | (stBytes << 10));                     // SUB sp, sp, #stBytes
+    var si: int64 := 8;
+    while si < argCount {
+      self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(argBase + si));
+      self.emit32(0xF9000000 | ((si - 8) << 10) | (31 << 5) | ARM64_X9);   // STR x9, [sp, #(si-8)*8]
+      si := si + 1;
+    }
+    return stBytes;
+  }
+
+  // #2132: die ersten acht Argumente in x0..x7. argBase < 0 ist die alte
+  // Konvention mit den Argumenten im Kratzstreifen ab Slot 0.
+  fn _a64RegArgs(argBase: int64, argCount: int64) {
+    var rb: int64 := argBase;
+    if rb < 0 { rb := 0; }
+    var ai: int64 := 0;
+    while ai < argCount && ai < 8 {
+      self.emitLdur(ai, ARM64_X29, self.slotOff(rb + ai));
+      ai := ai + 1;
+    }
   }
 
   // Indirect call. Args follow the same convention as emitCall: caller stores
@@ -1004,15 +1064,15 @@ pub type EmitARM64 = class {
     self.emitStur(9, ARM64_X29, self.slotOff(dest));
   }
 
-  fn emitCallIndirect(ptrSlot: int64, argCount: int64, dest: int64) {
-    var ai: int64 := 0;
-    while ai < argCount && ai < 8 {
-      self.emitLdur(ai, ARM64_X29, self.slotOff(ai));
-      ai := ai + 1;
-    }
+  // #2132: die Argumente liegen im Block ab argBase (src2), wie beim
+  // direkten Aufruf; ab dem neunten ueber den Stapel.
+  fn emitCallIndirect(ptrSlot: int64, argBase: int64, argCount: int64, dest: int64) {
+    var stBytes: int64 := self._a64StapelArgs(argBase, argCount);
+    self._a64RegArgs(argBase, argCount);
     self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(ptrSlot));
     // BLR x9
     self.emit32(0xD63F0120);
+    if stBytes > 0 { self.emit32(0x910003FF | (stBytes << 10)); }   // ADD sp, sp, #stBytes
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 
@@ -1020,12 +1080,12 @@ pub type EmitARM64 = class {
   // resolved function address from an inline GOT slot the loader fills via
   // R_AARCH64_GLOB_DAT, and BLR. nameStrOff/libStrOff index the IR string
   // table; the symbol is deduped into externBuf (dynsym index = idx+1).
-  fn emitCallExtern(argCount: int64, libStrOff: int64, nameStrOff: int64, dest: int64) {
-    var ai: int64 := 0;
-    while ai < argCount && ai < 8 {
-      self.emitLdur(ai, ARM64_X29, self.slotOff(ai));
-      ai := ai + 1;
-    }
+  //
+  // #2132: argBase (src3) ist der Argumentblock; ab dem neunten Argument
+  // nach AAPCS64 ueber den Stapel, wie beim direkten Aufruf.
+  fn emitCallExtern(argCount: int64, libStrOff: int64, nameStrOff: int64, dest: int64, argBase: int64) {
+    var stBytes: int64 := self._a64StapelArgs(argBase, argCount);
+    self._a64RegArgs(argBase, argCount);
     var strBuf: int64 := peek64(self.ir + 32);
     var namePtr: int64 := strBuf + nameStrOff;
     var nameLen: int64 := StrLen(namePtr as pchar);
@@ -1082,6 +1142,7 @@ pub type EmitARM64 = class {
       self.emit32(0x90000009);        // ADRP x9, 0             (nachgetragen)
       self.emit32(0xF9400129);        // LDR  x9, [x9, #0]      (nachgetragen)
       self.emit32(0xD63F0120);        // BLR x9
+      if stBytes > 0 { self.emit32(0x910003FF | (stBytes << 10)); }   // #2132: ADD sp, sp, #stBytes
       self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
       return;
     }
@@ -1093,6 +1154,7 @@ pub type EmitARM64 = class {
     self.emit64(0);                  // GOT slot (filled by loader)
     self._recordRelocation(slotOff, ((externIdx + 1) << 32) | 1025, 0);  // R_AARCH64_GLOB_DAT
     self.emit32(0xD63F0120);        // BLR x9
+    if stBytes > 0 { self.emit32(0x910003FF | (stBytes << 10)); }   // #2132: ADD sp, sp, #stBytes
     self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
   }
 

@@ -1,6 +1,6 @@
-# Lyx 1.2.15A — Canonical EBNF Grammar
+# Lyx 1.2.16A — Canonical EBNF Grammar
 
-> Stand 2026-10-17, gegen lyxc 1.2.15A geprueft. Die Keyword-Liste in
+> Stand 2026-10-20, gegen lyxc 1.2.16A geprueft. Die Keyword-Liste in
 > Abschnitt 2.1 wurde Wort fuer Wort gegen den Compiler verifiziert; die
 > Typgrammatik in Abschnitt 7 ist um Funktions- und Methodenzeiger ergaenzt,
 > und die match-Produktion in Abschnitt 12 entspricht jetzt dem Parser.
@@ -391,9 +391,18 @@ TypeParamList       = Ident { "," Ident } ;
    Ein Typparameter gilt nur INNERHALB seiner Funktion; ausserhalb ist er ein
    unbekannter Typ und wird gemeldet.
 
-   Generische TYPEN (`type P<T> = struct {...}`) werden weiterhin nicht
-   angenommen -- TypeParamClause steht daher nur an Funktionen, nicht an
-   Typdeklarationen. Siehe 20.1. *)
+   Bis 1.2.15A wurden generische TYPEN (`type P<T> = struct {...}`) nicht
+   angenommen. Seit #2134 steht TypeParamClause auch an der Typdeklaration
+   (Abschnitt 7, TypeDecl).
+
+   Je Kombination von Typargumenten entsteht EIN Rumpf, mit T ersetzt -- auf
+   allen Zielen, x86 eingeschlossen (bis 1.2.15A war der x86-Rumpf
+   typgeloescht: ein Feld ueber T lieferte 0, f64 wurde abgewiesen). Die
+   Anzahl der Typargumente muss der der Typparameter entsprechen (sema,
+   #2134). Ein Aufruf OHNE Typargumente (`Max(8, 2)`) nimmt weiterhin den
+   typgeloeschten Rumpf; haengt darin ein Feldzugriff an T, bricht er an
+   dieser Stelle zur Laufzeit ab. Eine innere Funktion in einer generischen
+   Funktion wird auf x86 abgewiesen. *)
 
 ParamList           = Param { "," Param } ;
 
@@ -420,7 +429,25 @@ ReturnType          = Type | TupleType ;
 # 7. Type Grammar
 
 ```ebnf
-TypeDecl            = [ Visibility ] "type" Ident "=" TypeDef ";" ;
+TypeDecl            = [ Visibility ] "type" Ident [ TypeParamClause ] "=" TypeDef ";" ;
+
+(* #2134: generische Typen. Mit TypeParamClause ist TypeDef nur StructDef,
+   FlatStructDef, PackedStructDef oder ClassDef -- kein Interface, kein
+   Alias, keine Einschraenkung `T: I` (laut abgewiesen).
+
+     type Box<T> = class { v: T; fn Get(): T { return self.v; } };
+     var b: Box<int64> := new Box<int64>();
+
+   Jede Nennung `Box<A>` (GenericTypeRef) steht fuer eine eigene Klasse
+   "Box<A>": Feld-Layout, Methoden und VMT entstehen je Typargument. Zwei
+   Nennungen derselben Kombination sind derselbe Typ; geschachtelt
+   (`Box<Box<int64>>`) und selbstbezueglich (`next: Node<T>`) geht.
+
+   Laut abgewiesen (nicht umgesetzt): ein generischer Typ einer ANDEREN Unit,
+   ein Typparameter einer generischen Funktion als Typargument (`Box<T>` in
+   `fn f<T>`), Ableitung von einer Instanz (`extends Box<int64>`), ein
+   Typargument, das kein schlichter Typname ist (`Box<int64[]>`), eine
+   generische Typdeklaration in einem `@if`-Zweig. *)
 
 TypeDef             = Type
                     | RangeTypeDef
@@ -439,6 +466,7 @@ RangeBound          = [ "-" ] IntLiteral ;
 Type                = PrimaryType [ "?" ] ;
 
 PrimaryType         = BuiltinType
+                    | GenericTypeRef
                     | Ident
                     | ArrayType
                     | ParallelArrayType
@@ -446,6 +474,8 @@ PrimaryType         = BuiltinType
                     | MapType
                     | FnPtrType
                     | MethodPtrType ;
+
+GenericTypeRef      = Ident "<" TypeArgList ">" ;   (* #2134, siehe TypeDecl *)
 
 BuiltinType         = "bool"
                     | BaseIntType
@@ -1654,6 +1684,7 @@ Einzelbefunde sind dort verlinkt.
 | Capability-Argumente, Wirkung | 22 | Der Capability-NAME wird geprueft, der ARGUMENTNAME seit 1.0.13C ebenfalls: ein unbekannter Schluessel (`fs.read(pfad: …)`) und ein Argument an einer Capability, die keine nimmt, werden abgewiesen. Gueltige Schluessel: `path` (fs.*, process.exec), `host`/`port` (network.*), `pin` (hardware.gpio), `bus` (i2c/spi), `cs` (spi), `vendor`/`product` (usb). Der WERT wird jedoch **nicht durchgesetzt** — die Sandbox wirkt als Ja/Nein (seccomp-Syscallfilter plus EINE Landlock-Regel fuer `/`), nicht als Beschraenkung auf den genannten Pfad, Rechner oder Port. Der Compiler meldet das an jedem Argument, statt eine Sicherheitszusage vorzutaeuschen, die es nicht gibt (#1108); die Durchsetzung ist als #1173 geführt. Die PortSpec-Bereichsform (`"host":8000-9000`) parst seit 1.0.13C und wird auf Start <= Ende geprueft. |
 | Schmale Ganzzahltypen, Breite | 7 | `intN`/`uintN` mit N < 64 belegen einen vollen 64-Bit-Slot; gekuerzt wird beim SPEICHERN, vorzeichenbehaftet bei `intN`, vorzeichenlos bei `uintN`. Erfasst sind Initialisierung, Zuweisung, Parameter, Rueckgabe, globale Variablen und der `as`-Cast; Strukturfelder liegen ohnehin in ihrer eigenen Breite. Bis 1.0.11D fand die Kuerzung an KEINER dieser Stellen statt (`var a: int8 := 130` ergab 130 statt -126), und `as int8`/`as int16` kuerzten nur in der kurzen Schreibweise (`as i8`) -- #1151. Ein konstanter Wert, der nicht in die Breite passt, wird gekuerzt und nicht gemeldet. Eine globale Variable mit BERECHNETER Initialisierung bleibt weiterhin still 0 (#1164). |
 | Indexzugriff, Bereichspruefung | 15 | Ein konstanter Index auf eine Variable mit fester Groesse (`int64[N]` oder ein Array-Literal als Initialisierung) wird zur UEBERSETZUNGSZEIT geprueft und ausserhalb der Grenzen abgewiesen -- ohne Schalter. Berechnete Indizes prueft der erzeugte Code nur unter `--runtime-checks`; dann bricht ein Zugriff ausserhalb mit `panic` ab ("index out of bounds"). Der Vergleich ist vorzeichenLOS, ein negativer Index faellt also in denselben Zweig. `@bounds_check(true)` fordert sie umgekehrt AN und wirkt damit auch OHNE `--runtime-checks`; `@bounds_check(false)` schaltet sie im Geltungsbereich ab, auch WENN die Option gesetzt ist -- die Direktive steht naeher am Code. Bis 1.0.13Q war die Direktive nur in der Richtung `false` wirksam: der Vorgabewert stand auf "an", "angefordert" und "nicht gesetzt" waren nicht zu unterscheiden, und `@bounds_check(true)` erzeugte dieselbe Binary wie gar keine Angabe (#1124). NICHT geprueft wird, wo es keine Laenge gibt: roher Zeiger, `pchar`, Array-Parameter und inline liegende Struct-Felder. Bis 1.0.11D emittierte `--runtime-checks` fuer Indizes gar nichts -- der Zugriff las still den Speicher dahinter (#1156). Nur das x86-64-Backend traegt diese Pruefung; die uebrigen Backends kennen `--runtime-checks` insgesamt nicht. |
+| Indexzugriff, Elementtyp | 15 | `s[i]` auf einem `pchar` liest bzw. schreibt das BYTE i (Schrittweite 1, Wert 0..255) -- auf allen Zielen und fuer jede Herkunft des pchar: Variable, Parameter, Modulvariable, Konstante, Feld, Literal, `x as pchar`, Aufruf mit pchar-Rueckgabe. Ein Index auf einen SKALAR (`int64`, `bool`, `char`, `f64` ...) hat keine Bedeutung und wird abgewiesen; ein Byte ist `peek8(p + i)` oder `(p as pchar)[i]`, ein Maschinenwort `peek64(p + i * 8)`. Bis 1.2.15A lief der IR-Weg (arm64, riscv, lyxos) fuer pchar mit 8-Byte-Schrittweite, x86 kannte pchar nur als Bezeichner, und `p[i]` mit `p: int64` lieferte auf x86 den Zeiger selbst, im IR-Weg 8 Byte ab p+8i (#2131). |
 | Bereichstyp, Pruefzeitpunkt | 7 | `type X = int64 range LO..HI;` wird geprueft, wo ein Wert den Typ ANNIMMT: Initialisierung, Zuweisung (lokal wie global), Parameter, Rueckgabe und Strukturfeld -- bei Funktionen wie bei Methoden. Steht der Wert zur UEBERSETZUNGSZEIT fest (Literal, `con`, konstanter Ausdruck), meldet der Compiler ihn dort (#1082); sonst prueft der erzeugte Code zur Laufzeit und bricht mit `panic` ab (#1097). Die Laufzeitpruefung haengt NICHT an `--runtime-checks`: der Bereich ist der einzige Inhalt dieses Typs. Grenzen sind einschliesslich, der Vergleich vorzeichenbehaftet. Nicht erfasst: ein Wert, der ueber einen `as`-Cast oder einen Zeiger am Typ vorbei geschrieben wird. |
 
 Behoben seit der letzten Fassung dieses Abschnitts und daher hier entfallen:

@@ -606,6 +606,71 @@ fn _irLeseImport(modName: pchar, modLen: int64, incPath: pchar, stdPath: pchar):
   return 0 as pchar;
 }
 
+// #2130: Wert einer Hexziffer, oder -1. Dieselbe Rechnung wie cg_hexVal in
+// codegen_x86.lyx — die beiden muessen uebereinstimmen.
+fn _irHexVal(ch: int64): int64 {
+  if (ch >= 48 && ch <= 57)  { return ch - 48; }       // 0-9
+  if (ch >= 97 && ch <= 102) { return ch - 97 + 10; }   // a-f
+  if (ch >= 65 && ch <= 70)  { return ch - 65 + 10; }   // A-F
+  return 0 - 1;
+}
+
+// #2130: Escapes eines Zeichenkettenliterals auswerten. `start` zeigt auf das
+// erste Zeichen NACH dem oeffnenden Anfuehrungszeichen, `n` ist die Nutzlaenge
+// (_irLitLen). Die Bytes gehen nach `out` (mindestens n Byte gross, ausgewertet
+// wird nie laenger als die Quelle); zurueck kommt die AUSGEWERTETE Laenge —
+// sie ist die, die irAddString in den Vorspann schreibt (#1968).
+//
+// Dieselbe Liste wie cg_addStr in codegen_x86.lyx — die beiden muessen
+// uebereinstimmen: \n \r \t \0 \\ \" \' und \xHH (auch \XHH). Bis 1.2.15A
+// kannte der IR-Weg \' und \xHH nicht, und der Catch-all reichte den
+// Backslash unveraendert durch: aus "\x41B\tC" wurden die Bytes 92 120 52 49
+// 66 9 67 statt 65 66 9 67, und die ANSI-Sequenzen in std/crt.lyx kamen auf
+// arm64/riscv/lyxos als sichtbares "\x1b[31m" an. Eine unbekannte Sequenz
+// wird deshalb gemeldet, nicht durchgereicht — wie auf x86 (#1285).
+fn _irStrEscapes(start: int64, n: int64, out: int64): int64 {
+  var o: int64 := 0;
+  var i: int64 := 0;
+  while i < n {
+    var c: int64 := peek8(start + i);
+    if c == 92 && i + 1 < n {
+      var e: int64 := peek8(start + i + 1);
+      if e == 110      { poke8(out + o, 10); i := i + 2; }   // \n
+      else if e == 114 { poke8(out + o, 13); i := i + 2; }   // \r
+      else if e == 116 { poke8(out + o, 9);  i := i + 2; }   // \t
+      else if e == 48  { poke8(out + o, 0);  i := i + 2; }   // \0
+      else if e == 92  { poke8(out + o, 92); i := i + 2; }   // \\
+      else if e == 34  { poke8(out + o, 34); i := i + 2; }   // \"
+      else if e == 39  { poke8(out + o, 39); i := i + 2; }   // \'
+      else if e == 120 || e == 88 {                           // \xHH
+        var h1: int64 := 0 - 1;
+        var h2: int64 := 0 - 1;
+        if i + 3 < n {
+          h1 := _irHexVal(peek8(start + i + 2));
+          h2 := _irHexVal(peek8(start + i + 3));
+        }
+        if h1 < 0 || h2 < 0 {
+          EPrintStrLn("ir_lower error: \\x erwartet genau zwei Hexziffern (#1285, #2130)"c);
+          exit(1);
+        }
+        poke8(out + o, h1 * 16 + h2);
+        i := i + 4;
+      } else {
+        EPrintStr("ir_lower error: unbekannte Escape-Sequenz '\\"c);
+        sys_write(2, start + i + 1, 1);
+        EPrintStrLn("' (#1285, #2130)"c);
+        EPrintStrLn("  Erlaubt sind \\n \\r \\t \\0 \\\\ \\\" \\' und \\xHH."c);
+        exit(1);
+      }
+    } else {
+      poke8(out + o, c);
+      i := i + 1;
+    }
+    o := o + 1;
+  }
+  return o;
+}
+
 // #1388: Nutzlaenge eines Zeichenkettenliterals im Quelltext.
 //
 // `nodeSLen(...) - 2` rechnete mit genau zwei Anfuehrungszeichen und nichts
@@ -849,7 +914,8 @@ pub type IRLower = class {
   //           Knoten, Namenszeiger, Laenge, Erfassungsliste, deren Anzahl,
   //           Knotentabelle.
   // clCap*  — Erfassungen des Lambdas, dessen Rumpf gerade gesenkt wird
-  //           (je 24 B: Name, Laenge, Typknoten), clEnvSlot sein Umgebungsslot.
+  //           (je 32 B: Name, Laenge, Typknoten, Satz? — #2133), clEnvSlot sein
+  //           Umgebungsslot.
   // clScan* — Arbeitsliste der Erfassungssuche (_clErfasst), gleiches Format.
   // clFett* — Locals, die einen Heap-Satz {Code, Umgebung} halten: Paare
   //           (Funktionsknoten, Slot).
@@ -858,6 +924,13 @@ pub type IRLower = class {
   clScanP: int64; clScanN: int64; clScanCap: int64;
   clFettBuf: int64; clFettN: int64; clFettCap: int64;
   clZaehler: int64; clLetzterKnoten: int64; clLetzteN: int64;
+  // #2133: clSatzKontext = 1: der naechste Bezeichner/Aufruf in lowerExpr soll
+  // einen Satz liefern (nicht auspacken). clVdSatz: Entscheidung der gerade
+  // gesenkten Variablendeklaration (fuer _clVarMerken).
+  clSatzKontext: int64; clVdSatz: int64;
+  // #2133: Verzeichnis der Deklarationen mit Funktionstyp-Rueckgabe ueber
+  // alle Module (_clDeclFnWert), gebaut je Importstand.
+  clFwBuf: int64; clFwN: int64; clFwCap: int64; clFwStand: int64;
   // #2076: Die Unit, deren Deklarationen gerade gesenkt werden — ihr
   // Importname wie auf x86 (cgUnitTag), 0 fuer das Hauptmodul —, und der Kopf
   // ihrer Deklarationskette. Eine nicht-oeffentliche Funktion einer Unit
@@ -915,7 +988,9 @@ pub type IRLower = class {
   // Sammelfunktion `__lyx_modinit`, die sie in Abhaengigkeitsreihenfolge ruft.
   //   irInitModus  — 0 Programm (main ruft __lyx_modinit), 1 Shared Library
   //                  (DT_INIT_ARRAY, writeELFSharedLib), 2 --compile-unit
-  //                  (kein Aufrufer: laut abweisen)
+  //                  (#2136: Funktion `__lyx_modinit@<unit>` in der .lyu; das
+  //                  einbindende Programm haengt sie in seine Sammelfunktion,
+  //                  _irLyuNachlese)
   //   modInitNoetig — 1, wenn irgendeine Unit einen Laufzeit-Anfangswert hat
   //   modInitBuf   — je 16 B: Zeiger auf den Namen der Unit-Funktion, Laenge
   irInitModus:   int64;
@@ -1394,6 +1469,18 @@ pub type IRLower = class {
     }
     
     var k: int64 := self.nodeKind(expr);
+
+    // #2133: ein Satz {Code, Umgebung} an einer Stelle, die eine Adresse
+    // braucht (alles ausser den Satz-Stellen, die clSatzKontext setzen):
+    // auspacken. Die Markierung gilt nur fuer DIESEN Knoten.
+    if (k == NK_IDENT || k == NK_CALL) {
+      var satzGew: int64 := self.clSatzKontext;
+      self.clSatzKontext := 0;
+      if satzGew == 0 && self._clSatzWert(expr) != 0 {
+        self.clSatzKontext := 1;
+        return self._clAuspacken(self.lowerExpr(expr));
+      }
+    }
 
     // Literal: integer constant
     if (k == NK_LIT_INT) {
@@ -2124,6 +2211,15 @@ pub type IRLower = class {
     else if op == 92 { iro := IRO_BITNOT; }   // TK_BITNOT
     // WP-SIMD: -vec auf parallel-Array<f32> → IRO_SIMD_NEG (packed Vorzeichenbit-Flip).
     if iro == IRO_NEG { if self._isSimdExpr(self.nodeC0(expr)) != 0 { iro := IRO_SIMD_NEG; } }
+    // #2129: -x auf GLEITKOMMA kippt das Vorzeichenbit (IRO_FNEG). IRO_NEG
+    // rechnet ganzzahlig `0 - bits`, und das ergibt ein plausibles falsches
+    // Gleitkomma: 0 - 0x3FF8000000000000 = 0xC008000000000000 = -3.0, aus
+    // `-1.5` wurde also -3.0, aus `-0.25` -16.0. Dieselbe Fehlerform wie
+    // #1803 im x86-Falter (cg_evalConExpr, unaerer Zweig): dort kippt
+    // `cv ^ (1 << 63)` das Bit, hier tut es IRO_FNEG. Die Frage „ist das
+    // Gleitkomma?" stellt _isF64Expr — dieselbe wie im binaeren Zweig
+    // (lowerBinOp, IRO_SUB → IRO_FSUB); die beiden muessen uebereinstimmen.
+    if iro == IRO_NEG { if self._isF64Expr(self.nodeC0(expr)) != 0 { iro := IRO_FNEG; } }
     if iro >= 0 {
       self.irAddInstrDirect(iro, dest, t1, -1, 0);
     }
@@ -2169,6 +2265,46 @@ pub type IRLower = class {
     return 0;
   }
 
+  // #2132: Argumentblock fuer einen Aufruf reservieren — so viele Slots, wie
+  // der Aufruf hoechstens belegt, mindestens acht. Gezaehlt werden die
+  // Argumente der Liste ab `arg0` plus `extra` (self, Umgebung, Vorgabewerte;
+  // eine Ueberschaetzung schadet nicht).
+  //
+  // Bis 1.2.15A reservierte jede Stelle fest acht Slots. Ein neuntes Argument
+  // landete damit auf base+8 — einem Temp, das bei der Auswertung eines
+  // spaeteren Arguments schon wieder vergeben war. Der Block muss VOR der
+  // Auswertung stehen: was danach angelegt wird, liegt sicher darueber.
+  fn _irArgBlock(arg0: int64, extra: int64): int64 {
+    var n: int64 := extra;
+    var a: int64 := arg0;
+    while a >= 0 { n := n + 1; a := self.nodeNext(a); }
+    if n < 8 { n := 8; }
+    var base: int64 := self.tempCount;
+    var r: int64 := 0;
+    while r < n { self.allocTemp(); r := r + 1; }
+    return base;
+  }
+
+  // #2132: Die Argumente der Liste ab `arg0` der Reihe nach auswerten und
+  // jedes SOFORT in den Block (base + start + i) legen — dieselbe Konvention
+  // wie beim direkten Aufruf (#1388/#2028). Ein Aufruf in einem spaeteren
+  // Argument belegt seinen eigenen, hoeheren Block und laesst die frueheren
+  // stehen. Liefert start + Anzahl.
+  //
+  // Die indirekten Aufrufe legten jedes Argument bis 1.2.15A in Slot i des
+  // Kratzstreifens: `f(1, g(2))` ueberschrieb dort mit der 2 die 1.
+  fn _irArgsLegen(arg0: int64, base: int64, start: int64): int64 {
+    var i: int64 := start;
+    var a: int64 := arg0;
+    while a >= 0 {
+      var t: int64 := self.lowerExpr(a);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, base + i, t, -1, 0);
+      i := i + 1;
+      a := self.nodeNext(a);
+    }
+    return i;
+  }
+
   // #2103: Aufruf der Nutzerfunktion fbUserIdx (aus lowerCall herausgeloest,
   // weil er jetzt an zwei Stellen entsteht: sofort und zurueckgestellt).
   fn _irRufNutzer(expr: int64, fbUserIdx: int64, arg0: int64, dest: int64): int64 {
@@ -2177,9 +2313,15 @@ pub type IRLower = class {
     // reservierten hohen Slot-Block (argBase..argBase+7) nutzen, der über allen
     // Live-Werten liegt. Sonst klobbert z.B. fib(n-1) den Slot0 (=Param n), und
     // fib(n-2) liest n-1 → falsch. emitCall lädt aus argBase (IRO_CALL.src2).
-    var fbArgBase: int64 := self.tempCount;
-    var fbRsv: int64 := 0;
-    while fbRsv < 8 { self.allocTemp(); fbRsv := fbRsv + 1; }
+    // #2132: der Block fasst alle Argumente samt Vorgabewerten (die
+    // Parameterzahl der Deklaration als Obergrenze), nicht fest acht.
+    var fbVorDecl: int64 := self._callDeclNi(expr);
+    var fbVorN: int64 := 0;
+    if fbVorDecl >= 0 {
+      var fbVorP: int64 := self.nodeC0(fbVorDecl);
+      while fbVorP >= 0 { fbVorN := fbVorN + 1; fbVorP := self.nodeNext(fbVorP); }
+    }
+    var fbArgBase: int64 := self._irArgBlock(arg0, fbVorN);
     var fbArgCnt: int64 := 0;
     var fbArg: int64 := arg0;
     while fbArg >= 0 {
@@ -2324,9 +2466,7 @@ pub type IRLower = class {
       }
       // Arg-Block: self @ argBase, dann die expliziten Args — dieselbe
       // Konvention wie beim Methodenaufruf darunter.
-      var spArgBase: int64 := self.tempCount;
-      var spRsv: int64 := 0;
-      while spRsv < 8 { self.allocTemp(); spRsv := spRsv + 1; }
+      var spArgBase: int64 := self._irArgBlock(self.nodeC1(expr), 1);   // #2132
       var spSelf: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_LOAD_LOCAL, spSelf, IR_BARG_SLOTS, -1, 0);
       self.irAddInstrDirect(IRO_STORE_LOCAL, spArgBase, spSelf, -1, 0);
@@ -2362,27 +2502,21 @@ pub type IRLower = class {
         self.irAddInstrDirect(IRO_LOAD_FIELD, mfCode, mfP, 0, 0);
         var mfData: int64 := self.allocTemp();
         self.irAddInstrDirect(IRO_LOAD_FIELD, mfData, mfP, 8, 0);
-        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, mfData, -1, 0);   // self → slot 0
-        var mfArg: int64 := self.nodeC1(expr); var mfI: int64 := 1;
-        while mfArg >= 0 {
-          var mfAT: int64 := self.lowerExpr(mfArg);
-          self.irAddInstrDirect(IRO_STORE_LOCAL, mfI, mfAT, -1, 0);
-          mfI += 1; mfArg := self.nodeNext(mfArg);
-        }
-        self.irAddInstrDirect(IRO_CALL_INDIRECT, mcDest, mfCode, -1, mfI);
+        // #2132: self und Argumente in einen hohen Block (src2 = argBase),
+        // nicht in die Slots 0..N-1 — ein Aufruf im Argument ueberschrieb sie.
+        var mfB: int64 := self._irArgBlock(self.nodeC1(expr), 1);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, mfB, mfData, -1, 0);   // self → argBase[0]
+        var mfI: int64 := self._irArgsLegen(self.nodeC1(expr), mfB, 1);
+        self.irAddInstrDirect(IRO_CALL_INDIRECT, mcDest, mfCode, mfB, mfI);
         return mcDest;
       }
       if fpOff >= 0 {
         var fpBase: int64 := self.lowerExpr(mcBaseNode);
         var fpFn: int64 := self.allocTemp();
         self.irAddInstrDirect(IRO_LOAD_FIELD, fpFn, fpBase, fpOff, 0);
-        var fpArg: int64 := self.nodeC1(expr); var fpI: int64 := 0;
-        while fpArg >= 0 {
-          var fpAT: int64 := self.lowerExpr(fpArg);
-          self.irAddInstrDirect(IRO_STORE_LOCAL, fpI, fpAT, -1, 0);
-          fpI += 1; fpArg := self.nodeNext(fpArg);
-        }
-        self.irAddInstrDirect(IRO_CALL_INDIRECT, mcDest, fpFn, -1, fpI);
+        var fpB: int64 := self._irArgBlock(self.nodeC1(expr), 0);   // #2132
+        var fpI: int64 := self._irArgsLegen(self.nodeC1(expr), fpB, 0);
+        self.irAddInstrDirect(IRO_CALL_INDIRECT, mcDest, fpFn, fpB, fpI);
         return mcDest;
       }
       // WP-XMOD-OOP: Klassenname + lokales decl holen. localDecl>=0 = same-module (Fast-Path,
@@ -2412,9 +2546,7 @@ pub type IRLower = class {
         if mcLocal >= 0 { mcVirt := self._methodVirtual(mcLocal, mNameP, mNameL); }
         else { mcVirt := self._tregMethodVirtualG(self._tregFind(mcCName, mcCNameL), mNameP, mNameL); }
         // Arg-Block: self @ argBase, dann explizite Args.
-        var mcArgBase: int64 := self.tempCount;
-        var mcRsv: int64 := 0;
-        while mcRsv < 8 { self.allocTemp(); mcRsv := mcRsv + 1; }
+        var mcArgBase: int64 := self._irArgBlock(self.nodeC1(expr), 1);   // #2132
         var mcSelf: int64 := self.lowerExpr(mcBaseNode);
         self.irAddInstrDirect(IRO_STORE_LOCAL, mcArgBase, mcSelf, -1, 0);
         var mcCnt: int64 := 1;
@@ -2630,16 +2762,19 @@ pub type IRLower = class {
       if (arg0 < 0) { return dest; }
       var fnTemp: int64 := self.lowerExpr(arg0);
       var argNode: int64 := self.nodeNext(arg0);
+      // #2132: Argumente in einen hohen Block (src2 = argBase) statt in die
+      // Slots 0..N-1 — die Einschraenkung oben ("clobbers the function's own
+      // slots") gilt damit nicht mehr.
+      var icB: int64 := self._irArgBlock(argNode, 0);
       var i: int64 := 0;
       while (i < indN && argNode >= 0) {
         var aTemp: int64 := self.lowerExpr(argNode);
-        // Store argTemp into slot `i` so the AArch64 emitter loads it into x{i}.
-        self.irAddInstrDirect(IRO_STORE_LOCAL, i, aTemp, -1, 0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, icB + i, aTemp, -1, 0);
         argNode := self.nodeNext(argNode);
         i += 1;
       }
-      // src1 = slot index of fn pointer, imm = arg count.
-      self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, fnTemp, -1, indN);
+      // src1 = slot index of fn pointer, src2 = argBase, imm = arg count.
+      self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, fnTemp, icB, indN);
       return dest;
     }
 
@@ -2821,23 +2956,9 @@ pub type IRLower = class {
       var psSrcLen: int64 := _irLitLen(self.nodeSVal(arg0) as int64, self.nodeSLen(arg0));   // #1388
       if (psSrcLen < 0) { psSrcLen := 0; }
       var psBuf: int64 := alloc(psSrcLen + 8);
-      var psOut: int64 := 0;
-      var psI: int64 := 0;
-      while psI < psSrcLen {
-        var psC: int64 := peek8(psStart + psI);
-        if psC == 92 && psI + 1 < psSrcLen {       // backslash escape
-          var psN: int64 := peek8(psStart + psI + 1);
-          if psN == 110      { psC := 10; psI := psI + 1; }   // \n
-          else if psN == 116 { psC := 9;  psI := psI + 1; }   // \t
-          else if psN == 114 { psC := 13; psI := psI + 1; }   // \r
-          else if psN == 92  { psC := 92; psI := psI + 1; }   // \\
-          else if psN == 34  { psC := 34; psI := psI + 1; }   // \"
-          else if psN == 48  { psC := 0;  psI := psI + 1; }   // \0
-        }
-        poke8(psBuf + psOut, psC);
-        psOut += 1;
-        psI += 1;
-      }
+      // #2130: dieselbe Auswertung wie _strLitInternieren (_irStrEscapes) —
+      // hier stand bis 1.2.15A eine zweite, ebenso unvollstaendige Kopie.
+      var psOut: int64 := _irStrEscapes(psStart, psSrcLen, psBuf);
       var psStrOff: int64 := self.irAddString(psBuf as pchar, psOut);
       var psA: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_CONST_STR, psA, -1, -1, psStrOff);
@@ -3182,15 +3303,14 @@ pub type IRLower = class {
         exLibLen    := (exLibPacked >> 32) & 0xFFFFFFFF;
         exLibStrOff := self.irAddString((self.src as int64 + exLibOff) as pchar, exLibLen);
       }
-      var exArgCnt: int64 := 0;
-      var exArg: int64 := arg0;
-      while exArg >= 0 {
-        var exAT: int64 := self.lowerExpr(exArg);
-        self.irAddInstrDirect(IRO_STORE_LOCAL, exArgCnt, exAT, -1, 0);
-        exArgCnt += 1;
-        exArg := self.nodeNext(exArg);
-      }
-      self.irAddInstrDirect(IRO_CALL_EXTERN, dest, exArgCnt, exLibStrOff, exNameStrOff);
+      // #2132: Argumente in einen hohen Block; dessen Basis steht in src3
+      // (src1/src2/imm sind belegt). Bis 1.2.15A lag jedes Argument sofort in
+      // Slot i — `cfn(1, g(2))` ueberschrieb die 1 —, und mehr als acht
+      // gingen nicht.
+      var exB: int64 := self._irArgBlock(arg0, 0);
+      var exArgCnt: int64 := self._irArgsLegen(arg0, exB, 0);
+      var exIdx: int64 := self.irAddInstrDirect(IRO_CALL_EXTERN, dest, exArgCnt, exLibStrOff, exNameStrOff);
+      poke64(peek64(self.ir + IR_MOD_OFF_INSTRBUF) + exIdx * IR_INSTR_SIZE + IR_INSTR_OFF_SRC3, exB);
       return dest;
     }
 
@@ -6012,14 +6132,17 @@ pub type IRLower = class {
       if lfCl >= 0 { return lfCl; }
       var lfFn: int64 := self.allocTemp();
       self.irAddInstrDirect(IRO_LOAD_LOCAL, lfFn, lfSlot, -1, 0);
-      var lfArg: int64 := arg0; var lfI: int64 := 0;
-      while lfArg >= 0 {
-        var lfAT: int64 := self.lowerExpr(lfArg);
-        self.irAddInstrDirect(IRO_STORE_LOCAL, lfI, lfAT, -1, 0);
-        lfI += 1; lfArg := self.nodeNext(lfArg);
-      }
-      self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, lfFn, -1, lfI);
-      return dest;
+      return self._clRufDuenn(lfFn, arg0, dest);
+    }
+    // #2133: im Rumpf eines Lambdas ein ERFASSTES Lambda (`c()`). Fehlte —
+    // der Name war weder Local noch Funktion, die Uebersetzung brach mit
+    // "unbekannter Name im Aufruf" ab. Satz oder Adresse sagt die Erfassung.
+    var ccIdx: int64 := self._clCapIdx(fname, fnlen);
+    if ccIdx >= 0 {
+      var ccWert: int64 := self.allocTemp();
+      self._clCapLaden(fname, fnlen, ccWert);
+      if self._clCapSatz(ccIdx) != 0 { return self._clRufSatz(ccWert, arg0, dest); }
+      return self._clRufDuenn(ccWert, arg0, dest);
     }
 
     // #1723: Aufruf ueber eine MODULVARIABLE vom Funktionstyp.
@@ -6063,15 +6186,9 @@ pub type IRLower = class {
           // Slots 0..N-1, die Fn-Adresse darf davon nicht getroffen werden.
           var gvFn: int64 := self.allocTemp();
           self.irAddInstrDirect(IRO_LOAD_GLOBAL, gvFn, gvIdx, -1, 0);
-          var gvArg: int64 := arg0;
-          var gvN:   int64 := 0;
-          while gvArg >= 0 {
-            var gvAT: int64 := self.lowerExpr(gvArg);
-            self.irAddInstrDirect(IRO_STORE_LOCAL, gvN, gvAT, -1, 0);
-            gvN += 1;
-            gvArg := self.nodeNext(gvArg);
-          }
-          self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, gvFn, -1, gvN);
+          var gvB: int64 := self._irArgBlock(arg0, 0);   // #2132
+          var gvN: int64 := self._irArgsLegen(arg0, gvB, 0);
+          self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, gvFn, gvB, gvN);
           return dest;
         }
       }
@@ -6129,6 +6246,17 @@ pub type IRLower = class {
       return self._opKlassenAufruf(self.nodeC0(expr), self.nodeC1(expr), ixIdx);
     }
     var simd: int64 := self._isSimdExpr(self.nodeC0(expr));
+    // #2131: `s[i]` auf einem pchar ist das BYTE i — wie auf x86 (movzx aus
+    // [rax+rbx]). Bis 1.2.15A lief es durch IRO_LOAD_IDX, also 8 Byte ab
+    // s+8i: "HELLO"[1] lieferte Muell statt 69.
+    if simd == 0 && self._indexBasisArt(self.nodeC0(expr)) == 1 {
+      var pcAdr: int64 := self._pcharElemAdr(expr);
+      var pcB: int64 := self.tempCount; var pcR: int64 := 0; while pcR < 4 { self.allocTemp(); pcR := pcR + 1; }
+      var pcDest: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_STORE_LOCAL, pcB, pcAdr, -1, 0);
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, pcDest, pcB, -1, 200);   // peek8
+      return pcDest;
+    }
     var base: int64 := self.lowerExpr(self.nodeC0(expr));
     var idx: int64 := self.lowerExpr(self.nodeC1(expr));
     var dest: int64 := self.allocTemp();
@@ -6142,7 +6270,43 @@ pub type IRLower = class {
     self.irAddInstrDirect(IRO_LOAD_IDX, dest, base, idx, 0);
     return dest;
   }
-  
+
+  // #2131: Was fuer eine Basis hat ein Indexzugriff? 1 = pchar (das
+  // Literal und alles, dessen statischer Typ `pchar` heisst: Local,
+  // Parameter, Modulvariable, Feld, Cast, Aufruf — _exprTypeNode),
+  // 2 = ein SKALAR ohne Elemente (int64, bool, char ...), 0 = sonst (Array,
+  // Klasse, unbestimmt). Dieselbe Frage stellt der x86-Weg mit
+  // cg_isPcharExpr bzw. seinem lauten Restzweig, sema mit _checkIndexBase —
+  // die drei muessen uebereinstimmen.
+  fn _indexBasisArt(nd: int64): int64 {
+    if nd < 0 { return 0; }
+    if self.nodeKind(nd) == NK_LIT_STR { return 1; }
+    var tn: int64 := self._exprTypeNode(nd);
+    if tn < 0 { return 0; }
+    if self.nodeKind(tn) != NK_TYPE_NAME { return 0; }
+    var art: int64 := self._artVonTypname(self.nodeSVal(tn), self.nodeSLen(tn));
+    if art == 1 { return 1; }
+    if art == 0 {
+      // Skalar — laut, wie sema es fuer Bezeichner schon tut. Hier kommen
+      // die Faelle an, deren Typ sema nicht kennt (Feld, Methodenaufruf).
+      EPrintStr("error: #2131: Indexzugriff auf einen Skalar ohne Elemente — Byte: peek8(p + i), Wort: peek64(p + i * 8); Typ "c);
+      sys_write(2, self.nodeSVal(tn) as int64, self.nodeSLen(tn));
+      EPrintStrLn(""c);
+      exit(1);
+    }
+    return 0;
+  }
+
+  // #2131: Adresse des Elements `s[i]` eines pchar: s + i, Schrittweite 1.
+  // Gemeinsam fuer Lesen (lowerIndex) und Schreiben (lowerAssign).
+  fn _pcharElemAdr(indexNode: int64): int64 {
+    var b: int64 := self.lowerExpr(self.nodeC0(indexNode));
+    var i: int64 := self.lowerExpr(self.nodeC1(indexNode));
+    var a: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, a, b, i, 0);
+    return a;
+  }
+
   // ------------------------------------------------------------------
   // Field Access Lowering
   // ------------------------------------------------------------------
@@ -6328,7 +6492,7 @@ pub type IRLower = class {
     // Parameter und Modulvariable; _findLocalSlot kennt sie nicht, weil eine
     // Erfassung keinen Slot hat (Lesen/Schreiben: _clCapLaden/_clCapSpeichern).
     var cti: int64 := self._clCapIdx(idp, idl);
-    if cti >= 0 { return peek64(self.clCapP + cti * 24 + 16); }
+    if cti >= 0 { return peek64(self.clCapP + cti * 32 + 16); }
     // #1812: zuletzt die MODULVARIABLEN. Locals und Parameter standen hier
     // schon; die dritte Speicherart fehlte — und damit hatte `g_obj` keinen
     // Typ, der Feld-Offset war unaufloesbar und `g_obj.feld` lieferte Muell.
@@ -6890,8 +7054,23 @@ pub type IRLower = class {
     }
 
     // ARM64-OOP: Instanz-Feldzugriff p.x — base = Objekt-Pointer, Offset aus p's Typ.
-    var base: int64 := self.lowerExpr(baseNode);
     var ifOff: int64 := self._instanceFieldOffset(baseNode, self.nodeSVal(expr), self.nodeSLen(expr));
+    // #2134: `obj.Methode` als WERT (kein Aufruf) — eine Methodenreferenz,
+    // derselbe Fat-Pointer wie bei der Zuweisung an ein method-Feld
+    // (_lowerMethodRef). Bis 1.2.15A fiel sie hierher durch und lieferte den
+    // unbeschriebenen Temp; die Zuweisung an ein method-Feld baute den Wert
+    // ohnehin selbst und uebersah den Muell. Seit der Fehlfall laut ist,
+    // muss die Referenz hier entstehen.
+    if ifOff < 0 {
+      var mrTn: int64 := self._baseTypeNode(baseNode);
+      if mrTn >= 0 {
+        var mrL: int64 := self.nodeSLen(mrTn) + 1 + self.nodeSLen(expr);
+        var mrM: int64 := self._methodMangle(self.nodeSVal(mrTn), self.nodeSLen(mrTn),
+                                             self.nodeSVal(expr), self.nodeSLen(expr));
+        if self._findFuncByName(mrM as pchar, mrL) >= 0 { return self._lowerMethodRef(expr); }
+      }
+    }
+    var base: int64 := self.lowerExpr(baseNode);
     if ifOff >= 0 {
       self.irAddInstrDirect(IRO_LOAD_FIELD, dest, base, ifOff, 0);
     } else if self.genSubstN > 0 {
@@ -6901,6 +7080,11 @@ pub type IRLower = class {
       // wie auf x86, wo der Rumpf typgeloescht ist.
       self._genFehler("Feld ueber einen Typparameter nicht aufloesbar (Klasse aus einer anderen Unit?): "c,
                       self.nodeSVal(expr), self.nodeSLen(expr));
+    } else {
+      // #2134: ausserhalb einer Spezialisierung ebenso laut. Bis 1.2.15A
+      // kam hier der unbeschriebene Temp zurueck — der Wert war, was
+      // zufaellig im Register stand, und das Programm lief weiter.
+      self._feldOffen(expr, dest);
     }
     return dest;
   }
@@ -6973,8 +7157,7 @@ pub type IRLower = class {
     var ctorLen:  int64 := self.nodeSLen(expr) + 1 + 6;
     var ctorIdx:  int64 := self._findFuncByName(ctorMang as pchar, ctorLen);
     if ctorIdx >= 0 {
-      var cArgBase: int64 := self.tempCount;
-      var cRsv: int64 := 0; while cRsv < 8 { self.allocTemp(); cRsv := cRsv + 1; }
+      var cArgBase: int64 := self._irArgBlock(self.nodeC0(expr), 1);   // #2132
       self.irAddInstrDirect(IRO_STORE_LOCAL, cArgBase, dest, -1, 0);   // self = neues Objekt
       var cCnt: int64 := 1;
       var cArg: int64 := self.nodeC0(expr);
@@ -7269,7 +7452,15 @@ pub type IRLower = class {
         if self._volSlotN < 256 { poke64(self._volSlotList + self._volSlotN * 8, vdSlot); self._volSlotN := self._volSlotN + 1; }
       }
       var vdInit: int64 := self.nodeC1(stmt);
+      // #2133: ohne Typangabe haelt die Variable einen Satz genau dann, wenn
+      // der Startwert einer ist (_clVarMerken liest die Entscheidung).
+      self.clVdSatz := 0;
+      if vdInit >= 0 && self.nodeC0(stmt) < 0 {
+        if self.nodeKind(vdInit) == NK_CLOSURE { self.clVdSatz := 0; }
+        else if self._clSatzWert(vdInit) != 0 { self.clVdSatz := 1; }
+      }
       if vdInit >= 0 {
+        if self.clVdSatz != 0 { self.clSatzKontext := 1; }
         var vdTemp: int64 := self.lowerExpr(vdInit);
         self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdTemp, -1, 0);
       } else {
@@ -7928,7 +8119,16 @@ pub type IRLower = class {
   fn lowerReturn(stmt: int64) {
     var retVal: int64 := self.nodeC0(stmt);
     if (retVal >= 0) {
-      var retTemp: int64 := self.lowerExpr(retVal);
+      // #2133: Funktion (oder Methode) mit Funktionstyp als Rueckgabe — der
+      // Wert geht als Satz ueber die Grenze. Ein Lambda (curFunc ist dann
+      // NK_CLOSURE) packt nicht ein, wie auf x86.
+      var retTemp: int64 := 0;
+      if self.curFunc >= 0 && self.nodeKind(self.curFunc) == NK_FUNC_DECL
+         && self._clTypIstFnWert(self.nodeC1(self.curFunc)) != 0 {
+        retTemp := self._clAlsSatz(retVal);
+      } else {
+        retTemp := self.lowerExpr(retVal);
+      }
       self.irAddInstrDirect(IRO_STORE_LOCAL, self.retValTemp, retTemp, -1, 0);
     }
     // WP-2.2-B: on early return, emit ALL accumulated deferred stmts (entire stack)
@@ -7951,7 +8151,18 @@ pub type IRLower = class {
     var val: int64 := self.nodeC1(stmt);
     
     if (target >= 0 && val >= 0) {
-      var valTemp: int64 := self.lowerExpr(val);
+      // #2133: Zuweisung an ein Local (oder eine Erfassung), das einen Satz
+      // haelt — der Wert muss ein Satz sein; die Darstellung haengt an der
+      // Deklaration, nicht am neuen Wert. Wie auf x86.
+      var asgSatz: int64 := 0;
+      if self.nodeKind(target) == NK_IDENT && self.curFunc >= 0 {
+        var asgSl: int64 := self._findLocalSlot(self.nodeSVal(target), self.nodeSLen(target));
+        if asgSl >= 0 { asgSatz := self._clIstFett(asgSl); }
+        else { asgSatz := self._clCapSatz(self._clCapIdx(self.nodeSVal(target), self.nodeSLen(target))); }
+      }
+      var valTemp: int64 := 0;
+      if asgSatz != 0 { valTemp := self._clAlsSatz(val); }
+      else { valTemp := self.lowerExpr(val); }
 
       // Target is IDENT — store to local variable or parameter slot.
       // ARM64-FIX: war Stub (kein Store emittiert) → Assignments waren no-ops,
@@ -8001,7 +8212,14 @@ pub type IRLower = class {
                       }
                       pj += 1;
                     }
-                    if pmatch != 0 { slot := IR_BARG_SLOTS + pidx; }   // #1388
+                    // #2137: in einer Methode liegt `self` in Slot 0, die
+                    // expliziten Parameter dahinter. Dieselbe Rechnung wie
+                    // beim Lesen (NK_IDENT in lowerExpr) und in
+                    // _findLocalSlot — die drei muessen uebereinstimmen.
+                    // Ohne den Versatz schrieb `a := ...` im ersten
+                    // Parameter auf `self`; arm64 stuerzte beim naechsten
+                    // Feldzugriff ab.
+                    if pmatch != 0 { slot := IR_BARG_SLOTS + pidx + self.methodParamBase; }   // #1388
                   }
                 }
                 pidx += 1;
@@ -8065,10 +8283,25 @@ pub type IRLower = class {
           // beiden muessen uebereinstimmen. Sonst entfiele die Zuweisung still.
           self._genFehler("Feld ueber einen Typparameter nicht aufloesbar (Klasse aus einer anderen Unit?): "c,
                           self.nodeSVal(target), self.nodeSLen(target));
+        } else {
+          // #2134: und ausserhalb einer Spezialisierung wie in lowerField.
+          self._feldOffen(target, 0 - 1);
         }
       }
       // Target is INDEX — store to array element. ARM64-FIX: war Stub.
       // IRO_STORE_IDX: src1=value, src2=base, dest=idx (emitStoreIdx: STR value,[base,idx,LSL#3]).
+      else if (self.nodeKind(target) == NK_INDEX
+               && self._isSimdExpr(self.nodeC0(target)) == 0
+               && self._indexBasisArt(self.nodeC0(target)) == 1) {
+        // #2131: `s[i] := b` auf einem pchar schreibt EIN Byte an s+i —
+        // spiegelbildlich zum Lesen in lowerIndex (dort peek8, hier poke8).
+        var pwAdr: int64 := self._pcharElemAdr(target);
+        var pwB: int64 := self.tempCount; var pwR: int64 := 0; while pwR < 4 { self.allocTemp(); pwR := pwR + 1; }
+        var pwDest: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_STORE_LOCAL, pwB, pwAdr, -1, 0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, pwB + 1, valTemp, -1, 0);
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, pwDest, pwB, -1, 203);   // poke8
+      }
       else if (self.nodeKind(target) == NK_INDEX) {
         var aiSimd: int64 := self._isSimdExpr(self.nodeC0(target));
         var aiBase: int64 := self.lowerExpr(self.nodeC0(target));
@@ -8541,11 +8774,13 @@ pub type IRLower = class {
                 free(nlBox, 8);
                 var nlOk: int64 := 0;
                 if (nlBuf != 0 && nlSz > 0) {
+                  var nlFnVor: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);   // #2136
                   var nlBelegt: int64 := _irUebernehmeLyu(self.ir, nlBuf, nlSz, self.labelCount,
                                                          _irLyuArchFuerZiel(self.target));
                   if (nlBelegt >= 0) {
                     nlOk := 1;
                     if (nlBelegt > 0) { self.labelCount := self.labelCount + nlBelegt; }
+                    self._irLyuNachlese(nlFnVor, 0);   // #2136: Anfangswerte der .lyu
                   }
                 }
                 if (nlOk == 0) {
@@ -9080,12 +9315,14 @@ pub type IRLower = class {
             var lyuSz: int64 := peek64(lyuBox);
             free(lyuBox, 8);
             if (lyuBuf != 0 && lyuSz > 0) {
+              var lyuFnVor: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);   // #2136
               var belegt: int64 := _irUebernehmeLyu(self.ir, lyuBuf, lyuSz, self.labelCount,
                                                     _irLyuArchFuerZiel(self.target));
               // Labelnummern weiterstellen, sonst vergibt genLabel() Nummern,
               // die die uebernommenen Sprungziele schon benutzen — der
               // naechste `if` spraenge dann mitten in die importierte Unit.
               if (belegt > 0) { self.labelCount := self.labelCount + belegt; }
+              if (belegt >= 0) { self._irLyuNachlese(lyuFnVor, 1); }   // #2136
             }
           }
         }
@@ -9344,22 +9581,12 @@ pub type IRLower = class {
     var hat: int64 := 0;
     var d: int64 := decls;
     while d >= 0 {
-      if self._modVarLaufzeit(d) != 0 {
-        if hat == 0 && self.irInitModus == 2 {
-          // --compile-unit: Die .lyu traegt das IR der Unit, aber niemand
-          // ruft ihre Anfangswerte — das Programm, das sie spaeter einbindet,
-          // baut seine Sammelfunktion aus SEINEN Units. Lieber kein Erzeugnis
-          // als eines mit stillen Nullen.
-          EPrintStr("lyxc: Modulvariable '"c);
-          sys_write(2, self.nodeSVal(d) as int64, self.nodeSLen(d));
-          EPrintStrLn("' braucht einen Anfangswert zur Laufzeit (#2123)."c);
-          EPrintStrLn("  In einer vorkompilierten Unit (--compile-unit) fuer ein IR-Ziel gibt es"c);
-          EPrintStrLn("  dafuer noch keinen Aufrufer. Die Unit als Quelle einbinden, oder den"c);
-          EPrintStrLn("  Wert in einer Funktion zuweisen."c);
-          exit(1);
-        }
-        hat := 1;
-      }
+      // #2136: Bis 1.2.15A wies --compile-unit (irInitModus 2) eine solche
+      // Unit hier ab — es gab keinen Aufrufer. Jetzt traegt die .lyu die
+      // Funktion unter einem Namen, an dem das einbindende Programm sie
+      // erkennt (_modInitLyuName), und haengt sie in SEINE Sammelfunktion
+      // (_irLyuNachlese).
+      if self._modVarLaufzeit(d) != 0 { hat := 1; }
       d := self.nodeNext(d);
     }
     if hat == 0 { return; }
@@ -9442,19 +9669,27 @@ pub type IRLower = class {
     self.irEmitLabel(self.funcExitLabel);
     self.irAddInstrDirect(IRO_LOAD_LOCAL, 0, self.retValTemp, -1, 0);
 
-    // Name "__lyx_modinit_<n>"
-    var nb: int64 := alloc(40);
-    var pre: pchar := "__lyx_modinit_";
-    memcpy(nb, pre as int64, 14);
-    var nl: int64 := 14;
-    var zahl: int64 := self.modInitN;
-    var ziff: int64 := alloc(24);
-    var zn: int64 := 0;
-    if zahl == 0 { poke8(ziff, 48); zn := 1; }
-    while zahl > 0 { poke8(ziff + zn, 48 + (zahl % 10)); zahl := zahl / 10; zn := zn + 1; }
-    while zn > 0 { zn := zn - 1; poke8(nb + nl, peek8(ziff + zn)); nl := nl + 1; }
-    poke8(nb + nl, 0);
-    free(ziff, 24);
+    // Name "__lyx_modinit_<n>" — in einer vorkompilierten Unit
+    // "__lyx_modinit@<unit>" (#2136), damit das Programm sie wiederfindet.
+    var nb: int64 := 0;
+    var nl: int64 := 0;
+    if self.irInitModus == 2 {
+      nb := self._modInitLyuName() as int64;
+      nl := StrLen(nb as pchar);
+    } else {
+      nb := alloc(40);
+      var pre: pchar := "__lyx_modinit_";
+      memcpy(nb, pre as int64, 14);
+      nl := 14;
+      var zahl: int64 := self.modInitN;
+      var ziff: int64 := alloc(24);
+      var zn: int64 := 0;
+      if zahl == 0 { poke8(ziff, 48); zn := 1; }
+      while zahl > 0 { poke8(ziff + zn, 48 + (zahl % 10)); zahl := zahl / 10; zn := zn + 1; }
+      while zn > 0 { zn := zn - 1; poke8(nb + nl, peek8(ziff + zn)); nl := nl + 1; }
+      poke8(nb + nl, 0);
+      free(ziff, 24);
+    }
 
     self.overrideFuncName := nb as pchar;
     self.overrideFuncNameLen := nl;
@@ -9537,6 +9772,153 @@ pub type IRLower = class {
     self.funcInstrStart := sStart;
     self.overrideFuncName := sOvN;
     self.overrideFuncNameLen := sOvL;
+  }
+
+  // #2136: Name der Init-Funktion einer vorkompilierten Unit (--compile-unit,
+  // irInitModus 2): "__lyx_modinit@" und dann der Importname der Unit — fuer
+  // die Wurzel, die keinen hat, der Dateiname samt Pruefsumme des ganzen
+  // Pfads, damit zwei gleichnamige Dateien aus verschiedenen Verzeichnissen
+  // nicht auf eine Funktion fallen (_addFunc nimmt einen vorhandenen Namen).
+  // Das Praefix ist der Vertrag mit _irLyuNachlese — `@` kommt in keinem
+  // Bezeichner vor.
+  fn _modInitLyuName(): pchar {
+    var pre: pchar := "__lyx_modinit@";
+    if self.irUnitTag != 0 {
+      var tb: int64 := alloc(14 + self.irUnitTagLen + 1);
+      memcpy(tb, pre as int64, 14);
+      memcpy(tb + 14, self.irUnitTag, self.irUnitTagLen);
+      poke8(tb + 14 + self.irUnitTagLen, 0);
+      return tb as pchar;
+    }
+    if (self.irSrcPath as int64) == 0 || self.irSrcLen <= 0 {
+      EPrintStrLn("lyxc: interner Fehler (#2136): vorkompilierte Unit ohne Quellpfad."c);
+      exit(1);
+    }
+    var sp: int64 := self.irSrcPath as int64;
+    var anf: int64 := 0;
+    var ende: int64 := self.irSrcLen;
+    var i: int64 := 0;
+    var h: int64 := 1469598103;
+    while i < self.irSrcLen {
+      var ch: int64 := peek8(sp + i) & 255;
+      if ch == 47 { anf := i + 1; ende := self.irSrcLen; }
+      if ch == 46 && i >= anf { ende := i; }
+      h := h * 31 + ch;
+      i := i + 1;
+    }
+    var bl: int64 := ende - anf;
+    if bl < 0 { bl := 0; }
+    var b: int64 := alloc(14 + bl + 1 + 16 + 1);
+    memcpy(b, pre as int64, 14);
+    memcpy(b + 14, sp + anf, bl);
+    var p: int64 := 14 + bl;
+    poke8(b + p, 35);                                  // '#'
+    p := p + 1;
+    var k: int64 := 15;
+    while k >= 0 {
+      var nib: int64 := (h >> (k * 4)) & 15;
+      if nib < 10 { poke8(b + p, 48 + nib); } else { poke8(b + p, 87 + nib); }
+      p := p + 1;
+      k := k - 1;
+    }
+    poke8(b + p, 0);
+    return b as pchar;
+  }
+
+  // #2136: Nach dem Uebernehmen einer .lyu (_irUebernehmeLyu).
+  //
+  // 1. Die Modulvariablen der .lyu belegen jetzt die Plaetze ab dem alten
+  //    globalLen. Das Verzeichnis (globalNameCnt) wusste davon nichts: die
+  //    naechste Modulvariable des Programms bekam denselben Platz wie die
+  //    erste der .lyu und setzte globalLen wieder zurueck — schrieb das
+  //    Programm seine Variable, aenderte sich die der Unit (bis 1.2.15A, auch
+  //    ohne Laufzeit-Anfangswerte). Die Plaetze werden hier namenlos
+  //    belegt; die .lyu traegt keine Namen zu ihnen.
+  // 2. Die Funktionen ab `vor` nach "__lyx_modinit@" durchsuchen und jede in
+  //    die Liste fuer __lyx_modinit eintragen — einmal je Name, denn eine .lyu
+  //    kann ueber zwei Wege in den Importgraphen kommen. Eine alte .lyu ohne
+  //    solche Funktion traegt nichts ein. `spaet` = 1 heisst: der Vorlauf ist
+  //    vorbei; war bis dahin nichts zu initialisieren, ist main schon ohne
+  //    Aufruf entstanden (bzw. entsteht so) — dann laut statt still 0.
+  fn _irLyuNachlese(vor: int64, spaet: int64) {
+    var gl: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALLEN);
+    while self.globalNameCnt < gl {
+      if self.globalNameCnt >= self.globalNameCap {
+        var gnc: int64 := self.globalNameCap * 2;
+        var gnb: int64 := alloc(gnc * 32);
+        memcpy(gnb, self.globalNameBuf, self.globalNameCnt * 32);
+        self.globalNameBuf := gnb;
+        self.globalNameCap := gnc;
+      }
+      var gr: int64 := self.globalNameBuf + self.globalNameCnt * 32;
+      poke64(gr + 0, 0);
+      poke64(gr + GLOBAL_REC_OFF_NAMELEN, 0);                // kein Name: findet niemand
+      poke64(gr + GLOBAL_REC_OFF_IDX, self.globalNameCnt);
+      poke64(gr + GLOBAL_REC_OFF_INIT, 0);
+      self.globalNameCnt := self.globalNameCnt + 1;
+    }
+    if self.irInitModus == 2 { return; }   // eine Unit ruft fremde Anfangswerte nicht
+    var fb: int64 := peek64(self.ir + IR_MOD_OFF_FUNCBUF);
+    var sb: int64 := peek64(self.ir + IR_MOD_OFF_STRBUF);
+    var fc: int64 := peek64(self.ir + IR_MOD_OFF_FUNCLEN);
+    var pre: pchar := "__lyx_modinit@";
+    var f: int64 := vor;
+    while f < fc {
+      var off: int64 := peek64(fb + f * IR_FUNC_SIZE);
+      var ln:  int64 := peek64(fb + f * IR_FUNC_SIZE + IR_FUNC_OFF_NAMELEN);
+      var pass: int64 := 0;
+      if ln > 14 {
+        pass := 1;
+        var j: int64 := 0;
+        while j < 14 {
+          if peek8(sb + off + j) != peek8((pre as int64) + j) { pass := 0; j := 14; }
+          j := j + 1;
+        }
+      }
+      if pass != 0 {
+        var schon: int64 := 0;
+        var m: int64 := 0;
+        while m < self.modInitN {
+          var mp: int64 := peek64(self.modInitBuf + m * 16);
+          var ml: int64 := peek64(self.modInitBuf + m * 16 + 8);
+          if ml == ln {
+            var gl: int64 := 1;
+            var q: int64 := 0;
+            while q < ln {
+              if peek8(mp + q) != peek8(sb + off + q) { gl := 0; q := ln; }
+              q := q + 1;
+            }
+            if gl != 0 { schon := 1; m := self.modInitN; }
+          }
+          m := m + 1;
+        }
+        if schon == 0 {
+          if spaet != 0 && self.modInitNoetig == 0 {
+            EPrintStr("lyxc: Unit-Anfangswerte aus einer .lyu ("c);
+            sys_write(2, sb + off, ln);
+            EPrintStrLn(") ohne Aufrufer (#2136):"c);
+            EPrintStrLn("  der Vorlauf hat die .lyu nicht gesehen, main ruft __lyx_modinit nicht."c);
+            exit(1);
+          }
+          // Name kopieren: der Zeichenpuffer des Moduls kann noch wachsen.
+          var nb: int64 := alloc(ln + 1);
+          memcpy(nb, sb + off, ln);
+          poke8(nb + ln, 0);
+          if self.modInitN >= self.modInitCap {
+            var nc: int64 := self.modInitCap * 2;
+            var nbuf: int64 := alloc(nc * 16);
+            memcpy(nbuf, self.modInitBuf, self.modInitN * 16);
+            self.modInitBuf := nbuf;
+            self.modInitCap := nc;
+          }
+          poke64(self.modInitBuf + self.modInitN * 16, nb);
+          poke64(self.modInitBuf + self.modInitN * 16 + 8, ln);
+          self.modInitN := self.modInitN + 1;
+          self.modInitNoetig := 1;
+        }
+      }
+      f := f + 1;
+    }
   }
 
   // Der Aufruf von __lyx_modinit am Anfang von main (lowerFunc).
@@ -9994,8 +10376,8 @@ pub type IRLower = class {
     self.globalFuncCount += 1;
     var capP: int64 := 0;
     if n > 0 {
-      capP := alloc(n * 24);
-      memcpy(capP, self.clScanP, n * 24);
+      capP := alloc(n * 32);
+      memcpy(capP, self.clScanP, n * 32);
     }
     // Zur Erzeugung vormerken.
     if self.clQCap == 0 {
@@ -10024,7 +10406,7 @@ pub type IRLower = class {
     self.irAddInstrDirect(IRO_ALLOC, env, envSz, -1, 0);
     var i: int64 := 0;
     while i < n {
-      var e: int64 := capP + i * 24;
+      var e: int64 := capP + i * 32;
       var np: pchar := peek64(e) as pchar;
       var nl: int64 := peek64(e + 8);
       var v: int64 := self.allocTemp();
@@ -10055,7 +10437,7 @@ pub type IRLower = class {
   fn _clErfasst(cl: int64): int64 {
     if self.clScanCap == 0 {
       self.clScanCap := 16;
-      self.clScanP := alloc(self.clScanCap * 24);
+      self.clScanP := alloc(self.clScanCap * 32);
     }
     self.clScanN := 0;
     if cl < 0 { return 0; }
@@ -10075,10 +10457,14 @@ pub type IRLower = class {
     }
     while ni >= 0 && ni < self.nodeCount {
       var k: int64 := self.nodeKind(ni);
-      if k == NK_IDENT {
+      // #2133: auch der AUFRUFNAME — `c()` im Rumpf meint das Lambda in der
+      // Variablen c. Er steht nicht als NK_IDENT im Baum, wurde deshalb nie
+      // erfasst, und der Rumpf fand c nicht ("unbekannter Name im Aufruf").
+      if k == NK_IDENT || (k == NK_CALL && self.nodeIVal(ni) == 0) {
         var np: pchar := self.nodeSVal(ni);
         var nl: int64 := self.nodeSLen(ni);
         var nimm: int64 := 1;
+        var satz: int64 := 0;
         var p: int64 := ph;
         while p >= 0 {
           if self.seq(self.nodeSVal(p), self.nodeSLen(p), np, nl) { nimm := 0; }
@@ -10086,31 +10472,37 @@ pub type IRLower = class {
         }
         var j: int64 := 0;
         while j < self.clScanN {
-          var e: int64 := self.clScanP + j * 24;
+          var e: int64 := self.clScanP + j * 32;
           if self.seq(peek64(e) as pchar, peek64(e + 8), np, nl) { nimm := 0; }
           j := j + 1;
         }
         var typ: int64 := 0 - 1;
         if nimm != 0 {
-          if self._findLocalSlot(np, nl) >= 0 {
+          var ls: int64 := self._findLocalSlot(np, nl);
+          if ls >= 0 {
             typ := self._localTypeNode(np, nl);
-          } else if self._clIstSelf(np, nl) != 0 {
+            satz := self._clIstFett(ls);   // #2133: Darstellung mitnehmen
+          } else if k == NK_IDENT && self._clIstSelf(np, nl) != 0 {
             typ := self.curMethodClassType;
           } else {
             var ci: int64 := self._clCapIdx(np, nl);
             if ci < 0 { nimm := 0; }
-            else { typ := peek64(self.clCapP + ci * 24 + 16); }
+            else {
+              typ := peek64(self.clCapP + ci * 32 + 16);
+              satz := self._clCapSatz(ci);
+            }
           }
         }
         if nimm != 0 {
           if self.clScanN >= self.clScanCap {
             var nc: int64 := self.clScanCap * 2;
-            var nb: int64 := alloc(nc * 24);
-            memcpy(nb, self.clScanP, self.clScanN * 24);
+            var nb: int64 := alloc(nc * 32);
+            memcpy(nb, self.clScanP, self.clScanN * 32);
             self.clScanP := nb; self.clScanCap := nc;
           }
-          var e2: int64 := self.clScanP + self.clScanN * 24;
+          var e2: int64 := self.clScanP + self.clScanN * 32;
           poke64(e2, np as int64); poke64(e2 + 8, nl); poke64(e2 + 16, typ);
+          poke64(e2 + 24, satz);   // #2133: 1 = haelt einen Satz {Code, Umgebung}
           self.clScanN := self.clScanN + 1;
         }
       }
@@ -10130,7 +10522,7 @@ pub type IRLower = class {
   fn _clCapIdx(np: pchar, nl: int64): int64 {
     var i: int64 := 0;
     while i < self.clCapN {
-      var e: int64 := self.clCapP + i * 24;
+      var e: int64 := self.clCapP + i * 32;
       if self.seq(peek64(e) as pchar, peek64(e + 8), np, nl) { return i; }
       i := i + 1;
     }
@@ -10962,23 +11354,9 @@ pub type IRLower = class {
     var lsSrcLen: int64 := _irLitLen(self.nodeSVal(nd) as int64, self.nodeSLen(nd));   // #1388
     if (lsSrcLen < 0) { lsSrcLen := 0; }
     var lsBuf: int64 := alloc(lsSrcLen + 8);
-    var lsOut: int64 := 0;
-    var lsI:   int64 := 0;
-    while lsI < lsSrcLen {
-      var lsC: int64 := peek8(lsStart + lsI);
-      if lsC == 92 && lsI + 1 < lsSrcLen {       // backslash-Escape
-        var lsN: int64 := peek8(lsStart + lsI + 1);
-        if lsN == 110      { lsC := 10; lsI := lsI + 1; }   // \n
-        else if lsN == 116 { lsC := 9;  lsI := lsI + 1; }   // \t
-        else if lsN == 114 { lsC := 13; lsI := lsI + 1; }   // \r
-        else if lsN == 92  { lsC := 92; lsI := lsI + 1; }   // \\
-        else if lsN == 34  { lsC := 34; lsI := lsI + 1; }   // \"
-        else if lsN == 48  { lsC := 0;  lsI := lsI + 1; }   // \0
-      }
-      poke8(lsBuf + lsOut, lsC);
-      lsOut += 1;
-      lsI += 1;
-    }
+    // #2130: die Auswertung steht EINMAL in _irStrEscapes (dieselbe Liste
+    // wie cg_addStr auf x86); lsOut ist die ausgewertete Laenge.
+    var lsOut: int64 := _irStrEscapes(lsStart, lsSrcLen, lsBuf);
     return self.irAddString(lsBuf as pchar, lsOut);
   }
 
@@ -12243,6 +12621,7 @@ pub type IRLower = class {
       // die erste gleichnamige des Moduls, eine innere eingeschlossen.
       var rtD: int64 := self._callDeclNi(nd);
       if rtD < 0 { return 0 - 1; }
+      if self.nodeIVal(nd) == 2 { return self._genRetTyp(rtD, nd); }   // #2134
       return self.nodeC1(rtD);
     }
 
@@ -12631,20 +13010,9 @@ pub type IRLower = class {
     var p: int64 := self.nodeC0(node);
     while p >= 0 { self.allocParam(); np := np + 1; p := self.nodeNext(p); }
     var env: int64 := 0 - 1;
-    var regs: int64 := np;
-    if capN > 0 { env := self.allocParam(); regs := regs + 1; }
-    if regs > 8 {
-      // Die IR-Backends uebergeben acht Registerargumente (x0..x7, a0..a7);
-      // ein neuntes ginge still verloren.
-      EPrintStr("lyxc: --target="c);
-      EPrintStr(self._targetName());
-      EPrintStr(": Lambda mit "c);
-      EPrintInt(np);
-      EPrintStr(" Parametern"c);
-      if capN > 0 { EPrintStr(" und Umgebung"c); }
-      EPrintStrLn(" — der IR-Weg uebergibt hoechstens 8 Registerargumente (#2108)."c);
-      exit(1);
-    }
+    // #2132: Parameter ab dem neunten kommen ueber den Stapel (Prolog der
+    // IR-Backends); die Grenze von acht aus #2108 entfaellt.
+    if capN > 0 { env := self.allocParam(); }
     self.retValTemp := self.allocTemp();
     self.funcExitLabel := self.genLabel();
     self.funcInstrStart := peek64(self.ir + IR_MOD_OFF_INSTRLEN);
@@ -12694,11 +13062,10 @@ pub type IRLower = class {
   //    `fn(...)`-Typ wird abgewiesen (cg_rejectCapturingClosure).
   //  * ohne Typangabe: Satz, wenn der Startwert ein einfangendes Lambda ist,
   //    ein Aufruf mit Funktionstyp als Rueckgabe (`var c := makeCounter();`)
-  //    oder die Kopie eines solchen Locals.
-  // Abweichung: x86 nimmt JEDEN untypisierten Startwert, der kein Lambda ohne
-  // Erfassung und keine Kopie eines duennen Locals ist, als Satz — auch
-  // `var h := plus;`, dessen Aufruf dort abstuerzt. Hier bleibt der
-  // Funktionsname ein duenner Zeiger, wie er es im IR-Weg seit #1806 war.
+  //    oder die Kopie eines solchen Locals (oder einer solchen Erfassung).
+  //    Alles andere — `var h := plus;` — ist die Adresse. Bis #2133 nahm x86
+  //    dort jeden anderen untypisierten Startwert als Satz und stuerzte bei
+  //    `h(2, 3)` ab; seither stimmen die beiden Wege ueberein.
   fn _clVarMerken(stmt: int64, slot: int64) {
     var init: int64 := self.nodeC1(stmt);
     if init < 0 { return; }
@@ -12722,25 +13089,11 @@ pub type IRLower = class {
     }
     var fett: int64 := 0;
     if ik == NK_CLOSURE && n > 0 { fett := 1; }
-    if ik == NK_CALL {
-      var rt: int64 := self._exprTypeNode(init);
-      if rt >= 0 {
-        if self.nodeKind(rt) == NK_FN_PTR { fett := 1; }
-        else if self.nodeKind(rt) == NK_TYPE_NAME {
-          // `type F = fn(...): R;` — Alias auf einen Funktionstyp (iv-Bit 1,
-          // c0 = NK_FN_PTR), wie _isMethodAlias fuer method(...).
-          var ad: int64 := self._findTypeDecl(self.nodeSVal(rt), self.nodeSLen(rt));
-          if ad >= 0 && (self.nodeIVal(ad) & 2) != 0 {
-            var ab: int64 := self.nodeC0(ad);
-            if ab >= 0 && self.nodeKind(ab) == NK_FN_PTR { fett := 1; }
-          }
-        }
-      }
-    }
-    if ik == NK_IDENT {
-      var qs: int64 := self._findLocalSlot(self.nodeSVal(init), self.nodeSLen(init));
-      if qs >= 0 && qs != slot && self._clIstFett(qs) != 0 { fett := 1; }
-    }
+    // #2133: Aufruf mit Funktionstyp als Rueckgabe (eigene oder importierte
+    // Unit, Methode), Kopie eines Satz-Locals oder einer Satz-Erfassung —
+    // entschieden VOR dem Senken des Startwerts (clVdSatz), bevor die eigene
+    // Variable als Local sichtbar war.
+    if self.clVdSatz != 0 { fett := 1; }
     if fett == 0 { return; }
     if self.clFettCap == 0 {
       self.clFettCap := 16;
@@ -12775,40 +13128,230 @@ pub type IRLower = class {
     if self._clIstFett(slot) == 0 { return 0 - 1; }
     var satz: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_LOAD_LOCAL, satz, slot, -1, 0);
-    // Erst ALLE Argumente auswerten: ein Aufruf darin belegt die Slots 0..N-1
-    // selbst, ein schon dort abgelegtes Argument waere danach ueberschrieben.
-    var n: int64 := 0;
-    var a: int64 := arg0;
-    while a >= 0 { n := n + 1; a := self.nodeNext(a); }
-    if n + 1 > 8 {
-      EPrintStr("lyxc: --target="c);
-      EPrintStr(self._targetName());
-      EPrintStr(": Aufruf eines Lambdas mit "c);
-      EPrintInt(n);
-      EPrintStrLn(" Argumenten und Umgebung — der IR-Weg uebergibt hoechstens 8 Registerargumente (#2108)."c);
-      exit(1);
-    }
-    var temps: int64 := alloc((n + 1) * 8);
-    var i: int64 := 0;
-    a := arg0;
-    while a >= 0 {
-      poke64(temps + i * 8, self.lowerExpr(a));
-      i := i + 1;
-      a := self.nodeNext(a);
-    }
+    return self._clRufSatz(satz, arg0, dest);
+  }
+
+  // #2133: duenner Aufruf ueber die Adresse im Temp `code`.
+  // #2132: Argumente in einen hohen Block (src2 = argBase) wie beim direkten
+  // Aufruf; ein Aufruf in einem Argument belegt einen eigenen, hoeheren Block
+  // und kann die schon abgelegten nicht ueberschreiben (`h(1, plus(2, 3))`).
+  fn _clRufDuenn(code: int64, arg0: int64, dest: int64): int64 {
+    var b: int64 := self._irArgBlock(arg0, 0);
+    var n: int64 := self._irArgsLegen(arg0, b, 0);
+    self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, code, b, n);
+    return dest;
+  }
+
+  // #2133: Aufruf ueber einen Satz {Code, Umgebung} im Temp `satz` (Local
+  // oder Erfassung). Die Umgebung folgt als verdecktes letztes Argument im
+  // selben hohen Block (#2132) — mehr als 8 Argumente gehen ueber den Stapel.
+  fn _clRufSatz(satz: int64, arg0: int64, dest: int64): int64 {
+    var b: int64 := self._irArgBlock(arg0, 1);
+    var n: int64 := self._irArgsLegen(arg0, b, 0);
     var code: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_LOAD_FIELD, code, satz, 0, 0);
     var env: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_LOAD_FIELD, env, satz, 8, 0);
-    i := 0;
-    while i < n {
-      self.irAddInstrDirect(IRO_STORE_LOCAL, i, peek64(temps + i * 8), -1, 0);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, b + n, env, -1, 0);
+    self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, code, b, n + 1);
+    return dest;
+  }
+
+  // ==================================================================
+  // #2133: Funktionswerte — Adresse oder Satz. Dieselbe Semantik wie
+  // codegen_x86.lyx ("Funktionswerte" bei cg_localRufArt) — die beiden
+  // muessen uebereinstimmen:
+  //  * Ein Local haelt einen Satz, wenn seine Deklaration es sagt
+  //    (_clVarMerken); sonst die Adresse.
+  //  * Ueber eine RUECKGABEGRENZE geht ein Funktionswert immer als Satz:
+  //    eine Funktion mit Funktionstyp als Rueckgabe packt eine Adresse in
+  //    {Adresse, 0} ein. Bis #2133 lieferte `mk7()` (Lambda ohne Erfassung)
+  //    die Adresse, `var f := mk7()` galt aber als Satz — Absturz.
+  //  * Wo eine Adresse gebraucht wird, wird ein Satz ausgepackt — nur mit
+  //    Umgebung 0, sonst bricht das Programm laut ab.
+  //  * Ein Satz wird mit der Umgebung als VERDECKTEM LETZTEM Argument gerufen;
+  //    eine eingepackte Adresse bekommt so eine 0, die sie nicht liest.
+  // ==================================================================
+
+  // Ist der Typknoten (in der GERADE eingesetzten Tabelle) ein Funktionstyp —
+  // `fn(...): R` oder `type F = fn(...): R`?
+  fn _clTypIstFnWert(tn: int64): int64 {
+    if tn < 0 { return 0; }
+    var k: int64 := self.nodeKind(tn);
+    if k == NK_FN_PTR { return 1; }
+    if k != NK_TYPE_NAME { return 0; }
+    if self.nodeSLen(tn) <= 0 { return 0; }
+    var ad: int64 := self._findTypeDecl(self.nodeSVal(tn), self.nodeSLen(tn));
+    if ad < 0 { return 0; }
+    if (self.nodeIVal(ad) & 2) == 0 { return 0; }
+    var ab: int64 := self.nodeC0(ad);
+    if ab >= 0 && self.nodeKind(ab) == NK_FN_PTR { return 1; }
+    return 0;
+  }
+
+  // Die Deklaration (np, nl) — freie Funktion (cl == 0) oder Methode der
+  // Klasse (cp, cl) — in irgendeinem Modul der Importliste: hat sie einen
+  // Funktionstyp als Rueckgabe? Die Frage stellt lowerExpr fuer JEDEN Aufruf;
+  // deshalb einmal je Importstand ein Verzeichnis der Deklarationen mit
+  // Funktionstyp-Rueckgabe (meist leer), danach nur noch ein Vergleich je
+  // Eintrag. Der Knotenindex gilt nur in seiner Tabelle — beim Bauen wird je
+  // Modul umgeschaltet (wie _rtBaue). Eintrag 32 B: Klasse (0 = frei), Laenge,
+  // Name, Laenge.
+  fn _clDeclFnWert(cp: pchar, cl: int64, np: pchar, nl: int64): int64 {
+    if self.clFwStand != self.impLstN + 1 {
+      self.clFwStand := self.impLstN + 1;
+      self.clFwN := 0;
+      var svS: pchar := self.src;
+      var svN: int64 := self.nodes;
+      var svC: int64 := self.nodeCount;
+      var m: int64 := 0;
+      while m < self.impLstN {
+        self.src       := peek64(self.impLstSrc + m * 8) as pchar;
+        self.nodes     := peek64(self.impLstNodes + m * 8);
+        self.nodeCount := peek64(self.impLstCnt + m * 8);
+        var d: int64 := peek64(self.impLstHead + m * 8);
+        while d >= 0 {
+          var dk: int64 := self.nodeKind(d);
+          // Kandidaten: die freie Funktion selbst oder die Methoden der Klasse.
+          var kand: int64 := 0 - 1;
+          var kp: int64 := 0;
+          var kl: int64 := 0;
+          if dk == NK_FUNC_DECL { kand := d; }
+          else if dk == NK_TYPE_DECL { kand := self.nodeC1(d); kp := self.nodeSVal(d) as int64; kl := self.nodeSLen(d); }
+          while kand >= 0 {
+            if self.nodeKind(kand) == NK_FUNC_DECL && self._clTypIstFnWert(self.nodeC1(kand)) != 0 {
+              if self.clFwN >= self.clFwCap {
+                var nc: int64 := self.clFwCap * 2;
+                if nc < 16 { nc := 16; }
+                var nb: int64 := alloc(nc * 32);
+                if self.clFwN > 0 { memcpy(nb, self.clFwBuf, self.clFwN * 32); }
+                self.clFwBuf := nb; self.clFwCap := nc;
+              }
+              var e: int64 := self.clFwBuf + self.clFwN * 32;
+              poke64(e, kp); poke64(e + 8, kl);
+              poke64(e + 16, self.nodeSVal(kand) as int64); poke64(e + 24, self.nodeSLen(kand));
+              self.clFwN := self.clFwN + 1;
+            }
+            if dk == NK_FUNC_DECL { kand := 0 - 1; } else { kand := self.nodeNext(kand); }
+          }
+          d := self.nodeNext(d);
+        }
+        m := m + 1;
+      }
+      self.src := svS; self.nodes := svN; self.nodeCount := svC;
+    }
+    var i: int64 := 0;
+    while i < self.clFwN {
+      var e2: int64 := self.clFwBuf + i * 32;
+      if peek64(e2 + 8) == cl && self._rtGleich(peek64(e2 + 16), peek64(e2 + 24), np as int64, nl) != 0 {
+        if cl == 0 { return 1; }
+        if self._rtGleich(peek64(e2), cl, cp as int64, cl) != 0 { return 1; }
+      }
       i := i + 1;
     }
-    free(temps, (n + 1) * 8);
-    self.irAddInstrDirect(IRO_STORE_LOCAL, n, env, -1, 0);
-    self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, code, -1, n + 1);
-    return dest;
+    return 0;
+  }
+
+  // Liefert der Aufruf einen Funktionswert ueber eine Rueckgabegrenze (also
+  // einen Satz)? Freie Funktion (eigene Unit, innere oder importierte) oder
+  // Methode.
+  fn _clRufLiefertFnWert(expr: int64): int64 {
+    if self.nodeKind(expr) != NK_CALL { return 0; }
+    var np: pchar := self.nodeSVal(expr);
+    var nl: int64 := self.nodeSLen(expr);
+    if self.nodeIVal(expr) == 1 {
+      var cd: int64 := self._typeNodeToDecl(self._exprTypeNode(self.nodeC0(expr)));
+      if cd >= 0 { return self._clTypIstFnWert(self._methodRetTypeIn(cd, np, nl)); }
+      if self._exprKlasse(self.nodeC0(expr)) == 0 { return 0; }
+      return self._clDeclFnWert(self._ekP, self._ekL, np, nl);
+    }
+    if self.nodeIVal(expr) != 0 { return 0; }
+    // Ein Aufruf ueber ein Local oder eine Erfassung ruft keine Funktion.
+    if self._findLocalSlot(np, nl) >= 0 { return 0; }
+    if self._clCapIdx(np, nl) >= 0 { return 0; }
+    var d: int64 := self._callDeclNi(expr);
+    if d >= 0 { return self._clTypIstFnWert(self.nodeC1(d)); }
+    return self._clDeclFnWert(0 as pchar, 0, np, nl);
+  }
+
+  // Haelt die Erfassung `ci` des Lambdas, dessen Rumpf gerade entsteht, einen
+  // Satz? (Vermerkt bei der Erzeugung, _clScan; Eintrag + 24.) Zugleich das
+  // zehnte neue Mitglied von #2133 — die Methodenzahl von IRLower muss
+  // gerade bleiben.
+  fn _clCapSatz(ci: int64): int64 {
+    if ci < 0 { return 0; }
+    return peek64(self.clCapP + ci * 32 + 24);
+  }
+
+  // Liefert der Ausdruck einen Satz? Bezeichner eines Satz-Locals oder einer
+  // Satz-Erfassung, oder ein Aufruf nach _clRufLiefertFnWert.
+  fn _clSatzWert(expr: int64): int64 {
+    if expr < 0 { return 0; }
+    var k: int64 := self.nodeKind(expr);
+    if k == NK_IDENT {
+      var np: pchar := self.nodeSVal(expr);
+      var nl: int64 := self.nodeSLen(expr);
+      var s: int64 := self._findLocalSlot(np, nl);
+      if s >= 0 { return self._clIstFett(s); }
+      var ci: int64 := self._clCapIdx(np, nl);
+      if ci >= 0 { return self._clCapSatz(ci); }
+      return 0;
+    }
+    if k == NK_CALL { return self._clRufLiefertFnWert(expr); }
+    return 0;
+  }
+
+  // Satz -> Adresse. Umgebung != 0: laut abbrechen (ein `fn(...)`-Typ kann
+  // sie nicht tragen).
+  fn _clAuspacken(satz: int64): int64 {
+    var env: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, env, satz, 8, 0);
+    var nullT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, nullT, -1, -1, 0);
+    var gleich: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CMP_EQ, gleich, env, nullT, 0);
+    var lFehl: int64 := self.genLabel();
+    var lEnde: int64 := self.genLabel();
+    self.irEmitBrFalse(gleich, lFehl);
+    var code: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_FIELD, code, satz, 0, 0);
+    self.irEmitJmp(lEnde);
+    self.irEmitLabel(lFehl);
+    var txt: pchar := "Laufzeitfehler: einfangendes Lambda, wo nur eine Funktionsadresse Platz hat (fn-Typ, Argument) (#2133)"c;
+    var mOff: int64 := self.irAddString(txt, StrLen(txt));
+    var msg: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_STR, msg, -1, -1, mOff);
+    self.irAddInstrDirect(IRO_PANIC, -1, msg, -1, 0);
+    self.irEmitLabel(lEnde);
+    return code;
+  }
+
+  // Adresse -> Satz {Adresse, 0}.
+  fn _clEinpacken(code: int64): int64 {
+    var sz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, sz, -1, -1, 16);
+    var satz: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, satz, sz, -1, 0);
+    var nullT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, nullT, -1, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, 0, code, satz, 0);
+    self.irAddInstrDirect(IRO_STORE_FIELD, 8, nullT, satz, 0);
+    return satz;
+  }
+
+  // Den Ausdruck als Satz senken (Rueckgabe einer Funktion mit Funktionstyp,
+  // Zuweisung an ein Satz-Local): ist er schon einer, nicht auspacken; sonst
+  // die Adresse einpacken.
+  fn _clAlsSatz(expr: int64): int64 {
+    if self.nodeKind(expr) == NK_CLOSURE {
+      if self._clErfasst(expr) > 0 { return self.lowerExpr(expr); }
+      return self._clEinpacken(self.lowerExpr(expr));
+    }
+    if self._clSatzWert(expr) != 0 {
+      self.clSatzKontext := 1;
+      return self.lowerExpr(expr);
+    }
+    return self._clEinpacken(self.lowerExpr(expr));
   }
 
   // Ein einfangendes Lambda als ARGUMENT landet in einem `fn(...)`-Parameter,
@@ -13016,6 +13559,55 @@ pub type IRLower = class {
       i += 1;
     }
     return tn;
+  }
+
+  // #2134: Rueckgabetyp eines generischen Aufrufs `f<P>(...)` (Deklaration
+  // rtD, Aufruf nd). Ist er ein Typparameter, gilt das Typargument an seiner
+  // Stelle — in einer Spezialisierung selbst noch einmal ersetzt. Ohne das
+  // galt `getP<T>(p).y` als Feld eines unbekannten Typs; x86 sieht den
+  // ersetzten Rueckgabetyp ueber die Signatur der Spezialisierung.
+  fn _genRetTyp(rtD: int64, nd: int64): int64 {
+    var rtN: int64 := self.nodeC1(rtD);
+    if (rtN < 0 || self.nodeKind(rtN) != NK_TYPE_NAME || self.nodeC0(rtN) >= 0) { return rtN; }
+    var gTp: int64 := self.nodeC3(rtD);
+    var gTa: int64 := self.nodeC2(nd);
+    while (gTp >= 0 && gTa >= 0 && self.nodeKind(gTp) == NK_TYPE_PARAM) {
+      if (self.seq(self.nodeSVal(gTp), self.nodeSLen(gTp), self.nodeSVal(rtN), self.nodeSLen(rtN))) {
+        return self._genSubst(gTa);
+      }
+      gTp := self.nodeNext(gTp);
+      gTa := self.nodeNext(gTa);
+    }
+    return rtN;
+  }
+
+  // #2134: Feldzugriff (Lesen oder Zuweisen), dessen Versatz sich nicht
+  // bestimmen laesst — laut statt eines unbeschriebenen Temps. Im
+  // typgeloeschten Rumpf einer generischen Funktion (erreichbar nur ueber
+  // einen Aufruf OHNE Typargumente, `gety(p)`) ist T unbekannt; dort bricht
+  // der Rumpf zur LAUFZEIT ab, an genau dieser Stelle — derselbe Weg wie
+  // cg_genFeldOffen auf x86, die beiden muessen uebereinstimmen. dest >= 0:
+  // Lesezugriff, der Temp wird beschrieben.
+  fn _feldOffen(expr: int64, dest: int64) {
+    var fd: int64 := self.curFunc;
+    if (fd >= 0 && self.genSubstN == 0) {
+      var tp: int64 := self.nodeC3(fd);
+      if (tp >= 0 && tp < self.nodeCount && self.nodeKind(tp) == NK_TYPE_PARAM) {
+        var mt: pchar := "lyxc: generische Funktion ohne Typargumente aufgerufen, Feld haengt am Typparameter (#2134)\n"c;
+        var mOff: int64 := self.irAddString(mt, StrLen(mt));
+        var mT: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_CONST_STR, mT, -1, -1, mOff);
+        self.irAddInstrDirect(IRO_PANIC, -1, mT, -1, 0);
+        if (dest >= 0) { self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, 0); }
+        return;
+      }
+    }
+    EPrintStr("error: #2134: Feld nicht aufloesbar (Typ der Basis unbekannt): "c);
+    sys_write(2, self.nodeSVal(expr) as int64, self.nodeSLen(expr));
+    EPrintStr(" (Zeile "c);
+    EPrintInt(self._lineOf(expr));
+    EPrintStrLn(")"c);
+    exit(1);
   }
 
   fn _genFehler(msg: pchar, np: pchar, nl: int64) {

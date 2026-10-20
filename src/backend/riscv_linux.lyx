@@ -838,20 +838,16 @@ pub type EmitRISCV64 = class {
       // riscv las sie bis hierher aus Slot 0 und uebergab damit irgendeinen
       // fremden Wert; arm64 und lyxos rechnen laengst ab argBase.
       var argCount: int64 := imm;
-      var argBase:  int64 := src2;
-      if argBase < 0 { argBase := 0; }
-      var ai: int64 := 0;
-      while ai < argCount && ai < 8 {
-        self.rv_loadSlot(argBase + ai);
-        self.rv_MV(RV_A0 + ai, RV_T0);
-        ai := ai + 1;
-      }
+      // #2132: ab dem neunten Argument ueber den Stapel (rv_StapelArgs).
+      var stBytes: int64 := self.rv_StapelArgs(src2, argCount);
+      self.rv_RegArgs(src2, argCount);
       var patchOff: int64 := self.codeLen;
       // #2112: AUIPC ra + JALR ra statt JAL ra (+/-1 MiB) — beide Platzhalter,
       // applyPatches traegt hoch/tief ein.
       self.rv_e32(0x17 | (RV_RA << 7));                       // AUIPC ra, 0
       self.rv_e32(0x67 | (RV_RA << 7) | (RV_RA << 15));       // JALR ra, 0(ra)
       self.addPatch(patchOff, src1, RV_PATCH_BL, 0);
+      if stBytes > 0 { self.rv_ADDI(RV_SP, RV_SP, stBytes); }   // #2132: Stapelargumente abraeumen
       self.rv_MV(RV_T0, RV_A0);
       self.rv_storeSlot(dest);
     }
@@ -865,17 +861,15 @@ pub type EmitRISCV64 = class {
     // so weit, weil die Namensaufloesung in ir_lower vorher scheiterte. Der
     // laute Opcode-Waechter hat ihn beim Beheben von #1806 sofort gemeldet —
     // so soll es sein.
+    // #2132: src2 = argBase des Argumentblocks, wie beim direkten Aufruf.
     if op == IRO_CALL_INDIRECT {
       var ciCount: int64 := imm;
-      var ciI: int64 := 0;
-      while ciI < ciCount && ciI < 8 {
-        self.rv_loadSlot(ciI);
-        self.rv_MV(RV_A0 + ciI, RV_T0);
-        ciI := ciI + 1;
-      }
+      var ciSt: int64 := self.rv_StapelArgs(src2, ciCount);
+      self.rv_RegArgs(src2, ciCount);
       self.rv_loadSlot(src1);                    // t0 = Zieladresse
       // JALR ra, t0, 0
       self.rv_e32(0x67 | (RV_RA << 7) | (0 << 12) | (RV_T0 << 15));
+      if ciSt > 0 { self.rv_ADDI(RV_SP, RV_SP, ciSt); }   // #2132
       self.rv_MV(RV_T0, RV_A0);
       self.rv_storeSlot(dest);
     }
@@ -1135,6 +1129,52 @@ pub type EmitRISCV64 = class {
         EPrintStrLn("error: asm: unbekannte Mnemonic (riscv)"c);
         exit(1);
       }
+    }
+  }
+
+  // #2132: Argumente ab dem neunten nach dem RISC-V-psABI (LP64) auf den
+  // Stapel — 8-Byte-Plaetze ab sp, sp bleibt 16-ausgerichtet. Der Platz wird
+  // am Stueck angelegt und nach dem Aufruf wieder freigegeben; die Slots
+  // liest dieser Weg s0-relativ. Liefert die Byte-Zahl fuer das ADDI danach.
+  // Bis 1.2.15A wurde alles ab dem neunten Argument still verworfen.
+  // Dieselbe Rechnung wie _a64StapelArgs in emit_arm64.lyx — die beiden
+  // muessen uebereinstimmen.
+  fn rv_StapelArgs(argBase: int64, argCount: int64): int64 {
+    if argCount <= 8 { return 0; }
+    if argBase < 0 {
+      // Alte Konvention (Argumente im Kratzstreifen 0..7): dort ist fuer ein
+      // neuntes kein Platz. Erzeugt ir_lower seit #2132 nicht mehr.
+      EPrintStr("error: riscv: Aufruf mit "c); EPrintInt(argCount);
+      EPrintStrLn(" Argumenten ohne Argumentblock — mehr als acht gehen so nicht (#2132)."c);
+      exit(1);
+    }
+    var stBytes: int64 := (argCount - 8) * 8;
+    if (stBytes & 15) != 0 { stBytes := stBytes + 8; }
+    if stBytes > 2032 {
+      EPrintStr("error: riscv: Aufruf mit "c); EPrintInt(argCount);
+      EPrintStrLn(" Argumenten — mehr als 2 KB Stapelargumente werden nicht erzeugt (#2132)."c);
+      exit(1);
+    }
+    self.rv_ADDI(RV_SP, RV_SP, 0 - stBytes);
+    var si: int64 := 8;
+    while si < argCount {
+      self.rv_loadSlot(argBase + si);
+      self.rv_SD(RV_T0, RV_SP, (si - 8) * 8);
+      si := si + 1;
+    }
+    return stBytes;
+  }
+
+  // #2132: die ersten acht Argumente in a0..a7. argBase < 0 ist die alte
+  // Konvention mit den Argumenten im Kratzstreifen ab Slot 0.
+  fn rv_RegArgs(argBase: int64, argCount: int64) {
+    var rb: int64 := argBase;
+    if rb < 0 { rb := 0; }
+    var ai: int64 := 0;
+    while ai < argCount && ai < 8 {
+      self.rv_loadSlot(rb + ai);
+      self.rv_MV(RV_A0 + ai, RV_T0);
+      ai := ai + 1;
     }
   }
 
@@ -1759,6 +1799,13 @@ pub type EmitRISCV64 = class {
     while pSpillI < pSpillCount {
       if pSpillI < 8 {
         self.rv_SD(RV_A0 + pSpillI, RV_FP, self.slotOff(IR_BARG_SLOTS + pSpillI));
+      } else {
+        // #2132: Parameter ab dem neunten liegen nach dem RISC-V-psABI beim
+        // Aufrufer auf dem Stapel, 8-Byte-Plaetze ab dessen sp — hier
+        // [s0+16], ueber dem geretteten s0/ra. Bis 1.2.15A blieben diese
+        // Slots unbeschrieben.
+        self.rv_LD(RV_T0, RV_FP, 16 + (pSpillI - 8) * 8);
+        self.rv_SD(RV_T0, RV_FP, self.slotOff(IR_BARG_SLOTS + pSpillI));
       }
       pSpillI := pSpillI + 1;
     }

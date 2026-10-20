@@ -56,6 +56,12 @@ EXPECTED_CON = {
     # lag der MAP_ANON-Fehler (Unit 32 vs. Builtin 34).
     "FD_NONE", "MAP_ANON", "MAP_ANONYMOUS", "MAP_PRIVATE",
     "PROT_READ", "PROT_RW", "PROT_WRITE",
+    # #2137: open-Flags. x86 (cg_addBuiltinCons) und der IR-Weg
+    # (_irEingebauteKonst) ersetzten sie schon immer; sema kennt sie seither
+    # ebenfalls. std/fs.lyx, std/audio.lyx und src/std/lyxos/fs.lyx deklarieren
+    # dieselben Werte (0, 1, 2, 64, 512, 1024) — gemessen neben std.fs in
+    # tests/sema_reste_2137_test.sh.
+    "O_APPEND", "O_CREAT", "O_RDONLY", "O_RDWR", "O_TRUNC", "O_WRONLY",
 }
 
 sema = open(os.path.join(root, "src/sema.lyx"), encoding="utf-8").read()

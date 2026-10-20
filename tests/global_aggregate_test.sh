@@ -120,11 +120,16 @@ fn main(): int64 {
 }' "0
 21"
 
-# ── Gegenproben: was NICHT ausrechenbar ist, wird gemeldet statt still genullt.
-rejects "nicht konstantes Element im Startwert wird gemeldet" 'import std.io;
-fn f(): int64 { return 1; }
+# ── Ein Element, das erst zur Laufzeit feststeht: bis 1.2.15A gemeldet
+#    ("nicht bekannt"), seit #2136 rechnet es die Init-Funktion vor main in
+#    denselben Block — gemessen am WERT, neben dem konstanten Nachbarn.
+out "Laufzeit-Element im Startwert (#2136)" 'import std.io;
+fn f(): int64 { return 41; }
 var q: [2]int64 := [f(), 2];
-fn main(): int64 { return 0; }' "nicht bekannt"
+fn main(): int64 { PrintLn(IntToStr(q[0] + 1)); PrintLn(IntToStr(q[1])); return 0; }' "42
+2"
+
+# ── Gegenproben: was nicht passt, wird gemeldet statt still abgeschnitten.
 
 rejects "zu langer Startwert wird gemeldet" 'import std.io;
 var q: [2]int64 := [1, 2, 3];

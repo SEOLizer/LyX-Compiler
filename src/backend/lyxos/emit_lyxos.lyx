@@ -689,9 +689,21 @@ pub type EmitLyxOS = class {
             var relOff:  int64 := peek64(rec + 0);
             var labelId: int64 := peek64(rec + 8);
             var target:  int64 := 0 - 1;
-            if labelId < self.labelCap { target := peek64(self.labelAddrs + labelId * 8); }
+            if labelId >= 0 && labelId < self.labelCap { target := peek64(self.labelAddrs + labelId * 8); }
             if target >= 0 {
                 self.patch32(relOff, target - (relOff + 4));
+            } else {
+                // #2134: dieselbe Pruefung wie _checkNoOpenPatches (arm64) und
+                // rv_checkNoOpenPatches (riscv) aus #2112 — die drei muessen
+                // uebereinstimmen. Hier blieb der Platzhalter 0 stehen: ein
+                // Sprung auf den naechsten Befehl, still. Die Marken sind
+                // modulweit eindeutig (IRLower.genLabel), aufgeloest wird
+                // einmal am Ende — offen heisst also: nie definiert.
+                EPrintStr("error: lyxos: Sprungziel nie aufgeloest — Marke "c);
+                EPrintInt(labelId);
+                EPrintStr(" (Code-Offset "c); EPrintInt(relOff);
+                EPrintStrLn(") (#2134)."c);
+                exit(1);
             }
             i := i + 1;
         }
@@ -753,13 +765,27 @@ pub type EmitLyxOS = class {
 
     // WP-STUB: indirekter Call (Funktions-Pointer). fnPtrSlot=Slot mit Adresse, argCount Args
     // in Slots 0..argCount-1 (System-V), Result rax→dest. (CALL_INDIRECT aus _indirect_call_N.)
-    fn emitCallIndirect(fnPtrSlot: int64, argCount: int64, dest: int64): void {
+    //
+    // #2132: argBase (src2) ist der Argumentblock, wie beim direkten Call.
+    // Bis 1.2.15A lagen die Argumente in den Slots 0..N-1 und ein Aufruf in
+    // einem spaeteren Argument ueberschrieb die frueheren. argBase < 0 ist
+    // die alte Konvention (Kratzstreifen ab Slot 0, hoechstens acht).
+    fn emitCallIndirect(fnPtrSlot: int64, argBase: int64, argCount: int64, dest: int64): void {
+        var rb: int64 := argBase;
+        if rb < 0 {
+            if argCount > IR_BARG_SLOTS {
+                EPrintStr("error: lyxos: indirekter Aufruf mit "c); EPrintInt(argCount);
+                EPrintStrLn(" Argumenten ohne Argumentblock (#2132)."c);
+                exit(1);
+            }
+            rb := 0;
+        }
         // #1761: sechstes Argument (r9) fehlte hier komplett, alles ab dem
         // siebten wurde still verworfen — beides jetzt wie beim direkten Call.
-        var cleanup: int64 := self.emitPushStackArgs(0, argCount);
+        var cleanup: int64 := self.emitPushStackArgs(rb, argCount);
         var ai: int64 := 0;
         while ai < argCount {
-            if ai < 6 { self.emitMovRegFromSlot(ai, ai); }
+            if ai < 6 { self.emitMovRegFromSlot(ai, rb + ai); }
             ai := ai + 1;
         }
         self.emitMovRaxFromSlot(fnPtrSlot);  // rax = Funktions-Pointer
@@ -893,6 +919,14 @@ pub type EmitLyxOS = class {
             if funcId >= 0 { if funcId < self.funcCap { target := peek64(self.funcAddrs + funcId * 8); } }
             if target >= 0 {
                 self.patch32(relOff, target - (relOff + 4));
+            } else {
+                // #2134: wie bei den Spruengen (applyJmpPatches) — ein CALL
+                // mit Platzhalter 0 rief still den naechsten Befehl auf.
+                EPrintStr("error: lyxos: Sprungziel nie aufgeloest — Funktion "c);
+                EPrintInt(funcId);
+                EPrintStr(" (Code-Offset "c); EPrintInt(relOff);
+                EPrintStrLn(") (#2134)."c);
+                exit(1);
             }
             i := i + 1;
         }
@@ -2223,7 +2257,7 @@ pub type EmitLyxOS = class {
             else if imm == 18 { self.emit8(0x0F); self.emit8(0x01); self.emit8(0x1F); } // lidt [rdi]
             else if imm == 19 { self.emit8(0x0F); self.emit8(0x01); self.emit8(0x3F); } // invlpg [rdi]
         } else if op == 85 {                    // IRO_CALL_INDIRECT (src1=fnPtr-slot, imm=argCount)
-            self.emitCallIndirect(src1, imm, dest);
+            self.emitCallIndirect(src1, src2, imm, dest);   // #2132: src2 = argBase
         } else if op == 84 {                    // IRO_CALL_EXTERN: auf lyxos kein Linkage → dest=0
             self.emit8(0x31); self.emit8(0xC0);                     // xor eax, eax
             self.emitMovSlotFromRax(dest);

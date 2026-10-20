@@ -268,6 +268,17 @@ pub con NK_TYPE_ARRAY: int64 := 61;
 pub con PARSER_TOK_SIZE:  int64 := 40;
 pub con PARSER_NODE_SIZE: int64 := 88;
 
+// #2134: Satz je generischer Typdeklaration (Parser.gtBuf).
+con GT_REC_SZ:        int64 := 48;
+con GT_REC_OFF_TP:    int64 := 8;    // Kette der NK_TYPE_PARAM-Knoten
+con GT_REC_OFF_TPN:   int64 := 16;   // Anzahl der Typparameter
+con GT_REC_OFF_END:   int64 := 24;   // Ende des Knotenbereichs (exklusiv)
+con GT_REC_OFF_DONE:  int64 := 32;   // in die Deklarationskette eingesetzt
+// Satz je Instanz (Parser.giBuf): Name, Laenge, Deklaration, Kopie.
+con GI_REC_SZ:        int64 := 32;
+// Mehr Instanzen deuten auf eine Rekursion im Typ (`n: L<L<T>>`).
+con GI_MAX:           int64 := 4096;
+
 // Token field offsets (size = 40)
 pub con TOK_OFF_START: int64 := 8;
 pub con TOK_OFF_LEN:   int64 := 16;
@@ -408,6 +419,29 @@ pub type Parser = class {
 
   // Recursion depth guard — prevents stack-overflow DoS via deeply nested expressions
   parseDepth: int64;
+
+  // #2134: generische TYPEN (`type Box<T> = class {...}`). Instanziiert wird
+  // hier im Parser, am Ende von Parse(): je Typargument-Kombination eine Kopie
+  // der Deklaration mit T ersetzt, unter dem Namen "Box<int64>". Alles danach
+  // (sema, x86, IR-Weg) sieht nur gewoehnliche Klassen — eine Stelle fuer alle
+  // Ziele statt je einer pro Backend.
+  //   gtBuf: je generischer Deklaration GT_REC_SZ Byte (siehe _gtParseParams)
+  //   grBuf: Knoten, die einen generischen Typ NENNEN (Typname mit
+  //          Typargumenten, `new Box<int64>()`), 8 Byte je Eintrag
+  //   giBuf: angelegte Instanzen (Name, Laenge, Deklaration, Kopie)
+  gtBuf: int64;
+  gtN:   int64;
+  gtCap: int64;
+  grBuf: int64;
+  grN:   int64;
+  grCap: int64;
+  giBuf: int64;
+  giN:   int64;
+  giCap: int64;
+  // Typparameter der generischen FUNKTION, deren Rumpf gerade gelesen wird
+  // (-1 ausserhalb). `Box<T>` mit diesem T laesst sich hier nicht
+  // instanziieren — T steht erst beim Aufruf fest.
+  curFnTp: int64;
 
   // ------------------------------------------------------------------
   // Token array helpers
@@ -938,6 +972,11 @@ pub type Parser = class {
     self.unitIntegrityScrubbed := 0; // #1916
     self.integritySeen := 0;         // #1917
 
+    self.gtBuf := 0; self.gtN := 0; self.gtCap := 0;   // #2134
+    self.grBuf := 0; self.grN := 0; self.grCap := 0;
+    self.giBuf := 0; self.giN := 0; self.giCap := 0;
+    self.curFnTp := 0 - 1;
+
     self._tokenize();
   }
 
@@ -1201,9 +1240,19 @@ pub type Parser = class {
             ttail := ta;
           }
         }
-        self.Expect(TK_GT);
+        self._gtExpectGt();
         // Store type arguments in child1
         self._sc1(n, targs);
+        // #2134: Bis 1.2.15A wurden die Typargumente hier abgelegt und dann
+        // von niemandem gelesen — `Box<int64>` galt als `Box`. Jetzt wird
+        // daraus eine Instanz (_gtExpand) oder eine Meldung.
+        // Ausgenommen `Array<T>`: die eingebaute Schreibweise des dynamischen
+        // Arrays als Bezeichner (das Schluesselwort `array` hat einen eigenen
+        // Zweig oben); ihr Elementtyp in c1 wird vom Codegen gelesen
+        // (src/sema.lyx `syms: Array<SymRecord>`).
+        if (self._gtSeq(self.src + nameStart, nameLen, "Array"c, 5) == 0) {
+          self._gtRefAdd(n, targs);
+        }
       }
       return self._parseArrayTypeSuffix(n, ti);
     }
@@ -1729,6 +1778,25 @@ pub type Parser = class {
       }
       var n: int64 := self._alloc(NK_NEW, ti);
       self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
+      // #2134: `new Box<int64>()` — Typargumente in c2, aufgeloest in
+      // _gtExpand (dort wird der Name zu "Box<int64>" und c2 wieder -1).
+      if (self.Check(TK_LT) != 0 && self.TokKind(nameTok) == TK_IDENT) {
+        self.Advance();
+        var nTa: int64 := 0 - 1;
+        var nTt: int64 := 0 - 1;
+        if (self.Check(TK_GT) == 0) {
+          nTa := self.ParseType();
+          nTt := nTa;
+          while (self.Match(TK_COMMA) != 0) {
+            var nTa2: int64 := self.ParseType();
+            self._sn(nTt, nTa2);
+            nTt := nTa2;
+          }
+        }
+        self._gtExpectGt();
+        self._sc2(n, nTa);
+        self._gtRefAdd(n, nTa);
+      }
       // #1255: `new T[n]` — ein dynamisches Array mit Laenge zur LAUFZEIT.
       // Bisher gab es dafuer keine Form: `new` verlangte eine Klammer, und
       // `array[T]`/`Array<T>` waren zwar deklarierbar, aber nie belegbar. Wer
@@ -3213,12 +3281,18 @@ pub type Parser = class {
       // Store type params in child3 (c3)
       self._sc3(n, tparams);
     }
-    
+    // #2134: Typparameter dieser Funktion fuer _gtRefAdd sichtbar machen.
+    var svFnTp: int64 := self.curFnTp;
+    if (self.NChild3(n) >= 0 && self.NKind(self.NChild3(n)) == NK_TYPE_PARAM) {
+      self.curFnTp := self.NChild3(n);
+    }
+
     self.Expect(TK_LPAREN);
     self._sc0(n, self._parseParamList());
     self.Expect(TK_RPAREN);
     if (self.Match(TK_COLON) != 0) { self._sc1(n, self.ParseType()); }
     if (self.Check(TK_LBRACE) != 0) { self._sc2(n, self.ParseBlock()); }
+    self.curFnTp := svFnTp;
     return n;
   }
 
@@ -3601,10 +3675,19 @@ pub type Parser = class {
     var n: int64 := self._alloc(NK_TYPE_DECL, ti);
     self._ssv(n, self._tokOff(nameTok), self._tokLen(nameTok));
     self._spub(n, isPub);
+    // #2134: `type Box<T, U> = class|struct {...}`
+    var gtRec: int64 := 0 - 1;
+    if (self.Check(TK_LT) != 0) { gtRec := self._gtParseParams(n); }
     if (self.Match(TK_EQ1) != 0) {
       // WP-BC-20: optional abstract modifier before class
       var isAbstractClass: int64 := 0;
       if (self.Match(TK_ABSTRACT) != 0) { isAbstractClass := 1; }
+      if (gtRec >= 0 && self.Check(TK_CLASS) == 0 && self.Check(TK_STRUCT) == 0) {
+        // Ein generisches Interface braeuchte Instanzen auch dort, wo nur der
+        // Interface-Typ genannt wird (Selektoren, Pruefung `implements`), ein
+        // generischer Alias eine Ersetzung im Zieltyp — beides nicht umgesetzt.
+        self._err("#2134: nur class und struct koennen Typparameter haben (kein interface, kein Alias)"c);
+      }
       if (self.Check(TK_CLASS) != 0) {
         self._siv(n, isAbstractClass);
         // WP-16: class with extends and implements
@@ -3618,6 +3701,11 @@ pub type Parser = class {
           self._sc2(n, pn);
           self._ssv(pn, self._tokOff(self.cur), self._tokLen(self.cur));
           self.Advance();
+          // #2134: `extends Box<int64>` — die Elternklasse waere eine Instanz,
+          // deren Layout und VMT beim Lesen dieser Zeile noch nicht feststehen.
+          if (self.Check(TK_LT) != 0) {
+            self._err("#2134: Ableitung von einer generischen Klasse (extends Name<...>) wird nicht unterstuetzt"c);
+          }
         }
         // c3 = interface names (implements)
         if (self.Check(TK_IMPLS) != 0) {
@@ -3940,8 +4028,13 @@ pub type Parser = class {
           if (istWraps != 0) { self._siv(n, self.NIVal(n) | 8); }
         }
       }
+    } else if (gtRec >= 0) {
+      self._err("#2134: generischer Typ ohne Rumpf (erwartet = class oder = struct)"c);
     }
     self.Match(TK_SEMI);
+    // #2134: Ende des Knotenbereichs der Deklaration — kopiert wird
+    // [Deklaration, Ende).
+    if (gtRec >= 0) { poke64(self.gtBuf + gtRec * GT_REC_SZ + GT_REC_OFF_END, self.nodeCount); }
     return n;
   }
 
@@ -4855,6 +4948,389 @@ pub type Parser = class {
     return rn;
   }
 
+  // ==================================================================
+  // #2134: generische Typen — Monomorphisierung im Parser
+  //
+  // `type Box<T> = class { v: T; fn Get(): T {...} }` wird nicht als solche
+  // weitergereicht. Am Ende von Parse() entsteht je Typargument-Kombination
+  // eine KOPIE des Knotenbereichs der Deklaration, darin jeder Typname `T`
+  // durch das Argument ersetzt und die Deklaration "Box<int64>" genannt. Jede
+  // Nennung `Box<int64>` (Typangabe, `new Box<int64>()`) traegt danach genau
+  // diesen Namen. sema und alle Backends sehen gewoehnliche Klassen — Feld-
+  // Layout, Methoden und VMT entstehen dort wie fuer jede andere.
+  //
+  // Der Name enthaelt `<`, kann also mit keinem Bezeichner zusammenfallen. Er
+  // steht nicht im Quelltext; der Knoten traegt ihn als Versatz relativ zu
+  // `src` (NSVal rechnet `src + Versatz`, das gilt fuer jeden Zeiger).
+  //
+  // Nicht umgesetzt und deshalb laut: generische Interfaces und Aliase,
+  // Ableitung von einer Instanz, ein generischer Typ einer ANDEREN Unit
+  // (die Kopie muesste in deren Knotentabelle entstehen), ein Typparameter
+  // einer generischen Funktion als Argument (`Box<T>` in `fn f<T>`).
+  // ==================================================================
+
+  // `>` am Ende einer Typargumentliste. `Box<Box<int64>>` lext das Ende als
+  // EIN Token `>>`: das erste Zeichen schliesst hier, das zweite bleibt fuer
+  // die aeussere Liste stehen.
+  fn _gtExpectGt() {
+    if (self.Check(TK_SHR) != 0) {
+      var t: int64 := self._toff(self.cur);
+      poke64(t, TK_GT);
+      poke64(t + TOK_OFF_START, peek64(t + TOK_OFF_START) + 1);
+      poke64(t + TOK_OFF_LEN, 1);
+      return;
+    }
+    self.Expect(TK_GT);
+  }
+
+  fn _gtSeq(a: pchar, al: int64, b: pchar, bl: int64): int64 {
+    if (al != bl) { return 0; }
+    var i: int64 := 0;
+    while (i < al) {
+      if (peek8((a as int64) + i) != peek8((b as int64) + i)) { return 0; }
+      i += 1;
+    }
+    return 1;
+  }
+
+  // Meldung mit der Zeile des Knotens — _gtExpand laeuft nach dem Lesen,
+  // `cur` steht dann am Dateiende.
+  fn _gtErr(node: int64, msg: pchar, np: pchar, nl: int64) {
+    if (self.hadError != 0) { return; }
+    self.hadError := 1;
+    PrintStr("Parse error at line ");
+    PrintInt(self.TokLine(self.NTokIdx(node)));
+    PrintStr(": ");
+    PrintStr(msg);
+    if (nl > 0) {
+      var buf: int64 := alloc(nl + 1);
+      memcpy(buf, np as int64, nl);
+      poke8(buf + nl, 0);
+      PrintStr(buf as pchar);
+      free(buf, nl + 1);
+    }
+    PrintStr("\n");
+  }
+
+  // `<T, U>` nach dem Typnamen. Liefert den Satzindex in gtBuf.
+  fn _gtParseParams(n: int64): int64 {
+    self.Advance();   // '<'
+    var head: int64 := 0 - 1;
+    var tail: int64 := 0 - 1;
+    var cnt: int64 := 0;
+    while (self.Check(TK_EOF) == 0) {
+      if (self.Check(TK_IDENT) == 0) {
+        self._err("#2134: Typparameter muss ein Name sein"c);
+        return 0 - 1;
+      }
+      var tp: int64 := self._alloc(NK_TYPE_PARAM, self.cur);
+      self._ssv(tp, self._tokOff(self.cur), self._tokLen(self.cur));
+      var d: int64 := head;
+      while (d >= 0) {
+        if (self._gtSeq(self.NSVal(d), self.NSLen(d), self.NSVal(tp), self.NSLen(tp)) != 0) {
+          self._err("#2134: Typparameter doppelt"c);
+        }
+        d := self.NNext(d);
+      }
+      self.Advance();
+      if (self.Check(TK_COLON) != 0) {
+        self._err("#2134: Einschraenkungen an Typparametern generischer TYPEN werden nicht unterstuetzt"c);
+        return 0 - 1;
+      }
+      if (head < 0) { head := tp; } else { self._sn(tail, tp); }
+      tail := tp;
+      cnt += 1;
+      if (self.Match(TK_COMMA) == 0) { break; }
+    }
+    self.Expect(TK_GT);
+    if (cnt == 0) { self._err("#2134: leere Typparameterliste"c); return 0 - 1; }
+    if (self.gtN >= self.gtCap) {
+      var nc: int64 := self.gtCap * 2;
+      if (nc < 8) { nc := 8; }
+      var nb: int64 := alloc(nc * GT_REC_SZ);
+      if (self.gtN > 0) { memcpy(nb, self.gtBuf, self.gtN * GT_REC_SZ); }
+      self.gtBuf := nb; self.gtCap := nc;
+    }
+    var r: int64 := self.gtBuf + self.gtN * GT_REC_SZ;
+    poke64(r, n);
+    poke64(r + GT_REC_OFF_TP, head);
+    poke64(r + GT_REC_OFF_TPN, cnt);
+    poke64(r + GT_REC_OFF_END, self.nodeCount);
+    poke64(r + GT_REC_OFF_DONE, 0);
+    self.gtN += 1;
+    return self.gtN - 1;
+  }
+
+  fn _gtPushRef(n: int64) {
+    if (self.grN >= self.grCap) {
+      var nc: int64 := self.grCap * 2;
+      if (nc < 16) { nc := 16; }
+      var nb: int64 := alloc(nc * 8);
+      if (self.grN > 0) { memcpy(nb, self.grBuf, self.grN * 8); }
+      self.grBuf := nb; self.grCap := nc;
+    }
+    poke64(self.grBuf + self.grN * 8, n);
+    self.grN += 1;
+  }
+
+  // Eine Nennung `Name<...>` vormerken (Typname oder `new`).
+  fn _gtRefAdd(n: int64, targs: int64) {
+    if (targs < 0) {
+      self._err("#2134: leere Typargumentliste"c);
+      return;
+    }
+    var a: int64 := targs;
+    while (a >= 0) {
+      if (self.NKind(a) == NK_TYPE_NAME && self.NChild0(a) < 0 && self.NChild1(a) < 0) {
+        var tp: int64 := self.curFnTp;
+        while (tp >= 0) {
+          if (self._gtSeq(self.NSVal(tp), self.NSLen(tp), self.NSVal(a), self.NSLen(a)) != 0) {
+            self._err("#2134: generischer Typ mit dem Typparameter einer generischen Funktion als Argument (Box<T> in fn f<T>) wird nicht unterstuetzt"c);
+            return;
+          }
+          tp := self.NNext(tp);
+        }
+      }
+      a := self.NNext(a);
+    }
+    self._gtPushRef(n);
+  }
+
+  fn _gtFind(np: pchar, nl: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.gtN) {
+      var d: int64 := peek64(self.gtBuf + i * GT_REC_SZ);
+      if (self._gtSeq(self.NSVal(d), self.NSLen(d), np, nl) != 0) { return i; }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // Liegt der Knoten im Bereich einer generischen DEKLARATION? Dort steht T
+  // noch fuer sich; aufgeloest wird erst in den Kopien.
+  fn _gtInRange(n: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.gtN) {
+      var r: int64 := self.gtBuf + i * GT_REC_SZ;
+      if (n >= peek64(r) && n < peek64(r + GT_REC_OFF_END)) { return 1; }
+      i += 1;
+    }
+    return 0;
+  }
+
+  fn _gtIsRef(n: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.grN) {
+      if (peek64(self.grBuf + i * 8) == n) { return 1; }
+      i += 1;
+    }
+    return 0;
+  }
+
+  // Den Knotenbereich der Deklaration g kopieren, T durch die Argumente
+  // ersetzen. Liefert den Index der kopierten Deklaration.
+  fn _gtClone(g: int64, args: int64, mangP: int64, mangL: int64): int64 {
+    var gr: int64 := self.gtBuf + g * GT_REC_SZ;
+    var start: int64 := peek64(gr);
+    var end: int64 := peek64(gr + GT_REC_OFF_END);
+    var len: int64 := end - start;
+    var base: int64 := self.nodeCount;
+    var i: int64 := 0;
+    // Erst alle Knoten anlegen (der Puffer kann dabei wachsen), dann kopieren.
+    while (i < len) { self._alloc(NK_INVALID, 0); i += 1; }
+    memcpy(self._noff(base), self._noff(start), len * PARSER_NODE_SIZE);
+    i := 0;
+    while (i < len) {
+      var b: int64 := self._noff(base + i);
+      // Verweise in den Bereich umrechnen. Was hinausweist (Attributknoten
+      // vor der Deklaration), bleibt geteilt — gelesen, nie geaendert.
+      var f: int64 := NODE_OFF_C0;
+      while (f <= NODE_OFF_NEXT) {
+        var v: int64 := peek64(b + f);
+        if (v >= start && v < end) { poke64(b + f, v - start + base); }
+        f := f + 8;
+      }
+      var k: int64 := peek64(b);
+      // T -> Argument. Nur ein schlichter Typname (keine Kinder) ist ein
+      // Typparameter; `T[]` traegt den Namen in einem Kindknoten, der hier
+      // ebenso vorbeikommt.
+      var subst: int64 := 0;
+      if (k == NK_TYPE_NAME && peek64(b + NODE_OFF_C0) < 0 && peek64(b + NODE_OFF_C1) < 0) { subst := 1; }
+      if (k == NK_NEW && peek64(b + NODE_OFF_C2) < 0) { subst := 1; }   // `new T()`
+      if (subst != 0) {
+        var tp: int64 := peek64(gr + GT_REC_OFF_TP);
+        var a: int64 := args;
+        while (tp >= 0 && a >= 0) {
+          if (self._gtSeq(self.NSVal(tp), self.NSLen(tp), self.NSVal(base + i), self.NSLen(base + i)) != 0) {
+            poke64(b + NODE_OFF_SVAL, peek64(self._noff(a) + NODE_OFF_SVAL));
+            poke64(b + NODE_OFF_SLEN, self.NSLen(a));
+            tp := 0 - 1;
+          } else {
+            tp := self.NNext(tp);
+            a := self.NNext(a);
+          }
+        }
+      }
+      // Nennungen im kopierten Rumpf (`next: Box<T>`) werden aufgeloest,
+      // sobald die Schleife in _gtExpand sie erreicht — T ist dann ersetzt.
+      if (self._gtIsRef(start + i) != 0) { self._gtPushRef(base + i); }
+      i += 1;
+    }
+    poke64(self._noff(base) + NODE_OFF_NEXT, 0 - 1);
+    poke64(self._noff(base) + NODE_OFF_SVAL, mangP - (self.src as int64));
+    poke64(self._noff(base) + NODE_OFF_SLEN, mangL);
+    return base;
+  }
+
+  // Eine Nennung `Name<A, B>` aufloesen: Instanz suchen oder anlegen, die
+  // Nennung auf deren Namen umstellen.
+  fn _gtResolve(r: int64) {
+    var istNew: int64 := 0;
+    if (self.NKind(r) == NK_NEW) { istNew := 1; }
+    var args: int64 := self.NChild1(r);
+    if (istNew != 0) { args := self.NChild2(r); }
+    if (args < 0) { return; }   // schon aufgeloest
+    var g: int64 := self._gtFind(self.NSVal(r), self.NSLen(r));
+    if (g < 0) {
+      self._gtErr(r, "#2134: kein generischer Typ dieser Unit (generische Typen einer anderen Unit werden nicht unterstuetzt): "c,
+                  self.NSVal(r), self.NSLen(r));
+      return;
+    }
+    var gr: int64 := self.gtBuf + g * GT_REC_SZ;
+    var cnt: int64 := 0;
+    var mLen: int64 := self.NSLen(r) + 2;
+    var a: int64 := args;
+    while (a >= 0) {
+      // Geschachtelt (`Box<Box<int64>>`): erst das Argument selbst.
+      if (self.NKind(a) == NK_TYPE_NAME && self.NChild1(a) >= 0) { self._gtResolve(a); }
+      if (self.hadError != 0) { return; }
+      if (self.NKind(a) != NK_TYPE_NAME || self.NChild0(a) >= 0 || self.NChild1(a) >= 0
+          || self.NIVal(a) != 0 || self.NSLen(a) <= 0) {
+        self._gtErr(a, "#2134: Typargument ist kein einfacher Typname (Array-, Funktions- oder nullbarer Typ) bei "c,
+                    self.NSVal(r), self.NSLen(r));
+        return;
+      }
+      cnt += 1;
+      mLen := mLen + self.NSLen(a) + 1;
+      a := self.NNext(a);
+    }
+    if (cnt != peek64(gr + GT_REC_OFF_TPN)) {
+      self._gtErr(r, "#2134: Anzahl der Typargumente passt nicht zu den Typparametern von "c,
+                  self.NSVal(r), self.NSLen(r));
+      return;
+    }
+    // Name "Box<A,B>"
+    var mb: int64 := alloc(mLen + 1);
+    var pos: int64 := self.NSLen(r);
+    memcpy(mb, self.NSVal(r) as int64, pos);
+    poke8(mb + pos, 60); pos += 1;
+    a := args;
+    var first: int64 := 1;
+    while (a >= 0) {
+      if (first == 0) { poke8(mb + pos, 44); pos += 1; }
+      first := 0;
+      memcpy(mb + pos, self.NSVal(a) as int64, self.NSLen(a));
+      pos := pos + self.NSLen(a);
+      a := self.NNext(a);
+    }
+    poke8(mb + pos, 62); pos += 1;
+    poke8(mb + pos, 0);
+
+    var found: int64 := 0 - 1;
+    var i: int64 := 0;
+    while (i < self.giN) {
+      var ir: int64 := self.giBuf + i * GI_REC_SZ;
+      if (self._gtSeq(peek64(ir) as pchar, peek64(ir + 8), mb as pchar, pos) != 0) { found := i; i := self.giN; }
+      i += 1;
+    }
+    var mP: int64 := mb;
+    if (found >= 0) {
+      mP := peek64(self.giBuf + found * GI_REC_SZ);
+      free(mb, mLen + 1);
+    } else {
+      if (self.giN >= GI_MAX) {
+        self._gtErr(r, "#2134: zu viele Instanzen — waechst der Typ in sich selbst (n: L<L<T>>)? bei "c,
+                    self.NSVal(r), self.NSLen(r));
+        return;
+      }
+      if (self.giN >= self.giCap) {
+        var nc: int64 := self.giCap * 2;
+        if (nc < 8) { nc := 8; }
+        var nb: int64 := alloc(nc * GI_REC_SZ);
+        if (self.giN > 0) { memcpy(nb, self.giBuf, self.giN * GI_REC_SZ); }
+        self.giBuf := nb; self.giCap := nc;
+      }
+      // Erst eintragen, dann kopieren: eine Nennung derselben Instanz im
+      // eigenen Rumpf findet sie so schon vor.
+      var nr: int64 := self.giBuf + self.giN * GI_REC_SZ;
+      poke64(nr, mb);
+      poke64(nr + 8, pos);
+      poke64(nr + 16, g);
+      poke64(nr + 24, 0 - 1);
+      self.giN += 1;
+      var cl: int64 := self._gtClone(g, args, mb, pos);
+      poke64(nr + 24, cl);
+    }
+    poke64(self._noff(r) + NODE_OFF_SVAL, mP - (self.src as int64));
+    poke64(self._noff(r) + NODE_OFF_SLEN, pos);
+    if (istNew != 0) { self._sc2(r, 0 - 1); } else { self._sc1(r, 0 - 1); }
+  }
+
+  // Alle Nennungen aufloesen, dann die generischen Deklarationen in der
+  // Kette durch ihre Instanzen ersetzen.
+  fn _gtExpand(head: int64): int64 {
+    if (self.gtN == 0 && self.grN == 0) { return head; }
+    var i: int64 := 0;
+    while (i < self.grN) {
+      if (self.hadError != 0) { return head; }
+      var r: int64 := peek64(self.grBuf + i * 8);
+      if (self._gtInRange(r) == 0) { self._gtResolve(r); }
+      i += 1;
+    }
+    if (self.hadError != 0) { return head; }
+    var nh: int64 := 0 - 1;
+    var nt: int64 := 0 - 1;
+    var cur: int64 := head;
+    while (cur >= 0) {
+      var nx: int64 := self.NNext(cur);
+      var g: int64 := 0 - 1;
+      var gi: int64 := 0;
+      while (gi < self.gtN) {
+        if (peek64(self.gtBuf + gi * GT_REC_SZ) == cur) { g := gi; gi := self.gtN; }
+        gi += 1;
+      }
+      if (g >= 0) {
+        poke64(self.gtBuf + g * GT_REC_SZ + GT_REC_OFF_DONE, 1);
+        var ii: int64 := 0;
+        while (ii < self.giN) {
+          var ir: int64 := self.giBuf + ii * GI_REC_SZ;
+          if (peek64(ir + 16) == g) {
+            var cl: int64 := peek64(ir + 24);
+            self._sn(cl, 0 - 1);
+            if (nh < 0) { nh := cl; } else { self._sn(nt, cl); }
+            nt := cl;
+          }
+          ii += 1;
+        }
+      } else {
+        self._sn(cur, 0 - 1);
+        if (nh < 0) { nh := cur; } else { self._sn(nt, cur); }
+        nt := cur;
+      }
+      cur := nx;
+    }
+    var gj: int64 := 0;
+    while (gj < self.gtN) {
+      var gd: int64 := peek64(self.gtBuf + gj * GT_REC_SZ);
+      if (peek64(self.gtBuf + gj * GT_REC_SZ + GT_REC_OFF_DONE) == 0) {
+        self._gtErr(gd, "#2134: generischer Typ nur auf oberster Ebene einer Unit (nicht in @if): "c,
+                    self.NSVal(gd), self.NSLen(gd));
+      }
+      gj += 1;
+    }
+    return nh;
+  }
+
   fn Parse(): int64 {
     // Use 0-1 (= -1) as sentinel: bootstrap miscompiles literal -1 as 0 (known bug).
     // Check head < 0 (not == -1) so node index 0 doesn't trigger the "unset" branch.
@@ -5244,7 +5720,8 @@ pub type Parser = class {
 
     }
 
-    return head;
+    if (self.hadError != 0) { return head; }
+    return self._gtExpand(head);   // #2134
   }
 
   // ============================================================================
