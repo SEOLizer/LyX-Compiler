@@ -330,11 +330,38 @@ con CG_TEMPBUF_SZ:      int64 := 16;
 con CG_TEMPBUF_OFF_SIZE: int64 := 8;
 con CG_IMPORT_OFF_LEN: int64 := 8;
 
-// Monomorphization entry (32 bytes: mangledPtr + mangledLen + origPtr + origLen)
-con CG_MONO_SZ:          int64 := 32;
-con CG_MONO_OFF_MANGLEN: int64 := 8;
-con CG_MONO_OFF_ORIGPTR: int64 := 16;
-con CG_MONO_OFF_ORIGLEN: int64 := 24;
+// #2134: generische Funktionen. Je Deklaration ein Satz (gfRecs) mit dem
+// Kontext ihrer Unit — die Spezialisierungen entstehen erst am Ende, wenn die
+// Unit laengst durchlaufen ist, und muessen dann in ihre Tabelle zurueck.
+con CG_GF_SZ:          int64 := 168;
+con CG_GF_OFF_NAMELEN: int64 := 8;
+con CG_GF_OFF_LBL:     int64 := 16;
+con CG_GF_OFF_LBLLEN:  int64 := 24;
+con CG_GF_OFF_SRC:     int64 := 32;
+con CG_GF_OFF_NODES:   int64 := 40;
+con CG_GF_OFF_NCNT:    int64 := 48;
+con CG_GF_OFF_NI:      int64 := 56;
+con CG_GF_OFF_PUB:     int64 := 64;
+con CG_GF_OFF_TPN:     int64 := 72;
+con CG_GF_OFF_END:     int64 := 80;   // Ende des Knotenbereichs der Funktion
+con CG_GF_OFF_TAG:     int64 := 88;
+con CG_GF_OFF_TAGLEN:  int64 := 96;
+con CG_GF_OFF_PTAB:    int64 := 104;
+con CG_GF_OFF_PCNT:    int64 := 112;
+con CG_GF_OFF_PVTAB:   int64 := 120;
+con CG_GF_OFF_PVCNT:   int64 := 128;
+con CG_GF_OFF_ALIAS:   int64 := 136;
+con CG_GF_OFF_ALIASL:  int64 := 144;
+con CG_GF_OFF_HEAD:    int64 := 152;
+con CG_GF_OFF_NESTED:  int64 := 160;  // Rumpf enthaelt eine innere Funktion
+// Je Spezialisierung (gmRecs): Name, Laenge, Deklaration, Argumente
+// (Paare Zeiger/Laenge), Anzahl, schon erzeugt.
+con CG_GM_SZ:          int64 := 48;
+con CG_GM_OFF_LEN:     int64 := 8;
+con CG_GM_OFF_GF:      int64 := 16;
+con CG_GM_OFF_ARGS:    int64 := 24;
+con CG_GM_OFF_ARGN:    int64 := 32;
+con CG_GM_OFF_DONE:    int64 := 40;
 
 // Enum record fields (accessed via enumBuf / enumVariants)
 // ebase+16=varsPtr; ebase+24=variantCount; vb+8=variantNameLen; vb+16=tagVal; vb+24=payloadSize
@@ -870,11 +897,30 @@ pub type Codegen = class {
   fnAliasCount: int64;
   fnAliasCap:   int64;
 
-  // WP-BC-24: deferred generic monomorphization list
-  // Entry: {mangledNamePtr:8, mangledNameLen:8, genericFuncNode:8} = 24 bytes
-  monoList:  int64;
-  monoCount: int64;
-  monoCap:   int64;
+  // #2134: Monomorphisierung generischer Funktionen (siehe cg_genInstanz).
+  // Bis 1.2.15A gab es EINEN typgeloeschten Rumpf und je Instanz nur einen
+  // Sprung dorthin: `p.x` ueber T fand kein Feld und lieferte still 0,
+  // Gleitkomma rechnete auf den IEEE-Bits.
+  gfRecs: int64;
+  gfN:    int64;
+  gfCap:  int64;
+  gmRecs: int64;
+  gmN:    int64;
+  gmCap:  int64;
+  // Knotenzahl der aktiven Tabelle (pNodes). Der Treiber setzt sie fuer das
+  // Hauptmodul, cg_processImport fuer jede Unit.
+  pNodeCount: int64;
+  // Deklaration der freien Funktion, deren Rumpf gerade entsteht (-1 in
+  // einer Methode) — cg_genFeldOffen fragt, ob es ein typgeloeschter
+  // generischer Rumpf ist.
+  genCurFd: int64;
+  // Marke fuer den naechsten cg_genFuncDecl (Spezialisierung), 0 = keine.
+  genOvLbl: int64;
+  genOvLen: int64;
+  // Die gerade aktive Ersetzung T -> Argument: Eintraege (Adresse des
+  // SVAL-Felds, alter Versatz, alte Laenge, neuer Versatz, neue Laenge).
+  genActBuf: int64;
+  genActN:   int64;
 
   // WP-13: Closure support - static link for nested functions
   staticLinkOffset: int64;  // rbp offset of static link param (or -1 if not nested)
@@ -5931,7 +5977,12 @@ pub type Codegen = class {
       // Speicherwachstum. Der Compiler drehte sich still fest, statt zu
       // scheitern.
       if (self.cg_nival(ni) == 2) {
-        return self.cg_funcRetClassIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+        // #2134: unter dem Namen der Spezialisierung (cg_callName).
+        var gcLc: int64 := alloc(8);
+        var gcP: pchar := self.cg_callName(ni, gcLc);
+        var gcL: int64 := peek64(gcLc);
+        free(gcLc, 8);
+        return self.cg_funcRetClassIdx(gcP, gcL);
       }
       if (self.cg_nival(ni) == 1) {
         var recvCi: int64 := self.cg_exprClassName(self.cg_nc0(ni));
@@ -9704,6 +9755,7 @@ pub type Codegen = class {
       return;
     }
     if (foff < 0) {
+      self.cg_genFeldOffen(fieldName, fieldLen);   // #2134
       self.cg_zeroRax();
     } else if (ldW == 1 || ldW == 2 || ldW == 4) {
       self.cg_emitNarrowLoadRax(foff, ldW, ldSigned);
@@ -9851,6 +9903,7 @@ pub type Codegen = class {
   fn cg_genMethodDecl(ni: int64, className: pchar, classNameLen: int64) {
     var mname: pchar := self.cg_nsval(ni);
     var mlen:  int64 := self.cg_nslen(ni);
+    self.genCurFd := 0 - 1;   // #2134: Methode, kein generischer Rumpf
     // WP-BC-19: record code start for VMT method slot patching
     var methodCodeStart: int64 := self.codeLen;
     // Build mangled name: className_methodName
@@ -12249,36 +12302,17 @@ pub type Codegen = class {
     var isSuperCall: int64 := 0;
     if (isMethod == 3) { isSuperCall := 1; isMethod := 1; }
 
-    // WP-BC-24: generic call (iVal==2) — build mangled name and register JMP stub
+    // #2134: generischer Aufruf (iVal 2) — Marke der Spezialisierung, die
+    // cg_genInstanz anlegt (im typgeloeschten Rumpf: die der generischen
+    // Funktion selbst). Ab hier ist es ein gewoehnlicher Aufruf. Bis 1.2.15A
+    // stand hier eine Sprungmarke auf den typgeloeschten Rumpf, und seit
+    // #2125 eine Sperre fuer Gleitkomma-Typargumente — beides entfaellt.
     if (isMethod == 2) {
-      var typeArgsNi: int64 := self.cg_nc2(ni);
-      // #2125: Hier gibt es EINEN Rumpf fuer alle Instanzen, T rechnet
-      // ganzzahlig. Fuer ein Gleitkomma-Argument hiesse das: Addition und
-      // Vergleich auf den IEEE-Bits — `add<f64>(1.5, 2.25)` lieferte still
-      // eine plausible, aber falsche Zahl. Seit `<f64>` parst, wird es laut
-      // abgewiesen; der IR-Weg (arm64, riscv, lyxos) spezialisiert je Typ und
-      // rechnet richtig.
-      var gfTa: int64 := typeArgsNi;
-      while (gfTa >= 0) {
-        if (self.cg_seq(self.cg_nsval(gfTa), self.cg_nslen(gfTa), "f64", 3) ||
-            self.cg_seq(self.cg_nsval(gfTa), self.cg_nslen(gfTa), "f32", 3)) {
-          EPrintStr("error: x86_64: Gleitkomma-Typargument fuer die generische Funktion "c);
-          sys_write(2, fname as int64, fnlen);
-          EPrintStrLn(" wird hier nicht unterstuetzt (#2125):"c);
-          EPrintStrLn("  der Rumpf ist typgeloescht und rechnete auf den IEEE-Bits."c);
-          exit(1);
-        }
-        gfTa := self.cg_nnext(gfTa);
-      }
-      var mangBuf: int64 := alloc(fnlen + 256);
-      var mangLen: int64 := self.cg_buildMangledName(fname, fnlen, typeArgsNi, mangBuf);
-      if (self.cg_monoExists(mangBuf as pchar, mangLen) == 0) {
-        self.cg_addMono(mangBuf as pchar, mangLen, fname, fnlen);
-      }
-      // Emit call to mangled name (JMP stub will redirect to generic function)
+      var gLc: int64 := alloc(8);
+      fname := self.cg_callName(ni, gLc);
+      fnlen := peek64(gLc);
+      free(gLc, 8);
       isMethod := 0;
-      fname := mangBuf as pchar;
-      fnlen := mangLen;
     }
 
     // Count args
@@ -16620,6 +16654,10 @@ pub type Codegen = class {
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x70); self.cg_e8(foff);
         } else if (foff > 127) {
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xB0); self.cg_e32(foff);
+        } else {
+          // #2134: dieselbe Pruefung wie beim Lesen (cg_genFieldLoad) — die
+          // beiden muessen uebereinstimmen.
+          self.cg_genFeldOffen(fieldName, fieldLen);
         }
       } else if (self.cg_nkind(lhs) == CGN_INDEX && self.cg_localIsMap(self.cg_nc0(lhs)) != 0) {
         // #1152: m[k] := v schreibt ueber _lyx_map_set. Bis 1.0.15A nahm der
@@ -18972,6 +19010,9 @@ pub type Codegen = class {
   // den Knotennamen direkt nimmt, faende bei einer Kollision die gleichnamige
   // Modulfunktion.
   fn cg_callName(ni: int64, lenCell: int64): pchar {
+    // #2134: ein generischer Aufruf meint seine Spezialisierung — unter
+    // deren Namen stehen Rueckgabetyp und f64-Merkung in den Registern.
+    if (self.cg_nival(ni) == 2) { return self.cg_genInstanz(ni, lenCell); }
     if (self.cg_nival(ni) == 0) {
       var i: int64 := self.cg_nestIdx(ni);
       if (i >= 0) {
@@ -19887,7 +19928,14 @@ pub type Codegen = class {
     // gleichnamige innere Funktionen — oder eine innere und eine gleichnamige
     // Modulfunktion — fielen auf eine Marke zusammen.
     var nestI: int64 := self.cg_nestIdx(ni);
-    if (nestI >= 0) {
+    self.genCurFd := ni;   // #2134
+    if (self.genOvLen > 0) {
+      // #2134: Spezialisierung einer generischen Funktion (cg_genEmitPending).
+      fname := self.genOvLbl as pchar;
+      fnlen := self.genOvLen;
+      self.genOvLbl := 0;
+      self.genOvLen := 0;
+    } else if (nestI >= 0) {
       fname := self.cg_nestLbl(nestI);
       fnlen := self.cg_nestLblLen(nestI);
     } else {
@@ -21818,8 +21866,10 @@ pub type Codegen = class {
     // im einbindenden Modul eine fremde Kette ab, fand die Funktion nicht,
     // und `f as int64` wurde still 0.
     var savedTopHead: int64 := self.topLevelHead;
+    var savedNodeCnt: int64 := self.pNodeCount;   // #2134
     self.pSrc   := p.src;
     self.pNodes := p.nodes;
+    self.pNodeCount := p.nodeCount;
 
     // #1655: Waehrend dieser Unit tragen private Marken ihren Namen.
     var utSaved:    int64 := self.cgUnitTag;
@@ -21871,6 +21921,7 @@ pub type Codegen = class {
     // Restore main file's source and nodes
     self.pSrc   := savedSrc;
     self.pNodes := savedNodes;
+    self.pNodeCount := savedNodeCnt;     // #2134
     self.topLevelHead := savedTopHead;   // #2079
 
     self.cgAlias := cgaSaved; self.cgAliasLen := cgaSavedLen;   // #1262
@@ -21909,53 +21960,422 @@ pub type Codegen = class {
     }
   }
 
-  // WP-BC-24: register a pending generic specialization
-  // Entry: {mangledNamePtr:8, mangledNameLen:8, origNamePtr:8, origNameLen:8} = 32 bytes
-  fn cg_addMono(mangName: pchar, mangLen: int64, origName: pchar, origLen: int64) {
-    if (self.monoCount >= self.monoCap) {
-      var nc: int64 := self.monoCap * 2;
-      var nb: int64 := alloc(nc * 32);
-      var ii: int64 := 0;
-      memcpy(nb, self.monoList, self.monoCount * CG_MONO_SZ);
-      self.monoList := nb; self.monoCap := nc;
+  // ==================================================================
+  // #2134: Monomorphisierung generischer Funktionen auf x86.
+  //
+  // Bis 1.2.15A (WP-BC-24) gab es EINEN typgeloeschten Rumpf, und jede
+  // Instanz `f<P>` war nur eine Marke mit einem Sprung dorthin. Was am Typ
+  // hing, ging dabei verloren: `p.x` mit `p: T` fand kein Feld und lieferte
+  // still 0, `add<f64>` haette auf den IEEE-Bits gerechnet (seit #2125
+  // abgewiesen). Der IR-Weg spezialisiert seit #2125 je Kombination.
+  //
+  // Jetzt auch hier: je Typargument-Kombination ein eigener Rumpf, erzeugt
+  // in der Unit der Deklaration, mit T durch das Argument ersetzt. Ersetzt
+  // wird am KNOTEN — jeder Typname `T` im Bereich der Funktion traegt fuer die
+  // Dauer der Erzeugung den Namen des Arguments (cg_genPatch). Damit sehen
+  // alle Stellen, die einen Typ nachschlagen (Locals, Parameter, Felder,
+  // Rueckgabe, Casts, weitere generische Aufrufe), den richtigen, ohne dass
+  // jede einzeln von der Ersetzung wissen muesste.
+  //
+  // Der typgeloeschte Rumpf bleibt: ein Aufruf OHNE Typargumente
+  // (`max(8, 2)`) und ein Verweis auf die Funktion als Wert meinen ihn.
+  // ==================================================================
+
+  // Vorpass einer Unit: jede generische Funktion samt Kontext eintragen.
+  fn cg_genRegistriere(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      if (self.cg_nkind(cur) == CGN_FUNC_DECL) {
+        var tp: int64 := self.cg_nc3(cur);
+        // c3 einer `extern fn` ist eine gepackte Bibliotheksangabe, kein
+        // Knoten — daher die Grenze vor dem Lesen der Art.
+        if (tp >= 0 && tp < self.pNodeCount && self.cg_nkind(tp) == 62
+            && self.cg_nestHatRumpf(cur) != 0) {
+          self.cg_genEintrag(cur, head);
+        }
+      }
+      cur := self.cg_nnext(cur);
     }
-    var base: int64 := self.monoList + self.monoCount * CG_MONO_SZ;
-    poke64(base,      mangName as int64);
-    poke64(base + CG_PATCH_OFF_NAMEPTR,  mangLen);
-    poke64(base + CG_PATCH_OFF_NAMELEN, origName as int64);
-    poke64(base + CG_PATCH_OFF_KIND, origLen);
-    self.monoCount += 1;
   }
 
-  // WP-BC-24: check if a mangled name is already in the mono list
-  fn cg_monoExists(mangName: pchar, mangLen: int64): int64 {
+  fn cg_genEintrag(fd: int64, head: int64) {
     var i: int64 := 0;
-    while (i < self.monoCount) {
-      var base: int64 := self.monoList + i * CG_MONO_SZ;
-      var n: pchar := peek64(base) as pchar;
-      var l: int64 := peek64(base + CG_PATCH_OFF_NAMEPTR);
-      if (self.cg_seq(n, l, mangName, mangLen) != 0) { return 1; }
+    while (i < self.gfN) {
+      var r0: int64 := self.gfRecs + i * CG_GF_SZ;
+      if (peek64(r0 + CG_GF_OFF_NODES) == self.pNodes && peek64(r0 + CG_GF_OFF_NI) == fd) { return; }
+      i += 1;
+    }
+    if (self.gfN >= self.gfCap) {
+      var nc: int64 := self.gfCap * 2;
+      if (nc < 8) { nc := 8; }
+      var nb: int64 := alloc(nc * CG_GF_SZ);
+      if (self.gfN > 0) { memcpy(nb, self.gfRecs, self.gfN * CG_GF_SZ); }
+      self.gfRecs := nb; self.gfCap := nc;
+    }
+    // Ende des Knotenbereichs: der Parser legt den Funktionsknoten VOR allen
+    // Kindern an, und die Deklarationen der Unit folgen einander. Der
+    // naechste Deklarationsknoten mit groesserem Index begrenzt den Bereich.
+    var ende: int64 := self.pNodeCount;
+    var c: int64 := head;
+    while (c != -1) {
+      if (c > fd && c < ende) { ende := c; }
+      c := self.cg_nnext(c);
+    }
+    var tpN: int64 := 0;
+    var tp: int64 := self.cg_nc3(fd);
+    while (tp >= 0) { tpN += 1; tp := self.cg_nnext(tp); }
+    var innen: int64 := 0;
+    var k: int64 := fd + 1;
+    while (k < ende) {
+      if (self.cg_nkind(k) == CGN_FUNC_DECL) { innen := 1; }
+      k += 1;
+    }
+    var lc: int64 := alloc(8);
+    var lbl: pchar := self.cg_topFnLabel(fd, lc);
+    var r: int64 := self.gfRecs + self.gfN * CG_GF_SZ;
+    poke64(r, self.cg_nsval(fd) as int64);
+    poke64(r + CG_GF_OFF_NAMELEN, self.cg_nslen(fd));
+    poke64(r + CG_GF_OFF_LBL, lbl as int64);
+    poke64(r + CG_GF_OFF_LBLLEN, peek64(lc));
+    free(lc, 8);
+    poke64(r + CG_GF_OFF_SRC, self.pSrc as int64);
+    poke64(r + CG_GF_OFF_NODES, self.pNodes);
+    poke64(r + CG_GF_OFF_NCNT, self.pNodeCount);
+    poke64(r + CG_GF_OFF_NI, fd);
+    poke64(r + CG_GF_OFF_PUB, peek64(self.cg_noff(fd) + CG_OFF_ISPUB));
+    poke64(r + CG_GF_OFF_TPN, tpN);
+    poke64(r + CG_GF_OFF_END, ende);
+    poke64(r + CG_GF_OFF_TAG, self.cgUnitTag);
+    poke64(r + CG_GF_OFF_TAGLEN, self.cgUnitTagLen);
+    poke64(r + CG_GF_OFF_PTAB, self.cgUnitPrivTab);
+    poke64(r + CG_GF_OFF_PCNT, self.cgUnitPrivCnt);
+    poke64(r + CG_GF_OFF_PVTAB, self.cgUnitPrivVTab);
+    poke64(r + CG_GF_OFF_PVCNT, self.cgUnitPrivVCnt);
+    poke64(r + CG_GF_OFF_ALIAS, self.cgAlias);
+    poke64(r + CG_GF_OFF_ALIASL, self.cgAliasLen);
+    poke64(r + CG_GF_OFF_HEAD, head);
+    poke64(r + CG_GF_OFF_NESTED, innen);
+    self.gfN += 1;
+  }
+
+  // Ein Feld, dessen Versatz sich nicht bestimmen laesst. Drei Lagen:
+  //   - in einer Spezialisierung: T ist ersetzt, der Typ trotzdem ohne dieses
+  //     Feld — laut, beim Uebersetzen (wie _genFehler im IR-Weg);
+  //   - im typgeloeschten Rumpf: T ist unbekannt, der Rumpf ist nur ueber
+  //     einen Aufruf OHNE Typargumente erreichbar (`gety(p)`). Bis 1.2.15A
+  //     lieferte er still 0; jetzt bricht er an dieser Stelle laut ab;
+  //   - sonst: das bisherige Verhalten (Wert 0), siehe Bericht zu #2134.
+  fn cg_genFeldOffen(fp: pchar, fl: int64) {
+    if (self.genActN > 0) {
+      self.cg_genFehler("Feld ueber einen Typparameter nicht aufloesbar: "c, fp, fl);
+    }
+    var fd: int64 := self.genCurFd;
+    if (fd < 0) { return; }
+    var tp: int64 := self.cg_nc3(fd);
+    if (tp < 0 || tp >= self.pNodeCount || self.cg_nkind(tp) != 62) { return; }
+    var msgOff: int64 := self.dataLen;
+    var t1: pchar := "lyxc: generische Funktion ohne Typargumente aufgerufen, Feld "c;
+    var i: int64 := 0;
+    while (StrCharAt(t1, i) != 0) { self.cg_edata(StrCharAt(t1, i)); i := i + 1; }
+    i := 0;
+    while (i < fl) { self.cg_edata(StrCharAt(fp, i)); i := i + 1; }
+    var t2: pchar := " haengt am Typparameter (#2134)"c;
+    i := 0;
+    while (StrCharAt(t2, i) != 0) { self.cg_edata(StrCharAt(t2, i)); i := i + 1; }
+    self.cg_edata(10); self.cg_edata(0);
+    self.cg_emitLeaRdiData(msgOff);
+    self.cg_emitPanicBody();
+  }
+
+  fn cg_genFehler(msg: pchar, np: pchar, nl: int64) {
+    EPrintStr("error: x86_64: #2134: "c);
+    EPrintStr(msg);
+    sys_write(2, np as int64, nl);
+    EPrintStrLn(""c);
+    exit(1);
+  }
+
+  // Die Deklaration zu einem Namen: zuerst in der aktiven Unit, sonst eine
+  // oeffentliche einer anderen (dieselbe Reihenfolge wie _genInstanz im
+  // IR-Weg). Ein Knotenindex allein genuegt nicht — er gilt nur in seiner
+  // Tabelle.
+  fn cg_genFind(np: pchar, nl: int64): int64 {
+    var gefunden: int64 := 0 - 1;
+    var i: int64 := 0;
+    while (i < self.gfN) {
+      var r: int64 := self.gfRecs + i * CG_GF_SZ;
+      if (self.cg_seq(peek64(r) as pchar, peek64(r + CG_GF_OFF_NAMELEN), np, nl) != 0) {
+        if (peek64(r + CG_GF_OFF_NODES) == self.pNodes) { return i; }
+        if (gefunden < 0 && peek64(r + CG_GF_OFF_PUB) != 0) { gefunden := i; }
+      }
+      i += 1;
+    }
+    return gefunden;
+  }
+
+  // Ist der Typname `ta` (im Bereich einer generischen Funktion der aktiven
+  // Tabelle) einer ihrer Typparameter? Dann steht der Aufruf im
+  // typgeloeschten Rumpf, und T ist dort nicht bekannt.
+  fn cg_genIstTypParam(ta: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.gfN) {
+      var r: int64 := self.gfRecs + i * CG_GF_SZ;
+      if (peek64(r + CG_GF_OFF_NODES) == self.pNodes) {
+        var fd: int64 := peek64(r + CG_GF_OFF_NI);
+        if (ta > fd && ta < peek64(r + CG_GF_OFF_END)) {
+          var tp: int64 := self.cg_nc3(fd);
+          while (tp >= 0) {
+            if (self.cg_seq(self.cg_nsval(tp), self.cg_nslen(tp), self.cg_nsval(ta), self.cg_nslen(ta)) != 0) { return 1; }
+            tp := self.cg_nnext(tp);
+          }
+        }
+      }
       i += 1;
     }
     return 0;
   }
 
-  // WP-BC-24: build mangled name for generic call, e.g. "Foo_int64"
-  fn cg_buildMangledName(baseName: pchar, baseLen: int64, typeArgsNi: int64, outBuf: int64): int64 {
-    var pos: int64 := 0;
-    var i: int64 := 0;
-    while (i < baseLen) { poke8(outBuf + pos, StrCharAt(baseName, i)); pos := pos + 1; i := i + 1; }
-    var ta: int64 := typeArgsNi;
+  // Name der Spezialisierung fuer den generischen Aufruf `ni` (iVal 2,
+  // c2 = Typargumente). Legt sie beim ersten Mal an und traegt ihre
+  // Signatur ein — Aufrufstellen fragen die Register (f64-Rueckgabe, Klasse
+  // des Ergebnisses) unter diesem Namen, oft BEVOR der Aufruf erzeugt wird.
+  //
+  // Im typgeloeschten Rumpf (Typargument ist ein noch nicht ersetzter
+  // Typparameter) bleibt es beim Namen der generischen Funktion.
+  fn cg_genInstanz(ni: int64, lenCell: int64): pchar {
+    var np: pchar := self.cg_nsval(ni);
+    var nl: int64 := self.cg_nslen(ni);
+    var g: int64 := self.cg_genFind(np, nl);
+    if (g < 0) {
+      self.cg_genFehler("keine generische Funktion dieses Namens (oder nur als .lyu ohne Quelltext): "c, np, nl);
+    }
+    var gr: int64 := self.gfRecs + g * CG_GF_SZ;
+    var argN: int64 := 0;
+    var mLen: int64 := peek64(gr + CG_GF_OFF_LBLLEN) + 2;
+    var ta: int64 := self.cg_nc2(ni);
     while (ta >= 0) {
-      StrSetChar(outBuf as pchar, pos, 95); pos := pos + 1;
-      var tname: pchar := self.cg_nsval(ta);
-      var tlen:  int64 := self.cg_nslen(ta);
-      var j: int64 := 0;
-      while (j < tlen) { poke8(outBuf + pos, StrCharAt(tname, j)); pos := pos + 1; j := j + 1; }
+      if (self.cg_nkind(ta) != 60 || self.cg_nc0(ta) >= 0 || self.cg_nc1(ta) >= 0 || self.cg_nslen(ta) <= 0) {
+        self.cg_genFehler("Typargument ist kein einfacher Typname bei "c, np, nl);
+      }
+      if (self.cg_genIstTypParam(ta) != 0) {
+        poke64(lenCell, nl);
+        return np;
+      }
+      argN += 1;
+      mLen := mLen + self.cg_nslen(ta) + 1;
       ta := self.cg_nnext(ta);
     }
-    poke8(outBuf + pos, 0);
-    return pos;
+    if (argN != peek64(gr + CG_GF_OFF_TPN)) {
+      self.cg_genFehler("Anzahl der Typargumente passt nicht zu den Typparametern von "c, np, nl);
+    }
+    // "<Marke><A,B>" — `<` kommt in keinem Bezeichner vor.
+    var mb: int64 := alloc(mLen + 1);
+    var lbl: int64 := peek64(gr + CG_GF_OFF_LBL);
+    var pos: int64 := peek64(gr + CG_GF_OFF_LBLLEN);
+    memcpy(mb, lbl, pos);
+    poke8(mb + pos, 60); pos += 1;
+    var argB: int64 := alloc(argN * 16 + 16);
+    var ai: int64 := 0;
+    ta := self.cg_nc2(ni);
+    while (ta >= 0) {
+      if (ai > 0) { poke8(mb + pos, 44); pos += 1; }
+      memcpy(mb + pos, self.cg_nsval(ta) as int64, self.cg_nslen(ta));
+      pos := pos + self.cg_nslen(ta);
+      poke64(argB + ai * 16, self.cg_nsval(ta) as int64);
+      poke64(argB + ai * 16 + 8, self.cg_nslen(ta));
+      ai += 1;
+      ta := self.cg_nnext(ta);
+    }
+    poke8(mb + pos, 62); pos += 1;
+    poke8(mb + pos, 0);
+    var i: int64 := 0;
+    while (i < self.gmN) {
+      var m: int64 := self.gmRecs + i * CG_GM_SZ;
+      if (self.cg_seq(peek64(m) as pchar, peek64(m + CG_GM_OFF_LEN), mb as pchar, pos) != 0) {
+        free(mb, mLen + 1);
+        free(argB, argN * 16 + 16);
+        poke64(lenCell, peek64(m + CG_GM_OFF_LEN));
+        return peek64(m) as pchar;
+      }
+      i += 1;
+    }
+    if (self.gmN >= self.gmCap) {
+      var nc: int64 := self.gmCap * 2;
+      if (nc < 8) { nc := 8; }
+      var nb: int64 := alloc(nc * CG_GM_SZ);
+      if (self.gmN > 0) { memcpy(nb, self.gmRecs, self.gmN * CG_GM_SZ); }
+      self.gmRecs := nb; self.gmCap := nc;
+    }
+    var nm: int64 := self.gmRecs + self.gmN * CG_GM_SZ;
+    poke64(nm, mb);
+    poke64(nm + CG_GM_OFF_LEN, pos);
+    poke64(nm + CG_GM_OFF_GF, g);
+    poke64(nm + CG_GM_OFF_ARGS, argB);
+    poke64(nm + CG_GM_OFF_ARGN, argN);
+    poke64(nm + CG_GM_OFF_DONE, 0);
+    self.gmN += 1;
+    self.cg_genSignatur(self.gmN - 1);
+    poke64(lenCell, pos);
+    return mb as pchar;
+  }
+
+  // T -> Argument an jedem schlichten Typnamen im Bereich der Funktion.
+  // Die AKTIVE Tabelle muss die der Deklaration sein. Liefert die Liste der
+  // Aenderungen (Eintraege zu 40 Byte), Anzahl in nCell.
+  fn cg_genPatch(gmI: int64, nCell: int64): int64 {
+    var m: int64 := self.gmRecs + gmI * CG_GM_SZ;
+    var gr: int64 := self.gfRecs + peek64(m + CG_GM_OFF_GF) * CG_GF_SZ;
+    var fd: int64 := peek64(gr + CG_GF_OFF_NI);
+    var ende: int64 := peek64(gr + CG_GF_OFF_END);
+    var argB: int64 := peek64(m + CG_GM_OFF_ARGS);
+    var buf: int64 := alloc((ende - fd + 1) * 40);
+    var n: int64 := 0;
+    var k: int64 := fd + 1;
+    while (k < ende) {
+      if (self.cg_nkind(k) == 60 && self.cg_nc0(k) < 0 && self.cg_nc1(k) < 0) {
+        var tp: int64 := self.cg_nc3(fd);
+        var ai: int64 := 0;
+        while (tp >= 0) {
+          if (self.cg_seq(self.cg_nsval(tp), self.cg_nslen(tp), self.cg_nsval(k), self.cg_nslen(k)) != 0) {
+            var feld: int64 := self.cg_noff(k) + CG_OFF_SVAL;
+            var e: int64 := buf + n * 40;
+            poke64(e, feld);
+            poke64(e + 8, peek64(feld));
+            poke64(e + 16, peek64(feld + 8));
+            poke64(e + 24, peek64(argB + ai * 16) - (self.pSrc as int64));
+            poke64(e + 32, peek64(argB + ai * 16 + 8));
+            poke64(feld, peek64(e + 24));
+            poke64(feld + 8, peek64(e + 32));
+            n += 1;
+            tp := 0 - 1;
+          } else {
+            tp := self.cg_nnext(tp);
+            ai += 1;
+          }
+        }
+      }
+      k += 1;
+    }
+    poke64(nCell, n);
+    return buf;
+  }
+
+  // Ersetzung zuruecknehmen (rueckwaerts) bzw. erneut anwenden.
+  fn cg_genUndo(buf: int64, n: int64) {
+    var i: int64 := n - 1;
+    while (i >= 0) {
+      var e: int64 := buf + i * 40;
+      poke64(peek64(e), peek64(e + 8));
+      poke64(peek64(e) + 8, peek64(e + 16));
+      i -= 1;
+    }
+  }
+
+  fn cg_genRedo(buf: int64, n: int64) {
+    var i: int64 := 0;
+    while (i < n) {
+      var e: int64 := buf + i * 40;
+      poke64(peek64(e), peek64(e + 24));
+      poke64(peek64(e) + 8, peek64(e + 32));
+      i += 1;
+    }
+  }
+
+  // Signatur der Spezialisierung eintragen (cg_registerSigUnter, dieselbe
+  // Stelle wie fuer jede Funktion): in der Tabelle der Deklaration, mit T
+  // ersetzt. Laeuft das waehrend einer anderen Spezialisierung, ist deren
+  // Ersetzung aktiv — sie kann dieselben Knoten betreffen (`f<T>` ruft
+  // `f<int64>`) und wird dafuer kurz zurueckgenommen.
+  fn cg_genSignatur(gmI: int64) {
+    var m: int64 := self.gmRecs + gmI * CG_GM_SZ;
+    var gr: int64 := self.gfRecs + peek64(m + CG_GM_OFF_GF) * CG_GF_SZ;
+    if (self.genActN > 0) { self.cg_genUndo(self.genActBuf, self.genActN); }
+    var svSrc: pchar := self.pSrc;
+    var svNodes: int64 := self.pNodes;
+    var svCnt: int64 := self.pNodeCount;
+    self.pSrc := peek64(gr + CG_GF_OFF_SRC) as pchar;
+    self.pNodes := peek64(gr + CG_GF_OFF_NODES);
+    self.pNodeCount := peek64(gr + CG_GF_OFF_NCNT);
+    var nc: int64 := alloc(8);
+    var pb: int64 := self.cg_genPatch(gmI, nc);
+    var pn: int64 := peek64(nc);
+    free(nc, 8);
+    self.cg_registerSigUnter(peek64(gr + CG_GF_OFF_NI), peek64(m) as pchar, peek64(m + CG_GM_OFF_LEN));
+    self.cg_genUndo(pb, pn);
+    self.pSrc := svSrc;
+    self.pNodes := svNodes;
+    self.pNodeCount := svCnt;
+    if (self.genActN > 0) { self.cg_genRedo(self.genActBuf, self.genActN); }
+  }
+
+  // Alle angeforderten Spezialisierungen erzeugen — jede im Kontext ihrer
+  // Unit (Quelltext, Knotentabelle, private Marken, Namensraum). Eine
+  // Spezialisierung darf weitere anfordern; die Schleife liest die Anzahl
+  // bei jedem Schritt neu.
+  fn cg_genEmitPending() {
+    var i: int64 := 0;
+    while (i < self.gmN) {
+      var m: int64 := self.gmRecs + i * CG_GM_SZ;
+      if (peek64(m + CG_GM_OFF_DONE) == 0) {
+        poke64(m + CG_GM_OFF_DONE, 1);
+        var gr: int64 := self.gfRecs + peek64(m + CG_GM_OFF_GF) * CG_GF_SZ;
+        if (peek64(gr + CG_GF_OFF_NESTED) != 0) {
+          // Die innere Funktion traegt eine Marke je Tabelle (cg_nestPlan),
+          // nicht je Spezialisierung — zwei Instanzen teilten sie sich.
+          self.cg_genFehler("innere Funktion in einer generischen Funktion wird nicht unterstuetzt: "c,
+                            peek64(gr) as pchar, peek64(gr + CG_GF_OFF_NAMELEN));
+        }
+        var svSrc: pchar := self.pSrc;
+        var svNodes: int64 := self.pNodes;
+        var svCnt: int64 := self.pNodeCount;
+        var svHead: int64 := self.topLevelHead;
+        var svTag: int64 := self.cgUnitTag;
+        var svTagL: int64 := self.cgUnitTagLen;
+        var svPT: int64 := self.cgUnitPrivTab;
+        var svPC: int64 := self.cgUnitPrivCnt;
+        var svPCap: int64 := self.cgUnitPrivCap;
+        var svPVT: int64 := self.cgUnitPrivVTab;
+        var svPVC: int64 := self.cgUnitPrivVCnt;
+        var svAl: int64 := self.cgAlias;
+        var svAlL: int64 := self.cgAliasLen;
+        self.pSrc := peek64(gr + CG_GF_OFF_SRC) as pchar;
+        self.pNodes := peek64(gr + CG_GF_OFF_NODES);
+        self.pNodeCount := peek64(gr + CG_GF_OFF_NCNT);
+        self.topLevelHead := peek64(gr + CG_GF_OFF_HEAD);
+        self.cgUnitTag := peek64(gr + CG_GF_OFF_TAG);
+        self.cgUnitTagLen := peek64(gr + CG_GF_OFF_TAGLEN);
+        self.cgUnitPrivTab := peek64(gr + CG_GF_OFF_PTAB);
+        self.cgUnitPrivCnt := peek64(gr + CG_GF_OFF_PCNT);
+        self.cgUnitPrivCap := self.cgUnitPrivCnt;
+        self.cgUnitPrivVTab := peek64(gr + CG_GF_OFF_PVTAB);
+        self.cgUnitPrivVCnt := peek64(gr + CG_GF_OFF_PVCNT);
+        self.cgAlias := peek64(gr + CG_GF_OFF_ALIAS);
+        self.cgAliasLen := peek64(gr + CG_GF_OFF_ALIASL);
+        var nc: int64 := alloc(8);
+        self.genActBuf := self.cg_genPatch(i, nc);
+        self.genActN := peek64(nc);
+        free(nc, 8);
+        self.genOvLbl := peek64(m);
+        self.genOvLen := peek64(m + CG_GM_OFF_LEN);
+        self.cg_genFuncDecl(peek64(gr + CG_GF_OFF_NI));
+        self.cg_genUndo(self.genActBuf, self.genActN);
+        self.genActN := 0;
+        self.pSrc := svSrc;
+        self.pNodes := svNodes;
+        self.pNodeCount := svCnt;
+        self.topLevelHead := svHead;
+        self.cgUnitTag := svTag;
+        self.cgUnitTagLen := svTagL;
+        self.cgUnitPrivTab := svPT;
+        self.cgUnitPrivCnt := svPC;
+        self.cgUnitPrivCap := svPCap;
+        self.cgUnitPrivVTab := svPVT;
+        self.cgUnitPrivVCnt := svPVC;
+        self.cgAlias := svAl;
+        self.cgAliasLen := svAlL;
+      }
+      i += 1;
+    }
   }
 
   // ------------------------------------------------------------------
@@ -22136,6 +22556,9 @@ pub type Codegen = class {
 
   fn cg_genFile(head: int64) {
     self.topLevelHead := head;   // A1: früh setzen (für cg_isDeclaredFunc beim Fn-Name-als-Wert)
+    // #2134: generische Funktionen dieser Unit samt Kontext — vor jedem
+    // Rumpf, der sie aufrufen koennte.
+    self.cg_genRegistriere(head);
     // #2004: Die EINHEITENTYPEN muessen VOR den f64-Funktionen gesammelt
     // werden. cg_collectF64Funcs entscheidet ueber cg_isFloatTypeName, ob eine
     // Funktion Gleitkomma zurueckgibt — und diese Frage beantwortet seit #1955
@@ -22603,21 +23026,9 @@ pub type Codegen = class {
       }
       cur := self.cg_nnext(cur);
     }
-    // WP-BC-24: emit JMP stubs for all registered generic specializations
-    var mi: int64 := 0;
-    while (mi < self.monoCount) {
-      var mBase: int64 := self.monoList + mi * 32;
-      var mangName: pchar := peek64(mBase) as pchar;
-      var mangLen:  int64 := peek64(mBase + CG_MONO_OFF_MANGLEN);
-      var origName: pchar := peek64(mBase + CG_MONO_OFF_ORIGPTR) as pchar;
-      var origLen:  int64 := peek64(mBase + CG_MONO_OFF_ORIGLEN);
-      // Emit label for mangled name, then JMP rel32 to the generic function
-      self.cg_addLabel(mangName, mangLen, 0);  // generic specialization: no direct line
-      self.cg_e8(0xE9);
-      self.cg_addPatch(self.codeLen, origName as int64, origLen, CG_PATCH_CALL);
-      self.cg_e32(0);
-      mi += 1;
-    }
+    // #2134: Hier standen die Sprungmarken der typgeloeschten Instanzen
+    // (WP-BC-24). Die Spezialisierungen entstehen jetzt in Generate
+    // (cg_genEmitPending), nachdem alle Units durchlaufen sind.
     // #1140: Restorer und SIGFPE-Handler ans Ende des Codes — nur wenn das
     // Programm ueberhaupt eine @flight_crit-Funktion hat.
     if (self.fcSeen != 0) { self.cg_fcEmitHandler(); }
@@ -22779,10 +23190,13 @@ pub type Codegen = class {
     self.cg_registerF64Func("fAbs"c,  4);
     self.cg_registerF64Func("sqrt"c,  4);
 
-    // WP-BC-24: deferred monomorphization list
-    self.monoCap   := 32;
-    self.monoList  := alloc(self.monoCap * CG_MONO_SZ);
-    self.monoCount := 0;
+    // #2134: generische Funktionen
+    self.gfRecs := 0; self.gfN := 0; self.gfCap := 0;
+    self.gmRecs := 0; self.gmN := 0; self.gmCap := 0;
+    self.pNodeCount := 0;
+    self.genCurFd := 0 - 1;
+    self.genOvLbl := 0; self.genOvLen := 0;
+    self.genActBuf := 0; self.genActN := 0;
 
     // WP-BC-25: DWARF debug info (off by default)
     self.debugMode   := 0;
@@ -23924,6 +24338,10 @@ pub type Codegen = class {
     // alle Units sind jetzt eingelesen.
     self.cg_miEinheit(miStartHaupt);
     self.cg_miSammel();
+    // #2134: Spezialisierungen generischer Funktionen — erst jetzt, wenn
+    // jede Unit ihre Aufrufe angefordert hat; nach den Anfangswerten (#2136),
+    // denn auch ein Anfangswert darf eine generische Funktion rufen.
+    self.cg_genEmitPending();
     // #1141: die Bilanz erst hier — cg_genFile laeuft je importierter Einheit
     // erneut, dort gedruckt gaebe es eine Zeile je Import.
     // #1370: --profile — die Berichtsfunktion ganz am Ende, hinter allen

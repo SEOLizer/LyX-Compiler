@@ -36,11 +36,13 @@ weist_ab "importC_gibt_es_nicht" \
   'importC "string.h" link "libc.so.6";
 fn main(): int64 { return 0; }' "unexpected top-level token"
 
-# Generische TYPEN sind nicht vorgesehen (ebnf.md §12: TypeParamClause steht
-# nur an Funktionen). Generische FUNKTIONEN gibt es seit #1009.
-weist_ab "generischer_typ_wird_abgewiesen" \
-  'pub type Pair<T> = struct { a: T; b: T; };
-fn main(): int64 { return 0; }' "top-level"
+# Generische TYPEN gibt es seit #2134 (class und struct; Wert gemessen in
+# tests/generics_x86_typen_test.sh). Bis 1.2.15A stand hier ihre Abweisung —
+# ein Test darf keine Luecke voraussetzen. Geblieben ist die Abweisung des
+# generischen INTERFACE, das weiterhin nicht vorgesehen ist.
+weist_ab "generisches_interface_wird_abgewiesen" \
+  'pub type I<T> = interface { fn F(): T; };
+fn main(): int64 { return 0; }' "nur class und struct"
 
 # `parallel` ist seit SIMD ein Schluesselwort und taugt nicht als Bezeichner.
 weist_ab "parallel_ist_schluesselwort" \

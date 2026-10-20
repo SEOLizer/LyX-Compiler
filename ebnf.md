@@ -391,9 +391,18 @@ TypeParamList       = Ident { "," Ident } ;
    Ein Typparameter gilt nur INNERHALB seiner Funktion; ausserhalb ist er ein
    unbekannter Typ und wird gemeldet.
 
-   Generische TYPEN (`type P<T> = struct {...}`) werden weiterhin nicht
-   angenommen -- TypeParamClause steht daher nur an Funktionen, nicht an
-   Typdeklarationen. Siehe 20.1. *)
+   Bis 1.2.15A wurden generische TYPEN (`type P<T> = struct {...}`) nicht
+   angenommen. Seit #2134 steht TypeParamClause auch an der Typdeklaration
+   (Abschnitt 7, TypeDecl).
+
+   Je Kombination von Typargumenten entsteht EIN Rumpf, mit T ersetzt -- auf
+   allen Zielen, x86 eingeschlossen (bis 1.2.15A war der x86-Rumpf
+   typgeloescht: ein Feld ueber T lieferte 0, f64 wurde abgewiesen). Die
+   Anzahl der Typargumente muss der der Typparameter entsprechen (sema,
+   #2134). Ein Aufruf OHNE Typargumente (`Max(8, 2)`) nimmt weiterhin den
+   typgeloeschten Rumpf; haengt darin ein Feldzugriff an T, bricht er an
+   dieser Stelle zur Laufzeit ab. Eine innere Funktion in einer generischen
+   Funktion wird auf x86 abgewiesen. *)
 
 ParamList           = Param { "," Param } ;
 
@@ -420,7 +429,25 @@ ReturnType          = Type | TupleType ;
 # 7. Type Grammar
 
 ```ebnf
-TypeDecl            = [ Visibility ] "type" Ident "=" TypeDef ";" ;
+TypeDecl            = [ Visibility ] "type" Ident [ TypeParamClause ] "=" TypeDef ";" ;
+
+(* #2134: generische Typen. Mit TypeParamClause ist TypeDef nur StructDef,
+   FlatStructDef, PackedStructDef oder ClassDef -- kein Interface, kein
+   Alias, keine Einschraenkung `T: I` (laut abgewiesen).
+
+     type Box<T> = class { v: T; fn Get(): T { return self.v; } };
+     var b: Box<int64> := new Box<int64>();
+
+   Jede Nennung `Box<A>` (GenericTypeRef) steht fuer eine eigene Klasse
+   "Box<A>": Feld-Layout, Methoden und VMT entstehen je Typargument. Zwei
+   Nennungen derselben Kombination sind derselbe Typ; geschachtelt
+   (`Box<Box<int64>>`) und selbstbezueglich (`next: Node<T>`) geht.
+
+   Laut abgewiesen (nicht umgesetzt): ein generischer Typ einer ANDEREN Unit,
+   ein Typparameter einer generischen Funktion als Typargument (`Box<T>` in
+   `fn f<T>`), Ableitung von einer Instanz (`extends Box<int64>`), ein
+   Typargument, das kein schlichter Typname ist (`Box<int64[]>`), eine
+   generische Typdeklaration in einem `@if`-Zweig. *)
 
 TypeDef             = Type
                     | RangeTypeDef
@@ -439,6 +466,7 @@ RangeBound          = [ "-" ] IntLiteral ;
 Type                = PrimaryType [ "?" ] ;
 
 PrimaryType         = BuiltinType
+                    | GenericTypeRef
                     | Ident
                     | ArrayType
                     | ParallelArrayType
@@ -446,6 +474,8 @@ PrimaryType         = BuiltinType
                     | MapType
                     | FnPtrType
                     | MethodPtrType ;
+
+GenericTypeRef      = Ident "<" TypeArgList ">" ;   (* #2134, siehe TypeDecl *)
 
 BuiltinType         = "bool"
                     | BaseIntType

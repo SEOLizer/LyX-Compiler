@@ -7027,8 +7027,23 @@ pub type IRLower = class {
     }
 
     // ARM64-OOP: Instanz-Feldzugriff p.x — base = Objekt-Pointer, Offset aus p's Typ.
-    var base: int64 := self.lowerExpr(baseNode);
     var ifOff: int64 := self._instanceFieldOffset(baseNode, self.nodeSVal(expr), self.nodeSLen(expr));
+    // #2134: `obj.Methode` als WERT (kein Aufruf) — eine Methodenreferenz,
+    // derselbe Fat-Pointer wie bei der Zuweisung an ein method-Feld
+    // (_lowerMethodRef). Bis 1.2.15A fiel sie hierher durch und lieferte den
+    // unbeschriebenen Temp; die Zuweisung an ein method-Feld baute den Wert
+    // ohnehin selbst und uebersah den Muell. Seit der Fehlfall laut ist,
+    // muss die Referenz hier entstehen.
+    if ifOff < 0 {
+      var mrTn: int64 := self._baseTypeNode(baseNode);
+      if mrTn >= 0 {
+        var mrL: int64 := self.nodeSLen(mrTn) + 1 + self.nodeSLen(expr);
+        var mrM: int64 := self._methodMangle(self.nodeSVal(mrTn), self.nodeSLen(mrTn),
+                                             self.nodeSVal(expr), self.nodeSLen(expr));
+        if self._findFuncByName(mrM as pchar, mrL) >= 0 { return self._lowerMethodRef(expr); }
+      }
+    }
+    var base: int64 := self.lowerExpr(baseNode);
     if ifOff >= 0 {
       self.irAddInstrDirect(IRO_LOAD_FIELD, dest, base, ifOff, 0);
     } else if self.genSubstN > 0 {
@@ -7038,6 +7053,11 @@ pub type IRLower = class {
       // wie auf x86, wo der Rumpf typgeloescht ist.
       self._genFehler("Feld ueber einen Typparameter nicht aufloesbar (Klasse aus einer anderen Unit?): "c,
                       self.nodeSVal(expr), self.nodeSLen(expr));
+    } else {
+      // #2134: ausserhalb einer Spezialisierung ebenso laut. Bis 1.2.15A
+      // kam hier der unbeschriebene Temp zurueck — der Wert war, was
+      // zufaellig im Register stand, und das Programm lief weiter.
+      self._feldOffen(expr, dest);
     }
     return dest;
   }
@@ -8208,6 +8228,9 @@ pub type IRLower = class {
           // beiden muessen uebereinstimmen. Sonst entfiele die Zuweisung still.
           self._genFehler("Feld ueber einen Typparameter nicht aufloesbar (Klasse aus einer anderen Unit?): "c,
                           self.nodeSVal(target), self.nodeSLen(target));
+        } else {
+          // #2134: und ausserhalb einer Spezialisierung wie in lowerField.
+          self._feldOffen(target, 0 - 1);
         }
       }
       // Target is INDEX — store to array element. ARM64-FIX: war Stub.
@@ -12533,6 +12556,7 @@ pub type IRLower = class {
       // die erste gleichnamige des Moduls, eine innere eingeschlossen.
       var rtD: int64 := self._callDeclNi(nd);
       if rtD < 0 { return 0 - 1; }
+      if self.nodeIVal(nd) == 2 { return self._genRetTyp(rtD, nd); }   // #2134
       return self.nodeC1(rtD);
     }
 
@@ -13273,6 +13297,55 @@ pub type IRLower = class {
       i += 1;
     }
     return tn;
+  }
+
+  // #2134: Rueckgabetyp eines generischen Aufrufs `f<P>(...)` (Deklaration
+  // rtD, Aufruf nd). Ist er ein Typparameter, gilt das Typargument an seiner
+  // Stelle — in einer Spezialisierung selbst noch einmal ersetzt. Ohne das
+  // galt `getP<T>(p).y` als Feld eines unbekannten Typs; x86 sieht den
+  // ersetzten Rueckgabetyp ueber die Signatur der Spezialisierung.
+  fn _genRetTyp(rtD: int64, nd: int64): int64 {
+    var rtN: int64 := self.nodeC1(rtD);
+    if (rtN < 0 || self.nodeKind(rtN) != NK_TYPE_NAME || self.nodeC0(rtN) >= 0) { return rtN; }
+    var gTp: int64 := self.nodeC3(rtD);
+    var gTa: int64 := self.nodeC2(nd);
+    while (gTp >= 0 && gTa >= 0 && self.nodeKind(gTp) == NK_TYPE_PARAM) {
+      if (self.seq(self.nodeSVal(gTp), self.nodeSLen(gTp), self.nodeSVal(rtN), self.nodeSLen(rtN))) {
+        return self._genSubst(gTa);
+      }
+      gTp := self.nodeNext(gTp);
+      gTa := self.nodeNext(gTa);
+    }
+    return rtN;
+  }
+
+  // #2134: Feldzugriff (Lesen oder Zuweisen), dessen Versatz sich nicht
+  // bestimmen laesst — laut statt eines unbeschriebenen Temps. Im
+  // typgeloeschten Rumpf einer generischen Funktion (erreichbar nur ueber
+  // einen Aufruf OHNE Typargumente, `gety(p)`) ist T unbekannt; dort bricht
+  // der Rumpf zur LAUFZEIT ab, an genau dieser Stelle — derselbe Weg wie
+  // cg_genFeldOffen auf x86, die beiden muessen uebereinstimmen. dest >= 0:
+  // Lesezugriff, der Temp wird beschrieben.
+  fn _feldOffen(expr: int64, dest: int64) {
+    var fd: int64 := self.curFunc;
+    if (fd >= 0 && self.genSubstN == 0) {
+      var tp: int64 := self.nodeC3(fd);
+      if (tp >= 0 && tp < self.nodeCount && self.nodeKind(tp) == NK_TYPE_PARAM) {
+        var mt: pchar := "lyxc: generische Funktion ohne Typargumente aufgerufen, Feld haengt am Typparameter (#2134)\n"c;
+        var mOff: int64 := self.irAddString(mt, StrLen(mt));
+        var mT: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_CONST_STR, mT, -1, -1, mOff);
+        self.irAddInstrDirect(IRO_PANIC, -1, mT, -1, 0);
+        if (dest >= 0) { self.irAddInstrDirect(IRO_CONST_INT, dest, -1, -1, 0); }
+        return;
+      }
+    }
+    EPrintStr("error: #2134: Feld nicht aufloesbar (Typ der Basis unbekannt): "c);
+    sys_write(2, self.nodeSVal(expr) as int64, self.nodeSLen(expr));
+    EPrintStr(" (Zeile "c);
+    EPrintInt(self._lineOf(expr));
+    EPrintStrLn(")"c);
+    exit(1);
   }
 
   fn _genFehler(msg: pchar, np: pchar, nl: int64) {

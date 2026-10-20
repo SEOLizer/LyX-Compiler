@@ -598,6 +598,7 @@ test: lyxc
 	@bash tests/ir_viele_argumente_test.sh
 	@bash tests/ir_bezeichner_herkunft_test.sh
 	@bash tests/ir_generics_test.sh
+	@bash tests/generics_x86_typen_test.sh
 	@bash tests/android_shared_lib_test.sh
 	@bash tests/ir_modulvar_init_test.sh
 	@bash tests/x86_shared_lib_test.sh
