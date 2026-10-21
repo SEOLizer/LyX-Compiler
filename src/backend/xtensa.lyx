@@ -191,6 +191,15 @@ pub type EmitXtensa = class {
   // --------------------------------------------------------------------------
 
   fn xt_RRI8(r: int64, at: int64, as_: int64, imm8: int64) {
+    // #2149: Der Direktwert hat acht Bit — vorzeichenbehaftet (ADDI, ADDMI)
+    // oder als Wort-/Halbwortversatz vorzeichenlos (L32I, S32I, L16UI …).
+    // Bis 1.2.16E wurde ein groesserer Wert still auf acht Bit gekuerzt, ein
+    // Feldversatz von 1024 Byte landete damit bei 0.
+    if imm8 < 0 - 128 || imm8 > 255 {
+      EPrintStr("error: xtensa: Direktwert "c); EPrintInt(imm8);
+      EPrintStrLn(" passt nicht in die acht Bit eines RRI8-Befehls (#2149)."c);
+      exit(1);
+    }
     self.xt_e3((at << 4) | 2, (r << 4) | as_, imm8 & 0xFF);
   }
 
@@ -238,8 +247,35 @@ pub type EmitXtensa = class {
           return;
         }
       }
-      self.xt_MOVI(ar, 0);  // fallback for values out of 20-bit range
+      // #2149: Hier stand `MOVI ar, 0` — ein Wert ausserhalb dieser Formen
+      // wurde still zu 0. Jetzt fuer jeden 32-Bit-Wert:
+      //   ar = hoch << 12;  ar += a << 8 (ADDMI);  ar += b (ADDI)
+      // mit lo = v & 0xFFF = a*256 + b, b in [-128, 127]. `hoch` entsteht
+      // auf demselben Weg (rekursiv). Die Zielarchitektur rechnet in 32 Bit;
+      // ein Wert, der nicht hineinpasst, wird laut abgewiesen.
+      var v32: int64 := imm & 0xFFFFFFFF;
+      if (v32 & 0x80000000) != 0 { v32 := v32 - 4294967296; }
+      if v32 != imm && imm != (imm & 0xFFFFFFFF) {
+        EPrintStr("error: xtensa: Konstante "c); EPrintInt(imm);
+        EPrintStrLn(" passt nicht in 32 Bit (#2149)."c);
+        exit(1);
+      }
+      var lo: int64 := v32 & 0xFFF;
+      var hoch: int64 := (v32 - lo) >> 12;
+      var a: int64 := (lo + 128) >> 8;
+      var b: int64 := lo - a * 256;
+      self.xt_li(ar, hoch);
+      self.xt_SLLI(ar, ar, 12);
+      if a != 0 { self.xt_ADDMI(ar, ar, a); }
+      if b != 0 { self.xt_ADDI(ar, ar, b); }
     }
+  }
+
+  // #2149: SLLI ar, as, sa (1..31). RRR, op1 = 1, op2 = 000x mit x =
+  // (32-sa) Bit 4, t = (32-sa) Bit 3..0 — dieselbe Byte-Anordnung wie xt_SLL.
+  fn xt_SLLI(ar: int64, as_: int64, sa: int64) {
+    var s2: int64 := 32 - sa;
+    self.xt_e3((s2 & 15) << 4, (ar << 4) | as_, (((s2 >> 4) & 1) << 4) | 1);
   }
 
   // --------------------------------------------------------------------------
@@ -685,10 +721,15 @@ pub type EmitXtensa = class {
     else if op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP {
       self.xt_loadSlot(src1);
       var woff: int64 := src2 >> 2;
-      if woff >= 0 && woff <= 255 {
+      if woff >= 0 && woff <= 255 && (src2 & 3) == 0 {
         self.xt_L32I(XT_T0, XT_T0, woff);
       } else {
-        self.xt_MOVI(XT_T0, 0);
+        // #2149: Hier stand `MOVI T0, 0` — ein Feld jenseits von 1020 Byte
+        // las still 0. Jetzt die Adresse rechnen (xt_li meldet sich, wenn
+        // auch das nicht reicht).
+        self.xt_li(XT_T1, src2);
+        self.xt_ADD(XT_T0, XT_T0, XT_T1);
+        self.xt_L32I(XT_T0, XT_T0, 0);
       }
       self.xt_storeSlot(dest);
     }
@@ -697,8 +738,13 @@ pub type EmitXtensa = class {
       self.xt_MOV(XT_T2, XT_T1);           // T2 = base (preserved across loadSlot)
       self.xt_loadSlot(src1);               // T0 = value
       var woff: int64 := dest >> 2;
-      if woff >= 0 && woff <= 255 {
+      if woff >= 0 && woff <= 255 && (dest & 3) == 0 {
         self.xt_S32I(XT_T0, XT_T2, woff);
+      } else {
+        // #2149: der Store entfiel hier still.
+        self.xt_li(XT_T1, dest);
+        self.xt_ADD(XT_T2, XT_T2, XT_T1);
+        self.xt_S32I(XT_T0, XT_T2, 0);
       }
     }
 
