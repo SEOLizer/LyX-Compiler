@@ -6,6 +6,8 @@
 #       retten, main ueberschrieb x28 (argv, #2110) — beides callee-saved.
 #   (2) arm64 --shared: exportierte Funktionen mit f64 hatten keine Huelle;
 #       C uebergibt Gleitkomma in d0..d7, Lyx las x0..x7 — still falsch.
+#       f32 (single in s0) wurde bis 1.2.17A laut abgewiesen, seit #2160
+#       wandelt die Huelle es.
 #   (3) android-arm64 mit extern fn verlangte /lib/ld-linux-aarch64.so.1 und
 #       den glibc-Startweg (__libc_start_main, libc.so.6).
 #   (4) Die Gleitkommamaske von `extern fn` kannte nur die Woerter f64/f32;
@@ -52,10 +54,16 @@ fn mischen(n: int64, x: f64, y: Meter, m: int64): f64 { return x + y + ((n * 10 
 fn ganz(a: int64, b: int64): int64 { return a * 10 + b; }
 @export
 fn fmt(a: f64): int64 { var s: pchar := FloatToStr(a); return StrLen(s); }
+// #2160: f32 an der Schnittstelle — C uebergibt und erwartet ein single in s0
+@export
+fn viertel(x: f32): f32 { return x / 4.0; }
+@export
+fn gemischt(a: int64, x: f32, y: f64): f64 { return (x as f64) + y + (a as f64); }
 LYX
 cat > "$TMP/lader.lyx" <<'LYX'
 import std.alloc;
 type T3 = fn(int64, int64, int64): int64;
+type T4 = fn(int64, int64, int64, int64): int64;
 type T5 = fn(int64, int64, int64, int64, int64): int64;
 fn nameIst(p: int64, s: pchar): int64 {
   var i: int64 := 0;
@@ -188,6 +196,18 @@ fn main(): int64 {
   poke32(t3 + 160, 0xA8C453F3);
   poke32(t3 + 164, 0xA8C17BFD);
   poke32(t3 + 168, 0xD65F03C0);
+  // thunk4(xbits, fn, 0): s0 = single aus w0, blr fn, w0 = s0 (#2160)
+  var t4: int64 := th + 320;
+  poke32(t4 + 0,  0xA9BF7BFD); poke32(t4 + 4,  0x910003FD);
+  poke32(t4 + 8,  0x1E270000); poke32(t4 + 12, 0xD63F0020);
+  poke32(t4 + 16, 0x1E260000); poke32(t4 + 20, 0xA8C17BFD);
+  poke32(t4 + 24, 0xD65F03C0);
+  // thunk5(a, xbits, ybits, fn): x0 = a, s0 = single aus w1, d1 = y, blr fn, x0 = d0
+  var t5: int64 := th + 384;
+  poke32(t5 + 0,  0xA9BF7BFD); poke32(t5 + 4,  0x910003FD);
+  poke32(t5 + 8,  0x1E270020); poke32(t5 + 12, 0x9E670041);
+  poke32(t5 + 16, 0xD63F0060); poke32(t5 + 20, 0x9E660000);
+  poke32(t5 + 24, 0xA8C17BFD); poke32(t5 + 28, 0xD65F03C0);
 
   var k3: T3 := t3 as T3;
   var k1: T3 := th as T3;
@@ -201,11 +221,21 @@ fn main(): int64 {
   var e3: int64 := fG(4, 2, 0);
   var fF: int64 := suche("fmt"c);
   var e4: int64 := k3(0x4004000000000000, fF, 0);
+  var k4: T3 := t4 as T3;
+  var k5: T4 := t5 as T4;
+  var fV: int64 := suche("viertel"c);
+  var fGm: int64 := suche("gemischt"c);
+  if (fV == 0 || fGm == 0) { PrintLn("Symbol fehlt"); return 5; }
+  var e5: int64 := k4(0x40A00000, fV, 0);
+  var e6: int64 := k5(3, 0x3F000000, 0x4024800000000000, fGm);
   // 1.5 * 2 + 3 = 6.0; 0.5 + 10.25 + 42 = 52.75 — als IEEE-Bits verglichen
   if (e1 == 0x4018000000000000) { Print("6.0 "); } else { Print("e1="); PrintInt(e1); Print(" "); }
   if (e2 == 0x404A600000000000) { Print("52.75 "); } else { Print("e2="); PrintInt(e2); Print(" "); }
   PrintInt(e3); Print(" ");
   if (e4 == 0) { Print("gerettet"); } else { Print("x19-x28 veraendert"); }
+  // viertel(5.0f) = 1.25f; gemischt(3, 0.5f, 10.25) = 13.75
+  if (e5 == 0x3FA00000) { Print(" 1.25f"); } else { Print(" e5="); PrintInt(e5); }
+  if (e6 == 0x402B800000000000) { Print(" 13.75"); } else { Print(" e6="); PrintInt(e6); }
   Print("\n");
   return 0;
 }
@@ -215,15 +245,11 @@ if baue arm64 "$TMP/lib.lyx" "$TMP/w/lib.so" --shared && baue arm64 "$TMP/lader.
   # rechne(1.5, 3) = 6.0; mischen(4, 0.5, 10.25, 2) = 52.75 (Ganzzahl und
   # Gleitkomma verschraenkt, y ueber einen Alias); ganz ohne Huelle;
   # fmt formatiert und muss x19..x24 zuruecklassen.
-  if [ "$aus" = "6.0 52.75 42 gerettet|" ]; then ok "arm64 .so: Huelle und gerettete Register [$aus]"
-  else nok "arm64 .so: [$aus] statt [6.0 52.75 42 gerettet|]"; fi
+  # viertel/gemischt (#2160): f32 als single in s0 hin und zurueck.
+  if [ "$aus" = "6.0 52.75 42 gerettet 1.25f 13.75|" ]; then ok "arm64 .so: Huelle und gerettete Register [$aus]"
+  else nok "arm64 .so: [$aus] statt [6.0 52.75 42 gerettet 1.25f 13.75|]"; fi
 else nok "arm64 .so/Lader uebersetzt nicht: $(grep -m1 -iE 'error|lyxc:' "$TMP/w/lib.so.log" "$TMP/w/lader.log")"; fi
 
-# f32 an der Schnittstelle: laut abgewiesen (#2160)
-printf 'type F = f32;\n@export\nfn g(a: F): int64 { return 1; }\n' > "$TMP/f32.lyx"
-if baue arm64 "$TMP/f32.lyx" "$TMP/f32.so" --shared; then nok "arm64 .so mit f32: uebersetzt"
-elif grep -q "f32 an der C-Schnittstelle" "$TMP/f32.so.log"; then ok "arm64 .so mit f32: laut abgewiesen"
-else nok "arm64 .so mit f32: $(grep -m1 -i error "$TMP/f32.so.log")"; fi
 
 # main rettet x28 im Rahmen: STUR x28, [x29, #…] unmittelbar vor MOV x28, x1
 printf 'fn main(): int64 { return GetArgC() - 1; }\n' > "$TMP/m.lyx"
