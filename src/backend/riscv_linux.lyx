@@ -116,6 +116,24 @@ pub type EmitRISCV64 = class {
   globRelocCap:   int64;
   globalsOff:     int64;   // Code-Offset des Datenbereichs (-1 = noch nicht gesetzt)
   mainOff:        int64;   // #1740: Code-Offset von main (-1 = nicht gefunden)
+  // #2162: FFI. Je Symbol {namePtr, nameLen, libPtr, libLen} (32 Byte,
+  // absolute Zeiger); je Aufruf {codeOff, extIdx} (16 Byte) fuer den
+  // GOT-Platz hinter den Modulvariablen.
+  extBuf:        int64;
+  extCount:      int64;
+  extCap:        int64;
+  gotRelocBuf:   int64;
+  gotRelocCount: int64;
+  gotRelocCap:   int64;
+  gotOff:        int64;   // Code-Offset des ersten GOT-Platzes (-1 = keiner)
+  dynStartOff:   int64;   // Code-Offset des libc-Startwegs (-1 = keiner)
+  noLibcInit:    int64;   // --no-libc-init: main direkt, ohne __libc_start_main
+  // #2162: --shared. Je Export mit Gleitkomma {funcId, sig, huellenOff}
+  // (24 Byte); sig wie lyxc._armSoSignaturen: n | arten << 8 | rueck << 32.
+  isShared:      int64;
+  soHuTab:       int64;
+  soHuCount:     int64;
+  soHuCap:       int64;
 
   // --------------------------------------------------------------------------
   // Code emission primitives
@@ -663,6 +681,7 @@ pub type EmitRISCV64 = class {
     if (op == IRO_CMP_LE || op == IRO_CMP_LT || op == IRO_CMP_NEQ || op == IRO_CONST_FLOAT) { return 1; }
     if (op == IRO_CONST_INT || op == IRO_DIV || op == IRO_FREE || op == IRO_FTOI) { return 1; }
     if (op == IRO_CALL_INDIRECT || op == IRO_FUNC_ADDR) { return 1; }   // #1806
+    if (op == IRO_CALL_EXTERN) { return 1; }   // #2162
     if (op == IRO_FUNC_EXIT || op == IRO_ITOF || op == IRO_JMP || op == IRO_LABEL) { return 1; }
     // #1764: die Gleitkomma-Rechnung. Sie fehlte komplett — behandelt waren nur
     // ITOF/FTOI, und die kopierten den Slot bloss. `PrintLn` scheiterte damit
@@ -915,6 +934,13 @@ pub type EmitRISCV64 = class {
     }
     if op == IRO_CALL_BUILTIN {
       self.emitBuiltinCall(imm, src1, dest);
+    }
+    // #2162: FFI-Aufruf nach LP64D. src1 = Argumentzahl, src2/imm = Bibliothek
+    // und Symbol (Offsets in den IR-Strings), src3 = Argumentblock, immFloat =
+    // Signatur der Deklaration (parser._parseExternFn).
+    if op == IRO_CALL_EXTERN {
+      self.rv_callExtern(src1, src2, imm, dest, self.getInstrField(idx, IR_INSTR_OFF_SRC3),
+                         self.getInstrField(idx, IR_INSTR_OFF_IMMFLOAT));
     }
     // #1806: Aufruf ueber einen Funktionszeiger. Die Argumente liegen wie beim
     // gewoehnlichen Aufruf, die Zieladresse steht in einem Slot.
@@ -1959,6 +1985,19 @@ pub type EmitRISCV64 = class {
     self.globRelocCount := 0;
     self.globalsOff     := -1;
     self.mainOff        := -1;
+    self.extCap        := 16;
+    self.extBuf        := alloc(self.extCap * 32);
+    self.extCount      := 0;
+    self.gotRelocCap   := 64;
+    self.gotRelocBuf   := alloc(self.gotRelocCap * 16);
+    self.gotRelocCount := 0;
+    self.gotOff        := -1;
+    self.dynStartOff   := -1;
+    self.noLibcInit    := 0;
+    self.isShared      := 0;
+    self.soHuCap       := 8;
+    self.soHuTab       := alloc(self.soHuCap * 24);
+    self.soHuCount     := 0;
   }
 
   pub fn emit(): int64 {
@@ -1967,6 +2006,20 @@ pub type EmitRISCV64 = class {
     while i < n { self.emitFunc(i); i := i + 1; }
     // #1740: jetzt steht jede Funktionsadresse fest — offene Vorwaertsaufrufe
     // aufloesen.
+    // #2162: mit FFI startet main ueber __libc_start_main (wie arm64, WP-A5),
+    // damit libc initialisiert ist und exit() die stdio-Puffer leert. Der
+    // Startweg steht hinter den Funktionen; sein Aufruf von main wird mit
+    // den anderen aufgeloest.
+    if self.extCount > 0 && self.noLibcInit == 0 && self.isShared == 0 { self.rv_emitLibcStart(); }
+    // #2162: Huellen der .so-Exporte mit Gleitkomma — hinter dem Code, vor
+    // den Daten; ihr Aufruf der Lyx-Funktion wird mit den anderen aufgeloest.
+    var hu: int64 := 0;
+    while hu < self.soHuCount {
+      var hr: int64 := self.soHuTab + hu * 24;
+      var hs: int64 := peek64(hr + 8);
+      poke64(hr + 16, self.rv_emitSoHuelle(peek64(hr), hs & 255, (hs >> 8) & 65535, (hs >> 32) & 3));
+      hu := hu + 1;
+    }
     self.applyPatches();
     self.rv_checkNoOpenPatches(0);   // #2112
     self.emitGlobalsPool();
@@ -2068,6 +2121,13 @@ pub type EmitRISCV64 = class {
       self.rv_e32((v >> 32) & 0xFFFFFFFF);
       gi := gi + 1;
     }
+    // #2162: GOT — je FFI-Symbol acht Byte, die der Lader ueber R_RISCV_64
+    // fuellt. Im beschreibbaren Segment, nicht im Code.
+    if self.extCount > 0 {
+      self.gotOff := self.codeLen;
+      var ge: int64 := 0;
+      while ge < self.extCount { self.rv_e32(0); self.rv_e32(0); ge := ge + 1; }
+    }
   }
 
   // AUIPC traegt die oberen 20 Bit, ADDI die unteren 12 — und weil ADDI sein
@@ -2086,6 +2146,18 @@ pub type EmitRISCV64 = class {
       self.rv_poke32at(codeOff, 0x17 | (RV_T2 << 7) | ((hi & 0xFFFFF) << 12));
       self.rv_poke32at(codeOff + 4, 0x13 | (RV_T2 << 7) | (RV_T2 << 15) | ((lo & 0xFFF) << 20));
       i := i + 1;
+    }
+    // #2162: GOT-Ladebefehle — AUIPC t1 / LD t1, dieselbe Teilung.
+    var gk: int64 := 0;
+    while gk < self.gotRelocCount {
+      var grec:  int64 := self.gotRelocBuf + gk * 16;
+      var gcOff: int64 := peek64(grec + 0);
+      var gDelta: int64 := self.gotOff + peek64(grec + 8) * 8 - gcOff;
+      var gHi: int64 := (gDelta + 0x800) >> 12;
+      var gLo: int64 := gDelta - (gHi << 12);
+      self.rv_poke32at(gcOff, 0x17 | (RV_T1 << 7) | ((gHi & 0xFFFFF) << 12));
+      self.rv_poke32at(gcOff + 4, 0x03 | (RV_T1 << 7) | (3 << 12) | (RV_T1 << 15) | ((gLo & 0xFFF) << 20));
+      gk := gk + 1;
     }
   }
 
@@ -2110,7 +2182,10 @@ pub type EmitRISCV64 = class {
   }
 
   // Code-Offset von main; -1, wenn das Modul keines hat.
-  pub fn getMainOff(): int64 { return self.mainOff; }
+  pub fn getMainOff(): int64 {
+    if self.dynStartOff >= 0 { return self.dynStartOff; }   // #2162: _start springt in den libc-Startweg
+    return self.mainOff;
+  }
 
   // --------------------------------------------------------------------------
   // #1764: Gleitkomma (D-Erweiterung). Auch diese Methoden stehen am ENDE der
@@ -2378,6 +2453,274 @@ pub type EmitRISCV64 = class {
     self.rv_ADD(RV_WEIT, rs1, RV_WEIT);
   }
 
+  // --------------------------------------------------------------------------
+  // #2162: FFI nach LP64D. Am Klassenende (VMT, siehe oben).
+  //
+  // Lyx fuehrt jeden Wert in einem Ganzzahlslot, f64 als Bitmuster, f32 als
+  // double (#1127). C erwartet nach LP64D Ganzzahlen/Zeiger in a0..a7 und
+  // Gleitkomma in fa0..fa7, GETRENNT gezaehlt; ist die Gleitkommareihe voll,
+  // geht der Wert nach der Ganzzahlregel weiter (Register, dann Stapel), ein
+  // f32 dann als single in den unteren 32 Bit. Variadische Argumente hinter
+  // der Deklaration haben keine Klasse (Maske 0) und gehen in die
+  // Ganzzahlreihe — das ist auf riscv auch fuer Gleitkomma richtig.
+  // Dieselbe Klasseneinteilung wie _a64FfiArgs (arm64) und der SysV-Weg in
+  // codegen_x86.lyx; die drei muessen uebereinstimmen.
+  // --------------------------------------------------------------------------
+
+  pub fn setNoLibcInit(v: int64) { self.noLibcInit := v; }
+  pub fn setShared(v: int64) { self.isShared := v; }
+  pub fn getFuncAddrs(): int64 { return self.funcAddrs; }
+
+  // Huelle vormerken (vor emit); liefert ihren Index fuer getSoHuelleOff.
+  pub fn addSoHuelle(funcId: int64, sig: int64): int64 {
+    if self.soHuCount >= self.soHuCap {
+      var nc: int64 := self.soHuCap * 2;
+      var nb: int64 := alloc(nc * 24);
+      memcpy(nb, self.soHuTab, self.soHuCount * 24);
+      self.soHuTab := nb; self.soHuCap := nc;
+    }
+    var r: int64 := self.soHuTab + self.soHuCount * 24;
+    poke64(r, funcId); poke64(r + 8, sig); poke64(r + 16, 0 - 1);
+    self.soHuCount := self.soHuCount + 1;
+    return self.soHuCount - 1;
+  }
+  pub fn getSoHuelleOff(i: int64): int64 { return peek64(self.soHuTab + i * 24 + 16); }
+
+  // C ruft einen Lyx-Export: Ganzzahlen in a0..a7, Gleitkomma in fa0..fa7
+  // (getrennt gezaehlt, f32 als single). Lyx erwartet alles der Reihe nach
+  // in a0..a7, f64 als Bitmuster, f32 als double (#1127). Die Huelle legt um
+  // — von hinten nach vorn, denn Parameter i kommt aus a_q mit q <= i und
+  // ein spaeteres Ziel ueberschreibt so keine noch gebrauchte Quelle —, ruft
+  // die Funktion und legt ein Gleitkommaergebnis nach fa0. Dieselbe Aufgabe
+  // wie emitSoHuelle (arm64) und cg_soEmitHuellen (x86); die drei muessen
+  // uebereinstimmen.
+  fn rv_emitSoHuelle(funcId: int64, n: int64, arten: int64, rueck: int64): int64 {
+    if n > 8 {
+      EPrintStrLn("error: riscv --shared: Export mit Gleitkomma und mehr als acht Parametern ist nicht umgesetzt (#2162)."c);
+      exit(1);
+    }
+    var start: int64 := self.codeLen;
+    self.rv_ADDI(RV_SP, RV_SP, 0 - 16);
+    self.rv_SD(RV_RA, RV_SP, 0);
+    var i: int64 := n - 1;
+    while i >= 0 {
+      var c: int64 := (arten >> (i * 2)) & 3;
+      var q: int64 := 0;
+      var j: int64 := 0;
+      while j < i {
+        var cj: int64 := (arten >> (j * 2)) & 3;
+        if (cj == 0) == (c == 0) { q := q + 1; }
+        j := j + 1;
+      }
+      if c == 0 {
+        if q != i { self.rv_MV(RV_A0 + i, RV_A0 + q); }
+      } else if c == 1 {
+        self.rv_FMV_X_D(RV_A0 + i, 10 + q);                              // a_i := fa_q
+      } else {
+        self.rv_e32(0x53 | ((10 + q) << 15) | (0x21 << 25));             // FCVT.D.S ft0, fa_q
+        self.rv_FMV_X_D(RV_A0 + i, 0);
+      }
+      i := i - 1;
+    }
+    var callOff: int64 := self.codeLen;
+    self.rv_e32(0x17 | (RV_RA << 7));                                     // AUIPC ra, 0
+    self.rv_e32(0x67 | (RV_RA << 7) | (RV_RA << 15));                     // JALR ra, 0(ra)
+    self.addPatch(callOff, funcId, RV_PATCH_BL, 0);
+    if rueck == 1 { self.rv_FMV_D_X(10, RV_A0); }                         // fa0 := a0
+    if rueck == 2 {
+      self.rv_FMV_D_X(0, RV_A0);
+      self.rv_e32(0x53 | (10 << 7) | (1 << 20) | (0x20 << 25));           // FCVT.S.D fa0, ft0
+    }
+    self.rv_LD(RV_RA, RV_SP, 0);
+    self.rv_ADDI(RV_SP, RV_SP, 16);
+    self.rv_RET();
+    return start;
+  }
+  pub fn getExternBuf(): int64 { return self.extBuf; }
+  pub fn getExternCount(): int64 { return self.extCount; }
+  pub fn getGotOff(): int64 { return self.gotOff; }
+
+  // Symbol eintragen (gleicher Name = gleicher GOT-Platz); liefert den Index.
+  fn rv_externIdx(np: int64, nl: int64, lp: int64, ll: int64): int64 {
+    var i: int64 := 0;
+    while i < self.extCount {
+      var b: int64 := self.extBuf + i * 32;
+      if peek64(b + 8) == nl {
+        var g: int64 := 1;
+        var j: int64 := 0;
+        while j < nl && g != 0 { if peek8(peek64(b) + j) != peek8(np + j) { g := 0; } j := j + 1; }
+        if g != 0 { return i; }
+      }
+      i := i + 1;
+    }
+    if self.extCount >= self.extCap {
+      var nc: int64 := self.extCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.extBuf, self.extCount * 32);
+      self.extBuf := nb; self.extCap := nc;
+    }
+    var e: int64 := self.extBuf + self.extCount * 32;
+    poke64(e, np); poke64(e + 8, nl); poke64(e + 16, lp); poke64(e + 24, ll);
+    self.extCount := self.extCount + 1;
+    return self.extCount - 1;
+  }
+
+  // t1 := GOT[extIdx]  (AUIPC/LD, von applyGlobalRelocs nachgetragen)
+  fn rv_ladeGot(extIdx: int64) {
+    if self.gotRelocCount >= self.gotRelocCap {
+      var nc: int64 := self.gotRelocCap * 2;
+      var nb: int64 := alloc(nc * 16);
+      memcpy(nb, self.gotRelocBuf, self.gotRelocCount * 16);
+      self.gotRelocBuf := nb; self.gotRelocCap := nc;
+    }
+    var r: int64 := self.gotRelocBuf + self.gotRelocCount * 16;
+    poke64(r, self.codeLen); poke64(r + 8, extIdx);
+    self.gotRelocCount := self.gotRelocCount + 1;
+    self.rv_e32(0x17 | (RV_T1 << 7));                          // AUIPC t1, 0
+    self.rv_e32(0x03 | (RV_T1 << 7) | (3 << 12) | (RV_T1 << 15));   // LD t1, 0(t1)
+  }
+
+  // t0 (double-Bitmuster) -> t0 (single-Bitmuster in den unteren 32 Bit)
+  fn rv_t0ZuSingle() {
+    self.rv_FMV_D_X(0, RV_T0);
+    self.rv_e32(0x53 | (1 << 20) | (0x20 << 25));            // FCVT.S.D ft0, ft0
+    self.rv_e32(0x53 | (RV_T0 << 7) | (0x70 << 25));         // FMV.X.W t0, ft0
+  }
+
+  fn rv_callExtern(argCount: int64, libStrOff: int64, nameStrOff: int64, dest: int64, argBase: int64, sig: int64) {
+    var strBuf: int64 := peek64(self.ir + 32);
+    var np: int64 := strBuf + nameStrOff;
+    var nl: int64 := StrLen(np as pchar);
+    if ((sig >> 53) & 1) != 0 {
+      EPrintStr("error: riscv: extern fn '"c); sys_write(2, np, nl);
+      EPrintStrLn("': Gleitkommaparameter ab dem neunten sind nicht umgesetzt (#2162)."c);
+      EPrintStrLn("  Die Signaturmaske der Deklaration reicht ueber acht Parameter; dahinter ist die Klasse unbekannt."c);
+      exit(1);
+    }
+    var fmask: int64 := (sig >> 32) & 0xFFFF;
+    var rb: int64 := argBase;
+    if rb < 0 { rb := 0; }
+    // Erster Durchgang: wie viele Werte landen auf dem Stapel?
+    var nI: int64 := 0;
+    var nF: int64 := 0;
+    var nSt: int64 := 0;
+    var i: int64 := 0;
+    while i < argCount {
+      var c0: int64 := 0;
+      if i < 8 { c0 := (fmask >> (i * 2)) & 3; }
+      if c0 != 0 && nF < 8 { nF := nF + 1; }
+      else if nI < 8 { nI := nI + 1; }
+      else { nSt := nSt + 1; }
+      i := i + 1;
+    }
+    var stBytes: int64 := nSt * 8;
+    if (stBytes & 15) != 0 { stBytes := stBytes + 8; }
+    if stBytes > 2032 {
+      EPrintStr("error: riscv: extern fn '"c); sys_write(2, np, nl);
+      EPrintStrLn("': mehr als 2 KB Stapelargumente werden nicht erzeugt (#2162)."c);
+      exit(1);
+    }
+    if stBytes > 0 {
+      if argBase < 0 {
+        EPrintStrLn("error: riscv: FFI-Aufruf mit Stapelargumenten ohne Argumentblock (#2132, #2162)."c);
+        exit(1);
+      }
+      self.rv_ADDI(RV_SP, RV_SP, 0 - stBytes);
+    }
+    // Zweiter Durchgang: dieselbe Einteilung, jetzt mit Befehlen.
+    nI := 0; nF := 0;
+    var si: int64 := 0;
+    i := 0;
+    while i < argCount {
+      var c: int64 := 0;
+      if i < 8 { c := (fmask >> (i * 2)) & 3; }
+      if c != 0 && nF < 8 {
+        self.rv_FLD(10 + nF, RV_FP, self.slotOff(rb + i));        // fa_nF
+        if c == 2 { self.rv_e32(0x53 | ((10 + nF) << 7) | ((10 + nF) << 15) | (1 << 20) | (0x20 << 25)); }   // FCVT.S.D
+        nF := nF + 1;
+      } else {
+        self.rv_loadSlot(rb + i);
+        if c == 2 { self.rv_t0ZuSingle(); }
+        if nI < 8 {
+          self.rv_MV(RV_A0 + nI, RV_T0);
+          nI := nI + 1;
+        } else {
+          self.rv_SD(RV_T0, RV_SP, si * 8);
+          si := si + 1;
+        }
+      }
+      i := i + 1;
+    }
+    var lp: int64 := strBuf + libStrOff;
+    self.rv_ladeGot(self.rv_externIdx(np, nl, lp, StrLen(lp as pchar)));
+    self.rv_e32(0x67 | (RV_RA << 7) | (RV_T1 << 15));          // JALR ra, 0(t1)
+    if stBytes > 0 { self.rv_ADDI(RV_SP, RV_SP, stBytes); }
+    // Rueckgabe: fa0 (f64/f32) oder a0, schmale Ganzzahlen auf 64 Bit.
+    var fret: int64 := (sig >> 48) & 3;
+    if fret == 1 {
+      self.rv_FMV_X_D(RV_T0, 10);
+    } else if fret == 2 {
+      self.rv_e32(0x53 | (10 << 15) | (0x21 << 25));          // FCVT.D.S ft0, fa0
+      self.rv_FMV_X_D(RV_T0, 0);
+    } else {
+      self.rv_MV(RV_T0, RV_A0);
+      var iw: int64 := (sig >> 50) & 7;
+      if iw == 1 { self.rv_SLLI(RV_T0, RV_T0, 56); self.rv_e32(0x13 | (RV_T0 << 7) | (5 << 12) | (RV_T0 << 15) | ((0x400 | 56) << 20)); }   // SRAI 56
+      if iw == 2 { self.rv_SLLI(RV_T0, RV_T0, 48); self.rv_e32(0x13 | (RV_T0 << 7) | (5 << 12) | (RV_T0 << 15) | ((0x400 | 48) << 20)); }   // SRAI 48
+      if iw == 3 { self.rv_e32(0x1B | (RV_T0 << 7) | (RV_T0 << 15)); }                                                                   // ADDIW t0, t0, 0
+      if iw == 4 { self.rv_e32(0x13 | (RV_T0 << 7) | (7 << 12) | (RV_T0 << 15) | (255 << 20)); }                                         // ANDI 255
+      if iw == 5 { self.rv_SLLI(RV_T0, RV_T0, 48); self.rv_e32(0x13 | (RV_T0 << 7) | (5 << 12) | (RV_T0 << 15) | (48 << 20)); }          // SRLI 48
+      if iw == 6 { self.rv_SLLI(RV_T0, RV_T0, 32); self.rv_e32(0x13 | (RV_T0 << 7) | (5 << 12) | (RV_T0 << 15) | (32 << 20)); }          // SRLI 32
+    }
+    self.rv_storeSlot(dest);
+  }
+
+  // Startweg mit libc (wie der 56-Byte-Rumpf auf arm64, WP-A5):
+  //   _start (RiscvLinuxBackend) setzt s10 und springt hierher statt nach main.
+  //   lstart: a5 := a0 (rtld_fini vom Lader), a1 := argc, a2 := argv,
+  //           a0 := &mtramp, a3 = a4 = 0, a6 := sp, __libc_start_main(...)
+  //   mtramp: von libc mit (argc, argv, envp) gerufen — s10 ist callee-saved
+  //           und deshalb hier NEU zu setzen (libc hat es zwischendurch
+  //           benutzt); gesichert und zurueckgeschrieben, dann main.
+  fn rv_emitLibcStart() {
+    var mainId: int64 := -1;
+    var fi: int64 := 0;
+    while fi < self.getFuncCount() {
+      if self.isMainFunc(fi) != 0 { mainId := fi; }
+      fi := fi + 1;
+    }
+    if mainId < 0 { return; }   // kein Programm (Bibliothek ohne main)
+    var lsm: int64 := self.rv_externIdx("__libc_start_main"c as int64, 17, "libc.so.6"c as int64, 9);
+    var mtramp: int64 := self.codeLen;
+    self.rv_ADDI(RV_SP, RV_SP, 0 - 16);
+    self.rv_SD(RV_RA, RV_SP, 0);
+    self.rv_SD(26, RV_SP, 8);                                   // s10
+    self.rv_MV(26, RV_A1);                                      // s10 := argv
+    var callOff: int64 := self.codeLen;
+    self.rv_e32(0x17 | (RV_RA << 7));                           // AUIPC ra, 0
+    self.rv_e32(0x67 | (RV_RA << 7) | (RV_RA << 15));           // JALR ra, 0(ra)
+    self.addPatch(callOff, mainId, RV_PATCH_BL, 0);
+    self.rv_LD(RV_RA, RV_SP, 0);
+    self.rv_LD(26, RV_SP, 8);
+    self.rv_ADDI(RV_SP, RV_SP, 16);
+    self.rv_RET();
+    self.dynStartOff := self.codeLen;
+    self.rv_MV(RV_A5, RV_A0);                                   // rtld_fini
+    self.rv_LD(RV_A1, RV_SP, 0);                                // argc
+    self.rv_ADDI(RV_A2, RV_SP, 8);                              // argv
+    var d: int64 := mtramp - self.codeLen;
+    var dHi: int64 := (d + 0x800) >> 12;
+    var dLo: int64 := d - (dHi << 12);
+    self.rv_e32(0x17 | (RV_A0 << 7) | ((dHi & 0xFFFFF) << 12));                       // AUIPC a0
+    self.rv_e32(0x13 | (RV_A0 << 7) | (RV_A0 << 15) | ((dLo & 0xFFF) << 20));         // ADDI a0
+    self.rv_MV(RV_A3, RV_ZERO);
+    self.rv_MV(RV_A4, RV_ZERO);
+    self.rv_MV(RV_A6, RV_SP);
+    self.rv_ladeGot(lsm);
+    self.rv_e32(0x67 | (RV_RA << 7) | (RV_T1 << 15));           // JALR ra, 0(t1) — kehrt nicht zurueck
+    self.rv_RET();                                              // sonst zurueck in _start (exit)
+  }
+
 };
 
 // ============================================================================
@@ -2390,6 +2733,11 @@ pub type RiscvLinuxBackend = class {
   codeCap: int64;
   dataOff: int64;   // #1740: Offset des Datenbereichs in self.code (0 = keiner)
   mainOff: int64;   // #1740: Code-Offset von main (0 = erste Funktion)
+  // #2162: FFI-Symbole des Emitters ({namePtr,nameLen,libPtr,libLen}) und
+  // der Offset (ab self.code) ihres ersten GOT-Platzes.
+  extBuf:   int64;
+  extCount: int64;
+  gotOff:   int64;
 
   fn rlb_ce8(v: int64) {
     // #1764: auch dieser Puffer war fest (64 KB) und ungeprueft.
@@ -2450,6 +2798,9 @@ pub type RiscvLinuxBackend = class {
     self.codeLen := 0;
     self.dataOff := 0;
     self.mainOff := 0;
+    self.extBuf   := 0;
+    self.extCount := 0;
+    self.gotOff   := 0;
   }
 
   pub fn Build(irBuf: int64, irLen: int64) {
@@ -2461,6 +2812,7 @@ pub type RiscvLinuxBackend = class {
   pub fn GetCodeSize(): int64 { return self.codeLen; }
 
   pub fn WriteELF64(path: pchar) {
+    if self.extCount > 0 { self.WriteELF64Dyn(path); return; }   // #2162
     var codeFileOffset: int64 := 4096;
     var codeSize:       int64 := self.codeLen;
     var elfSize:        int64 := codeFileOffset + codeSize;
@@ -2545,4 +2897,322 @@ pub type RiscvLinuxBackend = class {
   // #1740: Code-Offset von main. Muss VOR Build gesetzt werden — der
   // _start-Rumpf entsteht dort.
   pub fn SetMainOff(off: int64) { self.mainOff := off; }
+
+  // #2162: --shared. ET_DYN mit Ladebasis 0, sonst dasselbe Speicherbild
+  // (Code r-x ab Dateioffset 4096, Daten rw- ab der Seitengrenze dataOff) —
+  // der Code ist durchgehend PC-relativ (AUIPC), Modulvariablen und GOT
+  // liegen im Datensegment. dynsym: [0] null, [1..] die FFI-Symbole (UNDEF,
+  // R_RISCV_64 auf ihren GOT-Platz), danach die Exporte (GLOBAL FUNC,
+  // st_value = Adresse relativ zur Basis). Ein echter SysV-Hash, denn dlsym
+  // sucht darueber. Der 16-Byte-_start-Rumpf bleibt als toter Code stehen:
+  // an seiner Laenge haengt die Seitenausrichtung des Emitters.
+  // exportBuf: je Export {namePtr, nameLen, codeOff (ab self.code)} — dieselbe
+  // Liste wie lyxc.buildExportList.
+  pub fn WriteSharedLib(path: pchar, expBuf: int64, expCount: int64) {
+    var codeFileOffset: int64 := 4096;
+    var codeSize: int64 := self.codeLen;
+    var dataStart: int64 := self.dataOff;
+    if dataStart <= 0 {
+      EPrintStrLn("error: riscv --shared: kein Datensegment (#2162)."c);
+      exit(1);
+    }
+    var nE: int64 := self.extCount;
+    var nX: int64 := expCount;
+    var nSym: int64 := 1 + nE + nX;
+    var dsCap: int64 := 64;
+    var k: int64 := 0;
+    while k < nE { dsCap := dsCap + peek64(self.extBuf + k * 32 + 8) + peek64(self.extBuf + k * 32 + 24) + 2; k := k + 1; }
+    k := 0;
+    while k < nX { dsCap := dsCap + peek64(expBuf + k * 24 + 8) + 1; k := k + 1; }
+    var dynstr: int64 := alloc(dsCap);
+    var dsLen: int64 := 1;
+    poke8(dynstr, 0);
+    var nameOff: int64 := alloc(nSym * 8);       // dynstr-Offset je Symbol
+    var namePtr: int64 := alloc(nSym * 8);
+    var nameLen: int64 := alloc(nSym * 8);
+    var needOff: int64 := alloc(nE * 8 + 8);
+    var nNeed: int64 := 0;
+    k := 0;
+    while k < nE {
+      var lp: int64 := peek64(self.extBuf + k * 32 + 16);
+      var ll: int64 := peek64(self.extBuf + k * 32 + 24);
+      var neu: int64 := 1;
+      var j: int64 := 0;
+      while j < k && neu != 0 {
+        if peek64(self.extBuf + j * 32 + 24) == ll {
+          var gl: int64 := 1;
+          var q: int64 := 0;
+          while q < ll && gl != 0 { if peek8(peek64(self.extBuf + j * 32 + 16) + q) != peek8(lp + q) { gl := 0; } q := q + 1; }
+          if gl != 0 { neu := 0; }
+        }
+        j := j + 1;
+      }
+      if neu != 0 {
+        poke64(needOff + nNeed * 8, dsLen); nNeed := nNeed + 1;
+        memcpy(dynstr + dsLen, lp, ll); dsLen := dsLen + ll; poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+      }
+      k := k + 1;
+    }
+    k := 1;
+    while k < nSym {
+      var p: int64 := 0; var l: int64 := 0;
+      if k <= nE { p := peek64(self.extBuf + (k - 1) * 32); l := peek64(self.extBuf + (k - 1) * 32 + 8); }
+      else { p := peek64(expBuf + (k - 1 - nE) * 24); l := peek64(expBuf + (k - 1 - nE) * 24 + 8); }
+      poke64(namePtr + k * 8, p); poke64(nameLen + k * 8, l); poke64(nameOff + k * 8, dsLen);
+      memcpy(dynstr + dsLen, p, l); dsLen := dsLen + l; poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+      k := k + 1;
+    }
+    var nBucket: int64 := nSym;
+    var dynstrOff: int64 := ((codeFileOffset + codeSize + 7) >> 3) << 3;
+    var dynsymOff: int64 := ((dynstrOff + dsLen + 7) >> 3) << 3;
+    var hashOff: int64 := dynsymOff + nSym * 24;
+    var hashSize: int64 := (2 + nBucket + nSym) * 4;
+    var relaOff: int64 := ((hashOff + hashSize + 7) >> 3) << 3;
+    var relaSize: int64 := nE * 24;
+    var dynOff: int64 := relaOff + relaSize;
+    var dynCnt: int64 := nNeed + 9;
+    if nE > 0 { dynCnt := dynCnt + 3; }
+    var dynSize: int64 := dynCnt * 16;
+    var fileSize: int64 := dynOff + dynSize;
+
+    var buf: int64 := alloc(fileSize);
+    var z: int64 := 0;
+    while z < fileSize { poke8(buf + z, 0); z := z + 1; }
+    memcpy(buf + codeFileOffset, self.code, codeSize);
+    poke8(buf + 0, 127); poke8(buf + 1, 69); poke8(buf + 2, 76); poke8(buf + 3, 70);
+    poke8(buf + 4, 2);   poke8(buf + 5, 1);  poke8(buf + 6, 1);  poke8(buf + 7, 0);
+    poke16(buf + 16, 3);          // ET_DYN
+    poke16(buf + 18, 0xF3);       // EM_RISCV
+    poke32(buf + 20, 1);
+    poke64(buf + 24, 0);          // kein Einsprung
+    poke64(buf + 32, 64);
+    poke32(buf + 48, 0x05);       // RVC | lp64d
+    poke16(buf + 52, 64); poke16(buf + 54, 56); poke16(buf + 56, 3);
+    poke16(buf + 58, 64);
+    var dOff: int64 := codeFileOffset + dataStart;
+    var ph: int64 := buf + 64;
+    poke32(ph, 1); poke32(ph + 4, 5);
+    poke64(ph + 8, 0); poke64(ph + 16, 0); poke64(ph + 24, 0);
+    poke64(ph + 32, dOff); poke64(ph + 40, dOff); poke64(ph + 48, 0x1000);
+    ph := ph + 56;
+    poke32(ph, 1); poke32(ph + 4, 6);
+    poke64(ph + 8, dOff); poke64(ph + 16, dOff); poke64(ph + 24, dOff);
+    poke64(ph + 32, fileSize - dOff); poke64(ph + 40, fileSize - dOff); poke64(ph + 48, 0x1000);
+    ph := ph + 56;
+    poke32(ph, 2); poke32(ph + 4, 6);
+    poke64(ph + 8, dynOff); poke64(ph + 16, dynOff); poke64(ph + 24, dynOff);
+    poke64(ph + 32, dynSize); poke64(ph + 40, dynSize); poke64(ph + 48, 8);
+
+    memcpy(buf + dynstrOff, dynstr, dsLen);
+    k := 1;
+    while k < nSym {
+      var sy: int64 := buf + dynsymOff + k * 24;
+      poke32(sy, peek64(nameOff + k * 8));
+      poke8(sy + 4, 0x12);                                   // STB_GLOBAL | STT_FUNC
+      if k > nE {
+        poke16(sy + 6, 1);                                   // definiert (kein SHN_UNDEF/SHN_ABS)
+        poke64(sy + 8, codeFileOffset + peek64(expBuf + (k - 1 - nE) * 24 + 16));
+      }
+      k := k + 1;
+    }
+    // SysV-Hash: h = (h << 4) + c; g = h & 0xF0000000; h ^= g >> 24; h &= ~g
+    poke32(buf + hashOff, nBucket);
+    poke32(buf + hashOff + 4, nSym);
+    var bucket: int64 := buf + hashOff + 8;
+    var chain: int64 := bucket + nBucket * 4;
+    k := 1;
+    while k < nSym {
+      var h: int64 := 0;
+      var p2: int64 := peek64(namePtr + k * 8);
+      var q2: int64 := 0;
+      while q2 < peek64(nameLen + k * 8) {
+        h := ((h << 4) + peek8(p2 + q2)) & 0xFFFFFFFF;
+        var g: int64 := h & 0xF0000000;
+        if g != 0 { h := h ^ (g >> 24); }
+        h := h & (0xFFFFFFFF ^ g);
+        q2 := q2 + 1;
+      }
+      var bi: int64 := h % nBucket;
+      poke32(chain + k * 4, peek32(bucket + bi * 4));
+      poke32(bucket + bi * 4, k);
+      k := k + 1;
+    }
+    k := 0;
+    while k < nE {
+      var ra: int64 := buf + relaOff + k * 24;
+      poke64(ra, codeFileOffset + self.gotOff + k * 8);
+      poke64(ra + 8, ((k + 1) << 32) | 2);                   // R_RISCV_64
+      k := k + 1;
+    }
+    var dp: int64 := buf + dynOff;
+    k := 0;
+    while k < nNeed { poke64(dp, 1); poke64(dp + 8, peek64(needOff + k * 8)); dp := dp + 16; k := k + 1; }
+    poke64(dp, 4);  poke64(dp + 8, hashOff);   dp := dp + 16;   // DT_HASH
+    poke64(dp, 5);  poke64(dp + 8, dynstrOff); dp := dp + 16;   // DT_STRTAB
+    poke64(dp, 6);  poke64(dp + 8, dynsymOff); dp := dp + 16;   // DT_SYMTAB
+    poke64(dp, 10); poke64(dp + 8, dsLen);     dp := dp + 16;   // DT_STRSZ
+    poke64(dp, 11); poke64(dp + 8, 24);        dp := dp + 16;   // DT_SYMENT
+    if nE > 0 {
+      poke64(dp, 7); poke64(dp + 8, relaOff);  dp := dp + 16;   // DT_RELA
+      poke64(dp, 8); poke64(dp + 8, relaSize); dp := dp + 16;   // DT_RELASZ
+      poke64(dp, 9); poke64(dp + 8, 24);       dp := dp + 16;   // DT_RELAENT
+    }
+    poke64(dp, 30); poke64(dp + 8, 8);         dp := dp + 16;   // DT_FLAGS = DF_BIND_NOW
+    poke64(dp, 0);  poke64(dp + 8, 0);                          // DT_NULL
+    EmitWriteFile(path, buf, fileSize);
+    free(buf, fileSize);
+  }
+
+  // #2162: FFI-Symbole und GOT-Offset (ab self.code, mit _start-Rumpf).
+  pub fn SetFfi(extBuf: int64, extCount: int64, gotOff: int64) {
+    self.extBuf := extBuf; self.extCount := extCount; self.gotOff := gotOff;
+  }
+
+  // #2162: dynamisch gelinktes Erzeugnis. Dasselbe Speicherbild wie
+  // WriteELF64 (Code r-x ab 0x401000, Daten rw- ab der Seitengrenze dataOff),
+  // dazu:
+  //   - PT_INTERP /lib/ld-linux-riscv64-lp64d.so.1 (im Kopfbereich),
+  //   - hinter den Daten (im rw-Segment) .dynstr, .dynsym, .hash, .rela.dyn
+  //     und .dynamic, PT_DYNAMIC zeigt darauf,
+  //   - je Symbol eine R_RISCV_64-Relocation auf seinen GOT-Platz (der
+  //     Emitter legt die Plaetze hinter die Modulvariablen und laedt sie
+  //     PC-relativ). DF_BIND_NOW: alles beim Start, keine PLT.
+  // Dieselbe Tabellenfolge wie writeELFExecDynamic (arm64) in lyxc.lyx.
+  pub fn WriteELF64Dyn(path: pchar) {
+    var baseVA: int64 := 0x400000;
+    var codeFileOffset: int64 := 4096;
+    var codeSize: int64 := self.codeLen;
+    var dataStart: int64 := self.dataOff;
+    if dataStart <= 0 {
+      EPrintStrLn("error: riscv: FFI ohne Datensegment — der GOT haette keinen Platz (#2162)."c);
+      exit(1);
+    }
+    var interpStr: pchar := "/lib/ld-linux-riscv64-lp64d.so.1"c;
+    var interpLen: int64 := StrLen(interpStr) + 1;
+    var phnum: int64 := 4;
+    var interpOff: int64 := 64 + phnum * 56;
+    // .dynstr: \0, Bibliotheken (je einmal), Symbolnamen
+    var n: int64 := self.extCount;
+    var dsCap: int64 := 64;
+    var k: int64 := 0;
+    while k < n { dsCap := dsCap + peek64(self.extBuf + k * 32 + 8) + peek64(self.extBuf + k * 32 + 24) + 2; k := k + 1; }
+    var dynstr: int64 := alloc(dsCap);
+    var dsLen: int64 := 1;
+    poke8(dynstr, 0);
+    var libStr: int64 := alloc(n * 8 + 8);    // dynstr-Offset der Bibliothek von Symbol k (DT_NEEDED nur fuer den ersten)
+    var libNeu: int64 := alloc(n * 8 + 8);    // 1 = erste Nennung dieser Bibliothek
+    var symStr: int64 := alloc(n * 8 + 8);
+    k := 0;
+    while k < n {
+      var lp: int64 := peek64(self.extBuf + k * 32 + 16);
+      var ll: int64 := peek64(self.extBuf + k * 32 + 24);
+      var gef: int64 := -1;
+      var j: int64 := 0;
+      while j < k && gef < 0 {
+        if peek64(self.extBuf + j * 32 + 24) == ll {
+          var gl: int64 := 1;
+          var q: int64 := 0;
+          while q < ll && gl != 0 { if peek8(peek64(self.extBuf + j * 32 + 16) + q) != peek8(lp + q) { gl := 0; } q := q + 1; }
+          if gl != 0 { gef := j; }
+        }
+        j := j + 1;
+      }
+      if gef >= 0 {
+        poke64(libStr + k * 8, peek64(libStr + gef * 8)); poke64(libNeu + k * 8, 0);
+      } else {
+        poke64(libStr + k * 8, dsLen); poke64(libNeu + k * 8, 1);
+        memcpy(dynstr + dsLen, lp, ll); dsLen := dsLen + ll; poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+      }
+      var np: int64 := peek64(self.extBuf + k * 32);
+      var nl: int64 := peek64(self.extBuf + k * 32 + 8);
+      poke64(symStr + k * 8, dsLen);
+      memcpy(dynstr + dsLen, np, nl); dsLen := dsLen + nl; poke8(dynstr + dsLen, 0); dsLen := dsLen + 1;
+      k := k + 1;
+    }
+    var nNeeded: int64 := 0;
+    k := 0;
+    while k < n { nNeeded := nNeeded + peek64(libNeu + k * 8); k := k + 1; }
+    // Lage der Tabellen hinter dem Code-/Datenpuffer (alles 8-ausgerichtet)
+    var tabOff: int64 := ((codeFileOffset + codeSize + 7) >> 3) << 3;
+    var dynstrOff: int64 := tabOff;
+    var dynsymOff: int64 := ((dynstrOff + dsLen + 7) >> 3) << 3;
+    var dynsymSize: int64 := (n + 1) * 24;
+    var hashOff: int64 := dynsymOff + dynsymSize;
+    var hashSize: int64 := (3 + n + 1) * 4;
+    var relaOff: int64 := ((hashOff + hashSize + 7) >> 3) << 3;
+    var relaSize: int64 := n * 24;
+    var dynOff: int64 := relaOff + relaSize;
+    var dynSize: int64 := (nNeeded + 11) * 16;
+    var fileSize: int64 := dynOff + dynSize;
+
+    var buf: int64 := alloc(fileSize);
+    var z: int64 := 0;
+    while z < fileSize { poke8(buf + z, 0); z := z + 1; }
+    memcpy(buf + codeFileOffset, self.code, codeSize);
+
+    poke8(buf + 0, 127); poke8(buf + 1, 69); poke8(buf + 2, 76); poke8(buf + 3, 70);
+    poke8(buf + 4, 2);   poke8(buf + 5, 1);  poke8(buf + 6, 1);  poke8(buf + 7, 0);
+    poke16(buf + 16, 2);          // ET_EXEC
+    poke16(buf + 18, 0xF3);       // EM_RISCV
+    poke32(buf + 20, 1);
+    poke64(buf + 24, 0x401000);   // e_entry: _start
+    poke64(buf + 32, 64);
+    poke64(buf + 40, 0);
+    poke32(buf + 48, 0x05);       // EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE (lp64d)
+    poke16(buf + 52, 64); poke16(buf + 54, 56); poke16(buf + 56, phnum);
+    poke16(buf + 58, 64); poke16(buf + 60, 0); poke16(buf + 62, 0);
+
+    var dOff: int64 := codeFileOffset + dataStart;
+    var ph: int64 := buf + 64;
+    poke32(ph, 1); poke32(ph + 4, 5);                                       // PT_LOAD r-x
+    poke64(ph + 8, 0); poke64(ph + 16, baseVA); poke64(ph + 24, baseVA);
+    poke64(ph + 32, dOff); poke64(ph + 40, dOff); poke64(ph + 48, 0x1000);
+    ph := ph + 56;
+    poke32(ph, 1); poke32(ph + 4, 6);                                       // PT_LOAD rw- (Daten, GOT, Tabellen)
+    poke64(ph + 8, dOff); poke64(ph + 16, baseVA + dOff); poke64(ph + 24, baseVA + dOff);
+    poke64(ph + 32, fileSize - dOff); poke64(ph + 40, fileSize - dOff); poke64(ph + 48, 0x1000);
+    ph := ph + 56;
+    poke32(ph, 3); poke32(ph + 4, 4);                                       // PT_INTERP
+    poke64(ph + 8, interpOff); poke64(ph + 16, baseVA + interpOff); poke64(ph + 24, baseVA + interpOff);
+    poke64(ph + 32, interpLen); poke64(ph + 40, interpLen); poke64(ph + 48, 1);
+    ph := ph + 56;
+    poke32(ph, 2); poke32(ph + 4, 6);                                       // PT_DYNAMIC
+    poke64(ph + 8, dynOff); poke64(ph + 16, baseVA + dynOff); poke64(ph + 24, baseVA + dynOff);
+    poke64(ph + 32, dynSize); poke64(ph + 40, dynSize); poke64(ph + 48, 8);
+
+    memcpy(buf + interpOff, interpStr as int64, interpLen);
+    memcpy(buf + dynstrOff, dynstr, dsLen);
+    k := 0;
+    while k < n {
+      var sy: int64 := buf + dynsymOff + (k + 1) * 24;
+      poke32(sy, peek64(symStr + k * 8));
+      poke8(sy + 4, 0x12);                     // STB_GLOBAL | STT_FUNC, SHN_UNDEF
+      var ra: int64 := buf + relaOff + k * 24;
+      poke64(ra, baseVA + codeFileOffset + self.gotOff + k * 8);   // r_offset: GOT-Platz
+      poke64(ra + 8, ((k + 1) << 32) | 2);     // R_RISCV_64
+      poke64(ra + 16, 0);
+      k := k + 1;
+    }
+    poke32(buf + hashOff, 1);                  // nbucket = 1 (alle Symbole UNDEF)
+    poke32(buf + hashOff + 4, n + 1);          // nchain
+    var dp: int64 := buf + dynOff;
+    k := 0;
+    while k < n {
+      if peek64(libNeu + k * 8) != 0 { poke64(dp, 1); poke64(dp + 8, peek64(libStr + k * 8)); dp := dp + 16; }   // DT_NEEDED
+      k := k + 1;
+    }
+    poke64(dp, 4);  poke64(dp + 8, baseVA + hashOff);   dp := dp + 16;   // DT_HASH
+    poke64(dp, 5);  poke64(dp + 8, baseVA + dynstrOff); dp := dp + 16;   // DT_STRTAB
+    poke64(dp, 6);  poke64(dp + 8, baseVA + dynsymOff); dp := dp + 16;   // DT_SYMTAB
+    poke64(dp, 10); poke64(dp + 8, dsLen);              dp := dp + 16;   // DT_STRSZ
+    poke64(dp, 11); poke64(dp + 8, 24);                 dp := dp + 16;   // DT_SYMENT
+    poke64(dp, 7);  poke64(dp + 8, baseVA + relaOff);   dp := dp + 16;   // DT_RELA
+    poke64(dp, 8);  poke64(dp + 8, relaSize);           dp := dp + 16;   // DT_RELASZ
+    poke64(dp, 9);  poke64(dp + 8, 24);                 dp := dp + 16;   // DT_RELAENT
+    poke64(dp, 30); poke64(dp + 8, 8);                  dp := dp + 16;   // DT_FLAGS = DF_BIND_NOW
+    poke64(dp, 0);  poke64(dp + 8, 0);                                    // DT_NULL
+
+    EmitWriteFile(path, buf, fileSize);
+    free(buf, fileSize);
+  }
 };
