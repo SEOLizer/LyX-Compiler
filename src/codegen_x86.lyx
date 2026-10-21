@@ -1015,6 +1015,14 @@ pub type Codegen = class {
 
   // WP-13: Closure support - static link for nested functions
   staticLinkOffset: int64;  // rbp offset of static link param (or -1 if not nested)
+  // #2114: Locals in r12..r15 (cg_rlWaehlen). rlTab je Eintrag 48 Byte:
+  // [0] Name, [8] Laenge, [16] Zahl der Slots, [24] Sicherungsslot des
+  // Registers, [32] Puffer der Rahmenversaetze, [40] dessen Kapazitaet. Mehrere Slots, weil der
+  // Codegen eine Deklaration mehrfach erzeugen kann (Schleifenrumpf in
+  // mehreren Kopien) — jede Kopie legt ihr Local neu an, alle meinen dieselbe
+  // Variable. rlAnz = Zahl der gewaehlten Register.
+  rlAnz:  int64;
+  rlTab:  int64;
   outerFuncName:    pchar;  // name of outer function (for static link)
   outerFuncNameLen: int64;
 
@@ -2779,6 +2787,7 @@ pub type Codegen = class {
     // steht, fand das die Locals der aeusseren Funktion und kopierte sie aus
     // dem falschen Rahmen (rbp gehoert dort dem mittleren Lambda).
     var outerOff: int64 := self.cg_findLocal(name, nlen);
+    self.cg_rlNichtImRegister(outerOff, "Erfassung durch ein Lambda"c);   // #2114
     var outerIdx: int64 := self.cg_findLocalIdx(name, nlen);
     var envIdx: int64 := 0 - 1;
     if (outerOff == 0) {
@@ -4601,6 +4610,8 @@ pub type Codegen = class {
 
   // mov [rbp+off], rax  (store rax at rbp-relative offset)
   fn cg_storeRax(off: int64) {
+    var rlR: int64 := self.cg_rlReg(off);   // #2114
+    if (rlR >= 0) { self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC4 + rlR); return; }   // mov r12+i, rax
     if (off >= -128 && off <= 127) {
       // 48 89 45 off8
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x45); self.cg_e8(off);
@@ -4612,6 +4623,8 @@ pub type Codegen = class {
 
   // mov [rbp+off], rdx  (store second tuple return value)
   fn cg_storeRdx(off: int64) {
+    var rlR: int64 := self.cg_rlReg(off);   // #2114
+    if (rlR >= 0) { self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xD4 + rlR); return; }   // mov r12+i, rdx
     if (off >= -128 && off <= 127) {
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x55); self.cg_e8(off);
     } else {
@@ -4621,6 +4634,8 @@ pub type Codegen = class {
 
   // mov rax, [rbp+off]
   fn cg_loadRax(off: int64) {
+    var rlR: int64 := self.cg_rlReg(off);   // #2114
+    if (rlR >= 0) { self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE0 + (rlR << 3)); return; }   // mov rax, r12+i
     if (off >= -128 && off <= 127) {
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x45); self.cg_e8(off);
     } else {
@@ -5391,6 +5406,18 @@ pub type Codegen = class {
     self.frameSize += 8;
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x5D); self.cg_e8(0xF0);  // mov [rbp-16], rbx
     self.cg_cfi(CFI_SICHER, 3 | (4 << 8));     // #2135: rbx bei rbp-16 = CFA-32
+    // #2114: die von cg_rlWaehlen belegten r12..r15 sichern (callee-saved);
+    // cg_emitEpilogue laedt sie zurueck. Fuer die Abwicklungstabelle wie rbx
+    // (#2135): der Slot liegt bei CFA-(16-off).
+    var rli: int64 := 0;
+    while (rli < self.rlAnz) {
+      self.frameSize += 8;
+      var rlSo: int64 := 0 - self.frameSize;
+      poke64(self.rlTab + rli * 48 + 24, rlSo);
+      self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0x65 + (rli << 3)); self.cg_e8(rlSo & 255);   // mov [rbp+off], r12+i
+      self.cg_cfi(CFI_SICHER, (12 + rli) | (((16 - rlSo) / 8) << 8));
+      rli += 1;
+    }
     // #1370: --profile misst jede Funktion. Hier, nach dem Rahmenaufbau, sind
     // rax/rdx frei — die Argumentregister sind noch unberuehrt, weil sie erst
     // danach in den Rahmen gerettet werden.
@@ -5445,6 +5472,13 @@ pub type Codegen = class {
     self.cg_addPatch(failPatch, "__lyx_stack_fail" as int64, 16, CG_PATCH_CALL);
     // #2081: rbx des Aufrufers zurueck (gesichert im Prolog bei [rbp-16])
     self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x5D); self.cg_e8(0xF0);  // mov rbx, [rbp-16]
+    // #2114: r12..r15 des Aufrufers zurueck (cg_emitPrologue)
+    var rle: int64 := 0;
+    while (rle < self.rlAnz) {
+      var rlSe: int64 := peek64(self.rlTab + rle * 48 + 24);
+      self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x65 + (rle << 3)); self.cg_e8(rlSe & 255);   // mov r12+i, [rbp+off]
+      rle += 1;
+    }
     // Normal epilogue
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xEC);  // mov rsp, rbp
     self.cg_e8(0x5D);  // pop rbp
@@ -7125,6 +7159,354 @@ pub type Codegen = class {
   // beiden Operanden vorzeichenlos ist (wie bei den ueblichen arithmetischen
   // Konversionen). `lhsUnsigned` bleibt dem Rechtsshift vorbehalten, wo allein
   // der linke Operand entscheidet.
+  // #2114: Ganzzahl-Binaeroperation mit konstantem rechtem Operanden direkt
+  // auf rax (links). Liefert 1, wenn emittiert — sonst 0, und der Aufrufer
+  // nimmt den allgemeinen Weg ueber rbx/rax und cg_emitBinOp. Dieselben
+  // Ergebnisse und Flags wie dort (die beiden muessen uebereinstimmen):
+  // add/sub/imul setzen OF wie `add rax, rbx` usw., die Ueberlaufpruefung
+  // haengt deshalb unveraendert dahinter; Schiebeweiten maskiert die CPU bei
+  // `shl rax, imm8` genauso wie bei `shl rbx, cl`. Keine neue Verzweigung —
+  // Maskenarithmetik bleibt verzweigungsfrei (Konstantzeit, #2114 Punkt 3).
+  fn cg_emitBinOpImm(op: int64, imm: int64, lhsUnsigned: int64, cmpUnsigned: int64): int64 {
+    var passt8: int64 := 0;
+    if (imm >= -128 && imm <= 127) { passt8 := 1; }
+    var passt32: int64 := 0;
+    if (imm >= -2147483648 && imm <= 2147483647) { passt32 := 1; }
+    // Arithmetik und Bitlogik: /0 add, /5 sub, /4 and, /1 or, /6 xor, /7 cmp
+    var ext: int64 := -1;
+    if (op == CGT_PLUS)   { ext := 0; }
+    if (op == CGT_MINUS)  { ext := 5; }
+    if (op == CGT_BITAND) { ext := 4; }
+    if (op == CGT_BITOR)  { ext := 1; }
+    if (op == 89)         { ext := 6; }   // xor (TK_BITXOR)
+    if (op == CGT_EQ2 || op == CGT_NEQ || op == CGT_LT || op == CGT_LE || op == CGT_GT || op == CGT_GE) { ext := 7; }
+    if (op == CGT_BITAND && imm == 4294967295) {
+      self.cg_e8(0x89); self.cg_e8(0xC0);                       // mov eax, eax (nullt die oberen 32 Bit)
+      return 1;
+    }
+    if (ext >= 0) {
+      if (passt8 != 0) {
+        self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0 | (ext << 3)); self.cg_e8(imm & 255);
+      } else if (passt32 != 0) {
+        self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xC0 | (ext << 3)); self.cg_e32(imm);
+      } else {
+        return 0;
+      }
+      if (ext == 7) {
+        self.cg_emitSetccRax(op, cmpUnsigned);
+      } else if ((op == CGT_PLUS || op == CGT_MINUS) && self.overflowCheckEnabled != 0) {
+        self.cg_emitOverflowPanic();
+      }
+      return 1;
+    }
+    if (op == CGT_STAR) {
+      if (passt8 != 0) {
+        self.cg_e8(0x48); self.cg_e8(0x6B); self.cg_e8(0xC0); self.cg_e8(imm & 255);   // imul rax, rax, imm8
+      } else if (passt32 != 0) {
+        self.cg_e8(0x48); self.cg_e8(0x69); self.cg_e8(0xC0); self.cg_e32(imm);       // imul rax, rax, imm32
+      } else {
+        return 0;
+      }
+      if (self.overflowCheckEnabled != 0) { self.cg_emitOverflowPanic(); }
+      return 1;
+    }
+    if (op == CGT_SHL || op == CGT_SHR) {
+      var sub: int64 := 0xE0;                                    // shl /4
+      if (op == CGT_SHR) {
+        if (lhsUnsigned != 0) { sub := 0xE8; }                   // shr /5
+        else                  { sub := 0xF8; }                   // sar /7 (#1125)
+      }
+      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(sub); self.cg_e8(imm & 255);
+      return 1;
+    }
+    return 0;
+  }
+
+  // #2114: setcc al + movzx rax, al nach einem `cmp` mit LINKS als erstem
+  // Operanden — dieselbe Zuordnung wie in cg_emitBinOp (cmp rbx, rax).
+  fn cg_emitSetccRax(op: int64, cmpUnsigned: int64) {
+    var cc: int64 := 0x94;                                       // sete
+    if (op == CGT_NEQ) { cc := 0x95; }
+    if (op == CGT_LT)  { cc := 0x9C; if (cmpUnsigned != 0) { cc := 0x92; } }
+    if (op == CGT_LE)  { cc := 0x9E; if (cmpUnsigned != 0) { cc := 0x96; } }
+    if (op == CGT_GT)  { cc := 0x9F; if (cmpUnsigned != 0) { cc := 0x97; } }
+    if (op == CGT_GE)  { cc := 0x9D; if (cmpUnsigned != 0) { cc := 0x93; } }
+    self.cg_e8(0x0F); self.cg_e8(cc); self.cg_e8(0xC0);
+    self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);
+  }
+
+  // #2114: Rahmenversatz eines Locals, das cg_genExpr mit genau einem
+  // `mov rax, [rbp+off]` laedt (cg_loadRax) — 0, wenn nicht. Ausgeschlossen
+  // ist alles, was der IDENT-Zweig dort anders behandelt: Wiedergabe
+  // eines aufgeschobenen Aufrufs, Funktionswert-Satz, innere Funktion,
+  // @redundant (Mehrheitslesen), Erfassung, Globale, Konstante.
+  fn cg_einfachesLocalOff(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (self.cg_nkind(ni) != CGN_IDENT) { return 0; }
+    if (self.dfReplay != 0 && self.cg_deferArgIdx(ni) >= 0) { return 0; }
+    if (self.satzKontext != 0) { return 0; }
+    if (self.cg_istSatzWert(ni) != 0) { return 0; }
+    if (self.cg_nestIdx(ni) >= 0) { return 0; }
+    var off: int64 := self.cg_findLocal(self.cg_nsval(ni), self.cg_nslen(ni));
+    if (off == 0) { return 0; }
+    var ridx: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+    if (ridx >= 0 && self.cg_isLocalRedundant(ridx) != 0) { return 0; }
+    return off;
+  }
+
+  // #2114: `links OP local` mit einem einfachen Local rechts: links nach rax,
+  // dann `op rax, [rbp+off]` — kein push/pop, keine zweite Ladung. Dieselbe
+  // Auswertungsreihenfolge wie der allgemeine Weg (erst links, dann das Local
+  // lesen). Nur Ganzzahl; liefert 0, wenn der Fall nicht passt.
+  fn cg_binOpLocalRechts(op: int64, lhsNi: int64, rhsNi: int64): int64 {
+    var off: int64 := self.cg_einfachesLocalOff(rhsNi);
+    if (off == 0) { return 0; }
+    if (self.cg_isF64Expr(lhsNi) != 0 || self.cg_isF64Expr(rhsNi) != 0) { return 0; }
+    var opc: int64 := -1;
+    if (op == CGT_PLUS)   { opc := 0x03; }
+    if (op == CGT_MINUS)  { opc := 0x2B; }
+    if (op == CGT_BITAND) { opc := 0x23; }
+    if (op == CGT_BITOR)  { opc := 0x0B; }
+    if (op == 89)         { opc := 0x33; }
+    if (op == CGT_EQ2 || op == CGT_NEQ || op == CGT_LT || op == CGT_LE || op == CGT_GT || op == CGT_GE) { opc := 0x3B; }
+    var istMul: int64 := 0;
+    if (op == CGT_STAR) { istMul := 1; }
+    if (opc < 0 && istMul == 0) { return 0; }
+    self.cg_genExpr(lhsNi);
+    var rlR: int64 := self.cg_rlReg(off);
+    if (rlR >= 0) {
+      // Local im Register: dieselbe Operation mit Registeroperand (r12+i).
+      self.cg_e8(0x49);
+      if (istMul != 0) { self.cg_e8(0x0F); self.cg_e8(0xAF); }   // imul rax, r12+i
+      else             { self.cg_e8(opc); }
+      self.cg_e8(0xC4 + rlR);
+    } else {
+    self.cg_e8(0x48);
+    if (istMul != 0) { self.cg_e8(0x0F); self.cg_e8(0xAF); }     // imul rax, [rbp+off]
+    else             { self.cg_e8(opc); }
+    if (off >= -128 && off <= 127) { self.cg_e8(0x45); self.cg_e8(off & 255); }
+    else                           { self.cg_e8(0x85); self.cg_e32(off); }
+    }
+    var cmpU: int64 := self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi);
+    if (opc == 0x3B) {
+      self.cg_emitSetccRax(op, cmpU);
+    } else if ((op == CGT_PLUS || op == CGT_MINUS || op == CGT_STAR) && self.overflowCheckEnabled != 0) {
+      self.cg_emitOverflowPanic();
+    }
+    return 1;
+  }
+
+  // ------------------------------------------------------------------
+  // #2114: skalare Locals in r12..r15.
+  //
+  // Bis 1.2.17D lag jedes Local im Rahmen; eine Rechenschleife lief damit
+  // ueber Store->Load-Weiterleitung (4-5 Takte je Glied) und war latenz-
+  // gebunden — auch mit kuerzerem Code (Direktoperanden) nicht schneller.
+  //
+  // Der Slot bleibt reserviert, nur das Laden und Speichern geht ueber
+  // cg_loadRax/cg_storeRax/cg_storeRdx, die fuer ein registerresidentes Local
+  // auf das Register umlenken. Alle Zugriffe, die einen Local-Versatz
+  // ANDERS benutzen (Adresse, Erfassung, Feldbasis), sind entweder durch die
+  // Auswahl ausgeschlossen oder melden sich laut (cg_rlNichtImRegister).
+  //
+  // Die Auswahl ist DETERMINISTISCH (Gewicht, dann Deklarationsreihenfolge)
+  // und fuegt keinen Sprung ein — Konstantzeit-Code bleibt verzweigungsfrei.
+  // ------------------------------------------------------------------
+
+  // Register (0..3 = r12..r15) des Locals mit diesem Slot, sonst -1.
+  fn cg_rlReg(off: int64): int64 {
+    if (self.rlAnz == 0 || off == 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < self.rlAnz) {
+      var b: int64 := self.rlTab + i * 48;
+      var sb: int64 := peek64(b + 32);
+      var j: int64 := 0;
+      while (j < peek64(b + 16)) {
+        if (peek64(sb + j * 8) == off) { return i; }
+        j += 1;
+      }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // Ein Zugriff, der den Slot als SPEICHER braucht, auf ein Local im
+  // Register: die Auswahl haette es ausschliessen muessen. Laut, nie still.
+  fn cg_rlNichtImRegister(off: int64, wo: pchar) {
+    if (self.cg_rlReg(off) < 0) { return; }
+    EPrintStr("lyxc: interner Fehler (#2114): Local im Register an einer Stelle, die seinen Speicher braucht: "c);
+    EPrintStrLn(wo);
+    exit(70);
+  }
+
+  // Deklaration eines gewaehlten Locals: Slot dem Register zuordnen.
+  fn cg_rlBinde(np: pchar, nl: int64, off: int64) {
+    var i: int64 := 0;
+    while (i < self.rlAnz) {
+      var b: int64 := self.rlTab + i * 48;
+      if (peek64(b + 8) == nl && self.cg_seq(peek64(b) as pchar, nl, np, nl)) {
+        var ns: int64 := peek64(b + 16);
+        if (ns >= peek64(b + 40)) {
+          var nc: int64 := peek64(b + 40) * 2;
+          var nbuf: int64 := alloc(nc * 8);
+          memcpy(nbuf, peek64(b + 32), ns * 8);
+          poke64(b + 32, nbuf); poke64(b + 40, nc);
+        }
+        poke64(peek64(b + 32) + ns * 8, off);
+        poke64(b + 16, ns + 1);
+        return;
+      }
+      i += 1;
+    }
+  }
+
+  // Ist der Typknoten ein 64-Bit-Ganzzahltyp ohne Sonderbehandlung (keine
+  // Kuerzung, keine Einheit, kein Bereich, kein Gleitkomma)?
+  fn cg_rlTypOk(tn: int64): int64 {
+    if (tn < 0 || self.cg_nkind(tn) != 60) { return 0; }
+    var p: pchar := self.cg_nsval(tn);
+    var l: int64 := self.cg_nslen(tn);
+    if (self.cg_findUtype(p, l) >= 0) { return 0; }
+    if (self.cg_rangeOfTypeNode(tn) >= 0) { return 0; }
+    if (self.cg_seq(p, l, "int64"c, 5) || self.cg_seq(p, l, "uint64"c, 6)) { return 1; }
+    if (self.cg_seq(p, l, "i64"c, 3) || self.cg_seq(p, l, "u64"c, 3)) { return 1; }
+    return 0;
+  }
+
+  // Kandidatenpuffer: je 40 Byte {Knoten, Gewicht, ok, Deklarationen, frei}.
+  fn cg_rlKandIdx(kb: int64, kn: int64, np: pchar, nl: int64): int64 {
+    if (nl <= 0) { return 0 - 1; }
+    var i: int64 := 0;
+    while (i < kn) {
+      var k: int64 := peek64(kb + i * 40);
+      if (self.cg_nslen(k) == nl && self.cg_seq(self.cg_nsval(k), nl, np, nl)) { return i; }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // Durchgang ueber einen Rumpf (Kanten wie cg_nestWalkOne: AT_DIRECTIVE
+  // traegt in c0 einen Wert, c3 ist nur bei FOR_C ein Knoten).
+  //   modus 0: Kandidaten sammeln, Ausschlussgruende fuer die ganze Funktion
+  //   modus 1: Nutzungen gewichten, Konflikte je Name
+  // Rueckgabe des Puffers in kbBox: [0] Puffer, [8] Anzahl, [16] Ausschluss.
+  fn cg_rlLauf(ni: int64, modus: int64, tiefe: int64, kbBox: int64, rek: int64) {
+    var cur: int64 := ni;
+    while (cur >= 0) {
+      if (rek > 400) { poke64(kbBox + 16, 1); return; }
+      var k: int64 := self.cg_nkind(cur);
+      if (k == CGN_AT_DIRECTIVE) { cur := self.cg_nnext(cur); continue; }
+      if (k == CGN_TRY || k == CGN_DEFER || k == CGN_ASM || k == CGN_CLOSURE || k == CGN_FUNC_DECL
+          || k == CGN_TUPLE_VAR_DECL) {
+        poke64(kbBox + 16, 1);
+      }
+      var kb: int64 := peek64(kbBox);
+      var kn: int64 := peek64(kbBox + 8);
+      if (modus == 0 && k == CGN_VAR_DECL && (self.cg_nival(cur) & 4) == 0
+          && self.cg_rlTypOk(self.cg_nc0(cur)) != 0 && kn < 64) {
+        var nb: int64 := kb + kn * 40;
+        poke64(nb, cur); poke64(nb + 8, 0); poke64(nb + 16, 1); poke64(nb + 24, 0);
+        poke64(kbBox + 8, kn + 1);
+      }
+      if (modus == 1) {
+        var ki: int64 := self.cg_rlKandIdx(kb, kn, self.cg_nsval(cur), self.cg_nslen(cur));
+        if (ki >= 0) {
+          var kr: int64 := kb + ki * 40;
+          if (k == CGN_IDENT) {
+            var gw: int64 := 1;
+            var t: int64 := tiefe;
+            if (t > 3) { t := 3; }
+            while (t > 0) { gw := gw * 8; t -= 1; }
+            poke64(kr + 8, peek64(kr + 8) + gw);
+          } else if (k == CGN_VAR_DECL && cur == peek64(kr)) {
+            poke64(kr + 24, peek64(kr + 24) + 1);
+          } else {
+            // Jede andere Nennung desselben Namens (zweite Deklaration,
+            // Laufvariable, Musterbindung, gleichnamiges Feld …): nicht
+            // waehlen — die Zuordnung ueber den Namen waere nicht eindeutig.
+            poke64(kr + 16, 0);
+          }
+        }
+        // `@x` — die Adresse eines Locals im Register gibt es nicht.
+        if (k == CGN_UNOP && self.cg_nival(cur) == 111) {
+          var ai: int64 := self.cg_nc0(cur);
+          if (ai >= 0 && self.cg_nkind(ai) == CGN_IDENT) {
+            var ak: int64 := self.cg_rlKandIdx(kb, kn, self.cg_nsval(ai), self.cg_nslen(ai));
+            if (ak >= 0) { poke64(kb + ak * 40 + 16, 0); }
+          }
+        }
+      }
+      var schleife: int64 := 0;
+      if (k == CGN_WHILE || k == CGN_FOR || k == CGN_FOR_C || k == CGN_FOR_RANGE || k == CGN_REPEAT_UNTIL) { schleife := 1; }
+      self.cg_rlLauf(self.cg_nc0(cur), modus, tiefe + schleife, kbBox, rek + 1);
+      self.cg_rlLauf(self.cg_nc1(cur), modus, tiefe + schleife, kbBox, rek + 1);
+      self.cg_rlLauf(self.cg_nc2(cur), modus, tiefe + schleife, kbBox, rek + 1);
+      if (k == CGN_FOR_C) { self.cg_rlLauf(self.cg_nc3(cur), modus, tiefe + 1, kbBox, rek + 1); }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
+  // Waehlt fuer die Funktion fni (Parameterliste c0, Rumpf c2) bis zu vier
+  // Locals fuer r12..r15. Ausgeschlossen sind Funktionen, deren Rahmen von
+  // aussen gelesen oder per longjmp betreten wird: innere Funktionen und
+  // Lambdas (Erfassung ueber den Rahmen), try (der Handler setzt r12..r15 auf
+  // den Stand beim Eintritt zurueck), defer (Landepunkt per longjmp), asm,
+  // Debug-Information (DWARF nennt den Slot).
+  fn cg_rlWaehlen(fni: int64) {
+    if (self.rlAnz != 0) {
+      EPrintStrLn("lyxc: interner Fehler (#2114): Registerzuteilung einer Funktion noch aktiv"c);
+      exit(70);
+    }
+    if (self.debugMode != 0 || self.debugInfoEnabled != 0) { return; }
+    if (self.cg_nestIdx(fni) >= 0) { return; }
+    if (self.closureEnvPtrOff != 0) { return; }
+    var body: int64 := self.cg_nc2(fni);
+    if (body < 0 || self.cg_nkind(body) != CGN_BLOCK) { return; }
+    var kbBox: int64 := alloc(24);
+    poke64(kbBox, alloc(64 * 40)); poke64(kbBox + 8, 0); poke64(kbBox + 16, 0);
+    self.cg_rlLauf(body, 0, 0, kbBox, 0);
+    if (peek64(kbBox + 16) != 0 || peek64(kbBox + 8) == 0) { return; }
+    self.cg_rlLauf(body, 1, 0, kbBox, 0);
+    var kb: int64 := peek64(kbBox);
+    var kn: int64 := peek64(kbBox + 8);
+    // Parameter gleichen Namens schliessen aus.
+    var pp: int64 := self.cg_nc0(fni);
+    while (pp >= 0) {
+      var pk: int64 := self.cg_rlKandIdx(kb, kn, self.cg_nsval(pp), self.cg_nslen(pp));
+      if (pk >= 0) { poke64(kb + pk * 40 + 16, 0); }
+      pp := self.cg_nnext(pp);
+    }
+    // Bis zu vier mit dem hoechsten Gewicht; bei Gleichstand die frueher
+    // deklarierte. Mindestens zwei Nutzungen, sonst lohnt es nicht.
+    var tab: int64 := alloc(4 * 48);
+    var n: int64 := 0;
+    while (n < 4) {
+      var best: int64 := 0 - 1;
+      var bestW: int64 := 1;
+      var i: int64 := 0;
+      while (i < kn) {
+        var r: int64 := kb + i * 40;
+        if (peek64(r + 16) != 0 && peek64(r + 24) == 1 && peek64(r + 8) > bestW) {
+          best := i; bestW := peek64(r + 8);
+        }
+        i += 1;
+      }
+      if (best < 0) { break; }
+      var br: int64 := kb + best * 40;
+      var bk: int64 := peek64(br);
+      poke64(tab + n * 48, self.cg_nsval(bk) as int64);
+      poke64(tab + n * 48 + 8, self.cg_nslen(bk));
+      poke64(tab + n * 48 + 16, 0);
+      poke64(tab + n * 48 + 24, 0);
+      poke64(tab + n * 48 + 32, alloc(8 * 8));
+      poke64(tab + n * 48 + 40, 8);
+      poke64(br + 16, 0);
+      n += 1;
+    }
+    self.rlTab := tab;
+    self.rlAnz := n;
+  }
+
   fn cg_emitBinOp(op: int64, lhsUnsigned: int64, cmpUnsigned: int64) {
     if (op == CGT_PLUS) {
       // add rax, rbx  (48 01 D8)
@@ -10367,6 +10749,10 @@ pub type Codegen = class {
     var an: pchar := self.cg_nsval(objNode);
     var al: int64 := self.cg_nslen(objNode);
     var off: int64 := self.cg_findLocal(an, al);
+    // #2114: liegt das Local im Register, ist es dort zu lesen (mov rcx, r12+i)
+    // — dasselbe wie das Laden aus dem Slot darunter.
+    var rlA: int64 := self.cg_rlReg(off);
+    if (rlA >= 0) { self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xE1 + (rlA << 3)); return; }
     if (off != 0) {
       if (off >= -128 && off <= 127) {
         self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4D); self.cg_e8(off);
@@ -11056,6 +11442,7 @@ pub type Codegen = class {
     self.profCurName := mangBuf as pchar;
     self.profCurLen  := mangLen;
     // Emit prologue
+    self.cg_rlWaehlen(ni);   // #2114
     var prologuePatch: int64 := self.cg_emitPrologue();
     // #1140: @flight_crit an einer METHODE. Ohne diese Stelle gaelte die
     // Zusicherung fuer freie Funktionen und nicht fuer Methoden — sie haenge
@@ -11209,6 +11596,7 @@ pub type Codegen = class {
     var aligned: int64 := fs - (fs & 15);
     if (aligned == 0) { aligned := 16; }
     poke32(self.code + prologuePatch, aligned);
+    self.rlAnz := 0;   // #2114
     self.fcActive   := savedMFcActive;   // #1140
     self.fcMxSlot   := savedMFcMx;
     self.fcNameSlot := savedMFcName;
@@ -11549,6 +11937,14 @@ pub type Codegen = class {
         // CSE: RHS is constant → eval LHS into rax, mov rbx,rax, load const (no push/pop)
         var rhsVal: int64 := self.foldBuf;
         self.cg_genExpr(lhsNi);
+        // #2114: Ganzzahl OP Konstante direkt als Operand (`and rax, imm`,
+        // `shl rax, imm`), ohne die Konstante erst nach rax zu laden.
+        var rhsDirekt: int64 := 0;
+        if (self.cg_isF64Expr(lhsNi) == 0) {
+          rhsDirekt := self.cg_emitBinOpImm(op, rhsVal, self.cg_isUnsignedExpr(lhsNi),
+                                            self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi));
+        }
+        if (rhsDirekt == 0) {
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC3);  // mov rbx, rax
         self.cg_movRaxImm(rhsVal);
         // #1212: dieselbe Luecke mit vertauschten Rollen — `2.5 + 10` liess
@@ -11559,6 +11955,7 @@ pub type Codegen = class {
         } else {
           self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi),
                             self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi));
+        }
         }
       } else if (self.cg_tryClassBinop(ni) != 0) {
         // operator overloading: a.Op(b) for a class-typed left operand — emitted
@@ -11633,6 +12030,7 @@ pub type Codegen = class {
           // rax = result SIMD ptr
         } else {
           // idents but not SIMD — general path
+          if (self.cg_binOpLocalRechts(op, lhsNi, rhsNi) == 0) {   // #2114
           self.cg_genExpr(lhsNi);
           self.cg_pushRax();
           self.cg_genExpr(rhsNi);
@@ -11644,9 +12042,13 @@ pub type Codegen = class {
             self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi),
                           self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi));
           }
+          }
         }
       } else {
         // General: eval LHS, push; eval RHS; pop rbx
+        // #2114: rechts ein einfaches Local und beide Seiten ganzzahlig —
+        // dann als Speicheroperand, ohne push/pop (cg_binOpLocalRechts).
+        if (self.cg_binOpLocalRechts(op, lhsNi, rhsNi) == 0) {
         self.cg_genExpr(lhsNi);
         self.cg_pushRax();
         self.cg_genExpr(rhsNi);
@@ -11657,6 +12059,7 @@ pub type Codegen = class {
         } else {
           self.cg_emitBinOp(op, self.cg_isUnsignedExpr(lhsNi),
                           self.cg_isUnsignedExpr(lhsNi) | self.cg_isUnsignedExpr(rhsNi));
+        }
         }
       }
 
@@ -11670,6 +12073,7 @@ pub type Codegen = class {
           var iname0: pchar := self.cg_nsval(inner0);
           var ilen0:  int64 := self.cg_nslen(inner0);
           var ioff0:  int64 := self.cg_findLocal(iname0, ilen0);
+          self.cg_rlNichtImRegister(ioff0, "Adresse eines Locals (@x)"c);   // #2114
           if (ioff0 != 0) {
             // WP-B1: @redundant vars → return address of slot A (off-16, lowest addr)
             var addrOff0: int64 := ioff0;
@@ -13659,6 +14063,7 @@ pub type Codegen = class {
         }
       }
       var clOff: int64 := self.cg_findLocal(fname, fnlen);
+      self.cg_rlNichtImRegister(clOff, "Aufruf ueber ein Funktionswert-Local"c);   // #2114
       if (clOff != 0) {
         // #1: lokaler plain fn-ptr (fn-Typ-Alias)? → thin-call: Adresse laden, Args in normalen
         // Registern (arg0→rdi), KEIN env-Shift. Vorher: Closure-Pfad las {fnPtr,env} → Garbage/Crash.
@@ -17184,6 +17589,7 @@ pub type Codegen = class {
       var name: pchar := self.cg_nsval(ni);
       var nlen: int64 := self.cg_nslen(ni);
       var off: int64 := self.cg_addLocal(name, nlen);
+      if (k == CGN_VAR_DECL) { self.cg_rlBinde(name, nlen, off); }   // #2114
       var localIdx: int64 := self.localCount - 1;
       // Track type for OOP local lookup (child0 = type node, NK_TYPE_NAME = 60)
       var typeNode: int64 := self.cg_nc0(ni);
@@ -21357,6 +21763,8 @@ pub type Codegen = class {
     self.profCurName := fname;
     self.profCurLen  := fnlen;
 
+    self.cg_rlWaehlen(ni);   // #2114: vor dem Prolog, der die Register sichert
+
     // Emit prologue, capture patch position for sub rsp imm32
     var prologuePatch: int64 := self.cg_emitPrologue();
 
@@ -21629,6 +22037,7 @@ pub type Codegen = class {
     var aligned: int64 := fs - (fs & 15);
     if (aligned == 0) { aligned := 16; }
     poke32(self.code + prologuePatch, aligned);
+    self.rlAnz := 0;   // #2114: Zuteilung endet mit dem Rumpf
 
     // #1138: `@stack_limit(N)` sagt eine obere Schranke fuer den Stapel zu.
     // Hier steht die Rahmengroesse fest — ist schon EIN Aufruf groesser als
