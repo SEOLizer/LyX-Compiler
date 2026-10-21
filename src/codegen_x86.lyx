@@ -981,6 +981,12 @@ pub type Codegen = class {
   fnAliasList:  int64;
   fnAliasCount: int64;
   fnAliasCap:   int64;
+  // #2161: Aliase auf benannte Typen (`type Meter = f64`), je 32 Byte:
+  // Name (ptr,len) + Zielname (ptr,len). Aufgeloest wird beim Fragen
+  // (cg_aliasZiel), damit auch Aliase importierter Units zaehlen.
+  wertAliasList:  int64;
+  wertAliasCount: int64;
+  wertAliasCap:   int64;
 
   // #2134: Monomorphisierung generischer Funktionen (siehe cg_genInstanz).
   // Bis 1.2.15A gab es EINEN typgeloeschten Rumpf und je Instanz nur einen
@@ -5535,6 +5541,10 @@ pub type Codegen = class {
     // aus dem Bitmuster eine Zahl (std.pack lieferte 4.6e18 statt 3.5).
     if (self.cg_seq(name, nameLen, "peekf64"c, 7)) { return 1; }
     if (self.cg_seq(name, nameLen, "peekf32"c, 7)) { return 1; }
+    // #2160: der Builtin heisst peek32f (sema._regBuiltin) — "peekf32" oben
+    // gibt es nicht. `var v: f64 := peek32f(t)` wandelte das Ergebnis deshalb
+    // ein zweites Mal (12.1 -> 4.6e18).
+    if (self.cg_seq(name, nameLen, "peek32f"c, 7)) { return 1; }
     var i: int64 := 0;
     while (i < self.f64FuncCount) {
       var base: int64 := self.f64FuncList + i * 16;
@@ -5928,7 +5938,7 @@ pub type Codegen = class {
         } else if (body >= 0 && self.cg_nkind(body) == CGN_FN_PTR_NODE) {
           self.cg_registerFnAliasR(self.cg_nsval(cur), self.cg_nslen(cur),
                                    self.cg_nc1(body));   // #1595: Rueckgabetyp
-        }
+}
       }
       cur := self.cg_nnext(cur);
     }
@@ -6343,9 +6353,79 @@ pub type Codegen = class {
     return self.cg_fnTiefeKnoten(self.cg_nc1(typeNode));
   }
 
+  // #2161: Aliase auf benannte Typen einsammeln — VOR cg_collectF64Funcs,
+  // denn dort entscheidet cg_isFloatTypeName ueber den Rueckgabetyp (dieselbe
+  // Reihenfolgefalle wie #2004 bei den Einheitentypen).
+  fn cg_collectWertAliase(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      if (self.cg_nkind(cur) == CGN_TYPE_DECL && (self.cg_nival(cur) & 2) != 0) {
+        var body: int64 := self.cg_nc0(cur);
+        if (body >= 0 && self.cg_nkind(body) == 60 && self.cg_nslen(body) > 0) {
+          self.cg_registerWertAlias(self.cg_nsval(cur), self.cg_nslen(cur),
+                                    self.cg_nsval(body), self.cg_nslen(body));
+        }
+      }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
+  fn cg_registerWertAlias(np: pchar, nl: int64, zp: pchar, zl: int64) {
+    if (self.wertAliasCount >= self.wertAliasCap) {
+      var nc: int64 := self.wertAliasCap * 2;
+      if (nc < 32) { nc := 32; }
+      var nb: int64 := alloc(nc * 32);
+      if (self.wertAliasCount > 0) { memcpy(nb, self.wertAliasList, self.wertAliasCount * 32); }
+      self.wertAliasList := nb;
+      self.wertAliasCap  := nc;
+    }
+    var b: int64 := self.wertAliasList + self.wertAliasCount * 32;
+    poke64(b, np as int64); poke64(b + 8, nl);
+    poke64(b + 16, zp as int64); poke64(b + 24, zl);
+    self.wertAliasCount += 1;
+  }
+
+  // #2161: Eintrag des Alias `name` oder -1.
+  fn cg_aliasIdx(name: pchar, nl: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.wertAliasCount) {
+      var b: int64 := self.wertAliasList + i * 32;
+      if (peek64(b + 8) == nl && self.cg_seq(peek64(b) as pchar, nl, name, nl) != 0) { return i; }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // #2160: Ist das Feld vom Typ f32? Nur dann hat es vier Byte (cg_typeSize);
+  // ein Alias auf f32 belegt acht und haelt den double unveraendert.
+  // Dieselbe Abgrenzung wie _tnIstF32 im IR-Weg.
+  fn cg_feldIstF32(classIdx: int64, fname: pchar, flen: int64): int64 {
+    if (classIdx < 0) { return 0; }
+    var bx: int64 := alloc(8);
+    var tp: pchar := self.cg_fieldTypeNameIn(classIdx, fname, flen, bx);
+    var tl: int64 := peek64(bx);
+    free(bx, 8);
+    if (tp == 0 as pchar || tl <= 0) { return 0; }
+    if (self.cg_seq(tp, tl, "f32"c, 3)) { return 1; }
+    return 0;
+  }
+
   fn cg_isFloatTypeName(tp: pchar, tln: int64): int64 {
+    return self.cg_isFloatTypeNameT(tp, tln, 0);
+  }
+
+  fn cg_isFloatTypeNameT(tp: pchar, tln: int64, tiefe: int64): int64 {
     if (self.cg_seq(tp, tln, "f64"c, 3) != 0) { return 1; }
     if (self.cg_seq(tp, tln, "f32"c, 3) != 0) { return 1; }
+    // #2161: `type Meter = f64` — bis 1.2.17A galt der Alias als Ganzzahl,
+    // Literal und Arithmetik liefen auf dem IEEE-Bitmuster. Dieselbe
+    // Aufloesung wie parser._sigFloatName fuer extern-Signaturen; die
+    // Tiefe begrenzt einen (von sema abgewiesenen) Alias-Kreis.
+    var ai: int64 := self.cg_aliasIdx(tp, tln);
+    if (ai >= 0 && tiefe < 16) {
+      var ab: int64 := self.wertAliasList + ai * 32;
+      return self.cg_isFloatTypeNameT(peek64(ab + 16) as pchar, peek64(ab + 24), tiefe + 1);
+    }
     // #1955: Einheitentypen rechnen ab 1.2.1A in Gleitkomma.
     //
     // Bis dahin lagen sie in ganzzahligen Slots (#1358), und damit war jede
@@ -6641,13 +6721,19 @@ pub type Codegen = class {
   // alles Unsichere unberuehrt.
   fn cg_retToF64(expr: int64) {
     if (self.fnRetIsFloat == 0) { return; }
-    if (expr < 0) { return; }
-    if (self.cg_isF64Expr(expr) != 0) { return; }   // liegt schon als f64 vor
-    var sicherGanz: int64 := 0;
-    if (self.cg_nkind(expr) == CGN_LIT_INT) { sicherGanz := 1; }
-    else if (self.cg_tryFold(expr) != 0) { sicherGanz := 1; }
-    if (sicherGanz == 0) { return; }
+    if (self.cg_istSicherGanz(expr) == 0) { return; }
     self.cg_emitRaxIntToF64();
+  }
+
+  // #2160: dieselbe Abgrenzung fuer die Zuweisung an ein Gleitkommaziel —
+  // Literal oder ganzzahlig faltbar, und nicht als f64 erkannt. Die IR-Seite
+  // (_nachGleit) muss uebereinstimmen.
+  fn cg_istSicherGanz(expr: int64): int64 {
+    if (expr < 0) { return 0; }
+    if (self.cg_isF64Expr(expr) != 0) { return 0; }   // liegt schon als f64 vor
+    if (self.cg_nkind(expr) == CGN_LIT_INT) { return 1; }
+    if (self.cg_tryFold(expr) != 0) { return 1; }
+    return 0;
   }
 
   fn cg_emitRaxIntToF64() {
@@ -10644,6 +10730,12 @@ pub type Codegen = class {
       self.cg_zeroRax();
     } else if (ldW == 1 || ldW == 2 || ldW == 4) {
       self.cg_emitNarrowLoadRax(foff, ldW, ldSigned);
+      // #2160: f32-Feld -> double im Register (Gegenstueck zum Schreiben).
+      if (ldW == 4 && self.cg_feldIstF32(classIdx, fieldName, fieldLen) != 0) {
+        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC0);                     // movd xmm0, eax
+        self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x5A); self.cg_e8(0xC0);                     // cvtss2sd xmm0, xmm0
+        self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);   // movq rax, xmm0
+      }
     } else if (foff == 0) {
       self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x00);
     } else if (foff <= 127) {
@@ -17692,6 +17784,15 @@ pub type Codegen = class {
         if (utDst2 >= 0 && self.cg_isF64Expr(rhs) == 0) {
           self.cg_emitRaxIntToF64();
         }
+        // #2160: dasselbe fuer ein Ziel vom Typ f64/f32 oder einem Alias
+        // darauf. Bis 1.2.17A wandelte nur die Deklaration (#1502): `var b:
+        // f64 := 4` ergab 4.0, `b := 4` das Bitmuster (0.0). cg_isF64Expr
+        // auf der LINKEN Seite kennt Local, Erfassung und Globale.
+        // Nur ein NACHWEISLICH ganzzahliger Wert (cg_istSicherGanz) — ein
+        // "nein" von cg_isF64Expr heisst nur "nicht erkannt" (#2004).
+        if (utDst2 < 0 && self.cg_isF64Expr(lhs) != 0 && self.cg_istSicherGanz(rhs) != 0) {
+          self.cg_emitRaxIntToF64();
+        }
         self.cg_emitUtypeConvExpr(utDst2, rhs);
         self.cg_emitUtypeRange(utDst2);
         var off: int64 := self.cg_findLocal(name, nlen);
@@ -17773,7 +17874,15 @@ pub type Codegen = class {
           var ftn: pchar := self.cg_fieldTypeNameIn(classIdx, fieldName, fieldLen, fbx);
           var ftnL: int64 := peek64(fbx);
           free(fbx, 8);
-          if (ftn != 0 as pchar && ftnL > 0) { utFld := self.cg_findUtype(ftn, ftnL); }
+          if (ftn != 0 as pchar && ftnL > 0) {
+            utFld := self.cg_findUtype(ftn, ftnL);
+            // #2160: Feld vom Typ f64/f32 (oder Alias) — dieselbe Angleichung
+            // wie bei der Deklaration, ohne Einheitenumrechnung.
+            if (utFld < 0 && self.cg_isFloatTypeName(ftn, ftnL) != 0
+                && self.cg_istSicherGanz(rhs) != 0) {
+              self.cg_emitRaxIntToF64();
+            }
+          }
         }
         if (utFld >= 0) {
           if (self.cg_isF64Expr(rhs) == 0) { self.cg_emitRaxIntToF64(); }
@@ -17849,6 +17958,14 @@ pub type Codegen = class {
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC1);                   // mov rcx, rax
           self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0xA5);                   // rep movsq
         } else if (foff >= 0 && (stW == 1 || stW == 2 || stW == 4)) {
+          // #2160: ein f32-Feld bekommt ein echtes single — im Register liegt
+          // ein double (#1127); bis 1.2.17A landeten dessen untere vier Byte
+          // im Feld (0.25 -> 0). Gegenstueck in cg_genFieldLoad.
+          if (stW == 4 && self.cg_feldIstF32(classIdx, fieldName, fieldLen) != 0) {
+            self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC6); // movq xmm0, rsi
+            self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5A); self.cg_e8(0xC0);                   // cvtsd2ss xmm0, xmm0
+            self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC6);                   // movd esi, xmm0
+          }
           self.cg_emitNarrowStoreRsi(foff, stW);
         } else if (foff == 0) {
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x30);
@@ -24124,6 +24241,7 @@ pub type Codegen = class {
     // Einheit OHNE wraps traf es genauso. Das Verhalten hing allein daran, ob
     // der Wert durch eine FUNKTION lief oder in einer lokalen Variablen blieb.
     self.cg_collectUtypes(head);          // #1110: Einheitentypen samt Faktor
+    self.cg_collectWertAliase(head);      // #2161: `type Meter = f64`
     // Pre-pass: collect all user-defined functions returning f64 for cg_isF64Expr.
     self.cg_collectF64Funcs(head);
     // #2044: Marken der inneren Funktionen — nach den Signatur-Registern
@@ -24782,6 +24900,12 @@ pub type Codegen = class {
     self.cg_registerF64Func("fNeg"c,  4);
     self.cg_registerF64Func("fAbs"c,  4);
     self.cg_registerF64Func("sqrt"c,  4);
+    // #2160: die drei Rundungen (#1720, roundsd) liefern ebenfalls einen
+    // double. Ohne sie wandelte `var x: f64 := fFloor(y)` das Ergebnis ein
+    // zweites Mal.
+    self.cg_registerF64Func("fFloor"c, 6);
+    self.cg_registerF64Func("fCeil"c,  5);
+    self.cg_registerF64Func("fRound"c, 6);
 
     // #2134: generische Funktionen
     self.gfRecs := 0; self.gfN := 0; self.gfCap := 0;

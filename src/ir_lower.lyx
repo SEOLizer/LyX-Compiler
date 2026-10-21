@@ -1307,6 +1307,7 @@ pub type IRLower = class {
   // #2147: Zugriffsart (Breite | Vorzeichen << 8) des zuletzt ueber
   // _instanceFieldOffset aufgeloesten Feldes; 0 = acht Byte.
   letzteFeldArt: int64;
+  letzteFeldF32: int64;   // #2160: das zuletzt aufgeloeste Feld ist f32 (vier Byte im Speicher)
   // #2157: Index der verborgenen Modulvariablen der Bump-Arena (cur; end
   // liegt bei +1), -1 = noch nicht angelegt.
   arenaGlob: int64;
@@ -1455,6 +1456,7 @@ pub type IRLower = class {
     self.irArchCode := 0;
     self.irOsCode := 0;
     self.letzteFeldArt := 0;
+    self.letzteFeldF32 := 0;
     self.arenaGlob := 0 - 1;
     var wbI: int64 := 0;
     while wbI < self.wantCap { poke8(self.wantBuf + wbI, 0); poke8(self.doneBuf + wbI, 0); wbI := wbI + 1; }
@@ -2438,12 +2440,12 @@ pub type IRLower = class {
     if k == NK_LIT_FLOAT { return 1; }
     if k == NK_IDENT {
       var tn: int64 := self._localTypeNode(self.nodeSVal(expr), self.nodeSLen(expr));
-      if tn >= 0 { return self.seq(self.nodeSVal(tn), self.nodeSLen(tn), "f64", 3); }
+      if tn >= 0 { return self._istGleitTypName(self.nodeSVal(tn), self.nodeSLen(tn)); }
       return 0;
     }
     if k == NK_CAST {
       var tt: int64 := self.nodeC1(expr);
-      if tt >= 0 { return self.seq(self.nodeSVal(tt), self.nodeSLen(tt), "f64", 3); }
+      if tt >= 0 { return self._istGleitTypName(self.nodeSVal(tt), self.nodeSLen(tt)); }
       return 0;
     }
     if k == NK_BINOP {
@@ -2462,6 +2464,46 @@ pub type IRLower = class {
     // WP-SIMD: Element einer parallel-Array<f32> wird als f64 geladen (cvtss2sd) → f64-Ausdruck.
     if k == NK_INDEX { return self._isSimdExpr(self.nodeC0(expr)); }
     return 0;
+  }
+
+  // #2160/#2161: Ist der Typname ein Gleitkommatyp? f64, f32 (auf dem
+  // IR-Weg als double gehalten, wie x86 seit #1127) und jeder Alias darauf,
+  // auch ueber mehrere Stufen und aus einer importierten Unit (ueber das
+  // Typverzeichnis im Kontext der deklarierenden Unit). Bis 1.2.17A stand an
+  // jeder Stelle nur "f64" beim Namen: `x as f64` mit `x: f32` wandelte das
+  // Bitmuster als Ganzzahl, `var m: Meter := 3` legte die Ganzzahl ab.
+  // Dieselbe Frage wie cg_isFloatTypeName auf x86 — die beiden muessen
+  // uebereinstimmen.
+  fn _istGleitTypName(p: pchar, l: int64): int64 {
+    return self._istGleitTypNameT(p, l, 0);
+  }
+
+  fn _istGleitTypNameT(p: pchar, l: int64, tiefe: int64): int64 {
+    if p == 0 as pchar || l <= 0 { return 0; }
+    if self.seq(p, l, "f64", 3) || self.seq(p, l, "f32", 3) { return 1; }
+    if tiefe >= 16 { return 0; }   // ein Alias-Kreis (sema weist ihn ab)
+    // Diese Frage faellt fuer JEDEN Bezeichner mit Typ — die eingebauten
+    // Namen gleich abweisen und nur das Typverzeichnis durchsuchen (es fuehrt
+    // jede Typdeklaration jeder Unit, das Hauptmodul zuerst), nicht die ganze
+    // Knotentabelle: der erste Anlauf machte das Senken ueberlinear
+    // (ir_lower_tempo_test, Faktor 11 bei vierfacher Groesse).
+    if self._artVonTypname(p, l) >= 0 { return 0; }
+    var g: int64 := self._tregFind(p, l);
+    if g < 0 { return 0; }
+    var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
+    self.src := peek64(self._tregSrc + g * 8) as pchar;
+    self.nodes := peek64(self._tregNodes + g * 8);
+    self.nodeCount := peek64(self._tregCnt + g * 8);
+    var r: int64 := self._aliasGleit(peek64(self._tregIdx + g * 8), tiefe);
+    self.src := sS; self.nodes := sN; self.nodeCount := sC;
+    return r;
+  }
+
+  fn _aliasGleit(td: int64, tiefe: int64): int64 {
+    if (self.nodeIVal(td) & 2) == 0 { return 0; }   // kein Alias
+    var z: int64 := self.nodeC0(td);
+    if z < 0 || self.nodeKind(z) != NK_TYPE_NAME { return 0; }
+    return self._istGleitTypNameT(self.nodeSVal(z), self.nodeSLen(z), tiefe + 1);
   }
 
   // #2139: Ist das Ergebnis eines Aufrufs oder Feldzugriffs ein f64?
@@ -2488,7 +2530,7 @@ pub type IRLower = class {
     var tn: int64 := self._exprTypeNode(nd);
     if tn >= 0 {
       if self.nodeKind(tn) != NK_TYPE_NAME { return 0; }
-      return self.seq(self.nodeSVal(tn), self.nodeSLen(tn), "f64", 3);
+      return self._istGleitTypName(self.nodeSVal(tn), self.nodeSLen(tn));
     }
     if k == NK_FIELD {
       var fp: pchar := self.nodeSVal(nd);
@@ -2503,13 +2545,13 @@ pub type IRLower = class {
       var r: int64 := 0;
       var ft: int64 := self._fieldTypeNodeIn(peek64(self._tregIdx + g * 8), fp, fl);
       if ft >= 0 && self.nodeKind(ft) == NK_TYPE_NAME {
-        r := self.seq(self.nodeSVal(ft), self.nodeSLen(ft), "f64", 3);
+        r := self._istGleitTypName(self.nodeSVal(ft), self.nodeSLen(ft));
       }
       self.src := sS; self.nodes := sN; self.nodeCount := sC;
       return r;
     }
     if k != NK_CALL { return 0; }
-    if self._exprKlasse(nd) != 0 { return self.seq(self._ekP, self._ekL, "f64", 3); }
+    if self._exprKlasse(nd) != 0 { return self._istGleitTypName(self._ekP, self._ekL); }
     var cp: pchar := self.nodeSVal(nd);
     var cl: int64 := self.nodeSLen(nd);
     if self.nodeIVal(nd) == 0 {
@@ -2522,7 +2564,7 @@ pub type IRLower = class {
         if pt >= 0 && self.nodeKind(pt) == NK_FN_PTR {
           var rt: int64 := self.nodeC1(pt);
           if rt >= 0 && self.nodeKind(rt) == NK_TYPE_NAME {
-            return self.seq(self.nodeSVal(rt), self.nodeSLen(rt), "f64", 3);
+            return self._istGleitTypName(self.nodeSVal(rt), self.nodeSLen(rt));
           }
           return 0;
         }
@@ -2531,6 +2573,8 @@ pub type IRLower = class {
       // erzeugt (sqrt, fAdd…fDiv, fNeg, fAbs, peekf64). fEq/fLt/… und
       // fToInt liefern Ganzzahlen.
       if self.seq(cp, cl, "sqrt", 4) || self.seq(cp, cl, "peekf64", 7) { return 1; }
+      if self.seq(cp, cl, "peek32f", 7) { return 1; }   // #2160: liefert den Wert als double
+      if self.seq(cp, cl, "fFloor", 6) || self.seq(cp, cl, "fCeil", 5) || self.seq(cp, cl, "fRound", 6) { return 1; }   // #2160 (#1720: roundsd)
       if self.seq(cp, cl, "fAdd", 4) || self.seq(cp, cl, "fSub", 4) { return 1; }
       if self.seq(cp, cl, "fMul", 4) || self.seq(cp, cl, "fDiv", 4) { return 1; }
       if self.seq(cp, cl, "fNeg", 4) || self.seq(cp, cl, "fAbs", 4) { return 1; }
@@ -2557,7 +2601,7 @@ pub type IRLower = class {
       var ct: int64 := self.nodeC0(cd);
       var istF: int64 := 0;
       if ct >= 0 && self.nodeKind(ct) == NK_TYPE_NAME {
-        if self.seq(self.nodeSVal(ct), self.nodeSLen(ct), "f64", 3) { istF := 1; }
+        if self._istGleitTypName(self.nodeSVal(ct), self.nodeSLen(ct)) != 0 { istF := 1; }
       }
       if ct < 0 && self.nodeKind(self.nodeC1(cd)) == NK_LIT_FLOAT { istF := 1; }
       if istF == 0 { return 0; }
@@ -2595,6 +2639,32 @@ pub type IRLower = class {
   //
   // Erzeugt wird nur AND/XOR/SUB — ((t & maske) ^ vz) - vz —, also keine
   // Schiebung, deren Vorzeichenverhalten je Backend verschieden sein koennte.
+  // #2160: Ganzzahl in ein Gleitkommaziel — `var x: f64 := 3`, `x := 4`,
+  // `p.v := 2`. Bis 1.2.17A legte der IR-Weg die Ganzzahl als Bitmuster ab
+  // (gelesen 0.0). `istF` ist die Antwort fuer das Ziel (Typname oder
+  // _isF64Expr der linken Seite).
+  //
+  // Gewandelt wird nur ein NACHWEISLICH ganzzahliger Wert — Literal oder
+  // ganzzahlig faltbar (Konstante, Enum, `12 * 2`); mehr laesst sema fuer ein
+  // Gleitkommaziel ohnehin nicht zu. Ein "nein" von _isF64Expr heisst nur
+  // "nicht erkannt": der erste Anlauf wandelte `var r: f64 := m(4.0)` mit
+  // einem untypisierten Lambda-Local ein zweites Mal (closure_wert_test
+  // Fall 3) und `peek32f` ebenso. Dieselbe Abwaegung wie cg_retToF64 (#2004).
+  fn _nachGleit(t: int64, val: int64, istF: int64): int64 {
+    if t < 0 || val < 0 || istF == 0 { return t; }
+    if self.nodeKind(val) != NK_LIT_INT && self._constFaltbar(val) == 0 { return t; }
+    if self._isF64Expr(val) != 0 { return t; }
+    var d: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ITOF, d, t, -1, 0);
+    return d;
+  }
+
+  // Ist der Typknoten `tn` ein Gleitkommatyp (f64, f32, Alias)?
+  fn _tnGleit(tn: int64): int64 {
+    if tn < 0 || self.nodeKind(tn) != NK_TYPE_NAME { return 0; }
+    return self._istGleitTypName(self.nodeSVal(tn), self.nodeSLen(tn));
+  }
+
   fn _schmalKuerzen(t: int64, tn: int64): int64 {
     if t < 0 || tn < 0 { return t; }
     if self.nodeKind(tn) != NK_TYPE_NAME { return t; }
@@ -7419,6 +7489,17 @@ pub type IRLower = class {
   // cg_typeSize, dasselbe Vorzeichen wie cg_typeIsSignedNarrow auf x86 —
   // auch in Klassen, deren Felder acht Byte BELEGEN: x86 liest und schreibt
   // dort ebenfalls nur die Typbreite (CG_CFIELD_OFF_FLAGS).
+  // #2160: Ist der Feldtyp f32? Ein solches Feld belegt vier Byte
+  // (fieldTypeSize), der Wert im Register ist ein double (wie auf x86,
+  // #1127) — beim Lesen und Schreiben wird gewandelt. Bis 1.2.17A landeten
+  // die unteren vier Byte des double im Feld (0.25 -> 0). Ein Alias auf f32
+  // belegt wie auf x86 acht Byte und haelt den double unveraendert — dieselbe
+  // Abgrenzung wie cg_feldIstF32; die beiden muessen uebereinstimmen.
+  fn _tnIstF32(tn: int64): int64 {
+    if tn < 0 || self.nodeKind(tn) != NK_TYPE_NAME { return 0; }
+    return self.seq(self.nodeSVal(tn), self.nodeSLen(tn), "f32", 3);
+  }
+
   fn _feldArtVon(tn: int64): int64 {
     if tn < 0 { return 0; }
     if self.nodeKind(tn) != NK_TYPE_NAME { return 0; }
@@ -7622,6 +7703,7 @@ pub type IRLower = class {
   // WP-VMT-lyxos: +8 wenn die Klasse eine VMT hat (type-id @ Offset 0).
   fn _instanceFieldOffset(baseNode: int64, fp: pchar, fl: int64): int64 {
     self.letzteFeldArt := 0;   // #2147
+    self.letzteFeldF32 := 0;   // #2160
     // Fast-Path same-module/self: lokales decl direkt (kein Registry-Scan/ctx-Swap) — der
     // häufigste Fall (self.field). _baseClassDecl löst self→curMethodClassType O(1).
     var decl: int64 := self._baseClassDecl(baseNode);
@@ -7630,6 +7712,7 @@ pub type IRLower = class {
       if off >= 0 {
         if self._hasVmt(decl) != 0 { off := off + 8; }
         self.letzteFeldArt := self._feldArtVon(self._fieldTypeNodeIn(decl, fp, fl));
+        self.letzteFeldF32 := self._tnIstF32(self._fieldTypeNodeIn(decl, fp, fl));
       }
       return off;
     }
@@ -7652,8 +7735,10 @@ pub type IRLower = class {
       var sS: pchar := self.src; var sN: int64 := self.nodes; var sC: int64 := self.nodeCount;
       self.src := peek64(self._tregSrc + g * 8) as pchar; self.nodes := peek64(self._tregNodes + g * 8); self.nodeCount := peek64(self._tregCnt + g * 8);
       var ga: int64 := self._feldArtVon(self._fieldTypeNodeIn(peek64(self._tregIdx + g * 8), fp, fl));
+      var gf: int64 := self._tnIstF32(self._fieldTypeNodeIn(peek64(self._tregIdx + g * 8), fp, fl));
       self.src := sS; self.nodes := sN; self.nodeCount := sC;
       self.letzteFeldArt := ga;
+      self.letzteFeldF32 := gf;
     }
     return offg;
   }
@@ -8212,9 +8297,16 @@ pub type IRLower = class {
       }
     }
     var ifArt: int64 := self.letzteFeldArt;   // #2147 — vor lowerExpr, das sie ueberschreiben kann
+    var ifF32: int64 := self.letzteFeldF32;   // #2160
     var base: int64 := self.lowerExpr(baseNode);
     if ifOff >= 0 {
-      self.irAddInstrDirect(IRO_LOAD_FIELD, dest, base, ifOff, ifArt);
+      if ifF32 != 0 {
+        var ifRoh: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_LOAD_FIELD, ifRoh, base, ifOff, ifArt);
+        self.irAddInstrDirect(IRO_F32_ZU_F64, dest, ifRoh, -1, 0);   // #2160
+      } else {
+        self.irAddInstrDirect(IRO_LOAD_FIELD, dest, base, ifOff, ifArt);
+      }
     } else if self.genSubstN > 0 {
       // #2125: In einer Spezialisierung hat das Typargument kein solches
       // Feld (oder ist keine Klasse). Seit #2143 steht T immer fuer einen
@@ -8243,7 +8335,7 @@ pub type IRLower = class {
     var src: int64 := self.lowerExpr(self.nodeC0(expr));
     var tt: int64 := self.nodeC1(expr);
     var tgtF64: int64 := 0;
-    if tt >= 0 { tgtF64 := self.seq(self.nodeSVal(tt), self.nodeSLen(tt), "f64", 3); }
+    if tt >= 0 { tgtF64 := self._istGleitTypName(self.nodeSVal(tt), self.nodeSLen(tt)); }
     var srcF64: int64 := self._isF64Expr(self.nodeC0(expr));
     if tgtF64 != 0 {
       if srcF64 == 0 {
@@ -8612,6 +8704,7 @@ pub type IRLower = class {
         // #2139: auf die deklarierte Breite kuerzen, bevor der Wert im
         // 64-Bit-Slot landet (x86: cg_emitNarrowRax, #1151).
         vdTemp := self._schmalKuerzen(vdTemp, self._genSubst(self.nodeC0(stmt)));
+        vdTemp := self._nachGleit(vdTemp, vdInit, self._tnGleit(self._genSubst(self.nodeC0(stmt))));   // #2160
         // #2147: `var q: Pt := p` legt eine KOPIE an (x86: #1351). Nicht bei
         // einem Cast (`puffer as S` liest den Speicher als S) und nicht bei
         // `new` (frischer Speicher) — dieselben Ausnahmen wie auf x86.
@@ -9330,6 +9423,9 @@ pub type IRLower = class {
         // bis 1.2.16C lieferte `fn(x: int64): int8 { return x; }` 300 statt 44.
         if self.curFunc >= 0 && (self.nodeKind(self.curFunc) == NK_FUNC_DECL || self.nodeKind(self.curFunc) == NK_CLOSURE) {
           retTemp := self._schmalKuerzen(retTemp, self._genSubst(self.nodeC1(self.curFunc)));
+          // #2160: `return 2500;` in einer Funktion mit Gleitkomma-Rueckgabe —
+          // wie cg_retToF64 auf x86 (#2004); die beiden muessen uebereinstimmen.
+          retTemp := self._nachGleit(retTemp, retVal, self._tnGleit(self._genSubst(self.nodeC1(self.curFunc))));
         }
       }
       self.irAddInstrDirect(IRO_STORE_LOCAL, self.retValTemp, retTemp, -1, 0);
@@ -9379,6 +9475,7 @@ pub type IRLower = class {
           // Erfassung oder Modulvariable; _localTypeNode kennt alle vier
           // (wie cg_narrowKindOfVar auf x86, #1151).
           valTemp := self._schmalKuerzen(valTemp, self._localTypeNode(idName, idLen));
+          valTemp := self._nachGleit(valTemp, val, self._isF64Expr(target));   // #2160
           // #2147: `q := p` bei einem Wert-Struct kopiert den INHALT in den
           // Speicher, den q schon hat (x86: cg_emitStructKopieNach, #1351) —
           // statt q auf p umzubiegen. Ein Cast oder `new` rechts ist keine
@@ -9503,6 +9600,15 @@ pub type IRLower = class {
           var afFat: int64 := self._lowerMethodRef(val);
           self.irAddInstrDirect(IRO_STORE_FIELD, afOff, afFat, afBase, 0);
         } else if (afOff >= 0) {
+          var afArt: int64 := self.letzteFeldArt;   // _isF64Expr kann sie ueberschreiben
+          var afF32: int64 := self.letzteFeldF32;
+          valTemp := self._nachGleit(valTemp, val, self._isF64Expr(target));   // #2160
+          if afF32 != 0 {
+            var afS: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_F64_ZU_F32, afS, valTemp, -1, 0);   // #2160
+            valTemp := afS;
+          }
+          self.letzteFeldArt := afArt;
           // #2147: mit der Breite des Feldes — ein int8-Feld bekommt ein Byte,
           // nicht acht (das ueberschrieb die Nachbarfelder).
           self.irAddInstrDirect(IRO_STORE_FIELD, afOff, valTemp, afBase, self.letzteFeldArt);
@@ -10378,8 +10484,7 @@ pub type IRLower = class {
             var ggTy: int64 := self.nodeC0(ggCur);
             if ggTy >= 0 {
               if self.nodeKind(ggTy) == NK_TYPE_NAME {
-                if self.seq(self.nodeSVal(ggTy), self.nodeSLen(ggTy), "f64", 3) { ggIstF64 := 1; }
-                if self.seq(self.nodeSVal(ggTy), self.nodeSLen(ggTy), "f32", 3) { ggIstF64 := 1; }
+                if self._istGleitTypName(self.nodeSVal(ggTy), self.nodeSLen(ggTy)) != 0 { ggIstF64 := 1; }
               }
             }
             // #1801: Gleitkomma wird nicht GERECHNET, sondern als Bitmuster
@@ -10945,8 +11050,7 @@ pub type IRLower = class {
       if self.nodeKind(ini) == NK_LIT_FLOAT { fIst := 1; }
       if ty >= 0 {
         if self.nodeKind(ty) == NK_TYPE_NAME {
-          if self.seq(self.nodeSVal(ty), self.nodeSLen(ty), "f64", 3) { fIst := 1; }
-          if self.seq(self.nodeSVal(ty), self.nodeSLen(ty), "f32", 3) { fIst := 1; }
+          if self._istGleitTypName(self.nodeSVal(ty), self.nodeSLen(ty)) != 0 { fIst := 1; }
         }
       }
       if fIst != 0 {
@@ -11083,6 +11187,7 @@ pub type IRLower = class {
           // #2139: auf die deklarierte Breite — `var e8: int8 := f() * 60`
           // hielt 300 statt 44. Dieselbe Kuerzung wie beim Local.
           wert := self._schmalKuerzen(wert, self.nodeC0(d));
+          wert := self._nachGleit(wert, self.nodeC1(d), self._tnGleit(self.nodeC0(d)));   // #2160
         } else {
           var ty: int64 := self.nodeC0(d);
           var gr: int64 := 0;
