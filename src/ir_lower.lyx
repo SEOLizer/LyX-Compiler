@@ -1307,6 +1307,9 @@ pub type IRLower = class {
   // #2147: Zugriffsart (Breite | Vorzeichen << 8) des zuletzt ueber
   // _instanceFieldOffset aufgeloesten Feldes; 0 = acht Byte.
   letzteFeldArt: int64;
+  // #2157: Index der verborgenen Modulvariablen der Bump-Arena (cur; end
+  // liegt bei +1), -1 = noch nicht angelegt.
+  arenaGlob: int64;
 
   // #1693: Suchpfade fuer Importe. Die IR-Strecke hat sie bisher nicht
   // gekannt und jeden Import stur relativ zum ARBEITSVERZEICHNIS gelesen —
@@ -1452,6 +1455,7 @@ pub type IRLower = class {
     self.irArchCode := 0;
     self.irOsCode := 0;
     self.letzteFeldArt := 0;
+    self.arenaGlob := 0 - 1;
     var wbI: int64 := 0;
     while wbI < self.wantCap { poke8(self.wantBuf + wbI, 0); poke8(self.doneBuf + wbI, 0); wbI := wbI + 1; }
     self._tregCap := 1024;
@@ -7300,6 +7304,97 @@ pub type IRLower = class {
     return r;
   }
 
+  // #2157: Eine verborgene Modulvariable anlegen (Anfangswert 0) — dieselbe
+  // Bauart wie __lyx_restab_g im Vorpass. Liefert ihren Index.
+  fn _versteckteGlobale(np: pchar, nl: int64): int64 {
+    var schon: int64 := _irGlobalNamensIdx(self.ir, self.globalNameBuf, self.globalNameCnt, np as int64, nl);
+    if schon >= 0 { return schon; }
+    if self.globalNameCnt >= self.globalNameCap {
+      var gc: int64 := self.globalNameCap * 2;
+      var gb: int64 := alloc(gc * 32);
+      memcpy(gb, self.globalNameBuf, self.globalNameCnt * 32);
+      self.globalNameBuf := gb;
+      self.globalNameCap := gc;
+    }
+    var gr: int64 := self.globalNameBuf + self.globalNameCnt * 32;
+    poke64(gr + 0, self.irAddString(np, nl));
+    poke64(gr + GLOBAL_REC_OFF_NAMELEN, nl);
+    poke64(gr + GLOBAL_REC_OFF_IDX, self.globalNameCnt);
+    poke64(gr + GLOBAL_REC_OFF_INIT, 0);
+    var buf: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALBUF);
+    var cap: int64 := peek64(self.ir + IR_MOD_OFF_GLOBALCAP);
+    if self.globalNameCnt * 8 + 8 > cap {
+      var nc: int64 := cap * 2;
+      if nc < self.globalNameCnt * 8 + 8 { nc := self.globalNameCnt * 8 + 64; }
+      var nb: int64 := alloc(nc);
+      memcpy(nb, buf, self.globalNameCnt * 8);
+      buf := nb;
+      poke64(self.ir + IR_MOD_OFF_GLOBALBUF, buf);
+      poke64(self.ir + IR_MOD_OFF_GLOBALCAP, nc);
+    }
+    poke64(buf + self.globalNameCnt * 8, 0);
+    poke64(self.ir + IR_MOD_OFF_GLOBALLEN, self.globalNameCnt + 1);
+    var idx: int64 := self.globalNameCnt;
+    self.globalNameCnt += 1;
+    return idx;
+  }
+
+  // #2157: `bytes` Byte aus einer Bump-Arena — fuer Struct-Locals, Struct-
+  // Kopien (#2147) und feste Arrays. Bis 1.2.16E holte jede dieser
+  // Belegungen ein eigenes mmap (eine Seite, ein Systemaufruf) und gab es nie
+  // zurueck: eine Funktion mit Struct-Parameter, millionenfach gerufen,
+  // belegte je Aufruf 4 KB. Jetzt eine Addition; nachgelegt wird in
+  // 1-MiB-Bloecken (IRO_ALLOC, genullt). Dieselbe Idee wie
+  // cg_emitStructArenaAlloc auf x86 (#1580); freigegeben wird auch dort nicht.
+  // Grosse Belegungen (> 256 KiB) gehen weiter direkt an IRO_ALLOC.
+  // Nicht nebenlaeufigkeitsfest (x86 nimmt lock cmpxchg) — der IR-Weg hat
+  // keine atomaren Ladebefehle in dieser Folge.
+  fn _arenaAlloc(bytes: int64): int64 {
+    var n: int64 := (bytes + 15) / 16 * 16;
+    if n <= 0 { n := 16; }
+    if n > 262144 {
+      var gT: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, gT, -1, -1, n);
+      var gP: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_ALLOC, gP, gT, -1, 0);
+      return gP;
+    }
+    if self.arenaGlob < 0 {
+      self.arenaGlob := self._versteckteGlobale("__lyx_arena_cur"c, 15);
+    }
+    var gCur: int64 := self.arenaGlob;
+    var gEnd: int64 := self._versteckteGlobale("__lyx_arena_end"c, 15);
+    // p wird zweimal beschrieben — nur ueber STORE_LOCAL (siehe _mapZugriff).
+    var p: int64 := self.allocTemp();
+    var cur: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_GLOBAL, cur, gCur, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, p, cur, -1, 0);
+    var end: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_LOAD_GLOBAL, end, gEnd, -1, 0);
+    var nT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, nT, -1, -1, n);
+    var nxt: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, nxt, cur, nT, 0);
+    var lOk: int64 := self.genLabel();
+    var voll: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CMP_GT, voll, nxt, end, 0);
+    self.irEmitBrFalse(voll, lOk);
+    // Nachlegen (beim ersten Mal ist cur = end = 0, nxt = n > end).
+    var blkT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, blkT, -1, -1, 1048576);
+    var blk: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, blk, blkT, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, p, blk, -1, 0);
+    var nEnd: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, nEnd, blk, blkT, 0);
+    self.irAddInstrDirect(IRO_STORE_GLOBAL, gEnd, nEnd, -1, 0);
+    self.irEmitLabel(lOk);
+    var nCur: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, nCur, p, nT, 0);
+    self.irAddInstrDirect(IRO_STORE_GLOBAL, gCur, nCur, -1, 0);
+    return p;
+  }
+
   // #2147: `bytes` Byte ab src wortweise nach dst kopieren (dst existiert).
   fn _structKopieNach(dst: int64, src: int64, bytes: int64) {
     var w: int64 := 0;
@@ -7312,12 +7407,9 @@ pub type IRLower = class {
   }
 
   // #2147: Kopie in frischen Speicher; liefert den neuen Zeiger. Der Speicher
-  // kommt wie bei `var r: TStruct;` (#1835) aus IRO_ALLOC.
+  // kommt wie bei `var r: TStruct;` aus der Arena (#2157).
   fn _structKopie(src: int64, bytes: int64): int64 {
-    var szT: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_CONST_INT, szT, -1, -1, (bytes + 7) / 8 * 8);
-    var dst: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_ALLOC, dst, szT, -1, 0);
+    var dst: int64 := self._arenaAlloc(bytes);   // #2157
     self._structKopieNach(dst, src, bytes);
     return dst;
   }
@@ -8543,7 +8635,13 @@ pub type IRLower = class {
             self.irAddInstrDirect(IRO_CONST_INT, vdSzTemp, -1, -1, vdN * 8);
             // WP-ALIGN: @align(n) → Boundary aus iv-Bits 8+ (n direkt gespeichert); imm der ALLOC.
             var vdAlign: int64 := (self.nodeIVal(stmt) >> 8) & 0xFFFFFF;
-            self.irAddInstrDirect(IRO_ALLOC, vdSlot, vdSzTemp, -1, vdAlign);
+            if vdAlign <= 16 {
+              // #2157: aus der Arena (16-Byte-ausgerichtet) statt mmap je Aufruf.
+              var vdAr: int64 := self._arenaAlloc(vdN * 8);
+              self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdAr, -1, 0);
+            } else {
+              self.irAddInstrDirect(IRO_ALLOC, vdSlot, vdSzTemp, -1, vdAlign);
+            }
           }
         }
         // #1835: dasselbe fuer `var r: TStruct;`. Der Array-Fall daneben bekam
@@ -8584,9 +8682,9 @@ pub type IRLower = class {
             vdGr := self._tregStructGroesseG(self._tregFind(self.nodeSVal(vdType), self.nodeSLen(vdType)));
           }
           if vdGr > 0 {
-            var vdStTemp: int64 := self.allocTemp();
-            self.irAddInstrDirect(IRO_CONST_INT, vdStTemp, -1, -1, vdGr);
-            self.irAddInstrDirect(IRO_ALLOC, vdSlot, vdStTemp, -1, 0);
+            // #2157: aus der Arena statt eines mmap je Durchlauf.
+            var vdSt: int64 := self._arenaAlloc(vdGr);
+            self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdSt, -1, 0);
           }
         }
       }

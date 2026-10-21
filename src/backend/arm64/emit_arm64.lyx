@@ -37,15 +37,16 @@ pub con ARM64_X9:  int64 := 9;   // scratch
 pub con ARM64_X10: int64 := 10;  // scratch
 pub con ARM64_X11: int64 := 11;  // #1776: scratch
 // #1776: x19..x24 sind nach AAPCS64 callee-saved. Der erzeugte Code benutzt
-// sonst nur x0..x11, haelt also nie einen Wert in ihnen — der Formatierer darf
-// sie deshalb frei verwenden, ohne sie zu retten. Wer das aendert und dort
-// etwas ueber einen Aufruf hinweg haelt, muss sie im Prolog sichern.
+// sonst nur x0..x11. Der Formatierer (a64FloatToStr) benutzt sie und rettet
+// sie seit #2149 selbst — vorher verlor ein C-Aufrufer einer Lyx-.so dort
+// seine Werte.
 pub con ARM64_X19: int64 := 19;
 pub con ARM64_X20: int64 := 20;
 pub con ARM64_X21: int64 := 21;
 pub con ARM64_X22: int64 := 22;
 pub con ARM64_X23: int64 := 23;
 pub con ARM64_X24: int64 := 24;
+pub con ARM64_X28: int64 := 28;   // #2110: argv ab main; #2149: dort gerettet
 pub con ARM64_X29: int64 := 29;  // frame pointer (FP)
 pub con ARM64_X30: int64 := 30;  // link register (LR)
 pub con ARM64_XZR: int64 := 31;  // zero register / SP
@@ -88,6 +89,8 @@ pub type EmitARM64 = class {
   ir:              int64;
 
   stackSize:       int64;
+  // #2149: Versatz (zu x29) der Sicherung von x28 in main, 0 = keine.
+  x28Sicherung:    int64;
 
   // label address table: labelId -> byte offset in codeBuf
   labelAddrs:      int64;
@@ -325,7 +328,10 @@ pub type EmitARM64 = class {
     // callee-saved, der erzeugte Code benutzt es nie (s. emitPrologue), und
     // C-Code erhaelt es nach AAPCS64. Am Startrumpf selbst ginge es nicht:
     // glibc ruft main mit eigenen Werten in x19..x28.
-    if self.isMainFunc(funcId) != 0 { self.emit32(0xAA0103FC); }   // MOV x28, x1
+    if self.isMainFunc(funcId) != 0 {
+      self.emitStur(ARM64_X28, ARM64_X29, self.x28Sicherung);      // #2149: x28 retten
+      self.emit32(0xAA0103FC);                                     // MOV x28, x1
+    }
     // WP-AND-upstream-fix v7: spill incoming register args (x0..x7 per
     // AAPCS64) into stack slots 0..paramCount-1 so subsequent
     // IRO_LOAD_LOCAL of a parameter actually reads its value. Without
@@ -383,6 +389,17 @@ pub type EmitARM64 = class {
     if (sz & 15) != 0 {
       sz := (sz + 16) & -16;
     }
+    // #2149: main haelt argv in x28 (#2110) — x28 ist nach AAPCS64
+    // callee-saved, der Aufrufer von main darf es zurueck erwarten. Bis
+    // 1.2.16E wurde es ueberschrieben, ohne es zu retten (dieselbe Klasse wie
+    // s11 auf riscv, #2140). Die Sicherung liegt am UNTEREN Ende des Rahmens,
+    // unterhalb aller Slots; Aufrufe mit Stapelargumenten verschieben sp
+    // vorher und lassen sie unberuehrt.
+    self.x28Sicherung := 0;
+    if self.isMainFunc(funcId) != 0 {
+      sz := sz + 16;
+      self.x28Sicherung := 0 - sz;
+    }
     self.stackSize := sz;
   }
 
@@ -402,9 +419,9 @@ pub type EmitARM64 = class {
   //    TLS / shadow call stack) is never touched.
   //  - No MRS/MSR system-register access; TPIDR_EL0 and other system regs are
   //    untouched.
-  //  - Callee-saved regs (x19..x28) are not used, so we do not need to save them.
-  //    Ausnahme #2110: x28 traegt ab dem Eingang von main argv und wird danach
-  //    nur gelesen (GetArgC/GetArgV) — gerettet werden muss es nirgends.
+  //  - Callee-saved regs (x19..x28): x19..x24 benutzt nur der Formatierer und
+  //    rettet sie selbst (#2149). x28 traegt ab dem Eingang von main argv
+  //    (#2110); main rettet es im Rahmen und setzt es im Epilog zurueck (#2149).
   //  - DWARF CFI for stack unwinding is emitted by writeELFSharedLib via the
   //    .eh_frame section using funcAddrs + funcPrologueLen records.
   // -------------------------------------------------------------------------
@@ -456,6 +473,8 @@ pub type EmitARM64 = class {
   }
 
   fn emitEpilogue() {
+    // #2149: x28 in main zuruecksetzen (gerettet im Prolog).
+    if self.x28Sicherung != 0 { self.emitLdur(ARM64_X28, ARM64_X29, self.x28Sicherung); }
     // MOV sp, x29  (= ADD sp, x29, #0)  — 0x91000000|(29<<5)|31 = 0x910003BF
     self.emit32(0x910003BF);
     // LDP x29, x30, [sp], #16
@@ -2585,6 +2604,13 @@ pub type EmitARM64 = class {
 
   // f64 als Text in einen frischen Puffer; Zeiger nach x0.
   fn a64FloatToStr(bitsSlot: int64) {
+    // #2149: x19..x24 sind callee-saved. Der Formatierer benutzt sie, bis
+    // 1.2.16E ohne sie zu retten — unter Lyx-Aufrufern faellt das nicht auf
+    // (keiner haelt darin etwas), ein C-Aufrufer einer Lyx-.so verliert aber
+    // seine Werte. Gesichert unterhalb von sp, zurueck am Ende (lEnde).
+    self.emit32(0xA9BD53F3);                   // STP x19, x20, [sp, #-48]!
+    self.emit32(0xA9015BF5);                   // STP x21, x22, [sp, #16]
+    self.emit32(0xA90263F7);                   // STP x23, x24, [sp, #32]
     // Puffer aus mmap(0, 48, PROT_RW, MAP_PRIVATE|ANON)
     self.emitMovImmReg(ARM64_X0, 0);
     self.emitMovImmReg(ARM64_X1, 48);
@@ -2655,6 +2681,9 @@ pub type EmitARM64 = class {
 
     var lEnde: int64 := self.codeLen;
     self.emit32(0x3900029F);                   // STRB wzr, [x20]
+    self.emit32(0xA94263F7);                   // #2149: LDP x23, x24, [sp, #32]
+    self.emit32(0xA9415BF5);                   //        LDP x21, x22, [sp, #16]
+    self.emit32(0xA8C353F3);                   //        LDP x19, x20, [sp], #48
 
     self.poke32at(bKeinNan,  0x54000009 | ((((lKeinNan - bKeinNan) / 4) & 0x7FFFF) << 5));   // B.LS
     self.poke32at(bKeinInf,  0x54000001 | ((((lZahl - bKeinInf) / 4) & 0x7FFFF) << 5));      // B.NE
@@ -2666,6 +2695,72 @@ pub type EmitARM64 = class {
   }
 
   fn getFuncAddrs(): int64 { return self.funcAddrs; }   // WP-AND-02 Phase B: expose for export-table
+
+  // #2149: Huelle fuer eine exportierte Funktion mit Gleitkomma an der
+  // C-Schnittstelle (Gegenstueck zu cg_soEmitHuellen auf x86, #2124).
+  //
+  // Lyx uebergibt JEDES Argument der Reihe nach in x0..x7 (ein f64 als
+  // Bitmuster), C nach AAPCS64 Ganzzahlen in x0..x7 und Gleitkomma GETRENNT
+  // gezaehlt in d0..d7 (f32 in s0..s7). Bis 1.2.16E sprang das Symbol direkt
+  // in den Rumpf: C legte den Wert in d0, Lyx las x0 — still falsch.
+  //
+  // arten: zwei Bit je Parameter (0 Ganzzahl, 1 f64, 2 f32), rueck ebenso.
+  // Die Ganzzahlen ruecken von hinten nach vorn auf ihre Lyx-Position (das
+  // Ziel liegt nie vor der Quelle, also ueberschreibt keine Verschiebung eine
+  // noch ungelesene), danach kommen die Gleitkommawerte aus d/s in die Luecken.
+  // Liefert den Codeversatz der Huelle (das Symbol zeigt dorthin).
+  fn emitSoHuelle(funcId: int64, n: int64, arten: int64, rueck: int64): int64 {
+    if n > 8 {
+      EPrintStrLn("error: arm64 --shared: exportierte Funktion mit Gleitkomma und mehr als acht Parametern ist nicht umgesetzt (#2149)."c);
+      exit(1);
+    }
+    var start: int64 := self.codeLen;
+    self.emit32(0xA9BF7BFD);                   // STP x29, x30, [sp, #-16]!
+    self.emit32(0x910003FD);                   // MOV x29, sp
+    // Quellregister je Parameter bestimmen
+    var gi: int64 := 0;
+    var fi: int64 := 0;
+    var quelle: int64 := alloc(8 * 8);
+    var i: int64 := 0;
+    while i < n {
+      var a: int64 := (arten >> (i * 2)) & 3;
+      if a == 0 { poke64(quelle + i * 8, gi); gi := gi + 1; }
+      else { poke64(quelle + i * 8, fi); fi := fi + 1; }
+      i := i + 1;
+    }
+    // Ganzzahlen: von hinten nach vorn auf x_i
+    i := n - 1;
+    while i >= 0 {
+      if ((arten >> (i * 2)) & 3) == 0 {
+        var q: int64 := peek64(quelle + i * 8);
+        if q != i { self.emit32(0xAA0003E0 | (q << 16) | i); }   // MOV x_i, x_q
+      }
+      i := i - 1;
+    }
+    // Gleitkomma: d_q (bzw. s_q, erst nach double) nach x_i
+    i := 0;
+    while i < n {
+      var a2: int64 := (arten >> (i * 2)) & 3;
+      if a2 != 0 {
+        var q2: int64 := peek64(quelle + i * 8);
+        if a2 == 2 { self.emit32(0x1E22C000 | (q2 << 5) | q2); }   // FCVT d_q, s_q
+        self.emit32(0x9E660000 | (q2 << 5) | i);                    // FMOV x_i, d_q
+      }
+      i := i + 1;
+    }
+    free(quelle, 8 * 8);
+    // BL Rumpf
+    var ziel: int64 := peek64(self.funcAddrs + funcId * 8);
+    self.emit32(0x94000000 | (((ziel - self.codeLen) >> 2) & 0x3FFFFFF));
+    if rueck == 1 { self.emit32(0x9E670000); }                     // FMOV d0, x0
+    if rueck == 2 {
+      self.emit32(0x9E670000);                                     // FMOV d0, x0
+      self.emit32(0x1E624000);                                     // FCVT s0, d0
+    }
+    self.emit32(0xA8C17BFD);                   // LDP x29, x30, [sp], #16
+    self.emit32(0xD65F03C0);                   // RET
+    return start;
+  }
 
   // -------------------------------------------------------------------------
   // IR Module Helpers

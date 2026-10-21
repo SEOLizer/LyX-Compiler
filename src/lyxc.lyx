@@ -494,6 +494,11 @@ pub type CompilerConfig = class {
   // (Codegen.soExpTab). Gesetzt, nimmt buildExportList die Adresse von hier.
   x86SoExpTab:      int64;
   x86SoExpCount:    int64;
+  // #2149: arm64-.so — je exportierter Funktion mit Gleitkomma an der
+  // C-Schnittstelle 40 Byte {Knoten, Namenzeiger, Namenlaenge, n | arten<<8 |
+  // rueck<<32, Codeoffset der Huelle (-1 = noch keine)}.
+  armSoHuTab:       int64;
+  armSoHuCount:     int64;
   // Backing store for Java_*-mangled names produced by @jni (Phase B2). Grows as needed.
   mangledNamesBuf:  int64;
   mangledNamesLen:  int64;
@@ -653,6 +658,8 @@ pub type CompilerConfig = class {
     self.outputType       := OUTPUT_TYPE_EXECUTABLE;
     self.exportBuf        := 0;
     self.exportCount      := 0;
+    self.armSoHuTab       := 0;   // #2149
+    self.armSoHuCount     := 0;
     self.mangledNamesBuf  := 0;
     self.mangledNamesLen  := 0;
     self.mangledNamesCap  := 0;
@@ -1568,7 +1575,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.2.16E"c);
+      PrintStrLn("1.2.17A"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1590,7 +1597,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.2.16E"c);
+      PrintStrLn("1.2.17A"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1819,7 +1826,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.2.16E (bootstrap)");
+    PrintStrLn("lyxc 1.2.17A (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -2826,10 +2833,12 @@ pub type CompilerConfig = class {
     if self.target == LYX_TC_X86_64 {
       codeBuffer := self.emitX86_64(irMod as int64, lower);
     } else if self.target == LYX_TC_ARM64 {
+      if self.outputType == OUTPUT_TYPE_SHARED_LIB { self._armSoSignaturen(parser, astRoot); }   // #2149
       codeBuffer := self.emitARM64(irMod as int64);
     } else if self.target == LYX_TC_ANDROID_ARM64 {
       // WP-AND-01: Android target registered; routes to Linux ARM64 backend.
       // Bionic-specific ABI (TLS, stack alignment, .eh_frame) is WP-AND-03.
+      if self.outputType == OUTPUT_TYPE_SHARED_LIB { self._armSoSignaturen(parser, astRoot); }   // #2149
       codeBuffer := self.emitARM64(irMod as int64);
     } else if self.target == LYX_TC_ANDROID_X86_64 {
       // WP-AND-01: Android x86_64 routes to Linux x86_64 backend (emulator target).
@@ -3042,6 +3051,19 @@ pub type CompilerConfig = class {
         emitter.setSharedLib(1);
       }
       emitter.emit();
+      // #2149: Huellen fuer Exporte mit Gleitkomma — hinter dem Code, BEVOR
+      // dessen Laenge abgeholt wird.
+      self.irModulePtr := irMod;
+      var hu: int64 := 0;
+      while hu < self.armSoHuCount {
+        var hr: int64 := self.armSoHuTab + hu * 40;
+        var hFid: int64 := self._shlibFuncIdx(peek64(hr + 8), peek64(hr + 16));
+        if hFid >= 0 {
+          var hSig: int64 := peek64(hr + 24);
+          poke64(hr + 32, emitter.emitSoHuelle(hFid, hSig & 255, (hSig >> 8) & 65535, (hSig >> 32) & 3));
+        }
+        hu += 1;
+      }
       var irCodeLen: int64 := emitter.getCodeLen();
       var irCodeBuf: int64 := emitter.getCodeBuf();
       // WP-AND-02 Phase B: expose funcAddrs for export-table building.
@@ -3089,7 +3111,11 @@ pub type CompilerConfig = class {
       // 56: IR-emitted code (main...)
       //
       // For static binaries or --no-libc-init, use the original 12-byte stub.
-      if self.armExternCount > 0 && !self.noLibcInit {
+      // #2149: NICHT auf Android. Bionic hat kein __libc_start_main (und keine
+      // libc.so.6); dort initialisiert der Lader libc.so selbst, und der
+      // kurze Startrumpf darunter ruft main direkt. Bis 1.2.16E verlangte
+      // jedes android-arm64-Programm mit extern fn den glibc-Startweg.
+      if self.armExternCount > 0 && !self.noLibcInit && self.target != LYX_TC_ANDROID_ARM64 {
         // #2112: Der Puffer war fest 128 KiB gross. Hier wurde wenigstens
         // abgewiesen (mit einem `return;` ohne Wert), im statischen Zweig
         // darunter lief memcpy still darueber hinaus.
@@ -3718,6 +3744,79 @@ pub type CompilerConfig = class {
   // folgenden Exporte rutschten eine Funktion weiter. Jetzt: extern-
   // Deklarationen zaehlen nicht, die Adresse kommt ueber den NAMEN aus der
   // IR-Funktionstabelle (_shlibFuncIdx).
+  // #2149: Gleitkommaart eines Typknotens an der C-Schnittstelle: 1 = f64,
+  // 2 = f32, 0 = Ganzzahl. Ueber Aliase und Einheiten dieser Unit wie bei der
+  // Maske von `extern fn` (Parser._sigFloatName) — die beiden muessen
+  // uebereinstimmen.
+  fn _armSoArt(parser: Parser, tn: int64): int64 {
+    if tn < 0 { return 0; }
+    var off: int64 := parser.nodes + tn * PARSER_NODE_SIZE;
+    if peek64(off) != NK_TYPE_NAME { return 0; }
+    var p: int64 := (parser.src as int64) + peek64(off + NODE_OFF_SVAL);
+    var l: int64 := peek64(off + NODE_OFF_SLEN);
+    if l == 3 && peek8(p) == 102 && peek8(p + 1) == 54 && peek8(p + 2) == 52 { return 1; }
+    if l == 3 && peek8(p) == 102 && peek8(p + 1) == 51 && peek8(p + 2) == 50 { return 2; }
+    return parser._sigFloatName(p as pchar, l, 0);
+  }
+
+  // #2149: f32 an der C-Schnittstelle einer arm64-.so wird abgewiesen. Die
+  // Huelle koennte es wandeln (FCVT), aber f32 rechnet auf dem IR-Weg selbst
+  // noch falsch (#2160) — eine umgewandelte Zahl ginge in eine falsche
+  // Rechnung. Laut statt eines richtig aussehenden Aufrufs.
+  fn _armSoF32Fehler(parser: Parser, ni: int64): void {
+    var off: int64 := parser.nodes + ni * PARSER_NODE_SIZE;
+    EPrintStr("error: arm64 --shared: exportierte Funktion `"c);
+    sys_write(2, (parser.src as int64) + peek64(off + NODE_OFF_SVAL), peek64(off + NODE_OFF_SLEN));
+    EPrintStrLn("` hat f32 an der C-Schnittstelle — auf dem IR-Weg nicht umgesetzt (#2149, #2160); f64 benutzen."c);
+    exit(1);
+  }
+
+  // #2149: Signaturen der exportierten Funktionen mit Gleitkomma (dieselbe
+  // Auswahl wie buildExportList) fuer emitARM64 vormerken.
+  fn _armSoSignaturen(parser: Parser, astRoot: int64): void {
+    var cap: int64 := 16;
+    self.armSoHuTab := alloc(cap * 40);
+    self.armSoHuCount := 0;
+    var cur: int64 := astRoot;
+    while cur >= 0 {
+      var off: int64 := parser.nodes + cur * PARSER_NODE_SIZE;
+      if peek64(off) == NK_FUNC_DECL && self._shlibIstExtern(parser, cur) == 0
+         && (peek64(off + NODE_OFF_IVAL) & (ANNO_EXPORT_FN | ANNO_JNI)) != 0 {
+        var n: int64 := 0;
+        var arten: int64 := 0;
+        var hatF: int64 := 0;
+        var pp: int64 := peek64(off + NODE_OFF_C0);
+        while pp >= 0 {
+          var a: int64 := self._armSoArt(parser, peek64(parser.nodes + pp * PARSER_NODE_SIZE + NODE_OFF_C0));
+          if a != 0 { hatF := 1; }
+          if a == 2 { self._armSoF32Fehler(parser, cur); }
+          if n < 8 { arten := arten | (a << (n * 2)); }
+          n := n + 1;
+          pp := peek64(parser.nodes + pp * PARSER_NODE_SIZE + NODE_OFF_NEXT);
+        }
+        var r: int64 := self._armSoArt(parser, peek64(off + NODE_OFF_C1));
+        if r != 0 { hatF := 1; }
+        if r == 2 { self._armSoF32Fehler(parser, cur); }
+        if hatF != 0 {
+          if self.armSoHuCount >= cap {
+            var nc: int64 := cap * 2;
+            var nb: int64 := alloc(nc * 40);
+            memcpy(nb, self.armSoHuTab, self.armSoHuCount * 40);
+            self.armSoHuTab := nb; cap := nc;
+          }
+          var rec: int64 := self.armSoHuTab + self.armSoHuCount * 40;
+          poke64(rec, cur);
+          poke64(rec + 8, (parser.src as int64) + peek64(off + NODE_OFF_SVAL));
+          poke64(rec + 16, peek64(off + NODE_OFF_SLEN));
+          poke64(rec + 24, n | (arten << 8) | (r << 32));
+          poke64(rec + 32, 0 - 1);
+          self.armSoHuCount := self.armSoHuCount + 1;
+        }
+      }
+      cur := peek64(off + NODE_OFF_NEXT);
+    }
+  }
+
   fn buildExportList(parser: Parser, astRoot: int64): void {
     var EXPORT_MASK: int64 := ANNO_EXPORT_FN | ANNO_JNI;   // #2117: nicht Bit 0 (= extern)
 
@@ -3781,6 +3880,13 @@ pub type CompilerConfig = class {
               exit(1);
             }
             addr := peek64(self.codeFuncAddrs + funcId * 8) + self.codeStubOff;
+            // #2149: Gleitkomma an der Schnittstelle → das Symbol zeigt auf die Huelle.
+            var hk: int64 := 0;
+            while hk < self.armSoHuCount {
+              var hrk: int64 := self.armSoHuTab + hk * 40;
+              if peek64(hrk) == cur && peek64(hrk + 32) >= 0 { addr := peek64(hrk + 32) + self.codeStubOff; }
+              hk += 1;
+            }
           }
           var namePtr: int64 := 0;
           var nameLen: int64 := 0;
@@ -3874,6 +3980,9 @@ pub type CompilerConfig = class {
     var codeFileOff: int64 := 4096;
     var interpOff: int64 := 232;     // after ELF hdr (64) + 3 phdrs (3*56)
     var interpStr: pchar := "/lib/ld-linux-aarch64.so.1";
+    // #2149: Android laedt ueber /system/bin/linker64 — mit dem glibc-Lader
+    // als PT_INTERP startete kein android-arm64-Programm mit extern fn.
+    if self.target == LYX_TC_ANDROID_ARM64 { interpStr := "/system/bin/linker64"; }
     var interpLen: int64 := StrLen(interpStr) + 1;
     var nExt: int64 := self.armExternCount;
     var strBuf: int64 := peek64(self.irModulePtr + IR_MOD_OFF_STRBUF);   // IR string table
@@ -4007,6 +4116,8 @@ pub type CompilerConfig = class {
     var gblCountD: int64 := 0;
     if self.irModulePtr != 0 { gblCountD := peek64(self.irModulePtr + IR_MOD_OFF_GLOBALLEN); }
     var gblOffD: int64 := ((dynOff + dynSize + 7) >> 3) << 3;
+    // #2157: eigene Seite, wie im statischen Schreiber (dort begruendet).
+    if gblCountD > 0 { gblOffD := ((gblOffD + 4095) >> 12) << 12; }
     var fileSize: int64 := gblOffD + gblCountD * 8;
 
     var buf: int64 := alloc(fileSize);
@@ -4163,6 +4274,13 @@ pub type CompilerConfig = class {
       gblCount := peek64(self.irModulePtr + IR_MOD_OFF_GLOBALLEN);
     }
     var gblFileOff: int64 := ((codeFileOffset + size + 7) / 8) * 8;
+    // #2157: Die Modulvariablen auf eine EIGENE Seite. Lagen sie in der
+    // letzten Codeseite, war jeder Schreibzugriff ein Schreiben in Code —
+    // qemu-user verwirft dann die uebersetzten Bloecke dieser Seite (gemessen:
+    // 100 000 Zuweisungen an eine Globale 5,5 s), und ein echter Kern muss
+    // die Zeile zwischen Daten- und Befehlscache abgleichen. Die Arena der
+    // Struct-Belegung schreibt zwei Globale je Belegung.
+    if gblIsArm && gblCount > 0 { gblFileOff := ((codeFileOffset + size + 4095) / 4096) * 4096; }
     var gblSize:    int64 := gblCount * 8;
     var elfSize: int64 := gblFileOff + gblSize;
 
@@ -6105,7 +6223,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.2.16E — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.2.17A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
