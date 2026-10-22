@@ -21187,6 +21187,183 @@ pub type Codegen = class {
     return src;
   }
 
+  // ===========================================================================
+  // #2192: VEX-Praefix. Schnitt 1 — der Encoder fuer sich, noch OHNE Nutzung.
+  //
+  // AVX2 wird erkannt (#2187) und nirgends emittiert: im ganzen Compiler gab
+  // es kein einziges VEX-kodiertes Wort. Der Encoder ist die Voraussetzung
+  // dafuer, und er wird hier zuerst allein nachgewiesen, weil ein falsch
+  // gesetztes Bit keinen Fehler erzeugt, sondern einen ANDEREN gueltigen
+  // Befehl. Bei der NEON-Tabelle aus #2185 waren vier von vier Woertern
+  // falsch, und drei davon sahen wie gueltige Befehle aus; VEX hat sechs
+  // Felder statt zweier.
+  //
+  // Aufbau (Intel SDM 2.3). Zwei Formen:
+  //
+  //   zweibyteig  C5 | ~R vvvv~ L pp
+  //   dreibyteig  C4 | ~R ~X ~B mmmmm | W vvvv~ L pp
+  //
+  // Die kurze Form geht nur, wenn X und B unbenutzt sind, W = 0 ist und die
+  // Opcode-Karte 0F lautet; sonst die lange. R, X, B und vvvv stehen
+  // INVERTIERT im Praefix — ein Feld, das man vergisst zu invertieren,
+  // adressiert ein anderes Register, ohne dass etwas auffaellt.
+  //
+  //   r, x, b   die oberen Registerbits (je 0 oder 1)
+  //   vvvv      zweiter Quelloperand, 0..15 (bei unaeren Formen 0)
+  //   l         0 = 128 Bit (xmm), 1 = 256 Bit (ymm)
+  //   pp        0 = kein Praefix, 1 = 66, 2 = F3, 3 = F2
+  //   mm        1 = 0F, 2 = 0F 38, 3 = 0F 3A
+  //   w         wie REX.W
+  // ===========================================================================
+  fn cg_vexPrefix(r: int64, x: int64, b: int64, vvvv: int64,
+                  l: int64, pp: int64, mm: int64, w: int64) {
+    if (r < 0 || r > 1 || x < 0 || x > 1 || b < 0 || b > 1) {
+      EPrintStrLn("interner fehler: cg_vexPrefix: r/x/b sind je 0 oder 1 (#2192)."c);
+      exit(1);
+    }
+    if (vvvv < 0 || vvvv > 15) {
+      EPrintStrLn("interner fehler: cg_vexPrefix: vvvv ausserhalb 0..15 (#2192)."c);
+      exit(1);
+    }
+    if (l < 0 || l > 1 || pp < 0 || pp > 3 || mm < 1 || mm > 3 || w < 0 || w > 1) {
+      EPrintStrLn("interner fehler: cg_vexPrefix: l/pp/mm/w ausserhalb des Bereichs (#2192)."c);
+      exit(1);
+    }
+    var nv: int64 := (15 - vvvv) & 15;   // vvvv invertiert
+    if (x == 0 && b == 0 && w == 0 && mm == 1) {
+      // zweibyteige Form
+      self.cg_e8(0xC5);
+      self.cg_e8((((1 - r) & 1) << 7) | (nv << 3) | (l << 2) | pp);
+      return;
+    }
+    self.cg_e8(0xC4);
+    self.cg_e8((((1 - r) & 1) << 7) | (((1 - x) & 1) << 6) | (((1 - b) & 1) << 5) | mm);
+    self.cg_e8((w << 7) | (nv << 3) | (l << 2) | pp);
+  }
+
+  // #2192: eine vollstaendige Register-Register-Form.
+  //   dst   Zielregister 0..15      (ModRM.reg, oberes Bit nach VEX.R)
+  //   src1  erster Quelloperand     (VEX.vvvv)
+  //   src2  zweiter Quelloperand    (ModRM.rm, oberes Bit nach VEX.B)
+  // Unaere Formen (nur dst und src2) geben src1 = 0 an.
+  fn cg_vexOpRR(opcode: int64, dst: int64, src1: int64, src2: int64,
+                l: int64, pp: int64, mm: int64, w: int64) {
+    if (dst < 0 || dst > 15 || src1 < 0 || src1 > 15 || src2 < 0 || src2 > 15) {
+      EPrintStrLn("interner fehler: cg_vexOpRR: Register ausserhalb 0..15 (#2192)."c);
+      exit(1);
+    }
+    self.cg_vexPrefix(dst >> 3, 0, src2 >> 3, src1, l, pp, mm, w);
+    self.cg_e8(opcode);
+    self.cg_e8(0xC0 | ((dst & 7) << 3) | (src2 & 7));   // ModRM: reg-direkt
+  }
+
+  // #2192: Selbsttest des Encoders. Gibt je Zeile den erwarteten Befehl und
+  // die erzeugten Bytes aus:
+  //
+  //   vaddps ymm0, ymm1, ymm2	c5 f4 58 c2
+  //
+  // tests/vex_encoder_test.sh liest die Bytes zurueck und laesst sie von
+  // llvm-mc DISASSEMBLIEREN, statt sie mit einer Liste zu vergleichen, die
+  // ich selbst getippt habe. Nur so ist belegt, dass die Kodierung den
+  // gemeinten Befehl ergibt und nicht einen anderen gueltigen — und nur so
+  // faellt eine ungueltige Kodierung ueberhaupt auf (llvm-mc nennt sie
+  // ausdruecklich "invalid instruction encoding"; genau daran hing #2185).
+  //
+  // Die Tabelle deckt bewusst die Faelle ab, in denen sich Felder verwechseln
+  // lassen: beide Praefixformen, hohe Register (R und B), alle drei
+  // Opcode-Karten, W = 1, beide Breiten und die drei pp-Werte.
+  pub fn cg_vexSelftest() {
+    self.codeLen := 0;
+    var von: int64 := 0;
+
+    // -- zweibyteige Form, Karte 0F, pp = 0 --
+    von := self.codeLen; self.cg_vexOpRR(0x58, 0, 1, 2, 1, 0, 1, 0);
+    self.cg_vexZeile("vaddps ymm0, ymm1, ymm2"c, von);
+    von := self.codeLen; self.cg_vexOpRR(0x58, 0, 1, 2, 0, 0, 1, 0);
+    self.cg_vexZeile("vaddps xmm0, xmm1, xmm2"c, von);
+    von := self.codeLen; self.cg_vexOpRR(0x5C, 3, 4, 5, 1, 0, 1, 0);
+    self.cg_vexZeile("vsubps ymm3, ymm4, ymm5"c, von);
+    von := self.codeLen; self.cg_vexOpRR(0x59, 6, 7, 1, 1, 0, 1, 0);
+    self.cg_vexZeile("vmulps ymm6, ymm7, ymm1"c, von);
+    von := self.codeLen; self.cg_vexOpRR(0x5E, 2, 3, 4, 1, 0, 1, 0);
+    self.cg_vexZeile("vdivps ymm2, ymm3, ymm4"c, von);
+    von := self.codeLen; self.cg_vexOpRR(0x10, 0, 0, 1, 1, 0, 1, 0);
+    self.cg_vexZeile("vmovups ymm0, ymm1"c, von);
+
+    // -- pp = 1 (66): die f64-Formen --
+    von := self.codeLen; self.cg_vexOpRR(0x58, 0, 1, 2, 1, 1, 1, 0);
+    self.cg_vexZeile("vaddpd ymm0, ymm1, ymm2"c, von);
+    von := self.codeLen; self.cg_vexOpRR(0x5E, 1, 2, 3, 1, 1, 1, 0);
+    self.cg_vexZeile("vdivpd ymm1, ymm2, ymm3"c, von);
+
+    // -- pp = 2 (F3) und pp = 3 (F2): die skalaren Formen --
+    von := self.codeLen; self.cg_vexOpRR(0x58, 0, 1, 2, 0, 2, 1, 0);
+    self.cg_vexZeile("vaddss xmm0, xmm1, xmm2"c, von);
+    von := self.codeLen; self.cg_vexOpRR(0x58, 0, 1, 2, 0, 3, 1, 0);
+    self.cg_vexZeile("vaddsd xmm0, xmm1, xmm2"c, von);
+
+    // -- hohe Register: erzwingen die dreibyteige Form ueber R bzw. B --
+    von := self.codeLen; self.cg_vexOpRR(0x58, 8, 1, 2, 1, 0, 1, 0);
+    self.cg_vexZeile("vaddps ymm8, ymm1, ymm2"c, von);
+    von := self.codeLen; self.cg_vexOpRR(0x58, 0, 1, 10, 1, 0, 1, 0);
+    self.cg_vexZeile("vaddps ymm0, ymm1, ymm10"c, von);
+    von := self.codeLen; self.cg_vexOpRR(0x58, 12, 13, 14, 1, 0, 1, 0);
+    self.cg_vexZeile("vaddps ymm12, ymm13, ymm14"c, von);
+
+    // -- Karte 0F 38 (mm = 2): dort liegen die FMA-Formen (#2193) --
+    von := self.codeLen; self.cg_vexOpRR(0xA8, 0, 1, 2, 1, 1, 2, 0);
+    self.cg_vexZeile("vfmadd213ps ymm0, ymm1, ymm2"c, von);
+    von := self.codeLen; self.cg_vexOpRR(0xA8, 0, 1, 2, 1, 1, 2, 1);
+    self.cg_vexZeile("vfmadd213pd ymm0, ymm1, ymm2"c, von);
+
+    // -- W = 1 auf Karte 0F (vpermilpd braucht sie nicht, vpsllq schon) --
+    von := self.codeLen; self.cg_vexOpRR(0xF3, 0, 1, 2, 1, 1, 1, 1);
+    self.cg_vexZeile("vpsllq ymm0, ymm1, xmm2"c, von);
+
+    // -- VZEROUPPER --
+    von := self.codeLen; self.cg_vexZeroupper();
+    self.cg_vexZeile("vzeroupper"c, von);
+  }
+
+  // #2192: eine Zeile des Selbsttests — Name, Tabulator, Bytes in Hex.
+  fn cg_vexZeile(name: pchar, von: int64) {
+    PrintStr(name);
+    PrintStr("\t"c);
+    var i: int64 := von;
+    while (i < self.codeLen) {
+      var b: int64 := peek8(self.code + i) as int64;
+      self.cg_vexHexByte(b);
+      if (i + 1 < self.codeLen) { PrintStr(" "c); }
+      i := i + 1;
+    }
+    PrintStr("\n"c);
+  }
+
+  fn cg_vexHexByte(b: int64) {
+    var hi: int64 := (b >> 4) & 15;
+    var lo: int64 := b & 15;
+    self.cg_vexHexZiffer(hi);
+    self.cg_vexHexZiffer(lo);
+  }
+
+  fn cg_vexHexZiffer(d: int64) {
+    var buf: int64 := alloc(2);
+    if (d < 10) { poke8(buf, 48 + d); } else { poke8(buf, 97 + d - 10); }
+    poke8(buf + 1, 0);
+    PrintStr(buf as pchar);
+    free(buf, 2);
+  }
+
+  // #2192: VZEROUPPER. Gehoert zum Encoder und nicht zum spaeteren Vektorpfad,
+  // weil die Regel dazu eine Eigenschaft der Kodierung ist: wer 256-Bit-Code
+  // emittiert und vor der Rueckkehr in SSE-Code den oberen Teil nicht loescht,
+  // zahlt den Zustandswechsel bei JEDEM folgenden SSE-Befehl — oft mehr, als
+  // die breiten Vektoren eingebracht haben. VEX.128, kein Operand.
+  fn cg_vexZeroupper() {
+    self.cg_vexPrefix(0, 0, 0, 0, 0, 0, 1, 0);
+    self.cg_e8(0x77);
+  }
+
   // #2191: Deckt die wirksame CPU-Stufe die verlangte Faehigkeit?
   //
   // Die Stufen sind aufsteigend gedacht: avx2 kann alles, was sse4 kann. Wer
