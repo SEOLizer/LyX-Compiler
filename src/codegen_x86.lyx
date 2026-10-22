@@ -1045,7 +1045,19 @@ pub type Codegen = class {
   zlFrA: int64; zlFrT: int64;    // cg_funcRetTypeName
   zlLbA: int64; zlLbT: int64;    // cg_findLabel
   zlCoA: int64; zlCoT: int64;    // cg_findConIdx
-  zlLnA: int64; zlLnT: int64;    // cg_lineOf (gescannte Zeichen)
+  zlLnA: int64; zlLnT: int64;    // cg_lineOf (Suchschritte + einmal gelesene Zeichen, #2175)
+  // #2175: Zeilenanfaenge je Quelltext fuer cg_lineOf. Eintrag (32 Byte):
+  // Quelltextzeiger, Laenge, Zeiger auf die aufsteigenden Offsets aller '\n',
+  // deren Anzahl. lnLetzt = zuletzt benutzter Eintrag.
+  lnTab: int64; lnAnz: int64; lnCap: int64; lnLetzt: int64;
+  // #2175: Namensindex (cg_hxNeu) fuer Marken, Modulkonstanten und die
+  // Rueckgabetyp-Registry. Er liefert den ERSTEN Eintrag eines Namens, wie
+  // die lineare Suche davor; die Tabellen werden nur angehaengt.
+  lbHx: int64; coHx: int64; frHx: int64;
+  zlHxS: int64;                  // #2175: verglichene Eintraege in cg_hxSuch (fuer die Zaehler)
+  // #2175: Funktionsindex der obersten Ebene je (Knotentabelle, Kopf,
+  // Quelltext), siehe cg_tlEintrag. Eintrag 48 Byte.
+  tlTab: int64; tlAnz: int64; tlCap: int64; tlLetzt: int64;
   // #2114: belegt gerade ein linker Operand r11 (cg_lhsRhsNachRbxRax)?
   r11Belegt: int64;
   outerFuncName:    pchar;  // name of outer function (for static link)
@@ -3396,14 +3408,66 @@ pub type Codegen = class {
   fn cg_lineOf(ni: int64): int64 {
     var soff: int64 := self.cg_nsoff(ni);
     if (soff <= 0) { return 1; }
-    if (self.zlAktiv != 0) { self.zlLnA += 1; self.zlLnT += soff; }   // #2174
-    var line: int64 := 1;
-    var i: int64 := 0;
-    while (i < soff) {
-      if (StrCharAt(self.pSrc, i) == 10) { line := line + 1; }
-      i += 1;
+    if (self.zlAktiv != 0) { self.zlLnA += 1; }   // #2174
+    // #2175: Zeile = 1 + Zahl der '\n' vor soff, binaer in der Tabelle der
+    // Zeilenumbrueche gesucht. Bis 1.2.18B zaehlte jeder Aufruf vom
+    // Dateianfang: beim Selbstbau 1,3 Mrd gelesene Zeichen.
+    var e: int64 := self.cg_lnEintrag();
+    if (soff > peek64(e + 8)) {
+      // hinter dem Textende (kann nicht vorkommen) — wie frueher zaehlen
+      var line: int64 := 1;
+      var i: int64 := 0;
+      while (i < soff) {
+        if (StrCharAt(self.pSrc, i) == 10) { line := line + 1; }
+        i += 1;
+      }
+      return line;
     }
-    return line;
+    var nl: int64 := peek64(e + 16);
+    var lo: int64 := 0;
+    var hi: int64 := peek64(e + 24);   // erstes '\n' mit Offset >= soff liegt in [lo, hi]
+    while (lo < hi) {
+      var mid: int64 := (lo + hi) >> 1;
+      if (self.zlAktiv != 0) { self.zlLnT += 1; }   // #2174/#2175
+      if (peek64(nl + mid * 8) < soff) { lo := mid + 1; } else { hi := mid; }
+    }
+    return lo + 1;
+  }
+
+  // #2175: Tabelleneintrag zum aktuellen Quelltext self.pSrc; beim ersten
+  // Zugriff wird der Text einmal durchlaufen. Quelltexte liegen in der Arena
+  // und werden nicht veraendert, der Zeiger ist also ein tragfaehiger Schluessel.
+  fn cg_lnEintrag(): int64 {
+    var key: int64 := self.pSrc as int64;
+    if (self.lnAnz > 0) {
+      var le: int64 := self.lnTab + self.lnLetzt * 32;
+      if (peek64(le) == key) { return le; }
+    }
+    var k: int64 := 0;
+    while (k < self.lnAnz) {
+      if (peek64(self.lnTab + k * 32) == key) { self.lnLetzt := k; return self.lnTab + k * 32; }
+      k += 1;
+    }
+    if (self.lnAnz >= self.lnCap) {
+      var nc: int64 := self.lnCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.lnTab, self.lnAnz * 32);
+      self.lnTab := nb; self.lnCap := nc;
+    }
+    var len: int64 := StrLen(self.pSrc);
+    var anz: int64 := 0;
+    var i: int64 := 0;
+    while (i < len) { if (StrCharAt(self.pSrc, i) == 10) { anz += 1; } i += 1; }
+    if (self.zlAktiv != 0) { self.zlLnT += len; }   // #2174/#2175: einmaliger Durchlauf
+    var nl: int64 := alloc(anz * 8 + 8);
+    var j: int64 := 0;
+    i := 0;
+    while (i < len) { if (StrCharAt(self.pSrc, i) == 10) { poke64(nl + j * 8, i); j += 1; } i += 1; }
+    var e: int64 := self.lnTab + self.lnAnz * 32;
+    poke64(e, key); poke64(e + 8, len); poke64(e + 16, nl); poke64(e + 24, anz);
+    self.lnLetzt := self.lnAnz;
+    self.lnAnz += 1;
+    return e;
   }
 
   fn cg_addLabel(name: pchar, nlen: int64, lineNum: int64) {
@@ -3419,20 +3483,92 @@ pub type Codegen = class {
     poke64(base + CG_LABEL_OFF_NAMELEN,  nlen);
     poke64(base + CG_LABEL_OFF_CODEOFF, self.codeLen);
     poke64(base + CG_LABEL_OFF_LINENUM, lineNum);
+    self.lbHx := self.cg_hxEin(self.lbHx, self.labels, CG_LABEL_SZ, CG_LABEL_OFF_NAMELEN, self.labelCount);   // #2175
     self.labelCount += 1;
   }
 
   fn cg_findLabel(name: pchar, nlen: int64): int64 {
-    if (self.zlAktiv != 0) { self.zlLbA += 1; self.zlLbT += self.labelCount; }   // #2174
+    var hs0: int64 := self.zlHxS;
+    var i: int64 := self.cg_hxSuch(self.lbHx, self.labels, CG_LABEL_SZ, CG_LABEL_OFF_NAMELEN, name, nlen);   // #2175
+    if (self.zlAktiv != 0) { self.zlLbA += 1; self.zlLbT += self.zlHxS - hs0; }   // #2174
+    if (i < 0) { return -1; }
+    return peek64(self.labels + i * CG_LABEL_SZ + CG_LABEL_OFF_CODEOFF);
+  }
+
+  // ------------------------------------------------------------------
+  // #2175: Namensindex ueber eine angehaengte Tabelle (Eintrag: Namenszeiger
+  // bei +0, Laenge bei lenOff, Schrittweite stride). Offene Adressierung,
+  // Platz = Index des ERSTEN Eintrags dieses Namens; ein spaeterer gleich-
+  // namiger Eintrag wird nicht aufgenommen — dasselbe Ergebnis wie die
+  // lineare Suche von vorn, die cg_findLabel & Co. bis 1.2.18B machten.
+  // Kopf: [0] Plaetze (Zweierpotenz), [8] belegt; ab 16 die Plaetze (-1 = frei).
+  // ------------------------------------------------------------------
+  fn cg_hxNeu(plaetze: int64): int64 {
+    var hx: int64 := alloc(16 + plaetze * 8);
+    poke64(hx, plaetze); poke64(hx + 8, 0);
     var i: int64 := 0;
-    while (i < self.labelCount) {
-      var base: int64 := self.labels + i * CG_LABEL_SZ;
-      var sname: pchar := peek64(base) as pchar;
-      var slen:  int64 := peek64(base + CG_LABEL_OFF_NAMELEN);
-      if (self.cg_seq(sname, slen, name, nlen)) { return peek64(base + CG_LABEL_OFF_CODEOFF); }
-      i += 1;
+    while (i < plaetze) { poke64(hx + 16 + i * 8, 0 - 1); i += 1; }
+    return hx;
+  }
+
+  fn cg_hxHash(name: pchar, nlen: int64): int64 {
+    var h: int64 := 0 - 3750763034362895579;   // FNV-1a, wie Sema._symHash
+    var i: int64 := 0;
+    while (i < nlen) { h := (h ^ (StrCharAt(name, i) & 255)) * 1099511628211; i += 1; }
+    return h ^ (h >> 29);
+  }
+
+  fn cg_hxSuch(hx: int64, tab: int64, stride: int64, lenOff: int64, name: pchar, nlen: int64): int64 {
+    var maske: int64 := peek64(hx) - 1;
+    var h: int64 := self.cg_hxHash(name, nlen) & maske;
+    while (true) {
+      var v: int64 := peek64(hx + 16 + h * 8);
+      if (v < 0) { return 0 - 1; }
+      if (self.zlAktiv != 0) { self.zlHxS += 1; }
+      var b: int64 := tab + v * stride;
+      if (self.cg_seq(peek64(b) as pchar, peek64(b + lenOff), name, nlen)) { return v; }
+      h := (h + 1) & maske;
     }
-    return -1;
+    return 0 - 1;
+  }
+
+  // Eintrag idx aufnehmen; liefert den (bei Bedarf vergroesserten) Index.
+  fn cg_hxEin(hx: int64, tab: int64, stride: int64, lenOff: int64, idx: int64): int64 {
+    var plaetze: int64 := peek64(hx);
+    if ((peek64(hx + 8) + 1) * 2 > plaetze) {
+      var neu: int64 := self.cg_hxNeu(plaetze * 2);
+      var nm: int64 := plaetze * 2 - 1;
+      var k: int64 := 0;
+      while (k < plaetze) {
+        var w: int64 := peek64(hx + 16 + k * 8);
+        if (w >= 0) {
+          var wb: int64 := tab + w * stride;
+          var wh: int64 := self.cg_hxHash(peek64(wb) as pchar, peek64(wb + lenOff)) & nm;
+          while (peek64(neu + 16 + wh * 8) >= 0) { wh := (wh + 1) & nm; }
+          poke64(neu + 16 + wh * 8, w);
+        }
+        k += 1;
+      }
+      poke64(neu + 8, peek64(hx + 8));
+      hx := neu; plaetze := plaetze * 2;
+    }
+    var maske: int64 := plaetze - 1;
+    var eb: int64 := tab + idx * stride;
+    var name: pchar := peek64(eb) as pchar;
+    var nlen: int64 := peek64(eb + lenOff);
+    var h: int64 := self.cg_hxHash(name, nlen) & maske;
+    while (true) {
+      var v: int64 := peek64(hx + 16 + h * 8);
+      if (v < 0) {
+        poke64(hx + 16 + h * 8, idx);
+        poke64(hx + 8, peek64(hx + 8) + 1);
+        return hx;
+      }
+      var b: int64 := tab + v * stride;
+      if (self.cg_seq(peek64(b) as pchar, peek64(b + lenOff), name, nlen)) { return hx; }   // erster bleibt
+      h := (h + 1) & maske;
+    }
+    return hx;
   }
 
   // ------------------------------------------------------------------
@@ -3483,6 +3619,7 @@ pub type Codegen = class {
     poke8(self.conIsPchar + self.conCount, 0);
     poke8(self.conIsF64 + self.conCount, 0);
     poke8(self.conIsStrAddr + self.conCount, 0);   // #2026
+    self.coHx := self.cg_hxEin(self.coHx, self.conTable, CG_CON_SZ, CG_CON_OFF_NAMELEN, self.conCount);   // #2175
     self.conCount += 1;
   }
 
@@ -3492,15 +3629,9 @@ pub type Codegen = class {
       name := peek64(self.cgUnitPrivVTab + pvI * 32 + 16) as pchar;
       nlen := peek64(self.cgUnitPrivVTab + pvI * 32 + 24);
     }
-    var i: int64 := 0;
-    while (i < self.conCount) {
-      var base: int64 := self.conTable + i * CG_CON_SZ;
-      var ename: pchar := peek64(base) as pchar;
-      var elen:  int64 := peek64(base + CG_CON_OFF_NAMELEN);
-      if (self.cg_seq(ename, elen, name, nlen) != 0) { return peek64(base + CG_CON_OFF_VAL); }
-      i += 1;
-    }
-    return -1;
+    var i: int64 := self.cg_hxSuch(self.coHx, self.conTable, CG_CON_SZ, CG_CON_OFF_NAMELEN, name, nlen);   // #2175
+    if (i < 0) { return -1; }
+    return peek64(self.conTable + i * CG_CON_SZ + CG_CON_OFF_VAL);
   }
 
   // Returns 1 if constant exists, 0 if not (avoids -1 sentinel confusion with FD_NONE=-1)
@@ -3510,34 +3641,21 @@ pub type Codegen = class {
       name := peek64(self.cgUnitPrivVTab + pvI * 32 + 16) as pchar;
       nlen := peek64(self.cgUnitPrivVTab + pvI * 32 + 24);
     }
-    var i: int64 := 0;
-    while (i < self.conCount) {
-      var base: int64 := self.conTable + i * CG_CON_SZ;
-      var ename: pchar := peek64(base) as pchar;
-      var elen:  int64 := peek64(base + CG_CON_OFF_NAMELEN);
-      if (self.cg_seq(ename, elen, name, nlen) != 0) { return 1; }
-      i += 1;
-    }
+    if (self.cg_hxSuch(self.coHx, self.conTable, CG_CON_SZ, CG_CON_OFF_NAMELEN, name, nlen) >= 0) { return 1; }   // #2175
     return 0;
   }
 
   // Returns the index of a constant in conTable, or -1 if not found.
   fn cg_findConIdx(name: pchar, nlen: int64): int64 {
-    if (self.zlAktiv != 0) { self.zlCoA += 1; self.zlCoT += self.conCount; }   // #2174
     var pvI: int64 := self.cg_privIdx(name, nlen);   // #2097/#2099
     if (pvI >= 0) {
       name := peek64(self.cgUnitPrivVTab + pvI * 32 + 16) as pchar;
       nlen := peek64(self.cgUnitPrivVTab + pvI * 32 + 24);
     }
-    var i: int64 := 0;
-    while (i < self.conCount) {
-      var base: int64 := self.conTable + i * CG_CON_SZ;
-      var ename: pchar := peek64(base) as pchar;
-      var elen:  int64 := peek64(base + CG_CON_OFF_NAMELEN);
-      if (self.cg_seq(ename, elen, name, nlen) != 0) { return i; }
-      i += 1;
-    }
-    return -1;
+    var hs0: int64 := self.zlHxS;
+    var ci: int64 := self.cg_hxSuch(self.coHx, self.conTable, CG_CON_SZ, CG_CON_OFF_NAMELEN, name, nlen);   // #2175
+    if (self.zlAktiv != 0) { self.zlCoA += 1; self.zlCoT += self.zlHxS - hs0; }   // #2174
+    return ci;
   }
 
   // Add a pchar string constant: stores data offset in conTable and marks conIsPchar.
@@ -5833,7 +5951,13 @@ pub type Codegen = class {
     poke64(base + 8,  nameLen);
     poke64(base + 16, retName as int64);
     poke64(base + 24, retLen);
+    self.frHx := self.cg_hxEin(self.frHx, self.fnRetList, 32, 8, self.fnRetCount);   // #2175
     self.fnRetCount += 1;
+  }
+
+  // #2175: erster Registry-Eintrag einer Funktion oder -1.
+  fn cg_funcRetIdx(name: pchar, nameLen: int64): int64 {
+    return self.cg_hxSuch(self.frHx, self.fnRetList, 32, 8, name, nameLen);
   }
 
   // #1122: die beiden Elementtypen eines Tupel-Rueckgabetyps vermerken.
@@ -5894,18 +6018,13 @@ pub type Codegen = class {
   }
 
   fn cg_funcRetTypeIs(name: pchar, nameLen: int64, tname: pchar, tlen: int64): int64 {
-    var i: int64 := 0;
-    while (i < self.fnRetCount) {
+    var i: int64 := self.cg_funcRetIdx(name, nameLen);   // #2175
+    if (i >= 0) {
       var base: int64 := self.fnRetList + i * 32;
-      var n: pchar := peek64(base) as pchar;
-      var l: int64 := peek64(base + 8);
-      if (self.cg_seq(n, l, name, nameLen) != 0) {
-        var rn: pchar := peek64(base + 16) as pchar;
-        var rl: int64 := peek64(base + 24);
-        if (self.cg_seq(rn, rl, tname, tlen) != 0) { return 1; }
-        return 0;
-      }
-      i += 1;
+      var rn: pchar := peek64(base + 16) as pchar;
+      var rl: int64 := peek64(base + 24);
+      if (self.cg_seq(rn, rl, tname, tlen) != 0) { return 1; }
+      return 0;
     }
     return 0 - 1;   // Funktion unbekannt (Builtin oder importiert)
   }
@@ -5915,18 +6034,14 @@ pub type Codegen = class {
   // importiert). cg_funcRetTypeIs beantwortet nur "ist es DIESER Typ" und
   // taugt deshalb nicht, um einen Klassennamen zu uebernehmen.
   fn cg_funcRetTypeName(name: pchar, nameLen: int64, lenBox: int64): pchar {
-    if (self.zlAktiv != 0) { self.zlFrA += 1; self.zlFrT += self.fnRetCount; }   // #2174
     poke64(lenBox, 0);
-    var i: int64 := 0;
-    while (i < self.fnRetCount) {
+    var hs0: int64 := self.zlHxS;
+    var i: int64 := self.cg_funcRetIdx(name, nameLen);   // #2175
+    if (self.zlAktiv != 0) { self.zlFrA += 1; self.zlFrT += self.zlHxS - hs0; }   // #2174
+    if (i >= 0) {
       var base: int64 := self.fnRetList + i * 32;
-      var n: pchar := peek64(base) as pchar;
-      var l: int64 := peek64(base + 8);
-      if (self.cg_seq(n, l, name, nameLen) != 0) {
-        poke64(lenBox, peek64(base + 24));
-        return peek64(base + 16) as pchar;
-      }
-      i += 1;
+      poke64(lenBox, peek64(base + 24));
+      return peek64(base + 16) as pchar;
     }
     return 0 as pchar;
   }
@@ -5947,17 +6062,12 @@ pub type Codegen = class {
   }
 
   fn cg_funcRetClassIdx(name: pchar, nameLen: int64): int64 {
-    var i: int64 := 0;
-    while (i < self.fnRetCount) {
+    var i: int64 := self.cg_funcRetIdx(name, nameLen);   // #2175
+    if (i >= 0) {
       var base: int64 := self.fnRetList + i * 32;
-      var n: pchar := peek64(base) as pchar;
-      var l: int64 := peek64(base + 8);
-      if (self.cg_seq(n, l, name, nameLen) != 0) {
-        var rn: pchar := peek64(base + 16) as pchar;
-        var rl: int64 := peek64(base + 24);
-        return self.cg_findClass(rn, rl);
-      }
-      i += 1;
+      var rn: pchar := peek64(base + 16) as pchar;
+      var rl: int64 := peek64(base + 24);
+      return self.cg_findClass(rn, rl);
     }
     return 0 - 1;
   }
@@ -10652,19 +10762,14 @@ pub type Codegen = class {
     if (k == CGN_CALL && self.cg_nival(ni) == 0) {
       var cnm: pchar := self.cg_nsval(ni);
       var cnl: int64 := self.cg_nslen(ni);
-      var j: int64 := 0;
-      while (j < self.fnRetCount) {
+      var j: int64 := self.cg_funcRetIdx(cnm, cnl);   // #2175
+      if (j >= 0) {
         var rb: int64 := self.fnRetList + j * 32;
-        var rn: pchar := peek64(rb) as pchar;
-        var rl: int64 := peek64(rb + 8);
-        if (self.cg_seq(rn, rl, cnm, cnl)) {
-          var rt: pchar := peek64(rb + 16) as pchar;
-          var rtl: int64 := peek64(rb + 24);
-          if (rt == 0 as pchar || rtl <= 0) { return 0 as pchar; }
-          self.stnLen := rtl;
-          return rt;
-        }
-        j += 1;
+        var rt: pchar := peek64(rb + 16) as pchar;
+        var rtl: int64 := peek64(rb + 24);
+        if (rt == 0 as pchar || rtl <= 0) { return 0 as pchar; }
+        self.stnLen := rtl;
+        return rt;
       }
       return 0 as pchar;
     }
@@ -13702,16 +13807,87 @@ pub type Codegen = class {
   // Dieselbe Frage wie _eigeneUnitDefiniert in ir_lower.lyx — die beiden
   // muessen uebereinstimmen.
   fn cg_eigeneUnitDefiniert(fname: pchar, fnlen: int64): int64 {
-    var d: int64 := self.topLevelHead;
+    // #2175: aus dem Funktionsindex statt durch Ablaufen der obersten Ebene
+    if (self.topLevelHead < 0) { return 0; }
+    var e: int64 := self.cg_tlEintrag();
+    var i: int64 := self.cg_hxSuch(peek64(e + 32), peek64(e + 24), 32, 8, fname, fnlen);
+    if (i < 0) { return 0; }
+    return peek64(peek64(e + 24) + i * 32 + 24);
+  }
+
+  // #2175: erste Funktionsdeklaration der obersten Ebene mit diesem Namen
+  // (Knotenindex) oder -1 — was cg_genCall bis 1.2.18B je Aufruf durch
+  // Ablaufen der ganzen Ebene ermittelte.
+  fn cg_tlErsteFunc(fname: pchar, fnlen: int64): int64 {
+    if (self.topLevelHead < 0) { return 0 - 1; }
+    var e: int64 := self.cg_tlEintrag();
+    var i: int64 := self.cg_hxSuch(peek64(e + 32), peek64(e + 24), 32, 8, fname, fnlen);
+    if (i < 0) { return 0 - 1; }
+    return peek64(peek64(e + 24) + i * 32 + 16);
+  }
+
+  // #2175: Funktionsindex der obersten Ebene, beim ersten Zugriff in einem
+  // Durchlauf gebaut. Schluessel: Knotentabelle, Kopf und Quelltext — der
+  // Codegen schreibt nie in die Knoten, die Ebene aendert sich also nicht.
+  // Eintrag: [0] pNodes, [8] Kopf, [16] pSrc, [24] Namenstabelle, [32] Index.
+  // Namenstabelle je Name (32 Byte): Zeiger, Laenge, ERSTE Deklaration,
+  // 1 wenn irgendeine gleichnamige einen Rumpf hat (cg_eigeneUnitDefiniert).
+  fn cg_tlEintrag(): int64 {
+    var kn: int64 := self.pNodes;
+    var kh: int64 := self.topLevelHead;
+    var ks: int64 := self.pSrc as int64;
+    if (self.tlAnz > 0) {
+      var le: int64 := self.tlTab + self.tlLetzt * 48;
+      if (peek64(le) == kn && peek64(le + 8) == kh && peek64(le + 16) == ks) { return le; }
+    }
+    var k: int64 := 0;
+    while (k < self.tlAnz) {
+      var ke: int64 := self.tlTab + k * 48;
+      if (peek64(ke) == kn && peek64(ke + 8) == kh && peek64(ke + 16) == ks) { self.tlLetzt := k; return ke; }
+      k += 1;
+    }
+    if (self.tlAnz >= self.tlCap) {
+      var nc: int64 := self.tlCap * 2;
+      var nb: int64 := alloc(nc * 48);
+      memcpy(nb, self.tlTab, self.tlAnz * 48);
+      self.tlTab := nb; self.tlCap := nc;
+    }
+    var cap: int64 := 64;
+    var tab: int64 := alloc(cap * 32);
+    var anz: int64 := 0;
+    var hx: int64 := self.cg_hxNeu(128);
+    var d: int64 := kh;
     while (d >= 0) {
       if (self.cg_nkind(d) == CGN_FUNC_DECL) {
+        var dn: pchar := self.cg_nsval(d);
+        var dl: int64 := self.cg_nslen(d);
+        // Dieselbe Rumpfpruefung wie bisher (siehe Kommentar ueber
+        // cg_eigeneUnitDefiniert, #1287).
         var rumpf: int64 := self.cg_nc2(d);
-        if (rumpf >= 0 && self.cg_nkind(rumpf) != CGN_CAPABILITY_ATTR
-            && self.cg_seq(self.cg_nsval(d), self.cg_nslen(d), fname, fnlen)) { return 1; }
+        var hatRumpf: int64 := 0;
+        if (rumpf >= 0 && self.cg_nkind(rumpf) != CGN_CAPABILITY_ATTR) { hatRumpf := 1; }
+        var vi: int64 := self.cg_hxSuch(hx, tab, 32, 8, dn, dl);
+        if (vi >= 0) {
+          if (hatRumpf != 0) { poke64(tab + vi * 32 + 24, 1); }
+        } else {
+          if (anz >= cap) {
+            var nt: int64 := alloc(cap * 2 * 32);
+            memcpy(nt, tab, anz * 32);
+            tab := nt; cap := cap * 2;
+          }
+          var b: int64 := tab + anz * 32;
+          poke64(b, dn as int64); poke64(b + 8, dl); poke64(b + 16, d); poke64(b + 24, hatRumpf);
+          hx := self.cg_hxEin(hx, tab, 32, 8, anz);
+          anz += 1;
+        }
       }
       d := self.cg_nnext(d);
     }
-    return 0;
+    var e: int64 := self.tlTab + self.tlAnz * 48;
+    poke64(e, kn); poke64(e + 8, kh); poke64(e + 16, ks); poke64(e + 24, tab); poke64(e + 32, hx);
+    self.tlLetzt := self.tlAnz;
+    self.tlAnz += 1;
+    return e;
   }
 
   fn cg_builtinArity(name: pchar, nlen: int64): int64 {
@@ -14412,24 +14588,7 @@ pub type Codegen = class {
     if (isMethod == 0 && nestDecl >= 0) {
       cgDefFuncNi := nestDecl;   // #2044: die innere, nicht die gleichnamige Modulfunktion
     } else if (isMethod == 0 && self.topLevelHead >= 0) {
-      var cgScan: int64 := self.topLevelHead;
-      while (cgScan >= 0) {
-        if (self.cg_nkind(cgScan) == CGN_FUNC_DECL) {
-          if (self.cg_nslen(cgScan) == fnlen) {
-            var cgFN: pchar := self.cg_nsval(cgScan);
-            var cgMatch: int64 := 1;
-            var cgJ: int64 := 0;
-            while (cgJ < fnlen) {
-              if (cgMatch != 0) {
-                if (StrCharAt(cgFN, cgJ) != StrCharAt(fname, cgJ)) { cgMatch := 0; }
-              }
-              cgJ += 1;
-            }
-            if (cgMatch != 0) { cgDefFuncNi := cgScan; cgScan := -2; }
-          }
-        }
-        if (cgScan >= 0) { cgScan := self.cg_nnext(cgScan); }
-      }
+      cgDefFuncNi := self.cg_tlErsteFunc(fname, fnlen);   // #2175
     }
 
     // #1252: Aufruf mit benanntem Argument UND einer Luecke, die ein
@@ -25450,7 +25609,10 @@ pub type Codegen = class {
     self.zlAktiv := 0; self.zlImpNs := 0; self.zlImpN := 0; self.zlTiefe := 0;   // #2174
     self.zlFlA := 0; self.zlFlV := 0; self.zlFiA := 0; self.zlFiV := 0; self.zlFuA := 0; self.zlFuV := 0;
     self.zlFrA := 0; self.zlFrT := 0; self.zlLbA := 0; self.zlLbT := 0;
-    self.zlCoA := 0; self.zlCoT := 0; self.zlLnA := 0; self.zlLnT := 0;
+    self.zlCoA := 0; self.zlCoT := 0; self.zlLnA := 0; self.zlLnT := 0; self.zlHxS := 0;
+    self.lnCap := 16; self.lnTab := alloc(self.lnCap * 32); self.lnAnz := 0; self.lnLetzt := 0;   // #2175
+    self.lbHx := self.cg_hxNeu(1024); self.coHx := self.cg_hxNeu(256); self.frHx := self.cg_hxNeu(256);
+    self.tlCap := 16; self.tlTab := alloc(self.tlCap * 48); self.tlAnz := 0; self.tlLetzt := 0;
     self.methodAliasList  := alloc(self.methodAliasCap * 16);
     self.methodAliasCount := 0;
     self.fnAliasCap   := 64;
