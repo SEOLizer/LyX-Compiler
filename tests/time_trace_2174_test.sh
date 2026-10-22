@@ -54,7 +54,7 @@ s, c, o = ev["sema"].get("args", {}), ev["codegen-x86_64"].get("args", {}), d["o
 pruef = {
   "sema.importe_units": s.get("importe_units", 0) >= 1,
   "sema.Lookup_aufrufe": s.get("Lookup_aufrufe", 0) > 0,
-  "sema.Lookup_tabelle": s.get("Lookup_tabelle", 0) >= s.get("Lookup_aufrufe", 1),
+  "sema.Lookup_vergleiche": s.get("Lookup_vergleiche", 0) > 0,
   "codegen.importe_units": c.get("importe_units", 0) >= 1,
   "codegen.findLocal_aufrufe": c.get("findLocal_aufrufe", 0) > 0,
   "codegen.findLocalIdx_vergleiche": c.get("findLocalIdx_vergleiche", 0) >= c.get("findLocalIdx_aufrufe", 1),

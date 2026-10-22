@@ -254,6 +254,7 @@ pub type SymRecord = struct {
 };
 
 pub con SEMA_SYM_SIZE: int64 := 48;
+con SEMA_SYMH_BUCKETS: int64 := 8192;   // #2175: Zweierpotenz, Buckets der Symbol-Hash-Ketten
 
 
 // AST node field offsets (SEMA_NODE_SIZE = 88)
@@ -460,7 +461,15 @@ pub type Sema = class {
   zlImpNs: int64;    // Zeit in _sema_processImport (aeusserste Ebene)
   zlImpN:  int64;    // verarbeitete Units (_sema_markImported)
   zlTiefe: int64;
-  zlLkA: int64; zlLkT: int64;    // Lookup: Aufrufe, Tabellengroesse beim Aufruf
+  zlLkA: int64; zlLkT: int64;    // Lookup: Aufrufe, verglichene Eintraege (#2175)
+  // #2175: Hash-Ketten ueber die Symboltabelle. symHHead[b] = juengstes
+  // Symbol im Bucket b (-1 = leer), symHNext[i] = naechstaelteres Symbol im
+  // selben Bucket, symHBkt[i] = Bucket von Symbol i. Gepflegt in _pushSym
+  // und _popScope; Lookup laeuft nur die Kette ab.
+  symHHead: int64;
+  symHNext: int64;
+  symHBkt:  int64;
+  symHCap:  int64;
 
   // #1028: Register der von Imports EXPORTIERTEN Symbole. Je Eintrag 32 Byte:
   //  +0  namePtr:8    Symbolname (nicht null-terminiert)
@@ -727,8 +736,38 @@ pub type Sema = class {
     self.symCap := newCap;
   }
 
+  // #2175: Streuwert eines Namens (FNV-1a, 64 Bit); _symHash kuerzt ihn auf
+  // die Bucketzahl der Symboltabelle.
+  fn _symHashVoll(name: pchar, nameLen: int64): int64 {
+    var h: int64 := 0 - 3750763034362895579;   // 14695981039346656037 als int64
+    var i: int64 := 0;
+    while (i < nameLen) {
+      h := (h ^ (peek8((name as int64) + i) & 255)) * 1099511628211;
+      i += 1;
+    }
+    return h ^ (h >> 29);
+  }
+
+  fn _symHash(name: pchar, nameLen: int64): int64 {
+    return self._symHashVoll(name, nameLen) & (SEMA_SYMH_BUCKETS - 1);
+  }
+
   fn _pushSym(name: pchar, nameLen: int64, kind: int64, typeId: int64, nodeIdx: int64) {
     if (self.symCount >= self.symCap) { self._growSyms(); }
+    // #2175: in die Hash-Kette einhaengen (vorn = juengstes)
+    if (self.symCount >= self.symHCap) {
+      var nhc: int64 := self.symHCap * 2;
+      while (nhc <= self.symCount) { nhc := nhc * 2; }
+      var nn: int64 := alloc(nhc * 8);
+      var nk: int64 := alloc(nhc * 8);
+      memcpy(nn, self.symHNext, self.symHCap * 8);
+      memcpy(nk, self.symHBkt, self.symHCap * 8);
+      self.symHNext := nn; self.symHBkt := nk; self.symHCap := nhc;
+    }
+    var shb: int64 := self._symHash(name, nameLen);
+    poke64(self.symHNext + self.symCount * 8, peek64(self.symHHead + shb * 8));
+    poke64(self.symHBkt + self.symCount * 8, shb);
+    poke64(self.symHHead + shb * 8, self.symCount);
     self.syms[self.symCount].name       := name;
     self.syms[self.symCount].nameLen    := nameLen;
     self.syms[self.symCount].kind       := kind;
@@ -820,16 +859,23 @@ pub type Sema = class {
     return 0;
   }
 
+  // #2175: Lookup laeuft die Hash-Kette des Namens ab, juengstes Symbol
+  // zuerst — dieselbe Reihenfolge wie der fruehere Lauf von symCount-1
+  // abwaerts, nur ohne die Symbole anderer Namen. Bis 1.2.18B durchsuchte
+  // jeder Aufruf die ganze Tabelle: beim Selbstbau 953 Mio Eintraege in
+  // 425 000 Aufrufen, ~35 % der Uebersetzungszeit (#2174).
   fn Lookup(name: pchar, nameLen: int64): int64 {
-    if (self.zlAktiv != 0) { self.zlLkA += 1; self.zlLkT += self.symCount; }   // #2174
-    var i: int64 := self.symCount - 1;
+    if (self.zlAktiv != 0) { self.zlLkA += 1; }   // #2174
+    var i: int64 := peek64(self.symHHead + self._symHash(name, nameLen) * 8);
     var privHit: int64 := 0 - 1;   // #1035: erster Treffer, der unit-privat ist
     while (i >= 0) {
       var sName: pchar  := self.SymName(i);
       var sLen:  int64  := self.SymNameLen(i);
+      var iNext: int64  := peek64(self.symHNext + i * 8);
+      if (self.zlAktiv != 0) { self.zlLkT += 1; }   // #2174/#2175
       if (self._strNEq(sName, sLen, name, nameLen)) {
         // #1262: aus einem fremden Namensraum — unsichtbar ohne Qualifizierung.
-        if (self._symAliasVisible(i) == 0) { i -= 1; continue; }
+        if (self._symAliasVisible(i) == 0) { i := iNext; continue; }
         // #1035: Ein importiertes Symbol OHNE pub ist unit-intern und fuer den
         // Importeur nicht sichtbar. Es wird uebersprungen, die Suche laeuft
         // weiter — damit bindet `import std.alloc; alloc(16)` an die oeffentliche
@@ -838,12 +884,12 @@ pub type Sema = class {
         // oeffentliche Fassung gibt, wird gemeldet.
         if (self.privEnforce != 0 && i < self.privCap && peek8(self.privFlags + i) != 0) {
           if (privHit < 0) { privHit := i; }
-          i -= 1;
+          i := iNext;
           continue;
         }
         return i;
       }
-      i -= 1;
+      i := iNext;
     }
     // #1035: nur ein privater Treffer, keine oeffentliche Fassung — melden.
     if (privHit >= 0) {
@@ -875,7 +921,21 @@ pub type Sema = class {
   fn _popScope() {
     if (self.scopeDepth <= 0) { PrintStr("sema: scope underflow\n"); return; }
     self.scopeDepth -= 1;
-    self.symCount   := peek64(self.scopes + self.scopeDepth * 8);
+    var neu: int64 := peek64(self.scopes + self.scopeDepth * 8);
+    // #2175: die verworfenen Symbole aus ihren Hash-Ketten aushaengen. Sie
+    // wurden in aufsteigender Reihenfolge eingehaengt und gehen in absteigender
+    // wieder — jedes steht deshalb gerade vorn in seiner Kette.
+    var pi: int64 := self.symCount - 1;
+    while (pi >= neu) {
+      var pb: int64 := peek64(self.symHBkt + pi * 8);
+      if (peek64(self.symHHead + pb * 8) != pi) {
+        EPrintStrLn("lyxc: interner Fehler (#2175): Hash-Kette der Symboltabelle nicht LIFO"c);
+        exit(70);
+      }
+      poke64(self.symHHead + pb * 8, peek64(self.symHNext + pi * 8));
+      pi -= 1;
+    }
+    self.symCount   := neu;
   }
 
   // ------------------------------------------------------------------
@@ -9398,6 +9458,12 @@ pub type Sema = class {
     poke64(self.syms, self.symCap);  // Array header: cap
     poke64(self.syms + 8, 0);        // Array header: len
     self.symCount := 0;
+    self.symHHead := alloc(SEMA_SYMH_BUCKETS * 8);   // #2175
+    var shi: int64 := 0;
+    while (shi < SEMA_SYMH_BUCKETS) { poke64(self.symHHead + shi * 8, 0 - 1); shi += 1; }
+    self.symHCap  := 256;
+    self.symHNext := alloc(self.symHCap * 8);
+    self.symHBkt  := alloc(self.symHCap * 8);
     self.fcSeen      := alloc(512 * 8);   // #1701
     self.fcSeenCount := 0;
     self.fcTiefe     := 0;
@@ -9702,22 +9768,58 @@ pub type Sema = class {
   // Ebene des Wurzelmoduls: gleichnamige Funktionen in verschiedenen Units
   // sind kein Fehler, dafuer gibt es die Mehrdeutigkeitspruefung.
   fn _checkDuplicateFuncs(head: int64) {
+    // #2175: Bis 1.2.18B verglich eine Doppelschleife jedes Paar (quadratisch
+    // in der Funktionszahl). Jetzt kettet ein Durchlauf gleichnamige
+    // Funktionen in Quelltextreihenfolge (dupNach[k] = naechste gleichnamige
+    // hinter der k-ten), der zweite meldet fuer jede Funktion a alle spaeteren
+    // gleichnamigen — dieselben Meldungen in derselben Reihenfolge wie die
+    // Doppelschleife (bei drei gleichen Namen also die dritte zweimal).
+    var n: int64 := 0;
     var a: int64 := head;
+    while (a >= 0) { if (self.sn_kind(a) == SNK_FUNC_DECL) { n += 1; } a := self.sn_next(a); }
+    if (n < 2) { return; }
+    var knoten: int64 := alloc(n * 8);
+    var dupNach: int64 := alloc(n * 8);
+    var plaetze: int64 := 16;
+    while (plaetze < n * 2) { plaetze := plaetze * 2; }
+    var letzt: int64 := alloc(plaetze * 8);   // Platz -> juengste Position dieses Namens
+    var i: int64 := 0;
+    while (i < plaetze) { poke64(letzt + i * 8, 0 - 1); i += 1; }
+    var k: int64 := 0;
+    a := head;
     while (a >= 0) {
       if (self.sn_kind(a) == SNK_FUNC_DECL) {
+        poke64(knoten + k * 8, a);
+        poke64(dupNach + k * 8, 0 - 1);
         var an: pchar := self.sn_sVal(a);
         var al: int64 := self.sn_sLen(a);
-        var b: int64 := self.sn_next(a);
-        while (b >= 0) {
-          if (self.sn_kind(b) == SNK_FUNC_DECL) {
-            if (self._strNEq(an, al, self.sn_sVal(b), self.sn_sLen(b)) != 0) {
-              self._errorNodeName("Funktion bereits deklariert"c, b, self.sn_sVal(b), self.sn_sLen(b));
-            }
+        var h: int64 := self._symHashVoll(an, al) & (plaetze - 1);
+        while (true) {
+          var v: int64 := peek64(letzt + h * 8);
+          if (v < 0) { poke64(letzt + h * 8, k); h := 0 - 1; }
+          else {
+            var vn: int64 := peek64(knoten + v * 8);
+            if (self._strNEq(an, al, self.sn_sVal(vn), self.sn_sLen(vn)) != 0) {
+              poke64(dupNach + v * 8, k);
+              poke64(letzt + h * 8, k);
+              h := 0 - 1;
+            } else { h := (h + 1) & (plaetze - 1); }
           }
-          b := self.sn_next(b);
+          if (h < 0) { break; }
         }
+        k += 1;
       }
       a := self.sn_next(a);
+    }
+    k := 0;
+    while (k < n) {
+      var j: int64 := peek64(dupNach + k * 8);
+      while (j >= 0) {
+        var b: int64 := peek64(knoten + j * 8);
+        self._errorNodeName("Funktion bereits deklariert"c, b, self.sn_sVal(b), self.sn_sLen(b));
+        j := peek64(dupNach + j * 8);
+      }
+      k += 1;
     }
   }
 
