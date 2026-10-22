@@ -22,6 +22,7 @@ set -uo pipefail
 ulimit -c 0
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
+LYXCA="$(readlink -f "$LYXC")"   # absolut — die Tests wechseln das Verzeichnis
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
@@ -30,7 +31,7 @@ nok() { echo "FAIL $1"; FAIL=$((FAIL+1)); }
 
 baue() {  # quelle ausgabe [optionen]
   local f="$1" o="$2"; shift 2
-  ( cd "$ROOT" && timeout 240 "$LYXC" --std-path="$ROOT" "$@" "$f" -o "$o" ) >"$o.log" 2>&1
+  ( cd "$ROOT" && timeout 240 "$LYXCA" --std-path="$ROOT" "$@" "$f" -o "$o" ) >"$o.log" 2>&1
 }
 pruefe() {  # name quelle soll [optionen]
   local n="$1" f="$2" soll="$3"; shift 3
@@ -237,7 +238,7 @@ int main(int argc, char **argv) {
   return 0;
 }
 EOF
-  if ( cd "$TMP/so" && timeout 240 "$LYXC" --std-path="$ROOT" --shared lib.lyx -o lib.so ) >"$TMP/so/lib.log" 2>&1 \
+  if ( cd "$TMP/so" && timeout 240 "$LYXCA" --std-path="$ROOT" --shared lib.lyx -o lib.so ) >"$TMP/so/lib.log" 2>&1 \
      && gcc -O1 "$TMP/so/ruf.c" -o "$TMP/so/ruf" -ldl 2>"$TMP/so/cc.log"; then
     aus="$(timeout 30 "$TMP/so/ruf" "$TMP/so/lib.so" 2>&1)"
     # a = sum b, b = 1+2k..., gerechnet in C: siehe unten
@@ -251,6 +252,100 @@ print(a+b+c+d)") verloren=0"
 else
   echo "HINWEIS kein gcc — ABI-Pruefung gegen einen C-Aufrufer uebersprungen"
 fi
+
+# --- Stufe 2: Parameter im Register, auch Stapelparameter ---------------------
+cat > "$TMP/par.lyx" <<'EOF'
+fn mix(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64, g: int64, h: int64): int64 {
+  var i: int64 := 0;
+  while (i < 50) { a := a + b * 2; h := h ^ a; g := g + h; i := i + 1; }
+  return a + b + c + d + e + f + g + h;
+}
+fn tief(n: int64, acc: int64): int64 {
+  if (n == 0) { return acc; }
+  return tief(n - 1, acc + n);
+}
+fn main(): int64 {
+  PrintInt(mix(1, 2, 3, 4, 5, 6, 7, 8)); Print(" "); PrintInt(tief(100, 0)); Print("\n");
+  return 0;
+}
+EOF
+# Sollwert in Python gerechnet (dieselbe Schleife)
+psoll="$(python3 -c "
+a,b,c,d,e,f,g,h=1,2,3,4,5,6,7,8
+for i in range(50):
+  a=a+b*2; h=h^a; g=g+h
+print(a+b+c+d+e+f+g+h, 5050)" | tr ' ' ' ')|"
+pruefe "Parameter im Register (8 Parameter, Rekursion)" "$TMP/par.lyx" "$psoll"
+# Weg: in der Schleife von mix (Schranke 50 = cmp rax, 0x32) liegen die vier
+# meistgenutzten Werte a, h, i, g in Registern — darunter die Parameter a
+# (aus rdi) und g, h (Stapelparameter 7 und 8). Nur b laeuft noch ueber den
+# Rahmen; bis Stufe 1 waren es alle vier Parameter.
+if baue "$TMP/par.lyx" "$TMP/parw"; then
+  pw="$(python3 -I - "$TMP/parw" <<'PY'
+import sys
+b = open(sys.argv[1], 'rb').read()
+s = b.find(bytes.fromhex('4883f832'))
+e = b.find(b'\xe9', s)
+k = b[s:e]
+slots = set()
+for i in range(len(k) - 3):
+    if k[i] == 0x48 and k[i+1] in (0x8b, 0x89, 0x03, 0x2b, 0x23, 0x0b, 0x33, 0x3b, 0x0f) and k[i+2] == 0x45:
+        slots.add(k[i+3])
+print(len(slots))
+PY
+)"
+  [ "${pw:-9}" -le 1 ] && ok "Weg: Parameter im Register [$pw Rahmenslot(s) in der Schleife]" \
+    || nok "Weg: Parameter — $pw Rahmenslots in der Schleife statt hoechstens 1"
+else nok "Weg (Parameter): uebersetzt nicht"; fi
+
+# --- Stufe 2: verschmolzene Bedingungen (alle Vergleiche, vorzeichenlos) ----
+cat > "$TMP/cmp.lyx" <<'EOF'
+fn zaehle(lo: int64, hi: int64): int64 {
+  var n: int64 := 0; var i: int64 := lo;
+  while (i < hi) { if (i == 3) { n := n + 100; } if (i != 4) { n := n + 1; } i := i + 1; }
+  var j: int64 := 0;
+  while (j <= 5) { if (j > 2) { n := n + 10; } if (j >= 5) { n := n + 1000; } j := j + 1; }
+  return n;
+}
+fn main(): int64 {
+  var u: uint64 := 0 - 1;           // 2^64-1: vorzeichenlos gross, vorzeichenbehaftet -1
+  var z: uint64 := 5;
+  var s: int64 := 0 - 1;
+  if (u > z) { Print("u>z "); } else { Print("u<=z "); }
+  if (s > 5) { Print("s>5 "); } else { Print("s<=5 "); }
+  PrintInt(zaehle(0, 8)); Print("\n");
+  return 0;
+}
+EOF
+# zaehle: i=0..7: +1 ausser i==4 (7), +100 bei i==3 -> 107; j=0..5: j>2 -> 3*10, j>=5 -> 1000 -> 1137
+pruefe "Bedingungen verschmolzen (signed/unsigned)" "$TMP/cmp.lyx" "u>z s<=5 1137|"
+
+# --- Stufe 2: linker Operand in r11, Rueckfall bei Aufruf rechts ------------
+cat > "$TMP/r11.lyx" <<'EOF'
+fn f(x: int64): int64 { var q: int64 := x * 3; return q + 1; }
+fn main(): int64 {
+  var a: int64 := 7; var b: int64 := 5; var c: int64 := 3;
+  var t: int64 := ((a << 4) | (b >> 1)) + ((a - b) * (c + 2)) - ((a ^ c) & (b | 8));
+  var v: int64 := (a * 10) + f(b) * (c + f(a));
+  PrintInt(t); Print(" "); PrintInt(v); Print("\n");
+  return 0;
+}
+EOF
+# t = (112|2) + 2*5 - (4 & 13) = 114 + 10 - 4 = 120; v = 70 + 16*(3+22) = 470
+pruefe "linker Operand in r11, Aufruf rechts" "$TMP/r11.lyx" "120 470|"
+
+# Weg: die Schleifenbedingung `i < 1000000` endet in einem jge (0F 8D) direkt
+# hinter dem cmp, ohne setcc/movzx/test.
+if baue "$TMP/qr.lyx" "$TMP/qrj"; then
+  jw="$(python3 -I - "$TMP/qrj" <<'PY'
+import sys
+b = open(sys.argv[1], 'rb').read()
+s = b.find(bytes.fromhex('40420f00'))
+print('jcc' if b[s+4:s+6] == bytes.fromhex('0f8d') else 'setcc' if b[s+4] == 0x0f and (b[s+5] & 0xf0) == 0x90 else 'anders')
+PY
+)"
+  [ "$jw" = jcc ] && ok "Weg: Bedingung als cmp; jge" || nok "Weg: Bedingung [$jw] statt jcc"
+else nok "Weg (Bedingung): uebersetzt nicht"; fi
 
 # --- Determinismus: zweimal uebersetzt, dasselbe Erzeugnis -------------------
 if baue "$TMP/qr.lyx" "$TMP/d1" && baue "$TMP/qr.lyx" "$TMP/d2" && cmp -s "$TMP/d1" "$TMP/d2"; then
