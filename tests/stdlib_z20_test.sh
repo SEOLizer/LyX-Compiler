@@ -9,7 +9,9 @@
 #         Die Offset-Tabelle im Quelltext war selbst falsch (die _nsec-Felder
 #         fehlten), sie ist mitkorrigiert.
 #   #1585 std/cpu/dispatch.lyx hatte 13 Funktionen und KEIN einziges pub — die
-#         Unit liess sich importieren, aber nichts daraus benutzen.
+#         Unit liess sich importieren, aber nichts daraus benutzen. Die Unit
+#         ist mit #2186 zurueckgezogen (sie rechnete falsch); geprueft wird
+#         jetzt std.cpu.features, das dieselbe Frage traegt.
 #   #1563 Die kompilierte Regex-API war doppelt unbenutzbar: es gab keinen
 #         Erzeuger fuer den Bytecode, UND der Leser las das Programm mit
 #         StrSafeCharAt, das seine Grenze per StrLen bestimmt — der Kopf traegt
@@ -80,20 +82,30 @@ else
 fi
 
 # ===========================================================================
-# #1585 — std.cpu.dispatch ist von aussen benutzbar
+# #1585 — std.cpu.features ist von aussen benutzbar
+#
+# #2186: Die Haelfte dieses Falls betraf std.cpu.dispatch. Diese Unit ist
+# zurueckgezogen — sie nahm mit `peek32(p) as int64 as f64` das f32-Bitmuster
+# als Ganzzahl und rechnete damit weiter, in ALLEN vier Operationen, und ihre
+# Dispatch-Abfrage war wirkungslos, weil beide Zweige dieselbe Funktion
+# riefen. Der SimdAlloc/SimdGet-Teil pruefte also eine Schnittstelle, deren
+# Ergebnisse falsch waren. Geblieben ist die Frage, die #1585 eigentlich
+# stellt: ist die Unit von aussen BENUTZBAR, also sind ihre Namen `pub`?
+#
+# Dass der Fall hier bei entfernter Unit lokal weiter gruen war, lag an einer
+# systemweit INSTALLIERTEN Kopie (/usr/include/lyx/units/...): der Resolver
+# nahm sie, obwohl --std-path auf das Repo zeigt. Gemeldet hat es erst die CI,
+# die keine Installation hat. Wer eine Unit entfernt, muss also auch in
+# tests/**.sh nach ihrem Namen suchen und darf dem lokalen Lauf nicht trauen.
 # ===========================================================================
-out "#1585: dispatch und features sind exportiert" 'import std.io;
-import std.cpu.dispatch;
+out "#1585: features ist exportiert und abfragbar" 'import std.io;
 import std.cpu.features;
 fn main(): int64 {
-  var a: int64 := SimdAlloc(4);
-  SimdSet(a, 0, 7); SimdSet(a, 1, 35);
-  PrintStr(IntToStr(SimdLen(a))); PrintStr(" ");
-  PrintStr(IntToStr(SimdGet(a, 0) + SimdGet(a, 1))); PrintStr(" ");
-  if (CpuDispatchLevel() >= 0) { PrintStr("level-ok "); }
-  if (CpuHasSSE2() == 0 || CpuHasSSE2() == 1) { PrintLn("sse2-abfragbar"); }
+  if (CpuHasSSE2() == 0 || CpuHasSSE2() == 1) { PrintStr("sse2-abfragbar "); }
+  if (CpuFeatureDetect() >= 0) { PrintStr("maske-ok "); }
+  if (CpuHasCpuid() == 0 || CpuHasCpuid() == 1) { PrintLn("cpuid-abfragbar"); }
   return 0;
-}' "4 42 level-ok sse2-abfragbar"
+}' "sse2-abfragbar maske-ok cpuid-abfragbar"
 
 # ===========================================================================
 # #1564 — MULTILINE wirkt auf ^ und $

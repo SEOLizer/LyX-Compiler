@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.18D
+VERSION   := 1.2.18E
 VERSION_DATE := 2026-10-22
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -337,6 +337,10 @@ test: lyxc
 	@bash tests/arm64_laufzeit_test.sh
 	@echo "--- parallel Array<f32>: Werte auf x86-64 UND arm64 (#2183, #2184, #2185) ---"
 	@bash tests/simd_f32_test.sh
+	@echo "--- std.cpu.features gegen die echte CPU, beide Richtungen (#2187) ---"
+	@bash tests/cpu_features_test.sh
+	@echo "--- Bit-Builtins und ISA-Gating am Erzeugnis (#2190, #2191) ---"
+	@bash tests/bit_builtins_test.sh
 	@echo "--- Cortex-M: Abbild starten und ueber Semihosting ausgeben (#1744) ---"
 	@bash tests/arm_cm_laufzeit_test.sh
 	@echo "--- xtensa: Erzeugnisse ausfuehren (#1786) ---"

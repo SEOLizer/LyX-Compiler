@@ -482,3 +482,26 @@ der eingesetzte Wert steht jeweils fest.
 | 548 | Linux-Syscall readlinkat (Nr. 78) | `readlink`, `sys_readlink`, `sys_readlinkat` | #2156; nur arm64/riscv, dirfd AT_FDCWD |
 | 549 | Linux-Syscall symlinkat (Nr. 36) | `symlink` | #2156; nur arm64/riscv, newdirfd AT_FDCWD |
 | 550 | Linux-Syscall fstat (Nr. 80) | `sys_fstat` | #2156; nur arm64/riscv |
+
+## Bereich 253 … 260 — CPU-Abfrage und Bit-Rechenwerke (#2187, #2190)
+
+Vergeben in `src/ir_lower.lyx`; der Schnellweg (`codegen_x86`) kennt dieselben
+Namen ohne ID, weil er nicht über das IR geht. Die Spalte „Ziele" sagt, wo die
+ID emittiert wird — eine Lücke dort ist ein lauter Abbruch (#1339), kein
+stilles Nichts.
+
+| ID | Bedeutung | Lyx-Name | Ziele | Herkunft |
+|----|-----------|----------|-------|----------|
+| 253 | CPUID, ein Register der Antwort | `cpu_id(leaf, subleaf, welches)` | x86-Familie; auf anderen Architekturen senkt ir_lower auf die Konstante 0 | #2187 |
+| 254 | XGETBV (XCR0) | `cpu_xgetbv(index)` | wie 253 | #2187 |
+| 255 | gesetzte Bits | `popcount(x)` | lyxos, arm64 (CNT+ADDV), riscv (gerechnet) | #2190 |
+| 256 | führende Nullen, `clz(0) == 64` | `clz(x)` | lyxos (BSR + Nullfall), arm64 (CLZ), riscv (gerechnet) | #2190 |
+| 257 | nachlaufende Nullen, `ctz(0) == 64` | `ctz(x)` | lyxos (BSF + Nullfall), arm64 (RBIT+CLZ), riscv (gerechnet) | #2190 |
+| 258 | Bytetausch | `bswap64(x)` | lyxos (BSWAP), arm64 (REV), riscv (gerechnet) | #2190 |
+| 259 | Linksrotation, Weite mod 64 | `rotl(x, n)` | lyxos (ROL), arm64 (NEG+ROR), riscv (SLL/SRL/OR) | #2190 |
+| 260 | Rechtsrotation, Weite mod 64 | `rotr(x, n)` | lyxos (ROR), arm64 (ROR), riscv (SRL/SLL/OR) | #2190 |
+
+Auf x86 sind 255 … 257 an die CPU-Stufe gebunden (`--target-cpu`, `@cpu`):
+ohne Zusage wird gerechnet statt `POPCNT`/`LZCNT`/`TZCNT` zu emittieren, weil
+keiner der drei zum Grundbestand von x86-64 gehört (#2191). `bswap64`, `rotl`
+und `rotr` gibt es seit dem 486 bzw. 8086 und werden ungated emittiert.
