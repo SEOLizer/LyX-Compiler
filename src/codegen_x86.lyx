@@ -480,6 +480,23 @@ con CG_HEAP_END: int64 := 112; // data[112..119]: _lyx_heap_end
 // Bibliothek rechnet in Lyx weiter.
 con CG_RESTAB: int64 := 120;   // data[120..127]: _lyx_restab
 
+// #2206: EIGENE Arena fuer Vektorablagen, getrennt von CG_HEAP_PTR.
+//
+// Die Trennung ist der Kern der Sache: auf CG_HEAP_PTR liegen auch die
+// Objekte aus `new`. Eine Marke, die am Blockende zurueckgesetzt wird, gaebe
+// dort Objekte frei, die noch gehalten werden —
+// `while (…) { var o := new Knoten(); liste.Add(o); }` waere sofort kaputt,
+// und zwar als Speicherkorruption, nicht als Meldung. Vektorablagen sind
+// WERTE und niemand haelt sie ueber den Block hinaus, solange keiner sie
+// herausgibt; nur deshalb ist das Zuruecksetzen hier zulaessig.
+//
+// Bloecke zu 1 MiB statt 64 KiB: mit 64 KiB holte jede Ablage ab 16384
+// Elementen wieder einen eigenen Block, der Syscall je Operation blieb also
+// genau fuer die Groessen, bei denen er weh tut (gemessen: 2002 mmap fuer
+// 2000 Operationen bei n = 16384, dagegen 668 bei n = 4096).
+con CG_VEC_PTR: int64 := 128;  // data[128..135]: _lyx_vec_ptr
+con CG_VEC_END: int64 := 136;  // data[136..143]: _lyx_vec_end
+
 // #1971: Groesse eines Eintrags in `ress` (siehe Feld).
 pub con CG_RES_SZ: int64 := 56;
 
@@ -1266,6 +1283,7 @@ pub type Codegen = class {
   // und schlaegt das CLI-Flag; 0 = nicht gesetzt.
   scopeEnergyLevel:  int64;
   scopeCpuStufe:     int64;   // #2191: Stand aus `@cpu(stufe);`
+  vecMarkeEnde:      int64;   // #2206: Rahmenplatz der END-Marke der Vektorarena
 
   // WP-AS-04/05: @bounds_check / @debug_info / @optimization_level scope flags
   boundsCheckEnabled: int64;  // 1=on (default 1), 0=off
@@ -7287,6 +7305,237 @@ pub type Codegen = class {
   // WP-GPU-01: Emit inline SSE2 packed-f32 loop.
   // Convention: rdi=src1, rsi=src2, rdx=dst, rcx=element count.
   // Result: rax = dst ptr. Clobbers: rax, rcx, xmm0, xmm1.
+  // #2206: Darf die Vektorarena am Ende eines Schleifendurchlaufs auf die
+  // Marke zurueckgesetzt werden?
+  //
+  // Zurueckgesetzt wird nur, wenn im Rumpf kein Vektor ENTKOMMEN kann. Die
+  // Pruefung ist bewusst konservativ und rein syntaktisch — eine
+  // Lebendigkeitsanalyse gibt es hier nicht, und eine falsche Zusage waere
+  // Speicherkorruption statt eines Lecks. Unsicher ist ein Rumpf, der
+  //
+  //   * ein `return` enthaelt (der Wert verlaesst die Funktion),
+  //   * einen Vektor an etwas ZUWEIST, das schon existiert (`c := a + b` auf
+  //     ein aeusseres `c`; ein `var c := a + b` IM Rumpf ist dagegen frisch
+  //     und verschwindet mit ihm),
+  //   * einen Vektor als ARGUMENT weitergibt (die gerufene Funktion kann ihn
+  //     ablegen, und was sie tut, steht hier nicht).
+  //
+  // Alles andere bleibt im Rumpf und darf verfallen. Rueckgabe: 1 = es kann
+  // etwas entkommen, also NICHT zuruecksetzen.
+  // #2206: Legt dieser Rumpf ueberhaupt eine Vektorablage an?
+  //
+  // Ohne diese Frage bekam JEDE Schleife eine Marke — samt der Belegung, die
+  // einen Block erzwingt, also samt mmap im langsamen Zweig. Gemessen:
+  // tests/image_freestanding_test.sh meldete fuer png_mem 81 Syscalls statt
+  // 12, und der Befehlsbereich der Benchmark-Erzeugnisse wuchs von 91 auf
+  // 132 KiB. Eine Vorkehrung fuer Vektoren darf Programme ohne Vektoren
+  // nicht anfassen.
+  //
+  // Angelegt wird bei `parallel Array<T>(n)` und bei jeder Verknuepfung, die
+  // eine neue Ablage liefert (`a + b` auf zwei Vektoren, `-a`).
+  fn cg_vecRumpfLegtAn(ni: int64, tiefe: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (tiefe > 64) { return 0; }
+    var cur: int64 := ni;
+    while (cur >= 0) {
+      var k: int64 := self.cg_nkind(cur);
+      if (k == CGN_SIMD_NEW) { return 1; }
+      if (k == CGN_BINOP || k == CGN_UNOP) {
+        if (self.cg_istSimdAusdruck(cur) != 0) { return 1; }
+      }
+      if (self.cg_vecRumpfLegtAn(self.cg_nc0(cur), tiefe + 1) != 0) { return 1; }
+      if (self.cg_vecRumpfLegtAn(self.cg_nc1(cur), tiefe + 1) != 0) { return 1; }
+      if (self.cg_vecRumpfLegtAn(self.cg_nc2(cur), tiefe + 1) != 0) { return 1; }
+      if (self.cg_vecRumpfLegtAn(self.cg_nc3(cur), tiefe + 1) != 0) { return 1; }
+      cur := self.cg_nnext(cur);
+    }
+    return 0;
+  }
+
+  // Wie cg_vecEntkommtRumpf: NICHT dem next des Rumpfknotens folgen, sonst
+  // zaehlt der Code HINTER der Schleife mit.
+  fn cg_vecRumpfLegtAnRumpf(body: int64): int64 {
+    if (body < 0) { return 0; }
+    if (self.cg_vecRumpfLegtAn(self.cg_nc0(body), 0) != 0) { return 1; }
+    if (self.cg_vecRumpfLegtAn(self.cg_nc1(body), 0) != 0) { return 1; }
+    if (self.cg_vecRumpfLegtAn(self.cg_nc2(body), 0) != 0) { return 1; }
+    return self.cg_vecRumpfLegtAn(self.cg_nc3(body), 0);
+  }
+
+  // #2206: Einstieg fuer einen SCHLEIFENRUMPF. Wichtig: NICHT cg_vecEntkommt
+  // mit dem Rumpfknoten selbst aufrufen — der haengt in der Anweisungsliste
+  // seines Blocks, und `cg_nnext` fuehrt damit aus dem Rumpf HERAUS. Genau
+  // das hatte die erste Fassung getan: sie sah `PrintLn(r)` und `return 0`
+  // HINTER der Schleife, meldete "entkommt" und setzte nie zurueck. Gemessen
+  // wuchs der Speicher weiter, als gaebe es die Marke nicht; sichtbar wurde
+  // es erst, als ein `ud2` im Ruecksetz-Code nicht ausloeste — der Code war
+  // gar nicht erzeugt worden.
+  fn cg_vecEntkommtRumpf(body: int64): int64 {
+    if (body < 0) { return 1; }
+    if (self.cg_vecEntkommt(self.cg_nc0(body), 0) != 0) { return 1; }
+    if (self.cg_vecEntkommt(self.cg_nc1(body), 0) != 0) { return 1; }
+    if (self.cg_vecEntkommt(self.cg_nc2(body), 0) != 0) { return 1; }
+    return self.cg_vecEntkommt(self.cg_nc3(body), 0);
+  }
+
+  fn cg_vecEntkommt(ni: int64, tiefe: int64): int64 {
+    if (ni < 0) { return 0; }
+    if (tiefe > 64) { return 1; }   // zu tief, um es zu ueberblicken → vorsichtig
+    var cur: int64 := ni;
+    while (cur >= 0) {
+      var k: int64 := self.cg_nkind(cur);
+      if (k == CGN_RETURN) { return 1; }
+      if (k == CGN_ASSIGN) {
+        if (self.cg_istSimdAusdruck(self.cg_nc1(cur)) != 0) { return 1; }
+      }
+      if (k == CGN_CALL) {
+        var a: int64 := self.cg_nc1(cur);
+        while (a >= 0) {
+          if (self.cg_istSimdAusdruck(a) != 0) { return 1; }
+          a := self.cg_nnext(a);
+        }
+      }
+      if (self.cg_vecEntkommt(self.cg_nc0(cur), tiefe + 1) != 0) { return 1; }
+      if (self.cg_vecEntkommt(self.cg_nc1(cur), tiefe + 1) != 0) { return 1; }
+      if (self.cg_vecEntkommt(self.cg_nc2(cur), tiefe + 1) != 0) { return 1; }
+      if (self.cg_vecEntkommt(self.cg_nc3(cur), tiefe + 1) != 0) { return 1; }
+      cur := self.cg_nnext(cur);
+    }
+    return 0;
+  }
+
+  // #2206: Traegt dieser Ausdruck eine Vektorablage? Geprueft wird der
+  // einfache, haeufige Fall — ein Bezeichner, der als `parallel` angelegt
+  // wurde, und eine Verknuepfung zweier solcher. Bei allem anderen wird
+  // VORSICHTSHALBER 1 geliefert, wo es um das Entkommen geht: lieber eine
+  // Arena, die nicht zuruecksetzt, als eine, die zu frueh zuruecksetzt.
+  fn cg_istSimdAusdruck(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_IDENT) {
+      var li: int64 := self.cg_findLocalIdx(self.cg_nsval(ni), self.cg_nslen(ni));
+      if (li >= 0 && peek8(self.localIsSimd + li) != 0) { return 1; }
+      return 0;
+    }
+    if (k == CGN_SIMD_NEW) { return 1; }
+    if (k == CGN_BINOP) {
+      if (self.cg_istSimdAusdruck(self.cg_nc0(ni)) != 0) { return 1; }
+      return self.cg_istSimdAusdruck(self.cg_nc1(ni));
+    }
+    if (k == CGN_UNOP) { return self.cg_istSimdAusdruck(self.cg_nc0(ni)); }
+    return 0;
+  }
+
+  // #2206: Marke der Vektorarena in einen Rahmenplatz sichern. Rueckgabe:
+  // der Platz, oder -1, wenn nicht gesichert wurde.
+  // Gesichert werden BEIDE Zeiger, nicht nur PTR. Mit PTR allein waere der
+  // Fehler eingebaut: holt der Rumpf einen neuen Block, zeigt END hinter
+  // dessen Ende, waehrend die Marke in den ALTEN Block zeigt. Nach dem
+  // Zuruecksetzen glaubte der Allokator, ab der alten Stelle bis zum neuen
+  // Ende Platz zu haben — er gaebe Speicher aus einem Block heraus, der dort
+  // laengst zu Ende ist. PTR und END gehoeren immer zum selben Block.
+  // Rueckgabe ist der Platz der PTR-Marke; der END-Platz liegt in
+  // self.vecMarkeEnde. Die beiden Plaetze werden EINZELN erfragt und nicht
+  // aus einer angenommenen Schrittweite gerechnet — cg_addLocal liefert
+  // -frameSize, und wie weit der zwischen zwei Aufrufen waechst, ist nicht
+  // Sache dieser Funktion.
+  fn cg_vecMarkeSetzen(): int64 {
+    // #2206: ERST einen Block erzwingen, DANN die Marke nehmen.
+    //
+    // Ohne das stand hier der Fehler, den die Messung gezeigt hat: vor der
+    // ersten Belegung sind PTR und END beide 0, die Marke haelt also "Arena
+    // leer". Jeder Durchlauf setzte darauf zurueck, und die naechste Belegung
+    // fand eine leere Arena vor und holte sich einen neuen Block — ein mmap
+    // je Durchlauf, genau wie vorher. Gemessen blieben die Seitenfehler bei
+    // 80345 statt zu fallen.
+    //
+    // Eine Belegung von einem Byte legt den Block an; die Marke zeigt danach
+    // in einen Block, der auch beim Zuruecksetzen noch gilt.
+    self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6); self.cg_e32(1);   // mov rsi, 1
+    self.cg_emitBumpAtomarIn(0, 0, CG_VEC_PTR, CG_VEC_END, 1048576);
+    var slotPtr: int64 := self.cg_addLocal("__lyx_vecmarke"c, 14);
+    var slotEnd: int64 := self.cg_addLocal("__lyx_vecende"c, 13);
+    self.vecMarkeEnde := slotEnd;
+    // Geschrieben wird DIREKT ueber rbp, nicht ueber cg_storeRax. Der
+    // Registerzuteiler (#2114) bildet Rahmenplaetze auf r12..r15 ab; er hat
+    // diese Funktion aber beim Start der Funktion verteilt, als es die zwei
+    // Plaetze hier noch nicht gab. Ueber cg_storeRax landete die Marke
+    // deshalb in einem Register, das der Rumpf fuer eine ANDERE Variable
+    // benutzt — zurueckgelesen wurde Unsinn, der Allokator fand eine
+    // unbrauchbare Arena vor und holte jedes Mal einen neuen Block. Gemessen:
+    // der Speicher wuchs weiter linear, als gaebe es die Marke nicht.
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05); self.cg_bumpRip(CG_VEC_PTR);  // mov rax, [VEC_PTR]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(slotPtr);         // mov [rbp+slotPtr], rax
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05); self.cg_bumpRip(CG_VEC_END);  // mov rax, [VEC_END]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(slotEnd);         // mov [rbp+slotEnd], rax
+    return slotPtr;
+  }
+
+  // #2206: Arena auf die gesicherte Marke zuruecksetzen. Damit benutzt der
+  // naechste Durchlauf DIESELBEN Seiten wieder — der gemessene Aufwand lag
+  // nicht im mmap, sondern in 86696 Seitenfehlern auf immer frischem
+  // Speicher (gegen 94 bei der C-Fassung).
+  // `slot` ist ein RAHMENABSTAND und damit NEGATIV (cg_addLocal liefert
+  // -frameSize). Die erste Fassung pruefte hier `slot < 0` als "keine Marke
+  // gesetzt" — und wuergte sich damit immer selbst ab: das Zuruecksetzen
+  // wurde nie emittiert, der Speicher wuchs weiter linear, und die
+  // Markierung davor lief ins Leere. Gefunden mit einem `ud2` an dieser
+  // Stelle: es landete nicht einmal im Erzeugnis.
+  //
+  // Als "keine Marke" gilt deshalb 1 — ein positiver Wert kann kein
+  // Rahmenabstand sein.
+  fn cg_vecMarkeZurueck(slot: int64) {
+    if (slot > 0) { return; }
+    // Reihenfolge: zuerst END, dann PTR. Dazwischen darf kein anderer Faden
+    // belegen — END = 1 waere die Sperre des Allokators, und die wird hier
+    // nicht genommen. Fuer einen Rumpf, der selbst keine Faden startet, ist
+    // das in Ordnung; nebenlaeufige Nutzung derselben Arena ist es nicht.
+    // Siehe #2206: die Marke gilt nur fuer Rumpfe, aus denen nichts entkommt.
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x85); self.cg_e32(self.vecMarkeEnde);  // mov rax, [rbp+ende]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05); self.cg_bumpRip(CG_VEC_END);      // mov [VEC_END], rax
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x85); self.cg_e32(slot);                // mov rax, [rbp+marke]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05); self.cg_bumpRip(CG_VEC_PTR);      // mov [VEC_PTR], rax
+  }
+
+  // #2206: Vektorablage aus dem BUMP-ALLOKATOR, nicht per eigenem mmap.
+  //
+  // Bis 1.2.18G machte jede Anlage einer `parallel Array<f32>` — und jede
+  // Vektoroperation, denn `a + b` legt das Ergebnis neu an — einen eigenen
+  // mmap-Syscall. Freigegeben wurde nie. Gemessen mit 131072 Elementen und
+  // 500 Wiederholungen: 502 Anforderungen, 0 Rueckgaben, 253 MiB belegt fuer
+  // eine Rechnung, die 1,5 MiB Daten braucht. Ein mmap kostet rund 3 µs; bei
+  // kleinen Feldern ist das mehr als die Addition selbst, und der Abstand zu
+  // gcc schrumpfte in der Messung von 12,8x (im L1) auf 3,2x (ueber dem
+  // letzten Cache) — genau das Bild eines konstanten Aufwands JE OPERATION.
+  //
+  // Der Bump-Allokator aus #1836 (CG_HEAP_PTR/CG_HEAP_END) liegt ohnehin im
+  // Erzeugnis und holt seine Bloecke zu 64 KiB; cg_emitBumpAtomar nimmt bei
+  // `groesse == 0` die Groesse aus rsi, kann also auch eine zur Laufzeit
+  // berechnete Menge belegen. Damit kostet eine Vektoroperation keinen
+  // Kernelwechsel mehr.
+  //
+  // Erwartet: rax = Elementzahl. Ergebnis: rax = ausgerichteter Zeiger, die
+  // Elementzahl steht bei ptr-8. Belegt werden n*4 + 24 Byte — 8 fuer den
+  // Zaehler und bis zu 15 fuer die Ausrichtung auf 16.
+  //
+  // NICHT behoben ist damit das Wachstum: der Bump-Allokator gibt nichts
+  // zurueck, der Speicher waechst also weiter, nur ohne Syscall. Das braucht
+  // eine Aussage darueber, wann eine Ablage noch gehalten wird; siehe #2206.
+  fn cg_emitSimdBumpAlloc() {
+    self.cg_e8(0x50);                                                        // push rax (Elementzahl)
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(0x02);  // shl rax, 2
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x18);  // add rax, 24
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);                    // mov rsi, rax (Groesse)
+    // #2206: aus der VEKTORARENA, mit 1-MiB-Bloecken. Die Trennung von
+    // CG_HEAP_* ist Voraussetzung fuer das Zuruecksetzen der Marke (siehe
+    // cg_vecMarkeSetzen) — auf dem `new`-Heap waere es Speicherkorruption.
+    self.cg_emitBumpAtomarIn(0, 0, CG_VEC_PTR, CG_VEC_END, 1048576);   // rax = Blockstelle
+    self.cg_e8(0x59);                                                        // pop rcx (Elementzahl)
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x17);  // add rax, 23
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE0); self.cg_e8(0xF0);  // and rax, -16
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0xF8);  // mov [rax-8], rcx
+  }
+
   // #2184: Hier lief eine einzige Schleife in 16-Byte-Schritten, Abbruch erst
   // bei `rax >= n*4`. Bei n = 5 verarbeitete die zweite Iteration die Bytes
   // 16..31, also zwoelf Byte HINTER dem letzten Element — aus beiden Quellen
@@ -8547,30 +8796,38 @@ pub type Codegen = class {
   // groesse = 0: Groesse in rsi, schon auf 16 gerundet (cg_emitBumpAllocRsi);
   // die Blockgroesse wird zur Laufzeit bestimmt. Ergebnis in rax;
   // ueberschrieben werden rcx, rdx und im langsamen Weg die Syscall-Register.
+  // #2206: `ptrOff`/`endOff` benennen die Arena (CG_HEAP_* oder CG_VEC_*),
+  // `minBlock` ihre Mindestblockgroesse. Vorher war beides auf den
+  // `new`-Heap und 64 KiB festgeschrieben.
   fn cg_emitBumpAtomar(groesse: int64, block: int64) {
+    self.cg_emitBumpAtomarIn(groesse, block, CG_HEAP_PTR, CG_HEAP_END, 65536);
+  }
+
+  fn cg_emitBumpAtomarIn(groesse: int64, block: int64,
+                         ptrOff: int64, endOff: int64, minBlock: int64) {
     var oben: int64 := self.codeLen;
-    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05); self.cg_bumpRip(CG_HEAP_PTR);   // mov rax, [PTR]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05); self.cg_bumpRip(ptrOff);   // mov rax, [PTR]
     if (groesse > 0) {
       self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x88); self.cg_e32(groesse);        // lea rcx, [rax + groesse]
     } else {
       self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);            // lea rcx, [rax + rsi]
     }
-    self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x0D); self.cg_bumpRip(CG_HEAP_END);   // cmp rcx, [END]
+    self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x0D); self.cg_bumpRip(endOff);   // cmp rcx, [END]
     var pLangsam: int64 := self.cg_bumpVor(0x87);                                          // ja langsam
     self.cg_e8(0xF0); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB1); self.cg_e8(0x0D);
-    self.cg_bumpRip(CG_HEAP_PTR);                                                          // lock cmpxchg [PTR], rcx
+    self.cg_bumpRip(ptrOff);                                                          // lock cmpxchg [PTR], rcx
     self.cg_bumpZurueck(0x85, oben);                                                       // jne oben
     var pFertig1: int64 := self.cg_bumpVor(0xE9);                                          // jmp fertig
 
     // langsam: Sperre nehmen oder warten
     self.cg_bumpZiel(pLangsam);
-    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x15); self.cg_bumpRip(CG_HEAP_END);   // mov rdx, [END]
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x15); self.cg_bumpRip(endOff);   // mov rdx, [END]
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xFA); self.cg_e8(0x01);               // cmp rdx, 1
     var pWarten: int64 := self.cg_bumpVor(0x84);                                           // je warten
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                                 // mov rax, rdx
     self.cg_e8(0xB9); self.cg_e32(1);                                                      // mov ecx, 1
     self.cg_e8(0xF0); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB1); self.cg_e8(0x0D);
-    self.cg_bumpRip(CG_HEAP_END);                                                          // lock cmpxchg [END], rcx
+    self.cg_bumpRip(endOff);                                                          // lock cmpxchg [END], rcx
     self.cg_bumpZurueck(0x85, oben);                                                       // jne oben (ein anderer war schneller)
 
     // Sperre gehalten: neuen Block holen. mmap(0, n, PROT_RW, PRIVATE|ANON, -1, 0)
@@ -8583,7 +8840,7 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF2);   // mov rdx, rsi
       self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xC2); self.cg_e32(4095);    // add rdx, 4095
       self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xE2); self.cg_e32(0 - 4096); // and rdx, -4096
-      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6); self.cg_e32(65536);   // mov rsi, 65536
+      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC6); self.cg_e32(minBlock);   // mov rsi, 65536
       self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xF2);   // cmp rdx, rsi
       self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x47); self.cg_e8(0xF2);     // cmova rsi, rdx
       self.cg_e8(0x56);                                       // push rsi (Blockgroesse)
@@ -8612,8 +8869,8 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);       // lea rcx, [rax + rsi]
     }
     // Erst PTR, dann END — das zweite gibt die Sperre frei.
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D); self.cg_bumpRip(CG_HEAP_PTR);   // mov [PTR], rcx
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x15); self.cg_bumpRip(CG_HEAP_END);   // mov [END], rdx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x0D); self.cg_bumpRip(ptrOff);   // mov [PTR], rcx
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x15); self.cg_bumpRip(endOff);   // mov [END], rdx
     var pFertig2: int64 := self.cg_bumpVor(0xE9);                                          // jmp fertig
 
     // warten: ein anderer holt gerade einen Block
@@ -12032,30 +12289,10 @@ pub type Codegen = class {
       } else {
         self.cg_movRaxImm(0);
       }
-      // push rax (element count n, saved across mmap)
-      self.cg_e8(0x50);
-      // shl rax, 2  (rax = n*4 bytes)
-      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(0x02);
-      // add rax, 24  (16 for alignment + 8 for count slot)
-      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x18);
-      // mmap(0, size, PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=0x22, -1, 0)
-      self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);  // xor rdi, rdi
-      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);  // mov rsi, rax
-      self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-      self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-      self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
-      self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d, r9d
-      self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);  // mov eax, 9
-      self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall → rax = mmap base
-      self.cg_emitMmapGeprueft();   // #2144
-      // pop rcx (element count n)
-      self.cg_e8(0x59);
-      // align: rax = (rax + 23) & ~15  → guarantees rax-8 >= mmap_base
-      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x17);  // add rax, 23
-      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE0); self.cg_e8(0xF0);  // and rax, -16
-      // store element count at ptr-8  (mov [rax-8], rcx)
-      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0xF8);
-      // rax = 16-byte aligned SIMD ptr; count readable at ptr-8
+      // #2206: aus dem Bump-Allokator statt per eigenem mmap — siehe
+      // cg_emitSimdBumpAlloc. Layout unveraendert: Zaehler bei ptr-8,
+      // Zeiger auf 16 ausgerichtet.
+      self.cg_emitSimdBumpAlloc();
 
     // WP-17: Range expression (1..100) - returns start value in rax
     } else if (k == CGN_RANGE) {
@@ -12330,23 +12567,12 @@ pub type Codegen = class {
           self.cg_e8(0x51);  // push rcx
           self.cg_e8(0x57);  // push rdi
           self.cg_e8(0x56);  // push rsi
-          // alloc result SIMD buffer (same count): rax = rcx = count
-          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC8);  // mov rax, rcx
-          self.cg_e8(0x50);  // push rax (element count, saved across syscall)
-          self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(0x02);  // shl rax, 2
-          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x18);  // add rax, 24
-          self.cg_e8(0x48); self.cg_e8(0x31); self.cg_e8(0xFF);  // xor rdi, rdi
-          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);  // mov rsi, rax
-          self.cg_e8(0x48); self.cg_e8(0xC7); self.cg_e8(0xC2); self.cg_e8(0x03); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-          self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e8(0x22); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-          self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF); self.cg_e8(0xFF);
-          self.cg_e8(0x45); self.cg_e8(0x31); self.cg_e8(0xC9);  // xor r9d, r9d
-          self.cg_e8(0xB8); self.cg_e8(0x09); self.cg_e8(0x00); self.cg_e8(0x00); self.cg_e8(0x00);
-          self.cg_e8(0x0F); self.cg_e8(0x05);  // syscall → rax = mmap base
-          self.cg_e8(0x59);  // pop rcx (element count)
-          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x17);  // add rax, 23
-          self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE0); self.cg_e8(0xF0);  // and rax, -16
-          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0xF8);  // mov [rax-8], rcx
+          // #2206: Ergebnisablage aus dem Bump-Allokator. Hier stand ein
+          // eigener mmap-Syscall — in einer Schleife also einer JE
+          // OPERATION, und nie zurueckgegeben. Dieselbe Folge wie in
+          // cg_emitSimdBumpAlloc; die beiden muessen uebereinstimmen.
+          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC8);  // mov rax, rcx (Elementzahl)
+          self.cg_emitSimdBumpAlloc();
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov rdx, rax (dst ptr)
           // restore: rsi=rhs ptr, rdi=lhs ptr, rcx=count
           self.cg_e8(0x5E);  // pop rsi
@@ -20103,7 +20329,23 @@ pub type Codegen = class {
       limMsg := self.cg_emitCStrData(lm);
     }
 
+    // #2206: Marke der Vektorarena. Legt der Rumpf Vektorablagen an, die ihn
+    // nicht verlassen, wird die Arena bei jedem Durchlauf auf diesen Stand
+    // zurueckgesetzt — dieselben Seiten werden wiederverwendet. Gemessen
+    // waren es vorher 86696 Seitenfehler gegen 94 bei der C-Fassung, und
+    // darin lagen rund 90 % der Laufzeit, nicht im mmap.
+    //
+    // Gesichert wird NUR, wenn nichts entkommen kann (cg_vecEntkommt). Die
+    // Marke steht VOR loopTop, das Zuruecksetzen dahinter: so wirkt es in
+    // jedem Durchlauf, auch nach `continue` oder `break`.
+    var vecMarke: int64 := 1;   // 1 = keine Marke (Rahmenabstaende sind negativ)
+    if (self.cg_vecRumpfLegtAnRumpf(self.cg_nc1(ni)) != 0
+        && self.cg_vecEntkommtRumpf(self.cg_nc1(ni)) == 0) {
+      vecMarke := self.cg_vecMarkeSetzen();
+    }
+
     var loopTop:        int64 := self.codeLen;
+    self.cg_vecMarkeZurueck(vecMarke);   // #2206
 
     var copy: int64 := 0;
     while (copy < U) {
@@ -20146,7 +20388,14 @@ pub type Codegen = class {
   // WP-BC-04: repeat { body } until (cond)
   // body executes first; loop back while cond == 0 (false)
   fn cg_genRepeatUntil(ni: int64) {
+    // #2206: Marke der Vektorarena — `repeat ... until`, Rumpf in c0.
+    var vecMarke: int64 := 1;   // 1 = keine Marke (Rahmenabstaende sind negativ)
+    if (self.cg_vecRumpfLegtAnRumpf(self.cg_nc0(ni)) != 0
+        && self.cg_vecEntkommtRumpf(self.cg_nc0(ni)) == 0) {
+      vecMarke := self.cg_vecMarkeSetzen();
+    }
     var loopTop: int64 := self.codeLen;
+    self.cg_vecMarkeZurueck(vecMarke);   // #2206
     // Save outer break/continue lists
     var savedBreakHead: int64 := self.curBreakHead;
     var savedContHead:  int64 := self.curContHead;
@@ -20306,7 +20555,14 @@ pub type Codegen = class {
     var savedContHead:  int64 := self.curContHead;
     var allBreakHead:   int64 := -1;
     var jzHead:         int64 := -1;
+    // #2206: Marke der Vektorarena — `for`, Rumpf in c2.
+    var vecMarke: int64 := 1;   // 1 = keine Marke (Rahmenabstaende sind negativ)
+    if (self.cg_vecRumpfLegtAnRumpf(self.cg_nc2(ni)) != 0
+        && self.cg_vecEntkommtRumpf(self.cg_nc2(ni)) == 0) {
+      vecMarke := self.cg_vecMarkeSetzen();
+    }
     var loopTop:        int64 := self.codeLen;
+    self.cg_vecMarkeZurueck(vecMarke);   // #2206
 
     var copy: int64 := 0;
     while (copy < U) {
@@ -20374,7 +20630,14 @@ pub type Codegen = class {
     var savedContHead:  int64 := self.curContHead;
     var allBreakHead:   int64 := -1;
     var jzHead:         int64 := -1;
+    // #2206: Marke der Vektorarena — `for ... in a..b`, Rumpf in c2.
+    var vecMarke: int64 := 1;   // 1 = keine Marke (Rahmenabstaende sind negativ)
+    if (self.cg_vecRumpfLegtAnRumpf(self.cg_nc2(ni)) != 0
+        && self.cg_vecEntkommtRumpf(self.cg_nc2(ni)) == 0) {
+      vecMarke := self.cg_vecMarkeSetzen();
+    }
     var loopTop:        int64 := self.codeLen;
+    self.cg_vecMarkeZurueck(vecMarke);   // #2206
 
     // Bedingung: v < stop, sonst raus
     self.cg_loadRax(off);
@@ -20442,7 +20705,14 @@ pub type Codegen = class {
     var condNi:         int64 := self.cg_nc1(ni);
     var stepNi:         int64 := self.cg_nc2(ni);
     var bodyNi:         int64 := self.cg_nc3(ni);
+    // #2206: Marke der Vektorarena — `for (init; cond; step)`, Rumpf in c3.
+    var vecMarke: int64 := 1;   // 1 = keine Marke (Rahmenabstaende sind negativ)
+    if (self.cg_vecRumpfLegtAnRumpf(self.cg_nc3(ni)) != 0
+        && self.cg_vecEntkommtRumpf(self.cg_nc3(ni)) == 0) {
+      vecMarke := self.cg_vecMarkeSetzen();
+    }
     var loopTop:        int64 := self.codeLen;
+    self.cg_vecMarkeZurueck(vecMarke);   // #2206
 
     var copy: int64 := 0;
     while (copy < U) {
@@ -25956,7 +26226,7 @@ pub type Codegen = class {
     self.resCap      := 0;
     self.resTabOff   := 0 - 1;
     self.cgLesePfad  := 0;   // #1971
-    self.dataLen     := 128; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836), +8 CG_RESTAB (#1961)
+    self.dataLen     := 144; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836), +8 CG_RESTAB (#1961), +16 Vektorarena (#2206)
     self.dataOverflow := 0;  // WP-34  // WP-18: pre-reserve 88 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24, ARGC@32, ARGV@40, FLOAT_BUF@48, CANARY@80)
 
     self.localCap  := 64;
@@ -26136,6 +26406,7 @@ pub type Codegen = class {
     self.fnCpuStufe        := 0;
     self.scopeEnergyLevel  := 0;   // #1162: kein Quelltext-Stand gesetzt
     self.scopeCpuStufe     := 0;   // #2191
+    self.vecMarkeEnde      := 0;   // #2206
     self.fnEnergyLevel     := 3;   // #1162: Vorgabe 3 wie zugesagt (war 1)
 
     // WP-AS-04/05: directive flags
