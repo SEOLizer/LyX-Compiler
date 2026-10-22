@@ -529,6 +529,10 @@ pub type EmitARM64 = class {
     // sind ohnehin 64 Bit breit —, arm64 kannte sie gar nicht.
     if (op == IRO_CAST || op == IRO_SEXT || op == IRO_ZEXT || op == IRO_TRUNC) { return 1; }
     if (op == IRO_SHR || op == IRO_SIMD_ADD || op == IRO_SIMD_DIV || op == IRO_SIMD_MUL) { return 1; }
+    // #2185: ohne IRO_SIMD_NEW kam kein Programm bis zu den Binops — die
+    // Anlage ist der erste Opcode, den `parallel Array<f32>(n)` erzeugt.
+    // Element-Zugriff gehoert dazu, sonst ist der Vektor nicht beschreibbar.
+    if (op == IRO_SIMD_NEW || op == IRO_SIMD_LOAD_ELEM || op == IRO_SIMD_STORE_ELEM) { return 1; }
     if (op == IRO_SIMD_SUB || op == IRO_STORE_FIELD || op == IRO_STORE_GLOBAL || op == IRO_STORE_IDX) { return 1; }
     if (op == IRO_STORE_LOCAL || op == IRO_SUB || op == IRO_THROW || op == IRO_XOR) { return 1; }
     return 0;
@@ -654,10 +658,16 @@ pub type EmitARM64 = class {
     if op == IRO_ITOP { self.emitLoadSlot(src1, dest); }
 
     // --- SIMD (NEON) ---
-    if op == IRO_SIMD_ADD { self.emitNeon(0x4E608400, src1, src2, dest); }
-    if op == IRO_SIMD_SUB { self.emitNeon(0x4EE08400, src1, src2, dest); }
-    if op == IRO_SIMD_MUL { self.emitNeon(0x6E609C00, src1, src2, dest); }
-    if op == IRO_SIMD_DIV { self.emitNeon(0x6E60FC00, src1, src2, dest); }
+    // #2185: FADD/FSUB/FMUL/FDIV auf v.4s, dazu die skalare Form fuer den Rest.
+    // Jedes Wort einzeln mit llvm-mc gegengelesen — die alte Tabelle war in
+    // allen vier Zeilen falsch.
+    if op == IRO_SIMD_ADD { self.emitNeonBinOp(0x4E21D400, 0x1E212800, src1, src2, dest); }
+    if op == IRO_SIMD_SUB { self.emitNeonBinOp(0x4EA1D400, 0x1E213800, src1, src2, dest); }
+    if op == IRO_SIMD_MUL { self.emitNeonBinOp(0x6E21DC00, 0x1E210800, src1, src2, dest); }
+    if op == IRO_SIMD_DIV { self.emitNeonBinOp(0x6E21FC00, 0x1E211800, src1, src2, dest); }
+    if op == IRO_SIMD_NEW { self.emitSimdNew(src1, dest); }
+    if op == IRO_SIMD_LOAD_ELEM  { self.emitSimdLoadElem(dest, src1, src2); }
+    if op == IRO_SIMD_STORE_ELEM { self.emitSimdStoreElem(dest, src1, src2); }
 
     // --- Debug ---
     if op == IRO_INSPECT { self.emitInspect(src1, idx); }
@@ -2364,12 +2374,132 @@ pub type EmitARM64 = class {
   // NEON SIMD
   // -------------------------------------------------------------------------
 
-  fn emitNeon(base: int64, src1: int64, src2: int64, dest: int64) {
-    // Use v0.2d and v1.2d as scratch SIMD regs, result in v0.2d
-    self.emitFLdur(ARM64_D0, ARM64_X29, self.slotOff(src1));
-    self.emitFLdur(ARM64_D1, ARM64_X29, self.slotOff(src2));
-    self.emit32(base | (1 << 16) | (0 << 5) | 0);
+  // #2185: Hier stand eine Fassung, die beide Operanden als 64-Bit-SKALAR aus
+  // einem Stack-Slot lud (D0/D1) und ein festes Befehlswort anhaengte. Ein
+  // `parallel Array<f32>` ist aber ein ZEIGER auf einen ausgerichteten Block
+  // mit der Elementzahl bei ptr-8; der x86-Weg laeuft deshalb eine Schleife.
+  // Die vier Befehlswoerter waren zudem alle falsch — mit llvm-mc dekodiert:
+  // SIMD_ADD ergab `add v0.8h` (Integer, 16-Bit-Lanes), SIMD_SUB `add v0.2d`
+  // (Addition statt Subtraktion), SIMD_MUL war gar kein gueltiger Befehl und
+  // SIMD_DIV `fdiv v0.2d` (f64-Lanes statt f32). Aufgefallen ist nichts davon,
+  // weil IRO_SIMD_NEW auf arm64 fehlte: kein Programm kam bis hierher.
+  //
+  // Jetzt: Zeiger plus Schleife wie in codegen_x86.cg_emitSSE2BinOp — Vektorteil
+  // in 16-Byte-Schritten, danach ein skalarer Rest-Durchgang. Die drei Stellen
+  // (x86-ELF, lyxos, arm64) muessen uebereinstimmen.
+  //
+  // `vecWort`/`skalarWort` sind die fertigen Befehlswoerter fuer v0 = v0 OP v1
+  // bzw. s0 = s0 OP s1, jedes einzeln mit llvm-mc gegengelesen.
+  fn emitNeonBinOp(vecWort: int64, skalarWort: int64, src1: int64, src2: int64, dest: int64) {
+    // x0 = Zeiger auf lhs, x2 = Elementzahl aus [x0-8]
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src1));
+    self.emitLdur(ARM64_X2, ARM64_X0, 0 - 8);
+    // Die Elementzahl im Ziel-Slot parken: mmap unten braucht x0..x5 und x8,
+    // und die Quellzeiger stehen ohnehin in Rahmen-Slots.
+    self.emitStur(ARM64_X2, ARM64_X29, self.slotOff(dest));
+    // Ergebnispuffer anlegen: n*4 + 24 Byte, 16-Byte ausgerichtet, Zaehler bei ptr-8
+    self.emit32(0xD37EF442);   // LSL x2, x2, #2
+    self.emit32(0x91006042);   // ADD x2, x2, #24
+    self.emitMovImmReg(ARM64_X0, 0);    // addr = 0
+    self.emit32(0xAA0203E1);            // MOV x1, x2  (Laenge)
+    self.emitMovImmReg(ARM64_X2, 3);    // PROT_READ|PROT_WRITE
+    self.emitMovImmReg(ARM64_X3, 34);   // MAP_PRIVATE|MAP_ANON
+    self.emitMovImmReg(ARM64_X4, -1);   // fd
+    self.emitMovImmReg(ARM64_X5, 0);    // offset
+    self.emitMovImmReg(ARM64_X8, SYS_MMAP);
+    self.emit32(0xD4000001);            // SVC #0
+    self.emitMmapGeprueft();            // #2144
+    self.emit32(0x91005C00);   // ADD x0, x0, #23
+    self.emit32(0x927CEC00);   // AND x0, x0, #0xfffffffffffffff0
+    // Elementzahl zurueckholen und bei ptr-8 ablegen
+    self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(dest));
+    self.emitStur(ARM64_X2, ARM64_X0, 0 - 8);
+    // Quellzeiger neu laden: x3 = lhs, x4 = rhs
+    self.emitLdur(ARM64_X3, ARM64_X29, self.slotOff(src1));
+    self.emitLdur(ARM64_X4, ARM64_X29, self.slotOff(src2));
+    self.emit32(0xD37EF442);   // LSL x2, x2, #2   (Bytezahl)
+    self.emit32(0xD1004042);   // SUB x2, x2, #16  (letzter voller Block; darf negativ werden)
+    self.emitMovImmReg(ARM64_X5, 0);   // Byte-Offset
+
+    // ---- Vektorteil: while (x5 <= x2) ----
+    var vecStart: int64 := self.codeLen;
+    self.emit32(0xEB0200BF);   // CMP x5, x2
+    var jgPos: int64 := self.codeLen;
+    self.emit32(0x5400000C);   // B.GT .tail  (Weite wird nachgetragen)
+    self.emit32(0x3CE56860);   // LDR q0, [x3, x5]
+    self.emit32(0x3CE56881);   // LDR q1, [x4, x5]
+    self.emit32(vecWort);      // v0 = v0 OP v1  (.4s)
+    self.emit32(0x3CA56800);   // STR q0, [x0, x5]
+    self.emit32(0x910040A5);   // ADD x5, x5, #16
+    var vecBack: int64 := self.codeLen;
+    self.emit32(0x14000000 | (((vecStart - vecBack) / 4) & 0x03FFFFFF));   // B .vecStart
+    var tailStart: int64 := self.codeLen;
+    self.poke32at(jgPos, 0x5400000C | ((((tailStart - jgPos) / 4) & 0x7FFFF) << 5));
+
+    // ---- Rest: x2 zurueck auf die volle Bytezahl, dann 4 Byte je Schritt ----
+    self.emit32(0x91004042);   // ADD x2, x2, #16
+    var scalarStart: int64 := self.codeLen;
+    self.emit32(0xEB0200BF);   // CMP x5, x2
+    var jgePos: int64 := self.codeLen;
+    self.emit32(0x5400000A);   // B.GE .done  (Weite wird nachgetragen)
+    self.emit32(0xBC656860);   // LDR s0, [x3, x5]
+    self.emit32(0xBC656881);   // LDR s1, [x4, x5]
+    self.emit32(skalarWort);   // s0 = s0 OP s1
+    self.emit32(0xBC256800);   // STR s0, [x0, x5]
+    self.emit32(0x910010A5);   // ADD x5, x5, #4
+    var scalarBack: int64 := self.codeLen;
+    self.emit32(0x14000000 | (((scalarStart - scalarBack) / 4) & 0x03FFFFFF));   // B .scalarStart
+    var donePos: int64 := self.codeLen;
+    self.poke32at(jgePos, 0x5400000A | ((((donePos - jgePos) / 4) & 0x7FFFF) << 5));
+
+    // Ergebniszeiger in den Ziel-Slot
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2185: `parallel Array<f32>(n)` — ausgerichtete Anlage mit Zaehler bei
+  // ptr-8, dieselbe Ablage wie CGN_SIMD_NEW auf x86 und emit_lyxos. Ohne diese
+  // Umsetzung brach arm64 mit "kennt Opcode 165 nicht" ab.
+  fn emitSimdNew(countSlot: int64, dest: int64) {
+    self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(countSlot));
+    self.emitStur(ARM64_X2, ARM64_X29, self.slotOff(dest));   // Zahl parken
+    self.emit32(0xD37EF442);   // LSL x2, x2, #2
+    self.emit32(0x91006042);   // ADD x2, x2, #24
+    self.emitMovImmReg(ARM64_X0, 0);
+    self.emit32(0xAA0203E1);            // MOV x1, x2
+    self.emitMovImmReg(ARM64_X2, 3);
+    self.emitMovImmReg(ARM64_X3, 34);
+    self.emitMovImmReg(ARM64_X4, -1);
+    self.emitMovImmReg(ARM64_X5, 0);
+    self.emitMovImmReg(ARM64_X8, SYS_MMAP);
+    self.emit32(0xD4000001);            // SVC #0
+    self.emitMmapGeprueft();
+    self.emit32(0x91005C00);   // ADD x0, x0, #23
+    self.emit32(0x927CEC00);   // AND x0, x0, #0xfffffffffffffff0
+    self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(dest));
+    self.emitStur(ARM64_X2, ARM64_X0, 0 - 8);
+    self.emitStur(ARM64_X0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2185: `v[i]` auf einem f32-Vektor — 4 Byte Schrittweite, Ergebnis als
+  // f64-WERT (nicht als Bitmuster). Gegenstueck zu emitSimdStoreElem; die
+  // beiden muessen uebereinstimmen, sonst liest man anders, als man schreibt.
+  fn emitSimdLoadElem(dest: int64, ptrSlot: int64, idxSlot: int64) {
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
+    self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(idxSlot));
+    self.emit32(0xD37EF421);   // LSL x1, x1, #2
+    self.emit32(0xBC616800);   // LDR s0, [x0, x1]
+    self.emit32(0x1E22C000);   // FCVT d0, s0
     self.emitFStur(ARM64_D0, ARM64_X29, self.slotOff(dest));
+  }
+
+  // #2185: `v[i] := x` — f64-Wert nach f32 wandeln, dann ablegen.
+  fn emitSimdStoreElem(idxSlot: int64, valSlot: int64, ptrSlot: int64) {
+    self.emitFLdur(ARM64_D0, ARM64_X29, self.slotOff(valSlot));
+    self.emit32(0x1E624000);   // FCVT s0, d0
+    self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
+    self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(idxSlot));
+    self.emit32(0xD37EF421);   // LSL x1, x1, #2
+    self.emit32(0xBC216800);   // STR s0, [x0, x1]
   }
 
   // -------------------------------------------------------------------------

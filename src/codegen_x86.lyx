@@ -7279,34 +7279,96 @@ pub type Codegen = class {
   // WP-GPU-01: Emit inline SSE2 packed-f32 loop.
   // Convention: rdi=src1, rsi=src2, rdx=dst, rcx=element count.
   // Result: rax = dst ptr. Clobbers: rax, rcx, xmm0, xmm1.
+  // #2184: Hier lief eine einzige Schleife in 16-Byte-Schritten, Abbruch erst
+  // bei `rax >= n*4`. Bei n = 5 verarbeitete die zweite Iteration die Bytes
+  // 16..31, also zwoelf Byte HINTER dem letzten Element — aus beiden Quellen
+  // gelesen und ins Ziel GESCHRIEBEN. Verdeckt wurde das von der 24-Byte-
+  // Reserve der Anlage; alle vorhandenen Faelle nutzten n = 4.
+  // Jetzt: Vektorteil nur bis zum letzten vollen 16-Byte-Block, danach ein
+  // skalarer Durchgang in 4-Byte-Schritten fuer die bis zu drei Reste.
+  //
+  // Die Sprungweiten werden nachgetragen statt gezaehlt — die alten festen
+  // Werte (+21, -26) waren beim naechsten eingefuegten Befehl falsch.
   fn cg_emitSSE2BinOp(op: int64) {
     // xor eax, eax  (byte offset = 0)
     self.cg_e8(0x31); self.cg_e8(0xC0);
-    // shl rcx, 2  (rcx = byte count)
+    // shl rcx, 2  (rcx = Bytezahl)
     self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(0x02);
-    // [loop]: cmp rax, rcx
+    // sub rcx, 16  (rcx = letzter Offset, an dem noch ein voller Block passt;
+    //               darf negativ werden, der Vergleich unten ist vorzeichenbehaftet)
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x10);
+
+    // ---- Vektorteil: while (rax <= rcx) ----
+    var vecStart: int64 := self.codeLen;
+    // cmp rax, rcx
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);
-    // jge +21 (.done)
-    self.cg_e8(0x7D); self.cg_e8(0x15);
+    // jg .tail
+    self.cg_e8(0x7F);
+    var jgPos: int64 := self.codeLen; self.cg_e8(0);
+    var vecBody: int64 := self.codeLen;
     // movaps xmm0, [rdi+rax]  (0F 28 04 07)
     self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0x04); self.cg_e8(0x07);
     // movaps xmm1, [rsi+rax]  (0F 28 0C 06)
     self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0x0C); self.cg_e8(0x06);
     // packed f32 op: addps/subps/mulps/divps xmm0, xmm1
     self.cg_e8(0x0F);
-    if op == CGT_PLUS  { self.cg_e8(0x58); }
-    else if op == CGT_MINUS { self.cg_e8(0x5C); }
-    else if op == CGT_STAR  { self.cg_e8(0x59); }
-    else                    { self.cg_e8(0x5E); }  // CGT_SLASH → divps
+    self.cg_e8(self.cg_sseF32Opcode(op));
     self.cg_e8(0xC1);  // xmm0, xmm1
     // movaps [rdx+rax], xmm0  (0F 29 04 02)
     self.cg_e8(0x0F); self.cg_e8(0x29); self.cg_e8(0x04); self.cg_e8(0x02);
     // add rax, 16
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);
-    // jmp -26 (back to [loop])  EB E6
-    self.cg_e8(0xEB); self.cg_e8(0xE6);
-    // [.done]: mov rax, rdx  (result ptr)
+    // jmp .vecStart
+    self.cg_e8(0xEB);
+    var vecBackPos: int64 := self.codeLen;
+    self.cg_e8(vecStart - (vecBackPos + 1));
+
+    // ---- Rest: rcx zurueck auf die volle Bytezahl, dann 4 Byte je Schritt ----
+    var tailStart: int64 := self.codeLen;
+    cg_patchRel8Wert(self.code, jgPos, tailStart - vecBody);
+    // add rcx, 16
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x10);
+    var scalarStart: int64 := self.codeLen;
+    // cmp rax, rcx
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);
+    // jge .done
+    self.cg_e8(0x7D);
+    var jgePos: int64 := self.codeLen; self.cg_e8(0);
+    var scalarBody: int64 := self.codeLen;
+    // movss xmm0, [rdi+rax]  (F3 0F 10 04 07)
+    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x07);
+    // movss xmm1, [rsi+rax]  (F3 0F 10 0C 06)
+    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x0C); self.cg_e8(0x06);
+    // skalares f32-Gegenstueck: addss/subss/mulss/divss xmm0, xmm1 — derselbe
+    // Opcode wie packed, nur mit F3-Praefix.
+    self.cg_e8(0xF3); self.cg_e8(0x0F);
+    self.cg_e8(self.cg_sseF32Opcode(op));
+    self.cg_e8(0xC1);
+    // movss [rdx+rax], xmm0  (F3 0F 11 04 02)
+    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x02);
+    // add rax, 4
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x04);
+    // jmp .scalarStart
+    self.cg_e8(0xEB);
+    var scalarBackPos: int64 := self.codeLen;
+    self.cg_e8(scalarStart - (scalarBackPos + 1));
+
+    var donePos: int64 := self.codeLen;
+    cg_patchRel8Wert(self.code, jgePos, donePos - scalarBody);
+    // [.done]: mov rax, rdx  (Ergebniszeiger)
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);
+  }
+
+  // #2184: eine Stelle fuer die vier Opcodes, damit packed und skalar nicht
+  // auseinanderlaufen koennen. Gilt fuer `..ps` wie fuer `..ss`.
+  fn cg_sseF32Opcode(op: int64): int64 {
+    if (op == CGT_PLUS)  { return 0x58; }   // addps / addss
+    if (op == CGT_MINUS) { return 0x5C; }   // subps / subss
+    if (op == CGT_STAR)  { return 0x59; }   // mulps / mulss
+    if (op == CGT_SLASH) { return 0x5E; }   // divps / divss
+    EPrintStrLn("interner fehler: cg_sseF32Opcode mit einem Operator, der keine Vektorform hat (#2184)."c);
+    exit(1);
+    return 0;
   }
 
   // Emit binary operation: rax=right operand, rbx=left operand (from stack pop)
@@ -12621,6 +12683,7 @@ pub type Codegen = class {
       var isPchar:  int64 := 0;
       var isArray:  int64 := 0;
       var isSimd:   int64 := 0;
+      var isSimdFloat: int64 := 0;   // #2183
       var arrElemClassIdx: int64 := -1;
       var arrElemSize: int64 := 8;
       var arrFixedSize: int64 := 0;   // #1156: 0 = zur Uebersetzungszeit unbekannt
@@ -12656,6 +12719,9 @@ pub type Codegen = class {
           }
           // WP-GPU-01: check SIMD flag first
           if (peek8(self.localIsSimd + lidx) != 0) { isSimd := 1; }
+          // #2183: Gleitkomma-Elemente brauchen die Umrechnung f32 <-> f64,
+          // Ganzzahl-Elemente nicht.
+          if (isSimd == 1 && peek8(self.localElemFloat + lidx) != 0) { isSimdFloat := 1; }
           var tb: int64 := self.localTypes + lidx * CG_LOCTYPE_SZ;
           var tp: pchar := peek64(tb) as pchar;
           var tn: int64 := peek64(tb + CG_LOCTYPE_OFF_LEN);
@@ -12745,8 +12811,26 @@ pub type Codegen = class {
         // rax=base ptr, rbx=index
         // movss xmm0, [rax+rbx*4]  (F3 0F 10 04 98)
         self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x98);
-        // movd rax, xmm0  (66 0F 7E C0) — return f32 bits as int32 in rax
-        self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);
+        if (isSimdFloat == 1) {
+          // #2183: aus den f32-Bits wird ein f64-WERT. Hier stand nur
+          // `movd rax, xmm0`, also das rohe f32-Bitmuster — jeder Leser
+          // (Arithmetik, `as int64`, Print) behandelt den Wert aber als f64.
+          // Dieselbe Umrechnung wie im lyxos-Backend (emit_lyxos.lyx, CVTSS2SD);
+          // die beiden muessen uebereinstimmen. Gegenstueck ist der
+          // Schreibpfad in cg_genStmt (cvtsd2ss) — auch die beiden muessen
+          // uebereinstimmen, sonst liest man anders, als man geschrieben hat.
+          // cvtss2sd xmm0, xmm0  (F3 0F 5A C0)
+          self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x5A); self.cg_e8(0xC0);
+          // movq rax, xmm0  (66 48 0F 7E C0)
+          self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);
+        } else {
+          // Ganzzahl-Elemente (`parallel Array<int64>` u. a.): weiter das rohe
+          // 32-Bit-Muster. Die Schrittweite dieser Ablage ist 4 Byte, ein
+          // int64-Element passt also ohnehin nicht hinein — das ist eine
+          // eigene Luecke und wird hier nicht still mitgeaendert.
+          // movd eax, xmm0  (66 0F 7E C0)
+          self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);
+        }
       } else if (isPchar == 1) {
         // movzx rax, byte [rax+rbx]
         self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0x04); self.cg_e8(0x18);
@@ -18013,6 +18097,13 @@ pub type Codegen = class {
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 93) {
         poke8(self.localIsSimd + localIdx, 1);
         poke8(self.localIsArray + localIdx, 0);  // not a regular Array
+        // #2183: der ELEMENTTYP muss mit, wie bei `Array<T>` daneben. Ohne ihn
+        // galt `v[i]` bei `parallel Array<f32>` als Ganzzahl: cg_isF64ElemOf
+        // fragt localElemFloat, und das war fuer die parallele Form nie
+        // gesetzt. Folge war, dass `v[0] as int64` das Bitmuster lieferte und
+        // `v[0] + 1.0` auf den IEEE-Bits rechnete. c0 ist hier der
+        // Elementtyp (parser.lyx:1291), nicht c1 wie bei Array<T>.
+        self.cg_markElemFloat(localIdx, self.cg_nc0(typeNode));
       }
       // WP-BC-51: NK_TYPE_ARRAY_FIXED (=101) — store compile-time size
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 101) {
@@ -18767,6 +18858,7 @@ pub type Codegen = class {
         var lhsBase: int64 := self.cg_nc0(lhs);
         var lhsIsArray: int64 := 0;
         var lhsIsSimd:  int64 := 0;
+        var lhsIsSimdFloat: int64 := 0;   // #2183
         var lhsIsPchar: int64 := 0;     // #1266
         var lhsFixedSize: int64 := 0;   // #1156
         var lhsElemBytes: int64 := 0;   // #1612: >0 = Struct-Element, so viele Byte
@@ -18821,6 +18913,8 @@ pub type Codegen = class {
           }
           // WP-GPU-01: SIMD array store check
           if (llidx >= 0 && peek8(self.localIsSimd + llidx) != 0) { lhsIsSimd := 1; }
+          // #2183: wie im Lesepfad — Gleitkomma-Elemente brauchen cvtsd2ss.
+          if (lhsIsSimd == 1 && peek8(self.localElemFloat + llidx) != 0) { lhsIsSimdFloat := 1; }
           // #1266: `p[i] := x` auf einem pchar schrieb 8 Byte an Offset i*8 —
           // `p[0]` belegte die Bytes 0-7, `p[1]` die Bytes 8-15. Der LESEpfad
           // ermittelt die Zeichenkette laengst ueber denselben Typnamen und
@@ -18873,10 +18967,34 @@ pub type Codegen = class {
         if (lhsIsSimd == 1) {
           // WP-GPU-01: parallel Array<f32>[i] = val — movss store, 4-byte stride
           // stack: [value(rsi)]  rax=base  rbx=index
-          // pop rcx (value bits, f32 in low 32)
+          // pop rcx (Wert)
           self.cg_e8(0x59);
-          // movd xmm0, ecx  (66 0F 6E C1)
-          self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC1);
+          if (lhsIsSimdFloat == 1) {
+            // #2183: Hier stand `movd xmm0, ecx` — das legte die unteren 32 Bit
+            // des f64-BITMUSTERS ab, nicht den Wert. Bei 2.0, 3.0, 7.0 sind
+            // diese Bits 0, jede Zuweisung schrieb also still eine Null; bei
+            // 1.1 kam 0x9999999A heraus. Gemessen in #2183.
+            // Dieselbe Umrechnung wie im lyxos-Backend (emit_lyxos.lyx,
+            // CVTSD2SS) und Gegenstueck zum Lesepfad (cvtss2sd in cg_genExpr,
+            // CGN_INDEX) — die drei muessen uebereinstimmen.
+            if (self.cg_isF64Expr(rhs) != 0) {
+              // movq xmm0, rcx  (66 48 0F 6E C1)
+              self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC1);
+              // cvtsd2ss xmm0, xmm0  (F2 0F 5A C0)
+              self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x5A); self.cg_e8(0xC0);
+            } else {
+              // Ganzzahliger Ausdruck in ein f32-Element: `v[0] := 2` legt
+              // 2.0f ab. Ohne diesen Zweig landete die Ganzzahl als Bitmuster
+              // im Element und kam als winzige Denormalzahl zurueck.
+              // cvtsi2ss xmm0, rcx  (F3 48 0F 2A C1)
+              self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xC1);
+            }
+          } else {
+            // Ganzzahl-Elemente: rohes 32-Bit-Muster wie bisher (siehe
+            // Lesepfad — die Schrittweite 4 Byte ist eine eigene Luecke).
+            // movd xmm0, ecx  (66 0F 6E C1)
+            self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC1);
+          }
           // movss [rax+rbx*4], xmm0  (F3 0F 11 04 98)
           self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x98);
         } else if (lhsIsArray == 1 && lhsElemBytes > 8 && lhsFixedSize > 0) {

@@ -19,6 +19,11 @@
 
 import src.ir;
 
+// #2184: die drei Rumpfformen der Vektorschleife (siehe emitSimdSchleife).
+con SIMD_RUMPF_BINOP: int64 := 0;
+con SIMD_RUMPF_NEG:   int64 := 1;
+con SIMD_RUMPF_CMP:   int64 := 2;
+
 // ---------------------------------------------------------------------------
 // EmitLyxOS — x86-64 code generator for --target=lyxos
 // ---------------------------------------------------------------------------
@@ -499,18 +504,87 @@ pub type EmitLyxOS = class {
         self.emitSimdAllocFromRcx();                                             // rax = dst ptr
         self.emit8(0x48); self.emit8(0x89); self.emit8(0xC2);                    // mov rdx, rax (dst)
         self.emit8(0x5E); self.emit8(0x5F); self.emit8(0x59);                    // pop rsi; pop rdi; pop rcx
-        self.emit8(0x31); self.emit8(0xC0);                                      // xor eax, eax
-        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE1); self.emit8(0x02);  // shl rcx, 2 (byte count)
-        self.emit8(0x48); self.emit8(0x39); self.emit8(0xC8);                    // loop: cmp rax, rcx
-        self.emit8(0x7D); self.emit8(0x15);                                      // jge +21 (done)
-        self.emit8(0x0F); self.emit8(0x28); self.emit8(0x04); self.emit8(0x07);  // movaps xmm0, [rdi+rax]
-        self.emit8(0x0F); self.emit8(0x28); self.emit8(0x0C); self.emit8(0x06);  // movaps xmm1, [rsi+rax]
-        self.emit8(0x0F); self.emit8(packedOp); self.emit8(0xC1);               // packed op xmm0, xmm1
-        self.emit8(0x0F); self.emit8(0x29); self.emit8(0x04); self.emit8(0x02);  // movaps [rdx+rax], xmm0
-        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x10);  // add rax, 16
-        self.emit8(0xEB); self.emit8(0xE6);                                      // jmp loop
-        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);                    // done: mov rax, rdx
+        self.emitSimdSchleife(SIMD_RUMPF_BINOP, packedOp);
         self.emitMovSlotFromRax(dest);
+    }
+
+    // #2184: Alle drei Vektorschleifen (Binop, Negation, Vergleich) liefen in
+    // 16-Byte-Schritten bis `rax >= n*4` — bei n = 5 also einen Block zu weit,
+    // aus beiden Quellen gelesen und ins Ziel GESCHRIEBEN. Dieselbe Luecke wie
+    // in codegen_x86.cg_emitSSE2BinOp; die beiden muessen uebereinstimmen.
+    //
+    // Hier steht die Schleife jetzt EINMAL: Vektorteil bis zum letzten vollen
+    // Block, danach ein skalarer Durchgang in 4-Byte-Schritten. Die drei
+    // Rumpfformen unterscheiden sich nur in den zwei Zeilen dazwischen, und
+    // die Sprungweiten werden nachgetragen statt gezaehlt.
+    //
+    // Erwartet: rdi=src1, rsi=src2, rdx=dst, rcx=Elementzahl. Ergebnis in rax.
+    fn emitSimdSchleife(rumpf: int64, opByte: int64): void {
+        self.emit8(0x31); self.emit8(0xC0);                                      // xor eax, eax (Byte-Offset)
+        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE1); self.emit8(0x02);  // shl rcx, 2 (Bytezahl)
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xE9); self.emit8(0x10);  // sub rcx, 16
+
+        var vecStart: int64 := self.codeLen;
+        self.emit8(0x48); self.emit8(0x39); self.emit8(0xC8);                    // cmp rax, rcx
+        self.emit8(0x7F);                                                        // jg .tail
+        var jgPos: int64 := self.codeLen; self.emit8(0);
+        var vecBody: int64 := self.codeLen;
+        self.emitSimdRumpf(rumpf, opByte, 0);
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x10);  // add rax, 16
+        self.emit8(0xEB);
+        var vecBack: int64 := self.codeLen;
+        self.emit8(vecStart - (vecBack + 1));
+
+        var tailStart: int64 := self.codeLen;
+        poke8(self.codeBuf + jgPos, (tailStart - vecBody) & 0xFF);
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC1); self.emit8(0x10);  // add rcx, 16
+        var scalarStart: int64 := self.codeLen;
+        self.emit8(0x48); self.emit8(0x39); self.emit8(0xC8);                    // cmp rax, rcx
+        self.emit8(0x7D);                                                        // jge .done
+        var jgePos: int64 := self.codeLen; self.emit8(0);
+        var scalarBody: int64 := self.codeLen;
+        self.emitSimdRumpf(rumpf, opByte, 1);
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x04);  // add rax, 4
+        self.emit8(0xEB);
+        var scalarBack: int64 := self.codeLen;
+        self.emit8(scalarStart - (scalarBack + 1));
+
+        var donePos: int64 := self.codeLen;
+        poke8(self.codeBuf + jgePos, (donePos - scalarBody) & 0xFF);
+        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);                    // mov rax, rdx
+    }
+
+    // #2184: ein Durchlauf des Rumpfs. `skalar` 0 = 16 Byte (movaps/..ps),
+    // 1 = 4 Byte (movss/..ss). Packed und skalar benutzen denselben
+    // Operationsbyte — nur das F3-Praefix unterscheidet sie.
+    fn emitSimdRumpf(rumpf: int64, opByte: int64, skalar: int64): void {
+        if skalar == 0 {
+            self.emit8(0x0F); self.emit8(0x28); self.emit8(0x04); self.emit8(0x07);  // movaps xmm0, [rdi+rax]
+        } else {
+            self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x10); self.emit8(0x04); self.emit8(0x07);  // movss xmm0, [rdi+rax]
+        }
+        if rumpf == SIMD_RUMPF_NEG {
+            self.emit8(0x66); self.emit8(0x0F); self.emit8(0x76); self.emit8(0xC9);  // pcmpeqd xmm1, xmm1
+            self.emit8(0x66); self.emit8(0x0F); self.emit8(0x72); self.emit8(0xF1); self.emit8(0x1F);  // pslld xmm1, 31
+            self.emit8(0x0F); self.emit8(0x57); self.emit8(0xC1);                    // xorps xmm0, xmm1
+        } else {
+            if skalar == 0 {
+                self.emit8(0x0F); self.emit8(0x28); self.emit8(0x0C); self.emit8(0x06);  // movaps xmm1, [rsi+rax]
+            } else {
+                self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x10); self.emit8(0x0C); self.emit8(0x06);  // movss xmm1, [rsi+rax]
+            }
+            if skalar != 0 { self.emit8(0xF3); }
+            if rumpf == SIMD_RUMPF_CMP {
+                self.emit8(0x0F); self.emit8(0xC2); self.emit8(0xC1); self.emit8(opByte);  // cmpps/cmpss xmm0, xmm1, imm
+            } else {
+                self.emit8(0x0F); self.emit8(opByte); self.emit8(0xC1);                    // ..ps / ..ss xmm0, xmm1
+            }
+        }
+        if skalar == 0 {
+            self.emit8(0x0F); self.emit8(0x29); self.emit8(0x04); self.emit8(0x02);  // movaps [rdx+rax], xmm0
+        } else {
+            self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x11); self.emit8(0x04); self.emit8(0x02);  // movss [rdx+rax], xmm0
+        }
     }
     // WP-SIMD: f32-Element laden + nach f64. dest=f64-Slot, ptrSlot=SIMD-ptr, idxSlot=Index.
     fn emitSimdLoadElem(dest: int64, ptrSlot: int64, idxSlot: int64): void {
@@ -536,18 +610,7 @@ pub type EmitLyxOS = class {
         self.emitSimdAllocFromRcx();                                             // rax = dst
         self.emit8(0x48); self.emit8(0x89); self.emit8(0xC2);                    // mov rdx, rax
         self.emit8(0x5F); self.emit8(0x59);                                      // pop rdi; pop rcx
-        self.emit8(0x31); self.emit8(0xC0);                                      // xor eax, eax
-        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE1); self.emit8(0x02);  // shl rcx, 2
-        self.emit8(0x48); self.emit8(0x39); self.emit8(0xC8);                    // loop: cmp rax, rcx
-        self.emit8(0x7D); self.emit8(0x1A);                                      // jge +26 (done)
-        self.emit8(0x0F); self.emit8(0x28); self.emit8(0x04); self.emit8(0x07);  // movaps xmm0, [rdi+rax]
-        self.emit8(0x66); self.emit8(0x0F); self.emit8(0x76); self.emit8(0xC9);  // pcmpeqd xmm1, xmm1
-        self.emit8(0x66); self.emit8(0x0F); self.emit8(0x72); self.emit8(0xF1); self.emit8(0x1F);  // pslld xmm1, 31
-        self.emit8(0x0F); self.emit8(0x57); self.emit8(0xC1);                    // xorps xmm0, xmm1
-        self.emit8(0x0F); self.emit8(0x29); self.emit8(0x04); self.emit8(0x02);  // movaps [rdx+rax], xmm0
-        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x10);  // add rax, 16
-        self.emit8(0xEB); self.emit8(0xE1);                                      // jmp loop (-31)
-        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);                    // done: mov rax, rdx
+        self.emitSimdSchleife(SIMD_RUMPF_NEG, 0);   // #2184
         self.emitMovSlotFromRax(dest);
     }
     // WP-SIMD: packed f32-Vergleich (cmpps imm → Masken-Vektor 0xFFFFFFFF/0 pro Lane).
@@ -559,17 +622,7 @@ pub type EmitLyxOS = class {
         self.emitSimdAllocFromRcx();                                             // rax = dst
         self.emit8(0x48); self.emit8(0x89); self.emit8(0xC2);                    // mov rdx, rax
         self.emit8(0x5E); self.emit8(0x5F); self.emit8(0x59);                    // pop rsi; pop rdi; pop rcx
-        self.emit8(0x31); self.emit8(0xC0);                                      // xor eax, eax
-        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE1); self.emit8(0x02);  // shl rcx, 2
-        self.emit8(0x48); self.emit8(0x39); self.emit8(0xC8);                    // loop: cmp rax, rcx
-        self.emit8(0x7D); self.emit8(0x16);                                      // jge +22 (done)
-        self.emit8(0x0F); self.emit8(0x28); self.emit8(0x04); self.emit8(0x07);  // movaps xmm0, [rdi+rax]
-        self.emit8(0x0F); self.emit8(0x28); self.emit8(0x0C); self.emit8(0x06);  // movaps xmm1, [rsi+rax]
-        self.emit8(0x0F); self.emit8(0xC2); self.emit8(0xC1); self.emit8(predImm);  // cmpps xmm0, xmm1, imm
-        self.emit8(0x0F); self.emit8(0x29); self.emit8(0x04); self.emit8(0x02);  // movaps [rdx+rax], xmm0
-        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x10);  // add rax, 16
-        self.emit8(0xEB); self.emit8(0xE5);                                      // jmp loop (-27)
-        self.emit8(0x48); self.emit8(0x89); self.emit8(0xD0);                    // done: mov rax, rdx
+        self.emitSimdSchleife(SIMD_RUMPF_CMP, predImm);   // #2184
         self.emitMovSlotFromRax(dest);
     }
 
