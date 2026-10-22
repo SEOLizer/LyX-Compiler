@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.18C
+VERSION   := 1.2.18D
 VERSION_DATE := 2026-10-22
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -335,6 +335,8 @@ test: lyxc
 	@bash tests/oop_laufzeit_test.sh
 	@echo "--- arm64: Erzeugnisse ausfuehren, nicht nur uebersetzen (#1769) ---"
 	@bash tests/arm64_laufzeit_test.sh
+	@echo "--- parallel Array<f32>: Werte auf x86-64 UND arm64 (#2183, #2184, #2185) ---"
+	@bash tests/simd_f32_test.sh
 	@echo "--- Cortex-M: Abbild starten und ueber Semihosting ausgeben (#1744) ---"
 	@bash tests/arm_cm_laufzeit_test.sh
 	@echo "--- xtensa: Erzeugnisse ausfuehren (#1786) ---"

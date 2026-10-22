@@ -94,6 +94,25 @@ run "simd_store_load" 'fn main(): int64 { let v: parallel Array<f32>(4) = parall
 run "simd_add" 'fn main(): int64 { let a: parallel Array<f32>(4) = parallel Array<f32>(4); let b: parallel Array<f32>(4) = parallel Array<f32>(4); a[0] := 2.0; b[0] := 3.0; let c: parallel Array<f32> = a + b; return c[0] as int64; }' 5
 run "simd_mul" 'fn main(): int64 { let a: parallel Array<f32>(4) = parallel Array<f32>(4); let b: parallel Array<f32>(4) = parallel Array<f32>(4); a[2] := 6.0; b[2] := 7.0; let c: parallel Array<f32> = a * b; return c[2] as int64; }' 42
 run "simd_neg" 'fn main(): int64 { let a: parallel Array<f32>(4) = parallel Array<f32>(4); a[1] := 5.0; let b: parallel Array<f32> = -a; return (0 - (b[1] as int64)); }' 5
+# #2184: Laenge nicht durch 4 teilbar. Summiert wird ueber ALLE fuenf Elemente,
+# damit ein uebergangener Rest auffaellt.
+#
+# ACHTUNG, was diese zwei Faelle NICHT zeigen: nachgemessen sind sie auch mit
+# der alten Schleife gruen. Der Ueberlauf schrieb HINTER das letzte Element,
+# die Elemente 0..4 blieben richtig. Sie sichern also nur, dass kein Rest
+# uebergangen wird; den Ueberlauf belegt erst simd_waechter weiter unten.
+run "simd_rest_n5" 'fn main(): int64 { let a: parallel Array<f32>(5) = parallel Array<f32>(5); let b: parallel Array<f32>(5) = parallel Array<f32>(5); var i: int64 := 0; while (i < 5) { a[i] := 2.0; b[i] := 3.0; i += 1; } let c: parallel Array<f32> = a + b; var s: int64 := 0; i := 0; while (i < 5) { s += c[i] as int64; i += 1; } return s; }' 25
+run "simd_neg_rest_n5" 'fn main(): int64 { let a: parallel Array<f32>(5) = parallel Array<f32>(5); var i: int64 := 0; while (i < 5) { a[i] := 3.0; i += 1; } let b: parallel Array<f32> = -a; return (0 - (b[4] as int64)); }' 3
+# #2183: ganzzahliger Ausdruck in ein f32-Element. Die Wandlung steht in
+# ir_lower (_nachGleit), gilt also fuer alle drei Backends gleich.
+run "simd_element_aus_ganzzahl" 'fn main(): int64 { let v: parallel Array<f32>(4) = parallel Array<f32>(4); v[2] := 9; return v[2] as int64; }' 9
+# #2184: der WAECHTER. Acht Elemente anlegen, alle acht fuellen, dann die
+# Laenge bei ptr-8 auf 5 setzen: die Elemente 5..7 sind damit echter Speicher
+# hinter dem Ende. Das Ziel kommt frisch per mmap, ist also genullt — ein
+# Ueberlauf schriebe dort a[i]+b[i]. Dass alle acht gefuellt werden, ist der
+# Punkt: waeren sie 0, bliebe die geschriebene Null unsichtbar.
+# Rueckgabe 0 = unberuehrt. Mit der alten Schleife stehen dort Werte.
+run "simd_waechter" 'fn main(): int64 { let a: parallel Array<f32>(8) = parallel Array<f32>(8); let b: parallel Array<f32>(8) = parallel Array<f32>(8); var i: int64 := 0; while (i < 8) { a[i] := 2.0; b[i] := 3.0; i += 1; } poke64((a as int64) - 8, 5); poke64((b as int64) - 8, 5); let c: parallel Array<f32> = a + b; var pc: int64 := c as int64; var w: int64 := 0; if (peek32(pc + 5 * 4) as int64) != 0 { w += 1; } if (peek32(pc + 6 * 4) as int64) != 0 { w += 1; } if (peek32(pc + 7 * 4) as int64) != 0 { w += 1; } return w; }' 0
 
 # --- WP-WSP: Kernel-Systemprimitive (Atomics runtime; cpu-ctrl privileged = compile-only) ---
 run "atomic_store_load" 'fn main(): int64 { var x: int64 := 10; var p: int64 := @x; atomic_store(p, 42); return atomic_load(p); }' 42
