@@ -637,6 +637,15 @@ fn cg_faltF64(bop: int64, lb: int64, rb: int64): int64 {
 // #2148: Ein eingebauter Ganzzahltyp? Fuer `<f64> as T` im Anfangswert einer
 // Konstanten: nur dorthin wird abgeschnitten. Freie Funktion aus demselben
 // Grund wie cg_faltF64 (#1853, Vtable).
+// #2174: monotone Uhr in Nanosekunden (fuer die Zeitlinie).
+fn cg_zlJetztNs(): int64 {
+  var ts: int64 := alloc(16);
+  clock_gettime(1, ts);
+  var r: int64 := peek64(ts) * 1000000000 + peek64(ts + 8);
+  free(ts, 16);
+  return r;
+}
+
 fn cg_istGanzzahlTypName(tp: pchar, tl: int64): int64 {
   if (tl < 2 || tl > 6) { return 0; }
   var i: int64 := 0;
@@ -1023,6 +1032,20 @@ pub type Codegen = class {
   // Variable. rlAnz = Zahl der gewaehlten Register.
   rlAnz:  int64;
   rlTab:  int64;
+  // #2174: Zeitlinie (--time-trace). zlAktiv schaltet die Zaehlung ein;
+  // ohne Option bleibt alles 0 und das Erzeugnis unveraendert.
+  zlAktiv: int64;
+  zlImpNs: int64;    // Zeit in cg_processImportAs (aeusserste Ebene)
+  zlImpN:  int64;    // verarbeitete Units (cg_markImported)
+  zlTiefe: int64;
+  zlFlA: int64; zlFlV: int64;    // cg_findLocal: Aufrufe, Vergleiche
+  zlFiA: int64; zlFiV: int64;    // cg_findLocalIdx
+  zlFuA: int64; zlFuV: int64;    // cg_findUtype
+  // Aufrufe und Tabellengroesse beim Aufruf (obere Schranke der Vergleiche)
+  zlFrA: int64; zlFrT: int64;    // cg_funcRetTypeName
+  zlLbA: int64; zlLbT: int64;    // cg_findLabel
+  zlCoA: int64; zlCoT: int64;    // cg_findConIdx
+  zlLnA: int64; zlLnT: int64;    // cg_lineOf (gescannte Zeichen)
   // #2114: belegt gerade ein linker Operand r11 (cg_lhsRhsNachRbxRax)?
   r11Belegt: int64;
   outerFuncName:    pchar;  // name of outer function (for static link)
@@ -1674,9 +1697,13 @@ pub type Codegen = class {
       var base: int64 := self.locals + i * CG_LOCAL_SZ;
       var sname: pchar := peek64(base) as pchar;
       var slen:  int64 := peek64(base + CG_LOCAL_OFF_NAMELEN);
-      if (self.cg_seq(sname, slen, name, nlen)) { return peek64(base + CG_LOCAL_OFF_RBPOFF); }
+      if (self.cg_seq(sname, slen, name, nlen)) {
+        if (self.zlAktiv != 0) { self.zlFlA += 1; self.zlFlV += self.localCount - i; }   // #2174
+        return peek64(base + CG_LOCAL_OFF_RBPOFF);
+      }
       i -= 1;
     }
+    if (self.zlAktiv != 0) { self.zlFlA += 1; self.zlFlV += self.localCount - self.localBase; }   // #2174
     return 0;  // 0 = not found (valid offsets are always negative)
   }
 
@@ -1700,9 +1727,13 @@ pub type Codegen = class {
       var base: int64 := self.locals + i * CG_LOCAL_SZ;
       var sname: pchar := peek64(base) as pchar;
       var slen:  int64 := peek64(base + CG_LOCAL_OFF_NAMELEN);
-      if (self.cg_seq(sname, slen, name, nlen)) { return i; }
+      if (self.cg_seq(sname, slen, name, nlen)) {
+        if (self.zlAktiv != 0) { self.zlFiA += 1; self.zlFiV += self.localCount - i; }   // #2174
+        return i;
+      }
       i -= 1;
     }
+    if (self.zlAktiv != 0) { self.zlFiA += 1; self.zlFiV += self.localCount - self.localBase; }   // #2174
     return -1;
   }
 
@@ -3365,6 +3396,7 @@ pub type Codegen = class {
   fn cg_lineOf(ni: int64): int64 {
     var soff: int64 := self.cg_nsoff(ni);
     if (soff <= 0) { return 1; }
+    if (self.zlAktiv != 0) { self.zlLnA += 1; self.zlLnT += soff; }   // #2174
     var line: int64 := 1;
     var i: int64 := 0;
     while (i < soff) {
@@ -3391,6 +3423,7 @@ pub type Codegen = class {
   }
 
   fn cg_findLabel(name: pchar, nlen: int64): int64 {
+    if (self.zlAktiv != 0) { self.zlLbA += 1; self.zlLbT += self.labelCount; }   // #2174
     var i: int64 := 0;
     while (i < self.labelCount) {
       var base: int64 := self.labels + i * CG_LABEL_SZ;
@@ -3490,6 +3523,7 @@ pub type Codegen = class {
 
   // Returns the index of a constant in conTable, or -1 if not found.
   fn cg_findConIdx(name: pchar, nlen: int64): int64 {
+    if (self.zlAktiv != 0) { self.zlCoA += 1; self.zlCoT += self.conCount; }   // #2174
     var pvI: int64 := self.cg_privIdx(name, nlen);   // #2097/#2099
     if (pvI >= 0) {
       name := peek64(self.cgUnitPrivVTab + pvI * 32 + 16) as pchar;
@@ -5881,6 +5915,7 @@ pub type Codegen = class {
   // importiert). cg_funcRetTypeIs beantwortet nur "ist es DIESER Typ" und
   // taugt deshalb nicht, um einen Klassennamen zu uebernehmen.
   fn cg_funcRetTypeName(name: pchar, nameLen: int64, lenBox: int64): pchar {
+    if (self.zlAktiv != 0) { self.zlFrA += 1; self.zlFrT += self.fnRetCount; }   // #2174
     poke64(lenBox, 0);
     var i: int64 := 0;
     while (i < self.fnRetCount) {
@@ -9765,9 +9800,13 @@ pub type Codegen = class {
       var base: int64 := self.utypes + i * 72;
       var p: pchar := peek64(base) as pchar;
       var n: int64 := peek64(base + 8);
-      if (n == nameLen && self.cg_seq(p, n, name, nameLen)) { return i; }
+      if (n == nameLen && self.cg_seq(p, n, name, nameLen)) {
+        if (self.zlAktiv != 0) { self.zlFuA += 1; self.zlFuV += i + 1; }   // #2174
+        return i;
+      }
       i += 1;
     }
+    if (self.zlAktiv != 0) { self.zlFuA += 1; self.zlFuV += self.utypeCount; }   // #2174
     return 0 - 1;
   }
 
@@ -23441,6 +23480,7 @@ pub type Codegen = class {
 
   // Mark a module as imported (add to dedup set).
   fn cg_markImported(name: pchar, nameLen: int64) {
+    self.zlImpN += 1;   // #2174
     if (self.importCount >= self.importCap) {
       var nc: int64 := self.importCap * 2;
       var nb: int64 := alloc(nc * 16);
@@ -23609,8 +23649,20 @@ pub type Codegen = class {
     self.cg_processImportAs(modName, nameLen, 0, 0);
   }
 
-  // #1262: wie cg_processImport, aber mit Namensraum.
+  // #2174: Zeitmessung der Importverarbeitung, nur die aeusserste Ebene
+  // (cg_processImportAsKern ruft sich ueber Unter-Importe selbst auf).
   fn cg_processImportAs(modName: pchar, nameLen: int64, alias: int64, aliasLen: int64) {
+    if (self.zlAktiv == 0) { self.cg_processImportAsKern(modName, nameLen, alias, aliasLen); return; }
+    self.zlTiefe += 1;
+    var t0: int64 := 0;
+    if (self.zlTiefe == 1) { t0 := cg_zlJetztNs(); }
+    self.cg_processImportAsKern(modName, nameLen, alias, aliasLen);
+    if (self.zlTiefe == 1) { self.zlImpNs += cg_zlJetztNs() - t0; }
+    self.zlTiefe -= 1;
+  }
+
+  // #1262: wie cg_processImport, aber mit Namensraum.
+  fn cg_processImportAsKern(modName: pchar, nameLen: int64, alias: int64, aliasLen: int64) {
     if (self.cg_hasImported(modName, nameLen) != 0) { return; }
     self.cg_markImported(modName, nameLen);
     // Der Alias gilt nur fuer DIESE Unit. Was sie selbst importiert, wird beim
@@ -25395,6 +25447,10 @@ pub type Codegen = class {
     self.fnTupRetList  := alloc(self.fnTupRetCap * 48);
     self.fnTupRetCount := 0;
     self.methodAliasCap   := 64;
+    self.zlAktiv := 0; self.zlImpNs := 0; self.zlImpN := 0; self.zlTiefe := 0;   // #2174
+    self.zlFlA := 0; self.zlFlV := 0; self.zlFiA := 0; self.zlFiV := 0; self.zlFuA := 0; self.zlFuV := 0;
+    self.zlFrA := 0; self.zlFrT := 0; self.zlLbA := 0; self.zlLbT := 0;
+    self.zlCoA := 0; self.zlCoT := 0; self.zlLnA := 0; self.zlLnT := 0;
     self.methodAliasList  := alloc(self.methodAliasCap * 16);
     self.methodAliasCount := 0;
     self.fnAliasCap   := 64;

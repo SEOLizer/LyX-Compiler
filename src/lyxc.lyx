@@ -390,6 +390,38 @@ fn ms_appendMetaSafe(path: pchar, codeOff: int64, codeVa: int64, codeLen: int64,
 // Compiler Configuration
 // ============================================================================
 
+// #2174: CPU-Zeit des Prozesses in ns (CLOCK_PROCESS_CPUTIME_ID).
+fn lyxc_zlCpuNs(): int64 {
+  var ts: int64 := alloc(16);
+  clock_gettime(2, ts);
+  var r: int64 := peek64(ts) * 1000000000 + peek64(ts + 8);
+  free(ts, 16);
+  return r;
+}
+
+// #2174: Spitzen-RSS in kB aus /proc/self/status (Zeile VmHWM), -1 wenn nicht lesbar.
+fn lyxc_zlPeakRssKb(): int64 {
+  var fd: int64 := open("/proc/self/status"c, 0, 0);
+  if fd < 0 { return 0 - 1; }
+  var buf: int64 := alloc(8192);
+  var n: int64 := read(fd, buf, 8191);
+  close(fd);
+  if n <= 0 { return 0 - 1; }
+  var i: int64 := 0;
+  while i + 6 < n {
+    if peek8(buf + i) == 86 && peek8(buf + i + 1) == 109 && peek8(buf + i + 2) == 72
+       && peek8(buf + i + 3) == 87 && peek8(buf + i + 4) == 77 && peek8(buf + i + 5) == 58 {   // "VmHWM:"
+      var k: int64 := i + 6;
+      var v: int64 := 0;
+      while k < n && (peek8(buf + k) == 32 || peek8(buf + k) == 9) { k := k + 1; }
+      while k < n && peek8(buf + k) >= 48 && peek8(buf + k) <= 57 { v := v * 10 + (peek8(buf + k) - 48); k := k + 1; }
+      return v;
+    }
+    i := i + 1;
+  }
+  return 0 - 1;
+}
+
 pub type CompilerConfig = class {
   // Individual options (avoiding struct offset issues)
   inputFile: int64;
@@ -441,6 +473,13 @@ pub type CompilerConfig = class {
 
   // WP-BC-44: diagnostic flags
   tracePasses: bool;
+  // #2174: --time-trace=DATEI — Zeitlinie als JSON (Chrome-Trace-Format)
+  timeTrace: pchar;
+  zlStart:   int64;
+  zlCpu0:    int64;
+  zlEv:      int64;   // je Ereignis 32 Byte: Name, Start (ns), Dauer (ns), Zusatz (pchar oder 0)
+  zlEvN:     int64;
+  zlEvCap:   int64;
   irSourceMap:  bool;
 
   // WP-BC-45: dump flags
@@ -635,6 +674,9 @@ pub type CompilerConfig = class {
     self.traceEnabled   := false;
     self.profileEnabled := false;
     self.tracePasses    := false;
+    self.timeTrace      := 0 as pchar;   // #2174
+    self.zlEvN          := 0;
+    self.zlEvCap        := 0;
     self.irSourceMap    := false;
     self.astDump        := false;
     self.symtabDump     := false;
@@ -1478,6 +1520,11 @@ pub type CompilerConfig = class {
       self.tracePasses := true;
       return;
     }
+    // #2174: --time-trace=DATEI
+    if StrLen(arg) > 13 && StrCmp(StrSub(arg, 0, 13), "--time-trace="c) == 0 {
+      self.timeTrace := StrSub(arg, 13, StrLen(arg) - 13);
+      return;
+    }
     if StrCmp(arg, "--ir-source-map"c) == 0 {
       self.irSourceMap := true;
       return;
@@ -1575,7 +1622,7 @@ pub type CompilerConfig = class {
     if StrCmp(arg, "--version"c) == 0 {
       PrintStr("lyxc"c);
       PrintStr(" "c);
-      PrintStrLn("1.2.18A"c);
+      PrintStrLn("1.2.18B"c);
       PrintStr("Build: "c);
       PrintStrLn("bootstrap"c);
       self.exitCode := 0;
@@ -1597,7 +1644,7 @@ pub type CompilerConfig = class {
       PrintStr("  Name: "c);
       PrintStrLn("lyxc"c);
       PrintStr("  Version: "c);
-      PrintStrLn("1.2.18A"c);
+      PrintStrLn("1.2.18B"c);
       PrintStr("  Build: "c);
       PrintStrLn("bootstrap"c);
       PrintStr("  Target: "c);
@@ -1826,7 +1873,7 @@ pub type CompilerConfig = class {
   }
 
   fn printHelp(): void {
-    PrintStrLn("lyxc 1.2.18A (bootstrap)");
+    PrintStrLn("lyxc 1.2.18B (bootstrap)");
     PrintStrLn("Copyright (c) 2026 Andreas Roene. All rights reserved.");
     PrintStrLn("");
     PrintStrLn("Verwendung: lyxc <datei.lyx> [-o <ausgabe>] [--target=TARGET] [--arch=ARCH]");
@@ -1873,6 +1920,7 @@ pub type CompilerConfig = class {
     PrintStrLn("  --ast-dump             AST-Visualisierung nach dem Parsen");
     PrintStrLn("  --symtab-dump          Symbol-Tabelle ausgeben");
     PrintStrLn("  --trace-passes         Transformation Tracing");
+    PrintStrLn("  --time-trace=DATEI     Zeitlinie der Phasen als JSON (Chrome-Trace-Format, #2174)");
     PrintStrLn("  --ir-source-map        IR Source Mapping anzeigen");
     PrintStrLn("  --type-reasoning       Type-Checker Reasoning anzeigen");
     PrintStrLn("  --constraint-log       Constraint-Log ausgeben");
@@ -1924,6 +1972,7 @@ pub type CompilerConfig = class {
   // ---------------------------------------------------------------------------
   
   pub fn Compile(inputFile: pchar, outputFile: pchar): int64 {
+    if self.timeTrace != 0 as pchar { self.zlStart := MonotonicTimeNano(); self.zlCpu0 := lyxc_zlCpuNs(); }   // #2174
     // WP-T15: --self-test — LCBS-Integrationstest (läuft vor dem normalen Compile-Pfad)
     if self.selfTest {
       // inputFile = argv[0] (lyxc-Binary-Pfad) wenn via main() übergeben
@@ -2086,8 +2135,16 @@ pub type CompilerConfig = class {
       sema.unitTrusted := 0;
     }
     injectSystemConstants(sema, self);         // WP-CS-05
+    if self.timeTrace != 0 as pchar { sema.zlAktiv := 1; }   // #2174
     var semaResult: int64 := sema.Check(astRoot);
     self._passEnd("sema"c, _t3);
+    if self.timeTrace != 0 as pchar {
+      var zs: pchar := StrConcat(self._zlKv("importe_us"c, sema.zlImpNs / 1000), ","c);
+      zs := StrConcat(StrConcat(zs, self._zlKv("importe_units"c, sema.zlImpN)), ","c);
+      zs := StrConcat(StrConcat(zs, self._zlKv("Lookup_aufrufe"c, sema.zlLkA)), ","c);
+      zs := StrConcat(zs, self._zlKv("Lookup_tabelle"c, sema.zlLkT));
+      self._zlZusatz(zs);
+    }
 
     // WP-BC-45: --symtab-dump (non-destructive, continues compilation)
     if self.symtabDump {
@@ -2532,6 +2589,7 @@ pub type CompilerConfig = class {
       // Offsets, und genau zwei davon haengen an diesem Schalter.
       if self.kernelMode != 0 { cg.kernelMode := 1; }
       cg.Init(source, parser.nodes, parser.toks);
+      if self.timeTrace != 0 as pchar { cg.zlAktiv := 1; }   // #2174: nach Init (Init setzt die Zaehler zurueck)
       cg.pNodeCount := parser.nodeCount;   // #2134: generische Funktionen
       cg.includePath := self.includePath;
       cg.stdPath     := self.stdPath;
@@ -2643,6 +2701,25 @@ pub type CompilerConfig = class {
         ms_appendMetaSafe(outPath, cg.codeFileOff, cg.codeStartVa, cg.codeLen, cg.dataLen);
       }
       self._passEnd("codegen-x86_64"c, _t5x);
+      if self.timeTrace != 0 as pchar {   // #2174
+        var zf: pchar := StrConcat(self._zlKv("importe_us"c, cg.zlImpNs / 1000), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("importe_units"c, cg.zlImpN)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("findLocal_aufrufe"c, cg.zlFlA)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("findLocal_vergleiche"c, cg.zlFlV)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("findLocalIdx_aufrufe"c, cg.zlFiA)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("findLocalIdx_vergleiche"c, cg.zlFiV)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("findUtype_aufrufe"c, cg.zlFuA)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("findUtype_vergleiche"c, cg.zlFuV)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("funcRetTypeName_aufrufe"c, cg.zlFrA)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("funcRetTypeName_tabelle"c, cg.zlFrT)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("findLabel_aufrufe"c, cg.zlLbA)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("findLabel_tabelle"c, cg.zlLbT)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("findConIdx_aufrufe"c, cg.zlCoA)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("findConIdx_tabelle"c, cg.zlCoT)), ","c);
+        zf := StrConcat(StrConcat(zf, self._zlKv("lineOf_aufrufe"c, cg.zlLnA)), ","c);
+        zf := StrConcat(zf, self._zlKv("lineOf_zeichen"c, cg.zlLnT));
+        self._zlZusatz(zf);
+      }
       return self.exitCode;
     }
 
@@ -2780,8 +2857,16 @@ pub type CompilerConfig = class {
     // #1845: Die IR-Strecke hatte keine Pass-Marken — bei einem 80-Sekunden-Lauf
     // waren 78 davon unbeobachtet, weil `--trace-passes` nach `analysis` endete.
     var _t5i: int64 := self._passStart("ir-lowering"c);
+    if self.timeTrace != 0 as pchar { lower.zlAktiv := 1; }   // #2174
     lower.lowerModule(astRoot);
     self._passEnd("ir-lowering"c, _t5i);
+    if self.timeTrace != 0 as pchar {   // #2174
+      var zi: pchar := StrConcat(self._zlKv("tregFind_aufrufe"c, lower.zlTfA), ","c);
+      zi := StrConcat(StrConcat(zi, self._zlKv("tregFind_vergleiche"c, lower.zlTfV)), ","c);
+      zi := StrConcat(StrConcat(zi, self._zlKv("findTypeDecl_aufrufe"c, lower.zlTdA)), ","c);
+      zi := StrConcat(zi, self._zlKv("findTypeDecl_vergleiche"c, lower.zlTdV));
+      self._zlZusatz(zi);
+    }
     self.lyxosResListe := lower.irResListe;   // #1971: fuer die LBF-Ressourcenbloecke
 
     // WP-BC-44: dump IR (--dump-ir or --ir-source-map)
@@ -5569,17 +5654,87 @@ pub type CompilerConfig = class {
     return LYU_ARCH_X86_64;
   }
 
+  // ---------------------------------------------------------------------------
+  // #2174: Zeitlinie (--time-trace). Ereignisse aus _passStart/_passEnd, dazu
+  // je Phase Zusatzwerte (Importzeit, verarbeitete Units, Aufrufe und
+  // Vergleiche der linearen Suchen). Ohne Option wird nichts gesammelt und
+  // nichts gezaehlt; das Erzeugnis ist mit und ohne Option bitgleich.
+  // ---------------------------------------------------------------------------
+  fn _zlEreignis(name: pchar, t0: int64, dauer: int64): void {
+    if self.zlEvN >= self.zlEvCap {
+      var nc: int64 := self.zlEvCap * 2;
+      if nc < 16 { nc := 16; }
+      var nb: int64 := alloc(nc * 32);
+      if self.zlEvN > 0 { memcpy(nb, self.zlEv, self.zlEvN * 32); }
+      self.zlEv := nb; self.zlEvCap := nc;
+    }
+    var e: int64 := self.zlEv + self.zlEvN * 32;
+    poke64(e, name as int64); poke64(e + 8, t0); poke64(e + 16, dauer); poke64(e + 24, 0);
+    self.zlEvN := self.zlEvN + 1;
+  }
+
+  // Zusatzwerte des zuletzt beendeten Ereignisses (JSON-Fragment ohne Klammern).
+  fn _zlZusatz(frag: pchar): void {
+    if self.timeTrace == 0 as pchar || self.zlEvN == 0 { return; }
+    poke64(self.zlEv + (self.zlEvN - 1) * 32 + 24, frag as int64);
+  }
+
+  fn _zlKv(k: pchar, v: int64): pchar {
+    return StrConcat(StrConcat(StrConcat("\""c, k), "\":"c), IntToStr(v));
+  }
+
+  fn _zlSchreiben(): void {
+    if self.timeTrace == 0 as pchar { return; }
+    var j: pchar := "{\"traceEvents\":["c;
+    var i: int64 := 0;
+    while i < self.zlEvN {
+      var e: int64 := self.zlEv + i * 32;
+      if i > 0 { j := StrConcat(j, ","c); }
+      j := StrConcat(j, "{\"name\":\""c);
+      j := StrConcat(j, peek64(e) as pchar);
+      j := StrConcat(j, "\",\"ph\":\"X\",\"pid\":1,\"tid\":1,"c);
+      j := StrConcat(j, self._zlKv("ts"c, (peek64(e + 8) - self.zlStart) / 1000));
+      j := StrConcat(j, ","c);
+      j := StrConcat(j, self._zlKv("dur"c, peek64(e + 16) / 1000));
+      if peek64(e + 24) != 0 {
+        j := StrConcat(j, ",\"args\":{"c);
+        j := StrConcat(j, peek64(e + 24) as pchar);
+        j := StrConcat(j, "}"c);
+      }
+      j := StrConcat(j, "}"c);
+      i := i + 1;
+    }
+    j := StrConcat(j, "],\"otherData\":{"c);
+    j := StrConcat(j, self._zlKv("wall_us"c, (MonotonicTimeNano() - self.zlStart) / 1000));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._zlKv("cpu_us"c, (lyxc_zlCpuNs() - self.zlCpu0) / 1000));
+    j := StrConcat(j, ","c);
+    j := StrConcat(j, self._zlKv("peak_rss_kb"c, lyxc_zlPeakRssKb()));
+    j := StrConcat(j, "}}\n"c);
+    // Die eingebaute FileWriteAll liefert die geschriebenen Bytes (negativ bei
+    // einem Fehler) — nur die volle Laenge ist Erfolg.
+    var zlW: int64 := FileWriteAll(self.timeTrace, j, StrLen(j)) as int64;
+    if zlW != StrLen(j) {
+      EPrintStr("error: --time-trace: Datei nicht schreibbar: "c);
+      EPrintStrLn(self.timeTrace);
+    }
+  }
+
   fn _passStart(name: pchar): int64 {
-    if !self.tracePasses { return 0; }
-    PrintStr("[pass] "c);
-    PrintStr(name);
-    PrintStr(": start\n"c);
+    if !self.tracePasses && self.timeTrace == 0 as pchar { return 0; }
+    if self.tracePasses {
+      PrintStr("[pass] "c);
+      PrintStr(name);
+      PrintStr(": start\n"c);
+    }
     return MonotonicTimeNano();
   }
 
   fn _passEnd(name: pchar, t0: int64): void {
-    if !self.tracePasses { return; }
+    if !self.tracePasses && self.timeTrace == 0 as pchar { return; }
     var elapsed: int64 := MonotonicTimeNano() - t0;
+    if self.timeTrace != 0 as pchar { self._zlEreignis(name, t0, elapsed); }   // #2174
+    if !self.tracePasses { return; }
     var us: int64 := elapsed / 1000;
     var ms: int64 := elapsed / 1000000;
     PrintStr("[pass] "c);
@@ -6281,7 +6436,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   // Print version banner unless suppressed with --quiet
   if not cfg.quiet {
-    PrintStr("lyxc 1.2.18A — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
+    PrintStr("lyxc 1.2.18B — Copyright (c) 2026 Andreas Röne. All rights reserved.\n"c);
   }
 
   // WP-BC-50: --unit-info <file> — read .lyu file, print metadata, exit
@@ -6365,6 +6520,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
 
   if cfg.shouldRebuild(inputFile, outputFile) {
     cfg.Compile(inputFile, outputFile);
+    cfg._zlSchreiben();   // #2174
   } else {
     if cfg.enableVerbose {
       PrintStr("Skipping "c);
