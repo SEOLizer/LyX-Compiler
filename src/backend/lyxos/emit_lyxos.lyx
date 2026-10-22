@@ -2098,6 +2098,103 @@ pub type EmitLyxOS = class {
             self.emit8(0xF0); self.emit8(0x48); self.emit8(0x0F); self.emit8(0xC1); self.emit8(0x01);  // lock xadd [rcx], rax
             self.emitMovSlotFromRax(dest);
         }
+        // #2187: cpu_id(leaf, subleaf, welches) → ein Register der CPUID-Antwort.
+        // rbx wird gesichert: CPUID schreibt es, und rbx ist in der SysV-ABI
+        // callee-saved. Die vier Ergebnisse gehen in 4-Byte-Schritten auf den
+        // Stack, danach waehlt `welches` daraus aus; der 32-Bit-Lesezugriff
+        // nullt die oberen Bits, der Rueckgabewert ist also vorzeichenlos.
+        else if id == 253 {
+            self.emit8(0x53);                                                      // push rbx
+            self.emitMovRaxFromSlot(argBase + 2);
+            self.emit8(0x49); self.emit8(0x89); self.emit8(0xC3);                  // mov r11, rax (welches)
+            self.emitMovRaxFromSlot(argBase);                                      // eax = leaf
+            self.emitMovRcxFromSlot(argBase + 1);                                  // ecx = subleaf
+            self.emit8(0x0F); self.emit8(0xA2);                                    // cpuid
+            self.emit8(0x48); self.emit8(0x83); self.emit8(0xEC); self.emit8(0x10);// sub rsp, 16
+            self.emit8(0x89); self.emit8(0x04); self.emit8(0x24);                  // mov [rsp], eax
+            self.emit8(0x89); self.emit8(0x5C); self.emit8(0x24); self.emit8(0x04);// mov [rsp+4], ebx
+            self.emit8(0x89); self.emit8(0x4C); self.emit8(0x24); self.emit8(0x08);// mov [rsp+8], ecx
+            self.emit8(0x89); self.emit8(0x54); self.emit8(0x24); self.emit8(0x0C);// mov [rsp+12], edx
+            self.emit8(0x41); self.emit8(0x83); self.emit8(0xE3); self.emit8(0x03);// and r11d, 3
+            self.emit8(0x42); self.emit8(0x8B); self.emit8(0x04); self.emit8(0x9C);// mov eax, [rsp+r11*4]
+            self.emit8(0x48); self.emit8(0x83); self.emit8(0xC4); self.emit8(0x10);// add rsp, 16
+            self.emit8(0x5B);                                                      // pop rbx
+            self.emitMovSlotFromRax(dest);
+        }
+        // #2190: Bit-Rechenwerke. Fuer lyxos wird POPCNT/LZCNT/TZCNT NICHT
+        // emittiert, sondern gerechnet: der Kernel laeuft auf dem Geraet, und
+        // eine Zusage ueber --target-cpu gibt es fuer ihn nicht. Die Werte
+        // muessen denen des Schnellwegs entsprechen — clz(0) == ctz(0) == 64.
+        else if id == 255 {                                                        // popcount(x)
+            self.emitMovRaxFromSlot(argBase);
+            self.emit8(0x49); self.emit8(0x89); self.emit8(0xC3);                  // mov r11, rax (Eingabe)
+            self.emit8(0x31); self.emit8(0xC0);                                    // xor eax, eax
+            var pcL: int64 := self.codeLen;
+            self.emit8(0x4D); self.emit8(0x85); self.emit8(0xDB);                  // test r11, r11
+            self.emit8(0x74);
+            var pcJ: int64 := self.codeLen; self.emit8(0);
+            var pcB: int64 := self.codeLen;
+            self.emit8(0x4C); self.emit8(0x89); self.emit8(0xD9);                  // mov rcx, r11
+            self.emit8(0x83); self.emit8(0xE1); self.emit8(0x01);                  // and ecx, 1
+            self.emit8(0x48); self.emit8(0x01); self.emit8(0xC8);                  // add rax, rcx
+            self.emit8(0x49); self.emit8(0xD1); self.emit8(0xEB);                  // shr r11, 1
+            self.emit8(0xEB);
+            var pcK: int64 := self.codeLen; self.emit8(pcL - (pcK + 1));
+            poke8(self.codeBuf + pcJ, (self.codeLen - pcB) & 0xFF);
+            self.emitMovSlotFromRax(dest);
+        }
+        else if id == 256 {                                                        // clz(x), clz(0)=64
+            self.emitMovRcxFromSlot(argBase);
+            self.emit8(0xB8); self.emit32(64);                                     // mov eax, 64
+            self.emit8(0x48); self.emit8(0x85); self.emit8(0xC9);                  // test rcx, rcx
+            self.emit8(0x74);
+            var clJ: int64 := self.codeLen; self.emit8(0);
+            var clB: int64 := self.codeLen;
+            self.emit8(0x48); self.emit8(0x0F); self.emit8(0xBD); self.emit8(0xC1);// bsr rax, rcx
+            self.emit8(0xB9); self.emit32(63);                                     // mov ecx, 63
+            self.emit8(0x48); self.emit8(0x29); self.emit8(0xC1);                  // sub rcx, rax
+            self.emit8(0x48); self.emit8(0x89); self.emit8(0xC8);                  // mov rax, rcx
+            poke8(self.codeBuf + clJ, (self.codeLen - clB) & 0xFF);
+            self.emitMovSlotFromRax(dest);
+        }
+        else if id == 257 {                                                        // ctz(x), ctz(0)=64
+            self.emitMovRcxFromSlot(argBase);
+            self.emit8(0xB8); self.emit32(64);                                     // mov eax, 64
+            self.emit8(0x48); self.emit8(0x85); self.emit8(0xC9);                  // test rcx, rcx
+            self.emit8(0x74);
+            var ctJ: int64 := self.codeLen; self.emit8(0);
+            var ctB: int64 := self.codeLen;
+            self.emit8(0x48); self.emit8(0x0F); self.emit8(0xBC); self.emit8(0xC1);// bsf rax, rcx
+            poke8(self.codeBuf + ctJ, (self.codeLen - ctB) & 0xFF);
+            self.emitMovSlotFromRax(dest);
+        }
+        else if id == 258 {                                                        // bswap64(x)
+            self.emitMovRaxFromSlot(argBase);
+            self.emit8(0x48); self.emit8(0x0F); self.emit8(0xC8);                  // bswap rax
+            self.emitMovSlotFromRax(dest);
+        }
+        else if id == 259 {                                                        // rotl(x, n)
+            self.emitMovRaxFromSlot(argBase);
+            self.emitMovRcxFromSlot(argBase + 1);
+            self.emit8(0x48); self.emit8(0xD3); self.emit8(0xC0);                  // rol rax, cl
+            self.emitMovSlotFromRax(dest);
+        }
+        else if id == 260 {                                                        // rotr(x, n)
+            self.emitMovRaxFromSlot(argBase);
+            self.emitMovRcxFromSlot(argBase + 1);
+            self.emit8(0x48); self.emit8(0xD3); self.emit8(0xC8);                  // ror rax, cl
+            self.emitMovSlotFromRax(dest);
+        }
+        // #2187: cpu_xgetbv(index) → XCR0. Ohne diese Abfrage waere eine von
+        // CPUID gemeldete AVX-Faehigkeit nur die halbe Antwort: sichert das
+        // Betriebssystem den YMM-Zustand nicht, ist sie nicht nutzbar.
+        else if id == 254 {
+            self.emitMovRcxFromSlot(argBase);                                      // ecx = index
+            self.emit8(0x0F); self.emit8(0x01); self.emit8(0xD0);                  // xgetbv → edx:eax
+            self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE2); self.emit8(0x20);// shl rdx, 32
+            self.emit8(0x48); self.emit8(0x09); self.emit8(0xD0);                  // or rax, rdx
+            self.emitMovSlotFromRax(dest);
+        }
         else {
             // #1388: Hier endete die Kette OHNE Default — eine unbekannte
             // Builtin-ID erzeugte gar nichts und verschwand lautlos. Das ist

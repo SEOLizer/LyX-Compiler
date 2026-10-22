@@ -106,7 +106,8 @@ con CGN_MATCH_CASE:  int64 := 65;  // WP-15: case pattern => expr
 con CGN_RANGE:        int64 := 73;  // WP-17: range expression: 1..100
 con CGN_WHERE:        int64 := 74;  // WP-17: where clause: type X where constraint
 con CGN_EMBED:        int64 := 134;  // #1961: @embed / @embed_len
-con CGN_RESOURCE:     int64 := 135;  // #1961 Stufe 2: @resource("name","pfad")
+con CGN_RESOURCE:     int64 := 135;
+con CGN_AT_CPU:       int64 := 136;  // #2191: @cpu(stufe) — iv = Stufe
 con CGN_EXTERN_DATA:  int64 := 75;  // WSP-07: extern "asm" name: Type;
 con CGN_IS_EXPR:      int64 := 72;  // WP-16: x is Type
 
@@ -1251,6 +1252,12 @@ pub type Codegen = class {
 
   // WP-EN-01: energy levels — 0 = not set (codegen will default to 3)
   globalEnergyLevel: int64;  // from CLI --target-energy
+  // #2191: Mindest-CPU aus --target-cpu bzw. @cpu(...). 0 = baseline,
+  // 1 = sse4, 2 = avx2, 3 = avx512. Jede Emissionsstelle, die mehr als den
+  // Grundbestand braucht, fragt cg_cpuHat() — und scheitert laut, wenn die
+  // Stufe es nicht deckt, statt etwas Plausibles zu emittieren.
+  cgCpuStufe:   int64;
+  fnCpuStufe:   int64;   // wirksame Stufe der laufenden Funktion
   fnEnergyLevel:     int64;  // effective for current function
   // #1162: `@energy(N);` als Direktive vor/zwischen den Deklarationen. Auf
   // oberster Ebene nimmt der Parser diese Schreibweise als eigenen Knoten,
@@ -1258,6 +1265,7 @@ pub type Codegen = class {
   // sobald genFunc die Stufe neu bestimmte. Er steht hier als Quelltext-Stand
   // und schlaegt das CLI-Flag; 0 = nicht gesetzt.
   scopeEnergyLevel:  int64;
+  scopeCpuStufe:     int64;   // #2191: Stand aus `@cpu(stufe);`
 
   // WP-AS-04/05: @bounds_check / @debug_info / @optimization_level scope flags
   boundsCheckEnabled: int64;  // 1=on (default 1), 0=off
@@ -15368,6 +15376,119 @@ pub type Codegen = class {
       self.cg_e8(0xF0); self.cg_e8(0x48); self.cg_e8(0x0F);
       self.cg_e8(0xC1); self.cg_e8(0x07);                    // lock xadd [rdi], rax
 
+    } else if (self.cg_seq(fname, fnlen, "popcount", 8)) {
+      // #2190: Anzahl gesetzter Bits. POPCNT ist NICHT Grundbestand — es kam
+      // mit SSE4.2 und hat ein eigenes CPUID-Bit. Ohne Zusage wird deshalb
+      // gezaehlt statt den Befehl zu emittieren; auf einer aelteren CPU waere
+      // er SIGILL.
+      if (self.cg_cpuHat(1) != 0) {
+        self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB8); self.cg_e8(0xC7);  // popcnt rax, rdi
+      } else {
+        self.cg_e8(0x31); self.cg_e8(0xC0);                                      // xor eax, eax
+        var pcLoop: int64 := self.codeLen;
+        self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);                    // test rdi, rdi
+        self.cg_e8(0x74);
+        var pcJz: int64 := self.codeLen; self.cg_e8(0);
+        var pcBody: int64 := self.codeLen;
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF9);                    // mov rcx, rdi
+        self.cg_e8(0x83); self.cg_e8(0xE1); self.cg_e8(0x01);                    // and ecx, 1
+        self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xC8);                    // add rax, rcx
+        self.cg_e8(0x48); self.cg_e8(0xD1); self.cg_e8(0xEF);                    // shr rdi, 1
+        self.cg_e8(0xEB);
+        var pcBack: int64 := self.codeLen;
+        self.cg_e8(pcLoop - (pcBack + 1));
+        cg_patchRel8Wert(self.code, pcJz, self.codeLen - pcBody);
+      }
+
+    } else if (self.cg_seq(fname, fnlen, "clz", 3)) {
+      // #2190: fuehrende Nullen. clz(0) == 64, wie LZCNT es festlegt — der
+      // Software-Zweig muss denselben Wert liefern, sonst haengt das Ergebnis
+      // an der CPU. BSR laesst das Ziel bei 0 UNBESTIMMT, die Null wird also
+      // vorher abgefangen.
+      if (self.cg_cpuHat(2) != 0) {
+        self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBD); self.cg_e8(0xC7);  // lzcnt rax, rdi
+      } else {
+        self.cg_e8(0xB8); self.cg_e32(64);                                       // mov eax, 64
+        self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);                    // test rdi, rdi
+        self.cg_e8(0x74);
+        var clJz: int64 := self.codeLen; self.cg_e8(0);
+        var clBody: int64 := self.codeLen;
+        self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBD); self.cg_e8(0xC7);  // bsr rax, rdi
+        self.cg_e8(0xB9); self.cg_e32(63);                                       // mov ecx, 63
+        self.cg_e8(0x48); self.cg_e8(0x29); self.cg_e8(0xC1);                    // sub rcx, rax
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC8);                    // mov rax, rcx
+        cg_patchRel8Wert(self.code, clJz, self.codeLen - clBody);
+      }
+
+    } else if (self.cg_seq(fname, fnlen, "ctz", 3)) {
+      // #2190: nachlaufende Nullen, ctz(0) == 64 wie bei TZCNT.
+      if (self.cg_cpuHat(2) != 0) {
+        self.cg_e8(0xF3); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBC); self.cg_e8(0xC7);  // tzcnt rax, rdi
+      } else {
+        self.cg_e8(0xB8); self.cg_e32(64);                                       // mov eax, 64
+        self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xFF);                    // test rdi, rdi
+        self.cg_e8(0x74);
+        var ctJz: int64 := self.codeLen; self.cg_e8(0);
+        var ctBody: int64 := self.codeLen;
+        self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xBC); self.cg_e8(0xC7);  // bsf rax, rdi
+        cg_patchRel8Wert(self.code, ctJz, self.codeLen - ctBody);
+      }
+
+    } else if (self.cg_seq(fname, fnlen, "bswap64", 7)) {
+      // #2190: Bytetausch. BSWAP gibt es seit dem 486, also Grundbestand —
+      // keine Abfrage.
+      self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xCF);                      // bswap rdi
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);                      // mov rax, rdi
+
+    } else if (self.cg_seq(fname, fnlen, "rotl", 4)) {
+      // #2190: Linksrotation. ROL gibt es seit dem 8086. Die Weite wird von
+      // der Hardware auf 6 Bit beschnitten: rotl(x, 64) == rotl(x, 0) == x.
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);                      // mov rax, rdi
+      self.cg_e8(0x89); self.cg_e8(0xF1);                                        // mov ecx, esi
+      self.cg_e8(0x48); self.cg_e8(0xD3); self.cg_e8(0xC0);                      // rol rax, cl
+
+    } else if (self.cg_seq(fname, fnlen, "rotr", 4)) {
+      self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF8);                      // mov rax, rdi
+      self.cg_e8(0x89); self.cg_e8(0xF1);                                        // mov ecx, esi
+      self.cg_e8(0x48); self.cg_e8(0xD3); self.cg_e8(0xC8);                      // ror rax, cl
+
+    } else if (self.cg_seq(fname, fnlen, "cpu_id", 6)) {
+      // #2187: cpu_id(leaf, subleaf, welches) -> ein Register der CPUID-Antwort,
+      // welches 0=eax 1=ebx 2=ecx 3=edx. rdi=leaf, rsi=subleaf, rdx=welches.
+      //
+      // rbx wird gesichert: CPUID schreibt es, und in der SysV-ABI ist rbx
+      // callee-saved — der Codegen haelt dort den linken Operanden. Die vier
+      // Ergebnisse gehen in 4-Byte-Schritten auf den Stack, danach waehlt
+      // `welches` daraus aus; der 32-Bit-Lesezugriff nullt die oberen Bits,
+      // der Rueckgabewert ist also vorzeichenlos.
+      //
+      // Dieselbe Folge steht in emit_lyxos (id 253) — die beiden muessen
+      // uebereinstimmen.
+      self.cg_e8(0x53);                                                        // push rbx
+      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xD3);                    // mov r11, rdx (welches)
+      self.cg_e8(0x89); self.cg_e8(0xF8);                                      // mov eax, edi (leaf)
+      self.cg_e8(0x89); self.cg_e8(0xF1);                                      // mov ecx, esi (subleaf)
+      self.cg_e8(0x0F); self.cg_e8(0xA2);                                      // cpuid
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xEC); self.cg_e8(0x10);  // sub rsp, 16
+      self.cg_e8(0x89); self.cg_e8(0x04); self.cg_e8(0x24);                    // mov [rsp], eax
+      self.cg_e8(0x89); self.cg_e8(0x5C); self.cg_e8(0x24); self.cg_e8(0x04);  // mov [rsp+4], ebx
+      self.cg_e8(0x89); self.cg_e8(0x4C); self.cg_e8(0x24); self.cg_e8(0x08);  // mov [rsp+8], ecx
+      self.cg_e8(0x89); self.cg_e8(0x54); self.cg_e8(0x24); self.cg_e8(0x0C);  // mov [rsp+12], edx
+      self.cg_e8(0x41); self.cg_e8(0x83); self.cg_e8(0xE3); self.cg_e8(0x03);  // and r11d, 3
+      self.cg_e8(0x42); self.cg_e8(0x8B); self.cg_e8(0x04); self.cg_e8(0x9C);  // mov eax, [rsp+r11*4]
+      self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC4); self.cg_e8(0x10);  // add rsp, 16
+      self.cg_e8(0x5B);                                                        // pop rbx
+
+    } else if (self.cg_seq(fname, fnlen, "cpu_xgetbv", 10)) {
+      // #2187: cpu_xgetbv(index) -> XCR0 (edx:eax zusammengesetzt). Ohne diese
+      // Abfrage ist eine von CPUID gemeldete AVX-Faehigkeit nur die halbe
+      // Antwort: sichert das Betriebssystem den YMM-Zustand nicht, ist sie
+      // nicht nutzbar. rdi = index.
+      self.cg_e8(0x89); self.cg_e8(0xF9);                                      // mov ecx, edi
+      self.cg_e8(0x0F); self.cg_e8(0x01); self.cg_e8(0xD0);                    // xgetbv
+      self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x20);  // shl rdx, 32
+      self.cg_e8(0x48); self.cg_e8(0x09); self.cg_e8(0xD0);                    // or rax, rdx
+
     } else if (self.cg_seq(fname, fnlen, "fence_sfence", 12)) {
       self.cg_e8(0x0F); self.cg_e8(0xAE); self.cg_e8(0xF8);  // sfence
       self.cg_zeroRax();
@@ -19540,6 +19661,9 @@ pub type Codegen = class {
       if (kind == 3) { self.debugMode            := val; }  // WP-AS-05: @debug_info aliases debugMode
       if (kind == 4) { self.optLevel             := val; }  // WP-AS-04
 
+    } else if (k == CGN_AT_CPU) {  // #2191: @cpu(stufe); innerhalb eines Blocks
+      self.scopeCpuStufe := self.cg_nival(ni);
+      self.fnCpuStufe    := self.cg_nival(ni);
     } else if (k == CGN_AT_ENERGY) {  // WP-EN-04: @energy(N); statement override
       self.fnEnergyLevel := self.cg_nival(ni);
 
@@ -21063,6 +21187,38 @@ pub type Codegen = class {
     return src;
   }
 
+  // #2191: Deckt die wirksame CPU-Stufe die verlangte Faehigkeit?
+  //
+  // Die Stufen sind aufsteigend gedacht: avx2 kann alles, was sse4 kann. Wer
+  // eine Stelle hinzufuegt, die mehr als den Grundbestand braucht, ruft
+  // cg_cpuVerlange() — das scheitert LAUT, wenn die Stufe nicht reicht. Ein
+  // Default, der stattdessen die schmalere Form emittiert, waere genau der
+  // stille Fehler, den dieses Feld verhindern soll: der Code lief dann, waere
+  // aber langsamer als zugesagt, und niemand haette es gemerkt.
+  //
+  // Der Grundbestand (Stufe 0) ist alles, was jedes x86-64 hat: SSE und SSE2
+  // samt der packed-f32-Schleife, dazu BSWAP, ROL und ROR.
+  fn cg_cpuHat(stufe: int64): int64 {
+    if (self.fnCpuStufe >= stufe) { return 1; }
+    return 0;
+  }
+
+  // #2191: wie cg_cpuHat, aber mit Abbruch und Begruendung. `was` benennt die
+  // Faehigkeit so, wie sie in --target-cpu heisst, damit die Meldung sagt, was
+  // zu tun ist.
+  fn cg_cpuVerlange(stufe: int64, was: pchar) {
+    if (self.cg_cpuHat(stufe) != 0) { return; }
+    EPrintStr("error: codegen: diese Stelle braucht "c);
+    EPrintStr(was);
+    EPrintStrLn(", die Ziel-CPU deckt es nicht (#2191)."c);
+    EPrintStr("  Entweder mit --target-cpu="c);
+    EPrintStr(was);
+    EPrintStrLn(" uebersetzen oder die Funktion mit @cpu(...) auszeichnen."c);
+    EPrintStrLn("  Ohne Zusage darf hier nichts emittiert werden: auf einer aelteren CPU"c);
+    EPrintStrLn("  endet der Befehl in SIGILL."c);
+    exit(1);
+  }
+
   // WP-EN-04: unroll factor for current function's energy level
   // Level 1→1, 2→2, 3→4, 4→4, 5→8
   fn cg_unrollFactor(): int64 {
@@ -22138,6 +22294,18 @@ pub type Codegen = class {
       self.fnEnergyLevel := 3;
     }
 
+    // #2191: dieselbe Übernahme fuer die CPU-Stufe. `@cpu(...)` an der
+    // Funktion schlaegt --target-cpu — der Quelltext ist die genauere Angabe,
+    // genau wie oben bei @energy. Umgekehrt NICHT: eine Funktion darf nicht
+    // unter die Zusage des Aufrufs fallen, deshalb wird nur nach oben
+    // abgewichen.
+    var savedCpu: int64 := self.fnCpuStufe;
+    if (self.scopeCpuStufe > self.cgCpuStufe) {
+      self.fnCpuStufe := self.scopeCpuStufe;
+    } else {
+      self.fnCpuStufe := self.cgCpuStufe;
+    }
+
     // Reset locals
     self.localCount := 0;
     self.frameSize  := 0;
@@ -22472,6 +22640,7 @@ pub type Codegen = class {
 
     // WP-EN-04: restore energy level for enclosing scope
     self.fnEnergyLevel := savedEnergy;
+    self.fnCpuStufe    := savedCpu;   // #2191
     self.fcActive   := savedFcActive;   // #1140
     self.lockstepActive  := savedLs;         // #1878
     self.lockstepName    := savedLsName;
@@ -25544,6 +25713,12 @@ pub type Codegen = class {
         if (kind == 2) { self.boundsCheckForced    := val; }  // #1124
         if (kind == 3) { self.debugMode            := val; }  // WP-AS-05
         if (kind == 4) { self.optLevel             := val; }  // WP-AS-04
+      } else if (k == CGN_AT_CPU) {  // #2191: top-level @cpu(stufe)
+        // Wie bei @energy ein BEREICHS-Stand: cg_genFuncDecl bestimmt die
+        // Stufe je Funktion neu und wuerde einen nur hier gesetzten Wert
+        // sonst zugunsten des CLI-Flags verwerfen.
+        self.scopeCpuStufe := self.cg_nival(cur);
+        self.fnCpuStufe    := self.cg_nival(cur);
       } else if (k == CGN_AT_ENERGY) {  // WP-EN-04: top-level @energy(N)
         // #1162: als Quelltext-Stand vermerken, nicht nur als aktuelle Stufe —
         // genFunc bestimmt die Stufe je Funktion neu und verwarf den Wert
@@ -25776,7 +25951,10 @@ pub type Codegen = class {
 
     // WP-EN-01: energy levels
     self.globalEnergyLevel := 0;
+    self.cgCpuStufe        := 0;   // #2191: baseline
+    self.fnCpuStufe        := 0;
     self.scopeEnergyLevel  := 0;   // #1162: kein Quelltext-Stand gesetzt
+    self.scopeCpuStufe     := 0;   // #2191
     self.fnEnergyLevel     := 3;   // #1162: Vorgabe 3 wie zugesagt (war 1)
 
     // WP-AS-04/05: directive flags

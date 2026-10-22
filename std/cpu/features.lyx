@@ -1,90 +1,148 @@
 // std/cpu/features.lyx
-// WP-GPU-02: CPU feature detection via /proc/cpuinfo parsing.
-// Parses the flags field to detect SSE2, SSE4.1 and AVX2 capability.
+// CPU-Faehigkeiten ueber CPUID.
+//
+// #2187: Bis 1.2.18D parste diese Unit `/proc/cpuinfo` und suchte darin die
+// Zeichenketten " sse2", " sse4_1" und " avx2". Drei Dinge waren daran falsch:
+//
+//   1. Sie trug `@capabilities([fs.read])`. Jedes Programm, das nur wissen
+//      wollte, ob die CPU AVX2 kann, bekam damit Leserechte aufs Dateisystem.
+//   2. Ohne `/proc` — auf lyxos, bare metal, in einem engen Container —
+//      scheiterte `open` und die Funktion gab 0 zurueck, ununterscheidbar von
+//      "diese CPU kann nichts davon". Ein stiller Default.
+//   3. Drei Bits waren alles, was sie kannte.
+//
+// Jetzt wird die CPU selbst gefragt. `cpu_id(leaf, subleaf, welches)` ist ein
+// Builtin (welches: 0=eax 1=ebx 2=ecx 3=edx), `cpu_xgetbv(index)` liefert
+// XCR0. Beide gibt es auf jedem x86-64; auf anderen Architekturen liefern sie
+// 0, und 0 ist dort die richtige Antwort auf jede x86-Faehigkeitsfrage.
+//
+// Geprueft wurde jedes Bit einzeln gegen `lscpu` auf einer Maschine mit
+// AES-NI, AVX2, BMI1/2, FMA, POPCNT, SSE2 und SSE4.1 — und ohne SHA-NI und
+// AVX-512, damit auch die Gegenrichtung belegt ist.
 
-@description("CPU feature detection: SSE2, SSE4.1, AVX2 via /proc/cpuinfo")
+@description("CPU-Faehigkeiten ueber CPUID: SSE2 bis AVX-512, AES-NI, BMI, FMA, SHA")
 @author("Andreas Röne")
 @copyright("2025 Andreas Röne")
-@capabilities([fs.read])
 unit std.cpu.features;
 
-import std.alloc;
-import std.io;
-
-// Feature flag constants (bitmask)
+// Faehigkeits-Bits. Die ersten drei haben ihre Werte aus der Zeit vor #2187
+// behalten, damit vorhandener Code weiterliest.
 //
-// #2035: Diese Konstanten SIND die Schnittstelle — std/cpu/dispatch.lyx waehlt
-// darueber den Codepfad. Das pub fehlte, und bis 1.2.5H fiel das nicht auf,
-// weil sema die pub-Regel bei Konstanten gar nicht durchsetzte. Die ganze
-// Aufzaehlung wird oeffentlich, nicht nur die gerade benutzten Bits: eine halb
-// exportierte Aufzaehlung ist die Inkonsistenz, die spaeter beisst.
-pub con CPU_FEAT_SSE2:  int64 := 1;
-pub con CPU_FEAT_SSE41: int64 := 2;
-pub con CPU_FEAT_AVX2:  int64 := 4;
+// #2035: Diese Konstanten SIND die Schnittstelle. Die ganze Aufzaehlung ist
+// oeffentlich, nicht nur die gerade benutzten Bits — eine halb exportierte
+// Aufzaehlung ist die Inkonsistenz, die spaeter beisst.
+pub con CPU_FEAT_SSE2:    int64 := 1;
+pub con CPU_FEAT_SSE41:   int64 := 2;
+pub con CPU_FEAT_AVX2:    int64 := 4;
+pub con CPU_FEAT_SSE42:   int64 := 8;
+pub con CPU_FEAT_POPCNT:  int64 := 16;
+pub con CPU_FEAT_AESNI:   int64 := 32;
+pub con CPU_FEAT_AVX:     int64 := 64;
+pub con CPU_FEAT_FMA:     int64 := 128;
+pub con CPU_FEAT_BMI1:    int64 := 256;
+pub con CPU_FEAT_BMI2:    int64 := 512;
+pub con CPU_FEAT_SHANI:   int64 := 1024;
+pub con CPU_FEAT_AVX512F: int64 := 2048;
+pub con CPU_FEAT_LZCNT:   int64 := 4096;
 
-// Detected feature bitmask (0 = not yet probed)
+// Ermittelte Bitmaske. Das Flag ist noetig, weil 0 ein gueltiges Ergebnis ist:
+// eine CPU ohne jede dieser Faehigkeiten (oder eine andere Architektur) liefert
+// genau das, und ohne Flag wuerde jedes Mal neu gemessen.
 var cpuFeaturesCache: int64 := 0;
 var cpuFeaturesProbedFlag: int64 := 0;
 
-// Returns 1 if needle is found within [haystack, haystack+hlen), else 0.
-fn cpu_memmem(haystack: pchar, hlen: int64, needle: pchar, nlen: int64): int64 {
-  if (nlen == 0) { return 1; }
-  if (hlen < nlen) { return 0; }
-  var i: int64 := 0;
-  while (i <= hlen - nlen) {
-    var j: int64 := 0;
-    var ok: int64 := 1;
-    while (j < nlen) {
-      var hc: int64 := peek8(haystack + i + j) as int64;
-      var nc: int64 := peek8(needle + j) as int64;
-      if (hc != nc) { ok := 0; j := nlen; }
-      j += 1;
-    }
-    if (ok != 0) { return 1; }
-    i += 1;
-  }
-  return 0;
+// Trägt CPUID das Blatt `leaf` überhaupt? Blatt 0 nennt in eax die höchste
+// unterstützte Nummer. Ohne diese Frage liest man auf einer älteren CPU das
+// Ergebnis des höchsten vorhandenen Blattes und deutet fremde Bits.
+fn cpu_leafVorhanden(leaf: int64): int64 {
+  var max: int64 := cpu_id(0, 0, 0);
+  if (max < leaf) { return 0; }
+  return 1;
 }
 
-// Parse /proc/cpuinfo and return bitmask of detected CPU_FEAT_* flags.
-// Result is cached after first call.
+// Ermittelt die Faehigkeiten der laufenden CPU. Ergebnis wird gemerkt.
 pub fn CpuFeatureDetect(): int64 {
   if (cpuFeaturesProbedFlag != 0) { return cpuFeaturesCache; }
   cpuFeaturesProbedFlag := 1;
 
-  // Open /proc/cpuinfo for reading
-  var fd: int64 := open("/proc/cpuinfo", 0);
-  if (fd < 0) { return 0; }
-
-  // Read up to 8 KB
-  var bufSz: int64 := 8192;
-  var tbuf: int64 := alloc(bufSz + 1);
-  var nread: int64 := read(fd, tbuf as pchar, bufSz);
-  close(fd);
-  if (nread <= 0) { return 0; }
-  poke8(tbuf + nread, 0);  // NUL-terminate
-
   var feats: int64 := 0;
 
-  // Look for "flags" line — the flags are space-separated tokens after "flags\t: "
-  // We scan the whole buffer for the token substrings.
-  // SSE2 is represented as " sse2 " or at start/end of flags line.
-  // We search for " sse2" (with leading space) to avoid matching "sse2_..."
-  if (cpu_memmem(tbuf as pchar, nread, " sse2", 5) != 0) {
-    feats := feats | CPU_FEAT_SSE2;
+  // --- Blatt 1: die alten Faehigkeiten -------------------------------------
+  if (cpu_leafVorhanden(1) != 0) {
+    var ecx1: int64 := cpu_id(1, 0, 2);
+    var edx1: int64 := cpu_id(1, 0, 3);
+
+    if (((edx1 >> 26) & 1) != 0) { feats := feats | CPU_FEAT_SSE2; }
+    if (((ecx1 >> 19) & 1) != 0) { feats := feats | CPU_FEAT_SSE41; }
+    if (((ecx1 >> 20) & 1) != 0) { feats := feats | CPU_FEAT_SSE42; }
+    if (((ecx1 >> 23) & 1) != 0) { feats := feats | CPU_FEAT_POPCNT; }
+    if (((ecx1 >> 25) & 1) != 0) { feats := feats | CPU_FEAT_AESNI; }
+
+    // AVX, FMA und alles Breitere brauchen ZWEI Zusagen: die CPU muss den
+    // Befehlssatz haben UND das Betriebssystem muss den erweiterten
+    // Registerzustand sichern. Fehlt das zweite, faultet der erste
+    // ymm-Zugriff nach einem Kontextwechsel. Geprueft wird es ueber
+    // OSXSAVE (ecx Bit 27) und dann XCR0: Bit 1 = SSE-Zustand,
+    // Bit 2 = oberer YMM-Teil.
+    var osxsave: int64 := (ecx1 >> 27) & 1;
+    var ymmOk: int64 := 0;
+    if (osxsave != 0) {
+      var xcr0: int64 := cpu_xgetbv(0);
+      if ((xcr0 & 6) == 6) { ymmOk := 1; }
+    }
+
+    if (ymmOk != 0 && ((ecx1 >> 28) & 1) != 0) { feats := feats | CPU_FEAT_AVX; }
+    if (ymmOk != 0 && ((ecx1 >> 12) & 1) != 0) { feats := feats | CPU_FEAT_FMA; }
+
+    // --- Blatt 7, Unterblatt 0 ---------------------------------------------
+    if (cpu_leafVorhanden(7) != 0) {
+      var ebx7: int64 := cpu_id(7, 0, 1);
+      if (((ebx7 >> 3)  & 1) != 0) { feats := feats | CPU_FEAT_BMI1; }
+      if (((ebx7 >> 8)  & 1) != 0) { feats := feats | CPU_FEAT_BMI2; }
+      if (((ebx7 >> 29) & 1) != 0) { feats := feats | CPU_FEAT_SHANI; }
+      if (ymmOk != 0 && ((ebx7 >> 5) & 1) != 0) { feats := feats | CPU_FEAT_AVX2; }
+
+      // AVX-512 braucht zusaetzlich die Maskenregister (XCR0 Bit 5) und beide
+      // ZMM-Haelften (Bit 6 und 7). AVX512F ist ausserdem nur die Grundmenge;
+      // weitere Teilmengen sind EINZELN zu fragen, eine Sammelabfrage vergaebe
+      // Rechte zu weit.
+      if (osxsave != 0 && ((ebx7 >> 16) & 1) != 0) {
+        var xcr0b: int64 := cpu_xgetbv(0);
+        if ((xcr0b & 224) == 224) { feats := feats | CPU_FEAT_AVX512F; }
+      }
+    }
   }
-  if (cpu_memmem(tbuf as pchar, nread, " sse4_1", 7) != 0) {
-    feats := feats | CPU_FEAT_SSE41;
-  }
-  if (cpu_memmem(tbuf as pchar, nread, " avx2", 5) != 0) {
-    feats := feats | CPU_FEAT_AVX2;
+
+  // --- erweitertes Blatt 0x80000001: LZCNT (bei AMD "ABM") -----------------
+  // Die erweiterten Blaetter haben ihren eigenen Hoechstwert in eax von
+  // 0x80000000; die Frage nach Blatt 0 beantwortet sie nicht.
+  var maxExt: int64 := cpu_id(2147483648, 0, 0);
+  if (maxExt >= 2147483649) {
+    var ecxE: int64 := cpu_id(2147483649, 0, 2);
+    if (((ecxE >> 5) & 1) != 0) { feats := feats | CPU_FEAT_LZCNT; }
   }
 
   cpuFeaturesCache := feats;
   return feats;
 }
 
-// Convenience query functions
-pub fn CpuHasSSE2(): int64  { return (CpuFeatureDetect() & CPU_FEAT_SSE2)  != 0; }
-pub fn CpuHasSSE41(): int64 { return (CpuFeatureDetect() & CPU_FEAT_SSE41) != 0; }
-pub fn CpuHasAVX2(): int64  { return (CpuFeatureDetect() & CPU_FEAT_AVX2)  != 0; }
+// Einzelabfragen
+pub fn CpuHasSSE2(): int64    { return (CpuFeatureDetect() & CPU_FEAT_SSE2)    != 0; }
+pub fn CpuHasSSE41(): int64   { return (CpuFeatureDetect() & CPU_FEAT_SSE41)   != 0; }
+pub fn CpuHasSSE42(): int64   { return (CpuFeatureDetect() & CPU_FEAT_SSE42)   != 0; }
+pub fn CpuHasPOPCNT(): int64  { return (CpuFeatureDetect() & CPU_FEAT_POPCNT)  != 0; }
+pub fn CpuHasLZCNT(): int64   { return (CpuFeatureDetect() & CPU_FEAT_LZCNT)   != 0; }
+pub fn CpuHasAESNI(): int64   { return (CpuFeatureDetect() & CPU_FEAT_AESNI)   != 0; }
+pub fn CpuHasAVX(): int64     { return (CpuFeatureDetect() & CPU_FEAT_AVX)     != 0; }
+pub fn CpuHasAVX2(): int64    { return (CpuFeatureDetect() & CPU_FEAT_AVX2)    != 0; }
+pub fn CpuHasFMA(): int64     { return (CpuFeatureDetect() & CPU_FEAT_FMA)     != 0; }
+pub fn CpuHasBMI1(): int64    { return (CpuFeatureDetect() & CPU_FEAT_BMI1)    != 0; }
+pub fn CpuHasBMI2(): int64    { return (CpuFeatureDetect() & CPU_FEAT_BMI2)    != 0; }
+pub fn CpuHasSHANI(): int64   { return (CpuFeatureDetect() & CPU_FEAT_SHANI)   != 0; }
+pub fn CpuHasAVX512F(): int64 { return (CpuFeatureDetect() & CPU_FEAT_AVX512F) != 0; }
+
+// Ist diese Architektur ueberhaupt x86? CPUID gibt es nur dort; auf arm64,
+// riscv und den Mikrocontroller-Zielen liefert das Builtin 0, und Blatt 0
+// meldet dann eine Hoechstnummer von 0. Wer die Unterscheidung braucht, soll
+// sie ausdruecklich treffen koennen statt aus lauter Nullen zu raten.
+pub fn CpuHasCpuid(): int64 { return cpu_id(0, 0, 0) != 0; }

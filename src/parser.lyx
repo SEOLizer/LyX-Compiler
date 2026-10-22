@@ -232,6 +232,10 @@ pub con NK_WHERE:        int64 := 74;  // where clause: type X where constraint
 // in eine BENANNTE Tabelle im Erzeugnis ein, auffindbar zur Laufzeit ueber
 // std.res. sVal = Name, c0 = Knoten mit dem Pfad (NK_LIT_STR).
 pub con NK_RESOURCE:     int64 := 135;
+// #2191: `@cpu(sse4|avx2|avx512);` — Mindest-CPU ab dieser Stelle. iv = Stufe
+// (0 = baseline, 1 = sse4, 2 = avx2, 3 = avx512). Eigene Knotenart statt Bit
+// in iVal, weil dort kein Platz mehr ist (siehe ANNO-Block oben).
+pub con NK_AT_CPU:       int64 := 136;
 pub con NK_EMBED:        int64 := 134;
 pub con NK_EXTERN_DATA:  int64 := 75;  // WSP-07: extern "asm" name: Type; — externes Daten-Symbol (Linker-aufgelöst); sVal=name, c0=Typ
 
@@ -348,6 +352,15 @@ pub con ANNO_FLIGHTCRIT:     int64 := 2048; // @flight_crit
 // buildExportList las statt dessen das extern-Bit: jedes `extern fn` stand
 // als Export in der .so. Die Parser-Stellen setzen fuer @export dieses Bit.
 pub con ANNO_EXPORT_FN:      int64 := 16384;
+// #2191: @cpu(stufe) ist KEIN Bit in iVal. Dort ist kein Platz mehr: 0-7 sind
+// die Markierungen, 8-10 @energy, 11 @flight_crit, 12-13 @integrity, 14
+// @export an einer Funktion, 16-39 @stack_limit, 40-63 @wcet — frei ist allein
+// Bit 15, und eine Stufe braucht zwei. Der erste Versuch legte @cpu auf 12-13
+// und deutete damit jedes `@cpu(avx2)` als `@integrity`; aufgefallen ist es,
+// weil der Test die Meldung von @integrity bekam.
+// Stattdessen eine eigene Knotenart, wie `@energy(N);` sie auf oberster Ebene
+// schon hat (NK_AT_ENERGY): der Wert gilt ab der Stelle fuer die folgenden
+// Funktionen des Bereichs.
 // #1878: @integrity(mode: ...) — Bits 12-13 von iVal. Der MODUS steht am
 // Knoten, weil er je Funktion gilt; das INTERVALL ist programmweit (ein
 // Zeitgeber je Prozess) und liegt deshalb in `integrityIntervalMs` am Parser.
@@ -815,6 +828,11 @@ pub type Parser = class {
     if self._tokTextEq(tokIdx, "author"c)          != 0 { return 3; }
     if self._tokTextEq(tokIdx, "copyright"c)       != 0 { return 3; }
     if self._tokTextEq(tokIdx, "version"c)         != 0 { return 3; }
+    // #2191: @cpu(baseline|sse4|avx2|avx512) — Klammer verlangt, der Name wird
+    // in _parseCpuAttrArg geprueft. Form 4 und nicht 2: das Argument ist ein
+    // NAME, keine Zahl. Ohne diesen Eintrag faellt `@cpu(avx2)` in den
+    // "unbekanntes Attribut"-Zweig (#1099).
+    if self._tokTextEq(tokIdx, "cpu"c)             != 0 { return 4; }
     if self._tokTextEq(tokIdx, "capabilities"c)    != 0 { return 4; }
     if self._tokTextEq(tokIdx, "uses_caller_cap"c) != 0 { return 4; }
     if self._tokTextEq(tokIdx, "cap"c)             != 0 { return 4; }
@@ -873,7 +891,7 @@ pub type Parser = class {
       PrintStr("  @"c);
       self._printTokText(tokIdx);
       PrintStr("\n"c);
-      PrintStrLn("  Bekannt sind: @export @packed @redundant @volatile @align @energy @fastpath"c);
+      PrintStrLn("  Bekannt sind: @export @packed @redundant @volatile @align @energy @cpu @fastpath"c);
       PrintStrLn("    @big_endian @little_endian @capabilities @uses_caller_cap @cap @jni @lifecycle"c);
       PrintStrLn("    @critical @dal @wcet @stack_limit @integrity @flight_crit"c);
       PrintStrLn("    @description @author @copyright @version"c);
@@ -2212,6 +2230,11 @@ pub type Parser = class {
       if (self._tokTextEq(self.cur + 1, "energy"c) != 0) {
         self.Advance();  // consume @
         return self._parseAtEnergy();
+      }
+      // #2191: @cpu(stufe); — dieselbe Stelle, dieselbe Bauart
+      if (self._tokTextEq(self.cur + 1, "cpu"c) != 0) {
+        self.Advance();  // @
+        return self._parseAtCpu();
       }
       // WP-AS-17: @volatile var/let/co at statement level
       if (self._tokTextEq(self.cur + 1, "volatile"c) != 0) {
@@ -4687,6 +4710,10 @@ pub type Parser = class {
         self.Advance();  // WP-AS-02
         decl := self._parseAtDirectiveInt(AT_DIR_OPT_LEVEL);
       } else if (self.Peek() == TK_AT && self.Peek2() == TK_IDENT &&
+                 self._tokTextEq(self.cur + 1, "cpu"c) != 0) {
+        self.Advance();  // #2191: @cpu als Bereichsvorgabe
+        decl := self._parseAtCpu();
+      } else if (self.Peek() == TK_AT && self.Peek2() == TK_IDENT &&
                  self._tokTextEq(self.cur + 1, "energy"c) != 0) {
         self.Advance();  // WP-EN-02: @energy as top-level directive in block
         decl := self._parseAtEnergy();
@@ -4954,6 +4981,49 @@ pub type Parser = class {
   // Es gibt bewusst KEINEN stillen Standardmodus: `@integrity()` ohne `mode`
   // waere sonst ein Attribut, das nach Zusicherung aussieht und nichts tut —
   // genau der Zustand, den dieses Attribut bis 1.1.14G hatte.
+  // #2191: `@cpu(sse4)` — die Mindest-CPU einer einzelnen Funktion. Erwartet
+  // wird die oeffnende Klammer als naechstes Token (noch nicht verbraucht).
+  //
+  // Die Namen sind dieselben wie bei `--target-cpu`, damit niemand zwei
+  // Schreibweisen fuer dieselbe Sache lernen muss. Ein unbekannter Name wird
+  // GEMELDET: eine stille Deutung als baseline wuerde aus einem Tippfehler
+  // heimlich langsameren Code machen.
+  //
+  // Diese Funktion steht einmal, weil die Attributkette im Parser an fuenf
+  // Stellen aufgezaehlt wird (vor und nach `pub`, geschachtelt, Methode,
+  // freie Funktion). Fuenf Kopien derselben Auswertung waeren fuenf Orte, an
+  // denen der naechste Name fehlen kann.
+  fn _parseCpuAttrArg(): int64 {
+    self.Advance();   // (
+    var stufe: int64 := -1;
+    if (self.Check(TK_IDENT) != 0) {
+      if      (self._tokTextEq(self.cur, "baseline"c) != 0) { stufe := 0; }
+      else if (self._tokTextEq(self.cur, "sse4"c)     != 0) { stufe := 1; }
+      else if (self._tokTextEq(self.cur, "avx2"c)     != 0) { stufe := 2; }
+      else if (self._tokTextEq(self.cur, "avx512"c)   != 0) { stufe := 3; }
+      self.Advance();
+    }
+    if (stufe < 0) {
+      self._err("@cpu kennt nur baseline, sse4, avx2, avx512"c);
+      stufe := 0;
+    }
+    self.Expect(TK_RPAREN);
+    return stufe;
+  }
+
+  // #2191: `@cpu(avx2);` als eigene Anweisung bzw. vor einer Funktion auf
+  // oberster Ebene — dieselbe Bauart wie `@energy(N);` (_parseAtEnergy). Der
+  // Aufrufer hat das `@` verbraucht, `cur` steht auf "cpu".
+  fn _parseAtCpu(): int64 {
+    var ti: int64 := self.cur;
+    self.Advance();   // "cpu"
+    var stufe: int64 := self._parseCpuAttrArg();
+    self.Match(TK_SEMI);
+    var n: int64 := self._alloc(NK_AT_CPU, ti);
+    self._siv(n, stufe);
+    return n;
+  }
+
   fn _parseIntegrityArgs(): int64 {
     var mode:     int64 := 0;
     var interval: int64 := 0;
@@ -5979,6 +6049,16 @@ pub type Parser = class {
           if (head < 0) { head := dirDecl; }
           else { self._sn(tail, dirDecl); }
           tail := dirDecl;
+        }
+      } else if (self.Peek() == TK_AT && self.Peek2() == TK_IDENT &&
+                 self._tokTextEq(self.cur + 1, "cpu"c) != 0) {
+        // #2191: @cpu(stufe); auf oberster Ebene
+        self.Advance();  // consume @
+        var cpuDecl: int64 := self._parseAtCpu();
+        if (cpuDecl >= 0) {
+          if (head < 0) { head := cpuDecl; }
+          else { self._sn(tail, cpuDecl); }
+          tail := cpuDecl;
         }
       } else if (self.Peek() == TK_AT && self.Peek2() == TK_IDENT &&
                  self._tokTextEq(self.cur + 1, "energy"c) != 0) {
