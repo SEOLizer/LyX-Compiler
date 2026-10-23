@@ -14578,7 +14578,60 @@ pub type Codegen = class {
       }
     }
 
-    if (okOrder == 0 || hasGap == 0) { free(buf, pc * 8); return 0 - 1; }
+    // #2219: Ein ganzzahliges Literal an einem Gleitkomma-Parameter muss
+    // GEWANDELT werden. Bis 1.2.19E ging es als Bitmuster ins Register: die
+    // Ganzzahl 3 ist als double eine Denormalzahl nahe null, deshalb lieferte
+    // `eins(5)` 0.00 und `mittel(3, 4.0)` 2.00 — ohne Meldung. Eine
+    // ganzzahlige VARIABLE weist sema korrekt ab; nur das Literal kommt
+    // durch, und die Uebergabe hat die Wandlung nicht nachgezogen.
+    //
+    // Dieselbe Rechnung steht schon zweimal im Haus: `cg_retToF64` bei der
+    // Rueckgabe (#2004) und `cg_emitMixedToF64` bei gemischter Arithmetik
+    // (#1212). Hier wird sie nicht ein drittes Mal geschrieben, sondern ueber
+    // einen CGN_CAST auf den Parametertyp geholt — denselben Weg, den `x as
+    // f64` geht, und denselben, den die Einbettung fuer schmale Parameter
+    // benutzt (#2209).
+    //
+    // Gewandelt wird HIER und nicht an den Auswertungsstellen, weil es neun
+    // davon gibt (bis sechs Argumente, mehr als sechs, Methode, statischer
+    // Aufruf, Vorgabewerte, ...). Acht davon zu vergessen ist genau die
+    // Falle, aus der dieser Defekt kommt. Diese Stelle ist die gemeinsame
+    // Quelle: argBuf wird aus cgOrdBuf gefuellt, sobald geordnet wurde.
+    var brauchtKonv: int64 := 0;
+    if (okOrder != 0) {
+      var kn: int64 := self.cg_nc0(defFuncNi);
+      i := 0;
+      while (i < pc && kn >= 0) {
+        var av: int64 := peek64(buf + i * 8);
+        var pt: int64 := self.cg_nc0(kn);
+        if (av >= 0 && pt >= 0
+            && self.cg_isFloatTypeName(self.cg_nsval(pt), self.cg_nslen(pt)) != 0) {
+          // Bei einem benannten Argument steckt der Wert in c0 (nc0=value).
+          var wert: int64 := av;
+          if (self.cg_nkind(av) == CGN_NAMED_ARG) { wert := self.cg_nc0(av); }
+          if (self.cg_istSicherGanz(wert) != 0) {
+            var cst: int64 := self.cg_neuerKnoten();
+            var coff: int64 := self.cg_noff(cst);
+            poke64(coff + CG_OFF_KIND, CGN_CAST);
+            poke64(coff + CG_OFF_C0,   av);
+            poke64(coff + CG_OFF_C1,   pt);
+            poke64(coff + CG_OFF_C2,   0 - 1);
+            poke64(coff + CG_OFF_C3,   0 - 1);
+            poke64(coff + CG_OFF_NEXT, 0 - 1);
+            poke64(buf + i * 8, cst);
+            brauchtKonv := 1;
+          }
+        }
+        kn := self.cg_nnext(kn);
+        i := i + 1;
+      }
+    }
+
+    // Geordnet wird jetzt aus DREI Gruenden: eine Luecke, ein benanntes
+    // Argument — oder eine noetige Wandlung. Ohne den dritten liefe der
+    // gewoehnliche Aufruf weiter ueber die Knotenkette und saehe die
+    // Cast-Knoten nie.
+    if (okOrder == 0 || (hasGap == 0 && brauchtKonv == 0)) { free(buf, pc * 8); return 0 - 1; }
     self.cgOrdBuf := buf;
     return pc;
   }
@@ -15083,17 +15136,20 @@ pub type Codegen = class {
     }
     if (pz != az) { return 0; }
 
-    // #2209: Ein Gleitkomma-Parameter wird nur mit einem Gleitkomma-Argument
-    // bedient. Der echte Aufruf wandelt ein ganzzahliges Literal dort NICHT
-    // (#2219, vorbestehend: `eins(5)` liefert 0.00); eingebettet kaeme der
-    // richtige Wert heraus, und derselbe Quelltext duerfte nicht davon
-    // abhaengen, ob eingebettet wurde. Faellt #2219, kann diese Schranke weg.
+    // #2219: Ein ganzzahliges Argument an einem Gleitkomma-Parameter muss
+    // gewandelt werden. Hier stand dafuer eine Schranke (nicht einbetten),
+    // solange der echte Aufruf es still falsch rechnete — zwei Wege mit zwei
+    // Ergebnissen waeren schlimmer gewesen als ein Fehler an einer Stelle.
+    // Seit #2219 wandelt die Uebergabe selbst (cg_orderCallArgs), und die
+    // Kopie holt es unten mit demselben cg_istSicherGanz nach. Die Schranke
+    // ist damit weg, und tests/einbettung_test.sh fuehrt den Fall jetzt als
+    // EINGEBETTET statt als Ablehnung.
     var pf: int64 := self.cg_nc0(fni);
     var af: int64 := self.cg_nc0(callNi);
     while (pf >= 0 && af >= 0) {
       var pt: int64 := self.cg_nc0(pf);
       if (self.cg_isFloatTypeName(self.cg_nsval(pt), self.cg_nslen(pt)) != 0
-          && self.cg_isF64Expr(af) == 0) { return 0; }
+          && self.cg_isF64Expr(af) == 0 && self.cg_istSicherGanz(af) == 0) { return 0; }
       pf := self.cg_nnext(pf);
       af := self.cg_nnext(af);
     }

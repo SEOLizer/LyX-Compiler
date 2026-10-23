@@ -199,20 +199,20 @@ fn u8f(x: uint8): int64 { return x + 0; }
 fn main(): int64 { PrintLn(s8(200)); PrintLn(u8f(200)); return 0; }'
 laeuft "#2209: int8 und uint8 kuerzen verschieden" "$KURZU" "-56 200"
 
-# BEWUSSTE GRENZE, kein Defekt dieser Aenderung: ein ganzzahliges Literal an
-# einem f64-Parameter wird vom echten Aufruf nicht gewandelt (#2219,
-# vorbestehend — `eins(5)` liefert 0.00). Eingebettet kaeme der richtige Wert
-# heraus; derselbe Quelltext darf aber nicht davon abhaengen, ob eingebettet
-# wurde. Deshalb wird dieser Fall abgelehnt.
+# Ganzzahliges Literal an einem f64-Parameter. Das war bis 1.2.19E eine
+# bewusste GRENZE: der echte Aufruf rechnete still falsch (`eins(5)` lieferte
+# 0.00), und eingebettet waere der richtige Wert herausgekommen — derselbe
+# Quelltext haette also davon abgehangen, ob eingebettet wurde.
 #
-# Der erwartete WERT wird hier absichtlich NICHT festgeschrieben: er ist
-# heute falsch, und ein Test, der den falschen Wert festhaelt, wird beim Fix
-# von #2219 rot und sieht nach einem Regress aus. Geprueft wird nur, dass
-# nicht eingebettet wird — faellt #2219, wird diese Zeile rot und erinnert
-# daran, die Schranke in cg_betteEin zu entfernen.
-eingebettet "#2209: Ganzzahlliteral an f64-Parameter (Grenze, siehe #2219)" 'import std.io;
+# Mit #2219 wandelt die Uebergabe selbst, die Schranke in cg_betteEin ist weg,
+# und der Fall steht hier als EINGEBETTET. Genau so war es vorgesehen: der
+# Test schrieb den damals falschen Wert absichtlich NICHT fest, sonst waere er
+# beim Fix rot geworden und haette nach einem Regress ausgesehen.
+EINSL='import std.io;
 fn eins(a: f64): f64 { return a; }
-fn main(): int64 { PrintLn(FloatToStr(eins(5), 2)); return 0; }' "eins" 0
+fn main(): int64 { PrintLn(FloatToStr(eins(5), 2)); return 0; }'
+laeuft "#2219: Ganzzahlliteral an f64-Parameter, Wert stimmt" "$EINSL" "5.00"
+eingebettet "#2219: Ganzzahlliteral an f64-Parameter" "$EINSL" "eins" 1
 
 laeuft "#2208: eingebettet in einen groesseren Ausdruck" 'import std.io;
 fn dopp(x: int64): int64 { return x * 2; }
