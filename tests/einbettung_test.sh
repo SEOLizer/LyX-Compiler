@@ -266,5 +266,70 @@ abgelehnt "#2208: @flight_crit nicht eingebettet" 'import std.io;
 fn mal2(a: f64): f64 { return a * 2.0; }
 fn main(): int64 { var p: f64 := 1.5; PrintLn(FloatToStr(mal2(p), 2)); return 0; }' "3.00" "mal2"
 
+# ------------------------------------------------------------------
+# #2228: lesende Builtins im Rumpf, zusammengesetzte Argumente
+# ------------------------------------------------------------------
+
+# Die haeufigste kleine Funktion der stdlib: ein Feldzugriff ueber peek64.
+# Bis 1.2.19H zaehlte peek64 als Aufruf und sperrte die Einbettung.
+ZG='import std.io;
+import std.alloc;
+fn hole(a: int64, i: int64): int64 { return peek64(a + i * 8); }
+fn main(): int64 {
+  var a: int64 := alloc(80);
+  var i: int64 := 0;
+  while (i < 10) { poke64(a + i * 8, i * i); i := i + 1; }
+  var s: int64 := 0;
+  i := 1;
+  while (i < 10) { s := s + hole(a, i) - hole(a, i - 1); i := i + 1; }
+  PrintLn(IntToStr(s));
+  return 0;
+}'
+# Teleskopsumme: 9*9 - 0*0 = 81.
+laeuft "#2228: Zugriffsfunktion mit peek64, Wert stimmt" "$ZG" "81"
+eingebettet "#2228: Zugriffsfunktion mit peek64" "$ZG" "hole" 1
+
+# Zusammengesetztes Argument, Parameter im Rumpf EINMAL gelesen: einbetten.
+ZA='import std.io;
+fn plus1(x: int64): int64 { return x + 1; }
+fn main(): int64 { var a: int64 := 4; var b: int64 := 6; PrintLn(IntToStr(plus1(a * b - 3))); return 0; }'
+laeuft "#2228: zusammengesetztes Argument, einmal gelesen, Wert stimmt" "$ZA" "22"
+eingebettet "#2228: zusammengesetztes Argument, einmal gelesen" "$ZA" "plus1" 1
+
+# Dasselbe Argument, Parameter ZWEIMAL gelesen: nicht einbetten — die
+# Rechnung liefe doppelt.
+abgelehnt "#2228: zusammengesetztes Argument, zweimal gelesen" 'import std.io;
+fn quad(x: int64): int64 { return x * x; }
+fn main(): int64 { var a: int64 := 4; var b: int64 := 6; PrintLn(IntToStr(quad(a * b - 3))); return 0; }' "441" "quad"
+
+# Ein Parameter als ERSTES von zwei Argumenten eines Aufrufs im Rumpf. Die
+# Ersetzung kopierte ihn ohne seine Geschwisterkette — `pos` fiel aus
+# `StrCharAt(s, pos)` heraus, rsi blieb Muell (so beim Bau gefunden, im
+# Datumsparser aus std.datetime: tests/datetime_runde5_test.sh, #1603).
+ZK='import std.io;
+fn p2(s: pchar, pos: int64): int64 {
+  var a: int64 := StrCharAt(s, pos) - 48;
+  var b: int64 := StrCharAt(s, pos + 1) - 48;
+  return a * 10 + b;
+}
+fn main(): int64 {
+  var t: pchar := "2026-08-17";
+  var i: int64 := 2;
+  PrintLn(IntToStr(p2(t, 5) * 10000 + p2(t, 8) * 100 + p2(t, i)));
+  return 0;
+}'
+laeuft "#2228: Parameter vor einem weiteren Argument im Rumpf, Wert stimmt" "$ZK" "81726"
+eingebettet "#2228: Parameter vor einem weiteren Argument im Rumpf" "$ZK" "p2" 1
+
+# Eine EIGENE Funktion namens peek64 verdeckt den Builtin und hat hier eine
+# Wirkung. Als lesender Builtin behandelt, wanderten beide Argumente an
+# ihre Lesestelle im Rumpf — `b - a` wertete b zuerst aus und lieferte -1
+# (so beim Bauen aufgetreten). Der echte Aufruf wertet a, dann b aus: 1.
+laeuft "#2228: eigene Funktion namens peek64 behaelt die Reihenfolge" 'import std.io;
+var zaehler: int64 := 0;
+fn peek64(p: int64): int64 { zaehler := zaehler + 1; return zaehler; }
+fn diff(a: int64, b: int64): int64 { return b - a; }
+fn main(): int64 { PrintLn(IntToStr(diff(peek64(1), peek64(2)))); return 0; }' "1"
+
 echo "--- $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]
