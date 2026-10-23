@@ -7594,6 +7594,139 @@ pub type Codegen = class {
   //
   // Die Sprungweiten werden nachgetragen statt gezaehlt — die alten festen
   // Werte (+21, -26) waren beim naechsten eingefuegten Befehl falsch.
+  // #2192 Schnitt 2: eine Speicherform mit Basis- und Indexregister,
+  // `[basis + index]` ohne Verschiebung und ohne Skalierung — genau die Form,
+  // die die Vektorschleife braucht (`[rdi+rax]`).
+  //
+  // ModRM: mod = 00, rm = 100 (SIB folgt). SIB: scale = 00, index, basis.
+  // Mit mod = 00 bedeutet basis = 101 (rbp/r13) nicht "rbp", sondern eine
+  // 32-Bit-Verschiebung ohne Basis — deshalb hier laut abgewiesen statt
+  // still eine andere Adresse zu kodieren.
+  fn cg_vexOpRM(opcode: int64, dst: int64, src1: int64,
+                basis: int64, index: int64,
+                l: int64, pp: int64, mm: int64, w: int64) {
+    if (dst < 0 || dst > 15 || src1 < 0 || src1 > 15
+        || basis < 0 || basis > 15 || index < 0 || index > 15) {
+      EPrintStrLn("interner fehler: cg_vexOpRM: Register ausserhalb 0..15 (#2205)."c);
+      exit(1);
+    }
+    if ((basis & 7) == 5) {
+      EPrintStrLn("interner fehler: cg_vexOpRM: rbp/r13 als Basis braucht eine Verschiebung (#2205)."c);
+      exit(1);
+    }
+    if ((index & 7) == 4) {
+      EPrintStrLn("interner fehler: cg_vexOpRM: rsp/r12 ist als Index nicht kodierbar (#2205)."c);
+      exit(1);
+    }
+    self.cg_vexPrefix(dst >> 3, index >> 3, basis >> 3, src1, l, pp, mm, w);
+    self.cg_e8(opcode);
+    self.cg_e8(0x04 | ((dst & 7) << 3));          // mod 00, reg = dst, rm = SIB
+    self.cg_e8(((index & 7) << 3) | (basis & 7));  // scale 1
+  }
+
+  // #2205: derselbe Rechenschritt in 256 Bit. `l` waehlt die Breite
+  // (1 = ymm, 0 = xmm), die Register sind fest: 0 = Ergebnis, 1 = rechter
+  // Operand, Basis rdi (links), rsi (rechts), rdx (Ziel), Index rax.
+  //
+  // Geladen und gespeichert wird mit vmovups, NICHT vmovaps: die Anlage
+  // (cg_emitSimdBumpAlloc) richtet auf 16 Byte aus, 32 sind NICHT zugesichert
+  // — vmovaps faultete dort bei jeder zweiten Ablage. Die Alternative waere,
+  // die Anlage auf 32 Byte zu heben; gemessen hat die unausgerichtete Form
+  // auf dem Messgeraet keinen Unterschied gemacht, also bleibt die Anlage
+  // unberuehrt und die Entscheidung steht hier statt in einer Vermutung.
+  fn cg_emitVexF32Schritt(op: int64, l: int64) {
+    self.cg_vexOpRM(0x10, 0, 0, 7, 0, l, 0, 1, 0);   // vmovups v0, [rdi+rax]
+    self.cg_vexOpRM(0x10, 1, 0, 6, 0, l, 0, 1, 0);   // vmovups v1, [rsi+rax]
+    self.cg_vexOpRR(self.cg_sseF32Opcode(op), 0, 0, 1, l, 0, 1, 0);  // vXXXps v0, v0, v1
+    self.cg_vexOpRM(0x11, 0, 0, 2, 0, l, 0, 1, 0);   // vmovups [rdx+rax], v0
+  }
+
+  // #2205: Vektorpfad in 256 Bit, als Vorlauf der 128-Bit-Schleife.
+  //
+  // Gemessen wurde VOR dem Bauen, weil der Pfad sich nicht ueberall lohnt
+  // (bench/f32_breite.c, i5-8250U, je fuenf Laeufe, Minimum):
+  //
+  //            add    sub    mul    div
+  //   im L1    2,12x  2,00x  2,00x  1,19x
+  //   im L2    1,22x  1,62x  1,71x  1,33x
+  //   im RAM   1,03x  0,97x  1,00x  1,00x
+  //
+  // Zwei Dinge stehen damit fest. Erstens: im Cache bringt die doppelte
+  // Breite fast genau den Faktor zwei — ausser bei der Division, die
+  // dieselbe Dividiereinheit benutzt (1,19x). Zweitens: ueber dem letzten
+  // Cache bringt sie NICHTS, dort entscheidet die Speicherbandbreite. Sie
+  // kostet dort aber auch nichts, und die Laenge steht erst zur Laufzeit
+  // fest — eine Verzweigung nach Groesse waere also eine Laufzeitabfrage fuer
+  // einen Gewinn von null. Deshalb: ein Pfad fuer alle Groessen.
+  //
+  // Die Division ist mit aufgenommen, obwohl sie am wenigsten bringt. Sie ist
+  // dieselbe Schleife mit einem anderen Opcode-Byte; sie auszunehmen hiesse,
+  // einen zweiten Weg zu pflegen, der 1,19x liegenlaesst.
+  //
+  // Aufbau — drei Stufen, weil ein Rest bis zu 31 Byte lang sein kann:
+  //   32 Byte je Durchlauf, solange ein voller Block passt (VEX.256)
+  //   dann EINMAL 16 Byte, wenn noch einer passt                (VEX.128)
+  //   vzeroupper
+  //   dann bis zu drei Einzelelemente                           (SSE skalar)
+  //
+  // Die dritte Stufe ist dieselbe Pflicht wie in #2184, wo eine einzige
+  // 16-Byte-Schleife bei n = 5 zwoelf Byte hinter dem letzten Element
+  // gelesen UND geschrieben hat. Mit 32 Byte je Schritt waeren es bis zu 28.
+  fn cg_emitAVX2BinOp(op: int64) {
+    self.cg_e8(0x31); self.cg_e8(0xC0);                                      // xor eax, eax
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(0x02);  // shl rcx, 2
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x20);  // sub rcx, 32
+
+    // ---- 32 Byte je Durchlauf ----
+    var v256Start: int64 := self.codeLen;
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
+    self.cg_e8(0x7F); var jg256: int64 := self.codeLen; self.cg_e8(0);       // jg nach dem Block
+    var v256Body: int64 := self.codeLen;
+    self.cg_emitVexF32Schritt(op, 1);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x20);  // add rax, 32
+    self.cg_e8(0xEB); var back256: int64 := self.codeLen;
+    self.cg_e8(v256Start - (back256 + 1));
+
+    // ---- einmal 16 Byte, falls noch einer passt ----
+    var nach256: int64 := self.codeLen;
+    cg_patchRel8Wert(self.code, jg256, nach256 - v256Body);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x10);  // add rcx, 16  (= n*4 - 16)
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
+    self.cg_e8(0x7F); var jg128: int64 := self.codeLen; self.cg_e8(0);       // jg nach dem Block
+    var v128Body: int64 := self.codeLen;
+    self.cg_emitVexF32Schritt(op, 0);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);  // add rax, 16
+    var nach128: int64 := self.codeLen;
+    cg_patchRel8Wert(self.code, jg128, nach128 - v128Body);
+
+    // ---- zurueck in den SSE-Zustand, BEVOR ein SSE-Befehl kommt ----
+    //
+    // Ohne vzeroupper zahlt jeder folgende SSE-Befehl einen Zustandswechsel.
+    // Die Stelle ist bewusst hier und nicht am Ende: der skalare Rest unten
+    // ist SSE-Code, und auch der Aufrufer rechnet mit SSE weiter.
+    self.cg_vexZeroupper();
+
+    // ---- bis zu drei Einzelelemente, skalar ----
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x10);  // add rcx, 16  (= n*4)
+    var skStart: int64 := self.codeLen;
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
+    self.cg_e8(0x7D); var jge: int64 := self.codeLen; self.cg_e8(0);         // jge .done
+    var skBody: int64 := self.codeLen;
+    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x07);  // movss xmm0, [rdi+rax]
+    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x0C); self.cg_e8(0x06);  // movss xmm1, [rsi+rax]
+    self.cg_e8(0xF3); self.cg_e8(0x0F);
+    self.cg_e8(self.cg_sseF32Opcode(op));
+    self.cg_e8(0xC1);                                                        // addss/... xmm0, xmm1
+    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x02);  // movss [rdx+rax], xmm0
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x04);  // add rax, 4
+    self.cg_e8(0xEB); var backSk: int64 := self.codeLen;
+    self.cg_e8(skStart - (backSk + 1));
+
+    var done: int64 := self.codeLen;
+    cg_patchRel8Wert(self.code, jge, done - skBody);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                    // mov rax, rdx
+  }
+
   fn cg_emitSSE2BinOp(op: int64) {
     // xor eax, eax  (byte offset = 0)
     self.cg_e8(0x31); self.cg_e8(0xC0);
@@ -12627,7 +12760,12 @@ pub type Codegen = class {
           self.cg_e8(0x5F);  // pop rdi
           self.cg_e8(0x59);  // pop rcx
           // rdi=src1, rsi=src2, rdx=dst, rcx=count → inline SSE2 loop
-          self.cg_emitSSE2BinOp(op);
+          // #2205: ab Stufe avx2 der 256-Bit-Pfad. Ohne die Zusage bleibt
+          // es bei 128 Bit — ein VEX-Praefix auf einer aelteren CPU endet
+          // in SIGILL, und ein stiller Rueckfall waere hier genau falsch:
+          // der Code liefe, waere aber langsamer als zugesagt (#2191).
+          if (self.cg_cpuHat(2) != 0) { self.cg_emitAVX2BinOp(op); }
+          else                        { self.cg_emitSSE2BinOp(op); }
           // rax = result SIMD ptr
         } else {
           // idents but not SIMD — general path
