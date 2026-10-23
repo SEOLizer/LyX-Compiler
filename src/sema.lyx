@@ -963,6 +963,51 @@ pub type Sema = class {
     self.errorCount += 1;
   }
 
+  // #2199: Welche Elementarten darf `parallel Array<T>` tragen?
+  //
+  // Nur Gleitkomma, und das ist keine Geschmacksfrage: die Ablage hat eine
+  // Schrittweite je Elementbreite und die Vektorschleife eine Operation je
+  // Elementart. Fuer Ganzzahlen fehlt beides, und BEIDE Luecken rechneten
+  // still falsch:
+  //
+  //   * Schrittweite 4 Byte, also passte ein int64 nicht hinein —
+  //     `v[0] := 4294967296` ergab 0 (die oberen 32 Bit gingen verloren);
+  //   * die Addition lief als `addps`, also GLEITKOMMA auf dem
+  //     Ganzzahl-Bitmuster. Fuer kleine Werte stimmte das Ergebnis
+  //     zufaellig, weil denormale Floats in ihren Bits linear sind
+  //     (10 + 4 ergab 14), fuer groessere nicht mehr: `100000000 + 1`
+  //     blieb 100000000.
+  //
+  // Der zweite Fall ist der gefaehrlichere — ein Wertetest mit kleinen
+  // Zahlen waere gruen gewesen. Deshalb wird die Form jetzt ABGEWIESEN
+  // statt halb bedient. Ganzzahl-Vektoren brauchen eigene Opcodes
+  // (paddq/psubq) und einen eigenen Rest-Durchgang je Breite; das ist als
+  // Issue geführt, nicht als stiller Teilweg.
+  fn _simdElemOk(nm: pchar, nl: int64): int64 {
+    if (self._strNEq(nm, nl, "f32", 3)) { return 1; }
+    if (self._strNEq(nm, nl, "f64", 3)) { return 1; }
+    return 0;
+  }
+
+  // #2199: Den Elementtyp eines `parallel Array<T>`-Knotens pruefen. `tn` ist
+  // der Typknoten (c0 bei SNK_SIMD_NEW wie bei SNK_TYPE_PARALLEL) — zwei
+  // getrennte Stellen fuer dieselbe Frage, deshalb eine Funktion.
+  fn _simdElemPruefen(tn: int64, ni: int64) {
+    if (tn < 0) { return; }
+    if (self.sn_kind(tn) != SNK_TYPE_NAME) { return; }
+    var nm: pchar := self.sn_sVal(tn);
+    var nl: int64 := self.sn_sLen(tn);
+    if (nl <= 0) { return; }
+    if (self._simdElemOk(nm, nl) != 0) { return; }
+    self._errorNodeName("parallel Array traegt nur f32 oder f64, nicht"c, ni, nm, nl);
+    // Der Hinweis mit DERSELBEN Zeilennummer, nicht mit 0: eine zweite Zeile
+    // "line 0" sieht nach einer zweiten Fundstelle aus.
+    var hl: int64 := 0;
+    var hti: int64 := self.sn_tokIdx(ni);
+    if (hti >= 0 && hti < self.pTokCount) { hl := self.sn_tokLine(hti); }
+    self._error("  Die Ablage hat eine Schrittweite je Elementbreite, die Vektorschleife eine Operation je Elementart; fuer Ganzzahlen fehlt beides (#2199)."c, hl);
+  }
+
   fn _errorNode(msg: pchar, ni: int64) {
     var tokIdx: int64 := self.sn_tokIdx(ni);
     var line: int64 := 0;
@@ -5742,6 +5787,7 @@ pub type Sema = class {
     } else if (k == SNK_SIMD_NEW) {
       // parallel Array<T>(size) — check size expression (c1); type arg in c0
       self._checkExpr(self.sn_c1(ni));
+      self._simdElemPruefen(self.sn_c0(ni), ni);   // #2199
     }
     // Literals, NK_LIT_NULL, NK_INVALID: nothing to check
   }
@@ -5899,6 +5945,15 @@ pub type Sema = class {
       self._checkMapKeyType(typeNi);
       self._checkNestedArrayType(typeNi, ni);   // #1230
       self._pruefeTypargumente(typeNi, ni);      // #2151
+      // #2199: `var v: parallel Array<int64>` — die Elementart muss auch in
+      // der TYPANGABE geprueft werden, nicht nur am Ausdruck
+      // `parallel Array<T>(n)`. Sonst faellt die Form durch, sobald sie als
+      // Parameter- oder Rueckgabetyp steht (so in
+      // tests/lyx/simd/simd_example.lyx), und genau dort kommt sie im
+      // Bestand vor.
+      if (self.sn_kind(typeNi) == SNK_TYPE_PARALLEL) {
+        self._simdElemPruefen(self.sn_c0(typeNi), ni);
+      }
       self._pruefeKlasseOhneNew(typeNi, initNi, ni);   // #1519
       self._logReason("var-decl", ni, tid);
       if (initNi >= 0) {
@@ -7369,7 +7424,21 @@ pub type Sema = class {
           self._errorNodeName("Default-Wert muss zur Uebersetzungszeit feststehen", dv, self.sn_sVal(dp), self.sn_sLen(dp));
         }
       }
+      // #2199: Elementart eines `parallel Array<T>`-PARAMETERS. Die dritte
+      // Stelle derselben Frage (Ausdruck, Variablendeklaration, hier) — im
+      // Bestand steht die Form genau so: `fn addVectors(a: parallel
+      // Array<int64>, ...)` in tests/lyx/simd/simd_example.lyx.
+      var pt: int64 := self.sn_c0(dp);
+      if (pt >= 0 && self.sn_kind(pt) == SNK_TYPE_PARALLEL) {
+        self._simdElemPruefen(self.sn_c0(pt), dp);
+      }
       dp := self.sn_next(dp);
+    }
+
+    // #2199: und der RUECKGABETYP (`): parallel Array<int64> {`).
+    var rt: int64 := self.sn_c1(ni);
+    if (rt >= 0 && self.sn_kind(rt) == SNK_TYPE_PARALLEL) {
+      self._simdElemPruefen(self.sn_c0(rt), ni);
     }
 
     // WP-L5: extern fn-Validierung (iVal & 1 = extern)

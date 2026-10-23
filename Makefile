@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.19F
+VERSION   := 1.2.19G
 VERSION_DATE := 2026-10-23
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -347,6 +347,8 @@ test: lyxc
 	@bash tests/vex_encoder_test.sh
 	@echo "--- Vektorablage: Zuweisung rechnet in die vorhandene (#2213) ---"
 	@bash tests/vektorablage_wieder_test.sh
+	@echo "--- SIMD-Elementbreite: f64 echt, Ganzzahl abgewiesen (#2199) ---"
+	@bash tests/simd_elembreite_test.sh
 	@echo "--- AVX2-Vektorpfad: Werte, Waechter, Erzeugnis beidseitig (#2205) ---"
 	@bash tests/avx2_vektorpfad_test.sh
 	@echo "--- f64-Parameter: ganzzahliges Literal wandeln, drei Ziele (#2219) ---"
