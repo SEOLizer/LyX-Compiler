@@ -1128,6 +1128,13 @@ pub type Codegen = class {
   tlTab: int64; tlAnz: int64; tlCap: int64; tlLetzt: int64;
   // #2114: belegt gerade ein linker Operand r11 (cg_lhsRhsNachRbxRax)?
   r11Belegt: int64;
+  // #2228: codeLen direkt hinter dem letzten cg_pushRax. Steht die Pop-Stelle
+  // eines Aufrufs genau dort, wird aus `push rax; pop reg` ein `mov reg, rax`.
+  pushRaxEnde: int64;
+  // #2228: codeLen am Anfang des zuletzt ausgegebenen cmp vor einem setcc
+  // (cg_emitBinOp, cg_emitBinOpImm, cg_binOpLocalRechts). cg_genSprungWennFalsch
+  // braucht ihn, um das Paar cmp+jcc als Ganzes zu verschieben.
+  cmpAnfang: int64;
   outerFuncName:    pchar;  // name of outer function (for static link)
   outerFuncNameLen: int64;
 
@@ -5803,7 +5810,10 @@ pub type Codegen = class {
   }
 
   // push rax
-  fn cg_pushRax() { self.cg_e8(0x50); }
+  fn cg_pushRax() {
+    self.cg_e8(0x50);
+    self.pushRaxEnde := self.codeLen;   // #2228: fuer die Pop-Stelle in cg_genCall
+  }
   // pop rax
   fn cg_popRax() { self.cg_e8(0x58); }
   // pop rbx
@@ -7990,6 +8000,7 @@ pub type Codegen = class {
       return 1;
     }
     if (ext >= 0) {
+      self.cmpAnfang := self.codeLen;   // #2228: Anfang eines moeglichen cmp
       if (passt8 != 0) {
         self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0 | (ext << 3)); self.cg_e8(imm & 255);
       } else if (passt32 != 0) {
@@ -8078,6 +8089,7 @@ pub type Codegen = class {
     if (op == CGT_STAR) { istMul := 1; }
     if (opc < 0 && istMul == 0) { return 0; }
     self.cg_genExpr(lhsNi);
+    self.cmpAnfang := self.codeLen;   // #2228: Anfang eines moeglichen cmp
     var rlR: int64 := self.cg_rlReg(off);
     if (rlR >= 0) {
       // Local im Register: dieselbe Operation mit Registeroperand (r12+i).
@@ -8420,40 +8432,143 @@ pub type Codegen = class {
             && peek8(e - 4) == 0x48 && peek8(e - 3) == 0x0F && peek8(e - 2) == 0xB6 && peek8(e - 1) == 0xC0) {
           var cc: int64 := peek8(e - 6) & 15;
           self.codeLen := self.codeLen - 7;
+          // #2228: das Paar cmp+jcc darf keine 32-Byte-Grenze kreuzen
+          // (JCC-Erratum, siehe cg_paarAusrichten). Nur wenn der Anfang des cmp
+          // sicher bekannt ist: gesetzt von der Stelle, die ihn ausgegeben hat,
+          // innerhalb dieser Bedingung und hoechstens 7 Byte lang.
+          if (self.cmpAnfang >= start && self.cmpAnfang < self.codeLen
+              && self.codeLen - self.cmpAnfang <= 7) {
+            self.cg_paarAusrichten(self.cmpAnfang, 6);
+          }
           self.cg_e8(0x0F); self.cg_e8(0x80 | (cc ^ 1));         // j(nicht cc) rel32
           verschm := 1;
         }
       }
     }
     if (verschm == 0) {
+      self.cg_paarAusrichten(self.codeLen, 9);                  // #2228: test+jz zusammen
       self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);    // test rax, rax
       self.cg_e8(0x0F); self.cg_e8(0x84);                       // jz rel32
     }
   }
 
+  // #2228: JCC-Erratum (Intel Skylake bis Coffee Lake, mit dem Microcode von
+  // 2019): ein bedingter Sprung — als makrofusioniertes Paar mit seinem cmp/
+  // test —, der eine 32-Byte-Grenze KREUZT oder an ihr ENDET, wird nicht mehr
+  // aus dem uop-Cache geliefert. Gemessen am Sortieren (std/sort.lyx,
+  // Partition): eine Fassung, deren Schleifensprung `jge` bei 0x15a5d..62 die
+  // Grenze 0x15a60 kreuzte, lief 8-10 % langsamer als eine mit EINEM Befehl
+  // weniger davor. gcc behandelt das mit -mbranches-within-32B-boundaries.
+  //
+  // Das Paar beginnt bei `anfang` (schon ausgegeben bis codeLen) und ist
+  // insgesamt (codeLen - anfang) + `rest` Byte lang. Kreuzt es, werden vor
+  // `anfang` NOPs eingeschoben, bis es an der naechsten Grenze beginnt.
+  // Zwischen anfang und codeLen steht nur der cmp/test selbst — ohne Patch,
+  // ohne Sprungziel (die Bedingung beginnt davor).
+  //
+  // Die Adresse rechnet mit dem Textbeginn des ELF-Programms (Datei-Offset
+  // 0xb0, also 16 mod 32). In anderen Ausgabeformaten ist die Ausrichtung
+  // dann nur ungenau, nie falsch: NOPs aendern keine Bedeutung.
+  fn cg_paarAusrichten(anfang: int64, rest: int64) {
+    var a: int64 := anfang + 0xb0;
+    var ende: int64 := self.codeLen + rest + 0xb0;          // exklusiv
+    if ((a >> 5) == ((ende - 1) >> 5) && (ende & 31) != 0) { return; }
+    var pad: int64 := 32 - (a & 31);
+    var lang: int64 := self.codeLen - anfang;
+    var i: int64 := 0;
+    while (i < pad) { self.cg_e8(0x90); i += 1; }            // Platz schaffen (codeLen waechst, Puffer ok)
+    // cmp/test nach hinten verschieben (von hinten, die Bereiche ueberlappen).
+    // Kein Sprungpatch — das Ziel des Waechters cg_patchRel8 (#1915) sind
+    // Sprungweiten, hier werden ganze Befehlsbytes umgesetzt.
+    var quelle: int64 := self.code + anfang;
+    var ziel:   int64 := quelle + pad;
+    i := lang - 1;
+    while (i >= 0) {
+      poke8(ziel + i, peek8(quelle + i));
+      i -= 1;
+    }
+    self.cg_nopsSchreiben(anfang, pad);
+  }
+
+  // Mehrbyte-NOPs (Intel-Empfehlung) in [pos, pos+n) schreiben.
+  fn cg_nopsSchreiben(pos: int64, n: int64) {
+    var p: int64 := pos;
+    var rest: int64 := n;
+    while (rest > 0) {
+      var k: int64 := rest;
+      if (k > 9) { k := 9; }
+      var b: int64 := self.code + p;
+      if (k == 1) { poke8(b, 0x90); }
+      else if (k == 2) { poke8(b, 0x66); poke8(b + 1, 0x90); }
+      else if (k == 3) { poke8(b, 0x0F); poke8(b + 1, 0x1F); poke8(b + 2, 0x00); }
+      else if (k == 4) { poke8(b, 0x0F); poke8(b + 1, 0x1F); poke8(b + 2, 0x40); poke8(b + 3, 0x00); }
+      else if (k == 5) { poke8(b, 0x0F); poke8(b + 1, 0x1F); poke8(b + 2, 0x44); poke8(b + 3, 0x00); poke8(b + 4, 0x00); }
+      else if (k == 6) { poke8(b, 0x66); poke8(b + 1, 0x0F); poke8(b + 2, 0x1F); poke8(b + 3, 0x44); poke8(b + 4, 0x00); poke8(b + 5, 0x00); }
+      else if (k == 7) { poke8(b, 0x0F); poke8(b + 1, 0x1F); poke8(b + 2, 0x80); poke32(b + 3, 0); }
+      else if (k == 8) { poke8(b, 0x0F); poke8(b + 1, 0x1F); poke8(b + 2, 0x84); poke8(b + 3, 0x00); poke32(b + 4, 0); }
+      else { poke8(b, 0x66); poke8(b + 1, 0x0F); poke8(b + 2, 0x1F); poke8(b + 3, 0x84); poke8(b + 4, 0x00); poke32(b + 5, 0); }
+      p += k;
+      rest -= k;
+    }
+  }
+
   // #2114: Ist der Ausdruck "rein" — nur Ganzzahl-Locals, Konstanten und
   // Arithmetik, kein Aufruf, kein Systemaufruf, kein Gleitkomma? Dann
-  // beruehrt seine Auswertung r10/r11 nicht, und ein linker Operand kann
-  // dort statt auf dem Stapel warten (cg_binOpSpill).
+  // beruehrt seine Auswertung nur rax/rbx/rcx/rdx und die Halteregister
+  // oberhalb des eigenen (cg_lhsRhsNachRbxRax), und ein linker Operand kann
+  // dort statt auf dem Stapel warten.
   // #2114: links nach rbx, rechts nach rax (die Konvention von cg_emitBinOp).
   // Ist die rechte Seite rein (cg_exprRein) und r11 frei, wartet links in
   // r11 statt auf dem Stapel — push/pop lag auf dem kritischen Pfad jeder
   // Rotation `(x << k) | (x >> m)` (Store->Load-Weiterleitung). r10 nicht:
   // dort liegt beim Aufruf einer inneren Funktion der statische Link.
+  //
+  // #2228: Nicht nur r11, sondern ein kleiner STAPEL von Halteregistern —
+  // r11, r9, r8, rdi, rsi, in dieser Reihenfolge. r11Belegt zaehlt, wie
+  // viele davon gerade einen wartenden linken Operanden halten. Mit nur r11
+  // fiel jede zweite Verschachtelung auf push/pop zurueck: in SHA-256
+  // `((a >> 13) | (a << 19))` innerhalb eines Ausdrucks, der schon in r11
+  // wartete — 17,5 % der Befehle des Blocks waren push/pop.
+  //
+  // Warum die vier zusaetzlichen frei sind: eine reine rechte Seite
+  // (cg_exprRein) rechnet nur ueber rax/rbx/rcx/rdx und die hoeheren
+  // Stapelplaetze. Und kein Codegenpfad haelt einen Wert in rdi/rsi/r8/r9
+  // ueber ein cg_genExpr hinweg — ein allgemeiner Ausdruck kann ohnehin eine
+  // Funktion rufen, die alle vier ueberschreibt (SysV: vom Aufrufer zu
+  // sichern). Dieselbe Ueberlegung, die r11 in #2114 zulaessig gemacht hat.
   fn cg_lhsRhsNachRbxRax(lhsNi: int64, rhsNi: int64) {
-    if (self.r11Belegt == 0 && self.cg_exprRein(rhsNi, 0) != 0) {
+    if (self.r11Belegt < 5 && self.cg_exprRein(rhsNi, 0) != 0) {
+      var h: int64 := self.r11Belegt;
       self.cg_genExpr(lhsNi);
-      self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC3);       // mov r11, rax
-      self.r11Belegt := 1;
+      self.cg_movHalteRax(h);                                      // mov <Halteregister h>, rax
+      self.r11Belegt := h + 1;
       self.cg_genExpr(rhsNi);
-      self.r11Belegt := 0;
-      self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xDB);       // mov rbx, r11
+      self.r11Belegt := h;
+      self.cg_movRbxHalte(h);                                      // mov rbx, <Halteregister h>
       return;
     }
     self.cg_genExpr(lhsNi);
     self.cg_pushRax();
     self.cg_genExpr(rhsNi);
     self.cg_popRbx();
+  }
+
+  // #2228: Halteregister h (0..4) = r11, r9, r8, rdi, rsi.
+  fn cg_movHalteRax(h: int64) {
+    if (h == 0) { self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC3); }        // mov r11, rax
+    else if (h == 1) { self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC1); }   // mov r9, rax
+    else if (h == 2) { self.cg_e8(0x49); self.cg_e8(0x89); self.cg_e8(0xC0); }   // mov r8, rax
+    else if (h == 3) { self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7); }   // mov rdi, rax
+    else if (h == 4) { self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6); }   // mov rsi, rax
+    else { EPrintStrLn("lyxc: interner Fehler (#2228): Halteregister ausserhalb 0..4"c); exit(70); }
+  }
+  fn cg_movRbxHalte(h: int64) {
+    if (h == 0) { self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xDB); }        // mov rbx, r11
+    else if (h == 1) { self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xCB); }   // mov rbx, r9
+    else if (h == 2) { self.cg_e8(0x4C); self.cg_e8(0x89); self.cg_e8(0xC3); }   // mov rbx, r8
+    else if (h == 3) { self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xFB); }   // mov rbx, rdi
+    else if (h == 4) { self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xF3); }   // mov rbx, rsi
+    else { EPrintStrLn("lyxc: interner Fehler (#2228): Halteregister ausserhalb 0..4"c); exit(70); }
   }
 
   fn cg_exprRein(ni: int64, tiefe: int64): int64 {
@@ -8580,14 +8695,17 @@ pub type Codegen = class {
       self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD8);  // mov rax, rbx
     } else if (op == CGT_EQ2) {
       // cmp rbx, rax; sete al; movzx rax, al
+      self.cmpAnfang := self.codeLen;                        // #2228
       self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);  // cmp rbx, rax
       self.cg_e8(0x0F); self.cg_e8(0x94); self.cg_e8(0xC0);  // sete al
       self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);
     } else if (op == CGT_NEQ) {
+      self.cmpAnfang := self.codeLen;                        // #2228
       self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);  // cmp rbx, rax
       self.cg_e8(0x0F); self.cg_e8(0x95); self.cg_e8(0xC0);  // setne al
       self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);
     } else if (op == CGT_LT) {
+      self.cmpAnfang := self.codeLen;                        // #2228
       self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);  // cmp rbx, rax
       self.cg_e8(0x0F);
       if (cmpUnsigned != 0) { self.cg_e8(0x92); }   // setb al  — unsigned <
@@ -8595,6 +8713,7 @@ pub type Codegen = class {
       self.cg_e8(0xC0);
       self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);
     } else if (op == CGT_LE) {
+      self.cmpAnfang := self.codeLen;                        // #2228
       self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);
       self.cg_e8(0x0F);
       if (cmpUnsigned != 0) { self.cg_e8(0x96); }   // setbe al — unsigned <=
@@ -8602,6 +8721,7 @@ pub type Codegen = class {
       self.cg_e8(0xC0);
       self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);
     } else if (op == CGT_GT) {
+      self.cmpAnfang := self.codeLen;                        // #2228
       self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);
       self.cg_e8(0x0F);
       if (cmpUnsigned != 0) { self.cg_e8(0x97); }   // seta al  — unsigned >
@@ -8609,6 +8729,7 @@ pub type Codegen = class {
       self.cg_e8(0xC0);
       self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB6); self.cg_e8(0xC0);
     } else if (op == CGT_GE) {
+      self.cmpAnfang := self.codeLen;                        // #2228
       self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC3);
       self.cg_e8(0x0F);
       if (cmpUnsigned != 0) { self.cg_e8(0x93); }   // setae al — unsigned >=
@@ -16245,12 +16366,24 @@ pub type Codegen = class {
     var dAb: int64 := self.direktAb - 1;
     self.direktAb := 0;
     if (dAb >= 0) { gepusht := dAb; }
-    if (gepusht >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9  (arg5)
-    if (gepusht >= 5) { self.cg_e8(0x41); self.cg_e8(0x58); }  // pop r8  (arg4)
-    if (gepusht >= 4) { self.cg_popRcx(); }                      // pop rcx (arg3)
-    if (gepusht >= 3) { self.cg_popRdx(); }                      // pop rdx (arg2)
-    if (gepusht >= 2) { self.cg_popRsi(); }                      // pop rsi (arg1)
-    if (gepusht >= 1) { self.cg_popRdi(); }                      // pop rdi (arg0)
+    // #2228: Wurde das letzte Argument EBEN gepusht (nichts dazwischen), wird
+    // `push rax; pop reg` zu `mov reg, rax` — der Wert steht noch in rax. Das
+    // war die haeufigste Form ueberhaupt (`peek32(K + i * 4)`: push, pop rdi).
+    // Ein Sprungziel zwischen push und pop gibt es nicht: ein Weg, der den
+    // push uebersprungen haette, haette den Stapel unausgeglichen hinterlassen.
+    var oberstes: int64 := gepusht;
+    if (gepusht >= 1 && gepusht <= 6 && self.pushRaxEnde == self.codeLen
+        && peek8(self.code + self.codeLen - 1) == 0x50) {
+      self.codeLen := self.codeLen - 1;                          // push rax zuruecknehmen
+      self.cg_movArgRegRax(gepusht - 1);
+      oberstes := gepusht - 1;
+    }
+    if (oberstes >= 6) { self.cg_e8(0x41); self.cg_e8(0x59); }  // pop r9  (arg5)
+    if (oberstes >= 5) { self.cg_e8(0x41); self.cg_e8(0x58); }  // pop r8  (arg4)
+    if (oberstes >= 4) { self.cg_popRcx(); }                      // pop rcx (arg3)
+    if (oberstes >= 3) { self.cg_popRdx(); }                      // pop rdx (arg2)
+    if (oberstes >= 2) { self.cg_popRsi(); }                      // pop rsi (arg1)
+    if (oberstes >= 1) { self.cg_popRdi(); }                      // pop rdi (arg0)
     if (dAb >= 0) {
       var di: int64 := 0;
       var da: int64 := self.direktArgs;
