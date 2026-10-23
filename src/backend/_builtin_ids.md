@@ -494,16 +494,27 @@ stilles Nichts.
 |----|-----------|----------|-------|----------|
 | 253 | CPUID, ein Register der Antwort | `cpu_id(leaf, subleaf, welches)` | x86-Familie; auf anderen Architekturen senkt ir_lower auf die Konstante 0 | #2187 |
 | 254 | XGETBV (XCR0) | `cpu_xgetbv(index)` | wie 253 | #2187 |
-| 255 | gesetzte Bits | `popcount(x)` | lyxos, arm64 (CNT+ADDV), riscv (gerechnet) | #2190 |
-| 256 | führende Nullen, `clz(0) == 64` | `clz(x)` | lyxos (BSR + Nullfall), arm64 (CLZ), riscv (gerechnet) | #2190 |
-| 257 | nachlaufende Nullen, `ctz(0) == 64` | `ctz(x)` | lyxos (BSF + Nullfall), arm64 (RBIT+CLZ), riscv (gerechnet) | #2190 |
-| 258 | Bytetausch | `bswap64(x)` | lyxos (BSWAP), arm64 (REV), riscv (gerechnet) | #2190 |
-| 259 | Linksrotation, Weite mod 64 | `rotl(x, n)` | lyxos (ROL), arm64 (NEG+ROR), riscv (SLL/SRL/OR) | #2190 |
-| 260 | Rechtsrotation, Weite mod 64 | `rotr(x, n)` | lyxos (ROR), arm64 (ROR), riscv (SRL/SLL/OR) | #2190 |
-| 261 | Linksrotation der unteren 32 Bit, Weite mod 32, Ergebnis null-erweitert | `rotl32(x, n)` | lyxos (ROL r32), arm64 (NEG+ROR w), riscv (SLL/SRL/OR, auf 32 Bit gekuerzt) | #2177 |
-| 262 | Rechtsrotation der unteren 32 Bit, Weite mod 32 | `rotr32(x, n)` | lyxos (ROR r32), arm64 (ROR w), riscv (SRL/SLL/OR) | #2177 |
+| 255 | gesetzte Bits | `popcount(x)` | lyxos, arm64 (CNT+ADDV), riscv (gerechnet), arm-cm4 (SWAR+MUL), esp32 (SWAR) | #2190 |
+| 256 | führende Nullen, `clz(0) == 64` | `clz(x)` | lyxos (BSR + Nullfall), arm64 (CLZ), riscv (gerechnet), arm-cm4 (CLZ), esp32 (Binaersuche) | #2190 |
+| 257 | nachlaufende Nullen, `ctz(0) == 64` | `ctz(x)` | lyxos (BSF + Nullfall), arm64 (RBIT+CLZ), riscv (gerechnet), arm-cm4 (RBIT+CLZ), esp32 (x & -x, Binaersuche) | #2190 |
+| 258 | Bytetausch | `bswap64(x)` | lyxos (BSWAP), arm64 (REV), riscv (gerechnet); arm-cm4/esp32 laut abgewiesen (32-Bit-Wort) | #2190 |
+| 259 | Linksrotation, Weite mod 64 | `rotl(x, n)` | lyxos (ROL), arm64 (NEG+ROR), riscv (SLL/SRL/OR); arm-cm4/esp32 laut abgewiesen | #2190 |
+| 260 | Rechtsrotation, Weite mod 64 | `rotr(x, n)` | lyxos (ROR), arm64 (ROR), riscv (SRL/SLL/OR); arm-cm4/esp32 laut abgewiesen | #2190 |
+| 261 | Linksrotation der unteren 32 Bit, Weite mod 32, Ergebnis null-erweitert | `rotl32(x, n)` | lyxos (ROL r32), arm64 (NEG+ROR w), riscv (SLL/SRL/OR, auf 32 Bit gekuerzt), arm-cm4 (NEG+ROR), esp32 (SSL+SRC) | #2177 |
+| 262 | Rechtsrotation der unteren 32 Bit, Weite mod 32 | `rotr32(x, n)` | lyxos (ROR r32), arm64 (ROR w), riscv (SRL/SLL/OR), arm-cm4 (ROR), esp32 (SSR+SRC) | #2177 |
 
 Auf x86 sind 255 … 257 an die CPU-Stufe gebunden (`--target-cpu`, `@cpu`):
 ohne Zusage wird gerechnet statt `POPCNT`/`LZCNT`/`TZCNT` zu emittieren, weil
 keiner der drei zum Grundbestand von x86-64 gehört (#2191). `bswap64`, `rotl`,
 `rotr`, `rotl32` und `rotr32` gibt es seit dem 486 bzw. 8086 und werden ungated emittiert.
+
+Auf **arm-cm4** und **esp32** (#2228) haelt das Backend einen int64-Wert als
+EIN 32-Bit-Wort; Vergleiche, Division und PrintInt lesen es vorzeichenbehaftet,
+der dargestellte Wert ist also die Vorzeichenerweiterung. Gerechnet wird unter
+genau dieser Annahme: fuer jeden Wert in [-2^31, 2^31) stimmen popcount/clz/ctz
+mit x86 ueberein (`popcount(-1) == 64`, `clz(0) == ctz(0) == 64`). Ein
+32-Bit-Wort >= 2^31 gilt dort als negativ — `popcount(0xFFFFFFFF)` ist auf
+diesen Zielen 64, auf x86 32. rotl32/rotr32 liefern exakt die 32 Ergebnisbits.
+`bswap64`, `rotl` und `rotr` brauchen das obere Wort und werden laut
+abgewiesen. Esp32 benutzt nur Kernbefehle (SRC, SRLI, SRAI) — NSAU und MULL
+sind Optionen.

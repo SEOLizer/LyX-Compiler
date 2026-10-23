@@ -107,5 +107,14 @@ ausgabe "strlen" 'fn main(): int64 { PrintInt(StrLen("abcdef"c)); PrintLn(""c); 
 ausgabe "inttostrin"  'import src.std.string_in; fn main(): int64 { var b: int64 := 0x20001800; var n: int64 := IntToStrIn(0-1234, b, 32); var s: pchar := b as pchar; PrintLn(s); return 0; }' "-1234"
 ausgabe "strsubin"    'import src.std.string_in; fn main(): int64 { var b: int64 := 0x20001800; var m: int64 := StrSubIn("abcdef"c, 2, 3, b, 32); var s: pchar := b as pchar; PrintLn(s); return 0; }' "cde"
 
+# #2228: Rahmen ueber 508 Byte. SUB sp traegt in der 16-Bit-Form nur sieben
+# Bit; ein groesserer Rahmen wurde still gekuerzt, die oberen Slots lagen auf
+# dem geretteten r7/lr. Gemessen: der Rueckgabewert kam beim Aufrufer als 0
+# an, danach Lockup. 160 Variablen sind rund 170 Slots.
+GROSS="fn f(): int64 {"
+for i in $(seq 1 160); do GROSS="$GROSS var v$i: int64 := $i;"; done
+GROSS="$GROSS return v42 + v160 - 160; } fn main(): int64 { PrintInt(f()); PrintLn(\"\"c); return 0; }"
+ausgabe "grosser_rahmen" "$GROSS" "42"
+
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]

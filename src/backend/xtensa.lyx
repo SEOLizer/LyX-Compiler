@@ -278,6 +278,36 @@ pub type EmitXtensa = class {
     self.xt_e3((s2 & 15) << 4, (ar << 4) | as_, (((s2 >> 4) & 1) << 4) | 1);
   }
 
+  // #2228: Schiebe- und Trichterbefehle fuer die Bit-Rechenwerke (255-262).
+  // Alle drei gehoeren zum KERN der Xtensa-ISA, nicht zu einer Option
+  // (anders als MULL/NSAU) — sie laufen also auf jedem Kern, und die Tests
+  // fuehren sie unter qemu aus (tests/bit_builtins_alle_ziele_test.sh).
+  //
+  // SRLI ar, at, sa (sa 0..15): RRR op1 = 1, op2 = 4, s = sa.
+  fn xt_SRLI(ar: int64, at: int64, sa: int64) {
+    if sa < 0 || sa > 15 {
+      EPrintStr("error: xtensa: SRLI-Weite "c); EPrintInt(sa); EPrintStrLn(" ausserhalb 0..15."c);
+      exit(1);
+    }
+    self.xt_e3(at << 4, (ar << 4) | sa, 0x41);
+  }
+  // Logisch schieben um 0..31: SRLI traegt nur vier Bit Weite, groessere
+  // Weiten in zwei Schritten.
+  fn xt_srl_k(ar: int64, at: int64, sa: int64) {
+    if sa > 30 { self.xt_SRLI(ar, at, 15); self.xt_SRLI(ar, ar, 15); self.xt_SRLI(ar, ar, sa - 30); }
+    else if sa > 15 { self.xt_SRLI(ar, at, 15); self.xt_SRLI(ar, ar, sa - 15); }
+    else { self.xt_SRLI(ar, at, sa); }
+  }
+  // SRAI ar, at, sa (sa 0..31): RRR op1 = 1, op2 = 001x mit x = sa Bit 4.
+  fn xt_SRAI(ar: int64, at: int64, sa: int64) {
+    self.xt_e3(at << 4, (ar << 4) | (sa & 15), ((2 | ((sa >> 4) & 1)) << 4) | 1);
+  }
+  // SRC ar, as, at: ar = untere 32 Bit von (as:at) >> SAR. RRR op1 = 1, op2 = 8.
+  // Mit as == at ist das eine Rechtsrotation um SAR.
+  fn xt_SRC(ar: int64, as_: int64, at: int64) {
+    self.xt_e3(at << 4, (ar << 4) | as_, 0x81);
+  }
+
   // --------------------------------------------------------------------------
   // CALL format: b0=((off18&3)<<6)|(n<<4)|op0
   // #1786, beide gegen den Disassembler gegengelesen:
@@ -1293,6 +1323,10 @@ pub type EmitXtensa = class {
       self.xt_storeSlot(dest);
       return;
     }
+    if id >= 255 && id <= 262 {
+      self.xt_emitBitBuiltin(id, sB, dest);
+      return;
+    }
     if id == 1 {
       // PrintStr: a2 = pchar from slot 0, call printstr helper
       self.xt_loadSlot(0);                    // T0 (a8) = slot[0] = str ptr
@@ -1321,6 +1355,133 @@ pub type EmitXtensa = class {
       self._builtinUnsupportedXT(id);
     }
   }
+  // #2228: Bit-Rechenwerke (#2190, #2177) auf Xtensa.
+  //
+  // DARSTELLUNG: dieses Backend haelt jeden int64-Wert als EIN 32-Bit-Wort
+  // im Slot (xt_loadSlot/xt_storeSlot, L32I/S32I). Vergleiche (SUB+BLTZ),
+  // Division und PrintInt lesen das Wort vorzeichenbehaftet; der dargestellte
+  // int64-Wert ist also die Vorzeichenerweiterung des Wortes. Gerechnet wird
+  // genau unter dieser Annahme — fuer jeden Wert in [-2^31, 2^31) ist das
+  // Ergebnis dasselbe wie auf x86:
+  //
+  //   popcount(x) = popcount32(w) + (w < 0 ? 32 : 0)
+  //   clz(x)      = w < 0 ? 0 : 32 + clz32(w)          (clz(0) == 64)
+  //   ctz(x)      = w == 0 ? 64 : ctz32(w)
+  //   rotl32/rotr32: das Ergebniswort sind exakt die unteren 32 Bit des
+  //     x86-Ergebnisses. Ein Ergebnis >= 2^31 liest dieses Ziel — wie jede
+  //     solche Konstante — als negativ; mit Maske/Addition/XOR weiterrechnen
+  //     (Krypto) ist davon nicht betroffen.
+  //
+  // bswap64, rotl und rotr (64 Bit) haben KEIN darstellbares Ergebnis: die
+  // unteren 32 Bit des Ergebnisses kommen aus dem oberen Wort, das es hier
+  // nicht gibt. Sie werden laut abgewiesen statt still auf 32 Bit gerechnet.
+  //
+  // Nur Kernbefehle: NSAU (clz) gehoert zur NSA-Option, MULL zur Mul32-Option
+  // — beides hat der hier pruefbare qemu-Kern nicht sicher (vgl. #1790).
+  // clz32 entsteht deshalb als Binaersuche, popcount32 als SWAR ohne MUL,
+  // die Rotationen ueber den Trichterschieber SRC (Kern-ISA).
+  //
+  // Dieselbe Rechnung steht in arm_cm_backend.lyx (cm_emitBitBuiltin) — die
+  // beiden muessen uebereinstimmen.
+  fn xt_emitBitBuiltin(id: int64, sB: int64, dest: int64) {
+    if id == 258 || id == 259 || id == 260 {
+      EPrintStr("error: xtensa: "c);
+      if id == 258 { EPrintStr("bswap64"c); }
+      if id == 259 { EPrintStr("rotl"c); }
+      if id == 260 { EPrintStr("rotr"c); }
+      EPrintStrLn(" braucht 64 Bit — dieses Ziel haelt int64 als ein 32-Bit-Wort (#2228)."c);
+      EPrintStrLn("  Die unteren 32 Bit des Ergebnisses kaemen aus dem oberen Wort, das es"c);
+      EPrintStrLn("  hier nicht gibt; ein Ergebnis auf 32 Bit waere still falsch."c);
+      EPrintStrLn("  Fuer 32-Bit-Woerter: rotl32/rotr32."c);
+      exit(1);
+    }
+    self.xt_loadSlot(sB);
+    self.xt_MOV(XT_A3, XT_T0);                  // a3 = w
+    if id == 261 || id == 262 {
+      self.xt_loadSlot(sB + 1);                 // T0 = Weite
+      // SSL: SAR = 32 - (n & 31), SSR: SAR = n & 31 — die Weite mod 32
+      // liefert der Befehl selbst, auch fuer negative n.
+      if id == 261 { self.xt_SSL(XT_T0); } else { self.xt_SSR(XT_T0); }
+      self.xt_SRC(XT_T0, XT_A3, XT_A3);
+      self.xt_storeSlot(dest);
+      return;
+    }
+    if id == 255 {
+      // SWAR: Paare, Vierer, Achter, dann Bytesummen aufaddieren.
+      self.xt_MOV(XT_A4, XT_A3);
+      self.xt_SRLI(XT_A5, XT_A4, 1);
+      self.xt_li(XT_A6, 0x55555555);
+      self.xt_AND(XT_A5, XT_A5, XT_A6);
+      self.xt_SUB(XT_A4, XT_A4, XT_A5);
+      self.xt_li(XT_A6, 0x33333333);
+      self.xt_SRLI(XT_A5, XT_A4, 2);
+      self.xt_AND(XT_A5, XT_A5, XT_A6);
+      self.xt_AND(XT_A4, XT_A4, XT_A6);
+      self.xt_ADD(XT_A4, XT_A4, XT_A5);
+      self.xt_SRLI(XT_A5, XT_A4, 4);
+      self.xt_ADD(XT_A4, XT_A4, XT_A5);
+      self.xt_li(XT_A6, 0x0F0F0F0F);
+      self.xt_AND(XT_A4, XT_A4, XT_A6);
+      self.xt_SRLI(XT_A5, XT_A4, 8);
+      self.xt_ADD(XT_A4, XT_A4, XT_A5);
+      self.xt_srl_k(XT_A5, XT_A4, 16);
+      self.xt_ADD(XT_A4, XT_A4, XT_A5);
+      self.xt_MOVI(XT_A6, 63);
+      self.xt_AND(XT_A4, XT_A4, XT_A6);
+      // oberes Wort = Vorzeichenerweiterung: bei w < 0 32 weitere Bits.
+      self.xt_SRAI(XT_A5, XT_A3, 31);
+      self.xt_MOVI(XT_A6, 32);
+      self.xt_AND(XT_A5, XT_A5, XT_A6);
+      self.xt_ADD(XT_T0, XT_A4, XT_A5);
+      self.xt_storeSlot(dest);
+      return;
+    }
+    if id == 256 {
+      self.xt_MOV(XT_A4, XT_A3);
+      self.xt_emitClz32();                      // a5 = clz32(a4)
+      var cNeg: int64 := self.codeLen;
+      self.xt_BLTZ(XT_A3, 0);                   // w < 0: oberes Wort voll Einsen → 0
+      self.xt_ADDI(XT_A5, XT_A5, 32);
+      self.xt_patchBRI12(cNeg, 9, self.codeLen);
+      self.xt_MOV(XT_T0, XT_A5);
+      self.xt_storeSlot(dest);
+      return;
+    }
+    // id == 257: ctz. Niedrigstes Bit isolieren (w & -w), dann 31 - clz32.
+    self.xt_NEG(XT_A4, XT_A3);
+    self.xt_AND(XT_A4, XT_A4, XT_A3);
+    self.xt_emitClz32();
+    self.xt_MOVI(XT_A4, 31);
+    self.xt_SUB(XT_A5, XT_A4, XT_A5);
+    var tNz: int64 := self.codeLen;
+    self.xt_BNEZ(XT_A3, 0);                     // w == 0 → ctz(0) == 64
+    self.xt_MOVI(XT_A5, 64);
+    self.xt_patchBRI12(tNz, 5, self.codeLen);
+    self.xt_MOV(XT_T0, XT_A5);
+    self.xt_storeSlot(dest);
+  }
+
+  // #2228: a5 = clz32(a4), a4 und a6 werden verbraucht. Binaersuche ueber
+  // 16/8/4/2/1 Bit; danach ist a4 genau dann 0, wenn es vorher 0 war — dann
+  // ist clz32 = 32, nicht 31. Spruenge werden nachgetragen, nicht gezaehlt.
+  fn xt_emitClz32() {
+    self.xt_MOVI(XT_A5, 0);
+    var k: int64 := 16;
+    while k >= 1 {
+      self.xt_srl_k(XT_A6, XT_A4, 32 - k);       // a6 = obere k Bit
+      var b: int64 := self.codeLen;
+      self.xt_BNEZ(XT_A6, 0);
+      self.xt_ADDI(XT_A5, XT_A5, k);
+      self.xt_SLLI(XT_A4, XT_A4, k);
+      self.xt_patchBRI12(b, 5, self.codeLen);
+      k := k / 2;
+    }
+    var bNull: int64 := self.codeLen;
+    self.xt_BNEZ(XT_A4, 0);
+    self.xt_ADDI(XT_A5, XT_A5, 1);
+    self.xt_patchBRI12(bNull, 5, self.codeLen);
+  }
+
   fn _builtinUnsupportedXT(id: int64) {
     EPrintStr("error: xtensa: Builtin-ID "c);
     EPrintInt(id);
