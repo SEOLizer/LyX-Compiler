@@ -124,10 +124,31 @@ pub type EmitARMCM = class {
   fn cm_MOV_sp_r7() { self.cm_e16(0x46BD); }
 
   // SUB sp, sp, #bytes: T2 = 0xB080 | (bytes/4) — bytes must be multiple of 4, <= 508
-  fn cm_SUB_sp(bytes: int64) { self.cm_e16(0xB080 | ((bytes >> 2) & 0x7F)); }
+  //
+  // #2228: Die 16-Bit-Form traegt nur sieben Bit (508 Byte = 127 Slots). Bis
+  // 1.2.x wurde ein groesserer Rahmen still mit `& 0x7F` gekuerzt: der Rahmen
+  // war zu klein, die oberen Slots lagen auf dem geretteten r7/lr, und eine
+  // Funktion mit vielen Temporaeren lieferte ihren Rueckgabewert nicht ab
+  // (gemessen: `return 42` kam beim Aufrufer als 0 an, danach Lockup).
+  // Groessere Rahmen jetzt ueber SUBW/ADDW (zwoelf Bit, bis 4095 Byte) — so
+  // weit reicht auch die Slot-Adressierung (cm_LDR_sp); darueber laut.
+  fn cm_SUB_sp(bytes: int64) { self.cm_spImm(bytes, 0xB080, 0xF2AD); }
   // #1765: Gegenstueck zu cm_SUB_sp — gibt den Platz der Stapelargumente
   // nach dem Aufruf wieder frei.
-  fn cm_ADD_sp(bytes: int64) { self.cm_e16(0xB000 | ((bytes >> 2) & 0x7F)); }
+  fn cm_ADD_sp(bytes: int64) { self.cm_spImm(bytes, 0xB000, 0xF20D); }
+  fn cm_spImm(bytes: int64, kurz: int64, lang: int64) {
+    if bytes < 0 || bytes > 4095 {
+      EPrintStr("error: arm-cm: Stapelrahmen von "c); EPrintInt(bytes);
+      EPrintStrLn(" Byte — mehr als 4095 erreicht die Slot-Adressierung nicht (#2228)."c);
+      exit(1);
+    }
+    if bytes <= 508 && (bytes & 3) == 0 {
+      self.cm_e16(kurz | (bytes >> 2));
+    } else {
+      // ADDW/SUBW SP, SP, #imm12 (T4): i:imm3:imm8.
+      self.cm_t32(lang | (((bytes >> 11) & 1) << 10), (((bytes >> 8) & 7) << 12) | 0x0D00 | (bytes & 0xFF));
+    }
+  }
 
   // MOVS Rd, #imm8: T1 (Rd in 0-7)
   fn cm_MOVS_imm(rd: int64, imm: int64) {
@@ -286,6 +307,25 @@ pub type EmitARMCM = class {
     self.cm_t32(0xEBB0 | rn, 0x0F00 | rm);
   }
 
+  // #2228: Bit-Rechenwerke. CLZ, RBIT und ROR gehoeren zu ARMv7-M (Thumb-2)
+  // und damit zu jedem Cortex-M3/M4 — keine Option, keine Faehigkeitsfrage.
+  // CLZ Rd, Rm: T1
+  fn cm_CLZ(rd: int64, rm: int64) {
+    self.cm_t32(0xFAB0 | rm, 0xF080 | (rd << 8) | rm);
+  }
+  // RBIT Rd, Rm: T1
+  fn cm_RBIT(rd: int64, rm: int64) {
+    self.cm_t32(0xFA90 | rm, 0xF0A0 | (rd << 8) | rm);
+  }
+  // ROR.W Rd, Rn, Rm: T2 — Weite = Rm[7:0], rotiert wird um Weite mod 32.
+  fn cm_ROR(rd: int64, rn: int64, rm: int64) {
+    self.cm_t32(0xFA60 | rn, 0xF000 | (rd << 8) | rm);
+  }
+  // MOV.W Rd, Rm, <typ> #imm (typ 0 = LSL, 1 = LSR, 2 = ASR); imm 1..31.
+  fn cm_SHI(rd: int64, rm: int64, typ: int64, imm: int64) {
+    self.cm_t32(0xEA4F, (((imm >> 2) & 7) << 12) | (rd << 8) | ((imm & 3) << 6) | (typ << 4) | rm);
+  }
+
   // --------------------------------------------------------------------------
   // Branch encoding helpers
   // --------------------------------------------------------------------------
@@ -357,11 +397,21 @@ pub type EmitARMCM = class {
   }
 
   // LDR.W Rt, [SP, #off12]  /  STR.W Rt, [SP, #off12]
+  // #2228: off ausserhalb 0..4095 wurde still auf zwoelf Bit gekuerzt.
   fn cm_LDR_sp(rt: int64, off: int64) {
+    self.cm_spOffPruefen(off);
     self.cm_t32(0xF8DD, (rt << 12) | (off & 0xFFF));
   }
   fn cm_STR_sp(rt: int64, off: int64) {
+    self.cm_spOffPruefen(off);
     self.cm_t32(0xF8CD, (rt << 12) | (off & 0xFFF));
+  }
+  fn cm_spOffPruefen(off: int64) {
+    if off < 0 || off > 4095 {
+      EPrintStr("error: arm-cm: Slot-Versatz "c); EPrintInt(off);
+      EPrintStrLn(" ausserhalb 0..4095 — LDR/STR [sp, #imm12] erreicht ihn nicht (#2228)."c);
+      exit(1);
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -1015,7 +1065,97 @@ pub type EmitARMCM = class {
       self.emitSemihostExit();
       return;
     }
+    if (id >= 255 && id <= 262) {
+      self.cm_emitBitBuiltin(id, sBase, dest);
+      return;
+    }
     self._builtinUnsupportedCM(id);
+  }
+
+  // #2228: Bit-Rechenwerke (#2190, #2177) auf Cortex-M4.
+  //
+  // DARSTELLUNG: dieses Backend haelt jeden int64-Wert als EIN 32-Bit-Wort
+  // im Slot (cm_loadSlot/cm_storeSlot, LDR/STR). Vergleiche (CMP + BGE/BLT),
+  // SDIV und PrintInt lesen das Wort vorzeichenbehaftet; der dargestellte
+  // int64-Wert ist die Vorzeichenerweiterung des Wortes. Gerechnet wird unter
+  // genau dieser Annahme — fuer jeden Wert in [-2^31, 2^31) ist das Ergebnis
+  // dasselbe wie auf x86:
+  //
+  //   popcount(x) = popcount32(w) + (w < 0 ? 32 : 0)       SWAR + MUL
+  //   clz(x)      = clz32(w) + (w >= 0 ? 32 : 0)           CLZ (clz(0) == 64)
+  //   ctz(x)      = ctz32(w) + (w == 0 ? 32 : 0)           RBIT + CLZ
+  //   rotl32/rotr32: NEG + ROR bzw. ROR. Das Ergebniswort sind exakt die
+  //     unteren 32 Bit des x86-Ergebnisses; ein Ergebnis >= 2^31 liest dieses
+  //     Ziel — wie jede solche Konstante — als negativ.
+  //
+  // bswap64, rotl und rotr (64 Bit) haben KEIN darstellbares Ergebnis: die
+  // unteren 32 Bit des Ergebnisses kaemen aus dem oberen Wort, das es hier
+  // nicht gibt. Laut abgewiesen statt still auf 32 Bit gerechnet (REV und
+  // ROR waeren da — sie lieferten nur das Falsche).
+  //
+  // Dieselbe Rechnung steht in xtensa.lyx (xt_emitBitBuiltin) — die beiden
+  // muessen uebereinstimmen.
+  fn cm_emitBitBuiltin(id: int64, sBase: int64, dest: int64) {
+    if (id == 258 || id == 259 || id == 260) {
+      EPrintStr("error: arm-cm: "c);
+      if (id == 258) { EPrintStr("bswap64"c); }
+      if (id == 259) { EPrintStr("rotl"c); }
+      if (id == 260) { EPrintStr("rotr"c); }
+      EPrintStrLn(" braucht 64 Bit — dieses Ziel haelt int64 als ein 32-Bit-Wort (#2228)."c);
+      EPrintStrLn("  Die unteren 32 Bit des Ergebnisses kaemen aus dem oberen Wort, das es"c);
+      EPrintStrLn("  hier nicht gibt; ein Ergebnis auf 32 Bit waere still falsch."c);
+      EPrintStrLn("  Fuer 32-Bit-Woerter: rotl32/rotr32."c);
+      exit(1);
+    }
+    self.cm_loadSlot(sBase);                    // r4 = w
+    if (id == 261 || id == 262) {
+      self.cm_loadSlot2(sBase + 1);             // r5 = Weite
+      if (id == 261) { self.cm_NEG(CM_R5, CM_R5); }   // links um n = rechts um -n (mod 32)
+      self.cm_ROR(CM_R4, CM_R4, CM_R5);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 255) {
+      self.cm_MOV(CM_R0, CM_R4);                // r0 = w (fuer das Vorzeichen)
+      self.cm_SHI(CM_R5, CM_R4, 1, 1);
+      self.cm_LI(CM_R6, 0x55555555);
+      self.cm_AND(CM_R5, CM_R5, CM_R6);
+      self.cm_SUB(CM_R4, CM_R4, CM_R5);
+      self.cm_LI(CM_R6, 0x33333333);
+      self.cm_SHI(CM_R5, CM_R4, 1, 2);
+      self.cm_AND(CM_R5, CM_R5, CM_R6);
+      self.cm_AND(CM_R4, CM_R4, CM_R6);
+      self.cm_ADD(CM_R4, CM_R4, CM_R5);
+      self.cm_SHI(CM_R5, CM_R4, 1, 4);
+      self.cm_ADD(CM_R4, CM_R4, CM_R5);
+      self.cm_LI(CM_R6, 0x0F0F0F0F);
+      self.cm_AND(CM_R4, CM_R4, CM_R6);
+      self.cm_LI(CM_R6, 0x01010101);
+      self.cm_MUL(CM_R4, CM_R4, CM_R6);         // Bytesummen im obersten Byte
+      self.cm_SHI(CM_R4, CM_R4, 1, 24);
+      self.cm_SHI(CM_R5, CM_R0, 2, 31);         // -1 bei w < 0, sonst 0
+      self.cm_LI(CM_R6, 32);
+      self.cm_AND(CM_R5, CM_R5, CM_R6);
+      self.cm_ADD(CM_R4, CM_R4, CM_R5);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    if (id == 256) {
+      self.cm_CLZ(CM_R5, CM_R4);                // clz32, 32 bei w == 0
+      self.cm_MVN(CM_R6, CM_R4);
+      self.cm_SHI(CM_R6, CM_R6, 1, 31);         // 1 bei w >= 0
+      self.cm_SHI(CM_R6, CM_R6, 0, 5);          // 32 bei w >= 0
+      self.cm_ADD(CM_R4, CM_R5, CM_R6);
+      self.cm_storeSlot(dest);
+      return;
+    }
+    // id == 257: ctz32 = CLZ(RBIT w); 32 genau bei w == 0, dann 64.
+    self.cm_RBIT(CM_R5, CM_R4);
+    self.cm_CLZ(CM_R5, CM_R5);
+    self.cm_LI(CM_R6, 32);
+    self.cm_AND(CM_R6, CM_R5, CM_R6);
+    self.cm_ADD(CM_R4, CM_R5, CM_R6);
+    self.cm_storeSlot(dest);
   }
 
   // #1744: r4 = Puffer, r5 = Laenge (negativ heisst "bis zum Nullbyte").
