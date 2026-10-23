@@ -302,6 +302,25 @@ abgelehnt "#2228: zusammengesetztes Argument, zweimal gelesen" 'import std.io;
 fn quad(x: int64): int64 { return x * x; }
 fn main(): int64 { var a: int64 := 4; var b: int64 := 6; PrintLn(IntToStr(quad(a * b - 3))); return 0; }' "441" "quad"
 
+# Ein Parameter als ERSTES von zwei Argumenten eines Aufrufs im Rumpf. Die
+# Ersetzung kopierte ihn ohne seine Geschwisterkette — `pos` fiel aus
+# `StrCharAt(s, pos)` heraus, rsi blieb Muell (so beim Bau gefunden, im
+# Datumsparser aus std.datetime: tests/datetime_runde5_test.sh, #1603).
+ZK='import std.io;
+fn p2(s: pchar, pos: int64): int64 {
+  var a: int64 := StrCharAt(s, pos) - 48;
+  var b: int64 := StrCharAt(s, pos + 1) - 48;
+  return a * 10 + b;
+}
+fn main(): int64 {
+  var t: pchar := "2026-08-17";
+  var i: int64 := 2;
+  PrintLn(IntToStr(p2(t, 5) * 10000 + p2(t, 8) * 100 + p2(t, i)));
+  return 0;
+}'
+laeuft "#2228: Parameter vor einem weiteren Argument im Rumpf, Wert stimmt" "$ZK" "81726"
+eingebettet "#2228: Parameter vor einem weiteren Argument im Rumpf" "$ZK" "p2" 1
+
 # Eine EIGENE Funktion namens peek64 verdeckt den Builtin und hat hier eine
 # Wirkung. Als lesender Builtin behandelt, wanderten beide Argumente an
 # ihre Lesestelle im Rumpf — `b - a` wertete b zuerst aus und lieferte -1
