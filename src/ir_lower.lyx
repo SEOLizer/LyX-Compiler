@@ -2996,13 +2996,70 @@ pub type IRLower = class {
   //
   // Die indirekten Aufrufe legten jedes Argument bis 1.2.15A in Slot i des
   // Kratzstreifens: `f(1, g(2))` ueberschrieb dort mit der 2 die 1.
-  fn _irArgsLegen(arg0: int64, base: int64, start: int64): int64 {
+  // #2219: Typknoten des Parameters Nummer `idx` einer Deklaration, oder -1.
+  fn _paramTypNode(decl: int64, idx: int64): int64 {
+    if decl < 0 || idx < 0 { return 0 - 1; }
+    var p: int64 := self.nodeC0(decl);
+    var i: int64 := 0;
+    while p >= 0 {
+      if i == idx { return self.nodeC0(p); }
+      i := i + 1;
+      p := self.nodeNext(p);
+    }
+    return 0 - 1;
+  }
+
+  // #2219: Ein ganzzahliges Literal an einem Gleitkomma-Parameter muss
+  // gewandelt werden — sonst geht es als Bitmuster durch, und `eins(5)`
+  // liefert 0.00 statt 5.00. Auf dem Schnellweg sitzt die Entsprechung in
+  // cg_orderCallArgs; hier wird `_nachGleit` benutzt, dieselbe Stelle, die
+  // Zuweisung und Rueckgabe schon verwenden (#2160, #2004).
+  //
+  // Der IR-Weg braucht die Wandlung GETRENNT: er hat seine eigene
+  // Argumentuebergabe, und ohne diese Stelle lieferte dasselbe Programm je
+  // Ziel verschiedene Werte — x86 5.00, arm64 0.000000. Nachgemessen genau
+  // so, bevor es hier stand.
+  fn _argNachGleit(decl: int64, idx: int64, argNi: int64, temp: int64): int64 {
+    if argNi < 0 { return temp; }
+    // Bei einem BENANNTEN Argument sagt die Position nichts: `benannt(y: 1,
+    // x: 10)` steht in anderer Reihenfolge als die Parameter. Der Parameter
+    // wird deshalb ueber den NAMEN gesucht, und `_nachGleit` bekommt den
+    // WERT (c0) — es prueft auf NK_LIT_INT, und der Knoten darueber ist
+    // keins. Mit der Position und dem Huellknoten blieb die Wandlung aus:
+    // arm64 lieferte 0.00 statt 9.00, waehrend x86 stimmte (dort kommt der
+    // Index aus cg_orderCallArgs).
+    var wert: int64 := argNi;
+    var pidx: int64 := idx;
+    if self.nodeKind(argNi) == 108 {
+      wert := self.nodeC0(argNi);
+      pidx := 0 - 1;
+      if decl >= 0 {
+        var an: pchar := self.nodeSVal(argNi);
+        var al: int64 := self.nodeSLen(argNi);
+        var q: int64 := self.nodeC0(decl);
+        var qi: int64 := 0;
+        while q >= 0 {
+          if _irNameGleich(self.nodeSVal(q), self.nodeSLen(q), an, al) != 0 { pidx := qi; }
+          qi := qi + 1;
+          q := self.nodeNext(q);
+        }
+      }
+    }
+    var tn: int64 := self._paramTypNode(decl, pidx);
+    if tn < 0 { return temp; }
+    return self._nachGleit(temp, wert, self._tnGleit(tn));
+  }
+
+  fn _irArgsLegen(arg0: int64, base: int64, start: int64, decl: int64): int64 {
     var i: int64 := start;
     var a: int64 := arg0;
+    var pi: int64 := 0;
     while a >= 0 {
       var t: int64 := self.lowerExpr(a);
+      t := self._argNachGleit(decl, pi, a, t);   // #2219
       self.irAddInstrDirect(IRO_STORE_LOCAL, base + i, t, -1, 0);
       i := i + 1;
+      pi := pi + 1;
       a := self.nodeNext(a);
     }
     return i;
@@ -3040,6 +3097,8 @@ pub type IRLower = class {
     var fbArg: int64 := arg0;
     while fbArg >= 0 {
       var fbATemp: int64 := self.lowerExpr(fbArg);
+      // #2219: Gleitkomma-Parameter, ganzzahliges Argument -> wandeln.
+      fbATemp := self._argNachGleit(fbVorDecl, fbArgCnt, fbArg, fbATemp);
       self.irAddInstrDirect(IRO_STORE_LOCAL, fbArgBase + fbArgCnt, fbATemp, -1, 0);
       fbArgCnt += 1;
       fbArg := self.nodeNext(fbArg);
@@ -3302,7 +3361,7 @@ pub type IRLower = class {
         // nicht in die Slots 0..N-1 — ein Aufruf im Argument ueberschrieb sie.
         var mfB: int64 := self._irArgBlock(self.nodeC1(expr), 1);
         self.irAddInstrDirect(IRO_STORE_LOCAL, mfB, mfData, -1, 0);   // self → argBase[0]
-        var mfI: int64 := self._irArgsLegen(self.nodeC1(expr), mfB, 1);
+        var mfI: int64 := self._irArgsLegen(self.nodeC1(expr), mfB, 1, 0 - 1);
         self.irAddInstrDirect(IRO_CALL_INDIRECT, mcDest, mfCode, mfB, mfI);
         return mcDest;
       }
@@ -3311,7 +3370,7 @@ pub type IRLower = class {
         var fpFn: int64 := self.allocTemp();
         self.irAddInstrDirect(IRO_LOAD_FIELD, fpFn, fpBase, fpOff, 0);
         var fpB: int64 := self._irArgBlock(self.nodeC1(expr), 0);   // #2132
-        var fpI: int64 := self._irArgsLegen(self.nodeC1(expr), fpB, 0);
+        var fpI: int64 := self._irArgsLegen(self.nodeC1(expr), fpB, 0, 0 - 1);
         self.irAddInstrDirect(IRO_CALL_INDIRECT, mcDest, fpFn, fpB, fpI);
         return mcDest;
       }
@@ -4127,7 +4186,7 @@ pub type IRLower = class {
       // Slot i — `cfn(1, g(2))` ueberschrieb die 1 —, und mehr als acht
       // gingen nicht.
       var exB: int64 := self._irArgBlock(arg0, 0);
-      var exArgCnt: int64 := self._irArgsLegen(arg0, exB, 0);
+      var exArgCnt: int64 := self._irArgsLegen(arg0, exB, 0, self._callDeclNi(expr));
       var exIdx: int64 := self.irAddInstrDirect(IRO_CALL_EXTERN, dest, exArgCnt, exLibStrOff, exNameStrOff);
       poke64(peek64(self.ir + IR_MOD_OFF_INSTRBUF) + exIdx * IR_INSTR_SIZE + IR_INSTR_OFF_SRC3, exB);
       // #2140: das Gleitkommafeld ist bei CALL_EXTERN sonst unbenutzt.
@@ -7171,7 +7230,7 @@ pub type IRLower = class {
           var gvFn: int64 := self.allocTemp();
           self.irAddInstrDirect(IRO_LOAD_GLOBAL, gvFn, gvIdx, -1, 0);
           var gvB: int64 := self._irArgBlock(arg0, 0);   // #2132
-          var gvN: int64 := self._irArgsLegen(arg0, gvB, 0);
+          var gvN: int64 := self._irArgsLegen(arg0, gvB, 0, 0 - 1);
           self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, gvFn, gvB, gvN);
           return dest;
         }
@@ -15413,7 +15472,7 @@ pub type IRLower = class {
   // und kann die schon abgelegten nicht ueberschreiben (`h(1, plus(2, 3))`).
   fn _clRufDuenn(code: int64, arg0: int64, dest: int64): int64 {
     var b: int64 := self._irArgBlock(arg0, 0);
-    var n: int64 := self._irArgsLegen(arg0, b, 0);
+    var n: int64 := self._irArgsLegen(arg0, b, 0, 0 - 1);
     self.irAddInstrDirect(IRO_CALL_INDIRECT, dest, code, b, n);
     return dest;
   }
@@ -15423,7 +15482,7 @@ pub type IRLower = class {
   // selben hohen Block (#2132) — mehr als 8 Argumente gehen ueber den Stapel.
   fn _clRufSatz(satz: int64, arg0: int64, dest: int64): int64 {
     var b: int64 := self._irArgBlock(arg0, 1);
-    var n: int64 := self._irArgsLegen(arg0, b, 0);
+    var n: int64 := self._irArgsLegen(arg0, b, 0, 0 - 1);
     var code: int64 := self.allocTemp();
     self.irAddInstrDirect(IRO_LOAD_FIELD, code, satz, 0, 0);
     var env: int64 := self.allocTemp();

@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.19E
+VERSION   := 1.2.19F
 VERSION_DATE := 2026-10-23
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -349,6 +349,8 @@ test: lyxc
 	@bash tests/vektorablage_wieder_test.sh
 	@echo "--- AVX2-Vektorpfad: Werte, Waechter, Erzeugnis beidseitig (#2205) ---"
 	@bash tests/avx2_vektorpfad_test.sh
+	@echo "--- f64-Parameter: ganzzahliges Literal wandeln, drei Ziele (#2219) ---"
+	@bash tests/f64_argument_test.sh
 	@echo "--- Einbettung kleiner Funktionen, beide Richtungen (#2208) ---"
 	@bash tests/einbettung_test.sh
 	@echo "--- Bit-Builtins und ISA-Gating am Erzeugnis (#2190, #2191) ---"
