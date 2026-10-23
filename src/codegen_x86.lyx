@@ -1171,6 +1171,12 @@ pub type Codegen = class {
   tmrBypass:     int64;   // Zugriffe am Voter vorbei (Adresse-von)
   // WP-GPU-01: byte buffer parallel to locals, 1 = parallel Array<f32> (SIMD)
   localIsSimd:       int64;
+  // #2213: Rahmenabstand der Vektorvariablen, in die eine Zuweisung gerade
+  // schreibt — oder 1, wenn keine. Positiv kann kein Rahmenabstand sein
+  // (cg_addLocal liefert -frameSize), taugt also als "nicht gesetzt";
+  // dieselbe Kodierung wie bei der Marke aus #2206, wo `slot < 0` als
+  // "nicht gesetzt" die Stelle immer abgewuergt hat.
+  simdZielOff:       int64;
   // #1003: byte buffer parallel to locals, 1 = INLINE geschriebener fn-Zeigertyp
   // (`var f: fn(int64): int64`). Ueber einen Typalias merkt sich das die
   // fnAlias-Liste am Namen; ein inline geschriebener Typ HAT keinen Namen und
@@ -12752,9 +12758,50 @@ pub type Codegen = class {
           // eigener mmap-Syscall — in einer Schleife also einer JE
           // OPERATION, und nie zurueckgegeben. Dieselbe Folge wie in
           // cg_emitSimdBumpAlloc; die beiden muessen uebereinstimmen.
+          // #2213: Zuerst die vorhandene Ablage des Zieles pruefen. Sie ist
+          // brauchbar, wenn ihr Zeiger gesetzt ist UND ihre Elementzahl mit
+          // der der linken Seite uebereinstimmt. Beides muss zur Laufzeit
+          // geprueft werden:
+          //   - der Zeiger ist 0, solange `var c: parallel Array<f32>;` noch
+          //     nichts angelegt hat — dort hineinzuschreiben waere ein
+          //     Zugriff auf Adresse 0;
+          //   - die Laenge steht in der Ablage (bei ptr-8), nicht im Typ.
+          //     Eine kuerzere Zielablage wuerde ueberschrieben, eine laengere
+          //     behielte hinten alte Werte und meldete trotzdem ihre Laenge.
+          // Trifft eine der beiden Bedingungen nicht, wird wie bisher
+          // angelegt. Kein stiller Fall: beide Zweige rechnen dasselbe.
+          //
+          // Dass Ziel und Quelle dasselbe Feld sein koennen (`a := a + b`),
+          // ist unkritisch — gerechnet wird elementweise aufsteigend, Lese-
+          // und Schreibstelle sind in jedem Schritt dieselben Indizes.
+          var zielOff: int64 := self.simdZielOff;
+          var pNeu: int64 := 0 - 1;
+          var pHaben: int64 := 0 - 1;
+          if (zielOff < 0) {
+            // mov rdx, [rbp+zielOff]
+            if (zielOff >= -128) {
+              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x55); self.cg_e8(zielOff);
+            } else {
+              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x95); self.cg_e32(zielOff);
+            }
+            // Beide Spruenge als rel32. Der erste Anlauf nahm Kurzspruenge und
+            // scheiterte laut: `je haben` ueberspringt die ganze Anlage, und
+            // die ist 296 Byte lang (#1915 meldet das, statt still falsch zu
+            // kodieren).
+            self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xD2);               // test rdx, rdx
+            self.cg_e8(0x0F); self.cg_e8(0x84); pNeu := self.codeLen; self.cg_e32(0);   // jz anlegen
+            self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x42); self.cg_e8(0xF8);  // mov r8, [rdx-8]
+            self.cg_e8(0x4C); self.cg_e8(0x39); self.cg_e8(0xC1);               // cmp rcx, r8
+            self.cg_e8(0x0F); self.cg_e8(0x84); pHaben := self.codeLen; self.cg_e32(0); // je haben
+            poke32(self.code + pNeu, self.codeLen - pNeu - 4);
+            pNeu := 0 - 1;
+          }
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC8);  // mov rax, rcx (Elementzahl)
           self.cg_emitSimdBumpAlloc();
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov rdx, rax (dst ptr)
+          if (pHaben >= 0) {
+            poke32(self.code + pHaben, self.codeLen - pHaben - 4);
+          }
           // restore: rsi=rhs ptr, rdi=lhs ptr, rcx=count
           self.cg_e8(0x5E);  // pop rsi
           self.cg_e8(0x5F);  // pop rdi
@@ -19438,10 +19485,36 @@ pub type Codegen = class {
         if (asgSatzIdx < 0) { asgSatzIdx := self.cg_capOuterIdx(self.cg_nsval(lhs), self.cg_nslen(lhs)); }
         var asgSatz: int64 := 0;
         if (asgSatzIdx >= 0 && peek8(self.localIsFnPtr + asgSatzIdx) == 2) { asgSatz := 1; }
+        // #2213: Schreibt die Zuweisung in eine Vektorvariable, die schon eine
+        // Ablage hat, soll die Vektoroperation DORT hineinrechnen statt eine
+        // neue anzulegen. Gemessen kostet eine Anlage 18,8 ns (eine Schleife,
+        // die nur anlegt und nicht rechnet, 6,4 Mio Durchlaeufe) — bei
+        // kurzen Feldern mehr als die Rechnung selbst.
+        //
+        // Weitergegeben wird nur der Rahmenabstand; ob die Ablage brauchbar
+        // ist, entscheidet der erzeugte Code zur LAUFZEIT (Zeiger gesetzt,
+        // Laenge gleich). Statisch ist das nicht zu beantworten: die Laenge
+        // einer Ablage steht erst in ihr.
+        //
+        // Der Kanal gilt NUR fuer die unmittelbare Form `ziel := x <op> y`
+        // mit zwei Bezeichnern. Waere er fuer jeden rechten Ausdruck gesetzt,
+        // griffe er auch in einem Teilausdruck: `c := f(a + b, c)` haette die
+        // Summe nach `c` geschrieben, BEVOR `f` das alte `c` als zweites
+        // Argument liest — ein stiller falscher Wert. Deshalb hier die Form
+        // pruefen und nicht im Vektorpfad hoffen, dass sie passt.
+        var asgSimdAlt: int64 := self.simdZielOff;
+        self.simdZielOff := 1;
+        if (asgLIdx >= 0 && peek8(self.localIsSimd + asgLIdx) != 0
+            && self.cg_nkind(rhs) == CGN_BINOP
+            && self.cg_nkind(self.cg_nc0(rhs)) == CGN_IDENT
+            && self.cg_nkind(self.cg_nc1(rhs)) == CGN_IDENT) {
+          self.simdZielOff := self.cg_findLocal(self.cg_nsval(lhs), self.cg_nslen(lhs));
+        }
         if (asgIsMth != 0) { self.cg_genMethodTypedValue(rhs); }
         else if (asgSatz != 0 && self.cg_isMethodRefExpr(rhs) != 0) { self.cg_genMethodTypedValue(rhs); }
         else if (asgSatz != 0) { self.cg_genAlsSatz(rhs); }
         else { self.cg_genExpr(rhs); }
+        self.simdZielOff := asgSimdAlt;
         var name: pchar := self.cg_nsval(lhs);
         var nlen: int64 := self.cg_nslen(lhs);
         // #1097: Zuweisung an eine Variable vom Bereichstyp.
@@ -26792,6 +26865,7 @@ pub type Codegen = class {
     self.inlArgList   := alloc(self.inlArgCap * 32);
     self.inlArgCount  := 0;
 
+    self.simdZielOff := 1;   // #2213: keine Zielablage
     self.nextLblId := 0;
 
     // Import dedup (WP-09)
