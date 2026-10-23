@@ -483,7 +483,7 @@ der eingesetzte Wert steht jeweils fest.
 | 549 | Linux-Syscall symlinkat (Nr. 36) | `symlink` | #2156; nur arm64/riscv, newdirfd AT_FDCWD |
 | 550 | Linux-Syscall fstat (Nr. 80) | `sys_fstat` | #2156; nur arm64/riscv |
 
-## Bereich 253 … 260 — CPU-Abfrage und Bit-Rechenwerke (#2187, #2190)
+## Bereich 253 … 262 — CPU-Abfrage und Bit-Rechenwerke (#2187, #2190, #2177)
 
 Vergeben in `src/ir_lower.lyx`; der Schnellweg (`codegen_x86`) kennt dieselben
 Namen ohne ID, weil er nicht über das IR geht. Die Spalte „Ziele" sagt, wo die
@@ -500,8 +500,10 @@ stilles Nichts.
 | 258 | Bytetausch | `bswap64(x)` | lyxos (BSWAP), arm64 (REV), riscv (gerechnet) | #2190 |
 | 259 | Linksrotation, Weite mod 64 | `rotl(x, n)` | lyxos (ROL), arm64 (NEG+ROR), riscv (SLL/SRL/OR) | #2190 |
 | 260 | Rechtsrotation, Weite mod 64 | `rotr(x, n)` | lyxos (ROR), arm64 (ROR), riscv (SRL/SLL/OR) | #2190 |
+| 261 | Linksrotation der unteren 32 Bit, Weite mod 32, Ergebnis null-erweitert | `rotl32(x, n)` | lyxos (ROL r32), arm64 (NEG+ROR w), riscv (SLL/SRL/OR, auf 32 Bit gekuerzt) | #2177 |
+| 262 | Rechtsrotation der unteren 32 Bit, Weite mod 32 | `rotr32(x, n)` | lyxos (ROR r32), arm64 (ROR w), riscv (SRL/SLL/OR) | #2177 |
 
 Auf x86 sind 255 … 257 an die CPU-Stufe gebunden (`--target-cpu`, `@cpu`):
 ohne Zusage wird gerechnet statt `POPCNT`/`LZCNT`/`TZCNT` zu emittieren, weil
-keiner der drei zum Grundbestand von x86-64 gehört (#2191). `bswap64`, `rotl`
-und `rotr` gibt es seit dem 486 bzw. 8086 und werden ungated emittiert.
+keiner der drei zum Grundbestand von x86-64 gehört (#2191). `bswap64`, `rotl`,
+`rotr`, `rotl32` und `rotr32` gibt es seit dem 486 bzw. 8086 und werden ungated emittiert.

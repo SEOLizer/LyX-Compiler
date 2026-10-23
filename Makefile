@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.19J
+VERSION   := 1.2.19K
 VERSION_DATE := 2026-10-23
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -367,6 +367,8 @@ test: lyxc
 	@bash tests/methoden_einbettung_test.sh
 	@echo "--- Hintere Argumente direkt ins Register (#2228) ---"
 	@bash tests/direkte_argumente_test.sh
+	@echo "--- rotl32/rotr32: Werte auf drei Zielen, Weg auf x86 (#2177) ---"
+	@bash tests/rotl32_2177_test.sh
 	@echo "--- Bit-Builtins und ISA-Gating am Erzeugnis (#2190, #2191) ---"
 	@bash tests/bit_builtins_test.sh
 	@echo "--- Cortex-M: Abbild starten und ueber Semihosting ausgeben (#1744) ---"
