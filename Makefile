@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.19H
+VERSION   := 1.2.19I
 VERSION_DATE := 2026-10-23
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -359,6 +359,10 @@ test: lyxc
 	@bash tests/hashmap_2226_test.sh
 	@echo "--- Einbettung kleiner Funktionen, beide Richtungen (#2208) ---"
 	@bash tests/einbettung_test.sh
+	@echo "--- StrCharAt als ein Befehl, Weg beidseitig (#2228) ---"
+	@bash tests/strcharat_direkt_test.sh
+	@echo "--- std-Schleifen: Werte gegen Referenzen, StrCount linear (#2228) ---"
+	@bash tests/std_laufzeit_2228_test.sh
 	@echo "--- Bit-Builtins und ISA-Gating am Erzeugnis (#2190, #2191) ---"
 	@bash tests/bit_builtins_test.sh
 	@echo "--- Cortex-M: Abbild starten und ueber Semihosting ausgeben (#1744) ---"
