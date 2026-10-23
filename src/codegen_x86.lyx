@@ -1174,6 +1174,14 @@ pub type Codegen = class {
   tmrBypass:     int64;   // Zugriffe am Voter vorbei (Adresse-von)
   // WP-GPU-01: byte buffer parallel to locals, 1 = parallel Array<f32> (SIMD)
   localIsSimd:       int64;
+  // #2199: Elementbreite eines `parallel Array<T>`-Locals in BYTE (4 oder 8).
+  //
+  // Eigenes Feld, kein umgedeutetes: `localElemFloat` traegt an einem
+  // gewoehnlichen `Array<f64>` schon die 1, und `localIsSimd` wird an sechs
+  // Stellen auf `!= 0` geprueft. Eine der beiden zur Breite zu erklaeren
+  // haette eine dieser Stellen stillschweigend etwas anderes bedeuten
+  // lassen.
+  localSimdBytes:    int64;
   // #2213: Rahmenabstand der Vektorvariablen, in die eine Zuweisung gerade
   // schreibt — oder 1, wenn keine. Positiv kann kein Rahmenabstand sein
   // (cg_addLocal liefert -frameSize), taugt also als "nicht gesetzt";
@@ -1750,6 +1758,9 @@ pub type Codegen = class {
       i := 0;
       memcpy(simdb, self.localIsSimd, self.localCount);
       self.localIsSimd := simdb;
+      var simdw: int64 := alloc(nc);        // #2199
+      memcpy(simdw, self.localSimdBytes, self.localCount);
+      self.localSimdBytes := simdw;
       var fpb: int64 := alloc(nc);
       i := 0;
       memcpy(fpb, self.localIsFnPtr, self.localCount);
@@ -6757,6 +6768,28 @@ pub type Codegen = class {
   // und localTypes traegt (fuer Klassen) den Elementtyp, fuer f64 aber nichts.
   // Ein eigenes Kennzeichen ist sauberer, als den Typnamen umzudeuten: `arr`
   // ist KEIN f64, nur `arr[i]` ist eines.
+  // #2199: Elementbreite aus dem Elementtyp eines `parallel Array<T>`.
+  //
+  // Vorgabe ist 4 (f32) — nicht, weil f32 der Normalfall waere, sondern weil
+  // die Ablage bis 1.2.19F ueberhaupt nur diese Breite kannte. `f64` lieferte
+  // deshalb still f32: `v[0] := 0.1` ergab 0.10000000149011612, `1e40` wurde
+  // inf. Beim Lesen wandelte cvtss2sd zurueck (#2183), weshalb runde Werte
+  // wie 1.5 richtig aussahen und der Fehler unentdeckt blieb (#2199).
+  fn cg_simdBytesVonTyp(elemTypeNode: int64): int64 {
+    if (elemTypeNode < 0) { return 4; }
+    if (self.cg_nkind(elemTypeNode) != 60) { return 4; }
+    if (self.cg_seq(self.cg_nsval(elemTypeNode), self.cg_nslen(elemTypeNode), "f64", 3)) { return 8; }
+    return 4;
+  }
+
+  // Elementbreite eines SIMD-Locals; 4, wenn nichts vermerkt ist.
+  fn cg_simdBytesOf(localIdx: int64): int64 {
+    if (localIdx < 0) { return 4; }
+    var b: int64 := peek8(self.localSimdBytes + localIdx);
+    if (b == 8) { return 8; }
+    return 4;
+  }
+
   fn cg_markElemFloat(localIdx: int64, elemTypeNode: int64) {
     if (localIdx < 0 || elemTypeNode < 0) { return; }
     if (self.cg_nkind(elemTypeNode) != 60) { return; }
@@ -7578,9 +7611,18 @@ pub type Codegen = class {
   // NICHT behoben ist damit das Wachstum: der Bump-Allokator gibt nichts
   // zurueck, der Speicher waechst also weiter, nur ohne Syscall. Das braucht
   // eine Aussage darueber, wann eine Ablage noch gehalten wird; siehe #2206.
-  fn cg_emitSimdBumpAlloc() {
+  //
+  // #2199: `bytes` ist die ELEMENTBREITE (4 fuer f32, 8 fuer f64). Bis 1.2.19F
+  // stand hier fest `shl rax, 2`; eine f64-Ablage war damit halb so gross wie
+  // noetig. Aufgefallen ist das nicht durch einen Absturz, sondern weil die
+  // ZUGRIFFE ebenfalls 4 Byte nahmen und den Wert als f32 ablegten — die
+  // Ablage war in sich konsistent und still ungenau (0.1 wurde
+  // 0.10000000149011612).
+  fn cg_emitSimdBumpAlloc(bytes: int64) {
+    var schub: int64 := 2;
+    if (bytes == 8) { schub := 3; }
     self.cg_e8(0x50);                                                        // push rax (Elementzahl)
-    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(0x02);  // shl rax, 2
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(schub); // shl rax, 2 bzw. 3
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x18);  // add rax, 24
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);                    // mov rsi, rax (Groesse)
     // #2206: aus der VEKTORARENA, mit 1-MiB-Bloecken. Die Trennung von
@@ -7643,10 +7685,16 @@ pub type Codegen = class {
   // die Anlage auf 32 Byte zu heben; gemessen hat die unausgerichtete Form
   // auf dem Messgeraet keinen Unterschied gemacht, also bleibt die Anlage
   // unberuehrt und die Entscheidung steht hier statt in einer Vermutung.
-  fn cg_emitVexF32Schritt(op: int64, l: int64) {
+  //
+  // #2199: `bytes` waehlt die Breite der PACKED-Rechnung ueber das pp-Feld
+  // des VEX-Praefixes: pp=0 ergibt vaddps (f32), pp=1 ergibt vaddpd (f64).
+  // Die Ladebefehle bleiben vmovups — sie kopieren Bytes, nicht Zahlen.
+  fn cg_emitVexF32Schritt(op: int64, l: int64, bytes: int64) {
+    var pp: int64 := 0;
+    if (bytes == 8) { pp := 1; }
     self.cg_vexOpRM(0x10, 0, 0, 7, 0, l, 0, 1, 0);   // vmovups v0, [rdi+rax]
     self.cg_vexOpRM(0x10, 1, 0, 6, 0, l, 0, 1, 0);   // vmovups v1, [rsi+rax]
-    self.cg_vexOpRR(self.cg_sseF32Opcode(op), 0, 0, 1, l, 0, 1, 0);  // vXXXps v0, v0, v1
+    self.cg_vexOpRR(self.cg_sseF32Opcode(op), 0, 0, 1, l, pp, 1, 0);  // vXXXps/pd v0, v0, v1
     self.cg_vexOpRM(0x11, 0, 0, 2, 0, l, 0, 1, 0);   // vmovups [rdx+rax], v0
   }
 
@@ -7681,9 +7729,16 @@ pub type Codegen = class {
   // Die dritte Stufe ist dieselbe Pflicht wie in #2184, wo eine einzige
   // 16-Byte-Schleife bei n = 5 zwoelf Byte hinter dem letzten Element
   // gelesen UND geschrieben hat. Mit 32 Byte je Schritt waeren es bis zu 28.
-  fn cg_emitAVX2BinOp(op: int64) {
+  fn cg_emitAVX2BinOp(op: int64, bytes: int64) {
+    // #2199: Bytezahl = Elementzahl * Elementbreite. Die Blockgroessen
+    // darunter bleiben in BYTE (32 und 16) — sie haengen an der
+    // Registerbreite, nicht an der Elementart; ein 32-Byte-Block fasst acht
+    // f32 oder vier f64. Nur der skalare Rest zaehlt in Elementen.
+    var schub: int64 := 2;
+    if (bytes == 8) { schub := 3; }
+    var skPf: int64 := self.cg_sseSkalarPraefix(bytes);
     self.cg_e8(0x31); self.cg_e8(0xC0);                                      // xor eax, eax
-    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(0x02);  // shl rcx, 2
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(schub); // shl rcx, 2 bzw. 3
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x20);  // sub rcx, 32
 
     // ---- 32 Byte je Durchlauf ----
@@ -7691,7 +7746,7 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
     self.cg_e8(0x7F); var jg256: int64 := self.codeLen; self.cg_e8(0);       // jg nach dem Block
     var v256Body: int64 := self.codeLen;
-    self.cg_emitVexF32Schritt(op, 1);
+    self.cg_emitVexF32Schritt(op, 1, bytes);
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x20);  // add rax, 32
     self.cg_e8(0xEB); var back256: int64 := self.codeLen;
     self.cg_e8(v256Start - (back256 + 1));
@@ -7703,7 +7758,7 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
     self.cg_e8(0x7F); var jg128: int64 := self.codeLen; self.cg_e8(0);       // jg nach dem Block
     var v128Body: int64 := self.codeLen;
-    self.cg_emitVexF32Schritt(op, 0);
+    self.cg_emitVexF32Schritt(op, 0, bytes);
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);  // add rax, 16
     var nach128: int64 := self.codeLen;
     cg_patchRel8Wert(self.code, jg128, nach128 - v128Body);
@@ -7721,13 +7776,13 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
     self.cg_e8(0x7D); var jge: int64 := self.codeLen; self.cg_e8(0);         // jge .done
     var skBody: int64 := self.codeLen;
-    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x07);  // movss xmm0, [rdi+rax]
-    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x0C); self.cg_e8(0x06);  // movss xmm1, [rsi+rax]
-    self.cg_e8(0xF3); self.cg_e8(0x0F);
+    self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x07);  // movss/sd xmm0, [rdi+rax]
+    self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x0C); self.cg_e8(0x06);  // movss/sd xmm1, [rsi+rax]
+    self.cg_e8(skPf); self.cg_e8(0x0F);
     self.cg_e8(self.cg_sseF32Opcode(op));
-    self.cg_e8(0xC1);                                                        // addss/... xmm0, xmm1
-    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x02);  // movss [rdx+rax], xmm0
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x04);  // add rax, 4
+    self.cg_e8(0xC1);                                                        // addss/addsd xmm0, xmm1
+    self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x02);  // movss/sd [rdx+rax], xmm0
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(bytes); // add rax, 4 bzw. 8
     self.cg_e8(0xEB); var backSk: int64 := self.codeLen;
     self.cg_e8(skStart - (backSk + 1));
 
@@ -7736,11 +7791,18 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                    // mov rax, rdx
   }
 
-  fn cg_emitSSE2BinOp(op: int64) {
+  fn cg_emitSSE2BinOp(op: int64, bytes: int64) {
+    // #2199: Bytezahl = Elementzahl * Elementbreite; der 16-Byte-Block fasst
+    // vier f32 oder zwei f64. Die packed-Form waehlt das Praefix (kein
+    // Praefix = addps, 0x66 = addpd), die skalare F3 bzw. F2.
+    var schub: int64 := 2;
+    if (bytes == 8) { schub := 3; }
+    var pkPf: int64 := self.cg_ssePackedPraefix(bytes);
+    var skPf: int64 := self.cg_sseSkalarPraefix(bytes);
     // xor eax, eax  (byte offset = 0)
     self.cg_e8(0x31); self.cg_e8(0xC0);
-    // shl rcx, 2  (rcx = Bytezahl)
-    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(0x02);
+    // shl rcx, 2 bzw. 3  (rcx = Bytezahl)
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(schub);
     // sub rcx, 16  (rcx = letzter Offset, an dem noch ein voller Block passt;
     //               darf negativ werden, der Vergleich unten ist vorzeichenbehaftet)
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x10);
@@ -7757,7 +7819,9 @@ pub type Codegen = class {
     self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0x04); self.cg_e8(0x07);
     // movaps xmm1, [rsi+rax]  (0F 28 0C 06)
     self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0x0C); self.cg_e8(0x06);
-    // packed f32 op: addps/subps/mulps/divps xmm0, xmm1
+    // packed op: addps/subps/mulps/divps bzw. addpd/... xmm0, xmm1
+    // #2199: dasselbe Opcode-Byte, nur das Praefix entscheidet die Breite.
+    if (pkPf != 0) { self.cg_e8(pkPf); }
     self.cg_e8(0x0F);
     self.cg_e8(self.cg_sseF32Opcode(op));
     self.cg_e8(0xC1);  // xmm0, xmm1
@@ -7782,19 +7846,19 @@ pub type Codegen = class {
     self.cg_e8(0x7D);
     var jgePos: int64 := self.codeLen; self.cg_e8(0);
     var scalarBody: int64 := self.codeLen;
-    // movss xmm0, [rdi+rax]  (F3 0F 10 04 07)
-    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x07);
-    // movss xmm1, [rsi+rax]  (F3 0F 10 0C 06)
-    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x0C); self.cg_e8(0x06);
+    // movss/movsd xmm0, [rdi+rax]   (#2199: F3 bzw. F2)
+    self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x07);
+    // movss/movsd xmm1, [rsi+rax]
+    self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x0C); self.cg_e8(0x06);
     // skalares f32-Gegenstueck: addss/subss/mulss/divss xmm0, xmm1 — derselbe
     // Opcode wie packed, nur mit F3-Praefix.
-    self.cg_e8(0xF3); self.cg_e8(0x0F);
+    self.cg_e8(skPf); self.cg_e8(0x0F);
     self.cg_e8(self.cg_sseF32Opcode(op));
     self.cg_e8(0xC1);
-    // movss [rdx+rax], xmm0  (F3 0F 11 04 02)
-    self.cg_e8(0xF3); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x02);
-    // add rax, 4
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x04);
+    // movss/movsd [rdx+rax], xmm0
+    self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x02);
+    // add rax, 4 bzw. 8  (#2199: ein ELEMENT weiter)
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(bytes);
     // jmp .scalarStart
     self.cg_e8(0xEB);
     var scalarBackPos: int64 := self.codeLen;
@@ -7808,6 +7872,24 @@ pub type Codegen = class {
 
   // #2184: eine Stelle fuer die vier Opcodes, damit packed und skalar nicht
   // auseinanderlaufen koennen. Gilt fuer `..ps` wie fuer `..ss`.
+  // #2199: Das Praefixbyte, das die Breite der PACKED-Form waehlt.
+  //   f32: kein Praefix     -> addps  (0F 58)
+  //   f64: 0x66             -> addpd  (66 0F 58)
+  // Und fuer die SKALARE Form des Rest-Durchgangs:
+  //   f32: 0xF3             -> addss
+  //   f64: 0xF2             -> addsd
+  // Die Opcodes selbst sind identisch (cg_sseF32Opcode) — nur das Praefix
+  // entscheidet. Deshalb eine Stelle fuer beide Breiten, wie #2184 es fuer
+  // packed und skalar schon festgelegt hat.
+  fn cg_ssePackedPraefix(bytes: int64): int64 {
+    if (bytes == 8) { return 0x66; }
+    return 0;
+  }
+  fn cg_sseSkalarPraefix(bytes: int64): int64 {
+    if (bytes == 8) { return 0xF2; }
+    return 0xF3;
+  }
+
   fn cg_sseF32Opcode(op: int64): int64 {
     if (op == CGT_PLUS)  { return 0x58; }   // addps / addss
     if (op == CGT_MINUS) { return 0x5C; }   // subps / subss
@@ -12482,7 +12564,9 @@ pub type Codegen = class {
       // #2206: aus dem Bump-Allokator statt per eigenem mmap — siehe
       // cg_emitSimdBumpAlloc. Layout unveraendert: Zaehler bei ptr-8,
       // Zeiger auf 16 ausgerichtet.
-      self.cg_emitSimdBumpAlloc();
+      // #2199: c0 ist der Elementtyp (parser.lyx:1291) — er entscheidet die
+      // Breite der Ablage.
+      self.cg_emitSimdBumpAlloc(self.cg_simdBytesVonTyp(self.cg_nc0(ni)));
 
     // WP-17: Range expression (1..100) - returns start value in rax
     } else if (k == CGN_RANGE) {
@@ -12734,6 +12818,15 @@ pub type Codegen = class {
         if (sLI >= 0 && sRI >= 0 &&
             peek8(self.localIsSimd + sLI) != 0 &&
             peek8(self.localIsSimd + sRI) != 0) {
+          // #2199: Elementbreite beider Seiten. Weichen sie ab, ist das ein
+          // Typfehler, den sema melden muss — hier wird nicht geraten,
+          // sondern die linke Seite genommen und der Fall laut gemeldet.
+          var simdOpBytes: int64 := self.cg_simdBytesOf(sLI);
+          if (simdOpBytes != self.cg_simdBytesOf(sRI)) {
+            EPrintStrLn("error: codegen: Vektoroperation mit verschiedenen Elementbreiten (#2199)."c);
+            EPrintStrLn("  Beide Seiten muessen dieselbe Elementart haben (f32 mit f32, f64 mit f64)."c);
+            exit(1);
+          }
           // Both are SIMD locals — emit vectorized SSE2 loop
           var sLO: int64 := self.cg_findLocal(sLN, sLL);
           var sRO: int64 := self.cg_findLocal(sRN, sRL);
@@ -12800,7 +12893,9 @@ pub type Codegen = class {
             pNeu := 0 - 1;
           }
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC8);  // mov rax, rcx (Elementzahl)
-          self.cg_emitSimdBumpAlloc();
+          // #2199: dieselbe Breite wie die Quellen — sonst waere die
+          // Ergebnisablage halb so gross wie die Rechnung braucht.
+          self.cg_emitSimdBumpAlloc(simdOpBytes);
           self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov rdx, rax (dst ptr)
           if (pHaben >= 0) {
             poke32(self.code + pHaben, self.codeLen - pHaben - 4);
@@ -12814,8 +12909,8 @@ pub type Codegen = class {
           // es bei 128 Bit — ein VEX-Praefix auf einer aelteren CPU endet
           // in SIGILL, und ein stiller Rueckfall waere hier genau falsch:
           // der Code liefe, waere aber langsamer als zugesagt (#2191).
-          if (self.cg_cpuHat(2) != 0) { self.cg_emitAVX2BinOp(op); }
-          else                        { self.cg_emitSSE2BinOp(op); }
+          if (self.cg_cpuHat(2) != 0) { self.cg_emitAVX2BinOp(op, simdOpBytes); }
+          else                        { self.cg_emitSSE2BinOp(op, simdOpBytes); }
           // rax = result SIMD ptr
         } else {
           // idents but not SIMD — general path
@@ -13154,6 +13249,7 @@ pub type Codegen = class {
       var isArray:  int64 := 0;
       var isSimd:   int64 := 0;
       var isSimdFloat: int64 := 0;   // #2183
+      var simdBytes: int64 := 4;     // #2199: Elementbreite der SIMD-Ablage
       var arrElemClassIdx: int64 := -1;
       var arrElemSize: int64 := 8;
       var arrFixedSize: int64 := 0;   // #1156: 0 = zur Uebersetzungszeit unbekannt
@@ -13189,6 +13285,7 @@ pub type Codegen = class {
           }
           // WP-GPU-01: check SIMD flag first
           if (peek8(self.localIsSimd + lidx) != 0) { isSimd := 1; }
+          if (isSimd == 1) { simdBytes := self.cg_simdBytesOf(lidx); }   // #2199
           // #2183: Gleitkomma-Elemente brauchen die Umrechnung f32 <-> f64,
           // Ganzzahl-Elemente nicht.
           if (isSimd == 1 && peek8(self.localElemFloat + lidx) != 0) { isSimdFloat := 1; }
@@ -13276,7 +13373,18 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x04); self.cg_e8(0x19);
         return;
       }
-      if (isSimd == 1) {
+      if (isSimd == 1 && simdBytes == 8) {
+        // #2199: `parallel Array<f64>[i]` — 8 Byte Schrittweite, movsd, KEINE
+        // Umrechnung. Bis 1.2.19F lief dieser Fall ueber den f32-Pfad: die
+        // Ablage hielt 32 Bit, und erst beim Lesen machte cvtss2sd daraus
+        // wieder ein f64. Runde Werte ueberlebten das (1.5, 2.25), 0.1 nicht
+        // (0.10000000149011612), 1e40 wurde inf und 1e-50 null.
+        //
+        // movsd xmm0, [rax+rbx*8]  (F2 0F 10 04 D8)
+        self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0xD8);
+        // movq rax, xmm0  (66 48 0F 7E C0)
+        self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x7E); self.cg_e8(0xC0);
+      } else if (isSimd == 1) {
         // WP-GPU-01: parallel Array<f32>[i] — 4-byte stride, no header, SSE2 movss
         // rax=base ptr, rbx=index
         // movss xmm0, [rax+rbx*4]  (F3 0F 10 04 98)
@@ -19144,6 +19252,8 @@ pub type Codegen = class {
       // WP-GPU-01: CGN_TYPE_PARALLEL (=93) — mark as SIMD parallel array
       if (typeNode >= 0 && self.cg_nkind(typeNode) == 93) {
         poke8(self.localIsSimd + localIdx, 1);
+        // #2199: Elementbreite mitschreiben (c0 ist der Elementtyp).
+        poke8(self.localSimdBytes + localIdx, self.cg_simdBytesVonTyp(self.cg_nc0(typeNode)));
         poke8(self.localIsArray + localIdx, 0);  // not a regular Array
         // #2183: der ELEMENTTYP muss mit, wie bei `Array<T>` daneben. Ohne ihn
         // galt `v[i]` bei `parallel Array<f32>` als Ganzzahl: cg_isF64ElemOf
@@ -19933,6 +20043,7 @@ pub type Codegen = class {
         var lhsIsArray: int64 := 0;
         var lhsIsSimd:  int64 := 0;
         var lhsIsSimdFloat: int64 := 0;   // #2183
+        var lhsSimdBytes: int64 := 4;     // #2199
         var lhsIsPchar: int64 := 0;     // #1266
         var lhsFixedSize: int64 := 0;   // #1156
         var lhsElemBytes: int64 := 0;   // #1612: >0 = Struct-Element, so viele Byte
@@ -19987,6 +20098,7 @@ pub type Codegen = class {
           }
           // WP-GPU-01: SIMD array store check
           if (llidx >= 0 && peek8(self.localIsSimd + llidx) != 0) { lhsIsSimd := 1; }
+          if (lhsIsSimd == 1) { lhsSimdBytes := self.cg_simdBytesOf(llidx); }   // #2199
           // #2183: wie im Lesepfad — Gleitkomma-Elemente brauchen cvtsd2ss.
           if (lhsIsSimd == 1 && peek8(self.localElemFloat + llidx) != 0) { lhsIsSimdFloat := 1; }
           // #1266: `p[i] := x` auf einem pchar schrieb 8 Byte an Offset i*8 —
@@ -20038,7 +20150,24 @@ pub type Codegen = class {
         // dem Stack; der Panic-Pfad kehrt nicht zurueck, die Unwucht ist also
         // folgenlos.
         if (lhsIsArray == 1) { self.cg_emitIndexBoundsCheck(lhsFixedSize, 1); }
-        if (lhsIsSimd == 1) {
+        if (lhsIsSimd == 1 && lhsSimdBytes == 8) {
+          // #2199: `parallel Array<f64>[i] := wert` — 8 Byte, movsd, ohne
+          // Umrechnung. Gegenstueck zum Lesepfad (movsd dort); die beiden
+          // muessen uebereinstimmen, sonst liest man anders, als man
+          // geschrieben hat — genau der Fehler, den #2183 fuer f32 behoben
+          // hat.
+          self.cg_e8(0x59);                                                      // pop rcx (Wert)
+          if (self.cg_isF64Expr(rhs) != 0) {
+            // movq xmm0, rcx  (66 48 0F 6E C1)
+            self.cg_e8(0x66); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x6E); self.cg_e8(0xC1);
+          } else {
+            // Ganzzahliger Ausdruck in ein f64-Element: `v[0] := 2` legt 2.0
+            // ab. cvtsi2sd xmm0, rcx  (F2 48 0F 2A C1)
+            self.cg_e8(0xF2); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0x2A); self.cg_e8(0xC1);
+          }
+          // movsd [rax+rbx*8], xmm0  (F2 0F 11 04 D8)
+          self.cg_e8(0xF2); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0xD8);
+        } else if (lhsIsSimd == 1) {
           // WP-GPU-01: parallel Array<f32>[i] = val — movss store, 4-byte stride
           // stack: [value(rsi)]  rax=base  rbx=index
           // pop rcx (Wert)
@@ -27212,6 +27341,7 @@ pub type Codegen = class {
     self.tmrBypass      := 0;
     // WP-GPU-01: per-local SIMD flag
     self.localIsSimd      := alloc(self.localCap);
+    self.localSimdBytes   := alloc(self.localCap);   // #2199
     self.localIsFnPtr     := alloc(self.localCap);
     self.localFnPtrF64    := alloc(self.localCap);   // #1565
     self.localFnRetSatz   := alloc(self.localCap);   // #2143

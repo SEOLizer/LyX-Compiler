@@ -471,10 +471,26 @@ pub type EmitLyxOS = class {
     // WP-SIMD: aligned f32-Buffer allozieren. IN: rcx=Element-Anzahl. OUT: rax=16-Byte-aligned ptr,
     // Anzahl @ [rax-8]. mmap(0, n*4+24, PROT_RW=3, MAP_PRIVATE|ANON=0x22, -1, 0); align (ptr+23)&~15.
     // (Mirror ELF codegen_x86 SIMD_NEW; flags 0x22 = auf Linux gültig → lbf_run-testbar.)
-    fn emitSimdAllocFromRcx(): void {
+    // #2199: `bytes` ist die Elementbreite (4 = f32, 8 = f64). Bis 1.2.19F
+    // stand hier fest `shl rax, 2`, und die Zugriffe nahmen ebenfalls 4 Byte:
+    // `parallel Array<f64>` war damit in Wahrheit f32 — still, denn beim
+    // Lesen wandelte cvtss2sd zurueck.
+    fn emitSimdAllocFromRcx(bytes: int64): void {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        if bytes != 4 && bytes != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        var schub: int64 := 2;
+        if bytes == 8 { schub := 3; }
         self.emit8(0x48); self.emit8(0x89); self.emit8(0xC8);   // mov rax, rcx
         self.emit8(0x50);                                        // push rax (count)
-        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE0); self.emit8(0x02);  // shl rax, 2
+        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE0); self.emit8(schub);  // shl rax, 2 bzw. 3
         self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x18);  // add rax, 24
         self.emit8(0x48); self.emit8(0x31); self.emit8(0xFF);   // xor rdi, rdi
         self.emit8(0x48); self.emit8(0x89); self.emit8(0xC6);   // mov rsi, rax
@@ -489,22 +505,22 @@ pub type EmitLyxOS = class {
         self.emit8(0x48); self.emit8(0x83); self.emit8(0xE0); self.emit8(0xF0);  // and rax, -16
         self.emit8(0x48); self.emit8(0x89); self.emit8(0x48); self.emit8(0xF8);  // mov [rax-8], rcx
     }
-    fn emitSimdNew(dest: int64, cntSlot: int64): void {
+    fn emitSimdNew(dest: int64, cntSlot: int64, bytes: int64): void {
         self.emitMovRcxFromSlot(cntSlot);
-        self.emitSimdAllocFromRcx();
+        self.emitSimdAllocFromRcx(bytes);
         self.emitMovSlotFromRax(dest);
     }
     // WP-SIMD: vektorisierte f32-Binop. src1/src2=SIMD-ptr-Slots; alloc Ergebnis (gleiche Anzahl);
     // SSE2-Loop (movaps/packed-op/movaps); dest=Ergebnis-ptr. packedOp: addps 0x58/subps 0x5C/mulps 0x59/divps 0x5E.
-    fn emitSimdBinOp(packedOp: int64, dest: int64, src1: int64, src2: int64): void {
+    fn emitSimdBinOp(packedOp: int64, dest: int64, src1: int64, src2: int64, bytes: int64): void {
         self.emitMovRaxFromSlot(src1); self.emit8(0x48); self.emit8(0x89); self.emit8(0xC7);  // mov rdi, rax (lhs)
         self.emitMovRaxFromSlot(src2); self.emit8(0x48); self.emit8(0x89); self.emit8(0xC6);  // mov rsi, rax (rhs)
         self.emit8(0x48); self.emit8(0x8B); self.emit8(0x4F); self.emit8(0xF8);  // mov rcx, [rdi-8] (count)
         self.emit8(0x51); self.emit8(0x57); self.emit8(0x56);                    // push rcx; push rdi; push rsi
-        self.emitSimdAllocFromRcx();                                             // rax = dst ptr
+        self.emitSimdAllocFromRcx(bytes);                                        // rax = dst ptr
         self.emit8(0x48); self.emit8(0x89); self.emit8(0xC2);                    // mov rdx, rax (dst)
         self.emit8(0x5E); self.emit8(0x5F); self.emit8(0x59);                    // pop rsi; pop rdi; pop rcx
-        self.emitSimdSchleife(SIMD_RUMPF_BINOP, packedOp);
+        self.emitSimdSchleife(SIMD_RUMPF_BINOP, packedOp, bytes);
         self.emitMovSlotFromRax(dest);
     }
 
@@ -519,9 +535,23 @@ pub type EmitLyxOS = class {
     // die Sprungweiten werden nachgetragen statt gezaehlt.
     //
     // Erwartet: rdi=src1, rsi=src2, rdx=dst, rcx=Elementzahl. Ergebnis in rax.
-    fn emitSimdSchleife(rumpf: int64, opByte: int64): void {
+    fn emitSimdSchleife(rumpf: int64, opByte: int64, bytes: int64): void {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        if bytes != 4 && bytes != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        // #2199: Bytezahl = Elementzahl * Breite; der 16-Byte-Block fasst vier
+        // f32 oder zwei f64, der skalare Rest zaehlt in Elementen.
+        var schub: int64 := 2;
+        if bytes == 8 { schub := 3; }
         self.emit8(0x31); self.emit8(0xC0);                                      // xor eax, eax (Byte-Offset)
-        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE1); self.emit8(0x02);  // shl rcx, 2 (Bytezahl)
+        self.emit8(0x48); self.emit8(0xC1); self.emit8(0xE1); self.emit8(schub); // shl rcx, 2 bzw. 3
         self.emit8(0x48); self.emit8(0x83); self.emit8(0xE9); self.emit8(0x10);  // sub rcx, 16
 
         var vecStart: int64 := self.codeLen;
@@ -529,7 +559,7 @@ pub type EmitLyxOS = class {
         self.emit8(0x7F);                                                        // jg .tail
         var jgPos: int64 := self.codeLen; self.emit8(0);
         var vecBody: int64 := self.codeLen;
-        self.emitSimdRumpf(rumpf, opByte, 0);
+        self.emitSimdRumpf(rumpf, opByte, 0, bytes);
         self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x10);  // add rax, 16
         self.emit8(0xEB);
         var vecBack: int64 := self.codeLen;
@@ -543,8 +573,8 @@ pub type EmitLyxOS = class {
         self.emit8(0x7D);                                                        // jge .done
         var jgePos: int64 := self.codeLen; self.emit8(0);
         var scalarBody: int64 := self.codeLen;
-        self.emitSimdRumpf(rumpf, opByte, 1);
-        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(0x04);  // add rax, 4
+        self.emitSimdRumpf(rumpf, opByte, 1, bytes);
+        self.emit8(0x48); self.emit8(0x83); self.emit8(0xC0); self.emit8(bytes); // add rax, 4 bzw. 8
         self.emit8(0xEB);
         var scalarBack: int64 := self.codeLen;
         self.emit8(scalarStart - (scalarBack + 1));
@@ -557,72 +587,136 @@ pub type EmitLyxOS = class {
     // #2184: ein Durchlauf des Rumpfs. `skalar` 0 = 16 Byte (movaps/..ps),
     // 1 = 4 Byte (movss/..ss). Packed und skalar benutzen denselben
     // Operationsbyte — nur das F3-Praefix unterscheidet sie.
-    fn emitSimdRumpf(rumpf: int64, opByte: int64, skalar: int64): void {
+    //
+    // #2199: `bytes` waehlt die Breite. Die f64-Formen sind dieselben
+    // Opcode-Bytes mit einem Praefix — packed 0x66 (movapd/addpd/cmppd),
+    // skalar 0xF2 statt 0xF3 (movsd/addsd/cmpsd). Jede Form mit llvm-mc
+    // assembliert.
+    //
+    // EINE Ausnahme, und sie ist der Grund, hier genau hinzusehen: die
+    // Vorzeichenmaske der Negation. Fuer f32 ist es `pslld xmm1, 31`
+    // (66 0F 72 F1 1F), fuer f64 `psllq xmm1, 63` (66 0F 73 F1 3F) — anderes
+    // Opcode-Byte UND andere Verschiebung. Mit dem f32-Wort waere bei f64
+    // Bit 31 jedes Elements gekippt worden, also ein Bit der MANTISSE: aus
+    // -x wuerde eine andere Zahl, nicht das Vorzeichen.
+    fn emitSimdRumpf(rumpf: int64, opByte: int64, skalar: int64, bytes: int64): void {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        if bytes != 4 && bytes != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+        var pkPf: int64 := 0;
+        var skPf: int64 := 0xF3;
+        if bytes == 8 { pkPf := 0x66; skPf := 0xF2; }
         if skalar == 0 {
-            self.emit8(0x0F); self.emit8(0x28); self.emit8(0x04); self.emit8(0x07);  // movaps xmm0, [rdi+rax]
+            if pkPf != 0 { self.emit8(pkPf); }
+            self.emit8(0x0F); self.emit8(0x28); self.emit8(0x04); self.emit8(0x07);  // movaps/movapd xmm0, [rdi+rax]
         } else {
-            self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x10); self.emit8(0x04); self.emit8(0x07);  // movss xmm0, [rdi+rax]
+            self.emit8(skPf); self.emit8(0x0F); self.emit8(0x10); self.emit8(0x04); self.emit8(0x07);  // movss/movsd xmm0, [rdi+rax]
         }
         if rumpf == SIMD_RUMPF_NEG {
             self.emit8(0x66); self.emit8(0x0F); self.emit8(0x76); self.emit8(0xC9);  // pcmpeqd xmm1, xmm1
-            self.emit8(0x66); self.emit8(0x0F); self.emit8(0x72); self.emit8(0xF1); self.emit8(0x1F);  // pslld xmm1, 31
-            self.emit8(0x0F); self.emit8(0x57); self.emit8(0xC1);                    // xorps xmm0, xmm1
+            if bytes == 8 {
+                self.emit8(0x66); self.emit8(0x0F); self.emit8(0x73); self.emit8(0xF1); self.emit8(0x3F);  // psllq xmm1, 63
+                self.emit8(0x66); self.emit8(0x0F); self.emit8(0x57); self.emit8(0xC1);                    // xorpd xmm0, xmm1
+            } else {
+                self.emit8(0x66); self.emit8(0x0F); self.emit8(0x72); self.emit8(0xF1); self.emit8(0x1F);  // pslld xmm1, 31
+                self.emit8(0x0F); self.emit8(0x57); self.emit8(0xC1);                                      // xorps xmm0, xmm1
+            }
         } else {
             if skalar == 0 {
-                self.emit8(0x0F); self.emit8(0x28); self.emit8(0x0C); self.emit8(0x06);  // movaps xmm1, [rsi+rax]
+                if pkPf != 0 { self.emit8(pkPf); }
+                self.emit8(0x0F); self.emit8(0x28); self.emit8(0x0C); self.emit8(0x06);  // movaps/movapd xmm1, [rsi+rax]
             } else {
-                self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x10); self.emit8(0x0C); self.emit8(0x06);  // movss xmm1, [rsi+rax]
+                self.emit8(skPf); self.emit8(0x0F); self.emit8(0x10); self.emit8(0x0C); self.emit8(0x06);  // movss/movsd xmm1, [rsi+rax]
             }
-            if skalar != 0 { self.emit8(0xF3); }
+            if skalar != 0 { self.emit8(skPf); }
+            else { if pkPf != 0 { self.emit8(pkPf); } }
             if rumpf == SIMD_RUMPF_CMP {
-                self.emit8(0x0F); self.emit8(0xC2); self.emit8(0xC1); self.emit8(opByte);  // cmpps/cmpss xmm0, xmm1, imm
+                self.emit8(0x0F); self.emit8(0xC2); self.emit8(0xC1); self.emit8(opByte);  // cmpps/cmppd/cmpss/cmpsd
             } else {
-                self.emit8(0x0F); self.emit8(opByte); self.emit8(0xC1);                    // ..ps / ..ss xmm0, xmm1
+                self.emit8(0x0F); self.emit8(opByte); self.emit8(0xC1);                    // ..ps/..pd/..ss/..sd
             }
         }
         if skalar == 0 {
-            self.emit8(0x0F); self.emit8(0x29); self.emit8(0x04); self.emit8(0x02);  // movaps [rdx+rax], xmm0
+            if pkPf != 0 { self.emit8(pkPf); }
+            self.emit8(0x0F); self.emit8(0x29); self.emit8(0x04); self.emit8(0x02);  // movaps/movapd [rdx+rax], xmm0
         } else {
-            self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x11); self.emit8(0x04); self.emit8(0x02);  // movss [rdx+rax], xmm0
+            self.emit8(skPf); self.emit8(0x0F); self.emit8(0x11); self.emit8(0x04); self.emit8(0x02);  // movss/movsd [rdx+rax], xmm0
         }
     }
     // WP-SIMD: f32-Element laden + nach f64. dest=f64-Slot, ptrSlot=SIMD-ptr, idxSlot=Index.
-    fn emitSimdLoadElem(dest: int64, ptrSlot: int64, idxSlot: int64): void {
+    fn emitSimdLoadElem(dest: int64, ptrSlot: int64, idxSlot: int64, bytes: int64): void {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        if bytes != 4 && bytes != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
         self.emitMovRaxFromSlot(ptrSlot);
         self.emitMovRcxFromSlot(idxSlot);
-        self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x10); self.emit8(0x04); self.emit8(0x88);  // movss xmm0, [rax+rcx*4]
-        self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x5A); self.emit8(0xC0);                    // cvtss2sd xmm0, xmm0
+        if bytes == 8 {
+            // #2199: 8 Byte Schrittweite (SIB-Skalierung 3 → 0xC8), movsd,
+            // KEINE Umrechnung — der Wert ist schon f64.
+            self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x10); self.emit8(0x04); self.emit8(0xC8);  // movsd xmm0, [rax+rcx*8]
+        } else {
+            self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x10); self.emit8(0x04); self.emit8(0x88);  // movss xmm0, [rax+rcx*4]
+            self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x5A); self.emit8(0xC0);                    // cvtss2sd xmm0, xmm0
+        }
         self.emitMovsdSlotFromXmm0(dest);
     }
     // WP-SIMD: f64-Wert nach f32 + Element speichern. idxSlot=Index, valSlot=f64-Wert, ptrSlot=SIMD-ptr.
-    fn emitSimdStoreElem(idxSlot: int64, valSlot: int64, ptrSlot: int64): void {
+    fn emitSimdStoreElem(idxSlot: int64, valSlot: int64, ptrSlot: int64, bytes: int64): void {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        if bytes != 4 && bytes != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
         self.emitMovsdXmm0FromSlot(valSlot);
-        self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x5A); self.emit8(0xC0);  // cvtsd2ss xmm0, xmm0
+        if bytes != 8 { self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x5A); self.emit8(0xC0); }  // cvtsd2ss (nur f32)
         self.emitMovRaxFromSlot(ptrSlot);
         self.emitMovRcxFromSlot(idxSlot);
-        self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x11); self.emit8(0x04); self.emit8(0x88);  // movss [rax+rcx*4], xmm0
+        if bytes == 8 {
+            self.emit8(0xF2); self.emit8(0x0F); self.emit8(0x11); self.emit8(0x04); self.emit8(0xC8);  // movsd [rax+rcx*8], xmm0
+        } else {
+            self.emit8(0xF3); self.emit8(0x0F); self.emit8(0x11); self.emit8(0x04); self.emit8(0x88);  // movss [rax+rcx*4], xmm0
+        }
     }
     // WP-SIMD: packed f32-Negation (Vorzeichenbit-Flip pro Lane). Unär: dest=Ergebnis-Vektor.
-    fn emitSimdNeg(dest: int64, src1: int64): void {
+    fn emitSimdNeg(dest: int64, src1: int64, bytes: int64): void {
         self.emitMovRaxFromSlot(src1); self.emit8(0x48); self.emit8(0x89); self.emit8(0xC7);  // mov rdi, rax
         self.emit8(0x48); self.emit8(0x8B); self.emit8(0x4F); self.emit8(0xF8);  // mov rcx, [rdi-8] (count)
         self.emit8(0x51); self.emit8(0x57);                                      // push rcx; push rdi
-        self.emitSimdAllocFromRcx();                                             // rax = dst
+        self.emitSimdAllocFromRcx(bytes);                                        // rax = dst
         self.emit8(0x48); self.emit8(0x89); self.emit8(0xC2);                    // mov rdx, rax
         self.emit8(0x5F); self.emit8(0x59);                                      // pop rdi; pop rcx
-        self.emitSimdSchleife(SIMD_RUMPF_NEG, 0);   // #2184
+        self.emitSimdSchleife(SIMD_RUMPF_NEG, 0, bytes);   // #2184, #2199
         self.emitMovSlotFromRax(dest);
     }
     // WP-SIMD: packed f32-Vergleich (cmpps imm → Masken-Vektor 0xFFFFFFFF/0 pro Lane).
-    fn emitSimdCmp(predImm: int64, dest: int64, src1: int64, src2: int64): void {
+    fn emitSimdCmp(predImm: int64, dest: int64, src1: int64, src2: int64, bytes: int64): void {
         self.emitMovRaxFromSlot(src1); self.emit8(0x48); self.emit8(0x89); self.emit8(0xC7);  // mov rdi, rax (lhs)
         self.emitMovRaxFromSlot(src2); self.emit8(0x48); self.emit8(0x89); self.emit8(0xC6);  // mov rsi, rax (rhs)
         self.emit8(0x48); self.emit8(0x8B); self.emit8(0x4F); self.emit8(0xF8);  // mov rcx, [rdi-8]
         self.emit8(0x51); self.emit8(0x57); self.emit8(0x56);                    // push rcx; push rdi; push rsi
-        self.emitSimdAllocFromRcx();                                             // rax = dst
+        self.emitSimdAllocFromRcx(bytes);                                        // rax = dst
         self.emit8(0x48); self.emit8(0x89); self.emit8(0xC2);                    // mov rdx, rax
         self.emit8(0x5E); self.emit8(0x5F); self.emit8(0x59);                    // pop rsi; pop rdi; pop rcx
-        self.emitSimdSchleife(SIMD_RUMPF_CMP, predImm);   // #2184
+        self.emitSimdSchleife(SIMD_RUMPF_CMP, predImm, bytes);   // #2184, #2199
         self.emitMovSlotFromRax(dest);
     }
 
@@ -2526,39 +2620,39 @@ pub type EmitLyxOS = class {
             // (kein Profiling/Introspektion im Kernel-Build). Explizit, nicht stiller Default.
             self.emit8(0x90);                                       // nop
         } else if op == 165 {                     // IRO_SIMD_NEW (dest, src1=count)
-            self.emitSimdNew(dest, src1);
+            self.emitSimdNew(dest, src1, imm);
         } else if op == 122 {                     // IRO_SIMD_ADD → addps
-            self.emitSimdBinOp(0x58, dest, src1, src2);
+            self.emitSimdBinOp(0x58, dest, src1, src2, imm);
         } else if op == 123 {                     // IRO_SIMD_SUB → subps
-            self.emitSimdBinOp(0x5C, dest, src1, src2);
+            self.emitSimdBinOp(0x5C, dest, src1, src2, imm);
         } else if op == 124 {                     // IRO_SIMD_MUL → mulps
-            self.emitSimdBinOp(0x59, dest, src1, src2);
+            self.emitSimdBinOp(0x59, dest, src1, src2, imm);
         } else if op == 125 {                     // IRO_SIMD_DIV → divps
-            self.emitSimdBinOp(0x5E, dest, src1, src2);
+            self.emitSimdBinOp(0x5E, dest, src1, src2, imm);
         } else if op == 136 {                     // IRO_SIMD_LOAD_ELEM (dest, src1=ptr, src2=idx) f32→f64
-            self.emitSimdLoadElem(dest, src1, src2);
+            self.emitSimdLoadElem(dest, src1, src2, imm);
         } else if op == 137 {                     // IRO_SIMD_STORE_ELEM (dest=idx, src1=val, src2=ptr) f64→f32
-            self.emitSimdStoreElem(dest, src1, src2);
+            self.emitSimdStoreElem(dest, src1, src2, imm);
         } else if op == 126 {                     // IRO_SIMD_AND → andps
-            self.emitSimdBinOp(0x54, dest, src1, src2);
+            self.emitSimdBinOp(0x54, dest, src1, src2, imm);
         } else if op == 127 {                     // IRO_SIMD_OR → orps
-            self.emitSimdBinOp(0x56, dest, src1, src2);
+            self.emitSimdBinOp(0x56, dest, src1, src2, imm);
         } else if op == 128 {                     // IRO_SIMD_XOR → xorps
-            self.emitSimdBinOp(0x57, dest, src1, src2);
+            self.emitSimdBinOp(0x57, dest, src1, src2, imm);
         } else if op == 129 {                     // IRO_SIMD_NEG → packed Vorzeichenbit-Flip
-            self.emitSimdNeg(dest, src1);
+            self.emitSimdNeg(dest, src1, imm);
         } else if op == 130 {                     // IRO_SIMD_CMP_EQ → cmpps imm 0
-            self.emitSimdCmp(0, dest, src1, src2);
+            self.emitSimdCmp(0, dest, src1, src2, imm);
         } else if op == 131 {                     // IRO_SIMD_CMP_NE → cmpps imm 4
-            self.emitSimdCmp(4, dest, src1, src2);
+            self.emitSimdCmp(4, dest, src1, src2, imm);
         } else if op == 132 {                     // IRO_SIMD_CMP_LT → cmpps imm 1
-            self.emitSimdCmp(1, dest, src1, src2);
+            self.emitSimdCmp(1, dest, src1, src2, imm);
         } else if op == 133 {                     // IRO_SIMD_CMP_LE → cmpps imm 2
-            self.emitSimdCmp(2, dest, src1, src2);
+            self.emitSimdCmp(2, dest, src1, src2, imm);
         } else if op == 134 {                     // IRO_SIMD_CMP_GT → cmpps imm 6 (NLE)
-            self.emitSimdCmp(6, dest, src1, src2);
+            self.emitSimdCmp(6, dest, src1, src2, imm);
         } else if op == 135 {                     // IRO_SIMD_CMP_GE → cmpps imm 5 (NLT)
-            self.emitSimdCmp(5, dest, src1, src2);
+            self.emitSimdCmp(5, dest, src1, src2, imm);
         } else {
             // WP-STUB-00: unbehandelter IR-Opcode → INT3 (lauter Runtime-Trap) statt stilles
             // Falschverhalten. Deckt künftige Lücken sofort auf statt sie zu verschlucken.

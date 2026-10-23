@@ -2210,7 +2210,13 @@ pub type IRLower = class {
       // count @ ptr-8, 16-Byte-Alignment (wie ELF cg SIMD_NEW). c1 = Größen-Ausdruck.
       var dest: int64 := self.allocTemp();
       var cnt: int64 := self.lowerExpr(self.nodeC1(expr));
-      self.irAddInstrDirect(IRO_SIMD_NEW, dest, cnt, -1, 0);
+      // #2199: c0 ist der Elementtyp — die Breite geht als imm mit, sonst
+      // belegt das Backend n*4 Byte auch fuer f64.
+      var snB: int64 := 4;
+      var snT: int64 := self.nodeC0(expr);
+      if snT >= 0 && self.nodeKind(snT) == NK_TYPE_NAME
+         && _irNameGleich(self.nodeSVal(snT), self.nodeSLen(snT), "f64"c, 3) != 0 { snB := 8; }
+      self.irAddInstrDirect(IRO_SIMD_NEW, dest, cnt, -1, snB);
       return dest;
     }
     // WP-BC-15: regex literal — lower as string constant
@@ -2710,6 +2716,29 @@ pub type IRLower = class {
   }
 
   // WP-SIMD: ist expr eine parallel-Array<f32>-Variable (NK_TYPE_PARALLEL=93)? → SSE2-Vektor-Pfad.
+  // #2199: Elementbreite eines `parallel Array<T>` in Byte (4 oder 8).
+  //
+  // `tn` ist der TYPKNOTEN (NK_TYPE_PARALLEL); sein c0 traegt den Elementtyp
+  // (parser.lyx:1291). Bis 1.2.19F kannte die Ablage nur 4 Byte, `f64` lag
+  // deshalb still als f32 darin: 0.1 wurde 0.10000000149011612, 1e40 wurde
+  // inf. Die Breite wird jetzt im imm-Feld der IR-Instruktion mitgegeben —
+  // die Backends koennen sie nicht aus dem Opcode ableiten.
+  fn _simdBytesVonTypNode(tn: int64): int64 {
+    if tn < 0 { return 4; }
+    var et: int64 := self.nodeC0(tn);
+    if et < 0 { return 4; }
+    if self.nodeKind(et) != NK_TYPE_NAME { return 4; }
+    if _irNameGleich(self.nodeSVal(et), self.nodeSLen(et), "f64"c, 3) != 0 { return 8; }
+    return 4;
+  }
+
+  // Dasselbe fuer einen AUSDRUCK, der ein SIMD-Local nennt.
+  fn _simdBytesExpr(expr: int64): int64 {
+    if expr < 0 { return 4; }
+    if self.nodeKind(expr) != NK_IDENT { return 4; }
+    return self._simdBytesVonTypNode(self._localTypeNode(self.nodeSVal(expr), self.nodeSLen(expr)));
+  }
+
   fn _isSimdExpr(expr: int64): int64 {
     if expr < 0 { return 0; }
     if self.nodeKind(expr) != NK_IDENT { return 0; }
@@ -2806,7 +2835,16 @@ pub type IRLower = class {
       if iro == IRO_DIV || iro == IRO_MOD {
         self.irAddInstrDirect(IRO_ASSERT_NOT_ZERO, -1, t2, -1, 0);
       }
-      self.irAddInstrDirect(iro, dest, t1, t2, 0);
+      // #2199: Bei einer SIMD-Operation traegt imm die Elementbreite — das
+      // Backend kann sie dem Opcode nicht ansehen (IRO_SIMD_ADD gilt fuer f32
+      // wie f64). Bei allen anderen Operationen bleibt imm 0, die Bedeutung
+      // des Feldes aendert sich also nur fuer die SIMD-Opcodes.
+      var immBreite: int64 := 0;
+      if (iro >= IRO_SIMD_ADD && iro <= IRO_SIMD_DIV) || iro == IRO_SIMD_AND
+         || iro == IRO_SIMD_OR || iro == IRO_SIMD_XOR {
+        immBreite := self._simdBytesExpr(self.nodeC0(expr));
+      }
+      self.irAddInstrDirect(iro, dest, t1, t2, immBreite);
     }
     return dest;
   }
@@ -2924,7 +2962,13 @@ pub type IRLower = class {
     // (lowerBinOp, IRO_SUB → IRO_FSUB); die beiden muessen uebereinstimmen.
     if iro == IRO_NEG { if self._isF64Expr(self.nodeC0(expr)) != 0 { iro := IRO_FNEG; } }
     if iro >= 0 {
-      self.irAddInstrDirect(iro, dest, t1, -1, 0);
+      // #2199: auch der UNAERE SIMD-Pfad braucht die Elementbreite. Ohne sie
+      // kam im Backend `bytes = 0` an, und der skalare Rest-Durchgang zaehlte
+      // mit `add rax, 0` — eine Endlosschleife. Aufgefallen als Zeitablauf in
+      // tests/.../simd_neg_rest_n5 (exit 124), nicht als falscher Wert.
+      var unBreite: int64 := 0;
+      if iro == IRO_SIMD_NEG { unBreite := self._simdBytesExpr(self.nodeC0(expr)); }
+      self.irAddInstrDirect(iro, dest, t1, -1, unBreite);
     }
     return dest;
   }
@@ -7315,7 +7359,8 @@ pub type IRLower = class {
     var dest: int64 := self.allocTemp();
     // WP-SIMD: parallel-Array<f32>[i] → f32-Element laden + nach f64 konvertieren (LOAD_ELEM).
     if simd != 0 {
-      self.irAddInstrDirect(IRO_SIMD_LOAD_ELEM, dest, base, idx, 0);
+      self.irAddInstrDirect(IRO_SIMD_LOAD_ELEM, dest, base, idx,
+                            self._simdBytesExpr(self.nodeC0(expr)));   // #2199
       return dest;
     }
     // ARM64-FIX: war Stub. base = Array-Pointer (aus IRO_ALLOC), idx = Index.
@@ -9781,7 +9826,8 @@ pub type IRLower = class {
           // gehoert hierher und nicht in ein Backend: sonst muessten alle
           // drei sie einzeln kennen, und das naechste haette sie wieder nicht.
           valTemp := self._nachGleit(valTemp, val, 1);
-          self.irAddInstrDirect(IRO_SIMD_STORE_ELEM, aiIdx, valTemp, aiBase, 0);
+          self.irAddInstrDirect(IRO_SIMD_STORE_ELEM, aiIdx, valTemp, aiBase,
+                                self._simdBytesExpr(self.nodeC0(target)));   // #2199
         } else {
           self.irAddInstrDirect(IRO_STORE_IDX, aiIdx, valTemp, aiBase, 0);
         }

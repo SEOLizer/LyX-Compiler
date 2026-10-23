@@ -661,13 +661,16 @@ pub type EmitARM64 = class {
     // #2185: FADD/FSUB/FMUL/FDIV auf v.4s, dazu die skalare Form fuer den Rest.
     // Jedes Wort einzeln mit llvm-mc gegengelesen — die alte Tabelle war in
     // allen vier Zeilen falsch.
-    if op == IRO_SIMD_ADD { self.emitNeonBinOp(0x4E21D400, 0x1E212800, src1, src2, dest); }
-    if op == IRO_SIMD_SUB { self.emitNeonBinOp(0x4EA1D400, 0x1E213800, src1, src2, dest); }
-    if op == IRO_SIMD_MUL { self.emitNeonBinOp(0x6E21DC00, 0x1E210800, src1, src2, dest); }
-    if op == IRO_SIMD_DIV { self.emitNeonBinOp(0x6E21FC00, 0x1E211800, src1, src2, dest); }
-    if op == IRO_SIMD_NEW { self.emitSimdNew(src1, dest); }
-    if op == IRO_SIMD_LOAD_ELEM  { self.emitSimdLoadElem(dest, src1, src2); }
-    if op == IRO_SIMD_STORE_ELEM { self.emitSimdStoreElem(dest, src1, src2); }
+    //
+    // #2199: `imm` traegt die Elementbreite (4 oder 8). Ohne sie waere `f64`
+    // weiter als f32 gerechnet — still und nur an der Genauigkeit erkennbar.
+    if op == IRO_SIMD_ADD { self.emitNeonBinOp(0x4E21D400, 0x1E212800, src1, src2, dest, imm); }
+    if op == IRO_SIMD_SUB { self.emitNeonBinOp(0x4EA1D400, 0x1E213800, src1, src2, dest, imm); }
+    if op == IRO_SIMD_MUL { self.emitNeonBinOp(0x6E21DC00, 0x1E210800, src1, src2, dest, imm); }
+    if op == IRO_SIMD_DIV { self.emitNeonBinOp(0x6E21FC00, 0x1E211800, src1, src2, dest, imm); }
+    if op == IRO_SIMD_NEW { self.emitSimdNew(src1, dest, imm); }
+    if op == IRO_SIMD_LOAD_ELEM  { self.emitSimdLoadElem(dest, src1, src2, imm); }
+    if op == IRO_SIMD_STORE_ELEM { self.emitSimdStoreElem(dest, src1, src2, imm); }
 
     // --- Debug ---
     if op == IRO_INSPECT { self.emitInspect(src1, idx); }
@@ -2392,7 +2395,29 @@ pub type EmitARM64 = class {
   //
   // `vecWort`/`skalarWort` sind die fertigen Befehlswoerter fuer v0 = v0 OP v1
   // bzw. s0 = s0 OP s1, jedes einzeln mit llvm-mc gegengelesen.
-  fn emitNeonBinOp(vecWort: int64, skalarWort: int64, src1: int64, src2: int64, dest: int64) {
+  //
+  // #2199: `bytes` ist die Elementbreite. Zwischen der f32- und der
+  // f64-Form unterscheidet in BEIDEN Befehlswoertern genau Bit 22
+  // (0x00400000) — `fadd v0.4s` ist 0x4E21D400, `fadd v0.2d` 0x4E61D400;
+  // skalar `fadd s0` 0x1E212800, `fadd d0` 0x1E612800. Deshalb ein ODER
+  // statt acht weiterer Konstanten. Alle Woerter mit llvm-mc assembliert.
+  //
+  // Der Vektorteil bleibt bei 16 Byte je Durchlauf (ein q-Register fasst vier
+  // f32 oder zwei f64); nur der skalare Rest zaehlt in Elementen.
+  fn emitNeonBinOp(vecWort: int64, skalarWort: int64, src1: int64, src2: int64, dest: int64, bytes: int64) {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        if bytes != 4 && bytes != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
+    var vw: int64 := vecWort;
+    var sw: int64 := skalarWort;
+    if bytes == 8 { vw := vecWort | 0x00400000; sw := skalarWort | 0x00400000; }
     // x0 = Zeiger auf lhs, x2 = Elementzahl aus [x0-8]
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(src1));
     self.emitLdur(ARM64_X2, ARM64_X0, 0 - 8);
@@ -2400,7 +2425,8 @@ pub type EmitARM64 = class {
     // und die Quellzeiger stehen ohnehin in Rahmen-Slots.
     self.emitStur(ARM64_X2, ARM64_X29, self.slotOff(dest));
     // Ergebnispuffer anlegen: n*4 + 24 Byte, 16-Byte ausgerichtet, Zaehler bei ptr-8
-    self.emit32(0xD37EF442);   // LSL x2, x2, #2
+    if bytes == 8 { self.emit32(0xD37DF042); }   // LSL x2, x2, #3   (#2199)
+    else          { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
     self.emit32(0x91006042);   // ADD x2, x2, #24
     self.emitMovImmReg(ARM64_X0, 0);    // addr = 0
     self.emit32(0xAA0203E1);            // MOV x1, x2  (Laenge)
@@ -2419,7 +2445,8 @@ pub type EmitARM64 = class {
     // Quellzeiger neu laden: x3 = lhs, x4 = rhs
     self.emitLdur(ARM64_X3, ARM64_X29, self.slotOff(src1));
     self.emitLdur(ARM64_X4, ARM64_X29, self.slotOff(src2));
-    self.emit32(0xD37EF442);   // LSL x2, x2, #2   (Bytezahl)
+    if bytes == 8 { self.emit32(0xD37DF042); }   // LSL x2, x2, #3  (Bytezahl, #2199)
+    else          { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
     self.emit32(0xD1004042);   // SUB x2, x2, #16  (letzter voller Block; darf negativ werden)
     self.emitMovImmReg(ARM64_X5, 0);   // Byte-Offset
 
@@ -2430,7 +2457,7 @@ pub type EmitARM64 = class {
     self.emit32(0x5400000C);   // B.GT .tail  (Weite wird nachgetragen)
     self.emit32(0x3CE56860);   // LDR q0, [x3, x5]
     self.emit32(0x3CE56881);   // LDR q1, [x4, x5]
-    self.emit32(vecWort);      // v0 = v0 OP v1  (.4s)
+    self.emit32(vw);           // v0 = v0 OP v1  (.4s bzw. .2d)
     self.emit32(0x3CA56800);   // STR q0, [x0, x5]
     self.emit32(0x910040A5);   // ADD x5, x5, #16
     var vecBack: int64 := self.codeLen;
@@ -2444,11 +2471,19 @@ pub type EmitARM64 = class {
     self.emit32(0xEB0200BF);   // CMP x5, x2
     var jgePos: int64 := self.codeLen;
     self.emit32(0x5400000A);   // B.GE .done  (Weite wird nachgetragen)
-    self.emit32(0xBC656860);   // LDR s0, [x3, x5]
-    self.emit32(0xBC656881);   // LDR s1, [x4, x5]
-    self.emit32(skalarWort);   // s0 = s0 OP s1
-    self.emit32(0xBC256800);   // STR s0, [x0, x5]
-    self.emit32(0x910010A5);   // ADD x5, x5, #4
+    if bytes == 8 {
+      self.emit32(0xFC656860);   // LDR d0, [x3, x5]
+      self.emit32(0xFC656881);   // LDR d1, [x4, x5]
+      self.emit32(sw);           // d0 = d0 OP d1
+      self.emit32(0xFC256800);   // STR d0, [x0, x5]
+      self.emit32(0x910020A5);   // ADD x5, x5, #8
+    } else {
+      self.emit32(0xBC656860);   // LDR s0, [x3, x5]
+      self.emit32(0xBC656881);   // LDR s1, [x4, x5]
+      self.emit32(sw);           // s0 = s0 OP s1
+      self.emit32(0xBC256800);   // STR s0, [x0, x5]
+      self.emit32(0x910010A5);   // ADD x5, x5, #4
+    }
     var scalarBack: int64 := self.codeLen;
     self.emit32(0x14000000 | (((scalarStart - scalarBack) / 4) & 0x03FFFFFF));   // B .scalarStart
     var donePos: int64 := self.codeLen;
@@ -2517,10 +2552,23 @@ pub type EmitARM64 = class {
   // #2185: `parallel Array<f32>(n)` — ausgerichtete Anlage mit Zaehler bei
   // ptr-8, dieselbe Ablage wie CGN_SIMD_NEW auf x86 und emit_lyxos. Ohne diese
   // Umsetzung brach arm64 mit "kennt Opcode 165 nicht" ab.
-  fn emitSimdNew(countSlot: int64, dest: int64) {
+  fn emitSimdNew(countSlot: int64, dest: int64, bytes: int64) {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        if bytes != 4 && bytes != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
     self.emitLdur(ARM64_X2, ARM64_X29, self.slotOff(countSlot));
     self.emitStur(ARM64_X2, ARM64_X29, self.slotOff(dest));   // Zahl parken
-    self.emit32(0xD37EF442);   // LSL x2, x2, #2
+    // #2199: n*4 fuer f32, n*8 fuer f64. Beide Woerter mit llvm-mc
+    // assembliert, nicht getippt.
+    if bytes == 8 { self.emit32(0xD37DF042); }   // LSL x2, x2, #3
+    else          { self.emit32(0xD37EF442); }   // LSL x2, x2, #2
     self.emit32(0x91006042);   // ADD x2, x2, #24
     self.emitMovImmReg(ARM64_X0, 0);
     self.emit32(0xAA0203E1);            // MOV x1, x2
@@ -2541,23 +2589,55 @@ pub type EmitARM64 = class {
   // #2185: `v[i]` auf einem f32-Vektor — 4 Byte Schrittweite, Ergebnis als
   // f64-WERT (nicht als Bitmuster). Gegenstueck zu emitSimdStoreElem; die
   // beiden muessen uebereinstimmen, sonst liest man anders, als man schreibt.
-  fn emitSimdLoadElem(dest: int64, ptrSlot: int64, idxSlot: int64) {
+  fn emitSimdLoadElem(dest: int64, ptrSlot: int64, idxSlot: int64, bytes: int64) {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        if bytes != 4 && bytes != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
     self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(idxSlot));
-    self.emit32(0xD37EF421);   // LSL x1, x1, #2
-    self.emit32(0xBC616800);   // LDR s0, [x0, x1]
-    self.emit32(0x1E22C000);   // FCVT d0, s0
+    // #2199: bei f64 acht Byte Schrittweite, `ldr d0` — und KEIN FCVT, der
+    // Wert ist schon f64. Die Wandlung gehoert nur zum f32-Fall (#2183).
+    if bytes == 8 {
+      self.emit32(0xD37DF021);   // LSL x1, x1, #3
+      self.emit32(0xFC616800);   // LDR d0, [x0, x1]
+    } else {
+      self.emit32(0xD37EF421);   // LSL x1, x1, #2
+      self.emit32(0xBC616800);   // LDR s0, [x0, x1]
+      self.emit32(0x1E22C000);   // FCVT d0, s0
+    }
     self.emitFStur(ARM64_D0, ARM64_X29, self.slotOff(dest));
   }
 
   // #2185: `v[i] := x` — f64-Wert nach f32 wandeln, dann ablegen.
-  fn emitSimdStoreElem(idxSlot: int64, valSlot: int64, ptrSlot: int64) {
+  fn emitSimdStoreElem(idxSlot: int64, valSlot: int64, ptrSlot: int64, bytes: int64) {
+        // #2199: Schutz gegen eine 0 aus einem nicht versorgten IR-Pfad. Als
+        // Schrittweite waere sie eine Endlosschleife (`add rax, 0`) — genau
+        // das ist beim unaeren Pfad passiert. Hier wird NICHT stillschweigend
+        // 4 angenommen, sondern laut gemeldet: eine 0 heisst, dass eine
+        // Stelle in ir_lower die Breite nicht mitgibt, und das gehoert
+        // behoben, nicht geraten.
+        if bytes != 4 && bytes != 8 {
+            EPrintStrLn("interner fehler: SIMD-Elementbreite ist weder 4 noch 8 (#2199) — eine IR-Stelle gibt sie nicht mit."c);
+            exit(1);
+        }
     self.emitFLdur(ARM64_D0, ARM64_X29, self.slotOff(valSlot));
-    self.emit32(0x1E624000);   // FCVT s0, d0
+    if bytes != 8 { self.emit32(0x1E624000); }   // FCVT s0, d0  (nur f32)
     self.emitLdur(ARM64_X0, ARM64_X29, self.slotOff(ptrSlot));
     self.emitLdur(ARM64_X1, ARM64_X29, self.slotOff(idxSlot));
-    self.emit32(0xD37EF421);   // LSL x1, x1, #2
-    self.emit32(0xBC216800);   // STR s0, [x0, x1]
+    if bytes == 8 {
+      self.emit32(0xD37DF021);   // LSL x1, x1, #3
+      self.emit32(0xFC216800);   // STR d0, [x0, x1]
+    } else {
+      self.emit32(0xD37EF421);   // LSL x1, x1, #2
+      self.emit32(0xBC216800);   // STR s0, [x0, x1]
+    }
   }
 
   // -------------------------------------------------------------------------
