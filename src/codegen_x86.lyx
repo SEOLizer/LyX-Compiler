@@ -1085,6 +1085,15 @@ pub type Codegen = class {
   // Variable. rlAnz = Zahl der gewaehlten Register.
   rlAnz:  int64;
   rlTab:  int64;
+  // #2228: Deklarationsknoten je gewaehltem Register (parallel zu rlTab).
+  // Gebunden wird ueber den KNOTEN, nicht den Namen: zwei gleichnamige
+  // Deklarationen (auch verdeckende, sema laesst das zu) bekommen so je ihre
+  // eigene Zuordnung, und keine kann die andere im Register ueberschreiben.
+  rlKnoten: int64;
+  // #2228: In einer Methode ist `self` Kandidat wie ein Parameter. Sein
+  // Kandidatenknoten ist die Methodendeklaration selbst (rlSelfKnoten), der
+  // Name wird ueber cg_rlKName gelesen.
+  rlSelfKnoten: int64;
   // #2228: zurueckgehaltene Argumente zwischen Auswertung und Pop-Stelle in
   // cg_genCall: direktAb = erster zurueckgehaltener Index + 1 (0 = keine).
   direktAb: int64;
@@ -8136,11 +8145,11 @@ pub type Codegen = class {
   }
 
   // Deklaration eines gewaehlten Locals: Slot dem Register zuordnen.
-  fn cg_rlBinde(np: pchar, nl: int64, off: int64) {
+  fn cg_rlBinde(knoten: int64, off: int64) {
     var i: int64 := 0;
     while (i < self.rlAnz) {
       var b: int64 := self.rlTab + i * 48;
-      if (peek64(b + 8) == nl && self.cg_seq(peek64(b) as pchar, nl, np, nl)) {
+      if (peek64(self.rlKnoten + i * 8) == knoten) {
         var ns: int64 := peek64(b + 16);
         if (ns >= peek64(b + 40)) {
           var nc: int64 := peek64(b + 40) * 2;
@@ -8156,6 +8165,7 @@ pub type Codegen = class {
     }
   }
 
+
   // Ist der Typknoten ein 64-Bit-Ganzzahltyp ohne Sonderbehandlung (keine
   // Kuerzung, keine Einheit, kein Bereich, kein Gleitkomma)?
   fn cg_rlTypOk(tn: int64): int64 {
@@ -8166,16 +8176,60 @@ pub type Codegen = class {
     if (self.cg_rangeOfTypeNode(tn) >= 0) { return 0; }
     if (self.cg_seq(p, l, "int64"c, 5) || self.cg_seq(p, l, "uint64"c, 6)) { return 1; }
     if (self.cg_seq(p, l, "i64"c, 3) || self.cg_seq(p, l, "u64"c, 3)) { return 1; }
+    // #2228: Zeiger sind ein Maschinenwort wie int64 und gehen ueber dieselben
+    // Lade-/Speicherwege (cg_loadRax/cg_storeRax): pchar und Referenzen auf
+    // Klassen. NICHT Wert-Structs (cg_istWertStruct): deren Inhalt liegt im
+    // Rahmen selbst, der Slot ist kein Wert, der in ein Register passt.
+    if (self.cg_seq(p, l, "pchar"c, 5)) { return 1; }
+    var ci: int64 := self.cg_findClass(p, l);
+    if (ci >= 0 && self.cg_istWertStruct(ci) == 0) { return 1; }
     return 0;
   }
 
-  // Kandidatenpuffer: je 40 Byte {Knoten, Gewicht, ok, Deklarationen, frei}.
+  // #2228: Name eines Kandidaten — fuer `self` (Kandidatenknoten = Methode)
+  // nicht der Methodenname, sondern "self".
+  fn cg_rlKNameP(k: int64): pchar {
+    if (k == self.rlSelfKnoten && k >= 0) { return "self"c; }
+    return self.cg_nsval(k);
+  }
+  fn cg_rlKNameL(k: int64): int64 {
+    if (k == self.rlSelfKnoten && k >= 0) { return 4; }
+    return self.cg_nslen(k);
+  }
+
+  // #2228: Kandidat zu genau diesem Deklarationsknoten, sonst -1.
+  fn cg_rlKnotenIdx(kb: int64, kn: int64, knoten: int64): int64 {
+    var i: int64 := 0;
+    while (i < kn) {
+      if (peek64(kb + i * 40) == knoten) { return i; }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // #2228: Unter den gleichnamigen Kandidaten der mit dem hoechsten Stempel
+  // (zuletzt im Durchgang deklariert); ohne Stempel der erste.
+  fn cg_rlZuletzt(kb: int64, kn: int64, np: pchar, nl: int64): int64 {
+    var best: int64 := 0 - 1;
+    var bestS: int64 := 0 - 1;
+    var i: int64 := 0;
+    while (i < kn) {
+      var k: int64 := peek64(kb + i * 40);
+      if (self.cg_rlKNameL(k) == nl && self.cg_seq(self.cg_rlKNameP(k), nl, np, nl)) {
+        if (best < 0 || peek64(kb + i * 40 + 32) > bestS) { best := i; bestS := peek64(kb + i * 40 + 32); }
+      }
+      i += 1;
+    }
+    return best;
+  }
+
+  // Kandidatenpuffer: je 40 Byte {Knoten, Gewicht, ok, Deklarationen, Stempel}.
   fn cg_rlKandIdx(kb: int64, kn: int64, np: pchar, nl: int64): int64 {
     if (nl <= 0) { return 0 - 1; }
     var i: int64 := 0;
     while (i < kn) {
       var k: int64 := peek64(kb + i * 40);
-      if (self.cg_nslen(k) == nl && self.cg_seq(self.cg_nsval(k), nl, np, nl)) { return i; }
+      if (self.cg_rlKNameL(k) == nl && self.cg_seq(self.cg_rlKNameP(k), nl, np, nl)) { return i; }
       i += 1;
     }
     return 0 - 1;
@@ -8201,26 +8255,47 @@ pub type Codegen = class {
       if (modus == 0 && k == CGN_VAR_DECL && (self.cg_nival(cur) & 4) == 0
           && self.cg_rlTypOk(self.cg_nc0(cur)) != 0 && kn < 64) {
         var nb: int64 := kb + kn * 40;
-        poke64(nb, cur); poke64(nb + 8, 0); poke64(nb + 16, 1); poke64(nb + 24, 0);
+        poke64(nb, cur); poke64(nb + 8, 0); poke64(nb + 16, 1); poke64(nb + 24, 0); poke64(nb + 32, 0);
         poke64(kbBox + 8, kn + 1);
       }
       if (modus == 1) {
         var ki: int64 := self.cg_rlKandIdx(kb, kn, self.cg_nsval(cur), self.cg_nslen(cur));
         if (ki >= 0) {
-          var kr: int64 := kb + ki * 40;
           if (k == CGN_IDENT) {
+            // #2228: Gewicht an die zuletzt gesehene gleichnamige Deklaration.
+            // Ungenau bei Verdeckung — das betrifft nur die Auswahl, nicht die
+            // Korrektheit: gebunden wird ueber den Knoten (cg_rlBinde), und
+            // welcher Slot gemeint ist, entscheidet der Codegen selbst.
+            var kz: int64 := self.cg_rlZuletzt(kb, kn, self.cg_nsval(cur), self.cg_nslen(cur));
+            var kr: int64 := kb + kz * 40;
             var gw: int64 := 1;
             var t: int64 := tiefe;
             if (t > 3) { t := 3; }
             while (t > 0) { gw := gw * 8; t -= 1; }
             poke64(kr + 8, peek64(kr + 8) + gw);
-          } else if (k == CGN_VAR_DECL && cur == peek64(kr)) {
-            poke64(kr + 24, peek64(kr + 24) + 1);
-          } else {
-            // Jede andere Nennung desselben Namens (zweite Deklaration,
-            // Laufvariable, Musterbindung, gleichnamiges Feld …): nicht
-            // waehlen — die Zuordnung ueber den Namen waere nicht eindeutig.
-            poke64(kr + 16, 0);
+          } else if (k == CGN_VAR_DECL && self.cg_rlKnotenIdx(kb, kn, cur) >= 0) {
+            // #2228: JEDE Deklaration hat ihren eigenen Kandidaten. Bis
+            // 1.2.19J schied ein Name mit zweiter Deklaration ganz aus —
+            // `var i` in zwei Schleifen sperrte beide —, weil ueber den
+            // Namen gebunden wurde.
+            var kd: int64 := kb + self.cg_rlKnotenIdx(kb, kn, cur) * 40;
+            poke64(kd + 24, peek64(kd + 24) + 1);
+            poke64(kbBox + 32, peek64(kbBox + 32) + 1);
+            poke64(kd + 32, peek64(kbBox + 32) + 1);
+          } else if (k != CGN_VAR_DECL) {
+            // Jede andere Nennung desselben Namens (Laufvariable,
+            // Musterbindung, gleichnamiges Feld …): nicht waehlen. Diese
+            // Formen legen Locals auf anderen Wegen an; ob sie denselben Slot
+            // meinen, ist hier nicht sicher zu entscheiden.
+            var ka: int64 := 0;
+            while (ka < kn) {
+              var kq: int64 := peek64(kb + ka * 40);
+              if (self.cg_rlKNameL(kq) == self.cg_nslen(cur)
+                  && self.cg_seq(self.cg_rlKNameP(kq), self.cg_nslen(cur), self.cg_nsval(cur), self.cg_nslen(cur))) {
+                poke64(kb + ka * 40 + 16, 0);
+              }
+              ka += 1;
+            }
           }
         }
         // `@x` — die Adresse eines Locals im Register gibt es nicht.
@@ -8258,12 +8333,18 @@ pub type Codegen = class {
     if (self.closureEnvPtrOff != 0) { return; }
     var body: int64 := self.cg_nc2(fni);
     if (body < 0 || self.cg_nkind(body) != CGN_BLOCK) { return; }
-    var kbBox: int64 := alloc(24);
+    var kbBox: int64 := alloc(40);
     poke64(kbBox, alloc(64 * 40)); poke64(kbBox + 8, 0); poke64(kbBox + 16, 0);
+    poke64(kbBox + 32, 1);   // #2228: Stempelzaehler (Parameter haben 1)
     // Parameter zuerst: ein int64-Parameter ist Kandidat wie ein Local, seine
     // "Deklaration" ist der Spill im Prolog (cg_spillRdi..R9 bzw. die Kopie
     // eines Stapelparameters ueber cg_storeRax). Ein gleichnamiges Local im
     // Rumpf verdeckt ihn — dann scheiden beide aus (Konflikt im Durchgang 1).
+    if (self.rlSelfKnoten == fni) {
+      var sb: int64 := peek64(kbBox);
+      poke64(sb, fni); poke64(sb + 8, 0); poke64(sb + 16, 1); poke64(sb + 24, 1); poke64(sb + 32, 1);
+      poke64(kbBox + 8, 1);
+    }
     var pp: int64 := self.cg_nc0(fni);
     while (pp >= 0) {
       var pkn: int64 := peek64(kbBox + 8);
@@ -8272,6 +8353,7 @@ pub type Codegen = class {
         var pok: int64 := self.cg_rlTypOk(self.cg_nc0(pp));
         if (self.cg_rlKandIdx(peek64(kbBox), pkn, self.cg_nsval(pp), self.cg_nslen(pp)) >= 0) { pok := 0; }
         poke64(pb, pp); poke64(pb + 8, 0); poke64(pb + 16, pok); poke64(pb + 24, 1);
+        poke64(pb + 32, 1);   // #2228: Stempel — vor jeder Deklaration im Rumpf sichtbar
         poke64(kbBox + 8, pkn + 1);
       }
       pp := self.cg_nnext(pp);
@@ -8284,6 +8366,7 @@ pub type Codegen = class {
     // Bis zu vier mit dem hoechsten Gewicht; bei Gleichstand die frueher
     // deklarierte. Mindestens zwei Nutzungen, sonst lohnt es nicht.
     var tab: int64 := alloc(4 * 48);
+    var knt: int64 := alloc(4 * 8);
     var n: int64 := 0;
     while (n < 4) {
       var best: int64 := 0 - 1;
@@ -8299,15 +8382,17 @@ pub type Codegen = class {
       if (best < 0) { break; }
       var br: int64 := kb + best * 40;
       var bk: int64 := peek64(br);
-      poke64(tab + n * 48, self.cg_nsval(bk) as int64);
-      poke64(tab + n * 48 + 8, self.cg_nslen(bk));
+      poke64(tab + n * 48, self.cg_rlKNameP(bk) as int64);
+      poke64(tab + n * 48 + 8, self.cg_rlKNameL(bk));
       poke64(tab + n * 48 + 16, 0);
       poke64(tab + n * 48 + 24, 0);
       poke64(tab + n * 48 + 32, alloc(8 * 8));
       poke64(tab + n * 48 + 40, 8);
+      poke64(knt + n * 8, bk);
       poke64(br + 16, 0);
       n += 1;
     }
+    self.rlKnoten := knt;
     self.rlTab := tab;
     self.rlAnz := n;
   }
@@ -12342,6 +12427,7 @@ pub type Codegen = class {
     self.profCurName := mangBuf as pchar;
     self.profCurLen  := mangLen;
     // Emit prologue
+    self.rlSelfKnoten := ni;   // #2228: `self` ist Kandidat dieser Methode
     self.cg_rlWaehlen(ni);   // #2114
     var prologuePatch: int64 := self.cg_emitPrologue();
     // #1140: @flight_crit an einer METHODE. Ohne diese Stelle gaelte die
@@ -12385,6 +12471,7 @@ pub type Codegen = class {
 
     // Implicit self parameter at register 0 (rdi) — bei Struct-Rueckgabe rsi.
     var selfOff: int64 := self.cg_addLocal("self", 4);
+    self.cg_rlBinde(ni, selfOff);   // #2228
     self.cg_setLocalType(self.localCount - 1, className, classNameLen);
     if (self.fnRetStructBytes > 0) { self.cg_spillRsi(selfOff); }
     else { self.cg_spillRdi(selfOff); }
@@ -12396,7 +12483,7 @@ pub type Codegen = class {
       var pname: pchar := self.cg_nsval(param);
       var pnlen: int64 := self.cg_nslen(param);
       var poff: int64 := self.cg_addLocal(pname, pnlen);
-      self.cg_rlBinde(pname, pnlen, poff);   // #2114
+      self.cg_rlBinde(param, poff);   // #2114
       // Track param type if it's a user type (NK_TYPE_NAME = 60)
       var ptypeNode: int64 := self.cg_nc0(param);
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
@@ -12436,7 +12523,7 @@ pub type Codegen = class {
       var mspName: pchar := self.cg_nsval(param);
       var mspNlen: int64 := self.cg_nslen(param);
       var mspLocal: int64 := self.cg_addLocal(mspName, mspNlen);
-      self.cg_rlBinde(mspName, mspNlen, mspLocal);   // #2114
+      self.cg_rlBinde(param, mspLocal);   // #2114
       var mspType: int64 := self.cg_nc0(param);
       if (mspType >= 0 && self.cg_nkind(mspType) == 60) {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(mspType), self.cg_nslen(mspType));
@@ -19386,7 +19473,7 @@ pub type Codegen = class {
       var name: pchar := self.cg_nsval(ni);
       var nlen: int64 := self.cg_nslen(ni);
       var off: int64 := self.cg_addLocal(name, nlen);
-      if (k == CGN_VAR_DECL) { self.cg_rlBinde(name, nlen, off); }   // #2114
+      if (k == CGN_VAR_DECL) { self.cg_rlBinde(ni, off); }   // #2114
       var localIdx: int64 := self.localCount - 1;
       // Track type for OOP local lookup (child0 = type node, NK_TYPE_NAME = 60)
       var typeNode: int64 := self.cg_nc0(ni);
@@ -23898,6 +23985,7 @@ pub type Codegen = class {
     self.profCurName := fname;
     self.profCurLen  := fnlen;
 
+    self.rlSelfKnoten := 0 - 1;   // #2228: freie Funktion, kein `self`
     self.cg_rlWaehlen(ni);   // #2114: vor dem Prolog, der die Register sichert
 
     // Emit prologue, capture patch position for sub rsp imm32
@@ -23990,7 +24078,7 @@ pub type Codegen = class {
       var pname: pchar := self.cg_nsval(param);
       var pnlen: int64 := self.cg_nslen(param);
       var off: int64 := self.cg_addLocal(pname, pnlen);
-      self.cg_rlBinde(pname, pnlen, off);   // #2114
+      self.cg_rlBinde(param, off);   // #2114
       // Track param type if it's a user type (NK_TYPE_NAME = 60)
       var ptypeNode: int64 := self.cg_nc0(param);
       if (ptypeNode >= 0 && self.cg_nkind(ptypeNode) == 60) {
@@ -24033,7 +24121,7 @@ pub type Codegen = class {
       var spName: pchar := self.cg_nsval(param);
       var spNlen: int64 := self.cg_nslen(param);
       var spLocal: int64 := self.cg_addLocal(spName, spNlen);
-      self.cg_rlBinde(spName, spNlen, spLocal);   // #2114
+      self.cg_rlBinde(param, spLocal);   // #2114
       var spType: int64 := self.cg_nc0(param);
       if (spType >= 0 && self.cg_nkind(spType) == 60) {
         self.cg_setLocalType(self.localCount - 1, self.cg_nsval(spType), self.cg_nslen(spType));
