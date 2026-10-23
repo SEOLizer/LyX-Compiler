@@ -44,6 +44,23 @@ con CG_OFF_SVAL:   int64 := 64;
 con CG_OFF_SLEN:   int64 := 72;
 con CG_OFF_ISPUB:  int64 := 80;
 
+// #2208: Knotennummern ab hier meinen die Kopierablage (inlNodes), darunter
+// die Knotentabelle des Parsers. 2^40 liegt weit ueber jeder vorkommenden
+// Knotenzahl — die groesste gemessene Unit (lyxc.lyx selbst) hat rund 300000.
+con CG_INL_BASIS:  int64 := 1099511627776;
+// Eintrag der Einbettungstabelle: Name, Laenge, Deklarationsknoten und die
+// Herkunft (Knotentabelle + Quelltext). Die Herkunft MUSS mitgefuehrt werden:
+// cg_nsval liest Namen als Versatz in pSrc, und beides wird beim Uebersetzen
+// eines Imports getauscht (cg_processImport). Ein Eintrag aus einer anderen
+// Unit haette denselben Versatz in einem anderen Text gelesen.
+con CG_INL_SZ:       int64 := 40;
+con CG_INL_OFF_LEN:  int64 := 8;
+con CG_INL_OFF_NI:   int64 := 16;
+con CG_INL_OFF_NODES:int64 := 24;
+con CG_INL_OFF_SRC:  int64 := 32;
+// Eintrag der Einsetzungsliste (32 Byte): Name, Laenge, Knoten, Art.
+con CG_INL_OFF_ART:  int64 := 24;
+
 // Node kinds (mirror NK_xxx from bootstrap.parser)
 con CGN_IMPORT:      int64 := 1;
 con CG_WC_MAX_UNITS: int64 := 512;   // #1384
@@ -846,6 +863,21 @@ pub type Codegen = class {
   pNodes: int64;
   pToks:  int64;
 
+  // #2208: Einbettung kleiner Funktionen.
+  //   inlNodes/-Count/-Cap  Ablage der Knotenkopien (cg_klonKnoten)
+  //   inlTab/-N/-Cap        einbettbare Funktionen der laufenden Unit
+  //   inlArg*               Parametername -> Argumentknoten, nur waehrend
+  //                         eines Klonens belegt
+  inlNodes:     int64;
+  inlNodeCount: int64;
+  inlNodeCap:   int64;
+  inlTab:       int64;
+  inlTabN:      int64;
+  inlTabCap:    int64;
+  inlArgList:   int64;
+  inlArgCount:  int64;
+  inlArgCap:    int64;
+
   // Unique id for anonymous labels (if/while)
   nextLblId: int64;
 
@@ -1570,7 +1602,23 @@ pub type Codegen = class {
   // Node accessors (prefixed cg_ to avoid VMT collision with Parser)
   // ------------------------------------------------------------------
 
-  fn cg_noff(i: int64): int64   { return self.pNodes + i * 88; }
+  // #2208: Knoten kommen aus ZWEI Ablagen. Unter CG_INL_BASIS liegen die des
+  // Parsers, darueber die KOPIEN, die die Einbettung anlegt (cg_klonKnoten).
+  //
+  // Eine zweite Ablage ist noetig, weil der Codegen die Kapazitaet des
+  // Parser-Puffers nicht kennt — nur den Zeiger und die Zahl der belegten
+  // Knoten. Anhaengen wuerde in fremden Speicher schreiben.
+  //
+  // Dass eine einzige Stelle genuegt, ist der Grund fuer diesen Weg: ALLE
+  // Zugriffe (cg_nkind, cg_nc0..c3, cg_nnext, cg_nival, cg_nsval, cg_nslen)
+  // gehen hier durch. Der vorige Versuch hatte stattdessen im Emitter
+  // ersetzt und scheiterte daran, dass Bezeichner an mindestens acht Stellen
+  // aufgeloest werden — die Schnellwege aus #2114 gehen nicht ueber
+  // cg_genExpr. Eine Kopie des Baums braucht nirgends einen Sonderfall.
+  fn cg_noff(i: int64): int64 {
+    if (i >= CG_INL_BASIS) { return self.inlNodes + (i - CG_INL_BASIS) * 88; }
+    return self.pNodes + i * 88;
+  }
   fn cg_nkind(i: int64): int64  { return peek64(self.cg_noff(i) + CG_OFF_KIND); }
   fn cg_nc0(i: int64): int64    { return peek64(self.cg_noff(i) + CG_OFF_C0); }
   fn cg_nc1(i: int64): int64    { return peek64(self.cg_noff(i) + CG_OFF_C1); }
@@ -14519,6 +14567,324 @@ pub type Codegen = class {
                               fname, fnlen, lenCell);
   }
 
+  // ------------------------------------------------------------------
+  // #2208: Einbettung kleiner Funktionen
+  // ------------------------------------------------------------------
+  //
+  // Gearbeitet wird mit einer KOPIE des Rumpfes, in der die Parameter schon
+  // durch die Argumentknoten ersetzt sind. Danach ist es gewoehnlicher Code:
+  // keine Stelle im Emitter braucht einen Sonderfall.
+  //
+  // Der erste Anlauf ersetzte stattdessen IM EMITTER und scheiterte: ein
+  // Bezeichner wird an mindestens acht Stellen aufgeloest, die Schnellwege
+  // der Registerzuteilung (#2114) gehen gar nicht ueber cg_genExpr. Ein
+  // zweiter Anlauf legte die Argumente in frische Rahmenplaetze und gewann
+  // nichts (49 ms gegen 51 ms), weil diese Plaetze nach der Zuteilung
+  // entstehen. Nur die Kopie kommt an die 29 ms von Hand heran.
+
+  // Ein Knoten in der Kopierablage; liefert seine Nummer (>= CG_INL_BASIS).
+  fn cg_neuerKnoten(): int64 {
+    if (self.inlNodeCount >= self.inlNodeCap) {
+      var nc: int64 := self.inlNodeCap * 2;
+      var nb: int64 := alloc(nc * 88);
+      memcpy(nb, self.inlNodes, self.inlNodeCount * 88);
+      self.inlNodes   := nb;
+      self.inlNodeCap := nc;
+    }
+    var idx: int64 := self.inlNodeCount;
+    self.inlNodeCount += 1;
+    return idx + CG_INL_BASIS;
+  }
+
+  // Name -> einzusetzender Knoten. Liefert den EINTRAG (32 Byte) oder 0.
+  //
+  // Zwei Arten von Eintraegen, unterschieden durch CG_INL_OFF_ART:
+  //   0 — Argument des Aufrufers. Es steht in SEINEM Baum; beim Kopieren
+  //       darf darin nicht weiter ersetzt werden (`g(x)` mit einem Parameter
+  //       namens `x` rekursierte sonst endlos).
+  //   1 — Zwischenwert aus dem Rumpf (`var l := (x << n) & M32`). Er steht im
+  //       Baum der eingebetteten Funktion und MUSS weiter ersetzt werden, denn
+  //       er nennt ihre Parameter.
+  fn cg_inlEintrag(name: pchar, nlen: int64): int64 {
+    var i: int64 := self.inlArgCount - 1;
+    while (i >= 0) {
+      var base: int64 := self.inlArgList + i * 32;
+      if (peek64(base + CG_INL_OFF_LEN) == nlen
+          && self.cg_seq(peek64(base) as pchar, nlen, name, nlen)) {
+        return base;
+      }
+      i -= 1;
+    }
+    return 0;
+  }
+
+  // Einen Eintrag anlegen.
+  fn cg_inlPush(name: pchar, nlen: int64, ni: int64, art: int64) {
+    if (self.inlArgCount >= self.inlArgCap) {
+      var nc: int64 := self.inlArgCap * 2;
+      var nb: int64 := alloc(nc * 32);
+      memcpy(nb, self.inlArgList, self.inlArgCount * 32);
+      self.inlArgList := nb; self.inlArgCap := nc;
+    }
+    var base: int64 := self.inlArgList + self.inlArgCount * 32;
+    poke64(base,                  name as int64);
+    poke64(base + CG_INL_OFF_LEN, nlen);
+    poke64(base + CG_INL_OFF_NI,  ni);
+    poke64(base + CG_INL_OFF_ART, art);
+    self.inlArgCount += 1;
+  }
+
+  // Wie oft nennt der Teilbaum (samt Geschwistern) diesen Namen?
+  fn cg_inlZaehl(ni: int64, name: pchar, nlen: int64): int64 {
+    if (ni < 0) { return 0; }
+    var n: int64 := 0;
+    if (self.cg_nkind(ni) == CGN_IDENT
+        && self.cg_seq(self.cg_nsval(ni), self.cg_nslen(ni), name, nlen)) { n := 1; }
+    n += self.cg_inlZaehl(self.cg_nc0(ni), name, nlen);
+    n += self.cg_inlZaehl(self.cg_nc1(ni), name, nlen);
+    n += self.cg_inlZaehl(self.cg_nc2(ni), name, nlen);
+    n += self.cg_inlZaehl(self.cg_nc3(ni), name, nlen);
+    n += self.cg_inlZaehl(self.cg_nnext(ni), name, nlen);
+    return n;
+  }
+
+  // Teilbaum kopieren. `mitNext` 0 schneidet die Geschwisterkette ab — ein
+  // Argumentknoten haengt in der Argumentliste des Aufrufers, und die darf
+  // nicht in den Rumpf wandern. `inArg` 1 heisst: wir kopieren gerade einen
+  // Argumentausdruck des Aufrufers, dort wird NICHT mehr ersetzt (sonst
+  // rekursiert `g(x)` mit einem Parameter namens `x` endlos).
+  fn cg_klonKnoten(ni: int64, tiefe: int64, mitNext: int64, inArg: int64): int64 {
+    if (ni < 0) { return 0 - 1; }
+    if (tiefe > 64) {
+      EPrintStrLn("error: codegen: Einbettung zu tief verschachtelt (#2208)"c);
+      exit(1);
+    }
+    if (inArg == 0 && self.cg_nkind(ni) == CGN_IDENT) {
+      var e: int64 := self.cg_inlEintrag(self.cg_nsval(ni), self.cg_nslen(ni));
+      // Der eingesetzte Knoten wird KOPIERT, nicht eingehaengt: ein
+      // Argumentknoten traegt sein `next` aus der Liste des Aufrufers.
+      if (e != 0) {
+        return self.cg_klonKnoten(peek64(e + CG_INL_OFF_NI), tiefe + 1, 0,
+                                  1 - peek64(e + CG_INL_OFF_ART));
+      }
+    }
+    var neu:  int64 := self.cg_neuerKnoten();
+    var qoff: int64 := self.cg_noff(ni);
+    var zoff: int64 := self.cg_noff(neu);
+    var i: int64 := 0;
+    while (i < 88) { poke8(zoff + i, peek8(qoff + i)); i += 1; }
+    var k0: int64 := self.cg_klonKnoten(self.cg_nc0(ni), tiefe + 1, 1, inArg);
+    var k1: int64 := self.cg_klonKnoten(self.cg_nc1(ni), tiefe + 1, 1, inArg);
+    var k2: int64 := self.cg_klonKnoten(self.cg_nc2(ni), tiefe + 1, 1, inArg);
+    var k3: int64 := self.cg_klonKnoten(self.cg_nc3(ni), tiefe + 1, 1, inArg);
+    var kn: int64 := 0 - 1;
+    if (mitNext != 0) {
+      kn := self.cg_klonKnoten(self.cg_nnext(ni), tiefe + 1, 1, inArg);
+    }
+    // Versatz NEU bestimmen: ein Wachsen der Ablage in der Rekursion hat den
+    // Puffer verschoben.
+    zoff := self.cg_noff(neu);
+    poke64(zoff + CG_OFF_C0,   k0);
+    poke64(zoff + CG_OFF_C1,   k1);
+    poke64(zoff + CG_OFF_C2,   k2);
+    poke64(zoff + CG_OFF_C3,   k3);
+    poke64(zoff + CG_OFF_NEXT, kn);
+    return neu;
+  }
+
+  // Taugt dieser Ausdruck als Argument einer Einbettung? Er wird so oft
+  // eingesetzt, wie der Parameter im Rumpf vorkommt — also nur Ausdruecke
+  // ohne Wirkung und ohne nennenswerte Kosten.
+  fn cg_inlArgTaugt(a: int64): int64 {
+    if (a < 0) { return 0; }
+    var k: int64 := self.cg_nkind(a);
+    if (k == CGN_LIT_INT || k == CGN_LIT_FLOAT || k == CGN_IDENT) { return 1; }
+    if (k == CGN_UNOP) {
+      var ik: int64 := self.cg_nkind(self.cg_nc0(a));
+      if (ik == CGN_LIT_INT || ik == CGN_LIT_FLOAT || ik == CGN_IDENT) { return 1; }
+    }
+    return 0;
+  }
+
+  // Enthaelt der Teilbaum einen Aufruf? Dann nicht einbetten: ein Aufruf im
+  // Rumpf kann die Funktion selbst meinen (Rekursion), und ein mehrfach
+  // eingesetzter Parameter wuerde ihn mehrfach ausfuehren.
+  fn cg_inlRein(ni: int64, tiefe: int64): int64 {
+    if (ni < 0) { return 1; }
+    if (tiefe > 32) { return 0; }
+    var k: int64 := self.cg_nkind(ni);
+    if (k == CGN_CALL || k == CGN_CALL_PTR) { return 0; }
+    if (self.cg_inlRein(self.cg_nc0(ni), tiefe + 1) == 0) { return 0; }
+    if (self.cg_inlRein(self.cg_nc1(ni), tiefe + 1) == 0) { return 0; }
+    if (self.cg_inlRein(self.cg_nc2(ni), tiefe + 1) == 0) { return 0; }
+    if (self.cg_inlRein(self.cg_nc3(ni), tiefe + 1) == 0) { return 0; }
+    if (self.cg_inlRein(self.cg_nnext(ni), tiefe + 1) == 0) { return 0; }
+    return 1;
+  }
+
+  // Vorpass je Unit: einbettbare Funktionen der obersten Ebene eintragen.
+  //
+  // Die Bedingungen sind bewusst eng. Der Rumpf ist GENAU ein `return
+  // <ausdruck>`, der Ausdruck enthaelt keinen Aufruf, alle Parameter- und
+  // Rueckgabetypen sind eingebaute Grundtypen, und es gibt keine
+  // Typparameter. Damit entfaellt alles, was eine Einbettung schwierig
+  // macht: Rekursion, Verdeckung durch lokale Deklarationen, Kopien von
+  // Strukturwerten, mehrfache Rueckgabe.
+  fn cg_sammleEinbettbare(head: int64) {
+    var cur: int64 := head;
+    while (cur != -1) {
+      if (self.cg_nkind(cur) == CGN_FUNC_DECL && self.cg_einbettbar(cur) != 0) {
+        if (self.inlTabN >= self.inlTabCap) {
+          var nc: int64 := self.inlTabCap * 2;
+          var nb: int64 := alloc(nc * CG_INL_SZ);
+          memcpy(nb, self.inlTab, self.inlTabN * CG_INL_SZ);
+          self.inlTab := nb; self.inlTabCap := nc;
+        }
+        var r: int64 := self.inlTab + self.inlTabN * CG_INL_SZ;
+        poke64(r,                     self.cg_nsval(cur) as int64);
+        poke64(r + CG_INL_OFF_LEN,    self.cg_nslen(cur));
+        poke64(r + CG_INL_OFF_NI,     cur);
+        poke64(r + CG_INL_OFF_NODES,  self.pNodes);
+        poke64(r + CG_INL_OFF_SRC,    self.pSrc as int64);
+        self.inlTabN += 1;
+      }
+      cur := self.cg_nnext(cur);
+    }
+  }
+
+  fn cg_einbettbar(fni: int64): int64 {
+    if (self.cg_nestHatRumpf(fni) == 0) { return 0; }
+    if (self.cg_nc3(fni) >= 0) { return 0; }          // generisch oder extern
+    // Keine Funktion mit Annotation. iVal traegt sie alle (ANNO_FLIGHTCRIT,
+    // ANNO_INTEGRITY, ANNO_WCET, ANNO_ENERGY, ANNO_EXPORT_FN, ANNO_JNI).
+    //
+    // Belegt an @flight_crit: dessen FPU-Pruefung haengt am Rahmen des
+    // AUFGERUFENEN — Prolog schaltet die SSE-Ausnahmen frei, Epilog nimmt
+    // sie zurueck. Eingebettet gibt es diesen Rahmen nicht mehr, und
+    // `D(1.0, 0.0)` lieferte still `inf` statt abzubrechen
+    // (tests/flight_crit_heap_test.sh). Dieselbe Ueberlegung trifft jede
+    // weitere Annotation, die am Rahmen haengt — deshalb pauschal.
+    if (self.cg_nival(fni) != 0) { return 0; }
+    // Rueckgabe- und Parametertypen: NUR int64.
+    //
+    // Enger als noetig wirkt das erst, bis man sieht, was am Rahmen des
+    // Aufgerufenen haengt. Der return-Zweig rechnet um: `fn hoehe(): f64 {
+    // return 2500; }` wandelt die Ganzzahl dort in IEEE (#2007). Eingebettet
+    // gibt es diesen Zweig nicht mehr, und FloatToStr las 2500 als
+    // Bitmuster — eine denormale Zahl, ausgegeben als 0.0000
+    // (tests/utype_test.sh). Dieselbe Frage stellt sich bei jeder
+    // schmaleren Ganzzahl und bei jedem Einheitentyp.
+    //
+    // Mit int64 auf beiden Seiten ist nichts umzurechnen. Die uebrigen Typen
+    // sind nicht verloren, sie brauchen die Umrechnung an der Kopie — das
+    // ist ein eigenes Paket (Issue), kein Nebensatz hier.
+    var ret: int64 := self.cg_nc1(fni);
+    if (ret < 0) { return 0; }
+    if (self.cg_builtinTypeId(self.cg_nsval(ret), self.cg_nslen(ret)) != 2) { return 0; }
+    // Parameter: hoechstens acht, alle mit eingebautem Grundtyp.
+    var pz: int64 := 0;
+    var pp: int64 := self.cg_nc0(fni);
+    while (pp >= 0) {
+      if (self.cg_nkind(pp) != CGN_PARAM) { return 0; }
+      var pt: int64 := self.cg_nc0(pp);
+      if (pt < 0) { return 0; }
+      if (self.cg_builtinTypeId(self.cg_nsval(pt), self.cg_nslen(pt)) != 2) { return 0; }
+      pz += 1;
+      pp := self.cg_nnext(pp);
+    }
+    if (pz > 8) { return 0; }
+    // Rumpf: beliebig viele `var`-Zwischenwerte, dann genau ein `return`.
+    //
+    // Die Zwischenwerte werden EINGESETZT, nicht als Rahmenplatz angelegt —
+    // sonst entstuenden Plaetze, die die Registerzuteilung (#2114) nie
+    // gesehen hat, und genau daran ist der zweite Anlauf gescheitert.
+    // Einsetzen darf man einen Wert nur, wenn er GENAU EINMAL gelesen wird;
+    // sonst wuerde seine Rechnung mehrfach ausgefuehrt.
+    var st: int64 := self.cg_nc0(self.cg_nc2(fni));
+    if (st < 0) { return 0; }
+    while (st >= 0 && self.cg_nkind(st) == CGN_VAR_DECL) {
+      var ini: int64 := self.cg_nc1(st);
+      if (ini < 0) { return 0; }
+      if (self.cg_inlRein(ini, 0) == 0) { return 0; }
+      var vn: pchar := self.cg_nsval(st);
+      var vl: int64 := self.cg_nslen(st);
+      // Ein Name, der schon Parameter ist, wuerde ihn verdecken.
+      var pq: int64 := self.cg_nc0(fni);
+      while (pq >= 0) {
+        if (self.cg_seq(self.cg_nsval(pq), self.cg_nslen(pq), vn, vl)) { return 0; }
+        pq := self.cg_nnext(pq);
+      }
+      var rest: int64 := self.cg_nnext(st);
+      if (self.cg_inlZaehl(rest, vn, vl) != 1) { return 0; }
+      st := rest;
+    }
+    if (st < 0) { return 0; }
+    if (self.cg_nnext(st) >= 0) { return 0; }
+    if (self.cg_nkind(st) != CGN_RETURN) { return 0; }
+    var ex: int64 := self.cg_nc0(st);
+    if (ex < 0) { return 0; }
+    return self.cg_inlRein(ex, 0);
+  }
+
+  // Einbettbare Funktion dieses Namens aus DIESER Unit; sonst -1.
+  fn cg_findEinbettbar(name: pchar, nlen: int64): int64 {
+    var i: int64 := 0;
+    while (i < self.inlTabN) {
+      var r: int64 := self.inlTab + i * CG_INL_SZ;
+      if (peek64(r + CG_INL_OFF_NODES) == self.pNodes
+          && peek64(r + CG_INL_OFF_SRC) == self.pSrc as int64
+          && peek64(r + CG_INL_OFF_LEN) == nlen
+          && self.cg_seq(peek64(r) as pchar, nlen, name, nlen)) {
+        return peek64(r + CG_INL_OFF_NI);
+      }
+      i += 1;
+    }
+    return 0 - 1;
+  }
+
+  // Den Aufruf `callNi` durch den Rumpf von `fni` ersetzen. Liefert 1, wenn
+  // eingebettet wurde; das Ergebnis steht dann wie nach einem Aufruf in rax.
+  fn cg_betteEin(fni: int64, callNi: int64): int64 {
+    // Parameter und Argumente paarweise. Die Argumentliste eines FREIEN
+    // Aufrufs steht in c0 (bei einer Methode in c1) — mit c1 waere die Liste
+    // hier immer leer und die Einbettung faende nie statt.
+    var pz: int64 := 0;
+    var pp: int64 := self.cg_nc0(fni);
+    while (pp >= 0) { pz += 1; pp := self.cg_nnext(pp); }
+    var az: int64 := 0;
+    var aa: int64 := self.cg_nc0(callNi);
+    while (aa >= 0) {
+      if (self.cg_inlArgTaugt(aa) == 0) { return 0; }
+      az += 1;
+      aa := self.cg_nnext(aa);
+    }
+    if (pz != az) { return 0; }
+
+    var gemerkt: int64 := self.inlArgCount;
+    pp := self.cg_nc0(fni);
+    aa := self.cg_nc0(callNi);
+    while (pp >= 0 && aa >= 0) {
+      self.cg_inlPush(self.cg_nsval(pp), self.cg_nslen(pp), aa, 0);
+      pp := self.cg_nnext(pp);
+      aa := self.cg_nnext(aa);
+    }
+
+    // Zwischenwerte in Reihenfolge nachtragen — ein spaeterer darf einen
+    // frueheren nennen, deshalb erst eintragen, dann den naechsten lesen.
+    var st: int64 := self.cg_nc0(self.cg_nc2(fni));
+    while (st >= 0 && self.cg_nkind(st) == CGN_VAR_DECL) {
+      self.cg_inlPush(self.cg_nsval(st), self.cg_nslen(st), self.cg_nc1(st), 1);
+      st := self.cg_nnext(st);
+    }
+
+    var ex: int64 := self.cg_nc0(st);
+    var kopie: int64 := self.cg_klonKnoten(ex, 0, 0, 0);
+    self.inlArgCount := gemerkt;
+
+    self.cg_genExpr(kopie);
+    return 1;
+  }
+
   fn cg_genCall(ni: int64) {
     var fname: pchar := self.cg_nsval(ni);
     var fnlen: int64 := self.cg_nslen(ni);
@@ -14536,6 +14902,28 @@ pub type Codegen = class {
         fname := self.cg_nestLbl(cnI);
         fnlen := self.cg_nestLblLen(cnI);
         nestDecl := self.cg_nestDecl(cnI);
+      }
+    }
+
+    // #2208: Ein freier Aufruf einer kleinen Funktion aus derselben Unit
+    // wird durch ihren Rumpf ersetzt. Vor jeder Umdeutung des Namens, denn
+    // nur hier ist sicher, dass `fname` die Funktion der Unit meint und die
+    // Argumente in c0 stehen.
+    //
+    // Ein LOCAL dieses Namens verdeckt die Funktion: `var zehn: fn(int64):
+    // int64 := fuenf;` macht `zehn(1)` zum Aufruf ueber den Zeiger. Ohne
+    // diese Frage bettete die gleichnamige Modulfunktion ein und `zehn(1)`
+    // lieferte 11 statt 6 (tests/verschachtelte_namen_test.sh).
+    // Mit Debug-Info gar nicht erst: eine eingebettete Funktion hat keinen
+    // eigenen Rahmen, und der Backtrace nennt sie nicht mehr
+    // (tests/debug_tools_reste_test.sh erwartet `quadrat`, `summe`, `main`).
+    // Dieselbe Abwaegung trifft schon die Registerzuteilung (#2114).
+    if (isMethod == 0 && nestDecl < 0
+        && self.debugMode == 0 && self.debugInfoEnabled == 0
+        && self.cg_findLocalIdx(fname, fnlen) < 0) {
+      var inlFn: int64 := self.cg_findEinbettbar(fname, fnlen);
+      if (inlFn >= 0) {
+        if (self.cg_betteEin(inlFn, ni) != 0) { return; }
       }
     }
 
@@ -25700,6 +26088,7 @@ pub type Codegen = class {
     self.cg_collectWertAliase(head);      // #2161: `type Meter = f64`
     // Pre-pass: collect all user-defined functions returning f64 for cg_isF64Expr.
     self.cg_collectF64Funcs(head);
+    self.cg_sammleEinbettbare(head);      // #2208
     // #2044: Marken der inneren Funktionen — nach den Signatur-Registern
     // (cg_nestPlan traegt die inneren dort unter ihrer Marke nach) und vor
     // jedem Rumpf.
@@ -26253,6 +26642,17 @@ pub type Codegen = class {
     self.externDataCap   := 32;
     self.externData      := alloc(self.externDataCap * 16);
     self.externDataCount := 0;
+
+    // #2208
+    self.inlNodeCap   := 256;
+    self.inlNodes     := alloc(self.inlNodeCap * 88);
+    self.inlNodeCount := 0;
+    self.inlTabCap    := 32;
+    self.inlTab       := alloc(self.inlTabCap * CG_INL_SZ);
+    self.inlTabN      := 0;
+    self.inlArgCap    := 16;
+    self.inlArgList   := alloc(self.inlArgCap * 32);
+    self.inlArgCount  := 0;
 
     self.nextLblId := 0;
 
