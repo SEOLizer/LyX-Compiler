@@ -141,13 +141,78 @@ fn f(x: int64): int64 { return x + 1; }
 fn g(x: int64): int64 { return f(x) * 10; }
 fn main(): int64 { var x: int64 := 3; PrintLn(IntToStr(g(x))); return 0; }' "40"
 
-# Gleitkomma wird NICHT eingebettet: der return-Zweig des Aufgerufenen
-# rechnet um (#2007 — `fn hoehe(): f64 { return 2500; }`), und ohne ihn las
-# FloatToStr die Ganzzahl als Bitmuster. Der Wert muss trotzdem stimmen.
-abgelehnt "#2208: f64-Funktion nicht eingebettet" 'import std.io;
+# --- #2209: andere Typen als int64 ------------------------------------------
+#
+# Bis 1.2.19D war die Einbettung auf int64 beschraenkt, weil am `return` eine
+# Umrechnung haengt: `cg_retToF64` wandelt eine Ganzzahl in einer
+# Gleitkomma-Funktion (#2004). Sie wird jetzt an der Kopie nachgeholt, also
+# darf Gleitkomma eingebettet werden.
+MITTEL='import std.io;
 fn mittel(a: f64, b: f64): f64 { var s: f64 := a + b; return s / 2.0; }
 fn main(): int64 { var p: f64 := 3.0; var q: f64 := 4.0;
-  PrintLn(FloatToStr(mittel(p, q), 2)); return 0; }' "3.50" "mittel"
+  PrintLn(FloatToStr(mittel(p, q), 2)); return 0; }'
+laeuft "#2209: f64-Funktion, Wert stimmt" "$MITTEL" "3.50"
+eingebettet "#2209: f64-Funktion" "$MITTEL" "mittel" 1
+
+# Der Fall, der #2208 beim Bauen auf int64 beschraenkt hat: eine
+# Gleitkomma-Funktion gibt ein GANZZAHLLITERAL zurueck. Ohne die nachgeholte
+# Umrechnung las FloatToStr die 2500 als Bitmuster — eine Denormalzahl, also
+# 0.0000. Der WERT ist hier die Aussage, nicht die Zahl der Aufrufe.
+HOEHE='import std.io;
+fn hoehe(): f64 { return 2500; }
+fn main(): int64 { PrintLn(FloatToStr(hoehe(), 4)); return 0; }'
+laeuft "#2209: f64-Rueckgabe mit Ganzzahlliteral" "$HOEHE" "2500.0000"
+eingebettet "#2209: f64-Rueckgabe mit Ganzzahlliteral" "$HOEHE" "hoehe" 1
+
+# Schmalere Ganzzahlen. Hier lag mein Fehlschluss: ich hatte nur den
+# return-Zweig gelesen und geschlossen, am Rahmen haenge allein die
+# Gleitkomma-Wandlung. Tatsaechlich KUERZT der Eintritt die Parameter und der
+# Epilog die Rueckgabe — tests/int_width_test.sh hat beides laut gemeldet
+# ('200' erwartet '-56', '300' erwartet '44'). Beide Kuerzungen holt die
+# Einbettung jetzt nach, deshalb stehen beide Faelle auch hier.
+HALB='import std.io;
+fn halb(x: int32): int32 { return x / 2; }
+fn main(): int64 { var n: int32 := 9; PrintLn(halb(n) as int64); return 0; }'
+laeuft "#2209: int32 durchgaengig" "$HALB" "4"
+eingebettet "#2209: int32" "$HALB" "halb" 1
+
+# Der Parameter kuerzt am Eintritt: 200 passt nicht in int8.
+KURZP='import std.io;
+fn f(x: int8): int64 { return x + 0; }
+fn main(): int64 { PrintLn(f(200)); return 0; }'
+laeuft "#2209: schmaler Parameter kuerzt auch eingebettet" "$KURZP" "-56"
+eingebettet "#2209: schmaler Parameter" "$KURZP" "f" 1
+
+# Und die Rueckgabe kuerzt im Epilog: 300 passt nicht in uint8.
+KURZR='import std.io;
+fn f(): uint8 { return 300; }
+fn main(): int64 { PrintLn(f()); return 0; }'
+laeuft "#2209: schmale Rueckgabe kuerzt auch eingebettet" "$KURZR" "44"
+eingebettet "#2209: schmale Rueckgabe" "$KURZR" "f" 1
+
+# Vorzeichenlos gegen vorzeichenbehaftet bei derselben Breite — die Kuerzung
+# muss die richtige Richtung nehmen (movzx gegen movsx). Ein Test nur mit
+# int8 waere fuer eine vertauschte Richtung blind.
+KURZU='import std.io;
+fn s8(x: int8): int64 { return x + 0; }
+fn u8f(x: uint8): int64 { return x + 0; }
+fn main(): int64 { PrintLn(s8(200)); PrintLn(u8f(200)); return 0; }'
+laeuft "#2209: int8 und uint8 kuerzen verschieden" "$KURZU" "-56 200"
+
+# BEWUSSTE GRENZE, kein Defekt dieser Aenderung: ein ganzzahliges Literal an
+# einem f64-Parameter wird vom echten Aufruf nicht gewandelt (#2219,
+# vorbestehend — `eins(5)` liefert 0.00). Eingebettet kaeme der richtige Wert
+# heraus; derselbe Quelltext darf aber nicht davon abhaengen, ob eingebettet
+# wurde. Deshalb wird dieser Fall abgelehnt.
+#
+# Der erwartete WERT wird hier absichtlich NICHT festgeschrieben: er ist
+# heute falsch, und ein Test, der den falschen Wert festhaelt, wird beim Fix
+# von #2219 rot und sieht nach einem Regress aus. Geprueft wird nur, dass
+# nicht eingebettet wird — faellt #2219, wird diese Zeile rot und erinnert
+# daran, die Schranke in cg_betteEin zu entfernen.
+eingebettet "#2209: Ganzzahlliteral an f64-Parameter (Grenze, siehe #2219)" 'import std.io;
+fn eins(a: f64): f64 { return a; }
+fn main(): int64 { PrintLn(FloatToStr(eins(5), 2)); return 0; }' "eins" 0
 
 laeuft "#2208: eingebettet in einen groesseren Ausdruck" 'import std.io;
 fn dopp(x: int64): int64 { return x * 2; }

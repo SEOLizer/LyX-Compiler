@@ -60,6 +60,9 @@ con CG_INL_OFF_NODES:int64 := 24;
 con CG_INL_OFF_SRC:  int64 := 32;
 // Eintrag der Einsetzungsliste (32 Byte): Name, Laenge, Knoten, Art.
 con CG_INL_OFF_ART:  int64 := 24;
+// #2209: Typknoten des Parameters, fuer die Kuerzung schmaler Ganzzahlen.
+con CG_INL_OFF_PTYP: int64 := 32;
+con CG_INL_EINTRAG:  int64 := 40;
 
 // Node kinds (mirror NK_xxx from bootstrap.parser)
 con CGN_IMPORT:      int64 := 1;
@@ -14793,7 +14796,7 @@ pub type Codegen = class {
   fn cg_inlEintrag(name: pchar, nlen: int64): int64 {
     var i: int64 := self.inlArgCount - 1;
     while (i >= 0) {
-      var base: int64 := self.inlArgList + i * 32;
+      var base: int64 := self.inlArgList + i * CG_INL_EINTRAG;
       if (peek64(base + CG_INL_OFF_LEN) == nlen
           && self.cg_seq(peek64(base) as pchar, nlen, name, nlen)) {
         return base;
@@ -14804,18 +14807,19 @@ pub type Codegen = class {
   }
 
   // Einen Eintrag anlegen.
-  fn cg_inlPush(name: pchar, nlen: int64, ni: int64, art: int64) {
+  fn cg_inlPush(name: pchar, nlen: int64, ni: int64, art: int64, ptyp: int64) {
     if (self.inlArgCount >= self.inlArgCap) {
       var nc: int64 := self.inlArgCap * 2;
-      var nb: int64 := alloc(nc * 32);
-      memcpy(nb, self.inlArgList, self.inlArgCount * 32);
+      var nb: int64 := alloc(nc * CG_INL_EINTRAG);
+      memcpy(nb, self.inlArgList, self.inlArgCount * CG_INL_EINTRAG);
       self.inlArgList := nb; self.inlArgCap := nc;
     }
-    var base: int64 := self.inlArgList + self.inlArgCount * 32;
-    poke64(base,                  name as int64);
-    poke64(base + CG_INL_OFF_LEN, nlen);
-    poke64(base + CG_INL_OFF_NI,  ni);
-    poke64(base + CG_INL_OFF_ART, art);
+    var base: int64 := self.inlArgList + self.inlArgCount * CG_INL_EINTRAG;
+    poke64(base,                   name as int64);
+    poke64(base + CG_INL_OFF_LEN,  nlen);
+    poke64(base + CG_INL_OFF_NI,   ni);
+    poke64(base + CG_INL_OFF_ART,  art);
+    poke64(base + CG_INL_OFF_PTYP, ptyp);
     self.inlArgCount += 1;
   }
 
@@ -14849,8 +14853,35 @@ pub type Codegen = class {
       // Der eingesetzte Knoten wird KOPIERT, nicht eingehaengt: ein
       // Argumentknoten traegt sein `next` aus der Liste des Aufrufers.
       if (e != 0) {
-        return self.cg_klonKnoten(peek64(e + CG_INL_OFF_NI), tiefe + 1, 0,
-                                  1 - peek64(e + CG_INL_OFF_ART));
+        var ers: int64 := self.cg_klonKnoten(peek64(e + CG_INL_OFF_NI), tiefe + 1, 0,
+                                             1 - peek64(e + CG_INL_OFF_ART));
+        // #2209: Ist der Parameter eine schmale Ganzzahl, KUERZT der Eintritt
+        // in die Funktion den Wert — `fn f(x: int8)` mit `f(200)` sieht -56.
+        // Diese Stelle fehlte zuerst, und der Test meldete es laut
+        // (tests/int_width_test.sh: '200' erwartet '-56'). Meine Annahme, am
+        // Rahmen haenge nur die Gleitkomma-Wandlung, war falsch: sie kam
+        // daher, dass ich nur den return-Zweig gelesen hatte und nicht
+        // Prolog und Epilog.
+        //
+        // Nachgeholt wird sie mit der vorhandenen Umsetzung: ein CGN_CAST auf
+        // den Parametertyp. Dessen Emitter ruft cg_emitNarrowRax ueber
+        // cg_narrowKindOf — dieselbe Stelle, die `x as int8` benutzt (#1151).
+        // Eine eigene Kuerzung hier waere die zweite Rechnung, die irgendwann
+        // von der ersten abweicht.
+        var ptyp: int64 := peek64(e + CG_INL_OFF_PTYP);
+        if (ptyp >= 0 && ers >= 0
+            && self.cg_narrowKindOf(self.cg_nsval(ptyp), self.cg_nslen(ptyp)) != 0) {
+          var cst: int64 := self.cg_neuerKnoten();
+          var coff: int64 := self.cg_noff(cst);
+          poke64(coff + CG_OFF_KIND, CGN_CAST);
+          poke64(coff + CG_OFF_C0,   ers);
+          poke64(coff + CG_OFF_C1,   ptyp);
+          poke64(coff + CG_OFF_C2,   0 - 1);
+          poke64(coff + CG_OFF_C3,   0 - 1);
+          poke64(coff + CG_OFF_NEXT, 0 - 1);
+          return cst;
+        }
+        return ers;
       }
     }
     var neu:  int64 := self.cg_neuerKnoten();
@@ -14950,22 +14981,29 @@ pub type Codegen = class {
     // (tests/flight_crit_heap_test.sh). Dieselbe Ueberlegung trifft jede
     // weitere Annotation, die am Rahmen haengt — deshalb pauschal.
     if (self.cg_nival(fni) != 0) { return 0; }
-    // Rueckgabe- und Parametertypen: NUR int64.
+    // Rueckgabe- und Parametertypen (#2209).
     //
-    // Enger als noetig wirkt das erst, bis man sieht, was am Rahmen des
-    // Aufgerufenen haengt. Der return-Zweig rechnet um: `fn hoehe(): f64 {
-    // return 2500; }` wandelt die Ganzzahl dort in IEEE (#2007). Eingebettet
-    // gibt es diesen Zweig nicht mehr, und FloatToStr las 2500 als
-    // Bitmuster — eine denormale Zahl, ausgegeben als 0.0000
-    // (tests/utype_test.sh). Dieselbe Frage stellt sich bei jeder
-    // schmaleren Ganzzahl und bei jedem Einheitentyp.
+    // Erlaubt sind alle eingebauten Grundtypen. Die Frage ist nicht, welcher
+    // Typ "passt", sondern welche UMRECHNUNG am Rahmen des Aufgerufenen
+    // haengt und ohne ihn entfaellt. Gefunden ist genau eine: `cg_retToF64`
+    // wandelt eine Ganzzahl in einer Gleitkomma-Funktion (#2004 — `fn
+    // hoehe(): f64 { return 2500; }` lieferte eingebettet 0.0000, weil
+    // FloatToStr die 2500 als Bitmuster las). Sie wird unten an der Kopie
+    // nachgeholt, mit demselben `cg_istSicherGanz`.
     //
-    // Mit int64 auf beiden Seiten ist nichts umzurechnen. Die uebrigen Typen
-    // sind nicht verloren, sie brauchen die Umrechnung an der Kopie — das
-    // ist ein eigenes Paket (Issue), kein Nebensatz hier.
+    // Fuer schmalere Ganzzahlen gibt es am `return` keine Anpassung — der
+    // Zweig fuehrt nur cg_retToF64 und die Lockstep-Pruefung —, also ist
+    // dort nichts nachzuholen.
+    //
+    // Die ARGUMENTseite bleibt eng: ein Gleitkomma-Parameter wird nur
+    // bedient, wenn das Argument schon Gleitkomma ist. Ein ganzzahliges
+    // Literal an einem f64-Parameter rechnet der echte Aufruf heute still
+    // falsch (#2219, vorbestehend); eingebettet wuerde es richtig
+    // herauskommen, und zwei Wege mit zwei Ergebnissen sind schlimmer als
+    // ein bekannter Fehler an einer Stelle.
     var ret: int64 := self.cg_nc1(fni);
     if (ret < 0) { return 0; }
-    if (self.cg_builtinTypeId(self.cg_nsval(ret), self.cg_nslen(ret)) != 2) { return 0; }
+    if (self.cg_builtinTypeId(self.cg_nsval(ret), self.cg_nslen(ret)) == 0) { return 0; }
     // Parameter: hoechstens acht, alle mit eingebautem Grundtyp.
     var pz: int64 := 0;
     var pp: int64 := self.cg_nc0(fni);
@@ -14973,7 +15011,7 @@ pub type Codegen = class {
       if (self.cg_nkind(pp) != CGN_PARAM) { return 0; }
       var pt: int64 := self.cg_nc0(pp);
       if (pt < 0) { return 0; }
-      if (self.cg_builtinTypeId(self.cg_nsval(pt), self.cg_nslen(pt)) != 2) { return 0; }
+      if (self.cg_builtinTypeId(self.cg_nsval(pt), self.cg_nslen(pt)) == 0) { return 0; }
       pz += 1;
       pp := self.cg_nnext(pp);
     }
@@ -15045,11 +15083,26 @@ pub type Codegen = class {
     }
     if (pz != az) { return 0; }
 
+    // #2209: Ein Gleitkomma-Parameter wird nur mit einem Gleitkomma-Argument
+    // bedient. Der echte Aufruf wandelt ein ganzzahliges Literal dort NICHT
+    // (#2219, vorbestehend: `eins(5)` liefert 0.00); eingebettet kaeme der
+    // richtige Wert heraus, und derselbe Quelltext duerfte nicht davon
+    // abhaengen, ob eingebettet wurde. Faellt #2219, kann diese Schranke weg.
+    var pf: int64 := self.cg_nc0(fni);
+    var af: int64 := self.cg_nc0(callNi);
+    while (pf >= 0 && af >= 0) {
+      var pt: int64 := self.cg_nc0(pf);
+      if (self.cg_isFloatTypeName(self.cg_nsval(pt), self.cg_nslen(pt)) != 0
+          && self.cg_isF64Expr(af) == 0) { return 0; }
+      pf := self.cg_nnext(pf);
+      af := self.cg_nnext(af);
+    }
+
     var gemerkt: int64 := self.inlArgCount;
     pp := self.cg_nc0(fni);
     aa := self.cg_nc0(callNi);
     while (pp >= 0 && aa >= 0) {
-      self.cg_inlPush(self.cg_nsval(pp), self.cg_nslen(pp), aa, 0);
+      self.cg_inlPush(self.cg_nsval(pp), self.cg_nslen(pp), aa, 0, self.cg_nc0(pp));
       pp := self.cg_nnext(pp);
       aa := self.cg_nnext(aa);
     }
@@ -15058,7 +15111,7 @@ pub type Codegen = class {
     // frueheren nennen, deshalb erst eintragen, dann den naechsten lesen.
     var st: int64 := self.cg_nc0(self.cg_nc2(fni));
     while (st >= 0 && self.cg_nkind(st) == CGN_VAR_DECL) {
-      self.cg_inlPush(self.cg_nsval(st), self.cg_nslen(st), self.cg_nc1(st), 1);
+      self.cg_inlPush(self.cg_nsval(st), self.cg_nslen(st), self.cg_nc1(st), 1, 0 - 1);
       st := self.cg_nnext(st);
     }
 
@@ -15067,6 +15120,25 @@ pub type Codegen = class {
     self.inlArgCount := gemerkt;
 
     self.cg_genExpr(kopie);
+
+    // #2209: die Umrechnung des return-Zweiges nachholen. Dieselbe Rechnung
+    // wie in cg_retToF64 — die beiden muessen uebereinstimmen; dort haengt
+    // sie an `self.fnRetIsFloat` (dem Rueckgabetyp der UMGEBENDEN Funktion),
+    // hier am Rueckgabetyp der eingebetteten.
+    var retNi: int64 := self.cg_nc1(fni);
+    if (retNi >= 0
+        && self.cg_isFloatTypeName(self.cg_nsval(retNi), self.cg_nslen(retNi)) != 0
+        && self.cg_istSicherGanz(kopie) != 0) {
+      self.cg_emitRaxIntToF64();
+    }
+    // #2209: und die Breite der Rueckgabe. `fn f(): uint8 { return 300; }`
+    // liefert 44, nicht 300 — die Kuerzung sitzt im Epilog des Aufgerufenen
+    // (tests/int_width_test.sh, 'Rueckgabe kuerzt'). Dieselbe Stelle wie
+    // oben: cg_emitNarrowRax ueber cg_narrowKindOf.
+    if (retNi >= 0) {
+      self.cg_emitNarrowRax(self.cg_narrowKindOf(self.cg_nsval(retNi),
+                                                 self.cg_nslen(retNi)));
+    }
     return 1;
   }
 
@@ -26862,7 +26934,7 @@ pub type Codegen = class {
     self.inlTab       := alloc(self.inlTabCap * CG_INL_SZ);
     self.inlTabN      := 0;
     self.inlArgCap    := 16;
-    self.inlArgList   := alloc(self.inlArgCap * 32);
+    self.inlArgList   := alloc(self.inlArgCap * CG_INL_EINTRAG);
     self.inlArgCount  := 0;
 
     self.simdZielOff := 1;   // #2213: keine Zielablage
