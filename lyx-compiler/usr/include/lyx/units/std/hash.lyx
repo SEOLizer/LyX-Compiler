@@ -2185,15 +2185,31 @@ pub fn HMACSHA256(key: int64, keyLen: int64, msg: int64, msgLen: int64): int64 {
 
 // ============================================================================
 // FEAT-07: HashMap (open-addressing, pchar keys, int64 values)
-// Header: [cap:int64][count:int64][bucketsPtr:int64]
+// Header: [cap:int64][count:int64][bucketsPtr:int64][used:int64]
 // Bucket: [keyPtr:int64][keyLen:int64][value:int64][state:int64] (32 bytes)
 //   state: 0=empty, 1=occupied, 2=deleted
+//
+// #2226: Bis 1.2.19G drei Defekte, alle gemessen:
+//   * Set schrieb in den ERSTEN Grabstein der Sondierkette, ohne zu pruefen,
+//     ob der Schluessel weiter hinten schon stand — nach Del + Set stand er
+//     doppelt (29 von 100 Faellen in der Probe). Jetzt laeuft Set bis zum
+//     Treffer oder zum leeren Platz und setzt erst dann in den gemerkten
+//     ersten Grabstein.
+//   * Der Hash lief ueber HashFNV1a64(key), also bis zur Null, nicht ueber
+//     keyLen: Set(hm, "keyvalue", 3) und Get(hm, "key", 3) trafen sich nicht.
+//   * _hmGrow setzte ueber HashMapSet neu ein, das jeden Schluessel neu
+//     kopierte; die alten Kopien und die von Del blieben liegen.
+// Dazu: Kapazitaet ist eine Zweierpotenz, der Platz ergibt sich per Maske
+// statt zweier Divisionen je Hash und einer je Sondierschritt. Die
+// Fuellgrenze zaehlt Grabsteine mit (`used`), sonst kann eine Tabelle aus
+// lauter Grabsteinen bestehen und jede Suche die ganze Kapazitaet ablaufen.
 // ============================================================================
 
 con HM_HDR_CAP:     int64 := 0;
 con HM_HDR_CNT:     int64 := 8;
 con HM_HDR_PTR:     int64 := 16;
-con HM_HDR_SIZE:    int64 := 24;
+con HM_HDR_USED:    int64 := 24;   // belegt + Grabsteine
+con HM_HDR_SIZE:    int64 := 32;
 con HM_BUCKET_SIZE: int64 := 32;
 con HM_BKT_KEY:     int64 := 0;
 con HM_BKT_KLEN:    int64 := 8;
@@ -2203,11 +2219,31 @@ con HM_EMPTY:       int64 := 0;
 con HM_OCCUPIED:    int64 := 1;
 con HM_DELETED:     int64 := 2;
 
+// FNV-1a 64 ueber genau keyLen Byte (dieselbe Rechnung wie HashFNV1a64Bytes),
+// auf die Maske gekuerzt. cap ist eine Zweierpotenz.
 fn _hmHash(key: pchar, keyLen: int64, cap: int64): int64 {
-  var h: int64 := HashFNV1a64(key);
-  var idx: int64 := h % cap;
-  if (idx < 0) { idx := 0 - idx; }
-  return idx % cap;
+  var h: int64 := FNV_OFFSET_BASIS_64;
+  var p: int64 := key as int64;
+  var e: int64 := p + keyLen;
+  while (p < e) {
+    h := (h ^ peek8(p)) * FNV_PRIME_64;
+    p += 1;
+  }
+  return h & (cap - 1);
+}
+
+// Gleiche Bytes? Wortweise, der Rest einzeln.
+fn _hmKeyEq(a: int64, b: int64, n: int64): bool {
+  var i: int64 := 0;
+  while (i + 8 <= n) {
+    if (peek64(a + i) != peek64(b + i)) { return false; }
+    i += 8;
+  }
+  while (i < n) {
+    if (peek8(a + i) != peek8(b + i)) { return false; }
+    i += 1;
+  }
+  return true;
 }
 
 fn _hmFind(hm: int64, key: pchar, keyLen: int64): int64 {
@@ -2219,102 +2255,95 @@ fn _hmFind(hm: int64, key: pchar, keyLen: int64): int64 {
     var boff: int64 := bptr + idx * HM_BUCKET_SIZE;
     var state: int64 := peek64(boff + HM_BKT_STATE);
     if (state == HM_EMPTY) { return -1; }
-    if (state == HM_OCCUPIED) {
-      var bklen: int64 := peek64(boff + HM_BKT_KLEN);
-      if (bklen == keyLen) {
-        var bkptr: int64 := peek64(boff + HM_BKT_KEY);
-        var hmm: int64 := 1; var mj: int64 := 0;
-        while (mj < keyLen && hmm != 0) {
-          if (peek8(bkptr + mj) != StrCharAt(key, mj)) { hmm := 0; }
-          mj += 1;
-        }
-        if (hmm != 0) { return idx; }
-      }
+    if (state == HM_OCCUPIED && peek64(boff + HM_BKT_KLEN) == keyLen) {
+      if (_hmKeyEq(peek64(boff + HM_BKT_KEY), key as int64, keyLen)) { return idx; }
     }
-    idx := (idx + 1) % cap;
+    idx := (idx + 1) & (cap - 1);
     probes += 1;
   }
   return -1;
 }
 
-fn _hmGrow(hm: int64): void {
+// Neu aufbauen mit newCap Plaetzen. Die Schluessel sind eindeutig, also wird
+// nur verschoben — kein Vergleich, keine neue Kopie. Grabsteine entfallen.
+fn _hmRehash(hm: int64, newCap: int64): void {
   var oldCap: int64 := peek64(hm + HM_HDR_CAP);
-  var newCap: int64 := oldCap * 2;
   var oldPtr: int64 := peek64(hm + HM_HDR_PTR);
-  var newPtr: int64 := alloc(newCap * HM_BUCKET_SIZE);
-  var j: int64 := 0;
-  while (j < newCap * HM_BUCKET_SIZE) { poke8(newPtr + j, 0); j := j + 1; }
-  poke64(hm + HM_HDR_CAP, newCap);
-  poke64(hm + HM_HDR_PTR, newPtr);
-  poke64(hm + HM_HDR_CNT, 0);
-  // Re-insert all occupied entries
+  var newPtr: int64 := alloc(newCap * HM_BUCKET_SIZE);   // genullt: alles EMPTY
   var i: int64 := 0;
   while (i < oldCap) {
     var boff: int64 := oldPtr + i * HM_BUCKET_SIZE;
     if (peek64(boff + HM_BKT_STATE) == HM_OCCUPIED) {
       var kp: int64 := peek64(boff + HM_BKT_KEY);
       var kl: int64 := peek64(boff + HM_BKT_KLEN);
-      var v:  int64 := peek64(boff + HM_BKT_VAL);
-      HashMapSet(hm, kp as pchar, kl, v);
+      var idx: int64 := _hmHash(kp as pchar, kl, newCap);
+      while (peek64(newPtr + idx * HM_BUCKET_SIZE + HM_BKT_STATE) != HM_EMPTY) {
+        idx := (idx + 1) & (newCap - 1);
+      }
+      var noff: int64 := newPtr + idx * HM_BUCKET_SIZE;
+      poke64(noff + HM_BKT_KEY,   kp);
+      poke64(noff + HM_BKT_KLEN,  kl);
+      poke64(noff + HM_BKT_VAL,   peek64(boff + HM_BKT_VAL));
+      poke64(noff + HM_BKT_STATE, HM_OCCUPIED);
     }
     i += 1;
   }
+  poke64(hm + HM_HDR_CAP, newCap);
+  poke64(hm + HM_HDR_PTR, newPtr);
+  poke64(hm + HM_HDR_USED, peek64(hm + HM_HDR_CNT));
   free(oldPtr, oldCap * HM_BUCKET_SIZE);
 }
 
 pub fn HashMapNew(capacity: int64): int64 {
-  var cap: int64 := capacity;
-  if (cap < 8) { cap := 8; }
+  var cap: int64 := 8;
+  while (cap < capacity) { cap := cap * 2; }
   var hm: int64 := alloc(HM_HDR_SIZE);
-  var bptr: int64 := alloc(cap * HM_BUCKET_SIZE);
-  var j: int64 := 0;
-  while (j < cap * HM_BUCKET_SIZE) { poke8(bptr + j, 0); j := j + 1; }
   poke64(hm + HM_HDR_CAP, cap);
   poke64(hm + HM_HDR_CNT, 0);
-  poke64(hm + HM_HDR_PTR, bptr);
+  poke64(hm + HM_HDR_PTR, alloc(cap * HM_BUCKET_SIZE));   // genullt: alles EMPTY
+  poke64(hm + HM_HDR_USED, 0);
   return hm;
 }
 
 pub fn HashMapSet(hm: int64, key: pchar, keyLen: int64, value: int64): void {
   if (hm == 0) { return; }
   var cap: int64 := peek64(hm + HM_HDR_CAP);
-  var cnt: int64 := peek64(hm + HM_HDR_CNT);
-  // Grow if load > 75%
-  if (cnt * 4 >= cap * 3) { _hmGrow(hm); cap := peek64(hm + HM_HDR_CAP); }
+  // Fuellgrenze drei Viertel, Grabsteine mitgezaehlt. Danach bleibt immer ein
+  // leerer Platz, die Sondierung unten endet also. Bestehen die Plaetze vor
+  // allem aus Grabsteinen, genuegt ein Neuaufbau in derselben Groesse.
+  if ((peek64(hm + HM_HDR_USED) + 1) * 4 > cap * 3) {
+    if ((peek64(hm + HM_HDR_CNT) + 1) * 2 > cap) { cap := cap * 2; }
+    _hmRehash(hm, cap);
+  }
   var bptr: int64 := peek64(hm + HM_HDR_PTR);
   var idx: int64 := _hmHash(key, keyLen, cap);
-  var probes: int64 := 0;
-  while (probes < cap) {
+  var grab: int64 := -1;
+  while (true) {
     var boff: int64 := bptr + idx * HM_BUCKET_SIZE;
     var state: int64 := peek64(boff + HM_BKT_STATE);
-    if (state == HM_EMPTY || state == HM_DELETED) {
-      // Copy key
-      var kp: int64 := alloc(keyLen + 1);
-      var kj: int64 := 0;
-      while (kj < keyLen) { poke8(kp + kj, StrCharAt(key, kj)); kj := kj + 1; }
-      poke8(kp + keyLen, 0);
-      poke64(boff + HM_BKT_KEY,   kp);
-      poke64(boff + HM_BKT_KLEN,  keyLen);
-      poke64(boff + HM_BKT_VAL,   value);
-      poke64(boff + HM_BKT_STATE, HM_OCCUPIED);
-      poke64(hm + HM_HDR_CNT, cnt + 1);
-      return;
-    }
-    if (state == HM_OCCUPIED) {
-      var bklen: int64 := peek64(boff + HM_BKT_KLEN);
-      if (bklen == keyLen) {
-        var bkptr: int64 := peek64(boff + HM_BKT_KEY);
-        var hmm2: int64 := 1; var mj2: int64 := 0;
-        while (mj2 < keyLen && hmm2 != 0) {
-          if (peek8(bkptr + mj2) != StrCharAt(key, mj2)) { hmm2 := 0; }
-          mj2 += 1;
-        }
-        if (hmm2 != 0) { poke64(boff + HM_BKT_VAL, value); return; }
+    if (state == HM_EMPTY) { break; }
+    if (state == HM_DELETED) {
+      if (grab < 0) { grab := idx; }
+    } else if (peek64(boff + HM_BKT_KLEN) == keyLen) {
+      if (_hmKeyEq(peek64(boff + HM_BKT_KEY), key as int64, keyLen)) {
+        poke64(boff + HM_BKT_VAL, value);
+        return;
       }
     }
-    idx := (idx + 1) % cap;
-    probes += 1;
+    idx := (idx + 1) & (cap - 1);
   }
+  // Nicht vorhanden: in den ersten Grabstein, sonst in den leeren Platz.
+  if (grab >= 0) { idx := grab; }
+  else { poke64(hm + HM_HDR_USED, peek64(hm + HM_HDR_USED) + 1); }
+  var kp: int64 := alloc(keyLen + 1);
+  memcpy(kp, key as int64, keyLen);
+  poke8(kp + keyLen, 0);
+  var zoff: int64 := bptr + idx * HM_BUCKET_SIZE;
+  poke64(zoff + HM_BKT_KEY,   kp);
+  poke64(zoff + HM_BKT_KLEN,  keyLen);
+  poke64(zoff + HM_BKT_VAL,   value);
+  poke64(zoff + HM_BKT_STATE, HM_OCCUPIED);
+  poke64(hm + HM_HDR_CNT, peek64(hm + HM_HDR_CNT) + 1);
 }
 
 pub fn HashMapGet(hm: int64, key: pchar, keyLen: int64): int64 {
@@ -2334,6 +2363,8 @@ pub fn HashMapDel(hm: int64, key: pchar, keyLen: int64): void {
   var idx: int64 := _hmFind(hm, key, keyLen);
   if (idx < 0) { return; }
   var boff: int64 := peek64(hm + HM_HDR_PTR) + idx * HM_BUCKET_SIZE;
+  free(peek64(boff + HM_BKT_KEY), keyLen + 1);
+  poke64(boff + HM_BKT_KEY, 0);
   poke64(boff + HM_BKT_STATE, HM_DELETED);
   poke64(hm + HM_HDR_CNT, peek64(hm + HM_HDR_CNT) - 1);
 }
