@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.19G
+VERSION   := 1.2.19H
 VERSION_DATE := 2026-10-23
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -353,6 +353,10 @@ test: lyxc
 	@bash tests/avx2_vektorpfad_test.sh
 	@echo "--- f64-Parameter: ganzzahliges Literal wandeln, drei Ziele (#2219) ---"
 	@bash tests/f64_argument_test.sh
+	@echo "--- IntToStr aus der Bump-Arena: kein mmap je Aufruf (#2225) ---"
+	@bash tests/inttostr_2225_test.sh
+	@echo "--- HashMap: Duplikat nach Del, keyLen-Hash, Speicher (#2226) ---"
+	@bash tests/hashmap_2226_test.sh
 	@echo "--- Einbettung kleiner Funktionen, beide Richtungen (#2208) ---"
 	@bash tests/einbettung_test.sh
 	@echo "--- Bit-Builtins und ISA-Gating am Erzeugnis (#2190, #2191) ---"
