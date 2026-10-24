@@ -7708,15 +7708,21 @@ pub type Codegen = class {
     if (bytes == 8) { schub := 3; }
     self.cg_e8(0x50);                                                        // push rax (Elementzahl)
     self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE0); self.cg_e8(schub); // shl rax, 2 bzw. 3
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x18);  // add rax, 24
+    // #2215: Platz fuer den Zaehler (8) und bis zu 63 Byte Ausrichtung — die
+    // Daten beginnen auf einer CACHE-LINE. Mit 16 Byte (bis 1.2.20E) lag jeder
+    // zweite 32-Byte-AVX-Zugriff ueber zwei Lines (mem_inst_retired.split_loads
+    // = die Haelfte aller Ladebefehle); der f32-Kern lief 1,17x hinter gcc.
+    // In C gegengemessen: dieselbe Rechnung, Felder auf 4096 statt malloc+16,
+    // 404 statt 496 Mio. Takte.
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x48);  // add rax, 72
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);                    // mov rsi, rax (Groesse)
     // #2206: aus der VEKTORARENA, mit 1-MiB-Bloecken. Die Trennung von
     // CG_HEAP_* ist Voraussetzung fuer das Zuruecksetzen der Marke (siehe
     // cg_vecMarkeSetzen) — auf dem `new`-Heap waere es Speicherkorruption.
     self.cg_emitBumpAtomarIn(0, 0, CG_VEC_PTR, CG_VEC_END, 1048576);   // rax = Blockstelle
     self.cg_e8(0x59);                                                        // pop rcx (Elementzahl)
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x17);  // add rax, 23
-    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE0); self.cg_e8(0xF0);  // and rax, -16
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x47);  // add rax, 71
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE0); self.cg_e8(0xC0);  // and rax, -64
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x48); self.cg_e8(0xF8);  // mov [rax-8], rcx
   }
 
@@ -7827,14 +7833,20 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x20);  // sub rcx, 32
 
     // ---- 32 Byte je Durchlauf ----
-    var v256Start: int64 := self.codeLen;
+    // #2215: unten geprueft (Eintrittspruefung einmal, dann add/cmp/jle) —
+    // ein Sprung je Durchlauf statt zwei. Bis 1.2.20E stand die Pruefung oben
+    // und am Ende ein `jmp` zurueck; dieser kurze Sprung endete in allen vier
+    // abgerollten Kopien von bench/arr_add_f32 GENAU an einer 32-Byte-Grenze
+    // (JCC-Erratum, siehe cg_paarAusrichten) — gemessen 1,17x hinter gcc.
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
-    self.cg_e8(0x7F); var jg256: int64 := self.codeLen; self.cg_e8(0);       // jg nach dem Block
+    self.cg_e8(0x7F); var jg256: int64 := self.codeLen; self.cg_e8(0);       // jg nach dem Block (kein voller Block)
     var v256Body: int64 := self.codeLen;
     self.cg_emitVexF32Schritt(op, 1, bytes);
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x20);  // add rax, 32
-    self.cg_e8(0xEB); var back256: int64 := self.codeLen;
-    self.cg_e8(v256Start - (back256 + 1));
+    self.cg_paarAusrichten(self.codeLen, 5);                                 // cmp+jle als Paar
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
+    self.cg_e8(0x7E); var back256: int64 := self.codeLen;                   // jle Rumpf
+    self.cg_e8(v256Body - (back256 + 1));
 
     // ---- einmal 16 Byte, falls noch einer passt ----
     var nach256: int64 := self.codeLen;
@@ -7946,8 +7958,7 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(schub); // shl rcx, 2 bzw. 3
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x10);  // sub rcx, 16
 
-    // ---- Vektorteil: while (rax <= rcx) ----
-    var vecStart: int64 := self.codeLen;
+    // ---- Vektorteil: while (rax <= rcx), unten geprueft (#2215, wie cg_emitAVX2BinOp) ----
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
     self.cg_e8(0x7F); var jgPos: int64 := self.codeLen; self.cg_e8(0);       // jg .tail
     var vecBody: int64 := self.codeLen;
@@ -7955,8 +7966,10 @@ pub type Codegen = class {
     self.cg_e8(0x0F); self.cg_e8(0x57); self.cg_e8(0xC2);                    // xorps xmm0, xmm2
     self.cg_e8(0x0F); self.cg_e8(0x29); self.cg_e8(0x04); self.cg_e8(0x02);  // movaps [rdx+rax], xmm0
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);  // add rax, 16
-    self.cg_e8(0xEB); var vecBackPos: int64 := self.codeLen;
-    self.cg_e8(vecStart - (vecBackPos + 1));                                 // jmp .vecStart
+    self.cg_paarAusrichten(self.codeLen, 5);                                 // cmp+jle als Paar
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
+    self.cg_e8(0x7E); var vecBackPos: int64 := self.codeLen;
+    self.cg_e8(vecBody - (vecBackPos + 1));                                  // jle Rumpf
 
     // ---- Rest: Element fuer Element ----
     var tailStart: int64 := self.codeLen;
@@ -8061,8 +8074,7 @@ pub type Codegen = class {
     //               darf negativ werden, der Vergleich unten ist vorzeichenbehaftet)
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x10);
 
-    // ---- Vektorteil: while (rax <= rcx) ----
-    var vecStart: int64 := self.codeLen;
+    // ---- Vektorteil: while (rax <= rcx), unten geprueft (#2215, wie cg_emitAVX2BinOp) ----
     // cmp rax, rcx
     self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);
     // jg .tail
@@ -8083,10 +8095,12 @@ pub type Codegen = class {
     self.cg_e8(0x0F); self.cg_e8(0x29); self.cg_e8(0x04); self.cg_e8(0x02);
     // add rax, 16
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);
-    // jmp .vecStart
-    self.cg_e8(0xEB);
+    // cmp rax, rcx; jle Rumpf — als Paar ausgerichtet
+    self.cg_paarAusrichten(self.codeLen, 5);
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);
+    self.cg_e8(0x7E);
     var vecBackPos: int64 := self.codeLen;
-    self.cg_e8(vecStart - (vecBackPos + 1));
+    self.cg_e8(vecBody - (vecBackPos + 1));
 
     // ---- Rest: rcx zurueck auf die volle Bytezahl, dann 4 Byte je Schritt ----
     var tailStart: int64 := self.codeLen;

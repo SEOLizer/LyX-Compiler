@@ -68,7 +68,13 @@ if [ "$HAT_PERF" -eq 0 ]; then
   echo "          Gemessen wird nur die Wandzeit. Befehle je Operation, Takte und IPC"
   echo "          fehlen damit; fuer sie braucht es 'sudo sysctl kernel.perf_event_paranoid=1'."
 else
-  echo "ZAEHLER:  perf stat (Befehle, Takte, IPC)"
+  echo "ZAEHLER:  perf stat (Takte, Befehle, uOps je Operation, IPC)"
+fi
+RAPL=/sys/class/powercap/intel-rapl:0/energy_uj
+if cat "$RAPL" >/dev/null 2>&1; then
+  HAT_RAPL=1; echo "ENERGIE:  RAPL Paket ($RAPL), ein Lauf je Fassung"
+else
+  HAT_RAPL=0; echo "ENERGIE:  keine — $RAPL nicht lesbar (meist nur root)."
 fi
 echo "Laeufe je Fassung: $N (Median, dazu min/max)"
 echo
@@ -116,18 +122,46 @@ pruefsumme() {
   ( ulimit -c 0; "$bin" "$@" 2>/dev/null ) | sed -n 's/^checksum=//p' | head -1
 }
 
-# zaehler BINARY ARGS...  — eine Zeile mit den perf-Werten, oder leer
+# zaehler BINARY ARGS...  — eine Zeile mit den perf-Werten, oder leer.
+# Ist OPS gesetzt (Zahl der Operationen des laufenden Kerns: Elemente mal
+# Wiederholungen, bzw. Viertelrunden), stehen die Werte JE OPERATION da —
+# das, was #2195 verlangt. Sie enthalten Anlage und Prozessstart mit; bei
+# den gewaehlten Groessen ist das unter einem Prozent.
+# uOps: uops_issued.any (Intel). Fehlt das Ereignis, bleibt die Angabe weg.
 zaehler() {
   [ "$HAT_PERF" -eq 1 ] || return 0
   local bin="$1"; shift
   local out
-  out=$( ulimit -c 0; perf stat -x, -e instructions,cycles "$bin" "$@" 2>&1 >/dev/null ) || return 0
-  local ins cyc
+  out=$( ulimit -c 0; perf stat -x, -e instructions,cycles,uops_issued.any "$bin" "$@" 2>&1 >/dev/null ) || return 0
+  local ins cyc uop
   ins=$(printf '%s\n' "$out" | awk -F, '$3 == "instructions" {print $1}')
   cyc=$(printf '%s\n' "$out" | awk -F, '$3 == "cycles" {print $1}')
+  uop=$(printf '%s\n' "$out" | awk -F, '$3 == "uops_issued.any" {print $1}')
+  case "$uop" in ''|*[!0-9]*) uop="" ;; esac
   if [ -n "$ins" ] && [ -n "$cyc" ] && [ "$cyc" != "0" ] && [ "$ins" != "<not" ]; then
-    awk -v i="$ins" -v c="$cyc" 'BEGIN { printf "%s Befehle, %s Takte, IPC %.2f", i, c, i/c }'
+    if [ -n "${OPS:-}" ] && [ "${OPS:-0}" -gt 0 ]; then
+      awk -v i="$ins" -v c="$cyc" -v u="$uop" -v o="$OPS" 'BEGIN {
+        printf "%.3f Takte/Op, %.3f Befehle/Op", c/o, i/o
+        if (u != "") printf ", %.3f uOps/Op", u/o
+        printf ", IPC %.2f", i/c }'
+    else
+      awk -v i="$ins" -v c="$cyc" 'BEGIN { printf "%s Befehle, %s Takte, IPC %.2f", i, c, i/c }'
+    fi
   fi
+}
+
+# Energie ueber RAPL (Paket), wenn lesbar — sonst leer. Ein Lauf, Joule.
+# Die Datei ist auf den meisten Systemen nur fuer root lesbar; das wird
+# ausprobiert und im Kopf gemeldet, nicht angenommen.
+energie() {
+  [ "$HAT_RAPL" -eq 1 ] || return 0
+  local bin="$1"; shift
+  local e0 e1
+  e0=$(cat "$RAPL" 2>/dev/null) || return 0
+  ( ulimit -c 0; "$bin" "$@" >/dev/null 2>&1 )
+  e1=$(cat "$RAPL" 2>/dev/null) || return 0
+  [ "$e1" -ge "$e0" ] 2>/dev/null || return 0      # Zaehlerueberlauf: keine Angabe
+  awk -v a="$e0" -v b="$e1" 'BEGIN { printf "%.2f J", (b-a)/1e6 }'
 }
 
 # Groesse des GESAMTEN Befehlsbereichs — nicht die des Kerns. Bei lyxc stehen
@@ -205,8 +239,12 @@ kern() {
     if [ "$med" -gt 0 ] && [ "$referenz" -gt 0 ]; then
       verh=$(awk -v a="$referenz" -v b="$med" 'BEGIN { printf "%.2fx", a/b }')
     fi
-    printf "  %-26s %6s ms  (min %s, max %s)  %-8s %7s B .text(ganz)  %s\n" \
-      "$k" "$med" "$min" "$max" "$verh" "$(groesse "${bins[$k]}")" "$(zaehler "${bins[$k]}" "${args[@]}")"
+    local nsop=""
+    if [ -n "${OPS:-}" ] && [ "${OPS:-0}" -gt 0 ]; then
+      nsop=$(awk -v m="$med" -v o="$OPS" 'BEGIN { printf "%.3f ns/Op", m*1e6/o }')
+    fi
+    printf "  %-26s %6s ms  (min %s, max %s)  %-8s %-14s %7s B .text(ganz)  %s  %s\n" \
+      "$k" "$med" "$min" "$max" "$verh" "$nsop" "$(groesse "${bins[$k]}")" "$(zaehler "${bins[$k]}" "${args[@]}")" "$(energie "${bins[$k]}" "${args[@]}")"
   done
   echo "  (Verhaeltnis bezogen auf lyxc baseline; groesser als 1 heisst schneller als diese.)"
   echo "  (.text(ganz) ist der GESAMTE Befehlsbereich — bei lyxc samt Laufzeit und stdlib."
@@ -218,13 +256,13 @@ kern() {
 
 if [ -z "$KERN" ] || [ "$KERN" = "chacha" ]; then
   # Ganzzahlkern: haengt an Rotationen, nicht an Speicher — eine Groesse genuegt.
-  kern "chacha_qr" "bench/chacha_qr.lyx" "$ROOT/bench/chacha_qr.c" 2000000
+  OPS=2000000 kern "chacha_qr" "bench/chacha_qr.lyx" "$ROOT/bench/chacha_qr.c" 2000000
 fi
 
 if [ -z "$KERN" ] || [ "$KERN" = "arr_add_f32" ]; then
-  kern "arr_f32_L1"  "bench/arr_add_f32.lyx" "$ROOT/bench/arr_add_f32.c" "$L1_N"  "$L1_W"
-  kern "arr_f32_L2"  "bench/arr_add_f32.lyx" "$ROOT/bench/arr_add_f32.c" "$L2_N"  "$L2_W"
-  kern "arr_f32_RAM" "bench/arr_add_f32.lyx" "$ROOT/bench/arr_add_f32.c" "$RAM_N" "$RAM_W"
+  OPS=$((L1_N * L1_W))   kern "arr_f32_L1"  "bench/arr_add_f32.lyx" "$ROOT/bench/arr_add_f32.c" "$L1_N"  "$L1_W"
+  OPS=$((L2_N * L2_W))   kern "arr_f32_L2"  "bench/arr_add_f32.lyx" "$ROOT/bench/arr_add_f32.c" "$L2_N"  "$L2_W"
+  OPS=$((RAM_N * RAM_W)) kern "arr_f32_RAM" "bench/arr_add_f32.lyx" "$ROOT/bench/arr_add_f32.c" "$RAM_N" "$RAM_W"
 fi
 
 if [ -z "$KERN" ] || [ "$KERN" = "arr_int" ]; then
@@ -235,9 +273,9 @@ if [ -z "$KERN" ] || [ "$KERN" = "arr_int" ]; then
   for breite in 8 16 32; do
     for op in 1 2 3; do
       case "$op" in 1) opn=add ;; 2) opn=mul ;; 3) opn=sum ;; esac
-      kern "int${breite}_${opn}_L1"  "bench/arr_int.lyx" "$ROOT/bench/arr_int.c" "$breite" "$op" "$L1_N"  "$L1_W"
-      kern "int${breite}_${opn}_L2"  "bench/arr_int.lyx" "$ROOT/bench/arr_int.c" "$breite" "$op" "$L2_N"  "$L2_W"
-      kern "int${breite}_${opn}_RAM" "bench/arr_int.lyx" "$ROOT/bench/arr_int.c" "$breite" "$op" "$RAM_N" "$RAM_W"
+      OPS=$((L1_N * L1_W))   kern "int${breite}_${opn}_L1"  "bench/arr_int.lyx" "$ROOT/bench/arr_int.c" "$breite" "$op" "$L1_N"  "$L1_W"
+      OPS=$((L2_N * L2_W))   kern "int${breite}_${opn}_L2"  "bench/arr_int.lyx" "$ROOT/bench/arr_int.c" "$breite" "$op" "$L2_N"  "$L2_W"
+      OPS=$((RAM_N * RAM_W)) kern "int${breite}_${opn}_RAM" "bench/arr_int.lyx" "$ROOT/bench/arr_int.c" "$breite" "$op" "$RAM_N" "$RAM_W"
     done
   done
 fi
