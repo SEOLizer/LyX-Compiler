@@ -1260,9 +1260,11 @@ fn main(): int64 {
 
 ---
 
-## Energy-Aware-Compiling (v0.3.1+ ✅ ABGESCHLOSSEN)
+## Energy-Aware-Compiling (v0.3.1+)
 
-Der Lyx-Compiler implementiert Energy-Aware-Compiling, um energieeffizienten Maschinencode zu erzeugen. Dies ist bereits vollständig in den Versionen v0.3.1+ integriert.
+Das Energieziel steuert im selbstgehosteten Compiler genau eine Stellgröße:
+den Abrollfaktor der Schleifen im x86-64-Codegenerator (`cg_unrollFactor`).
+Die IR-Backends (arm64, riscv, esp32, arm-cm4, lyxos) werten es nicht aus.
 
 ### CLI-Option
 
@@ -1270,58 +1272,45 @@ Der Lyx-Compiler implementiert Energy-Aware-Compiling, um energieeffizienten Mas
 lyxc input.lyx -o output --target-energy=<1-5>
 ```
 
-| Level | Name | Beschreibung |
+| Level | Name | Abrollfaktor |
 |-------|------|--------------|
-| 1 | Minimal | Loop Unrolling 4×, Battery-Optimierung, Cache-Lokalität |
-| 2 | Low | Loop Unrolling 2×, Battery-Optimierung |
-| 3 | Medium | Performance-optimiert, SIMD erlaubt |
-| 4 | High | Volle Performance, FPU erlaubt |
-| 5 | Extreme | Loop Unrolling 8×, AVX512 wenn verfügbar |
+| 1 | Minimal | 1× (kein Abrollen) |
+| 2 | Low | 2× |
+| 3 | Medium (Default) | 4× |
+| 4 | High | 4× |
+| 5 | Extreme | 8× |
+
+Das Energieziel wählt **keine** Befehlssätze aus (SIMD, FPU, AVX-512) und
+schaltet kein Batterieprofil. Die Befehlssatzwahl läuft über `--target-cpu`
+bzw. `@cpu`.
 
 ### Sprach-Level-Pragma
 
 ```lyx
 @energy(1)
 fn low_energy_function(): int64 {
-  // Diese Funktion wird mit Energy-Level 1 compiliert
+  // Schleifen dieser Funktion werden nicht abgerollt
   return 0;
 }
 
 @energy(5)
 fn high_performance_function(): int64 {
-  // Diese Funktion wird mit Energy-Level 5 compiliert
+  // Schleifen dieser Funktion werden 8-fach abgerollt
   return compute_heavy();
 }
 ```
 
-### Energy-Statistiken
+`@energy(N)` vor einer Funktion überschreibt das globale Ziel für diese
+Funktion; ein `@energy(N)` auf oberster Ebene setzt das globale Ziel wie
+`--target-energy`.
 
-Der Compiler gibt nach der Kompilation detaillierte Energie-Statistiken aus:
+### Historisch: Pascal-Compiler (bis zur Selbstübersetzung)
 
-```
-=== Energy Statistics ===
-Energy level:           3
-CPU family:             1
-Optimize for battery:   TRUE
-
-Total ALU operations:   42
-Total FPU operations:   0
-Total memory accesses:  17
-Total branches:         8
-Total syscalls:         3
-
-Estimated energy units: 16955
-Code size:              846 bytes
-L1 cache footprint:     846 bytes
-```
-
-### Architektur
-
-- **energy_model.pas**: Zentrale Energy-Konfiguration, CPU-Modelle, Kosten-Tabellen
-- **backend_types.pas**: TEnergyLevel, TCPUFamily Enums
-- **IR**: EnergyCostHint pro Instruktion, GetIROpEnergyCost()
-- **x86_64_emit.pas / arm64_emit.pas**: TrackEnergy(), SetEnergyLevel()
-- **Parser**: @energy(level) Attribut vor Funktionen
+Der Pascal-Compiler (eigenes Repository `lyx-pascal`) führte zusätzlich ein Energiemodell
+(`energy_model.pas`, `EnergyCostHint` je IR-Instruktion, `TrackEnergy()` in
+`x86_64_emit.pas`/`arm64_emit.pas`) und gab nach der Kompilation einen Block
+„=== Energy Statistics ===" aus. Der selbstgehostete Compiler `lyxc` hat beides
+nicht übernommen; es gibt weder die Statistik noch eine Kostenschätzung (#2188).
 
 ---
 

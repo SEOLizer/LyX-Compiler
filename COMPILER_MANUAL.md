@@ -160,7 +160,7 @@ Annotations modify the compiler's behavior for the decorated declaration. They a
 | `@capabilities([...])` | `fn` | ✅ | LCBS: declare required runtime capabilities |
 | `@uses_caller_cap([...])` | `fn` | ✅ | LCBS: inherit capabilities from caller |
 | `@cap(path)` | `extern fn` | ✅ | LCBS: map FFI call to capability path |
-| `@energy(N)` | `fn` | ✅ | Energy level override for this function (1–5) |
+| `@energy(N)` | `fn` | ✅ | Energy level override for this function (1–5); sets the loop unroll factor |
 
 #### `@export`
 
@@ -258,7 +258,19 @@ extern fn open(path: pchar, flags: int64, mode: int64): int64 link "libc.so.6";
 
 #### `@energy(N)` (fn)
 
-Overrides the energy level (1 = minimal, 5 = extreme) for the annotated function, independently of the global `--target-energy` flag. Affects loop unrolling and SIMD strategy.
+Overrides the energy level (1 = minimal, 5 = extreme) for the annotated function, independently of the global `--target-energy` flag (default level: 3).
+
+The level has exactly one effect: the loop unroll factor of the x86-64 code generator.
+
+| Level | Unroll factor |
+|-------|---------------|
+| 1 | 1× (no unrolling) |
+| 2 | 2× |
+| 3 (default) | 4× |
+| 4 | 4× |
+| 5 | 8× |
+
+It does **not** select instruction sets, SIMD/FPU/AVX-512 use or a battery profile, and the IR backends (arm64, riscv, esp32, arm-cm4, lyxos) ignore it. Instruction set selection goes through `--target-cpu` / `@cpu`.
 
 ```lyx
 @energy(5)
@@ -294,7 +306,7 @@ fn hotLoop(data: pchar, len: int64): void { ... }
 | `--std-path=PATH` | Override standard library path |
 | `--target=TARGET` | Target platform (linux, win64, arm64, macosx64, macos-arm64, esp32, riscv) |
 | `--arch=ARCH` | Architecture (x86_64, arm64, xtensa, riscv) |
-| `--target-energy=<1-5>` | Energy level (1=minimal, 5=extreme) |
+| `--target-energy=<1-5>` | Energy level (1=minimal, 5=extreme); sets only the x86-64 loop unroll factor 1/2/4/4/8, see `@energy(N)` |
 | `--emit-asm` | Write x86-64 disassembly of the generated code to `<output>.asm` |
 | `--dump-asm` | Same disassembly, to standard output |
 | `--asm-listing` | Disassembly annotated with source line numbers at function entries |
