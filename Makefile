@@ -369,6 +369,8 @@ test: lyxc
 	@bash tests/direkte_argumente_test.sh
 	@echo "--- rotl32/rotr32: Werte auf drei Zielen, Weg auf x86 (#2177) ---"
 	@bash tests/rotl32_2177_test.sh
+	@echo "--- xxHash32/64 gegen Referenzwerte (#2235) ---"
+	@bash tests/xxhash_2235_test.sh
 	@echo "--- Bit-Builtins auf esp32 und arm-cm4: Werte, 64-Bit-Formen laut (#2228) ---"
 	@bash tests/bit_builtins_alle_ziele_test.sh
 	@echo "--- Registerkandidaten: je Deklaration, pchar, Objekte, self (#2228) ---"
