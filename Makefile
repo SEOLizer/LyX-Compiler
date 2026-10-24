@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.20A
+VERSION   := 1.2.20B
 VERSION_DATE := 2026-10-24
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -369,6 +369,10 @@ test: lyxc
 	@bash tests/direkte_argumente_test.sh
 	@echo "--- rotl32/rotr32: Werte auf drei Zielen, Weg auf x86 (#2177) ---"
 	@bash tests/rotl32_2177_test.sh
+	@echo "--- xxHash32/64 gegen Referenzwerte (#2235) ---"
+	@bash tests/xxhash_2235_test.sh
+	@echo "--- Negation eines parallel Array: Bitmuster, Mischformen laut (#2222) ---"
+	@bash tests/simd_neg_2222_test.sh
 	@echo "--- Bit-Builtins auf esp32 und arm-cm4: Werte, 64-Bit-Formen laut (#2228) ---"
 	@bash tests/bit_builtins_alle_ziele_test.sh
 	@echo "--- Registerkandidaten: je Deklaration, pchar, Objekte, self (#2228) ---"

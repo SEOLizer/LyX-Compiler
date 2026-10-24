@@ -53,10 +53,27 @@ if [ "$rc" -ne 0 ]; then ok "Ziel ist ein Verzeichnis: Status $rc"; else bad "Zi
 # 3) ETXTBSY — die Zieldatei laeuft gerade. Das ist der Fall aus dem Bericht:
 #    er tritt auf, ohne dass man etwas falsch macht, und die Ursache ist von
 #    aussen nicht zu sehen. Deshalb muss die Meldung sie benennen.
+#    #2216: Das Hilfsprogramm war eine Zaehlschleife (9e8 Durchlaeufe) — der
+#    Test HOFFTE, dass es beim Ueberschreiben noch laeuft. Seit die Schleife
+#    in Registern laeuft (#2228), endet sie nach Bruchteilen einer Sekunde;
+#    im Volllauf unter Last fiel das Ende zwischen Sonde und Compileraufruf,
+#    der Compiler schrieb erfolgreich, und der Test las statt der ETXTBSY-
+#    Meldung das Security-Audit des gelungenen Baus. Jetzt wird die
+#    Bedingung HERGESTELLT: das Programm meldet sich mit einer Zeile, sobald
+#    es laeuft, und endet nie von selbst — beendet wird es vom Test, NACH
+#    dem Compileraufruf. Ob es dabei noch lief, wird zusaetzlich gemessen.
 cat > "$TMP/lauf.lyx" <<'EOF'
 import std.io;
-fn main(): int64 { var i: int64 := 0; while (i < 900000000) { i := i + 1; } return 0; }
+import std.time;
+fn main(): int64 {
+  PrintLn("laeuft");
+  var i: int64 := 0;
+  while (i >= 0) { Sleep(50); }
+  return 0;
+}
 EOF
+busy=""
+trap '[ -n "$busy" ] && kill "$busy" 2>/dev/null; rm -rf "$TMP"' EXIT
 #
 #    #1911: Diese Pruefung setzte voraus, dass die Umgebung ETXTBSY ueberhaupt
 #    erzeugt. Auf dem CI-Runner tut sie das nicht — dort ist das Ziel seit
@@ -71,14 +88,19 @@ EOF
 #    denn sie schlaegt im interessanten Fall fehl.
 if "$LYXC" --std-path=. "$TMP/lauf.lyx" -o "$TMP/laeuft" > /dev/null 2>&1; then
   chmod +x "$TMP/laeuft"
-  "$TMP/laeuft" & busy=$!
-  sleep 1
-  if ! kill -0 "$busy" 2>/dev/null; then
-    echo "UEBERSPRUNGEN ETXTBSY: das Hilfsprogramm lief nicht lange genug (#1911)"
+  "$TMP/laeuft" > "$TMP/marke" 2>/dev/null & busy=$!
+  # Auf die Marke warten (hoechstens 30 s): erst wenn main() geschrieben
+  # hat, ist das Abbild sicher geladen — vorher koennte die Sonde noch die
+  # Datei VOR dem exec treffen.
+  t=0
+  while [ ! -s "$TMP/marke" ] && [ $t -lt 300 ] && kill -0 "$busy" 2>/dev/null; do
+    sleep 0.1; t=$((t+1))
+  done
+  if [ ! -s "$TMP/marke" ] || ! kill -0 "$busy" 2>/dev/null; then
+    bad "Hilfsprogramm fuer den ETXTBSY-Fall meldet sich nicht (Marke fehlt nach $((t/10)) s, #2216)"
   elif ( printf '' >> "$TMP/laeuft" ) 2>/dev/null; then
     # Die Umgebung laesst das Schreiben in eine laufende Datei zu. Dann kann
     # der Compiler ETXTBSY nicht melden, und die Pruefung misst hier nichts.
-    kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
     echo "UEBERSPRUNGEN ETXTBSY: diese Umgebung sperrt laufende Dateien nicht (#1911)"
     echo "  Ein Schreibzugriff auf die laufende Datei ist durchgegangen — der Fall"
     echo "  ist hier nicht messbar. Auf einem gewoehnlichen Linux-Dateisystem laeuft"
@@ -86,14 +108,23 @@ if "$LYXC" --std-path=. "$TMP/lauf.lyx" -o "$TMP/laeuft" > /dev/null 2>&1; then
   else
     "$LYXC" --std-path=. "$TMP/q.lyx" -o "$TMP/laeuft" > "$TMP/c.out" 2> "$TMP/c.err"
     rc=$?
-    kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
-    if [ "$rc" -ne 0 ]; then ok "laufende Zieldatei: Status $rc"; else bad "laufende Zieldatei, endet aber mit 0"; fi
-    if grep -q "ETXTBSY" "$TMP/c.err"; then
-      ok "Meldung nennt ETXTBSY als Anlass"
+    # Lief das Programm waehrend des ganzen Compileraufrufs? Es endet nie von
+    # selbst; ist es weg, ist die Voraussetzung verloren und das Ergebnis
+    # sagt nichts — das wird laut, nicht still uebergangen.
+    lief=1; kill -0 "$busy" 2>/dev/null || lief=0
+    kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null; busy=""
+    if [ "$lief" -ne 1 ]; then
+      bad "Hilfsprogramm lief beim Ueberschreiben nicht mehr — Messung ungueltig (#2216)"
     else
-      bad "Meldung nennt ETXTBSY nicht: $(head -1 "$TMP/c.err")"
+      if [ "$rc" -ne 0 ]; then ok "laufende Zieldatei: Status $rc"; else bad "laufende Zieldatei, endet aber mit 0"; fi
+      if grep -q "ETXTBSY" "$TMP/c.err"; then
+        ok "Meldung nennt ETXTBSY als Anlass"
+      else
+        bad "Meldung nennt ETXTBSY nicht: $(head -1 "$TMP/c.err")"
+      fi
     fi
   fi
+  if [ -n "$busy" ]; then kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null; busy=""; fi
 else
   bad "Hilfsprogramm fuer den ETXTBSY-Fall uebersetzt nicht"
 fi
