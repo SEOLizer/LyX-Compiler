@@ -6132,23 +6132,65 @@ fn injectSystemConstants(sema: Sema, cfg: CompilerConfig): void {
   sema.InjectConBool("TARGET_IS_XTENSA"c, arch == 5);
 }
 
-// Look up an environment variable by scanning envp, which on Linux x86_64
-// starts right after argv's null terminator: argv + (argc+1)*8.
+// #2264: Die Umgebung hat ZWEI Speicherbilder. Unter SysV (Linux, lyxos)
+// stehen hinter argv ein Nullzeiger und dann envp; auf Windows gibt es das
+// nicht — die Laufzeit legt einen zusammenhaengenden Block ab
+// ("NAME=WERT\0NAME=WERT\0\0"), den GetEnvBlock() liefert.
+//
+// Bis 1.2.20F rechnete diese Funktion ausschliesslich das SysV-Bild aus.
+// Auf win64 traf `argv + (argc+1)*8` damit genau in den Zeichenkettenbereich
+// des argv-Blocks (wxb_emitArgvSetup legt Vektor, Sentinel und Zeichenketten
+// hintereinander), las die ersten acht Bytes von argv[0] als ZEIGER und
+// verglich Bytes an dieser Adresse: Zugriffsverletzung, noch vor dem Banner.
+// lyxc.exe konnte deshalb nichts uebersetzen, waehrend --version und --help
+// liefen (die kommen vor dieser Stelle zurueck).
+//
+// Dieselbe Reihenfolge wie EnvLookupRaw in std/env.lyx (#1677) — die beiden
+// muessen uebereinstimmen: zuerst der Windows-Block, sonst SysV.
 pub fn lyx_getEnvVar(argc: int64, argv: pchar, name: pchar): pchar {
-  var envp:    int64 := argv as int64 + (argc + 1) * 8;
+  if (name as int64) == 0 { return 0 as pchar; }
   var nameLen: int64 := StrLen(name);
+
+  // Windows: zusammenhaengender Block, durch ein leeres Feld beendet.
+  var block: int64 := GetEnvBlock();
+  if block != 0 {
+    var p: int64 := block;
+    while peek8(p) != 0 {
+      var j: int64 := 0;
+      var passt: int64 := 1;
+      while j < nameLen {
+        if peek8(p + j) != peek8(name as int64 + j) {
+          passt := 0;
+          j := nameLen;
+        }
+        j += 1;
+      }
+      if passt == 1 && peek8(p + nameLen) == 61 {
+        return (p + nameLen + 1) as pchar;
+      }
+      while peek8(p) != 0 { p += 1; }   // bis zum Ende des Eintrags
+      p += 1;                            // hinter dessen NUL
+    }
+    return 0 as pchar;
+  }
+
+  // SysV: Zeigervektor hinter argv. Die Schranke 8192 steht auch in
+  // EnvLookupRaw: ohne sie laeuft ein fehlendes Abschlusszeichen durch
+  // fremden Speicher, statt zu melden.
+  if (argv as int64) == 0 { return 0 as pchar; }
+  var envp: int64 := argv as int64 + (argc + 1) * 8;
   var i: int64 := 0;
-  while true {
+  while i < 8192 {
     var envPtr: int64 := peek64(envp + i * 8);
     if envPtr == 0 { return 0 as pchar; }
-    var j: int64 := 0;
+    var j2: int64 := 0;
     var isMatch: int64 := 1;
-    while j < nameLen {
-      if peek8(envPtr + j) != peek8(name as int64 + j) {
+    while j2 < nameLen {
+      if peek8(envPtr + j2) != peek8(name as int64 + j2) {
         isMatch := 0;
-        j := nameLen;
+        j2 := nameLen;
       }
-      j += 1;
+      j2 += 1;
     }
     if isMatch == 1 && peek8(envPtr + nameLen) == 61 {
       return (envPtr + nameLen + 1) as pchar;
