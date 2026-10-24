@@ -705,6 +705,345 @@ fn main(): int64 {
   CheckI("argRow0"c, peek64(argo), 0);
   CheckI("argRow1"c, peek64(argo + 8), 2);
 
+  // ── Gewichtsabfall (L2) ───────────────────────────────────────────────────
+  //
+  // Ein-Parameter-Netz, damit der Schritt von Hand nachrechenbar ist:
+  // w = 2, x = 1, y = 2 -> a = 2, Gradient 0. Mit lambda = 0.5 und lr = 0.1
+  // bleibt genau der L2-Anteil: w = 2 - 0.1 * 0.5 * 2 = 1.9.
+
+  var l2n: int64 := NnNew(1, 1);
+  var okl: bool := NnAddDense(l2n, 1, NN_ACT_LINEAR);
+  okl := NnSetWeight(l2n, 0, 0, 0, 2.0);
+  okl := NnSetBias(l2n, 0, 0, 0.5);
+  okl := NnSetLoss(l2n, NN_LOSS_MSE);
+  NnSetLearningRate(l2n, 0.1);
+  CheckB("l2Negative"c, NnSetWeightDecay(l2n, NEG(0.1)), false);
+  CheckB("l2Set"c, NnSetWeightDecay(l2n, 0.5), true);
+  Check("l2Get"c, NnWeightDecay(l2n), 0.5, TOL());
+  var x1b: int64 := alloc(8);
+  SV(x1b, 0, 1.0);
+  var y1b: int64 := alloc(8);
+  SV(y1b, 0, 2.5);                 // a = 2*1 + 0.5 = 2.5 -> Gradient 0
+  NnZeroGrad(l2n);
+  lv := NnAccumulate(l2n, x1b, y1b);
+  Check("l2NoGrad"c, NnGradWeight(l2n, 0, 0, 0), 0.0, TOL());
+  CheckB("l2Step"c, NnStep(l2n, 1), true);
+  Check("l2Weight"c, NnGetWeight(l2n, 0, 0, 0), 1.9, 0.000000001);
+  // Der Bias wird NICHT mitgeschrumpft -- das ist die halbe Aussage der Regel
+  Check("l2BiasUntouched"c, NnGetBias(l2n, 0, 0), 0.5, 0.000000001);
+  // Gegenseite: ohne Gewichtsabfall bewegt sich bei Gradient 0 nichts
+  okl := NnSetWeightDecay(l2n, 0.0);
+  okl := NnSetWeight(l2n, 0, 0, 0, 2.0);
+  NnZeroGrad(l2n);
+  lv := NnAccumulate(l2n, x1b, y1b);
+  okl := NnStep(l2n, 1);
+  Check("noL2NoMove"c, NnGetWeight(l2n, 0, 0, 0), 2.0, 0.000000001);
+
+  // ── Gradienten begrenzen ──────────────────────────────────────────────────
+  //
+  // y = -10 bei a = 0 gibt dW = 10 und db = 10, Norm sqrt(200) = 14.1421...
+  // Bei Schwelle 1 wird mit 1/14.1421 gekuerzt, der Schritt ist also
+  // -lr * 10/14.1421 = -0.0707107 (lr = 0.1).
+
+  var cl: int64 := NnNew(1, 1);
+  var okc: bool := NnAddDense(cl, 1, NN_ACT_LINEAR);
+  okc := NnSetWeight(cl, 0, 0, 0, 0.0);
+  okc := NnSetBias(cl, 0, 0, 0.0);
+  okc := NnSetLoss(cl, NN_LOSS_MSE);
+  NnSetLearningRate(cl, 0.1);
+  CheckB("clipNegative"c, NnSetGradClip(cl, NEG(1.0)), false);
+  CheckB("clipSet"c, NnSetGradClip(cl, 1.0), true);
+  Check("clipGet"c, NnGradClip(cl), 1.0, TOL());
+  var yBig: int64 := alloc(8);
+  SV(yBig, 0, NEG(10.0));
+  NnZeroGrad(cl);
+  lv := NnAccumulate(cl, x1b, yBig);
+  Check("clipRawGrad"c, NnGradWeight(cl, 0, 0, 0), 10.0, 0.000000001);
+  okc := NnStep(cl, 1);
+  var erwartet: f64 := NEG(0.1) * 10.0 / SqrtF64(200.0);
+  Check("clipStep"c, NnGetWeight(cl, 0, 0, 0), erwartet, 0.000000001);
+  // Gegenseite: liegt die Norm unter der Schwelle, wird NICHT gekuerzt
+  okc := NnSetWeight(cl, 0, 0, 0, 0.0);
+  okc := NnSetBias(cl, 0, 0, 0.0);
+  okc := NnSetGradClip(cl, 100.0);
+  NnZeroGrad(cl);
+  lv := NnAccumulate(cl, x1b, yBig);
+  okc := NnStep(cl, 1);
+  Check("noClipStep"c, NnGetWeight(cl, 0, 0, 0), NEG(1.0), 0.000000001);
+  // und ohne Begrenzung derselbe Wert
+  okc := NnSetWeight(cl, 0, 0, 0, 0.0);
+  okc := NnSetBias(cl, 0, 0, 0.0);
+  okc := NnSetGradClip(cl, 0.0);
+  NnZeroGrad(cl);
+  lv := NnAccumulate(cl, x1b, yBig);
+  okc := NnStep(cl, 1);
+  Check("clipOffStep"c, NnGetWeight(cl, 0, 0, 0), NEG(1.0), 0.000000001);
+  NnFree(cl);
+  NnFree(l2n);
+
+  // ── MAE und Huber ─────────────────────────────────────────────────────────
+  //
+  // Werte von Hand: a = (0.15, 0.5) waere bequem, hier rechnet das Netz aber
+  // selbst. Darum wird gegen die Definition geprueft: MAE ist die Summe der
+  // Betraege, Huber bis zum Knick gleich 0.5*d^2 und darueber
+  // delta*(|d| - 0.5*delta).
+
+  var mh: int64 := NnNew(2, 1);
+  var okm: bool := NnAddDense(mh, 2, NN_ACT_LINEAR);
+  SetFixedWeights(mh);
+  CheckB("maeSet"c, NnSetLoss(mh, NN_LOSS_MAE), true);
+  // Ausgaben sind -0.30 und 0.05 (wie oben nachgerechnet), y = (0, 1)
+  var o5: int64 := NnForward(mh, x);
+  Check("mhOut0"c, NnOutputAt(mh, 0), NEG(0.3), 0.000000001);
+  // MAE = |-0.3 - 0| + |0.05 - 1| = 0.3 + 0.95 = 1.25
+  Check("maeVal"c, NnSampleLoss(mh, x, y), 1.25, 0.000000001);
+  // Gradient: Vorzeichen, also dW[0][0] = 1 * x0 = ... bei d0 < 0: -1
+  NnZeroGrad(mh);
+  lv := NnAccumulate(mh, x, y);
+  Check("maeDb0"c, NnGradBias(mh, 0, 0), NEG(1.0), 0.000000001);
+  Check("maeDb1"c, NnGradBias(mh, 0, 1), NEG(1.0), 0.000000001);
+  Check("maeDW01"c, NnGradWeight(mh, 0, 0, 1), NEG(2.0), 0.000000001);
+  GradCheckLayer("gradMaeW"c, mh, 0, x, y, 0.000001);
+  GradCheckBias("gradMaeB"c, mh, 0, x, y, 0.000001);
+
+  CheckB("huberBadDelta"c, NnSetHuberDelta(mh, 0.0), false);
+  CheckB("huberSet"c, NnSetLoss(mh, NN_LOSS_HUBER), true);
+  CheckB("huberDelta"c, NnSetHuberDelta(mh, 1.0), true);
+  Check("huberDeltaGet"c, NnHuberDelta(mh), 1.0, TOL());
+  // d0 = -0.3 (innerhalb): 0.5*0.09 = 0.045
+  // d1 = -0.95 (innerhalb): 0.5*0.9025 = 0.45125  -> 0.49625, wie MSE
+  Check("huberInside"c, NnSampleLoss(mh, x, y), 0.49625, 0.000000001);
+  // Knick nach unten: delta = 0.5 -> d1 = -0.95 ist aussen
+  // 0.5*0.09 = 0.045 ; 0.5*(0.95 - 0.25) = 0.35  -> 0.395
+  CheckB("huberSmall"c, NnSetHuberDelta(mh, 0.5), true);
+  Check("huberOutside"c, NnSampleLoss(mh, x, y), 0.395, 0.000000001);
+  // Gradient wird bei |d| > delta gekappt: db1 = -0.5 statt -0.95
+  NnZeroGrad(mh);
+  lv := NnAccumulate(mh, x, y);
+  Check("huberDb0"c, NnGradBias(mh, 0, 0), NEG(0.3), 0.000000001);
+  Check("huberDb1"c, NnGradBias(mh, 0, 1), NEG(0.5), 0.000000001);
+  GradCheckLayer("gradHuberW"c, mh, 0, x, y, 0.000001);
+  GradCheckBias("gradHuberB"c, mh, 0, x, y, 0.000001);
+  NnFree(mh);
+
+  // Softmax passt zu keinem der beiden -- die Ableitung waere eine Matrix
+  var sm: int64 := NnNew(2, 1);
+  var oks: bool := NnAddDense(sm, 2, NN_ACT_SOFTMAX);
+  CheckB("maeRejectsSoftmax"c, NnSetLoss(sm, NN_LOSS_MAE), false);
+  CheckB("huberRejectsSoftmax"c, NnSetLoss(sm, NN_LOSS_HUBER), false);
+  CheckB("lossOutOfRange"c, NnSetLoss(sm, 5), false);
+  NnFree(sm);
+
+  // ── Lernraten-Zeitplan ────────────────────────────────────────────────────
+
+  var sch: int64 := NnNew(1, 1);
+  var oksc: bool := NnAddDense(sch, 1, NN_ACT_LINEAR);
+  NnSetLearningRate(sch, 1.0);
+  Check("baseLr"c, NnBaseLearningRate(sch), 1.0, TOL());
+  CheckI("schedDefault"c, NnLrSchedule(sch), NN_LR_CONST);
+  Check("constLr"c, NnLrForEpoch(sch, 7), 1.0, TOL());
+  // Stufen: alle zwei Epochen halbieren
+  CheckB("stepSched"c, NnSetLrSchedule(sch, NN_LR_STEP, 0.5, 2.0), true);
+  Check("step0"c, NnLrForEpoch(sch, 0), 1.0, TOL());
+  Check("step1"c, NnLrForEpoch(sch, 1), 1.0, TOL());
+  Check("step2"c, NnLrForEpoch(sch, 2), 0.5, TOL());
+  Check("step5"c, NnLrForEpoch(sch, 5), 0.25, TOL());
+  CheckB("stepBadP2"c, NnSetLrSchedule(sch, NN_LR_STEP, 0.5, 0.0), false);
+  // exponentiell
+  CheckB("expSched"c, NnSetLrSchedule(sch, NN_LR_EXP, 0.1, 0.0), true);
+  Check("exp0"c, NnLrForEpoch(sch, 0), 1.0, TOL());
+  Check("exp2"c, NnLrForEpoch(sch, 2), 0.01, 0.000000001);
+  // Kosinus von 1.0 auf 0.2 ueber 10 Epochen
+  CheckB("cosSched"c, NnSetLrSchedule(sch, NN_LR_COSINE, 0.2, 10.0), true);
+  Check("cos0"c, NnLrForEpoch(sch, 0), 1.0, 0.000000001);
+  Check("cos5"c, NnLrForEpoch(sch, 5), 0.6, 0.000000001);
+  Check("cos10"c, NnLrForEpoch(sch, 10), 0.2, 0.000000001);
+  // hinter dem Plan bleibt es bei der Endlernrate, statt zurueckzuschwingen
+  Check("cos20"c, NnLrForEpoch(sch, 20), 0.2, 0.000000001);
+  CheckB("schedBadKind"c, NnSetLrSchedule(sch, 9, 0.5, 2.0), false);
+  // Epoche setzen macht die Lernrate wirksam, laesst die Grundrate stehen
+  CheckB("setEpoch"c, NnSetEpoch(sch, 10), true);
+  CheckI("epochGet"c, NnEpoch(sch), 10);
+  Check("lrApplied"c, NnLearningRate(sch), 0.2, 0.000000001);
+  Check("baseKept"c, NnBaseLearningRate(sch), 1.0, TOL());
+  CheckB("setEpochNegative"c, NnSetEpoch(sch, -1), false);
+  // NnSetEffectiveLearningRate verschiebt die Grundrate NICHT
+  NnSetEffectiveLearningRate(sch, 0.03);
+  Check("effOnly"c, NnLearningRate(sch), 0.03, TOL());
+  Check("baseStill"c, NnBaseLearningRate(sch), 1.0, TOL());
+  NnFree(sch);
+
+  // ── Dropout ───────────────────────────────────────────────────────────────
+
+  var dn: int64 := NnNew(4, 2);
+  var okd: bool := NnAddDense(dn, 20, NN_ACT_RELU);
+  okd := NnAddDense(dn, 1, NN_ACT_LINEAR);
+  NnSeed(dn, 20261024);
+  okd := NnInitHe(dn);
+  okd := NnSetLoss(dn, NN_LOSS_MSE);
+  Check("dropDefault"c, NnDropout(dn, 0), 0.0, TOL());
+  CheckB("dropLastRejected"c, NnSetDropout(dn, 1, 0.5), false);
+  CheckB("dropRateOne"c, NnSetDropout(dn, 0, 1.0), false);
+  CheckB("dropRateNeg"c, NnSetDropout(dn, 0, NEG(0.1)), false);
+  CheckB("dropOob"c, NnSetDropout(dn, 7, 0.5), false);
+  CheckB("dropSet"c, NnSetDropout(dn, 0, 0.5), true);
+  Check("dropGet"c, NnDropout(dn, 0), 0.5, TOL());
+  CheckB("trainDefault"c, NnIsTraining(dn), true);
+
+  var x4: int64 := alloc(4 * 8);
+  SV(x4, 0, 0.5);
+  SV(x4, 1, NEG(0.25));
+  SV(x4, 2, 1.0);
+  SV(x4, 3, 0.75);
+
+  // Im Inferenzmodus ist die Vorhersage WIEDERHOLBAR -- ohne den Modus waere
+  // sie zufaellig, und genau das ist der stille Fehler, den der Schalter
+  // verhindert
+  NnSetTraining(dn, false);
+  CheckB("trainOff"c, NnIsTraining(dn), false);
+  var p1a: int64 := NnForward(dn, x4);
+  var v1: f64 := NnOutputAt(dn, 0);
+  var p1b: int64 := NnForward(dn, x4);
+  Check("inferRepeatable"c, NnOutputAt(dn, 0), v1, 0.0);
+  var p1c: int64 := NnForward(dn, x4);
+  Check("inferRepeatable2"c, NnOutputAt(dn, 0), v1, 0.0);
+
+  // Im Trainingsmodus faellt ein Teil aus: ueber mehrere Laeufe muessen
+  // verschiedene Werte herauskommen
+  NnSetTraining(dn, true);
+  var versch: int64 := 0;
+  var summe: f64 := 0.0;
+  var laeufe: int64 := 4000;
+  i := 0;
+  var vorher: f64 := 0.0;
+  while (i < laeufe) {
+    var pt: int64 := NnForward(dn, x4);
+    var vt: f64 := NnOutputAt(dn, 0);
+    summe := summe + vt;
+    if (i > 0) {
+      if (AbsF64(vt - vorher) > 0.0000001) { versch := versch + 1; }
+    }
+    vorher := vt;
+    i := i + 1;
+  }
+  CheckB("trainVaries"c, versch > 3000, true);
+  // Umgekehrtes Dropout haelt den ERWARTUNGSWERT: der Mittelwert ueber viele
+  // Laeufe liegt beim Wert ohne Dropout. Die Schranke muss ENG sein -- mit
+  // einer weiten waere der Test auch von einer fehlenden 1/(1-p)-Skalierung
+  // erfuellt, und die halbiert den Mittelwert. Geprueft wird darum gegen
+  // 10 % des Werts, und zusaetzlich, dass die HALBIERUNG draussen liegt.
+  var mittel: f64 := summe / (laeufe as f64);
+  CheckB("dropoutMean"c, AbsF64(mittel - v1) < 0.1 * AbsF64(v1), true);
+  var halb: f64 := v1 * 0.5;
+  CheckB("dropoutMeanNotHalved"c,
+         AbsF64(mittel - halb) > 0.2 * AbsF64(v1), true);
+
+  // Maske: im Trainingsmodus sind Ausgaben der verdeckten Schicht genau null
+  var nullen: int64 := 0;
+  var pz: int64 := NnForward(dn, x4);
+  // ueber die Gewichtsmatrix nicht erreichbar -- gemessen wird am Verlauf:
+  // ein Netz mit Anteil 0.99 muss fast immer null liefern
+  CheckB("drop99"c, NnSetDropout(dn, 0, 0.99), true);
+  var fastNull: int64 := 0;
+  i := 0;
+  while (i < 50) {
+    var pn: int64 := NnForward(dn, x4);
+    // die Ausgabeschicht ist linear ohne Bias-Init -> praktisch null
+    if (AbsF64(NnOutputAt(dn, 0)) < AbsF64(v1)) { fastNull := fastNull + 1; }
+    i := i + 1;
+  }
+  CheckB("drop99Mostly"c, fastNull > 25, true);
+
+  // Gradientenpruefung mit gesetztem Anteil, aber abgeschaltetem Modus: die
+  // Maske ist dann durchgaengig 1, der Rueckwaertslauf muss genau dem Netz
+  // ohne Dropout entsprechen
+  okd := NnSetDropout(dn, 0, 0.5);
+  NnSetTraining(dn, false);
+  var yd: int64 := alloc(8);
+  SV(yd, 0, 0.3);
+  NnZeroGrad(dn);
+  lv := NnAccumulate(dn, x4, yd);
+  GradCheckLayer("gradDropOffW0"c, dn, 0, x4, yd, 0.000001);
+  GradCheckLayer("gradDropOffW1"c, dn, 1, x4, yd, 0.000001);
+  NnFree(dn);
+
+  // ── Training mit Abbruchkriterium ────────────────────────────────────────
+  //
+  // Gelernt wird eine Gerade; die Pruefdaten stammen aus derselben Geraden.
+  // Geprueft wird die WIRKUNG: der Lauf bricht vor maxEpochs ab UND die
+  // zurueckgespielten Gewichte sind die des besten Standes, nicht die des
+  // letzten.
+
+  var nTr: int64 := 6;
+  var XT: int64 := alloc(nTr * 8);
+  var YT: int64 := alloc(nTr * 8);
+  i := 0;
+  while (i < nTr) {
+    var xv2: f64 := (i as f64) / 2.0;
+    SV(XT, i, xv2);
+    SV(YT, i, 3.0 * xv2 - 1.0);
+    i := i + 1;
+  }
+  var XV: int64 := alloc(2 * 8);
+  var YV: int64 := alloc(2 * 8);
+  SV(XV, 0, 4.0);  SV(YV, 0, 11.0);
+  SV(XV, 1, 5.0);  SV(YV, 1, 14.0);
+
+  var es: int64 := NnNew(1, 1);
+  var oke: bool := NnAddDense(es, 1, NN_ACT_LINEAR);
+  oke := NnInitUniform(es, 0.1);
+  oke := NnSetLoss(es, NN_LOSS_MSE);
+  NnSetLearningRate(es, 0.02);
+  CheckB("esBadPatience"c,
+         NnTrainEarlyStop(es, XT, YT, nTr, XV, YV, 2, 2, 100, 0) < 0.0, true);
+  CheckB("esBadVal"c,
+         NnTrainEarlyStop(es, XT, YT, nTr, XV, YV, 0, 2, 100, 5) < 0.0, true);
+  // maxEpochs weit genug, dass der Abbruch WIRKLICH vom Kriterium kommt:
+  // sobald die Gerade sitzt, wird der Pruefverlust nicht mehr besser
+  // maxEpochs weit genug, dass der Abbruch WIRKLICH vom Kriterium kommt:
+  // sobald die Gerade sitzt, wird der Pruefverlust nicht mehr besser
+  var bestLoss: f64 := NnTrainEarlyStop(es, XT, YT, nTr, XV, YV, 2,
+                                        2, 3000, 3);
+  CheckB("esReturnsLoss"c, bestLoss >= 0.0, true);
+  NnSetTraining(es, false);
+  Check("esRestoredBest"c, NnEvaluate(es, XV, YV, 2), bestLoss, 0.000000001);
+  Check("esSlope"c, NnGetWeight(es, 0, 0, 0), 3.0, 0.05);
+  CheckB("esStoppedEarly"c, NnEpoch(es) < 2999, true);
+  NnFree(es);
+
+  // Zweite Seite: mit einer Lernrate, bei der das Training nach einem
+  // Minimum WIEDER SCHLECHTER wird. Nur dann unterscheidet sich der beste
+  // vom letzten Stand -- ein Test, der bloss gegen den eigenen Rueckgabewert
+  // prueft, waere auch ohne Rueckspielen gruen (bei monotoner Verbesserung
+  // sind best und letzt derselbe Stand).
+  var es2: int64 := NnNew(1, 1);
+  var oke2: bool := NnAddDense(es2, 1, NN_ACT_LINEAR);
+  oke2 := NnSetWeight(es2, 0, 0, 0, 0.0);
+  oke2 := NnSetBias(es2, 0, 0, 0.0);
+  oke2 := NnSetLoss(es2, NN_LOSS_MSE);
+  NnSetLearningRate(es2, 0.75);        // zu gross: der Verlauf laeuft weg
+  var best2: f64 := NnTrainEarlyStop(es2, XT, YT, nTr, XV, YV, 2, 6, 60, 2);
+  CheckB("es2Returns"c, best2 >= 0.0, true);
+  NnSetTraining(es2, false);
+  Check("es2Restored"c, NnEvaluate(es2, XV, YV, 2), best2, 0.000000001);
+  var gelaufen: int64 := NnEpoch(es2);
+  CheckB("es2StoppedEarly"c, gelaufen < 59, true);
+  NnFree(es2);
+
+  // Dasselbe Netz, gleich viele Epochen, aber OHNE Abbruch und ohne
+  // Rueckspielen: sein Pruefverlust muss deutlich schlechter sein
+  var es3: int64 := NnNew(1, 1);
+  var oke3: bool := NnAddDense(es3, 1, NN_ACT_LINEAR);
+  oke3 := NnSetWeight(es3, 0, 0, 0, 0.0);
+  oke3 := NnSetBias(es3, 0, 0, 0.0);
+  oke3 := NnSetLoss(es3, NN_LOSS_MSE);
+  NnSetLearningRate(es3, 0.75);
+  var l7: f64 := NnTrain(es3, XT, YT, nTr, 6, gelaufen + 1);
+  NnSetTraining(es3, false);
+  var ohneStop: f64 := NnEvaluate(es3, XV, YV, 2);
+  CheckB("es3WorseThanBest"c, ohneStop > best2 * 2.0 + 0.001, true);
+  NnFree(es3);
+
   PrintStr("checks="c);
   PrintInt(_checks);
   PrintStr(" fails="c);

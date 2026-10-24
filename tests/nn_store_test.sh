@@ -177,12 +177,12 @@ get() { printf '%s\n' "$OUT" | grep "^$1 " | head -1 | cut -d' ' -f2-; }
   || no "zwei Eintraege nach zwei Namen" "COUNT='$(get COUNT)'"
 [ "$(get EXISTS)" = "1 0" ] && ok "NnStoreExists trennt vorhanden und fehlend" \
   || no "NnStoreExists trennt vorhanden und fehlend" "'$(get EXISTS)'"
-# 3 Eingaenge, 2 Ausgaenge, 2 Schichten, 3*5+5 + 5*2+2 = 32 Parameter,
-# Bytefolge: (5 + 4 + 11 + 32 + 1 + 64 + 1) * 8 = 942 ... nachgerechnet:
-# Felder = 5 Kopf + 2*2 Schichten + 11 Schwanz + 32 Parameter
-#          + 1 Zaehler + 64 Optimiererwerte + 1 Pruefsumme = 118 -> 944 Byte
-[ "$(get META)" = "3 2 2 32 944 1 0" ] && ok "Nebenspalten beschreiben das Netz" \
-  || no "Nebenspalten beschreiben das Netz" "'$(get META)' erwartet '3 2 2 32 944 1 0'"
+# 3 Eingaenge, 2 Ausgaenge, 2 Schichten, 3*5+5 + 5*2+2 = 32 Parameter.
+# Bytefolge (Format 2): Felder = 5 Kopf + 3*2 Schichten + 19 Schwanz
+#   + 32 Parameter + 1 Zaehler + 64 Optimiererwerte + 1 Pruefsumme
+#   = 128 -> 1024 Byte
+[ "$(get META)" = "3 2 2 32 1024 1 0" ] && ok "Nebenspalten beschreiben das Netz" \
+  || no "Nebenspalten beschreiben das Netz" "'$(get META)' erwartet '3 2 2 32 1024 1 0'"
 [ "$(get METAMISSING)" = "-1 3" ] && ok "fehlender Name: -1 und NNSTORE_E_NOTFOUND" \
   || no "fehlender Name: -1 und NNSTORE_E_NOTFOUND" "'$(get METAMISSING)'"
 [ "$(get NAMES)" = "modell-a modell-b 0" ] && ok "NnStoreNameAt zaehlt den Bestand auf" \
@@ -207,7 +207,7 @@ get() { printf '%s\n' "$OUT" | grep "^$1 " | head -1 | cut -d' ' -f2-; }
 
 if command -v sqlite3 >/dev/null 2>&1; then
   COLS="$(sqlite3 "$DBF" "SELECT name, input_dim, output_dim, layers, params, length(state) FROM nn_models ORDER BY name" 2>/dev/null)"
-  if [ "$COLS" = "modell-a|3|2|2|32|424" ]; then
+  if [ "$COLS" = "modell-a|3|2|2|32|504" ]; then
     ok "Client liest Zeile und BLOB-Laenge des ersetzten Netzes"
   else
     no "Client liest Zeile und BLOB-Laenge des ersetzten Netzes" "'$COLS'"
@@ -301,7 +301,7 @@ EOF
 
 if "$LYXC" --std-path="$ROOT" "$TMP/c.lyx" -o "$TMP/c" >"$TMP/c.log" 2>&1; then
   FLIP="$(ulimit -c 0; timeout 60 "$TMP/c" 2>&1 | grep '^FLIPPED ')"
-  if [ "$FLIP" = "FLIPPED 1 424" ]; then
+  if [ "$FLIP" = "FLIPPED 1 504" ]; then
     ok "ein Byte gekippt, Laenge unveraendert"
   else
     no "ein Byte gekippt, Laenge unveraendert" "'$FLIP'"

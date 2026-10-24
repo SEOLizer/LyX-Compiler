@@ -28,15 +28,21 @@ import std.fs;
 //   Offset  Groesse  Inhalt
 //   0       8        Kennung "LYXNN1\0\0"
 //   8       8        Formatfassung (1)
-//   16      8        Merkmalsbits: Bit 0 = Optimiererzustand enthalten
+//   16      8        Merkmalsbits: Bit 0 = Optimiererzustand enthalten,
+//                    Bit 1 = Netz stand im Trainingsmodus
 //   24      8        Eingangsbreite
 //   32      8        Zahl der Schichten
-//   40      16*L     je Schicht: Ausgabebreite, Aktivierung
+//   40      24*L     je Schicht: Ausgabebreite, Aktivierung, Dropout-Anteil
 //   ...     8        Verlustart
 //   ...     8        Optimierer
 //   ...     8*6      lr, momentum, beta1, beta2, adamEps, leakySlope (f64)
 //   ...     8        Schrittzaehler (0, wenn Bit 0 nicht gesetzt ist)
 //   ...     8        Zufallszustand
+//   ...     8*3      weightDecay, gradClip, huberDelta (f64)
+//   ...     8        Grundlernrate (f64)
+//   ...     8        Art des Lernraten-Zeitplans
+//   ...     8*2      Zeitplanparameter p1, p2 (f64)
+//   ...     8        Epochennummer
 //   ...     8        Zahl der Parameter
 //   ...     8*P      Parameter (Reihenfolge von NnSaveParams)
 //   ...     8        Zahl der Optimiererwerte (nur bei Bit 0)
@@ -72,10 +78,11 @@ fn _s(p: int64, i: int64, v: f64): void {
 
 // ── Kennzahlen ───────────────────────────────────────────────────────────────
 
-pub con NNIO_FORMAT: int64 := 1;
+pub con NNIO_FORMAT: int64 := 2;
 
 // Merkmalsbits
 pub con NNIO_WITH_OPT: int64 := 1;
+pub con NNIO_TRAINING: int64 := 2;   // Netz stand im Trainingsmodus
 
 // Fehlerschluessel von NnIoLoadError
 pub con NNIO_OK: int64         := 0;
@@ -131,13 +138,14 @@ pub fn NnIoChecksum(buf: int64, len: int64): int64 {
 // ── Groesse ──────────────────────────────────────────────────────────────────
 
 con HDR_FIXED_SLOTS: int64 := 5;    // Kennung, Fassung, Merkmale, inDim, nLayer
-con TAIL_SLOTS: int64 := 11;        // loss, opt, 6 f64, step, rng, paramCount
+con TAIL_SLOTS: int64 := 19;        // loss, opt, 6 f64, step, rng, paramCount,
+                                    // l2, clip, huber, lr0, lrKind, p1, p2, epoch
 
 // Zahl der Bytes, die NnIoSaveBuffer schreibt. 0 heisst: Netz unbrauchbar.
 pub fn NnIoBufferSize(net: int64, withOpt: bool): int64 {
   var nL: int64 := NnLayerCount(net);
   if (nL < 1) { return 0; }
-  var slots: int64 := HDR_FIXED_SLOTS + nL * 2 + TAIL_SLOTS;
+  var slots: int64 := HDR_FIXED_SLOTS + nL * 3 + TAIL_SLOTS;
   slots := slots + NnParamCount(net);
   if (withOpt) {
     slots := slots + 1 + NnOptStateCount(net);
@@ -174,6 +182,10 @@ pub fn NnIoSaveBuffer(net: int64, buf: int64, cap: int64, withOpt: bool): int64 
   var nL: int64 := NnLayerCount(net);
   var flags: int64 := 0;
   if (withOpt) { flags := NNIO_WITH_OPT; }
+  // Der Modus gehoert in die Datei: ein im Inferenzmodus ausgeliefertes Netz,
+  // das als trainierend zurueckkaeme, wuerde mit Dropout vorhersagen und bei
+  // derselben Eingabe zweimal etwas anderes antworten -- lautlos.
+  if (NnIsTraining(net)) { flags := flags | NNIO_TRAINING; }
 
   _putI(buf, 0, _magic());
   _putI(buf, 1, NNIO_FORMAT);
@@ -185,7 +197,8 @@ pub fn NnIoSaveBuffer(net: int64, buf: int64, cap: int64, withOpt: bool): int64 
   while (k < nL) {
     _putI(buf, at, NnLayerOutDim(net, k));
     _putI(buf, at + 1, NnLayerAct(net, k));
-    at := at + 2;
+    _s(buf, at + 2, NnDropout(net, k));
+    at := at + 3;
     k := k + 1;
   }
   _putI(buf, at, NnLoss(net));
@@ -206,6 +219,14 @@ pub fn NnIoSaveBuffer(net: int64, buf: int64, cap: int64, withOpt: bool): int64 
   _putI(buf, at + 9, NnRngState(net));
   var pc: int64 := NnParamCount(net);
   _putI(buf, at + 10, pc);
+  _s(buf, at + 11, NnWeightDecay(net));
+  _s(buf, at + 12, NnGradClip(net));
+  _s(buf, at + 13, NnHuberDelta(net));
+  _s(buf, at + 14, NnBaseLearningRate(net));
+  _putI(buf, at + 15, NnLrSchedule(net));
+  _s(buf, at + 16, NnLrParam1(net));
+  _s(buf, at + 17, NnLrParam2(net));
+  _putI(buf, at + 18, NnEpoch(net));
   at := at + TAIL_SLOTS;
   if (NnSaveParams(net, buf + at * 8) != pc) { return _fail(NNIO_E_SHAPE); }
   at := at + pc;
@@ -239,7 +260,7 @@ pub fn NnIoVerify(buf: int64, len: int64): int64 {
   if (inDim < 1) { return NNIO_E_SHAPE; }
   if (nL < 1) { return NNIO_E_SHAPE; }
   if (nL > 4096) { return NNIO_E_SHAPE; }
-  var slots: int64 := HDR_FIXED_SLOTS + nL * 2 + TAIL_SLOTS;
+  var slots: int64 := HDR_FIXED_SLOTS + nL * 3 + TAIL_SLOTS;
   if (len < slots * 8) { return NNIO_E_TRUNC; }
   // Architektur nachrechnen und mit der mitgeschriebenen Parameterzahl
   // vergleichen: so faellt eine verdrehte Datei auf, bevor etwas gebaut wird
@@ -253,9 +274,17 @@ pub fn NnIoVerify(buf: int64, len: int64): int64 {
     if (outDim < 1) { return NNIO_E_SHAPE; }
     if (act < NN_ACT_LINEAR) { return NNIO_E_SHAPE; }
     if (act > NN_ACT_SOFTMAX) { return NNIO_E_SHAPE; }
+    var drop: f64 := _g(buf, at + 2);
+    if (drop < _zero()) { return NNIO_E_SHAPE; }
+    if (drop >= 1.0) { return NNIO_E_SHAPE; }
+    // Dropout auf der letzten Schicht gibt es nicht (NnSetDropout lehnt es
+    // ab); eine Bytefolge, die es behauptet, ist unbrauchbar
+    if (k == nL - 1) {
+      if (drop > _zero()) { return NNIO_E_SHAPE; }
+    }
     calc := calc + prev * outDim + outDim;
     prev := outDim;
-    at := at + 2;
+    at := at + 3;
     k := k + 1;
   }
   var pc: int64 := _getI(buf, at + 10);
@@ -288,7 +317,7 @@ pub fn NnIoHeaderLayerCount(buf: int64, len: int64): int64 {
 pub fn NnIoHeaderOutputDim(buf: int64, len: int64): int64 {
   if (NnIoVerify(buf, len) != NNIO_OK) { return 0; }
   var nL: int64 := _getI(buf, 4);
-  return _getI(buf, HDR_FIXED_SLOTS + (nL - 1) * 2);
+  return _getI(buf, HDR_FIXED_SLOTS + (nL - 1) * 3);
 }
 
 pub fn NnIoHeaderHasOptState(buf: int64, len: int64): bool {
@@ -300,7 +329,7 @@ pub fn NnIoHeaderHasOptState(buf: int64, len: int64): bool {
 pub fn NnIoHeaderParamCount(buf: int64, len: int64): int64 {
   if (NnIoVerify(buf, len) != NNIO_OK) { return 0; }
   var nL: int64 := _getI(buf, 4);
-  return _getI(buf, HDR_FIXED_SLOTS + nL * 2 + 10);
+  return _getI(buf, HDR_FIXED_SLOTS + nL * 3 + 10);
 }
 
 // ── Lesen ────────────────────────────────────────────────────────────────────
@@ -325,7 +354,22 @@ pub fn NnIoLoadBuffer(buf: int64, len: int64): int64 {
       NnFree(net);
       return _fail(NNIO_E_BUILD);
     }
-    at := at + 2;
+    at := at + 3;
+    k := k + 1;
+  }
+  // Dropout erst, wenn alle Schichten stehen: NnSetDropout lehnt die letzte
+  // Schicht ab, und welche das ist, weiss es erst dann
+  k := 0;
+  var dAt: int64 := HDR_FIXED_SLOTS;
+  while (k < nL) {
+    var drop: f64 := _g(buf, dAt + 2);
+    if (drop > _zero()) {
+      if (NnSetDropout(net, k, drop) == false) {
+        NnFree(net);
+        return _fail(NNIO_E_SHAPE);
+      }
+    }
+    dAt := dAt + 3;
     k := k + 1;
   }
   // Verlust und Optimierer. NnSetLoss prueft die Ausgabeaktivierung mit --
@@ -339,7 +383,6 @@ pub fn NnIoLoadBuffer(buf: int64, len: int64): int64 {
     NnFree(net);
     return _fail(NNIO_E_SHAPE);
   }
-  NnSetLearningRate(net, _g(buf, at + 2));
   NnSetMomentum(net, _g(buf, at + 3));
   NnSetAdam(net, _g(buf, at + 4), _g(buf, at + 5), _g(buf, at + 6));
   NnSetLeakySlope(net, _g(buf, at + 7));
@@ -351,6 +394,38 @@ pub fn NnIoLoadBuffer(buf: int64, len: int64): int64 {
   if (NnSetRngState(net, _getI(buf, at + 9)) == false) {
     NnFree(net);
     return _fail(NNIO_E_SHAPE);
+  }
+  if (NnSetWeightDecay(net, _g(buf, at + 11)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  if (NnSetGradClip(net, _g(buf, at + 12)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  if (NnSetHuberDelta(net, _g(buf, at + 13)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  // Grundlernrate zuletzt setzen und dann die wirksame wiederherstellen:
+  // NnSetLearningRate setzt beide, der Zeitplan rechnet aus der Grundrate
+  NnSetLearningRate(net, _g(buf, at + 14));
+  if (NnSetLrSchedule(net, _getI(buf, at + 15),
+                      _g(buf, at + 16), _g(buf, at + 17)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  if (NnSetEpoch(net, _getI(buf, at + 18)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  // wirksame Lernrate aus der Datei, nicht die vom Zeitplan nachgerechnete:
+  // sie kann von Hand gesetzt worden sein
+  NnSetEffectiveLearningRate(net, _g(buf, at + 2));
+  if ((flags & NNIO_TRAINING) != 0) {
+    NnSetTraining(net, true);
+  } else {
+    NnSetTraining(net, false);
   }
   var pc: int64 := _getI(buf, at + 10);
   at := at + TAIL_SLOTS;

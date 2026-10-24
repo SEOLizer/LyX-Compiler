@@ -401,7 +401,7 @@ fn main(): int64 {
 EOF
 if bauen "$TMP/nnpg.lyx" "$TMP/nnpg"; then
   aus="$(timeout 120 "$TMP/nnpg" 2>&1 | tr -d '\n')"
-  soll='2|10|3,2,2,32,944,10|modell-a,modell-b|111|120|103|424,424|05|'
+  soll='2|10|3,2,2,32,1024,10|modell-a,modell-b|111|120|103|504,504|05|'
   if [ "$aus" = "$soll" ]; then
     ok "Netz in bytea: Angaben, Rundlauf bitgleich, Ersetzen, Loeschen, Verdrehung abgewiesen"
   else

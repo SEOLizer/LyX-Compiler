@@ -75,9 +75,18 @@ pub con NN_ACT_TANH: int64      := 3;
 pub con NN_ACT_LEAKYRELU: int64 := 4;
 pub con NN_ACT_SOFTMAX: int64   := 5;
 
-pub con NN_LOSS_MSE: int64 := 0;   // Regression
-pub con NN_LOSS_BCE: int64 := 1;   // binaer, mit Sigmoid-Ausgabe
-pub con NN_LOSS_CE: int64  := 2;   // mehrklassig, mit Softmax-Ausgabe
+pub con NN_LOSS_MSE: int64 := 0;     // Regression
+pub con NN_LOSS_BCE: int64 := 1;     // binaer, mit Sigmoid-Ausgabe
+pub con NN_LOSS_CE: int64  := 2;     // mehrklassig, mit Softmax-Ausgabe
+pub con NN_LOSS_MAE: int64 := 3;     // Regression, robust gegen Ausreisser
+pub con NN_LOSS_HUBER: int64 := 4;   // quadratisch nahe null, linear aussen
+
+// Lernraten-Zeitplan. Der Zeitplan rechnet aus der GRUNDLERNRATE und der
+// Epochennummer; die wirksame Lernrate steht danach in NnLearningRate().
+pub con NN_LR_CONST: int64  := 0;
+pub con NN_LR_STEP: int64   := 1;   // alle p2 Epochen mit p1 multiplizieren
+pub con NN_LR_EXP: int64    := 2;   // lr0 * p1^epoche
+pub con NN_LR_COSINE: int64 := 3;   // Kosinus von lr0 auf p1 ueber p2 Epochen
 
 pub con NN_OPT_SGD: int64      := 0;
 pub con NN_OPT_MOMENTUM: int64 := 1;
@@ -101,7 +110,16 @@ con H_AEPS: int64    := 11;
 con H_STEP: int64    := 12;
 con H_RNG: int64     := 13;
 con H_LEAK: int64    := 14;
-con H_SLOTS: int64   := 15;
+con H_L2: int64      := 15;   // Gewichtsabfall
+con H_CLIP: int64    := 16;   // Schwelle der Gradientennorm, 0 = aus
+con H_HUBER: int64   := 17;   // Knickpunkt von Huber
+con H_TRAIN: int64   := 18;   // 1 = Trainingsmodus (Dropout wirkt)
+con H_LR0: int64     := 19;   // Grundlernrate des Zeitplans
+con H_LRK: int64     := 20;   // Art des Zeitplans
+con H_LRP1: int64    := 21;
+con H_LRP2: int64    := 22;
+con H_EPOCH: int64   := 23;   // letzte gesetzte Epochennummer
+con H_SLOTS: int64   := 24;
 
 con NN_MAGIC: int64 := 7566667;   // 'nnf'
 
@@ -121,7 +139,9 @@ con L_VW: int64     := 11;
 con L_MB: int64     := 12;
 con L_VB: int64     := 13;
 con L_IN: int64     := 14;
-con L_SLOTS: int64  := 15;
+con L_DROP: int64   := 15;   // Dropout-Anteil (f64), 0 = aus
+con L_MASK: int64   := 16;   // Maske des letzten Vorwaertslaufs
+con L_SLOTS: int64  := 17;
 
 fn _hg(net: int64, slot: int64): int64 { return peek64(net + slot * 8); }
 fn _hs(net: int64, slot: int64, v: int64): void { poke64(net + slot * 8, v); }
@@ -221,6 +241,15 @@ pub fn NnNew(inputDim: int64, maxLayers: int64): int64 {
   _hs(net, H_STEP, 0);
   _hs(net, H_RNG, 88172645463325252);
   _hsf(net, H_LEAK, 0.01);
+  _hsf(net, H_L2, 0.0);
+  _hsf(net, H_CLIP, 0.0);
+  _hsf(net, H_HUBER, 1.0);
+  _hs(net, H_TRAIN, 1);
+  _hsf(net, H_LR0, 0.01);
+  _hs(net, H_LRK, NN_LR_CONST);
+  _hsf(net, H_LRP1, 1.0);
+  _hsf(net, H_LRP2, 1.0);
+  _hs(net, H_EPOCH, 0);
   return net;
 }
 
@@ -240,6 +269,7 @@ fn _freeLayer(l: int64): void {
   if (_lg(l, L_VW) != 0) { free(_lg(l, L_VW), wBytes); }
   if (_lg(l, L_MB) != 0) { free(_lg(l, L_MB), bBytes); }
   if (_lg(l, L_VB) != 0) { free(_lg(l, L_VB), bBytes); }
+  if (_lg(l, L_MASK) != 0) { free(_lg(l, L_MASK), bBytes); }
 }
 
 pub fn NnFree(net: int64): void {
@@ -285,6 +315,7 @@ pub fn NnAddDense(net: int64, outDim: int64, act: int64): bool {
   var z: int64  := allocZeroed(bBytes);
   var a: int64  := allocZeroed(bBytes);
   var d: int64  := allocZeroed(bBytes);
+  var msk: int64 := allocZeroed(bBytes);
   if (w == 0)  { return false; }
   if (dw == 0) { return false; }
   if (mw == 0) { return false; }
@@ -296,6 +327,7 @@ pub fn NnAddDense(net: int64, outDim: int64, act: int64): bool {
   if (z == 0)  { return false; }
   if (a == 0)  { return false; }
   if (d == 0)  { return false; }
+  if (msk == 0) { return false; }
   var l: int64 := _layer(net, n);
   _ls(l, L_INDIM, inDim);
   _ls(l, L_OUTDIM, outDim);
@@ -312,6 +344,13 @@ pub fn NnAddDense(net: int64, outDim: int64, act: int64): bool {
   _ls(l, L_MB, mb);
   _ls(l, L_VB, vb);
   _ls(l, L_IN, 0);
+  _ls(l, L_MASK, msk);
+  _s(msk, 0, _one());          // ohne Dropout ist die Maske durchgaengig 1
+  var mi: int64 := 1;
+  while (mi < outDim) {
+    _s(msk, mi, _one());
+    mi := mi + 1;
+  }
   _hs(net, H_NLAYER, n + 1);
   return true;
 }
@@ -378,14 +417,62 @@ pub fn NnSeed(net: int64, seed: int64): void {
   _hs(net, H_RNG, seed);
 }
 
+// Setzt die wirksame UND die Grundlernrate. Letztere ist der Bezugspunkt
+// jedes Zeitplans -- wer sie nicht mitfuehrte, haette nach der ersten
+// Zeitplan-Epoche keinen Weg zurueck.
 pub fn NnSetLearningRate(net: int64, lr: f64): void {
   if (_isNet(net) == false) { return; }
   _hsf(net, H_LR, lr);
+  _hsf(net, H_LR0, lr);
 }
 
 pub fn NnLearningRate(net: int64): f64 {
   if (_isNet(net) == false) { return _zero(); }
   return _hgf(net, H_LR);
+}
+
+// Gewichtsabfall (L2). Wirkt NUR auf Gewichte, nicht auf Biase: ein Bias
+// verschiebt die Schwelle eines Neurons und hat mit der Groesse der
+// Gewichtsmatrix nichts zu tun -- ihn mitzuschrumpfen zieht das Netz ohne
+// Gegenwert zur Null.
+pub fn NnSetWeightDecay(net: int64, lambda: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (lambda < 0.0) { return false; }
+  _hsf(net, H_L2, lambda);
+  return true;
+}
+
+pub fn NnWeightDecay(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_L2);
+}
+
+// Schwelle fuer die GLOBALE Gradientennorm ueber alle Schichten. 0 schaltet
+// das Begrenzen ab. Je Schicht einzeln zu begrenzen waere etwas anderes: es
+// verschiebt die Richtung des Gesamtgradienten, statt ihn nur zu kuerzen.
+pub fn NnSetGradClip(net: int64, maxNorm: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (maxNorm < 0.0) { return false; }
+  _hsf(net, H_CLIP, maxNorm);
+  return true;
+}
+
+pub fn NnGradClip(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_CLIP);
+}
+
+// Knickpunkt von Huber: bis dahin quadratisch, danach linear.
+pub fn NnSetHuberDelta(net: int64, delta: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (delta <= 0.0) { return false; }
+  _hsf(net, H_HUBER, delta);
+  return true;
+}
+
+pub fn NnHuberDelta(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_HUBER);
 }
 
 pub fn NnSetLeakySlope(net: int64, slope: f64): void {
@@ -398,7 +485,7 @@ pub fn NnSetLeakySlope(net: int64, slope: f64): void {
 pub fn NnSetLoss(net: int64, kind: int64): bool {
   if (_isNet(net) == false) { return false; }
   if (kind < NN_LOSS_MSE) { return false; }
-  if (kind > NN_LOSS_CE) { return false; }
+  if (kind > NN_LOSS_HUBER) { return false; }
   var n: int64 := _hg(net, H_NLAYER);
   if (n > 0) {
     var act: int64 := _lg(_layer(net, n - 1), L_ACT);
@@ -408,7 +495,15 @@ pub fn NnSetLoss(net: int64, kind: int64): bool {
     if (kind == NN_LOSS_CE) {
       if (act != NN_ACT_SOFTMAX) { return false; }
     }
+    // Softmax gehoert zur Kreuzentropie: fuer jeden anderen Verlust waere
+    // die Ableitung eine volle Jacobi-Matrix, die hier nicht gerechnet wird
     if (kind == NN_LOSS_MSE) {
+      if (act == NN_ACT_SOFTMAX) { return false; }
+    }
+    if (kind == NN_LOSS_MAE) {
+      if (act == NN_ACT_SOFTMAX) { return false; }
+    }
+    if (kind == NN_LOSS_HUBER) {
       if (act == NN_ACT_SOFTMAX) { return false; }
     }
   }
@@ -699,6 +794,95 @@ fn _actDeriv(net: int64, act: int64, z: int64, a: int64, i: int64): f64 {
   return _one();
 }
 
+// ── Dropout ──────────────────────────────────────────────────────────────────
+//
+// Umgekehrtes Dropout (inverted dropout): im Training wird ein Anteil der
+// Ausgaben einer Schicht auf null gesetzt und der Rest mit 1/(1-p)
+// hochskaliert. Dadurch ist der ERWARTUNGSWERT der Ausgabe derselbe wie ohne
+// Dropout, und die Vorhersage braucht keine Nachkorrektur -- sie laeuft
+// einfach mit abgeschalteter Maske.
+//
+// Genau darum gibt es den Trainings-/Inferenzmodus (NnSetTraining). Ohne ihn
+// wuerde eine Vorhersage still mit zufaellig ausgeknipsten Neuronen rechnen:
+// ein Netz, das zweimal nach derselben Eingabe gefragt zwei Antworten gibt,
+// ohne dass irgendwo ein Fehler gemeldet wird.
+//
+// Die Maske des letzten Vorwaertslaufs bleibt stehen, weil der
+// Rueckwaertslauf sie braucht: der Gradient darf nur durch die Neuronen
+// zurueckfliessen, die auch nach vorn beigetragen haben.
+
+fn _applyDropout(net: int64, l: int64, n: int64): void {
+  var rate: f64 := _g(l, L_DROP);
+  var mask: int64 := _lg(l, L_MASK);
+  var a: int64 := _lg(l, L_A);
+  var i: int64 := 0;
+  // Ausserhalb des Trainings und ohne Anteil ist die Maske durchgaengig 1 --
+  // einmal gesetzt, damit der Rueckwaertslauf keinen Sonderfall braucht
+  if (rate <= _zero()) {
+    while (i < n) {
+      _s(mask, i, _one());
+      i := i + 1;
+    }
+    return;
+  }
+  if (_hg(net, H_TRAIN) == 0) {
+    while (i < n) {
+      _s(mask, i, _one());
+      i := i + 1;
+    }
+    return;
+  }
+  var keep: f64 := _one() - rate;
+  if (keep < _eps()) { keep := _eps(); }
+  var scale: f64 := _one() / keep;
+  while (i < n) {
+    var u: f64 := _uni(net);
+    if (u < rate) {
+      _s(mask, i, _zero());
+      _s(a, i, _zero());
+    } else {
+      _s(mask, i, scale);
+      var av: f64 := _g(a, i);
+      _s(a, i, av * scale);
+    }
+    i := i + 1;
+  }
+}
+
+// Dropout-Anteil einer Schicht. Die LETZTE Schicht wird abgelehnt: dort
+// wuerde Dropout Ausgaben der Vorhersage ausknipsen, und bei Softmax waere
+// die Summe nicht mehr eins. Anteil ausserhalb [0,1) ebenso.
+pub fn NnSetDropout(net: int64, k: int64, rate: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  var nL: int64 := _hg(net, H_NLAYER);
+  if (k < 0) { return false; }
+  if (k >= nL) { return false; }
+  if (k == nL - 1) { return false; }
+  if (rate < _zero()) { return false; }
+  if (rate >= _one()) { return false; }
+  _s(_layer(net, k), L_DROP, rate);
+  return true;
+}
+
+pub fn NnDropout(net: int64, k: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (k < 0) { return _zero(); }
+  if (k >= _hg(net, H_NLAYER)) { return _zero(); }
+  return _g(_layer(net, k), L_DROP);
+}
+
+// Trainings- oder Inferenzmodus. Im Inferenzmodus wirkt kein Dropout.
+pub fn NnSetTraining(net: int64, on: bool): void {
+  if (_isNet(net) == false) { return; }
+  if (on) { _hs(net, H_TRAIN, 1); } else { _hs(net, H_TRAIN, 0); }
+}
+
+pub fn NnIsTraining(net: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (_hg(net, H_TRAIN) == 1) { return true; }
+  return false;
+}
+
 // ── Vorwaertslauf ────────────────────────────────────────────────────────────
 
 // x ist ein f64-Feld mit NnInputDim() Eintraegen. Rueckgabe ist der Zeiger auf
@@ -731,6 +915,7 @@ pub fn NnForward(net: int64, x: int64): int64 {
       r := r + 1;
     }
     _applyAct(net, _lg(l, L_ACT), z, _lg(l, L_A), outDim);
+    _applyDropout(net, l, outDim);
     inPtr := _lg(l, L_A);
     k := k + 1;
   }
@@ -785,6 +970,35 @@ pub fn NnPredictClass(net: int64, x: int64): int64 {
 
 // ── Verlust ──────────────────────────────────────────────────────────────────
 
+fn _lossOf2(net: int64, kind: int64, a: int64, y: int64, n: int64): f64 {
+  var i: int64 := 0;
+  var sum: f64 := _zero();
+  if (kind == NN_LOSS_MAE) {
+    while (i < n) {
+      sum := sum + AbsF64(_g(a, i) - _g(y, i));
+      i := i + 1;
+    }
+    return sum;
+  }
+  if (kind == NN_LOSS_HUBER) {
+    // quadratisch bis zum Knickpunkt, danach linear -- so zieht ein einzelner
+    // Ausreisser den Gradienten nicht beliebig weit
+    var dl: f64 := _hgf(net, H_HUBER);
+    while (i < n) {
+      var d: f64 := _g(a, i) - _g(y, i);
+      var ad: f64 := AbsF64(d);
+      if (ad <= dl) {
+        sum := sum + _half() * d * d;
+      } else {
+        sum := sum + dl * (ad - _half() * dl);
+      }
+      i := i + 1;
+    }
+    return sum;
+  }
+  return _lossOf(kind, a, y, n);
+}
+
 fn _lossOf(kind: int64, a: int64, y: int64, n: int64): f64 {
   var i: int64 := 0;
   var sum: f64 := _zero();
@@ -823,7 +1037,7 @@ pub fn NnSampleLoss(net: int64, x: int64, y: int64): f64 {
   var o: int64 := NnForward(net, x);
   if (o == 0) { return _zero(); }
   if (y == 0) { return _zero(); }
-  return _lossOf(_hg(net, H_LOSS), o, y, NnOutputDim(net));
+  return _lossOf2(net, _hg(net, H_LOSS), o, y, NnOutputDim(net));
 }
 
 // Mittlerer Verlust ueber n Beispiele. X ist n x inputDim, Y ist n x outputDim,
@@ -877,7 +1091,7 @@ pub fn NnAccumulate(net: int64, x: int64, y: int64): f64 {
   var kind: int64 := _hg(net, H_LOSS);
   var last: int64 := _layer(net, nL - 1);
   var outDim: int64 := _lg(last, L_OUTDIM);
-  var lossVal: f64 := _lossOf(kind, o, y, outDim);
+  var lossVal: f64 := _lossOf2(net, kind, o, y, outDim);
 
   // Fehler der Ausgabeschicht
   var dl: int64 := _lg(last, L_DELTA);
@@ -887,6 +1101,27 @@ pub fn NnAccumulate(net: int64, x: int64, y: int64): f64 {
     while (i < outDim) {
       var d: f64 := _g(o, i) - _g(y, i);
       _s(dl, i, d * _actDeriv(net, act, _lg(last, L_Z), o, i));
+      i := i + 1;
+    }
+  } else if (kind == NN_LOSS_MAE) {
+    // Ableitung des Betrags: das Vorzeichen. An der Stelle null ist sie nicht
+    // definiert; 0 ist dort der einzige Wert, der keine Richtung erfindet.
+    while (i < outDim) {
+      var d2: f64 := _g(o, i) - _g(y, i);
+      var sgn: f64 := _zero();
+      if (d2 > _zero()) { sgn := _one(); }
+      if (d2 < _zero()) { sgn := _neg(_one()); }
+      _s(dl, i, sgn * _actDeriv(net, act, _lg(last, L_Z), o, i));
+      i := i + 1;
+    }
+  } else if (kind == NN_LOSS_HUBER) {
+    var dlim: f64 := _hgf(net, H_HUBER);
+    while (i < outDim) {
+      var d3: f64 := _g(o, i) - _g(y, i);
+      var g3: f64 := d3;
+      if (d3 > dlim) { g3 := dlim; }
+      if (d3 < _neg(dlim)) { g3 := _neg(dlim); }
+      _s(dl, i, g3 * _actDeriv(net, act, _lg(last, L_Z), o, i));
       i := i + 1;
     }
   } else {
@@ -936,7 +1171,11 @@ pub fn NnAccumulate(net: int64, x: int64, y: int64): f64 {
           acc := acc + _g(w, r2 * inDim + c2) * _g(delta, r2);
           r2 := r2 + 1;
         }
-        _s(pDelta, c2, acc * _actDeriv(net, pAct, pZ, pA, c2));
+        // Maske der Vorgaengerschicht: ausgeknipste Neuronen haben nach vorn
+        // nichts beigetragen, also fliesst durch sie auch kein Gradient
+        // zurueck. Ohne Dropout steht dort 1, ohne Sonderfall.
+        var mv: f64 := _g(_lg(prev, L_MASK), c2);
+        _s(pDelta, c2, acc * _actDeriv(net, pAct, pZ, pA, c2) * mv);
         c2 := c2 + 1;
       }
     }
@@ -990,6 +1229,37 @@ pub fn NnStep(net: int64, batchSize: int64): bool {
   var b2: f64 := _hgf(net, H_B2);
   var aeps: f64 := _hgf(net, H_AEPS);
   var scale: f64 := _one() / (batchSize as f64);
+  var l2: f64 := _hgf(net, H_L2);
+  // Gradienten begrenzen: erst die globale Norm der GEMITTELTEN Gradienten
+  // messen (einschliesslich des Gewichtsabfalls, denn der ist Teil des
+  // Gradienten, den der Schritt geht), dann alles mit demselben Faktor
+  // kuerzen. Nur ein gemeinsamer Faktor laesst die Richtung unveraendert.
+  var clipMax: f64 := _hgf(net, H_CLIP);
+  var clipScale: f64 := _one();
+  if (clipMax > _zero()) {
+    var sumSq: f64 := _zero();
+    var ck: int64 := 0;
+    while (ck < nL) {
+      var cl: int64 := _layer(net, ck);
+      var cnw: int64 := _lg(cl, L_INDIM) * _lg(cl, L_OUTDIM);
+      var cnb: int64 := _lg(cl, L_OUTDIM);
+      var ci: int64 := 0;
+      while (ci < cnw) {
+        var gw0: f64 := _g(_lg(cl, L_DW), ci) * scale + l2 * _g(_lg(cl, L_W), ci);
+        sumSq := sumSq + gw0 * gw0;
+        ci := ci + 1;
+      }
+      ci := 0;
+      while (ci < cnb) {
+        var gb0: f64 := _g(_lg(cl, L_DB), ci) * scale;
+        sumSq := sumSq + gb0 * gb0;
+        ci := ci + 1;
+      }
+      ck := ck + 1;
+    }
+    var norm: f64 := SqrtF64(sumSq);
+    if (norm > clipMax) { clipScale := clipMax / norm; }
+  }
   var step: int64 := _hg(net, H_STEP) + 1;
   _hs(net, H_STEP, step);
   // Bias-Korrektur von Adam; fuer die anderen Optimierer ohne Wirkung
@@ -1008,14 +1278,18 @@ pub fn NnStep(net: int64, batchSize: int64): bool {
     var nb: int64 := _lg(l, L_OUTDIM);
     var i: int64 := 0;
     while (i < nw) {
-      var gw: f64 := _g(_lg(l, L_DW), i) * scale;
+      // Gewichtsabfall ist ein Summand im Gradienten (L2-Term d/dw von
+      // lambda/2 * w^2), nicht ein Schrumpfen des Gewichts hinterher: nur so
+      // gehen Momentum und Adam korrekt damit um
+      var gw: f64 := (_g(_lg(l, L_DW), i) * scale + l2 * _g(_lg(l, L_W), i))
+                     * clipScale;
       _applyOne(opt, _lg(l, L_W), gw, i, _lg(l, L_MW), _lg(l, L_VW),
                 lr, mu, b1, b2, aeps, bc1, bc2);
       i := i + 1;
     }
     i := 0;
     while (i < nb) {
-      var gb: f64 := _g(_lg(l, L_DB), i) * scale;
+      var gb: f64 := _g(_lg(l, L_DB), i) * scale * clipScale;
       _applyOne(opt, _lg(l, L_B), gb, i, _lg(l, L_MB), _lg(l, L_VB),
                 lr, mu, b1, b2, aeps, bc1, bc2);
       i := i + 1;
@@ -1194,6 +1468,192 @@ pub fn NnLoadParams(net: int64, buf: int64, count: int64): bool {
     k := k + 1;
   }
   return true;
+}
+
+// ── Lernraten-Zeitplan ───────────────────────────────────────────────────────
+//
+// Der Zeitplan rechnet aus der GRUNDLERNRATE (zuletzt per NnSetLearningRate
+// gesetzt) und der Epochennummer. Die ausgerechnete Lernrate wird beim Setzen
+// der Epoche wirksam; NnLrForEpoch rechnet sie ohne Nebenwirkung aus, damit
+// sich ein Plan vor dem Lauf nachsehen laesst.
+//
+//   NN_LR_STEP:   lr0 * p1^(epoche / p2)      ganzzahlige Division
+//   NN_LR_EXP:    lr0 * p1^epoche
+//   NN_LR_COSINE: p1 + (lr0 - p1) * (1 + cos(pi * epoche / p2)) / 2
+//
+// Bei NN_LR_COSINE ist p1 die ENDLERNRATE und p2 die Zahl der geplanten
+// Epochen; ab p2 bleibt es bei p1, statt weiter zu schwingen.
+
+pub fn NnSetLrSchedule(net: int64, kind: int64, p1: f64, p2: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (kind < NN_LR_CONST) { return false; }
+  if (kind > NN_LR_COSINE) { return false; }
+  if (kind == NN_LR_STEP) {
+    if (p2 < _one()) { return false; }        // Stufenlaenge in Epochen
+    if (p1 <= _zero()) { return false; }
+  }
+  if (kind == NN_LR_EXP) {
+    if (p1 <= _zero()) { return false; }
+  }
+  if (kind == NN_LR_COSINE) {
+    if (p2 < _one()) { return false; }
+    if (p1 < _zero()) { return false; }
+  }
+  _hs(net, H_LRK, kind);
+  _hsf(net, H_LRP1, p1);
+  _hsf(net, H_LRP2, p2);
+  return true;
+}
+
+pub fn NnLrParam1(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_LRP1);
+}
+
+pub fn NnLrParam2(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_LRP2);
+}
+
+// Setzt NUR die wirksame Lernrate, ohne die Grundlernrate des Zeitplans zu
+// verschieben. Gebraucht wird das beim Zurueckladen eines Netzes: dort stehen
+// beide Werte getrennt in der Datei, und die wirksame kann von Hand gesetzt
+// worden sein.
+pub fn NnSetEffectiveLearningRate(net: int64, lr: f64): void {
+  if (_isNet(net) == false) { return; }
+  _hsf(net, H_LR, lr);
+}
+
+pub fn NnLrSchedule(net: int64): int64 {
+  if (_isNet(net) == false) { return -1; }
+  return _hg(net, H_LRK);
+}
+
+pub fn NnBaseLearningRate(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_LR0);
+}
+
+// Lernrate, die der Zeitplan fuer diese Epoche vorsieht -- ohne sie zu setzen
+pub fn NnLrForEpoch(net: int64, epoch: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (epoch < 0) { return _zero(); }
+  var lr0: f64 := _hgf(net, H_LR0);
+  var kind: int64 := _hg(net, H_LRK);
+  var p1: f64 := _hgf(net, H_LRP1);
+  var p2: f64 := _hgf(net, H_LRP2);
+  if (kind == NN_LR_CONST) { return lr0; }
+  if (kind == NN_LR_STEP) {
+    var stufen: int64 := epoch / (p2 as int64);
+    return lr0 * PowF64(p1, (stufen as f64));
+  }
+  if (kind == NN_LR_EXP) {
+    return lr0 * PowF64(p1, (epoch as f64));
+  }
+  // NN_LR_COSINE
+  var e: f64 := (epoch as f64);
+  if (e > p2) { return p1; }
+  var two: f64 := 2.0;
+  var cosArg: f64 := _pi() * e / p2;
+  return p1 + (lr0 - p1) * (_one() + CosF64(cosArg)) / two;
+}
+
+// Epoche setzen und die Lernrate des Zeitplans wirksam machen. Die
+// Grundlernrate bleibt unberuehrt.
+pub fn NnSetEpoch(net: int64, epoch: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (epoch < 0) { return false; }
+  _hs(net, H_EPOCH, epoch);
+  _hsf(net, H_LR, NnLrForEpoch(net, epoch));
+  return true;
+}
+
+pub fn NnEpoch(net: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  return _hg(net, H_EPOCH);
+}
+
+// Epochen in Folge, mit Zeitplan. Die Epochennummer laeuft weiter, wo sie
+// stand -- ein fortgesetztes Training setzt den Zeitplan also fort, statt ihn
+// von vorn zu beginnen.
+pub fn NnTrainScheduled(net: int64, X: int64, Y: int64, n: int64,
+                        batchSize: int64, epochs: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (epochs < 1) { return _zero(); }
+  var e: int64 := 0;
+  var last: f64 := _zero();
+  var start: int64 := _hg(net, H_EPOCH);
+  while (e < epochs) {
+    if (NnSetEpoch(net, start + e) == false) { return _zero(); }
+    last := NnTrainEpoch(net, X, Y, n, batchSize);
+    e := e + 1;
+  }
+  return last;
+}
+
+// ── Training mit Abbruchkriterium ────────────────────────────────────────────
+//
+// Trainiert hoechstens maxEpochs Epochen und bricht ab, wenn der Verlust auf
+// den Pruefdaten patience Epochen lang nicht besser geworden ist. Die
+// GEWICHTE DES BESTEN STANDES werden zurueckgespielt -- ohne das waere das
+// Ergebnis der letzte, also der schlechteste gemessene Stand, und das
+// Abbrechen haette nichts gebracht.
+//
+// Rueckgabe ist der beste Pruefverlust oder ein negativer Wert bei
+// unbrauchbaren Angaben (ein Verlust ist nie negativ, der Fall ist also
+// unterscheidbar). NnEpoch() sagt danach, bei welcher Epoche Schluss war.
+pub fn NnTrainEarlyStop(net: int64, X: int64, Y: int64, n: int64,
+                        Xval: int64, Yval: int64, nVal: int64,
+                        batchSize: int64, maxEpochs: int64,
+                        patience: int64): f64 {
+  if (_isNet(net) == false) { return _neg(_one()); }
+  if (n < 1) { return _neg(_one()); }
+  if (nVal < 1) { return _neg(_one()); }
+  if (maxEpochs < 1) { return _neg(_one()); }
+  if (patience < 1) { return _neg(_one()); }
+  var pc: int64 := NnParamCount(net);
+  if (pc < 1) { return _neg(_one()); }
+  var best: int64 := alloc(pc * 8);
+  if (best == 0) { return _neg(_one()); }
+  var bestLoss: f64 := _zero();
+  var haveBest: bool := false;
+  var seit: int64 := 0;
+  var e: int64 := 0;
+  var start: int64 := _hg(net, H_EPOCH);
+  while (e < maxEpochs) {
+    if (NnSetEpoch(net, start + e) == false) {
+      free(best, pc * 8);
+      return _neg(_one());
+    }
+    var tl: f64 := NnTrainEpoch(net, X, Y, n, batchSize);
+    // Gemessen wird im Inferenzmodus: mit Dropout waere der Pruefverlust
+    // zufaellig und das Abbruchkriterium wuerde Rauschen hinterherlaufen
+    var warTraining: bool := NnIsTraining(net);
+    NnSetTraining(net, false);
+    var vl: f64 := NnEvaluate(net, Xval, Yval, nVal);
+    NnSetTraining(net, warTraining);
+    if (haveBest == false) {
+      bestLoss := vl;
+      haveBest := true;
+      var w1: int64 := NnSaveParams(net, best);
+      seit := 0;
+    } else if (vl < bestLoss) {
+      bestLoss := vl;
+      var w2: int64 := NnSaveParams(net, best);
+      seit := 0;
+    } else {
+      seit := seit + 1;
+      if (seit >= patience) {
+        e := e + 1;
+        break;
+      }
+    }
+    e := e + 1;
+  }
+  var okb: bool := NnLoadParams(net, best, pc);
+  free(best, pc * 8);
+  if (okb == false) { return _neg(_one()); }
+  return bestLoss;
 }
 
 // ── Zustand ausserhalb der Gewichte ──────────────────────────────────────────

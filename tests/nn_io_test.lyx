@@ -115,6 +115,12 @@ fn BuildNet(seed: int64): int64 {
   NnSetLearningRate(net, 0.03);
   NnSetAdam(net, 0.85, 0.995, 0.0000001);
   NnSetLeakySlope(net, 0.02);
+  ok := NnSetWeightDecay(net, 0.002);
+  ok := NnSetGradClip(net, 2.5);
+  ok := NnSetHuberDelta(net, 0.75);
+  ok := NnSetDropout(net, 0, 0.25);
+  ok := NnSetLrSchedule(net, NN_LR_COSINE, 0.001, 50.0);
+  ok := NnSetEpoch(net, 7);
   return net;
 }
 
@@ -124,11 +130,12 @@ fn main(): int64 {
   var net: int64 := BuildNet(31337);
   // 3*4+4 + 4*2+2 = 16 + 10 = 26 Parameter
   CheckI("params26"c, NnParamCount(net), 26);
-  // Kopf: 5 + 2*2 Schichten + 11 Schwanz = 20 Felder, + 26 Parameter,
-  // + 1 Zaehler + 52 Optimiererwerte, + 1 Pruefsumme = 100 Felder = 800 Byte
-  CheckI("sizeOpt"c, NnIoBufferSize(net, true), 800);
-  // ohne Optimiererzustand: 20 + 26 + 1 = 47 Felder = 376 Byte
-  CheckI("sizePlain"c, NnIoBufferSize(net, false), 376);
+  // Fassung 2: Kopf 5 + 3*2 Schichten (Breite, Aktivierung, Dropout)
+  // + 19 Schwanz = 30 Felder, + 26 Parameter, + 1 Zaehler
+  // + 52 Optimiererwerte, + 1 Pruefsumme = 110 Felder = 880 Byte
+  CheckI("sizeOpt"c, NnIoBufferSize(net, true), 880);
+  // ohne Optimiererzustand: 30 + 26 + 1 = 57 Felder = 456 Byte
+  CheckI("sizePlain"c, NnIoBufferSize(net, false), 456);
   CheckI("sizeEmpty"c, NnIoBufferSize(NnNew(2, 2), true), 0);
 
   var cap: int64 := NnIoBufferSize(net, true);
@@ -140,7 +147,7 @@ fn main(): int64 {
   CheckI("errNullBuf"c, NnIoLoadError(), NNIO_E_ARGS);
 
   var n: int64 := NnIoSaveBuffer(net, buf, cap, true);
-  CheckI("saveBytes"c, n, 800);
+  CheckI("saveBytes"c, n, 880);
   CheckI("verifyOk"c, NnIoVerify(buf, n), NNIO_OK);
 
   // Kopfangaben ohne Aufbau
@@ -162,11 +169,27 @@ fn main(): int64 {
   // Einstellungen
   CheckI("backLoss"c, NnLoss(back), NN_LOSS_CE);
   CheckI("backOpt"c, NnOptimizer(back), NN_OPT_ADAM);
-  Check("backLr"c, NnLearningRate(back), 0.03, TOL());
+  // wirksame Lernrate: die des gesicherten Netzes (vom Zeitplan gesetzt),
+  // nicht die Grundrate -- beide stehen getrennt in der Datei
+  Check("backLr"c, NnLearningRate(back), NnLearningRate(net), TOL());
   Check("backB1"c, NnBeta1(back), 0.85, TOL());
   Check("backB2"c, NnBeta2(back), 0.995, TOL());
   Check("backAEps"c, NnAdamEps(back), 0.0000001, TOL());
   Check("backLeak"c, NnLeakySlope(back), 0.02, TOL());
+  Check("backL2"c, NnWeightDecay(back), 0.002, TOL());
+  Check("backClip"c, NnGradClip(back), 2.5, TOL());
+  Check("backHuber"c, NnHuberDelta(back), 0.75, TOL());
+  Check("backDrop0"c, NnDropout(back, 0), 0.25, TOL());
+  Check("backDrop1"c, NnDropout(back, 1), 0.0, TOL());
+  CheckI("backSched"c, NnLrSchedule(back), NN_LR_COSINE);
+  Check("backP1"c, NnLrParam1(back), 0.001, TOL());
+  Check("backP2"c, NnLrParam2(back), 50.0, TOL());
+  CheckI("backEpoch"c, NnEpoch(back), 7);
+  Check("backBaseLr"c, NnBaseLearningRate(back), 0.03, TOL());
+  // die wirksame Lernrate steht getrennt in der Datei: hier die vom
+  // Zeitplan fuer Epoche 7 gesetzte, nicht die Grundrate
+  Check("backEffLr"c, NnLearningRate(back), NnLrForEpoch(net, 7), TOL());
+  CheckB("backTraining"c, NnIsTraining(back), true);
   CheckI("backRng"c, NnRngState(back), NnRngState(net));
   // Gewichte bitgleich
   Check("paramsEqual"c, MaxParamDiff(net, back), 0.0, 0.0);
@@ -176,6 +199,10 @@ fn main(): int64 {
   SV(x, 0, 0.6);
   SV(x, 1, NEG(1.1));
   SV(x, 2, 0.25);
+  // Vergleich im Inferenzmodus: mit Dropout wuerfelt jeder Vorwaertslauf,
+  // und der Test wuerde Rauschen messen statt der Gleichheit
+  NnSetTraining(net, false);
+  NnSetTraining(back, false);
   var o1: int64 := NnForward(net, x);
   var a0: f64 := NnOutputAt(net, 0);
   var a1: f64 := NnOutputAt(net, 1);
@@ -241,12 +268,48 @@ fn main(): int64 {
 
   NnFree(back);
 
+  // Der Modus gehoert in die Datei: ein im Inferenzmodus gesichertes Netz
+  // darf nicht als trainierendes zurueckkommen -- sonst wuerde es nach dem
+  // Laden mit Dropout vorhersagen, lautlos und bei gleicher Eingabe
+  // verschieden.
+  NnSetTraining(net, false);
+  var nInf: int64 := NnIoSaveBuffer(net, buf, cap, true);
+  CheckB("infSaved"c, nInf > 0, true);
+  var infBack: int64 := NnIoLoadBuffer(buf, nInf);
+  CheckB("infLoaded"c, infBack != 0, true);
+  CheckB("infModeKept"c, NnIsTraining(infBack), false);
+  NnFree(infBack);
+  NnSetTraining(net, true);
+  n := NnIoSaveBuffer(net, buf, cap, true);
+  var trBack: int64 := NnIoLoadBuffer(buf, n);
+  CheckB("trainModeKept"c, NnIsTraining(trBack), true);
+  NnFree(trBack);
+
+  // Dropout auf der LETZTEN Schicht ist unmoeglich -- eine Bytefolge, die es
+  // behauptet, wird abgewiesen (Pruefsumme nachgezogen, sonst waere sie es,
+  // die abweist)
+  var dropSlot: int64 := 5 + 1 * 3 + 2;        // zweite Schicht, Dropout-Feld
+  pokef64(buf + dropSlot * 8, 0.5);
+  poke64(buf + (n - 8), NnIoChecksum(buf, n - 8));
+  CheckI("lastDropRejected"c, NnIoVerify(buf, n), NNIO_E_SHAPE);
+  pokef64(buf + dropSlot * 8, 0.0);
+  poke64(buf + (n - 8), NnIoChecksum(buf, n - 8));
+  CheckI("lastDropRestored"c, NnIoVerify(buf, n), NNIO_OK);
+  // Anteil ausserhalb [0,1) ebenso
+  var dropSlot0: int64 := 5 + 0 * 3 + 2;
+  pokef64(buf + dropSlot0 * 8, 1.5);
+  poke64(buf + (n - 8), NnIoChecksum(buf, n - 8));
+  CheckI("dropRangeRejected"c, NnIoVerify(buf, n), NNIO_E_SHAPE);
+  pokef64(buf + dropSlot0 * 8, 0.25);
+  poke64(buf + (n - 8), NnIoChecksum(buf, n - 8));
+  CheckI("dropRangeRestored"c, NnIoVerify(buf, n), NNIO_OK);
+
   // ── Ohne Optimiererzustand ────────────────────────────────────────────────
 
   var capP: int64 := NnIoBufferSize(net, false);
   var bufP: int64 := alloc(capP);
   var nP: int64 := NnIoSaveBuffer(net, bufP, capP, false);
-  CheckI("plainBytes"c, nP, 376);
+  CheckI("plainBytes"c, nP, 456);
   CheckI("plainVerify"c, NnIoVerify(bufP, nP), NNIO_OK);
   CheckB("plainHasOpt"c, NnIoHeaderHasOptState(bufP, nP), false);
   var plain: int64 := NnIoLoadBuffer(bufP, nP);
@@ -259,10 +322,12 @@ fn main(): int64 {
   DeleteFile(FILEPATH());
   CheckI("fileSaveNullPath"c, NnIoSaveFile(net, 0 as pchar, true), 0);
   CheckI("errNullPath"c, NnIoLoadError(), NNIO_E_ARGS);
-  CheckI("fileSave"c, NnIoSaveFile(net, FILEPATH(), true), 800);
-  CheckI("fileSize"c, FileSize(FILEPATH()), 800);
+  CheckI("fileSave"c, NnIoSaveFile(net, FILEPATH(), true), 880);
+  CheckI("fileSize"c, FileSize(FILEPATH()), 880);
   var fromFile: int64 := NnIoLoadFile(FILEPATH());
   CheckB("fileLoad"c, fromFile != 0, true);
+  NnSetTraining(fromFile, false);   // Vergleich ohne Dropout
+  NnSetTraining(net, false);
   CheckI("fileLoadErr"c, NnIoLoadError(), NNIO_OK);
   Check("fileParams"c, MaxParamDiff(net, fromFile), 0.0, 0.0);
   var o3: int64 := NnForward(fromFile, x);
@@ -298,7 +363,7 @@ fn main(): int64 {
   // nicht ladbar: der gekuerzte Gradient gilt dort nicht. Geprueft wird am
   // veraenderten Feld, mit nachgezogener Pruefsumme -- sonst wuerde schon die
   // Pruefsumme abweisen und die eigentliche Regel bliebe ungemessen.
-  var lossSlot: int64 := 5 + 2 * 2;      // Kopf + zwei Schichten
+  var lossSlot: int64 := 5 + 2 * 3;      // Kopf + zwei Schichten je 3 Felder
   poke64(buf + lossSlot * 8, NN_LOSS_BCE);
   poke64(buf + (n - 8), NnIoChecksum(buf, n - 8));
   CheckI("mismatchVerify"c, NnIoVerify(buf, n), NNIO_OK);
@@ -348,6 +413,10 @@ fn main(): int64 {
 
   var refNet: int64 := BuildNet(4711);
   var cutNet: int64 := BuildNet(4711);
+  // Fuer den Gleichheitsvergleich muss das Training wiederholbar sein:
+  // Dropout aus, sonst zieht jeder Lauf andere Masken
+  var okd1: bool := NnSetDropout(refNet, 0, 0.0);
+  var okd2: bool := NnSetDropout(cutNet, 0, 0.0);
   Check("startEqual"c, MaxParamDiff(refNet, cutNet), 0.0, 0.0);
   var l1: f64 := NnTrain(refNet, X, Y, nS, 3, 30);
   var l2: f64 := NnTrain(cutNet, X, Y, nS, 3, 30);
@@ -376,6 +445,7 @@ fn main(): int64 {
   // Pruefung waere der Test auch dann gruen, wenn NnSaveOptState nie etwas
   // schreibt.
   var plainNet: int64 := BuildNet(4711);
+  var okd3: bool := NnSetDropout(plainNet, 0, 0.0);
   var l5: f64 := NnTrain(plainNet, X, Y, nS, 3, 30);
   var capN: int64 := NnIoBufferSize(plainNet, false);
   var bufN: int64 := alloc(capN);
