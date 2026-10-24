@@ -896,6 +896,10 @@ pub type Codegen = class {
   // Class layout table (WP-09 OOP support)
   classLayouts: int64;   // {namePtr:8, nameLen:8, fieldsPtr:8, fieldCnt:8} each
   classCount:   int64;
+  // #2173: Zwischenspeicher fuer cg_findMethodDeclNi — je Klassenindex
+  // {pNodes, topLevelHead, Knoten der Typdeklaration}.
+  mdCache:      int64;
+  mdCacheCap:   int64;
   classCap:     int64;
 
   // Enum layout table (BUG-08: enum tag analysis for match)
@@ -5307,7 +5311,7 @@ pub type Codegen = class {
       self.profEntries := nb;
       self.profEntryCap := nc;
     }
-    // Allocate runtime slots: tsc_start(8) + call_count(8) + total_cycles(8) = 24 bytes
+    // Allocate runtime slots: tsc_start(8) + call_count(8) + total_cycles(8) + depth(8) = 32 bytes (#2249)
     var dOff: int64 := self.dataLen;
     self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);
     self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);  // tsc_start
@@ -5315,6 +5319,9 @@ pub type Codegen = class {
     self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);  // call_count
     self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);
     self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);  // total_cycles
+    // #2249: Aufruftiefe — nur der aeusserste Aufruf misst (Rekursion).
+    self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);
+    self.cg_edata(0); self.cg_edata(0); self.cg_edata(0); self.cg_edata(0);  // depth (+24)
     // Store name string in data section for profile_report output
     var nDOff: int64 := self.dataLen;
     var k: int64 := 0;
@@ -15267,26 +15274,59 @@ pub type Codegen = class {
     if (classIdx < 0 || self.topLevelHead < 0) { return 0 - 1; }
     var ownIdx: int64 := self.cg_findMethodOwner(classIdx, mname, mlen);
     if (ownIdx < 0) { ownIdx := classIdx; }
-    var cBase: int64 := self.classLayouts + ownIdx * CG_CLASS_SZ;
+    var decl: int64 := self.cg_klassenDeklNi(ownIdx);
+    if (decl < 0) { return 0 - 1; }
+    var m: int64 := self.cg_nc1(decl);
+    while (m >= 0) {
+      if (self.cg_seq(self.cg_nsval(m), self.cg_nslen(m), mname, mlen) != 0) {
+        return m;
+      }
+      m := self.cg_nnext(m);
+    }
+    return 0 - 1;
+  }
+
+  // #2173: Knoten der Typdeklaration von Klasse ci in der AKTUELLEN
+  // Knotentabelle (-1 = dort nicht deklariert). Bis 1.2.20G lief
+  // cg_findMethodDeclNi fuer jeden Methodenaufruf ueber alle Top-Level-
+  // Deklarationen (7,9 % inklusive im Selbstbau). Gemerkt wird je Klasse mit
+  // dem Schluessel {pNodes, topLevelHead}: der Codegen wechselt die Tabelle
+  // je Unit (Importe), und die Tabellen stammen aus einer Arena, die nichts
+  // freigibt — dieselbe Adresse heisst dieselbe Unit.
+  fn cg_klassenDeklNi(ci: int64): int64 {
+    if (ci >= self.mdCacheCap) {
+      var nc: int64 := self.mdCacheCap * 2;
+      if (nc < 64) { nc := 64; }
+      while (nc <= ci) { nc := nc * 2; }
+      var nb: int64 := alloc(nc * 24);
+      var z: int64 := 0;
+      while (z < nc * 24) { poke64(nb + z, 0); z += 8; }
+      if (self.mdCacheCap > 0) { memcpy(nb, self.mdCache, self.mdCacheCap * 24); }
+      self.mdCache := nb;
+      self.mdCacheCap := nc;
+    }
+    var e: int64 := self.mdCache + ci * 24;
+    if (peek64(e) == self.pNodes && peek64(e + 8) == self.topLevelHead + 1) {
+      return peek64(e + 16);
+    }
+    var cBase: int64 := self.classLayouts + ci * CG_CLASS_SZ;
     var cName: pchar := peek64(cBase) as pchar;
     var cLen:  int64 := peek64(cBase + CG_CLASS_OFF_NAMELEN);
+    var gefunden: int64 := 0 - 1;
     var scan: int64 := self.topLevelHead;
     while (scan >= 0) {
       if (self.cg_nkind(scan) == CGN_TYPE_DECL) {
         if (self.cg_seq(self.cg_nsval(scan), self.cg_nslen(scan), cName, cLen) != 0) {
-          var m: int64 := self.cg_nc1(scan);
-          while (m >= 0) {
-            if (self.cg_seq(self.cg_nsval(m), self.cg_nslen(m), mname, mlen) != 0) {
-              return m;
-            }
-            m := self.cg_nnext(m);
-          }
-          return 0 - 1;
+          gefunden := scan;
+          break;
         }
       }
       scan := self.cg_nnext(scan);
     }
-    return 0 - 1;
+    poke64(e, self.pNodes);
+    poke64(e + 8, self.topLevelHead + 1);   // +1: Kopf 0 ist gueltig, 0 im Speicher heisst "leer"
+    poke64(e + 16, gefunden);
+    return gefunden;
   }
 
   // #1655: Einen privaten Funktionsnamen der laufenden Unit vormerken.
@@ -27901,6 +27941,8 @@ pub type Codegen = class {
     self.classCap    := 16;
     self.classLayouts := alloc(self.classCap * CG_CLASS_SZ);
     self.classCount  := 0;
+    self.mdCache     := 0;   // #2173
+    self.mdCacheCap  := 0;
 
     // BUG-08: Enum layout table for match tag analysis
     self.enumCap     := 16;
@@ -31213,16 +31255,56 @@ pub type Codegen = class {
   // Doppelung, die in dieser Codebasis schon oft auseinandergelaufen ist.
   //
   // dOff = Datenoffset des Eintrags {tsc_start(8), call_count(8), total(8)}.
+  // #2249: Je Funktion gibt es EINEN Startwert. Bis 1.2.20G ueberschrieb ein
+  // rekursiver Eintritt den Start des aeusseren Aufrufs; dessen Austritt
+  // rechnete dann ab dem innersten Eintritt — `rek` meldete weniger Takte als
+  // `main`, das es vollstaendig enthaelt. Jetzt zaehlt ein Tiefenzaehler
+  // (dOff+24): nur der aeusserste Eintritt setzt den Start, nur der
+  // aeusserste Austritt addiert die Dauer. Die Zeit ist damit INKLUSIVE und
+  // ohne Doppelzaehlung; die Aufrufzahl zaehlt weiter jeden Aufruf.
+  // Wer per throw an einem Austritt vorbei springt, laesst die Tiefe stehen —
+  // die Funktion wird dann nicht weiter gemessen (bekannt, wie bei jedem
+  // Instrumentierungsprofiler ohne Abwicklungshaken).
   fn cg_profEnterBytes(dOff: int64) {
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);                   // mov rax, [rip+depth]
+    var pt1: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pt1, dOff + 24, 0, CG_PATCH_STR);
+    self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);                   // inc rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);                   // mov [rip+depth], rax
+    var pt2: int64 := self.codeLen; self.cg_e32(0);
+    self.cg_addPatch(pt2, dOff + 24, 0, CG_PATCH_STR);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xF8); self.cg_e8(0x01); // cmp rax, 1
+    self.cg_e8(0x75); var pInnen: int64 := self.codeLen; self.cg_e8(0);     // jne innen (schon aktiv)
+    var nachJ: int64 := self.codeLen;
     self.cg_e8(0x0F); self.cg_e8(0x31);                                      // rdtsc
     self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x20); // shl rdx, 32
     self.cg_e8(0x48); self.cg_e8(0x09); self.cg_e8(0xD0);                   // or rax, rdx
-    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);                   // mov [rip+d], rax
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);                   // mov [rip+start], rax
     var pp: int64 := self.codeLen; self.cg_e32(0);
     self.cg_addPatch(pp, dOff, 0, CG_PATCH_STR);
+    cg_patchRel8Wert(self.code, pInnen, self.codeLen - nachJ);
   }
 
   fn cg_profLeaveBytes(dOff: int64) {
+        // call_count += 1 (jeder Aufruf, auch rekursive)
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+        var plP4: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(plP4, dOff + 8, 0, CG_PATCH_STR);       // mov rax, [count]
+        self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);  // inc rax
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
+        var plP5: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(plP5, dOff + 8, 0, CG_PATCH_STR);       // mov [count], rax
+        // #2249: Tiefe -1; nur der aeusserste Austritt (Tiefe 0) misst.
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+        var plT1: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(plT1, dOff + 24, 0, CG_PATCH_STR);      // mov rax, [depth]
+        self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC8);  // dec rax
+        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
+        var plT2: int64 := self.codeLen; self.cg_e32(0);
+        self.cg_addPatch(plT2, dOff + 24, 0, CG_PATCH_STR);      // mov [depth], rax
+        self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
+        self.cg_e8(0x75); var plInnen: int64 := self.codeLen; self.cg_e8(0);   // jnz innen
+        var plNach: int64 := self.codeLen;
         // rdtsc → rax (current TSC)
         self.cg_e8(0x0F); self.cg_e8(0x31);
         self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE2); self.cg_e8(0x20);
@@ -31243,17 +31325,9 @@ pub type Codegen = class {
         self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x15);
         var plP3: int64 := self.codeLen; self.cg_e32(0);
         self.cg_addPatch(plP3, dOff + 16, 0, CG_PATCH_STR);
-        // mov rax, [rip+rel32] → call_count at dOff+8
-        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
-        var plP4: int64 := self.codeLen; self.cg_e32(0);
-        self.cg_addPatch(plP4, dOff + 8, 0, CG_PATCH_STR);
-        // inc rax; store back
-        self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);  // inc rax
-        // mov [rip+rel32], rax → call_count at dOff+8
-        self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05);
-        var plP5: int64 := self.codeLen; self.cg_e32(0);
-        self.cg_addPatch(plP5, dOff + 8, 0, CG_PATCH_STR);
+        cg_patchRel8Wert(self.code, plInnen, self.codeLen - plNach);
   }
+
 
   // #1370: Der Bericht. Er wird zur UEBERSETZUNGSZEIT ausgerollt — je Eintrag
   // eine feste Folge Druckbefehle. Deshalb muss er nach allen Funktionen
@@ -31298,6 +31372,13 @@ pub type Codegen = class {
           var prNLen:  int64 := peek64(prEBase + CG_PR_OFF_NAMELEN);
           var prDOff:  int64 := peek64(prEBase + CG_PR_OFF_DOFF);
           var prNDOff: int64 := peek64(prEBase + CG_PR_OFF_NDOFF);
+          // #2249: Eintraege ohne Aufruf weglassen — sonst listete jedes
+          // Programm alle Funktionen der importierten std mit „0 calls“.
+          self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05);
+          var prPZ: int64 := self.codeLen; self.cg_e32(0);
+          self.cg_addPatch(prPZ, prDOff + 8, 0, CG_PATCH_STR);                              // mov rax, [count]
+          self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);                              // test rax, rax
+          self.cg_e8(0x0F); self.cg_e8(0x84); var prSkip: int64 := self.codeLen; self.cg_e32(0);  // jz weiter
           // Write "[PROFILE] " to stderr
           self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x35);
           var prPH: int64 := self.codeLen; self.cg_e32(0);
@@ -31377,6 +31458,7 @@ pub type Codegen = class {
           self.cg_e8(0xBF); self.cg_e8(2); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov edi, 2
           self.cg_e8(0xB8); self.cg_e8(1); self.cg_e8(0); self.cg_e8(0); self.cg_e8(0);    // mov eax, 1
           self.cg_e8(0x0F); self.cg_e8(0x05);                                                // syscall
+          poke32(self.code + prSkip, self.codeLen - prSkip - 4);   // #2249: weiter
           prIdx += 1;
         }
       }
