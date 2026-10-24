@@ -1,0 +1,494 @@
+// std/nn_io.lyx
+// Netzzustand als Bytefolge: Format, Puffer, Datei.
+
+@description("Serialization of neural networks from std.nn: versioned binary format with checksum, buffer and file I/O, optional optimizer state")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.nn_io;
+
+import std.nn;
+import std.math;
+import std.alloc;
+import std.fs;
+
+// ── Worum es geht ────────────────────────────────────────────────────────────
+//
+// Ein trainiertes Netz muss eine Sitzung ueberleben. Diese Unit schreibt den
+// VOLLSTAENDIGEN Zustand in eine Bytefolge und liest ihn zurueck: Architektur,
+// Gewichte, Verlust- und Optimiererwahl samt Hyperparametern, Schrittzaehler,
+// Zufallszustand und -- wenn gewuenscht -- die Momente des Optimierers.
+//
+// Warum der Optimiererzustand dazugehoert: ohne ihn laeuft ein fortgesetztes
+// Training anders weiter als das unterbrochene, und zwar lautlos. Adam
+// korrigiert seinen Bias ueber den Schrittzaehler; faengt der bei null an,
+// macht der erste Schritt nach dem Laden einen Sprung.
+//
+// ── Aufbau der Bytefolge ─────────────────────────────────────────────────────
+//
+//   Offset  Groesse  Inhalt
+//   0       8        Kennung "LYXNN1\0\0"
+//   8       8        Formatfassung (1)
+//   16      8        Merkmalsbits: Bit 0 = Optimiererzustand enthalten,
+//                    Bit 1 = Netz stand im Trainingsmodus
+//   24      8        Eingangsbreite
+//   32      8        Zahl der Schichten
+//   40      24*L     je Schicht: Ausgabebreite, Aktivierung, Dropout-Anteil
+//   ...     8        Verlustart
+//   ...     8        Optimierer
+//   ...     8*6      lr, momentum, beta1, beta2, adamEps, leakySlope (f64)
+//   ...     8        Schrittzaehler (0, wenn Bit 0 nicht gesetzt ist)
+//   ...     8        Zufallszustand
+//   ...     8*3      weightDecay, gradClip, huberDelta (f64)
+//   ...     8        Grundlernrate (f64)
+//   ...     8        Art des Lernraten-Zeitplans
+//   ...     8*2      Zeitplanparameter p1, p2 (f64)
+//   ...     8        Epochennummer
+//   ...     8        Zahl der Parameter
+//   ...     8*P      Parameter (Reihenfolge von NnSaveParams)
+//   ...     8        Zahl der Optimiererwerte (nur bei Bit 0)
+//   ...     8*O      Optimiererwerte (nur bei Bit 0)
+//   ...     8        Pruefsumme (FNV-1a ueber alles davor)
+//
+// Alle Zahlen stehen als 8 Byte in der Bytereihenfolge der Maschine; alle
+// Ziele dieses Compilers sind little-endian (x86-64, arm64, riscv64, xtensa,
+// cortex-m4). f64 steht als IEEE-754-Bitmuster.
+//
+// ── Die Pruefsumme wird geprueft ─────────────────────────────────────────────
+//
+// Eine Pruefsumme, die beim Laden nicht verglichen wird, ist Zierde. Hier
+// scheitert das Laden bei Abweichung -- NnIoLoadError sagt, woran. Ein halb
+// geladenes Netz gibt es nicht: erst wird die Bytefolge geprueft, dann wird
+// gebaut.
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in std.nn: Konstanten als Funktionen, jeder peekf64 erst in eine
+// Variable.
+
+fn _zero(): f64 { return 0.0; }
+
+fn _g(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn _s(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+// ── Kennzahlen ───────────────────────────────────────────────────────────────
+
+pub con NNIO_FORMAT: int64 := 2;
+
+// Merkmalsbits
+pub con NNIO_WITH_OPT: int64 := 1;
+pub con NNIO_TRAINING: int64 := 2;   // Netz stand im Trainingsmodus
+
+// Fehlerschluessel von NnIoLoadError
+pub con NNIO_OK: int64         := 0;
+pub con NNIO_E_ARGS: int64     := 1;   // Zeiger 0 oder Laenge unbrauchbar
+pub con NNIO_E_MAGIC: int64    := 2;   // Kennung passt nicht
+pub con NNIO_E_FORMAT: int64   := 3;   // Formatfassung unbekannt
+pub con NNIO_E_TRUNC: int64    := 4;   // Bytefolge kuerzer als der Kopf sagt
+pub con NNIO_E_CHECKSUM: int64 := 5;   // Pruefsumme weicht ab
+pub con NNIO_E_SHAPE: int64    := 6;   // Architekturangaben unbrauchbar
+pub con NNIO_E_BUILD: int64    := 7;   // Netz liess sich nicht anlegen
+pub con NNIO_E_FILE: int64     := 8;   // Datei fehlt, ist leer oder zu gross
+
+// Letzter Fehler. Eine globale Angabe ist hier richtig: die Ladefunktionen
+// geben ein Handle bzw. bool zurueck, und ohne diesen Schluessel waere jeder
+// Fehlschlag ununterscheidbar -- "ging nicht" ist keine Diagnose.
+var _nnio_err: int64 := 0;
+
+pub fn NnIoLoadError(): int64 {
+  return _nnio_err;
+}
+
+fn _fail(code: int64): int64 {
+  _nnio_err := code;
+  return 0;
+}
+
+// ── Pruefsumme ───────────────────────────────────────────────────────────────
+//
+// FNV-1a ueber die Bytes. Kein kryptographischer Schutz -- der Zweck ist, eine
+// abgeschnittene oder verdrehte Datei zu erkennen, nicht eine gefaelschte.
+// Wer Echtheit braucht, legt eine Signatur darueber.
+
+fn _fnv1a(buf: int64, len: int64): int64 {
+  var h: int64 := -3750763034362895579;   // 0xcbf29ce484222325 als int64
+  var i: int64 := 0;
+  while (i < len) {
+    var b: int64 := peek8(buf + i);
+    h := h ^ b;
+    h := h * 1099511628211;
+    i := i + 1;
+  }
+  return h;
+}
+
+// Dieselbe Rechnung oeffentlich -- wer eine Bytefolge ausserhalb dieser Unit
+// weiterreicht (Datenbank, Netz), kann damit selbst nachrechnen.
+pub fn NnIoChecksum(buf: int64, len: int64): int64 {
+  if (buf == 0) { return 0; }
+  if (len < 1) { return 0; }
+  return _fnv1a(buf, len);
+}
+
+// ── Groesse ──────────────────────────────────────────────────────────────────
+
+con HDR_FIXED_SLOTS: int64 := 5;    // Kennung, Fassung, Merkmale, inDim, nLayer
+con TAIL_SLOTS: int64 := 19;        // loss, opt, 6 f64, step, rng, paramCount,
+                                    // l2, clip, huber, lr0, lrKind, p1, p2, epoch
+
+// Zahl der Bytes, die NnIoSaveBuffer schreibt. 0 heisst: Netz unbrauchbar.
+pub fn NnIoBufferSize(net: int64, withOpt: bool): int64 {
+  var nL: int64 := NnLayerCount(net);
+  if (nL < 1) { return 0; }
+  var slots: int64 := HDR_FIXED_SLOTS + nL * 3 + TAIL_SLOTS;
+  slots := slots + NnParamCount(net);
+  if (withOpt) {
+    slots := slots + 1 + NnOptStateCount(net);
+  }
+  slots := slots + 1;                 // Pruefsumme
+  return slots * 8;
+}
+
+// ── Schreiben ────────────────────────────────────────────────────────────────
+
+fn _putI(buf: int64, slot: int64, v: int64): void {
+  poke64(buf + slot * 8, v);
+}
+
+fn _getI(buf: int64, slot: int64): int64 {
+  return peek64(buf + slot * 8);
+}
+
+fn _magic(): int64 {
+  // "LYXNN1\0\0" als little-endian-Wort: L=0x4c Y=0x59 X=0x58 N=0x4e N=0x4e 1=0x31
+  return 3544670011230023756;
+}
+
+// Zustand nach buf schreiben. cap ist die Groesse des Puffers in Bytes.
+// Rueckgabe ist die Zahl der geschriebenen Bytes, 0 bei Fehler
+// (NnIoLoadError sagt, welcher).
+pub fn NnIoSaveBuffer(net: int64, buf: int64, cap: int64, withOpt: bool): int64 {
+  _nnio_err := NNIO_OK;
+  if (buf == 0) { return _fail(NNIO_E_ARGS); }
+  var need: int64 := NnIoBufferSize(net, withOpt);
+  if (need == 0) { return _fail(NNIO_E_SHAPE); }
+  if (cap < need) { return _fail(NNIO_E_ARGS); }
+
+  var nL: int64 := NnLayerCount(net);
+  var flags: int64 := 0;
+  if (withOpt) { flags := NNIO_WITH_OPT; }
+  // Der Modus gehoert in die Datei: ein im Inferenzmodus ausgeliefertes Netz,
+  // das als trainierend zurueckkaeme, wuerde mit Dropout vorhersagen und bei
+  // derselben Eingabe zweimal etwas anderes antworten -- lautlos.
+  if (NnIsTraining(net)) { flags := flags | NNIO_TRAINING; }
+
+  _putI(buf, 0, _magic());
+  _putI(buf, 1, NNIO_FORMAT);
+  _putI(buf, 2, flags);
+  _putI(buf, 3, NnInputDim(net));
+  _putI(buf, 4, nL);
+  var at: int64 := HDR_FIXED_SLOTS;
+  var k: int64 := 0;
+  while (k < nL) {
+    _putI(buf, at, NnLayerOutDim(net, k));
+    _putI(buf, at + 1, NnLayerAct(net, k));
+    _s(buf, at + 2, NnDropout(net, k));
+    at := at + 3;
+    k := k + 1;
+  }
+  _putI(buf, at, NnLoss(net));
+  _putI(buf, at + 1, NnOptimizer(net));
+  _s(buf, at + 2, NnLearningRate(net));
+  _s(buf, at + 3, NnMomentum(net));
+  _s(buf, at + 4, NnBeta1(net));
+  _s(buf, at + 5, NnBeta2(net));
+  _s(buf, at + 6, NnAdamEps(net));
+  _s(buf, at + 7, NnLeakySlope(net));
+  // Der Schrittzaehler gehoert zum Optimiererzustand: ohne die Momente ist er
+  // schaedlich, weil Adam seine Bias-Korrektur daran festmacht und der erste
+  // Schritt nach dem Laden sonst einen Sprung macht. Schlank gesichert heisst
+  // also auch: Zaehler auf null.
+  var step: int64 := 0;
+  if (withOpt) { step := NnStepCount(net); }
+  _putI(buf, at + 8, step);
+  _putI(buf, at + 9, NnRngState(net));
+  var pc: int64 := NnParamCount(net);
+  _putI(buf, at + 10, pc);
+  _s(buf, at + 11, NnWeightDecay(net));
+  _s(buf, at + 12, NnGradClip(net));
+  _s(buf, at + 13, NnHuberDelta(net));
+  _s(buf, at + 14, NnBaseLearningRate(net));
+  _putI(buf, at + 15, NnLrSchedule(net));
+  _s(buf, at + 16, NnLrParam1(net));
+  _s(buf, at + 17, NnLrParam2(net));
+  _putI(buf, at + 18, NnEpoch(net));
+  at := at + TAIL_SLOTS;
+  if (NnSaveParams(net, buf + at * 8) != pc) { return _fail(NNIO_E_SHAPE); }
+  at := at + pc;
+  if (withOpt) {
+    var oc: int64 := NnOptStateCount(net);
+    _putI(buf, at, oc);
+    at := at + 1;
+    if (NnSaveOptState(net, buf + at * 8) != oc) { return _fail(NNIO_E_SHAPE); }
+    at := at + oc;
+  }
+  // Pruefsumme ueber alles davor
+  _putI(buf, at, _fnv1a(buf, at * 8));
+  at := at + 1;
+  return at * 8;
+}
+
+// ── Kopf lesen, ohne zu bauen ────────────────────────────────────────────────
+
+// Prueft Kennung, Fassung, Laenge und Pruefsumme. Rueckgabe NNIO_OK oder ein
+// Fehlerschluessel. Dies ist die EINE Stelle, die entscheidet, ob eine
+// Bytefolge brauchbar ist -- beide Ladewege gehen durch sie.
+pub fn NnIoVerify(buf: int64, len: int64): int64 {
+  if (buf == 0) { return NNIO_E_ARGS; }
+  // Kopf bis einschliesslich Schichtzahl
+  if (len < HDR_FIXED_SLOTS * 8) { return NNIO_E_TRUNC; }
+  if (_getI(buf, 0) != _magic()) { return NNIO_E_MAGIC; }
+  if (_getI(buf, 1) != NNIO_FORMAT) { return NNIO_E_FORMAT; }
+  var flags: int64 := _getI(buf, 2);
+  var inDim: int64 := _getI(buf, 3);
+  var nL: int64 := _getI(buf, 4);
+  if (inDim < 1) { return NNIO_E_SHAPE; }
+  if (nL < 1) { return NNIO_E_SHAPE; }
+  if (nL > 4096) { return NNIO_E_SHAPE; }
+  var slots: int64 := HDR_FIXED_SLOTS + nL * 3 + TAIL_SLOTS;
+  if (len < slots * 8) { return NNIO_E_TRUNC; }
+  // Architektur nachrechnen und mit der mitgeschriebenen Parameterzahl
+  // vergleichen: so faellt eine verdrehte Datei auf, bevor etwas gebaut wird
+  var at: int64 := HDR_FIXED_SLOTS;
+  var prev: int64 := inDim;
+  var calc: int64 := 0;
+  var k: int64 := 0;
+  while (k < nL) {
+    var outDim: int64 := _getI(buf, at);
+    var act: int64 := _getI(buf, at + 1);
+    if (outDim < 1) { return NNIO_E_SHAPE; }
+    if (act < NN_ACT_LINEAR) { return NNIO_E_SHAPE; }
+    if (act > NN_ACT_SOFTMAX) { return NNIO_E_SHAPE; }
+    var drop: f64 := _g(buf, at + 2);
+    if (drop < _zero()) { return NNIO_E_SHAPE; }
+    if (drop >= 1.0) { return NNIO_E_SHAPE; }
+    // Dropout auf der letzten Schicht gibt es nicht (NnSetDropout lehnt es
+    // ab); eine Bytefolge, die es behauptet, ist unbrauchbar
+    if (k == nL - 1) {
+      if (drop > _zero()) { return NNIO_E_SHAPE; }
+    }
+    calc := calc + prev * outDim + outDim;
+    prev := outDim;
+    at := at + 3;
+    k := k + 1;
+  }
+  var pc: int64 := _getI(buf, at + 10);
+  if (pc != calc) { return NNIO_E_SHAPE; }
+  at := at + TAIL_SLOTS + pc;
+  if ((flags & NNIO_WITH_OPT) != 0) {
+    if (len < (at + 1) * 8) { return NNIO_E_TRUNC; }
+    var oc: int64 := _getI(buf, at);
+    if (oc != pc * 2) { return NNIO_E_SHAPE; }
+    at := at + 1 + oc;
+  }
+  if (len < (at + 1) * 8) { return NNIO_E_TRUNC; }
+  var want: int64 := _getI(buf, at);
+  if (_fnv1a(buf, at * 8) != want) { return NNIO_E_CHECKSUM; }
+  return NNIO_OK;
+}
+
+// Angaben aus dem Kopf, ohne das Netz zu bauen. Alle vier geben bei
+// unbrauchbarer Bytefolge 0 bzw. -1.
+pub fn NnIoHeaderInputDim(buf: int64, len: int64): int64 {
+  if (NnIoVerify(buf, len) != NNIO_OK) { return 0; }
+  return _getI(buf, 3);
+}
+
+pub fn NnIoHeaderLayerCount(buf: int64, len: int64): int64 {
+  if (NnIoVerify(buf, len) != NNIO_OK) { return 0; }
+  return _getI(buf, 4);
+}
+
+pub fn NnIoHeaderOutputDim(buf: int64, len: int64): int64 {
+  if (NnIoVerify(buf, len) != NNIO_OK) { return 0; }
+  var nL: int64 := _getI(buf, 4);
+  return _getI(buf, HDR_FIXED_SLOTS + (nL - 1) * 3);
+}
+
+pub fn NnIoHeaderHasOptState(buf: int64, len: int64): bool {
+  if (NnIoVerify(buf, len) != NNIO_OK) { return false; }
+  if ((_getI(buf, 2) & NNIO_WITH_OPT) != 0) { return true; }
+  return false;
+}
+
+pub fn NnIoHeaderParamCount(buf: int64, len: int64): int64 {
+  if (NnIoVerify(buf, len) != NNIO_OK) { return 0; }
+  var nL: int64 := _getI(buf, 4);
+  return _getI(buf, HDR_FIXED_SLOTS + nL * 3 + 10);
+}
+
+// ── Lesen ────────────────────────────────────────────────────────────────────
+
+// Netz aus einer Bytefolge aufbauen. Rueckgabe ist ein Handle wie von NnNew
+// oder 0; NnIoLoadError() nennt den Grund. Der Aufrufer gibt es mit NnFree
+// zurueck.
+pub fn NnIoLoadBuffer(buf: int64, len: int64): int64 {
+  var rc: int64 := NnIoVerify(buf, len);
+  if (rc != NNIO_OK) { return _fail(rc); }
+  _nnio_err := NNIO_OK;
+
+  var flags: int64 := _getI(buf, 2);
+  var inDim: int64 := _getI(buf, 3);
+  var nL: int64 := _getI(buf, 4);
+  var net: int64 := NnNew(inDim, nL);
+  if (net == NN_INVALID) { return _fail(NNIO_E_BUILD); }
+  var at: int64 := HDR_FIXED_SLOTS;
+  var k: int64 := 0;
+  while (k < nL) {
+    if (NnAddDense(net, _getI(buf, at), _getI(buf, at + 1)) == false) {
+      NnFree(net);
+      return _fail(NNIO_E_BUILD);
+    }
+    at := at + 3;
+    k := k + 1;
+  }
+  // Dropout erst, wenn alle Schichten stehen: NnSetDropout lehnt die letzte
+  // Schicht ab, und welche das ist, weiss es erst dann
+  k := 0;
+  var dAt: int64 := HDR_FIXED_SLOTS;
+  while (k < nL) {
+    var drop: f64 := _g(buf, dAt + 2);
+    if (drop > _zero()) {
+      if (NnSetDropout(net, k, drop) == false) {
+        NnFree(net);
+        return _fail(NNIO_E_SHAPE);
+      }
+    }
+    dAt := dAt + 3;
+    k := k + 1;
+  }
+  // Verlust und Optimierer. NnSetLoss prueft die Ausgabeaktivierung mit --
+  // eine Bytefolge mit unpassender Paarung ist nicht ladbar, statt mit einem
+  // falschen Gradienten weiterzurechnen.
+  if (NnSetLoss(net, _getI(buf, at)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  if (NnSetOptimizer(net, _getI(buf, at + 1)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  NnSetMomentum(net, _g(buf, at + 3));
+  NnSetAdam(net, _g(buf, at + 4), _g(buf, at + 5), _g(buf, at + 6));
+  NnSetLeakySlope(net, _g(buf, at + 7));
+  // NnSetOptimizer hat den Schrittzaehler genullt -- darum erst jetzt setzen
+  if (NnSetStepCount(net, _getI(buf, at + 8)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  if (NnSetRngState(net, _getI(buf, at + 9)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  if (NnSetWeightDecay(net, _g(buf, at + 11)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  if (NnSetGradClip(net, _g(buf, at + 12)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  if (NnSetHuberDelta(net, _g(buf, at + 13)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  // Grundlernrate zuletzt setzen und dann die wirksame wiederherstellen:
+  // NnSetLearningRate setzt beide, der Zeitplan rechnet aus der Grundrate
+  NnSetLearningRate(net, _g(buf, at + 14));
+  if (NnSetLrSchedule(net, _getI(buf, at + 15),
+                      _g(buf, at + 16), _g(buf, at + 17)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  if (NnSetEpoch(net, _getI(buf, at + 18)) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  // wirksame Lernrate aus der Datei, nicht die vom Zeitplan nachgerechnete:
+  // sie kann von Hand gesetzt worden sein
+  NnSetEffectiveLearningRate(net, _g(buf, at + 2));
+  if ((flags & NNIO_TRAINING) != 0) {
+    NnSetTraining(net, true);
+  } else {
+    NnSetTraining(net, false);
+  }
+  var pc: int64 := _getI(buf, at + 10);
+  at := at + TAIL_SLOTS;
+  if (NnLoadParams(net, buf + at * 8, pc) == false) {
+    NnFree(net);
+    return _fail(NNIO_E_SHAPE);
+  }
+  at := at + pc;
+  if ((flags & NNIO_WITH_OPT) != 0) {
+    var oc: int64 := _getI(buf, at);
+    at := at + 1;
+    if (NnLoadOptState(net, buf + at * 8, oc) == false) {
+      NnFree(net);
+      return _fail(NNIO_E_SHAPE);
+    }
+  }
+  return net;
+}
+
+// ── Datei ────────────────────────────────────────────────────────────────────
+
+// Hoechstgroesse einer Netzdatei, die geladen wird: 256 MiB. Ohne Deckel
+// bestimmt die Datei, wie viel Speicher angefordert wird.
+pub fn NnIoMaxFileBytes(): int64 {
+  return 268435456;
+}
+
+// Netz in eine Datei schreiben. Rueckgabe ist die Zahl der geschriebenen
+// Bytes oder 0; NnIoLoadError() nennt den Grund.
+pub fn NnIoSaveFile(net: int64, path: pchar, withOpt: bool): int64 {
+  _nnio_err := NNIO_OK;
+  if (path == 0 as pchar) { return _fail(NNIO_E_ARGS); }
+  var need: int64 := NnIoBufferSize(net, withOpt);
+  if (need == 0) { return _fail(NNIO_E_SHAPE); }
+  var buf: int64 := alloc(need);
+  if (buf == 0) { return _fail(NNIO_E_ARGS); }
+  var n: int64 := NnIoSaveBuffer(net, buf, need, withOpt);
+  if (n == 0) {
+    free(buf, need);
+    return 0;                      // _nnio_err steht schon
+  }
+  var written: int64 := WriteFile(path, buf as pchar, n);
+  free(buf, need);
+  if (written != n) { return _fail(NNIO_E_FILE); }
+  return n;
+}
+
+// Netz aus einer Datei aufbauen. Rueckgabe ist ein Handle oder 0;
+// NnIoLoadError() nennt den Grund. Der Aufrufer gibt es mit NnFree zurueck.
+pub fn NnIoLoadFile(path: pchar): int64 {
+  _nnio_err := NNIO_OK;
+  if (path == 0 as pchar) { return _fail(NNIO_E_ARGS); }
+  var size: int64 := FileSize(path);
+  if (size < 1) { return _fail(NNIO_E_FILE); }
+  if (size > NnIoMaxFileBytes()) { return _fail(NNIO_E_FILE); }
+  var buf: int64 := alloc(size);
+  if (buf == 0) { return _fail(NNIO_E_ARGS); }
+  var got: int64 := ReadFile(path, buf as pchar, size);
+  if (got != size) {
+    free(buf, size);
+    return _fail(NNIO_E_FILE);
+  }
+  var net: int64 := NnIoLoadBuffer(buf, got);
+  free(buf, size);
+  return net;                      // bei 0 steht _nnio_err schon
+}

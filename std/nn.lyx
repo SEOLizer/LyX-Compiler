@@ -1,0 +1,1795 @@
+// std/nn.lyx
+// Vorwaertsgerichtete neuronale Netze: Aufbau, Vorwaertslauf, Rueckwaertslauf,
+// Optimierer.
+
+@description("Feed-forward neural networks: dense layers, activations, backpropagation, SGD/Momentum/Adam")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.nn;
+
+import std.math;
+import std.alloc;
+
+// ── Worum es geht ────────────────────────────────────────────────────────────
+//
+// Ein Netz ist hier eine Kette dichter Schichten. Jede Schicht haelt eine
+// Gewichtsmatrix W (outDim x inDim, zeilenweise) und einen Bias b (outDim) und
+// rechnet
+//
+//     z = W * x + b ,   a = act(z)
+//
+// Der Rueckwaertslauf traegt den Fehler von hinten nach vorn:
+//
+//     delta_L   = dLoss/da * act'(z)          (Ausgabeschicht)
+//     delta_k   = (W_{k+1}^T * delta_{k+1}) * act'(z_k)
+//     dW_k     += delta_k * x_k^T  ,  db_k += delta_k
+//
+// Die Gradienten werden ueber einen Stapel AUFSUMMIERT (NnAccumulate) und erst
+// beim Schritt (NnStep) durch die Stapelgroesse geteilt. Dadurch ist dieselbe
+// Maschinerie Einzelschritt, Mini-Stapel und Voll-Stapel.
+//
+// ── Warum Softmax+Kreuzentropie zusammen ─────────────────────────────────────
+//
+// Fuer Softmax getrennt gerechnet waere die Ableitung eine volle Jacobi-Matrix.
+// Zusammen mit der Kreuzentropie kuerzt sich alles zu delta = a - y. Genauso
+// bei Sigmoid mit binaerer Kreuzentropie. Diese Unit nutzt die gekuerzte Form
+// und prueft sie: NN_LOSS_CE verlangt NN_ACT_SOFTMAX in der letzten Schicht,
+// NN_LOSS_BCE verlangt NN_ACT_SIGMOID. Wer etwas anderes kombiniert, bekommt
+// `false` — nicht stillschweigend einen falschen Gradienten.
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in std.linalg und std.tensor: `con f64` als Operand (#1499), negatives
+// Literal als Operand (#1496), unaeres Minus auf einer Variablen im Ausdruck
+// (#1512) und peekf64 direkt im Ausdruck (Typbug derselben Familie) rechnen
+// still falsch. Konstanten stehen darum als Funktionen, negiert wird ueber
+// _neg(), und jeder Speicherlesevorgang geht ueber _g() in eine Variable.
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _half(): f64 { return 0.5; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+fn _eps(): f64  { return 0.000000000001; }
+fn _pi(): f64   { return 3.141592653589793; }
+
+fn _g(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn _s(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+fn _add(p: int64, i: int64, v: f64): void {
+  var old: f64 := peekf64(p + i * 8);
+  pokef64(p + i * 8, old + v);
+}
+
+// ── Kennzahlen ───────────────────────────────────────────────────────────────
+
+pub con NN_ACT_LINEAR: int64    := 0;
+pub con NN_ACT_RELU: int64      := 1;
+pub con NN_ACT_SIGMOID: int64   := 2;
+pub con NN_ACT_TANH: int64      := 3;
+pub con NN_ACT_LEAKYRELU: int64 := 4;
+pub con NN_ACT_SOFTMAX: int64   := 5;
+
+pub con NN_LOSS_MSE: int64 := 0;     // Regression
+pub con NN_LOSS_BCE: int64 := 1;     // binaer, mit Sigmoid-Ausgabe
+pub con NN_LOSS_CE: int64  := 2;     // mehrklassig, mit Softmax-Ausgabe
+pub con NN_LOSS_MAE: int64 := 3;     // Regression, robust gegen Ausreisser
+pub con NN_LOSS_HUBER: int64 := 4;   // quadratisch nahe null, linear aussen
+
+// Lernraten-Zeitplan. Der Zeitplan rechnet aus der GRUNDLERNRATE und der
+// Epochennummer; die wirksame Lernrate steht danach in NnLearningRate().
+pub con NN_LR_CONST: int64  := 0;
+pub con NN_LR_STEP: int64   := 1;   // alle p2 Epochen mit p1 multiplizieren
+pub con NN_LR_EXP: int64    := 2;   // lr0 * p1^epoche
+pub con NN_LR_COSINE: int64 := 3;   // Kosinus von lr0 auf p1 ueber p2 Epochen
+
+pub con NN_OPT_SGD: int64      := 0;
+pub con NN_OPT_MOMENTUM: int64 := 1;
+pub con NN_OPT_ADAM: int64     := 2;
+
+pub con NN_INVALID: int64 := 0;
+
+// Kopf des Netzes, Slots je 8 Byte
+con H_MAGIC: int64   := 0;
+con H_NLAYER: int64  := 1;
+con H_MAXLAYER: int64 := 2;
+con H_INDIM: int64   := 3;
+con H_LAYERS: int64  := 4;
+con H_LOSS: int64    := 5;
+con H_OPT: int64     := 6;
+con H_LR: int64      := 7;
+con H_MOM: int64     := 8;
+con H_B1: int64      := 9;
+con H_B2: int64      := 10;
+con H_AEPS: int64    := 11;
+con H_STEP: int64    := 12;
+con H_RNG: int64     := 13;
+con H_LEAK: int64    := 14;
+con H_L2: int64      := 15;   // Gewichtsabfall
+con H_CLIP: int64    := 16;   // Schwelle der Gradientennorm, 0 = aus
+con H_HUBER: int64   := 17;   // Knickpunkt von Huber
+con H_TRAIN: int64   := 18;   // 1 = Trainingsmodus (Dropout wirkt)
+con H_LR0: int64     := 19;   // Grundlernrate des Zeitplans
+con H_LRK: int64     := 20;   // Art des Zeitplans
+con H_LRP1: int64    := 21;
+con H_LRP2: int64    := 22;
+con H_EPOCH: int64   := 23;   // letzte gesetzte Epochennummer
+con H_SLOTS: int64   := 24;
+
+con NN_MAGIC: int64 := 7566667;   // 'nnf'
+
+// Schichtbeschreibung, Slots je 8 Byte
+con L_INDIM: int64  := 0;
+con L_OUTDIM: int64 := 1;
+con L_ACT: int64    := 2;
+con L_W: int64      := 3;
+con L_B: int64      := 4;
+con L_Z: int64      := 5;
+con L_A: int64      := 6;
+con L_DW: int64     := 7;
+con L_DB: int64     := 8;
+con L_DELTA: int64  := 9;
+con L_MW: int64     := 10;
+con L_VW: int64     := 11;
+con L_MB: int64     := 12;
+con L_VB: int64     := 13;
+con L_IN: int64     := 14;
+con L_DROP: int64   := 15;   // Dropout-Anteil (f64), 0 = aus
+con L_MASK: int64   := 16;   // Maske des letzten Vorwaertslaufs
+con L_SLOTS: int64  := 17;
+
+fn _hg(net: int64, slot: int64): int64 { return peek64(net + slot * 8); }
+fn _hs(net: int64, slot: int64, v: int64): void { poke64(net + slot * 8, v); }
+fn _hgf(net: int64, slot: int64): f64 {
+  var v: f64 := peekf64(net + slot * 8);
+  return v;
+}
+fn _hsf(net: int64, slot: int64, v: f64): void { pokef64(net + slot * 8, v); }
+
+fn _layer(net: int64, k: int64): int64 {
+  var base: int64 := _hg(net, H_LAYERS);
+  return base + k * L_SLOTS * 8;
+}
+
+fn _lg(l: int64, slot: int64): int64 { return peek64(l + slot * 8); }
+fn _ls(l: int64, slot: int64, v: int64): void { poke64(l + slot * 8, v); }
+
+fn _isNet(net: int64): bool {
+  if (net == 0) { return false; }
+  if (_hg(net, H_MAGIC) != NN_MAGIC) { return false; }
+  return true;
+}
+
+// ── Zufall ───────────────────────────────────────────────────────────────────
+//
+// Eigener xorshift64* statt std.prob: die Gewichtsanfangswerte sollen
+// REPRODUZIERBAR sein. Ein Netz mit gesetztem Keim trainiert zweimal gleich,
+// und genau das macht einen Trainingstest ueberhaupt pruefbar.
+
+fn _nextBits(net: int64): int64 {
+  var s: int64 := _hg(net, H_RNG);
+  if (s == 0) { s := 88172645463325252; }
+  s := s ^ (s >> 12);
+  s := s ^ (s << 25);
+  s := s ^ (s >> 27);
+  _hs(net, H_RNG, s);
+  var r: int64 := s * 2685821657736338717;
+  // Die Maske ist nicht Zierde: `>>` ist arithmetisch, und das Produkt ist in
+  // der Haelfte der Faelle negativ. Ohne das Abschneiden des Vorzeichenbits
+  // kommt eine negative Zahl heraus, und der erste Gebrauch als Index
+  // (Fisher-Yates) greift vor den Puffer.
+  return (r >> 11) & 9007199254740991;     // 53 Bit, immer >= 0
+}
+
+// gleichverteilt in [0,1)
+fn _uni(net: int64): f64 {
+  var bits: int64 := _nextBits(net);
+  var scale: f64 := 9007199254740992.0;    // 2^53
+  return (bits as f64) / scale;
+}
+
+// gleichverteilt in [-r, r]
+fn _uniSym(net: int64, r: f64): f64 {
+  var u: f64 := _uni(net);
+  var two: f64 := 2.0;
+  return (u * two - _one()) * r;
+}
+
+// Standardnormal nach Box-Muller (Polarform)
+fn _normal(net: int64): f64 {
+  var u1: f64 := _uni(net);
+  var u2: f64 := _uni(net);
+  // log(0) vermeiden
+  if (u1 < _eps()) { u1 := _eps(); }
+  var two: f64 := 2.0;
+  var r: f64 := SqrtF64(_neg(two) * LogF64(u1));
+  var theta: f64 := two * _pi() * u2;
+  return r * CosF64(theta);
+}
+
+// ── Anlegen und Freigeben ────────────────────────────────────────────────────
+
+// Netz mit inputDim Eingaengen und Platz fuer maxLayers Schichten.
+// Rueckgabe NN_INVALID bei unbrauchbaren Angaben.
+pub fn NnNew(inputDim: int64, maxLayers: int64): int64 {
+  if (inputDim < 1) { return NN_INVALID; }
+  if (maxLayers < 1) { return NN_INVALID; }
+  var net: int64 := allocZeroed(H_SLOTS * 8);
+  if (net == 0) { return NN_INVALID; }
+  var layers: int64 := allocZeroed(maxLayers * L_SLOTS * 8);
+  if (layers == 0) {
+    free(net, H_SLOTS * 8);
+    return NN_INVALID;
+  }
+  _hs(net, H_MAGIC, NN_MAGIC);
+  _hs(net, H_NLAYER, 0);
+  _hs(net, H_MAXLAYER, maxLayers);
+  _hs(net, H_INDIM, inputDim);
+  _hs(net, H_LAYERS, layers);
+  _hs(net, H_LOSS, NN_LOSS_MSE);
+  _hs(net, H_OPT, NN_OPT_SGD);
+  _hsf(net, H_LR, 0.01);
+  _hsf(net, H_MOM, 0.9);
+  _hsf(net, H_B1, 0.9);
+  _hsf(net, H_B2, 0.999);
+  _hsf(net, H_AEPS, 0.00000001);
+  _hs(net, H_STEP, 0);
+  _hs(net, H_RNG, 88172645463325252);
+  _hsf(net, H_LEAK, 0.01);
+  _hsf(net, H_L2, 0.0);
+  _hsf(net, H_CLIP, 0.0);
+  _hsf(net, H_HUBER, 1.0);
+  _hs(net, H_TRAIN, 1);
+  _hsf(net, H_LR0, 0.01);
+  _hs(net, H_LRK, NN_LR_CONST);
+  _hsf(net, H_LRP1, 1.0);
+  _hsf(net, H_LRP2, 1.0);
+  _hs(net, H_EPOCH, 0);
+  return net;
+}
+
+fn _freeLayer(l: int64): void {
+  var inDim: int64 := _lg(l, L_INDIM);
+  var outDim: int64 := _lg(l, L_OUTDIM);
+  var wBytes: int64 := inDim * outDim * 8;
+  var bBytes: int64 := outDim * 8;
+  free(_lg(l, L_W), wBytes);
+  free(_lg(l, L_DW), wBytes);
+  free(_lg(l, L_B), bBytes);
+  free(_lg(l, L_DB), bBytes);
+  free(_lg(l, L_Z), bBytes);
+  free(_lg(l, L_A), bBytes);
+  free(_lg(l, L_DELTA), bBytes);
+  if (_lg(l, L_MW) != 0) { free(_lg(l, L_MW), wBytes); }
+  if (_lg(l, L_VW) != 0) { free(_lg(l, L_VW), wBytes); }
+  if (_lg(l, L_MB) != 0) { free(_lg(l, L_MB), bBytes); }
+  if (_lg(l, L_VB) != 0) { free(_lg(l, L_VB), bBytes); }
+  if (_lg(l, L_MASK) != 0) { free(_lg(l, L_MASK), bBytes); }
+}
+
+pub fn NnFree(net: int64): void {
+  if (_isNet(net) == false) { return; }
+  var n: int64 := _hg(net, H_NLAYER);
+  var k: int64 := 0;
+  while (k < n) {
+    _freeLayer(_layer(net, k));
+    k := k + 1;
+  }
+  free(_hg(net, H_LAYERS), _hg(net, H_MAXLAYER) * L_SLOTS * 8);
+  _hs(net, H_MAGIC, 0);
+  free(net, H_SLOTS * 8);
+}
+
+// Eingangsbreite der naechsten Schicht: Ausgabe der letzten, sonst H_INDIM
+fn _nextIn(net: int64): int64 {
+  var n: int64 := _hg(net, H_NLAYER);
+  if (n == 0) { return _hg(net, H_INDIM); }
+  return _lg(_layer(net, n - 1), L_OUTDIM);
+}
+
+// Dichte Schicht anhaengen. Momentum- und Adam-Zustand werden mit angelegt,
+// damit ein Optimiererwechsel nach dem Aufbau nicht nachallokieren muss.
+pub fn NnAddDense(net: int64, outDim: int64, act: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (outDim < 1) { return false; }
+  if (act < NN_ACT_LINEAR) { return false; }
+  if (act > NN_ACT_SOFTMAX) { return false; }
+  var n: int64 := _hg(net, H_NLAYER);
+  if (n >= _hg(net, H_MAXLAYER)) { return false; }
+  var inDim: int64 := _nextIn(net);
+  var wBytes: int64 := inDim * outDim * 8;
+  var bBytes: int64 := outDim * 8;
+  var w: int64  := allocZeroed(wBytes);
+  var dw: int64 := allocZeroed(wBytes);
+  var mw: int64 := allocZeroed(wBytes);
+  var vw: int64 := allocZeroed(wBytes);
+  var b: int64  := allocZeroed(bBytes);
+  var db: int64 := allocZeroed(bBytes);
+  var mb: int64 := allocZeroed(bBytes);
+  var vb: int64 := allocZeroed(bBytes);
+  var z: int64  := allocZeroed(bBytes);
+  var a: int64  := allocZeroed(bBytes);
+  var d: int64  := allocZeroed(bBytes);
+  var msk: int64 := allocZeroed(bBytes);
+  if (w == 0)  { return false; }
+  if (dw == 0) { return false; }
+  if (mw == 0) { return false; }
+  if (vw == 0) { return false; }
+  if (b == 0)  { return false; }
+  if (db == 0) { return false; }
+  if (mb == 0) { return false; }
+  if (vb == 0) { return false; }
+  if (z == 0)  { return false; }
+  if (a == 0)  { return false; }
+  if (d == 0)  { return false; }
+  if (msk == 0) { return false; }
+  var l: int64 := _layer(net, n);
+  _ls(l, L_INDIM, inDim);
+  _ls(l, L_OUTDIM, outDim);
+  _ls(l, L_ACT, act);
+  _ls(l, L_W, w);
+  _ls(l, L_B, b);
+  _ls(l, L_Z, z);
+  _ls(l, L_A, a);
+  _ls(l, L_DW, dw);
+  _ls(l, L_DB, db);
+  _ls(l, L_DELTA, d);
+  _ls(l, L_MW, mw);
+  _ls(l, L_VW, vw);
+  _ls(l, L_MB, mb);
+  _ls(l, L_VB, vb);
+  _ls(l, L_IN, 0);
+  _ls(l, L_MASK, msk);
+  _s(msk, 0, _one());          // ohne Dropout ist die Maske durchgaengig 1
+  var mi: int64 := 1;
+  while (mi < outDim) {
+    _s(msk, mi, _one());
+    mi := mi + 1;
+  }
+  _hs(net, H_NLAYER, n + 1);
+  return true;
+}
+
+// ── Abfragen ─────────────────────────────────────────────────────────────────
+
+pub fn NnLayerCount(net: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  return _hg(net, H_NLAYER);
+}
+
+pub fn NnInputDim(net: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  return _hg(net, H_INDIM);
+}
+
+pub fn NnOutputDim(net: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  var n: int64 := _hg(net, H_NLAYER);
+  if (n == 0) { return 0; }
+  return _lg(_layer(net, n - 1), L_OUTDIM);
+}
+
+pub fn NnLayerInDim(net: int64, k: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  if (k < 0) { return 0; }
+  if (k >= _hg(net, H_NLAYER)) { return 0; }
+  return _lg(_layer(net, k), L_INDIM);
+}
+
+pub fn NnLayerOutDim(net: int64, k: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  if (k < 0) { return 0; }
+  if (k >= _hg(net, H_NLAYER)) { return 0; }
+  return _lg(_layer(net, k), L_OUTDIM);
+}
+
+pub fn NnLayerAct(net: int64, k: int64): int64 {
+  if (_isNet(net) == false) { return -1; }
+  if (k < 0) { return -1; }
+  if (k >= _hg(net, H_NLAYER)) { return -1; }
+  return _lg(_layer(net, k), L_ACT);
+}
+
+// Anzahl trainierbarer Zahlen (Gewichte + Biase) ueber alle Schichten
+pub fn NnParamCount(net: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  var n: int64 := _hg(net, H_NLAYER);
+  var k: int64 := 0;
+  var cnt: int64 := 0;
+  while (k < n) {
+    var l: int64 := _layer(net, k);
+    cnt := cnt + _lg(l, L_INDIM) * _lg(l, L_OUTDIM) + _lg(l, L_OUTDIM);
+    k := k + 1;
+  }
+  return cnt;
+}
+
+// ── Einstellungen ────────────────────────────────────────────────────────────
+
+pub fn NnSeed(net: int64, seed: int64): void {
+  if (_isNet(net) == false) { return; }
+  if (seed == 0) { _hs(net, H_RNG, 88172645463325252); return; }
+  _hs(net, H_RNG, seed);
+}
+
+// Setzt die wirksame UND die Grundlernrate. Letztere ist der Bezugspunkt
+// jedes Zeitplans -- wer sie nicht mitfuehrte, haette nach der ersten
+// Zeitplan-Epoche keinen Weg zurueck.
+pub fn NnSetLearningRate(net: int64, lr: f64): void {
+  if (_isNet(net) == false) { return; }
+  _hsf(net, H_LR, lr);
+  _hsf(net, H_LR0, lr);
+}
+
+pub fn NnLearningRate(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_LR);
+}
+
+// Gewichtsabfall (L2). Wirkt NUR auf Gewichte, nicht auf Biase: ein Bias
+// verschiebt die Schwelle eines Neurons und hat mit der Groesse der
+// Gewichtsmatrix nichts zu tun -- ihn mitzuschrumpfen zieht das Netz ohne
+// Gegenwert zur Null.
+pub fn NnSetWeightDecay(net: int64, lambda: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (lambda < 0.0) { return false; }
+  _hsf(net, H_L2, lambda);
+  return true;
+}
+
+pub fn NnWeightDecay(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_L2);
+}
+
+// Schwelle fuer die GLOBALE Gradientennorm ueber alle Schichten. 0 schaltet
+// das Begrenzen ab. Je Schicht einzeln zu begrenzen waere etwas anderes: es
+// verschiebt die Richtung des Gesamtgradienten, statt ihn nur zu kuerzen.
+pub fn NnSetGradClip(net: int64, maxNorm: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (maxNorm < 0.0) { return false; }
+  _hsf(net, H_CLIP, maxNorm);
+  return true;
+}
+
+pub fn NnGradClip(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_CLIP);
+}
+
+// Knickpunkt von Huber: bis dahin quadratisch, danach linear.
+pub fn NnSetHuberDelta(net: int64, delta: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (delta <= 0.0) { return false; }
+  _hsf(net, H_HUBER, delta);
+  return true;
+}
+
+pub fn NnHuberDelta(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_HUBER);
+}
+
+pub fn NnSetLeakySlope(net: int64, slope: f64): void {
+  if (_isNet(net) == false) { return; }
+  _hsf(net, H_LEAK, slope);
+}
+
+// Verlustart. Prueft die Ausgabeaktivierung mit: BCE braucht Sigmoid, CE
+// braucht Softmax -- die gekuerzten Gradienten gelten nur dort.
+pub fn NnSetLoss(net: int64, kind: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (kind < NN_LOSS_MSE) { return false; }
+  if (kind > NN_LOSS_HUBER) { return false; }
+  var n: int64 := _hg(net, H_NLAYER);
+  if (n > 0) {
+    var act: int64 := _lg(_layer(net, n - 1), L_ACT);
+    if (kind == NN_LOSS_BCE) {
+      if (act != NN_ACT_SIGMOID) { return false; }
+    }
+    if (kind == NN_LOSS_CE) {
+      if (act != NN_ACT_SOFTMAX) { return false; }
+    }
+    // Softmax gehoert zur Kreuzentropie: fuer jeden anderen Verlust waere
+    // die Ableitung eine volle Jacobi-Matrix, die hier nicht gerechnet wird
+    if (kind == NN_LOSS_MSE) {
+      if (act == NN_ACT_SOFTMAX) { return false; }
+    }
+    if (kind == NN_LOSS_MAE) {
+      if (act == NN_ACT_SOFTMAX) { return false; }
+    }
+    if (kind == NN_LOSS_HUBER) {
+      if (act == NN_ACT_SOFTMAX) { return false; }
+    }
+  }
+  _hs(net, H_LOSS, kind);
+  return true;
+}
+
+pub fn NnLoss(net: int64): int64 {
+  if (_isNet(net) == false) { return -1; }
+  return _hg(net, H_LOSS);
+}
+
+pub fn NnSetOptimizer(net: int64, kind: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (kind < NN_OPT_SGD) { return false; }
+  if (kind > NN_OPT_ADAM) { return false; }
+  _hs(net, H_OPT, kind);
+  _hs(net, H_STEP, 0);
+  return true;
+}
+
+pub fn NnSetMomentum(net: int64, mu: f64): void {
+  if (_isNet(net) == false) { return; }
+  _hsf(net, H_MOM, mu);
+}
+
+pub fn NnSetAdam(net: int64, beta1: f64, beta2: f64, eps: f64): void {
+  if (_isNet(net) == false) { return; }
+  _hsf(net, H_B1, beta1);
+  _hsf(net, H_B2, beta2);
+  _hsf(net, H_AEPS, eps);
+}
+
+// Optimiererzustand (Momentum, Adam-Momente, Schrittzaehler) auf null
+pub fn NnResetOptimizer(net: int64): void {
+  if (_isNet(net) == false) { return; }
+  var n: int64 := _hg(net, H_NLAYER);
+  var k: int64 := 0;
+  while (k < n) {
+    var l: int64 := _layer(net, k);
+    var nw: int64 := _lg(l, L_INDIM) * _lg(l, L_OUTDIM);
+    var nb: int64 := _lg(l, L_OUTDIM);
+    var i: int64 := 0;
+    while (i < nw) {
+      _s(_lg(l, L_MW), i, _zero());
+      _s(_lg(l, L_VW), i, _zero());
+      i := i + 1;
+    }
+    i := 0;
+    while (i < nb) {
+      _s(_lg(l, L_MB), i, _zero());
+      _s(_lg(l, L_VB), i, _zero());
+      i := i + 1;
+    }
+    k := k + 1;
+  }
+  _hs(net, H_STEP, 0);
+}
+
+// ── Anfangswerte ─────────────────────────────────────────────────────────────
+
+fn _initLayer(net: int64, l: int64, mode: int64, scale: f64): void {
+  var inDim: int64 := _lg(l, L_INDIM);
+  var outDim: int64 := _lg(l, L_OUTDIM);
+  var w: int64 := _lg(l, L_W);
+  var b: int64 := _lg(l, L_B);
+  var cnt: int64 := inDim * outDim;
+  var i: int64 := 0;
+  var fi: f64 := (inDim as f64);
+  var fo: f64 := (outDim as f64);
+  var two: f64 := 2.0;
+  var six: f64 := 6.0;
+  var lim: f64 := scale;
+  if (mode == 1) {
+    // Xavier/Glorot, gleichverteilt: sqrt(6/(in+out))
+    lim := SqrtF64(six / (fi + fo));
+  }
+  if (mode == 2) {
+    // He, normalverteilt: sigma = sqrt(2/in)
+    lim := SqrtF64(two / fi);
+  }
+  while (i < cnt) {
+    if (mode == 2) {
+      _s(w, i, _normal(net) * lim);
+    } else {
+      _s(w, i, _uniSym(net, lim));
+    }
+    i := i + 1;
+  }
+  i := 0;
+  while (i < outDim) {
+    _s(b, i, _zero());
+    i := i + 1;
+  }
+}
+
+fn _initAll(net: int64, mode: int64, scale: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  var n: int64 := _hg(net, H_NLAYER);
+  if (n == 0) { return false; }
+  var k: int64 := 0;
+  while (k < n) {
+    _initLayer(net, _layer(net, k), mode, scale);
+    k := k + 1;
+  }
+  return true;
+}
+
+// Gleichverteilt in [-scale, scale]
+pub fn NnInitUniform(net: int64, scale: f64): bool {
+  return _initAll(net, 0, scale);
+}
+
+// Xavier/Glorot -- fuer Sigmoid und Tanh
+pub fn NnInitXavier(net: int64): bool {
+  return _initAll(net, 1, _zero());
+}
+
+// He -- fuer ReLU
+pub fn NnInitHe(net: int64): bool {
+  return _initAll(net, 2, _zero());
+}
+
+// ── Gewichte lesen und setzen ────────────────────────────────────────────────
+
+pub fn NnGetWeight(net: int64, k: int64, row: int64, col: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (k < 0) { return _zero(); }
+  if (k >= _hg(net, H_NLAYER)) { return _zero(); }
+  var l: int64 := _layer(net, k);
+  if (row < 0) { return _zero(); }
+  if (row >= _lg(l, L_OUTDIM)) { return _zero(); }
+  if (col < 0) { return _zero(); }
+  if (col >= _lg(l, L_INDIM)) { return _zero(); }
+  return _g(_lg(l, L_W), row * _lg(l, L_INDIM) + col);
+}
+
+pub fn NnSetWeight(net: int64, k: int64, row: int64, col: int64, v: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (k < 0) { return false; }
+  if (k >= _hg(net, H_NLAYER)) { return false; }
+  var l: int64 := _layer(net, k);
+  if (row < 0) { return false; }
+  if (row >= _lg(l, L_OUTDIM)) { return false; }
+  if (col < 0) { return false; }
+  if (col >= _lg(l, L_INDIM)) { return false; }
+  _s(_lg(l, L_W), row * _lg(l, L_INDIM) + col, v);
+  return true;
+}
+
+pub fn NnGetBias(net: int64, k: int64, row: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (k < 0) { return _zero(); }
+  if (k >= _hg(net, H_NLAYER)) { return _zero(); }
+  var l: int64 := _layer(net, k);
+  if (row < 0) { return _zero(); }
+  if (row >= _lg(l, L_OUTDIM)) { return _zero(); }
+  return _g(_lg(l, L_B), row);
+}
+
+pub fn NnSetBias(net: int64, k: int64, row: int64, v: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (k < 0) { return false; }
+  if (k >= _hg(net, H_NLAYER)) { return false; }
+  var l: int64 := _layer(net, k);
+  if (row < 0) { return false; }
+  if (row >= _lg(l, L_OUTDIM)) { return false; }
+  _s(_lg(l, L_B), row, v);
+  return true;
+}
+
+// Aufsummierter Gewichtsgradient -- der Haken, an dem ein Test den
+// Rueckwaertslauf gegen eine finite Differenz haengen kann.
+pub fn NnGradWeight(net: int64, k: int64, row: int64, col: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (k < 0) { return _zero(); }
+  if (k >= _hg(net, H_NLAYER)) { return _zero(); }
+  var l: int64 := _layer(net, k);
+  if (row < 0) { return _zero(); }
+  if (row >= _lg(l, L_OUTDIM)) { return _zero(); }
+  if (col < 0) { return _zero(); }
+  if (col >= _lg(l, L_INDIM)) { return _zero(); }
+  return _g(_lg(l, L_DW), row * _lg(l, L_INDIM) + col);
+}
+
+pub fn NnGradBias(net: int64, k: int64, row: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (k < 0) { return _zero(); }
+  if (k >= _hg(net, H_NLAYER)) { return _zero(); }
+  var l: int64 := _layer(net, k);
+  if (row < 0) { return _zero(); }
+  if (row >= _lg(l, L_OUTDIM)) { return _zero(); }
+  return _g(_lg(l, L_DB), row);
+}
+
+// ── Aktivierungen ────────────────────────────────────────────────────────────
+
+fn _sigmoid(z: f64): f64 {
+  // Beide Haelften getrennt: exp(+grosse Zahl) laeuft sonst ueber
+  if (z >= _zero()) {
+    var e: f64 := ExpF64(_neg(z));
+    return _one() / (_one() + e);
+  }
+  var e2: f64 := ExpF64(z);
+  return e2 / (_one() + e2);
+}
+
+fn _tanh(z: f64): f64 {
+  var two: f64 := 2.0;
+  return two * _sigmoid(two * z) - _one();
+}
+
+// act auf z anwenden, Ergebnis nach a. Softmax braucht die ganze Zeile.
+fn _applyAct(net: int64, act: int64, z: int64, a: int64, n: int64): void {
+  var i: int64 := 0;
+  if (act == NN_ACT_SOFTMAX) {
+    // Maximum abziehen: exp(z) laeuft sonst bei grossen z ueber
+    var mx: f64 := _g(z, 0);
+    i := 1;
+    while (i < n) {
+      var zv: f64 := _g(z, i);
+      if (zv > mx) { mx := zv; }
+      i := i + 1;
+    }
+    var sum: f64 := _zero();
+    i := 0;
+    while (i < n) {
+      var zv2: f64 := _g(z, i);
+      var e: f64 := ExpF64(zv2 - mx);
+      _s(a, i, e);
+      sum := sum + e;
+      i := i + 1;
+    }
+    if (sum < _eps()) { sum := _eps(); }
+    i := 0;
+    while (i < n) {
+      var av: f64 := _g(a, i);
+      _s(a, i, av / sum);
+      i := i + 1;
+    }
+    return;
+  }
+  var leak: f64 := _hgf(net, H_LEAK);
+  while (i < n) {
+    var v: f64 := _g(z, i);
+    if (act == NN_ACT_LINEAR) {
+      _s(a, i, v);
+    }
+    if (act == NN_ACT_RELU) {
+      if (v > _zero()) { _s(a, i, v); } else { _s(a, i, _zero()); }
+    }
+    if (act == NN_ACT_SIGMOID) {
+      _s(a, i, _sigmoid(v));
+    }
+    if (act == NN_ACT_TANH) {
+      _s(a, i, _tanh(v));
+    }
+    if (act == NN_ACT_LEAKYRELU) {
+      if (v > _zero()) { _s(a, i, v); } else { _s(a, i, v * leak); }
+    }
+    i := i + 1;
+  }
+}
+
+// act'(z) an der Stelle i, ausgedrueckt durch z bzw. die Ausgabe a.
+// Softmax ist hier nicht enthalten: dort ist die Ableitung eine Matrix und
+// wird nur in der mit der Kreuzentropie gekuerzten Form benutzt.
+fn _actDeriv(net: int64, act: int64, z: int64, a: int64, i: int64): f64 {
+  if (act == NN_ACT_LINEAR) { return _one(); }
+  if (act == NN_ACT_RELU) {
+    var v: f64 := _g(z, i);
+    if (v > _zero()) { return _one(); }
+    return _zero();
+  }
+  if (act == NN_ACT_SIGMOID) {
+    var s: f64 := _g(a, i);
+    return s * (_one() - s);
+  }
+  if (act == NN_ACT_TANH) {
+    var t: f64 := _g(a, i);
+    return _one() - t * t;
+  }
+  if (act == NN_ACT_LEAKYRELU) {
+    var v2: f64 := _g(z, i);
+    if (v2 > _zero()) { return _one(); }
+    return _hgf(net, H_LEAK);
+  }
+  return _one();
+}
+
+// ── Dropout ──────────────────────────────────────────────────────────────────
+//
+// Umgekehrtes Dropout (inverted dropout): im Training wird ein Anteil der
+// Ausgaben einer Schicht auf null gesetzt und der Rest mit 1/(1-p)
+// hochskaliert. Dadurch ist der ERWARTUNGSWERT der Ausgabe derselbe wie ohne
+// Dropout, und die Vorhersage braucht keine Nachkorrektur -- sie laeuft
+// einfach mit abgeschalteter Maske.
+//
+// Genau darum gibt es den Trainings-/Inferenzmodus (NnSetTraining). Ohne ihn
+// wuerde eine Vorhersage still mit zufaellig ausgeknipsten Neuronen rechnen:
+// ein Netz, das zweimal nach derselben Eingabe gefragt zwei Antworten gibt,
+// ohne dass irgendwo ein Fehler gemeldet wird.
+//
+// Die Maske des letzten Vorwaertslaufs bleibt stehen, weil der
+// Rueckwaertslauf sie braucht: der Gradient darf nur durch die Neuronen
+// zurueckfliessen, die auch nach vorn beigetragen haben.
+
+fn _applyDropout(net: int64, l: int64, n: int64): void {
+  var rate: f64 := _g(l, L_DROP);
+  var mask: int64 := _lg(l, L_MASK);
+  var a: int64 := _lg(l, L_A);
+  var i: int64 := 0;
+  // Ausserhalb des Trainings und ohne Anteil ist die Maske durchgaengig 1 --
+  // einmal gesetzt, damit der Rueckwaertslauf keinen Sonderfall braucht
+  if (rate <= _zero()) {
+    while (i < n) {
+      _s(mask, i, _one());
+      i := i + 1;
+    }
+    return;
+  }
+  if (_hg(net, H_TRAIN) == 0) {
+    while (i < n) {
+      _s(mask, i, _one());
+      i := i + 1;
+    }
+    return;
+  }
+  var keep: f64 := _one() - rate;
+  if (keep < _eps()) { keep := _eps(); }
+  var scale: f64 := _one() / keep;
+  while (i < n) {
+    var u: f64 := _uni(net);
+    if (u < rate) {
+      _s(mask, i, _zero());
+      _s(a, i, _zero());
+    } else {
+      _s(mask, i, scale);
+      var av: f64 := _g(a, i);
+      _s(a, i, av * scale);
+    }
+    i := i + 1;
+  }
+}
+
+// Dropout-Anteil einer Schicht. Die LETZTE Schicht wird abgelehnt: dort
+// wuerde Dropout Ausgaben der Vorhersage ausknipsen, und bei Softmax waere
+// die Summe nicht mehr eins. Anteil ausserhalb [0,1) ebenso.
+pub fn NnSetDropout(net: int64, k: int64, rate: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  var nL: int64 := _hg(net, H_NLAYER);
+  if (k < 0) { return false; }
+  if (k >= nL) { return false; }
+  if (k == nL - 1) { return false; }
+  if (rate < _zero()) { return false; }
+  if (rate >= _one()) { return false; }
+  _s(_layer(net, k), L_DROP, rate);
+  return true;
+}
+
+pub fn NnDropout(net: int64, k: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (k < 0) { return _zero(); }
+  if (k >= _hg(net, H_NLAYER)) { return _zero(); }
+  return _g(_layer(net, k), L_DROP);
+}
+
+// Trainings- oder Inferenzmodus. Im Inferenzmodus wirkt kein Dropout.
+pub fn NnSetTraining(net: int64, on: bool): void {
+  if (_isNet(net) == false) { return; }
+  if (on) { _hs(net, H_TRAIN, 1); } else { _hs(net, H_TRAIN, 0); }
+}
+
+pub fn NnIsTraining(net: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (_hg(net, H_TRAIN) == 1) { return true; }
+  return false;
+}
+
+// ── Vorwaertslauf ────────────────────────────────────────────────────────────
+
+// x ist ein f64-Feld mit NnInputDim() Eintraegen. Rueckgabe ist der Zeiger auf
+// die Ausgabe der letzten Schicht (NnOutputDim() Eintraege) oder 0.
+pub fn NnForward(net: int64, x: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  if (x == 0) { return 0; }
+  var n: int64 := _hg(net, H_NLAYER);
+  if (n == 0) { return 0; }
+  var inPtr: int64 := x;
+  var k: int64 := 0;
+  while (k < n) {
+    var l: int64 := _layer(net, k);
+    var inDim: int64 := _lg(l, L_INDIM);
+    var outDim: int64 := _lg(l, L_OUTDIM);
+    var w: int64 := _lg(l, L_W);
+    var b: int64 := _lg(l, L_B);
+    var z: int64 := _lg(l, L_Z);
+    _ls(l, L_IN, inPtr);
+    var r: int64 := 0;
+    while (r < outDim) {
+      var acc: f64 := _g(b, r);
+      var c: int64 := 0;
+      var rowBase: int64 := r * inDim;
+      while (c < inDim) {
+        acc := acc + _g(w, rowBase + c) * _g(inPtr, c);
+        c := c + 1;
+      }
+      _s(z, r, acc);
+      r := r + 1;
+    }
+    _applyAct(net, _lg(l, L_ACT), z, _lg(l, L_A), outDim);
+    _applyDropout(net, l, outDim);
+    inPtr := _lg(l, L_A);
+    k := k + 1;
+  }
+  return inPtr;
+}
+
+// Zeiger auf die letzte Ausgabe (nach NnForward gueltig)
+pub fn NnOutput(net: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  var n: int64 := _hg(net, H_NLAYER);
+  if (n == 0) { return 0; }
+  return _lg(_layer(net, n - 1), L_A);
+}
+
+pub fn NnOutputAt(net: int64, i: int64): f64 {
+  var o: int64 := NnOutput(net);
+  if (o == 0) { return _zero(); }
+  if (i < 0) { return _zero(); }
+  if (i >= NnOutputDim(net)) { return _zero(); }
+  return _g(o, i);
+}
+
+// Vorwaertslauf und Ausgabe nach out kopieren
+pub fn NnPredict(net: int64, x: int64, out: int64): bool {
+  var o: int64 := NnForward(net, x);
+  if (o == 0) { return false; }
+  if (out == 0) { return false; }
+  var n: int64 := NnOutputDim(net);
+  var i: int64 := 0;
+  while (i < n) {
+    _s(out, i, _g(o, i));
+    i := i + 1;
+  }
+  return true;
+}
+
+// Index des groessten Ausgabewerts -- die Klassenentscheidung
+pub fn NnPredictClass(net: int64, x: int64): int64 {
+  var o: int64 := NnForward(net, x);
+  if (o == 0) { return -1; }
+  var n: int64 := NnOutputDim(net);
+  var best: int64 := 0;
+  var bv: f64 := _g(o, 0);
+  var i: int64 := 1;
+  while (i < n) {
+    var v: f64 := _g(o, i);
+    if (v > bv) { bv := v; best := i; }
+    i := i + 1;
+  }
+  return best;
+}
+
+// ── Verlust ──────────────────────────────────────────────────────────────────
+
+fn _lossOf2(net: int64, kind: int64, a: int64, y: int64, n: int64): f64 {
+  var i: int64 := 0;
+  var sum: f64 := _zero();
+  if (kind == NN_LOSS_MAE) {
+    while (i < n) {
+      sum := sum + AbsF64(_g(a, i) - _g(y, i));
+      i := i + 1;
+    }
+    return sum;
+  }
+  if (kind == NN_LOSS_HUBER) {
+    // quadratisch bis zum Knickpunkt, danach linear -- so zieht ein einzelner
+    // Ausreisser den Gradienten nicht beliebig weit
+    var dl: f64 := _hgf(net, H_HUBER);
+    while (i < n) {
+      var d: f64 := _g(a, i) - _g(y, i);
+      var ad: f64 := AbsF64(d);
+      if (ad <= dl) {
+        sum := sum + _half() * d * d;
+      } else {
+        sum := sum + dl * (ad - _half() * dl);
+      }
+      i := i + 1;
+    }
+    return sum;
+  }
+  return _lossOf(kind, a, y, n);
+}
+
+fn _lossOf(kind: int64, a: int64, y: int64, n: int64): f64 {
+  var i: int64 := 0;
+  var sum: f64 := _zero();
+  if (kind == NN_LOSS_MSE) {
+    while (i < n) {
+      var d: f64 := _g(a, i) - _g(y, i);
+      sum := sum + d * d;
+      i := i + 1;
+    }
+    return sum * _half();
+  }
+  if (kind == NN_LOSS_BCE) {
+    while (i < n) {
+      var p: f64 := _g(a, i);
+      var t: f64 := _g(y, i);
+      if (p < _eps()) { p := _eps(); }
+      if (p > _one() - _eps()) { p := _one() - _eps(); }
+      sum := sum + _neg(t * LogF64(p) + (_one() - t) * LogF64(_one() - p));
+      i := i + 1;
+    }
+    return sum;
+  }
+  // NN_LOSS_CE
+  while (i < n) {
+    var p2: f64 := _g(a, i);
+    var t2: f64 := _g(y, i);
+    if (p2 < _eps()) { p2 := _eps(); }
+    sum := sum + _neg(t2 * LogF64(p2));
+    i := i + 1;
+  }
+  return sum;
+}
+
+// Verlust eines einzelnen Beispiels, ohne Gradienten
+pub fn NnSampleLoss(net: int64, x: int64, y: int64): f64 {
+  var o: int64 := NnForward(net, x);
+  if (o == 0) { return _zero(); }
+  if (y == 0) { return _zero(); }
+  return _lossOf2(net, _hg(net, H_LOSS), o, y, NnOutputDim(net));
+}
+
+// Mittlerer Verlust ueber n Beispiele. X ist n x inputDim, Y ist n x outputDim,
+// beide zeilenweise.
+pub fn NnEvaluate(net: int64, X: int64, Y: int64, n: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (n < 1) { return _zero(); }
+  var inDim: int64 := _hg(net, H_INDIM);
+  var outDim: int64 := NnOutputDim(net);
+  var i: int64 := 0;
+  var sum: f64 := _zero();
+  while (i < n) {
+    sum := sum + NnSampleLoss(net, X + i * inDim * 8, Y + i * outDim * 8);
+    i := i + 1;
+  }
+  return sum / (n as f64);
+}
+
+// ── Rueckwaertslauf ──────────────────────────────────────────────────────────
+
+pub fn NnZeroGrad(net: int64): void {
+  if (_isNet(net) == false) { return; }
+  var n: int64 := _hg(net, H_NLAYER);
+  var k: int64 := 0;
+  while (k < n) {
+    var l: int64 := _layer(net, k);
+    var nw: int64 := _lg(l, L_INDIM) * _lg(l, L_OUTDIM);
+    var nb: int64 := _lg(l, L_OUTDIM);
+    var i: int64 := 0;
+    while (i < nw) {
+      _s(_lg(l, L_DW), i, _zero());
+      i := i + 1;
+    }
+    i := 0;
+    while (i < nb) {
+      _s(_lg(l, L_DB), i, _zero());
+      i := i + 1;
+    }
+    k := k + 1;
+  }
+}
+
+// Vorwaertslauf, Verlust, Rueckwaertslauf; dW/db werden AUFSUMMIERT.
+// Rueckgabe ist der Verlust des Beispiels; bei ungueltigen Angaben 0.
+pub fn NnAccumulate(net: int64, x: int64, y: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (y == 0) { return _zero(); }
+  var o: int64 := NnForward(net, x);
+  if (o == 0) { return _zero(); }
+  var nL: int64 := _hg(net, H_NLAYER);
+  var kind: int64 := _hg(net, H_LOSS);
+  var last: int64 := _layer(net, nL - 1);
+  var outDim: int64 := _lg(last, L_OUTDIM);
+  var lossVal: f64 := _lossOf2(net, kind, o, y, outDim);
+
+  // Fehler der Ausgabeschicht
+  var dl: int64 := _lg(last, L_DELTA);
+  var act: int64 := _lg(last, L_ACT);
+  var i: int64 := 0;
+  if (kind == NN_LOSS_MSE) {
+    while (i < outDim) {
+      var d: f64 := _g(o, i) - _g(y, i);
+      _s(dl, i, d * _actDeriv(net, act, _lg(last, L_Z), o, i));
+      i := i + 1;
+    }
+  } else if (kind == NN_LOSS_MAE) {
+    // Ableitung des Betrags: das Vorzeichen. An der Stelle null ist sie nicht
+    // definiert; 0 ist dort der einzige Wert, der keine Richtung erfindet.
+    while (i < outDim) {
+      var d2: f64 := _g(o, i) - _g(y, i);
+      var sgn: f64 := _zero();
+      if (d2 > _zero()) { sgn := _one(); }
+      if (d2 < _zero()) { sgn := _neg(_one()); }
+      _s(dl, i, sgn * _actDeriv(net, act, _lg(last, L_Z), o, i));
+      i := i + 1;
+    }
+  } else if (kind == NN_LOSS_HUBER) {
+    var dlim: f64 := _hgf(net, H_HUBER);
+    while (i < outDim) {
+      var d3: f64 := _g(o, i) - _g(y, i);
+      var g3: f64 := d3;
+      if (d3 > dlim) { g3 := dlim; }
+      if (d3 < _neg(dlim)) { g3 := _neg(dlim); }
+      _s(dl, i, g3 * _actDeriv(net, act, _lg(last, L_Z), o, i));
+      i := i + 1;
+    }
+  } else {
+    // BCE mit Sigmoid und CE mit Softmax kuerzen beide zu a - y
+    while (i < outDim) {
+      _s(dl, i, _g(o, i) - _g(y, i));
+      i := i + 1;
+    }
+  }
+
+  // von hinten nach vorn
+  var k: int64 := nL - 1;
+  while (k >= 0) {
+    var l: int64 := _layer(net, k);
+    var inDim: int64 := _lg(l, L_INDIM);
+    var oDim: int64 := _lg(l, L_OUTDIM);
+    var delta: int64 := _lg(l, L_DELTA);
+    var inPtr: int64 := _lg(l, L_IN);
+    var dw: int64 := _lg(l, L_DW);
+    var db: int64 := _lg(l, L_DB);
+    // dW += delta * x^T , db += delta
+    var r: int64 := 0;
+    while (r < oDim) {
+      var dv: f64 := _g(delta, r);
+      _add(db, r, dv);
+      var rowBase: int64 := r * inDim;
+      var c: int64 := 0;
+      while (c < inDim) {
+        _add(dw, rowBase + c, dv * _g(inPtr, c));
+        c := c + 1;
+      }
+      r := r + 1;
+    }
+    // Fehler der Vorgaengerschicht
+    if (k > 0) {
+      var prev: int64 := _layer(net, k - 1);
+      var pDelta: int64 := _lg(prev, L_DELTA);
+      var pAct: int64 := _lg(prev, L_ACT);
+      var pZ: int64 := _lg(prev, L_Z);
+      var pA: int64 := _lg(prev, L_A);
+      var w: int64 := _lg(l, L_W);
+      var c2: int64 := 0;
+      while (c2 < inDim) {
+        var acc: f64 := _zero();
+        var r2: int64 := 0;
+        while (r2 < oDim) {
+          acc := acc + _g(w, r2 * inDim + c2) * _g(delta, r2);
+          r2 := r2 + 1;
+        }
+        // Maske der Vorgaengerschicht: ausgeknipste Neuronen haben nach vorn
+        // nichts beigetragen, also fliesst durch sie auch kein Gradient
+        // zurueck. Ohne Dropout steht dort 1, ohne Sonderfall.
+        var mv: f64 := _g(_lg(prev, L_MASK), c2);
+        _s(pDelta, c2, acc * _actDeriv(net, pAct, pZ, pA, c2) * mv);
+        c2 := c2 + 1;
+      }
+    }
+    k := k - 1;
+  }
+  return lossVal;
+}
+
+// ── Optimierer ───────────────────────────────────────────────────────────────
+
+fn _applyOne(opt: int64, p: int64, grad: f64, i: int64,
+             m: int64, v: int64,
+             lr: f64, mu: f64, b1: f64, b2: f64, aeps: f64,
+             bc1: f64, bc2: f64): void {
+  var cur: f64 := _g(p, i);
+  if (opt == NN_OPT_SGD) {
+    _s(p, i, cur - lr * grad);
+    return;
+  }
+  if (opt == NN_OPT_MOMENTUM) {
+    var vel: f64 := _g(m, i);
+    vel := mu * vel - lr * grad;
+    _s(m, i, vel);
+    _s(p, i, cur + vel);
+    return;
+  }
+  // Adam
+  var mi: f64 := _g(m, i);
+  var vi: f64 := _g(v, i);
+  mi := b1 * mi + (_one() - b1) * grad;
+  vi := b2 * vi + (_one() - b2) * grad * grad;
+  _s(m, i, mi);
+  _s(v, i, vi);
+  var mh: f64 := mi / bc1;
+  var vh: f64 := vi / bc2;
+  _s(p, i, cur - lr * mh / (SqrtF64(vh) + aeps));
+}
+
+// Gradienten durch batchSize teilen und einen Schritt gehen.
+// batchSize < 1 wird abgelehnt -- eine Division durch null waere sonst ein
+// stiller Default.
+pub fn NnStep(net: int64, batchSize: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (batchSize < 1) { return false; }
+  var nL: int64 := _hg(net, H_NLAYER);
+  if (nL == 0) { return false; }
+  var opt: int64 := _hg(net, H_OPT);
+  var lr: f64 := _hgf(net, H_LR);
+  var mu: f64 := _hgf(net, H_MOM);
+  var b1: f64 := _hgf(net, H_B1);
+  var b2: f64 := _hgf(net, H_B2);
+  var aeps: f64 := _hgf(net, H_AEPS);
+  var scale: f64 := _one() / (batchSize as f64);
+  var l2: f64 := _hgf(net, H_L2);
+  // Gradienten begrenzen: erst die globale Norm der GEMITTELTEN Gradienten
+  // messen (einschliesslich des Gewichtsabfalls, denn der ist Teil des
+  // Gradienten, den der Schritt geht), dann alles mit demselben Faktor
+  // kuerzen. Nur ein gemeinsamer Faktor laesst die Richtung unveraendert.
+  var clipMax: f64 := _hgf(net, H_CLIP);
+  var clipScale: f64 := _one();
+  if (clipMax > _zero()) {
+    var sumSq: f64 := _zero();
+    var ck: int64 := 0;
+    while (ck < nL) {
+      var cl: int64 := _layer(net, ck);
+      var cnw: int64 := _lg(cl, L_INDIM) * _lg(cl, L_OUTDIM);
+      var cnb: int64 := _lg(cl, L_OUTDIM);
+      var ci: int64 := 0;
+      while (ci < cnw) {
+        var gw0: f64 := _g(_lg(cl, L_DW), ci) * scale + l2 * _g(_lg(cl, L_W), ci);
+        sumSq := sumSq + gw0 * gw0;
+        ci := ci + 1;
+      }
+      ci := 0;
+      while (ci < cnb) {
+        var gb0: f64 := _g(_lg(cl, L_DB), ci) * scale;
+        sumSq := sumSq + gb0 * gb0;
+        ci := ci + 1;
+      }
+      ck := ck + 1;
+    }
+    var norm: f64 := SqrtF64(sumSq);
+    if (norm > clipMax) { clipScale := clipMax / norm; }
+  }
+  var step: int64 := _hg(net, H_STEP) + 1;
+  _hs(net, H_STEP, step);
+  // Bias-Korrektur von Adam; fuer die anderen Optimierer ohne Wirkung
+  var bc1: f64 := _one();
+  var bc2: f64 := _one();
+  if (opt == NN_OPT_ADAM) {
+    bc1 := _one() - PowF64(b1, (step as f64));
+    bc2 := _one() - PowF64(b2, (step as f64));
+    if (bc1 < _eps()) { bc1 := _eps(); }
+    if (bc2 < _eps()) { bc2 := _eps(); }
+  }
+  var k: int64 := 0;
+  while (k < nL) {
+    var l: int64 := _layer(net, k);
+    var nw: int64 := _lg(l, L_INDIM) * _lg(l, L_OUTDIM);
+    var nb: int64 := _lg(l, L_OUTDIM);
+    var i: int64 := 0;
+    while (i < nw) {
+      // Gewichtsabfall ist ein Summand im Gradienten (L2-Term d/dw von
+      // lambda/2 * w^2), nicht ein Schrumpfen des Gewichts hinterher: nur so
+      // gehen Momentum und Adam korrekt damit um
+      var gw: f64 := (_g(_lg(l, L_DW), i) * scale + l2 * _g(_lg(l, L_W), i))
+                     * clipScale;
+      _applyOne(opt, _lg(l, L_W), gw, i, _lg(l, L_MW), _lg(l, L_VW),
+                lr, mu, b1, b2, aeps, bc1, bc2);
+      i := i + 1;
+    }
+    i := 0;
+    while (i < nb) {
+      var gb: f64 := _g(_lg(l, L_DB), i) * scale * clipScale;
+      _applyOne(opt, _lg(l, L_B), gb, i, _lg(l, L_MB), _lg(l, L_VB),
+                lr, mu, b1, b2, aeps, bc1, bc2);
+      i := i + 1;
+    }
+    k := k + 1;
+  }
+  return true;
+}
+
+// ── Training ─────────────────────────────────────────────────────────────────
+
+// Ein Stapel: Beispiele [offset, offset+count) aus X/Y.
+// Rueckgabe ist der mittlere Verlust des Stapels; bei ungueltigen Angaben 0.
+pub fn NnTrainBatch(net: int64, X: int64, Y: int64, nTotal: int64,
+                    offset: int64, count: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (count < 1) { return _zero(); }
+  if (offset < 0) { return _zero(); }
+  if (offset + count > nTotal) { return _zero(); }
+  var inDim: int64 := _hg(net, H_INDIM);
+  var outDim: int64 := NnOutputDim(net);
+  NnZeroGrad(net);
+  var i: int64 := 0;
+  var sum: f64 := _zero();
+  while (i < count) {
+    var idx: int64 := offset + i;
+    sum := sum + NnAccumulate(net, X + idx * inDim * 8, Y + idx * outDim * 8);
+    i := i + 1;
+  }
+  NnStep(net, count);
+  return sum / (count as f64);
+}
+
+// Eine Epoche in der gegebenen Reihenfolge. batchSize <= 0 heisst Voll-Stapel.
+// Der letzte Stapel bleibt kuerzer, wenn n nicht aufgeht.
+pub fn NnTrainEpoch(net: int64, X: int64, Y: int64, n: int64,
+                    batchSize: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (n < 1) { return _zero(); }
+  var bs: int64 := batchSize;
+  if (bs < 1) { bs := n; }
+  var off: int64 := 0;
+  var sum: f64 := _zero();
+  var seen: int64 := 0;
+  while (off < n) {
+    var cnt: int64 := bs;
+    if (off + cnt > n) { cnt := n - off; }
+    sum := sum + NnTrainBatch(net, X, Y, n, off, cnt) * (cnt as f64);
+    seen := seen + cnt;
+    off := off + cnt;
+  }
+  if (seen == 0) { return _zero(); }
+  return sum / (seen as f64);
+}
+
+// Epochen in Folge, Reihenfolge wie uebergeben. Rueckgabe ist der mittlere
+// Verlust der LETZTEN Epoche.
+pub fn NnTrain(net: int64, X: int64, Y: int64, n: int64,
+               batchSize: int64, epochs: int64): f64 {
+  if (epochs < 1) { return _zero(); }
+  var e: int64 := 0;
+  var last: f64 := _zero();
+  while (e < epochs) {
+    last := NnTrainEpoch(net, X, Y, n, batchSize);
+    e := e + 1;
+  }
+  return last;
+}
+
+// Eine Epoche in zufaelliger Reihenfolge. order ist ein int64-Feld mit n
+// Eintraegen, das der Aufrufer bereitstellt (Arbeitsspeicher); es wird mit
+// einer Permutation gefuellt. Die Beispiele werden einzeln gemischt gezogen
+// und in Stapeln verrechnet.
+pub fn NnTrainEpochShuffled(net: int64, X: int64, Y: int64, n: int64,
+                            batchSize: int64, order: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (n < 1) { return _zero(); }
+  if (order == 0) { return _zero(); }
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(order + i * 8, i);
+    i := i + 1;
+  }
+  // Fisher-Yates von hinten
+  i := n - 1;
+  while (i > 0) {
+    var bits: int64 := _nextBits(net);
+    var j: int64 := bits % (i + 1);
+    var a: int64 := peek64(order + i * 8);
+    var b: int64 := peek64(order + j * 8);
+    poke64(order + i * 8, b);
+    poke64(order + j * 8, a);
+    i := i - 1;
+  }
+  var bs: int64 := batchSize;
+  if (bs < 1) { bs := n; }
+  var inDim: int64 := _hg(net, H_INDIM);
+  var outDim: int64 := NnOutputDim(net);
+  var off: int64 := 0;
+  var sum: f64 := _zero();
+  while (off < n) {
+    var cnt: int64 := bs;
+    if (off + cnt > n) { cnt := n - off; }
+    NnZeroGrad(net);
+    var t: int64 := 0;
+    while (t < cnt) {
+      var idx: int64 := peek64(order + (off + t) * 8);
+      sum := sum + NnAccumulate(net, X + idx * inDim * 8,
+                                Y + idx * outDim * 8);
+      t := t + 1;
+    }
+    NnStep(net, cnt);
+    off := off + cnt;
+  }
+  return sum / (n as f64);
+}
+
+// ── Gewichte sichern und laden ───────────────────────────────────────────────
+//
+// Flache f64-Folge, Schicht fuer Schicht: erst alle Gewichte zeilenweise, dann
+// die Biase. Die Laenge ist NnParamCount(); der Aufrufer legt den Puffer an.
+
+pub fn NnSaveParams(net: int64, buf: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  if (buf == 0) { return 0; }
+  var nL: int64 := _hg(net, H_NLAYER);
+  var k: int64 := 0;
+  var at: int64 := 0;
+  while (k < nL) {
+    var l: int64 := _layer(net, k);
+    var nw: int64 := _lg(l, L_INDIM) * _lg(l, L_OUTDIM);
+    var nb: int64 := _lg(l, L_OUTDIM);
+    var i: int64 := 0;
+    while (i < nw) {
+      _s(buf, at, _g(_lg(l, L_W), i));
+      at := at + 1;
+      i := i + 1;
+    }
+    i := 0;
+    while (i < nb) {
+      _s(buf, at, _g(_lg(l, L_B), i));
+      at := at + 1;
+      i := i + 1;
+    }
+    k := k + 1;
+  }
+  return at;
+}
+
+// Laedt eine mit NnSaveParams erzeugte Folge zurueck. count muss genau
+// NnParamCount() sein -- eine kuerzere Folge wird abgelehnt statt halb
+// eingelesen.
+pub fn NnLoadParams(net: int64, buf: int64, count: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (buf == 0) { return false; }
+  if (count != NnParamCount(net)) { return false; }
+  var nL: int64 := _hg(net, H_NLAYER);
+  var k: int64 := 0;
+  var at: int64 := 0;
+  while (k < nL) {
+    var l: int64 := _layer(net, k);
+    var nw: int64 := _lg(l, L_INDIM) * _lg(l, L_OUTDIM);
+    var nb: int64 := _lg(l, L_OUTDIM);
+    var i: int64 := 0;
+    while (i < nw) {
+      _s(_lg(l, L_W), i, _g(buf, at));
+      at := at + 1;
+      i := i + 1;
+    }
+    i := 0;
+    while (i < nb) {
+      _s(_lg(l, L_B), i, _g(buf, at));
+      at := at + 1;
+      i := i + 1;
+    }
+    k := k + 1;
+  }
+  return true;
+}
+
+// ── Lernraten-Zeitplan ───────────────────────────────────────────────────────
+//
+// Der Zeitplan rechnet aus der GRUNDLERNRATE (zuletzt per NnSetLearningRate
+// gesetzt) und der Epochennummer. Die ausgerechnete Lernrate wird beim Setzen
+// der Epoche wirksam; NnLrForEpoch rechnet sie ohne Nebenwirkung aus, damit
+// sich ein Plan vor dem Lauf nachsehen laesst.
+//
+//   NN_LR_STEP:   lr0 * p1^(epoche / p2)      ganzzahlige Division
+//   NN_LR_EXP:    lr0 * p1^epoche
+//   NN_LR_COSINE: p1 + (lr0 - p1) * (1 + cos(pi * epoche / p2)) / 2
+//
+// Bei NN_LR_COSINE ist p1 die ENDLERNRATE und p2 die Zahl der geplanten
+// Epochen; ab p2 bleibt es bei p1, statt weiter zu schwingen.
+
+pub fn NnSetLrSchedule(net: int64, kind: int64, p1: f64, p2: f64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (kind < NN_LR_CONST) { return false; }
+  if (kind > NN_LR_COSINE) { return false; }
+  if (kind == NN_LR_STEP) {
+    if (p2 < _one()) { return false; }        // Stufenlaenge in Epochen
+    if (p1 <= _zero()) { return false; }
+  }
+  if (kind == NN_LR_EXP) {
+    if (p1 <= _zero()) { return false; }
+  }
+  if (kind == NN_LR_COSINE) {
+    if (p2 < _one()) { return false; }
+    if (p1 < _zero()) { return false; }
+  }
+  _hs(net, H_LRK, kind);
+  _hsf(net, H_LRP1, p1);
+  _hsf(net, H_LRP2, p2);
+  return true;
+}
+
+pub fn NnLrParam1(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_LRP1);
+}
+
+pub fn NnLrParam2(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_LRP2);
+}
+
+// Setzt NUR die wirksame Lernrate, ohne die Grundlernrate des Zeitplans zu
+// verschieben. Gebraucht wird das beim Zurueckladen eines Netzes: dort stehen
+// beide Werte getrennt in der Datei, und die wirksame kann von Hand gesetzt
+// worden sein.
+pub fn NnSetEffectiveLearningRate(net: int64, lr: f64): void {
+  if (_isNet(net) == false) { return; }
+  _hsf(net, H_LR, lr);
+}
+
+pub fn NnLrSchedule(net: int64): int64 {
+  if (_isNet(net) == false) { return -1; }
+  return _hg(net, H_LRK);
+}
+
+pub fn NnBaseLearningRate(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_LR0);
+}
+
+// Lernrate, die der Zeitplan fuer diese Epoche vorsieht -- ohne sie zu setzen
+pub fn NnLrForEpoch(net: int64, epoch: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (epoch < 0) { return _zero(); }
+  var lr0: f64 := _hgf(net, H_LR0);
+  var kind: int64 := _hg(net, H_LRK);
+  var p1: f64 := _hgf(net, H_LRP1);
+  var p2: f64 := _hgf(net, H_LRP2);
+  if (kind == NN_LR_CONST) { return lr0; }
+  if (kind == NN_LR_STEP) {
+    var stufen: int64 := epoch / (p2 as int64);
+    return lr0 * PowF64(p1, (stufen as f64));
+  }
+  if (kind == NN_LR_EXP) {
+    return lr0 * PowF64(p1, (epoch as f64));
+  }
+  // NN_LR_COSINE
+  var e: f64 := (epoch as f64);
+  if (e > p2) { return p1; }
+  var two: f64 := 2.0;
+  var cosArg: f64 := _pi() * e / p2;
+  return p1 + (lr0 - p1) * (_one() + CosF64(cosArg)) / two;
+}
+
+// Epoche setzen und die Lernrate des Zeitplans wirksam machen. Die
+// Grundlernrate bleibt unberuehrt.
+pub fn NnSetEpoch(net: int64, epoch: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (epoch < 0) { return false; }
+  _hs(net, H_EPOCH, epoch);
+  _hsf(net, H_LR, NnLrForEpoch(net, epoch));
+  return true;
+}
+
+pub fn NnEpoch(net: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  return _hg(net, H_EPOCH);
+}
+
+// Epochen in Folge, mit Zeitplan. Die Epochennummer laeuft weiter, wo sie
+// stand -- ein fortgesetztes Training setzt den Zeitplan also fort, statt ihn
+// von vorn zu beginnen.
+pub fn NnTrainScheduled(net: int64, X: int64, Y: int64, n: int64,
+                        batchSize: int64, epochs: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  if (epochs < 1) { return _zero(); }
+  var e: int64 := 0;
+  var last: f64 := _zero();
+  var start: int64 := _hg(net, H_EPOCH);
+  while (e < epochs) {
+    if (NnSetEpoch(net, start + e) == false) { return _zero(); }
+    last := NnTrainEpoch(net, X, Y, n, batchSize);
+    e := e + 1;
+  }
+  return last;
+}
+
+// ── Training mit Abbruchkriterium ────────────────────────────────────────────
+//
+// Trainiert hoechstens maxEpochs Epochen und bricht ab, wenn der Verlust auf
+// den Pruefdaten patience Epochen lang nicht besser geworden ist. Die
+// GEWICHTE DES BESTEN STANDES werden zurueckgespielt -- ohne das waere das
+// Ergebnis der letzte, also der schlechteste gemessene Stand, und das
+// Abbrechen haette nichts gebracht.
+//
+// Rueckgabe ist der beste Pruefverlust oder ein negativer Wert bei
+// unbrauchbaren Angaben (ein Verlust ist nie negativ, der Fall ist also
+// unterscheidbar). NnEpoch() sagt danach, bei welcher Epoche Schluss war.
+pub fn NnTrainEarlyStop(net: int64, X: int64, Y: int64, n: int64,
+                        Xval: int64, Yval: int64, nVal: int64,
+                        batchSize: int64, maxEpochs: int64,
+                        patience: int64): f64 {
+  if (_isNet(net) == false) { return _neg(_one()); }
+  if (n < 1) { return _neg(_one()); }
+  if (nVal < 1) { return _neg(_one()); }
+  if (maxEpochs < 1) { return _neg(_one()); }
+  if (patience < 1) { return _neg(_one()); }
+  var pc: int64 := NnParamCount(net);
+  if (pc < 1) { return _neg(_one()); }
+  var best: int64 := alloc(pc * 8);
+  if (best == 0) { return _neg(_one()); }
+  var bestLoss: f64 := _zero();
+  var haveBest: bool := false;
+  var seit: int64 := 0;
+  var e: int64 := 0;
+  var start: int64 := _hg(net, H_EPOCH);
+  while (e < maxEpochs) {
+    if (NnSetEpoch(net, start + e) == false) {
+      free(best, pc * 8);
+      return _neg(_one());
+    }
+    var tl: f64 := NnTrainEpoch(net, X, Y, n, batchSize);
+    // Gemessen wird im Inferenzmodus: mit Dropout waere der Pruefverlust
+    // zufaellig und das Abbruchkriterium wuerde Rauschen hinterherlaufen
+    var warTraining: bool := NnIsTraining(net);
+    NnSetTraining(net, false);
+    var vl: f64 := NnEvaluate(net, Xval, Yval, nVal);
+    NnSetTraining(net, warTraining);
+    if (haveBest == false) {
+      bestLoss := vl;
+      haveBest := true;
+      var w1: int64 := NnSaveParams(net, best);
+      seit := 0;
+    } else if (vl < bestLoss) {
+      bestLoss := vl;
+      var w2: int64 := NnSaveParams(net, best);
+      seit := 0;
+    } else {
+      seit := seit + 1;
+      if (seit >= patience) {
+        e := e + 1;
+        break;
+      }
+    }
+    e := e + 1;
+  }
+  var okb: bool := NnLoadParams(net, best, pc);
+  free(best, pc * 8);
+  if (okb == false) { return _neg(_one()); }
+  return bestLoss;
+}
+
+// ── Zustand ausserhalb der Gewichte ──────────────────────────────────────────
+//
+// Gewichte allein beschreiben ein Netz nicht vollstaendig: wer ein Training
+// unterbricht und fortsetzt, braucht auch die Momente des Optimierers, den
+// Schrittzaehler (Adam korrigiert damit seinen Bias) und den Zufallszustand.
+// Ohne sie laeuft das fortgesetzte Training anders weiter als das
+// unterbrochene -- und zwar lautlos. Die folgenden Abfragen und Setzer sind
+// genau dafuer da; std.nn_io schreibt sie mit.
+
+pub fn NnOptimizer(net: int64): int64 {
+  if (_isNet(net) == false) { return -1; }
+  return _hg(net, H_OPT);
+}
+
+pub fn NnMomentum(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_MOM);
+}
+
+pub fn NnBeta1(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_B1);
+}
+
+pub fn NnBeta2(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_B2);
+}
+
+pub fn NnAdamEps(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_AEPS);
+}
+
+pub fn NnLeakySlope(net: int64): f64 {
+  if (_isNet(net) == false) { return _zero(); }
+  return _hgf(net, H_LEAK);
+}
+
+// Zahl der bisher gegangenen Schritte (Adam-Bias-Korrektur haengt daran)
+pub fn NnStepCount(net: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  return _hg(net, H_STEP);
+}
+
+pub fn NnSetStepCount(net: int64, step: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (step < 0) { return false; }
+  _hs(net, H_STEP, step);
+  return true;
+}
+
+pub fn NnRngState(net: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  return _hg(net, H_RNG);
+}
+
+// Zufallszustand zurueckstellen. 0 ist kein gueltiger xorshift-Zustand (die
+// Folge bliebe dort stehen) und wird abgelehnt, statt still ersetzt zu werden.
+pub fn NnSetRngState(net: int64, state: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (state == 0) { return false; }
+  _hs(net, H_RNG, state);
+  return true;
+}
+
+// ── Optimiererzustand als flache Folge ───────────────────────────────────────
+//
+// Je trainierbarer Zahl zwei Werte: erstes und zweites Moment (bei Momentum
+// ist nur das erste belegt, das zweite bleibt null). Die Reihenfolge ist die
+// von NnSaveParams, jeweils Moment eins direkt vor Moment zwei -- damit ist
+// die Folge selbstbeschreibend, sobald die Architektur bekannt ist.
+
+pub fn NnOptStateCount(net: int64): int64 {
+  return NnParamCount(net) * 2;
+}
+
+pub fn NnSaveOptState(net: int64, buf: int64): int64 {
+  if (_isNet(net) == false) { return 0; }
+  if (buf == 0) { return 0; }
+  var nL: int64 := _hg(net, H_NLAYER);
+  var k: int64 := 0;
+  var at: int64 := 0;
+  while (k < nL) {
+    var l: int64 := _layer(net, k);
+    var nw: int64 := _lg(l, L_INDIM) * _lg(l, L_OUTDIM);
+    var nb: int64 := _lg(l, L_OUTDIM);
+    var i: int64 := 0;
+    while (i < nw) {
+      _s(buf, at, _g(_lg(l, L_MW), i));
+      _s(buf, at + 1, _g(_lg(l, L_VW), i));
+      at := at + 2;
+      i := i + 1;
+    }
+    i := 0;
+    while (i < nb) {
+      _s(buf, at, _g(_lg(l, L_MB), i));
+      _s(buf, at + 1, _g(_lg(l, L_VB), i));
+      at := at + 2;
+      i := i + 1;
+    }
+    k := k + 1;
+  }
+  return at;
+}
+
+// count muss genau NnOptStateCount() sein -- eine kuerzere Folge wird
+// abgelehnt statt halb eingelesen.
+pub fn NnLoadOptState(net: int64, buf: int64, count: int64): bool {
+  if (_isNet(net) == false) { return false; }
+  if (buf == 0) { return false; }
+  if (count != NnOptStateCount(net)) { return false; }
+  var nL: int64 := _hg(net, H_NLAYER);
+  var k: int64 := 0;
+  var at: int64 := 0;
+  while (k < nL) {
+    var l: int64 := _layer(net, k);
+    var nw: int64 := _lg(l, L_INDIM) * _lg(l, L_OUTDIM);
+    var nb: int64 := _lg(l, L_OUTDIM);
+    var i: int64 := 0;
+    while (i < nw) {
+      _s(_lg(l, L_MW), i, _g(buf, at));
+      _s(_lg(l, L_VW), i, _g(buf, at + 1));
+      at := at + 2;
+      i := i + 1;
+    }
+    i := 0;
+    while (i < nb) {
+      _s(_lg(l, L_MB), i, _g(buf, at));
+      _s(_lg(l, L_VB), i, _g(buf, at + 1));
+      at := at + 2;
+      i := i + 1;
+    }
+    k := k + 1;
+  }
+  return true;
+}

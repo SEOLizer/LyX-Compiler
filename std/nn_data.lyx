@@ -1,0 +1,442 @@
+// std/nn_data.lyx
+// Daten fuer neuronale Netze: Skalierung, Kodierung, Aufteilen, Guetemasse.
+
+@description("Data preparation and metrics for neural networks: scaling, one-hot encoding, shuffling, train/test split, accuracy, confusion matrix")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.nn_data;
+
+import std.math;
+import std.alloc;
+
+// ── Worum es geht ────────────────────────────────────────────────────────────
+//
+// std.nn rechnet auf flachen f64-Feldern: eine Beispielmatrix X ist n x d,
+// zeilenweise, ein Zielfeld Y ist n x c. Diese Unit bringt Daten in diese
+// Form und beurteilt hinterher das Ergebnis.
+//
+// ── Die Kennwerte der Skalierung gehoeren zum Modell ─────────────────────────
+//
+// Mittelwert und Streuung werden auf den TRAININGSDATEN bestimmt und auf die
+// Testdaten mit DENSELBEN Zahlen angewandt. Darum geben NnDataFitStandard und
+// NnDataFitMinMax die Kennwerte heraus (zwei Felder der Breite d) und die
+// Anwendung ist ein getrennter Aufruf. Wer die Testdaten mit ihren eigenen
+// Kennwerten skaliert, hat Wissen aus dem Test ins Training getragen und misst
+// sich zu gut.
+//
+// ── f64-Fallstricke des Compilers ────────────────────────────────────────────
+//
+// Wie in std.nn: Konstanten als Funktionen, negiert ueber _neg(), jeder
+// peekf64 erst in eine Variable.
+
+fn _zero(): f64 { return 0.0; }
+fn _one(): f64  { return 1.0; }
+fn _neg(x: f64): f64 { return 0.0 - x; }
+fn _eps(): f64  { return 0.000000000001; }
+
+fn _g(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn _s(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+// ── Spaltenkennwerte ─────────────────────────────────────────────────────────
+
+// Mittelwert und Standardabweichung je Spalte (n Zeilen, d Spalten).
+// Die Streuung wird mit n normiert (Grundgesamtheit), nicht mit n-1: skaliert
+// wird mit dem, was vorliegt, nicht geschaetzt.
+pub fn NnDataFitStandard(X: int64, n: int64, d: int64,
+                         mean: int64, std: int64): bool {
+  if (X == 0) { return false; }
+  if (mean == 0) { return false; }
+  if (std == 0) { return false; }
+  if (n < 1) { return false; }
+  if (d < 1) { return false; }
+  var j: int64 := 0;
+  var fn2: f64 := (n as f64);
+  while (j < d) {
+    var sum: f64 := _zero();
+    var i: int64 := 0;
+    while (i < n) {
+      sum := sum + _g(X, i * d + j);
+      i := i + 1;
+    }
+    var mu: f64 := sum / fn2;
+    var acc: f64 := _zero();
+    i := 0;
+    while (i < n) {
+      var dv: f64 := _g(X, i * d + j) - mu;
+      acc := acc + dv * dv;
+      i := i + 1;
+    }
+    var sd: f64 := SqrtF64(acc / fn2);
+    _s(mean, j, mu);
+    _s(std, j, sd);
+    j := j + 1;
+  }
+  return true;
+}
+
+// (x - mean) / std, an Ort und Stelle. Eine Spalte ohne Streuung bleibt
+// unveraendert (statt durch null geteilt zu werden) -- ihr Wert traegt keine
+// Information.
+pub fn NnDataApplyStandard(X: int64, n: int64, d: int64,
+                           mean: int64, std: int64): bool {
+  if (X == 0) { return false; }
+  if (mean == 0) { return false; }
+  if (std == 0) { return false; }
+  if (n < 1) { return false; }
+  if (d < 1) { return false; }
+  var i: int64 := 0;
+  while (i < n) {
+    var j: int64 := 0;
+    while (j < d) {
+      var sd: f64 := _g(std, j);
+      if (sd > _eps()) {
+        var v: f64 := _g(X, i * d + j);
+        _s(X, i * d + j, (v - _g(mean, j)) / sd);
+      }
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Kleinster und groesster Wert je Spalte
+pub fn NnDataFitMinMax(X: int64, n: int64, d: int64,
+                       lo: int64, hi: int64): bool {
+  if (X == 0) { return false; }
+  if (lo == 0) { return false; }
+  if (hi == 0) { return false; }
+  if (n < 1) { return false; }
+  if (d < 1) { return false; }
+  var j: int64 := 0;
+  while (j < d) {
+    var mn: f64 := _g(X, j);
+    var mx: f64 := mn;
+    var i: int64 := 1;
+    while (i < n) {
+      var v: f64 := _g(X, i * d + j);
+      if (v < mn) { mn := v; }
+      if (v > mx) { mx := v; }
+      i := i + 1;
+    }
+    _s(lo, j, mn);
+    _s(hi, j, mx);
+    j := j + 1;
+  }
+  return true;
+}
+
+// (x - lo) / (hi - lo) auf [0,1], an Ort und Stelle. Spalte mit lo == hi
+// bleibt unveraendert.
+pub fn NnDataApplyMinMax(X: int64, n: int64, d: int64,
+                         lo: int64, hi: int64): bool {
+  if (X == 0) { return false; }
+  if (lo == 0) { return false; }
+  if (hi == 0) { return false; }
+  if (n < 1) { return false; }
+  if (d < 1) { return false; }
+  var i: int64 := 0;
+  while (i < n) {
+    var j: int64 := 0;
+    while (j < d) {
+      var a: f64 := _g(lo, j);
+      var b: f64 := _g(hi, j);
+      var span: f64 := b - a;
+      if (span > _eps()) {
+        var v: f64 := _g(X, i * d + j);
+        _s(X, i * d + j, (v - a) / span);
+      }
+      j := j + 1;
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// ── Kodierung ────────────────────────────────────────────────────────────────
+
+// Klassennummern (int64-Feld, n Eintraege) zu einer n x nClasses Matrix.
+// Eine Nummer ausserhalb [0, nClasses) ist ein Fehler, keine stille Nullzeile.
+pub fn NnDataOneHot(labels: int64, n: int64, nClasses: int64,
+                    out: int64): bool {
+  if (labels == 0) { return false; }
+  if (out == 0) { return false; }
+  if (n < 1) { return false; }
+  if (nClasses < 1) { return false; }
+  var i: int64 := 0;
+  while (i < n) {
+    var c: int64 := peek64(labels + i * 8);
+    if (c < 0) { return false; }
+    if (c >= nClasses) { return false; }
+    var j: int64 := 0;
+    while (j < nClasses) {
+      _s(out, i * nClasses + j, _zero());
+      j := j + 1;
+    }
+    _s(out, i * nClasses + c, _one());
+    i := i + 1;
+  }
+  return true;
+}
+
+// Groesster Eintrag einer Zeile -- die Umkehrung von NnDataOneHot
+pub fn NnDataArgmax(row: int64, n: int64): int64 {
+  if (row == 0) { return -1; }
+  if (n < 1) { return -1; }
+  var best: int64 := 0;
+  var bv: f64 := _g(row, 0);
+  var i: int64 := 1;
+  while (i < n) {
+    var v: f64 := _g(row, i);
+    if (v > bv) { bv := v; best := i; }
+    i := i + 1;
+  }
+  return best;
+}
+
+// Zeilenweise Argmax ueber eine n x c Matrix nach out (int64-Feld)
+pub fn NnDataArgmaxRows(M: int64, n: int64, c: int64, out: int64): bool {
+  if (M == 0) { return false; }
+  if (out == 0) { return false; }
+  if (n < 1) { return false; }
+  if (c < 1) { return false; }
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(out + i * 8, NnDataArgmax(M + i * c * 8, c));
+    i := i + 1;
+  }
+  return true;
+}
+
+// ── Mischen und Aufteilen ────────────────────────────────────────────────────
+
+fn _nextBits(state: int64): int64 {
+  var s: int64 := peek64(state);
+  if (s == 0) { s := 88172645463325252; }
+  s := s ^ (s >> 12);
+  s := s ^ (s << 25);
+  s := s ^ (s >> 27);
+  poke64(state, s);
+  var r: int64 := s * 2685821657736338717;
+  // Vorzeichenbit abschneiden: `>>` ist arithmetisch, das Produkt oft negativ.
+  // Dieselbe Rechnung wie _nextBits in std.nn -- die beiden muessen
+  // uebereinstimmen.
+  return (r >> 11) & 9007199254740991;
+}
+
+// Permutation 0..n-1 nach order. state ist ein int64-Feld mit EINEM Eintrag,
+// das den Zufallszustand haelt -- der Aufrufer setzt den Keim und behaelt
+// damit die Reproduzierbarkeit in der Hand.
+pub fn NnDataPermutation(order: int64, n: int64, state: int64): bool {
+  if (order == 0) { return false; }
+  if (state == 0) { return false; }
+  if (n < 1) { return false; }
+  var i: int64 := 0;
+  while (i < n) {
+    poke64(order + i * 8, i);
+    i := i + 1;
+  }
+  i := n - 1;
+  while (i > 0) {
+    var bits: int64 := _nextBits(state);
+    var j: int64 := bits % (i + 1);
+    var a: int64 := peek64(order + i * 8);
+    var b: int64 := peek64(order + j * 8);
+    poke64(order + i * 8, b);
+    poke64(order + j * 8, a);
+    i := i - 1;
+  }
+  return true;
+}
+
+// Zeilen von X (n x d) und Y (n x c) in der Reihenfolge order nach Xo/Yo.
+// Nicht an Ort und Stelle: eine Permutation im Puffer selbst braucht
+// Zyklenverfolgung und waere hier nur eine Fehlerquelle.
+pub fn NnDataGather(X: int64, Y: int64, n: int64, d: int64, c: int64,
+                    order: int64, Xo: int64, Yo: int64): bool {
+  if (X == 0) { return false; }
+  if (Xo == 0) { return false; }
+  if (order == 0) { return false; }
+  if (n < 1) { return false; }
+  if (d < 1) { return false; }
+  var i: int64 := 0;
+  while (i < n) {
+    var src: int64 := peek64(order + i * 8);
+    if (src < 0) { return false; }
+    if (src >= n) { return false; }
+    var j: int64 := 0;
+    while (j < d) {
+      _s(Xo, i * d + j, _g(X, src * d + j));
+      j := j + 1;
+    }
+    if (Y != 0) {
+      if (Yo == 0) { return false; }
+      j := 0;
+      while (j < c) {
+        _s(Yo, i * c + j, _g(Y, src * c + j));
+        j := j + 1;
+      }
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Anzahl Trainingszeilen bei einem Testanteil von ratio (0 < ratio < 1).
+// Mindestens eine Zeile bleibt auf jeder Seite, sonst ist die Aufteilung
+// unbrauchbar: dann -1.
+pub fn NnDataSplitCount(n: int64, ratio: f64): int64 {
+  if (n < 2) { return -1; }
+  if (ratio <= _zero()) { return -1; }
+  if (ratio >= _one()) { return -1; }
+  var nTest: int64 := (FloorF64((n as f64) * ratio) as int64);
+  if (nTest < 1) { nTest := 1; }
+  if (nTest > n - 1) { nTest := n - 1; }
+  return n - nTest;
+}
+
+// ── Gueteriesen ──────────────────────────────────────────────────────────────
+
+// Anteil uebereinstimmender Klassennummern
+pub fn NnDataAccuracy(pred: int64, truth: int64, n: int64): f64 {
+  if (pred == 0) { return _zero(); }
+  if (truth == 0) { return _zero(); }
+  if (n < 1) { return _zero(); }
+  var i: int64 := 0;
+  var hit: int64 := 0;
+  while (i < n) {
+    if (peek64(pred + i * 8) == peek64(truth + i * 8)) { hit := hit + 1; }
+    i := i + 1;
+  }
+  return (hit as f64) / (n as f64);
+}
+
+// Verwechslungsmatrix: Zeile = wahre Klasse, Spalte = vorhergesagte.
+// out ist ein int64-Feld mit nClasses*nClasses Eintraegen.
+pub fn NnDataConfusion(pred: int64, truth: int64, n: int64,
+                       nClasses: int64, out: int64): bool {
+  if (pred == 0) { return false; }
+  if (truth == 0) { return false; }
+  if (out == 0) { return false; }
+  if (n < 1) { return false; }
+  if (nClasses < 1) { return false; }
+  var i: int64 := 0;
+  while (i < nClasses * nClasses) {
+    poke64(out + i * 8, 0);
+    i := i + 1;
+  }
+  i := 0;
+  while (i < n) {
+    var t: int64 := peek64(truth + i * 8);
+    var p: int64 := peek64(pred + i * 8);
+    if (t < 0) { return false; }
+    if (t >= nClasses) { return false; }
+    if (p < 0) { return false; }
+    if (p >= nClasses) { return false; }
+    var at: int64 := out + (t * nClasses + p) * 8;
+    poke64(at, peek64(at) + 1);
+    i := i + 1;
+  }
+  return true;
+}
+
+// Genauigkeit (precision) der Klasse c: richtig vorhergesagt / vorhergesagt.
+// Ohne eine einzige Vorhersage dieser Klasse ist der Wert nicht bestimmbar:
+// dann -1, nicht 0 -- 0 waere hier "alles falsch" und damit eine Aussage.
+pub fn NnDataPrecision(conf: int64, nClasses: int64, c: int64): f64 {
+  if (conf == 0) { return _neg(_one()); }
+  if (c < 0) { return _neg(_one()); }
+  if (c >= nClasses) { return _neg(_one()); }
+  var col: int64 := 0;
+  var i: int64 := 0;
+  while (i < nClasses) {
+    col := col + peek64(conf + (i * nClasses + c) * 8);
+    i := i + 1;
+  }
+  if (col == 0) { return _neg(_one()); }
+  var tp: int64 := peek64(conf + (c * nClasses + c) * 8);
+  return (tp as f64) / (col as f64);
+}
+
+// Trefferquote (recall) der Klasse c: richtig vorhergesagt / tatsaechlich
+// vorhanden. Ohne Beispiel dieser Klasse: -1.
+pub fn NnDataRecall(conf: int64, nClasses: int64, c: int64): f64 {
+  if (conf == 0) { return _neg(_one()); }
+  if (c < 0) { return _neg(_one()); }
+  if (c >= nClasses) { return _neg(_one()); }
+  var row: int64 := 0;
+  var i: int64 := 0;
+  while (i < nClasses) {
+    row := row + peek64(conf + (c * nClasses + i) * 8);
+    i := i + 1;
+  }
+  if (row == 0) { return _neg(_one()); }
+  var tp: int64 := peek64(conf + (c * nClasses + c) * 8);
+  return (tp as f64) / (row as f64);
+}
+
+// F1 der Klasse c. Ist eine der beiden Groessen unbestimmt oder sind beide
+// null, ist F1 unbestimmt: -1.
+pub fn NnDataF1(conf: int64, nClasses: int64, c: int64): f64 {
+  var p: f64 := NnDataPrecision(conf, nClasses, c);
+  var r: f64 := NnDataRecall(conf, nClasses, c);
+  if (p < _zero()) { return _neg(_one()); }
+  if (r < _zero()) { return _neg(_one()); }
+  var two: f64 := 2.0;
+  if (p + r < _eps()) { return _neg(_one()); }
+  return two * p * r / (p + r);
+}
+
+// Mittlerer quadratischer Fehler zwischen zwei n x c Matrizen
+pub fn NnDataMSE(pred: int64, truth: int64, n: int64, c: int64): f64 {
+  if (pred == 0) { return _zero(); }
+  if (truth == 0) { return _zero(); }
+  if (n < 1) { return _zero(); }
+  if (c < 1) { return _zero(); }
+  var cnt: int64 := n * c;
+  var i: int64 := 0;
+  var sum: f64 := _zero();
+  while (i < cnt) {
+    var d: f64 := _g(pred, i) - _g(truth, i);
+    sum := sum + d * d;
+    i := i + 1;
+  }
+  return sum / (cnt as f64);
+}
+
+// Bestimmtheitsmass auf Spalte 0 einer n x 1 Vorhersage.
+// Ist die Streuung der Wahrheit null, ist R2 nicht bestimmbar: -1 (hier ein
+// gueltiger Zahlenwert waere irrefuehrend, R2 kann selbst negativ sein --
+// darum nur dieser Fall).
+pub fn NnDataR2(pred: int64, truth: int64, n: int64): f64 {
+  if (pred == 0) { return _neg(_one()); }
+  if (truth == 0) { return _neg(_one()); }
+  if (n < 2) { return _neg(_one()); }
+  var i: int64 := 0;
+  var sum: f64 := _zero();
+  while (i < n) {
+    sum := sum + _g(truth, i);
+    i := i + 1;
+  }
+  var mu: f64 := sum / (n as f64);
+  var ssRes: f64 := _zero();
+  var ssTot: f64 := _zero();
+  i := 0;
+  while (i < n) {
+    var t: f64 := _g(truth, i);
+    var p: f64 := _g(pred, i);
+    var dr: f64 := t - p;
+    var dt: f64 := t - mu;
+    ssRes := ssRes + dr * dr;
+    ssTot := ssTot + dt * dt;
+    i := i + 1;
+  }
+  if (ssTot < _eps()) { return _neg(_one()); }
+  return _one() - ssRes / ssTot;
+}
