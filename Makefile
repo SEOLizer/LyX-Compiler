@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.20B
+VERSION   := 1.2.20C
 VERSION_DATE := 2026-10-24
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -373,6 +373,10 @@ test: lyxc
 	@bash tests/xxhash_2235_test.sh
 	@echo "--- bench/arr_int: Ganzzahl-Feldkerne wie C, drei Ziele (#2195) ---"
 	@bash tests/bench_arr_int_test.sh
+	@echo "--- Zeichenketten-Builtins arm64/riscv aus dem Bump-Block (#2227) ---"
+	@bash tests/bump_ir_2227_test.sh
+	@echo "--- esp32/arm-cm: 64-Bit-Anfangswerte laut beim Lesen (#2239) ---"
+	@bash tests/wort32_merker_2239_test.sh
 	@echo "--- Negation eines parallel Array: Bitmuster, Mischformen laut (#2222) ---"
 	@bash tests/simd_neg_2222_test.sh
 	@echo "--- Bit-Builtins auf esp32 und arm-cm4: Werte, 64-Bit-Formen laut (#2228) ---"

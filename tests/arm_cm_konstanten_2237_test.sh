@@ -10,7 +10,8 @@
 # uebersetzen und rechnen richtig (qemu, Semihosting); 2^32 und ein 64-Bit-
 # Wert werden abgewiesen. Dazu: ein Programm mit `import std.hash`, das nur
 # HashDJB2 nutzt, uebersetzt weiter — die Anfangswerte der Modulkonstanten
-# (FNV) gehen einen eigenen, noch kuerzenden Weg (#2239). Wuerde dieser Weg
+# (FNV) werden nicht beim Uebersetzen abgewiesen, sondern beim LESEN
+# (Merkerwort, #2239, tests/wort32_merker_2239_test.sh). Wuerde dieser Weg
 # mit abgewiesen, waere std.hash auf arm-cm4 ganz unbenutzbar.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
