@@ -2351,19 +2351,26 @@ pub type IRLower = class {
         ej := ej + 1;
       }
     } else {
-      // #1478: 10 ist 5 mal 2 — der Faktor 2 wandert in den Binaerexponenten,
-      // statt den Zaehler zu halbieren. Sonst laeuft der Zaehler bei kleinen
-      // Mantissen auf 0 und jedes Literal unter etwa 1e-18 wird still null.
-      // Gleichlautend in codegen_x86.cg_parseFloat — die beiden muessen
-      // dasselbe rechnen.
+      // #2223: Hier stand noch die Fassung von #1478 — der Nenner wuchs um 5,
+      // bis er nicht mehr in int64 passte, dann halbierte ein Notzweig den
+      // Zaehler bis 0. Jedes Literal ab etwa 1e-28 wurde auf arm64, riscv und
+      // lyxos still zu 0 (`1.0e-40 > 0.0` war falsch). x86 hatte das mit #1569
+      // laengst behoben; die zweite Stelle war nicht nachgezogen.
+      //
+      // Jetzt dieselbe Rechnung wie codegen_x86.cg_parseFloat (#1569/#1657) —
+      // die beiden muessen uebereinstimmen: den Zaehler so weit nach oben
+      // schieben, wie int64 es erlaubt, dann durch 5 TEILEN (mit Rundung),
+      // der Faktor 2 aus 10 = 5 * 2 wandert in den Binaerexponenten.
       while ej < expVal {
-        while d > 1844674407370955161 && (d % 2) == 0 { d := d / 2; binExp := binExp - 1; }
-        if d <= 1844674407370955161 { d := d * 5; binExp := binExp - 1; }
-        else {
-          while d > 922337203685477580 { d := d / 2; n := n / 2; }
-          d := d * 10;
-          if n == 0 { return 0; }
+        while n <= 4611686018427387903 {     // n*2 bleibt in int64
+          n := n * 2;
+          binExp := binExp - 1;
         }
+        var rest: int64 := n % 5;
+        n := n / 5;
+        if rest * 2 > 5 { n := n + 1; }
+        binExp := binExp - 1;                // der Faktor 2 aus 10 = 5 * 2
+        if n == 0 { return 0; }              // wirklich unter dem Wertebereich
         ej := ej + 1;
       }
     }
@@ -2779,7 +2786,12 @@ pub type IRLower = class {
     else if op == 91  { iro := IRO_OR;  }   // TK_BITOR
     else if op == 89  { iro := IRO_XOR; }   // TK_BITXOR
     else if op == 93  { iro := IRO_SHL; }   // TK_SHL
-    else if op == 94  { iro := IRO_SHR; }   // TK_SHR
+    else if op == 94 {                       // TK_SHR
+      // #2236: logisch nur bei vorzeichenlosem linken Operanden, sonst
+      // arithmetisch — dieselbe Entscheidung wie cg_isUnsignedExpr auf x86.
+      iro := IRO_SAR;
+      if self._irVorzeichenlos(self.nodeC0(expr)) != 0 { iro := IRO_SHR; }
+    }
     else if op == 85  { iro := IRO_AND; }   // TK_AND (&&; treat as bitwise for now)
     else if op == 86  { iro := IRO_OR;  }   // TK_OR (||)
     if iro >= 0 {
@@ -14958,6 +14970,29 @@ pub type IRLower = class {
 
   // Der statische Typ eines Ausdrucks. Rekursiv, weil die Basis selbst wieder
   // eine beliebige Form haben darf (`a.b.c.methode()`).
+  // #2236: Traegt der Ausdruck einen vorzeichenlosen Typ? Dieselben Faelle
+  // wie cg_isUnsignedExpr in codegen_x86.lyx — die beiden muessen
+  // uebereinstimmen, sonst rechnet derselbe Quelltext auf x86 und auf den
+  // IR-Zielen verschieden: ein Bezeichner mit deklariertem Typ (Local,
+  // Parameter, Modulvariable) und ein `as`-Cast. Alles andere gilt als
+  // vorzeichenbehaftet; das erhaelt das Vorzeichen und ist die Vorgabe von
+  // int64. Die Typnamen wie cg_typeNameIsUnsigned.
+  fn _irVorzeichenlos(nd: int64): int64 {
+    if nd < 0 { return 0; }
+    var k: int64 := self.nodeKind(nd);
+    var tn: int64 := 0 - 1;
+    if k == NK_CAST { tn := self.nodeC1(nd); }
+    else if k == NK_IDENT { tn := self._localTypeNode(self.nodeSVal(nd), self.nodeSLen(nd)); }
+    if tn < 0 { return 0; }
+    var tp: pchar := self.nodeSVal(tn);
+    var tl: int64 := self.nodeSLen(tn);
+    if (self.seq(tp, tl, "u8", 2)  || self.seq(tp, tl, "uint8", 5))  { return 1; }
+    if (self.seq(tp, tl, "u16", 3) || self.seq(tp, tl, "uint16", 6)) { return 1; }
+    if (self.seq(tp, tl, "u32", 3) || self.seq(tp, tl, "uint32", 6)) { return 1; }
+    if (self.seq(tp, tl, "u64", 3) || self.seq(tp, tl, "uint64", 6)) { return 1; }
+    return 0;
+  }
+
   fn _exprTypeNode(nd: int64): int64 {
     if nd < 0 { return 0 - 1; }
     var k: int64 := self.nodeKind(nd);
