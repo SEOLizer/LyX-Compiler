@@ -160,7 +160,7 @@ run_test() {
     want_err="$(cat "$error_file")"
     want_err="${want_err#"${want_err%%[![:space:]]*}"}"
     want_err="${want_err%"${want_err##*[![:space:]]}"}"
-    if neg_out=$(timeout "$TIMEOUT" "$LYXC" "$lyx_file" -o "$BIN" 2>&1); then
+    if neg_out=$(timeout "$TIMEOUT" "$LYXC" --std-path="$REPO_ROOT" "$lyx_file" -o "$BIN" 2>&1); then
       verdict fail "$rel" "[negativtest] uebersetzte klaglos, erwartet war: ${want_err}"
     elif [[ "$neg_out" == *"$want_err"* ]]; then
       verdict pass "$rel"
@@ -172,7 +172,7 @@ run_test() {
 
   # Compile
   local compile_err
-  if ! compile_err=$(timeout "$TIMEOUT" "$LYXC" "$lyx_file" -o "$BIN" 2>&1); then
+  if ! compile_err=$(timeout "$TIMEOUT" "$LYXC" --std-path="$REPO_ROOT" "$lyx_file" -o "$BIN" 2>&1); then
     local msg
     msg=$(echo "$compile_err" | grep -i "error\|parse\|fail" | head -1)
     if [[ $UPDATE -eq 1 ]]; then

@@ -31,7 +31,7 @@ alle_ziele() {
   local was="$1" src="$2" erw="$3" strom="${4:-out}"
   for ziel in x86_64 arm64 riscv; do
     local bin="$TMP/b_${ziel}"
-    if ! ( cd "$ROOT" && timeout 300 "$LYXC" --target="$ziel" "$src" -o "$bin" ) >"$TMP/bl.log" 2>&1; then
+    if ! ( cd "$ROOT" && timeout 300 "$LYXC" --std-path="$ROOT" --target="$ziel" "$src" -o "$bin" ) >"$TMP/bl.log" 2>&1; then
       nok "$was [$ziel]: uebersetzt nicht ($(grep -m1 -E '^lyxc:|error' "$TMP/bl.log"))"
       continue
     fi
@@ -104,7 +104,7 @@ type G = struct { w: f64; }
 fn main(): int64 { var g: G; g.w := 1.5; Print(g.w); return 0; }
 EOF
 for ziel in arm64 riscv; do
-  if ( cd "$ROOT" && timeout 300 "$LYXC" --target="$ziel" "$TMP/f64.lyx" -o "$TMP/f64.bin" ) >"$TMP/f64.log" 2>&1; then
+  if ( cd "$ROOT" && timeout 300 "$LYXC" --std-path="$ROOT" --target="$ziel" "$TMP/f64.lyx" -o "$TMP/f64.bin" ) >"$TMP/f64.log" 2>&1; then
     nok "$ziel: ein f64-Feld ging durch — wird es als Ganzzahl ausgegeben?"
   elif grep -q "kann den Typ des Arguments nicht bestimmen" "$TMP/f64.log"; then
     ok "$ziel: f64-Feld wird abgewiesen statt geraten"
@@ -145,7 +145,7 @@ EOF
 JETZT="$(date +%s)"
 for ziel in x86_64 arm64 riscv; do
   bin="$TMP/ct_$ziel"
-  if ! ( cd "$ROOT" && timeout 300 "$LYXC" --target="$ziel" "$TMP/ct.lyx" -o "$bin" ) >"$TMP/ct.log" 2>&1; then
+  if ! ( cd "$ROOT" && timeout 300 "$LYXC" --std-path="$ROOT" --target="$ziel" "$TMP/ct.lyx" -o "$bin" ) >"$TMP/ct.log" 2>&1; then
     nok "#2045 [$ziel]: uebersetzt nicht ($(grep -m1 -E '^lyxc:|error' "$TMP/ct.log"))"; continue
   fi
   case "$ziel" in
@@ -172,7 +172,7 @@ echo "--- #2043: eine IMPORTIERTE extern fn wird gefunden ---"
 # uebersetzte, std/net/mongo.lyx ruft sie ueber den Import und scheiterte.
 # Gleiche Funktion, andere HERKUNFT. Beide gehoeren deshalb geprueft.
 for u in std/net/tls.lyx std/net/mongo.lyx; do
-  if ( cd "$ROOT" && timeout 420 "$LYXC" --compile-unit --target=arm64 "$u" -o /dev/null ) >"$TMP/u.log" 2>&1; then
+  if ( cd "$ROOT" && timeout 420 "$LYXC" --std-path="$ROOT" --compile-unit --target=arm64 "$u" -o /dev/null ) >"$TMP/u.log" 2>&1; then
     ok "$(basename "$u") uebersetzt fuer arm64"
   else
     nok "$(basename "$u") fuer arm64: $(grep -m1 -E '^lyxc:|error' "$TMP/u.log")"
@@ -234,7 +234,7 @@ unit main;
 extern fn labs(i: int64): int64 link "libc.so.6";
 fn main(): int64 { return labs(-9); }
 EOF
-if ( cd "$ROOT" && timeout 300 "$LYXC" --target=arm64 "$TMP/anno.lyx" -o "$TMP/anno.bin" ) >"$TMP/anno.log" 2>&1; then
+if ( cd "$ROOT" && timeout 300 "$LYXC" --std-path="$ROOT" --target=arm64 "$TMP/anno.lyx" -o "$TMP/anno.bin" ) >"$TMP/anno.log" 2>&1; then
   if readelf -lW "$TMP/anno.bin" 2>/dev/null | grep -q 'INTERP' \
      && readelf -dW "$TMP/anno.bin" 2>/dev/null | grep -q 'libc.so.6'; then
     ok "arm64: annotierte extern fn ergibt ein dynamisches Erzeugnis (INTERP + NEEDED libc.so.6)"
@@ -249,7 +249,7 @@ fi
 # Erzeugnis entsteht, nicht der Wortlaut: kommt riscv-FFI eines Tages, greift
 # der erste Zweig und prueft dann das Erzeugnis.
 rm -f "$TMP/anno_rv.bin"
-if ( cd "$ROOT" && timeout 300 "$LYXC" --target=riscv "$TMP/anno.lyx" -o "$TMP/anno_rv.bin" ) >"$TMP/anno.log" 2>&1; then
+if ( cd "$ROOT" && timeout 300 "$LYXC" --std-path="$ROOT" --target=riscv "$TMP/anno.lyx" -o "$TMP/anno_rv.bin" ) >"$TMP/anno.log" 2>&1; then
   if readelf -dW "$TMP/anno_rv.bin" 2>/dev/null | grep -q 'libc.so.6'; then
     ok "riscv: annotierte extern fn ergibt ein dynamisches Erzeugnis"
   else
@@ -262,7 +262,7 @@ fi
 echo
 echo "--- #2042/#2045: die betroffenen stdlib-Units uebersetzen ---"
 for u in std/theorem123.lyx std/cloud/aws/sigv4.lyx; do
-  if ( cd "$ROOT" && timeout 420 "$LYXC" --compile-unit --target=arm64 "$u" -o /dev/null ) >"$TMP/s.log" 2>&1; then
+  if ( cd "$ROOT" && timeout 420 "$LYXC" --std-path="$ROOT" --compile-unit --target=arm64 "$u" -o /dev/null ) >"$TMP/s.log" 2>&1; then
     ok "$(basename "$u") uebersetzt fuer arm64"
   else
     nok "$(basename "$u") fuer arm64: $(grep -m1 -E '^lyxc:|error' "$TMP/s.log")"

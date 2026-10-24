@@ -6,10 +6,13 @@
 # untrusted — dadurch ließen sich 15 stdlib-Units nicht mehr zu .lyu
 # vorkompilieren, was `make package` betraf, nicht nur den Compile-Sweep.
 #
-# Das Vertrauen kommt jetzt vom PFAD, den der Aufrufer angibt (std/, src/, data/),
-# nicht aus einer Selbstauskunft der Datei. Dieser Test hält beide Seiten fest:
-# die stdlib-Unit compiliert, und Code außerhalb des Baums bleibt fail-closed —
-# auch dann, wenn er sich selbst `unit std.x;` nennt.
+# Das Vertrauen kommt vom PFAD (std/, src/, data/), nicht aus einer
+# Selbstauskunft der Datei — und seit #2202 zusaetzlich von der HERKUNFT: die
+# Datei muss kanonisch im massgeblichen Baum liegen (--std-path, sonst die
+# Installation). Ein Segment `std/` in $TMP reicht nicht mehr. Dieser Test
+# haelt beide Seiten fest: die stdlib-Unit compiliert mit genanntem Baum,
+# Code ausserhalb bleibt fail-closed — auch mit `unit std.x;` und auch in
+# einem Verzeichnis namens std/.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
@@ -27,9 +30,18 @@ extern fn some_unknown_probe_symbol(a: int64): int64 link "libprobe.so";
 pub fn probe(): int64 { return some_unknown_probe_symbol(1); }
 EOF
 rm -f "$TMP/probe.lyu"
-"$LYXC" --compile-unit "$ROOT/std/_ffi_trust_probe.lyx" -o "$TMP/probe.lyu" >/dev/null 2>&1
+"$LYXC" --std-path="$ROOT" --compile-unit "$ROOT/std/_ffi_trust_probe.lyx" -o "$TMP/probe.lyu" >/dev/null 2>&1
 if [ -f "$TMP/probe.lyu" ]; then ok "std_tree_unit_trusted"
 else no "std_tree_unit_trusted" "stdlib-Unit ließ sich nicht vorkompilieren"; fi
+
+# --- 1b. #2202: dieselbe Datei in einem FREMDEN Verzeichnis namens std/ ---
+# Hat das Segment `std/`, liegt aber nicht im genannten Baum: fail-closed.
+mkdir -p "$TMP/fremd/std"
+cp "$ROOT/std/_ffi_trust_probe.lyx" "$TMP/fremd/std/_ffi_trust_probe.lyx"
+rm -f "$TMP/fremd.lyu"
+out=$("$LYXC" --std-path="$ROOT" --compile-unit "$TMP/fremd/std/_ffi_trust_probe.lyx" -o "$TMP/fremd.lyu" 2>&1)
+if [ ! -f "$TMP/fremd.lyu" ] && echo "$out" | grep -q "Fail-Closed"; then ok "foreign_std_dir_fail_closed"
+else no "foreign_std_dir_fail_closed" "Verzeichnisname std/ reichte fuer Vertrauen — Bypass (#2202)"; fi
 
 # --- 2. Gleiche Datei AUSSERHALB des Baums: fail-closed, trotz `unit std.*` ---
 cp "$ROOT/std/_ffi_trust_probe.lyx" "$TMP/outside.lyx"
@@ -59,7 +71,7 @@ extern fn execve(path: pchar, argv: pchar, envp: pchar): int64 link "libc.so.6";
 pub fn f(): int64 { return 0; }
 EOF
 rm -f "$TMP/bl.lyu"
-out=$("$LYXC" --compile-unit "$ROOT/std/_ffi_trust_probe.lyx" -o "$TMP/bl.lyu" 2>&1)
+out=$("$LYXC" --std-path="$ROOT" --compile-unit "$ROOT/std/_ffi_trust_probe.lyx" -o "$TMP/bl.lyu" 2>&1)
 if [ ! -f "$TMP/bl.lyu" ] && echo "$out" | grep -q "Blacklist"; then ok "blacklist_still_enforced"
 else no "blacklist_still_enforced" "Vertrauen hat die FFI-Blacklist ausgehebelt"; fi
 
@@ -80,7 +92,7 @@ unit std._ffi_trust_probe;
 pub fn f(): int64 { return sys_fork(); }
 EOF
 rm -f "$TMP/fk.lyu"
-"$LYXC" --compile-unit "$ROOT/std/_ffi_trust_probe.lyx" -o "$TMP/fk.lyu" >/dev/null 2>&1
+"$LYXC" --std-path="$ROOT" --compile-unit "$ROOT/std/_ffi_trust_probe.lyx" -o "$TMP/fk.lyu" >/dev/null 2>&1
 if [ -f "$TMP/fk.lyu" ]; then ok "stdlib_builtin_no_decl_needed"
 else no "stdlib_builtin_no_decl_needed" "Builtin sys_fork wurde im std-Baum abgelehnt"; fi
 
@@ -90,7 +102,7 @@ extern fn fork(): int64;
 pub fn f(): int64 { return fork(); }
 EOF
 rm -f "$TMP/nl.lyu"
-out=$("$LYXC" --compile-unit "$ROOT/std/_ffi_trust_probe.lyx" -o "$TMP/nl.lyu" 2>&1)
+out=$("$LYXC" --std-path="$ROOT" --compile-unit "$ROOT/std/_ffi_trust_probe.lyx" -o "$TMP/nl.lyu" 2>&1)
 if [ ! -f "$TMP/nl.lyu" ] && echo "$out" | grep -q "link-Klausel"; then ok "stdlib_linkless_extern_rejected"
 else no "stdlib_linkless_extern_rejected" "link-lose Deklaration im std-Baum blieb unbeanstandet"; fi
 
