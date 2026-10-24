@@ -10,6 +10,7 @@ unit std.csv;
 import std.string;
 import std.alloc;
 import std.fs;
+import std.io;      // FloatToStr fuer den Schreibteil
 
 // ── Worum es geht ────────────────────────────────────────────────────────────
 //
@@ -54,6 +55,8 @@ pub con CSV_E_MISSING: int64 := 5;   // Feld fehlt, wo eine Zahl stehen muss
 pub con CSV_E_NUMBER: int64  := 6;   // Feld ist keine Zahl
 pub con CSV_E_RANGE: int64   := 7;   // Zeile oder Spalte gibt es nicht
 pub con CSV_E_SPACE: int64   := 8;   // Zielpuffer zu klein
+pub con CSV_E_UNQUOTABLE: int64 := 9;   // Feld braucht Anfuehrungszeichen, es gibt keins
+pub con CSV_E_EMPTYROW: int64   := 10;  // Zeile ohne Felder
 
 // Trennzeichen 0 heisst: an Folgen von Leerzeichen und Tabulatoren trennen
 pub con CSV_SEP_WHITESPACE: int64 := 0;
@@ -766,5 +769,378 @@ pub fn CsvUsableRowCount(t: int64, cols: int64, nCols: int64): int64 {
     if (CsvRowUsable(t, i, cols, nCols)) { n := n + 1; }
     i := i + 1;
   }
+  return n;
+}
+
+// ── Schreiben ────────────────────────────────────────────────────────────────
+//
+// Der Schreiber sammelt die Tabelle in einem wachsenden Puffer und legt sie am
+// Ende als Datei ab (oder gibt den Puffer heraus, etwa fuer eine
+// Datenbankspalte). Felder werden in der Reihenfolge geschrieben, in der sie
+// stehen sollen; CsvEndRow schliesst eine Zeile ab.
+//
+// ── Wann Anfuehrungszeichen gesetzt werden ───────────────────────────────────
+//
+// Immer dann, wenn das Feld sonst nicht wieder einzulesen waere: wenn es das
+// Trennzeichen, ein Anfuehrungszeichen, einen Zeilenumbruch oder fuehrenden
+// bzw. abschliessenden Leerraum enthaelt. Anfuehrungszeichen im Feld werden
+// verdoppelt. Wer `quoteAlways` setzt, bekommt sie um jedes Feld.
+//
+// Gibt es KEIN Anfuehrungszeichen (CSV_NO_QUOTE) und braeuchte das Feld eines,
+// scheitert der Aufruf mit CSV_E_UNQUOTABLE. Eine Datei zu schreiben, die sich
+// nicht mehr lesen laesst, waere der schlimmere Ausgang: der Fehler faellt
+// dann erst beim Einlesen auf, und niemand sucht ihn beim Schreiber.
+
+con W_MAGIC: int64  := 0;
+con W_BUF: int64    := 1;
+con W_CAP: int64    := 2;
+con W_LEN: int64    := 3;
+con W_SEP: int64    := 4;
+con W_QUOTE: int64  := 5;
+con W_ALWAYS: int64 := 6;
+con W_MISS: int64   := 7;
+con W_FIELDS: int64 := 8;   // Felder in der laufenden Zeile
+con W_ROWS: int64   := 9;
+con W_CRLF: int64   := 10;
+con W_SLOTS: int64  := 11;
+
+con CSVW_MAGIC: int64 := 6517495;   // 'csw'
+
+fn _isW(w: int64): bool {
+  if (w == 0) { return false; }
+  if (peek64(w + W_MAGIC * 8) != CSVW_MAGIC) { return false; }
+  return true;
+}
+
+fn _wg(w: int64, slot: int64): int64 { return peek64(w + slot * 8); }
+fn _ws(w: int64, slot: int64, v: int64): void { poke64(w + slot * 8, v); }
+
+// Platz fuer weitere n Bytes schaffen. Verdoppeln, nicht nachlegen: std.alloc
+// holt je Allokation eine eigene mmap-Abbildung.
+fn _wNeed(w: int64, n: int64): bool {
+  var len: int64 := _wg(w, W_LEN);
+  var cap: int64 := _wg(w, W_CAP);
+  if (len + n + 1 <= cap) { return true; }
+  var neu: int64 := cap * 2;
+  if (neu < 256) { neu := 256; }
+  while (neu < len + n + 1) { neu := neu * 2; }
+  var frisch: int64 := alloc(neu);
+  if (frisch == 0) { return false; }
+  var alt: int64 := _wg(w, W_BUF);
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(frisch + i, peek8(alt + i));
+    i := i + 1;
+  }
+  if (alt != 0) { free(alt, cap); }
+  _ws(w, W_BUF, frisch);
+  _ws(w, W_CAP, neu);
+  return true;
+}
+
+fn _wByte(w: int64, c: int64): bool {
+  if (_wNeed(w, 1) == false) { return false; }
+  var len: int64 := _wg(w, W_LEN);
+  poke8(_wg(w, W_BUF) + len, c);
+  _ws(w, W_LEN, len + 1);
+  return true;
+}
+
+fn _wStr(w: int64, s: pchar): bool {
+  var n: int64 := StrLen(s);
+  if (_wNeed(w, n) == false) { return false; }
+  var len: int64 := _wg(w, W_LEN);
+  var buf: int64 := _wg(w, W_BUF);
+  var i: int64 := 0;
+  while (i < n) {
+    poke8(buf + len + i, peek8((s as int64) + i));
+    i := i + 1;
+  }
+  _ws(w, W_LEN, len + n);
+  return true;
+}
+
+// Neuer Schreiber. sep ist das Trennzeichen (CSV_SEP_COMMA, CSV_SEP_TAB, 32
+// fuer Leerzeichen ...); CSV_SEP_WHITESPACE wird abgelehnt, denn beim
+// Schreiben muss ein konkretes Zeichen zwischen die Felder.
+pub fn CsvWriterNew(sep: int64, quote: int64, quoteAlways: bool): int64 {
+  _csv_err := CSV_OK;
+  if (sep == CSV_SEP_WHITESPACE) { return _failI(CSV_E_ARGS); }
+  if (sep < 1) { return _failI(CSV_E_ARGS); }
+  if (sep > 255) { return _failI(CSV_E_ARGS); }
+  if (sep == 10) { return _failI(CSV_E_ARGS); }
+  if (sep == 13) { return _failI(CSV_E_ARGS); }
+  if (quote < 0) { return _failI(CSV_E_ARGS); }
+  if (quote > 255) { return _failI(CSV_E_ARGS); }
+  if (quote == sep) { return _failI(CSV_E_ARGS); }
+  if (quoteAlways) {
+    if (quote == CSV_NO_QUOTE) { return _failI(CSV_E_ARGS); }
+  }
+  var w: int64 := allocZeroed(W_SLOTS * 8);
+  if (w == 0) { return _failI(CSV_E_MEM); }
+  _ws(w, W_MAGIC, CSVW_MAGIC);
+  _ws(w, W_SEP, sep);
+  _ws(w, W_QUOTE, quote);
+  if (quoteAlways) { _ws(w, W_ALWAYS, 1); } else { _ws(w, W_ALWAYS, 0); }
+  _ws(w, W_CRLF, 0);
+  return w;
+}
+
+pub fn CsvWriterFree(w: int64): void {
+  if (_isW(w) == false) { return; }
+  var b: int64 := _wg(w, W_BUF);
+  if (b != 0) { free(b, _wg(w, W_CAP)); }
+  var mi: int64 := _wg(w, W_MISS);
+  if (mi != 0) { free(mi, 64); }
+  _ws(w, W_MAGIC, 0);
+  free(w, W_SLOTS * 8);
+}
+
+// Zeichenkette, die fuer ein fehlendes Feld geschrieben wird (etwa "?" oder
+// "NA"). Ohne sie bleibt das Feld leer.
+pub fn CsvWriterSetMissing(w: int64, marker: pchar): bool {
+  _csv_err := CSV_OK;
+  if (_isW(w) == false) { return _failB(CSV_E_ARGS); }
+  if (marker == 0 as pchar) { return _failB(CSV_E_ARGS); }
+  var n: int64 := StrLen(marker);
+  if (n > 63) { return _failB(CSV_E_ARGS); }
+  var alt: int64 := _wg(w, W_MISS);
+  if (alt != 0) { free(alt, 64); }
+  var p: int64 := alloc(64);
+  if (p == 0) { return _failB(CSV_E_MEM); }
+  var i: int64 := 0;
+  while (i < n) {
+    poke8(p + i, peek8((marker as int64) + i));
+    i := i + 1;
+  }
+  poke8(p + n, 0);
+  _ws(w, W_MISS, p);
+  return true;
+}
+
+// Zeilenende CRLF statt LF (fuer Empfaenger, die darauf bestehen).
+pub fn CsvWriterSetCrlf(w: int64, on: bool): void {
+  if (_isW(w) == false) { return; }
+  if (on) { _ws(w, W_CRLF, 1); } else { _ws(w, W_CRLF, 0); }
+}
+
+// Braucht dieses Feld Anfuehrungszeichen?
+fn _needsQuote(w: int64, s: pchar): bool {
+  var sep: int64 := _wg(w, W_SEP);
+  var quote: int64 := _wg(w, W_QUOTE);
+  var n: int64 := StrLen(s);
+  if (n == 0) { return false; }
+  var erst: int64 := peek8((s as int64)) & 255;
+  if (_isSpace(erst)) { return true; }
+  var letzt: int64 := peek8((s as int64) + n - 1) & 255;
+  if (_isSpace(letzt)) { return true; }
+  var i: int64 := 0;
+  while (i < n) {
+    var c: int64 := peek8((s as int64) + i) & 255;
+    if (c == sep) { return true; }
+    if (c == 10) { return true; }
+    if (c == 13) { return true; }
+    if (quote != CSV_NO_QUOTE) {
+      if (c == quote) { return true; }
+    }
+    i := i + 1;
+  }
+  return false;
+}
+
+// Ein Feld schreiben. Trennzeichen davor setzt die Funktion selbst, wenn in
+// dieser Zeile schon ein Feld steht.
+pub fn CsvWriteField(w: int64, s: pchar): bool {
+  _csv_err := CSV_OK;
+  if (_isW(w) == false) { return _failB(CSV_E_ARGS); }
+  if (s == 0 as pchar) { return _failB(CSV_E_ARGS); }
+  var sep: int64 := _wg(w, W_SEP);
+  var quote: int64 := _wg(w, W_QUOTE);
+  if (_wg(w, W_FIELDS) > 0) {
+    if (_wByte(w, sep) == false) { return _failB(CSV_E_MEM); }
+  }
+  var mitQuote: bool := false;
+  if (_wg(w, W_ALWAYS) == 1) { mitQuote := true; }
+  if (_needsQuote(w, s)) {
+    if (quote == CSV_NO_QUOTE) { return _failB(CSV_E_UNQUOTABLE); }
+    mitQuote := true;
+  }
+  if (mitQuote) {
+    if (_wByte(w, quote) == false) { return _failB(CSV_E_MEM); }
+    var n: int64 := StrLen(s);
+    var i: int64 := 0;
+    while (i < n) {
+      var c: int64 := peek8((s as int64) + i) & 255;
+      if (c == quote) {
+        if (_wByte(w, quote) == false) { return _failB(CSV_E_MEM); }
+      }
+      if (_wByte(w, c) == false) { return _failB(CSV_E_MEM); }
+      i := i + 1;
+    }
+    if (_wByte(w, quote) == false) { return _failB(CSV_E_MEM); }
+  } else {
+    if (_wStr(w, s) == false) { return _failB(CSV_E_MEM); }
+  }
+  _ws(w, W_FIELDS, _wg(w, W_FIELDS) + 1);
+  return true;
+}
+
+pub fn CsvWriteInt(w: int64, v: int64): bool {
+  _csv_err := CSV_OK;
+  if (_isW(w) == false) { return _failB(CSV_E_ARGS); }
+  return CsvWriteField(w, IntToStr(v));
+}
+
+// Gleitkommazahl mit decimals Nachkommastellen. decimals < 0 wird abgelehnt:
+// eine stillschweigend gewaehlte Genauigkeit ist beim Schreiben von Messwerten
+// genau die Art Entscheidung, die niemand bemerkt.
+pub fn CsvWriteFloat(w: int64, v: f64, decimals: int64): bool {
+  _csv_err := CSV_OK;
+  if (_isW(w) == false) { return _failB(CSV_E_ARGS); }
+  if (decimals < 0) { return _failB(CSV_E_ARGS); }
+  if (decimals > 17) { return _failB(CSV_E_ARGS); }
+  // NaN und Unendlich haben in einer Zahlenspalte nichts zu suchen: beim
+  // Einlesen waeren sie keine Zahl. Wer eine Luecke schreiben will, nimmt
+  // CsvWriteMissing. (Nebenbei: FloatToStr gibt fuer diese Faelle ein
+  // String-LITERAL zurueck, das nicht freigegeben werden darf -- der Zweig
+  // unten gibt 96 Byte zurueck.)
+  if (v != v) { return _failB(CSV_E_NUMBER); }
+  var maxFinite: f64 := 1.7976931348623157e308;
+  if (v > maxFinite) { return _failB(CSV_E_NUMBER); }
+  var negMax: f64 := 0.0 - maxFinite;
+  if (v < negMax) { return _failB(CSV_E_NUMBER); }
+  var s: pchar := FloatToStr(v, decimals);
+  if (s == 0 as pchar) { return _failB(CSV_E_MEM); }
+  var okb: bool := CsvWriteField(w, s);
+  free(s as int64, 96);        // FloatToStr legt 96 Byte an
+  if (okb == false) { return false; }
+  return true;
+}
+
+// Fehlendes Feld: die Marke aus CsvWriterSetMissing, sonst ein leeres Feld.
+pub fn CsvWriteMissing(w: int64): bool {
+  _csv_err := CSV_OK;
+  if (_isW(w) == false) { return _failB(CSV_E_ARGS); }
+  var mi: int64 := _wg(w, W_MISS);
+  if (mi == 0) { return CsvWriteField(w, ""c); }
+  return CsvWriteField(w, mi as pchar);
+}
+
+// Zeile abschliessen. Eine Zeile OHNE Feld wird abgelehnt: beim Einlesen
+// verschwindet eine Leerzeile wieder, der Bestand waere also nach dem
+// Rundlauf ein anderer.
+pub fn CsvEndRow(w: int64): bool {
+  _csv_err := CSV_OK;
+  if (_isW(w) == false) { return _failB(CSV_E_ARGS); }
+  if (_wg(w, W_FIELDS) < 1) { return _failB(CSV_E_EMPTYROW); }
+  if (_wg(w, W_CRLF) == 1) {
+    if (_wByte(w, 13) == false) { return _failB(CSV_E_MEM); }
+  }
+  if (_wByte(w, 10) == false) { return _failB(CSV_E_MEM); }
+  _ws(w, W_FIELDS, 0);
+  _ws(w, W_ROWS, _wg(w, W_ROWS) + 1);
+  return true;
+}
+
+// Eine ganze Zeile aus Zeichenketten: names ist ein int64-Feld mit n Zeigern.
+pub fn CsvWriteRowStrings(w: int64, names: int64, n: int64): bool {
+  _csv_err := CSV_OK;
+  if (_isW(w) == false) { return _failB(CSV_E_ARGS); }
+  if (names == 0) { return _failB(CSV_E_ARGS); }
+  if (n < 1) { return _failB(CSV_E_ARGS); }
+  var i: int64 := 0;
+  while (i < n) {
+    var s: int64 := peek64(names + i * 8);
+    if (s == 0) { return _failB(CSV_E_ARGS); }
+    if (CsvWriteField(w, s as pchar) == false) { return false; }
+    i := i + 1;
+  }
+  return CsvEndRow(w);
+}
+
+// Eine f64-Matrix (zeilenweise, cols Spalten) als rows Zeilen.
+pub fn CsvWriteMatrix(w: int64, M: int64, rows: int64, cols: int64,
+                      decimals: int64): bool {
+  _csv_err := CSV_OK;
+  if (_isW(w) == false) { return _failB(CSV_E_ARGS); }
+  if (M == 0) { return _failB(CSV_E_ARGS); }
+  if (rows < 1) { return _failB(CSV_E_ARGS); }
+  if (cols < 1) { return _failB(CSV_E_ARGS); }
+  var i: int64 := 0;
+  while (i < rows) {
+    var j: int64 := 0;
+    while (j < cols) {
+      var v: f64 := peekf64(M + (i * cols + j) * 8);
+      if (CsvWriteFloat(w, v, decimals) == false) { return false; }
+      j := j + 1;
+    }
+    if (CsvEndRow(w) == false) { return false; }
+    i := i + 1;
+  }
+  return true;
+}
+
+pub fn CsvWriterRowCount(w: int64): int64 {
+  if (_isW(w) == false) { return 0; }
+  return _wg(w, W_ROWS);
+}
+
+// Felder in der noch offenen Zeile (0, wenn gerade keine offen ist)
+pub fn CsvWriterPendingFields(w: int64): int64 {
+  if (_isW(w) == false) { return 0; }
+  return _wg(w, W_FIELDS);
+}
+
+pub fn CsvWriterLen(w: int64): int64 {
+  if (_isW(w) == false) { return 0; }
+  return _wg(w, W_LEN);
+}
+
+// Zeiger auf die gesammelten Bytes; gilt bis zum naechsten Schreibschritt
+// (der Puffer kann wachsen) und bis CsvWriterFree. Der Inhalt ist mit einem
+// Nullbyte abgeschlossen, damit er auch als pchar durchgereicht werden kann.
+pub fn CsvWriterData(w: int64): int64 {
+  if (_isW(w) == false) { return 0; }
+  var buf: int64 := _wg(w, W_BUF);
+  if (buf == 0) { return 0; }
+  poke8(buf + _wg(w, W_LEN), 0);
+  return buf;
+}
+
+// In eine Datei schreiben. Rueckgabe ist die Zahl der Bytes oder -1.
+// Eine offene Zeile (Felder ohne CsvEndRow) wird abgelehnt, statt sie
+// stillschweigend abzuschliessen -- sonst entscheidet der Schreiber, wo die
+// Tabelle endet.
+pub fn CsvWriterSave(w: int64, path: pchar): int64 {
+  _csv_err := CSV_OK;
+  if (_isW(w) == false) { _csv_err := CSV_E_ARGS; return -1; }
+  if (path == 0 as pchar) { _csv_err := CSV_E_ARGS; return -1; }
+  if (_wg(w, W_FIELDS) > 0) { _csv_err := CSV_E_EMPTYROW; return -1; }
+  var len: int64 := _wg(w, W_LEN);
+  if (len < 1) { _csv_err := CSV_E_FILE; return -1; }
+  var buf: int64 := _wg(w, W_BUF);
+  var n: int64 := WriteFile(path, buf as pchar, len);
+  if (n != len) { _csv_err := CSV_E_FILE; return -1; }
+  return n;
+}
+
+// Kurzform: eine f64-Matrix als Datei, mit Kopfzeile wenn names != 0.
+pub fn CsvSaveMatrix(path: pchar, M: int64, rows: int64, cols: int64,
+                     decimals: int64, sep: int64, names: int64): int64 {
+  _csv_err := CSV_OK;
+  var w: int64 := CsvWriterNew(sep, CSV_QUOTE_DOUBLE, false);
+  if (w == 0) { return -1; }
+  if (names != 0) {
+    if (CsvWriteRowStrings(w, names, cols) == false) {
+      CsvWriterFree(w);
+      return -1;
+    }
+  }
+  if (CsvWriteMatrix(w, M, rows, cols, decimals) == false) {
+    CsvWriterFree(w);
+    return -1;
+  }
+  var n: int64 := CsvWriterSave(w, path);
+  CsvWriterFree(w);
   return n;
 }
