@@ -21,8 +21,8 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.19N
-VERSION_DATE := 2026-10-23
+VERSION   := 1.2.20A
+VERSION_DATE := 2026-10-24
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
 UNITS_DST := $(PKG_DIR)/usr/include/lyx/units/std
@@ -375,6 +375,14 @@ test: lyxc
 	@bash tests/register_kandidaten_test.sh
 	@echo "--- Zwischenwerte in Registern, Sprungpaare ausgerichtet (#2228) ---"
 	@bash tests/ausdruck_register_test.sh
+	@echo "--- Rechtsshift mit/ohne Vorzeichen auf allen Zielen (#2236) ---"
+	@bash tests/rechtsshift_2236_test.sh
+	@echo "--- kleine f64-Literale auf den IR-Zielen (#2223) ---"
+	@bash tests/f64_kleine_literale_2223_test.sh
+	@echo "--- nicht schreibbarer Ausgabepfad auf jedem Ziel (#2179) ---"
+	@bash tests/ausgabepfad_ziele_2179_test.sh
+	@echo "--- arm-cm: 64-Bit-Konstanten laut (#2237) ---"
+	@bash tests/arm_cm_konstanten_2237_test.sh
 	@echo "--- Bit-Builtins und ISA-Gating am Erzeugnis (#2190, #2191) ---"
 	@bash tests/bit_builtins_test.sh
 	@echo "--- Cortex-M: Abbild starten und ueber Semihosting ausgeben (#1744) ---"

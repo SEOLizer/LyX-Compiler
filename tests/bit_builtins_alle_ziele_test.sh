@@ -50,7 +50,11 @@ lit = lambda v: str(v) if v >= 0 else "(0 - %d)" % (-v)
 L = ["fn ref_rotl32(x: int64, n: int64): int64 {",
      "  var k: int64 := n & 31; var w: int64 := x & 0xFFFFFFFF;",
      "  if (k == 0) { return w; }",
-     "  return ((w << k) | (w >> (32 - k))) & 0xFFFFFFFF;",
+     # #2236: vorzeichenlos schieben. Auf esp32/arm-cm ist int64 ein Wort;
+     # `x & 0xFFFFFFFF` mit gesetztem Bit 31 ist dort NEGATIV, und `>>` auf
+     # einem vorzeichenbehafteten Wert ist seit #2236 auf jedem Ziel
+     # arithmetisch (vorher auf diesen Zielen still logisch).
+     "  return ((w << k) | ((w as uint32) >> (32 - k))) & 0xFFFFFFFF;",
      "}",
      ]
 # Je Rechenwerk eine eigene Funktion: auf xtensa erreicht L32I nur 255 Worte

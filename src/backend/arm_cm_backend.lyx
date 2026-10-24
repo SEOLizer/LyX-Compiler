@@ -197,6 +197,27 @@ pub type EmitARMCM = class {
 
   // Load 32-bit immediate (truncated from int64) into Rd
   fn cm_LI(rd: int64, imm: int64) {
+    // #2237: Hier wurde jeder Wert still auf seine unteren 32 Bit gekuerzt —
+    // XXHash64 uebersetzte fuer arm-cm4 und lieferte 98376185. Jetzt dieselbe
+    // Regel wie xt_li auf esp32 (#2149): zulaessig ist, was vorzeichenbehaftet
+    // oder vorzeichenlos in 32 Bit passt (int64 ist hier ein Wort); alles
+    // andere wird laut abgewiesen.
+    var v32: int64 := imm & 0xFFFFFFFF;
+    if (v32 & 0x80000000) != 0 { v32 := v32 - 4294967296; }
+    if v32 != imm && imm != (imm & 0xFFFFFFFF) {
+      EPrintStr("error: arm-cm: Konstante "c); EPrintInt(imm);
+      EPrintStrLn(" passt nicht in 32 Bit (#2237)."c);
+      exit(1);
+    }
+    self.cm_LIroh(rd, imm);
+  }
+
+  // Laedt die unteren 32 Bit OHNE Pruefung. Nur fuer die Anfangswerte der
+  // Modulvariablen (main, Startcode): dort waere ein Abbruch zu weit — jede
+  // importierte Unit mit einer ungenutzten 64-Bit-Konstante (std.hash: FNV)
+  // braechte das Uebersetzen, auch fuer MD5/DJB2. Das Kuerzen dort ist ein
+  // bekannter, offener Defekt (#2239), kein gewollter Normalfall.
+  fn cm_LIroh(rd: int64, imm: int64) {
     var imm32: int64 := imm & 0xFFFFFFFF;
     if imm32 >= 0 && imm32 <= 255 && rd < 8 {
       self.cm_MOVS_imm(rd, imm32);
@@ -300,6 +321,11 @@ pub type EmitARMCM = class {
   // LSR.W Rd, Rn, Rs: T2
   fn cm_LSR(rd: int64, rn: int64, rs: int64) {
     self.cm_t32(0xFA20 | rn, 0xF000 | (rd << 8) | rs);
+  }
+
+  // ASR.W Rd, Rn, Rm (T2) — arithmetisch rechts (#2236)
+  fn cm_ASR(rd: int64, rn: int64, rs: int64) {
+    self.cm_t32(0xFA40 | rn, 0xF000 | (rd << 8) | rs);
   }
 
   // CMP.W Rn, Rm: T3
@@ -527,7 +553,7 @@ pub type EmitARMCM = class {
     if (op == IRO_LOAD_FIELD || op == IRO_LOAD_FIELD_HEAP || op == IRO_LOAD_GLOBAL || op == IRO_LOAD_LOCAL) { return 1; }
     if (op == IRO_MOD || op == IRO_MUL || op == IRO_NEG || op == IRO_NOT) { return 1; }
     if (op == IRO_OR || op == IRO_PANIC || op == IRO_SEXT || op == IRO_SHL) { return 1; }
-    if (op == IRO_SHR || op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP || op == IRO_STORE_GLOBAL) { return 1; }
+    if (op == IRO_SHR || op == IRO_SAR || op == IRO_STORE_FIELD || op == IRO_STORE_FIELD_HEAP || op == IRO_STORE_GLOBAL) { return 1; }
     if (op == IRO_STORE_LOCAL || op == IRO_SUB || op == IRO_THROW || op == IRO_TRUNC) { return 1; }
     if (op == IRO_XOR || op == IRO_ZEXT) { return 1; }
     return 0;
@@ -608,6 +634,10 @@ pub type EmitARMCM = class {
     if op == IRO_SHR {
       self.cm_loadSlot(src1); self.cm_loadSlot2(src2);
       self.cm_LSR(CM_R4, CM_R4, CM_R5); self.cm_storeSlot(dest);
+    }
+    if op == IRO_SAR {                       // #2236: arithmetisch
+      self.cm_loadSlot(src1); self.cm_loadSlot2(src2);
+      self.cm_ASR(CM_R4, CM_R4, CM_R5); self.cm_storeSlot(dest);
     }
 
     // --- Comparisons: CMP r4,r5 + MOVS r4,#0 + B<inv_cond>.N +2 + MOVS r4,#1 ---
@@ -1360,7 +1390,7 @@ pub type EmitARMCM = class {
       while gi < gCount {
         var gv: int64 := 0;
         if gBuf != 0 { gv := peek64(gBuf + gi * 8); }
-        self.cm_LI(CM_R4, gv);
+        self.cm_LIroh(CM_R4, gv);   // #2239: Anfangswert, siehe cm_LIroh
         self.cm_LI(CM_R6, CM_GLOBALS_BASE + gi * 4);
         self.cm_STR_pos(CM_R4, CM_R6, 0);
         gi := gi + 1;
