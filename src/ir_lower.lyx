@@ -4656,8 +4656,8 @@ pub type IRLower = class {
     // #2147: len() auf einem Array. Bis 1.2.16C kannte der IR-Weg es nicht
     // ("unbekannter Name im Aufruf: len"). Feste Groesse `[N]T`: N zur
     // Uebersetzungszeit. Dynamisches Array (`T[]`, `array`, `Array<T>`) und
-    // Literal: die Laenge steht bei [p-8] (Kopf {cap,len} vor dem ersten
-    // Element, _lowerArrayLit); ein Nullzeiger (noch nicht angelegt) hat 0.
+    // Literal: die Laenge steht bei [p+8] (Kopf {cap,len}, seit #2262 wie auf
+    // x86); ein Nullzeiger (noch nicht angelegt) hat 0.
     if (self.seq(fname, fnlen, "len", 3) && arg0 >= 0 && self._irVerdecktBuiltin(fname, fnlen) == 0) {
       var laArt: int64 := 0;
       var laN: int64 := 0;
@@ -4691,12 +4691,9 @@ pub type IRLower = class {
         self.irAddInstrDirect(IRO_CMP_EQ, laIst0, laP, laNull, 0);
         var laAus: int64 := self.genLabel();
         self.irAddInstrDirect(IRO_BR_TRUE, -1, laIst0, -1, laAus);
-        var la8: int64 := self.allocTemp();
-        self.irAddInstrDirect(IRO_CONST_INT, la8, -1, -1, 8);
-        var laK: int64 := self.allocTemp();
-        self.irAddInstrDirect(IRO_SUB, laK, laP, la8, 0);
+        // #2262: len steht bei [p+8] — der Zeiger zeigt auf den Kopf.
         var laL: int64 := self.allocTemp();
-        self.irAddInstrDirect(IRO_LOAD_FIELD, laL, laK, 0, 0);
+        self.irAddInstrDirect(IRO_LOAD_FIELD, laL, laP, 8, 0);
         self.irAddInstrDirect(IRO_STORE_LOCAL, dest, laL, -1, 0);
         self.irEmitLabel(laAus);
         return dest;
@@ -7371,6 +7368,22 @@ pub type IRLower = class {
     }
     var base: int64 := self.lowerExpr(self.nodeC0(expr));
     var idx: int64 := self.lowerExpr(self.nodeC1(expr));
+    // #2262/#2260: Kopf-Array → Elemente ab +16; Struct-Elemente inline →
+    // die ADRESSE des Elements (Feldzugriff darauf liest/schreibt in place).
+    if simd == 0 {
+      var ixTn: int64 := self._exprTypeNode(self.nodeC0(expr));
+      var ixSg: int64 := self._arrStructElemGroesse(ixTn);
+      base := self._elemBasis(self.nodeC0(expr), base);
+      if ixSg > 0 {
+        var sgT: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_CONST_INT, sgT, -1, -1, ixSg);
+        var offT: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_MUL, offT, idx, sgT, 0);
+        var adr: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_ADD, adr, base, offT, 0);
+        return adr;
+      }
+    }
     var dest: int64 := self.allocTemp();
     // WP-SIMD: parallel-Array<f32>[i] → f32-Element laden + nach f64 konvertieren (LOAD_ELEM).
     if simd != 0 {
@@ -8905,17 +8918,29 @@ pub type IRLower = class {
             vdN := self.nodeIVal(vdSzNode);
           }
           if vdN > 0 {
-            var vdSzTemp: int64 := self.allocTemp();
-            self.irAddInstrDirect(IRO_CONST_INT, vdSzTemp, -1, -1, vdN * 8);
+            // #2262: {cap,len}-Kopf vor den Elementen, der Slot haelt den
+            // Kopfzeiger — wie auf x86. Bis 1.2.20H ohne Kopf, und len()
+            // bzw. ein x86-artiger Zugriff lasen daneben.
+            var vdP: int64 := 0 - 1;
             // WP-ALIGN: @align(n) → Boundary aus iv-Bits 8+ (n direkt gespeichert); imm der ALLOC.
             var vdAlign: int64 := (self.nodeIVal(stmt) >> 8) & 0xFFFFFF;
             if vdAlign <= 16 {
               // #2157: aus der Arena (16-Byte-ausgerichtet) statt mmap je Aufruf.
-              var vdAr: int64 := self._arenaAlloc(vdN * 8);
-              self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdAr, -1, 0);
+              vdP := self._arenaAlloc(16 + vdN * 8);
             } else {
-              self.irAddInstrDirect(IRO_ALLOC, vdSlot, vdSzTemp, -1, vdAlign);
+              // Die AUSRICHTUNG gilt den Elementen: Block mit Reserve holen,
+              // Kopf so legen, dass p+16 auf der Grenze liegt.
+              var vdSzTemp: int64 := self.allocTemp();
+              self.irAddInstrDirect(IRO_CONST_INT, vdSzTemp, -1, -1, vdAlign + vdN * 8);
+              var vdQ: int64 := self.allocTemp();
+              self.irAddInstrDirect(IRO_ALLOC, vdQ, vdSzTemp, -1, vdAlign);
+              var vdV: int64 := self.allocTemp();
+              self.irAddInstrDirect(IRO_CONST_INT, vdV, -1, -1, vdAlign - 16);
+              vdP := self.allocTemp();
+              self.irAddInstrDirect(IRO_ADD, vdP, vdQ, vdV, 0);
             }
+            self._arrKopfSchreiben(vdP, vdN);
+            self.irAddInstrDirect(IRO_STORE_LOCAL, vdSlot, vdP, -1, 0);
           }
         }
         // #1835: dasselbe fuer `var r: TStruct;`. Der Array-Fall daneben bekam
@@ -8970,9 +8995,15 @@ pub type IRLower = class {
       var vdTyp: int64 := self.nodeC0(stmt);
       if vdTyp < 0 && vdInit >= 0 {
         if self.nodeKind(vdInit) == NK_CLOSURE { vdTyp := vdInit; }
+        // #2262: ein Array-Literal bzw. Tupel `(a, b)` als Startwert — wie das
+        // Lambda oben gilt der Literalknoten als Typ. Sonst kennt der
+        // Elementzugriff das Local nicht als Kopf-Array (x86: localIsArray)
+        // und laese den Kopf statt der Elemente.
+        else if self.nodeKind(vdInit) == NK_ARRAY_LIT { vdTyp := vdInit; }
         else if self.nodeKind(vdInit) == NK_IDENT {
           var vdQt: int64 := self._localTypeNode(self.nodeSVal(vdInit), self.nodeSLen(vdInit));
-          if vdQt >= 0 && (self.nodeKind(vdQt) == NK_CLOSURE || self.nodeKind(vdQt) == NK_FN_PTR) { vdTyp := vdQt; }
+          if vdQt >= 0 && (self.nodeKind(vdQt) == NK_CLOSURE || self.nodeKind(vdQt) == NK_FN_PTR
+                           || self.nodeKind(vdQt) == NK_ARRAY_LIT) { vdTyp := vdQt; }
         }
         // das Ergebnis eines Aufrufs, wenn es ein Funktionswert ist — sein
         // Typknoten (`var d1 := dreifach(3)`)
@@ -9198,11 +9229,10 @@ pub type IRLower = class {
       i := i + 1;
     }
     free(vals, (cnt + 1) * 8);
-    var c16: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_CONST_INT, c16, -1, -1, 16);
-    var dest: int64 := self.allocTemp();
-    self.irAddInstrDirect(IRO_ADD, dest, p, c16, 0);
-    return dest;
+    // #2262: der Zeiger zeigt auf den KOPF, wie auf x86 — bis 1.2.20H auf das
+    // erste Element, und jeder x86-artig angelegte Puffer wurde auf den
+    // IR-Zielen um zwei Elemente verschoben gelesen.
+    return p;
   }
 
   // #2080: Ruft `call` eine Nutzerfunktion oder -methode mit Tupel-
@@ -9388,13 +9418,13 @@ pub type IRLower = class {
       var initTemp: int64 := self.lowerExpr(initExpr);
       if tvTupel != 0 {
         var tvI0: int64 := self.allocTemp();
-        self.irAddInstrDirect(IRO_CONST_INT, tvI0, -1, -1, 0);
+        self.irAddInstrDirect(IRO_CONST_INT, tvI0, -1, -1, 2);   // #2262: hinter dem Kopf
         var tvE0: int64 := self.allocTemp();
         self.irAddInstrDirect(IRO_LOAD_IDX, tvE0, initTemp, tvI0, 0);
         self.irAddInstrDirect(IRO_STORE_LOCAL, valSlot, tvE0, -1, 0);
         if errSlot >= 0 {
           var tvI1: int64 := self.allocTemp();
-          self.irAddInstrDirect(IRO_CONST_INT, tvI1, -1, -1, 1);
+          self.irAddInstrDirect(IRO_CONST_INT, tvI1, -1, -1, 3);   // #2262
           var tvE1: int64 := self.allocTemp();
           self.irAddInstrDirect(IRO_LOAD_IDX, tvE1, initTemp, tvI1, 0);
           self.irAddInstrDirect(IRO_STORE_LOCAL, errSlot, tvE1, -1, 0);
@@ -9844,6 +9874,8 @@ pub type IRLower = class {
           self.irAddInstrDirect(IRO_SIMD_STORE_ELEM, aiIdx, valTemp, aiBase,
                                 self._simdBytesExpr(self.nodeC0(target)));   // #2199
         } else {
+          // #2262: hinter den {cap,len}-Kopf, wie beim Lesen (lowerIndex).
+          aiBase := self._elemBasis(self.nodeC0(target), aiBase);
           self.irAddInstrDirect(IRO_STORE_IDX, aiIdx, valTemp, aiBase, 0);
         }
       }
@@ -11384,17 +11416,35 @@ pub type IRLower = class {
           var ty: int64 := self.nodeC0(d);
           var gr: int64 := 0;
           var ausr: int64 := 0;
+          var gN: int64 := 0 - 1;   // #2262: Elementzahl eines festen Arrays
           if self.nodeKind(ty) == NK_TYPE_ARRAY_FIXED {
-            gr := self.nodeIVal(self.nodeC1(ty)) * 8;
+            gN := self.nodeIVal(self.nodeC1(ty));
+            gr := gN * 8;
             // WP-ALIGN: @align(n) wie beim Local.
             ausr := (self.nodeIVal(d) >> 8) & 0xFFFFFF;
           } else {
             gr := self.structGroesse(self._typeNodeToDecl(ty));
           }
-          var grT: int64 := self.allocTemp();
-          self.irAddInstrDirect(IRO_CONST_INT, grT, -1, -1, gr);
-          wert := self.allocTemp();
-          self.irAddInstrDirect(IRO_ALLOC, wert, grT, -1, ausr);
+          if gN >= 0 {
+            // #2262: Kopf {cap,len} davor, wie beim Local und auf x86 (#1256);
+            // eine Ausrichtung gilt den Elementen (p+16).
+            var gRes: int64 := 16;
+            if ausr > 16 { gRes := ausr; }
+            var grT: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_CONST_INT, grT, -1, -1, gRes + gr);
+            var gQ: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_ALLOC, gQ, grT, -1, ausr);
+            var gV: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_CONST_INT, gV, -1, -1, gRes - 16);
+            wert := self.allocTemp();
+            self.irAddInstrDirect(IRO_ADD, wert, gQ, gV, 0);
+            self._arrKopfSchreiben(wert, gN);
+          } else {
+            var grT2: int64 := self.allocTemp();
+            self.irAddInstrDirect(IRO_CONST_INT, grT2, -1, -1, gr);
+            wert := self.allocTemp();
+            self.irAddInstrDirect(IRO_ALLOC, wert, grT2, -1, ausr);
+          }
         }
         self.irAddInstrDirect(IRO_STORE_GLOBAL, gIdx, wert, -1, 0);
       }
@@ -14993,6 +15043,82 @@ pub type IRLower = class {
     return 0;
   }
 
+  // #2262: Ist tn ein Array-Typ mit {cap,len}-Kopf? Dynamisch (`T[]`,
+  // `Array<T>`, `array`) oder fest (`[N]T`). Dieselbe Unterscheidung wie
+  // isArray in codegen_x86 (Indexzugriff) — die beiden muessen
+  // uebereinstimmen: NUR dann liegt der Kopf vor den Elementen; ein Zeiger
+  // unbekannten Typs wird wie dort roh gelesen.
+  fn _istKopfArray(tn: int64): int64 {
+    if tn < 0 { return 0; }
+    var k: int64 := self.nodeKind(tn);
+    if k == NK_TYPE_ARRAY || k == NK_TYPE_ARRAY_FIXED { return 1; }
+    // Literal bzw. Tupel als Typknoten eines untypisierten Locals (lowerStmt,
+    // Variablendeklaration) und der Tupeltyp einer Rueckgabe.
+    if k == NK_ARRAY_LIT || k == NK_TYPE_TUPLE { return 1; }
+    if k == NK_TYPE_NAME {
+      if self.seq(self.nodeSVal(tn), self.nodeSLen(tn), "array", 5)
+         || self.seq(self.nodeSVal(tn), self.nodeSLen(tn), "Array", 5) { return 1; }
+    }
+    return 0;
+  }
+
+  // #2260: Elementtyp eines Array-Typknotens, oder -1. Zwei Formen: `T[]` und
+  // das Schluesselwort `array<T>` sind NK_TYPE_ARRAY mit dem Elementtyp in
+  // c0; `Array<T>` als Bezeichner ist NK_TYPE_NAME "Array" mit dem Elementtyp
+  // in c1 (parser.lyx, Zweig Name<T>: „ihr Elementtyp in c1 wird vom Codegen
+  // gelesen“). Feste Arrays `[N]T`: NK_TYPE_ARRAY_FIXED, c0.
+  fn _arrElemTyp(tn: int64): int64 {
+    if tn < 0 { return 0 - 1; }
+    var k: int64 := self.nodeKind(tn);
+    if k == NK_TYPE_ARRAY || k == NK_TYPE_ARRAY_FIXED { return self.nodeC0(tn); }
+    if k == NK_TYPE_NAME {
+      if self.seq(self.nodeSVal(tn), self.nodeSLen(tn), "Array", 5)
+         || self.seq(self.nodeSVal(tn), self.nodeSLen(tn), "array", 5) { return self.nodeC1(tn); }
+    }
+    return 0 - 1;
+  }
+
+  // #2260: Groesse eines INLINE liegenden Struct-Elements eines dynamischen
+  // Arrays (`Array<S>`, S ein struct > 8 Byte), sonst 0. Dann ist `a[i]` die
+  // ADRESSE p + 16 + i*Groesse, nicht der Wert eines 8-Byte-Slots — wie auf
+  // x86 (#1109, Zweig `arrElemSize > 8 && arrFixedSize == 0`). Feste Arrays
+  // `[N]S` tragen dort Zeiger-Slots und bleiben ausgenommen. Nur STRUCTS
+  // (iv-Bit 4): Klassenelemente sind Referenzen.
+  fn _arrStructElemGroesse(tn: int64): int64 {
+    if tn < 0 || self.nodeKind(tn) == NK_TYPE_ARRAY_FIXED { return 0; }
+    var et: int64 := self._arrElemTyp(tn);
+    if et < 0 { return 0; }
+    var ed: int64 := self._typeNodeToDecl(et);
+    if ed < 0 || (self.nodeIVal(ed) & 16) == 0 { return 0; }
+    var g: int64 := self.structGroesse(ed);
+    if g > 8 { return g; }
+    return 0;
+  }
+
+  // #2262: Basis eines Elementzugriffs: bei einem Kopf-Array 16 Byte weiter
+  // (hinter {cap,len}), sonst unveraendert (roher Zeiger).
+  fn _elemBasis(baseNode: int64, base: int64): int64 {
+    if self._istKopfArray(self._exprTypeNode(baseNode)) == 0 { return base; }
+    var c16: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, c16, -1, -1, 16);
+    var b16: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, b16, base, c16, 0);
+    return b16;
+  }
+
+  // #2262: Kopf {cap, len} = {n, n} an p schreiben (Anlage fester Arrays,
+  // wie codegen_x86 sie anlegt).
+  fn _arrKopfSchreiben(p: int64, n: int64) {
+    var nT: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, nT, -1, -1, n);
+    var i0: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, i0, -1, -1, 0);
+    self.irAddInstrDirect(IRO_STORE_IDX, i0, nT, p, 0);
+    var i1: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, i1, -1, -1, 1);
+    self.irAddInstrDirect(IRO_STORE_IDX, i1, nT, p, 0);
+  }
+
   fn _exprTypeNode(nd: int64): int64 {
     if nd < 0 { return 0 - 1; }
     var k: int64 := self.nodeKind(nd);
@@ -15027,6 +15153,17 @@ pub type IRLower = class {
       var od: int64 := self._typeNodeToDecl(self._exprTypeNode(self.nodeC0(nd)));
       if od < 0 { return 0 - 1; }
       return self._fieldTypeNodeIn(od, self.nodeSVal(nd), self.nodeSLen(nd));
+    }
+
+    // #2260: `a[i]` — der Elementtyp eines Arrays (c0 des Array-Typknotens).
+    // Fehlte in dieser Aufzaehlung; x86 kennt den Fall in cg_objClassIdx
+    // (CGN_INDEX -> cg_arrayElemClassIdx) — die beiden muessen
+    // uebereinstimmen. Beide Herkuenfte (Local/Modulvariable und Feld) laufen
+    // ueber die rekursive Bestimmung der Basis.
+    if k == NK_INDEX {
+      var etn: int64 := self._arrElemTyp(self._exprTypeNode(self.nodeC0(nd)));
+      if etn >= 0 { return etn; }
+      return 0 - 1;
     }
 
     // Aufruf: Methodenaufruf (iVal == 1) oder freie Funktion.
