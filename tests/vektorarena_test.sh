@@ -20,6 +20,12 @@
 #      (while, for-C-Form, for..to, for..in, repeat..until); fehlt sie an
 #      einer, waechst nur diese eine, und das faellt sonst niemandem auf.
 #
+#      #2253: dasselbe in L2-GROESSE (131072 Elemente). Dort passte das
+#      Ergebnis nicht in den Rest des Markenblocks; jeder Durchlauf holte
+#      einen neuen Block, das Zuruecksetzen sprang in den alten Rest zurueck
+#      — 602 mmap und 310 MB fuer 600 Wiederholungen. Dazu verschachtelte
+#      Schleifen (Spitzenbedarf der inneren zaehlt einmal).
+#
 #   2. Ein Vektor, der dem Rumpf ENTKOMMT, muss korrekt bleiben. Ohne diese
 #      Haelfte waere der Test auch von einer Fassung erfuellt, die immer
 #      zuruecksetzt — und die taeuschte ein Leck gegen eine
@@ -41,15 +47,15 @@ rss() {
 # Uebersetzt dieselbe Schleife mit 200 und mit 20000 Durchlaeufen und
 # vergleicht den Speicher. Ohne Marke sind das 3 MiB gegen 320 MiB.
 waechst() {
-  local name="$1" kopf="$2" fuss="$3"
+  local name="$1" kopf="$2" fuss="$3" elem="${4:-4096}" klein="${5:-200}" gross="${6:-20000}"
   local rss_klein rss_gross
   local n
-  for n in 200 20000; do
+  for n in $klein $gross; do
     cat > "$TMP/w.lyx" <<EOF
 import std.io;
 fn main(): int64 {
-  var a: parallel Array<f32> := parallel Array<f32>(4096);
-  var b: parallel Array<f32> := parallel Array<f32>(4096);
+  var a: parallel Array<f32> := parallel Array<f32>($elem);
+  var b: parallel Array<f32> := parallel Array<f32>($elem);
   var zaehler: int64 := 0;
   ${kopf//@N/$n}
     var c: parallel Array<f32> := a + b;
@@ -62,7 +68,7 @@ EOF
     if ! (cd "$ROOT" && timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/w.lyx" -o "$TMP/w.$n" >"$TMP/w.log" 2>&1); then
       echo "FAIL $name: uebersetzt nicht"; sed -n '1,4p' "$TMP/w.log"; FAIL=$((FAIL+1)); return
     fi
-    if [ "$n" = "200" ]; then rss_klein=$(rss "$TMP/w.$n"); else rss_gross=$(rss "$TMP/w.$n"); fi
+    if [ "$n" = "$klein" ]; then rss_klein=$(rss "$TMP/w.$n"); else rss_gross=$(rss "$TMP/w.$n"); fi
   done
 
   # Hundertfache Durchlaufzahl darf den Speicher nicht vervielfachen. Die
@@ -70,10 +76,10 @@ EOF
   # ohne Marke waeren es 3200 gegen 321152.
   local schranke=$(( rss_klein * 4 ))
   if [ "$rss_gross" -le "$schranke" ]; then
-    echo "PASS $name waechst nicht ($rss_klein KiB bei 200, $rss_gross KiB bei 20000)"
+    echo "PASS $name ($elem Elemente) waechst nicht ($rss_klein KiB bei $klein, $rss_gross KiB bei $gross)"
     PASS=$((PASS+1))
   else
-    echo "FAIL $name waechst: $rss_klein KiB bei 200, $rss_gross KiB bei 20000 Durchlaeufen"
+    echo "FAIL $name ($elem Elemente) waechst: $rss_klein KiB bei $klein, $rss_gross KiB bei $gross Durchlaeufen"
     FAIL=$((FAIL+1))
   fi
 }
@@ -83,6 +89,60 @@ waechst "for-C-Form"    'for i := 0; i < @N; i := i + 1 {'        '}'
 waechst "for..to"       'for i := 1 to @N {'                      '}'
 waechst "for..in"       'for i in 1..@N {'                        '}'
 waechst "repeat..until" 'repeat {'                                '} until (zaehler >= @N);'
+
+# #2253: L2-Groesse — das Ergebnis (512 KiB) passt nicht in den Rest des
+# Markenblocks. 20 gegen 400 Durchlaeufe: vorher 10 gegen 200 MiB.
+waechst "while"         'while (zaehler < @N) {'                  '}'                        131072 20 400
+waechst "for-C-Form"    'for i := 0; i < @N; i := i + 1 {'        '}'                        131072 20 400
+waechst "for..to"       'for i := 1 to @N {'                      '}'                        131072 20 400
+waechst "for..in"       'for i in 1..@N {'                        '}'                        131072 20 400
+waechst "repeat..until" 'repeat {'                                '} until (zaehler >= @N);' 131072 20 400
+
+# #2253: verschachtelt, L2-Groesse, mit Werten. Aussen 20 bzw. 300 Durchlaeufe,
+# innen je 3 Ablagen; die Summe haengt an jedem Ergebnis.
+for n in 20 300; do
+  cat > "$TMP/v.lyx" <<LYX
+import std.io;
+fn main(): int64 {
+  var a: parallel Array<f32> := parallel Array<f32>(131072);
+  var b: parallel Array<f32> := parallel Array<f32>(131072);
+  var i: int64 := 0;
+  while (i < 131072) { a[i] := (i % 7) as f64; b[i] := (i % 5) as f64; i += 1; }
+  var summe: int64 := 0;
+  var r: int64 := 0;
+  while (r < $n) {
+    var d: parallel Array<f32> := a + a;
+    var k: int64 := 0;
+    while (k < 3) {
+      var c: parallel Array<f32> := a + b;
+      summe := summe + (c[(r * 3 + k) % 131072] as int64) + (d[k] as int64);
+      k += 1;
+    }
+    r += 1;
+  }
+  PrintLn(summe);
+  return 0;
+}
+LYX
+  if ! (cd "$ROOT" && timeout 200 "$LYXC" --std-path="$ROOT" "$TMP/v.lyx" -o "$TMP/v.$n" >"$TMP/v.log" 2>&1); then
+    echo "FAIL verschachtelt: uebersetzt nicht"; sed -n '1,4p' "$TMP/v.log"; FAIL=$((FAIL+1))
+  fi
+done
+if [ -x "$TMP/v.20" ] && [ -x "$TMP/v.300" ]; then
+  erw=$(python3 -c "
+s=0
+for r in range(300):
+    for k in range(3):
+        j=(r*3+k)%131072
+        s+=(j%7)+(j%5)+2*(k%7)
+print(s)")
+  got=$( ulimit -c 0; "$TMP/v.300" 2>/dev/null )
+  r1=$(rss "$TMP/v.20"); r2=$(rss "$TMP/v.300")
+  if [ "$got" = "$erw" ]; then echo "PASS verschachtelt: Summe $got"; PASS=$((PASS+1))
+  else echo "FAIL verschachtelt: '$got' erwartet '$erw'"; FAIL=$((FAIL+1)); fi
+  if [ "$r2" -le $(( r1 * 4 )) ]; then echo "PASS verschachtelt waechst nicht ($r1 KiB bei 20, $r2 KiB bei 300)"; PASS=$((PASS+1))
+  else echo "FAIL verschachtelt waechst: $r1 KiB bei 20, $r2 KiB bei 300"; FAIL=$((FAIL+1)); fi
+fi
 
 # --- Die Gegenrichtung: ein entkommender Vektor bleibt gueltig -------------
 # Zugewiesen wird an ein `halt`, das VOR der Schleife steht — der Wert muss

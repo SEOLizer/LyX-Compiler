@@ -516,6 +516,10 @@ con CG_RESTAB: int64 := 120;   // data[120..127]: _lyx_restab
 // 2000 Operationen bei n = 16384, dagegen 668 bei n = 4096).
 con CG_VEC_PTR: int64 := 128;  // data[128..135]: _lyx_vec_ptr
 con CG_VEC_END: int64 := 136;  // data[136..143]: _lyx_vec_end
+// #2253: Summe der angeforderten Bytes der Vektorarena. Die Marke sichert sie
+// mit; das Zuruecksetzen stellt sie zurueck und weiss damit, wie viel EIN
+// Durchlauf braucht (siehe cg_vecMarkeZurueck).
+con CG_VEC_SUM: int64 := 144;  // data[144..151]: _lyx_vec_sum
 
 // #1971: Groesse eines Eintrags in `ress` (siehe Feld).
 pub con CG_RES_SZ: int64 := 56;
@@ -1355,6 +1359,7 @@ pub type Codegen = class {
   scopeEnergyLevel:  int64;
   scopeCpuStufe:     int64;   // #2191: Stand aus `@cpu(stufe);`
   vecMarkeEnde:      int64;   // #2206: Rahmenplatz der END-Marke der Vektorarena
+  vecMarkeSumme:     int64;   // #2253: Rahmenplatz des gesicherten CG_VEC_SUM
 
   // WP-AS-04/05: @bounds_check / @debug_info / @optimization_level scope flags
   boundsCheckEnabled: int64;  // 1=on (default 1), 0=off
@@ -7643,6 +7648,11 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(slotPtr);         // mov [rbp+slotPtr], rax
     self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05); self.cg_bumpRip(CG_VEC_END);  // mov rax, [VEC_END]
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(slotEnd);         // mov [rbp+slotEnd], rax
+    // #2253: Bedarfszaehler mitsichern (Begruendung bei cg_vecMarkeZurueck).
+    var slotSum: int64 := self.cg_addLocal("__lyx_vecsumme"c, 14);
+    self.vecMarkeSumme := slotSum;
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05); self.cg_bumpRip(CG_VEC_SUM);  // mov rax, [VEC_SUM]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(slotSum);         // mov [rbp+slotSum], rax
     return slotPtr;
   }
 
@@ -7661,6 +7671,46 @@ pub type Codegen = class {
   // Rahmenabstand sein.
   fn cg_vecMarkeZurueck(slot: int64) {
     if (slot > 0) { return; }
+    // #2253: Hat der letzte Durchlauf einen NEUEN Block geholt (END weicht von
+    // der Marke ab), passt sein Bedarf nicht in den Rest des Markenblocks.
+    // Bis 1.2.20F sprang das Zuruecksetzen trotzdem dorthin zurueck: jeder
+    // Durchlauf holte erneut einen Block, der alte blieb liegen — gemessen
+    // bei 131072 f32-Elementen ein mmap je Wiederholung, 77 662 Seitenfehler,
+    // 310 MB nach 600 Wiederholungen. Jetzt wird EINMAL ein Block geholt, der
+    // den ganzen Bedarf eines Durchlaufs fasst (CG_VEC_SUM seit der Marke,
+    // auf Seiten aufgerundet), und die Marke rueckt dorthin. Ab dem naechsten
+    // Durchlauf liegt alles in diesem Block.
+    //
+    // Der Bedarf ist der eines Durchlaufs, auch mit inneren Schleifen: deren
+    // Zuruecksetzen stellt CG_VEC_SUM auf ihre eigene Marke zurueck, es zaehlt
+    // also nur ihr letzter Durchlauf mit — genau ihr Spitzenbedarf.
+    //
+    // Hier, am Schleifenkopf, ist kein Ausdruck in Arbeit; rax/rcx/rdx/rsi/
+    // rdi/r8-r11 sind frei (r12-r15 der Registerzuteilung bleiben unberuehrt).
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x05); self.cg_bumpRip(CG_VEC_END);   // mov rax, [VEC_END]
+    self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x85); self.cg_e32(self.vecMarkeEnde); // cmp rax, [rbp+ende]
+    self.cg_e8(0x0F); self.cg_e8(0x84); var pGleich: int64 := self.codeLen; self.cg_e32(0);  // je gleich
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x35); self.cg_bumpRip(CG_VEC_SUM);   // mov rsi, [VEC_SUM]
+    self.cg_e8(0x48); self.cg_e8(0x2B); self.cg_e8(0xB5); self.cg_e32(self.vecMarkeSumme); // sub rsi, [rbp+summe]
+    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xC6); self.cg_e32(4095);              // add rsi, 4095
+    self.cg_e8(0x48); self.cg_e8(0x81); self.cg_e8(0xE6); self.cg_e32(0 - 4096);          // and rsi, -4096
+    self.cg_e8(0x56);                                                                      // push rsi (Groesse)
+    self.cg_e8(0x31); self.cg_e8(0xFF);                                                    // xor edi, edi
+    self.cg_e8(0xBA); self.cg_e32(3);                                                      // mov edx, 3
+    self.cg_e8(0x41); self.cg_e8(0xBA); self.cg_e32(34);                                   // mov r10d, 34
+    self.cg_e8(0x49); self.cg_e8(0xC7); self.cg_e8(0xC0); self.cg_e32(0 - 1);              // mov r8, -1
+    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xC9);                                  // xor r9, r9
+    self.cg_e8(0xB8); self.cg_e32(9);                                                      // mov eax, 9
+    self.cg_e8(0x0F); self.cg_e8(0x05);                                                    // syscall
+    self.cg_emitMmapGeprueft();                                                            // #2144
+    self.cg_e8(0x5E);                                                                      // pop rsi
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(slot);               // mov [rbp+marke], rax
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0xF0);                                  // add rax, rsi
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x85); self.cg_e32(self.vecMarkeEnde);  // mov [rbp+ende], rax
+    poke32(self.code + pGleich, self.codeLen - pGleich - 4);
+    // gleich: Zaehler auf den Stand der Marke
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x85); self.cg_e32(self.vecMarkeSumme); // mov rax, [rbp+summe]
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0x05); self.cg_bumpRip(CG_VEC_SUM);   // mov [VEC_SUM], rax
     // Reihenfolge: zuerst END, dann PTR. Dazwischen darf kein anderer Faden
     // belegen — END = 1 waere die Sperre des Allokators, und die wird hier
     // nicht genommen. Fuer einen Rumpf, der selbst keine Faden startet, ist
@@ -7716,6 +7766,7 @@ pub type Codegen = class {
     // 404 statt 496 Mio. Takte.
     self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x48);  // add rax, 72
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC6);                    // mov rsi, rax (Groesse)
+    self.cg_e8(0x48); self.cg_e8(0x01); self.cg_e8(0x35); self.cg_bumpRip(CG_VEC_SUM);  // add [VEC_SUM], rsi  (#2253)
     // #2206: aus der VEKTORARENA, mit 1-MiB-Bloecken. Die Trennung von
     // CG_HEAP_* ist Voraussetzung fuer das Zuruecksetzen der Marke (siehe
     // cg_vecMarkeSetzen) — auf dem `new`-Heap waere es Speicherkorruption.
@@ -27799,7 +27850,7 @@ pub type Codegen = class {
     self.resCap      := 0;
     self.resTabOff   := 0 - 1;
     self.cgLesePfad  := 0;   // #1971
-    self.dataLen     := 144; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836), +8 CG_RESTAB (#1961), +16 Vektorarena (#2206)
+    self.dataLen     := 152; // WP-18: 88 Byte reserviert, +8 CG_FC_NAME (#1140), +8 CG_ENVBLOCK (#1677), +16 Bump-Allokator (#1836), +8 CG_RESTAB (#1961), +16 Vektorarena (#2206), +8 Vektorarena-Summe (#2253)
     self.dataOverflow := 0;  // WP-34  // WP-18: pre-reserve 88 bytes (EXN_VAL@0, EXN_PTR@8, IO_RESULT@16, RAND_STATE@24, ARGC@32, ARGV@40, FLOAT_BUF@48, CANARY@80)
 
     self.localCap  := 64;
@@ -27992,6 +28043,7 @@ pub type Codegen = class {
     self.scopeEnergyLevel  := 0;   // #1162: kein Quelltext-Stand gesetzt
     self.scopeCpuStufe     := 0;   // #2191
     self.vecMarkeEnde      := 0;   // #2206
+    self.vecMarkeSumme     := 0;   // #2253
     self.fnEnergyLevel     := 3;   // #1162: Vorgabe 3 wie zugesagt (war 1)
 
     // WP-AS-04/05: directive flags
