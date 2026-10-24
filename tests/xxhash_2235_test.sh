@@ -22,8 +22,7 @@
 # 39 Byte (Streifen + 4- und 1-Byte-Rest), 131 Byte (vier Streifen, 8er-Rest),
 # Seed 0, 1 und 2654435761.
 #
-# Gemessen auf x86-64 und riscv (unter qemu), XXH32 zusaetzlich auf arm64 —
-# zu arm64 und XXH64 siehe unten.
+# Gemessen auf x86-64, arm64 und riscv (unter qemu).
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
@@ -116,16 +115,11 @@ ziel() { # prog name target runner erwartet
     no "$prog Werte $name" "Wert $i ist '$g', erwartet '$e' (gesamt: '$got')"
   fi
 }
-# Programm a NICHT auf arm64: dort schiebt IRO_SHR immer arithmetisch (ASRV),
-# auch fuer uint64 — `(h as uint64) >> 33` liefert also den alten falschen
-# Wert. Umgekehrt schiebt riscv IMMER logisch (SRL), auch fuer int64. Das
-# IR fuehrt beim Rechtsshift keine Vorzeichenart mit (IRO_SHR); ein eigener
-# Defekt der IR-Backends, nicht von std.hash: #2236. Ein Test darf nicht an
-# einem fremden offenen Defekt haengen; sobald #2236 behoben ist, gehoert
-# arm64 hier wieder dazu.
-# Programm b (XXH32) rechnet nur mit nichtnegativen Werten und laeuft
-# deshalb auch auf arm64.
+# Beide Programme auf allen drei Zielen. Bis #2236 (1.2.20A) schob arm64
+# `(h as uint64) >> 33` arithmetisch und riscv `int64 >> k` logisch — XXH64
+# war auf arm64 damit nicht messbar und hier ausgenommen.
 ziel a x86 "" "" "$ERW_A"
+ziel a arm64 arm64 "$QEMU_ARM64" "$ERW_A"
 ziel a riscv riscv "$QEMU_RISCV64" "$ERW_A"
 ziel b x86 "" "" "$ERW_B"
 ziel b arm64 arm64 "$QEMU_ARM64" "$ERW_B"
