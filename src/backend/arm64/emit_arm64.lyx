@@ -157,6 +157,7 @@ pub type EmitARM64 = class {
   winPatchBuf:   int64;
   winPatchCount: int64;
   winPatchCap:   int64;
+  bumpGIdx:        int64;   // #2227: erstes der zwei Bump-Globals (Zeiger, Ende), -1 = noch keins
 
 
   // -------------------------------------------------------------------------
@@ -165,6 +166,7 @@ pub type EmitARM64 = class {
 
   fn init(irMod: int64) {
     self.ir          := irMod;
+    self.bumpGIdx    := -1;
     self.codeBuf     := alloc(131072);
     self.codeCap     := 131072;
     self.codeLen     := 0;
@@ -1620,7 +1622,7 @@ pub type EmitARM64 = class {
       // WO sie steht. Der Waechter in tests/backend_abdeckung_test.sh
       // vergleicht deshalb je Zweig.
       //
-      // Puffer aus mmap wie bei StrSub (6) und StrConcat (7).
+      // Puffer aus dem Bump-Block wie bei StrSub (6) und StrConcat (7), #2227.
       var scB: int64 := argBase;
       if (scB < 0) { scB := 0; }
       self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(scB));   // x9 = s
@@ -1632,14 +1634,7 @@ pub type EmitARM64 = class {
       self.emit32(0x17FFFFFD);  // B -3
       // Puffer: Laenge + 16
       self.emit32(0x91004161);  // ADD x1, x11, #16
-      self.emitMovImmReg(ARM64_X0, 0);
-      self.emitMovImmReg(ARM64_X2, 3);
-      self.emitMovImmReg(ARM64_X3, 0x22);
-      self.emit32(0x92800004);  // MOVN x4, #0
-      self.emitMovImmReg(ARM64_X5, 0);
-      self.emitMovImmReg(ARM64_X8, SYS_MMAP);
-      self.emit32(0xD4000001);  // SVC #0 → x0 = Puffer
-      self.emitMmapGeprueft();   // #2144
+      self.emitBumpAlloc();     // #2227: x0 = Puffer
       // Kopieren, Nullbyte eingeschlossen
       self.emit32(0xD280000D);  // MOVZ x13, #0
       self.emit32(0x386D6923);  // [L2] LDRB w3,[x9,x13]
@@ -1885,15 +1880,9 @@ pub type EmitARM64 = class {
       // WP-01 (wab_strconcat). Jedes Programm mit Zeichenkettenverkettung war
       // damit fuer arm64 unbaubar — nach PrintLn das meistbenutzte Builtin.
       //
-      // Der Puffer kommt aus mmap: der Zeiger muss den Aufruf ueberleben, und
-      // einen Allokator hat das Backend nicht. Dieselbe Ueberlegung wie bei
-      // StrSub (6) und IntToStr (16) daneben.
-      //
-      // Der x86-Weg gibt seit #1980 aus einem Bump-Block aus, weil ein mmap je
-      // Verkettung mindestens eine SEITE belegt — 4096 Byte fuer elf Zeichen,
-      // und nie zurueckgegeben. Das gilt hier genauso; ein Bump-Block fuer die
-      // IR-Backends beträfe aber StrSub und IntToStr mit und ist deshalb ein
-      // eigenes Paket, kein Nebenher-Umbau in diesem.
+      // Der Puffer kommt aus dem Bump-Block (emitBumpAlloc, #2227): der
+      // Zeiger muss den Aufruf ueberleben. Bis 1.2.20B war es ein mmap je
+      // Verkettung — eine SEITE fuer elf Zeichen, nie zurueckgegeben.
       // #2028: aus dem HOHEN Argumentblock lesen (argBase), nicht aus den
       // festen Slots 0/1. Mit festen Slots ueberschrieb ein verschachtelter
       // Aufruf die Argumente des aeusseren — `StrConcat(StrConcat("a","b"),
@@ -1917,14 +1906,7 @@ pub type EmitARM64 = class {
       // Groesse = la + lb + 16 (Reserve wie bei StrSub) → x1
       self.emit32(0x8B0C0161);  // [L2ENDE] ADD x1, x11, x12
       self.emit32(0x91004021);  // ADD x1, x1, #16
-      self.emitMovImmReg(ARM64_X0, 0);
-      self.emitMovImmReg(ARM64_X2, 3);      // PROT_READ|PROT_WRITE
-      self.emitMovImmReg(ARM64_X3, 0x22);   // MAP_PRIVATE|MAP_ANON
-      self.emit32(0x92800004);              // MOVN x4, #0   (fd = -1)
-      self.emitMovImmReg(ARM64_X5, 0);
-      self.emitMovImmReg(ARM64_X8, SYS_MMAP);
-      self.emit32(0xD4000001);              // SVC #0 → x0 = Puffer
-      self.emitMmapGeprueft();   // #2144
+      self.emitBumpAlloc();     // #2227: x0 = Puffer
       // a kopieren: bis zum Nullbyte, Ziel = Puffer + i
       self.emit32(0xD280000D);  // MOVZ x13, #0
       self.emit32(0x386D6923);  // [L3] LDRB w3,[x9,x13]
@@ -1949,9 +1931,8 @@ pub type EmitARM64 = class {
     } else if id == 6 {
       // #1388: StrSub(s, start, len) — Teilkette in frischen Speicher kopieren.
       //
-      // Der Puffer kommt aus mmap: der Zeiger muss den Aufruf ueberleben,
-      // und einen Allokator hat das Backend nicht. Dieselbe Ueberlegung wie
-      // bei IntToStr (16).
+      // Der Puffer kommt aus dem Bump-Block (emitBumpAlloc, #2227): der
+      // Zeiger muss den Aufruf ueberleben.
       //
       // Bei negativem oder zu grossem `start` kaeme sonst ein Lesezugriff
       // ausserhalb der Kette heraus. Deshalb wird `len` hier nur kopiert,
@@ -1961,16 +1942,9 @@ pub type EmitARM64 = class {
       self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(0));      // x9  = s
       self.emitLdur(ARM64_X10, ARM64_X29, self.slotOff(1));     // x10 = start
       self.emitLdur(ARM64_X7, ARM64_X29, self.slotOff(2));      // x7  = len
-      self.emitMovImmReg(ARM64_X0, 0);
       self.emit32(0x8B0700E1);                                  // ADD x1, x7, x7  (2*len ...)
       self.emit32(0x91004021);                                  // ADD x1, x1, #16 (... + 16 Reserve)
-      self.emitMovImmReg(ARM64_X2, 3);
-      self.emitMovImmReg(ARM64_X3, 0x22);
-      self.emit32(0x92800004);                                  // MOVN x4, #0
-      self.emitMovImmReg(ARM64_X5, 0);
-      self.emitMovImmReg(ARM64_X8, SYS_MMAP);
-      self.emit32(0xD4000001);                                  // SVC #0 -> x0 = Puffer
-      self.emitMmapGeprueft();   // #2144
+      self.emitBumpAlloc();                                     // #2227: x0 = Puffer
       self.emit32(0x8B0A0129);                                  // ADD x9, x9, x10  (Quelle = s + start)
       self.emit32(0xAA0003E2);                                  // MOV x2, x0       (Schreibmarke)
       self.emit32(0xD2800003);                                  // MOVZ x3, #0      (Zaehler)
@@ -1987,7 +1961,7 @@ pub type EmitARM64 = class {
     } else if id == 16 {
       // #1388: IntToStr(n) — Dezimaltext, Zeiger nach x0.
       //
-      // Der Puffer kommt aus mmap, nicht vom Stapel: der Zeiger muss den
+      // Der Puffer kommt aus dem Bump-Block (#2227), nicht vom Stapel: der Zeiger muss den
       // Aufruf ueberleben (dieselbe Ueberlegung wie im lyxos-Backend).
       // Gerechnet wird von hinten nach vorn, weil die niedrigste Stelle
       // zuerst herausfaellt; zurueck kommt ein Zeiger auf die erste Ziffer,
@@ -1997,15 +1971,8 @@ pub type EmitARM64 = class {
       // Backend ohnehin als fluechtig behandelt. Ein erster Anlauf rechnete in
       // x11-x15 und brachte laengere Programme zum Absturz.
       self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(0));      // x9 = n
-      self.emitMovImmReg(ARM64_X0, 0);
       self.emitMovImmReg(ARM64_X1, 64);
-      self.emitMovImmReg(ARM64_X2, 3);                          // PROT_READ|WRITE
-      self.emitMovImmReg(ARM64_X3, 0x22);                       // MAP_PRIVATE|ANON
-      self.emit32(0x92800004);                                  // MOVN x4, #0   (fd = -1)
-      self.emitMovImmReg(ARM64_X5, 0);
-      self.emitMovImmReg(ARM64_X8, SYS_MMAP);
-      self.emit32(0xD4000001);                                  // SVC #0 -> x0 = Puffer
-      self.emitMmapGeprueft();   // #2144
+      self.emitBumpAlloc();                                     // #2227: x0 = Puffer
       self.emit32(0xAA0003EA);                                  // MOV x10, x0
       self.emit32(0x9100FD42);                                  // ADD x2, x10, #63   (Schreibmarke)
       self.emit32(0x3900005F);                                  // STRB wzr, [x2]     (Nullbyte)
@@ -2311,6 +2278,62 @@ pub type EmitARM64 = class {
     var i: int64 := 0;
     while i < 42 { self.emit8(StrCharAt(m, i)); i := i + 1; }
     self.emit8(0); self.emit8(0);
+  }
+
+  // #2227: x0 := Puffer mit x1 Byte aus dem Bump-Block. Dieselbe Rechnung wie
+  // cg_emitBumpAtomarIn im x86-Weg (src/codegen_x86.lyx): Zeiger und Ende im
+  // Datenbereich, Bloecke von 64 KiB oder der Anforderung selbst auf ganze
+  // Seiten aufgerundet, mmap geprueft (#2144). Vorher holte JEDER Aufruf von
+  // StrConcat/StrSub/IntToStr ein eigenes mmap — eine Seite, ein Mapping,
+  // nie freigegeben; nach rund einer Million war vm.max_map_count erschoepft.
+  //
+  // NICHT atomar: dieses Backend kennt keine Threads (kein clone). Kommen sie
+  // dazu, muss der schnelle Weg LDAXR/STLXR werden und der langsame eine
+  // Sperre bekommen, wie x86 sie mit `lock cmpxchg` hat.
+  //
+  // Register: nur x0-x6, x8, x16, x17. StrConcat haelt x9-x12, StrSub x7,
+  // x9 und x10 ueber die Anforderung hinweg. x1 ist danach die auf 16
+  // aufgerundete Groesse.
+  fn emitBumpAlloc() {
+    if self.bumpGIdx < 0 { self.bumpGIdx := _irGlobalsAnhaengen(self.ir, 2); }
+    self.emit32(0x91003C21);   // ADD x1, x1, #15
+    self.emit32(0x927CEC21);   // AND x1, x1, #~15
+    // Adresse der Globals nach x16. _emitGlobalAddrX9 schreibt fest x9 (auch
+    // der ADRP-Nachtrag fuer .so), x9 ist hier aber belegt: retten in x17.
+    self.emit32(0xAA0903F1);   // MOV x17, x9
+    self._emitGlobalAddrX9(self.bumpGIdx);
+    self.emit32(0xAA0903F0);   // MOV x16, x9
+    self.emit32(0xAA1103E9);   // MOV x9, x17
+    self.emit32(0xF9400200);   // LDR x0, [x16]       (Zeiger)
+    self.emit32(0xF9400602);   // LDR x2, [x16, #8]   (Ende)
+    self.emit32(0x8B010003);   // ADD x3, x0, x1
+    self.emit32(0xEB02007F);   // CMP x3, x2
+    self.emit32(0x54000068);   // B.HI +3 (langsam)
+    self.emit32(0xF9000203);   // STR x3, [x16]
+    var pFertig: int64 := self.codeLen;
+    self.emit32(0x14000000);   // B fertig (nachgetragen)
+    // langsam: Blockgroesse = max(64 KiB, Anforderung auf Seiten aufgerundet)
+    self.emit32(0x913FFC31);   // ADD x17, x1, #4095
+    self.emit32(0x9274CE31);   // AND x17, x17, #~4095
+    self.emit32(0xD2A00022);   // MOVZ x2, #1, LSL #16   (65536)
+    self.emit32(0xEB02023F);   // CMP x17, x2
+    self.emit32(0x9A828231);   // CSEL x17, x17, x2, HI
+    self.emit32(0xAA0103E6);   // MOV x6, x1   (Groesse; SVC laesst x1..x17 stehen)
+    self.emit32(0xD2800000);   // MOVZ x0, #0
+    self.emit32(0xAA1103E1);   // MOV x1, x17
+    self.emit32(0xD2800062);   // MOVZ x2, #3      PROT_READ|PROT_WRITE
+    self.emit32(0xD2800443);   // MOVZ x3, #0x22   MAP_PRIVATE|MAP_ANON
+    self.emit32(0x92800004);   // MOVN x4, #0      fd = -1
+    self.emit32(0xD2800005);   // MOVZ x5, #0
+    self.emitMovImmReg(ARM64_X8, SYS_MMAP);
+    self.emit32(0xD4000001);   // SVC #0 -> x0 = Blockanfang
+    self.emitMmapGeprueft();
+    self.emit32(0x8B110002);   // ADD x2, x0, x17
+    self.emit32(0xF9000602);   // STR x2, [x16, #8]  (Ende)
+    self.emit32(0x8B060003);   // ADD x3, x0, x6
+    self.emit32(0xF9000203);   // STR x3, [x16]      (Zeiger)
+    var rel: int64 := (self.codeLen - pFertig) / 4;
+    poke32(self.codeBuf + pFertig, 0x14000000 | (rel & 0x3FFFFFF));
   }
 
   fn emitAlloc(sizeSlot: int64, dest: int64) {
@@ -2932,16 +2955,9 @@ pub type EmitARM64 = class {
     self.emit32(0xA9BD53F3);                   // STP x19, x20, [sp, #-48]!
     self.emit32(0xA9015BF5);                   // STP x21, x22, [sp, #16]
     self.emit32(0xA90263F7);                   // STP x23, x24, [sp, #32]
-    // Puffer aus mmap(0, 48, PROT_RW, MAP_PRIVATE|ANON)
-    self.emitMovImmReg(ARM64_X0, 0);
+    // Puffer: 48 Byte aus dem Bump-Block (#2227, vorher ein mmap je Aufruf)
     self.emitMovImmReg(ARM64_X1, 48);
-    self.emitMovImmReg(ARM64_X2, 3);
-    self.emitMovImmReg(ARM64_X3, 0x22);
-    self.emit32(0x92800004);                   // MOVN x4, #0   (fd = -1)
-    self.emitMovImmReg(ARM64_X5, 0);
-    self.emitMovImmReg(ARM64_X8, SYS_MMAP);
-    self.emit32(0xD4000001);                   // SVC #0 → x0 = Puffer
-    self.emitMmapGeprueft();   // #2144
+    self.emitBumpAlloc();
     self.emit32(0xAA0003F4);                   // MOV x20, x0   (Schreibmarke)
     self.emitLdur(ARM64_X9, ARM64_X29, self.slotOff(bitsSlot));   // x9 = Bitmuster
 

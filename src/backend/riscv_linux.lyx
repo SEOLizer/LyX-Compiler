@@ -134,6 +134,7 @@ pub type EmitRISCV64 = class {
   soHuTab:       int64;
   soHuCount:     int64;
   soHuCap:       int64;
+  bumpGIdx:      int64;   // #2227: erstes der zwei Bump-Globals (Zeiger, Ende), -1 = noch keins
 
   // --------------------------------------------------------------------------
   // Code emission primitives
@@ -1368,15 +1369,8 @@ pub type EmitRISCV64 = class {
       // t6 = Vorzeichenmerker.
       self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
       self.rv_MV(28, RV_A1);                       // t3 = n
-      self.rv_LI(RV_A0, 0);
       self.rv_LI(RV_A1, 64);
-      self.rv_LI(RV_A2, 3);
-      self.rv_LI(RV_A3, 34);
-      self.rv_LI(RV_A4, 0 - 1);
-      self.rv_LI(RV_A5, 0);
-      self.rv_LI(RV_A7, RV_SYS_MMAP);
-      self.rv_ECALL();
-      self.rv_mmapGeprueft();   // #2144
+      self.rv_bumpAlloc();                         // #2227: a0 = Puffer
       self.rv_MV(29, RV_A0);                       // t4 = Puffer
       self.rv_ADDI(30, 29, 63);                    // t5 = t4 + 63 (Ende)
       // #2148: NICHT negieren. `t3 = -t3` liess den kleinsten int64 negativ
@@ -1483,7 +1477,7 @@ pub type EmitRISCV64 = class {
       if (id == 202) { self.rv_LD(RV_A0, RV_A1, 0); }
     } else if id == 6 {
       // #1388: StrSub(s, start, len) — Teilkette in frischen Speicher kopieren.
-      // Puffer aus mmap, wie bei IntToStr. Kopiert wird hoechstens bis zum
+      // Puffer aus dem Bump-Block (#2227). Kopiert wird hoechstens bis zum
       // Ende der Kette: ein zu grosses `len` liest sonst darueber hinaus.
       self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
       self.rv_MV(28, RV_A1);                       // t3 = s
@@ -1491,16 +1485,9 @@ pub type EmitRISCV64 = class {
       self.rv_ADD(28, 28, RV_A1);                  // t3 = s + start
       self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase + 2));
       self.rv_MV(31, RV_A1);                       // t6 = len
-      self.rv_LI(RV_A0, 0);
       self.rv_ADD(RV_A1, 31, 31);
       self.rv_ADDI(RV_A1, RV_A1, 16);              // Groesse = 2*len + 16
-      self.rv_LI(RV_A2, 3);
-      self.rv_LI(RV_A3, 34);
-      self.rv_LI(RV_A4, 0 - 1);
-      self.rv_LI(RV_A5, 0);
-      self.rv_LI(RV_A7, RV_SYS_MMAP);
-      self.rv_ECALL();
-      self.rv_mmapGeprueft();   // #2144
+      self.rv_bumpAlloc();                         // #2227: a0 = Puffer
       self.rv_MV(29, RV_A0);                       // t4 = Puffer
       self.rv_LI(30, 0);                           // t5 = Zaehler
       var subL: int64 := self.codeLen;
@@ -1520,9 +1507,9 @@ pub type EmitRISCV64 = class {
       // #2028: StrConcat(a, b) — beide Ketten in frischen Speicher kopieren.
       //
       // Fehlte ganz; jedes Programm mit Zeichenkettenverkettung war fuer riscv
-      // unbaubar — nach PrintLn das meistbenutzte Builtin. Puffer aus mmap wie
-      // bei StrSub (6) und IntToStr (16): der Zeiger muss den Aufruf
-      // ueberleben, einen Allokator hat das Backend nicht.
+      // unbaubar — nach PrintLn das meistbenutzte Builtin. Puffer aus dem
+      // Bump-Block (rv_bumpAlloc, #2227): der Zeiger muss den Aufruf
+      // ueberleben.
       //
       // Register: t3 = a, t4 = b, t5 = Laenge a, t6 = Laenge b, a6 = Puffer,
       // t0 = Zaehler. a0..a5 und a7 sind nach dem Systemaufruf wieder frei.
@@ -1547,16 +1534,9 @@ pub type EmitRISCV64 = class {
       self.rv_ADDI(31, 31, 1);
       self.rv_JAL_x0(cnBL - self.codeLen);
       // Groesse = la + lb + 16 (Reserve wie bei StrSub)
-      self.rv_LI(RV_A0, 0);
       self.rv_ADD(RV_A1, 30, 31);
       self.rv_ADDI(RV_A1, RV_A1, 16);
-      self.rv_LI(RV_A2, 3);
-      self.rv_LI(RV_A3, 34);
-      self.rv_LI(RV_A4, 0 - 1);
-      self.rv_LI(RV_A5, 0);
-      self.rv_LI(RV_A7, RV_SYS_MMAP);
-      self.rv_ECALL();
-      self.rv_mmapGeprueft();   // #2144
+      self.rv_bumpAlloc();                         // #2227: a0 = Puffer
       self.rv_MV(RV_A6, RV_A0);                    // a6 = Puffer
       // a kopieren: bis zum Nullbyte, Ziel = Puffer + i
       self.rv_LI(RV_T0, 0);
@@ -1587,23 +1567,16 @@ pub type EmitRISCV64 = class {
     } else if id == 16 {
       // #1388: IntToStr(n) — Dezimaltext, Zeiger nach a0.
       //
-      // Puffer aus mmap (222): der Zeiger muss den Aufruf ueberleben, einen
-      // Allokator hat das Backend nicht. Gerechnet wird von hinten nach vorn,
+      // Puffer aus dem Bump-Block (#2227, vorher ein mmap je Aufruf): der
+      // Zeiger muss den Aufruf ueberleben. Gerechnet wird von hinten nach vorn,
       // weil die niedrigste Stelle zuerst herausfaellt.
       //
       // Register: t3 = Restwert, t4 = Pufferanfang, t5 = Schreibmarke,
       // t6 = Vorzeichenmerker. a0..a7 sind nach dem Systemaufruf wieder frei.
       self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
       self.rv_MV(28, RV_A1);                       // t3 = n
-      self.rv_LI(RV_A0, 0);
       self.rv_LI(RV_A1, 64);
-      self.rv_LI(RV_A2, 3);
-      self.rv_LI(RV_A3, 34);
-      self.rv_LI(RV_A4, 0 - 1);
-      self.rv_LI(RV_A5, 0);
-      self.rv_LI(RV_A7, RV_SYS_MMAP);
-      self.rv_ECALL();
-      self.rv_mmapGeprueft();   // #2144
+      self.rv_bumpAlloc();                         // #2227: a0 = Puffer
       self.rv_MV(29, RV_A0);                       // t4 = Puffer
       self.rv_ADDI(30, 29, 63);                    // t5 = t4 + 63
       self.rv_SB(0, 30, 0);                        // Nullbyte ans Ende
@@ -1769,9 +1742,8 @@ pub type EmitRISCV64 = class {
     } else if id == 8 {
       // #2037: StrCopy(s) — Kette in frischen Speicher kopieren.
       //
-      // Das arm64-Backend hat sie laengst; hier fehlte sie. Puffer aus mmap
-      // wie bei StrSub (6) und StrConcat (7): der Zeiger muss den Aufruf
-      // ueberleben, und einen Allokator hat das Backend nicht.
+      // Das arm64-Backend hat sie laengst; hier fehlte sie. Puffer aus dem
+      // Bump-Block wie bei StrSub (6) und StrConcat (7), #2227.
       self.rv_LD(RV_A1, RV_FP, self.slotOff(sBase));
       self.rv_MV(28, RV_A1);                       // t3 = s
       // Laenge zaehlen
@@ -1783,15 +1755,8 @@ pub type EmitRISCV64 = class {
       self.rv_ADDI(30, 30, 1);
       self.rv_JAL_x0(scpL - self.codeLen);
       // Puffer: Laenge + 16 Reserve
-      self.rv_LI(RV_A0, 0);
       self.rv_ADDI(RV_A1, 30, 16);
-      self.rv_LI(RV_A2, 3);
-      self.rv_LI(RV_A3, 34);
-      self.rv_LI(RV_A4, 0 - 1);
-      self.rv_LI(RV_A5, 0);
-      self.rv_LI(RV_A7, RV_SYS_MMAP);
-      self.rv_ECALL();
-      self.rv_mmapGeprueft();   // #2144
+      self.rv_bumpAlloc();                         // #2227: a0 = Puffer
       self.rv_MV(29, RV_A0);                       // t4 = Puffer
       // Kopieren, Nullbyte eingeschlossen
       self.rv_LI(31, 0);
@@ -2094,6 +2059,7 @@ pub type EmitRISCV64 = class {
 
   pub fn init(irMod: int64) {
     self.ir         := irMod;
+    self.bumpGIdx   := -1;
     self.codeBuf    := alloc(131072);
     self.codeCap    := 131072;
     self.codeLen    := 0;
@@ -2291,6 +2257,60 @@ pub type EmitRISCV64 = class {
     }
   }
 
+  // #2227: a0 := Puffer mit a1 Byte aus dem Bump-Block. Dieselbe Rechnung wie
+  // cg_emitBumpAtomarIn (src/codegen_x86.lyx) und emitBumpAlloc im
+  // arm64-Backend — die drei muessen uebereinstimmen: Zeiger/Ende als zwei
+  // Modulvariablen, Bloecke von 64 KiB oder der Anforderung auf Seiten
+  // aufgerundet, mmap geprueft (#2144). Vorher ein mmap je StrConcat/StrSub/
+  // IntToStr — eine Seite, ein Mapping, nie freigegeben.
+  //
+  // NICHT atomar: das Backend kennt keine Threads. Kommen sie dazu, braucht
+  // der schnelle Weg LR/SC und der langsame eine Sperre.
+  //
+  // Register: nur a0-a7, t0, t1, t2. StrConcat und StrSub halten t3-t6 ueber
+  // die Anforderung hinweg. a1 ist danach die auf 16 aufgerundete Groesse.
+  fn rv_bumpAlloc() {
+    if self.bumpGIdx < 0 { self.bumpGIdx := _irGlobalsAnhaengen(self.ir, 2); }
+    self.rv_ADDI(RV_A1, RV_A1, 15);
+    self.rv_e32(0x13 | (RV_A1 << 7) | (7 << 12) | (RV_A1 << 15) | ((0 - 16) & 0xFFF) << 20);   // ANDI a1, a1, -16
+    self.emitGlobalAddr(self.bumpGIdx);           // t2 = &Zeiger, t2+8 = &Ende
+    self.rv_LD(RV_A0, RV_T2, 0);
+    self.rv_LD(RV_A2, RV_T2, 8);
+    self.rv_ADD(RV_A3, RV_A0, RV_A1);
+    self.rv_Bcond(6, RV_A2, RV_A3, 12);           // BLTU Ende, neu -> langsam
+    self.rv_SD(RV_A3, RV_T2, 0);
+    var pFertig: int64 := self.codeLen;
+    self.rv_JAL_x0(0);                            // -> fertig (nachgetragen)
+    // langsam: t1 = max(64 KiB, Groesse auf Seiten aufgerundet)
+    self.rv_LI64(RV_T0, 4095);
+    self.rv_ADD(RV_T1, RV_A1, RV_T0);
+    self.rv_e32(0x13 | (RV_T1 << 7) | (5 << 12) | (RV_T1 << 15) | (12 << 20));   // SRLI t1, t1, 12
+    self.rv_SLLI(RV_T1, RV_T1, 12);
+    self.rv_LI64(RV_T0, 65536);
+    self.rv_Bcond(7, RV_T1, RV_T0, 8);            // BGEU t1, t0 -> behalten
+    self.rv_MV(RV_T1, RV_T0);
+    self.rv_MV(RV_A6, RV_A1);                     // Groesse; ECALL laesst a1..a7, t* stehen
+    self.rv_LI(RV_A0, 0);
+    self.rv_MV(RV_A1, RV_T1);
+    self.rv_LI(RV_A2, 3);
+    self.rv_LI(RV_A3, 34);
+    self.rv_LI(RV_A4, 0 - 1);
+    self.rv_LI(RV_A5, 0);
+    self.rv_LI(RV_A7, RV_SYS_MMAP);
+    self.rv_ECALL();
+    self.rv_mmapGeprueft();
+    self.rv_ADD(RV_A2, RV_A0, RV_T1);
+    self.rv_SD(RV_A2, RV_T2, 8);                  // Ende
+    self.rv_ADD(RV_A3, RV_A0, RV_A6);
+    self.rv_SD(RV_A3, RV_T2, 0);                  // Zeiger
+    var rel: int64 := self.codeLen - pFertig;
+    var b20:    int64 := (rel >> 20) & 0x1;
+    var b10_1:  int64 := (rel >> 1)  & 0x3FF;
+    var b11:    int64 := (rel >> 11) & 0x1;
+    var b19_12: int64 := (rel >> 12) & 0xFF;
+    self.rv_poke32at(pFertig, 0x6F | (b19_12 << 12) | (b11 << 20) | (b10_1 << 21) | (b20 << 31));
+  }
+
   // Code-Offset des Datenbereichs — der ELF-Schreiber trennt daran die
   // Segmente. -1, solange emit() nicht gelaufen ist.
   pub fn getGlobalsOff(): int64 { return self.globalsOff; }
@@ -2471,16 +2491,9 @@ pub type EmitRISCV64 = class {
   //
   // Register: a0 = Puffer, t3 = Bits, t4 = Schreibmarke, t5/t6 = Rechenwerte.
   fn emitF64ToStrRV(bitsSlot: int64) {
-    // Puffer aus mmap(0, 48, PROT_RW, MAP_PRIVATE|ANON)
-    self.rv_LI(RV_A0, 0);
+    // Puffer: 48 Byte aus dem Bump-Block (#2227, vorher ein mmap je Aufruf)
     self.rv_LI(RV_A1, 48);
-    self.rv_LI(RV_A2, 3);
-    self.rv_LI(RV_A3, 34);
-    self.rv_LI(RV_A4, 0 - 1);
-    self.rv_LI(RV_A5, 0);
-    self.rv_LI(RV_A7, RV_SYS_MMAP);
-    self.rv_ECALL();
-    self.rv_mmapGeprueft();   // #2144
+    self.rv_bumpAlloc();
     self.rv_MV(29, RV_A0);                       // t4 = Schreibmarke
     self.rv_LD(28, RV_FP, self.slotOff(bitsSlot));   // t3 = Bitmuster
 

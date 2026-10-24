@@ -79,6 +79,7 @@ pub type EmitARMCM = class {
   funcCount:  int64;
   cmMainOff:  int64;   // #1765: Code-Offset von main (-1 = nicht gefunden)
   spExtra:    int64;   // #1765: zusaetzlicher Abstand, solange Stapelargumente liegen
+  wort32Merker: int64; // #2239: _irWort32Merker-Tabelle (0 = keine)
 
   // --------------------------------------------------------------------------
   // Code emission primitives
@@ -215,8 +216,9 @@ pub type EmitARMCM = class {
   // Laedt die unteren 32 Bit OHNE Pruefung. Nur fuer die Anfangswerte der
   // Modulvariablen (main, Startcode): dort waere ein Abbruch zu weit — jede
   // importierte Unit mit einer ungenutzten 64-Bit-Konstante (std.hash: FNV)
-  // braechte das Uebersetzen, auch fuer MD5/DJB2. Das Kuerzen dort ist ein
-  // bekannter, offener Defekt (#2239), kein gewollter Normalfall.
+  // braechte das Uebersetzen, auch fuer MD5/DJB2. Der gekuerzte Wert wird
+  // nie gelesen: seit #2239 traegt ein solches Global einen Merker, und
+  // Lesen vor dem ersten Schreiben haelt an (IRO_LOAD_GLOBAL).
   fn cm_LIroh(rd: int64, imm: int64) {
     var imm32: int64 := imm & 0xFFFFFFFF;
     if imm32 >= 0 && imm32 <= 255 && rd < 8 {
@@ -691,6 +693,17 @@ pub type EmitARMCM = class {
     // erzeugt STORE_GLOBAL als (dest = gIdx, src1 = Wert, src2 = -1). Aus src2
     // gelesen wurde -1, geschrieben also vier Byte VOR den Bereich.
     if op == IRO_LOAD_GLOBAL {
+      // #2239: Anfangswert passte nicht in ein Wort und es wurde noch nicht
+      // geschrieben → Debug-Halt wie bei IRO_PANIC statt eines still
+      // gekuerzten Werts.
+      var lMerk: int64 := _irWort32MerkerFuer(self.wort32Merker, src1);
+      if lMerk >= 0 {
+        self.cm_LI(CM_R6, CM_GLOBALS_BASE + lMerk * 4);
+        self.cm_LDR_pos(CM_R4, CM_R6, 0);
+        self.cm_CMP0(CM_R4);
+        self.cm_e16(0xD100);       // BNE +0 → ueberspringt das folgende BKPT
+        self.cm_e16(0xBE00);       // bkpt #0
+      }
       self.cm_LI(CM_R6, CM_GLOBALS_BASE + src1 * 4);
       self.cm_LDR_pos(CM_R4, CM_R6, 0); self.cm_storeSlot(dest);
     }
@@ -698,6 +711,12 @@ pub type EmitARMCM = class {
       self.cm_LI(CM_R6, CM_GLOBALS_BASE + dest * 4);
       self.cm_loadSlot(src1);
       self.cm_STR_pos(CM_R4, CM_R6, 0);
+      var sMerk: int64 := _irWort32MerkerFuer(self.wort32Merker, dest);
+      if sMerk >= 0 {              // #2239: ab jetzt ist der Wert gueltig
+        self.cm_LI(CM_R6, CM_GLOBALS_BASE + sMerk * 4);
+        self.cm_LI(CM_R4, 1);
+        self.cm_STR_pos(CM_R4, CM_R6, 0);
+      }
     }
 
     // --- Struct field access ---
@@ -1390,7 +1409,7 @@ pub type EmitARMCM = class {
       while gi < gCount {
         var gv: int64 := 0;
         if gBuf != 0 { gv := peek64(gBuf + gi * 8); }
-        self.cm_LIroh(CM_R4, gv);   // #2239: Anfangswert, siehe cm_LIroh
+        self.cm_LIroh(CM_R4, gv);   // #2239: gekuerzt, aber durch den Merker gesperrt (cm_LIroh)
         self.cm_LI(CM_R6, CM_GLOBALS_BASE + gi * 4);
         self.cm_STR_pos(CM_R4, CM_R6, 0);
         gi := gi + 1;
@@ -1411,6 +1430,7 @@ pub type EmitARMCM = class {
   pub fn init(irMod: int64) {
     self.cmMainOff  := 0 - 1;
     self.spExtra    := 0;
+    self.wort32Merker := 0;
     self.ir         := irMod;
     self.codeBuf    := alloc(131072);
     self.codeCap    := 131072;
@@ -1424,6 +1444,9 @@ pub type EmitARMCM = class {
   }
 
   pub fn emit(): int64 {
+    // #2239: Merker anlegen, bevor main die Anfangswerte setzt — sie gehoeren
+    // dazu (Anfangswert 0).
+    self.wort32Merker := _irWort32Merker(self.ir);
     var n: int64 := self.getFuncCount();
     var i: int64 := 0;
     while i < n { self.emitFunc(i); i := i + 1; }

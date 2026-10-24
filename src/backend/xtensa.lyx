@@ -94,6 +94,7 @@ pub type EmitXtensa = class {
   strIdxBuf:  int64;   // je Literal: Byte-Offset in strDatBuf
   strIdxN:    int64;
   globDatOff: int64;   // Code-Offset des Bereichs fuer globale Variablen
+  wort32Merker: int64; // #2239: _irWort32Merker-Tabelle (0 = keine)
   funcCount:  int64;
 
   // WP-D3: offsets of helper subroutines in codeBuf (prepended before user code)
@@ -697,6 +698,17 @@ pub type EmitXtensa = class {
     // Bis 1.1.9M standen hier zwei stille Stummel: Lesen lieferte 0, Schreiben
     // tat gar nichts, beides ohne ein Wort.
     if op == IRO_LOAD_GLOBAL {
+      // #2239: Anfangswert passte nicht in ein Wort und es wurde noch nicht
+      // geschrieben → Abbruch statt eines still gekuerzten Werts.
+      var lMerk: int64 := _irWort32MerkerFuer(self.wort32Merker, src1);
+      if lMerk >= 0 {
+        self.xt_adresseNachT0(1, lMerk);
+        self.xt_L32I(XT_T0, XT_T0, 0);
+        var mOff: int64 := self.codeLen;
+        self.xt_BNEZ(XT_T0, 0);          // gesetzt → weiter
+        self.xt_ILL();
+        self.xt_patchBRI12(mOff, 5, self.codeLen);
+      }
       self.xt_adresseNachT0(1, src1);
       self.xt_L32I(XT_T0, XT_T0, 0);
       self.xt_storeSlot(dest);
@@ -708,6 +720,12 @@ pub type EmitXtensa = class {
       self.xt_MOV(XT_T2, XT_T0);
       self.xt_loadSlot(src1);
       self.xt_S32I(XT_T0, XT_T2, 0);
+      var sMerk: int64 := _irWort32MerkerFuer(self.wort32Merker, dest);
+      if sMerk >= 0 {                    // #2239: ab jetzt ist der Wert gueltig
+        self.xt_adresseNachT0(1, sMerk);
+        self.xt_li(XT_T1, 1);
+        self.xt_S32I(XT_T1, XT_T0, 0);
+      }
     }
 
     // --- Struct field access ---
@@ -1563,6 +1581,7 @@ pub type EmitXtensa = class {
 
   pub fn init(irMod: int64) {
     self.xtMainOff  := 0 - 1;
+    self.wort32Merker := 0;
     self.poolOff    := 0;
     self.poolCount  := 0;
     self.poolCap    := 0;
@@ -1694,6 +1713,8 @@ pub type EmitXtensa = class {
     // #1786: Der Literal-Pool steht ganz vorn, denn L32R liest nur
     // RUECKWAERTS. Seine Groesse muss also feststehen, bevor der erste Befehl
     // entsteht — sie wird vorher aus dem IR gezaehlt, statt sie zu schaetzen.
+    // #2239: Merker zuerst — sie brauchen eigene Pool-Eintraege.
+    self.wort32Merker := _irWort32Merker(self.ir);
     self.poolCap := self.xt_zaehleGlobalZugriffe();
     self.poolOff := self.codeLen;
     var pz: int64 := 0;
@@ -1757,7 +1778,15 @@ pub type EmitXtensa = class {
       var k:  int64 := 0;
       while k < ct {
         var o: int64 := self.getInstrOp(st + k);
-        if o == IRO_LOAD_GLOBAL || o == IRO_STORE_GLOBAL { summe := summe + 1; }
+        if o == IRO_LOAD_GLOBAL || o == IRO_STORE_GLOBAL {
+          summe := summe + 1;
+          // #2239: ein Zugriff auf ein Global mit Merker braucht einen zweiten
+          // Eintrag — dieselbe Unterscheidung wie im Zweig IRO_LOAD_GLOBAL /
+          // IRO_STORE_GLOBAL, die beiden muessen uebereinstimmen.
+          var gIdxZ: int64 := self.getInstrSrc1(st + k);
+          if o == IRO_STORE_GLOBAL { gIdxZ := self.getInstrDest(st + k); }
+          if _irWort32MerkerFuer(self.wort32Merker, gIdxZ) >= 0 { summe := summe + 1; }
+        }
         k := k + 1;
       }
       fn2 := fn2 + 1;
