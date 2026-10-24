@@ -5799,8 +5799,14 @@ pub type Codegen = class {
     var pCanaryChk: int64 := self.codeLen;
     self.cg_e32(0);
     self.cg_addPatch(pCanaryChk, CG_CANARY, 0, CG_PATCH_STR);
-    // xor r11, r10
-    self.cg_e8(0x4D); self.cg_e8(0x31); self.cg_e8(0xD3);
+    // #2244: cmp statt xor — dieselbe Null-Flagge, aber cmp+jne verschmilzt zu
+    // EINEM Makro-Op (xor+jcc nicht), und das Paar wird wie jedes andere
+    // ausgerichtet (cg_paarAusrichten). Bis 1.2.20D lag der Sprung in 2308
+    // von rund 3400 Epilogen des Selbstbaus ueber oder an einer
+    // 32-Byte-Grenze — und dieser Epilog laeuft bei JEDER Rueckkehr.
+    self.cg_paarAusrichten(self.codeLen, 9);
+    // cmp r11, r10
+    self.cg_e8(0x4D); self.cg_e8(0x39); self.cg_e8(0xD3);
     // jnz __lyx_stack_fail (0F 85 rel32)
     self.cg_e8(0x0F); self.cg_e8(0x85);
     var failPatch: int64 := self.codeLen;
@@ -9463,11 +9469,16 @@ pub type Codegen = class {
   // `jcc rel32` / `jmp rel32` nach vorn: Stelle des rel32 merken, spaeter
   // cg_bumpZiel. Rueckwaerts: cg_bumpZurueck.
   fn cg_bumpZiel(stelle: int64) { poke32(self.code + stelle, self.codeLen - stelle - 4); }
+  // #2244: beide Sprungformen des Bump-Blocks liegen nie ueber einer
+  // 32-Byte-Grenze (cg_paarAusrichten) — der Block laeuft bei jeder
+  // Anforderung (new, IntToStr, StrConcat ...).
   fn cg_bumpZurueck(op: int64, ziel: int64) {
+    if (op == 0xE9) { self.cg_paarAusrichten(self.codeLen, 5); } else { self.cg_paarAusrichten(self.codeLen, 6); }
     if (op == 0xE9) { self.cg_e8(0xE9); } else { self.cg_e8(0x0F); self.cg_e8(op); }
     self.cg_e32(ziel - self.codeLen - 4);
   }
   fn cg_bumpVor(op: int64): int64 {
+    if (op == 0xE9) { self.cg_paarAusrichten(self.codeLen, 5); } else { self.cg_paarAusrichten(self.codeLen, 6); }
     if (op == 0xE9) { self.cg_e8(0xE9); } else { self.cg_e8(0x0F); self.cg_e8(op); }
     var p: int64 := self.codeLen;
     self.cg_e32(0);
@@ -9519,6 +9530,7 @@ pub type Codegen = class {
     } else {
       self.cg_e8(0x48); self.cg_e8(0x8D); self.cg_e8(0x0C); self.cg_e8(0x30);            // lea rcx, [rax + rsi]
     }
+    self.cg_paarAusrichten(self.codeLen, 13);                                              // #2244: cmp+ja als Paar
     self.cg_e8(0x48); self.cg_e8(0x3B); self.cg_e8(0x0D); self.cg_bumpRip(endOff);   // cmp rcx, [END]
     var pLangsam: int64 := self.cg_bumpVor(0x87);                                          // ja langsam
     self.cg_e8(0xF0); self.cg_e8(0x48); self.cg_e8(0x0F); self.cg_e8(0xB1); self.cg_e8(0x0D);
@@ -13140,15 +13152,21 @@ pub type Codegen = class {
         // ausgewertet. Vorher wurden beide Seiten zu Werten ausgewertet und
         // danach verknuepft -- damit lief `p != 0 && deref(p)` auch bei p == 0
         // in die Dereferenzierung (Issue #1023).
+        // #2244: jedes test+jcc und der jmp wie in cg_genSprungWennFalsch
+        // ausgerichtet (JCC-Erratum, cg_paarAusrichten) — nur Fuellung davor,
+        // nichts wird verschoben.
         self.cg_genExpr(lhsNi);
+        self.cg_paarAusrichten(self.codeLen, 9);
         self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
         self.cg_e8(0x0F); self.cg_e8(0x84);                     // jz  -> falsch
         var scaF1: int64 := self.codeLen; self.cg_e32(0);
         self.cg_genExpr(rhsNi);
+        self.cg_paarAusrichten(self.codeLen, 9);
         self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
         self.cg_e8(0x0F); self.cg_e8(0x84);                     // jz  -> falsch
         var scaF2: int64 := self.codeLen; self.cg_e32(0);
         self.cg_movRaxImm(1);
+        self.cg_paarAusrichten(self.codeLen, 5);
         self.cg_e8(0xE9);                                       // jmp -> Ende
         var scaEnd: int64 := self.codeLen; self.cg_e32(0);
         poke32(self.code + scaF1, self.codeLen - scaF1 - 4);
@@ -13160,14 +13178,17 @@ pub type Codegen = class {
         // Kurzschluss: ist die linke Seite wahr, wird die rechte nicht
         // ausgewertet.
         self.cg_genExpr(lhsNi);
+        self.cg_paarAusrichten(self.codeLen, 9);                  // #2244
         self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
         self.cg_e8(0x0F); self.cg_e8(0x85);                     // jnz -> wahr
         var scoT1: int64 := self.codeLen; self.cg_e32(0);
         self.cg_genExpr(rhsNi);
+        self.cg_paarAusrichten(self.codeLen, 9);                  // #2244
         self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);   // test rax, rax
         self.cg_e8(0x0F); self.cg_e8(0x85);                     // jnz -> wahr
         var scoT2: int64 := self.codeLen; self.cg_e32(0);
         self.cg_zeroRax();
+        self.cg_paarAusrichten(self.codeLen, 5);                  // #2244
         self.cg_e8(0xE9);                                       // jmp -> Ende
         var scoEnd: int64 := self.codeLen; self.cg_e32(0);
         poke32(self.code + scoT1, self.codeLen - scoT1 - 4);
@@ -21773,6 +21794,7 @@ pub type Codegen = class {
     var elseNode: int64 := self.cg_nc2(ni);
     if (elseNode >= 0) {
       // jmp over else
+      self.cg_paarAusrichten(self.codeLen, 5);   // #2244
       self.cg_e8(0xE9);
       var jmpPos: int64 := self.codeLen;
       self.cg_e32(0);
@@ -21904,6 +21926,7 @@ pub type Codegen = class {
     // Last copy's continue list → loopTop
     if (prevContHead != -1) { self.cg_patchList(prevContHead, loopTop); }
     // jmp loopTop
+    self.cg_paarAusrichten(self.codeLen, 5);   // #2244: Ruecksprung nicht ueber eine 32-Byte-Grenze
     self.cg_e8(0xE9);
     self.cg_e32(loopTop - self.codeLen - 4);
     // .exit: patch all condition exits and break jumps
@@ -21955,6 +21978,7 @@ pub type Codegen = class {
     // Condition → rax
     self.cg_genExpr(self.cg_nc1(ni));
     // test rax, rax; jz loopTop  (if cond false → loop back)
+    self.cg_paarAusrichten(self.codeLen, 9);               // #2244
     self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xC0);  // test rax, rax
     self.cg_e8(0x0F); self.cg_e8(0x84);                     // jz rel32
     self.cg_e32(loopTop - self.codeLen - 4);
@@ -22128,6 +22152,7 @@ pub type Codegen = class {
       copy += 1;
     }
     // jmp loopTop
+    self.cg_paarAusrichten(self.codeLen, 5);   // #2244: Ruecksprung nicht ueber eine 32-Byte-Grenze
     self.cg_e8(0xE9);
     self.cg_e32(loopTop - self.codeLen - 4);
     // .exit
@@ -22197,6 +22222,7 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0xFF); self.cg_e8(0xC0);  // inc rax
     self.cg_storeRax(off);
 
+    self.cg_paarAusrichten(self.codeLen, 5);   // #2244: Ruecksprung nicht ueber eine 32-Byte-Grenze
     self.cg_e8(0xE9);
     self.cg_e32(loopTop - self.codeLen - 4);
 
@@ -22270,6 +22296,7 @@ pub type Codegen = class {
       copy += 1;
     }
     // jmp loopTop
+    self.cg_paarAusrichten(self.codeLen, 5);   // #2244: Ruecksprung nicht ueber eine 32-Byte-Grenze
     self.cg_e8(0xE9);
     self.cg_e32(loopTop - self.codeLen - 4);
     // .exit
