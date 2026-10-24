@@ -1,0 +1,399 @@
+// tests/nn_io_test.lyx
+// Selbstpruefende Testbatterie fuer std.nn_io.
+//
+// Die tragende Pruefung ist nicht "laedt ohne Fehler", sondern die WIRKUNG:
+// ein geladenes Netz muss auf denselben Eingaben dieselben Ausgaben liefern
+// wie das gesicherte, und ein mit Optimiererzustand fortgesetztes Training
+// muss dieselben Gewichte erreichen wie das ununterbrochene. Dazu kommt die
+// Gegenseite: ohne Optimiererzustand laeuft es NACHWEISLICH anders weiter --
+// sonst wuerde der Test auch dann gruen bleiben, wenn der Zustand nie
+// geschrieben wird.
+
+unit main;
+
+import std.nn;
+import std.nn_io;
+import std.math;
+import std.alloc;
+import std.fs;
+
+var _fails: int64 := 0;
+var _checks: int64 := 0;
+
+fn TOL(): f64 { return 0.000000001; }
+
+fn Check(name: pchar, got: f64, want: f64, tol: f64): void {
+  _checks := _checks + 1;
+  if (AbsF64(got - want) > tol) {
+    _fails := _fails + 1;
+    PrintStr("FAIL "c);
+    PrintStr(name);
+    PrintStr(" got="c);
+    PrintFloat(got);
+    PrintStr(" want="c);
+    PrintFloat(want);
+    PrintStr("\n"c);
+  }
+}
+
+fn CheckI(name: pchar, got: int64, want: int64): void {
+  _checks := _checks + 1;
+  if (got != want) {
+    _fails := _fails + 1;
+    PrintStr("FAIL "c);
+    PrintStr(name);
+    PrintStr(" got="c);
+    PrintInt(got);
+    PrintStr(" want="c);
+    PrintInt(want);
+    PrintStr("\n"c);
+  }
+}
+
+fn CheckB(name: pchar, got: bool, want: bool): void {
+  _checks := _checks + 1;
+  if (got != want) {
+    _fails := _fails + 1;
+    PrintStr("FAIL "c);
+    PrintStr(name);
+    PrintStr(" (bool)\n"c);
+  }
+}
+
+fn SV(p: int64, i: int64, v: f64): void {
+  pokef64(p + i * 8, v);
+}
+
+fn PV(p: int64, i: int64): f64 {
+  var v: f64 := peekf64(p + i * 8);
+  return v;
+}
+
+fn NEG(x: f64): f64 { return 0.0 - x; }
+
+fn FILEPATH(): pchar { return "/tmp/nn_io_test_net.lyxnn"c; }
+
+// Groesste Abweichung aller Gewichte und Biase zweier Netze gleicher Bauart.
+// Das Rueckgrat jeder Gleichheitspruefung hier: eine Stichprobe auf ein
+// Gewicht wuerde eine verdrehte Reihenfolge nicht bemerken.
+fn MaxParamDiff(a: int64, b: int64): f64 {
+  var worst: f64 := 0.0;
+  var nL: int64 := NnLayerCount(a);
+  if (NnLayerCount(b) != nL) { return 999.0; }
+  var k: int64 := 0;
+  while (k < nL) {
+    var inD: int64 := NnLayerInDim(a, k);
+    var outD: int64 := NnLayerOutDim(a, k);
+    if (NnLayerInDim(b, k) != inD) { return 999.0; }
+    if (NnLayerOutDim(b, k) != outD) { return 999.0; }
+    var r: int64 := 0;
+    while (r < outD) {
+      var c: int64 := 0;
+      while (c < inD) {
+        var d: f64 := AbsF64(NnGetWeight(a, k, r, c) - NnGetWeight(b, k, r, c));
+        if (d > worst) { worst := d; }
+        c := c + 1;
+      }
+      var db: f64 := AbsF64(NnGetBias(a, k, r) - NnGetBias(b, k, r));
+      if (db > worst) { worst := db; }
+      r := r + 1;
+    }
+    k := k + 1;
+  }
+  return worst;
+}
+
+// Netz mit fester Bauart: 3 -> 4 tanh -> 2 softmax, Gewichte aus dem Keim
+fn BuildNet(seed: int64): int64 {
+  var net: int64 := NnNew(3, 2);
+  NnSeed(net, seed);
+  var ok: bool := NnAddDense(net, 4, NN_ACT_TANH);
+  ok := NnAddDense(net, 2, NN_ACT_SOFTMAX);
+  ok := NnInitXavier(net);
+  ok := NnSetLoss(net, NN_LOSS_CE);
+  ok := NnSetOptimizer(net, NN_OPT_ADAM);
+  NnSetLearningRate(net, 0.03);
+  NnSetAdam(net, 0.85, 0.995, 0.0000001);
+  NnSetLeakySlope(net, 0.02);
+  return net;
+}
+
+fn main(): int64 {
+  // ── Groesse und Rundlauf im Puffer ────────────────────────────────────────
+
+  var net: int64 := BuildNet(31337);
+  // 3*4+4 + 4*2+2 = 16 + 10 = 26 Parameter
+  CheckI("params26"c, NnParamCount(net), 26);
+  // Kopf: 5 + 2*2 Schichten + 11 Schwanz = 20 Felder, + 26 Parameter,
+  // + 1 Zaehler + 52 Optimiererwerte, + 1 Pruefsumme = 100 Felder = 800 Byte
+  CheckI("sizeOpt"c, NnIoBufferSize(net, true), 800);
+  // ohne Optimiererzustand: 20 + 26 + 1 = 47 Felder = 376 Byte
+  CheckI("sizePlain"c, NnIoBufferSize(net, false), 376);
+  CheckI("sizeEmpty"c, NnIoBufferSize(NnNew(2, 2), true), 0);
+
+  var cap: int64 := NnIoBufferSize(net, true);
+  var buf: int64 := alloc(cap);
+  // zu kleiner Puffer wird abgelehnt, nicht teilweise beschrieben
+  CheckI("saveTooSmall"c, NnIoSaveBuffer(net, buf, cap - 8, true), 0);
+  CheckI("errTooSmall"c, NnIoLoadError(), NNIO_E_ARGS);
+  CheckI("saveNullBuf"c, NnIoSaveBuffer(net, 0, cap, true), 0);
+  CheckI("errNullBuf"c, NnIoLoadError(), NNIO_E_ARGS);
+
+  var n: int64 := NnIoSaveBuffer(net, buf, cap, true);
+  CheckI("saveBytes"c, n, 800);
+  CheckI("verifyOk"c, NnIoVerify(buf, n), NNIO_OK);
+
+  // Kopfangaben ohne Aufbau
+  CheckI("hdrIn"c, NnIoHeaderInputDim(buf, n), 3);
+  CheckI("hdrLayers"c, NnIoHeaderLayerCount(buf, n), 2);
+  CheckI("hdrOut"c, NnIoHeaderOutputDim(buf, n), 2);
+  CheckI("hdrParams"c, NnIoHeaderParamCount(buf, n), 26);
+  CheckB("hdrHasOpt"c, NnIoHeaderHasOptState(buf, n), true);
+
+  var back: int64 := NnIoLoadBuffer(buf, n);
+  CheckB("loadOk"c, back != 0, true);
+  CheckI("loadErr"c, NnIoLoadError(), NNIO_OK);
+  // Architektur
+  CheckI("backIn"c, NnInputDim(back), 3);
+  CheckI("backLayers"c, NnLayerCount(back), 2);
+  CheckI("backOut"c, NnOutputDim(back), 2);
+  CheckI("backAct0"c, NnLayerAct(back, 0), NN_ACT_TANH);
+  CheckI("backAct1"c, NnLayerAct(back, 1), NN_ACT_SOFTMAX);
+  // Einstellungen
+  CheckI("backLoss"c, NnLoss(back), NN_LOSS_CE);
+  CheckI("backOpt"c, NnOptimizer(back), NN_OPT_ADAM);
+  Check("backLr"c, NnLearningRate(back), 0.03, TOL());
+  Check("backB1"c, NnBeta1(back), 0.85, TOL());
+  Check("backB2"c, NnBeta2(back), 0.995, TOL());
+  Check("backAEps"c, NnAdamEps(back), 0.0000001, TOL());
+  Check("backLeak"c, NnLeakySlope(back), 0.02, TOL());
+  CheckI("backRng"c, NnRngState(back), NnRngState(net));
+  // Gewichte bitgleich
+  Check("paramsEqual"c, MaxParamDiff(net, back), 0.0, 0.0);
+
+  // Wirkung: gleiche Eingabe, gleiche Ausgabe
+  var x: int64 := alloc(3 * 8);
+  SV(x, 0, 0.6);
+  SV(x, 1, NEG(1.1));
+  SV(x, 2, 0.25);
+  var o1: int64 := NnForward(net, x);
+  var a0: f64 := NnOutputAt(net, 0);
+  var a1: f64 := NnOutputAt(net, 1);
+  var o2: int64 := NnForward(back, x);
+  Check("sameOut0"c, NnOutputAt(back, 0), a0, 0.0);
+  Check("sameOut1"c, NnOutputAt(back, 1), a1, 0.0);
+
+  // ── Abweisungen: jede einzeln, am veraenderten Byte ───────────────────────
+
+  // Kennung verdreht
+  var saveB0: int64 := peek8(buf);
+  poke8(buf, 88);
+  CheckI("badMagic"c, NnIoVerify(buf, n), NNIO_E_MAGIC);
+  CheckI("loadBadMagic"c, NnIoLoadBuffer(buf, n), 0);
+  CheckI("errBadMagic"c, NnIoLoadError(), NNIO_E_MAGIC);
+  poke8(buf, saveB0);
+  CheckI("magicRestored"c, NnIoVerify(buf, n), NNIO_OK);
+
+  // Formatfassung unbekannt
+  poke64(buf + 8, 999);
+  CheckI("badFormat"c, NnIoVerify(buf, n), NNIO_E_FORMAT);
+  poke64(buf + 8, NNIO_FORMAT);
+
+  // abgeschnitten
+  CheckI("truncHdr"c, NnIoVerify(buf, 16), NNIO_E_TRUNC);
+  CheckI("truncBody"c, NnIoVerify(buf, n - 8), NNIO_E_TRUNC);
+  CheckI("loadTrunc"c, NnIoLoadBuffer(buf, n - 8), 0);
+  CheckI("errTrunc"c, NnIoLoadError(), NNIO_E_TRUNC);
+
+  // ein verdrehtes Gewichtsbyte -- die Pruefsumme muss das sehen
+  var mid: int64 := 30 * 8;
+  var saveMid: int64 := peek8(buf + mid);
+  poke8(buf + mid, saveMid ^ 1);
+  CheckI("badChecksum"c, NnIoVerify(buf, n), NNIO_E_CHECKSUM);
+  CheckI("loadBadSum"c, NnIoLoadBuffer(buf, n), 0);
+  CheckI("errBadSum"c, NnIoLoadError(), NNIO_E_CHECKSUM);
+  poke8(buf + mid, saveMid);
+  CheckI("sumRestored"c, NnIoVerify(buf, n), NNIO_OK);
+
+  // Architektur passt nicht zur Parameterzahl (Schichtbreite verdreht).
+  // Hier faellt es schon an der Nachrechnung auf, vor der Pruefsumme -- und
+  // genau darum wird beides geprueft und nicht nur eines.
+  var saveOut: int64 := peek64(buf + 5 * 8);
+  poke64(buf + 5 * 8, 7);
+  CheckI("badShape"c, NnIoVerify(buf, n), NNIO_E_SHAPE);
+  poke64(buf + 5 * 8, saveOut);
+  // unbrauchbare Aktivierung
+  var saveAct: int64 := peek64(buf + 6 * 8);
+  poke64(buf + 6 * 8, 42);
+  CheckI("badAct"c, NnIoVerify(buf, n), NNIO_E_SHAPE);
+  poke64(buf + 6 * 8, saveAct);
+  CheckI("shapeRestored"c, NnIoVerify(buf, n), NNIO_OK);
+  // Nullzeiger und Unsinnslaenge
+  CheckI("verifyNull"c, NnIoVerify(0, n), NNIO_E_ARGS);
+  CheckI("verifyZeroLen"c, NnIoVerify(buf, 0), NNIO_E_TRUNC);
+
+  // Pruefsumme oeffentlich nachrechnen: dieselbe Zahl wie im Puffer
+  var want: int64 := peek64(buf + (n - 8));
+  CheckI("pubChecksum"c, NnIoChecksum(buf, n - 8), want);
+  // und sie haengt wirklich am Inhalt
+  CheckB("checksumSensitive"c,
+         NnIoChecksum(buf, n - 8) != NnIoChecksum(buf, n - 16), true);
+
+  NnFree(back);
+
+  // ── Ohne Optimiererzustand ────────────────────────────────────────────────
+
+  var capP: int64 := NnIoBufferSize(net, false);
+  var bufP: int64 := alloc(capP);
+  var nP: int64 := NnIoSaveBuffer(net, bufP, capP, false);
+  CheckI("plainBytes"c, nP, 376);
+  CheckI("plainVerify"c, NnIoVerify(bufP, nP), NNIO_OK);
+  CheckB("plainHasOpt"c, NnIoHeaderHasOptState(bufP, nP), false);
+  var plain: int64 := NnIoLoadBuffer(bufP, nP);
+  CheckB("plainLoad"c, plain != 0, true);
+  Check("plainParams"c, MaxParamDiff(net, plain), 0.0, 0.0);
+  NnFree(plain);
+
+  // ── Datei ─────────────────────────────────────────────────────────────────
+
+  DeleteFile(FILEPATH());
+  CheckI("fileSaveNullPath"c, NnIoSaveFile(net, 0 as pchar, true), 0);
+  CheckI("errNullPath"c, NnIoLoadError(), NNIO_E_ARGS);
+  CheckI("fileSave"c, NnIoSaveFile(net, FILEPATH(), true), 800);
+  CheckI("fileSize"c, FileSize(FILEPATH()), 800);
+  var fromFile: int64 := NnIoLoadFile(FILEPATH());
+  CheckB("fileLoad"c, fromFile != 0, true);
+  CheckI("fileLoadErr"c, NnIoLoadError(), NNIO_OK);
+  Check("fileParams"c, MaxParamDiff(net, fromFile), 0.0, 0.0);
+  var o3: int64 := NnForward(fromFile, x);
+  Check("fileSameOut"c, NnOutputAt(fromFile, 0), a0, 0.0);
+  NnFree(fromFile);
+
+  // fehlende Datei
+  CheckI("fileMissing"c, NnIoLoadFile("/tmp/nn_io_test_nicht_da.lyxnn"c), 0);
+  CheckI("errMissing"c, NnIoLoadError(), NNIO_E_FILE);
+  // Datei mit Muell: die Pruefung greift auch ueber den Dateiweg
+  var junk: int64 := alloc(64);
+  var j: int64 := 0;
+  while (j < 64) {
+    poke8(junk + j, 65);
+    j := j + 1;
+  }
+  var wrote: int64 := WriteFile("/tmp/nn_io_test_junk.lyxnn"c, junk as pchar, 64);
+  CheckI("junkWritten"c, wrote, 64);
+  CheckI("junkLoad"c, NnIoLoadFile("/tmp/nn_io_test_junk.lyxnn"c), 0);
+  CheckI("errJunk"c, NnIoLoadError(), NNIO_E_MAGIC);
+  // abgeschnittene, aber gueltig beginnende Datei
+  var half: int64 := WriteFile("/tmp/nn_io_test_half.lyxnn"c, buf as pchar, 200);
+  CheckI("halfWritten"c, half, 200);
+  CheckI("halfLoad"c, NnIoLoadFile("/tmp/nn_io_test_half.lyxnn"c), 0);
+  CheckI("errHalf"c, NnIoLoadError(), NNIO_E_TRUNC);
+  DeleteFile("/tmp/nn_io_test_junk.lyxnn"c);
+  DeleteFile("/tmp/nn_io_test_half.lyxnn"c);
+  DeleteFile(FILEPATH());
+
+  // ── Verlust und Ausgabeaktivierung muessen zusammenpassen ─────────────────
+  //
+  // Eine Bytefolge, in der NN_LOSS_BCE neben einer Softmax-Ausgabe steht, ist
+  // nicht ladbar: der gekuerzte Gradient gilt dort nicht. Geprueft wird am
+  // veraenderten Feld, mit nachgezogener Pruefsumme -- sonst wuerde schon die
+  // Pruefsumme abweisen und die eigentliche Regel bliebe ungemessen.
+  var lossSlot: int64 := 5 + 2 * 2;      // Kopf + zwei Schichten
+  poke64(buf + lossSlot * 8, NN_LOSS_BCE);
+  poke64(buf + (n - 8), NnIoChecksum(buf, n - 8));
+  CheckI("mismatchVerify"c, NnIoVerify(buf, n), NNIO_OK);
+  CheckI("mismatchLoad"c, NnIoLoadBuffer(buf, n), 0);
+  CheckI("errMismatch"c, NnIoLoadError(), NNIO_E_SHAPE);
+  // zurueckdrehen
+  poke64(buf + lossSlot * 8, NN_LOSS_CE);
+  poke64(buf + (n - 8), NnIoChecksum(buf, n - 8));
+  var again: int64 := NnIoLoadBuffer(buf, n);
+  CheckB("mismatchBack"c, again != 0, true);
+  NnFree(again);
+
+  // Zufallszustand 0 ist kein gueltiger xorshift-Zustand
+  poke64(buf + (lossSlot + 9) * 8, 0);
+  poke64(buf + (n - 8), NnIoChecksum(buf, n - 8));
+  CheckI("rngZeroLoad"c, NnIoLoadBuffer(buf, n), 0);
+  CheckI("errRngZero"c, NnIoLoadError(), NNIO_E_SHAPE);
+
+  NnFree(net);
+
+  // ── Wirkung: Training fortsetzen ──────────────────────────────────────────
+  //
+  // Zwei gleich gebaute Netze trainieren 30 Epochen. Dann wird eines
+  // gesichert, freigegeben und zurueckgeladen; beide laufen 30 weitere
+  // Epochen. Nur wenn der Optimiererzustand UND der Schrittzaehler
+  // mitgegangen sind, stehen danach dieselben Gewichte.
+
+  var nS: int64 := 6;
+  var X: int64 := alloc(nS * 3 * 8);
+  var Y: int64 := alloc(nS * 2 * 8);
+  var i: int64 := 0;
+  var three: f64 := 3.0;
+  while (i < nS) {
+    var t: f64 := (i as f64) / three;
+    SV(X, i * 3, t);
+    SV(X, i * 3 + 1, NEG(t) + 0.5);
+    SV(X, i * 3 + 2, t * t);
+    if (i < 3) {
+      SV(Y, i * 2, 1.0);
+      SV(Y, i * 2 + 1, 0.0);
+    } else {
+      SV(Y, i * 2, 0.0);
+      SV(Y, i * 2 + 1, 1.0);
+    }
+    i := i + 1;
+  }
+
+  var refNet: int64 := BuildNet(4711);
+  var cutNet: int64 := BuildNet(4711);
+  Check("startEqual"c, MaxParamDiff(refNet, cutNet), 0.0, 0.0);
+  var l1: f64 := NnTrain(refNet, X, Y, nS, 3, 30);
+  var l2: f64 := NnTrain(cutNet, X, Y, nS, 3, 30);
+  Check("sameAfter30"c, MaxParamDiff(refNet, cutNet), 0.0, 0.0);
+  CheckB("steppedForward"c, NnStepCount(cutNet) > 0, true);
+
+  // sichern, freigeben, zurueckholen
+  var capC: int64 := NnIoBufferSize(cutNet, true);
+  var bufC: int64 := alloc(capC);
+  var nC: int64 := NnIoSaveBuffer(cutNet, bufC, capC, true);
+  CheckB("cutSaved"c, nC > 0, true);
+  var stepsBefore: int64 := NnStepCount(cutNet);
+  NnFree(cutNet);
+  var resumed: int64 := NnIoLoadBuffer(bufC, nC);
+  CheckB("resumedLoad"c, resumed != 0, true);
+  CheckI("resumedSteps"c, NnStepCount(resumed), stepsBefore);
+  Check("resumedParams"c, MaxParamDiff(refNet, resumed), 0.0, 0.0);
+
+  var l3: f64 := NnTrain(refNet, X, Y, nS, 3, 30);
+  var l4: f64 := NnTrain(resumed, X, Y, nS, 3, 30);
+  Check("resumeSameLoss"c, l4, l3, 0.0);
+  Check("resumeSameParams"c, MaxParamDiff(refNet, resumed), 0.0, 0.0);
+  NnFree(resumed);
+
+  // Gegenseite: OHNE Optimiererzustand laeuft es anders weiter. Ohne diese
+  // Pruefung waere der Test auch dann gruen, wenn NnSaveOptState nie etwas
+  // schreibt.
+  var plainNet: int64 := BuildNet(4711);
+  var l5: f64 := NnTrain(plainNet, X, Y, nS, 3, 30);
+  var capN: int64 := NnIoBufferSize(plainNet, false);
+  var bufN: int64 := alloc(capN);
+  var nN: int64 := NnIoSaveBuffer(plainNet, bufN, capN, false);
+  NnFree(plainNet);
+  var naive: int64 := NnIoLoadBuffer(bufN, nN);
+  CheckB("naiveLoad"c, naive != 0, true);
+  // Schlank gesichert heisst: kein Optimiererzustand UND kein Schrittzaehler
+  CheckI("naiveSteps"c, NnStepCount(naive), 0);
+  var l6: f64 := NnTrain(naive, X, Y, nS, 3, 30);
+  CheckB("naiveDiffers"c, MaxParamDiff(refNet, naive) > 0.000001, true);
+  NnFree(naive);
+  NnFree(refNet);
+
+  PrintStr("checks="c);
+  PrintInt(_checks);
+  PrintStr(" fails="c);
+  PrintInt(_fails);
+  PrintStr("\n"c);
+  return _fails;
+}

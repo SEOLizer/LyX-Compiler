@@ -266,6 +266,148 @@ else
   nok "python3 fehlt — die Faelle mit falsch antwortendem Server wurden NICHT gemessen"
 fi
 
+
+echo
+echo "--- std.nn_store_pg: Netz in bytea ablegen, zurueckholen, Verdrehung abweisen ---"
+# Dieselbe Bytefolge wie in der Datei (std.nn_io), nur in einer bytea-Spalte.
+# Gemessen wird die WIRKUNG: gleiche Gewichte, gleicher Schrittzaehler und
+# gleiche Ausgabe nach dem Zurueckholen. Dazu die Gegenseite: ein gekipptes
+# Byte in der Spalte muss das Laden scheitern lassen -- sonst waere die
+# Pruefsumme Zierde.
+cat > "$TMP/nnpg.lyx" <<EOF
+unit main;
+
+import std.nn;
+import std.nn_io;
+import std.nn_store_pg;
+import std.db.postgres;
+import std.math;
+import std.alloc;
+
+fn SV(p: int64, i: int64, v: f64): void { pokef64(p + i * 8, v); }
+
+fn bauNetz(seed: int64): int64 {
+  var net: int64 := NnNew(3, 2);
+  NnSeed(net, seed);
+  var ok: bool := NnAddDense(net, 5, NN_ACT_TANH);
+  ok := NnAddDense(net, 2, NN_ACT_SOFTMAX);
+  ok := NnInitXavier(net);
+  ok := NnSetLoss(net, NN_LOSS_CE);
+  ok := NnSetOptimizer(net, NN_OPT_ADAM);
+  NnSetLearningRate(net, 0.04);
+  return net;
+}
+
+fn schlimmste(a: int64, b: int64): f64 {
+  var worst: f64 := 0.0;
+  var k: int64 := 0;
+  while (k < NnLayerCount(a)) {
+    var r: int64 := 0;
+    while (r < NnLayerOutDim(a, k)) {
+      var c: int64 := 0;
+      while (c < NnLayerInDim(a, k)) {
+        var d: f64 := AbsF64(NnGetWeight(a, k, r, c) - NnGetWeight(b, k, r, c));
+        if (d > worst) { worst := d; }
+        c := c + 1;
+      }
+      var e: f64 := AbsF64(NnGetBias(a, k, r) - NnGetBias(b, k, r));
+      if (e > worst) { worst := e; }
+      r := r + 1;
+    }
+    k := k + 1;
+  }
+  return worst;
+}
+
+fn main(): int64 {
+  var conn: int64 := PGConnect("127.0.0.1"c, $PORT, "lyxmd5"c, "$PW_MD5"c, "nexus"c);
+  if (PGIsConnected(conn) == 0) { PrintStr("connect:"); PrintStr(PGErrorMessage(conn)); return 1; }
+  var r0: int64 := PGQuery(conn, "DROP TABLE IF EXISTS nn_models"c);
+  if (r0 != 0) { PGFreeResult(r0); }
+  if (NnPgInit(conn) == false) { PrintStr("init:"); PrintInt(NnPgError()); return 2; }
+
+  var net: int64 := bauNetz(2026);
+  var x: int64 := alloc(3 * 8);
+  SV(x, 0, 0.4); SV(x, 1, 0.9); SV(x, 2, 0.2);
+  var Y: int64 := alloc(2 * 8);
+  SV(Y, 0, 1.0); SV(Y, 1, 0.0);
+  var lv: f64 := NnTrain(net, x, Y, 1, 1, 25);
+
+  if (NnPgSave(conn, "modell-a"c, net, true) == false) { PrintStr("save:"); PrintInt(NnPgError()); return 3; }
+  var net2: int64 := bauNetz(777);
+  var ok2: bool := NnPgSave(conn, "modell-b"c, net2, false);
+
+  PrintInt(NnPgCount(conn)); PrintStr("|");
+  PrintInt(NnPgExists(conn, "modell-a"c) as int64);
+  PrintInt(NnPgExists(conn, "modell-x"c) as int64); PrintStr("|");
+  PrintInt(NnPgInputDim(conn, "modell-a"c)); PrintStr(",");
+  PrintInt(NnPgOutputDim(conn, "modell-a"c)); PrintStr(",");
+  PrintInt(NnPgLayerCount(conn, "modell-a"c)); PrintStr(",");
+  PrintInt(NnPgParamCount(conn, "modell-a"c)); PrintStr(",");
+  PrintInt(NnPgByteCount(conn, "modell-a"c)); PrintStr(",");
+  PrintInt(NnPgHasOptState(conn, "modell-a"c));
+  PrintInt(NnPgHasOptState(conn, "modell-b"c)); PrintStr("|");
+  PrintStr(NnPgNameAt(conn, 0)); PrintStr(",");
+  PrintStr(NnPgNameAt(conn, 1)); PrintStr("|");
+
+  var back: int64 := NnPgLoad(conn, "modell-a"c);
+  if (back == 0) { PrintStr("load:"); PrintInt(NnPgError()); return 4; }
+  var o1: int64 := NnForward(net, x);
+  var a0: f64 := NnOutputAt(net, 0);
+  var o2: int64 := NnForward(back, x);
+  PrintInt((schlimmste(net, back) == 0.0) as int64);
+  PrintInt((NnStepCount(back) == NnStepCount(net)) as int64);
+  PrintInt(((NnOutputAt(back, 0) - a0) == 0.0) as int64); PrintStr("|");
+
+  var fresh: int64 := bauNetz(31415);
+  var ok3: bool := NnPgSave(conn, "modell-a"c, fresh, false);
+  PrintInt(ok3 as int64);
+  PrintInt(NnPgCount(conn));
+  PrintInt(NnPgHasOptState(conn, "modell-a"c)); PrintStr("|");
+  PrintInt(NnPgDelete(conn, "modell-b"c) as int64);
+  PrintInt(NnPgDelete(conn, "modell-b"c) as int64);
+  PrintInt(NnPgError()); PrintStr("|");
+
+  var sel: int64 := PGStmtPrepare(conn, "nnpg_sel"c, "SELECT state FROM nn_models WHERE name = \$1"c);
+  PGStmtReset(sel);
+  PGBindStr(sel, 0, "modell-a"c);
+  var rs: int64 := PGStmtExecute(conn, sel);
+  if (rs == 0) { PrintStr("sel:"); PrintStr(PGErrorMessage(conn)); return 5; }
+  PGFetchRow(rs);
+  var lenBox: int64 := alloc(8);
+  var ptr: int64 := PGGetBytes(rs, 0, lenBox);
+  var len: int64 := peek64(lenBox);
+  PGFreeResult(rs);
+  PGStmtClose(conn, "nnpg_sel"c);
+  PGStmtFree(sel);
+  poke8(ptr + 200, peek8(ptr + 200) ^ 1);
+  var upd: int64 := PGStmtPrepare(conn, "nnpg_upd"c, "UPDATE nn_models SET state = \$1 WHERE name = \$2"c);
+  PGStmtReset(upd);
+  PGBindBytes(upd, 0, ptr, len);
+  PGBindStr(upd, 1, "modell-a"c);
+  var ru: int64 := PGStmtExecute(conn, upd);
+  if (ru == 0) { PrintStr("upd:"); PrintStr(PGErrorMessage(conn)); return 6; }
+  PGFreeResult(ru);
+  PGStmtClose(conn, "nnpg_upd"c);
+  PGStmtFree(upd);
+  PrintInt(len); PrintStr(",");
+  PrintInt(NnPgByteCount(conn, "modell-a"c)); PrintStr("|");
+  var broken: int64 := NnPgLoad(conn, "modell-a"c);
+  PrintInt(broken);
+  PrintInt(NnPgError()); PrintStr("|");
+  PGClose(conn);
+  return 0;
+}
+EOF
+if bauen "$TMP/nnpg.lyx" "$TMP/nnpg"; then
+  aus="$(timeout 120 "$TMP/nnpg" 2>&1 | tr -d '\n')"
+  soll='2|10|3,2,2,32,944,10|modell-a,modell-b|111|120|103|424,424|05|'
+  if [ "$aus" = "$soll" ]; then
+    ok "Netz in bytea: Angaben, Rundlauf bitgleich, Ersetzen, Loeschen, Verdrehung abgewiesen"
+  else
+    nok "nn_store_pg: [$aus] statt [$soll]"
+  fi
+else nok "nn_store_pg uebersetzt nicht: $(grep -m1 -i error "$TMP/bau.log")"; fi
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]

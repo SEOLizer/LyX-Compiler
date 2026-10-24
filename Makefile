@@ -843,6 +843,8 @@ test: lyxc
 	@echo "OK"
 	@echo "--- std.db.sqlite: REAL ueber FFI in beide Richtungen (3 Pruefungen) ---"
 	@bash tests/db_sqlite_real_test.sh
+	@echo "--- std.nn_store: Netze in SQLite (17 Pruefungen) ---"
+	@bash tests/nn_store_test.sh
 	@bash tests/pg_live_test.sh
 	@echo "OK"
 	@echo "--- std.matrix: Mat3/Mat4/Vec3/Vec4 und ihre Fehlerfaelle (9 Gruppen) ---"

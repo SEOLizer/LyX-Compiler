@@ -1,0 +1,387 @@
+// std/nn_store_pg.lyx
+// Netze in PostgreSQL ablegen und zurueckholen.
+
+@description("Persistence of std.nn networks in PostgreSQL: bytea column with metadata, save/load/list/delete by name")
+@author("Andreas Roene")
+@copyright("2026 Andreas Roene")
+unit std.nn_store_pg;
+
+import std.nn;
+import std.nn_io;
+import std.db.postgres;
+import std.alloc;
+import std.string;
+
+// ── Worum es geht ────────────────────────────────────────────────────────────
+//
+// Gleiche Aufgabe wie std.nn_store, gleiche Bytefolge aus std.nn_io, anderer
+// Server: die Spalte ist `bytea` statt `BLOB`, und die Tabelle liegt dort, wo
+// mehrere Rechner sie sehen. Eine eigene Unit, damit ein Programm, das nur
+// SQLite braucht, nicht die PostgreSQL-Unit mitzieht.
+//
+// Die Bytefolge bleibt die Wahrheit: beim Laden entscheidet die Pruefsumme IN
+// der Bytefolge (NnIoVerify), nicht die Spalte `checksum` -- die ist zum
+// Suchen und Vergleichen da.
+//
+// ── Parameter werden gebunden, nie eingesetzt ────────────────────────────────
+//
+// Jede Abfrage mit einem Namen laeuft ueber ein vorbereitetes Statement mit
+// $1. Ein in SQL eingesetzter Name waere eine Einladung; ausserdem traegt
+// bytea als Text den doppelten Platz.
+
+// ── Fehlerschluessel ─────────────────────────────────────────────────────────
+//
+// Dieselben Zahlen wie in std.nn_store -- wer zwischen den Ablagen wechselt,
+// muss seine Fehlerbehandlung nicht umschreiben.
+
+pub con NNPG_OK: int64         := 0;
+pub con NNPG_E_ARGS: int64     := 1;
+pub con NNPG_E_SQL: int64      := 2;
+pub con NNPG_E_NOTFOUND: int64 := 3;
+pub con NNPG_E_SERIALIZE: int64 := 4;
+pub con NNPG_E_CORRUPT: int64  := 5;
+pub con NNPG_E_BUILD: int64    := 6;
+
+var _nnpg_err: int64 := 0;
+
+pub fn NnPgError(): int64 {
+  return _nnpg_err;
+}
+
+fn _failI(code: int64): int64 {
+  _nnpg_err := code;
+  return 0;
+}
+
+fn _failB(code: int64): bool {
+  _nnpg_err := code;
+  return false;
+}
+
+fn _nameOk(name: pchar): bool {
+  if (name == 0 as pchar) { return false; }
+  if (StrLen(name) < 1) { return false; }
+  return true;
+}
+
+// ── Tabelle ──────────────────────────────────────────────────────────────────
+
+pub fn NnPgTableName(): pchar {
+  return "nn_models"c;
+}
+
+// Legt die Tabelle an, falls sie fehlt. Mehrfaches Aufrufen ist harmlos.
+pub fn NnPgInit(conn: int64): bool {
+  _nnpg_err := NNPG_OK;
+  if (conn == 0) { return _failB(NNPG_E_ARGS); }
+  var sql: pchar := "CREATE TABLE IF NOT EXISTS nn_models (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, format BIGINT NOT NULL, input_dim BIGINT NOT NULL, output_dim BIGINT NOT NULL, layers BIGINT NOT NULL, params BIGINT NOT NULL, has_opt_state BOOLEAN NOT NULL, nbytes BIGINT NOT NULL, checksum BIGINT NOT NULL, created TIMESTAMPTZ NOT NULL DEFAULT now(), updated TIMESTAMPTZ NOT NULL DEFAULT now(), state BYTEA NOT NULL)"c;
+  var r: int64 := PGQuery(conn, sql);
+  if (r == 0) { return _failB(NNPG_E_SQL); }
+  PGFreeResult(r);
+  var idx: pchar := "CREATE INDEX IF NOT EXISTS nn_models_shape ON nn_models (input_dim, output_dim)"c;
+  var r2: int64 := PGQuery(conn, idx);
+  if (r2 == 0) { return _failB(NNPG_E_SQL); }
+  PGFreeResult(r2);
+  return true;
+}
+
+// ── Sichern ──────────────────────────────────────────────────────────────────
+
+// Netz unter name ablegen; ein vorhandener Eintrag desselben Namens wird
+// ersetzt, beides in einer Transaktion. withOpt entscheidet, ob der
+// Optimiererzustand mitgeht.
+pub fn NnPgSave(conn: int64, name: pchar, net: int64, withOpt: bool): bool {
+  _nnpg_err := NNPG_OK;
+  if (conn == 0) { return _failB(NNPG_E_ARGS); }
+  if (_nameOk(name) == false) { return _failB(NNPG_E_ARGS); }
+  var need: int64 := NnIoBufferSize(net, withOpt);
+  if (need == 0) { return _failB(NNPG_E_SERIALIZE); }
+  var buf: int64 := alloc(need);
+  if (buf == 0) { return _failB(NNPG_E_ARGS); }
+  var n: int64 := NnIoSaveBuffer(net, buf, need, withOpt);
+  if (n == 0) {
+    free(buf, need);
+    return _failB(NNPG_E_SERIALIZE);
+  }
+  var sum: int64 := NnIoChecksum(buf, n - 8);   // ohne die Pruefsumme selbst
+  var optFlag: int64 := 0;
+  if (withOpt) { optFlag := 1; }
+
+  if (PGBegin(conn) < 0) {
+    free(buf, need);
+    return _failB(NNPG_E_SQL);
+  }
+
+  var delSql: pchar := "DELETE FROM nn_models WHERE name = $1"c;
+  var del: int64 := PGStmtPrepare(conn, "nn_pg_del"c, delSql);
+  if (del == 0) {
+    PGRollback(conn);
+    free(buf, need);
+    return _failB(NNPG_E_SQL);
+  }
+  PGBindStr(del, 0, name);
+  var rd: int64 := PGStmtExecute(conn, del);
+  PGStmtClose(conn, "nn_pg_del"c);
+  PGStmtFree(del);
+  if (rd == 0) {
+    PGRollback(conn);
+    free(buf, need);
+    return _failB(NNPG_E_SQL);
+  }
+  PGFreeResult(rd);
+
+  var insSql: pchar := "INSERT INTO nn_models (name, format, input_dim, output_dim, layers, params, has_opt_state, nbytes, checksum, state) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"c;
+  var ins: int64 := PGStmtPrepare(conn, "nn_pg_ins"c, insSql);
+  if (ins == 0) {
+    PGRollback(conn);
+    free(buf, need);
+    return _failB(NNPG_E_SQL);
+  }
+  PGBindStr(ins, 0, name);
+  PGBindInt(ins, 1, NNIO_FORMAT);
+  PGBindInt(ins, 2, NnInputDim(net));
+  PGBindInt(ins, 3, NnOutputDim(net));
+  PGBindInt(ins, 4, NnLayerCount(net));
+  PGBindInt(ins, 5, NnParamCount(net));
+  PGBindBool(ins, 6, optFlag);
+  PGBindInt(ins, 7, n);
+  PGBindInt(ins, 8, sum);
+  PGBindBytes(ins, 9, buf, n);
+  var ri: int64 := PGStmtExecute(conn, ins);
+  PGStmtClose(conn, "nn_pg_ins"c);
+  PGStmtFree(ins);
+  free(buf, need);
+  if (ri == 0) {
+    PGRollback(conn);
+    return _failB(NNPG_E_SQL);
+  }
+  PGFreeResult(ri);
+  if (PGCommit(conn) < 0) { return _failB(NNPG_E_SQL); }
+  return true;
+}
+
+// ── Laden ────────────────────────────────────────────────────────────────────
+
+// Netz unter name aufbauen. Rueckgabe ist ein Handle wie von NnNew oder 0;
+// NnPgError() nennt den Grund. Der Aufrufer gibt es mit NnFree zurueck.
+pub fn NnPgLoad(conn: int64, name: pchar): int64 {
+  _nnpg_err := NNPG_OK;
+  if (conn == 0) { return _failI(NNPG_E_ARGS); }
+  if (_nameOk(name) == false) { return _failI(NNPG_E_ARGS); }
+  var sql: pchar := "SELECT state FROM nn_models WHERE name = $1"c;
+  var st: int64 := PGStmtPrepare(conn, "nn_pg_sel"c, sql);
+  if (st == 0) { return _failI(NNPG_E_SQL); }
+  PGBindStr(st, 0, name);
+  var r: int64 := PGStmtExecute(conn, st);
+  PGStmtClose(conn, "nn_pg_sel"c);
+  PGStmtFree(st);
+  if (r == 0) { return _failI(NNPG_E_SQL); }
+  if (PGNumRows(r) < 1) {
+    PGFreeResult(r);
+    return _failI(NNPG_E_NOTFOUND);
+  }
+  if (PGFetchRow(r) == 0) {
+    PGFreeResult(r);
+    return _failI(NNPG_E_SQL);
+  }
+  var lenBox: int64 := alloc(8);
+  if (lenBox == 0) {
+    PGFreeResult(r);
+    return _failI(NNPG_E_ARGS);
+  }
+  // PGGetBytes entschluesselt die bytea-Hexform und legt eine eigene Kopie an
+  // (freizugeben mit free(ptr, len + 1)); der Zeiger ueberlebt PGFreeResult.
+  var ptr: int64 := PGGetBytes(r, 0, lenBox);
+  var len: int64 := peek64(lenBox);
+  free(lenBox, 8);
+  PGFreeResult(r);
+  if (ptr == 0) { return _failI(NNPG_E_CORRUPT); }
+  if (len < 1) {
+    free(ptr, len + 1);
+    return _failI(NNPG_E_CORRUPT);
+  }
+  var rcv: int64 := NnIoVerify(ptr, len);
+  if (rcv != NNIO_OK) {
+    free(ptr, len + 1);
+    return _failI(NNPG_E_CORRUPT);
+  }
+  var net: int64 := NnIoLoadBuffer(ptr, len);
+  free(ptr, len + 1);
+  if (net == 0) { return _failI(NNPG_E_BUILD); }
+  return net;
+}
+
+// ── Bestand ──────────────────────────────────────────────────────────────────
+
+fn _metaInt(conn: int64, name: pchar, sql: pchar, stmtName: pchar): int64 {
+  _nnpg_err := NNPG_OK;
+  if (conn == 0) {
+    _nnpg_err := NNPG_E_ARGS;
+    return -1;
+  }
+  if (_nameOk(name) == false) {
+    _nnpg_err := NNPG_E_ARGS;
+    return -1;
+  }
+  var st: int64 := PGStmtPrepare(conn, stmtName, sql);
+  if (st == 0) {
+    _nnpg_err := NNPG_E_SQL;
+    return -1;
+  }
+  PGBindStr(st, 0, name);
+  var r: int64 := PGStmtExecute(conn, st);
+  PGStmtClose(conn, stmtName);
+  PGStmtFree(st);
+  if (r == 0) {
+    _nnpg_err := NNPG_E_SQL;
+    return -1;
+  }
+  if (PGNumRows(r) < 1) {
+    PGFreeResult(r);
+    _nnpg_err := NNPG_E_NOTFOUND;
+    return -1;
+  }
+  if (PGFetchRow(r) == 0) {
+    PGFreeResult(r);
+    _nnpg_err := NNPG_E_SQL;
+    return -1;
+  }
+  var v: int64 := PGGetInt(r, 0);
+  PGFreeResult(r);
+  return v;
+}
+
+pub fn NnPgExists(conn: int64, name: pchar): bool {
+  var v: int64 := _metaInt(conn, name,
+    "SELECT 1 FROM nn_models WHERE name = $1"c, "nn_pg_ex"c);
+  if (v == 1) { return true; }
+  return false;
+}
+
+pub fn NnPgCount(conn: int64): int64 {
+  _nnpg_err := NNPG_OK;
+  if (conn == 0) { return _failI(NNPG_E_ARGS); }
+  var r: int64 := PGQuery(conn, "SELECT COUNT(*) FROM nn_models"c);
+  if (r == 0) { return _failI(NNPG_E_SQL); }
+  var n: int64 := 0;
+  if (PGFetchRow(r) != 0) { n := PGGetInt(r, 0); }
+  PGFreeResult(r);
+  return n;
+}
+
+// Eintrag loeschen. false heisst "nicht geloescht"; NnPgError() unterscheidet
+// NNPG_E_NOTFOUND von NNPG_E_SQL.
+pub fn NnPgDelete(conn: int64, name: pchar): bool {
+  _nnpg_err := NNPG_OK;
+  if (conn == 0) { return _failB(NNPG_E_ARGS); }
+  if (_nameOk(name) == false) { return _failB(NNPG_E_ARGS); }
+  var sql: pchar := "DELETE FROM nn_models WHERE name = $1"c;
+  var st: int64 := PGStmtPrepare(conn, "nn_pg_del2"c, sql);
+  if (st == 0) { return _failB(NNPG_E_SQL); }
+  PGBindStr(st, 0, name);
+  var r: int64 := PGStmtExecute(conn, st);
+  PGStmtClose(conn, "nn_pg_del2"c);
+  PGStmtFree(st);
+  if (r == 0) { return _failB(NNPG_E_SQL); }
+  var changed: int64 := PGAffectedRows(r);
+  PGFreeResult(r);
+  if (changed < 1) { return _failB(NNPG_E_NOTFOUND); }
+  return true;
+}
+
+// Name an Stelle idx, alphabetisch sortiert. Rueckgabe 0, wenn idx hinter dem
+// Bestand liegt. Die Zeichenkette gehoert dem Aufrufer (free(ptr, len + 1)).
+pub fn NnPgNameAt(conn: int64, idx: int64): pchar {
+  _nnpg_err := NNPG_OK;
+  if (conn == 0) {
+    _nnpg_err := NNPG_E_ARGS;
+    return 0 as pchar;
+  }
+  if (idx < 0) {
+    _nnpg_err := NNPG_E_ARGS;
+    return 0 as pchar;
+  }
+  var sql: pchar := "SELECT name FROM nn_models ORDER BY name LIMIT 1 OFFSET $1"c;
+  var st: int64 := PGStmtPrepare(conn, "nn_pg_nm"c, sql);
+  if (st == 0) {
+    _nnpg_err := NNPG_E_SQL;
+    return 0 as pchar;
+  }
+  PGBindInt(st, 0, idx);
+  var r: int64 := PGStmtExecute(conn, st);
+  PGStmtClose(conn, "nn_pg_nm"c);
+  PGStmtFree(st);
+  if (r == 0) {
+    _nnpg_err := NNPG_E_SQL;
+    return 0 as pchar;
+  }
+  if (PGNumRows(r) < 1) {
+    PGFreeResult(r);
+    _nnpg_err := NNPG_E_NOTFOUND;
+    return 0 as pchar;
+  }
+  if (PGFetchRow(r) == 0) {
+    PGFreeResult(r);
+    _nnpg_err := NNPG_E_SQL;
+    return 0 as pchar;
+  }
+  var txt: pchar := PGGetStr(r, 0);
+  if (txt == 0 as pchar) {
+    PGFreeResult(r);
+    _nnpg_err := NNPG_E_CORRUPT;
+    return 0 as pchar;
+  }
+  // Eigene Kopie: der Zeiger aus dem Ergebnis stirbt mit PGFreeResult
+  var len: int64 := StrLen(txt);
+  var out: int64 := alloc(len + 1);
+  if (out == 0) {
+    PGFreeResult(r);
+    _nnpg_err := NNPG_E_ARGS;
+    return 0 as pchar;
+  }
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(out + i, peek8((txt as int64) + i));
+    i := i + 1;
+  }
+  poke8(out + len, 0);
+  PGFreeResult(r);
+  return out as pchar;
+}
+
+// ── Angaben ohne Laden ───────────────────────────────────────────────────────
+
+pub fn NnPgInputDim(conn: int64, name: pchar): int64 {
+  return _metaInt(conn, name,
+    "SELECT input_dim FROM nn_models WHERE name = $1"c, "nn_pg_m1"c);
+}
+
+pub fn NnPgOutputDim(conn: int64, name: pchar): int64 {
+  return _metaInt(conn, name,
+    "SELECT output_dim FROM nn_models WHERE name = $1"c, "nn_pg_m2"c);
+}
+
+pub fn NnPgLayerCount(conn: int64, name: pchar): int64 {
+  return _metaInt(conn, name,
+    "SELECT layers FROM nn_models WHERE name = $1"c, "nn_pg_m3"c);
+}
+
+pub fn NnPgParamCount(conn: int64, name: pchar): int64 {
+  return _metaInt(conn, name,
+    "SELECT params FROM nn_models WHERE name = $1"c, "nn_pg_m4"c);
+}
+
+pub fn NnPgByteCount(conn: int64, name: pchar): int64 {
+  return _metaInt(conn, name,
+    "SELECT nbytes FROM nn_models WHERE name = $1"c, "nn_pg_m5"c);
+}
+
+pub fn NnPgChecksum(conn: int64, name: pchar): int64 {
+  return _metaInt(conn, name,
+    "SELECT checksum FROM nn_models WHERE name = $1"c, "nn_pg_m6"c);
+}
+
+pub fn NnPgHasOptState(conn: int64, name: pchar): int64 {
+  return _metaInt(conn, name,
+    "SELECT has_opt_state::int FROM nn_models WHERE name = $1"c, "nn_pg_m7"c);
+}
