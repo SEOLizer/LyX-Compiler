@@ -7856,6 +7856,175 @@ pub type Codegen = class {
     self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                    // mov rax, rdx
   }
 
+  // #2213: Ergebnisablage einer Vektoroperation. Erwartet rcx = Elementzahl,
+  // liefert rdx = Zielzeiger; rax und r8 werden benutzt, rcx/rdi/rsi muss der
+  // Aufrufer selbst sichern (sie gehen durch die Anlage verloren).
+  // Herausgeloest aus dem Binop-Pfad, weil die Negation (#2222) dieselbe
+  // Ablage braucht — eine Stelle, damit die beiden nicht auseinanderlaufen.
+  fn cg_emitSimdZielAblage(simdOpBytes: int64) {
+    var zielOff: int64 := self.simdZielOff;
+    var pNeu: int64 := 0 - 1;
+    var pHaben: int64 := 0 - 1;
+    if (zielOff < 0) {
+      // mov rdx, [rbp+zielOff]
+      if (zielOff >= -128) {
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x55); self.cg_e8(zielOff);
+      } else {
+        self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x95); self.cg_e32(zielOff);
+      }
+      // Beide Spruenge als rel32. Der erste Anlauf nahm Kurzspruenge und
+      // scheiterte laut: `je haben` ueberspringt die ganze Anlage, und
+      // die ist 296 Byte lang (#1915 meldet das, statt still falsch zu
+      // kodieren).
+      self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xD2);               // test rdx, rdx
+      self.cg_e8(0x0F); self.cg_e8(0x84); pNeu := self.codeLen; self.cg_e32(0);   // jz anlegen
+      self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x42); self.cg_e8(0xF8);  // mov r8, [rdx-8]
+      self.cg_e8(0x4C); self.cg_e8(0x39); self.cg_e8(0xC1);               // cmp rcx, r8
+      self.cg_e8(0x0F); self.cg_e8(0x84); pHaben := self.codeLen; self.cg_e32(0); // je haben
+      poke32(self.code + pNeu, self.codeLen - pNeu - 4);
+      pNeu := 0 - 1;
+    }
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC8);  // mov rax, rcx (Elementzahl)
+    // #2199: dieselbe Breite wie die Quellen — sonst waere die
+    // Ergebnisablage halb so gross wie die Rechnung braucht.
+    self.cg_emitSimdBumpAlloc(simdOpBytes);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov rdx, rax (dst ptr)
+    if (pHaben >= 0) {
+      poke32(self.code + pHaben, self.codeLen - pHaben - 4);
+    }
+  }
+
+  // #2222: `-a` auf `parallel Array<f32|f64>` — Vorzeichenbit je Element
+  // kippen. Dieselbe Rechnung wie emitSimdNeg/SIMD_RUMPF_NEG in
+  // backend/lyxos/emit_lyxos.lyx; die beiden muessen uebereinstimmen.
+  // Erwartet rdi = Quelle, rdx = Ziel, rcx = Elementzahl; liefert rax = Ziel.
+  //
+  // Gekippt wird per xorps mit einer Maske, NICHT als `0 - x`: das ergaebe
+  // fuer +0.0 wieder +0.0 statt -0.0, und NaN behielte sein Vorzeichen.
+  // Die Maske entsteht ohne Speicherzugriff: pcmpeqd setzt alle Bits, der
+  // Shift laesst je Lane nur das oberste stehen — fuer f32 `pslld xmm2, 31`
+  // (66 0F 72 F2 1F), fuer f64 `psllq xmm2, 63` (66 0F 73 F2 3F). Anderes
+  // Opcode-Byte UND andere Weite; mit dem f32-Wort waere bei f64 ein
+  // Mantissenbit gekippt worden (#2199).
+  //
+  // Aufbau wie cg_emitSSE2BinOp: 16 Byte je Durchlauf, danach Einzelelemente
+  // (#2184 — sonst liest und schreibt der letzte Block hinter das Ende).
+  // xorps im skalaren Rest trifft mit Lane 0 genau das Element; die oberen
+  // Lanes von xmm0 werden nicht gespeichert.
+  fn cg_emitSSE2Neg(bytes: int64) {
+    var schub: int64 := 2;
+    if (bytes == 8) { schub := 3; }
+    var skPf: int64 := self.cg_sseSkalarPraefix(bytes);
+    // Maske in xmm2
+    self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x76); self.cg_e8(0xD2);  // pcmpeqd xmm2, xmm2
+    if (bytes == 8) {
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x73); self.cg_e8(0xF2); self.cg_e8(0x3F);  // psllq xmm2, 63
+    } else {
+      self.cg_e8(0x66); self.cg_e8(0x0F); self.cg_e8(0x72); self.cg_e8(0xF2); self.cg_e8(0x1F);  // pslld xmm2, 31
+    }
+    self.cg_e8(0x31); self.cg_e8(0xC0);                                      // xor eax, eax
+    self.cg_e8(0x48); self.cg_e8(0xC1); self.cg_e8(0xE1); self.cg_e8(schub); // shl rcx, 2 bzw. 3
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xE9); self.cg_e8(0x10);  // sub rcx, 16
+
+    // ---- Vektorteil: while (rax <= rcx) ----
+    var vecStart: int64 := self.codeLen;
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
+    self.cg_e8(0x7F); var jgPos: int64 := self.codeLen; self.cg_e8(0);       // jg .tail
+    var vecBody: int64 := self.codeLen;
+    self.cg_e8(0x0F); self.cg_e8(0x28); self.cg_e8(0x04); self.cg_e8(0x07);  // movaps xmm0, [rdi+rax]
+    self.cg_e8(0x0F); self.cg_e8(0x57); self.cg_e8(0xC2);                    // xorps xmm0, xmm2
+    self.cg_e8(0x0F); self.cg_e8(0x29); self.cg_e8(0x04); self.cg_e8(0x02);  // movaps [rdx+rax], xmm0
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(0x10);  // add rax, 16
+    self.cg_e8(0xEB); var vecBackPos: int64 := self.codeLen;
+    self.cg_e8(vecStart - (vecBackPos + 1));                                 // jmp .vecStart
+
+    // ---- Rest: Element fuer Element ----
+    var tailStart: int64 := self.codeLen;
+    cg_patchRel8Wert(self.code, jgPos, tailStart - vecBody);
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC1); self.cg_e8(0x10);  // add rcx, 16
+    var scalarStart: int64 := self.codeLen;
+    self.cg_e8(0x48); self.cg_e8(0x39); self.cg_e8(0xC8);                    // cmp rax, rcx
+    self.cg_e8(0x7D); var jgePos: int64 := self.codeLen; self.cg_e8(0);      // jge .done
+    var scalarBody: int64 := self.codeLen;
+    self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x10); self.cg_e8(0x04); self.cg_e8(0x07);  // movss/sd xmm0, [rdi+rax]
+    self.cg_e8(0x0F); self.cg_e8(0x57); self.cg_e8(0xC2);                    // xorps xmm0, xmm2
+    self.cg_e8(skPf); self.cg_e8(0x0F); self.cg_e8(0x11); self.cg_e8(0x04); self.cg_e8(0x02);  // movss/sd [rdx+rax], xmm0
+    self.cg_e8(0x48); self.cg_e8(0x83); self.cg_e8(0xC0); self.cg_e8(bytes); // add rax, 4 bzw. 8
+    self.cg_e8(0xEB); var scalarBackPos: int64 := self.codeLen;
+    self.cg_e8(scalarStart - (scalarBackPos + 1));                           // jmp .scalarStart
+
+    var donePos: int64 := self.codeLen;
+    cg_patchRel8Wert(self.code, jgePos, donePos - scalarBody);
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xD0);                    // mov rax, rdx
+  }
+
+  // #2222: Unaere Operation auf einem Vektor. Vorher lief `-a` in den
+  // skalaren Zweig: er negierte den ZEIGER (btc bzw. neg rax), und der
+  // naechste Zugriff ging an eine Adresse im Kernelbereich — SIGSEGV.
+  //
+  // Umgesetzt ist die Negation eines Vektor-BEZEICHNERS, wie beim Binop-Pfad
+  // (beide Seiten Bezeichner). Alles andere wird laut abgewiesen statt
+  // geraten: ein verschachtelter Vektorausdruck wuerde die Zielablage
+  // (simdZielOff) schon fuer das Zwischenergebnis benutzen.
+  fn cg_genSimdUnop(op: int64, inner: int64) {
+    if (op != CGT_MINUS) {
+      EPrintStrLn("error: dieser unaere Operator ist auf `parallel Array` nicht umgesetzt — nur die Negation `-a` (#2222)."c);
+      exit(1);
+    }
+    var li: int64 := 0 - 1;
+    if (self.cg_nkind(inner) == CGN_IDENT) {
+      li := self.cg_findLocalIdx(self.cg_nsval(inner), self.cg_nslen(inner));
+    }
+    if (li < 0 || peek8(self.localIsSimd + li) == 0) {
+      EPrintStrLn("error: Negation eines Vektorausdrucks ist auf x86-64 nur fuer einen Namen umgesetzt (`-a`, #2222)."c);
+      EPrintStrLn("  Das Zwischenergebnis erst einer Variablen zuweisen: `let t: parallel Array<f64> = a + b; let n: parallel Array<f64> = -t;`"c);
+      exit(1);
+    }
+    var bytes: int64 := self.cg_simdBytesOf(li);
+    var off: int64 := self.cg_findLocal(self.cg_nsval(inner), self.cg_nslen(inner));
+    if (off >= -128 && off <= -1) {
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x45); self.cg_e8(off);     // mov rax, [rbp+off8]
+    } else {
+      self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x85); self.cg_e32(off);    // mov rax, [rbp+off32]
+    }
+    self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC7);                         // mov rdi, rax
+    self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x4F); self.cg_e8(0xF8);       // mov rcx, [rdi-8]
+    self.cg_e8(0x51);                                                             // push rcx
+    self.cg_e8(0x57);                                                             // push rdi
+    self.cg_emitSimdZielAblage(bytes);                                            // rdx = Ziel
+    self.cg_e8(0x5F);                                                             // pop rdi
+    self.cg_e8(0x59);                                                             // pop rcx
+    self.cg_emitSSE2Neg(bytes);                                                   // rax = Ziel
+  }
+
+  // #2222: Rechnet dieser Binop mit einem Vektor, den der x86-Pfad NICHT
+  // vektorisiert? Umgesetzt sind + - * / auf zwei Vektor-BEZEICHNERN (der
+  // Zweig unten mit cg_emitSSE2BinOp). Alles andere — Skalar mit Vektor
+  // (`0.0 - a`, `a * 2.0`), ein verschachtelter Vektorausdruck, eine
+  // Bit-Operation — lief bisher in den skalaren Zweig und rechnete auf dem
+  // ZEIGER; der naechste Zugriff stuerzte ab (SIGSEGV) oder las still
+  // fremden Speicher. Gemischte Formen weist schon sema ab
+  // (_checkVektorBinop); diese Stelle faengt, was sema durchlaesst, laut ab.
+  // Vergleiche sind ausgenommen: sie liefern keinen Vektor.
+  fn cg_vektorBinopOhneWeg(op: int64, lhsNi: int64, rhsNi: int64): int64 {
+    var rechnend: int64 := 0;
+    if (op == CGT_PLUS || op == CGT_MINUS || op == CGT_STAR || op == CGT_SLASH || op == CGT_PERCENT) { rechnend := 1; }
+    if (op == CGT_BITAND || op == CGT_BITOR || op == 89 || op == CGT_SHL || op == CGT_SHR) { rechnend := 1; }   // 89 = ^
+    if (rechnend == 0) { return 0; }
+    var lv: int64 := self.cg_istSimdAusdruck(lhsNi);
+    var rv: int64 := self.cg_istSimdAusdruck(rhsNi);
+    if (lv == 0 && rv == 0) { return 0; }
+    if ((op == CGT_PLUS || op == CGT_MINUS || op == CGT_STAR || op == CGT_SLASH) &&
+        self.cg_nkind(lhsNi) == CGN_IDENT && self.cg_nkind(rhsNi) == CGN_IDENT && lv != 0 && rv != 0) {
+      return 0;
+    }
+    EPrintStrLn("error: diese Rechnung mit `parallel Array` ist auf x86-64 nicht umgesetzt (#2222)."c);
+    EPrintStrLn("  Umgesetzt: + - * / auf zwei Vektor-Variablen gleicher Elementart, und die Negation `-a`."c);
+    EPrintStrLn("  Ein Zwischenergebnis erst einer Variablen zuweisen; Skalar und Vektor nicht mischen."c);
+    exit(1);
+    return 1;
+  }
+
   fn cg_emitSSE2BinOp(op: int64, bytes: int64) {
     // #2199: Bytezahl = Elementzahl * Elementbreite; der 16-Byte-Block fasst
     // vier f32 oder zwei f64. Die packed-Form waehlt das Praefix (kein
@@ -12992,6 +13161,9 @@ pub type Codegen = class {
         self.cg_movRaxImm(1);
         poke32(self.code + scoEnd, self.codeLen - scoEnd - 4);
 
+      } else if (self.cg_vektorBinopOhneWeg(op, lhsNi, rhsNi) != 0) {
+        // #2222: meldet und beendet selbst; hier kommt nichts an.
+
       } else if (self.cg_utypeBinopConvNeeded(ni) != 0) {
         // #1956: zwei Einheiten derselben Dimension mit verschiedenem Faktor.
         // Die rechte Seite wird auf die Einheit der linken gebracht, DANN
@@ -13124,36 +13296,7 @@ pub type Codegen = class {
           // Dass Ziel und Quelle dasselbe Feld sein koennen (`a := a + b`),
           // ist unkritisch — gerechnet wird elementweise aufsteigend, Lese-
           // und Schreibstelle sind in jedem Schritt dieselben Indizes.
-          var zielOff: int64 := self.simdZielOff;
-          var pNeu: int64 := 0 - 1;
-          var pHaben: int64 := 0 - 1;
-          if (zielOff < 0) {
-            // mov rdx, [rbp+zielOff]
-            if (zielOff >= -128) {
-              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x55); self.cg_e8(zielOff);
-            } else {
-              self.cg_e8(0x48); self.cg_e8(0x8B); self.cg_e8(0x95); self.cg_e32(zielOff);
-            }
-            // Beide Spruenge als rel32. Der erste Anlauf nahm Kurzspruenge und
-            // scheiterte laut: `je haben` ueberspringt die ganze Anlage, und
-            // die ist 296 Byte lang (#1915 meldet das, statt still falsch zu
-            // kodieren).
-            self.cg_e8(0x48); self.cg_e8(0x85); self.cg_e8(0xD2);               // test rdx, rdx
-            self.cg_e8(0x0F); self.cg_e8(0x84); pNeu := self.codeLen; self.cg_e32(0);   // jz anlegen
-            self.cg_e8(0x4C); self.cg_e8(0x8B); self.cg_e8(0x42); self.cg_e8(0xF8);  // mov r8, [rdx-8]
-            self.cg_e8(0x4C); self.cg_e8(0x39); self.cg_e8(0xC1);               // cmp rcx, r8
-            self.cg_e8(0x0F); self.cg_e8(0x84); pHaben := self.codeLen; self.cg_e32(0); // je haben
-            poke32(self.code + pNeu, self.codeLen - pNeu - 4);
-            pNeu := 0 - 1;
-          }
-          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC8);  // mov rax, rcx (Elementzahl)
-          // #2199: dieselbe Breite wie die Quellen — sonst waere die
-          // Ergebnisablage halb so gross wie die Rechnung braucht.
-          self.cg_emitSimdBumpAlloc(simdOpBytes);
-          self.cg_e8(0x48); self.cg_e8(0x89); self.cg_e8(0xC2);  // mov rdx, rax (dst ptr)
-          if (pHaben >= 0) {
-            poke32(self.code + pHaben, self.codeLen - pHaben - 4);
-          }
+          self.cg_emitSimdZielAblage(simdOpBytes);   // #2213, #2222
           // restore: rsi=rhs ptr, rdi=lhs ptr, rcx=count
           self.cg_e8(0x5E);  // pop rsi
           self.cg_e8(0x5F);  // pop rdi
@@ -13249,6 +13392,8 @@ pub type Codegen = class {
         }
       } else if (self.cg_tryFold(ni) != 0) {
         self.cg_movRaxImm(self.foldBuf);
+      } else if (self.cg_istSimdAusdruck(self.cg_nc0(ni)) != 0) {
+        self.cg_genSimdUnop(op, self.cg_nc0(ni));   // #2222
       } else {
       self.cg_genExpr(self.cg_nc0(ni));
       if (op == CGT_MINUS) {

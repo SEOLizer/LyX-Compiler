@@ -4017,6 +4017,83 @@ pub type Sema = class {
     return TY_UNKNOWN;
   }
 
+  // #2222: Ist der Ausdruck ein `parallel Array`? Erkannt wird die Anlage,
+  // ein Name bzw. Aufruf dieses Typs und eine Rechnung, an der einer haengt.
+  fn _istVektor(ni: int64): int64 {
+    if (ni < 0) { return 0; }
+    var k: int64 := self.sn_kind(ni);
+    if (k == SNK_SIMD_NEW) { return 1; }
+    if (k == SNK_BINOP) {
+      var op: int64 := self.sn_iVal(ni);
+      if (self._istRechenOp(op) == 0) { return 0; }
+      if (self._istVektor(self.sn_c0(ni)) != 0) { return 1; }
+      return self._istVektor(self.sn_c1(ni));
+    }
+    if (k == SNK_UNOP) {
+      if (self.sn_iVal(ni) != 71) { return 0; }
+      return self._istVektor(self.sn_c0(ni));
+    }
+    if (self._inferExprType(ni) == TY_PARALLEL_ARRAY) { return 1; }
+    return 0;
+  }
+
+  // + - * / % und die Bit-Operationen ^ & | << >> — alles, was aus zwei
+  // Operanden einen Wert DERSELBEN Art macht. Vergleiche gehoeren nicht dazu.
+  fn _istRechenOp(op: int64): int64 {
+    if (op == 70 || op == 71 || op == 72 || op == 73 || op == 74) { return 1; }
+    if (op == 89 || op == 90 || op == 91 || op == 93 || op == 94) { return 1; }
+    return 0;
+  }
+
+  // #2222: Skalar und Vektor in einer Rechnung (`0.0 - a`, `0 - a`,
+  // `a * 2.0`). Kein Backend setzt das um: ir_lower vektorisiert nur, wenn
+  // BEIDE Seiten Vektoren sind, x86 nur zwei Vektor-Namen. Alles andere
+  // rechnete skalar auf dem ZEIGER der Ablage — auf x86 SIGSEGV beim
+  // naechsten Zugriff, auf arm64 still der alte Wert (`0.0 - a` lieferte a).
+  // Die Negation hat ihre eigene Form: `-a`.
+  //
+  // Abgewiesen wird nur, wenn die andere Seite SICHER ein Skalar ist (Zahl
+  // oder Wahrheitswert); ist ihr Typ unbestimmt, bleibt es beim Urteil des
+  // Backends (fail-open wie _checkBinopTypes).
+  //
+  // Zweitens: beide Seiten muessen NAMEN sein. Sowohl x86 (codegen_x86) als
+  // auch ir_lower (_isSimdExpr) erkennen einen Vektor nur am Bezeichner; ein
+  // verschachtelter Ausdruck wie `(a + b) * c` oder `-(a + b)` lief ebenso
+  // skalar auf dem Zeiger (arm64: SIGSEGV). Bis das umgesetzt ist, wird das
+  // Zwischenergebnis einer Variablen zugewiesen.
+  fn _checkVektorBinop(ni: int64): void {
+    if (self._istRechenOp(self.sn_iVal(ni)) == 0) { return; }
+    var lv: int64 := self._istVektor(self.sn_c0(ni));
+    var rv: int64 := self._istVektor(self.sn_c1(ni));
+    if (lv != 0 && rv != 0) {
+      if (self.sn_kind(self.sn_c0(ni)) != SNK_IDENT || self.sn_kind(self.sn_c1(ni)) != SNK_IDENT) {
+        self._errorNode("Vektorrechnung nur zwischen zwei Variablen umgesetzt — Zwischenergebnis erst einer `parallel Array`-Variablen zuweisen (#2222)", ni);
+      }
+      return;
+    }
+    if (lv == rv) { return; }
+    var skalar: int64 := self.sn_c0(ni);
+    if (lv != 0) { skalar := self.sn_c1(ni); }
+    var kl: int64 := self._typeClass(self._inferExprType(skalar));
+    if (kl != 1 && kl != 3) { return; }
+    self._errorNode("Rechnung aus Skalar und parallel Array ist nicht umgesetzt — beide Seiten muessen Vektoren sein; Negation als `-a` (#2222)", ni);
+  }
+
+  // #2222: Unaere Operation auf einem `parallel Array`. Umgesetzt ist nur die
+  // Negation eines Namens (`-a`, IRO_SIMD_NEG bzw. cg_emitSSE2Neg); `!a`,
+  // `~a` und `-(a + b)` rechneten skalar auf dem Zeiger.
+  fn _checkVektorUnop(ni: int64): void {
+    var inner: int64 := self.sn_c0(ni);
+    if (self._istVektor(inner) == 0) { return; }
+    if (self.sn_iVal(ni) != 71) {
+      self._errorNode("auf `parallel Array` ist als unaerer Operator nur die Negation `-a` umgesetzt (#2222)", ni);
+      return;
+    }
+    if (self.sn_kind(inner) != SNK_IDENT) {
+      self._errorNode("Negation eines Vektorausdrucks nur fuer eine Variable umgesetzt — Zwischenergebnis erst zuweisen, dann `-t` (#2222)", ni);
+    }
+  }
+
   fn _checkBinopTypes(ni: int64): void {
     var bop: int64 := self.sn_iVal(ni);
     var arith: int64 := 0;
@@ -5545,9 +5622,11 @@ pub type Sema = class {
       self._checkUtypeBinop(ni);   // #1110
       self._checkEnumBinop(ni);    // #1967
       self._checkBinopTypes(ni);   // #1143
+      self._checkVektorBinop(ni);  // #2222
 
     } else if (k == SNK_UNOP) {
       self._checkExpr(self.sn_c0(ni));
+      self._checkVektorUnop(ni);   // #2222
 
     } else if (k == SNK_INDEX) {
       self._checkExpr(self.sn_c0(ni));
