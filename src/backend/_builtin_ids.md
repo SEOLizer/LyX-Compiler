@@ -37,8 +37,8 @@ gegen genau diese Liste, ein nicht eingetragener Aufrufer gilt als Kollision.
 | 12 | Formatierte Ausgabe | `Printf` | war bis 1.0.11C fälschlich 10 |
 | 13 | `write(2, ptr, strlen(ptr))` | `EPrintStr`, `EPrintStrLn`, `EPrint`, `panic` | #1388; Länge rechnet das Backend selbst |
 | 14 | Zeilenumbruch nach stderr | `EPrintStrLn`, `EPrintLn`, `panic` | #1388 |
-| 15 | Länge einer Zeichenkette | `StrLen`, `StrLength` | #1388 |
-| 16 | Ganzzahl als Dezimaltext, Zeiger zurück | `IntToStr`, `StrFromInt` | #1720; der Puffer stammt aus mmap, nicht vom Stapel — er muss den Aufruf überleben |
+| 15 | Länge einer Zeichenkette | `StrLen`, `StrLength`, `EPrintInt` | #1388; EPrintInt nutzt sie seit #2266 ausserhalb von lyxos (IntToStr + StrLen + write(2, …)) |
+| 16 | Ganzzahl als Dezimaltext, Zeiger zurück | `IntToStr`, `StrFromInt`, `EPrintInt` | #1720; der Puffer stammt seit #2227 aus dem Bump-Block, nicht vom Stapel — er muss den Aufruf überleben; EPrintInt siehe 15 |
 | 17 | Anzahl der Programmargumente | `GetArgC` | #1720; lyxos: Startrumpf legt argc/argv ab (#1754); arm64/riscv: argv in x28/s10, GetArgC zählt bis NULL (#2110) |
 | 18 | Zeiger auf den Argumentvektor | `GetArgV`, `GetArg` | #1720; `GetArg(i)` ist ID 18 plus ein Lesezugriff, keine eigene ID |
 | 19 | Zeiger auf den Umgebungsblock | `GetEnvBlock` | #1720; auf lyxos und Linux 0 — nur die win64-Laufzeit setzt ihn (#1677) |
