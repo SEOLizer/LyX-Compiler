@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.20E
+VERSION   := 1.2.20F
 VERSION_DATE := 2026-10-24
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -497,6 +497,8 @@ test: lyxc
 	@bash tests/profile_argumente_2180_test.sh
 	@echo "--- keine Spruenge ueber 32-Byte-Grenzen (#2244) ---"
 	@bash tests/sprung_ausrichtung_2244_test.sh
+	@echo "--- Vektordaten auf 64 Byte, Vektorschleifen unten geprueft (#2215) ---"
+	@bash tests/vektor_ausrichtung_2215_test.sh
 	@echo "--- GLX-/EGL-Wrapper (4 tests) ---"
 	@bash tests/glx_egl_wrappers_test.sh
 	@echo "OK"
