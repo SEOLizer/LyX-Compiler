@@ -845,6 +845,8 @@ test: lyxc
 	@bash tests/db_sqlite_real_test.sh
 	@echo "--- std.nn_store: Netze in SQLite (17 Pruefungen) ---"
 	@bash tests/nn_store_test.sh
+	@echo "--- examples/ml/nn_auto_mpg.lyx: Probetraining von vorn bis hinten (12 Pruefungen) ---"
+	@bash tests/nn_beispiel_test.sh
 	@bash tests/pg_live_test.sh
 	@echo "OK"
 	@echo "--- std.matrix: Mat3/Mat4/Vec3/Vec4 und ihre Fehlerfaelle (9 Gruppen) ---"
