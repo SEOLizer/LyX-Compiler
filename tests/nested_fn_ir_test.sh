@@ -34,7 +34,7 @@ QEMU_ARM=""; QEMU_RV=""
 lauf() {
   local ziel="$1" src="$2" out="$3"
   local bin="$TMP/b_${ziel}_$(basename "$src" .lyx)"
-  ( cd "$ROOT" && timeout 240 "$LYXC" --target="$ziel" "$src" -o "$bin" ) >"$TMP/build_$ziel.log" 2>&1 || return 1
+  ( cd "$ROOT" && timeout 240 "$LYXC" --std-path="$ROOT" --target="$ziel" "$src" -o "$bin" ) >"$TMP/build_$ziel.log" 2>&1 || return 1
   case "$ziel" in
     x86_64) timeout 60 "$bin" >"$out" 2>&1 ;;
     arm64)  [ -n "$QEMU_ARM" ] || return 2; timeout 60 $QEMU_ARM "$bin" >"$out" 2>&1 ;;
@@ -155,7 +155,7 @@ fn main(): int64 { return aussen(1); }
 EOF
   fi
   for ziel in x86_64 arm64; do
-    if ( cd "$ROOT" && timeout 240 "$LYXC" --target="$ziel" "$TMP/sperre.lyx" -o "$TMP/sp" ) >"$TMP/sp.log" 2>&1; then
+    if ( cd "$ROOT" && timeout 240 "$LYXC" --std-path="$ROOT" --target="$ziel" "$TMP/sperre.lyx" -o "$TMP/sp" ) >"$TMP/sp.log" 2>&1; then
       nok "Zugriff auf die Umgebung ($was) ging fuer $ziel durch — das Hochziehen ist damit still falsch"
     elif grep -q "verschachtelte Funktion darf keine lokale Variable" "$TMP/sp.log"; then
       ok "Zugriff auf die Umgebung ($was) wird fuer $ziel abgewiesen"
@@ -178,7 +178,7 @@ fn fremd(): int64 { return innen(); }
 fn main(): int64 { return fremd(); }
 EOF
 for ziel in x86_64 arm64; do
-  if ( cd "$ROOT" && timeout 240 "$LYXC" --target="$ziel" "$TMP/aussen.lyx" -o "$TMP/au" ) >"$TMP/au.log" 2>&1; then
+  if ( cd "$ROOT" && timeout 240 "$LYXC" --std-path="$ROOT" --target="$ziel" "$TMP/aussen.lyx" -o "$TMP/au" ) >"$TMP/au.log" 2>&1; then
     nok "$ziel: eine innere Funktion ist von aussen aufrufbar geworden"
   elif grep -q "undefined function" "$TMP/au.log"; then
     ok "$ziel: der Aufruf von aussen bleibt abgewiesen"
@@ -195,7 +195,7 @@ echo "--- #2020: die betroffenen stdlib-Units uebersetzen fuer arm64 ---"
 # obwohl sie selbst keine verschachtelte Funktion enthalten.
 for u in std/cloud/aws/sigv4.lyx std/hardware/bluetooth_ext.lyx \
          std/hardware/bluetooth_gatts.lyx std/cloud/s3.lyx std/cloud/dynamodb.lyx; do
-  if ( cd "$ROOT" && timeout 420 "$LYXC" --compile-unit --target=arm64 "$u" -o /dev/null ) >"$TMP/u.log" 2>&1; then
+  if ( cd "$ROOT" && timeout 420 "$LYXC" --std-path="$ROOT" --compile-unit --target=arm64 "$u" -o /dev/null ) >"$TMP/u.log" 2>&1; then
     ok "$(basename "$u") uebersetzt fuer arm64"
   else
     nok "$(basename "$u") fuer arm64: $(grep -m1 -E '^lyxc:|error' "$TMP/u.log")"

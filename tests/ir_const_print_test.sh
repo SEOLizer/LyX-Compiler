@@ -35,7 +35,7 @@ lauf() {
   local src="$2"
   local out="$3"
   local bin="$TMP/b_$ziel"
-  ( cd "$ROOT" && timeout 180 "$LYXC" --target="$ziel" "$src" -o "$bin" ) >"$TMP/build_$ziel.log" 2>&1 || return 1
+  ( cd "$ROOT" && timeout 180 "$LYXC" --std-path="$ROOT" --target="$ziel" "$src" -o "$bin" ) >"$TMP/build_$ziel.log" 2>&1 || return 1
   case "$ziel" in
     x86_64) timeout 60 "$bin" >"$out" 2>&1 ;;
     arm64)  [ -n "$QEMU_ARM" ] || return 2; timeout 60 $QEMU_ARM "$bin" >"$out" 2>&1 ;;
@@ -109,7 +109,7 @@ unit u;
 pub var Y: int64 := 5;
 pub con X: int64 := Y;
 EOF
-if ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --target=arm64 "$TMP/unfaltbar.lyx" -o /dev/null ) >"$TMP/uf.log" 2>&1; then
+if ( cd "$ROOT" && timeout 120 "$LYXC" --std-path="$ROOT" --compile-unit --target=arm64 "$TMP/unfaltbar.lyx" -o /dev/null ) >"$TMP/uf.log" 2>&1; then
   nok "eine nicht ausrechenbare Konstante ging durch — die Pruefung ist weg statt erweitert"
 else
   # #2102: seit 1.2.13G meldet sich schon der strenge Konstantendurchlauf
@@ -133,7 +133,7 @@ for expr in 'ip' 'ip & 0xFF' 'ip >> 24' '(ip >> 24) & 0xFF' 'ip + 1 + 2' \
             '(ip + 1) & 1' 'ip & 1 & 2' '(ip >> 2) >> 3' 'ip * (ip + 1)' \
             '((ip >> 8) & 0xFF) + 1'; do
   printf 'unit t;\nimport std.io;\npub fn zeig(ip: int64) { Print(%s); }\n' "$expr" > "$TMP/t.lyx"
-  if ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --target=arm64 "$TMP/t.lyx" -o /dev/null ) >"$TMP/t.log" 2>&1; then
+  if ( cd "$ROOT" && timeout 120 "$LYXC" --std-path="$ROOT" --compile-unit --target=arm64 "$TMP/t.lyx" -o /dev/null ) >"$TMP/t.log" 2>&1; then
     ok "Print($expr)"
   else
     nok "Print($expr) — $(grep -m1 -E 'kann den Typ|error' "$TMP/t.log")"
@@ -178,7 +178,7 @@ unit f;
 import std.io;
 pub fn zeig(x: f64) { Print((x * 2.0) + 1.0); }
 EOF
-if ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --target=arm64 "$TMP/f64.lyx" -o /dev/null ) >"$TMP/f64.log" 2>&1; then
+if ( cd "$ROOT" && timeout 120 "$LYXC" --std-path="$ROOT" --compile-unit --target=arm64 "$TMP/f64.lyx" -o /dev/null ) >"$TMP/f64.log" 2>&1; then
   nok "ein f64-Ausdruck ging als Ganzzahl durch — die Rekursion raet"
 else
   ok "f64 in verschachteltem Ausdruck wird weiterhin abgewiesen"
@@ -258,7 +258,7 @@ fi
 # das Prozessende sein. Ohne diese Haelfte waere der Test auch von einer
 # Fassung erfuellt, die exit kaputtgemacht hat.
 printf 'unit main;\nimport std.io;\nfn main(): int64 { PrintLn("vorher"); panic("weg"); return 0; }\n' > "$TMP/pa.lyx"
-( cd "$ROOT" && timeout 180 "$LYXC" --target=riscv "$TMP/pa.lyx" -o "$TMP/pa.rv" ) >/dev/null 2>&1
+( cd "$ROOT" && timeout 180 "$LYXC" --std-path="$ROOT" --target=riscv "$TMP/pa.lyx" -o "$TMP/pa.rv" ) >/dev/null 2>&1
 pao="$(timeout 60 "$QEMU_RISCV64" "$TMP/pa.rv" 2>&1)"; parc=$?
 if [ "$parc" = "1" ] && printf '%s' "$pao" | grep -q "vorher"; then
   ok "riscv: panic beendet weiterhin mit 1, die Ausgabe davor kommt an"
@@ -343,7 +343,7 @@ fi
 # durchgehen. Der neue NK_CAST-Zweig liest den Zieltyp — er darf daraus nicht
 # "alles, was ich nicht als pchar erkenne, ist eine Zahl" machen.
 printf 'unit fc;\nimport std.io;\npub fn f(x: int64) { Print(x as f64); }\n' > "$TMP/fc.lyx"
-if ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --target=arm64 "$TMP/fc.lyx" -o /dev/null ) >"$TMP/fc.log" 2>&1; then
+if ( cd "$ROOT" && timeout 120 "$LYXC" --std-path="$ROOT" --compile-unit --target=arm64 "$TMP/fc.lyx" -o /dev/null ) >"$TMP/fc.log" 2>&1; then
   nok "Print(x as f64) ging als Ganzzahl durch — der Cast-Zweig raet"
 else
   ok "Cast auf f64 wird weiterhin abgewiesen"

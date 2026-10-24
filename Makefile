@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.20C
+VERSION   := 1.2.20D
 VERSION_DATE := 2026-10-24
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -488,9 +488,13 @@ test: lyxc
 	@/tmp/lyxc_process_test > /dev/null
 	@rm -f /tmp/lyxc_process_test
 	@echo "OK"
-	@echo "--- FFI-Trust-Grenze von --compile-unit (5 tests) ---"
+	@echo "--- FFI-Trust-Grenze von --compile-unit (7 tests) ---"
 	@bash tests/ffi_unit_trust_test.sh
 	@echo "OK"
+	@echo "--- FFI-Vertrauen beim Import nach Herkunft (#2202) ---"
+	@bash tests/ffi_herkunft_2202_test.sh
+	@echo "--- --profile laesst Argumentregister in Ruhe (#2180) ---"
+	@bash tests/profile_argumente_2180_test.sh
 	@echo "--- GLX-/EGL-Wrapper (4 tests) ---"
 	@bash tests/glx_egl_wrappers_test.sh
 	@echo "OK"
@@ -1169,12 +1173,12 @@ install-bin: lyxc
 $(UNITS_DST)/%.lyu: std/%.lyx lyxc
 	@mkdir -p $(dir $@)
 	@echo "  precompile $<"
-	./lyxc --compile-unit $< -o $@
+	./lyxc --std-path=. --compile-unit $< -o $@
 
 $(DATA_DST)/%.lyu: data/%.lyx lyxc
 	@mkdir -p $(dir $@)
 	@echo "  precompile $<"
-	./lyxc --compile-unit $< -o $@
+	./lyxc --std-path=. --compile-unit $< -o $@
 
 # ── Keygen (nicht für Endkunden — nur intern verwenden) ──────────────────────
 

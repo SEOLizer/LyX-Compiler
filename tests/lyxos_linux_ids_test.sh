@@ -33,7 +33,7 @@ lauf() {
   local src="$2"
   local out="$3"
   local bin="$TMP/b_$ziel"
-  ( cd "$ROOT" && timeout 180 "$LYXC" --target="$ziel" "$src" -o "$bin" ) >"$TMP/build_$ziel.log" 2>&1 || return 1
+  ( cd "$ROOT" && timeout 180 "$LYXC" --std-path="$ROOT" --target="$ziel" "$src" -o "$bin" ) >"$TMP/build_$ziel.log" 2>&1 || return 1
   case "$ziel" in
     x86_64) timeout 60 "$bin" >"$out" 2>&1 ;;
     arm64)  [ -n "$QEMU_ARM" ] || return 2; timeout 60 $QEMU_ARM "$bin" >"$out" 2>&1 ;;
@@ -91,7 +91,7 @@ EOF
 echo x > "$TMP/marke.txt"
 for ziel in x86_64 arm64 riscv; do
   bin="$TMP/rel_$ziel"
-  if ( cd "$ROOT" && timeout 180 "$LYXC" --target="$ziel" "$TMP/rel.lyx" -o "$bin" ) >"$TMP/rel.log" 2>&1; then
+  if ( cd "$ROOT" && timeout 180 "$LYXC" --std-path="$ROOT" --target="$ziel" "$TMP/rel.lyx" -o "$bin" ) >"$TMP/rel.log" 2>&1; then
     case "$ziel" in
       x86_64) aus="$( cd "$TMP" && timeout 60 "$bin" 2>&1 )" ;;
       arm64)  [ -n "$QEMU_ARM" ] && aus="$( cd "$TMP" && timeout 60 $QEMU_ARM "$bin" 2>&1 )" || aus="KEINQEMU" ;;
@@ -131,7 +131,7 @@ fi
 
 # Und die Linux-Form mit sechs Argumenten muss fuer arm64 GEHEN — das ist die
 # andere Haelfte derselben Frage.
-if ( cd "$ROOT" && timeout 180 "$LYXC" --target=arm64 "$TMP/s6.lyx" -o "$TMP/s6.arm" ) >"$TMP/s6a.log" 2>&1; then
+if ( cd "$ROOT" && timeout 180 "$LYXC" --std-path="$ROOT" --target=arm64 "$TMP/s6.lyx" -o "$TMP/s6.arm" ) >"$TMP/s6a.log" 2>&1; then
   ok "arm64 uebersetzt sendto mit sechs Argumenten (Linux-Form)"
 else
   nok "arm64 lehnt die Linux-Form ab: $(grep -m1 -E 'error|erwartet' "$TMP/s6a.log")"
@@ -148,7 +148,7 @@ cat > "$TMP/udp.lyx" <<'EOF'
 unit main;
 fn main(): int64 { return sys_udp_close(0); }
 EOF
-if ( cd "$ROOT" && timeout 120 "$LYXC" --target=arm64 "$TMP/udp.lyx" -o "$TMP/udp.bin" ) >"$TMP/udp.log" 2>&1; then
+if ( cd "$ROOT" && timeout 120 "$LYXC" --std-path="$ROOT" --target=arm64 "$TMP/udp.lyx" -o "$TMP/udp.bin" ) >"$TMP/udp.log" 2>&1; then
   nok "sys_udp_close uebersetzte fuer arm64 — gibt es die Abbildung jetzt? Dann diesen Test auf die WIRKUNG umstellen"
 else
   if grep -q "gibt es auf diesem Ziel nicht" "$TMP/udp.log"; then
@@ -165,7 +165,7 @@ echo "--- #2024: betroffene stdlib-Units uebersetzen ---"
 # std/security_ext.lyx ist NICHT dabei: es haengt an sys_arch_prctl, das es in
 # der generischen ABI nicht gibt und das deshalb benannt abgewiesen wird.
 for u in std/sched.lyx std/net/dns.lyx std/hardware/bluetooth_gattc.lyx; do
-  if ( cd "$ROOT" && timeout 120 "$LYXC" --compile-unit --target=arm64 "$u" -o /dev/null ) >"$TMP/u2.log" 2>&1; then
+  if ( cd "$ROOT" && timeout 120 "$LYXC" --std-path="$ROOT" --compile-unit --target=arm64 "$u" -o /dev/null ) >"$TMP/u2.log" 2>&1; then
     ok "$(basename "$u") uebersetzt fuer arm64"
   else
     nok "$(basename "$u") fuer arm64: $(grep -m1 -E 'error|unbekannt|erwartet' "$TMP/u2.log")"

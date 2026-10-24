@@ -51,7 +51,7 @@ else no "Kopien sind inhaltsgleich mit den Quellen" "$diffs abweichend — 'make
 bad=0
 for u in std/alloc.lyx std/io.lyx std/os.lyx std/time.lyx std/fs.lyx std/log.lyx std/qt5_core.lyx std/env.lyx; do
   if [ ! -f "$PKG/$u" ]; then echo "    fehlt: $u"; bad=$((bad+1)); continue; fi
-  msg="$(cd "$PKG" && timeout 60 "$LYXC" --compile-unit "$u" -o /tmp/lyx_pkgsync.lyu -I . 2>&1 | grep -iE "(parse error|sema error|codegen error)" | head -1)"
+  msg="$(cd "$PKG" && timeout 60 "$LYXC" --std-path=. --compile-unit "$u" -o /tmp/lyx_pkgsync.lyu -I . 2>&1 | grep -iE "(parse error|sema error|codegen error)" | head -1)"
   if [ -n "$msg" ]; then echo "    $u: $msg"; bad=$((bad+1)); fi
 done
 rm -f /tmp/lyx_pkgsync.lyu

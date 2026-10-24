@@ -245,6 +245,8 @@ fn criticalCounter(): int64 {
 
 These annotations are part of the Lyx Capability-Based Security (LCBS) system. See `doc/capabilities.md` for the full reference.
 
+An `extern fn` whose symbol the compiler cannot classify needs a capability annotation (FFI sandbox, fail-closed). The standard library is exempt as the binding layer — but only units that were actually read from the authoritative library tree: `--std-path` / `LYX_STD_PATH` if set, otherwise the installation (`/usr/include/lyx/units`). The unit name alone (`std.*`, `src.*`) or a directory called `std/` next to the program does not grant this trust (since 1.2.20D, #2202). When compiling from a checkout of the library itself, name it: `--std-path=.`.
+
 ```lyx
 @capabilities([fs.read, net.connect])
 fn fetchConfig(path: pchar): void { ... }
@@ -303,7 +305,7 @@ fn hotLoop(data: pchar, len: int64): void { ... }
 |--------|-------------|
 | `-o <file>` | Output file (default: a.out / a.exe) |
 | `-I <path>` | Add include path for modules (repeatable) |
-| `--std-path=PATH` | Override standard library path |
+| `--std-path=PATH` | Override standard library path; also the tree whose units count as the trusted FFI binding layer (#2202) |
 | `--target=TARGET` | Target platform (linux, win64, arm64, macosx64, macos-arm64, esp32, riscv) |
 | `--arch=ARCH` | Architecture (x86_64, arm64, xtensa, riscv) |
 | `--target-energy=<1-5>` | Energy level (1=minimal, 5=extreme); sets only the x86-64 loop unroll factor 1/2/4/4/8, see `@energy(N)` |

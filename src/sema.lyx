@@ -7,6 +7,7 @@
 
 import src.parser;
 import src.paket_pfade;   // Paketwurzeln aus *.lpf
+import src.herkunft;      // #2202: FFI-Vertrauen nach Herkunft
 import src.std.alloc;
 import src.wildcard_import;   // #1384
 import src.std.io;
@@ -564,6 +565,8 @@ pub type Sema = class {
   // WP-35: actual byte count of the last file read by _sema_readFile (binary-safe, no StrLen)
   lastReadSize: int64;
   lastReadPath: int64;   // #1098: welcher Pfad tatsaechlich geoeffnet wurde
+  lastReadVertraut: int64;   // #2202: lag die zuletzt gelesene Datei im massgeblichen Baum?
+  ffiHerkunftFremd: int64;   // #2202: Unit heisst std./src., kommt aber nicht aus dem Baum
   traceImports: int64;   // #1098: --trace-imports
 
   // WP-KM-01: --target=lyxos-kernel: 1 = reject POSIX-dependent imports
@@ -2012,6 +2015,9 @@ pub type Sema = class {
       }
       if (fd < 0) { return 0 as pchar; }
     }
+    // #2202: Herkunft festhalten, solange der Deskriptor offen ist — der
+    // kanonische Pfad kommt aus /proc/self/fd, nicht aus dem Suchweg.
+    self.lastReadVertraut := HerkunftImBaum(fd, self.stdPath as pchar);
     var size: int64 := lseek(fd, 0, 2);
     if (size <= 0) { close(fd); return 0 as pchar; }
     // WP-31: Dateigrößen-Limit 256 MB — verhindert OOM durch präparierte .lyu/.lyx-Eingaben
@@ -2421,6 +2427,8 @@ pub type Sema = class {
 
     var path: pchar := pathBuf as pchar;
     var src: pchar  := self._sema_readFile(path);
+    // #2202: sofort sichern — verschachtelte Imports lesen weitere Dateien.
+    var impVertraut: int64 := self.lastReadVertraut;
     // #1098: `--trace-imports` setzte bislang nur ein Feld; die beiden
     // Ausgabehelfer in lyxc.lyx wurden nie gerufen, der Schalter war stumm.
     // Interessant ist ohnehin nicht der Beginn der Aufloesung, sondern
@@ -2501,6 +2509,7 @@ pub type Sema = class {
       }
       if (lyuSrc == 0 as pchar) { lyuSrc := self._sema_readFile(lyuPath); }
       if (lyuSrc != 0 as pchar) {
+        impVertraut := self.lastReadVertraut;   // #2202: Herkunft der .lyu
         // WP-35: use actual file size (not StrLen) — .lyu is binary and contains null bytes
         if (self.traceImports != 0) {
           EPrintStr("[import] "c);
@@ -2819,16 +2828,13 @@ pub type Sema = class {
     // ihre Externs dürfen FFI_CLASS_UNKNOWN sein. User-Code (und Drittmodule)
     // bleiben fail-closed.
     //
-    // #2202: Hier stand "modName-Namespace ist robust (User kann nicht als
-    // std.* importieren — Resolver schlaegt std.* nur im stdPath nach)". Das
-    // trifft nicht zu: der Resolver sucht ZUERST relativ zum
-    // Arbeitsverzeichnis, ein Verzeichnis `std/` neben der Quelldatei wird
-    // also als std.* aufgeloest und bekommt diese Vertrauensstellung.
-    // Gemessen mit derselben Unit zweimal — als `std.eigen` uebersetzt sie
-    // ein unbekanntes FFI-Symbol, als `mein.eigen` wird sie abgewiesen.
-    // Das Vertrauen muesste an der HERKUNFT haengen (stdPath oder
-    // Installation), nicht am Namen; als eigenes Issue geführt, weil der Fix
-    // den CWD-Weg beruehrt, den #2201 bewusst unangetastet laesst.
+    // #2202: Bis 1.2.20C reichte der NAME ("modName-Namespace ist robust").
+    // Das trifft nicht zu: der Resolver sucht ZUERST relativ zum
+    // Arbeitsverzeichnis, ein Verzeichnis `std/` neben der Quelldatei wurde
+    // also als std.* aufgeloest und bekam diese Vertrauensstellung. Jetzt
+    // muss ZUSAETZLICH die gelesene Datei im massgeblichen Baum liegen
+    // (--std-path, sonst Installation; src/herkunft.lyx). Wer aus einem
+    // Checkout baut, nennt den Baum: --std-path=.
     var savedTrust: int64 := self.ffiTrusted;
     var isStd: int64 := 0;
     if modLen >= 4 {
@@ -2837,6 +2843,10 @@ pub type Sema = class {
       if (StrCharAt(modName,0)&255)==115 && (StrCharAt(modName,1)&255)==114 &&
          (StrCharAt(modName,2)&255)==99  && (StrCharAt(modName,3)&255)==46 { isStd := 1; }  // "src."
     }
+    var savedFremd: int64 := self.ffiHerkunftFremd;
+    self.ffiHerkunftFremd := 0;
+    if (impVertraut == 0 && isStd != 0) { self.ffiHerkunftFremd := 1; }   // nur fuer die Meldung
+    if (impVertraut == 0) { isStd := 0; }   // #2202: Name UND Herkunft
     self.ffiTrusted := isStd;
 
     // BUG-3: type-check function bodies in imported module
@@ -2844,6 +2854,7 @@ pub type Sema = class {
     if (semaAusLyu == 0) { self.Pass2(head); }
 
     self.ffiTrusted := savedTrust;
+    self.ffiHerkunftFremd := savedFremd;
     self.src       := savedSrc;
     self.pNodes    := savedNodes;
     self.pNodeCount := savedNodeCnt;
@@ -7056,6 +7067,14 @@ pub type Sema = class {
           EPrintStrLn("    @capabilities([system.exit])"c);
           EPrintStrLn("    extern fn ... link \"lib.so\";"c);
           EPrintStrLn("  Fuer genau eine Capability auch kurz: @cap(system.exit)"c);
+          if (self.ffiHerkunftFremd != 0) {
+            // #2202: Hier ist meist nicht die Deklaration das Problem, sondern
+            // woher die Unit kam — der Name allein vergibt kein Vertrauen mehr.
+            EPrintStrLn("  Hinweis: Diese Unit heisst std.*/src.*, wurde aber nicht aus dem massgeblichen"c);
+            EPrintStrLn("  Baum gelesen (--std-path, sonst die Installation), sondern z. B. relativ zum"c);
+            EPrintStrLn("  Arbeitsverzeichnis (#2202). Ist sie die Standardbibliothek, den Baum nennen:"c);
+            EPrintStrLn("    lyxc --std-path=<Verzeichnis> ...   (im Checkout: --std-path=.)"c);
+          }
         }
       }
     } else if ffi_isStrncpyFamily(name, nameLen) {
@@ -9786,6 +9805,8 @@ pub type Sema = class {
     self.lyuArch     := 0;   // #2014
     self.lastReadSize := 0;  // WP-35: binary-safe file size
     self.lastReadPath := 0;
+    self.lastReadVertraut := 0;
+    self.ffiHerkunftFremd := 0;
     self.traceImports := 0;
 
     // WP-BC-46: verbose flags (set by caller after Init)
