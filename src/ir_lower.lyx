@@ -2949,6 +2949,20 @@ pub type IRLower = class {
     if op == 111 { return self._irAdresseVon(expr); }
     var t1: int64 := self.lowerExpr(self.nodeC0(expr));
     var dest: int64 := self.allocTemp();
+    // #2266: `!x` / `not x` ist das LOGISCHE Nicht, wie auf x86 (CGT_NOT,
+    // `!5` = 0, `!0` = 1) und wie der Kommentar unten es meint. Bis 1.2.20I
+    // ging es als IRO_NOT hinaus, und arm64, riscv, esp32 und arm-cm setzen
+    // IRO_NOT BITWEISE um (MVN bzw. xori -1): `not true` war -2, also wahr —
+    // jedes `if not x` lief auf diesen Zielen falsch herum. Gefunden, weil der
+    // arm64-Selbstbau bei `if not cliOk { return }` still ausstieg. Hier als
+    // Vergleich mit 0 abgesenkt; damit ist es auf allen IR-Zielen dasselbe,
+    // auch auf lyxos (dort war IRO_NOT schon logisch).
+    if op == 87 {
+      var nullT: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CONST_INT, nullT, -1, -1, 0);
+      self.irAddInstrDirect(IRO_CMP_EQ, dest, t1, nullT, 0);
+      return dest;
+    }
     // WP-AND-upstream-fix v6: emit actual ops. Map the parser's TK_*
     // operator to the corresponding IRO_*.
     //   TK_MINUS  (-x)   -> IRO_NEG
@@ -4500,6 +4514,11 @@ pub type IRLower = class {
     // #1720 Block B: FileReadAll(path) — ID 409.
     if (self.seq(fname, fnlen, "FileReadAll", 11) && arg0 >= 0) {
       var frP: int64 := self.lowerExpr(arg0);
+      if self.target != 14 {   // #2266: nur lyxos hat ID 409 nativ
+        var frR: int64 := self._fileReadAllIR(frP);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, dest, frR, -1, 0);
+        return dest;
+      }
       self.irAddInstrDirect(IRO_STORE_LOCAL, 0, frP, -1, 0);
       self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, -1, -1, 409);
       return dest;
@@ -4540,6 +4559,14 @@ pub type IRLower = class {
     if      (self.seq(fname, fnlen, "StrEquals", 9))     { svOp := 404; }
     else if (self.seq(fname, fnlen, "StrEq", 5))         { svOp := 404; }
     else if (self.seq(fname, fnlen, "StrStartsWith", 13)) { svOp := 405; }
+    if (svOp >= 0 && arg0 >= 0 && self.target != 14 && self.nodeNext(arg0) >= 0) {
+      // #2266: nur lyxos hat 404/405 nativ — sonst aus IR-Bausteinen.
+      var svX: int64 := self.lowerExpr(arg0);
+      var svY: int64 := self.lowerExpr(self.nodeNext(arg0));
+      var svR: int64 := self._strVergleichIR(svX, svY, svOp - 404);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, dest, svR, -1, 0);
+      return dest;
+    }
     if (svOp >= 0 && arg0 >= 0) {
       var svA: int64 := self.lowerExpr(arg0);
       self.irAddInstrDirect(IRO_STORE_LOCAL, 0, svA, -1, 0);
@@ -4848,6 +4875,18 @@ pub type IRLower = class {
     // LX-06: VFS syscalls (--target=lyxos, builtin IDs 20-41)
     // Pattern: lower args into slots 0..N-1, emit IRO_CALL_BUILTIN(id).
     // No helper method allowed (would shift IRLower VMT and break seed).
+    // #2266: sys_* auf den Linux-IR-Zielen auf die generischen Wege.
+    var sysZ: int64 := self._sysLinuxZiel(fname, fnlen);
+    if sysZ >= 0 {
+      var szA0: int64 := 0 - 1; var szA1: int64 := 0 - 1; var szA2: int64 := 0 - 1;
+      var szN: int64 := arg0;
+      if szN >= 0 { szA0 := self.lowerExpr(szN); szN := self.nodeNext(szN); }
+      if szN >= 0 { szA1 := self.lowerExpr(szN); szN := self.nodeNext(szN); }
+      if szN >= 0 { szA2 := self.lowerExpr(szN); }
+      var szD: int64 := self._rufArg(sysZ, szA0, szA1, szA2);
+      self.irAddInstrDirect(IRO_STORE_LOCAL, dest, szD, -1, 0);
+      return dest;
+    }
     if (self.seq(fname, fnlen, "sys_open", 8)) {
       // #1742: Der implementierte Kernel nimmt KEIN dir_fd — §10.7 der
       // ABI-Antwort sagt es ausdruecklich: "Pfad-Syscalls ohne dir_fd, CWD
@@ -6864,14 +6903,18 @@ pub type IRLower = class {
     if (self.seq(fname, fnlen, "peekf64", 7)) {
       var pf64B: int64 := self.tempCount; var pf64R: int64 := 0; while pf64R < 4 { self.allocTemp(); pf64R := pf64R + 1; }
       if arg0 >= 0 { var t: int64 := self.lowerExpr(arg0); self.irAddInstrDirect(IRO_STORE_LOCAL, pf64B, t, -1, 0); }
-      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, pf64B, -1, 253); return dest;
+      // #2266: ausserhalb von lyxos ein 8-Byte-Lesen (peek64, 202) — f64 liegt
+      // im IR-Weg als Bitmuster im int64-Slot, wie der lyxos-Zweig selbst sagt.
+      var pf64Id: int64 := 253; if self.target != 14 { pf64Id := 202; }
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, pf64B, -1, pf64Id); return dest;
     }
     if (self.seq(fname, fnlen, "pokef64", 7)) {
       var kf64B: int64 := self.tempCount; var kf64R: int64 := 0; while kf64R < 4 { self.allocTemp(); kf64R := kf64R + 1; }
       var kf64A: int64 := arg0;
       if kf64A >= 0 { var t: int64 := self.lowerExpr(kf64A); self.irAddInstrDirect(IRO_STORE_LOCAL, kf64B, t, -1, 0); kf64A := self.nodeNext(kf64A); }
       if kf64A >= 0 { var t: int64 := self.lowerExpr(kf64A); self.irAddInstrDirect(IRO_STORE_LOCAL, kf64B + 1, t, -1, 0); }
-      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, kf64B, -1, 254); return dest;
+      var kf64Id: int64 := 254; if self.target != 14 { kf64Id := 205; }   // #2266: poke64
+      self.irAddInstrDirect(IRO_CALL_BUILTIN, dest, kf64B, -1, kf64Id); return dest;
     }
     if (self.seq(fname, fnlen, "peek32f", 7)) {
       var p32fB: int64 := self.tempCount; var p32fR: int64 := 0; while p32fR < 4 { self.allocTemp(); p32fR := p32fR + 1; }
@@ -7169,6 +7212,20 @@ pub type IRLower = class {
     }
     // lyxc→LyxOS: EPrintInt → stderr (Arg in Slot 0 wie PrintInt id 2, id 234).
     if (self.seq(fname, fnlen, "EPrintInt", 9)) {
+      if arg0 >= 0 && self.target != 14 {
+        // #2266: ausserhalb von lyxos aus vorhandenen Bausteinen: IntToStr
+        // (16), StrLen (15), write(2, …) (223) — dieselbe Ausgabe wie PrintInt
+        // auf stdout, nur fd 2.
+        var epN: int64 := self.lowerExpr(arg0);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, epN, -1, 0);
+        var epS: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, epS, -1, -1, 16);
+        self.irAddInstrDirect(IRO_STORE_LOCAL, 0, epS, -1, 0);
+        var epL: int64 := self.allocTemp();
+        self.irAddInstrDirect(IRO_CALL_BUILTIN, epL, -1, -1, 15);
+        self._rufArg(223, self._konst(2), epS, epL);
+        return dest;
+      }
       if arg0 >= 0 {
         var epTemp: int64 := self.lowerExpr(arg0);
         self.irAddInstrDirect(IRO_STORE_LOCAL, 0, epTemp, -1, 0);
@@ -15041,6 +15098,127 @@ pub type IRLower = class {
     if (self.seq(tp, tl, "u32", 3) || self.seq(tp, tl, "uint32", 6)) { return 1; }
     if (self.seq(tp, tl, "u64", 3) || self.seq(tp, tl, "uint64", 6)) { return 1; }
     return 0;
+  }
+
+  // #2266: Builtin `id` mit bis zu drei Argumenten im Argumentblock rufen
+  // (argBase-Konvention wie open/read/write: vier Temps, ab dem ersten die
+  // Argumente). Liefert den Ergebnis-Temp.
+  fn _rufArg(id: int64, a0: int64, a1: int64, a2: int64): int64 {
+    var b: int64 := self.tempCount;
+    var r: int64 := 0;
+    while r < 4 { self.allocTemp(); r := r + 1; }
+    if a0 >= 0 { self.irAddInstrDirect(IRO_STORE_LOCAL, b, a0, -1, 0); }
+    if a1 >= 0 { self.irAddInstrDirect(IRO_STORE_LOCAL, b + 1, a1, -1, 0); }
+    if a2 >= 0 { self.irAddInstrDirect(IRO_STORE_LOCAL, b + 2, a2, -1, 0); }
+    var d: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CALL_BUILTIN, d, b, -1, id);
+    return d;
+  }
+
+  fn _konst(v: int64): int64 {
+    var t: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CONST_INT, t, -1, -1, v);
+    return t;
+  }
+
+  // #2266: StrEq (praefix == 0) bzw. StrStartsWith (praefix == 1) aus
+  // IR-Bausteinen — Schleife ueber peek8 (200). Dieselbe Bedeutung wie die
+  // lyxos-Umsetzung (emit_lyxos, IDs 404/405); die beiden muessen
+  // uebereinstimmen: gleich = jedes Byte gleich bis zur gemeinsamen Null,
+  // Praefix = jedes Byte von p gleich bis zur Null von p.
+  fn _strVergleichIR(a: int64, b: int64, praefix: int64): int64 {
+    var iS: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_STORE_LOCAL, iS, self._konst(0), -1, 0);
+    var res: int64 := self.allocTemp();
+    var lSchl: int64 := self.genLabel();
+    var lJa: int64 := self.genLabel();
+    var lNein: int64 := self.genLabel();
+    var lEnde: int64 := self.genLabel();
+    var null0: int64 := self._konst(0);
+    self.irEmitLabel(lSchl);
+    var adrB: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, adrB, b, iS, 0);
+    var cb: int64 := self._rufArg(200, adrB, 0 - 1, 0 - 1);
+    if praefix != 0 {
+      var bNul: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_EQ, bNul, cb, null0, 0);
+      self.irAddInstrDirect(IRO_BR_TRUE, -1, bNul, -1, lJa);
+    }
+    var adrA: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, adrA, a, iS, 0);
+    var ca: int64 := self._rufArg(200, adrA, 0 - 1, 0 - 1);
+    var ung: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CMP_NEQ, ung, ca, cb, 0);
+    self.irAddInstrDirect(IRO_BR_TRUE, -1, ung, -1, lNein);
+    if praefix == 0 {
+      var aNul: int64 := self.allocTemp();
+      self.irAddInstrDirect(IRO_CMP_EQ, aNul, ca, null0, 0);
+      self.irAddInstrDirect(IRO_BR_TRUE, -1, aNul, -1, lJa);
+    }
+    var i1: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, i1, iS, self._konst(1), 0);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, iS, i1, -1, 0);
+    self.irAddInstrDirect(IRO_JMP, -1, -1, -1, lSchl);
+    self.irEmitLabel(lJa);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, res, self._konst(1), -1, 0);
+    self.irAddInstrDirect(IRO_JMP, -1, -1, -1, lEnde);
+    self.irEmitLabel(lNein);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, res, self._konst(0), -1, 0);
+    self.irEmitLabel(lEnde);
+    return res;
+  }
+
+  // #2266: FileReadAll(pfad) aus IR-Bausteinen — open (220), lseek (228),
+  // read (222), close (221), poke8 (203). Bedeutung wie lyxos (ID 409):
+  // ganzer Inhalt, nullterminiert; 0 bei Fehler (oeffnen oder Groesse).
+  fn _fileReadAllIR(pfad: int64): int64 {
+    var res: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_STORE_LOCAL, res, self._konst(0), -1, 0);
+    var lEnde: int64 := self.genLabel();
+    var lZu: int64 := self.genLabel();
+    var fd: int64 := self._rufArg(220, pfad, self._konst(0), self._konst(0));
+    var fdNeg: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CMP_LT, fdNeg, fd, self._konst(0), 0);
+    self.irAddInstrDirect(IRO_BR_TRUE, -1, fdNeg, -1, lEnde);
+    var gr: int64 := self._rufArg(228, fd, self._konst(0), self._konst(2));   // SEEK_END
+    var grNeg: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_CMP_LT, grNeg, gr, self._konst(0), 0);
+    self.irAddInstrDirect(IRO_BR_TRUE, -1, grNeg, -1, lZu);
+    self._rufArg(228, fd, self._konst(0), self._konst(0));                   // zurueck an den Anfang
+    var gr1: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, gr1, gr, self._konst(1), 0);
+    var buf: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ALLOC, buf, gr1, -1, 0);
+    self._rufArg(222, fd, buf, gr);
+    var ende: int64 := self.allocTemp();
+    self.irAddInstrDirect(IRO_ADD, ende, buf, gr, 0);
+    self._rufArg(203, ende, self._konst(0), 0 - 1);
+    self.irAddInstrDirect(IRO_STORE_LOCAL, res, buf, -1, 0);
+    self.irEmitLabel(lZu);
+    self._rufArg(221, fd, 0 - 1, 0 - 1);
+    self.irEmitLabel(lEnde);
+    return res;
+  }
+
+  // #2266: Die fest geslotteten sys_*-Aufrufe (IDs 20-33) sind eine
+  // lyxos-Eigenheit. Auf den Linux-IR-Zielen gehen sie auf die generischen
+  // Wege mit Argumentblock (open/close/read/write/lseek/mkdir/unlink/rename/
+  // pipe/truncate) — dieselben Systemaufrufe, die dort schon umgesetzt sind.
+  // Liefert die Ziel-ID oder -1 (kein Gegenstueck: bleibt beim alten Weg und
+  // meldet sich dort laut).
+  fn _sysLinuxZiel(fname: pchar, fnlen: int64): int64 {
+    if self.target == 14 { return 0 - 1; }   // LYX_TC_LYXOS: eigene Nummern
+    if self.seq(fname, fnlen, "sys_open", 8)     { return 220; }
+    if self.seq(fname, fnlen, "sys_close", 9)    { return 221; }
+    if self.seq(fname, fnlen, "sys_read", 8)     { return 222; }
+    if self.seq(fname, fnlen, "sys_write", 9)    { return 223; }
+    if self.seq(fname, fnlen, "sys_seek", 8)     { return 228; }
+    if self.seq(fname, fnlen, "sys_mkdir", 9)    { return 226; }
+    if self.seq(fname, fnlen, "sys_unlink", 10)  { return 225; }
+    if self.seq(fname, fnlen, "sys_rename", 10)  { return 224; }
+    if self.seq(fname, fnlen, "sys_pipe", 8)     { return 231; }
+    if self.seq(fname, fnlen, "sys_truncate", 12) { return 232; }
+    return 0 - 1;
   }
 
   // #2262: Ist tn ein Array-Typ mit {cap,len}-Kopf? Dynamisch (`T[]`,

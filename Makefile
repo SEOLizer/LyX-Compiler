@@ -21,7 +21,7 @@ LYXC_LICENSE_REQUIRED ?= 0
 UNITS_SRC := $(shell find std  -name "*.lyx" | sort)
 DATA_SRC  := $(shell find data -name "*.lyx" | sort)
 
-VERSION   := 1.2.20I
+VERSION   := 1.2.20J
 VERSION_DATE := 2026-10-24
 DEB_NAME  := lyxc-$(VERSION).deb
 PKG_DIR   := lyx-compiler
@@ -499,6 +499,8 @@ test: lyxc
 	@bash tests/profile_rekursion_2249_test.sh
 	@echo "--- IR-Ziele: Array-Kopf wie x86, Struct-Elemente, lseek (#2262, #2260) ---"
 	@bash tests/ir_array_kopf_2262_test.sh
+	@echo "--- IR-Ziele: Selbstbau-Builtins, logisches Nicht, arm64-Selbstbau (#2266) ---"
+	@bash tests/ir_selbstbau_2266_test.sh
 	@echo "--- keine Spruenge ueber 32-Byte-Grenzen (#2244) ---"
 	@bash tests/sprung_ausrichtung_2244_test.sh
 	@echo "--- Vektordaten auf 64 Byte, Vektorschleifen unten geprueft (#2215) ---"
