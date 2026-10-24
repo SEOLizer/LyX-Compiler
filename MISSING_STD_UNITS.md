@@ -24,7 +24,7 @@ constants
 | `fmt` | Formatierte Ausgabe (like Go's fmt) | FEHLT |
 | `bytes` | Byte-Slice Operationen | FEHLT (buffer.lyx existiert, aber nicht vollständig) |
 | `text` | Text-Verarbeitung (Lines, Words) | FEHLT |
-| `csv` | CSV Lesen/Schreiben | FEHLT |
+| `csv` | CSV Lesen/Schreiben | ✅ LESEN VORHANDEN (std/csv.lyx: Komma/Semikolon/Tabulator/Leerraum, Anfuehrungszeichen, Kommentare, Fehlend-Marken, Zahlenmatrix); SCHREIBEN fehlt |
 | `xml` | XML Parsen/Generieren | ✅ VORHANDEN |
 | `yaml` | YAML Parsen/Generieren | ✅ VORHANDEN |
 | `toml` | TOML Parsen/Generieren | FEHLT |
@@ -126,7 +126,7 @@ constants
 
 | Kategorie | Vorhanden | Fehlend |
 |-----------|-----------|---------|
-| Text/Serialisierung | 7 (json, regex, string, base64, xml, yaml, html) | ~4 |
+| Text/Serialisierung | 8 (json, regex, string, base64, xml, yaml, html, csv-lesen) | ~4 |
 | Database/Storage | 0 | ~4 |
 | Crypto | 1 (aes) | ~5 |
 | Netzwerk (erweitert) | 20 | ~7 |
