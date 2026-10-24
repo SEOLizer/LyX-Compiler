@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/bench_runtime.sh — Messgeschirr fuer die LAUFZEIT erzeugten Codes (#2195).
 #
-#   tools/bench_runtime.sh [-n LAEUFE] [-k KERN] [--nur-pruefen]
+#   tools/bench_runtime.sh [-n LAEUFE] [-k chacha|arr_add_f32|arr_int] [--nur-pruefen]
 #
 # Aus dem Auftrag der CPU-Bestandsaufnahme: ChaCha20-Quarter-Round und
 # elementweise Array-Kerne gegen GCC und Clang halten. tools/bench_compile.sh
@@ -225,6 +225,21 @@ if [ -z "$KERN" ] || [ "$KERN" = "arr_add_f32" ]; then
   kern "arr_f32_L1"  "bench/arr_add_f32.lyx" "$ROOT/bench/arr_add_f32.c" "$L1_N"  "$L1_W"
   kern "arr_f32_L2"  "bench/arr_add_f32.lyx" "$ROOT/bench/arr_add_f32.c" "$L2_N"  "$L2_W"
   kern "arr_f32_RAM" "bench/arr_add_f32.lyx" "$ROOT/bench/arr_add_f32.c" "$RAM_N" "$RAM_W"
+fi
+
+if [ -z "$KERN" ] || [ "$KERN" = "arr_int" ]; then
+  # Ganzzahlfelder in 8/16/32 Bit, je add, mul und sum. Dieselben
+  # Elementzahlen wie bei f32; bei 8 und 16 Bit belegen die Felder
+  # entsprechend weniger Bytes, die Stufen bleiben trotzdem getrennt
+  # (4 Ki Elemente im L1, 4 Mi ueber dem letzten Cache).
+  for breite in 8 16 32; do
+    for op in 1 2 3; do
+      case "$op" in 1) opn=add ;; 2) opn=mul ;; 3) opn=sum ;; esac
+      kern "int${breite}_${opn}_L1"  "bench/arr_int.lyx" "$ROOT/bench/arr_int.c" "$breite" "$op" "$L1_N"  "$L1_W"
+      kern "int${breite}_${opn}_L2"  "bench/arr_int.lyx" "$ROOT/bench/arr_int.c" "$breite" "$op" "$L2_N"  "$L2_W"
+      kern "int${breite}_${opn}_RAM" "bench/arr_int.lyx" "$ROOT/bench/arr_int.c" "$breite" "$op" "$RAM_N" "$RAM_W"
+    done
+  done
 fi
 
 if [ "$FEHLER" -ne 0 ]; then

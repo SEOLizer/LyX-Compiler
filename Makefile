@@ -371,6 +371,8 @@ test: lyxc
 	@bash tests/rotl32_2177_test.sh
 	@echo "--- xxHash32/64 gegen Referenzwerte (#2235) ---"
 	@bash tests/xxhash_2235_test.sh
+	@echo "--- bench/arr_int: Ganzzahl-Feldkerne wie C, drei Ziele (#2195) ---"
+	@bash tests/bench_arr_int_test.sh
 	@echo "--- Negation eines parallel Array: Bitmuster, Mischformen laut (#2222) ---"
 	@bash tests/simd_neg_2222_test.sh
 	@echo "--- Bit-Builtins auf esp32 und arm-cm4: Werte, 64-Bit-Formen laut (#2228) ---"
