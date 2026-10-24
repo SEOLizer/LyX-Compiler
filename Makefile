@@ -675,6 +675,10 @@ test: lyxc
 	@bash tests/sema_reste_2151_test.sh
 	@bash tests/symlink_builtins_test.sh
 	@bash tests/win64_literal_test.sh
+	@echo "--- win64: argv ohne Quotes, Umgebung ueber GetEnvBlock (#2263, #2264) ---"
+	@bash tests/win64_argv_umgebung_test.sh
+	@echo "--- win64: lyxc.exe uebersetzt selbst (#2264) ---"
+	@bash tests/win64_selbstbau_test.sh
 	@bash tests/arm64_abi_reste_test.sh
 	@bash tests/float_typen_2160_test.sh
 	@bash tests/riscv_ffi_2162_test.sh
