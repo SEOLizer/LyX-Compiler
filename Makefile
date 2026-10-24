@@ -1003,17 +1003,17 @@ test: lyxc
 	@echo "OK"
 	@echo "OK"
 	@echo "--- LX-36: Lifecycle Descriptor ---"
-	./lyxc tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
+	./lyxc --std-path=. tests/lx36_lifecycle_test.lyx -o /tmp/lyxc_lx36_test
 	@/tmp/lyxc_lx36_test
 	@rm -f /tmp/lyxc_lx36_test
 
 	@echo "--- net_frame: kernel-safe frame units (45 tests) ---"
-	./lyxc tests/net_frame_test.lyx -o /tmp/lyxc_net_frame_test
+	./lyxc --std-path=. tests/net_frame_test.lyx -o /tmp/lyxc_net_frame_test
 	@/tmp/lyxc_net_frame_test
 	@rm -f /tmp/lyxc_net_frame_test
 
 	@echo "--- sec_wp26: alloc()/calloc() Integer-Overflow + Zero-Alloc (18 tests) ---"
-	./lyxc tests/sec_wp26_alloc_test.lyx -o /tmp/lyxc_sec_wp26_test
+	./lyxc --std-path=. tests/sec_wp26_alloc_test.lyx -o /tmp/lyxc_sec_wp26_test
 	@/tmp/lyxc_sec_wp26_test
 	@rm -f /tmp/lyxc_sec_wp26_test
 	@echo "OK"
@@ -1043,13 +1043,13 @@ test: lyxc
 	@echo "OK"
 
 	@echo "--- sec_wp29: Ed25519-Lizenzverifikation (20 tests) ---"
-	./lyxc tests/sec_wp29_ed25519_test.lyx -o /tmp/lyxc_sec_wp29_test
+	./lyxc --std-path=. tests/sec_wp29_ed25519_test.lyx -o /tmp/lyxc_sec_wp29_test
 	@/tmp/lyxc_sec_wp29_test
 	@rm -f /tmp/lyxc_sec_wp29_test
 	@echo "OK"
 
 	@echo "--- sec_wp30: HTTP Custom-Header CRLF-Injection (20 tests) ---"
-	./lyxc tests/sec_wp30_crlf_test.lyx -o /tmp/lyxc_sec_wp30_test
+	./lyxc --std-path=. tests/sec_wp30_crlf_test.lyx -o /tmp/lyxc_sec_wp30_test
 	@/tmp/lyxc_sec_wp30_test
 	@rm -f /tmp/lyxc_sec_wp30_test
 	@echo "OK"
