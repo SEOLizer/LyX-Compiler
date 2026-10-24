@@ -509,6 +509,11 @@ pub type Sema = class {
   // std.math ruft intern SqrtF64 und faende sich selbst nicht mehr.
   // Geaendert wird stattdessen die SICHTBARKEIT beim Nachschlagen.
   symAliasPtr: int64;
+  // #2173: kleine Liste {symIdx, aliasPtr, aliasLen} je neu auftretendem
+  // Alias — IsImportAlias prueft nur diese, statt alle Symbole abzulaufen.
+  aliasTab:   int64;
+  aliasTabN:  int64;
+  aliasTabCap: int64;
   symAliasLen: int64;
   // #1858: Ist das Symbol eine einmal bindende Deklaration (`let`, `co`, `con`)?
   // Die Auskunft stand bisher nur im DEKLARATIONSKNOTEN, und den gibt es fuer
@@ -782,6 +787,7 @@ pub type Sema = class {
     if (self.symCount < self.privCap) {   // #1262
       poke64(self.symAliasPtr + self.symCount * 8, self.curAlias);
       poke64(self.symAliasLen + self.symCount * 8, self.curAliasLen);
+      if (self.curAlias != 0) { self._aliasMerken(self.symCount); }   // #2173
     }
     poke64(self.syms + 8, self.symCount + 1);
     self.symCount += 1;
@@ -848,19 +854,52 @@ pub type Sema = class {
 
   // #1262: Ist `name` ein Import-Alias? Geprueft an den Symbolen, die ihn
   // tragen — eine eigene Liste waere eine zweite Wahrheit.
+  // #2173: Bis 1.2.20G lief jeder Aufruf ueber ALLE Symbole rueckwaerts, nur
+  // um die wenigen mit Alias zu finden — 4,8 % Eigenzeit im Selbstbau. Jetzt
+  // steht je neu auftretendem Alias ein Eintrag {symIdx, Alias} in aliasTab
+  // (_aliasMerken, beim Anlegen des Symbols). Geprueft wird nur diese Liste;
+  // ein Eintrag zaehlt, solange sein Symbol noch existiert (symIdx < symCount)
+  // und denselben Alias traegt — dieselbe Aussage wie der fruehere Lauf, der
+  // ja ebenfalls nur die noch vorhandenen Symbole sah.
   pub fn IsImportAlias(name: pchar, nameLen: int64): int64 {
-    var i: int64 := self.symCount - 1;
-    while (i >= 0) {
-      if (i < self.privCap) {
-        var ap: int64 := peek64(self.symAliasPtr + i * 8);
-        if (ap != 0) {
-          var al: int64 := peek64(self.symAliasLen + i * 8);
-          if (al == nameLen && self._strNEq(ap as pchar, al, name, nameLen)) { return 1; }
-        }
+    var k: int64 := 0;
+    while (k < self.aliasTabN) {
+      var e: int64 := self.aliasTab + k * 24;
+      var si: int64 := peek64(e);
+      var ap: int64 := peek64(e + 8);
+      var al: int64 := peek64(e + 16);
+      if (si < self.symCount && al == nameLen && self._strNEq(ap as pchar, al, name, nameLen)) {
+        if (peek64(self.symAliasPtr + si * 8) == ap) { return 1; }
       }
-      i -= 1;
+      k += 1;
     }
     return 0;
+  }
+
+  // #2173: Alias des eben angelegten Symbols si vormerken — nur, wenn er sich
+  // vom zuletzt vorgemerkten unterscheidet (alle Symbole einer Unit tragen
+  // denselben Alias, die Liste bleibt so bei einem Eintrag je Import-Lauf).
+  // Wird ein vorgemerktes Symbol spaeter ausgetragen (Gueltigkeitsbereich zu
+  // Ende), traegt das naechste mit demselben Alias ihn erneut ein.
+  fn _aliasMerken(si: int64) {
+    var ap: int64 := self.curAlias;
+    if (self.aliasTabN > 0) {
+      var le: int64 := self.aliasTab + (self.aliasTabN - 1) * 24;
+      var lsi: int64 := peek64(le);
+      if (peek64(le + 8) == ap && lsi < si && peek64(self.symAliasPtr + lsi * 8) == ap) { return; }
+    }
+    if (self.aliasTabN >= self.aliasTabCap) {
+      var nc: int64 := self.aliasTabCap * 2;
+      var nb: int64 := alloc(nc * 24);
+      memcpy(nb, self.aliasTab, self.aliasTabN * 24);
+      self.aliasTab := nb;
+      self.aliasTabCap := nc;
+    }
+    var e: int64 := self.aliasTab + self.aliasTabN * 24;
+    poke64(e, si);
+    poke64(e + 8, ap);
+    poke64(e + 16, self.curAliasLen);
+    self.aliasTabN += 1;
   }
 
   // #2175: Lookup laeuft die Hash-Kette des Namens ab, juengstes Symbol
@@ -9776,6 +9815,9 @@ pub type Sema = class {
     self.curAliasLen := 0;
     self.privCap    := 16384;
     self.symAliasPtr := alloc(self.privCap * 8);   // #1262
+    self.aliasTab    := alloc(64 * 24);   // #2173
+    self.aliasTabN   := 0;
+    self.aliasTabCap := 64;
     self.symAliasLen := alloc(self.privCap * 8);
     var az: int64 := 0;
     while (az < self.privCap) { poke64(self.symAliasPtr + az * 8, 0); az := az + 1; }
