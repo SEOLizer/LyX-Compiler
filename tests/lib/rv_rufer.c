@@ -9,7 +9,8 @@
  * seinen Wert. Genau den spielt dieses Programm:
  *
  *   - das statische riscv-Erzeugnis an seine feste Adresse legen,
- *   - aus dem JAL im _start-Rumpf (Offset 4) die Adresse von main lesen,
+ *   - aus AUIPC+JALR im _start-Rumpf (Offset 12, #2271) die Adresse von
+ *     main lesen,
  *   - main als C-Funktion rufen, mit Merkwerten in s1..s11,
  *   - die Werte danach vergleichen.
  *
@@ -71,13 +72,15 @@ int main(int argc, char **argv) {
     if (m != (void *)lo) { perror("mmap"); return 96; }
     memcpy((void *)ph[i].p_vaddr, f + ph[i].p_offset, ph[i].p_filesz);
   }
-  /* JAL ra, main bei e_entry + 4 (rlb_emitStart). */
-  uint32_t jal = *(uint32_t *)(eh->e_entry + 4);
-  if ((jal & 0x7F) != 0x6F) { fprintf(stderr, "kein JAL bei _start+4\n"); return 98; }
-  int64_t imm = ((jal >> 31) & 1) << 20 | ((jal >> 12) & 0xFF) << 12 |
-                ((jal >> 20) & 1) << 11 | ((jal >> 21) & 0x3FF) << 1;
-  if (imm & (1 << 20)) imm -= (1 << 21);
-  long mainVA = (long)(eh->e_entry + 4 + imm);
+  /* AUIPC ra, hi / JALR ra, lo(ra) bei e_entry + 12 (rlb_emitStart, #2271). */
+  uint32_t auipc = *(uint32_t *)(eh->e_entry + 12);
+  uint32_t jalr = *(uint32_t *)(eh->e_entry + 16);
+  if ((auipc & 0x7F) != 0x17 || (jalr & 0x7F) != 0x67) {
+    fprintf(stderr, "kein AUIPC+JALR bei _start+12\n"); return 98;
+  }
+  int64_t hi = (int64_t)(int32_t)(auipc & 0xFFFFF000u);
+  int64_t lo = (int64_t)((int32_t)jalr >> 20);
+  long mainVA = (long)(eh->e_entry + 12 + hi + lo);
   long nachher[11];
   long merk = 0x5100;
   long r = rufe(mainVA, merk, nachher);

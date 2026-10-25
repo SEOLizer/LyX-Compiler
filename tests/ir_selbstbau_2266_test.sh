@@ -15,11 +15,15 @@
 # `if not cliOk { return }` still aus.
 #
 # Geprueft wird die WIRKUNG auf x86, arm64 und riscv (gleiche Ausgabe), dazu
-# der Selbstbau: das arm64-Erzeugnis von lyxc uebersetzt unter qemu ein
-# Programm, das richtig rechnet.
+# der Selbstbau: das arm64- und das riscv-Erzeugnis von lyxc uebersetzen unter
+# qemu ein Programm, das richtig rechnet (riscv seit #2271).
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
+# Der Selbstbau uebersetzt die Compilerquelle (allein 52-62 s, unter Last mehr):
+# die Grenzen, die lyxc_guard.sh dafuer nennt. Mit 60 s brach er unter
+# Volllast ab (#2271).
+LYXC_VM_KB=$(( 8 * 1024 * 1024 )); LYXC_TIMEOUT=900
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 . "$(dirname "$0")/lib/qemu.sh"   # #2048
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
@@ -131,19 +135,25 @@ for z in $ZIELE; do
   else no "EPrintInt $z" "uebersetzt nicht"; fi
 done
 
-# 4. Selbstbau: lyxc fuer arm64, das Erzeugnis uebersetzt unter qemu ein Programm.
-if [ -n "$QEMU_ARM64" ]; then
-  (cd "$ROOT" && ulimit -v 8000000 && timeout 1200 "$LYXC" --std-path="$ROOT" --target=arm64 src/lyxc.lyx -o "$TMP/lyxc_arm64" >"$TMP/sb.log" 2>&1); sbRc=$?
+# 4. Selbstbau: lyxc fuer arm64 und riscv, das Erzeugnis uebersetzt unter qemu
+# ein Programm. riscv (#2271): eine Funktion des Compilers liegt ueber 1 MiB —
+# JAL reichte nicht, und main(argc, argv) bekam kein argc.
+printf 'import std.io;\nfn main(): int64 {\n  var s: int64 := 0; var i: int64 := 1;\n  while (i <= 10) { s := s + i * i; i += 1; }\n  PrintLn(s);\n  return 0;\n}\n' > "$TMP/h.lyx"
+for z in arm64 riscv; do
+  q="$QEMU_ARM64"; em_soll=183
+  [ "$z" = riscv ] && { q="$QEMU_RISCV64"; em_soll=243; }
+  [ -n "$q" ] || continue
+  (cd "$ROOT" && ulimit -v 8000000 && timeout 1200 "$LYXC" --std-path="$ROOT" --target=$z src/lyxc.lyx -o "$TMP/lyxc_$z" >"$TMP/sb.log" 2>&1); sbRc=$?
   if [ "$sbRc" -eq 0 ]; then
-    em=$(od -An -tu2 -j18 -N2 "$TMP/lyxc_arm64" | tr -d ' ')
-    if [ "$em" = 183 ]; then ok "Selbstbau arm64: Erzeugnis e_machine 183"; else no "Selbstbau arm64" "e_machine $em"; fi
-    printf 'import std.io;\nfn main(): int64 {\n  var s: int64 := 0; var i: int64 := 1;\n  while (i <= 10) { s := s + i * i; i += 1; }\n  PrintLn(s);\n  return 0;\n}\n' > "$TMP/h.lyx"
-    ( cd "$ROOT" && ulimit -v 8000000 && timeout 600 "$QEMU_ARM64" "$TMP/lyxc_arm64" "$TMP/h.lyx" --std-path="$ROOT" -o "$TMP/h" >"$TMP/h.log" 2>&1 )
+    em=$(od -An -tu2 -j18 -N2 "$TMP/lyxc_$z" | tr -d ' ')
+    if [ "$em" = "$em_soll" ]; then ok "Selbstbau $z: Erzeugnis e_machine $em"; else no "Selbstbau $z" "e_machine $em"; fi
+    rm -f "$TMP/h"
+    ( cd "$ROOT" && ulimit -v 8000000 && timeout 600 "$q" "$TMP/lyxc_$z" "$TMP/h.lyx" --std-path="$ROOT" -o "$TMP/h" >"$TMP/h.log" 2>&1 )
     got=$( [ -x "$TMP/h" ] && "$TMP/h" )
-    if [ "$got" = "385" ]; then ok "arm64-Compiler uebersetzt ein Programm (Ergebnis 385)"
-    else no "arm64-Compiler" "Ergebnis '$got' ($(grep -m1 -iE 'error|signal' "$TMP/h.log"))"; fi
-  else no "Selbstbau arm64" "rc $sbRc: $(grep -v '^ \|^=\|^$' "$TMP/sb.log" | tail -2 | tr '\n' ' ')"; fi
-fi
+    if [ "$got" = "385" ]; then ok "$z-Compiler uebersetzt ein Programm (Ergebnis 385)"
+    else no "$z-Compiler" "Ergebnis '$got' ($(grep -m1 -iE 'error|signal|Verwendung' "$TMP/h.log"))"; fi
+  else no "Selbstbau $z" "rc $sbRc: $(grep -v '^ \|^=\|^$' "$TMP/sb.log" | tail -2 | tr '\n' ' ')"; fi
+done
 
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

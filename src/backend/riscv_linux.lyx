@@ -71,7 +71,8 @@ con RV_SYS_CLOSE:  int64 := 57;
 // Laenge versetzt auf eine Seitengrenze fallen.
 // #2035: wird ausserhalb dieser Unit gebraucht.
 // #2110: 16 seit dem ersten Befehl, der argv fuer GetArgC/GetArgV sichert.
-pub con RV_START_STUB_LEN: int64 := 16;
+// #2271: 28 — argc/argv in a0/a1 und der Aufruf von main als AUIPC+JALR.
+pub con RV_START_STUB_LEN: int64 := 28;
 
 // Branch patch types
 con RV_PATCH_J:   int64 := 0;   // JAL x0, label  (unconditional)
@@ -621,8 +622,22 @@ pub type EmitRISCV64 = class {
       if target >= 0 {
         var delta: int64 := target - codeOff;
         if ptype == RV_PATCH_J {
-          self.rv_checkReach("JAL (Sprung innerhalb der Funktion)"c, delta, RV_REACH_JAL);
-          self.rv_poke32at(codeOff, self.rv_buildJAL(0, delta));
+          // #2271: Die Stelle hat Platz fuer zwei Befehle. In JAL-Reichweite
+          // bleibt es beim JAL, dahinter ein NOP, das nie laeuft (JAL x0 kehrt
+          // nicht zurueck). Darueber AUIPC t1 + JALR x0 — der Selbstbau fuer
+          // riscv hat eine Funktion ueber 1 MiB und scheiterte daran. Hoch/tief
+          // geteilt wie bei RV_PATCH_BL darunter; die beiden muessen
+          // uebereinstimmen.
+          if delta >= (0 - RV_REACH_JAL) && delta < RV_REACH_JAL {
+            self.rv_poke32at(codeOff, self.rv_buildJAL(0, delta));
+            self.rv_poke32at(codeOff + 4, 0x13);   // ADDI x0, x0, 0
+          } else {
+            self.rv_checkReach("AUIPC+JALR (Sprung innerhalb der Funktion)"c, delta, RV_REACH_PC);
+            var jHi: int64 := (delta + 0x800) >> 12;
+            var jLo: int64 := delta - (jHi << 12);
+            self.rv_poke32at(codeOff, 0x17 | (RV_T1 << 7) | ((jHi & 0xFFFFF) << 12));
+            self.rv_poke32at(codeOff + 4, 0x67 | (RV_ZERO << 7) | (0 << 12) | (RV_T1 << 15) | ((jLo & 0xFFF) << 20));
+          }
         } else if ptype == RV_PATCH_BL {
           // #2112: Aufruf als AUIPC ra + JALR ra — JAL reichte nur +/-1 MiB,
           // und ein Programm mit mehr Code ist kein Sonderfall. Hoch/tief
@@ -982,27 +997,32 @@ pub type EmitRISCV64 = class {
     }
 
     // --- Control flow ---
+    // #2271: Jeder Sprung innerhalb der Funktion belegt zwei Befehle —
+    // applyPatches setzt JAL+NOP oder, ueber +/-1 MiB, AUIPC+JALR ein.
     if op == IRO_JMP {
       var patchOff: int64 := self.codeLen;
       self.rv_e32(0x0000006F);   // JAL x0, 0 placeholder
+      self.rv_e32(0x00000013);   // NOP / JALR — nachgetragen
       self.addPatch(patchOff, imm, RV_PATCH_J, 0);
     }
-    // #2112: Bedingte Spruenge als umgekehrter Kurzsprung ueber ein JAL.
+    // #2112: Bedingte Spruenge als umgekehrter Kurzsprung ueber den Sprung.
     // BEQ/BNE reichen nur +/-4 KiB — ein while-Rumpf mit rund 16 poke8 lag
-    // schon darueber, und der Abstand wurde still maskiert. JAL reicht
-    // +/-1 MiB; darueber meldet applyPatches.
+    // schon darueber, und der Abstand wurde still maskiert. Der Kurzsprung
+    // ueberspringt beide Befehle der Sprungstelle (#2271: +12 statt +8).
     if op == IRO_BR_TRUE {
       self.rv_loadSlot(src1);
-      self.rv_e32(self.rv_buildBtype(0, RV_T0, RV_ZERO, 8));  // BEQ t0, x0, +8
+      self.rv_e32(self.rv_buildBtype(0, RV_T0, RV_ZERO, 12)); // BEQ t0, x0, +12
       var patchOff: int64 := self.codeLen;
       self.rv_e32(0x0000006F);                                 // JAL x0, label
+      self.rv_e32(0x00000013);                                 // NOP / JALR
       self.addPatch(patchOff, imm, RV_PATCH_J, 0);
     }
     if op == IRO_BR_FALSE {
       self.rv_loadSlot(src1);
-      self.rv_e32(self.rv_buildBtype(1, RV_T0, RV_ZERO, 8));  // BNE t0, x0, +8
+      self.rv_e32(self.rv_buildBtype(1, RV_T0, RV_ZERO, 12)); // BNE t0, x0, +12
       var patchOff: int64 := self.codeLen;
       self.rv_e32(0x0000006F);                                 // JAL x0, label
+      self.rv_e32(0x00000013);                                 // NOP / JALR
       self.addPatch(patchOff, imm, RV_PATCH_J, 0);
     }
     if op == IRO_LABEL {
@@ -2921,9 +2941,11 @@ pub type RiscvLinuxBackend = class {
     self.rlb_ce8(v >> 24);
   }
 
-  // _start stub (16 bytes):
+  // _start stub (28 bytes):
   //   ADDI s10, sp, 8                       (#2110: argv sichern)
-  //   JAL ra, RV_START_STUB_LEN + mainOff - 4   (call main)
+  //   LD   a0, 0(sp)                        (#2271: argc an main)
+  //   ADDI a1, sp, 8                        (#2271: argv an main)
+  //   AUIPC ra, hi / JALR ra, lo(ra)        (#2271: call main, +/-2 GiB)
   //   ADDI a7, x0, 93     = 0x05D00893  (exit syscall)
   //   ECALL               = 0x00000073
   //
@@ -2936,18 +2958,19 @@ pub type RiscvLinuxBackend = class {
     // Hilfsregister); C-Code erhaelt es nach der ABI. GetArgC zaehlt bis zum
     // NULL, GetArgV liefert s10 — dieselbe Auskunft wie emitArgcArgv auf lyxos.
     self.rlb_ce32(0x00810D13);  // ADDI s10, sp, 8
-    var off: int64 := RV_START_STUB_LEN + mainOff - 4;   // JAL steht bei Offset 4
-    // #2112: JAL reicht +/-1 MiB; der Rumpf hat feste Laenge (RV_START_STUB_LEN),
-    // eine Langform passt nicht hinein. Darueber laut statt still maskiert.
-    if off >= 0x100000 {
-      EPrintStrLn("error: riscv: main liegt mehr als 1 MiB hinter _start — JAL reicht nicht (#2112)."c);
-      exit(1);
-    }
-    var b20:    int64 := (off >> 20) & 0x1;
-    var b10_1:  int64 := (off >> 1)  & 0x3FF;
-    var b11:    int64 := (off >> 11) & 0x1;
-    var b19_12: int64 := (off >> 12) & 0xFF;
-    self.rlb_ce32(0xEF | (b19_12 << 12) | (b11 << 20) | (b10_1 << 21) | (b20 << 31));
+    // #2271: `main(argc, argv)` bekam auf riscv nichts in a0/a1 — der
+    // riscv-Selbstbau las argc 0 und zeigte nur die Hilfe. Der Weg ueber
+    // __libc_start_main (lstart) setzt a0/a1 selbst; dort schadet es nicht.
+    self.rlb_ce32(0x00013503);  // LD a0, 0(sp)
+    self.rlb_ce32(0x00810593);  // ADDI a1, sp, 8
+    // #2271: main per AUIPC+JALR statt JAL — der riscv-Selbstbau hat mehr als
+    // 1 MiB Code, main liegt dahinter. Hoch/tief geteilt wie RV_PATCH_BL in
+    // applyPatches; die beiden muessen uebereinstimmen.
+    var off: int64 := RV_START_STUB_LEN + mainOff - 12;   // AUIPC steht bei Offset 12
+    var hi: int64 := (off + 0x800) >> 12;
+    var lo: int64 := off - (hi << 12);
+    self.rlb_ce32(0x17 | (RV_RA << 7) | ((hi & 0xFFFFF) << 12));                          // AUIPC ra, hi
+    self.rlb_ce32(0x67 | (RV_RA << 7) | (0 << 12) | (RV_RA << 15) | ((lo & 0xFFF) << 20)); // JALR ra, lo(ra)
     self.rlb_ce32(0x05D00893);  // ADDI a7, x0, 93
     self.rlb_ce32(0x00000073);  // ECALL
   }
@@ -3064,7 +3087,7 @@ pub type RiscvLinuxBackend = class {
   // liegen im Datensegment. dynsym: [0] null, [1..] die FFI-Symbole (UNDEF,
   // R_RISCV_64 auf ihren GOT-Platz), danach die Exporte (GLOBAL FUNC,
   // st_value = Adresse relativ zur Basis). Ein echter SysV-Hash, denn dlsym
-  // sucht darueber. Der 16-Byte-_start-Rumpf bleibt als toter Code stehen:
+  // sucht darueber. Der _start-Rumpf (RV_START_STUB_LEN) bleibt als toter Code stehen:
   // an seiner Laenge haengt die Seitenausrichtung des Emitters.
   // exportBuf: je Export {namePtr, nameLen, codeOff (ab self.code)} — dieselbe
   // Liste wie lyxc.buildExportList.

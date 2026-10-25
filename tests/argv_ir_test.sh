@@ -55,6 +55,31 @@ for ziel in x86_64 arm64 riscv; do
   else nok "[$ziel] ohne Argumente: [$ist0]"; fi
 done
 
+# #2271: `main(argc, argv)` als Parameter. riscv setzte a0/a1 im Startrumpf
+# nicht — argc kam als 0 an, der riscv-Selbstbau zeigte deshalb nur die Hilfe.
+# GetArgC oben ging ueber s10 und war davon nicht betroffen.
+cat > "$TMP/p.lyx" <<'LYX'
+import std.io;
+pub fn main(argc: int64, argv: pchar): int64 {
+  PrintLn(IntToStr(argc));
+  var i: int64 := 1;
+  while (i < argc) { var a: pchar := ArgvGet(argv, i); PrintLn(a); i := i + 1; }
+  return 0;
+}
+LYX
+for ziel in x86_64 arm64 riscv; do
+  pre=""
+  case "$ziel" in arm64) pre="$QEMU_ARM64" ;; riscv) pre="$QEMU_RISCV64" ;; esac
+  if ! ( cd "$ROOT" && timeout 240 "$LYXC" --std-path="$ROOT" --target="$ziel" "$TMP/p.lyx" -o "$TMP/p_$ziel" ) >"$TMP/bl.log" 2>&1; then
+    nok "[$ziel] main(argc, argv) uebersetzt nicht ($(grep -m1 -iE 'error' "$TMP/bl.log"))"; continue
+  fi
+  if [ "$ziel" != "x86_64" ] && [ -z "$pre" ]; then nok "[$ziel] qemu fehlt — NICHT gemessen"; continue; fi
+  ist="$( (timeout 30 $pre "$TMP/p_$ziel" eins "zwei drei" 2>&1) | tr '\n' '|')"
+  soll="3|eins|zwei drei|"
+  if [ "$ist" = "$soll" ]; then ok "[$ziel] main(argc, argv): $soll"
+  else nok "[$ziel] main(argc, argv): [$ist] statt [$soll]"; fi
+done
+
 echo
 echo "Ergebnis: $PASS PASS, $FAIL FAIL"
 [ "$FAIL" -eq 0 ]

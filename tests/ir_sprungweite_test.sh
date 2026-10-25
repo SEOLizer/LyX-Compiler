@@ -153,7 +153,13 @@ for ziel in arm64 riscv; do
   pruefe "300 Funktionen (ueber 256)"              "$ziel" funcs 300
   pruefe "700 if/else (ueber 1024 Marken)"         "$ziel" ifs 700
   pruefe "if-Rumpf mit 2000 poke8"                 "$ziel" if 2000
-  pruefe_grenze "if-Rumpf mit 9000 poke8 (ueber 1 MiB)" "$ziel" if 9000
+  # #2271: riscv springt jenseits der JAL-Reichweite ueber AUIPC+JALR — dort
+  # muss der WERT stimmen, eine Ablehnung ist kein Erfolg mehr.
+  if [ "$ziel" = riscv ]; then
+    pruefe "if-Rumpf mit 9000 poke8 (ueber 1 MiB)" "$ziel" if 9000
+  else
+    pruefe_grenze "if-Rumpf mit 9000 poke8 (ueber 1 MiB)" "$ziel" if 9000
+  fi
 done
 
 echo
