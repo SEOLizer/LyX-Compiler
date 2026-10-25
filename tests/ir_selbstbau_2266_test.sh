@@ -20,6 +20,10 @@
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LYXC="${LYXC:-$ROOT/lyxc}"
+# Der Selbstbau uebersetzt die Compilerquelle (allein 52-62 s, unter Last mehr):
+# die Grenzen, die lyxc_guard.sh dafuer nennt. Mit 60 s brach er unter
+# Volllast ab (#2271).
+LYXC_VM_KB=$(( 8 * 1024 * 1024 )); LYXC_TIMEOUT=900
 _g="$(dirname "$0")/lib/lyxc_guard.sh"; [ -f "$_g" ] || _g="$(dirname "$0")/../lib/lyxc_guard.sh"; . "$_g"   # #1294
 . "$(dirname "$0")/lib/qemu.sh"   # #2048
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
