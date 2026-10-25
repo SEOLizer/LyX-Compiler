@@ -87,7 +87,7 @@ LyxOS-Builtin-Misdispatch (PR #839) und der verworfene Opcode-Catch-all
 | 403 | f64 als Text, Zeiger zurück | `FloatToStr` | #1720; derselbe Formatierer wie ID 9, ohne Ausgabe |
 | 404 | Zeichenketten auf Gleichheit | `StrEq`, `StrEquals` | #1720 |
 | 405 | Anfang einer Zeichenkette prüfen | `StrStartsWith` | #1720 |
-| 406 | Dateigröße oder −1 | `FileSize` | #1720; open + seek(ENDE) + close |
+| 406 | Dateigröße oder −1 | `FileSize` | #1720; open + seek(ENDE) + close. Nur lyxos emittiert die ID; auf den Linux-IR-Zielen setzt ir_lower sie aus 220/228/221 zusammen (#2258), wie FileReadAll (409) seit #2266 |
 | 407 | Leerraum vorn/hinten entfernen | `StrTrim` | #1720; ändert an Ort und Stelle, gibt Zeiger zurück |
 | 408 | Teilkette suchen, Index oder −1 | `StrFind` | #1720; leere Nadel → 0 |
 | 409 | Datei ganz lesen, nullterminiert | `FileReadAll` | #1720; 0 bei Fehler |
