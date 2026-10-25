@@ -5,7 +5,7 @@
 // Strategy: "preamble + trampoline" pattern.
 //   [0..WIN_PREAMBLE_SZ-1]              Windows API implementation code
 //   [WIN_PREAMBLE_SZ..WIN_PREAMBLE_SZ+286]  Trampolines at same relative offsets as Linux helpers
-//   [WIN_PREAMBLE_SZ+287..]             User code (copied verbatim from Linux cgBuf[287..])
+//   [WIN_PREAMBLE_SZ+WIN_HELPERS_SZ..]  User code (copied verbatim from Linux cgBuf)
 //
 // This preserves all user-code rel32 call offsets unchanged, because both helper
 // trampolines and user code are shifted by the same WIN_PREAMBLE_SZ bytes.
@@ -25,18 +25,24 @@
 // ============================================================================
 
 // Preamble size: win_print_str_impl(68) + win_print_int_impl(145) + win_strsub_impl(58)
-//               + win_argv_setup(237)
+//               + win_argv_setup(WIN_AS_SZ)
 
 import src.emit_write;
 import src.std.alloc;
-con WIN_PREAMBLE_SZ:   int64 := 508;
+// #2263: Der Vorspann waechst, weil win_argv_setup jetzt Anfuehrungszeichen
+// behandelt. WIN_AS_SZ ist die Groesse dieser Routine; wird sie zu klein,
+// scheitert der Erzeuger laut (siehe wxb_emitArgvSetup). Alles dahinter haengt
+// an WIN_PREAMBLE_SZ = WIN_AS_OFF + WIN_AS_SZ — nichts rechnet mehr mit einer
+// festen Zahl, die Sprungbretter werden aus den Marken gerechnet.
+con WIN_AS_SZ:         int64 := 289;   // win_argv_setup (277 Bytes + Reserve)
+con WIN_PREAMBLE_SZ:   int64 := 560;   // = WIN_AS_OFF(271) + WIN_AS_SZ(289)
 // WP-A2: WIN_HELPERS_SZ MUST equal CG_H_USER from codegen_x86.lyx so that
 // user-code rel32 call offsets to helpers are identical in Linux and Windows.
 // The trampoline zone is now emitted with explicit padding to each WIN_H_*
 // offset (see wxb_padTo below), so individual helper SIZE drift can no longer
 // shift later trampolines — only these offset constants must track CG_H_*.
 con WIN_HELPERS_SZ:    int64 := 1372;  // = CG_H_USER from codegen_x86.lyx
-con WIN_USER_OFF:      int64 := 1880;  // WIN_PREAMBLE_SZ + WIN_HELPERS_SZ
+con WIN_USER_OFF:      int64 := 1932;  // WIN_PREAMBLE_SZ + WIN_HELPERS_SZ
 
 // Trampoline target offsets within the helper zone — MUST mirror CG_H_* in
 // codegen_x86.lyx exactly (user-code call sites use those Linux offsets).
@@ -80,14 +86,14 @@ con WIN_CALL_WF1:  int64 := 56;    // print_str's WriteFile call (WIN_PS_OFF+56)
 con WIN_CALL_GH2:  int64 := 169;   // print_int's GetStdHandle call (WIN_PI_OFF+101)
 con WIN_CALL_WF2:  int64 := 198;   // print_int's WriteFile call (WIN_PI_OFF+130)
 con WIN_CALL_VA:   int64 := 239;   // strsub's VirtualAlloc call
-con WIN_CALL_GCL:  int64 := 286;   // win_argv_setup's GetCommandLineA call (WIN_AS_OFF+15)
-con WIN_CALL_VA2:  int64 := 372;   // win_argv_setup's VirtualAlloc call (WIN_AS_OFF+101)
-con WIN_CALL_EP:   int64 := 563;   // _start's ExitProcess call  (WIN_PREAMBLE_SZ + 55)
+// #2263: Die drei Aufrufstellen in win_argv_setup und _start werden beim
+// Erzeugen gemerkt (asGclOff, asVa2Off, epCallOff), nicht als Konstante
+// gefuehrt. Jede Aenderung an der Routine verschob sie sonst still.
 
 // PE layout
 con WIN_IMAGE_BASE:   int64 := 0x140000000;
 con WIN_TEXT_RVA:     int64 := 0x1000;
-con WIN_ENTRY_OFF:    int64 := 508;   // = WIN_PREAMBLE_SZ, _start offset in .text
+con WIN_ENTRY_OFF:    int64 := 560;   // = WIN_PREAMBLE_SZ, _start offset in .text
 con WIN_FILE_ALIGN:   int64 := 0x200;
 con WIN_SEC_ALIGN:    int64 := 0x1000;
 
@@ -178,6 +184,11 @@ pub type WinX86Backend = class {
   argvStoreOff:    int64;   // WP-WINARGV: disp32-Offset von `mov [rip+d],rdx` (argv→CG_ARGV), Patch
   envStoreOff:     int64;   // #1677: disp32-Offset des Stores in CG_ENVBLOCK
   envCallOff:      int64;   // #1677: Offset des `call [GetEnvironmentStringsA]`
+  // #2263: Lage der IAT-Aufrufe, beim Erzeugen gemerkt statt als Konstante
+  // gefuehrt (WIN_CALL_GCL/VA2/EP sind deshalb weg).
+  asGclOff:        int64;   // `call [GetCommandLineA]` in win_argv_setup
+  asVa2Off:        int64;   // `call [VirtualAlloc]` in win_argv_setup
+  epCallOff:       int64;   // `call [ExitProcess]` in _start
 
   // #1678: Offset des `call [VirtualFree]` im Freigabe-Helfer (-1 = keiner).
   vfreeCallOff:    int64;
@@ -211,6 +222,21 @@ pub type WinX86Backend = class {
     self.wxb_ce8((v >> 8)  & 0xFF);
     self.wxb_ce8((v >> 16) & 0xFF);
     self.wxb_ce8((v >> 24) & 0xFF);
+  }
+
+  // #2263: kurze Sprungweite (ein Byte) aus der Marke nachtragen. feldOff ist
+  // die Lage des Weitenbytes, ziel die Marke; die Weite zaehlt ab dem Byte
+  // DAHINTER. Eine Weite, die nicht in ein Byte passt, scheitert laut — sonst
+  // springt das Erzeugnis irgendwohin.
+  fn wxb_patchRel8(feldOff: int64, ziel: int64) {
+    var d: int64 := ziel - (feldOff + 1);
+    if (d < 0 - 128 || d > 127) {
+      EPrintStr("lyxc: win64: Sprungweite "c);
+      EPrintInt(d);
+      EPrintStrLn(" passt nicht in ein Byte (win_argv_setup)."c);
+      exit(1);
+    }
+    poke8(self.code + feldOff, d & 0xFF);
   }
 
   fn wxb_patch32(off: int64, val: int64) {
@@ -539,29 +565,38 @@ pub type WinX86Backend = class {
   }
 
   // ------------------------------------------------------------------
-  // Preamble: win_argv_setup (237 bytes, at WIN_AS_OFF=269)
-  // Calls GetCommandLineA() to get the ASCII command line, splits on spaces
-  // into an argv[] array allocated via VirtualAlloc.
-  // Returns: rax = argc (int64), rdx = argv base pointer (pchar*).
-  // Called from _start with a backwards E8 call.
+  // Preamble: win_argv_setup (WIN_AS_SZ Bytes, ab WIN_AS_OFF)
+  // Holt die Kommandozeile mit GetCommandLineA() und zerlegt sie in ein
+  // argv[]-Feld, das ueber VirtualAlloc angefordert wird.
+  // Rueckgabe: rax = argc (int64), rdx = argv-Basis (pchar*).
+  // Aufgerufen aus _start mit einem E8-Sprung zurueck in den Vorspann.
   //
-  // Byte layout (verified offsets within this function):
-  //   [0..14]   prologue: push r12-r15,rbx,rdi,rsi; sub rsp,0x20
-  //   [15..23]  call [GetCommandLineA_IAT] (WIN_CALL_GCL); mov r13,rax
-  //   [24..31]  phase1 init: xor r12d, xor ebx, xor r14d
-  //   [32..66]  phase1 count-argc loop (NUL-terminated, ASCII)
-  //   [67..109] phase2 alloc: compute size (argc*8+8+strlen+1), VirtualAlloc
-  //   [101..106] call [VirtualAlloc_IAT] (WIN_CALL_VA2 = WIN_AS_OFF+101)
-  //   [107..122] save argv base (rdi), compute string area ptr (rsi)
-  //   [124..131] phase3 init: xor r14d, xor ebx, xor r8d
-  //   [132..185] phase3 fill-argv loop
-  //   [186..196] terminate last token + argv sentinel
-  //   [197..218] return: mov eax,r12d; mov rdx,rdi; restore; ret
-  //   [219..236] 18 NOPs (padding to 237 bytes)
+  // #2263: Anfuehrungszeichen. Windows setzt den Programmpfad regelmaessig in
+  // Anfuehrungszeichen (wine immer), und jeder Pfad mit Leerzeichen kommt
+  // ebenfalls gequotet. Bis 1.2.20F trennte diese Routine ausschliesslich an
+  // Bytes <= 0x20 und liess die `"` stehen: argv[0] war
+  // `"D:\pfad\prog.exe"`, und `-o "C:\Program Files\x.exe"` wurde zu zwei
+  // Argumenten mit Fremdzeichen. Jetzt fuehren BEIDE Durchlaeufe dasselbe
+  // Zustandsbit in r15 ("in Anfuehrungszeichen"): ein `"` kippt es und wird
+  // nicht kopiert, ein Leerzeichen innerhalb trennt nicht. Die beiden
+  // Durchlaeufe muessen uebereinstimmen — sonst passen argc und die Zahl der
+  // gefuellten Eintraege nicht zusammen.
+  //
+  // Register: r13 = Kommandozeile, r14 = Index, r12 = argc, rbx = im Token,
+  // r15 = in Anfuehrungszeichen, rdi = argv-Basis, rsi = Zeichenbereich,
+  // r8 = Index im argv-Feld.
+  //
+  // Die Sprungweiten werden beim Erzeugen aus den Marken gerechnet und
+  // nachgetragen (wxb_patchRel8); handgezaehlte Offsets im Kommentar waren
+  // der Grund, dass jede Aenderung hier bisher die Konstanten daneben
+  // mitverschob. Die Lage der beiden IAT-Aufrufe merkt sich die Routine in
+  // asGclOff/asVa2Off, statt sie als Konstante zu fuehren.
   // ------------------------------------------------------------------
 
   fn wxb_emitArgvSetup() {
-    // -- Prologue [0..14] --
+    var fnStart: int64 := self.codeLen;
+
+    // -- Prologue --
     self.wxb_ce8(0x41); self.wxb_ce8(0x54);  // push r12
     self.wxb_ce8(0x41); self.wxb_ce8(0x55);  // push r13
     self.wxb_ce8(0x41); self.wxb_ce8(0x56);  // push r14
@@ -569,100 +604,166 @@ pub type WinX86Backend = class {
     self.wxb_ce8(0x53);                       // push rbx
     self.wxb_ce8(0x57);                       // push rdi
     self.wxb_ce8(0x56);                       // push rsi
-    // sub rsp, 0x20 (32 bytes shadow space; also aligns stack for Windows ABI calls)
+    // sub rsp, 0x20 (Schattenbereich; haelt den Stapel 16-ausgerichtet)
     self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x20);
 
-    // -- Call GetCommandLineA [15..23] --
-    // Shadow space already allocated above; rsp is 16-aligned here.
-    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);    // call [GetCommandLineA_IAT], patched by wxb_patchIAT
-    self.wxb_ce8(0x4C); self.wxb_ce8(0x8B); self.wxb_ce8(0xE8);  // mov r13, rax  (ASCII cmdline ptr)
+    // -- GetCommandLineA --
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15);
+    self.asGclOff := self.codeLen - 2;           // Lage des Befehls (FF 15 ...)
+    self.wxb_ce32(0);                             // in wxb_patchIAT nachgetragen
+    self.wxb_ce8(0x4C); self.wxb_ce8(0x8B); self.wxb_ce8(0xE8);  // mov r13, rax
 
-    // -- Phase 1 init [24..31] --
+    // ================= Durchlauf 1: argc zaehlen =================
     self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xE4);  // xor r12d, r12d  (argc=0)
-    self.wxb_ce8(0x31); self.wxb_ce8(0xDB);                       // xor ebx, ebx    (in_token=0)
+    self.wxb_ce8(0x31); self.wxb_ce8(0xDB);                       // xor ebx, ebx    (im Token=0)
     self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xF6);  // xor r14d, r14d  (i=0)
+    self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xFF);  // xor r15d, r15d  (in Quote=0)
 
-    // -- Phase 1: count argc [32..66] (NUL-terminated ASCII) --
-    // .cnt_loop: (offset 32)
-    // movzx eax, byte[r13+r14*1+0]  (REX=43: X=r14,B=r13; SIB=35: scale=1,idx=r14,base=r13)
-    self.wxb_ce8(0x43); self.wxb_ce8(0x0F); self.wxb_ce8(0xB6); self.wxb_ce8(0x44); self.wxb_ce8(0x35); self.wxb_ce8(0x00);
-    self.wxb_ce8(0x84); self.wxb_ce8(0xC0);                       // test al, al  (NUL?)
-    self.wxb_ce8(0x74); self.wxb_ce8(0x19);                       // jz +25 → .cnt_done (offset 67)
-    self.wxb_ce8(0x3C); self.wxb_ce8(0x20);                       // cmp al, 0x20 (space/ctrl)
-    self.wxb_ce8(0x7E); self.wxb_ce8(0x0E);                       // jle +14 → .cnt_sep (offset 60)
+    var cntLoop: int64 := self.codeLen;
+    self.wxb_ce8(0x43); self.wxb_ce8(0x0F); self.wxb_ce8(0xB6); self.wxb_ce8(0x44); self.wxb_ce8(0x35); self.wxb_ce8(0x00);  // movzx eax, byte[r13+r14]
+    self.wxb_ce8(0x84); self.wxb_ce8(0xC0);                       // test al, al
+    self.wxb_ce8(0x74); var pCntDone: int64 := self.codeLen; self.wxb_ce8(0x00);   // jz → .cnt_done
+    self.wxb_ce8(0x3C); self.wxb_ce8(0x22);                       // cmp al, '"'
+    self.wxb_ce8(0x75); var pCntNq: int64 := self.codeLen; self.wxb_ce8(0x00);     // jne → .cnt_nq
+    // Anfuehrungszeichen: Bit kippen, Zeichen nicht zaehlen. Ein oeffnendes
+    // `"` beginnt ein Token, damit `""` als (leeres) Argument ankommt und
+    // Durchlauf 3 an derselben Stelle einen Eintrag anlegt.
+    self.wxb_ce8(0x41); self.wxb_ce8(0x83); self.wxb_ce8(0xF7); self.wxb_ce8(0x01);  // xor r15d, 1
     self.wxb_ce8(0x85); self.wxb_ce8(0xDB);                       // test ebx, ebx
-    self.wxb_ce8(0x75); self.wxb_ce8(0x05);                       // jnz +5 → .cnt_next (offset 55)
+    self.wxb_ce8(0x75); var pCntQnext: int64 := self.codeLen; self.wxb_ce8(0x00);   // jnz → .cnt_next
     self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC4);  // inc r12d  (argc++)
-    self.wxb_ce8(0xFF); self.wxb_ce8(0xC3);                       // inc ebx   (in_token=1)
-    // .cnt_next: (offset 55)
-    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc r14d  (i++)
-    self.wxb_ce8(0xEB); self.wxb_ce8(0xE4);                       // jmp -28 → .cnt_loop (offset 32)
-    // .cnt_sep: (offset 60)
-    self.wxb_ce8(0x31); self.wxb_ce8(0xDB);                       // xor ebx, ebx  (in_token=0)
-    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc r14d
-    self.wxb_ce8(0xEB); self.wxb_ce8(0xDD);                       // jmp -35 → .cnt_loop (offset 32)
-    // .cnt_done: (offset 67)  r14 = strlen(cmdline)
+    self.wxb_ce8(0xFF); self.wxb_ce8(0xC3);                       // inc ebx   (im Token=1)
+    self.wxb_ce8(0xEB); var pCntQjmp: int64 := self.codeLen; self.wxb_ce8(0x00);    // jmp → .cnt_next
 
-    // -- Phase 2: VirtualAlloc [67..109] --
-    // size = argc*8 + 8 + strlen + 1
-    self.wxb_ce8(0x44); self.wxb_ce8(0x89); self.wxb_ce8(0xE0);  // mov eax, r12d  (argc)
+    var cntNq: int64 := self.codeLen;                             // .cnt_nq
+    self.wxb_ce8(0x3C); self.wxb_ce8(0x20);                       // cmp al, 0x20
+    self.wxb_ce8(0x7F); var pCntTok: int64 := self.codeLen; self.wxb_ce8(0x00);     // jg → .cnt_tok
+    // Trennzeichen — aber nur ausserhalb von Anfuehrungszeichen.
+    self.wxb_ce8(0x45); self.wxb_ce8(0x85); self.wxb_ce8(0xFF);  // test r15d, r15d
+    self.wxb_ce8(0x74); var pCntSep: int64 := self.codeLen; self.wxb_ce8(0x00);     // jz → .cnt_sep
+
+    var cntTok: int64 := self.codeLen;                            // .cnt_tok
+    self.wxb_ce8(0x85); self.wxb_ce8(0xDB);                       // test ebx, ebx
+    self.wxb_ce8(0x75); var pCntTnext: int64 := self.codeLen; self.wxb_ce8(0x00);   // jnz → .cnt_next
+    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC4);  // inc r12d  (argc++)
+    self.wxb_ce8(0xFF); self.wxb_ce8(0xC3);                       // inc ebx
+
+    var cntNext: int64 := self.codeLen;                           // .cnt_next
+    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc r14d  (i++)
+    self.wxb_ce8(0xEB); var pCntBack1: int64 := self.codeLen; self.wxb_ce8(0x00);   // jmp → .cnt_loop
+
+    var cntSep: int64 := self.codeLen;                            // .cnt_sep
+    self.wxb_ce8(0x31); self.wxb_ce8(0xDB);                       // xor ebx, ebx
+    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc r14d
+    self.wxb_ce8(0xEB); var pCntBack2: int64 := self.codeLen; self.wxb_ce8(0x00);   // jmp → .cnt_loop
+
+    var cntDone: int64 := self.codeLen;                           // .cnt_done — r14 = strlen
+    self.wxb_patchRel8(pCntDone,  cntDone);
+    self.wxb_patchRel8(pCntNq,    cntNq);
+    self.wxb_patchRel8(pCntQnext, cntNext);
+    self.wxb_patchRel8(pCntQjmp,  cntNext);
+    self.wxb_patchRel8(pCntTok,   cntTok);
+    self.wxb_patchRel8(pCntSep,   cntSep);
+    self.wxb_patchRel8(pCntTnext, cntNext);
+    self.wxb_patchRel8(pCntBack1, cntLoop);
+    self.wxb_patchRel8(pCntBack2, cntLoop);
+
+    // ================= Durchlauf 2: Speicher anfordern =================
+    // Groesse = argc*8 + 8 (Sentinel) + strlen + 1. Die weggelassenen
+    // Trennzeichen und Anfuehrungszeichen lassen genug Platz fuer die
+    // abschliessenden Nullbytes der Tokens.
+    self.wxb_ce8(0x44); self.wxb_ce8(0x89); self.wxb_ce8(0xE0);  // mov eax, r12d
     self.wxb_ce8(0x48); self.wxb_ce8(0xC1); self.wxb_ce8(0xE0); self.wxb_ce8(0x03); // shl rax, 3
     self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC0); self.wxb_ce8(0x08); // add rax, 8
-    self.wxb_ce8(0x49); self.wxb_ce8(0x03); self.wxb_ce8(0xC6);  // add rax, r14  (+ strlen)
-    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xC0);  // inc rax       (+ 1 for null)
-    self.wxb_ce8(0x31); self.wxb_ce8(0xC9);                       // xor ecx, ecx  (lpAddress=0)
-    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC2);  // mov rdx, rax  (dwSize)
+    self.wxb_ce8(0x49); self.wxb_ce8(0x03); self.wxb_ce8(0xC6);  // add rax, r14
+    self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xC0);  // inc rax
+    self.wxb_ce8(0x31); self.wxb_ce8(0xC9);                       // xor ecx, ecx   (lpAddress=0)
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC2);  // mov rdx, rax   (dwSize)
     self.wxb_ce8(0x41); self.wxb_ce8(0xB8); self.wxb_ce8(0x00); self.wxb_ce8(0x30); self.wxb_ce8(0x00); self.wxb_ce8(0x00); // mov r8d, 0x3000
     self.wxb_ce8(0x41); self.wxb_ce8(0xB9); self.wxb_ce8(0x04); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); // mov r9d, 4
-    // call [VirtualAlloc_IAT] at offset 101 = WIN_CALL_VA2 - WIN_AS_OFF
-    self.wxb_ce8(0xFF); self.wxb_ce8(0x15); self.wxb_ce32(0);    // patched by wxb_patchIAT
-    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC7);  // mov rdi, rax  (argv array base)
+    self.wxb_ce8(0xFF); self.wxb_ce8(0x15);
+    self.asVa2Off := self.codeLen - 2;           // Lage des VirtualAlloc-Aufrufs
+    self.wxb_ce32(0);                             // in wxb_patchIAT nachgetragen
+    self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC7);  // mov rdi, rax   (argv-Basis)
 
-    // -- Compute string area ptr rsi = rdi + argc*8 + 8 [110..122] --
-    self.wxb_ce8(0x44); self.wxb_ce8(0x89); self.wxb_ce8(0xE6);  // mov esi, r12d  (argc)
+    // Zeichenbereich rsi = rdi + argc*8 + 8
+    self.wxb_ce8(0x44); self.wxb_ce8(0x89); self.wxb_ce8(0xE6);  // mov esi, r12d
     self.wxb_ce8(0x48); self.wxb_ce8(0xC1); self.wxb_ce8(0xE6); self.wxb_ce8(0x03); // shl rsi, 3
     self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC6); self.wxb_ce8(0x08); // add rsi, 8
     self.wxb_ce8(0x48); self.wxb_ce8(0x01); self.wxb_ce8(0xFE);  // add rsi, rdi
 
-    // -- Phase 3 init [124..131] --
+    // ================= Durchlauf 3: argv fuellen =================
     self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xF6);  // xor r14d, r14d  (i=0)
-    self.wxb_ce8(0x31); self.wxb_ce8(0xDB);                       // xor ebx, ebx    (in_token=0)
-    self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xC0);  // xor r8d, r8d    (argv_idx=0)
+    self.wxb_ce8(0x31); self.wxb_ce8(0xDB);                       // xor ebx, ebx    (im Token=0)
+    self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xC0);  // xor r8d, r8d    (argv-Index=0)
+    self.wxb_ce8(0x45); self.wxb_ce8(0x31); self.wxb_ce8(0xFF);  // xor r15d, r15d  (in Quote=0)
 
-    // -- Phase 3: fill argv [132..185] --
-    // .fill_loop: (offset 132)
-    self.wxb_ce8(0x43); self.wxb_ce8(0x0F); self.wxb_ce8(0xB6); self.wxb_ce8(0x44); self.wxb_ce8(0x35); self.wxb_ce8(0x00); // movzx eax, byte[r13+r14]
+    var filLoop: int64 := self.codeLen;
+    self.wxb_ce8(0x43); self.wxb_ce8(0x0F); self.wxb_ce8(0xB6); self.wxb_ce8(0x44); self.wxb_ce8(0x35); self.wxb_ce8(0x00);  // movzx eax, byte[r13+r14]
     self.wxb_ce8(0x84); self.wxb_ce8(0xC0);                       // test al, al
-    self.wxb_ce8(0x74); self.wxb_ce8(0x2C);                       // jz +44 → .fill_done (offset 186)
-    self.wxb_ce8(0x3C); self.wxb_ce8(0x20);                       // cmp al, 0x20
-    self.wxb_ce8(0x7E); self.wxb_ce8(0x17);                       // jle +23 → .fill_sep (offset 169)
+    self.wxb_ce8(0x74); var pFilDone: int64 := self.codeLen; self.wxb_ce8(0x00);    // jz → .fill_done
+    self.wxb_ce8(0x3C); self.wxb_ce8(0x22);                       // cmp al, '"'
+    self.wxb_ce8(0x75); var pFilNq: int64 := self.codeLen; self.wxb_ce8(0x00);      // jne → .fill_nq
+    // Anfuehrungszeichen: Bit kippen, Zeichen NICHT kopieren. Dieselbe
+    // Token-Eroeffnung wie in Durchlauf 1 — die beiden muessen uebereinstimmen.
+    self.wxb_ce8(0x41); self.wxb_ce8(0x83); self.wxb_ce8(0xF7); self.wxb_ce8(0x01);  // xor r15d, 1
     self.wxb_ce8(0x85); self.wxb_ce8(0xDB);                       // test ebx, ebx
-    self.wxb_ce8(0x75); self.wxb_ce8(0x09);                       // jnz +9 → .fill_notnew (offset 159)
+    self.wxb_ce8(0x75); var pFilQnext: int64 := self.codeLen; self.wxb_ce8(0x00);   // jnz → .fill_next
     self.wxb_ce8(0x4A); self.wxb_ce8(0x89); self.wxb_ce8(0x34); self.wxb_ce8(0xC7); // mov [rdi+r8*8], rsi
     self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC0);  // inc r8d
     self.wxb_ce8(0xFF); self.wxb_ce8(0xC3);                       // inc ebx
-    // .fill_notnew: (offset 159)
+    self.wxb_ce8(0xEB); var pFilQjmp: int64 := self.codeLen; self.wxb_ce8(0x00);    // jmp → .fill_next
+
+    var filNq: int64 := self.codeLen;                             // .fill_nq
+    self.wxb_ce8(0x3C); self.wxb_ce8(0x20);                       // cmp al, 0x20
+    self.wxb_ce8(0x7F); var pFilTok: int64 := self.codeLen; self.wxb_ce8(0x00);     // jg → .fill_tok
+    self.wxb_ce8(0x45); self.wxb_ce8(0x85); self.wxb_ce8(0xFF);  // test r15d, r15d
+    self.wxb_ce8(0x74); var pFilSep: int64 := self.codeLen; self.wxb_ce8(0x00);     // jz → .fill_sep
+
+    var filTok: int64 := self.codeLen;                            // .fill_tok
+    self.wxb_ce8(0x85); self.wxb_ce8(0xDB);                       // test ebx, ebx
+    self.wxb_ce8(0x75); var pFilNotnew: int64 := self.codeLen; self.wxb_ce8(0x00);  // jnz → .fill_notnew
+    self.wxb_ce8(0x4A); self.wxb_ce8(0x89); self.wxb_ce8(0x34); self.wxb_ce8(0xC7); // mov [rdi+r8*8], rsi
+    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC0);  // inc r8d
+    self.wxb_ce8(0xFF); self.wxb_ce8(0xC3);                       // inc ebx
+
+    var filNotnew: int64 := self.codeLen;                         // .fill_notnew
     self.wxb_ce8(0x88); self.wxb_ce8(0x06);                       // mov [rsi], al
     self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc rsi
+
+    var filNext: int64 := self.codeLen;                           // .fill_next
     self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc r14d
-    self.wxb_ce8(0xEB); self.wxb_ce8(0xDB);                       // jmp -37 → .fill_loop (offset 132)
-    // .fill_sep: (offset 169)
+    self.wxb_ce8(0xEB); var pFilBack1: int64 := self.codeLen; self.wxb_ce8(0x00);   // jmp → .fill_loop
+
+    var filSep: int64 := self.codeLen;                            // .fill_sep
     self.wxb_ce8(0x85); self.wxb_ce8(0xDB);                       // test ebx, ebx
-    self.wxb_ce8(0x74); self.wxb_ce8(0x08);                       // jz +8 → .fill_nosep (offset 181)
+    self.wxb_ce8(0x74); var pFilNosep: int64 := self.codeLen; self.wxb_ce8(0x00);   // jz → .fill_nosep
     self.wxb_ce8(0xC6); self.wxb_ce8(0x06); self.wxb_ce8(0x00);  // mov byte[rsi], 0
     self.wxb_ce8(0x48); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc rsi
     self.wxb_ce8(0x31); self.wxb_ce8(0xDB);                       // xor ebx, ebx
-    // .fill_nosep: (offset 181)
-    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc r14d
-    self.wxb_ce8(0xEB); self.wxb_ce8(0xCA);                       // jmp -54 → .fill_loop (offset 132)
-    // .fill_done: (offset 186)
 
-    // -- Terminate last token and argv sentinel [186..196] --
+    var filNosep: int64 := self.codeLen;                          // .fill_nosep
+    self.wxb_ce8(0x41); self.wxb_ce8(0xFF); self.wxb_ce8(0xC6);  // inc r14d
+    self.wxb_ce8(0xEB); var pFilBack2: int64 := self.codeLen; self.wxb_ce8(0x00);   // jmp → .fill_loop
+
+    var filDone: int64 := self.codeLen;                           // .fill_done
+    self.wxb_patchRel8(pFilDone,   filDone);
+    self.wxb_patchRel8(pFilNq,     filNq);
+    self.wxb_patchRel8(pFilQnext,  filNext);
+    self.wxb_patchRel8(pFilQjmp,   filNext);
+    self.wxb_patchRel8(pFilTok,    filTok);
+    self.wxb_patchRel8(pFilSep,    filSep);
+    self.wxb_patchRel8(pFilNotnew, filNotnew);
+    self.wxb_patchRel8(pFilBack1,  filLoop);
+    self.wxb_patchRel8(pFilNosep,  filNosep);
+    self.wxb_patchRel8(pFilBack2,  filLoop);
+
+    // -- Letztes Token abschliessen, argv-Sentinel setzen --
     self.wxb_ce8(0xC6); self.wxb_ce8(0x06); self.wxb_ce8(0x00);  // mov byte[rsi], 0
     self.wxb_ce8(0x4A); self.wxb_ce8(0xC7); self.wxb_ce8(0x04); self.wxb_ce8(0xC7);
     self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); self.wxb_ce8(0x00); // mov qword[rdi+r8*8], 0
 
-    // -- Return: rax=argc, rdx=argv [197..218] --
+    // -- Rueckgabe: rax=argc, rdx=argv --
     self.wxb_ce8(0x44); self.wxb_ce8(0x89); self.wxb_ce8(0xE0);  // mov eax, r12d
     self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xFA);  // mov rdx, rdi
     self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xC4); self.wxb_ce8(0x20); // add rsp, 0x20
@@ -675,10 +776,19 @@ pub type WinX86Backend = class {
     self.wxb_ce8(0x41); self.wxb_ce8(0x5C);  // pop r12
     self.wxb_ce8(0xC3);                       // ret
 
-    // -- Padding [219..236]: 18 NOPs to reach exactly 237 bytes --
-    var p: int64 := 0;
-    while (p < 18) { self.wxb_ce8(0x90); p := p + 1; }
-    // Total: 237 bytes ✓
+    // -- Auffuellen auf WIN_AS_SZ --
+    // Laut scheitern, statt still eine kuerzere Routine zu schreiben: der
+    // Vorspann traegt die festen Offsets der Sprungbretter dahinter.
+    var belegt: int64 := self.codeLen - fnStart;
+    if (belegt > WIN_AS_SZ) {
+      EPrintStr("lyxc: win64: win_argv_setup ist "c);
+      EPrintInt(belegt);
+      EPrintStr(" Bytes gross, WIN_AS_SZ ist "c);
+      EPrintInt(WIN_AS_SZ);
+      EPrintStrLn(" — WIN_AS_SZ und WIN_PREAMBLE_SZ nachziehen."c);
+      exit(1);
+    }
+    while ((self.codeLen - fnStart) < WIN_AS_SZ) { self.wxb_ce8(0x90); }
   }
 
   // ------------------------------------------------------------------
@@ -692,10 +802,13 @@ pub type WinX86Backend = class {
   fn wxb_emitStart(relMain: int64) {
     // sub rsp, 40  [0..3]
     self.wxb_ce8(0x48); self.wxb_ce8(0x83); self.wxb_ce8(0xEC); self.wxb_ce8(0x28);
-    // call win_argv_setup  E8 rel32  [4..8]
-    // _start is at WIN_PREAMBLE_SZ=506; call at 506+4=510; end=515; target=WIN_AS_OFF=269
-    // rel32 = 269-515 = -246 = 0xFFFFFF0A
-    self.wxb_ce8(0xE8); self.wxb_ce32(-246);
+    // call win_argv_setup  E8 rel32
+    // #2263: Weite aus der LAGE rechnen, nicht als Zahl fuehren. Die alte
+    // Konstante -246 stand fuer WIN_PREAMBLE_SZ=506 und war schon beim Stand
+    // 508 falsch dokumentiert; mit WIN_AS_SZ wandert sie ohnehin.
+    self.wxb_ce8(0xE8);
+    var callEnd: int64 := self.codeLen + 4;
+    self.wxb_ce32(WIN_AS_OFF - callEnd);
     // mov rdi, rax  (argc → first SysV arg)  [9..11]
     self.wxb_ce8(0x48); self.wxb_ce8(0x89); self.wxb_ce8(0xC7);
     // mov rsi, rdx  (argv → second SysV arg) [12..14]
@@ -727,9 +840,10 @@ pub type WinX86Backend = class {
     self.wxb_ce8(0xE8); self.wxb_ce32(relMain);
     // mov ecx, eax  (exit code = main() return value)  2 bytes [53..54]
     self.wxb_ce8(0x89); self.wxb_ce8(0xC1);
-    // call [ExitProcess_IAT]  FF 15 rel32              6 bytes [55..60]
+    // call [ExitProcess_IAT]  FF 15 rel32
     self.wxb_ce8(0xFF); self.wxb_ce8(0x15);
-    self.wxb_ce32(0);   // placeholder, patched in wxb_patchIAT
+    self.epCallOff := self.codeLen - 2;   // #2263: Lage merken
+    self.wxb_ce32(0);   // in wxb_patchIAT nachgetragen
     // 18 NOPs [61..78]: 4 original + 14 to pad _start to 79 bytes (= CG_H_STRLEN)
     var j: int64 := 0;
     while (j < 18) { self.wxb_ce8(0x90); j := j + 1; }
@@ -751,44 +865,12 @@ pub type WinX86Backend = class {
     // 15 bytes ✓
   }
 
-  // ------------------------------------------------------------------
-  // Trampoline zone: print_str JMP trampoline (26 bytes, at code WIN_PREAMBLE_SZ+94=602)
-  // Jumps backward to win_print_str_impl at code[0].
-  // rel32 = 0 - (WIN_PREAMBLE_SZ + 94 + 5) = 0 - 607 = -607  (WP-4.3: updated for 79-byte _start)
-  // ------------------------------------------------------------------
-
-  fn wxb_emitPrintStrJmp() {
-    self.wxb_ce8(0xE9); self.wxb_ce32(0 - 607);  // JMP to WIN_PS_OFF = 0
-    var i: int64 := 0;
-    while (i < 21) { self.wxb_ce8(0x90); i := i + 1; }
-    // 26 bytes ✓
-  }
-
-  // ------------------------------------------------------------------
-  // Trampoline zone: print_int JMP trampoline (104 bytes, at code WIN_PREAMBLE_SZ+120=628)
-  // Jumps backward to win_print_int_impl at code[68].
-  // rel32 = 68 - (WIN_PREAMBLE_SZ + 120 + 5) = 68 - 633 = -565  (WP-4.3: updated)
-  // ------------------------------------------------------------------
-
-  fn wxb_emitPrintIntJmp() {
-    self.wxb_ce8(0xE9); self.wxb_ce32(68 - 633);  // JMP to WIN_PI_OFF = 68
-    var i: int64 := 0;
-    while (i < 99) { self.wxb_ce8(0x90); i := i + 1; }
-    // 104 bytes ✓
-  }
-
-  // ------------------------------------------------------------------
-  // Trampoline zone: strsub JMP trampoline (71 bytes, at code WIN_PREAMBLE_SZ+210)
-  // Jumps backward to win_strsub_impl at code[213].
-  // rel32 = WIN_SS_OFF - (WIN_PREAMBLE_SZ + 224 + 5) = 213 - 737 = -524  (WP-4.3: updated for zone offset 224)
-  // ------------------------------------------------------------------
-
-  fn wxb_emitStrSubJmp() {
-    self.wxb_ce8(0xE9); self.wxb_ce32(213 - 737);  // JMP to WIN_SS_OFF = 213
-    var i: int64 := 0;
-    while (i < 66) { self.wxb_ce8(0x90); i := i + 1; }
-    // 71 bytes ✓
-  }
+  // #2263: Die funf JMP-Sprungbretter mit fest eingetragener rel32-Weite
+  // (print_str, print_int, strsub, EPrintStr, EPrintInt) sind hier entfallen.
+  // Sie wurden von keiner Stelle aufgerufen — wxb_buildCode nimmt dafuer
+  // wxb_emitJmpTo, das die Weite aus der Lage rechnet —, trugen aber Zahlen
+  // wie -607, die fuer WIN_PREAMBLE_SZ=508 gerechnet waren. Wer sie benutzt
+  // haette, waere ohne Meldung ins Leere gesprungen.
 
   // ------------------------------------------------------------------
   // Trampoline zone: strcharat (6 bytes, at code WIN_PREAMBLE_SZ+281)
@@ -922,17 +1004,20 @@ pub type WinX86Backend = class {
     var r3: int64 := vaRVA - (textBase + WIN_CALL_VA + 6);
     self.wxb_patch32(WIN_CALL_VA + 2, r3);
 
-    // win_argv_setup GetCommandLineA call at code[284], instruction end at 290
-    var r5: int64 := gclRVA - (textBase + WIN_CALL_GCL + 6);
-    self.wxb_patch32(WIN_CALL_GCL + 2, r5);
+    // win_argv_setup GetCommandLineA call — Lage aus dem Erzeugen (#2263)
+    if (self.asGclOff >= 0) {
+      self.wxb_patch32(self.asGclOff + 2, gclRVA - (textBase + self.asGclOff + 6));
+    }
 
-    // win_argv_setup VirtualAlloc call at code[370], instruction end at 376
-    var r6: int64 := vaRVA - (textBase + WIN_CALL_VA2 + 6);
-    self.wxb_patch32(WIN_CALL_VA2 + 2, r6);
+    // win_argv_setup VirtualAlloc call — Lage aus dem Erzeugen (#2263)
+    if (self.asVa2Off >= 0) {
+      self.wxb_patch32(self.asVa2Off + 2, vaRVA - (textBase + self.asVa2Off + 6));
+    }
 
-    // _start ExitProcess call at code[561], instruction end at 567
-    var r4: int64 := epRVA - (textBase + WIN_CALL_EP + 6);
-    self.wxb_patch32(WIN_CALL_EP + 2, r4);
+    // _start ExitProcess call — Lage aus dem Erzeugen (#2263)
+    if (self.epCallOff >= 0) {
+      self.wxb_patch32(self.epCallOff + 2, epRVA - (textBase + self.epCallOff + 6));
+    }
 
     // WP-A2.3: VirtualAlloc call inside the appended heap helper (dynamic offset).
     if (self.vallocCallOff >= 0) {
@@ -988,11 +1073,23 @@ pub type WinX86Backend = class {
     // multi-fn programs landed in the previous function's epilogue and crashed.)
     var relMain: int64 := linuxRelMain + 14;
 
-    // Emit preamble (WIN_PREAMBLE_SZ = 508 bytes)
+    // Emit preamble (WIN_PREAMBLE_SZ Bytes)
     self.wxb_emitPrintStr();     // 68 bytes, offsets 0..67
     self.wxb_emitPrintInt();     // 145 bytes, offsets 68..212 (was 143, comment was stale)
     self.wxb_emitStrSub();       // 58 bytes, offsets 213..270
-    self.wxb_emitArgvSetup();    // 237 bytes, offsets 271..507
+    self.wxb_emitArgvSetup();    // WIN_AS_SZ Bytes, ab WIN_AS_OFF
+    // #2263: Der Vorspann MUSS genau WIN_PREAMBLE_SZ lang sein — die
+    // Sprungbretter dahinter liegen auf festen Offsets, und der Nutzercode
+    // wird um diesen Betrag verschoben eingesetzt. Laut scheitern, statt mit
+    // verschobenen Offsets eine Datei zu schreiben, die beim Start faellt.
+    if (self.codeLen != WIN_PREAMBLE_SZ) {
+      EPrintStr("lyxc: win64: Vorspann ist "c);
+      EPrintInt(self.codeLen);
+      EPrintStr(" Bytes lang, WIN_PREAMBLE_SZ ist "c);
+      EPrintInt(WIN_PREAMBLE_SZ);
+      EPrintStrLn(" — WIN_PREAMBLE_SZ/WIN_USER_OFF/WIN_ENTRY_OFF nachziehen."c);
+      exit(1);
+    }
 
     // WP-A2: Emit trampoline zone. Each trampoline is padded to its EXACT WIN_H_*
     // offset (mirroring CG_H_* in codegen_x86.lyx) so user-code rel32 calls — which
@@ -1839,8 +1936,9 @@ pub type WinX86Backend = class {
     self.argvStoreOff    := 0 - 1;
     self.envStoreOff     := 0 - 1;   // #1677
     self.envCallOff      := 0 - 1;
-    self.envStoreOff     := 0 - 1;   // #1677
-    self.envCallOff      := 0 - 1;
+    self.asGclOff        := 0 - 1;   // #2263
+    self.asVa2Off        := 0 - 1;   // #2263
+    self.epCallOff       := 0 - 1;   // #2263
     self.externBuf       := 0;      // #1671
     self.externCount     := 0;
     self.patchBuf        := 0;
