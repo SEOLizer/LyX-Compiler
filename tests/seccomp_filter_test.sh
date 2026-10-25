@@ -277,6 +277,41 @@ fn main(): int64 {
   return 0;
 }"
 
+# #2279: die Gegenseite dazu, und zwar als MESSUNG statt als Zusicherung.
+# Gemeldet war "dateibasierte SQLite stirbt unter dem gehaerteten Profil mit
+# Bad system call" — als Luecke im Filter. Es ist die GRENZE: ohne fs.delete
+# verwirft der Filter `unlink`, mit dem die Journaldatei weggeraeumt wird.
+# Nachgemessen mit --seccomp-trap (#1348): si_syscall=__NR_unlink. Von aussen
+# ist die Nummer nicht bestimmbar, deshalb steht sie hier im Kommentar und
+# nicht im Test.
+#
+# Der Fall stirbt erst beim ersten SCHREIBEN, nicht beim Oeffnen — ein Test,
+# der nur SQLiteOpen prueft, waere gruen. Deshalb wird geschrieben.
+blocked "#2279 std.db.sqlite ohne fs.delete bleibt verboten (unlink)" "@capabilities([system.exit, system.memory.heap, system.rand, fs.read, fs.write, fs.create, fs.meta])
+import std.io;
+import std.db.sqlite;
+fn main(): int64 {
+  var db: int64 := SQLiteOpen(\"/tmp/lyx_2279_test.db\"c);
+  if (db == 0) { return 1; }
+  SQLiteExec(db, \"CREATE TABLE IF NOT EXISTS t(a INTEGER); INSERT INTO t VALUES(42);\"c);
+  SQLiteClose(db);
+  return 0;
+}"
+
+# #2279: dieselbe Unit mit :memory: braucht KEINE fs-Capability. Das ist die
+# dritte Seite der Messung: ohne sie koennte man den Fall darueber auch fuer
+# "SQLite ist unter Haertung gar nicht benutzbar" halten.
+runs "#2279 std.db.sqlite :memory: ohne fs-Capability" "@capabilities([system.exit, system.memory.heap, system.rand])
+import std.io;
+import std.db.sqlite;
+fn main(): int64 {
+  var db: int64 := SQLiteOpen(\":memory:\"c);
+  if (db == 0) { return 1; }
+  SQLiteExec(db, \"CREATE TABLE t(a INTEGER); INSERT INTO t VALUES(42);\"c);
+  SQLiteClose(db);
+  return 0;
+}"
+
 # --- #2098: network.unix und die Vereinigung der Socket-Familien ----------
 # network.unix erlaubte nur socket(AF_UNIX) — bind/listen/accept/connect
 # starben mit SIGSYS. Zusammen mit network.tcp.* gewann der TCP-Zweig einer
